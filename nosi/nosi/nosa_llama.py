@@ -22,6 +22,7 @@ from .cache_engine import InfLLMv2Cache
 from .cache_engine_gpu import InfLLMv2Cache as InfLLMv2CacheNoOffload
 from .max_pooling_fused import nosa_pooling
 from .nosa_linear import nosa_linear
+from . import transfer_trace as _tt   # retroinfer-eval fork: event timing, off unless NOSI_TRANSFER_TRACE
 from flash_attn import flash_attn_with_kvcache
 from flash_attn_nosa import flash_attn_with_kvcache as flash_attn_nosa_with_kvcache
 
@@ -355,6 +356,8 @@ class LlamaLayer:
     @torch.inference_mode()
     def decode_forward_warmup(self, hidden_states, position_ids, cos_sin_cache, cu_seqlens, max_seqlen, cache_engine, cache_lens, q_idx, pooling_buf, topk_buf_val, topk_buf_indices, topk_val_buf_q, topk_idx_buf_q, topk_val_buf, topk_idx_buf, mask_buf):
         # [ATTN] prepare
+        _tr = _tt.TRACE
+        if _tr is not None: _tr.begin_layer(self.layer_idx)
         residual = hidden_states
         bsz, q_len, _ = hidden_states.size()
         max_pooling_buf = pooling_buf[:self.num_key_value_heads]
@@ -485,6 +488,7 @@ class LlamaLayer:
         # [ATTN] stage 2
         nvtx.range_push("stage 2")
         # breakpoint()
+        if _tr is not None: _tr.attn_begin()
         attn_output = flash_attn_nosa_with_kvcache(
             query_states.unsqueeze(1),
             key_states,
@@ -492,6 +496,7 @@ class LlamaLayer:
             kv_bias,
             cache_seqlens=_cache_lens,
         )
+        if _tr is not None: _tr.attn_end()
         nvtx.range_pop()
 
         attn_output = attn_output.view(bsz, q_len, -1)
@@ -521,6 +526,8 @@ class LlamaLayer:
 
         nvtx.range_push("linear")
         # [ATTN] prepare
+        _tr = _tt.TRACE
+        if _tr is not None: _tr.begin_layer(self.layer_idx)
         residual = hidden_states
         bsz, q_len, _ = hidden_states.size()
         max_pooling_buf = pooling_buf[:self.num_key_value_heads]
@@ -597,6 +604,7 @@ class LlamaLayer:
         # [ATTN] stage 2
         nvtx.range_push("stage 2")
         
+        if _tr is not None: _tr.attn_begin()
         attn_output = flash_attn_nosa_with_kvcache(
             query_states.unsqueeze(1),
             key_states,
@@ -604,6 +612,7 @@ class LlamaLayer:
             kv_bias,
             cache_seqlens=_cache_lens,
         )
+        if _tr is not None: _tr.attn_end()
         nvtx.range_pop()
 
         attn_output = attn_output.view(bsz, q_len, -1)
@@ -753,6 +762,8 @@ class Llama:
             cu_seqlens: torch.Tensor,
             position_ids: torch.LongTensor,
             cache_engine = None, warmup=False):
+        _tr = _tt.TRACE
+        if _tr is not None: _tr.begin_step()
         hidden_states = F.embedding(input_ids, self.embed_tokens)
         bsz, seq_len = input_ids.shape[0], input_ids.shape[1]
         max_seqlen = 1
@@ -791,6 +802,7 @@ class Llama:
         if hidden_states.shape[1] > 16: # prefill
             hidden_states = hidden_states[:, -1:, :]
         logits = F.linear(hidden_states, self.lm_head).float()
+        if _tr is not None: _tr.record_logits(logits); _tr.end_step()
         
         return logits
 
@@ -809,6 +821,7 @@ class Llama:
 
 
     def batch_generate(self, input_ids, max_new_tokens=4):
+        if _tt.TRACE is not None: _tt.TRACE.new_document()
         cache_cls = InfLLMv2Cache if self.offload else InfLLMv2CacheNoOffload
         cache_engine = cache_cls(config=self.config, num_hidden_layers=self.config.num_hidden_layers, has_kv_bias=True)
         logits, position_ids = self.batch_prefill(input_ids, cache_engine)
@@ -830,6 +843,7 @@ class Llama:
         return gen_ids
 
     def batch_generate_benchmark(self, input_ids, max_new_tokens=4):
+        if _tt.TRACE is not None: _tt.TRACE.new_document()
         cache_cls = InfLLMv2Cache if self.offload else InfLLMv2CacheNoOffload
         cache_engine = cache_cls(config=self.config, num_hidden_layers=self.config.num_hidden_layers, has_kv_bias=True)
         logits, position_ids = self.batch_prefill(input_ids, cache_engine)

@@ -3,6 +3,7 @@ from queue import Queue
 import time
 from .flash_cache_engine.flash_h2d_mask import flash_h2d_from_mask
 from .flash_cache_engine.flash_h2d_mask_bias import flash_h2d_from_mask_bias
+from . import transfer_trace as _tt   # retroinfer-eval fork: event timing, off unless NOSI_TRANSFER_TRACE
 from torch.utils.cpp_extension import load
 from torch.cuda import nvtx
 import argparse
@@ -148,12 +149,16 @@ class CacheEngine:
         # 先判断要不要写回。如果需要写回，在完成该层的计算后再写回 TODO: 最后弄写回的逻辑
         tail_full = self._tail_block_len_on_gpu == self.block_size
         # B. 计算load mask和新的映射 尾块的映射不会动
+        _tr = _tt.TRACE
+        if _tr is not None: _tr.fetch_begin()
         diff.diff_offload(self._block_map, topk_idx, self._new_block_map_buf, self._load_mask)
         self._block_map.copy_(self._new_block_map_buf, non_blocking=True)
+        if _tr is not None: _tr.fetch_mid()
 
         # C. 从disk取需要load进来的块
         flash_h2d_from_mask(self._k_gpu, self._k_cpu, self._load_mask, self.block_size)
         flash_h2d_from_mask_bias(self._v_gpu, self._v_cpu, self._kv_bias_gpu, kv_bias, self._load_mask, self.block_size)
+        if _tr is not None: _tr.fetch_end(); _tr.record_mask(self._load_mask, self._block_map)
 
         # D. 处理写回逻辑 TODO: 测试时CUDA Graph没有包进来这里的逻辑
         if tail_full:
@@ -196,12 +201,16 @@ class CacheEngine:
         # 先判断要不要写回。如果需要写回，在完成该层的计算后再写回 TODO: 最后弄写回的逻辑
         tail_full = self._tail_block_len_on_gpu == self.block_size
         # B. 计算load mask和新的映射 尾块的映射不会动
+        _tr = _tt.TRACE
+        if _tr is not None: _tr.fetch_begin()
         diff.diff_offload(self._block_map, topk_idx, self._new_block_map_buf, self._load_mask)
         self._block_map.copy_(self._new_block_map_buf, non_blocking=True)
+        if _tr is not None: _tr.fetch_mid()
 
         # C. 从disk取需要load进来的块
         flash_h2d_from_mask(self._k_gpu, self._k_cpu, self._load_mask, self.block_size)
         flash_h2d_from_mask(self._v_gpu, self._v_cpu, self._load_mask, self.block_size)
+        if _tr is not None: _tr.fetch_end(); _tr.record_mask(self._load_mask, self._block_map)
 
         # D. 处理写回逻辑 TODO: 测试时CUDA Graph没有包进来这里的逻辑
         if tail_full:
