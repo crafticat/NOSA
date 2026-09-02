@@ -480,6 +480,7 @@ class LlamaLayer:
         self.after_pooling_graph.replay()
     
         topk_idx = topk_idx_buf
+        if _tr is not None: _tr.record_scores(max_pooling_buf, max_pooling_buf_cis)
 
         # [ATTN] offloading-update
         nvtx.range_push("_offloading update")
@@ -595,6 +596,7 @@ class LlamaLayer:
 
         self.after_pooling_graph.replay()
         topk_idx = topk_idx_buf
+        if _tr is not None: _tr.record_scores(max_pooling_buf, max_pooling_buf_cis)
 
         # [ATTN] offloading-update
         nvtx.range_push("offloading update")

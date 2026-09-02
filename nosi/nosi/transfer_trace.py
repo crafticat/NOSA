@@ -15,6 +15,12 @@ Modes (environment variable NOSI_TRANSFER_TRACE):
                  and around flash_attn_nosa_with_kvcache; per step: events
                  around the whole decode_inference; an archive of `_load_mask`
                  and `_block_map` per (step, layer); the per-step logits copy.
+  "scores"    -> mode "1" plus, per (step, layer), the two pooled score
+                 buffers the selection is drawn from (`max_pooling_buf`: the
+                 QK score; `max_pooling_buf_cis`: the cis score with the
+                 QK-selected blocks forced to +inf), read after the captured
+                 pooling->top-k graph replays. Phase P2 (offline predictor
+                 study) ranks the blocks below the top-64 from these.
 
 Nothing here synchronizes inside a step: events are recorded on the current
 stream, masks are copied device-to-device into a preallocated archive, logits
@@ -74,7 +80,9 @@ class TransferTrace:
     def __init__(self, num_layers: int, mode: str, max_steps: int = 16):
         self.num_layers = num_layers
         self.mode = mode
-        self.full = mode == "1"
+        self.full = mode in ("1", "scores")
+        self.scores = mode == "scores"
+        self.score_archive = None     # (max_steps, L, 2, H, B, out_len) bf16, device
         self.max_steps = max_steps
         self.steps: list[_Step] = []
         self.cur: _Step | None = None
@@ -149,6 +157,17 @@ class TransferTrace:
             self.map_archive = torch.full(shape, -2, dtype=block_map.dtype, device=block_map.device)
         self.mask_archive[self.cur.index, self.layer].copy_(load_mask, non_blocking=True)
         self.map_archive[self.cur.index, self.layer].copy_(block_map, non_blocking=True)
+
+    def record_scores(self, qk_scores: torch.Tensor, cis_scores: torch.Tensor):
+        """Mode "scores" only: copy the (H, B, out_len) pooled score buffers of
+        the current layer into the archive (device-to-device, no sync)."""
+        if self.cur is None or not self.scores or self.layer is None:
+            return
+        if self.score_archive is None or self.score_archive.shape[3:] != tuple(qk_scores.shape):
+            shape = (self.max_steps, self.num_layers, 2) + tuple(qk_scores.shape)
+            self.score_archive = torch.full(shape, float("nan"), dtype=qk_scores.dtype, device=qk_scores.device)
+        self.score_archive[self.cur.index, self.layer, 0].copy_(qk_scores, non_blocking=True)
+        self.score_archive[self.cur.index, self.layer, 1].copy_(cis_scores, non_blocking=True)
 
     # -- harvest (one synchronize, after the timed region) ----------------------
     def harvest(self, timed_steps=(1, 2, 3, 4)):
@@ -295,6 +314,11 @@ def dump(out_dir: str, doc_idx: int, meta: dict, timed_steps=(1, 2, 3, 4)) -> di
         torch.save({"masks_b0": masks[:, :, :, 0, :].to(torch.int32).clone(),
                     "maps_b0": maps[:, :, :, 0, :].to(torch.int32).clone(), "meta": meta},
                    os.path.join(out_dir, f"selection_{tag}.pt"))
+    if TRACE.scores and TRACE.score_archive is not None and masks is not None:
+        n_steps = masks.shape[0]
+        torch.save({"masks": masks.to(torch.int32).clone(), "maps": maps.to(torch.int32).clone(),
+                    "scores": TRACE.score_archive[:n_steps].cpu().clone(), "meta": meta},
+                   os.path.join(out_dir, f"scores_{tag}.pt"))
     timed = [r for r in step_rows if r["timed"]]
     summ = {}
     if timed:
