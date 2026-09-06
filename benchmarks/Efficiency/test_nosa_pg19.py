@@ -58,6 +58,21 @@ for i in range(len(dataset)):
     print(f"thru: {t} tok/s")
     print(f"[doc] idx={i} n_tokens={input_ids.shape[1]} batch={input_ids.shape[0]} wall={time.time() - _t0:.1f}s "
           f"gpu_peak_gb={torch.cuda.max_memory_allocated() / 1e9:.2f}")
+    # host-memory evidence per document (fork addition, 2026-09-03): the 64K x 64 and 96K x 64 cells were
+    # killed by the host cgroup even at 900 GB; this line records RSS/locked pages per document so growth
+    # vs. steady state is measured, not inferred. NOSI_BENCH_HOST_EMPTY_CACHE=1 releases PyTorch's cached
+    # pinned-host blocks between documents (torch._C._host_emptyCache); it does not touch per-document timing.
+    try:
+        _st = {}
+        for _ln in open("/proc/self/status"):
+            if _ln.startswith(("VmRSS", "VmLck", "VmHWM")):
+                _k, _v = _ln.split(":", 1); _st[_k] = int(_v.split()[0]) / 1048576
+        print(f"[mem] doc={i} rss_gb={_st.get('VmRSS', 0):.1f} hwm_gb={_st.get('VmHWM', 0):.1f} locked_gb={_st.get('VmLck', 0):.1f}")
+        if os.environ.get("NOSI_BENCH_HOST_EMPTY_CACHE", "0") == "1" and hasattr(torch._C, "_host_emptyCache"):
+            torch._C._host_emptyCache(); torch.cuda.empty_cache()
+            print(f"[mem] doc={i} host_empty_cache=ran")
+    except Exception as _e:  # never let the instrument kill the cell
+        print(f"[mem] doc={i} instrument_error={type(_e).__name__}: {_e}")
     if _trace is not None:
         _summ = _tt.dump(_trace_out, doc_idx=i, meta=_meta)
         print(f"[trace] doc={i} " + " ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in _summ.items()))
