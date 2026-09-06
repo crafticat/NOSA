@@ -69,8 +69,16 @@ for i in range(len(dataset)):
                 _k, _v = _ln.split(":", 1); _st[_k] = int(_v.split()[0]) / 1048576
         print(f"[mem] doc={i} rss_gb={_st.get('VmRSS', 0):.1f} hwm_gb={_st.get('VmHWM', 0):.1f} locked_gb={_st.get('VmLck', 0):.1f}")
         if os.environ.get("NOSI_BENCH_HOST_EMPTY_CACHE", "0") == "1" and hasattr(torch._C, "_host_emptyCache"):
+            # 2171641 showed RSS 273 -> 529 GB per document with the empty-cache alone: the previous document's
+            # InfLLMv2Cache (32 layers of pinned _k_cpu/_v_cpu) is cyclic garbage that CPython's refcount does not
+            # free and the generational GC has not yet visited, so the allocator had nothing to release. Collect first.
+            import gc; _n = gc.collect()
             torch._C._host_emptyCache(); torch.cuda.empty_cache()
-            print(f"[mem] doc={i} host_empty_cache=ran")
+            _st2 = {}
+            for _ln in open("/proc/self/status"):
+                if _ln.startswith(("VmRSS", "VmHWM")):
+                    _k, _v = _ln.split(":", 1); _st2[_k] = int(_v.split()[0]) / 1048576
+            print(f"[mem] doc={i} host_empty_cache=ran gc_collected={_n} rss_after_gb={_st2.get('VmRSS', 0):.1f}")
     except Exception as _e:  # never let the instrument kill the cell
         print(f"[mem] doc={i} instrument_error={type(_e).__name__}: {_e}")
     if _trace is not None:
