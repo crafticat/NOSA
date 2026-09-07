@@ -288,7 +288,11 @@ class InfLLMv2CacheLayer(DynamicLayer):
             self.cached_compressed_cu_seqlens = torch.empty((total_bsz+1,), dtype=cu_seqlens.dtype, device=cu_seqlens.device)
             self.cached_compressed_cu_seqlens[:cu_seqlens.shape[-1]].copy_(cu_seqlens)
             self.cached_compressed_max_seqlen = max_seqlen
-            self.cached_compressed_cu_seqlens_adder = torch.arange(total_bsz, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+            # cu_seqlens has total_bsz + 1 entries; one new compressed key per sequence adds [0, 1, ..., total_bsz].
+            # Upstream used arange(total_bsz): a size mismatch for B > 1 (RuntimeError at the first decode step that
+            # crosses the 16-token compression stride) and a silent no-op by broadcasting at B = 1. Never reached by
+            # the 4-token benchmark; reached by any longer decode (retroinfer-eval fork, 2026-09-07).
+            self.cached_compressed_cu_seqlens_adder = torch.arange(total_bsz + 1, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
         else:
             self.cached_compressed_cu_seqlens[current_batch_pos:current_batch_pos+cu_seqlens.shape[-1]].copy_(cu_seqlens + self.cached_compressed_cu_seqlens[current_batch_pos])
 
