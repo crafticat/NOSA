@@ -22,6 +22,9 @@ model = Llama(
     model_name=path,
     device="cuda",
     offload=os.environ.get("NOSI_BENCH_OFFLOAD", "1") == "1",
+    # NOSI_BENCH_MAX_LENGTH (fork, 2026-09-07): only sizes the RoPE cos/sin cache (nosa_llama.py `arange(max_length + 1024)`);
+    # default = upstream default, so cells inside 128K are unchanged
+    max_length=int(os.environ.get("NOSI_BENCH_MAX_LENGTH", 128 * 1024)),
 )
 
 B = int(os.environ.get("NOSI_BENCH_B", 16))
@@ -44,9 +47,26 @@ def test_time(input_ids):
 total_t = 0
 add_time = 0
 first_time = True
+# NOSI_BENCH_CONCAT=1 (fork, 2026-09-07): beyond PG-19's longest books, concatenate CONSECUTIVE books until
+# L tokens; each concatenated document starts after the last book the previous one used, so documents never
+# overlap. Off by default: the upstream loop below is byte-for-byte the shipped one when it is off.
+_concat = os.environ.get("NOSI_BENCH_CONCAT", "0") == "1"
+_next_i = 0
 for i in range(len(dataset)):
+    if i < _next_i:
+        continue
 
     text = dataset[i]
+    j = i
+    if _concat:
+        _ids = tokenizer(text, return_tensors="pt").input_ids
+        while _ids.shape[1] < L and j + 1 < len(dataset):
+            j += 1
+            text = text + "\n\n" + dataset[j]
+            _ids = tokenizer(text, return_tensors="pt").input_ids
+        _next_i = j + 1
+        if _ids.shape[1] >= L:
+            print(f"[concat] books {i}..{j} -> {_ids.shape[1]} tokens for L={L}")
 
     input_ids = tokenizer(text, return_tensors="pt").to("cuda").input_ids
     if input_ids.shape[1] < L:
