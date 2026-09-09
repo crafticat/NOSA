@@ -21,6 +21,50 @@ diff = load(
     verbose=False,
 )
 
+# ---------------------------------------------------------------------------
+# retroinfer-eval fork: VICTIM POOL (knob NOSI_POOL_BLOCKS, default 0).
+#
+# NOSI's GPU block cache is exact-fit -- `topk` slots for a `topk`-block
+# selection (the allocation below) -- so a block that leaves the selection and
+# re-enters it a few steps later is fetched over PCIe again. Replaying the
+# measured selection sequence through an LRU (scripts/nosi_cache_sweep.py,
+# REPRODUCE.md experiment 1) shows misses per (layer, KV head, request, step)
+# fall from 3.580 at 63 usable slots to 1.200 at 80, 0.863 at 96, 0.708 at 128
+# and 0.671 at 192, flat thereafter: ~80% of the fetch is avoidable.
+#
+# The pool adds P extra block slots per (layer, KV head, request) at slot
+# indices topk .. topk+P-1 of the SAME cache tensors, BEYOND `_cache_lens`,
+# where flash_attn_nosa never reads (it takes no block table; it reads rows
+# 0.._cache_lens-1 as one flat sequence). So the attended set is still exactly
+# slots 0..topk-1 and the served output is unchanged; only WHERE a block is
+# read from moves, never WHICH blocks the model attends to.
+#
+# P = 0 IS THE UPSTREAM PATH, BYTE FOR BYTE: nothing below is imported, no
+# extension is compiled, no tensor is allocated, no kernel is launched, and
+# `decode_update` is bound to the untouched upstream method at construction.
+# The knob is read once, here, so a run cannot change P halfway.
+#
+# The one OTHER file the knob reaches is transfer_trace.py (the instrument, off
+# unless NOSI_TRANSFER_TRACE). It binds its per-event recorder and its event-name
+# tuple at construction for the same reason, so a P = 0 mode-"1" baseline is the
+# same instrument as the baselines already on record (jobs 2170892 / 2171644).
+#
+# SCOPE: this engine only. cache_engine_gpu.py (offload=0, the GPU-resident
+# control) never reads the knob and is untouched.
+POOL_BLOCKS = int(os.environ.get("NOSI_POOL_BLOCKS", "0") or 0)
+_pool = None
+_flash_pool_swap = None
+if POOL_BLOCKS > 0:
+    # a SEPARATE extension name on purpose: adding these sources to the
+    # diff_offload load() above would change that extension's build hash and
+    # force every P=0 run to rebuild it
+    _pool = load(
+        name="nosi_pool",
+        sources=[os.path.join(this_dir, "flash_cache_engine/pool_update.cpp"), os.path.join(this_dir, "flash_cache_engine/pool_update_kernel.cu")],
+        verbose=False,
+    )
+    from .flash_cache_engine.flash_pool_swap import flash_pool_swap as _flash_pool_swap
+
 class CacheEngine:
     def __init__(self,
         gpu_mem_usage: int = 60,
@@ -62,7 +106,25 @@ class CacheEngine:
         self.topk = topk
         self.max_gen_len = 8192
 
-        self.decode_update = self.decode_update_has_kv_bias if has_kv_bias else self.decode_update_no_kv_bias
+        # retroinfer-eval fork: victim pool. Dispatch is bound here, the way
+        # upstream already binds the has_kv_bias variant, because this file's
+        # own comment (decode_update_no_kv_bias, "用python写分支会非常慢") warns
+        # that a Python branch in the decode path is very slow -- and because
+        # binding is the only way P=0 provably executes the upstream body.
+        self.pool_blocks = POOL_BLOCKS
+        self._pool_stamp_base = 0
+        if POOL_BLOCKS > 0 and not has_kv_bias:
+            # NOSA-8B always takes the has_kv_bias path (nosa_llama.py:828,850).
+            # Refuse rather than silently serve an un-pooled run that a manifest
+            # would then report as a pooled one.
+            raise RuntimeError(
+                "NOSI_POOL_BLOCKS=%d but this CacheEngine was built with "
+                "has_kv_bias=False; the victim pool is implemented only in "
+                "decode_update_has_kv_bias" % POOL_BLOCKS)
+        if POOL_BLOCKS > 0:
+            self.decode_update = self.decode_update_has_kv_bias_pool
+        else:
+            self.decode_update = self.decode_update_has_kv_bias if has_kv_bias else self.decode_update_no_kv_bias
         
         
     def prefill_update(self, key_states, value_states, kv_bias, current_batch_pos, total_bsz):
@@ -86,15 +148,66 @@ class CacheEngine:
             self._v_cpu = torch.empty((total_bsz, S+self.max_gen_len, H, D), dtype=self.dtype, device='cpu').pin_memory()
 
             # 2. 在gpu上开空间，开topk * block_size大小
-            self._k_gpu = torch.empty((total_bsz, self.topk * self.block_size, H, D), dtype=self.dtype, device=self.device)
-            self._v_gpu = torch.empty((total_bsz, self.topk * self.block_size, H, D), dtype=self.dtype, device=self.device)
-            self._kv_bias_gpu = torch.empty((total_bsz, self.topk * self.block_size, H), dtype=self.dtype, device=self.device)
+            # retroinfer-eval fork: + self.pool_blocks victim slots, which live
+            # past _cache_lens and are therefore invisible to attention. The
+            # expression is IDENTICAL to upstream when pool_blocks == 0.
+            _gpu_slots = self.topk + self.pool_blocks
+            if self.pool_blocks > 0:
+                # THE INT32 ENVELOPE, re-derived because the pool moves one half
+                # of it. flash_h2d_from_mask{,_bias} do NOT cast their program
+                # ids (flash_h2d_mask.py:23-25, :48-54), so `pid_b * stride_b`
+                # is int32 x int32 on BOTH sides of the copy:
+                #   host side  B * (S + max_gen_len) * H * D  < 2**31
+                #              (the measured wall: 64K x 112 passes, x120 aborts)
+                #   GPU side   B * (topk + P) * block_size * H * D < 2**31,
+                #              which the pool DIVIDES by (topk+P)/topk.
+                # Guarded to the pooled path so p=0 stays upstream byte for byte;
+                # env/slurm/nosi_pool.sbatch refuses out-of-envelope cells for
+                # every p, before any GPU time is spent.
+                _hd = H * D
+                assert total_bsz * (S + self.max_gen_len) * _hd < 2**31, (
+                    "host-side int32 gather overflow: B=%d S=%d -> %d elements"
+                    % (total_bsz, S, total_bsz * (S + self.max_gen_len) * _hd))
+                assert total_bsz * _gpu_slots * self.block_size * _hd < 2**31, (
+                    "GPU-side int32 gather overflow: B=%d topk+p=%d -> %d elements"
+                    % (total_bsz, _gpu_slots, total_bsz * _gpu_slots * self.block_size * _hd))
+            self._k_gpu = torch.empty((total_bsz, _gpu_slots * self.block_size, H, D), dtype=self.dtype, device=self.device)
+            self._v_gpu = torch.empty((total_bsz, _gpu_slots * self.block_size, H, D), dtype=self.dtype, device=self.device)
+            self._kv_bias_gpu = torch.empty((total_bsz, _gpu_slots * self.block_size, H), dtype=self.dtype, device=self.device)
 
             # 3. block_map
             self._block_map = torch.full((H, total_bsz, self.topk), -1, dtype=torch.int64, device=self.device)
             # 开好中间buffer方便外面用cuda graph包起来
             self._new_block_map_buf = torch.empty_like(self._block_map) 
             self._load_mask = torch.empty_like(self._new_block_map_buf)
+
+            if self.pool_blocks > 0:
+                # 3b. retroinfer-eval fork: victim-pool state, one row per
+                # (kv head, request). An EMPTY slot q carries age -P+q: the
+                # values are pairwise distinct and all strictly below every real
+                # stamp (which is >= 0), so empties are consumed first, in slot
+                # order, and the LRU comparison never has to break a tie.
+                _p = self.pool_blocks
+                self._pool_map = torch.full((H, total_bsz, _p), -1, dtype=torch.int64, device=self.device)
+                self._pool_age = (torch.arange(_p, dtype=torch.int64, device=self.device) - _p).expand(H, total_bsz, _p).contiguous()
+                self._pool_target = torch.full((H, total_bsz, self.topk), -1, dtype=torch.int64, device=self.device)
+                self._pool_action = torch.zeros((H, total_bsz, self.topk), dtype=torch.int8, device=self.device)
+                self._pool_stamp_base = 0
+                # Not required for correctness -- attention never reads past
+                # _cache_lens, and a pool slot is only ever read back when
+                # _pool_map[q] >= 0, which implies it was written first. COST,
+                # corrected: there is one CacheEngine PER LAYER
+                # (InfLLMv2CacheLayer.__init__ below), so this runs 32 times per
+                # document, not once: ~0.4 ms per layer, ~13 ms and ~17 GB of
+                # writes per document at p=129 B=64. That is PREFILL time; the
+                # benchmark's [Speed] and every steps.csv number are measured
+                # inside the decode loop (nosa_llama.batch_generate_benchmark
+                # starts its clock after decode step 0), so it does not enter
+                # P-3 or P-4. It makes a pool dump readable and protects any
+                # future kernel that is less careful.
+                self._k_gpu[:, self.topk * self.block_size:].zero_()
+                self._v_gpu[:, self.topk * self.block_size:].zero_()
+                self._kv_bias_gpu[:, self.topk * self.block_size:].zero_()
 
             # 4. 直接把尾块在GPU上设置好
             self._tail_block_len_on_gpu = S % self.block_size
@@ -171,6 +284,128 @@ class CacheEngine:
             self._tail_block_len_on_gpu = 0
             self._cache_lens[...] = (self.topk - 1) * self.block_size + self._tail_block_len_on_gpu
             
+
+        return self._k_gpu, self._v_gpu, self._kv_bias_gpu, self._cache_lens 
+
+    def decode_update_has_kv_bias_pool(self, key_states, value_states, kv_bias, topk_idx):
+        """decode_update_has_kv_bias PLUS the victim pool (NOSI_POOL_BLOCKS > 0).
+
+        A SEPARATE method, bound at construction, so that the upstream body
+        above is not edited at all and a P = 0 run launches exactly the kernels
+        it launches today. KEEP THE TWO BODIES IN SYNC: everything here except
+        section B2 is copied verbatim from decode_update_has_kv_bias.
+
+        What changes and what does not:
+          * _cache_lens is UNCHANGED, so the attended window is unchanged and
+            the served logits are unchanged.
+          * the tail slot (self._tail_block_idx_on_gpu == topk-1) never enters
+            the pool. It is excluded twice over: explicitly, by the tail_slot
+            argument to pool_update, and implicitly, because the tail block id
+            is always inside the selection (nosa_pooling forces the local
+            window), so diff_kernel takes its old_hit branch at that slot and
+            _load_mask[..., tail] is always -1.
+          * the tail write-back (section D) is untouched and runs AFTER the
+            gathers, so it cannot race the pool; and since the pool never held
+            the tail block, renaming it to T+1 leaves no stale pool entry. The
+            just-completed block T is NOT captured into the pool even though its
+            bytes are already in HBM. THE COST OF THAT IS ASSERTED, NOT
+            MEASURED: one compulsory fetch per 64 decode steps per stream, i.e.
+            ~0.4% of the traffic at the shipped 3.58 blocks/stream-step. The
+            branch itself needs 64 decode steps to fire at all, which no cell
+            reached before the 63-step rewrite of env/slurm/nosi_pool.sbatch;
+            the cells there now cross it once, and P-8 registers the capture as
+            a separate follow-up rather than leaving the number in a docstring.
+        """
+        B, S, H, D = key_states.shape
+        assert H == self.head_num and D == self.head_dim and S == 1
+
+        self.seq_length += 1
+        self._cache_lens[...] += 1
+
+        # A. 首先处理尾块。尾块一定写在GPU上，且self._tail_block_idx_on_gpu指示的位置一定是可写的
+        _tail_write_pos = self._tail_block_idx_on_gpu * self.block_size + self._tail_block_len_on_gpu
+        self._k_gpu[:, _tail_write_pos:_tail_write_pos+1, :, :].copy_(key_states, non_blocking=True)
+        self._v_gpu[:, _tail_write_pos:_tail_write_pos+1, :, :].copy_(value_states, non_blocking=True)
+
+
+        self._kv_bias_gpu[:, _tail_write_pos:_tail_write_pos+1, :].copy_(kv_bias[:, self.seq_length-1:self.seq_length, :], non_blocking=True)
+
+
+        self._tail_block_len_on_gpu += 1
+        # 先判断要不要写回。如果需要写回，在完成该层的计算后再写回
+        tail_full = self._tail_block_len_on_gpu == self.block_size
+        # THE POOL'S SAFETY MARGIN IS EXACTLY ZERO ROWS, so pin it. _cache_lens
+        # is (topk-1)*block_size + _tail_block_len_on_gpu, and the pool's first
+        # row is topk*block_size (flash_pool_swap: (TOPK+q)*block_size). Those
+        # two are equal the instant _tail_block_len_on_gpu reaches block_size --
+        # which is precisely when `tail_full` resets it below. One token more
+        # and attention would read pool row 0, i.e. a victim block from an
+        # unrelated part of the document, as if it were an attended token: a
+        # plausible, finite, WRONG output. Two host integer compares per decode
+        # step per layer.
+        assert self._tail_block_len_on_gpu <= self.block_size, (
+            "tail ran past its block (%d > %d): _cache_lens would reach the pool"
+            % (self._tail_block_len_on_gpu, self.block_size))
+        # B. 计算load mask和新的映射 尾块的映射不会动
+        _tr = _tt.TRACE
+        if _tr is not None: _tr.fetch_begin()
+        diff.diff_offload(self._block_map, topk_idx, self._new_block_map_buf, self._load_mask)
+
+        # B2. THE POOL. It MUST sit between diff_offload and the copy_ below,
+        # because it reads self._block_map while that still holds the OLD ids --
+        # the block Y being displaced from each attended slot. After the copy_
+        # that value is gone. It must also run before the two gathers, because a
+        # pool hit clears _load_mask[s] to -1 and the gathers key off exactly
+        # that (flash_h2d_mask.py:32-33), and because on a miss the outgoing
+        # block must be parked before the gather overwrites slot s.
+        #
+        # STREAMS. pool_update and the two Triton gathers all run on the CURRENT
+        # stream, so pool -> gather is ordered with no sync. The pairing that is
+        # NOT automatic is diff_offload -> pool_update: diff launches with a
+        # bare <<<>>> onto the LEGACY DEFAULT stream (diff_offload_kernel.cu),
+        # and PyTorch's other streams do not synchronize with it implicitly.
+        # pool_update therefore TORCH_CHECKs that the current stream IS the
+        # default one and refuses otherwise; do not wrap this decode in
+        # torch.cuda.stream() or capture it in a CUDA graph while that holds.
+        #
+        # _new_block_map_buf is deliberately NOT touched: diff already wrote
+        # new_map[s] = X for every loaded slot, and after either a pool hit or a
+        # host fetch slot s does hold X, so the copy_ below stays correct.
+        #
+        # _pool_stamp_base is a host int (free). It is correct because this
+        # region is not CUDA-graph captured -- see the "TODO: 测试时CUDA
+        # Graph没有包进来这里的逻辑" comment on section D. If it ever is
+        # captured, move the stamp into a 0-d device tensor.
+        if _tr is not None: _tr.pool_begin()
+        _pool.pool_update(self._block_map, self._load_mask,
+                          self._pool_map, self._pool_age,
+                          self._pool_target, self._pool_action,
+                          self._pool_stamp_base, self._tail_block_idx_on_gpu)
+        _flash_pool_swap(self._k_gpu, self._v_gpu, self._kv_bias_gpu,
+                         self._pool_target, self._pool_action,
+                         self.topk, self.block_size)
+        self._pool_stamp_base += self.topk
+        if _tr is not None: _tr.pool_end(); _tr.record_pool(self._pool_action)
+
+        self._block_map.copy_(self._new_block_map_buf, non_blocking=True)
+        if _tr is not None: _tr.fetch_mid()
+
+        # C. 从disk取需要load进来的块 -- now only what the pool could not serve
+        flash_h2d_from_mask(self._k_gpu, self._k_cpu, self._load_mask, self.block_size)
+        flash_h2d_from_mask_bias(self._v_gpu, self._v_cpu, self._kv_bias_gpu, kv_bias, self._load_mask, self.block_size)
+        if _tr is not None: _tr.fetch_end(); _tr.record_mask(self._load_mask, self._block_map)
+
+        # D. 处理写回逻辑 TODO: 测试时CUDA Graph没有包进来这里的逻辑
+        if tail_full:
+            tail_block_base_pos = self._tail_block_idx_on_gpu * self.block_size
+            cpu_block_base_pos = self.seq_length - self.block_size # 现在self.seq_len应该可以整除self.block_size
+            self._k_cpu[:, cpu_block_base_pos:cpu_block_base_pos+self.block_size, :, :].copy_(self._k_gpu[:, tail_block_base_pos:tail_block_base_pos+self.block_size, :, :], non_blocking=True)
+            self._v_cpu[:, cpu_block_base_pos:cpu_block_base_pos+self.block_size, :, :].copy_(self._v_gpu[:, tail_block_base_pos:tail_block_base_pos+self.block_size, :, :], non_blocking=True)
+            # 复用self._tail_block_idx_on_gpu的位置，但是让block_map里这里指向下一个块，并且将这个块认为全部可写
+            self._block_map[..., self._tail_block_idx_on_gpu] += 1
+            self._tail_block_len_on_gpu = 0
+            self._cache_lens[...] = (self.topk - 1) * self.block_size + self._tail_block_len_on_gpu
+
 
         return self._k_gpu, self._v_gpu, self._kv_bias_gpu, self._cache_lens 
     

@@ -61,8 +61,21 @@ class CacheEngine:
         self.max_seq_len = max_seq_len
         self.topk = topk
         self.max_gen_len = 8192
+        # retroinfer-eval fork: the victim pool (NOSI_POOL_BLOCKS) exists only
+        # on the OFFLOAD engine, cache_engine.py -- there is no wire to save
+        # here, the whole KV is already resident. Refuse rather than run an
+        # un-pooled control that a manifest would report as a pooled cell, and
+        # rather than let transfer_trace create pool events this engine never
+        # records (which would raise inside harvest and lose the document).
+        # Mirrors the refusal in cache_engine.CacheEngine.__init__.
+        if int(os.environ.get("NOSI_POOL_BLOCKS", "0") or 0) > 0:
+            raise RuntimeError(
+                "NOSI_POOL_BLOCKS=%s with NOSI_BENCH_OFFLOAD=0: the victim pool "
+                "is implemented only in the offloading CacheEngine "
+                "(cache_engine.py); this GPU-resident engine has no pool."
+                % os.environ.get("NOSI_POOL_BLOCKS"))
         self.decode_update = self.decode_update_has_kv_bias if has_kv_bias else self.decode_update_no_kv_bias
-        
+
     def prefill_update(self, key_states, value_states, kv_bias, current_batch_pos, total_bsz):
         # 将 key_states 和 value_states 放入 cache
         # key_states: (batch_size, seq_len, head_num, head_dim)

@@ -46,12 +46,24 @@ import torch
 
 MODE = os.environ.get("NOSI_TRANSFER_TRACE", "0")
 
+# retroinfer-eval fork: the victim pool (cache_engine.py, knob
+# NOSI_POOL_BLOCKS). Read the same env var so this module never has to import
+# cache_engine. With the pool off, begin_layer builds exactly the event dict it
+# built before, so a mode-"1" P=0 run records what it records today.
+POOL_BLOCKS = int(os.environ.get("NOSI_POOL_BLOCKS", "0") or 0)
+POOL_NONE, POOL_SWAP, POOL_MOVE_IN, POOL_MOVE_OUT = 0, 1, 2, 3
+POOL_SERVED = (POOL_SWAP, POOL_MOVE_IN)   # actions that served a block from HBM
+
 BLOCK_TOKENS = 64
 HEAD_DIM = 128
 BYTES_K = BLOCK_TOKENS * HEAD_DIM * 2          # 16384, bf16
 BYTES_V = BYTES_K
 BLOCK_BYTES_WIRE = BYTES_K + BYTES_V           # 32768 per loaded (head, request, slot)
 BYTES_BIAS_D2D = BLOCK_TOKENS * 2              # 128, device-to-device, not wire
+
+
+_LAYER_EVENTS = ("fetch_begin", "fetch_mid", "fetch_end", "attn_begin", "attn_end")
+_LAYER_EVENTS_POOL = _LAYER_EVENTS + ("pool_begin", "pool_end")
 
 
 def _ev():
@@ -89,7 +101,23 @@ class TransferTrace:
         self.layer: int | None = None
         self.mask_archive = None      # (max_steps, L, H, B, M) int64, device
         self.map_archive = None
+        self.pool_archive = None      # (max_steps, L, H, B, M) int8, device
+        self.pool_blocks = POOL_BLOCKS
         self.dropped_steps = 0        # steps beyond max_steps: recorded nowhere
+        # BOUND AT CONSTRUCTION, the way cache_engine.py binds `decode_update`,
+        # so that a P=0 mode-"1" run executes the SAME instrument it executed
+        # before the pool existed -- no per-event ternary and no per-event dict
+        # lookup, 160 of which would otherwise land inside every timed step.
+        # This is what keeps "P=0 is the upstream path" true of the instrument
+        # as well as of the engine.
+        self._event_names = _LAYER_EVENTS_POOL if POOL_BLOCKS > 0 else _LAYER_EVENTS
+        self._rec = self._rec_pool if POOL_BLOCKS > 0 else self._rec_plain
+        # WHICH ENGINE IS RUNNING decides whether the pool events exist, not the
+        # environment variable. cache_engine_gpu.py (NOSI_BENCH_OFFLOAD=0) has
+        # no pool and never calls pool_begin/pool_end, so with the knob set and
+        # offload off the events would be CREATED and never RECORDED, and
+        # elapsed_time() would raise inside harvest and lose the whole document.
+        self.pool_recorded = False
 
     # -- document / step boundaries ------------------------------------------
     def new_document(self):
@@ -123,15 +151,27 @@ class TransferTrace:
     def begin_layer(self, layer_idx: int):
         self.layer = layer_idx
         if self.cur is not None and self.full:
-            self.cur.layers[layer_idx] = {k: _ev() for k in
-                                          ("fetch_begin", "fetch_mid", "fetch_end", "attn_begin", "attn_end")}
+            self.cur.layers[layer_idx] = {k: _ev() for k in self._event_names}
 
-    def _rec(self, key: str):
+    def _rec_plain(self, key: str):
+        """The pre-pool recorder, bound when POOL_BLOCKS == 0: every key in
+        _LAYER_EVENTS exists, so there is nothing to look up defensively."""
         if self.cur is None or not self.full or self.layer is None:
             return
         d = self.cur.layers[self.layer]
         if d is not None:
             d[key].record()
+
+    def _rec_pool(self, key: str):
+        """Bound when POOL_BLOCKS > 0. A layer dict built before the knob was
+        read (or by another engine) may lack the pool keys, so miss quietly."""
+        if self.cur is None or not self.full or self.layer is None:
+            return
+        d = self.cur.layers[self.layer]
+        if d is not None:
+            e = d.get(key)
+            if e is not None:
+                e.record()
 
     def fetch_begin(self):
         self._rec("fetch_begin")
@@ -148,6 +188,15 @@ class TransferTrace:
     def attn_end(self):
         self._rec("attn_end")
 
+    def pool_begin(self):
+        # the flag is what harvest trusts: only the offload CacheEngine calls
+        # this, so it is proof the events were really recorded
+        self.pool_recorded = True
+        self._rec("pool_begin")
+
+    def pool_end(self):
+        self._rec("pool_end")
+
     def record_mask(self, load_mask: torch.Tensor, block_map: torch.Tensor):
         if self.cur is None or not self.full or self.layer is None:
             return
@@ -157,6 +206,17 @@ class TransferTrace:
             self.map_archive = torch.full(shape, -2, dtype=block_map.dtype, device=block_map.device)
         self.mask_archive[self.cur.index, self.layer].copy_(load_mask, non_blocking=True)
         self.map_archive[self.cur.index, self.layer].copy_(block_map, non_blocking=True)
+
+    def record_pool(self, pool_action: torch.Tensor):
+        """Victim pool only: archive this layer's per-attended-slot action code
+        (device-to-device, no sync), so `harvest` can count how many blocks the
+        pool served instead of the wire. Same shape as the load mask."""
+        if self.cur is None or not self.full or self.layer is None:
+            return
+        if self.pool_archive is None or self.pool_archive.shape[2:] != tuple(pool_action.shape):
+            shape = (self.max_steps, self.num_layers) + tuple(pool_action.shape)
+            self.pool_archive = torch.full(shape, -1, dtype=pool_action.dtype, device=pool_action.device)
+        self.pool_archive[self.cur.index, self.layer].copy_(pool_action, non_blocking=True)
 
     def record_scores(self, qk_scores: torch.Tensor, cis_scores: torch.Tensor):
         """Mode "scores" only: copy the (H, B, out_len) pooled score buffers of
@@ -181,12 +241,14 @@ class TransferTrace:
         torch.cuda.synchronize()
         step_rows, layer_rows, logits_rows = [], [], []
         n_steps = len(self.steps)
-        masks = maps = None
+        masks = maps = pools = None
         H = B = M = 0
         if self.full and self.mask_archive is not None:
             masks = self.mask_archive[:n_steps].cpu()
             maps = self.map_archive[:n_steps].cpu()
             _, _, H, B, M = masks.shape
+        if self.full and self.pool_archive is not None:
+            pools = self.pool_archive[:n_steps].cpu()
         for s in self.steps:
             if s.logits is not None:
                 lg = s.logits.float().cpu().contiguous()
@@ -206,6 +268,15 @@ class TransferTrace:
                     "transfer_ms": d["fetch_mid"].elapsed_time(d["fetch_end"]),
                     "attn_ms": d["attn_begin"].elapsed_time(d["attn_end"]),
                     "blocks_loaded": int((masks[s.index, l] >= 0).sum()) if masks is not None else -1,
+                    "pool_hits": (int(((pools[s.index, l] == POOL_SWAP) | (pools[s.index, l] == POOL_MOVE_IN)).sum())
+                                  if pools is not None else -1),
+                    # `"pool_begin" in d` alone is NOT enough: the key is created
+                    # from the env var but recorded only by cache_engine.py's
+                    # pooled decode, so an offload=0 run with the knob set would
+                    # raise "Both events must be recorded" here and lose the
+                    # document. self.pool_recorded is set by pool_begin itself.
+                    "pool_ms": (d["pool_begin"].elapsed_time(d["pool_end"])
+                                if (self.pool_recorded and "pool_begin" in d) else 0.0),
                     "fetch_in": bool(s.start.elapsed_time(d["fetch_begin"]) >= 0 and d["fetch_end"].elapsed_time(s.end) >= 0),
                     "attn_in": bool(s.start.elapsed_time(d["attn_begin"]) >= 0 and d["attn_end"].elapsed_time(s.end) >= 0),
                     "attn_after": bool(d["fetch_end"].elapsed_time(d["attn_begin"]) >= 0),
@@ -213,7 +284,8 @@ class TransferTrace:
                 layer_stats.append(st)
                 layer_rows.append({"step": s.index, "layer": l, "diff_ms": st["diff_ms"],
                                    "transfer_ms": st["transfer_ms"], "attn_ms": st["attn_ms"],
-                                   "blocks_loaded": st["blocks_loaded"]})
+                                   "blocks_loaded": st["blocks_loaded"],
+                                   "pool_hits": st["pool_hits"], "pool_ms": st["pool_ms"]})
             same = -1
             if masks is not None and B > 1:
                 same = int(bool((maps[s.index, :, :, 0, :] == maps[s.index, :, :, B - 1, :]).all()))
@@ -236,13 +308,34 @@ def aggregate_step(index: int, timed: bool, step_ms: float, layer_stats: list, H
       gamma        = 1 - blocks_loaded / (layers x H x B x M): the fraction of
                      the selected set already resident;
       new_blocks_per_head_layer = blocks_loaded / (layers x H x B).
+
+    VICTIM POOL (NOSI_POOL_BLOCKS > 0). Three more keys, ALWAYS present so the
+    steps.csv schema is one schema across pool sizes:
+      pool_hits    = attended slots served from the GPU victim pool instead of
+                     the wire (-1 when the pool archive is absent);
+      pool_ms      = sum over layers of the [pool_begin, pool_end] window. NOTE
+                     that window is NESTED INSIDE [fetch_begin, fetch_mid], so
+                     `diff_ms` INCLUDES it; `diff_only_ms` = diff_ms - pool_ms
+                     is the comparable-to-baseline diff_offload cost;
+      blocks_entering = blocks_loaded + pool_hits: how many blocks entered the
+                     selection. THIS IS THE SELF-CHECK THAT MATTERS. It is a
+                     property of the selection alone, so at a fixed cell it must
+                     be the SAME at every pool size while blocks_loaded falls.
+                     If it moves with the pool size, the pool has changed which
+                     blocks the model attends to and the cell is VOID.
+    `layer_stats` entries without the pool keys default to -1 / 0.0, so a
+    baseline row aggregates exactly as before.
     """
     n_rec = len(layer_stats)
     tr_ms = sum(s["transfer_ms"] for s in layer_stats)
     diff_ms = sum(s["diff_ms"] for s in layer_stats)
     attn_ms = sum(s["attn_ms"] for s in layer_stats)
+    pool_ms = sum(s.get("pool_ms", 0.0) for s in layer_stats)
     known = [s["blocks_loaded"] for s in layer_stats if s["blocks_loaded"] >= 0]
     loaded_total = sum(known) if known else -1
+    known_hits = [s.get("pool_hits", -1) for s in layer_stats if s.get("pool_hits", -1) >= 0]
+    pool_hits = sum(known_hits) if known_hits else -1
+    entering = (loaded_total + max(pool_hits, 0)) if loaded_total >= 0 else -1
     nbytes = loaded_total * BLOCK_BYTES_WIRE if loaded_total >= 0 else -1
     denom = n_rec * H * B * M
     return {
@@ -251,8 +344,13 @@ def aggregate_step(index: int, timed: bool, step_ms: float, layer_stats: list, H
         "step_ms": step_ms,
         "transfer_ms": tr_ms,
         "diff_ms": diff_ms,
+        "pool_ms": pool_ms,
+        "diff_only_ms": diff_ms - pool_ms,
         "attn_ms": attn_ms,
         "blocks_loaded": loaded_total,
+        "pool_hits": pool_hits,
+        "blocks_entering": entering,
+        "pool_blocks": POOL_BLOCKS,
         "block_bytes": BLOCK_BYTES_WIRE,
         "bytes": nbytes,
         "eff_gbps": (nbytes / tr_ms / 1e6) if (tr_ms > 0 and nbytes >= 0) else 0.0,
@@ -322,7 +420,8 @@ def dump(out_dir: str, doc_idx: int, meta: dict, timed_steps=(1, 2, 3, 4)) -> di
     timed = [r for r in step_rows if r["timed"]]
     summ = {}
     if timed:
-        for k in ("step_ms", "transfer_ms", "diff_ms", "attn_ms", "blocks_loaded", "bytes", "transfer_share", "gamma"):
+        for k in ("step_ms", "transfer_ms", "diff_ms", "pool_ms", "attn_ms", "blocks_loaded",
+                  "pool_hits", "blocks_entering", "bytes", "transfer_share", "gamma"):
             summ[k] = sum(r[k] for r in timed) / len(timed)
         summ["eff_gbps"] = (summ["bytes"] / summ["transfer_ms"] / 1e6) if summ["transfer_ms"] > 0 else 0.0
         summ["n_timed"] = len(timed)
