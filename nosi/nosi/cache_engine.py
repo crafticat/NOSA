@@ -36,8 +36,24 @@ diff = load(
 # indices topk .. topk+P-1 of the SAME cache tensors, BEYOND `_cache_lens`,
 # where flash_attn_nosa never reads (it takes no block table; it reads rows
 # 0.._cache_lens-1 as one flat sequence). So the attended set is still exactly
-# slots 0..topk-1 and the served output is unchanged; only WHERE a block is
-# read from moves, never WHICH blocks the model attends to.
+# slots 0..topk-1; only WHERE a block is read from moves, never WHICH blocks
+# the model attends to.
+#
+# THAT IS NOT ENOUGH ON ITS OWN, and job 2173299 proved it. "Attention never
+# READS past _cache_lens" does not imply "attention does not DEPEND on the
+# allocation": flash-attention picks its split-KV partition from
+# `kcache.size(1)` (flash_api.cpp:338 -> :224 -> :235 ->
+# flash_fwd_kernel.h:594), so a longer tensor recombines the partial softmax
+# accumulators in a different fp32 order and the bf16 logits move by one ULP.
+# At p=65 that flipped a near-tied top-k block on decode step 0 -- before the
+# pool had moved a single byte -- and the run diverged. The engine therefore
+# hands attention a VIEW of exactly topk*block_size rows (prefill_update
+# section 3c, and the return of the pooled decode below), which makes the
+# served output identical to p=0 by construction at every pool size.
+# NOTE the name of that method is deliberately NOT repeated here:
+# tests/test_nosi_pool_reference.py pins it to exactly two occurrences in this
+# file, the guarded bind and the def, so that a second binding site cannot
+# hide.
 #
 # P = 0 IS THE UPSTREAM PATH, BYTE FOR BYTE: nothing below is imported, no
 # extension is compiled, no tensor is allocated, no kernel is launched, and
@@ -94,6 +110,14 @@ class CacheEngine:
         self._v_cpu = None
         self._k_gpu = None
         self._v_gpu = None
+        # retroinfer-eval fork: the victim pool makes the three GPU tensors
+        # longer than the attended window, so the pooled decode hands attention
+        # a VIEW of the window instead of the whole allocation. Built in
+        # prefill_update; None until then, and never used on the p=0 path.
+        self._att_rows = None
+        self._k_gpu_att = None
+        self._v_gpu_att = None
+        self._kv_bias_gpu_att = None
 
 
         self.seq_length = 0
@@ -209,6 +233,54 @@ class CacheEngine:
                 self._v_gpu[:, self.topk * self.block_size:].zero_()
                 self._kv_bias_gpu[:, self.topk * self.block_size:].zero_()
 
+                # 3c. THE WINDOW ATTENTION IS ALLOWED TO SEE -- exactly topk
+                # blocks, at every pool size.
+                #
+                # WHY. flash-attention's split-KV partition is NOT a function of
+                # cache_seqlens. It is derived from the ALLOCATED length of the
+                # cache tensor: flash_api.cpp:338 takes `seqlen_k` from
+                # `kcache.size(1)`, :224 turns that into `num_n_blocks`, :235
+                # picks `num_splits` from it, and flash_fwd_kernel.h:594 cuts
+                # `n_blocks_per_split` out of it. Only :598 clamps the LAST
+                # block by the real `cache_seqlens`. So handing attention the
+                # padded tensor moves the seams at which the partial softmax
+                # accumulators are cut and recombined in fp32, which moves the
+                # bf16 logits by one ULP -- enough to flip a near-tied top-k
+                # block and send the whole autoregressive trace elsewhere.
+                #
+                # MEASURED (job 2173299, 16128 x 16, 64 steps, 2 documents):
+                # p=2 and p=4 happen to land on p=0's partition (6 splits of 6
+                # n-blocks) and were bit-identical on all 128 (doc, step) logit
+                # hashes; p=65 lands on 11 n-blocks per split and matched on 0
+                # of 128, with a maximum logit delta of 20.22 and argmax
+                # agreement 0.5938 on document 0. The pool bookkeeping was
+                # correct throughout -- the divergence is already present at
+                # decode step 0, where the pool has emitted nothing at all.
+                #
+                # WHY A VIEW IS SAFE. It is a narrow on dim 1, so stride(-1)
+                # stays 1 (the only contiguity flash-attn requires,
+                # flash_api.cpp:312-315) and every stride the kernel uses is
+                # read off the tensor it is given (flash_api.cpp:63, :66, :76,
+                # :78), batch stride included. The window is always long enough:
+                # `_cache_lens` is (topk-1)*block_size + _tail_block_len_on_gpu
+                # and the pooled decode asserts _tail_block_len_on_gpu <=
+                # block_size, so _cache_lens <= topk*block_size = _att_rows.
+                #
+                # WHAT MUST NOT BE NARROWED: flash_pool_swap and the two host
+                # gathers. They address the pool rows, and flash_pool_swap
+                # derives P from `S_GPU // block_size - topk`
+                # (flash_pool_swap.py), so a narrowed tensor would tell it the
+                # pool has no slots at all.
+                self._att_rows = self.topk * self.block_size
+                self._k_gpu_att = self._k_gpu[:, :self._att_rows]
+                self._v_gpu_att = self._v_gpu[:, :self._att_rows]
+                self._kv_bias_gpu_att = self._kv_bias_gpu[:, :self._att_rows]
+                # once, at prefill, so the decode path stays a bare return
+                assert (self._k_gpu_att.shape[1] == self._v_gpu_att.shape[1]
+                        == self._kv_bias_gpu_att.shape[1] == self._att_rows), (
+                    "the attended view is %d rows, not topk*block_size = %d"
+                    % (self._k_gpu_att.shape[1], self._att_rows))
+
             # 4. 直接把尾块在GPU上设置好
             self._tail_block_len_on_gpu = S % self.block_size
 
@@ -296,8 +368,12 @@ class CacheEngine:
         section B2 is copied verbatim from decode_update_has_kv_bias.
 
         What changes and what does not:
-          * _cache_lens is UNCHANGED, so the attended window is unchanged and
-            the served logits are unchanged.
+          * _cache_lens is UNCHANGED, and the tensors handed to attention are
+            VIEWS of exactly _att_rows = topk*block_size rows, so both the
+            length and the contents of what attention sees are identical to
+            p=0 and the served logits are identical to p=0. `_cache_lens`
+            alone is not sufficient -- see section 3c of prefill_update; that
+            was the defect job 2173299 measured.
           * the tail slot (self._tail_block_idx_on_gpu == topk-1) never enters
             the pool. It is excluded twice over: explicitly, by the tail_slot
             argument to pool_update, and implicitly, because the tail block id
@@ -407,7 +483,11 @@ class CacheEngine:
             self._cache_lens[...] = (self.topk - 1) * self.block_size + self._tail_block_len_on_gpu
 
 
-        return self._k_gpu, self._v_gpu, self._kv_bias_gpu, self._cache_lens 
+        # THE ONLY TENSORS THAT REACH ATTENTION (nosa_llama.py:493, :610).
+        # Views of the attended window, never the padded allocation -- see
+        # section 3c of prefill_update for why the length of this tensor,
+        # and not only its contents, changes the served logits.
+        return self._k_gpu_att, self._v_gpu_att, self._kv_bias_gpu_att, self._cache_lens
     
     def decode_update_no_kv_bias(self, key_states, value_states, kv_bias, topk_idx):
         # 将 key_states 和 value_states 放入 cache
