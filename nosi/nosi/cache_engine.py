@@ -4,6 +4,7 @@ import time
 from .flash_cache_engine.flash_h2d_mask import flash_h2d_from_mask
 from .flash_cache_engine.flash_h2d_mask_bias import flash_h2d_from_mask_bias
 from . import transfer_trace as _tt   # retroinfer-eval fork: event timing, off unless NOSI_TRANSFER_TRACE
+from . import avail_policy as _avail   # retroinfer-eval fork: restricted availability, off unless NOSI_AVAIL
 from torch.utils.cpp_extension import load
 from torch.cuda import nvtx
 import argparse
@@ -137,6 +138,29 @@ class CacheEngine:
         # binding is the only way P=0 provably executes the upstream body.
         self.pool_blocks = POOL_BLOCKS
         self._pool_stamp_base = 0
+        # retroinfer-eval fork: the availability hook and the victim pool must
+        # never run together. pool_update sits BETWEEN diff and the copy_ and may
+        # PARK the outgoing block Y of a slot in anticipation of a fetch that the
+        # hook would then deny: the slot would still hold Y while the pool also
+        # held Y, the map would name Y twice, and diff_offload's free-slot
+        # counting -- which needs pairwise distinct ids -- would break, producing
+        # a plausible, finite, WRONG output with no error. The pooled decode also
+        # hands attention a NARROWED VIEW, and combining a second mechanism with
+        # the length the split-KV partition is derived from is the defect job
+        # 2173299 measured at p=65. Refuse at construction, the way the pool
+        # already refuses an inconsistent configuration.
+        if _avail.SPEC not in ("", "0", "off") and POOL_BLOCKS > 0:
+            raise RuntimeError(
+                "NOSI_AVAIL=%r together with NOSI_POOL_BLOCKS=%d: the availability "
+                "hook and the victim pool may not run in the same process "
+                "(pool_update parks the victim of a fetch the hook can deny, which "
+                "duplicates a block id and breaks diff_offload's slot accounting)."
+                % (_avail.SPEC, POOL_BLOCKS))
+        if _avail.SPEC not in ("", "0", "off") and not has_kv_bias:
+            raise RuntimeError(
+                "NOSI_AVAIL=%r but this CacheEngine was built with has_kv_bias=False; "
+                "the availability hook is implemented only in decode_update_has_kv_bias, "
+                "so this run would silently execute an un-hooked path." % (_avail.SPEC,))
         if POOL_BLOCKS > 0 and not has_kv_bias:
             # NOSA-8B always takes the has_kv_bias path (nosa_llama.py:828,850).
             # Refuse rather than silently serve an un-pooled run that a manifest
@@ -337,13 +361,41 @@ class CacheEngine:
         _tr = _tt.TRACE
         if _tr is not None: _tr.fetch_begin()
         diff.diff_offload(self._block_map, topk_idx, self._new_block_map_buf, self._load_mask)
+        # B2. RESTRICTED AVAILABILITY (knob NOSI_AVAIL, avail_policy.py). It MUST
+        # sit here, between diff_offload and the copy_ below, because this is the
+        # only instant at which all three facts coexist: `_block_map` still holds
+        # the OLD occupant of every slot, `_new_block_map_buf` holds the REQUESTED
+        # occupant, and `_load_mask[h,b,m] >= 0` names exactly the blocks the
+        # selection newly reached, i.e. the ones that must come over the wire.
+        # `topk_idx` is READ and never written, so the model's own selection is
+        # identical at every availability level. With NOSI_AVAIL unset POLICY is
+        # None and not one line of the hook body executes.
+        _ap = _avail.POLICY
+        if _ap is not None:
+            _ap.on_diff(self._block_map, self._new_block_map_buf, self._load_mask,
+                        topk_idx, self._tail_block_idx_on_gpu)
         self._block_map.copy_(self._new_block_map_buf, non_blocking=True)
         if _tr is not None: _tr.fetch_mid()
 
         # C. 从disk取需要load进来的块
         flash_h2d_from_mask(self._k_gpu, self._k_cpu, self._load_mask, self.block_size)
         flash_h2d_from_mask_bias(self._v_gpu, self._v_cpu, self._kv_bias_gpu, kv_bias, self._load_mask, self.block_size)
-        if _tr is not None: _tr.fetch_end(); _tr.record_mask(self._load_mask, self._block_map)
+        if _tr is not None:
+            _tr.fetch_end()
+            # (b), THE LRU MISS COUNT AT THIS CAPACITY, IS READ BEFORE ANY
+            # DENIAL. In mech=stale the policy rewrote _load_mask to -1 on the
+            # denied slots a few lines above, so archiving the live tensor here
+            # would count every SUPPRESSED fetch as a hit and understate (b) by
+            # exactly the number of denials. pre_denial_mask() returns the clone
+            # taken before that rewrite, and None in every other case -- mask
+            # mode included, where the mask is untouched.
+            _mask_for_trace = self._load_mask
+            if _ap is not None:
+                _pre = _ap.pre_denial_mask()
+                if _pre is not None:
+                    _mask_for_trace = _pre
+            _tr.record_mask(_mask_for_trace, self._block_map)
+            if _ap is not None: _tr.record_avail(_ap.denied())
 
         # D. 处理写回逻辑 TODO: 测试时CUDA Graph没有包进来这里的逻辑
         if tail_full:

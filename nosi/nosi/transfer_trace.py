@@ -102,6 +102,7 @@ class TransferTrace:
         self.mask_archive = None      # (max_steps, L, H, B, M) int64, device
         self.map_archive = None
         self.pool_archive = None      # (max_steps, L, H, B, M) int8, device
+        self.avail_archive = None     # (max_steps, L, H, B, M) int8, device: denials
         self.pool_blocks = POOL_BLOCKS
         self.dropped_steps = 0        # steps beyond max_steps: recorded nowhere
         # BOUND AT CONSTRUCTION, the way cache_engine.py binds `decode_update`,
@@ -218,6 +219,31 @@ class TransferTrace:
             self.pool_archive = torch.full(shape, -1, dtype=pool_action.dtype, device=pool_action.device)
         self.pool_archive[self.cur.index, self.layer].copy_(pool_action, non_blocking=True)
 
+    def record_avail(self, denied: torch.Tensor):
+        """RESTRICTED AVAILABILITY only (avail_policy.py, knob NOSI_AVAIL):
+        archive this layer's per-attended-slot DENIAL mask, device-to-device and
+        with no synchronisation, modelled line for line on record_pool above.
+
+        THREE QUANTITIES, KEPT APART, and this archive holds the third.
+          (a) CAPACITY is a configuration number, not a measurement: 63 usable
+              attended slots (slot topk-1 is the tail, written locally and never
+              fetched) plus the pool, which is 0 for this pilot.
+          (b) THE LRU HIT FRACTION at that capacity is
+              1 - (slots with _load_mask >= 0) / 63, and `record_mask` above
+              already archives the mask it is read from.
+          (c) READY AT THE INSTANT THE DRAFT ATTENDS is 1 - denials / 63, and it
+              is the one that drives acceptance, because a block that is still in
+              flight is not usable however large the cache is.
+        A `denied` of None (a target step, or a draft step that denied nothing)
+        leaves the archive at 0 for that (step, layer), which is the correct
+        reading: nothing was withheld."""
+        if self.cur is None or not self.full or self.layer is None or denied is None:
+            return
+        if self.avail_archive is None or self.avail_archive.shape[2:] != tuple(denied.shape):
+            shape = (self.max_steps, self.num_layers) + tuple(denied.shape)
+            self.avail_archive = torch.zeros(shape, dtype=denied.dtype, device=denied.device)
+        self.avail_archive[self.cur.index, self.layer].copy_(denied, non_blocking=True)
+
     def record_scores(self, qk_scores: torch.Tensor, cis_scores: torch.Tensor):
         """Mode "scores" only: copy the (H, B, out_len) pooled score buffers of
         the current layer into the archive (device-to-device, no sync)."""
@@ -242,6 +268,7 @@ class TransferTrace:
         step_rows, layer_rows, logits_rows = [], [], []
         n_steps = len(self.steps)
         masks = maps = pools = None
+        avails = None
         H = B = M = 0
         if self.full and self.mask_archive is not None:
             masks = self.mask_archive[:n_steps].cpu()
@@ -249,6 +276,8 @@ class TransferTrace:
             _, _, H, B, M = masks.shape
         if self.full and self.pool_archive is not None:
             pools = self.pool_archive[:n_steps].cpu()
+        if self.full and self.avail_archive is not None:
+            avails = self.avail_archive[:n_steps].cpu()
         for s in self.steps:
             if s.logits is not None:
                 lg = s.logits.float().cpu().contiguous()
@@ -280,12 +309,32 @@ class TransferTrace:
                     "fetch_in": bool(s.start.elapsed_time(d["fetch_begin"]) >= 0 and d["fetch_end"].elapsed_time(s.end) >= 0),
                     "attn_in": bool(s.start.elapsed_time(d["attn_begin"]) >= 0 and d["attn_end"].elapsed_time(s.end) >= 0),
                     "attn_after": bool(d["fetch_end"].elapsed_time(d["attn_begin"]) >= 0),
+                    # AVAILABILITY, per (step, layer). blocks_requested_miss is
+                    # (b) the LRU miss count at this capacity, read BEFORE any
+                    # denial -- cache_engine.py hands record_mask the policy's
+                    # pre-denial clone in mech=stale, where the live mask has
+                    # already had the denied slots set to -1, and the live mask
+                    # everywhere else, where nothing rewrites it;
+                    # blocks_denied is what the policy withheld;
+                    # ready_slots is (c) what attention actually had. All three
+                    # count the 63 non-tail slots per (KV head, request), never
+                    # 64: slot topk-1 is the tail, written locally and never
+                    # fetched, so counting it would move every rate by ~1.6%.
+                    "blocks_requested_miss": (int((masks[s.index, l][..., :M - 1] >= 0).sum())
+                                              if masks is not None and M > 1 else -1),
+                    "blocks_denied": (int((avails[s.index, l][..., :M - 1] > 0).sum())
+                                      if avails is not None and M > 1 else -1),
+                    "ready_slots": (int(H * B * (M - 1) - (avails[s.index, l][..., :M - 1] > 0).sum())
+                                    if avails is not None and M > 1 else -1),
                 }
                 layer_stats.append(st)
                 layer_rows.append({"step": s.index, "layer": l, "diff_ms": st["diff_ms"],
                                    "transfer_ms": st["transfer_ms"], "attn_ms": st["attn_ms"],
                                    "blocks_loaded": st["blocks_loaded"],
-                                   "pool_hits": st["pool_hits"], "pool_ms": st["pool_ms"]})
+                                   "pool_hits": st["pool_hits"], "pool_ms": st["pool_ms"],
+                                   "blocks_requested_miss": st["blocks_requested_miss"],
+                                   "blocks_denied": st["blocks_denied"],
+                                   "ready_slots": st["ready_slots"]})
             same = -1
             if masks is not None and B > 1:
                 same = int(bool((maps[s.index, :, :, 0, :] == maps[s.index, :, :, B - 1, :]).all()))

@@ -23,6 +23,7 @@ from .cache_engine_gpu import InfLLMv2Cache as InfLLMv2CacheNoOffload
 from .max_pooling_fused import nosa_pooling
 from .nosa_linear import nosa_linear
 from . import transfer_trace as _tt   # retroinfer-eval fork: event timing, off unless NOSI_TRANSFER_TRACE
+from . import avail_policy as _avail   # retroinfer-eval fork: restricted availability, off unless NOSI_AVAIL
 from flash_attn import flash_attn_with_kvcache
 from flash_attn_nosa import flash_attn_with_kvcache as flash_attn_nosa_with_kvcache
 
@@ -358,6 +359,8 @@ class LlamaLayer:
         # [ATTN] prepare
         _tr = _tt.TRACE
         if _tr is not None: _tr.begin_layer(self.layer_idx)
+        _ap = _avail.POLICY
+        if _ap is not None: _ap.begin_layer(self.layer_idx)
         residual = hidden_states
         bsz, q_len, _ = hidden_states.size()
         max_pooling_buf = pooling_buf[:self.num_key_value_heads]
@@ -485,6 +488,7 @@ class LlamaLayer:
         # [ATTN] offloading-update
         nvtx.range_push("_offloading update")
         key_states, value_states, kv_bias, _cache_lens = cache_engine.decode_update_kv(key_states, value_states, ucis, self.layer_idx, topk_idx)
+        if _ap is not None: kv_bias = _ap.mask_bias(kv_bias)
         nvtx.range_pop()
         # [ATTN] stage 2
         nvtx.range_push("stage 2")
@@ -529,6 +533,8 @@ class LlamaLayer:
         # [ATTN] prepare
         _tr = _tt.TRACE
         if _tr is not None: _tr.begin_layer(self.layer_idx)
+        _ap = _avail.POLICY
+        if _ap is not None: _ap.begin_layer(self.layer_idx)
         residual = hidden_states
         bsz, q_len, _ = hidden_states.size()
         max_pooling_buf = pooling_buf[:self.num_key_value_heads]
@@ -601,6 +607,15 @@ class LlamaLayer:
         # [ATTN] offloading-update
         nvtx.range_push("offloading update")
         key_states, value_states, kv_bias, _cache_lens = cache_engine.decode_update_kv(key_states, value_states, ucis, self.layer_idx, topk_idx)
+        # RESTRICTED AVAILABILITY, mask mechanism (avail_policy.py, knob
+        # NOSI_AVAIL). Returns kv_bias itself unless this is a DENYING DRAFT step
+        # in mask mode, in which case it returns a scratch tensor of the same
+        # shape, stride and contiguity carrying a large negative FINITE bias on
+        # the 64 rows of every unavailable slot. _kv_bias_gpu is never written:
+        # it is persistent and the gather rewrites only the rows of slots that
+        # were actually fetched, so an in-place mask would poison every later
+        # step of the run silently.
+        if _ap is not None: kv_bias = _ap.mask_bias(kv_bias)
         nvtx.range_pop()
 
         # [ATTN] stage 2
@@ -766,6 +781,8 @@ class Llama:
             cache_engine = None, warmup=False):
         _tr = _tt.TRACE
         if _tr is not None: _tr.begin_step()
+        _ap = _avail.POLICY
+        if _ap is not None: _ap.begin_step()
         hidden_states = F.embedding(input_ids, self.embed_tokens)
         bsz, seq_len = input_ids.shape[0], input_ids.shape[1]
         max_seqlen = 1
