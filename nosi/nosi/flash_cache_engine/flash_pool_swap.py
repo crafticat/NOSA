@@ -73,10 +73,17 @@ import torch
 import triton
 import triton.language as tl
 
-POOL_NONE = 0
-POOL_SWAP = 1
-POOL_MOVE_IN = 2
-POOL_MOVE_OUT = 3
+# The action codes, shared with pool_update_kernel.cu (which #defines the same
+# four) and with transfer_trace.py. Triton refuses to close over a plain module
+# global, so each carries a `tl.constexpr` annotation: that makes it readable
+# from inside @triton.jit AND leaves it a perfectly ordinary int for Python
+# callers, the CPU reference and the parity harness. Job 2173294 died at gate 0
+# in three minutes without the annotations ("Cannot access global variable
+# POOL_NONE from within @jit'ed function"), which is what that gate is for.
+POOL_NONE: tl.constexpr = 0
+POOL_SWAP: tl.constexpr = 1
+POOL_MOVE_IN: tl.constexpr = 2
+POOL_MOVE_OUT: tl.constexpr = 3
 
 
 @triton.jit
