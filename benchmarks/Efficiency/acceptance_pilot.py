@@ -431,6 +431,11 @@ class Pilot:
                 "NOSI_AVAIL is unset, so the fork is upstream-exact and no availability "
                 "can be restricted. Set it, e.g. NOSI_AVAIL='mech=mask,C=63,d=1'.")
         self.points = parse_points(POINTS)
+        _np = os.environ.get("NOSI_ACC_NPOINTS")
+        if _np is not None and int(_np) != len(self.points):
+            raise SystemExit(f"NOSI_ACC_POINTS carries {len(self.points)} point(s) but the host "
+                             f"passed {_np}: the grid was TRUNCATED in transit (apptainer --env splits "
+                             f"on commas; use APPTAINERENV_). Refusing to measure a partial grid.")
         # THE LOWEST-AVAILABILITY MEASUREMENT POINT is what the hygiene and NaN
         # gates must exercise, so it is chosen HERE, from the parsed grid, before
         # anything is registered. A grid with no delayed point falls back to the
