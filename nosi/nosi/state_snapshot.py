@@ -160,6 +160,7 @@ class CacheSnapshot:
         hi = min(n, eng.seq_length + m)
         return (lo, hi)
 
+    @torch.inference_mode()   # the engine's tensors are inference tensors (decode runs under inference_mode); an in-place copy_ on them is only legal inside it (job 2174640)
     def take(self):
         cache = self.cache
         _sync_host_window()
@@ -187,6 +188,7 @@ class CacheSnapshot:
         self.taken = True
         return self
 
+    @torch.inference_mode()   # the engine's tensors are inference tensors (decode runs under inference_mode); an in-place copy_ on them is only legal inside it (job 2174640)
     def restore(self):
         if not self.taken:
             raise RuntimeError("restore() before take(): there is no verified state to go back to")
