@@ -17,6 +17,14 @@ from infllm_v2 import (
 )
 import time
 import torch.cuda.nvtx as nvtx
+import os
+# NOSI_ATTN_SPLITS: force flash-attn's split-KV count for the decode attention.
+# 0 = the library heuristic (flash_api.cpp:261-295), which turns splitting off once
+# batch * kv_heads >= 0.8 * 2 * SMs (batch >= 87 on an A100 for NOSA-8B) and then
+# doubles the per-request attention cost (retroinfer-eval scripts/nosi_attention_splits.py).
+# Any value > 0 changes the fp32 reduction order, so it is a different rounding
+# path from the shipped engine: compare arms only at equal NOSI_ATTN_SPLITS.
+_ATTN_SPLITS = int(os.environ.get("NOSI_ATTN_SPLITS", "0") or 0)
 
 from .cache_engine import InfLLMv2Cache
 from .cache_engine_gpu import InfLLMv2Cache as InfLLMv2CacheNoOffload
@@ -500,6 +508,7 @@ class LlamaLayer:
             value_states,
             kv_bias,
             cache_seqlens=_cache_lens,
+            num_splits=_ATTN_SPLITS,
         )
         if _tr is not None: _tr.attn_end()
         nvtx.range_pop()
@@ -628,6 +637,7 @@ class LlamaLayer:
             value_states,
             kv_bias,
             cache_seqlens=_cache_lens,
+            num_splits=_ATTN_SPLITS,
         )
         if _tr is not None: _tr.attn_end()
         nvtx.range_pop()
