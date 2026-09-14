@@ -487,14 +487,10 @@ class CacheEngine:
         # that (flash_h2d_mask.py:32-33), and because on a miss the outgoing
         # block must be parked before the gather overwrites slot s.
         #
-        # STREAMS. pool_update and the two Triton gathers all run on the CURRENT
-        # stream, so pool -> gather is ordered with no sync. The pairing that is
-        # NOT automatic is diff_offload -> pool_update: diff launches with a
-        # bare <<<>>> onto the LEGACY DEFAULT stream (diff_offload_kernel.cu),
-        # and PyTorch's other streams do not synchronize with it implicitly.
-        # pool_update therefore TORCH_CHECKs that the current stream IS the
-        # default one and refuses otherwise; do not wrap this decode in
-        # torch.cuda.stream() or capture it in a CUDA graph while that holds.
+        # STREAMS. diff_offload, pool_update and the Triton copies all use
+        # PyTorch's current device stream. Keep producer and consumers together.
+        # The host timestamp below still prevents replaying this entire method
+        # in a CUDA graph: capture would freeze its LRU ages.
         #
         # _new_block_map_buf is deliberately NOT touched: diff already wrote
         # new_map[s] = X for every loaded slot, and after either a pool hit or a

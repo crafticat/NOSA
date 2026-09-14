@@ -20,9 +20,11 @@ def flash_h2d_from_mask_kernel(
     D: tl.constexpr,
 ):
 
-    pid_b = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    pid_m = tl.program_id(2)
+    # Widen BEFORE multiplying by a stride: casting the final pointer cannot
+    # undo an int32 overflow at large batch/context or cache capacity.
+    pid_b = tl.program_id(0).to(tl.int64)
+    pid_h = tl.program_id(1).to(tl.int64)
+    pid_m = tl.program_id(2).to(tl.int64)
 
     # load offset
     cpu_block_id = tl.load(
