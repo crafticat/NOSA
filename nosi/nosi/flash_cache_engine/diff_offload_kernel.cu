@@ -1,4 +1,7 @@
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -113,11 +116,17 @@ void diff_offload_cuda(
 
     dim3 block(M);
 
-    diff_kernel<<<grid, block, sizeof(int64_t) * 2 * M>>>(
+    // The following pool/Triton kernels consume these outputs on PyTorch's
+    // current stream. A default-stream launch races them on nonblocking streams
+    // and cannot participate in the caller's CUDA graph.
+    c10::cuda::CUDAGuard device_guard(old_map.device());
+    const auto stream = at::cuda::getCurrentCUDAStream(old_map.get_device());
+    diff_kernel<<<grid, block, sizeof(int64_t) * 2 * M, stream>>>(
         old_map.data_ptr<int64_t>(),
         new_act.data_ptr<int64_t>(),
         new_map.data_ptr<int64_t>(),
         load_map.data_ptr<int64_t>(),
         H, B, M
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

@@ -61,20 +61,15 @@
 // Modelled line for line on diff_offload_kernel.cu (the O(M) rank-then-select
 // at :62-87 is the same pattern).
 //
-// STREAM PRECONDITION, inherited from the producer. diff_offload_kernel.cu:116
-// launches with a bare <<<grid,block,smem>>>, i.e. onto the LEGACY DEFAULT
-// stream. This kernel consumes what that one writes (`load_mask`) and mutates
-// state that persists across decode steps (`pool_map`, `pool_age`), so the two
-// must be ordered. PyTorch's non-default streams are created with
-// cudaStreamNonBlocking and do NOT implicitly synchronize with the legacy
-// stream, so ordering holds only while the current stream IS the default one.
-// pool_update_cuda below therefore TORCH_CHECKs exactly that and refuses
-// otherwise; it is a hard precondition, not a stylistic choice. (Wrapping the
-// decode in `with torch.cuda.stream(s)` or capturing it in a CUDA graph would
-// break it; the fix then is to move diff_offload onto the current stream too.)
+// STREAM ORDERING: diff_offload now launches on PyTorch's current device
+// stream, just like the pool and Triton copies. All callers must enqueue the
+// producer and its consumers in the same stream, or supply explicit events.
+// This removes the old default-stream restriction; it does not make the host
+// LRU timestamp or the entire decode loop CUDA-graph replay safe.
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -290,17 +285,9 @@ void pool_update_cuda(
                 "victim pool needs ", smem, " B of shared memory for P=", P,
                 " M=", M, ", above the 48 KB static limit; lower NOSI_POOL_BLOCKS");
 
-    // See STREAM PRECONDITION at the top of this file. diff_offload, which
-    // writes the load_mask this kernel reads, launches onto the legacy default
-    // stream; PyTorch's other streams do not synchronize with it implicitly.
-    // getCurrentCUDAStream().stream() is nullptr exactly for the default stream.
-    TORCH_CHECK(at::cuda::getCurrentCUDAStream(block_map.device().index()).stream() == nullptr,
-                "the victim pool requires the legacy default stream: its producer "
-                "diff_offload_kernel.cu launches with a bare <<<>>> and nothing "
-                "would order the two. Do not wrap the decode in torch.cuda.stream() "
-                "or capture it in a CUDA graph while that holds.");
-
-    pool_update_kernel<<<grid, block, smem, at::cuda::getCurrentCUDAStream()>>>(
+    c10::cuda::CUDAGuard device_guard(block_map.device());
+    const auto stream = at::cuda::getCurrentCUDAStream(block_map.get_device());
+    pool_update_kernel<<<grid, block, smem, stream>>>(
         block_map.data_ptr<int64_t>(),
         load_mask.data_ptr<int64_t>(),
         pool_map.data_ptr<int64_t>(),
