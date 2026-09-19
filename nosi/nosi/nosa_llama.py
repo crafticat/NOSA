@@ -37,6 +37,7 @@ from .nosa_linear import nosa_linear
 from . import transfer_trace as _tt   # retroinfer-eval fork: event timing, off unless NOSI_TRANSFER_TRACE
 from . import avail_policy as _avail   # retroinfer-eval fork: restricted availability, off unless NOSI_AVAIL
 from .verify.verify_step import verify_attention   # retroinfer-eval fork: Path 1 verify attention (pure torch until called)
+from . import verify_trace as _vtr   # retroinfer-eval fork: event brackets of one verify call, off unless the cost pilot binds TRACE
 from flash_attn import flash_attn_with_kvcache
 from flash_attn_nosa import flash_attn_with_kvcache as flash_attn_nosa_with_kvcache
 
@@ -686,6 +687,8 @@ class LlamaLayer:
         the DECODE's (one token per request), consumed by the per-position
         stage 1. Needs the warm-up decode step's buffers and graph.
         """
+        _vt = _vtr.TRACE   # cost brackets (verify_trace.py); None in every gate mode
+        if _vt is not None: _vt.begin_layer(self.layer_idx)
         residual = hidden_states
         bsz, U, _ = hidden_states.size()
         max_pooling_buf = pooling_buf[:self.num_key_value_heads]
@@ -705,6 +708,7 @@ class LlamaLayer:
         value_states = value_states.reshape(bsz, U, self.num_key_value_heads, self.head_dim)
 
         # scoring, ONE POSITION AT A TIME, on the state that position sees (spec 2c)
+        if _vt is not None: _vt.rec("score_begin")
         sels = []
         ucis = None
         for u in range(U):
@@ -736,10 +740,13 @@ class LlamaLayer:
         sel = torch.stack(sels, dim=0)              # (U, H, B, K)
 
         # the round: U tail rows + mirror, the union, its fetch (cache_engine.verify_round_update)
+        if _vt is not None: _vt.rec("fetch_begin")
         k_all, v_all, kv_bias_all, rnd = cache_engine.verify_round_update_kv(key_states, value_states, ucis, self.layer_idx, sel)
+        if _vt is not None: _vt.rec("fetch_end")
         self._verify_last_round = rnd               # diagnostics for the pilot (n_new, overflow); never read by the decode path
 
         attn_output = verify_attention(query_states.reshape(bsz * U, self.num_heads, self.head_dim), k_all, v_all, kv_bias_all, rnd)
+        if _vt is not None: _vt.rec("attn_end")
         attn_output = attn_output.view(bsz, U, -1)
         hidden_states = F.linear(attn_output, self.wo)
         hidden_states = residual + hidden_states
@@ -952,12 +959,15 @@ class Llama:
             "warm-up decode step (decode_inference with warmup=True) -- run one shipped step first")
         bsz, U = input_ids.shape
         assert tuple(position_ids.shape) == (bsz, U), (tuple(position_ids.shape), (bsz, U))
+        _vt = _vtr.TRACE
+        if _vt is not None: _vt.begin_call()
         hidden_states = F.embedding(input_ids, self.embed_tokens)
         max_seqlen = 1
         for idx in range(self.num_layers):
             hidden_states = self.layers[idx].verify_forward(hidden_states, position_ids, self.cos_sin_cache, cu_seqlens, max_seqlen, cache_engine, self.pooling_buf_all, self.topk_val_buf_q, self.topk_idx_buf_q, self.topk_val_buf, self.topk_idx_buf, self.mask_buf)
         hidden_states = layer_norm(hidden_states, w=self.norm_weight, eps=self.norm_variance_epsilon)
         logits = F.linear(hidden_states, self.lm_head).float()
+        if _vt is not None: _vt.end_call()
         return logits
 
     @torch.inference_mode()
