@@ -797,11 +797,21 @@ class Llama:
         bsz, seq_len = input_ids.shape[0], input_ids.shape[1]
         max_seqlen = 1
 
-        cache_lens = cache_engine.get_seq_length(0)
-        cache_lens = torch.tensor([cache_lens] * bsz, dtype=torch.int, device=hidden_states.device)
-        q_idx = cache_lens // self.block_size
-
         warmup = not self.has_buffers
+
+        # ORDINARY FIX A (retroinfer-eval stage 2, 2026-09-19): cache_lens / q_idx
+        # are read only by decode_forward_warmup. Building them from a Python
+        # list every step was a pageable host-to-device copy, i.e. a full stream
+        # sync that left the host with no lead over the GPU for the ~1000 eager
+        # launches of a step. decode_forward takes the parameters but never reads
+        # them (attention uses _cache_lens from decode_update_kv), so the steady
+        # state passes None and computes nothing.
+        if warmup:
+            cache_lens = cache_engine.get_seq_length(0)
+            cache_lens = torch.tensor([cache_lens] * bsz, dtype=torch.int, device=hidden_states.device)
+            q_idx = cache_lens // self.block_size
+        else:
+            cache_lens = q_idx = None
 
         if warmup:
             total_len = cache_engine.get_seq_length(0) + 1
