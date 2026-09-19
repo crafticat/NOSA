@@ -36,6 +36,7 @@ from .max_pooling_fused import nosa_pooling
 from .nosa_linear import nosa_linear
 from . import transfer_trace as _tt   # retroinfer-eval fork: event timing, off unless NOSI_TRANSFER_TRACE
 from . import avail_policy as _avail   # retroinfer-eval fork: restricted availability, off unless NOSI_AVAIL
+from .verify.verify_step import verify_attention   # retroinfer-eval fork: Path 1 verify attention (pure torch until called)
 from flash_attn import flash_attn_with_kvcache
 from flash_attn_nosa import flash_attn_with_kvcache as flash_attn_nosa_with_kvcache
 
@@ -666,6 +667,95 @@ class LlamaLayer:
         return hidden_states
 
 
+    @torch.inference_mode()
+    def verify_forward(self, hidden_states, position_ids, cos_sin_cache, cu_seqlens, max_seqlen, cache_engine, pooling_buf, topk_val_buf_q, topk_idx_buf_q, topk_val_buf, topk_idx_buf, mask_buf):
+        """ONE VERIFY ROUND of U positions through Path 1 (retroinfer-eval fork;
+        spec 2026-09-19-multiposition-verify-path1.md, sections 1, 2c).
+
+        decode_forward applied to (B, U, hidden) at once, with two differences.
+        (i) The SCORING runs once per position through the decode kernels: the
+        same stage 1 + captured pooling/top-k graph, fed by the same one-token
+        state updates (compress-k, cis) the decode makes at that position, so
+        position j's selection is the decode's selection at step j (spec O1).
+        (ii) The attention is the prefill's varlen block-sparse kernel over the
+        engine's UNION store (verify_step.verify_attention), every query masked
+        to its own selection, instead of flash_attn_nosa over the 64-slot
+        window; the engine's verify_round_update writes the U tail rows, builds
+        the union and fetches it. Everything else (prenorm, qkv, cis, rope, wo,
+        FFN) is the decode text. position_ids (B, U); cu_seqlens/max_seqlen are
+        the DECODE's (one token per request), consumed by the per-position
+        stage 1. Needs the warm-up decode step's buffers and graph.
+        """
+        residual = hidden_states
+        bsz, U, _ = hidden_states.size()
+        max_pooling_buf = pooling_buf[:self.num_key_value_heads]
+        max_pooling_buf_cis = pooling_buf[self.num_key_value_heads:]
+
+        hidden_states = layer_norm(hidden_states, self.input_layernorm_variance_epsilon, self.input_layernorm_weight)
+        qkv = F.linear(hidden_states, self.wqkv)
+        query_states, key_states, value_states, cis = nosa_linear(qkv, self.delta.weight, self.A, self.q_size, self.kv_size, self.num_key_value_heads)
+
+        # rope at positions L+u, all U tokens at once (flat rows = (b, u) request-major)
+        query_states = query_states.view(bsz * U, -1)
+        key_states = key_states.view(bsz * U, -1)
+        apply_rope_with_cos_sin_cache_inplace(position_ids.flatten(), query_states, key_states, self.head_dim, cos_sin_cache, True)
+
+        query_states = query_states.reshape(bsz, U, self.num_heads, self.head_dim)
+        key_states = key_states.reshape(bsz, U, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.reshape(bsz, U, self.num_key_value_heads, self.head_dim)
+
+        # scoring, ONE POSITION AT A TIME, on the state that position sees (spec 2c)
+        sels = []
+        ucis = None
+        for u in range(U):
+            no_compress_k = cache_engine.update_no_compress_k_decode(key_states[:, u:u+1], self.layer_idx, self.pooling_block_size, self.pooling_stride)
+            if no_compress_k is not None:
+                new_compressed_k = no_compress_k.mean(dim=1, keepdim=True)
+            else:
+                new_compressed_k = None
+            compressed_k, cu_seqlens_comp, max_seqlen_comp = cache_engine.update_compress_k_decode(new_compressed_k, self.layer_idx)
+            compressed_k = compressed_k.contiguous().flatten(0, 1)
+
+            ucis = cache_engine.update_uncompressed_cis(cis[:, u:u+1], self.layer_idx, 0, bsz)
+            compressed_cis = cache_engine.update_cis(cis[:, u:u+1].permute(2, 0, 1), self.layer_idx, 0, bsz)   # (H, B, M)
+
+            score = infllmv2_attn_stage1_fast(
+                query_states[:, u].contiguous(),
+                compressed_k,
+                compressed_k,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens_comp,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen_comp,
+                causal=False,
+            )
+            self.score_buf.copy_(score)
+            self.compressed_cis_buf.copy_(compressed_cis)
+            self.after_pooling_graph.replay()
+            sels.append(topk_idx_buf.clone())       # (H, B, K) int64; the buffer is rewritten by the next replay
+        sel = torch.stack(sels, dim=0)              # (U, H, B, K)
+
+        # the round: U tail rows + mirror, the union, its fetch (cache_engine.verify_round_update)
+        k_all, v_all, kv_bias_all, rnd = cache_engine.verify_round_update_kv(key_states, value_states, ucis, self.layer_idx, sel)
+        self._verify_last_round = rnd               # diagnostics for the pilot (n_new, overflow); never read by the decode path
+
+        attn_output = verify_attention(query_states.reshape(bsz * U, self.num_heads, self.head_dim), k_all, v_all, kv_bias_all, rnd)
+        attn_output = attn_output.view(bsz, U, -1)
+        hidden_states = F.linear(attn_output, self.wo)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = layer_norm(hidden_states, self.post_attention_layernorm_variance_epsilon, self.post_attention_layernorm_weight)
+        hidden_states = F.linear(hidden_states, self.gate_up_proj)
+        dd = hidden_states.shape[-1] // 2
+        output_shape = (hidden_states.shape[:-1] + (dd, ))
+        out = torch.empty(output_shape, dtype=hidden_states.dtype, device=hidden_states.device)
+        silu_and_mul(hidden_states, out)
+        hidden_states = F.linear(out, self.down_proj)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
 class Llama:
     def __init__(self, 
         model_name: str = "gradientai/Llama-3-8B-Instruct-Gradient-1048k",
@@ -847,6 +937,27 @@ class Llama:
         logits = F.linear(hidden_states, self.lm_head).float()
         if _tr is not None: _tr.record_logits(logits); _tr.end_step()
         
+        return logits
+
+    @torch.inference_mode()
+    def verify_inference(self, input_ids: torch.LongTensor, cu_seqlens: torch.Tensor, position_ids: torch.LongTensor, cache_engine=None):
+        """Path 1 verify round over U = input_ids.shape[1] positions
+        (retroinfer-eval fork): fp32 logits (B, U, V), one row per position.
+        input_ids (B, U), position_ids (B, U); cu_seqlens the decode's
+        arange(B+1). The engine must have been built with
+        NOSI_VERIFY_ROUND_SLOTS > 0 and the warm-up decode step must have run
+        (the buffers and the captured pooling graph are the model's)."""
+        assert self.has_buffers, (
+            "verify_inference needs the buffers and the captured pooling graph of the "
+            "warm-up decode step (decode_inference with warmup=True) -- run one shipped step first")
+        bsz, U = input_ids.shape
+        assert tuple(position_ids.shape) == (bsz, U), (tuple(position_ids.shape), (bsz, U))
+        hidden_states = F.embedding(input_ids, self.embed_tokens)
+        max_seqlen = 1
+        for idx in range(self.num_layers):
+            hidden_states = self.layers[idx].verify_forward(hidden_states, position_ids, self.cos_sin_cache, cu_seqlens, max_seqlen, cache_engine, self.pooling_buf_all, self.topk_val_buf_q, self.topk_idx_buf_q, self.topk_val_buf, self.topk_idx_buf, self.mask_buf)
+        hidden_states = layer_norm(hidden_states, w=self.norm_weight, eps=self.norm_variance_epsilon)
+        logits = F.linear(hidden_states, self.lm_head).float()
         return logits
 
     @torch.inference_mode()

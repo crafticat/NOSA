@@ -78,12 +78,35 @@ POOL_BLOCKS = int(os.environ.get("NOSI_POOL_BLOCKS", "0") or 0)
 # written into _kv_bias_gpu; sqrt(128) = 11.3137085 makes the decode kernel
 # apply cis in logit units. It is a PROBE knob: nothing else reads it.
 KV_BIAS_SCALE = float(os.environ.get("NOSI_KV_BIAS_SCALE", "1.0") or 1.0)
+# NOSI_VERIFY_ROUND_SLOTS (retroinfer-eval fork, 2026-09-19; default 0 = the
+# shipped layout, byte for byte). The exact multi-position verifier (spec
+# docs/superpowers/specs/2026-09-19-multiposition-verify-path1.md, sections 1-2)
+# needs R extra block slots per (layer, KV head, request) -- the ROUND REGION,
+# bump-allocated with the blocks a verify round's selections reach -- plus a
+# 2-slot TAIL MIRROR at the END of the allocation, because the prefill varlen
+# kernel's causal rule (IV2 mask.h:181-185) needs the U new tokens to be the
+# LAST U rows of the request's flat sequence and the decode's live tail at slot
+# topk-1 is last only inside the 64-slot window. With R > 0 the allocation is
+# topk + R + 2 slots; the DECODE kernel still receives the 64-slot views of
+# prefill_update section 3c (the split-KV partition is derived from the
+# allocated length, job 2173299), so the served decode logits are identical to
+# R = 0 by construction (pilot gate T0). Read once, here, like POOL_BLOCKS.
+VERIFY_ROUND_SLOTS = int(os.environ.get("NOSI_VERIFY_ROUND_SLOTS", "0") or 0)
 
 
 def _bias_rows(kv_bias):
     """The kv_bias rows as written to the GPU cache, scaled by KV_BIAS_SCALE (a
     no-op that returns the input tensor itself when the scale is exactly 1)."""
     return kv_bias if KV_BIAS_SCALE == 1.0 else kv_bias * KV_BIAS_SCALE
+_us = None
+_tw = None
+_vs = None
+if VERIFY_ROUND_SLOTS > 0:
+    # pure torch, no extension; imported only under the knob so that R = 0
+    # imports exactly what the shipped engine imports
+    from .verify import union_store as _us
+    from .verify import tail_write as _tw
+    from .verify import verify_step as _vs
 _pool = None
 _flash_pool_swap = None
 if POOL_BLOCKS > 0:
@@ -188,7 +211,35 @@ class CacheEngine:
             self.decode_update = self.decode_update_has_kv_bias_pool
         else:
             self.decode_update = self.decode_update_has_kv_bias if has_kv_bias else self.decode_update_no_kv_bias
-        
+        # retroinfer-eval fork: the exact multi-position verifier's round region
+        # and tail mirror (knob NOSI_VERIFY_ROUND_SLOTS, see the knob's comment).
+        # Refusals at construction, the pool's precedent: v1 has no victim pool
+        # (spec 2c), the round update exists only for the has_kv_bias engine,
+        # and the availability hook is not carried into the verify path.
+        self.verify_round_slots = VERIFY_ROUND_SLOTS
+        self._verify_slots = VERIFY_ROUND_SLOTS + 2 if VERIFY_ROUND_SLOTS > 0 else 0
+        if VERIFY_ROUND_SLOTS > 0 and POOL_BLOCKS > 0:
+            raise RuntimeError(
+                "NOSI_VERIFY_ROUND_SLOTS=%d together with NOSI_POOL_BLOCKS=%d: the "
+                "verify round region (v1) and the victim pool may not run in the "
+                "same process (spec 2c: pool members join the union in v2)"
+                % (VERIFY_ROUND_SLOTS, POOL_BLOCKS))
+        if VERIFY_ROUND_SLOTS > 0 and not has_kv_bias:
+            raise RuntimeError(
+                "NOSI_VERIFY_ROUND_SLOTS=%d but this CacheEngine was built with "
+                "has_kv_bias=False; the verify round update is implemented only "
+                "for the has_kv_bias engine" % VERIFY_ROUND_SLOTS)
+        if VERIFY_ROUND_SLOTS > 0 and _avail.SPEC not in ("", "0", "off"):
+            raise RuntimeError(
+                "NOSI_AVAIL=%r together with NOSI_VERIFY_ROUND_SLOTS=%d: the "
+                "availability hook is not carried into the verify path"
+                % (_avail.SPEC, VERIFY_ROUND_SLOTS))
+        if VERIFY_ROUND_SLOTS > 0:
+            # THE DECODE MUST RECEIVE THE 64-SLOT VIEWS (prefill_update section
+            # 3c), never the padded allocation: flash-attention derives its
+            # split-KV partition from kcache.size(1) (job 2173299).
+            self.decode_update = self.decode_update_has_kv_bias_verify_slots
+
         
     def prefill_update(self, key_states, value_states, kv_bias, current_batch_pos, total_bsz):
         # 将 key_states 和 value_states 放入 cache
@@ -214,8 +265,12 @@ class CacheEngine:
             # retroinfer-eval fork: + self.pool_blocks victim slots, which live
             # past _cache_lens and are therefore invisible to attention. The
             # expression is IDENTICAL to upstream when pool_blocks == 0.
-            _gpu_slots = self.topk + self.pool_blocks
-            if self.pool_blocks > 0:
+            # retroinfer-eval fork, verifier: + self._verify_slots = R + 2 (the
+            # round region and the 2-slot tail mirror, spec 2b), 0 unless
+            # NOSI_VERIFY_ROUND_SLOTS > 0; the slot arithmetic is
+            # verify/union_store.union_layout (tests/test_nosi_verify_engine.py).
+            _gpu_slots = self.topk + self.pool_blocks + self._verify_slots
+            if self.pool_blocks > 0 or self._verify_slots > 0:
                 # THE INT32 ENVELOPE, re-derived because the pool moves one half
                 # of it. flash_h2d_from_mask{,_bias} do NOT cast their program
                 # ids (flash_h2d_mask.py:23-25, :48-54), so `pid_b * stride_b`
@@ -224,9 +279,10 @@ class CacheEngine:
                 #              (the measured wall: 64K x 112 passes, x120 aborts)
                 #   GPU side   B * (topk + P) * block_size * H * D < 2**31,
                 #              which the pool DIVIDES by (topk+P)/topk.
-                # Guarded to the pooled path so p=0 stays upstream byte for byte;
-                # env/slurm/nosi_pool.sbatch refuses out-of-envelope cells for
-                # every p, before any GPU time is spent.
+                # Guarded to the pooled path (and, spec 2b, to the verifier's
+                # round slots, which lengthen the same tensors) so p=0 stays
+                # upstream byte for byte; env/slurm/nosi_pool.sbatch refuses
+                # out-of-envelope cells for every p, before any GPU time is spent.
                 _hd = H * D
                 assert total_bsz * (S + self.max_gen_len) * _hd < 2**31, (
                     "host-side int32 gather overflow: B=%d S=%d -> %d elements"
@@ -272,8 +328,27 @@ class CacheEngine:
                 self._v_gpu[:, self.topk * self.block_size:].zero_()
                 self._kv_bias_gpu[:, self.topk * self.block_size:].zero_()
 
+            if self._verify_slots > 0:
+                # 3b'. retroinfer-eval fork, verifier: the round region
+                # (slots topk .. topk+R-1) and the tail mirror (W-2, W-1) sit
+                # past _cache_lens, invisible to the decode kernel, which is
+                # handed the views of section 3c below. _round_map is the
+                # fetch list of the LAST verify round (scratch: reset every
+                # round, never snapshotted). The extra rows are zeroed so that
+                # exp(kv_bias) * v over the WHOLE allocation (verify_step.py,
+                # the prefill's V * exp(cis) trick) is finite on every row the
+                # kernel could load: a masked-out row with a NaN value would
+                # still poison P.V through 0 * NaN. Prefill time only.
+                self._round_map = torch.full((H, total_bsz, self.verify_round_slots), -1, dtype=torch.int64, device=self.device)
+                self._k_gpu[:, self.topk * self.block_size:].zero_()
+                self._v_gpu[:, self.topk * self.block_size:].zero_()
+                self._kv_bias_gpu[:, self.topk * self.block_size:].zero_()
+
+            if self.pool_blocks > 0 or self._verify_slots > 0:
                 # 3c. THE WINDOW ATTENTION IS ALLOWED TO SEE -- exactly topk
-                # blocks, at every pool size.
+                # blocks, at every pool size (and at every verify round size,
+                # which lengthens the same three tensors: the verifier reads
+                # the whole allocation, the decode kernel never does).
                 #
                 # WHY. flash-attention's split-KV partition is NOT a function of
                 # cache_seqlens. It is derived from the ALLOCATED length of the
@@ -346,7 +421,115 @@ class CacheEngine:
         self._v_cpu[current_batch_pos:current_batch_pos+B, :S, :, :].copy_(value_states, non_blocking=True)
 
         return
-    
+
+    # -----------------------------------------------------------------------
+    # retroinfer-eval fork: EXACT MULTI-POSITION VERIFIER, Path 1 (knob
+    # NOSI_VERIFY_ROUND_SLOTS; spec 2026-09-19-multiposition-verify-path1.md).
+    # Two methods, bound at construction the way the pool variant is bound.
+    # Neither edits the three S == 1 decode bodies below (the P = 0 promise
+    # above; tests/test_nosi_verify_engine.py pins their text).
+    # -----------------------------------------------------------------------
+    def decode_update_has_kv_bias_verify_slots(self, key_states, value_states, kv_bias, topk_idx):
+        """The upstream S == 1 decode, then the 64-slot VIEWS instead of the
+        padded allocation (NOSI_VERIFY_ROUND_SLOTS > 0).
+
+        The body is not copied: it is CALLED, so the shipped tail write, diff,
+        gathers and write-back execute verbatim (hook included). Only the
+        return changes, for the reason prefill_update section 3c gives: the
+        decode kernel's split-KV partition is a function of the ALLOCATED
+        length, so it must see exactly topk*block_size rows at every R
+        (pilot gate T0 = these logits hash-identical to R = 0).
+        """
+        self.decode_update_has_kv_bias(key_states, value_states, kv_bias, topk_idx)
+        return self._k_gpu_att, self._v_gpu_att, self._kv_bias_gpu_att, self._cache_lens
+
+    def verify_round_update(self, key_states, value_states, kv_bias, sel):
+        """ONE VERIFY ROUND of U tokens (spec 2a-2c): the tail writes, the
+        union store and its fetch. Returns the WHOLE allocation plus a
+        VerifyRound describing it, for verify_step.verify_attention.
+
+        key_states, value_states: (B, U, H, D), the U new tokens in order.
+        kv_bias: the layer's total_cis table (B, L, H), indexed exactly as the
+            S == 1 write indexes it (row seq_length-1 after each increment).
+        sel: (U, H, B, K) int64, the per-position selections (block ids, -1
+            padded), each scored with the decode kernels on the state the
+            position sees (nosa_llama.LlamaLayer.verify_forward).
+
+        WHAT IT DOES, in order (every step is a pure-torch helper or a shipped
+        gather; tests/test_nosi_verify_engine.py executes this very body on
+        CPU with the gathers replaced by their twins):
+          A. captures the window map and the tail id T BEFORE any write (a
+             rollover renames slot topk-1 to T+1, and the union needs T);
+          B. tail_write.write_tail: the S == 1 tail semantics replayed per
+             token (seq_length, _cache_lens, the slot topk-1 rows, the
+             write-back and the rename on a fill) plus the MIRROR rows at
+             W-2/W-1; the bias rows go through _bias_rows exactly as the four
+             shipped write sites do;
+          C. union_store.build_union: new blocks bump-allocated in the round
+             region, per-query masks over union slot ids (the tail T maps to
+             W-2, T+1 to W-1, slot topk-1 is never named), overflow/invalid
+             detected and REFUSED (RoundOverflow), never truncated;
+          D. the fetch of the round region through the shipped Triton gathers
+             on a VIEW of the region: they read strides and S_GPU off the
+             tensor they are given (flash_h2d_mask.py:71-77,
+             flash_h2d_mask_bias.py:369-377) and the bias rows off the same
+             total_cis table the decode passes (raw, as at the decode's gather).
+        NOT done, on purpose: no diff kernel and no window-map copy (the window
+        does not move inside a round, spec 2c), no load mask, no trace hooks.
+        The one host sync is the overflow/invalid read in C.
+        """
+        B, U, H, D = key_states.shape
+        assert H == self.head_num and D == self.head_dim and U >= 1, (
+            "key_states %s: expected (B, U >= 1, H=%d, D=%d)" % (tuple(key_states.shape), self.head_num, self.head_dim))
+        assert tuple(value_states.shape) == (B, U, H, D), (
+            "value_states %s != key_states %s" % (tuple(value_states.shape), (B, U, H, D)))
+        assert self.verify_round_slots > 0, (
+            "NOSI_VERIFY_ROUND_SLOTS=0: this engine has no round region and no tail mirror")
+        assert self.pool_blocks == 0, "verify round v1 runs without the victim pool (spec 2c)"
+        assert sel.dtype == torch.int64 and sel.dim() == 4 and tuple(sel.shape[:3]) == (U, H, B), (
+            "sel must be int64 (U=%d, H=%d, B=%d, K), got %s %s" % (U, H, B, sel.dtype, tuple(sel.shape)))
+        assert self._k_gpu.shape[0] == B and kv_bias.shape[0] == B, (
+            "batch mismatch: _k_gpu %d, kv_bias %d, key_states %d" % (self._k_gpu.shape[0], kv_bias.shape[0], B))
+        lay = _us.union_layout(self.topk, self.pool_blocks, self.verify_round_slots)
+        assert self._k_gpu.shape[1] == lay.W * self.block_size, (
+            "the allocation has %d rows but the layout has W=%d slots of %d rows"
+            % (self._k_gpu.shape[1], lay.W, self.block_size))
+        assert self._tail_block_idx_on_gpu == lay.tail_slot
+
+        # A. round start (spec 2c): the window and the tail id before any write
+        window_map = self._block_map.clone()
+        tail_id = window_map[..., lay.tail_slot].clone()
+
+        # B. the U tail writes and the mirror (spec 2a/2b)
+        tail = _tw.write_tail(self, key_states, value_states, _bias_rows(kv_bias), lay.mirror_lo)
+
+        # C. the union (spec 2c); no victim pool in v1 -> an empty (H, B, 0) member list
+        ur = _us.build_union(window_map, tail_id, sel,
+                             torch.full((H, B, 0), -1, dtype=torch.int64, device=self.device),
+                             self.verify_round_slots, tail.rollover_at)
+        if bool(ur.overflow.any()) or bool(ur.invalid.any()):
+            raise _vs.RoundOverflow(
+                "verify round refused: overflow on %d stream(s) (max %d new blocks > R=%d), invalid selection on %d stream(s)"
+                % (int(ur.overflow.sum()), int(ur.n_new.max()), self.verify_round_slots, int(ur.invalid.sum())),
+                n_new=ur.n_new, overflow=ur.overflow, invalid=ur.invalid)
+
+        # D. the fetch of the round region, on a VIEW of exactly R*block_size rows
+        _rb = lay.round_base * self.block_size
+        _re = lay.mirror_lo * self.block_size
+        round_ids = ur.round_map.contiguous()
+        assert round_ids.dtype == torch.int64 and tuple(round_ids.shape) == (H, B, self.verify_round_slots), (
+            "round_map %s %s" % (round_ids.dtype, tuple(round_ids.shape)))
+        assert _re - _rb == self.verify_round_slots * self.block_size
+        flash_h2d_from_mask(self._k_gpu[:, _rb:_re], self._k_cpu, round_ids, self.block_size)
+        flash_h2d_from_mask_bias(self._v_gpu[:, _rb:_re], self._v_cpu, self._kv_bias_gpu[:, _rb:_re], kv_bias, round_ids, self.block_size)
+        self._round_map.copy_(round_ids)
+
+        # all requests roll together (one _tail_block_len_on_gpu per engine), so one seqused_k value
+        seqused_k = torch.full((B,), tail.seqused_k, dtype=torch.int32, device=self.device)
+        return self._k_gpu, self._v_gpu, self._kv_bias_gpu, _vs.VerifyRound(
+            union=ur, tail=tail, seqused_k=seqused_k, U=U, W=lay.W,
+            block_size=self.block_size, tail_slot=lay.tail_slot)
+
     def decode_update_has_kv_bias(self, key_states, value_states, kv_bias, topk_idx):
         # 将 key_states 和 value_states 放入 cache
         # key_states: (batch_size, seq_len, head_num, head_dim)
@@ -716,6 +899,11 @@ class InfLLMv2CacheLayer(DynamicLayer):
         self.seq_length += 1
         return self.cache_engine.decode_update(key_states.unsqueeze(1), value_states.unsqueeze(1), kv_bias, topk_idx)
 
+    def verify_round_update_kv(self, key_states, value_states, kv_bias, sel):
+        # retroinfer-eval fork, verifier: key_states/value_states (B, U, H, D), sel (U, H, B, K)
+        self.seq_length += key_states.shape[1]
+        return self.cache_engine.verify_round_update(key_states, value_states, kv_bias, sel)
+
 
     def update(self, key_states, value_states, cache_kwargs=None):
         is_prefill = cache_kwargs.get("is_prefill", True)
@@ -819,6 +1007,12 @@ class InfLLMv2Cache(DynamicCache):
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[-2]
         return self.layers[layer_idx].decode_update_kv(key_states, value_states, kv_bias, topk_idx)
+
+    def verify_round_update_kv(self, key_states, value_states, kv_bias, layer_idx, sel):
+        # retroinfer-eval fork, verifier: U tokens at once, key_states (B, U, H, D)
+        if layer_idx == 0:
+            self._seen_tokens += key_states.shape[1]
+        return self.layers[layer_idx].verify_round_update_kv(key_states, value_states, kv_bias, sel)
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         if layer_idx == 0:
