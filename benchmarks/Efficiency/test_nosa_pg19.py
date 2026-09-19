@@ -79,7 +79,11 @@ def _profile_ready(prof):
     ka = prof.key_averages()
     with open(os.path.join(out, tag + ".txt"), "w") as f:
         f.write(ka.table(sort_by="cuda_time_total", row_limit=60))
-    evs = [e for e in prof.events() if getattr(e, "device_type", None) is not None and str(e.device_type).endswith("CUDA")]
+    # kernel-side events only: kineto also emits the ProfilerStep markers as CUDA-side
+    # annotations spanning the whole window (job 2175353 counted them: 152 ms of
+    # "kernel time" in an 82 ms window). Exclude them and any other user annotation.
+    evs = [e for e in prof.events() if getattr(e, "device_type", None) is not None and str(e.device_type).endswith("CUDA")
+           and not e.name.startswith("ProfilerStep") and not e.name.startswith("[")]
     kernel_us = sum(e.time_range.elapsed_us() for e in evs)
     launches = len(evs)
     t0 = min((e.time_range.start for e in evs), default=0); t1 = max((e.time_range.end for e in evs), default=0)
