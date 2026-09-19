@@ -866,3 +866,31 @@ class InfLLMv2Cache(DynamicCache):
     
     def get_max_length(self):
         raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# NOSI_POOL_SWAP_COMPACT (retroinfer-eval, 2026-09-19; default 0 = the shipped
+# pool mover, byte for byte). Job 2175353 profiled pool_swap_kernel at 102 us
+# per launch (3.3 ms per decode step at 16K x 128), 3.5x the byte time of the
+# rows it moves: its grid (B, H, M) is one program per attended slot, 16384
+# programs per launch at batch 128, ~95% of which only load their action code
+# and exit. A value k > 0 rebinds _flash_pool_swap to flash_pool_swap_compact:
+# grid (B, H, k), each program loops over slots r, r+k, ... of its (b, h) row
+# with the shipped kernel's per-slot body verbatim (k = 1 is one program per
+# (b, h)); same bytes to the same rows, torch.equal after the call
+# (flash_pool_swap.py, COMPACT GEOMETRY; the twin is
+# flash_cache_engine/pool_swap_twin.py, the CPU gate is retroinfer-eval's
+# tests/test_nosi_pool_swap_compact.py, the GPU gate scripts/nosi_pool_parity.py).
+#
+# WHY THIS SITS AT THE END OF THE MODULE and not next to POOL_BLOCKS: the
+# pooled decode resolves `_flash_pool_swap` as a module global at call time,
+# so a rebind here, still at import, is the same binding as one in the guarded
+# block above -- and it adds no line above :409, which retroinfer-eval's
+# tests/test_nosi_verify_core.py pins by absolute line number. Read once, so
+# both arms of a paired run keep their geometry for the whole run. Guarded by
+# POOL_BLOCKS as well: with the pool off no mover module is imported at all.
+POOL_SWAP_COMPACT = int(os.environ.get("NOSI_POOL_SWAP_COMPACT", "0") or 0)
+if POOL_BLOCKS > 0 and POOL_SWAP_COMPACT > 0:
+    import functools
+    from .flash_cache_engine.flash_pool_swap import flash_pool_swap_compact
+    _flash_pool_swap = functools.partial(flash_pool_swap_compact, split=POOL_SWAP_COMPACT)
