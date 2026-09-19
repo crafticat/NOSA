@@ -25,6 +25,10 @@ import os
 # Any value > 0 changes the fp32 reduction order, so it is a different rounding
 # path from the shipped engine: compare arms only at equal NOSI_ATTN_SPLITS.
 _ATTN_SPLITS = int(os.environ.get("NOSI_ATTN_SPLITS", "0") or 0)
+# NOSI_PROFILE hook (retroinfer-eval stage 2): the benchmark installs a
+# torch.profiler here; batch_generate_benchmark calls .step() once per decode
+# step so a schedule(wait, warmup, active) can pick steady-state steps.
+PROFILER = None
 
 from .cache_engine import InfLLMv2Cache
 from .cache_engine_gpu import InfLLMv2Cache as InfLLMv2CacheNoOffload
@@ -898,6 +902,7 @@ class Llama:
             logits = self.decode_inference(next_ids, cu_seqlens_de, position_ids, cache_engine, warmup=warmup)
 
             next_ids = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            if PROFILER is not None: PROFILER.step()
             gen_ids.append(next_ids)
             position_ids = position_ids[:, -1:] + 1
             if it == 0:

@@ -56,7 +56,54 @@ print(f"[Trace] mode={_tt.MODE} out={_trace_out if _trace is not None else None}
       f"decode_steps={_n_decode_steps} timed={_timed_steps[0]}..{_timed_steps[-1]} pool={os.environ.get('NOSI_POOL_BLOCKS', '0')}")
 
 
+# NOSI_PROFILE=1 (retroinfer-eval stage 2, 2026-09-19): kernel-level breakdown of
+# steady-state decode steps. schedule: skip the first NOSI_PROFILE_WAIT steps (the
+# warm-up step and the pool-fill transient), 2 warm-up steps, then NOSI_PROFILE_ACTIVE
+# profiled steps. Writes <NOSI_TRACE_OUT>/profile_doc<i>.txt (key_averages by CUDA
+# time), profile_doc<i>_launches.json (kernel launch count, total CUDA kernel time,
+# wall of the active window) and a Chrome trace. Profiling adds overhead: a
+# profiled document's step times are NOT serving numbers and are excluded from
+# steps.csv by the trace's own timed window (set NOSI_BENCH_TIMED_FROM past it) or
+# by running the profile on its own document.
+_profile = os.environ.get("NOSI_PROFILE", "0") == "1"
+_prof_wait = int(os.environ.get("NOSI_PROFILE_WAIT", "20"))
+_prof_active = int(os.environ.get("NOSI_PROFILE_ACTIVE", "6"))
+_prof_doc = [0]
+
+
+def _profile_ready(prof):
+    import json as _json
+    out = _trace_out if _trace is not None else "."
+    os.makedirs(out, exist_ok=True)
+    tag = f"profile_doc{_prof_doc[0]}"
+    ka = prof.key_averages()
+    with open(os.path.join(out, tag + ".txt"), "w") as f:
+        f.write(ka.table(sort_by="cuda_time_total", row_limit=60))
+    evs = [e for e in prof.events() if getattr(e, "device_type", None) is not None and str(e.device_type).endswith("CUDA")]
+    kernel_us = sum(e.time_range.elapsed_us() for e in evs)
+    launches = len(evs)
+    t0 = min((e.time_range.start for e in evs), default=0); t1 = max((e.time_range.end for e in evs), default=0)
+    with open(os.path.join(out, tag + "_launches.json"), "w") as f:
+        _json.dump(dict(active_steps=_prof_active, kernel_launches=launches, kernel_launches_per_step=launches / max(1, _prof_active),
+                        cuda_kernel_ms_per_step=kernel_us / 1e3 / max(1, _prof_active), window_wall_ms_per_step=(t1 - t0) / 1e3 / max(1, _prof_active)), f, indent=1)
+    prof.export_chrome_trace(os.path.join(out, tag + ".json.gz"))
+    print(f"[profile] doc={_prof_doc[0]} launches/step={launches / max(1, _prof_active):.0f} cuda_ms/step={kernel_us / 1e3 / max(1, _prof_active):.2f} window_ms/step={(t1 - t0) / 1e3 / max(1, _prof_active):.2f}")
+
+
 def test_time(input_ids):
+    if _profile:
+        import torch.profiler as _tp
+        import nosi.nosa_llama as _nl
+        with _tp.profile(activities=[_tp.ProfilerActivity.CPU, _tp.ProfilerActivity.CUDA],
+                         schedule=_tp.schedule(wait=_prof_wait, warmup=2, active=_prof_active, repeat=1),
+                         on_trace_ready=_profile_ready) as prof:
+            _nl.PROFILER = prof
+            try:
+                gen_ids, thru = model.batch_generate_benchmark(input_ids, max_new_tokens=max_new_tokens+2)
+            finally:
+                _nl.PROFILER = None
+        _prof_doc[0] += 1
+        return thru
     gen_ids, thru = model.batch_generate_benchmark(input_ids, max_new_tokens=max_new_tokens+2)
     return thru
 
