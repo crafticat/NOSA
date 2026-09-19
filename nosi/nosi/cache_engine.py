@@ -69,6 +69,21 @@ diff = load(
 # SCOPE: this engine only. cache_engine_gpu.py (offload=0, the GPU-resident
 # control) never reads the knob and is untouched.
 POOL_BLOCKS = int(os.environ.get("NOSI_POOL_BLOCKS", "0") or 0)
+# NOSI_KV_BIAS_SCALE (retroinfer-eval probe, 2026-09-19; default 1.0 = shipped
+# behaviour, byte-identical writes). The decode kernel adds kv_bias to the raw
+# q.k accumulator BEFORE the softmax scale (flash_fwd_kernel.h:321-342, :380),
+# so its effective logit bias is kv_bias / sqrt(head_dim), while NOSA's
+# reference forward and NOSI's own prefill apply cis in logit units
+# (V * exp(cis), nosa_llama.py:299-333). This knob multiplies every value
+# written into _kv_bias_gpu; sqrt(128) = 11.3137085 makes the decode kernel
+# apply cis in logit units. It is a PROBE knob: nothing else reads it.
+KV_BIAS_SCALE = float(os.environ.get("NOSI_KV_BIAS_SCALE", "1.0") or 1.0)
+
+
+def _bias_rows(kv_bias):
+    """The kv_bias rows as written to the GPU cache, scaled by KV_BIAS_SCALE (a
+    no-op that returns the input tensor itself when the scale is exactly 1)."""
+    return kv_bias if KV_BIAS_SCALE == 1.0 else kv_bias * KV_BIAS_SCALE
 _pool = None
 _flash_pool_swap = None
 if POOL_BLOCKS > 0:
@@ -316,7 +331,7 @@ class CacheEngine:
 
             self._v_gpu[current_batch_pos:current_batch_pos+B, _tail_block_base_pos:_tail_block_base_pos+self._tail_block_len_on_gpu, :, :].copy_(value_states[:, -self._tail_block_len_on_gpu:, :, :], non_blocking=True)
 
-            self._kv_bias_gpu[current_batch_pos:current_batch_pos+B, _tail_block_base_pos:_tail_block_base_pos+self._tail_block_len_on_gpu, :].copy_(kv_bias[:, -self._tail_block_len_on_gpu:, :], non_blocking=True)
+            self._kv_bias_gpu[current_batch_pos:current_batch_pos+B, _tail_block_base_pos:_tail_block_base_pos+self._tail_block_len_on_gpu, :].copy_(_bias_rows(kv_bias[:, -self._tail_block_len_on_gpu:, :]), non_blocking=True)
 
             self._block_map[:, current_batch_pos:current_batch_pos+B, self._tail_block_idx_on_gpu] = S // self.block_size
         else: # 如果没有尾块，在gpu上开一个块作为尾块，预备下一次decode写入
@@ -351,7 +366,7 @@ class CacheEngine:
         self._v_gpu[:, _tail_write_pos:_tail_write_pos+1, :, :].copy_(value_states, non_blocking=True)
 
 
-        self._kv_bias_gpu[:, _tail_write_pos:_tail_write_pos+1, :].copy_(kv_bias[:, self.seq_length-1:self.seq_length, :], non_blocking=True)
+        self._kv_bias_gpu[:, _tail_write_pos:_tail_write_pos+1, :].copy_(_bias_rows(kv_bias[:, self.seq_length-1:self.seq_length, :]), non_blocking=True)
 
 
         self._tail_block_len_on_gpu += 1
@@ -456,7 +471,7 @@ class CacheEngine:
         self._v_gpu[:, _tail_write_pos:_tail_write_pos+1, :, :].copy_(value_states, non_blocking=True)
 
 
-        self._kv_bias_gpu[:, _tail_write_pos:_tail_write_pos+1, :].copy_(kv_bias[:, self.seq_length-1:self.seq_length, :], non_blocking=True)
+        self._kv_bias_gpu[:, _tail_write_pos:_tail_write_pos+1, :].copy_(_bias_rows(kv_bias[:, self.seq_length-1:self.seq_length, :]), non_blocking=True)
 
 
         self._tail_block_len_on_gpu += 1
@@ -557,7 +572,7 @@ class CacheEngine:
 
         # 注意！用python写分支会非常慢
         if kv_bias != None:
-            self._kv_bias_gpu[:, _tail_write_pos:_tail_write_pos+1, :].copy_(kv_bias[:, self.seq_length-1:self.seq_length, :], non_blocking=True)
+            self._kv_bias_gpu[:, _tail_write_pos:_tail_write_pos+1, :].copy_(_bias_rows(kv_bias[:, self.seq_length-1:self.seq_length, :]), non_blocking=True)
 
 
         self._tail_block_len_on_gpu += 1
