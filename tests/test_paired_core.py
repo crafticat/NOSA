@@ -1323,6 +1323,9 @@ def test_ring_book_readiness_state_machine():
     assert rb.release_done(0, q) == [] and rb.try_issue(0, 7, 1) is None and rb.ring_full == 1, "the half is busy until its scatter completed: ring full"
     rb.halves[0][1].ev_consumed.done = True
     assert rb.release_done(0, q) == [1] and rb.try_issue(0, 7, 1) == 1
+    hs = pf.HalfState()
+    assert hs.n_unreq == 0 and "n_unreq" in pf.HalfState.__slots__, "the worker records the capped pieces on the half"
+    assert pf.account_half(torch.ones((2, H), dtype=torch.bool), torch.tensor([1, 2, 0, 0], dtype=torch.int32)[:2])["wrong"] == 0, "served_p sliced to the issued pieces"
     acc = pf.PrefetchAccount()
     acc.add(layer=0, tick=5, issued=10, arrived=False, late_pieces=10, residual=7, pack_ms=1.5)
     acc.add(layer=0, tick=6, issued=3, arrived=True, served=2, wrong=1, extra_head_bytes=pf.BYTES_HEAD_BLOCK * 2, residual=1, slack_ms=12.0, pack_ms=0.5, occupancy=2)

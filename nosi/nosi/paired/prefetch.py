@@ -348,9 +348,10 @@ def v_update_with_ring(engine, ops: EngineOps, key_states, value_states, kv_bias
 # the ring bookkeeping (host side, pure python): a double-buffered ring per layer
 # ---------------------------------------------------------------------------
 class HalfState:
-    __slots__ = ("status", "tick", "n_pieces", "n_rows", "ev_done", "ev_consumed", "t_issue", "t_ready", "pack_ms", "late", "heads")
+    __slots__ = ("status", "tick", "n_pieces", "n_rows", "ev_done", "ev_consumed", "t_issue", "t_ready", "pack_ms", "late", "heads", "n_unreq")
 
     def __init__(self):
+        self.n_unreq = 0
         self.status = FREE
         self.tick = -1
         self.n_pieces = 0
@@ -528,11 +529,11 @@ class PrefetchEngine:
 
     # -- the launch thread, layer l of tick t, after V's update and S's scoring --
     def submit(self, l: int, tick: int, sel_s: torch.Tensor, block_map: torch.Tensor, tail_id: int, req_idx: Optional[torch.Tensor] = None):
+        self.book.release_done(l, lambda e: e.query())            # free the halves whose copy and scatter completed, then issue
         half = self.book.try_issue(l, tick, 0)
         if half is None:
             self.account.add(layer=l, tick=tick, issued=0, arrived=False, ring_full=1)
             return
-        self.book.release_done(l, lambda e: e.query())
         sel_h, map_h = self.sel_h[l][half], self.map_h[l][half]
         n = sel_s.shape[1]
         sel_h[:, :n].copy_(sel_s, non_blocking=True)
@@ -613,7 +614,7 @@ class PrefetchEngine:
             if hs.tick == tick - 1 and hs.status in (ARRIVED, CONSUMED, INFLIGHT, FREE) and hs.n_pieces >= 0 and hs.t_issue is not None:
                 rec.update(issued=hs.n_pieces, arrived=(hs.status in (ARRIVED, CONSUMED)), pack_ms=hs.pack_ms, unrequested=getattr(hs, "n_unreq", 0))
                 if hs.status in (ARRIVED, CONSUMED):
-                    rec.update(account_half(hs.heads, self.served_p[l][half].cpu()))
+                    rec.update(account_half(hs.heads, self.served_p[l][half][:hs.n_pieces].cpu()))   # only the issued pieces, not the half's capacity
                     evn = self.ev_need.get((l, tick))
                     if evn is not None and hs.ev_done is not None:
                         rec["slack_ms"] = hs.ev_done.elapsed_time(evn)      # + = arrived before it was needed
