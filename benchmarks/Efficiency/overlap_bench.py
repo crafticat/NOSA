@@ -166,7 +166,11 @@ def run(model, ids):
             trans = ss.transient_ids(model)
             for D in D_LIST:                                    # JIT / first touch of the scratch shapes, untimed
                 timed(None, lambda: side_triton(D, ids_for(D))); timed(None, lambda: side_memcpy(D)); timed(None, lambda: side_memcpy_pinned(D))
-                timed(None, lambda: side_triton_chunked(D, ids_for(D))); timed(None, lambda: side_persistent(D, ids_for(D), 32))
+                for warm_fn in (lambda: side_triton_chunked(D, ids_for(D)), lambda: side_persistent(D, ids_for(D), 32)):
+                    try:
+                        timed(None, warm_fn)
+                    except Exception as exc:
+                        print("[overlap] warm-up of an arm failed at D=%d: %s: %s" % (D, type(exc).__name__, exc), flush=True); torch.cuda.synchronize()
         t_wall = time.time()
         snap.take()
         for e in engines:
@@ -201,6 +205,13 @@ def run(model, ids):
             arms = [(a, all_arms[a][0], all_arms[a][1]) for a in ARMS if a in all_arms]
             for arm, fn_side, mstream in arms:
                 tS, hS = [], []
+                try:
+                    _, _, t = timed(None, fn_side)                   # first touch (JIT of a new arm); a broken arm is recorded, not fatal
+                except Exception as exc:
+                    print("[overlap] ARM FAILED %s D=%d: %s: %s" % (arm, D, type(exc).__name__, exc), flush=True)
+                    rows.append(dict(batch=B, L=VA.L, step=it, D=D, arm=arm, error="%s: %s" % (type(exc).__name__, exc)))
+                    torch.cuda.synchronize()
+                    continue
                 for rep in range(REPS):
                     _, _, t = timed(None, fn_side); tS.append(t); hS.append(HOST["side_launch_ms"])
                 tS_mean = sum(tS) / len(tS)
@@ -246,8 +257,11 @@ def run(model, ids):
 def summarize(payloads):
     from collections import defaultdict
     acc = defaultdict(list)
+    failed = []
     for p in payloads:
         for r in p["rows"]:
+            if "error" in r:
+                failed.append("%s D=%d: %s" % (r["arm"], r["D"], r["error"][:160])); continue
             acc[(r["batch"], r["D"], r["arm"])].append(r)
     L = ["## E3 overlap: resident step A vs side transfer S vs both C (mean over gated steps x reps)", "",
          "| B | D | arm | t_A ms | t_S alone ms (GB/s) | t_C ms | main in C ms (+%) | side in C ms (+%, GB/s) | serial sum | kappa | HOST side launch ms (alone / in C) | HOST main launch ms in C |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
@@ -271,6 +285,8 @@ def summarize(payloads):
     verdicts["correctness: logits torch.equal to the reference and 0 loads in every timed A / C step"] = "PASS" if fails == 0 else "FAILED (%d)" % fails
     L += ["", "## Registered predictions (ledger 2026-09-20 'E3 REGISTERED')", "| prediction | verdict |", "|---|---|"] + ["| %s | %s |" % kv for kv in verdicts.items()]
     L += ["", "FALSIFIERS: " + PRED["falsifiers"]]
+    if failed:
+        L += ["", "ARMS THAT FAILED (recorded, not timed):"] + ["- " + f for f in sorted(set(failed))]
     return "\n".join(L) + "\n", dict(summary=summ, verdicts=verdicts, fails=fails)
 
 
