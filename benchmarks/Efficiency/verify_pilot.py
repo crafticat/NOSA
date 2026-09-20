@@ -657,6 +657,11 @@ if __name__ == "__main__":
         # retroinfer-eval fork: rows-attention microbench beside Path 1 (verify/rows_bench_hook.py); the forward keeps Path 1's output
         from nosi.verify import rows_bench_hook
         rows_bench_hook.install(OUT, TAG, splits_list=tuple(int(x) for x in os.environ.get("NOSI_ROWS_SPLITS", "4 8 0").split()))
+    if os.environ.get("NOSI_ROWS_DECODE_BENCH", "0") == "1":
+        # retroinfer-eval fork: the rows mechanism on the ordinary decode allocation (verify/rows_decode_hook.py); mode decode
+        from nosi.verify import rows_decode_hook
+        rows_decode_hook.install(OUT, TAG, u_list=tuple(int(x) for x in os.environ.get("NOSI_ROWS_DECODE_U", "2 3").split()),
+                                 splits=int(os.environ.get("NOSI_ATTN_SPLITS", "0") or 0))
     ids, rows, distinct = load_docs(path)
     print("[docs] %s (%d distinct)  L=%d N=%d" % (rows, distinct, L, N), flush=True)
     if MODE == "decode":
