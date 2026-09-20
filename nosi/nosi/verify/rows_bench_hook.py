@@ -68,11 +68,11 @@ def install(out_dir: str, tag: str, splits_list=(4, 8, 0), orders=("adjacent", "
             rb, rec["ev"]["bias_build"] = timed(lambda: RA.rows_bias_from_round(kv_bias_gpu, rnd, physical_tail=False))
             rec["union_slots_per_row_mean"] = float(rb.selected.sum(dim=1).float().mean())      # selected (B*U, W, Hkv) -> slots per (row, head)
             rec["union_slots_per_row_max"] = int(rb.selected.sum(dim=1).max())
-            q4 = q.reshape(BU, 1, Hq, D).contiguous()
+            q3 = q.reshape(BU, Hq, D).contiguous()           # rows_attention_args wants (B*U, Hq, D); it adds the seqlen-1 axis itself
             perm, inv = _perm(B, U, q.device)
             outs = {}
             for order in orders:
-                rbo, qo = (rb, q4) if order == "adjacent" else (_reorder(rb, perm), q4[perm].contiguous())
+                rbo, qo = (rb, q3) if order == "adjacent" else (_reorder(rb, perm), q3[perm].contiguous())
                 for s in splits_list:
                     flush.fill_(1)
                     o, rec["ev"]["rows_%s_s%d" % (order, s)] = timed(lambda: RA.rows_attention(qo, k_gpu, v_gpu, rbo, s))
