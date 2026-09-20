@@ -39,6 +39,13 @@ from typing import NamedTuple
 
 import torch
 
+try:                      # module-level on purpose: triton resolves the kernel's ``tl.constexpr`` annotations
+    import triton         # through the function's GLOBALS (job 2175570: NameError('tl is not defined')
+    import triton.language as tl   # when the imports were local to _kernel()); CPU hosts without triton still import this module
+except Exception:         # pragma: no cover
+    triton = None
+    tl = None
+
 from ..verify import rows_attention as _ra
 
 
@@ -160,8 +167,8 @@ def _kernel():
     global _KERNEL
     if _KERNEL is not None:
         return _KERNEL
-    import triton
-    import triton.language as tl
+    if triton is None or tl is None:
+        raise RuntimeError("triton is not importable here: the fused bias kernel needs it (NOSI_PAIRED_BIAS=torch selects the reference build)")
 
     @triton.jit
     def paired_bias_kernel(cis_ptr, bias_ptr, prefix_ptr, extent_ptr, sel_ptr, bmap_ptr, ring_ptr, ready_ptr, req_ptr, srow_ptr, role_ptr,
