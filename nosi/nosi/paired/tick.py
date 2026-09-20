@@ -56,11 +56,13 @@ class TickConfig(NamedTuple):
     poison: bool           # NaN-poison the provisional rows after every S write's tick (G1 / G7 control)
     masked: float          # the finite masked bias value
     refuse_compress: bool  # refuse a 16-token compress event inside a call (the captured pooling graph is fixed-shape)
+    gemm_pad_rows: int     # twin2b diagnostic (DESIGN.md blocker 5): zero rows appended to EVERY GEMM's M so cuBLAS sees the tick's M; 0 = off
 
 
-def config_from_env() -> TickConfig:
+def config_from_env(gemm_pad_rows: int = 0) -> TickConfig:
     """Resolved by the DRIVER at dispatch time (never at import): NOSI_ATTN_SPLITS
-    (default 4; 0 refused), NOSI_PAIRED_POISON (1 = on)."""
+    (default 4; 0 refused), NOSI_PAIRED_POISON (1 = on). ``gemm_pad_rows`` is
+    the driver's (the twin2b arm passes B); it is not an environment knob."""
     raw = os.environ.get("NOSI_ATTN_SPLITS", "4")
     try:
         splits = int(raw)
@@ -69,8 +71,26 @@ def config_from_env() -> TickConfig:
     if not (1 <= splits <= 128):
         raise SystemExit("NOSI_ATTN_SPLITS=%d: the paired tick needs an EXPLICIT split count in [1, 128] "
                          "(0 = the library heuristic, which depends on the number of rows and breaks the twin identity)" % splits)
+    if int(gemm_pad_rows) < 0:
+        raise SystemExit("gemm_pad_rows=%d must be >= 0" % gemm_pad_rows)
     return TickConfig(num_splits=splits, poison=os.environ.get("NOSI_PAIRED_POISON", "0") == "1",
-                      masked=core.MASKED, refuse_compress=True)
+                      masked=core.MASKED, refuse_compress=True, gemm_pad_rows=int(gemm_pad_rows))
+
+
+def linear_padded(x: torch.Tensor, w: torch.Tensor, pad_rows: int) -> torch.Tensor:
+    """F.linear over x (n, U, K) whose flattened row count is padded with
+    ``pad_rows`` ZERO rows (appended, discarded from the output): the cuBLAS
+    call then has M = n*U + pad_rows, so a U = 1 twin with pad_rows = B runs
+    every GEMM at the tick's M = 2B and cuBLAS selects the tick's kernel
+    (DESIGN.md blocker 5). Every output row depends on its own input row and
+    the kernel only, so the first n*U rows are what the unpadded rows would
+    be under that kernel. pad_rows = 0 is the plain call."""
+    if pad_rows <= 0:
+        return F.linear(x, w)
+    n, U, K = x.shape
+    xf = x.reshape(n * U, K)
+    xp = torch.cat([xf, xf.new_zeros((int(pad_rows), K))], dim=0)
+    return F.linear(xp, w)[:n * U].reshape(n, U, -1)
 
 
 class _GPU(NamedTuple):
@@ -300,7 +320,7 @@ def layer_body(G, model, cache, l: int, hidden: torch.Tensor, position_ids: torc
 
     # [1] prenorm, qkv GEMM over all rows, rope at per-row positions (verify_forward :697-708)
     hs = NL.layer_norm(hidden, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
-    qkv = F.linear(hs, layer.wqkv)
+    qkv = linear_padded(hs, layer.wqkv, cfg.gemm_pad_rows).contiguous()
     q, k, v, cis = NL.nosa_linear(qkv, layer.delta.weight, layer.A, layer.q_size, layer.kv_size, Hk)
     q = q.view(n * U, -1)
     k = k.view(n * U, -1)
@@ -358,14 +378,14 @@ def layer_body(G, model, cache, l: int, hidden: torch.Tensor, position_ids: torc
     attn = attn.view(n, U, -1)
 
     # [6] wo, FFN over all rows (decode_forward :652-667)
-    hidden = residual + F.linear(attn, layer.wo)
+    hidden = residual + linear_padded(attn, layer.wo, cfg.gemm_pad_rows)
     residual = hidden
     hs = NL.layer_norm(hidden, layer.post_attention_layernorm_variance_epsilon, layer.post_attention_layernorm_weight)
-    gu = F.linear(hs, layer.gate_up_proj)
+    gu = linear_padded(hs, layer.gate_up_proj, cfg.gemm_pad_rows)
     dd = gu.shape[-1] // 2
     act = torch.empty(gu.shape[:-1] + (dd,), dtype=gu.dtype, device=gu.device)
     NL.silu_and_mul(gu, act)
-    hidden = residual + F.linear(act, layer.down_proj)
+    hidden = residual + linear_padded(act, layer.down_proj, cfg.gemm_pad_rows)
 
     # accounting (core): misses, S's selections and hits, the divergence vs S's prediction for this V position
     # (the twin arm has no S rows and no prediction: its accounts carry no divergence; the paired
@@ -416,7 +436,7 @@ def _forward(G, model, cache, sc: Scratch, cfg: TickConfig, tokens: torch.Tensor
             recs.append(out.insitu)
     pre = hidden
     hidden = NL.layer_norm(hidden, model.norm_variance_epsilon, model.norm_weight)
-    logits = F.linear(hidden, model.lm_head).float()                                  # (n, U, V)
+    logits = linear_padded(hidden, model.lm_head, cfg.gemm_pad_rows).float()          # (n, U, V)
     if trace is not None:
         trace.end_call()
     if insitu is not None and plan.has_v and plan.has_s:

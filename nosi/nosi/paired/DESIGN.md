@@ -70,8 +70,12 @@ from `feature/nosi-verify-rows` (004f279). Line numbers below are of THIS worktr
 5. **cuBLAS at M = 2B vs M = B** may pick another kernel and change every row's accumulation order
    (verify_pilot's B2 caveat). G3 can fail for that reason alone; `InSituTwin` isolates it from the
    attention and the bias terms so the verdict says which. Nothing in the engine can be changed to make
-   a 2B-row GEMM bit-equal to a B-row GEMM; if it fails, the honest twin is a 2B-row twin (padding B
-   zero rows), which `twin.py` does not do on purpose (the spec's twin is U = 1).
+   a 2B-row GEMM bit-equal to a B-row GEMM. The OPTIONAL `twin2b` arm (`twin.twin2b_step`,
+   `NOSI_PAIRED_MODE=twin2b`) is the U = 1 twin with every GEMM padded to M = 2B by B zero rows
+   (`tick.linear_padded`): when G3 against the U = 1 twin fails at a GEMM term, compare gates the tick
+   against twin2b (`G3-2b`), which must be torch.equal if the kernel choice was the only difference.
+   The spec's twin stays U = 1 at M = B; the author's greedy gate (`G3-greedy` / `G3-tol` /
+   `G3-commit` against the SHIPPED rows) is reported beside it, separately.
 
 ## 5. Stage E4 (per-layer prefetch into a staging ring): what it needs from the engine
 

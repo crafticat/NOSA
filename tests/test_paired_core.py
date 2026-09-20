@@ -583,3 +583,49 @@ def test_pilot_refuses_without_tau_ctrl(tmp_path, monkeypatch):
     monkeypatch.setenv("NOSI_VERIFY_TAU_CTRL", "inf")
     with pytest.raises(SystemExit):
         pilot.read_tau_ctrl()
+
+
+# ---------------------------------------------------------------------------
+# twin2b (GEMMs padded to M = 2B) and the registered decomposition
+# ---------------------------------------------------------------------------
+def test_linear_padded_discards_the_pad_rows():
+    g = torch.Generator().manual_seed(2)
+    x = torch.randn((3, 2, 8), generator=g)
+    w = torch.randn((5, 8), generator=g)
+    plain = torch.nn.functional.linear(x, w)
+    assert torch.equal(tick.linear_padded(x, w, 0), plain), "pad 0 is the plain call"
+    padded = tick.linear_padded(x, w, 6)
+    assert padded.shape == plain.shape and torch.allclose(padded, plain, atol=1e-6)
+    # the padded rows are zeros and never reach the output: a poisoned weight row still gives finite outputs where x is finite
+    assert torch.isfinite(padded).all()
+
+
+def test_config_gemm_pad_rows_and_twin2b_text(monkeypatch):
+    monkeypatch.delenv("NOSI_ATTN_SPLITS", raising=False)
+    assert tick.config_from_env().gemm_pad_rows == 0
+    assert tick.config_from_env(gemm_pad_rows=64).gemm_pad_rows == 64
+    with pytest.raises(SystemExit):
+        tick.config_from_env(gemm_pad_rows=-1)
+    src = (NOSI_PKG / "paired" / "twin.py").read_text()
+    assert "cfg._replace(gemm_pad_rows=int(sc.B))" in src, "twin2b pads every GEMM by B rows: M = 2B"
+    tsrc = (NOSI_PKG / "paired" / "tick.py").read_text()
+    for w in ("layer.wqkv", "layer.wo", "layer.gate_up_proj", "layer.down_proj", "model.lm_head"):
+        assert "linear_padded(" in tsrc and w in tsrc
+    assert "F.linear(hs, layer.wqkv)" not in tsrc and "F.linear(attn, layer.wo)" not in tsrc, "every GEMM of the body goes through linear_padded"
+
+
+def test_pilot_predictions_and_decomposition(tmp_path, monkeypatch):
+    pilot = _load_pilot(tmp_path, monkeypatch)
+    p = pilot.predicted_deltas(128)
+    assert abs(p["rest_delta"] - (20.03 - 14.59)) < 1e-9 and p["attn_abs"] == 13.7 and abs(p["score_delta"] - (3.56 + 0.0281 * 128)) < 1e-9
+    q = pilot.predicted_deltas(64)
+    assert q["rest_delta"] is None and q["attn_abs"] is None and abs(q["score_delta"] - (3.56 + 0.0281 * 64)) < 1e-9, "no number is invented at a B without a registered point"
+    twin_row = dict(n=3, ms_mean=40.0, score=7.0, fetch=5.0, attn=12.0, rest=16.0)
+    tick_row = dict(n=3, ms_mean=60.0, score=14.0, fetch=6.0, attn=14.0, rest=26.0)
+    txt = pilot.render_decomposition(128, twin_row, tick_row)
+    assert "| rest | 16.00 | 26.00 | +10.00 | +5.44 | +4.56 |" in txt, "residual = measured - predicted, named per term"
+    assert "| attn | 12.00 | 14.00 | +2.00 | +1.70 | +0.30 |" in txt
+    txt64 = pilot.render_decomposition(64, twin_row, tick_row)
+    assert "| rest | 16.00 | 26.00 | +10.00 | - | - |" in txt64
+    assert "twin2b" in (ROOT / "benchmarks" / "Efficiency" / "paired_pilot.py").read_text()
+    assert "G3-greedy" in (ROOT / "benchmarks" / "Efficiency" / "paired_pilot.py").read_text() and "G3-commit" in (ROOT / "benchmarks" / "Efficiency" / "paired_pilot.py").read_text()

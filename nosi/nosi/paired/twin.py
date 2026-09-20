@@ -57,6 +57,19 @@ def twin_step(model, cache, sc: _tick.Scratch, cfg: _tick.TickConfig, v_tokens: 
     return _tick._forward(G, model, cache, sc, cfg, v_tokens.unsqueeze(1), position.unsqueeze(1), plan, sc.req_all, True, trace=trace)
 
 
+@torch.inference_mode()
+def twin2b_step(model, cache, sc: _tick.Scratch, cfg: _tick.TickConfig, v_tokens: torch.Tensor, position: torch.Tensor,
+                trace=None) -> _tick.TickResult:
+    """The twin2b DIAGNOSTIC (DESIGN.md blocker 5): the U = 1 twin whose every
+    GEMM (wqkv, wo, gate_up, down, lm_head) runs at M = 2B by appending B zero
+    rows (tick.linear_padded), so cuBLAS selects the kernel the paired tick's
+    GEMMs get. If G3 against the U = 1 twin fails at a GEMM term and the only
+    difference was the kernel choice, the tick's V logits are torch.equal to
+    this arm's. Everything else (scoring, engine update, the rows kernel at
+    B rows) is the twin's."""
+    return twin_step(model, cache, sc, cfg._replace(gemm_pad_rows=int(sc.B)), v_tokens, position, trace=trace)
+
+
 def _maxabs(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a.float() - b.float()).abs().max()) if a.numel() else 0.0
 

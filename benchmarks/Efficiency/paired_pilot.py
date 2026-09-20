@@ -16,6 +16,9 @@ per arm (the engine reads its layout knobs at import). NOSI_PAIRED_MODE:
             (twin.twin_step: V rows only, the shipped engine update, the rows
             kernel at U = 1 over the whole allocation) with the score / fetch /
             attn / rest brackets of verify_trace.py.
+  twin2b    OPTIONAL diagnostic (DESIGN.md blocker 5): the same twin with every
+            GEMM padded to M = 2B (twin.twin2b_step), so cuBLAS picks the tick's
+            kernel; compare tolerates its absence.
   equiv     steps 0 .. WARM-1 shipped, setup, the SEED (S rows for every
             request at position L+WARM: the first draft), then per step t
             the PAIRED TICK (V at L+t on forced[t], S at L+t+1 on its draft)
@@ -35,6 +38,20 @@ per arm (the engine reads its layout knobs at import). NOSI_PAIRED_MODE:
                            row at the same forced step (splits equal, explicit);
                            on failure the first differing step and the equiv
                            arm's in-situ diagnosis (which term) are printed;
+            G3-greedy      the author's gate, exact GREEDY equivalence to the
+                           optimized ordinary target: argmax of every tick's V
+                           row == argmax of the SHIPPED decode row, 100 %;
+            G3-tol         the same rows: max |dlogit| <= 4 x tau_ctrl;
+            G3-commit      the per-tick greedy tokens (B, ticks) torch.equal
+                           the shipped greedy tokens of the same rows;
+            G3-2b          only when G3 vs the U = 1 twin FAILED and a twin2b
+                           arm exists: the tick's V logits must then be
+                           torch.equal to twin2b (the kernel choice was the
+                           only difference); reported otherwise;
+            VERDICT lines  one per (B, arm) stating the gates separately;
+            decomposition  per bracket of the resident tick vs the twin step:
+                           measured delta vs the REGISTERED prediction
+                           (predicted_deltas), the residual named per term;
             G2-tol[B]      the twin vs the shipped decode: max |dlogit| <=
                            4 x tau_ctrl over the compared rows (NOSI_VERIFY_TAU_CTRL,
                            0.4844 at 16K, job 2175374; REFUSES to run unset)
@@ -86,6 +103,7 @@ DISTINCT = int(os.environ.get("NOSI_PAIRED_DISTINCT", "0") or 0) or NDOCS
 os.makedirs(OUT, exist_ok=True)
 
 PAIRED_MODES = ("equiv", "resident")
+TWIN_MODES = ("twin", "twin2b")
 
 
 def die(msg):
@@ -176,6 +194,49 @@ def render_timing(rows) -> str:
                 *["%.1f" % r[k] if r.get(k) is not None else "-" for k in ("score", "fetch", "attn", "rest")], r["peak_gb"]))
         else:
             out.append("| %d | %s | %s | 0 | - | - | - | - | - | - | %.1f |" % (r["B"], r["arm"], r["call"], r["peak_gb"]))
+    return "\n".join(out)
+
+
+def predicted_deltas(B: int) -> dict:
+    """REGISTERED predictions of the resident tick's brackets against the U = 1
+    twin step at the same B (None = no registered number at this B: never
+    invented). rest_delta: the GEMM set at M = 2B vs M = B, the M-scan of job
+    2175525 (14.59 -> 20.03 ms at B = 128); attn_abs: the rows attention with
+    U = 2 on the 64-slot window, 13.7 ms at B = 128 (reuse ledger (ii-a));
+    score_delta: the present serial scoring chain, one extra position,
+    3.56 + 0.0281 B ms (job 2175382, U = 1 -> 2); fetch_delta: the bias build,
+    +1..2 ms per call (reuse ledger), point 1.5."""
+    at128 = int(B) == 128
+    return dict(rest_delta=(20.03 - 14.59) if at128 else None, attn_abs=13.7 if at128 else None,
+                score_delta=3.56 + 0.0281 * int(B), fetch_delta=1.5, fetch_band=(1.0, 2.0),
+                source=dict(rest="M-scan job 2175525 (B=128 only)", attn="reuse ledger (ii-a) point 13.7 ms at B=128",
+                            score="delta_scoring 3.56 + 0.0281 B (job 2175382)", fetch="bias build +1..2 ms (reuse ledger)"))
+
+
+def render_decomposition(B: int, twin_row: dict, tick_row: dict) -> str:
+    """Per bracket: the twin step's and the tick's measured means, the measured
+    delta, the registered predicted delta and the RESIDUAL (measured -
+    predicted), so the unexplained part is named per term."""
+    pred = predicted_deltas(B)
+    out = ["| B=%d bracket | twin ms | tick ms | delta measured | delta predicted | residual | prediction source |" % B,
+           "|---|---|---|---|---|---|---|"]
+    if not (twin_row.get("n", 0) and tick_row.get("n", 0)):
+        out.append("| (no timed twin or tick calls) | - | - | - | - | - | - |")
+        return "\n".join(out)
+    for name in ("score", "fetch", "attn", "rest"):
+        tw, tk = twin_row.get(name), tick_row.get(name)
+        if tw is None or tk is None:
+            out.append("| %s | - | - | - | - | - | %s |" % (name, pred["source"][name]))
+            continue
+        delta = tk - tw
+        if name == "attn":
+            p = (pred["attn_abs"] - tw) if pred["attn_abs"] is not None else None
+        else:
+            p = pred[name + "_delta"]
+        out.append("| %s | %.2f | %.2f | %+.2f | %s | %s | %s |" % (
+            name, tw, tk, delta, ("%+.2f" % p) if p is not None else "-", ("%+.2f" % (delta - p)) if p is not None else "-", pred["source"][name]))
+    tot_tw, tot_tk = twin_row["ms_mean"], tick_row["ms_mean"]
+    out.append("| total | %.2f | %.2f | %+.2f | - | - | sum of the brackets above |" % (tot_tw, tot_tk, tot_tk - tot_tw))
     return "\n".join(out)
 
 
@@ -270,7 +331,7 @@ def run_shipped(path, ids):
 
 
 @torch.inference_mode()
-def run_twin(path, ids):
+def run_twin(path, ids, pad2b: bool = False):
     from nosi import verify_trace as _vtr
     from nosi.paired import twin as TW
     model, cache, logits, position_ids, forced, meta = _setup(path, ids, need_round_slots=True)
@@ -281,20 +342,21 @@ def run_twin(path, ids):
     ev = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(WARM)]
     position_ids = _shipped_steps(model, cache, forced, position_ids, cu, WARM, rows, ev)
     Tk = _budget_or_die(cache)
-    cfg = Tk.config_from_env()
+    cfg = Tk.config_from_env(gemm_pad_rows=(B if pad2b else 0))
     sc = Tk.setup(model, cache, B)
     vt = _vtr.VerifyTrace(model.num_layers)
+    step = TW.twin2b_step if pad2b else TW.twin_step
     for it in range(WARM, N):
         vt.label(("twin", it))
-        res = TW.twin_step(model, cache, sc, cfg, forced[:, it], position_ids[:, 0], trace=vt)
+        res = step(model, cache, sc, cfg, forced[:, it], position_ids[:, 0], trace=vt)
         torch.cuda.synchronize()
         rows.append(res.logits_v.cpu())
         position_ids = position_ids + 1
     timing = vt.harvest()
     out = torch.stack(rows, dim=1)
     for r in timing:
-        print("[paired_pilot] twin step %d: %.1f ms (score %.1f fetch %.1f attn %.1f rest %.1f)" % (r["label"][1], r["total_ms"], r["score_ms"], r["fetch_ms"], r["attn_ms"], r["rest_ms"]), flush=True)
-    return dict(meta, cfg=cfg._asdict(), logits=out, hashes=[[sha(out[b, r]) for r in range(N + 1)] for b in range(B)],
+        print("[paired_pilot] %s step %d: %.1f ms (score %.1f fetch %.1f attn %.1f rest %.1f)" % (MODE, r["label"][1], r["total_ms"], r["score_ms"], r["fetch_ms"], r["attn_ms"], r["rest_ms"]), flush=True)
+    return dict(meta, cfg=cfg._asdict(), pad2b=bool(pad2b), logits=out, hashes=[[sha(out[b, r]) for r in range(N + 1)] for b in range(B)],
                 calls=timing, peak_gb=torch.cuda.max_memory_allocated() / 1e9, reserved_gb=torch.cuda.max_memory_reserved() / 1e9)
 
 
@@ -329,7 +391,7 @@ def run_paired(path, ids, insitu_on: bool):
     ledger.add_restart(WARM - 1, rows=B, ms=None, layers=seed.accounts)
     if any(p is None for p in sc.prev_sel_s):
         die("the seed left a layer without an S prediction")
-    ticks, diags, committed_rows, non_finite = [], [], [], 0
+    ticks, diags, committed_rows, greedy_rows, non_finite = [], [], [], [], 0
     for t in range(WARM, N):
         v_tok = forced[:, t]
         s_tok = state.s_inputs(v_tok)
@@ -347,6 +409,7 @@ def run_paired(path, ids, insitu_on: bool):
         v_arg = lv.argmax(-1)
         outcome = state.tick_end(committed, ls.argmax(-1))
         committed_rows.append(outcome.committed)
+        greedy_rows.append(v_arg)
         greedy_agree = v_arg == committed
         prod_accept = had_draft & (s_tok == v_arg)                    # production-style accept: the draft equals argmax(V)
         n_restart = 0
@@ -389,6 +452,7 @@ def run_paired(path, ids, insitu_on: bool):
     for r in timing:
         print("[paired_pilot] %s %d: %.1f ms (score %.1f fetch %.1f attn %.1f rest %.1f)" % (r["label"][0], r["label"][1], r["total_ms"], r["score_ms"], r["fetch_ms"], r["attn_ms"], r["rest_ms"]), flush=True)
     return dict(meta, cfg=cfg._asdict(), insitu=insitu_on, logits=out, hashes=[[sha(out[b, r]) for r in range(N + 1)] for b in range(B)],
+                greedy_tokens=torch.stack(greedy_rows, 1).cpu(), committed_tokens=torch.stack(committed_rows, 1).cpu(),
                 calls=timing, ticks=ticks, ledger_ticks=[_cpu_tick_record(r) for r in ledger.ticks], ledger_restarts=[_cpu_tick_record(r) for r in ledger.restarts],
                 summary=summary, diagnoses=diags, peak_gb=torch.cuda.max_memory_allocated() / 1e9, reserved_gb=torch.cuda.max_memory_reserved() / 1e9)
 
@@ -408,7 +472,7 @@ def compare() -> int:
     by_B = {}
     for name, d in arms.items():
         by_B.setdefault(int(d["batch"]), []).append((name, d))
-    lines, summary, nfail, timing_rows = [], {}, 0, []
+    lines, summary, nfail, timing_rows, decompositions = [], {}, 0, [], []
 
     def gate(key, ok, detail):
         nonlocal nfail
@@ -421,6 +485,7 @@ def compare() -> int:
     for B, group in sorted(by_B.items()):
         shipped = [d for n, d in group if d["mode"] == "shipped"]
         twins = [d for n, d in group if d["mode"] == "twin"]
+        twin2b = [d for n, d in group if d["mode"] == "twin2b"]          # optional diagnostic arm
         paired = [(n, d) for n, d in group if d["mode"] in PAIRED_MODES]
         if len(shipped) != 1 or len(twins) != 1:
             gate("arms[B=%d]" % B, False, "expected one shipped and one twin arm, found %d and %d" % (len(shipped), len(twins)))
@@ -432,7 +497,18 @@ def compare() -> int:
              "max |dlogit| %.4f <= %.4f over rows %d..%d; argmax agree %d/%d; torch.equal rows %d/%d (different split seams expected)"
              % (g["worst"] or float("nan"), tol, rows[0], rows[-1], sum(g["argmax_agree"]), B * len(rows), sum(g["equal"]), len(rows)))
         timing_rows.append(timing_row(B, "shipped", "decode step", sh["calls_timed"], sh["peak_gb"]))
-        timing_rows.append(timing_row(B, "twin", "twin step", tw["calls"], tw["peak_gb"]))
+        twin_timing = timing_row(B, "twin", "twin step", tw["calls"], tw["peak_gb"])
+        timing_rows.append(twin_timing)
+        t2b = None
+        if len(twin2b) == 1 and twin2b[0]["logits"].shape == tw["logits"].shape and twin2b[0]["cfg"]["num_splits"] == tw["cfg"]["num_splits"]:
+            t2b = twin2b[0]
+            g2 = row_gate(t2b["logits"], tw["logits"], rows)
+            lines.append("| report[B=%d,twin2b vs twin] | - | GEMMs at M = 2B vs M = B alone: torch.equal rows %d/%d, max |d| %.4g (the kernel-choice term) |" % (B, sum(g2["equal"]), len(rows), g2["worst"]))
+            timing_rows.append(timing_row(B, "twin2b", "twin2b step", t2b["calls"], t2b["peak_gb"]))
+        elif twin2b:
+            lines.append("| report[B=%d,twin2b] | - | present but not comparable (shape or splits differ): ignored |" % B)
+        else:
+            lines.append("| report[B=%d,twin2b] | - | absent (optional diagnostic arm) |" % B)
         for name, d in paired:
             if d["warm"] != tw["warm"] or d["N"] != tw["N"] or d["logits"].shape != tw["logits"].shape:
                 gate("shape[B=%d,%s]" % (B, name), False, "arm N=%s warm=%s %s vs twin N=%s warm=%s %s" % (d["N"], d["warm"], tuple(d["logits"].shape), tw["N"], tw["warm"], tuple(tw["logits"].shape)))
@@ -452,12 +528,34 @@ def compare() -> int:
                     diag = "no in-situ record (resident arm); see the equiv arm's diagnosis"
                 detail += "; first differing row %d (tick %d): %s" % (g3["first_bad"], t_bad, diag)
             gate("G3[B=%d,%s vs twin]" % (B, name), g3["all_equal"], detail)
+            verdict = ["G3-exact(twin)=%s" % ("PASS" if g3["all_equal"] else "FAIL")]
+            # the author's gate: exact GREEDY equivalence to the optimized ordinary target (the shipped decode rows)
+            gp = row_gate(d["logits"], sh["logits"], rows)
+            greedy_ok = sum(gp["argmax_agree"]) == B * len(rows)
+            gate("G3-greedy[B=%d,%s vs shipped]" % (B, name), greedy_ok, "argmax agree %d/%d over rows %d..%d" % (sum(gp["argmax_agree"]), B * len(rows), rows[0], rows[-1]))
+            tol_ok = gp["worst"] is not None and gp["worst"] <= tol
+            gate("G3-tol[B=%d,%s vs shipped]" % (B, name), tol_ok, "max |dlogit| %.4f <= 4 x tau_ctrl %.4f" % (gp["worst"] if gp["worst"] is not None else float("nan"), tol))
+            greedy_tokens = d.get("greedy_tokens")
+            if greedy_tokens is None:
+                greedy_tokens = d["logits"][:, rows].argmax(-1)
+            shipped_greedy = sh["logits"][:, rows].argmax(-1)
+            commit_ok = tuple(greedy_tokens.shape) == tuple(shipped_greedy.shape) and bool(torch.equal(greedy_tokens.to(shipped_greedy.dtype), shipped_greedy))
+            gate("G3-commit[B=%d,%s vs shipped]" % (B, name), commit_ok, "per-tick greedy tokens %s torch.equal the shipped greedy tokens: %s" % (tuple(greedy_tokens.shape), commit_ok))
+            verdict += ["G3-greedy(shipped)=%s" % ("PASS" if greedy_ok else "FAIL"), "G3-tol(shipped)=%s" % ("PASS" if tol_ok else "FAIL"),
+                        "G3-commit(shipped)=%s" % ("PASS" if commit_ok else "FAIL")]
+            if t2b is not None:
+                g2b = row_gate(d["logits"], t2b["logits"], rows)
+                det2 = "V logits torch.equal twin2b on %d/%d rows (max |d| %.4g)" % (sum(g2b["equal"]), len(rows), g2b["worst"])
+                if not g3["all_equal"]:
+                    gate("G3-2b[B=%d,%s vs twin2b]" % (B, name), g2b["all_equal"], det2 + " -- G3 vs the U = 1 twin failed: equality here means the kernel choice at M = 2B was the only difference")
+                else:
+                    lines.append("| report[B=%d,%s vs twin2b] | - | %s |" % (B, name, det2))
+                verdict.append("G3-2b(twin2b)=%s" % ("PASS" if g2b["all_equal"] else "FAIL"))
+            lines.append("| VERDICT[B=%d,%s] | - | %s |" % (B, name, " ; ".join(verdict)))
             fin = bool(torch.isfinite(d["logits"][:, rows]).all())
             gate("finite[B=%d,%s]" % (B, name), fin, "all logits finite (poison=%s)" % d["poison"])
             s = d["summary"]
             gate("G8[B=%d,%s]" % (B, name), s["ticks"] == len(rows) and s["rows"] == B * len(rows), "%d ticks x %d requests = %d committed tokens" % (s["ticks"], B, s["rows"]))
-            gp = row_gate(d["logits"], sh["logits"], rows)
-            lines.append("| report[B=%d,%s vs shipped] | - | max |dlogit| %.4f (tol %.4f); argmax agree %d/%d |" % (B, name, gp["worst"], tol, sum(gp["argmax_agree"]), B * len(rows)))
             lines.append("| report[B=%d,%s acceptance] | - | a = %.3f (teacher-forced), prod-style %d/%d, greedy agree %s/%d, restarts %d rows %d, restart ms %s |" % (
                 B, name, s["acceptance_rate"] or float("nan"), sum(r["prod_accept"] for r in d["ticks"]), s["rows"], s["greedy_agree"], s["rows"], s["restarts"], s["restart_rows"],
                 ["%.1f" % m for m in s["restart_ms"] if m is not None]))
@@ -468,13 +566,16 @@ def compare() -> int:
                 lines.append("| report[B=%d,%s divergence per layer] | - | needed-not-predicted %s ; predicted-not-needed %s |" % (
                     B, name, ["%.2f" % x for x in s["div_v_not_s_per_layer_mean"]], ["%.2f" % x for x in s["div_s_not_v_per_layer_mean"]]))
             if d["mode"] == "resident":
-                timing_rows.append(timing_row(B, name, "paired tick", [c for c in d["calls"] if c["label"][0] == "tick"], d["peak_gb"]))
+                tick_timing = timing_row(B, name, "paired tick", [c for c in d["calls"] if c["label"][0] == "tick"], d["peak_gb"])
+                timing_rows.append(tick_timing)
                 timing_rows.append(timing_row(B, name, "restart", [c for c in d["calls"] if c["label"][0] == "restart"], d["peak_gb"]))
+                decompositions.append("\nresident tick decomposition at B=%d (%s vs the twin step; predictions REGISTERED in predicted_deltas):\n%s" % (B, name, render_decomposition(B, twin_timing, tick_timing)))
             if d.get("diagnoses") is not None:
                 bad = [x for x in d["diagnoses"] if x]
                 lines.append("| report[B=%d,%s in-situ] | - | %d/%d ticks with every term torch.equal%s |" % (
                     B, name, len(d["diagnoses"]) - len(bad), len(d["diagnoses"]), ("; first: " + bad[0]) if bad else ""))
     lines.append("\ntiming (first call of every kind excluded; the equiv arm is not timed: its in-situ twin adds work):\n" + render_timing(timing_rows))
+    lines.extend(decompositions)
     lines.append("\nfailed gates: %d" % nfail)
     text = "\n".join(lines)
     print(text, flush=True)
@@ -494,8 +595,8 @@ if __name__ == "__main__":
     print("[docs] %s (%d distinct)  L=%d N=%d" % (rows, distinct, L, N), flush=True)
     if MODE == "shipped":
         payload = run_shipped(path, ids)
-    elif MODE == "twin":
-        payload = run_twin(path, ids)
+    elif MODE in TWIN_MODES:
+        payload = run_twin(path, ids, pad2b=(MODE == "twin2b"))
     elif MODE in PAIRED_MODES:
         payload = run_paired(path, ids, insitu_on=(MODE == "equiv"))
     else:
