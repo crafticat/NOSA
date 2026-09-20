@@ -18,7 +18,7 @@ from `feature/nosi-verify-rows` (004f279). Line numbers below are of THIS worktr
 - `twin.py`: `twin_step` (V rows only through the same body) and `InSituTwin` (every term recomputed
   at M = B from the same inputs; `diagnose` names the first differing term).
 - `benchmarks/Efficiency/paired_pilot.py`: arms `shipped`, `twin`, `equiv`, `resident`, `compare`.
-- `tests/test_paired_core.py`: 26 CPU tests (see section 5).
+- `tests/test_paired_core.py`: 28 CPU tests (see section 5).
 
 ## 2. Assumptions about the engine, each with the line that carries it
 

@@ -120,6 +120,7 @@ class Scratch:
         self.comp_len: List[Optional[int]] = [None] * model.num_layers            # M per layer (uniform over the batch), read once
 
 
+@torch.inference_mode()   # the engine's tensors are inference tensors: the zero-fill below is an in-place write on them (state_snapshot.py, job 2174640)
 def setup(model, cache, B: int) -> Scratch:
     """Build the scratch and check every assumption where it is produced:
     the model has the warm-up buffers and the captured graph; every layer's
