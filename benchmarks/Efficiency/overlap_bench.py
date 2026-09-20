@@ -34,6 +34,8 @@ import torch  # noqa: E402
 import verify_alone as VA  # noqa: E402
 
 D_LIST = tuple(int(x) for x in os.environ.get("NOSI_OVERLAP_D", "4 8 16").split())
+ARMS = tuple(os.environ.get("NOSI_OVERLAP_ARMS", "triton memcpy memcpy_pinned triton_mainhi memcpy_pinned_mainhi").split())
+PROFILE_ARMS = tuple(x for x in os.environ.get("NOSI_OVERLAP_PROFILE", "").split() if x)   # arms to capture ONE concurrent step of under torch.profiler (chrome trace)
 REPS = int(os.environ.get("NOSI_OVERLAP_REPS", "3"))
 OUT = VA.OUT
 B_REQ = VA.BATCH
@@ -94,15 +96,34 @@ def run(model, ids):
 
     HOST = {"side_launch_ms": 0.0, "main_launch_ms": 0.0}
     main_hi = torch.cuda.Stream(priority=-1)          # HIGH priority (lower number = higher in CUDA): the 'mainhi' variant runs the step here
-    k_pin = torch.empty((B, Dmax * bs, H, Dh), dtype=e0._k_gpu.dtype, device="cpu").pin_memory()   # CONTIGUOUS pinned staging: a true cudaMemcpyAsync source
-    v_pin = torch.empty_like(k_pin).pin_memory()
-    k_pin.copy_(e0._k_cpu[:, :Dmax * bs]); v_pin.copy_(e0._v_cpu[:, :Dmax * bs])
+    # CONTIGUOUS pinned staging PER D (job 2175547: a sliced view is non-contiguous and falls back to a host-blocking pageable copy)
+    k_pin, v_pin = {}, {}
+    for D in D_LIST:
+        k_pin[D] = torch.empty((B, D * bs, H, Dh), dtype=e0._k_gpu.dtype, device="cpu").pin_memory()
+        v_pin[D] = torch.empty((B, D * bs, H, Dh), dtype=e0._k_gpu.dtype, device="cpu").pin_memory()
+        k_pin[D].copy_(e0._k_cpu[:, :D * bs]); v_pin[D].copy_(e0._v_cpu[:, :D * bs])
+    k_s_c = {D: torch.empty((B, D * bs, H, Dh), dtype=e0._k_gpu.dtype, device="cuda") for D in D_LIST}   # contiguous destinations
+    v_s_c = {D: torch.empty_like(k_s_c[D]) for D in D_LIST}
+    from nosi.flash_cache_engine.flash_h2d_persistent import flash_h2d_persistent
 
     def side_memcpy_pinned(D):
+        for _ in engines:                              # the same bytes per layer as the other arms: contiguous pinned -> contiguous device
+            k_s_c[D].copy_(k_pin[D], non_blocking=True)
+            v_s_c[D].copy_(v_pin[D], non_blocking=True)
+
+    def side_triton_chunked(D, ids_hbd):
         n = D * bs
-        for _ in engines:                              # the same bytes per layer as the other arms, from a contiguous pinned source
-            k_s[:, :n].copy_(k_pin[:, :n], non_blocking=True)
-            v_s[:, :n].copy_(v_pin[:, :n], non_blocking=True)
+        for lay, e in zip(layers, engines):           # one (layer, m) per launch: grid B x H x 1
+            for m in range(D):
+                ids_m = ids_hbd[:, :, m:m + 1].contiguous()
+                gather_k(k_s[:, m * bs:(m + 1) * bs], e._k_cpu, ids_m, bs)
+                gather_v_bias(v_s[:, m * bs:(m + 1) * bs], e._v_cpu, b_s[:, m * bs:(m + 1) * bs], lay.total_cis, ids_m, bs)
+
+    def side_persistent(D, ids_hbd, n_ctas):
+        n = D * bs
+        for e in engines:                              # K and V through the throttled kernel (no bias: timing only)
+            flash_h2d_persistent(k_s[:, :n], e._k_cpu, ids_hbd, bs, n_ctas=n_ctas)
+            flash_h2d_persistent(v_s[:, :n], e._v_cpu, ids_hbd, bs, n_ctas=n_ctas)
 
     def timed(fn_main=None, fn_side=None, main_stream=None):
         ms_ = main if main_stream is None else main_stream
@@ -145,6 +166,7 @@ def run(model, ids):
             trans = ss.transient_ids(model)
             for D in D_LIST:                                    # JIT / first touch of the scratch shapes, untimed
                 timed(None, lambda: side_triton(D, ids_for(D))); timed(None, lambda: side_memcpy(D)); timed(None, lambda: side_memcpy_pinned(D))
+                timed(None, lambda: side_triton_chunked(D, ids_for(D))); timed(None, lambda: side_persistent(D, ids_for(D), 32))
         t_wall = time.time()
         snap.take()
         for e in engines:
@@ -171,9 +193,12 @@ def run(model, ids):
         tA_mean = sum(tA) / len(tA)
         for D in D_LIST:
             ids_hbd = ids_for(D)
-            arms = [("triton", lambda: side_triton(D, ids_hbd), None), ("memcpy", lambda: side_memcpy(D), None),
-                    ("memcpy_pinned", lambda: side_memcpy_pinned(D), None), ("triton_mainhi", lambda: side_triton(D, ids_hbd), main_hi),
-                    ("memcpy_pinned_mainhi", lambda: side_memcpy_pinned(D), main_hi)]
+            all_arms = {"triton": (lambda: side_triton(D, ids_hbd), None), "memcpy": (lambda: side_memcpy(D), None),
+                        "memcpy_pinned": (lambda: side_memcpy_pinned(D), None), "triton_mainhi": (lambda: side_triton(D, ids_hbd), main_hi),
+                        "memcpy_pinned_mainhi": (lambda: side_memcpy_pinned(D), main_hi), "triton_chunked": (lambda: side_triton_chunked(D, ids_hbd), None),
+                        "persistent8": (lambda: side_persistent(D, ids_hbd, 8), None), "persistent32": (lambda: side_persistent(D, ids_hbd, 32), None),
+                        "persistent108": (lambda: side_persistent(D, ids_hbd, 108), None)}
+            arms = [(a, all_arms[a][0], all_arms[a][1]) for a in ARMS if a in all_arms]
             for arm, fn_side, mstream in arms:
                 tS, hS = [], []
                 for rep in range(REPS):
@@ -197,6 +222,19 @@ def run(model, ids):
                 print("[overlap] step %d D=%d %s: A %.1f  S %.1f (%.1f GB/s)  C %.1f (main %.1f, side %.1f)  kappa %.3f  main +%.1f%%  side +%.1f%%  HOST side-launch %.1f ms, main-launch %.1f ms"
                       % (it, D, arm, tA_mean, tS_mean, by / (tS_mean * 1e6), tC_m, tM_cm, tS_cm, rows[-1]["kappa"], 100 * rows[-1]["main_slowdown"], 100 * rows[-1]["side_slowdown"],
                          rows[-1]["host_side_launch_ms_in_C"], rows[-1]["host_main_launch_ms_in_C"]), flush=True)
+        if PROFILE_ARMS and it == VA.WARM:
+            D = max(D_LIST); ids_hbd = ids_for(D)
+            for arm in PROFILE_ARMS:
+                if arm not in all_arms:
+                    continue
+                fn_side, mstream = all_arms[arm]
+                fresh()
+                from torch.profiler import profile, ProfilerActivity
+                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                    timed(lambda: model.decode_inference(tok, cu, position_ids, cache), fn_side, main_stream=mstream)
+                fn = os.path.join(OUT, "trace_%s_b%d_D%d.json" % (arm, B, D))
+                prof.export_chrome_trace(fn)
+                print("[overlap] profiler trace of one concurrent step (%s, D=%d) -> %s" % (arm, D, fn), flush=True)
         snap.restore(); ss.assert_transients_intact(model, trans)
         model.decode_inference(tok, cu, position_ids, cache)          # the advance (natural step)
         torch.cuda.synchronize()
