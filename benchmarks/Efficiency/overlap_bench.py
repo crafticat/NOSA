@@ -92,17 +92,43 @@ def run(model, ids):
     def side_bytes(D):
         return 2 * B * D * bs * H * Dh * elem * nl          # K + V over all layers (the bias, 4 B/row, is not counted)
 
-    def timed(fn_main=None, fn_side=None):
+    HOST = {"side_launch_ms": 0.0, "main_launch_ms": 0.0}
+    main_hi = torch.cuda.Stream(priority=-1)          # HIGH priority (lower number = higher in CUDA): the 'mainhi' variant runs the step here
+    k_pin = torch.empty((B, Dmax * bs, H, Dh), dtype=e0._k_gpu.dtype, device="cpu").pin_memory()   # CONTIGUOUS pinned staging: a true cudaMemcpyAsync source
+    v_pin = torch.empty_like(k_pin).pin_memory()
+    k_pin.copy_(e0._k_cpu[:, :Dmax * bs]); v_pin.copy_(e0._v_cpu[:, :Dmax * bs])
+
+    def side_memcpy_pinned(D):
+        n = D * bs
+        for _ in engines:                              # the same bytes per layer as the other arms, from a contiguous pinned source
+            k_s[:, :n].copy_(k_pin[:, :n], non_blocking=True)
+            v_s[:, :n].copy_(v_pin[:, :n], non_blocking=True)
+
+    def timed(fn_main=None, fn_side=None, main_stream=None):
+        ms_ = main if main_stream is None else main_stream
         torch.cuda.synchronize()
         t0 = torch.cuda.Event(enable_timing=True); tm = torch.cuda.Event(enable_timing=True); ts = torch.cuda.Event(enable_timing=True)
-        t0.record(main)
+        t0.record(ms_)
         if fn_side is not None:
             side.wait_event(t0)
+            h0 = time.perf_counter()
             with torch.cuda.stream(side):
                 fn_side()
                 ts.record(side)
-        out = fn_main() if fn_main is not None else None
-        tm.record(main)
+            HOST["side_launch_ms"] = 1000 * (time.perf_counter() - h0)
+        h1 = time.perf_counter()
+        if fn_main is not None:
+            if main_stream is None:
+                out = fn_main()
+            else:
+                ms_.wait_stream(main)
+                with torch.cuda.stream(ms_):
+                    out = fn_main()
+                main.wait_stream(ms_)
+        else:
+            out = None
+        HOST["main_launch_ms"] = 1000 * (time.perf_counter() - h1)
+        tm.record(ms_)
         torch.cuda.synchronize()
         return out, (t0.elapsed_time(tm) if fn_main is not None else 0.0), (t0.elapsed_time(ts) if fn_side is not None else 0.0)
 
@@ -118,7 +144,7 @@ def run(model, ids):
         if trans is None:
             trans = ss.transient_ids(model)
             for D in D_LIST:                                    # JIT / first touch of the scratch shapes, untimed
-                timed(None, lambda: side_triton(D, ids_for(D))); timed(None, lambda: side_memcpy(D))
+                timed(None, lambda: side_triton(D, ids_for(D))); timed(None, lambda: side_memcpy(D)); timed(None, lambda: side_memcpy_pinned(D))
         t_wall = time.time()
         snap.take()
         for e in engines:
@@ -145,27 +171,32 @@ def run(model, ids):
         tA_mean = sum(tA) / len(tA)
         for D in D_LIST:
             ids_hbd = ids_for(D)
-            for arm, fn_side in (("triton", lambda: side_triton(D, ids_hbd)), ("memcpy", lambda: side_memcpy(D))):
-                tS = []
+            arms = [("triton", lambda: side_triton(D, ids_hbd), None), ("memcpy", lambda: side_memcpy(D), None),
+                    ("memcpy_pinned", lambda: side_memcpy_pinned(D), None), ("triton_mainhi", lambda: side_triton(D, ids_hbd), main_hi),
+                    ("memcpy_pinned_mainhi", lambda: side_memcpy_pinned(D), main_hi)]
+            for arm, fn_side, mstream in arms:
+                tS, hS = [], []
                 for rep in range(REPS):
-                    _, _, t = timed(None, fn_side); tS.append(t)
+                    _, _, t = timed(None, fn_side); tS.append(t); hS.append(HOST["side_launch_ms"])
                 tS_mean = sum(tS) / len(tS)
-                tM_c, tS_c, tC = [], [], []
+                tM_c, tS_c, tC, hSc, hMc = [], [], [], [], []
                 for rep in range(REPS):
                     fresh()
-                    lg, tm_, ts_ = timed(lambda: model.decode_inference(tok, cu, position_ids, cache), fn_side)
+                    lg, tm_, ts_ = timed(lambda: model.decode_inference(tok, cu, position_ids, cache), fn_side, main_stream=mstream)
                     ok = torch.equal(lg, lg_ref) and loaded_now() == 0
                     fails += int(not ok)
-                    tM_c.append(tm_); tS_c.append(ts_); tC.append(max(tm_, ts_))
+                    tM_c.append(tm_); tS_c.append(ts_); tC.append(max(tm_, ts_)); hSc.append(HOST["side_launch_ms"]); hMc.append(HOST["main_launch_ms"])
                 tM_cm, tS_cm, tC_m = (sum(x) / len(x) for x in (tM_c, tS_c, tC))
                 lo, hi = min(tA_mean, tS_mean), max(tA_mean, tS_mean)
                 by = side_bytes(D)
                 rows.append(dict(batch=B, L=VA.L, step=it, D=D, arm=arm, reps=REPS, t_A_ms=tA_mean, t_A_std=VA._std(tA), t_S_alone_ms=tS_mean,
                                  t_main_in_C_ms=tM_cm, t_side_in_C_ms=tS_cm, t_C_ms=tC_m, kappa=(tC_m - hi) / lo if lo > 0 else float("nan"),
                                  main_slowdown=tM_cm / tA_mean - 1, side_slowdown=tS_cm / tS_mean - 1,
-                                 bytes=by, bw_alone_gbps=by / (tS_mean * 1e6), bw_in_C_gbps=by / (tS_cm * 1e6), serial_sum_ms=tA_mean + tS_mean))
-                print("[overlap] step %d D=%d %s: A %.1f  S %.1f (%.1f GB/s)  C %.1f (main %.1f, side %.1f)  kappa %.3f  main +%.1f%%  side +%.1f%%"
-                      % (it, D, arm, tA_mean, tS_mean, by / (tS_mean * 1e6), tC_m, tM_cm, tS_cm, rows[-1]["kappa"], 100 * rows[-1]["main_slowdown"], 100 * rows[-1]["side_slowdown"]), flush=True)
+                                 bytes=by, bw_alone_gbps=by / (tS_mean * 1e6), bw_in_C_gbps=by / (tS_cm * 1e6), serial_sum_ms=tA_mean + tS_mean,
+                                 host_side_launch_ms_alone=sum(hS) / len(hS), host_side_launch_ms_in_C=sum(hSc) / len(hSc), host_main_launch_ms_in_C=sum(hMc) / len(hMc)))
+                print("[overlap] step %d D=%d %s: A %.1f  S %.1f (%.1f GB/s)  C %.1f (main %.1f, side %.1f)  kappa %.3f  main +%.1f%%  side +%.1f%%  HOST side-launch %.1f ms, main-launch %.1f ms"
+                      % (it, D, arm, tA_mean, tS_mean, by / (tS_mean * 1e6), tC_m, tM_cm, tS_cm, rows[-1]["kappa"], 100 * rows[-1]["main_slowdown"], 100 * rows[-1]["side_slowdown"],
+                         rows[-1]["host_side_launch_ms_in_C"], rows[-1]["host_main_launch_ms_in_C"]), flush=True)
         snap.restore(); ss.assert_transients_intact(model, trans)
         model.decode_inference(tok, cu, position_ids, cache)          # the advance (natural step)
         torch.cuda.synchronize()
@@ -181,14 +212,15 @@ def summarize(payloads):
         for r in p["rows"]:
             acc[(r["batch"], r["D"], r["arm"])].append(r)
     L = ["## E3 overlap: resident step A vs side transfer S vs both C (mean over gated steps x reps)", "",
-         "| B | D | arm | t_A ms | t_S alone ms (GB/s) | t_C ms | main in C ms (+%) | side in C ms (+%, GB/s) | serial sum | kappa |", "|---|---|---|---|---|---|---|---|---|---|"]
+         "| B | D | arm | t_A ms | t_S alone ms (GB/s) | t_C ms | main in C ms (+%) | side in C ms (+%, GB/s) | serial sum | kappa | HOST side launch ms (alone / in C) | HOST main launch ms in C |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     verdicts, summ = {}, {}
     for key in sorted(acc):
         rs = acc[key]; m = lambda k: sum(r[k] for r in rs) / len(rs)
         B, D, arm = key
         summ[str(key)] = dict(B=B, D=D, arm=arm, n=len(rs), t_A=m("t_A_ms"), t_S=m("t_S_alone_ms"), t_C=m("t_C_ms"), kappa=m("kappa"), bw_alone=m("bw_alone_gbps"), bw_in_C=m("bw_in_C_gbps"), main_slowdown=m("main_slowdown"), side_slowdown=m("side_slowdown"))
         s = summ[str(key)]
-        L.append("| %d | %d | %s | %.1f | %.1f (%.1f) | %.1f | %.1f (%+.0f%%) | %.1f (%+.0f%%, %.1f) | %.1f | %.3f |" % (B, D, arm, s["t_A"], s["t_S"], s["bw_alone"], s["t_C"], m("t_main_in_C_ms"), 100 * s["main_slowdown"], m("t_side_in_C_ms"), 100 * s["side_slowdown"], s["bw_in_C"], m("serial_sum_ms"), s["kappa"]))
+        hs = (lambda k: (sum(r.get(k, float("nan")) for r in rs) / len(rs)))
+        L.append("| %d | %d | %s | %.1f | %.1f (%.1f) | %.1f | %.1f (%+.0f%%) | %.1f (%+.0f%%, %.1f) | %.1f | %.3f | %.1f / %.1f | %.1f |" % (B, D, arm, s["t_A"], s["t_S"], s["bw_alone"], s["t_C"], m("t_main_in_C_ms"), 100 * s["main_slowdown"], m("t_side_in_C_ms"), 100 * s["side_slowdown"], s["bw_in_C"], m("serial_sum_ms"), s["kappa"], hs("host_side_launch_ms_alone"), hs("host_side_launch_ms_in_C"), hs("host_main_launch_ms_in_C")))
     for (B, D, arm), rs in acc.items():
         if D >= 8:
             k = sum(r["kappa"] for r in rs) / len(rs); bw = sum(r["bw_alone_gbps"] for r in rs) / len(rs)
