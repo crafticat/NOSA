@@ -127,7 +127,11 @@ def run(model, ids):
         T = [mc.record_targets(e, l) for l, e in enumerate(engines)]
 
         def fresh():
+            # verify_alone's arm-A recipe (run_points step 3): restore -> FLUSH the map -> prewarm T_l;
+            # prewarm from the natural pre-step map is refused by design (miss_control.prewarm docstring)
             snap.restore(); ss.assert_transients_intact(model, trans)
+            for e in engines:
+                mc.flush_map(e)
             ok = prewarm_all(T)
             if not ok:
                 raise RuntimeError("prewarm failed at step %d" % it)
