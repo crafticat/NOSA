@@ -800,7 +800,8 @@ def test_subset_scoring_leaves_the_tables_equal_and_the_alias_is_live():
     assert not torch.equal(snap, clayer.compressed_cis) and torch.equal(clayer.compressed_cis[:, 0], snap[:, 2]), "requests 0..n-1 receive other requests' cis"
     src = (NOSI_PKG / "paired" / "tick.py").read_text()
     assert "compressed_cis_buf[:, :" not in src and "score_buf[:, :" not in src, "never a slice write into the graph's buffers"
-    assert "layer.compressed_cis_buf.copy_(compressed_cis)" in src and "layer.score_buf.copy_(score)" in src
+    assert "ss.cis_buf.copy_(compressed_cis)" in src and "ss.score_buf.copy_(score)" in src, "full copies through the scoring set (the main set's cis_buf is the table alias: a self-copy)"
+    assert "def main_scoring(model, layer)" in src and "cis_buf=layer.compressed_cis_buf" in src
 
 
 def test_v_scores_against_the_state_the_decode_scores_against():
