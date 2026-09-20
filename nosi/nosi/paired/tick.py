@@ -1,0 +1,476 @@
+"""The PAIRED TICK's model-level body and driver methods (GPU; spec
+retroinfer-eval docs/superpowers/specs/2026-09-20-paired-tick.md section 1,
+gates G1-G8; stage E2 of section 4: RESIDENT, no per-layer prefetch).
+
+ONE per-layer body, ``layer_body``, serves three row layouts (core.RowPlan):
+  paired   rows [V | S] per request, adjacent (2B rows): the tick;
+  twin     V rows only (B rows): the reference twin of gate G3 (twin.py);
+  srows    S rows only over a subset of requests (n rows): the RESTART after
+           a reject and the SEED before the first tick (spec section 3 (a)).
+Per layer, in order (spec section 1, audit D.2):
+  [1] prenorm, ONE qkv GEMM over all rows (M = n*U), nosa_linear, rope with
+      per-row positions (tau for V, tau + 1 for S): verify_forward's text
+      (nosa_llama.py:697-708) at U = 2.
+  [3] scoring per position through the DECODE's kernels and the captured
+      pooling / top-k graph, one position at a time on the table state that
+      position sees (verify_forward :714-739): V's table update persists;
+      S's is bracketed by spec_loop.LayerJournal.take / restore, so the S
+      position's state follows V's and nothing of it survives (G5).
+  [4] the V row's engine update = the SHIPPED S == 1 body, called, not
+      copied: cache.decode_update_kv -> cache_engine.decode_update_has_kv_bias
+      (tail write :345-357, diff :363, the two BLOCKING Triton gathers
+      :381-382, the write-back and rename on a fill :401-409). Its 64-slot
+      return views are not used: the rows call reads the whole allocation.
+      V's residual misses = _load_mask >= 0 after it (bytes counted).
+      The S row's K/V/bias -> row 0 of the provisional slot (core).
+  [5] the per-row bias (core.paired_bias) and ONE rows-attention call over
+      all rows: the shipped decode kernel through cache_batch_idx and a
+      per-row bias (verify/rows_attention.py, reuse ledger (ii-a)), explicit
+      num_splits (refused at 0: the heuristic depends on the row count).
+  [6] wo, FFN over all rows.
+The driver methods: ``paired_tick`` (one tick: (B, 2) rows -> V and S logits,
+then the poison of the provisional rows under NOSI_PAIRED_POISON=1),
+``s_rows_forward`` (restart / seed over a subset), ``setup`` (the scratch:
+layout checks, the bias storage, the E2 readiness mask, the journals, the
+one-time zero-fill of the tail slot's never-written rows).
+
+No CUDA extension is imported at module level: ``_gpu`` binds the model
+module's names (nosa_llama.py:1-42) and the shipped kernel entry
+``flash_attn_nosa.flash_attn_with_kvcache`` on first use, so this module and
+its text are importable by the CPU tests.
+"""
+from __future__ import annotations
+
+import os
+from typing import List, NamedTuple, Optional
+
+import torch
+import torch.nn.functional as F
+
+from . import core
+from .. import spec_loop as _sl
+
+
+class TickConfig(NamedTuple):
+    num_splits: int        # explicit split-KV count of every rows call (> 0)
+    poison: bool           # NaN-poison the provisional rows after every S write's tick (G1 / G7 control)
+    masked: float          # the finite masked bias value
+    refuse_compress: bool  # refuse a 16-token compress event inside a call (the captured pooling graph is fixed-shape)
+
+
+def config_from_env() -> TickConfig:
+    """Resolved by the DRIVER at dispatch time (never at import): NOSI_ATTN_SPLITS
+    (default 4; 0 refused), NOSI_PAIRED_POISON (1 = on)."""
+    raw = os.environ.get("NOSI_ATTN_SPLITS", "4")
+    try:
+        splits = int(raw)
+    except ValueError:
+        raise SystemExit("NOSI_ATTN_SPLITS=%r is not an integer" % raw)
+    if not (1 <= splits <= 128):
+        raise SystemExit("NOSI_ATTN_SPLITS=%d: the paired tick needs an EXPLICIT split count in [1, 128] "
+                         "(0 = the library heuristic, which depends on the number of rows and breaks the twin identity)" % splits)
+    return TickConfig(num_splits=splits, poison=os.environ.get("NOSI_PAIRED_POISON", "0") == "1",
+                      masked=core.MASKED, refuse_compress=True)
+
+
+class _GPU(NamedTuple):
+    NL: object          # nosi.nosa_llama: layer_norm, nosa_linear, apply_rope_with_cos_sin_cache_inplace, infllmv2_attn_stage1_fast, silu_and_mul
+    fa: object          # flash_attn_nosa.flash_attn_with_kvcache: THE shipped decode kernel entry (nosa_llama.py:42)
+    bias_rows: object   # cache_engine._bias_rows: KV_BIAS_SCALE applied exactly as the engine's four write sites do
+
+
+_G: Optional[_GPU] = None
+
+
+def _gpu() -> _GPU:
+    global _G
+    if _G is None:
+        import nosi.nosa_llama as NL
+        from nosi import cache_engine as CE
+        from flash_attn_nosa import flash_attn_with_kvcache
+        _G = _GPU(NL=NL, fa=flash_attn_with_kvcache, bias_rows=CE._bias_rows)
+    return _G
+
+
+# ---------------------------------------------------------------------------
+# the per-process scratch
+# ---------------------------------------------------------------------------
+class Scratch:
+    """Everything the tick needs beyond the model and the cache, allocated once."""
+
+    def __init__(self, model, cache, lay: core.Layout, B: int):
+        self.lay = lay
+        self.B = int(B)
+        eng0 = cache.layers[0].cache_engine
+        dev, dtype = eng0._k_gpu.device, eng0._k_gpu.dtype
+        H, D = eng0.head_num, eng0.head_dim
+        self.device, self.dtype, self.H, self.D = dev, dtype, H, D
+        rows = lay.W * lay.bs
+        # the rows bias storage: >= max(2B, B) rows (the kernel's host check wants bias.size(0) == B on the narrowed view)
+        self.bias = torch.empty((2 * self.B, rows, H), dtype=dtype, device=dev)
+        self.bias_twin = torch.empty((self.B, rows, H), dtype=dtype, device=dev)
+        self.ready = core.ready_mask(H, self.B, lay, device=dev)                      # E2: window + tail + provisional; ring not ready
+        self.journals = [_sl.LayerJournal() for _ in range(model.num_layers)]
+        self.slot_complete = [False] * model.num_layers                            # slot topk-1 holds a complete block (after a fill)
+        self.prev_sel_s: List[Optional[torch.Tensor]] = [None] * model.num_layers  # (H, B, K) int64: S's selection for the NEXT V position
+        self.req_all = torch.arange(self.B, dtype=torch.int64, device=dev)
+        self.cu_full = torch.arange(self.B + 1, dtype=torch.int32, device=dev)
+        self.key_pad = torch.zeros((self.B, 1, H, D), dtype=dtype, device=dev)
+        self.cis_pad = torch.zeros((self.B, 1, H), dtype=dtype, device=dev)
+        self.comp_len: List[Optional[int]] = [None] * model.num_layers            # M per layer (uniform over the batch), read once
+
+
+def setup(model, cache, B: int) -> Scratch:
+    """Build the scratch and check every assumption where it is produced:
+    the model has the warm-up buffers and the captured graph; every layer's
+    engine has the layout's allocation (R >= 1, no pool); the window is fully
+    occupied (every row the V rows read has been written by a gather); the
+    never-written rows of the tail slot are zero-filled ONCE (the rows call
+    loads every row below a row's extent: rows_attention.py PRECONDITION; the
+    shipped decode never reads them, so this changes no served logit); the
+    compressed length is uniform over the batch (the subset scoring of the
+    restart builds its cu_seqlens from it)."""
+    if not getattr(model, "has_buffers", False):
+        raise RuntimeError("the paired tick needs the warm-up decode step's buffers and captured pooling graph (decode_inference warmup) first")
+    eng0 = cache.layers[0].cache_engine
+    if int(eng0._k_gpu.shape[0]) != int(B):
+        raise RuntimeError("engine batch %d != B=%d" % (eng0._k_gpu.shape[0], B))
+    lay = core.paired_layout(eng0.topk, eng0.verify_round_slots, eng0.block_size)
+    sc = Scratch(model, cache, lay, B)
+    for l, clayer in enumerate(cache.layers):
+        eng = clayer.cache_engine
+        core.check_layout_against_engine(lay, eng)
+        if not bool((eng._block_map[..., :lay.tail_slot] >= 0).all()):
+            raise RuntimeError("layer %d: the window has unoccupied slots; the V rows read the whole window (run the warm-up decode step first, "
+                               "and use a context long enough for 64 selected blocks)" % l)
+        tl = int(eng._tail_block_len_on_gpu)
+        lo, hi = lay.tail_slot * lay.bs + tl, (lay.tail_slot + 1) * lay.bs
+        if hi > lo:
+            eng._k_gpu[:, lo:hi].zero_()
+            eng._v_gpu[:, lo:hi].zero_()
+            eng._kv_bias_gpu[:, lo:hi].zero_()
+        cu = clayer.cached_compressed_cu_seqlens
+        M = int(clayer.cached_compressed_max_seqlen)
+        if not bool(((cu[1:] - cu[:-1]) == M).all()):
+            raise RuntimeError("layer %d: the compressed length is not uniform over the batch (max %d); the subset scoring assumes it" % (l, M))
+        sc.comp_len[l] = M
+        if clayer.compress_k_cache_varlen.shape[1] != M:
+            raise RuntimeError("layer %d: compress_k_cache_varlen has %d columns, cached max %d" % (l, clayer.compress_k_cache_varlen.shape[1], M))
+    return sc
+
+
+def compress_budget(cache, n_positions_ahead: int) -> int:
+    """How many more positions (V appends + one provisional S append) fit
+    before a 16-token compress event: pooling_block_size - no_compress_k_len.
+    A compress event changes the stage-1 score's column count while the
+    captured graph's score_buf is fixed-shape (nosa_llama.py:465-497,
+    :613-618): the call would fail at score_buf.copy_. The driver sizes N
+    from this once, after the warm-up step."""
+    layer0 = cache.layers[0]
+    kernel_size = int(layer0.no_compress_k_cache.shape[1])
+    return kernel_size - int(layer0.no_compress_k_len) - int(n_positions_ahead)
+
+
+# ---------------------------------------------------------------------------
+# scoring: the decode's per-position chain (stage 1 + the captured pooling / top-k graph)
+# ---------------------------------------------------------------------------
+def score_position(G, model, cache, layer, l: int, q_u: torch.Tensor, k_u: torch.Tensor, cis_u: torch.Tensor,
+                   sc: Scratch, cfg: TickConfig, req_idx: Optional[torch.Tensor]):
+    """One position's table updates and selection, exactly decode_forward's /
+    verify_forward's text (nosa_llama.py:715-739) for the whole batch
+    (req_idx None), or for a SUBSET of requests: the subset's rows are
+    scattered into a zero-padded full-batch key / cis (the layer tables are
+    batch-wide; the caller journals and restores them), the stage-1 call runs
+    over the subset's compressed keys (gathered) with its own cu_seqlens, and
+    the score lands in the first n rows of the captured graph's score_buf
+    (nosa_pooling and top-k are per-row: rows >= n are stale and unread).
+    Returns (sel (H, n, K) int64, ucis = the layer's total_cis table)."""
+    NL = G.NL
+    B = sc.B
+    if req_idx is None:
+        key_full = k_u.unsqueeze(1).contiguous()
+        cis_full = cis_u.unsqueeze(1).contiguous()
+        n = B
+    else:
+        n = int(req_idx.numel())
+        key_full, cis_full = sc.key_pad, sc.cis_pad
+        key_full.zero_(); cis_full.zero_()
+        key_full[req_idx, 0] = k_u
+        cis_full[req_idx, 0] = cis_u
+    no_compress_k = cache.update_no_compress_k_decode(key_full, l, layer.pooling_block_size, layer.pooling_stride)
+    if no_compress_k is not None:
+        if cfg.refuse_compress:
+            raise RuntimeError("layer %d: a 16-token compress event fired inside a paired call (no_compress_k_len reached %d); the captured "
+                               "pooling graph's score_buf is fixed-shape (nosa_llama.py:465-497): shorten the run or move L (tick.compress_budget)"
+                               % (l, layer.pooling_block_size))
+        new_compressed_k = no_compress_k.mean(dim=1, keepdim=True)
+    else:
+        new_compressed_k = None
+    compressed_k, cu_comp, max_seqlen_comp = cache.update_compress_k_decode(new_compressed_k, l)
+    ucis = cache.update_uncompressed_cis(cis_full, l, 0, B)
+    compressed_cis = cache.update_cis(cis_full.permute(2, 0, 1), l, 0, B)          # (H, B, M)
+    if req_idx is None:
+        ck = compressed_k.contiguous().flatten(0, 1)
+        cu_q, cu_k, ccis = sc.cu_full, cu_comp, compressed_cis
+    else:
+        M = sc.comp_len[l]
+        ck = compressed_k.index_select(0, req_idx).contiguous().flatten(0, 1)
+        cu_q = torch.arange(n + 1, dtype=torch.int32, device=q_u.device)
+        cu_k = cu_q * M
+        ccis = compressed_cis.index_select(1, req_idx)
+    score = NL.infllmv2_attn_stage1_fast(q_u.contiguous(), ck, ck, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+                                         max_seqlen_q=1, max_seqlen_k=max_seqlen_comp, causal=False)
+    layer.score_buf[:, :n].copy_(score)
+    layer.compressed_cis_buf[:, :n].copy_(ccis)
+    layer.after_pooling_graph.replay()
+    sel = model.topk_idx_buf[:, :n].clone()                                         # (H, n, K) int64; the buffer is rewritten by the next replay
+    return sel, ucis
+
+
+# ---------------------------------------------------------------------------
+# the attention call: the shipped decode kernel over R rows
+# ---------------------------------------------------------------------------
+def attend_rows(G, q: torch.Tensor, k_gpu: torch.Tensor, v_gpu: torch.Tensor, rb, num_splits: int) -> torch.Tensor:
+    """q (R, Hq, D) contiguous; K/V = the WHOLE allocation (B, W*bs, Hkv, D);
+    rb = core.paired_bias's RowsBias whose storage has >= max(R, B) rows.
+    Every kernel fact rows_attention.rows_attention_args asserts is asserted
+    here for a row count R that need not equal B*U (the restart's subset):
+    the narrowed view bias[:B] satisfies flash_api.cpp:366, its stride(0) is
+    what the kernel multiplies the query row by, and the storage holds every
+    row < R. Returns (R, Hq, D) in the store dtype."""
+    if k_gpu.dim() != 4:
+        raise ValueError("k_gpu must be (B, W*bs, Hkv, D), got %s" % (tuple(k_gpu.shape),))
+    B, rows, Hkv, D = k_gpu.shape
+    if tuple(v_gpu.shape) != (B, rows, Hkv, D) or not (k_gpu.is_contiguous() and v_gpu.is_contiguous()):
+        raise ValueError("v_gpu must match k_gpu and both must be the contiguous allocation")
+    if q.dim() != 3 or q.shape[2] != D or not q.is_contiguous():
+        raise ValueError("q must be a contiguous (R, Hq, D=%d), got %s" % (D, tuple(q.shape)))
+    R, Hq, _ = q.shape
+    if R < 1 or Hq % Hkv != 0 or D % 8 != 0:
+        raise ValueError("R=%d Hq=%d Hkv=%d D=%d: need R >= 1, Hq %% Hkv == 0, D %% 8 == 0 (the ngroups swap)" % (R, Hq, Hkv, D))
+    bias = rb.bias
+    if bias.dim() != 3 or tuple(bias.shape[1:]) != (rows, Hkv) or bias.shape[0] < max(R, B) or not bias.is_contiguous():
+        raise ValueError("bias storage must be a contiguous (>= max(R, B)=%d, %d, %d), got %s" % (max(R, B), rows, Hkv, tuple(bias.shape)))
+    if not (q.dtype == k_gpu.dtype == v_gpu.dtype == bias.dtype):
+        raise TypeError("q/k/v/bias dtypes differ: %s %s %s %s" % (q.dtype, k_gpu.dtype, v_gpu.dtype, bias.dtype))
+    cbi, csl = rb.cache_batch_idx, rb.cache_seqlens
+    if cbi.dtype != torch.int32 or tuple(cbi.shape) != (R,) or not cbi.is_contiguous():
+        raise ValueError("cache_batch_idx must be int32 contiguous (R=%d,), got %s %s" % (R, cbi.dtype, tuple(cbi.shape)))
+    if csl.dtype != torch.int32 or tuple(csl.shape) != (R,) or not csl.is_contiguous():
+        raise ValueError("cache_seqlens must be int32 contiguous (R=%d,), got %s %s" % (R, csl.dtype, tuple(csl.shape)))
+    if not (q.device == k_gpu.device == v_gpu.device == bias.device == cbi.device == csl.device):
+        raise ValueError("q/k/v/bias/cache_seqlens/cache_batch_idx are not on one device")
+    ns = int(num_splits)
+    if not (1 <= ns <= 128):
+        raise ValueError("num_splits=%d must be explicit in [1, 128]" % ns)
+    bias_view = bias[:B]
+    if bias_view.stride(0) != rows * Hkv or bias_view.stride(-2) != Hkv or bias_view.stride(-1) != 1 or bias_view.data_ptr() != bias.data_ptr():
+        raise AssertionError("bias[:B] strides %s; the kernel needs (W*bs*Hkv, Hkv, 1) over the full storage" % (bias_view.stride(),))
+    out = G.fa(q.unsqueeze(1), k_gpu, v_gpu, bias_view, cache_seqlens=csl, cache_batch_idx=cbi, num_splits=ns)
+    if tuple(out.shape) != (R, 1, Hq, D):
+        raise AssertionError("kernel output %s != (R, 1, Hq, D) = %s" % (tuple(out.shape), (R, 1, Hq, D)))
+    return out.squeeze(1)
+
+
+# ---------------------------------------------------------------------------
+# the per-layer body
+# ---------------------------------------------------------------------------
+class LayerOut(NamedTuple):
+    hidden: torch.Tensor
+    account: core.LayerAccount
+    insitu: Optional[dict]
+
+
+def layer_body(G, model, cache, l: int, hidden: torch.Tensor, position_ids: torch.Tensor, plan: core.RowPlan,
+               req_idx: torch.Tensor, whole_batch: bool, sc: Scratch, cfg: TickConfig, trace=None, insitu=None) -> LayerOut:
+    NL = G.NL
+    layer = model.layers[l]
+    clayer = cache.layers[l]
+    eng = clayer.cache_engine
+    lay = sc.lay
+    if trace is not None:
+        trace.begin_layer(l)
+    n, U, _ = hidden.shape
+    if U != plan.U or n != int(req_idx.numel()):
+        raise ValueError("hidden %s does not match the row plan (n=%d, U=%d)" % (tuple(hidden.shape), req_idx.numel(), plan.U))
+    Hq, Hk, D = layer.num_heads, layer.num_key_value_heads, layer.head_dim
+    sub = None if whole_batch else req_idx
+    residual = hidden
+
+    # [1] prenorm, qkv GEMM over all rows, rope at per-row positions (verify_forward :697-708)
+    hs = NL.layer_norm(hidden, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
+    qkv = F.linear(hs, layer.wqkv)
+    q, k, v, cis = NL.nosa_linear(qkv, layer.delta.weight, layer.A, layer.q_size, layer.kv_size, Hk)
+    q = q.view(n * U, -1)
+    k = k.view(n * U, -1)
+    NL.apply_rope_with_cos_sin_cache_inplace(position_ids.flatten(), q, k, D, model.cos_sin_cache, True)
+    q = q.reshape(n, U, Hq, D)
+    k = k.reshape(n, U, Hk, D)
+    v = v.reshape(n, U, Hk, D)
+
+    # [3] scoring, one position at a time, on the table state that position sees
+    if trace is not None:
+        trace.rec("score_begin")
+    u = 0
+    sel_v = sel_s = ucis = None
+    if plan.has_v:
+        sel_v, ucis = score_position(G, model, cache, layer, l, q[:, u], k[:, u], cis[:, u], sc, cfg, None)
+        u += 1
+    if plan.has_s:
+        j = sc.journals[l]
+        j.take(clayer)
+        sel_s, _ = score_position(G, model, cache, layer, l, q[:, u], k[:, u], cis[:, u], sc, cfg, sub)
+        j.restore(clayer)                                     # the S position's table state never survives (G5)
+
+    # [4] the V row's engine update = the shipped S == 1 body; the S row's provisional write
+    if trace is not None:
+        trace.rec("fetch_begin")
+    tail_len_before = int(eng._tail_block_len_on_gpu)
+    v_miss = None
+    if plan.has_v:
+        cache.decode_update_kv(k[:, 0], v[:, 0], ucis, l, sel_v)      # returns the 64-slot views; the rows call reads the allocation
+        v_miss = (eng._load_mask >= 0).sum(-1)                        # (H, B): V's residual misses, fetched BLOCKING above
+    tv = core.tail_view(tail_len_before, plan.has_v, sc.slot_complete[l], lay)
+    sc.slot_complete[l] = tv.slot_complete
+    if int(eng._tail_block_len_on_gpu) != tv.tail_len_after:
+        raise AssertionError("layer %d: engine tail_len %d != the S == 1 rule's %d" % (l, eng._tail_block_len_on_gpu, tv.tail_len_after))
+    if plan.has_s:
+        core.s_provisional_write(eng, k[:, u], v[:, u], G.bias_rows(cis[:, u].unsqueeze(1)), lay, sub)
+
+    # [5] the per-row bias and ONE rows-attention call
+    vis_v = vis_s = None
+    if plan.has_v:
+        vis_v = core.v_visible_rows(Hk, n, lay, tv.tail_len_after, device=sc.device)
+    if plan.has_s:
+        content_id = eng._block_map[..., lay.tail_slot] - tv.content_offset
+        ids = core.slot_ids(eng._block_map, content_id, lay)
+        ids_n, ready_n = (ids, sc.ready) if whole_batch else (ids[:, req_idx], sc.ready[:, req_idx])
+        vis_s = core.s_visible_rows(ids_n, ready_n, sel_s, lay, tv.tail_rows_for_s)
+    vis, cbi = core.assemble_rows(plan, vis_v, vis_s, req_idx)
+    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, plan.U, cfg.masked, out=sc.bias)
+    if trace is not None:
+        trace.rec("fetch_end")
+    q_rows = q.reshape(n * U, Hq, D).contiguous()
+    attn = attend_rows(G, q_rows, eng._k_gpu, eng._v_gpu, rb, cfg.num_splits)
+    if trace is not None:
+        trace.rec("attn_end")
+    attn = attn.view(n, U, -1)
+
+    # [6] wo, FFN over all rows (decode_forward :652-667)
+    hidden = residual + F.linear(attn, layer.wo)
+    residual = hidden
+    hs = NL.layer_norm(hidden, layer.post_attention_layernorm_variance_epsilon, layer.post_attention_layernorm_weight)
+    gu = F.linear(hs, layer.gate_up_proj)
+    dd = gu.shape[-1] // 2
+    act = torch.empty(gu.shape[:-1] + (dd,), dtype=gu.dtype, device=gu.device)
+    NL.silu_and_mul(gu, act)
+    hidden = residual + F.linear(act, layer.down_proj)
+
+    # accounting (core): misses, S's selections and hits, the divergence vs S's prediction for this V position
+    # (the twin arm has no S rows and no prediction: its accounts carry no divergence; the paired
+    # driver asserts the seed ran before the first tick, so every V position there has one)
+    sel_s_prev = sc.prev_sel_s[l] if plan.has_v else None
+    acct = core.layer_account(v_miss, sel_s, vis_s, sel_v, sel_s_prev, lay, tv.tail_len_after, tv.filled)
+    if plan.has_s:
+        if sc.prev_sel_s[l] is None:
+            sc.prev_sel_s[l] = torch.full((Hk, sc.B, sel_s.shape[-1]), -1, dtype=torch.int64, device=sc.device)
+        if whole_batch:
+            sc.prev_sel_s[l].copy_(sel_s)
+        else:
+            sc.prev_sel_s[l][:, req_idx] = sel_s
+    rec = None
+    if insitu is not None and plan.has_v and plan.has_s:
+        rec = insitu.compare_layer(G, model, layer, l, position_ids=position_ids, q=q, k=k, v=v, cis=cis, vis_v=vis_v,
+                                   rb=rb, attn=attn, hidden_out=hidden, eng=eng, sc=sc, cfg=cfg)
+    return LayerOut(hidden=hidden, account=acct, insitu=rec)
+
+
+# ---------------------------------------------------------------------------
+# driver methods
+# ---------------------------------------------------------------------------
+class TickResult(NamedTuple):
+    logits_v: torch.Tensor           # (n, V) fp32
+    logits_s: Optional[torch.Tensor] # (n, V) fp32 or None
+    accounts: List[core.LayerAccount]
+    insitu: Optional[list]           # per-layer in-situ twin records (+ the head record) or None
+
+
+def _forward(G, model, cache, sc: Scratch, cfg: TickConfig, tokens: torch.Tensor, position_ids: torch.Tensor,
+             plan: core.RowPlan, req_idx: torch.Tensor, whole_batch: bool, trace=None, insitu=None) -> TickResult:
+    NL = G.NL
+    n, U = tokens.shape
+    if tuple(position_ids.shape) != (n, U) or U != plan.U:
+        raise ValueError("tokens %s / position_ids %s / plan U=%d disagree" % (tuple(tokens.shape), tuple(position_ids.shape), plan.U))
+    hidden = F.embedding(tokens, model.embed_tokens)
+    if trace is not None:
+        trace.begin_call()
+    accts, recs = [], []
+    for l in range(model.num_layers):
+        if insitu is not None:
+            insitu.capture_input(l, hidden)
+        out = layer_body(G, model, cache, l, hidden, position_ids, plan, req_idx, whole_batch, sc, cfg, trace=trace, insitu=insitu)
+        hidden = out.hidden
+        accts.append(out.account)
+        if out.insitu is not None:
+            recs.append(out.insitu)
+    pre = hidden
+    hidden = NL.layer_norm(hidden, model.norm_variance_epsilon, model.norm_weight)
+    logits = F.linear(hidden, model.lm_head).float()                                  # (n, U, V)
+    if trace is not None:
+        trace.end_call()
+    if insitu is not None and plan.has_v and plan.has_s:
+        recs.append(insitu.compare_head(G, model, pre, hidden, logits))
+    if plan.has_s and cfg.poison:
+        for clayer in cache.layers:
+            core.poison_provisional(clayer.cache_engine, sc.lay, None if whole_batch else req_idx)
+    lv = logits[:, 0] if plan.has_v else None
+    ls = logits[:, U - 1] if plan.has_s else None
+    return TickResult(logits_v=lv if lv is not None else ls, logits_s=ls if plan.has_v else None, accounts=accts, insitu=(recs if insitu is not None else None))
+
+
+@torch.inference_mode()
+def paired_tick(model, cache, sc: Scratch, cfg: TickConfig, v_tokens: torch.Tensor, s_tokens: torch.Tensor,
+                position: torch.Tensor, trace=None, insitu=None) -> TickResult:
+    """ONE TICK over the whole batch: v_tokens / s_tokens (B,) int64, position
+    (B,) the committed position tau (any integer dtype the rope accepts).
+    Returns V's and S's fp32 logits (B, V) and the per-layer accounts."""
+    G = _gpu()
+    B = sc.B
+    for name, t in (("v_tokens", v_tokens), ("s_tokens", s_tokens), ("position", position)):
+        if tuple(t.shape) != (B,):
+            raise ValueError("%s must be (B=%d,), got %s" % (name, B, tuple(t.shape)))
+    plan = core.row_plan(sc.req_all, True, True)
+    toks = torch.stack([v_tokens, s_tokens], dim=1)                # (B, 2): row 2b = V, 2b + 1 = S
+    pos = torch.stack([position, position + 1], dim=1)
+    return _forward(G, model, cache, sc, cfg, toks, pos, plan, sc.req_all, True, trace=trace, insitu=insitu)
+
+
+@torch.inference_mode()
+def s_rows_forward(model, cache, sc: Scratch, cfg: TickConfig, tokens: torch.Tensor, position: torch.Tensor,
+                   req_idx: torch.Tensor, trace=None) -> TickResult:
+    """The RESTART (after a reject: position tau + 1 on the committed token)
+    and the SEED (before the first tick: position tau on the V input) over a
+    subset of requests, spec section 3 option (a): S rows only, resident-only
+    attention, provisional writes, journaled tables. tokens / position /
+    req_idx (n,). Returns the rows' fp32 logits (n, V) as logits_v."""
+    G = _gpu()
+    n = int(req_idx.numel())
+    if n < 1 or tuple(tokens.shape) != (n,) or tuple(position.shape) != (n,):
+        raise ValueError("tokens %s / position %s must be (n=%d,) with n >= 1" % (tuple(tokens.shape), tuple(position.shape), n))
+    whole = (n == sc.B) and bool(torch.equal(req_idx, sc.req_all))
+    plan = core.row_plan(req_idx, False, True)
+    return _forward(G, model, cache, sc, cfg, tokens.unsqueeze(1), position.unsqueeze(1), plan, req_idx, whole, trace=trace)
+
+
+def restart_after(model, cache, sc: Scratch, cfg: TickConfig, state: core.DraftState, outcome: core.TickOutcome,
+                  committed: torch.Tensor, position_next: torch.Tensor, trace=None) -> int:
+    """Spec section 3 (a): the sequential restart for outcome.restart_idx:
+    S rows at position tau + 1 on the committed token; their argmax becomes
+    the draft for tau + 2. Returns (rows run, their per-layer accounts); (0, []) when none."""
+    idx = outcome.restart_idx
+    n = int(idx.numel())
+    if n == 0:
+        return 0, []
+    res = s_rows_forward(model, cache, sc, cfg, committed[idx], position_next[idx], idx, trace=trace)
+    state.apply_restart(idx, res.logits_v.argmax(-1))
+    return n, res.accounts
