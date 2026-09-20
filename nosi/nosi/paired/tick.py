@@ -49,6 +49,7 @@ import torch.nn.functional as F
 
 from . import core
 from . import fused_bias as _fb
+from . import prefetch as _pf
 from .. import spec_loop as _sl
 
 
@@ -61,12 +62,19 @@ class TickConfig(NamedTuple):
     s_off: bool            # NOSI_PAIRED_S_OFF=1 debug: S rows stay in the GEMMs / attention call but score nothing, write nothing, attend V's mask
     bias_impl: str         # NOSI_PAIRED_BIAS: 'fused' (one Triton kernel per layer, fused_bias.py) or 'torch' (the core.py path)
     gemm: str              # NOSI_PAIRED_GEMM: 'fused' (one GEMM at M = n*U rows) or 'split' (one M = n call per row kind: V's call is the decode's)
+    prefetch: str          # NOSI_PAIRED_PREFETCH: 'off' (E2: S resident-only, no transfer) or 'ring' (E4: copy-engine prefetch into the ring, prefetch.py)
+    prefetch_cap: int      # NOSI_PAIRED_PREFETCH_CAP: pieces per request per layer per tick (ring half capacity = B x cap)
+    prefetch_workers: int  # NOSI_PAIRED_PREFETCH_WORKERS: CPU pack threads
+    restart: str           # NOSI_PAIRED_RESTART: 'sequential' (spec 3a) or 'overlapped' (spec 3b: the two-position catch-up on a side stream)
 
 
-def config_from_env(gemm_pad_rows: int = 0) -> TickConfig:
+def config_from_env(gemm_pad_rows: int = 0, gemm: Optional[str] = None) -> TickConfig:
     """Resolved by the DRIVER at dispatch time (never at import): NOSI_ATTN_SPLITS
-    (default 4; 0 refused), NOSI_PAIRED_POISON (1 = on). ``gemm_pad_rows`` is
-    the driver's (the twin2b arm passes B); it is not an environment knob."""
+    (default 4; 0 refused), NOSI_PAIRED_POISON (1 = on), NOSI_PAIRED_BIAS,
+    NOSI_PAIRED_GEMM, NOSI_PAIRED_PREFETCH (+ _CAP, _WORKERS), NOSI_PAIRED_RESTART.
+    ``gemm_pad_rows`` is the driver's (the twin2b arm passes B) and ``gemm``
+    overrides the environment (the twin2b arm forces 'fused': its padding IS
+    the fused-GEMM diagnostic; job 2175574's twin2b refused under gemm=split)."""
     raw = os.environ.get("NOSI_ATTN_SPLITS", "4")
     try:
         splits = int(raw)
@@ -80,14 +88,41 @@ def config_from_env(gemm_pad_rows: int = 0) -> TickConfig:
     bias_impl = os.environ.get("NOSI_PAIRED_BIAS", "fused")
     if bias_impl not in ("fused", "torch"):
         raise SystemExit("NOSI_PAIRED_BIAS=%r: 'fused' (the Triton kernel) or 'torch' (the core path)" % bias_impl)
-    gemm = os.environ.get("NOSI_PAIRED_GEMM", "fused")
+    gemm = os.environ.get("NOSI_PAIRED_GEMM", "fused") if gemm is None else str(gemm)
     if gemm not in ("fused", "split"):
         raise SystemExit("NOSI_PAIRED_GEMM=%r: 'fused' (M = n*U) or 'split' (one M = n call per row kind)" % gemm)
     if gemm == "split" and int(gemm_pad_rows) > 0:
         raise SystemExit("NOSI_PAIRED_GEMM=split cannot combine with the twin2b padding")
+    prefetch = os.environ.get("NOSI_PAIRED_PREFETCH", "off")
+    if prefetch not in ("off", "ring"):
+        raise SystemExit("NOSI_PAIRED_PREFETCH=%r: 'off' or 'ring'" % prefetch)
+    restart = os.environ.get("NOSI_PAIRED_RESTART", "sequential")
+    if restart not in ("sequential", "overlapped"):
+        raise SystemExit("NOSI_PAIRED_RESTART=%r: 'sequential' or 'overlapped'" % restart)
+    cap = int(os.environ.get("NOSI_PAIRED_PREFETCH_CAP", "8"))
+    workers = int(os.environ.get("NOSI_PAIRED_PREFETCH_WORKERS", "8"))
+    if cap < 1 or workers < 1:
+        raise SystemExit("NOSI_PAIRED_PREFETCH_CAP / _WORKERS must be >= 1")
     return TickConfig(num_splits=splits, poison=os.environ.get("NOSI_PAIRED_POISON", "0") == "1",
                       masked=core.MASKED, refuse_compress=True, gemm_pad_rows=int(gemm_pad_rows),
-                      s_off=os.environ.get("NOSI_PAIRED_S_OFF", "0") == "1", bias_impl=bias_impl, gemm=gemm)
+                      s_off=os.environ.get("NOSI_PAIRED_S_OFF", "0") == "1", bias_impl=bias_impl, gemm=gemm,
+                      prefetch=prefetch, prefetch_cap=cap, prefetch_workers=workers, restart=restart)
+
+
+class ScoringSet(NamedTuple):
+    """The buffers one scoring pass writes and the captured graph that reads
+    them: the MAIN set is the model's (score_buf, compressed_cis_buf = the
+    layer table's alias, after_pooling_graph, topk_idx_buf); the side
+    restart's set is a second capture over its own buffers (side_restart.py),
+    so a side-stream forward never races the main tick's scoring."""
+    score_buf: torch.Tensor
+    cis_buf: torch.Tensor
+    graph: object
+    topk_idx_buf: torch.Tensor
+
+
+def main_scoring(model, layer) -> ScoringSet:
+    return ScoringSet(score_buf=layer.score_buf, cis_buf=layer.compressed_cis_buf, graph=layer.after_pooling_graph, topk_idx_buf=model.topk_idx_buf)
 
 
 def linear_rows(x: torch.Tensor, w: torch.Tensor, cfg: TickConfig) -> torch.Tensor:
@@ -132,6 +167,7 @@ class _GPU(NamedTuple):
     NL: object          # nosi.nosa_llama: layer_norm, nosa_linear, apply_rope_with_cos_sin_cache_inplace, infllmv2_attn_stage1_fast, silu_and_mul
     fa: object          # flash_attn_nosa.flash_attn_with_kvcache: THE shipped decode kernel entry (nosa_llama.py:42)
     bias_rows: object   # cache_engine._bias_rows: KV_BIAS_SCALE applied exactly as the engine's four write sites do
+    engine_ops: object  # prefetch.EngineOps: the engine's diff / gathers + the ring-hit kernel (E4)
 
 
 _G: Optional[_GPU] = None
@@ -143,7 +179,11 @@ def _gpu() -> _GPU:
         import nosi.nosa_llama as NL
         from nosi import cache_engine as CE
         from flash_attn_nosa import flash_attn_with_kvcache
-        _G = _GPU(NL=NL, fa=flash_attn_with_kvcache, bias_rows=CE._bias_rows)
+        from nosi.flash_cache_engine.flash_h2d_mask import flash_h2d_from_mask
+        from nosi.flash_cache_engine.flash_h2d_mask_bias import flash_h2d_from_mask_bias
+        ops = _pf.EngineOps(diff=CE.diff.diff_offload, gather_k=flash_h2d_from_mask, gather_v=flash_h2d_from_mask_bias,
+                            ring_hit=_pf.ring_hit_triton, bias_rows=CE._bias_rows)
+        _G = _GPU(NL=NL, fa=flash_attn_with_kvcache, bias_rows=CE._bias_rows, engine_ops=ops)
     return _G
 
 
@@ -171,6 +211,13 @@ class Scratch:
         self.ring_dummy = torch.full((H, self.B, max(lay.ring_hi - lay.ring_lo, 1)), -1, dtype=torch.int64, device=dev)  # E2: no ring occupants (E4 fills it)
         self.sel_dummy = torch.full((H, 1, int(model.topk_blocks)), -1, dtype=torch.int64, device=dev)   # a V-only call has no S selection (K = topk_blocks)
         self.masked_rounded = _fb.rounded_masked(core.MASKED, dtype)
+        self.prefetch = None                                                            # prefetch.PrefetchEngine when NOSI_PAIRED_PREFETCH=ring (setup_prefetch)
+        self.tail_seq0 = None                                                           # engine seq_length at setup: tail_id_host derives T without a device read
+
+    def tail_id_host(self, eng) -> int:
+        """The live tail block id T = seq_length // bs from the engine's HOST
+        counter (one per engine; cache_engine.py prefill_update: _block_map[..., tail] = S // bs)."""
+        return int(eng.seq_length) // int(self.lay.bs)
         self.journals = [_sl.LayerJournal() for _ in range(model.num_layers)]
         self.slot_complete = [False] * model.num_layers                            # slot topk-1 holds a complete block (after a fill)
         self.prev_sel_s: List[Optional[torch.Tensor]] = [None] * model.num_layers  # (H, B, K) int64: S's selection for the NEXT V position
@@ -219,6 +266,19 @@ def setup(model, cache, B: int) -> Scratch:
     return sc
 
 
+def setup_prefetch(model, cache, sc: Scratch, cfg: TickConfig) -> Optional["_pf.PrefetchEngine"]:
+    """E4: the copy-engine prefetch engine (prefetch.py) when cfg.prefetch == 'ring'."""
+    if cfg.prefetch != "ring":
+        return None
+    if not sc.lay.narrow:
+        raise RuntimeError("the ring prefetch is built for the narrow layout (the ring is invisible to attention; it feeds V's diff)")
+    G = _gpu()
+    pe = _pf.PrefetchEngine(cache, sc.B, cfg.prefetch_cap, cfg.prefetch_workers, G.engine_ops, sc.device)
+    pe.bind_host(cache)
+    sc.prefetch = pe
+    return pe
+
+
 def compress_budget(cache, n_positions_ahead: int) -> int:
     """How many more positions (V appends + one provisional S append) fit
     before a 16-token compress event: pooling_block_size - no_compress_k_len.
@@ -235,7 +295,7 @@ def compress_budget(cache, n_positions_ahead: int) -> int:
 # scoring: the decode's per-position chain (stage 1 + the captured pooling / top-k graph)
 # ---------------------------------------------------------------------------
 def score_position(G, model, cache, layer, l: int, q_u: torch.Tensor, k_u: torch.Tensor, cis_u: torch.Tensor,
-                   sc: Scratch, cfg: TickConfig, req_idx: Optional[torch.Tensor]):
+                   sc: Scratch, cfg: TickConfig, req_idx: Optional[torch.Tensor], scoring: Optional[ScoringSet] = None):
     """One position's table updates and selection, exactly decode_forward's /
     verify_forward's text (nosa_llama.py:715-739) over the WHOLE batch. For a
     SUBSET of requests (the restart) the subset's q / key / cis rows are
@@ -279,13 +339,14 @@ def score_position(G, model, cache, layer, l: int, q_u: torch.Tensor, k_u: torch
     ck = compressed_k.contiguous().flatten(0, 1)
     score = NL.infllmv2_attn_stage1_fast(q_full, ck, ck, cu_seqlens_q=sc.cu_full, cu_seqlens_k=cu_comp,
                                          max_seqlen_q=1, max_seqlen_k=max_seqlen_comp, causal=False)
-    layer.score_buf.copy_(score)                        # nosa_llama.py:613
-    layer.compressed_cis_buf.copy_(compressed_cis)      # nosa_llama.py:614: a self-copy (the alias above), the decode's own line
-    layer.after_pooling_graph.replay()
+    ss = scoring if scoring is not None else main_scoring(model, layer)
+    ss.score_buf.copy_(score)                           # nosa_llama.py:613
+    ss.cis_buf.copy_(compressed_cis)                    # nosa_llama.py:614: a self-copy on the main set (the alias above), a real copy on a side set
+    ss.graph.replay()
     if req_idx is None:
-        sel = model.topk_idx_buf.clone()                # (H, B, K) int64; the buffer is rewritten by the next replay
+        sel = ss.topk_idx_buf.clone()                   # (H, B, K) int64; the buffer is rewritten by the next replay
     else:
-        sel = model.topk_idx_buf[:, req_idx].clone()    # (H, n, K)
+        sel = ss.topk_idx_buf[:, req_idx].clone()       # (H, n, K)
     return sel, ucis, score
 
 
@@ -360,7 +421,14 @@ class LayerOut(NamedTuple):
 
 
 def layer_body(G, model, cache, l: int, hidden: torch.Tensor, position_ids: torch.Tensor, plan: core.RowPlan,
-               req_idx: torch.Tensor, whole_batch: bool, sc: Scratch, cfg: TickConfig, trace=None, insitu=None) -> LayerOut:
+               req_idx: torch.Tensor, whole_batch: bool, sc: Scratch, cfg: TickConfig, trace=None, insitu=None,
+               tick_index: int = -1, tv_override: Optional[core.TailView] = None, own_row_override: Optional[int] = None,
+               scoring: Optional[ScoringSet] = None) -> LayerOut:
+    """tick_index: the tick number (the ring prefetch keys its halves by it; -1
+    = no prefetch for this call). tv_override / own_row_override: the side
+    catch-up's tail rule (side_restart.py: position tau + 1 must not attend
+    V's exact tau + 1 row and both positions write row tail_len of the tail
+    slot); scoring: a side ScoringSet for a side-stream call."""
     NL = G.NL
     layer = model.layers[l]
     clayer = cache.layers[l]
@@ -396,12 +464,12 @@ def layer_body(G, model, cache, l: int, hidden: torch.Tensor, position_ids: torc
     u = 0
     sel_v = sel_s = ucis = score_v = None
     if plan.has_v:
-        sel_v, ucis, score_v = score_position(G, model, cache, layer, l, q[:, u], k[:, u], cis[:, u], sc, cfg, None)
+        sel_v, ucis, score_v = score_position(G, model, cache, layer, l, q[:, u], k[:, u], cis[:, u], sc, cfg, None, scoring)
         u += 1
     if plan.has_s and not s_off:
         j = sc.journals[l]
         j.take(clayer)
-        sel_s, _, _ = score_position(G, model, cache, layer, l, q[:, u], k[:, u], cis[:, u], sc, cfg, sub)
+        sel_s, _, _ = score_position(G, model, cache, layer, l, q[:, u], k[:, u], cis[:, u], sc, cfg, sub, scoring)
         j.restore(clayer)                                     # the S position's table state never survives (G5)
 
     # [4] the V row's engine update = the shipped S == 1 body; the S row's provisional write
@@ -409,16 +477,34 @@ def layer_body(G, model, cache, l: int, hidden: torch.Tensor, position_ids: torc
         trace.rec("fetch_begin")
     tail_len_before = int(eng._tail_block_len_on_gpu)
     v_miss = None
+    ring_half = None
     if plan.has_v:
-        cache.decode_update_kv(k[:, 0], v[:, 0], ucis, l, sel_v)      # returns the 64-slot views; the rows call reads the allocation
-        v_miss = (eng._load_mask >= 0).sum(-1)                        # (H, B): V's residual misses, fetched BLOCKING above
+        pe = sc.prefetch if (cfg.prefetch == "ring" and tick_index >= 0) else None
+        if pe is None:
+            cache.decode_update_kv(k[:, 0], v[:, 0], ucis, l, sel_v)  # returns the 64-slot views; the rows call reads the allocation
+        else:
+            # E4: the same S == 1 body with the ring-hit step between diff and the gathers (prefetch.v_update_with_ring)
+            ring_half = pe.check_need(l, tick_index)
+            _pf.v_update_with_ring(eng, G.engine_ops, k[:, 0].unsqueeze(1), v[:, 0].unsqueeze(1), ucis, sel_v, ring_half)
+            clayer.seq_length += 1                                    # InfLLMv2CacheLayer.decode_update_kv's own line
+            if l == 0:
+                cache._seen_tokens += 1
+            if ring_half is not None:
+                pe.consumed(l, tick_index)
+        v_miss = (eng._load_mask >= 0).sum(-1)                        # (H, B): V's residual misses, fetched BLOCKING (after the ring served its hits)
     tv = core.tail_view(tail_len_before, plan.has_v, sc.slot_complete[l], lay)
     sc.slot_complete[l] = tv.slot_complete
     if int(eng._tail_block_len_on_gpu) != tv.tail_len_after:
         raise AssertionError("layer %d: engine tail_len %d != the S == 1 rule's %d" % (l, eng._tail_block_len_on_gpu, tv.tail_len_after))
+    if tv_override is not None:
+        tv = tv_override
     own_row = core.provisional_row(lay, tv.tail_len_after) if (plan.has_s and not s_off) else -1
+    if own_row_override is not None and plan.has_s and not s_off:
+        own_row = int(own_row_override)
     if plan.has_s and not s_off:
-        core.s_provisional_write(eng, k[:, u], v[:, u], G.bias_rows(cis[:, u].unsqueeze(1)), lay, sub, tv.tail_len_after)
+        core.s_provisional_write(eng, k[:, u], v[:, u], G.bias_rows(cis[:, u].unsqueeze(1)), lay, sub, own_row - lay.tail_slot * lay.bs if lay.narrow else tv.tail_len_after)
+    if plan.has_v and plan.has_s and sc.prefetch is not None and cfg.prefetch == "ring" and tick_index >= 0 and not s_off:
+        sc.prefetch.submit(l, tick_index, sel_s, eng._block_map, sc.tail_id_host(eng), None if whole_batch else req_idx)
 
     # [5] the per-row bias and ONE rows-attention call
     vis_v = vis_s = None
@@ -491,7 +577,11 @@ class TickResult(NamedTuple):
 
 
 def _forward(G, model, cache, sc: Scratch, cfg: TickConfig, tokens: torch.Tensor, position_ids: torch.Tensor,
-             plan: core.RowPlan, req_idx: torch.Tensor, whole_batch: bool, trace=None, insitu=None) -> TickResult:
+             plan: core.RowPlan, req_idx: torch.Tensor, whole_batch: bool, trace=None, insitu=None, tick_index: int = -1,
+             after_layer=None, tv_override=None, own_row_override=None, scoring_sets=None, before_layer=None) -> TickResult:
+    """after_layer(l): called after every layer's body (the overlapped restart
+    launches its side-stream layer there); scoring_sets[l]: a side ScoringSet
+    per layer for a side-stream call."""
     NL = G.NL
     n, U = tokens.shape
     if tuple(position_ids.shape) != (n, U) or U != plan.U:
@@ -501,13 +591,19 @@ def _forward(G, model, cache, sc: Scratch, cfg: TickConfig, tokens: torch.Tensor
         trace.begin_call()
     accts, recs = [], []
     for l in range(model.num_layers):
+        if before_layer is not None:
+            before_layer(l)
         if insitu is not None:
             insitu.capture_input(l, hidden)
-        out = layer_body(G, model, cache, l, hidden, position_ids, plan, req_idx, whole_batch, sc, cfg, trace=trace, insitu=insitu)
+        out = layer_body(G, model, cache, l, hidden, position_ids, plan, req_idx, whole_batch, sc, cfg, trace=trace, insitu=insitu,
+                         tick_index=tick_index, tv_override=tv_override, own_row_override=own_row_override,
+                         scoring=(scoring_sets[l] if scoring_sets is not None else None))
         hidden = out.hidden
         accts.append(out.account)
         if out.insitu is not None:
             recs.append(out.insitu)
+        if after_layer is not None:
+            after_layer(l)
     pre = hidden
     hidden = NL.layer_norm(hidden, model.norm_variance_epsilon, model.norm_weight)
     logits = linear_rows(hidden, model.lm_head, cfg).float()                          # (n, U, V)
@@ -526,7 +622,7 @@ def _forward(G, model, cache, sc: Scratch, cfg: TickConfig, tokens: torch.Tensor
 
 @torch.inference_mode()
 def paired_tick(model, cache, sc: Scratch, cfg: TickConfig, v_tokens: torch.Tensor, s_tokens: torch.Tensor,
-                position: torch.Tensor, trace=None, insitu=None) -> TickResult:
+                position: torch.Tensor, trace=None, insitu=None, tick_index: int = -1, after_layer=None, before_layer=None) -> TickResult:
     """ONE TICK over the whole batch: v_tokens / s_tokens (B,) int64, position
     (B,) the committed position tau (any integer dtype the rope accepts).
     Returns V's and S's fp32 logits (B, V) and the per-layer accounts."""
@@ -538,12 +634,13 @@ def paired_tick(model, cache, sc: Scratch, cfg: TickConfig, v_tokens: torch.Tens
     plan = core.row_plan(sc.req_all, True, True)
     toks = torch.stack([v_tokens, s_tokens], dim=1)                # (B, 2): row 2b = V, 2b + 1 = S
     pos = torch.stack([position, position + 1], dim=1)
-    return _forward(G, model, cache, sc, cfg, toks, pos, plan, sc.req_all, True, trace=trace, insitu=insitu)
+    return _forward(G, model, cache, sc, cfg, toks, pos, plan, sc.req_all, True, trace=trace, insitu=insitu, tick_index=tick_index,
+                    after_layer=after_layer, before_layer=before_layer)
 
 
 @torch.inference_mode()
 def s_rows_forward(model, cache, sc: Scratch, cfg: TickConfig, tokens: torch.Tensor, position: torch.Tensor,
-                   req_idx: torch.Tensor, trace=None) -> TickResult:
+                   req_idx: torch.Tensor, trace=None, tv_override=None, own_row_override=None, scoring_sets=None, after_layer=None) -> TickResult:
     """The RESTART (after a reject: position tau + 1 on the committed token)
     and the SEED (before the first tick: position tau on the V input) over a
     subset of requests, spec section 3 option (a): S rows only, resident-only
@@ -555,7 +652,8 @@ def s_rows_forward(model, cache, sc: Scratch, cfg: TickConfig, tokens: torch.Ten
         raise ValueError("tokens %s / position %s must be (n=%d,) with n >= 1" % (tuple(tokens.shape), tuple(position.shape), n))
     whole = (n == sc.B) and bool(torch.equal(req_idx, sc.req_all))
     plan = core.row_plan(req_idx, False, True)
-    return _forward(G, model, cache, sc, cfg, tokens.unsqueeze(1), position.unsqueeze(1), plan, req_idx, whole, trace=trace)
+    return _forward(G, model, cache, sc, cfg, tokens.unsqueeze(1), position.unsqueeze(1), plan, req_idx, whole, trace=trace,
+                    tv_override=tv_override, own_row_override=own_row_override, scoring_sets=scoring_sets, after_layer=after_layer)
 
 
 def restart_after(model, cache, sc: Scratch, cfg: TickConfig, state: core.DraftState, outcome: core.TickOutcome,

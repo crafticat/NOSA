@@ -173,3 +173,83 @@ per call at B = 128 (the E2 torch path measured +131 ms contaminated / E1b 19.3 
 = the ordinary 3.8 blocks per stream-step (the churn of E2 was the compressed-cis corruption). Arms: shipped,
 twin, twin2b, equiv, resident at R = 0 with gemm=split / bias=fused (the gate), then resident with gemm=fused
 (the cost), optionally bias=torch (the old build, for the fetch delta).
+
+## 9. Stage E4: per-layer prefetch through the copy engine (`paired/prefetch.py`)
+
+**Transfer path (decided by E3d, REPRODUCE.md 'E3d RESULT' / 'E3d TIMELINES')**: a CONTIGUOUS cudaMemcpyAsync from
+pinned memory overlaps a decode step at kappa 0.006-0.05 and 25 GB/s; every SM-side gather (the engine's Triton
+kernels, throttled or not) slows the co-running kernels 2.5-3x through the memory system. So the scattered blocks
+are PACKED ON THE HOST into a contiguous pinned staging buffer and copied by the copy engine.
+
+**Engine constraints and the pack unit**: the pinned window is `_k_cpu (B, S, H, D)` bf16 (`cache_engine.py:263`),
+row stride H*D*2 = 512 B. A block's 64 rows for BOTH heads are one contiguous 32 KB run; a per-head piece would be
+64 strided 256 B runs. Decision: pack per (request, block) with both heads (K: 32 KB, V: 32 KB, two
+`index_select`s over flat rows `b*S + blk*64 + i`, the measured HOST PACK path 21-30 GB/s at 8-16 threads), and
+charge the other head's half as extra bytes when only one head needed the block (`account_half`). The bias rows
+never cross PCIe: the gathers read them from the GPU-resident `total_cis` (`flash_h2d_mask_bias`), and so does
+the ring-hit kernel.
+
+**Cadence (one behind)**: at layer l of tick t, after S's scoring and V's update, `PrefetchEngine.submit` copies
+`sel_S(l)` and `_block_map(l)` (after the update = the resident set at the need time) to pinned host buffers
+(non_blocking + event) and hands the job to a worker thread: `plan_prefetch` (want = sel_S minus resident minus
+in-flight minus ids >= T, unique (b, blk) over heads, canonical order, cap per request), `pack_pieces`, the id
+table, ONE cudaMemcpyAsync (K then V; the id table beside it) on the side stream into the device ring half
+(l, t % 2) after waiting on the half's last consumer event, an arrival event. At layer l of tick t + 1, before
+V's update, `check_need` polls the event (`query()`, no host sync): ARRIVED -> the half is handed to
+`v_update_with_ring`; pending -> LATE (nothing of it is used; freed when the copy completes).
+
+**The ring-hit step**: `v_update_with_ring` = `decode_update_has_kv_bias` (`cache_engine.py:640-716`) replayed
+over injected ops with ONE inserted step between `diff_offload` (:663) and the gathers (:681-682) -- where the
+victim pool sits (:785-800): the Triton kernel `ring_hit` (grid (H, B, M) like the gathers) resolves every
+`_load_mask` entry against the half's id table, scatters the piece's head-h rows into the slot diff assigned
+(D2D: no PCIe, no UVA), the bias rows from `total_cis`, clears the entry and counts (served per piece, per
+stream). The shipped gathers then fetch the residual misses (blocking, counted). diff's slot assignment is
+untouched, so the window is the decode's in the decode's slot order: V stays bit-exact. The ring is INVISIBLE to
+attention (narrow layout, W = 64): prefetched blocks become attendable only once diff places them.
+
+**Accounting** (`PrefetchAccount`, per (layer, tick)): pieces / bytes issued, arrived in time vs late, served /
+wrong (arrived, never needed by V) pieces, extra-head bytes, residual misses (= the blocking bytes = exposed),
+unrequested (cap), ring full, occupancy, host pack ms, deadline slack = arrival event -> need event (CUDA events,
++ = early). Memory (G9): device ring 2 halves x B x cap pieces x 64 KB per layer (2 GB at B = 64, cap 8, 32
+layers), the same pinned; reported per arm.
+
+**Tests**: `plan_prefetch` (want / unique / heads / cap / in-flight), `pack_rows` / `id_table`,
+`diff_reference` (the CUDA kernel's rule, `diff_offload_kernel.cu:34-85`), `ring_hit` reference == interpreted
+kernel (serve, clear, bias rows, other head untouched, counts), `v_update_with_ring` == the plain body on a
+fake engine (same maps, same window bytes) with only the residual miss through the host gather, `RingBook`
+(issue / late / arrive / consume / full / release), `PrefetchAccount` identities.
+
+**Registered predictions (E4, B = 64, narrow, gemm=split, bias=fused, cap 8, 8 workers)**: P-E4-1 arrived-in-time
+layers >= 95 % (one tick of slack ~80 ms against ~1 ms of copy and ~1-2 ms of pack per layer); P-E4-2 residual
+(blocking) bytes <= 0.10 x the E2c 7.21 MB/token (the 0.4 % S-vs-V divergence plus late layers) -> the tick's
+fetch bracket from 22.8 ms to <= 4 ms; P-E4-3 host pack <= 2 ms per layer (25 MB at >= 15 GB/s), i.e. <= 40 ms
+of CPU time per tick spread over the workers, hidden; P-E4-4 the tick's main-stream brackets unchanged within
++5 % (kappa_copy <= 0.05); P-E4-5 wrong-prefetch pieces <= 2 % of issued (divergence 0.4 %, cap effects). The
+replay's coarse-schedule number (prefetch precision 1, no exposed bytes) is the comparison line: E4's exposed
+bytes per token vs 0.
+
+## 10. The OVERLAPPED restart (spec section 3 option (b); `core.CatchupState`, `paired/side_restart.py`)
+
+A request rejected at tick t (V at tau) does not block the batch: during tick t + 1 a two-position catch-up
+forward runs for the rejected subset on a SIDE stream -- position tau + 1 (input x_{tau+1}, the committed token)
+gives tok1 = x^_{tau+2}; position tau + 2 (input tok1, taken on the device) gives tok2 = x^_{tau+3}. Its S row in
+tick t + 1 is a dummy. At tick t + 1's end tok1 is judged against the committed x_{tau+2}: equal -> the request
+rejoins at tick t + 2 with draft tok2 (S at tau + 3); else it catches up again on x_{tau+2}
+(`catchup_schedule`, tested). Lockstep and G8 hold: one committed token per request per tick.
+Rows / rules: position 1's layer l is launched right after the main tick's layer l finished (event) so it reads
+the layer's window as the tick left it (no torn slots), attends the tail rows <= tau (NOT V's exact tau + 1
+row: same position) and writes / attends its own row at `tail_len_after` of the tail slot (the row tick t + 2's
+V writes); position 2 runs after position 1's head (data dependency: its input token) and attends rows <= tau +
+1 incl. V's exact row, same own row; tick t + 2's layer-l update waits on the side's layer-l event. Scoring on
+the side uses a SECOND captured pooling / top-k graph per layer over private buffers (`SideScoring`, the
+warm-up's capture block nosa_llama.py:465-497 on side buffers; the cis buffer is a real copy, not the table
+alias), so the side never races the main tick's scoring; the catch-up's table updates are journaled per layer
+on the side stream (the host counters are consistent in program order: main layer l, then side layer l).
+Costs on the tick: SM contention with the side forwards (E3d measured kappa 0.2-0.9 for SM-side WORK beside a
+step; a small forward is ordinary compute) and the per-layer event waits. Exposed: position 2 cannot start
+before position 1's head, so at n_rej ~ 34 (B = 64) roughly one forward's worth (~40 ms) still trails the
+tick unless the request rejoins at t + 3 (the next option if position 2 is the exposed part).
+**Registered predictions**: P-R-1 the main-stream tick bracket grows by 10-25 % of the sequential restart's 42 ms
+(+4-10 ms at B = 64) from contention; P-R-2 the tick-to-tick wall (incl. the wait for tok1 / tok2) is
+sequential - (0.3 .. 0.6) x 42 ms; P-R-3 rejoin rate at tick t + 2 = the prod-style acceptance (0.97);
+P-R-4 V rows stay torch.equal to the shipped decode (the catch-up touches only rows above the decode's extent).

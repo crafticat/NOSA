@@ -121,7 +121,7 @@ class InSituTwin:
         U = q.shape[1]
         # term: bias / tail rule
         cbi = torch.arange(B, dtype=torch.int32, device=x.device)
-        rb1 = core.paired_bias(eng._kv_bias_gpu, vis_v, cbi, 1, cfg.masked, out=sc.bias_twin, check_values=False)
+        rb1 = core.paired_bias(eng._kv_bias_gpu, vis_v.to(torch.int64), cbi, 1, cfg.masked, out=sc.bias_twin, check_values=False)   # the fused path's prefix is int32 (job 2175574)
         rows_v = torch.arange(0, U * B, U, device=x.device)
         rec["bias_equal"] = bool(torch.equal(rb.bias[rows_v], rb1.bias[:B]) and torch.equal(rb.cache_seqlens[rows_v], rb1.cache_seqlens)
                                  and torch.equal(rb.cache_batch_idx[rows_v], rb1.cache_batch_idx))

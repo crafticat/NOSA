@@ -550,6 +550,86 @@ class DraftState:
         self.draft[restart_idx] = restart_argmax
 
 
+ACTIVE, CATCHING = 0, 1
+
+
+class CatchupOutcome(NamedTuple):
+    committed: torch.Tensor     # (B,) int64: one token per request (G8)
+    accepted: torch.Tensor      # (B,) bool: ACTIVE requests whose draft equalled the committed token
+    rejoined: torch.Tensor      # (B,) bool: CATCHING requests whose catch-up token 1 equalled the committed token (they rejoin next tick)
+    catch_idx: torch.Tensor     # (n,) int64: requests that need a catch-up forward DURING the next tick
+    catch_in: torch.Tensor      # (n,) int64: its input token = the token they just committed (position tau + 1)
+    had_draft: torch.Tensor     # (B,) bool
+
+
+class CatchupState:
+    """Spec section 3 option (b), the OVERLAPPED restart. A request rejected at
+    tick t (V at tau) goes CATCHING: during tick t + 1 a two-position catch-up
+    forward runs on a side stream for it -- position tau + 1 on the committed
+    token x_{tau+1} gives tok1 = x^_{tau+2}, position tau + 2 on tok1 gives
+    tok2 = x^_{tau+3}; its S row in tick t + 1 is a dummy. At tick t + 1's end
+    tok1 is judged against the committed x_{tau+2}: equal -> the request
+    rejoins at tick t + 2 with draft tok2 (S at tau + 3); else it stays
+    CATCHING with a new catch-up on x_{tau+2}. Lockstep: every request commits
+    one token per tick whatever its mode (G8)."""
+
+    def __init__(self, B: int, device=None):
+        if B < 1:
+            raise ValueError("B must be >= 1")
+        self.B = int(B)
+        z = lambda: torch.full((self.B,), -1, dtype=torch.int64, device=device)
+        self.draft, self.catch_in, self.tok1, self.tok2 = z(), z(), z(), z()
+        self.mode = torch.full((self.B,), CATCHING, dtype=torch.int8, device=device)   # no draft yet: every request needs the first catch-up
+
+    def s_inputs(self, fallback: torch.Tensor) -> torch.Tensor:
+        return torch.where(self.draft >= 0, self.draft, fallback)
+
+    def catch_set(self):
+        """The requests whose catch-up must run during the coming tick and their inputs."""
+        idx = (self.mode == CATCHING).nonzero().squeeze(-1)
+        return idx, self.catch_in[idx]
+
+    def apply_catchup(self, idx: torch.Tensor, tok1: torch.Tensor, tok2: torch.Tensor) -> None:
+        """The side forward's results, read before the tick's end."""
+        if idx.dim() != 1 or tuple(tok1.shape) != tuple(idx.shape) or tuple(tok2.shape) != tuple(idx.shape):
+            raise ValueError("apply_catchup: idx %s tok1 %s tok2 %s" % (tuple(idx.shape), tuple(tok1.shape), tuple(tok2.shape)))
+        if idx.numel() and bool((self.mode[idx] != CATCHING).any()):
+            raise AssertionError("apply_catchup over a request that is not catching up")
+        self.tok1[idx] = tok1
+        self.tok2[idx] = tok2
+
+    def tick_end(self, committed: torch.Tensor, s_argmax: torch.Tensor) -> CatchupOutcome:
+        for name, t in (("committed", committed), ("s_argmax", s_argmax)):
+            if tuple(t.shape) != (self.B,) or t.dtype != torch.int64:
+                raise ValueError("%s must be int64 (B=%d,), got %s %s" % (name, self.B, t.dtype, tuple(t.shape)))
+        if bool((committed < 0).any()):
+            raise ValueError("G8: every request commits exactly one token per tick")
+        active = self.mode == ACTIVE
+        had = active & (self.draft >= 0)
+        accepted = had & (self.draft == committed)
+        rejoined = (~active) & (self.tok1 >= 0) & (self.tok1 == committed)
+        new_draft = torch.where(accepted, s_argmax, torch.where(rejoined, self.tok2, torch.full_like(self.draft, -1)))
+        now_catching = ~(accepted | rejoined)
+        self.draft = new_draft
+        self.mode = torch.where(now_catching, torch.full_like(self.mode, CATCHING), torch.full_like(self.mode, ACTIVE))
+        self.catch_in = torch.where(now_catching, committed, torch.full_like(self.catch_in, -1))
+        self.tok1 = torch.full_like(self.tok1, -1)
+        self.tok2 = torch.full_like(self.tok2, -1)
+        idx = now_catching.nonzero().squeeze(-1)
+        return CatchupOutcome(committed=committed, accepted=accepted, rejoined=rejoined, catch_idx=idx, catch_in=committed[idx], had_draft=had)
+
+
+def catchup_schedule(t_reject: int, tau: int) -> dict:
+    """Which tick sees which rows for a request rejected at tick t_reject (V at
+    tau): the catch-up runs DURING tick t_reject + 1 at positions tau + 1
+    (input x_{tau+1}, the committed token; attends rows <= tau and its own row
+    above V's exact tau + 1 row) and tau + 2 (input tok1; attends rows <= tau + 1
+    incl. V's exact row); judged at tick t_reject + 1's end against x_{tau+2};
+    rejoins at tick t_reject + 2 with S at tau + 3."""
+    return dict(run_during=t_reject + 1, pos1=tau + 1, pos2=tau + 2, dummy_s_tick=t_reject + 1, judged_at=t_reject + 1,
+                rejoin_tick=t_reject + 2, rejoin_pos=tau + 3, pos1_attends_upto=tau, pos2_attends_upto=tau + 1)
+
+
 def lockstep_check(committed_per_tick: Sequence[torch.Tensor], B: int) -> int:
     """G8 accounting identity: T ticks commit exactly T tokens per request."""
     n = 0

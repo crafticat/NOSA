@@ -766,7 +766,7 @@ def _scoring_world(B=4, M=12, K=5, seed=0):
     cache = _FakeCache([clayer])
     sc = SimpleNamespace(B=B, cu_full=torch.arange(B + 1, dtype=torch.int32), key_pad=torch.zeros((B, 1, H, D)),
                          cis_pad=torch.zeros((B, 1, H)), q_pad=torch.zeros((B, HQ, D)))
-    cfg = tick.TickConfig(num_splits=4, poison=False, masked=core.MASKED, refuse_compress=True, gemm_pad_rows=0, s_off=False, bias_impl="torch", gemm="fused")
+    cfg = tick.TickConfig(num_splits=4, poison=False, masked=core.MASKED, refuse_compress=True, gemm_pad_rows=0, s_off=False, bias_impl="torch", gemm="fused", prefetch="off", prefetch_cap=8, prefetch_workers=8, restart="sequential")
     G = SimpleNamespace(NL=_FakeNL)
     return G, model, cache, layer, clayer, sc, cfg
 
@@ -923,7 +923,7 @@ def test_narrow_layout_rules_and_extents():
 def test_linear_rows_split_is_two_decode_shaped_calls():
     g = torch.Generator().manual_seed(4)
     x = torch.randn((3, 2, 8), generator=g); w = torch.randn((5, 8), generator=g)
-    cfg_f = tick.TickConfig(num_splits=4, poison=False, masked=core.MASKED, refuse_compress=True, gemm_pad_rows=0, s_off=False, bias_impl="torch", gemm="fused")
+    cfg_f = tick.TickConfig(num_splits=4, poison=False, masked=core.MASKED, refuse_compress=True, gemm_pad_rows=0, s_off=False, bias_impl="torch", gemm="fused", prefetch="off", prefetch_cap=8, prefetch_workers=8, restart="sequential")
     cfg_s = cfg_f._replace(gemm="split")
     plain = torch.nn.functional.linear(x, w)
     assert torch.equal(tick.linear_rows(x, w, cfg_f), plain)
@@ -1156,3 +1156,235 @@ def test_fused_args_through_scratch_at_round_slots(R, kind):
         assert int(rb_t.cache_seqlens[0]) == lay.tail_slot * BS + tv.tail_len_after, "V's extent = the decode's cache_seqlens at both layouts"
     src = (NOSI_PKG / "paired" / "tick.py").read_text()
     assert "fused_args(sc, eng, plan, n, sel_s, tv, own_row)" in src, "the body builds the kernel arguments through fused_args"
+
+
+# ---------------------------------------------------------------------------
+# E4: the copy-engine prefetch core (paired/prefetch.py)
+# ---------------------------------------------------------------------------
+pf = importlib.import_module("nosi.paired.prefetch")
+
+
+def test_plan_prefetch_want_pieces_cap_and_inflight():
+    Hh, n, Kk, B, topk = 2, 3, 5, 4, 4
+    req = torch.tensor([0, 2, 3])
+    window = torch.full((Hh, B, topk), -1, dtype=torch.int64)
+    window[0, 0, :3] = torch.tensor([10, 11, 12]); window[1, 0, :3] = torch.tensor([10, 20, 21])
+    window[:, 2, :3] = torch.tensor([30, 31, 32]); window[:, 3, :3] = torch.tensor([40, 41, 42])
+    window[..., topk - 1] = 100                                               # the tail block T
+    sel = torch.full((Hh, n, Kk), -1, dtype=torch.int64)
+    sel[0, 0] = torch.tensor([10, 13, 14, 100, -1])                           # head 0 of request 0: 10 resident, 13 14 wanted, T never
+    sel[1, 0] = torch.tensor([13, 20, 15, 100, 101])                          # head 1: 13 (shared with head 0), 15; 101 >= forbid: not on the host
+    sel[:, 1] = torch.tensor([30, 33, -1, -1, -1])                            # request 2: 33 wanted by both heads
+    sel[:, 2] = torch.tensor([50, 51, 52, 53, 54])                            # request 3: five wanted, cap 3
+    infl = torch.full((B, 4), -1, dtype=torch.int64); infl[0, 0] = 14         # 14 already in flight for request 0
+    p = pf.plan_prefetch(sel, req, window, topk - 1, forbid_ge=100, inflight=infl, cap=3)
+    assert p.b.tolist() == [0, 0, 2, 3, 3, 3] and p.blk.tolist() == [13, 15, 33, 50, 51, 52], "canonical (b, blk) order, unique over heads, capped at 3"
+    assert p.heads.tolist() == [[True, True], [False, True], [True, True], [True, True], [True, True], [True, True]]
+    assert p.n_want[:, 0].tolist() == [1, 2] and p.n_inflight_hit[:, 0].tolist() == [1, 0], "14 is in flight: not re-issued, counted"
+    assert p.n_unrequested[:, 3].tolist() == [2, 2] and int(p.n_unrequested.sum()) == 4
+    assert int(p.n_want[:, 1].sum()) == 0
+    rows = pf.pack_rows(p.b[:2], p.blk[:2], S_host=1000, bs=4)
+    assert rows.tolist() == [52, 53, 54, 55, 60, 61, 62, 63], "b*S + blk*bs + i"
+    ids, pidx = pf.id_table(p.b, p.blk, B, 3)
+    assert ids[0].tolist() == [13, 15, -1] and pidx[0].tolist() == [0, 1, -1] and ids[3].tolist() == [50, 51, 52] and pidx[3].tolist() == [3, 4, 5]
+    assert ids[1].tolist() == [-1, -1, -1]
+    empty = pf.plan_prefetch(torch.full((Hh, n, Kk), -1, dtype=torch.int64), req, window, topk - 1, 100, None, 3)
+    assert empty.b.numel() == 0 and empty.heads.shape == (0, Hh)
+
+
+def test_diff_reference_rule():
+    old = torch.tensor([[[5, 6, 7, 8]]]); new = torch.tensor([[[8, 9, 5, 10]]])
+    nm, lm = pf.diff_reference(old, new)
+    assert nm.tolist() == [[[5, 9, 10, 8]]], "old hits stay (5 at 0, 8 at 3); new 9, 10 take the free slots 1, 2 in slot order"
+    assert lm.tolist() == [[[-1, 9, 10, -1]]]
+    nm2, lm2 = pf.diff_reference(old, old.clone())
+    assert torch.equal(nm2, old) and (lm2 == -1).all()
+
+
+def _ring_world(seed=0):
+    g = torch.Generator().manual_seed(seed)
+    B, M, bs, Dd = 2, TOPK, BS, D
+    eng = NarrowEngine(B=B, tail_len=5, seed=seed)                               # W = topk = 4 slots
+    total_cis = torch.randn((B, 300 * bs + 4 * bs, H), generator=g)
+    P = 3
+    ring_k = torch.randn((P * bs, H, Dd), generator=g); ring_v = torch.randn((P * bs, H, Dd), generator=g)
+    piece_b = torch.tensor([0, 0, 1]); piece_blk = torch.tensor([7, 9, 7])
+    ids, pidx = pf.id_table(piece_b, piece_blk, B, 4)
+    load = torch.full((H, B, M), -1, dtype=torch.int64)
+    load[0, 0, 1] = 7; load[1, 0, 2] = 9; load[0, 1, 0] = 7; load[1, 1, 1] = 8   # 8 is not in the ring: stays a host load
+    return eng, total_cis, ring_k, ring_v, ids, pidx, load, P
+
+
+def test_ring_hit_reference_and_interpreter_serve_and_clear():
+    for impl in ("reference", "triton"):
+        eng, total_cis, ring_k, ring_v, ids, pidx, load, P = _ring_world(3)
+        if impl == "triton" and not (_triton_available() and os.environ.get("TRITON_INTERPRET") == "1"):
+            continue
+        sp = torch.zeros((P,), dtype=torch.int32); shb = torch.zeros((H, eng.B), dtype=torch.int32)
+        k0 = eng._k_gpu.clone()
+        fn = pf.ring_hit_reference if impl == "reference" else pf.ring_hit_triton
+        lm = load.clone()
+        fn(eng._k_gpu, eng._v_gpu, eng._kv_bias_gpu, total_cis, lm, ring_k, ring_v, ids, pidx, sp, shb, BS)
+        assert lm.tolist() == torch.tensor(load).masked_fill(load == 7, -1).masked_fill(load == 9, -1).tolist(), "served loads cleared, the host load (8) kept"
+        assert torch.equal(eng._k_gpu[0, BS:2 * BS, 0], ring_k[0:BS, 0]) and torch.equal(eng._v_gpu[0, 2 * BS:3 * BS, 1], ring_v[BS:2 * BS, 1]), "piece rows -> the assigned slot, head-wise"
+        assert torch.equal(eng._k_gpu[1, 0:BS, 0], ring_k[2 * BS:3 * BS, 0])
+        assert torch.equal(eng._kv_bias_gpu[0, BS:2 * BS, 0], total_cis[0, 7 * BS:8 * BS, 0]), "bias rows from the GPU-resident cis table"
+        assert torch.equal(eng._k_gpu[0, BS:2 * BS, 1], k0[0, BS:2 * BS, 1]), "the other head's rows of that slot are untouched"
+        assert sp.tolist() == [1, 1, 1] and shb.tolist() == [[1, 1], [1, 0]]
+        acc = pf.account_half(torch.ones((P, H), dtype=torch.bool), sp)
+        assert acc == dict(served=3, wrong=0, extra_head_bytes=3 * 2 * pf.BYTES_HEAD_BLOCK), "each piece served one head: the other head's K+V halves are extra"
+
+
+def _fake_ops(loaded_log):
+    def gather_k(k_gpu, k_cpu, load_mask, bs):
+        Hh, Bb, M = load_mask.shape
+        for h in range(Hh):
+            for b in range(Bb):
+                for m in range(M):
+                    blk = int(load_mask[h, b, m])
+                    if blk >= 0:
+                        k_gpu[b, m * bs:(m + 1) * bs, h] = k_cpu[b, blk * bs:(blk + 1) * bs, h]
+                        loaded_log.append((h, b, blk))
+
+    def gather_v(v_gpu, v_cpu, bias_gpu, kv_bias, load_mask, bs):
+        Hh, Bb, M = load_mask.shape
+        for h in range(Hh):
+            for b in range(Bb):
+                for m in range(M):
+                    blk = int(load_mask[h, b, m])
+                    if blk >= 0:
+                        v_gpu[b, m * bs:(m + 1) * bs, h] = v_cpu[b, blk * bs:(blk + 1) * bs, h]
+                        bias_gpu[b, m * bs:(m + 1) * bs, h] = kv_bias[b, blk * bs:(blk + 1) * bs, h]
+
+    def diff(old, new, new_buf, load):
+        nm, lm = pf.diff_reference(old, new)
+        new_buf.copy_(nm); load.copy_(lm)
+    return pf.EngineOps(diff=diff, gather_k=gather_k, gather_v=gather_v, ring_hit=pf.ring_hit_reference, bias_rows=lambda x: x)
+
+
+def test_v_update_with_ring_matches_the_plain_body_with_fewer_host_loads():
+    """The S == 1 body with the ring step gives the SAME maps and the SAME window
+    bytes as the plain body (ring None); the ring serves its pieces D2D and
+    the host gathers see only the residual loads."""
+    B, bs = 2, BS
+    def world(seed):
+        e = NarrowEngine(B=B, tail_len=5, seed=seed)
+        e._block_map[:, :, :TOPK - 1] = torch.tensor([[[5, 6, 7], [15, 16, 17]], [[5, 6, 7], [15, 16, 17]]])
+        e._new_block_map_buf = torch.empty_like(e._block_map); e._load_mask = torch.empty_like(e._block_map)
+        gg = torch.Generator().manual_seed(9)
+        e._k_cpu = torch.randn((B, 40 * bs, H, D), generator=gg); e._v_cpu = torch.randn((B, 40 * bs, H, D), generator=gg)   # both worlds share the host window
+        e.seq_length = 40 * bs - 100          # T = 39 (irrelevant here: the tail slot keeps its id)
+        return e
+    eA, eB = world(1), world(1)
+    topk_idx = torch.tensor([[[5, 8, 9, eA.T], [15, 18, 17, eA.T]], [[5, 6, 9, eA.T], [15, 18, 19, eA.T]]])   # per (h, b): new blocks 8 9 / 18 / 9 / 18 19
+    key = torch.randn((B, 1, H, D)); val = torch.randn((B, 1, H, D)); kv_bias = torch.randn((B, 40 * bs, H))
+    logA, logB = [], []
+    opsA, opsB = _fake_ops(logA), _fake_ops(logB)
+    pf.v_update_with_ring(eA, opsA, key, val, kv_bias, topk_idx, None)                                   # the plain body
+    # the ring holds pieces (b=0, blk 8), (b=0, blk 9), (b=1, blk 18) with the host's bytes (what a correct prefetch packed)
+    pb, pblk = torch.tensor([0, 0, 1]), torch.tensor([8, 9, 18])
+    rows = pf.pack_rows(pb, pblk, 40 * bs, bs)
+    ring_k = eB._k_cpu.view(-1, H, D)[rows].clone(); ring_v = eB._v_cpu.view(-1, H, D)[rows].clone()
+    ids, pidx = pf.id_table(pb, pblk, B, 4)
+    half = pf.RingHalfDevice(ring_k=ring_k, ring_v=ring_v, ids=ids, piece=pidx, served_p=torch.zeros(3, dtype=torch.int32), served_hb=torch.zeros((H, B), dtype=torch.int32))
+    pf.v_update_with_ring(eB, opsB, key, val, kv_bias, topk_idx, half)
+    assert torch.equal(eA._block_map, eB._block_map) and torch.equal(eA._k_gpu, eB._k_gpu) and torch.equal(eA._v_gpu, eB._v_gpu) and torch.equal(eA._kv_bias_gpu, eB._kv_bias_gpu)
+    assert eA.seq_length == eB.seq_length and eA._tail_block_len_on_gpu == eB._tail_block_len_on_gpu and torch.equal(eA._cache_lens, eB._cache_lens)
+    assert sorted(logA) == sorted([(0, 0, 8), (0, 0, 9), (0, 1, 18), (1, 0, 9), (1, 1, 18), (1, 1, 19)])
+    assert sorted(logB) == sorted([(1, 1, 19)]), "only the residual miss (19) went through the host gather"
+    assert half.served_p.tolist() == [1, 2, 2] and half.served_hb.tolist() == [[2, 1], [1, 1]]
+    acc = pf.account_half(torch.ones((3, H), dtype=torch.bool), half.served_p)
+    assert acc["served"] == 3 and acc["wrong"] == 0 and acc["extra_head_bytes"] == 1 * 2 * pf.BYTES_HEAD_BLOCK
+
+
+class _Ev:
+    def __init__(self, done=False):
+        self.done = done
+
+    def query(self):
+        return self.done
+
+
+def test_ring_book_readiness_state_machine():
+    rb = pf.RingBook(num_layers=1)
+    q = lambda e: e.query()
+    assert rb.check_need(0, 5, q) is None, "nothing issued for tick 4: no half"
+    half = rb.try_issue(0, 4, 10)
+    assert half == 0 and rb.occupancy(0) == 1
+    ev = _Ev(False)
+    rb.set_event(0, half, ev, pack_ms=1.5, n_rows=640)
+    assert rb.check_need(0, 5, q) is None and rb.halves[0][0].late, "copy still pending at need time: LATE, unusable"
+    ev.done = True
+    assert rb.release_done(0, q) == [0] and rb.occupancy(0) == 0, "a late half is freed once its copy completed"
+    h2 = rb.try_issue(0, 5, 3); ev2 = _Ev(True); rb.set_event(0, h2, ev2, 0.5, 192)
+    assert h2 == 1 and rb.check_need(0, 6, q) == 1, "arrived in time"
+    rb.consume(0, 1, _Ev(False))
+    assert rb.release_done(0, q) == [] and rb.try_issue(0, 7, 1) is None and rb.ring_full == 1, "the half is busy until its scatter completed: ring full"
+    rb.halves[0][1].ev_consumed.done = True
+    assert rb.release_done(0, q) == [1] and rb.try_issue(0, 7, 1) == 1
+    acc = pf.PrefetchAccount()
+    acc.add(layer=0, tick=5, issued=10, arrived=False, late_pieces=10, residual=7, pack_ms=1.5)
+    acc.add(layer=0, tick=6, issued=3, arrived=True, served=2, wrong=1, extra_head_bytes=pf.BYTES_HEAD_BLOCK * 2, residual=1, slack_ms=12.0, pack_ms=0.5, occupancy=2)
+    s = acc.summary(committed_tokens=100)
+    assert s["issued_pieces"] == 13 and s["issued_bytes"] == 13 * 4 * pf.BYTES_HEAD_BLOCK and s["late_pieces"] == 10 and s["in_time_layers"] == 1 and s["late_layers"] == 1
+    assert s["residual_misses"] == 8 and s["residual_bytes"] == 8 * 2 * pf.BYTES_HEAD_BLOCK and s["exposed_bytes_per_token"] == s["residual_bytes"] / 100
+    assert s["wrong_pieces"] == 1 and s["pack_ms_mean"] == 1.0 and s["slack_ms_min"] == 12.0 and s["occupancy_max"] == 2
+
+
+# ---------------------------------------------------------------------------
+# the OVERLAPPED restart's state machine and schedule (core.CatchupState, core.catchup_schedule)
+# ---------------------------------------------------------------------------
+def test_catchup_state_machine_sequence():
+    B = 4
+    st = core.CatchupState(B)
+    assert st.catch_set()[0].tolist() == [0, 1, 2, 3], "no draft yet: every request catches up first"
+    st.draft = torch.tensor([21, 22, 23, 24]); st.mode.fill_(core.ACTIVE)          # the seed
+    out = st.tick_end(committed=torch.tensor([21, 99, 23, 98]), s_argmax=torch.tensor([31, 32, 33, 34]))
+    assert out.accepted.tolist() == [True, False, True, False] and out.catch_idx.tolist() == [1, 3] and out.catch_in.tolist() == [99, 98]
+    assert st.draft.tolist() == [31, -1, 33, -1] and st.mode.tolist() == [0, 1, 0, 1]
+    idx, cin = st.catch_set()
+    assert idx.tolist() == [1, 3] and cin.tolist() == [99, 98], "the catch-up during the next tick starts from the committed token"
+    with pytest.raises(AssertionError):
+        st.apply_catchup(torch.tensor([0]), torch.tensor([1]), torch.tensor([2]))
+    st.apply_catchup(idx, tok1=torch.tensor([55, 66]), tok2=torch.tensor([77, 88]))
+    # next tick: request 1's tok1 matches the committed token -> rejoins with draft 77; request 3's does not -> catches up again
+    out = st.tick_end(committed=torch.tensor([31, 55, 40, 67]), s_argmax=torch.tensor([41, 42, 43, 44]))
+    assert out.accepted.tolist() == [True, False, False, False] and out.rejoined.tolist() == [False, True, False, False]
+    assert st.draft.tolist() == [41, 77, -1, -1] and st.mode.tolist() == [0, 0, 1, 1] and out.catch_idx.tolist() == [2, 3] and out.catch_in.tolist() == [40, 67]
+    assert st.tok1.tolist() == [-1] * 4, "results are consumed"
+    assert st.s_inputs(torch.tensor([9, 9, 9, 9])).tolist() == [41, 77, 9, 9]
+    with pytest.raises(ValueError):
+        st.tick_end(torch.tensor([1, -1, 1, 1]), torch.zeros(4, dtype=torch.int64))
+
+
+def test_catchup_schedule_which_tick_sees_which_rows():
+    s = core.catchup_schedule(t_reject=4, tau=1000)
+    assert s == dict(run_during=5, pos1=1001, pos2=1002, dummy_s_tick=5, judged_at=5, rejoin_tick=6, rejoin_pos=1003, pos1_attends_upto=1000, pos2_attends_upto=1001)
+    src = (NOSI_PKG / "paired" / "side_restart.py").read_text()
+    assert "prefix = tl_after - 1 if pos_kind == 1 else tl_after" in src, "position 1 never attends V's exact tau + 1 row; position 2 does"
+    assert "own = lay.tail_slot * lay.bs + tl_after" in src, "both positions write tick t + 2's V row"
+
+
+def test_knobs_prefetch_restart_and_twin2b_override(monkeypatch):
+    monkeypatch.delenv("NOSI_ATTN_SPLITS", raising=False)
+    for k in ("NOSI_PAIRED_PREFETCH", "NOSI_PAIRED_RESTART", "NOSI_PAIRED_GEMM"):
+        monkeypatch.delenv(k, raising=False)
+    c = tick.config_from_env()
+    assert c.prefetch == "off" and c.restart == "sequential" and c.prefetch_cap == 8 and c.prefetch_workers == 8
+    monkeypatch.setenv("NOSI_PAIRED_PREFETCH", "ring"); monkeypatch.setenv("NOSI_PAIRED_RESTART", "overlapped"); monkeypatch.setenv("NOSI_PAIRED_PREFETCH_CAP", "4")
+    c = tick.config_from_env()
+    assert c.prefetch == "ring" and c.restart == "overlapped" and c.prefetch_cap == 4
+    monkeypatch.setenv("NOSI_PAIRED_GEMM", "split")
+    c2 = tick.config_from_env(gemm_pad_rows=8, gemm="fused")
+    assert c2.gemm == "fused" and c2.gemm_pad_rows == 8, "twin2b forces the fused GEMM whatever the environment says (job 2175574's twin2b rc=1)"
+    with pytest.raises(SystemExit):
+        tick.config_from_env(gemm_pad_rows=8)
+    monkeypatch.setenv("NOSI_PAIRED_PREFETCH", "always")
+    with pytest.raises(SystemExit):
+        tick.config_from_env()
+    tw_src = (NOSI_PKG / "paired" / "twin.py").read_text()
+    assert "vis_v.to(torch.int64)" in tw_src, "the in-situ twin casts the fused path's int32 prefix (job 2175574's comparator error)"
+    psrc = (ROOT / "benchmarks" / "Efficiency" / "paired_pilot.py").read_text()
+    assert 'gemm=("fused" if pad2b else None)' in psrc
+    tsrc = (NOSI_PKG / "paired" / "tick.py").read_text()
+    assert "_pf.v_update_with_ring(eng, G.engine_ops" in tsrc and "pe.check_need(l, tick_index)" in tsrc and "sc.prefetch.submit(l, tick_index, sel_s" in tsrc

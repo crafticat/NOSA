@@ -274,9 +274,10 @@ def _setup(path, ids, need_round_slots: bool):
     layout = "narrow" if R == 0 else "union"       # R = 0: the shipped 64-slot allocation, S's row inside the tail slot (E2c); R >= 1: the union store
     if _ce.POOL_BLOCKS != 0:
         die("NOSI_POOL_BLOCKS must be 0 for this pilot")
-    print("[paired_pilot] mode=%s tag=%s L=%d N=%d warm=%d docs=%d distinct<=%d ROUND_SLOTS=%d (%s layout) ATTN_SPLITS=%s POISON=%s GEMM=%s BIAS=%s S_OFF=%s"
+    print("[paired_pilot] mode=%s tag=%s L=%d N=%d warm=%d docs=%d distinct<=%d ROUND_SLOTS=%d (%s layout) ATTN_SPLITS=%s POISON=%s GEMM=%s BIAS=%s S_OFF=%s PREFETCH=%s RESTART=%s"
           % (MODE, TAG, L, N, WARM, NDOCS, DISTINCT, R, layout, os.environ.get("NOSI_ATTN_SPLITS", "unset"), os.environ.get("NOSI_PAIRED_POISON", "0"),
-             os.environ.get("NOSI_PAIRED_GEMM", "fused"), os.environ.get("NOSI_PAIRED_BIAS", "fused"), os.environ.get("NOSI_PAIRED_S_OFF", "0")), flush=True)
+             os.environ.get("NOSI_PAIRED_GEMM", "fused"), os.environ.get("NOSI_PAIRED_BIAS", "fused"), os.environ.get("NOSI_PAIRED_S_OFF", "0"),
+             os.environ.get("NOSI_PAIRED_PREFETCH", "off"), os.environ.get("NOSI_PAIRED_RESTART", "sequential")), flush=True)
     model = Llama(model_name=path, device="cuda", offload=True)
     B = ids.shape[0]
     x = ids.to("cuda")
@@ -351,7 +352,7 @@ def run_twin(path, ids, pad2b: bool = False):
     ev = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(WARM)]
     position_ids = _shipped_steps(model, cache, forced, position_ids, cu, WARM, rows, ev)
     Tk = _budget_or_die(cache)
-    cfg = Tk.config_from_env(gemm_pad_rows=(B if pad2b else 0))
+    cfg = Tk.config_from_env(gemm_pad_rows=(B if pad2b else 0), gemm=("fused" if pad2b else None))   # twin2b IS the fused-GEMM diagnostic
     sc = Tk.setup(model, cache, B)
     vt = _vtr.VerifyTrace(model.num_layers)
     step = TW.twin2b_step if pad2b else TW.twin_step
@@ -389,10 +390,23 @@ def run_paired(path, ids, insitu_on: bool):
     cfg = Tk.config_from_env()
     sc = Tk.setup(model, cache, B)
     vt = _vtr.VerifyTrace(model.num_layers)
-    state = C.DraftState(B, device="cuda")
+    pe = Tk.setup_prefetch(model, cache, sc, cfg)                                   # E4 (NOSI_PAIRED_PREFETCH=ring) or None
+    overlapped = cfg.restart == "overlapped"
+    runner = None
+    if overlapped:
+        from nosi.paired import side_restart as SR
+        side = torch.cuda.Stream()
+        side_scoring = SR.SideScoring(model, cache, side)
+        sc_side = Tk.Scratch(model, cache, sc.lay, B)
+        runner = SR.CatchupRunner(model, cache, sc_side, cfg, side, side_scoring)
+        state = C.CatchupState(B, device="cuda")
+    else:
+        state = C.DraftState(B, device="cuda")
     ledger = C.Ledger()
+    catchups = []
     pos = position_ids[:, 0].contiguous()          # (B,) the committed position tau = L + WARM
     s_off = bool(cfg.s_off)
+    sync = torch.cuda.current_stream().synchronize if (pe is not None or overlapped) else torch.cuda.synchronize   # the side stream keeps running
     if s_off:
         print("[paired_pilot] NOSI_PAIRED_S_OFF=1: S rows present in the GEMMs / attention only; no seed, no restart", flush=True)
     else:
@@ -400,7 +414,10 @@ def run_paired(path, ids, insitu_on: bool):
         vt.label(("seed", WARM))
         seed = Tk.s_rows_forward(model, cache, sc, cfg, forced[:, WARM], pos, sc.req_all, trace=vt)
         torch.cuda.synchronize()
-        state.apply_restart(sc.req_all, seed.logits_v.argmax(-1))
+        if overlapped:
+            state.draft = seed.logits_v.argmax(-1); state.mode.fill_(C.ACTIVE)         # every request starts with a seeded draft
+        else:
+            state.apply_restart(sc.req_all, seed.logits_v.argmax(-1))
         ledger.add_restart(WARM - 1, rows=B, ms=None, layers=seed.accounts)
         if any(p is None for p in sc.prev_sel_s):
             die("the seed left a layer without an S prediction")
@@ -411,8 +428,27 @@ def run_paired(path, ids, insitu_on: bool):
         had_draft = (state.draft >= 0).clone()
         insitu = TW.InSituTwin() if insitu_on else None
         vt.label(("tick", t))
-        res = Tk.paired_tick(model, cache, sc, cfg, v_tok, s_tok, pos, trace=vt, insitu=insitu)
-        torch.cuda.synchronize()
+        t_wall0 = time.perf_counter()
+        if overlapped:
+            c_idx, c_in = state.catch_set()
+            e0 = torch.cuda.Event(enable_timing=True); e1 = torch.cuda.Event(enable_timing=True)
+            with torch.cuda.stream(runner.side):
+                e0.record(runner.side)
+            runner.begin(c_in, pos[c_idx], c_idx)                                  # position tau + 1 = this tick's V position
+            res = Tk.paired_tick(model, cache, sc, cfg, v_tok, s_tok, pos, trace=vt, insitu=insitu, tick_index=t,
+                                 after_layer=runner.main_layer_done, before_layer=runner.wait_before_main_layer)
+            runner.finish()
+            with torch.cuda.stream(runner.side):
+                e1.record(runner.side)
+            tok1, tok2 = runner.results()                                          # a side-stream sync: the catch-up must be done before the tick ends
+            if tok1 is not None:
+                state.apply_catchup(c_idx, tok1, tok2)
+            sync()
+            catchups.append(dict(tick=t, rows=int(c_idx.numel()), side_ms=(e0.elapsed_time(e1) if c_idx.numel() else 0.0)))
+        else:
+            res = Tk.paired_tick(model, cache, sc, cfg, v_tok, s_tok, pos, trace=vt, insitu=insitu, tick_index=t)
+            sync()
+        wall_ms = 1e3 * (time.perf_counter() - t_wall0)
         lv, ls = res.logits_v, res.logits_s
         if not (torch.isfinite(lv).all() and torch.isfinite(ls).all()):
             non_finite += 1
@@ -426,16 +462,21 @@ def run_paired(path, ids, insitu_on: bool):
         greedy_agree = v_arg == committed
         prod_accept = had_draft & (s_tok == v_arg)                    # production-style accept: the draft equals argmax(V)
         n_restart = 0
-        if t < N - 1 and not s_off:
+        if overlapped:
+            n_restart = int(outcome.catch_idx.numel())                            # rows that catch up DURING the next tick
+        elif t < N - 1 and not s_off:
             vt.label(("restart", t))
             n_restart, r_accts = Tk.restart_after(model, cache, sc, cfg, state, outcome, committed, pos + 1, trace=vt)
             torch.cuda.synchronize()
             if n_restart:
                 ledger.add_restart(t, rows=n_restart, ms=None, layers=r_accts)
+        if pe is not None:
+            pe.close_tick(t, torch.stack([a.v_miss for a in res.accounts], 0))
         ledger.add_tick(t, res.accounts, outcome.accepted, greedy_agree, n_restart)
         rec = dict(tick=t, accepted=int(outcome.accepted.sum()), had_draft=int(had_draft.sum()), prod_accept=int(prod_accept.sum()),
-                   greedy_agree=int(greedy_agree.sum()), n_restart=n_restart, restart_idx=outcome.restart_idx.cpu(),
-                   s_hash=sha(ls), v_hash=sha(lv))
+                   greedy_agree=int(greedy_agree.sum()), n_restart=n_restart, wall_ms=wall_ms,
+                   restart_idx=(outcome.catch_idx if overlapped else outcome.restart_idx).cpu(),
+                   rejoined=(int(outcome.rejoined.sum()) if overlapped else None), s_hash=sha(ls), v_hash=sha(lv))
         if insitu is not None:
             d = TW.diagnose(res.insitu)
             rec["insitu"] = res.insitu
@@ -453,6 +494,15 @@ def run_paired(path, ids, insitu_on: bool):
     if non_finite:
         die("%d ticks produced non-finite logits under POISON=%s: a row read the provisional slot without writing it (G1/G7)" % (non_finite, cfg.poison))
     C.lockstep_check(committed_rows, B)
+    prefetch = None
+    if pe is not None:
+        torch.cuda.synchronize()
+        pe.shutdown()
+        prefetch = dict(summary=pe.account.summary(B * len(ticks)), rows=pe.account.rows, errors=pe.errors, pinned_gb=pe.pinned_gb, device_gb=pe.device_gb,
+                        cap=cfg.prefetch_cap, workers=cfg.prefetch_workers)
+        print("[paired_pilot] prefetch: %s" % {k: v for k, v in prefetch["summary"].items() if not isinstance(v, list)}, flush=True)
+        if pe.errors:
+            print("[paired_pilot] prefetch worker errors: %s" % pe.errors[:5], flush=True)
     timing = vt.harvest()
     for r in timing:
         for rec in ledger.ticks:
@@ -468,7 +518,7 @@ def run_paired(path, ids, insitu_on: bool):
              summary.get("v_miss_bytes_per_committed_token", float("nan")), summary.get("prefetch_precision"), summary.get("prefetch_recall")), flush=True)
     for r in timing:
         print("[paired_pilot] %s %d: %.1f ms (score %.1f fetch %.1f attn %.1f rest %.1f)" % (r["label"][0], r["label"][1], r["total_ms"], r["score_ms"], r["fetch_ms"], r["attn_ms"], r["rest_ms"]), flush=True)
-    return dict(meta, cfg=cfg._asdict(), insitu=insitu_on, s_off=s_off, logits=out, hashes=[[sha(out[b, r]) for r in range(N + 1)] for b in range(B)],
+    return dict(meta, cfg=cfg._asdict(), insitu=insitu_on, s_off=s_off, prefetch=prefetch, catchups=catchups, logits=out, hashes=[[sha(out[b, r]) for r in range(N + 1)] for b in range(B)],
                 greedy_tokens=torch.stack(greedy_rows, 1).cpu(), committed_tokens=torch.stack(committed_rows, 1).cpu(),
                 calls=timing, ticks=ticks, ledger_ticks=[_cpu_tick_record(r) for r in ledger.ticks], ledger_restarts=[_cpu_tick_record(r) for r in ledger.restarts],
                 summary=summary, diagnoses=diags, peak_gb=torch.cuda.max_memory_allocated() / 1e9, reserved_gb=torch.cuda.max_memory_reserved() / 1e9)
@@ -594,6 +644,17 @@ def compare() -> int:
                 decompositions.append("\nresident tick decomposition at B=%d (%s vs the twin step; gemm=%s bias=%s; predictions REGISTERED in predicted_deltas):\n%s" % (
                     B, name, d["cfg"].get("gemm", "fused"), d["cfg"].get("bias_impl", "torch"),
                     render_decomposition(B, twin_timing, tick_timing, d["cfg"].get("gemm", "fused"), d["cfg"].get("bias_impl", "torch"))))
+            if d.get("prefetch"):
+                ps = d["prefetch"]["summary"]
+                lines.append("| report[B=%d,%s prefetch] | - | issued %.3g B/token, residual (blocking) %.3g B/token, in-time layers %d / late %d, served %d wrong %d pieces, extra-head %.3g B, unrequested %d, ring full %d, pack ms mean %s, slack ms min %s mean %s, occupancy max %d, pinned %.2f GB device %.2f GB, worker errors %d |" % (
+                    B, name, ps["issued_bytes_per_token"], ps["residual_bytes_per_token"], ps["in_time_layers"], ps["late_layers"], ps["served_pieces"], ps["wrong_pieces"],
+                    ps["extra_head_bytes"], ps["unrequested"], ps["ring_full"], ps["pack_ms_mean"], ps["slack_ms_min"], ps["slack_ms_mean"], ps["occupancy_max"],
+                    d["prefetch"]["pinned_gb"], d["prefetch"]["device_gb"], len(d["prefetch"]["errors"])))
+            if d.get("catchups"):
+                cs = d["catchups"]
+                walls = [r["wall_ms"] for r in d["ticks"] if r.get("wall_ms") is not None][1:]
+                lines.append("| report[B=%d,%s overlapped restart] | - | catch-up rows per tick %s, side ms %s, tick wall ms mean %.1f (main-stream bracket in the timing table), rejoined per tick %s |" % (
+                    B, name, [c["rows"] for c in cs], ["%.1f" % c["side_ms"] for c in cs], (sum(walls) / len(walls)) if walls else float("nan"), [r.get("rejoined") for r in d["ticks"]]))
             if d.get("diagnoses") is not None:
                 bad = [x for x in d["diagnoses"] if x]
                 lines.append("| report[B=%d,%s in-situ] | - | %d/%d ticks with every term torch.equal%s |" % (
