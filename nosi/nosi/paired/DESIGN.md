@@ -18,7 +18,7 @@ from `feature/nosi-verify-rows` (004f279). Line numbers below are of THIS worktr
 - `twin.py`: `twin_step` (V rows only through the same body) and `InSituTwin` (every term recomputed
   at M = B from the same inputs; `diagnose` names the first differing term).
 - `benchmarks/Efficiency/paired_pilot.py`: arms `shipped`, `twin`, `equiv`, `resident`, `compare`.
-- `tests/test_paired_core.py`: 36 CPU tests (see section 5).
+- `tests/test_paired_core.py`: 56 CPU tests (see section 5).
 
 ## 2. Assumptions about the engine, each with the line that carries it
 
@@ -135,3 +135,41 @@ from `feature/nosi-verify-rows` (004f279). Line numbers below are of THIS worktr
 5. **Diagnostics added**: `InSituTwin` terms bias / qkv (pre-rope) / rope / score / selection / attention /
    wo-FFN / norm / lm_head, `diagnose_layers` per layer of the first differing tick (printed by compare);
    `NOSI_PAIRED_S_OFF=1` (S rows in the GEMMs and the attention call only, no seed / restart).
+
+## 8. E2c: the NARROW layout and the fused bias build (preconditions from E1b / E1c / E2)
+
+**Layout (R = 0, `NOSI_VERIFY_ROUND_SLOTS=0`, `core.paired_layout(..., narrow=True)`)**: the SHIPPED allocation,
+W = 64 slots, the engine byte-for-byte upstream (no round region, no mirrors, `decode_update` = the R = 0 body,
+returning `_k_gpu` itself). S's provisional K/V is written to ROW `tail_len_after` of slot 63 = the row the next V
+write overwrites (`cache_engine.py` S == 1 body: write at `_tail_block_idx_on_gpu*bs + _tail_block_len_on_gpu`).
+Why that row is safe: the shipped decode reads rows `< _cache_lens = 63*bs + tail_len` (never it); a fill's
+write-back (`:401-409`) copies slot 63 only after V wrote row 63 over it; the restart / seed rewrite it before
+reading it. Why W must stay 64: the split partition is `n_blocks_per_split = ceil(ceil(seqlen_k / kBlockN) /
+num_splits)` with `seqlen_k` = the ALLOCATED length (`flash_fwd_kernel.h:594`; `flash_api.cpp:338`), so W = 65
+(33 n-blocks -> 9 per split, the decode's 8) already moves the seams; both rows' extents stay <= 64*bs (V:
+`63*bs + tail_len` = the decode's; S: own row + 1), and E1c (job 2175546) proved row 0 of a U = 2 call over this
+allocation torch.equal to the shipped call. The S row after a FILL (tail_len_after = 0, slot 63 = block T
+complete): its own row is row 0, so it attends its own K/V in place of T's row 0 (an approximation for the
+approximate row only; T is on the host by then and the next V overwrites row 0 anyway) -- never reached within
+the pilot budget (section 4.2). The union layout (R >= 1) stays selectable for comparison.
+**GEMMs**: `NOSI_PAIRED_GEMM=split` (`tick.linear_rows`): one M = n call per row kind on a contiguous (n, 1, K)
+input, so V's five GEMMs (wqkv, wo, gate_up, down, lm_head) are the decode's own calls (cuBLAS sees the same M,
+N, K, strides) -> V bit-exact to the shipped decode is EXPECTED (P-E2c-1); `fused` keeps M = 2B (bit-exact to
+twin2b only; the M term measured 0.72-1.4 max |dlogit| in E2).
+**Fused bias (`NOSI_PAIRED_BIAS=fused`, `paired/fused_bias.py`)**: ONE Triton kernel per layer over a (rows,
+slots) grid; each program computes one (bs, Hkv) tile: the slot's block id (from `_block_map`, the tail slot's
+content id, or the ring) checked against S's selection (K compares), the readiness flag, the V / S prefix rules,
+the own-row fold / extra, and writes the bias tile, the prefix count and the extent (atomic max). Inputs are the
+engine's own tensors (no `slot_ids` / `assemble_rows` / gather intermediates); the only host work per layer is
+the argument tuple. The torch path (`NOSI_PAIRED_BIAS=torch`) is the reference; `fused_bias_reference` is the
+kernel's arithmetic in vectorized torch; the CPU test gates all three torch.equal on random rounds (narrow and
+union, subsets, fills, T-not-selected) through Triton's interpreter (`TRITON_INTERPRET=1`, triton 3.4 in
+manar28.sif).
+**Registered predictions for E2c** (falsifiers in compare.md): P-E2c-1 V rows torch.equal the SHIPPED decode rows on
+every tick with gemm=split (G3-greedy / G3-tol / G3-commit PASS, max |dlogit| = 0); P-E2c-2 with gemm=fused the
+V rows are torch.equal to twin2b and vs shipped within 4 x tau_ctrl; P-E2c-3 attention bracket of the tick =
+1.31 x the twin's (E1c) at B = 64 and 128; P-E2c-4 fused bias: the tick's fetch bracket minus the twin's <= 1.0 ms
+per call at B = 128 (the E2 torch path measured +131 ms contaminated / E1b 19.3 ms clean); P-E2c-5 v_miss
+= the ordinary 3.8 blocks per stream-step (the churn of E2 was the compressed-cis corruption). Arms: shipped,
+twin, twin2b, equiv, resident at R = 0 with gemm=split / bias=fused (the gate), then resident with gemm=fused
+(the cost), optionally bias=torch (the old build, for the fetch delta).

@@ -201,27 +201,32 @@ def render_timing(rows) -> str:
     return "\n".join(out)
 
 
-def predicted_deltas(B: int) -> dict:
+def predicted_deltas(B: int, gemm: str = "fused", bias_impl: str = "fused") -> dict:
     """REGISTERED predictions of the resident tick's brackets against the U = 1
-    twin step at the same B (None = no registered number at this B: never
-    invented). rest_delta: the GEMM set at M = 2B vs M = B, the M-scan of job
-    2175525 (14.59 -> 20.03 ms at B = 128); attn_abs: the rows attention with
-    U = 2 on the 64-slot window, 13.7 ms at B = 128 (reuse ledger (ii-a));
-    score_delta: the present serial scoring chain, one extra position,
-    3.56 + 0.0281 B ms (job 2175382, U = 1 -> 2); fetch_delta: the bias build,
-    +1..2 ms per call (reuse ledger), point 1.5."""
+    twin step at the same B (None = no registered number: never invented).
+    rest_delta: gemm 'fused' = the GEMM set at M = 2B vs M = B, the M-scan of
+    job 2175525 (14.59 -> 20.03 ms at B = 128, B = 128 only); gemm 'split' =
+    one more M = B GEMM set = 14.59 ms at B = 128. attn_factor: the rows
+    attention with U = 2 adjacent rows over the 64-slot allocation = 1.31 x
+    the shipped attention (E1c, job 2175546: 8.38 vs 6.42 ms at B = 64), any
+    B; the twin's attention over the same allocation stands in for the shipped
+    one. score_delta: the present serial scoring chain, one extra position,
+    3.56 + 0.0281 B ms (job 2175382). fetch_delta: bias 'fused' = the Triton
+    build, <= 1.0 ms per 32-layer call at B = 128 (registered, DESIGN.md 8);
+    bias 'torch' = the E1b measurement 19.3 ms at B = 128."""
     at128 = int(B) == 128
-    return dict(rest_delta=(20.03 - 14.59) if at128 else None, attn_abs=13.7 if at128 else None,
-                score_delta=3.56 + 0.0281 * int(B), fetch_delta=1.5, fetch_band=(1.0, 2.0),
-                source=dict(rest="M-scan job 2175525 (B=128 only)", attn="reuse ledger (ii-a) point 13.7 ms at B=128",
-                            score="delta_scoring 3.56 + 0.0281 B (job 2175382)", fetch="bias build +1..2 ms (reuse ledger)"))
+    rest = ((20.03 - 14.59) if gemm == "fused" else 14.59) if at128 else None
+    fetch = 1.0 if bias_impl == "fused" else (19.3 if at128 else None)
+    return dict(rest_delta=rest, attn_factor=1.31, score_delta=3.56 + 0.0281 * int(B), fetch_delta=fetch,
+                source=dict(rest="M-scan job 2175525 (B=128 only): gemm=%s" % gemm, attn="E1c job 2175546: U = 2 rows = 1.31 x the shipped attention",
+                            score="delta_scoring 3.56 + 0.0281 B (job 2175382)", fetch="bias=%s: fused <= 1.0 ms registered / torch 19.3 ms (E1b, B=128)" % bias_impl))
 
 
-def render_decomposition(B: int, twin_row: dict, tick_row: dict) -> str:
+def render_decomposition(B: int, twin_row: dict, tick_row: dict, gemm: str = "fused", bias_impl: str = "fused") -> str:
     """Per bracket: the twin step's and the tick's measured means, the measured
     delta, the registered predicted delta and the RESIDUAL (measured -
     predicted), so the unexplained part is named per term."""
-    pred = predicted_deltas(B)
+    pred = predicted_deltas(B, gemm, bias_impl)
     out = ["| B=%d bracket | twin ms | tick ms | delta measured | delta predicted | residual | prediction source |" % B,
            "|---|---|---|---|---|---|---|"]
     if not (twin_row.get("n", 0) and tick_row.get("n", 0)):
@@ -234,7 +239,7 @@ def render_decomposition(B: int, twin_row: dict, tick_row: dict) -> str:
             continue
         delta = tk - tw
         if name == "attn":
-            p = (pred["attn_abs"] - tw) if pred["attn_abs"] is not None else None
+            p = (pred["attn_factor"] - 1.0) * tw
         else:
             p = pred[name + "_delta"]
         out.append("| %s | %.2f | %.2f | %+.2f | %s | %s | %s |" % (
@@ -266,12 +271,12 @@ def _setup(path, ids, need_round_slots: bool):
     from nosi import cache_engine as _ce
     from nosi.cache_engine import InfLLMv2Cache
     R = _ce.VERIFY_ROUND_SLOTS
-    if need_round_slots and R <= 0:
-        die("%s mode needs NOSI_VERIFY_ROUND_SLOTS > 0 (the provisional slot is round slot 0; the engine read %d at import)" % (MODE, R))
+    layout = "narrow" if R == 0 else "union"       # R = 0: the shipped 64-slot allocation, S's row inside the tail slot (E2c); R >= 1: the union store
     if _ce.POOL_BLOCKS != 0:
         die("NOSI_POOL_BLOCKS must be 0 for this pilot")
-    print("[paired_pilot] mode=%s tag=%s L=%d N=%d warm=%d docs=%d distinct<=%d ROUND_SLOTS=%d ATTN_SPLITS=%s POISON=%s"
-          % (MODE, TAG, L, N, WARM, NDOCS, DISTINCT, R, os.environ.get("NOSI_ATTN_SPLITS", "unset"), os.environ.get("NOSI_PAIRED_POISON", "0")), flush=True)
+    print("[paired_pilot] mode=%s tag=%s L=%d N=%d warm=%d docs=%d distinct<=%d ROUND_SLOTS=%d (%s layout) ATTN_SPLITS=%s POISON=%s GEMM=%s BIAS=%s S_OFF=%s"
+          % (MODE, TAG, L, N, WARM, NDOCS, DISTINCT, R, layout, os.environ.get("NOSI_ATTN_SPLITS", "unset"), os.environ.get("NOSI_PAIRED_POISON", "0"),
+             os.environ.get("NOSI_PAIRED_GEMM", "fused"), os.environ.get("NOSI_PAIRED_BIAS", "fused"), os.environ.get("NOSI_PAIRED_S_OFF", "0")), flush=True)
     model = Llama(model_name=path, device="cuda", offload=True)
     B = ids.shape[0]
     x = ids.to("cuda")
@@ -285,7 +290,7 @@ def _setup(path, ids, need_round_slots: bool):
     alloc_gb = sum(t.numel() * t.element_size() for t in (eng._k_gpu, eng._v_gpu, eng._kv_bias_gpu)) * model.num_layers / 1e9
     print("[paired_pilot] prefill %d x %d: %.1fs; allocation %s (W=%d), K+V+bias over %d layers %.2f GB" % (
         B, L, time.time() - t0, tuple(eng._k_gpu.shape), W, model.num_layers, alloc_gb), flush=True)
-    meta = dict(mode=MODE, tag=TAG, L=L, N=N, warm=WARM, batch=B, round_slots=R, W=W, alloc_gb=alloc_gb,
+    meta = dict(mode=MODE, tag=TAG, L=L, N=N, warm=WARM, batch=B, round_slots=R, layout=layout, W=W, alloc_gb=alloc_gb,
                 attn_splits_env=os.environ.get("NOSI_ATTN_SPLITS"), poison=os.environ.get("NOSI_PAIRED_POISON", "0") == "1",
                 kv_bias_scale=_ce.KV_BIAS_SCALE)
     return model, cache, logits, position_ids, forced, meta
@@ -586,7 +591,9 @@ def compare() -> int:
                 tick_timing = timing_row(B, name, "paired tick", [c for c in d["calls"] if c["label"][0] == "tick"], d["peak_gb"])
                 timing_rows.append(tick_timing)
                 timing_rows.append(timing_row(B, name, "restart", [c for c in d["calls"] if c["label"][0] == "restart"], d["peak_gb"]))
-                decompositions.append("\nresident tick decomposition at B=%d (%s vs the twin step; predictions REGISTERED in predicted_deltas):\n%s" % (B, name, render_decomposition(B, twin_timing, tick_timing)))
+                decompositions.append("\nresident tick decomposition at B=%d (%s vs the twin step; gemm=%s bias=%s; predictions REGISTERED in predicted_deltas):\n%s" % (
+                    B, name, d["cfg"].get("gemm", "fused"), d["cfg"].get("bias_impl", "torch"),
+                    render_decomposition(B, twin_timing, tick_timing, d["cfg"].get("gemm", "fused"), d["cfg"].get("bias_impl", "torch"))))
             if d.get("diagnoses") is not None:
                 bad = [x for x in d["diagnoses"] if x]
                 lines.append("| report[B=%d,%s in-situ] | - | %d/%d ticks with every term torch.equal%s |" % (

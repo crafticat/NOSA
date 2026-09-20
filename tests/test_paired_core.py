@@ -20,6 +20,7 @@ provisional slot 4, ring 5..6, mirrors 7, 8; H = 2 KV heads, Hq = 4, D = 8.
 from __future__ import annotations
 
 import ast
+os_env_set = __import__("os").environ.setdefault("TRITON_INTERPRET", "1")   # the fused kernel runs on CPU through the interpreter (read at triton import)
 import importlib
 import os
 import sys
@@ -59,6 +60,7 @@ BS, TOPK, R = 64, 4, 3
 H, HQ, D = 2, 4, 8
 LAY = core.paired_layout(TOPK, R, BS)
 W = LAY.W
+K = 4                      # selection entries per (head, request) row in the fused-bias rounds
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +99,8 @@ def _sel(H_, n, ids):
 def test_layout_and_engine_check():
     assert (LAY.tail_slot, LAY.prov_slot, LAY.ring_lo, LAY.ring_hi, LAY.mirror_lo, LAY.mirror_hi, LAY.W) == (3, 4, 5, 7, 7, 8, 9)
     with pytest.raises(ValueError):
-        core.paired_layout(TOPK, 0, BS)          # no provisional slot without a round slot
+        core.paired_layout(TOPK, -1, BS)
+    assert core.paired_layout(TOPK, 0, BS).narrow and not LAY.narrow      # R = 0 is the NARROW layout (E2c), R >= 1 the union store
     eng = FakeEngine()
     core.check_layout_against_engine(LAY, eng)
     eng.pool_blocks = 1
@@ -210,12 +213,12 @@ def test_s_visible_rows_selection_tail_and_provisional():
     assert vis.shape == (2, W, H)
     for h in range(H):
         assert vis[0, 0, h] == BS and vis[0, 1, h] == BS and vis[0, 2, h] == 0          # slot 2 holds 20+h+0, not selected
-        assert vis[0, LAY.tail_slot, h] == 6 and vis[0, LAY.prov_slot, h] == 1
+        assert vis[0, LAY.tail_slot, h] == 6 and vis[0, LAY.prov_slot, h] == 0          # the own row is not a prefix here: paired_bias's own_rows adds it
         assert (vis[0, LAY.ring_lo:LAY.ring_hi, h] == 0).all() and vis[0, LAY.mirror_lo, h] == 0 and vis[0, LAY.mirror_hi, h] == 0
-    # the tail slot is named by id: a selection without T sees 0 tail rows; the provisional row is S's own, always
+    # the tail slot is named by id: a selection without T sees 0 tail rows
     sel2 = sel.clone(); sel2[..., 2] = -1
     vis2 = core.s_visible_rows(ids, ready, sel2, LAY, tail_rows=6)
-    assert (vis2[:, LAY.tail_slot] == 0).all() and (vis2[:, LAY.prov_slot] == 1).all()
+    assert (vis2[:, LAY.tail_slot] == 0).all() and (vis2[:, LAY.prov_slot] == 0).all()
     # after a fill the slot physically holds T complete: tail_rows = bs
     vis3 = core.s_visible_rows(ids, ready, sel, LAY, tail_rows=BS)
     assert (vis3[:, LAY.tail_slot] == BS).all()
@@ -248,7 +251,8 @@ def test_g2_canonical_order_deterministic_and_batch_independent():
     ids_in_order = ids[0, 0][order].tolist()
     named = [i for i in ids_in_order if i >= 0]
     assert named == sorted(named), "ascending block id"
-    assert order.tolist()[-1] == LAY.prov_slot, "the id-less provisional slot sorts last"
+    vis_own = vis_a[0, :, 0].clone(); vis_own[LAY.prov_slot] = 1
+    assert core.canonical_order(ids[0, 0], vis_own).tolist()[-1] == LAY.prov_slot, "the id-less provisional slot sorts last"
     # a neighbour's state does not enter request 0's rows (isolation / float-order law)
     eng2 = FakeEngine(B=3, seed=1)
     eng2._block_map[:, 1, :LAY.tail_slot] = torch.tensor([90, 91, 92])
@@ -262,6 +266,7 @@ def test_assemble_rows_interleaves_v_then_s():
     vis_v = core.v_visible_rows(H, 2, LAY, 5)
     vis_s = torch.zeros((2, W, H), dtype=torch.int64); vis_s[:, LAY.prov_slot] = 1
     vis, cbi = core.assemble_rows(plan, vis_v, vis_s, torch.arange(2))
+    assert core.own_rows(plan, 77).tolist() == [-1, 77, -1, 77]
     assert vis.shape == (4, W, H) and cbi.tolist() == [0, 0, 1, 1] and cbi.dtype == torch.int32
     assert torch.equal(vis[0], vis_v[0]) and torch.equal(vis[1], vis_s[0]) and torch.equal(vis[2], vis_v[1]) and torch.equal(vis[3], vis_s[1])
     sub = core.row_plan(torch.tensor([2, 0]), False, True)
@@ -280,7 +285,8 @@ def test_paired_bias_values_extent_and_inplace():
     vis_v = core.v_visible_rows(H, 2, LAY, 6)
     vis_s = core.s_visible_rows(ids, ready, sel, LAY, tail_rows=6)
     vis, cbi = core.assemble_rows(plan, vis_v, vis_s, torch.arange(2))
-    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, check_values=True)
+    own = core.own_rows(plan, core.provisional_row(LAY, 6))
+    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, check_values=True, own_rows=own)
     assert isinstance(rb, ra.RowsBias) and rb.bias.shape == (4, W * BS, H) and rb.bias.is_contiguous()
     assert core.MASKED == -3.0e4 and torch.isfinite(rb.bias).all(), "G7: the masked value is finite"
     # V row 0: cis of request 0 on window rows and tail rows < 6, MASKED above; nothing past the tail slot
@@ -296,13 +302,13 @@ def test_paired_bias_values_extent_and_inplace():
     assert rb.cache_batch_idx.tolist() == [0, 0, 1, 1]
     # in-place into a storage of >= max(R, B) rows: same bytes as the allocating path
     out = torch.empty((6, W * BS, H))
-    rb2 = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, out=out, check_values=True)
+    rb2 = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, out=out, check_values=True, own_rows=own)
     assert rb2.bias.data_ptr() == out.data_ptr() and torch.equal(out[:4], rb.bias) and torch.equal(rb2.cache_seqlens, rb.cache_seqlens)
     with pytest.raises(ValueError):
         core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, out=torch.empty((1, W * BS, H)), check_values=True)
     # a flipped mask entry moves the bias (the mask is read)
     vis_f = vis.clone(); vis_f[0, 2, 0] = 0
-    rb3 = core.paired_bias(eng._kv_bias_gpu, vis_f, cbi, 2, check_values=True)
+    rb3 = core.paired_bias(eng._kv_bias_gpu, vis_f, cbi, 2, check_values=True, own_rows=own)
     assert not torch.equal(rb3.bias, rb.bias)
 
 
@@ -315,7 +321,8 @@ def test_reference_twin_gathered_equals_dense_membership():
     ids, ready = _ids_ready(eng)
     sel = _sel(H, 2, [3, 4, 10, eng.T])
     vis, cbi = core.assemble_rows(plan, core.v_visible_rows(H, 2, LAY, 6), core.s_visible_rows(ids, ready, sel, LAY, 6), torch.arange(2))
-    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, check_values=True)
+    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, check_values=True, own_rows=core.own_rows(plan, core.provisional_row(LAY, 6)))
+    assert (rb.visible_rows[1::2, LAY.prov_slot] == 1).all(), "the own row right after an empty prefix folds into it"
     q = torch.randn((4, HQ, D), generator=torch.Generator().manual_seed(5))
     scale = D ** -0.5
     og = ra.reference_rows_attention(q, eng._k_gpu, eng._v_gpu, rb, scale, torch.float32, gather=True)
@@ -338,16 +345,16 @@ def test_g5_provisional_write_and_poison_leave_exact_store_unchanged():
     eng = FakeEngine(B=3, tail_len=6)
     before = core.exact_store_digest(eng, LAY)
     k = torch.randn((3, H, D)); v = torch.randn((3, H, D)); b = torch.randn((3, H))
-    row = core.s_provisional_write(eng, k, v, b, LAY)
+    row = core.s_provisional_write(eng, k, v, b, LAY, None, 6)
     assert row == LAY.prov_slot * BS
     assert torch.equal(eng._k_gpu[:, row], k) and torch.equal(eng._v_gpu[:, row], v) and torch.equal(eng._kv_bias_gpu[:, row], b)
     assert core.digests_equal(before, core.exact_store_digest(eng, LAY)) == []
-    core.poison_provisional(eng, LAY)
+    core.poison_provisional(eng, LAY, None, 6)
     assert torch.isnan(eng._k_gpu[:, row]).all() and torch.isnan(eng._kv_bias_gpu[:, row]).all()
     assert core.digests_equal(before, core.exact_store_digest(eng, LAY)) == []
     # a subset write touches only its requests
     idx = torch.tensor([2, 0])
-    core.s_provisional_write(eng, k[idx], v[idx], b[idx], LAY, idx)
+    core.s_provisional_write(eng, k[idx], v[idx], b[idx], LAY, idx, 6)
     assert torch.equal(eng._k_gpu[2, row], k[2]) and torch.isnan(eng._k_gpu[1, row]).all()
     assert core.digests_equal(before, core.exact_store_digest(eng, LAY)) == []
     # positive control: a V write into the tail DOES change the exact store (the digest sees it)
@@ -365,7 +372,7 @@ def test_g7_poison_control_surfaces_only_when_read():
     ids, ready = _ids_ready(eng)
     sel = _sel(H, 1, [3, 10, eng.T, -1])
     plan = core.row_plan(torch.arange(1), True, True)
-    core.poison_provisional(eng, LAY)                                      # the previous tick's poison
+    core.poison_provisional(eng, LAY, None, 6)                             # the previous tick's poison
     q = torch.randn((2, HQ, D), generator=torch.Generator().manual_seed(1))
     # V row alone: extent 3*64 + 6 < the provisional row -> finite
     vis_v = core.v_visible_rows(H, 1, LAY, 6)
@@ -374,14 +381,14 @@ def test_g7_poison_control_surfaces_only_when_read():
     ov = ra.reference_rows_attention(q[:1], eng._k_gpu, eng._v_gpu, rb_v, D ** -0.5, torch.float32, gather=False)
     assert torch.isfinite(ov).all()
     # S row that wrote its row this tick -> finite
-    core.s_provisional_write(eng, torch.randn(1, H, D), torch.randn(1, H, D), torch.randn(1, H), LAY)
+    core.s_provisional_write(eng, torch.randn(1, H, D), torch.randn(1, H, D), torch.randn(1, H), LAY, None, 6)
     vis_s = core.s_visible_rows(ids, ready, sel, LAY, 6)
     vis, cbi = core.assemble_rows(plan, vis_v, vis_s, torch.arange(1))
-    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, check_values=True)
+    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, check_values=True, own_rows=core.own_rows(plan, core.provisional_row(LAY, 6)))
     o = ra.reference_rows_attention(q, eng._k_gpu, eng._v_gpu, rb, D ** -0.5, torch.float32, gather=False)
     assert torch.isfinite(o).all()
     # positive control: poison again and let a row's extent reach the row without naming it -> NaN surfaces
-    core.poison_provisional(eng, LAY)
+    core.poison_provisional(eng, LAY, None, 6)
     bad = vis_v.clone(); bad[0, LAY.prov_slot + 1, :] = 1                     # a wrong extent past the poisoned row
     rb_bad = core.paired_bias(eng._kv_bias_gpu, bad, torch.zeros(1, dtype=torch.int32), 1, check_values=True)
     ob = ra.reference_rows_attention(q[:1], eng._k_gpu, eng._v_gpu, rb_bad, D ** -0.5, torch.float32, gather=False)
@@ -617,14 +624,17 @@ def test_config_gemm_pad_rows_and_twin2b_text(monkeypatch):
 def test_pilot_predictions_and_decomposition(tmp_path, monkeypatch):
     pilot = _load_pilot(tmp_path, monkeypatch)
     p = pilot.predicted_deltas(128)
-    assert abs(p["rest_delta"] - (20.03 - 14.59)) < 1e-9 and p["attn_abs"] == 13.7 and abs(p["score_delta"] - (3.56 + 0.0281 * 128)) < 1e-9
+    assert abs(p["rest_delta"] - (20.03 - 14.59)) < 1e-9 and p["attn_factor"] == 1.31 and abs(p["score_delta"] - (3.56 + 0.0281 * 128)) < 1e-9 and p["fetch_delta"] == 1.0
+    assert pilot.predicted_deltas(128, gemm="split")["rest_delta"] == 14.59, "split: one more M = B GEMM set"
+    assert pilot.predicted_deltas(128, bias_impl="torch")["fetch_delta"] == 19.3 and pilot.predicted_deltas(64, bias_impl="torch")["fetch_delta"] is None
     q = pilot.predicted_deltas(64)
-    assert q["rest_delta"] is None and q["attn_abs"] is None and abs(q["score_delta"] - (3.56 + 0.0281 * 64)) < 1e-9, "no number is invented at a B without a registered point"
+    assert q["rest_delta"] is None and abs(q["score_delta"] - (3.56 + 0.0281 * 64)) < 1e-9, "no number is invented at a B without a registered point"
     twin_row = dict(n=3, ms_mean=40.0, score=7.0, fetch=5.0, attn=12.0, rest=16.0)
     tick_row = dict(n=3, ms_mean=60.0, score=14.0, fetch=6.0, attn=14.0, rest=26.0)
     txt = pilot.render_decomposition(128, twin_row, tick_row)
     assert "| rest | 16.00 | 26.00 | +10.00 | +5.44 | +4.56 |" in txt, "residual = measured - predicted, named per term"
-    assert "| attn | 12.00 | 14.00 | +2.00 | +1.70 | +0.30 |" in txt
+    assert "| attn | 12.00 | 14.00 | +2.00 | +3.72 | -1.72 |" in txt, "attention predicted at 1.31 x the twin's (E1c)"
+    assert "| fetch | 5.00 | 6.00 | +1.00 | +1.00 | +0.00 |" in txt
     txt64 = pilot.render_decomposition(64, twin_row, tick_row)
     assert "| rest | 16.00 | 26.00 | +10.00 | - | - |" in txt64
     assert "twin2b" in (ROOT / "benchmarks" / "Efficiency" / "paired_pilot.py").read_text()
@@ -756,7 +766,7 @@ def _scoring_world(B=4, M=12, K=5, seed=0):
     cache = _FakeCache([clayer])
     sc = SimpleNamespace(B=B, cu_full=torch.arange(B + 1, dtype=torch.int32), key_pad=torch.zeros((B, 1, H, D)),
                          cis_pad=torch.zeros((B, 1, H)), q_pad=torch.zeros((B, HQ, D)))
-    cfg = tick.TickConfig(num_splits=4, poison=False, masked=core.MASKED, refuse_compress=True, gemm_pad_rows=0, s_off=False)
+    cfg = tick.TickConfig(num_splits=4, poison=False, masked=core.MASKED, refuse_compress=True, gemm_pad_rows=0, s_off=False, bias_impl="torch", gemm="fused")
     G = SimpleNamespace(NL=_FakeNL)
     return G, model, cache, layer, clayer, sc, cfg
 
@@ -844,3 +854,218 @@ def test_s_off_config_and_text(monkeypatch):
     assert "if plan.has_s and not s_off:" in src and "vis_s = vis_v" in src, "S_OFF: no S scoring, no provisional write, S rows attend V's mask"
     psrc = (ROOT / "benchmarks" / "Efficiency" / "paired_pilot.py").read_text()
     assert "NOSI_PAIRED_S_OFF" in psrc and "if t < N - 1 and not s_off:" in psrc
+
+
+# ---------------------------------------------------------------------------
+# E2c: the NARROW layout (R = 0), the split GEMM, the fused bias kernel
+# ---------------------------------------------------------------------------
+NLAY = core.paired_layout(TOPK, 0, BS)            # narrow: W = 4, provisional row inside the tail slot
+
+
+class NarrowEngine(FakeEngine):
+    def __init__(self, B=3, tail_len=5, T=40, seed=0):
+        super().__init__(B=B, tail_len=tail_len, T=T, seed=seed)
+        g = torch.Generator().manual_seed(seed + 100)
+        self.verify_round_slots = 0
+        self._k_gpu = torch.randn((B, TOPK * BS, H, D), generator=g)
+        self._v_gpu = torch.randn((B, TOPK * BS, H, D), generator=g)
+        self._kv_bias_gpu = torch.randn((B, TOPK * BS, H), generator=g)
+
+
+def test_narrow_layout_rules_and_extents():
+    assert NLAY.narrow and NLAY.W == TOPK and NLAY.prov_slot == NLAY.tail_slot and NLAY.ring_lo == NLAY.ring_hi and NLAY.mirror_lo == -1
+    eng = NarrowEngine(B=2, tail_len=6)
+    core.check_layout_against_engine(NLAY, eng)                       # the shipped allocation: W*bs rows, R = 0
+    assert core.provisional_row(NLAY, 6) == NLAY.tail_slot * BS + 6, "S's row = the next V write's row"
+    with pytest.raises(ValueError):
+        core.provisional_row(NLAY, BS)
+    plan = core.row_plan(torch.arange(2), True, True)
+    ids = core.slot_ids(eng._block_map, eng._block_map[..., NLAY.tail_slot].clone(), NLAY)
+    ready = core.ready_mask(H, 2, NLAY)
+    assert ready.all(), "narrow: every slot of the allocation is the decode's window or tail"
+    sel = _sel(H, 2, [3, 4, 10, eng.T])
+    vis_v = core.v_visible_rows(H, 2, NLAY, 6)
+    vis_s = core.s_visible_rows(ids, ready, sel, NLAY, tail_rows=6)
+    vis, cbi = core.assemble_rows(plan, vis_v, vis_s, torch.arange(2))
+    own = core.own_rows(plan, core.provisional_row(NLAY, 6))
+    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, check_values=True, own_rows=own)
+    # V: the decode's extent; S: the own row extends V's tail prefix by one (T selected)
+    assert rb.cache_seqlens[0::2].tolist() == [NLAY.tail_slot * BS + 6] * 2 and rb.cache_seqlens[1::2].tolist() == [NLAY.tail_slot * BS + 7] * 2
+    assert (rb.visible_rows[1::2, NLAY.tail_slot] == 7).all() and (rb.visible_rows[0::2, NLAY.tail_slot] == 6).all()
+    b1 = rb.bias[1].view(W if False else NLAY.W, BS, H)
+    assert torch.equal(b1[NLAY.tail_slot, :7], eng._kv_bias_gpu[0].view(NLAY.W, BS, H)[NLAY.tail_slot, :7]) and (b1[NLAY.tail_slot, 7:] == core.MASKED).all()
+    assert int(rb.cache_seqlens.max()) <= NLAY.W * BS, "both extents stay inside the 64-slot allocation: the decode's split seams"
+    # T NOT selected: the own row is an EXTRA visible row, the rows below it stay masked, the extent still reaches it
+    sel2 = sel.clone(); sel2[..., 3] = -1
+    vis_s2 = core.s_visible_rows(ids, ready, sel2, NLAY, tail_rows=6)
+    vis2, _ = core.assemble_rows(plan, vis_v, vis_s2, torch.arange(2))
+    rb2 = core.paired_bias(eng._kv_bias_gpu, vis2, cbi, 2, check_values=True, own_rows=own)
+    b1 = rb2.bias[1].view(NLAY.W, BS, H)
+    assert (b1[NLAY.tail_slot, :6] == core.MASKED).all() and torch.equal(b1[NLAY.tail_slot, 6], eng._kv_bias_gpu[0].view(NLAY.W, BS, H)[NLAY.tail_slot, 6])
+    assert rb2.cache_seqlens[1::2].tolist() == [NLAY.tail_slot * BS + 7] * 2 and (rb2.visible_rows[1::2, NLAY.tail_slot] == 0).all()
+    # after a fill: slot 63 = block T complete, the own row is row 0 (inside the prefix): 64 rows, extent = the whole allocation
+    tvw = core.tail_view(63, True, False, NLAY)
+    assert core.provisional_row(NLAY, tvw.tail_len_after) == NLAY.tail_slot * BS
+    vis_s3 = core.s_visible_rows(ids, ready, sel, NLAY, tail_rows=tvw.tail_rows_for_s)
+    vis3, _ = core.assemble_rows(plan, core.v_visible_rows(H, 2, NLAY, 0), vis_s3, torch.arange(2))
+    rb3 = core.paired_bias(eng._kv_bias_gpu, vis3, cbi, 2, check_values=True, own_rows=core.own_rows(plan, NLAY.tail_slot * BS))
+    assert rb3.cache_seqlens[0::2].tolist() == [NLAY.tail_slot * BS] * 2 and rb3.cache_seqlens[1::2].tolist() == [NLAY.W * BS] * 2
+    # the provisional write lands on that row and the poison too; the decode's rows below stay untouched
+    k = torch.randn((2, H, D)); v = torch.randn((2, H, D)); b = torch.randn((2, H))
+    before = core.exact_store_digest(eng, NLAY)
+    row = core.s_provisional_write(eng, k, v, b, NLAY, None, 6)
+    assert row == NLAY.tail_slot * BS + 6 and torch.equal(eng._k_gpu[:, row], k)
+    assert torch.equal(eng._k_gpu[:, :row], before["k"][:, :row]), "rows below the provisional row (the decode's) are untouched"
+    core.poison_provisional(eng, NLAY, None, 6)
+    assert torch.isnan(eng._k_gpu[:, row]).all() and torch.equal(eng._k_gpu[:, :row], before["k"][:, :row])
+
+
+def test_linear_rows_split_is_two_decode_shaped_calls():
+    g = torch.Generator().manual_seed(4)
+    x = torch.randn((3, 2, 8), generator=g); w = torch.randn((5, 8), generator=g)
+    cfg_f = tick.TickConfig(num_splits=4, poison=False, masked=core.MASKED, refuse_compress=True, gemm_pad_rows=0, s_off=False, bias_impl="torch", gemm="fused")
+    cfg_s = cfg_f._replace(gemm="split")
+    plain = torch.nn.functional.linear(x, w)
+    assert torch.equal(tick.linear_rows(x, w, cfg_f), plain)
+    split = tick.linear_rows(x, w, cfg_s)
+    assert split.shape == plain.shape
+    assert torch.equal(split[:, 0], torch.nn.functional.linear(x[:, 0:1].contiguous(), w)[:, 0]), "V's call = the decode-shaped (n, 1, K) call"
+    assert torch.allclose(split, plain)
+    assert torch.equal(tick.linear_rows(x[:, :1], w, cfg_s), torch.nn.functional.linear(x[:, :1], w)), "U = 1: the plain call"
+
+
+def test_config_gemm_and_bias_knobs(monkeypatch):
+    monkeypatch.delenv("NOSI_ATTN_SPLITS", raising=False)
+    for k in ("NOSI_PAIRED_GEMM", "NOSI_PAIRED_BIAS"):
+        monkeypatch.delenv(k, raising=False)
+    c = tick.config_from_env()
+    assert c.gemm == "fused" and c.bias_impl == "fused"
+    monkeypatch.setenv("NOSI_PAIRED_GEMM", "split"); monkeypatch.setenv("NOSI_PAIRED_BIAS", "torch")
+    c = tick.config_from_env()
+    assert c.gemm == "split" and c.bias_impl == "torch"
+    with pytest.raises(SystemExit):
+        tick.config_from_env(gemm_pad_rows=8)          # split + twin2b padding is refused
+    monkeypatch.setenv("NOSI_PAIRED_GEMM", "half")
+    with pytest.raises(SystemExit):
+        tick.config_from_env()
+    src = (NOSI_PKG / "paired" / "tick.py").read_text()
+    for w in ("layer.wqkv", "layer.wo", "layer.gate_up_proj", "layer.down_proj", "model.lm_head"):
+        assert "linear_rows(" in src and w in src
+    assert "linear_padded(hs, layer.wqkv" not in src and "F.linear(hs, layer.wqkv)" not in src, "every GEMM of the body goes through linear_rows"
+
+
+# ---- the fused bias kernel: reference (vectorized torch) and Triton (interpreter) vs the torch path, random rounds ----
+fb = importlib.import_module("nosi.paired.fused_bias")
+
+
+def _random_round(lay, B, K, n_sub, seed, fill=False, drop_tail=False, roles=(True, True)):
+    g = torch.Generator().manual_seed(seed)
+    eng = (NarrowEngine if lay.narrow else FakeEngine)(B=B, tail_len=(63 if fill else int(torch.randint(1, 60, (1,), generator=g))), T=40, seed=seed)
+    # a random window map (distinct ids per (h, b)) and a selection that names some of them + the tail + strangers
+    for h in range(H):
+        for b in range(B):
+            eng._block_map[h, b, :TOPK - 1] = torch.randperm(30, generator=g)[:TOPK - 1]
+    has_v, has_s = roles
+    req_idx = torch.arange(B) if n_sub is None else torch.sort(torch.randperm(B, generator=g)[:n_sub]).values
+    n = req_idx.numel()
+    plan = core.row_plan(req_idx, has_v, has_s)
+    tv = core.tail_view(int(eng._tail_block_len_on_gpu), has_v, False, lay)
+    sel = torch.full((H, n, K), -1, dtype=torch.int64)
+    for h in range(H):
+        for i, b in enumerate(req_idx.tolist()):
+            pool = torch.cat([eng._block_map[h, b, :TOPK - 1], torch.tensor([eng.T, 90, 91])])
+            pick = pool[torch.randperm(pool.numel(), generator=g)[:K - 1]]
+            sel[h, i, :K - 1] = pick
+            if drop_tail:
+                sel[h, i][sel[h, i] == eng.T] = -1
+            elif not (sel[h, i] == eng.T).any():
+                sel[h, i, K - 1] = eng.T
+    if fill and has_v:
+        eng._block_map[..., lay.tail_slot] += 1                # the S == 1 rename after the fill
+    ring_ready = None
+    if not lay.narrow:
+        ring_ready = torch.rand((H, B, lay.ring_hi - lay.ring_lo), generator=g) < 0.5
+    ready = core.ready_mask(H, B, lay, ring_ready=ring_ready)
+    own_row = core.provisional_row(lay, tv.tail_len_after) if has_s else -1
+    return eng, plan, req_idx, sel, ready, tv, own_row
+
+
+def _torch_path(eng, lay, plan, req_idx, sel, ready, tv, own_row, out):
+    n = req_idx.numel()
+    vis_v = core.v_visible_rows(H, n, lay, tv.tail_len_after) if plan.has_v else None
+    vis_s = None
+    if plan.has_s:
+        content = eng._block_map[..., lay.tail_slot] - tv.content_offset
+        ids = core.slot_ids(eng._block_map, content, lay)
+        vis_s = core.s_visible_rows(ids[:, req_idx], ready[:, req_idx], sel, lay, tv.tail_rows_for_s)
+    vis, cbi = core.assemble_rows(plan, vis_v, vis_s, req_idx)
+    return core.paired_bias(eng._kv_bias_gpu, vis, cbi, plan.U, core.MASKED, out=out, check_values=True,
+                            own_rows=(core.own_rows(plan, own_row) if own_row >= 0 else None))
+
+
+def _fused_args(eng, lay, plan, req_idx, sel, ready, tv, own_row):
+    n = req_idx.numel()
+    return fb.FusedArgs(cis=eng._kv_bias_gpu.contiguous(), sel=sel.contiguous(), bmap=eng._block_map.contiguous(),
+                        ring_ids=torch.full((H, eng.B, max(lay.ring_hi - lay.ring_lo, 1)), -1, dtype=torch.int64), ready=ready.to(torch.uint8).contiguous(),
+                        req=plan.req.to(torch.int32).contiguous(), srow=torch.arange(n, dtype=torch.int32).repeat_interleave(plan.U).contiguous(),
+                        role=plan.role.contiguous(), W=lay.W, bs=lay.bs, topk=lay.topk, tail_slot=lay.tail_slot, ring_lo=lay.ring_lo,
+                        n_ring=lay.ring_hi - lay.ring_lo, tail_rows_v=tv.tail_len_after, tail_rows_s=tv.tail_rows_for_s, own_row_s=own_row,
+                        content_off=tv.content_offset, masked=fb.rounded_masked(core.MASKED, eng._kv_bias_gpu.dtype))
+
+
+ROUNDS = [dict(lay=NLAY, B=3, n_sub=None, seed=1), dict(lay=NLAY, B=4, n_sub=2, seed=2, roles=(False, True)), dict(lay=NLAY, B=3, n_sub=None, seed=3, drop_tail=True),
+          dict(lay=NLAY, B=2, n_sub=None, seed=4, fill=True), dict(lay=NLAY, B=3, n_sub=None, seed=5, roles=(True, False)),
+          dict(lay=LAY, B=3, n_sub=None, seed=6), dict(lay=LAY, B=4, n_sub=3, seed=7, roles=(False, True)), dict(lay=LAY, B=2, n_sub=None, seed=8, drop_tail=True)]
+
+
+@pytest.mark.parametrize("spec", ROUNDS, ids=[("narrow" if r["lay"].narrow else "union") + "-%d" % r["seed"] for r in ROUNDS])
+def test_fused_bias_reference_equals_torch_path(spec):
+    lay = spec["lay"]
+    eng, plan, req_idx, sel, ready, tv, own_row = _random_round(lay, spec["B"], K, spec["n_sub"], spec["seed"], spec.get("fill", False), spec.get("drop_tail", False), spec.get("roles", (True, True)))
+    R = plan.req.numel()
+    out_t = torch.empty((max(R, eng.B), lay.W * BS, H)); out_r = torch.empty_like(out_t)
+    rb_t = _torch_path(eng, lay, plan, req_idx, sel, ready, tv, own_row, out_t)
+    prefix = torch.zeros((R, lay.W, H), dtype=torch.int32); extent = torch.zeros((R,), dtype=torch.int32)
+    rb_r = fb.fused_bias_reference(_fused_args(eng, lay, plan, req_idx, sel, ready, tv, own_row), out_r, prefix, extent)
+    assert torch.equal(out_r[:R], rb_t.bias[:R]) and torch.equal(rb_r.cache_seqlens.to(torch.int64), rb_t.cache_seqlens.to(torch.int64))
+    assert torch.equal(rb_r.visible_rows.to(torch.int64), rb_t.visible_rows) and torch.equal(rb_r.cache_batch_idx, rb_t.cache_batch_idx)
+    assert torch.isfinite(out_r[:R]).all()
+
+
+def _triton_available():
+    try:
+        import triton  # noqa
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _triton_available(), reason="triton not importable: the interpreter test needs it (manar28.sif has triton 3.4)")
+@pytest.mark.parametrize("spec", ROUNDS, ids=[("narrow" if r["lay"].narrow else "union") + "-%d" % r["seed"] for r in ROUNDS])
+def test_fused_bias_triton_interpreter_equals_torch_path(spec):
+    if os.environ.get("TRITON_INTERPRET") != "1":
+        pytest.skip("set TRITON_INTERPRET=1 before importing triton to run the kernel on CPU")
+    lay = spec["lay"]
+    eng, plan, req_idx, sel, ready, tv, own_row = _random_round(lay, spec["B"], K, spec["n_sub"], spec["seed"], spec.get("fill", False), spec.get("drop_tail", False), spec.get("roles", (True, True)))
+    R = plan.req.numel()
+    out_t = torch.empty((max(R, eng.B), lay.W * BS, H)); out_k = torch.empty_like(out_t)
+    rb_t = _torch_path(eng, lay, plan, req_idx, sel, ready, tv, own_row, out_t)
+    prefix = torch.zeros((R, lay.W, H), dtype=torch.int32); extent = torch.zeros((R,), dtype=torch.int32)
+    rb_k = fb.fused_bias_triton(_fused_args(eng, lay, plan, req_idx, sel, ready, tv, own_row), out_k, prefix, extent)
+    assert torch.equal(out_k[:R], rb_t.bias[:R]), "the kernel's bias tiles equal the torch build"
+    assert torch.equal(rb_k.cache_seqlens.to(torch.int64), rb_t.cache_seqlens.to(torch.int64)), "the atomic-max extent equals the exact extent"
+    assert torch.equal(rb_k.visible_rows.to(torch.int64), rb_t.visible_rows)
+
+
+def test_fused_bias_masked_value_rounding_and_arg_checks():
+    assert fb.rounded_masked(core.MASKED, torch.bfloat16) == float(torch.tensor(-3.0e4, dtype=torch.bfloat16)) == -29952.0
+    eng, plan, req_idx, sel, ready, tv, own_row = _random_round(NLAY, 2, K, None, 9)
+    a = _fused_args(eng, NLAY, plan, req_idx, sel, ready, tv, own_row)
+    R = plan.req.numel()
+    with pytest.raises(ValueError):
+        fb.check_args(a._replace(ready=a.ready.to(torch.bool)), torch.empty((R, NLAY.W * BS, H)), torch.zeros((R, NLAY.W, H), dtype=torch.int32), torch.zeros((R,), dtype=torch.int32))
+    with pytest.raises(ValueError):
+        fb.check_args(a, torch.empty((1, NLAY.W * BS, H)), torch.zeros((R, NLAY.W, H), dtype=torch.int32), torch.zeros((R,), dtype=torch.int32))
+    src = (NOSI_PKG / "paired" / "fused_bias.py").read_text()
+    top = [n for n in ast.parse(src).body if isinstance(n, (ast.Import, ast.ImportFrom))]
+    assert not any("triton" in ast.dump(n) for n in top), "no Triton import at module level"

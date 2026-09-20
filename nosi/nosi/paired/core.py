@@ -103,27 +103,40 @@ ROLE_V, ROLE_S = 0, 1
 # ---------------------------------------------------------------------------
 class Layout(NamedTuple):
     topk: int
-    R: int            # NOSI_VERIFY_ROUND_SLOTS
+    R: int            # NOSI_VERIFY_ROUND_SLOTS (0 = the NARROW layout)
     bs: int
-    W: int            # topk + R + 2
+    W: int            # topk (narrow) or topk + R + 2 (union)
     tail_slot: int    # topk - 1
-    prov_slot: int    # topk
-    ring_lo: int      # topk + 1 (inclusive)
-    ring_hi: int      # W - 2 (exclusive)
-    mirror_lo: int    # W - 2
-    mirror_hi: int    # W - 1
+    prov_slot: int    # narrow: the tail slot (the provisional row is ROW tail_len of it); union: slot topk, row 0
+    ring_lo: int      # union: topk + 1 (inclusive); narrow: W (empty)
+    ring_hi: int      # union: W - 2 (exclusive); narrow: W (empty)
+    mirror_lo: int    # union: W - 2; narrow: -1 (none)
+    mirror_hi: int    # union: W - 1; narrow: -1
+    narrow: bool
 
 
 def paired_layout(topk: int, round_slots: int, block_size: int = 64) -> Layout:
-    """The engine's allocation under NOSI_VERIFY_ROUND_SLOTS = round_slots
-    (union_store.union_layout with no pool: W = topk + R + 2), with the paired
-    tick's use of the extra slots. Needs R >= 1 (the provisional slot)."""
+    """R = 0: the NARROW layout (E2c) = the SHIPPED allocation, W = topk slots.
+    S's provisional K/V is written to ROW tail_len_after of the tail slot: the
+    row the next V write overwrites, which the shipped decode never reads
+    (cache_seqlens = (topk-1)*bs + tail_len: cache_engine.py S == 1 body) and
+    a fill's write-back copies only after V overwrote it. Both rows' extents
+    stay <= topk*bs, so ONE call over the allocation the decode itself uses
+    keeps the decode's split seams: n_blocks_per_split = ceil(ceil(seqlen_k /
+    kBlockN) / num_splits) with seqlen_k = the ALLOCATED length
+    (flash_fwd_kernel.h:594, flash_api.cpp:338) -- any extra slot (W = 65 ->
+    33 n-blocks -> 9 per split instead of 8) would move the seams.
+    R >= 1: the UNION layout (W = topk + R + 2, union_store.union_layout with
+    no pool): provisional slot topk row 0, ring topk+1 .. W-3, mirrors W-2/W-1."""
     topk, R, bs = int(topk), int(round_slots), int(block_size)
-    if topk < 2 or R < 1 or bs < 1:
-        raise ValueError("paired_layout: topk=%d round_slots=%d block_size=%d (need topk >= 2, R >= 1: the provisional slot is round slot 0)" % (topk, R, bs))
+    if topk < 2 or R < 0 or bs < 1:
+        raise ValueError("paired_layout: topk=%d round_slots=%d block_size=%d (need topk >= 2, R >= 0)" % (topk, R, bs))
+    if R == 0:
+        return Layout(topk=topk, R=0, bs=bs, W=topk, tail_slot=topk - 1, prov_slot=topk - 1, ring_lo=topk, ring_hi=topk,
+                      mirror_lo=-1, mirror_hi=-1, narrow=True)
     W = topk + R + 2
     return Layout(topk=topk, R=R, bs=bs, W=W, tail_slot=topk - 1, prov_slot=topk, ring_lo=topk + 1, ring_hi=W - 2,
-                  mirror_lo=W - 2, mirror_hi=W - 1)
+                  mirror_lo=W - 2, mirror_hi=W - 1, narrow=False)
 
 
 def check_layout_against_engine(lay: Layout, engine) -> None:
@@ -206,7 +219,7 @@ def ready_mask(H: int, B: int, lay: Layout, device=None, ring_ready: Optional[to
     ready = torch.zeros((H, B, lay.W), dtype=torch.bool, device=device)
     ready[..., :lay.tail_slot + 1] = True
     ready[..., lay.prov_slot] = True
-    if ring_ready is not None:
+    if ring_ready is not None and lay.ring_hi > lay.ring_lo:
         n_ring = lay.ring_hi - lay.ring_lo
         if tuple(ring_ready.shape) != (H, B, n_ring) or ring_ready.dtype != torch.bool:
             raise ValueError("ring_ready must be bool (H, B, %d), got %s %s" % (n_ring, ring_ready.dtype, tuple(ring_ready.shape)))
@@ -228,13 +241,15 @@ def v_visible_rows(H: int, B: int, lay: Layout, tail_len_after: int, device=None
 
 
 def s_visible_rows(ids: torch.Tensor, ready: torch.Tensor, sel: torch.Tensor, lay: Layout, tail_rows: int) -> torch.Tensor:
-    """(B, W, H) int64: what an S row attends. ids / ready (H, B, W) from
-    slot_ids / ready_mask; sel (H, B, K) int64 = S's own selection (block ids,
-    -1 padded); tail_rows = rows of the tail slot that hold exact KV of the
-    block named by ids[..., tail_slot] (bs after a fill, else tail_len_after).
-    Rule: slot visible in full iff (id in sel) and ready, for every slot but
-    the tail (tail_rows instead of bs) and the provisional slot (1 row,
-    always, ready or not being irrelevant: S wrote it). Mirrors never."""
+    """(B, W, H) int64: the PREFIX rows an S row attends per slot. ids / ready
+    (H, B, W) from slot_ids / ready_mask; sel (H, B, K) int64 = S's own
+    selection (block ids, -1 padded); tail_rows = rows of the tail slot that
+    hold exact KV of the block named by ids[..., tail_slot] (bs after a fill,
+    else tail_len_after). Rule: slot visible in full iff (id in sel) and
+    ready, for every slot but the tail (tail_rows instead of bs); the
+    mirrors never. S's OWN provisional row is not part of this prefix: it is
+    given to paired_bias as ``own_rows`` (it extends the prefix when it sits
+    right after it, the common case, and is an extra visible row otherwise)."""
     H, B, W = ids.shape
     if W != lay.W or tuple(ready.shape) != (H, B, W) or ready.dtype != torch.bool:
         raise ValueError("ids %s / ready %s must be (H, B, W=%d), ready bool" % (tuple(ids.shape), tuple(ready.shape), lay.W))
@@ -248,10 +263,17 @@ def s_visible_rows(ids: torch.Tensor, ready: torch.Tensor, sel: torch.Tensor, la
     rows = torch.full((H, B, W), lay.bs, dtype=torch.int64, device=ids.device)
     rows[..., lay.tail_slot] = tr
     vis = torch.where(named, rows, torch.zeros_like(rows))
-    vis[..., lay.prov_slot] = 1
-    vis[..., lay.mirror_lo] = 0
-    vis[..., lay.mirror_hi] = 0
+    if not lay.narrow:
+        vis[..., lay.prov_slot] = 0
+        vis[..., lay.mirror_lo] = 0
+        vis[..., lay.mirror_hi] = 0
     return vis.permute(1, 2, 0).contiguous()   # (B, W, H)
+
+
+def own_rows(plan: RowPlan, own_row_s: int) -> torch.Tensor:
+    """(R,) int64: the flat row of S's provisional K/V for the S rows of the
+    plan (provisional_row), -1 for V rows."""
+    return torch.where(plan.role == ROLE_S, torch.full_like(plan.req, int(own_row_s)), torch.full_like(plan.req, -1))
 
 
 def assemble_rows(plan: RowPlan, vis_v: Optional[torch.Tensor], vis_s: Optional[torch.Tensor], req_idx: torch.Tensor):
@@ -279,7 +301,8 @@ def assemble_rows(plan: RowPlan, vis_v: Optional[torch.Tensor], vis_s: Optional[
 # the rows bias (the ONE thing the attention call takes besides q / K / V)
 # ---------------------------------------------------------------------------
 def paired_bias(cis_rows: torch.Tensor, visible_rows: torch.Tensor, cache_batch_idx: torch.Tensor,
-                U: int, masked_value: float = MASKED, out: Optional[torch.Tensor] = None, *, check_values: bool) -> _ra.RowsBias:
+                U: int, masked_value: float = MASKED, out: Optional[torch.Tensor] = None, *, check_values: bool,
+                own_rows: Optional[torch.Tensor] = None) -> _ra.RowsBias:
     """cis_rows (B, W*bs, H): the engine's _kv_bias_gpu (store dtype);
     visible_rows (R, W, H) int64; cache_batch_idx (R,) int32. Returns a
     rows_attention.RowsBias: bias[r, slot*bs + i, h] = cis of request
@@ -287,7 +310,12 @@ def paired_bias(cis_rows: torch.Tensor, visible_rows: torch.Tensor, cache_batch_
     cache_seqlens = the exact extent. ``out`` (>= R rows, contiguous, the
     allocation's row shape) receives the bias in place (no allocation on the
     steady path); its storage must hold >= B rows for the kernel's host check
-    (rows_attention.py: the narrowed view). ``check_values`` reads the index /
+    (rows_attention.py: the narrowed view). ``own_rows`` (R,) int64: a flat row
+    that is visible for the row whatever the prefix says (S's provisional
+    K/V; -1 = none): when it sits right after the slot's prefix the prefix is
+    extended by one (visible_rows reports it); when the prefix is shorter (the
+    tail block not selected) it is an EXTRA visible row that visible_rows does
+    not report (the bias and the extent do). ``check_values`` reads the index /
     row tensors on the host (4 device syncs): the CPU tests pass True; the GPU
     body passes False because both come from its own bounded rules
     (v_visible_rows / s_visible_rows / row_plan) -- job 2175550 showed the
@@ -309,8 +337,26 @@ def paired_bias(cis_rows: torch.Tensor, visible_rows: torch.Tensor, cache_batch_
         if bool((visible_rows < 0).any()) or bool((visible_rows > bs).any()):
             raise ValueError("visible_rows must lie in [0, bs=%d]" % bs)
     dev = cis_rows.device
+    extra_extent = None
+    if own_rows is not None:
+        if own_rows.dtype != torch.int64 or tuple(own_rows.shape) != (R,):
+            raise ValueError("own_rows must be int64 (R=%d,), got %s %s" % (R, own_rows.dtype, tuple(own_rows.shape)))
+        visible_rows = visible_rows.clone()
+        has = own_rows >= 0
+        own_slot = torch.where(has, own_rows // bs, torch.zeros_like(own_rows))
+        own_i = torch.where(has, own_rows % bs, torch.zeros_like(own_rows))
+        cur = visible_rows.gather(1, own_slot.view(R, 1, 1).expand(R, 1, H)).squeeze(1)          # (R, H)
+        fold = has.view(R, 1) & (cur == own_i.view(R, 1))
+        extra = has.view(R, 1) & (cur < own_i.view(R, 1))
+        visible_rows.scatter_add_(1, own_slot.view(R, 1, 1).expand(R, 1, H), fold.to(torch.int64).view(R, 1, H))
+        extra_extent = torch.where(extra.any(1), own_rows + 1, torch.zeros_like(own_rows))
     cis = cis_rows.index_select(0, cache_batch_idx.to(torch.int64)).view(R, W, bs, H)
-    vis = torch.arange(bs, dtype=torch.int64, device=dev).view(1, 1, bs, 1) < visible_rows.unsqueeze(2)   # (R, W, bs, H)
+    i_idx = torch.arange(bs, dtype=torch.int64, device=dev).view(1, 1, bs, 1)
+    vis = i_idx < visible_rows.unsqueeze(2)                                                             # (R, W, bs, H)
+    if own_rows is not None:
+        # the EXTRA own rows (prefix shorter than the own row): a broadcast mask, no host sync, no per-row loop
+        s_idx = torch.arange(W, dtype=torch.int64, device=dev).view(1, W, 1, 1)
+        vis = vis | (extra.view(R, 1, 1, H) & (s_idx == own_slot.view(R, 1, 1, 1)) & (i_idx == own_i.view(R, 1, 1, 1)))
     neg = torch.tensor(float(masked_value), dtype=cis_rows.dtype, device=dev)
     if out is None:
         bias = torch.where(vis, cis, neg).view(R, rows, H)
@@ -321,6 +367,8 @@ def paired_bias(cis_rows: torch.Tensor, visible_rows: torch.Tensor, cache_batch_
         bias = out
     slot = torch.arange(W, dtype=torch.int64, device=dev).view(1, W, 1)
     extent = torch.where(visible_rows > 0, slot * bs + visible_rows, torch.zeros_like(visible_rows)).amax(dim=(1, 2))
+    if extra_extent is not None:
+        extent = torch.maximum(extent, extra_extent)
     return _ra.RowsBias(bias=bias, selected=visible_rows > 0, visible_rows=visible_rows,
                         cache_batch_idx=cache_batch_idx.contiguous(), cache_seqlens=extent.to(torch.int32).contiguous(),
                         U=int(U), block_size=bs)
@@ -528,18 +576,27 @@ def v_tail_write(engine, key_states: torch.Tensor, value_states: torch.Tensor, k
     return int(row), bool(tail_full)
 
 
-def provisional_row(lay: Layout) -> int:
+def provisional_row(lay: Layout, tail_len_after: int) -> int:
+    """The flat row of S's provisional K/V: narrow = row tail_len_after of
+    the tail slot (the next V write's row); union = row 0 of slot topk."""
+    if lay.narrow:
+        tl = int(tail_len_after)
+        if not (0 <= tl < lay.bs):
+            raise ValueError("tail_len_after=%d outside [0, bs=%d)" % (tl, lay.bs))
+        return lay.tail_slot * lay.bs + tl
     return lay.prov_slot * lay.bs
 
 
 def s_provisional_write(engine, key_states: torch.Tensor, value_states: torch.Tensor, bias_rows: torch.Tensor,
-                        lay: Layout, req_idx: Optional[torch.Tensor] = None) -> int:
-    """S's K/V/bias at tau + 1 -> row 0 of the provisional slot of the given
-    requests (all when req_idx is None). key/value (n, H, D) or (n, 1, H, D);
-    bias_rows (n, H) or (n, 1, H), already through the engine's _bias_rows
-    (KV_BIAS_SCALE). Touches nothing else: not the window, not the tail, not
-    the host, not the counters (G5). Returns the flat row written."""
-    r = provisional_row(lay)
+                        lay: Layout, req_idx: Optional[torch.Tensor], tail_len_after: int) -> int:
+    """S's K/V/bias at tau + 1 -> the provisional row (provisional_row) of the
+    given requests (all when req_idx is None). key/value (n, H, D) or
+    (n, 1, H, D); bias_rows (n, H) or (n, 1, H), already through the engine's
+    _bias_rows (KV_BIAS_SCALE). Touches nothing the exact path reads: in the
+    narrow layout the row is above the decode's cache_seqlens and is the next
+    V write's own row; never the window, the host or the counters (G5).
+    Returns the flat row written."""
+    r = provisional_row(lay, tail_len_after)
     k = key_states.reshape(key_states.shape[0], -1, engine.head_num, engine.head_dim)
     v = value_states.reshape(value_states.shape[0], -1, engine.head_num, engine.head_dim)
     b = bias_rows.reshape(bias_rows.shape[0], -1, engine.head_num)
@@ -561,12 +618,13 @@ def s_provisional_write(engine, key_states: torch.Tensor, value_states: torch.Te
     return r
 
 
-def poison_provisional(engine, lay: Layout, req_idx: Optional[torch.Tensor] = None) -> int:
+def poison_provisional(engine, lay: Layout, req_idx: Optional[torch.Tensor], tail_len_after: int) -> int:
     """NaN-poison the provisional row after a tick (G1 / G7 control under
     NOSI_PAIRED_POISON=1): a read of the row by any later attention surfaces
-    as a non-finite output. Every S row writes the row before attending, and
-    no V row's extent reaches it (V's extent ends at the tail slot)."""
-    r = provisional_row(lay)
+    as a non-finite output. Every S row writes the row before attending; no
+    V row's extent reaches it (narrow: V's extent ends one row below it;
+    union: at the tail slot), and the next V write overwrites it."""
+    r = provisional_row(lay, tail_len_after)
     nan = float("nan")
     if req_idx is None:
         engine._k_gpu[:, r:r + 1].fill_(nan)

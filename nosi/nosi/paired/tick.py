@@ -48,6 +48,7 @@ import torch
 import torch.nn.functional as F
 
 from . import core
+from . import fused_bias as _fb
 from .. import spec_loop as _sl
 
 
@@ -58,6 +59,8 @@ class TickConfig(NamedTuple):
     refuse_compress: bool  # refuse a 16-token compress event inside a call (the captured pooling graph is fixed-shape)
     gemm_pad_rows: int     # twin2b diagnostic (DESIGN.md blocker 5): zero rows appended to EVERY GEMM's M so cuBLAS sees the tick's M; 0 = off
     s_off: bool            # NOSI_PAIRED_S_OFF=1 debug: S rows stay in the GEMMs / attention call but score nothing, write nothing, attend V's mask
+    bias_impl: str         # NOSI_PAIRED_BIAS: 'fused' (one Triton kernel per layer, fused_bias.py) or 'torch' (the core.py path)
+    gemm: str              # NOSI_PAIRED_GEMM: 'fused' (one GEMM at M = n*U rows) or 'split' (one M = n call per row kind: V's call is the decode's)
 
 
 def config_from_env(gemm_pad_rows: int = 0) -> TickConfig:
@@ -74,9 +77,30 @@ def config_from_env(gemm_pad_rows: int = 0) -> TickConfig:
                          "(0 = the library heuristic, which depends on the number of rows and breaks the twin identity)" % splits)
     if int(gemm_pad_rows) < 0:
         raise SystemExit("gemm_pad_rows=%d must be >= 0" % gemm_pad_rows)
+    bias_impl = os.environ.get("NOSI_PAIRED_BIAS", "fused")
+    if bias_impl not in ("fused", "torch"):
+        raise SystemExit("NOSI_PAIRED_BIAS=%r: 'fused' (the Triton kernel) or 'torch' (the core path)" % bias_impl)
+    gemm = os.environ.get("NOSI_PAIRED_GEMM", "fused")
+    if gemm not in ("fused", "split"):
+        raise SystemExit("NOSI_PAIRED_GEMM=%r: 'fused' (M = n*U) or 'split' (one M = n call per row kind)" % gemm)
+    if gemm == "split" and int(gemm_pad_rows) > 0:
+        raise SystemExit("NOSI_PAIRED_GEMM=split cannot combine with the twin2b padding")
     return TickConfig(num_splits=splits, poison=os.environ.get("NOSI_PAIRED_POISON", "0") == "1",
                       masked=core.MASKED, refuse_compress=True, gemm_pad_rows=int(gemm_pad_rows),
-                      s_off=os.environ.get("NOSI_PAIRED_S_OFF", "0") == "1")
+                      s_off=os.environ.get("NOSI_PAIRED_S_OFF", "0") == "1", bias_impl=bias_impl, gemm=gemm)
+
+
+def linear_rows(x: torch.Tensor, w: torch.Tensor, cfg: TickConfig) -> torch.Tensor:
+    """The GEMM over x (n, U, K): cfg.gemm == 'fused' -> ONE call at M = n*U
+    (linear_padded, the twin2b padding applies); 'split' -> one M = n call per
+    row kind u (U calls, U <= 2: a loop over row KINDS, never over rows), each
+    on a contiguous (n, 1, K) input -- V's call is then byte-identical to the
+    shipped decode's F.linear(hidden (B, 1, K), w) and cuBLAS picks the same
+    kernel (E2: twin vs twin2b showed the M = B vs 2B kernel term is real)."""
+    n, U, K = x.shape
+    if cfg.gemm == "split" and U > 1:
+        return torch.cat([F.linear(x[:, u:u + 1].contiguous(), w) for u in range(U)], dim=1)
+    return linear_padded(x, w, cfg.gemm_pad_rows)
 
 
 def rope_positions(position_ids: torch.Tensor) -> torch.Tensor:
@@ -141,6 +165,12 @@ class Scratch:
         self.bias = torch.empty((2 * self.B, rows, H), dtype=dtype, device=dev)
         self.bias_twin = torch.empty((self.B, rows, H), dtype=dtype, device=dev)
         self.ready = core.ready_mask(H, self.B, lay, device=dev)                      # E2: window + tail + provisional; ring not ready
+        self.ready_u8 = self.ready.to(torch.uint8).contiguous()                        # the fused kernel's readiness input (E4 updates both)
+        self.prefix = torch.zeros((2 * self.B, lay.W, H), dtype=torch.int32, device=dev)
+        self.extent = torch.zeros((2 * self.B,), dtype=torch.int32, device=dev)
+        self.ring_dummy = torch.full((H, self.B, max(lay.ring_hi - lay.ring_lo, 1)), -1, dtype=torch.int64, device=dev)  # E2: no ring occupants (E4 fills it)
+        self.sel_dummy = torch.full((H, 1, int(model.topk_blocks)), -1, dtype=torch.int64, device=dev)   # a V-only call has no S selection (K = topk_blocks)
+        self.masked_rounded = _fb.rounded_masked(core.MASKED, dtype)
         self.journals = [_sl.LayerJournal() for _ in range(model.num_layers)]
         self.slot_complete = [False] * model.num_layers                            # slot topk-1 holds a complete block (after a fill)
         self.prev_sel_s: List[Optional[torch.Tensor]] = [None] * model.num_layers  # (H, B, K) int64: S's selection for the NEXT V position
@@ -167,7 +197,7 @@ def setup(model, cache, B: int) -> Scratch:
     eng0 = cache.layers[0].cache_engine
     if int(eng0._k_gpu.shape[0]) != int(B):
         raise RuntimeError("engine batch %d != B=%d" % (eng0._k_gpu.shape[0], B))
-    lay = core.paired_layout(eng0.topk, eng0.verify_round_slots, eng0.block_size)
+    lay = core.paired_layout(eng0.topk, eng0.verify_round_slots, eng0.block_size)   # R = 0 -> narrow, R >= 1 -> union
     sc = Scratch(model, cache, lay, B)
     for l, clayer in enumerate(cache.layers):
         eng = clayer.cache_engine
@@ -331,7 +361,7 @@ def layer_body(G, model, cache, l: int, hidden: torch.Tensor, position_ids: torc
 
     # [1] prenorm, qkv GEMM over all rows, rope at per-row positions (verify_forward :697-708)
     hs = NL.layer_norm(hidden, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
-    qkv = linear_padded(hs, layer.wqkv, cfg.gemm_pad_rows).contiguous()
+    qkv = linear_rows(hs, layer.wqkv, cfg).contiguous()
     q, k, v, cis = NL.nosa_linear(qkv, layer.delta.weight, layer.A, layer.q_size, layer.kv_size, Hk)
     q = q.view(n * U, -1)
     k = k.view(n * U, -1)
@@ -370,22 +400,41 @@ def layer_body(G, model, cache, l: int, hidden: torch.Tensor, position_ids: torc
     sc.slot_complete[l] = tv.slot_complete
     if int(eng._tail_block_len_on_gpu) != tv.tail_len_after:
         raise AssertionError("layer %d: engine tail_len %d != the S == 1 rule's %d" % (l, eng._tail_block_len_on_gpu, tv.tail_len_after))
+    own_row = core.provisional_row(lay, tv.tail_len_after) if (plan.has_s and not s_off) else -1
     if plan.has_s and not s_off:
-        core.s_provisional_write(eng, k[:, u], v[:, u], G.bias_rows(cis[:, u].unsqueeze(1)), lay, sub)
+        core.s_provisional_write(eng, k[:, u], v[:, u], G.bias_rows(cis[:, u].unsqueeze(1)), lay, sub, tv.tail_len_after)
 
     # [5] the per-row bias and ONE rows-attention call
     vis_v = vis_s = None
-    if plan.has_v:
-        vis_v = core.v_visible_rows(Hk, n, lay, tv.tail_len_after, device=sc.device)
-    if plan.has_s and not s_off:
-        content_id = eng._block_map[..., lay.tail_slot] - tv.content_offset
-        ids = core.slot_ids(eng._block_map, content_id, lay)
-        ids_n, ready_n = (ids, sc.ready) if whole_batch else (ids[:, req_idx], sc.ready[:, req_idx])
-        vis_s = core.s_visible_rows(ids_n, ready_n, sel_s, lay, tv.tail_rows_for_s)
-    elif s_off:
-        vis_s = vis_v                                         # S rows attend exactly what V attends: no S contribution anywhere
-    vis, cbi = core.assemble_rows(plan, vis_v, vis_s, req_idx)
-    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, plan.U, cfg.masked, out=sc.bias, check_values=False)
+    if cfg.bias_impl == "fused" and not s_off:
+        # ONE kernel per layer (fused_bias.py); prefix rows for the ledger come out of the same launch
+        rows_plan = plan
+        req_i32 = plan.req.to(torch.int32)
+        srow_i32 = torch.arange(n, dtype=torch.int32, device=sc.device).repeat_interleave(plan.U)
+        fa = _fb.FusedArgs(cis=eng._kv_bias_gpu, sel=(sel_s.contiguous() if sel_s is not None else sc.sel_dummy), bmap=eng._block_map,
+                           ring_ids=sc.ring_dummy, ready=sc.ready_u8, req=req_i32, srow=srow_i32, role=plan.role,
+                           W=lay.W, bs=lay.bs, topk=lay.topk, tail_slot=lay.tail_slot, ring_lo=lay.ring_lo, n_ring=lay.ring_hi - lay.ring_lo,
+                           tail_rows_v=tv.tail_len_after, tail_rows_s=tv.tail_rows_for_s, own_row_s=own_row,
+                           content_off=tv.content_offset, masked=sc.masked_rounded)
+        rb = _fb.fused_bias_triton(fa, sc.bias, sc.prefix, sc.extent)
+        pre = rb.visible_rows.view(n, plan.U, lay.W, Hk)
+        if plan.has_v:
+            vis_v = pre[:, 0]
+        if plan.has_s:
+            vis_s = pre[:, plan.U - 1]
+    else:
+        if plan.has_v:
+            vis_v = core.v_visible_rows(Hk, n, lay, tv.tail_len_after, device=sc.device)
+        if plan.has_s and not s_off:
+            content_id = eng._block_map[..., lay.tail_slot] - tv.content_offset
+            ids = core.slot_ids(eng._block_map, content_id, lay)
+            ids_n, ready_n = (ids, sc.ready) if whole_batch else (ids[:, req_idx], sc.ready[:, req_idx])
+            vis_s = core.s_visible_rows(ids_n, ready_n, sel_s, lay, tv.tail_rows_for_s)
+        elif s_off:
+            vis_s = vis_v                                     # S rows attend exactly what V attends: no S contribution anywhere
+        vis, cbi = core.assemble_rows(plan, vis_v, vis_s, req_idx)
+        rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, plan.U, cfg.masked, out=sc.bias, check_values=False,
+                              own_rows=(core.own_rows(plan, own_row) if own_row >= 0 else None))
     if trace is not None:
         trace.rec("fetch_end")
     q_rows = q.reshape(n * U, Hq, D).contiguous()
@@ -395,14 +444,14 @@ def layer_body(G, model, cache, l: int, hidden: torch.Tensor, position_ids: torc
     attn = attn.view(n, U, -1)
 
     # [6] wo, FFN over all rows (decode_forward :652-667)
-    hidden = residual + linear_padded(attn, layer.wo, cfg.gemm_pad_rows)
+    hidden = residual + linear_rows(attn, layer.wo, cfg)
     residual = hidden
     hs = NL.layer_norm(hidden, layer.post_attention_layernorm_variance_epsilon, layer.post_attention_layernorm_weight)
-    gu = linear_padded(hs, layer.gate_up_proj, cfg.gemm_pad_rows)
+    gu = linear_rows(hs, layer.gate_up_proj, cfg)
     dd = gu.shape[-1] // 2
     act = torch.empty(gu.shape[:-1] + (dd,), dtype=gu.dtype, device=gu.device)
     NL.silu_and_mul(gu, act)
-    hidden = residual + linear_padded(act, layer.down_proj, cfg.gemm_pad_rows)
+    hidden = residual + linear_rows(act, layer.down_proj, cfg)
 
     # accounting (core): misses, S's selections and hits, the divergence vs S's prediction for this V position
     # (the twin arm has no S rows and no prediction: its accounts carry no divergence; the paired
@@ -453,14 +502,15 @@ def _forward(G, model, cache, sc: Scratch, cfg: TickConfig, tokens: torch.Tensor
             recs.append(out.insitu)
     pre = hidden
     hidden = NL.layer_norm(hidden, model.norm_variance_epsilon, model.norm_weight)
-    logits = linear_padded(hidden, model.lm_head, cfg.gemm_pad_rows).float()          # (n, U, V)
+    logits = linear_rows(hidden, model.lm_head, cfg).float()                          # (n, U, V)
     if trace is not None:
         trace.end_call()
     if insitu is not None and plan.has_v and plan.has_s:
         recs.append(insitu.compare_head(G, model, pre, hidden, logits))
     if plan.has_s and cfg.poison and not cfg.s_off:
         for clayer in cache.layers:
-            core.poison_provisional(clayer.cache_engine, sc.lay, None if whole_batch else req_idx)
+            eng = clayer.cache_engine
+            core.poison_provisional(eng, sc.lay, None if whole_batch else req_idx, int(eng._tail_block_len_on_gpu))
     lv = logits[:, 0] if plan.has_v else None
     ls = logits[:, U - 1] if plan.has_s else None
     return TickResult(logits_v=lv if lv is not None else ls, logits_s=ls if plan.has_v else None, accounts=accts, insitu=(recs if insitu is not None else None))
