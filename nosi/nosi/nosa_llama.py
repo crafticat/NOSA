@@ -762,6 +762,185 @@ class LlamaLayer:
         hidden_states = residual + hidden_states
         return hidden_states
 
+    # -----------------------------------------------------------------------
+    # retroinfer-eval fork, 2026-09-20: the SPECULATIVE DECODE LOOP's two
+    # forwards (spec_loop.py; driver benchmarks/Efficiency/spec_loop_pilot.py).
+    # Schedule = 'round:K-draft-then-verify': K draft steps, then one verify
+    # round, then accept / rollback; no verify compute overlaps any draft
+    # compute. What overlaps: the draft's misses are gathered on a SIDE
+    # stream (cache_engine.spec_draft_update) while the draft's own kernels
+    # run on the main stream; the draft's attention never waits on a
+    # prefetch event (it reads only slots the host observed complete).
+    # -----------------------------------------------------------------------
+    @torch.inference_mode()
+    def draft_forward(self, hidden_states, position_ids, cos_sin_cache, cu_seqlens, max_seqlen, cache_engine, pooling_buf, topk_val_buf_q, topk_idx_buf_q, topk_val_buf, topk_idx_buf, mask_buf, ctx):
+        """decode_forward with the engine update replaced by
+        cache_engine.spec_draft_update_kv (no diff, no synchronous fetch, the
+        prefetch on the side stream) and the attention handed the WHOLE
+        allocation with the draft's masked bias and cache_seqlens = W * bs.
+        The scoring (stage 1, the captured pooling / top-k graph, the one-token
+        table updates) is the decode's text: the selection is never restricted
+        (avail_policy.py); only what attention may USE is."""
+        _vt = _vtr.TRACE
+        if _vt is not None: _vt.begin_layer(self.layer_idx)
+        residual = hidden_states
+        bsz, q_len, _ = hidden_states.size()
+        max_pooling_buf = pooling_buf[:self.num_key_value_heads]
+        max_pooling_buf_cis = pooling_buf[self.num_key_value_heads:]
+
+        hidden_states = layer_norm(hidden_states, self.input_layernorm_variance_epsilon, self.input_layernorm_weight)
+        qkv = F.linear(hidden_states, self.wqkv)
+        query_states, key_states, value_states, cis = nosa_linear(qkv, self.delta.weight, self.A, self.q_size, self.kv_size, self.num_key_value_heads)
+
+        query_states = query_states.view(bsz * q_len, -1)
+        key_states = key_states.view(bsz * q_len, -1)
+        apply_rope_with_cos_sin_cache_inplace(position_ids.flatten(), query_states, key_states, self.head_dim, cos_sin_cache, True)
+
+        query_states = query_states.reshape(bsz * q_len, self.num_heads, self.head_dim)
+        key_states = key_states.reshape(bsz * q_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.reshape(bsz * q_len, self.num_key_value_heads, self.head_dim)
+
+        if _vt is not None: _vt.rec("score_begin")
+        no_compress_k = cache_engine.update_no_compress_k_decode(key_states.unsqueeze(1), self.layer_idx, self.pooling_block_size, self.pooling_stride)
+        if no_compress_k is not None:
+            new_compressed_k = no_compress_k.mean(dim=1, keepdim=True)
+        else:
+            new_compressed_k = None
+        compressed_k, cu_seqlens_comp, max_seqlen_comp = cache_engine.update_compress_k_decode(new_compressed_k, self.layer_idx)
+        compressed_k = compressed_k.contiguous().flatten(0, 1)
+
+        ucis = cache_engine.update_uncompressed_cis(cis, self.layer_idx, 0, bsz)
+        compressed_cis = cache_engine.update_cis(cis.permute(2, 0, 1), self.layer_idx, 0, bsz)
+
+        score = infllmv2_attn_stage1_fast(
+            query_states,
+            compressed_k,
+            compressed_k,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens_comp,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen_comp,
+            causal=False,
+        )
+        self.score_buf.copy_(score)
+        self.compressed_cis_buf.copy_(compressed_cis)
+        self.after_pooling_graph.replay()
+        topk_idx = topk_idx_buf
+
+        # the draft's engine update: tail write, availability plan, side-stream prefetch, masked bias
+        if _vt is not None: _vt.rec("fetch_begin")
+        key_states, value_states, kv_bias, _cache_lens = cache_engine.spec_draft_update_kv(key_states, value_states, ucis, self.layer_idx, topk_idx, ctx)
+        if _vt is not None: _vt.rec("fetch_end")
+
+        attn_output = flash_attn_nosa_with_kvcache(
+            query_states.unsqueeze(1),
+            key_states,
+            value_states,
+            kv_bias,
+            cache_seqlens=_cache_lens,
+            num_splits=_ATTN_SPLITS,
+        )
+        if _vt is not None: _vt.rec("attn_end")
+
+        attn_output = attn_output.view(bsz, q_len, -1)
+        hidden_states = F.linear(attn_output, self.wo)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = layer_norm(hidden_states, self.post_attention_layernorm_variance_epsilon, self.post_attention_layernorm_weight)
+        hidden_states = F.linear(hidden_states, self.gate_up_proj)
+        dd = hidden_states.shape[-1] // 2
+        output_shape = (hidden_states.shape[:-1] + (dd, ))
+        out = torch.empty(output_shape, dtype=hidden_states.dtype, device=hidden_states.device)
+        silu_and_mul(hidden_states, out)
+        hidden_states = F.linear(out, self.down_proj)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+    @torch.inference_mode()
+    def spec_verify_forward(self, hidden_states, position_ids, cos_sin_cache, cu_seqlens, max_seqlen, cache_engine, pooling_buf, topk_val_buf_q, topk_idx_buf_q, topk_val_buf, topk_idx_buf, mask_buf, ctx):
+        """verify_forward over the loop's PERSISTENT store: the same
+        per-position scoring, cache_engine.spec_round_update_kv in place of
+        verify_round_update_kv (resident blocks need no fetch; the late misses
+        are fetched here, synchronously, on the main stream), the finer
+        brackets of verify_trace.py, and the per-position key / value / cis
+        tensors kept on the layer for the rollback's journal replay
+        (spec_loop.LayerJournal.replay)."""
+        _vt = _vtr.TRACE
+        if _vt is not None: _vt.begin_layer(self.layer_idx)
+        residual = hidden_states
+        bsz, U, _ = hidden_states.size()
+        max_pooling_buf = pooling_buf[:self.num_key_value_heads]
+        max_pooling_buf_cis = pooling_buf[self.num_key_value_heads:]
+
+        hidden_states = layer_norm(hidden_states, self.input_layernorm_variance_epsilon, self.input_layernorm_weight)
+        qkv = F.linear(hidden_states, self.wqkv)
+        query_states, key_states, value_states, cis = nosa_linear(qkv, self.delta.weight, self.A, self.q_size, self.kv_size, self.num_key_value_heads)
+
+        query_states = query_states.view(bsz * U, -1)
+        key_states = key_states.view(bsz * U, -1)
+        apply_rope_with_cos_sin_cache_inplace(position_ids.flatten(), query_states, key_states, self.head_dim, cos_sin_cache, True)
+
+        query_states = query_states.reshape(bsz, U, self.num_heads, self.head_dim)
+        key_states = key_states.reshape(bsz, U, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.reshape(bsz, U, self.num_key_value_heads, self.head_dim)
+
+        if _vt is not None: _vt.rec("score_begin")
+        sels = []
+        ucis = None
+        for u in range(U):
+            no_compress_k = cache_engine.update_no_compress_k_decode(key_states[:, u:u+1], self.layer_idx, self.pooling_block_size, self.pooling_stride)
+            if no_compress_k is not None:
+                new_compressed_k = no_compress_k.mean(dim=1, keepdim=True)
+            else:
+                new_compressed_k = None
+            compressed_k, cu_seqlens_comp, max_seqlen_comp = cache_engine.update_compress_k_decode(new_compressed_k, self.layer_idx)
+            compressed_k = compressed_k.contiguous().flatten(0, 1)
+
+            ucis = cache_engine.update_uncompressed_cis(cis[:, u:u+1], self.layer_idx, 0, bsz)
+            compressed_cis = cache_engine.update_cis(cis[:, u:u+1].permute(2, 0, 1), self.layer_idx, 0, bsz)
+
+            score = infllmv2_attn_stage1_fast(
+                query_states[:, u].contiguous(),
+                compressed_k,
+                compressed_k,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens_comp,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen_comp,
+                causal=False,
+            )
+            self.score_buf.copy_(score)
+            self.compressed_cis_buf.copy_(compressed_cis)
+            self.after_pooling_graph.replay()
+            sels.append(topk_idx_buf.clone())
+        sel = torch.stack(sels, dim=0)              # (U, H, B, K)
+        # kept for the rollback's journal replay (the same tensors, the same order) and the rollback probe's write_tail replay
+        self._spec_round_inputs = (key_states, value_states, cis)
+
+        if _vt is not None: _vt.rec("fetch_begin")
+        k_all, v_all, kv_bias_all, rnd = cache_engine.spec_round_update_kv(key_states, value_states, ucis, self.layer_idx, sel, ctx)
+        if _vt is not None: _vt.rec("fetch_end")
+        self._verify_last_round = rnd
+
+        attn_output = verify_attention(query_states.reshape(bsz * U, self.num_heads, self.head_dim), k_all, v_all, kv_bias_all, rnd,
+                                       mark=(_vt.rec if _vt is not None else None))
+        if _vt is not None: _vt.rec("attn_end")
+        attn_output = attn_output.view(bsz, U, -1)
+        hidden_states = F.linear(attn_output, self.wo)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = layer_norm(hidden_states, self.post_attention_layernorm_variance_epsilon, self.post_attention_layernorm_weight)
+        hidden_states = F.linear(hidden_states, self.gate_up_proj)
+        dd = hidden_states.shape[-1] // 2
+        output_shape = (hidden_states.shape[:-1] + (dd, ))
+        out = torch.empty(output_shape, dtype=hidden_states.dtype, device=hidden_states.device)
+        silu_and_mul(hidden_states, out)
+        hidden_states = F.linear(out, self.down_proj)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
 
 class Llama:
     def __init__(self, 
@@ -969,6 +1148,65 @@ class Llama:
         logits = F.linear(hidden_states, self.lm_head).float()
         if _vt is not None: _vt.end_call()
         return logits
+
+    # -- retroinfer-eval fork, 2026-09-20: the speculative decode loop (spec_loop.py) --
+    @torch.inference_mode()
+    def draft_inference(self, input_ids: torch.LongTensor, cu_seqlens: torch.Tensor, position_ids: torch.LongTensor, cache_engine, ctx):
+        """One DRAFT step (B, 1) -> fp32 logits (B, 1, V): decode_inference's
+        steady-state loop with LlamaLayer.draft_forward. Needs the warm-up
+        decode step's buffers and graph."""
+        assert self.has_buffers, "draft_inference needs the warm-up decode step's buffers and graph"
+        bsz, seq_len = input_ids.shape
+        assert seq_len == 1, "one token per request per draft step"
+        _vt = _vtr.TRACE
+        if _vt is not None: _vt.begin_call()
+        hidden_states = F.embedding(input_ids, self.embed_tokens)
+        max_seqlen = 1
+        for idx in range(self.num_layers):
+            hidden_states = self.layers[idx].draft_forward(hidden_states, position_ids, self.cos_sin_cache, cu_seqlens, max_seqlen, cache_engine, self.pooling_buf_all, self.topk_val_buf_q, self.topk_idx_buf_q, self.topk_val_buf, self.topk_idx_buf, self.mask_buf, ctx)
+        hidden_states = layer_norm(hidden_states, w=self.norm_weight, eps=self.norm_variance_epsilon)
+        logits = F.linear(hidden_states, self.lm_head).float()
+        if _vt is not None: _vt.end_call()
+        return logits
+
+    @torch.inference_mode()
+    def spec_verify_inference(self, input_ids: torch.LongTensor, cu_seqlens: torch.Tensor, position_ids: torch.LongTensor, cache_engine, ctx):
+        """One VERIFY round over the persistent store (B, U) -> fp32 logits
+        (B, U, V): verify_inference with LlamaLayer.spec_verify_forward."""
+        assert self.has_buffers, "spec_verify_inference needs the warm-up decode step's buffers and graph"
+        bsz, U = input_ids.shape
+        assert tuple(position_ids.shape) == (bsz, U), (tuple(position_ids.shape), (bsz, U))
+        _vt = _vtr.TRACE
+        if _vt is not None: _vt.begin_call()
+        hidden_states = F.embedding(input_ids, self.embed_tokens)
+        max_seqlen = 1
+        for idx in range(self.num_layers):
+            hidden_states = self.layers[idx].spec_verify_forward(hidden_states, position_ids, self.cos_sin_cache, cu_seqlens, max_seqlen, cache_engine, self.pooling_buf_all, self.topk_val_buf_q, self.topk_idx_buf_q, self.topk_val_buf, self.topk_idx_buf, self.mask_buf, ctx)
+        hidden_states = layer_norm(hidden_states, w=self.norm_weight, eps=self.norm_variance_epsilon)
+        logits = F.linear(hidden_states, self.lm_head).float()
+        if _vt is not None: _vt.end_call()
+        return logits
+
+    @torch.inference_mode()
+    def spec_rollback(self, cache_engine, ctx, keep: int):
+        """After a verify round of U positions: keep the first ``keep`` on
+        every layer (cache_engine.spec_rollback_tail: the tail in place;
+        spec_loop.LayerJournal: the tables restored to round start and the
+        kept positions replayed from the verify's own key / cis tensors) and
+        fix the cache's token counter. Returns the layer-0 TruncateResult."""
+        first = None
+        mirror_lo = ctx.store.lay.mirror_lo
+        for l, lay in enumerate(cache_engine.layers):
+            tr = lay.cache_engine.spec_rollback_tail(keep, mirror_lo)
+            if first is None:
+                first = tr
+            key_states, value_states, cis = self.layers[l]._spec_round_inputs
+            self.layers[l]._spec_probe_inputs = self.layers[l]._spec_round_inputs   # the probe's replay (spec_loop_pilot.py); dropped next round
+            self.layers[l]._spec_round_inputs = None
+            ctx.journals[l].restore(lay)
+            ctx.journals[l].replay(lay, key_states, cis, keep, self.layers[l].pooling_block_size, self.layers[l].pooling_stride)
+        cache_engine._seen_tokens = ctx.seen0 + keep
+        return first
 
     @torch.inference_mode()
     def batch_prefill(self, input_ids: torch.Tensor, cache_engine=None):
