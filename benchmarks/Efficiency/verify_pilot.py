@@ -653,6 +653,10 @@ if __name__ == "__main__":
         sys.exit(cost_table())
     check_budget()
     path = os.environ["NOSI_MODEL_PATH"]
+    if os.environ.get("NOSI_ROWS_BENCH", "0") == "1":
+        # retroinfer-eval fork: rows-attention microbench beside Path 1 (verify/rows_bench_hook.py); the forward keeps Path 1's output
+        from nosi.verify import rows_bench_hook
+        rows_bench_hook.install(OUT, TAG, splits_list=tuple(int(x) for x in os.environ.get("NOSI_ROWS_SPLITS", "4 8 0").split()))
     ids, rows, distinct = load_docs(path)
     print("[docs] %s (%d distinct)  L=%d N=%d" % (rows, distinct, L, N), flush=True)
     if MODE == "decode":
