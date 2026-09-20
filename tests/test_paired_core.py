@@ -1069,3 +1069,90 @@ def test_fused_bias_masked_value_rounding_and_arg_checks():
     src = (NOSI_PKG / "paired" / "fused_bias.py").read_text()
     top = [n for n in ast.parse(src).body if isinstance(n, (ast.Import, ast.ImportFrom))]
     assert not any("triton" in ast.dump(n) for n in top), "no Triton import at module level"
+
+
+# ---------------------------------------------------------------------------
+# the kernel arguments through a REAL tick.Scratch at ROUND_SLOTS = 62 (union, NR = 61) and 0 (narrow):
+# job 2175563's mixed-code process crashed on a (H, B, 1) ring placeholder against NR = 61
+# ---------------------------------------------------------------------------
+class _ScratchEngine:
+    """The CacheEngine attributes Scratch / setup-free arg building read, at any (topk, R)."""
+
+    def __init__(self, topk, R, B, tail_len, seed):
+        g = torch.Generator().manual_seed(seed)
+        lay = core.paired_layout(topk, R, BS)
+        self.block_size, self.topk, self.head_num, self.head_dim = BS, topk, H, D
+        self.verify_round_slots, self.pool_blocks = R, 0
+        self._k_gpu = torch.randn((B, lay.W * BS, H, D), generator=g)
+        self._v_gpu = torch.randn((B, lay.W * BS, H, D), generator=g)
+        self._kv_bias_gpu = torch.randn((B, lay.W * BS, H), generator=g)
+        self._block_map = torch.stack([torch.stack([torch.randperm(4 * topk, generator=g)[:topk] for _ in range(B)]) for _ in range(H)]).to(torch.int64)
+        self._block_map[..., topk - 1] = 300
+        self._tail_block_len_on_gpu = tail_len
+        self._tail_block_idx_on_gpu = topk - 1
+        self.B, self.T, self.lay = B, 300, lay
+
+
+def _scratch_world(R, B=2, tail_len=5, seed=21):
+    topk = 64
+    eng = _ScratchEngine(topk, R, B, tail_len, seed)
+    cache = SimpleNamespace(layers=[SimpleNamespace(cache_engine=eng)])
+    model = SimpleNamespace(num_layers=1, num_heads=HQ, topk_blocks=topk, block_size=BS)
+    sc = tick.Scratch(model, cache, eng.lay, B)
+    return eng, sc
+
+
+@pytest.mark.parametrize("R", [62, 0], ids=["union-R62", "narrow-R0"])
+@pytest.mark.parametrize("kind", ["paired", "twin", "restart"])
+def test_fused_args_through_scratch_at_round_slots(R, kind):
+    eng, sc = _scratch_world(R)
+    lay = sc.lay
+    B = eng.B
+    n_ring = lay.ring_hi - lay.ring_lo
+    assert (n_ring, lay.W) == ((61, 128) if R == 62 else (0, 64))
+    assert tuple(sc.ring_dummy.shape) == (H, B, max(n_ring, 1)) and tuple(sc.ready_u8.shape) == (H, B, lay.W) and sc.ready_u8.dtype == torch.uint8
+    assert tuple(sc.sel_dummy.shape) == (H, 1, 64)
+    g = torch.Generator().manual_seed(5)
+    if kind == "paired":
+        req_idx, has_v, has_s = torch.arange(B), True, True
+    elif kind == "twin":
+        req_idx, has_v, has_s = torch.arange(B), True, False
+    else:
+        req_idx, has_v, has_s = torch.tensor([1]), False, True
+    n = req_idx.numel()
+    plan = core.row_plan(req_idx, has_v, has_s)
+    tv = core.tail_view(int(eng._tail_block_len_on_gpu), has_v, False, lay)
+    own_row = core.provisional_row(lay, tv.tail_len_after) if has_s else -1
+    sel_s = None
+    if has_s:
+        sel_s = torch.full((H, n, 64), -1, dtype=torch.int64)
+        for h in range(H):
+            for i, b in enumerate(req_idx.tolist()):
+                pick = eng._block_map[h, b, torch.randperm(63, generator=g)[:40]]
+                sel_s[h, i, :40] = pick
+                sel_s[h, i, 40] = eng.T
+    a = tick.fused_args(sc, eng, plan, n, sel_s, tv, own_row)
+    R_rows = plan.req.numel()
+    assert fb.check_args(a, sc.bias, sc.prefix, sc.extent) == R_rows, "the production argument tuple passes the kernel's checks at this ROUND_SLOTS"
+    # the reference and the interpreted kernel, on the production scratch buffers, vs the torch path
+    out_t = torch.empty_like(sc.bias)
+    vis_v = core.v_visible_rows(H, n, lay, tv.tail_len_after) if has_v else None
+    vis_s = None
+    if has_s:
+        content = eng._block_map[..., lay.tail_slot] - tv.content_offset
+        ids = core.slot_ids(eng._block_map, content, lay)
+        vis_s = core.s_visible_rows(ids[:, req_idx], sc.ready[:, req_idx], sel_s, lay, tv.tail_rows_for_s)
+    vis, cbi = core.assemble_rows(plan, vis_v, vis_s, req_idx)
+    rb_t = core.paired_bias(eng._kv_bias_gpu, vis, cbi, plan.U, core.MASKED, out=out_t, check_values=True,
+                            own_rows=(core.own_rows(plan, own_row) if own_row >= 0 else None))
+    rb_r = fb.fused_bias_reference(a, sc.bias, sc.prefix, sc.extent)
+    assert torch.equal(sc.bias[:R_rows], out_t[:R_rows]) and torch.equal(rb_r.cache_seqlens.to(torch.int64), rb_t.cache_seqlens.to(torch.int64))
+    if _triton_available() and os.environ.get("TRITON_INTERPRET") == "1":
+        sc.bias.zero_(); sc.prefix.zero_()
+        rb_k = fb.fused_bias_triton(a, sc.bias, sc.prefix, sc.extent)
+        assert torch.equal(sc.bias[:R_rows], out_t[:R_rows]) and torch.equal(rb_k.cache_seqlens.to(torch.int64), rb_t.cache_seqlens.to(torch.int64))
+        assert torch.equal(rb_k.visible_rows.to(torch.int64), rb_t.visible_rows)
+    if has_v:
+        assert int(rb_t.cache_seqlens[0]) == lay.tail_slot * BS + tv.tail_len_after, "V's extent = the decode's cache_seqlens at both layouts"
+    src = (NOSI_PKG / "paired" / "tick.py").read_text()
+    assert "fused_args(sc, eng, plan, n, sel_s, tv, own_row)" in src, "the body builds the kernel arguments through fused_args"

@@ -125,7 +125,8 @@ def fused_bias_reference(a: FusedArgs, out: torch.Tensor, prefix: torch.Tensor, 
     ids[:, a.tail_slot, :] = bmap_r[:, a.tail_slot, :] - a.content_off
     if a.n_ring > 0:
         ids[:, a.ring_lo:a.ring_lo + a.n_ring, :] = a.ring_ids[:, req, :a.n_ring].permute(1, 2, 0)
-    sel_r = a.sel[:, srow, :].permute(1, 0, 2)                                    # (R, H, K)
+    # V rows never read the selection (the kernel masks that load by role): clamp so a V-only call's 1-row sel_dummy indexes
+    sel_r = a.sel[:, srow.clamp(max=a.sel.shape[1] - 1), :].permute(1, 0, 2)      # (R, H, K)
     found = (ids.permute(0, 2, 1).unsqueeze(-1) == sel_r.unsqueeze(2)).any(-1).permute(0, 2, 1) & (ids >= 0)
     ready_r = a.ready[:, req, :].permute(1, 2, 0) != 0                            # (R, W, H)
     z = torch.zeros((), dtype=torch.int64, device=dev)

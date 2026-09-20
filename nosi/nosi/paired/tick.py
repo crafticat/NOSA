@@ -334,6 +334,22 @@ def attend_rows(G, q: torch.Tensor, k_gpu: torch.Tensor, v_gpu: torch.Tensor, rb
     return out.squeeze(1)
 
 
+def fused_args(sc: Scratch, eng, plan: core.RowPlan, n: int, sel_s, tv: core.TailView, own_row: int) -> "_fb.FusedArgs":
+    """The fused kernel's argument tuple for one layer call, from the engine's
+    own tensors and the scratch (ring_dummy: (H, B, max(NR, 1)) of -1 until E4
+    fills the ring; sel_dummy for a V-only call). tests/test_paired_core.py
+    builds it through a real Scratch at ROUND_SLOTS = 62 and 0 (job 2175563's
+    mixed-code crash was a (H, B, 1) placeholder against NR = 61)."""
+    lay = sc.lay
+    req_i32 = plan.req.to(torch.int32)
+    srow_i32 = torch.arange(int(n), dtype=torch.int32, device=sc.device).repeat_interleave(plan.U)
+    return _fb.FusedArgs(cis=eng._kv_bias_gpu, sel=(sel_s.contiguous() if sel_s is not None else sc.sel_dummy), bmap=eng._block_map,
+                         ring_ids=sc.ring_dummy, ready=sc.ready_u8, req=req_i32, srow=srow_i32, role=plan.role,
+                         W=lay.W, bs=lay.bs, topk=lay.topk, tail_slot=lay.tail_slot, ring_lo=lay.ring_lo, n_ring=lay.ring_hi - lay.ring_lo,
+                         tail_rows_v=tv.tail_len_after, tail_rows_s=tv.tail_rows_for_s, own_row_s=int(own_row),
+                         content_off=tv.content_offset, masked=sc.masked_rounded)
+
+
 # ---------------------------------------------------------------------------
 # the per-layer body
 # ---------------------------------------------------------------------------
@@ -408,15 +424,7 @@ def layer_body(G, model, cache, l: int, hidden: torch.Tensor, position_ids: torc
     vis_v = vis_s = None
     if cfg.bias_impl == "fused" and not s_off:
         # ONE kernel per layer (fused_bias.py); prefix rows for the ledger come out of the same launch
-        rows_plan = plan
-        req_i32 = plan.req.to(torch.int32)
-        srow_i32 = torch.arange(n, dtype=torch.int32, device=sc.device).repeat_interleave(plan.U)
-        fa = _fb.FusedArgs(cis=eng._kv_bias_gpu, sel=(sel_s.contiguous() if sel_s is not None else sc.sel_dummy), bmap=eng._block_map,
-                           ring_ids=sc.ring_dummy, ready=sc.ready_u8, req=req_i32, srow=srow_i32, role=plan.role,
-                           W=lay.W, bs=lay.bs, topk=lay.topk, tail_slot=lay.tail_slot, ring_lo=lay.ring_lo, n_ring=lay.ring_hi - lay.ring_lo,
-                           tail_rows_v=tv.tail_len_after, tail_rows_s=tv.tail_rows_for_s, own_row_s=own_row,
-                           content_off=tv.content_offset, masked=sc.masked_rounded)
-        rb = _fb.fused_bias_triton(fa, sc.bias, sc.prefix, sc.extent)
+        rb = _fb.fused_bias_triton(fused_args(sc, eng, plan, n, sel_s, tv, own_row), sc.bias, sc.prefix, sc.extent)
         pre = rb.visible_rows.view(n, plan.U, lay.W, Hk)
         if plan.has_v:
             vis_v = pre[:, 0]
