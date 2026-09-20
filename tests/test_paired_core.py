@@ -280,7 +280,7 @@ def test_paired_bias_values_extent_and_inplace():
     vis_v = core.v_visible_rows(H, 2, LAY, 6)
     vis_s = core.s_visible_rows(ids, ready, sel, LAY, tail_rows=6)
     vis, cbi = core.assemble_rows(plan, vis_v, vis_s, torch.arange(2))
-    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2)
+    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, check_values=True)
     assert isinstance(rb, ra.RowsBias) and rb.bias.shape == (4, W * BS, H) and rb.bias.is_contiguous()
     assert core.MASKED == -3.0e4 and torch.isfinite(rb.bias).all(), "G7: the masked value is finite"
     # V row 0: cis of request 0 on window rows and tail rows < 6, MASKED above; nothing past the tail slot
@@ -296,13 +296,13 @@ def test_paired_bias_values_extent_and_inplace():
     assert rb.cache_batch_idx.tolist() == [0, 0, 1, 1]
     # in-place into a storage of >= max(R, B) rows: same bytes as the allocating path
     out = torch.empty((6, W * BS, H))
-    rb2 = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, out=out)
+    rb2 = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, out=out, check_values=True)
     assert rb2.bias.data_ptr() == out.data_ptr() and torch.equal(out[:4], rb.bias) and torch.equal(rb2.cache_seqlens, rb.cache_seqlens)
     with pytest.raises(ValueError):
-        core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, out=torch.empty((1, W * BS, H)))
+        core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, out=torch.empty((1, W * BS, H)), check_values=True)
     # a flipped mask entry moves the bias (the mask is read)
     vis_f = vis.clone(); vis_f[0, 2, 0] = 0
-    rb3 = core.paired_bias(eng._kv_bias_gpu, vis_f, cbi, 2)
+    rb3 = core.paired_bias(eng._kv_bias_gpu, vis_f, cbi, 2, check_values=True)
     assert not torch.equal(rb3.bias, rb.bias)
 
 
@@ -315,7 +315,7 @@ def test_reference_twin_gathered_equals_dense_membership():
     ids, ready = _ids_ready(eng)
     sel = _sel(H, 2, [3, 4, 10, eng.T])
     vis, cbi = core.assemble_rows(plan, core.v_visible_rows(H, 2, LAY, 6), core.s_visible_rows(ids, ready, sel, LAY, 6), torch.arange(2))
-    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2)
+    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, check_values=True)
     q = torch.randn((4, HQ, D), generator=torch.Generator().manual_seed(5))
     scale = D ** -0.5
     og = ra.reference_rows_attention(q, eng._k_gpu, eng._v_gpu, rb, scale, torch.float32, gather=True)
@@ -369,7 +369,7 @@ def test_g7_poison_control_surfaces_only_when_read():
     q = torch.randn((2, HQ, D), generator=torch.Generator().manual_seed(1))
     # V row alone: extent 3*64 + 6 < the provisional row -> finite
     vis_v = core.v_visible_rows(H, 1, LAY, 6)
-    rb_v = core.paired_bias(eng._kv_bias_gpu, vis_v, torch.zeros(1, dtype=torch.int32), 1)
+    rb_v = core.paired_bias(eng._kv_bias_gpu, vis_v, torch.zeros(1, dtype=torch.int32), 1, check_values=True)
     assert int(rb_v.cache_seqlens[0]) < LAY.prov_slot * BS
     ov = ra.reference_rows_attention(q[:1], eng._k_gpu, eng._v_gpu, rb_v, D ** -0.5, torch.float32, gather=False)
     assert torch.isfinite(ov).all()
@@ -377,13 +377,13 @@ def test_g7_poison_control_surfaces_only_when_read():
     core.s_provisional_write(eng, torch.randn(1, H, D), torch.randn(1, H, D), torch.randn(1, H), LAY)
     vis_s = core.s_visible_rows(ids, ready, sel, LAY, 6)
     vis, cbi = core.assemble_rows(plan, vis_v, vis_s, torch.arange(1))
-    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2)
+    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, check_values=True)
     o = ra.reference_rows_attention(q, eng._k_gpu, eng._v_gpu, rb, D ** -0.5, torch.float32, gather=False)
     assert torch.isfinite(o).all()
     # positive control: poison again and let a row's extent reach the row without naming it -> NaN surfaces
     core.poison_provisional(eng, LAY)
     bad = vis_v.clone(); bad[0, LAY.prov_slot + 1, :] = 1                     # a wrong extent past the poisoned row
-    rb_bad = core.paired_bias(eng._kv_bias_gpu, bad, torch.zeros(1, dtype=torch.int32), 1)
+    rb_bad = core.paired_bias(eng._kv_bias_gpu, bad, torch.zeros(1, dtype=torch.int32), 1, check_values=True)
     ob = ra.reference_rows_attention(q[:1], eng._k_gpu, eng._v_gpu, rb_bad, D ** -0.5, torch.float32, gather=False)
     assert torch.isnan(ob).any(), "the NaN-poison control must surface a read of the provisional row"
 
@@ -446,7 +446,7 @@ def test_attend_rows_arguments_and_split_refusal():
     ids, ready = _ids_ready(eng)
     vis, cbi = core.assemble_rows(plan, core.v_visible_rows(H, 2, LAY, 6), core.s_visible_rows(ids, ready, _sel(H, 2, [3, 10, eng.T, -1]), LAY, 6), torch.arange(2))
     storage = torch.empty((4, W * BS, H))
-    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, out=storage)
+    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, out=storage, check_values=True)
     seen = {}
 
     def fake_fa(q4, k, v, bias_view, cache_seqlens, cache_batch_idx, num_splits):
@@ -465,11 +465,11 @@ def test_attend_rows_arguments_and_split_refusal():
         with pytest.raises(ValueError):
             tick.attend_rows(G, q, eng._k_gpu, eng._v_gpu, rb, bad)
     # a subset call: 1 row, storage still B rows
-    rb1 = core.paired_bias(eng._kv_bias_gpu, vis[1:2], cbi[1:2], 1, out=storage)
+    rb1 = core.paired_bias(eng._kv_bias_gpu, vis[1:2], cbi[1:2], 1, out=storage, check_values=True)
     out1 = tick.attend_rows(G, q[:1], eng._k_gpu, eng._v_gpu, rb1, 8)
     assert out1.shape == (1, HQ, D) and seen["rows"] == 1 and seen["bias_rows"] == 2
     with pytest.raises(ValueError):
-        tick.attend_rows(G, q, eng._k_gpu, eng._v_gpu, core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, out=torch.empty((4, W * BS, H)))._replace(bias=torch.empty((4, W * BS, H))[:, :10]), 4)
+        tick.attend_rows(G, q, eng._k_gpu, eng._v_gpu, core.paired_bias(eng._kv_bias_gpu, vis, cbi, 2, out=torch.empty((4, W * BS, H)), check_values=True)._replace(bias=torch.empty((4, W * BS, H))[:, :10]), 4)
 
 
 def test_config_from_env_reads_at_dispatch_and_refuses_heuristic(monkeypatch):
@@ -487,10 +487,10 @@ def test_config_from_env_reads_at_dispatch_and_refuses_heuristic(monkeypatch):
 
 def test_twin_diagnose_names_first_term_and_g3_verdict():
     recs = [dict(layer=0, bias_equal=True, qkv_equal=True, attn_equal=True, ffn_equal=True),
-            dict(layer=1, bias_equal=True, qkv_equal=False, q_maxabs=0.5, attn_equal=True, ffn_equal=True),
+            dict(layer=1, bias_equal=True, qkv_equal=False, qkv_maxabs=0.5, attn_equal=True, ffn_equal=True),
             dict(layer="head", norm_equal=True, lm_head_equal=False, lm_head_maxabs=1.0)]
     msg = twin.diagnose(recs)
-    assert msg.startswith("layer 1: qkv GEMM")
+    assert msg.startswith("layer 1: qkv (pre-rope)")
     assert twin.diagnose(recs[:1]) is None
     a = [torch.zeros(2, 5), torch.ones(2, 5)]
     v = twin.g3_verdict(a, [torch.zeros(2, 5), torch.ones(2, 5)])
@@ -629,3 +629,218 @@ def test_pilot_predictions_and_decomposition(tmp_path, monkeypatch):
     assert "| rest | 16.00 | 26.00 | +10.00 | - | - |" in txt64
     assert "twin2b" in (ROOT / "benchmarks" / "Efficiency" / "paired_pilot.py").read_text()
     assert "G3-greedy" in (ROOT / "benchmarks" / "Efficiency" / "paired_pilot.py").read_text() and "G3-commit" in (ROOT / "benchmarks" / "Efficiency" / "paired_pilot.py").read_text()
+
+
+# ---------------------------------------------------------------------------
+# job 2175550: the equiv crash (a strided-view rope argument) and the V-row bug (a slice write into
+# compressed_cis_buf, which aliases the layer's persistent compressed-cis table)
+# ---------------------------------------------------------------------------
+def test_rope_positions_are_contiguous_for_a_strided_view():
+    pos = torch.stack([torch.arange(5), torch.arange(5) + 1], dim=1)      # (B, 2): [tau, tau+1]
+    col = pos[:, 0]
+    assert not col.is_contiguous(), "the column view is strided (the crash of job 2175550)"
+    p = tick.rope_positions(col)
+    assert p.is_contiguous() and p.dtype == col.dtype and torch.equal(p, torch.arange(5))
+    assert torch.equal(tick.rope_positions(pos), pos.flatten())
+    flat = torch.arange(6)
+    assert tick.rope_positions(flat).data_ptr() == flat.data_ptr(), "a contiguous vector is passed as a view, not copied"
+    src = (NOSI_PKG / "paired" / "twin.py").read_text() + (NOSI_PKG / "paired" / "tick.py").read_text()
+    assert "position_ids.flatten()" not in src and "position_ids[:, 0].flatten()" not in src, "every rope call goes through rope_positions"
+    assert src.count("rope_positions(") >= 3
+
+
+class _FakeNL:
+    """The two scoring kernels the body binds from nosa_llama, as pure torch:
+    stage 1 = per KV head, the sum over its query group of q . compressed_k
+    (any deterministic function of (q, ck) will do), (Hkv, B, M); the captured
+    pooling / top-k graph = top-K over score_buf + compressed_cis_buf."""
+
+    @staticmethod
+    def infllmv2_attn_stage1_fast(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal):
+        Bq = cu_seqlens_q.numel() - 1
+        M = int(max_seqlen_k)
+        Hq_, D_ = q.shape[1], q.shape[2]
+        Hk_ = k.shape[1]
+        g = Hq_ // Hk_
+        kk = k.view(Bq, M, Hk_, D_)
+        out = torch.zeros((Hk_, Bq, M), dtype=torch.float32)
+        for h in range(Hk_):
+            qh = q[:, h * g:(h + 1) * g, :].float().sum(1)                 # (B, D)
+            out[h] = torch.einsum("bd,bmd->bm", qh, kk[:, :, h, :].float())
+        return out
+
+
+class _FakeGraph:
+    def __init__(self, layer, model, K):
+        self.layer, self.model, self.K = layer, model, K
+
+    def replay(self):
+        s = self.layer.score_buf + self.layer.compressed_cis_buf.float()
+        self.model.topk_idx_buf.copy_(torch.topk(s, self.K, dim=-1, sorted=False).indices.to(torch.int64))
+
+
+class _FakeCacheLayer:
+    """InfLLMv2CacheLayer's four decode-time table updates (cache_engine.py
+    :966-995, :1068-1100) with their real semantics inside the no-compress
+    budget, incl. the ALIAS: update_cis returns self.compressed_cis itself."""
+
+    def __init__(self, B, M, seq0, seed):
+        g = torch.Generator().manual_seed(seed)
+        ks = 32
+        self.no_compress_k_cache = torch.randn((B, ks, H, D), generator=g)
+        self.no_compress_k_len = 17
+        self.compress_k_cache_varlen = torch.randn((B, M, H, D), generator=g)
+        self.cached_compressed_cu_seqlens = torch.arange(B + 1, dtype=torch.int32) * M
+        self.cached_compressed_max_seqlen = M
+        self.total_cis = torch.randn((B, seq0 + 64, H), generator=g)
+        self.cis_len = seq0
+        self.compressed_cis = torch.randn((H, B, M), generator=g)
+        self.comp_cis_len = M
+        self.tail_cis = torch.randn((H, B, ks), generator=g)
+        self.tail_cis_len = 17
+        self.seq_length = seq0
+
+    def update_no_compress_k_decode(self, key_states, kernel_size=32, kernel_stride=16):
+        if self.no_compress_k_len >= kernel_size:
+            raise RuntimeError("compress event outside the test budget")
+        self.no_compress_k_cache[:, self.no_compress_k_len:self.no_compress_k_len + 1].copy_(key_states)
+        self.no_compress_k_len += 1
+        return None
+
+    def update_compress_k_decode(self, key_states, cu_seqlens=None):
+        if key_states is not None:
+            raise RuntimeError("compress event outside the test budget")
+        return self.compress_k_cache_varlen, self.cached_compressed_cu_seqlens, self.cached_compressed_max_seqlen
+
+    def update_uncompressed_cis(self, cis, current_batch_pos, total_bsz):
+        self.total_cis[:, self.cis_len:self.cis_len + 1, :].copy_(cis)
+        self.cis_len += 1
+        return self.total_cis
+
+    def update_cis(self, cis, current_batch_pos, total_bsz, kernel_size=32, kernel_stride=16):
+        self.tail_cis[:, :, self.tail_cis_len:self.tail_cis_len + 1].copy_(cis)
+        self.tail_cis_len += 1
+        return self.compressed_cis                                   # THE ALIAS the warm-up binds compressed_cis_buf to
+
+    def tables(self):
+        # total_cis is compared over its COMMITTED rows (< cis_len): the journal restores cis_len, not the row above it,
+        # which the S position leaves stale and the next V write overwrites before any reader (spec_loop.LayerJournal)
+        return dict(no_compress_k_cache=self.no_compress_k_cache.clone(), no_compress_k_len=self.no_compress_k_len,
+                    compress_k=self.compress_k_cache_varlen.clone(), total_cis=self.total_cis[:, :self.cis_len].clone(), cis_len=self.cis_len,
+                    compressed_cis=self.compressed_cis.clone(), tail_cis=self.tail_cis.clone(), tail_cis_len=self.tail_cis_len)
+
+
+class _FakeCache:
+    def __init__(self, layers):
+        self.layers = layers
+
+    def update_no_compress_k_decode(self, key_states, layer_idx, kernel_size=32, kernel_stride=16, cache_kwargs=None):
+        return self.layers[layer_idx].update_no_compress_k_decode(key_states, kernel_size, kernel_stride)
+
+    def update_compress_k_decode(self, key_states, layer_idx, cu_seqlens=None, cache_kwargs=None):
+        return self.layers[layer_idx].update_compress_k_decode(key_states, cu_seqlens)
+
+    def update_uncompressed_cis(self, cis, layer_idx, current_batch_pos, total_bsz):
+        return self.layers[layer_idx].update_uncompressed_cis(cis, current_batch_pos, total_bsz)
+
+    def update_cis(self, cis, layer_idx, current_batch_pos, total_bsz):
+        return self.layers[layer_idx].update_cis(cis, current_batch_pos, total_bsz)
+
+
+def _scoring_world(B=4, M=12, K=5, seed=0):
+    clayer = _FakeCacheLayer(B, M, seq0=100, seed=seed)
+    model = SimpleNamespace(topk_idx_buf=torch.zeros((H, B, K), dtype=torch.int64), num_heads=HQ, head_dim=D)
+    layer = SimpleNamespace(score_buf=torch.zeros((H, B, M)), compressed_cis_buf=clayer.compressed_cis,   # the alias, as nosa_llama.py:451 binds it
+                            pooling_block_size=32, pooling_stride=16)
+    layer.after_pooling_graph = _FakeGraph(layer, model, K)
+    cache = _FakeCache([clayer])
+    sc = SimpleNamespace(B=B, cu_full=torch.arange(B + 1, dtype=torch.int32), key_pad=torch.zeros((B, 1, H, D)),
+                         cis_pad=torch.zeros((B, 1, H)), q_pad=torch.zeros((B, HQ, D)))
+    cfg = tick.TickConfig(num_splits=4, poison=False, masked=core.MASKED, refuse_compress=True, gemm_pad_rows=0, s_off=False)
+    G = SimpleNamespace(NL=_FakeNL)
+    return G, model, cache, layer, clayer, sc, cfg
+
+
+def _tables_equal(a, b):
+    return [k for k in a if (not torch.equal(a[k], b[k]) if torch.is_tensor(a[k]) else a[k] != b[k])]
+
+
+def test_subset_scoring_leaves_the_tables_equal_and_the_alias_is_live():
+    G, model, cache, layer, clayer, sc, cfg = _scoring_world()
+    g = torch.Generator().manual_seed(7)
+    B = sc.B
+    q = torch.randn((B, HQ, D), generator=g); k = torch.randn((B, H, D), generator=g); cis = torch.randn((B, H), generator=g)
+    idx = torch.tensor([2, 0])
+    before = clayer.tables()
+    stale_before = clayer.total_cis[:, clayer.cis_len].clone()
+    j = sl.LayerJournal(); j.take(clayer)
+    sel_sub, _, _ = tick.score_position(G, model, cache, layer, 0, q[idx], k[idx], cis[idx], sc, cfg, idx)
+    j.restore(clayer)
+    assert _tables_equal(before, clayer.tables()) == [], "a journaled subset scoring leaves every table torch.equal (compressed_cis included)"
+    assert not torch.equal(stale_before, clayer.total_cis[:, clayer.cis_len]), "the one row the S position leaves behind is the stale row above cis_len (unread; the next V overwrites it)"
+    # the subset's selection equals the rows of a whole-batch scoring with the same q rows on the same state
+    j.take(clayer)
+    q_full = torch.zeros_like(q); q_full[idx] = q[idx]
+    sel_full, _, _ = tick.score_position(G, model, cache, layer, 0, q_full, k, cis, sc, cfg, None)
+    j.restore(clayer)
+    assert torch.equal(torch.sort(sel_sub, -1).values, torch.sort(sel_full[:, idx], -1).values)
+    # POSITIVE CONTROL of the bug of job 2175550: the compacted slice write hits the persistent table through the alias
+    snap = clayer.compressed_cis.clone()
+    layer.compressed_cis_buf[:, :2].copy_(clayer.compressed_cis[:, idx])
+    assert not torch.equal(snap, clayer.compressed_cis) and torch.equal(clayer.compressed_cis[:, 0], snap[:, 2]), "requests 0..n-1 receive other requests' cis"
+    src = (NOSI_PKG / "paired" / "tick.py").read_text()
+    assert "compressed_cis_buf[:, :" not in src and "score_buf[:, :" not in src, "never a slice write into the graph's buffers"
+    assert "layer.compressed_cis_buf.copy_(compressed_cis)" in src and "layer.score_buf.copy_(score)" in src
+
+
+def test_v_scores_against_the_state_the_decode_scores_against():
+    """V's selection at step t+1 after a journaled S scoring at step t equals
+    V's selection with no S scoring at all (the S position's table state is
+    never visible to V), and the tables are torch.equal."""
+    g = torch.Generator().manual_seed(11)
+    B = 4
+    qs = [torch.randn((B, HQ, D), generator=g) for _ in range(3)]
+    ks = [torch.randn((B, H, D), generator=g) for _ in range(3)]
+    cs = [torch.randn((B, H), generator=g) for _ in range(3)]
+    # world A: V(t), S(t) journaled, V(t+1)
+    G, model, cache, layer, clayer, sc, cfg = _scoring_world(B=B, seed=3)
+    tick.score_position(G, model, cache, layer, 0, qs[0], ks[0], cs[0], sc, cfg, None)
+    j = sl.LayerJournal(); j.take(clayer)
+    sub = torch.tensor([1, 3])
+    tick.score_position(G, model, cache, layer, 0, qs[1][sub], ks[1][sub], cs[1][sub], sc, cfg, sub)
+    j.restore(clayer)
+    selA, _, scoreA = tick.score_position(G, model, cache, layer, 0, qs[2], ks[2], cs[2], sc, cfg, None)
+    tabA = clayer.tables()
+    # world B: V(t), V(t+1) only
+    G, model, cache, layer, clayer, sc, cfg = _scoring_world(B=B, seed=3)
+    tick.score_position(G, model, cache, layer, 0, qs[0], ks[0], cs[0], sc, cfg, None)
+    selB, _, scoreB = tick.score_position(G, model, cache, layer, 0, qs[2], ks[2], cs[2], sc, cfg, None)
+    assert torch.equal(scoreA, scoreB) and torch.equal(selA, selB)
+    assert _tables_equal(tabA, clayer.tables()) == []
+
+
+def test_diagnose_layers_names_first_term_and_errors():
+    recs = [dict(layer=0, bias_equal=True, qkv_equal=True, rope_equal=True, score_equal=True, sel_equal=True, attn_equal=True, ffn_equal=True),
+            dict(layer=1, bias_equal=True, qkv_equal=True, rope_equal=True, score_equal=False, score_maxabs=0.25, sel_equal=False, sel_rows_differ=3,
+                 attn_equal=False, attn_maxabs=0.5, ffn_equal=False, ffn_maxabs=1.0),
+            dict(layer=2, error="RuntimeError: pos_ids must be contiguous"),
+            dict(layer="head", norm_equal=True, lm_head_equal=True)]
+    lines = twin.diagnose_layers(recs)
+    assert len(lines) == 2 and lines[0].startswith("layer 1: first departs at score") and "sel=DIFF(differ 3)" in lines[0] and "attn=DIFF(maxabs 0.5)" in lines[0]
+    assert lines[1].startswith("layer 2: comparator ERROR RuntimeError")
+    assert twin.diagnose(recs).startswith("layer 1: score:")
+    assert twin.diagnose(recs[:1] + recs[3:]) is None
+    src = (NOSI_PKG / "paired" / "twin.py").read_text()
+    assert "except Exception as e:" in src and 'rec["error"]' in src, "the in-situ twin records failures instead of crashing the arm"
+
+
+def test_s_off_config_and_text(monkeypatch):
+    monkeypatch.delenv("NOSI_ATTN_SPLITS", raising=False)
+    monkeypatch.delenv("NOSI_PAIRED_S_OFF", raising=False)
+    assert tick.config_from_env().s_off is False
+    monkeypatch.setenv("NOSI_PAIRED_S_OFF", "1")
+    assert tick.config_from_env().s_off is True
+    src = (NOSI_PKG / "paired" / "tick.py").read_text()
+    assert "if plan.has_s and not s_off:" in src and "vis_s = vis_v" in src, "S_OFF: no S scoring, no provisional write, S rows attend V's mask"
+    psrc = (ROOT / "benchmarks" / "Efficiency" / "paired_pilot.py").read_text()
+    assert "NOSI_PAIRED_S_OFF" in psrc and "if t < N - 1 and not s_off:" in psrc

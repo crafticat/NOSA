@@ -57,6 +57,7 @@ class TickConfig(NamedTuple):
     masked: float          # the finite masked bias value
     refuse_compress: bool  # refuse a 16-token compress event inside a call (the captured pooling graph is fixed-shape)
     gemm_pad_rows: int     # twin2b diagnostic (DESIGN.md blocker 5): zero rows appended to EVERY GEMM's M so cuBLAS sees the tick's M; 0 = off
+    s_off: bool            # NOSI_PAIRED_S_OFF=1 debug: S rows stay in the GEMMs / attention call but score nothing, write nothing, attend V's mask
 
 
 def config_from_env(gemm_pad_rows: int = 0) -> TickConfig:
@@ -74,7 +75,17 @@ def config_from_env(gemm_pad_rows: int = 0) -> TickConfig:
     if int(gemm_pad_rows) < 0:
         raise SystemExit("gemm_pad_rows=%d must be >= 0" % gemm_pad_rows)
     return TickConfig(num_splits=splits, poison=os.environ.get("NOSI_PAIRED_POISON", "0") == "1",
-                      masked=core.MASKED, refuse_compress=True, gemm_pad_rows=int(gemm_pad_rows))
+                      masked=core.MASKED, refuse_compress=True, gemm_pad_rows=int(gemm_pad_rows),
+                      s_off=os.environ.get("NOSI_PAIRED_S_OFF", "0") == "1")
+
+
+def rope_positions(position_ids: torch.Tensor) -> torch.Tensor:
+    """The flat, CONTIGUOUS position vector the flashinfer rope takes
+    (rope.cu:122 CHECK_INPUT(pos_ids): a strided view such as
+    position_ids[:, 0] is refused -- job 2175550, the equiv arm's crash).
+    reshape(-1) of a strided view copies; of a contiguous tensor it is a view."""
+    p = position_ids.reshape(-1)
+    return p if p.is_contiguous() else p.contiguous()
 
 
 def linear_padded(x: torch.Tensor, w: torch.Tensor, pad_rows: int) -> torch.Tensor:
@@ -137,7 +148,7 @@ class Scratch:
         self.cu_full = torch.arange(self.B + 1, dtype=torch.int32, device=dev)
         self.key_pad = torch.zeros((self.B, 1, H, D), dtype=dtype, device=dev)
         self.cis_pad = torch.zeros((self.B, 1, H), dtype=dtype, device=dev)
-        self.comp_len: List[Optional[int]] = [None] * model.num_layers            # M per layer (uniform over the batch), read once
+        self.q_pad = torch.zeros((self.B, int(model.num_heads), D), dtype=dtype, device=dev)   # the subset's q rows scattered into a full-batch stage-1 call
 
 
 @torch.inference_mode()   # the engine's tensors are inference tensors: the zero-fill below is an in-place write on them (state_snapshot.py, job 2174640)
@@ -170,13 +181,11 @@ def setup(model, cache, B: int) -> Scratch:
             eng._k_gpu[:, lo:hi].zero_()
             eng._v_gpu[:, lo:hi].zero_()
             eng._kv_bias_gpu[:, lo:hi].zero_()
-        cu = clayer.cached_compressed_cu_seqlens
-        M = int(clayer.cached_compressed_max_seqlen)
-        if not bool(((cu[1:] - cu[:-1]) == M).all()):
-            raise RuntimeError("layer %d: the compressed length is not uniform over the batch (max %d); the subset scoring assumes it" % (l, M))
-        sc.comp_len[l] = M
-        if clayer.compress_k_cache_varlen.shape[1] != M:
-            raise RuntimeError("layer %d: compress_k_cache_varlen has %d columns, cached max %d" % (l, clayer.compress_k_cache_varlen.shape[1], M))
+        if model.layers[l].compressed_cis_buf.data_ptr() != clayer.compressed_cis.data_ptr():
+            # nosa_llama.py:451 binds the warm-up's compressed_cis_buf to update_cis's return value, which IS the
+            # layer's persistent table (cache_engine.py:1081). score_position relies on that being a self-copy.
+            raise RuntimeError("layer %d: compressed_cis_buf does not alias the layer's compressed_cis table; score_position's "
+                               "full-batch self-copy assumption (DESIGN.md A8) no longer holds" % l)
     return sc
 
 
@@ -198,26 +207,33 @@ def compress_budget(cache, n_positions_ahead: int) -> int:
 def score_position(G, model, cache, layer, l: int, q_u: torch.Tensor, k_u: torch.Tensor, cis_u: torch.Tensor,
                    sc: Scratch, cfg: TickConfig, req_idx: Optional[torch.Tensor]):
     """One position's table updates and selection, exactly decode_forward's /
-    verify_forward's text (nosa_llama.py:715-739) for the whole batch
-    (req_idx None), or for a SUBSET of requests: the subset's rows are
-    scattered into a zero-padded full-batch key / cis (the layer tables are
-    batch-wide; the caller journals and restores them), the stage-1 call runs
-    over the subset's compressed keys (gathered) with its own cu_seqlens, and
-    the score lands in the first n rows of the captured graph's score_buf
-    (nosa_pooling and top-k are per-row: rows >= n are stale and unread).
-    Returns (sel (H, n, K) int64, ucis = the layer's total_cis table)."""
+    verify_forward's text (nosa_llama.py:715-739) over the WHOLE batch. For a
+    SUBSET of requests (the restart) the subset's q / key / cis rows are
+    scattered into zero-padded full-batch tensors (the layer tables are
+    batch-wide; the caller journals and restores them) and the selection is
+    read off topk_idx_buf at req_idx.
+
+    NEVER a slice write into score_buf / compressed_cis_buf. compressed_cis_buf
+    is NOT a scratch buffer: the warm-up bound it to update_cis's return value
+    (nosa_llama.py:451), which is the layer's PERSISTENT compressed-cis table
+    (cache_engine.py:1081), so the decode's compressed_cis_buf.copy_(
+    compressed_cis) is a self-copy. A compacted scoring that wrote the
+    gathered rows of req_idx into [:, :n] overwrote the table rows of requests
+    0..n-1 with other requests' cis, un-journaled (job 2175550: after every
+    restart of n rows exactly requests 0..n-1 diverged from the twin).
+    Returns (sel (H, n, K) int64, ucis = the layer's total_cis table, score)."""
     NL = G.NL
     B = sc.B
     if req_idx is None:
         key_full = k_u.unsqueeze(1).contiguous()
         cis_full = cis_u.unsqueeze(1).contiguous()
-        n = B
+        q_full = q_u.contiguous()
     else:
-        n = int(req_idx.numel())
-        key_full, cis_full = sc.key_pad, sc.cis_pad
-        key_full.zero_(); cis_full.zero_()
+        key_full, cis_full, q_full = sc.key_pad, sc.cis_pad, sc.q_pad
+        key_full.zero_(); cis_full.zero_(); q_full.zero_()
         key_full[req_idx, 0] = k_u
         cis_full[req_idx, 0] = cis_u
+        q_full[req_idx] = q_u
     no_compress_k = cache.update_no_compress_k_decode(key_full, l, layer.pooling_block_size, layer.pooling_stride)
     if no_compress_k is not None:
         if cfg.refuse_compress:
@@ -229,23 +245,18 @@ def score_position(G, model, cache, layer, l: int, q_u: torch.Tensor, k_u: torch
         new_compressed_k = None
     compressed_k, cu_comp, max_seqlen_comp = cache.update_compress_k_decode(new_compressed_k, l)
     ucis = cache.update_uncompressed_cis(cis_full, l, 0, B)
-    compressed_cis = cache.update_cis(cis_full.permute(2, 0, 1), l, 0, B)          # (H, B, M)
-    if req_idx is None:
-        ck = compressed_k.contiguous().flatten(0, 1)
-        cu_q, cu_k, ccis = sc.cu_full, cu_comp, compressed_cis
-    else:
-        M = sc.comp_len[l]
-        ck = compressed_k.index_select(0, req_idx).contiguous().flatten(0, 1)
-        cu_q = torch.arange(n + 1, dtype=torch.int32, device=q_u.device)
-        cu_k = cu_q * M
-        ccis = compressed_cis.index_select(1, req_idx)
-    score = NL.infllmv2_attn_stage1_fast(q_u.contiguous(), ck, ck, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+    compressed_cis = cache.update_cis(cis_full.permute(2, 0, 1), l, 0, B)          # (H, B, M): the layer's table itself
+    ck = compressed_k.contiguous().flatten(0, 1)
+    score = NL.infllmv2_attn_stage1_fast(q_full, ck, ck, cu_seqlens_q=sc.cu_full, cu_seqlens_k=cu_comp,
                                          max_seqlen_q=1, max_seqlen_k=max_seqlen_comp, causal=False)
-    layer.score_buf[:, :n].copy_(score)
-    layer.compressed_cis_buf[:, :n].copy_(ccis)
+    layer.score_buf.copy_(score)                        # nosa_llama.py:613
+    layer.compressed_cis_buf.copy_(compressed_cis)      # nosa_llama.py:614: a self-copy (the alias above), the decode's own line
     layer.after_pooling_graph.replay()
-    sel = model.topk_idx_buf[:, :n].clone()                                         # (H, n, K) int64; the buffer is rewritten by the next replay
-    return sel, ucis
+    if req_idx is None:
+        sel = model.topk_idx_buf.clone()                # (H, B, K) int64; the buffer is rewritten by the next replay
+    else:
+        sel = model.topk_idx_buf[:, req_idx].clone()    # (H, n, K)
+    return sel, ucis, score
 
 
 # ---------------------------------------------------------------------------
@@ -324,23 +335,27 @@ def layer_body(G, model, cache, l: int, hidden: torch.Tensor, position_ids: torc
     q, k, v, cis = NL.nosa_linear(qkv, layer.delta.weight, layer.A, layer.q_size, layer.kv_size, Hk)
     q = q.view(n * U, -1)
     k = k.view(n * U, -1)
-    NL.apply_rope_with_cos_sin_cache_inplace(position_ids.flatten(), q, k, D, model.cos_sin_cache, True)
+    q_pre = k_pre = None
+    if insitu is not None and plan.has_v and plan.has_s:
+        q_pre, k_pre = q.clone(), k.clone()                   # pre-rope copies for the in-situ 'qkv' vs 'rope' terms (equiv arm only)
+    NL.apply_rope_with_cos_sin_cache_inplace(rope_positions(position_ids), q, k, D, model.cos_sin_cache, True)
     q = q.reshape(n, U, Hq, D)
     k = k.reshape(n, U, Hk, D)
     v = v.reshape(n, U, Hk, D)
+    s_off = bool(cfg.s_off) and plan.has_v and plan.has_s   # the S rows stay in the GEMMs and the attention call only
 
     # [3] scoring, one position at a time, on the table state that position sees
     if trace is not None:
         trace.rec("score_begin")
     u = 0
-    sel_v = sel_s = ucis = None
+    sel_v = sel_s = ucis = score_v = None
     if plan.has_v:
-        sel_v, ucis = score_position(G, model, cache, layer, l, q[:, u], k[:, u], cis[:, u], sc, cfg, None)
+        sel_v, ucis, score_v = score_position(G, model, cache, layer, l, q[:, u], k[:, u], cis[:, u], sc, cfg, None)
         u += 1
-    if plan.has_s:
+    if plan.has_s and not s_off:
         j = sc.journals[l]
         j.take(clayer)
-        sel_s, _ = score_position(G, model, cache, layer, l, q[:, u], k[:, u], cis[:, u], sc, cfg, sub)
+        sel_s, _, _ = score_position(G, model, cache, layer, l, q[:, u], k[:, u], cis[:, u], sc, cfg, sub)
         j.restore(clayer)                                     # the S position's table state never survives (G5)
 
     # [4] the V row's engine update = the shipped S == 1 body; the S row's provisional write
@@ -355,20 +370,22 @@ def layer_body(G, model, cache, l: int, hidden: torch.Tensor, position_ids: torc
     sc.slot_complete[l] = tv.slot_complete
     if int(eng._tail_block_len_on_gpu) != tv.tail_len_after:
         raise AssertionError("layer %d: engine tail_len %d != the S == 1 rule's %d" % (l, eng._tail_block_len_on_gpu, tv.tail_len_after))
-    if plan.has_s:
+    if plan.has_s and not s_off:
         core.s_provisional_write(eng, k[:, u], v[:, u], G.bias_rows(cis[:, u].unsqueeze(1)), lay, sub)
 
     # [5] the per-row bias and ONE rows-attention call
     vis_v = vis_s = None
     if plan.has_v:
         vis_v = core.v_visible_rows(Hk, n, lay, tv.tail_len_after, device=sc.device)
-    if plan.has_s:
+    if plan.has_s and not s_off:
         content_id = eng._block_map[..., lay.tail_slot] - tv.content_offset
         ids = core.slot_ids(eng._block_map, content_id, lay)
         ids_n, ready_n = (ids, sc.ready) if whole_batch else (ids[:, req_idx], sc.ready[:, req_idx])
         vis_s = core.s_visible_rows(ids_n, ready_n, sel_s, lay, tv.tail_rows_for_s)
+    elif s_off:
+        vis_s = vis_v                                         # S rows attend exactly what V attends: no S contribution anywhere
     vis, cbi = core.assemble_rows(plan, vis_v, vis_s, req_idx)
-    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, plan.U, cfg.masked, out=sc.bias)
+    rb = core.paired_bias(eng._kv_bias_gpu, vis, cbi, plan.U, cfg.masked, out=sc.bias, check_values=False)
     if trace is not None:
         trace.rec("fetch_end")
     q_rows = q.reshape(n * U, Hq, D).contiguous()
@@ -391,8 +408,8 @@ def layer_body(G, model, cache, l: int, hidden: torch.Tensor, position_ids: torc
     # (the twin arm has no S rows and no prediction: its accounts carry no divergence; the paired
     # driver asserts the seed ran before the first tick, so every V position there has one)
     sel_s_prev = sc.prev_sel_s[l] if plan.has_v else None
-    acct = core.layer_account(v_miss, sel_s, vis_s, sel_v, sel_s_prev, lay, tv.tail_len_after, tv.filled)
-    if plan.has_s:
+    acct = core.layer_account(v_miss, sel_s, (None if s_off else vis_s), sel_v, sel_s_prev, lay, tv.tail_len_after, tv.filled)
+    if plan.has_s and not s_off:
         if sc.prev_sel_s[l] is None:
             sc.prev_sel_s[l] = torch.full((Hk, sc.B, sel_s.shape[-1]), -1, dtype=torch.int64, device=sc.device)
         if whole_batch:
@@ -401,8 +418,8 @@ def layer_body(G, model, cache, l: int, hidden: torch.Tensor, position_ids: torc
             sc.prev_sel_s[l][:, req_idx] = sel_s
     rec = None
     if insitu is not None and plan.has_v and plan.has_s:
-        rec = insitu.compare_layer(G, model, layer, l, position_ids=position_ids, q=q, k=k, v=v, cis=cis, vis_v=vis_v,
-                                   rb=rb, attn=attn, hidden_out=hidden, eng=eng, sc=sc, cfg=cfg)
+        rec = insitu.compare_layer(G, model, cache, layer, l, position_ids=position_ids, q_pre=q_pre, k_pre=k_pre, q=q, k=k, v=v, cis=cis,
+                                   score_v=score_v, sel_v=sel_v, vis_v=vis_v, rb=rb, attn=attn, hidden_out=hidden, eng=eng, sc=sc, cfg=cfg)
     return LayerOut(hidden=hidden, account=acct, insitu=rec)
 
 
@@ -441,7 +458,7 @@ def _forward(G, model, cache, sc: Scratch, cfg: TickConfig, tokens: torch.Tensor
         trace.end_call()
     if insitu is not None and plan.has_v and plan.has_s:
         recs.append(insitu.compare_head(G, model, pre, hidden, logits))
-    if plan.has_s and cfg.poison:
+    if plan.has_s and cfg.poison and not cfg.s_off:
         for clayer in cache.layers:
             core.poison_provisional(clayer.cache_engine, sc.lay, None if whole_batch else req_idx)
     lv = logits[:, 0] if plan.has_v else None

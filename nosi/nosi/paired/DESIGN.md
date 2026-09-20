@@ -18,7 +18,7 @@ from `feature/nosi-verify-rows` (004f279). Line numbers below are of THIS worktr
 - `twin.py`: `twin_step` (V rows only through the same body) and `InSituTwin` (every term recomputed
   at M = B from the same inputs; `diagnose` names the first differing term).
 - `benchmarks/Efficiency/paired_pilot.py`: arms `shipped`, `twin`, `equiv`, `resident`, `compare`.
-- `tests/test_paired_core.py`: 28 CPU tests (see section 5).
+- `tests/test_paired_core.py`: 36 CPU tests (see section 5).
 
 ## 2. Assumptions about the engine, each with the line that carries it
 
@@ -31,7 +31,7 @@ from `feature/nosi-verify-rows` (004f279). Line numbers below are of THIS worktr
 | A5 | A slot outside the decode's window exists only under `NOSI_VERIFY_ROUND_SLOTS = R > 0`: `W = topk + R + 2`; slots `>= topk` are zero-filled at prefill; the decode never reads them. The paired tick uses slot `topk` (= round slot 0) as the PROVISIONAL slot, slots `topk+1 .. W-3` as E4's ring, and leaves the mirrors `W-2, W-1` (Path 1's) unused. | `core.paired_layout`, `core.check_layout_against_engine` | `cache_engine.py:274-297` (`_gpu_slots`), `:332-347` (3b': zero-fill), `verify/union_store.py:63-71` |
 | A6 | Every row below a row's `cache_seqlens` is LOADED by the rows kernel (masked columns contribute exact zeros only if their K/V are finite). Slot 63's rows above the prefill's tail length are `torch.empty` garbage until written; the shipped decode's extent never covers them, the S row's extent (`topk*bs + 1`) does. | `tick.setup` zero-fills `slot 63 rows [tail_len, 64)` once after the warm-up step (never read by the decode) | `verify/rows_attention.py:76-83` (PRECONDITION); `cache_engine.py:295-297` (`torch.empty`), `:402-410` (prefill writes only `tail_len` rows) |
 | A7 | The scoring of one position = the decode's chain: `update_no_compress_k_decode`, `update_compress_k_decode`, `update_uncompressed_cis`, `update_cis`, `infllmv2_attn_stage1_fast`, `score_buf.copy_`, `compressed_cis_buf.copy_`, `after_pooling_graph.replay()`, `topk_idx_buf`; the graph and its buffers exist after the warm-up step. The S position's four table updates are bracketed by `spec_loop.LayerJournal.take/restore` (per layer, per call). | `tick.score_position` | `nosa_llama.py:579-619` (decode), `:714-739` (verify, per position); `spec_loop.py:692-760` (journal) |
-| A8 | `nosa_pooling` and the top-k are per-row, so a SUBSET of n requests can be scored by writing rows `[:n]` of `score_buf` / `compressed_cis_buf` and reading `topk_idx_buf[:, :n]`; the compressed length is uniform over the batch (asserted once at setup). | `tick.score_position` with `req_idx` (the restart) | `max_pooling_fused.py:79-107` (grid `(H, B, M)`); `nosa_llama.py:482-496` (top-k over the last dim) |
+| A8 | `compressed_cis_buf` is NOT a scratch buffer: the warm-up binds it to `update_cis`'s return value, which is the layer's PERSISTENT compressed-cis table; the decode's `compressed_cis_buf.copy_(compressed_cis)` is a self-copy. A subset (restart) is therefore scored over the WHOLE batch with zero-padded q / key / cis rows (the decode's exact lines) and its selection read off `topk_idx_buf[:, req_idx]`; a slice write into `[:, :n]` corrupts requests 0..n-1 (job 2175550, section 7). `setup` asserts the alias. | `tick.score_position` | `nosa_llama.py:451` (`self.compressed_cis_buf = compressed_cis`), `cache_engine.py:1081` (`return self.compressed_cis`); `nosa_llama.py:613-614` |
 | A9 | The stage-1 score is `(Hkv, total_q, max_seqlen_k)` and `score_buf` is fixed-shape (aliased into the captured graph): a 16-token COMPRESS EVENT changes `max_seqlen_comp` and would fail at `score_buf.copy_`. | `tick.score_position` refuses on a compress event; the pilot sizes N from `no_compress_k_len` after the warm-up step (`_budget_or_die`) | `dependencies/infllmv2_cuda_impl/infllm_v2/infllmv2_sparse_attention.py:677`; `nosa_llama.py:465-497`, `:613-618`; `cache_engine.py:984-995` (`update_no_compress_k_decode` shifts at `kernel_size`) |
 | A10 | `KV_BIAS_SCALE` must be applied to the provisional bias row exactly as the engine's write sites apply it. | `G.bias_rows = cache_engine._bias_rows` | `cache_engine.py:97-100`, the four write sites `:657`, `:762`, `:863`, `:411` |
 | A11 | The FAN host check wants `bias.size(0) == kcache.size(0)`; the kernel addresses query rows through `bias.stride(0)`. A storage of `>= max(R, B)` rows with the narrowed view `bias[:B]` satisfies the check for R = 2B (tick), R = B (twin) and R = n < B (restart). | `tick.attend_rows` | `dependencies/flash-attention-nosa/csrc/flash_attn_nosa/flash_api.cpp:366`; `verify/rows_attention.py:31-43` |
@@ -111,3 +111,27 @@ from `feature/nosi-verify-rows` (004f279). Line numbers below are of THIS worktr
 - The sequential restart's cost at n_rej rows vs `rest(B = 16) = 20.2 ms`; how often n_rej > 0 at B = 128.
 - The resident tick's brackets vs the twin's and the shipped step's: the added scoring pass and the
   2B-row attention (registered band for the attention: [13, 51] ms at B = 128 in the reuse ledger).
+
+## 7. Found by the GPU (E2, job 2175550) and fixed
+
+1. **V rows wrong from the tick after the first restart** (resident arm: argmax vs shipped 686/704, max
+   dlogit 7.5). The data: tick 4 torch.equal to twin2b on all 64 requests; tick 5 differs on exactly requests
+   0..27 with n_restart(4) = 28; tick 6 on 0..32 with n_restart(5) = 33. Cause: the compacted restart scoring
+   wrote the gathered compressed-cis rows of the restarted requests into `compressed_cis_buf[:, :n]`, which
+   aliases the layer's persistent table (A8), un-journaled. Fix: no compaction of the scoring (full-batch
+   stage-1 with zero-padded rows, the decode's own two copy lines), `setup` asserts the alias, a CPU
+   harness with the live alias as positive control (`test_subset_scoring_leaves_the_tables_equal...`).
+   The same corruption explains the fetch residual (+69 ms/tick at B = 64 = 1.9 GB at 25 GB/s: corrupted
+   selections churned the window at 14 blocks per stream-step vs 3.8).
+2. **equiv arms crashed** at `twin.py:103`: `position_ids[:, 0].flatten()` is a strided view; the flashinfer
+   rope checks contiguity (`rope.cu:122`). Fix: `tick.rope_positions` at every rope call; the in-situ
+   comparator records exceptions per layer instead of raising.
+3. **Host syncs in every layer's fetch bracket**: `core.paired_bias` read `cache_batch_idx.min/max` and two
+   `any()` flags on the device (4 syncs x 32 layers per call, twin and tick alike). Now `check_values` is
+   explicit (CPU tests True, the GPU body False: the values come from its own bounded rules).
+4. **Open (not fixed, to be profiled)**: the restart's `rest` bracket is 175 ms at n_rej >= 27 rows and 56 ms
+   at n_rej = 26 (a threshold, not a slope); candidates: cuBLAS kernel selection at small M, the allocator
+   for varying n. The timeline job (audit C.6) should split it.
+5. **Diagnostics added**: `InSituTwin` terms bias / qkv (pre-rope) / rope / score / selection / attention /
+   wo-FFN / norm / lm_head, `diagnose_layers` per layer of the first differing tick (printed by compare);
+   `NOSI_PAIRED_S_OFF=1` (S rows in the GEMMs and the attention call only, no seed / restart).

@@ -270,8 +270,8 @@ def assemble_rows(plan: RowPlan, vis_v: Optional[torch.Tensor], vis_s: Optional[
         parts.append(vis_s)
     W, H = parts[0].shape[1:]
     vis = torch.stack(parts, dim=1).reshape(n * plan.U, W, H)   # row i*U + u
-    if not torch.equal(plan.req, req_idx.repeat_interleave(plan.U)):
-        raise AssertionError("row plan / req_idx mismatch")
+    if plan.req.numel() != n * plan.U:
+        raise AssertionError("row plan has %d rows, req_idx x U = %d" % (plan.req.numel(), n * plan.U))   # no device read: plan.req was built from req_idx
     return vis, plan.req.to(torch.int32)
 
 
@@ -279,7 +279,7 @@ def assemble_rows(plan: RowPlan, vis_v: Optional[torch.Tensor], vis_s: Optional[
 # the rows bias (the ONE thing the attention call takes besides q / K / V)
 # ---------------------------------------------------------------------------
 def paired_bias(cis_rows: torch.Tensor, visible_rows: torch.Tensor, cache_batch_idx: torch.Tensor,
-                U: int, masked_value: float = MASKED, out: Optional[torch.Tensor] = None) -> _ra.RowsBias:
+                U: int, masked_value: float = MASKED, out: Optional[torch.Tensor] = None, *, check_values: bool) -> _ra.RowsBias:
     """cis_rows (B, W*bs, H): the engine's _kv_bias_gpu (store dtype);
     visible_rows (R, W, H) int64; cache_batch_idx (R,) int32. Returns a
     rows_attention.RowsBias: bias[r, slot*bs + i, h] = cis of request
@@ -287,7 +287,11 @@ def paired_bias(cis_rows: torch.Tensor, visible_rows: torch.Tensor, cache_batch_
     cache_seqlens = the exact extent. ``out`` (>= R rows, contiguous, the
     allocation's row shape) receives the bias in place (no allocation on the
     steady path); its storage must hold >= B rows for the kernel's host check
-    (rows_attention.py: the narrowed view)."""
+    (rows_attention.py: the narrowed view). ``check_values`` reads the index /
+    row tensors on the host (4 device syncs): the CPU tests pass True; the GPU
+    body passes False because both come from its own bounded rules
+    (v_visible_rows / s_visible_rows / row_plan) -- job 2175550 showed the
+    syncs inside every layer's fetch bracket."""
     if cis_rows.dim() != 3 or not cis_rows.is_floating_point():
         raise ValueError("cis_rows must be a floating (B, W*bs, H), got %s %s" % (cis_rows.dtype, tuple(cis_rows.shape)))
     B, rows, H = cis_rows.shape
@@ -299,10 +303,11 @@ def paired_bias(cis_rows: torch.Tensor, visible_rows: torch.Tensor, cache_batch_
     bs = rows // W
     if cache_batch_idx.dtype != torch.int32 or tuple(cache_batch_idx.shape) != (R,):
         raise ValueError("cache_batch_idx must be int32 (R=%d,), got %s %s" % (R, cache_batch_idx.dtype, tuple(cache_batch_idx.shape)))
-    if R > 0 and (int(cache_batch_idx.min()) < 0 or int(cache_batch_idx.max()) >= B):
-        raise ValueError("cache_batch_idx must index requests 0..B-1=%d" % (B - 1))
-    if bool((visible_rows < 0).any()) or bool((visible_rows > bs).any()):
-        raise ValueError("visible_rows must lie in [0, bs=%d]" % bs)
+    if check_values:
+        if R > 0 and (int(cache_batch_idx.min()) < 0 or int(cache_batch_idx.max()) >= B):
+            raise ValueError("cache_batch_idx must index requests 0..B-1=%d" % (B - 1))
+        if bool((visible_rows < 0).any()) or bool((visible_rows > bs).any()):
+            raise ValueError("visible_rows must lie in [0, bs=%d]" % bs)
     dev = cis_rows.device
     cis = cis_rows.index_select(0, cache_batch_idx.to(torch.int64)).view(R, W, bs, H)
     vis = torch.arange(bs, dtype=torch.int64, device=dev).view(1, 1, bs, 1) < visible_rows.unsqueeze(2)   # (R, W, bs, H)

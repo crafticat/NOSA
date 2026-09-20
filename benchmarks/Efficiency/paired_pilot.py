@@ -29,7 +29,11 @@ per arm (the engine reads its layout knobs at import). NOSI_PAIRED_MODE:
             RESTART for the rejected requests (S rows at L+t+1 on forced[t+1]),
             the per-(layer, head, request) accounts. NOSI_PAIRED_POISON=1:
             the provisional rows are NaN-poisoned after every S write's call
-            (G1 / G7): a non-finite logit REFUSES the arm.
+            (G1 / G7): a non-finite logit REFUSES the arm. With
+            NOSI_PAIRED_S_OFF=1 (debug): the S rows stay in the GEMMs and the
+            attention call but score nothing, write nothing and attend V's
+            mask; no seed, no restart -- if V is then bit-exact to the twin,
+            the contamination path is in what S touches.
   resident  the same tick loop WITHOUT the in-situ twin: the timing arm
             (tick / restart brackets; the twin and the shipped step are timed
             in their own arms in the same job).
@@ -382,15 +386,19 @@ def run_paired(path, ids, insitu_on: bool):
     vt = _vtr.VerifyTrace(model.num_layers)
     state = C.DraftState(B, device="cuda")
     ledger = C.Ledger()
-    pos = position_ids[:, 0]                       # (B,) the committed position tau = L + WARM
-    # THE SEED: S rows at L+WARM on forced[WARM] -> the draft for L+WARM+1 (spec section 3: the first tick needs an S input)
-    vt.label(("seed", WARM))
-    seed = Tk.s_rows_forward(model, cache, sc, cfg, forced[:, WARM], pos, sc.req_all, trace=vt)
-    torch.cuda.synchronize()
-    state.apply_restart(sc.req_all, seed.logits_v.argmax(-1))
-    ledger.add_restart(WARM - 1, rows=B, ms=None, layers=seed.accounts)
-    if any(p is None for p in sc.prev_sel_s):
-        die("the seed left a layer without an S prediction")
+    pos = position_ids[:, 0].contiguous()          # (B,) the committed position tau = L + WARM
+    s_off = bool(cfg.s_off)
+    if s_off:
+        print("[paired_pilot] NOSI_PAIRED_S_OFF=1: S rows present in the GEMMs / attention only; no seed, no restart", flush=True)
+    else:
+        # THE SEED: S rows at L+WARM on forced[WARM] -> the draft for L+WARM+1 (spec section 3: the first tick needs an S input)
+        vt.label(("seed", WARM))
+        seed = Tk.s_rows_forward(model, cache, sc, cfg, forced[:, WARM], pos, sc.req_all, trace=vt)
+        torch.cuda.synchronize()
+        state.apply_restart(sc.req_all, seed.logits_v.argmax(-1))
+        ledger.add_restart(WARM - 1, rows=B, ms=None, layers=seed.accounts)
+        if any(p is None for p in sc.prev_sel_s):
+            die("the seed left a layer without an S prediction")
     ticks, diags, committed_rows, greedy_rows, non_finite = [], [], [], [], 0
     for t in range(WARM, N):
         v_tok = forced[:, t]
@@ -413,7 +421,7 @@ def run_paired(path, ids, insitu_on: bool):
         greedy_agree = v_arg == committed
         prod_accept = had_draft & (s_tok == v_arg)                    # production-style accept: the draft equals argmax(V)
         n_restart = 0
-        if t < N - 1:
+        if t < N - 1 and not s_off:
             vt.label(("restart", t))
             n_restart, r_accts = Tk.restart_after(model, cache, sc, cfg, state, outcome, committed, pos + 1, trace=vt)
             torch.cuda.synchronize()
@@ -427,11 +435,15 @@ def run_paired(path, ids, insitu_on: bool):
             d = TW.diagnose(res.insitu)
             rec["insitu"] = res.insitu
             rec["diagnosis"] = d
+            rec["diagnosis_layers"] = TW.diagnose_layers(res.insitu)
             diags.append(d)
         ticks.append(rec)
         print("[paired_pilot] tick %d: accept %d/%d (prod-style %d/%d)  greedy agree %d/%d  restart rows %d%s" % (
             t, rec["accepted"], B, rec["prod_accept"], B, rec["greedy_agree"], B, n_restart,
-            ("  in-situ: %s" % (d or "all terms torch.equal")) if insitu is not None else ""), flush=True)
+            ("  in-situ: %s (%d layers depart)" % (d or "all terms torch.equal", len(rec["diagnosis_layers"]))) if insitu is not None else ""), flush=True)
+        if insitu is not None and rec["diagnosis_layers"]:
+            for line in rec["diagnosis_layers"][:6]:
+                print("[paired_pilot]     " + line, flush=True)
         pos = pos + 1
     if non_finite:
         die("%d ticks produced non-finite logits under POISON=%s: a row read the provisional slot without writing it (G1/G7)" % (non_finite, cfg.poison))
@@ -451,7 +463,7 @@ def run_paired(path, ids, insitu_on: bool):
              summary.get("v_miss_bytes_per_committed_token", float("nan")), summary.get("prefetch_precision"), summary.get("prefetch_recall")), flush=True)
     for r in timing:
         print("[paired_pilot] %s %d: %.1f ms (score %.1f fetch %.1f attn %.1f rest %.1f)" % (r["label"][0], r["label"][1], r["total_ms"], r["score_ms"], r["fetch_ms"], r["attn_ms"], r["rest_ms"]), flush=True)
-    return dict(meta, cfg=cfg._asdict(), insitu=insitu_on, logits=out, hashes=[[sha(out[b, r]) for r in range(N + 1)] for b in range(B)],
+    return dict(meta, cfg=cfg._asdict(), insitu=insitu_on, s_off=s_off, logits=out, hashes=[[sha(out[b, r]) for r in range(N + 1)] for b in range(B)],
                 greedy_tokens=torch.stack(greedy_rows, 1).cpu(), committed_tokens=torch.stack(committed_rows, 1).cpu(),
                 calls=timing, ticks=ticks, ledger_ticks=[_cpu_tick_record(r) for r in ledger.ticks], ledger_restarts=[_cpu_tick_record(r) for r in ledger.restarts],
                 summary=summary, diagnoses=diags, peak_gb=torch.cuda.max_memory_allocated() / 1e9, reserved_gb=torch.cuda.max_memory_reserved() / 1e9)
@@ -522,11 +534,16 @@ def compare() -> int:
                 t_bad = g3["first_bad"] - 1
                 diag = None
                 if d.get("insitu"):
-                    diag = next((r.get("diagnosis") for r in d["ticks"] if r["tick"] == t_bad), None)
+                    trec = next((r for r in d["ticks"] if r["tick"] == t_bad), None)
+                    diag = (trec or {}).get("diagnosis")
                     diag = diag or "in-situ: every term torch.equal at tick %d -- the difference is CARRIED from an earlier row (state), not produced here" % t_bad
+                    for line in (trec or {}).get("diagnosis_layers", []):
+                        lines.append("| diag[B=%d,%s tick %d] | - | %s |" % (B, name, t_bad, line))
                 else:
                     diag = "no in-situ record (resident arm); see the equiv arm's diagnosis"
                 detail += "; first differing row %d (tick %d): %s" % (g3["first_bad"], t_bad, diag)
+            if d.get("s_off"):
+                name = name + "[S_OFF]"
             gate("G3[B=%d,%s vs twin]" % (B, name), g3["all_equal"], detail)
             verdict = ["G3-exact(twin)=%s" % ("PASS" if g3["all_equal"] else "FAIL")]
             # the author's gate: exact GREEDY equivalence to the optimized ordinary target (the shipped decode rows)
