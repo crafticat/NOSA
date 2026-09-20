@@ -71,6 +71,26 @@ import, so each layout is its own process; NOSI_VERIFY_MODE):
             formula today; the JSON is written so it can replace that formula).
             Exit code = requested cells (NOSI_VERIFY_COST_BATCHES x U_LIST) with
             no timed call + a failed hygiene probe.
+  timeline  CUDA TIMELINE of the verify call (the DIAGNOSTIC arm, ledger 2026-09-20:
+            what the cost brackets contain). At NOSI_VERIFY_DOCS = batch, for every U
+            of NOSI_TIMELINE_U ("1 2"), all at gate step WARM with the light snapshot
+            around every round: NOSI_TIMELINE_WARM (2) unprofiled warm-up rounds (their
+            event brackets are harvested: the unprofiled reference), then
+            NOSI_TIMELINE_CALLS (3) rounds under torch.profiler (kineto, CPU + CUDA
+            activities), ONLY the verify_inference call inside record_function
+            ("verify_call") and the four brackets of verify_trace.py as record_function
+            ranges too (verify_timeline.TimelineTrace: score / fetch / attention / rest,
+            non-overlapping, covering the call). Then the NOSI_TIMELINE_CALLS shipped
+            decode steps at WARM+1 .. WARM+CALLS under one profiler session, each call
+            in record_function("decode_call"). Per session: <tag>.json.gz (the chrome
+            trace), <tag>.txt (key_averages by CUDA time), <tag>_launches.json (kernel
+            launches and kernel ms per call, ANNOTATIONS EXCLUDED: kineto mirrors every
+            range onto the GPU timeline, job 2175353 counted them), and
+            timeline_manifest.json for the analyzer
+            (retroinfer-eval scripts/verify_timeline_report.py: per bracket the kernel
+            time by family, wall vs kernel-sum = host gaps and their largest host ops,
+            copy/SM overlap across streams). Profiled calls carry profiler overhead:
+            their brackets are NOT cost numbers; the cost table is the cost mode's.
 
 Alignment (spec 5d, ledger). The decode arm's tensor is (B, N+1, V): row 0 is
 the prefill row (predicts forced[0]); row r >= 1 is decode step r-1, which
@@ -86,6 +106,7 @@ length where the round region is fetched), NOSI_VERIFY_N (12), NOSI_VERIFY_WARM
 PG-19 documents when the batch exceeds them), NOSI_VERIFY_U (verify_u),
 NOSI_VERIFY_U_LIST ("1 2 3 5", cost), NOSI_VERIFY_TAU_CTRL (compare; no default),
 NOSI_VERIFY_COST_HYG (cost), NOSI_VERIFY_COST_BATCHES ("64 128", cost_table),
+NOSI_TIMELINE_U ("1 2"), NOSI_TIMELINE_CALLS (3), NOSI_TIMELINE_WARM (2) (timeline),
 NOSI_VERIFY_ROUND_SLOTS (read by the engine at import).
 """
 import hashlib
@@ -108,6 +129,10 @@ U = int(os.environ.get("NOSI_VERIFY_U", "1"))                                   
 U_LIST = tuple(int(x) for x in os.environ.get("NOSI_VERIFY_U_LIST", "1 2 3 5").split())   # cost (no commas: apptainer --env splits on them)
 COST_HYG = os.environ.get("NOSI_VERIFY_COST_HYG", "0") == "1"
 COST_BATCHES = tuple(int(x) for x in os.environ.get("NOSI_VERIFY_COST_BATCHES", "64 128").split())
+TL_U = tuple(int(x) for x in os.environ.get("NOSI_TIMELINE_U", "1 2").split())        # timeline: U per profiled session
+TL_CALLS = int(os.environ.get("NOSI_TIMELINE_CALLS", "3"))                            # timeline: profiled calls per U, and profiled decode steps
+TL_WARM = int(os.environ.get("NOSI_TIMELINE_WARM", "2"))                              # timeline: unprofiled warm-up rounds per U
+CYCLING_MODES = ("cost", "timeline")                                                  # the modes that may repeat PG-19 documents to fill a batch
 os.makedirs(OUT, exist_ok=True)
 
 
@@ -134,11 +159,16 @@ def read_tau_ctrl() -> float:
 
 def check_budget():
     # the gate set is WARM .. N-U; the warm-up step (a shipped decode) must precede any verify
-    u_max = max(U_LIST) if MODE == "cost" else U
+    u_max = max(U_LIST) if MODE == "cost" else (max(TL_U) if MODE == "timeline" else U)
     if u_max < 1:
         die("U must be >= 1")
     if not (1 <= WARM <= N - u_max):
         die("need 1 <= WARM=%d <= N-U=%d (the warm-up decode step precedes every verify; a round of U=%d at step t needs decode rows up to t+U <= N)" % (WARM, N - u_max, u_max))
+    if MODE == "timeline":
+        if TL_CALLS < 1 or TL_WARM < 0:
+            die("NOSI_TIMELINE_CALLS must be >= 1 and NOSI_TIMELINE_WARM >= 0")
+        if WARM + TL_CALLS > N - 1:
+            die("timeline profiles the shipped decode steps WARM+1 .. WARM+CALLS = %d .. %d; need WARM + CALLS <= N-1 = %d" % (WARM + 1, WARM + TL_CALLS, N - 1))
     # keep the whole trace inside one tail block: no write-back, no rollover, no host-window question
     # (a round at step t <= N-U writes tail rows up to (L % 64) + t + U - 1 <= (L % 64) + N - 1)
     if (L % 64) + N >= 64:
@@ -166,11 +196,11 @@ def load_docs(path):
     distinct = len(rows)
     assert distinct >= 1, "no document with >= %d tokens" % (L + N + 1)
     if distinct < NDOCS:
-        # only the cost mode may cycle: a batch of 64/128 requests from PG-19 test's qualifying
-        # documents (the sweeps repeated ONE document B times, test_nosa_pg19.py:142; a cycle of
-        # distinct documents keeps the per-request selections different). A gate arm must not.
-        if MODE != "cost":
-            die("only %d documents with >= %d tokens, %d requested (cycling is allowed in cost mode only)" % (distinct, L + N + 1, NDOCS))
+        # only the cost and timeline modes may cycle: a batch of 64/128 requests from PG-19 test's
+        # qualifying documents (the sweeps repeated ONE document B times, test_nosa_pg19.py:142; a
+        # cycle of distinct documents keeps the per-request selections different). A gate arm must not.
+        if MODE not in CYCLING_MODES:
+            die("only %d documents with >= %d tokens, %d requested (cycling is allowed in the %s modes only)" % (distinct, L + N + 1, NDOCS, "/".join(CYCLING_MODES)))
         rows = [rows[i % distinct] for i in range(NDOCS)]
         ids = [ids[i % distinct] for i in range(NDOCS)]
     return torch.stack(ids), rows, distinct
@@ -349,7 +379,7 @@ def _setup(path, ids, need_round_slots: bool):
     if _ce.POOL_BLOCKS != 0:
         die("NOSI_POOL_BLOCKS must be 0 for this pilot")
     print("[pilot] mode=%s tag=%s L=%d N=%d warm=%d docs=%d U=%s ROUND_SLOTS=%d KV_BIAS_SCALE=%s ATTN_SPLITS=%s"
-          % (MODE, TAG, L, N, WARM, NDOCS, U_LIST if MODE == "cost" else U, R, _ce.KV_BIAS_SCALE, os.environ.get("NOSI_ATTN_SPLITS", "0")), flush=True)
+          % (MODE, TAG, L, N, WARM, NDOCS, U_LIST if MODE == "cost" else (TL_U if MODE == "timeline" else U), R, _ce.KV_BIAS_SCALE, os.environ.get("NOSI_ATTN_SPLITS", "0")), flush=True)
     model = Llama(model_name=path, device="cuda", offload=True)
     B = ids.shape[0]
     x = ids.to("cuda")
@@ -538,6 +568,135 @@ def run_cost(path, ids, distinct: int):
     return payload
 
 
+def _export_profile(prof, tag: str, ranges, n_calls: int) -> dict:
+    """One profiler session -> <tag>.txt (key_averages), <tag>.json.gz (chrome
+    trace), <tag>_launches.json. Kernel sums count DEVICE events only and
+    exclude the record_function ranges kineto mirrors onto the GPU timeline
+    (``ranges``; the stage-2 lesson of job 2175353: ProfilerStep annotations
+    doubled the 'kernel' time), so kernel_ms_per_call is comparable to wall."""
+    with open(os.path.join(OUT, tag + ".txt"), "w") as f:
+        f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=80))
+    skip = set(ranges)
+    evs = [e for e in prof.events() if getattr(e, "device_type", None) is not None and str(e.device_type).endswith("CUDA")
+           and e.name not in skip and not e.name.startswith("ProfilerStep") and not e.name.startswith("[")]
+    kernel_us = sum(e.time_range.elapsed_us() for e in evs)
+    t0 = min((e.time_range.start for e in evs), default=0)
+    t1 = max((e.time_range.end for e in evs), default=0)
+    info = dict(tag=tag, calls=n_calls, kernel_launches=len(evs), kernel_launches_per_call=len(evs) / max(1, n_calls),
+                kernel_ms_per_call=kernel_us / 1e3 / max(1, n_calls), session_wall_ms=(t1 - t0) / 1e3, excluded_ranges=sorted(skip))
+    with open(os.path.join(OUT, tag + "_launches.json"), "w") as f:
+        json.dump(info, f, indent=1)
+    prof.export_chrome_trace(os.path.join(OUT, tag + ".json.gz"))
+    print("[timeline] %s: %d calls, %.0f kernel launches/call, %.1f kernel ms/call (device events, ranges excluded), session wall %.1f ms"
+          % (tag, n_calls, info["kernel_launches_per_call"], info["kernel_ms_per_call"], info["session_wall_ms"]), flush=True)
+    return info
+
+
+@torch.inference_mode()
+def run_timeline(path, ids, distinct: int):
+    """The diagnostic arm (module docstring, 'timeline'): kineto traces of
+    TL_CALLS verify calls per U of TL_U at gate step WARM, then of TL_CALLS
+    shipped decode steps; light snapshot around every round."""
+    import torch.profiler as _tp
+    from nosi import state_snapshot as ss
+    from nosi import verify_trace as _vtr
+    from nosi import verify_timeline as _vtl
+    from nosi.verify.verify_step import RoundOverflow
+    model, cache, logits, position_ids, forced, meta = _setup(path, ids, need_round_slots=True)
+    B = ids.shape[0]
+    position_ids = position_ids[:, -1:] + 1
+    cu = torch.arange(0, B + 1, dtype=torch.int, device="cuda")
+    ar = torch.arange(max(TL_U), device="cuda", dtype=position_ids.dtype).unsqueeze(0)
+    vt = _vtl.TimelineTrace(model.num_layers)          # CUDA-event brackets (the cross-check) + record_function ranges
+    _vtr.TRACE = vt
+    light = ss.CounterSnapshot(cache)
+    trans = None
+    ranges = list(_vtl.CALL_RANGES) + list(_vtl.BRACKETS)
+    activities = [_tp.ProfilerActivity.CPU, _tp.ProfilerActivity.CUDA]
+    sessions, bracket_rows = [], []
+    dec_ev = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(N)]
+
+    def round_once(Uc, it, profiled: bool) -> bool:
+        """snapshot -> verify_inference (inside record_function('verify_call') when profiled) -> sync -> restore."""
+        toks, pos = forced[:, it:it + Uc], position_ids + ar[:, :Uc]
+        light.take()
+        vt.label((Uc, it, int(profiled)))
+        ok = True
+        try:
+            if profiled:
+                with _tp.record_function("verify_call"):
+                    model.verify_inference(toks, cu, pos, cache)
+            else:
+                model.verify_inference(toks, cu, pos, cache)
+            torch.cuda.synchronize()                    # outside the range: the range is the call, the sync is the driver's
+        except RoundOverflow as e:
+            torch.cuda.synchronize()
+            vt.abort_call()
+            ok = False
+            print("[timeline] U=%d step %d: %s" % (Uc, it, e), flush=True)
+        light.restore(); ss.assert_transients_intact(model, trans)
+        return ok
+
+    dec_prof = None
+    for it in range(N):
+        tok = forced[:, it:it + 1]
+        if it == WARM:
+            trans = ss.transient_ids(model)
+            for Uc in TL_U:
+                vt.reset()
+                n_warm = sum(int(round_once(Uc, it, False)) for _ in range(TL_WARM))
+                for r in vt.harvest():
+                    bracket_rows.append(dict(r, U=Uc, kind="verify", profiled=0))
+                vt.reset()
+                with _tp.profile(activities=activities) as prof:
+                    n_ok = sum(int(round_once(Uc, it, True)) for _ in range(TL_CALLS))
+                    torch.cuda.synchronize()
+                for r in vt.harvest():
+                    bracket_rows.append(dict(r, U=Uc, kind="verify", profiled=1))
+                tag = "timeline_b%d_u%d" % (B, Uc)
+                info = _export_profile(prof, tag, ranges, n_ok)
+                sessions.append(dict(info, kind="verify", U=Uc, step=it, warm_rounds=n_warm, file=tag + ".json.gz",
+                                     call_range="verify_call", brackets=list(_vtl.BRACKETS)))
+        profiled_dec = WARM < it <= WARM + TL_CALLS
+        if it == WARM + 1:
+            dec_prof = _tp.profile(activities=activities)
+            dec_prof.__enter__()
+        e0, e1 = dec_ev[it]
+        e0.record()
+        if profiled_dec:
+            with _tp.record_function("decode_call"):
+                lg = model.decode_inference(tok, cu, position_ids, cache, warmup=(it == 0))
+        else:
+            lg = model.decode_inference(tok, cu, position_ids, cache, warmup=(it == 0))
+        e1.record()
+        torch.cuda.synchronize()
+        if it == WARM + TL_CALLS:
+            dec_prof.__exit__(None, None, None)
+            tag = "timeline_b%d_decode" % B
+            info = _export_profile(dec_prof, tag, ranges, TL_CALLS)
+            sessions.append(dict(info, kind="decode", U=1, step=it, warm_rounds=0, file=tag + ".json.gz",
+                                 call_range="decode_call", brackets=[]))
+            dec_prof = None
+        position_ids = position_ids + 1
+    _vtr.TRACE = None
+    decode_ms = [dec_ev[it][0].elapsed_time(dec_ev[it][1]) for it in range(N)]
+    unprofiled = [decode_ms[it] for it in range(WARM, N) if not (WARM < it <= WARM + TL_CALLS)]
+    payload = dict(meta, U_list=list(TL_U), calls=TL_CALLS, warm_rounds=TL_WARM, distinct_docs=distinct, sessions=sessions,
+                   brackets=bracket_rows, decode_ms=decode_ms, decode_step_ms=sum(unprofiled) / max(1, len(unprofiled)),
+                   profiled_decode_steps=[it for it in range(N) if WARM < it <= WARM + TL_CALLS],
+                   peak_gb=torch.cuda.max_memory_allocated() / 1e9, reserved_gb=torch.cuda.max_memory_reserved() / 1e9)
+    manifest = dict(batch=B, L=L, N=N, warm=WARM, round_slots=meta["round_slots"], W=meta["W"], U_list=list(TL_U), calls=TL_CALLS,
+                    decode_step_ms_unprofiled=payload["decode_step_ms"], sessions=sessions, brackets=bracket_rows)
+    with open(os.path.join(OUT, "timeline_manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=1)
+    for r in bracket_rows:
+        print("[timeline] U=%d %s: %.1f ms (score %.1f fetch %.1f attn %.1f rest %.1f) over %d layers"
+              % (r["U"], "profiled" if r["profiled"] else "unprofiled", r["total_ms"], r["score_ms"], r["fetch_ms"], r["attn_ms"], r["rest_ms"], r["layers"]), flush=True)
+    print("[timeline] decode step ms per step: %s -> unprofiled mean over steps >= %d = %.1f (profiled steps %s)"
+          % (" ".join("%.1f" % m for m in decode_ms), WARM, payload["decode_step_ms"], payload["profiled_decode_steps"]), flush=True)
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # reports
 # ---------------------------------------------------------------------------
@@ -665,6 +824,8 @@ if __name__ == "__main__":
         payload = run_trace(path, ids, with_verify=True, U=U)
     elif MODE == "cost":
         payload = run_cost(path, ids, distinct)
+    elif MODE == "timeline":
+        payload = run_timeline(path, ids, distinct)
     else:
         raise SystemExit("unknown NOSI_VERIFY_MODE %r" % MODE)
     payload["docs"] = rows
