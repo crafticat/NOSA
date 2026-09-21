@@ -214,10 +214,6 @@ class Scratch:
         self.prefetch = None                                                            # prefetch.PrefetchEngine when NOSI_PAIRED_PREFETCH=ring (setup_prefetch)
         self.tail_seq0 = None                                                           # engine seq_length at setup: tail_id_host derives T without a device read
 
-    def tail_id_host(self, eng) -> int:
-        """The live tail block id T = seq_length // bs from the engine's HOST
-        counter (one per engine; cache_engine.py prefill_update: _block_map[..., tail] = S // bs)."""
-        return int(eng.seq_length) // int(self.lay.bs)
         self.journals = [_sl.LayerJournal() for _ in range(model.num_layers)]
         self.slot_complete = [False] * model.num_layers                            # slot topk-1 holds a complete block (after a fill)
         self.prev_sel_s: List[Optional[torch.Tensor]] = [None] * model.num_layers  # (H, B, K) int64: S's selection for the NEXT V position
@@ -226,6 +222,11 @@ class Scratch:
         self.key_pad = torch.zeros((self.B, 1, H, D), dtype=dtype, device=dev)
         self.cis_pad = torch.zeros((self.B, 1, H), dtype=dtype, device=dev)
         self.q_pad = torch.zeros((self.B, int(model.num_heads), D), dtype=dtype, device=dev)   # the subset's q rows scattered into a full-batch stage-1 call
+
+    def tail_id_host(self, eng) -> int:
+        """The live tail block id T = seq_length // bs from the engine's HOST
+        counter (one per engine; cache_engine.py prefill_update: _block_map[..., tail] = S // bs)."""
+        return int(eng.seq_length) // int(self.lay.bs)
 
 
 @torch.inference_mode()   # the engine's tensors are inference tensors: the zero-fill below is an in-place write on them (state_snapshot.py, job 2174640)

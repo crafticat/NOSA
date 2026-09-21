@@ -1103,6 +1103,37 @@ def _scratch_world(R, B=2, tail_len=5, seed=21):
     return eng, sc
 
 
+@pytest.mark.parametrize("R", [0, 62], ids=["narrow", "union"])
+def test_scratch_is_ready_for_first_forward_before_tail_id_is_queried(R):
+    """Catch init state stranded below tail_id_host's return (E4 regression).
+
+    Exercise the twin/paired first row-plan consumer and the subset-restart
+    writes using real Scratch storage; no CUDA kernels or fabricated Scratch.
+    """
+    eng, sc = _scratch_world(R)
+    v_plan = core.row_plan(sc.req_all, True, False)
+    vs_plan = core.row_plan(sc.req_all, True, True)
+    assert v_plan.req.tolist() == [0, 1]
+    assert vs_plan.req.tolist() == [0, 0, 1, 1]
+    assert sc.cu_full.tolist() == [0, 1, 2]
+    assert sc.cu_full.dtype == torch.int32
+
+    # Restarting request 1 must have writable full-batch padding while
+    # request 0 remains zero. The same tensors feed score_position.
+    for pad in (sc.key_pad, sc.cis_pad, sc.q_pad):
+        pad[1].fill_(3)
+        assert torch.count_nonzero(pad[0]) == 0
+        assert torch.all(pad[1] == 3)
+    assert len(sc.journals) == 1 and isinstance(sc.journals[0], sl.LayerJournal)
+    assert sc.slot_complete == [False] and sc.prev_sel_s == [None]
+
+    # The helper derives the current tail id, without acting as a deferred
+    # initializer or replacing the already populated restart buffers.
+    eng.seq_length = 301 * BS + 7
+    assert sc.tail_id_host(eng) == 301
+    assert torch.all(sc.key_pad[1] == 3)
+
+
 @pytest.mark.parametrize("R", [62, 0], ids=["union-R62", "narrow-R0"])
 @pytest.mark.parametrize("kind", ["paired", "twin", "restart"])
 def test_fused_args_through_scratch_at_round_slots(R, kind):
