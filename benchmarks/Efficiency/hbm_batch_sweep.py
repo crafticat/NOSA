@@ -81,6 +81,7 @@ REPS_RES_GATED = int(os.environ.get("HBM_REPS_RES_GATED", "3"))
 SLEEP_MS = float(os.environ.get("HBM_SLEEP_MS", "50"))
 CAPTURE = os.environ.get("HBM_CAPTURE", "1") == "1"
 MEM_HISTORY_MAX_B = int(os.environ.get("HBM_MEM_HISTORY_MAX_B", "64"))
+P_MULTIPASS_MAX_B = int(os.environ.get("HBM_P_MULTIPASS_MAX_B", "64"))   # stage P cap when no metric set is single-pass
 TAG = os.environ.get("HBM_TAG") or ("c%d_b%d" % (C, B))
 CELL_DIR = os.path.join(OUT, TAG)
 P_POOL = C - 63
@@ -1033,6 +1034,7 @@ class Orchestrator:
             if sp and chosen is None:
                 chosen = (name, metrics)
                 break
+        self.p_single_pass = chosen is not None
         if chosen is None:
             chosen = sets[-1]
         HL.write_json(os.path.join(self.dir, "passprobe.json"), dict(sets=lines, chosen=dict(name=chosen[0], metrics=chosen[1])))
@@ -1115,6 +1117,13 @@ class Orchestrator:
                 cc = parts[2] if len(parts) > 2 else "none"
                 tag = "c%d_b%d" % (c, b) + ("" if cc == "none" else "_cache%s" % cc)
                 if tag in done:
+                    break
+                if not getattr(self, "p_single_pass", True) and b > P_MULTIPASS_MAX_B:
+                    # review NB (2026-09-23): no metric set is single-pass, so kernel replay would save/restore
+                    # device memory at 60-77 GB allocated; keep stage P at B <= 64 and record the rest, never silently.
+                    self.record(kind="ncu_cell", C=c, B=b, tag=tag, status="NOT_RUN", cls="multi_pass_metric_set",
+                                detail="no single-pass metric set; profiled cells capped at B <= %d" % P_MULTIPASS_MAX_B)
+                    done.add(tag)
                     break
                 if self.remaining() < HL.cell_estimate_s("P", b) and k + 1 < len(item.split("|")):
                     self.record(kind="ncu_cell", C=c, B=b, tag=tag, status="DEFERRED", cls="IMPLEMENTATION_LIMIT:time_budget",
