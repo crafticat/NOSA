@@ -119,6 +119,24 @@ def run(model, ids):
                 gather_k(k_s[:, m * bs:(m + 1) * bs], e._k_cpu, ids_m, bs)
                 gather_v_bias(v_s[:, m * bs:(m + 1) * bs], e._v_cpu, b_s[:, m * bs:(m + 1) * bs], lay.total_cis, ids_m, bs)
 
+    # E5 control: the SAME throttled kernel reading from DEVICE memory (HBM) instead of pinned host memory -- same CTAs, same
+    # item loop, no PCIe / UVA reads. If the step's slowdown persists with this source, the cause is the resident gather CTAs
+    # (occupancy / launch path); if it vanishes, the cause is the queue of host reads.
+    k_dev = torch.empty((B, Dmax * bs, H, Dh), dtype=e0._k_gpu.dtype, device="cuda"); k_dev.copy_(e0._k_cpu[:, :Dmax * bs])
+    v_dev = torch.empty_like(k_dev); v_dev.copy_(e0._v_cpu[:, :Dmax * bs])
+
+    def side_persistent_hbm(D, ids_hbd, n_ctas):
+        n = D * bs
+        for _ in engines:
+            flash_h2d_persistent(k_s[:, :n], k_dev, ids_hbd, bs, n_ctas=n_ctas)
+            flash_h2d_persistent(v_s[:, :n], v_dev, ids_hbd, bs, n_ctas=n_ctas)
+
+    def side_persistent_cv(D, ids_hbd, n_ctas):
+        n = D * bs
+        for e in engines:
+            flash_h2d_persistent(k_s[:, :n], e._k_cpu, ids_hbd, bs, n_ctas=n_ctas, bypass_cache=True)
+            flash_h2d_persistent(v_s[:, :n], e._v_cpu, ids_hbd, bs, n_ctas=n_ctas, bypass_cache=True)
+
     def side_persistent(D, ids_hbd, n_ctas):
         n = D * bs
         for e in engines:                              # K and V through the throttled kernel (no bias: timing only)
@@ -201,7 +219,11 @@ def run(model, ids):
                         "memcpy_pinned": (lambda: side_memcpy_pinned(D), None), "triton_mainhi": (lambda: side_triton(D, ids_hbd), main_hi),
                         "memcpy_pinned_mainhi": (lambda: side_memcpy_pinned(D), main_hi), "triton_chunked": (lambda: side_triton_chunked(D, ids_hbd), None),
                         "persistent8": (lambda: side_persistent(D, ids_hbd, 8), None), "persistent32": (lambda: side_persistent(D, ids_hbd, 32), None),
-                        "persistent108": (lambda: side_persistent(D, ids_hbd, 108), None)}
+                        "persistent108": (lambda: side_persistent(D, ids_hbd, 108), None),
+                        "persistent1": (lambda: side_persistent(D, ids_hbd, 1), None), "persistent2": (lambda: side_persistent(D, ids_hbd, 2), None),
+                        "persistent4": (lambda: side_persistent(D, ids_hbd, 4), None),
+                        "persistent8_cv": (lambda: side_persistent_cv(D, ids_hbd, 8), None),
+                        "persistent8_hbm": (lambda: side_persistent_hbm(D, ids_hbd, 8), None)}
             arms = [(a, all_arms[a][0], all_arms[a][1]) for a in ARMS if a in all_arms]
             for arm, fn_side, mstream in arms:
                 tS, hS = [], []
