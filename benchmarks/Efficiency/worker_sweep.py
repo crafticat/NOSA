@@ -11,14 +11,24 @@ What is fixed and checked here:
       workersW   the existing throttled persistent Triton gather (flash_h2d_persistent.py) with W CTAs of 128 threads
       dma2d      the matched copy-engine reference: cudaMemcpy2DAsync of exactly those bytes (per layer, K and V:
                  B rows of D x 64 x H x Dh x 2 bytes at the host cache's request pitch) into the same scratch
-  * OVERLAP: per concurrent rep the side interval must cover >= 95% of the step's interval (overlap_frac); the side
-    is sized (repeat passes) to last >= 1.2 x the step alone.
+      hisparseW_<item>  SGLang HiSparse's copy-only kernel (copy_cache_planned_kernel, sglang 87db743, vendored
+                 verbatim in nosi/flash_cache_engine/hisparse_copy/) with a grid of W blocks x WS_HS_THREADS threads, one
+                 launch per layer (K and V), fed a plan built from the SAME ids by hisparse_copy/plan.py:
+                 i256 = one token row of one head per item (the exact per-head adapter), i32k = one (request, block) with
+                 both heads per item (exact here: both heads load blocks 0..D-1 into slots 0..D-1). A threads value other
+                 than 1024 adds '_t<threads>' to the arm name. Plan-build time (host, upload, device) is recorded per
+                 (D, item), outside every bracket.
+  * OVERLAP: per concurrent rep the side interval must cover >= 95% of the step's interval (overlap_frac). SIZING
+    (side_sizing.py): passes so the side lasts >= 1.2 x the step alone, then a TRIAL concurrent bracket, raising
+    passes until the side lasts >= 1.15 x the CONCURRENT step (<= WS_SIZE_TRIALS trials; the miniature's 16-CTA
+    arm had overlap 0.92 because the slowed step outlasted a side sized from the step alone).
   * CORRECTNESS: every timed step loads 0 blocks and its logits are torch.equal to the flushed reference step; after
     every transfer rep the scratch equals the source blocks of the last layer (torch.equal).
   * STATE: a LIGHT restore (state_snapshot.CounterSnapshot with the post-reference map), so a near-capacity batch fits.
   * NUMA: /proc/self/numa_maps pages per node for NOSI's host cache, the process CPU affinity and node cpulists.
 Env: WS_B (64), WS_D ('8 16'), WS_WORKERS ('1 2 4 8 16'), WS_N (8), WS_WARM (4), WS_REPS (5), WS_L (16128), WS_OUT, WS_TAG,
-WS_SLEEP_MS (15). Mode WS_MODE=run | table.
+WS_SLEEP_MS (15), WS_HS_BLOCKS ('1 2 4 8 16'; empty = no HiSparse arm), WS_HS_THREADS ('1024'; 256 and/or 1024),
+WS_HS_ITEMS ('i256 i32k'), WS_SIZE_TRIALS (3). Mode WS_MODE=run | table.
 """
 import ctypes
 import json
@@ -36,16 +46,37 @@ os.environ.setdefault("NOSI_ALONE_D", "0")
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
+import side_sizing as SZ  # noqa: E402
 import verify_alone as VA  # noqa: E402
 
 D_LIST = tuple(int(x) for x in os.environ.get("WS_D", "8 16").split())
 WORKERS = tuple(int(x) for x in os.environ.get("WS_WORKERS", "1 2 4 8 16").split())
+HS_BLOCKS = tuple(int(x) for x in os.environ.get("WS_HS_BLOCKS", "1 2 4 8 16").split())
+HS_THREADS = tuple(int(x) for x in os.environ.get("WS_HS_THREADS", "1024").split())
+HS_ITEMS = tuple(os.environ.get("WS_HS_ITEMS", "i256 i32k").split())
+SIZE_TRIALS = int(os.environ.get("WS_SIZE_TRIALS", "3"))
 REPS = int(os.environ.get("WS_REPS", "5"))
 SLEEP_MS = float(os.environ.get("WS_SLEEP_MS", "15"))
 OUT = VA.OUT
 TAG = os.environ.get("WS_TAG", "sweep_b%d" % VA.BATCH)
 TARGET = dict(bw_frac_of_dma=0.90, max_slowdown=0.05)
 CUDART = "/venv/nosa/lib/python3.10/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12"
+
+
+def hs_arm_name(W: int, item: str, threads: int) -> str:
+    """hisparse<W>_<item>, plus _t<threads> when the block is not the upstream default of 1024 threads."""
+    return "hisparse%d_%s" % (W, item) + ("" if threads == 1024 else "_t%d" % threads)
+
+
+def arm_order(arm: str):
+    """Table order: dma2d, workers by W, hisparse by (item, threads suffix) then W."""
+    import re
+    if arm == "dma2d":
+        return (0, "", 0)
+    m = re.match(r"(workers|hisparse)(\d+)(.*)$", arm)
+    if m:
+        return ({"workers": 1, "hisparse": 2}[m.group(1)], m.group(3), int(m.group(2)))
+    return (3, arm, 0)
 
 
 def numa_pages(ptr: int):
@@ -173,6 +204,40 @@ def run(model, ids):
 
     snap = ss.CounterSnapshot(cache)
     rows, fails, trans = [], 0, None
+
+    # HiSparse arms: the vendored copy_cache_planned kernel fed a plan of the SAME ids (plan.py), built once per
+    # (D, item) OUTSIDE every bracket; host / upload / device build times recorded, the two builds must agree.
+    hs, plans, plan_log = None, {}, []
+    if HS_BLOCKS:
+        from nosi.flash_cache_engine import hisparse_copy as hs
+        hs.load()
+        S_cpu = int(e0._k_cpu.shape[1])
+        for D in D_LIST:
+            for item in HS_ITEMS:
+                try:
+                    pl, tm = hs.timed_build(ids_for(D).cpu(), device="cuda", s_cpu=S_cpu, s_dst=int(k_s.shape[1]), n_heads=H, head_dim=Dh,
+                                            elem_size=elem, block_rows=bs, item=item)
+                except hs.PlanRefused as e:                             # recorded, never approximated; that item's arms are skipped
+                    plan_log.append(dict(D=D, item=item, refused=str(e)))
+                    print("[sweep] plan D=%d %s REFUSED: %s" % (D, item, e), flush=True)
+                    continue
+                hs.validate_plan(pl)
+                assert pl.bytes_per_launch * nl == pass_bytes(D), (D, item, pl.bytes_per_launch * nl, pass_bytes(D))
+                plans[(D, item)] = pl
+                tm.update(D=D, item=item)
+                plan_log.append(tm)
+                fails += int(not tm["device_build_equal"])
+                print("[sweep] plan D=%d %s: %d items of %d B (stride %d); build host %.2f ms, upload %.2f ms, device %.2f ms, device==host %s"
+                      % (D, item, tm["n_items"], tm["item_size_bytes"], tm["plan_stride"], tm["build_host_ms"], tm["upload_ms"], tm["build_device_ms"],
+                         tm["device_build_equal"]), flush=True)
+
+    def side_hisparse(W, T, D, item, passes):
+        pl = plans[(D, item)]
+        def f():
+            for _ in range(passes):
+                for e in engines:
+                    hs.copy_plan(pl, e._k_cpu, e._v_cpu, k_s, v_s, W, T)
+        return f
     step_fn = lambda tok: (lambda: model.decode_inference(tok, cu, position_ids, cache))
     for it in range(VA.N):
         tok = forced[:, it:it + 1]
@@ -185,6 +250,10 @@ def run(model, ids):
             trans = ss.transient_ids(model)
             for D in D_LIST:                                            # JIT / first touch, untimed
                 bracket(None, side_gather(1, D, ids_for(D), 1)); bracket(None, side_dma(D, 1))
+                for T in (HS_THREADS if HS_BLOCKS else ()):
+                    for item in HS_ITEMS:
+                        if (D, item) in plans:
+                            bracket(None, side_hisparse(1, T, D, item, 1))
         t_wall = time.time()
         snap.take()                                                     # pre-step counters and tables
         for e in engines:
@@ -212,11 +281,29 @@ def run(model, ids):
         t_alone = sorted(x["main_ms"] for x in alone)[len(alone) // 2]
         for D in D_LIST:
             ids_hbd = ids_for(D)
-            arms = [("workers%d" % W, (lambda W=W: (lambda p: side_gather(W, D, ids_hbd, p)))()) for W in WORKERS] + [("dma2d", lambda p: side_dma(D, p))]
-            for arm, mk in arms:
-                # size the side to last >= 1.2 x the step alone
+            arms = [("workers%d" % W, (lambda W=W: (lambda p: side_gather(W, D, ids_hbd, p)))(), dict(family="workers", workers=W)) for W in WORKERS]
+            arms += [(hs_arm_name(W, item, T), (lambda W=W, T=T, item=item: (lambda p: side_hisparse(W, T, D, item, p)))(),
+                      dict(family="hisparse", blocks=W, threads=T, item=item, item_bytes=plans[(D, item)].item_size_bytes,
+                           plan_items=plans[(D, item)].n_items))
+                     for item in (HS_ITEMS if HS_BLOCKS else ()) if (D, item) in plans for T in HS_THREADS for W in HS_BLOCKS]
+            arms += [("dma2d", lambda p: side_dma(D, p), dict(family="dma2d"))]
+            for arm, mk, meta in arms:
+                # SIZING (side_sizing.py): >= 1.2 x the step alone from a one-pass side, then TRIAL concurrent brackets
+                # raising passes until the side lasts >= 1.15 x the CONCURRENT step (trials are checked like reps)
                 _, r1 = bracket(None, mk(1))
-                passes = max(1, int(np.ceil(1.2 * t_alone / max(r1["side_ms"] - r1["host_lag_ms"], 1e-3))))
+                trial_fails = []
+
+                def trial(p, mk=mk):
+                    restore()
+                    k_s.zero_(); v_s.zero_()
+                    lg, rt = bracket(step_fn(tok), mk(p))
+                    ok = torch.equal(lg, lg_ref) and loaded_now() == 0
+                    good = torch.equal(k_s[:, :D * bs], k_ref[:, :D * bs]) and torch.equal(v_s[:, :D * bs], v_ref[:, :D * bs])
+                    trial_fails.append(int(not ok) + int(not good))
+                    return rt["side_ms"] - rt["host_lag_ms"], rt["main_ms"]
+                sizing = SZ.size_side(trial, t_alone, r1["side_ms"] - r1["host_lag_ms"], max_trials=SIZE_TRIALS)
+                passes = sizing["passes"]
+                fails += sum(trial_fails)
                 s_alone = []
                 for rep in range(REPS):
                     k_s.zero_(); v_s.zero_()
@@ -234,7 +321,8 @@ def run(model, ids):
                     r.update(logits_equal=bool(ok), transfer_equal=bool(good))
                     conc.append(r)
                 by = pass_bytes(D) * passes
-                rows.append(dict(batch=B, step=it, D=D, arm=arm, workers=(int(arm[7:]) if arm.startswith("workers") else None), passes=passes, bytes=by,
+                rows.append(dict(batch=B, step=it, D=D, arm=arm, workers=meta.get("workers"), family=meta["family"],
+                                 hisparse=(meta if meta["family"] == "hisparse" else None), sizing=sizing, passes=passes, bytes=by,
                                  decode_alone_ms=[x["main_ms"] for x in alone], decode_conc_ms=[x["main_ms"] for x in conc],
                                  side_alone_ms=[x["side_ms"] - x["host_lag_ms"] for x in s_alone], side_conc_ms=[x["side_ms"] - x["host_lag_ms"] for x in conc],
                                  overlap_frac=[x["overlap_frac"] for x in conc], host_lag_ms=[x["host_lag_ms"] for x in conc + s_alone],
@@ -250,6 +338,10 @@ def run(model, ids):
         position_ids = position_ids + 1
         print("[sweep] step %d done in %.0fs (fails %d)" % (it, time.time() - t_wall, fails), flush=True)
     return dict(meta=meta, rows=rows, fails=fails, numa=numa, D_list=list(D_LIST), workers=list(WORKERS), reps=REPS, sleep_ms=SLEEP_MS, target=TARGET,
+                hisparse=dict(blocks=list(HS_BLOCKS), threads=list(HS_THREADS), items=list(HS_ITEMS), plans=plan_log,
+                              upstream=(hs.UPSTREAM_COMMIT if hs is not None else None)),
+                sizing_rule=dict(alone_margin=SZ.ALONE_MARGIN, conc_margin=SZ.CONC_MARGIN, max_trials=SIZE_TRIALS, overlap_min=SZ.OVERLAP_MIN,
+                                 host_lag_max_ms=SZ.HOST_LAG_MAX_MS),
                 peak_allocated_gb=torch.cuda.max_memory_allocated() / 1e9, peak_reserved_gb=torch.cuda.max_memory_reserved() / 1e9,
                 device_total_gb=torch.cuda.get_device_properties(0).total_memory / 1e9)
 
@@ -257,8 +349,9 @@ def run(model, ids):
 def table(out_dir):
     import glob
     pays = [json.load(open(f)) for f in sorted(glob.glob(os.path.join(out_dir, "sweep_*.json")))]
-    L = ["# Corrected worker sweep: SM gather (W CTAs x 128 threads) vs matched copy engine, beside NOSI's resident decode step", "",
-         "Medians (and p95) over gated steps x reps. GB/s = bytes / side interval. slowdown = median concurrent / median alone - 1. "
+    L = ["# Corrected worker sweep: SM gather (workersW: W CTAs x 128 threads), HiSparse copy_cache_planned (hisparseW_item: W blocks x "
+         "1024 threads unless _tT) vs matched copy engine, beside NOSI's resident decode step", "",
+         "Medians (and p95) over gated steps x reps. GB/s = median over reps of that rep's bytes / side interval. slowdown = median concurrent / median alone - 1. "
          "tok/s = B / decode ms. Valid = min overlap_frac >= 0.95 and max host_lag <= 0.1 ms and all correctness checks pass.", ""]
     L.append("| B | D | arm | passes | transfer alone GB/s | transfer concurrent GB/s | % of dma2d concurrent | decode alone median / p95 ms | decode concurrent median / p95 ms | slowdown | tok/s alone -> concurrent | min overlap | max host lag ms | meets target |")
     L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
@@ -268,23 +361,32 @@ def table(out_dir):
         by_key = {}
         for r in p["rows"]:
             k = (r["D"], r["arm"])
-            a = by_key.setdefault(k, dict(D=r["D"], arm=r["arm"], passes=r["passes"], bytes=r["bytes"], da=[], dc=[], sa=[], sc=[], ov=[], hl=[]))
-            a["da"] += r["decode_alone_ms"]; a["dc"] += r["decode_conc_ms"]; a["sa"] += r["side_alone_ms"]; a["sc"] += r["side_conc_ms"]; a["ov"] += r["overlap_frac"]; a["hl"] += r["host_lag_ms"]
+            a = by_key.setdefault(k, dict(D=r["D"], arm=r["arm"], passes=[], da=[], dc=[], ra=[], rc=[], ov=[], hl=[]))
+            a["da"] += r["decode_alone_ms"]; a["dc"] += r["decode_conc_ms"]; a["ov"] += r["overlap_frac"]; a["hl"] += r["host_lag_ms"]
+            # GB/s per rep from THAT row's bytes: the sizing may choose different passes at different steps
+            a["passes"].append(r["passes"]); a["ra"] += [r["bytes"] / (x * 1e6) for x in r["side_alone_ms"]]; a["rc"] += [r["bytes"] / (x * 1e6) for x in r["side_conc_ms"]]
         dma = {D: v for (D, arm), v in by_key.items() if arm == "dma2d"}
-        for (D, arm), a in sorted(by_key.items(), key=lambda kv: (kv[0][0], kv[0][1] != "dma2d", kv[0][1])):
+        for (D, arm), a in sorted(by_key.items(), key=lambda kv: (kv[0][0], arm_order(kv[0][1]))):
             med, p95 = (lambda xs: float(np.median(xs))), (lambda xs: float(np.percentile(xs, 95)))
-            bw_a, bw_c = a["bytes"] / (med(a["sa"]) * 1e6), a["bytes"] / (med(a["sc"]) * 1e6)
+            bw_a, bw_c = med(a["ra"]), med(a["rc"])
             d = dma.get(D)
-            dma_c = d["bytes"] / (med(d["sc"]) * 1e6) if d else float("nan")
+            dma_c = med(d["rc"]) if d else float("nan")
             slow = med(a["dc"]) / med(a["da"]) - 1
             valid = min(a["ov"]) >= 0.95 and max(a["hl"]) <= 0.1
             meets = valid and arm != "dma2d" and bw_c >= TARGET["bw_frac_of_dma"] * dma_c and slow <= TARGET["max_slowdown"]
             verdict_rows.append(dict(B=B, D=D, arm=arm, bw_conc=bw_c, frac_dma=bw_c / dma_c if dma_c == dma_c else None, slowdown=slow, valid=valid, meets=meets))
-            L.append("| %d | %d | %s | %d | %.1f | %.1f | %.0f%% | %.2f / %.2f | %.2f / %.2f | %+.1f%% | %.0f -> %.0f | %.2f | %.3f | %s |" % (
-                B, D, arm, a["passes"], bw_a, bw_c, 100 * bw_c / dma_c, med(a["da"]), p95(a["da"]), med(a["dc"]), p95(a["dc"]), 100 * slow,
+            ps = sorted(set(a["passes"]))
+            L.append("| %d | %d | %s | %s | %.1f | %.1f | %.0f%% | %.2f / %.2f | %.2f / %.2f | %+.1f%% | %.0f -> %.0f | %.2f | %.3f | %s |" % (
+                B, D, arm, ("%d" % ps[0]) if len(ps) == 1 else "%d-%d" % (ps[0], ps[-1]), bw_a, bw_c, 100 * bw_c / dma_c, med(a["da"]), p95(a["da"]), med(a["dc"]), p95(a["dc"]), 100 * slow,
                 1000 * B / med(a["da"]), 1000 * B / med(a["dc"]), min(a["ov"]), max(a["hl"]), ("YES" if meets else ("n/a" if arm == "dma2d" else "no")) + ("" if valid else " (INVALID overlap/timer)")))
         L.append("")
         L.append("B=%d: correctness fails %d; peak allocated %.2f GB, reserved %.2f GB of %.1f GB; NUMA %s" % (B, p["fails"], p["peak_allocated_gb"], p["peak_reserved_gb"], p["device_total_gb"], json.dumps(p["numa"])))
+        for t in (p.get("hisparse") or {}).get("plans", []):
+            if "refused" in t:
+                L.append("B=%d plan D=%d %s: REFUSED (%s)" % (B, t["D"], t["item"], t["refused"]))
+                continue
+            L.append("B=%d plan D=%d %s: %d items of %d B, stride %d; build host %.2f ms, upload %.2f ms, device %.2f ms, device==host %s"
+                     % (B, t["D"], t["item"], t["n_items"], t["item_size_bytes"], t["plan_stride"], t["build_host_ms"], t["upload_ms"], t["build_device_ms"], t["device_build_equal"]))
         L.append("")
     met = [v for v in verdict_rows if v["meets"]]
     L.append("## Registered target (ledger 'WORKER SWEEP REGISTERED'): >= 90% of the matched copy-engine concurrent bandwidth with <= 5% decode slowdown")
