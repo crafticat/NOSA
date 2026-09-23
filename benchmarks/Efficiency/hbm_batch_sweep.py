@@ -455,6 +455,19 @@ class CellContext:
         rec.point("after_warm_steps")
 
 
+def snapshot_post_step_map(torch, snap, engines):
+    """Point the light snapshot at the POST-step block map (worker_sweep.py:194-197), so that the next restore gives
+    the committed state with every selected block resident (the resident target step). INSIDE inference_mode: the
+    snapshot's saved tensors are clones made under CounterSnapshot.take's @torch.inference_mode
+    (state_snapshot.py:166), i.e. inference tensors, and an in-place copy_ on an inference tensor outside
+    inference_mode raises RuntimeError (job 2174640; worker_sweep.run is @torch.inference_mode, worker_sweep.py:81)."""
+    with torch.inference_mode():
+        for i, e in enumerate(engines):
+            slot = snap.layers[i]["engine"]
+            for name in ("_block_map", "_new_block_map_buf"):
+                slot[name].copy_(getattr(e, name))
+
+
 def write_result(status, cls="", detail="", **extra):
     HL.write_json(os.path.join(CELL_DIR, "result.json"), dict(C=C, B=B, L=L, N=N, warm=WARM, mode=MODE, tag=TAG, status=status, cls=cls, detail=detail,
                                                               nosi_commit=os.environ.get("NOSI_COMMIT"), t=time.time(), **extra))
@@ -586,10 +599,7 @@ def mode_cell(ph):
             if last and CAPTURE:
                 restore()
                 capture(tok, "ordinary", it)
-            for i, e in enumerate(ctx.engines):     # worker_sweep.py:194-197: the light restore returns to the POST-step map
-                slot = snap.layers[i]["engine"]
-                for name in ("_block_map", "_new_block_map_buf"):
-                    slot[name].copy_(getattr(e, name))
+            snapshot_post_step_map(torch, snap, ctx.engines)   # worker_sweep.py:194-197: the light restore returns to the POST-step map
             for rep, tm in enumerate(res_reps):
                 restore()
                 timed(tok, tm, "resident", it, rep, False, ref=lg_nat, expect_loads=0)
@@ -719,10 +729,7 @@ def mode_ncu_cell(ph):
     lg_nat = window(1, "ordinary")
     windows[-1]["logits_sha"] = logits_sha(lg_nat)
     if C == 63:
-        for i, e in enumerate(ctx.engines):
-            slot = snap.layers[i]["engine"]
-            for name in ("_block_map", "_new_block_map_buf"):
-                slot[name].copy_(getattr(e, name))
+        snapshot_post_step_map(torch, snap, ctx.engines)
         snap.restore()
         ss.assert_transients_intact(ctx.model, trans)
         lg_res = window(2, "resident")
