@@ -42,10 +42,12 @@
 // [vendored]   D8  :893-924 the tvm-ffi host launcher copy_cache_planned (LaunchKernel, tvm::ffi::TensorView)
 // [vendored]                -> the torch launcher below the BEGIN TORCH LAUNCHER marker:
 // [vendored]                <<<num_blocks, BLOCK_SIZE, 0, at::cuda::getCurrentCUDAStream()>>>, instantiated for
-// [vendored]                BLOCK_SIZE in {256, 1024} x SkipIO in {false, true} with IsMLA = false (separate K
-// [vendored]                and V caches) and IsDsv4Layout = false; plan_stride = miss_src_locs.stride(0) and
-// [vendored]                the equal-row-stride check exactly as :907-910; the V pointers are always passed
-// [vendored]                (upstream :919/:921 pass nullptr only for MLA / 0-dim V)
+// [vendored]                BLOCK_SIZE in {256, 1024} x IsMLA in {false, true} x SkipIO in {false, true} with
+// [vendored]                IsDsv4Layout = false; plan_stride = miss_src_locs.stride(0) and the equal-row-stride
+// [vendored]                check exactly as :907-910. IsMLA = true is SGLang's SHIPPED instantiation (the caller
+// [vendored]                copy_cache_planned_mla: K only) and passes nullptr for both V pointers exactly as
+// [vendored]                :919/:921 do; IsMLA = false (separate K and V caches, K then V at the same locs) is
+// [vendored]                a template instantiation the SGLang caller never makes (NOSI's KV is not MLA)
 // [vendored]   D9  this header, and blank lines between the vendored blocks
 // [vendored] Argument checks (dtype / device / stride / pinned / alignment) live in hisparse_copy.cpp.
 #include <stdint.h>
@@ -191,7 +193,7 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
 
 namespace {
 
-template <int BLOCK_SIZE, bool SkipIO>
+template <int BLOCK_SIZE, bool IsMLA, bool SkipIO>
 void launch_copy_cache_planned(
     const at::Tensor& miss_src_locs,
     const at::Tensor& miss_dst_locs,
@@ -208,16 +210,16 @@ void launch_copy_cache_planned(
   const int64_t plan_stride = miss_src_locs.stride(0);
   TORCH_CHECK(miss_dst_locs.stride(0) == plan_stride, "copy_cache_planned: miss_src/miss_dst row strides differ");
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  sglang::copy_cache_planned_kernel<BLOCK_SIZE, /*IsMLA=*/false, /*IsDsv4Layout=*/false, SkipIO>
+  sglang::copy_cache_planned_kernel<BLOCK_SIZE, IsMLA, /*IsDsv4Layout=*/false, SkipIO>
       <<<static_cast<unsigned int>(num_blocks), BLOCK_SIZE, 0, stream>>>(
           miss_src_locs.data_ptr<int64_t>(),
           miss_dst_locs.data_ptr<int32_t>(),
           miss_counts.data_ptr<int32_t>(),
           num_real_reqs.data_ptr<int32_t>(),
           host_k.data_ptr(),
-          host_v.data_ptr(),
+          IsMLA ? (const void*)nullptr : host_v.data_ptr(),  // upstream :919 (MLA: K only)
           dev_k.data_ptr(),
-          dev_v.data_ptr(),
+          IsMLA ? (void*)nullptr : dev_v.data_ptr(),         // upstream :921
           plan_stride,
           item_size_bytes);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -237,16 +239,27 @@ void hisparse_copy_planned_cuda(
     int64_t num_blocks,
     int64_t block_size,
     int64_t item_size_bytes,
-    bool skip_io) {
+    bool skip_io,
+    bool is_mla) {
   const c10::cuda::CUDAGuard guard(miss_src_locs.device());
 #define HISPARSE_COPY_ARGS \
   miss_src_locs, miss_dst_locs, miss_counts, num_real_reqs, host_k, host_v, dev_k, dev_v, num_blocks, item_size_bytes
   if (block_size == 256) {
-    if (skip_io) launch_copy_cache_planned<256, true>(HISPARSE_COPY_ARGS);
-    else launch_copy_cache_planned<256, false>(HISPARSE_COPY_ARGS);
+    if (is_mla) {
+      if (skip_io) launch_copy_cache_planned<256, true, true>(HISPARSE_COPY_ARGS);
+      else launch_copy_cache_planned<256, true, false>(HISPARSE_COPY_ARGS);
+    } else {
+      if (skip_io) launch_copy_cache_planned<256, false, true>(HISPARSE_COPY_ARGS);
+      else launch_copy_cache_planned<256, false, false>(HISPARSE_COPY_ARGS);
+    }
   } else if (block_size == 1024) {
-    if (skip_io) launch_copy_cache_planned<1024, true>(HISPARSE_COPY_ARGS);
-    else launch_copy_cache_planned<1024, false>(HISPARSE_COPY_ARGS);
+    if (is_mla) {
+      if (skip_io) launch_copy_cache_planned<1024, true, true>(HISPARSE_COPY_ARGS);
+      else launch_copy_cache_planned<1024, true, false>(HISPARSE_COPY_ARGS);
+    } else {
+      if (skip_io) launch_copy_cache_planned<1024, false, true>(HISPARSE_COPY_ARGS);
+      else launch_copy_cache_planned<1024, false, false>(HISPARSE_COPY_ARGS);
+    }
   } else {
     TORCH_CHECK(false, "block_size ", block_size, " is not instantiated; supported: 256, 1024");
   }

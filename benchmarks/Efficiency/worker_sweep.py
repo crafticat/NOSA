@@ -25,7 +25,12 @@ What is fixed and checked here:
   * CORRECTNESS: every timed step loads 0 blocks and its logits are torch.equal to the flushed reference step; after
     every transfer rep the scratch equals the source blocks of the last layer (torch.equal).
   * STATE: a LIGHT restore (state_snapshot.CounterSnapshot with the post-reference map), so a near-capacity batch fits.
-  * NUMA: /proc/self/numa_maps pages per node for NOSI's host cache, the process CPU affinity and node cpulists.
+  * NUMA: /proc/self/numa_maps read ONCE (numa_maps.py); pages per node of EVERY layer's _k_cpu and _v_cpu over every
+    mapping each buffer touches (review NB1 / NB11: at B = 336 the cache splits across nodes by layer), the process
+    CPU affinity and node cpulists. k_nodes / v_nodes = one character per layer ('0', '1', 's' = split).
+  * DURING-STEP (review B3): one event per launch unit (layer, K and V) on the side stream; every concurrent rep
+    reports the bytes whose unit ended inside the step / step ms (a lower bound), next to the whole-interval GB/s.
+  * JSON is flushed after every gated step (review NB10; 'partial': true until the run ends).
 Env: WS_B (64), WS_D ('8 16'), WS_WORKERS ('1 2 4 8 16'), WS_N (8), WS_WARM (4), WS_REPS (5), WS_L (16128), WS_OUT, WS_TAG,
 WS_SLEEP_MS (15), WS_HS_BLOCKS ('1 2 4 8 16'; empty = no HiSparse arm), WS_HS_THREADS ('1024'; 256 and/or 1024),
 WS_HS_ITEMS ('i256 i32k'), WS_SIZE_TRIALS (3). Mode WS_MODE=run | table.
@@ -46,6 +51,7 @@ os.environ.setdefault("NOSI_ALONE_D", "0")
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
+import numa_maps as NM  # noqa: E402
 import side_sizing as SZ  # noqa: E402
 import verify_alone as VA  # noqa: E402
 
@@ -109,15 +115,30 @@ def cpu_numa():
     return dict(affinity=[aff[0], aff[-1], len(aff)] if aff else [], node_cpulists=nodes)
 
 
+def numa_layers(vmas, engines, elem):
+    """Per-layer NUMA split of NOSI's pinned host cache (review NB1): every layer's _k_cpu / _v_cpu over every mapping
+    it touches (numa_maps.range_pages), from ONE parse of /proc/self/numa_maps."""
+    per = []
+    for i, e in enumerate(engines):
+        nb = e._k_cpu.numel() * elem
+        k = NM.range_pages(vmas, e._k_cpu.data_ptr(), nb)
+        v = NM.range_pages(vmas, e._v_cpu.data_ptr(), nb)
+        per.append(dict(layer=i, k=(k or {}).get("pages_per_node"), v=(v or {}).get("pages_per_node"),
+                        k_vmas=(k or {}).get("n_vmas"), v_vmas=(v or {}).get("n_vmas"),
+                        k_covered_bytes=(k or {}).get("covered_bytes"), v_covered_bytes=(v or {}).get("covered_bytes"),
+                        k_node=NM.node_of(k), v_node=NM.node_of(v)))
+    return dict(per_layer=per, k_nodes="".join(p["k_node"] for p in per), v_nodes="".join(p["v_node"] for p in per), bytes_per_layer=nb if engines else 0)
+
+
 @torch.inference_mode()
-def run(model, ids):
+def run(model, ids, flush=None):
     from nosi import state_snapshot as ss
     from nosi.verify import miss_control as mc
     from nosi.flash_cache_engine.flash_h2d_persistent import flash_h2d_persistent
     cudart = ctypes.CDLL(CUDART)
     cudart.cudaMemcpy2DAsync.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
     cudart.cudaMemcpy2DAsync.restype = ctypes.c_int
-    model, cache, logits, position_ids, forced, meta = VA._setup(model, ids)
+    model, cache, logits, position_ids, forced, run_meta = VA._setup(model, ids)
     B, nl = ids.shape[0], model.num_layers
     layers = list(cache.layers)
     engines = [lay.cache_engine for lay in layers]
@@ -137,10 +158,16 @@ def run(model, ids):
     side = torch.cuda.Stream()
     main = torch.cuda.current_stream()
     sleep_cycles = int(SLEEP_MS * 1e-3 * 1.41e9)
-    numa = dict(k_cpu_layer0=numa_pages(engines[0]._k_cpu.data_ptr()), k_cpu_layer31=numa_pages(engines[-1]._k_cpu.data_ptr()),
-                v_cpu_layer0=numa_pages(engines[0]._v_cpu.data_ptr()), cpu=cpu_numa(),
-                k_cpu_bytes_per_layer=engines[0]._k_cpu.numel() * elem)
-    print("[sweep] NUMA %s" % json.dumps(numa), flush=True)
+    try:
+        vmas = NM.parse()                                               # ONE read of /proc/self/numa_maps (review NB1)
+        layers_numa = numa_layers(vmas, engines, elem)
+    except OSError as e:
+        vmas, layers_numa = [], dict(error=str(e))
+    numa = dict(k_cpu_layer0=NM.pages_at(engines[0]._k_cpu.data_ptr(), vmas), k_cpu_layer31=NM.pages_at(engines[-1]._k_cpu.data_ptr(), vmas),
+                v_cpu_layer0=NM.pages_at(engines[0]._v_cpu.data_ptr(), vmas), cpu=cpu_numa(),
+                k_cpu_bytes_per_layer=engines[0]._k_cpu.numel() * elem, layers=layers_numa)
+    print("[sweep] NUMA k_nodes %s v_nodes %s; %s" % (layers_numa.get("k_nodes"), layers_numa.get("v_nodes"),
+                                                     json.dumps({k: v for k, v in numa.items() if k != "layers"})), flush=True)
 
     def loaded_now():
         return int(torch.stack([(e._load_mask >= 0).sum() for e in engines]).sum())
@@ -153,11 +180,13 @@ def run(model, ids):
 
     def side_gather(W, D, ids_hbd, passes):
         n = D * bs
+        unit = pass_bytes(D) // nl
         def f():
             for _ in range(passes):
                 for e in engines:
                     flash_h2d_persistent(k_s[:, :n], e._k_cpu, ids_hbd, bs, n_ctas=W)
                     flash_h2d_persistent(v_s[:, :n], e._v_cpu, ids_hbd, bs, n_ctas=W)
+                    SZ.LAUNCH_LOG.mark(unit)
         return f
 
     def side_dma(D, passes):
@@ -173,11 +202,13 @@ def run(model, ids):
                         rc = cudart.cudaMemcpy2DAsync(ctypes.c_void_p(dst.data_ptr()), dpitch, ctypes.c_void_p(src.data_ptr()), spitch, width, B, 1, st)
                         if rc != 0:
                             raise RuntimeError("cudaMemcpy2DAsync rc=%d" % rc)
+                    SZ.LAUNCH_LOG.mark(2 * B * width)
         return f
 
     def bracket(fn_main, fn_side):
         """GPU sleep on main -> gate -> side enqueued behind the gate -> t0 -> main work. Returns ms dict."""
         torch.cuda.synchronize()
+        SZ.LAUNCH_LOG.reset()
         ev = {k: torch.cuda.Event(enable_timing=True) for k in ("pre", "gate", "t0", "tm", "ts")}
         ev["pre"].record(main)
         torch.cuda._sleep(sleep_cycles)
@@ -200,6 +231,8 @@ def run(model, ids):
             r["side_ms"] = ev["gate"].elapsed_time(ev["ts"])
         if fn_main is not None and fn_side is not None:
             r["overlap_frac"] = min(r["side_ms"] - r["host_lag_ms"], r["main_ms"]) / r["main_ms"] if r["main_ms"] > 0 else float("nan")
+        if fn_main is not None and fn_side is not None and SZ.LAUNCH_LOG.n:
+            r.update(SZ.during_step([ev["gate"].elapsed_time(e) for e, _ in SZ.LAUNCH_LOG.marks()], [b for _, b in SZ.LAUNCH_LOG.marks()], r["host_lag_ms"], r["main_ms"]))
         return out, r
 
     snap = ss.CounterSnapshot(cache)
@@ -237,7 +270,19 @@ def run(model, ids):
             for _ in range(passes):
                 for e in engines:
                     hs.copy_plan(pl, e._k_cpu, e._v_cpu, k_s, v_s, W, T)
+                    SZ.LAUNCH_LOG.mark(pl.bytes_per_launch)
         return f
+
+    def payload(partial):
+        return dict(meta=run_meta, rows=rows, fails=fails, partial=partial, numa=numa, D_list=list(D_LIST), workers=list(WORKERS), reps=REPS,
+                    sleep_ms=SLEEP_MS, target=TARGET,
+                    hisparse=dict(blocks=list(HS_BLOCKS), threads=list(HS_THREADS), items=list(HS_ITEMS), plans=plan_log,
+                                  upstream=(hs.UPSTREAM_COMMIT if hs is not None else None)),
+                    sizing_rule=dict(alone_margin=SZ.ALONE_MARGIN, conc_margin=SZ.CONC_MARGIN, max_trials=SIZE_TRIALS, overlap_min=SZ.OVERLAP_MIN,
+                                     host_lag_max_ms=SZ.HOST_LAG_MAX_MS),
+                    peak_allocated_gb=torch.cuda.max_memory_allocated() / 1e9, peak_reserved_gb=torch.cuda.max_memory_reserved() / 1e9,
+                    device_total_gb=torch.cuda.get_device_properties(0).total_memory / 1e9)
+
     step_fn = lambda tok: (lambda: model.decode_inference(tok, cu, position_ids, cache))
     for it in range(VA.N):
         tok = forced[:, it:it + 1]
@@ -287,7 +332,7 @@ def run(model, ids):
                            plan_items=plans[(D, item)].n_items))
                      for item in (HS_ITEMS if HS_BLOCKS else ()) if (D, item) in plans for T in HS_THREADS for W in HS_BLOCKS]
             arms += [("dma2d", lambda p: side_dma(D, p), dict(family="dma2d"))]
-            for arm, mk, meta in arms:
+            for arm, mk, ameta in arms:
                 # SIZING (side_sizing.py): >= 1.2 x the step alone from a one-pass side, then TRIAL concurrent brackets
                 # raising passes until the side lasts >= 1.15 x the CONCURRENT step (trials are checked like reps)
                 _, r1 = bracket(None, mk(1))
@@ -321,12 +366,14 @@ def run(model, ids):
                     r.update(logits_equal=bool(ok), transfer_equal=bool(good))
                     conc.append(r)
                 by = pass_bytes(D) * passes
-                rows.append(dict(batch=B, step=it, D=D, arm=arm, workers=meta.get("workers"), family=meta["family"],
-                                 hisparse=(meta if meta["family"] == "hisparse" else None), sizing=sizing, passes=passes, bytes=by,
+                rows.append(dict(batch=B, step=it, D=D, arm=arm, workers=ameta.get("workers"), family=ameta["family"],
+                                 hisparse=(ameta if ameta["family"] == "hisparse" else None), sizing=sizing, passes=passes, bytes=by,
                                  decode_alone_ms=[x["main_ms"] for x in alone], decode_conc_ms=[x["main_ms"] for x in conc],
                                  side_alone_ms=[x["side_ms"] - x["host_lag_ms"] for x in s_alone], side_conc_ms=[x["side_ms"] - x["host_lag_ms"] for x in conc],
                                  overlap_frac=[x["overlap_frac"] for x in conc], host_lag_ms=[x["host_lag_ms"] for x in conc + s_alone],
-                                 host_enqueue_ms=[x["host_enqueue_ms"] for x in conc]))
+                                 host_enqueue_ms=[x["host_enqueue_ms"] for x in conc],
+                                 during_gbps=[x.get("during_gbps") for x in conc], inside_frac=[x.get("inside_frac") for x in conc],
+                                 during_bytes=[x.get("during_bytes") for x in conc], last_end_ms=[x.get("last_end_ms") for x in conc]))
                 rr = rows[-1]
                 med = lambda xs: float(np.median(xs))
                 print("[sweep] step %d D=%d %-9s passes=%d  decode %.2f -> %.2f ms (%+.1f%%)  side alone %.1f GB/s, conc %.1f GB/s  overlap %.2f  host_lag max %.3f ms"
@@ -337,13 +384,25 @@ def run(model, ids):
         torch.cuda.synchronize()
         position_ids = position_ids + 1
         print("[sweep] step %d done in %.0fs (fails %d)" % (it, time.time() - t_wall, fails), flush=True)
-    return dict(meta=meta, rows=rows, fails=fails, numa=numa, D_list=list(D_LIST), workers=list(WORKERS), reps=REPS, sleep_ms=SLEEP_MS, target=TARGET,
-                hisparse=dict(blocks=list(HS_BLOCKS), threads=list(HS_THREADS), items=list(HS_ITEMS), plans=plan_log,
-                              upstream=(hs.UPSTREAM_COMMIT if hs is not None else None)),
-                sizing_rule=dict(alone_margin=SZ.ALONE_MARGIN, conc_margin=SZ.CONC_MARGIN, max_trials=SIZE_TRIALS, overlap_min=SZ.OVERLAP_MIN,
-                                 host_lag_max_ms=SZ.HOST_LAG_MAX_MS),
-                peak_allocated_gb=torch.cuda.max_memory_allocated() / 1e9, peak_reserved_gb=torch.cuda.max_memory_reserved() / 1e9,
-                device_total_gb=torch.cuda.get_device_properties(0).total_memory / 1e9)
+        if flush is not None:
+            flush(payload(True))
+
+    return payload(False)
+
+
+def arm_footprint(arm: str) -> str:
+    """What W means for the SMs (review NB2): hisparse at 1024 threads = W SMs (48 regs x 1024 thr: one copy CTA per
+    SM); a _t256 arm = W blocks, not W SMs (up to 4 per SM); workersW = W CTAs of 128 threads, not W SMs."""
+    import re
+    if arm == "dma2d":
+        return "copy engine"
+    m = re.match(r"(workers|hisparse)(\d+)(.*)$", arm)
+    if not m:
+        return "-"
+    W = int(m.group(2))
+    if m.group(1) == "workers":
+        return "%d CTAs x 128 thr (not W SMs)" % W
+    return ("%d blocks (not W SMs)" % W) if "_t" in m.group(3) else ("%d SMs" % W)
 
 
 def table(out_dir):
@@ -351,36 +410,59 @@ def table(out_dir):
     pays = [json.load(open(f)) for f in sorted(glob.glob(os.path.join(out_dir, "sweep_*.json")))]
     L = ["# Corrected worker sweep: SM gather (workersW: W CTAs x 128 threads), HiSparse copy_cache_planned (hisparseW_item: W blocks x "
          "1024 threads unless _tT) vs matched copy engine, beside NOSI's resident decode step", "",
-         "Medians (and p95) over gated steps x reps. GB/s = median over reps of that rep's bytes / side interval. slowdown = median concurrent / median alone - 1. "
-         "tok/s = B / decode ms. Valid = min overlap_frac >= 0.95 and max host_lag <= 0.1 ms and all correctness checks pass.", ""]
-    L.append("| B | D | arm | passes | transfer alone GB/s | transfer concurrent GB/s | % of dma2d concurrent | decode alone median / p95 ms | decode concurrent median / p95 ms | slowdown | tok/s alone -> concurrent | min overlap | max host lag ms | meets target |")
-    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+         "Medians (and p95) over gated steps x reps. Transfer GB/s = median over reps of that rep's bytes / side interval (the concurrent value "
+         "includes the tail the side runs alone after the step). During-step GB/s = bytes of the per-layer launches that ENDED inside the step / "
+         "step ms (a lower bound). slowdown = median concurrent / median alone - 1; normalized decode throughput = alone / concurrent. "
+         "tok/s = B / decode ms. Valid = min overlap_frac >= 0.95 and max host_lag <= 0.1 ms and all correctness checks pass. covered = every "
+         "sizing reached a side >= 1.15 x the concurrent step.", ""]
+    L.append("| B | D | arm | footprint | passes | transfer alone GB/s | transfer concurrent GB/s | % of dma2d concurrent | during-step GB/s (lower bound) "
+             "| side bytes inside step | decode alone median / p95 ms | decode concurrent median / p95 ms | slowdown | normalized decode throughput "
+             "| tok/s alone -> concurrent | min overlap | max host lag ms | covered | meets target (whole interval) | meets target (during-step) |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     verdict_rows = []
+    fnum = lambda x, f="%.1f": "-" if x is None or x != x else f % x
     for p in pays:
         B = p["meta"]["batch"]
         by_key = {}
         for r in p["rows"]:
             k = (r["D"], r["arm"])
-            a = by_key.setdefault(k, dict(D=r["D"], arm=r["arm"], passes=[], da=[], dc=[], ra=[], rc=[], ov=[], hl=[]))
+            a = by_key.setdefault(k, dict(D=r["D"], arm=r["arm"], passes=[], da=[], dc=[], ra=[], rc=[], ov=[], hl=[], dg=[], inf=[], cov=[]))
             a["da"] += r["decode_alone_ms"]; a["dc"] += r["decode_conc_ms"]; a["ov"] += r["overlap_frac"]; a["hl"] += r["host_lag_ms"]
             # GB/s per rep from THAT row's bytes: the sizing may choose different passes at different steps
             a["passes"].append(r["passes"]); a["ra"] += [r["bytes"] / (x * 1e6) for x in r["side_alone_ms"]]; a["rc"] += [r["bytes"] / (x * 1e6) for x in r["side_conc_ms"]]
+            a["dg"] += [x for x in (r.get("during_gbps") or []) if x is not None]; a["inf"] += [x for x in (r.get("inside_frac") or []) if x is not None]
+            if r.get("sizing") is not None:
+                a["cov"].append(bool(r["sizing"].get("covered")))
         dma = {D: v for (D, arm), v in by_key.items() if arm == "dma2d"}
         for (D, arm), a in sorted(by_key.items(), key=lambda kv: (kv[0][0], arm_order(kv[0][1]))):
-            med, p95 = (lambda xs: float(np.median(xs))), (lambda xs: float(np.percentile(xs, 95)))
-            bw_a, bw_c = med(a["ra"]), med(a["rc"])
+            med, p95 = (lambda xs: float(np.median(xs)) if xs else float("nan")), (lambda xs: float(np.percentile(xs, 95)))
+            bw_a, bw_c, bw_d = med(a["ra"]), med(a["rc"]), med(a["dg"])
             d = dma.get(D)
             dma_c = med(d["rc"]) if d else float("nan")
+            dma_d = med(d["dg"]) if d else float("nan")
             slow = med(a["dc"]) / med(a["da"]) - 1
             valid = min(a["ov"]) >= 0.95 and max(a["hl"]) <= 0.1
             meets = valid and arm != "dma2d" and bw_c >= TARGET["bw_frac_of_dma"] * dma_c and slow <= TARGET["max_slowdown"]
-            verdict_rows.append(dict(B=B, D=D, arm=arm, bw_conc=bw_c, frac_dma=bw_c / dma_c if dma_c == dma_c else None, slowdown=slow, valid=valid, meets=meets))
+            meets_d = valid and arm != "dma2d" and bw_d == bw_d and dma_d == dma_d and bw_d >= TARGET["bw_frac_of_dma"] * dma_d and slow <= TARGET["max_slowdown"]
+            covered = (all(a["cov"]) if a["cov"] else None)
+            verdict_rows.append(dict(B=B, D=D, arm=arm, bw_conc=bw_c, bw_during=bw_d, frac_dma=bw_c / dma_c if dma_c == dma_c else None,
+                                     frac_dma_during=(bw_d / dma_d if dma_d == dma_d and dma_d > 0 else None), slowdown=slow,
+                                     norm_tput=med(a["da"]) / med(a["dc"]), valid=valid, covered=covered, meets=meets, meets_during=meets_d))
             ps = sorted(set(a["passes"]))
-            L.append("| %d | %d | %s | %s | %.1f | %.1f | %.0f%% | %.2f / %.2f | %.2f / %.2f | %+.1f%% | %.0f -> %.0f | %.2f | %.3f | %s |" % (
-                B, D, arm, ("%d" % ps[0]) if len(ps) == 1 else "%d-%d" % (ps[0], ps[-1]), bw_a, bw_c, 100 * bw_c / dma_c, med(a["da"]), p95(a["da"]), med(a["dc"]), p95(a["dc"]), 100 * slow,
-                1000 * B / med(a["da"]), 1000 * B / med(a["dc"]), min(a["ov"]), max(a["hl"]), ("YES" if meets else ("n/a" if arm == "dma2d" else "no")) + ("" if valid else " (INVALID overlap/timer)")))
+            L.append("| %d | %d | %s | %s | %s | %.1f | %.1f | %.0f%% | %s | %s | %.2f / %.2f | %.2f / %.2f | %+.1f%% | %.1f%% | %.0f -> %.0f | %.2f | %.3f | %s | %s | %s |" % (
+                B, D, arm, arm_footprint(arm), ("%d" % ps[0]) if len(ps) == 1 else "%d-%d" % (ps[0], ps[-1]), bw_a, bw_c, 100 * bw_c / dma_c, fnum(bw_d),
+                fnum(100 * med(a["inf"]) if a["inf"] else None, "%.0f%%"), med(a["da"]), p95(a["da"]), med(a["dc"]), p95(a["dc"]), 100 * slow,
+                100 * med(a["da"]) / med(a["dc"]), 1000 * B / med(a["da"]), 1000 * B / med(a["dc"]), min(a["ov"]), max(a["hl"]),
+                "-" if covered is None else ("yes" if covered else "NO"),
+                ("YES" if meets else ("n/a" if arm == "dma2d" else "no")) + ("" if valid else " (INVALID overlap/timer)"),
+                "YES" if meets_d else ("n/a" if arm == "dma2d" else "no")))
         L.append("")
-        L.append("B=%d: correctness fails %d; peak allocated %.2f GB, reserved %.2f GB of %.1f GB; NUMA %s" % (B, p["fails"], p["peak_allocated_gb"], p["peak_reserved_gb"], p["device_total_gb"], json.dumps(p["numa"])))
+        numa = p.get("numa") or {}
+        lay = numa.get("layers") or {}
+        L.append("B=%d: correctness fails %d%s; peak allocated %.2f GB, reserved %.2f GB of %.1f GB; host cache NUMA node per layer (0 / 1 / s = split): "
+                 "K %s, V %s; %s" % (B, p["fails"], " (PARTIAL: the run did not finish)" if p.get("partial") else "", p["peak_allocated_gb"], p["peak_reserved_gb"],
+                                    p["device_total_gb"], lay.get("k_nodes", "?"), lay.get("v_nodes", "?"),
+                                    json.dumps({k: v for k, v in numa.items() if k != "layers"})))
         for t in (p.get("hisparse") or {}).get("plans", []):
             if "refused" in t:
                 L.append("B=%d plan D=%d %s: REFUSED (%s)" % (B, t["D"], t["item"], t["refused"]))
@@ -389,11 +471,14 @@ def table(out_dir):
                      % (B, t["D"], t["item"], t["n_items"], t["item_size_bytes"], t["plan_stride"], t["build_host_ms"], t["upload_ms"], t["build_device_ms"], t["device_build_equal"]))
         L.append("")
     met = [v for v in verdict_rows if v["meets"]]
+    met_d = [v for v in verdict_rows if v["meets_during"]]
     L.append("## Registered target (ledger 'WORKER SWEEP REGISTERED'): >= 90% of the matched copy-engine concurrent bandwidth with <= 5% decode slowdown")
-    L.append("MET by: " + (", ".join("B=%d D=%d %s" % (v["B"], v["D"], v["arm"]) for v in met) if met else "NONE -- see the tradeoff columns above"))
+    L.append("MET (whole-interval GB/s) by: " + (", ".join("B=%d D=%d %s" % (v["B"], v["D"], v["arm"]) for v in met) if met else "NONE -- see the tradeoff columns above"))
+    L.append("MET (during-step GB/s, lower bound) by: " + (", ".join("B=%d D=%d %s" % (v["B"], v["D"], v["arm"]) for v in met_d) if met_d else "NONE"))
     text = "\n".join(L) + "\n"
     open(os.path.join(out_dir, "sweep_table.md"), "w").write(text)
-    json.dump(dict(verdicts=verdict_rows, fails=sum(p["fails"] for p in pays)), open(os.path.join(out_dir, "sweep_table.json"), "w"), indent=1)
+    json.dump(dict(verdicts=verdict_rows, fails=sum(p["fails"] for p in pays), partial=[p.get("partial", False) for p in pays]),
+              open(os.path.join(out_dir, "sweep_table.json"), "w"), indent=1)
     print(text)
     return 0 if pays and all(p["fails"] == 0 for p in pays) else 1
 
@@ -407,9 +492,15 @@ if __name__ == "__main__":
     model = VA.load_model(path)
     ids, docs, distinct = VA.pick_batch(corpus, VA.BATCH, 0)
     print("[docs] %s%s (%d distinct books for %d requests)  L=%d N=%d D=%s workers=%s reps=%d" % (docs[:8], "..." if len(docs) > 8 else "", distinct, len(docs), VA.L, VA.N, D_LIST, WORKERS, REPS), flush=True)
-    payload = run(model, ids)
-    payload["docs"] = docs; payload["distinct_books"] = distinct
     fn = os.path.join(OUT, "%s.json" % TAG)
-    json.dump(payload, open(fn, "w"), indent=1)
+
+    def flush(p):
+        """Write the JSON atomically (review NB10: after every gated step, so a timeout keeps the finished steps)."""
+        p["docs"] = docs; p["distinct_books"] = distinct
+        tmp = fn + ".tmp"
+        json.dump(p, open(tmp, "w"), indent=1)
+        os.replace(tmp, fn)
+    payload = run(model, ids, flush=flush)
+    flush(payload)
     print("[sweep] saved %s (fails %d, peak reserved %.2f GB)" % (fn, payload["fails"], payload["peak_reserved_gb"]), flush=True)
     sys.exit(min(payload["fails"], 200))

@@ -16,7 +16,10 @@
 //                                                           not here: reading it would sync every launch)
 //   host_k, host_v pinned CPU, contiguous, same dtype and byte size (read through UVA)
 //   dev_k, dev_v   CUDA on the plan's device, contiguous, same dtype and byte size as each other
-// IsMLA = false: K and V are separate caches and both are copied at the same locs (:213-222).
+// is_mla = false: K and V are separate caches and both are copied at the same locs (:213-222).
+// is_mla = true : SGLang's shipped instantiation (copy_cache_planned_mla): K only. host_v / dev_v are IGNORED
+//                 (not checked, not dereferenced: the launcher passes nullptr as upstream :919/:921 do); the
+//                 python wrapper passes empty placeholders.
 #include <torch/extension.h>
 
 #include <algorithm>
@@ -36,7 +39,8 @@ void hisparse_copy_planned_cuda(
     int64_t num_blocks,
     int64_t block_size,
     int64_t item_size_bytes,
-    bool skip_io);
+    bool skip_io,
+    bool is_mla);
 
 namespace {
 
@@ -82,7 +86,8 @@ void copy_planned(
     int64_t num_blocks,
     int64_t block_size,
     int64_t item_size_bytes,
-    bool skip_io) {
+    bool skip_io,
+    bool is_mla) {
   check_plan_2d(miss_src_locs, at::kLong, "miss_src_locs");
   check_plan_2d(miss_dst_locs, at::kInt, "miss_dst_locs");
   const int64_t R = miss_src_locs.size(0);
@@ -107,15 +112,18 @@ void copy_planned(
               "the four plan tensors must be on one device");
 
   check_cache(host_k, true, "host_k");
-  check_cache(host_v, true, "host_v");
   check_cache(dev_k, false, "dev_k");
-  check_cache(dev_v, false, "dev_v");
-  TORCH_CHECK(dev_k.device() == dev && dev_v.device() == dev, "dev_k / dev_v must be on the plan's device ", dev);
-  TORCH_CHECK(host_k.scalar_type() == host_v.scalar_type() && dev_k.scalar_type() == host_k.scalar_type()
-                  && dev_v.scalar_type() == host_k.scalar_type(),
-              "host_k, host_v, dev_k, dev_v must share one dtype");
-  TORCH_CHECK(nbytes(host_k) == nbytes(host_v), "host_k and host_v must have the same byte size (K and V share locs, :214-221)");
-  TORCH_CHECK(nbytes(dev_k) == nbytes(dev_v), "dev_k and dev_v must have the same byte size (K and V share locs, :214-221)");
+  TORCH_CHECK(dev_k.device() == dev, "dev_k must be on the plan's device ", dev);
+  TORCH_CHECK(dev_k.scalar_type() == host_k.scalar_type(), "host_k and dev_k must share one dtype");
+  if (!is_mla) {
+    check_cache(host_v, true, "host_v");
+    check_cache(dev_v, false, "dev_v");
+    TORCH_CHECK(dev_v.device() == dev, "dev_v must be on the plan's device ", dev);
+    TORCH_CHECK(host_k.scalar_type() == host_v.scalar_type() && dev_v.scalar_type() == host_k.scalar_type(),
+                "host_k, host_v, dev_k, dev_v must share one dtype");
+    TORCH_CHECK(nbytes(host_k) == nbytes(host_v), "host_k and host_v must have the same byte size (K and V share locs, :214-221)");
+    TORCH_CHECK(nbytes(dev_k) == nbytes(dev_v), "dev_k and dev_v must have the same byte size (K and V share locs, :214-221)");
+  }
 
   TORCH_CHECK(item_size_bytes > 0 && item_size_bytes % 16 == 0,
               "item_size_bytes must be a positive multiple of 16 (got ", item_size_bytes, "): transfer_item_warp moves "
@@ -133,16 +141,17 @@ void copy_planned(
               "block_size ", block_size, " is not instantiated; supported: 256, 1024");
 
   hisparse_copy_planned_cuda(miss_src_locs, miss_dst_locs, miss_counts, num_real_reqs, host_k, host_v, dev_k, dev_v,
-                             num_blocks, block_size, item_size_bytes, skip_io);
+                             num_blocks, block_size, item_size_bytes, skip_io, is_mla);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("copy_planned", &copy_planned,
-        "SGLang HiSparse copy_cache_planned_kernel (87db743, vendored): one launch copies every planned item of K and V",
+        "SGLang HiSparse copy_cache_planned_kernel (87db743, vendored): one launch copies every planned item of K and V "
+        "(is_mla = true: K only, SGLang's shipped copy_cache_planned_mla)",
         pybind11::arg("miss_src_locs"), pybind11::arg("miss_dst_locs"), pybind11::arg("miss_counts"),
         pybind11::arg("num_real_reqs"), pybind11::arg("host_k"), pybind11::arg("host_v"), pybind11::arg("dev_k"),
         pybind11::arg("dev_v"), pybind11::arg("num_blocks"), pybind11::arg("block_size"),
-        pybind11::arg("item_size_bytes"), pybind11::arg("skip_io"));
+        pybind11::arg("item_size_bytes"), pybind11::arg("skip_io"), pybind11::arg("is_mla") = false);
   m.def("block_sizes", []() { return kBlockSizes; }, "BLOCK_SIZE values the kernel is instantiated for");
   m.def("upstream_commit", []() { return std::string(kUpstreamCommit); }, "SGLang commit the kernel is vendored from");
 }

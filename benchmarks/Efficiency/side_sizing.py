@@ -13,6 +13,17 @@ RULE NOW
      max_trials trials). The last trial's outcome is recorded (covered or not).
   3. validity (unchanged): every concurrent rep must have overlap_frac >= OVERLAP_MIN (0.95) and every
      rep host_lag <= HOST_LAG_MAX_MS (0.1 ms); rows that fail are kept and flagged INVALID.
+
+DURING-STEP ACCOUNTING (review B3, 2026-09-23). Interval coverage alone cannot show that the copy ran DURING the
+step: the whole-interval GB/s (bytes / side interval) includes the >= 15% tail the side runs alone after the step
+ends, and a per-layer launch queued behind the step still reads overlap 1.0. So every side function records ONE
+event on the side stream after each launch unit (one layer: K and V) through LAUNCH_LOG.mark(bytes), and each
+concurrent bracket reports, from those events (all timed from the gate; t0 = gate + host_lag):
+  during_bytes  bytes of the launch units whose END falls inside [t0, tm] (the step's interval)
+  during_gbps   during_bytes / main_ms: a LOWER BOUND of the bandwidth delivered during the step (the unit still in
+                flight at tm is not counted)
+  inside_frac   during_bytes / all side bytes of the rep
+  last_end_ms   end of the last unit relative to t0 (<= main_ms: the whole side finished inside the step)
 """
 import math
 from typing import Callable, Dict, List, Tuple
@@ -67,3 +78,59 @@ def overlap_frac(side_ms: float, host_lag_ms: float, main_ms: float) -> float:
 def valid(overlaps, host_lags) -> bool:
     ov, hl = list(overlaps), list(host_lags)
     return bool(ov) and min(ov) >= OVERLAP_MIN and (not hl or max(hl) <= HOST_LAG_MAX_MS)
+
+
+def lag_ok(host_lags) -> bool:
+    """The timer rule alone (the burst regime has no coverage requirement: its side may end before the step)."""
+    hl = list(host_lags)
+    return bool(hl) and max(hl) <= HOST_LAG_MAX_MS
+
+
+def during_step(end_from_gate_ms, nbytes, host_lag_ms: float, main_ms: float) -> Dict:
+    """Pure: launch-unit end times (ms from the gate event) and their bytes -> the during-step record (see the module
+    docstring). A unit ending before t0 or after tm is not counted as delivered during the step."""
+    ends = [float(e) - float(host_lag_ms) for e in end_from_gate_ms]
+    nb = [int(b) for b in nbytes]
+    if len(ends) != len(nb):
+        raise ValueError("%d end times for %d byte counts" % (len(ends), len(nb)))
+    total = sum(nb)
+    during = sum(b for e, b in zip(ends, nb) if 0.0 <= e <= main_ms)
+    nan = float("nan")
+    return dict(n_launches=len(nb), side_bytes=total, during_bytes=during,
+                during_gbps=(during / (main_ms * 1e6) if main_ms > 0 else nan),
+                inside_frac=(during / total if total else nan),
+                first_end_ms=(min(ends) if ends else nan), last_end_ms=(max(ends) if ends else nan))
+
+
+def _cuda_timing_event():
+    import torch
+    return torch.cuda.Event(enable_timing=True)
+
+
+class LaunchLog:
+    """Events recorded on the CURRENT stream (the side stream, inside `with torch.cuda.stream(side)`) after each
+    launch unit, with the bytes that unit moved. Events come from a pool that grows once and is reused, so a
+    bracket allocates nothing after the first rep. reset() at the start of every bracket."""
+
+    def __init__(self, event_factory=None):
+        self._factory = event_factory or _cuda_timing_event
+        self._pool: List = []
+        self._bytes: List[int] = []
+        self.n = 0
+
+    def reset(self) -> None:
+        self.n = 0
+        self._bytes = []
+
+    def mark(self, nbytes: int) -> None:
+        if self.n == len(self._pool):
+            self._pool.append(self._factory())
+        self._pool[self.n].record()
+        self._bytes.append(int(nbytes))
+        self.n += 1
+
+    def marks(self) -> List[Tuple[object, int]]:
+        return list(zip(self._pool[: self.n], self._bytes))
+
+
+LAUNCH_LOG = LaunchLog()

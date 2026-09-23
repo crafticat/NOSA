@@ -36,6 +36,14 @@ THE PLAN (the tensors the kernel reads, hisparse_coordinator.py:296-307 shapes)
   num_real int32 [1]  = B
 Items inside a row are in NOSI's load_ids memory order: head, then slot, then row (head_row); slot,
 then row (row); slot (block).
+
+THE NATIVE CONTROL (build_native_plan; no adapter, review 2026-09-23 / the user's request): HiSparse's OWN layout.
+Host pool and device buffer are linear arrays of item_size_bytes records, one record = one token of one layer
+(1152 B = 576 x bf16 = HiSparse's BF16 MLA item: kv_lora_rank 512 + rope 64), K ONLY (IsMLA = true, SGLang's
+shipped copy_cache_planned_mla). Request b owns host records [b*ctx, (b+1)*ctx) and device records
+[b*slots, (b+1)*slots). Per request and layer: `misses` distinct host tokens drawn uniformly (seeded) from its ctx
+tokens into `misses` distinct device slots (274 = 13.4% of k = 2048, HiSparse's published LRU miss rate at a
+4096-slot buffer). Items stay in draw order: HiSparse orders a request's misses by top-k index, not by address.
 """
 from __future__ import annotations
 
@@ -46,6 +54,8 @@ from typing import Iterator, Optional, Tuple
 import torch
 
 KINDS = ("head_row", "row", "block")
+NATIVE_KIND = "native"
+NATIVE_ITEM_BYTES = 1152             # 576 x bf16: HiSparse's BF16 MLA token record (kv_cache_dim 576)
 LABEL_KIND = {"i256": "head_row", "i512": "row", "i32k": "block"}
 LABEL_BYTES = {"i256": 256, "i512": 512, "i32k": 32768}
 WARP_SIZE = 32
@@ -84,6 +94,7 @@ class Plan:
     n_items: int
     host_records: int
     dev_records: int
+    k_only: bool = False              # True = IsMLA (SGLang's shipped instantiation): K only, V never touched
 
     @property
     def plan_stride(self) -> int:
@@ -95,8 +106,9 @@ class Plan:
 
     @property
     def bytes_per_launch(self) -> int:
-        """K and V: copy_miss_item moves the K item, then the V item at the same locs (:213-222)."""
-        return 2 * self.n_items * self.item_size_bytes
+        """K and V: copy_miss_item moves the K item, then the V item at the same locs (:213-222); K only when
+        k_only (IsMLA: the `if constexpr (!IsMLA)` V copy is compiled out)."""
+        return (1 if self.k_only else 2) * self.n_items * self.item_size_bytes
 
     def to(self, device, non_blocking: bool = False) -> "Plan":
         return replace(self, src=self.src.to(device, non_blocking=non_blocking), dst=self.dst.to(device, non_blocking=non_blocking),
@@ -180,6 +192,47 @@ def build_plan(load_ids: torch.Tensor, *, s_cpu: int, s_dst: int, n_heads: int, 
     plan_dst[rows, pos] = dst.to(torch.int32)
     return Plan(src=plan_src, dst=plan_dst, counts=counts.to(torch.int32), num_real=torch.tensor([B], dtype=torch.int32, device=dev),
                 kind=kind, item_size_bytes=nbytes, n_items=int(counts.sum()), host_records=host_records, dev_records=dev_records)
+
+
+def build_native_plan(*, B: int, misses: int, ctx: int, slots: int, item_size_bytes: int = NATIVE_ITEM_BYTES,
+                      seed: int = 0, pad: int = -1) -> Plan:
+    """HiSparse's native layout (module docstring, THE NATIVE CONTROL): a K-only plan of B requests x `misses`
+    scattered token records. Built on the CPU with a seeded generator (the reproduction's plans are inputs, as
+    the anchor's recorded miss plan is in SGLang); .to(device) uploads it."""
+    if B < 1 or misses < 1:
+        raise ValueError("B = %d, misses = %d: both must be >= 1" % (B, misses))
+    if misses > ctx or misses > slots:
+        raise ValueError("%d misses do not fit %d host tokens / %d device slots per request" % (misses, ctx, slots))
+    if item_size_bytes <= 0 or item_size_bytes % 16:
+        raise ValueError("item_size_bytes must be a positive multiple of 16, got %d" % item_size_bytes)
+    if B * slots >= 2 ** 31:
+        raise ValueError("%d device records exceed miss_dst_locs' int32" % (B * slots))
+    g = torch.Generator().manual_seed(int(seed))
+    src = torch.stack([torch.randperm(ctx, generator=g)[:misses] for _ in range(B)]).to(torch.int64)
+    dst = torch.stack([torch.randperm(slots, generator=g)[:misses] for _ in range(B)]).to(torch.int64)
+    b = torch.arange(B, dtype=torch.int64)[:, None]
+    return Plan(src=(b * ctx + src).contiguous(), dst=(b * slots + dst).to(torch.int32).contiguous(),
+                counts=torch.full((B,), misses, dtype=torch.int32), num_real=torch.tensor([B], dtype=torch.int32),
+                kind=NATIVE_KIND, item_size_bytes=int(item_size_bytes), n_items=B * misses, host_records=B * ctx,
+                dev_records=B * slots, k_only=True)
+
+
+def timed_native_build(device=None, **kw):
+    """build_native_plan timed on the host, then uploaded to `device` (upload timed). There is no device build to
+    compare: in SGLang the plan is recorded by the anchor's resolver, which is not part of this copy."""
+    t0 = time.perf_counter()
+    p = build_native_plan(**kw)
+    t = dict(build_host_ms=1e3 * (time.perf_counter() - t0), n_items=p.n_items, plan_stride=p.plan_stride,
+             item_size_bytes=p.item_size_bytes, kind=p.kind, label=p.label, plan_bytes=_plan_bytes(p), k_only=True,
+             build_device_ms=None, device_build_equal=None)
+    if device is None:
+        return p, t
+    _sync(device)
+    t1 = time.perf_counter()
+    p_dev = p.to(device)
+    _sync(device)
+    t["upload_ms"] = 1e3 * (time.perf_counter() - t1)
+    return p_dev, t
 
 
 def validate_plan(plan: Plan) -> None:
@@ -275,13 +328,15 @@ def _records(t: torch.Tensor, item: int) -> torch.Tensor:
 
 def simulate_planned_copy(plan: Plan, host_k, host_v, dev_k, dev_v, num_blocks: Optional[int] = None,
                           block_size: Optional[int] = None) -> int:
-    """CPU twin of one copy_cache_planned_kernel launch with IsMLA = false (:879-887 -> :212-222): for every
-    planned item, dev[dst] = host[src] for K and for V, byte for byte. With num_blocks / block_size the
-    items are visited in the kernel's own warp walk (kernel_walk); otherwise vectorized. Returns the number
-    of items copied."""
+    """CPU twin of one copy_cache_planned_kernel launch (:879-887 -> :212-222): for every planned item,
+    dev[dst] = host[src] for K and, unless plan.k_only (IsMLA), for V, byte for byte. With num_blocks /
+    block_size the items are visited in the kernel's own warp walk (kernel_walk); otherwise vectorized.
+    Returns the number of items copied."""
     item = plan.item_size_bytes
     real = int(plan.num_real.reshape(-1)[0])
-    pairs = ((_records(host_k, item), _records(dev_k, item)), (_records(host_v, item), _records(dev_v, item)))
+    pairs = ((_records(host_k, item), _records(dev_k, item)),)
+    if not plan.k_only:
+        pairs += ((_records(host_v, item), _records(dev_v, item)),)
     src, dst = plan.src.cpu(), plan.dst.cpu().to(torch.int64)
     if num_blocks is not None:
         n = 0
