@@ -32,6 +32,9 @@ PASS RULE (registered before the run; evaluate_cells):
   step time (harness main_ms) is within 2% of the untraced median of the same process (else INCONCLUSIVE); the negative
   control (arm 'alone_late') must FAIL the 0.5% rule in every traced rep (DETECTED), otherwise the metric is not trusted
   (NOT_DETECTED). A FAILED cell's gated device times are invalid. No row is rescued by a threshold on totals.
+  (review fix, pre-GPU) a cell whose traced reps hold ANY main-stream GPU op inside [gate end, last step op end) that is
+  not attributed to a correlated step launch (n_main_unattributed > 0) cannot PASS: it is INCONCLUSIVE, because the
+  metric cannot see a gap that such an op would hide.
     python launch_timeline.py OUT_PREFIX run1.sqlite [run2.sqlite ...] [--harness sweep_b64.json ...]
 """
 import csv
@@ -194,11 +197,12 @@ def evaluate_cells(reps: List[Dict], harness_records: List[Dict]) -> List[Dict]:
         none_pass = bool(rs) and not any(r["passes_rule"] for r in rs)
         repr_ratio = (_median(traced) / _median(untraced) - 1.0) if traced and untraced else float("nan")
         repr_ok = repr_ratio == repr_ratio and abs(repr_ratio) <= REPR_TOL
+        complete = all(int(r.get("n_main_unattributed") or 0) == 0 for r in rs)     # review fix: every main-stream op attributed
         if arm in NEG_CONTROL_ARMS:
             verdict = "DETECTED" if none_pass else "NOT_DETECTED"
         elif not all_pass:
             verdict = "FAIL"
-        elif not repr_ok:
+        elif not repr_ok or not complete:
             verdict = "INCONCLUSIVE"
         else:
             verdict = "PASS"
@@ -208,7 +212,7 @@ def evaluate_cells(reps: List[Dict], harness_records: List[Dict]) -> List[Dict]:
                         max_gap_us=max(r["max_gap_us"] for r in rs) if rs else None,
                         min_backlog_us=min((r["min_backlog_us"] for r in rs if r.get("min_backlog_us") is not None), default=None),
                         traced_median_ms=_median(traced), untraced_median_ms=_median(untraced), traced_vs_untraced=repr_ratio,
-                        n_untraced=len(untraced), representative=repr_ok,
+                        n_untraced=len(untraced), representative=repr_ok, all_main_ops_attributed=complete,
                         grid_ok=(all(r["grid"]["ok"] for r in rs if r.get("grid")) if any(r.get("grid") for r in rs) else None)))
     return out
 
@@ -296,6 +300,14 @@ def analyse_trace(data: Dict, harness: Optional[Dict] = None) -> List[Dict]:
         summ = rep_summary(step, side, gate["end"])
         rows = summ.pop("rows")
         rec = dict(label=text, **lab, main_stream=ms, gate_end_ns=gate["end"], submit_range=win is not None, **summ)
+        # review fix: a main-stream GPU op inside [gate end, last step op end) that is NOT a step op (no correlated launch
+        # record, or its launch lies outside the range) is invisible to the metric and could hide a starved gap: count it;
+        # evaluate_cells makes such a cell INCONCLUSIVE (never PASS)
+        span_end = max((o["end"] for o in step), default=gate["end"])
+        seen = {(o["start"], o["end"], o["corr"]) for o in step}
+        rec["n_main_unattributed"] = sum(1 for g in data["gpu"] if g["stream"] == ms and gate["end"] <= g["start"] < span_end
+                                         and (g["start"], g["end"], g["corr"]) not in seen
+                                         and not any(p in (g["name"] or "").lower() for p in GATE_PATTERNS))
         rec["warmup"] = bool(lab.get("phase") == "traced" and lab.get("rep") == 0 and lab.get("kind") == "lt")
         rec["grid"] = grid_check(side, expected_grid(lab["arm"], harness))
         h = {r.get("label"): r for r in ((harness or {}).get("timeline") or [])}.get(text)
@@ -359,7 +371,7 @@ def main(argv) -> int:
     json.dump(dict(pass_frac=PASS_FRAC, repr_tol=REPR_TOL, reps=reps, cells=cells), open(out + ".json", "w"), indent=1, default=str)
     keys = ["label", "batch", "arm", "step", "phase", "rep", "warmup", "n_step_ops", "n_submissions", "span_ms", "starved_ms", "starved_lb_ms",
             "starved_frac", "n_starved", "max_starved_us", "max_gap_us", "min_backlog_us", "main_busy_frac", "device_busy_frac", "head_ms",
-            "queued_at_gate", "busy_queued_ms", "submit_end_after_gate_ms", "harness_submit_end_ms", "harness_main_ms", "harness_host_submit_ms",
+            "n_main_unattributed", "queued_at_gate", "busy_queued_ms", "submit_end_after_gate_ms", "harness_submit_end_ms", "harness_main_ms", "harness_host_submit_ms",
             "side_busy_in_span_ms", "passes_rule", "error", "sqlite"]
     with open(out + ".reps.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
