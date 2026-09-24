@@ -20,6 +20,11 @@ ARMS (identical bytes, identical destinations except dma2d, which writes each re
   hicachejit<W>_t1024_<lf|pf>  JIT hicache_transfer_per_layer, W blocks x 1024 threads (SGLang's default; NOT Strata)
   hisparse<W>_i512_t1024       HiSparse copy_cache_planned_kernel on the SAME lf host buffers (control; NOT Strata)
   dma2d                        cudaMemcpy2DAsync of the same bytes per layer and tensor, request prefixes (copy engine)
+ITEM-SIZE CONTROL (HR_HC_ITEM_CONTROL=1; a mechanism control, NOT SGLang's item for NOSA): a second seeded plan whose
+device rows are 64-row runs, copied by the AOT kernel as 512-B items (strata<W>_t1024_i512runs) and as 2048-B items of four
+consecutive tokens (strata<W>_t1024_i2048runs; Strata Fig. 5's Llama-3.1-8B K row is 2 KB), identical bytes and
+destinations. The SASS of transfer_item_warp batches four 8-B loads per lane only when a lane has >= 4 chunks (items
+>= 1 KB); this pair tests whether the item size, not a different kernel, sets the AOT kernel's bandwidth.
 PLAN COST: EXCLUDED from every timed side (prebuilt index tensors, as SGLang's per-layer loop); the released caller's
 cost (host build + pageable index upload, once per load op) is timed separately (meta.plans.native). Every row is a
 'prebuilt-plan copy microbenchmark, NOT an integrated LRU getter baseline'.
@@ -134,13 +139,19 @@ def setup(cfg, hs, side, cudart, H) -> Dict:
             return [(dev_k.view(L, B, -1)[:, :, :w_el], dma_ref_k), (dev_v.view(L, B, -1)[:, :, :w_el], dma_ref_v)]
         return None
 
+    def rows_of(kind):
+        if kind == "runs":
+            return runs["didx"], runs["ref_k"], runs["ref_v"]
+        return didx, ref_k, ref_v
+
     def poison(kind):
         if kind == "dma2d":
             for t, _ in region(kind):
                 t.fill_(nan)
         else:
-            dev_k[:, didx] = nan
-            dev_v[:, didx] = nan
+            di_, _, _ = rows_of(kind)
+            dev_k[:, di_] = nan
+            dev_v[:, di_] = nan
 
     def canary_intact() -> bool:
         return all(not bool(t[l].ne(CANARY).any()) for t in (dev_k, dev_v) for l in range(L))
@@ -151,9 +162,10 @@ def setup(cfg, hs, side, cudart, H) -> Dict:
             for t, _ in region(kind):
                 t.fill_(CANARY)
         else:
-            ok = torch.equal(dev_k[:, didx], ref_k) and torch.equal(dev_v[:, didx], ref_v)
-            dev_k[:, didx] = CANARY
-            dev_v[:, didx] = CANARY
+            di_, rk, rv = rows_of(kind)
+            ok = torch.equal(dev_k[:, di_], rk) and torch.equal(dev_v[:, di_], rv)
+            dev_k[:, di_] = CANARY
+            dev_v[:, di_] = CANARY
         intact = canary_intact()
         stats["canary_fail"] += int(not intact)
         return bool(ok and intact)
@@ -236,6 +248,44 @@ def setup(cfg, hs, side, cudart, H) -> Dict:
     if cfg.dma:
         arms.append(dict(arm="dma2d", family="dma2d", W=None, threads=None, item="prefix", kind="dma2d", mk=side_dma(), bytes_pass=dma_bytes))
 
+    # ---- item-size control (module docstring): a second plan with device runs, AOT at 512 B and at 2048 B
+    runs = None
+    if cfg.hc_item_control:
+        pr, tr = HC.timed_native_build(B=B, host_tokens_per_request=cfg.s_cpu, dev_rows_per_request=cfg.window_rows, runs_per_request=cfg.miss_per_head,
+                                       block_rows=cfg.block_rows, item_size=item, seed=cfg.seed + 1, dev_mode="runs")
+        hr_, dr_ = tr.pop("host_idx_gpu"), tr.pop("dev_idx_gpu")
+        HC.validate_indices(pr.host_idx, pr.dev_idx, host_records, dev_records, item)
+        g4 = 4
+        h4, d4 = pr.host_idx.view(-1, g4), pr.dev_idx.view(-1, g4)
+        if not (bool(((h4 - h4[:, :1]) == torch.arange(g4)).all()) and bool(((d4 - d4[:, :1]) == torch.arange(g4)).all())
+                and bool((h4[:, 0] % g4 == 0).all()) and bool((d4[:, 0] % g4 == 0).all())):
+            raise AssertionError("the runs plan does not group into aligned 4-token items")
+        h4i, d4i = (h4[:, 0] // g4).cuda(), (d4[:, 0] // g4).cuda()
+        runs = dict(didx=dr_, ref_k=lf_k[:, pr.host_idx].cuda(), ref_v=lf_v[:, pr.host_idx].cuda())
+        plan_meta["runs"] = dict(tr, item_size_bytes=item, label=HC.PLAN_COST_LABEL, counts=pr.counts, dev_mode="runs",
+                                 note="item-size control only; the i2048 items are 4 consecutive tokens of this plan")
+
+        def side_runs(W, big):
+            def mk(passes):
+                def f():
+                    for _ in range(passes):
+                        for l in range(L):
+                            if big:
+                                aot.aot_per_layer(lf_k[l], dev_k[l], lf_v[l], dev_v[l], h4i, d4i, g4 * item, W, 32)
+                            else:
+                                aot.aot_per_layer(lf_k[l], dev_k[l], lf_v[l], dev_v[l], hr_, dr_, item, W, 32)
+                            H.SZ.LAUNCH_LOG.mark(layer_bytes)
+                return f
+            return mk
+        for W in cfg.hc_blocks:
+            for big in (False, True):
+                name = "strata%d_t1024_%s" % (W, "i2048runs" if big else "i512runs")
+                n_it = pr.n_items // g4 if big else pr.n_items
+                grids[name] = dict(grid=HC.aot_grid(n_it, W, 32)[1], block=1024, kernel="transfer_kernel_impl", label=HC.STRATA_LABEL, layout="lf",
+                                   control="item size")
+                arms.append(dict(arm=name, family="strata", W=W, threads=1024, item=("i2048" if big else "i512") + "_runs", kind="runs",
+                                 mk=side_runs(W, big), bytes_pass=pass_bytes))
+
     # ---- negative controls: each must make check() fail
     wrong = didx.clone()
     wrong[0], wrong[1] = didx[1].item(), didx[0].item()
@@ -252,6 +302,7 @@ def setup(cfg, hs, side, cudart, H) -> Dict:
                 neg_controls=neg, stats=stats,
                 meta=dict(payload=dict(kind="hicache", item_size_bytes=item, n_items_per_layer=N, counts=p.counts, block_rows=p.block_rows,
                                        dev_mode=p.dev_mode, host_alloc=cfg.hc_host_alloc, layouts=list(cfg.hc_layouts), kernels=list(cfg.hc_kernels),
+                                       item_control=bool(cfg.hc_item_control),
                                        same_plan_every_layer=True, bench_label=HC.BENCH_LABEL, plan_cost=HC.PLAN_COST_LABEL),
                           pass_bytes=pass_bytes, dma_bytes=dma_bytes, dma_width_bytes=w_dma, numa=numa, plans=plan_meta, expected_grids=grids,
                           strata_label=HC.STRATA_LABEL, jit_label=HC.JIT_LABEL, upstream_sglang=HC.UPSTREAM_COMMIT))

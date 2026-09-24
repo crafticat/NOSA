@@ -131,6 +131,7 @@ class Config:
     hc_blocks: Tuple[int, ...] = (1, 2)
     hc_dev_mode: str = "scattered"
     hc_host_alloc: str = "register"
+    hc_item_control: bool = False
     out: str = "."
     tag: str = "repro"
 
@@ -155,6 +156,7 @@ def config_from_env(env=None) -> Config:
         num_splits=int(g("HR_NUM_SPLITS", "4")), require_numa_node=(int(rn) if rn.strip() else None), nvtx=g("HR_NVTX", "0") == "1",
         hc_layouts=tuple(g("HR_HC_LAYOUTS", "lf pf").split()), hc_kernels=tuple(g("HR_HC_KERNELS", "aot jit").split()),
         hc_blocks=_ints(g("HR_HC_BLOCKS", "1 2")), hc_dev_mode=g("HR_HC_DEV_MODE", "scattered"), hc_host_alloc=g("HR_HC_HOST_ALLOC", "register"),
+        hc_item_control=g("HR_HC_ITEM_CONTROL", "0") == "1",
         out=g("HR_OUT", "."), tag=g("HR_TAG", "repro"))
     if cfg.payload not in PAYLOADS:
         raise ValueError("HR_PAYLOAD must be one of %s, got %r" % (PAYLOADS, cfg.payload))
