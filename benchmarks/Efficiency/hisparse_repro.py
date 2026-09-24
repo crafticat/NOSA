@@ -88,7 +88,7 @@ CUDART = "/venv/nosa/lib/python3.10/site-packages/nvidia/cuda_runtime/lib/libcud
 # NOSA-8B, /mnt/beegfs/ojerbi/models/NOSA-8B/config.json
 MODEL = dict(hidden=4096, n_heads=32, n_kv=2, head_dim=128, inter=16384, vocab=73448, layers=32, eps=1e-6)
 GPU_CLOCK_HZ = 1.41e9          # the worker sweep's sleep calibration (A100 max SM clock)
-PAYLOADS = ("nosi", "native")
+PAYLOADS = ("nosi", "native", "hicache")
 REGIMES = ("saturating", "burst")
 
 
@@ -126,6 +126,11 @@ class Config:
     num_splits: int = 4
     require_numa_node: Optional[int] = None
     nvtx: bool = False
+    hc_layouts: Tuple[str, ...] = ("lf", "pf")
+    hc_kernels: Tuple[str, ...] = ("aot", "jit")
+    hc_blocks: Tuple[int, ...] = (1, 2)
+    hc_dev_mode: str = "scattered"
+    hc_host_alloc: str = "register"
     out: str = "."
     tag: str = "repro"
 
@@ -148,9 +153,16 @@ def config_from_env(env=None) -> Config:
         regimes=tuple(g("HR_REGIMES", "saturating burst").split()),
         reps=int(g("HR_REPS", "5")), sleep_ms=float(g("HR_SLEEP_MS", "15")), size_trials=int(g("HR_SIZE_TRIALS", "3")),
         num_splits=int(g("HR_NUM_SPLITS", "4")), require_numa_node=(int(rn) if rn.strip() else None), nvtx=g("HR_NVTX", "0") == "1",
+        hc_layouts=tuple(g("HR_HC_LAYOUTS", "lf pf").split()), hc_kernels=tuple(g("HR_HC_KERNELS", "aot jit").split()),
+        hc_blocks=_ints(g("HR_HC_BLOCKS", "1 2")), hc_dev_mode=g("HR_HC_DEV_MODE", "scattered"), hc_host_alloc=g("HR_HC_HOST_ALLOC", "register"),
         out=g("HR_OUT", "."), tag=g("HR_TAG", "repro"))
     if cfg.payload not in PAYLOADS:
         raise ValueError("HR_PAYLOAD must be one of %s, got %r" % (PAYLOADS, cfg.payload))
+    if cfg.payload == "hicache":
+        bad = [x for x in cfg.hc_layouts if x not in ("lf", "pf")] + [x for x in cfg.hc_kernels if x not in ("aot", "jit")]
+        if bad or cfg.hc_host_alloc not in ("register", "pin") or cfg.hc_dev_mode not in ("scattered", "runs"):
+            raise ValueError("bad HR_HC_* setting: layouts %r kernels %r host_alloc %r dev_mode %r"
+                             % (cfg.hc_layouts, cfg.hc_kernels, cfg.hc_host_alloc, cfg.hc_dev_mode))
     bad = [r for r in cfg.regimes if r not in REGIMES]
     if bad or not cfg.regimes:
         raise ValueError("HR_REGIMES must be a non-empty subset of %s, got %r" % (REGIMES, cfg.regimes))
@@ -173,6 +185,10 @@ def footprint(family: str, W: Optional[int], threads: Optional[int]) -> str:
         return "%d CTAs x 128 thr (not W SMs)" % W
     if family == "dma2d":
         return "copy engine"
+    if family == "strata":
+        return "%d blocks x 1024 thr (48 regs: 1 per SM)" % W
+    if family == "hicachejit":
+        return "%d blocks x 1024 thr (30-32 regs)" % W
     return "-"
 
 
@@ -430,7 +446,14 @@ def render_adapter(summary: List[Dict], plans: Dict) -> List[str]:
 
 def render(summary: List[Dict], meta: Dict) -> str:
     cfg = meta.get("config", {})
-    if cfg.get("payload") == "native":
+    if cfg.get("payload") == "hicache":
+        pl = meta.get("payload") or {}
+        pay = ("SGLang NATIVE HiCache layout (%s): %s-B token items (K and V), %s items per layer (runs of %s host slots per request: %s), "
+               "device rows %s, host alloc %s, the same plan for every layer; %.4f GB per pass. %s; %s. Arms strata* = %s. Arms hicachejit* = %s."
+               % ("/".join(pl.get("layouts", [])), pl.get("item_size_bytes"), pl.get("n_items_per_layer"), pl.get("block_rows"), pl.get("counts"),
+                  pl.get("dev_mode"), pl.get("host_alloc"), meta.get("pass_bytes", 0) / 1e9, pl.get("bench_label"), pl.get("plan_cost"),
+                  meta.get("strata_label"), meta.get("jit_label")))
+    elif cfg.get("payload") == "native":
         pay = ("NATIVE HiSparse layout (no adapter): %s-byte K-only records (IsMLA), %s scattered tokens per (layer, request) of a %s-token "
                "context into a %s-slot buffer, seed %s; %.4f GB per pass" % (cfg.get("native_item"), cfg.get("native_misses"), cfg.get("native_ctx"),
                                                                            cfg.get("native_slots"), cfg.get("seed"), meta.get("pass_bytes", 0) / 1e9))
@@ -693,11 +716,17 @@ class Proxy:
 def make_bracket(main, side, sleep_cycles):
     """The worker sweep's GPU-sleep-gated bracket (worker_sweep.py bracket(), identical lines) plus live_main: GPU sleep
     on main -> gate -> side enqueued behind the gate -> [live_main: host waits for the gate] -> t0 -> main work. The
-    side functions mark SZ.LAUNCH_LOG after every launch unit; a concurrent bracket adds the during-step record."""
+    side functions mark SZ.LAUNCH_LOG after every launch unit; a concurrent bracket adds the during-step record.
+    SELF-REPORT (Strata / timeline stage): host_submit_ms = host time of fn_main's submission; gate_done_at_submit_end =
+    the gate event had completed when fn_main returned (False = the whole step was queued before the GPU could start it);
+    submit_end_ms = elapsed(gate, an event recorded on the idle aux stream right after fn_main returned), the
+    submission end on the GPU clock (an UPPER bound if the aux stream shares a hardware queue with busy work)."""
+    aux = torch.cuda.Stream()
+
     def bracket(fn_main, fn_side, live_main=False):
         torch.cuda.synchronize()
         SZ.LAUNCH_LOG.reset()
-        ev = {k: torch.cuda.Event(enable_timing=True) for k in ("pre", "gate", "t0", "tm", "ts")}
+        ev = {k: torch.cuda.Event(enable_timing=True) for k in ("pre", "gate", "t0", "tm", "ts", "sub")}
         ev["pre"].record(main)
         torch.cuda._sleep(sleep_cycles)
         ev["gate"].record(main)
@@ -711,10 +740,15 @@ def make_bracket(main, side, sleep_cycles):
         if live_main:
             ev["gate"].synchronize()
         ev["t0"].record(main)
+        h1 = time.perf_counter()
         out = fn_main() if fn_main is not None else None
+        h2 = time.perf_counter()
+        gate_done = ev["gate"].query()
+        ev["sub"].record(aux)
         ev["tm"].record(main)
         torch.cuda.synchronize()
         r = dict(host_lag_ms=ev["gate"].elapsed_time(ev["t0"]), sleep_ms=ev["pre"].elapsed_time(ev["gate"]), host_enqueue_ms=host_enqueue_ms)
+        r.update(host_submit_ms=1000 * (h2 - h1), gate_done_at_submit_end=bool(gate_done), submit_end_ms=ev["gate"].elapsed_time(ev["sub"]))
         if fn_main is not None:
             r["main_ms"] = ev["t0"].elapsed_time(ev["tm"])
         if fn_side is not None:
@@ -986,7 +1020,14 @@ def _row(a: Dict, mode: str, regime: str, passes: int, sizing, fails: int, alone
                 host_enqueue_ms=[x["host_enqueue_ms"] for x in conc], sleep_ms=[x["sleep_ms"] for x in conc],
                 during_gbps=[x.get("during_gbps") for x in conc], inside_frac=[x.get("inside_frac") for x in conc],
                 during_bytes=[x.get("during_bytes") for x in conc], last_end_ms=[x.get("last_end_ms") for x in conc],
-                n_launches=[x.get("n_launches") for x in conc])
+                n_launches=[x.get("n_launches") for x in conc],
+                alone_self=[_self(x) for x in alone], conc_self=[_self(x) for x in conc])
+
+
+def _self(x: Dict) -> Dict:
+    """The self-reporting timer fields of one bracket (make_bracket docstring)."""
+    return dict(host_submit_ms=x.get("host_submit_ms"), gate_done_at_submit_end=x.get("gate_done_at_submit_end"),
+                submit_end_ms=x.get("submit_end_ms"), host_enqueue_ms=x.get("host_enqueue_ms"), main_ms=x.get("main_ms"))
 
 
 @torch.inference_mode()
@@ -1001,7 +1042,11 @@ def run(cfg: Config) -> Dict:
     main = torch.cuda.current_stream()
     side = torch.cuda.Stream()
     bracket = make_bracket(main, side, int(cfg.sleep_ms * 1e-3 * GPU_CLOCK_HZ))
-    env = (_setup_native if cfg.payload == "native" else _setup_nosi)(cfg, hs, side, cudart)
+    if cfg.payload == "hicache":
+        import hicache_payload as HP                                           # stage N0 (Strata / HiCache native control)
+        env = HP.setup(cfg, hs, side, cudart, sys.modules[__name__])
+    else:
+        env = (_setup_native if cfg.payload == "native" else _setup_nosi)(cfg, hs, side, cudart)
     fails += env["fails"]
     controls.update(env["controls"])
     arms, poison, check = env["arms"], env["poison"], env["check"]
@@ -1146,6 +1191,19 @@ def run(cfg: Config) -> Dict:
         except Exception as e:  # noqa: BLE001
             controls["skip_io_error"] = repr(e)[:300]
             fails += 1
+    # ---- negative controls of the payload (hicache: omitted layer, swapped destination index): each must be detected
+    for name, mk, kind in env.get("neg_controls", []):
+        try:
+            poison(kind)
+            bracket(None, mk(1))
+            detected = not check(kind)
+            controls["neg_" + name] = dict(detected=detected)
+            fails += int(not detected)
+        except Exception as e:  # noqa: BLE001
+            controls["neg_%s_error" % name] = repr(e)[:300]
+            fails += 1
+    if env.get("stats") is not None:
+        controls["payload_stats"] = dict(env["stats"])
 
     meta = dict(config=asdict(cfg), torch=torch.__version__, cuda=torch.version.cuda, device=torch.cuda.get_device_name(0),
                 attn_backend=proxy.attn_backend, norm_backend=proxy.norm_backend, weight_bytes=proxy.weight_bytes(),

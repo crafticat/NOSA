@@ -22,7 +22,7 @@ import sqlite3
 import sys
 from typing import Dict, List, Tuple
 
-SIDE_PATTERNS = ("copy_cache_planned", "flash_h2d_persistent")
+SIDE_PATTERNS = ("copy_cache_planned", "flash_h2d_persistent", "transfer_kernel_impl", "hicache_transfer_per_layer")
 GATE_PATTERNS = ("spin", "sleep")
 MEMCPY_HTOD = 1
 

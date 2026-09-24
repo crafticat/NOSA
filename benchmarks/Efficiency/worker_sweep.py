@@ -34,6 +34,30 @@ What is fixed and checked here:
 Env: WS_B (64), WS_D ('8 16'), WS_WORKERS ('1 2 4 8 16'), WS_N (8), WS_WARM (4), WS_REPS (5), WS_L (16128), WS_OUT, WS_TAG,
 WS_SLEEP_MS (15), WS_HS_BLOCKS ('1 2 4 8 16'; empty = no HiSparse arm), WS_HS_THREADS ('1024'; 256 and/or 1024),
 WS_HS_ITEMS ('i256 i32k'), WS_SIZE_TRIALS (3). Mode WS_MODE=run | table.
+
+STRATA / HICACHE ARMS (stage S2 of the Strata / timeline experiment; all default OFF, so the old runs are unchanged):
+  strata<W>_t1024_<item>      SGLang's AOT kvcacheio transfer_kv_per_layer (sglang 87db743, vendored verbatim in
+                              nosi/flash_cache_engine/sglang_hicache/): the CLOSEST RELEASED IMPLEMENTATION of Strata's IO
+                              kernel (Strata's first author; the paper releases no code). W blocks x 32 warps.
+  hicachejit<W>_t1024_<item>  SGLang's default JIT hicache_transfer_per_layer (87db743; NOT a Strata author, NOT Strata).
+  items: i256 = the NOSI ADAPTER (per-head 256-B rows, exact for any descriptor); i512 = SGLang's NATIVE token item (both
+  heads), exact here only because the sweep's ids are coupled (both heads load blocks 0..D-1 into slots 0..D-1).
+  Index tensors (int64, one per (D, item), the same for every layer: the sweep's ids are the same in every layer) are
+  PREBUILT outside every bracket: every row is a 'prebuilt-plan copy microbenchmark, NOT an integrated LRU getter
+  baseline'; the per-layer plan cost an integrated getter would pay (miss-mask compaction + count sync + index build) is
+  timed separately (plans[*].nosi_plan_cost) and never added to a row. First touch of every new arm checks layers 0,
+  L/2 and L-1 one at a time against their own source (NaN-poisoned scratch).
+  WS_ST_BLOCKS (''), WS_ST_ITEMS ('i256 i512'), WS_JIT_BLOCKS (''), WS_JIT_ITEMS ('i256'), WS_ARMS ('' = every arm; else only
+  the named arms run).
+SELF-REPORTING TIMER (every bracket, measurement only): host_submit_ms, gate_done_at_submit_end, submit_end_ms (see
+hisparse_repro.make_bracket, the same lines).
+STAGE T, LAUNCH-CORRELATED TIMELINE (WS_T_ARMS, '' = off): after the arms of the FIRST D of a gated step, for each named
+arm ('alone', 'alone_late' = the negative control: the host waits for the gate then sleeps WS_T_LATE_MS before it submits
+the step, or any arm name of this run): WS_T_UNTRACED untraced reps, then cudaProfilerStart, 1 + WS_T_REPS traced reps
+(the first is CUPTI warm-up), cudaProfilerStop, then WS_T_UNTRACED untraced reps again. Every rep sits in an NVTX range
+'lt|b<B>|<arm>|step<it>|<phase>|rep<k>' and the step's own submission in 'lt_submit|<the same label>'; run the process under
+`nsys profile --trace=cuda,nvtx --capture-range=cudaProfilerApi --capture-range-end=repeat` and analyse with
+launch_timeline.py. Records land in the JSON's 'timeline' list.
 """
 import ctypes
 import json
@@ -66,6 +90,15 @@ SLEEP_MS = float(os.environ.get("WS_SLEEP_MS", "15"))
 OUT = VA.OUT
 TAG = os.environ.get("WS_TAG", "sweep_b%d" % VA.BATCH)
 TARGET = dict(bw_frac_of_dma=0.90, max_slowdown=0.05)
+ST_BLOCKS = tuple(int(x) for x in os.environ.get("WS_ST_BLOCKS", "").split())
+ST_ITEMS = tuple(os.environ.get("WS_ST_ITEMS", "i256 i512").split())
+JIT_BLOCKS = tuple(int(x) for x in os.environ.get("WS_JIT_BLOCKS", "").split())
+JIT_ITEMS = tuple(os.environ.get("WS_JIT_ITEMS", "i256").split())
+ARMS_ONLY = tuple(os.environ.get("WS_ARMS", "").split())
+T_ARMS = tuple(os.environ.get("WS_T_ARMS", "").split())
+T_REPS = int(os.environ.get("WS_T_REPS", "3"))
+T_UNTRACED = int(os.environ.get("WS_T_UNTRACED", "3"))
+T_LATE_MS = float(os.environ.get("WS_T_LATE_MS", "2.0"))
 CUDART = "/venv/nosa/lib/python3.10/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12"
 
 
@@ -74,15 +107,50 @@ def hs_arm_name(W: int, item: str, threads: int) -> str:
     return "hisparse%d_%s" % (W, item) + ("" if threads == 1024 else "_t%d" % threads)
 
 
+def st_arm_name(family: str, W: int, item: str) -> str:
+    """strata<W>_t1024_<item> (the AOT kernel) or hicachejit<W>_t1024_<item> (the JIT kernel)."""
+    if family not in ("strata", "hicachejit"):
+        raise ValueError(family)
+    return "%s%d_t1024_%s" % (family, W, item)
+
+
 def arm_order(arm: str):
-    """Table order: dma2d, workers by W, hisparse by (item, threads suffix) then W."""
+    """Table order: dma2d, workers by W, hisparse by (item, threads suffix) then W, strata, hicachejit."""
     import re
     if arm == "dma2d":
         return (0, "", 0)
-    m = re.match(r"(workers|hisparse)(\d+)(.*)$", arm)
+    m = re.match(r"(workers|hisparse|strata|hicachejit)(\d+)(.*)$", arm)
     if m:
-        return ({"workers": 1, "hisparse": 2}[m.group(1)], m.group(3), int(m.group(2)))
-    return (3, arm, 0)
+        return ({"workers": 1, "hisparse": 2, "strata": 3, "hicachejit": 4}[m.group(1)], m.group(3), int(m.group(2)))
+    return (5, arm, 0)
+
+
+def arm_selected(arm: str) -> bool:
+    return not ARMS_ONLY or arm in ARMS_ONLY
+
+
+def self_report(r: dict) -> dict:
+    """The self-reporting timer fields of one bracket (measurement only; see the module docstring)."""
+    return dict(host_submit_ms=r.get("host_submit_ms"), gate_done_at_submit_end=r.get("gate_done_at_submit_end"),
+                submit_end_ms=r.get("submit_end_ms"), host_enqueue_ms=r.get("host_enqueue_ms"), main_ms=r.get("main_ms"))
+
+
+def timeline_main(fn, label: str, late_ms: float = 0.0):
+    """fn inside an NVTX range 'lt_submit|<label>' (the step's own submissions). late_ms > 0 = the NEGATIVE CONTROL: wait
+    for the gate (the main stream holds only the gate's sleep and events here), sleep late_ms on the host, then submit, so
+    the GPU is idle for >= late_ms before the step's first kernel; the timeline metric must count it as starvation."""
+    import torch as _t
+
+    def g():
+        if late_ms > 0:
+            _t.cuda.current_stream().synchronize()
+            time.sleep(late_ms / 1000.0)
+        _t.cuda.nvtx.range_push("lt_submit|" + label)
+        try:
+            return fn()
+        finally:
+            _t.cuda.nvtx.range_pop()
+    return g
 
 
 def numa_pages(ptr: int):
@@ -156,6 +224,7 @@ def run(model, ids, flush=None):
     for e in engines:
         assert e._k_cpu.is_pinned() and e._k_cpu.is_contiguous() and e._k_cpu.stride(0) == engines[0]._k_cpu.stride(0)
     side = torch.cuda.Stream()
+    aux = torch.cuda.Stream()                                           # idle: its event marks the step's submission end
     main = torch.cuda.current_stream()
     sleep_cycles = int(SLEEP_MS * 1e-3 * 1.41e9)
     try:
@@ -209,7 +278,7 @@ def run(model, ids, flush=None):
         """GPU sleep on main -> gate -> side enqueued behind the gate -> t0 -> main work. Returns ms dict."""
         torch.cuda.synchronize()
         SZ.LAUNCH_LOG.reset()
-        ev = {k: torch.cuda.Event(enable_timing=True) for k in ("pre", "gate", "t0", "tm", "ts")}
+        ev = {k: torch.cuda.Event(enable_timing=True) for k in ("pre", "gate", "t0", "tm", "ts", "sub")}
         ev["pre"].record(main)
         torch.cuda._sleep(sleep_cycles)
         ev["gate"].record(main)
@@ -221,10 +290,15 @@ def run(model, ids, flush=None):
                 ev["ts"].record(side)
         host_enqueue_ms = 1000 * (time.perf_counter() - h0)
         ev["t0"].record(main)
+        h1 = time.perf_counter()
         out = fn_main() if fn_main is not None else None
+        h2 = time.perf_counter()
+        gate_done = ev["gate"].query()
+        ev["sub"].record(aux)
         ev["tm"].record(main)
         torch.cuda.synchronize()
         r = dict(host_lag_ms=ev["gate"].elapsed_time(ev["t0"]), sleep_ms=ev["pre"].elapsed_time(ev["gate"]), host_enqueue_ms=host_enqueue_ms)
+        r.update(host_submit_ms=1000 * (h2 - h1), gate_done_at_submit_end=bool(gate_done), submit_end_ms=ev["gate"].elapsed_time(ev["sub"]))
         if fn_main is not None:
             r["main_ms"] = ev["t0"].elapsed_time(ev["tm"])
         if fn_side is not None:
@@ -237,6 +311,7 @@ def run(model, ids, flush=None):
 
     snap = ss.CounterSnapshot(cache)
     rows, fails, trans = [], 0, None
+    tl_records, st_verify = [], {}
 
     # HiSparse arms: the vendored copy_cache_planned kernel fed a plan of the SAME ids (plan.py), built once per
     # (D, item) OUTSIDE every bracket; host / upload / device build times recorded, the two builds must agree.
@@ -273,15 +348,121 @@ def run(model, ids, flush=None):
                     SZ.LAUNCH_LOG.mark(pl.bytes_per_launch)
         return f
 
+    # STRATA / HICACHE arms (module docstring): prebuilt int64 index tensors per (D, item), the same for every layer;
+    # the per-layer plan cost an integrated getter would pay is timed separately and never enters a bracket.
+    hc, st_idx, st_log = None, {}, []
+    if ST_BLOCKS or JIT_BLOCKS:
+        from nosi.flash_cache_engine import sglang_hicache as hc
+        hc.load_aot()
+        if JIT_BLOCKS:
+            hc.load_jit()
+        S_cpu_st, S_dst_st = int(e0._k_cpu.shape[1]), int(k_s.shape[1])
+        for D in D_LIST:
+            for item in sorted(set((ST_ITEMS if ST_BLOCKS else ()) + (JIT_ITEMS if JIT_BLOCKS else ()))):
+                ids_g = ids_for(D)
+                try:
+                    t0 = time.perf_counter()
+                    si, di = hc.nosi_items(ids_g.cpu(), s_cpu=S_cpu_st, s_dst=S_dst_st, block_rows=bs, item=item)
+                    t1 = time.perf_counter()
+                except hc.PlanRefused as e:
+                    st_log.append(dict(D=D, item=item, refused=str(e)))
+                    print("[sweep] strata/jit index D=%d %s REFUSED: %s" % (D, item, e), flush=True)
+                    continue
+                isz = hc.ITEMS[item]
+                recs_src, recs_dst = e0._k_cpu.numel() * elem // isz, k_s.numel() * elem // isz
+                hc.validate_indices(si, di, recs_src, recs_dst, isz)
+                assert 2 * si.numel() * isz * nl == pass_bytes(D), (D, item, 2 * si.numel() * isz * nl, pass_bytes(D))
+                t2 = time.perf_counter()
+                si_g, di_g = si.to("cuda", non_blocking=True), di.to("cuda", non_blocking=True)
+                torch.cuda.synchronize()
+                t3 = time.perf_counter()
+                st_idx[(D, item)] = (si_g, di_g, isz)
+                cost = hc.timed_nosi_build(ids_g, s_cpu=S_cpu_st, s_dst=S_dst_st, block_rows=bs, item=item)
+                st_log.append(dict(D=D, item=item, item_size_bytes=isz, n_items=int(si.numel()), build_host_ms=1000 * (t1 - t0),
+                                   upload_ms=1000 * (t3 - t2), nosi_plan_cost=cost, plan_cost=hc.PLAN_COST_LABEL, bench_label=hc.BENCH_LABEL,
+                                   aot_grid=dict((W, hc.aot_grid(int(si.numel()), W, 32)[1]) for W in ST_BLOCKS),
+                                   jit_grid=dict((W, hc.jit_grid(int(si.numel()), W)) for W in JIT_BLOCKS)))
+                print("[sweep] strata/jit index D=%d %s: %d items of %d B; host build %.2f ms, upload %.2f ms; integrated per-layer cost "
+                      "(EXCLUDED) %.3f ms" % (D, item, si.numel(), isz, 1000 * (t1 - t0), 1000 * (t3 - t2), cost["per_layer_ms"]), flush=True)
+
+    def side_strata(family, W, D, item, passes, layers=None):
+        si, di, isz = st_idx[(D, item)]
+        es = isz // elem
+        eng = engines if layers is None else [engines[i] for i in layers]
+        kv2 = [(e._k_cpu.view(-1, es), e._v_cpu.view(-1, es)) for e in eng]
+        kd, vd = k_s.view(-1, es), v_s.view(-1, es)
+        unit = 2 * si.numel() * isz
+        def f():
+            for _ in range(passes):
+                for e, (ks2, vs2) in zip(eng, kv2):
+                    if family == "strata":
+                        hc.strata_per_layer(e._k_cpu, k_s, e._v_cpu, v_s, si, di, isz, W, 32)
+                    else:
+                        hc.jit_per_layer(kd, vd, di, ks2, vs2, si, W)
+                    SZ.LAUNCH_LOG.mark(unit)
+        return f
+
+    def verify_layers(family, W, D, item):
+        """First touch of a strata / hicachejit arm: layers 0, L/2, L-1 one at a time, each against its own source."""
+        bad = []
+        for l in sorted({0, nl // 2, nl - 1}):
+            k_s.fill_(float("nan")); v_s.fill_(float("nan"))
+            bracket(None, side_strata(family, W, D, item, 1, layers=[l]))
+            src_k = engines[l]._k_cpu[:, :D * bs].to("cuda"); src_v = engines[l]._v_cpu[:, :D * bs].to("cuda")
+            if not (torch.equal(k_s[:, :D * bs], src_k) and torch.equal(v_s[:, :D * bs], src_v)):
+                bad.append(l)
+        k_s.zero_(); v_s.zero_()
+        return bad
+
     def payload(partial):
         return dict(meta=run_meta, rows=rows, fails=fails, partial=partial, numa=numa, D_list=list(D_LIST), workers=list(WORKERS), reps=REPS,
                     sleep_ms=SLEEP_MS, target=TARGET,
                     hisparse=dict(blocks=list(HS_BLOCKS), threads=list(HS_THREADS), items=list(HS_ITEMS), plans=plan_log,
                                   upstream=(hs.UPSTREAM_COMMIT if hs is not None else None)),
+                    strata=dict(blocks=list(ST_BLOCKS), items=list(ST_ITEMS), jit_blocks=list(JIT_BLOCKS), jit_items=list(JIT_ITEMS), plans=st_log,
+                                upstream=(hc.UPSTREAM_COMMIT if hc is not None else None), strata_label=(hc.STRATA_LABEL if hc is not None else None),
+                                jit_label=(hc.JIT_LABEL if hc is not None else None), verify_layers=st_verify),
+                    arms_only=list(ARMS_ONLY), timeline=tl_records, timeline_arms=list(T_ARMS), timeline_late_ms=T_LATE_MS,
                     sizing_rule=dict(alone_margin=SZ.ALONE_MARGIN, conc_margin=SZ.CONC_MARGIN, max_trials=SIZE_TRIALS, overlap_min=SZ.OVERLAP_MIN,
                                      host_lag_max_ms=SZ.HOST_LAG_MAX_MS),
                     peak_allocated_gb=torch.cuda.max_memory_allocated() / 1e9, peak_reserved_gb=torch.cuda.max_memory_reserved() / 1e9,
                     device_total_gb=torch.cuda.get_device_properties(0).total_memory / 1e9)
+
+    def timeline_block(it, D, sized, restore, mk_step, lg_ref):
+        """STAGE T (module docstring): untraced, traced (cudaProfilerApi capture range), untraced reps of each T arm."""
+        nf = 0
+        for tarm in T_ARMS:
+            if tarm in ("alone", "alone_late"):
+                mk, passes = None, 0
+            elif tarm in sized:
+                mk, passes = sized[tarm]
+            else:
+                tl_records.append(dict(batch=B, step=it, D=D, arm=tarm, error="not an arm of this run (WS_ARMS / blocks)"))
+                continue
+            late = T_LATE_MS if tarm == "alone_late" else 0.0
+            for phase, n in (("untraced_pre", T_UNTRACED), ("traced", 1 + T_REPS), ("untraced_post", T_UNTRACED)):
+                if phase == "traced":
+                    torch.cuda.synchronize()
+                    torch.cuda.profiler.start()
+                for rep in range(n):
+                    restore()
+                    k_s.zero_(); v_s.zero_()
+                    label = "lt|b%d|%s|step%d|%s|rep%d" % (B, tarm, it, phase, rep)
+                    fn = timeline_main(mk_step(), label, late)
+                    torch.cuda.nvtx.range_push(label)
+                    lg, r = bracket(fn, mk(passes) if mk is not None else None)
+                    torch.cuda.nvtx.range_pop()
+                    ok = torch.equal(lg, lg_ref) and loaded_now() == 0
+                    good = True if mk is None else (torch.equal(k_s[:, :D * bs], k_ref[:, :D * bs]) and torch.equal(v_s[:, :D * bs], v_ref[:, :D * bs]))
+                    nf += int(not ok) + int(not good)
+                    tl_records.append(dict(batch=B, step=it, D=D, arm=tarm, phase=phase, rep=rep, label=label, passes=passes, late_ms=late,
+                                           warmup=(phase == "traced" and rep == 0), logits_equal=bool(ok), transfer_equal=bool(good), **r))
+                if phase == "traced":
+                    torch.cuda.synchronize()
+                    torch.cuda.profiler.stop()
+            print("[sweep] timeline step %d %s: %s" % (it, tarm, " ".join("%s=%.2f" % (x["phase"][:9], x["main_ms"]) for x in tl_records
+                                                                       if x.get("arm") == tarm and x.get("step") == it and "main_ms" in x)), flush=True)
+        return nf
 
     step_fn = lambda tok: (lambda: model.decode_inference(tok, cu, position_ids, cache))
     for it in range(VA.N):
@@ -299,6 +480,14 @@ def run(model, ids, flush=None):
                     for item in HS_ITEMS:
                         if (D, item) in plans:
                             bracket(None, side_hisparse(1, T, D, item, 1))
+                for fam, blocks, items in (("strata", ST_BLOCKS, ST_ITEMS), ("hicachejit", JIT_BLOCKS, JIT_ITEMS)):
+                    for item in (items if blocks else ()):
+                        if (D, item) in st_idx:
+                            for W in blocks:
+                                bad = verify_layers(fam, W, D, item)
+                                st_verify[st_arm_name(fam, W, item) + "_D%d" % D] = dict(bad_layers=bad, ok=not bad)
+                                fails += int(bool(bad))
+                                print("[sweep] first touch %s D=%d: per-layer exact %s" % (st_arm_name(fam, W, item), D, not bad), flush=True)
         t_wall = time.time()
         snap.take()                                                     # pre-step counters and tables
         for e in engines:
@@ -331,7 +520,15 @@ def run(model, ids, flush=None):
                       dict(family="hisparse", blocks=W, threads=T, item=item, item_bytes=plans[(D, item)].item_size_bytes,
                            plan_items=plans[(D, item)].n_items))
                      for item in (HS_ITEMS if HS_BLOCKS else ()) if (D, item) in plans for T in HS_THREADS for W in HS_BLOCKS]
+            arms += [(st_arm_name(fam, W, item), (lambda fam=fam, W=W, item=item: (lambda p: side_strata(fam, W, D, item, p)))(),
+                      dict(family=fam, blocks=W, threads=1024, item=item, item_bytes=st_idx[(D, item)][2], plan_items=int(st_idx[(D, item)][0].numel()),
+                           plan_cost=hc.PLAN_COST_LABEL, bench_label=hc.BENCH_LABEL,
+                           label=(hc.STRATA_LABEL if fam == "strata" else hc.JIT_LABEL)))
+                     for fam, blocks, items in (("strata", ST_BLOCKS, ST_ITEMS), ("hicachejit", JIT_BLOCKS, JIT_ITEMS))
+                     for item in (items if blocks else ()) if (D, item) in st_idx for W in blocks]
             arms += [("dma2d", lambda p: side_dma(D, p), dict(family="dma2d"))]
+            arms = [a for a in arms if arm_selected(a[0])]
+            sized = {}
             for arm, mk, ameta in arms:
                 # SIZING (side_sizing.py): >= 1.2 x the step alone from a one-pass side, then TRIAL concurrent brackets
                 # raising passes until the side lasts >= 1.15 x the CONCURRENT step (trials are checked like reps)
@@ -373,12 +570,17 @@ def run(model, ids, flush=None):
                                  overlap_frac=[x["overlap_frac"] for x in conc], host_lag_ms=[x["host_lag_ms"] for x in conc + s_alone],
                                  host_enqueue_ms=[x["host_enqueue_ms"] for x in conc],
                                  during_gbps=[x.get("during_gbps") for x in conc], inside_frac=[x.get("inside_frac") for x in conc],
-                                 during_bytes=[x.get("during_bytes") for x in conc], last_end_ms=[x.get("last_end_ms") for x in conc]))
+                                 during_bytes=[x.get("during_bytes") for x in conc], last_end_ms=[x.get("last_end_ms") for x in conc],
+                                 strata=(ameta if ameta["family"] in ("strata", "hicachejit") else None),
+                                 alone_self=[self_report(x) for x in alone], conc_self=[self_report(x) for x in conc]))
+                sized[arm] = (mk, passes)
                 rr = rows[-1]
                 med = lambda xs: float(np.median(xs))
                 print("[sweep] step %d D=%d %-9s passes=%d  decode %.2f -> %.2f ms (%+.1f%%)  side alone %.1f GB/s, conc %.1f GB/s  overlap %.2f  host_lag max %.3f ms"
                       % (it, D, arm, passes, med(rr["decode_alone_ms"]), med(rr["decode_conc_ms"]), 100 * (med(rr["decode_conc_ms"]) / med(rr["decode_alone_ms"]) - 1),
                          by / (med(rr["side_alone_ms"]) * 1e6), by / (med(rr["side_conc_ms"]) * 1e6), min(rr["overlap_frac"]), max(rr["host_lag_ms"])), flush=True)
+            if T_ARMS and D == D_LIST[0]:
+                fails += timeline_block(it, D, sized, restore, lambda: step_fn(tok), lg_ref)
         restore()
         model.decode_inference(tok, cu, position_ids, cache)            # the advance: a resident step from the restored state
         torch.cuda.synchronize()
@@ -396,13 +598,68 @@ def arm_footprint(arm: str) -> str:
     import re
     if arm == "dma2d":
         return "copy engine"
-    m = re.match(r"(workers|hisparse)(\d+)(.*)$", arm)
+    m = re.match(r"(workers|hisparse|strata|hicachejit)(\d+)(.*)$", arm)
     if not m:
         return "-"
     W = int(m.group(2))
     if m.group(1) == "workers":
         return "%d CTAs x 128 thr (not W SMs)" % W
+    if m.group(1) == "strata":
+        return "%d SMs (48 regs x 1024 thr)" % W
+    if m.group(1) == "hicachejit":
+        return "%d blocks x 1024 thr (30-32 regs)" % W
     return ("%d blocks (not W SMs)" % W) if "_t" in m.group(3) else ("%d SMs" % W)
+
+
+def adapter_table(rows) -> list:
+    """NATIVE (i512 token rows, SGLang's item; exact here because the ids are coupled) vs ADAPTED (i256 per-head rows, the
+    NOSI adapter) at identical bytes and destinations, per (batch, D, family, W): medians over reps and steps."""
+    import re
+    acc = {}
+    for r in rows:
+        m = re.match(r"(strata|hicachejit|hisparse)(\d+)(?:_t1024)?_(i256|i512)$", r["arm"])
+        if not m:
+            continue
+        a = acc.setdefault((r["batch"], r["D"], m.group(1), int(m.group(2)), m.group(3)), dict(ra=[], rc=[], da=[], dc=[]))
+        a["ra"] += [r["bytes"] / (x * 1e6) for x in r["side_alone_ms"]]
+        a["rc"] += [r["bytes"] / (x * 1e6) for x in r["side_conc_ms"]]
+        a["da"] += r["decode_alone_ms"]; a["dc"] += r["decode_conc_ms"]
+    med = lambda xs: float(np.median(xs)) if xs else float("nan")
+    L = []
+    for (B, D, fam, W, item), a in sorted(acc.items()):
+        if item != "i256" or (B, D, fam, W, "i512") not in acc:
+            continue
+        b = acc[(B, D, fam, W, "i512")]
+        sa, sb = med(a["dc"]) / med(a["da"]) - 1, med(b["dc"]) / med(b["da"]) - 1
+        L.append("| %d | %d | %s | %d | %.1f | %.1f | %.2f | %.1f | %.1f | %+.1f%% | %+.1f%% | %+.1f |" % (
+            B, D, fam, W, med(a["ra"]), med(b["ra"]), med(a["ra"]) / med(b["ra"]), med(a["rc"]), med(b["rc"]), 100 * sa, 100 * sb, 100 * (sa - sb)))
+    if not L:
+        return []
+    return ["", "## Native (i512 token rows) vs adapted (i256 per-head rows) layout, identical bytes and destinations", "",
+            "| B | D | family | W | adapted alone GB/s | native alone GB/s | adapted / native | adapted concurrent GB/s | native concurrent GB/s "
+            "| adapted slowdown | native slowdown | delta (pp) |", "|---|---|---|---|---|---|---|---|---|---|---|---|"] + L
+
+
+def self_report_table(pays) -> list:
+    """Per (batch, arm): the self-reporting timer over every concurrent rep (and the alone reps of the step)."""
+    L = ["", "## Self-reporting gated timer (measurement only; the launch-correlated timeline decides validity)", "",
+         "| B | arm | reps | gate done when submission ended | host submit ms median / max | submit end after gate ms median / max |",
+         "|---|---|---|---|---|---|"]
+    n = 0
+    for p in pays:
+        acc = {}
+        for r in p["rows"]:
+            for key, recs in (("alone", r.get("alone_self") or []), (r["arm"], r.get("conc_self") or [])):
+                acc.setdefault(key, []).extend(recs)
+        for arm, recs in sorted(acc.items()):
+            recs = [x for x in recs if x.get("submit_end_ms") is not None]
+            if not recs:
+                continue
+            n += 1
+            hs_, se = [x["host_submit_ms"] for x in recs], [x["submit_end_ms"] for x in recs]
+            L.append("| %d | %s | %d | %d/%d | %.2f / %.2f | %.2f / %.2f |" % (p["meta"]["batch"], arm, len(recs), sum(1 for x in recs if x["gate_done_at_submit_end"]),
+                                                                            len(recs), float(np.median(hs_)), max(hs_), float(np.median(se)), max(se)))
+    return L if n else []
 
 
 def table(out_dir):
@@ -470,6 +727,28 @@ def table(out_dir):
             L.append("B=%d plan D=%d %s: %d items of %d B, stride %d; build host %.2f ms, upload %.2f ms, device %.2f ms, device==host %s"
                      % (B, t["D"], t["item"], t["n_items"], t["item_size_bytes"], t["plan_stride"], t["build_host_ms"], t["upload_ms"], t["build_device_ms"], t["device_build_equal"]))
         L.append("")
+    L += adapter_table([r for p in pays for r in p["rows"]])
+    L += self_report_table(pays)
+    labels = {}
+    for p in pays:
+        st = p.get("strata") or {}
+        for pl in st.get("plans") or []:
+            if "refused" in pl:
+                L.append("B=%d strata/jit index D=%d %s: REFUSED (%s)" % (p["meta"]["batch"], pl["D"], pl["item"], pl["refused"]))
+            else:
+                c = pl.get("nosi_plan_cost") or {}
+                L.append("B=%d strata/jit index D=%d %s: %d items of %d B; host build %.2f ms, upload %.2f ms; INTEGRATED per-layer plan cost "
+                         "(EXCLUDED from every row): count sync %.3f ms + index build %.3f ms = %.3f ms per layer per step"
+                         % (p["meta"]["batch"], pl["D"], pl["item"], pl["n_items"], pl["item_size_bytes"], pl["build_host_ms"], pl["upload_ms"],
+                            c.get("count_sync_ms", float("nan")), c.get("index_build_ms", float("nan")), c.get("per_layer_ms", float("nan"))))
+        if st.get("verify_layers"):
+            L.append("B=%d first-touch per-layer exactness: %s" % (p["meta"]["batch"], json.dumps(st["verify_layers"])))
+        for k in ("strata_label", "jit_label"):
+            if st.get(k):
+                labels[k] = st[k]
+    if labels:
+        L += ["", "strata* arms = %s. hicachejit* arms = %s. Every strata / hicachejit / hisparse row is a prebuilt-plan copy "
+              "microbenchmark, NOT an integrated LRU getter baseline (plan EXCLUDED)." % (labels.get("strata_label"), labels.get("jit_label")), ""]
     met = [v for v in verdict_rows if v["meets"]]
     met_d = [v for v in verdict_rows if v["meets_during"]]
     L.append("## Registered target (ledger 'WORKER SWEEP REGISTERED'): >= 90% of the matched copy-engine concurrent bandwidth with <= 5% decode slowdown")
