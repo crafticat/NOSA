@@ -306,4 +306,4 @@ def timed_nosi_build(load_ids_gpu: torch.Tensor, *, s_cpu: int, s_dst: int, bloc
     out.sort(key=lambda x: x[2])
     c, b, t = out[len(out) // 2]
     return dict(item=item, count_sync_ms=c, index_build_ms=b, per_layer_ms=t, n_loads=n, n_items=int(s.numel()),
-                note="per layer per step if integrated (NOSI plans differ per layer); EXCLUDED from every copy row")
+                note="ISOLATED plan cost on an IDLE GPU = a LOWER BOUND of the per-layer per-step cost if integrated (inside a real step the count sync would also drain the launch queue; not measured); NOSI plans differ per layer; EXCLUDED from every copy row")
