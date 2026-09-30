@@ -21,26 +21,39 @@ STAGES (CP_STAGES; one process per batch; B336 primary, B64 comparison, B320 reg
             (direct shipped gather flash_h2d_from_mask, W8, CPU pack) against logical references with a NaN-poisoned scratch
             and exact canary rows; the step-0 full list; synthetic empty / one-full-stream / duplicate-source / random
             per-head plans; negative controls (skipped scatter, poisoned staged row, missing staging wait, missing landing
-            wait, logits without restore) must be DETECTED; positive lifetime controls must pass. A failure skips MAIN,
-            LAYOUT and TIMELINE (exit 21).
+            wait, missing scatter-on-its-H2D wait, logits without restore) must be DETECTED; positive lifetime controls
+            must pass. The lifetime controls run on the step's layer with the most groups, with the chunk cap lowered until
+            there are more chunks than ring slots (n_chunks recorded; UNTESTABLE is a failure). The warm-up rep of every arm
+            is checked and counted like the timed reps. A failure skips MAIN, LAYOUT and TIMELINE (exit 21).
   MAIN      untraced, gated steps CP_STEPS (plans[it] = the natural plan of the same step index), per arm REPS transfer-alone
             and REPS beside the resident decode (worker_sweep.py:491-514 light restore; 0 loads and logits torch.equal every
             rep), decode-alone reps before and after. Arms: w8 (flash_h2d_persistent n_ctas=8, num_warps=4,
             bypass_cache=False, K and V), cpu1/2/4/8 (pack on N physical cores), cpu8_c16 (16 MiB chunks), cpu8_lite (events
             lite), cpu8_L / cpu8_LP / cpu8_LPD (cumulative ablations), cpu8_prepacked, ceil_contig, scatter_only (ceilings).
             Then SWEEP: transfer-alone w8 and cpu8 over every captured step (steady 1..62 and the step-0 full list).
-  LAYOUT    (layout_ablation; runs AFTER the original arms' JSON is flushed, own deadline CP_LAYOUT_BUDGET_S) the 2x2 of
-            {orig, head-major} CPU SOURCE x {orig, head-major} GPU SCRATCH, same natural plans (CP_LAYOUT_PLAN_STEPS), W8 and
-            cpu8 variants (row / group packer x row / group placer), each alone and beside the decode. The host cache is
+  LAYOUT    (layout_ablation; runs AFTER the original arms' JSON is flushed and the main-done marker is written; isolated:
+            any exception is a layout failure, never an exit 20..24) the 2x2 of {orig, head-major} CPU SOURCE x {orig,
+            head-major} GPU SCRATCH, same natural plans (CP_LAYOUT_PLAN_STEPS), W8 and cpu8 variants (row / group packer x
+            row / group placer), each alone and beside the decode, with CP_LAYOUT_REPS decode-alone reps before and after the
+            variants at EVERY (cell, plan step) gated decode step (the same-step slowdown denominator). The host cache is
             reordered IN PLACE (no second host cache, no extra pinned memory; cpupack_core.convert_inplace) between the
             orig-source and head-major-source cells, with a bit-exact per-request logical check and a flushed-reference
-            logits check before == after. The resident decode's own GPU window layout is untouched. Plus the measured
-            tail-write cost per layout and the one-time conversion cost.
+            logits check before == after; the conversion is PREDICTED first (cpupack_core.probe_convert + C0) and guarded per
+            layer against the deadline. The resident decode's own GPU window layout is untouched. Plus the measured
+            tail-write cost per layout (small buffer, and the real cache's never-read rows [S_cpu-64, S_cpu)) and the
+            one-time conversion cost (reorder and verification separately). A rollover tripwire guards every gated step.
   TIMELINE  (separate process under nsys --capture-range=cudaProfilerApi) alone, alone_late (negative control), w8, cpu4,
             cpu8 beside the decode: untraced, traced, untraced reps with NVTX 'lt|b<B>|<arm>|step<it>|<phase>|rep<k>'.
 MODES (CP_MODE): run | calib (node-local CPU pack calibration, no model) | table.
 EXIT: 0 ok; 1..19 failure count; 20 hygiene gate (two-process fallback); 21 correctness failed; 22 memory fallback
-(OOM, pinned allocation failure, free HBM below need, peak reserved above CP_PEAK_LIMIT_GB).
+(OOM, pinned allocation failure, free HBM below need, peak reserved above CP_PEAK_LIMIT_GB) -- only BEFORE the main-done
+marker; 23 an uncaught exception (a crash, never a failure count); 24 CPU placement refused (before the model is loaded).
+MAIN-DONE MARKER: <CP_OUT>/<CP_TAG>.main_done is written once MAIN + SWEEP are flushed and passed the memory gate, before
+LAYOUT. From then on nothing returns 20..22: a LAYOUT exception only adds to layout_fails, and the sbatch keeps a batch whose
+marker exists (no B320 rerun) whatever the exit code (a timeout inside LAYOUT included).
+DEADLINE: CP_STAGE_DEADLINE (epoch s, from the sbatch: the stage's timeout bound - 3 min) bounds SWEEP and LAYOUT; LAYOUT
+also stops at CP_LAYOUT_BUDGET_S, skips a step that its observed step time does not fit, and skips the head-major cells when
+the PREDICTED in-place conversion (probe of 3 requests + C0's measurement, x CP_CONV_SAFETY) plus one step does not fit.
 """
 import gc
 import json
@@ -89,7 +102,13 @@ ARMS_ONLY = tuple(os.environ.get("CP_ARMS", "").split())
 SWEEP = os.environ.get("CP_SWEEP", "1") == "1"
 LAYOUT_PLAN_STEPS = tuple(int(x) for x in os.environ.get("CP_LAYOUT_PLAN_STEPS", "4 5 6 7").split())
 LAYOUT_REPS = int(os.environ.get("CP_LAYOUT_REPS", "3"))
-LAYOUT_BUDGET_S = float(os.environ.get("CP_LAYOUT_BUDGET_S", "1200"))
+LAYOUT_BUDGET_S = float(os.environ.get("CP_LAYOUT_BUDGET_S", "900"))
+STAGE_DEADLINE = float(os.environ.get("CP_STAGE_DEADLINE", "0") or 0) or None   # epoch s: the sbatch's timeout bound - 3 min
+FINAL_RESERVE_S = float(os.environ.get("CP_FINAL_RESERVE_S", "60"))      # left for the last inventory + JSON flush
+LAYOUT_STEP_EST_S = float(os.environ.get("CP_LAYOUT_STEP_EST_S", "90"))  # first LAYOUT step estimate (then the observed max)
+SWEEP_STEP_EST_S = float(os.environ.get("CP_SWEEP_STEP_EST_S", "10"))
+CALIB_JSON = os.environ.get("CP_CALIB_JSON", "")                           # C0's calib_*.json (conversion-time predictor)
+CONV_SAFETY = float(os.environ.get("CP_CONV_SAFETY", "1.5"))
 LAYOUT_BACK = os.environ.get("CP_LAYOUT_BACK", "0") == "1"
 LAYOUT_CHECK_LAYERS = tuple(int(x) for x in os.environ.get("CP_LAYOUT_CHECK_LAYERS", "0 15 16 31").split())
 PLANS_NPZ = os.environ.get("CP_PLANS_NPZ", "")
@@ -106,14 +125,34 @@ LIFETIME_CAP = int(os.environ.get("CP_LIFETIME_CAP_GROUPS", "16"))
 LIFETIME_DELAY_MS = float(os.environ.get("CP_LIFETIME_DELAY_MS", "20"))
 OUT = VA.OUT
 TAG = os.environ.get("CP_TAG", "cp_b%d" % VA.BATCH)
-RC_HYGIENE, RC_CORRECT, RC_MEMGATE = 20, 21, 22
+RC_HYGIENE, RC_CORRECT, RC_MEMGATE, RC_CRASH, RC_PLACEMENT = 20, 21, 22, 23, 24
 W8 = dict(n_ctas=8, num_warps=4, bypass_cache=False)
-CHUNK_FIELDS = ("g0", "g1", "slot", "pk", "h2d0", "h2d1", "sc0", "sc1", "sub", "bp_ms", "pack_ms", "pack_cpu_ms", "api_ms", "bytes", "useful")
-LAYER_FIELDS = ("pr", "list", "hk", "desc", "list_wait_ms", "desc_ms", "desc_cpu_ms", "n")
+CHUNK_FIELDS = ("g0", "g1", "slot", "pk", "h2d0", "h2d1", "sc0", "sc1", "sub", "bp_ms", "pack_ms", "pack_coord_cpu_ms", "api_ms", "bytes",
+                "useful")
+FIELD_NOTES = dict(
+    pack_coord_cpu_ms="thread_time of the COORDINATOR thread only during the pack call; it EXCLUDES the OpenMP helper threads, so "
+                      "it is NOT the total pack CPU time (the helpers' ticks are in thread_use census deltas)",
+    desc_coord_cpu_ms="thread_time of the coordinator thread during descriptor preparation (same caveat)",
+    pack_ms="host wall time of the pack call (all team threads)")
 
 
 class MemGate(Exception):
     """A registered B320-fallback trigger (the sbatch reruns ALL arms at the fallback batch)."""
+
+
+class PlacementRefused(Exception):
+    """The CPU placement cannot give the launch core + the full team on the GPU's node (exit RC_PLACEMENT)."""
+
+
+def placement_problem(early):
+    """None when the early placement is usable for team size max(CORES), else the refusal text."""
+    e = early or {}
+    if e.get("omp_env_problems"):
+        return "refused: %s" % e["omp_env_problems"]
+    team = e.get("team") or []
+    if not e.get("ok") or len(team) < max(CORES):
+        return "placement gives %d physical team cores < %d on the GPU node (%s)" % (len(team), max(CORES), e.get("notes"))
+    return None
 
 
 # ---------------------------------------------------------------------------------------------------------------- arms
@@ -184,7 +223,7 @@ def mem_need_gb(B, S_dst, H, D, ring, slot, contig, extra_gb=0.35) -> float:
 
 class Job:
     def __init__(self, fn):
-        self.fn, self.done, self.error, self.result = fn, threading.Event(), None, None
+        self.fn, self.done, self.error, self.result, self.exc = fn, threading.Event(), None, None, None
 
 
 class Coordinator(threading.Thread):
@@ -209,8 +248,9 @@ class Coordinator(threading.Thread):
             try:
                 with torch.inference_mode():                            # thread-local: the main thread's tensors are inference
                     job.result = job.fn(self)                           # tensors, written in place here (landing, scratch)
-            except BaseException:
+            except BaseException as e:
                 job.error = traceback.format_exc()
+                job.exc = e
             finally:
                 job.done.set()
 
@@ -220,9 +260,14 @@ class Coordinator(threading.Thread):
         return j
 
     def call(self, fn):
+        """Run fn on the coordinator and wait. A registered memory trigger (MemGate, a CUDA OOM) keeps its own type, so the
+        exit-code rule sees it exactly; every other error becomes RuntimeError('coordinator: <traceback>'), which is never
+        read as a memory trigger (its traceback text may contain any word, e.g. 'pinned')."""
         j = self.submit(fn)
         j.done.wait()
         if j.error:
+            if isinstance(j.exc, (MemGate, torch.cuda.OutOfMemoryError)):
+                raise j.exc
             raise RuntimeError("coordinator: " + j.error)
         return j.result
 
@@ -260,7 +305,9 @@ class Runner:
         self.nonce = 0
         self.rows, self.sweep, self.timeline, self.layout_rows = [], [], [], []
         self.correct = {}
-        self.layout = dict(cells=[], conversion=None, tail_write=None, notes=[], partial=False)
+        self.layout = dict(cells=[], conversion=None, tail_write=None, tail_write_real={}, notes=[], partial=False, memgate=[])
+        self.main_done = False
+        self.sweep_notes = []
         self.t_start = time.time()
         self.payload_extra = {}
         self.inv_snaps = {}
@@ -292,10 +339,9 @@ class Runner:
         self.cap_max = max(self.cap_main, self.cap_alt, LIFETIME_CAP)
         self.slot = K.slot_bytes(self.cap_max)
         team = (EARLY or {}).get("team") or []
-        if (EARLY or {}).get("omp_env_problems"):
-            raise RuntimeError("refused: %s" % EARLY["omp_env_problems"])
-        if not (EARLY or {}).get("ok") or len(team) < max(CORES):
-            raise RuntimeError("placement gives %d physical team cores < %d on the GPU node (%s)" % (len(team), max(CORES), EARLY))
+        why = placement_problem(EARLY)
+        if why:
+            raise PlacementRefused(why)
         self.coord = Coordinator(team)
         self.coord.start()
         for n in CORES:                                      # nested helper creation: 1, 2, 4, 8
@@ -589,9 +635,12 @@ class Runner:
                     self.ev_g0[l].record(self.s_scatter)
                     idx = c["so_idx"][l]
                     n = int(idx.numel())
-                    src = self.contig_dev[:n * self.D * 2].view(torch.bfloat16).view(n, self.D)
-                    K.rows2d(self.scr_k).index_copy_(0, idx, src)
-                    K.rows2d(self.scr_v).index_copy_(0, idx, src)
+                    cap_rows = CONTIG_BYTES // (self.D * 2)                  # the device source holds cap_rows rows: pieces
+                    for a0 in range(0, n, cap_rows):
+                        k = min(cap_rows, n - a0)
+                        src = self.contig_dev[:k * self.D * 2].view(torch.bfloat16).view(k, self.D)
+                        K.rows2d(self.scr_k).index_copy_(0, idx[a0:a0 + k], src)
+                        K.rows2d(self.scr_v).index_copy_(0, idx[a0:a0 + k], src)
                     self.ev_g1[l].record(self.s_scatter)
         elif kind == "cpu":
             spec = dict(arm=a, layers=L, pipe=pipe, faults=faults, prebuilt=c.get("prebuilt", {}).get((a["packer"], a["placer"])), cell=cell)
@@ -707,6 +756,10 @@ class Runner:
     def gated(self, it, pos, work):
         """worker_sweep.py:491-507 (light restore) around `work(ctx)`, then the advance (:584-587)."""
         tok = self.forced[:, it:it + 1]
+        tails = [int(e._tail_block_len_on_gpu) for e in self.engines]
+        if max(tails) >= self.R - 1:                                     # the next decode would complete the tail block: a
+            raise RuntimeError("rollover tripwire at step %d: tail lengths %s reach %d (a tail write-back would follow)"
+                               % (it, sorted(set(tails)), self.R - 1))     # write-back into the host cache (section D)
         snap = self.snap
         snap.take()
         for e in self.engines:
@@ -722,7 +775,7 @@ class Runner:
         def restore():
             snap.restore()
             self.ss.assert_transients_intact(self.model, self.trans)
-        ctx = dict(it=it, tok=tok, pos=pos, lg_ref=lg_ref, restore=restore, step_fn=lambda: self.decode(tok, pos),
+        ctx = dict(it=it, tok=tok, pos=pos, lg_ref=lg_ref, restore=restore, step_fn=lambda: self.decode(tok, pos), tail_len_max=max(tails),
                    agreement=dict(same_frac_mean=float(np.mean([x["same_frac"] for x in agree])) if agree else None,
                                   jaccard_mean=float(np.mean([x["jaccard_mean"] for x in agree])) if agree else None,
                                   jaccard_min=float(min(x["jaccard_min"] for x in agree)) if agree else None))
@@ -746,9 +799,8 @@ class Runner:
         th0 = CC.census()
         _, w = self.bracket(a, c, False)
         w.update(step=ctx["it"], plan_step=c["key"][0], phase="warmup", rep=0, stage=tag)
-        self.rep_checks(w, c, c["union"], c["last"])
+        nf = int(not self.rep_checks(w, c, c["union"], c["last"]))      # the warm-up is untimed but its correctness counts
         rows.append(w)
-        nf = 0
         for mode in ("alone", "conc"):
             for rep in range(reps):
                 if mode == "conc":
@@ -786,6 +838,23 @@ class Runner:
                 return dict(ok=False, error=r["coord_error"][-400:], layer=l, arm=r["arm"])
         ch = self.check_scratch(exp, ref)
         return dict(ok=ch["canary_ok"] and ch["content_ok"], layer=l, arm=r["arm"], **ch)
+
+    def lifetime_control_layer(self, cpu_rows):
+        """The lifetime controls need MORE chunks than ring slots (every slot reused). The layer with the most natural groups
+        of the correctness step, with the chunk cap lowered from CP_LIFETIME_CAP_GROUPS until n_chunks >= RING + 2 when the
+        layer is thin; 'testable' is False (a loud failure, verdict UNTESTABLE) only if even cap 1 gives <= RING chunks."""
+        per = []
+        for l in range(self.NL):
+            p = cpu_rows[l][1 + self.HB:].view(self.H, self.B, self.M)
+            per.append(p[..., :K.TAIL_SLOT].ge(0).sum(dim=(0, 2)).tolist())
+        tot = [sum(x) for x in per]
+        l = max(range(self.NL), key=lambda i: (tot[i], -i))
+        cap = LIFETIME_CAP
+        n = len(K.chunk_requests(per[l], cap))
+        while n < RING + 2 and cap > 1:
+            cap = max(1, cap // 2)
+            n = len(K.chunk_requests(per[l], cap))
+        return dict(layer=l, groups=tot[l], cap=cap, n_chunks=n, ring=RING, testable=n > RING)
 
     def synthetic_rows(self, kind, seed=0):
         """Layer-0 synthetic plans (labelled SYNTHETIC): 'empty', 'one_full' (stream (0, 0) loads 63 blocks), 'dup_src' (two
@@ -860,18 +929,28 @@ class Runner:
                 nf += int(not x["ok"])
         res["synthetic"] = syn
         # negative controls: each must be DETECTED (the check fails); positive lifetime controls must pass
+        lc = self.lifetime_control_layer(cpu)
+        res["lifetime_control"] = lc
         negs = []
         for name, fl, expect_fail, cap in (
                 ("skip_scatter", K.Faults(skip_scatter_chunk=0), True, None),
                 ("poison_stage", K.Faults(poison_stage=True), True, None),
-                ("no_slot_wait+delay_copy", K.Faults(no_slot_wait=True, delay_copy_ms=LIFETIME_DELAY_MS), True, LIFETIME_CAP),
-                ("slot_wait+delay_copy (positive)", K.Faults(delay_copy_ms=LIFETIME_DELAY_MS), False, LIFETIME_CAP),
-                ("no_landing_wait+delay_scatter", K.Faults(no_landing_wait=True, delay_scatter_ms=LIFETIME_DELAY_MS), True, LIFETIME_CAP),
-                ("landing_wait+delay_scatter (positive)", K.Faults(delay_scatter_ms=LIFETIME_DELAY_MS), False, LIFETIME_CAP)):
-            x = self.exact_layer(cpu8, c, 0, cap=cap, faults=fl)
-            x.update(control=name, expect_fail=expect_fail, n_chunks_hint=cap)
-            x["verdict"] = ("DETECTED" if not x["ok"] else "NOT_DETECTED") if expect_fail else ("PASS" if x["ok"] else "FAIL")
-            nf += int(x["verdict"] in ("NOT_DETECTED", "FAIL"))
+                ("no_slot_wait+delay_copy", K.Faults(no_slot_wait=True, delay_copy_ms=LIFETIME_DELAY_MS), True, lc["cap"]),
+                ("slot_wait+delay_copy (positive)", K.Faults(delay_copy_ms=LIFETIME_DELAY_MS), False, lc["cap"]),
+                ("no_landing_wait+delay_scatter", K.Faults(no_landing_wait=True, delay_scatter_ms=LIFETIME_DELAY_MS), True, lc["cap"]),
+                ("landing_wait+delay_scatter (positive)", K.Faults(delay_scatter_ms=LIFETIME_DELAY_MS), False, lc["cap"]),
+                ("no_h2d_wait+delay_copy", K.Faults(no_h2d_wait=True, delay_copy_ms=LIFETIME_DELAY_MS), True, lc["cap"])):
+            lifetime = cap is not None
+            if lifetime and not lc["testable"]:
+                x = dict(ok=False, layer=lc["layer"], arm=cpu8["name"], error="UNTESTABLE: %d chunks <= ring %d" % (lc["n_chunks"], RING))
+            else:
+                x = self.exact_layer(cpu8, c, lc["layer"] if lifetime else 0, cap=cap, faults=fl)
+            x.update(control=name, expect_fail=expect_fail, cap=cap, n_chunks=(lc["n_chunks"] if lifetime else None))
+            if lifetime and not lc["testable"]:
+                x["verdict"] = "UNTESTABLE"
+            else:
+                x["verdict"] = ("DETECTED" if not x["ok"] else "NOT_DETECTED") if expect_fail else ("PASS" if x["ok"] else "FAIL")
+            nf += int(x["verdict"] in ("NOT_DETECTED", "FAIL", "UNTESTABLE"))
             negs.append(x)
         res["controls"] = negs
         # decode: zero-load resident step, and the logits negative control (a second step without restore)
@@ -910,10 +989,19 @@ class Runner:
         return nf
 
     def sweep_stage(self):
+        """Transfer-alone w8 and cpu8 over every captured step (steady 1.. and the step-0 full list LAST). Bounded by
+        CP_STAGE_DEADLINE: a step that its observed step time does not fit is skipped (sweep_notes, partial)."""
         nf = 0
         arms = [arm("w8", "w8"), arm("cpu%d" % max(CORES), "cpu", cores=max(CORES))]
         self.coord.configure(max(CORES))
-        for ps in list(range(1, self.masks.shape[0])) + [0]:
+        order = list(range(1, self.masks.shape[0])) + [0]
+        took = []
+        for i, ps in enumerate(order):
+            est = max(took) if took else SWEEP_STEP_EST_S
+            if STAGE_DEADLINE and time.time() + est > STAGE_DEADLINE - FINAL_RESERVE_S:
+                self.sweep_notes.append("deadline: SWEEP stopped before plan step %d (%d of %d steps done)" % (ps, i, len(order)))
+                break
+            t_s = time.time()
             c = self.prepare(ps, arms)
             for a in arms:
                 _, r = self.bracket(a, c, False)
@@ -921,6 +1009,7 @@ class Runner:
                 ok = self.rep_checks(r, c, c["union"], c["last"])
                 nf += int(not ok)
                 self.sweep.append(r)
+            took.append(time.time() - t_s)
         self.chk = {}
         return nf
 
@@ -956,39 +1045,189 @@ class Runner:
             del phys, log
         return out
 
-    def convert_host(self, to):
+    def tail_write_real(self, reps=3):
+        """N1 realism: the SAME section-D write form (cache_engine.py:707-708) through the REAL host tensors' logical views
+        (e._k_cpu / e._v_cpu: the real per-request pitch and NUMA placement, orig or head-major), every layer's K and V, into
+        rows [S_cpu - R, S_cpu), which nothing reads in this process: plans name blocks < L/R + 1 and no rollover happens
+        (checked here; skipped with a note otherwise). Per-rollover cost = the SUM of the 2*NL measured per-tensor medians."""
+        R, lo = self.R, self.S_cpu - self.R
+        max_blk = int(self.masks.max()) if hasattr(self, "masks") else -1
+        if lo < VA.L + R * (VA.N // R + 2) or (max_blk + 1) * R > lo:
+            return dict(layout=self.host_layout, skipped="rows [%d, %d) not provably unread (L=%d N=%d max planned block %d)"
+                        % (lo, self.S_cpu, VA.L, VA.N, max_blk))
+        host_ms, ev_ms, ok = [], [], True
+        for e in self.engines:
+            t_slot = int(e._tail_block_idx_on_gpu)
+            for win, host in ((e._k_gpu, e._k_cpu), (e._v_gpu, e._v_cpu)):
+                src = win[:, t_slot * R:(t_slot + 1) * R]
+                dst = host[:, lo:lo + R]
+                hs, es = [], []
+                for i in range(reps + 1):
+                    torch.cuda.synchronize()
+                    e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    t = time.perf_counter()
+                    e0.record()
+                    dst.copy_(src, non_blocking=True)
+                    e1.record()
+                    torch.cuda.synchronize()
+                    if i:
+                        hs.append(1000 * (time.perf_counter() - t))
+                        es.append(e0.elapsed_time(e1))
+                ok &= K.bits_equal(dst.to("cuda"), src)
+                host_ms.append(float(np.median(hs)))
+                ev_ms.append(float(np.median(es)))
+        roll = float(sum(host_ms))
+        return dict(layout=self.host_layout, rows=[lo, self.S_cpu], tensors=len(host_ms), reps=reps, host_ms_per_tensor=host_ms,
+                    event_ms_per_tensor=ev_ms, content_ok=bool(ok), measured_ms_per_rollover=roll, measured_ms_per_token=roll / R,
+                    accounting=K.tail_write_accounting(self.host_layout, self.B, self.NL, measured_ms_per_tensor=float(np.median(host_ms))),
+                    note="the real cache tensors through the engine's own copy_ form; a torch D2H into a non-contiguous host view "
+                         "goes through a contiguous temporary (Copy.cu copy_requires_temporaries) in BOTH layouts")
+
+    def _convert_layer(self, l, frm, to):
+        """One layer's K and V host tensors reordered in place; the engine's tensors become the new logical views."""
+        e = self.engines[l]
+        new, infos = [], []
+        for which in (0, 1):
+            phys = self.host_phys[l][which]
+            np_, info = K.convert_inplace(phys, frm, to, verify=True)
+            assert np_.data_ptr() == phys.data_ptr()
+            new.append(np_)
+            infos.append(info)
+        self.host_phys[l] = (new[0], new[1])
+        e._k_cpu, e._v_cpu = K.logical(new[0], to), K.logical(new[1], to)
+        assert K.layout_of(e._k_cpu) == to and K.layout_of(e._v_cpu) == to
+        assert self.dev != "cuda" or (e._k_cpu.is_pinned() and e._v_cpu.is_pinned())
+        return infos
+
+    def convert_host(self, to, deadline=None):
         """In-place reorder of every layer's K and V host tensor (cpupack_core.convert_inplace; bit-exact per-request logical
         check); the engines read the new layout through their logical views (the shipped gathers take strides:
-        flash_h2d_mask.py:76-77 / :41-56, flash_h2d_mask_bias.py:97-98 / :62-77)."""
+        flash_h2d_mask.py:76-77 / :41-56, flash_h2d_mask_bias.py:97-98 / :62-77). DEADLINE GUARD (layer granularity): after
+        each layer, if now + (layers left) x (slowest layer so far) passes `deadline`, the conversion stops and takes the
+        cheaper way back to ONE layout (revert the converted layers, or finish); 'aborted' records it and the caller skips
+        the head-major cells. The time is split into ms_reorder and ms_verify (the verification is not a conversion cost).
+        NOT the production path: a head-major host cache would be written at prefill by the strided D2H of
+        cache_engine.py:422 into the logical view; this is the ablation's one-time reorder of an orig cache."""
         frm = self.host_layout
-        per, bad, ms = [], 0, []
+        per, bad, ms, ms_re, ms_ve, lay_s = [], 0, [], [], [], []
         if self.dev == "cuda":
             torch.cuda.synchronize()                                     # no gather may be reading the host cache
-        for l, e in enumerate(self.engines):
-            new = []
-            for which in (0, 1):
-                phys = self.host_phys[l][which]
-                np_, info = K.convert_inplace(phys, frm, to, verify=True)
-                assert np_.data_ptr() == phys.data_ptr()
+        t0 = time.time()
+        aborted, done = None, 0
+
+        def book(l, infos, direction):
+            nonlocal bad
+            for info in infos:
                 bad += info["bad"]
                 ms.append(info["ms"])
-                new.append(np_)
-            self.host_phys[l] = (new[0], new[1])
-            e._k_cpu, e._v_cpu = K.logical(new[0], to), K.logical(new[1], to)
-            assert K.layout_of(e._k_cpu) == to and K.layout_of(e._v_cpu) == to
-            assert self.dev != "cuda" or (e._k_cpu.is_pinned() and e._v_cpu.is_pinned())
-            per.append(dict(layer=l, ms_k=ms[-2], ms_v=ms[-1]))
-        self.host_layout = to
+                ms_re.append(info["ms_reorder"])
+                ms_ve.append(info["ms_verify"])
+            per.append(dict(layer=l, direction=direction, ms_k=infos[0]["ms"], ms_v=infos[1]["ms"], bad=infos[0]["bad"] + infos[1]["bad"]))
+        for l in range(self.NL):
+            tl = time.time()
+            book(l, self._convert_layer(l, frm, to), "forward")
+            done = l + 1
+            lay_s.append(time.time() - tl)
+            if deadline is not None and done < self.NL:
+                left = (self.NL - done) * max(lay_s)
+                if time.time() + left > deadline:
+                    spent = time.time() - t0
+                    aborted = dict(after_layers=done, spent_s=spent, left_s_est=left, action=("revert" if spent <= left else "finish"))
+                    break
+        final = to
+        if aborted is not None:
+            if aborted["action"] == "revert":
+                for l in range(done):
+                    book(l, self._convert_layer(l, to, frm), "revert")
+                final = frm
+            else:
+                for l in range(done, self.NL):
+                    book(l, self._convert_layer(l, frm, to), "forward")
+        self.host_layout = final
         self.chk = {}
-        acc = K.conversion_accounting(self.B, self.S_cpu, self.H, self.D, 2, self.NL, ms)
-        return dict(frm=frm, to=to, bad_requests=bad, per_layer=per, accounting=acc, extra_pinned_bytes=0)
+        fwd = [x for x in per if x["direction"] == "forward"]
+        acc = K.conversion_accounting(self.B, self.S_cpu, self.H, self.D, 2, self.NL, [v for x in fwd for v in (x["ms_k"], x["ms_v"])])
+        return dict(frm=frm, to=to, final_layout=final, bad_requests=bad, per_layer=per, accounting=acc, extra_pinned_bytes=0,
+                    seconds=time.time() - t0, ms_total=float(sum(ms)), ms_reorder_total=float(sum(ms_re)), ms_verify_total=float(sum(ms_ve)),
+                    aborted=aborted, deadline_epoch=deadline,
+                    note="one-time ablation reorder of an orig cache (NOT the production path: a head-major cache would be written at "
+                         "prefill through the strided D2H of cache_engine.py:422)")
+
+    def predict_conversion(self, to):
+        """The conversion-time prediction BEFORE any head-major cell: an in-place round trip of 3 requests (K and V of the
+        first / middle / last layer, first / middle / last request; cpupack_core.probe_convert, the same per-request code,
+        the data left bit-identical) and, when CP_CALIB_JSON is readable, C0's measured per-tensor time scaled by bytes.
+        predicted = CP_CONV_SAFETY x max(probe, C0)."""
+        if self.dev == "cuda":
+            torch.cuda.synchronize()
+        picks = sorted({(0, 0), (self.NL // 2, self.B // 2), (self.NL - 1, self.B - 1)})
+        probes = []
+        for l, b in picks:
+            for which in (0, 1):
+                pr = K.probe_convert(self.host_phys[l][which], self.host_layout, b)
+                pr.update(layer=l, tensor="kv"[which])
+                probes.append(pr)
+        per_req = max(p["ms_fwd"] for p in probes)
+        probe_s = per_req * self.B * 2 * self.NL / 1000.0
+        c0_s, c0_note = None, None
+        if CALIB_JSON:
+            try:
+                with open(CALIB_JSON) as f:
+                    cj = json.load(f)
+                pt = cj["conversion"]["per_tensor"]
+                c0_s = float(np.mean([x["ms"] for x in pt])) * (self.B * self.S_cpu) / float(cj["B"] * cj["S"]) * 2 * self.NL / 1000.0
+            except Exception as e:                                       # a missing C0 leaves the probe alone
+                c0_note = "C0 calibration unusable: %r" % (e,)
+        return dict(to=to, probes=probes, probe_bad=sum(1 for p in probes if p["bad"] or not p["restored"]), per_request_ms_max=per_req,
+                    probe_s=probe_s, c0_s=c0_s, c0_note=c0_note, calib_json=CALIB_JSON or None, safety=CONV_SAFETY,
+                    predicted_s=CONV_SAFETY * max(probe_s, c0_s or 0.0))
+
+    def layout_deadline(self, t0):
+        d = t0 + LAYOUT_BUDGET_S
+        if STAGE_DEADLINE:
+            d = min(d, STAGE_DEADLINE - FINAL_RESERVE_S)
+        return d
+
+    def layout_resident(self, ctx, phase, cellk, ps):
+        """LAYOUT_REPS decode-alone reps at THIS gated step (the same-step denominator of the cell's slowdown)."""
+        for rep in range(LAYOUT_REPS):
+            r = self.resident(ctx)
+            r.update(step=ctx["it"], plan_step=ps, phase=phase, rep=rep, stage="LAYOUT", cell=cellk)
+            self.layout_fails += int(not r["ok"])
+            self.layout_rows.append(r)
+
+    def layout_peak_check(self, it):
+        """Registered trigger (c) seen inside LAYOUT: MAIN is done, so it is a layout note + failure, never a fallback."""
+        if self.dev != "cuda" or self.layout["memgate"]:
+            return
+        pk = torch.cuda.max_memory_reserved() / 1e9
+        if pk > PEAK_LIMIT_GB:
+            self.layout["memgate"].append(dict(step=it, peak_reserved_gb=pk, note="LAYOUT peak reserved above %.1f GB: a layout "
+                                               "failure, NOT a fallback trigger (MAIN is done)" % PEAK_LIMIT_GB))
+            self.layout_fails += 1
 
     def layout_stage(self, steps_iter, pos_of):
         """layout_ablation: the 2x2 (module docstring). steps_iter yields free decode steps; each (cell, plan step) uses one
-        gated decode step. Returns the failure count (kept separate from the original arms')."""
+        gated decode step: LAYOUT_REPS decode-alone reps, the variants (each: warm-up, LAYOUT_REPS alone, LAYOUT_REPS beside
+        the decode), LAYOUT_REPS decode-alone reps. Failures go to self.layout_fails (separate from the original arms').
+        Deadline = min(start + CP_LAYOUT_BUDGET_S, CP_STAGE_DEADLINE - CP_FINAL_RESERVE_S); a step is started only if the
+        slowest step so far still fits; the head-major cells only if the predicted conversion + one step fit."""
         t0 = time.time()
-        nf = 0
-        self.layout["tail_write"] = self.tail_write_bench()
+        deadline = self.layout_deadline(t0)
+        L = self.layout
+        L.update(deadline_epoch=deadline, stage_deadline_epoch=STAGE_DEADLINE, budget_s=LAYOUT_BUDGET_S, step_s=[])
+        dev = self.dev
+        est = lambda: max(L["step_s"]) if L["step_s"] else LAYOUT_STEP_EST_S
+
+        def stop(msg):
+            L["partial"] = True
+            L["notes"].append(msg)
+            self.log("LAYOUT: " + msg)
+        if time.time() + est() > deadline:
+            stop("not started: %.0f s left < one step estimate %.0f s" % (deadline - time.time(), est()))
+            return
+        L["tail_write"] = self.tail_write_bench()
+        L["tail_write_real"][self.host_layout] = self.tail_write_real()
         orig_refs = {}                                                   # references computed BEFORE any conversion
         self.set_scratch("orig")
         for ps in LAYOUT_PLAN_STEPS:
@@ -996,42 +1235,66 @@ class Runner:
             for l in sorted(set(LAYOUT_CHECK_LAYERS) | {self.NL - 1}):
                 r = self.ref_layer(cpu, l)
                 orig_refs[(ps, l)] = dict(rk=r["rk"].cpu(), rv=r["rv"].cpu())
-        cells = list(LAYOUT_CELLS_PRE) + list(LAYOUT_CELLS_POST)
-        for ci, (src, dst) in enumerate(cells):
-            if time.time() - t0 > LAYOUT_BUDGET_S:
-                self.layout["partial"] = True
-                self.layout["notes"].append("deadline reached before cell %s>%s" % (src, dst))
+        halt = False
+        for src, dst in list(LAYOUT_CELLS_PRE) + list(LAYOUT_CELLS_POST):
+            if halt:
                 break
-            conv_needed = src != self.host_layout
+            cellk = "%s>%s" % (src, dst)
+            conv = None
+            if src != self.host_layout:
+                pred = self.predict_conversion(src)
+                L.setdefault("conversion_predictions", []).append(pred)
+                if pred["probe_bad"]:
+                    self.layout_fails += 1
+                    stop("conversion probe NOT exact (%d probes): head-major cells skipped" % pred["probe_bad"])
+                    break
+                if time.time() + pred["predicted_s"] + est() > deadline:
+                    stop("head-major cells skipped: predicted conversion %.0f s + one step %.0f s > %.0f s left"
+                         % (pred["predicted_s"], est(), deadline - time.time()))
+                    break
+                conv = dict(deadline=deadline - est(), pred=pred)
+            elif time.time() + est() > deadline:
+                stop("deadline before cell %s" % cellk)
+                break
             self.set_scratch(dst)
             cell = dict(src=src, dst=dst, variants=[a["name"] for a in layout_variants(src, dst, max(CORES))], exact=[], steps=[])
+            L["cells"].append(cell)
             for j, ps in enumerate(LAYOUT_PLAN_STEPS):
-                if j and time.time() - t0 > LAYOUT_BUDGET_S:
-                    self.layout["partial"] = True
-                    self.layout["notes"].append("deadline reached inside cell %s>%s after %d plan steps" % (src, dst, j))
+                if j and time.time() + est() > deadline:
+                    stop("deadline inside cell %s after %d plan steps" % (cellk, j))
+                    halt = True
                     break
                 it = next(steps_iter)
+                box = dict(conv_s=0.0, aborted=False)
 
-                def work(ctx, ps=ps, j=j):
-                    nonlocal nf, conv_needed
-                    if conv_needed:
-                        res = self.convert_host(src)
+                def work(ctx, ps=ps, j=j, box=box):
+                    nonlocal conv
+                    if conv is not None:
+                        tc = time.time()
+                        res = self.convert_host(src, deadline=conv["deadline"])
+                        res["prediction"] = conv["pred"]
+                        conv = None
                         ctx["restore"]()
                         for e in self.engines:
                             self.mc.flush_map(e)
                         lg2 = self.decode(ctx["tok"], ctx["pos"])
-                        torch.cuda.synchronize()
+                        if dev == "cuda":
+                            torch.cuda.synchronize()
                         res["reference_logits_equal_before_after"] = bool(torch.equal(lg2, ctx["lg_ref"]))
                         res["loads_of_reference_after"] = self.loaded_now()
-                        nf += int(res["bad_requests"] > 0) + int(not res["reference_logits_equal_before_after"])
-                        self.layout["conversion"] = res
-                        conv_needed = False
+                        self.layout_fails += int(res["bad_requests"] > 0) + int(not res["reference_logits_equal_before_after"])
+                        L["conversion"] = res
+                        box["conv_s"] = time.time() - tc
                         self.flush_payload(True)
+                        if res["aborted"] is not None:
+                            box["aborted"] = True
+                            return
                     c = self.prepare(ps, [])
                     # the stored pre-conversion reference replaces the live one: content must equal the ORIGINAL bytes
                     ref = c["last"]
                     o = orig_refs[(ps, self.NL - 1)]
-                    ref["rk"], ref["rv"] = o["rk"].to("cuda"), o["rv"].to("cuda")
+                    ref["rk"], ref["rv"] = o["rk"].to(dev), o["rv"].to(dev)
+                    self.layout_resident(ctx, "decode_alone_pre", cellk, ps)
                     for a in layout_variants(src, dst, max(CORES)):
                         if j == 0:
                             for l in LAYOUT_CHECK_LAYERS:
@@ -1039,23 +1302,65 @@ class Runner:
                                 rr = self.ref_layer(c["cpu"], l)
                                 o2 = orig_refs[(ps, l)]
                                 x["live_ref_equals_original"] = K.bits_equal(rr["rk"].cpu(), o2["rk"]) and K.bits_equal(rr["rv"].cpu(), o2["rv"])
-                                ok = x["ok"] and x["live_ref_equals_original"]
-                                x["ok"] = ok
+                                x["ok"] = bool(x["ok"] and x["live_ref_equals_original"])
                                 cell["exact"].append(dict(x, variant=a["name"]))
-                                nf += int(not ok)
+                                self.layout_fails += int(not x["ok"])
                         rows = []
-                        nf += self.arm_reps(a, ctx, c, LAYOUT_REPS, rows, "LAYOUT")
+                        self.layout_fails += self.arm_reps(a, ctx, c, LAYOUT_REPS, rows, "LAYOUT")
                         for r in rows:
-                            r["cell"] = "%s>%s" % (src, dst)
+                            r["cell"] = cellk
                         self.layout_rows.extend(rows)
-                    cell["steps"].append(dict(decode_step=ctx["it"], plan_step=ps, agreement=ctx["agreement"]))
+                    self.layout_resident(ctx, "decode_alone_post", cellk, ps)
+                    cell["steps"].append(dict(decode_step=ctx["it"], plan_step=ps, agreement=ctx["agreement"], tail_len_max=ctx.get("tail_len_max")))
+                ts = time.time()
                 self.gated(it, pos_of(it), work)
+                L["step_s"].append(time.time() - ts - box["conv_s"])
+                self.layout_peak_check(it)
                 self.flush_payload(True)
-            self.layout["cells"].append(cell)
+                if box["aborted"]:
+                    stop("conversion stopped by its deadline guard (%s): head-major cells skipped" % (L["conversion"]["aborted"],))
+                    halt = True
+                    break
+            if self.host_layout not in L["tail_write_real"]:
+                L["tail_write_real"][self.host_layout] = self.tail_write_real()
         if LAYOUT_BACK and self.host_layout != "orig":
-            self.layout["conversion_back"] = self.convert_host("orig")
-        self.layout["seconds"] = time.time() - t0
-        return nf
+            pred = self.predict_conversion("orig")
+            if time.time() + pred["predicted_s"] <= deadline:
+                L["conversion_back"] = self.convert_host("orig", deadline=deadline)
+            else:
+                L["notes"].append("conversion back skipped: predicted %.0f s past the deadline" % pred["predicted_s"])
+        L["seconds"] = time.time() - t0
+
+    def run_layout(self, steps_iter, pos_of):
+        """LAYOUT isolated from the job's control flow: ANY exception (OOM and pinned-allocation failures included) is a
+        layout failure with a note and the traceback; it never reaches main()'s exit-code rule (so it can never discard the
+        batch's MAIN or start a B320 rerun)."""
+        try:
+            self.layout_stage(steps_iter, pos_of)
+        except StopIteration:
+            self.layout["notes"].append("ran out of no-rollover decode steps")
+            self.layout["partial"] = True
+        except Exception as e:
+            self.layout_fails += 1
+            self.layout["partial"] = True
+            self.layout["error"] = traceback.format_exc()[-4000:]
+            self.layout["notes"].append("LAYOUT aborted by %s: %s" % (type(e).__name__, str(e)[:300]))
+            self.log("LAYOUT aborted by %s (MAIN results are kept): %s" % (type(e).__name__, str(e)[:300]))
+        self.snap_inventory("after_layout")
+        try:
+            self.flush_payload(True)
+        except Exception as e:                                           # the final flush in run() retries
+            self.log("flush after LAYOUT failed: %r" % (e,))
+
+    def mark_main_done(self, path=None):
+        """The main-done marker (module docstring): written once MAIN + SWEEP are flushed and passed the memory gate."""
+        path = path or os.path.join(OUT, "%s.main_done" % TAG)
+        rec = dict(tag=TAG, batch=self.B, fails=self.fails, epoch=time.time(), seconds=time.time() - self.t_start, sweep_notes=self.sweep_notes)
+        with open(path + ".tmp", "w") as f:
+            json.dump(rec, f)
+        os.replace(path + ".tmp", path)
+        self.main_done = True
+        return path
 
     # ---------------------------------------------------------------------------------------------- TIMELINE
     def timeline_step(self, ctx):
@@ -1129,12 +1434,14 @@ class Runner:
                                 sleep_ms=SLEEP_MS, w8=W8, layout_plan_steps=LAYOUT_PLAN_STEPS, layout_reps=LAYOUT_REPS, layout_budget_s=LAYOUT_BUDGET_S,
                                 t_arms=T_ARMS, t_steps=T_STEPS, t_reps=T_REPS, t_untraced=T_UNTRACED, lifetime_cap=LIFETIME_CAP,
                                 lifetime_delay_ms=LIFETIME_DELAY_MS, peak_limit_gb=PEAK_LIMIT_GB, chunk_fields=CHUNK_FIELDS,
-                                layer_fields=("hk", "desc", "list_wait_ms", "desc_ms", "desc_cpu_ms", "n", "chunks"),
+                                layer_fields=("hk", "desc", "list_wait_ms", "desc_ms", "desc_coord_cpu_ms", "n", "chunks"), field_notes=FIELD_NOTES,
+                                stage_deadline=STAGE_DEADLINE, final_reserve_s=FINAL_RESERVE_S, calib_json=CALIB_JSON or None, conv_safety=CONV_SAFETY,
                                 env={k: v for k, v in os.environ.items() if k.startswith(("CP_", "NOSI_", "OMP_", "CUDA_", "TORCH_", "TRITON_"))}),
                     provenance=dict(nosi_commit=os.environ.get("NOSI_COMMIT"), repo_commit=os.environ.get("REPO_COMMIT"), torch=torch.__version__,
                                     host=os.uname().nodename, pid=os.getpid()),
                     cpu=dict(placement=EARLY, model=CC.cpu_model(), smt_active=CC.smt_active(), configs=getattr(getattr(self, "coord", None), "configs", None)),
                     capture=getattr(self, "capture_rec", None), hygiene=getattr(self, "hygiene", None), correct=self.correct,
+                    main_done=self.main_done, sweep_notes=self.sweep_notes, crash=getattr(self, "crash", None),
                     rows=self.rows, sweep=self.sweep, layout=dict(self.layout, rows=self.layout_rows), timeline=self.timeline,
                     inventory=self.inv_snaps, thread_use=self.thread_use, seconds=time.time() - self.t_start, docs=self.docs,
                     distinct_books=self.distinct, **self.payload_extra)
@@ -1248,15 +1555,24 @@ class Runner:
             cur = it + 1
             self.log("step %d done (%.0fs, fails %d)" % (it, time.time() - self.t_start, self.fails))
             self.flush_payload(True)
+            if self.memgate:                                            # registered (c): the step's results are kept, then exit
+                self.flush_payload(False)
+                raise MemGate("; ".join(m["trigger"] for m in self.memgate))
         if "MAIN" in STAGES and SWEEP:
             self.fails += self.sweep_stage()
+            pk = torch.cuda.max_memory_reserved() / 1e9
+            if pk > PEAK_LIMIT_GB:
+                self.memgate.append(dict(step="SWEEP", peak_reserved_gb=pk, trigger="(c) peak reserved above %.1f GB (SWEEP)" % PEAK_LIMIT_GB))
             self.flush_payload(True)
         self.snap_inventory("after_main")
         if self.memgate:
             self.flush_payload(False)
             raise MemGate("; ".join(m["trigger"] for m in self.memgate))
-        if "LAYOUT" in STAGES:
+        if "MAIN" in STAGES:
             self.flush_payload(True)                                    # the original arms are on disk before the add-on
+            self.mark_main_done()
+            self.log("MAIN done: marker written; nothing after this point can trigger a fallback")
+        if "LAYOUT" in STAGES:
             free_steps = iter(range(cur, VA.N))
             pos_box = dict(pos=pos, cur=cur)
 
@@ -1266,13 +1582,7 @@ class Runner:
                 cur = target + 1                                        # the gated step consumes `target`
                 pos_box["pos"] = p + 1
                 return p
-            try:
-                self.layout_fails = self.layout_stage(free_steps, pos_of)
-            except StopIteration:
-                self.layout["notes"].append("ran out of no-rollover decode steps")
-                self.layout["partial"] = True
-            self.snap_inventory("after_layout")
-            self.flush_payload(True)
+            self.run_layout(free_steps, pos_of)
         self.flush_payload(False)
         return min(self.fails + self.layout_fails, 19)
 
@@ -1293,8 +1603,10 @@ def MODES_DMA(a) -> bool:
 def calib():
     """Node-local CPU calibration (stage C0 of the job, no model): SYNTHETIC Poisson(CP_CALIB_MEAN) plans at the batch
     geometry, the coordinator on 1/2/4/8 team cores, the row packer from the original layout, then the host tensor reordered
-    in place to head-major (the one-time conversion, timed) and the row and group packers from it. Pack only (mode LP),
-    8 MiB chunks, pinned staging. Label: 'synthetic plan, node-local pack calibration'."""
+    in place to head-major (the one-time conversion, timed: reorder and verification separately; PAGEABLE tensors, so
+    LAYOUT's conversion predictor takes max(C0, its own in-place probe of the real pinned cache)) and the row and group
+    packers from it. Pack only (mode LP), 8 MiB chunks, pinned staging. Label: 'synthetic plan, node-local pack
+    calibration'. main() refuses (exit 24) before this runs when the placement has no full team on the GPU node."""
     B = int(os.environ.get("CP_B", "336"))
     S = VA.L + 8192
     mean = float(os.environ.get("CP_CALIB_MEAN", "3.7"))
@@ -1400,17 +1712,31 @@ def rep_view(r):
 
 
 def table(out_dir):
-    """Markdown + CSV summaries of every cp_*.json under out_dir (medians / p95 over individual samples)."""
+    """Markdown + CSV summaries of every cp_*.json under out_dir (medians / p95 over individual samples).
+    Slowdown = median decode beside / median decode alone AT THE SAME decode step(s) - 1: MAIN and LAYOUT each record their
+    own decode-alone reps at every gated step (a group without them prints nan, never a cross-step ratio). Request e2e
+    p50 / p95 are given for the transfer-alone AND the beside-decode reps. Also: the registered low / mid / high tercile
+    cells of the captured per-(step, layer) totals over steps 1.. (SWEEP request e2e by cell; step 0 = the full list) with
+    the zero-miss stream denominator; the LAYOUT (orig, orig) drift against MAIN on the same plan steps (the cell-order
+    confound); the conversion (reorder vs verification) and the tail-write accounting (small buffer + real cache)."""
     import csv
     import glob
     L = ["# CPU-packing transport (%s; %s)" % (K.LABEL, K.REPLAY_LABEL), ""]
     ok_all = True
     for fn in sorted(glob.glob(os.path.join(out_dir, "cp_*.json"))):
-        p = json.load(open(fn))
+        with open(fn) as f:
+            p = json.load(f)
         B = p.get("batch")
-        ok_all &= p.get("fails", 1) == 0 and not p.get("partial")
-        L.append("## B=%s (%s): fails %s, layout fails %s%s" % (B, os.path.basename(fn), p.get("fails"), p.get("layout_fails"),
-                                                             " PARTIAL" if p.get("partial") else ""))
+        lay = p.get("layout") or {}
+        ok = (p.get("fails", 1) == 0 and not p.get("partial") and not p.get("layout_fails") and not lay.get("partial")
+              and not p.get("crash"))
+        ok_all &= ok
+        L.append("## B=%s (%s): fails %s, layout fails %s%s%s%s%s" % (
+            B, os.path.basename(fn), p.get("fails"), p.get("layout_fails"), " PARTIAL" if p.get("partial") else "",
+            " LAYOUT-PARTIAL" if lay.get("partial") else "", " CRASH(%s)" % p["crash"].get("kind") if p.get("crash") else "",
+            "" if p.get("main_done") in (None, True) else " (MAIN not done)"))
+        for n in (p.get("sweep_notes") or []) + ["LAYOUT: " + x for x in lay.get("notes") or []]:
+            L.append("- note: %s" % n)
         cap = p.get("capture") or {}
         masks = None
         npz = cap.get("export") or (cap.get("source", "").split(" ")[1] if cap.get("source", "").startswith("export") else None)
@@ -1419,78 +1745,161 @@ def table(out_dir):
         req = {}
 
         def req_of(ps):
-            if ps not in req and masks is not None:
+            if ps not in req and masks is not None and ps is not None and 0 <= ps < masks.shape[0]:
                 req[ps] = [(masks[ps, l][..., :63] >= 0).sum(dim=(0, 2)).tolist() for l in range(masks.shape[1])]
             return req.get(ps)
         groups = {}
         alone = {}
-        for r in p.get("rows", []) + p.get("layout", {}).get("rows", []):
-            key = (r.get("stage"), r.get("cell", "orig>orig"), r["arm"])
+        for r in p.get("rows", []) + lay.get("rows", []):
             if r.get("phase", "").startswith("decode_alone"):
                 alone.setdefault(r.get("step"), []).append(r["main_ms"])
                 continue
             if r.get("phase") == "warmup":
                 continue
-            groups.setdefault(key, []).append(r)
-        L += ["", "| stage | cell | arm | reps alone/conc | useful GB/s alone p50 | useful GB/s conc p50 | e2e p50 / p95 ms (requests) "
-              "| list / wake / desc / pack / submit / dma / scq / scatter p50 ms | decode alone -> conc ms p50 | slowdown | late ms p50 | overlap p50 | ok |",
-              "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+            groups.setdefault((r.get("stage"), r.get("cell", "orig>orig"), r["arm"]), []).append(r)
+        L += ["", "| stage | cell | arm | reps alone/conc | useful GB/s alone p50 | useful GB/s conc p50 | e2e alone p50 / p95 ms | "
+              "e2e conc p50 / p95 ms (requests) | list / wake / desc / pack / submit / dma / scq / scatter p50 ms (conc) | "
+              "decode alone -> conc ms p50 (same steps) | slowdown | late ms p50 | overlap p50 | ok |",
+              "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         csv_rows = []
+        summ = {}
         for (stage, cellk, a), rs in sorted(groups.items(), key=lambda kv: (str(kv[0][0]), kv[0][1], kv[0][2])):
             al = [x for x in rs if not x.get("with_decode")]
             co = [x for x in rs if x.get("with_decode")]
             agg_a = [TM.rep_aggregate(rep_view(x), x["useful"]) for x in al]
             agg_c = [TM.rep_aggregate(rep_view(x), x["useful"]) for x in co]
-            samples = []
-            for x in co:
-                rq = req_of(x.get("plan_step"))
-                if rq is not None:
-                    for s in request_rows(x, rq):
-                        s.update(stage=stage, cell=cellk, arm=a, step=x.get("step"), rep=x.get("rep"), mode="conc")
-                        samples.append(s)
-            csv_rows += samples
-            sm = TM.summarize(samples, ("e2e",) + TM.CPU_STAGES)
+            s_a, s_c = [], []
+            for mode, xs, dst in (("alone", al, s_a), ("conc", co, s_c)):
+                for x in xs:
+                    rq = req_of(x.get("plan_step"))
+                    if rq is None:
+                        continue
+                    for s_ in request_rows(x, rq):
+                        s_.update(stage=stage, cell=cellk, arm=a, step=x.get("step"), plan_step=x.get("plan_step"), rep=x.get("rep"), mode=mode)
+                        dst.append(s_)
+            csv_rows += s_a + s_c
+            sa = TM.summarize(s_a, ("e2e",))
+            sm = TM.summarize(s_c, ("e2e",) + TM.CPU_STAGES)
             dec_c = [x["main_ms"] for x in co]
-            dec_a = [m for x in co for m in alone.get(x.get("step"), [])]
+            dec_a = [m for st in sorted({x.get("step") for x in co}, key=str) for m in alone.get(st, [])]
             da, dc = TM.pctl(dec_a, 50), TM.pctl(dec_c, 50)
-            L.append("| %s | %s | %s | %d/%d | %.2f | %.2f | %.2f / %.2f | %s | %.2f -> %.2f | %+.1f%% | %.2f | %.2f | %d/%d |" % (
-                stage, cellk, a, len(al), len(co), TM.pctl([g["useful_gbps"] for g in agg_a], 50), TM.pctl([g["useful_gbps"] for g in agg_c], 50),
-                sm["e2e"]["p50"], sm["e2e"]["p95"], " / ".join("%.2f" % sm[k]["p50"] for k in TM.CPU_STAGES), da, dc,
-                100 * (dc / da - 1) if da == da and da > 0 else float("nan"), TM.pctl([g.get("late_ms") for g in agg_c], 50),
+            slow = 100 * (dc / da - 1) if da == da and da > 0 else float("nan")
+            ga, gc = TM.pctl([g["useful_gbps"] for g in agg_a], 50), TM.pctl([g["useful_gbps"] for g in agg_c], 50)
+            summ[(stage, cellk, a)] = dict(gbps_alone=ga, gbps_conc=gc, slowdown_pct=slow, plan_steps=sorted({x.get("plan_step") for x in rs}, key=str))
+            L.append("| %s | %s | %s | %d/%d | %.2f | %.2f | %.2f / %.2f | %.2f / %.2f | %s | %.2f -> %.2f | %+.1f%% | %.2f | %.2f | %d/%d |" % (
+                stage, cellk, a, len(al), len(co), ga, gc, sa["e2e"]["p50"], sa["e2e"]["p95"], sm["e2e"]["p50"], sm["e2e"]["p95"],
+                " / ".join("%.2f" % sm[k]["p50"] for k in TM.CPU_STAGES), da, dc, slow, TM.pctl([g.get("late_ms") for g in agg_c], 50),
                 TM.pctl([g.get("overlap_frac") for g in agg_c], 50), sum(1 for x in rs if x.get("ok")), len(rs)))
+        # N3: the (orig, orig) LAYOUT pair against MAIN on the same plan steps (the cell-order / time drift)
+        lsteps = set()
+        for (stage, cellk, a), v in summ.items():
+            if stage == "LAYOUT":
+                lsteps |= set(v["plan_steps"])
+        for main_arm, lay_arm in (("w8", "w8@orig>orig"), ("cpu8", "cpu8@orig>orig:row/row")):
+            lo = summ.get(("LAYOUT", "orig>orig", lay_arm))
+            if lo is None:
+                continue
+            ms_ = [x for x in groups.get(("MAIN", "orig>orig", main_arm), []) if x.get("plan_step") in lsteps and not x.get("with_decode")]
+            gm = TM.pctl([TM.rep_aggregate(rep_view(x), x["useful"])["useful_gbps"] for x in ms_], 50)
+            L.append("- drift LAYOUT %s vs MAIN %s on plan steps %s: useful GB/s alone %.2f / %.2f = %.3f (the cell-order confound; "
+                     "hm cells run after the conversion)" % (lay_arm, main_arm, sorted(lsteps), lo["gbps_alone"], gm,
+                                                               lo["gbps_alone"] / gm if gm == gm and gm > 0 else float("nan")))
+        # the registered cells: terciles of the captured per-(step, layer) totals over steps 1.., the zero-miss denominator
+        if masks is not None and masks.shape[0] > 1:
+            steady = list(range(1, masks.shape[0]))
+            tot = PL.layer_totals(masks, range(masks.shape[0]))
+            cuts = PL.tercile_cells(tot, steady)
+            cnt = PL.counts_of(masks)[1:]
+            zero, streams = int((cnt == 0).sum()), int(cnt.numel())
+            L.append("")
+            L.append("registered cells: per-(step, layer) load totals over steps 1..%d: low <= %.1f < mid <= %.1f < high (n %d, min %d, max %d); "
+                     "zero-miss (layer, head, request) streams %d of %d (%.1f%%) = the separate denominator; step 0 = the full list" % (
+                         steady[-1], cuts["lo"], cuts["hi"], cuts["n"], cuts["min"], cuts["max"], zero, streams, 100.0 * zero / max(streams, 1)))
+            by = {}
+            for r in p.get("sweep", []):
+                ps = r.get("plan_step")
+                rq = req_of(ps)
+                if rq is None:
+                    continue
+                for s_ in request_rows(r, rq):
+                    cn = "full" if ps == 0 else PL.cell_of(tot[(ps, s_["layer"])], cuts)
+                    by.setdefault((r["arm"], cn), []).append(s_["e2e"])
+            if by:
+                L += ["", "| SWEEP arm | cell | requests | e2e alone p50 / p95 ms |", "|---|---|---|---|"]
+                order = {"low": 0, "mid": 1, "high": 2, "full": 3}
+                for (a, cn), xs in sorted(by.items(), key=lambda kv: (kv[0][0], order.get(kv[0][1], 9))):
+                    L.append("| %s | %s | %d | %.2f / %.2f |" % (a, cn, len(xs), TM.pctl(xs, 50), TM.pctl(xs, 95)))
         if csv_rows:
-            keys = sorted({k for s in csv_rows for k in s})
+            keys = sorted({k for s_ in csv_rows for k in s_})
             with open(os.path.join(out_dir, "requests_b%s.csv" % B), "w", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=keys)
                 w.writeheader()
-                for s in csv_rows:
-                    w.writerow(s)
-        lay = p.get("layout") or {}
+                for s_ in csv_rows:
+                    w.writerow(s_)
         if lay.get("conversion"):
             cv = lay["conversion"]
             L.append("")
-            L.append("layout_ablation conversion %s->%s: bad requests %s, reference logits equal before/after %s, total %.1f s (%s)" % (
-                cv["frm"], cv["to"], cv["bad_requests"], cv.get("reference_logits_equal_before_after"),
-                (cv["accounting"].get("measured_ms_total") or 0) / 1000, "in place, extra pinned 0"))
-        if lay.get("tail_write"):
-            for k, v in lay["tail_write"].items():
-                a = v["accounting"]
-                L.append("layout_ablation tail write %s: %d runs x %d B per tensor; measured %.3f ms/tensor (host), %.3f ms per rollover, "
-                         "%.4f ms per token amortized; link bound %.4f ms per token" % (k, a["runs"], a["run_bytes"], float(np.median(v["host_ms"])),
-                                                                                       a["measured_ms_per_rollover"], a["measured_ms_per_token"],
-                                                                                       a["link_bound_ms_per_token"]))
+            L.append("layout_ablation conversion %s->%s (final %s): bad requests %s, reference logits equal before/after %s, reorder %.1f s + "
+                     "verification %.1f s (in place, extra pinned 0; predicted %s s; aborted %s)" % (
+                         cv["frm"], cv["to"], cv.get("final_layout"), cv["bad_requests"], cv.get("reference_logits_equal_before_after"),
+                         (cv.get("ms_reorder_total") or 0) / 1000, (cv.get("ms_verify_total") or 0) / 1000,
+                         "%.0f" % cv["prediction"]["predicted_s"] if cv.get("prediction") else "-", cv.get("aborted")))
+        for k, v in (lay.get("tail_write") or {}).items():
+            a = v["accounting"]
+            L.append("layout_ablation tail write %s (small pinned buffer): %d runs x %d B per tensor; measured %.3f ms/tensor (host), %.3f ms "
+                     "per rollover, %.4f ms per token amortized; link bound %.4f ms per token" % (
+                         k, a["runs"], a["run_bytes"], float(np.median(v["host_ms"])), a["measured_ms_per_rollover"], a["measured_ms_per_token"],
+                         a["link_bound_ms_per_token"]))
+        for k, v in (lay.get("tail_write_real") or {}).items():
+            if v.get("skipped"):
+                L.append("layout_ablation tail write %s (real cache): skipped: %s" % (k, v["skipped"]))
+            else:
+                L.append("layout_ablation tail write %s (real cache, %d tensors): %.3f ms per rollover (sum of per-tensor medians), %.4f ms per "
+                         "token amortized; content ok %s" % (k, v["tensors"], v["measured_ms_per_rollover"], v["measured_ms_per_token"], v["content_ok"]))
         L.append("")
     text = "\n".join(L) + "\n"
-    open(os.path.join(out_dir, "cpupack_table.md"), "w").write(text)
+    with open(os.path.join(out_dir, "cpupack_table.md"), "w") as f:
+        f.write(text)
     print(text)
     return 0 if ok_all else 1
 
 
 # ------------------------------------------------------------------------------------------------------------ main
+def is_memory_trigger(exc) -> bool:
+    """Registered trigger (a): a MemGate, a CUDA OOM, or a RuntimeError from a CUDA / pinned allocation. A coordinator
+    error ('coordinator: <traceback>') is never one: its text is a traceback and may contain any word."""
+    if isinstance(exc, (MemGate, torch.cuda.OutOfMemoryError)):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc)
+        if msg.startswith("coordinator:"):
+            return False
+        low = msg.lower()
+        return "out of memory" in low or "cudahostalloc" in low or "pinned" in low
+    return False
+
+
+def exit_code_for(runner, exc) -> int:
+    """The exit code of an exception that left Runner.run. Before the main-done marker: a placement refusal -> 24, a
+    registered memory trigger -> 22 (the sbatch's B320 fallback), anything else -> 23 (a crash, never read as a failure
+    count). After the marker the batch's MAIN results are final: a failure count 1..19, never 20..24."""
+    if getattr(runner, "main_done", False):
+        return max(1, min(int(runner.fails) + int(runner.layout_fails) + 1, 19))
+    if isinstance(exc, PlacementRefused):
+        return RC_PLACEMENT
+    if is_memory_trigger(exc):
+        return RC_MEMGATE
+    return RC_CRASH
+
+
 def main():
     if MODE == "table":
         return table(OUT)
     os.makedirs(OUT, exist_ok=True)
+    why = placement_problem(EARLY)
+    if why:                                                              # before the corpus / model load (minutes at B336)
+        print("[cpupack] PLACEMENT REFUSED (exit %d): %s; placement %s" % (RC_PLACEMENT, why, json.dumps(EARLY)), flush=True)
+        return RC_PLACEMENT
     if MODE == "calib":
         return calib()
     VA.check_budget()
@@ -1509,25 +1918,21 @@ def main():
     runner = Runner(model, ids, docs, distinct, flush)
     try:
         rc = runner.run()
-    except MemGate as e:
-        runner.memgate.append(dict(trigger=str(e)))
-        runner.log("MEMORY FALLBACK TRIGGER: %s" % e)
+    except Exception as e:
+        rc = exit_code_for(runner, e)
+        kind = {RC_MEMGATE: "MEMORY FALLBACK TRIGGER", RC_PLACEMENT: "PLACEMENT REFUSED", RC_CRASH: "CRASH"}.get(
+            rc, "FAILURE AFTER MAIN (MAIN results kept, no fallback)")
+        if rc == RC_MEMGATE:
+            runner.memgate.append(dict(trigger=(str(e) if isinstance(e, MemGate) else "(a) %s" % str(e)[:300])))
+        else:
+            runner.crash = dict(kind=kind, exit=rc, error=traceback.format_exc()[-4000:])
+        runner.log("%s (exit %d): %s: %s" % (kind, rc, type(e).__name__, str(e)[:300]))
+        traceback.print_exc()
         try:
             runner.flush_payload(False)
         except Exception:
             pass
-        return RC_MEMGATE
-    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-        msg = str(e)
-        if isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in msg or "cudaHostAlloc" in msg or "pinned" in msg.lower():
-            runner.memgate.append(dict(trigger="(a) %s" % msg[:300]))
-            runner.log("MEMORY FALLBACK TRIGGER (OOM / pinned): %s" % msg[:300])
-            try:
-                runner.flush_payload(False)
-            except Exception:
-                pass
-            return RC_MEMGATE
-        raise
+        return rc
     print("[cpupack] saved %s (fails %d, layout fails %d, peak reserved %.2f GB)" % (fn, runner.fails, runner.layout_fails,
                                                                                torch.cuda.max_memory_reserved() / 1e9), flush=True)
     return rc

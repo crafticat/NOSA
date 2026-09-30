@@ -35,7 +35,9 @@ destination only) write identical destinations. So the packer/placer ALGORITHM c
 LIFETIMES (every reuse wait has a negative control: Faults, and the deferred CpuBackend makes a missing wait visible):
   staging slot s is overwritten by the host only after the H2D that read it completed (host_wait on its H2D-end event);
   landing slot s is overwritten by an H2D only after the scatter that read it completed (copy-stream wait on its scatter
-  event). Poisoned scratch + canary rows detect a skipped scatter; a poisoned staged row detects content corruption.
+  event); the scatter of a chunk reads its landing slot only after THAT chunk's H2D completed (scatter-stream wait on the
+  H2D end event; negative control Faults.no_h2d_wait, visible with a scatter-first drain / a delayed copy stream).
+  Poisoned scratch + canary rows detect a skipped scatter; a poisoned staged row detects content corruption.
 """
 from __future__ import annotations
 
@@ -367,10 +369,11 @@ class CpuBackend:
     forces it (a host wait on a later event of that stream, a stream wait, or synchronize). That is the WORST case a GPU can
     produce for a missing lifetime wait, so a removed wait deterministically corrupts the result (the negative controls)."""
 
-    def __init__(self, names=("copy", "scatter", "side", "plan")):
+    def __init__(self, names=("copy", "scatter", "side", "plan"), drain=("copy", "scatter", "side", "plan")):
         self.s = {n: _Stream(n) for n in names}
         self.cur: Optional[str] = None
         self.n_ops = 0
+        self.drain = tuple(drain)                              # synchronize()'s default stream order (see synchronize)
 
     @contextmanager
     def stream(self, name):
@@ -425,8 +428,11 @@ class CpuBackend:
             return
         self._run(ev.stream, ev)
 
-    def synchronize(self, order=("copy", "scatter", "side", "plan")):
-        for n in order:                                        # copy first: a missing landing wait shows up
+    def synchronize(self, order=None):
+        """Drain every stream in `order` (default self.drain). Copy first makes a missing LANDING wait visible (the copy
+        overwrites a landing slot before its scatter ran); scatter first makes a missing H2D wait of the scatter visible
+        (the scatter reads its landing slot before the copy filled it). The tests run both orders."""
+        for n in (self.drain if order is None else order):
             self._run(self.s[n])
         for st in self.s.values():
             self._run(st)
@@ -495,11 +501,12 @@ class Faults:
     poison_stage: bool = False                      # the first staged K row of chunk 0 is overwritten after packing
     no_slot_wait: bool = False                      # the host repacks a staging slot without waiting for its H2D
     no_landing_wait: bool = False                   # an H2D overwrites a landing slot without waiting for its scatter
+    no_h2d_wait: bool = False                       # the scatter does not wait for its OWN chunk's H2D (reads the slot early)
     delay_copy_ms: float = 0.0                      # a GPU sleep on the copy stream before chunk 0 of each layer
     delay_scatter_ms: float = 0.0                   # a GPU sleep on the scatter stream before chunk 0 of each layer
 
     def any(self) -> bool:
-        return any((self.skip_scatter_chunk is not None, self.poison_stage, self.no_slot_wait, self.no_landing_wait,
+        return any((self.skip_scatter_chunk is not None, self.poison_stage, self.no_slot_wait, self.no_landing_wait, self.no_h2d_wait,
                     self.delay_copy_ms > 0, self.delay_scatter_ms > 0))
 
 
@@ -529,12 +536,16 @@ class Pipe:
         self.reset()
 
     def reset(self):
-        """After a full synchronize: forget the ring's events and zero every slot's index region [0, P0) (so a too-early
-        transfer in a negative control can only deliver indices of this pipe or zeros, all in range)."""
+        """After a full synchronize: forget the ring's events and zero every slot's index region [0, P0) in the staging AND
+        the landing ring (so a too-early transfer or a too-early scatter in a negative control can only see indices of this
+        pipe or zeros, all in range: the landing ring is shared by pipes of different caps, and a smaller cap's payload
+        lies inside a larger cap's index region)."""
         self.k = 0
         self.slot_h2d = [None] * self.ring
         self.slot_sc = [None] * self.ring
-        self.stage[:, :idx_region(self.cap, self.R)].zero_()
+        p0 = idx_region(self.cap, self.R)
+        self.stage[:, :p0].zero_()
+        self.land[:, :p0].zero_()
 
     def layer(self, desc: Desc, src_k2d, src_v2d, dst_k2d, dst_v2d, mode: str = "full", faults: Optional[Faults] = None,
               lite: bool = False, chunks: Optional[List[Tuple[int, int]]] = None) -> List[Dict]:
@@ -580,7 +591,8 @@ class Pipe:
             if scat:
                 kd, vd, idd, _, _ = stage_views(self.land[s], n, desc.placer, desc.placer, self.cap, self.dtype, R, self.D)
                 with be.stream("scatter"):
-                    be.stream_wait("scatter", r["h2d1"])
+                    if not f.no_h2d_wait:
+                        be.stream_wait("scatter", r["h2d1"])    # the scatter reads the landing slot only after its H2D
                     if f.delay_scatter_ms > 0 and ci == 0:
                         be.sleep(f.delay_scatter_ms, "scatter")
                     r["sc0"] = None if lite else be.event_rec("scatter")
@@ -681,39 +693,72 @@ def overfetch_report(desc: Desc, D: int = D_DEF, elem: int = 2) -> Dict:
 
 
 # ------------------------------------------------------------------------------------------ in-place layout change
+def _reorder_region(reg: torch.Tensor, S: int, H: int, D: int, src_layout: str, verify: bool) -> Tuple[int, int, int]:
+    """Reorder ONE request's region (a flat view of S*H*D elements; the same bytes in both layouts) in place from
+    src_layout to the other layout. Returns (bad, reorder_ns, verify_ns)."""
+    t0 = time.perf_counter_ns()
+    if src_layout == "orig":
+        A = reg.view(S, H, D).clone()                                       # original logical [S, H, D]
+        reg.view(H, S, D).copy_(A.permute(1, 0, 2))
+        t1 = time.perf_counter_ns()
+        bad = int(not torch.equal(reg.view(H, S, D).permute(1, 0, 2).view(torch.int16), A.view(torch.int16))) if verify else 0
+    else:
+        A = reg.view(H, S, D).permute(1, 0, 2).clone()                      # original logical [S, H, D] (clone of a permuted
+        reg.view(S, H, D).copy_(A)                                          # view: it keeps the permuted strides; the copy_
+        t1 = time.perf_counter_ns()                                         # honours them, so the content is still exact)
+        bad = int(not torch.equal(reg.view(S, H, D).view(torch.int16), A.view(torch.int16))) if verify else 0
+    return bad, t1 - t0, time.perf_counter_ns() - t1
+
+
+def _dims(phys: torch.Tensor, layout: str) -> Tuple[int, int, int, int]:
+    if layout == "orig":
+        B, S, H, D = phys.shape
+    else:
+        B, H, S, D = phys.shape
+    return B, S, H, D
+
+
 def convert_inplace(phys: torch.Tensor, src_layout: str, dst_layout: str, verify: bool = True) -> Tuple[torch.Tensor, Dict]:
     """Reorder a CONTIGUOUS physical tensor between layouts IN ITS OWN ALLOCATION, one request at a time (a request's region
     [b*S*H*D, (b+1)*S*H*D) is the same in both layouts). Extra memory: one request's region (S*H*D elements, pageable).
     With verify, the logical [S, H, D] content of every request is compared bit for bit with the original after the write.
-    Returns (the physical tensor of dst_layout on the same storage, info)."""
+    Returns (the physical tensor of dst_layout on the same storage, info); info splits the time into ms_reorder (clone +
+    permuted write) and ms_verify (the bit-exact check); ms = their sum."""
     if src_layout == dst_layout:
-        return phys, dict(requests=0, bad=0, ms=0.0, tmp_bytes=0)
+        return phys, dict(requests=0, bad=0, ms=0.0, ms_reorder=0.0, ms_verify=0.0, tmp_bytes=0)
     if not phys.is_contiguous():
         raise ValueError("convert_inplace needs the contiguous physical tensor")
-    if src_layout == "orig":
-        B, S, H, D = phys.shape
-    else:
-        B, H, S, D = phys.shape
+    B, S, H, D = _dims(phys, src_layout)
     flat = phys.view(-1)
     per = S * H * D
-    bad = 0
-    t0 = time.perf_counter()
+    bad, t_re, t_ve = 0, 0, 0
     for b in range(B):
-        reg = flat[b * per:(b + 1) * per]
-        if src_layout == "orig":
-            A = reg.view(S, H, D).clone()                                   # original logical [S, H, D]
-            reg.view(H, S, D).copy_(A.permute(1, 0, 2))
-            if verify:
-                bad += int(not torch.equal(reg.view(H, S, D).permute(1, 0, 2).view(torch.int16), A.view(torch.int16)))
-        else:
-            A = reg.view(H, S, D).permute(1, 0, 2).clone()                  # original logical [S, H, D] (contiguous clone)
-            reg.view(S, H, D).copy_(A)
-            if verify:
-                bad += int(not torch.equal(reg.view(S, H, D).view(torch.int16), A.view(torch.int16)))
+        x, a, v = _reorder_region(flat[b * per:(b + 1) * per], S, H, D, src_layout, verify)
+        bad, t_re, t_ve = bad + x, t_re + a, t_ve + v
     out = flat.view(phys_shape(dst_layout, B, S, H, D))
     assert out.data_ptr() == phys.data_ptr()
-    return out, dict(requests=B, bad=bad, ms=1000 * (time.perf_counter() - t0), tmp_bytes=per * phys.element_size(),
-                     bytes_per_tensor=phys.numel() * phys.element_size())
+    return out, dict(requests=B, bad=bad, ms=(t_re + t_ve) / 1e6, ms_reorder=t_re / 1e6, ms_verify=t_ve / 1e6,
+                     tmp_bytes=per * phys.element_size(), bytes_per_tensor=phys.numel() * phys.element_size())
+
+
+def probe_convert(phys: torch.Tensor, layout: str, b: int = 0, verify: bool = True) -> Dict:
+    """The conversion-time PREDICTOR: request b's region is reordered to the other layout and back, in place, with the
+    same per-request code as convert_inplace (so ms_fwd is one request's forward cost incl. verification). The tensor is
+    left bit-identical (checked against a clone of the region). Extra memory: two region copies (pageable)."""
+    if not phys.is_contiguous():
+        raise ValueError("probe_convert needs the contiguous physical tensor")
+    B, S, H, D = _dims(phys, layout)
+    if not 0 <= b < B:
+        raise ValueError("request %d not in [0, %d)" % (b, B))
+    per = S * H * D
+    reg = phys.view(-1)[b * per:(b + 1) * per]
+    keep = reg.clone()
+    other = "hm" if layout == "orig" else "orig"
+    bad1, r1, v1 = _reorder_region(reg, S, H, D, layout, verify)
+    bad2, r2, v2 = _reorder_region(reg, S, H, D, other, verify)
+    same = bool(torch.equal(reg.view(torch.int16), keep.view(torch.int16)))
+    return dict(b=b, ms_fwd=(r1 + v1) / 1e6, ms_back=(r2 + v2) / 1e6, ms_reorder_fwd=r1 / 1e6, ms_verify_fwd=v1 / 1e6,
+                bad=bad1 + bad2, restored=same, region_bytes=per * phys.element_size())
 
 
 def tail_write_runs(layout: str, B: int, H: int = H_DEF, R: int = R_DEF, D: int = D_DEF, elem: int = 2) -> Dict:
