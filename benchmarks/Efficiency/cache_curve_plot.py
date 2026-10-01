@@ -155,16 +155,17 @@ def render(rows, out_dir, stem="ccurve_plot", title=None):
             if l not in labels:
                 handles.append(h)
                 labels.append(l)
-    fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False, fontsize=8.5, bbox_to_anchor=(0.5, 0.995))
+    ncol = len(labels) if n >= 4 else min(len(labels), 2)        # job 2179948: 3 long labels on 2 facets ran off both edges
+    fig.legend(handles, labels, loc="upper center", ncol=ncol, frameon=False, fontsize=8.5, bbox_to_anchor=(0.5, 0.995))
     if title:
         fig.suptitle(title, y=1.04, color=INK)
     fig.text(0.01, 0.005, CAPTION, ha="left", va="bottom", fontsize=7, color=INK2, wrap=True)
-    fig.tight_layout(rect=(0, 0.09, 1, 0.95))
+    fig.tight_layout(rect=(0, 0.09, 1, 0.95 if ncol == len(labels) else 0.92))
     os.makedirs(out_dir, exist_ok=True)
     out = {}
     for ext in ("png", "svg", "pdf"):
         p = os.path.join(out_dir, "%s.%s" % (stem, ext))
-        fig.savefig(p, dpi=200, facecolor=SURFACE)
+        fig.savefig(p, dpi=200, facecolor=SURFACE, bbox_inches="tight", pad_inches=0.12)   # nothing outside the canvas is cut
         out[ext] = p
     plt.close(fig)
     return out
