@@ -959,6 +959,8 @@ def summarize_batch(p):
 def controls_lines(root):
     L, ok_all = [], True
     for fn in sorted(glob.glob(os.path.join(root, "controls", "ctl_b*.json"))):
+        if fn.endswith(("_golden.json", ".result.json")):     # the golden pass export and the stop marker are not CONTROLS
+            continue                                            # payloads (miniature 2179945: a golden file was judged FAIL)
         with open(fn) as f:
             p = json.load(f)
         names = [c.get("name") for c in p.get("controls") or []]

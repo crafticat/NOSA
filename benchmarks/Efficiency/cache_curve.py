@@ -60,6 +60,15 @@ PACED = os.environ.get("CC_PACED", "1") == "1"
 PACED_TICKS = int(os.environ.get("CC_PACED_TICKS", "24"))
 TRAIN_STEPS_ = int(os.environ.get("CC_TRAIN_STEPS", os.environ.get("CV_TRAIN_STEPS", "4")))
 _STEPS = tuple(int(x) for x in STEPS_S.split())
+
+
+def replayed_steps(ncap):
+    """The natural steps the windows replay: the first gated step .. the capture's last. A victim pool is EMPTY after prefill and
+    fills over the first decode steps (miniature 2179945, B32: C128 H2D 3.73 groups per stream-step at step 1, 0.65 at 17), so a
+    summary from step 1 mixes that cold start into the replayed miss volume."""
+    return list(range(min(_STEPS), ncap))
+
+
 os.environ["CV_MODE"] = {"run": "run", "controls": "controls", "table": "table"}.get(MODE, "run")
 os.environ["CV_STEPS"] = STEPS_S
 os.environ["CV_TRAIN_STEPS"] = str(TRAIN_STEPS_)
@@ -640,7 +649,8 @@ class CacheCurveRunner(IC.CurveRunner):
         if has_pool:
             np.savez(os.path.join(OUT, "%s_pool.npz" % CT.TAG), acts=self.acts.numpy(), pool_maps=self.pool_maps.numpy())
         self.accounting = dict(summary=acc["summary"], per_step={k: v.sum(dim=1).tolist() for k, v in acc["per"].items()},
-                               steady=PS.steady_summary(acc, list(range(1, ncap))))
+                               steady=PS.steady_summary(acc, replayed_steps(ncap)),               # the steps the windows REPLAY
+                               all_steps=PS.steady_summary(acc, list(range(1, ncap))))           # incl. the cold-pool start
         cap = dict(source="capture at C=%d (int16 AloneTrace + pool archives, one harvest)" % self.cell_C, ncap=ncap, seconds=time.time() - t0,
                    cross_check_fails=xfail, trace_ok=ok_trace, invariants=inv, accepted=PL.accepted(inv) and xfail == 0 and ok_trace,
                    run_digest=hs["run_digest"], step_digest=hs["step_digest"], export=path, step_loaded=loaded, logits_sha=sha,
@@ -1083,9 +1093,15 @@ def table_ccurve(out_dir, csv_requests=None):
                          "gate fails %s" % (C, cell.get("P"), "CERTIFIED" if cert else "NOT CERTIFIED -> MISSING", p.get("fails"), res.get("rc"), res.get("class"),
                                              s["kept"], s["total"], cap.get("accepted"), {k: v for k, v in (cap.get("invariants") or {}).items() if v} or "all 0",
                                              sum(1 for r in restarts if r.get("ok")), len(restarts), gs["bad"] or "none"))
-                L.append("  - natural plans at C%d (steady steps): H2D %.4f groups per stream-step (the PCIe misses BOTH methods replay), pool hits %.4f "
-                         "(device-to-device, NOT replayed), evictions %.4f; %s" % (C, st.get("h2d_per_stream_step", float("nan")), st.get("hits_per_stream_step", float("nan")),
+                sts = st.get("steps") or [float("nan")]
+                L.append("  - natural plans at C%d (replayed steps %s..%s): H2D %.4f groups per stream-step (the PCIe misses BOTH methods replay), pool hits %.4f "
+                         "(device-to-device, NOT replayed), evictions %.4f; %s" % (C, sts[0], sts[-1], st.get("h2d_per_stream_step", float("nan")),
+                                                                                  st.get("hits_per_stream_step", float("nan")),
                                                                                   st.get("evicted_per_stream_step", float("nan")), summ.get("replayed", "")))
+                al = acc.get("all_steps") or {}
+                if al:
+                    L.append("  - from step 1 (incl. the cold victim pool after prefill): H2D %.4f, pool hits %.4f per stream-step; per-step series in "
+                             "ccurve_plans.csv" % (al.get("h2d_per_stream_step", float("nan")), al.get("hits_per_stream_step", float("nan"))))
                 cur = p.get("curve") or {}
                 pdig = {x.get("digest") for x in (cur.get("ptrains") or {}).values()}
                 cov = {"saturation": [], "paced": []}
@@ -1096,9 +1112,10 @@ def table_ccurve(out_dir, csv_requests=None):
                          "paced %s. A fully rewritten request's delivery is evidenced by its launch + events only; plan identity across the two "
                          "methods is structural (the same train and per-C plan store; CPU8 list rows compared per request)" % (
                              ", ".join(cov["saturation"]) or "none", ", ".join(cov["paced"]) or "none"))
-                for i, stp in enumerate(st.get("steps") or []):
-                    plans_rows.append(dict(batch=B, C=C, step=stp, h2d_groups=st["h2d_groups"][i], h2d_bytes=st["h2d_bytes"][i], pool_hits=st["hits"][i],
-                                           d2d_moves=st["d2d_moves"][i], evicted=st["evicted"][i]))
+                ps = acc.get("all_steps") or st                             # the per-step series from step 1 (incl. the cold pool)
+                for i, stp in enumerate(ps.get("steps") or []):
+                    plans_rows.append(dict(batch=B, C=C, step=stp, h2d_groups=ps["h2d_groups"][i], h2d_bytes=ps["h2d_bytes"][i], pool_hits=ps["hits"][i],
+                                           d2d_moves=ps["d2d_moves"][i], evicted=ps["evicted"][i]))
                 for (arm_, ph), c in sorted(s["excl"].items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
                     excl_rows.append((B, C, arm_, ph, c["total"], c["kept"], c["not_ok"], c["gate_fail"]))
                 if tw:
