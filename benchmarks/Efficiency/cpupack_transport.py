@@ -2327,7 +2327,18 @@ def rep_view(r):
 
 TABLE_CSV_FIELDS = ("stage", "cell", "arm", "step", "plan_step", "rep", "mode", "layer", "b", "groups", "chunk", "e2e") + \
     tuple(TM.CPU_STAGES) + tuple(TM.W8_STAGES)
-PAYLOAD_RE = re.compile(r"^(cp|t|ctl)_b\d+\.json$")
+PAYLOAD_RE = re.compile(r"^(cp|t|ctl)(2?)_b(\d+)\.json$")       # cp2_b<B> / t2_b<B> = the fallback (ii) attempt of the same batch
+
+
+def payload_files(paths):
+    """(tabulated, superseded): the payload files among `paths`; an attempt-1 payload (cp_b<B> / t_b<B>) whose fallback (ii)
+    attempt (cp2_b<B> / t2_b<B>, the registered rerun after exit 20) exists is SUPERSEDED: listed, never tabulated (its
+    batch-keyed CSV outputs would otherwise overwrite the fallback's)."""
+    m = {fn: PAYLOAD_RE.match(os.path.basename(fn)) for fn in paths}
+    m = {fn: x for fn, x in m.items() if x}
+    second = {(x.group(1), x.group(3)) for x in m.values() if x.group(2)}
+    tab = [fn for fn in sorted(m) if m[fn].group(2) or (m[fn].group(1), m[fn].group(3)) not in second]
+    return tab, [fn for fn in sorted(m) if fn not in tab]
 
 
 def row_keep(r):
@@ -2413,7 +2424,9 @@ def table(out_dir, csv_requests=None):
          "Rows enter a statistic only when ok AND their gated step passed the golden gate (row_keep); every exclusion is counted "
          "with its denominator.", ""]
     ok_all = True
-    files = [fn for fn in sorted(glob.glob(os.path.join(out_dir, "cp_*.json"))) if PAYLOAD_RE.match(os.path.basename(fn))]
+    files, superseded = payload_files(glob.glob(os.path.join(out_dir, "cp*.json")))
+    for fn in superseded:
+        L += ["## %s: SUPERSEDED by its fallback (ii) attempt (registered rerun after exit 20); not tabulated" % os.path.basename(fn), ""]
     for fn in files:
         with open(fn) as f:
             p = json.load(f)
@@ -2586,10 +2599,11 @@ def table(out_dir, csv_requests=None):
         L.append("")
     # the TIMELINE and CONTROLS payloads of the same job (gate + exclusions; the launch analysis is launch_timeline.py's)
     root = os.path.dirname(os.path.abspath(out_dir))
-    for sub, pat in (("timeline", "t_*.json"), ("controls", "ctl_*.json")):
-        for fn in sorted(glob.glob(os.path.join(root, sub, pat))):
-            if not PAYLOAD_RE.match(os.path.basename(fn)):
-                continue
+    for sub, pat in (("timeline", "t*.json"), ("controls", "ctl*.json")):
+        tab, sup = payload_files(glob.glob(os.path.join(root, sub, pat)))
+        for fn in sup:
+            L += ["## %s %s: SUPERSEDED by its fallback (ii) attempt; not tabulated" % (sub.upper(), os.path.basename(fn)), ""]
+        for fn in tab:
             with open(fn) as f:
                 p = json.load(f)
             gs = gate_summary(p)
