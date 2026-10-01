@@ -712,7 +712,10 @@ class Runner:
                         K.rows2d(self.scr_v).index_copy_(0, idx[a0:a0 + k], src)
                     self.ev_g1[l].record(self.s_scatter)
         elif kind == "cpu":
-            spec = dict(arm=a, layers=L, pipe=pipe, faults=faults, prebuilt=c.get("prebuilt", {}).get((a["packer"], a["placer"])), cell=cell)
+            # the prebuilt descriptors belong to the prepacked CEILING only (job 2179735 scoring: keyed by (packer, placer) alone, they
+            # were reused by every live CPU arm of 2179683 = uncharged work); a live arm always builds its descriptors
+            pre = c.get("prebuilt", {}).get((a["packer"], a["placer"])) if a.get("mode") == "prepacked" else None
+            spec = dict(arm=a, layers=L, pipe=pipe, faults=faults, prebuilt=pre, cell=cell)
             job = self.coord.submit(lambda co, spec=spec: self.transport(co, spec))
         host_enqueue_ms = 1000 * (time.perf_counter() - h0)
         ev["t0"].record(self.main)
@@ -2389,6 +2392,33 @@ def exclusion_counts(rows, default_cell="orig>orig"):
     return excl, kept
 
 
+def controls_verdict(p, expected=None):
+    """(ok, reasons) of one CONTROLS payload, judged by EACH CONTROL'S OWN VERDICT. The raw 'fails' count is NOT a verdict: in
+    check mode gated() adds one per GATE_FAIL (cpupack_transport.py gated), so the detected destructive controls raise it by
+    exactly their intended detections (job 2179735: fails 8 with all 8 controls PASS, printed 'FAIL' by the old rule).
+    FAIL when: a crash, a partial payload, no control, a control whose verdict is not its expected one, the golden pass's
+    own resident check failing, or (with `expected`) a missing control."""
+    why = []
+    ctl = p.get("controls") or []
+    if p.get("crash"):
+        why.append("crash %s" % (p["crash"].get("kind") if isinstance(p["crash"], dict) else p["crash"]))
+    if p.get("partial"):
+        why.append("partial payload")
+    if not ctl:
+        why.append("no controls")
+    bad = [c.get("name") for c in ctl if not c.get("pass")]
+    if bad:
+        why.append("controls not passing: %s" % bad)
+    gf = (p.get("confirm") or {}).get("golden_fail") or []
+    if gf:
+        why.append("golden pass resident check failed at %s" % gf)
+    if expected:
+        miss = sorted(set(expected) - {c.get("name") for c in ctl})
+        if miss:
+            why.append("missing controls %s" % miss)
+    return not why, why
+
+
 def gate_summary(p):
     conf = p.get("confirm") or {}
     gate = conf.get("gate") or []
@@ -2609,7 +2639,7 @@ def table(out_dir, csv_requests=None):
             gs = gate_summary(p)
             ctl = p.get("controls") or []
             if sub == "controls":                                        # its GATE_FAILs are the intended detections
-                okp = p.get("fails", 1) == 0 and not p.get("crash") and bool(ctl) and all(c.get("pass") for c in ctl)
+                okp = controls_verdict(p)[0]                             # job 2179735: never the raw 'fails' count
             else:
                 okp = p.get("fails", 1) == 0 and not p.get("crash") and not gs["bad"]
             ok_all &= okp
