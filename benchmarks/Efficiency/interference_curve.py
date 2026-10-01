@@ -920,6 +920,7 @@ def summarize_batch(p):
                  window_gbps=_p([m.get("window_gbps") for m in m_ov], 50), window_gbps_prorata=_p([m.get("window_gbps_prorata") for m in m_ov], 50),
                  during_gbps=_p([m.get("during_gbps") for m in m_ov], 50), conc_full_ms=_p([m.get("full_ready_ms") for m in m_ov], 50),
                  overlap_frac=_p([m.get("overlap_frac") for m in m_ov], 50), overlap_frac_min=min((m.get("overlap_frac", float("nan")) for m in m_ov), default=float("nan")),
+                 decode_duty=_p([m.get("decode_duty") for m in m_ov], 50), inter_tick_gap_ms=_p([m.get("inter_tick_gap_p50_ms") for m in m_ov], 50),
                  train_done_in_window=sum(1 for m in m_ov if m.get("train_done_in_window")),
                  pump_latency_p95_ms=_p([m.get("pump_latency_p95_ms") for m in m_ov], 50),
                  side_idle_ms=_p([(m.get("side_idle") or {}).get("total_ms") for m in m_ov], 50),
@@ -1038,16 +1039,17 @@ def table_curve(out_dir, csv_requests=None):
             L += ["", "| arm | steps | decode-alone p50 / p95 ms | tick p50 / p95 ms (covered n) | extra ms [CI] | extra %% [CI] | extra %% all ticks | "
                   "RESIDENT tok/s alone -> conc | useful / wire MB | GB/s alone | window GB/s (pro-rata) | GB/s during overlap | full ready ms alone / conc | "
                   "overlap frac p50 (min) | trains done in window | extra ms per GB/s | pump p95 ms | side idle ms | receipts ticks (0 loads, bit-exact) | "
-                  "host-bound ticks |", "|" + "---|" * 20]
+                  "host-bound ticks | decode duty / inter-tick gap ms |", "|" + "---|" * 21]
             for a in s["arms"]:
                 L.append("| %s | %s | %.3f / %.3f | %.3f / %.3f (%d) | %+.3f [%.3f, %.3f] | %+.2f [%.2f, %.2f] | %+.2f | %.0f -> %.0f | %.1f / %.1f | %.2f | "
-                         "%.2f (%.2f) | %.2f | %.1f / %.1f | %.3f (%.3f) | %d of %d | %.3f | %.2f | %.2f | %d (%s, %s) | %d |" % (
+                         "%.2f (%.2f) | %.2f | %.1f / %.1f | %.3f (%.3f) | %d of %d | %.3f | %.2f | %.2f | %d (%s, %s) | %d | %.3f / %.2f |" % (
                              a["arm"], a["steps"], a["decode_alone_p50"], a["decode_alone_p95"], a["tick_p50"], a["tick_p95"], a["n_covered_ticks"],
                              a["extra_ms"], a["extra_ms_ci"][0], a["extra_ms_ci"][1], a["extra_pct"], a["extra_pct_ci"][0], a["extra_pct_ci"][1],
                              a["extra_pct_all_ticks"], a["resident_tps_alone"], a["resident_tps_conc"], a["useful_bytes"] / 1e6, a["wire_bytes"] / 1e6,
                              a["alone_gbps"], a["window_gbps"], a["window_gbps_prorata"], a["during_gbps"], a["alone_full_ms"], a["conc_full_ms"],
                              a["overlap_frac"], a["overlap_frac_min"], a["train_done_in_window"], a["n_overlap"], a["ms_per_gbps"], a["pump_latency_p95_ms"],
-                             a["side_idle_ms"], a["receipts_ticks"], a["receipts_zero_load"], a["receipts_bit_exact"], a["host_bound_ticks"]))
+                             a["side_idle_ms"], a["receipts_ticks"], a["receipts_zero_load"], a["receipts_bit_exact"], a["host_bound_ticks"],
+                             a["decode_duty"], a["inter_tick_gap_ms"]))
                 summ_rows.append({k2: v for k2, v in a.items() if k2 != "per_step"})
             L += ["", "| exclusions: arm / phase | total | kept | not ok | GATE_FAIL |", "|---|---|---|---|---|"]
             for (arm_, ph), c in sorted(s["excl"].items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):

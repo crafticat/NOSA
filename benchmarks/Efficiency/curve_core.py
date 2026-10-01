@@ -41,6 +41,8 @@ ACCOUNTING (all times in ms from the window's gate; a request's busy interval is
   during_gbps     pro-rata bytes inside the window / busy time inside the window  (transfer rate DURING overlap)
   full_ready_ms   gate -> the last request's completion (the FULL completion time of the train)
   alone_gbps      train useful bytes / (last completion - first start) of a transfer-alone train
+  decode duty     sum of decode spans / window; inter-tick gap = t0 of tick k+1 - t1 of tick k (the restore's device copies
+                  of the CounterSnapshot, ~6.5 GB at B336, and the receipts run there, on the decode stream)
   tick coverage   per tick, the fraction of [t0, t1] covered by busy intervals; COVERED ticks (>= cover_min) after the
                   first `skip_first` ticks are the 'decode under sustained transfer' samples; decode-alone uses the same
                   tick positions (skip_first excluded)
@@ -349,6 +351,9 @@ def window_metrics(ticks: Sequence[Tuple[float, float]], reqs: Sequence[Dict], c
             pro += int(q["useful"])
     cov = tick_coverage(ticks, iv)
     covered = [k for k in range(skip_first, len(ticks)) if cov[k] >= cover_min]
+    gaps = [ticks[k + 1][0] - ticks[k][1] for k in range(len(ticks) - 1)]
+    out.update(decode_duty=(sum(tick_ms(ticks)) / W if W > 0 else nan), inter_tick_gap_p50_ms=pctl(gaps, 50),
+               inter_tick_gap_max_ms=(max(gaps) if gaps else nan))
     out.update(window_ms=W, window_start_ms=w0, window_end_ms=w1, busy_in_window_ms=busy_in,
                overlap_frac=(busy_in / busy if busy > 0 else nan), window_bytes_completed=done_in,
                window_gbps=(done_in / (W * 1e6) if W > 0 else nan), window_bytes_prorata=pro,
