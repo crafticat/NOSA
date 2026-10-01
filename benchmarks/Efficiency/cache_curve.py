@@ -11,9 +11,26 @@ groups per (layer, KV head, request) (C = 63 attended non-tail slots + P = NOSI_
 more 64-token group per stream, always resident, written locally and never fetched), as the natural miss volume falls?
 
 LABELS: 'transport/placement-ready, NOT live-LRU-ready'; 'GPU-resident trace replay'; saturation = 'resource-contention control,
-NOT live verifier throughput'; arrival-paced = ccurve_core.PACED_LABEL; 'RESIDENT decode controls, NOT cache-draft / verifier
-throughput'; CPU8 / W8 copy rows = 'prebuilt-plan copy microbenchmark, NOT an integrated LRU getter baseline' (descriptors are
-built LIVE for CPU8, never the prebuilt cache).
+NOT live verifier throughput'; DECODE-PACED (raw key 'paced', CC1's 'arrival-paced') = ccurve_core.DECODE_PACED_LABEL: releases at
+each method's OWN decode tick starts, a method-dependent arrival schedule, NOT a matched external load (Codex's CC1 audit);
+'RESIDENT decode controls, NOT cache-draft / verifier throughput'; CPU8 / W8 copy rows = 'prebuilt-plan copy microbenchmark, NOT an
+integrated LRU getter baseline' (descriptors are built LIVE for CPU8, never the prebuilt cache).
+
+THE HOST-PACK DIAGNOSTIC (CC2, authorized by the user via Codex 2026-10-01: 'a small HOST-PACK diagnostic ... alongside the B64
+curve'): at the cells CC_DIAG_CAPS (default '63 128') only, for the arms CC_DIAG_ARMS (default 'cpu8 cpu8_hostpack'):
+  * 'cpu8_hostpack' (cc_arm; ccurve_core.HOSTPACK_LABEL) = the cpu8 code path with ONLY the pipe mode 'LP' (pack, no H2D, no
+    scatter): fresh list D2H, host wait, live descriptors and CPU pack on 8 cores, all charged as for cpu8. Gates (hostpack_gates):
+    the scratch is bit-identical before / after (scratch_gate), no H2D / scatter is issued (counted at the branch), the staging slots
+    hold the logical source rows (staging_check), receipts, golden gate. Run in saturation (the same train as cpu8) and ext-paced.
+  * EXT-PACED (ext_window; ccurve_core.EXT_LABEL): a prerecorded external release schedule, fixed per (cell, step) right after
+    decode-alone pre and before any arm (ext_schedule_for: P = that step's decode-alone tick p50, T0 = CC_EXT_T0_MS), issued by a
+    dedicated release thread; cpu8 and cpu8_hostpack see the IDENTICAL schedule (SCHEDULE gate: digest, every release issued by the
+    release thread, lateness recorded). Diagnostic numbers per window: rec['diag'] (ccurve_core.diag_metrics).
+  Everywhere else (and for w8) nothing changes: w8 + cpu8 saturation + decode-paced at every C. The table adds the diagnostic
+  section and ccurve_hostpack.csv (side by side, NO subtraction).
+TABLE CAVEATS (printed once, ccurve_core.TABLE_CAVEATS): during GB/s vs covered-tick slowdown are not a cost per byte; every
+resident tick includes the decode-state restore (its bytes per tick per cell are reported, note_restore); H1 / H2 not firing is not
+evidence of no host contention; no additive GPU share, the GIL is a hypothesis.
 
 ONE PROCESS = ONE BATCH B, a list of capacities CC_CAPACITIES in order (default '128 63 73 81 96 113': the most memory-hungry
 cell, C128, FIRST = the fit probe; C63 second = the cross-C reference). The engine is imported with NOSI_POOL_BLOCKS = the
@@ -27,7 +44,8 @@ pool maps; invariants I1..I9 where they hold + pool-aware P1..P5; natural accoun
 hits at C) -> [C63 at B64: the capture equals the SAVED 2179683 plans on its prefix] -> restart -> GOLDEN (warm + gated steps;
 pool-aware digests) -> cross-C check against C63 (capture logits, reference / advance logits; a cell that differs is NOT
 measured and is MISSING) -> restart -> MEASURED: per gated step, decode-alone pre, SATURATION (transfer-alone + overlap per arm
-x CV_REPS), ARRIVAL-PACED (CC_PACED_TICKS releases per arm x CV_REPS), decode-alone post. Per cell: cc_b<B>_c<C>.json (payload),
+x CV_REPS), DECODE-PACED (CC_PACED_TICKS releases per arm x CV_REPS), [at a diagnostic cell: host-pack saturation +
+EXT-PACED], decode-alone post. Per cell: cc_b<B>_c<C>.json (payload),
 .result.json (rc, stop class), _plans.npz (+ pool archives), _golden.json.
 
 GATES AND RECEIPTS with the pool (pool_state.py): the CounterSnapshot is PoolCounterSnapshot (pool map / ages / targets / actions
@@ -72,7 +90,8 @@ def replayed_steps(ncap):
 os.environ["CV_MODE"] = {"run": "run", "controls": "controls", "table": "table"}.get(MODE, "run")
 os.environ["CV_STEPS"] = STEPS_S
 os.environ["CV_TRAIN_STEPS"] = str(TRAIN_STEPS_)
-os.environ.setdefault("CP_NCAP", str(max(_STEPS) + max(TRAIN_STEPS_, PACED_TICKS if PACED else 0) + 1))
+_EXT_NEEDS_PACED = os.environ.get("CC_EXT", "1") == "1" and bool(os.environ.get("CC_DIAG_CAPS", "63 128").split())   # ext replays the paced train
+os.environ.setdefault("CP_NCAP", str(max(_STEPS) + max(TRAIN_STEPS_, PACED_TICKS if (PACED or _EXT_NEEDS_PACED) else 0) + 1))
 os.environ["CV_ARMS"] = os.environ.get("CC_ARMS", "w8 cpu8")
 os.environ["CV_TRADE_BATCHES"] = ""
 os.environ["CV_CPU_BATCHES"] = ""
@@ -106,6 +125,11 @@ CROSS_REQUIRED = os.environ.get("CC_CROSS_REQUIRED", "1") == "1"
 LEAK_LIMIT_GB = float(os.environ.get("CC_LEAK_LIMIT_GB", "2.0"))
 NUMA_INVENTORY = os.environ.get("CC_NUMA_INVENTORY", "first")        # first | every | never
 XREF_DIRS = tuple(os.environ.get("CC_XREF_DIRS", "").split())          # other jobs' cell directories (the C63 reference of leftovers)
+DIAG_CAPS = tuple(int(x) for x in os.environ.get("CC_DIAG_CAPS", "63 128").split())     # the host-pack diagnostic's cells
+DIAG_ARMS = tuple(os.environ.get("CC_DIAG_ARMS", "cpu8 cpu8_hostpack").split())          # its ext-paced arms (+ host-pack saturation)
+EXT = os.environ.get("CC_EXT", "1") == "1"                                                # the ext-paced regime at the diagnostic cells
+EXT_T0_MS = float(os.environ.get("CC_EXT_T0_MS", "2.0"))                                  # release 0 at the anchor + T0
+EXT_LATE_TOL_MS = float(os.environ.get("CC_EXT_LATE_TOL_MS", "1.0"))                      # a release later than this is counted late
 OUT = VA.OUT
 SAT_PHASES = ("transfer_alone", "overlap")
 CAPACITY_CLASSES = CV.GPU_CLASSES + CV.HOST_CLASSES
@@ -113,6 +137,32 @@ CAPACITY_CLASSES = CV.GPU_CLASSES + CV.HOST_CLASSES
 
 def saved_for(B):
     return os.environ.get("CC_SAVED_%d" % B, ""), os.environ.get("CC_SAVED_SHA_%d" % B, "")
+
+
+def cc_arm(name):
+    """interference_curve.curve_arm + the HOST-PACK control 'cpu8_hostpack' (ccurve_core.HOSTPACK_LABEL): the cpu8 arm with ONLY
+    the pipe mode changed to 'LP' = (pack, no DMA, no scatter, host writes the slot) (cpupack_core.MODES). Same coordinator, cores,
+    chunk, packer / placer, list D2H, live descriptors and release handling as cpu8."""
+    if name == "cpu8_hostpack":
+        if K.MODES["LP"] != (True, False, False, True):
+            raise RuntimeError("cpupack_core.MODES['LP'] is %s, not pack-only" % (K.MODES["LP"],))
+        a = dict(IC.curve_arm("cpu8"))
+        a.update(name=name, mode="LP", hostpack=True, label=CCC.HOSTPACK_LABEL, done=CCC.HOSTPACK_DONE_LABEL)
+        return a
+    return IC.curve_arm(name)
+
+
+def snapshot_bytes(snap):
+    """Bytes the sanctioned per-tick decode-state restore copies (every tensor of the CounterSnapshot: engine bookkeeping + pool
+    tensors + the layer compress / CIS tables); HBM traffic ~2x (read the saved copy + write the live tensor)."""
+    tot, n = 0, 0
+    for slot in getattr(snap, "layers", None) or []:
+        for part in ("engine", "layer"):
+            for v in (slot.get(part) or {}).values():
+                if torch.is_tensor(v):
+                    tot += v.numel() * v.element_size()
+                    n += 1
+    return dict(bytes=tot, tensors=n, hbm_traffic_bytes_estimate=2 * tot)
 
 
 def tag_of(B, C):
@@ -153,6 +203,9 @@ class CacheCurveRunner(IC.CurveRunner):
         self.cell = {}
         self._pacts = []
         self.skip_post_ref_at = None
+        self.diag_arms = []
+        self._cpu_out = None
+        self.ext_late_ns = None                                          # CPU tests only: a deliberately late release
 
     # ------------------------------------------------------------------------------------------------ setup
     def install_pool_snapshots(self, ss):
@@ -175,7 +228,8 @@ class CacheCurveRunner(IC.CurveRunner):
         if minimal:
             return
         self.arms = [IC.curve_arm(a) for a in ARMS]
-        n_req = max(IC.TRAIN_STEPS, PACED_TICKS if PACED else 0) * self.NL
+        self.diag_arms = [cc_arm(a) for a in DIAG_ARMS] if DIAG_CAPS else []
+        n_req = max(IC.TRAIN_STEPS, PACED_TICKS if (PACED or (self.diag_arms and EXT)) else 0) * self.NL
         if self.dev == "cuda":
             self.be_main = K.CudaBackend(dict(main=self.s_main, plan=self.s_plan), self.aux_main, pool_size=4 * (IC.K_MAX + PACED_TICKS) + 64)
             self.be_pump = K.CudaBackend(dict(side=self.s_side), self.aux_pump, pool_size=4 * n_req + 64)
@@ -183,7 +237,10 @@ class CacheCurveRunner(IC.CurveRunner):
             self.be_plan = K.CudaBackend(dict(plan=self.s_plan), self.aux_plan, pool_size=2 * n_req + 64)
             self.cbe = K.CudaBackend(dict(copy=self.s_copy, scatter=self.s_scatter), self.aux, pool_size=int(os.environ.get("CC_CBE_EVENTS", "60000")))
             self.pipes = {}
-        if any(a["kind"] == "cpu" for a in self.arms):
+            if self.diag_arms and EXT:                                   # the ext-paced RELEASE thread's own stream + backend
+                self.s_rel, self.aux_rel = torch.cuda.Stream(), torch.cuda.Stream()
+                self.be_rel = K.CudaBackend(dict(release=self.s_rel), self.aux_rel, pool_size=PACED_TICKS + 64)
+        if any(a["kind"] == "cpu" for a in list(self.arms) + list(self.diag_arms)):
             W = self.W
 
             def alloc(c):
@@ -231,6 +288,25 @@ class CacheCurveRunner(IC.CurveRunner):
                          note="C = 63 attended non-tail slots + P pool slots per (layer, KV head, request); the tail slot (1 group) is separate")
         self.curve["ptrains"] = {}
         self.arms = arms if arms else [IC.curve_arm(a) for a in ARMS]
+        self.diag_arms = [cc_arm(a) for a in DIAG_ARMS] if DIAG_CAPS else []
+        self.mark_diag()
+
+    def mark_diag(self):
+        """The cell's record of the diagnostic (what the table reads to emit its rows); idempotent."""
+        if self.is_diag() and "diag" not in self.cell:
+            self.cell["diag"] = dict(caps=list(DIAG_CAPS), arms=[a["name"] for a in self.diag_arms], ext=EXT, ext_t0_ms=EXT_T0_MS,
+                                     late_tol_ms=EXT_LATE_TOL_MS, hostpack_saturation=[a["name"] for a in self.hostpack_arms()],
+                                     label_ext=CCC.EXT_LABEL, label_hostpack=CCC.HOSTPACK_LABEL)
+            self.cell["regimes"] = list(self.cell.get("regimes") or []) + (["ext-paced"] if EXT else [])
+
+    def is_diag(self):
+        return bool(self.diag_arms) and self.cell_C in DIAG_CAPS
+
+    def hostpack_arms(self):
+        return [a for a in self.diag_arms if a.get("hostpack")]
+
+    def ext_arms(self):
+        return list(self.diag_arms) if EXT else []
 
     def end_cell(self):
         """Drop the per-cell tensors (scratch, plan store, archives, snapshot, references); the shared ones stay."""
@@ -343,8 +419,8 @@ class CacheCurveRunner(IC.CurveRunner):
             self.rc_swaps[k] = PS.actions_receipt(self._pacts)
 
     def _ticks(self, ctx, K_, box=None):
-        """THE DECODE THREAD (interference_curve._ticks) + the arrival-paced release: with a ReleaseBox, tick k's start event
-        (after the restore, before the decode) is published as release k. No sleep, no synchronize, no host read of a device
+        """THE DECODE THREAD (interference_curve._ticks) + the decode-paced release: with a ReleaseBox, tick k's start event
+        (after the restore, before the decode) is published as release k (ext-paced: box=None, it publishes nothing). No sleep, no synchronize, no host read of a device
         value, no wait for the transfer."""
         be, ref, step = self.be_main, ctx["lg_ref"], ctx["step_fn"]
         hook = self.tick_hook
@@ -386,10 +462,127 @@ class CacheCurveRunner(IC.CurveRunner):
                 self.fails += 1
 
     def window(self, ctx, arm, train, K_, phase, rep, ticks=True, transfer=True):
+        """interference_curve.window + the pool receipts. At a diagnostic cell, a CPU arm's window also gets the diagnostic
+        numbers (rec['diag'], bookkeeping only); the HOST-PACK control's window is judged by its own gates (scratch unchanged,
+        no H2D / scatter issued, staging pack content) instead of the delivered-content check it cannot pass."""
+        hp = bool(transfer and arm and arm.get("hostpack"))
+        cpu_diag = bool(transfer and arm and arm.get("kind") == "cpu" and self.is_diag())
+        fp0 = None
+        if hp:
+            self.sync()
+            K.poison_(self.scr_k)                                        # the window poisons again: the same bytes
+            K.poison_(self.scr_v)
+            fp0 = (G.fp_t(self.scr_k), G.fp_t(self.scr_v))
+        self._cpu_out = None
         self._arm_receipts(ticks)
         rec = super().window(ctx, arm, train, K_, phase, rep, ticks, transfer)
         self._finish_receipts(rec, K_ if ticks else 0)
         rec.update(regime=("saturation" if transfer else "alone"), C=self.cell_C, P=self.cell_P)
+        if hp or cpu_diag:
+            out = self._cpu_out or []
+            iv = self.coord_intervals(rec.get("requests") or [], out)
+            tk = [tuple(x) for x in rec.get("ticks", [])]
+            rec["diag"] = CCC.diag_metrics(rec.get("requests") or [], tk, iv, done_label=arm.get("done", "scattered into the scratch"))
+            rec["schedule"] = CCC.SCHEDULES["saturation"]
+            if hp:
+                self.hostpack_gates(rec, arm, train, out, fp0)
+        return rec
+
+    def run_cpu_train(self, arm, train, lists):
+        out = super().run_cpu_train(arm, train, lists)
+        self._cpu_out = out                                              # read by window() after job.done (bookkeeping only)
+        return out
+
+    # ------------------------------------------------------------------------------------------------ host-pack gates
+    def coord_intervals(self, reqs, raw):
+        """The coordinator's host-work intervals (ms on the gate clock) of a CPU window, from its raw records: each request's
+        markers are placed relative to its own hk marker, whose gate time is the request's g0 (no gate event needed)."""
+        iv = dict(desc=[], pack=[], api=[], release=[])
+        g0 = {q["i"]: q.get("g0") for q in reqs}
+        for q in raw:
+            base = g0.get(q.get("i"))
+            if base is None or q.get("hk") is None:
+                continue
+            at = lambda ev: (None if ev is None else (lambda d: None if d is None else base + d)(CV.ev_ms(q["hk"], ev)))
+            de = at(q.get("desc_ev"))
+            if de is not None:
+                iv["desc"].append((de - q["desc_ns"] / 1e6, de))
+            for c in q.get("chunks") or []:
+                pk, sub = at(c.get("pk")), at(c.get("sub"))
+                if pk is not None:
+                    iv["pack"].append((pk - c["pack_ns"] / 1e6, pk))
+                    if sub is not None:
+                        iv["api"].append((pk, max(pk, sub)))
+            mk = at(q.get("rel_issued"))
+            if mk is not None and q.get("rel_issue_ns") is not None:
+                iv["release"].append((mk - q["rel_issue_ns"] / 1e6, mk))
+        return iv
+
+    def scratch_gate(self, fp0):
+        """HOST-PACK SCRATCH gate: the destination scratch (the region the transport would write, and every other row) is
+        bit-identical before / after the window (fingerprint of the poisoned scratch) and holds no non-poison row."""
+        fk, fv = G.fp_t(self.scr_k), G.fp_t(self.scr_v)
+        written = int(K.nonpoison_rows(self.scr_k).sum()) + int(K.nonpoison_rows(self.scr_v).sum())
+        ok = fp0 is not None and (fk, fv) == tuple(fp0) and written == 0
+        return dict(ok=bool(ok), fp_before=list(fp0) if fp0 else None, fp_after=[fk, fv], written_rows=written)
+
+    def staging_check(self, arm, raw):
+        """STAGING PACK-CONTENT check: the last chunk packed into each staging slot (still in place after the window) holds the
+        LOGICAL source rows of its request's groups (cpupack_core.reference_rows, independent of the address formulas) and the
+        descriptor's destination indices. Requests whose last packed chunk survives are 'verified'; the rest are counted."""
+        last = {}
+        for q in raw:
+            for c in q.get("chunks") or []:
+                last[c["slot"]] = (q, c)
+        cap = arm["chunk_kb"] * 1024 // K.useful_bytes(1)
+        bad, chunks, reqs = [], 0, set()
+        layout = getattr(self, "host_layout", None) or "orig"
+        for s, (q, c) in sorted(last.items()):
+            r = self._req_by_i.get(q["i"])
+            if r is None:
+                bad.append(dict(slot=s, i=q["i"], why="request not in the train"))
+                continue
+            d = K.build_desc(self.plan_t[r.i][1 + self.HB:].view(self.H, self.B, self.M), src_layout="orig", dst_layout="orig",
+                             s_src=self.S_cpu, s_dst=self.S_dst, packer=arm["packer"], placer=arm["placer"])
+            g0, g1 = int(c["g0"]), int(c["g1"])
+            kst, vst, ist, _, _ = K.stage_views(self.stage[s], g1 - g0, d.packer, d.placer, cap, R=self.R, D=self.D)
+            ek = K.reference_rows(K.logical(self.host_phys[r.layer][0], layout), d)[g0 * self.R:g1 * self.R]
+            ev = K.reference_rows(K.logical(self.host_phys[r.layer][1], layout), d)[g0 * self.R:g1 * self.R]
+            okk = K.bits_equal(kst.reshape(-1, self.D), ek.reshape(-1, self.D).to(kst.device))
+            okv = K.bits_equal(vst.reshape(-1, self.D), ev.reshape(-1, self.D).to(vst.device))
+            oki = bool(torch.equal(ist, d.dst_idx[g0 * d.dst_per_group:g1 * d.dst_per_group].to(ist.device)))
+            chunks += 1
+            reqs.add(r.i)
+            if not (okk and okv and oki):
+                bad.append(dict(slot=s, i=r.i, layer=r.layer, groups=[g0, g1], k=okk, v=okv, idx=oki))
+        return dict(ok=(not bad and chunks > 0) or (not last and not any(r.groups for r in self._req_by_i.values())), slots_checked=chunks,
+                    requests_verified=len(reqs), requests_total=len(raw), bad=bad[:8])
+
+    def hostpack_gates(self, rec, arm, train, raw, fp0, base_ok=None, count=True):
+        """The host-pack window's own verdict (replaces content_ok, which needs a delivery): no error, every request done and
+        charged, every list delivered, the tick receipts (base_ok: the ext window's own checks, which include these), AND the
+        scratch gate, NO H2D and NO scatter issued (counted at the branch: the pipe's chunk records carry no H2D / scatter
+        event), the staging pack-content check."""
+        was = bool(rec.get("ok"))
+        self._req_by_i = {r.i: r for r in train}
+        sc = self.scratch_gate(fp0)
+        h2d = sum(1 for q in raw for c in q.get("chunks") or [] if c.get("h2d1") is not None or c.get("h2d0") is not None)
+        scat = sum(1 for q in raw for c in q.get("chunks") or [] if c.get("sc1") is not None or c.get("sc0") is not None)
+        pk = self.staging_check(arm, raw)
+        rec.update(scratch_gate=sc, h2d_issued=h2d, scatter_issued=scat, pack_check=pk, content_ok=None, done=CCC.HOSTPACK_DONE_LABEL,
+                   content_check="n/a for the host-pack control (nothing is delivered): scratch gate + staging pack-content check instead")
+        if base_ok is None:
+            ok = "error" not in rec and "coord_error" not in rec and bool(rec.get("all_requests_done")) and bool(rec.get("bytes_charged"))
+            ok &= bool(rec.get("list_ok"))
+            if rec.get("with_decode"):
+                ok &= bool(rec.get("receipts_ok"))
+        else:
+            ok = bool(base_ok)
+        ok &= sc["ok"] and pk["ok"] and h2d == 0 and scat == 0
+        rec["hostpack_ok"] = bool(ok)
+        rec["ok"] = bool(ok)
+        if count:
+            self.fails += int(not ok) - int(not was)
         return rec
 
     # ------------------------------------------------------------------------------------------------ the paced regime
@@ -405,15 +598,19 @@ class CacheCurveRunner(IC.CurveRunner):
         be.reset()
         return CCC.pump_paced(be, train, self.launcher(arm), gate, IC.QUEUE, box, it)
 
-    def run_cpu_paced(self, arm, train, gate, box, it):
+    def run_cpu_paced(self, arm, train, gate, box, it, ext=False):
         """cpu8 on the COORDINATOR thread: per release, the plan stream waits for the release event, the 32 list D2Hs follow
-        (charged); per request: host-wait its list, descriptors LIVE, the pipe (pack -> H2D -> scatter)."""
+        (charged); per request: host-wait its list, descriptors LIVE, the pipe (pack -> H2D -> scatter; the host-pack control:
+        pack only, arm['mode']). ext=True (the ext-paced regime) also records, per release, a plan-stream event after the wait
+        (the list D2H spans are then consecutive plan-stream events), the host time of the release's issue (plan-stream wait +
+        32 D2H enqueues) and an aux marker after it."""
         be, pb = self.cbe, getattr(self, "be_plan", None) or self.cbe
         be.reset()
         if pb is not be:
             pb.reset()
         pipe = self.pipe(arm["chunk_kb"] * 1024 // K.useful_bytes(1))
         pipe.reset()
+        mode = arm.get("mode", "full")
         by_rel = {}
         for r in train:
             by_rel.setdefault(CCC.release_index(r, it), []).append(r)
@@ -421,19 +618,27 @@ class CacheCurveRunner(IC.CurveRunner):
         for j in sorted(by_rel):
             ev, wns = box.wait(j)
             lists = {}
+            if ext:
+                t_iss = time.perf_counter_ns()
             with pb.stream("plan"):
                 if not gated:
                     pb.stream_wait("plan", gate)
                     gated = True
                 pb.stream_wait("plan", ev)
+                l0 = pb.event_rec("plan") if ext else None
                 for r in by_rel[j]:
                     pb.memcpy(self.plan_t[r.i], self.store[r.step, r.layer], "plan")
                     lists[r.i] = pb.event_rec("plan")
+            if ext:
+                iss_ns = time.perf_counter_ns() - t_iss
+                iss_mk = be.marker()
             first = True
             for r in by_rel[j]:
                 t = time.perf_counter_ns()
                 be.host_wait(lists[r.i])
                 rec = dict(i=r.i, release=j, release_wait_ns=(wns if first else 0), wait_ns=time.perf_counter_ns() - t, hk=be.marker(), list_ev=lists[r.i])
+                if ext and first:
+                    rec.update(rel_l0=l0, rel_issue_ns=iss_ns, rel_issued=iss_mk)
                 first = False
                 t = time.perf_counter_ns()
                 d = K.build_desc(self.plan_t[r.i][1 + self.HB:].view(self.H, self.B, self.M), src_layout="orig", dst_layout="orig",
@@ -443,19 +648,20 @@ class CacheCurveRunner(IC.CurveRunner):
                 rec["n"] = d.n
                 sk, dk = K.views_for(d, self.host_phys[r.layer][0], self.scr_k)
                 sv, dv = K.views_for(d, self.host_phys[r.layer][1], self.scr_v)
-                rec["chunks"] = pipe.layer(d, sk, sv, dk, dv, mode="full")
+                rec["chunks"] = pipe.layer(d, sk, sv, dk, dv, mode=mode)
                 out.append(rec)
         return out
 
     def paced_window(self, ctx, arm, train, K_p, phase, rep):
-        """One ARRIVAL-PACED window (ccurve_core module docstring): K_p ticks, release k at tick k's start, the transport on
-        the coordinator. Same checks as the saturation window + releases complete."""
+        """One DECODE-PACED window (raw key 'paced'; ccurve_core module docstring): K_p ticks, release k at THIS arm's own tick k
+        start (a method-dependent schedule, NOT a matched load), the transport on the coordinator. Same checks as the saturation
+        window + releases complete."""
         it = ctx["it"]
         kind = arm["kind"]
         rec = dict(stage="PACED", regime="paced", batch=self.B, C=self.cell_C, P=self.cell_P, step=it, plan_step=it, arm=arm["name"], kind=kind,
                    phase=phase, rep=rep, K=K_p, with_decode=True, with_train=True, queue=IC.QUEUE, regions=IC.REGIONS, label=K.LABEL,
-                   replay_label=CCC.PACED_LABEL, saturated_label=None, copy_label=CV.PREBUILT_LABEL, arm_label=arm.get("label"), W=arm.get("W"),
-                   train=self.curve.setdefault("ptrains", {}).get(it))
+                   replay_label=CCC.PACED_LABEL, schedule=CCC.SCHEDULES["paced"], saturated_label=None, copy_label=CV.PREBUILT_LABEL,
+                   arm_label=arm.get("label"), W=arm.get("W"), train=self.curve.setdefault("ptrains", {}).get(it))
         self.sync()
         K.poison_(self.scr_k)
         K.poison_(self.scr_v)
@@ -564,8 +770,214 @@ class CacheCurveRunner(IC.CurveRunner):
         self._finish_receipts(rec, K_p)
         return rec
 
+    # ------------------------------------------------------------------------------------------------ the ext-paced regime
+    def ext_schedule_for(self, it, pre, ptrain):
+        """The step's PRERECORDED schedule (ccurve_core.ext_schedule), FIXED before any arm of the step runs: P = the steady
+        decode-alone tick p50 of this step's decode_alone_pre window (its start-to-start period p50 is recorded beside it),
+        T0 = CC_EXT_T0_MS, R = CC_PACED_TICKS releases of the paced train's trace steps. None (recorded) when the pre window
+        cannot give P (not ok, no steady tick)."""
+        tk = [tuple(x) for x in pre.get("ticks", [])]
+        P = CV.pctl(CV.steady_ticks(tk, IC.SKIP_FIRST), 50)
+        starts = [a for a, _ in tk]
+        period = CV.pctl([starts[k + 1] - starts[k] for k in range(IC.SKIP_FIRST, len(starts) - 1)], 50)
+        rec = self.curve.setdefault("ext_sched", {})
+        if not pre.get("ok") or not (P == P and P > 0):
+            rec[it] = dict(skipped=True, why="decode_alone_pre not ok or no steady tick (P=%s)" % P)
+            return None
+        steps = list(range(it, it + PACED_TICKS))
+        per = [sum(r.useful for r in ptrain if r.step == st) for st in steps]
+        sched = CCC.ext_schedule(per, steps, P, EXT_T0_MS, PACED_TICKS)
+        sched.update(P_source="decode_alone_pre steady tick p50 (step %d)" % it, alone_period_p50_ms=period, late_tol_ms=EXT_LATE_TOL_MS)
+        rec[it] = {k: v for k, v in sched.items() if k != "offsets_ns"}
+        return sched
+
+    def release_backend(self):
+        be = getattr(self, "be_rel", None)
+        if be is None:
+            if self.dev == "cuda":                                       # the release thread's OWN stream (never a host-only twin)
+                self.s_rel, self.aux_rel = torch.cuda.Stream(), torch.cuda.Stream()
+                be = self.be_rel = K.CudaBackend(dict(release=self.s_rel), self.aux_rel, pool_size=PACED_TICKS + 64)
+            else:                                                        # CPU tests: an idle-GPU twin
+                be = self.be_rel = CV.ImmediateBackend()
+        return be
+
+    def ext_window(self, ctx, arm, train, sched, phase, rep):
+        """One EXT-PACED window (ccurve_core module docstring): the release thread issues the step's fixed schedule; the decode
+        thread runs sched['ticks'] back-to-back resident ticks and publishes nothing; the transport (the coordinator) consumes
+        the releases exactly as in decode-paced. Gates: the paced window's (receipts, every request done and charged, lists,
+        releases) + the SCHEDULE gate + content (cpu8: the delivered scratch == the reference; the host-pack control: its own
+        gates) + the staging pack-content check for every CPU arm."""
+        it = ctx["it"]
+        kind, hp = arm["kind"], bool(arm.get("hostpack"))
+        K_t, R = int(sched["ticks"]), int(sched["R"])
+        rec = dict(stage="EXT", regime="ext-paced", batch=self.B, C=self.cell_C, P=self.cell_P, step=it, plan_step=it, arm=arm["name"], kind=kind,
+                   phase=phase, rep=rep, K=K_t, with_decode=True, with_train=True, queue=IC.QUEUE, regions=IC.REGIONS, label=K.LABEL,
+                   replay_label=CCC.EXT_LABEL, schedule=CCC.SCHEDULES["ext-paced"], saturated_label=None, copy_label=CV.PREBUILT_LABEL,
+                   arm_label=arm.get("label"), W=arm.get("W"), hostpack=hp, done=arm.get("done", "scattered into the scratch" if kind == "cpu" else "gathered"),
+                   train=self.curve.setdefault("ptrains", {}).get(it),
+                   sched={k: sched[k] for k in ("digest", "R", "P_ms", "T0_ms", "ticks", "bytes_total", "offered_gbps", "scheduled_ms")})
+        self.sync()
+        K.poison_(self.scr_k)
+        K.poison_(self.scr_v)
+        fp0 = (G.fp_t(self.scr_k), G.fp_t(self.scr_v)) if hp else None
+        want = arm.get("cores") or 1
+        if hasattr(self, "coord") and getattr(self.coord, "n", None) != want:
+            self.coord.configure(want)
+        if kind == "cpu":
+            self.plan_t.fill_(-7)
+        self.rc_loads.zero_()
+        self.rc_eq.zero_()
+        self._masks = [e._load_mask for e in self.engines]
+        self._arm_receipts(True)
+        retries0 = IC._alloc_retries()
+        self.be_main.reset()
+        be_rel = self.release_backend()
+        be_rel.reset()
+        self.sync()
+        gate = self.be_main.event_rec("main")
+        anchor = time.perf_counter_ns()                                  # the GPU is idle (synchronized): gate ~ anchor
+        box = CCC.ReleaseBox()
+        if kind == "cpu":
+            job = self.coord.submit(lambda co, a=arm, t=train, g=gate, bx=box: self.run_cpu_paced(a, t, g, bx, it, ext=True))
+        else:
+            job = self.coord.submit(lambda co, a=arm, t=train, g=gate, bx=box: self.run_pump_paced(a, t, g, bx, it))
+        rt = CCC.ReleaseThread(box, be_rel, anchor, sched["offsets_ns"], late_ns=self.ext_late_ns)
+        rt.start()
+        tk, err = None, None
+        try:
+            tk = self._ticks(ctx, K_t)                                   # the decode thread: NO box, publishes nothing
+        except (G.UnsanctionedDecode, torch.cuda.OutOfMemoryError, CT.MemGate):
+            rt.halt()
+            rt.join()
+            box.close()
+            job.done.wait()
+            self.sync()
+            raise
+        except Exception:
+            err = traceback.format_exc()[-3000:]
+        end = self.be_main.event_rec("main")
+        if err:
+            rt.halt()
+        left = (anchor + sched["offsets_ns"][-1] + sum((self.ext_late_ns or {}).values()) - time.perf_counter_ns()) / 1e9
+        rt.join(timeout=max(0.0, left) + 30.0)
+        if rt.is_alive():
+            rt.halt()
+            rt.join()
+            err = (err or "") + "release thread still running after its schedule + 30 s"
+        box.close()                                                      # a release never published fails the transport, never hangs it
+        job.done.wait()
+        self.sync()
+        if isinstance(job.exc, (torch.cuda.OutOfMemoryError, CT.MemGate, MemoryError)):
+            raise job.exc
+        rec["alloc_retries"] = IC._alloc_retries() - retries0
+        if err:
+            rec["error"] = err
+        if job.error:
+            rec["coord_error"] = job.error[-3000:]
+        if rt.error:
+            rec["release_error"] = rt.error
+        ms = lambda e: CV.ev_ms(gate, e)
+        rec["end_ms"] = ms(end)
+        rel = [dict(k=r["k"], scheduled_ms=r["scheduled_ns"] / 1e6, issue_ms=r["issue_ns"] / 1e6, publish_ms=r["publish_ns"] / 1e6,
+                    gpu_ms=ms(r["ev"]), lateness_ms=r["lateness_ns"] / 1e6, publish_cost_ms=r["publish_cost_ns"] / 1e6,
+                    injected_delay_ms=r["injected_delay_ns"] / 1e6, lateness_ns=r["lateness_ns"], publish_cost_ns=r["publish_cost_ns"]) for r in rt.recs]
+        rec["releases"] = rel
+        rel_ms = [r["gpu_ms"] for r in rel]
+        rec["release_ms"] = rel_ms
+        rec["release_publishers"] = sorted(set(box.who))
+        reqs, raw = [], []
+        if not job.error:
+            raw = job.result
+            if kind == "cpu":
+                scat = K.MODES[arm.get("mode", "full")][2]
+                by = {r.i: r for r in train}
+                prev = {}
+                for q in raw:
+                    r = by[q["i"]]
+                    j = q["release"]
+                    ch = [[ms(c.get("pk")), ms(c.get("h2d0")), ms(c.get("h2d1")), ms(c.get("sc0")), ms(c.get("sc1")), c["bytes"],
+                           c["pack_ns"] / 1e6, c["bp_ns"] / 1e6, c["g1"] - c["g0"]] for c in q["chunks"]]
+                    if scat:
+                        g1 = max((c[4] for c in ch if c[4] is not None), default=ms(q["desc_ev"]))
+                    else:
+                        g1 = max((c[0] for c in ch if c[0] is not None), default=ms(q["desc_ev"]))
+                    lm = ms(q["list_ev"])
+                    if q.get("rel_l0") is not None:
+                        prev[j] = ms(q["rel_l0"])
+                    d2h = (lm - prev[j]) if (j in prev and lm is not None and prev[j] is not None) else None
+                    prev[j] = lm
+                    x = dict(i=r.i, step=r.step, layer=r.layer, groups=r.groups, useful=r.useful, wire=sum(c[5] for c in ch), region=r.region,
+                             release=j, release_wait_ms=q["release_wait_ns"] / 1e6, release_wait_ns=q["release_wait_ns"], issue=lm, g0=ms(q["hk"]), g1=g1,
+                             wait_ms=q["wait_ns"] / 1e6, desc_ms=q["desc_ns"] / 1e6, d2h_ms=d2h, list_ms=lm, waited_for=None, inflight_at_issue=None, chunks=ch)
+                    if q.get("rel_issue_ns") is not None:
+                        x.update(rel_issue_ms=q["rel_issue_ns"] / 1e6, rel_l0_ms=ms(q["rel_l0"]), rel_issued_ms=ms(q["rel_issued"]))
+                    reqs.append(x)
+            else:
+                for q in raw:
+                    reqs.append(dict(i=q["i"], step=q["step"], layer=q["layer"], groups=q["groups"], useful=q["useful"], wire=q["wire"], region=q["region"],
+                                     release=q["release"], release_wait_ms=q["release_wait_ns"] / 1e6, release_wait_ns=q["release_wait_ns"],
+                                     issue=ms(q["issue"]), g0=ms(q["g0"]), g1=ms(q["g1"]), wait_ms=q["wait_ns"] / 1e6, api_ms=q["api_ns"] / 1e6,
+                                     waited_for=q["waited_for"], inflight_at_issue=q["inflight_at_issue"], dep=q["dep"]))
+        rec["requests"] = reqs
+        if tk is not None:
+            t0s, t1s, host, idle = tk
+            rec["ticks"] = [[ms(a), ms(b)] for a, b in zip(t0s, t1s)]
+            rec["tick_host_ms"] = host
+            rec["main_idle_at_submit"] = idle
+            rec["tick_loads"] = [int(x) for x in self.rc_loads[:K_t].tolist()]
+            rec["tick_bit_exact"] = [bool(x) for x in self.rc_eq[:K_t].tolist()]
+        ticks_ms = [tuple(x) for x in rec.get("ticks", [])]
+        m = CV.window_metrics(ticks_ms, reqs, IC.COVER_MIN, IC.SKIP_FIRST) if ticks_ms else CV.transfer_metrics(reqs)
+        m["paced"] = CCC.paced_metrics(rel_ms, reqs, ticks_ms)
+        iv = self.coord_intervals(reqs, raw) if kind == "cpu" else {}
+        m["ext"] = CCC.diag_metrics(reqs, ticks_ms, iv, rel_ms=rel_ms, rel=rel, sched=sched, done_label=rec["done"], late_tol_ms=EXT_LATE_TOL_MS)
+        rec["m"] = m
+        rec["diag"] = m["ext"]
+        ref_sched = self.curve.get("ext_sched", {}).get(it) or {}
+        rec["schedule_gate"] = CCC.schedule_gate(sched, ref_sched.get("digest"), rel, len(box.evs), box.who, rt.error)
+        ok = "error" not in rec and "coord_error" not in rec and "release_error" not in rec
+        rec["all_requests_done"] = len(reqs) == len(train)
+        rec["bytes_charged"] = sum(q["useful"] for q in reqs) == sum(r.useful for r in train)
+        rec["releases_ok"] = len(rel_ms) == R and all(x is not None for x in rel_ms) and bool(m["paced"]["all_released"])
+        ok &= rec["all_requests_done"] and rec["bytes_charged"] and rec["releases_ok"] and rec["schedule_gate"]["ok"]
+        if kind == "cpu":
+            rows = torch.stack([self.store[r.step, r.layer].cpu() for r in train]) if self.dev == "cuda" else torch.stack([self.store[r.step, r.layer] for r in train])
+            rec["list_ok"] = bool(torch.equal(self.plan_t[:len(train)], rows))
+            ok &= rec["list_ok"]
+        else:
+            mx = max((q["inflight_at_issue"] for q in reqs), default=0)
+            rec["queue_ok"] = mx < IC.QUEUE
+            ok &= rec["queue_ok"]
+        rec["ticks_complete"] = len(rec.get("ticks", [])) == K_t
+        rec["receipts_ok"] = bool(rec["ticks_complete"] and all(x == 0 for x in rec.get("tick_loads", [1])) and all(rec.get("tick_bit_exact", [False])))
+        ok &= rec["receipts_ok"]
+        if hp:
+            self.hostpack_gates(rec, arm, train, raw, fp0, base_ok=ok, count=False)
+        else:
+            ref = self.refs.get(CV.train_digest(train))
+            fk, fv = G.fp_t(self.scr_k), G.fp_t(self.scr_v)
+            rec["content_ok"] = bool(ref is not None and fk == ref["fp_k"] and fv == ref["fp_v"])
+            ok &= rec["content_ok"]
+            if kind == "cpu":
+                self._req_by_i = {r.i: r for r in train}
+                rec["pack_check"] = self.staging_check(arm, raw)
+                ok &= rec["pack_check"]["ok"]
+            rec["ok"] = bool(ok)
+        if self.dev == "cuda":
+            free, total = torch.cuda.mem_get_info()
+            rec["device_used_gb"] = (total - free) / 1e9
+            rec["peak_allocated_gb"] = torch.cuda.max_memory_allocated() / 1e9
+            rec["peak_reserved_gb"] = torch.cuda.max_memory_reserved() / 1e9
+        self.windows.append(rec)
+        self.fails += int(not rec["ok"])
+        self._finish_receipts(rec, K_t)
+        return rec
+
     # ------------------------------------------------------------------------------------------------ one gated step
     def curve_step(self, ctx):
+        """decode-alone pre -> saturation (every arm; + the host-pack control at a diagnostic cell) -> decode-paced (the base
+        arms) -> ext-paced (the diagnostic arms, at a diagnostic cell) -> decode-alone post. The ext schedule is fixed right after
+        decode-alone pre, before any arm of the step runs. Outside the diagnostic cells nothing differs from CC1."""
         it = ctx["it"]
         train = self.train_for(it)
         self.train_reference(train)
@@ -573,20 +985,44 @@ class CacheCurveRunner(IC.CurveRunner):
             self.calibrate(ctx, train)
         K_ = self.curve["K"]["K"]
         K_da = max(K_, PACED_TICKS if PACED else 0)
-        self.window(ctx, None, train, K_da, "decode_alone_pre", 0, ticks=True, transfer=False)
-        order = list(self.arms) if it % 2 == 0 else list(self.arms)[::-1]
+        pre = self.window(ctx, None, train, K_da, "decode_alone_pre", 0, ticks=True, transfer=False)
+        self.note_restore(it)
+        diag = self.is_diag()
+        self.mark_diag()
+        ptrain, sched = None, None
+        if diag and self.ext_arms():
+            ptrain = self.paced_train_for(it)
+            sched = self.ext_schedule_for(it, pre, ptrain)               # FIXED here, before any arm of the step
+        sat = list(self.arms) + (self.hostpack_arms() if diag else [])
+        order = sat if it % 2 == 0 else sat[::-1]
         for rep in range(IC.REPS):
             for a in order:
                 self.window(ctx, a, train, K_, "transfer_alone", rep, ticks=False, transfer=True)
                 self.window(ctx, a, train, K_, "overlap", rep, ticks=True, transfer=True)
         if PACED:
-            ptrain = self.paced_train_for(it)
+            ptrain = ptrain or self.paced_train_for(it)
             self.train_reference(ptrain)
+            base = list(self.arms) if it % 2 == 0 else list(self.arms)[::-1]
             for rep in range(IC.REPS):
-                for a in order:
+                for a in base:
                     self.paced_window(ctx, a, ptrain, PACED_TICKS, "paced", rep)
+        if sched is not None:
+            self.train_reference(ptrain)
+            ea = self.ext_arms()
+            eorder = ea if it % 2 == 0 else ea[::-1]
+            for rep in range(IC.REPS):
+                for a in eorder:
+                    self.ext_window(ctx, a, ptrain, sched, "ext_paced", rep)
         self.window(ctx, None, train, K_da, "decode_alone_post", 0, ticks=True, transfer=False)
         self.curve["steps_done"].append(it)
+
+    def note_restore(self, it):
+        """The bytes of the sanctioned per-tick decode-state restore at this step (snapshot tensors; labelled in the table)."""
+        try:
+            b = snapshot_bytes(self.snap)
+        except Exception as e:
+            b = dict(error=repr(e)[:200])
+        self.cell.setdefault("restore_per_tick", {})[int(it)] = b
 
     # ------------------------------------------------------------------------------------------------ capture at C
     def capture_pool(self, digest_steps=()):
@@ -872,7 +1308,8 @@ class CacheCurveRunner(IC.CurveRunner):
     def payload(self, partial):
         p = super().payload(partial)
         p["cell"] = dict(self.cell, C=self.cell_C, P=self.cell_P, accounting=getattr(self, "accounting", None), cross_record=self.cross.get(self.cell_C),
-                         cross_check=getattr(self, "cross_check", None), pinned=self.pinned_inventory(), paced=PACED, paced_ticks=PACED_TICKS)
+                         cross_check=getattr(self, "cross_check", None), pinned=self.pinned_inventory(), paced=PACED, paced_ticks=PACED_TICKS,
+                         diag_arms=list(getattr(self, "diag_arms", []) or []))
         return p
 
 
@@ -942,8 +1379,31 @@ def _kept(rows):
     return [r for r in rows if CT.row_keep(r)[0]]
 
 
+def _restore_gb(cell):
+    v = [x.get("bytes") for x in (cell.get("restore_per_tick") or {}).values() if isinstance(x, dict) and x.get("bytes") is not None]
+    return CV.pctl(v, 50) / 1e9 if v else float("nan")
+
+
+def _point_specs(cell):
+    """(method, regime, phase, covered) of every point of a cell: the base arms x (saturation, decode-paced) exactly as CC1, then
+    at a diagnostic cell the host-pack saturation and the ext-paced arms (from the payload's own diag record)."""
+    specs = [(a, rg, ph, rg == "saturation") for a in ARMS for rg, ph in (("saturation", "overlap"), ("paced", "paced"))]
+    dg = cell.get("diag") or {}
+    for a in dg.get("hostpack_saturation") or []:
+        specs.append((a, "saturation", "overlap", True))
+    if dg.get("ext"):
+        for a in dg.get("arms") or []:
+            specs.append((a, "ext-paced", "ext_paced", False))
+    return specs
+
+
+def _med(ws, key):
+    return CV.pctl([(w.get("diag") or {}).get(key) for w in ws], 50)
+
+
 def summarize_cell(p, cert):
-    """Per (method, regime): the plot points of one cell payload, from kept rows only (row_keep); every exclusion counted."""
+    """Per (method, regime): the plot points of one cell payload, from kept rows only (row_keep); every exclusion counted. At a
+    diagnostic cell also the diagnostic rows (cpu8 vs the host-pack control; ext-paced and saturation; NO subtraction)."""
     B, cell = p.get("batch"), p.get("cell") or {}
     C = cell.get("C")
     rows = p.get("windows") or []
@@ -962,51 +1422,84 @@ def summarize_cell(p, cert):
     acc = (cell.get("accounting") or {}).get("steady") or {}
     mem = ((p.get("curve") or {}).get("mem_samples") or [])
     pin = cell.get("pinned") or {}
-    points, per_step_rows = [], []
-    for a in ARMS:
-        for regime, phase in (("saturation", "overlap"), ("paced", "paced")):
-            ov = [r for r in kept if r.get("arm") == a and r.get("phase") == phase]
-            pt = CCC.blank_point(B, C, a, regime, "OK" if (cert and ov) else "MISSING")
-            pt["certified"] = bool(cert)
-            conc = {}
-            for r in ov:
-                tk = [tuple(x) for x in r.get("ticks", [])]
-                if regime == "saturation":
-                    cov = CV.tick_coverage(tk, [(q["g0"], q["g1"]) for q in r.get("requests", []) if q.get("g0") is not None])
-                    conc.setdefault(r["step"], []).extend(CV.steady_ticks(tk, IC.SKIP_FIRST, cov, IC.COVER_MIN))
-                else:
-                    conc.setdefault(r["step"], []).extend(CV.steady_ticks(tk, IC.SKIP_FIRST))
-            pc = CV.paired_by_step(alone, conc)
-            gb = {}
-            for r in ov:
-                gb.setdefault(r["step"], []).append((r.get("m") or {}).get("during_gbps"))
-            gstep = [CV.pctl(v, 50) for s, v in sorted(gb.items())]
-            g_mean, g_lo, g_hi = CCC.step_ci(gstep)
-            ms = [r.get("m") or {} for r in ov]
-            pz = [m.get("paced") or {} for m in ms]
-            ta = [r.get("m") or {} for r in kept if r.get("arm") == a and r.get("phase") == "transfer_alone"]
-            pt.update(n_steps=pc["n_steps"], slowdown_pct=pc["extra_pct_mean"], slowdown_ci_lo=pc["extra_pct_ci"][0], slowdown_ci_hi=pc["extra_pct_ci"][1],
-                      extra_ms=pc["extra_ms_mean"], extra_ms_ci_lo=pc["extra_ms_ci"][0], extra_ms_ci_hi=pc["extra_ms_ci"][1],
-                      decode_alone_p50_ms=pc["alone_p50"], decode_alone_p95_ms=pc["alone_p95"], tick_p50_ms=pc["conc_p50"], tick_p95_ms=pc["conc_p95"],
-                      useful_gbps=g_mean, useful_gbps_ci_lo=g_lo, useful_gbps_ci_hi=g_hi, window_gbps=CV.pctl([m.get("window_gbps") for m in ms], 50),
-                      alone_gbps=CV.pctl([m.get("alone_gbps") for m in ta], 50),
-                      offered_gbps=(CV.pctl([z.get("offered_gbps") for z in pz], 50) if regime == "paced" else float("nan")),
-                      useful_bytes=CV.pctl([m.get("useful_bytes") for m in ms], 50), wire_bytes=CV.pctl([m.get("wire_bytes") for m in ms], 50),
-                      full_ready_ms=CV.pctl([m.get("full_ready_ms") for m in ms], 50), overlap_frac=CV.pctl([m.get("overlap_frac") for m in ms], 50),
-                      backlog_slope_bytes_per_release=CV.pctl([z.get("backlog_slope_bytes_per_release") for z in pz], 50),
-                      backlog_end_bytes=CV.pctl([z.get("backlog_end_bytes") for z in pz], 50), overloaded_windows=sum(1 for z in pz if z.get("overloaded")),
-                      drain_ms=CV.pctl([z.get("drain_ms") for z in pz], 50), ready_p95_ms=CV.pctl([z.get("ready_p95_ms") for z in pz], 50),
-                      h2d_per_stream_step=acc.get("h2d_per_stream_step", float("nan")), pool_hits_per_stream_step=acc.get("hits_per_stream_step", float("nan")),
-                      peak_allocated_gb=max([m["peak_allocated_gb"] for m in mem] or [float("nan")]), peak_reserved_gb=max([m["peak_reserved_gb"] for m in mem] or [float("nan")]),
-                      device_used_gb=max([m["device_used_gb"] for m in mem] or [float("nan")]),
-                      pinned_host_gb=(pin.get("host_cache_reserved_pow2", 0) + pin.get("staging_bytes", 0) + pin.get("plan_rows_bytes", 0)) / 1e9,
-                      note=("" if cert else "NOT certified") + ("" if ov else "; no kept %s rows" % phase))
-            points.append(pt)
-            for x in pc["per_step"]:
-                per_step_rows.append(dict(batch=B, C=C, method=a, regime=regime, step=x["step"], alone_p50=x["alone_p50"], conc_p50=x["conc_p50"],
-                                          extra_ms=x["extra_ms"], extra_pct=x["extra_pct"], n_alone=x["n_alone"], n_conc=x["n_conc"],
-                                          during_gbps_p50=CV.pctl(gb.get(x["step"], []), 50)))
-    return dict(batch=B, C=C, points=points, per_step=per_step_rows, excl=excl, kept=len(kept), total=len(rows))
+    rgb = _restore_gb(cell)
+    points, per_step_rows, diag_rows = [], [], []
+    for a, regime, phase, covered in _point_specs(cell):
+        ov = [r for r in kept if r.get("arm") == a and r.get("phase") == phase]
+        pt = CCC.blank_point(B, C, a, regime, "OK" if (cert and ov) else "MISSING")
+        pt["certified"] = bool(cert)
+        conc = {}
+        for r in ov:
+            tk = [tuple(x) for x in r.get("ticks", [])]
+            if covered:
+                cov = CV.tick_coverage(tk, [(q["g0"], q["g1"]) for q in r.get("requests", []) if q.get("g0") is not None])
+                conc.setdefault(r["step"], []).extend(CV.steady_ticks(tk, IC.SKIP_FIRST, cov, IC.COVER_MIN))
+            else:
+                conc.setdefault(r["step"], []).extend(CV.steady_ticks(tk, IC.SKIP_FIRST))
+        pc = CV.paired_by_step(alone, conc)
+        gb = {}
+        for r in ov:
+            gb.setdefault(r["step"], []).append((r.get("m") or {}).get("during_gbps"))
+        gstep = [CV.pctl(v, 50) for s, v in sorted(gb.items())]
+        g_mean, g_lo, g_hi = CCC.step_ci(gstep)
+        ms = [r.get("m") or {} for r in ov]
+        pz = [m.get("paced") or {} for m in ms]
+        ta = [r.get("m") or {} for r in kept if r.get("arm") == a and r.get("phase") == "transfer_alone"]
+        if regime == "paced":
+            offered = CV.pctl([z.get("offered_gbps") for z in pz], 50)                  # per METHOD (its own release intervals)
+        elif regime == "ext-paced":
+            offered = CV.pctl([(m.get("ext") or {}).get("offered_gbps") for m in ms], 50)  # the schedule's (identical for every arm)
+        else:
+            offered = float("nan")
+        paced_like = regime in ("paced", "ext-paced")
+        note = ("" if cert else "NOT certified") + ("" if ov else "; no kept %s rows" % phase)
+        if a.endswith("hostpack"):
+            note = (note + "; " if note else "") + "useful / window GB/s = " + CCC.HOSTPACK_DONE_LABEL
+        pt.update(n_steps=pc["n_steps"], slowdown_pct=pc["extra_pct_mean"], slowdown_ci_lo=pc["extra_pct_ci"][0], slowdown_ci_hi=pc["extra_pct_ci"][1],
+                  extra_ms=pc["extra_ms_mean"], extra_ms_ci_lo=pc["extra_ms_ci"][0], extra_ms_ci_hi=pc["extra_ms_ci"][1],
+                  decode_alone_p50_ms=pc["alone_p50"], decode_alone_p95_ms=pc["alone_p95"], tick_p50_ms=pc["conc_p50"], tick_p95_ms=pc["conc_p95"],
+                  useful_gbps=g_mean, useful_gbps_ci_lo=g_lo, useful_gbps_ci_hi=g_hi, window_gbps=CV.pctl([m.get("window_gbps") for m in ms], 50),
+                  alone_gbps=CV.pctl([m.get("alone_gbps") for m in ta], 50), offered_gbps=offered,
+                  useful_bytes=CV.pctl([m.get("useful_bytes") for m in ms], 50), wire_bytes=CV.pctl([m.get("wire_bytes") for m in ms], 50),
+                  full_ready_ms=CV.pctl([m.get("full_ready_ms") for m in ms], 50), overlap_frac=CV.pctl([m.get("overlap_frac") for m in ms], 50),
+                  backlog_slope_bytes_per_release=(CV.pctl([z.get("backlog_slope_bytes_per_release") for z in pz], 50) if paced_like else float("nan")),
+                  backlog_end_bytes=(CV.pctl([z.get("backlog_end_bytes") for z in pz], 50) if paced_like else float("nan")),
+                  overloaded_windows=sum(1 for z in pz if z.get("overloaded")),
+                  drain_ms=(CV.pctl([z.get("drain_ms") for z in pz], 50) if paced_like else float("nan")),
+                  ready_p95_ms=(CV.pctl([z.get("ready_p95_ms") for z in pz], 50) if paced_like else float("nan")),
+                  h2d_per_stream_step=acc.get("h2d_per_stream_step", float("nan")), pool_hits_per_stream_step=acc.get("hits_per_stream_step", float("nan")),
+                  peak_allocated_gb=max([m["peak_allocated_gb"] for m in mem] or [float("nan")]), peak_reserved_gb=max([m["peak_reserved_gb"] for m in mem] or [float("nan")]),
+                  device_used_gb=max([m["device_used_gb"] for m in mem] or [float("nan")]),
+                  pinned_host_gb=(pin.get("host_cache_reserved_pow2", 0) + pin.get("staging_bytes", 0) + pin.get("plan_rows_bytes", 0)) / 1e9,
+                  note=note, restore_gb_per_tick=rgb)
+        points.append(pt)
+        for x in pc["per_step"]:
+            per_step_rows.append(dict(batch=B, C=C, method=a, regime=regime, step=x["step"], alone_p50=x["alone_p50"], conc_p50=x["conc_p50"],
+                                      extra_ms=x["extra_ms"], extra_pct=x["extra_pct"], n_alone=x["n_alone"], n_conc=x["n_conc"],
+                                      during_gbps_p50=CV.pctl(gb.get(x["step"], []), 50)))
+        if cell.get("diag") and a in (cell["diag"].get("arms") or []) and regime in CCC.DIAG_REGIMES:
+            dws = [r for r in ov if r.get("diag")]
+            sig = {}
+            for r in dws:
+                if regime == "ext-paced":
+                    sig.setdefault(r["step"], set()).add((r.get("sched") or {}).get("digest"))
+            same = (all(len(v) == 1 for v in sig.values()) and bool(sig)) if regime == "ext-paced" else None
+            diag_rows.append(dict(batch=B, C=C, method=a, regime=regime, status=pt["status"], label=CCC.method_label(a) or "cpu8: " + IC.curve_arm("cpu8")["label"],
+                                  done=(CCC.HOSTPACK_DONE_LABEL if a.endswith("hostpack") else "scattered into the scratch"), n_steps=pc["n_steps"],
+                                  n_windows=len(dws), slowdown_pct=pt["slowdown_pct"], slowdown_ci_lo=pt["slowdown_ci_lo"], slowdown_ci_hi=pt["slowdown_ci_hi"],
+                                  offered_gbps=offered, P_ms=_med(dws, "P_ms"), T0_ms=_med(dws, "T0_ms"), ready_p50_ms=_med(dws, "ready_p50_ms"),
+                                  ready_p95_ms=_med(dws, "ready_p95_ms"), full_release_p50_ms=_med(dws, "full_release_p50_ms"),
+                                  full_release_p95_ms=_med(dws, "full_release_p95_ms"), full_window_ms=_med(dws, "full_window_ms"),
+                                  backlog_end_bytes=_med(dws, "backlog_end_bytes"), backlog_slope_bytes_per_release=_med(dws, "backlog_slope_bytes_per_release"),
+                                  overloaded_windows=sum(1 for r in dws if (r.get("diag") or {}).get("overloaded")), drain_ms=_med(dws, "drain_ms"),
+                                  lateness_p50_ms=_med(dws, "lateness_p50_ms"), lateness_p95_ms=_med(dws, "lateness_p95_ms"),
+                                  lateness_max_ms=CV.pctl([(r.get("diag") or {}).get("lateness_max_ms") for r in dws], 100),
+                                  late_releases=(sum(int((r.get("diag") or {}).get("late_releases") or 0) for r in dws) if regime == "ext-paced" else float("nan")),
+                                  handoff_p50_ms=_med(dws, "handoff_p50_ms"), handoff_p95_ms=_med(dws, "handoff_p95_ms"), d2h_p50_ms=_med(dws, "d2h_p50_ms"),
+                                  d2h_p95_ms=_med(dws, "d2h_p95_ms"), coord_duty=_med(dws, "coord_duty"), pack_duty=_med(dws, "pack_duty"),
+                                  decode_duty=_med(dws, "decode_duty"), done_gbps_in_window=_med(dws, "done_gbps_in_window"), schedule_identical=same,
+                                  note=pt["note"]))
+    return dict(batch=B, C=C, points=points, per_step=per_step_rows, diag=diag_rows, excl=excl, kept=len(kept), total=len(rows), restore_gb=rgb)
 
 
 def table_ccurve(out_dir, csv_requests=None):
@@ -1016,8 +1509,12 @@ def table_ccurve(out_dir, csv_requests=None):
     t0 = time.time()
     root = os.path.dirname(os.path.abspath(out_dir))
     L = ["# Cache-size interference curve (%s; %s)" % (K.LABEL, CV.SUSTAINED_LABEL), "",
-         "Saturation = %s. Arrival-paced = %s. Copy rows: %s (CPU8 descriptors built live). Decode: %s." % (
-             CV.SATURATED_LABEL, CCC.PACED_LABEL, CV.PREBUILT_LABEL, CV.RESIDENT_LABEL),
+         "Saturation = %s. Decode-paced (raw key 'paced'; called 'arrival-paced' in CC1's raw files) = %s. Copy rows: %s (CPU8 "
+         "descriptors built live). Decode: %s." % (CV.SATURATED_LABEL, CCC.DECODE_PACED_LABEL, CV.PREBUILT_LABEL, CV.RESIDENT_LABEL),
+         "The decode-paced offered GB/s is PER METHOD (each from its own release intervals); the methods' offered loads are NOT matched. "
+         "Ext-paced (the diagnostic cells only) = %s. Host-pack rows = %s; their GB/s are %s." % (CCC.EXT_LABEL, CCC.HOSTPACK_LABEL,
+                                                                                               CCC.HOSTPACK_DONE_LABEL),
+         "CAVEATS: " + " ".join(CCC.TABLE_CAVEATS), "",
          "C = 63 attended non-tail slots + P pool slots per (layer, KV head, request); the tail slot (one more 64-token group per stream) is "
          "always resident and never fetched. Rows enter a statistic only when ok AND their gated step passed the golden gate (row_keep). "
          "Slowdown = per trace step p50(beside) / p50(decode-alone pre + post) - 1, mean over steps, 95%% bootstrap CI over steps; saturation "
@@ -1040,7 +1537,7 @@ def table_ccurve(out_dir, csv_requests=None):
             with open(fn) as f:
                 markers[(int(m.group(1)), int(m.group(2)))] = json.load(f)
     batches = sorted({b for b, _ in list(pays) + list(markers)})
-    cross_all, points, per_step, plans_rows = {}, [], [], []
+    cross_all, points, per_step, plans_rows, diag_rows = {}, [], [], [], []
     tick_sink = gzip.open(os.path.join(out_dir, "ticks_ccurve.csv.gz"), "wt", compresslevel=1, newline="") if csv_requests else None
     req_sink = gzip.open(os.path.join(out_dir, "requests_ccurve.csv.gz"), "wt", compresslevel=1, newline="") if csv_requests else None
     tw = csv.writer(tick_sink) if tick_sink else None
@@ -1066,9 +1563,21 @@ def table_ccurve(out_dir, csv_requests=None):
             for C in CCC.CAPACITIES:
                 p, res = pays.get((B, C)), markers.get((B, C), {})
                 if p is None:
+                    why_ = "no payload; marker rc %s class %s" % (res.get("rc"), res.get("class"))
                     for a in ARMS:
                         for rg in CCC.REGIMES:
-                            points.append(CCC.blank_point(B, C, a, rg, "MISSING", "no payload; marker rc %s class %s" % (res.get("rc"), res.get("class"))))
+                            points.append(CCC.blank_point(B, C, a, rg, "MISSING", why_))
+                    if C in DIAG_CAPS and DIAG_ARMS:                     # the registered diagnostic cells: MISSING, never dropped
+                        for a in DIAG_ARMS:
+                            if a.endswith("hostpack"):
+                                points.append(CCC.blank_point(B, C, a, "saturation", "MISSING", why_))
+                            if EXT:
+                                points.append(CCC.blank_point(B, C, a, "ext-paced", "MISSING", why_))
+                            for rg in (("saturation", "ext-paced") if EXT else ("saturation",)):
+                                d_ = {k: float("nan") for k in CCC.DIAG_FIELDS}
+                                d_.update(batch=B, C=C, method=a, regime=rg, status="MISSING", label=CCC.method_label(a), done="", n_steps=0, n_windows=0,
+                                          late_releases=None, schedule_identical=None, overloaded_windows=0, note=why_)
+                                diag_rows.append(d_)
                     L.append("- C%d: NO PAYLOAD (marker rc %s, class %s): MISSING" % (C, res.get("rc"), res.get("class")))
                     ok_all = False
                     continue
@@ -1085,6 +1594,7 @@ def table_ccurve(out_dir, csv_requests=None):
                         pt["note"] = (pt["note"] + "; cell fails %s rc %s" % (p.get("fails"), res.get("rc"))).strip("; ")
                 points += s["points"]
                 per_step += s["per_step"]
+                diag_rows += s["diag"]
                 ok_all &= own_ok and cert
                 acc = cell.get("accounting") or {}
                 st = acc.get("steady") or {}
@@ -1108,8 +1618,22 @@ def table_ccurve(out_dir, csv_requests=None):
                 for dg, x in (cur.get("refs") or {}).items():
                     if "requests_loading" in x:
                         cov["paced" if dg in pdig else "saturation"].append("%d/%d" % (x["requests_content_verified"], x["requests_loading"]))
+                rpt = cell.get("restore_per_tick") or {}
+                rb = [x.get("bytes") for x in rpt.values() if isinstance(x, dict) and x.get("bytes") is not None]
+                L.append("  - decode-state restore (sanctioned, every resident tick, alone AND beside): %s GB copied per tick from the snapshot "
+                         "tensors (HBM traffic ~2x: read + write)%s" % (("%.3f" % (CV.pctl(rb, 50) / 1e9)) if rb else "NOT RECORDED (pre-relabel payload)",
+                                                                        "" if not rb else " over %d gated steps" % len(rb)))
+                dg = cell.get("diag")
+                if dg:
+                    es = cur.get("ext_sched") or {}
+                    L.append("  - DIAGNOSTIC cell: arms %s; host-pack saturation %s; ext-paced %s. Ext schedules (fixed per step before any arm): %s" % (
+                        dg.get("arms"), dg.get("hostpack_saturation"), "ON" if dg.get("ext") else "off",
+                        "; ".join("step %s: %s" % (k, ("SKIPPED (%s)" % v.get("why")) if v.get("skipped") else "R %d, P %.3f ms (alone period %.3f ms), T0 %.3f ms, "
+                                  "offered %.3f GB/s, %d ticks, digest %s" % (v["R"], v["P_ms"], v.get("alone_period_p50_ms", float("nan")), v["T0_ms"],
+                                                                           v["offered_gbps"], v["ticks"], v["digest"]))
+                                  for k, v in sorted(es.items(), key=lambda kv: int(kv[0]))) or "none"))
                 L.append("  - content-check coverage per train (requests whose rows survive in the final scratch / loading requests): saturation %s; "
-                         "paced %s. A fully rewritten request's delivery is evidenced by its launch + events only; plan identity across the two "
+                         "decode-paced %s. A fully rewritten request's delivery is evidenced by its launch + events only; plan identity across the two "
                          "methods is structural (the same train and per-C plan store; CPU8 list rows compared per request)" % (
                              ", ".join(cov["saturation"]) or "none", ", ".join(cov["paced"]) or "none"))
                 ps = acc.get("all_steps") or st                             # the per-step series from step 1 (incl. the cold pool)
@@ -1139,17 +1663,20 @@ def table_ccurve(out_dir, csv_requests=None):
                             n_r += 1
             L.append("")
             L += ["| C | method | regime | status | steps | slowdown %% [CI] | extra ms | decode-alone p50 / p95 | beside p50 / p95 | useful GB/s [CI] | "
-                  "window GB/s | offered GB/s | backlog slope MB/release | overloaded | drain ms | H2D / pool hits per stream-step | peak alloc / reserved / used GB |",
+                  "window GB/s | offered GB/s (per method) | backlog slope MB/release | overloaded | drain ms | H2D / pool hits per stream-step | peak alloc / reserved / used GB |",
                   "|" + "---|" * 17]
             for pt in [x for x in points if x["batch"] == B]:
                 L.append("| %d | %s | %s | %s | %d | %+.2f [%.2f, %.2f] | %+.3f | %.3f / %.3f | %.3f / %.3f | %.2f [%.2f, %.2f] | %.2f | %.2f | %.2f | %s | %.1f | "
                          "%.3f / %.3f | %.1f / %.1f / %.1f |" % (
-                             pt["C"], pt["method"], pt["regime"], pt["status"], pt["n_steps"], pt["slowdown_pct"], pt["slowdown_ci_lo"], pt["slowdown_ci_hi"],
+                             pt["C"], pt["method"], CCC.REGIME_NAMES.get(pt["regime"], pt["regime"]), pt["status"], pt["n_steps"], pt["slowdown_pct"], pt["slowdown_ci_lo"], pt["slowdown_ci_hi"],
                              pt["extra_ms"], pt["decode_alone_p50_ms"], pt["decode_alone_p95_ms"], pt["tick_p50_ms"], pt["tick_p95_ms"], pt["useful_gbps"],
                              pt["useful_gbps_ci_lo"], pt["useful_gbps_ci_hi"], pt["window_gbps"], pt["offered_gbps"], pt["backlog_slope_bytes_per_release"] / 1e6,
                              pt["overloaded_windows"], pt["drain_ms"], pt["h2d_per_stream_step"], pt["pool_hits_per_stream_step"], pt["peak_allocated_gb"],
                              pt["peak_reserved_gb"], pt["device_used_gb"]))
             L.append("")
+            dr = [x for x in diag_rows if x["batch"] == B]
+            if dr:
+                L += diag_lines(dr)
     finally:
         if tick_sink:
             tick_sink.close()
@@ -1159,6 +1686,12 @@ def table_ccurve(out_dir, csv_requests=None):
         w.writerow(CCC.POINT_FIELDS)
         for pt in points:
             w.writerow([CCC.fmt(pt.get(k)) for k in CCC.POINT_FIELDS])
+    if diag_rows:
+        with open(os.path.join(out_dir, "ccurve_hostpack.csv"), "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(CCC.DIAG_FIELDS)
+            for r in diag_rows:
+                w.writerow([CCC.fmt(r.get(k)) for k in CCC.DIAG_FIELDS])
     with open(os.path.join(out_dir, "ccurve_per_step.csv"), "w", newline="") as f:
         cols = ("batch", "C", "method", "regime", "step", "alone_p50", "conc_p50", "extra_ms", "extra_pct", "n_alone", "n_conc", "during_gbps_p50")
         w = csv.writer(f)
@@ -1186,6 +1719,31 @@ def table_ccurve(out_dir, csv_requests=None):
         f.write(text)
     print(text)
     return 0 if ok_all else 1
+
+
+def diag_lines(rows):
+    """The diagnostic section of the table: cpu8 vs the host-pack control side by side, NO subtraction, NO 'GPU share'."""
+    f = lambda x, d=2: "" if (x is None or (isinstance(x, float) and x != x)) else ("%.*f" % (d, x) if isinstance(x, float) else str(x))
+    L = ["### Host-pack diagnostic (cpu8 vs %s)" % CCC.HOSTPACK_LABEL,
+         "Side by side; NOTHING is subtracted (no additive 'GPU share'; the GIL is a hypothesis). Ext-paced = %s. Host-pack 'done' = %s. "
+         "Saturation: every request released at the gate (ready = from the gate); covered ticks. Ext-paced: every steady tick; "
+         "lateness = actual publication - scheduled; handoff = host wait for the list + live descriptor build; D2H = list copy span; "
+         "coordinator / pack duty = its host work inside the tick window / the window; decode duty = decode spans / window." % (
+             CCC.EXT_LABEL, CCC.HOSTPACK_DONE_LABEL), "",
+         "| C | method | regime | status | steps / windows | slowdown %% [CI] | offered GB/s | ready p50 / p95 ms | full release p50 / window ms | "
+         "backlog end MB / slope MB per release | lateness p50 / p95 / max ms (late) | handoff p50 / p95 ms | D2H p50 / p95 ms | coord / pack / decode duty | "
+         "done GB/s in window | schedule identical |", "|" + "---|" * 16]
+    for r in rows:
+        L.append("| %s | %s | %s | %s | %s / %s | %s [%s, %s] | %s | %s / %s | %s / %s | %s / %s | %s / %s / %s (%s) | %s / %s | %s / %s | %s / %s / %s | %s | %s |" % (
+            r["C"], r["method"], CCC.REGIME_NAMES.get(r["regime"], r["regime"]), r["status"], r["n_steps"], r["n_windows"], f(r["slowdown_pct"]),
+            f(r["slowdown_ci_lo"]), f(r["slowdown_ci_hi"]), f(r["offered_gbps"]), f(r["ready_p50_ms"], 1), f(r["ready_p95_ms"], 1),
+            f(r["full_release_p50_ms"], 1), f(r["full_window_ms"], 1), f(r["backlog_end_bytes"] / 1e6 if r["backlog_end_bytes"] == r["backlog_end_bytes"] else float("nan"), 1),
+            f(r["backlog_slope_bytes_per_release"] / 1e6 if r["backlog_slope_bytes_per_release"] == r["backlog_slope_bytes_per_release"] else float("nan"), 2),
+            f(r["lateness_p50_ms"], 3), f(r["lateness_p95_ms"], 3), f(r["lateness_max_ms"], 3), f(r["late_releases"]), f(r["handoff_p50_ms"], 3),
+            f(r["handoff_p95_ms"], 3), f(r["d2h_p50_ms"], 3), f(r["d2h_p95_ms"], 3), f(r["coord_duty"], 3), f(r["pack_duty"], 3), f(r["decode_duty"], 3),
+            f(r["done_gbps_in_window"]), "" if r["schedule_identical"] is None else ("YES" if r["schedule_identical"] else "NO")))
+    L += ["- rows -> ccurve_hostpack.csv", ""]
+    return L
 
 
 # ------------------------------------------------------------------------------------------------------------ main

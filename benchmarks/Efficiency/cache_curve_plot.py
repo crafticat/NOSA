@@ -2,12 +2,15 @@
 a synthetic CSV). Reads cache_curve.py's ccurve_points.csv and writes one figure as PNG, SVG and PDF, next to a copy of the CSV
 and of this script:
 
-  rows     panel 1 = resident-decode slowdown % beside the transfer; panel 2 = useful delivered GB/s (H2D bytes during overlap),
-           plus the offered rate in the arrival-paced regime
+  rows     panel 1 = resident-decode slowdown % beside the transfer; panel 2 = useful delivered GB/s (H2D bytes / the request-busy
+           union within the tick-window hull), plus, in the decode-paced regime, each method's OWN offered rate (dashed, in that
+           method's colour: decode-paced releases follow each method's own decode ticks, so the offered loads are method-dependent
+           and NOT matched; no averaged line is drawn)
   columns  one facet per (batch, regime): the primary batch (B192 or its registered fallback) first, then B64; saturation, then
-           arrival-paced
+           decode-paced (CSV regime key 'paced'; CC1's 'arrival-paced')
   lines    one per method: CPU8 (categorical slot 1, circles) and W8 (slot 2, squares); error bars = 95% bootstrap CI over trace
-           steps; a cell whose status is not OK is not drawn and is marked MISSING under the axis
+           steps; a cell whose status is not OK is not drawn and is marked MISSING under the axis. Rows of other methods / regimes
+           (the host-pack control, ext-paced) are not drawn in this figure (ccurve_hostpack.csv / the table carry them)
 
     python cache_curve_plot.py --csv <dir>/ccurve_points.csv [--csv <other job>/ccurve_points.csv ...] --out-dir <dir>/plot
 
@@ -28,15 +31,17 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 CAPACITIES = (63, 73, 81, 96, 113, 128)
-REGIMES = (("saturation", "saturation"), ("paced", "arrival-paced"))
+REGIMES = (("saturation", "saturation"), ("paced", "decode-paced"))
 METHODS = (("cpu8", "CPU8 (CPU pack + bulk DMA + GPU scatter)", "#2a78d6", "o"),      # reference palette slots 1 and 2,
            ("w8", "W8 (NOSI GPU gather, 8 CTAs)", "#eb6834", "s"))                   # validated all-pairs (first three slots)
+SHORT = {"cpu8": "CPU8", "w8": "W8"}
 INK, INK2, GRID, SURFACE = "#0b0b0b", "#52514e", "#e6e5e1", "#fcfcfb"
-OFFERED = "#8a8984"
 CAPTION = ("NOSA-8B, PG-19, L = 16128, A100. C = 63 attended + P victim-pool groups (64 tokens) per layer, KV head and request. "
-           "Slowdown: resident decode tick beside the transfer vs decode alone, mean over trace steps, bars = 95% bootstrap CI over steps. "
-           "Useful GB/s: natural H2D miss bytes delivered while overlapping the decode. Saturation: a finite train released at once; "
-           "arrival-paced: one trace step of plans released per decode tick (offered = dashed). MISSING = not certified or not run.")
+           "Slowdown: resident decode tick beside the transfer vs decode alone (every tick includes the decode-state restore), mean over "
+           "trace steps, bars = 95% bootstrap CI over steps. Useful GB/s: natural H2D miss bytes / the request-busy union within the "
+           "tick-window hull (includes restore and receipt gaps; not a per-byte cost). Saturation: a finite train released at once. "
+           "Decode-paced: one trace step of plans released at each tick start of THAT method's own decode, so the arrival schedule is "
+           "method-dependent and NOT a matched load; dashed = each method's own offered rate. MISSING = not certified or not run.")
 
 
 def _f(x):
@@ -92,6 +97,18 @@ def _series(rows, b, rg, method, y, lo, hi):
     return xs, ys, [el, eh]
 
 
+def offered_series(rows, b, rg, method):
+    """One method's OWN offered rate per C (decode-paced: from its own release intervals). Never averaged across methods."""
+    pts = sorted((r for r in rows if r["batch"] == b and r["regime"] == rg and r["method"] == method and r.get("status") == "OK"), key=lambda r: r["C"])
+    xs, ys = [], []
+    for r in pts:
+        v = _f(r.get("offered_gbps"))
+        if v == v:
+            xs.append(r["C"])
+            ys.append(v)
+    return xs, ys
+
+
 def _missing(rows, b, rg):
     st = {}
     for r in rows:
@@ -121,6 +138,8 @@ def render(rows, out_dir, stem="ccurve_plot", title=None):
             ax.set_xlim(58, 133)
         top.axhline(0.0, color=INK2, linewidth=0.8)
         top.set_title("B%d, %s" % (b, label), color=INK)
+        if rg == "paced":
+            bot.set_title("each method's own release schedule: offered loads NOT matched", fontsize=7, color=INK2)
         for m, name, col, mk in METHODS:
             xs, ys, err = _series(rows, b, rg, m, "slowdown_pct", "slowdown_ci_lo", "slowdown_ci_hi")
             if xs:
@@ -131,15 +150,11 @@ def render(rows, out_dir, stem="ccurve_plot", title=None):
                 bot.errorbar(xs, ys, yerr=err, color=col, marker=mk, markersize=5, linewidth=1.6, capsize=2.5, elinewidth=1.0, label=name,
                              markeredgecolor=SURFACE, markeredgewidth=0.8)
         if rg == "paced":
-            off = {}
-            for r in rows:
-                if r["batch"] == b and r["regime"] == rg and r.get("status") == "OK":
-                    v = _f(r.get("offered_gbps"))
-                    if v == v:
-                        off.setdefault(r["C"], []).append(v)
-            if off:
-                xs = sorted(off)
-                bot.plot(xs, [sum(off[x]) / len(off[x]) for x in xs], color=OFFERED, linestyle="--", linewidth=1.2, label="offered (natural miss bytes per tick)")
+            for m, name, col, mk in METHODS:                      # one dashed line PER METHOD, in its colour (never averaged)
+                xs, ys = offered_series(rows, b, rg, m)
+                if xs:
+                    bot.plot(xs, ys, color=col, linestyle="--", linewidth=1.1, marker=mk, markersize=3, markerfacecolor="none",
+                             label="offered, %s (its own decode ticks)" % SHORT[m])
         miss = _missing(rows, b, rg)
         for C in miss:
             for ax in (top, bot):

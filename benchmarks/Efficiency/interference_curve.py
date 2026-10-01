@@ -422,7 +422,7 @@ class CurveRunner(CT.Runner):
             rec["n"] = d.n
             sk, dk = K.views_for(d, self.host_phys[r.layer][0], self.scr_k)
             sv, dv = K.views_for(d, self.host_phys[r.layer][1], self.scr_v)
-            rec["chunks"] = pipe.layer(d, sk, sv, dk, dv, mode="full")
+            rec["chunks"] = pipe.layer(d, sk, sv, dk, dv, mode=arm.get("mode", "full"))   # cpu8: "full"; the host-pack control: "LP"
             out.append(rec)
         return out
 
@@ -543,7 +543,8 @@ class CurveRunner(CT.Runner):
                     r = by[q["i"]]
                     ch = [[ms(c.get("pk")), ms(c.get("h2d0")), ms(c.get("h2d1")), ms(c.get("sc0")), ms(c.get("sc1")), c["bytes"],
                            c["pack_ns"] / 1e6, c["bp_ns"] / 1e6, c["g1"] - c["g0"]] for c in q["chunks"]]
-                    g1 = max((c[4] for c in ch if c[4] is not None), default=ms(q["desc_ev"]))
+                    g1 = max((c[4] for c in ch if c[4] is not None),               # done = scattered; a mode without a scatter
+                             default=max((c[0] for c in ch if c[0] is not None), default=ms(q["desc_ev"])))   # (host-pack): packed
                     reqs.append(dict(i=r.i, step=r.step, layer=r.layer, groups=r.groups, useful=r.useful, wire=sum(c[5] for c in ch),
                                      region=r.region, issue=ms(lists[r.i]), g0=ms(q["hk"]), g1=g1, wait_ms=q["wait_ns"] / 1e6,
                                      desc_ms=q["desc_ns"] / 1e6, waited_for=None, inflight_at_issue=None, chunks=ch))
