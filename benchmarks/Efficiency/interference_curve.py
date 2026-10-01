@@ -42,7 +42,7 @@ union canary). K (curve_core.choose_K) is chosen ONCE per batch at the first gat
 and frozen; the same K and the same train serve every arm of a step; arm order is reversed on odd steps.
 restore_nosync: CounterSnapshot (host_window = False) restores no pinned host rows; the only asynchronous device->host write
 of a decode step is the tail write-back at a block rollover (cache_engine.py:707-708), which gated()'s rollover tripwire
-excludes (cpupack_transport.py:831-833) and which the K ticks of one step cannot reach (every tick replays the same step).
+excludes (cpupack_transport.py gated(), d9348e5:831-833) and which the K ticks of one step cannot reach (every tick replays the same step).
 The elided synchronize is therefore a no-op for correctness here; every tick is checked (0 loads, logits bit-exact) and the
 advance after the window is gated against the golden.
 
