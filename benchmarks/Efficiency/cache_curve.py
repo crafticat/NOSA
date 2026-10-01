@@ -27,7 +27,8 @@ curve'): at the cells CC_DIAG_CAPS (default '63 128') only, for the arms CC_DIAG
     dedicated release thread; cpu8 and cpu8_hostpack see the IDENTICAL schedule (SCHEDULE gate: digest, every release issued by the
     release thread, lateness recorded). Diagnostic numbers per window: rec['diag'] (ccurve_core.diag_metrics).
   Everywhere else (and for w8) nothing changes: w8 + cpu8 saturation + decode-paced at every C. The table adds the diagnostic
-  section and ccurve_hostpack.csv (side by side, NO subtraction).
+  section and ccurve_hostpack.csv (side by side, NO subtraction). CONTAINMENT (diag_guard): a Python error in the diagnostic is
+  recorded (cell['diag_errors'], +1 fail) and turns the diagnostic OFF for the rest of the cell; the base windows go on.
 TABLE CAVEATS (printed once, ccurve_core.TABLE_CAVEATS): during GB/s vs covered-tick slowdown are not a cost per byte; every
 resident tick includes the decode-state restore (its bytes per tick per cell are reported, note_restore); H1 / H2 not firing is not
 evidence of no host contention; no additive GPU share, the GIL is a hypothesis.
@@ -204,6 +205,7 @@ class CacheCurveRunner(IC.CurveRunner):
         self._pacts = []
         self.skip_post_ref_at = None
         self.diag_arms = []
+        self.diag_off = False                                            # diag_guard: the diagnostic failed in this cell
         self._cpu_out = None
         self.ext_late_ns = None                                          # CPU tests only: a deliberately late release
 
@@ -289,7 +291,32 @@ class CacheCurveRunner(IC.CurveRunner):
         self.curve["ptrains"] = {}
         self.arms = arms if arms else [IC.curve_arm(a) for a in ARMS]
         self.diag_arms = [cc_arm(a) for a in DIAG_ARMS] if DIAG_CAPS else []
+        self.diag_off = False
         self.mark_diag()
+
+    def diag_guard(self, it, what, fn):
+        """CONTAINMENT of the host-pack / ext-paced diagnostic (its first GPU run is CC2). A Python error inside one diagnostic
+        window, the step's ext schedule, or the diagnostic bookkeeping of a base cpu8 window is RECORDED (cell['diag_errors'],
+        +1 fail: the cell is not clean) and switches the diagnostic OFF for the rest of the cell, so the cell's base W8 / CPU8
+        windows still run (registration 14.9); its diagnostic rows hold what was kept (MISSING when none). NOT contained, exactly
+        as before: a capacity stop (OOM, MemGate, MemoryError), an unsanctioned decode, a plan mismatch, and a CUDA error that
+        breaks the synchronize below. ext_window joins its release thread and its coordinator job before any of its bookkeeping,
+        so nothing of a failed window is left running."""
+        if self.diag_off:
+            return None
+        try:
+            return fn()
+        except (G.UnsanctionedDecode, torch.cuda.OutOfMemoryError, CT.MemGate, MemoryError, IC._PlanMismatch):
+            raise
+        except Exception:
+            err = traceback.format_exc()[-3000:]
+            self.sync()
+            self.diag_off = True
+            self.fails += 1
+            self.cell.setdefault("diag_errors", []).append(dict(step=int(it), what=what, error=err))
+            self.log("DIAGNOSTIC ERROR at step %d (%s): the diagnostic is OFF for the rest of C%s, the base windows go on: %s" % (
+                it, what, self.cell_C, err[-600:]))
+            return None
 
     def mark_diag(self):
         """The cell's record of the diagnostic (what the table reads to emit its rows); idempotent."""
@@ -478,15 +505,20 @@ class CacheCurveRunner(IC.CurveRunner):
         rec = super().window(ctx, arm, train, K_, phase, rep, ticks, transfer)
         self._finish_receipts(rec, K_ if ticks else 0)
         rec.update(regime=("saturation" if transfer else "alone"), C=self.cell_C, P=self.cell_P)
-        if hp or cpu_diag:
-            out = self._cpu_out or []
-            iv = self.coord_intervals(rec.get("requests") or [], out)
-            tk = [tuple(x) for x in rec.get("ticks", [])]
-            rec["diag"] = CCC.diag_metrics(rec.get("requests") or [], tk, iv, done_label=arm.get("done", "scattered into the scratch"))
-            rec["schedule"] = CCC.SCHEDULES["saturation"]
-            if hp:
-                self.hostpack_gates(rec, arm, train, out, fp0)
+        if hp:                                                           # (an error here: curve_step's diag_guard)
+            self._window_diag(rec, arm)
+            self.hostpack_gates(rec, arm, train, self._cpu_out or [], fp0)
+        elif cpu_diag:                                                   # a BASE cpu8 window: its diagnostic bookkeeping is
+            self.diag_guard(ctx["it"], "cpu8 diagnostic bookkeeping (%s rep %d)" % (phase, rep),      # contained, the window stands
+                            lambda: self._window_diag(rec, arm))
         return rec
+
+    def _window_diag(self, rec, arm):
+        out = self._cpu_out or []
+        iv = self.coord_intervals(rec.get("requests") or [], out)
+        tk = [tuple(x) for x in rec.get("ticks", [])]
+        rec["diag"] = CCC.diag_metrics(rec.get("requests") or [], tk, iv, done_label=arm.get("done", "scattered into the scratch"))
+        rec["schedule"] = CCC.SCHEDULES["saturation"]
 
     def run_cpu_train(self, arm, train, lists):
         out = super().run_cpu_train(arm, train, lists)
@@ -992,11 +1024,16 @@ class CacheCurveRunner(IC.CurveRunner):
         ptrain, sched = None, None
         if diag and self.ext_arms():
             ptrain = self.paced_train_for(it)
-            sched = self.ext_schedule_for(it, pre, ptrain)               # FIXED here, before any arm of the step
+            sched = self.diag_guard(it, "ext schedule", lambda: self.ext_schedule_for(it, pre, ptrain))   # FIXED here, before any arm
         sat = list(self.arms) + (self.hostpack_arms() if diag else [])
         order = sat if it % 2 == 0 else sat[::-1]
         for rep in range(IC.REPS):
             for a in order:
+                if a.get("hostpack"):                                    # the diagnostic: contained (diag_guard)
+                    self.diag_guard(it, "%s saturation rep %d" % (a["name"], rep), lambda a=a, rep=rep: (
+                        self.window(ctx, a, train, K_, "transfer_alone", rep, ticks=False, transfer=True),
+                        self.window(ctx, a, train, K_, "overlap", rep, ticks=True, transfer=True)))
+                    continue
                 self.window(ctx, a, train, K_, "transfer_alone", rep, ticks=False, transfer=True)
                 self.window(ctx, a, train, K_, "overlap", rep, ticks=True, transfer=True)
         if PACED:
@@ -1012,7 +1049,7 @@ class CacheCurveRunner(IC.CurveRunner):
             eorder = ea if it % 2 == 0 else ea[::-1]
             for rep in range(IC.REPS):
                 for a in eorder:
-                    self.ext_window(ctx, a, ptrain, sched, "ext_paced", rep)
+                    self.diag_guard(it, "%s ext-paced rep %d" % (a["name"], rep), lambda a=a, rep=rep: self.ext_window(ctx, a, ptrain, sched, "ext_paced", rep))
         self.window(ctx, None, train, K_da, "decode_alone_post", 0, ticks=True, transfer=False)
         self.curve["steps_done"].append(it)
 
@@ -1424,6 +1461,11 @@ def summarize_cell(p, cert):
     pin = cell.get("pinned") or {}
     rgb = _restore_gb(cell)
     points, per_step_rows, diag_rows = [], [], []
+    ext_dig = {}                                                         # per step: the schedule digests of every kept ext window
+    for r in kept:
+        if r.get("phase") == "ext_paced":
+            ext_dig.setdefault(r["step"], set()).add((r.get("sched") or {}).get("digest"))
+    derr = cell.get("diag_errors") or []
     for a, regime, phase, covered in _point_specs(cell):
         ov = [r for r in kept if r.get("arm") == a and r.get("phase") == phase]
         pt = CCC.blank_point(B, C, a, regime, "OK" if (cert and ov) else "MISSING")
@@ -1481,8 +1523,8 @@ def summarize_cell(p, cert):
             dws = [r for r in ov if r.get("diag")]
             sig = {}
             for r in dws:
-                if regime == "ext-paced":
-                    sig.setdefault(r["step"], set()).add((r.get("sched") or {}).get("digest"))
+                if regime == "ext-paced":                                # this arm's steps, digests of EVERY diagnostic arm
+                    sig.setdefault(r["step"], set()).update(ext_dig.get(r["step"], set()))
             same = (all(len(v) == 1 for v in sig.values()) and bool(sig)) if regime == "ext-paced" else None
             diag_rows.append(dict(batch=B, C=C, method=a, regime=regime, status=pt["status"], label=CCC.method_label(a) or "cpu8: " + IC.curve_arm("cpu8")["label"],
                                   done=(CCC.HOSTPACK_DONE_LABEL if a.endswith("hostpack") else "scattered into the scratch"), n_steps=pc["n_steps"],
@@ -1498,7 +1540,7 @@ def summarize_cell(p, cert):
                                   handoff_p50_ms=_med(dws, "handoff_p50_ms"), handoff_p95_ms=_med(dws, "handoff_p95_ms"), d2h_p50_ms=_med(dws, "d2h_p50_ms"),
                                   d2h_p95_ms=_med(dws, "d2h_p95_ms"), coord_duty=_med(dws, "coord_duty"), pack_duty=_med(dws, "pack_duty"),
                                   decode_duty=_med(dws, "decode_duty"), done_gbps_in_window=_med(dws, "done_gbps_in_window"), schedule_identical=same,
-                                  note=pt["note"]))
+                                  note=(pt["note"] + ("; diagnostic ERROR at step %s: OFF from there (contained)" % derr[0].get("step") if derr else "")).strip("; ")))
     return dict(batch=B, C=C, points=points, per_step=per_step_rows, diag=diag_rows, excl=excl, kept=len(kept), total=len(rows), restore_gb=rgb)
 
 
@@ -1632,6 +1674,10 @@ def table_ccurve(out_dir, csv_requests=None):
                                   "offered %.3f GB/s, %d ticks, digest %s" % (v["R"], v["P_ms"], v.get("alone_period_p50_ms", float("nan")), v["T0_ms"],
                                                                            v["offered_gbps"], v["ticks"], v["digest"]))
                                   for k, v in sorted(es.items(), key=lambda kv: int(kv[0]))) or "none"))
+                de = cell.get("diag_errors") or []
+                if de:
+                    L.append("  - DIAGNOSTIC ERROR (contained; the diagnostic is OFF from step %s on, the base windows ran): %d error(s); first: %s: %s" % (
+                        de[0].get("step"), len(de), de[0].get("what"), ((de[0].get("error") or "").strip().splitlines() or [""])[-1]))
                 L.append("  - content-check coverage per train (requests whose rows survive in the final scratch / loading requests): saturation %s; "
                          "decode-paced %s. A fully rewritten request's delivery is evidenced by its launch + events only; plan identity across the two "
                          "methods is structural (the same train and per-C plan store; CPU8 list rows compared per request)" % (
