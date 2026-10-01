@@ -41,7 +41,9 @@ CAPTION = ("NOSA-8B, PG-19, L = 16128, A100. C = 63 attended + P victim-pool gro
            "trace steps, bars = 95% bootstrap CI over steps. Useful GB/s: natural H2D miss bytes / the request-busy union within the "
            "tick-window hull (includes restore and receipt gaps; not a per-byte cost). Saturation: a finite train released at once. "
            "Decode-paced: one trace step of plans released at each tick start of THAT method's own decode, so the arrival schedule is "
-           "method-dependent and NOT a matched load; dashed = each method's own offered rate. MISSING = not certified or not run.")
+           "method-dependent and NOT a matched load; dashed = each method's own offered rate. HOST-BOUND (rule H1): decode-alone p50 below "
+           "1.6x the eager launch floor (20 ms at C63, 24.5 ms at C > 63), so the slowdown is NOT read as device interference. "
+           "MISSING = not certified or not run.")
 
 
 def _f(x):
@@ -80,6 +82,23 @@ def merge_points(row_lists):
 def facets(rows):
     batches = sorted({r["batch"] for r in rows}, key=lambda b: (b == 64, -b))       # the primary batch first, B64 last
     return [(b, rg, label) for b in batches for rg, label in REGIMES]
+
+
+H1_FLOOR_MS = 20.0, 24.5          # eager launch floor at C63 / C > 63 (ledger 2026-09-24); registration section 13 rule H1
+H1_FACTOR = 1.6
+
+
+def host_bound_caps(rows, b):
+    """C values of batch b whose W8 / CPU8 decode-alone p50 is below H1_FACTOR x the launch floor (rule H1: HOST-BOUND, the
+    slowdown is NOT read as device interference). Computed from the points, so the label follows the measured value."""
+    out = set()
+    for r in rows:
+        if r["batch"] != b or r.get("status") != "OK" or r.get("method") not in ("w8", "cpu8"):
+            continue
+        da = _f(r.get("decode_alone_p50_ms"))
+        if da == da and da < H1_FACTOR * (H1_FLOOR_MS[0] if r["C"] == 63 else H1_FLOOR_MS[1]):
+            out.add(r["C"])
+    return sorted(out)
 
 
 def _series(rows, b, rg, method, y, lo, hi):
@@ -137,7 +156,11 @@ def render(rows, out_dir, stem="ccurve_plot", title=None):
             ax.set_xticks(CAPACITIES)
             ax.set_xlim(58, 133)
         top.axhline(0.0, color=INK2, linewidth=0.8)
-        top.set_title("B%d, %s" % (b, label), color=INK)
+        hb = host_bound_caps(rows, b)
+        cs = sorted({r["C"] for r in rows if r["batch"] == b and r.get("status") == "OK"})
+        note = ("\nHOST-BOUND, all C (rule H1)" if hb and hb == cs else
+                "\nHOST-BOUND at C %s (rule H1)" % ", ".join(map(str, hb)) if hb else "")
+        top.set_title("B%d, %s%s" % (b, label, note), color=INK, fontsize=10 if not note else 9)
         if rg == "paced":
             bot.set_title("each method's own release schedule: offered loads NOT matched", fontsize=7, color=INK2)
         for m, name, col, mk in METHODS:
