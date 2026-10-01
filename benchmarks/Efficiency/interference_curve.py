@@ -637,7 +637,19 @@ class CurveRunner(CT.Runner):
         r["step_digest_mismatch"] = [i for i, (a, b) in enumerate(zip(mine, z["hashes"]["step_digest"][:n])) if a != b][:16]
         r["logits_sha_equal"] = [str(x) for x in self.logits_sha] == [str(x) for x in z["logits_sha"][:n]]
         r["step_loaded_equal"] = [int(x) for x in self.step_loaded] == [int(x) for x in z["step_loaded"][:n]]
-        r["ids_equal"] = VA.sha(self.ids.to(torch.float32)) == z["meta"].get("ids_sha")
+        r["ids_sha_fresh"] = VA.sha(self.ids.to(torch.float32))
+        saved_n = z["meta"].get("ncap")
+        if saved_n is None or int(saved_n) == int(VA.N):
+            r["ids_check"] = "sha over the same L + N + 1 tokens"
+            r["ids_equal"] = r["ids_sha_fresh"] == z["meta"].get("ids_sha")
+        else:
+            # CC2 2179981: the ids hold L + N + 1 tokens per request, so a run with another N (steps 26-31 -> N 56; saved N 63)
+            # hashes differently although its tokens are the same prefix. Compare what defines the tokens instead: the document
+            # rows (load_corpus admits a document by length, so a different N could change them) and L. The per-step plan
+            # digests, logits and loads above cover every compared step.
+            r["ids_check"] = "document rows + L (saved N %s != this N %s: the sha covers a different length)" % (saved_n, VA.N)
+            r["ids_equal"] = ([int(x) for x in (z["meta"].get("docs") or [])] == [int(x) for x in self.docs]
+                              and int(z["meta"].get("L", -1)) == int(VA.L))
         r["ok"] = bool(r["file_sha_ok"] and not r["step_digest_mismatch"] and r["logits_sha_equal"] and r["step_loaded_equal"] and r["ids_equal"]
                        and len(z["hashes"]["step_digest"]) >= n)
         return r
