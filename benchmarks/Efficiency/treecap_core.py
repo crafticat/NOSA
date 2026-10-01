@@ -119,15 +119,21 @@ def forced_blocks(M: int, init: int = 1, local: int = 17) -> torch.Tensor:
     return f
 
 
+def _top_mask(x: torch.Tensor, k: int) -> torch.Tensor:
+    """The k largest along the last axis, ties broken by the LOWER block index (a stable descending sort). torch.topk breaks
+    ties arbitrarily; the pooled bf16 scores tie at the cut in most rows (job 2179952: 3033 / 4096 rows at the top-64 cut,
+    760 at the top-33 cut; the 13 MB export: 11547 / 16384 and 2882 / 16384), and NOSA's choice equals this rule in all of them."""
+    i = torch.sort(x, dim=-1, descending=True, stable=True).indices[..., :k]
+    return torch.zeros_like(x, dtype=torch.bool).scatter_(-1, i, True)
+
+
 def select_offline(pooled_qk: torch.Tensor, pooled_cis: torch.Tensor, qk_select: int = 33, topk: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
-    """(qk top-33 as a bool mask, final top-64 as a bool mask) over the block axis (sets: the GPU's topk is sorted=False)."""
+    """(qk top-33 as a bool mask, final top-64 as a bool mask) over the block axis; ties -> the lower block index (_top_mask)."""
     q = pooled_qk.float()
     c = pooled_cis.float().clone()
-    i33 = torch.topk(q, qk_select, dim=-1).indices
-    m33 = torch.zeros_like(q, dtype=torch.bool).scatter_(-1, i33, True)
+    m33 = _top_mask(q, qk_select)
     c[m33] = float("inf")
-    i64 = torch.topk(c, topk, dim=-1).indices
-    m64 = torch.zeros_like(c, dtype=torch.bool).scatter_(-1, i64, True)
+    m64 = _top_mask(c, topk)
     return m33, m64
 
 
@@ -347,7 +353,11 @@ def check_selection(pooled_qk: torch.Tensor, pooled_cis_forced: torch.Tensor, bl
     _, m64 = select_offline(pooled_qk, pooled_cis_forced, cfg["qk_select"], cfg["topk_blocks"])
     sel = ids_to_mask(block_map_ids, M)
     eq = (m64 == sel).all(dim=-1)
-    return dict(rows_equal=int(eq.sum()), rows=int(eq.numel()), ok=bool(eq.all()))
+    c = pooled_cis_forced.float()
+    lo = torch.where(sel, c, torch.full_like(c, float("inf"))).amin(dim=-1)        # the weakest selected block
+    hi = torch.where(sel, torch.full_like(c, float("-inf")), c).amax(dim=-1)       # the strongest unselected block
+    return dict(rows_equal=int(eq.sum()), rows=int(eq.numel()), ok=bool(eq.all()), tie_rule="lower block index first",
+                rows_valid_topk=int((lo >= hi).sum()), rows_tie_at_cut=int((lo == hi).sum()))
 
 
 def check_compressed(k_host: torch.Tensor, comp_final: torch.Tensor, n_check: int, kernel: int = 32, stride: int = 16) -> Dict:
