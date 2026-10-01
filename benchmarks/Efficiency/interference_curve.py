@@ -314,15 +314,25 @@ class CurveRunner(CT.Runner):
         self.sync()
         fp = (G.fp_t(self.scr_k), G.fp_t(self.scr_v))
         union = torch.zeros((self.B, self.S_dst, self.H), dtype=torch.bool)
-        last = None
+        owner = torch.full((self.B, self.S_dst, self.H), -1, dtype=torch.int32)    # the LAST request that writes each row
+        last, loading = None, []
         for r in train:
             d = K.build_desc(self.cpu_rows(r)[1 + self.HB:].view(self.H, self.B, self.M), src_layout="orig", dst_layout="orig",
                              s_src=self.S_cpu, s_dst=self.S_dst)
             if d.n:
                 b, t, h = K.dest_rows_logical(d)
                 union[b, t, h] = True
+                owner[b, t, h] = r.i
                 last = (r, d)
+                loading.append(r.i)
         out = dict(digest=dg, fp_k=fp[0], fp_v=fp[1], union_rows=int(union.sum()))
+        # WHAT THE END-OF-WINDOW FINGERPRINT CAN SEE: a request whose every destination row is rewritten later in the train
+        # leaves no trace in the final scratch, so its delivery is evidenced only by the pump (one launch + g0 / g1 per
+        # request, curve_core.pump), not by the content check. Reported, never silently assumed.
+        surv = set(int(x) for x in owner.unique().tolist()) - {-1}
+        out["requests_loading"] = len(loading)
+        out["requests_content_verified"] = len(surv)
+        out["requests_fully_overwritten"] = [i for i in loading if i not in surv][:128]
         ck = K.canary(self.scr_k, union.reshape(-1).to(self.dev))
         cv = K.canary(self.scr_v, union.reshape(-1).to(self.dev))
         out["canary_ok"] = bool(ck["ok"] and cv["ok"])
@@ -1021,6 +1031,11 @@ def table_curve(out_dir, csv_requests=None):
                 L.append("- i256 plans: %d built, %d equal to the NOSI descriptor (rows + bytes); device build p50 %.3f ms per request (isolated, NOT "
                          "charged); plan bytes p50 %.1f MB" % (len(hsb), sum(1 for x in hsb if x["equal_to_nosi_desc"] and x["bytes_ok"]),
                                                               _p([x["build_device_ms"] for x in hsb], 50), _p([x["plan_bytes"] for x in hsb], 50) / 1e6))
+            refs = [x for x in (cur.get("refs") or {}).values() if "requests_loading" in x]
+            if refs:
+                L.append("- content-check coverage per train (requests leaving rows in the final scratch / loading requests): %s; a fully "
+                         "rewritten request's delivery is evidenced by the pump's per-request launch + events only" % ", ".join(
+                             "%d/%d" % (x["requests_content_verified"], x["requests_loading"]) for x in refs))
             L.append("- decode-alone drift: pre %.3f ms -> post %.3f ms" % (s["drift"].get("decode_alone_pre", float("nan")),
                                                                              s["drift"].get("decode_alone_post", float("nan"))))
             inv = (p.get("inventory") or {}).get("after_curve") or (p.get("inventory") or {}).get("after_setup") or {}
@@ -1246,7 +1261,8 @@ def main():
             if isinstance(e, KeyboardInterrupt):
                 raise
             rc = CT.exit_code_for(runner, e)
-            cls = runner.stop_class or (CV.classify_exception(e) if rc == CT.RC_MEMGATE else
+            cx = CV.classify_exception(e)                                 # a host stop that is not a registered memory trigger
+            cls = runner.stop_class or (cx if (rc == CT.RC_MEMGATE or (rc == CT.RC_CRASH and cx in CV.HOST_CLASSES)) else   # DefaultCPUAllocator
                                         {CT.RC_HYGIENE: "RESTART_PROOF", CT.RC_PLACEMENT: "PLACEMENT", CT.RC_CRASH: "CRASH"}.get(rc, "CRASH"))
             err = "%s: %s" % (type(e).__name__, str(e)[:600])
             if rc == CT.RC_MEMGATE:

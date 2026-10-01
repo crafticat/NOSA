@@ -440,16 +440,36 @@ GPU_CLASSES = ("GPU_OOM", "GPU_PREDICTED")
 HOST_CLASSES = ("HOST_PINNED", "HOST_MEMORY", "HOST_KILLED")
 
 
+_PINNED_KEYS = ("pinned", "cudahostalloc", "pin_memory", "hostalloc", "cachinghostallocator", "cudahostregister")
+
+
+def _tb_text(exc: BaseException) -> str:
+    """The raising Python frames (function names + source lines), lower case: '' for an exception that was never raised."""
+    import traceback
+    try:
+        return " ".join("%s %s" % (f.name or "", f.line or "") for f in traceback.extract_tb(exc.__traceback__)).lower()
+    except Exception:
+        return ""
+
+
 def classify_exception(exc: BaseException) -> str:
-    """The stop class of an exception that ended a capacity attempt (driver side; text markers are the driver's own)."""
+    """The stop class of an exception that ended a capacity attempt (driver side; text markers are the driver's own).
+    torch's pinned host allocator reports a refused cudaHostAlloc as a PLAIN RuntimeError 'CUDA error: out of memory'
+    (C10_CUDA_CHECK in CUDACachingHostAllocator, not the device allocator's torch.cuda.OutOfMemoryError 'CUDA out of
+    memory. Tried to allocate ...'), and the pageable CPU allocator as 'DefaultCPUAllocator: can't allocate memory'. A raw
+    'CUDA error: out of memory' is attributed to the host only when a raising frame is a pinned allocation (e.g.
+    cache_engine.py:263 `.pin_memory()`), else it is OOM_UNATTRIBUTED (side UNKNOWN: never reported as a GPU maximum)."""
     name = type(exc).__name__
     msg = str(exc).lower()
-    if name == "MemoryError":
+    if name == "MemoryError" or "defaultcpuallocator" in msg or "can't allocate memory" in msg:
         return "HOST_MEMORY"
-    if "pinned" in msg or "cudahostalloc" in msg or "pin_memory" in msg or "hostalloc" in msg or "cachinghostallocator" in msg:
+    if any(k in msg for k in _PINNED_KEYS):
         return "HOST_PINNED"
-    if name == "OutOfMemoryError" or ("out of memory" in msg and ("cuda" in msg or "gpu" in msg)):
+    if name == "OutOfMemoryError" or "cuda out of memory" in msg:
         return "GPU_OOM"
+    if "out of memory" in msg and ("cuda" in msg or "gpu" in msg):
+        tb = _tb_text(exc)
+        return "HOST_PINNED" if any(k in tb for k in _PINNED_KEYS) else "OOM_UNATTRIBUTED"
     if name == "MemGate" and "free hbm" in msg:
         return "GPU_PREDICTED"
     if name == "MemGate":
