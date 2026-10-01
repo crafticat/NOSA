@@ -846,6 +846,9 @@ class Runner:
                 slot = snap.layers[i]["engine"]
                 for name in ("_block_map", "_new_block_map_buf"):
                     slot[name].copy_(getattr(e, name))
+            post_ref = getattr(snap, "post_reference", None)              # cache-size curve (pool_state.PoolCounterSnapshot): the
+            if post_ref is not None:                                       # post-reference pool state; absent on CounterSnapshot
+                post_ref()
             maps = getattr(self, "maps", None)
             agree = [PL.selection_agreement(self.engines[l]._block_map.cpu(), maps[it, l]) for l in range(self.NL)] \
                 if maps is not None and it < maps.shape[0] else []

@@ -1,0 +1,171 @@
+"""DOC PLOT of the cache-size interference curve (CPU only, matplotlib; retroinfer-eval tests/test_cache_curve.py renders it from
+a synthetic CSV). Reads cache_curve.py's ccurve_points.csv and writes one figure as PNG, SVG and PDF, next to a copy of the CSV
+and of this script:
+
+  rows     panel 1 = resident-decode slowdown % beside the transfer; panel 2 = useful delivered GB/s (H2D bytes during overlap),
+           plus the offered rate in the arrival-paced regime
+  columns  one facet per (batch, regime): the primary batch (B192 or its registered fallback) first, then B64; saturation, then
+           arrival-paced
+  lines    one per method: CPU8 (categorical slot 1, circles) and W8 (slot 2, squares); error bars = 95% bootstrap CI over trace
+           steps; a cell whose status is not OK is not drawn and is marked MISSING under the axis
+
+    python cache_curve_plot.py --csv <dir>/ccurve_points.csv --out-dir <dir>/plot
+"""
+import argparse
+import csv
+import math
+import os
+import shutil
+import sys
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+CAPACITIES = (63, 73, 81, 96, 113, 128)
+REGIMES = (("saturation", "saturation"), ("paced", "arrival-paced"))
+METHODS = (("cpu8", "CPU8 (CPU pack + bulk DMA + GPU scatter)", "#2a78d6", "o"),      # reference palette slots 1 and 2,
+           ("w8", "W8 (NOSI GPU gather, 8 CTAs)", "#eb6834", "s"))                   # validated all-pairs (first three slots)
+INK, INK2, GRID, SURFACE = "#0b0b0b", "#52514e", "#e6e5e1", "#fcfcfb"
+OFFERED = "#8a8984"
+CAPTION = ("NOSA-8B, PG-19, L = 16128, A100. C = 63 attended + P victim-pool groups (64 tokens) per layer, KV head and request. "
+           "Slowdown: resident decode tick beside the transfer vs decode alone, mean over trace steps, bars = 95% bootstrap CI over steps. "
+           "Useful GB/s: natural H2D miss bytes delivered while overlapping the decode. Saturation: a finite train released at once; "
+           "arrival-paced: one trace step of plans released per decode tick (offered = dashed). MISSING = not certified or not run.")
+
+
+def _f(x):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return float("nan")
+    return v
+
+
+def read_points(path):
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        r["batch"] = int(float(r["batch"]))
+        r["C"] = int(float(r["C"]))
+    return rows
+
+
+def facets(rows):
+    batches = sorted({r["batch"] for r in rows}, key=lambda b: (b == 64, -b))       # the primary batch first, B64 last
+    return [(b, rg, label) for b in batches for rg, label in REGIMES]
+
+
+def _series(rows, b, rg, method, y, lo, hi):
+    pts = sorted((r for r in rows if r["batch"] == b and r["regime"] == rg and r["method"] == method), key=lambda r: r["C"])
+    xs, ys, el, eh = [], [], [], []
+    for r in pts:
+        v = _f(r.get(y))
+        if r.get("status") != "OK" or v != v:
+            continue
+        a, c = _f(r.get(lo)), _f(r.get(hi))
+        xs.append(r["C"])
+        ys.append(v)
+        el.append(max(0.0, v - a) if a == a else 0.0)
+        eh.append(max(0.0, c - v) if c == c else 0.0)
+    return xs, ys, [el, eh]
+
+
+def _missing(rows, b, rg):
+    st = {}
+    for r in rows:
+        if r["batch"] == b and r["regime"] == rg:
+            st.setdefault(r["C"], []).append(r.get("status") == "OK")
+    return [C for C in CAPACITIES if not any(st.get(C, []))]
+
+
+def render(rows, out_dir, stem="ccurve_plot", title=None):
+    fc = facets(rows)
+    if not fc:
+        raise ValueError("no points to plot")
+    plt.rcParams.update({"font.size": 9, "axes.edgecolor": INK2, "axes.labelcolor": INK, "xtick.color": INK2, "ytick.color": INK2,
+                         "axes.titlesize": 10, "svg.fonttype": "none", "pdf.fonttype": 42})
+    n = len(fc)
+    fig, axes = plt.subplots(2, n, figsize=(3.3 * n + 0.6, 6.4), sharex=True, squeeze=False)
+    fig.patch.set_facecolor(SURFACE)
+    for j, (b, rg, label) in enumerate(fc):
+        top, bot = axes[0][j], axes[1][j]
+        for ax in (top, bot):
+            ax.set_facecolor(SURFACE)
+            ax.grid(True, color=GRID, linewidth=0.6)
+            ax.set_axisbelow(True)
+            for s in ("top", "right"):
+                ax.spines[s].set_visible(False)
+            ax.set_xticks(CAPACITIES)
+            ax.set_xlim(58, 133)
+        top.axhline(0.0, color=INK2, linewidth=0.8)
+        top.set_title("B%d, %s" % (b, label), color=INK)
+        for m, name, col, mk in METHODS:
+            xs, ys, err = _series(rows, b, rg, m, "slowdown_pct", "slowdown_ci_lo", "slowdown_ci_hi")
+            if xs:
+                top.errorbar(xs, ys, yerr=err, color=col, marker=mk, markersize=5, linewidth=1.6, capsize=2.5, elinewidth=1.0, label=name,
+                             markeredgecolor=SURFACE, markeredgewidth=0.8)
+            xs, ys, err = _series(rows, b, rg, m, "useful_gbps", "useful_gbps_ci_lo", "useful_gbps_ci_hi")
+            if xs:
+                bot.errorbar(xs, ys, yerr=err, color=col, marker=mk, markersize=5, linewidth=1.6, capsize=2.5, elinewidth=1.0, label=name,
+                             markeredgecolor=SURFACE, markeredgewidth=0.8)
+        if rg == "paced":
+            off = {}
+            for r in rows:
+                if r["batch"] == b and r["regime"] == rg and r.get("status") == "OK":
+                    v = _f(r.get("offered_gbps"))
+                    if v == v:
+                        off.setdefault(r["C"], []).append(v)
+            if off:
+                xs = sorted(off)
+                bot.plot(xs, [sum(off[x]) / len(off[x]) for x in xs], color=OFFERED, linestyle="--", linewidth=1.2, label="offered (natural miss bytes per tick)")
+        miss = _missing(rows, b, rg)
+        for C in miss:
+            for ax in (top, bot):
+                ax.annotate("MISSING", (C, 0.0), xycoords=("data", "axes fraction"), xytext=(0, 3), textcoords="offset points", ha="center",
+                            va="bottom", fontsize=6.5, color=INK2, rotation=90)
+        bot.set_xlabel("cache capacity C (groups per stream)")
+        if j == 0:
+            top.set_ylabel("resident-decode slowdown (%)")
+            bot.set_ylabel("useful delivered GB/s")
+    handles, labels = [], []
+    for ax in axes.flat:
+        for h, l in zip(*ax.get_legend_handles_labels()):
+            if l not in labels:
+                handles.append(h)
+                labels.append(l)
+    fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False, fontsize=8.5, bbox_to_anchor=(0.5, 0.995))
+    if title:
+        fig.suptitle(title, y=1.04, color=INK)
+    fig.text(0.01, 0.005, CAPTION, ha="left", va="bottom", fontsize=7, color=INK2, wrap=True)
+    fig.tight_layout(rect=(0, 0.09, 1, 0.95))
+    os.makedirs(out_dir, exist_ok=True)
+    out = {}
+    for ext in ("png", "svg", "pdf"):
+        p = os.path.join(out_dir, "%s.%s" % (stem, ext))
+        fig.savefig(p, dpi=200, facecolor=SURFACE)
+        out[ext] = p
+    plt.close(fig)
+    return out
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--csv", required=True)
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--stem", default="ccurve_plot")
+    ap.add_argument("--title", default=None)
+    a = ap.parse_args(argv)
+    rows = read_points(a.csv)
+    out = render(rows, a.out_dir, a.stem, a.title)
+    for src in (a.csv, os.path.abspath(__file__)):
+        dst = os.path.join(a.out_dir, os.path.basename(src))
+        if os.path.abspath(src) != os.path.abspath(dst) and not os.path.exists(dst):
+            shutil.copyfile(src, dst)
+    print("[ccurve-plot] %s" % " ".join(sorted(out.values())))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
