@@ -33,6 +33,7 @@ LAYERS = tuple(int(x) for x in os.environ.get("TC_LAYERS", "0 4 8 12 16 20 24 28
 RAW_LAYERS = tuple(int(x) for x in os.environ.get("TC_RAW_LAYERS", "0 16").split())
 OUT = os.environ.get("TC_OUT", "")
 REF_NPZ = os.environ.get("TC_REF_NPZ", "")
+GM_REF = os.environ.get("TC_GROUPMEAN_REF", "")                     # job 2179927's group-mean export (fork 8c68d8b + one hook)
 HASH_MODEL = os.environ.get("TC_HASH_MODEL", "1") == "1"
 EXPECT_SAFETENSORS_SHA = os.environ.get("TC_EXPECT_SAFETENSORS_SHA", "5219c9ec34c4a19650e98b079ccf4911ffb3457e8f67690ca9037c09e89fd477")
 RC_GATE, RC_CRASH = 21, 23
@@ -169,12 +170,27 @@ def main():
     else:
         ident["ok"] = None
     checks["identity_vs_existing_export"] = ident
+    gmx = dict(reference=GM_REF or None)
+    if GM_REF:                                                           # the same host keys as job 2179927 (layout heuristic export)
+        ref = np.load(GM_REF)["group_mean_key"]
+        mine = torch.stack(gm).numpy()
+        side = os.path.splitext(GM_REF)[0] + ".json"
+        ref_layers = json.load(open(side)).get("layer_ids") if os.path.exists(side) else None
+        gmx.update(shape_equal=list(ref.shape) == list(mine.shape), layers_equal=(ref_layers is None or [int(x) for x in ref_layers] == sl))
+        if gmx["shape_equal"]:
+            err = np.abs(mine.astype(np.float64) - ref.astype(np.float64))
+            gmx["max_rel_err"] = float(err.max() / max(1e-30, float(np.abs(ref).max())))
+            gmx["bit_equal"] = bool(np.array_equal(mine, ref))
+        gmx["ok"] = bool(gmx["shape_equal"] and gmx["layers_equal"] and gmx.get("max_rel_err", 1.0) <= 1e-5)
+    else:
+        gmx["ok"] = None
+    checks["group_means_vs_2179927"] = gmx
     causal = TC.causal_groups(positions)
     causal["n_comp_per_call"] = ncomp[:, 0].tolist()
     causal["note"] = ("groups 0..%d complete at prefill (L = %d = %d x 64); every decode position lies in tail block %d, so no 64-token group "
                       "completes during the %d calls; compressed chunks complete at the calls listed in checks.n_comp_vs_rule" % (n_groups - 1, L, n_groups, n_groups, T))
     ok = bool(checks["records_complete"] and checks["pooling"]["ok"] and checks["selection"]["ok"] and checks["selection_ids_equal_block_map"]
-              and checks["positions_equal"] and (ident["ok"] is not False))
+              and checks["positions_equal"] and (ident["ok"] is not False) and (gmx["ok"] is not False))
     cache_before = torch.cat([torch.full((1,) + tuple(maps.shape[1:]), -1, dtype=torch.int16), maps[:-1]], dim=0)
     cache_before[0, ..., 63] = n_groups
     arrays = dict(
