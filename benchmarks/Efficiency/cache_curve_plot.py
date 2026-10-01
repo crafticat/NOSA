@@ -9,7 +9,11 @@ and of this script:
   lines    one per method: CPU8 (categorical slot 1, circles) and W8 (slot 2, squares); error bars = 95% bootstrap CI over trace
            steps; a cell whose status is not OK is not drawn and is marked MISSING under the axis
 
-    python cache_curve_plot.py --csv <dir>/ccurve_points.csv --out-dir <dir>/plot
+    python cache_curve_plot.py --csv <dir>/ccurve_points.csv [--csv <other job>/ccurve_points.csv ...] --out-dir <dir>/plot
+
+SEVERAL CSVs (job CC2 passes CC1's points next to its own, so ONE figure carries the primary batch and B64): the rows are merged
+per (batch, C, method, regime); an OK row replaces a MISSING one (a leftover cell measured by CC2), two OK rows for the same key
+are REFUSED (never a silent pick).
 """
 import argparse
 import csv
@@ -50,6 +54,22 @@ def read_points(path):
         r["batch"] = int(float(r["batch"]))
         r["C"] = int(float(r["C"]))
     return rows
+
+
+def merge_points(row_lists):
+    """Rows of several points CSVs, one per (batch, C, method, regime) (module docstring)."""
+    out, order = {}, []
+    for rows in row_lists:
+        for r in rows:
+            k = (r["batch"], r["C"], r.get("method"), r.get("regime"))
+            if k not in out:
+                out[k] = r
+                order.append(k)
+            elif r.get("status") == "OK":
+                if out[k].get("status") == "OK":
+                    raise ValueError("two OK points for batch %s C %s %s %s: refusing to pick one" % k)
+                out[k] = r
+    return [out[k] for k in order]
 
 
 def facets(rows):
@@ -152,15 +172,16 @@ def render(rows, out_dir, stem="ccurve_plot", title=None):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--csv", required=True)
+    ap.add_argument("--csv", required=True, action="append", help="points CSV; repeat to merge several jobs' points")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--stem", default="ccurve_plot")
     ap.add_argument("--title", default=None)
     a = ap.parse_args(argv)
-    rows = read_points(a.csv)
+    rows = merge_points([read_points(c) for c in a.csv])
     out = render(rows, a.out_dir, a.stem, a.title)
-    for src in (a.csv, os.path.abspath(__file__)):
-        dst = os.path.join(a.out_dir, os.path.basename(src))
+    srcs = [(c, os.path.basename(c) if i == 0 else "input%d_%s" % (i + 1, os.path.basename(c))) for i, c in enumerate(a.csv)]
+    for src, name in srcs + [(os.path.abspath(__file__), os.path.basename(__file__))]:
+        dst = os.path.join(a.out_dir, name)
         if os.path.abspath(src) != os.path.abspath(dst) and not os.path.exists(dst):
             shutil.copyfile(src, dst)
     print("[ccurve-plot] %s" % " ".join(sorted(out.values())))

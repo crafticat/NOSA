@@ -1086,6 +1086,16 @@ def table_ccurve(out_dir, csv_requests=None):
                 L.append("  - natural plans at C%d (steady steps): H2D %.4f groups per stream-step (the PCIe misses BOTH methods replay), pool hits %.4f "
                          "(device-to-device, NOT replayed), evictions %.4f; %s" % (C, st.get("h2d_per_stream_step", float("nan")), st.get("hits_per_stream_step", float("nan")),
                                                                                   st.get("evicted_per_stream_step", float("nan")), summ.get("replayed", "")))
+                cur = p.get("curve") or {}
+                pdig = {x.get("digest") for x in (cur.get("ptrains") or {}).values()}
+                cov = {"saturation": [], "paced": []}
+                for dg, x in (cur.get("refs") or {}).items():
+                    if "requests_loading" in x:
+                        cov["paced" if dg in pdig else "saturation"].append("%d/%d" % (x["requests_content_verified"], x["requests_loading"]))
+                L.append("  - content-check coverage per train (requests whose rows survive in the final scratch / loading requests): saturation %s; "
+                         "paced %s. A fully rewritten request's delivery is evidenced by its launch + events only; plan identity across the two "
+                         "methods is structural (the same train and per-C plan store; CPU8 list rows compared per request)" % (
+                             ", ".join(cov["saturation"]) or "none", ", ".join(cov["paced"]) or "none"))
                 for i, stp in enumerate(st.get("steps") or []):
                     plans_rows.append(dict(batch=B, C=C, step=stp, h2d_groups=st["h2d_groups"][i], h2d_bytes=st["h2d_bytes"][i], pool_hits=st["hits"][i],
                                            d2d_moves=st["d2d_moves"][i], evicted=st["evicted"][i]))
