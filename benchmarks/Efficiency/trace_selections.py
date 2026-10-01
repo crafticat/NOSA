@@ -28,6 +28,7 @@ from transformers import AutoTokenizer
 
 from nosi import NOSALlama as Llama
 from nosi import transfer_trace as _tt
+import treecap_groupmean as _tc
 
 path = os.environ["NOSI_MODEL_PATH"]
 pq = os.environ["NOSI_PG19_PARQUET"]
@@ -44,6 +45,8 @@ model = Llama(model_name=path, device="cuda", offload=os.environ.get("NOSI_BENCH
 trace = _tt.install(model.num_layers, max_steps=STEPS)
 assert trace is not None and trace.scores, "run with NOSI_TRANSFER_TRACE=scores"
 print(f"[Setup] model={path} layers={model.num_layers} L={L} B={B} steps={STEPS} offset={OFFSET} mode={_tt.MODE}")
+TREECAP = _tc.layers_from_env(model.num_layers)   # opt-in real-vector export (NOSI_TREECAP_LAYERS); None = off
+assert TREECAP is None or model.offload, "the treecap export reads the host KV: needs NOSI_BENCH_OFFLOAD=1"
 
 # pick B distinct documents with >= L + STEPS tokens, in dataset order
 rows, ids = [], []
@@ -78,6 +81,11 @@ def run():
     logits, position_ids = model.batch_prefill(prompt, cache_engine)
     torch.cuda.synchronize()
     prefill_s = time.time() - t0
+    if TREECAP is not None:                            # read-only, after the synchronized prefill, before decode call 0
+        _tc.export(cache_engine, TREECAP, L, rows, OUT, n_q_heads=model.config.num_attention_heads,
+                   provenance=dict(model=path, parquet=pq, steps=STEPS, offset=OFFSET, batch=B,
+                                   nosi_commit=os.environ.get("NOSI_COMMIT", "unknown"),
+                                   job=os.environ.get("SLURM_JOB_ID", "none")))
     position_ids = position_ids[:, -1:] + 1
     cu = torch.arange(0, B + 1, dtype=torch.int, device="cuda")
     step_ms, argmax_match = [], []
