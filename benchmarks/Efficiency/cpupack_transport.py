@@ -1,6 +1,26 @@
 """CPU-PACKING TRANSPORT beside NOSI's resident decode (authorized 2026-09-29, the user via Codex; ledger 'CPU-PACKING
 TRANSPORT EXPERIMENT AUTHORIZED'). Measurement harness only: no production-baseline change.
 
+CONFIRMATION (feature/nosi-cpupack-c; Codex's review of job 2179683, relayed by the user 2026-10-01; cpupack_golden.py has
+the mechanism and its proof):
+  * NO DESTRUCTIVE OPERATION IN A MEASUREMENT PROCESS. The logits negative control (a second decode without a restore,
+    2179683's cpupack_transport.py:961) is gone from correct_stage; it and the other destructive controls (window row, tail
+    row, block map, compression state, counters, the guard itself) run in the separate CONTROLS process (CP_MODE=controls,
+    run_controls), first; its failure stops the job. Every decode goes through Runner.decode -> DecodeGuard.check: inside
+    a gated step only the flushed reference and restored steps are legal (UnsanctionedDecode otherwise, before the model
+    runs). tail_write_real puts back the host rows it writes.
+  * GOLDEN GATE (CP_CONFIRM=1, run_confirm). One process: prefill -> PostPrefillSnapshot (hosted in pageable memory) ->
+    [CAPTURE: the 63 natural steps, verified against the SAVED 2179683 plans (CP_SAVED_PLANS_NPZ, CP_SAVED_PLANS_SHA256)]
+    -> restart -> GOLDEN pass (the same gated sequence with no transports and no controls; exported) -> restart ->
+    MEASURED pass. Every restart must reproduce the post-prefill start digest, and every pass's warm natural steps the
+    first pass's logits and full state digests (exit 20 otherwise = fallback (ii): CP_STAGES=GOLDEN in one process,
+    CP_GOLDEN_JSON in the next). At every gated step BEFORE any timing: reference logits sha256, post-step maps, tail,
+    counters, compression state and window == golden, and the pre-timing resident check (restore -> decode: 0 loads,
+    logits torch.equal the reference); after the advance: advance logits sha256 and the post-advance state == golden.
+    A mismatch is GATE_FAIL: no timing at that step (pre) / its rows excluded (post), counted as a failure.
+  * C0 runs under inference mode (2179683 defect 2); TABLE keeps only ok rows of gate-passing steps, streams the
+    per-request CSV per group through gzip and reports every exclusion with its denominator (defect 3).
+
 QUESTION. GPU produces the missing-KV list -> CPU packs scattered KV into contiguous pinned staging -> bulk DMA -> GPU places
 the data in the required slots. Does it keep useful transfer speed while reducing decode interference, and where is the cost
 (list delivery, descriptor preparation, packing, DMA, placement)?
@@ -55,10 +75,14 @@ DEADLINE: CP_STAGE_DEADLINE (epoch s, from the sbatch: the stage's timeout bound
 also stops at CP_LAYOUT_BUDGET_S, skips a step that its observed step time does not fit, and skips the head-major cells when
 the PREDICTED in-place conversion (probe of 3 requests + C0's measurement, x CP_CONV_SAFETY) plus one step does not fit.
 """
+import csv
 import gc
+import gzip
+import hashlib
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -66,7 +90,7 @@ import traceback
 
 import cpupack_cpu as CC
 
-MODE = os.environ.get("CP_MODE", "run")
+MODE = os.environ.get("CP_MODE", "run")   # run | calib | table | controls
 EARLY = None
 if __name__ == "__main__" and MODE in ("run", "calib"):
     _gn = os.environ.get("CP_GPU_NUMA_NODE", "").strip()
@@ -85,6 +109,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 import cpupack_core as K  # noqa: E402
+import cpupack_golden as G  # noqa: E402
 import cpupack_plans as PL  # noqa: E402
 import cpupack_timing as TM  # noqa: E402
 import numa_maps as NM  # noqa: E402
@@ -123,6 +148,16 @@ PEAK_LIMIT_GB = float(os.environ.get("CP_PEAK_LIMIT_GB", "84.1"))
 CONTIG_BYTES = int(os.environ.get("CP_CONTIG_MB", "256")) << 20
 LIFETIME_CAP = int(os.environ.get("CP_LIFETIME_CAP_GROUPS", "16"))
 LIFETIME_DELAY_MS = float(os.environ.get("CP_LIFETIME_DELAY_MS", "20"))
+# ---- the confirmation (module docstring 'CONFIRMATION')
+CONFIRM = os.environ.get("CP_CONFIRM", "0") == "1"
+SAVED_PLANS_NPZ = os.environ.get("CP_SAVED_PLANS_NPZ", "")                 # the 2179683 plans (read-only)
+SAVED_PLANS_SHA256 = os.environ.get("CP_SAVED_PLANS_SHA256", "")           # its expected file sha256 ('' = not checked)
+GOLDEN_JSON = os.environ.get("CP_GOLDEN_JSON", "")                         # fallback (ii): gate against this export
+XGOLDEN_JSON = os.environ.get("CP_XGOLDEN_JSON", "")                       # another process's golden: a determinism record
+ARM_ORDER = os.environ.get("CP_ARM_ORDER", "fixed")                        # fixed | alternate (reversed on odd steps)
+LAYOUT_PLACERS = tuple(os.environ.get("CP_LAYOUT_PLACERS", "row group").split())
+CONTROL_STEPS = tuple(int(x) for x in os.environ.get("CP_CONTROL_STEPS", "4 5").split())
+GOLDEN_FOR = tuple(os.environ.get("CP_GOLDEN_FOR", "CORRECT MAIN LAYOUT").split())   # a GOLDEN-only process: whose schedule
 OUT = VA.OUT
 TAG = os.environ.get("CP_TAG", "cp_b%d" % VA.BATCH)
 RC_HYGIENE, RC_CORRECT, RC_MEMGATE, RC_CRASH, RC_PLACEMENT = 20, 21, 22, 23, 24
@@ -184,13 +219,15 @@ LAYOUT_CELLS_PRE = (("orig", "orig"), ("orig", "hm"))
 LAYOUT_CELLS_POST = (("hm", "hm"), ("hm", "orig"))
 
 
-def layout_variants(src, dst, top=8):
+def layout_variants(src, dst, top=8, placers_hm=None):
     """layout_ablation: W8 plus the cpu<top> packer x placer variants of one (source, destination) cell. The packer effect
     is row vs group at a fixed placer (head-major source only); the placer effect is row vs group at a fixed packer
-    (head-major destination only)."""
+    (head-major destination only). placers_hm (default CP_LAYOUT_PLACERS) limits the head-major destination's placers:
+    the confirmation registers ('row',) = row/row in every cell plus the group packer on head-major source cells."""
     out = [arm("w8@%s>%s" % (src, dst), "w8")]
     packers = ("row", "group") if src == "hm" else ("row",)
-    placers = ("row", "group") if dst == "hm" else ("row",)
+    ph = tuple(p for p in (LAYOUT_PLACERS if placers_hm is None else placers_hm) if p in ("row", "group")) or ("row",)
+    placers = ph if dst == "hm" else ("row",)
     for p in packers:
         for q in placers:
             out.append(arm("cpu%d@%s>%s:%s/%s" % (top, src, dst, p, q), "cpu", cores=top, packer=p, placer=q))
@@ -313,6 +350,18 @@ class Runner:
         self.inv_snaps = {}
         self.thread_use = []
         self.dev = "cuda"                                                # the CPU tests drive transport / checks / conversion with "cpu"
+        # ---- the confirmation (cpupack_golden.py)
+        self.guard = G.DecodeGuard("controls" if MODE == "controls" else "measure")
+        self.golden_mode = None                                          # None (original flow) | "record" | "check"
+        self.golden = dict(steps={})
+        self.golden_fail = []                                            # golden-pass steps whose own resident check failed
+        self.gate_log, self.gate_fail_steps, self.restarts, self.warm_log = [], [], [], []
+        self.schedule = None
+        self.inject = None                                               # CONTROLS only: perturbation hooks
+        self.in_layout = False
+        self.arm_orders = []
+        self.plans_vs_saved = None
+        self.golden_cross = None
 
     def snap_inventory(self, label):
         """One memory / NUMA inventory at a named point (a /proc/self/numa_maps read walks ~268 GB of pinned pages at B336, so it
@@ -368,6 +417,14 @@ class Runner:
         self.sleep_cycles = int(SLEEP_MS * 1e-3 * 1.41e9)
         self.pipes = {}
 
+    def setup_min(self):
+        """CONTROLS process: the geometry only (no coordinator, no pinned staging, no transport)."""
+        B = int(self.ids.shape[0])
+        self.B = B
+        self.H, self.D, self.R, self.M = K.H_DEF, K.D_DEF, K.R_DEF, K.M_DEF
+        self.HB = self.H * B
+        self.W = 1 + self.HB + self.HB * self.M
+
     def pipe(self, cap):
         if cap not in self.pipes:
             self.pipes[cap] = K.Pipe(self.cbe, self.stage, self.land, cap)
@@ -390,21 +447,31 @@ class Runner:
             assert e._k_cpu.is_pinned() and e._k_cpu.is_contiguous() and e._v_cpu.is_contiguous()
         self.host_layout = "orig"
         self.host_phys = [(e._k_cpu, e._v_cpu) for e in self.engines]
-        assert self.NL <= self.plan_h.shape[0], "the plan-list buffer holds %d layers < %d" % (self.plan_h.shape[0], self.NL)
+        if hasattr(self, "plan_h"):
+            assert self.NL <= self.plan_h.shape[0], "the plan-list buffer holds %d layers < %d" % (self.plan_h.shape[0], self.NL)
         torch.cuda.reset_peak_memory_stats()
 
     def loaded_now(self):
         return int(torch.stack([(e._load_mask >= 0).sum() for e in self.engines]).sum())
 
     def decode(self, tok, pos, warmup=False):
+        """EVERY decode of this harness goes through here: the guard checks it BEFORE the model runs (cpupack_golden)."""
+        self.guard.check("decode")
         return self.model.decode_inference(tok, self.cu, pos, self.cache, warmup=warmup) if warmup else \
             self.model.decode_inference(tok, self.cu, pos, self.cache)
 
+    def sync(self):
+        if self.dev == "cuda":
+            torch.cuda.synchronize()
+
     # ---------------------------------------------------------------------------------------------- capture
-    def capture(self):
+    def capture(self, snapshot=None, digest_steps=()):
+        """snapshot=False: the caller owns the restart (run_confirm's hosted PostPrefillSnapshot). digest_steps: the warm
+        steps whose logits sha256 and FULL state digest are recorded (cap['warm']) as the restart proof's reference."""
         from nosi import transfer_trace as _tt
         snap = None
-        if not NO_SNAPSHOT:
+        warm = []
+        if (not NO_SNAPSHOT) if snapshot is None else snapshot:
             try:
                 snap = self.ss.PostPrefillSnapshot(self.cache).take()
             except torch.cuda.OutOfMemoryError as e:                     # registered rule (e): two processes first
@@ -425,6 +492,8 @@ class Runner:
             for l, e in enumerate(self.engines):
                 xfail += int(not torch.equal(tr.mask_archive[it, l].to(torch.int64), e._load_mask))
                 xfail += int(not torch.equal(tr.map_archive[it, l].to(torch.int64), e._block_map))
+            if it in digest_steps:
+                warm.append(dict(step=it, logits_sha=sha[-1], logits_sha256=G.sha_parts([lg]), digest=self.state_digest(G.FAMILIES_PRE)))
             pos = pos + 1
         step_rows, _, _, masks, maps = tr.harvest(timed_steps=())
         _tt.TRACE = None
@@ -447,7 +516,7 @@ class Runner:
         cap = dict(source="capture (int16 AloneTrace, one harvest)", ncap=ncap, seconds=time.time() - t0, cross_check_fails=xfail,
                    trace_ok=ok_trace, invariants=inv, accepted=PL.accepted(inv) and xfail == 0 and ok_trace, run_digest=hs["run_digest"],
                    step_digest=hs["step_digest"], export=path, step_loaded=loaded, logits_sha=sha,
-                   natural_step_ms=[r.get("step_ms") for r in step_rows], snapshot=not NO_SNAPSHOT)
+                   natural_step_ms=[r.get("step_ms") for r in step_rows], snapshot=snap is not None, warm=warm)
         if snap is not None:
             snap.restore()
             del snap
@@ -754,7 +823,9 @@ class Runner:
 
     # ---------------------------------------------------------------------------------------------- the gated step
     def gated(self, it, pos, work):
-        """worker_sweep.py:491-507 (light restore) around `work(ctx)`, then the advance (:584-587)."""
+        """worker_sweep.py:491-507 (light restore) around `work(ctx)`, then the advance (:584-587). With a golden mode
+        (cpupack_golden): the gate BEFORE work (digests after the reference decode + the pre-timing resident check) and
+        after the advance; a failing pre-gate skips `work` (no timing at this step)."""
         tok = self.forced[:, it:it + 1]
         tails = [int(e._tail_block_len_on_gpu) for e in self.engines]
         if max(tails) >= self.R - 1:                                     # the next decode would complete the tail block: a
@@ -764,25 +835,125 @@ class Runner:
         snap.take()
         for e in self.engines:
             self.mc.flush_map(e)
-        lg_ref = self.decode(tok, pos)
-        torch.cuda.synchronize()
-        for i, e in enumerate(self.engines):
-            slot = snap.layers[i]["engine"]
-            for name in ("_block_map", "_new_block_map_buf"):
-                slot[name].copy_(getattr(e, name))
-        agree = [PL.selection_agreement(self.engines[l]._block_map.cpu(), self.maps[it, l]) for l in range(self.NL)] if it < self.maps.shape[0] else []
+        self.guard.begin_step(it)
+        try:
+            lg_ref = self.decode(tok, pos)
+            self.sync()
+            for i, e in enumerate(self.engines):
+                slot = snap.layers[i]["engine"]
+                for name in ("_block_map", "_new_block_map_buf"):
+                    slot[name].copy_(getattr(e, name))
+            maps = getattr(self, "maps", None)
+            agree = [PL.selection_agreement(self.engines[l]._block_map.cpu(), maps[it, l]) for l in range(self.NL)] \
+                if maps is not None and it < maps.shape[0] else []
 
-        def restore():
-            snap.restore()
-            self.ss.assert_transients_intact(self.model, self.trans)
-        ctx = dict(it=it, tok=tok, pos=pos, lg_ref=lg_ref, restore=restore, step_fn=lambda: self.decode(tok, pos), tail_len_max=max(tails),
-                   agreement=dict(same_frac_mean=float(np.mean([x["same_frac"] for x in agree])) if agree else None,
-                                  jaccard_mean=float(np.mean([x["jaccard_mean"] for x in agree])) if agree else None,
-                                  jaccard_min=float(min(x["jaccard_min"] for x in agree)) if agree else None))
-        work(ctx)
-        restore()
-        self.decode(tok, pos)
-        torch.cuda.synchronize()
+            def restore():
+                snap.restore()
+                self.ss.assert_transients_intact(self.model, self.trans)
+                self.guard.on_restore()
+            ctx = dict(it=it, tok=tok, pos=pos, lg_ref=lg_ref, restore=restore, step_fn=lambda: self.decode(tok, pos), tail_len_max=max(tails),
+                       agreement=dict(same_frac_mean=float(np.mean([x["same_frac"] for x in agree])) if agree else None,
+                                      jaccard_mean=float(np.mean([x["jaccard_mean"] for x in agree])) if agree else None,
+                                      jaccard_min=float(min(x["jaccard_min"] for x in agree)) if agree else None))
+            if self.inject and self.inject.get("after_ref"):             # CONTROLS process only (a destructive perturbation)
+                self.inject["after_ref"](ctx)
+            pre = self.gate_pre(it, lg_ref, ctx)
+            marks = self.row_marks()
+            if pre["ok"]:
+                work(ctx)
+            else:
+                self.log("GATE_FAIL step %d BEFORE timing (%s): %s" % (it, self.golden_mode, pre.get("why")))
+            restore()
+            lg_adv = self.decode(tok, pos)
+            self.sync()
+            post = self.gate_post(it, lg_adv)
+            ok = bool(pre["ok"] and post["ok"])
+            self.stamp_rows(marks, it, ok)
+            self.gate_log.append(dict(step=it, ok=ok, pre=pre, post=post, layout=self.in_layout, work_ran=bool(pre["ok"])))
+            if not ok:
+                if self.golden_mode == "check":
+                    self.gate_fail_steps.append(it)
+                    if self.in_layout:
+                        self.layout_fails += 1
+                    else:
+                        self.fails += 1
+                    if post is not None and not post["ok"]:
+                        self.log("GATE_FAIL step %d AFTER the advance: %s (the step's rows are excluded)" % (it, post.get("why")))
+                elif self.golden_mode == "record":
+                    self.golden_fail.append(it)
+        finally:
+            self.guard.end_step()
+
+    # ---------------------------------------------------------------------------------- the golden gate (cpupack_golden)
+    def state_digest(self, families):
+        return G.state_digest(self.cache, families, R=self.R)
+
+    def start_digest(self):
+        return self.state_digest(G.FAMILIES_START)
+
+    def gate_pre(self, it, lg_ref, ctx):
+        """BEFORE any timing: digests after the flushed reference decode, then the pre-timing resident check (restore ->
+        decode: 0 loads, logits torch.equal the reference). 'record' stores them as the golden; 'check' compares."""
+        rec = dict(step=it, mode=self.golden_mode, ok=True, why=[])
+        if self.golden_mode is None:
+            return rec
+        t = time.time()
+        rec["ref_sha"] = G.sha_parts([lg_ref])
+        rec["pre"] = self.state_digest(G.FAMILIES_PRE)
+        ctx["restore"]()
+        lg = ctx["step_fn"]()
+        self.sync()
+        rec["resident"] = dict(loads=self.loaded_now(), logits_equal=bool(torch.equal(lg, lg_ref)))
+        why = [] if (rec["resident"]["loads"] == 0 and rec["resident"]["logits_equal"]) else \
+            ["resident(loads=%d, logits_equal=%s)" % (rec["resident"]["loads"], rec["resident"]["logits_equal"])]
+        if self.golden_mode == "record":
+            self.golden["steps"].setdefault(it, {}).update(ref_sha=rec["ref_sha"], pre=rec["pre"], resident=rec["resident"])
+        else:
+            g = self.golden["steps"].get(it)
+            if g is None:
+                why.append("no golden record for step %d" % it)
+            else:
+                if g.get("ref_sha") != rec["ref_sha"]:
+                    why.append("ref_logits")
+                why += G.compare(g.get("pre"), rec["pre"])
+        rec["why"], rec["ok"] = why[:64], not why
+        rec["seconds"] = time.time() - t
+        return rec
+
+    def gate_post(self, it, lg_adv):
+        rec = dict(step=it, mode=self.golden_mode, ok=True, why=[])
+        if self.golden_mode is None:
+            return rec
+        t = time.time()
+        rec["adv_sha"] = G.sha_parts([lg_adv])
+        rec["post"] = self.state_digest(G.FAMILIES_POST)
+        why = []
+        if self.golden_mode == "record":
+            self.golden["steps"].setdefault(it, {}).update(adv_sha=rec["adv_sha"], post=rec["post"])
+        else:
+            g = self.golden["steps"].get(it)
+            if g is None:
+                why.append("no golden record for step %d" % it)
+            else:
+                if g.get("adv_sha") != rec["adv_sha"]:
+                    why.append("adv_logits")
+                why += G.compare(g.get("post"), rec["post"])
+        rec["why"], rec["ok"] = why[:64], not why
+        rec["seconds"] = time.time() - t
+        return rec
+
+    def row_marks(self):
+        return (len(self.rows), len(self.layout_rows), len(self.timeline), id(self.correct))
+
+    def stamp_rows(self, marks, it, ok):
+        """Every row a gated step produced carries its gate verdict (TABLE keeps only gate_ok rows)."""
+        for lst, m in ((self.rows, marks[0]), (self.layout_rows, marks[1]), (self.timeline, marks[2])):
+            for r in lst[m:]:
+                r["gate_ok"] = bool(ok)
+                r["gate_step"] = it
+        if self.correct and id(self.correct) != marks[3]:
+            self.correct["gate_ok"] = bool(ok)
+            self.correct["gate_step"] = it
 
     def resident(self, ctx, label=None):
         ctx["restore"]()
@@ -953,16 +1124,17 @@ class Runner:
             nf += int(x["verdict"] in ("NOT_DETECTED", "FAIL", "UNTESTABLE"))
             negs.append(x)
         res["controls"] = negs
-        # decode: zero-load resident step, and the logits negative control (a second step without restore)
+        # decode: the zero-load resident step (restore -> decode: legal, the guard is armed by the restore). The DESTRUCTIVE
+        # logits negative control of job 2179683 (a second decode WITHOUT a restore; its gathers overwrite live window KV
+        # and tail state that the CounterSnapshot does not restore, and gated() then advanced from it) is NOT run in a
+        # measurement process: it runs in the separate CONTROLS process (run_controls), first; a failure there stops the job.
         ctx["restore"]()
         lg1 = ctx["step_fn"]()
-        torch.cuda.synchronize()
+        self.sync()
         res["resident_zero_load"] = self.loaded_now() == 0 and bool(torch.equal(lg1, ctx["lg_ref"]))
-        lg2 = ctx["step_fn"]()
-        torch.cuda.synchronize()
-        res["logits_negative_control"] = "DETECTED" if not torch.equal(lg2, ctx["lg_ref"]) else "NOT_DETECTED"
+        res["logits_negative_control"] = "MOVED_TO_CONTROLS_PROCESS"
         ctx["restore"]()
-        nf += int(not res["resident_zero_load"]) + int(res["logits_negative_control"] != "DETECTED")
+        nf += int(not res["resident_zero_load"])
         res["fails"] = nf
         self.chk = {}
         return nf, res
@@ -978,7 +1150,11 @@ class Runner:
             r.update(step=ps, plan_step=ps, phase="decode_alone_pre", rep=rep, stage="MAIN", agreement=ctx["agreement"])
             nf += int(not r["ok"])
             rows.append(r)
-        for a in arms:
+        order = list(arms)
+        if ARM_ORDER == "alternate" and ps % 2:                          # balance the arms' position inside the step
+            order = order[::-1]
+        self.arm_orders.append(dict(step=ps, order=[a["name"] for a in order]))
+        for a in order:
             nf += self.arm_reps(a, ctx, c, REPS, rows, "MAIN")
         for rep in range(REPS):
             r = self.resident(ctx)
@@ -1055,12 +1231,13 @@ class Runner:
         if lo < VA.L + R * (VA.N // R + 2) or (max_blk + 1) * R > lo:
             return dict(layout=self.host_layout, skipped="rows [%d, %d) not provably unread (L=%d N=%d max planned block %d)"
                         % (lo, self.S_cpu, VA.L, VA.N, max_blk))
-        host_ms, ev_ms, ok = [], [], True
+        host_ms, ev_ms, ok, restored = [], [], True, True
         for e in self.engines:
             t_slot = int(e._tail_block_idx_on_gpu)
             for win, host in ((e._k_gpu, e._k_cpu), (e._v_gpu, e._v_cpu)):
                 src = win[:, t_slot * R:(t_slot + 1) * R]
                 dst = host[:, lo:lo + R]
+                keep = dst.clone()                                       # the confirmation: live host rows are put back below
                 hs, es = [], []
                 for i in range(reps + 1):
                     torch.cuda.synchronize()
@@ -1074,11 +1251,18 @@ class Runner:
                         hs.append(1000 * (time.perf_counter() - t))
                         es.append(e0.elapsed_time(e1))
                 ok &= K.bits_equal(dst.to("cuda"), src)
+                torch.cuda.synchronize()
+                dst.copy_(keep)                                          # no write to live engine state survives the bench
+                restored &= K.bits_equal(dst, keep)
+                del keep
                 host_ms.append(float(np.median(hs)))
                 ev_ms.append(float(np.median(es)))
         roll = float(sum(host_ms))
+        if not restored:
+            self.layout_fails += 1
         return dict(layout=self.host_layout, rows=[lo, self.S_cpu], tensors=len(host_ms), reps=reps, host_ms_per_tensor=host_ms,
-                    event_ms_per_tensor=ev_ms, content_ok=bool(ok), measured_ms_per_rollover=roll, measured_ms_per_token=roll / R,
+                    event_ms_per_tensor=ev_ms, content_ok=bool(ok), host_rows_restored=bool(restored),
+                    measured_ms_per_rollover=roll, measured_ms_per_token=roll / R,
                     accounting=K.tail_write_accounting(self.host_layout, self.B, self.NL, measured_ms_per_tensor=float(np.median(host_ms))),
                     note="the real cache tensors through the engine's own copy_ form; a torch D2H into a non-contiguous host view "
                          "goes through a contiguous temporary (Copy.cu copy_requires_temporaries) in BOTH layouts")
@@ -1335,6 +1519,7 @@ class Runner:
         """LAYOUT isolated from the job's control flow: ANY exception (OOM and pinned-allocation failures included) is a
         layout failure with a note and the traceback; it never reaches main()'s exit-code rule (so it can never discard the
         batch's MAIN or start a B320 rerun)."""
+        self.in_layout = True                                            # a LAYOUT GATE_FAIL is a layout failure
         try:
             self.layout_stage(steps_iter, pos_of)
         except StopIteration:
@@ -1346,6 +1531,7 @@ class Runner:
             self.layout["error"] = traceback.format_exc()[-4000:]
             self.layout["notes"].append("LAYOUT aborted by %s: %s" % (type(e).__name__, str(e)[:300]))
             self.log("LAYOUT aborted by %s (MAIN results are kept): %s" % (type(e).__name__, str(e)[:300]))
+        self.in_layout = False
         self.snap_inventory("after_layout")
         try:
             self.flush_payload(True)
@@ -1444,12 +1630,34 @@ class Runner:
                     main_done=self.main_done, sweep_notes=self.sweep_notes, crash=getattr(self, "crash", None),
                     rows=self.rows, sweep=self.sweep, layout=dict(self.layout, rows=self.layout_rows), timeline=self.timeline,
                     inventory=self.inv_snaps, thread_use=self.thread_use, seconds=time.time() - self.t_start, docs=self.docs,
-                    distinct_books=self.distinct, **self.payload_extra)
+                    distinct_books=self.distinct,
+                    confirm=dict(enabled=CONFIRM, mode=MODE, golden_mode=self.golden_mode, schedule=self.schedule,
+                                 gate=self.gate_log, gate_fail_steps=self.gate_fail_steps, golden_fail=self.golden_fail,
+                                 golden_steps=sorted(self.golden.get("steps", {})), golden_source=self.golden.get("source"),
+                                 restarts=self.restarts, warm=self.warm_log, plans_vs_saved=self.plans_vs_saved,
+                                 golden_cross_process=self.golden_cross, guard=dict(role=self.guard.role, decodes=self.guard.decodes,
+                                                                                   log=self.guard.log[-200:]),
+                                 arm_orders=self.arm_orders, arm_order=ARM_ORDER, layout_placers=LAYOUT_PLACERS,
+                                 saved_plans=SAVED_PLANS_NPZ or None, golden_json=GOLDEN_JSON or None),
+                    gated_labels=([r.get("label") for r in self.timeline if row_keep(r)[0]] if (self.timeline and self.golden_mode) else None),
+                    **self.payload_extra)
 
     def flush_payload(self, partial):
         self.flush_fn(self.payload(partial))
 
     # ---------------------------------------------------------------------------------------------- run
+    def alloc_measure(self):
+        """The plan work rows, the registered memory gate (trigger (b)), the scratch; peak statistics restart here."""
+        self.work = torch.zeros((self.NL, self.W), dtype=torch.int32, device="cuda")
+        need = mem_need_gb(self.B, self.S_dst, self.H, self.D, RING, self.slot, CONTIG_BYTES)
+        free = torch.cuda.mem_get_info()[0] / 1e9
+        self.payload_extra["memory_gate"] = dict(free_gb=free, need_gb=need, margin_gb=MEM_MARGIN_GB)
+        if free < need + MEM_MARGIN_GB:
+            raise MemGate("free HBM %.2f GB < need %.2f + margin %.2f GB" % (free, need, MEM_MARGIN_GB))
+        self.set_scratch("orig")
+        torch.cuda.reset_peak_memory_stats()
+        self.snap_inventory("after_setup")
+
     @torch.inference_mode()
     def run(self):
         from nosi.verify import miss_control as mc
@@ -1477,15 +1685,7 @@ class Runner:
             self.model.has_buffers = False
         else:
             raise SystemExit("no plans: CAPTURE not in CP_STAGES and no CP_PLANS_NPZ")
-        self.work = torch.zeros((self.NL, self.W), dtype=torch.int32, device="cuda")
-        need = mem_need_gb(self.B, self.S_dst, self.H, self.D, RING, self.slot, CONTIG_BYTES)
-        free = torch.cuda.mem_get_info()[0] / 1e9
-        self.payload_extra["memory_gate"] = dict(free_gb=free, need_gb=need, margin_gb=MEM_MARGIN_GB)
-        if free < need + MEM_MARGIN_GB:
-            raise MemGate("free HBM %.2f GB < need %.2f + margin %.2f GB" % (free, need, MEM_MARGIN_GB))
-        self.set_scratch("orig")
-        torch.cuda.reset_peak_memory_stats()
-        self.snap_inventory("after_setup")
+        self.alloc_measure()
         # replay: natural warm steps reproduce the capture (the hygiene gate)
         pos = self.pos0.clone()
         hyg = []
@@ -1505,22 +1705,42 @@ class Runner:
             return RC_HYGIENE
         self.snap = self.ss.CounterSnapshot(self.cache)
         self.trans = self.ss.transient_ids(self.model)
+        return self.measured(pos)
+
+    def plan_schedule(self, stages=None):
+        """(order, layout_steps): the gated steps of CORRECT / MAIN / TIMELINE in order, then the LAYOUT steps (consecutive
+        after the last one; one per (cell, plan step)). The golden pass runs EXACTLY these steps. A GOLDEN-only process
+        (fallback (ii)) records the schedule of the stages it serves (CP_GOLDEN_FOR)."""
+        stages = STAGES if stages is None else tuple(stages)
+        main_steps = [s for s in STEPS if "MAIN" in stages]
+        t_steps = [s for s in T_STEPS if "TIMELINE" in stages]
+        first = min(main_steps + t_steps) if (main_steps or t_steps) else VA.WARM
+        order = sorted(set(main_steps + t_steps + ([first] if "CORRECT" in stages else [])))
+        lay = []
+        if "LAYOUT" in stages:
+            start = (max(order) + 1) if order else VA.WARM
+            n = len(LAYOUT_CELLS_PRE + LAYOUT_CELLS_POST) * len(LAYOUT_PLAN_STEPS)
+            lay = list(range(start, min(start + n, VA.N)))
+        return order, lay
+
+    def measured(self, pos):
+        """The gated steps (CORRECT at the first, MAIN, TIMELINE), SWEEP, the main-done marker, LAYOUT. With a schedule
+        (the confirmation) LAYOUT takes exactly the scheduled steps the golden pass recorded."""
         if EARLY and EARLY.get("launch") is not None:
             CC.set_mask([EARLY["launch"]])                               # the launch thread alone on its core from here on
         max_step = self.masks.shape[0] - 1
         main_steps = [s for s in STEPS if "MAIN" in STAGES]
         t_steps = [s for s in T_STEPS if "TIMELINE" in STAGES]
-        first = min(main_steps + t_steps) if (main_steps or t_steps) else VA.WARM
         arms = main_arms()
         correct_done = "CORRECT" not in STAGES
-        order = sorted(set(main_steps + t_steps + ([first] if not correct_done else [])))
+        order, lay_sched = self.schedule if self.schedule is not None else (self.plan_schedule()[0], None)
         cur = VA.WARM
 
         def advance_to(target, pos):
             nonlocal cur
             while cur < target:                                          # natural steps between gated steps
                 self.decode(self.forced[:, cur:cur + 1], pos)
-                torch.cuda.synchronize()
+                self.sync()
                 pos = pos + 1
                 cur += 1
             return pos
@@ -1573,7 +1793,7 @@ class Runner:
             self.mark_main_done()
             self.log("MAIN done: marker written; nothing after this point can trigger a fallback")
         if "LAYOUT" in STAGES:
-            free_steps = iter(range(cur, VA.N))
+            free_steps = iter(range(cur, VA.N) if lay_sched is None else [s for s in lay_sched if s >= cur])
             pos_box = dict(pos=pos, cur=cur)
 
             def pos_of(target):
@@ -1586,9 +1806,400 @@ class Runner:
         self.flush_payload(False)
         return min(self.fails + self.layout_fails, 19)
 
+    # ---------------------------------------------------------------------------------------------- the confirmation
+    def golden_meta(self):
+        return dict(batch=self.B, L=VA.L, warm=VA.WARM, schedule=self.schedule, tag=TAG, mode=MODE, stages=STAGES,
+                    nosi_commit=os.environ.get("NOSI_COMMIT"), ids_sha=VA.sha(self.ids.to(torch.float32)),
+                    families_pre=G.FAMILIES_PRE, families_post=G.FAMILIES_POST, families_start=G.FAMILIES_START)
+
+    def warm_pass(self, label, ref=None):
+        """The natural warm steps 0..WARM-1 from a (re)started post-prefill state. Checks: load masks and logits (VA.sha)
+        against the plans (when there are plans), and logits sha256 + the FULL state digest (window included) against
+        `ref` (this process's first pass, or the golden export). Returns (pos, records, ok); ok False = the restart proof
+        failed (the caller raises _ProofFail, exit 20)."""
+        pos = self.pos0.clone()
+        recs, ok = [], True
+        store = getattr(self, "store", None)
+        for it in range(VA.WARM):
+            lg = self.decode(self.forced[:, it:it + 1], pos, warmup=(it == 0))
+            self.sync()
+            r = dict(step=it, logits_sha=VA.sha(lg), logits_sha256=G.sha_parts([lg]), digest=self.state_digest(G.FAMILIES_PRE))
+            if store is not None:
+                r["masks_equal_plans"] = all(bool(torch.equal(e._load_mask, store[it, l, 1 + self.HB:].view(self.H, self.B, self.M).to(torch.int64)))
+                                             for l, e in enumerate(self.engines))
+                r["logits_equal_plans"] = r["logits_sha"] == self.logits_sha[it]
+            if ref is not None:
+                rr = next((x for x in ref if int(x["step"]) == it), None)
+                r["mismatch"] = ["<no reference>"] if rr is None else \
+                    (([] if rr.get("logits_sha256") == r["logits_sha256"] else ["logits"]) + G.compare(rr.get("digest"), r["digest"]))
+            r["ok"] = bool(r.get("masks_equal_plans", True) and r.get("logits_equal_plans", True) and not r.get("mismatch"))
+            ok &= r["ok"]
+            recs.append(r)
+            pos = pos + 1
+        self.warm_log.append(dict(label=label, ok=bool(ok), reference=("given" if ref is not None else None),
+                                  steps=[{k: v for k, v in x.items() if k != "digest"} for x in recs]))
+        self.hygiene = dict(steps=[dict(step=x["step"], logits_equal=x.get("logits_equal_plans"), masks_equal=x.get("masks_equal_plans"),
+                                        mismatch=x.get("mismatch")) for x in recs], ok=bool(ok))
+        return pos, recs, bool(ok)
+
+    def gated_sequence(self, pos, work=None):
+        """The scheduled gated steps (natural steps in between), each through gated(); work=None = the golden's no-op."""
+        order, lay = self.schedule
+        cur = VA.WARM
+        for it in list(order) + list(lay):
+            if it >= VA.N:
+                raise RuntimeError("step %d beyond the no-rollover budget" % it)
+            while cur < it:
+                self.decode(self.forced[:, cur:cur + 1], pos)
+                self.sync()
+                pos = pos + 1
+                cur += 1
+            self.gated(it, pos, work or (lambda ctx: None))
+            pos = pos + 1
+            cur = it + 1
+        return pos
+
+    def restart(self, pps, label):
+        """Back to the post-prefill state (the hosted PostPrefillSnapshot) and PROVE it: the start digest must equal the
+        one taken right after prefill (cpupack_golden 'RESTART PROOF'); the model re-warms at the next decode."""
+        self.snap = None                                                 # the CounterSnapshot (~6.4 GB at B336) goes first
+        gc.collect()
+        if self.dev == "cuda":
+            torch.cuda.empty_cache()
+        t = time.time()
+        G.snapshot_restore_hosted(pps)
+        bad = G.compare(self.d0, self.start_digest())
+        self.model.has_buffers = False
+        rec = dict(label=label, ok=not bad, mismatched=bad[:64], seconds=time.time() - t)
+        self.restarts.append(rec)
+        self.log("restart '%s': start digest %s (%.1fs)" % (label, "IDENTICAL" if not bad else "DIFFERS %s" % bad[:6], rec["seconds"]))
+        if bad:
+            raise _ProofFail("restart '%s': the post-prefill restore is not bit-identical (%s)" % (label, bad[:8]))
+        return rec
+
+    @staticmethod
+    def file_sha256(path):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for blk in iter(lambda: f.read(8 << 20), b""):
+                h.update(blk)
+        return h.hexdigest()
+
+    def verify_saved(self, path, fresh=True):
+        """The SAVED 2179683 plans against this process's fresh capture: file sha256 (CP_SAVED_PLANS_SHA256), the
+        per-step plan digests (masks + maps of every layer; the run digest also hashes the meta, whose commit differs),
+        the captured logits (VA.sha), the per-step load counts and the input ids. Any mismatch is a failure."""
+        r = dict(path=path, file_sha256=self.file_sha256(path), expected_sha256=SAVED_PLANS_SHA256 or None, fresh_capture=bool(fresh))
+        r["file_sha_ok"] = (not SAVED_PLANS_SHA256) or r["file_sha256"] == SAVED_PLANS_SHA256
+        z = PL.load_npz(path)                                            # re-verifies the sidecar's run digest
+        r["saved_meta"] = {k: z["meta"].get(k) for k in ("batch", "L", "ncap", "ids_sha", "nosi_commit")}
+        r["ids_sha_fresh"] = VA.sha(self.ids.to(torch.float32))
+        r["ids_equal"] = r["ids_sha_fresh"] == z["meta"].get("ids_sha")
+        ok = r["file_sha_ok"] and r["ids_equal"]
+        if fresh:
+            mine = PL.plan_hashes(self.masks, self.maps)["step_digest"]
+            saved = z["hashes"]["step_digest"]
+            r["steps_fresh"], r["steps_saved"] = len(mine), len(saved)
+            r["step_digest_mismatch"] = [i for i, (a, b) in enumerate(zip(mine, saved)) if a != b][:16]
+            r["logits_sha_equal"] = [str(x) for x in self.logits_sha] == [str(x) for x in z["logits_sha"]]
+            r["step_loaded_equal"] = [int(x) for x in self.step_loaded] == [int(x) for x in z["step_loaded"]]
+            ok = ok and len(mine) == len(saved) and not r["step_digest_mismatch"] and r["logits_sha_equal"] and r["step_loaded_equal"]
+        r["ok"] = bool(ok)
+        return r
+
+    @torch.inference_mode()
+    def run_confirm(self):
+        """The confirmation process (module docstring 'CONFIRMATION'; cpupack_golden.py): plans -> GOLDEN -> MEASURED."""
+        if getattr(self, "mc", None) is None:                         # the CPU tests inject the file-loaded module
+            from nosi.verify import miss_control as mc
+            self.mc = mc
+        self.setup_early()
+        self.setup_model()
+        self.schedule = self.plan_schedule(GOLDEN_FOR if STAGES == ("GOLDEN",) else STAGES)
+        use_snap = not NO_SNAPSHOT and not GOLDEN_JSON
+        pps, ref_warm = None, None
+        if use_snap:
+            try:
+                pps = self.ss.PostPrefillSnapshot(self.cache).take()
+            except torch.cuda.OutOfMemoryError as e:
+                self.restarts.append(dict(label="take", ok=False, error=str(e)[:300]))
+                self.log("PostPrefillSnapshot OOM -> fallback (ii) (exit %d)" % RC_HYGIENE)
+                self.flush_payload(False)
+                return RC_HYGIENE
+            self.d0 = self.start_digest()
+            self.payload_extra["restart_snapshot"] = dict(hosted_bytes=G.snapshot_offload(pps), start_digest_families=G.FAMILIES_START)
+            gc.collect()
+            torch.cuda.empty_cache()
+        # 1. the plans
+        if "CAPTURE" in STAGES:
+            if pps is None:
+                raise SystemExit("CAPTURE in a confirmation process needs the restart snapshot (CP_NO_SNAPSHOT=0, no CP_GOLDEN_JSON)")
+            cap = self.capture(snapshot=False, digest_steps=range(VA.WARM))
+            ref_warm = cap["warm"]
+            self.capture_rec = dict(cap, warm=[{k: v for k, v in x.items() if k != "digest"} for x in cap["warm"]])
+            if not cap["accepted"]:
+                self.log("capture NOT accepted: %s" % json.dumps({k: cap[k] for k in ("invariants", "cross_check_fails", "trace_ok")}))
+                self.fails += 1
+                self.flush_payload(False)
+                return RC_CORRECT
+            if SAVED_PLANS_NPZ:
+                self.plans_vs_saved = self.verify_saved(SAVED_PLANS_NPZ, fresh=True)
+                self.log("fresh capture vs SAVED plans %s: %s" % (SAVED_PLANS_NPZ, "IDENTICAL" if self.plans_vs_saved["ok"] else
+                                                                  json.dumps(self.plans_vs_saved)[:600]))
+                if not self.plans_vs_saved["ok"]:
+                    self.fails += 1
+                    self.flush_payload(False)
+                    return RC_CORRECT
+                self.capture_rec["plans_used"] = self.load_plans(SAVED_PLANS_NPZ)
+            self.restart(pps, "after capture")
+        else:
+            path = SAVED_PLANS_NPZ or PLANS_NPZ
+            if not path:
+                raise SystemExit("no plans: CAPTURE not in CP_STAGES and neither CP_SAVED_PLANS_NPZ nor CP_PLANS_NPZ")
+            if SAVED_PLANS_NPZ:
+                self.plans_vs_saved = self.verify_saved(SAVED_PLANS_NPZ, fresh=False)
+                if not self.plans_vs_saved["ok"]:
+                    self.log("SAVED plans refused: %s" % json.dumps(self.plans_vs_saved)[:600])
+                    self.fails += 1
+                    self.flush_payload(False)
+                    return RC_CORRECT
+            self.capture_rec = self.load_plans(path)
+        self.flush_payload(True)
+        # 2. the golden trajectory
+        if GOLDEN_JSON:
+            self.golden = G.golden_load(GOLDEN_JSON)
+            self.golden["source"] = "cross-process export %s (fallback (ii))" % GOLDEN_JSON
+            ref_warm = self.golden.get("warm")
+        else:
+            self.golden = dict(source="in-process golden pass (option (i))", meta=self.golden_meta(), warm=None, steps={})
+            self.golden_mode = "record"
+            pos, warm, ok = self.warm_pass("golden", ref=ref_warm)
+            if not ok:
+                raise _ProofFail("the golden pass's warm steps differ from the %s" % ("capture" if ref_warm is not None else "plans"))
+            self.golden["warm"] = warm
+            ref_warm = ref_warm if ref_warm is not None else warm
+            self.snap = self.ss.CounterSnapshot(self.cache)
+            self.trans = self.ss.transient_ids(self.model)
+            self.gated_sequence(pos)
+            gpath = os.path.join(OUT, "%s_golden.json" % TAG)
+            G.golden_export(gpath, self.golden)
+            self.payload_extra["golden_export"] = gpath
+            self.log("golden pass: %d gated steps recorded -> %s" % (len(self.golden["steps"]), gpath))
+            if self.golden_fail:
+                self.log("the golden pass's own resident check FAILED at steps %s" % self.golden_fail)
+                self.fails += len(self.golden_fail)
+                self.flush_payload(False)
+                return RC_CORRECT
+            if STAGES == ("GOLDEN",):
+                self.flush_payload(False)
+                return 0
+            if pps is None:
+                raise SystemExit("a measured pass after an in-process golden pass needs the restart snapshot")
+            self.restart(pps, "after golden")
+        if pps is not None:
+            del pps
+            gc.collect()
+            torch.cuda.empty_cache()
+        if XGOLDEN_JSON:
+            try:
+                self.golden_cross = dict(G.golden_cross(self.golden, G.golden_load(XGOLDEN_JSON)), other=XGOLDEN_JSON)
+            except Exception as e:                                       # a determinism record, never a gate
+                self.golden_cross = dict(error=repr(e)[:300], other=XGOLDEN_JSON)
+        # 3. the measured pass
+        self.golden_mode = "check"
+        self.alloc_measure()
+        pos, _, ok = self.warm_pass("measured", ref=ref_warm)
+        if not ok:
+            raise _ProofFail("the measured pass's warm steps differ from the reference pass")
+        self.snap = self.ss.CounterSnapshot(self.cache)
+        self.trans = self.ss.transient_ids(self.model)
+        return self.measured(pos)
+
+    # ------------------------------------------------------------------------------------------- the CONTROLS process
+    def control_specs(self):
+        """The destructive controls (each in its own pass from a proven restart). expect = the required verdict."""
+        NL, s0 = self.NL, CONTROL_STEPS[0]
+        out = [dict(name="clean", kind="clean", expect="PASS", step=s0),
+               dict(name="logits_without_restore", kind="defect2179683", expect="DETECTED", step=s0)]
+        for name, fam, l in (("window_row", "win", 7), ("tail_row", "tail", 11), ("block_map", "map", 3),
+                             ("compression_state", "comp", 20), ("counters", "cnt", 9)):
+            out.append(dict(name=name, kind="perturb", family=fam, layer=l % NL, expect="DETECTED", step=s0))
+        out.append(dict(name="guard_unsanctioned_decode", kind="guard", expect="RAISED_AND_CLEAN", step=s0))
+        return out
+
+    def perturb(self, what, l):
+        """One destructive write to LIVE engine state (CONTROLS only; called inside guard.destructive)."""
+        e, lay = self.engines[l], self.cache.layers[l]
+        t0, tl = int(e._tail_block_idx_on_gpu) * self.R, int(e._tail_block_len_on_gpu)
+        b, h = 1 % self.B, 1 % self.H
+        if what == "window_row":
+            e._k_gpu.view(torch.int16)[0, 5, 0, :8].bitwise_xor_(0x0101)
+            return "layer %d _k_gpu[0, 5, 0, :8] ^= 0x0101 (non-tail slot 0, row 5)" % l
+        if what == "tail_row":
+            e._v_gpu.view(torch.int16)[b, t0 + tl - 1, h, :4].bitwise_xor_(0x0101)
+            return "layer %d _v_gpu[%d, %d, %d, :4] ^= 0x0101 (the valid tail row just written)" % (l, b, t0 + tl - 1, h)
+        if what == "block_map":
+            m = e._block_map
+            x = m[h, b, 0].clone()
+            m[h, b, 0] = m[h, b, 1]
+            m[h, b, 1] = x
+            return "layer %d _block_map[%d, %d, 0] <-> [.., 1]" % (l, h, b)
+        if what == "compression_state":
+            lay.no_compress_k_cache.view(torch.int16)[0, 0, 0, :4].bitwise_xor_(0x0101)
+            return "layer %d no_compress_k_cache[0, 0, 0, :4] ^= 0x0101" % l
+        if what == "counters":
+            e._cache_lens[0] += 1
+            return "layer %d _cache_lens[0] += 1" % l
+        raise ValueError(what)
+
+    def control_pass(self, spec, warm):
+        """One control from a proven restart: warm steps (== the golden pass's), then the scheduled gated steps in CHECK
+        mode with the control injected at spec['step']; the gate log decides the verdict."""
+        name, s0 = spec["name"], spec["step"]
+        self.golden_mode = "check"
+        pos, _, ok = self.warm_pass(name, ref=warm)
+        if not ok:
+            raise _ProofFail("CONTROLS pass %s: the warm steps differ from the golden pass" % name)
+        self.snap = self.ss.CounterSnapshot(self.cache)
+        self.trans = self.ss.transient_ids(self.model)
+        extra, work, role = {}, None, self.guard.role
+        if spec["kind"] == "perturb":
+            def after_ref(ctx):
+                if ctx["it"] == s0:
+                    with self.guard.destructive(name):
+                        extra["perturbed"] = self.perturb(name, spec["layer"])
+            self.inject = dict(after_ref=after_ref)
+        elif spec["kind"] == "defect2179683":
+            def work(ctx):
+                if ctx["it"] != s0:
+                    return
+                ctx["restore"]()
+                lg1 = ctx["step_fn"]()                                   # the legal resident step (2179683's lg1)
+                self.sync()
+                extra["resident_before"] = dict(loads=self.loaded_now(), logits_equal=bool(torch.equal(lg1, ctx["lg_ref"])))
+                with self.guard.destructive(name):
+                    lg2 = self.decode(ctx["tok"], ctx["pos"])          # 2179683 :961: a second decode WITHOUT a restore
+                self.sync()
+                extra["original_control"] = "DETECTED" if not torch.equal(lg2, ctx["lg_ref"]) else "NOT_DETECTED"
+                ctx["restore"]()                                         # 2179683 :964: the CounterSnapshot restore only
+                lg3 = ctx["step_fn"]()                                   # what 2179683's later step-4 rows saw
+                self.sync()
+                extra["after_control"] = dict(loads=self.loaded_now(), logits_equal=bool(torch.equal(lg3, ctx["lg_ref"])))
+        elif spec["kind"] == "guard":
+            self.guard.role = "measure"                                  # exactly a measurement process's guard
+
+            def work(ctx):
+                if ctx["it"] != s0:
+                    return
+                ctx["restore"]()
+                ctx["step_fn"]()
+                self.sync()
+                n0 = self.guard.decodes
+                try:
+                    ctx["step_fn"]()                                     # unsanctioned: no restore since the last decode
+                    extra["raised"] = False
+                except G.UnsanctionedDecode as e:
+                    extra["raised"] = True
+                    extra["message"] = str(e)[:300]
+                extra["decode_ran"] = self.guard.decodes != n0
+                try:
+                    with self.guard.destructive("probe"):
+                        pass
+                    extra["destructive_refused"] = False
+                except G.UnsanctionedDecode:
+                    extra["destructive_refused"] = True
+        start = len(self.gate_log)
+        try:
+            self.gated_sequence(pos, work)
+        finally:
+            self.inject = None
+            self.guard.role = role
+        log = self.gate_log[start:]
+        compact = [dict(step=g["step"], ok=g["ok"], work_ran=g["work_ran"], pre_ok=g["pre"]["ok"], pre_why=g["pre"].get("why"),
+                        post_ok=g["post"]["ok"], post_why=g["post"].get("why")) for g in log]
+        return dict(name=name, step=s0, expect=spec["expect"], family=spec.get("family"), layer=spec.get("layer"),
+                    verdict=self.control_verdict(spec, compact, extra), extra=extra, gate=compact)
+
+    def control_verdict(self, spec, log, extra):
+        by = {g["step"]: g for g in log}
+        s0 = spec["step"]
+        steps = list(self.schedule[0]) + list(self.schedule[1])
+        if spec["kind"] == "clean":
+            return "PASS" if len(log) == len(steps) and all(g["ok"] for g in log) else "FAIL"
+        if spec["kind"] == "perturb":
+            g = by.get(s0)
+            if g is None:
+                return "UNTESTABLE"
+            key = "%s[%d]" % (spec["family"], spec["layer"])
+            return "DETECTED" if (not g["pre_ok"] and not g["work_ran"] and key in (g["pre_why"] or [])) else "NOT_DETECTED"
+        if spec["kind"] == "defect2179683":
+            if extra.get("original_control") != "DETECTED":
+                return "NOT_DETECTED(original control)"
+            ac = extra.get("after_control") or {}
+            if ac.get("loads", 0) == 0 and ac.get("logits_equal", True):
+                return "NO_CORRUPTION"                                   # nothing to detect: the control is vacuous
+            nxt = [s for s in steps if s > s0]
+            g0, g1 = by.get(s0), (by.get(nxt[0]) if nxt else None)
+            caught = (g0 is not None and not g0["post_ok"]) or (g1 is not None and not g1["pre_ok"])
+            return "DETECTED" if caught else "NOT_DETECTED"
+        if spec["kind"] == "guard":
+            good = extra.get("raised") and not extra.get("decode_ran") and extra.get("destructive_refused") and \
+                len(log) == len(steps) and all(g["ok"] for g in log)
+            return "RAISED_AND_CLEAN" if good else "FAIL"
+        return "UNKNOWN"
+
+    @torch.inference_mode()
+    def run_controls(self):
+        """The CONTROLS process (run FIRST by the job; any failure stops the job before measurement): its own setup at a
+        small batch, a golden pass, then every destructive control of control_specs() in its own pass from a PROVEN restart.
+        Nothing here is timed or reported as a measurement."""
+        if getattr(self, "mc", None) is None:                         # the CPU tests inject the file-loaded module
+            from nosi.verify import miss_control as mc
+            self.mc = mc
+        self.setup_min()
+        self.setup_model()
+        self.schedule = (list(CONTROL_STEPS), [])
+        pps = self.ss.PostPrefillSnapshot(self.cache).take()
+        self.d0 = self.start_digest()
+        self.payload_extra["restart_snapshot"] = dict(hosted_bytes=G.snapshot_offload(pps), start_digest_families=G.FAMILIES_START)
+        self.golden = dict(source="CONTROLS in-process golden pass", meta=self.golden_meta(), warm=None, steps={})
+        self.golden_mode = "record"
+        pos, warm, _ = self.warm_pass("golden")
+        self.golden["warm"] = warm
+        self.snap = self.ss.CounterSnapshot(self.cache)
+        self.trans = self.ss.transient_ids(self.model)
+        self.gated_sequence(pos)
+        gpath = os.path.join(OUT, "%s_golden.json" % TAG)
+        G.golden_export(gpath, self.golden)
+        self.payload_extra["golden_export"] = gpath
+        nf = len(self.golden_fail)
+        self.controls_results = []
+        self.payload_extra["controls"] = self.controls_results          # partial results reach every flush
+        for spec in self.control_specs():
+            self.restart(pps, spec["name"])                              # a _ProofFail propagates: exit 20
+            try:
+                r = self.control_pass(spec, warm)
+            except _ProofFail:
+                raise
+            except Exception as e:
+                r = dict(name=spec["name"], expect=spec["expect"], verdict="ERROR", error="%s: %s" % (type(e).__name__, str(e)[:300]),
+                         traceback=traceback.format_exc()[-3000:])
+            r["pass"] = r.get("verdict") == spec["expect"]
+            nf += int(not r["pass"])
+            self.controls_results.append(r)
+            self.log("CONTROL %-26s expect %-16s got %s" % (spec["name"], spec["expect"], r.get("verdict")))
+            self.flush_payload(True)
+        self.fails += nf
+        self.flush_payload(False)
+        return RC_CORRECT if nf else 0
+
 
 class _CorrectFail(Exception):
     pass
+
+
+class _ProofFail(Exception):
+    """The restart proof failed (a restore is not bit-identical, or warm steps differ): exit 20 = fallback (ii)."""
 
 
 class _SnapshotOOM(Exception):
@@ -1600,7 +2211,8 @@ def MODES_DMA(a) -> bool:
 
 
 # ------------------------------------------------------------------------------------------------------------ calib
-def calib():
+@torch.inference_mode()     # job 2179683 defect 2: the staging tensor is made under the coordinator's inference_mode, so
+def calib():                # Pipe.reset()'s zero_ on it (cpupack_core.py:547) must run under inference mode too
     """Node-local CPU calibration (stage C0 of the job, no model): SYNTHETIC Poisson(CP_CALIB_MEAN) plans at the batch
     geometry, the coordinator on 1/2/4/8 team cores, the row packer from the original layout, then the host tensor reordered
     in place to head-major (the one-time conversion, timed: reorder and verification separately; PAGEABLE tensors, so
@@ -1626,7 +2238,8 @@ def calib():
     for n in CORES:
         co.configure(n)
     cap = CHUNK_KB * 1024 // K.useful_bytes(1)
-    stage = co.call(lambda c: torch.zeros((RING, K.slot_bytes(cap)), dtype=torch.uint8).pin_memory())
+    pin = torch.cuda.is_available()                                     # the job: pinned staging; a CPU-only test node cannot pin
+    stage = co.call(lambda c: (lambda t: t.pin_memory() if pin else t)(torch.zeros((RING, K.slot_bytes(cap)), dtype=torch.uint8)))
     land = torch.zeros_like(stage)
     phys_k = K.alloc_phys("orig", B, S, H, D, torch.bfloat16)
     phys_v = K.alloc_phys("orig", B, S, H, D, torch.bfloat16)
@@ -1634,7 +2247,8 @@ def calib():
     phys_v.view(torch.int16).random_(-3000, 3000, generator=g)
     dst = K.alloc_phys("orig", B, 4096, H, D, torch.bfloat16)
     res = dict(label="synthetic plan (Poisson %.2f per stream), node-local pack calibration; pack only (LP)" % mean, B=B, S=S,
-               groups=int((plan[..., :63] >= 0).sum()), placement=EARLY, cpu_model=CC.cpu_model(), rows=[], conversion=None)
+               groups=int((plan[..., :63] >= 0).sum()), placement=EARLY, cpu_model=CC.cpu_model(), rows=[], conversion=None,
+               pinned_staging=bool(pin and stage.is_pinned()), cores=list(CORES), reps_per_row=reps)
 
     def run(layout, packer, n):
         co.configure(n)
@@ -1711,35 +2325,121 @@ def rep_view(r):
     return v
 
 
-def table(out_dir):
-    """Markdown + CSV summaries of every cp_*.json under out_dir (medians / p95 over individual samples).
+TABLE_CSV_FIELDS = ("stage", "cell", "arm", "step", "plan_step", "rep", "mode", "layer", "b", "groups", "chunk", "e2e") + \
+    tuple(TM.CPU_STAGES) + tuple(TM.W8_STAGES)
+PAYLOAD_RE = re.compile(r"^(cp|t|ctl)_b\d+\.json$")
+
+
+def row_keep(r):
+    """(keep, reason) of one row: a row enters a statistic only when its own checks passed (ok is True) AND its gated step
+    passed the golden gate (gate_ok is not False). A row without gate_ok comes from a payload without the gate (job
+    2179683, or a row outside any gated step): kept on ok alone, counted 'ungated'."""
+    if r.get("ok") is not True:
+        return False, "not_ok"
+    if r.get("gate_ok") is False:
+        return False, "gate_fail"
+    return True, ("ungated" if "gate_ok" not in r else "gated")
+
+
+class CsvSink:
+    """The per-request CSV of one batch, streamed through gzip group by group (never held in memory)."""
+
+    def __init__(self, path):
+        self.path, self.n = path, 0
+        self.f = gzip.open(path, "wt", compresslevel=1, newline="")
+        self.w = csv.writer(self.f)
+        self.w.writerow(TABLE_CSV_FIELDS)
+
+    def write(self, samples):
+        for s in samples:
+            self.w.writerow([s.get(k, "") for k in TABLE_CSV_FIELDS])
+        self.n += len(samples)
+
+    def close(self):
+        self.f.close()
+
+
+def exclusion_counts(rows, default_cell="orig>orig"):
+    """{(stage, cell, arm, phase): dict(total, kept, not_ok, gate_fail, ungated)} and the kept rows; decode-alone phases
+    pool as 'decode_alone'."""
+    excl, kept = {}, []
+    for r in rows:
+        ph = r.get("phase") or ""
+        key = (str(r.get("stage")), r.get("cell", default_cell), str(r.get("arm")), "decode_alone" if ph.startswith("decode_alone") else ph)
+        c = excl.setdefault(key, dict(total=0, kept=0, not_ok=0, gate_fail=0, ungated=0))
+        c["total"] += 1
+        k, why = row_keep(r)
+        if k:
+            c["kept"] += 1
+            c["ungated"] += int(why == "ungated")
+            kept.append(r)
+        else:
+            c[why] += 1
+    return excl, kept
+
+
+def gate_summary(p):
+    conf = p.get("confirm") or {}
+    gate = conf.get("gate") or []
+    restarts = conf.get("restarts") or []
+    warm = conf.get("warm") or []
+    pvs = conf.get("plans_vs_saved")
+    xg = conf.get("golden_cross_process")
+    pre_bad = [g["step"] for g in gate if not (g.get("pre") or {}).get("ok", True)]
+    post_bad = [g["step"] for g in gate if not (g.get("post") or {}).get("ok", True)]
+    return dict(enabled=bool(conf.get("enabled") or gate), golden_mode=conf.get("golden_mode"), source=conf.get("golden_source"),
+                steps=len(gate), pre_fail=pre_bad, post_fail=post_bad, bad=sorted(set(pre_bad) | set(post_bad)),
+                restarts_ok=sum(1 for r in restarts if r.get("ok")), restarts=len(restarts),
+                warm_ok=sum(1 for w in warm if w.get("ok")), warm=len(warm),
+                plans_vs_saved=(None if pvs is None else bool(pvs.get("ok"))), cross=(None if not xg else xg.get("equal")))
+
+
+def table(out_dir, csv_requests=None):
+    """Markdown + CSV summaries of every cp_b<B>.json under out_dir (medians / p95 over individual samples), the TIMELINE
+    payloads under ../timeline and the CONTROLS payloads under ../controls (gate and exclusion summaries).
+    ROW FILTER (row_keep): only ok rows of gate-passing steps enter ANY statistic -- decode-alone pools, groups, the drift
+    line, SWEEP cells; every exclusion is reported with its denominator (the 'Exclusions' table and exclusions_b<B>.csv).
     Slowdown = median decode beside / median decode alone AT THE SAME decode step(s) - 1: MAIN and LAYOUT each record their
     own decode-alone reps at every gated step (a group without them prints nan, never a cross-step ratio). Request e2e
-    p50 / p95 are given for the transfer-alone AND the beside-decode reps. Also: the registered low / mid / high tercile
-    cells of the captured per-(step, layer) totals over steps 1.. (SWEEP request e2e by cell; step 0 = the full list) with
-    the zero-miss stream denominator; the LAYOUT (orig, orig) drift against MAIN on the same plan steps (the cell-order
-    confound); the conversion (reorder vs verification) and the tail-write accounting (small buffer + real cache)."""
-    import csv
+    p50 / p95 are given for the transfer-alone AND the beside-decode reps; the per-request samples are STREAMED per group
+    into requests_b<B>.csv.gz (CP_TABLE_CSV=0 skips the file, not the statistics). Also: the registered low / mid / high
+    tercile cells of the captured per-(step, layer) totals over steps 1.. (SWEEP request e2e by cell; step 0 = the full
+    list) with the zero-miss stream denominator; the LAYOUT (orig, orig) drift against MAIN on the same plan steps; the
+    conversion (reorder vs verification) and the tail-write accounting (small buffer + real cache)."""
     import glob
-    L = ["# CPU-packing transport (%s; %s)" % (K.LABEL, K.REPLAY_LABEL), ""]
+    csv_requests = (os.environ.get("CP_TABLE_CSV", "1") == "1") if csv_requests is None else csv_requests
+    t_start = time.time()
+    L = ["# CPU-packing transport (%s; %s)" % (K.LABEL, K.REPLAY_LABEL), "",
+         "Rows enter a statistic only when ok AND their gated step passed the golden gate (row_keep); every exclusion is counted "
+         "with its denominator.", ""]
     ok_all = True
-    for fn in sorted(glob.glob(os.path.join(out_dir, "cp_*.json"))):
+    files = [fn for fn in sorted(glob.glob(os.path.join(out_dir, "cp_*.json"))) if PAYLOAD_RE.match(os.path.basename(fn))]
+    for fn in files:
         with open(fn) as f:
             p = json.load(f)
         B = p.get("batch")
         lay = p.get("layout") or {}
+        gs = gate_summary(p)
         ok = (p.get("fails", 1) == 0 and not p.get("partial") and not p.get("layout_fails") and not lay.get("partial")
-              and not p.get("crash"))
+              and not p.get("crash") and not gs["bad"])
         ok_all &= ok
         L.append("## B=%s (%s): fails %s, layout fails %s%s%s%s%s" % (
             B, os.path.basename(fn), p.get("fails"), p.get("layout_fails"), " PARTIAL" if p.get("partial") else "",
             " LAYOUT-PARTIAL" if lay.get("partial") else "", " CRASH(%s)" % p["crash"].get("kind") if p.get("crash") else "",
             "" if p.get("main_done") in (None, True) else " (MAIN not done)"))
+        if gs["enabled"]:
+            L.append("- golden gate (%s; %s): %d gated steps; GATE_FAIL before timing at %s, after the advance at %s; restarts "
+                     "%d/%d bit-identical; warm passes %d/%d; fresh capture == saved 2179683 plans: %s; golden cross-process equal: %s" % (
+                         gs["golden_mode"], gs["source"], gs["steps"], gs["pre_fail"] or "none", gs["post_fail"] or "none",
+                         gs["restarts_ok"], gs["restarts"], gs["warm_ok"], gs["warm"], gs["plans_vs_saved"], gs["cross"]))
         for n in (p.get("sweep_notes") or []) + ["LAYOUT: " + x for x in lay.get("notes") or []]:
             L.append("- note: %s" % n)
         cap = p.get("capture") or {}
         masks = None
         npz = cap.get("export") or (cap.get("source", "").split(" ")[1] if cap.get("source", "").startswith("export") else None)
+        used = (cap.get("plans_used") or {}).get("source", "")
+        if used.startswith("export"):
+            npz = used.split(" ")[1]
         if npz and os.path.exists(npz):
             masks = PL.load_npz(npz)["masks"]
         req = {}
@@ -1748,49 +2448,66 @@ def table(out_dir):
             if ps not in req and masks is not None and ps is not None and 0 <= ps < masks.shape[0]:
                 req[ps] = [(masks[ps, l][..., :63] >= 0).sum(dim=(0, 2)).tolist() for l in range(masks.shape[1])]
             return req.get(ps)
-        groups = {}
-        alone = {}
-        for r in p.get("rows", []) + lay.get("rows", []):
-            if r.get("phase", "").startswith("decode_alone"):
+        excl, kept = exclusion_counts(p.get("rows", []) + lay.get("rows", []))
+        groups, alone = {}, {}
+        for r in kept:
+            ph = r.get("phase", "")
+            if ph.startswith("decode_alone"):
                 alone.setdefault(r.get("step"), []).append(r["main_ms"])
                 continue
-            if r.get("phase") == "warmup":
+            if ph == "warmup":
                 continue
             groups.setdefault((r.get("stage"), r.get("cell", "orig>orig"), r["arm"]), []).append(r)
-        L += ["", "| stage | cell | arm | reps alone/conc | useful GB/s alone p50 | useful GB/s conc p50 | e2e alone p50 / p95 ms | "
+        L += ["", "| stage | cell | arm | kept reps alone/conc | useful GB/s alone p50 | useful GB/s conc p50 | e2e alone p50 / p95 ms | "
               "e2e conc p50 / p95 ms (requests) | list / wake / desc / pack / submit / dma / scq / scatter p50 ms (conc) | "
-              "decode alone -> conc ms p50 (same steps) | slowdown | late ms p50 | overlap p50 | ok |",
+              "decode alone -> conc ms p50 (same steps; kept decode-alone n) | slowdown | late ms p50 | overlap p50 | excluded alone+conc (not ok / gate) of total |",
               "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
-        csv_rows = []
+        sink = CsvSink(os.path.join(out_dir, "requests_b%s.csv.gz" % B)) if csv_requests else None
         summ = {}
-        for (stage, cellk, a), rs in sorted(groups.items(), key=lambda kv: (str(kv[0][0]), kv[0][1], kv[0][2])):
-            al = [x for x in rs if not x.get("with_decode")]
-            co = [x for x in rs if x.get("with_decode")]
-            agg_a = [TM.rep_aggregate(rep_view(x), x["useful"]) for x in al]
-            agg_c = [TM.rep_aggregate(rep_view(x), x["useful"]) for x in co]
-            s_a, s_c = [], []
-            for mode, xs, dst in (("alone", al, s_a), ("conc", co, s_c)):
-                for x in xs:
-                    rq = req_of(x.get("plan_step"))
-                    if rq is None:
-                        continue
-                    for s_ in request_rows(x, rq):
-                        s_.update(stage=stage, cell=cellk, arm=a, step=x.get("step"), plan_step=x.get("plan_step"), rep=x.get("rep"), mode=mode)
-                        dst.append(s_)
-            csv_rows += s_a + s_c
-            sa = TM.summarize(s_a, ("e2e",))
-            sm = TM.summarize(s_c, ("e2e",) + TM.CPU_STAGES)
-            dec_c = [x["main_ms"] for x in co]
-            dec_a = [m for st in sorted({x.get("step") for x in co}, key=str) for m in alone.get(st, [])]
-            da, dc = TM.pctl(dec_a, 50), TM.pctl(dec_c, 50)
-            slow = 100 * (dc / da - 1) if da == da and da > 0 else float("nan")
-            ga, gc = TM.pctl([g["useful_gbps"] for g in agg_a], 50), TM.pctl([g["useful_gbps"] for g in agg_c], 50)
-            summ[(stage, cellk, a)] = dict(gbps_alone=ga, gbps_conc=gc, slowdown_pct=slow, plan_steps=sorted({x.get("plan_step") for x in rs}, key=str))
-            L.append("| %s | %s | %s | %d/%d | %.2f | %.2f | %.2f / %.2f | %.2f / %.2f | %s | %.2f -> %.2f | %+.1f%% | %.2f | %.2f | %d/%d |" % (
-                stage, cellk, a, len(al), len(co), ga, gc, sa["e2e"]["p50"], sa["e2e"]["p95"], sm["e2e"]["p50"], sm["e2e"]["p95"],
-                " / ".join("%.2f" % sm[k]["p50"] for k in TM.CPU_STAGES), da, dc, slow, TM.pctl([g.get("late_ms") for g in agg_c], 50),
-                TM.pctl([g.get("overlap_frac") for g in agg_c], 50), sum(1 for x in rs if x.get("ok")), len(rs)))
-        # N3: the (orig, orig) LAYOUT pair against MAIN on the same plan steps (the cell-order / time drift)
+        try:
+            for (stage, cellk, a), rs in sorted(groups.items(), key=lambda kv: (str(kv[0][0]), kv[0][1], kv[0][2])):
+                al = [x for x in rs if not x.get("with_decode")]
+                co = [x for x in rs if x.get("with_decode")]
+                agg_a = [TM.rep_aggregate(rep_view(x), x["useful"]) for x in al]
+                agg_c = [TM.rep_aggregate(rep_view(x), x["useful"]) for x in co]
+                e2e_a, conc_vals = [], {k: [] for k in ("e2e",) + tuple(TM.CPU_STAGES)}
+                for mode, xs in (("alone", al), ("conc", co)):
+                    for x in xs:
+                        rq = req_of(x.get("plan_step"))
+                        if rq is None:
+                            continue
+                        smp = request_rows(x, rq)
+                        for s_ in smp:
+                            s_.update(stage=stage, cell=cellk, arm=a, step=x.get("step"), plan_step=x.get("plan_step"), rep=x.get("rep"), mode=mode)
+                            if mode == "alone":
+                                e2e_a.append(s_["e2e"])
+                            else:
+                                for k, v in conc_vals.items():
+                                    if k in s_:
+                                        v.append(s_[k])
+                        if sink is not None:
+                            sink.write(smp)
+                sa = dict(e2e=dict(p50=TM.pctl(e2e_a, 50), p95=TM.pctl(e2e_a, 95)))
+                sm = {k: dict(p50=TM.pctl(v, 50), p95=TM.pctl(v, 95)) for k, v in conc_vals.items()}
+                dec_c = [x["main_ms"] for x in co]
+                dec_a = [m for st in sorted({x.get("step") for x in co}, key=str) for m in alone.get(st, [])]
+                da, dc = TM.pctl(dec_a, 50), TM.pctl(dec_c, 50)
+                slow = 100 * (dc / da - 1) if da == da and da > 0 else float("nan")
+                ga, gc_ = TM.pctl([g["useful_gbps"] for g in agg_a], 50), TM.pctl([g["useful_gbps"] for g in agg_c], 50)
+                summ[(stage, cellk, a)] = dict(gbps_alone=ga, gbps_conc=gc_, slowdown_pct=slow, plan_steps=sorted({x.get("plan_step") for x in rs}, key=str))
+                ex = [excl.get((str(stage), cellk, str(a), ph), {}) for ph in ("alone", "conc")]
+                tot = sum(e.get("total", 0) for e in ex)
+                L.append("| %s | %s | %s | %d/%d | %.2f | %.2f | %.2f / %.2f | %.2f / %.2f | %s | %.2f -> %.2f (n %d) | %+.1f%% | %.2f | %.2f | %d (%d / %d) of %d |" % (
+                    stage, cellk, a, len(al), len(co), ga, gc_, sa["e2e"]["p50"], sa["e2e"]["p95"], sm["e2e"]["p50"], sm["e2e"]["p95"],
+                    " / ".join("%.2f" % sm[k]["p50"] for k in TM.CPU_STAGES), da, dc, len(dec_a), slow, TM.pctl([g.get("late_ms") for g in agg_c], 50),
+                    TM.pctl([g.get("overlap_frac") for g in agg_c], 50), tot - sum(e.get("kept", 0) for e in ex),
+                    sum(e.get("not_ok", 0) for e in ex), sum(e.get("gate_fail", 0) for e in ex), tot))
+        finally:
+            if sink is not None:
+                sink.close()
+        if sink is not None:
+            L.append("- per-request samples: %d rows streamed to %s" % (sink.n, os.path.basename(sink.path)))
+        # N3: the (orig, orig) LAYOUT pair against MAIN on the same plan steps (the cell-order / time drift); kept rows only
         lsteps = set()
         for (stage, cellk, a), v in summ.items():
             if stage == "LAYOUT":
@@ -1807,35 +2524,44 @@ def table(out_dir):
         # the registered cells: terciles of the captured per-(step, layer) totals over steps 1.., the zero-miss denominator
         if masks is not None and masks.shape[0] > 1:
             steady = list(range(1, masks.shape[0]))
-            tot = PL.layer_totals(masks, range(masks.shape[0]))
-            cuts = PL.tercile_cells(tot, steady)
+            tot_ = PL.layer_totals(masks, range(masks.shape[0]))
+            cuts = PL.tercile_cells(tot_, steady)
             cnt = PL.counts_of(masks)[1:]
             zero, streams = int((cnt == 0).sum()), int(cnt.numel())
             L.append("")
             L.append("registered cells: per-(step, layer) load totals over steps 1..%d: low <= %.1f < mid <= %.1f < high (n %d, min %d, max %d); "
                      "zero-miss (layer, head, request) streams %d of %d (%.1f%%) = the separate denominator; step 0 = the full list" % (
                          steady[-1], cuts["lo"], cuts["hi"], cuts["n"], cuts["min"], cuts["max"], zero, streams, 100.0 * zero / max(streams, 1)))
+            sw_excl, sw_kept = exclusion_counts(p.get("sweep", []))
             by = {}
-            for r in p.get("sweep", []):
+            for r in sw_kept:
                 ps = r.get("plan_step")
                 rq = req_of(ps)
                 if rq is None:
                     continue
                 for s_ in request_rows(r, rq):
-                    cn = "full" if ps == 0 else PL.cell_of(tot[(ps, s_["layer"])], cuts)
+                    cn = "full" if ps == 0 else PL.cell_of(tot_[(ps, s_["layer"])], cuts)
                     by.setdefault((r["arm"], cn), []).append(s_["e2e"])
+            excl.update({k: v for k, v in sw_excl.items()})
             if by:
                 L += ["", "| SWEEP arm | cell | requests | e2e alone p50 / p95 ms |", "|---|---|---|---|"]
                 order = {"low": 0, "mid": 1, "high": 2, "full": 3}
                 for (a, cn), xs in sorted(by.items(), key=lambda kv: (kv[0][0], order.get(kv[0][1], 9))):
                     L.append("| %s | %s | %d | %.2f / %.2f |" % (a, cn, len(xs), TM.pctl(xs, 50), TM.pctl(xs, 95)))
-        if csv_rows:
-            keys = sorted({k for s_ in csv_rows for k in s_})
-            with open(os.path.join(out_dir, "requests_b%s.csv" % B), "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=keys)
-                w.writeheader()
-                for s_ in csv_rows:
-                    w.writerow(s_)
+        # every exclusion with its denominator
+        L += ["", "### Exclusions B=%s (rows: total / kept / excluded not ok / excluded GATE_FAIL / kept without a gate)" % B, "",
+              "| stage / cell / arm | phase | total | kept | not ok | GATE_FAIL | kept ungated |", "|---|---|---|---|---|---|---|"]
+        with open(os.path.join(out_dir, "exclusions_b%s.csv" % B), "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(("batch", "stage", "cell", "arm", "phase", "total", "kept", "not_ok", "gate_fail", "ungated"))
+            for k in sorted(excl, key=lambda k: tuple(str(x) for x in k)):
+                c = excl[k]
+                w.writerow((B,) + k + (c["total"], c["kept"], c["not_ok"], c["gate_fail"], c["ungated"]))
+                L.append("| %s / %s / %s | %s | %d | %d | %d | %d | %d |" % (k + (c["total"], c["kept"], c["not_ok"], c["gate_fail"], c["ungated"])))
+        n_tot = sum(c["total"] for c in excl.values())
+        n_kept = sum(c["kept"] for c in excl.values())
+        L.append("- B=%s: %d of %d rows kept; %d excluded (not ok %d, GATE_FAIL %d)" % (
+            B, n_kept, n_tot, n_tot - n_kept, sum(c["not_ok"] for c in excl.values()), sum(c["gate_fail"] for c in excl.values())))
         if lay.get("conversion"):
             cv = lay["conversion"]
             L.append("")
@@ -1855,8 +2581,46 @@ def table(out_dir):
                 L.append("layout_ablation tail write %s (real cache): skipped: %s" % (k, v["skipped"]))
             else:
                 L.append("layout_ablation tail write %s (real cache, %d tensors): %.3f ms per rollover (sum of per-tensor medians), %.4f ms per "
-                         "token amortized; content ok %s" % (k, v["tensors"], v["measured_ms_per_rollover"], v["measured_ms_per_token"], v["content_ok"]))
+                         "token amortized; content ok %s; host rows restored %s" % (k, v["tensors"], v["measured_ms_per_rollover"],
+                                                                                v["measured_ms_per_token"], v["content_ok"], v.get("host_rows_restored")))
         L.append("")
+    # the TIMELINE and CONTROLS payloads of the same job (gate + exclusions; the launch analysis is launch_timeline.py's)
+    root = os.path.dirname(os.path.abspath(out_dir))
+    for sub, pat in (("timeline", "t_*.json"), ("controls", "ctl_*.json")):
+        for fn in sorted(glob.glob(os.path.join(root, sub, pat))):
+            if not PAYLOAD_RE.match(os.path.basename(fn)):
+                continue
+            with open(fn) as f:
+                p = json.load(f)
+            gs = gate_summary(p)
+            ctl = p.get("controls") or []
+            if sub == "controls":                                        # its GATE_FAILs are the intended detections
+                okp = p.get("fails", 1) == 0 and not p.get("crash") and bool(ctl) and all(c.get("pass") for c in ctl)
+            else:
+                okp = p.get("fails", 1) == 0 and not p.get("crash") and not gs["bad"]
+            ok_all &= okp
+            L.append("## %s %s (B=%s): fails %s%s -> %s" % (sub.upper(), os.path.basename(fn), p.get("batch"), p.get("fails"),
+                                                            " CRASH(%s)" % p["crash"].get("kind") if p.get("crash") else "",
+                                                            "PASS" if okp else "FAIL"))
+            if sub == "controls":
+                L.append("- restarts %d/%d bit-identical; warm passes %d/%d (each control runs from a proven restart)" % (
+                    gs["restarts_ok"], gs["restarts"], gs["warm_ok"], gs["warm"]))
+            elif gs["enabled"]:
+                L.append("- golden gate (%s): %d gated steps; GATE_FAIL before timing at %s, after the advance at %s; restarts %d/%d "
+                         "bit-identical; warm passes %d/%d; golden cross-process equal: %s" % (
+                             gs["source"], gs["steps"], gs["pre_fail"] or "none", gs["post_fail"] or "none", gs["restarts_ok"],
+                             gs["restarts"], gs["warm_ok"], gs["warm"], gs["cross"]))
+            if sub == "controls":
+                for c in ctl:
+                    L.append("- control %s: expect %s, got %s -> %s" % (c.get("name"), c.get("expect"), c.get("verdict"),
+                                                                      "PASS" if c.get("pass") else "FAIL"))
+            else:
+                ex, _ = exclusion_counts([dict(r, stage="TIMELINE", cell="-") for r in p.get("timeline", [])])
+                for k in sorted(ex, key=lambda k: tuple(str(x) for x in k)):
+                    c = ex[k]
+                    L.append("- TIMELINE %s %s: kept %d of %d (not ok %d, GATE_FAIL %d)" % (k[2], k[3], c["kept"], c["total"], c["not_ok"], c["gate_fail"]))
+            L.append("")
+    L.append("table built in %.1f s" % (time.time() - t_start))
     text = "\n".join(L) + "\n"
     with open(os.path.join(out_dir, "cpupack_table.md"), "w") as f:
         f.write(text)
@@ -1885,6 +2649,8 @@ def exit_code_for(runner, exc) -> int:
     count). After the marker the batch's MAIN results are final: a failure count 1..19, never 20..24."""
     if getattr(runner, "main_done", False):
         return max(1, min(int(runner.fails) + int(runner.layout_fails) + 1, 19))
+    if isinstance(exc, _ProofFail):                                       # the restart proof (cpupack_golden): fallback (ii)
+        return RC_HYGIENE
     if isinstance(exc, PlacementRefused):
         return RC_PLACEMENT
     if is_memory_trigger(exc):
@@ -1896,7 +2662,7 @@ def main():
     if MODE == "table":
         return table(OUT)
     os.makedirs(OUT, exist_ok=True)
-    why = placement_problem(EARLY)
+    why = placement_problem(EARLY) if MODE != "controls" else None        # CONTROLS packs nothing: no team needed
     if why:                                                              # before the corpus / model load (minutes at B336)
         print("[cpupack] PLACEMENT REFUSED (exit %d): %s; placement %s" % (RC_PLACEMENT, why, json.dumps(EARLY)), flush=True)
         return RC_PLACEMENT
@@ -1917,10 +2683,11 @@ def main():
         os.replace(tmp, fn)
     runner = Runner(model, ids, docs, distinct, flush)
     try:
-        rc = runner.run()
+        rc = runner.run_controls() if MODE == "controls" else (runner.run_confirm() if CONFIRM else runner.run())
     except Exception as e:
         rc = exit_code_for(runner, e)
-        kind = {RC_MEMGATE: "MEMORY FALLBACK TRIGGER", RC_PLACEMENT: "PLACEMENT REFUSED", RC_CRASH: "CRASH"}.get(
+        kind = {RC_MEMGATE: "MEMORY FALLBACK TRIGGER", RC_PLACEMENT: "PLACEMENT REFUSED", RC_CRASH: "CRASH",
+                RC_HYGIENE: "RESTART PROOF FAILED (fallback (ii): a separate golden process)"}.get(
             rc, "FAILURE AFTER MAIN (MAIN results kept, no fallback)")
         if rc == RC_MEMGATE:
             runner.memgate.append(dict(trigger=(str(e) if isinstance(e, MemGate) else "(a) %s" % str(e)[:300])))

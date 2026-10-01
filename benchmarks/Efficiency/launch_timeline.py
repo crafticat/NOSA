@@ -350,8 +350,11 @@ def main(argv) -> int:
     sqls = args[:args.index("--harness")] if "--harness" in args else args
     sqls = [p for pat in sqls for p in sorted(glob.glob(pat))]
     harness = {}
+    gated = None                       # cpupack confirmation: labels of reps that are ok AND passed the golden gate
     for hp in harness_paths:
         h = json.load(open(hp))
+        if h.get("gated_labels") is not None:
+            gated = (gated or set()) | set(h["gated_labels"])
         harness.setdefault("timeline", []).extend(h.get("timeline") or [])
         for k in ("strata",):
             if h.get(k) and not harness.get(k):
@@ -367,8 +370,16 @@ def main(argv) -> int:
                 write_rows("%s.%s.csv" % (out, safe), rec)
                 del rec["_rows"]
             reps.append(rec)
+    gate_filter = None
+    if gated is not None:              # a harness WITHOUT gated_labels (every earlier job) is analysed exactly as before
+        n_reps, n_h = len(reps), len(harness.get("timeline") or [])
+        reps = [r for r in reps if r.get("label") in gated]
+        harness["timeline"] = [h for h in (harness.get("timeline") or []) if h.get("label") in gated]
+        gate_filter = dict(kept_traced_reps=len(reps), of_traced_reps=n_reps, kept_harness_rows=len(harness["timeline"]), of_harness_rows=n_h,
+                           rule="only reps that are ok AND whose gated step passed the golden gate (cpupack_golden)")
     cells = evaluate_cells([r for r in reps if "error" not in r], harness.get("timeline") or [])
-    json.dump(dict(pass_frac=PASS_FRAC, repr_tol=REPR_TOL, reps=reps, cells=cells), open(out + ".json", "w"), indent=1, default=str)
+    json.dump(dict(pass_frac=PASS_FRAC, repr_tol=REPR_TOL, reps=reps, cells=cells, gate_filter=gate_filter), open(out + ".json", "w"),
+              indent=1, default=str)
     keys = ["label", "batch", "arm", "step", "phase", "rep", "warmup", "n_step_ops", "n_submissions", "span_ms", "starved_ms", "starved_lb_ms",
             "starved_frac", "n_starved", "max_starved_us", "max_gap_us", "min_backlog_us", "main_busy_frac", "device_busy_frac", "head_ms",
             "n_main_unattributed", "queued_at_gate", "busy_queued_ms", "submit_end_after_gate_ms", "harness_submit_end_ms", "harness_main_ms", "harness_host_submit_ms",
@@ -381,8 +392,12 @@ def main(argv) -> int:
     L = ["# Launch-correlated timeline of gated steps (stage T)", "",
          "PASS RULE (registered): every traced non-warm-up rep starved <= %.1f%% of the step span AND traced median step within %.0f%% of "
          "the untraced median (else INCONCLUSIVE); the negative control 'alone_late' must fail the rule in every traced rep (DETECTED)."
-         % (100 * PASS_FRAC, 100 * REPR_TOL), "",
-         "| batch | arm | traced reps | verdict | max starved % of span | max starved ms | largest gap us | min backlog us | traced / untraced median ms | grid ok |",
+         % (100 * PASS_FRAC, 100 * REPR_TOL), ""]
+    if gate_filter is not None:
+        L += ["GATE FILTER: %d of %d traced reps and %d of %d harness rows kept (%s)." % (
+            gate_filter["kept_traced_reps"], gate_filter["of_traced_reps"], gate_filter["kept_harness_rows"], gate_filter["of_harness_rows"],
+            gate_filter["rule"]), ""]
+    L += ["| batch | arm | traced reps | verdict | max starved % of span | max starved ms | largest gap us | min backlog us | traced / untraced median ms | grid ok |",
          "|---|---|---|---|---|---|---|---|---|---|"]
     for c in cells:
         L.append("| %s | %s | %d | %s | %.3f%% | %.3f | %.1f | %s | %.2f / %.2f (%+.1f%%) | %s |" % (
