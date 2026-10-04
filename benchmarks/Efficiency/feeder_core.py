@@ -15,8 +15,8 @@ ARMS (identical plans, descriptors, chunk lists, chunk order, bytes, staging and
       and the scatter and publishes the H2D completion handle. Barrier: the producer builds layer l+1's descriptor only
       after the submitter ACKNOWLEDGED the submission of layer l's final chunk (an acknowledgement, not a device drain).
   S2  S1 plus at most ONE next-layer descriptor ahead: after the producer published layer l's final chunk, and after layer
-      l+1's list D2H of THIS repetition completed, it may build layer l+1's descriptor before the acknowledgement; PACKING
-      layer l+1 still waits for the same acknowledgement. Only descriptor construction crosses the S1 barrier. The plan of a
+      l+1's list D2H of THIS repetition completed, it may build layer l+1's descriptor before the acknowledgement; chunk
+      planning and PACKING of layer l+1 still wait for it. Only descriptor construction crosses the S1 barrier. The plan of a
       layer comes from the repetition's own list (no future-query oracle).
 
 OWNERSHIP (explicit slot + generation; SlotTable):
@@ -597,13 +597,13 @@ class SplitRun:
                     ahead = None
                 else:
                     d = self._desc(i, lay, False)
-                chunks = K.chunk_requests(d.req_groups.tolist(), cap)
-                L["nch"][i] = len(chunks)
                 if sp.arm == "S2" and i > 0 and not f.s2_pack_cross:
                     t = now()
-                    self._barrier(i - 1)                                 # S2: PACKING still waits for the same acknowledgement
+                    self._barrier(i - 1)                                 # S2: chunk planning + PACKING still wait for the same ack
                     if full:
                         L["bw0"][i], L["bw1"][i] = t, now()
+                chunks = K.chunk_requests(d.req_groups.tolist(), cap)    # after the barrier in S1 AND S2: only the DESCRIPTOR crosses
+                L["nch"][i] = len(chunks)
                 sk, _ = K.views_for(d, lay.src_k, sp.dst_k, R)
                 sv, _ = K.views_for(d, lay.src_v, sp.dst_v, R)
                 spg, dpg = d.src_per_group, d.dst_per_group

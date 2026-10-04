@@ -29,7 +29,7 @@ PER REPETITION (rep_metrics; useful = K + V bytes of the plan's groups; wire = i
   conservation:      chunks, useful and wire sums (checked against the plan by feeder_core.audit_rep)
   contention:        per role (producer, its OpenMP helpers, submitter) the run-queue WAIT ms, on-CPU ms and involuntary context
                      switches between the drain before the gate and the drain after the repetition (/proc schedstat deltas)
-  beside the decode: decode_ms = tm - t0 [device]; during_useful = useful of chunks whose sc1 <= tm; during_gbps.
+  beside the decode: decode_ms = tm - t0 [device]; during_useful = useful of chunks whose sc1 is in [t0, tm]; during_gbps.
 BLOCK (score_blocks): 3 arms x (transfer-alone, resident-alone, concurrent); COMPLETE when all 9 rows exist, every row ok and
 its gated step passed the golden gate. Only complete blocks are scored. extra_ms = concurrent decode - the paired
 resident-alone decode of the same arm in the same block; slowdown = extra_ms / resident decode.
@@ -116,7 +116,7 @@ def rep_metrics(r: Dict) -> Dict:
     nan = _nan()
     if r.get("with_decode") and r.get("t0") is not None and r.get("tm") is not None:
         t0, tm = r["t0"], r["tm"]
-        dur = sum(int(c.get("useful") or 0) for c, e in zip(chs, evs) if e.get("sc1") is not None and e["sc1"] <= tm)
+        dur = sum(int(c.get("useful") or 0) for c, e in zip(chs, evs) if e.get("sc1") is not None and t0 <= e["sc1"] <= tm)
         out.update(decode_ms=tm - t0, during_useful=dur, during_gbps=_div(dur, (tm - t0) * 1e6))
     sched = r.get("sched") or {}
     if sched:                                                            # runnable-thread contention (schedstat deltas, host)
