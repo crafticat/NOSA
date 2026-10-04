@@ -548,9 +548,13 @@ class Pipe:
         self.land[:, :p0].zero_()
 
     def layer(self, desc: Desc, src_k2d, src_v2d, dst_k2d, dst_v2d, mode: str = "full", faults: Optional[Faults] = None,
-              lite: bool = False, chunks: Optional[List[Tuple[int, int]]] = None) -> List[Dict]:
+              lite: bool = False, chunks: Optional[List[Tuple[int, int]]] = None, host_stamps: bool = False) -> List[Dict]:
         """Run every chunk of one layer. src_*2d / dst_*2d are the (-1, D) row views or (-1, R*D) group views matching
-        desc.packer / desc.placer. Returns one record per chunk (events + host nanoseconds)."""
+        desc.packer / desc.placer. Returns one record per chunk (events + host nanoseconds).
+        host_stamps (feeder diagnostic, default off = the unchanged record): ABSOLUTE perf_counter_ns instants per chunk,
+        fw0/fw1 (staging-slot wait; equal when no wait ran), p0/p1 (pack + index write), sub0 (submission start), cp0/cp1 (the
+        H2D call: entry and return, i.e. AFTER the copy call returns and BEFORE the scatter submission), sc0h/sc1h (scatter
+        submission entry / return). The work, its order and its waits are the same with and without them."""
         f = faults or Faults()
         pack, dma, scat, host_writes = MODES[mode]
         be, R = self.be, self.R
@@ -561,10 +565,14 @@ class Pipe:
             n = g1 - g0
             s = self.k % self.ring
             r = dict(g0=g0, g1=g1, slot=s, bp_ns=0, pack_ns=0, pack_cpu_ns=0, api_ns=0, bytes=0)
+            if host_stamps:
+                r["fw0"] = r["fw1"] = time.perf_counter_ns()
             if host_writes and self.slot_h2d[s] is not None and not f.no_slot_wait:
                 t = time.perf_counter_ns()
                 be.host_wait(self.slot_h2d[s])                  # the H2D that last read this slot has completed
                 r["bp_ns"] = time.perf_counter_ns() - t
+                if host_stamps:
+                    r["fw0"], r["fw1"] = t, t + r["bp_ns"]
             kst, vst, ist, lo, hi = stage_views(self.stage[s], n, desc.packer, desc.placer, self.cap, self.dtype, R, self.D)
             r["bytes"] = hi - lo
             t, tc = time.perf_counter_ns(), time.thread_time_ns()
@@ -576,8 +584,12 @@ class Pipe:
             if host_writes:
                 ist.copy_(desc.dst_idx[g0 * dp:g1 * dp])
             r["pack_ns"], r["pack_cpu_ns"] = time.perf_counter_ns() - t, time.thread_time_ns() - tc
+            if host_stamps:
+                r["p0"], r["p1"] = t, t + r["pack_ns"]
             r["pk"] = None if lite else be.marker()
             t = time.perf_counter_ns()
+            if host_stamps:
+                r["sub0"] = t
             if dma:
                 with be.stream("copy"):
                     if scat and self.slot_sc[s] is not None and not f.no_landing_wait:
@@ -585,11 +597,17 @@ class Pipe:
                     if f.delay_copy_ms > 0 and ci == 0:
                         be.sleep(f.delay_copy_ms, "copy")
                     r["h2d0"] = None if lite else be.event_rec("copy")
+                    if host_stamps:
+                        r["cp0"] = time.perf_counter_ns()
                     be.memcpy(self.land[s][lo:hi], self.stage[s][lo:hi], "copy")
+                    if host_stamps:
+                        r["cp1"] = time.perf_counter_ns()
                     r["h2d1"] = be.event_rec("copy")
                 self.slot_h2d[s] = r["h2d1"]
             if scat:
                 kd, vd, idd, _, _ = stage_views(self.land[s], n, desc.placer, desc.placer, self.cap, self.dtype, R, self.D)
+                if host_stamps:
+                    r["sc0h"] = time.perf_counter_ns()
                 with be.stream("scatter"):
                     if not f.no_h2d_wait:
                         be.stream_wait("scatter", r["h2d1"])    # the scatter reads the landing slot only after its H2D
@@ -601,6 +619,8 @@ class Pipe:
                         be.index_copy(dst_v2d, idd, vd, "scatter")
                     r["sc1"] = be.event_rec("scatter")
                 self.slot_sc[s] = r["sc1"]
+                if host_stamps:
+                    r["sc1h"] = time.perf_counter_ns()
             r["api_ns"] = time.perf_counter_ns() - t
             r["sub"] = None if lite else be.marker()
             self.k += 1
