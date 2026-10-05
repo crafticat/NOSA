@@ -30,6 +30,12 @@ PER REPETITION (rep_metrics; useful = K + V bytes of the plan's groups; wire = i
   contention:        per role (producer, its OpenMP helpers, submitter) the run-queue WAIT ms, on-CPU ms and involuntary context
                      switches between the drain before the gate and the drain after the repetition (/proc schedstat deltas)
   beside the decode: decode_ms = tm - t0 [device]; during_useful = useful of chunks whose sc1 is in [t0, tm]; during_gbps.
+  admission (host clock only; review 2026-10-06): the primary path has NO gate sleep, so the per-repetition job admission /
+                     handoff is no longer hidden before the origin: handoff_submit_ms = jobs handed to the feeder threads -
+                     the gate instant; admission_ms = the first feeder thread running its job - the gate instant;
+                     host_completion_ms = the last feeder thread done - the gate instant; admitted_after_origin must hold.
+                     On the device clock the same delay is inside startup_ms and fullpath_ms (both from the plan-ready
+                     origin); host and device stamps are still never subtracted.
 BLOCK (score_blocks): 3 arms x (transfer-alone, resident-alone, concurrent); COMPLETE when all 9 rows exist, every row ok and
 its gated step passed the golden gate. Only complete blocks are scored. extra_ms = concurrent decode - the paired
 resident-alone decode of the same arm in the same block; slowdown = extra_ms / resident decode.
@@ -118,6 +124,13 @@ def rep_metrics(r: Dict) -> Dict:
         t0, tm = r["t0"], r["tm"]
         dur = sum(int(c.get("useful") or 0) for c, e in zip(chs, evs) if e.get("sc1") is not None and t0 <= e["sc1"] <= tm)
         out.update(decode_ms=tm - t0, during_useful=dur, during_gbps=_div(dur, (tm - t0) * 1e6))
+    adm, tg = r.get("admit") or {}, r.get("t_gate_host")
+    if adm and tg is not None:                                           # job admission / handoff (host clock only; review 2026-10-06)
+        ent = [v[0] for v in adm.values() if v and v[0] is not None]
+        ext = [v[1] for v in adm.values() if v and len(v) > 1 and v[1] is not None]
+        out.update(handoff_submit_ms=((r["t_submit"] - tg) / 1e6 if r.get("t_submit") is not None else nan),
+                   admission_ms=((min(ent) - tg) / 1e6 if ent else nan), host_completion_ms=((max(ext) - tg) / 1e6 if ext else nan),
+                   admitted_after_origin=bool(ent) and min(ent) >= tg and (r.get("t_submit") is None or r["t_submit"] >= tg))
     sched = r.get("sched") or {}
     if sched:                                                            # runnable-thread contention (schedstat deltas, host)
         role = lambda n: "producer" if n == "producer" else ("submitter" if n == "submitter" else ("helper" if n.startswith("helper") else None))
@@ -267,43 +280,106 @@ def _paired(blocks, key, num, den, phase="alone"):
     return xs
 
 
+T4_MIN_LIGHT_PAIRS = 3   # the registered light blocks per batch (orders 012, 120, 201): fewer complete PAIRED light blocks = the
+                          # perturbation is not assessable and no performance verdict is supported (review 2026-10-06)
+
+
+def _complete(blocks, B, kind):
+    return [b for b in blocks if b["complete"] and b["kind"] == kind and int(b["batch"]) == B]
+
+
+def perturbation(blocks: Sequence[Dict], B: int, phase: str = "alone", key: str = "fullpath_gbps") -> Dict:
+    """Target 4, POPULATION-MATCHED: only plan steps present in BOTH the complete full and the complete light blocks of batch
+    B; per step the heavy value = the median over the full blocks of that step and the light value = the median over the
+    light blocks of that step; per arm the statistic = the median over steps of heavy / light (every step weighs the same).
+    material = |statistic - 1| > T4_DIFF for ANY arm. assessable = >= T4_MIN_LIGHT_PAIRS complete light blocks AND a matched
+    step for every arm."""
+    full, light = _complete(blocks, B, "full"), _complete(blocks, B, "light")
+    steps = sorted({b["plan_step"] for b in light} & {b["plan_step"] for b in full})
+    cells = {}
+    for a in ARMS:
+        per = []
+        for st in steps:
+            h = pctl([b["arms"][a][phase].get(key) for b in full if b["plan_step"] == st], 50)
+            l_ = pctl([b["arms"][a][phase].get(key) for b in light if b["plan_step"] == st], 50)
+            r = _div(h, l_)
+            if r == r:
+                per.append(r)
+        d = pctl(per, 50)
+        cells[a] = dict(plan_steps=steps, per_step_heavy_over_light=per, diff=(d - 1 if d == d else d),
+                        heavy_blocks=sum(1 for b in full if b["plan_step"] in steps), light_blocks=len(light),
+                        heavy_median=pctl([b["arms"][a][phase].get(key) for b in full if b["plan_step"] in steps], 50),
+                        light_median=pctl([b["arms"][a][phase].get(key) for b in light], 50),
+                        material=(None if d != d else bool(abs(d - 1) > T4_DIFF)))
+        cells[a]["verdict"] = ("NOT_SCORED" if d != d else ("LIGHT_DEFINES_PERFORMANCE (full trace = mechanism only)" if cells[a]["material"]
+                                                            else "heavy within 5% of light"))
+    assessable = len(light) >= T4_MIN_LIGHT_PAIRS and all(cells[a]["material"] is not None for a in ARMS)
+    return dict(batch=B, phase=phase, key=key, n_light_blocks=len(light), assessable=bool(assessable),
+                material=bool(any(cells[a]["material"] for a in ARMS if cells[a]["material"] is not None)), cells=cells)
+
+
 def targets(blocks: Sequence[Dict]) -> Dict:
-    """The four preregistered diagnostic targets (registration section 'Targets'); only COMPLETE blocks."""
+    """The four preregistered diagnostic targets; only COMPLETE blocks. Review 2026-10-06: target 4 SELECTS the evidence of
+    the headline delivery verdict (T1). If the heavy / light perturbation is assessable and NOT material, T1 is scored on the
+    full blocks; if it is material for ANY arm, T1 is scored on the PAIRED light blocks (the full-block value is kept as an
+    instrumented diagnostic); if it is not assessable (fewer than T4_MIN_LIGHT_PAIRS complete paired light blocks), NO
+    performance verdict is supported. T2 (boundary gaps) and T3 (event occupancy, fullpath / activeDMA) need the full event
+    traces: they are INSTRUMENTED MECHANISM, and T3 never becomes an uninstrumented efficiency claim when the perturbation
+    is material or unassessed. The concurrent perturbation is checked separately (T4 conc)."""
     res = {}
-    full = lambda B: [b for b in blocks if b["complete"] and b["kind"] == "full" and int(b["batch"]) == B]
-    b336, b64 = full(336), full(64)
-    r1 = _paired(b336, "fullpath_gbps", "S1", "S0")
-    m1 = pctl(r1, 50)
-    res["T1"] = dict(name="S1 B336 transfer-alone fullpath delivery / paired S0 >= %.2f" % T1_MIN, n_blocks=len(r1), ratios=r1, median=m1,
-                     ratio_of_medians=_div(pctl([b["arms"]["S1"]["alone"].get("fullpath_gbps") for b in b336], 50),
-                                           pctl([b["arms"]["S0"]["alone"].get("fullpath_gbps") for b in b336], 50)),
-                     verdict=("NOT_SCORED" if not r1 else ("SUPPORTED" if m1 >= T1_MIN else "REFUTED")))
+    b336, b64 = _complete(blocks, 336, "full"), _complete(blocks, 64, "full")
+    l336, l64 = _complete(blocks, 336, "light"), _complete(blocks, 64, "light")
+    pert = {B: perturbation(blocks, B, "alone") for B in sorted({int(b["batch"]) for b in blocks})}
+    pc = {B: perturbation(blocks, B, "conc") for B in sorted({int(b["batch"]) for b in blocks})}
+    p336 = pert.get(336) or dict(assessable=False, material=False)
+
+    def t1_on(bs):
+        r = _paired(bs, "fullpath_gbps", "S1", "S0")
+        m = pctl(r, 50)
+        return dict(n_blocks=len(r), ratios=r, median=m,
+                    ratio_of_medians=_div(pctl([b["arms"]["S1"]["alone"].get("fullpath_gbps") for b in bs], 50),
+                                          pctl([b["arms"]["S0"]["alone"].get("fullpath_gbps") for b in bs], 50)),
+                    verdict=("NOT_SCORED" if not r else ("SUPPORTED" if m >= T1_MIN else "REFUTED")))
+
+    full1, light1 = t1_on(b336), t1_on(l336)
+    if not p336["assessable"]:
+        head = dict(evidence="none", n_blocks=0, median=_nan(),
+                    verdict="NO_SUPPORTED_VERDICT (perturbation not assessable: %d complete paired light blocks < %d)" % (len(l336), T4_MIN_LIGHT_PAIRS))
+    elif p336["material"]:
+        head = dict(evidence="paired light blocks (target 4: the full trace perturbs delivery > %.0f%%)" % (100 * T4_DIFF), **light1)
+    else:
+        head = dict(evidence="full blocks (target 4: heavy within %.0f%% of light)" % (100 * T4_DIFF), **full1)
+    res["T1"] = dict(name="S1 B336 transfer-alone fullpath delivery / paired S0 >= %.2f (HEADLINE, selected evidence)" % T1_MIN,
+                     instrumented_full_blocks=dict(label="instrumented diagnostic (full trace)", **full1), light_blocks=light1, **head)
     r2 = _paired(b64, "boundary_ms", "S2", "S1")
     m2 = pctl(r2, 50)
-    res["T2"] = dict(name="S2 B64 transfer-alone boundary-gap time / S1 <= %.2f" % T2_MAX, n_blocks=len(r2), ratios=r2, median=m2,
-                     undefined_blocks=len(b64) - len(r2),
-                     delivery_gbps=dict((a, pctl([b["arms"][a]["alone"].get("fullpath_gbps") for b in b64], 50)) for a in ARMS),
-                     verdict=("NOT_SCORED" if not r2 else ("SUPPORTED" if m2 <= T2_MAX else "REFUTED")))
+    p64 = pert.get(64) or dict(assessable=False, material=False)
+    res["T2"] = dict(name="S2 B64 transfer-alone boundary-gap time / S1 <= %.2f (INSTRUMENTED MECHANISM: full event traces)" % T2_MAX,
+                     n_blocks=len(r2), ratios=r2, median=m2, undefined_blocks=len(b64) - len(r2),
+                     delivery_gbps_full_blocks=dict((a, pctl([b["arms"][a]["alone"].get("fullpath_gbps") for b in b64], 50)) for a in ARMS),
+                     delivery_gbps_light_blocks=dict((a, pctl([b["arms"][a]["alone"].get("fullpath_gbps") for b in l64], 50)) for a in ARMS),
+                     delivery_evidence=("light blocks" if p64["assessable"] and p64["material"] else "full blocks" if p64["assessable"] else "unassessed"),
+                     verdict=("NOT_SCORED" if not r2 else ("SUPPORTED" if m2 <= T2_MAX else "REFUTED") + " (instrumented mechanism)"))
     occ = pctl([b["arms"]["S2"]["alone"].get("occupancy") for b in b336], 50)
     pva = pctl([b["arms"]["S2"]["alone"].get("path_vs_active") for b in b336], 50)
     miss = ([] if occ >= T3_OCC else ["occupancy %.3f < %.2f" % (occ, T3_OCC)]) + ([] if pva >= T3_PATH else ["fullpath / activeDMA %.3f < %.2f" % (pva, T3_PATH)])
-    res["T3"] = dict(name="S2 B336: DMA event occupancy >= %.2f AND fullpath >= %.2f x own activeDMA useful rate" % (T3_OCC, T3_PATH),
-                     n_blocks=len(b336), occupancy_median=occ, path_vs_active_median=pva,
-                     verdict=("NOT_SCORED" if not b336 else ("SHOWN" if not miss else "NOT_SHOWN: preparation not shown almost hidden (%s)" % "; ".join(miss))))
-    t4 = {}
-    for B in sorted({int(b["batch"]) for b in blocks}):
-        light = [b for b in blocks if b["complete"] and b["kind"] == "light" and int(b["batch"]) == B]
-        lsteps = {b["plan_step"] for b in light}
-        heavy = [b for b in blocks if b["complete"] and b["kind"] == "full" and int(b["batch"]) == B and b["plan_step"] in lsteps]
+    raw3 = "NOT_SCORED" if not b336 else ("SHOWN" if not miss else "NOT_SHOWN: preparation not shown almost hidden (%s)" % "; ".join(miss))
+    if b336 and (p336["material"] or not p336["assessable"]):
+        v3 = "MECHANISM_ONLY (instrumented trace says %s; NOT an efficiency claim: target 4 %s)" % (
+            raw3, "perturbation material" if p336["assessable"] else "not assessable")
+    else:
+        v3 = raw3
+    res["T3"] = dict(name="S2 B336: DMA event occupancy >= %.2f AND fullpath >= %.2f x own activeDMA useful rate (INSTRUMENTED: full event traces)"
+                     % (T3_OCC, T3_PATH), n_blocks=len(b336), occupancy_median=occ, path_vs_active_median=pva, instrumented_verdict=raw3, verdict=v3)
+    cells = {}
+    for B, p in pert.items():
         for a in ARMS:
-            h = pctl([b["arms"][a]["alone"].get("fullpath_gbps") for b in heavy], 50)
-            l_ = pctl([b["arms"][a]["alone"].get("fullpath_gbps") for b in light], 50)
-            d = _div(h, l_)
-            t4["b%d_%s" % (B, a)] = dict(heavy_median=h, light_median=l_, heavy_blocks=len(heavy), light_blocks=len(light), plan_steps=sorted(lsteps),
-                                         diff=(d - 1 if d == d else d),
-                                         verdict=("NOT_SCORED" if d != d else ("LIGHT_DEFINES_PERFORMANCE (full trace = mechanism only)"
-                                                                               if abs(d - 1) > T4_DIFF else "heavy within 5% of light")))
-    res["T4"] = dict(name="heavy / light median fullpath difference > %.0f%% -> light defines performance" % (100 * T4_DIFF), cells=t4)
+            cells["b%d_%s" % (B, a)] = p["cells"][a]
+    res["T4"] = dict(name="heavy / light median fullpath difference > %.0f%% (population-matched plan steps) -> light defines performance"
+                     % (100 * T4_DIFF), cells=cells, alone=pert, conc=pc,
+                     conc_slowdown=dict(("b%d_%s" % (B, a), dict(heavy=pctl([b["arms"][a].get("slowdown") for b in _complete(blocks, B, "full")], 50),
+                                                                light=pctl([b["arms"][a].get("slowdown") for b in _complete(blocks, B, "light")], 50)))
+                                        for B in pert for a in ARMS))
     return res
 
 
@@ -376,15 +452,24 @@ def render(res: Dict) -> str:
          "", "Raw files: %s; bracket rows %d; truncated lines %d. Only COMPLETE paired blocks are scored; every row is kept in the raw files."
          % (", ".join(os.path.basename(p) for p in res["paths"]), res["rows"], res["truncated_lines"]), ""]
     t = res["targets"]
-    L += ["## Preregistered diagnostic targets (not promises)", ""]
-    for k in ("T1", "T2", "T3"):
+    t1 = t["T1"]
+    L += ["## Headline delivery verdict (evidence selected by target 4; not a promise)", "",
+          "- T1 %s: **%s** (evidence: %s; blocks %s; median S1 / S0 %s)" % (t1["name"], t1["verdict"], t1["evidence"], t1.get("n_blocks"), _f(t1.get("median"))),
+          "", "## Target 4: heavy / light perturbation (population-matched plan steps; selects the evidence above)", ""]
+    for ph in ("alone", "conc"):
+        for B, p in sorted(t["T4"][ph].items()):
+            L.append("- B%d %s: assessable %s (light blocks %d), material %s" % (B, ph, p["assessable"], p["n_light_blocks"], p["material"]))
+            for a in ARMS:
+                x = p["cells"][a]
+                L.append("  - %s: heavy %s vs light %s GB/s; per-step heavy / light median - 1 = %s (steps %s; %d / %d blocks) -> %s" % (
+                    a, _f(x["heavy_median"]), _f(x["light_median"]), _f(x["diff"]), x["plan_steps"], x["heavy_blocks"], x["light_blocks"], x["verdict"]))
+    L += ["", "## Instrumented mechanism (full event traces; not performance evidence when target 4 is material or unassessed)", "",
+          "- T1 on the full blocks (instrumented diagnostic): %s (blocks %s; median %s)" % (
+              t1["instrumented_full_blocks"]["verdict"], t1["instrumented_full_blocks"]["n_blocks"], _f(t1["instrumented_full_blocks"]["median"]))]
+    for k in ("T2", "T3"):
         x = t[k]
         L.append("- %s %s: %s (blocks %s; median %s)" % (k, x["name"], x["verdict"], x.get("n_blocks"),
                                                          _f(x.get("median", x.get("occupancy_median")))))
-    L.append("- T4 %s:" % t["T4"]["name"])
-    for c, x in sorted(t["T4"]["cells"].items()):
-        L.append("  - %s: heavy %s vs light %s GB/s (diff %s; %d / %d blocks) -> %s" % (c, _f(x["heavy_median"]), _f(x["light_median"]), _f(x["diff"]),
-                                                                              x["heavy_blocks"], x["light_blocks"], x["verdict"]))
     L += ["", "## Per-batch summaries (linear p50 / p95 over complete blocks; hardware repetitions, not independent workloads)", ""]
     for s in res["summaries"]:
         if not s["n_blocks"]:
@@ -449,10 +534,15 @@ def rec_value(key: str, B: int) -> float:
     return tab["b336"] if key == "load_s" else tab["b336"] * B / 336.0
 
 
+RECORDED_GATE_SLEEP_S = 0.050   # every 2179735 MAIN bracket contained the 50 ms gate sleep (CP_SLEEP_MS=50); the feeder's
+                                # primary path has none (review 2026-10-06), so it is removed from the bracket estimate
+
+
 def bracket_s(B: int) -> float:
-    """Wall seconds of one transfer bracket incl. its checks (2179735 MAIN: 62 brackets in 19.0 s at B336 / 7.0 s at B64 ->
-    0.31 / 0.11 s; +25 % for the feeder's stamps, the whole-scratch fingerprint and the raw stream)."""
-    return 1.25 * rec_value("main_step_s", B) / 62.0
+    """Wall seconds of one transfer bracket incl. its checks: 2179735 MAIN = 62 brackets in 19.0 s at B336 / 7.0 s at B64
+    (0.306 / 0.113 s, each incl. a 50 ms gate sleep); minus that sleep; +25 % for the feeder's stamps, the whole-scratch
+    fingerprint and the raw stream -> 0.321 / 0.079 s."""
+    return 1.25 * (rec_value("main_step_s", B) / 62.0 - RECORDED_GATE_SLEEP_S)
 
 
 def batch_budget(B: int, n_full: int = 12, n_light: int = 3, warm_per_arm: int = 3, first: bool = True) -> Dict:

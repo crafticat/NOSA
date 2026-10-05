@@ -114,6 +114,16 @@ class _CorrectFail(Exception):
     pass
 
 
+class _FailFast(Exception):
+    """A correctness failure of a MEASUREMENT row (payload / list / ownership / audit / resident decode) or a failed golden
+    gate: the row is already streamed; the run stops all later timing and later batches (review 2026-10-06)."""
+    pass
+
+
+FAILFAST_CLASSES = ("CORRECTNESS", "FAILED_CHECKS", "RESTART_PROOF")     # a batch ending so stops every later batch (main)
+MEASURED_PHASES = ("warmup", "alone", "resident", "conc")
+
+
 def snapshot_bytes(snap) -> int:
     """Bytes the CounterSnapshot restore copies (every saved tensor of every layer): the restoration traffic."""
     tot = 0
@@ -161,18 +171,34 @@ class FeederRunner(CT.Runner):
             return None
         return (e.t_ns - gate.t_ns) / 1e6
 
+    def gate_sleep_ms(self):
+        """The gate sleep. PRIMARY NO-SLEEP RULE (review 2026-10-06): 0 in every measurement process, so the per-repetition
+        job admission / handoff is not hidden before the measurement origin; a nonzero CP_SLEEP_MS there is REFUSED. Only the
+        isolated CONTROLS process (allow_faults) may keep a gate sleep."""
+        ms = float(CT.SLEEP_MS)
+        if not self.allow_faults:
+            if ms != 0.0:
+                raise RuntimeError("primary no-sleep rule: CP_SLEEP_MS=%g in a measurement process (must be 0)" % ms)
+            return 0.0
+        return ms
+
     def gate_open(self):
-        """GPU: drain, the aux-marker lag, then the 50 ms sleep and the gate on the decode stream (cpupack_transport bracket,
-        unchanged); CPU: a completed marker."""
+        """Drain, the aux-marker lag, then the gate event on the decode stream = the common origin of the repetition. NO
+        sleep kernel in a measurement process (gate_sleep_ms); the feeder jobs are handed over AFTER the gate (fbracket), so
+        their admission is counted from the plan-ready origin. CPU: a completed marker."""
+        ms = self.gate_sleep_ms()
         if self.dev != "cuda":
+            if ms:
+                self.be_main.sleep(ms, "main")                          # CONTROLS only
             return self.be_main.marker(), 0.0
         torch.cuda.synchronize()
         t = time.perf_counter()
         self.bev["lag"].record(self.aux)
         self.bev["lag"].synchronize()
         lag = (time.perf_counter() - t) * 1e6
-        self.be_main.event_rec("main")                                  # pre
-        torch.cuda._sleep(self.sleep_cycles)
+        if ms:                                                           # CONTROLS only (allow_faults)
+            self.be_main.event_rec("main")                              # pre
+            torch.cuda._sleep(int(ms * 1e-3 * 1.41e9))
         return self.be_main.event_rec("main"), lag
 
     # ------------------------------------------------------------------------------------------- setup
@@ -388,6 +414,7 @@ class FeederRunner(CT.Runner):
         tids = self.feeder_tids()
         s_before = FC.sched_snapshot(tids)
         self.sync()
+        t_start = time.perf_counter_ns()
         gate, lag_us = self.gate_open()
         t_gate_host = time.perf_counter_ns()
         evp, evl = [None] * len(L), [None] * len(L)
@@ -403,12 +430,22 @@ class FeederRunner(CT.Runner):
                     be.memcpy(self.plan_h[l], self.work[l], "plan")
                     evl[j] = be.event_rec("plan")
                     spec.layers[j].list_ev = evl[j]
-        jobs = []
+        jobs, admit = [], {}
+
+        def admitted(role, fn):                                          # host stamps of the job's own thread: admission, completion
+            def job(w):
+                admit[role] = [time.perf_counter_ns(), None]
+                try:
+                    return fn(w)
+                finally:
+                    admit[role][1] = time.perf_counter_ns()
+            return job
+        t_submit = time.perf_counter_ns()                               # the handoff starts AFTER the gate (no-sleep rule)
         if arm == "S0":
-            jobs.append(self.coord.submit(lambda co: FC.run_s0(spec, self.cbe, pipe, self.wait_ev)))
+            jobs.append(self.coord.submit(admitted("coordinator", lambda co: FC.run_s0(spec, self.cbe, pipe, self.wait_ev))))
         elif run is not None:
-            jobs.append(self.coord.submit(lambda co: run.produce(co)))
-            jobs.append(self.sub.submit(lambda w: run.submit(w)))
+            jobs.append(self.coord.submit(admitted("producer", lambda co: run.produce(co))))
+            jobs.append(self.sub.submit(admitted("submitter", lambda w: run.submit(w))))
         t_go = time.perf_counter_ns()
         t0 = be.event_rec("main")
         out, dec_ns = None, None
@@ -427,12 +464,15 @@ class FeederRunner(CT.Runner):
             j.done.wait()
             if j.error and err is None:
                 err = j.error
+        t_join = time.perf_counter_ns()
         self.sync()
         s_after = FC.sched_snapshot(tids)
         ms = lambda e: self.ev_ms(gate, e)
         r = dict(type="bracket", bracket=arm, arm=arm, full=bool(full), with_decode=bool(with_decode), nonce=nonce, layers=L, cap=cap,
                  lag_us=round(lag_us, 2), pr=[ms(e) for e in evp] if spec is not None else [], list=[ms(e) for e in evl] if spec is not None else [],
-                 t0=ms(t0), tm=ms(tm), t_gate_host=t_gate_host, t_go=t_go, decode_host_ns=dec_ns, sched=FC.sched_delta(s_before, s_after),
+                 t0=ms(t0), tm=ms(tm), t_start=t_start, t_gate_host=t_gate_host, t_submit=t_submit, t_go=t_go, t_join=t_join,
+                 admit={k: list(v) for k, v in admit.items()}, gate_sleep_ms=self.gate_sleep_ms(),
+                 decode_host_ns=dec_ns, sched=FC.sched_delta(s_before, s_after),
                  error=err, list_bytes=(4 * self.W * len(L) if spec is not None else 0),
                  list_padding_bytes=(4 * sum(self.HB * self.M - int((c["cpu"][l][1 + self.HB:] >= 0).sum()) for l in L) if spec is not None else 0))
         if spec is not None and err is None:
@@ -475,6 +515,13 @@ class FeederRunner(CT.Runner):
                 r["fp_ok"] = got == tuple(fp_ref)
                 if not r["fp_ok"]:
                     why.append("whole-scratch fingerprint")
+            adm = r.get("admit") or {}
+            r["admitted_after_origin"] = bool(adm) and r.get("t_submit", -1) >= r.get("t_gate_host", 0) and all(
+                v[0] is not None and v[0] >= r["t_gate_host"] for v in adm.values())
+            if not r["admitted_after_origin"]:
+                why.append("handoff before the measurement origin")
+            if r.get("gate_sleep_ms") and not self.allow_faults:
+                why.append("gate sleep in a measurement process")
             rec = r.get("rec")
             exp_chunks = [x for x in c["chunks"] if x[0] in set(layers)]
             if rec is None:
@@ -520,7 +567,9 @@ class FeederRunner(CT.Runner):
         if not r.get("ok"):
             self.fd["rows_not_ok"] += 1
             self.fails += 1
-        self.emit(r)
+        self.emit(r)                                                     # the bad row is streamed BEFORE the stop
+        if not r.get("ok") and phase in MEASURED_PHASES:
+            raise _FailFast("%s %s block %s %s/%s: %s" % (x["kind"], x["gated_step"], x["block"], arm, phase, "; ".join(r.get("why") or ["not ok"])))
         return r
 
     # ------------------------------------------------------------------------------------------- CORRECT + warm-ups
@@ -643,9 +692,14 @@ class FeederRunner(CT.Runner):
                 self.emit(dict(type="gate", gated_step=it, ok=False, why="CORRECT failed"))
                 self.flush_payload(False)
                 return RC_CORRECT
+            except _FailFast as e:
+                return self.fail_fast(idx, x, it, "row: %s" % e)
             g = self.gate_log[-1]
             self.emit(dict(type="gate", gated_step=it, kind=x["kind"], block=x["block"], ok=bool(g["ok"]), pre_ok=bool(g["pre"]["ok"]),
                            post_ok=bool(g["post"]["ok"]), work_ran=bool(g["work_ran"]), pre_why=g["pre"].get("why"), post_why=g["post"].get("why")))
+            if not g["ok"]:
+                return self.fail_fast(idx + 1, x, it, "golden gate (pre %s: %s; post %s: %s)" % (
+                    g["pre"]["ok"], g["pre"].get("why"), g["post"]["ok"] if g["post"] else None, (g["post"] or {}).get("why")), streamed=True)
             pos = pos + 1
             cur = it + 1
             dt = time.time() - t
@@ -658,6 +712,28 @@ class FeederRunner(CT.Runner):
         self.snap_inventory("after_measure")
         self.flush_payload(False)
         return min(self.fails, 19)
+
+    def fail_fast(self, idx, x, it, why, streamed=False):
+        """Stop on a correctness failure: drain, stream the failed gated step and the stop record, mark the failed block and
+        every later schedule entry INCOMPLETE ('FAIL-FAST'), flush; no later bracket runs. Completed blocks stay as streamed."""
+        try:
+            self.sync()                                                   # the bracket already joined its feeder threads
+        finally:
+            if not streamed:
+                self.emit(dict(type="gate", gated_step=it, kind=x["kind"], block=x["block"], ok=False, work_ran=True,
+                               why="FAIL-FAST: work aborted (%s)" % why))
+            self.fd["failfast"] = dict(gated_step=it, kind=x["kind"], block=x["block"], why=why)
+            self.emit(dict(type="failfast", gated_step=it, kind=x["kind"], block=x["block"], why=why))
+            if streamed:                                                  # the gate record of a failed golden gate is already streamed
+                self.fd["incomplete"].append(dict(kind=x["kind"], block=x["block"], gated_step=it, order=x["order"], why="FAIL-FAST: " + why))
+            for y in self.sched[idx:]:
+                self.fd["incomplete"].append(dict(kind=y["kind"], block=y["block"], gated_step=y["gated_step"], order=y["order"],
+                                                  why="FAIL-FAST: %s" % why))
+            self.fd["partial"] = True
+            self.fails = max(self.fails, 1)
+            self.log("FAIL-FAST at gated step %d (%s): %s; no later timing" % (it, x["kind"], why))
+            self.flush_payload(False)
+        return RC_CORRECT
 
     # ------------------------------------------------------------------------------------------- the batch
     def load_plans(self, path):
@@ -1011,6 +1087,9 @@ def main():
             print("[feeder] CONTROLS crashed: %s: %s" % (type(e).__name__, str(e)[:400]), flush=True)
             traceback.print_exc()
             return RC_CRASH
+    if float(CT.SLEEP_MS) != 0.0:                                        # primary no-sleep rule, before any setup (review 2026-10-06)
+        print("[feeder] REFUSED: CP_SLEEP_MS=%g in the measurement process (the primary path has no gate sleep)" % CT.SLEEP_MS, flush=True)
+        return 3
     VA.check_budget()
     path = os.environ["NOSI_MODEL_PATH"]
     todo = list(BATCHES)
@@ -1071,6 +1150,12 @@ def main():
         print("[feeder] B=%d done rc=%d class=%s (%.0f s); after teardown %.2f GB allocated (leak %.2f GB)" % (
             B, rc, cls, res["seconds"], td["allocated_gb"], td["leaked_gb"]), flush=True)
         total += rc if rc < 20 else 1
+        if cls in FAILFAST_CLASSES:                                      # fail-fast: no later batch (review 2026-10-06)
+            for B2 in todo[i:]:
+                write_result("fd_b%d" % B2, dict(batch=B2, tag="fd_b%d" % B2, rc=1, after=B, **{"class": "NOT_RUN_FAILFAST"}))
+                total += 1
+            print("[feeder] FAIL-FAST after B=%d (%s): later batches %s NOT RUN" % (B, cls, todo[i:]), flush=True)
+            return min(total, 19)
         if rc == RC_MEMGATE and not timing_started and B in FALLBACK:
             fb = FALLBACK[B]
             print("[feeder] B=%d CAPACITY STOP before any timing -> the registered common fallback B=%d (ALL arms), if it fits the deadline"
