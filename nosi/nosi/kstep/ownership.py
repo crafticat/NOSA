@@ -5,18 +5,25 @@ STATES of a physical slot (one block per slot; ONE slot per resident block, K3):
   INFLIGHT    destination of a transfer; never reassigned while in flight (T3)
   LRU         resident, a member of the stream's logical LRU (capacity C, K1)
   PO          protected-only: evicted from the LRU while protected; keeps its slot (K3)
+  VRES        verifier resident (repair 1, R2.4): the arrival of a transfer whose demand set is {verify} only; resident,
+              OUTSIDE the LRU, protected (K2); released when its last reference is dropped (R1)
   RELEASING   left every role; becomes FREE when its LAST reader event has completed (host poll, K4)
-Physical slots in use per stream = |LRU| + |PO| + |INFLIGHT| (K3); RELEASING slots are reported separately.
+Physical slots in use per stream = |LRU| + |PO| + |VRES| + |INFLIGHT| (K3); RELEASING slots are reported separately.
 
-K1  recency: Stream.touch() moves a read LRU entry to MRU; the dispatcher calls it in the fixed order of a joint call
-    (verifier rows: cohort order, then position order; then the draft row). A fetched block enters the LRU when its
-    arrival is observed (Stream.admit at the host poll), at MRU, evicting the least recent entry. The recency rule is the
-    HitProtectedLRU twin's (retroinfer-eval hisparse-native-eval d7e3149 scripts/hisparse_native/reproduce.py:55-76: hits
-    to MRU, misses before hits) extended across calls; HiSparse @87db743 hisparse.cuh:640-672 is the upstream rule.
+K1  (amended by repair 1, R2: the logical LRU is DRAFT-ONLY.) Recency changes only on draft events: (a) a draft row's
+    read of an LRU entry moves it to MRU (Stream.touch); (b) the arrival of a transfer whose demand set contains
+    "draft" enters the LRU at MRU (Stream.admit at the host poll); (c) a draft row's read of a resident non-LRU entry
+    (PO or VRES) enters the LRU at MRU (Stream.acquire: "draft acquisition", no transfer, no new slot). After (b) and
+    (c) the least recent entry leaves when the LRU holds more than C entries (protected: PO, else released through the
+    reader gate). Verifier reads never touch the LRU (R2.2). The recency rule is the HitProtectedLRU twin's
+    (retroinfer-eval hisparse-native-eval d7e3149 scripts/hisparse_native/reproduce.py:55-76: hits to MRU) extended
+    across calls; HiSparse @87db743 hisparse.cuh:640-672 is the upstream rule.
 K2  protection is a per-(block, cohort) reference of the stream (the block's single slot carries it, K3). A block may be
     protected while it has no slot (a refused or pending miss); it then pins the slot it gets.
-K4  a cohort's references at a layer are dropped by the dispatcher only after the cohort is accepted or cancelled AND its
-    last reader event at that layer completed. A slot becomes FREE only after its own last reader event completed.
+K4  (amended by repair 1, R1.) The dispatcher drops a cohort's references at layer l after the joint call in which the
+    cohort executed layer l, or at its decision for the layers it did not execute, and in both cases only after the
+    last reader event of (cohort, l) completed. Stream.unprotect drops ONE key. A slot becomes FREE only after its own
+    last reader event completed.
 K5  per layer: C slots per stream plus X shared extra slots. The extra pool is a per-layer COUNT: a stream whose usage
     reaches C borrows from it. A draft fetch may borrow only while more than R_ver extra slots are free (the verifier
     reserve); a verifier fetch may borrow any free extra slot. A refused draft fetch is counted and the draft continues
@@ -34,9 +41,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .backend import ev_done
 from .errors import ConfigError, OwnershipViolation, StaleGeneration
+from .executor import DRAFT
 
-FREE, INFLIGHT, LRU, PO, RELEASING = "free", "inflight", "lru", "po", "releasing"
-STATES = (FREE, INFLIGHT, LRU, PO, RELEASING)
+FREE, INFLIGHT, LRU, PO, VRES, RELEASING = "free", "inflight", "lru", "po", "vres", "releasing"
+STATES = (FREE, INFLIGHT, LRU, PO, VRES, RELEASING)
 
 
 class Slot:
@@ -61,6 +69,7 @@ class Stream:
         self.slots = [Slot(i) for i in range(n_pos)]
         self.lru: "OrderedDict[int, int]" = OrderedDict()   # block -> slot; first = least recent, last = MRU
         self.po: Dict[int, int] = {}                         # block -> slot (protected-only)
+        self.vres: Dict[int, int] = {}                       # block -> slot (verifier resident, R2.4)
         self.pending: Dict[int, int] = {}                    # block -> slot of the CURRENT owner's transfers in flight
         self.prot: Dict[int, Set[Any]] = {}                  # block -> cohort keys (K2)
         self.owner = None                                    # request uid that owns the batch slot now
@@ -75,7 +84,11 @@ class Stream:
 
     def resident(self, block: int) -> Optional[int]:
         s = self.lru.get(block)
-        return s if s is not None else self.po.get(block)
+        if s is None:
+            s = self.po.get(block)
+        if s is None:
+            s = self.vres.get(block)
+        return s
 
     def protected(self, block: int) -> bool:
         return bool(self.prot.get(block))
@@ -83,11 +96,12 @@ class Stream:
     def check(self) -> None:
         """Structural invariants (K3): one slot per resident block; states agree with the maps."""
         seen = {}
-        for blk, s in list(self.lru.items()) + list(self.po.items()):
+        for blk, s in list(self.lru.items()) + list(self.po.items()) + list(self.vres.items()):
             if blk in seen:
-                raise OwnershipViolation("block %d both in the LRU and protected-only (stream %s)" % (blk, (self.l, self.h, self.b)))
+                raise OwnershipViolation("block %d is in two of LRU / protected-only / verifier-resident (stream %s)"
+                                         % (blk, (self.l, self.h, self.b)))
             seen[blk] = s
-            want = LRU if blk in self.lru else PO
+            want = LRU if blk in self.lru else (PO if blk in self.po else VRES)
             if self.slots[s].state != want or self.slots[s].block != blk:
                 raise OwnershipViolation("slot %d holds %s/%d but the map says %s/%d" % (s, self.slots[s].state, self.slots[s].block, want, blk))
         if len(set(seen.values())) != len(seen):
@@ -97,13 +111,13 @@ class Stream:
         for blk, s in self.pending.items():
             if self.slots[s].state != INFLIGHT or self.slots[s].block != blk:
                 raise OwnershipViolation("pending block %d slot %d is %s" % (blk, s, self.slots[s].state))
-        for blk in self.po:
+        for blk in list(self.po) + list(self.vres):
             if not self.prot.get(blk):
-                raise OwnershipViolation("protected-only block %d has no protection" % blk)
+                raise OwnershipViolation("protected-only or verifier-resident block %d has no protection" % blk)
 
     # ------------------------------------------------------------------ transitions
     def touch(self, block: int) -> None:
-        """K1: a read of an LRU entry moves it to MRU (protected-only entries are not in the LRU)."""
+        """K1 / R2.1(a): a draft read of an LRU entry moves it to MRU (PO and VRES entries are not in the LRU)."""
         if block in self.lru:
             self.lru.move_to_end(block)
             self.log.append(("touch", block, self.lru[block], self.slots[self.lru[block]].gen, None))
@@ -111,17 +125,23 @@ class Stream:
     def protect(self, block: int, key) -> None:
         self.prot.setdefault(block, set()).add(key)
 
-    def unprotect(self, key) -> List[int]:
-        """Drop every reference of cohort `key`; returns the protected-only slots that now must be released."""
+    def unprotect(self, key, mut=None) -> List[int]:
+        """Drop the references of cohort `key` (ONE key per block; other cohorts keep theirs, R1.2); returns the
+        protected-only and verifier-resident slots that now must be released."""
         out = []
         for blk in list(self.prot):
             refs = self.prot[blk]
             if key in refs:
-                refs.discard(key)
+                if mut and mut.release_drops_all_keys:
+                    refs.clear()                          # NEGATIVE CONTROL (R1.6 shared pins): every key is dropped
+                else:
+                    refs.discard(key)
                 if not refs:
                     del self.prot[blk]
                     if blk in self.po:
                         out.append(self.po.pop(blk))
+                    elif blk in self.vres:
+                        out.append(self.vres.pop(blk))
         return out
 
     def take(self, idx: int, uid, block: int, seq: int) -> int:
@@ -140,13 +160,48 @@ class Stream:
     def release(self, idx: int, why: str) -> None:
         """A slot that leaves every role -> RELEASING (FREE after its last reader event, K4)."""
         s = self.slots[idx]
-        if s.state not in (LRU, PO, INFLIGHT):
+        if s.state not in (LRU, PO, VRES, INFLIGHT):
             raise OwnershipViolation("release(%s): slot %d of %s is %s" % (why, idx, (self.l, self.h, self.b), s.state))
         s.state = RELEASING
         self.log.append(("release", s.block, idx, s.gen, why))
 
-    def admit(self, idx: int, uid, block: int, gen: int, mut=None) -> Dict:
-        """The host observed the arrival of transfer (uid, block, slot idx, gen). Returns what happened."""
+    def _evict_over_c(self, mut=None) -> Optional[Dict]:
+        """K1: after an insertion, the least recent entry leaves an LRU that holds more than C entries: a protected one
+        keeps its slot as protected-only (K3), an unprotected one is released through the reader gate."""
+        if len(self.lru) <= self.C:
+            return None
+        eb, es = self.lru.popitem(last=False)      # the least recent entry
+        if self.prot.get(eb):
+            self.po[eb] = es                       # K3: protected-only keeps its slot
+            self.slots[es].state = PO
+            self.log.append(("evict_po", eb, es, self.slots[es].gen, None))
+            if mut and mut.drop_alias:             # NEGATIVE CONTROL: the payload is freed, the alias map kept
+                self.slots[es].state = RELEASING
+            return dict(block=eb, slot=es, protected=True)
+        self.release(es, "evict")
+        return dict(block=eb, slot=es, protected=False)
+
+    def acquire(self, block: int, mut=None) -> Dict:
+        """R2.1(c) draft acquisition: a draft row read a resident NON-LRU entry (PO or VRES). The entry enters the LRU at
+        MRU on its own slot (no transfer, no new slot); then the least recent entry leaves as after an arrival."""
+        if block in self.po:
+            idx, src = self.po.pop(block), PO
+        elif block in self.vres:
+            idx, src = self.vres.pop(block), VRES
+        else:
+            raise OwnershipViolation("acquire: block %d of %s is not protected-only or verifier-resident"
+                                     % (block, (self.l, self.h, self.b)))
+        s = self.slots[idx]
+        s.state = LRU
+        self.lru[block] = idx                      # at MRU
+        self.log.append(("acquire", block, idx, s.gen, src))
+        return dict(block=block, slot=idx, src=src, evicted=self._evict_over_c(mut))
+
+    def admit(self, idx: int, uid, block: int, gen: int, mut=None, demand=(DRAFT,)) -> Dict:
+        """The host observed the arrival of transfer (uid, block, slot idx, gen) whose demand set is `demand` (R2.3).
+        A demand that contains "draft" enters the LRU at MRU (R2.1(b)); a verifier-only demand makes the block VRES
+        (R2.4), or releases it at once when no reference protects it (its requester was cancelled). The default
+        demand is for unit tests; the dispatcher always passes the transfer's demand set. Returns what happened."""
         s = self.slots[idx]
         if s.gen != gen:
             raise StaleGeneration("arrival (uid %s, block %d) names slot %d gen %d but the slot holds gen %d (%s)"
@@ -162,30 +217,28 @@ class Stream:
             s.last_reader = None
             self.log.append(("drop_unowned", block, idx, gen, uid))
             return dict(admitted=False, dropped=True, evicted=None)
-        if block in self.lru or block in self.po:
+        if self.resident(block) is not None:
             raise OwnershipViolation("arrival of block %d into slot %d but the block is already resident (slot %s)"
                                      % (block, idx, self.resident(block)))
-        s.state = LRU
         s.first_reader = None
-        self.lru[block] = idx                     # at MRU
-        self.log.append(("admit", block, idx, gen, uid))
-        ev = None
-        if len(self.lru) > self.C:
-            eb, es = self.lru.popitem(last=False)  # the least recent entry
-            if self.prot.get(eb):
-                self.po[eb] = es                   # K3: protected-only keeps its slot
-                self.slots[es].state = PO
-                self.log.append(("evict_po", eb, es, self.slots[es].gen, None))
-                if mut and mut.drop_alias:         # NEGATIVE CONTROL: the payload is freed, the alias map kept
-                    self.slots[es].state = RELEASING
-                ev = dict(block=eb, slot=es, protected=True)
-            else:
-                self.release(es, "evict")
-                ev = dict(block=eb, slot=es, protected=False)
-        return dict(admitted=True, dropped=False, evicted=ev)
+        if DRAFT in demand or (mut and mut.verifier_arrival_enters_lru):   # NEGATIVE CONTROL (R2.6): {verify} -> LRU
+            s.state = LRU
+            self.lru[block] = idx                 # at MRU
+            self.log.append(("admit", block, idx, gen, uid))
+            return dict(admitted=True, dropped=False, evicted=self._evict_over_c(mut), where=LRU)
+        if self.prot.get(block):
+            s.state = VRES                        # R2.4: resident outside the LRU, protected
+            self.vres[block] = idx
+            self.log.append(("admit_vres", block, idx, gen, uid))
+            return dict(admitted=True, dropped=False, evicted=None, where=VRES)
+        s.state = RELEASING                       # R2.4: an unprotected verifier-only arrival; never read, FREE at the next poll
+        s.last_reader = None
+        self.log.append(("drop_vres_unprotected", block, idx, gen, uid))
+        return dict(admitted=True, dropped=False, evicted=None, where=RELEASING)
 
     def end_owner(self) -> List[int]:
-        """Request end: LRU and protected-only entries are released; in-flight transfers stay in flight (T3)."""
+        """Request end: LRU, protected-only and verifier-resident entries are released; in-flight transfers stay in
+        flight (T3)."""
         out = []
         for blk, s in list(self.lru.items()):
             self.release(s, "end")
@@ -194,8 +247,12 @@ class Stream:
             if self.slots[s].state == PO:
                 self.release(s, "end")
             out.append(s)
+        for blk, s in list(self.vres.items()):
+            self.release(s, "end")
+            out.append(s)
         self.lru.clear()
         self.po.clear()
+        self.vres.clear()
         self.prot.clear()
         self.pending.clear()
         self.owner = None
@@ -305,13 +362,13 @@ class Geometry:
         )
 
 
-CATS = ("slots_free", "slots_lru", "slots_po", "slots_inflight", "slots_releasing", "staging", "workspace", "hidden",
-        "q_vectors", "p_vectors", "draft_kv", "provisional_kv", "recent_kv", "compressed_keys", "metadata")
+CATS = ("slots_free", "slots_lru", "slots_po", "slots_vres", "slots_inflight", "slots_releasing", "staging", "workspace",
+        "hidden", "q_vectors", "p_vectors", "draft_kv", "provisional_kv", "recent_kv", "compressed_keys", "metadata")
 
 # the counts one sample takes (every key is required: a missing count is an error, never a silent zero)
-COUNTS = (FREE, LRU, PO, INFLIGHT, RELEASING, "workspace_rows", "hidden_rows", "q_vectors", "p_vectors", "draft_kv_pos",
-          "prov_kv_pos", "recent_kv_pos", "ck_entries", "prot_refs", "transfers", "drafts", "cohorts", "sel_ids",
-          "release_entries")
+COUNTS = (FREE, LRU, PO, VRES, INFLIGHT, RELEASING, "workspace_rows", "hidden_rows", "q_vectors", "p_vectors",
+          "draft_kv_pos", "prov_kv_pos", "recent_kv_pos", "ck_entries", "prot_refs", "transfers", "drafts", "cohorts",
+          "sel_ids", "release_entries")
 
 
 class MemoryAccountant:
@@ -319,7 +376,7 @@ class MemoryAccountant:
     counts x the REAL per-unit sizes of `geom`. staging is the S0 ring (pinned staging + device landing) in bytes.
 
     Categories: physical slots by state, FREE included (M1 backs every stream with C + X slot positions, ownership
-    docstring K5); staging; saved verifier workspace (q/k/v + selections per row and layer); hidden states held between
+    docstring K5; verifier-resident slots have their own category slots_vres, repair 1 R2.4); staging; saved verifier workspace (q/k/v + selections per row and layer); hidden states held between
     layers (rows of RUNNING cohorts and draft rows of the current step); every held recorded q; every verifier p of a
     DONE cohort; every held draft KV entry; every held provisional KV entry; the published exact KV of the recent region;
     every held compressed or buffered key (committed chain, draft chain, cohort chains); metadata (every physical slot,
@@ -341,9 +398,10 @@ class MemoryAccountant:
         if missing:
             raise KeyError("K6 sample lacks counts %s" % missing)
         u = self.u
-        n_slots = n[FREE] + n[LRU] + n[PO] + n[INFLIGHT] + n[RELEASING]
+        n_slots = n[FREE] + n[LRU] + n[PO] + n[VRES] + n[INFLIGHT] + n[RELEASING]
         b = dict(slots_free=n[FREE] * u["slot"], slots_lru=n[LRU] * u["slot"], slots_po=n[PO] * u["slot"],
-                 slots_inflight=n[INFLIGHT] * u["slot"], slots_releasing=n[RELEASING] * u["slot"],
+                 slots_vres=n[VRES] * u["slot"], slots_inflight=n[INFLIGHT] * u["slot"],
+                 slots_releasing=n[RELEASING] * u["slot"],
                  staging=self.staging_bytes, workspace=n["workspace_rows"] * u["workspace_row"],
                  hidden=n["hidden_rows"] * u["hidden_row"], q_vectors=n["q_vectors"] * u["q_vector"],
                  p_vectors=n["p_vectors"] * u["p_vector"], draft_kv=n["draft_kv_pos"] * u["pos_kv"],

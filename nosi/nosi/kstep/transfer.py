@@ -24,8 +24,8 @@ event completed (a poll postpones; force() waits).
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
-from typing import Any, List
+from dataclasses import dataclass, field
+from typing import Any, List, Set
 
 import torch
 
@@ -42,7 +42,7 @@ class Transfer:
     block: int
     slot: int
     gen: int
-    kind: str                                   # "draft" | "verify"
+    kind: str                                   # "draft" | "verify": the kind of the request that issued it
     requester: Any                              # cohort key of the requester
     hist_ev: Any = None
     reader_ev: Any = None
@@ -51,6 +51,10 @@ class Transfer:
     delivered: bool = False                     # adversarial: payload landed
     payload: Any = None
     release_tick: int = 0
+    demand: Set[str] = field(default_factory=set)  # repair 1 R2.3: every kind ("draft", "verify") that requested it
+
+    def __post_init__(self):
+        self.demand.add(self.kind)
 
     def tag(self):
         return (self.uid, self.block, self.slot, self.gen)

@@ -13,9 +13,10 @@ ONE DECODE STEP t
           record q_s; cohort triggers (C1) and the flush (C4).
 
 ONE JOINT CALL (layer l)
-  1 host poll: arrivals of every transport (each transfer's own completion, T2), admitted at MRU (K1); RELEASING slots
-    whose last reader completed become FREE (K4); deferred-read validators whose reader event completed; protection
-    releases whose cohort is accepted/cancelled and whose last reader at the layer completed (K4).
+  1 host poll: arrivals of every transport (each transfer's own completion, T2): a demand set with "draft" enters the
+    LRU at MRU, a verifier-only one becomes VRES (repair 1 R2.1(b), R2.4); RELEASING slots whose last reader completed
+    become FREE (K4); deferred-read validators whose reader event completed; queued protection releases (key, layer)
+    whose last reader event of (key, layer) completed (K4 as amended by repair 1 R1).
   2 verifier cohorts at layer l in cohort order: D3a (cohort m-1 of the epoch executed layer l in an EARLIER call, or is
     accepted). Phase 1 once (saved as workspace, counted in memory, not recomputed): exact q/k/v of every row, the
     cohort's exact compressed-key chain, exact selections (D5). Protection of the exact selection (K2). D3b: every
@@ -23,21 +24,26 @@ ONE JOINT CALL (layer l)
     requested (verifier fetch, K5), in-flight ones are waited for, and the cohort retries at the next call of layer l.
   3 draft rows: phase 1 from the DRAFT hidden state and the draft chain; protection of every selected historical block
     (hits AND misses) for the cohort of d_s (K2); readable = resident; misses requested (draft fetch, K5; a refusal is
-    counted and the draft continues masked).
-  4 recency (K1), per stream in the fixed order: verifier rows (cohort order, then position order), then the draft row.
+    counted and the draft continues masked); a miss already in flight adds "draft" to that transfer's demand (R2.3).
+  4 verifier read log (repair 1 R2.2: verifier reads never touch the LRU).
   5 phase 2: the rows' reads (slot reads after the host-observed arrival, T4; recent region from the published state as
     of the call start, D6) -> executor.joint_post. Every slot read is ALSO enqueued as a deferred copy on the "compute"
     stream; the call's reader event follows it. A slot is reused only after that event (K4, T3); a validator compares the
     deferred copy with the bytes the call computed from (ReadCorruption otherwise).
+    Then the DRAFT-ONLY recency (repair 1 R2.1), per stream after the reads: the draft row's LRU hits move to MRU (read
+    order), then its reads of PO / VRES entries enter the LRU at MRU (draft acquisition, evicting the least recent).
+    Each cohort that executed layer l queues the release of its layer-l references (repair 1 R1.1).
   6 fetch issue: verifier requests (cohort order) then draft requests; slot allocation (K5); one transport issue per
-    layer (S0: one Pipe.layer).
+    layer (S0: one Pipe.layer); a request for a block already requested in this call or in flight adds its kind to that
+    transfer's demand set (R2.3).
   7 D1 records (per stream SUM and UNION of the rows' selected blocks: the IDEAL sharing, not a measurement) and the
     memory sample (K6).
 
 READINGS WHERE THE SPEC LEAVES A CHOICE (the most conservative one; listed in retroinfer-eval
 docs/evidence/kstep_live/M1_RECEIPTS.md):
   * D3a "has executed layer l" = in an EARLIER joint call (outputs of a call become visible only after it).
-  * K2 verifier protections are held until the cohort is accepted or cancelled (K4), not only while it waits.
+  * K2 verifier protections are held until the cohort's layer-l references are released (repair 1 R1: after the call
+    in which it executed layer l, behind the reader gate), not only while it waits.
   * A block that becomes historical (A5) leaves the recent region and is NOT admitted into the LRU: the LRU admits only
     observed fetch arrivals (K1); a later selection fetches it.
   * The draft's compressed-key chain is the committed exact chain extended by the draft keys of the uncommitted
@@ -47,7 +53,12 @@ docs/evidence/kstep_live/M1_RECEIPTS.md):
   * Positions: the prefill publishes positions 0 .. P0-2; the last prompt token is the pending token x (spec section 1);
     the first generated token is d_1 of epoch 0.
 ADDITIONS FOR D4 (reported as spec deviations): the verifier eviction (_verifier_evict) and the pin guard (_pins_high,
-a C2 'memory' refusal) with the parameter condition C >= (2K + 1) * max_sel (Config.pin_guard).
+a C2 'memory' refusal) with the parameter condition C >= (2K + 1) * max_sel (Config.pin_guard). Repair 1 R2.5 keeps the
+verifier eviction ONLY as an explicit, counted progress fallback: each use is recorded per stream with the evicted block
+(vev_log, trace[uid]["verifier_evictions_of_draft_entries"], report()["verifier_evictions_of_draft_entries"]).
+REPAIR 1 (retroinfer-eval docs/superpowers/specs/2026-10-12-kstep-m1-repair1.md): R1 per-layer release of historical
+pins (_queue_release, _finished_key, the release step of _poll, _protect), R2 draft-only logical LRU with demand sets
+and VRES (_add_demand, the recency step of _call, Stream.admit / Stream.acquire), R3 join_step at PENDING -> RUNNING.
 OBSERVER (test hook, fix round): observer(dispatcher, phase, call id, layer) runs after the host poll of a joint call
 (phase "poll") and at its end (phase "call"); the M1 tests install a test-side auditor of K2, K4 and K6 there.
 """
@@ -65,7 +76,7 @@ from . import cadence as cad
 from . import rng
 from .backend import check_backend, ev_done
 from .compressed import CompressedChain
-from .errors import ConfigError, KStepError, NoProgress, ReadCorruption
+from .errors import ConfigError, KStepError, NoProgress, OwnershipViolation, ReadCorruption
 from .executor import DRAFT, VERIFY, Row, check_executor
 from .mutations import Mutations
 from .ownership import COUNTS, Geometry, LayerPool, MemoryAccountant
@@ -115,6 +126,7 @@ class Cohort:
         self.tokens = [req.u(i - 1) for i in range(a, b + 1)]
         self.state = PENDING
         self.trigger_step = step
+        self.join_step = None                  # repair 1 R3.1: the step of the PENDING -> RUNNING transition
         self.next_layer = 0
         self.hidden: List[Any] = []
         self.ws: Dict[int, Dict] = {}
@@ -216,8 +228,12 @@ class Dispatcher:
         self.pub_log: List[Tuple] = []             # (uid, pos), one entry per publication of a position
         self.results: Dict[Any, List[int]] = {}
         self.call_step: Dict[int, int] = {}        # call id -> decode step
-        self.touch_log: List[Tuple] = []           # (call, layer, b, h, block, rank): K1 recency order of every read
+        self.touch_log: List[Tuple] = []           # (call, layer, b, h, block, event): draft-only recency (R2.1)
+        self.vread_log: List[Tuple] = []           # (call, layer, b, h, block, (m, pos)): verifier reads (R2.2)
         self.arrival_log: List[int] = []           # transfer seq in the order the host observed the arrivals
+        self.admit_log: List[Tuple] = []           # (call, layer, b, h, block, demand, where, issuer kind) (R2.3)
+        self.vev_log: List[Tuple] = []             # (call, layer, b, h, block, uid): verifier evictions (R2.5)
+        self.rel_layers: Dict[Tuple, Dict[int, bool]] = {}  # key -> {layer: released}: queued layers (R1.4)
         self.cancelled_keys = set()
         self._noprog = 0
         self._vfail = set()
@@ -267,6 +283,7 @@ class Dispatcher:
                 self.pools[l].stream(r.b, h).end_owner()
         self.pending_release = [x for x in self.pending_release if x[0][0] != r.uid]
         self.key_readers = {k: v for k, v in self.key_readers.items() if k[0][0] != r.uid}
+        self.rel_layers = {k: v for k, v in self.rel_layers.items() if k[0] != r.uid}
         r.done = True
         self.results[r.uid] = r.toks[r.P0:r.P0 + r.N]
         self.trace[r.uid]["final"] = list(r.toks)
@@ -288,7 +305,13 @@ class Dispatcher:
         for r in self.active():
             for c in r.cohorts:
                 if c.state == PENDING and c.trigger_step < t:
+                    if self.mut.delayed_join_even_steps and t % 2 != 0:
+                        continue                                        # NEGATIVE CONTROL (R3.3, OWN_join_even_steps)
+                    if self.mut.delayed_join_wait_other_requests and any(
+                            cc.state == RUNNING for rr in self.active() if rr is not r for cc in rr.cohorts):
+                        continue                                        # NEGATIVE CONTROL (R3.3, OWN_join_wait_other_requests)
                     c.state = RUNNING                                   # D2: joins at layer 0 of the next step
+                    c.join_step = t                                     # R3.1
                     c.hidden = [self.ex.embed(tok) for tok in c.tokens]
         rows: List[Tuple[Request, Draft]] = []
         for r in self.active():
@@ -368,7 +391,7 @@ class Dispatcher:
         for tr in arrived:
             del self.inflight[tr.seq]
             st = self.pools[tr.layer].stream(tr.b, tr.h)
-            res = st.admit(tr.slot, tr.uid, tr.block, tr.gen, self.mut)
+            res = st.admit(tr.slot, tr.uid, tr.block, tr.gen, self.mut, demand=tr.demand)
             self.arrival_log.append(tr.seq)
             self.stats["progress"] += 1
             if tr.requester in self.cancelled_keys:
@@ -377,6 +400,11 @@ class Dispatcher:
                 self.stats["arrivals_dropped_unowned"] += 1
             else:
                 self.stats["arrivals_admitted"] += 1
+                self.stats["arrivals_" + res["where"]] += 1            # arrivals_lru / arrivals_vres / arrivals_releasing
+                if tr.kind == VERIFY and DRAFT in tr.demand:
+                    self.stats["arrivals_verify_joined_by_draft"] += 1  # R2.3: a draft request joined a verifier transfer
+                self.admit_log.append((self.call_id, tr.layer, tr.b, tr.h, tr.block, tuple(sorted(tr.demand)), res["where"],
+                                       tr.kind))
                 ev = res["evicted"]
                 if ev is not None:
                     self.stats["evict_protected_only" if ev["protected"] else "evict_released"] += 1
@@ -392,16 +420,31 @@ class Dispatcher:
         for key, l in self.pending_release:
             fr, lr = self.key_readers.get((key, l), (None, None))
             gate = fr if self.mut.release_first_reader else lr
-            if self.mut.no_reader_wait or ev_done(gate):
-                r = self.reqs[key[0]]
-                for h in range(self.H):
-                    st = self.pools[l].stream(r.b, h)
-                    for idx in st.unprotect(key):
-                        st.release(idx, "unprotect")
-                self.key_readers.pop((key, l), None)
+            if self.mut.no_reader_wait or self.mut.prot_release_no_reader_gate or ev_done(gate):
+                self._release_refs(key, l)
             else:
                 keep.append((key, l))
         self.pending_release = keep
+        done = [k for k, lay in self.rel_layers.items() if len(lay) == self.L and all(lay.values())]
+        for k in done:                                                  # K6: every layer of the key is released
+            del self.rel_layers[k]
+
+    def _release_refs(self, key, l: int) -> None:
+        """R1: drop the references keyed `key` at layer l (one key, R1.2); PO / VRES slots that lose their last reference
+        go through the reader gate. A second release of the same (key, l) is an ownership violation (R1.4)."""
+        lay = self.rel_layers.get(key)
+        if lay is None or l not in lay:
+            raise KStepError("R1.4: release of cohort %s at layer %d that was never queued" % (key, l))
+        if lay[l]:
+            raise OwnershipViolation("R1.4: double release of cohort %s at layer %d" % (key, l))
+        lay[l] = True
+        r = self.reqs[key[0]]
+        for h in range(self.H):
+            st = self.pools[l].stream(r.b, h)
+            for idx in st.unprotect(key, self.mut):
+                st.release(idx, "unprotect")
+        self.key_readers.pop((key, l), None)
+        self.stats["releases_per_layer"] += 1
 
     def _validate(self, all_: bool = False) -> None:
         keep = []
@@ -503,8 +546,14 @@ class Dispatcher:
             self.observer(self, "poll", cid, l)
         requests: List[Tuple] = []
         exec_cohorts: List[Tuple[Request, Cohort]] = []
-        eligible = [(r, c) for r in self.active() for c in r.cohorts
-                    if c.state == RUNNING and c.next_layer == l and self._d3a(r, c, l)]
+        eligible = []
+        for r in self.active():
+            for c in r.cohorts:
+                if c.state == RUNNING and c.next_layer == l:
+                    if self._d3a(r, c, l):
+                        eligible.append((r, c))
+                    else:
+                        self.stats["cohort_waits_d3a"] += 1             # R3.2: a counted D3a wait
         # phase 1 of the joint call: ONE executor call for every row that needs it (verifier rows without a saved
         # workspace at this layer, then the draft rows)
         items, owners_pre = [], []
@@ -529,7 +578,9 @@ class Dispatcher:
                 st = self.pools[l].stream(r.b, h)
                 for blocks in (need[h][1:] if self.mut.no_verifier_ready_protection else need[h]):
                     for j in blocks:
-                        st.protect(j, c.key)                       # K2: the exact selection, while it waits
+                        self._protect(st, l, j, c.key)             # K2: the exact selection, while it waits
+                for j in need[h][1]:
+                    self._add_demand(st, j, VERIFY)                # R2.3: a verifier request for an in-flight block
             ok = all(not miss and not infl for _, infl, miss in need)
             if not ok and self.mut.read_not_ready:
                 ok = all(not miss for _, infl, miss in need)       # NEGATIVE CONTROL: reads in-flight slots
@@ -563,30 +614,26 @@ class Dispatcher:
                     if j >= r.hist_blocks:
                         continue
                     if not (self.mut.no_draft_hit_protection and st.resident(j) is not None):
-                        st.protect(j, key)                             # K2: hits AND misses, for the cohort of d_s
+                        self._protect(st, l, j, key)                   # K2: hits AND misses, for the cohort of d_s
                     if st.resident(j) is not None:
                         a.append(j)
                     elif j not in st.pending:
                         requests.append((DRAFT, r, h, j, key))
+                    else:
+                        self._add_demand(st, j, DRAFT)                 # R2.3: joins the transfer already in flight
                 avail.append(a)
             dr.sel[l], dr.avail[l] = sel, avail
             draft_pre[id(dr)] = (q, k, v)
-        # K1 recency, fixed order per stream: verifier rows (cohort order, position order), then the draft row
+        # R2.2: verifier reads never touch the logical LRU; they are logged separately (cohort order, position order)
         for r, c in exec_cohorts:
             for i, pos in enumerate(c.positions):
                 for h in range(self.H):
                     st = self.pools[l].stream(r.b, h)
                     for j in c.ws[l]["sel"][i][h]:
                         if j < r.hist_blocks:
-                            st.touch(j)
-                            self.touch_log.append((cid, l, r.b, h, j, (0, c.m, pos)))
-        for r, dr in rows:
-            if id(dr) in draft_pre:
-                for h in range(self.H):
-                    st = self.pools[l].stream(r.b, h)
-                    for j in dr.avail[l][h]:
-                        st.touch(j)
-                        self.touch_log.append((cid, l, r.b, h, j, (1, 0, dr.pos)))
+                            self.vread_log.append((cid, l, r.b, h, j, (c.m, pos)))
+                            if self.mut.verifier_touches_lru:
+                                st.touch(j)                            # NEGATIVE CONTROL (R2.6): the M1 rule
         # phase 2: reads + executor
         jrows: List[Row] = []
         owners: List[Tuple] = []
@@ -641,6 +688,7 @@ class Dispatcher:
             for i in range(len(self.validators) - self._n_new_val, len(self.validators)):
                 ev, ws, exp, info = self.validators[i]
                 self.validators[i] = (rev, ws, exp, info)
+        self._draft_recency(l, rows, draft_pre, cid)
         outs = self.ex.joint_post(l, jrows) if jrows else []
         for (kind, r, obj, i), row, out in zip(owners, jrows, outs):
             if kind == "v":
@@ -660,6 +708,11 @@ class Dispatcher:
             c.next_layer = l + 1
             self.exec_log.append((cid, l, r.uid, c.epoch, c.m))
             self.stats["progress"] += 1
+            if self.mut.release_at_execution:                          # NEGATIVE CONTROL (R1.6 early release)
+                self.rel_layers.setdefault(c.key, {})[l] = False
+                self._release_refs(c.key, l)
+            elif not self.mut.release_only_at_decision:                # (the control keeps the M1 decision-only rule)
+                self._queue_release(c.key, l)                          # R1.1: behind the (key, l) reader gate
             if l == self.L - 1:
                 c.p = {c.a + i: self.ex.dist(c.hidden[i]) for i in range(len(c.positions))}
                 c.hidden = []                                          # K6: the rows' hidden states are no longer held
@@ -696,6 +749,65 @@ class Dispatcher:
                     raise KStepError("D3a: %r reads position %d of %r at layer %d before that cohort executed it" % (c, qp, cc, l))
                 return cc.prov[l][h][qp]
         raise KStepError("verifier %r: position %d (n=%d) has no published, provisional or own KV" % (c, qp, r.n))
+
+    def _draft_recency(self, l: int, rows, draft_pre, cid: int) -> None:
+        """R2.1 (a), (c): the DRAFT-ONLY recency of the call at layer l, after the rows' reads were enqueued (a slot that
+        an eviction releases here is FREE only after this call's reader event). Per stream, the draft row's reads of LRU
+        entries move to MRU in read order, then its reads of resident non-LRU entries (PO, VRES) enter the LRU at MRU
+        (draft acquisition), each followed by the eviction rule of an arrival."""
+        for r, dr in rows:
+            if id(dr) not in draft_pre:
+                continue
+            for h in range(self.H):
+                st = self.pools[l].stream(r.b, h)
+                reads = dr.avail[l][h]
+                hits = [j for j in reads if j in st.lru]
+                acq = [j for j in reads if j not in st.lru]
+                for j in hits:
+                    st.touch(j)
+                    self.touch_log.append((cid, l, r.b, h, j, "hit"))
+                for j in acq:
+                    if j not in st.po and j not in st.vres:
+                        raise KStepError("R2.1: the draft row of uid %s read block %d (stream %s), which is no longer "
+                                         "resident at the recency update" % (r.uid, j, (l, h, r.b)))
+                    if self.mut.skip_acquisition:
+                        continue                                       # NEGATIVE CONTROL (R2.6)
+                    res = st.acquire(j, self.mut)
+                    self.touch_log.append((cid, l, r.b, h, j, "acquire_" + res["src"]))
+                    self.stats["draft_acquisitions_" + res["src"]] += 1  # draft_acquisitions_po / _vres
+                    ev = res["evicted"]
+                    if ev is not None:
+                        self.stats["evict_protected_only" if ev["protected"] else "evict_released"] += 1
+
+    def _protect(self, st, l: int, j: int, key) -> None:
+        """K2 with the R1.5 guard: no reference keyed `key` is added at layer l after (key, l) was queued for release."""
+        lay = self.rel_layers.get(key)
+        if lay is not None and l in lay and not self.mut.no_late_protection_guard:
+            raise KStepError("R1.5: late protection of block %d at layer %d for cohort %s after its layer-%d references "
+                             "were queued for release" % (j, l, key, l))
+        st.protect(j, key)
+
+    def _add_demand(self, st, j: int, kind: str) -> None:
+        """R2.3: a request for a block in flight for the stream's owner adds its kind to that transfer's demand set (no
+        second transfer)."""
+        if self.mut.drop_demand_merge:
+            return                                                     # NEGATIVE CONTROL (R2.6)
+        seq = st.slots[st.pending[j]].seq
+        tr = self.inflight.get(seq)
+        if tr is None:
+            raise KStepError("R2.3: block %d of stream %s is pending but transfer %s is not in flight"
+                             % (j, (st.l, st.h, st.b), seq))
+        if kind not in tr.demand:
+            tr.demand.add(kind)
+            self.stats["demand_merged_" + kind] += 1                   # demand_merged_draft / demand_merged_verify
+
+    def _queue_release(self, key, l: int) -> None:
+        """R1.1 / R1.4: queue the release of every reference keyed `key` at layer l, at most once per (key, l)."""
+        lay = self.rel_layers.setdefault(key, {})
+        if l in lay:
+            return
+        lay[l] = False
+        self.pending_release.append((key, l))
 
     def _row_kv(self, r: Request, l: int, h: int, pos: int, sel: List[int], readable: Optional[List[int]], recent,
                 read_slots: List, key) -> List[Tuple]:
@@ -744,17 +856,25 @@ class Dispatcher:
     def _issue(self, l: int, requests: List[Tuple], cid: int) -> None:
         pool = self.pools[l]
         seen = set()
+        issued: Dict[Tuple[int, int, int], Transfer] = {}
         batch = []
         order = [x for x in requests if x[0] == VERIFY] + [x for x in requests if x[0] == DRAFT]
         for kind, r, h, j, key in order:
             if (r.b, h, j) in seen:
+                tr0 = issued.get((r.b, h, j))
+                if tr0 is not None and kind not in tr0.demand and not self.mut.drop_demand_merge:
+                    tr0.demand.add(kind)                                  # R2.3: joins the transfer issued in this call
+                    self.stats["demand_merged_" + kind] += 1
                 continue
             seen.add((r.b, h, j))
             st = pool.stream(r.b, h)
-            if st.resident(j) is not None or j in st.pending:
+            if st.resident(j) is not None:
                 continue
-            if not pool.can_take(st, kind) and kind == VERIFY:
-                self._verifier_evict(pool, st)
+            if j in st.pending:
+                self._add_demand(st, j, kind)                             # R2.3
+                continue
+            if kind == VERIFY and (self.mut.verifier_evicts_without_pressure or not pool.can_take(st, kind)):
+                self._verifier_evict(pool, st, cid)                       # R2.5: the counted progress fallback
             if not pool.can_take(st, kind):
                 if kind == DRAFT:
                     self.stats["fetch_draft_refused"] += 1                # unrequested; the draft continues masked
@@ -779,6 +899,7 @@ class Dispatcher:
             tr = Transfer(self.seq, r.uid, l, r.b, h, j, idx, gen, kind, key, hist_ev=r.hist_ev.get((l, j)),
                           reader_ev=prev, issued_call=cid)
             self.inflight[tr.seq] = tr
+            issued[(r.b, h, j)] = tr
             batch.append(tr)
             self.stats["fetch_%s_issued" % kind] += 1
         if batch:
@@ -790,17 +911,23 @@ class Dispatcher:
                 return blk
         return None
 
-    def _verifier_evict(self, pool, st) -> None:
+    def _verifier_evict(self, pool, st, cid: int) -> None:
         """VERIFIER EVICTION (an M1 addition for D4, reported as a spec deviation). K5 refused a verifier fetch: the
         stream is at C and no extra slot is free. Entries leave the LRU only at an arrival (K1), and an arrival needs a
         destination, so a full LRU with every extra slot held elsewhere could never change again. The least recent
-        UNPROTECTED LRU entry leaves the LRU now; its slot is released through the K4 reader gate as usual."""
+        UNPROTECTED LRU entry leaves the LRU now; its slot is released through the K4 reader gate as usual.
+        Repair 1 R2.5: this is a verifier access that changes the draft LRU, so it stays ONLY as an explicit, counted
+        progress fallback, recorded per stream with the evicted block (vev_log, the request's trace, report())."""
         blk = self._verifier_eviction_candidate(st)
         if blk is None:
             return
         idx = st.lru.pop(blk)
         st.release(idx, "verifier_eviction")
         self.stats["verifier_evictions"] += 1
+        if not self.mut.silent_verifier_eviction:                       # (the NEGATIVE CONTROL records nothing)
+            self.vev_log.append((cid, st.l, st.b, st.h, blk, st.owner))
+            self.trace[st.owner].setdefault("verifier_evictions_of_draft_entries", []).append(
+                dict(call=cid, layer=st.l, h=st.h, block=blk))
         n = pool.poll_releases(self.mut)
         if n:
             self.stats["slots_freed"] += n
@@ -876,7 +1003,7 @@ class Dispatcher:
     def _cohort_record(self, r: Request, c: Cohort, o=None, was: Optional[str] = None) -> Dict:
         c.decided_step = self.t
         return dict(m=c.m, a=c.a, b=c.b, E=c.E, positions=list(c.positions), trigger_step=c.trigger_step,
-                    decided_step=self.t, state=c.state, exec_call=dict(c.exec_call), vsel=dict(c.vsel),
+                    join_step=c.join_step, decided_step=self.t, state=c.state, exec_call=dict(c.exec_call), vsel=dict(c.vsel),
                     p={i: list(v) for i, v in c.p.items()}, waits=c.waits, row_layers=c.row_layers,
                     layers_done=c.next_layer, state_at_decision=was or c.state,
                     outcome=None if o is None else dict(n_acc=o.n_acc, i_star=o.i_star, correction=o.correction))
@@ -911,8 +1038,16 @@ class Dispatcher:
                 r.dchain[l][h] = ch
 
     def _finished_key(self, key) -> None:
+        """R1.4 decision cleanup (acceptance, cancellation, untriggered key): queue only the layers of `key` that are not
+        queued yet; a layer queued after its execution (R1.1) is not queued again."""
+        if self.mut.cleanup_skips_unqueued_layers:
+            return                                                     # NEGATIVE CONTROL (R1.6 rollback)
         for l in range(self.L):
-            self.pending_release.append((key, l))
+            if self.mut.cleanup_double_queues:                         # NEGATIVE CONTROL (R1.6 rollback)
+                self.rel_layers.setdefault(key, {}).setdefault(l, False)
+                self.pending_release.append((key, l))
+            else:
+                self._queue_release(key, l)
 
     def _apply(self, r: Request, c: Cohort, o) -> None:
         ep = self.trace[r.uid]["epochs"][-1]
@@ -1076,8 +1211,12 @@ class Dispatcher:
                 n["prot_refs"] += sum(len(v) for v in st.prot.values())
         if self.mut.mem_no_releasing:
             n["releasing"] = 0                                         # NEGATIVE CONTROL (fix round F4)
+        if self.mut.vres_counted_as_lru:
+            n["lru"] += n["vres"]                                      # NEGATIVE CONTROL (repair 1 R2.6)
+            n["vres"] = 0
         n["transfers"] = len(self.inflight)
-        n["release_entries"] = len(self.pending_release) + len(self.key_readers)
+        n["release_entries"] = (len(self.pending_release) + len(self.key_readers)
+                                + sum(len(v) for v in self.rel_layers.values()))
         for r in self.active():
             drafts = list(r.drafts) + ([r.cur] if r.cur is not None else [])
             n["drafts"] += len(drafts)
@@ -1119,7 +1258,16 @@ class Dispatcher:
                               verifier_only_passes=s["verifier_only_passes"]),
                     stalls={k[6:]: v for k, v in s.items() if k.startswith("stall_")},
                     stall_accounting=self.stall_accounting(),
+                    verifier_evictions_of_draft_entries=self.vev_report(),
                     sharing_IDEAL=self.sharing(), memory=self.acct.report())
+
+    def vev_report(self) -> Dict[str, Any]:
+        """Repair 1 R2.5: every verifier eviction of a draft LRU entry (the counted progress fallback), per stream
+        ("l<layer> b<batch slot> h<head>") with the evicted blocks in order, and the total."""
+        per: Dict[str, List[int]] = {}
+        for cid, l, b, h, blk, uid in self.vev_log:
+            per.setdefault("l%d b%d h%d" % (l, b, h), []).append(blk)
+        return dict(count=len(self.vev_log), per_stream=per)
 
     def stall_accounting(self) -> Dict[str, Any]:
         """C2 (fix round F3): every (active request, decode step) either starts a draft row or stalls with ONE reason.
