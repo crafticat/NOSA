@@ -181,9 +181,18 @@ class Stream:
         self.release(es, "evict")
         return dict(block=eb, slot=es, protected=False)
 
-    def acquire(self, block: int, mut=None) -> Dict:
+    def evict_to_c(self, mut=None) -> List[Dict]:
+        """Repair 1c (ordering contract O1): after a draft row's whole batch update, the least recent entries leave while
+        the LRU holds more than C (each as in _evict_over_c). Returns the evictions in order."""
+        out = []
+        while len(self.lru) > self.C:
+            out.append(self._evict_over_c(mut))
+        return out
+
+    def acquire(self, block: int, mut=None, evict: bool = True) -> Dict:
         """R2.1(c) draft acquisition: a draft row read a resident NON-LRU entry (PO or VRES). The entry enters the LRU at
-        MRU on its own slot (no transfer, no new slot); then the least recent entry leaves as after an arrival."""
+        MRU on its own slot (no transfer, no new slot); then, if evict, the least recent entry leaves as after an arrival.
+        The dispatcher passes evict=False and evicts once after the row's whole batch (repair 1c, O1: evict_to_c)."""
         if block in self.po:
             idx, src = self.po.pop(block), PO
         elif block in self.vres:
@@ -195,7 +204,7 @@ class Stream:
         s.state = LRU
         self.lru[block] = idx                      # at MRU
         self.log.append(("acquire", block, idx, s.gen, src))
-        return dict(block=block, slot=idx, src=src, evicted=self._evict_over_c(mut))
+        return dict(block=block, slot=idx, src=src, evicted=self._evict_over_c(mut) if evict else None)
 
     def admit(self, idx: int, uid, block: int, gen: int, mut=None, demand=(DRAFT,)) -> Dict:
         """The host observed the arrival of transfer (uid, block, slot idx, gen) whose demand set is `demand` (R2.3).

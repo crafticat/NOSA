@@ -751,33 +751,35 @@ class Dispatcher:
         raise KStepError("verifier %r: position %d (n=%d) has no published, provisional or own KV" % (c, qp, r.n))
 
     def _draft_recency(self, l: int, rows, draft_pre, cid: int) -> None:
-        """R2.1 (a), (c): the DRAFT-ONLY recency of the call at layer l, after the rows' reads were enqueued (a slot that
-        an eviction releases here is FREE only after this call's reader event). Per stream, the draft row's reads of LRU
-        entries move to MRU in read order, then its reads of resident non-LRU entries (PO, VRES) enter the LRU at MRU
-        (draft acquisition), each followed by the eviction rule of an arrival."""
+        """R2.1 (a), (c) under the ORDERING CONTRACT O1 (repair 1c; Codex decision 2026-10-12): the DRAFT-ONLY recency of
+        the call at layer l, after the rows' reads were enqueued (a slot that an eviction releases here is FREE only after
+        this call's reader event). Per stream and draft row: the locally READY historical blocks the row read (dr.avail),
+        in ASCENDING block id, each either moves to MRU (an LRU hit) or enters the LRU at MRU (a protected-only or VRES
+        entry: draft acquisition, no transfer, no new slot); only AFTER the whole batch do the least recent entries leave
+        while the LRU holds more than C (protected ones become protected-only, others are released through the reader
+        gate). The logical result equals the reference batch update then oldest eviction (memory_replay.py prepare_lru on
+        the ready snapshot; tests/kstep_toy.py ref_order_memory_replay). A TRUE miss enters only at its observed arrival
+        with draft demand (O2, Stream.admit); verifier reads and verifier-only arrivals never change this order."""
         for r, dr in rows:
             if id(dr) not in draft_pre:
                 continue
             for h in range(self.H):
                 st = self.pools[l].stream(r.b, h)
-                reads = dr.avail[l][h]
-                hits = [j for j in reads if j in st.lru]
-                acq = [j for j in reads if j not in st.lru]
-                for j in hits:
-                    st.touch(j)
-                    self.touch_log.append((cid, l, r.b, h, j, "hit"))
-                for j in acq:
+                for j in sorted(set(dr.avail[l][h])):                  # O1: ascending block id, hits and acquisitions alike
+                    if j in st.lru:
+                        st.touch(j)
+                        self.touch_log.append((cid, l, r.b, h, j, "hit"))
+                        continue
                     if j not in st.po and j not in st.vres:
                         raise KStepError("R2.1: the draft row of uid %s read block %d (stream %s), which is no longer "
                                          "resident at the recency update" % (r.uid, j, (l, h, r.b)))
                     if self.mut.skip_acquisition:
                         continue                                       # NEGATIVE CONTROL (R2.6)
-                    res = st.acquire(j, self.mut)
+                    res = st.acquire(j, self.mut, evict=False)
                     self.touch_log.append((cid, l, r.b, h, j, "acquire_" + res["src"]))
                     self.stats["draft_acquisitions_" + res["src"]] += 1  # draft_acquisitions_po / _vres
-                    ev = res["evicted"]
-                    if ev is not None:
-                        self.stats["evict_protected_only" if ev["protected"] else "evict_released"] += 1
+                for ev in st.evict_to_c(self.mut):                     # O1: oldest eviction after the whole batch
+                    self.stats["evict_protected_only" if ev["protected"] else "evict_released"] += 1
 
     def _protect(self, st, l: int, j: int, key) -> None:
         """K2 with the R1.5 guard: no reference keyed `key` is added at layer l after (key, l) was queued for release."""
