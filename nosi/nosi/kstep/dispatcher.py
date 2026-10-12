@@ -40,13 +40,16 @@ docs/evidence/kstep_live/M1_RECEIPTS.md):
   * K2 verifier protections are held until the cohort is accepted or cancelled (K4), not only while it waits.
   * A block that becomes historical (A5) leaves the recent region and is NOT admitted into the LRU: the LRU admits only
     observed fetch arrivals (K1); a later selection fetches it.
-  * The draft's compressed-key chain is the committed chain at the epoch start extended by the draft's own keys; it is
-    restored at every new epoch (A6) and not rebuilt at a full-acceptance publication (D6 governs KV reads).
+  * The draft's compressed-key chain is the committed exact chain extended by the draft keys of the uncommitted
+    positions. It is restored at every new epoch (A6) and REBUILT at every full-acceptance publication (_rebuild_dchain,
+    fix round F5: D6/A4 "drafts read the exact KV from then on" covers the compressed keys derived from that KV).
   * K5 draft reserve: a draft fetch may borrow an extra slot only while MORE than R_ver extra slots are free.
   * Positions: the prefill publishes positions 0 .. P0-2; the last prompt token is the pending token x (spec section 1);
     the first generated token is d_1 of epoch 0.
 ADDITIONS FOR D4 (reported as spec deviations): the verifier eviction (_verifier_evict) and the pin guard (_pins_high,
 a C2 'memory' refusal) with the parameter condition C >= (2K + 1) * max_sel (Config.pin_guard).
+OBSERVER (test hook, fix round): observer(dispatcher, phase, call id, layer) runs after the host poll of a joint call
+(phase "poll") and at its end (phase "call"); the M1 tests install a test-side auditor of K2, K4 and K6 there.
 """
 from __future__ import annotations
 
@@ -65,7 +68,7 @@ from .compressed import CompressedChain
 from .errors import ConfigError, KStepError, NoProgress, ReadCorruption
 from .executor import DRAFT, VERIFY, Row, check_executor
 from .mutations import Mutations
-from .ownership import Geometry, LayerPool, MemoryAccountant
+from .ownership import COUNTS, Geometry, LayerPool, MemoryAccountant
 from .transfer import Transfer
 
 POISON = -7777777                         # no toy KV value is negative
@@ -164,7 +167,7 @@ class Request:
 
 class Dispatcher:
     def __init__(self, cfg: Config, executor, be, make_transport: Callable, mut: Optional[Mutations] = None,
-                 progress: Optional[Callable] = None):
+                 progress: Optional[Callable] = None, observer: Optional[Callable] = None):
         check_executor(executor)
         check_backend(be)
         self.K, self.LAMBDA = cad.check(cfg.K, cfg.LAMBDA)
@@ -173,6 +176,7 @@ class Dispatcher:
         self.cfg, self.ex, self.be = cfg, executor, be
         self.mut = mut or Mutations()
         self.progress = progress
+        self.observer = observer
         ex = executor
         self.L, self.H, self.D, self.bs, self.stride = ex.L, ex.H, ex.D, ex.bs, ex.stride
         self.rb = int(cfg.pin_row_bound or ex.max_sel)
@@ -262,6 +266,7 @@ class Dispatcher:
             for h in range(self.H):
                 self.pools[l].stream(r.b, h).end_owner()
         self.pending_release = [x for x in self.pending_release if x[0][0] != r.uid]
+        self.key_readers = {k: v for k, v in self.key_readers.items() if k[0][0] != r.uid}
         r.done = True
         self.results[r.uid] = r.toks[r.P0:r.P0 + r.N]
         self.trace[r.uid]["final"] = list(r.toks)
@@ -297,6 +302,7 @@ class Dispatcher:
             dr.hidden = self.ex.embed(dr.tok_in)
             r.cur = dr
             rows.append((r, dr))
+            self.stats["draft_rows_started"] += 1
         vonly = not rows
         if vonly:
             if not any(c.state in (RUNNING, PENDING) for r in self.active() for c in r.cohorts):
@@ -374,6 +380,8 @@ class Dispatcher:
                 ev = res["evicted"]
                 if ev is not None:
                     self.stats["evict_protected_only" if ev["protected"] else "evict_released"] += 1
+        if self.cancelled_keys:                                         # K6: kept only while a transfer may still name it
+            self.cancelled_keys &= {tr.requester for tr in self.inflight.values()}
         for pool in self.pools:
             n = pool.poll_releases(self.mut)
             if n:
@@ -491,6 +499,8 @@ class Dispatcher:
         if self.progress is not None:
             self.progress(self, cid)
         self._poll()
+        if self.observer is not None:
+            self.observer(self, "poll", cid, l)
         requests: List[Tuple] = []
         exec_cohorts: List[Tuple[Request, Cohort]] = []
         eligible = [(r, c) for r in self.active() for c in r.cohorts
@@ -517,7 +527,7 @@ class Dispatcher:
             need = self._need(r, c.ws[l]["sel"], l)
             for h in range(self.H):
                 st = self.pools[l].stream(r.b, h)
-                for blocks in need[h]:
+                for blocks in (need[h][1:] if self.mut.no_verifier_ready_protection else need[h]):
                     for j in blocks:
                         st.protect(j, c.key)                       # K2: the exact selection, while it waits
             ok = all(not miss and not infl for _, infl, miss in need)
@@ -537,6 +547,10 @@ class Dispatcher:
             if r.cur is not dr:
                 continue
             q, k, v = draft_pre_raw[id(dr)]
+            for h in range(self.H):
+                if r.dchain[l][h].count != dr.pos:
+                    raise KStepError("D6: the draft chain of uid %s (l %d h %d) holds %d keys at draft position %d"
+                                     % (r.uid, l, h, r.dchain[l][h].count, dr.pos))
             sel = [self.ex.select(l, h, q[h], r.dchain[l][h].cks, dr.pos // self.bs) for h in range(self.H)]
             key = (r.uid, r.epoch, dr.m)
             avail = []
@@ -548,7 +562,8 @@ class Dispatcher:
                 for j in sel[h]:
                     if j >= r.hist_blocks:
                         continue
-                    st.protect(j, key)                                 # K2: hits AND misses, for the cohort of d_s
+                    if not (self.mut.no_draft_hit_protection and st.resident(j) is not None):
+                        st.protect(j, key)                             # K2: hits AND misses, for the cohort of d_s
                     if st.resident(j) is not None:
                         a.append(j)
                     elif j not in st.pending:
@@ -647,6 +662,7 @@ class Dispatcher:
             self.stats["progress"] += 1
             if l == self.L - 1:
                 c.p = {c.a + i: self.ex.dist(c.hidden[i]) for i in range(len(c.positions))}
+                c.hidden = []                                          # K6: the rows' hidden states are no longer held
                 c.state = DONE
         # D1: per stream SUM and UNION of the selected blocks of the executing rows
         per = defaultdict(lambda: [0, set(), 0, set(), 0])
@@ -666,6 +682,8 @@ class Dispatcher:
         if self.cfg.check_invariants and not self.mut.active():
             for st in self.pools[l].streams.values():
                 st.check()
+        if self.observer is not None:
+            self.observer(self, "call", cid, l)
 
     def _prov(self, r: Request, c: Cohort, l: int, h: int, qp: int):
         for cc in r.cohorts:
@@ -831,6 +849,7 @@ class Dispatcher:
 
     def _finish_draft(self, r: Request, dr: Draft) -> None:
         dist = self.ex.dist(dr.hidden)
+        dr.hidden = None                                               # K6: only d and q are kept
         u = rng.uniform(self.cfg.seed, r.uid, dr.pos + 1, r.epoch, "draft")
         dr.d, dr.q = acc.draft_token(self.cfg.mode, dist, u)
         dr.state = DONE
@@ -854,12 +873,42 @@ class Dispatcher:
         r.n_trig = m
         self.stats["cohorts_triggered"] += 1
 
-    def _cohort_record(self, r: Request, c: Cohort, o=None) -> Dict:
+    def _cohort_record(self, r: Request, c: Cohort, o=None, was: Optional[str] = None) -> Dict:
         c.decided_step = self.t
         return dict(m=c.m, a=c.a, b=c.b, E=c.E, positions=list(c.positions), trigger_step=c.trigger_step,
                     decided_step=self.t, state=c.state, exec_call=dict(c.exec_call), vsel=dict(c.vsel),
                     p={i: list(v) for i, v in c.p.items()}, waits=c.waits, row_layers=c.row_layers,
+                    layers_done=c.next_layer, state_at_decision=was or c.state,
                     outcome=None if o is None else dict(n_acc=o.n_acc, i_star=o.i_star, correction=o.correction))
+
+    @staticmethod
+    def _free_cohort(c: Cohort) -> None:
+        """K6: a decided cohort keeps no workspace, hidden state, provisional KV, chains or distributions."""
+        c.ws.clear()
+        c.hidden = []
+        c.prov = {}
+        c.chain = {}
+        c.vsel = {}
+        c.p = {}
+
+    def _rebuild_dchain(self, r: Request) -> None:
+        """D6 / A4 (fix round F5): after a full-acceptance publication the draft chain is the committed exact chain
+        r.comp extended by the draft keys of the still uncommitted positions r.n, r.n + 1, ... in order."""
+        for l in range(self.L):
+            for h in range(self.H):
+                base = r.comp[l][h]
+                if base.count != r.n:
+                    raise KStepError("A5/D6: the committed chain of uid %s (l %d h %d) holds %d keys, n = %d"
+                                     % (r.uid, l, h, base.count, r.n))
+                dk = r.draft_kv[l][h]
+                pos = sorted(dk)
+                if pos != list(range(r.n, r.n + len(pos))):
+                    raise KStepError("D6: draft KV of uid %s (l %d h %d) at %s is not the uncommitted run from n = %d"
+                                     % (r.uid, l, h, pos, r.n))
+                ch = base.copy()
+                for qp in pos:
+                    ch.append(dk[qp][0])
+                r.dchain[l][h] = ch
 
     def _finished_key(self, key) -> None:
         for l in range(self.L):
@@ -878,6 +927,13 @@ class Dispatcher:
             ep["cohorts"].append(self._cohort_record(r, c, o))
             self._finished_key(c.key)
             self._drop_superseded(r)
+            for i in range(c.a, c.b + 1):                              # K6: a committed draft keeps d only
+                dd = r.drafts[i - 1]
+                dd.q, dd.sel, dd.avail = None, {}, {}
+            if not self.mut.no_dchain_rebuild:
+                self._rebuild_dchain(r)
+            r.cohorts.remove(c)                                        # an accepted cohort is no longer held (K6)
+            self._free_cohort(c)
             return
         i_star = o.i_star
         upto_pub = c.b if self.mut.publish_beyond_prefix else i_star
@@ -891,24 +947,29 @@ class Dispatcher:
         self.stats["corrections"] += 1
         ep["cohorts"].append(self._cohort_record(r, c, o))
         self._finished_key(c.key)
+        self._free_cohort(c)
         # C3: cancel every later cohort (triggered or not) and every draft with index >= i_star
         for cc in r.cohorts:
             if cc.state in (PENDING, RUNNING, DONE) and cc is not c:
+                was = cc.state
                 cc.state = CANCELLED
                 self.stats["cohorts_cancelled"] += 1
                 self.stats["verifier_row_layers_cancelled"] += cc.row_layers
                 self.stats["cohort_rows_discarded"] += len(cc.positions)
                 self.stats["workspace_rows_discarded"] += len(cc.ws) * len(cc.positions)
                 cc.ws.clear()
-                ep["cohorts"].append(self._cohort_record(r, cc))
-                self._finished_key(cc.key)
+                ep["cohorts"].append(self._cohort_record(r, cc, was=was))
+                if not self.mut.leak_cancelled_protection:
+                    self._finished_key(cc.key)
                 self._cancel_requester(cc.key)
+                self._free_cohort(cc)
         n_open = cad.cohort_of(len(r.drafts) + 1, self.K)
         for m in range(c.m + 1, n_open + 1):
             k = (r.uid, r.epoch, m)
             if not any(cc.key == k for cc in r.cohorts):
                 self._finished_key(k)
                 self._cancel_requester(k)
+                self.stats["untriggered_keys_cancelled"] += 1
         discarded = [dd for dd in r.drafts if dd.s >= i_star]
         self.stats["draft_steps_discarded"] += len(discarded)
         for dd in discarded:
@@ -1001,26 +1062,44 @@ class Dispatcher:
             self.stats["history_blocks"] += 1
 
     # ================================================================== memory, finish
+    @staticmethod
+    def _chain_entries(ch: CompressedChain) -> int:
+        return len(ch.cks) + len(ch.buf)
+
     def _sample_memory(self) -> None:
-        slots = defaultdict(int)
+        """K6: count EVERY held item (no filter that could hide a leak); MemoryAccountant turns counts into bytes."""
+        n = defaultdict(int)
         for pool in self.pools:
             for k, v in pool.counts().items():
-                slots[k] += v
-        ws_rows = q_vec = dkv = pkv = refs = 0
+                n[k] += v                                              # physical slots by state, FREE included
+            for st in pool.streams.values():
+                n["prot_refs"] += sum(len(v) for v in st.prot.values())
+        if self.mut.mem_no_releasing:
+            n["releasing"] = 0                                         # NEGATIVE CONTROL (fix round F4)
+        n["transfers"] = len(self.inflight)
+        n["release_entries"] = len(self.pending_release) + len(self.key_readers)
         for r in self.active():
-            q_vec += r.lead()
+            drafts = list(r.drafts) + ([r.cur] if r.cur is not None else [])
+            n["drafts"] += len(drafts)
+            for dr in drafts:
+                n["q_vectors"] += dr.q is not None
+                n["hidden_rows"] += dr.hidden is not None
+                n["sel_ids"] += sum(len(x) for v in dr.sel.values() for x in v) + sum(len(x) for v in dr.avail.values() for x in v)
             for l in range(self.L):
                 for h in range(self.H):
-                    dkv += sum(1 for qp in r.draft_kv[l][h] if qp >= r.n)
+                    n["draft_kv_pos"] += len(r.draft_kv[l][h])
+                    n["recent_kv_pos"] += len(r.pub[l][h])
+                    n["ck_entries"] += self._chain_entries(r.comp[l][h]) + self._chain_entries(r.dchain[l][h])
             for c in r.cohorts:
-                if c.state in (ACCEPTED, CANCELLED):
-                    continue
-                ws_rows += len(c.ws) * len(c.positions)
-                pkv += sum(len(d) for lst in c.prov.values() for d in lst)
-        for pool in self.pools:
-            for st in pool.streams.values():
-                refs += sum(len(v) for v in st.prot.values())
-        self.acct.sample(slots, ws_rows, q_vec, dkv, pkv, refs)
+                n["cohorts"] += 1
+                n["workspace_rows"] += len(c.ws) * len(c.positions)
+                n["hidden_rows"] += len(c.hidden)
+                n["p_vectors"] += len(c.p)
+                n["prov_kv_pos"] += sum(len(d) for lst in c.prov.values() for d in lst)
+                n["sel_ids"] += sum(len(x) for rows in c.vsel.values() for row in rows for x in row)
+                n["ck_entries"] += sum(self._chain_entries(ch) for lst in c.chain.values() for ch in lst)
+                n["ck_entries"] += sum(self._chain_entries(ch) for w in c.ws.values() for ch in w["chain"])
+        self.acct.sample({k: n[k] for k in COUNTS})
 
     def finish(self, order: Optional[Tuple[str, ...]] = None) -> None:
         """Drain every stream (deferred reads, scatters, history writes) and validate every deferred read."""
@@ -1039,7 +1118,24 @@ class Dispatcher:
                               verifier_row_layers_cancelled=s["verifier_row_layers_cancelled"], cohort_waits=s["cohort_waits"],
                               verifier_only_passes=s["verifier_only_passes"]),
                     stalls={k[6:]: v for k, v in s.items() if k.startswith("stall_")},
+                    stall_accounting=self.stall_accounting(),
                     sharing_IDEAL=self.sharing(), memory=self.acct.report())
+
+    def stall_accounting(self) -> Dict[str, Any]:
+        """C2 (fix round F3): every (active request, decode step) either starts a draft row or stalls with ONE reason.
+        request_steps = draft_rows_started + stalls; each share is a fraction of request_steps; memory_per_lead is the
+        ratio of 'memory' (pin guard) stalls to 'lead' stalls."""
+        s = self.stats
+        st = {k[6:]: v for k, v in s.items() if k.startswith("stall_")}
+        started = s["draft_rows_started"]
+        tot = started + sum(st.values())
+        out = dict(request_steps=tot, draft_rows_started=started, draft_steps=s["draft_steps"],
+                   lead=st.get("lead", 0), memory=st.get("memory", 0), done=st.get("done", 0))
+        for k in ("lead", "memory", "done"):
+            out["share_" + k] = out[k] / tot if tot else 0.0
+        out["share_draft"] = started / tot if tot else 0.0
+        out["memory_per_lead"] = out["memory"] / out["lead"] if out["lead"] else float("inf") if out["memory"] else 0.0
+        return out
 
     def sharing(self) -> Dict[str, float]:
         """D1 IDEAL sharing from actual selections: sum over calls and streams of UNION / SUM (1.0 = no sharing)."""

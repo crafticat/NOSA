@@ -273,7 +273,7 @@ class LayerPool:
 class Geometry:
     """REAL geometry for byte accounting (K6: 'bytes use the real geometry parameters'). Defaults: NOSA-8B
     (Llama-3.1-8B base): bs 64, D 128, H 2 KV heads, Hq 32, L 32, hidden 4096, vocab 128256, bf16, top-k 64 slots,
-    q vectors stored as fp32."""
+    q and p vectors stored as fp32."""
     bs: int = 64
     D: int = 128
     H: int = 2
@@ -286,23 +286,45 @@ class Geometry:
     q_elem: int = 4
 
     def unit(self) -> Dict[str, int]:
+        """Bytes of one counted item. The metadata sizes are fixed conventions (stated here, used everywhere)."""
         return dict(
             slot=2 * self.bs * self.D * self.elem,                      # K + V of one (layer, head, block)
             pos_kv=2 * self.D * self.elem,                              # K + V of one (layer, head, position)
-            q_vector=self.V * self.q_elem,                              # one recorded q
-            workspace_row=(self.Hq * self.D + 2 * self.H * self.D + self.hidden) * self.elem + self.H * self.topk * 4,
+            q_vector=self.V * self.q_elem,                              # one recorded q (draft distribution)
+            p_vector=self.V * self.q_elem,                              # one verifier distribution p awaiting the decision
+            workspace_row=(self.Hq * self.D + 2 * self.H * self.D) * self.elem + self.H * self.topk * 4,  # q, k, v, sel
+            hidden_row=self.hidden * self.elem,                         # one row's hidden state between layers
+            ck=self.D * self.elem,                                      # one compressed key (or buffered key) of (l, h)
             slot_meta=8 + 1 + 8 + 8,                                    # block id, state, generation, recency
             prot_ref=16,                                                # (cohort key, block) reference
+            transfer_rec=64,                                            # uid, layer, b, h, block, slot, gen, kind, events
+            draft_rec=32,                                               # s, position, input, d, epoch, n_at, state
+            cohort_rec=64,                                              # key, range, state, layer, call ids
+            sel_id=4,                                                   # one block id held in a draft or cohort record
+            release_entry=16,                                           # one release-queue entry or reader-event entry
         )
 
 
-CATS = ("slots_lru", "slots_po", "slots_inflight", "slots_releasing", "staging", "workspace", "q_vectors",
-        "draft_kv", "provisional_kv", "metadata")
+CATS = ("slots_free", "slots_lru", "slots_po", "slots_inflight", "slots_releasing", "staging", "workspace", "hidden",
+        "q_vectors", "p_vectors", "draft_kv", "provisional_kv", "recent_kv", "compressed_keys", "metadata")
+
+# the counts one sample takes (every key is required: a missing count is an error, never a silent zero)
+COUNTS = (FREE, LRU, PO, INFLIGHT, RELEASING, "workspace_rows", "hidden_rows", "q_vectors", "p_vectors", "draft_kv_pos",
+          "prov_kv_pos", "recent_kv_pos", "ck_entries", "prot_refs", "transfers", "drafts", "cohorts", "sel_ids",
+          "release_entries")
 
 
 class MemoryAccountant:
     """K6: peak and time-average bytes per category, sampled at every joint call. Counts come from the run; bytes are
-    counts x the REAL per-unit sizes of `geom`. staging is the S0 ring (pinned staging + device landing) in bytes."""
+    counts x the REAL per-unit sizes of `geom`. staging is the S0 ring (pinned staging + device landing) in bytes.
+
+    Categories: physical slots by state, FREE included (M1 backs every stream with C + X slot positions, ownership
+    docstring K5); staging; saved verifier workspace (q/k/v + selections per row and layer); hidden states held between
+    layers (rows of RUNNING cohorts and draft rows of the current step); every held recorded q; every verifier p of a
+    DONE cohort; every held draft KV entry; every held provisional KV entry; the published exact KV of the recent region;
+    every held compressed or buffered key (committed chain, draft chain, cohort chains); metadata (every physical slot,
+    protection references, in-flight transfer records, draft and cohort records with their block ids, release-queue and
+    reader-event entries). M1 test instrumentation (trace, logs, the deferred-read validators) is not counted."""
 
     def __init__(self, geom: Optional[Geometry] = None, staging_bytes: int = 0):
         self.geom = geom or Geometry()
@@ -312,22 +334,35 @@ class MemoryAccountant:
         self.sum = {k: 0 for k in CATS + ("total",)}
         self.n = 0
         self.last: Dict[str, int] = {}
+        self.last_counts: Dict[str, int] = {}
 
-    def sample(self, slots: Dict[str, int], workspace_rows: int, q_vectors: int, draft_kv_pos: int, prov_kv_pos: int,
-               prot_refs: int) -> Dict[str, int]:
+    def bytes_of(self, n: Dict[str, int]) -> Dict[str, int]:
+        missing = [k for k in COUNTS if k not in n]
+        if missing:
+            raise KeyError("K6 sample lacks counts %s" % missing)
         u = self.u
-        n_slots = slots.get(LRU, 0) + slots.get(PO, 0) + slots.get(INFLIGHT, 0) + slots.get(RELEASING, 0)
-        b = dict(slots_lru=slots.get(LRU, 0) * u["slot"], slots_po=slots.get(PO, 0) * u["slot"],
-                 slots_inflight=slots.get(INFLIGHT, 0) * u["slot"], slots_releasing=slots.get(RELEASING, 0) * u["slot"],
-                 staging=self.staging_bytes, workspace=workspace_rows * u["workspace_row"], q_vectors=q_vectors * u["q_vector"],
-                 draft_kv=draft_kv_pos * u["pos_kv"], provisional_kv=prov_kv_pos * u["pos_kv"],
-                 metadata=n_slots * u["slot_meta"] + prot_refs * u["prot_ref"])
+        n_slots = n[FREE] + n[LRU] + n[PO] + n[INFLIGHT] + n[RELEASING]
+        b = dict(slots_free=n[FREE] * u["slot"], slots_lru=n[LRU] * u["slot"], slots_po=n[PO] * u["slot"],
+                 slots_inflight=n[INFLIGHT] * u["slot"], slots_releasing=n[RELEASING] * u["slot"],
+                 staging=self.staging_bytes, workspace=n["workspace_rows"] * u["workspace_row"],
+                 hidden=n["hidden_rows"] * u["hidden_row"], q_vectors=n["q_vectors"] * u["q_vector"],
+                 p_vectors=n["p_vectors"] * u["p_vector"], draft_kv=n["draft_kv_pos"] * u["pos_kv"],
+                 provisional_kv=n["prov_kv_pos"] * u["pos_kv"], recent_kv=n["recent_kv_pos"] * u["pos_kv"],
+                 compressed_keys=n["ck_entries"] * u["ck"],
+                 metadata=(n_slots * u["slot_meta"] + n["prot_refs"] * u["prot_ref"] + n["transfers"] * u["transfer_rec"]
+                           + n["drafts"] * u["draft_rec"] + n["cohorts"] * u["cohort_rec"] + n["sel_ids"] * u["sel_id"]
+                           + n["release_entries"] * u["release_entry"]))
         b["total"] = sum(b[k] for k in CATS)
+        return b
+
+    def sample(self, counts: Dict[str, int]) -> Dict[str, int]:
+        b = self.bytes_of(counts)
         for k, v in b.items():
             self.peak[k] = max(self.peak[k], v)
             self.sum[k] += v
         self.n += 1
         self.last = b
+        self.last_counts = dict(counts)
         return b
 
     def report(self) -> Dict[str, Dict[str, float]]:

@@ -1,6 +1,9 @@
-"""R6 negative controls: TEST-ONLY switches. Every switch is OFF by default and the dispatcher reads them at the exact
-code point the mutation breaks. A test turns one on and must FAIL (retroinfer-eval tests/test_kstep_mutations.py).
-The pattern follows benchmarks/Efficiency/cpupack_core.py:497-510 (Faults) and feeder_core.FeederFaults."""
+"""Negative controls: TEST-ONLY switches. Every switch is OFF by default and the dispatcher reads them at the exact code
+point the mutation breaks. A test turns one on and must FAIL (retroinfer-eval tests/test_kstep_mutations.py).
+The pattern follows benchmarks/Efficiency/cpupack_core.py:497-510 (Faults) and feeder_core.FeederFaults.
+
+R6 lists the 16 mutations of spec section 7 R6. EXTRA lists the negative controls of the M1 fix round (checker findings
+F1, F2, F4, F5): each one survived the first M1 suite and is caught by a test of the fix round."""
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
@@ -8,6 +11,7 @@ from dataclasses import dataclass, fields
 
 @dataclass
 class Mutations:
+    # ---------------------------------------------------------------- spec R6
     free_on_cancel: bool = False            # T3: a cancelled requester frees its in-flight destination before landing
     no_reader_wait: bool = False            # T3/K4: a slot is reused without waiting for its previous reader event
     publish_draft_kv: bool = False          # A4: the draft KV is published as committed KV
@@ -24,9 +28,18 @@ class Mutations:
     draft_k_then_stop: bool = False         # C2: a request stops drafting after K drafts until its cohort is verified
     no_compressed_rollback: bool = False    # A6: the draft compressed-key chain is not restored at a new epoch
     read_not_ready: bool = False            # D3b/T4: a verifier executes a layer with an in-flight block
+    # ---------------------------------------------------------------- fix round (not in R6)
+    leak_cancelled_protection: bool = False     # K4/C3 (F1): a cancelled cohort's protections are never queued for release
+    no_draft_hit_protection: bool = False       # K2 (F2): a draft row protects its misses only, not its hits
+    no_verifier_ready_protection: bool = False  # K2 (F2): a waiting verifier protects in-flight and missing blocks only
+    mem_no_releasing: bool = False              # K6 (F4): the memory sample omits RELEASING slots
+    no_dchain_rebuild: bool = False             # D6/A4 (F5): the draft chain keeps draft keys of published positions
 
     def active(self):
         return [f.name for f in fields(self) if getattr(self, f.name)]
 
 
 NAMES = tuple(f.name for f in fields(Mutations))
+EXTRA = ("leak_cancelled_protection", "no_draft_hit_protection", "no_verifier_ready_protection", "mem_no_releasing",
+         "no_dchain_rebuild")
+R6 = tuple(n for n in NAMES if n not in EXTRA)

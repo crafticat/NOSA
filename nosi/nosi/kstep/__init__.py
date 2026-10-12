@@ -16,7 +16,7 @@ Modules (each names the spec clauses it implements):
   backend      -       the stream-backend interface (the cpupack_core CpuBackend / CudaBackend shape) and ev_done()
   executor     D1, D5  the model-executor interface that M2's GPU executor implements (M1: the toy model, test side)
   dispatcher   D1-D6, A3-A7, C1-C4, K1-K5, T2-T4: the REAL dispatch (the tests drive this class, never a copy)
-  mutations    R6      TEST-ONLY negative-control switches (all off by default)
+  mutations    R6      TEST-ONLY negative-control switches (all off by default): the 16 of R6 and 5 of the fix round
 
 Labels: no timing, throughput, interference or memory-fit claim (spec section 9). The KV read sharing recorded per call
 (D1) is the IDEAL from actual selections (SUM vs UNION of selected blocks), not a measured kernel saving.
