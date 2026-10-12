@@ -101,6 +101,7 @@ ACCURACY pilot; nothing here may be quoted as a speed number.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 from collections import OrderedDict
@@ -309,23 +310,72 @@ class AvailPolicy:
         self.rows_header = ("call", "doc", "site", "role", "layer", "head", "req",
                             "sel", "phys_hit", "model_hit", "denied", "ready",
                             "unexpressible", "lru_match", "point_id", "pos")
+        # PER-LAYER ALLOCATION (accept-alloc study). All three stay None/False
+        # for every point registered without them, and then not one branch
+        # below differs from the archived policy.
+        self.caps = None                 # active point's per-layer capacities
+        self.deny_layers = None          # active point's fully denied layers
+        self.protect = False             # rollout-local protection emulation
+        self.protected = {}              # stream -> blocks selected by this rollout's drafts
+        self.present = {}                # stream -> protected blocks that were physically present
+        self.prot_log = []               # (call, layer, protected_only, extra_ready)
+        self.sel_log = None              # opt-in: {(call, layer, h, b): (sel digest, denied digest)}
 
     # -- availability points ---------------------------------------------------
     def register_point(self, pid: int, capacity: int, delay: float, instep: float = 0.0,
-                       ablate: str = "none", ready: float = 1.0):
+                       ablate: str = "none", ready: float = 1.0, layer_caps=None,
+                       deny_layers=None, protect=None):
+        """`layer_caps` (a tuple, one capacity per layer), `deny_layers` (layers
+        whose every non-tail slot a draft step denies: the positive control) and
+        `protect` (rollout-local protection) are the accept-alloc extensions.
+        None keeps the archived behaviour bit for bit."""
         if ablate not in ABLATIONS:
             raise ValueError("ablate=%r not in %s" % (ablate, ABLATIONS))
+        if layer_caps is not None:
+            layer_caps = tuple(int(c) for c in layer_caps)
+            if not layer_caps or min(layer_caps) < 1:
+                raise ValueError("layer_caps must be a non-empty tuple of capacities >= 1")
+        if deny_layers is not None:
+            deny_layers = frozenset(int(l) for l in deny_layers)
         self.points[int(pid)] = dict(C=int(capacity), d=float(delay), f=float(instep),
-                                     ablate=ablate, ready=float(ready), streams={})
+                                     ablate=ablate, ready=float(ready), streams={},
+                                     caps=layer_caps, deny_layers=deny_layers,
+                                     protect=bool(protect))
         return self.points[int(pid)]
+
+    @staticmethod
+    def cap_of(c: dict, layer: int) -> int:
+        """The capacity of ONE stream of point `c`: its own layer's entry when the
+        point has a per-layer vector, else the scalar C. A layer index outside
+        the vector is a hard error, never a silent fallback to C."""
+        caps = c.get("caps")
+        if caps is None:
+            return c["C"]
+        if not (0 <= layer < len(caps)):
+            raise IndexError("layer %r outside the %d-entry capacity vector" % (layer, len(caps)))
+        return caps[layer]
+
+    @staticmethod
+    def caps_digest(caps) -> str:
+        if caps is None:
+            return "none"
+        return hashlib.sha256(",".join(str(int(c)) for c in caps).encode()).hexdigest()[:16]
 
     def clear_points(self):
         self.points = {}
 
     def point_label(self, pid: int = None) -> str:
         c = self.points[self.active if pid is None else pid]
-        return ("mech=%s,C=%d,d=%s,f=%g,ablate=%s,ready=%g"
-                % (self.mech, c["C"], c["d"], c["f"], c["ablate"], c["ready"]))
+        lab = ("mech=%s,C=%d,d=%s,f=%g,ablate=%s,ready=%g"
+               % (self.mech, c["C"], c["d"], c["f"], c["ablate"], c["ready"]))
+        # APPENDED only when set, so an archived point keeps its archived label
+        if c.get("caps") is not None:
+            lab += ",caps=%s" % self.caps_digest(c["caps"])
+        if c.get("deny_layers"):
+            lab += ",deny_layers=%s" % "+".join(str(l) for l in sorted(c["deny_layers"]))
+        if c.get("protect"):
+            lab += ",protect=1"
+        return lab
 
     def is_natural(self, pid: int = None) -> bool:
         """True when the omitted blocks are the ones a real cache omits AND
@@ -421,6 +471,11 @@ class AvailPolicy:
         self.active = int(pid)
         self.capacity, self.delay, self.instep = c["C"], c["d"], c["f"]
         self.ablate, self.ready_target = c["ablate"], c["ready"]
+        self.caps = c.get("caps")
+        self.deny_layers = c.get("deny_layers")
+        self.protect = bool(c.get("protect"))
+        self.protected = {}
+        self.present = {}
         self.draft_j = 0
         self.streams = {}
         for k, v in c["streams"].items():
@@ -433,6 +488,8 @@ class AvailPolicy:
 
     def end_rollout(self):
         self.streams = {}
+        self.protected = {}
+        self.present = {}
 
     def begin_step(self):
         """Called from nosa_llama.decode_inference, next to the transfer_trace
@@ -489,6 +546,8 @@ class AvailPolicy:
         tail = self.tail_slot
         deny = [[[False] * M for _ in range(B)] for _ in range(H)]
         any_deny = False
+        self._prot_only = 0              # protected-only slots, this layer, all streams
+        self._prot_extra = 0             # blocks made readable by protection, this layer
         for h in range(H):
             for b in range(B):
                 row_map = new_map[h][b]
@@ -518,7 +577,9 @@ class AvailPolicy:
                     for c in self.points.values():
                         vc = c["streams"].get(key)
                         if vc is None:
-                            vc = VirtualCache(c["C"], WARM_DELAY, 0.0)
+                            # EACH POINT WARMS AT ITS OWN CAPACITY FOR THIS
+                            # LAYER: an arm's cache is never a copy of another's
+                            vc = VirtualCache(self.cap_of(c, self.layer), WARM_DELAY, 0.0)
                             c["streams"][key] = vc
                         vc.step(sel)
                     # a warm step advances EVERY point, so it belongs to none:
@@ -529,7 +590,8 @@ class AvailPolicy:
                     continue
                 vc = self.streams.get(key)
                 if vc is None:
-                    vc = VirtualCache(self.capacity, self.delay, self.instep)
+                    cap = self.capacity if self.caps is None else self.caps[self.layer]
+                    vc = VirtualCache(cap, self.delay, self.instep)
                     self.streams[key] = vc
                 avail, before = vc.step(sel)
                 model_hit = len(before & set(sel))
@@ -542,8 +604,28 @@ class AvailPolicy:
                                         + h * 3 + b)
                     keep = int(round(self.ready_target * len(sel)))
                     avail = set(rng.sample(sorted(sel), min(max(keep, 0), len(sel))))
+                if self.protect:
+                    # ROLLOUT-LOCAL PROTECTION EMULATION (older-policy
+                    # diagnostic, NOT the M1-tested retention reference). A block
+                    # an earlier draft step of THIS rollout selected, and that
+                    # was physically present at some point of the rollout, keeps
+                    # its slot after the LRU evicts it, so it stays readable. A
+                    # requested block that never arrived (d = inf, or still in
+                    # flight) is protected but has no payload: not readable.
+                    prot = self.protected.setdefault(key, set())
+                    pres = self.present.setdefault(key, set())
+                    extra = (set(sel) & pres) - avail
+                    avail = avail | extra
+                    prot.update(sel)
+                    pres.update(prot & (set(vc.res) | avail))
+                    self._prot_extra += len(extra)
+                    self._prot_only += len(pres - set(vc.res))
+                if self.deny_layers is not None and self.layer in self.deny_layers:
+                    # POSITIVE CONTROL: every non-tail slot of this layer denied
+                    avail = set()
                 lru_match = -1
-                if self.capacity == 63 and self.delay == 1 and self.instep == 0.0:
+                if (self.caps is None and self.capacity == 63 and self.delay == 1
+                        and self.instep == 0.0):
                     phys_res = {row_map[m] for m in range(M) if m != tail and row_mask[m] < 0}
                     lru_match = int(phys_res == (before & set(sel)))
                 unexpressible = denied = 0
@@ -566,6 +648,12 @@ class AvailPolicy:
                                      model_hit, denied, len(sel) - denied,
                                      unexpressible, lru_match, self.active,
                                      self.draft_j))
+                if self.sel_log is not None:
+                    den = sorted(row_map[m] for m in range(M) if deny[h][b][m])
+                    self.sel_log[(self.call, self.layer, h, b)] = (
+                        _digest(sorted(sel)), _digest(den))
+        if self.role == ROLE_DRAFT and self.protect:
+            self.prot_log.append((self.call, self.layer, self._prot_only, self._prot_extra))
         if self.role != ROLE_DRAFT or not any_deny:
             self._deny_cpu = None
             self._deny_dev = None
@@ -687,6 +775,11 @@ class AvailPolicy:
             head[(r[4], r[5])][1] += r[7]
         return dict(per_layer={k: (v[0] / v[1] if v[1] else float("nan")) for k, v in lay.items()},
                     per_layer_head={k: (v[0] / v[1] if v[1] else float("nan")) for k, v in head.items()})
+
+
+def _digest(ids) -> str:
+    """A stable digest of a sorted block-id list (selection or denied set)."""
+    return hashlib.sha256(",".join(str(int(i)) for i in ids).encode()).hexdigest()[:16]
 
 
 POLICY: "AvailPolicy | None" = None
