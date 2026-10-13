@@ -61,6 +61,33 @@ pins (_queue_release, _finished_key, the release step of _poll, _protect), R2 dr
 and VRES (_add_demand, the recency step of _call, Stream.admit / Stream.acquire), R3 join_step at PENDING -> RUNNING.
 OBSERVER (test hook, fix round): observer(dispatcher, phase, call id, layer) runs after the host poll of a joint call
 (phase "poll") and at its end (phase "call"); the M1 tests install a test-side auditor of K2, K4 and K6 there.
+
+CAPACITY MODE "rev6" (Config.capacity; default "m1" keeps every M1 rule above unchanged). The contract of retroinfer-eval
+docs/superpowers/specs/2026-10-12-kstep-m1-progress-policy-PROPOSAL.md rev 6, section 8 (Codex approval 2026-10-13 for a
+limited CPU implementation; the C >= (2K + 1) * max_sel guard and the pin guard are UNCHANGED and still apply):
+  L4  construction refuses d_h < W = (K + 1) * S_max and H * d_h > X_d = X - R_ver (S_max = the asserted row bound,
+      pin_row_bound or executor.max_sel). d_h >= W is a conservative SUFFICIENT share for this guarantee mode, not a
+      proven minimum. Each active request reserves H * d_h shared draft positions per layer, all-or-nothing, in request
+      age order, without overtaking (_rev6_reserve; stall reason "admission"); an ended request's reservation returns
+      only when every slot it owned is FREE.
+  L2  P(stream) = its non-FREE "ad" slots (an unpinned LRU entry and a RELEASING slot count until FREE).
+  SC2 at the step start (before layer 0) a request starts a draft step only if, on every stream of every layer,
+      untriggered draft pins + (T - s + 1) * S_max <= d_h ("horizon") and P + S_max <= C + d_h ("capacity"); it then
+      holds S_max STEP CREDITS on every (layer, head) at once (Request.credits).
+  SC3 only the row's own new "ad" positions take a credit: a draft fetch (_issue), the V -> A / D conversion of a VRES
+      read (_draft_recency) or of a draft join to a verify-only transfer (_add_demand, _issue). The unused credits of
+      layer l return at the end of the joint call of layer l. A missing credit is an OwnershipViolation (SC4), never a
+      refused fetch: fetch_draft_refused stays 0.
+  G1-G6 verifier residual fetches are class "v". At layer l the eligible waiting cohorts are taken in age order
+      (trigger step, request age): an ungranted cohort pins only "ad" blocks (resident or in flight); the oldest one is
+      GRANTED when its new fetches fit the free verifier reserve (R_ver - v_used(l)) and the FREE positions of its streams
+      that no credit holds; no younger cohort is granted at that layer in the same call (no overtaking). A granted cohort
+      pins its whole exact selection (sharing "v" slots that another grant holds: inheritance without a free) and
+      requests its misses. Refused with nothing outstanding at the layer: CapacityRefusal (G5). _verifier_evict is never
+      called (G6).
+  L9  verifier pins never take a credit or a FREE position; Stream.pin_kind records the provenance (evict_log).
+  Verifier-only passes with a rev6 'capacity' / 'admission' stall force every transfer and reader event; with no cohort
+      and nothing outstanding the request is refused (CapacityRefusal), never spun.
 """
 from __future__ import annotations
 
@@ -76,15 +103,16 @@ from . import cadence as cad
 from . import rng
 from .backend import check_backend, ev_done
 from .compressed import CompressedChain
-from .errors import ConfigError, KStepError, NoProgress, OwnershipViolation, ReadCorruption
+from .errors import CapacityRefusal, ConfigError, KStepError, NoProgress, OwnershipViolation, ReadCorruption
 from .executor import DRAFT, VERIFY, Row, check_executor
 from .mutations import Mutations
-from .ownership import COUNTS, Geometry, LayerPool, MemoryAccountant
+from .ownership import COUNTS, FREE, LRU, PO, RELEASING, VRES, Geometry, LayerPool, MemoryAccountant
 from .transfer import Transfer
 
 POISON = -7777777                         # no toy KV value is negative
 
 PENDING, RUNNING, DONE, ACCEPTED, CANCELLED = "pending", "running", "done", "accepted", "cancelled"
+CAPACITY_MODES = ("m1", "rev6")
 
 
 @dataclass
@@ -104,6 +132,8 @@ class Config:
     drain_order: Tuple[str, ...] = ("copy", "scatter", "compute", "d2h")
     pin_guard: bool = True                 # memory refusal of drafting that guarantees head-cohort progress (see below)
     pin_row_bound: Optional[int] = None    # blocks one (row, head) may select; default executor.max_sel
+    capacity: str = "m1"                   # "m1" (the M1 rules) | "rev6" (PROPOSAL rev 6 contract; see the docstring)
+    d_share: Optional[int] = None          # rev6: per-head draft share d_h; default W = (K + 1) * S_max; < W is refused
 
 
 class Draft:
@@ -138,6 +168,7 @@ class Cohort:
         self.waits = 0
         self.row_layers = 0
         self.decided_step = None
+        self.granted = set()                   # rev6 G3: the layers at which this cohort holds a verifier grant
 
     def __repr__(self):
         return "Cohort(uid=%s e=%d m=%d [%d,%d] %s L%d)" % (self.uid, self.epoch, self.m, self.a, self.b, self.state, self.next_layer)
@@ -163,6 +194,7 @@ class Request:
         self.hist_blocks = 0
         self.hist_ev: Dict[Tuple[int, int], Any] = {}
         self.cur: Optional[Draft] = None
+        self.credits: Optional[List[List[int]]] = None   # rev6 SC2: step credits [layer][head] of the current draft step
 
     def u(self, i: int) -> int:
         return self.toks[self.E] if i == 0 else self.drafts[i - 1].d
@@ -199,6 +231,32 @@ class Dispatcher:
         if cfg.pin_guard and cfg.C < (2 * self.K + 1) * self.rb:
             raise ConfigError("D4 progress guarantee: C = %d < (2K + 1) * max_sel = %d (pin_guard=True; see Dispatcher docs)"
                               % (cfg.C, (2 * self.K + 1) * self.rb))
+        if cfg.capacity not in CAPACITY_MODES:
+            raise ConfigError("capacity must be one of %s (got %r)" % (CAPACITY_MODES, cfg.capacity))
+        self.rev6 = cfg.capacity == "rev6"
+        self.W = (self.K + 1) * self.rb                       # rev6 L3: positions through the next trigger, per stream
+        self.X_d = cfg.X - cfg.R_ver                          # rev6 L1: the shared draft pool per layer
+        self.N_max = self.H * self.K * self.rb                # rev6 section 5: one cohort's largest residual footprint
+        self.d_share = 0
+        if self.rev6:
+            d = self.W if cfg.d_share is None else int(cfg.d_share)
+            if d < self.W:
+                raise ConfigError("rev6 L4: per-head draft share d_h = %d < W = (K + 1) * S_max = %d (guarantee mode)"
+                                  % (d, self.W))
+            if self.H * d > self.X_d:
+                raise ConfigError("rev6 L4: one request needs H * d_h = %d shared draft positions per layer > X_d = X - R_ver"
+                                  " = %d (H %d, d_h %d)" % (self.H * d, self.X_d, self.H, d))
+            if cfg.R_ver < self.N_max and not self.mut.rev6_admit_small_reserve:
+                raise ConfigError("rev6 G5: R_ver = %d < N_max = H * K * S_max = %d (guarantee mode)" % (cfg.R_ver, self.N_max))
+            self.d_share = d
+        self.age: Dict[Any, int] = {}              # uid -> batch admission order (rev6 request age)
+        self.dres: Dict[Any, bool] = {}            # rev6 L4: uid -> reservation held (True: active, False: ended, draining)
+        self.dres_b: Dict[Any, int] = {}           # rev6: batch slot of an ended request whose reservation drains
+        self.grant_log: List[Tuple] = []           # rev6 G3: (call, layer, uid, cohort key, new fetches, free V after)
+        self.evict_log: List[Tuple] = []           # (call, layer, b, h, block, protected, kinds, where): every LRU eviction
+        self.late_log: List[Tuple] = []            # (call, layer, b, h, block, displaced (block, protected, kinds) or None)
+        self.res_log: List[Tuple] = []             # rev6 L4: (step, uid) of every reservation
+        self._rev6_stalled = False
         self.pools = [LayerPool(l, cfg.B, self.H, cfg.C, cfg.X, cfg.R_ver) for l in range(self.L)]
         n_pos = self.pools[0].n_pos
         self.n_pos = n_pos
@@ -261,6 +319,7 @@ class Dispatcher:
             r = Request(uid, b, prompt, N, self.L, self.H, self.stride, self.ex.compress)
             self.reqs[uid] = r
             self.slot_req[b] = r
+            self.age[uid] = len(self.age)
             for l in range(self.L):
                 for h in range(self.H):
                     self.pools[l].stream(b, h).owner = uid
@@ -285,6 +344,10 @@ class Dispatcher:
         self.key_readers = {k: v for k, v in self.key_readers.items() if k[0][0] != r.uid}
         self.rel_layers = {k: v for k, v in self.rel_layers.items() if k[0] != r.uid}
         r.done = True
+        r.credits = None
+        if r.uid in self.dres:                                         # rev6 L4: returned once its slots are all FREE
+            self.dres[r.uid] = False
+            self.dres_b[r.uid] = r.b
         self.results[r.uid] = r.toks[r.P0:r.P0 + r.N]
         self.trace[r.uid]["final"] = list(r.toks)
         self.slot_req[r.b] = None
@@ -302,6 +365,8 @@ class Dispatcher:
     def step(self) -> None:
         t = self.t
         self._admit()
+        if self.rev6:
+            self._rev6_reserve()
         for r in self.active():
             for c in r.cohorts:
                 if c.state == PENDING and c.trigger_step < t:
@@ -314,12 +379,17 @@ class Dispatcher:
                     c.join_step = t                                     # R3.1
                     c.hidden = [self.ex.embed(tok) for tok in c.tokens]
         rows: List[Tuple[Request, Draft]] = []
+        self._rev6_stalled = False
         for r in self.active():
             why = self._stall_reason(r)
             if why:
                 self.stalls.append((t, r.uid, why, r.lead()))
                 self.stats["stall_" + why] += 1
+                if why in ("admission", "horizon", "capacity"):
+                    self._rev6_stalled = True
                 continue
+            if self.rev6:
+                self._reserve_credits(r)                               # SC2: before layer 0, every (layer, head) at once
             s = len(r.drafts) + 1
             dr = Draft(s, r.E + s - 1, r.u(s - 1), r.epoch, r.n, cad.cohort_of(s, self.K), t)
             dr.hidden = self.ex.embed(dr.tok_in)
@@ -329,11 +399,17 @@ class Dispatcher:
         vonly = not rows
         if vonly:
             if not any(c.state in (RUNNING, PENDING) for r in self.active() for c in r.cohorts):
-                if self.active():
+                if not self.active():
+                    self.t += 1
+                    return
+                if not (self.rev6 and self._rev6_stalled):
                     raise KStepError("step %d: no draft row and no cohort, but requests are active" % t)
-                self.t += 1
-                return
+                if not self._rev6_outstanding():
+                    raise CapacityRefusal("rev6 step %d: every active request stalls (%s), no cohort runs and no transfer, "
+                                          "reader event or release is outstanding" % (t, [x for x in self.stalls if x[0] == t]))
             self.stats["verifier_only_passes"] += 1
+            if self.rev6 and self._rev6_stalled:
+                self._rev6_force_all()                                 # rev6: free 'capacity' / 'admission' stalls
             for key_l in [x for x in self.pending_release]:              # D4: protections waiting for a reader event
                 fr, lr = self.key_readers.get(key_l, (None, None))
                 if lr is not None and not ev_done(lr):
@@ -364,6 +440,8 @@ class Dispatcher:
             return "lead"
         if self.cfg.pin_guard and self._pins_high(r):
             return "memory"
+        if self.rev6:
+            return self._rev6_stall(r)
         return None
 
     def _pins_high(self, r: Request) -> bool:
@@ -383,6 +461,246 @@ class Dispatcher:
                 if len(st.prot) + self.rb > lim:
                     return True
         return False
+
+    # ================================================================== capacity mode rev6 (PROPOSAL rev 6, section 8)
+    def _rev6_reserve(self) -> None:
+        """L4 at the step start. An ended request's reservation returns once every slot it owned (any layer, any head of
+        its batch slot) is FREE. Then every active request without a reservation that still drafts gets H * d_h shared
+        draft positions per layer (the same at every layer), in request age order and without overtaking: when the
+        oldest such request does not fit, no younger one is served."""
+        for uid in [u for u, live in self.dres.items() if not live]:
+            if not self._owns_slots(uid, self.dres_b[uid]):
+                del self.dres[uid]
+                del self.dres_b[uid]
+                self.stats["rev6_reservations_returned"] += 1
+        need = self.H * self.d_share
+        free = self.X_d - need * len(self.dres)
+        for r in sorted(self.active(), key=lambda x: self.age[x.uid]):
+            if r.uid in self.dres or r.drafting_done:
+                continue
+            if need > free:
+                break
+            self.dres[r.uid] = True
+            self.res_log.append((self.t, r.uid))
+            free -= need
+            self.stats["rev6_reservations"] += 1
+
+    def _owns_slots(self, uid, b: int) -> bool:
+        for pool in self.pools:
+            for h in range(self.H):
+                for s in pool.stream(b, h).slots:
+                    if s.state != FREE and s.owner == uid:
+                        return True
+        return False
+
+    def _positions(self, st) -> int:
+        """L2: P of a stream (every non-FREE "ad" slot). NEGATIVE CONTROL rev6_unpinned_lru_counts_free: the rev-5 rule,
+        an unpinned LRU entry counted as available."""
+        if self.mut.rev6_unpinned_lru_counts_free:
+            return st.positions() - st.unpinned_lru()
+        return st.positions()
+
+    @staticmethod
+    def _untriggered_pins(r: Request, st) -> int:
+        """SC2(a): the blocks of the stream that a key of an UNTRIGGERED cohort of r's current epoch references (only draft
+        rows reference them: no verifier exists before the trigger)."""
+        n = 0
+        for keys in st.prot.values():
+            if any(isinstance(k, tuple) and len(k) == 3 and k[0] == r.uid and k[1] == r.epoch and k[2] > r.n_trig
+                   for k in keys):
+                n += 1
+        return n
+
+    def _rev6_stall(self, r: Request) -> Optional[str]:
+        """SC2 at the step start: 'admission' (no L4 reservation), 'horizon' (SC2a: untriggered pins + (T - s + 1) * S_max
+        > d_h on some stream; never with d_h >= W, P6 ii) or 'capacity' (SC2b: P + S_max > C + d_h on some stream). It
+        reserves nothing (_reserve_credits does, after this returns None)."""
+        if r.uid not in self.dres:
+            return "admission"
+        s = len(r.drafts) + 1
+        T = ((s + self.K - 1) // self.K) * self.K
+        cap = self.cfg.C + self.d_share
+        horizon = capacity = False
+        for l in range(self.L):
+            for h in range(self.H):
+                st = self.pools[l].stream(r.b, h)
+                if self._untriggered_pins(r, st) + (T - s + 1) * self.rb > self.d_share:
+                    horizon = True
+                if self._positions(st) + self.rb > cap:
+                    capacity = True
+        if horizon:
+            return "horizon"
+        if capacity:
+            return "capacity"
+        return None
+
+    def _reserve_credits(self, r: Request) -> None:
+        """SC2: S_max step credits on EVERY (layer, head) at once, before layer 0. NEGATIVE CONTROL
+        rev6_partial_reservation: layer 0 only."""
+        part = self.mut.rev6_partial_reservation
+        r.credits = [[self.rb if (l == 0 or not part) else 0 for _ in range(self.H)] for l in range(self.L)]
+        self.stats["rev6_credits_reserved"] += sum(sum(x) for x in r.credits)
+
+    def _take_credit(self, r: Request, l: int, h: int, why: str) -> None:
+        """SC3: one credit for one new "ad" position of r's draft row at (l, h). None left: the SC4 contract is broken."""
+        cr = r.credits
+        if cr is None or cr[l][h] < 1:
+            raise OwnershipViolation("rev6 SC4: the draft row of uid %s needs a new A / D position at layer %d head %d (%s) but "
+                                     "holds no step credit (credits %s)" % (r.uid, l, h, why, cr))
+        cr[l][h] -= 1
+        self.stats["rev6_credits_" + why] += 1                         # rev6_credits_fetch / _join / _vres
+
+    def _credits_held(self, b: int, l: int, h: int) -> int:
+        r = self.slot_req[b]
+        return 0 if r is None or r.credits is None else r.credits[l][h]
+
+    def _rev6_outstanding(self) -> bool:
+        return bool(self.inflight) or bool(self.pending_release) or any(
+            s.state == RELEASING for pool in self.pools for st in pool.streams.values() for s in st.slots)
+
+    def _rev6_force_all(self) -> None:
+        """A verifier-only pass with a rev6 'admission' / 'horizon' / 'capacity' stall: force every transfer in flight, every
+        RELEASING slot's reader event and every queued release's reader event (the deferred CPU model completes nothing
+        on its own; a GPU completes them without a host wait)."""
+        for tr in sorted(self.inflight.values(), key=lambda x: x.seq):
+            self.tp.force(tr)
+            self.stats["forced_transfers"] += 1
+        for pool in self.pools:
+            for ev in pool.releasing_gates():
+                self.be.host_wait(ev)
+                self.stats["forced_readers"] += 1
+        for key_l, (fr, lr) in list(self.key_readers.items()):
+            if lr is not None and not ev_done(lr):
+                self.be.host_wait(lr)
+                self.stats["forced_readers"] += 1
+
+    def _is_ad(self, st, j: int) -> bool:
+        """G2: may an UNGRANTED verifier pin block j of stream st? Only a resident or in-flight slot of class "ad"."""
+        idx = st.resident(j)
+        if idx is None:
+            idx = st.pending.get(j)
+        return idx is not None and st.slots[idx].cls != "v"
+
+    def _rev6_verifiers(self, l: int, eligible, requests: List[Tuple], exec_cohorts: List[Tuple]) -> None:
+        """G1-G6 at layer l (replaces the M1 verifier loop of _call). The eligible cohorts in age order (trigger step,
+        request age, m). An ungranted cohort is granted when no older eligible cohort was refused at this layer in this
+        call (no overtaking), its new residual fetches fit the free verifier reserve, and every stream has that many FREE
+        positions that no step credit holds. A granted cohort pins its whole exact selection (a "v" slot of another grant
+        is shared, so it moves to this grant without a free when the other releases it, G4a) and requests its misses
+        (class "v"); an ungranted cohort pins only "ad" blocks (G2) and requests nothing. After a refusal the next
+        verifier-only pass forces every transfer and reader event of the layer; G5 raises CapacityRefusal when nothing
+        at the layer is outstanding."""
+        pool = self.pools[l]
+        v_free = self.cfg.R_ver - pool.v_used()
+        refused = None
+        order = sorted(eligible, key=lambda rc: (rc[1].trigger_step, self.age[rc[0].uid], rc[1].m))
+        for r, c in order:
+            need = self._need(r, c.ws[l]["sel"], l)
+            n_new = sum(len(miss) for _, _, miss in need)
+            if l in c.granted:
+                if n_new:
+                    raise OwnershipViolation("rev6 G3: granted cohort %s lost %d blocks of its exact selection at layer %d"
+                                             % (c.key, n_new, l))
+                granted = True
+            else:
+                fits = n_new <= v_free and all(
+                    pool.stream(r.b, h).free_count() - self._credits_held(r.b, l, h) >= len(need[h][2])
+                    for h in range(self.H))
+                granted = refused is None and fits
+                if granted:
+                    c.granted.add(l)
+                    v_free -= n_new
+                    self.stats["rev6_grants"] += 1
+                    self.grant_log.append((self.call_id, l, r.uid, c.key, n_new, v_free))
+                else:
+                    self.stats["rev6_grant_waits"] += 1
+                    if refused is None:
+                        refused = (c, n_new, v_free, fits)
+            for h in range(self.H):
+                st = pool.stream(r.b, h)
+                for blocks in need[h]:
+                    for j in blocks:
+                        if granted or self._is_ad(st, j):
+                            self._protect(st, l, j, c.key, VERIFY)     # K2 (granted) / G2 ("ad" only, ungranted)
+                if granted:
+                    for j in need[h][1]:
+                        self._add_demand(st, j, VERIFY)               # R2.3
+            if granted and all(not miss and not infl for _, infl, miss in need):
+                exec_cohorts.append((r, c))
+                continue
+            c.waits += 1
+            self.stats["cohort_waits"] += 1
+            if granted:
+                for h in range(self.H):
+                    for j in need[h][2]:
+                        requests.append((VERIFY, r, h, j, c.key))
+        if refused is not None:
+            self._vfail.add(l)
+            self._g5(l, refused)
+
+    def _g5(self, l: int, refused) -> None:
+        """G5: the oldest eligible cohort at layer l was refused. Outstanding at the layer: a transfer in flight, a
+        RELEASING slot, a queued release, or a granted cohort that has not executed the layer. None: CapacityRefusal."""
+        c, n_new, v_free, fits = refused
+        pool = self.pools[l]
+        busy = (any(tr.layer == l for tr in self.inflight.values())
+                or any(s.state == RELEASING for st in pool.streams.values() for s in st.slots)
+                or any(ll == l for _, ll in self.pending_release)
+                or any(l in cc.granted and cc.next_layer == l and cc.state == RUNNING
+                       for rr in self.active() for cc in rr.cohorts))
+        if not busy:
+            raise CapacityRefusal("rev6 G5: cohort %s at layer %d needs %d new verifier slots, %d of R_ver %d are free "
+                                  "(positions fit: %s), and nothing at the layer is outstanding (v_used %d)"
+                                  % (c.key, l, n_new, v_free, self.cfg.R_ver, fits, pool.v_used()))
+
+    def _key_live(self, key, l: int) -> bool:
+        """Does the cohort `key` still hold its layer-l draft references (undecided and not released at layer l)?"""
+        if not (isinstance(key, tuple) and len(key) == 3):
+            return False
+        uid, e, m = key
+        r = self.reqs.get(uid)
+        if r is None or r.done or e != r.epoch or key in self.cancelled_keys:
+            return False
+        if (self.rel_layers.get(key) or {}).get(l):
+            return False
+        if m > r.n_trig:
+            return True
+        return any(c.key == key and c.state in (PENDING, RUNNING, DONE) for c in r.cohorts)
+
+    def _rev6_check(self, l: int) -> None:
+        """The rev6 ledger at the end of the joint call of layer l (OwnershipViolation on failure): P + credits <= C + d_h
+        on every stream; v_used <= R_ver; the reservations fit X_d; an LRU / PO slot is "ad" and a VRES slot is "v"; no
+        draft reference holds a "v" slot; every reference to a "v" slot is a grant of layer l or a queued release."""
+        pool = self.pools[l]
+        cap = self.cfg.C + self.d_share
+        if self.H * self.d_share * len(self.dres) > self.X_d:
+            raise OwnershipViolation("rev6 L4: %d reservations of H * d_h = %d > X_d = %d"
+                                     % (len(self.dres), self.H * self.d_share, self.X_d))
+        if pool.v_used() > self.cfg.R_ver:
+            raise OwnershipViolation("rev6 L1: layer %d holds %d verifier slots > R_ver %d" % (l, pool.v_used(), self.cfg.R_ver))
+        grants = {cc.key for rr in self.active() for cc in rr.cohorts if l in cc.granted}
+        queued = {k for k, ll in self.pending_release if ll == l}
+        for (b, h), st in pool.streams.items():
+            p, e = st.positions(), self._credits_held(b, l, h)
+            if p + e > cap:
+                raise OwnershipViolation("rev6 L2: stream (l %d b %d h %d) holds P %d + credits %d > C + d_h = %d"
+                                         % (l, b, h, p, e, cap))
+            for blk, idx in list(st.lru.items()) + list(st.po.items()):
+                if st.slots[idx].cls == "v":
+                    raise OwnershipViolation("rev6 L1: LRU / PO block %d of stream (l %d b %d h %d) is class v" % (blk, l, b, h))
+            for blk, idx in st.vres.items():
+                if st.slots[idx].cls != "v":
+                    raise OwnershipViolation("rev6 L1: VRES block %d of stream (l %d b %d h %d) is not class v" % (blk, l, b, h))
+            for s in st.slots:
+                if s.state in (FREE, RELEASING) or s.cls != "v" or s.owner != st.owner:
+                    continue
+                if DRAFT in st.kinds_of(s.block):
+                    raise OwnershipViolation("rev6 L1: a draft reference holds verifier slot %d (block %d, l %d b %d h %d)"
+                                             % (s.idx, s.block, l, b, h))
+                bad = [k for k in st.prot.get(s.block, ()) if k not in grants and k not in queued]
+                if bad:
+                    raise OwnershipViolation("rev6 G2: verifier slot %d (block %d, l %d b %d h %d) is held by %s, which hold no "
+                                             "grant at layer %d" % (s.idx, s.block, l, b, h, bad, l))
 
     # ================================================================== host poll
     def _poll(self) -> None:
@@ -408,6 +726,15 @@ class Dispatcher:
                 ev = res["evicted"]
                 if ev is not None:
                     self.stats["evict_protected_only" if ev["protected"] else "evict_released"] += 1
+                    self.evict_log.append((self.call_id, tr.layer, tr.b, tr.h, ev["block"], ev["protected"],
+                                           tuple(ev.get("kinds", ())), "arrival"))
+                if tr.kind == DRAFT and res["where"] == LRU and not self._key_live(tr.requester, tr.layer):
+                    # a LATE O2 arrival: its requesting draft cohort no longer holds layer-l references
+                    self.stats["late_draft_arrivals"] += 1
+                    disp = None if ev is None else (ev["block"], ev["protected"], tuple(ev.get("kinds", ())))
+                    if ev is not None and ev["protected"]:
+                        self.stats["late_draft_arrivals_displacing_a_pin"] += 1
+                    self.late_log.append((self.call_id, tr.layer, tr.b, tr.h, tr.block, disp))
         if self.cancelled_keys:                                         # K6: kept only while a transfer may still name it
             self.cancelled_keys &= {tr.requester for tr in self.inflight.values()}
         for pool in self.pools:
@@ -572,13 +899,17 @@ class Dispatcher:
                 self._verifier_pre(r, obj, l, pre_all[at:at + len(obj.positions)])
             else:
                 draft_pre_raw[id(obj)] = pre_all[at]
-        for r, c in eligible:
+        if self.rev6:
+            for r, c in eligible:
+                self._row_bound(r, c.ws[l]["sel"], l, "verifier %s" % (c.key,))
+            self._rev6_verifiers(l, eligible, requests, exec_cohorts)  # G1-G6 (capacity mode rev6)
+        for r, c in ([] if self.rev6 else eligible):
             need = self._need(r, c.ws[l]["sel"], l)
             for h in range(self.H):
                 st = self.pools[l].stream(r.b, h)
                 for blocks in (need[h][1:] if self.mut.no_verifier_ready_protection else need[h]):
                     for j in blocks:
-                        self._protect(st, l, j, c.key)             # K2: the exact selection, while it waits
+                        self._protect(st, l, j, c.key, VERIFY)     # K2: the exact selection, while it waits
                 for j in need[h][1]:
                     self._add_demand(st, j, VERIFY)                # R2.3: a verifier request for an in-flight block
             ok = all(not miss and not infl for _, infl, miss in need)
@@ -604,6 +935,8 @@ class Dispatcher:
                                      % (r.uid, l, h, r.dchain[l][h].count, dr.pos))
             sel = [self.ex.select(l, h, q[h], r.dchain[l][h].cks, dr.pos // self.bs) for h in range(self.H)]
             key = (r.uid, r.epoch, dr.m)
+            if self.rev6:
+                self._row_bound(r, [sel], l, "draft s%d" % dr.s)
             avail = []
             for h in range(self.H):
                 r.draft_kv[l][h][dr.pos] = (k[h], v[h])
@@ -614,7 +947,7 @@ class Dispatcher:
                     if j >= r.hist_blocks:
                         continue
                     if not (self.mut.no_draft_hit_protection and st.resident(j) is not None):
-                        self._protect(st, l, j, key)                   # K2: hits AND misses, for the cohort of d_s
+                        self._protect(st, l, j, key, DRAFT)            # K2: hits AND misses, for the cohort of d_s
                     if st.resident(j) is not None:
                         a.append(j)
                     elif j not in st.pending:
@@ -731,10 +1064,17 @@ class Dispatcher:
         for (b, h), x in per.items():
             self.share.append((cid, l, b, h, x[4], x[0], len(x[1]), x[2], len(x[3])))
         self._issue(l, requests, cid)
+        if self.rev6 and not self.mut.rev6_credit_leak:                # SC3: the unused credits of layer l return now
+            for r, dr in rows:
+                if r.credits is not None:
+                    self.stats["rev6_credits_returned"] += sum(r.credits[l])
+                    r.credits[l] = [0] * self.H
         self._sample_memory()
         if self.cfg.check_invariants and not self.mut.active():
             for st in self.pools[l].streams.values():
                 st.check()
+            if self.rev6:
+                self._rev6_check(l)
         if self.observer is not None:
             self.observer(self, "call", cid, l)
 
@@ -775,19 +1115,33 @@ class Dispatcher:
                                          "resident at the recency update" % (r.uid, j, (l, h, r.b)))
                     if self.mut.skip_acquisition:
                         continue                                       # NEGATIVE CONTROL (R2.6)
+                    if self.rev6 and j in st.vres and st.slots[st.vres[j]].cls == "v":
+                        self._take_credit(r, l, h, "vres")             # rev6 SC3: V -> A / D conversion, credit first
+                        st.slots[st.vres[j]].cls = "ad"
                     res = st.acquire(j, self.mut, evict=False)
                     self.touch_log.append((cid, l, r.b, h, j, "acquire_" + res["src"]))
                     self.stats["draft_acquisitions_" + res["src"]] += 1  # draft_acquisitions_po / _vres
                 for ev in st.evict_to_c(self.mut):                     # O1: oldest eviction after the whole batch
                     self.stats["evict_protected_only" if ev["protected"] else "evict_released"] += 1
+                    self.evict_log.append((cid, l, r.b, h, ev["block"], ev["protected"], tuple(ev.get("kinds", ())), "batch"))
 
-    def _protect(self, st, l: int, j: int, key) -> None:
-        """K2 with the R1.5 guard: no reference keyed `key` is added at layer l after (key, l) was queued for release."""
+    def _protect(self, st, l: int, j: int, key, kind: Optional[str] = None) -> None:
+        """K2 with the R1.5 guard: no reference keyed `key` is added at layer l after (key, l) was queued for release.
+        `kind` ("draft" / "verify") is the reference's provenance (L9)."""
         lay = self.rel_layers.get(key)
         if lay is not None and l in lay and not self.mut.no_late_protection_guard:
             raise KStepError("R1.5: late protection of block %d at layer %d for cohort %s after its layer-%d references "
                              "were queued for release" % (j, l, key, l))
-        st.protect(j, key)
+        st.protect(j, key, kind)
+
+    def _row_bound(self, r: Request, rows, l: int, who: str) -> None:
+        """Rev6 F-d: every (row, head) selects at most S_max historical blocks (the bound behind N_max and the credits)."""
+        for row in rows:
+            for h in range(self.H):
+                n = len({j for j in row[h] if j < r.hist_blocks})
+                if n > self.rb:
+                    raise KStepError("rev6 F-d: %s of uid %s selects %d historical blocks at layer %d head %d > S_max %d"
+                                     % (who, r.uid, n, l, h, self.rb))
 
     def _add_demand(self, st, j: int, kind: str) -> None:
         """R2.3: a request for a block in flight for the stream's owner adds its kind to that transfer's demand set (no
@@ -802,6 +1156,9 @@ class Dispatcher:
         if kind not in tr.demand:
             tr.demand.add(kind)
             self.stats["demand_merged_" + kind] += 1                   # demand_merged_draft / demand_merged_verify
+        if self.rev6 and kind == DRAFT and st.slots[st.pending[j]].cls == "v":
+            self._take_credit(self.reqs[st.owner], st.l, st.h, "join")  # rev6 SC3: V -> A / D conversion of the join
+            st.slots[st.pending[j]].cls = "ad"
 
     def _queue_release(self, key, l: int) -> None:
         """R1.1 / R1.4: queue the release of every reference keyed `key` at layer l, at most once per (key, l)."""
@@ -867,6 +1224,10 @@ class Dispatcher:
                 if tr0 is not None and kind not in tr0.demand and not self.mut.drop_demand_merge:
                     tr0.demand.add(kind)                                  # R2.3: joins the transfer issued in this call
                     self.stats["demand_merged_" + kind] += 1
+                    st0 = pool.stream(r.b, h)
+                    if self.rev6 and kind == DRAFT and st0.slots[tr0.slot].cls == "v":
+                        self._take_credit(r, l, h, "join")                # rev6 SC3: V -> A / D conversion of the join
+                        st0.slots[tr0.slot].cls = "ad"
                 continue
             seen.add((r.b, h, j))
             st = pool.stream(r.b, h)
@@ -875,15 +1236,19 @@ class Dispatcher:
             if j in st.pending:
                 self._add_demand(st, j, kind)                             # R2.3
                 continue
-            if kind == VERIFY and (self.mut.verifier_evicts_without_pressure or not pool.can_take(st, kind)):
-                self._verifier_evict(pool, st, cid)                       # R2.5: the counted progress fallback
-            if not pool.can_take(st, kind):
+            if self.rev6:
                 if kind == DRAFT:
-                    self.stats["fetch_draft_refused"] += 1                # unrequested; the draft continues masked
-                else:
-                    self.stats["fetch_verify_noslot"] += 1
-                    self._vfail.add(l)
-                continue
+                    self._take_credit(r, l, h, "fetch")                   # rev6 SC3 (a VERIFY fetch holds a grant, G3)
+            else:
+                if kind == VERIFY and (self.mut.verifier_evicts_without_pressure or not pool.can_take(st, kind)):
+                    self._verifier_evict(pool, st, cid)                   # R2.5: the counted progress fallback
+                if not pool.can_take(st, kind):
+                    if kind == DRAFT:
+                        self.stats["fetch_draft_refused"] += 1            # unrequested; the draft continues masked
+                    else:
+                        self.stats["fetch_verify_noslot"] += 1
+                        self._vfail.add(l)
+                    continue
             if (l, j) not in r.hist_ev:
                 raise KStepError("A5: fetch of block %d of uid %s at layer %d, which is not historical" % (j, r.uid, l))
             idx = pool.first_free(st)
@@ -897,7 +1262,7 @@ class Dispatcher:
             else:
                 prev = s.last_reader
             self.seq += 1
-            gen = st.take(idx, r.uid, j, self.seq)
+            gen = st.take(idx, r.uid, j, self.seq, cls="v" if kind == VERIFY else "ad")
             tr = Transfer(self.seq, r.uid, l, r.b, h, j, idx, gen, kind, key, hist_ev=r.hist_ev.get((l, j)),
                           reader_ev=prev, issued_call=cid)
             self.inflight[tr.seq] = tr
@@ -919,7 +1284,10 @@ class Dispatcher:
         destination, so a full LRU with every extra slot held elsewhere could never change again. The least recent
         UNPROTECTED LRU entry leaves the LRU now; its slot is released through the K4 reader gate as usual.
         Repair 1 R2.5: this is a verifier access that changes the draft LRU, so it stays ONLY as an explicit, counted
-        progress fallback, recorded per stream with the evicted block (vev_log, the request's trace, report())."""
+        progress fallback, recorded per stream with the evicted block (vev_log, the request's trace, report()).
+        Capacity mode rev6 never evicts a draft entry for a verifier (G6): the call is refused there."""
+        if self.rev6:
+            raise KStepError("rev6 G6: a verifier eviction of a draft LRU entry was requested")
         blk = self._verifier_eviction_candidate(st)
         if blk is None:
             return
@@ -1261,7 +1629,22 @@ class Dispatcher:
                     stalls={k[6:]: v for k, v in s.items() if k.startswith("stall_")},
                     stall_accounting=self.stall_accounting(),
                     verifier_evictions_of_draft_entries=self.vev_report(),
-                    sharing_IDEAL=self.sharing(), memory=self.acct.report())
+                    sharing_IDEAL=self.sharing(), memory=self.acct.report(), capacity=self.capacity_report())
+
+    def capacity_report(self) -> Dict[str, Any]:
+        """The capacity mode and (rev6) its contract counters. Memory is charged for the FULL C + X positions of every
+        stream (K6 counts FREE slots): no shared arena or address map exists, so no fit claim follows from them."""
+        s = self.stats
+        out = dict(mode=self.cfg.capacity)
+        if self.rev6:
+            out.update(W=self.W, d_share=self.d_share, X_d=self.X_d, R_ver=self.cfg.R_ver, N_max=self.N_max,
+                       reservations=s.get("rev6_reservations", 0), reservations_returned=s.get("rev6_reservations_returned", 0),
+                       credits_reserved=s.get("rev6_credits_reserved", 0), credits_returned=s.get("rev6_credits_returned", 0),
+                       credits_fetch=s.get("rev6_credits_fetch", 0), credits_join=s.get("rev6_credits_join", 0),
+                       credits_vres=s.get("rev6_credits_vres", 0), grants=s.get("rev6_grants", 0), grant_waits=s.get("rev6_grant_waits", 0),
+                       stalls={k: s.get("stall_" + k, 0) for k in ("admission", "horizon", "capacity")},
+                       fetch_draft_refused=s.get("fetch_draft_refused", 0), verifier_evictions=s.get("verifier_evictions", 0))
+        return out
 
     def vev_report(self) -> Dict[str, Any]:
         """Repair 1 R2.5: every verifier eviction of a draft LRU entry (the counted progress fallback), per stream
@@ -1280,8 +1663,9 @@ class Dispatcher:
         started = s["draft_rows_started"]
         tot = started + sum(st.values())
         out = dict(request_steps=tot, draft_rows_started=started, draft_steps=s["draft_steps"],
-                   lead=st.get("lead", 0), memory=st.get("memory", 0), done=st.get("done", 0))
-        for k in ("lead", "memory", "done"):
+                   lead=st.get("lead", 0), memory=st.get("memory", 0), done=st.get("done", 0),
+                   admission=st.get("admission", 0), horizon=st.get("horizon", 0), capacity=st.get("capacity", 0))
+        for k in ("lead", "memory", "done", "admission", "horizon", "capacity"):
             out["share_" + k] = out[k] / tot if tot else 0.0
         out["share_draft"] = started / tot if tot else 0.0
         out["memory_per_lead"] = out["memory"] / out["lead"] if out["lead"] else float("inf") if out["memory"] else 0.0

@@ -6,7 +6,9 @@ R6 lists the 16 mutations of spec section 7 R6. EXTRA lists the negative control
 F1, F2, F4, F5): each one survived the first M1 suite and is caught by a test of the fix round. EXTRA also lists the 16
 negative controls of repair 1 (retroinfer-eval docs/superpowers/specs/2026-10-12-kstep-m1-repair1.md, R1 per-layer pin
 release, R2 draft-only logical LRU, R3 per-cohort join check); the test that each one must fail is named in
-retroinfer-eval tests/test_kstep_mutations.py (CATCHERS)."""
+retroinfer-eval tests/test_kstep_mutations.py (CATCHERS). EXTRA_REV6 lists the 4 negative controls of the capacity mode
+"rev6" (retroinfer-eval PROPOSAL rev 6, section 8): credit leak, partial reservation, the rev-5 free-entry rule and a
+reserve below N_max."""
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
@@ -56,6 +58,11 @@ class Mutations:
     # ---------------------------------------------------------------- repair 1, R3 (D2 per-cohort join)
     delayed_join_even_steps: bool = False       # = recheck2_cqlhP6/mut/OWN_join_even_steps/MUTATION.diff
     delayed_join_wait_other_requests: bool = False  # = recheck2_cqlhP6/mut/OWN_join_wait_other_requests/MUTATION.diff
+    # ---------------------------------------------------------------- capacity mode "rev6" (PROPOSAL rev 6, section 8)
+    rev6_credit_leak: bool = False              # SC3: the unused credits of a layer are not returned after its call
+    rev6_partial_reservation: bool = False      # SC2: a step reserves credits at layer 0 only, not at every layer
+    rev6_unpinned_lru_counts_free: bool = False  # L2 (the rev-5 rule): an unpinned LRU entry counts as free at step start
+    rev6_admit_small_reserve: bool = False      # G5: the constructor accepts R_ver < N_max (a run must refuse, not hang)
 
     def active(self):
         return [f.name for f in fields(self) if getattr(self, f.name)]
@@ -70,5 +77,6 @@ EXTRA_R2 = ("verifier_touches_lru", "verifier_arrival_enters_lru", "drop_demand_
             "vres_counted_as_lru", "silent_verifier_eviction", "verifier_evicts_without_pressure")
 EXTRA_R3 = ("delayed_join_even_steps", "delayed_join_wait_other_requests")
 EXTRA_REPAIR1 = EXTRA_R1 + EXTRA_R2 + EXTRA_R3
-EXTRA = EXTRA_FIX_ROUND + EXTRA_REPAIR1
+EXTRA_REV6 = ("rev6_credit_leak", "rev6_partial_reservation", "rev6_unpinned_lru_counts_free", "rev6_admit_small_reserve")
+EXTRA = EXTRA_FIX_ROUND + EXTRA_REPAIR1 + EXTRA_REV6
 R6 = tuple(n for n in NAMES if n not in EXTRA)

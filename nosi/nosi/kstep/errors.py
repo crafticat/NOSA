@@ -24,3 +24,8 @@ class NoProgress(KStepError):
 
 class ReadCorruption(KStepError):
     """A deferred read of a slot saw other bytes than the read the joint call was computed from (T3, T4, K4)."""
+
+
+class CapacityRefusal(KStepError):
+    """Capacity mode "rev6" (retroinfer-eval PROPOSAL rev 6, G5 and the draft side of P6): no grant, draft step, transfer,
+    reader event or release can ever free the capacity that the oldest waiter needs. An explicit refusal, never a hang."""

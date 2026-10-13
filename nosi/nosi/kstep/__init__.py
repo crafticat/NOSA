@@ -17,10 +17,15 @@ Modules (each names the spec clauses it implements):
   backend      -       the stream-backend interface (the cpupack_core CpuBackend / CudaBackend shape) and ev_done()
   executor     D1, D5  the model-executor interface that M2's GPU executor implements (M1: the toy model, test side)
   dispatcher   D1-D6, A3-A7, C1-C4, K1-K5, T2-T4: the REAL dispatch (the tests drive this class, never a copy)
-  mutations    R6      TEST-ONLY negative-control switches (all off by default): the 16 of R6, 5 of the fix round and
-                       16 of repair 1 (R1 per-layer pin release, R2 draft-only LRU, R3 per-cohort join check)
+  mutations    R6      TEST-ONLY negative-control switches (all off by default): the 16 of R6, 5 of the fix round,
+                       16 of repair 1 (R1 per-layer pin release, R2 draft-only LRU, R3 per-cohort join check) and 4 of
+                       the capacity mode "rev6"
+Capacity modes (dispatcher.Config.capacity): "m1" (default, the M1 rules unchanged) and "rev6" (retroinfer-eval
+docs/superpowers/specs/2026-10-12-kstep-m1-progress-policy-PROPOSAL.md rev 6, section 8: position ledger, step credits,
+aggregate draft admission, V-only verifier residuals with age-ordered all-or-nothing grants, no verifier eviction).
 
 Labels: no timing, throughput, interference or memory-fit claim (spec section 9). The KV read sharing recorded per call
 (D1) is the IDEAL from actual selections (SUM vs UNION of selected blocks), not a measured kernel saving.
 """
-from .errors import (ConfigError, KStepError, NoProgress, OwnershipViolation, ReadCorruption, StaleGeneration)  # noqa: F401
+from .errors import (CapacityRefusal, ConfigError, KStepError, NoProgress, OwnershipViolation, ReadCorruption,  # noqa: F401
+                     StaleGeneration)

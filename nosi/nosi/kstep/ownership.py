@@ -32,6 +32,17 @@ K5  per layer: C slots per stream plus X shared extra slots. The extra pool is a
     descriptor for a physically shared pool).
 The slot + generation pattern and the error names follow benchmarks/Efficiency/feeder_core.py:266-349 (SlotTable, a
 staging-ring state machine; reused as a pattern only).
+
+CAPACITY MODE "rev6" (retroinfer-eval PROPOSAL rev 6, section 8; the dispatcher enforces it, Config.capacity):
+  CLASS  every taken slot carries cls "ad" (the request's draft classes A / D) or "v" (the verifier reserve) until it is
+         FREE (L1). A and D are a COUNT split, not two tags: of a stream's "ad" positions the first C are A and the rest
+         are D, charged to the owner's reservation (L4). A verifier residual fetch is "v"; a draft fetch is "ad"; a draft
+         use of a "v" slot re-tags it "ad" (the atomic V -> A / D conversion; the dispatcher takes a step credit first).
+  P      Stream.positions(): every non-FREE "ad" slot, an unpinned LRU entry and a RELEASING slot included (L2: a slot
+         counts until it is FREE). Stream.v_slots() / LayerPool.v_used(): the non-FREE "v" slots.
+  KIND   provenance of a reference (pin_kind: block -> key -> {"draft", "verify"}), recorded when the caller names it;
+         an eviction reports the kinds that held the entry (L9: a verifier pin makes it PO instead of RELEASING).
+In mode "m1" the class and kind are recorded too, but nothing checks them.
 """
 from __future__ import annotations
 
@@ -48,7 +59,7 @@ STATES = (FREE, INFLIGHT, LRU, PO, VRES, RELEASING)
 
 
 class Slot:
-    __slots__ = ("idx", "state", "block", "gen", "owner", "first_reader", "last_reader", "seq")
+    __slots__ = ("idx", "state", "block", "gen", "owner", "first_reader", "last_reader", "seq", "cls")
 
     def __init__(self, idx: int):
         self.idx = idx
@@ -59,6 +70,7 @@ class Slot:
         self.first_reader = None
         self.last_reader = None
         self.seq = None                      # sequence id of the transfer in flight
+        self.cls = None                      # "ad" | "v" while not FREE (capacity mode rev6, L1)
 
 
 class Stream:
@@ -72,6 +84,7 @@ class Stream:
         self.vres: Dict[int, int] = {}                       # block -> slot (verifier resident, R2.4)
         self.pending: Dict[int, int] = {}                    # block -> slot of the CURRENT owner's transfers in flight
         self.prot: Dict[int, Set[Any]] = {}                  # block -> cohort keys (K2)
+        self.pin_kind: Dict[int, Dict[Any, Set[str]]] = {}   # block -> key -> {"draft", "verify"} (provenance, L9)
         self.owner = None                                    # request uid that owns the batch slot now
         self.log: List[Tuple] = []                           # (event, block, slot, gen, detail) transition log
 
@@ -92,6 +105,28 @@ class Stream:
 
     def protected(self, block: int) -> bool:
         return bool(self.prot.get(block))
+
+    def kinds_of(self, block: int) -> Set[str]:
+        """The provenance kinds of the references that hold `block` now (empty when unknown or unprotected)."""
+        out: Set[str] = set()
+        for key in self.prot.get(block, ()):
+            out |= self.pin_kind.get(block, {}).get(key, set())
+        return out
+
+    def positions(self) -> int:
+        """Capacity mode rev6, L2: the non-FREE slots of class "ad" (an unpinned LRU entry and a RELEASING slot count)."""
+        return sum(1 for s in self.slots if s.state != FREE and s.cls != "v")
+
+    def unpinned_lru(self) -> int:
+        """The LRU entries without a reference (the rev-5 L2 counted them as available; kept for its negative control)."""
+        return sum(1 for blk in self.lru if not self.prot.get(blk))
+
+    def v_slots(self) -> int:
+        """Capacity mode rev6: the non-FREE slots of class "v" (verifier reserve), RELEASING included."""
+        return sum(1 for s in self.slots if s.state != FREE and s.cls == "v")
+
+    def free_count(self) -> int:
+        return sum(1 for s in self.slots if s.state == FREE)
 
     def check(self) -> None:
         """Structural invariants (K3): one slot per resident block; states agree with the maps."""
@@ -122,8 +157,10 @@ class Stream:
             self.lru.move_to_end(block)
             self.log.append(("touch", block, self.lru[block], self.slots[self.lru[block]].gen, None))
 
-    def protect(self, block: int, key) -> None:
+    def protect(self, block: int, key, kind: Optional[str] = None) -> None:
         self.prot.setdefault(block, set()).add(key)
+        if kind is not None:
+            self.pin_kind.setdefault(block, {}).setdefault(key, set()).add(kind)
 
     def unprotect(self, key, mut=None) -> List[int]:
         """Drop the references of cohort `key` (ONE key per block; other cohorts keep theirs, R1.2); returns the
@@ -136,6 +173,12 @@ class Stream:
                     refs.clear()                          # NEGATIVE CONTROL (R1.6 shared pins): every key is dropped
                 else:
                     refs.discard(key)
+                kinds = self.pin_kind.get(blk)
+                if kinds is not None:
+                    for k in [k for k in kinds if k not in refs]:
+                        del kinds[k]
+                    if not kinds:
+                        del self.pin_kind[blk]
                 if not refs:
                     del self.prot[blk]
                     if blk in self.po:
@@ -144,13 +187,16 @@ class Stream:
                         out.append(self.vres.pop(blk))
         return out
 
-    def take(self, idx: int, uid, block: int, seq: int) -> int:
-        """FREE -> INFLIGHT for a transfer of (uid, block). Returns the new generation."""
+    def take(self, idx: int, uid, block: int, seq: int, cls: str = "ad") -> int:
+        """FREE -> INFLIGHT for a transfer of (uid, block) into a slot of class `cls` ("ad" draft, "v" verifier reserve).
+        Returns the new generation."""
         s = self.slots[idx]
         if s.state != FREE:
             raise OwnershipViolation("take: slot %d of %s is %s" % (idx, (self.l, self.h, self.b), s.state))
+        if cls not in ("ad", "v"):
+            raise ValueError(cls)
         s.gen += 1
-        s.state, s.block, s.owner, s.seq = INFLIGHT, int(block), uid, seq
+        s.state, s.block, s.owner, s.seq, s.cls = INFLIGHT, int(block), uid, seq, cls
         s.first_reader = None
         self.log.append(("take", block, idx, s.gen, uid))
         if uid == self.owner:
@@ -172,14 +218,15 @@ class Stream:
             return None
         eb, es = self.lru.popitem(last=False)      # the least recent entry
         if self.prot.get(eb):
+            kinds = sorted(self.kinds_of(eb))
             self.po[eb] = es                       # K3: protected-only keeps its slot
             self.slots[es].state = PO
             self.log.append(("evict_po", eb, es, self.slots[es].gen, None))
             if mut and mut.drop_alias:             # NEGATIVE CONTROL: the payload is freed, the alias map kept
                 self.slots[es].state = RELEASING
-            return dict(block=eb, slot=es, protected=True)
+            return dict(block=eb, slot=es, protected=True, kinds=kinds)
         self.release(es, "evict")
-        return dict(block=eb, slot=es, protected=False)
+        return dict(block=eb, slot=es, protected=False, kinds=[])
 
     def evict_to_c(self, mut=None) -> List[Dict]:
         """Repair 1c (ordering contract O1): after a draft row's whole batch update, the least recent entries leave while
@@ -263,6 +310,7 @@ class Stream:
         self.po.clear()
         self.vres.clear()
         self.prot.clear()
+        self.pin_kind.clear()
         self.pending.clear()
         self.owner = None
         return out
@@ -286,6 +334,10 @@ class LayerPool:
 
     def free_extras(self) -> int:
         return self.X - self.borrowed()
+
+    def v_used(self) -> int:
+        """Capacity mode rev6: the layer's non-FREE verifier-reserve slots (class "v", RELEASING included)."""
+        return sum(st.v_slots() for st in self.streams.values())
 
     def can_take(self, st: Stream, kind: str) -> bool:
         if st.usage() < self.C:
@@ -313,7 +365,7 @@ class LayerPool:
                 gate = s.first_reader if (mut and mut.release_first_reader) else s.last_reader
                 if (mut and mut.no_reader_wait) or ev_done(gate):
                     s.state = FREE
-                    s.block, s.owner = -1, None
+                    s.block, s.owner, s.cls = -1, None, None
                     st.log.append(("free", -1, s.idx, s.gen, None))
                     n += 1
         return n
