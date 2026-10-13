@@ -88,6 +88,13 @@ limited CPU implementation; the C >= (2K + 1) * max_sel guard and the pin guard 
   L9  verifier pins never take a credit or a FREE position; Stream.pin_kind records the provenance (evict_log).
   Verifier-only passes with a rev6 'capacity' / 'admission' stall force every transfer and reader event; with no cohort
       and nothing outstanding the request is refused (CapacityRefusal), never spun.
+  H1  recent-to-history handoff (Codex G3 diagnosis 2026-10-13): a cohort's layer-l workspace keeps the history boundary
+      of its phase 1 (ws["hist"]). Blocks below it are historical slots (its grant footprint); blocks at or above it are
+      read from the recent region, also after a publication makes them historical: _history then keeps their positions
+      in r.pub (charged as recent_kv; holders in r.pub_hold, charged as release entries) while a waiting workspace or an
+      executed read whose (key, l) reader gate has not released depends on them (h1_reads), and _release_refs drops them
+      after the last such reader. So no granted cohort gains a historical need after its grant (G3 holds), and no extra
+      fetch, capacity or draft-LRU change follows from a publication.
 """
 from __future__ import annotations
 
@@ -169,6 +176,7 @@ class Cohort:
         self.row_layers = 0
         self.decided_step = None
         self.granted = set()                   # rev6 G3: the layers at which this cohort holds a verifier grant
+        self.vhist: Dict[int, int] = {}       # rev6 H1: the frozen history boundary of each executed layer
 
     def __repr__(self):
         return "Cohort(uid=%s e=%d m=%d [%d,%d] %s L%d)" % (self.uid, self.epoch, self.m, self.a, self.b, self.state, self.next_layer)
@@ -195,6 +203,7 @@ class Request:
         self.hist_ev: Dict[Tuple[int, int], Any] = {}
         self.cur: Optional[Draft] = None
         self.credits: Optional[List[List[int]]] = None   # rev6 SC2: step credits [layer][head] of the current draft step
+        self.pub_hold: Dict[Tuple[int, int, int], set] = {}  # rev6 H1: (l, h, pos) below the boundary -> holder keys
 
     def u(self, i: int) -> int:
         return self.toks[self.E] if i == 0 else self.drafts[i - 1].d
@@ -256,6 +265,8 @@ class Dispatcher:
         self.evict_log: List[Tuple] = []           # (call, layer, b, h, block, protected, kinds, where): every LRU eviction
         self.late_log: List[Tuple] = []            # (call, layer, b, h, block, displaced (block, protected, kinds) or None)
         self.res_log: List[Tuple] = []             # rev6 L4: (step, uid) of every reservation
+        self.h1_reads: Dict[Tuple, Tuple] = {}     # rev6 H1: (key, l) -> (frozen boundary, selection) read, gate pending
+        self.h1_log: List[Tuple] = []              # rev6 H1: ("retain", step, uid, l, h, block, holder states)
         self._rev6_stalled = False
         self.pools = [LayerPool(l, cfg.B, self.H, cfg.C, cfg.X, cfg.R_ver) for l in range(self.L)]
         n_pos = self.pools[0].n_pos
@@ -345,6 +356,10 @@ class Dispatcher:
         self.rel_layers = {k: v for k, v in self.rel_layers.items() if k[0] != r.uid}
         r.done = True
         r.credits = None
+        if r.pub_hold:                                                 # H1: no reader of an ended request remains
+            self.stats["rev6_h1_end_cleared_positions"] += len(r.pub_hold)
+        r.pub_hold.clear()
+        self.h1_reads = {k: v for k, v in self.h1_reads.items() if k[0][0] != r.uid}
         if r.uid in self.dres:                                         # rev6 L4: returned once its slots are all FREE
             self.dres[r.uid] = False
             self.dres_b[r.uid] = r.b
@@ -595,7 +610,7 @@ class Dispatcher:
         refused = None
         order = sorted(eligible, key=lambda rc: (rc[1].trigger_step, self.age[rc[0].uid], rc[1].m))
         for r, c in order:
-            need = self._need(r, c.ws[l]["sel"], l)
+            need = self._need(r, c.ws[l]["sel"], l, self._vhist(r, c, l))   # H1: the frozen boundary
             n_new = sum(len(miss) for _, _, miss in need)
             if l in c.granted:
                 if n_new:
@@ -652,6 +667,42 @@ class Dispatcher:
             raise CapacityRefusal("rev6 G5: cohort %s at layer %d needs %d new verifier slots, %d of R_ver %d are free "
                                   "(positions fit: %s), and nothing at the layer is outstanding (v_used %d)"
                                   % (c.key, l, n_new, v_free, self.cfg.R_ver, fits, pool.v_used()))
+
+    # ---------------------------------------------------------------- rev6 H1: recent-to-history handoff
+    def _vhist(self, r: Request, c: Cohort, l: int) -> int:
+        """H1: the history boundary of cohort c's layer-l workspace, frozen at its phase 1 (rev6). A block at or above it is
+        read from the recent region (retained by _history while this workspace or its read depends on it); a block below
+        it is a historical slot that the grant covers. Mode m1 (and the negative control rev6_unfrozen_boundary) uses the
+        current boundary, so a block that becomes historical while the cohort waits is a new historical need there."""
+        if self.rev6 and not self.mut.rev6_unfrozen_boundary:
+            return c.ws[l]["hist"]
+        return r.hist_blocks
+
+    def _h1_holders(self, r: Request, l: int, h: int, j: int) -> set:
+        """H1: the cohorts that still read block j of (l, h) from the RECENT region: a waiting workspace at layer l whose
+        frozen boundary is <= j and whose selection holds j at head h; or an executed layer-l read of the same kind whose
+        (key, l) reader gate has not released yet (h1_reads)."""
+        out = set()
+        for c in r.cohorts:
+            w = c.ws.get(l)
+            if w is not None and w["hist"] <= j and any(j in row[h] for row in w["sel"]):
+                out.add(c.key)
+        for (key, ll), (hist, rows) in self.h1_reads.items():
+            if ll == l and key[0] == r.uid and hist <= j and any(j in row[h] for row in rows):
+                out.add(key)
+        return out
+
+    def _h1_release(self, r: Request, key, l: int) -> None:
+        """H1: `key` no longer reads layer l (its (key, l) reader gate released, or its request ended): it leaves the
+        holder sets of the retained positions of layer l; a retained position without holders leaves the recent region."""
+        for x in [x for x in r.pub_hold if x[0] == l]:
+            hold = r.pub_hold[x]
+            hold.discard(key)
+            if not hold:
+                ll, h, pos = x
+                del r.pub_hold[x]
+                del r.pub[ll][h][pos]
+                self.stats["rev6_h1_released_positions"] += 1
 
     def _key_live(self, key, l: int) -> bool:
         """Does the cohort `key` still hold its layer-l draft references (undecided and not released at layer l)?"""
@@ -772,6 +823,9 @@ class Dispatcher:
                 st.release(idx, "unprotect")
         self.key_readers.pop((key, l), None)
         self.stats["releases_per_layer"] += 1
+        if self.rev6:                                                  # H1: the (key, l) read is over (reader gate)
+            self.h1_reads.pop((key, l), None)
+            self._h1_release(r, key, l)
 
     def _validate(self, all_: bool = False) -> None:
         keep = []
@@ -846,14 +900,15 @@ class Dispatcher:
         sel = []
         for i, pos in enumerate(c.positions):
             sel.append([self.ex.select(l, h, pre[i][0][h], chain[h].cks, pos // self.bs) for h in range(self.H)])
-        c.ws[l] = dict(pre=pre, sel=sel, chain=chain)
+        c.ws[l] = dict(pre=pre, sel=sel, chain=chain, hist=r.hist_blocks)   # rev6 H1: the boundary of this workspace
 
-    def _need(self, r: Request, sel_rows, l: int):
+    def _need(self, r: Request, sel_rows, l: int, hist: Optional[int] = None):
         """Per head: (ready, inflight, missing) historical blocks of a set of rows' selections."""
         out = []
         for h in range(self.H):
             st = self.pools[l].stream(r.b, h)
-            blocks = sorted({j for sel in sel_rows for j in sel[h] if j < r.hist_blocks})
+            hb = r.hist_blocks if hist is None else hist
+            blocks = sorted({j for sel in sel_rows for j in sel[h] if j < hb})
             ready = [j for j in blocks if st.resident(j) is not None]
             infl = [j for j in blocks if st.resident(j) is None and j in st.pending]
             miss = [j for j in blocks if st.resident(j) is None and j not in st.pending]
@@ -901,7 +956,7 @@ class Dispatcher:
                 draft_pre_raw[id(obj)] = pre_all[at]
         if self.rev6:
             for r, c in eligible:
-                self._row_bound(r, c.ws[l]["sel"], l, "verifier %s" % (c.key,))
+                self._row_bound(r, c.ws[l]["sel"], l, "verifier %s" % (c.key,), self._vhist(r, c, l))
             self._rev6_verifiers(l, eligible, requests, exec_cohorts)  # G1-G6 (capacity mode rev6)
         for r, c in ([] if self.rev6 else eligible):
             need = self._need(r, c.ws[l]["sel"], l)
@@ -959,11 +1014,12 @@ class Dispatcher:
             draft_pre[id(dr)] = (q, k, v)
         # R2.2: verifier reads never touch the logical LRU; they are logged separately (cohort order, position order)
         for r, c in exec_cohorts:
+            hv = self._vhist(r, c, l)
             for i, pos in enumerate(c.positions):
                 for h in range(self.H):
                     st = self.pools[l].stream(r.b, h)
                     for j in c.ws[l]["sel"][i][h]:
-                        if j < r.hist_blocks:
+                        if j < hv:
                             self.vread_log.append((cid, l, r.b, h, j, (c.m, pos)))
                             if self.mut.verifier_touches_lru:
                                 st.touch(j)                            # NEGATIVE CONTROL (R2.6): the M1 rule
@@ -973,12 +1029,18 @@ class Dispatcher:
         read_slots: List[Tuple[int, int, int, Any]] = []
         for r, c in exec_cohorts:
             pre, sel = c.ws[l]["pre"], c.ws[l]["sel"]
+            hv = self._vhist(r, c, l)                                  # rev6 H1: the workspace's own history boundary
             own = {pos: i for i, pos in enumerate(c.positions)}
             for i, pos in enumerate(c.positions):
                 kv = []
                 for h in range(self.H):
-                    def recent(qp, h=h, i=i):
+                    def recent(qp, h=h, i=i, c=c):
                         if qp < r.n:
+                            if qp not in r.pub[l][h]:
+                                raise KStepError("rev6 H1: verifier %s reads position %d (layer %d head %d), which left the "
+                                                 "recent region before its last reader" % (c.key, qp, l, h))
+                            if qp < r.hist_blocks * self.bs:
+                                self.stats["rev6_h1_retained_reads"] += 1   # a retained position (now historical)
                             return r.pub[l][h][qp]
                         if qp in own:
                             if own[qp] > i:
@@ -986,9 +1048,9 @@ class Dispatcher:
                             ii = own[qp]
                             return (pre[ii][1][h], pre[ii][2][h])
                         return self._prov(r, c, l, h, qp)
-                    kv.append(self._row_kv(r, l, h, pos, sel[i][h], None, recent, read_slots, c.key))
+                    kv.append(self._row_kv(r, l, h, pos, sel[i][h], None, recent, read_slots, c.key, hv))
                 jrows.append(Row(r.uid, r.b, pos, VERIFY, c.key, sel[i], pos,
-                                 [[j for j in sel[i][hh] if j < r.hist_blocks] for hh in range(self.H)],
+                                 [[j for j in sel[i][hh] if j < hv] for hh in range(self.H)],
                                  c.hidden[i], pre[i][0], kv))
                 owners.append(("v", r, c, i))
         for r, dr in rows:
@@ -1036,7 +1098,10 @@ class Dispatcher:
             c.prov[l] = [{pos: (pre[i][1][h], pre[i][2][h]) for i, pos in enumerate(c.positions)} for h in range(self.H)]
             c.chain[l] = c.ws[l]["chain"]
             c.vsel[l] = [[list(x) for x in row] for row in c.ws[l]["sel"]]
+            c.vhist[l] = c.ws[l]["hist"]
             c.exec_call[l] = cid
+            if self.rev6 and not self.mut.rev6_release_recent_before_gate:
+                self.h1_reads[(c.key, l)] = (c.ws[l]["hist"], [[list(x) for x in row] for row in c.ws[l]["sel"]])  # H1
             del c.ws[l]
             c.next_layer = l + 1
             self.exec_log.append((cid, l, r.uid, c.epoch, c.m))
@@ -1046,6 +1111,8 @@ class Dispatcher:
                 self._release_refs(c.key, l)
             elif not self.mut.release_only_at_decision:                # (the control keeps the M1 decision-only rule)
                 self._queue_release(c.key, l)                          # R1.1: behind the (key, l) reader gate
+            if self.rev6 and self.mut.rev6_release_recent_before_gate:
+                self._h1_release(r, c.key, l)                          # NEGATIVE CONTROL (H1): before the reader gate
             if l == self.L - 1:
                 c.p = {c.a + i: self.ex.dist(c.hidden[i]) for i in range(len(c.positions))}
                 c.hidden = []                                          # K6: the rows' hidden states are no longer held
@@ -1057,7 +1124,8 @@ class Dispatcher:
                 x = per[(row.b, h)]
                 x[0] += len(row.sel[h])
                 x[1].update(row.sel[h])
-                hist = [j for j in row.sel[h] if j < self.reqs[row.uid].hist_blocks]
+                hist = (list(row.readable[h]) if row.kind == VERIFY       # a verifier row: its workspace's boundary
+                        else [j for j in row.sel[h] if j < self.reqs[row.uid].hist_blocks])
                 x[2] += len(hist)
                 x[3].update(hist)
                 x[4] += 1
@@ -1134,11 +1202,12 @@ class Dispatcher:
                              "were queued for release" % (j, l, key, l))
         st.protect(j, key, kind)
 
-    def _row_bound(self, r: Request, rows, l: int, who: str) -> None:
+    def _row_bound(self, r: Request, rows, l: int, who: str, hist: Optional[int] = None) -> None:
         """Rev6 F-d: every (row, head) selects at most S_max historical blocks (the bound behind N_max and the credits)."""
+        hb = r.hist_blocks if hist is None else hist
         for row in rows:
             for h in range(self.H):
-                n = len({j for j in row[h] if j < r.hist_blocks})
+                n = len({j for j in row[h] if j < hb})
                 if n > self.rb:
                     raise KStepError("rev6 F-d: %s of uid %s selects %d historical blocks at layer %d head %d > S_max %d"
                                      % (who, r.uid, n, l, h, self.rb))
@@ -1169,7 +1238,7 @@ class Dispatcher:
         self.pending_release.append((key, l))
 
     def _row_kv(self, r: Request, l: int, h: int, pos: int, sel: List[int], readable: Optional[List[int]], recent,
-                read_slots: List, key) -> List[Tuple]:
+                read_slots: List, key, hist: Optional[int] = None) -> List[Tuple]:
         """The (k, v) list one row attends at one head, in increasing position order: the selected blocks it may read,
         then its causal recent region. Slot reads are eager (the joint call computes from them) AND enqueued as deferred
         copies on the "compute" stream (validated later)."""
@@ -1178,7 +1247,7 @@ class Dispatcher:
         out = []
         tail0 = (pos // bs) * bs
         for j in sel:
-            if j < r.hist_blocks:
+            if j < (r.hist_blocks if hist is None else hist):        # rev6 H1: a verifier row passes its own boundary
                 if readable is not None and j not in readable:
                     continue                                           # draft: masked miss
                 idx = st.resident(j)
@@ -1386,6 +1455,7 @@ class Dispatcher:
         c.prov = {}
         c.chain = {}
         c.vsel = {}
+        c.vhist = {}
         c.p = {}
 
     def _rebuild_dchain(self, r: Request) -> None:
@@ -1561,10 +1631,33 @@ class Dispatcher:
                     self.be.memcpy(self.host_v[l][r.b, j * bs:(j + 1) * bs], vb, "d2h")
                     r.hist_ev[(l, j)] = self.be.event_rec("d2h")
                 for h in range(self.H):
-                    for pos in range(j * bs, (j + 1) * bs):
-                        del r.pub[l][h][pos]
+                    hold = set()
+                    if self.rev6 and not self.mut.rev6_release_recent_at_history:
+                        hold = self._h1_holders(r, l, h, j)            # H1: a dependent verifier keeps the recent source
+                    if hold:
+                        for pos in range(j * bs, (j + 1) * bs):
+                            r.pub_hold[(l, h, pos)] = set(hold)
+                        self.stats["rev6_h1_retained_positions"] += bs
+                        self.h1_log.append(("retain", self.t, r.uid, l, h, j, tuple(
+                            (k, any(c.key == k and l in c.granted for c in r.cohorts), self._h1_waits_in_flight(r, k, l))
+                            for k in sorted(hold))))
+                    else:
+                        for pos in range(j * bs, (j + 1) * bs):
+                            del r.pub[l][h][pos]
             r.hist_blocks += 1
             self.stats["history_blocks"] += 1
+
+    def _h1_waits_in_flight(self, r: Request, key, l: int) -> bool:
+        """H1 evidence: does cohort `key` wait at layer l for a historical block of its workspace that is in flight?"""
+        for c in r.cohorts:
+            w = c.ws.get(l)
+            if c.key != key or w is None:
+                continue
+            for h in range(self.H):
+                st = self.pools[l].stream(r.b, h)
+                if any(j < w["hist"] and j in st.pending for row in w["sel"] for j in row[h]):
+                    return True
+        return False
 
     # ================================================================== memory, finish
     @staticmethod
@@ -1586,10 +1679,12 @@ class Dispatcher:
             n["vres"] = 0
         n["transfers"] = len(self.inflight)
         n["release_entries"] = (len(self.pending_release) + len(self.key_readers)
-                                + sum(len(v) for v in self.rel_layers.values()))
+                                + sum(len(v) for v in self.rel_layers.values()) + len(self.h1_reads))
+        n["sel_ids"] += sum(len(x) for _, rows in self.h1_reads.values() for row in rows for x in row)   # H1 records
         for r in self.active():
             drafts = list(r.drafts) + ([r.cur] if r.cur is not None else [])
             n["drafts"] += len(drafts)
+            n["release_entries"] += sum(len(v) for v in r.pub_hold.values())   # H1 holder references
             for dr in drafts:
                 n["q_vectors"] += dr.q is not None
                 n["hidden_rows"] += dr.hidden is not None
