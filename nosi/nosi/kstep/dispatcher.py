@@ -95,6 +95,24 @@ limited CPU implementation; the C >= (2K + 1) * max_sel guard and the pin guard 
       executed read whose (key, l) reader gate has not released depends on them (h1_reads), and _release_refs drops them
       after the last such reader. So no granted cohort gains a historical need after its grant (G3 holds), and no extra
       fetch, capacity or draft-LRU change follows from a publication.
+
+N3 P1 / P2 (both capacity modes; retroinfer-eval docs/superpowers/specs/2026-10-14-kstep-n3-useful-progress-contract.md,
+Codex approval 2026-10-14 for a limited CPU implementation; NoProgress, waits, forcing and every scheduling decision are
+UNCHANGED):
+  P1  stats["progress"] keeps exactly its old increments, and each one also increments stats["useful"] (a cohort executes
+      a layer, a draft step completes, a cohort is decided) or stats["traffic"] (an arriving transfer, dropped ones too;
+      a layer pool whose poll freed any slot; the verifier eviction's direct frees add nothing, as before). Observation
+      only: progress = useful + traffic (checked with the invariants; progress_report(), report()["progress"]).
+  P2  the lost-work budget: vfetch[(cohort key, layer)] holds the (batch slot, head, block) of every SUCCESSFUL new
+      verify issue while that obligation is live. In _issue, after the same-call, resident and in-flight shortcuts and
+      before any verifier eviction, credit, slot, sequence or transport change, a second verify fetch ATTEMPT of a recorded
+      id is counted (verify_refetch_attempts); in checked mode (check_invariants and no Mutations switch) it raises
+      OwnershipViolation, so no second transfer exists; in unchecked mode the issue proceeds as before. Allocation
+      refusals and demand joins record nothing. Records are dropped at the layer's execution, at the cohort's decision or
+      cancellation and at the request end (metadata only: no reference, reader event, slot or release changes), so
+      late arrivals cannot recreate them and a later request of the batch slot inherits none. At most one record per
+      undecided cohort (its current layer) and at most H * K * S_max ids per record, so at most
+      B * (ceil(LAMBDA / K) + 1) * H * K * S_max live ids; charged as release entries (records) and selection ids (ids).
 """
 from __future__ import annotations
 
@@ -305,6 +323,9 @@ class Dispatcher:
         self.rel_layers: Dict[Tuple, Dict[int, bool]] = {}  # key -> {layer: released}: queued layers (R1.4)
         self.cancelled_keys = set()
         self._noprog = 0
+        self.vfetch: Dict[Tuple, set] = {}         # N3 P2: (cohort key, layer) -> {(b, h, block)} verify-fetched while live
+        self.vfetch_ids = 0                        # N3 P2: live ids (sum of the record sizes)
+        self.vfetch_max_ids = 0
         self._vfail = set()
         self._read_keys = set()
         self._n_new_val = 0
@@ -353,6 +374,8 @@ class Dispatcher:
                 self.pools[l].stream(r.b, h).end_owner()
         self.pending_release = [x for x in self.pending_release if x[0][0] != r.uid]
         self.key_readers = {k: v for k, v in self.key_readers.items() if k[0][0] != r.uid}
+        for rk in [k for k in self.vfetch if k[0][0] == r.uid]:          # N3 P2 metadata only; a later request of
+            self._vfetch_drop(rk, "end")                                # this batch slot inherits nothing
         self.rel_layers = {k: v for k, v in self.rel_layers.items() if k[0] != r.uid}
         r.done = True
         r.credits = None
@@ -763,6 +786,7 @@ class Dispatcher:
             res = st.admit(tr.slot, tr.uid, tr.block, tr.gen, self.mut, demand=tr.demand)
             self.arrival_log.append(tr.seq)
             self.stats["progress"] += 1
+            self.stats["traffic"] += 1                                  # N3 P1: an arrival (dropped ones too) is traffic
             if tr.requester in self.cancelled_keys:
                 self.stats["arrivals_after_cancel"] += 1               # T3: kept (history is immutable) or dropped
             if res["dropped"]:
@@ -793,6 +817,7 @@ class Dispatcher:
             if n:
                 self.stats["slots_freed"] += n
                 self.stats["progress"] += 1
+                self.stats["traffic"] += 1                              # N3 P1: one per layer pool that freed ANY slot
         self._validate()
         keep = []
         for key, l in self.pending_release:
@@ -1100,12 +1125,14 @@ class Dispatcher:
             c.vsel[l] = [[list(x) for x in row] for row in c.ws[l]["sel"]]
             c.vhist[l] = c.ws[l]["hist"]
             c.exec_call[l] = cid
+            self._vfetch_drop((c.key, l), "exec")                      # N3 P2: the layer-l obligation is met
             if self.rev6 and not self.mut.rev6_release_recent_before_gate:
                 self.h1_reads[(c.key, l)] = (c.ws[l]["hist"], [[list(x) for x in row] for row in c.ws[l]["sel"]])  # H1
             del c.ws[l]
             c.next_layer = l + 1
             self.exec_log.append((cid, l, r.uid, c.epoch, c.m))
             self.stats["progress"] += 1
+            self.stats["useful"] += 1                                  # N3 P1: a cohort executed a layer
             if self.mut.release_at_execution:                          # NEGATIVE CONTROL (R1.6 early release)
                 self.rel_layers.setdefault(c.key, {})[l] = False
                 self._release_refs(c.key, l)
@@ -1143,6 +1170,11 @@ class Dispatcher:
                 st.check()
             if self.rev6:
                 self._rev6_check(l)
+            s = self.stats
+            if s["progress"] != s["useful"] + s["traffic"] or self.vfetch_ids != sum(len(v) for v in self.vfetch.values()):
+                raise OwnershipViolation("N3 P1/P2: progress %d != useful %d + traffic %d, or %d live verify-fetch ids != the "
+                                         "records' %d" % (s["progress"], s["useful"], s["traffic"], self.vfetch_ids,
+                                                          sum(len(v) for v in self.vfetch.values())))
         if self.observer is not None:
             self.observer(self, "call", cid, l)
 
@@ -1281,6 +1313,50 @@ class Dispatcher:
         return [(k, v) for _, k, v in out]
 
     # ================================================================== fetch issue (K5, T3)
+    # ---------------------------------------------------------------- N3 P2: the lost-work budget of verifier obligations
+    def _refetch_attempt(self, r: Request, l: int, h: int, j: int, key) -> None:
+        """N3 P2. Cohort `key` ATTEMPTS a second verify fetch of block j (layer l, batch slot r.b, head h) while its layer-l
+        obligation is live. A waiting verifier pins its whole selection (K2), a pinned block keeps its slot (K3, R2.4), and
+        _issue skips resident and in-flight blocks, so in a correct run this never happens for any finite transfer or
+        reader delay: the obligation lost a block it had fetched (lost work). Called after the same-call, resident and
+        in-flight shortcuts and BEFORE any verifier eviction, credit, slot, sequence or transport change.
+        Checked mode (check_invariants and no Mutations switch active, as for the other invariant checks): the attempt is
+        counted and OwnershipViolation is raised, so no second transfer exists. Unchecked mode: the attempt is counted
+        (stats["verify_refetch_attempts"]) and the issue proceeds as before this check existed."""
+        self.stats["verify_refetch_attempts"] += 1
+        if self.cfg.check_invariants and not self.mut.active():
+            raise OwnershipViolation("N3 lost work: cohort %s attempted a second verify fetch of block %d (layer %d, batch "
+                                     "slot %d, head %d) while its layer-%d obligation is live; prevented, no transfer was "
+                                     "issued" % (key, j, l, r.b, h, l))
+
+    def _vfetch_count(self, delta: int) -> None:
+        self.vfetch_ids += delta
+        self.vfetch_max_ids = max(self.vfetch_max_ids, self.vfetch_ids)
+
+    def _vfetch_drop(self, rk, why: str) -> None:
+        """N3 P2 metadata cleanup of one (cohort key, layer) record (layer execution, decision or cancellation, request
+        end). It touches no reference, reader event, slot or release."""
+        ids = self.vfetch.pop(rk, None)
+        if ids:
+            self._vfetch_count(-len(ids))
+            self.stats["vfetch_records_dropped_" + why] += 1
+
+    def _vfetch_drop_cohort(self, key, why: str) -> None:
+        for l in range(self.L):
+            self._vfetch_drop((key, l), why)
+
+    def progress_report(self) -> Dict[str, Any]:
+        """N3 P1 (observation only; NoProgress still uses `progress`): useful = cohort-layer executions + completed draft
+        steps + cohort decisions; traffic = arrivals (dropped ones too) + layer-pool polls that freed any slot; progress =
+        useful + traffic. N3 P2: refetch attempts and the live verify-fetch records (one record per (cohort, layer), one
+        id per (batch slot, head, block)) with their peak and the bound B * (ceil(LAMBDA / K) + 1) * H * K * S_max."""
+        s = self.stats
+        return dict(progress=s.get("progress", 0), useful=s.get("useful", 0), traffic=s.get("traffic", 0),
+                    verify_refetch_attempts=s.get("verify_refetch_attempts", 0), vfetch_records=len(self.vfetch),
+                    vfetch_ids=self.vfetch_ids, vfetch_max_ids=self.vfetch_max_ids,
+                    vfetch_bound=self.cfg.B * (-(-self.LAMBDA // self.K) + 1) * self.H * self.K * self.rb,
+                    vfetch_dropped={w: s.get("vfetch_records_dropped_" + w, 0) for w in ("exec", "decided", "end")})
+
     def _issue(self, l: int, requests: List[Tuple], cid: int) -> None:
         pool = self.pools[l]
         seen = set()
@@ -1305,6 +1381,8 @@ class Dispatcher:
             if j in st.pending:
                 self._add_demand(st, j, kind)                             # R2.3
                 continue
+            if kind == VERIFY and (r.b, h, j) in self.vfetch.get((key, l), ()):
+                self._refetch_attempt(r, l, h, j, key)                    # N3 P2: before any eviction, credit or slot change
             if self.rev6:
                 if kind == DRAFT:
                     self._take_credit(r, l, h, "fetch")                   # rev6 SC3 (a VERIFY fetch holds a grant, G3)
@@ -1338,6 +1416,11 @@ class Dispatcher:
             issued[(r.b, h, j)] = tr
             batch.append(tr)
             self.stats["fetch_%s_issued" % kind] += 1
+            if kind == VERIFY:                                            # N3 P2: only a successful new verify issue
+                ids = self.vfetch.setdefault((key, l), set())
+                if (r.b, h, j) not in ids:                                # (unchecked mode: a repeat adds no id)
+                    ids.add((r.b, h, j))
+                    self._vfetch_count(1)
         if batch:
             self.tp.issue(l, batch)
 
@@ -1422,6 +1505,7 @@ class Dispatcher:
         r.drafts.append(dr)
         self.stats["draft_steps"] += 1
         self.stats["progress"] += 1
+        self.stats["useful"] += 1                                      # N3 P1: a draft step completed
         self._record_draft(r, dr, "drafted")
         m = cad.triggered_by(dr.s, self.K)
         if m is not None:
@@ -1494,6 +1578,7 @@ class Dispatcher:
         self.stats["accepted_drafts"] += o.n_acc
         self.stats["zero_mass_accepts"] += o.zero_mass_accepts
         self.stats["progress"] += 1
+        self.stats["useful"] += 1                                      # N3 P1: a cohort decision
         if o.full:
             self._publish(r, c, c.b, c.b)
             r.toks.extend(r.drafts[i - 1].d for i in range(c.a, c.b + 1))
@@ -1509,6 +1594,7 @@ class Dispatcher:
                 self._rebuild_dchain(r)
             r.cohorts.remove(c)                                        # an accepted cohort is no longer held (K6)
             self._free_cohort(c)
+            self._vfetch_drop_cohort(c.key, "decided")                 # N3 P2 metadata only
             return
         i_star = o.i_star
         upto_pub = c.b if self.mut.publish_beyond_prefix else i_star
@@ -1523,6 +1609,7 @@ class Dispatcher:
         ep["cohorts"].append(self._cohort_record(r, c, o))
         self._finished_key(c.key)
         self._free_cohort(c)
+        self._vfetch_drop_cohort(c.key, "decided")                     # N3 P2 metadata only
         # C3: cancel every later cohort (triggered or not) and every draft with index >= i_star
         for cc in r.cohorts:
             if cc.state in (PENDING, RUNNING, DONE) and cc is not c:
@@ -1538,6 +1625,7 @@ class Dispatcher:
                     self._finished_key(cc.key)
                 self._cancel_requester(cc.key)
                 self._free_cohort(cc)
+                self._vfetch_drop_cohort(cc.key, "decided")            # N3 P2 metadata only (cancellation)
         n_open = cad.cohort_of(len(r.drafts) + 1, self.K)
         for m in range(c.m + 1, n_open + 1):
             k = (r.uid, r.epoch, m)
@@ -1681,6 +1769,8 @@ class Dispatcher:
         n["release_entries"] = (len(self.pending_release) + len(self.key_readers)
                                 + sum(len(v) for v in self.rel_layers.values()) + len(self.h1_reads))
         n["sel_ids"] += sum(len(x) for _, rows in self.h1_reads.values() for row in rows for x in row)   # H1 records
+        n["release_entries"] += len(self.vfetch)                         # N3 P2: one record per (cohort, layer)
+        n["sel_ids"] += self.vfetch_ids                                  # N3 P2: one id per (batch slot, head, block)
         for r in self.active():
             drafts = list(r.drafts) + ([r.cur] if r.cur is not None else [])
             n["drafts"] += len(drafts)
@@ -1724,7 +1814,8 @@ class Dispatcher:
                     stalls={k[6:]: v for k, v in s.items() if k.startswith("stall_")},
                     stall_accounting=self.stall_accounting(),
                     verifier_evictions_of_draft_entries=self.vev_report(),
-                    sharing_IDEAL=self.sharing(), memory=self.acct.report(), capacity=self.capacity_report())
+                    sharing_IDEAL=self.sharing(), memory=self.acct.report(), capacity=self.capacity_report(),
+                    progress=self.progress_report())
 
     def capacity_report(self) -> Dict[str, Any]:
         """The capacity mode and (rev6) its contract counters. Memory is charged for the FULL C + X positions of every
