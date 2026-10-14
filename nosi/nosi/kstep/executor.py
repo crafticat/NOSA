@@ -34,6 +34,23 @@ without it). Row.kv stays the eager input of the row (read through the address m
                           read nothing). The dispatcher installs read_ev as the last reader of every slot and position read
                           IMMEDIATELY after joint_post returns; nothing frees a position in between. Reads on several
                           independent streams would need a joined completion frontier: not part of this protocol.
+
+M2 RING PROTOCOL, interface v3 (Config.recent = "ring"; contract revisions 4-5, section 11.3), versioned by the attribute
+reads_ring = True (requires reads_arena; ring mode refuses an executor without it). Checkpoint 1 (2026-10-14) adds this
+interface (Row.ring, the attach_ring requirement of check_executor) only; the dispatcher's use of it is checkpoint 2.
+In addition to the arena protocol:
+  attach_ring(be, rk, rv, rgen, register_ring)
+                          once, at dispatcher construction: per layer the ring rows rk[l], rv[l] ((Q_l, D): row e = entry
+                          e) and the generation mirror rgen[l] ((Q_l,) int64, written at every bind);
+                          register_ring(l, row, h, pos, entry, rgen, kind, which, ws, pg) records ONE deferred ring read
+                          (which "k" or "v"; ws the deferred copy of the entry's row; pg a one-element copy of
+                          rgen[l][entry] made at the read's execution).
+  Row.ring[h] = [(pos, entry, rgen, kind)] in position order for every NON-SLOT position the row attends at head h (tail
+                          block, selected non-historical blocks, retained exact, own pre, predecessor prov, own draft).
+  joint_post(l, rows) -> (outs, read_ev)
+                          read_ev is recorded on "compute" after the LAST read of ANY arena position OR ring entry, and
+                          is None only when the call read nothing. The executor reads the K row and the V row of every
+                          Row.ring entry (registering each). Row.kv stays the eager input (the semantic reference).
 """
 from __future__ import annotations
 
@@ -58,17 +75,21 @@ class Row:
     q: Any = None
     kv: List[List[Tuple]] = field(default_factory=list)
     addr: Optional[List[List[Tuple[int, int, int]]]] = None   # M2 arena: per head [(block, phys, pgen)], block order
+    ring: Optional[List[List[Tuple[int, int, int, str]]]] = None   # M2 B2 v3: per head [(pos, entry, rgen, kind)]
 
 
 REQUIRED = ("joint_pre", "select", "joint_post", "dist", "embed", "compress", "prefill")
 ATTRS = ("L", "H", "D", "V", "bs", "stride", "max_sel")
 ARENA_REQUIRED = ("attach_arena",)
+RING_REQUIRED = ("attach_ring",)
 
 
 def check_executor(ex) -> None:
     miss = [m for m in REQUIRED if not callable(getattr(ex, m, None))] + [a for a in ATTRS if not hasattr(ex, a)]
     if getattr(ex, "reads_arena", False):
         miss += [m for m in ARENA_REQUIRED if not callable(getattr(ex, m, None))]
+    if getattr(ex, "reads_ring", False):
+        miss += [m for m in RING_REQUIRED if not callable(getattr(ex, m, None))]
     if miss:
         raise TypeError("executor %r lacks %s" % (type(ex).__name__, miss))
     if ex.bs % ex.stride:

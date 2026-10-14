@@ -59,6 +59,24 @@ unchanged; a Slot gains its binding (phys, pgen).
   CHECKS  (Arena.checked, set by the dispatcher in checked mode; named "arena binding: ...") after every bind for the
           bound slot, after every release / dropped arrival for the slot it moved, at every unbind, and the full scan
           (LayerPool.check_arena: 1:1 binding, pgen_t = pgen, bound + E + G <= P_l) at the end of every joint call.
+
+M2 B2 RING (Config.recent = "ring"; retroinfer-eval docs/superpowers/specs/2026-10-14-kstep-m2-integration-contract.md
+revisions 4-5, section 11; default "eager" keeps every rule above unchanged). One RingPool per layer holds the records of
+Q_l entries; one entry holds the K row and the V row of ONE (head, position) of one request (the rows live in the
+dispatcher's ring tensors, row e = entry e). Per entry e:
+  state         FREE | LIVE (logically held) | DRAINING (logically released, waiting for its gates)
+  kind          exact | draft | pre | prov (pre -> prov and prov -> exact are re-tags of the same entry)
+  owner, prov   (uid, b, h) and (epoch, cohort key or None, position)
+  rgen[e]       +1 at every bind; rgen_t[e] is its int64 mirror (the map entry a deferred read copies at execution)
+  ready, cev, dev   the producer's write event, the latest COMPUTE reader event, the latest D2H reader event: two
+                separate gates on two ordered streams (no single latest event is used); kept after FREE as history
+  BIND    RingPool.bind, as one step after every check (bind_check): the LOWEST FREE entry, rgen + 1 (and rgen_t), the
+          owner and provenance, empty reader state. The dispatcher's maps, payload write and ready event follow.
+  FREE    only in RingPool.retire (the dispatcher's host poll, beside poll_releases, and the bind's backpressure step):
+          a DRAINING entry whose ready, compute and D2H events are all complete (non-blocking ev_done).
+  CHECKS  named "ring binding: ..." (bind_check before any change; reader installs and re-tags name the binding rgen).
+  CHECKPOINT 1 (2026-10-14 steering): these records and the ring-mode K6 accountant only. At this pin the dispatcher
+          does not create or use them (no Config.recent yet); its integration is checkpoint 2.
 """
 from __future__ import annotations
 
@@ -75,6 +93,9 @@ from .executor import DRAFT
 
 FREE, INFLIGHT, LRU, PO, VRES, RELEASING = "free", "inflight", "lru", "po", "vres", "releasing"
 STATES = (FREE, INFLIGHT, LRU, PO, VRES, RELEASING)
+LIVE, DRAINING = "live", "draining"                                 # M2 B2 ring entry states (with FREE)
+R_EXACT, R_DRAFT, R_PRE, R_PROV = "exact", "draft", "pre", "prov"  # M2 B2 ring entry kinds
+RING_KINDS = (R_EXACT, R_DRAFT, R_PRE, R_PROV)
 
 
 class Slot:
@@ -617,6 +638,192 @@ class Arena:
                                      "granted unissued verifier fetches > P %d" % (self.l, self.n_bound, E, G, self.P))
 
 
+# --------------------------------------------------------------------------------------------------- M2 B2 ring
+class RingPool:
+    """M2 B2 (retroinfer-eval docs/superpowers/specs/2026-10-14-kstep-m2-integration-contract.md revisions 4-5, sections
+    11.2-11.4): the records of ONE layer's pooled ring of Q entries (one entry = the K row and the V row of one (head,
+    position) of one request; the rows live in the dispatcher's ring tensors, row e = entry e). See the module docstring
+    (M2 B2 RING) for the fields. The free list is a heap: a bind always takes the LOWEST FREE entry. live_by counts the
+    LIVE entries per (batch slot, head): the per-stream quantity of the 11.4 bound (a stream's previous request left only
+    DRAINING entries at its end). log is test instrumentation (bind / retag / drain / free records; not counted in K6)."""
+
+    def __init__(self, l: int, Q: int, checked: bool = False):
+        if Q < 1:
+            raise ConfigError("M2 B2: a ring needs Q >= 1 entries (got %d)" % Q)
+        self.l, self.Q = int(l), int(Q)
+        self.checked = bool(checked)
+        self.rgen: List[int] = [0] * self.Q
+        self.rgen_t = torch.zeros(self.Q, dtype=torch.int64)
+        self.state: List[str] = [FREE] * self.Q
+        self.kind: List[Optional[str]] = [None] * self.Q
+        self.owner: List[Optional[Tuple]] = [None] * self.Q
+        self.prov: List[Optional[Tuple]] = [None] * self.Q
+        self.ready: List[Any] = [None] * self.Q
+        self.cev: List[Any] = [None] * self.Q
+        self.dev: List[Any] = [None] * self.Q
+        self.dseq: List[Optional[int]] = [None] * self.Q
+        self._free: List[int] = list(range(self.Q))            # a valid heap: sorted
+        self._drains = 0
+        self.n_live = 0
+        self.n_draining = 0
+        self.live_by: Dict[Tuple[int, int], int] = {}
+        self.peak_live = 0
+        self.peak_stream = 0
+        self.binds = 0
+        self.log: List[Dict] = []
+
+    def lowest_free(self) -> Optional[int]:
+        return self._free[0] if self._free else None
+
+    def bind_check(self, e: Optional[int], where: str) -> None:
+        """The conditions of entry e as the next binding, available without a scan (RingPool.bind repeats them as a
+        fail-stop): a FREE entry exists, e is the top of the free list, LIVE + DRAINING + free list = Q, e is FREE, and its
+        rgen_t mirror equals rgen. OwnershipViolation "ring binding: ..." otherwise."""
+        bad = None
+        if e is None:
+            bad = "no FREE entry (LIVE %d, DRAINING %d of Q %d)" % (self.n_live, self.n_draining, self.Q)
+        elif not self._free or self._free[0] != e:
+            bad = "entry %d is not the lowest FREE entry" % e
+        elif self.n_live + self.n_draining + len(self._free) != self.Q:
+            bad = "LIVE %d + DRAINING %d + free list %d != Q %d" % (self.n_live, self.n_draining, len(self._free), self.Q)
+        elif self.state[e] != FREE:
+            bad = "entry %d on the free list is %s" % (e, self.state[e])
+        elif int(self.rgen_t[e]) != self.rgen[e]:
+            bad = "entry %d generation mirror rgen_t %d != rgen %d" % (e, int(self.rgen_t[e]), self.rgen[e])
+        if bad is not None:
+            raise OwnershipViolation("ring binding: %s (layer %d, %s)" % (bad, self.l, where))
+
+    def bind(self, e: int, kind: str, owner: Tuple, prov: Tuple, where: str) -> Tuple[int, Any]:
+        """Contract 11.2: FREE -> LIVE for entry e (bind_check runs again here as a fail-stop): rgen + 1 (and rgen_t),
+        kind, owner (uid, b, h), provenance, empty reader state. Returns (the new rgen, the previous occupancy's D2H
+        event: the dispatcher's write stream-waits it, the second safeguard)."""
+        if kind not in RING_KINDS:
+            raise ValueError(kind)
+        self.bind_check(e, where)
+        heapq.heappop(self._free)
+        prev_d2h = self.dev[e]
+        self.rgen[e] += 1
+        self.rgen_t[e] = self.rgen[e]
+        self.state[e], self.kind[e], self.owner[e], self.prov[e] = LIVE, kind, tuple(owner), tuple(prov)
+        self.ready[e] = self.cev[e] = self.dev[e] = None
+        self.dseq[e] = None
+        self.n_live += 1
+        bh = (owner[1], owner[2])
+        self.live_by[bh] = self.live_by.get(bh, 0) + 1
+        self.peak_live = max(self.peak_live, self.n_live)
+        self.peak_stream = max(self.peak_stream, self.live_by[bh])
+        self.binds += 1
+        self.log.append(dict(op="bind", l=self.l, e=e, rgen=self.rgen[e], kind=kind, owner=tuple(owner), prov=tuple(prov),
+                             where=where, prev_d2h=prev_d2h))
+        return self.rgen[e], prev_d2h
+
+    def _held(self, e: int, g: int, what: str) -> None:
+        if e is None or not 0 <= e < self.Q or self.state[e] == FREE or self.rgen[e] != g:
+            raise OwnershipViolation("ring binding: %s for entry %s (layer %d) of rgen %s, but the entry is %s with rgen %s"
+                                     % (what, e, self.l, g, None if e is None else self.state[e],
+                                        None if e is None else self.rgen[e]))
+
+    def set_ready(self, e: int, g: int, ev) -> None:
+        """The producer's payload write of binding rgen g completed at `ev` (an event on "compute")."""
+        self._held(e, g, "ready event")
+        self.ready[e] = ev
+
+    def note_compute(self, e: int, g: int, ev) -> None:
+        """A compute read of binding rgen g whose call's read event is `ev` (one ordered stream: the latest covers all)."""
+        self._held(e, g, "compute reader event")
+        self.cev[e] = ev
+
+    def note_d2h(self, e: int, g: int, ev) -> None:
+        """A D2H read of binding rgen g that completes at `ev` (one ordered stream "d2h": the latest covers all)."""
+        self._held(e, g, "D2H reader event")
+        self.dev[e] = ev
+
+    def retag(self, e: int, g: int, kind: str, prov: Tuple) -> None:
+        """PRE -> PROV (the cohort executed the layer) or PROV -> EXACT (publication): the same entry and payload."""
+        self._held(e, g, "re-tag to %s" % kind)
+        if self.state[e] != LIVE or kind not in RING_KINDS:
+            raise OwnershipViolation("ring binding: re-tag of entry %d (layer %d) to %s, but it is %s"
+                                     % (e, self.l, kind, self.state[e]))
+        self.log.append(dict(op="retag", l=self.l, e=e, rgen=self.rgen[e], kind=kind, old=self.kind[e], prov=tuple(prov)))
+        self.kind[e], self.prov[e] = kind, tuple(prov)
+
+    def drain(self, e: int, g: int, why: str) -> None:
+        """LIVE -> DRAINING: the logical release (rollback, supersession, decision, history, H1, request end). The entry
+        stays bound (rgen unchanged) until RingPool.retire finds all three of its events complete."""
+        self._held(e, g, "drain(%s)" % why)
+        if self.state[e] != LIVE:
+            raise OwnershipViolation("ring binding: drain(%s) of entry %d (layer %d), which is %s" % (why, e, self.l,
+                                                                                                    self.state[e]))
+        self.state[e] = DRAINING
+        self.n_live -= 1
+        self.n_draining += 1
+        bh = (self.owner[e][1], self.owner[e][2])
+        self.live_by[bh] -= 1
+        self._drains += 1
+        self.dseq[e] = self._drains
+        self.log.append(dict(op="drain", l=self.l, e=e, rgen=self.rgen[e], kind=self.kind[e], owner=self.owner[e], why=why))
+
+    def gates(self, e: int) -> List[Any]:
+        """The INCOMPLETE events of entry e (its write, its latest compute reader, its latest D2H reader)."""
+        return [ev for ev in (self.ready[e], self.cev[e], self.dev[e]) if ev is not None and not ev_done(ev)]
+
+    def _free_entry(self, e: int, why: str) -> None:
+        self.state[e] = FREE
+        self.n_draining -= 1
+        self.log.append(dict(op="free", l=self.l, e=e, rgen=self.rgen[e], kind=self.kind[e], owner=self.owner[e], why=why))
+        self.kind[e] = self.owner[e] = self.prov[e] = None
+        self.dseq[e] = None
+        heapq.heappush(self._free, e)
+
+    def retire(self) -> int:
+        """DRAINING -> FREE for every entry whose events are all complete (non-blocking). Returns the number freed."""
+        n = 0
+        for e in range(self.Q):
+            if self.state[e] == DRAINING and not self.gates(e):
+                self._free_entry(e, "retire")
+                n += 1
+        return n
+
+    def oldest_held(self) -> Optional[int]:
+        """The DRAINING entry with an incomplete event that was released FIRST (backpressure's wait target), or None."""
+        best = None
+        for e in range(self.Q):
+            if self.state[e] == DRAINING and self.gates(e) and (best is None or self.dseq[e] < self.dseq[best]):
+                best = e
+        return best
+
+    def counts(self) -> Dict[str, int]:
+        """K6 (contract 11.4): LIVE entries by kind, and FREE + DRAINING (ring_idle)."""
+        c = {k: 0 for k in RING_KINDS}
+        idle = 0
+        for e in range(self.Q):
+            if self.state[e] == LIVE:
+                c[self.kind[e]] += 1
+            else:
+                idle += 1
+        c["idle"] = idle
+        return c
+
+    def check(self) -> None:
+        """Full scan (checked mode): counts, the free list = the FREE entries, rgen_t = rgen, live_by = the LIVE entries
+        per (batch slot, head)."""
+        live = sum(1 for s in self.state if s == LIVE)
+        drn = sum(1 for s in self.state if s == DRAINING)
+        by: Dict[Tuple[int, int], int] = {}
+        for e in range(self.Q):
+            if self.state[e] == LIVE:
+                bh = (self.owner[e][1], self.owner[e][2])
+                by[bh] = by.get(bh, 0) + 1
+        if (live, drn) != (self.n_live, self.n_draining) or sorted(self._free) != [e for e in range(self.Q)
+                                                                                  if self.state[e] == FREE]:
+            raise OwnershipViolation("ring binding: layer %d counts LIVE %d / %d, DRAINING %d / %d, free list %s"
+                                     % (self.l, live, self.n_live, drn, self.n_draining, sorted(self._free)))
+        if {k: v for k, v in self.live_by.items() if v} != by:
+            raise OwnershipViolation("ring binding: layer %d per-stream LIVE counts %s != %s" % (self.l, self.live_by, by))
+        if not torch.equal(self.rgen_t, torch.tensor(self.rgen, dtype=torch.int64)):
+            raise OwnershipViolation("ring binding: layer %d generation mirror rgen_t differs from rgen" % self.l)
+
+
 # --------------------------------------------------------------------------------------------------- memory (K6)
 @dataclass
 class Geometry:
@@ -658,6 +865,13 @@ class Geometry:
             map_entry=8,                                                # one int64 entry of the generation mirror pgen_t
             transfer_bind=8 + 8,                                        # Transfer.phys, Transfer.pgen of one transfer
             counter=8,                                                  # one rev6 credit counter or grant entry
+            # M2 B2 ring metadata (contract 11.4), charged at ALLOCATED capacity in ring mode only:
+            ring_meta=1 + 1 + 3 * 8 + 3 * 8 + 8 + 3 * 8 + 8 + 8,        # state, kind, owner (uid, b, h), provenance
+                                                                        # (epoch, key, position), rgen, three events,
+                                                                        # holds, free-list entry
+            ring_map=8 + 8,                                             # one map entry (key, entry) of a request
+            adm_meta=1 + 3 * 8 + 8,                                     # one admission buffer: state, ready / compute /
+                                                                        # D2H events, size
         )
 
 
@@ -672,6 +886,13 @@ COUNTS = (FREE, LRU, PO, VRES, INFLIGHT, RELEASING, "workspace_rows", "hidden_ro
 # these count the logical slot records, their binding fields, the position records, the pgen_t entries, the transfers'
 # binding fields and the rev6 credit counters / grant entries.
 ARENA_COUNTS = ("slot_records", "slot_binds", "pos_records", "map_entries", "transfer_binds", "reserve_counters")
+# M2 B2 ring mode only (MemoryAccountant(ring=True), contract 11.4): LIVE ring entries by kind (EXACT, DRAFT, PRE + PROV),
+# FREE + DRAINING entries, all allocated entries, the requests' map entries, and the held admission buffers (their
+# (layer, head, position) items and their records). In ring mode these REPLACE the eager draft / provisional / recent
+# dict counts for the draft_kv / provisional_kv / recent_kv categories; ring_idle and admission_kv are added.
+RING_COUNTS = ("ring_live_exact", "ring_live_draft", "ring_live_prov", "ring_idle", "ring_entries", "ring_map_entries",
+               "admission_pos", "admission_records")
+RING_CATS = ("ring_idle", "admission_kv")
 
 
 class MemoryAccountant:
@@ -688,26 +909,37 @@ class MemoryAccountant:
     arena=True (M2, contract 2.6): the slot categories are the ALLOCATED arena positions by state (FREE, or the state of
     the bound logical slot), and the metadata adds ARENA_COUNTS at allocated capacity; the logical slot records are
     charged from their own count (slot_records). Test instrumentation (arena logs, the S0 readback payloads) is not
-    counted. Not a GPU memory measurement."""
+    counted. Not a GPU memory measurement.
+    ring=True (M2 B2, contract 11.4; needs arena=True): every ALLOCATED ring entry is charged at pos_kv: LIVE entries by
+    kind into draft_kv (DRAFT), provisional_kv (PRE and PROV) and recent_kv (EXACT), replacing the eager dict counts, and
+    FREE + DRAINING into ring_idle; every admission buffer that is not FREE (also of an ended request) into admission_kv;
+    the metadata adds the entry records and the rgen_t entries at allocated capacity, the map entries and the admission
+    buffer records. Ring logs, the D2H snapshots and the host-row owner record are test instrumentation, not counted."""
 
-    def __init__(self, geom: Optional[Geometry] = None, staging_bytes: int = 0, arena: bool = False):
+    def __init__(self, geom: Optional[Geometry] = None, staging_bytes: int = 0, arena: bool = False, ring: bool = False):
         self.geom = geom or Geometry()
         self.u = self.geom.unit()
         self.staging_bytes = int(staging_bytes)
         self.arena = bool(arena)
-        self.peak = {k: 0 for k in CATS + ("total",)}
-        self.sum = {k: 0 for k in CATS + ("total",)}
+        self.ring = bool(ring)
+        if self.ring and not self.arena:
+            raise ConfigError("K6: the ring accountant needs arena=True")
+        self.cats = CATS + (RING_CATS if self.ring else ())
+        self.peak = {k: 0 for k in self.cats + ("total",)}
+        self.sum = {k: 0 for k in self.cats + ("total",)}
         self.n = 0
         self.last: Dict[str, int] = {}
         self.last_counts: Dict[str, int] = {}
 
     def bytes_of(self, n: Dict[str, int]) -> Dict[str, int]:
-        missing = [k for k in COUNTS + (ARENA_COUNTS if self.arena else ()) if k not in n]
+        missing = [k for k in COUNTS + (ARENA_COUNTS if self.arena else ()) + (RING_COUNTS if self.ring else ())
+                   if k not in n]
         if missing:
             raise KeyError("K6 sample lacks counts %s" % missing)
-        extra = [] if self.arena else [k for k in ARENA_COUNTS if k in n]
+        extra = ([] if self.arena else [k for k in ARENA_COUNTS if k in n]) + (
+            [] if self.ring else [k for k in RING_COUNTS if k in n])
         if extra:
-            raise KeyError("K6 sample has arena counts %s outside arena mode" % extra)
+            raise KeyError("K6 sample has arena / ring counts %s outside their mode" % extra)
         u = self.u
         n_slots = n[FREE] + n[LRU] + n[PO] + n[VRES] + n[INFLIGHT] + n[RELEASING]
         b = dict(slots_free=n[FREE] * u["slot"], slots_lru=n[LRU] * u["slot"], slots_po=n[PO] * u["slot"],
@@ -726,7 +958,18 @@ class MemoryAccountant:
             b["metadata"] += (n["slot_binds"] * u["slot_bind"] + n["pos_records"] * u["pos_meta"]
                               + n["map_entries"] * u["map_entry"] + n["transfer_binds"] * u["transfer_bind"]
                               + n["reserve_counters"] * u["counter"])
-        b["total"] = sum(b[k] for k in CATS)
+        if self.ring:
+            if (n["ring_live_exact"] + n["ring_live_draft"] + n["ring_live_prov"] + n["ring_idle"]) != n["ring_entries"]:
+                raise KeyError("K6 ring counts %s do not cover the %d allocated entries"
+                               % ({k: n[k] for k in RING_COUNTS}, n["ring_entries"]))
+            b["draft_kv"] = n["ring_live_draft"] * u["pos_kv"]
+            b["provisional_kv"] = n["ring_live_prov"] * u["pos_kv"]
+            b["recent_kv"] = n["ring_live_exact"] * u["pos_kv"]
+            b["ring_idle"] = n["ring_idle"] * u["pos_kv"]
+            b["admission_kv"] = n["admission_pos"] * u["pos_kv"]
+            b["metadata"] += (n["ring_entries"] * (u["ring_meta"] + u["map_entry"]) + n["ring_map_entries"] * u["ring_map"]
+                              + n["admission_records"] * u["adm_meta"])
+        b["total"] = sum(b[k] for k in self.cats)
         return b
 
     def sample(self, counts: Dict[str, int]) -> Dict[str, int]:
@@ -740,4 +983,4 @@ class MemoryAccountant:
         return b
 
     def report(self) -> Dict[str, Dict[str, float]]:
-        return {k: dict(peak=self.peak[k], mean=(self.sum[k] / self.n if self.n else 0.0)) for k in CATS + ("total",)}
+        return {k: dict(peak=self.peak[k], mean=(self.sum[k] / self.n if self.n else 0.0)) for k in self.cats + ("total",)}
