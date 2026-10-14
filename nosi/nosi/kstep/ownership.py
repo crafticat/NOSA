@@ -217,10 +217,11 @@ class Stream:
     def take(self, idx: int, uid, block: int, seq: int, cls: str = "ad") -> int:
         """FREE -> INFLIGHT for a transfer of (uid, block) into a slot of class `cls` ("ad" draft, "v" verifier reserve).
         Returns the new generation.
-        M2 arena mode (contract 2.2 / 2.4): the take also BINDS the lowest FREE position. Every check that can fail (the
-        slot is FREE, a FREE position exists, the slot names no position) runs before the first change; the previous
-        physical occupant's last reader is captured in the Arena (Arena.forward hands it to the transfer once), and the
-        new binding's reader state starts empty: the logical slot's old last_reader belongs to whatever position it held
+        M2 arena mode (contract 2.2 / 2.4): the take also BINDS the lowest FREE position. Every check that can fail runs
+        before the first change of the slot or the arena: the slot is FREE and names neither a position nor a generation,
+        and the candidate position passes Arena.bind_check (Arena.bind repeats it as a fail-stop). The previous physical
+        occupant's last reader is captured in the Arena (Arena.forward hands it to the transfer once), and the new
+        binding's reader state starts empty: the logical slot's old last_reader belongs to whatever position it held
         before and is NOT kept."""
         s = self.slots[idx]
         if s.state != FREE:
@@ -229,14 +230,11 @@ class Stream:
             raise ValueError(cls)
         ar = self.arena
         if ar is not None:
+            if s.phys is not None or s.pgen is not None:
+                raise OwnershipViolation("arena binding: FREE slot %d of stream (l %d b %d h %d) still names position %s "
+                                         "pgen %s" % (idx, self.l, self.b, self.h, s.phys, s.pgen))
             p = ar.lowest_free()
-            if p is None:
-                raise OwnershipViolation("arena binding: layer %d has no FREE position for a take into slot %d of stream "
-                                         "(l %d b %d h %d) (bound %d of P %d)" % (self.l, idx, self.l, self.b, self.h,
-                                                                                  ar.n_bound, ar.P))
-            if s.phys is not None:
-                raise OwnershipViolation("arena binding: FREE slot %d of stream (l %d b %d h %d) still names position %d"
-                                         % (idx, self.l, self.b, self.h, s.phys))
+            ar.bind_check(p, "take into slot %d of stream (l %d b %d h %d)" % (idx, self.l, self.b, self.h))
         s.gen += 1
         s.state, s.block, s.owner, s.seq, s.cls = INFLIGHT, int(block), uid, seq, cls
         s.first_reader = None
@@ -515,13 +513,34 @@ class Arena:
     def lowest_free(self) -> Optional[int]:
         return self._free[0] if self._free else None
 
+    def bind_check(self, p: Optional[int], where: str) -> None:
+        """The consistency conditions of position p as the next binding that are available without a scan (contract
+        2.4; Stream.take calls this BEFORE any change, and bind repeats it as a fail-stop): a FREE position exists, p is the
+        top of the free list, bound count + free list = P, p is unbound, records no pending write and no uncollected
+        captured reader, and its pgen_t mirror equals pgen. OwnershipViolation "arena binding: ..." otherwise."""
+        bad = None
+        if p is None:
+            bad = "no FREE position (bound %d of P %d)" % (self.n_bound, self.P)
+        elif not self._free or self._free[0] != p:
+            bad = "position %d is not the lowest FREE position" % p
+        elif self.n_bound + len(self._free) != self.P:
+            bad = "bound count %d + free list %d != P %d" % (self.n_bound, len(self._free), self.P)
+        elif self.bound[p] is not None:
+            bad = "position %d on the free list is bound to %s" % (p, self.bound[p])
+        elif self.writes[p] is not None:
+            bad = "FREE position %d still records the write of transfer %s" % (p, self.writes[p])
+        elif self.captured[p] is not None:
+            bad = "FREE position %d still holds an uncollected captured reader" % p
+        elif int(self.pgen_t[p]) != self.pgen[p]:
+            bad = "position %d generation mirror pgen_t %d != pgen %d" % (p, int(self.pgen_t[p]), self.pgen[p])
+        if bad is not None:
+            raise OwnershipViolation("arena binding: %s (layer %d, %s)" % (bad, self.l, where))
+
     def bind(self, p: int, who: Tuple[int, int, int, int], uid, block: int, seq: int, slot_prev=None) -> int:
-        """Contract 2.2 steps 1-4 for position p (the caller checked p = lowest_free() before any change): capture p's
-        last reader, pgen + 1 (and pgen_t), bound = who, the new binding's reader state empty. Returns the new pgen.
-        slot_prev (the logical slot's last reader before the take) is recorded in the log only."""
-        if not self._free or self._free[0] != p or self.bound[p] is not None:
-            raise OwnershipViolation("arena binding: bind of position %d (layer %d), which is not the lowest FREE position"
-                                     % (p, self.l))
+        """Contract 2.2 steps 1-4 for position p (Stream.take ran bind_check before any change; it runs again here as a
+        fail-stop): capture p's last reader, pgen + 1 (and pgen_t), bound = who, the new binding's reader state empty.
+        Returns the new pgen. slot_prev (the logical slot's last reader before the take) is recorded in the log only."""
+        self.bind_check(p, "bind")
         heapq.heappop(self._free)
         self.captured[p] = self.last_reader[p]
         self.pgen[p] += 1
