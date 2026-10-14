@@ -118,9 +118,12 @@ M2 SLICE A / B1 (Config.physical = "arena"; default "per_stream" keeps every rul
 docs/superpowers/specs/2026-10-14-kstep-m2-integration-contract.md revision 2, steps S1-S5 only, Codex approval
 2026-10-14). The schedule, cadence, guards, retention, recency, rollback, decisions and counters are the logical ones
 above; only the physical backing, the address of a read and WHICH event retires a position change.
-  A  storage: per layer one arena (P_l * bs, D) of head-agnostic block positions with P_l = B * H * (C + X) (the
-     conservative backing, the same amount as per stream, addressed through the map; the reduced B * H * C + X is S6,
-     NOT approved). ownership.Arena keeps the position records and the generation mirror pgen_t; Stream.take binds the
+  A  storage: per layer one arena (P_l * bs, D) of head-agnostic block positions. Config.arena_backing selects P_l:
+     "conservative" (default) P_l = B * H * (C + X), the same amount as per stream, addressed through the map;
+     "reduced" (S6, contract revision 3 section 10, Codex approval 2026-10-14) P_l = B * H * C + X, the logical bound
+     (a SUFFICIENCY argument, not a measured fit; the logical C + X slot records per stream stay). Only the geometry
+     differs; every rule, check and counter is the same. ownership.Arena keeps the position records and the generation
+     mirror pgen_t; Stream.take binds the
      lowest FREE position, LayerPool.poll_releases unbinds (ownership docstring). _issue: the bind, the take, the
      Transfer (phys, pgen, reader_ev = the previous PHYSICAL occupant's last reader, Arena.forward) and its inflight
      registration are one unit after every refusal and check; the transport sees it only after the unit. _poll checks the
@@ -161,6 +164,7 @@ POISON = -7777777                         # no toy KV value is negative
 PENDING, RUNNING, DONE, ACCEPTED, CANCELLED = "pending", "running", "done", "accepted", "cancelled"
 CAPACITY_MODES = ("m1", "rev6")
 PHYSICAL_MODES = ("per_stream", "arena")
+ARENA_BACKINGS = ("conservative", "reduced")
 
 
 @dataclass
@@ -183,6 +187,7 @@ class Config:
     capacity: str = "m1"                   # "m1" (the M1 rules) | "rev6" (PROPOSAL rev 6 contract; see the docstring)
     d_share: Optional[int] = None          # rev6: per-head draft share d_h; default W = (K + 1) * S_max; < W is refused
     physical: str = "per_stream"           # "per_stream" (M1 backing) | "arena" (M2 slice A / B1; see the docstring)
+    arena_backing: str = "conservative"    # arena mode: "conservative" P_l = B*H*(C + X) | "reduced" P_l = B*H*C + X (S6)
 
 
 class Draft:
@@ -287,6 +292,10 @@ class Dispatcher:
         if cfg.physical not in PHYSICAL_MODES:
             raise ConfigError("physical must be one of %s (got %r)" % (PHYSICAL_MODES, cfg.physical))
         self.arena_mode = cfg.physical == "arena"
+        if cfg.arena_backing not in ARENA_BACKINGS:
+            raise ConfigError("arena_backing must be one of %s (got %r)" % (ARENA_BACKINGS, cfg.arena_backing))
+        if cfg.arena_backing != "conservative" and not self.arena_mode:
+            raise ConfigError("arena_backing %r needs physical 'arena' (got %r)" % (cfg.arena_backing, cfg.physical))
         if self.arena_mode and not getattr(executor, "reads_arena", False):
             raise ConfigError("M2 arena mode needs an executor with reads_arena = True (it reads the arena itself and "
                               "returns its read event; executor docstring)")
@@ -322,8 +331,8 @@ class Dispatcher:
         z = lambda S: torch.full((cfg.B, S, self.H, self.D), POISON, dtype=torch.int64)
         self.host_k = [z(cfg.S_host) for _ in range(self.L)]
         self.host_v = [z(cfg.S_host) for _ in range(self.L)]
-        if self.arena_mode:                                    # M2 slice A: P_l = B * H * (C + X) only (S6 not approved)
-            self.P = cfg.B * self.H * n_pos
+        if self.arena_mode:                                    # M2: conservative B*H*(C + X) or reduced B*H*C + X (S6)
+            self.P = cfg.B * self.H * n_pos if cfg.arena_backing == "conservative" else cfg.B * self.H * cfg.C + cfg.X
             self.arenas = [Arena(l, self.P, checked=self._checked()) for l in range(self.L)]
             for pool, ar in zip(self.pools, self.arenas):
                 pool.attach_arena(ar)
@@ -1000,14 +1009,23 @@ class Dispatcher:
                     reserve_counters=reserve)
 
     def arena_report(self) -> Dict[str, Any]:
-        """M2: the physical mode and, in arena mode, per layer P_l, binds, peak bound positions and peak bound + E + G, the
-        logical bound B * H * C + X (REPORTED, not a fit: S6 is not approved), and the S0 adapter counters."""
+        """M2: the physical mode and, in arena mode, the backing and P_l; per layer binds, peak_bound (the EXACT maximum
+        of the bound positions: the bound rises only at a bind), peak_reserved (the maximum of bound + E + G over its
+        SAMPLES only: after every bind and at the end-of-call scans, checked mode; not an exhaustive temporal maximum);
+        the logical bound B * H * C + X (a sufficiency bound, not a measured fit); the S0 adapter counters; and
+        cpu_tensor_bytes, the actual numel * element_size of the arena_k / arena_v rows and the pgen_t mirrors (CPU
+        tensor bytes: not the K6 geometry convention, not a Python-allocator or GPU measurement, not C81 / B287)."""
         out = dict(mode=self.cfg.physical)
         if self.arena_mode:
-            out.update(P=self.P, logical_bound=self.cfg.B * self.H * self.cfg.C + self.cfg.X,
+            out.update(backing=self.cfg.arena_backing, P=self.P,
+                       logical_bound=self.cfg.B * self.H * self.cfg.C + self.cfg.X,
                        binds=[ar.binds for ar in self.arenas], peak_bound=[ar.peak_bound for ar in self.arenas],
                        peak_reserved=[ar.peak_reserved for ar in self.arenas], bound=[ar.n_bound for ar in self.arenas],
-                       pool_checks=getattr(self.tp, "pool_checks", None), readbacks=getattr(self.tp, "readbacks", None))
+                       pool_checks=getattr(self.tp, "pool_checks", None), readbacks=getattr(self.tp, "readbacks", None),
+                       cpu_tensor_bytes=dict(
+                           arena_k=sum(t.numel() * t.element_size() for t in self.arena_k),
+                           arena_v=sum(t.numel() * t.element_size() for t in self.arena_v),
+                           pgen_t=sum(ar.pgen_t.numel() * ar.pgen_t.element_size() for ar in self.arenas)))
         return out
 
     def _force_for_layer(self, l: int) -> None:
@@ -2001,8 +2019,8 @@ class Dispatcher:
 
     def capacity_report(self) -> Dict[str, Any]:
         """The capacity mode and (rev6) its contract counters. Memory is charged for the FULL C + X positions of every
-        stream (K6 counts FREE slots; in M2 arena mode the allocated P_l = B * H * (C + X) positions, the same amount),
-        so no fit claim follows from them."""
+        stream (K6 counts FREE slots; in M2 arena mode the ALLOCATED P_l positions: B * H * (C + X) conservative, or
+        B * H * C + X reduced, plus the logical C + X slot records), so no fit claim follows from them."""
         s = self.stats
         out = dict(mode=self.cfg.capacity)
         if self.rev6:
