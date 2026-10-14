@@ -26,6 +26,13 @@ class ReadCorruption(KStepError):
     """A deferred read of a slot saw other bytes than the read the joint call was computed from (T3, T4, K4)."""
 
 
+class StaleReader(KStepError):
+    """M2 arena (Config.physical = "arena"; retroinfer-eval docs/superpowers/specs/2026-10-14-kstep-m2-integration-contract.md
+    revision 2, section 3.1 (a)): a deferred read of an arena position ran after the position was unbound and bound again
+    (the generation it copied at execution differs from the generation captured when the read was enqueued). The strict
+    identity check runs BEFORE the byte check, so this is never reported as ReadCorruption, even when the bytes match."""
+
+
 class CapacityRefusal(KStepError):
     """Capacity mode "rev6" (retroinfer-eval PROPOSAL rev 6, G5 and the draft side of P6): no grant, draft step, transfer,
     reader event or release can ever free the capacity that the oldest waiter needs. An explicit refusal, never a hang."""

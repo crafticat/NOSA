@@ -17,6 +17,23 @@ A layer is two phases, as in NOSA (QKV + compressed-key scoring / top-k, then sp
   prefill(tokens)         exact KV of feeding tokens[0 .. n-1]: kv[pos][l][h] = (k, v) (start of decoding, outside M1).
 Attributes: L, H, D (per-head KV width), V, bs (block size), stride (compression stride, divides bs), max_sel (largest
 number of blocks one (row, head) selects).
+
+M2 ARENA PROTOCOL (Config.physical = "arena"; retroinfer-eval docs/superpowers/specs/2026-10-14-kstep-m2-integration-
+contract.md revision 2, section 3.1), versioned by the attribute reads_arena = True (arena mode refuses an executor
+without it). Row.kv stays the eager input of the row (read through the address map at call time, as above). In addition:
+  attach_arena(be, ak, av, pgen, register)
+                          once, at dispatcher construction: the backend; per layer the arena rows ak[l], av[l]
+                          ((P_l * bs, D): row r of position p is row p * bs + r) and the generation mirror pgen[l] ((P_l,)
+                          int64, written at every bind); register(l, row, h, block, phys, pgen, ws, exp, pg) records ONE
+                          deferred read with the dispatcher (ws the deferred copy, exp an eager clone taken at call time,
+                          pg a one-element copy of pgen[l][phys] made at the read's execution, or None).
+  joint_post(l, rows) -> (outs, read_ev)
+                          Row.addr[h] = [(block, phys, pgen)] in increasing BLOCK order (the declared logical order) for
+                          the historical blocks the row reads at head h. The executor enqueues every arena read on the ONE
+                          ordered stream "compute" and records read_ev there AFTER its last read of the call (None when it
+                          read nothing). The dispatcher installs read_ev as the last reader of every slot and position read
+                          IMMEDIATELY after joint_post returns; nothing frees a position in between. Reads on several
+                          independent streams would need a joined completion frontier: not part of this protocol.
 """
 from __future__ import annotations
 
@@ -40,14 +57,18 @@ class Row:
     hidden: Any = None
     q: Any = None
     kv: List[List[Tuple]] = field(default_factory=list)
+    addr: Optional[List[List[Tuple[int, int, int]]]] = None   # M2 arena: per head [(block, phys, pgen)], block order
 
 
 REQUIRED = ("joint_pre", "select", "joint_post", "dist", "embed", "compress", "prefill")
 ATTRS = ("L", "H", "D", "V", "bs", "stride", "max_sel")
+ARENA_REQUIRED = ("attach_arena",)
 
 
 def check_executor(ex) -> None:
     miss = [m for m in REQUIRED if not callable(getattr(ex, m, None))] + [a for a in ATTRS if not hasattr(ex, a)]
+    if getattr(ex, "reads_arena", False):
+        miss += [m for m in ARENA_REQUIRED if not callable(getattr(ex, m, None))]
     if miss:
         raise TypeError("executor %r lacks %s" % (type(ex).__name__, miss))
     if ex.bs % ex.stride:

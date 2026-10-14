@@ -23,9 +23,13 @@ Modules (each names the spec clauses it implements):
 Capacity modes (dispatcher.Config.capacity): "m1" (default, the M1 rules unchanged) and "rev6" (retroinfer-eval
 docs/superpowers/specs/2026-10-12-kstep-m1-progress-policy-PROPOSAL.md rev 6, section 8: position ledger, step credits,
 aggregate draft admission, V-only verifier residuals with age-ordered all-or-nothing grants, no verifier eviction).
+Physical modes (dispatcher.Config.physical): "per_stream" (default, the M1 backing unchanged) and "arena" (M2 slice A /
+B1, retroinfer-eval docs/superpowers/specs/2026-10-14-kstep-m2-integration-contract.md revision 2, steps S1-S5: a
+per-layer arena of P_l = B * H * (C + X) positions bound through an address map, the S0 pool-addressed descriptor and
+the executor's own read event; no GPU, memory-fit or throughput claim).
 
 Labels: no timing, throughput, interference or memory-fit claim (spec section 9). The KV read sharing recorded per call
 (D1) is the IDEAL from actual selections (SUM vs UNION of selected blocks), not a measured kernel saving.
 """
 from .errors import (CapacityRefusal, ConfigError, KStepError, NoProgress, OwnershipViolation, ReadCorruption,  # noqa: F401
-                     StaleGeneration)
+                     StaleGeneration, StaleReader)

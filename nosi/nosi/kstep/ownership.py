@@ -43,12 +43,31 @@ CAPACITY MODE "rev6" (retroinfer-eval PROPOSAL rev 6, section 8; the dispatcher 
   KIND   provenance of a reference (pin_kind: block -> key -> {"draft", "verify"}), recorded when the caller names it;
          an eviction reports the kinds that held the entry (L9: a verifier pin makes it PO instead of RELEASING).
 In mode "m1" the class and kind are recorded too, but nothing checks them.
+
+M2 PHYSICAL ARENA (Config.physical = "arena"; retroinfer-eval docs/superpowers/specs/2026-10-14-kstep-m2-integration-
+contract.md revision 2, sections 2.1-2.6; default "per_stream" keeps every rule above unchanged). One Arena per layer
+holds the records of P_l head-agnostic block positions (the conservative P_l = B * H * (C + X) only; the reduced
+B * H * C + X is step S6, not approved). The logical slots, maps, protections, classes, credits and grants above are
+unchanged; a Slot gains its binding (phys, pgen).
+  BIND    Stream.take, FREE -> INFLIGHT, as one step after every check: the LOWEST FREE position p; capture p's last
+          reader (the previous PHYSICAL occupant's, Arena.captured, forwarded once as Transfer.reader_ev); pgen + 1 (and
+          the mirror pgen_t); bound = (b, h, idx, gen); then the new binding's reader state starts empty (position and
+          slot last_reader, slot first_reader).
+  READ    the dispatcher installs the call's read event on the slot AND on its position (Arena.note_reader).
+  UNBIND  only in LayerPool.poll_releases, with the logical FREE transition (the FREE gate). The position keeps its final
+          reader as physical history for the next bind.
+  CHECKS  (Arena.checked, set by the dispatcher in checked mode; named "arena binding: ...") after every bind for the
+          bound slot, after every release / dropped arrival for the slot it moved, at every unbind, and the full scan
+          (LayerPool.check_arena: 1:1 binding, pgen_t = pgen, bound + E + G <= P_l) at the end of every joint call.
 """
 from __future__ import annotations
 
+import heapq
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+import torch
 
 from .backend import ev_done
 from .errors import ConfigError, OwnershipViolation, StaleGeneration
@@ -59,7 +78,7 @@ STATES = (FREE, INFLIGHT, LRU, PO, VRES, RELEASING)
 
 
 class Slot:
-    __slots__ = ("idx", "state", "block", "gen", "owner", "first_reader", "last_reader", "seq", "cls")
+    __slots__ = ("idx", "state", "block", "gen", "owner", "first_reader", "last_reader", "seq", "cls", "phys", "pgen")
 
     def __init__(self, idx: int):
         self.idx = idx
@@ -71,6 +90,8 @@ class Slot:
         self.last_reader = None
         self.seq = None                      # sequence id of the transfer in flight
         self.cls = None                      # "ad" | "v" while not FREE (capacity mode rev6, L1)
+        self.phys = None                     # M2 arena: the bound position while not FREE (None per stream)
+        self.pgen = None                     # M2 arena: the position's generation of this binding
 
 
 class Stream:
@@ -87,6 +108,7 @@ class Stream:
         self.pin_kind: Dict[int, Dict[Any, Set[str]]] = {}   # block -> key -> {"draft", "verify"} (provenance, L9)
         self.owner = None                                    # request uid that owns the batch slot now
         self.log: List[Tuple] = []                           # (event, block, slot, gen, detail) transition log
+        self.arena: Optional["Arena"] = None                 # M2 arena mode: the layer's position records (else None)
 
     # ------------------------------------------------------------------ queries
     def usage(self) -> int:
@@ -150,6 +172,11 @@ class Stream:
             if not self.prot.get(blk):
                 raise OwnershipViolation("protected-only or verifier-resident block %d has no protection" % blk)
 
+    def _arena_check(self, s: Slot, where: str) -> None:
+        """M2 check point (checked mode): the binding of slot s still holds after `where`."""
+        if self.arena is not None and self.arena.checked:
+            self.arena.check_slot(self, s, where)
+
     # ------------------------------------------------------------------ transitions
     def touch(self, block: int) -> None:
         """K1 / R2.1(a): a draft read of an LRU entry moves it to MRU (PO and VRES entries are not in the LRU)."""
@@ -189,18 +216,37 @@ class Stream:
 
     def take(self, idx: int, uid, block: int, seq: int, cls: str = "ad") -> int:
         """FREE -> INFLIGHT for a transfer of (uid, block) into a slot of class `cls` ("ad" draft, "v" verifier reserve).
-        Returns the new generation."""
+        Returns the new generation.
+        M2 arena mode (contract 2.2 / 2.4): the take also BINDS the lowest FREE position. Every check that can fail (the
+        slot is FREE, a FREE position exists, the slot names no position) runs before the first change; the previous
+        physical occupant's last reader is captured in the Arena (Arena.forward hands it to the transfer once), and the
+        new binding's reader state starts empty: the logical slot's old last_reader belongs to whatever position it held
+        before and is NOT kept."""
         s = self.slots[idx]
         if s.state != FREE:
             raise OwnershipViolation("take: slot %d of %s is %s" % (idx, (self.l, self.h, self.b), s.state))
         if cls not in ("ad", "v"):
             raise ValueError(cls)
+        ar = self.arena
+        if ar is not None:
+            p = ar.lowest_free()
+            if p is None:
+                raise OwnershipViolation("arena binding: layer %d has no FREE position for a take into slot %d of stream "
+                                         "(l %d b %d h %d) (bound %d of P %d)" % (self.l, idx, self.l, self.b, self.h,
+                                                                                  ar.n_bound, ar.P))
+            if s.phys is not None:
+                raise OwnershipViolation("arena binding: FREE slot %d of stream (l %d b %d h %d) still names position %d"
+                                         % (idx, self.l, self.b, self.h, s.phys))
         s.gen += 1
         s.state, s.block, s.owner, s.seq, s.cls = INFLIGHT, int(block), uid, seq, cls
         s.first_reader = None
+        if ar is not None:
+            slot_prev, s.last_reader = s.last_reader, None
+            s.phys, s.pgen = p, ar.bind(p, (self.b, self.h, idx, s.gen), uid, int(block), seq, slot_prev)
         self.log.append(("take", block, idx, s.gen, uid))
         if uid == self.owner:
             self.pending[int(block)] = idx
+        self._arena_check(s, "bind")
         return s.gen
 
     def release(self, idx: int, why: str) -> None:
@@ -210,6 +256,7 @@ class Stream:
             raise OwnershipViolation("release(%s): slot %d of %s is %s" % (why, idx, (self.l, self.h, self.b), s.state))
         s.state = RELEASING
         self.log.append(("release", s.block, idx, s.gen, why))
+        self._arena_check(s, "release(%s)" % why)                  # M2: a RELEASING slot keeps its position
 
     def _evict_over_c(self, mut=None) -> Optional[Dict]:
         """K1: after an insertion, the least recent entry leaves an LRU that holds more than C entries: a protected one
@@ -272,6 +319,7 @@ class Stream:
             s.state = RELEASING                   # T3: unowned arrival dropped; never read, so FREE at the next poll
             s.last_reader = None
             self.log.append(("drop_unowned", block, idx, gen, uid))
+            self._arena_check(s, "drop_unowned")
             return dict(admitted=False, dropped=True, evicted=None)
         if self.resident(block) is not None:
             raise OwnershipViolation("arrival of block %d into slot %d but the block is already resident (slot %s)"
@@ -290,6 +338,7 @@ class Stream:
         s.state = RELEASING                       # R2.4: an unprotected verifier-only arrival; never read, FREE at the next poll
         s.last_reader = None
         self.log.append(("drop_vres_unprotected", block, idx, gen, uid))
+        self._arena_check(s, "drop_vres_unprotected")
         return dict(admitted=True, dropped=False, evicted=None, where=RELEASING)
 
     def end_owner(self) -> List[int]:
@@ -325,6 +374,15 @@ class LayerPool:
         self.l, self.B, self.H, self.C, self.X, self.R_ver = l, B, H, C, X, R_ver
         self.n_pos = C + X
         self.streams: Dict[Tuple[int, int], Stream] = {(b, h): Stream(l, h, b, self.n_pos, C) for b in range(B) for h in range(H)}
+        self.arena: Optional["Arena"] = None
+
+    def attach_arena(self, arena: "Arena") -> None:
+        """M2 arena mode: every stream of the layer binds its takes in `arena` (before any take)."""
+        if arena.l != self.l or any(s.state != FREE for st in self.streams.values() for s in st.slots):
+            raise ConfigError("M2: arena of layer %d attached to layer %d, or after a take" % (arena.l, self.l))
+        self.arena = arena
+        for st in self.streams.values():
+            st.arena = arena
 
     def stream(self, b: int, h: int) -> Stream:
         return self.streams[(b, h)]
@@ -356,7 +414,8 @@ class LayerPool:
         return None
 
     def poll_releases(self, mut=None) -> int:
-        """K4: RELEASING -> FREE once the slot's last reader event completed (non-blocking poll)."""
+        """K4: RELEASING -> FREE once the slot's last reader event completed (non-blocking poll). M2 arena mode: the
+        position is unbound HERE and only here, together with the logical FREE transition (contract 2.2)."""
         n = 0
         for st in self.streams.values():
             for s in st.slots:
@@ -364,6 +423,9 @@ class LayerPool:
                     continue
                 gate = s.first_reader if (mut and mut.release_first_reader) else s.last_reader
                 if (mut and mut.no_reader_wait) or ev_done(gate):
+                    if self.arena is not None:
+                        self.arena.unbind(s.phys, (st.b, st.h, s.idx, s.gen), s.pgen, s.owner, s.block)
+                        s.phys = s.pgen = None
                     s.state = FREE
                     s.block, s.owner, s.cls = -1, None, None
                     st.log.append(("free", -1, s.idx, s.gen, None))
@@ -384,6 +446,156 @@ class LayerPool:
             for s in st.slots:
                 c[s.state] += 1
         return c
+
+    def position_counts(self) -> Dict[str, int]:
+        """M2 K6 (contract 2.6): the arena's ALLOCATED positions by state: FREE, or the state of the bound logical slot."""
+        c = {k: 0 for k in STATES}
+        for who in self.arena.bound:
+            if who is None:
+                c[FREE] += 1
+            else:
+                c[self.streams[(who[0], who[1])].slots[who[2]].state] += 1
+        return c
+
+    def check_arena(self, E: int = 0, G: int = 0) -> None:
+        """M2 full scan (checked mode, the end of every joint call; contract 2.3): every slot's binding (check_slot), no
+        two slots on one position, bound positions = non-FREE slots, the free list = the unbound positions, pgen_t = pgen,
+        and bound + E + G <= P_l (E: unconsumed draft credits of the layer, G: granted but unissued verifier fetches)."""
+        ar = self.arena
+        on = {}
+        for st in self.streams.values():
+            for s in st.slots:
+                ar.check_slot(st, s, "the end-of-call scan")
+                if s.state != FREE:
+                    if s.phys in on:
+                        raise OwnershipViolation("arena binding: slots %s and %s of layer %d share position %d"
+                                                 % (on[s.phys], (st.b, st.h, s.idx), self.l, s.phys))
+                    on[s.phys] = (st.b, st.h, s.idx)
+        bound = sum(1 for who in ar.bound if who is not None)
+        if not len(on) == bound == ar.n_bound or sorted(ar._free) != [p for p, who in enumerate(ar.bound) if who is None]:
+            raise OwnershipViolation("arena binding: layer %d has %d non-FREE slots, %d bound positions (count %d) and free "
+                                     "list %s" % (self.l, len(on), bound, ar.n_bound, sorted(ar._free)))
+        if not torch.equal(ar.pgen_t, torch.tensor(ar.pgen, dtype=torch.int64)):
+            raise OwnershipViolation("arena binding: layer %d generation mirror pgen_t differs from pgen" % self.l)
+        ar.check_reserve(E, G)
+
+
+# --------------------------------------------------------------------------------------------------- M2 arena
+class Arena:
+    """M2 slice A (retroinfer-eval docs/superpowers/specs/2026-10-14-kstep-m2-integration-contract.md revision 2,
+    sections 2.1-2.4): the records of ONE layer's P physical block positions (one KV head per position; the K / V rows
+    live in the dispatcher's arena tensors, row r of position p = row p * bs + r). Per position p:
+      bound[p]        (b, h, slot idx, slot gen) of the logical slot bound to p, or None (FREE)
+      pgen[p]         +1 at every bind; pgen_t[p] is its int64 mirror (the address-map entry a deferred read copies at its
+                      execution, contract 3.1)
+      last_reader[p]  the last reader event of the CURRENT binding; kept after the unbind as physical history
+      captured[p]     the previous occupant's last reader, captured at the bind until the transfer takes it (forward)
+      writes[p]       seq of the transfer that targets p, until its arrival is observed (landed)
+    The free list is a heap: a take always binds the LOWEST FREE position (deterministic reuse across streams and
+    requests). log is test instrumentation (bind / unbind / land records; not counted in K6)."""
+
+    def __init__(self, l: int, P: int, checked: bool = False):
+        if P < 1:
+            raise ConfigError("M2: an arena needs P >= 1 positions (got %d)" % P)
+        self.l, self.P = int(l), int(P)
+        self.checked = bool(checked)
+        self.pgen: List[int] = [0] * self.P
+        self.pgen_t = torch.zeros(self.P, dtype=torch.int64)
+        self.bound: List[Optional[Tuple[int, int, int, int]]] = [None] * self.P
+        self.last_reader: List[Any] = [None] * self.P
+        self.captured: List[Any] = [None] * self.P
+        self.writes: List[Optional[int]] = [None] * self.P
+        self._free: List[int] = list(range(self.P))             # a valid heap: sorted
+        self.n_bound = 0
+        self.peak_bound = 0
+        self.peak_reserved = 0                                   # max of bound + E + G seen by check_reserve
+        self.binds = 0
+        self.log: List[Dict] = []
+
+    def lowest_free(self) -> Optional[int]:
+        return self._free[0] if self._free else None
+
+    def bind(self, p: int, who: Tuple[int, int, int, int], uid, block: int, seq: int, slot_prev=None) -> int:
+        """Contract 2.2 steps 1-4 for position p (the caller checked p = lowest_free() before any change): capture p's
+        last reader, pgen + 1 (and pgen_t), bound = who, the new binding's reader state empty. Returns the new pgen.
+        slot_prev (the logical slot's last reader before the take) is recorded in the log only."""
+        if not self._free or self._free[0] != p or self.bound[p] is not None:
+            raise OwnershipViolation("arena binding: bind of position %d (layer %d), which is not the lowest FREE position"
+                                     % (p, self.l))
+        heapq.heappop(self._free)
+        self.captured[p] = self.last_reader[p]
+        self.pgen[p] += 1
+        self.pgen_t[p] = self.pgen[p]
+        self.bound[p] = who
+        self.writes[p] = seq
+        self.last_reader[p] = None
+        self.n_bound += 1
+        self.binds += 1
+        self.peak_bound = max(self.peak_bound, self.n_bound)
+        self.log.append(dict(op="bind", l=self.l, p=p, pgen=self.pgen[p], who=who, uid=uid, block=block, seq=seq,
+                             prev_ev=self.captured[p], prev_done=ev_done(self.captured[p]), slot_prev_ev=slot_prev))
+        return self.pgen[p]
+
+    def forward(self, p: int):
+        """The previous physical occupant's last reader of position p, captured at its bind: handed to the transfer ONCE
+        (Transfer.reader_ev) and cleared."""
+        ev, self.captured[p] = self.captured[p], None
+        return ev
+
+    def note_reader(self, p: int, pgen: int, ev) -> None:
+        """A read of position p (binding pgen) whose last read event is `ev` (contract 2.2: reads set the slot's AND the
+        position's last reader)."""
+        if p is None or self.bound[p] is None or self.pgen[p] != pgen:
+            raise OwnershipViolation("arena binding: reader event for position %s (layer %d) of binding pgen %s, but the "
+                                     "position is %s with pgen %s" % (p, self.l, pgen, None if p is None else self.bound[p],
+                                                                      None if p is None else self.pgen[p]))
+        self.last_reader[p] = ev
+
+    def landed(self, p: int, seq: int, uid=None, b: Optional[int] = None, dropped: bool = False) -> None:
+        """The host observed the arrival of transfer `seq` into position p (the quarantine of 2.4 ends at the logical FREE,
+        not here: the position stays bound)."""
+        if self.writes[p] != seq:
+            raise OwnershipViolation("arena binding: arrival of transfer %d at position %d (layer %d), which records transfer "
+                                     "%s" % (seq, p, self.l, self.writes[p]))
+        self.writes[p] = None
+        self.log.append(dict(op="land", l=self.l, p=p, pgen=self.pgen[p], seq=seq, uid=uid, b=b, dropped=dropped))
+
+    def unbind(self, p: int, who: Tuple[int, int, int, int], pgen: int, uid=None, block: Optional[int] = None) -> None:
+        """The logical slot `who` became FREE (LayerPool.poll_releases only). last_reader stays as physical history."""
+        if p is None or self.bound[p] != who or self.pgen[p] != pgen:
+            raise OwnershipViolation("arena binding: unbind of position %s (layer %d) by slot %s pgen %s, but the position "
+                                     "holds %s with pgen %s" % (p, self.l, who, pgen, None if p is None else self.bound[p],
+                                                                None if p is None else self.pgen[p]))
+        self.bound[p] = None
+        self.writes[p] = None
+        self.captured[p] = None
+        heapq.heappush(self._free, p)
+        self.n_bound -= 1
+        self.log.append(dict(op="unbind", l=self.l, p=p, pgen=pgen, who=who, uid=uid, block=block,
+                             last_ev=self.last_reader[p]))
+
+    def check_slot(self, st, s, where: str) -> None:
+        """Checked mode: a non-FREE slot is bound (its position names it with its pgen); a FREE slot names no position."""
+        if s.state == FREE:
+            if s.phys is not None or s.pgen is not None:
+                raise OwnershipViolation("arena binding: free slot %d gen %d of stream (l %d b %d h %d) still names position "
+                                         "%s pgen %s after %s" % (s.idx, s.gen, st.l, st.b, st.h, s.phys, s.pgen, where))
+            return
+        p = s.phys
+        ok = p is not None and 0 <= p < self.P
+        if not ok or self.bound[p] != (st.b, st.h, s.idx, s.gen) or self.pgen[p] != s.pgen:
+            raise OwnershipViolation("arena binding: %s slot %d gen %d of stream (l %d b %d h %d) is not bound to position %s "
+                                     "(the position holds %s with pgen %s; the slot names pgen %s) after %s"
+                                     % (s.state, s.idx, s.gen, st.l, st.b, st.h, p, self.bound[p] if ok else None,
+                                        self.pgen[p] if ok else None, s.pgen, where))
+
+    def check_reserve(self, E: int, G: int) -> None:
+        """Contract 2.3: bound + E + G <= P (a FREE position for every later issue the logical rules admit)."""
+        tot = self.n_bound + int(E) + int(G)
+        self.peak_reserved = max(self.peak_reserved, tot)
+        if tot > self.P:
+            raise OwnershipViolation("arena binding: layer %d holds %d bound positions + %d unconsumed draft credits + %d "
+                                     "granted unissued verifier fetches > P %d" % (self.l, self.n_bound, E, G, self.P))
 
 
 # --------------------------------------------------------------------------------------------------- memory (K6)
@@ -420,6 +632,13 @@ class Geometry:
             cohort_rec=64,                                              # key, range, state, layer, call ids
             sel_id=4,                                                   # one block id held in a draft or cohort record
             release_entry=16,                                           # one release-queue entry or reader-event entry
+            # M2 arena metadata (contract 2.6), charged at ALLOCATED capacity in arena mode only:
+            slot_bind=8 + 8,                                            # Slot.phys, Slot.pgen of one logical slot
+            pos_meta=1 + 8 + 4 * 8 + 8 + 8 + 8 + 8,                     # state, pgen, bound (b, h, idx, gen), last_reader,
+                                                                        # captured, writes, free-list entry
+            map_entry=8,                                                # one int64 entry of the generation mirror pgen_t
+            transfer_bind=8 + 8,                                        # Transfer.phys, Transfer.pgen of one transfer
+            counter=8,                                                  # one rev6 credit counter or grant entry
         )
 
 
@@ -430,6 +649,10 @@ CATS = ("slots_free", "slots_lru", "slots_po", "slots_vres", "slots_inflight", "
 COUNTS = (FREE, LRU, PO, VRES, INFLIGHT, RELEASING, "workspace_rows", "hidden_rows", "q_vectors", "p_vectors",
           "draft_kv_pos", "prov_kv_pos", "recent_kv_pos", "ck_entries", "prot_refs", "transfers", "drafts", "cohorts",
           "sel_ids", "release_entries")
+# M2 arena mode only (MemoryAccountant(arena=True)): the slot-state counts above are then ALLOCATED POSITIONS by state, and
+# these count the logical slot records, their binding fields, the position records, the pgen_t entries, the transfers'
+# binding fields and the rev6 credit counters / grant entries.
+ARENA_COUNTS = ("slot_records", "slot_binds", "pos_records", "map_entries", "transfer_binds", "reserve_counters")
 
 
 class MemoryAccountant:
@@ -442,12 +665,17 @@ class MemoryAccountant:
     DONE cohort; every held draft KV entry; every held provisional KV entry; the published exact KV of the recent region;
     every held compressed or buffered key (committed chain, draft chain, cohort chains); metadata (every physical slot,
     protection references, in-flight transfer records, draft and cohort records with their block ids, release-queue and
-    reader-event entries). M1 test instrumentation (trace, logs, the deferred-read validators) is not counted."""
+    reader-event entries). M1 test instrumentation (trace, logs, the deferred-read validators) is not counted.
+    arena=True (M2, contract 2.6): the slot categories are the ALLOCATED arena positions by state (FREE, or the state of
+    the bound logical slot), and the metadata adds ARENA_COUNTS at allocated capacity; the logical slot records are
+    charged from their own count (slot_records). Test instrumentation (arena logs, the S0 readback payloads) is not
+    counted. Not a GPU memory measurement."""
 
-    def __init__(self, geom: Optional[Geometry] = None, staging_bytes: int = 0):
+    def __init__(self, geom: Optional[Geometry] = None, staging_bytes: int = 0, arena: bool = False):
         self.geom = geom or Geometry()
         self.u = self.geom.unit()
         self.staging_bytes = int(staging_bytes)
+        self.arena = bool(arena)
         self.peak = {k: 0 for k in CATS + ("total",)}
         self.sum = {k: 0 for k in CATS + ("total",)}
         self.n = 0
@@ -455,9 +683,12 @@ class MemoryAccountant:
         self.last_counts: Dict[str, int] = {}
 
     def bytes_of(self, n: Dict[str, int]) -> Dict[str, int]:
-        missing = [k for k in COUNTS if k not in n]
+        missing = [k for k in COUNTS + (ARENA_COUNTS if self.arena else ()) if k not in n]
         if missing:
             raise KeyError("K6 sample lacks counts %s" % missing)
+        extra = [] if self.arena else [k for k in ARENA_COUNTS if k in n]
+        if extra:
+            raise KeyError("K6 sample has arena counts %s outside arena mode" % extra)
         u = self.u
         n_slots = n[FREE] + n[LRU] + n[PO] + n[VRES] + n[INFLIGHT] + n[RELEASING]
         b = dict(slots_free=n[FREE] * u["slot"], slots_lru=n[LRU] * u["slot"], slots_po=n[PO] * u["slot"],
@@ -468,9 +699,14 @@ class MemoryAccountant:
                  p_vectors=n["p_vectors"] * u["p_vector"], draft_kv=n["draft_kv_pos"] * u["pos_kv"],
                  provisional_kv=n["prov_kv_pos"] * u["pos_kv"], recent_kv=n["recent_kv_pos"] * u["pos_kv"],
                  compressed_keys=n["ck_entries"] * u["ck"],
-                 metadata=(n_slots * u["slot_meta"] + n["prot_refs"] * u["prot_ref"] + n["transfers"] * u["transfer_rec"]
+                 metadata=((n["slot_records"] if self.arena else n_slots) * u["slot_meta"] + n["prot_refs"] * u["prot_ref"]
+                           + n["transfers"] * u["transfer_rec"]
                            + n["drafts"] * u["draft_rec"] + n["cohorts"] * u["cohort_rec"] + n["sel_ids"] * u["sel_id"]
                            + n["release_entries"] * u["release_entry"]))
+        if self.arena:
+            b["metadata"] += (n["slot_binds"] * u["slot_bind"] + n["pos_records"] * u["pos_meta"]
+                              + n["map_entries"] * u["map_entry"] + n["transfer_binds"] * u["transfer_bind"]
+                              + n["reserve_counters"] * u["counter"])
         b["total"] = sum(b[k] for k in CATS)
         return b
 

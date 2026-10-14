@@ -113,6 +113,27 @@ UNCHANGED):
       late arrivals cannot recreate them and a later request of the batch slot inherits none. At most one record per
       undecided cohort (its current layer) and at most H * K * S_max ids per record, so at most
       B * (ceil(LAMBDA / K) + 1) * H * K * S_max live ids; charged as release entries (records) and selection ids (ids).
+
+M2 SLICE A / B1 (Config.physical = "arena"; default "per_stream" keeps every rule above unchanged; retroinfer-eval
+docs/superpowers/specs/2026-10-14-kstep-m2-integration-contract.md revision 2, steps S1-S5 only, Codex approval
+2026-10-14). The schedule, cadence, guards, retention, recency, rollback, decisions and counters are the logical ones
+above; only the physical backing, the address of a read and WHICH event retires a position change.
+  A  storage: per layer one arena (P_l * bs, D) of head-agnostic block positions with P_l = B * H * (C + X) (the
+     conservative backing, the same amount as per stream, addressed through the map; the reduced B * H * C + X is S6,
+     NOT approved). ownership.Arena keeps the position records and the generation mirror pgen_t; Stream.take binds the
+     lowest FREE position, LayerPool.poll_releases unbinds (ownership docstring). _issue: the bind, the take, the
+     Transfer (phys, pgen, reader_ev = the previous PHYSICAL occupant's last reader, Arena.forward) and its inflight
+     registration are one unit after every refusal and check; the transport sees it only after the unit. _poll checks the
+     binding at admission (and, checked mode, the S0 payload readback). Checked mode adds the arena check points and the
+     end-of-call scan, and bound + E + G <= P_l after every bind (E: unconsumed credits, G: granted unissued fetches).
+  B1 reader lifetime: an executor with reads_arena = True (required) reads the arena itself (executor docstring); Row.kv
+     is still read through the binding at call time. ONE ordered common stream "compute" carries every arena read and
+     every reader event; the executor's read_ev is installed on every slot and position read and on (key, l)
+     IMMEDIATELY after joint_post, before _issue (whose _verifier_evict polls releases); nothing between capturing
+     Row.addr and that install moves a slot to FREE (_draft_recency may release to RELEASING). A deferred read is
+     validated with the strict identity check first (the generation it copied at execution, StaleReader) and then
+     the bytes (ReadCorruption).
+  K6 charges the allocated positions by state and the arena metadata at allocated capacity (ownership.MemoryAccountant).
 """
 from __future__ import annotations
 
@@ -128,16 +149,18 @@ from . import cadence as cad
 from . import rng
 from .backend import check_backend, ev_done
 from .compressed import CompressedChain
-from .errors import CapacityRefusal, ConfigError, KStepError, NoProgress, OwnershipViolation, ReadCorruption
+from .errors import (CapacityRefusal, ConfigError, KStepError, NoProgress, OwnershipViolation, ReadCorruption,
+                     StaleReader)
 from .executor import DRAFT, VERIFY, Row, check_executor
 from .mutations import Mutations
-from .ownership import COUNTS, FREE, LRU, PO, RELEASING, VRES, Geometry, LayerPool, MemoryAccountant
+from .ownership import COUNTS, FREE, LRU, PO, RELEASING, VRES, Arena, Geometry, LayerPool, MemoryAccountant
 from .transfer import Transfer
 
 POISON = -7777777                         # no toy KV value is negative
 
 PENDING, RUNNING, DONE, ACCEPTED, CANCELLED = "pending", "running", "done", "accepted", "cancelled"
 CAPACITY_MODES = ("m1", "rev6")
+PHYSICAL_MODES = ("per_stream", "arena")
 
 
 @dataclass
@@ -159,6 +182,7 @@ class Config:
     pin_row_bound: Optional[int] = None    # blocks one (row, head) may select; default executor.max_sel
     capacity: str = "m1"                   # "m1" (the M1 rules) | "rev6" (PROPOSAL rev 6 contract; see the docstring)
     d_share: Optional[int] = None          # rev6: per-head draft share d_h; default W = (K + 1) * S_max; < W is refused
+    physical: str = "per_stream"           # "per_stream" (M1 backing) | "arena" (M2 slice A / B1; see the docstring)
 
 
 class Draft:
@@ -260,6 +284,12 @@ class Dispatcher:
                               % (cfg.C, (2 * self.K + 1) * self.rb))
         if cfg.capacity not in CAPACITY_MODES:
             raise ConfigError("capacity must be one of %s (got %r)" % (CAPACITY_MODES, cfg.capacity))
+        if cfg.physical not in PHYSICAL_MODES:
+            raise ConfigError("physical must be one of %s (got %r)" % (PHYSICAL_MODES, cfg.physical))
+        self.arena_mode = cfg.physical == "arena"
+        if self.arena_mode and not getattr(executor, "reads_arena", False):
+            raise ConfigError("M2 arena mode needs an executor with reads_arena = True (it reads the arena itself and "
+                              "returns its read event; executor docstring)")
         self.rev6 = cfg.capacity == "rev6"
         self.W = (self.K + 1) * self.rb                       # rev6 L3: positions through the next trigger, per stream
         self.X_d = cfg.X - cfg.R_ver                          # rev6 L1: the shared draft pool per layer
@@ -292,10 +322,22 @@ class Dispatcher:
         z = lambda S: torch.full((cfg.B, S, self.H, self.D), POISON, dtype=torch.int64)
         self.host_k = [z(cfg.S_host) for _ in range(self.L)]
         self.host_v = [z(cfg.S_host) for _ in range(self.L)]
-        self.slots_k = [z(n_pos * self.bs) for _ in range(self.L)]
-        self.slots_v = [z(n_pos * self.bs) for _ in range(self.L)]
+        if self.arena_mode:                                    # M2 slice A: P_l = B * H * (C + X) only (S6 not approved)
+            self.P = cfg.B * self.H * n_pos
+            self.arenas = [Arena(l, self.P, checked=self._checked()) for l in range(self.L)]
+            for pool, ar in zip(self.pools, self.arenas):
+                pool.attach_arena(ar)
+            za = lambda: torch.full((self.P * self.bs, self.D), POISON, dtype=torch.int64)
+            self.arena_k = [za() for _ in range(self.L)]
+            self.arena_v = [za() for _ in range(self.L)]
+            self.slots_k = self.slots_v = None
+            executor.attach_arena(be, self.arena_k, self.arena_v, [ar.pgen_t for ar in self.arenas], self._register_read)
+        else:
+            self.P, self.arenas, self.arena_k, self.arena_v = None, None, None, None
+            self.slots_k = [z(n_pos * self.bs) for _ in range(self.L)]
+            self.slots_v = [z(n_pos * self.bs) for _ in range(self.L)]
         self.tp = make_transport(self)
-        self.acct = MemoryAccountant(cfg.geom, getattr(self.tp, "staging_bytes", 0))
+        self.acct = MemoryAccountant(cfg.geom, getattr(self.tp, "staging_bytes", 0), arena=self.arena_mode)
         self.queue: List[Tuple] = []
         self.slot_req: List[Optional[Request]] = [None] * cfg.B
         self.reqs: Dict[Any, Request] = {}
@@ -783,7 +825,11 @@ class Dispatcher:
         for tr in arrived:
             del self.inflight[tr.seq]
             st = self.pools[tr.layer].stream(tr.b, tr.h)
+            if self.arena_mode:
+                self._arena_admission(tr, st)                          # M2 2.2 / 2.5: the binding (and the readback) first
             res = st.admit(tr.slot, tr.uid, tr.block, tr.gen, self.mut, demand=tr.demand)
+            if self.arena_mode:
+                self.arenas[tr.layer].landed(tr.phys, tr.seq, tr.uid, tr.b, res["dropped"])
             self.arrival_log.append(tr.seq)
             self.stats["progress"] += 1
             self.stats["traffic"] += 1                                  # N3 P1: an arrival (dropped ones too) is traffic
@@ -856,12 +902,113 @@ class Dispatcher:
         keep = []
         for ev, ws, exp, info in self.validators:
             if all_ or ev_done(ev):
+                pg = info.get("pg")
+                if pg is not None and int(pg[0]) != info["pgen"]:          # M2 3.1 (a): identity first, then the bytes
+                    raise StaleReader("stale reader: position %d pgen captured %d, at read %d (layer %d b %d h %d slot %s "
+                                      "block %d uid %s call %d)" % (info["phys"], info["pgen"], int(pg[0]), info["layer"],
+                                                                    info["b"], info["h"], info["slot"], info["block"],
+                                                                    info["uid"], info["call"]))
                 if not torch.equal(ws, exp):
-                    raise ReadCorruption("deferred read of %s saw other bytes than the call computed from" % (info,))
+                    shown = info if pg is None else {k: v for k, v in info.items() if k != "pg"}
+                    raise ReadCorruption("deferred read of %s saw other bytes than the call computed from" % (shown,))
                 self.stats["reads_validated"] += 1
             else:
                 keep.append((ev, ws, exp, info))
         self.validators = keep
+
+    # ---------------------------------------------------------------- M2 slice A / B1 (Config.physical = "arena")
+    def _checked(self) -> bool:
+        """Checked mode, as for every other invariant check: check_invariants and no Mutations switch active."""
+        return bool(self.cfg.check_invariants) and not self.mut.active()
+
+    def _credits_at(self, l: int) -> int:
+        """E(l): the unconsumed rev6 draft step credits held at layer l (0 in mode m1)."""
+        return sum(sum(r.credits[l]) for r in self.active() if r.credits is not None)
+
+    def _register_read(self, l: int, row, h: int, block: int, phys: int, pgen: int, ws, exp, pg) -> None:
+        """The executor's attach_arena callback: ONE deferred arena read of this call (the K or the V rows of one (row,
+        head, block)), validated when the call's read event completes (_arm_validators): the identity copy pg (None: no
+        identity check) against pgen, then the bytes ws against the eager clone exp."""
+        who = self.arenas[l].bound[phys]
+        info = dict(layer=l, b=row.b, h=h, slot=None if who is None else who[2], block=block, uid=row.uid,
+                    call=self.call_id, phys=phys, pgen=pgen)
+        if pg is not None:
+            info["pg"] = pg
+        self.validators.append((None, ws, exp, info))
+        self._n_new_val += 1
+
+    def _install_reader(self, l: int, read_slots, ev) -> None:
+        """The call's reader event becomes the last reader of every slot read (arena mode: and of its position) and the
+        (key, l) reader event of every key that read a slot (K4, R1)."""
+        if not read_slots:
+            return
+        for l_, b_, h_, idx in read_slots:
+            s = self.pools[l_].stream(b_, h_).slots[idx]
+            if s.first_reader is None:
+                s.first_reader = ev
+            s.last_reader = ev
+            if self.arena_mode:
+                self.arenas[l_].note_reader(s.phys, s.pgen, ev)
+        for key in self._read_keys:
+            kr = self.key_readers.setdefault((key, l), [None, None])
+            if kr[0] is None:
+                kr[0] = ev
+            kr[1] = ev
+
+    def _arm_validators(self, ev) -> None:
+        """The deferred-read validators registered in this call are checked once `ev` completed."""
+        for i in range(len(self.validators) - self._n_new_val, len(self.validators)):
+            _, ws, exp, info = self.validators[i]
+            self.validators[i] = (ev, ws, exp, info)
+
+    def _arena_admission(self, tr: Transfer, st) -> None:
+        """M2 at the observed arrival, before admission: the slot's binding still equals the transfer's (phys, pgen)
+        (contract 2.2); checked mode: the transport's payload readback (S0, contract 2.5)."""
+        s = st.slots[tr.slot]
+        if s.gen == tr.gen and (s.phys, s.pgen) != (tr.phys, tr.pgen):
+            raise OwnershipViolation("arena binding: arrival of transfer %d (uid %s, l %d b %d h %d block %d, slot %d gen %d) "
+                                     "names position %s pgen %s, but the slot is bound to %s pgen %s"
+                                     % (tr.seq, tr.uid, tr.layer, tr.b, tr.h, tr.block, tr.slot, tr.gen, tr.phys, tr.pgen,
+                                        s.phys, s.pgen))
+        if self._checked():
+            rb = getattr(self.tp, "readback", None)
+            if rb is not None:
+                rb(tr)
+
+    def _arena_reserve_check(self, l: int, rest, seen) -> None:
+        """Checked mode, after every bind of _issue (contract 2.3): bound + E + G <= P_l with E the unconsumed credits held
+        at layer l and G the granted verifier fetches of this issue that still need a new position (rev6; 0 in m1)."""
+        G = 0
+        if self.rev6:
+            pool, need = self.pools[l], set()
+            for kind, r, h, j, key in rest:
+                if kind != VERIFY or (r.b, h, j) in seen:
+                    continue
+                st = pool.stream(r.b, h)
+                if st.resident(j) is None and j not in st.pending:
+                    need.add((r.b, h, j))
+            G = len(need)
+        self.arenas[l].check_reserve(self._credits_at(l), G)
+
+    def _arena_counts(self) -> Dict[str, int]:
+        """K6 arena metadata at allocated capacity (contract 2.6; ownership.ARENA_COUNTS)."""
+        n_slots = sum(pool.B * pool.H * pool.n_pos for pool in self.pools)
+        reserve = (sum(self.L * self.H for r in self.active() if r.credits is not None)
+                   + sum(len(c.granted) for r in self.active() for c in r.cohorts))
+        return dict(slot_records=n_slots, slot_binds=n_slots, pos_records=sum(ar.P for ar in self.arenas),
+                    map_entries=sum(int(ar.pgen_t.numel()) for ar in self.arenas), transfer_binds=len(self.inflight),
+                    reserve_counters=reserve)
+
+    def arena_report(self) -> Dict[str, Any]:
+        """M2: the physical mode and, in arena mode, per layer P_l, binds, peak bound positions and peak bound + E + G, the
+        logical bound B * H * C + X (REPORTED, not a fit: S6 is not approved), and the S0 adapter counters."""
+        out = dict(mode=self.cfg.physical)
+        if self.arena_mode:
+            out.update(P=self.P, logical_bound=self.cfg.B * self.H * self.cfg.C + self.cfg.X,
+                       binds=[ar.binds for ar in self.arenas], peak_bound=[ar.peak_bound for ar in self.arenas],
+                       peak_reserved=[ar.peak_reserved for ar in self.arenas], bound=[ar.n_bound for ar in self.arenas],
+                       pool_checks=getattr(self.tp, "pool_checks", None), readbacks=getattr(self.tp, "readbacks", None))
+        return out
 
     def _force_for_layer(self, l: int) -> None:
         """Verifier-only pass (D4): wait (host) for the in-flight blocks the waiting cohorts at layer l need; after a
@@ -946,6 +1093,9 @@ class Dispatcher:
         self._read_keys = set()
         self._n_new_val = 0
         self.call_step[cid] = self.t
+        if self.arena_mode:
+            for ar in self.arenas:
+                ar.checked = self._checked()                           # M2: the arena check points follow checked mode
         if self.progress is not None:
             self.progress(self, cid)
         self._poll()
@@ -1058,6 +1208,7 @@ class Dispatcher:
             own = {pos: i for i, pos in enumerate(c.positions)}
             for i, pos in enumerate(c.positions):
                 kv = []
+                addr = [] if self.arena_mode else None                 # M2: per head [(block, phys, pgen)]
                 for h in range(self.H):
                     def recent(qp, h=h, i=i, c=c):
                         if qp < r.n:
@@ -1073,43 +1224,48 @@ class Dispatcher:
                             ii = own[qp]
                             return (pre[ii][1][h], pre[ii][2][h])
                         return self._prov(r, c, l, h, qp)
-                    kv.append(self._row_kv(r, l, h, pos, sel[i][h], None, recent, read_slots, c.key, hv))
+                    ad = [] if addr is not None else None
+                    kv.append(self._row_kv(r, l, h, pos, sel[i][h], None, recent, read_slots, c.key, hv, ad))
+                    if addr is not None:
+                        addr.append(sorted(ad))
                 jrows.append(Row(r.uid, r.b, pos, VERIFY, c.key, sel[i], pos,
                                  [[j for j in sel[i][hh] if j < hv] for hh in range(self.H)],
-                                 c.hidden[i], pre[i][0], kv))
+                                 c.hidden[i], pre[i][0], kv, addr))
                 owners.append(("v", r, c, i))
         for r, dr in rows:
             if id(dr) not in draft_pre:
                 continue
             q, k, v = draft_pre[id(dr)]
             kv = []
+            addr = [] if self.arena_mode else None                     # M2: per head [(block, phys, pgen)]
             for h in range(self.H):
                 def recent(qp, h=h):
                     if qp < r.n:
                         return r.pub[l][h][qp]
                     return r.draft_kv[l][h][qp]
+                ad = [] if addr is not None else None
                 kv.append(self._row_kv(r, l, h, dr.pos, dr.sel[l][h], dr.avail[l][h], recent, read_slots,
-                                       (r.uid, r.epoch, dr.m)))
-            jrows.append(Row(r.uid, r.b, dr.pos, DRAFT, (r.uid, r.epoch, dr.m), dr.sel[l], dr.pos, dr.avail[l], dr.hidden, q, kv))
+                                       (r.uid, r.epoch, dr.m), None, ad))
+                if addr is not None:
+                    addr.append(sorted(ad))
+            jrows.append(Row(r.uid, r.b, dr.pos, DRAFT, (r.uid, r.epoch, dr.m), dr.sel[l], dr.pos, dr.avail[l], dr.hidden, q, kv,
+                             addr))
             owners.append(("d", r, dr, None))
-        if read_slots:
+        if read_slots and not self.arena_mode:                         # F4: the eager executor's host order (per stream)
             with self.be.stream("compute"):
                 rev = self.be.event_rec("compute")
-            for l_, b_, h_, idx in read_slots:
-                s = self.pools[l_].stream(b_, h_).slots[idx]
-                if s.first_reader is None:
-                    s.first_reader = rev
-                s.last_reader = rev
-            for key in self._read_keys:
-                kr = self.key_readers.setdefault((key, l), [None, None])
-                if kr[0] is None:
-                    kr[0] = rev
-                kr[1] = rev
-            for i in range(len(self.validators) - self._n_new_val, len(self.validators)):
-                ev, ws, exp, info = self.validators[i]
-                self.validators[i] = (rev, ws, exp, info)
+            self._install_reader(l, read_slots, rev)
+            self._arm_validators(rev)
         self._draft_recency(l, rows, draft_pre, cid)
-        outs = self.ex.joint_post(l, jrows) if jrows else []
+        if self.arena_mode:                                            # M2 B1 (contract 3.1): the executor's own event
+            outs, read_ev = self.ex.joint_post(l, jrows) if jrows else ([], None)
+            if (read_ev is None) != (not read_slots) or (self._n_new_val and read_ev is None):
+                raise KStepError("M2 B1: the executor returned read event %r for %d slot reads (%d registered reads)"
+                                 % (read_ev, len(read_slots), self._n_new_val))
+            self._install_reader(l, read_slots, read_ev)               # IMMEDIATELY: no poll or release in between
+            self._arm_validators(read_ev)
+        else:
+            outs = self.ex.joint_post(l, jrows) if jrows else []
         for (kind, r, obj, i), row, out in zip(owners, jrows, outs):
             if kind == "v":
                 c = obj
@@ -1175,6 +1331,9 @@ class Dispatcher:
                 raise OwnershipViolation("N3 P1/P2: progress %d != useful %d + traffic %d, or %d live verify-fetch ids != the "
                                          "records' %d" % (s["progress"], s["useful"], s["traffic"], self.vfetch_ids,
                                                           sum(len(v) for v in self.vfetch.values())))
+            if self.arena_mode:
+                for ll, pool in enumerate(self.pools):                 # M2 2.3: the full scan of every layer (G = 0: a
+                    pool.check_arena(self._credits_at(ll), 0)          # grant is issued in the call that grants it)
         if self.observer is not None:
             self.observer(self, "call", cid, l)
 
@@ -1270,10 +1429,12 @@ class Dispatcher:
         self.pending_release.append((key, l))
 
     def _row_kv(self, r: Request, l: int, h: int, pos: int, sel: List[int], readable: Optional[List[int]], recent,
-                read_slots: List, key, hist: Optional[int] = None) -> List[Tuple]:
+                read_slots: List, key, hist: Optional[int] = None, addr: Optional[List] = None) -> List[Tuple]:
         """The (k, v) list one row attends at one head, in increasing position order: the selected blocks it may read,
         then its causal recent region. Slot reads are eager (the joint call computes from them) AND enqueued as deferred
-        copies on the "compute" stream (validated later)."""
+        copies on the "compute" stream (validated later). M2 arena mode: the eager read goes through the binding (the
+        rows of position phys), (block, phys, pgen) is appended to `addr`, and the executor enqueues the deferred reads
+        itself (contract 3.1)."""
         bs = self.bs
         st = self.pools[l].stream(r.b, h)
         out = []
@@ -1287,17 +1448,26 @@ class Dispatcher:
                     idx = st.pending.get(j)
                 if idx is None:
                     raise KStepError("row at %d reads block %d that is not resident (stream %s)" % (pos, j, (l, h, r.b)))
-                vk = self.slots_k[l][r.b, idx * bs:(idx + 1) * bs, h]
-                vv = self.slots_v[l][r.b, idx * bs:(idx + 1) * bs, h]
-                ek, evv = vk.clone(), vv.clone()
-                wk, wv = torch.empty_like(vk), torch.empty_like(vv)
-                with self.be.stream("compute"):
-                    self.be.memcpy(wk, vk, "compute")
-                    self.be.memcpy(wv, vv, "compute")
-                info = dict(layer=l, b=r.b, h=h, slot=idx, block=j, uid=r.uid, call=self.call_id)
-                self.validators.append((None, wk, ek, info))
-                self.validators.append((None, wv, evv, info))
-                self._n_new_val += 2
+                if self.arena_mode:
+                    s = st.slots[idx]
+                    if s.phys is None:
+                        raise OwnershipViolation("arena binding: row at %d reads slot %d of stream (l %d b %d h %d) (block "
+                                                 "%d), which names no position" % (pos, idx, l, r.b, h, j))
+                    p0 = s.phys * bs
+                    ek, evv = self.arena_k[l][p0:p0 + bs].clone(), self.arena_v[l][p0:p0 + bs].clone()
+                    addr.append((j, s.phys, s.pgen))
+                else:
+                    vk = self.slots_k[l][r.b, idx * bs:(idx + 1) * bs, h]
+                    vv = self.slots_v[l][r.b, idx * bs:(idx + 1) * bs, h]
+                    ek, evv = vk.clone(), vv.clone()
+                    wk, wv = torch.empty_like(vk), torch.empty_like(vv)
+                    with self.be.stream("compute"):
+                        self.be.memcpy(wk, vk, "compute")
+                        self.be.memcpy(wv, vv, "compute")
+                    info = dict(layer=l, b=r.b, h=h, slot=idx, block=j, uid=r.uid, call=self.call_id)
+                    self.validators.append((None, wk, ek, info))
+                    self.validators.append((None, wv, evv, info))
+                    self._n_new_val += 2
                 read_slots.append((l, r.b, h, idx))
                 self._read_keys.add(key)
                 for rr, (kk, vv_) in enumerate(zip(ek.tolist(), evv.tolist())):
@@ -1363,7 +1533,7 @@ class Dispatcher:
         issued: Dict[Tuple[int, int, int], Transfer] = {}
         batch = []
         order = [x for x in requests if x[0] == VERIFY] + [x for x in requests if x[0] == DRAFT]
-        for kind, r, h, j, key in order:
+        for i_req, (kind, r, h, j, key) in enumerate(order):
             if (r.b, h, j) in seen:
                 tr0 = issued.get((r.b, h, j))
                 if tr0 is not None and kind not in tr0.demand and not self.mut.drop_demand_merge:
@@ -1410,12 +1580,18 @@ class Dispatcher:
                 prev = s.last_reader
             self.seq += 1
             gen = st.take(idx, r.uid, j, self.seq, cls="v" if kind == VERIFY else "ad")
+            if self.arena_mode:                                           # M2 2.2: the bind inside take captured the
+                prev = self.arenas[l].forward(s.phys)                     # previous PHYSICAL occupant's last reader
+                if self.mut.no_reader_wait:                               # (negative control: no transfer gate)
+                    prev = None
             tr = Transfer(self.seq, r.uid, l, r.b, h, j, idx, gen, kind, key, hist_ev=r.hist_ev.get((l, j)),
-                          reader_ev=prev, issued_call=cid)
+                          reader_ev=prev, issued_call=cid, phys=s.phys, pgen=s.pgen)
             self.inflight[tr.seq] = tr
             issued[(r.b, h, j)] = tr
             batch.append(tr)
             self.stats["fetch_%s_issued" % kind] += 1
+            if self.arena_mode and self._checked():
+                self._arena_reserve_check(l, order[i_req + 1:], seen)   # M2 2.3: bound + E + G <= P_l after the bind
             if kind == VERIFY:                                            # N3 P2: only a successful new verify issue
                 ids = self.vfetch.setdefault((key, l), set())
                 if (r.b, h, j) not in ids:                                # (unchecked mode: a repeat adds no id)
@@ -1756,8 +1932,8 @@ class Dispatcher:
         """K6: count EVERY held item (no filter that could hide a leak); MemoryAccountant turns counts into bytes."""
         n = defaultdict(int)
         for pool in self.pools:
-            for k, v in pool.counts().items():
-                n[k] += v                                              # physical slots by state, FREE included
+            for k, v in (pool.position_counts() if self.arena_mode else pool.counts()).items():
+                n[k] += v                                              # physical slots (M2: positions) by state, FREE included
             for st in pool.streams.values():
                 n["prot_refs"] += sum(len(v) for v in st.prot.values())
         if self.mut.mem_no_releasing:
@@ -1793,7 +1969,10 @@ class Dispatcher:
                 n["sel_ids"] += sum(len(x) for rows in c.vsel.values() for row in rows for x in row)
                 n["ck_entries"] += sum(self._chain_entries(ch) for lst in c.chain.values() for ch in lst)
                 n["ck_entries"] += sum(self._chain_entries(ch) for w in c.ws.values() for ch in w["chain"])
-        self.acct.sample({k: n[k] for k in COUNTS})
+        counts = {k: n[k] for k in COUNTS}
+        if self.arena_mode:
+            counts.update(self._arena_counts())                        # M2 2.6: arena metadata at allocated capacity
+        self.acct.sample(counts)
 
     def finish(self, order: Optional[Tuple[str, ...]] = None) -> None:
         """Drain every stream (deferred reads, scatters, history writes) and validate every deferred read."""
@@ -1805,21 +1984,25 @@ class Dispatcher:
         committed = accepted drafts + corrections (A7); every discarded draft step, cancelled verifier row-layer, retry
         and verifier-only pass is reported as work; no mean hypothetical yield is reported as committed output."""
         s = self.stats
-        return dict(mode=self.cfg.mode.upper(), committed=s["accepted_drafts"] + s["corrections"],
-                    accepted_drafts=s["accepted_drafts"], corrections=s["corrections"],
-                    work=dict(draft_steps=s["draft_steps"] + s["draft_rows_cancelled_in_flight"],
-                              draft_steps_discarded=s["draft_steps_discarded"], verifier_row_layers=s["verifier_row_layers"],
-                              verifier_row_layers_cancelled=s["verifier_row_layers_cancelled"], cohort_waits=s["cohort_waits"],
-                              verifier_only_passes=s["verifier_only_passes"]),
-                    stalls={k[6:]: v for k, v in s.items() if k.startswith("stall_")},
-                    stall_accounting=self.stall_accounting(),
-                    verifier_evictions_of_draft_entries=self.vev_report(),
-                    sharing_IDEAL=self.sharing(), memory=self.acct.report(), capacity=self.capacity_report(),
-                    progress=self.progress_report())
+        out = dict(mode=self.cfg.mode.upper(), committed=s["accepted_drafts"] + s["corrections"],
+                   accepted_drafts=s["accepted_drafts"], corrections=s["corrections"],
+                   work=dict(draft_steps=s["draft_steps"] + s["draft_rows_cancelled_in_flight"],
+                             draft_steps_discarded=s["draft_steps_discarded"], verifier_row_layers=s["verifier_row_layers"],
+                             verifier_row_layers_cancelled=s["verifier_row_layers_cancelled"], cohort_waits=s["cohort_waits"],
+                             verifier_only_passes=s["verifier_only_passes"]),
+                   stalls={k[6:]: v for k, v in s.items() if k.startswith("stall_")},
+                   stall_accounting=self.stall_accounting(),
+                   verifier_evictions_of_draft_entries=self.vev_report(),
+                   sharing_IDEAL=self.sharing(), memory=self.acct.report(), capacity=self.capacity_report(),
+                   progress=self.progress_report())
+        if self.arena_mode:
+            out["physical"] = self.arena_report()                      # M2: addresses / allocation differ by construction
+        return out
 
     def capacity_report(self) -> Dict[str, Any]:
         """The capacity mode and (rev6) its contract counters. Memory is charged for the FULL C + X positions of every
-        stream (K6 counts FREE slots): no shared arena or address map exists, so no fit claim follows from them."""
+        stream (K6 counts FREE slots; in M2 arena mode the allocated P_l = B * H * (C + X) positions, the same amount),
+        so no fit claim follows from them."""
         s = self.stats
         out = dict(mode=self.cfg.capacity)
         if self.rev6:
