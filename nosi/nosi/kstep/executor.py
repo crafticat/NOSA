@@ -70,11 +70,35 @@ unchanged (v3). With it (needs reads_arena; the dispatcher needs physical "arena
                           Row.ring entry with which = "c" (a 1-element copy of rc[l][e:e + 1]).
   Geometry (12.3.1 V5, check_chain_geometry): stride >= 1, stride divides bs and chain_kernel, stride <= chain_kernel
   <= bs; NOSA: (bs, chain_kernel, stride) = (64, 32, 16) only.
+
+C1.2 SERIALIZED PHYSICAL CONSUMPTION (contract revision 11, 12.9.2; dispatcher Config.consume = "physical"; needs ABI v4,
+reads_ring and the attribute consumes_physical = True). The dispatcher calls, per joint call with rows:
+  joint_post_consume(l, rows) -> (handle, read_ev)
+                          the call's validator reads exactly as joint_post (same registrations, same order); then per
+                          (row, head) ONE gather on "compute" of the row's attended positions in the declared logical
+                          order (increasing position: Row.addr blocks as bs rows each, merged with Row.ring entries):
+                          K (n, D), V (n, D) and bias (n,) from the arena / ring stores, and one identity copy per block
+                          (pgen_t) or entry (rgen_t), each copied AFTER its data; read_ev on "compute" after the call's
+                          LAST read (the completion event). It also computes, at call time, the eager reference from
+                          Row.kv (instrumentation). The handle is a dict the dispatcher owns from then on.
+  gather_tensors(handle)  [((row index, head, part), tensor)]: every gather backing (part "k", "v", "c", "id").
+  consumed_identities(handle)
+                          after completion: one record per gathered block / entry: where ("arena" / "ring"), layer,
+                          addr, expected (the generation captured at call time, independently of the copy), observed
+                          (the copied value), uid, pos, kind, head.
+  resolve(handle) -> (outs, heads)
+                          after completion: per row the output and per head the head result, computed ONLY from the
+                          gathered K / V / bias and the row's own phase-1 q and hidden (never from Row.kv).
+  reference(handle) -> (outs, heads)
+                          the eager reference of the same rows, same order, same arithmetic.
+check_consumed_identity(records) is the dispatcher's identity check of those records (StaleReader "stale consumption").
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from .errors import StaleReader
 
 DRAFT, VERIFY = "draft", "verify"
 
@@ -103,6 +127,20 @@ ARENA_REQUIRED = ("attach_arena",)
 RING_REQUIRED = ("attach_ring",)
 ABI4_REQUIRED = ("attach_bias",)                 # C1.1 ABI v4 (docstring)
 ABI4_ATTRS = ("chain_kernel",)
+CONSUME_REQUIRED = ("joint_post_consume", "gather_tensors", "consumed_identities", "resolve", "reference")   # C1.2
+
+
+def check_consumed_identity(records: List[Dict[str, Any]]) -> int:
+    """C1.2 (12.9.2 step 4), BEFORE any gathered value is used: every gathered block / entry's copied generation
+    (observed) equals the generation captured at call time (expected); else StaleReader. Returns the records checked."""
+    for rec in records:
+        if int(rec["observed"]) != int(rec["expected"]):
+            what = ("ring entry %d (layer %d) rgen" if rec["where"] == "ring" else "position %d (layer %d) pgen") % (
+                rec["addr"], rec["layer"])
+            raise StaleReader("stale consumption: %s expected %d, read %d (row (%s, %d, %s) head %d)"
+                              % (what, int(rec["expected"]), int(rec["observed"]), rec["uid"], rec["pos"], rec["kind"],
+                                 rec["head"]))
+    return len(records)
 
 
 def abi_of(ex) -> int:
@@ -130,6 +168,8 @@ def check_executor(ex) -> None:
     if abi4:
         miss += [m for m in ABI4_REQUIRED if not callable(getattr(ex, m, None))] + [
             a for a in ABI4_ATTRS if not hasattr(ex, a)]
+    if getattr(ex, "consumes_physical", False):                       # C1.2 (docstring)
+        miss += [m for m in CONSUME_REQUIRED if not callable(getattr(ex, m, None))]
     if miss:
         raise TypeError("executor %r lacks %s" % (type(ex).__name__, miss))
     if ex.bs % ex.stride:

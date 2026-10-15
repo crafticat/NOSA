@@ -36,3 +36,10 @@ class StaleReader(KStepError):
 class CapacityRefusal(KStepError):
     """Capacity mode "rev6" (retroinfer-eval PROPOSAL rev 6, G5 and the draft side of P6): no grant, draft step, transfer,
     reader event or release can ever free the capacity that the oldest waiter needs. An explicit refusal, never a hang."""
+
+
+class ConsumptionMismatch(KStepError):
+    """C1.2 (retroinfer-eval docs/superpowers/specs/2026-10-14-kstep-m2-integration-contract.md revision 11, 12.9.2,
+    Config.consume = "physical"): an output (one head's result or the row output) that the executor computed from the
+    physically gathered K / V / bias bytes differs from the same-order eager reference computed from Row.kv. Raised at
+    the consuming call, after the identity check and before the output is published."""

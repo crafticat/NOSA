@@ -913,6 +913,11 @@ RING_CATS = ("ring_idle", "admission_kv")
 # peak at allocation transitions is BiasOpLedger.peak, reported apart.
 BIAS_COUNTS = ("bias_staging_bytes",)
 BIAS_CATS = ("bias_staging",)
+# C1.2 consume mode only (contract revision 11, 12.9.2): the bytes of the gather backings (consume ledger) held at the
+# sample. Every gather is released inside its call, before that call's sample, so the serialized mode samples 0; the
+# ledger's exact allocation-transition peak is reported apart.
+CONSUME_COUNTS = ("consume_staging_bytes",)
+CONSUME_CATS = ("consume_staging",)
 
 
 class MemoryAccountant:
@@ -941,7 +946,8 @@ class MemoryAccountant:
     persistent bias tensor bytes and the ledger (its exact allocation-transition peak) separately
     (report()["physical"]["bias"]); none of these is a Python-allocator or GPU measurement or a fit claim."""
 
-    def __init__(self, geom: Optional[Geometry] = None, staging_bytes: int = 0, arena: bool = False, ring: bool = False):
+    def __init__(self, geom: Optional[Geometry] = None, staging_bytes: int = 0, arena: bool = False, ring: bool = False,
+                 consume: bool = False):
         self.geom = geom or Geometry()
         self.u = self.geom.unit()
         self.staging_bytes = int(staging_bytes)
@@ -950,7 +956,11 @@ class MemoryAccountant:
         if self.ring and not self.arena:
             raise ConfigError("K6: the ring accountant needs arena=True")
         self.bias = self.geom.bias_elem > 0                # C1.1 ABI v4: + the operational bias staging category
-        self.cats = CATS + (RING_CATS if self.ring else ()) + (BIAS_CATS if self.bias else ())
+        self.consume = bool(consume)                       # C1.2: + the consume (gather) staging category
+        if self.consume and not (self.ring and self.bias):
+            raise ConfigError("K6: the consume accountant needs the ring and ABI v4 bias accounting")
+        self.cats = CATS + (RING_CATS if self.ring else ()) + (BIAS_CATS if self.bias else ()) + (
+            CONSUME_CATS if self.consume else ())
         self.peak = {k: 0 for k in self.cats + ("total",)}
         self.sum = {k: 0 for k in self.cats + ("total",)}
         self.n = 0
@@ -959,12 +969,13 @@ class MemoryAccountant:
 
     def bytes_of(self, n: Dict[str, int]) -> Dict[str, int]:
         missing = [k for k in COUNTS + (ARENA_COUNTS if self.arena else ()) + (RING_COUNTS if self.ring else ())
-                   + (BIAS_COUNTS if self.bias else ()) if k not in n]
+                   + (BIAS_COUNTS if self.bias else ()) + (CONSUME_COUNTS if self.consume else ()) if k not in n]
         if missing:
             raise KeyError("K6 sample lacks counts %s" % missing)
         extra = ([] if self.arena else [k for k in ARENA_COUNTS if k in n]) + (
             [] if self.ring else [k for k in RING_COUNTS if k in n]) + (
-            [] if self.bias else [k for k in BIAS_COUNTS if k in n])
+            [] if self.bias else [k for k in BIAS_COUNTS if k in n]) + (
+            [] if self.consume else [k for k in CONSUME_COUNTS if k in n])
         if extra:
             raise KeyError("K6 sample has arena / ring counts %s outside their mode" % extra)
         u = self.u
@@ -998,6 +1009,8 @@ class MemoryAccountant:
                               + n["admission_records"] * u["adm_meta"])
         if self.bias:                                      # C1.1: bytes of the operational backings held at the sample
             b["bias_staging"] = int(n["bias_staging_bytes"])
+        if self.consume:                                   # C1.2: bytes of the gather backings held at the sample
+            b["consume_staging"] = int(n["consume_staging_bytes"])
         b["total"] = sum(b[k] for k in self.cats)
         return b
 
@@ -1034,22 +1047,24 @@ class BiasOpLedger:
     diagnostic copies (Transfer.expect, the D2H expected rows and snapshot, the validators' copies) and synchronous
     eager-reference temporaries. Not a Python-allocator or GPU measurement."""
     KINDS = ("ring_producer", "admission_src", "d2h_src", "s0_stage", "s0_land", "adv_payload")
+    CONSUME_KINDS = ("c1_gather",)          # C1.2 (12.9.2): the consume ledger (gather K / V / bias / identity backings)
 
-    def __init__(self):
+    def __init__(self, kinds: Optional[Tuple[str, ...]] = None):
+        self.kinds = tuple(kinds) if kinds else self.KINDS
         self.recs: Dict[int, Dict[str, Any]] = {}
         self.by_key: Dict[Tuple[str, Any], int] = {}
         self.serial = 0
         self.held = 0
         self.peak = 0
         self.peak_records = 0
-        self.allocs = {k: 0 for k in self.KINDS}
-        self.alloc_bytes = {k: 0 for k in self.KINDS}
-        self.releases = {k: 0 for k in self.KINDS}
-        self.max_concurrent = {k: 0 for k in self.KINDS}
+        self.allocs = {k: 0 for k in self.kinds}
+        self.alloc_bytes = {k: 0 for k in self.kinds}
+        self.releases = {k: 0 for k in self.kinds}
+        self.max_concurrent = {k: 0 for k in self.kinds}
         self.log: List[Tuple] = []
 
     def hold(self, kind: str, t, ev=None, key=None) -> int:
-        if kind not in self.KINDS or (ev is None) == (key is None):
+        if kind not in self.kinds or (ev is None) == (key is None):
             raise OwnershipViolation("bias ledger: %s needs exactly one release (event %s, key %s)" % (kind, ev, key))
         if t.numel() == 0:
             return 0                                     # an empty tensor holds no backing (and may share address 0)

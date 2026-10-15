@@ -195,6 +195,21 @@ rollback and recency are unchanged; C1.1 still computes outputs from Row.kv (no 
             poll, at each K6 sample and in finish(); no wait or stream advancement is added. The K6 category
             bias_staging charges the held bytes at each sample; the ledger reports its exact allocation-transition
             peak. Diagnostic copies and synchronous eager-reference temporaries are excluded by name (BIAS_EXCLUDED).
+
+C1.2 SERIALIZED PHYSICAL CONSUMPTION (Config.consume = "physical"; default "none" keeps every path above unchanged;
+retroinfer-eval contract revision 11, 12.9; Codex approval 2026-10-15 of the portable slice only). Needs ABI v4, physical
+"arena", recent "ring" and an executor with consumes_physical = True (executor docstring). At each joint call with rows
+(_call): (1) joint_post_consume: the same validator reads as joint_post, then one gather per (row, head) on "compute"
+in the declared order; the gather backings are owned by self.consume_ledger at once; (2) the same registration checks
+(_check_post_reads), then the reader gates (_install_reader) and the validators (_arm_validators) BEFORE any wait;
+(3) a NEW per-call host wait on the call's completion event: serialized, it changes completion order, so no B2
+schedule parity is claimed; (4) check_consumed_identity BEFORE any value is used (StaleReader "stale consumption");
+(5) resolve (from the gathered bytes and the rows' own q / hidden only) and the exact per-head / output comparison
+with the same-order Row.kv reference (ConsumptionMismatch); (6) release of the call's gather backings and of the handle;
+(7) the CONSUMED outputs are published (consumed output is what continues). K6 category consume_staging is the sampled
+held gather bytes (0 at every sample: each call releases its own); report()["physical"]["consume"] gives the exact
+peak, counters and the first consumed item of each provenance kind (instrumentation). No asynchronous decision callback
+and no overlap claim.
 """
 from __future__ import annotations
 
@@ -210,9 +225,9 @@ from . import cadence as cad
 from . import rng
 from .backend import check_backend, ev_done
 from .compressed import CompressedChain, row_prefixes
-from .errors import (CapacityRefusal, ConfigError, KStepError, NoProgress, OwnershipViolation, ReadCorruption,
-                     StaleReader)
-from .executor import DRAFT, VERIFY, Row, abi_of, check_executor
+from .errors import (CapacityRefusal, ConfigError, ConsumptionMismatch, KStepError, NoProgress, OwnershipViolation,
+                     ReadCorruption, StaleReader)
+from .executor import DRAFT, VERIFY, Row, abi_of, check_consumed_identity, check_executor
 from .mutations import Mutations
 from .ownership import (COUNTS, FREE, LIVE, LRU, PO, R_DRAFT, R_EXACT, R_PRE, R_PROV, RELEASING, RING_KINDS, VRES, Arena,
                         BiasOpLedger, Geometry, LayerPool, MemoryAccountant, RingPool)
@@ -225,6 +240,7 @@ CAPACITY_MODES = ("m1", "rev6")
 PHYSICAL_MODES = ("per_stream", "arena")
 ARENA_BACKINGS = ("conservative", "reduced")
 RECENT_MODES = ("eager", "ring", "eager_matched")
+CONSUME_MODES = ("none", "physical")
 
 
 @dataclass
@@ -250,6 +266,7 @@ class Config:
     arena_backing: str = "conservative"    # arena mode: "conservative" P_l = B*H*(C + X) | "reduced" P_l = B*H*C + X (S6)
     recent: str = "eager"                  # M2 B2: "eager" | "ring" | "eager_matched" (parity reference); see the docstring
     ring_slack: Optional[int] = None       # M2 B2 ring: S_ring >= 1 (default B * H); Q_l = B * H * R_log + S_ring
+    consume: str = "none"                  # C1.2: "none" | "physical" (serialized physical consumption; see the docstring)
 
 
 class Draft:
@@ -379,6 +396,12 @@ class Dispatcher:
         if self.abi4 and (not self.arena_mode or self.recent not in ("ring", "eager_matched")):
             raise ConfigError("C1.1 ABI v4 needs physical 'arena' and recent 'ring' or 'eager_matched' (got %r, %r)"
                               % (cfg.physical, cfg.recent))
+        if cfg.consume not in CONSUME_MODES:
+            raise ConfigError("consume must be one of %s (got %r)" % (CONSUME_MODES, cfg.consume))
+        self.consume = cfg.consume == "physical"               # C1.2 (12.9.2): the serialized physical consumer
+        if self.consume and not (self.abi4 and self.ring_mode and getattr(executor, "consumes_physical", False)):
+            raise ConfigError("C1.2 consume 'physical' needs an ABI v4 executor with consumes_physical = True, physical "
+                              "'arena' and recent 'ring' (got %r, %r)" % (cfg.physical, cfg.recent))
         self.rev6 = cfg.capacity == "rev6"
         self.W = (self.K + 1) * self.rb                       # rev6 L3: positions through the next trigger, per stream
         self.X_d = cfg.X - cfg.R_ver                          # rev6 L1: the shared draft pool per layer
@@ -450,6 +473,8 @@ class Dispatcher:
             self.bias_ledger = BiasOpLedger()      # C1.1 A9: the queued operational bias backings (ownership docstring)
         else:
             self.bias_dtype = self.host_c = self.arena_c = self.ring_c = self.bias_ledger = None
+        self.consume_ledger = BiasOpLedger(BiasOpLedger.CONSUME_KINDS) if self.consume else None   # C1.2: the gathers
+        self.consume_first: Dict[str, Tuple] = {}  # C1.2 instrumentation: per provenance kind its first consumed item
         self.rstat = defaultdict(int)              # M2 B2: ring / D2H-check counters (report()["ring"]; never self.stats)
         self.adm: List[Dict] = []                  # M2 B2 ring: the admission buffers A_r that are not FREE
         self.adm_log: List[Dict] = []              # M2 B2: (step, uid, b, P0, LIVE at the admission start) per admission
@@ -473,7 +498,7 @@ class Dispatcher:
                 raise ConfigError("C1.1 A9: Geometry.bias_elem %d != the bias dtype's element size %d" % (g0.bias_elem, el))
             geom = replace(g0, bias_elem=el)
         self.acct = MemoryAccountant(geom, getattr(self.tp, "staging_bytes", 0), arena=self.arena_mode,
-                                     ring=self.ring_mode)
+                                     ring=self.ring_mode, **(dict(consume=True) if self.consume else {}))
         self.queue: List[Tuple] = []
         self.slot_req: List[Optional[Request]] = [None] * cfg.B
         self.reqs: Dict[Any, Request] = {}
@@ -1161,6 +1186,106 @@ class Dispatcher:
             _, ws, exp, info = self.validators[i]
             self.validators[i] = (ev, ws, exp, info)
 
+    def _check_post_reads(self, jrows, read_slots, read_ev) -> None:
+        """The executor's reads of the call, checked right after it returned (M2 B1 / B2, C1.1): read_ev exists exactly
+        when the call read a slot or a ring entry; two (ABI v4: three) registered reads per ring entry read; one arena
+        bias read per (row, head, block) read (ABI v4). Shared by joint_post and, in consume mode, joint_post_consume."""
+        if (read_ev is None) != (not read_slots and not self._ring_reads) or (self._n_new_val and read_ev is None):
+            raise KStepError("M2 B1: the executor returned read event %r for %d slot reads and %d ring reads (%d "
+                             "registered reads)" % (read_ev, len(read_slots), len(self._ring_reads), self._n_new_val))
+        n_per = 3 if self.abi4 else 2                                  # M2 B2: the K and the V row of every entry read
+        if self._n_ring_val != n_per * len(self._ring_reads):          # (C1.1 ABI v4: and its bias row)
+            raise KStepError("M2 B2: the executor registered %d ring reads for %d ring entries of the rows"
+                             % (self._n_ring_val, len(self._ring_reads)))
+        if self.abi4:                                                  # C1.1: one bias read per (row, head, block) read
+            n_addr = sum(len(a) for row in jrows for a in (row.addr or ()))
+            if self._n_bias_reads != n_addr:
+                raise KStepError("C1.1: the executor registered %d arena bias reads for %d (row, head, block) reads"
+                                 % (self._n_bias_reads, n_addr))
+        if self._ring_reads and not read_slots:
+            self.rstat["ring_only_calls"] += 1                         # M2 B2: read_ev with no historical slot read
+
+    # ---------------------------------------------------------------- C1.2 (Config.consume = "physical"; 12.9.2)
+    def _consume_post(self, l: int, jrows: List[Row]):
+        """C1.2 step 1: the executor's validator reads and per-(row, head) gathers of the call; every gather backing is
+        owned by the consume ledger from now on (kind c1_gather, key (call, row index, head, part))."""
+        if not jrows:
+            return None, None
+        handle, cev = self.ex.joint_post_consume(l, jrows)
+        for (i, h, part), t in self.ex.gather_tensors(handle):
+            self.consume_ledger.hold("c1_gather", t, key=(self.call_id, i, h, part))
+        return handle, cev
+
+    def _consume(self, l: int, jrows: List[Row], handle, cev) -> List[Any]:
+        """C1.2 steps 3-6, after the reader gates and the validators of the call were installed and armed: the NEW
+        per-call host wait on the call's completion event (serialized: it changes completion order); the identity check
+        of every gathered block / entry BEFORE any value is used (StaleReader); resolution from the gathered bytes only;
+        the exact comparison with the same-order Row.kv reference per row (call order) and head (ascending), then the
+        row output (ConsumptionMismatch); then the release of the call's gather backings and of the handle. Returns the
+        CONSUMED outputs: they are what the call publishes."""
+        if not jrows:
+            return []
+        cid = self.call_id
+        if cev is None:
+            raise KStepError("C1.2: call %d consumes %d rows without a completion event" % (cid, len(jrows)))
+        self.be.host_wait(cev)
+        self.c1stat["consume_identity_checks"] += check_consumed_identity(self.ex.consumed_identities(handle))
+        outs, heads = self.ex.resolve(handle)
+        ref_outs, ref_heads = self.ex.reference(handle)
+        if not (len(outs) == len(heads) == len(ref_outs) == len(ref_heads) == len(jrows)):
+            raise KStepError("C1.2: call %d resolved %d / %d rows for %d consumed rows" % (cid, len(outs), len(ref_outs),
+                                                                                        len(jrows)))
+        for i, row in enumerate(jrows):
+            for h in range(self.H):
+                if heads[i][h] != ref_heads[i][h]:
+                    raise ConsumptionMismatch("C1 consumption mismatch: call %d row (%s, %d, %s) head %d: consumed %r != "
+                                              "reference %r" % (cid, row.uid, row.pos, row.kind, h, heads[i][h],
+                                                                ref_heads[i][h]))
+            if outs[i] != ref_outs[i]:
+                raise ConsumptionMismatch("C1 consumption mismatch: call %d row (%s, %d, %s) output: consumed %r != "
+                                          "reference %r" % (cid, row.uid, row.pos, row.kind, outs[i], ref_outs[i]))
+        self._consume_count(l, jrows)
+        for key in [r["key"] for r in self.consume_ledger.recs.values() if r["key"][0] == cid]:
+            self.consume_ledger.release_key("c1_gather", key)
+        handle.clear()                                                 # the handle's backing references are dropped
+        return list(outs)
+
+    def _consume_count(self, l: int, jrows: List[Row]) -> None:
+        """C1.2 counters and first witnesses (instrumentation), from Row.addr / Row.ring of every consumed (row, head) in
+        the declared order: historical rows (per block), EXACT / DRAFT / PRE (own position or an earlier row of the same
+        cohort) / PROV entries, tail positions (the row's own block), bias items (every gathered row)."""
+        s, bs, cid = self.c1stat, self.bs, self.call_id
+        s["consume_calls"] += 1
+        s["consumed_rows"] += len(jrows)
+        for row in jrows:
+            tail0 = (row.pos // bs) * bs
+            for h in range(self.H):
+                items = [(blk * bs, "historical", blk, p, g) for blk, p, g in (row.addr[h] if row.addr else ())]
+                items += [(pos, kind, pos, e, g) for pos, e, g, kind in (row.ring[h] if row.ring else ())]
+                for _, kind, what, a, g in sorted(items, key=lambda x: x[0]):
+                    n = bs if kind == "historical" else 1
+                    keys = [kind, "bias"]
+                    if kind == R_PRE:
+                        keys.append("pre_own" if what == row.pos else "pre_earlier_row")
+                    if kind != "historical" and what >= tail0:
+                        keys.append("tail")
+                    for k in keys:
+                        s["consumed_items_" + k] += n
+                        if k not in self.consume_first:
+                            self.consume_first[k] = (cid, l, row.uid, row.pos, row.kind, h, what, a, g)
+
+    def consume_report(self) -> Dict[str, Any]:
+        """C1.2: the consume ledger (held bytes, the EXACT allocation-transition peak, records, allocations, releases,
+        outstanding; the K6 category consume_staging is its SAMPLED value, 0 at every sample in this serialized mode),
+        the consumption counters and the first consumed item of each provenance kind (call, layer, uid, pos, row kind,
+        head, position or block, entry or position, generation). Not a Python-allocator or GPU measurement."""
+        lg = self.consume_ledger
+        return dict(mode="physical", serialized=True, held_bytes=lg.held, peak_bytes=lg.peak, held_records=len(lg.recs),
+                    peak_records=lg.peak_records, allocs=dict(lg.allocs), alloc_bytes=dict(lg.alloc_bytes),
+                    releases=dict(lg.releases), outstanding=lg.outstanding(),
+                    counters={k: v for k, v in sorted(self.c1stat.items()) if k.startswith("consum")},
+                    first=dict(self.consume_first))
+
     def _arena_admission(self, tr: Transfer, st) -> None:
         """M2 at the observed arrival, before admission: the slot's binding still equals the transfer's (phys, pgen)
         (contract 2.2); checked mode: the transport's payload readback (S0, contract 2.5)."""
@@ -1219,6 +1344,8 @@ class Dispatcher:
                            pgen_t=sum(ar.pgen_t.numel() * ar.pgen_t.element_size() for ar in self.arenas)))
             if self.abi4:
                 out["bias"] = self.bias_report()
+            if self.consume:
+                out["consume"] = self.consume_report()               # C1.2
         return out
 
     # C1.1 A9 reporting scope: what bias_report does NOT count, by name (diagnostics and synchronous references).
@@ -2014,22 +2141,15 @@ class Dispatcher:
             self._install_reader(l, read_slots, rev)
             self._arm_validators(rev)
         self._draft_recency(l, rows, draft_pre, cid)
-        if self.arena_mode:                                            # M2 B1 (contract 3.1): the executor's own event
+        if self.consume:                                               # C1.2 (12.9.2): the serialized consumer
+            handle, cev = self._consume_post(l, jrows)                 # 1. gather backings held at once
+            self._check_post_reads(jrows, read_slots, cev)             # 2. the same registration checks, then the
+            self._install_reader(l, read_slots, cev)                   #    reader gates and the validators, BEFORE
+            self._arm_validators(cev)                                  #    any wait (no poll or release in between)
+            outs = self._consume(l, jrows, handle, cev)                # 3-6. wait, identity, resolve, compare, release
+        elif self.arena_mode:                                          # M2 B1 (contract 3.1): the executor's own event
             outs, read_ev = self.ex.joint_post(l, jrows) if jrows else ([], None)
-            if (read_ev is None) != (not read_slots and not self._ring_reads) or (self._n_new_val and read_ev is None):
-                raise KStepError("M2 B1: the executor returned read event %r for %d slot reads and %d ring reads (%d "
-                                 "registered reads)" % (read_ev, len(read_slots), len(self._ring_reads), self._n_new_val))
-            n_per = 3 if self.abi4 else 2                              # M2 B2: the K and the V row of every entry read
-            if self._n_ring_val != n_per * len(self._ring_reads):      # (C1.1 ABI v4: and its bias row)
-                raise KStepError("M2 B2: the executor registered %d ring reads for %d ring entries of the rows"
-                                 % (self._n_ring_val, len(self._ring_reads)))
-            if self.abi4:                                              # C1.1: one bias read per (row, head, block) read
-                n_addr = sum(len(a) for row in jrows for a in (row.addr or ()))
-                if self._n_bias_reads != n_addr:
-                    raise KStepError("C1.1: the executor registered %d arena bias reads for %d (row, head, block) reads"
-                                     % (self._n_bias_reads, n_addr))
-            if self._ring_reads and not read_slots:
-                self.rstat["ring_only_calls"] += 1                     # M2 B2: read_ev with no historical slot read
+            self._check_post_reads(jrows, read_slots, read_ev)
             self._install_reader(l, read_slots, read_ev)               # IMMEDIATELY: no poll or release in between
             self._arm_validators(read_ev)
         else:
@@ -2807,6 +2927,8 @@ class Dispatcher:
         if self.abi4:                                                  # C1.1 A9: the operational bias backings held
             self.bias_ledger.retire()                                  # now (passive release first; a SAMPLED value)
             counts["bias_staging_bytes"] = self.bias_ledger.held
+        if self.consume:                                               # C1.2: the gather backings held now (0: each
+            counts["consume_staging_bytes"] = self.consume_ledger.held  # call releases its own; a SAMPLED value)
         self.acct.sample(counts)
 
     def finish(self, order: Optional[Tuple[str, ...]] = None) -> None:
