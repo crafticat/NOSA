@@ -183,10 +183,18 @@ rollback and recency are unchanged; C1.1 still computes outputs from Row.kv (no 
             the chain at its own position, then its element; KStepError "C1 row prefix: ..."). Rollback copies and the
             full-acceptance rebuild carry the overlap buffer (V4); rollback_across_compression uses the v4 event rule.
   records   (labelled instrumentation, not charged in K6) the windows each draft row's select received per (l, h)
-            (Draft.cks; trace field "cks" of a draft record, ABI v4 only); c1stat counters; report()["physical"]["bias"]:
-            the ACTUAL allocated bias tensor bytes (numel * element_size at allocated capacity: every arena / ring row
-            whatever its state, the host rows, the held admission buffers and their peak) apart from the LOGICAL K6
-            units (Geometry.bias_elem = the actual element size; ownership.Geometry.unit).
+            (Draft.cks; trace field "cks" of a draft record, ABI v4 only); c1stat counters; report()["physical"]["bias"]
+            (bias_report): the ACTUAL persistent bias store bytes (numel * element_size at allocated capacity: every
+            arena / ring row whatever its state, the host rows, the held admission buffers and their peak), apart from
+            the LOGICAL K6 units (Geometry.bias_elem = the actual element size; ownership.Geometry.unit).
+  ledger    (Codex correction of 2026-10-15) every queued OPERATIONAL bias backing is owned by self.bias_ledger
+            (ownership.BiasOpLedger) from its allocation to its release: a ring producer's fresh bias (until its
+            ready_ev), A_r's per-layer bias source (until A_r's ready event), an eager_matched D2H source clone (until
+            hist_ev), each S0 issue's bias stage and landing (until that issue's frontier event) and each adversarial
+            payload's bias rows (until its landing). Release is a PASSIVE check of those existing events at the host
+            poll, at each K6 sample and in finish(); no wait or stream advancement is added. The K6 category
+            bias_staging charges the held bytes at each sample; the ledger reports its exact allocation-transition
+            peak. Diagnostic copies and synchronous eager-reference temporaries are excluded by name (BIAS_EXCLUDED).
 """
 from __future__ import annotations
 
@@ -207,7 +215,7 @@ from .errors import (CapacityRefusal, ConfigError, KStepError, NoProgress, Owner
 from .executor import DRAFT, VERIFY, Row, abi_of, check_executor
 from .mutations import Mutations
 from .ownership import (COUNTS, FREE, LIVE, LRU, PO, R_DRAFT, R_EXACT, R_PRE, R_PROV, RELEASING, RING_KINDS, VRES, Arena,
-                        Geometry, LayerPool, MemoryAccountant, RingPool)
+                        BiasOpLedger, Geometry, LayerPool, MemoryAccountant, RingPool)
 from .transfer import Transfer
 
 POISON = -7777777                         # no toy KV value is negative
@@ -439,8 +447,9 @@ class Dispatcher:
             self.ring_c = ([torch.full((self.Q,), POISON, dtype=self.bias_dtype) for _ in range(self.L)]
                            if self.ring_mode else None)
             executor.attach_bias(be, self.arena_c, self.ring_c)
+            self.bias_ledger = BiasOpLedger()      # C1.1 A9: the queued operational bias backings (ownership docstring)
         else:
-            self.bias_dtype = self.host_c = self.arena_c = self.ring_c = None
+            self.bias_dtype = self.host_c = self.arena_c = self.ring_c = self.bias_ledger = None
         self.rstat = defaultdict(int)              # M2 B2: ring / D2H-check counters (report()["ring"]; never self.stats)
         self.adm: List[Dict] = []                  # M2 B2 ring: the admission buffers A_r that are not FREE
         self.adm_log: List[Dict] = []              # M2 B2: (step, uid, b, P0, LIVE at the admission start) per admission
@@ -1010,6 +1019,8 @@ class Dispatcher:
                 self.stats["traffic"] += 1                              # N3 P1: one per layer pool that freed ANY slot
         if self.ring_mode:                                              # M2 B2: ring retirement beside poll_releases
             self._ring_retire()                                         # (non-blocking; never a logical counter)
+        if self.abi4:                                                   # C1.1 A9: passive release of the operational
+            self.bias_ledger.retire()                                   # bias backings whose frontier completed
         self._validate()
         if self.recent != "eager":
             self._d2h_poll()                                            # M2 B2 11.3 (1): snapshots, non-blocking
@@ -1210,26 +1221,47 @@ class Dispatcher:
                 out["bias"] = self.bias_report()
         return out
 
+    # C1.1 A9 reporting scope: what bias_report does NOT count, by name (diagnostics and synchronous references).
+    BIAS_EXCLUDED = ("Transfer.expect bias rows (S0 readback expectation, checked mode)",
+                     "D2H expected rows ec and snapshot sc (checked mode)",
+                     "deferred-read validator copies ws / exp / val and identity copies pg",
+                     "synchronous eager-reference temporaries (_row_kv's arena bias clone; _d2h_block's list-to-tensor "
+                     "construction of the expected ec, kept only as the diagnostic expectation)",
+                     "views of the persistent stores (A_r bias rows read by a ring producer or the D2H; ring / arena rows)")
+
     def bias_report(self) -> Dict[str, Any]:
-        """C1.1 A9 (12.3), three separate quantities: allocated_bytes, the ACTUAL numel * element_size of every bias
-        tensor at its allocated capacity (arena and ring rows whatever their state, the host rows, the admission buffers
-        held now and their exact peak; no reference gather exists in C1.1); logical_units, the K6 units
-        (Geometry.bias_elem = the actual element size); and the coverage counters (c1stat, the transports' bias
-        readbacks / landings / staging). Neither byte figure measures Python objects or a GPU allocator; no fit claim."""
+        """C1.1 A9 (12.3; Codex correction of 2026-10-15), separate quantities, none a Python-allocator or GPU measurement
+        or a fit claim:
+          persistent_bytes  the ACTUAL numel * element_size of every PERSISTENT bias store at its allocated capacity
+                            (host rows; arena and ring rows whatever their state; the admission buffers held now and
+                            their exact peak at allocations; no reference gather exists in C1.1);
+          operational       the queued OPERATIONAL bias backings (ownership.BiasOpLedger): bytes held now, the EXACT
+                            peak at allocation transitions, the most records held at once (in total and per kind),
+                            allocations, bytes and releases per kind, and what is still held (outstanding). The K6
+                            category bias_staging charges the held bytes at each SAMPLE (a sampled peak, reported in
+                            report()["memory"], distinct from this exact peak);
+          logical_units     the K6 units (Geometry.bias_elem = the actual element size);
+          excluded          BIAS_EXCLUDED, named: diagnostic copies and synchronous eager-reference temporaries;
+          counters          c1stat and the transports' bias readbacks / groups / landings."""
         el = lambda ts: sum(t.numel() * t.element_size() for t in (ts or ()))
         u = self.acct.u
         tp = self.tp
+        lg = self.bias_ledger
         return dict(dtype=str(self.bias_dtype), element_size=torch.empty((), dtype=self.bias_dtype).element_size(),
                     chain_kernel=self.chain_kernel, stride=self.stride,
-                    allocated_bytes=dict(host_c=el(self.host_c), arena_c=el(self.arena_c), ring_c=el(self.ring_c),
-                                         admission_held=sum(el(A.get("c")) for A in self.adm),
-                                         admission_peak=self.adm_bias_peak_bytes, gather=0),
+                    persistent_bytes=dict(host_c=el(self.host_c), arena_c=el(self.arena_c), ring_c=el(self.ring_c),
+                                          admission_held=sum(el(A.get("c")) for A in self.adm),
+                                          admission_peak=self.adm_bias_peak_bytes, gather=0),
+                    operational=dict(held_bytes=lg.held, peak_bytes=lg.peak, held_records=len(lg.recs),
+                                     peak_records=lg.peak_records, max_concurrent=dict(lg.max_concurrent),
+                                     allocs=dict(lg.allocs), alloc_bytes=dict(lg.alloc_bytes),
+                                     releases=dict(lg.releases), outstanding=lg.outstanding()),
                     logical_units=dict(bias_elem=self.acct.geom.bias_elem, pos_bias=u["pos_bias"],
                                        slot_bias=u["slot_bias"], ck_bias=u["ck_bias"]),
+                    excluded=list(self.BIAS_EXCLUDED),
                     counters=dict(sorted(self.c1stat.items())),
                     transport=dict(bias_readbacks=getattr(tp, "bias_readbacks", None),
-                                   bias_groups=getattr(tp, "bias_groups", None), bias_lands=getattr(tp, "bias_lands", None),
-                                   bias_staging_bytes=getattr(tp, "bias_staging_bytes", None)))
+                                   bias_groups=getattr(tp, "bias_groups", None), bias_lands=getattr(tp, "bias_lands", None)))
 
     # ---------------------------------------------------------------- M2 B2 (Config.recent "ring" / "eager_matched")
     def _produce(self, l: int, r: Request, h: int, kind: str, key, prov: Tuple, k, v, where: str, c=None) -> None:
@@ -1267,7 +1299,10 @@ class Dispatcher:
             self.be.memcpy(self.ring_v[l][e], sv, "compute")
             if sc is not None:                                         # C1.1: the bias, inside the same transaction
                 self.be.memcpy(self.ring_c[l][e:e + 1], sc, "compute")
-            ring.set_ready(e, g, self.be.event_rec("compute"))
+            rev = self.be.event_rec("compute")
+            ring.set_ready(e, g, rev)
+        if sc is not None and not torch.is_tensor(c):                  # C1.1 A9: a fresh source (an A_r view is not;
+            self.bias_ledger.hold("ring_producer", sc, ev=rev)         # A_r is charged) is held until ready_ev
 
     def _ring_take(self, l: int, r: Request, where: str) -> int:
         """Contract 11.4 backpressure, bounded: the lowest FREE entry; else (1) retirement; (2) a host wait on every
@@ -1447,6 +1482,7 @@ class Dispatcher:
                    live_start=[rp.n_live for rp in self.rings] if ring else None)
         self.adm_log.append(rec)
         A = dict(uid=r.uid, b=r.b, n=n0, step=self.t, k=None, v=None, ready=None, cev=None, dev=None)
+        srcs = []                                                      # C1.1 A9: the fresh bias sources per layer
         with self.be.stream("compute"):                                # 0. the prefill output and its ready event (D1)
             if ring:
                 A["k"] = [torch.full((n0, H, D), POISON, dtype=torch.int64) for _ in range(L)]
@@ -1464,7 +1500,10 @@ class Dispatcher:
                         scc = torch.tensor([[kv[pos][l][h][2] for h in range(H)] for pos in range(n0)],
                                            dtype=self.bias_dtype).reshape(n0, H)
                         self.be.memcpy(A["c"][l], scc, "compute")
+                        srcs.append(scc)
             A["ready"] = self.be.event_rec("compute")
+        for scc in srcs:                                               # C1.1 A9: held until A_r's ready event (the
+            self.bias_ledger.hold("admission_src", scc, ev=A["ready"]) # copies that read them precede it)
         blocks0 = r.hist_blocks
         self._history(r, adm=A)                                        # 1. complete prompt blocks: D2H from A_r
         self.rstat["admission_blocks"] += r.hist_blocks - blocks0
@@ -1504,7 +1543,7 @@ class Dispatcher:
             ec = torch.tensor([[r.pub[l][h][pos][2] for h in range(H)] for pos in range(r0, r1)], dtype=self.bias_dtype)
         self.pub_seq += 1
         pub = self.pub_seq
-        src = rg = rg_exp = None
+        src = rg = rg_exp = csrc = None
         ring = self.rings[l] if self.ring_mode else None
         if adm is None and ring is not None:
             src = []
@@ -1529,7 +1568,8 @@ class Dispatcher:
                     self.be.memcpy(self.host_k[l][b, r0:r1], ek.clone(), "d2h")
                     self.be.memcpy(self.host_v[l][b, r0:r1], evv.clone(), "d2h")
                     if ec is not None:
-                        self.be.memcpy(self.host_c[l][b, r0:r1], ec.clone(), "d2h")
+                        csrc = ec.clone()                              # C1.1 A9: an operational source (ledger)
+                        self.be.memcpy(self.host_c[l][b, r0:r1], csrc, "d2h")
             elif ring is not None:
                 for row in src:
                     for e, g in row:
@@ -1550,9 +1590,12 @@ class Dispatcher:
                 self.be.memcpy(self.host_k[l][b, r0:r1], ek.clone(), "d2h")
                 self.be.memcpy(self.host_v[l][b, r0:r1], evv.clone(), "d2h")
                 if ec is not None:
-                    self.be.memcpy(self.host_c[l][b, r0:r1], ec.clone(), "d2h")
+                    csrc = ec.clone()                                  # C1.1 A9: an operational source (ledger)
+                    self.be.memcpy(self.host_c[l][b, r0:r1], csrc, "d2h")
             hist_ev = self.be.event_rec("d2h")
             r.hist_ev[(l, j)] = hist_ev
+            if csrc is not None:                                       # held until hist_ev (the copy precedes it)
+                self.bias_ledger.hold("d2h_src", csrc, ev=hist_ev)
             snap = None
             if self._checked():
                 sk, sv = torch.empty_like(ek), torch.empty_like(evv)
@@ -2761,6 +2804,9 @@ class Dispatcher:
             counts.update(self._arena_counts())                        # M2 2.6: arena metadata at allocated capacity
         if self.ring_mode:
             counts.update(self._ring_counts())                         # M2 B2 11.4: the ring and every held A_r
+        if self.abi4:                                                  # C1.1 A9: the operational bias backings held
+            self.bias_ledger.retire()                                  # now (passive release first; a SAMPLED value)
+            counts["bias_staging_bytes"] = self.bias_ledger.held
         self.acct.sample(counts)
 
     def finish(self, order: Optional[Tuple[str, ...]] = None) -> None:
@@ -2768,6 +2814,9 @@ class Dispatcher:
         every remaining D2H snapshot; every publication's snapshot must have been validated exactly once."""
         self.be.synchronize(order or self.cfg.drain_order)
         self._validate(all_=True)
+        if self.abi4:                                                  # C1.1 A9: after the drain, every event-held
+            self.bias_ledger.retire()                                  # backing is released (adversarial payloads of
+                                                                       # transfers never landed stay held)
         if self.recent != "eager":
             self._d2h_poll(final=True)
             if self.rstat["d2h_snapshots"] != self.rstat["d2h_snapshots_validated"] or self.d2h_checks:

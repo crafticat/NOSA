@@ -908,6 +908,11 @@ ARENA_COUNTS = ("slot_records", "slot_binds", "pos_records", "map_entries", "tra
 RING_COUNTS = ("ring_live_exact", "ring_live_draft", "ring_live_prov", "ring_idle", "ring_entries", "ring_map_entries",
                "admission_pos", "admission_records")
 RING_CATS = ("ring_idle", "admission_kv")
+# C1.1 ABI v4 only (geom.bias_elem > 0): the bytes of the queued OPERATIONAL bias backings held at the sample
+# (BiasOpLedger.held, after its passive retirement), charged as the category bias_staging. A SAMPLED value: the exact
+# peak at allocation transitions is BiasOpLedger.peak, reported apart.
+BIAS_COUNTS = ("bias_staging_bytes",)
+BIAS_CATS = ("bias_staging",)
 
 
 class MemoryAccountant:
@@ -931,8 +936,10 @@ class MemoryAccountant:
     the metadata adds the entry records and the rgen_t entries at allocated capacity, the map entries and the admission
     buffer records. Ring logs, the D2H snapshots and the host-row owner record are test instrumentation, not counted.
     C1.1 ABI v4 (geom.bias_elem > 0): the bias is charged inside the same categories through the units (Geometry.unit);
-    these are LOGICAL units. The dispatcher reports the ACTUAL allocated bias tensor bytes separately
-    (report()["physical"]["bias"]); neither is a Python-allocator or GPU measurement."""
+    these are LOGICAL units. In addition the category bias_staging charges, at each sample, the bytes of the queued
+    OPERATIONAL bias backings still held (BiasOpLedger; the count bias_staging_bytes). The dispatcher reports the ACTUAL
+    persistent bias tensor bytes and the ledger (its exact allocation-transition peak) separately
+    (report()["physical"]["bias"]); none of these is a Python-allocator or GPU measurement or a fit claim."""
 
     def __init__(self, geom: Optional[Geometry] = None, staging_bytes: int = 0, arena: bool = False, ring: bool = False):
         self.geom = geom or Geometry()
@@ -942,7 +949,8 @@ class MemoryAccountant:
         self.ring = bool(ring)
         if self.ring and not self.arena:
             raise ConfigError("K6: the ring accountant needs arena=True")
-        self.cats = CATS + (RING_CATS if self.ring else ())
+        self.bias = self.geom.bias_elem > 0                # C1.1 ABI v4: + the operational bias staging category
+        self.cats = CATS + (RING_CATS if self.ring else ()) + (BIAS_CATS if self.bias else ())
         self.peak = {k: 0 for k in self.cats + ("total",)}
         self.sum = {k: 0 for k in self.cats + ("total",)}
         self.n = 0
@@ -951,11 +959,12 @@ class MemoryAccountant:
 
     def bytes_of(self, n: Dict[str, int]) -> Dict[str, int]:
         missing = [k for k in COUNTS + (ARENA_COUNTS if self.arena else ()) + (RING_COUNTS if self.ring else ())
-                   if k not in n]
+                   + (BIAS_COUNTS if self.bias else ()) if k not in n]
         if missing:
             raise KeyError("K6 sample lacks counts %s" % missing)
         extra = ([] if self.arena else [k for k in ARENA_COUNTS if k in n]) + (
-            [] if self.ring else [k for k in RING_COUNTS if k in n])
+            [] if self.ring else [k for k in RING_COUNTS if k in n]) + (
+            [] if self.bias else [k for k in BIAS_COUNTS if k in n])
         if extra:
             raise KeyError("K6 sample has arena / ring counts %s outside their mode" % extra)
         u = self.u
@@ -987,6 +996,8 @@ class MemoryAccountant:
             b["admission_kv"] = n["admission_pos"] * u["pos_kv"]
             b["metadata"] += (n["ring_entries"] * (u["ring_meta"] + u["map_entry"]) + n["ring_map_entries"] * u["ring_map"]
                               + n["admission_records"] * u["adm_meta"])
+        if self.bias:                                      # C1.1: bytes of the operational backings held at the sample
+            b["bias_staging"] = int(n["bias_staging_bytes"])
         b["total"] = sum(b[k] for k in self.cats)
         return b
 
@@ -1002,3 +1013,84 @@ class MemoryAccountant:
 
     def report(self) -> Dict[str, Dict[str, float]]:
         return {k: dict(peak=self.peak[k], mean=(self.sum[k] / self.n if self.n else 0.0)) for k in self.cats + ("total",)}
+
+
+class BiasOpLedger:
+    """C1.1 A9 (contract revision 10; Codex correction of 2026-10-15; ABI v4 only): every queued OPERATIONAL bias backing
+    (a tensor that a deferred copy reads or that an in-flight payload holds), owned and charged from its allocation to
+    its release. The ledger keeps ONE reference to each backing, so a backing counts until the ledger drops it:
+      hold(kind, t, ev)      a backing released at the first passive retire() that sees ev complete (the existing
+                             completion frontier of the copies that read it);
+      hold(kind, t, key=k)   a backing released by release_key(kind, k) at its existing release point (an adversarial
+                             landing sets the payload to None);
+      retire()               PASSIVE: releases the records whose event is complete (ev_done only: no wait, no stream
+                             advancement); the dispatcher calls it at its host poll, at each K6 sample and in finish().
+    held = the bytes of the unique backings held now; peak = the EXACT maximum of held, updated at every allocation
+    transition (held only falls at a release); log = every transition (instrumentation, not charged). A backing that
+    shares storage with a held one is refused (no double count). Kinds: ring_producer (a ring payload's fresh bias),
+    admission_src (A_r's bias source per layer), d2h_src (an eager_matched D2H source clone), s0_stage / s0_land (one
+    S0 issue's bias pack and landing), adv_payload (an adversarial transfer's bias payload). Not counted here (reported
+    as excluded): the persistent stores (host / arena / ring / A_r bias rows, charged in full elsewhere), views of them,
+    diagnostic copies (Transfer.expect, the D2H expected rows and snapshot, the validators' copies) and synchronous
+    eager-reference temporaries. Not a Python-allocator or GPU measurement."""
+    KINDS = ("ring_producer", "admission_src", "d2h_src", "s0_stage", "s0_land", "adv_payload")
+
+    def __init__(self):
+        self.recs: Dict[int, Dict[str, Any]] = {}
+        self.by_key: Dict[Tuple[str, Any], int] = {}
+        self.serial = 0
+        self.held = 0
+        self.peak = 0
+        self.peak_records = 0
+        self.allocs = {k: 0 for k in self.KINDS}
+        self.alloc_bytes = {k: 0 for k in self.KINDS}
+        self.releases = {k: 0 for k in self.KINDS}
+        self.max_concurrent = {k: 0 for k in self.KINDS}
+        self.log: List[Tuple] = []
+
+    def hold(self, kind: str, t, ev=None, key=None) -> int:
+        if kind not in self.KINDS or (ev is None) == (key is None):
+            raise OwnershipViolation("bias ledger: %s needs exactly one release (event %s, key %s)" % (kind, ev, key))
+        if t.numel() == 0:
+            return 0                                     # an empty tensor holds no backing (and may share address 0)
+        ptr = t.untyped_storage().data_ptr()
+        if any(r["ptr"] == ptr for r in self.recs.values()) or (key is not None and (kind, key) in self.by_key):
+            raise OwnershipViolation("bias ledger: %s backing %s (key %s) is already held" % (kind, ptr, key))
+        nb = t.numel() * t.element_size()
+        self.serial += 1
+        s = self.serial
+        self.recs[s] = dict(kind=kind, t=t, ptr=ptr, nbytes=nb, ev=ev, key=key)
+        if key is not None:
+            self.by_key[(kind, key)] = s
+        self.held += nb
+        self.allocs[kind] += 1
+        self.alloc_bytes[kind] += nb
+        self.peak = max(self.peak, self.held)
+        self.peak_records = max(self.peak_records, len(self.recs))
+        self.max_concurrent[kind] = max(self.max_concurrent[kind], sum(1 for r in self.recs.values() if r["kind"] == kind))
+        self.log.append(("alloc", s, kind, nb, self.held))
+        return s
+
+    def _release(self, s: int) -> None:
+        r = self.recs.pop(s)
+        if r["key"] is not None:
+            del self.by_key[(r["kind"], r["key"])]
+        self.held -= r["nbytes"]
+        self.releases[r["kind"]] += 1
+        self.log.append(("release", s, r["kind"], r["nbytes"], self.held))
+
+    def release_key(self, kind: str, key) -> None:
+        s = self.by_key.get((kind, key))
+        if s is None:
+            raise OwnershipViolation("bias ledger: release of %s key %s that is not held" % (kind, key))
+        self._release(s)
+
+    def retire(self) -> int:
+        done = [s for s, r in self.recs.items() if r["ev"] is not None and ev_done(r["ev"])]
+        for s in done:
+            self._release(s)
+        return len(done)
+
+    def outstanding(self) -> List[Tuple[str, Any, int]]:
+        """The records held now: (kind, key or None, bytes), in allocation order."""
+        return [(r["kind"], r["key"], r["nbytes"]) for _, r in sorted(self.recs.items())]
