@@ -840,9 +840,24 @@ class Geometry:
     elem: int = 2
     topk: int = 64
     q_elem: int = 4
+    bias_elem: int = 0                  # C1.1 A9: the element size of the recorded bias dtype (0: no bias, ABI v3)
 
     def unit(self) -> Dict[str, int]:
-        """Bytes of one counted item. The metadata sizes are fixed conventions (stated here, used everywhere)."""
+        """Bytes of one counted item. The metadata sizes are fixed conventions (stated here, used everywhere).
+        C1.1 A9 (bias_elem > 0, ABI v4 only; the dispatcher sets it from the ACTUAL bias dtype, never a constant): the
+        bias joins every unit that counts K / V (slot, pos_kv, ck, workspace_row), and pos_bias / slot_bias / ck_bias
+        report its share. With bias_elem = 0 the units are exactly today's."""
+        u = self._unit()
+        be = int(self.bias_elem)
+        if be:
+            u.update(pos_bias=be, slot_bias=self.bs * be, ck_bias=be)
+            u["slot"] += self.bs * be
+            u["pos_kv"] += be
+            u["ck"] += be
+            u["workspace_row"] += self.H * be
+        return u
+
+    def _unit(self) -> Dict[str, int]:
         return dict(
             slot=2 * self.bs * self.D * self.elem,                      # K + V of one (layer, head, block)
             pos_kv=2 * self.D * self.elem,                              # K + V of one (layer, head, position)
@@ -914,7 +929,10 @@ class MemoryAccountant:
     kind into draft_kv (DRAFT), provisional_kv (PRE and PROV) and recent_kv (EXACT), replacing the eager dict counts, and
     FREE + DRAINING into ring_idle; every admission buffer that is not FREE (also of an ended request) into admission_kv;
     the metadata adds the entry records and the rgen_t entries at allocated capacity, the map entries and the admission
-    buffer records. Ring logs, the D2H snapshots and the host-row owner record are test instrumentation, not counted."""
+    buffer records. Ring logs, the D2H snapshots and the host-row owner record are test instrumentation, not counted.
+    C1.1 ABI v4 (geom.bias_elem > 0): the bias is charged inside the same categories through the units (Geometry.unit);
+    these are LOGICAL units. The dispatcher reports the ACTUAL allocated bias tensor bytes separately
+    (report()["physical"]["bias"]); neither is a Python-allocator or GPU measurement."""
 
     def __init__(self, geom: Optional[Geometry] = None, staging_bytes: int = 0, arena: bool = False, ring: bool = False):
         self.geom = geom or Geometry()

@@ -51,6 +51,25 @@ In addition to the arena protocol:
                           read_ev is recorded on "compute" after the LAST read of ANY arena position OR ring entry, and
                           is None only when the call read nothing. The executor reads the K row and the V row of every
                           Row.ring entry (registering each). Row.kv stays the eager input (the semantic reference).
+
+C1.1 ABI v4 (retroinfer-eval docs/superpowers/specs/2026-10-14-kstep-m2-integration-contract.md revision 10, 12.3 A0-A9
+and 12.3.1; opt-in): declared by the attribute abi = 4 together with chain_kernel. Without it everything above is
+unchanged (v3). With it (needs reads_arena; the dispatcher needs physical "arena" and recent "ring" or "eager_matched"):
+  joint_pre(l, items)     returns [(q, k, v, c)]: c the per-KV-head bias of the row's own position (NOSA cis).
+  prefill(tokens)         kv[pos][l][h] = (k, v, c).
+  compress(elems)         elems are (k, c) pairs of one window; returns the pair (reduced k, reduced c).
+  select(l, h, q_h, cks, n_cand)
+                          cks are the (ck, cc) windows VISIBLE to the row (12.3.1 V1, V3: complete windows of positions
+                          before the row's own); the per-row extent is len(cks); window w holds the positions
+                          [w * stride, w * stride + chain_kernel); no chain-length assertion (the references check it).
+  Row.kv[h]               (k, v, c) per attended position, in increasing position order (C1.1 still consumes Row.kv).
+  attach_bias(be, ac, rc) once, at dispatcher construction: per layer the arena bias rows ac[l] ((P_l * bs,): row
+                          p * bs + r) and, ring mode only, the ring bias rows rc[l] ((Q_l,): row e); rc is None
+                          otherwise. joint_post registers ONE more deferred arena read per (row, head, block) of
+                          Row.addr, the bias rows (a 1-D copy, identity copy as for K / V), and ONE more ring read per
+                          Row.ring entry with which = "c" (a 1-element copy of rc[l][e:e + 1]).
+  Geometry (12.3.1 V5, check_chain_geometry): stride >= 1, stride divides bs and chain_kernel, stride <= chain_kernel
+  <= bs; NOSA: (bs, chain_kernel, stride) = (64, 32, 16) only.
 """
 from __future__ import annotations
 
@@ -82,6 +101,23 @@ REQUIRED = ("joint_pre", "select", "joint_post", "dist", "embed", "compress", "p
 ATTRS = ("L", "H", "D", "V", "bs", "stride", "max_sel")
 ARENA_REQUIRED = ("attach_arena",)
 RING_REQUIRED = ("attach_ring",)
+ABI4_REQUIRED = ("attach_bias",)                 # C1.1 ABI v4 (docstring)
+ABI4_ATTRS = ("chain_kernel",)
+
+
+def abi_of(ex) -> int:
+    """The executor's declared ABI: 4 with abi = 4 (C1.1), else 3 (every earlier interface)."""
+    abi = getattr(ex, "abi", 3)
+    if abi not in (3, 4):
+        raise ValueError("executor %r declares abi %r (3 or 4)" % (type(ex).__name__, abi))
+    return int(abi)
+
+
+def check_chain_geometry(bs: int, kernel: int, stride: int) -> None:
+    """C1.1 V5: stride >= 1, stride divides bs and kernel, and stride <= kernel <= bs (ValueError otherwise)."""
+    if stride < 1 or bs % stride or kernel % stride or not stride <= kernel <= bs:
+        raise ValueError("C1 chain geometry (bs %d, kernel %d, stride %d): need stride >= 1, stride dividing bs and "
+                         "kernel, and stride <= kernel <= bs" % (bs, kernel, stride))
 
 
 def check_executor(ex) -> None:
@@ -90,7 +126,13 @@ def check_executor(ex) -> None:
         miss += [m for m in ARENA_REQUIRED if not callable(getattr(ex, m, None))]
     if getattr(ex, "reads_ring", False):
         miss += [m for m in RING_REQUIRED if not callable(getattr(ex, m, None))]
+    abi4 = abi_of(ex) == 4
+    if abi4:
+        miss += [m for m in ABI4_REQUIRED if not callable(getattr(ex, m, None))] + [
+            a for a in ABI4_ATTRS if not hasattr(ex, a)]
     if miss:
         raise TypeError("executor %r lacks %s" % (type(ex).__name__, miss))
     if ex.bs % ex.stride:
         raise ValueError("the compression stride %d must divide the block size %d" % (ex.stride, ex.bs))
+    if abi4:
+        check_chain_geometry(ex.bs, ex.chain_kernel, ex.stride)

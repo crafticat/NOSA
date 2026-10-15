@@ -164,11 +164,34 @@ retention, attention, rollback and recency are unchanged, and ring counters go t
   validated without a host wait (identity of every gathered ring entry, then the bytes); at the first poll at which a
   publication's hist_ev is complete, whether the live rows still equal it is RECORDED (d2h_seen, a witness only); the
   host-row owner record hown is checked before every pack (11.3 (3)). These are instrumentation, not charged in K6.
+
+C1.1 ABI v4 (retroinfer-eval docs/superpowers/specs/2026-10-14-kstep-m2-integration-contract.md revision 10, 12.3 A0-A9
+and 12.3.1 V1-V7; Codex approval 2026-10-15 of the portable checkpoint C1.1 only). Opt-in by the executor (abi = 4,
+executor docstring); every ABI v3 path, store, counter and trace field is unchanged without it. Needs physical "arena" and
+recent "ring" or "eager_matched", and a transport with carries_bias. The schedule, guards, cadence, retention, attention,
+rollback and recency are unchanged; C1.1 still computes outputs from Row.kv (no physical consumption, no model numerics).
+  bias      every KV item is (k, v, c): r.pub, draft KV, the cohort's pre (q, k, v, c) and provisional KV, Row.kv, and
+            published. Stores (12.3 A4, int64 on the CPU, POISON-filled): host_c (B, S_host, H), arena_c (P_l * bs,),
+            ring_c (Q_l,) (ring), A_r's c (P0 - 1, H). The bias moves INSIDE the same transaction as its K / V: the ring
+            producer writes it before ready_ev (after the previous occupancy's D2H wait); _d2h_block copies it on "d2h"
+            before hist_ev (after the same ready waits) and snapshots it; the transports carry it (transfer docstring:
+            S0's completion frontier is after the bias scatter); the S0 readback, the arena / ring deferred-read
+            validators (identity first, then bytes) and the D2H snapshot compare it; hown covers the host rows it lives
+            in. The executor must register one bias read per (row, head, block) of Row.addr and one per Row.ring entry.
+  chain     Request chains use CompressedChain(stride, reduce, kernel=chain_kernel) with (k, c) elements (V2). Draft rows
+            select over r.dchain as before (count == pos); verifier rows use compressed.row_prefixes (V3: each row over
+            the chain at its own position, then its element; KStepError "C1 row prefix: ..."). Rollback copies and the
+            full-acceptance rebuild carry the overlap buffer (V4); rollback_across_compression uses the v4 event rule.
+  records   (labelled instrumentation, not charged in K6) the windows each draft row's select received per (l, h)
+            (Draft.cks; trace field "cks" of a draft record, ABI v4 only); c1stat counters; report()["physical"]["bias"]:
+            the ACTUAL allocated bias tensor bytes (numel * element_size at allocated capacity: every arena / ring row
+            whatever its state, the host rows, the held admission buffers and their peak) apart from the LOGICAL K6
+            units (Geometry.bias_elem = the actual element size; ownership.Geometry.unit).
 """
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -178,10 +201,10 @@ from . import accept as acc
 from . import cadence as cad
 from . import rng
 from .backend import check_backend, ev_done
-from .compressed import CompressedChain
+from .compressed import CompressedChain, row_prefixes
 from .errors import (CapacityRefusal, ConfigError, KStepError, NoProgress, OwnershipViolation, ReadCorruption,
                      StaleReader)
-from .executor import DRAFT, VERIFY, Row, check_executor
+from .executor import DRAFT, VERIFY, Row, abi_of, check_executor
 from .mutations import Mutations
 from .ownership import (COUNTS, FREE, LIVE, LRU, PO, R_DRAFT, R_EXACT, R_PRE, R_PROV, RELEASING, RING_KINDS, VRES, Arena,
                         Geometry, LayerPool, MemoryAccountant, RingPool)
@@ -222,11 +245,12 @@ class Config:
 
 
 class Draft:
-    __slots__ = ("s", "pos", "tok_in", "epoch", "n_at", "m", "sel", "avail", "hidden", "d", "q", "state", "step")
+    __slots__ = ("s", "pos", "tok_in", "epoch", "n_at", "m", "sel", "avail", "hidden", "d", "q", "state", "step", "cks")
 
     def __init__(self, s, pos, tok_in, epoch, n_at, m, step):
         self.s, self.pos, self.tok_in, self.epoch, self.n_at, self.m, self.step = s, pos, tok_in, epoch, n_at, m, step
         self.sel, self.avail = {}, {}
+        self.cks = {}                          # C1.1 ABI v4 instrumentation: per layer the windows select received
         self.hidden = None
         self.d, self.q = None, None
         self.state = RUNNING
@@ -261,7 +285,7 @@ class Cohort:
 
 
 class Request:
-    def __init__(self, uid, b: int, prompt: List[int], N: int, L: int, H: int, stride: int, reduce):
+    def __init__(self, uid, b: int, prompt: List[int], N: int, L: int, H: int, stride: int, reduce, kernel: int = None):
         self.uid, self.b, self.prompt, self.N = uid, b, list(prompt), int(N)
         self.P0 = len(prompt)
         self.toks = list(prompt)
@@ -275,7 +299,7 @@ class Request:
         self.done = False
         self.pub = [[dict() for _ in range(H)] for _ in range(L)]
         self.draft_kv = [[dict() for _ in range(H)] for _ in range(L)]
-        self.comp = [[CompressedChain(stride, reduce) for _ in range(H)] for _ in range(L)]
+        self.comp = [[CompressedChain(stride, reduce, kernel=kernel) for _ in range(H)] for _ in range(L)]
         self.dchain = None
         self.hist_blocks = 0
         self.hist_ev: Dict[Tuple[int, int], Any] = {}
@@ -342,6 +366,11 @@ class Dispatcher:
             raise ConfigError("M2 B2 ring mode needs an executor with reads_ring = True (interface v3; executor docstring)")
         if cfg.ring_slack is not None and (not self.ring_mode or int(cfg.ring_slack) < 1):
             raise ConfigError("M2 B2: ring_slack %r needs recent 'ring' and ring_slack >= 1" % (cfg.ring_slack,))
+        self.abi4 = abi_of(executor) == 4                     # C1.1 ABI v4 (module docstring); check_executor ran V5
+        self.chain_kernel = int(executor.chain_kernel) if self.abi4 else self.stride
+        if self.abi4 and (not self.arena_mode or self.recent not in ("ring", "eager_matched")):
+            raise ConfigError("C1.1 ABI v4 needs physical 'arena' and recent 'ring' or 'eager_matched' (got %r, %r)"
+                              % (cfg.physical, cfg.recent))
         self.rev6 = cfg.capacity == "rev6"
         self.W = (self.K + 1) * self.rb                       # rev6 L3: positions through the next trigger, per stream
         self.X_d = cfg.X - cfg.R_ver                          # rev6 L1: the shared draft pool per layer
@@ -401,6 +430,17 @@ class Dispatcher:
         else:
             self.S_ring = self.Q = None
             self.rings, self.ring_k, self.ring_v = [], None, None
+        self.c1stat = defaultdict(int)             # C1.1: bias / chain coverage counters (report()["physical"]["bias"])
+        self.adm_bias_peak_bytes = 0               # C1.1: the EXACT peak of the held A_r bias bytes (at allocations)
+        if self.abi4:                              # C1.1 A4: the bias stores beside their K / V stores (POISON-filled)
+            self.bias_dtype = torch.int64
+            self.host_c = [torch.full((cfg.B, cfg.S_host, self.H), POISON, dtype=self.bias_dtype) for _ in range(self.L)]
+            self.arena_c = [torch.full((self.P * self.bs,), POISON, dtype=self.bias_dtype) for _ in range(self.L)]
+            self.ring_c = ([torch.full((self.Q,), POISON, dtype=self.bias_dtype) for _ in range(self.L)]
+                           if self.ring_mode else None)
+            executor.attach_bias(be, self.arena_c, self.ring_c)
+        else:
+            self.bias_dtype = self.host_c = self.arena_c = self.ring_c = None
         self.rstat = defaultdict(int)              # M2 B2: ring / D2H-check counters (report()["ring"]; never self.stats)
         self.adm: List[Dict] = []                  # M2 B2 ring: the admission buffers A_r that are not FREE
         self.adm_log: List[Dict] = []              # M2 B2: (step, uid, b, P0, LIVE at the admission start) per admission
@@ -414,7 +454,16 @@ class Dispatcher:
         self._ring_exp: Dict[Tuple, Tuple] = {}    # (id(row), head, position) -> the eager (k, v) of the current call
         self._n_ring_val = 0
         self.tp = make_transport(self)
-        self.acct = MemoryAccountant(cfg.geom, getattr(self.tp, "staging_bytes", 0), arena=self.arena_mode,
+        geom = cfg.geom
+        if self.abi4:
+            if not getattr(self.tp, "carries_bias", False):
+                raise ConfigError("C1.1 ABI v4 needs a transport that carries the bias rows (carries_bias; transfer.py)")
+            el = torch.empty((), dtype=self.bias_dtype).element_size()   # A9: the ACTUAL bias element size
+            g0 = geom if geom is not None else Geometry()
+            if g0.bias_elem not in (0, el):
+                raise ConfigError("C1.1 A9: Geometry.bias_elem %d != the bias dtype's element size %d" % (g0.bias_elem, el))
+            geom = replace(g0, bias_elem=el)
+        self.acct = MemoryAccountant(geom, getattr(self.tp, "staging_bytes", 0), arena=self.arena_mode,
                                      ring=self.ring_mode)
         self.queue: List[Tuple] = []
         self.slot_req: List[Optional[Request]] = [None] * cfg.B
@@ -449,6 +498,7 @@ class Dispatcher:
         self._vfail = set()
         self._read_keys = set()
         self._n_new_val = 0
+        self._n_bias_reads = 0                     # C1.1: arena bias reads the executor registered in the current call
 
     # ================================================================== requests
     def submit(self, uid, prompt: List[int], max_new_tokens: int) -> None:
@@ -468,7 +518,7 @@ class Dispatcher:
             if self.slot_req[b] is not None or not self.queue:
                 continue
             uid, prompt, N = self.queue.pop(0)
-            r = Request(uid, b, prompt, N, self.L, self.H, self.stride, self.ex.compress)
+            r = Request(uid, b, prompt, N, self.L, self.H, self.stride, self.ex.compress, self.chain_kernel)
             self.reqs[uid] = r
             self.slot_req[b] = r
             self.age[uid] = len(self.age)
@@ -480,7 +530,7 @@ class Dispatcher:
                 for l in range(self.L):
                     for h in range(self.H):
                         r.pub[l][h][pos] = kv[pos][l][h]
-                        r.comp[l][h].append(kv[pos][l][h][0])
+                        r.comp[l][h].append(self._ck(kv[pos][l][h]))
             r.dchain = [[c.copy() for c in row] for row in r.comp]
             if self.recent == "eager":
                 self._history(r)
@@ -490,6 +540,10 @@ class Dispatcher:
             self.stats["requests_admitted"] += 1
             if r.generated() >= r.N:
                 self._end_request(r)
+
+    def _ck(self, kvv):
+        """The chain element of one KV item: its key (ABI v3), or the pair (k, c) of the same item (ABI v4, V2)."""
+        return (kvv[0], kvv[2]) if self.abi4 else kvv[0]
 
     def _end_request(self, r: Request) -> None:
         for l in range(self.L):
@@ -1016,6 +1070,8 @@ class Dispatcher:
                     self.rstat["ring_reads_validated"] += 1                # M2 B2: a ring counter, not a logical one
                 else:
                     self.stats["reads_validated"] += 1
+                if info.get("which") == "c":                               # C1.1: a bias read (identity, then bytes)
+                    self.c1stat["ring_bias_reads_validated" if info.get("ring") else "arena_bias_reads_validated"] += 1
             else:
                 keep.append((ev, ws, exp, info))
         self.validators = keep
@@ -1038,6 +1094,11 @@ class Dispatcher:
                     call=self.call_id, phys=phys, pgen=pgen)
         if pg is not None:
             info["pg"] = pg
+        if self.abi4:                                                  # C1.1: the bias rows are the 1-D read (12.3 A4)
+            info["which"] = "c" if ws.dim() == 1 else "kv"
+            if ws.dim() == 1:
+                self._n_bias_reads += 1
+                self.c1stat["arena_bias_reads_registered"] += 1
         self.validators.append((None, ws, exp, info))
         self._n_new_val += 1
 
@@ -1047,10 +1108,14 @@ class Dispatcher:
         rgen g, then the bytes ws against the EAGER value the row attends (Row.kv's reference, not a ring clone: the
         entry's payload write may not have executed at call time)."""
         exp = self._ring_exp.get((id(row), h, pos))
-        if exp is None or pg is None or which not in ("k", "v"):
+        if exp is None or pg is None or which not in (("k", "v", "c") if self.abi4 else ("k", "v")):
             raise KStepError("M2 B2: the executor registered a ring read of position %d (head %d, %s, identity copy %s) that "
                              "row (uid %s pos %d) does not attend" % (pos, h, which, pg is not None, row.uid, row.pos))
-        val = torch.tensor(exp[0] if which == "k" else exp[1], dtype=torch.int64)
+        if which == "c":                                               # C1.1: the entry's bias (a 1-element read)
+            val = torch.tensor([exp[2]], dtype=torch.int64)
+            self.c1stat["ring_bias_reads_registered"] += 1
+        else:
+            val = torch.tensor(exp[0] if which == "k" else exp[1], dtype=torch.int64)
         info = dict(ring=True, layer=l, b=row.b, h=h, pos=pos, entry=e, rgen=g, kind=kind, which=which, uid=row.uid,
                     call=self.call_id, rg=pg)
         self.validators.append((None, ws, val, info))
@@ -1141,15 +1206,41 @@ class Dispatcher:
                            arena_k=sum(t.numel() * t.element_size() for t in self.arena_k),
                            arena_v=sum(t.numel() * t.element_size() for t in self.arena_v),
                            pgen_t=sum(ar.pgen_t.numel() * ar.pgen_t.element_size() for ar in self.arenas)))
+            if self.abi4:
+                out["bias"] = self.bias_report()
         return out
 
+    def bias_report(self) -> Dict[str, Any]:
+        """C1.1 A9 (12.3), three separate quantities: allocated_bytes, the ACTUAL numel * element_size of every bias
+        tensor at its allocated capacity (arena and ring rows whatever their state, the host rows, the admission buffers
+        held now and their exact peak; no reference gather exists in C1.1); logical_units, the K6 units
+        (Geometry.bias_elem = the actual element size); and the coverage counters (c1stat, the transports' bias
+        readbacks / landings / staging). Neither byte figure measures Python objects or a GPU allocator; no fit claim."""
+        el = lambda ts: sum(t.numel() * t.element_size() for t in (ts or ()))
+        u = self.acct.u
+        tp = self.tp
+        return dict(dtype=str(self.bias_dtype), element_size=torch.empty((), dtype=self.bias_dtype).element_size(),
+                    chain_kernel=self.chain_kernel, stride=self.stride,
+                    allocated_bytes=dict(host_c=el(self.host_c), arena_c=el(self.arena_c), ring_c=el(self.ring_c),
+                                         admission_held=sum(el(A.get("c")) for A in self.adm),
+                                         admission_peak=self.adm_bias_peak_bytes, gather=0),
+                    logical_units=dict(bias_elem=self.acct.geom.bias_elem, pos_bias=u["pos_bias"],
+                                       slot_bias=u["slot_bias"], ck_bias=u["ck_bias"]),
+                    counters=dict(sorted(self.c1stat.items())),
+                    transport=dict(bias_readbacks=getattr(tp, "bias_readbacks", None),
+                                   bias_groups=getattr(tp, "bias_groups", None), bias_lands=getattr(tp, "bias_lands", None),
+                                   bias_staging_bytes=getattr(tp, "bias_staging_bytes", None)))
+
     # ---------------------------------------------------------------- M2 B2 (Config.recent "ring" / "eager_matched")
-    def _produce(self, l: int, r: Request, h: int, kind: str, key, prov: Tuple, k, v, where: str) -> None:
+    def _produce(self, l: int, r: Request, h: int, kind: str, key, prov: Tuple, k, v, where: str, c=None) -> None:
         """Contract 11.2 / 11.4 D1: ONE producer at its producer point. ring: the bind transaction (_ring_take with
         backpressure, RingPool.bind), then in checked mode the per-bind LIVE bound (_ring_live_check), the map insert,
         and the payload write enqueued on "compute" after a stream wait on the previous occupancy's D2H event (the
         second safeguard; complete by the FREE rule) with ready_ev after it. eager_matched: a marker event on "compute"
-        at the same point, kept in the same map (no entry, no payload, no wait). A second producer of a key is refused."""
+        at the same point, kept in the same map (no entry, no payload, no wait). A second producer of a key is refused.
+        C1.1 ABI v4: the payload write includes the entry's bias c (ring_c[l][e]) before the same ready_ev."""
+        if self.abi4 and self.ring_mode and c is None:
+            raise KStepError("C1.1: the %s producer of uid %s (layer %d h %d, %s) has no bias" % (kind, r.uid, l, h, where))
         m = r.rmap[l][h][kind]
         if key in m:
             raise OwnershipViolation("ring binding: duplicate %s key %s of uid %s (layer %d b %d h %d, %s)"
@@ -1166,11 +1257,16 @@ class Dispatcher:
         m[key] = (e, g)
         sk = k if torch.is_tensor(k) else torch.tensor(k, dtype=torch.int64)
         sv = v if torch.is_tensor(v) else torch.tensor(v, dtype=torch.int64)
+        sc = None
+        if self.abi4:
+            sc = c if torch.is_tensor(c) else torch.tensor([c], dtype=self.bias_dtype)
         with self.be.stream("compute"):
             if prev_d2h is not None:
                 self.be.stream_wait("compute", prev_d2h)
             self.be.memcpy(self.ring_k[l][e], sk, "compute")
             self.be.memcpy(self.ring_v[l][e], sv, "compute")
+            if sc is not None:                                         # C1.1: the bias, inside the same transaction
+                self.be.memcpy(self.ring_c[l][e:e + 1], sc, "compute")
             ring.set_ready(e, g, self.be.event_rec("compute"))
 
     def _ring_take(self, l: int, r: Request, where: str) -> int:
@@ -1355,6 +1451,8 @@ class Dispatcher:
             if ring:
                 A["k"] = [torch.full((n0, H, D), POISON, dtype=torch.int64) for _ in range(L)]
                 A["v"] = [torch.full((n0, H, D), POISON, dtype=torch.int64) for _ in range(L)]
+                if self.abi4:                                          # C1.1: A_r's bias rows (P0 - 1, H) per layer
+                    A["c"] = [torch.full((n0, H), POISON, dtype=self.bias_dtype) for _ in range(L)]
                 for l in range(L):
                     sk = torch.tensor([[kv[pos][l][h][0] for h in range(H)] for pos in range(n0)],
                                       dtype=torch.int64).reshape(n0, H, D)
@@ -1362,6 +1460,10 @@ class Dispatcher:
                                       dtype=torch.int64).reshape(n0, H, D)
                     self.be.memcpy(A["k"][l], sk, "compute")
                     self.be.memcpy(A["v"][l], sv, "compute")
+                    if self.abi4:
+                        scc = torch.tensor([[kv[pos][l][h][2] for h in range(H)] for pos in range(n0)],
+                                           dtype=self.bias_dtype).reshape(n0, H)
+                        self.be.memcpy(A["c"][l], scc, "compute")
             A["ready"] = self.be.event_rec("compute")
         blocks0 = r.hist_blocks
         self._history(r, adm=A)                                        # 1. complete prompt blocks: D2H from A_r
@@ -1372,7 +1474,8 @@ class Dispatcher:
             for h in range(H):
                 for pos in range(r0, n0):
                     src = (A["k"][l][pos, h], A["v"][l][pos, h]) if ring else (None, None)
-                    self._produce(l, r, h, R_EXACT, pos, (r.epoch, None, pos), src[0], src[1], where)
+                    cc = A["c"][l][pos, h] if (ring and self.abi4) else None    # C1.1: from A_r, as K / V
+                    self._produce(l, r, h, R_EXACT, pos, (r.epoch, None, pos), src[0], src[1], where, cc)
                     self.rstat["admission_partial_binds"] += 1
         with self.be.stream("compute"):                                # 3. A_r's two gates
             A["cev"] = self.be.event_rec("compute")
@@ -1382,6 +1485,9 @@ class Dispatcher:
         if ring:
             self.adm.append(A)
             self.adm_peak = max(self.adm_peak, sum(a["n"] * H * L for a in self.adm))
+            if self.abi4:                                              # C1.1 A9: the held A_r bias bytes, exact peak
+                self.adm_bias_peak_bytes = max(self.adm_bias_peak_bytes, sum(
+                    t.numel() * t.element_size() for a in self.adm for t in (a.get("c") or ())))
 
     def _d2h_block(self, r: Request, l: int, j: int, adm: Optional[Dict]) -> None:
         """Contract 11.3: the D2H of block j of layer l (ring / eager_matched). Source: A_r for an admission block (after
@@ -1393,6 +1499,9 @@ class Dispatcher:
         r0, r1 = j * bs, (j + 1) * bs
         ek = torch.tensor([[r.pub[l][h][pos][0] for h in range(H)] for pos in range(r0, r1)], dtype=torch.int64)
         evv = torch.tensor([[r.pub[l][h][pos][1] for h in range(H)] for pos in range(r0, r1)], dtype=torch.int64)
+        ec = None
+        if self.abi4:                                                  # C1.1: the eager exact bias of the block (bs, H)
+            ec = torch.tensor([[r.pub[l][h][pos][2] for h in range(H)] for pos in range(r0, r1)], dtype=self.bias_dtype)
         self.pub_seq += 1
         pub = self.pub_seq
         src = rg = rg_exp = None
@@ -1414,9 +1523,13 @@ class Dispatcher:
                 if ring is not None:
                     self.be.memcpy(self.host_k[l][b, r0:r1], adm["k"][l][r0:r1], "d2h")
                     self.be.memcpy(self.host_v[l][b, r0:r1], adm["v"][l][r0:r1], "d2h")
+                    if ec is not None:                                 # C1.1: the bias from A_r, before hist_ev
+                        self.be.memcpy(self.host_c[l][b, r0:r1], adm["c"][l][r0:r1], "d2h")
                 else:
                     self.be.memcpy(self.host_k[l][b, r0:r1], ek.clone(), "d2h")
                     self.be.memcpy(self.host_v[l][b, r0:r1], evv.clone(), "d2h")
+                    if ec is not None:
+                        self.be.memcpy(self.host_c[l][b, r0:r1], ec.clone(), "d2h")
             elif ring is not None:
                 for row in src:
                     for e, g in row:
@@ -1426,6 +1539,8 @@ class Dispatcher:
                     for h, (e, g) in enumerate(row):
                         self.be.memcpy(self.host_k[l][b, r0 + i, h], self.ring_k[l][e], "d2h")
                         self.be.memcpy(self.host_v[l][b, r0 + i, h], self.ring_v[l][e], "d2h")
+                        if ec is not None:                             # C1.1: the entry's bias, gathered with K / V
+                            self.be.memcpy(self.host_c[l][b, r0 + i, h:h + 1], self.ring_c[l][e:e + 1], "d2h")
                         self.be.memcpy(rg[i, h:h + 1], ring.rgen_t[e:e + 1], "d2h")
                 rg_exp = [[g for e, g in row] for row in src]
             else:
@@ -1434,6 +1549,8 @@ class Dispatcher:
                         self.be.stream_wait("d2h", r.rmap[l][h][R_EXACT][pos])
                 self.be.memcpy(self.host_k[l][b, r0:r1], ek.clone(), "d2h")
                 self.be.memcpy(self.host_v[l][b, r0:r1], evv.clone(), "d2h")
+                if ec is not None:
+                    self.be.memcpy(self.host_c[l][b, r0:r1], ec.clone(), "d2h")
             hist_ev = self.be.event_rec("d2h")
             r.hist_ev[(l, j)] = hist_ev
             snap = None
@@ -1441,7 +1558,11 @@ class Dispatcher:
                 sk, sv = torch.empty_like(ek), torch.empty_like(evv)
                 self.be.memcpy(sk, self.host_k[l][b, r0:r1], "d2h")
                 self.be.memcpy(sv, self.host_v[l][b, r0:r1], "d2h")
-                snap = (sk, sv, self.be.event_rec("d2h"))
+                sc = None
+                if ec is not None:                                     # C1.1: the bias rows in the same snapshot
+                    sc = torch.empty_like(ec)
+                    self.be.memcpy(sc, self.host_c[l][b, r0:r1], "d2h")
+                snap = (sk, sv, self.be.event_rec("d2h"), sc)
         if src is not None:
             for row in src:
                 for e, g in row:
@@ -1455,6 +1576,8 @@ class Dispatcher:
                                         sv=snap[1], ek=ek, ev=evv, rg=rg, rg_exp=rg_exp,
                                         src=None if src is None else [[e for e, g in row] for row in src],
                                         call=self.call_id, step=self.t, seen=None))
+            if ec is not None:                                         # C1.1: the bias snapshot and its expectation
+                self.d2h_checks[-1].update(sc=snap[3], ec=ec)
             self.rstat["d2h_snapshots"] += 1
 
     def _d2h_poll(self, final: bool = False) -> None:
@@ -1469,18 +1592,20 @@ class Dispatcher:
                 live_k = self.host_k[rec["l"]][rec["b"], r0:r0 + self.bs]
                 live_v = self.host_v[rec["l"]][rec["b"], r0:r0 + self.bs]
                 same = torch.equal(live_k, rec["ek"]) and torch.equal(live_v, rec["ev"])
+                if rec.get("ec") is not None:                          # C1.1: the witness covers the bias rows too
+                    same = same and torch.equal(self.host_c[rec["l"]][rec["b"], r0:r0 + self.bs], rec["ec"])
                 rec["seen"] = "finish" if final else "poll"
                 req = self.reqs.get(rec["uid"])
                 self.d2h_seen.append(dict(uid=rec["uid"], l=rec["l"], b=rec["b"], j=rec["j"], pub=rec["pub"],
                                           call=self.call_id, step=self.t, phase=rec["seen"], live_equal=same,
                                           ended=req is None or req.done, owner=self.hown.get((rec["l"], rec["b"], rec["j"]))))
             if final or ev_done(rec["snap_ev"]):
-                self._d2h_check(rec, rec["sk"], rec["sv"])
+                self._d2h_check(rec, rec["sk"], rec["sv"], rec.get("sc"))
             else:
                 keep.append(rec)
         self.d2h_checks = keep
 
-    def _d2h_check(self, rec: Dict, k, v) -> None:
+    def _d2h_check(self, rec: Dict, k, v, c=None) -> None:
         if rec["rg"] is not None:
             for i, row in enumerate(rec["rg_exp"]):
                 for h, g in enumerate(row):
@@ -1489,13 +1614,18 @@ class Dispatcher:
                                           "captured %d, at read %d" % (rec["uid"], rec["l"], rec["b"], rec["j"],
                                                                        rec["src"][i][h], h, rec["j"] * self.bs + i, g,
                                                                        int(rec["rg"][i, h])))
-        self._d2h_bytes(rec, k, v)
+        self._d2h_bytes(rec, k, v, c)
         self.rstat["d2h_snapshots_validated"] += 1
 
-    def _d2h_bytes(self, rec: Dict, k, v) -> None:
+    def _d2h_bytes(self, rec: Dict, k, v, c=None) -> None:
         if not (torch.equal(k, rec["ek"]) and torch.equal(v, rec["ev"])):
             raise ReadCorruption("D2H readback mismatch: uid %s l %d b %d block %d pub %d"
                                  % (rec["uid"], rec["l"], rec["b"], rec["j"], rec["pub"]))
+        if rec.get("ec") is not None and c is not None:                # C1.1: then the bias rows of the same snapshot
+            if not torch.equal(c, rec["ec"]):
+                raise ReadCorruption("D2H readback mismatch: uid %s l %d b %d block %d pub %d (bias rows)"
+                                     % (rec["uid"], rec["l"], rec["b"], rec["j"], rec["pub"]))
+            self.c1stat["d2h_bias_snapshots_validated"] += 1
 
     def _ring_counts(self) -> Dict[str, int]:
         """K6 ring-mode counts (ownership.RING_COUNTS, contract 11.4)."""
@@ -1600,18 +1730,25 @@ class Dispatcher:
             raise KStepError("D3: phase 1 of %r at layer %d would be recomputed" % (c, l))
         self.stats["verifier_pre_rows"] += len(c.positions)
         chain = [x.copy() for x in self._chain_base(r, c, l)]
-        for i, pos in enumerate(c.positions):
-            for h in range(self.H):
-                chain[h].append(pre[i][1][h])
-        sel = []
-        for i, pos in enumerate(c.positions):
-            sel.append([self.ex.select(l, h, pre[i][0][h], chain[h].cks, pos // self.bs) for h in range(self.H)])
+        if self.abi4:                                                  # C1.1 V3: the row-local prefix, row by row
+            vis = [row_prefixes(chain[h], c.positions, [(pre[i][1][h], pre[i][3][h]) for i in range(len(c.positions))],
+                                "cohort %s" % (c.key,), "l %d h %d" % (l, h)) for h in range(self.H)]
+            sel = [[self.ex.select(l, h, pre[i][0][h], vis[h][i], pos // self.bs) for h in range(self.H)]
+                   for i, pos in enumerate(c.positions)]
+            self.c1stat["row_prefix_checks"] += len(c.positions) * self.H
+        else:
+            for i, pos in enumerate(c.positions):
+                for h in range(self.H):
+                    chain[h].append(pre[i][1][h])
+            sel = []
+            for i, pos in enumerate(c.positions):
+                sel.append([self.ex.select(l, h, pre[i][0][h], chain[h].cks, pos // self.bs) for h in range(self.H)])
         c.ws[l] = dict(pre=pre, sel=sel, chain=chain, hist=r.hist_blocks)   # rev6 H1: the boundary of this workspace
         if self.recent != "eager":                                     # M2 B2: the cohort's PRE KV (producer D1)
             for i, pos in enumerate(c.positions):
                 for h in range(self.H):
                     self._produce(l, r, h, R_PRE, (c.key, pos), (c.epoch, c.key, pos), pre[i][1][h], pre[i][2][h],
-                                  "call %d step %d" % (self.call_id, self.t))
+                                  "call %d step %d" % (self.call_id, self.t), pre[i][3][h] if self.abi4 else None)
 
     def _need(self, r: Request, sel_rows, l: int, hist: Optional[int] = None):
         """Per head: (ready, inflight, missing) historical blocks of a set of rows' selections."""
@@ -1631,6 +1768,7 @@ class Dispatcher:
         cid = self.call_id
         self._read_keys = set()
         self._n_new_val = 0
+        self._n_bias_reads = 0
         self._ring_reads, self._ring_exp, self._n_ring_val = [], {}, 0
         self.call_step[cid] = self.t
         if self.arena_mode:
@@ -1700,22 +1838,26 @@ class Dispatcher:
         for r, dr in rows:
             if r.cur is not dr:
                 continue
-            q, k, v = draft_pre_raw[id(dr)]
+            q, k, v = draft_pre_raw[id(dr)][:3]
+            cb = draft_pre_raw[id(dr)][3] if self.abi4 else None       # C1.1: the draft row's own bias per head
             for h in range(self.H):
                 if r.dchain[l][h].count != dr.pos:
                     raise KStepError("D6: the draft chain of uid %s (l %d h %d) holds %d keys at draft position %d"
                                      % (r.uid, l, h, r.dchain[l][h].count, dr.pos))
             sel = [self.ex.select(l, h, q[h], r.dchain[l][h].cks, dr.pos // self.bs) for h in range(self.H)]
+            if self.abi4:                                              # C1.1 instrumentation: the windows select read
+                dr.cks[l] = [list(r.dchain[l][h].cks) for h in range(self.H)]
+                self.c1stat["draft_cks_records"] += self.H
             key = (r.uid, r.epoch, dr.m)
             if self.rev6:
                 self._row_bound(r, [sel], l, "draft s%d" % dr.s)
             avail = []
             for h in range(self.H):
-                r.draft_kv[l][h][dr.pos] = (k[h], v[h])
-                r.dchain[l][h].append(k[h])
+                r.draft_kv[l][h][dr.pos] = (k[h], v[h]) if cb is None else (k[h], v[h], cb[h])
+                r.dchain[l][h].append(k[h] if cb is None else (k[h], cb[h]))
                 if self.recent != "eager":                             # M2 B2: the draft row's DRAFT KV (producer D1)
                     self._produce(l, r, h, R_DRAFT, dr.pos, (r.epoch, None, dr.pos), k[h], v[h],
-                                  "call %d step %d" % (cid, self.t))
+                                  "call %d step %d" % (cid, self.t), None if cb is None else cb[h])
                 st = self.pools[l].stream(r.b, h)
                 a = []
                 for j in sel[h]:
@@ -1731,7 +1873,7 @@ class Dispatcher:
                         self._add_demand(st, j, DRAFT)                 # R2.3: joins the transfer already in flight
                 avail.append(a)
             dr.sel[l], dr.avail[l] = sel, avail
-            draft_pre[id(dr)] = (q, k, v)
+            draft_pre[id(dr)] = (q, k, v) if cb is None else (q, k, v, cb)
         # R2.2: verifier reads never touch the logical LRU; they are logged separately (cohort order, position order)
         for r, c in exec_cohorts:
             hv = self._vhist(r, c, l)
@@ -1775,6 +1917,8 @@ class Dispatcher:
                             if own[qp] > i:
                                 raise KStepError("causality: row %d reads a later position %d" % (pos, qp))
                             ii = own[qp]
+                            if self.abi4:                              # C1.1: the PRE item with its own bias
+                                return (pre[ii][1][h], pre[ii][2][h], pre[ii][3][h])
                             return (pre[ii][1][h], pre[ii][2][h])
                         return self._prov(r, c, l, h, qp)
                     ad = [] if addr is not None else None
@@ -1795,7 +1939,7 @@ class Dispatcher:
         for r, dr in rows:
             if id(dr) not in draft_pre:
                 continue
-            q, k, v = draft_pre[id(dr)]
+            q = draft_pre[id(dr)][0]
             kv = []
             addr = [] if self.arena_mode else None                     # M2: per head [(block, phys, pgen)]
             rg = [] if self.ring_mode else None                        # M2 B2: per head [(pos, entry, rgen, kind, kv)]
@@ -1832,9 +1976,15 @@ class Dispatcher:
             if (read_ev is None) != (not read_slots and not self._ring_reads) or (self._n_new_val and read_ev is None):
                 raise KStepError("M2 B1: the executor returned read event %r for %d slot reads and %d ring reads (%d "
                                  "registered reads)" % (read_ev, len(read_slots), len(self._ring_reads), self._n_new_val))
-            if self._n_ring_val != 2 * len(self._ring_reads):          # M2 B2: the K and the V row of every entry read
+            n_per = 3 if self.abi4 else 2                              # M2 B2: the K and the V row of every entry read
+            if self._n_ring_val != n_per * len(self._ring_reads):      # (C1.1 ABI v4: and its bias row)
                 raise KStepError("M2 B2: the executor registered %d ring reads for %d ring entries of the rows"
                                  % (self._n_ring_val, len(self._ring_reads)))
+            if self.abi4:                                              # C1.1: one bias read per (row, head, block) read
+                n_addr = sum(len(a) for row in jrows for a in (row.addr or ()))
+                if self._n_bias_reads != n_addr:
+                    raise KStepError("C1.1: the executor registered %d arena bias reads for %d (row, head, block) reads"
+                                     % (self._n_bias_reads, n_addr))
             if self._ring_reads and not read_slots:
                 self.rstat["ring_only_calls"] += 1                     # M2 B2: read_ev with no historical slot read
             self._install_reader(l, read_slots, read_ev)               # IMMEDIATELY: no poll or release in between
@@ -1851,7 +2001,8 @@ class Dispatcher:
                 obj.hidden = out
         for r, c in exec_cohorts:
             pre = c.ws[l]["pre"]
-            c.prov[l] = [{pos: (pre[i][1][h], pre[i][2][h]) for i, pos in enumerate(c.positions)} for h in range(self.H)]
+            c.prov[l] = [{pos: (pre[i][1][h], pre[i][2][h]) + ((pre[i][3][h],) if self.abi4 else ())   # C1.1: with c
+                          for i, pos in enumerate(c.positions)} for h in range(self.H)]
             if self.recent != "eager":                                 # M2 B2: PRE -> PROV, the same entries (11.2)
                 for pos in c.positions:
                     for h in range(self.H):
@@ -2052,6 +2203,8 @@ class Dispatcher:
                                                  "%d), which names no position" % (pos, idx, l, r.b, h, j))
                     p0 = s.phys * bs
                     ek, evv = self.arena_k[l][p0:p0 + bs].clone(), self.arena_v[l][p0:p0 + bs].clone()
+                    if self.abi4:                                      # C1.1: the bias rows of the same position
+                        ec = self.arena_c[l][p0:p0 + bs].clone()
                     addr.append((j, s.phys, s.pgen))
                 else:
                     vk = self.slots_k[l][r.b, idx * bs:(idx + 1) * bs, h]
@@ -2068,22 +2221,22 @@ class Dispatcher:
                 read_slots.append((l, r.b, h, idx))
                 self._read_keys.add(key)
                 for rr, (kk, vv_) in enumerate(zip(ek.tolist(), evv.tolist())):
-                    out.append((j * bs + rr, tuple(kk), tuple(vv_)))
+                    out.append((j * bs + rr, (tuple(kk), tuple(vv_)) + ((int(ec[rr]),) if self.abi4 else ())))
             else:
                 for qp in range(j * bs, (j + 1) * bs):
-                    k, v = recent(qp)
-                    out.append((qp, k, v))
+                    kvv = recent(qp)                                   # (k, v), or (k, v, c) in ABI v4
+                    out.append((qp, kvv))
                     if rout is not None:
-                        rout.append(self._ring_ref(l, r, h, qp, rsrc(qp), (k, v)))
+                        rout.append(self._ring_ref(l, r, h, qp, rsrc(qp), kvv))
         for qp in range(tail0, pos + 1):
-            k, v = recent(qp)
-            out.append((qp, k, v))
+            kvv = recent(qp)
+            out.append((qp, kvv))
             if rout is not None:
-                rout.append(self._ring_ref(l, r, h, qp, rsrc(qp), (k, v)))
+                rout.append(self._ring_ref(l, r, h, qp, rsrc(qp), kvv))
         if rout is not None:
             rout.sort(key=lambda x: x[0])
         out.sort(key=lambda x: x[0])
-        return [(k, v) for _, k, v in out]
+        return [kvv for _, kvv in out]
 
     # ================================================================== fetch issue (K5, T3)
     # ---------------------------------------------------------------- N3 P2: the lost-work budget of verifier obligations
@@ -2282,6 +2435,8 @@ class Dispatcher:
                                  sel={l: [list(x) for x in v] for l, v in dr.sel.items()},
                                  avail={l: [list(x) for x in v] for l, v in dr.avail.items()},
                                  d=dr.d, q=None if dr.q is None else list(dr.q), status=status))
+        if self.abi4:                                                  # C1.1 instrumentation (12.3.1): the windows
+            ep["drafts"][-1]["cks"] = {l: [list(x) for x in v] for l, v in dr.cks.items()}   # each select received
 
     def _finish_draft(self, r: Request, dr: Draft) -> None:
         dist = self.ex.dist(dr.hidden)
@@ -2345,7 +2500,7 @@ class Dispatcher:
                                      % (r.uid, l, h, pos, r.n))
                 ch = base.copy()
                 for qp in pos:
-                    ch.append(dk[qp][0])
+                    ch.append(self._ck(dk[qp]))
                 r.dchain[l][h] = ch
 
     def _finished_key(self, key) -> None:
@@ -2433,7 +2588,12 @@ class Dispatcher:
         # A6: rollback of the draft list, draft KV, draft compressed chain and positions to the committed state
         hi = r.E + len(r.drafts) + (1 if (r.cur is not None and r.cur.epoch == r.epoch) else 0)
         lo = r.n
-        if any((qp + 1) % self.stride == 0 for qp in range(lo, hi)):
+        if self.abi4:                                                  # C1.1 V4: the v4 window event rule
+            kk, ss = self.chain_kernel, self.stride
+            crossed = any(qp + 1 >= kk and (qp + 1 - kk) % ss == 0 for qp in range(lo, hi))
+        else:
+            crossed = any((qp + 1) % self.stride == 0 for qp in range(lo, hi))
+        if crossed:
             self.stats["rollback_across_compression"] += 1
         if any((qp + 1) % self.bs == 0 for qp in range(lo, hi)):
             self.stats["rollback_across_fill"] += 1
@@ -2484,7 +2644,7 @@ class Dispatcher:
                     else:
                         kv = c.prov[l][h][pos]
                     r.pub[l][h][pos] = kv
-                    r.comp[l][h].append(kv[0])
+                    r.comp[l][h].append(self._ck(kv))
                     self.published[(r.uid, pos, l, h)] = kv
                     if self.recent != "eager":                         # M2 B2: PROV -> EXACT, the same entry (11.2)
                         self._rmove(l, r, h, R_PROV, R_EXACT, (c.key, pos), pos, (r.epoch, None, pos))

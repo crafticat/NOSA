@@ -34,6 +34,19 @@ its destination position and generation (phys, pgen); reader_ev is the previous 
   (called by the dispatcher in checked mode before admission) compares the landed arena rows with them, so a later
   request of the batch slot cannot change the expectation.
   AdversarialTransport._land writes the rows of position phys.
+
+C1.1 ABI v4 (retroinfer-eval docs/superpowers/specs/2026-10-14-kstep-m2-integration-contract.md revision 10, 12.3 A5;
+arena only; host_c / arena_c given together, carries_bias = True). The per-position bias travels with its K / V rows:
+  S0Transport._issue_bias, after Pipe.layer of the same layer issue: the host pack of every group's bias rows at issue
+  (index_select by the descriptor's own src_idx, after the same T4 host waits and the dispatcher's hown check; a fresh
+  staging tensor), ONE H2D on "copy" into a fresh landing tensor, then ONE index_copy on "scatter" (a stream wait on that
+  H2D) to the descriptor's own dst_idx, and an event on "scatter" after it. "scatter" is ordered and already waited every
+  destination's previous reader (T3) before Pipe.layer, and the bias copy follows every chunk's K / V scatter, so that
+  event is the layer issue's completion frontier: EVERY transfer of the issue completes on it (Transfer.ev), never on
+  its chunk's sc1 alone. The readback compares the bias rows as well ("... the arena bias rows differ ..."). The fresh
+  staging / landing tensors live until their deferred copies ran (bias_staging_bytes reports them; not K6 staging).
+  AdversarialTransport: the payload read at issue holds the bias rows, and _land writes K, V and bias together before
+  the transfer counts as delivered.
 """
 from __future__ import annotations
 
@@ -69,7 +82,7 @@ class Transfer:
     demand: Set[str] = field(default_factory=set)  # repair 1 R2.3: every kind ("draft", "verify") that requested it
     phys: Any = None                            # M2 arena: the destination position (None per stream)
     pgen: Any = None                            # M2 arena: the position's generation of this binding
-    expect: Any = None                          # M2 S0: (K rows, V rows) the pack read at issue (readback)
+    expect: Any = None                          # M2 S0: (K rows, V rows[, bias rows (ABI v4)]) the pack read at issue
 
     def __post_init__(self):
         self.demand.add(self.kind)
@@ -83,13 +96,20 @@ class S0Transport:
 
     def __init__(self, core, be, host_k, host_v, slots_k, slots_v, bs: int, D: int, H: int, B: int, n_pos: int,
                  S_host: int, cap_groups: int = 4, ring: int = 2, dtype=torch.int64, arena_k=None, arena_v=None,
-                 P: int = None):
+                 P: int = None, host_c=None, arena_c=None):
         self.core, self.be = core, be
         self.host_k, self.host_v, self.slots_k, self.slots_v = host_k, host_v, slots_k, slots_v
         self.bs, self.D, self.H, self.B, self.n_pos, self.S_host = bs, D, H, B, n_pos, S_host
         if (arena_k is None) != (arena_v is None) or (arena_k is not None and P is None):
             raise ValueError("M2 arena: pass arena_k, arena_v and P together")
         self.arena_k, self.arena_v, self.P = arena_k, arena_v, P   # M2 arena rows per layer, (P * bs, D)
+        if (host_c is None) != (arena_c is None) or (arena_c is not None and arena_k is None):
+            raise ValueError("C1.1 ABI v4: pass host_c and arena_c together, in arena mode only")
+        self.host_c, self.arena_c = host_c, arena_c                 # C1.1: (B, S_host, H) and (P * bs,) per layer
+        self.carries_bias = arena_c is not None
+        self.bias_readbacks = 0                   # C1.1: readbacks that compared the bias rows too
+        self.bias_groups = 0                      # C1.1: groups whose bias rows joined their issue's frontier
+        self.bias_staging_bytes = 0               # C1.1: the largest per-issue bias staging + landing (not K6 staging)
         elem = torch.empty((), dtype=dtype).element_size()
         nb = core.slot_bytes(cap_groups, bs, D, elem)
         self.stage = torch.zeros((ring, nb), dtype=torch.uint8)
@@ -163,6 +183,8 @@ class S0Transport:
         for tr in order:                          # the expected payload, read now (the pack reads the host rows now)
             r0 = tr.block * bs
             tr.expect = (self.host_k[layer][tr.b, r0:r0 + bs, tr.h].clone(), self.host_v[layer][tr.b, r0:r0 + bs, tr.h].clone())
+            if self.arena_c is not None:          # C1.1: the bias rows the bias pack reads (the same host rows)
+                tr.expect += (self.host_c[layer][tr.b, r0:r0 + bs, tr.h].clone(),)
         recs = self.pipe.layer(desc, core.rows2d(self.host_k[layer]), core.rows2d(self.host_v[layer]), self.arena_k[layer],
                                self.arena_v[layer])
         n = 0
@@ -172,9 +194,32 @@ class S0Transport:
                 n += 1
         if n != len(order):
             raise OwnershipViolation("S0 pool descriptor: %d of %d groups of layer %d were scattered" % (n, len(order), layer))
+        if self.arena_c is not None:
+            self._issue_bias(layer, desc, order)  # C1.1 A5: the issue's completion frontier moves past the bias rows
         self.n_layers_issued += 1
         self.chunks += len(recs)
         self.pool_checks += len(order)
+
+    def _issue_bias(self, layer: int, desc, order: List[Transfer]) -> None:
+        """C1.1 A5 (module docstring): the bias rows of every group of this layer issue, after Pipe.layer: host pack at
+        issue, one H2D on "copy", one scatter on "scatter" to the descriptor's own destination rows, then the frontier
+        event on "scatter", which every transfer of the issue completes on."""
+        be = self.be
+        cdst = desc.dst_idx                       # C1.1 A5: each group's bias rows land where its K / V rows land
+        hc, ac = self.host_c[layer], self.arena_c[layer]
+        stage = torch.index_select(hc.reshape(-1), 0, desc.src_idx)   # the host pack, now (the K / V pack reads now)
+        land = torch.empty_like(stage)
+        with be.stream("copy"):
+            be.memcpy(land, stage, "copy")
+            h2d = be.event_rec("copy")
+        with be.stream("scatter"):
+            be.stream_wait("scatter", h2d)
+            be.index_copy(ac, cdst, land, "scatter")
+            ev = be.event_rec("scatter")
+        for tr in order:
+            tr.ev = ev
+        self.bias_groups += len(order)
+        self.bias_staging_bytes = max(self.bias_staging_bytes, 2 * stage.numel() * stage.element_size())
 
     def _check_pool_bounds(self, layer: int, desc) -> None:
         """Lower and upper bounds of every source row (< B * S_host * H) and destination row (< P * bs), the row counts,
@@ -190,6 +235,14 @@ class S0Transport:
             raise OwnershipViolation("S0 pool descriptor: dtype / shape mismatch at layer %d (host %s %s, arena %s %s %s %s, "
                                      "pipe %s; want arena (%d, %d))" % (layer, hk.dtype, hv.dtype, ak.dtype, av.dtype,
                                                                         tuple(ak.shape), tuple(av.shape), dt, self.P * bs, D))
+        if self.arena_c is not None:              # C1.1: the bias rows share the descriptor's source / destination rows
+            hc, ac = self.host_c[layer], self.arena_c[layer]
+            if tuple(hc.shape) != (self.B, self.S_host, self.H) or tuple(ac.shape) != (self.P * bs,) \
+                    or hc.dtype != ac.dtype or hc.numel() != hk.numel() // D:
+                raise OwnershipViolation("S0 pool descriptor: bias shape / dtype mismatch at layer %d (host %s %s, arena %s "
+                                         "%s; want host (%d, %d, %d), arena (%d,))"
+                                         % (layer, tuple(hc.shape), hc.dtype, tuple(ac.shape), ac.dtype, self.B,
+                                            self.S_host, self.H, self.P * bs))
         n_src, n_dst = hk.numel() // D, self.P * bs
         if desc.n:
             lo, hi = int(desc.src_idx.min()), int(desc.src_idx.max())
@@ -247,6 +300,16 @@ class S0Transport:
             raise OwnershipViolation("S0 pool descriptor: payload readback mismatch: transfer seq %d (uid %s, l %d b %d h %d "
                                      "block %d) at position %d pgen %s: the arena rows differ from the rows its pack read"
                                      % (tr.seq, tr.uid, tr.layer, tr.b, tr.h, tr.block, tr.phys, tr.pgen))
+        if self.arena_c is not None:              # C1.1: the bias rows, after the K / V rows
+            if len(tr.expect) != 3:
+                raise OwnershipViolation("S0 pool descriptor: payload readback of transfer seq %d without its bias rows"
+                                         % tr.seq)
+            if not torch.equal(self.arena_c[tr.layer][p0:p0 + self.bs], tr.expect[2]):
+                raise OwnershipViolation("S0 pool descriptor: payload readback mismatch: transfer seq %d (uid %s, l %d b %d "
+                                         "h %d block %d) at position %d pgen %s: the arena bias rows differ from the bias "
+                                         "rows its pack read" % (tr.seq, tr.uid, tr.layer, tr.b, tr.h, tr.block, tr.phys,
+                                                                 tr.pgen))
+            self.bias_readbacks += 1
         tr.expect = None
         self.readbacks += 1
 
@@ -265,14 +328,19 @@ class AdversarialTransport:
     MODES = ("delay", "force_only")
 
     def __init__(self, be, host_k, host_v, slots_k, slots_v, bs: int, seed: int, mode: str = "delay", max_delay: int = 6,
-                 burst_p: float = 0.3, burst_len: int = 4, arena_k=None, arena_v=None):
+                 burst_p: float = 0.3, burst_len: int = 4, arena_k=None, arena_v=None, host_c=None, arena_c=None):
         if mode not in self.MODES:
             raise ValueError(mode)
         if (arena_k is None) != (arena_v is None):
             raise ValueError("M2 arena: pass arena_k and arena_v together")
+        if (host_c is None) != (arena_c is None) or (arena_c is not None and arena_k is None):
+            raise ValueError("C1.1 ABI v4: pass host_c and arena_c together, in arena mode only")
         self.be = be
         self.host_k, self.host_v, self.slots_k, self.slots_v = host_k, host_v, slots_k, slots_v
         self.arena_k, self.arena_v = arena_k, arena_v               # M2 arena rows per layer, (P * bs, D)
+        self.host_c, self.arena_c = host_c, arena_c                 # C1.1: (B, S_host, H) and (P * bs,) per layer
+        self.carries_bias = arena_c is not None
+        self.bias_lands = 0                                         # C1.1: landings that wrote the bias rows too
         self.bs, self.mode, self.max_delay = bs, mode, int(max_delay)
         self.rng = random.Random(seed)
         self.burst_p, self.burst_len = burst_p, burst_len
@@ -289,6 +357,8 @@ class AdversarialTransport:
                 self.be.host_wait(tr.hist_ev)                    # T4
             r0, r1 = tr.block * self.bs, (tr.block + 1) * self.bs
             tr.payload = (self.host_k[layer][tr.b, r0:r1, tr.h].clone(), self.host_v[layer][tr.b, r0:r1, tr.h].clone())
+            if self.arena_c is not None:                         # C1.1: the bias rows, read with K / V at issue
+                tr.payload += (self.host_c[layer][tr.b, r0:r1, tr.h].clone(),)
             tr.release_tick = self.now + self.rng.randint(0, self.max_delay)
             self.pending.append(tr)
 
@@ -297,6 +367,9 @@ class AdversarialTransport:
             p0, p1 = tr.phys * self.bs, (tr.phys + 1) * self.bs
             self.arena_k[tr.layer][p0:p1].copy_(tr.payload[0])
             self.arena_v[tr.layer][p0:p1].copy_(tr.payload[1])
+            if self.arena_c is not None:                         # C1.1: K, V and bias land together, then delivered
+                self.arena_c[tr.layer][p0:p1].copy_(tr.payload[2])
+                self.bias_lands += 1
         else:
             s0, s1 = tr.slot * self.bs, (tr.slot + 1) * self.bs
             self.slots_k[tr.layer][tr.b, s0:s1, tr.h].copy_(tr.payload[0])
