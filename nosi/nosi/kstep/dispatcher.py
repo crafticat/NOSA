@@ -137,6 +137,33 @@ above; only the physical backing, the address of a read and WHICH event retires 
      validated with the strict identity check first (the generation it copied at execution, StaleReader) and then
      the bytes (ReadCorruption).
   K6 charges the allocated positions by state and the arena metadata at allocated capacity (ownership.MemoryAccountant).
+
+M2 B2 (Config.recent; default "eager" keeps every rule above unchanged; retroinfer-eval
+docs/superpowers/specs/2026-10-14-kstep-m2-integration-contract.md revisions 4-6, section 11, stages S7 / S8; Codex
+approval 2026-10-14 of the source implementation). Both need physical "arena" (either backing). The eager dicts (r.pub,
+r.draft_kv, c.ws pre, c.prov) stay the SEMANTIC reference that Row.kv is read from; the schedule, guards, cadence,
+retention, attention, rollback and recency are unchanged, and ring counters go to report()["ring"] only.
+  "ring"  recent exact, draft, pre and provisional KV also live in a pooled per-layer ring (ownership.RingPool) with
+     per-request maps r.rmap[l][h][kind] -> (entry, rgen). Producers (_produce): the admission's final partial prompt
+     block (EXACT), the draft row's phase 1 (DRAFT), the cohort's phase 1 (PRE); PRE -> PROV at the cohort's execution and
+     PROV -> EXACT at publication are re-tags of the same entry. _rsync drains (LIVE -> DRAINING) what is no longer
+     logically held: draft KV at supersession or rollback, PRE / PROV of decided or cancelled cohorts, EXACT at its
+     block's D2H unless a WAITING workspace reads it (rev6 H1; an executed read is covered by the compute gate), and
+     everything at request end. FREE only in RingPool.retire (host poll; backpressure). A bind without a FREE entry
+     retires, then host-waits the oldest DRAINING entry's events (ring_backpressure_waits, traced), then raises
+     CapacityRefusal when none is DRAINING. Checked mode checks LIVE <= R_log per stream and <= B*H*R_log per layer after
+     EVERY bind (admission included). Interface v3: Row.ring, read_ev also for ring-only calls, installed as the compute
+     gate of every entry read; deferred ring reads are validated by identity (rgen) and then bytes. Admission: one buffer
+     A_r per request (the prefill output; charged until its ready, compute and D2H events completed), complete prompt
+     blocks go by D2H from A_r, only the final partial block binds entries. _history gathers EXACT entries on "d2h"
+     after waiting their ready events and installs hist_ev as their D2H gate.
+  "eager_matched"  the parity reference: eager storage, plus marker events at the same producer points kept in the same
+     maps, and the same D2H stream waits on them (the dependency edges D1 / D2 of 11.4), the same snapshot and owner
+     record; no ring, no backpressure.
+  Both (checked mode): an ordered per-publication SNAPSHOT of the destination host rows on "d2h" right after hist_ev,
+  validated without a host wait (identity of every gathered ring entry, then the bytes); at the first poll at which a
+  publication's hist_ev is complete, whether the live rows still equal it is RECORDED (d2h_seen, a witness only); the
+  host-row owner record hown is checked before every pack (11.3 (3)). These are instrumentation, not charged in K6.
 """
 from __future__ import annotations
 
@@ -156,7 +183,8 @@ from .errors import (CapacityRefusal, ConfigError, KStepError, NoProgress, Owner
                      StaleReader)
 from .executor import DRAFT, VERIFY, Row, check_executor
 from .mutations import Mutations
-from .ownership import COUNTS, FREE, LRU, PO, RELEASING, VRES, Arena, Geometry, LayerPool, MemoryAccountant
+from .ownership import (COUNTS, FREE, LIVE, LRU, PO, R_DRAFT, R_EXACT, R_PRE, R_PROV, RELEASING, RING_KINDS, VRES, Arena,
+                        Geometry, LayerPool, MemoryAccountant, RingPool)
 from .transfer import Transfer
 
 POISON = -7777777                         # no toy KV value is negative
@@ -165,6 +193,7 @@ PENDING, RUNNING, DONE, ACCEPTED, CANCELLED = "pending", "running", "done", "acc
 CAPACITY_MODES = ("m1", "rev6")
 PHYSICAL_MODES = ("per_stream", "arena")
 ARENA_BACKINGS = ("conservative", "reduced")
+RECENT_MODES = ("eager", "ring", "eager_matched")
 
 
 @dataclass
@@ -188,6 +217,8 @@ class Config:
     d_share: Optional[int] = None          # rev6: per-head draft share d_h; default W = (K + 1) * S_max; < W is refused
     physical: str = "per_stream"           # "per_stream" (M1 backing) | "arena" (M2 slice A / B1; see the docstring)
     arena_backing: str = "conservative"    # arena mode: "conservative" P_l = B*H*(C + X) | "reduced" P_l = B*H*C + X (S6)
+    recent: str = "eager"                  # M2 B2: "eager" | "ring" | "eager_matched" (parity reference); see the docstring
+    ring_slack: Optional[int] = None       # M2 B2 ring: S_ring >= 1 (default B * H); Q_l = B * H * R_log + S_ring
 
 
 class Draft:
@@ -251,6 +282,8 @@ class Request:
         self.cur: Optional[Draft] = None
         self.credits: Optional[List[List[int]]] = None   # rev6 SC2: step credits [layer][head] of the current draft step
         self.pub_hold: Dict[Tuple[int, int, int], set] = {}  # rev6 H1: (l, h, pos) below the boundary -> holder keys
+        self.rmap: Optional[List[List[Dict[str, Dict]]]] = None  # M2 B2: [l][h][kind] -> key -> (entry, rgen) / marker
+        self.hist_pub: Dict[Tuple[int, int], int] = {}      # M2 B2: (l, block) -> publication sequence (hown)
 
     def u(self, i: int) -> int:
         return self.toks[self.E] if i == 0 else self.drafts[i - 1].d
@@ -299,6 +332,16 @@ class Dispatcher:
         if self.arena_mode and not getattr(executor, "reads_arena", False):
             raise ConfigError("M2 arena mode needs an executor with reads_arena = True (it reads the arena itself and "
                               "returns its read event; executor docstring)")
+        if cfg.recent not in RECENT_MODES:
+            raise ConfigError("recent must be one of %s (got %r)" % (RECENT_MODES, cfg.recent))
+        self.recent = cfg.recent
+        self.ring_mode = cfg.recent == "ring"
+        if self.recent != "eager" and not self.arena_mode:
+            raise ConfigError("M2 B2: recent %r needs physical 'arena' (got %r)" % (cfg.recent, cfg.physical))
+        if self.ring_mode and not getattr(executor, "reads_ring", False):
+            raise ConfigError("M2 B2 ring mode needs an executor with reads_ring = True (interface v3; executor docstring)")
+        if cfg.ring_slack is not None and (not self.ring_mode or int(cfg.ring_slack) < 1):
+            raise ConfigError("M2 B2: ring_slack %r needs recent 'ring' and ring_slack >= 1" % (cfg.ring_slack,))
         self.rev6 = cfg.capacity == "rev6"
         self.W = (self.K + 1) * self.rb                       # rev6 L3: positions through the next trigger, per stream
         self.X_d = cfg.X - cfg.R_ver                          # rev6 L1: the shared draft pool per layer
@@ -345,8 +388,34 @@ class Dispatcher:
             self.P, self.arenas, self.arena_k, self.arena_v = None, None, None, None
             self.slots_k = [z(n_pos * self.bs) for _ in range(self.L)]
             self.slots_v = [z(n_pos * self.bs) for _ in range(self.L)]
+        # M2 B2 (contract 11.2): R_log = (LAMBDA + bs - 1) EXACT + (LAMBDA + 1) DRAFT + (LAMBDA + 1) PRE or PROV per stream
+        self.R_log = (self.LAMBDA + self.bs - 1) + 2 * (self.LAMBDA + 1)
+        if self.ring_mode:
+            self.S_ring = cfg.B * self.H if cfg.ring_slack is None else int(cfg.ring_slack)
+            self.Q = cfg.B * self.H * self.R_log + self.S_ring
+            self.rings = [RingPool(l, self.Q, checked=self._checked()) for l in range(self.L)]
+            zr = lambda: torch.full((self.Q, self.D), POISON, dtype=torch.int64)
+            self.ring_k = [zr() for _ in range(self.L)]
+            self.ring_v = [zr() for _ in range(self.L)]
+            executor.attach_ring(be, self.ring_k, self.ring_v, [rp.rgen_t for rp in self.rings], self._register_ring_read)
+        else:
+            self.S_ring = self.Q = None
+            self.rings, self.ring_k, self.ring_v = [], None, None
+        self.rstat = defaultdict(int)              # M2 B2: ring / D2H-check counters (report()["ring"]; never self.stats)
+        self.adm: List[Dict] = []                  # M2 B2 ring: the admission buffers A_r that are not FREE
+        self.adm_log: List[Dict] = []              # M2 B2: (step, uid, b, P0, LIVE at the admission start) per admission
+        self.adm_peak = 0                          # M2 B2 ring: the EXACT peak of the held A_r items (at allocations)
+        self.d2h_checks: List[Dict] = []           # M2 B2 checked mode: publications whose snapshot is not validated yet
+        self.d2h_seen: List[Dict] = []             # M2 B2: per publication, the live rows at its first complete poll
+        self.hown: Dict[Tuple[int, int, int], Tuple] = {}   # M2 B2: (l, b, block) -> (uid, publication) of the host rows
+        self.pub_seq = 0
+        self.ring_waits: List[Dict] = []           # M2 B2 ring: every backpressure host wait (trace)
+        self._ring_reads: List[Tuple[int, int, int]] = []   # the (layer, entry, rgen) read by the current call's rows
+        self._ring_exp: Dict[Tuple, Tuple] = {}    # (id(row), head, position) -> the eager (k, v) of the current call
+        self._n_ring_val = 0
         self.tp = make_transport(self)
-        self.acct = MemoryAccountant(cfg.geom, getattr(self.tp, "staging_bytes", 0), arena=self.arena_mode)
+        self.acct = MemoryAccountant(cfg.geom, getattr(self.tp, "staging_bytes", 0), arena=self.arena_mode,
+                                     ring=self.ring_mode)
         self.queue: List[Tuple] = []
         self.slot_req: List[Optional[Request]] = [None] * cfg.B
         self.reqs: Dict[Any, Request] = {}
@@ -413,7 +482,10 @@ class Dispatcher:
                         r.pub[l][h][pos] = kv[pos][l][h]
                         r.comp[l][h].append(kv[pos][l][h][0])
             r.dchain = [[c.copy() for c in row] for row in r.comp]
-            self._history(r)
+            if self.recent == "eager":
+                self._history(r)
+            else:
+                self._admit_recent(r, kv)                              # M2 B2: A_r, its D2H, the partial-block entries
             self.trace[uid] = dict(prompt=list(prompt), N=N, b=b, epochs=[dict(epoch=0, E=r.E, u0=r.toks[r.E], drafts=[], cohorts=[], outcome=None)])
             self.stats["requests_admitted"] += 1
             if r.generated() >= r.N:
@@ -437,6 +509,12 @@ class Dispatcher:
         if r.uid in self.dres:                                         # rev6 L4: returned once its slots are all FREE
             self.dres[r.uid] = False
             self.dres_b[r.uid] = r.b
+        if r.rmap is not None:                                         # M2 B2: every LIVE entry -> DRAINING (owner kept);
+            for l in range(self.L):                                    # pending D2H keeps its gate; A_r is unaffected
+                for h in range(self.H):
+                    for kind in RING_KINDS:
+                        for key in list(r.rmap[l][h][kind]):
+                            self._rdrop(l, r, h, kind, key, "end")
         self.results[r.uid] = r.toks[r.P0:r.P0 + r.N]
         self.trace[r.uid]["final"] = list(r.toks)
         self.slot_req[r.b] = None
@@ -777,6 +855,9 @@ class Dispatcher:
                 del r.pub_hold[x]
                 del r.pub[ll][h][pos]
                 self.stats["rev6_h1_released_positions"] += 1
+                if r.rmap is not None and pos in r.rmap[ll][h][R_EXACT]:   # M2 B2: never expected (a waiting holder
+                    self.rstat["ring_h1_late_drains"] += 1             # keeps its key until its own decision)
+                    self._rdrop(ll, r, h, R_EXACT, pos, "h1")
 
     def _key_live(self, key, l: int) -> bool:
         """Does the cohort `key` still hold its layer-l draft references (undecided and not released at layer l)?"""
@@ -873,7 +954,11 @@ class Dispatcher:
                 self.stats["slots_freed"] += n
                 self.stats["progress"] += 1
                 self.stats["traffic"] += 1                              # N3 P1: one per layer pool that freed ANY slot
+        if self.ring_mode:                                              # M2 B2: ring retirement beside poll_releases
+            self._ring_retire()                                         # (non-blocking; never a logical counter)
         self._validate()
+        if self.recent != "eager":
+            self._d2h_poll()                                            # M2 B2 11.3 (1): snapshots, non-blocking
         keep = []
         for key, l in self.pending_release:
             fr, lr = self.key_readers.get((key, l), (None, None))
@@ -917,10 +1002,20 @@ class Dispatcher:
                                       "block %d uid %s call %d)" % (info["phys"], info["pgen"], int(pg[0]), info["layer"],
                                                                     info["b"], info["h"], info["slot"], info["block"],
                                                                     info["uid"], info["call"]))
+                rg = info.get("rg")
+                if rg is not None and int(rg[0]) != info["rgen"]:          # M2 B2 11.3: ring identity first, then bytes
+                    raise StaleReader("stale reader: ring entry %d (layer %d) rgen captured %d, at read %d (%s %s of uid %s "
+                                      "b %d h %d position %d call %d)" % (info["entry"], info["layer"], info["rgen"],
+                                                                         int(rg[0]), info["kind"], info["which"],
+                                                                         info["uid"], info["b"], info["h"], info["pos"],
+                                                                         info["call"]))
                 if not torch.equal(ws, exp):
-                    shown = info if pg is None else {k: v for k, v in info.items() if k != "pg"}
+                    shown = info if pg is None and rg is None else {k: v for k, v in info.items() if k not in ("pg", "rg")}
                     raise ReadCorruption("deferred read of %s saw other bytes than the call computed from" % (shown,))
-                self.stats["reads_validated"] += 1
+                if info.get("ring"):
+                    self.rstat["ring_reads_validated"] += 1                # M2 B2: a ring counter, not a logical one
+                else:
+                    self.stats["reads_validated"] += 1
             else:
                 keep.append((ev, ws, exp, info))
         self.validators = keep
@@ -946,10 +1041,28 @@ class Dispatcher:
         self.validators.append((None, ws, exp, info))
         self._n_new_val += 1
 
+    def _register_ring_read(self, l: int, row, h: int, pos: int, e: int, g: int, kind: str, which: str, ws, pg) -> None:
+        """The executor's attach_ring callback (interface v3): ONE deferred ring read of this call (the K or the V row of
+        entry e for (row, head, position)), validated when the call's read event completes: the identity copy pg against
+        rgen g, then the bytes ws against the EAGER value the row attends (Row.kv's reference, not a ring clone: the
+        entry's payload write may not have executed at call time)."""
+        exp = self._ring_exp.get((id(row), h, pos))
+        if exp is None or pg is None or which not in ("k", "v"):
+            raise KStepError("M2 B2: the executor registered a ring read of position %d (head %d, %s, identity copy %s) that "
+                             "row (uid %s pos %d) does not attend" % (pos, h, which, pg is not None, row.uid, row.pos))
+        val = torch.tensor(exp[0] if which == "k" else exp[1], dtype=torch.int64)
+        info = dict(ring=True, layer=l, b=row.b, h=h, pos=pos, entry=e, rgen=g, kind=kind, which=which, uid=row.uid,
+                    call=self.call_id, rg=pg)
+        self.validators.append((None, ws, val, info))
+        self._n_new_val += 1
+        self._n_ring_val += 1
+        self.rstat["ring_reads_registered"] += 1
+
     def _install_reader(self, l: int, read_slots, ev) -> None:
         """The call's reader event becomes the last reader of every slot read (arena mode: and of its position) and the
-        (key, l) reader event of every key that read a slot (K4, R1)."""
-        if not read_slots:
+        (key, l) reader event of every key that read a slot (K4, R1). M2 B2 ring mode: it is also the compute gate of
+        every ring entry the call read, also when no historical slot was read."""
+        if not read_slots and not self._ring_reads:
             return
         for l_, b_, h_, idx in read_slots:
             s = self.pools[l_].stream(b_, h_).slots[idx]
@@ -963,6 +1076,8 @@ class Dispatcher:
             if kr[0] is None:
                 kr[0] = ev
             kr[1] = ev
+        for ll, e, g in self._ring_reads:                              # M2 B2 11.3: the compute gate (one ordered stream)
+            self.rings[ll].note_compute(e, g, ev)
 
     def _arm_validators(self, ev) -> None:
         """The deferred-read validators registered in this call are checked once `ev` completed."""
@@ -1028,6 +1143,407 @@ class Dispatcher:
                            pgen_t=sum(ar.pgen_t.numel() * ar.pgen_t.element_size() for ar in self.arenas)))
         return out
 
+    # ---------------------------------------------------------------- M2 B2 (Config.recent "ring" / "eager_matched")
+    def _produce(self, l: int, r: Request, h: int, kind: str, key, prov: Tuple, k, v, where: str) -> None:
+        """Contract 11.2 / 11.4 D1: ONE producer at its producer point. ring: the bind transaction (_ring_take with
+        backpressure, RingPool.bind), then in checked mode the per-bind LIVE bound (_ring_live_check), the map insert,
+        and the payload write enqueued on "compute" after a stream wait on the previous occupancy's D2H event (the
+        second safeguard; complete by the FREE rule) with ready_ev after it. eager_matched: a marker event on "compute"
+        at the same point, kept in the same map (no entry, no payload, no wait). A second producer of a key is refused."""
+        m = r.rmap[l][h][kind]
+        if key in m:
+            raise OwnershipViolation("ring binding: duplicate %s key %s of uid %s (layer %d b %d h %d, %s)"
+                                     % (kind, key, r.uid, l, r.b, h, where))
+        if not self.ring_mode:
+            with self.be.stream("compute"):
+                m[key] = self.be.event_rec("compute")
+            return
+        ring = self.rings[l]
+        e = self._ring_take(l, r, where)
+        g, prev_d2h = ring.bind(e, kind, (r.uid, r.b, h), prov, where)
+        if self._checked():
+            self._ring_live_check(l, r, h, e, kind, key, where)
+        m[key] = (e, g)
+        sk = k if torch.is_tensor(k) else torch.tensor(k, dtype=torch.int64)
+        sv = v if torch.is_tensor(v) else torch.tensor(v, dtype=torch.int64)
+        with self.be.stream("compute"):
+            if prev_d2h is not None:
+                self.be.stream_wait("compute", prev_d2h)
+            self.be.memcpy(self.ring_k[l][e], sk, "compute")
+            self.be.memcpy(self.ring_v[l][e], sv, "compute")
+            ring.set_ready(e, g, self.be.event_rec("compute"))
+
+    def _ring_take(self, l: int, r: Request, where: str) -> int:
+        """Contract 11.4 backpressure, bounded: the lowest FREE entry; else (1) retirement; (2) a host wait on every
+        incomplete event of the OLDEST event-held (DRAINING) entry, counted in ring_backpressure_waits and traced, then
+        retirement again (each round frees that entry, so at most Q rounds); (3) CapacityRefusal when no entry is
+        event-held. Runs only in a producer, before any Row.ring of the call is built."""
+        ring = self.rings[l]
+        e = ring.lowest_free()
+        while e is None:
+            self.rstat["ring_freed"] += ring.retire()
+            e = ring.lowest_free()
+            if e is not None:
+                break
+            o = ring.oldest_held()
+            if o is None:
+                raise CapacityRefusal("ring: layer %d full of logically held entries (LIVE %d of Q_l %d; bind for uid %s)"
+                                      % (l, ring.n_live, ring.Q, r.uid))
+            evs = ring.gates(o)
+            self.ring_waits.append(dict(call=self.call_id, step=self.t, layer=l, entry=o, rgen=ring.rgen[o],
+                                        kind=ring.kind[o], owner=ring.owner[o], events=len(evs), uid=r.uid, where=where))
+            self.rstat["ring_backpressure_waits"] += 1
+            for ev in evs:
+                self.be.host_wait(ev)
+        return e
+
+    def _ring_live_check(self, l: int, r: Request, h: int, e: int, kind: str, key, where: str) -> None:
+        """Checked mode, after EVERY bind (admission included; contract 11.4, revision 6 NB7): LIVE <= R_log on the bound
+        entry's stream, THEN LIVE <= B * H * R_log on its layer (both active; the stream bound is the earlier one)."""
+        ring = self.rings[l]
+        n_s = ring.live_by.get((r.b, h), 0)
+        if n_s > self.R_log:
+            raise OwnershipViolation("ring: LIVE bound: stream (l %d b %d h %d) holds %d LIVE entries > R_log %d after the "
+                                     "bind of entry %d (%s uid %s key %s, %s)" % (l, r.b, h, n_s, self.R_log, e, kind, r.uid,
+                                                                                  key, where))
+        lim = self.cfg.B * self.H * self.R_log
+        if ring.n_live > lim:
+            raise OwnershipViolation("ring: LIVE bound: layer %d holds %d LIVE entries > B*H*R_log %d after the bind of "
+                                     "entry %d (%s uid %s key %s, %s)" % (l, ring.n_live, lim, e, kind, r.uid, key, where))
+
+    def _rdrop(self, l: int, r: Request, h: int, kind: str, key, why: str) -> None:
+        """The logical release of one map entry: removed from the map; ring: LIVE -> DRAINING (FREE only at retirement)."""
+        v = r.rmap[l][h][kind].pop(key)
+        if self.ring_mode:
+            self.rings[l].drain(v[0], v[1], why)
+
+    def _rmove(self, l: int, r: Request, h: int, src: str, dst: str, skey, dkey, prov: Tuple) -> None:
+        """PRE -> PROV (execution) or PROV -> EXACT (publication): the same entry (ring: RingPool.retag) or marker."""
+        m = r.rmap[l][h]
+        if skey not in m[src] or dkey in m[dst]:
+            raise OwnershipViolation("ring binding: re-tag %s %s -> %s %s of uid %s (layer %d b %d h %d): source mapped %s, "
+                                     "destination mapped %s" % (src, skey, dst, dkey, r.uid, l, r.b, h, skey in m[src],
+                                                                dkey in m[dst]))
+        v = m[src].pop(skey)
+        m[dst][dkey] = v
+        if self.ring_mode:
+            self.rings[l].retag(v[0], v[1], dst, prov)
+
+    def _ring_ws_held(self, r: Request, l: int, h: int, j: int) -> bool:
+        """Contract 11.4: does a WAITING workspace of r still read block j of (l, h) from the recent region (rev6 H1, the
+        frozen boundary <= j and j selected at head h)? An executed read is covered by the entry's compute gate."""
+        if not self.rev6 or self.mut.rev6_unfrozen_boundary:
+            return False
+        for c in r.cohorts:
+            w = c.ws.get(l)
+            if w is not None and w["hist"] <= j and any(j in row[h] for row in w["sel"]):
+                return True
+        return False
+
+    def _rsync(self, r: Request, why: str) -> None:
+        """Drop every map entry of r that is no longer logically LIVE (contract 11.4): EXACT below the boundary without a
+        waiting workspace ("h1"); DRAFT not in the epoch's draft KV; PRE without its cohort's workspace; PROV without its
+        undecided cohort's provisional KV (`why`: exec / superseded / rollback)."""
+        live = {c.key: c for c in r.cohorts if c.state in (PENDING, RUNNING, DONE)}
+        bnd = r.hist_blocks * self.bs
+        for l in range(self.L):
+            for h in range(self.H):
+                m = r.rmap[l][h]
+                for pos in [p for p in m[R_EXACT] if p < bnd and not self._ring_ws_held(r, l, h, p // self.bs)]:
+                    self._rdrop(l, r, h, R_EXACT, pos, "h1")
+                for pos in [p for p in m[R_DRAFT] if p not in r.draft_kv[l][h]]:
+                    self._rdrop(l, r, h, R_DRAFT, pos, why)
+                for key in [k for k in m[R_PRE] if k[0] not in live or l not in live[k[0]].ws]:
+                    self._rdrop(l, r, h, R_PRE, key, why)
+                for key in [k for k in m[R_PROV] if k[0] not in live or l not in live[k[0]].prov
+                            or k[1] not in live[k[0]].prov[l][h]]:
+                    self._rdrop(l, r, h, R_PROV, key, why)
+
+    def _ring_ref(self, l: int, r: Request, h: int, qp: int, src, kvv) -> Tuple:
+        """Row.ring item of one non-slot position: the LIVE entry of its map (kind, key) with the binding rgen, and the
+        eager (k, v) the row attends (the validator's reference)."""
+        kind, key = src
+        v = r.rmap[l][h][kind].get(key)
+        ring = self.rings[l]
+        if v is None or ring.state[v[0]] != LIVE or ring.rgen[v[0]] != v[1] or ring.kind[v[0]] != kind:
+            raise OwnershipViolation("ring read: no LIVE %s entry for key %s of uid %s (layer %d b %d h %d, call %d): map %s, "
+                                     "entry %s" % (kind, key, r.uid, l, r.b, h, self.call_id, v,
+                                                   None if v is None else (ring.state[v[0]], ring.rgen[v[0]], ring.kind[v[0]])))
+        return (qp, v[0], v[1], kind, kvv)
+
+    def _ring_row(self, l: int, row: Row, rg: List[List[Tuple]]) -> None:
+        """Interface v3: Row.ring from the row's items; the eager values for the validators; the (layer, entry, rgen)
+        reads whose compute gate _install_reader sets; coverage counters (ring report only)."""
+        r = self.reqs[row.uid]
+        bnd = r.hist_blocks * self.bs
+        row.ring = []
+        for h, items in enumerate(rg):
+            lst = []
+            for qp, e, g, kind, kvv in items:
+                self._ring_exp[(id(row), h, qp)] = kvv
+                self._ring_reads.append((l, e, g))
+                lst.append((qp, e, g, kind))
+                self.rstat["ring_reads_%s_%s" % (row.kind, kind)] += 1
+                if row.kind == VERIFY and kind == R_EXACT and qp < bnd:
+                    self.rstat["ring_reads_h1_retained_exact"] += 1
+            row.ring.append(lst)
+        if row.kind == VERIFY and not any(row.readable):
+            self.rstat["ring_all_recent_verifier_rows"] += 1
+
+    def _ring_retire(self) -> None:
+        """Host poll: DRAINING -> FREE for entries whose events completed; an admission buffer is FREE once its ready,
+        compute and D2H events completed (non-blocking; never a logical counter)."""
+        for ring in self.rings:
+            self.rstat["ring_freed"] += ring.retire()
+        keep = []
+        for A in self.adm:
+            if all(ev_done(A[k]) for k in ("ready", "cev", "dev")):
+                self.rstat["admission_freed"] += 1
+            else:
+                keep.append(A)
+        self.adm = keep
+
+    def _ring_scan(self) -> None:
+        """Checked mode, the end of every joint call: every RingPool record (RingPool.check); every map entry of an active
+        request names a LIVE entry with its rgen, kind and owner (uid, b, h), 1:1; the LIVE entries are exactly the
+        mapped ones; LIVE <= R_log per stream and <= B * H * R_log per layer."""
+        lim = self.cfg.B * self.H * self.R_log
+        for l, ring in enumerate(self.rings):
+            ring.check()
+            seen: Dict[int, Tuple] = {}
+            for r in self.active():
+                for h in range(self.H):
+                    for kind in RING_KINDS:
+                        for key, (e, g) in r.rmap[l][h][kind].items():
+                            if e in seen or ring.state[e] != LIVE or ring.rgen[e] != g or ring.kind[e] != kind \
+                                    or ring.owner[e] != (r.uid, r.b, h):
+                                raise OwnershipViolation(
+                                    "ring binding: map %s key %s of uid %s (layer %d h %d) names entry %d rgen %d; the entry "
+                                    "is %s %s rgen %d owner %s (also mapped by %s)" % (kind, key, r.uid, l, h, e, g,
+                                                                                       ring.state[e], ring.kind[e],
+                                                                                       ring.rgen[e], ring.owner[e],
+                                                                                       seen.get(e)))
+                            seen[e] = (r.uid, h, kind, key)
+            if len(seen) != ring.n_live:
+                raise OwnershipViolation("ring binding: layer %d has %d LIVE entries and %d map entries"
+                                         % (l, ring.n_live, len(seen)))
+            worst = max(ring.live_by.values()) if ring.live_by else 0
+            if worst > self.R_log or ring.n_live > lim:
+                raise OwnershipViolation("ring: LIVE bound: layer %d holds %d LIVE entries (stream maximum %d) > B*H*R_log %d "
+                                         "or R_log %d at the end of call %d" % (l, ring.n_live, worst, lim, self.R_log,
+                                                                                self.call_id))
+
+    def _admit_recent(self, r: Request, kv) -> None:
+        """Contract 11.2 admission (revision 5), ring and eager_matched. The executor's ONE prefill output is the request's
+        admission buffer A_r (ring: allocated rows, written on "compute"; eager_matched: a marker), then
+          1. every COMPLETE prompt block goes by D2H from A_r to the host rows (_history with adm: after a stream wait on
+             A_r's ready event; snapshot and owner record);
+          2. only the final partial block (at most bs - 1 positions per stream) binds EXACT entries, in (layer, head,
+             position) order, each copied from A_r on "compute";
+          3. A_r's gates: a compute event after step 2 and a D2H event after step 1, both recorded also when a step is
+             empty. ring: A_r is held (charged in K6) until its ready, compute and D2H events completed (_ring_retire).
+        The prompt is not truncated or split; the executor interface is unchanged."""
+        bs, L, H, D = self.bs, self.L, self.H, self.D
+        n0 = r.n                                                       # P0 - 1 prompt positions
+        r.rmap = [[{kind: {} for kind in RING_KINDS} for _ in range(H)] for _ in range(L)]
+        ring = self.ring_mode
+        rec = dict(step=self.t, uid=r.uid, b=r.b, P0=r.P0, n=n0, items=n0 * H * L,
+                   live_start=[rp.n_live for rp in self.rings] if ring else None)
+        self.adm_log.append(rec)
+        A = dict(uid=r.uid, b=r.b, n=n0, step=self.t, k=None, v=None, ready=None, cev=None, dev=None)
+        with self.be.stream("compute"):                                # 0. the prefill output and its ready event (D1)
+            if ring:
+                A["k"] = [torch.full((n0, H, D), POISON, dtype=torch.int64) for _ in range(L)]
+                A["v"] = [torch.full((n0, H, D), POISON, dtype=torch.int64) for _ in range(L)]
+                for l in range(L):
+                    sk = torch.tensor([[kv[pos][l][h][0] for h in range(H)] for pos in range(n0)],
+                                      dtype=torch.int64).reshape(n0, H, D)
+                    sv = torch.tensor([[kv[pos][l][h][1] for h in range(H)] for pos in range(n0)],
+                                      dtype=torch.int64).reshape(n0, H, D)
+                    self.be.memcpy(A["k"][l], sk, "compute")
+                    self.be.memcpy(A["v"][l], sv, "compute")
+            A["ready"] = self.be.event_rec("compute")
+        blocks0 = r.hist_blocks
+        self._history(r, adm=A)                                        # 1. complete prompt blocks: D2H from A_r
+        self.rstat["admission_blocks"] += r.hist_blocks - blocks0
+        r0 = (n0 // bs) * bs                                           # 2. the final partial block: EXACT entries
+        where = "admission step %d" % self.t
+        for l in range(L):
+            for h in range(H):
+                for pos in range(r0, n0):
+                    src = (A["k"][l][pos, h], A["v"][l][pos, h]) if ring else (None, None)
+                    self._produce(l, r, h, R_EXACT, pos, (r.epoch, None, pos), src[0], src[1], where)
+                    self.rstat["admission_partial_binds"] += 1
+        with self.be.stream("compute"):                                # 3. A_r's two gates
+            A["cev"] = self.be.event_rec("compute")
+        with self.be.stream("d2h"):
+            A["dev"] = self.be.event_rec("d2h")
+        rec["exact_after"] = [[len(r.rmap[l][h][R_EXACT]) for h in range(H)] for l in range(L)]
+        if ring:
+            self.adm.append(A)
+            self.adm_peak = max(self.adm_peak, sum(a["n"] * H * L for a in self.adm))
+
+    def _d2h_block(self, r: Request, l: int, j: int, adm: Optional[Dict]) -> None:
+        """Contract 11.3: the D2H of block j of layer l (ring / eager_matched). Source: A_r for an admission block (after
+        a stream wait on its ready event), else the ring's EXACT entries (after a stream wait on each entry's ready event;
+        each entry's rgen copied at execution; hist_ev installed as its D2H gate), else (eager_matched) a fresh tensor of
+        the eager values after the same waits on the markers. Then hist_ev; in checked mode the ordered snapshot of the
+        destination rows on the same stream before any later "d2h" enqueue, and its record; the owner record hown."""
+        bs, b, H = self.bs, r.b, self.H
+        r0, r1 = j * bs, (j + 1) * bs
+        ek = torch.tensor([[r.pub[l][h][pos][0] for h in range(H)] for pos in range(r0, r1)], dtype=torch.int64)
+        evv = torch.tensor([[r.pub[l][h][pos][1] for h in range(H)] for pos in range(r0, r1)], dtype=torch.int64)
+        self.pub_seq += 1
+        pub = self.pub_seq
+        src = rg = rg_exp = None
+        ring = self.rings[l] if self.ring_mode else None
+        if adm is None and ring is not None:
+            src = []
+            for pos in range(r0, r1):
+                row = []
+                for h in range(H):
+                    v = r.rmap[l][h][R_EXACT].get(pos)
+                    if v is None or ring.state[v[0]] != LIVE or ring.rgen[v[0]] != v[1]:
+                        raise OwnershipViolation("ring D2H: no LIVE EXACT entry for position %d of uid %s (layer %d h %d, "
+                                                 "block %d): %s" % (pos, r.uid, l, h, j, v))
+                    row.append(v)
+                src.append(row)
+        with self.be.stream("d2h"):
+            if adm is not None:
+                self.be.stream_wait("d2h", adm["ready"])
+                if ring is not None:
+                    self.be.memcpy(self.host_k[l][b, r0:r1], adm["k"][l][r0:r1], "d2h")
+                    self.be.memcpy(self.host_v[l][b, r0:r1], adm["v"][l][r0:r1], "d2h")
+                else:
+                    self.be.memcpy(self.host_k[l][b, r0:r1], ek.clone(), "d2h")
+                    self.be.memcpy(self.host_v[l][b, r0:r1], evv.clone(), "d2h")
+            elif ring is not None:
+                for row in src:
+                    for e, g in row:
+                        self.be.stream_wait("d2h", ring.ready[e])
+                rg = torch.full((bs, H), -1, dtype=torch.int64)
+                for i, row in enumerate(src):
+                    for h, (e, g) in enumerate(row):
+                        self.be.memcpy(self.host_k[l][b, r0 + i, h], self.ring_k[l][e], "d2h")
+                        self.be.memcpy(self.host_v[l][b, r0 + i, h], self.ring_v[l][e], "d2h")
+                        self.be.memcpy(rg[i, h:h + 1], ring.rgen_t[e:e + 1], "d2h")
+                rg_exp = [[g for e, g in row] for row in src]
+            else:
+                for pos in range(r0, r1):
+                    for h in range(H):
+                        self.be.stream_wait("d2h", r.rmap[l][h][R_EXACT][pos])
+                self.be.memcpy(self.host_k[l][b, r0:r1], ek.clone(), "d2h")
+                self.be.memcpy(self.host_v[l][b, r0:r1], evv.clone(), "d2h")
+            hist_ev = self.be.event_rec("d2h")
+            r.hist_ev[(l, j)] = hist_ev
+            snap = None
+            if self._checked():
+                sk, sv = torch.empty_like(ek), torch.empty_like(evv)
+                self.be.memcpy(sk, self.host_k[l][b, r0:r1], "d2h")
+                self.be.memcpy(sv, self.host_v[l][b, r0:r1], "d2h")
+                snap = (sk, sv, self.be.event_rec("d2h"))
+        if src is not None:
+            for row in src:
+                for e, g in row:
+                    ring.note_d2h(e, g, hist_ev)
+            self.rstat["d2h_ring_publications"] += 1
+        self.hown[(l, b, j)] = (r.uid, pub)
+        r.hist_pub[(l, j)] = pub
+        self.rstat["d2h_publications"] += 1
+        if snap is not None:
+            self.d2h_checks.append(dict(uid=r.uid, l=l, b=b, j=j, pub=pub, hist_ev=hist_ev, snap_ev=snap[2], sk=snap[0],
+                                        sv=snap[1], ek=ek, ev=evv, rg=rg, rg_exp=rg_exp,
+                                        src=None if src is None else [[e for e, g in row] for row in src],
+                                        call=self.call_id, step=self.t, seen=None))
+            self.rstat["d2h_snapshots"] += 1
+
+    def _d2h_poll(self, final: bool = False) -> None:
+        """Contract 11.3 (1), checked mode, non-blocking (and once more after the final synchronize): at the first poll at
+        which a publication's hist_ev is complete, whether the LIVE host rows still equal its eager exact KV is RECORDED
+        (d2h_seen: a later writer may already have overwritten them; a witness only, it decides nothing); the snapshot is
+        validated once its own event completed: the identity of every gathered ring entry first, then the bytes."""
+        keep = []
+        for rec in self.d2h_checks:
+            if rec["seen"] is None and (final or ev_done(rec["hist_ev"])):
+                r0 = rec["j"] * self.bs
+                live_k = self.host_k[rec["l"]][rec["b"], r0:r0 + self.bs]
+                live_v = self.host_v[rec["l"]][rec["b"], r0:r0 + self.bs]
+                same = torch.equal(live_k, rec["ek"]) and torch.equal(live_v, rec["ev"])
+                rec["seen"] = "finish" if final else "poll"
+                req = self.reqs.get(rec["uid"])
+                self.d2h_seen.append(dict(uid=rec["uid"], l=rec["l"], b=rec["b"], j=rec["j"], pub=rec["pub"],
+                                          call=self.call_id, step=self.t, phase=rec["seen"], live_equal=same,
+                                          ended=req is None or req.done, owner=self.hown.get((rec["l"], rec["b"], rec["j"]))))
+            if final or ev_done(rec["snap_ev"]):
+                self._d2h_check(rec, rec["sk"], rec["sv"])
+            else:
+                keep.append(rec)
+        self.d2h_checks = keep
+
+    def _d2h_check(self, rec: Dict, k, v) -> None:
+        if rec["rg"] is not None:
+            for i, row in enumerate(rec["rg_exp"]):
+                for h, g in enumerate(row):
+                    if int(rec["rg"][i, h]) != g:
+                        raise StaleReader("stale reader: D2H uid %s l %d b %d block %d entry %d (head %d position %d) rgen "
+                                          "captured %d, at read %d" % (rec["uid"], rec["l"], rec["b"], rec["j"],
+                                                                       rec["src"][i][h], h, rec["j"] * self.bs + i, g,
+                                                                       int(rec["rg"][i, h])))
+        self._d2h_bytes(rec, k, v)
+        self.rstat["d2h_snapshots_validated"] += 1
+
+    def _d2h_bytes(self, rec: Dict, k, v) -> None:
+        if not (torch.equal(k, rec["ek"]) and torch.equal(v, rec["ev"])):
+            raise ReadCorruption("D2H readback mismatch: uid %s l %d b %d block %d pub %d"
+                                 % (rec["uid"], rec["l"], rec["b"], rec["j"], rec["pub"]))
+
+    def _ring_counts(self) -> Dict[str, int]:
+        """K6 ring-mode counts (ownership.RING_COUNTS, contract 11.4)."""
+        c = dict(ring_live_exact=0, ring_live_draft=0, ring_live_prov=0, ring_idle=0)
+        for ring in self.rings:
+            rc = ring.counts()
+            c["ring_live_exact"] += rc[R_EXACT]
+            c["ring_live_draft"] += rc[R_DRAFT]
+            c["ring_live_prov"] += rc[R_PRE] + rc[R_PROV]
+            c["ring_idle"] += rc["idle"]
+        c["ring_entries"] = sum(ring.Q for ring in self.rings)
+        c["ring_map_entries"] = sum(len(r.rmap[l][h][kind]) for r in self.active() if r.rmap is not None
+                                    for l in range(self.L) for h in range(self.H) for kind in RING_KINDS)
+        c["admission_pos"] = sum(A["n"] * self.H * self.L for A in self.adm)
+        c["admission_records"] = len(self.adm)
+        return c
+
+    def ring_report(self) -> Dict[str, Any]:
+        """M2 B2 report (never a logical counter): the mode; D2H publications, snapshots and their validations, owner
+        checks, first-complete-poll observations (live rows overwritten at a poll); ring mode: Q_l, R_log, S_ring, the
+        LIVE bounds, per-layer binds and peaks (EXACT: they change only at binds), backpressure waits with their trace,
+        ring reads validated, retirements, admissions (A_r) and the EXACT admission_kv peak (it rises only at an
+        allocation), coverage counters, and cpu_tensor_bytes (numel * element_size; not a K6 or GPU measurement)."""
+        s = self.rstat
+        out = dict(mode=self.recent, d2h_publications=s["d2h_publications"], d2h_snapshots=s["d2h_snapshots"],
+                   d2h_snapshots_validated=s["d2h_snapshots_validated"], hown_checks=s["hown_checks"],
+                   d2h_seen=len(self.d2h_seen),
+                   d2h_live_overwritten_at_poll=sum(1 for x in self.d2h_seen if x["phase"] == "poll" and not x["live_equal"]),
+                   admissions=len(self.adm_log))
+        if self.ring_mode:
+            u = self.acct.u
+            out.update(Q=self.Q, R_log=self.R_log, S_ring=self.S_ring, live_bound=self.cfg.B * self.H * self.R_log,
+                       binds=[rp.binds for rp in self.rings], peak_live=[rp.peak_live for rp in self.rings],
+                       peak_stream=[rp.peak_stream for rp in self.rings], live=[rp.n_live for rp in self.rings],
+                       draining=[rp.n_draining for rp in self.rings],
+                       ring_backpressure_waits=s["ring_backpressure_waits"], waits=[dict(w) for w in self.ring_waits],
+                       ring_reads_registered=s["ring_reads_registered"], ring_reads_validated=s["ring_reads_validated"],
+                       ring_freed=s["ring_freed"], admission_freed=s["admission_freed"], admission_held=len(self.adm),
+                       admission_kv_peak_items=self.adm_peak, admission_kv_peak_bytes=self.adm_peak * u["pos_kv"],
+                       coverage={k: v for k, v in sorted(s.items()) if k.startswith(("ring_reads_", "ring_all_", "ring_only",
+                                                                                     "admission_", "d2h_ring"))},
+                       h1_late_drains=s["ring_h1_late_drains"],
+                       cpu_tensor_bytes=dict(ring_k=sum(t.numel() * t.element_size() for t in self.ring_k),
+                                             ring_v=sum(t.numel() * t.element_size() for t in self.ring_v),
+                                             rgen_t=sum(rp.rgen_t.numel() * rp.rgen_t.element_size()
+                                                        for rp in self.rings)))
+        return out
+
     def _force_for_layer(self, l: int) -> None:
         """Verifier-only pass (D4): wait (host) for the in-flight blocks the waiting cohorts at layer l need; after a
         failed verifier allocation at this layer, also for every in-flight transfer and every releasing slot of the
@@ -1091,6 +1607,11 @@ class Dispatcher:
         for i, pos in enumerate(c.positions):
             sel.append([self.ex.select(l, h, pre[i][0][h], chain[h].cks, pos // self.bs) for h in range(self.H)])
         c.ws[l] = dict(pre=pre, sel=sel, chain=chain, hist=r.hist_blocks)   # rev6 H1: the boundary of this workspace
+        if self.recent != "eager":                                     # M2 B2: the cohort's PRE KV (producer D1)
+            for i, pos in enumerate(c.positions):
+                for h in range(self.H):
+                    self._produce(l, r, h, R_PRE, (c.key, pos), (c.epoch, c.key, pos), pre[i][1][h], pre[i][2][h],
+                                  "call %d step %d" % (self.call_id, self.t))
 
     def _need(self, r: Request, sel_rows, l: int, hist: Optional[int] = None):
         """Per head: (ready, inflight, missing) historical blocks of a set of rows' selections."""
@@ -1110,10 +1631,13 @@ class Dispatcher:
         cid = self.call_id
         self._read_keys = set()
         self._n_new_val = 0
+        self._ring_reads, self._ring_exp, self._n_ring_val = [], {}, 0
         self.call_step[cid] = self.t
         if self.arena_mode:
             for ar in self.arenas:
                 ar.checked = self._checked()                           # M2: the arena check points follow checked mode
+            for rp in self.rings:
+                rp.checked = self._checked()
         if self.progress is not None:
             self.progress(self, cid)
         self._poll()
@@ -1189,6 +1713,9 @@ class Dispatcher:
             for h in range(self.H):
                 r.draft_kv[l][h][dr.pos] = (k[h], v[h])
                 r.dchain[l][h].append(k[h])
+                if self.recent != "eager":                             # M2 B2: the draft row's DRAFT KV (producer D1)
+                    self._produce(l, r, h, R_DRAFT, dr.pos, (r.epoch, None, dr.pos), k[h], v[h],
+                                  "call %d step %d" % (cid, self.t))
                 st = self.pools[l].stream(r.b, h)
                 a = []
                 for j in sel[h]:
@@ -1227,7 +1754,15 @@ class Dispatcher:
             for i, pos in enumerate(c.positions):
                 kv = []
                 addr = [] if self.arena_mode else None                 # M2: per head [(block, phys, pgen)]
+                rg = [] if self.ring_mode else None                    # M2 B2: per head [(pos, entry, rgen, kind, kv)]
                 for h in range(self.H):
+                    def rsrc(qp, c=c):                                 # M2 B2: which map holds the KV the row reads
+                        if qp < r.n:
+                            return R_EXACT, qp
+                        if qp in own:
+                            return R_PRE, (c.key, qp)
+                        return R_PROV, (self._prov_cohort(r, c, l, qp).key, qp)
+
                     def recent(qp, h=h, i=i, c=c):
                         if qp < r.n:
                             if qp not in r.pub[l][h]:
@@ -1243,12 +1778,19 @@ class Dispatcher:
                             return (pre[ii][1][h], pre[ii][2][h])
                         return self._prov(r, c, l, h, qp)
                     ad = [] if addr is not None else None
-                    kv.append(self._row_kv(r, l, h, pos, sel[i][h], None, recent, read_slots, c.key, hv, ad))
+                    ro = [] if rg is not None else None
+                    kv.append(self._row_kv(r, l, h, pos, sel[i][h], None, recent, read_slots, c.key, hv, ad,
+                                           rsrc if ro is not None else None, ro))
                     if addr is not None:
                         addr.append(sorted(ad))
-                jrows.append(Row(r.uid, r.b, pos, VERIFY, c.key, sel[i], pos,
-                                 [[j for j in sel[i][hh] if j < hv] for hh in range(self.H)],
-                                 c.hidden[i], pre[i][0], kv, addr))
+                    if rg is not None:
+                        rg.append(ro)
+                row = Row(r.uid, r.b, pos, VERIFY, c.key, sel[i], pos,
+                          [[j for j in sel[i][hh] if j < hv] for hh in range(self.H)],
+                          c.hidden[i], pre[i][0], kv, addr)
+                jrows.append(row)
+                if rg is not None:
+                    self._ring_row(l, row, rg)
                 owners.append(("v", r, c, i))
         for r, dr in rows:
             if id(dr) not in draft_pre:
@@ -1256,18 +1798,28 @@ class Dispatcher:
             q, k, v = draft_pre[id(dr)]
             kv = []
             addr = [] if self.arena_mode else None                     # M2: per head [(block, phys, pgen)]
+            rg = [] if self.ring_mode else None                        # M2 B2: per head [(pos, entry, rgen, kind, kv)]
             for h in range(self.H):
                 def recent(qp, h=h):
                     if qp < r.n:
                         return r.pub[l][h][qp]
                     return r.draft_kv[l][h][qp]
+
+                def rsrc(qp):                                          # M2 B2: exact below n, the epoch's draft KV above
+                    return (R_EXACT, qp) if qp < r.n else (R_DRAFT, qp)
                 ad = [] if addr is not None else None
+                ro = [] if rg is not None else None
                 kv.append(self._row_kv(r, l, h, dr.pos, dr.sel[l][h], dr.avail[l][h], recent, read_slots,
-                                       (r.uid, r.epoch, dr.m), None, ad))
+                                       (r.uid, r.epoch, dr.m), None, ad, rsrc if ro is not None else None, ro))
                 if addr is not None:
                     addr.append(sorted(ad))
-            jrows.append(Row(r.uid, r.b, dr.pos, DRAFT, (r.uid, r.epoch, dr.m), dr.sel[l], dr.pos, dr.avail[l], dr.hidden, q, kv,
-                             addr))
+                if rg is not None:
+                    rg.append(ro)
+            row = Row(r.uid, r.b, dr.pos, DRAFT, (r.uid, r.epoch, dr.m), dr.sel[l], dr.pos, dr.avail[l], dr.hidden, q, kv,
+                      addr)
+            jrows.append(row)
+            if rg is not None:
+                self._ring_row(l, row, rg)
             owners.append(("d", r, dr, None))
         if read_slots and not self.arena_mode:                         # F4: the eager executor's host order (per stream)
             with self.be.stream("compute"):
@@ -1277,9 +1829,14 @@ class Dispatcher:
         self._draft_recency(l, rows, draft_pre, cid)
         if self.arena_mode:                                            # M2 B1 (contract 3.1): the executor's own event
             outs, read_ev = self.ex.joint_post(l, jrows) if jrows else ([], None)
-            if (read_ev is None) != (not read_slots) or (self._n_new_val and read_ev is None):
-                raise KStepError("M2 B1: the executor returned read event %r for %d slot reads (%d registered reads)"
-                                 % (read_ev, len(read_slots), self._n_new_val))
+            if (read_ev is None) != (not read_slots and not self._ring_reads) or (self._n_new_val and read_ev is None):
+                raise KStepError("M2 B1: the executor returned read event %r for %d slot reads and %d ring reads (%d "
+                                 "registered reads)" % (read_ev, len(read_slots), len(self._ring_reads), self._n_new_val))
+            if self._n_ring_val != 2 * len(self._ring_reads):          # M2 B2: the K and the V row of every entry read
+                raise KStepError("M2 B2: the executor registered %d ring reads for %d ring entries of the rows"
+                                 % (self._n_ring_val, len(self._ring_reads)))
+            if self._ring_reads and not read_slots:
+                self.rstat["ring_only_calls"] += 1                     # M2 B2: read_ev with no historical slot read
             self._install_reader(l, read_slots, read_ev)               # IMMEDIATELY: no poll or release in between
             self._arm_validators(read_ev)
         else:
@@ -1295,6 +1852,10 @@ class Dispatcher:
         for r, c in exec_cohorts:
             pre = c.ws[l]["pre"]
             c.prov[l] = [{pos: (pre[i][1][h], pre[i][2][h]) for i, pos in enumerate(c.positions)} for h in range(self.H)]
+            if self.recent != "eager":                                 # M2 B2: PRE -> PROV, the same entries (11.2)
+                for pos in c.positions:
+                    for h in range(self.H):
+                        self._rmove(l, r, h, R_PRE, R_PROV, (c.key, pos), (c.key, pos), (c.epoch, c.key, pos))
             c.chain[l] = c.ws[l]["chain"]
             c.vsel[l] = [[list(x) for x in row] for row in c.ws[l]["sel"]]
             c.vhist[l] = c.ws[l]["hist"]
@@ -1318,6 +1879,9 @@ class Dispatcher:
                 c.p = {c.a + i: self.ex.dist(c.hidden[i]) for i in range(len(c.positions))}
                 c.hidden = []                                          # K6: the rows' hidden states are no longer held
                 c.state = DONE
+        if self.recent != "eager":                                     # M2 B2: a retained EXACT entry whose last WAITING
+            for r in list({id(r): r for r, _ in exec_cohorts}.values()):   # holder executed now drains (its read is
+                self._rsync(r, "exec")                                 # already the compute gate, installed above)
         # D1: per stream SUM and UNION of the selected blocks of the executing rows
         per = defaultdict(lambda: [0, set(), 0, set(), 0])
         for row in jrows:
@@ -1352,6 +1916,8 @@ class Dispatcher:
             if self.arena_mode:
                 for ll, pool in enumerate(self.pools):                 # M2 2.3: the full scan of every layer (G = 0: a
                     pool.check_arena(self._credits_at(ll), 0)          # grant is issued in the call that grants it)
+            if self.ring_mode:
+                self._ring_scan()                                      # M2 B2: records, maps 1:1, rgen_t, LIVE bounds
         if self.observer is not None:
             self.observer(self, "call", cid, l)
 
@@ -1366,6 +1932,17 @@ class Dispatcher:
                     raise KStepError("D3a: %r reads position %d of %r at layer %d before that cohort executed it" % (c, qp, cc, l))
                 return cc.prov[l][h][qp]
         raise KStepError("verifier %r: position %d (n=%d) has no published, provisional or own KV" % (c, qp, r.n))
+
+    def _prov_cohort(self, r: Request, c: Cohort, l: int, qp: int) -> Cohort:
+        """M2 B2: the predecessor cohort whose provisional KV _prov returns for position qp (the same search)."""
+        for cc in r.cohorts:
+            if cc is c:
+                break
+            if cc.state in (ACCEPTED, CANCELLED):
+                continue
+            if qp in cc.positions:
+                return cc
+        raise KStepError("verifier %r: position %d (n=%d) has no provisional KV" % (c, qp, r.n))
 
     def _draft_recency(self, l: int, rows, draft_pre, cid: int) -> None:
         """R2.1 (a), (c) under the ORDERING CONTRACT O1 (repair 1c; Codex decision 2026-10-12): the DRAFT-ONLY recency of
@@ -1447,12 +2024,14 @@ class Dispatcher:
         self.pending_release.append((key, l))
 
     def _row_kv(self, r: Request, l: int, h: int, pos: int, sel: List[int], readable: Optional[List[int]], recent,
-                read_slots: List, key, hist: Optional[int] = None, addr: Optional[List] = None) -> List[Tuple]:
+                read_slots: List, key, hist: Optional[int] = None, addr: Optional[List] = None, rsrc=None,
+                rout: Optional[List] = None) -> List[Tuple]:
         """The (k, v) list one row attends at one head, in increasing position order: the selected blocks it may read,
         then its causal recent region. Slot reads are eager (the joint call computes from them) AND enqueued as deferred
         copies on the "compute" stream (validated later). M2 arena mode: the eager read goes through the binding (the
         rows of position phys), (block, phys, pgen) is appended to `addr`, and the executor enqueues the deferred reads
-        itself (contract 3.1)."""
+        itself (contract 3.1). M2 B2 ring mode: for every non-slot position, rsrc(qp) names the map that holds its KV and
+        (pos, entry, rgen, kind, eager kv) is appended to `rout` in position order (contract 11.3, Row.ring)."""
         bs = self.bs
         st = self.pools[l].stream(r.b, h)
         out = []
@@ -1494,9 +2073,15 @@ class Dispatcher:
                 for qp in range(j * bs, (j + 1) * bs):
                     k, v = recent(qp)
                     out.append((qp, k, v))
+                    if rout is not None:
+                        rout.append(self._ring_ref(l, r, h, qp, rsrc(qp), (k, v)))
         for qp in range(tail0, pos + 1):
             k, v = recent(qp)
             out.append((qp, k, v))
+            if rout is not None:
+                rout.append(self._ring_ref(l, r, h, qp, rsrc(qp), (k, v)))
+        if rout is not None:
+            rout.sort(key=lambda x: x[0])
         out.sort(key=lambda x: x[0])
         return [(k, v) for _, k, v in out]
 
@@ -1616,6 +2201,14 @@ class Dispatcher:
                     ids.add((r.b, h, j))
                     self._vfetch_count(1)
         if batch:
+            if self.recent != "eager" and self._checked():            # M2 B2 11.3 (3): the pack lifetime invariant,
+                for tr in batch:                                       # checked before the pack reads the host rows
+                    want = (tr.uid, self.reqs[tr.uid].hist_pub.get((l, tr.block)))
+                    got = self.hown.get((l, tr.b, tr.block))
+                    if got != want:
+                        raise OwnershipViolation("host rows: pack of transfer seq %d (uid %s, l %d, b %d, block %d) finds "
+                                                 "rows owned by %s" % (tr.seq, tr.uid, l, tr.b, tr.block, got))
+                    self.rstat["hown_checks"] += 1
             self.tp.issue(l, batch)
 
     def _verifier_eviction_candidate(self, st) -> Optional[int]:
@@ -1789,6 +2382,8 @@ class Dispatcher:
             r.cohorts.remove(c)                                        # an accepted cohort is no longer held (K6)
             self._free_cohort(c)
             self._vfetch_drop_cohort(c.key, "decided")                 # N3 P2 metadata only
+            if self.recent != "eager":
+                self._rsync(r, "superseded")                           # M2 B2: draft KV of committed positions drains
             return
         i_star = o.i_star
         upto_pub = c.b if self.mut.publish_beyond_prefix else i_star
@@ -1857,6 +2452,8 @@ class Dispatcher:
             r.dchain = [[x.copy() for x in row] for row in r.comp]
         r.drafting_done = r.generated() >= r.N
         self.trace[r.uid]["epochs"].append(dict(epoch=r.epoch, E=r.E, u0=r.toks[r.E], drafts=[], cohorts=[], outcome=None))
+        if self.recent != "eager":
+            self._rsync(r, "rollback")                                 # M2 B2: the old epoch's DRAFT, cancelled PRE / PROV
 
     def _cancel_requester(self, key) -> None:
         """T3: a cancelled requester never frees an in-flight destination (its arrival is kept or dropped later)."""
@@ -1889,6 +2486,8 @@ class Dispatcher:
                     r.pub[l][h][pos] = kv
                     r.comp[l][h].append(kv[0])
                     self.published[(r.uid, pos, l, h)] = kv
+                    if self.recent != "eager":                         # M2 B2: PROV -> EXACT, the same entry (11.2)
+                        self._rmove(l, r, h, R_PROV, R_EXACT, (c.key, pos), pos, (r.epoch, None, pos))
         r.n = c.E + upto_commit
         self._history(r)
 
@@ -1899,19 +2498,29 @@ class Dispatcher:
                 for qp in [x for x in r.draft_kv[l][h] if x < r.n]:
                     del r.draft_kv[l][h][qp]
 
-    def _history(self, r: Request) -> None:
+    def _history(self, r: Request, adm: Optional[Dict] = None) -> None:
         """A5: every committed block that became complete is written to the host (D2H on the "d2h" stream, one event per
-        layer and block) and becomes fetchable; its positions leave the recent region."""
+        layer and block) and becomes fetchable; its positions leave the recent region. M2 B2 (recent "ring" /
+        "eager_matched"): _d2h_block writes the block (admission blocks from `adm`, the request's A_r); afterwards a ring
+        EXACT entry of the block drains unless a WAITING workspace still reads it (_ring_ws_held)."""
         bs = self.bs
         while (r.hist_blocks + 1) * bs <= r.n:
             j = r.hist_blocks
             for l in range(self.L):
-                kb = torch.tensor([[r.pub[l][h][pos][0] for h in range(self.H)] for pos in range(j * bs, (j + 1) * bs)], dtype=torch.int64)
-                vb = torch.tensor([[r.pub[l][h][pos][1] for h in range(self.H)] for pos in range(j * bs, (j + 1) * bs)], dtype=torch.int64)
-                with self.be.stream("d2h"):
-                    self.be.memcpy(self.host_k[l][r.b, j * bs:(j + 1) * bs], kb, "d2h")
-                    self.be.memcpy(self.host_v[l][r.b, j * bs:(j + 1) * bs], vb, "d2h")
-                    r.hist_ev[(l, j)] = self.be.event_rec("d2h")
+                if self.recent == "eager":
+                    kb = torch.tensor([[r.pub[l][h][pos][0] for h in range(self.H)] for pos in range(j * bs, (j + 1) * bs)], dtype=torch.int64)
+                    vb = torch.tensor([[r.pub[l][h][pos][1] for h in range(self.H)] for pos in range(j * bs, (j + 1) * bs)], dtype=torch.int64)
+                    with self.be.stream("d2h"):
+                        self.be.memcpy(self.host_k[l][r.b, j * bs:(j + 1) * bs], kb, "d2h")
+                        self.be.memcpy(self.host_v[l][r.b, j * bs:(j + 1) * bs], vb, "d2h")
+                        r.hist_ev[(l, j)] = self.be.event_rec("d2h")
+                else:
+                    self._d2h_block(r, l, j, adm)                      # M2 B2 11.3: ring / matched D2H, snapshot, hown
+                if self.recent != "eager" and adm is None:
+                    for h in range(self.H):
+                        if not self._ring_ws_held(r, l, h, j):
+                            for pos in range(j * bs, (j + 1) * bs):
+                                self._rdrop(l, r, h, R_EXACT, pos, "history")
                 for h in range(self.H):
                     hold = set()
                     if self.rev6 and not self.mut.rev6_release_recent_at_history:
@@ -1990,12 +2599,21 @@ class Dispatcher:
         counts = {k: n[k] for k in COUNTS}
         if self.arena_mode:
             counts.update(self._arena_counts())                        # M2 2.6: arena metadata at allocated capacity
+        if self.ring_mode:
+            counts.update(self._ring_counts())                         # M2 B2 11.4: the ring and every held A_r
         self.acct.sample(counts)
 
     def finish(self, order: Optional[Tuple[str, ...]] = None) -> None:
-        """Drain every stream (deferred reads, scatters, history writes) and validate every deferred read."""
+        """Drain every stream (deferred reads, scatters, history writes) and validate every deferred read. M2 B2: then
+        every remaining D2H snapshot; every publication's snapshot must have been validated exactly once."""
         self.be.synchronize(order or self.cfg.drain_order)
         self._validate(all_=True)
+        if self.recent != "eager":
+            self._d2h_poll(final=True)
+            if self.rstat["d2h_snapshots"] != self.rstat["d2h_snapshots_validated"] or self.d2h_checks:
+                raise OwnershipViolation("D2H readback missing: %d snapshots, %d validated, %d pending"
+                                         % (self.rstat["d2h_snapshots"], self.rstat["d2h_snapshots_validated"],
+                                            len(self.d2h_checks)))
 
     def report(self) -> Dict[str, Any]:
         """The run's accounting, labelled by mode (A2: GREEDY results are reported separately from SAMPLED results).
@@ -2015,6 +2633,8 @@ class Dispatcher:
                    progress=self.progress_report())
         if self.arena_mode:
             out["physical"] = self.arena_report()                      # M2: addresses / allocation differ by construction
+        if self.recent != "eager":
+            out["ring"] = self.ring_report()                           # M2 B2: ring / D2H-check counters only
         return out
 
     def capacity_report(self) -> Dict[str, Any]:

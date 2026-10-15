@@ -75,8 +75,8 @@ dispatcher's ring tensors, row e = entry e). Per entry e:
   FREE    only in RingPool.retire (the dispatcher's host poll, beside poll_releases, and the bind's backpressure step):
           a DRAINING entry whose ready, compute and D2H events are all complete (non-blocking ev_done).
   CHECKS  named "ring binding: ..." (bind_check before any change; reader installs and re-tags name the binding rgen).
-  CHECKPOINT 1 (2026-10-14 steering): these records and the ring-mode K6 accountant only. At this pin the dispatcher
-          does not create or use them (no Config.recent yet); its integration is checkpoint 2.
+  CHECKPOINTS (2026-10-14 steering): checkpoint 1 added these records and the ring-mode K6 accountant; checkpoint 2
+          (the dispatcher's Config.recent "ring") creates and uses them.
 """
 from __future__ import annotations
 

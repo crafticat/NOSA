@@ -36,8 +36,8 @@ without it). Row.kv stays the eager input of the row (read through the address m
                           independent streams would need a joined completion frontier: not part of this protocol.
 
 M2 RING PROTOCOL, interface v3 (Config.recent = "ring"; contract revisions 4-5, section 11.3), versioned by the attribute
-reads_ring = True (requires reads_arena; ring mode refuses an executor without it). Checkpoint 1 (2026-10-14) adds this
-interface (Row.ring, the attach_ring requirement of check_executor) only; the dispatcher's use of it is checkpoint 2.
+reads_ring = True (requires reads_arena; ring mode refuses an executor without it). Checkpoint 1 (2026-10-14) added this
+interface (Row.ring, the attach_ring requirement of check_executor); checkpoint 2 is the dispatcher's use of it.
 In addition to the arena protocol:
   attach_ring(be, rk, rv, rgen, register_ring)
                           once, at dispatcher construction: per layer the ring rows rk[l], rv[l] ((Q_l, D): row e = entry
