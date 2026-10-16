@@ -116,25 +116,43 @@ model only.
    run yet (the CpuBackend runs "join" only when forced). A reset path must also check those holders (the pools' and
    the dispatcher's own references).
 
-8. QUIESCENT RESET (milestone 3; addendum I8). QuiescentReset(disp, backend_reset) is that reset path. It uses only the
-   lead's three Dispatcher hooks (HOOK-L3: quiesce_state, event_holders, detach_completed_events), this module's
-   reset_pending / before_reset, and track B's store API (drained_all, clear_caches). reset():
+8. QUIESCENT RESET (milestone 3, addendum I8; milestone 4, addendum I10). QuiescentReset(disp, backend_reset) is that
+   reset path. It uses only the lead's Dispatcher hooks (HOOK-L3: quiesce_state, event_holders,
+   detach_completed_events; HOOK-L4 puts the executor's reset contract into the last two), the executor module's
+   reset_contract_of, this module's reset_pending / before_reset, and track B's store API (drained_all,
+   clear_caches). reset():
    (1) the FULL check, with no mutation (pending()): every quiesce_state() value 0 (an OPEN dict: every key, whatever
        its name); every event_holders() event complete (ev_done); the frontier table (incomplete components, installed
        handles, cached joins) and every registered hold provider of every live incarnation at 0; store.drained_all()
-       when Dispatcher.store exists. Anything outstanding: OwnershipViolation "quiescent reset refused: <items>" that
-       names EVERY outstanding owner class, one item each, in a fixed order: "state:<key>=<n>" (quiesce_state keys,
-       sorted), "holder:<owner class>=<pending references>" (sorted), "frontier:components|handles|joins=<n>",
-       "provider:<name>(<uid>,<inc>)=<n>" (incarnations and names sorted), "store:not_drained=1". Nothing is changed.
+       when Dispatcher.store exists; the executor declares the I10 contract. Anything outstanding: OwnershipViolation
+       "quiescent reset refused: <items>" that names EVERY outstanding owner class, one item each, in a fixed order:
+       "state:<key>=<n>" (quiesce_state keys, sorted), "holder:<owner class>=<pending references>" (sorted; a declared
+       executor's classes "executor:..." too), "frontier:components|handles|joins=<n>", "provider:<name>(<uid>,<inc>)=
+       <n>" (incarnations and names sorted), "store:not_drained=1", "executor:no_reset_contract=1". Nothing is changed.
        The check never polls: a store record that completed but was not polled yet is refused, and so are registered
        validators, D2H checks and admission buffers (the lead's quiesce_state counts them; their completion runs byte
        checks that may raise). The caller drains them first: Dispatcher.finish, then one host poll.
-   (2) Only then, in this order: detach_completed_events() (the hook runs the passive host poll, which also runs this
-       module's poll, then sets every remaining reference to a complete event to None); before_reset() (the identity
-       caches; it checks again); store.clear_caches(); backend_reset() (the point where pooled events may be
-       re-recorded); then the reset count.
+   (2) Only then, in this order: detach_completed_events() (HOOK-L4: a declared executor's detach_completed() first,
+       which changes nothing when it refuses; then the passive host poll, which also runs this module's poll; then
+       every remaining reference to a complete event is set to None); the post-check: event_holders() is empty, else
+       OwnershipViolation "quiescent reset: the detach left <n> event references: [<first 6 (class, location)>];
+       backend_reset did not run (I10)" (only a hook or executor defect leaves one; the counts do not change);
+       before_reset() (the identity caches; it checks again); store.clear_caches(); backend_reset() (the point where
+       pooled events may be re-recorded); then the counts.
    The crucial case: the table can be drained (its components completed and pruned) while a JOINED output that it
    installed stays referenced outside it (a slot's last reader) and incomplete. Only the holder enumeration sees it.
+   THE EXECUTOR (I10). An executor can keep OPERATIONAL events between calls (an event it will wait on, hand on or test
+   later, for example the last write of a private output buffer). The dispatcher cannot see them. So a reset needs the
+   executor's declaration: reset_contract = "I10" IN ITS OWN CLASS BODY (executor.reset_contract_of reads
+   type(ex).__dict__; neither inheritance nor attribute forwarding declares it), with reset_holders() (read-only: every
+   operational reference, owner classes "executor:...") and detach_completed() (refuses with no mutation while one is
+   pending; else sets them to None). An executor without the declaration is refused by the item
+   "executor:no_reset_contract=1", even when nothing else is outstanding. Construction refuses a declaration without
+   callable reset_holders / detach_completed (ConfigError). Instrumentation history that an executor keeps (logs,
+   counters, eager copies that no later decision reads) is not listed and not detached; its docstring names it.
+   BOUNDARY: the coordinator relies on the declared list. An operational event that reset_holders() leaves out is not
+   seen (the omitted-provider hazard); every executor class is audited on its own. No claim for an arbitrary backend or
+   an undeclared executor.
    The no-reset path is unchanged: no coordinator exists unless a caller constructs one. No live-reset scheduling, no
    uid-reuse redesign (Dispatcher.submit still refuses a uid that it knows).
 """
@@ -783,28 +801,43 @@ class CompletionOwnership:
                     peak_bytes=self.peak_entries * u, frontier=self.table.report(), finished=self.cohorts.report())
 
 
-# ------------------------------------------------------------------------------------------------- milestone 3: I8
+# -------------------------------------------------------------------------------------------- milestone 3-4: I8, I10
 class QuiescentReset:
-    """Section 8 of the module docstring (addendum I8): the ONE reset path that may let pooled events be re-recorded.
+    """Section 8 of the module docstring (I8, I10): the ONE reset path that may let pooled events be re-recorded.
     disp: the Dispatcher (it must have the HOOK-L3 methods quiesce_state, event_holders and detach_completed_events);
     backend_reset: the callable that resets the backend (for example CudaBackend.reset); it runs last. pending() is
-    READ-ONLY; reset() refuses with no mutation, else detaches, clears the identity caches, clears the store's caches
-    and resets the backend, in that order. Counts: resets (passed resets), detached (references the hook set to None)."""
+    READ-ONLY; reset() refuses with no mutation, else detaches (the executor's references first), checks that no
+    event reference is left, clears the identity caches, clears the store's caches and resets the backend, in that
+    order. Counts: resets (passed resets), detached (references the hook set to None, the executor's included)."""
 
     HOOKS = ("quiesce_state", "event_holders", "detach_completed_events")
     TABLE_PARTS = ("components", "handles", "joins")
+    EXECUTOR_METHODS = ("reset_holders", "detach_completed")      # I10
 
     def __init__(self, disp, backend_reset: Callable[[], Any]):
+        # I10 (HOOK-L4): the ONE reader of an executor's declaration. Imported here, so that the milestone 1-2 parts of
+        # this module do not need it.
+        from .executor import RESET_CONTRACT, reset_contract_of
         missing = [h for h in self.HOOKS if not callable(getattr(disp, h, None))]
-        faults = []
+        faults, tags = [], []
         if missing:
             faults.append("the dispatcher lacks the HOOK-L3 methods %s" % (missing,))
         if not callable(backend_reset):
             faults.append("backend_reset is not callable (%s)" % (type(backend_reset).__name__,))
+        if faults:
+            tags.append("I8")
+        ex = getattr(disp, "ex", None)
+        if reset_contract_of(ex) == RESET_CONTRACT:
+            bad = [m for m in self.EXECUTOR_METHODS if not callable(getattr(ex, m, None))]
+            if bad:
+                faults.append("the executor %s declares reset_contract %r without callable %s"
+                              % (type(ex).__name__, RESET_CONTRACT, bad))
+                tags.append("I10")
         if faults:                                              # names only the actual fault(s)
-            raise ConfigError("quiescent reset: %s (I8)" % "; ".join(faults))
+            raise ConfigError("quiescent reset: %s (%s)" % ("; ".join(faults), ", ".join(tags)))
         self.d = disp
         self.backend_reset = backend_reset
+        self.contract_of, self.contract = reset_contract_of, RESET_CONTRACT
         self.resets = 0
         self.detached = 0
 
@@ -812,9 +845,12 @@ class QuiescentReset:
         """READ-ONLY (no poll, no wait, no change): every outstanding item, by owner class. Returns state (the nonzero
         quiesce_state counts), holders (owner class -> incomplete references), first (owner class -> the location of its
         first incomplete reference, for diagnosis), frontier (the nonzero table parts), providers ({(uid, inc): {name:
-        count}}, nonzero only), store (True when a store exists and is not drained) and items (the refusal text items,
-        in the fixed order of section 8; empty when the reset may proceed)."""
+        count}}, nonzero only), store (True when a store exists and is not drained), contract (the executor's own
+        declaration, executor.reset_contract_of; None when undeclared) and items (the refusal text items, in the fixed
+        order of section 8; empty when the reset may proceed). A declared executor's operational events come through
+        event_holders() (HOOK-L4), so its owner classes are holder items like any other."""
         d = self.d
+        contract = self.contract_of(getattr(d, "ex", None))           # I10: the own class body only
         state: Dict[str, int] = {}
         for k, v in d.quiesce_state().items():
             if isinstance(v, bool) or not isinstance(v, int) or v < 0:
@@ -841,18 +877,25 @@ class QuiescentReset:
                  + ["frontier:%s=%d" % (k, table[k]) for k in self.TABLE_PARTS if k in table]
                  + ["provider:%s(%s,%s)=%d" % (name, inc_[0], inc_[1], n)
                     for inc_ in sorted(providers, key=repr) for name, n in sorted(providers[inc_].items())]
-                 + (["store:not_drained=1"] if store_out else []))
+                 + (["store:not_drained=1"] if store_out else [])
+                 + (["executor:no_reset_contract=1"] if contract != self.contract else []))
         return dict(state=state, holders=holders, first=first, frontier=table, providers=providers, store=store_out,
-                    items=items)
+                    contract=contract, items=items)
 
     def reset(self) -> None:
-        """I8: the full check (pending), then detach_completed_events, before_reset (the frontier's identity caches),
-        store.clear_caches, backend_reset and the count. A refusal names every outstanding owner class and changes
-        nothing."""
+        """I8 / I10: the full check (pending), then detach_completed_events (the executor's own detach first, HOOK-L4),
+        the post-check (no event_holders() entry left), before_reset (the frontier's identity caches),
+        store.clear_caches, backend_reset and the counts. A refusal names every outstanding owner class and changes
+        nothing. A failed post-check (a hook or executor defect: a reference that the detach reported or should have
+        set to None is still listed) raises before before_reset and backend_reset, and changes no count."""
         p = self.pending()
         if p["items"]:
             raise OwnershipViolation("quiescent reset refused: %s" % "; ".join(p["items"]))
         n = self.d.detach_completed_events()
+        left = [(cls, loc) for cls, loc, _ in self.d.event_holders()]
+        if left:                                                       # I10: complete references detach BEFORE reuse
+            raise OwnershipViolation("quiescent reset: the detach left %d event references: %s; backend_reset did not "
+                                     "run (I10)" % (len(left), left[:6]))
         fo = getattr(self.d, "frontier", None)
         if fo is not None:
             fo.before_reset()
