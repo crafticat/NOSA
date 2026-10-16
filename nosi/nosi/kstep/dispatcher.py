@@ -606,7 +606,10 @@ class Dispatcher:
         for b in range(self.cfg.B):
             if self.slot_req[b] is not None or not self.queue:
                 continue
-            uid, prompt, N = self.queue.pop(0)
+            prep = None
+            if self.store is not None:                                 # HOOK-L5 (I9.1): the opt-in executor's prefill
+                prep = self.store.prepare_admit(self, self.queue[0][0], self.queue[0][1])   # result is obtained and
+            uid, prompt, N = self.queue.pop(0)                         # checked BEFORE any mutation (None: opt-out)
             r = Request(uid, b, prompt, N, self.L, self.H, self.stride, self.ex.compress, self.chain_kernel)
             r.inc = self.inc_at_submit.pop(uid, 0)                     # HOOK-C: I3 (0: not queued through submit)
             if self.frontier is not None:                              # HOOK-C2: the incarnation becomes live, the
@@ -617,7 +620,7 @@ class Dispatcher:
             for l in range(self.L):
                 for h in range(self.H):
                     self.pools[l].stream(b, h).owner = uid
-            kv = self.ex.prefill(prompt[:-1])
+            kv = prep.kv if prep is not None else self.ex.prefill(prompt[:-1])   # HOOK-L5: ONE prefill either way
             for pos in range(len(prompt) - 1):
                 for l in range(self.L):
                     for h in range(self.H):
@@ -627,7 +630,7 @@ class Dispatcher:
             if self.recent == "eager":
                 self._history(r)
             else:
-                self._admit_recent(r, kv)                              # M2 B2: A_r, its D2H, the partial-block entries
+                self._admit_recent(r, kv, prep)                        # M2 B2: A_r, its D2H, the partial-block entries
             self.trace[uid] = dict(prompt=list(prompt), N=N, b=b, epochs=[dict(epoch=0, E=r.E, u0=r.toks[r.E], drafts=[], cohorts=[], outcome=None)])
             self.stats["requests_admitted"] += 1
             if r.generated() >= r.N:
@@ -1495,7 +1498,10 @@ class Dispatcher:
             with self.be.stream("compute"):
                 m[key] = self.be.event_rec("compute")
             return
-        ring = self.rings[l]
+        prep = None
+        if self.store is not None:                                     # HOOK-L5 (I9.1): the opt-in executor's payload
+            prep = self.store.prepare_produce(self, l, r, h, kind, key, k, v, c)   # is obtained and checked BEFORE
+        ring = self.rings[l]                                           # the bind (None: opt-out or A_r source)
         e = self._ring_take(l, r, where)
         g, prev_d2h = ring.bind(e, kind, (r.uid, r.b, h), prov, where)
         if self._checked():
@@ -1503,7 +1509,7 @@ class Dispatcher:
         m[key] = (e, g)
         if self.store is not None:                                     # HOOK-B2: the payload write through the store
             ring.set_ready(e, g, self.store.dispatch_produce(self, l, r, h, e, prev_d2h, k, v, c,   # HOOK-B2: its
-                                                             kind, key))                        # HOOK-B2: hold owns
+                                                             kind, key, prepared=prep))         # HOOK-B2: hold owns
             return                                                     # HOOK-B2: the sources (no bias entry)
         sk = k if torch.is_tensor(k) else torch.tensor(k, dtype=torch.int64)
         sv = v if torch.is_tensor(v) else torch.tensor(v, dtype=torch.int64)
@@ -1684,7 +1690,7 @@ class Dispatcher:
                                          "or R_log %d at the end of call %d" % (l, ring.n_live, worst, lim, self.R_log,
                                                                                 self.call_id))
 
-    def _admit_recent(self, r: Request, kv) -> None:
+    def _admit_recent(self, r: Request, kv, prep=None) -> None:
         """Contract 11.2 admission (revision 5), ring and eager_matched. The executor's ONE prefill output is the request's
         admission buffer A_r (ring: allocated rows, written on "compute"; eager_matched: a marker), then
           1. every COMPLETE prompt block goes by D2H from A_r to the host rows (_history with adm: after a stream wait on
@@ -1695,7 +1701,7 @@ class Dispatcher:
              empty. ring: A_r is held (charged in K6) until its ready, compute and D2H events completed (_ring_retire).
         The prompt is not truncated or split; the executor interface is unchanged."""
         if self.store is not None:                                     # HOOK-B2: A_r = the executor's prefill tensors
-            return self.store.dispatch_admit(self, r, kv)            # HOOK-B2: (TensorStore.dispatch_admit)
+            return self.store.dispatch_admit(self, r, kv, prepared=prep)   # HOOK-B2 / HOOK-L5 (I9.1: prepared)
         bs, L, H, D = self.bs, self.L, self.H, self.D
         n0 = r.n                                                       # P0 - 1 prompt positions
         r.rmap = [[{kind: {} for kind in RING_KINDS} for _ in range(H)] for _ in range(L)]
