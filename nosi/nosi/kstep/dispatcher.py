@@ -250,6 +250,7 @@ from .errors import (CapacityRefusal, ConfigError, ConsumptionMismatch, KStepErr
                      ReadCorruption, StaleReader)
 from .executor import DRAFT, VERIFY, Row, abi_of, check_consumed_identity, check_executor
 from .mutations import Mutations
+# HOOK-L3: DRAINING is imported for quiesce_state / detach_completed_events (INTERFACE_BC3 I8)
 from .ownership import (COUNTS, DRAINING, FREE, LIVE, LRU, PO, R_DRAFT, R_EXACT, R_PRE, R_PROV, RELEASING, RING_KINDS, VRES,
                         Arena, BiasOpLedger, Geometry, LayerPool, MemoryAccountant, RingPool)
 from .transfer import Transfer
@@ -3073,23 +3074,30 @@ class Dispatcher:
     # history and are never read for a decision. The frontier (reset_pending) and the store (drained_all) report their
     # own state.
     def quiesce_state(self) -> Dict[str, int]:
-        """HOOK-L3, READ-ONLY: the counts of state that NO passive poll can drain (an OPEN dict; a caller requires every
-        value 0 and names every nonzero key). State that the existing host poll drains once its events complete (RELEASING
-        slots, DRAINING ring entries, admission buffers, event-held ledger records, armed validators, D2H checks) is not
-        counted here: its gating events are listed by event_holders(), and detach_completed_events() drains it."""
+        """HOOK-L3, READ-ONLY: every count that must be 0 before a quiescent reset (an OPEN dict; a caller requires every
+        value 0 and names every nonzero key). The I8 counts: queued, active, inflight, validators, pending_release,
+        d2h_checks, adm, key_readers. Validators, D2H checks and admission buffers must be ZERO, not only complete: their
+        completion runs the byte checks (_validate, _d2h_poll), which may raise, so the caller drains them first
+        (Dispatcher.finish, then one host poll, as F21 / BC2). Then detach_completed_events never runs a check that can
+        raise after a mutation. Also counted, because no passive poll can drain them: transport_pending, slots_held
+        (slots not FREE and not RELEASING), ring_live (entries not FREE and not DRAINING), and the key-held ledger
+        records. RELEASING slots, DRAINING ring entries and event-held ledger records are not counted: their gating
+        events are listed by event_holders(), and detach_completed_events() drains them passively."""
         def keyed(lg):
             return 0 if lg is None else sum(1 for rec in lg.recs.values() if rec["ev"] is None)
         return dict(
             queued=len(self.queue),
             active=sum(1 for r in self.slot_req if r is not None),
             inflight=len(self.inflight),
+            validators=len(self.validators),
+            pending_release=len(self.pending_release),
+            d2h_checks=len(self.d2h_checks),
+            adm=len(self.adm),
+            key_readers=len(self.key_readers),
             transport_pending=len(getattr(self.tp, "pending", None) or ()),
             slots_held=sum(1 for p in self.pools for st in p.streams.values() for s in st.slots
                            if s.state not in (FREE, RELEASING)),
             ring_live=sum(1 for rg in self.rings for e in range(rg.Q) if rg.state[e] not in (FREE, DRAINING)),
-            validators_unarmed=sum(1 for v in self.validators if v[0] is None),
-            pending_release=len(self.pending_release),
-            key_readers=len(self.key_readers),
             bias_ledger_keyed=keyed(self.bias_ledger),
             consume_ledger_keyed=keyed(self.consume_ledger),
         )
@@ -3098,7 +3106,9 @@ class Dispatcher:
         """HOOK-L3, READ-ONLY: one (owner_class, location, event) per event reference that the dispatcher, its pools,
         ledgers, requests and transport hold (None references are not listed). Owner classes: slot_reader, arena_reader,
         arena_captured, ring_gate, admission, bias_ledger, consume_ledger, transfer, validator, key_reader, hist,
-        d2h_check, request_map (a non-ring request map holds events directly), transport."""
+        d2h_check, request_map (a non-ring request map holds events directly), transport (the S0 Pipe's slot events).
+        The adversarial transport's pending transfers are a subset of inflight (only _poll removes an inflight entry),
+        so their reader_ev / hist_ev appear as "transfer"; quiesce_state counts them as transport_pending."""
         out: List[Tuple[str, Tuple, Any]] = []
 
         def put(cls, loc, ev):
@@ -3149,16 +3159,15 @@ class Dispatcher:
             for s in range(pipe.ring):
                 put("transport", ("slot_h2d", s), pipe.slot_h2d[s])
                 put("transport", ("slot_sc", s), pipe.slot_sc[s])
-        for tr in getattr(self.tp, "pending", None) or ():
-            put("transport", ("pending", tr.seq), tr.ev)
         return out
 
     def detach_completed_events(self) -> int:
         """HOOK-L3, MUTATING (only frontier.QuiescentReset calls it, after its own full check). First the same check, with
         NO mutation on a refusal: every quiesce_state() count 0 and every event_holders() event complete (ev_done).
         Then (1) the existing passive host poll (_poll) drains what those events gated: RELEASING slots, DRAINING ring
-        entries, admission buffers, event-held ledger records (through retire), armed validators, D2H checks, the store's
-        and the frontier's own polls; (2) the post-condition, which only an internal inconsistency can break; (3) every
+        entries, event-held ledger records (through retire), the store's and the frontier's own polls. No byte check
+        runs there: validators, D2H checks and admission buffers are already 0 (quiesce_state), and nothing is in
+        flight; (2) the post-condition, which only an internal inconsistency can break; (3) every
         remaining reference to a complete event is set to None (a FREE slot's or position's history readers, a FREE ring
         entry's gates, the requests' history events and map events, the S0 Pipe's slot events). Returns the number of
         references set to None. A later reader of any of these sees None (complete; no wait), never a pooled object that
