@@ -2207,7 +2207,7 @@ class Dispatcher:
         if read_slots and not self.arena_mode:                         # F4: the eager executor's host order (per stream)
             with self.be.stream("compute"):
                 rev = self.be.event_rec("compute")
-            self._install_reader(l, read_slots, rev)
+            self._install_reader(l, read_slots, rev, "compute")      # HOOK-C (lead): rev was recorded on "compute"
             self._arm_validators(rev)
         self._draft_recency(l, rows, draft_pre, cid)
         if self.consume:                                               # C1.2 (12.9.2): the serialized consumer

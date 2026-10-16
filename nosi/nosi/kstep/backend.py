@@ -32,3 +32,16 @@ def ev_done(ev: Any) -> bool:
     if callable(q):
         return bool(q())
     return bool(getattr(ev, "done"))
+
+
+def record_join(be: Any, stream: str, live: Any) -> Any:
+    """I1 (the frozen B / C interface of 2026-10-16): the ONE native join primitive of the package. On `stream`: a
+    stream wait on each handle of `live`, in order, then one event recorded on `stream`; returns that event (a native
+    backend event). No host wait, no synchronize, no Python object that stands for several events. The caller filters
+    `live` (two or more live native handles) and names a stream that exists in the backend. The callers' policies for
+    fewer live inputs differ and are both complete handles: tensor_store.join_events returns None when no input is live;
+    frontier.join returns the last complete input (lead integration of tracks B and C)."""
+    with be.stream(stream):
+        for ev in live:
+            be.stream_wait(stream, ev)
+        return be.event_rec(stream)

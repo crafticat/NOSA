@@ -89,7 +89,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
-from .backend import ev_done
+from .backend import ev_done, record_join
 from .errors import ConfigError, KStepError, OwnershipViolation
 
 JOIN_STREAM = "join"
@@ -158,9 +158,7 @@ def join(be, evs: Iterable[Any], stream: str = JOIN_STREAM, types: Optional[Tupl
         if stats is not None:
             stats["join_cache_hits"] = stats.get("join_cache_hits", 0) + 1
         return cache[k][0]
-    for e in live:
-        be.stream_wait(stream, e)
-    out = be.event_rec(stream)
+    out = record_join(be, stream, live)          # lead integration: the one shared primitive (backend.py)
     check_native(out, types, "a join output")
     if cache is not None:
         cache[k] = (out, tuple(live))
@@ -373,7 +371,13 @@ class FinishedCohorts:
         return self.poll()
 
     def outstanding(self, uid, inc) -> Dict[str, int]:
-        return {name: int(fn(uid, inc)) for name, fn in self.sources}
+        out: Dict[str, int] = {}
+        for name, fn in self.sources:                  # lead integration: a COUNT >= 0, never a bool (a drained-
+            n = fn(uid, inc)                           # predicate passed by mistake would invert the clearing rule)
+            if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+                raise TypeError("finished cohorts: hold source %r returned %r, not a count >= 0" % (name, n))
+            out[name] = n
+        return out
 
     def poll(self) -> int:
         """Clears every ENDED incarnation whose hold sources all report 0 (records and incarnation). Non-blocking.
@@ -404,7 +408,15 @@ class CompletionOwnership:
     built-in hold source is the table's outstanding reader events of the incarnation, and the HOOK-C entry points. A
     callback names its incarnation through the dispatcher's Request (d.reqs[uid].inc): the dispatcher refuses a second
     submit of a uid today (Dispatcher.submit), so a later asynchronous caller must pass (uid, inc) to FinishedCohorts
-    itself."""
+    itself.
+
+    Scope (lead integration of tracks B and C, after the independent review): the built-in hold source is the reader
+    frontiers ONLY. In-flight transfers (d.inflight), ring ready / D2H gates, hist_ev and Track B's source holds are not
+    consulted yet, so a record may clear while such work of the incarnation is still pending. That is fail-closed: after
+    clearing, a late protect, queue or decision raises the I3 "not live" error; only the finer diagnosis is lost. Track
+    B's holds attach with add_source("tensor_store", store.holds.outstanding_count) when the dispatcher uses the store.
+    Mutation catchers run in "single" mode: in "joined" mode the frontier's R1.5 check still fires under
+    no_late_protection_guard."""
 
     def __init__(self, be, join_stream: str = JOIN_STREAM, entry_bytes: int = 16):
         self.table = FrontierTable(be, join_stream, entry_bytes)

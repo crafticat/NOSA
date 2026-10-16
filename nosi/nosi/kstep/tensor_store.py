@@ -47,7 +47,14 @@ copy is ever queued with an unheld source. SourceHolds.open is atomic: a refusal
 Precondition (admission). The prefill tensors that admit adopts as A_r are storage that the executor does not reuse
 until adm.gate completes. If the executor writes its next prefill into a reused workspace, that write must wait on the
 adm.gate of every admission that adopted the workspace (on the GPU: a stream wait on the executor's stream). The store
-cannot see such a reuse; its hold keeps the storage referenced, not unwritten.
+cannot see such a reuse; its hold keeps the storage referenced, not unwritten. adm.gate covers this admission's own
+copies only: the strict condition for a reuse is holds_storage(t) is False for every adopted tensor t (lead
+integration, after the Track B review).
+
+Failures (lead integration, after the Track B review): a refused open leaves held exact, but the ledger's peak / log may
+show the charge and its rollback. An enqueue that raises after its hold opened leaves that hold OPEN on purpose: a
+partly queued copy may still read the source, so the hold is never released early (drained() stays False; a leak, not
+a corruption).
 
 Not claimed: NOSA or model numerics, CUDA stream safety, HBM fit, throughput, or any use by the dispatcher. The pgen_t /
 rgen_t mirrors stay the pools' CPU int64 tensors.
@@ -81,7 +88,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
-from .backend import check_backend, ev_done
+from .backend import check_backend, ev_done, record_join
 from .errors import ConfigError, KStepError, OwnershipViolation, ReadCorruption, StaleReader
 from .ownership import LIVE, BiasOpLedger
 
@@ -141,10 +148,7 @@ def join_events(be: Any, stream: Optional[str], evs: Iterable[Any]) -> Any:
     if stream is None:
         raise KStepError("tensor store: a join of %d live completion handles needs a join stream (I1); none is "
                          "configured" % len(live))
-    with be.stream(stream):
-        for ev in live:
-            be.stream_wait(stream, ev)
-        return be.event_rec(stream)
+    return record_join(be, stream, live)              # lead integration: the one shared primitive (backend.py)
 
 
 # ------------------------------------------------------------------------------------------------------ I2: holds
@@ -309,6 +313,11 @@ class SourceHolds:
         """I3: no hold of the request incarnation (uid, inc) remains (open, or with a storage not yet released)."""
         return not any(tuple(h["owner"][:2]) == (uid, inc) for h in self.holds.values())
 
+    def outstanding_count(self, uid: Any, inc: Any) -> int:
+        """I3: the number of live holds of the request incarnation (uid, inc): the COUNT form that a finished-cohort
+        hold source takes (frontier.FinishedCohorts.add_source; lead integration of tracks B and C)."""
+        return sum(1 for h in self.holds.values() if tuple(h["owner"][:2]) == (uid, inc))
+
     def recount(self) -> int:
         """The bytes of the unique storages that the live records reference now (independent of the ledger)."""
         seen: Dict[Tuple, int] = {}
@@ -365,6 +374,8 @@ class TensorStore:
         if len(arenas) != L or (rings is not None and len(rings) != L):
             raise ConfigError("tensor store: one arena and one ring per layer: %d arenas, %s rings for L %d"
                               % (len(arenas), None if rings is None else len(rings), L))
+        if join_stream is None:                       # lead integration: adm.gate is an I1 join of two streams
+            raise ConfigError("tensor store: a join stream is required (adm.gate joins the compute and D2H reads; I1)")
         self.be = be
         self.L, self.H, self.D, self.bs, self.B, self.S_host = int(L), int(H), int(D), int(bs), int(B), int(S_host)
         self.arenas = list(arenas)
@@ -594,11 +605,11 @@ class TensorStore:
         references. Returns adm.gate."""
         where = "admission close of owner %s" % (getattr(adm, "owner", None),)
         self._open_admission(adm, where)
+        self.holds.close(adm.hold)            # lead integration: close FIRST, so a failed join never leaves it open
         first = adm.cev if adm.cev is not None else adm.ready
         gate = join_events(self.be, self.join_stream, (first, adm.dev))
         if gate is not None and gate is not first and gate is not adm.dev:
             self.stats["admission_joins"] += 1
-        self.holds.close(adm.hold)
         adm.gate = gate
         adm.closed = True
         adm.k = adm.v = adm.c = None
