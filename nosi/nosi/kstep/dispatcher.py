@@ -68,9 +68,9 @@ limited CPU implementation; the C >= (2K + 1) * max_sel guard and the pin guard 
 under the opt-in Config.progress_guard = "rev6" of the C81 / K3 note at the end of this docstring):
   L4  construction refuses d_h < W = (K + 1) * S_max and H * d_h > X_d = X - R_ver (S_max = the asserted row bound,
       pin_row_bound or executor.max_sel). d_h >= W is a SUFFICIENT share for this guarantee mode; the C81 / K3 note
-      gives a worst case that needs it under the unchanged policy. Each active request reserves H * d_h shared draft
-      positions per layer, all-or-nothing, in request age order, without overtaking (_rev6_reserve; stall reason
-      "admission"); an ended request's reservation returns only when every slot it owned is FREE.
+      shows only conditional cases that need it (no minimum for every rule). Each active request reserves H * d_h
+      shared draft positions per layer, all-or-nothing, in request age order, without overtaking (_rev6_reserve; stall
+      reason "admission"); an ended request's reservation returns only when every slot it owned is FREE.
   L2  P(stream) = its non-FREE "ad" slots (an unpinned LRU entry and a RELEASING slot count until FREE).
   SC2 at the step start (before layer 0) a request starts a draft step only if, on every stream of every layer,
       untriggered draft pins + (T - s + 1) * S_max <= d_h ("horizon") and P + S_max <= C + d_h ("capacity"); it then
@@ -213,7 +213,8 @@ peak, counters and the first consumed item of each provenance kind (instrumentat
 and no overlap claim.
 
 C81 / K3 (Config.progress_guard = "rev6"; default "pin" keeps every rule above unchanged; retroinfer-eval
-docs/superpowers/specs/2026-10-16-kstep-c81-k3-progress.md; a CANDIDATE, unvalidated and unpromoted). The pin guard
+docs/superpowers/specs/2026-10-16-kstep-c81-k3-progress.md; a CANDIDATE, unpromoted; portable CPU toy evidence only,
+tests/test_kstep_c81.py). The pin guard
 (construction C >= (2K + 1) * S_max and the _pins_high 'memory' stall) protects the M1 verifier eviction: it keeps an
 unprotected LRU entry where the oldest cohort waits. Capacity mode rev6 never evicts for a verifier (G6): a verifier
 takes FREE "v" positions under an all-or-nothing grant (R_ver >= N_max), and a draft step starts only with S_max step
@@ -221,11 +222,15 @@ credits within C + d_h (d_h >= W). The rev6 drafting argument (PROPOSAL section 
 after the drain against the cap C + d_h, so C cancels: in rev6 the pin guard protects nothing that the rev6 contract
 does not already guarantee, for any C >= 1. Mode "rev6" therefore REPLACES it, explicitly: it needs capacity "rev6" and
 pin_guard=False, and every rev6 guarantee refusal (d_h >= W, H * d_h <= X_d, R_ver >= N_max, C + X >= K * S_max) still
-applies. The explicit budget per layer is B * H * C (logical LRU) + X_d (n_res * H * d_h, the requests that may draft at
-once) + R_ver; per drafting stream C + d_h positions. d_h >= W is also NECESSARY under the unchanged policy (the C81
-note: late arrivals leave P = C + K * S_max with nothing outstanding). Counters (this mode only): stats
-rev6g_pin_guard_would_stall (draft steps the pin guard would have stalled), rev6g_peak_positions,
-rev6g_peak_positions_over_C, rev6g_peak_v_used; capacity_report()["guarantee"].
+applies. ENTITLEMENT, not allocation: a stream of a request that holds a draft reservation may hold up to C + d_h
+class "ad" positions (P + credits <= C + d_h; capacity_report()["guarantee"]["per_stream_budget"]). The allocated
+historical backing does not change: B * H * (C + X) per layer (per_stream, arena conservative) or B * H * C + X (arena
+reduced), X = X_d + R_ver; B * H * C + n_res * H * d_h + R_ver equals the reduced backing only when X_d has no unused
+remainder. Ring / recent, admission, metadata, staging and model bytes are outside both. d_h >= W is SUFFICIENT. The
+note shows that it is needed only conditionally (the rev6 rules themselves, SC2a; the capacity rule alone under late
+arrivals); that is not a minimum for every policy-preserving rule. Counters (this mode only; sampled at the end of every
+joint call, not maxima over every transition): stats rev6g_pin_guard_would_stall (draft steps the pin guard would have
+stalled), rev6g_peak_positions, rev6g_peak_positions_over_C, rev6g_peak_v_used; capacity_report()["guarantee"].
 """
 from __future__ import annotations
 
@@ -988,8 +993,9 @@ class Dispatcher:
         return any(c.key == key and c.state in (PENDING, RUNNING, DONE) for c in r.cohorts)
 
     def _rev6g_sample(self, l: int) -> None:
-        """progress_guard 'rev6' (C81 / K3 note): observed peaks at the end of the joint call of layer l, every mode of the
-        check (instrumentation): the largest P of a stream, how far it exceeded C (0: never), the layer's "v" slots."""
+        """progress_guard 'rev6' (C81 / K3 note): peaks SAMPLED at the end of the joint call of layer l (not maxima over
+        every transition), every mode of the check (instrumentation): the largest P of a stream, how far it exceeded C
+        (0: never), the layer's "v" slots."""
         s, pool = self.stats, self.pools[l]
         for st in pool.streams.values():
             p = st.positions()
@@ -3020,7 +3026,7 @@ class Dispatcher:
                        credits_vres=s.get("rev6_credits_vres", 0), grants=s.get("rev6_grants", 0), grant_waits=s.get("rev6_grant_waits", 0),
                        stalls={k: s.get("stall_" + k, 0) for k in ("admission", "horizon", "capacity")},
                        fetch_draft_refused=s.get("fetch_draft_refused", 0), verifier_evictions=s.get("verifier_evictions", 0))
-        if self.rev6_guard:                                            # C81 / K3 note: the explicit budget and its peaks
+        if self.rev6_guard:                    # C81 / K3 note: the "ad" entitlement (not the allocation), sampled peaks
             out["guarantee"] = dict(
                 mode="rev6", replaces="pin guard C >= (2K + 1) * S_max = %d" % ((2 * self.K + 1) * self.rb),
                 C=self.cfg.C, S_max=self.rb, K=self.K, LAMBDA=self.LAMBDA, W=self.W, d_h=self.d_share,
