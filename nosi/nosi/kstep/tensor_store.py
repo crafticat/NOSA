@@ -88,9 +88,12 @@ the default "none" path is unchanged; sites named by function, as line numbers s
                   holds.peak). The dispatcher's admission_src / ring_producer / d2h_src entries are not made (the
                   store paths return before them). FREE / DRAINING ring entries and the held A records stay in the
                   reports (ring_report admission_held / admission_freed / admission_kv_peak_*).
-  transport       check_transport: a typed staging Pipe must stage kv_dtype (transfer.S0Transport stages int64 by
-                  default and is refused); transfer.AdversarialTransport copies rows as they are; a transport may
-                  declare carries_dtype.
+  transport       check_transport (unchanged since milestone 2): a typed staging Pipe must stage kv_dtype, else
+                  ConfigError; transfer.AdversarialTransport copies rows as they are; a transport may declare
+                  carries_dtype. Milestone 3 (I7): the factory of tests/kstep_toy.build passes the stores' dtype, so a
+                  bf16 store gets a bf16 S0 transport (the REAL Pipe stages bf16); S0Transport itself refuses, at
+                  construction, any store whose dtype differs from its staging dtype (OwnershipViolation "S0 transport:
+                  dtype mismatch at construction (...)", transfer.py HOOK-B3), before check_transport can run.
   executor        tensor_payload = True; fresh_outputs = True; kv_dtype / bias_dtype (torch dtypes);
                   prefill_tensors(kv) -> per-layer (k, v, c) tensors of the last prefill; payload(kvv, at=None) -> the
                   tensors of one eager item (at = (uid, layer, head, kind, position) for a producer, None for an
@@ -104,8 +107,8 @@ the default "none" path is unchanged; sites named by function, as line numbers s
                   (FinishedCohorts.add_source; duck-typed: Dispatcher.store.holds.outstanding_count) when the store's
                   mode and "joined" are both on. The dispatcher attribute is exactly `store` (None in the default path).
   reset (I4)      drained_all() and clear_caches(); Track C's reset guard calls them (the lead wires it).
-  open items      the S0 transport in the store's mode (refused until its Pipe stages kv_dtype); eager / eager_matched
-                  in the store's mode; device-resident pgen_t / rgen_t; the CUDA ready events above.
+  open items      eager / eager_matched in the store's mode; device-resident pgen_t / rgen_t; the CUDA ready events
+                  above.
 """
 from __future__ import annotations
 

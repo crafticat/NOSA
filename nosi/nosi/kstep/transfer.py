@@ -114,6 +114,7 @@ class S0Transport:
         self.carries_bias = arena_c is not None
         self.bias_readbacks = 0                   # C1.1: readbacks that compared the bias rows too
         self.bias_groups = 0                      # C1.1: groups whose bias rows joined their issue's frontier
+        self._check_construction_dtypes(dtype)    # HOOK-B3: every store against dtype, BEFORE any staging or Pipe
         elem = torch.empty((), dtype=dtype).element_size()
         nb = core.slot_bytes(cap_groups, bs, D, elem)
         self.stage = torch.zeros((ring, nb), dtype=torch.uint8)
@@ -124,6 +125,34 @@ class S0Transport:
         self.chunks = 0
         self.pool_checks = 0                      # M2: transfers whose pool descriptor group passed every adapter check
         self.readbacks = 0                        # M2: landed transfers whose arena rows were read back equal
+
+    @staticmethod                                                       # HOOK-B3
+    def _dtype_text(ts) -> str:                                         # HOOK-B3
+        """HOOK-B3: the dtype of one store list (one per layer): one dtype, or the per-layer list when they differ."""
+        dts = [t.dtype for t in ts]                                     # HOOK-B3
+        if dts and all(x == dts[0] for x in dts):                       # HOOK-B3
+            return str(dts[0])                                          # HOOK-B3
+        return "[%s]" % ", ".join(str(x) for x in dts)                  # HOOK-B3
+
+    def _check_construction_dtypes(self, dtype) -> None:                # HOOK-B3
+        """HOOK-B3 (I7, B / C interface addendum 3): at construction, BEFORE any staging buffer, Pipe or descriptor
+        exists, every store that this transport reads or writes is checked: host_k / host_v and arena_k / arena_v (or
+        slots_k / slots_v) against `dtype` (the Pipe's staging dtype), and host_c / arena_c (when present) against ONE
+        bias dtype (that of host_c[0]; the bias may differ from K / V). A mismatch raises OwnershipViolation
+        "S0 transport: dtype mismatch at construction (dtype D; <store> <dtype>, ...; mismatched <stores>)", which names
+        every present store with its dtype (per layer when the layers differ). The issue-time _check_pool_bounds check
+        stays as it is (defence in depth). (HOOK-B3)"""
+        names_kv = ("host_k", "host_v", "arena_k", "arena_v", "slots_k", "slots_v")         # HOOK-B3
+        kv = [(n, getattr(self, n)) for n in names_kv if getattr(self, n) is not None]      # HOOK-B3
+        bias = [(n, getattr(self, n)) for n in ("host_c", "arena_c") if getattr(self, n) is not None]   # HOOK-B3
+        bad = [n for n, ts in kv if any(t.dtype != dtype for t in ts)]                      # HOOK-B3
+        bias_dts = [t.dtype for _, ts in bias for t in ts]                                  # HOOK-B3
+        if bias_dts and any(x != bias_dts[0] for x in bias_dts):                            # HOOK-B3
+            bad.append("host_c / arena_c")                                                  # HOOK-B3
+        if bad:                                                                             # HOOK-B3
+            stores = ", ".join("%s %s" % (n, self._dtype_text(ts)) for n, ts in kv + bias)   # HOOK-B3
+            msg = "S0 transport: dtype mismatch at construction (dtype %s; %s; mismatched %s)"   # HOOK-B3
+            raise OwnershipViolation(msg % (dtype, stores, ", ".join(bad)))                 # HOOK-B3
 
     def issue(self, layer: int, transfers: List[Transfer]) -> None:
         if not transfers:
