@@ -596,10 +596,10 @@ class Dispatcher:
                 continue
             uid, prompt, N = self.queue.pop(0)
             r = Request(uid, b, prompt, N, self.L, self.H, self.stride, self.ex.compress, self.chain_kernel)
-            self.reqs[uid] = r
             r.inc = self.inc_at_submit.pop(uid, 0)                     # HOOK-C: I3 (0: not queued through submit)
-            if self.frontier is not None:                              # HOOK-C: the incarnation becomes live
-                self.frontier.start_request(self, r)
+            if self.frontier is not None:                              # HOOK-C2: the incarnation becomes live, the
+                self.frontier.start_request(self, r)                   # providers bind, BEFORE the uid enters reqs
+            self.reqs[uid] = r
             self.slot_req[b] = r
             self.age[uid] = len(self.age)
             for l in range(self.L):

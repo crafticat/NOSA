@@ -72,20 +72,23 @@ model only.
    A reused uid gets a new inc and never matches an old record. A call that names an incarnation that is not live is
    refused (I3).
    Milestone 2 (addendum I5, I6; "# HOOK-C2" in dispatcher.py):
-   - Hold providers (CompletionOwnership._bind, at the first admission): "reader_frontier", "transfers" (in-flight
-     transfers of the uid whose transport does not report them complete), "ring_gates" (ring entries owned by the uid
-     with an incomplete ready / compute / D2H gate, and its admission buffer A_r with an incomplete gate), "d2h" (the
-     request's incomplete hist_ev events and its D2H snapshot records with an incomplete event) and, only when the
-     dispatcher holds a TensorStore as Dispatcher.store (track B's opt-in mode; detected by duck typing, tensor_store
-     is never imported here), "tensor_store" = store.holds.outstanding_count. Records clear only when EVERY provider
-     reports 0. Every provider is non-blocking (ev_done / transport done only).
+   - Hold providers (CompletionOwnership._bind, at the first admission, before the request enters Dispatcher.reqs):
+     "reader_frontier", "transfers" (in-flight transfers of the uid whose transport does not report them complete),
+     "ring_gates" (ring entries owned by the uid with an incomplete ready / compute / D2H gate, and its admission buffer
+     A_r with an incomplete gate), "d2h" (the request's DISTINCT incomplete D2H events: hist_ev and snapshot events,
+     each counted once) and, when Dispatcher.store is not None (track B's opt-in mode), the provider that
+     store.hold_source() returns ("tensor_store"). tensor_store.py is never imported here. Fail closed: a store without
+     hold_source, Config.store other than "none" without a store, or a name that is already registered is a named
+     ConfigError, raised before anything is registered. Records clear only when EVERY provider reports 0. Every
+     provider is non-blocking (ev_done / transport done only).
    - Decision entry: Dispatcher._apply, _finish_draft and _end_request first ask CompletionOwnership, BEFORE any
-     mutation of accepted drafts, progress, publications, tokens or results. A duplicate decision of a finished key, and
-     a draft completion of an old epoch, are counted no-ops. A decision, draft completion or end that names an ended or
-     cleared incarnation, a Request object that is not the dispatcher's, or a cohort that is not the DONE head of the
-     current epoch is refused by name.
-   - No uid-reuse promise beyond this: Dispatcher.submit refuses a uid that it knows, so a uid has one incarnation
-     per dispatcher today; the providers attribute work by uid (conservative if a uid ever had two incarnations).
+     mutation of accepted drafts, progress, publications, tokens or results. Counted no-ops: a decision of a finished
+     key (duplicate_decisions_ignored, or cancelled_decisions_ignored for a cancelled cohort) and a draft completion of
+     an old epoch (stale_drafts_ignored). Refused by name: a decision, draft completion or end that names an ended or
+     cleared incarnation or a Request object that is not the dispatcher's; a decision of a cohort that is not the DONE
+     head of the current epoch; a draft completion in the current epoch whose draft is not RUNNING or not the next one.
+   - No uid-reuse promise beyond this: Dispatcher.submit refuses a uid that it knows, so a uid has one incarnation per
+     dispatcher today. Under uid reuse the provider attribution would not be exact (CompletionOwnership docstring).
 
 5. ACCOUNTING. The entries are counted as the dispatcher counts its release-queue and reader-event entries (one
    Geometry.unit()["release_entry"] each, ownership.py:875): per frontier object one record plus one per component, one
@@ -101,11 +104,17 @@ model only.
 7. EVENT LIFETIME (addendum I4). FrontierTable keys its objects' components and its join cache by the IDENTITY of
    native event objects (comp[ident][stream] is ev; cache key frozenset(id(e))). The cpupack_core CudaBackend takes its
    events from a pool, and reset() (:452-453) makes later event_rec calls re-record pooled objects. So these identities
-   are valid only between two resets. The rule: CompletionOwnership.before_reset(d) must run before any backend reset.
+   are valid only between two resets. The rule: CompletionOwnership.before_reset() must run before any backend reset.
    It refuses (OwnershipViolation "reader frontier: reset refused (I4): ...") while any reader component, installed
-   handle or cached join (output or input) is incomplete, or any hold provider of a live incarnation reports a count.
-   Otherwise it clears the identity-keyed state (clear_caches). It never waits, forces or drops a reference to make a
-   reset possible. backend.py and cpupack_core are unchanged: the caller of reset must call before_reset first.
+   handle or cached join (output or input) in the table is incomplete, or any hold provider of a live incarnation
+   reports a count. Otherwise it clears the identity-keyed state (clear_caches). It never waits, forces or drops a
+   reference to make a reset possible. backend.py and cpupack_core are unchanged: the caller of reset must call
+   before_reset first.
+   before_reset is NECESSARY, NOT SUFFICIENT. The table forgets an object when its components are complete (prune), but
+   the handle installed for it can stay referenced outside the table (slot / position last_reader, key_readers, a ring
+   compute gate, Transfer.reader_ev): for example a join output whose inputs are all complete but whose record has not
+   run yet (the CpuBackend runs "join" only when forced). A reset path must also check those holders (the pools' and
+   the dispatcher's own references).
 """
 from __future__ import annotations
 
@@ -321,7 +330,8 @@ class FinishedCohorts:
         self.stats: Dict[str, int] = dict(started=0, ended=0, finishes=0, duplicate_finish=0, late_queue_ignored=0,
                                           late_protect_refused=0, late_release_refused=0, records_cleared=0,
                                           incarnations_cleared=0, duplicate_decisions_ignored=0,
-                                          stale_drafts_ignored=0, stale_callbacks_refused=0)
+                                          cancelled_decisions_ignored=0, stale_drafts_ignored=0,
+                                          duplicate_drafts_refused=0, stale_callbacks_refused=0)
         self.peak_entries = 0
 
     def add_source(self, name: str, fn: Callable[[Any, Any], int]) -> None:
@@ -375,8 +385,8 @@ class FinishedCohorts:
     def check_decision(self, uid, inc, key) -> bool:
         """Milestone 2 (I6), the ENTRY of a decision (Dispatcher._apply), before any mutation: the key belongs to uid; the
         incarnation must be live (else I3 "... which is not live ...") and ACTIVE (else I3 "decision ... after its end",
-        also for a finished key); a finished key returns True (a duplicate decision: counted, the caller changes
-        nothing). Unlike check_finish, the incarnation state is checked BEFORE the duplicate test."""
+        also for a finished key); a finished key returns True (the caller changes nothing and counts it by its kind).
+        Unlike check_finish, the incarnation state is checked BEFORE the finished-key test."""
         self._own(uid, key)
         try:
             st = self.state(uid, inc, lambda: "the decision of cohort %s" % (key,))
@@ -386,10 +396,7 @@ class FinishedCohorts:
         except KStepError:
             self.stats["stale_callbacks_refused"] += 1
             raise
-        if (uid, inc, key) in self.rec:
-            self.stats["duplicate_decisions_ignored"] += 1
-            return True
-        return False
+        return (uid, inc, key) in self.rec
 
     def finish(self, uid, inc, key) -> bool:
         """Records the decision of `key`. Returns False for a duplicate decision (nothing changes)."""
@@ -454,9 +461,9 @@ class FinishedCohorts:
         """Clears every ENDED incarnation whose hold sources all report 0 (records and incarnation). Non-blocking.
         Returns the number of records cleared."""
         n = 0
-        for uid, inc in [k for k, st in self.live.items() if st == self.ENDED]:
-            if any(self.outstanding(uid, inc).values()):
-                continue
+        cands = [k for k, st in self.live.items() if st == self.ENDED]
+        clear = [k for k in cands if not any(self.outstanding(*k).values())]   # every provider of every candidate
+        for uid, inc in clear:                                  # first, so a provider error leaves nothing half-cleared
             mine = [k for k in self.rec if k[0] == uid and k[1] == inc]
             for k in mine:
                 del self.rec[k]
@@ -481,13 +488,26 @@ class CompletionOwnership:
     submit of a uid today (Dispatcher.submit), so a later asynchronous caller must pass (uid, inc) to FinishedCohorts
     itself.
 
-    Scope, milestone 2 (addendum I5; supersedes the lead's milestone-1 note that only the reader frontiers were
-    consulted): _bind registers the providers "transfers", "ring_gates", "d2h" and, when Dispatcher.store has
-    holds.outstanding_count, "tensor_store", at the first admission (the dispatcher's own state is complete then).
-    A record clears only when EVERY provider reports 0 for its incarnation. Mutation catchers run in "single" mode: in
-    "joined" mode the frontier's R1.5 check still fires under no_late_protection_guard."""
+    Scope (lead integration of tracks B and C, after the independent review): the built-in hold source is the reader
+    frontiers ONLY. In-flight transfers (d.inflight), ring ready / D2H gates, hist_ev and Track B's source holds are not
+    consulted yet, so a record may clear while such work of the incarnation is still pending. That is fail-closed: after
+    clearing, a late protect, queue or decision raises the I3 "not live" error; only the finer diagnosis is lost. Track
+    B's holds attach with add_source("tensor_store", store.holds.outstanding_count) when the dispatcher uses the store.
+    Mutation catchers run in "single" mode: in "joined" mode the frontier's R1.5 check still fires under
+    no_late_protection_guard.
+
+    Milestone 2 (addendum I5; HOOK-C2; this extends the note above): _bind registers the providers "transfers",
+    "ring_gates", "d2h" and, when Dispatcher.store is not None, the provider that store.hold_source() returns
+    ("tensor_store"), at the first admission and BEFORE the request enters Dispatcher.reqs. A record clears only when
+    EVERY registered provider reports 0 for its incarnation. Fail closed: a store without hold_source, a Config.store
+    other than "none" without a store, or a provider name that is already registered is a named ConfigError.
+    Attribution: "transfers", "ring_gates" and the D2H snapshot records match by uid; hist_ev is read only from
+    d.reqs[uid] when its inc matches. Dispatcher.submit refuses a known uid, so a uid has one incarnation per dispatcher
+    today. If a uid ever had two incarnations, the attribution would not be exact: the uid-matched providers would count
+    the work of both, and the hist_ev of the older one would no longer be visible."""
 
     ACCEPTED, CANCELLED, DONE = "accepted", "cancelled", "done"    # dispatcher.py's cohort states (no import cycle)
+    RUNNING = "running"                                           # dispatcher.py's draft state of a draft in flight
 
     def __init__(self, be, join_stream: str = JOIN_STREAM, entry_bytes: int = 16):
         self.table = FrontierTable(be, join_stream, entry_bytes)
@@ -499,18 +519,39 @@ class CompletionOwnership:
 
     # ---------------------------------------------------------------------------------- I5: the hold providers
     def _bind(self, d) -> None:
-        """Registers the dispatcher's hold providers once (I5). "tensor_store" only when d.store has
-        holds.outstanding_count (track B's opt-in store; duck-typed, tensor_store.py is not imported)."""
+        """Registers the dispatcher's hold providers once (I5; lead decision D1). Every check runs BEFORE the first
+        registration, and `bound` is set only after the last one, so a refusal registers nothing:
+          - Dispatcher.store not None: its hold_source() must exist and return ("tensor_store", a callable);
+          - Dispatcher.store None: Config.store (when the field exists) must be "none";
+          - no provider name may be registered already.
+        Each failure is a named ConfigError (fail closed). tensor_store.py is never imported here."""
         if self.bound:
             return
+        plan = [("transfers", lambda uid, inc: self.transfers_pending(d, uid, inc)),
+                ("ring_gates", lambda uid, inc: self.ring_gates_pending(d, uid, inc)),
+                ("d2h", lambda uid, inc: self.d2h_pending(d, uid, inc))]
+        store = getattr(d, "store", None)
+        if store is not None:
+            hs = getattr(store, "hold_source", None)
+            if not callable(hs):
+                raise ConfigError("reader frontier: Dispatcher.store has no hold_source(); the 'tensor_store' hold "
+                                  "provider cannot be registered (I5; fail closed)")
+            src = hs()
+            if not (isinstance(src, tuple) and len(src) == 2 and src[0] == "tensor_store" and callable(src[1])):
+                raise ConfigError("reader frontier: Dispatcher.store.hold_source() returned %r, not ('tensor_store', a "
+                                  "callable) (I5; fail closed)" % (src,))
+            plan.append(src)
+        elif getattr(d.cfg, "store", "none") != "none":
+            raise ConfigError("reader frontier: Config.store is %r but the dispatcher holds no store; the "
+                              "'tensor_store' hold provider cannot be registered (I5; fail closed)" % (d.cfg.store,))
+        have = {n for n, _ in self.cohorts.sources}
+        clash = [n for n, _ in plan if n in have]
+        if clash:
+            raise ConfigError("reader frontier: hold provider(s) %s already registered before the dispatcher's "
+                              "registration (I5)" % (clash,))
+        for name, fn in plan:
+            self.cohorts.add_source(name, fn)
         self.bound = True
-        add = self.cohorts.add_source
-        add("transfers", lambda uid, inc: self.transfers_pending(d, uid, inc))
-        add("ring_gates", lambda uid, inc: self.ring_gates_pending(d, uid, inc))
-        add("d2h", lambda uid, inc: self.d2h_pending(d, uid, inc))
-        fn = getattr(getattr(getattr(d, "store", None), "holds", None), "outstanding_count", None)
-        if callable(fn):
-            add("tensor_store", fn)
 
     @staticmethod
     def transfers_pending(d, uid, inc) -> int:
@@ -535,15 +576,19 @@ class CompletionOwnership:
 
     @staticmethod
     def d2h_pending(d, uid, inc) -> int:
-        """The request's incomplete hist_ev events (when d.reqs[uid] is incarnation inc), plus uid's checked-mode D2H
-        snapshot records whose hist_ev or snapshot event is incomplete."""
-        n = 0
+        """The DISTINCT incomplete D2H events of the request, each counted once: its hist_ev events (read from
+        d.reqs[uid] only when that Request is incarnation inc) and the hist_ev and snapshot events of uid's checked-mode
+        D2H records (a record's hist_ev is the same object as the request's, so it is not counted twice)."""
+        evs: Dict[int, Any] = {}
         r = d.reqs.get(uid)
         if r is not None and getattr(r, "inc", None) == inc:
-            n += sum(1 for ev in r.hist_ev.values() if not ev_done(ev))
-        n += sum(1 for rec in d.d2h_checks
-                 if rec["uid"] == uid and not (ev_done(rec["hist_ev"]) and ev_done(rec["snap_ev"])))
-        return n
+            for ev in r.hist_ev.values():
+                evs[id(ev)] = ev
+        for rec in d.d2h_checks:
+            if rec["uid"] == uid:
+                evs[id(rec["hist_ev"])] = rec["hist_ev"]
+                evs[id(rec["snap_ev"])] = rec["snap_ev"]
+        return sum(1 for ev in evs.values() if not ev_done(ev))
 
     # ---------------------------------------------------------------------------------- I6: the decision entry
     def _live_request(self, d, r, what: Callable[[], str]) -> None:
@@ -554,11 +599,14 @@ class CompletionOwnership:
                              % (what(), r.uid, getattr(r, "inc", None)))
 
     def decision_entry(self, d, r, c) -> bool:
-        """Dispatcher._apply's entry, BEFORE any mutation. True: a duplicate decision of a finished key (a counted no-op).
-        Refused (raises): an ended or cleared incarnation (I3), a stale Request object (I3), or a cohort that is not the
-        DONE head of the request's current epoch (OwnershipViolation "decision entry: ...")."""
+        """Dispatcher._apply's entry, BEFORE any mutation. True: a decision of a finished key, a counted no-op: counted
+        as cancelled_decisions_ignored when the cohort was cancelled, else as duplicate_decisions_ignored. Refused
+        (raises): an ended or cleared incarnation (I3), a stale Request object (I3), or a cohort that is not the DONE
+        head of the request's current epoch (OwnershipViolation "decision entry: ...")."""
         self._live_request(d, r, lambda: "the decision of cohort %s" % (c.key,))
         if self.cohorts.check_decision(r.uid, r.inc, c.key):
+            self.cohorts.stats["cancelled_decisions_ignored" if c.state == self.CANCELLED
+                               else "duplicate_decisions_ignored"] += 1
             return True
         head = next((cc for cc in r.cohorts if cc.state not in (self.ACCEPTED, self.CANCELLED)), None)
         if c is not head or c.state != self.DONE or c.epoch != r.epoch:
@@ -570,8 +618,10 @@ class CompletionOwnership:
 
     def draft_entry(self, d, r, dr) -> bool:
         """Dispatcher._finish_draft's entry, BEFORE any mutation. True: a draft completion of an old epoch (a counted
-        no-op; _end_of_step skips those already). Refused (raises, I3): a stale Request object, or an incarnation that
-        ended or is not live."""
+        no-op, stale_drafts_ignored; _end_of_step skips those already). Refused (raises, I3): a stale Request object, or
+        an incarnation that ended or is not live. Refused (raises OwnershipViolation "draft entry: ...", counted as
+        duplicate_drafts_refused): a completion in the CURRENT epoch whose draft is not RUNNING (a duplicate delivery of
+        a completed draft) or is not the next draft (dr.s != len(r.drafts) + 1)."""
         self._live_request(d, r, lambda: "the draft completion s%d" % (dr.s,))
         try:
             st = self.cohorts.state(r.uid, r.inc, lambda: "the draft completion s%d (epoch %d)" % (dr.s, dr.epoch))
@@ -584,6 +634,11 @@ class CompletionOwnership:
         if dr.epoch != r.epoch:
             self.cohorts.stats["stale_drafts_ignored"] += 1
             return True
+        if dr.state != self.RUNNING or dr.s != len(r.drafts) + 1:
+            self.cohorts.stats["duplicate_drafts_refused"] += 1
+            raise OwnershipViolation("draft entry: draft s%d (epoch %d, state %s) of request incarnation (%s, %s) is not "
+                                     "the RUNNING next draft s%d" % (dr.s, dr.epoch, dr.state, r.uid, r.inc,
+                                                                     len(r.drafts) + 1))
         return False
 
     def end_entry(self, d, r) -> None:
@@ -617,9 +672,10 @@ class CompletionOwnership:
     def clear_caches(self) -> None:
         self.table.clear_caches()
 
-    def before_reset(self, d=None) -> None:
+    def before_reset(self) -> None:
         """I4: call before any backend reset. Refuses (OwnershipViolation) while anything is outstanding; otherwise
-        clears the identity-keyed caches. Never waits, forces or drops a reference."""
+        clears the identity-keyed caches. Never waits, forces or drops a reference. NECESSARY, NOT SUFFICIENT: see
+        section 7 of the module docstring (handles installed outside the table)."""
         p = self.reset_pending()
         if p["components"] or p["handles"] or p["joins"] or p["holds"]:
             raise OwnershipViolation("reader frontier: reset refused (I4): %d incomplete reader components, %d incomplete "
