@@ -43,3 +43,11 @@ class ConsumptionMismatch(KStepError):
     Config.consume = "physical"): an output (one head's result or the row output) that the executor computed from the
     physically gathered K / V / bias bytes differs from the same-order eager reference computed from Row.kv. Raised at
     the consuming call, after the identity check and before the output is published."""
+
+
+class CacheMismatch(ConsumptionMismatch):
+    """C1.3 (retroinfer-eval docs/superpowers/specs/2026-10-14-kstep-m2-integration-contract.md 12.10.5 step 8, CP4;
+    kstep/c13.py): the candidate's cache (K, V, bias or cache_seqlens), gathered from the stores through the row's
+    descriptor, differs from Twin R's cache, written from the logical state. Raised after the identity check and before
+    any output is compared or published; the message names the first difference (case, row, head, slot, row in the slot,
+    tensor)."""
