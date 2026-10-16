@@ -117,6 +117,7 @@ class S0Transport:
         self._check_construction_dtypes(dtype)    # HOOK-B3: every store against dtype, BEFORE any staging or Pipe
         elem = torch.empty((), dtype=dtype).element_size()
         nb = core.slot_bytes(cap_groups, bs, D, elem)
+        self._check_slot_alignment(nb, ring, cap_groups, elem)   # HOOK-B3: BEFORE the staging buffers and the Pipe
         self.stage = torch.zeros((ring, nb), dtype=torch.uint8)
         self.land = torch.zeros((ring, nb), dtype=torch.uint8)
         self.pipe = core.Pipe(be, self.stage, self.land, cap_groups, dtype=dtype, R=bs, D=D)
@@ -153,6 +154,19 @@ class S0Transport:
             stores = ", ".join("%s %s" % (n, self._dtype_text(ts)) for n, ts in kv + bias)   # HOOK-B3
             msg = "S0 transport: dtype mismatch at construction (dtype %s; %s; mismatched %s)"   # HOOK-B3
             raise OwnershipViolation(msg % (dtype, stores, ", ".join(bad)))                 # HOOK-B3
+
+    def _check_slot_alignment(self, nb: int, ring: int, cap: int, elem: int) -> None:   # HOOK-B3
+        """HOOK-B3 (I7): ring slot s starts at byte s * nb of the staging and landing buffers. The Pipe views the index
+        region of each slot as int64 (cpupack_core.stage_views), and that view needs a start byte that is a multiple of
+        the index size (cpupack_core.IDX_BYTES, 8). So with ring > 1, nb must be a multiple of it. Else
+        OwnershipViolation "S0 transport: staging slot of <nb> bytes is not a multiple of 8 (ring R, cap C, bs B, D D,
+        element E); the int64 index view of ring slot 1 needs it", after slot_bytes and BEFORE any staging buffer or
+        Pipe exists. No padding is added. (HOOK-B3)"""
+        ib = getattr(self.core, "IDX_BYTES", 8)                                             # HOOK-B3
+        if ring > 1 and nb % ib:                                                            # HOOK-B3
+            msg = ("S0 transport: staging slot of %d bytes is not a multiple of %d (ring %d, cap %d, "   # HOOK-B3
+                   "bs %d, D %d, element %d); the int64 index view of ring slot 1 needs it")           # HOOK-B3
+            raise OwnershipViolation(msg % (nb, ib, ring, cap, self.bs, self.D, elem))      # HOOK-B3
 
     def issue(self, layer: int, transfers: List[Transfer]) -> None:
         if not transfers:
