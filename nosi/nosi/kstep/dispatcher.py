@@ -626,6 +626,8 @@ class Dispatcher:
         return (kvv[0], kvv[2]) if self.abi4 else kvv[0]
 
     def _end_request(self, r: Request) -> None:
+        if self.frontier is not None:                                  # HOOK-C2: a second or stale end is refused
+            self.frontier.end_entry(self, r)                           # before any mutation (I3, I6)
         for l in range(self.L):
             for h in range(self.H):
                 self.pools[l].stream(r.b, h).end_owner()
@@ -2677,6 +2679,8 @@ class Dispatcher:
             ep["drafts"][-1]["cks"] = {l: [list(x) for x in v] for l, v in dr.cks.items()}   # each select received
 
     def _finish_draft(self, r: Request, dr: Draft) -> None:
+        if self.frontier is not None and self.frontier.draft_entry(self, r, dr):
+            return                                                     # HOOK-C2: an old-epoch completion: no mutation
         dist = self.ex.dist(dr.hidden)
         dr.hidden = None                                               # K6: only d and q are kept
         u = rng.uniform(self.cfg.seed, r.uid, dr.pos + 1, r.epoch, "draft")
@@ -2758,6 +2762,8 @@ class Dispatcher:
             self.frontier.record_finish(self, key)                     # of the key was queued (m1, I3)
 
     def _apply(self, r: Request, c: Cohort, o) -> None:
+        if self.frontier is not None and self.frontier.decision_entry(self, r, c):
+            return                                                     # HOOK-C2: a duplicate decision: no mutation (I6)
         ep = self.trace[r.uid]["epochs"][-1]
         self.stats["accepted_drafts"] += o.n_acc
         self.stats["zero_mass_accepts"] += o.zero_mass_accepts
