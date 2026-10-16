@@ -9,12 +9,15 @@ the named streams). It never converts a payload to a Python list or back.
 
   check_tensor        refuses a payload with a wrong type, dtype, shape or device (KStepError with a precise message).
   join_events         I1: one native completion handle for several handles. A stream wait per live input, then one
-                      event on the join stream. One live input is returned unchanged. No live input gives None.
+                      event on the join stream. One live input is returned unchanged. No live input gives None. Used
+                      ONLY for a handle that the store returns to a consumer (close_admission's adm.gate).
   SourceHolds         I2: a source backing that a queued copy reads stays referenced and charged until the completion
                       handle of every copy that reads it passes ev_done. One record per distinct storage, charged at
                       untyped_storage().nbytes() in an ownership.BiasOpLedger with the kinds "admission", "ring" and
-                      "publish". The ledger key is (owner, kind, hold serial); the owner is the I3 identity
-                      (uid, inc[, cohort key]). Only poll() releases a record (passive ev_done; no wait).
+                      "publish". The ledger key is (owner, kind, hold serial, storage id); the owner is the I3
+                      identity (uid, inc[, cohort key]). A record keeps the latest read event of each stream. Only
+                      poll() releases it: when every one of those events passes ev_done (a host-side poll of each
+                      native event; no join event, no wait).
   TensorStore         the host, arena, ring and bias stores (12.3 A4) and the producer copies:
                         admit, admission_d2h, admission_ring, close_admission
                                            11.2 admission. A_r IS the caller's prefill tensors (adopted, not copied).
@@ -32,10 +35,19 @@ one gate that the store installs itself is the D2H gate of the ring entries that
 backpressure.
 
 Streams. Producer copies run on "compute". Publications run on "d2h" (the dispatcher's streams). Each stream is ordered,
-so the latest event of a stream covers every earlier copy on it. When copies on two streams read one source, its
-release handle is their join on the configured join stream (I1). On the deferred cpupack_core CpuBackend, a join event
-completes only when its join stream runs (a host wait on the join, or synchronize). Until then the hold stays held. That
-is the conservative side.
+so the latest event of a stream covers every earlier copy on it. A source that copies on two streams read is released
+when the latest event of EACH stream passed ev_done (lead decision, 2026-10-16): no join event is formed for a release,
+so no hold depends on a join stream. The one join is adm.gate (close_admission), a consumer handle: it needs the
+configured join stream, and on the deferred cpupack_core CpuBackend it completes only when that stream runs (a host wait
+on it, or synchronize).
+
+Every hold is opened (charged) after the payload checks and BEFORE its copies are enqueued, and closed after them: no
+copy is ever queued with an unheld source. SourceHolds.open is atomic: a refusal part-way charges nothing.
+
+Precondition (admission). The prefill tensors that admit adopts as A_r are storage that the executor does not reuse
+until adm.gate completes. If the executor writes its next prefill into a reused workspace, that write must wait on the
+adm.gate of every admission that adopted the workspace (on the GPU: a stream wait on the executor's stream). The store
+cannot see such a reuse; its hold keeps the storage referenced, not unwritten.
 
 Not claimed: NOSA or model numerics, CUDA stream safety, HBM fit, throughput, or any use by the dispatcher. The pgen_t /
 rgen_t mirrors stay the pools' CPU int64 tensors.
@@ -54,9 +66,14 @@ INTEGRATION MAP (for the lead; dispatcher.py at NOSI d996868; NOTHING here is wi
                      :1736-1741, :1755-1763 (eager_matched) and :2877-2883 (eager _history) -> publish_block with
                      tensor sources. The checked-mode expectations ek / evv / ec (:1708-1712) still rebuild from r.pub:
                      instrumentation, but a live adapter needs a tensor reference there too.
-  open items      a named join stream in the backend (tests/kstep_toy.build makes copy / scatter / compute / d2h
-                  only); Request.inc (I3) and holds.drained(uid, inc) before _end_request clears identity records; a
-                  K6 category for holds.held (ownership.MemoryAccountant has none); device-resident pgen_t / rgen_t.
+  ledger          (lead decision, 2026-10-16; NOT implemented here) when the dispatcher uses the store (opt-in),
+                  SourceHolds is the ONE owner of the source backings (K, V and bias). In that mode the dispatcher does
+                  not make its bias-only ledger entries for the same sources (admission_src :1675, ring_producer
+                  :1474, d2h_src :1767), and the K6 admission_kv logical count (_ring_counts admission_pos :1854; its
+                  report peak :1879) is not made. A K6 category for holds.held is a lead integration item.
+  open items      a named join stream in the backend for adm.gate (tests/kstep_toy.build makes copy / scatter /
+                  compute / d2h only); Request.inc (I3) and holds.drained(uid, inc) before _end_request clears identity
+                  records; device-resident pgen_t / rgen_t; one shared join_events (the lead moves it to backend.py).
 """
 from __future__ import annotations
 
@@ -144,30 +161,28 @@ def storage_alias(t: torch.Tensor) -> torch.Tensor:
 
 
 class SourceHolds:
-    """I2 (frozen interface, 2026-10-16): the queued copies' source backings, owned and charged until every copy that
-    reads them completed.
+    """I2 (frozen interface, 2026-10-16; release rule: lead decision S4 of the same day): the queued copies' source
+    backings, owned and charged until every copy that reads them completed.
 
       open(owner, kind, tensors) -> hold serial
                      The store takes the sources and keeps a reference to each tensor. Each distinct storage gets ONE
-                     record, charged at untyped_storage().nbytes() in the ledger (BiasOpLedger.hold with key (owner,
-                     kind, serial)). A storage that a live record already holds is not charged again (a shared record).
+                     record, charged at untyped_storage().nbytes() in the ledger (BiasOpLedger.hold with the key
+                     (owner, kind, serial, storage id)). A storage that a live record already holds is not charged
+                     again (a shared record). ATOMIC: every check and every new record is computed first; the ledger
+                     is charged only after that, and a refusal part-way uncharges what this call charged.
       read(serial, stream, ev)
-                     A copy on `stream` that reads the hold's sources completes at `ev`. Each stream is ordered, so
-                     the record keeps the latest event per stream.
-      close(serial)  No later copy reads the hold's sources. A record whose holds are all closed gets its release
-                     handle: the join (I1) of the latest event per stream. Records with the same events share one
-                     join. Returns the distinct release handles that this close set.
-      hold(...)      open, read and close in one call (a source that one copy reads).
-      poll()         PASSIVE (ev_done only; no wait, no stream advancement): releases each record whose holds are all
-                     closed and whose release handle is complete. The ledger uncharges it (release_key), and the
-                     store drops every reference to it.
+                     A copy on `stream` that reads the hold's sources completes at `ev`. Each stream is ordered, so a
+                     record keeps the latest event per stream. ev None is ignored (it never erases a stored event).
+      close(serial)  No later copy of this hold reads its sources.
+      poll()         PASSIVE (ev_done only; no wait, no stream advancement, no join event): releases each record whose
+                     holds are all closed and whose latest event of EVERY stream passed ev_done (_complete). The ledger
+                     uncharges it (release_key), and the store drops every reference to it.
 
     held / peak / log are the ledger's (bytes of the distinct storages held now, the exact allocation-transition peak,
     every transition). recount() is an independent recount from the records' own references. Not a Python-allocator
     or GPU measurement."""
 
-    def __init__(self, be: Any, join_stream: Optional[str] = None, ledger: Optional[BiasOpLedger] = None):
-        self.be, self.join_stream = be, join_stream
+    def __init__(self, ledger: Optional[BiasOpLedger] = None):
         self.ledger = ledger if ledger is not None else BiasOpLedger(HOLD_KINDS)
         missing = [k for k in HOLD_KINDS if k not in self.ledger.kinds]
         if missing:
@@ -176,7 +191,6 @@ class SourceHolds:
         self.holds: Dict[int, Dict[str, Any]] = {}
         self.serial = 0
         self.shared = 0                  # opens that found their storage already held (not charged again)
-        self.joins = 0                   # release handles that are new join events (two or more live inputs)
         self.released = 0                # records released
 
     @property
@@ -194,33 +208,51 @@ class SourceHolds:
     def open(self, owner: Tuple, kind: str, tensors: Iterable[Optional[torch.Tensor]]) -> int:
         if kind not in HOLD_KINDS:
             raise KStepError("tensor store: hold kind %r is not one of %s" % (kind, HOLD_KINDS))
-        self.serial += 1
-        hid = self.serial
-        sids: List[Tuple] = []
-        for t in tensors:
+        hid = self.serial + 1
+        plan: List[Dict[str, Any]] = []                  # one entry per distinct storage, in the order given
+        by_sid: Dict[Tuple, Dict[str, Any]] = {}
+        for t in tensors:                                # 1. checks and the new records; nothing is charged yet
             if t is None:
                 continue
-            if t.untyped_storage().nbytes() == 0:
-                continue                                 # an empty storage holds no backing
+            if not torch.is_tensor(t):
+                raise KStepError("tensor store: a %s source is not a tensor (%s)" % (kind, type(t).__name__))
             nb = t.untyped_storage().nbytes()
+            if nb == 0:
+                continue                                 # an empty storage holds no backing
             sid = storage_id(t)
-            rec = self.recs.get(sid)
-            if sid in sids:
-                rec["refs"].append(t)                    # this hold already covers the storage; keep the tensor too
+            ent = by_sid.get(sid)
+            if ent is not None:
+                ent["refs"].append(t)                    # this hold already covers the storage; keep the tensor too
                 continue
+            rec = self.recs.get(sid)
+            ent = dict(sid=sid, refs=[t], rec=rec, nbytes=nb, key=(owner, kind, hid, sid),
+                       alias=storage_alias(t) if rec is None else None)
+            by_sid[sid] = ent
+            plan.append(ent)
+        charged: List[Tuple] = []
+        try:                                             # 2. the ledger charges, one key per storage
+            for ent in plan:
+                if ent["rec"] is None:
+                    self.ledger.hold(kind, ent["alias"], key=ent["key"])
+                    charged.append(ent["key"])
+        except Exception:
+            for key in charged:                          # no charged orphan
+                self.ledger.release_key(kind, key)
+            raise
+        self.serial = hid                                # 3. the records and the hold
+        sids: List[Tuple] = []
+        for ent in plan:
+            rec = ent["rec"]
             if rec is None:
-                alias = storage_alias(t)
-                key = (owner, kind, hid)
-                self.ledger.hold(kind, alias, key=key)
-                rec = dict(kind=kind, key=key, alias=alias, nbytes=nb, refs=[], holds=[], open=0, last={}, gate=None)
-                self.recs[sid] = rec
+                rec = dict(kind=kind, key=ent["key"], alias=ent["alias"], nbytes=ent["nbytes"], refs=[], holds=[],
+                           open=0, last={})
+                self.recs[ent["sid"]] = rec
             else:
                 self.shared += 1
-            rec["refs"].append(t)
+            rec["refs"].extend(ent["refs"])
             rec["holds"].append(hid)
             rec["open"] += 1
-            rec["gate"] = None
-            sids.append(sid)
+            sids.append(ent["sid"])
         self.holds[hid] = dict(owner=owner, kind=kind, sids=sids, open=True)
         return hid
 
@@ -232,44 +264,29 @@ class SourceHolds:
 
     def read(self, hid: int, stream: str, ev: Any) -> None:
         h = self._open_hold(hid, "read")
+        if ev is None:
+            return
         for sid in h["sids"]:
             self.recs[sid]["last"][stream] = ev
 
-    def close(self, hid: int) -> List[Any]:
+    def close(self, hid: int) -> None:
         h = self._open_hold(hid, "close")
         h["open"] = False
-        made: Dict[Tuple, Any] = {}
-        gates: List[Any] = []
         for sid in h["sids"]:
-            rec = self.recs[sid]
-            rec["open"] -= 1
-            if rec["open"]:
-                continue                                 # another open hold still adds reads to this storage
-            evs = [rec["last"][s] for s in sorted(rec["last"])]
-            key = tuple(id(ev) for ev in evs)
-            if key not in made:
-                g = join_events(self.be, self.join_stream, evs)
-                if g is not None and not any(g is ev for ev in evs):
-                    self.joins += 1
-                made[key] = g
-                if not any(g is x for x in gates):
-                    gates.append(g)
-            rec["gate"] = made[key]
+            self.recs[sid]["open"] -= 1
         if not h["sids"]:
             del self.holds[hid]
-        return gates
 
-    def hold(self, owner: Tuple, kind: str, tensors: Iterable[Optional[torch.Tensor]], stream: str, ev: Any) -> int:
-        hid = self.open(owner, kind, tensors)
-        self.read(hid, stream, ev)
-        self.close(hid)
-        return hid
+    def _complete(self, rec: Dict[str, Any]) -> bool:
+        """The release rule: every hold of the record is closed and the latest event of every stream that read it
+        passed ev_done."""
+        return rec["open"] == 0 and all(ev_done(ev) for ev in rec["last"].values())
 
     def poll(self) -> int:
         n = 0
         for sid in list(self.recs):
             rec = self.recs[sid]
-            if rec["open"] or not ev_done(rec["gate"]):
+            if not self._complete(rec):
                 continue
             self.ledger.release_key(rec["kind"], rec["key"])
             del self.recs[sid]
@@ -311,8 +328,9 @@ class SourceHolds:
 class Admission:
     """One request's admission buffer A_r (11.2): the adopted prefill tensors per layer (k, v: (n, H, D); c: (n, H)),
     the producer event `ready` (on "compute"), the latest D2H read `dev` and compute read `cev`, the source hold and,
-    after close_admission, its release handle `gate`. After the close the record drops its tensor references (the hold
-    keeps them until the gate passes) and refuses every further copy."""
+    after close_admission, `gate`: the consumer handle that the executor's workspace reuse waits on (not the release
+    rule of the hold; SourceHolds releases each storage by the per-stream rule). After the close the record drops its
+    tensor references (the hold keeps them until poll releases them) and refuses every further copy."""
     __slots__ = ("owner", "b", "n", "k", "v", "c", "ready", "cev", "dev", "hold", "gate", "closed", "d2h_blocks",
                  "ring_copies")
 
@@ -352,8 +370,8 @@ class TensorStore:
         self.arenas = list(arenas)
         self.rings = list(rings) if rings is not None else None
         self.kv_dtype, self.bias_dtype = kv_dtype, bias_dtype
-        self.join_stream = join_stream
-        self.holds = SourceHolds(be, join_stream, ledger)
+        self.join_stream = join_stream                # only for adm.gate (a consumer handle), never for a release
+        self.holds = SourceHolds(ledger)
         kpo = self._poison(kv_dtype, poison)
         cpo = self._poison(bias_dtype, poison) if bias_dtype is not None else None
 
@@ -378,8 +396,8 @@ class TensorStore:
         self.dev = self.arena_k[0].device
         self.hdev = self.host_k[0].device
         self._store_ids = {storage_id(t) for t in self._stores()}
-        self.stats = dict(admissions=0, admission_d2h=0, admission_ring=0, admissions_closed=0, ring_produced=0,
-                          ring_published=0, published=0)
+        self.stats = dict(admissions=0, admission_d2h=0, admission_ring=0, admissions_closed=0, admission_joins=0,
+                          ring_produced=0, ring_published=0, published=0)
 
     # -- helpers
     @staticmethod
@@ -469,7 +487,7 @@ class TensorStore:
     def report(self) -> Dict[str, Any]:
         h = self.holds
         return dict(stats=dict(self.stats), held=h.held, peak=h.peak, records=len(h.recs), holds=len(h.holds),
-                    shared=h.shared, joins=h.joins, released=h.released, stores=self.store_bytes())
+                    shared=h.shared, released=h.released, stores=self.store_bytes())
 
     def poll(self) -> int:
         """The passive release of the source holds (call it at the existing host poll points)."""
@@ -482,7 +500,9 @@ class TensorStore:
         (n, H) bias_dtype tensor per layer (only with a bias dtype); all on the store's device. Views are accepted (use
         t.unbind(0) for an (L, n, H, D) tensor); the hold charges each distinct storage once, in full. `ready` is an
         optional producer event of another stream; the store waits it on "compute". A_r's ready event is recorded on
-        "compute" (the model of the prefill kernel's write, D1). Every check runs before any enqueue or hold."""
+        "compute" (the model of the prefill kernel's write, D1). Every check runs before any enqueue or hold.
+        PRECONDITION (module docstring): the executor does not reuse these tensors' storage until adm.gate (from
+        close_admission) completes; a next prefill into a reused workspace must wait on that adm.gate."""
         own = self._owner(owner)
         where = "admission of owner %s b %d" % (own, b)
         if not 0 <= b < self.B:
@@ -566,13 +586,20 @@ class TensorStore:
         return ev
 
     def close_admission(self, adm: Admission) -> Any:
-        """Step 3: no later copy reads A_r. The hold gets its release handle: the join (I1) of the latest compute read
-        (or the ready event) and the latest D2H read; one live handle is returned unchanged. The record drops its
-        tensor references. Returns the handle (also adm.gate)."""
+        """Step 3: no later copy reads A_r. adm.gate is the CONSUMER handle of this admission (the executor's reuse of
+        the prefill workspace waits on it): the I1 join of [adm.cev, or adm.ready when no ring copy ran; adm.dev],
+        None skipped; one live handle is returned unchanged. It is computed from this admission's own events, so a
+        storage shared with another admission never makes it complete early. The source hold is closed; its records
+        are released by poll() under the per-stream rule, independently of adm.gate. The record drops its tensor
+        references. Returns adm.gate."""
         where = "admission close of owner %s" % (getattr(adm, "owner", None),)
         self._open_admission(adm, where)
-        gates = self.holds.close(adm.hold)
-        adm.gate = join_events(self.be, self.join_stream, gates)
+        first = adm.cev if adm.cev is not None else adm.ready
+        gate = join_events(self.be, self.join_stream, (first, adm.dev))
+        if gate is not None and gate is not first and gate is not adm.dev:
+            self.stats["admission_joins"] += 1
+        self.holds.close(adm.hold)
+        adm.gate = gate
         adm.closed = True
         adm.k = adm.v = adm.c = None
         self.stats["admissions_closed"] += 1
@@ -584,8 +611,8 @@ class TensorStore:
         """The payload write of one ring entry that the caller bound first (RingPool.bind): k, v (D,) kv_dtype and c
         () or (1,) bias_dtype (only with a bias dtype), on the store's device. On "compute": a stream wait on prev_d2h
         (the bind's previous D2H event) and on `ready` (an optional producer event of another stream), then the copies.
-        The sources are held (kind "ring") until the copy's event. Returns that event (the caller's
-        RingPool.set_ready)."""
+        The sources are held (kind "ring"): the hold is opened after the checks and before the copies are enqueued, and
+        released by poll() after the copy's event. Returns that event (the caller's RingPool.set_ready)."""
         own = self._owner(owner)
         where = "ring producer of owner %s layer %d entry %d" % (own, l, e)
         self._entry(l, e, where)
@@ -596,6 +623,7 @@ class TensorStore:
         elif c is not None:
             raise KStepError("tensor store: ring producer c given, but the store has no bias (%s)" % where)
         self._live_entry(l, e, where)
+        hid = self.holds.open(own, "ring", (k, v, c))
         with self.be.stream(PRODUCE):
             if prev_d2h is not None:
                 self.be.stream_wait(PRODUCE, prev_d2h)
@@ -606,7 +634,8 @@ class TensorStore:
             if self.ring_c is not None:
                 self.be.memcpy(self.ring_c[l][e:e + 1], c.reshape(1), PRODUCE)
             ev = self.be.event_rec(PRODUCE)
-        self.holds.hold(own, "ring", (k, v, c), PRODUCE, ev)
+        self.holds.read(hid, PRODUCE, ev)
+        self.holds.close(hid)
         self.stats["ring_produced"] += 1
         return ev
 
@@ -656,10 +685,12 @@ class TensorStore:
         return hist_ev, rg
 
     def publish_block(self, owner: Tuple, l: int, b: int, j: int, k: torch.Tensor, v: torch.Tensor, c: Any = None,
-                      ready: Any = None) -> Any:
+                      *, ready: Any) -> Any:
         """The D2H of block j of layer l from caller tensors: k, v (bs, H, D) kv_dtype and c (bs, H) bias_dtype (only
-        with a bias dtype), on the store's device. On "d2h": a stream wait on `ready` (the producer of the sources),
-        the copies, then hist_ev. The sources are held (kind "publish") until hist_ev. Returns hist_ev."""
+        with a bias dtype), on the store's device. `ready` is REQUIRED (keyword): the producer event of the sources
+        (on CUDA, a "d2h" copy of tensors produced on "compute" needs that order); a caller with complete (eager)
+        sources passes ready=None explicitly. On "d2h": a stream wait on `ready`, the copies, then hist_ev. The sources
+        are held (kind "publish"): opened before the copies, released by poll() after hist_ev. Returns hist_ev."""
         own = self._owner(owner)
         where = "publication of owner %s layer %d b %d block %d" % (own, l, b, j)
         self._layer(l, where)
@@ -672,6 +703,7 @@ class TensorStore:
         elif c is not None:
             raise KStepError("tensor store: publish c given, but the store has no bias (%s)" % where)
         r0, r1 = j * bs, (j + 1) * bs
+        hid = self.holds.open(own, "publish", (k, v, c))
         with self.be.stream(PUBLISH):
             if ready is not None:
                 self.be.stream_wait(PUBLISH, ready)
@@ -680,7 +712,8 @@ class TensorStore:
             if self.host_c is not None:
                 self.be.memcpy(self.host_c[l][b, r0:r1], c, PUBLISH)
             hist_ev = self.be.event_rec(PUBLISH)
-        self.holds.hold(own, "publish", (k, v, c), PUBLISH, hist_ev)
+        self.holds.read(hid, PUBLISH, hist_ev)
+        self.holds.close(hid)
         self.stats["published"] += 1
         return hist_ev
 
