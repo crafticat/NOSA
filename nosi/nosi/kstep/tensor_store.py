@@ -111,22 +111,36 @@ the default "none" path is unchanged; sites named by function, as line numbers s
                   (producer_ready_of; attach_dispatcher sets store.producer_ready). Then prefill_tensors(kv) and a
                   producer payload(kvv, at=...) return (k, v, c, ready); payload(kvv) with at None (an expectation)
                   returns (k, v, c). `ready` is None (complete tensors) or ONE native event of the dispatcher's backend
-                  that the executor recorded after its writes. dispatch_admit and dispatch_produce check the result
-                  first (_producer_result, check_ready: KStepError "tensor store: I9: ...", before any hold, admit or
-                  enqueue) and pass ready to admit / produce_ring. Order: admit waits ready on "compute" before A_r's
-                  ready event, so admission_ring ("compute", later on the same ordered stream) and admission_d2h
-                  ("d2h", it waits A_r's ready event) follow it; produce_ring waits ready on "compute" before its
-                  copies, and publish_ring_block waits that entry's ready event on "d2h". Lifecycle: the hold records
-                  ready under (READY, serial), so a source storage stays held and charged (K6 source_staging) until
-                  its readiness AND every copy that reads it passed ev_done. Without producer_ready every path is that
-                  of milestone 2. No CUDA or model-overlap claim follows from the CPU evidence.
-  prepare (I9.1)  the executor call and its checks move BEFORE any dispatcher mutation: prepare_admit(d, uid, prompt)
-                  (the dispatcher's HOOK-L5 calls it on the queue head before queue.pop(0); it makes the ONE prefill,
-                  kv = ex.prefill(prompt[:-1]), and the checked prefill_tensors) and prepare_produce(d, l, r, h, kind,
-                  key, k, v, c) (before _ring_take, the bind and the map insert). Both are READ-ONLY and return None
+                  that the executor recorded after its writes. The result is checked (_producer_result, check_ready:
+                  KStepError "tensor store: I9: ...") by the prepare step below, before any hold, admit or enqueue,
+                  and ready goes to admit / produce_ring. Order: admit waits ready on "compute" before A_r's ready
+                  event, so admission_ring ("compute", later on the same ordered stream) and admission_d2h ("d2h", it
+                  waits A_r's ready event) follow it; produce_ring waits ready on "compute" before its copies, and
+                  publish_ring_block waits that entry's ready event on "d2h". Lifecycle ("held until ready"): every
+                  hold records an event on the stream that waited ready, after that wait (A_r's ready event and the
+                  ring copy's event on "compute"; publish_block's event on "d2h"), and the stream order makes that
+                  event complete only after ready. So
+                  a source storage stays held and charged (K6 source_staging) until its readiness and every copy that
+                  reads it completed. The hold also records ready itself under (READY, serial); that record never
+                  decides a release on the cpupack_core backends (the copy event already implies it) and is not the
+                  tested guard. check_ready knows the native event type of the cpupack_core CpuBackend and
+                  CudaBackend only: on a duck-typed wrapper backend (such as the test fixtures' DropWaits) any
+                  non-None ready is refused (ConfigError "tensor store: I9: backend <name> has no known native event
+                  type (...)"); ready None works there as before. Without producer_ready every path is that of
+                  milestone 2. No CUDA or model-overlap claim follows from the CPU evidence.
+  prepare (I9.1 / I9.2) the executor call and its checks come BEFORE the dispatcher's own mutation of that
+                  producer: prepare_admit(d, uid, prompt, b) (the dispatcher's HOOK-L5 calls it on the queue head
+                  before queue.pop(0), with its loop's batch slot b; it makes the ONE prefill, kv =
+                  ex.prefill(prompt[:-1]), and the checked prefill_tensors) and prepare_produce(d, l, r, h, kind, key,
+                  k, v, c) (before _ring_take, the bind and the map insert). Both are READ-ONLY and return None
                   without producer_ready (no executor call) and for an AdmissionSource producer; else a Prepared
                   (.kv for the admission). dispatch_admit / dispatch_produce(..., prepared=P) commit it with no second
-                  executor call. Without HOOK-L5 (prepared None) they call the executor as above.
+                  executor call; with producer_ready and no P they are refused by name (OwnershipViolation "tensor
+                  store: I9.2: ..."). Scope (I9.2): a refused prefill result leaves the dispatcher as it was (the
+                  request is still queued); a refused payload leaves the producer's own bind transaction undone (no
+                  _ring_take, bind, map insert or store change), while the writes that the dispatcher made earlier
+                  in the same call (r.draft_kv, r.dchain; in the verifier's pre-pass c.ws) stay, and the refusal
+                  aborts the run.
   hold provider   I5: hold_source() = ("tensor_store", holds.outstanding_count); Track C registers it
                   (FinishedCohorts.add_source; duck-typed: Dispatcher.store.holds.outstanding_count) when the store's
                   mode and "joined" are both on. The dispatcher attribute is exactly `store` (None in the default path).
@@ -251,9 +265,10 @@ class SourceHolds:
       read(serial, stream, ev)
                      A copy on `stream` that reads the hold's sources completes at `ev`. Each stream is ordered, so a
                      record keeps the latest event per stream. ev None is ignored (it never erases a stored event).
-                     I9 (milestone 4): the producer's ready event is recorded under the key (READY, serial), one key
-                     per hold (two holds may get their ready events from different streams), so the record is
-                     released only after its readiness AND every copy that reads it passed ev_done.
+                     I9 (milestone 4): the producer's ready event is also recorded under the key (READY, serial), one
+                     key per hold (two holds may get their ready events from different streams). On the cpupack_core
+                     backends it never decides a release: the hold's event on the stream that waited ready comes after
+                     that wait, so the stream order already makes it complete only after ready.
       close(serial)  No later copy of this hold reads its sources.
       poll()         PASSIVE (ev_done only; no wait, no stream advancement, no join event): releases each record whose
                      holds are all closed and whose latest event of EVERY stream passed ev_done (_complete). The ledger
@@ -587,7 +602,8 @@ class TensorStore:
         """I9: the result of a PRODUCER call of a producer_ready executor (prefill_tensors, or payload with at given)
         is the 4-tuple (k, v, c, ready) with check_ready(ready). Else KStepError "tensor store: I9: the
         producer_ready executor <class> returned <a n-tuple | a type> from <call>, not (k, v, c, ready) (<where>)".
-        It runs BEFORE any store or dispatcher bookkeeping of the call, so a refusal changes nothing."""
+        prepare_admit / prepare_produce run it BEFORE the dispatcher's bookkeeping of that producer and before any
+        store change (the scope of I9.2: module docstring, "prepare")."""
         if not isinstance(res, tuple) or len(res) != 4:
             got = ("a %d-tuple" % len(res)) if isinstance(res, tuple) else ("a %s" % type(res).__name__)
             raise KStepError("tensor store: I9: the producer_ready executor %s returned %s from %s, not (k, v, c, "
@@ -675,8 +691,9 @@ class TensorStore:
         optional producer event of another stream (I9: None or ONE native event of this backend, check_ready); the
         store waits it on "compute". A_r's ready event is recorded on "compute" (the model of the prefill kernel's
         write, D1), so every later copy of A_r is ordered after `ready`: admission_ring on "compute" (the same ordered
-        stream, after that wait) and admission_d2h on "d2h" (it waits A_r's ready event). The hold records `ready`
-        too (SourceHolds.read). Every check runs before any enqueue or hold.
+        stream, after that wait) and admission_d2h on "d2h" (it waits A_r's ready event). The hold records A_r's ready
+        event, which the stream order completes only after `ready` (held until ready). Every check runs before any
+        enqueue or hold.
         PRECONDITION (module docstring): the executor does not reuse these tensors' storage until adm.gate (from
         close_admission) completes; a next prefill into a reused workspace must wait on that adm.gate."""
         own = self._owner(owner)
@@ -689,7 +706,7 @@ class TensorStore:
                 self.be.stream_wait(PRODUCE, ready)
             rev = self.be.event_rec(PRODUCE)
         self.holds.read(hid, PRODUCE, rev)         # A_r stays held at least until its producer completed
-        self.holds.read(hid, (READY, hid), ready)  # I9: and until its readiness itself (None is ignored)
+        self.holds.read(hid, (READY, hid), ready)  # I9: recorded too (the copy event above already implies it)
         self.stats["admissions"] += 1
         self.stats["ready_admissions"] += ready is not None
         return Admission(own, b, n, ks, vs, cs, rev, hid)
@@ -793,9 +810,9 @@ class TensorStore:
         () or (1,) bias_dtype (only with a bias dtype), on the store's device. On "compute": a stream wait on prev_d2h
         (the bind's previous D2H event) and on `ready` (an optional producer event of another stream; I9: None or ONE
         native event of this backend, check_ready), then the copies. The sources are held (kind "ring"): the hold is
-        opened after the checks and before the copies are enqueued, and released by poll() after the copy's event and
-        `ready` (both recorded in the hold). Returns that event (the caller's RingPool.set_ready); publish_ring_block
-        waits it on "d2h", so the D2H of the entry is ordered after `ready` too."""
+        opened after the checks and before the copies are enqueued, and released by poll() after the copy's event,
+        which the stream order puts after `ready` (held until ready). Returns that event (RingPool.set_ready);
+        publish_ring_block waits it on "d2h", so the D2H of the entry is ordered after `ready` too."""
         own = self._owner(owner)
         where = "ring producer of owner %s layer %d entry %d" % (own, l, e)
         self._entry(l, e, where)
@@ -814,7 +831,7 @@ class TensorStore:
                 self.be.memcpy(self.ring_c[l][e:e + 1], c.reshape(1), PRODUCE)
             ev = self.be.event_rec(PRODUCE)
         self.holds.read(hid, PRODUCE, ev)
-        self.holds.read(hid, (READY, hid), ready)  # I9: held until its readiness too (None is ignored)
+        self.holds.read(hid, (READY, hid), ready)  # I9: recorded too (the copy event already implies it)
         self.holds.close(hid)
         self.stats["ring_produced"] += 1
         self.stats["ready_produced"] += ready is not None
@@ -895,7 +912,7 @@ class TensorStore:
                 self.be.memcpy(self.host_c[l][b, r0:r1], c, PUBLISH)
             hist_ev = self.be.event_rec(PUBLISH)
         self.holds.read(hid, PUBLISH, hist_ev)
-        self.holds.read(hid, (READY, hid), ready)  # I9: held until its readiness too (None is ignored)
+        self.holds.read(hid, (READY, hid), ready)  # I9: recorded too (the copy event already implies it)
         self.holds.close(hid)
         self.stats["published"] += 1
         self.stats["ready_published"] += ready is not None
@@ -998,18 +1015,18 @@ class TensorStore:
             raise OwnershipViolation("tensor store: I9.1: the prepared %s of %s is committed for %s"
                                      % (what, getattr(p, "who", type(p).__name__), who))
 
-    def prepare_admit(self, d: Any, uid: Any, prompt: Sequence[Any]) -> Optional["Prepared"]:
-        """HOOK-L5 (I9.1; Dispatcher._admit, on the queue head BEFORE queue.pop(0)), READ-ONLY. Without producer_ready:
-        None, and no executor call (the opt-out path is unchanged). With it: kv = ex.prefill(prompt[:-1]) (the ONE
-        prefill of the admission), then ex.prefill_tensors(kv), checked by _producer_result (the I9 refusals, the same
-        texts as before) and by the admission checks of admit (_admit_checks). The owner and slot of the refusal
-        context are those that _admit will give: (uid, d.inc_at_submit[uid]) and the lowest free batch slot. No store
-        or dispatcher state changes (the executor's own writes are the executor's). Returns Prepared (kv, the checked
-        k, v, c, ready; who = (uid, inc, b))."""
+    def prepare_admit(self, d: Any, uid: Any, prompt: Sequence[Any], b: int) -> Optional["Prepared"]:
+        """HOOK-L5 (I9.1 / I9.2; Dispatcher._admit, on the queue head BEFORE queue.pop(0), with the batch slot b of the
+        dispatcher's own loop), READ-ONLY. Without producer_ready: None, and no executor call (the opt-out path is
+        unchanged). With it: kv = ex.prefill(prompt[:-1]) (the ONE prefill of the admission), then
+        ex.prefill_tensors(kv), checked by _producer_result (the I9 refusals, the same texts as before) and by the
+        admission checks of admit (_admit_checks). The owner of the refusal context is the one _admit will give:
+        (uid, d.inc_at_submit[uid]); the slot is the caller's b (I9.2: never a guess; a request that ends at its
+        admission frees its slot inside the same loop). No store or dispatcher state changes (the executor's own
+        writes are the executor's). Returns Prepared (kv, the checked k, v, c, ready; who = (uid, inc, b))."""
         if not self.producer_ready:
             return None
         own = (uid, d.inc_at_submit.get(uid, 0))
-        b = next((i for i, x in enumerate(d.slot_req) if x is None), -1)
         where = "admission of owner %s b %d" % (own, b)
         kv = d.ex.prefill(list(prompt)[:-1])
         k, v, c, ready = self._producer_result(d.ex, d.ex.prefill_tensors(kv), "prefill_tensors", where)
@@ -1047,14 +1064,14 @@ class TensorStore:
         dispatcher gates (a compute and a D2H event after the steps, as before; the A record stays in d.adm, visible in
         the reports, until _ring_retire), then close_admission (terminal; adm.gate). The A record carries no tensor
         (k, v, c None): the store's hold owns and charges the A_r storages (K6 source_staging, not admission_kv).
-        I9 (milestone 4; producer_ready): the executor call comes FIRST, and its result is checked
-        (_producer_result: the 4-tuple (k, v, c, ready), check_ready) before any dispatcher or store bookkeeping of
-        the admission; then admit(..., ready=ready). Without producer_ready the order and the calls are exactly
-        those of milestone 2 (ready None).
+        I9 (milestone 4; producer_ready): the executor's checked result (k, v, c, ready) comes from prepare_admit;
+        admit(..., ready=ready). Without producer_ready the order and the calls are exactly those of milestone 2
+        (ready None).
         I9.1 (HOOK-L5): `prepared` is prepare_admit's result, made before the dispatcher popped the queue. It is
         committed here with NO second executor call (its who must be (r.uid, r.inc, r.b) and its kv the dispatcher's
-        kv, else OwnershipViolation "tensor store: I9.1: ..."). Without it (a dispatcher without HOOK-L5) the
-        producer_ready executor is called here, as above."""
+        kv, else OwnershipViolation "tensor store: I9.1: ..."). I9.2: with producer_ready and no prepared result the
+        call is refused by name (OwnershipViolation "tensor store: I9.2: dispatch_admit of owner <owner> b <b> without
+        a prepared result (...)"): the executor is never called after the dispatcher mutated."""
         bs, L, H = d.bs, d.L, d.H
         n0 = r.n
         ready = None
@@ -1064,10 +1081,11 @@ class TensorStore:
                 raise OwnershipViolation("tensor store: I9.1: the prepared admission of %s is committed with another "
                                          "kv" % (prepared.who,))
             k, v, c, ready = prepared.k, prepared.v, prepared.c, prepared.ready
-        elif self.producer_ready:                        # I9: the executor's result is checked before any change
-            k, v, c, ready = self._producer_result(d.ex, d.ex.prefill_tensors(kv), "prefill_tensors",
-                                                   "admission of owner %s b %d" % ((r.uid, r.inc), r.b))
-        r.rmap = [[{kind: {} for kind in RING_KINDS} for _ in range(H)] for _ in range(L)]
+        elif self.producer_ready:                        # I9.2: no late executor call after a dispatcher mutation
+            raise OwnershipViolation("tensor store: I9.2: dispatch_admit of owner %s b %d without a prepared result (a "
+                                     "producer_ready executor is called only by prepare_admit, before any dispatcher "
+                                     "mutation)" % ((r.uid, r.inc), r.b))
+        r.rmap =[[{kind: {} for kind in RING_KINDS} for _ in range(H)] for _ in range(L)]
         rec = dict(step=d.t, uid=r.uid, b=r.b, P0=r.P0, n=n0, items=n0 * H * L,
                    live_start=[rp.n_live for rp in d.rings])
         d.adm_log.append(rec)
@@ -1105,14 +1123,16 @@ class TensorStore:
         other producer (DRAFT, PRE) passes its eager (k, v, c) and the executor gives the TENSORS
         (ex.payload(kvv, at=(uid, layer, head, kind, position))), which produce_ring holds until the copy's event.
         Returns the ready event (the caller's RingPool.set_ready).
-        I9 (milestone 4; producer_ready): the payload call returns (k, v, c, ready), checked by _producer_result before
-        produce_ring opens its hold or enqueues anything; then produce_ring(..., ready=ready). Without producer_ready
-        the call is exactly that of milestone 2 (ready None).
+        I9 (milestone 4; producer_ready): the executor's checked payload (k, v, c, ready) comes from prepare_produce;
+        produce_ring(..., ready=ready). Without producer_ready the call is exactly that of milestone 2 (ready None).
         I9.1 (HOOK-L5): `prepared` is prepare_produce's result, made BEFORE the dispatcher's _ring_take, bind and map
-        insert, so a refusal changes nothing in the dispatcher. It is committed here with NO second executor call (its
-        who must be (uid, layer, head, kind, position) of this producer, else OwnershipViolation "tensor store: I9.1:
-        ..."). Without it (a dispatcher without HOOK-L5) the producer_ready executor is called here, after the bind
-        (that bind is then not undone by a refusal)."""
+        insert, so a refused producer result leaves the producer's own bind transaction undone (no _ring_take, bind,
+        map insert or store change; I9.2: the writes that the dispatcher made earlier in the same call, r.draft_kv,
+        r.dchain and in the verifier's pre-pass c.ws, stay, and the refusal aborts the run). It is committed here with
+        NO second executor call (its who must be (uid, layer, head, kind, position) of this producer, else
+        OwnershipViolation "tensor store: I9.1: ..."). I9.2: with producer_ready and no prepared result (and not an
+        AdmissionSource) the call is refused by name (OwnershipViolation "tensor store: I9.2: dispatch_produce of
+        <context> without a prepared result (...)"): the executor is never called after the bind."""
         if isinstance(k, AdmissionSource):
             if prepared is not None:
                 raise OwnershipViolation("tensor store: I9.1: a prepared result %s for an admission-buffer producer "
@@ -1124,9 +1144,10 @@ class TensorStore:
         if prepared is not None:                         # I9.1: checked before the bind (prepare_produce)
             self._check_prepared(prepared, (r.uid, l, h, kind, pos), "ring producer")
             kt, vt, ct, ready = prepared.k, prepared.v, prepared.c, prepared.ready
-        elif self.producer_ready:                        # I9: the executor's result is checked before any store change
-            kt, vt, ct, ready = self._producer_result(d.ex, d.ex.payload((k, v, c), at=(r.uid, l, h, kind, pos)),
-                                                      "payload", self._producer_where(own, l, h, kind, pos))
+        elif self.producer_ready:                        # I9.2: no late executor call after the bind
+            raise OwnershipViolation("tensor store: I9.2: dispatch_produce of %s without a prepared result (a "
+                                     "producer_ready executor is called only by prepare_produce, before the bind)"
+                                     % (self._producer_where(own, l, h, kind, pos),))
         else:
             kt, vt, ct = d.ex.payload((k, v, c), at=(r.uid, l, h, kind, pos))
         return self.produce_ring(own, l, e, kt, vt, ct, prev_d2h, ready=ready)
