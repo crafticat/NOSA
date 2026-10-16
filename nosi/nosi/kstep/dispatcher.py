@@ -290,6 +290,7 @@ class Config:
     ring_slack: Optional[int] = None       # M2 B2 ring: S_ring >= 1 (default B * H); Q_l = B * H * R_log + S_ring
     consume: str = "none"                  # C1.2: "none" | "physical" (serialized physical consumption; see the docstring)
     progress_guard: str = "pin"            # "pin" (the pin guard, as before) | "rev6" (the rev6 guarantee REPLACES it; C81)
+    reader_frontier: str = "single"        # HOOK-C: "single" (one ordered reader stream, as before) | "joined" (frontier.py)
 
 
 class Draft:
@@ -356,6 +357,7 @@ class Request:
         self.pub_hold: Dict[Tuple[int, int, int], set] = {}  # rev6 H1: (l, h, pos) below the boundary -> holder keys
         self.rmap: Optional[List[List[Dict[str, Dict]]]] = None  # M2 B2: [l][h][kind] -> key -> (entry, rgen) / marker
         self.hist_pub: Dict[Tuple[int, int], int] = {}      # M2 B2: (l, block) -> publication sequence (hown)
+        self.inc = 0                                         # HOOK-C: I3 incarnation (given at submit; 0 = none)
 
     def u(self, i: int) -> int:
         return self.toks[self.E] if i == 0 else self.drafts[i - 1].d
@@ -562,6 +564,16 @@ class Dispatcher:
         self._read_keys = set()
         self._n_new_val = 0
         self._n_bias_reads = 0                     # C1.1: arena bias reads the executor registered in the current call
+        # HOOK-C: I3 incarnations (assigned at submit) and Config.reader_frontier. frontier.py is imported only in
+        # "joined" mode, so "single" loads, runs and reports exactly as before.
+        self.inc_seq = 0
+        self.inc_at_submit: Dict[Any, int] = {}
+        if cfg.reader_frontier not in ("single", "joined"):
+            raise ConfigError("reader_frontier must be one of ('single', 'joined') (got %r)" % (cfg.reader_frontier,))
+        self.frontier = None
+        if cfg.reader_frontier == "joined":
+            from .frontier import CompletionOwnership
+            self.frontier = CompletionOwnership(be, entry_bytes=self.acct.u["release_entry"])
 
     # ================================================================== requests
     def submit(self, uid, prompt: List[int], max_new_tokens: int) -> None:
@@ -571,6 +583,8 @@ class Dispatcher:
             raise ValueError("empty prompt")
         if len(prompt) + max_new_tokens > self.cfg.S_host:
             raise ConfigError("prompt %d + max_new_tokens %d > S_host %d" % (len(prompt), max_new_tokens, self.cfg.S_host))
+        self.inc_seq += 1                                              # HOOK-C: I3, the incarnation of this submit
+        self.inc_at_submit[uid] = self.inc_seq
         self.queue.append((uid, list(prompt), int(max_new_tokens)))
 
     def active(self) -> List[Request]:
@@ -583,6 +597,9 @@ class Dispatcher:
             uid, prompt, N = self.queue.pop(0)
             r = Request(uid, b, prompt, N, self.L, self.H, self.stride, self.ex.compress, self.chain_kernel)
             self.reqs[uid] = r
+            r.inc = self.inc_at_submit.pop(uid, 0)                     # HOOK-C: I3 (0: not queued through submit)
+            if self.frontier is not None:                              # HOOK-C: the incarnation becomes live
+                self.frontier.start_request(self, r)
             self.slot_req[b] = r
             self.age[uid] = len(self.age)
             for l in range(self.L):
@@ -636,6 +653,8 @@ class Dispatcher:
         self.trace[r.uid]["final"] = list(r.toks)
         self.slot_req[r.b] = None
         self.stats["requests_done"] += 1
+        if self.frontier is not None:                                  # HOOK-C: its finished-cohort records are cleared
+            self.frontier.end_request(self, r)                         # once every hold of the incarnation drained (I3)
 
     # ================================================================== the step
     def run(self, max_steps: int = 200000) -> Dict[Any, List[int]]:
@@ -1103,11 +1122,15 @@ class Dispatcher:
         done = [k for k, lay in self.rel_layers.items() if len(lay) == self.L and all(lay.values())]
         for k in done:                                                  # K6: every layer of the key is released
             del self.rel_layers[k]
+        if self.frontier is not None:                                   # HOOK-C: prune complete frontiers; clear the
+            self.frontier.poll(self)                                    # records of drained incarnations (non-blocking)
 
     def _release_refs(self, key, l: int) -> None:
         """R1: drop the references keyed `key` at layer l (one key, R1.2); PO / VRES slots that lose their last reference
         go through the reader gate. A second release of the same (key, l) is an ownership violation (R1.4)."""
         lay = self.rel_layers.get(key)
+        if lay is None and self.frontier is not None:                  # HOOK-C: after pruning, the durable finished-
+            self.frontier.refuse_late_release(self, key, l)            # cohort record names a double release (m1)
         if lay is None or l not in lay:
             raise KStepError("R1.4: release of cohort %s at layer %d that was never queued" % (key, l))
         if lay[l]:
@@ -1201,11 +1224,15 @@ class Dispatcher:
         self._n_ring_val += 1
         self.rstat["ring_reads_registered"] += 1
 
-    def _install_reader(self, l: int, read_slots, ev) -> None:
+    def _install_reader(self, l: int, read_slots, ev, stream: Optional[str] = None) -> None:   # HOOK-C: stream
         """The call's reader event becomes the last reader of every slot read (arena mode: and of its position) and the
         (key, l) reader event of every key that read a slot (K4, R1). M2 B2 ring mode: it is also the compute gate of
         every ring entry the call read, also when no historical slot was read."""
         if not read_slots and not self._ring_reads:
+            return
+        if self.frontier is not None:                                  # HOOK-C: "joined": each object gets the JOINED
+            self.frontier.install(self, l, read_slots, ev,             # handle of its per-stream latest readers; the
+                                  stream or getattr(self.ex, "read_stream", "compute"))   # stream that recorded ev
             return
         for l_, b_, h_, idx in read_slots:
             s = self.pools[l_].stream(b_, h_).slots[idx]
@@ -2344,6 +2371,8 @@ class Dispatcher:
         if lay is not None and l in lay and not self.mut.no_late_protection_guard:
             raise KStepError("R1.5: late protection of block %d at layer %d for cohort %s after its layer-%d references "
                              "were queued for release" % (j, l, key, l))
+        if self.frontier is not None:                                  # HOOK-C: the durable finished-cohort record
+            self.frontier.refuse_late_protect(self, key, l, j)         # also after rel_layers was pruned (m1, I3)
         st.protect(j, key, kind)
 
     def _row_bound(self, r: Request, rows, l: int, who: str, hist: Optional[int] = None) -> None:
@@ -2375,6 +2404,8 @@ class Dispatcher:
 
     def _queue_release(self, key, l: int) -> None:
         """R1.1 / R1.4: queue the release of every reference keyed `key` at layer l, at most once per (key, l)."""
+        if self.frontier is not None and key not in self.rel_layers and self.frontier.late_queue(self, key, l):
+            return                                                     # HOOK-C: a finished key after pruning (m1)
         lay = self.rel_layers.setdefault(key, {})
         if l in lay:
             return
@@ -2713,6 +2744,8 @@ class Dispatcher:
     def _finished_key(self, key) -> None:
         """R1.4 decision cleanup (acceptance, cancellation, untriggered key): queue only the layers of `key` that are not
         queued yet; a layer queued after its execution (R1.1) is not queued again."""
+        if self.frontier is not None and self.frontier.begin_finish(self, key):
+            return                                                     # HOOK-C: a duplicate decision is a no-op (m1)
         if self.mut.cleanup_skips_unqueued_layers:
             return                                                     # NEGATIVE CONTROL (R1.6 rollback)
         for l in range(self.L):
@@ -2721,6 +2754,8 @@ class Dispatcher:
                 self.pending_release.append((key, l))
             else:
                 self._queue_release(key, l)
+        if self.frontier is not None:                                  # HOOK-C: the durable record, after every layer
+            self.frontier.record_finish(self, key)                     # of the key was queued (m1, I3)
 
     def _apply(self, r: Request, c: Cohort, o) -> None:
         ep = self.trace[r.uid]["epochs"][-1]
@@ -2980,6 +3015,8 @@ class Dispatcher:
         every remaining D2H snapshot; every publication's snapshot must have been validated exactly once."""
         self.be.synchronize(order or self.cfg.drain_order)
         self._validate(all_=True)
+        if self.frontier is not None:                                  # HOOK-C: every stream ran: prune and clear what
+            self.frontier.poll(self)                                   # drained (non-blocking)
         if self.abi4:                                                  # C1.1 A9: after the drain, every event-held
             self.bias_ledger.retire()                                  # backing is released (adversarial payloads of
                                                                        # transfers never landed stay held)
