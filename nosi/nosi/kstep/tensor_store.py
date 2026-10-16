@@ -60,41 +60,52 @@ Not claimed: NOSA or model numerics, CUDA stream safety, HBM fit or throughput. 
 pools' CPU int64 tensors.
 
 DISPATCHER ADAPTER (milestone 2; opt-in Config.store = "tensor"; every dispatcher / ownership edit is marked HOOK-B2;
-the default "none" path is unchanged; line numbers at NOSI feature/kstep-b2):
-  Config          dispatcher.py:294-295 store ("none" | "tensor") and store_join (the stream of adm.gate).
-  __init__        :523-526 attach_dispatcher (after the int64 stores and the attach calls, BEFORE make_transport):
-                  the TensorStore over the dispatcher's Arena / RingPool with the executor's dtypes BECOMES host / arena
-                  / ring K, V and bias (bias_dtype too), and the executor is attached to it again; :539-540 the K6
-                  category source_staging (ownership.py:921-925, :975-987, :999-1002, :1036-1037).
-  admission       :1688-1689 _admit_recent -> dispatch_admit: A_r = ex.prefill_tensors(kv) via admit; complete blocks
-                  by _history -> _d2h_block -> dispatch_d2h_block -> admission_d2h; the partial block by the existing
-                  bind (_produce) -> dispatch_produce -> admission_ring; the dispatcher's A record (no tensors) keeps
-                  ready / cev / dev and stays in d.adm until _ring_retire; then close_admission.
-  producers       :1496-1498 _produce, after the bind and the map insert -> dispatch_produce -> produce_ring with the
-                  executor's tensors (ex.payload) or admission_ring; set_ready of the returned event; no bias entry.
-  publication     :1750-1751 _d2h_block -> dispatch_d2h_block: publish_ring_block (decode blocks) or admission_d2h
+the default "none" path is unchanged; sites named by function, as line numbers shift when other tracks merge):
+  Config          store ("none" | "tensor") and store_join (the stream of adm.gate).
+  __init__        attach_dispatcher (after the int64 stores and the attach calls, BEFORE make_transport): the
+                  TensorStore over the dispatcher's Arena / RingPool with the executor's dtypes BECOMES host / arena /
+                  ring K, V and bias (bias_dtype too); the executor is attached to it again; Dispatcher.store (None in
+                  the default path). Then check_transport (right after make_transport) and the K6 category
+                  source_staging (ownership.MemoryAccountant.enable_sources).
+  admission       Dispatcher._admit_recent -> dispatch_admit: A_r = ex.prefill_tensors(kv) via admit; complete blocks by
+                  _history -> _d2h_block -> dispatch_d2h_block -> admission_d2h; the partial block by the existing bind
+                  (_produce) -> dispatch_produce -> admission_ring; the dispatcher's A record (no tensors) keeps ready /
+                  cev / dev, is appended to d.adm and stays there until _ring_retire; then close_admission.
+  producers       Dispatcher._produce, after the bind and the map insert -> dispatch_produce -> produce_ring with the
+                  executor's tensors (ex.payload(kvv, at=...)) or admission_ring; set_ready of the returned event.
+  publication     Dispatcher._d2h_block -> dispatch_d2h_block: publish_ring_block (decode blocks) or admission_d2h
                   (prompt blocks); hist_ev, snapshot, hown, note_d2h and counters as before. In the store's mode recent
                   is "ring", so _history's eager branch and _d2h_block's eager_matched branch are not reached;
                   publish_block stays the store's API for them (component-tested; not wired).
-  validators      :1228-1229 _register_ring_read: the expectation is the executor's tensor of the eager item
-                  (dispatch_expect_item); the D2H snapshots compare with dispatch_expect_block. :2480-2482 _row_kv:
-                  the historical rows of Row.kv are the executor's values of the arena bytes (ex.values), not .tolist().
-  release         :1645-1646 _ring_retire (the host poll) and :3033-3036 _sample_memory: the passive poll().
-  K6 / ledger     (lead decision) SourceHolds is the ONE owner of the source backings. :3033-3036: admission_pos = 0
-                  (no admission_kv charge), source_staging = holds.held (a sampled value; the exact peak is
+  validators      Dispatcher._register_ring_read: the expectation is the executor's tensor of the eager item
+                  (dispatch_expect_item, store device); the D2H snapshots compare with dispatch_expect_block (host
+                  device; checked mode only). Dispatcher._row_kv: the historical rows of Row.kv are the executor's
+                  values of the arena bytes (ex.values), not .tolist().
+  release         Dispatcher._ring_retire (the host poll), _sample_memory and finish (after the drain, BEFORE the
+                  frontier's poll): the passive poll().
+  K6 / ledger     (lead decision) SourceHolds is the ONE owner of the source backings. _sample_memory: admission_pos =
+                  0 (no admission_kv charge), source_staging = holds.held (a sampled value; the exact peak is
                   holds.peak). The dispatcher's admission_src / ring_producer / d2h_src entries are not made (the
                   store paths return before them). FREE / DRAINING ring entries and the held A records stay in the
                   reports (ring_report admission_held / admission_freed / admission_kv_peak_*).
-  executor        tensor_payload = True, kv_dtype / bias_dtype (torch dtypes), prefill_tensors(kv) -> per-layer (k, v,
-                  c) tensors of the last prefill, payload((k, v, c)) -> the tensors of one eager item;
-                  values(k, v, c) -> the eager items of rows read from the stores (the historical rows of Row.kv,
-                  dispatcher _row_kv HOOK-B2); optional store_device (default "cpu").
+  transport       check_transport: a typed staging Pipe must stage kv_dtype (transfer.S0Transport stages int64 by
+                  default and is refused); transfer.AdversarialTransport copies rows as they are; a transport may
+                  declare carries_dtype.
+  executor        tensor_payload = True; fresh_outputs = True; kv_dtype / bias_dtype (torch dtypes);
+                  prefill_tensors(kv) -> per-layer (k, v, c) tensors of the last prefill; payload(kvv, at=None) -> the
+                  tensors of one eager item (at = (uid, layer, head, kind, position) for a producer, None for an
+                  expectation); values(k, v, c) -> the eager items of rows read from the stores; optional
+                  store_device (default "cpu").
+  executor ordering (lead decision; CUDA later) fresh_outputs = True states that the prefill and payload tensors are
+                  fresh storage that the executor does not reuse while store.holds.holds_storage(t) is True. A CUDA
+                  executor that writes them on its own stream must also hand the store a ready event of that write
+                  (admit and produce_ring take `ready`); the dispatcher adapter does not pass one yet (no CUDA hook).
   hold provider   I5: hold_source() = ("tensor_store", holds.outstanding_count); Track C registers it
                   (FinishedCohorts.add_source; duck-typed: Dispatcher.store.holds.outstanding_count) when the store's
                   mode and "joined" are both on. The dispatcher attribute is exactly `store` (None in the default path).
-  open items      the S0 transport in the store's mode (its Pipe needs dtype = kv_dtype; the portable controls use the
-                  adversarial transport); eager / eager_matched in the store's mode; device-resident pgen_t / rgen_t;
-                  A_r reuse by a real executor (the precondition above); the reset rule I4 (drained() before a reset).
+  reset (I4)      drained_all() and clear_caches(); Track C's reset guard calls them (the lead wires it).
+  open items      the S0 transport in the store's mode (refused until its Pipe stages kv_dtype); eager / eager_matched
+                  in the store's mode; device-resident pgen_t / rgen_t; the CUDA ready events above.
 """
 from __future__ import annotations
 
@@ -499,7 +510,7 @@ class TensorStore:
 
     # -- wiring and reports
     def attach_executor(self, ex: Any, register: Any, register_ring: Any = None) -> None:
-        """The executor's attach calls, as Dispatcher.__init__ makes them (dispatcher.py:475, :489, :501)."""
+        """The executor's attach calls, as Dispatcher.__init__ makes them (attach_arena, attach_ring, attach_bias)."""
         ex.attach_arena(self.be, self.arena_k, self.arena_v, [a.pgen_t for a in self.arenas], register)
         if self.rings is not None:
             ex.attach_ring(self.be, self.ring_k, self.ring_v, [rp.rgen_t for rp in self.rings], register_ring)
@@ -517,8 +528,30 @@ class TensorStore:
                     shared=h.shared, released=h.released, stores=self.store_bytes())
 
     def poll(self) -> int:
-        """The passive release of the source holds (call it at the existing host poll points)."""
-        return self.holds.poll()
+        """The passive release of the source holds (call it at the existing host poll points). It also drops the
+        instrumentation record of every closed admission whose hold drained, so `admissions` stays bounded."""
+        n = self.holds.poll()
+        if self.admissions:
+            self.admissions = [a for a in self.admissions
+                               if not (a["adm"].closed and a["adm"].hold not in self.holds.holds)]
+        return n
+
+    def check_transport(self, tp: Any) -> None:
+        """HOOK-B2 (Dispatcher.__init__, right after make_transport): the transport must carry the store's kv_dtype. A
+        transport that declares carries_dtype is taken at its word; a typed staging Pipe (transfer.S0Transport: int64
+        by default) must stage kv_dtype; transfer.AdversarialTransport (name "adversarial") copies the host rows as
+        they are (clone, copy_). Any other transport, or another dtype: ConfigError."""
+        dt = getattr(tp, "carries_dtype", None)
+        if dt is None:
+            pipe = getattr(tp, "pipe", None)
+            if pipe is not None:
+                dt = getattr(pipe, "dtype", None)
+            elif getattr(tp, "name", None) == "adversarial":
+                dt = self.kv_dtype
+        if dt != self.kv_dtype:
+            raise ConfigError("tensor store: the transport %s (%s) carries %s, not the store's kv_dtype %s "
+                              "(Config.store 'tensor')"
+                              % (type(tp).__name__, getattr(tp, "name", None), dt, self.kv_dtype))
 
     # -- admission (11.2)
     def admit(self, owner: Tuple, b: int, k: Sequence[torch.Tensor], v: Sequence[torch.Tensor],
@@ -624,7 +657,8 @@ class TensorStore:
         the hold is closed; then adm.gate is formed. If the join raises, the admission stays closed, the hold stays
         closed with its pending per-stream events (poll releases each storage only after its own stream events
         completed; nothing is forced and no hold is dropped), adm.gate stays None with adm.gate_ok False (None is NOT
-        a complete handle then), and the error propagates."""
+        a complete handle then), and the error propagates. stats["admissions_closed"] and stats["admission_joins"]
+        count SUCCESSFUL closes only: a failed join leaves both unchanged (TS9)."""
         where = "admission close of owner %s" % (getattr(adm, "owner", None),)
         self._open_admission(adm, where)
         adm.closed = True                     # milestone 2: terminal BEFORE anything that can fail
@@ -826,7 +860,9 @@ class TensorStore:
 
     def clear_caches(self) -> None:
         """I4: the store keeps no id(ev)-keyed cache. It drops its admission instrumentation (whose Admission records
-        reference events). OwnershipViolation while anything is held: nothing is dropped to make a reset possible."""
+        reference events). OwnershipViolation while anything is held: nothing is dropped to make a reset possible.
+        Reachable through Track C's reset guard (I4: drained() then clear_caches() of every cache owner before a
+        CudaBackend.reset); the lead wires that call."""
         if not self.drained_all():
             raise OwnershipViolation("tensor store: clear_caches with %d source records and %d holds outstanding"
                                      % (len(self.holds.recs), len(self.holds.holds)))
@@ -868,49 +904,57 @@ class TensorStore:
             A["dev"] = d.be.event_rec(PUBLISH)
         sids = list(self.holds.holds[adm.hold]["sids"]) if adm.hold in self.holds.holds else []
         self.admissions.append(dict(uid=r.uid, inc=r.inc, adm=adm, sids=sids, step=d.t))
-        self.close_admission(adm)
         rec["exact_after"] = [[len(r.rmap[l][h][R_EXACT]) for h in range(H)] for l in range(L)]
-        d.adm.append(A)
+        d.adm.append(A)                                  # the dispatcher's A record first, then the terminal close
         d.adm_peak = max(d.adm_peak, sum(a["n"] * H * L for a in d.adm))
+        self.close_admission(adm)
 
-    def dispatch_produce(self, d: Any, l: int, r: Any, h: int, e: int, prev_d2h: Any, k: Any, v: Any, c: Any) -> Any:
+    def dispatch_produce(self, d: Any, l: int, r: Any, h: int, e: int, prev_d2h: Any, k: Any, v: Any, c: Any,
+                         kind: Any = None, key: Any = None) -> Any:
         """HOOK-B2 (Dispatcher._produce, store mode; after the bind transaction and the map insert): the payload write
         of entry e. An AdmissionSource (the partial block of dispatch_admit) is copied from A_r (admission_ring); any
-        other producer (DRAFT, PRE) passes its eager (k, v, c) and the executor gives the TENSORS (ex.payload), which
-        produce_ring holds until the copy's event. Returns the ready event (the caller's RingPool.set_ready)."""
+        other producer (DRAFT, PRE) passes its eager (k, v, c) and the executor gives the TENSORS
+        (ex.payload(kvv, at=(uid, layer, head, kind, position))), which produce_ring holds until the copy's event.
+        Returns the ready event (the caller's RingPool.set_ready)."""
         if isinstance(k, AdmissionSource):
             return self.admission_ring(k.adm, l, h, k.pos, e, prev_d2h)
-        kt, vt, ct = d.ex.payload((k, v, c))
+        pos = key[1] if isinstance(key, tuple) else key  # PRE: (cohort key, position); DRAFT / EXACT: the position
+        kt, vt, ct = d.ex.payload((k, v, c), at=(r.uid, l, h, kind, pos))
         return self.produce_ring((r.uid, r.inc), l, e, kt, vt, ct, prev_d2h)
 
     def dispatch_expect_block(self, d: Any, r: Any, l: int, j: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The checked-mode expectation of block j of layer l: the executor's tensors of the eager exact items
-        r.pub[l][h][pos], stacked to (bs, H, D), (bs, H, D) and (bs, H) (instrumentation; the data path never reads
-        it)."""
+        r.pub[l][h][pos], stacked to (bs, H, D), (bs, H, D) and (bs, H), on the HOST device (_d2h_poll and the snapshot
+        check compare them with host rows; instrumentation; the data path never reads it)."""
         ks, vs, cs = [], [], []
         for pos in range(j * self.bs, (j + 1) * self.bs):
             items = [d.ex.payload(r.pub[l][h][pos]) for h in range(self.H)]
             ks.append(torch.stack([x[0] for x in items]))
             vs.append(torch.stack([x[1] for x in items]))
             cs.append(torch.stack([x[2].reshape(()) for x in items]))
-        return torch.stack(ks), torch.stack(vs), torch.stack(cs)
+        return torch.stack(ks).to(self.hdev), torch.stack(vs).to(self.hdev), torch.stack(cs).to(self.hdev)
 
     def dispatch_expect_item(self, d: Any, kvv: Any, which: str) -> torch.Tensor:
         """HOOK-B2 (Dispatcher._register_ring_read, store mode): the expectation of one deferred ring read in the
-        stores' dtypes: the executor's tensor of the eager item kvv, part `which` ("k", "v" or "c"; the bias (1,))."""
+        stores' dtypes, on the store's device (the deferred copy of a ring row): the executor's tensor of the eager
+        item kvv, part `which` ("k", "v" or "c"; the bias (1,))."""
         k, v, c = d.ex.payload(kvv)
-        return {"k": k, "v": v, "c": c.reshape(1)}[which]
+        return {"k": k, "v": v, "c": c.reshape(1)}[which].to(self.dev)
 
     def dispatch_d2h_block(self, d: Any, r: Any, l: int, j: int, adm: Any) -> None:
         """HOOK-B2 (Dispatcher._d2h_block, store mode; recent "ring" only): contract 11.3 for block j of layer l with
         the dispatcher's bookkeeping kept exactly (publication serial, hist_ev, the ordered checked-mode snapshot, its
         record, hown, the D2H gate of every source entry, the counters). The copies go through the store: an admission
         block (adm = the A record) by admission_d2h from A_r; any other block by publish_ring_block from its LIVE EXACT
-        entries (with the rgen identity copies). The expectations (ek, evv, ec) are the executor's tensors of r.pub
-        (dispatch_expect_block). Then hist_ev on "d2h" (after the store's copies), the snapshot, the records."""
+        entries (with the rgen identity copies). In checked mode only, the expectations (ek, evv, ec) are the
+        executor's tensors of r.pub on the host device (dispatch_expect_block). Then hist_ev on "d2h" (after the store's
+        copies), the snapshot, the records."""
         bs, b, H = self.bs, r.b, self.H
         r0, r1 = j * bs, (j + 1) * bs
-        ek, evv, ec = self.dispatch_expect_block(d, r, l, j)
+        checked = d._checked()
+        ek = evv = ec = None
+        if checked:
+            ek, evv, ec = self.dispatch_expect_block(d, r, l, j)
         d.pub_seq += 1
         pub = d.pub_seq
         rg = rg_exp = src = None
@@ -935,7 +979,7 @@ class TensorStore:
             hist_ev = d.be.event_rec(PUBLISH)
             r.hist_ev[(l, j)] = hist_ev
             snap = None
-            if d._checked():
+            if checked:
                 sk, sv, sc = torch.empty_like(ek), torch.empty_like(evv), torch.empty_like(ec)
                 d.be.memcpy(sk, d.host_k[l][b, r0:r1], PUBLISH)
                 d.be.memcpy(sv, d.host_v[l][b, r0:r1], PUBLISH)
@@ -977,8 +1021,10 @@ def attach_dispatcher(d: Any, cfg: Any, ex: Any, be: Any) -> TensorStore:
     executor's dtypes, makes its tensors the dispatcher's stores (host / arena / ring K, V and bias; bias_dtype), and
     attaches the executor to them (the same calls as Dispatcher.__init__, the same callbacks). ConfigError when:
     the mode is unknown; the dispatcher is not physical "arena", recent "ring" and ABI v4; the executor does not declare
-    tensor_payload = True with prefill_tensors, payload and the torch dtypes kv_dtype / bias_dtype; the backend has no
-    stream Config.store_join (adm.gate). Returns the store (Dispatcher.store)."""
+    tensor_payload = True with prefill_tensors, payload, values and the torch dtypes kv_dtype / bias_dtype; the
+    executor does not declare fresh_outputs = True (lead decision; module docstring, executor ordering); the backend
+    has no stream Config.store_join (adm.gate). The transport is checked after make_transport (check_transport).
+    Returns the store (Dispatcher.store)."""
     if cfg.store not in STORE_MODES:
         raise ConfigError("store must be one of %s (got %r)" % (STORE_MODES, cfg.store))
     if not (d.arena_mode and d.ring_mode and d.abi4):
@@ -990,6 +1036,10 @@ def attach_dispatcher(d: Any, cfg: Any, ex: Any, be: Any) -> TensorStore:
         raise ConfigError("tensor store: Config.store 'tensor' needs an executor with tensor_payload = True, %s and "
                           "the torch dtypes kv_dtype / bias_dtype (executor %s; missing %s)"
                           % (" / ".join(ADAPTER_METHODS), type(ex).__name__, miss))
+    if getattr(ex, "fresh_outputs", False) is not True:
+        raise ConfigError("tensor store: Config.store 'tensor' needs an executor that declares fresh_outputs = True: "
+                          "its prefill and payload tensors are fresh storage that it does not reuse while "
+                          "store.holds.holds_storage(t) is True (executor %s)" % (type(ex).__name__,))
     streams = getattr(be, "s", None)
     if not isinstance(streams, dict) or cfg.store_join not in streams:
         raise ConfigError("tensor store: the backend has no stream %r for the admission gate (Config.store_join)"

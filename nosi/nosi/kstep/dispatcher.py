@@ -525,6 +525,8 @@ class Dispatcher:
             from .tensor_store import attach_dispatcher               # HOOK-B2: stores and re-attach the executor,
             self.store = attach_dispatcher(self, cfg, executor, be)   # HOOK-B2: BEFORE the transport takes them
         self.tp = make_transport(self)
+        if self.store is not None:                                     # HOOK-B2: the transport must carry the store's
+            self.store.check_transport(self.tp)                        # HOOK-B2: dtype (S0 stages int64 by default)
         geom = cfg.geom
         if self.abi4:
             if not getattr(self.tp, "carries_bias", False):
@@ -1220,13 +1222,15 @@ class Dispatcher:
         if exp is None or pg is None or which not in (("k", "v", "c") if self.abi4 else ("k", "v")):
             raise KStepError("M2 B2: the executor registered a ring read of position %d (head %d, %s, identity copy %s) that "
                              "row (uid %s pos %d) does not attend" % (pos, h, which, pg is not None, row.uid, row.pos))
-        if which == "c":                                               # C1.1: the entry's bias (a 1-element read)
+        if self.store is not None:                                     # HOOK-B2: the expectation in the stores' dtypes
+            val = self.store.dispatch_expect_item(self, exp, which)  # HOOK-B2: (the executor's tensors of exp)
+            if which == "c":                                           # HOOK-B2: counted as below
+                self.c1stat["ring_bias_reads_registered"] += 1         # HOOK-B2
+        elif which == "c":                                             # HOOK-B2: "if" before; C1.1: the entry's bias
             val = torch.tensor([exp[2]], dtype=torch.int64)
             self.c1stat["ring_bias_reads_registered"] += 1
         else:
             val = torch.tensor(exp[0] if which == "k" else exp[1], dtype=torch.int64)
-        if self.store is not None:                                     # HOOK-B2: the expectation in the stores' dtypes
-            val = self.store.dispatch_expect_item(self, exp, which)  # HOOK-B2: (the executor's tensors of exp)
         info = dict(ring=True, layer=l, b=row.b, h=h, pos=pos, entry=e, rgen=g, kind=kind, which=which, uid=row.uid,
                     call=self.call_id, rg=pg)
         self.validators.append((None, ws, val, info))
@@ -1494,8 +1498,9 @@ class Dispatcher:
             self._ring_live_check(l, r, h, e, kind, key, where)
         m[key] = (e, g)
         if self.store is not None:                                     # HOOK-B2: the payload write through the store
-            ring.set_ready(e, g, self.store.dispatch_produce(self, l, r, h, e, prev_d2h, k, v, c))   # HOOK-B2: its
-            return                                                     # HOOK-B2: hold owns the sources (no bias entry)
+            ring.set_ready(e, g, self.store.dispatch_produce(self, l, r, h, e, prev_d2h, k, v, c,   # HOOK-B2: its
+                                                             kind, key))                        # HOOK-B2: hold owns
+            return                                                     # HOOK-B2: the sources (no bias entry)
         sk = k if torch.is_tensor(k) else torch.tensor(k, dtype=torch.int64)
         sv = v if torch.is_tensor(v) else torch.tensor(v, dtype=torch.int64)
         sc = None
@@ -3041,6 +3046,8 @@ class Dispatcher:
         every remaining D2H snapshot; every publication's snapshot must have been validated exactly once."""
         self.be.synchronize(order or self.cfg.drain_order)
         self._validate(all_=True)
+        if self.store is not None:                                     # HOOK-B2: every stream ran: release the store's
+            self.store.poll()                                          # HOOK-B2: holds BEFORE the frontier clears (I5)
         if self.frontier is not None:                                  # HOOK-C: every stream ran: prune and clear what
             self.frontier.poll(self)                                   # drained (non-blocking)
         if self.abi4:                                                  # C1.1 A9: after the drain, every event-held
