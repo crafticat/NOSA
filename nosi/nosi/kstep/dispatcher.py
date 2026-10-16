@@ -248,7 +248,8 @@ from .backend import check_backend, ev_done
 from .compressed import CompressedChain, row_prefixes
 from .errors import (CapacityRefusal, ConfigError, ConsumptionMismatch, KStepError, NoProgress, OwnershipViolation,
                      ReadCorruption, StaleReader)
-from .executor import DRAFT, VERIFY, Row, abi_of, check_consumed_identity, check_executor
+from .executor import (DRAFT, RESET_CONTRACT, VERIFY, Row, abi_of, check_consumed_identity, check_executor,
+                       reset_contract_of)                       # HOOK-L4: RESET_CONTRACT, reset_contract_of (I10)
 from .mutations import Mutations
 # HOOK-L3: DRAINING is imported for quiesce_state / detach_completed_events (INTERFACE_BC3 I8)
 from .ownership import (COUNTS, DRAINING, FREE, LIVE, LRU, PO, R_DRAFT, R_EXACT, R_PRE, R_PROV, RELEASING, RING_KINDS, VRES,
@@ -3159,12 +3160,20 @@ class Dispatcher:
             for s in range(pipe.ring):
                 put("transport", ("slot_h2d", s), pipe.slot_h2d[s])
                 put("transport", ("slot_sc", s), pipe.slot_sc[s])
+        if reset_contract_of(self.ex) == RESET_CONTRACT:              # HOOK-L4 (I10): the executor's own operational
+            for cls, loc, ev in self.ex.reset_holders():               # events, when its OWN class declares the
+                if not (isinstance(cls, str) and cls.startswith("executor:")):   # contract (else nothing is listed;
+                    raise OwnershipViolation("I10: the executor %s lists owner class %r (it must start with "   # the
+                                             "'executor:')" % (type(self.ex).__name__, cls))   # coordinator refuses)
+                put(cls, loc, ev)
         return out
 
     def detach_completed_events(self) -> int:
         """HOOK-L3, MUTATING (only frontier.QuiescentReset calls it, after its own full check). First the same check, with
         NO mutation on a refusal: every quiesce_state() count 0 and every event_holders() event complete (ev_done).
-        Then (1) the existing passive host poll (_poll) drains what those events gated: RELEASING slots, DRAINING ring
+        HOOK-L4 (I10): an executor that declares the reset contract in its own class detaches its own references FIRST
+        (its refusal changes nothing in the dispatcher); its count is part of the result. Then (1) the existing
+        passive host poll (_poll) drains what those events gated: RELEASING slots, DRAINING ring
         entries, event-held ledger records (through retire), the store's and the frontier's own polls. No byte check
         runs there: validators, D2H checks and admission buffers are already 0 (quiesce_state), and nothing is in
         flight; (2) the post-condition, which only an internal inconsistency can break; (3) every
@@ -3177,6 +3186,12 @@ class Dispatcher:
         if bad or live:
             raise OwnershipViolation("detach refused: not quiescent %s; %d pending events: %s"
                                      % (bad, len(live), live[:6]))
+        n_ex = 0
+        if reset_contract_of(self.ex) == RESET_CONTRACT:              # HOOK-L4 (I10): the executor's own detach FIRST,
+            n_ex = self.ex.detach_completed()                          # before any dispatcher mutation, so that its
+            if isinstance(n_ex, bool) or not isinstance(n_ex, int) or n_ex < 0:   # refusal leaves everything as it
+                raise OwnershipViolation("I10: the executor %s detach_completed returned %r, not a count"   # was
+                                         % (type(self.ex).__name__, n_ex))
         self._poll()
         if self.consume_ledger is not None:                            # _poll retires the bias ledger only
             self.consume_ledger.retire()
@@ -3218,7 +3233,7 @@ class Dispatcher:
             for s in range(pipe.ring):
                 n += (pipe.slot_h2d[s] is not None) + (pipe.slot_sc[s] is not None)
                 pipe.slot_h2d[s] = pipe.slot_sc[s] = None
-        return n
+        return n + n_ex                                                # HOOK-L4: with the executor's own count
 
     def report(self) -> Dict[str, Any]:
         """The run's accounting, labelled by mode (A2: GREEDY results are reported separately from SAMPLED results).

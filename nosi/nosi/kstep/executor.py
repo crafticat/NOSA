@@ -92,6 +92,24 @@ reads_ring and the attribute consumes_physical = True). The dispatcher calls, pe
   reference(handle) -> (outs, heads)
                           the eager reference of the same rows, same order, same arithmetic.
 check_consumed_identity(records) is the dispatcher's identity check of those records (StaleReader "stale consumption").
+
+I10 RESET CONTRACT (INTERFACE_BC4 I10, 2026-10-17; frontier.QuiescentReset; dispatcher HOOK-L4). An executor that
+retains operational events between calls must let a quiescent reset see and detach them before pooled events are
+re-recorded.
+It DECLARES the contract IN ITS OWN CLASS BODY (reset_contract = "I10"; reset_contract_of reads type(ex).__dict__ only,
+so neither inheritance nor attribute forwarding, such as a wrapper's __getattr__, can declare it for a class that was
+not audited) and provides:
+  reset_holders() -> [(owner_class, location, event)]
+                          READ-ONLY: every OPERATIONAL event reference it keeps between calls (one it will wait on, hand
+                          on or test later); owner_class starts with "executor:"; None is not listed. Instrumentation
+                          history (logs, counters, eager reference copies, records no later decision reads) is not
+                          listed; the class docstring names it.
+  detach_completed() -> int
+                          MUTATING: refuses (OwnershipViolation "executor detach refused: <n> pending events: [...]")
+                          with NO mutation while a listed event is not complete; else sets every listed reference to
+                          None and returns the count.
+Dispatcher.event_holders appends reset_holders() of a declared executor; Dispatcher.detach_completed_events calls
+detach_completed() first after its pre-check. An executor without the declaration is refused by the coordinator.
 """
 from __future__ import annotations
 
@@ -141,6 +159,15 @@ def check_consumed_identity(records: List[Dict[str, Any]]) -> int:
                               % (what, int(rec["expected"]), int(rec["observed"]), rec["uid"], rec["pos"], rec["kind"],
                                  rec["head"]))
     return len(records)
+
+
+RESET_CONTRACT = "I10"                           # I10 (docstring): the declared reset contract
+
+
+def reset_contract_of(ex) -> Optional[str]:
+    """I10: the reset contract declared in the executor's OWN class body (type(ex).__dict__), else None. Inherited or
+    forwarded attributes do not count: every executor class is audited and declared on its own."""
+    return type(ex).__dict__.get("reset_contract")
 
 
 def abi_of(ex) -> int:
