@@ -132,13 +132,17 @@ model only.
        The check never polls: a store record that completed but was not polled yet is refused, and so are registered
        validators, D2H checks and admission buffers (the lead's quiesce_state counts them; their completion runs byte
        checks that may raise). The caller drains them first: Dispatcher.finish, then one host poll.
-   (2) Only then, in this order: detach_completed_events() (HOOK-L4: a declared executor's detach_completed() first,
-       which changes nothing when it refuses; then the passive host poll, which also runs this module's poll; then
-       every remaining reference to a complete event is set to None); the post-check: event_holders() is empty, else
-       OwnershipViolation "quiescent reset: the detach left <n> event references: [<first 6 (class, location)>];
-       backend_reset did not run (I10)" (only a hook or executor defect leaves one; the counts do not change);
-       before_reset() (the identity caches; it checks again); store.clear_caches(); backend_reset() (the point where
-       pooled events may be re-recorded); then the counts.
+   (2) Only then, in this order: detach_completed_events() (HOOK-L4: a declared executor's detach_completed() first;
+       the hook VERIFIES it before any dispatcher change: its count must equal the references it listed, and nothing
+       may be left listed; a refusal leaves the dispatcher unchanged; then the passive host poll, which also runs this
+       module's poll; then every remaining reference to a complete event is set to None); the post-check:
+       event_holders() is empty, else OwnershipViolation "quiescent reset: the detach left <n> event references:
+       [<first 6 (class, location)>]; backend_reset did not run (I10)"; before_reset() (the identity caches; it
+       checks again); store.clear_caches(); backend_reset() (the point where pooled events may be re-recorded); then
+       the counts. The post-check is a SECOND guard, against a dispatcher hook defect (the hook already verifies the
+       executor's detach). A failed post-check is NOT a no-change refusal: the detach has already run, so the
+       dispatcher's (and the executor's) complete references are already set to None. Only the coordinator's counts
+       are unchanged, and before_reset, store.clear_caches and backend_reset do not run.
    The crucial case: the table can be drained (its components completed and pruned) while a JOINED output that it
    installed stays referenced outside it (a slot's last reader) and incomplete. Only the holder enumeration sees it.
    THE EXECUTOR (I10). An executor can keep OPERATIONAL events between calls (an event it will wait on, hand on or test
@@ -147,9 +151,14 @@ model only.
    type(ex).__dict__; neither inheritance nor attribute forwarding declares it), with reset_holders() (read-only: every
    operational reference, owner classes "executor:...") and detach_completed() (refuses with no mutation while one is
    pending; else sets them to None). An executor without the declaration is refused by the item
-   "executor:no_reset_contract=1", even when nothing else is outstanding. Construction refuses a declaration without
-   callable reset_holders / detach_completed (ConfigError). Instrumentation history that an executor keeps (logs,
-   counters, eager copies that no later decision reads) is not listed and not detached; its docstring names it.
+   "executor:no_reset_contract=1", even when nothing else is outstanding. Construction refuses a declared executor
+   whose classes do not define reset_holders and detach_completed (executor.reset_methods_missing: the classes of
+   type(ex).__mro__ only; __getattr__ forwarding and instance attributes do not count) with ConfigError "quiescent
+   reset: the executor <cls> declares reset_contract 'I10' without the class methods [...] (I10)". The hook's own I10
+   refusals (an owner class that does not start with "executor:", missing class methods, a detach that fails the
+   verification, and the TypeError of a wrapper over an undeclared toy) come out of pending() / reset() unchanged,
+   before any mutation. Instrumentation history that an executor keeps (logs, counters, eager copies that no later
+   decision reads) is not listed and not detached; its docstring names it.
    BOUNDARY: the coordinator relies on the declared list. An operational event that reset_holders() leaves out is not
    seen (the omitted-provider hazard); every executor class is audited on its own. No claim for an arbitrary backend or
    an undeclared executor.
@@ -812,12 +821,11 @@ class QuiescentReset:
 
     HOOKS = ("quiesce_state", "event_holders", "detach_completed_events")
     TABLE_PARTS = ("components", "handles", "joins")
-    EXECUTOR_METHODS = ("reset_holders", "detach_completed")      # I10
 
     def __init__(self, disp, backend_reset: Callable[[], Any]):
-        # I10 (HOOK-L4): the ONE reader of an executor's declaration. Imported here, so that the milestone 1-2 parts of
-        # this module do not need it.
-        from .executor import RESET_CONTRACT, reset_contract_of
+        # I10 (HOOK-L4): the readers of an executor's declaration and of its contract methods. Imported here, so that
+        # the milestone 1-2 parts of this module do not need them.
+        from .executor import RESET_CONTRACT, reset_contract_of, reset_methods_missing
         missing = [h for h in self.HOOKS if not callable(getattr(disp, h, None))]
         faults, tags = [], []
         if missing:
@@ -828,9 +836,9 @@ class QuiescentReset:
             tags.append("I8")
         ex = getattr(disp, "ex", None)
         if reset_contract_of(ex) == RESET_CONTRACT:
-            bad = [m for m in self.EXECUTOR_METHODS if not callable(getattr(ex, m, None))]
+            bad = reset_methods_missing(ex)                     # the classes of type(ex).__mro__ only (no forwarding)
             if bad:
-                faults.append("the executor %s declares reset_contract %r without callable %s"
+                faults.append("the executor %s declares reset_contract %r without the class methods %s"
                               % (type(ex).__name__, RESET_CONTRACT, bad))
                 tags.append("I10")
         if faults:                                              # names only the actual fault(s)
@@ -883,11 +891,13 @@ class QuiescentReset:
                     contract=contract, items=items)
 
     def reset(self) -> None:
-        """I8 / I10: the full check (pending), then detach_completed_events (the executor's own detach first, HOOK-L4),
-        the post-check (no event_holders() entry left), before_reset (the frontier's identity caches),
-        store.clear_caches, backend_reset and the counts. A refusal names every outstanding owner class and changes
-        nothing. A failed post-check (a hook or executor defect: a reference that the detach reported or should have
-        set to None is still listed) raises before before_reset and backend_reset, and changes no count."""
+        """I8 / I10: the full check (pending), then detach_completed_events (the executor's own detach first, verified
+        by the hook, HOOK-L4), the post-check (no event_holders() entry left), before_reset (the frontier's identity
+        caches), store.clear_caches, backend_reset and the counts. A refusal of pending() names every outstanding owner
+        class and changes nothing; so does a refusal of the hook (it raises before any dispatcher change). A failed
+        post-check (a dispatcher hook defect: a reference that the detach should have set to None is still listed) is
+        NOT a no-change refusal: the detach has already set the complete references to None. It raises before
+        before_reset, store.clear_caches and backend_reset, and only the coordinator's counts stay unchanged."""
         p = self.pending()
         if p["items"]:
             raise OwnershipViolation("quiescent reset refused: %s" % "; ".join(p["items"]))
