@@ -104,18 +104,33 @@ the default "none" path is unchanged; sites named by function, as line numbers s
                   expectation); values(k, v, c) -> the eager items of rows read from the stores; optional
                   store_device (default "cpu").
   executor ordering (lead decision; CUDA later) fresh_outputs = True states that the prefill and payload tensors are
-                  fresh storage that the executor does not reuse while store.holds.holds_storage(t) is True. A CUDA
-                  executor that writes them on its own stream must also hand the store a ready event of that write
-                  (admit and produce_ring take `ready`); the dispatcher adapter does not pass one yet (no CUDA hook).
+                  fresh storage that the executor does not reuse while store.holds.holds_storage(t) is True. An
+                  executor that writes them on its own stream hands the store a ready event of that write through
+                  the I9 opt-in below.
+  producer readiness (milestone 4, INTERFACE_BC4 I9) the executor's CLASS declares producer_ready = True
+                  (producer_ready_of; attach_dispatcher sets store.producer_ready). Then prefill_tensors(kv) and a
+                  producer payload(kvv, at=...) return (k, v, c, ready); payload(kvv) with at None (an expectation)
+                  returns (k, v, c). `ready` is None (complete tensors) or ONE native event of the dispatcher's backend
+                  that the executor recorded after its writes. dispatch_admit and dispatch_produce check the result
+                  first (_producer_result, check_ready: KStepError "tensor store: I9: ...", before any hold, admit or
+                  enqueue) and pass ready to admit / produce_ring. Order: admit waits ready on "compute" before A_r's
+                  ready event, so admission_ring ("compute", later on the same ordered stream) and admission_d2h
+                  ("d2h", it waits A_r's ready event) follow it; produce_ring waits ready on "compute" before its
+                  copies, and publish_ring_block waits that entry's ready event on "d2h". Lifecycle: the hold records
+                  ready under (READY, serial), so a source storage stays held and charged (K6 source_staging) until
+                  its readiness AND every copy that reads it passed ev_done. Without producer_ready every path is that
+                  of milestone 2. No CUDA or model-overlap claim follows from the CPU evidence.
   hold provider   I5: hold_source() = ("tensor_store", holds.outstanding_count); Track C registers it
                   (FinishedCohorts.add_source; duck-typed: Dispatcher.store.holds.outstanding_count) when the store's
                   mode and "joined" are both on. The dispatcher attribute is exactly `store` (None in the default path).
   reset (I4)      drained_all() and clear_caches(); Track C's reset guard calls them (the lead wires it).
-  open items      eager / eager_matched in the store's mode; device-resident pgen_t / rgen_t; the CUDA ready events
-                  above.
+  open items      eager / eager_matched in the store's mode; device-resident pgen_t / rgen_t; a CUDA executor's ready
+                  events (only the event type is checked there: a torch.cuda.Event does not show its stream); a
+                  refused producer payload leaves the dispatcher's bind of that entry in place (the run fails).
 """
 from __future__ import annotations
 
+import sys
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
@@ -128,6 +143,7 @@ HOLD_KINDS = ("admission", "ring", "publish")      # I2: the hold kinds (the sec
 INT_POISON = -7777777                              # the dispatcher's POISON for integer stores
 PRODUCE = "compute"                                # the stream of every producer copy (ring writes; A_r's ready event)
 PUBLISH = "d2h"                                    # the stream of every historical publication (D2H)
+READY = "ready"                                    # I9: a hold's producer-readiness key, (READY, hold serial)
 
 
 # ------------------------------------------------------------------------------------------------------------- checks
@@ -183,6 +199,26 @@ def join_events(be: Any, stream: Optional[str], evs: Iterable[Any]) -> Any:
     return record_join(be, stream, live)              # lead integration: the one shared primitive (backend.py)
 
 
+# ------------------------------------------------------------------------------------------- I9: producer readiness
+def native_event_types(be: Any) -> Tuple[type, ...]:
+    """I9: the native event type of backend `be`: torch.cuda.Event for the cpupack_core CudaBackend, the _Ev class of
+    the backend's own module for the cpupack_core CpuBackend. ConfigError for any other backend (no silent fallback).
+    The same rule as frontier.native_event_types (track C's file); this module keeps its own copy."""
+    if type(be).__name__ == "CudaBackend":
+        return (torch.cuda.Event,)
+    cls = getattr(sys.modules.get(type(be).__module__), "_Ev", None)
+    if isinstance(cls, type):
+        return (cls,)
+    raise ConfigError("tensor store: I9: backend %s has no known native event type (the cpupack_core CpuBackend _Ev "
+                      "or the CudaBackend torch.cuda.Event)" % (type(be).__name__,))
+
+
+def producer_ready_of(ex: Any) -> bool:
+    """I9: does the executor's CLASS declare producer_ready = True? It is read on the class (inherited from a base
+    class is accepted), never through an instance __getattr__ (ArenaToy forwards unknown attributes to its toy)."""
+    return getattr(type(ex), "producer_ready", False) is True
+
+
 # ------------------------------------------------------------------------------------------------------ I2: holds
 def storage_id(t: torch.Tensor) -> Tuple[str, Optional[int], int]:
     """The identity of the storage that backs t: (device type, device index, data pointer of the storage)."""
@@ -209,6 +245,9 @@ class SourceHolds:
       read(serial, stream, ev)
                      A copy on `stream` that reads the hold's sources completes at `ev`. Each stream is ordered, so a
                      record keeps the latest event per stream. ev None is ignored (it never erases a stored event).
+                     I9 (milestone 4): the producer's ready event is recorded under the key (READY, serial), one key
+                     per hold (two holds may get their ready events from different streams), so the record is
+                     released only after its readiness AND every copy that reads it passed ev_done.
       close(serial)  No later copy of this hold reads its sources.
       poll()         PASSIVE (ev_done only; no wait, no stream advancement, no join event): releases each record whose
                      holds are all closed and whose latest event of EVERY stream passed ev_done (_complete). The ledger
@@ -441,8 +480,10 @@ class TensorStore:
         self.hdev = self.host_k[0].device
         self._store_ids = {storage_id(t) for t in self._stores()}
         self.stats = dict(admissions=0, admission_d2h=0, admission_ring=0, admissions_closed=0, admission_joins=0,
-                          ring_produced=0, ring_published=0, published=0)
+                          ring_produced=0, ring_published=0, published=0, ready_admissions=0, ready_produced=0,
+                          ready_published=0)
         self.admissions: List[Dict[str, Any]] = []   # dispatcher adapter (B2): each admission, its A_r storages
+        self.producer_ready = False                   # I9: set by attach_dispatcher from the executor's class
 
     # -- helpers
     @staticmethod
@@ -515,6 +556,40 @@ class TensorStore:
         if not isinstance(adm, Admission) or adm.closed:
             raise KStepError("tensor store: the admission is closed or unknown (%s)" % where)
 
+    def check_ready(self, ready: Any, where: str) -> Any:
+        """I9: `ready` is None (the sources are complete) or ONE native event of this store's backend
+        (native_event_types: the exact type; a subclass, a wrapper or a Python object that stands for several events is
+        refused). A CpuBackend event shows the stream that recorded it: that stream must be one of this backend's
+        streams (the same object), else the event belongs to another backend. A torch.cuda.Event does not show its
+        stream; only its type is checked. KStepError "tensor store: I9: ready ... (<where>)". Changes nothing.
+        Returns ready."""
+        if ready is None:
+            return None
+        types = native_event_types(self.be)
+        if type(ready) not in types:
+            raise KStepError("tensor store: I9: ready is a %s, not a native event of the backend %s (%s) (%s)"
+                             % (type(ready).__name__, type(self.be).__name__, ", ".join(t.__name__ for t in types),
+                                where))
+        rs = getattr(ready, "stream", None)
+        streams = getattr(self.be, "s", None)
+        if rs is not None and isinstance(streams, dict) and not any(rs is s for s in streams.values()):
+            raise KStepError("tensor store: I9: ready was recorded on the stream %r of another backend, not on one of "
+                             "this backend's streams %s (%s)" % (getattr(rs, "name", None), sorted(streams), where))
+        return ready
+
+    def _producer_result(self, ex: Any, res: Any, call: str, where: str) -> Tuple[Any, Any, Any, Any]:
+        """I9: the result of a PRODUCER call of a producer_ready executor (prefill_tensors, or payload with at given)
+        is the 4-tuple (k, v, c, ready) with check_ready(ready). Else KStepError "tensor store: I9: the
+        producer_ready executor <class> returned <a n-tuple | a type> from <call>, not (k, v, c, ready) (<where>)".
+        It runs BEFORE any store or dispatcher bookkeeping of the call, so a refusal changes nothing."""
+        if not isinstance(res, tuple) or len(res) != 4:
+            got = ("a %d-tuple" % len(res)) if isinstance(res, tuple) else ("a %s" % type(res).__name__)
+            raise KStepError("tensor store: I9: the producer_ready executor %s returned %s from %s, not (k, v, c, "
+                             "ready) (%s)" % (type(ex).__name__, got, call, where))
+        k, v, c, ready = res
+        self.check_ready(ready, where)
+        return k, v, c, ready
+
     # -- wiring and reports
     def attach_executor(self, ex: Any, register: Any, register_ring: Any = None) -> None:
         """The executor's attach calls, as Dispatcher.__init__ makes them (attach_arena, attach_ring, attach_bias)."""
@@ -532,7 +607,8 @@ class TensorStore:
     def report(self) -> Dict[str, Any]:
         h = self.holds
         return dict(stats=dict(self.stats), held=h.held, peak=h.peak, records=len(h.recs), holds=len(h.holds),
-                    shared=h.shared, released=h.released, stores=self.store_bytes())
+                    shared=h.shared, released=h.released, stores=self.store_bytes(),
+                    producer_ready=self.producer_ready)
 
     def poll(self) -> int:
         """The passive release of the source holds (call it at the existing host poll points). It also drops the
@@ -566,8 +642,11 @@ class TensorStore:
         """Step 0: the prefill output becomes A_r without a copy. k, v: one (n, H, D) kv_dtype tensor per layer; c: one
         (n, H) bias_dtype tensor per layer (only with a bias dtype); all on the store's device. Views are accepted (use
         t.unbind(0) for an (L, n, H, D) tensor); the hold charges each distinct storage once, in full. `ready` is an
-        optional producer event of another stream; the store waits it on "compute". A_r's ready event is recorded on
-        "compute" (the model of the prefill kernel's write, D1). Every check runs before any enqueue or hold.
+        optional producer event of another stream (I9: None or ONE native event of this backend, check_ready); the
+        store waits it on "compute". A_r's ready event is recorded on "compute" (the model of the prefill kernel's
+        write, D1), so every later copy of A_r is ordered after `ready`: admission_ring on "compute" (the same ordered
+        stream, after that wait) and admission_d2h on "d2h" (it waits A_r's ready event). The hold records `ready`
+        too (SourceHolds.read). Every check runs before any enqueue or hold.
         PRECONDITION (module docstring): the executor does not reuse these tensors' storage until adm.gate (from
         close_admission) completes; a next prefill into a reused workspace must wait on that adm.gate."""
         own = self._owner(owner)
@@ -590,13 +669,16 @@ class TensorStore:
             self._source("admission v[%d]" % l, vs[l], self.kv_dtype, ((n, self.H, self.D),), where)
             if cs is not None:
                 self._source("admission c[%d]" % l, cs[l], self.bias_dtype, ((n, self.H),), where)
+        self.check_ready(ready, where)              # I9: before the hold, so a refusal changes nothing
         hid = self.holds.open(own, "admission", ks + vs + (cs if cs is not None else []))
         with self.be.stream(PRODUCE):
             if ready is not None:
                 self.be.stream_wait(PRODUCE, ready)
             rev = self.be.event_rec(PRODUCE)
         self.holds.read(hid, PRODUCE, rev)         # A_r stays held at least until its producer completed
+        self.holds.read(hid, (READY, hid), ready)  # I9: and until its readiness itself (None is ignored)
         self.stats["admissions"] += 1
+        self.stats["ready_admissions"] += ready is not None
         return Admission(own, b, n, ks, vs, cs, rev, hid)
 
     def admission_d2h(self, adm: Admission, l: int, j: int) -> Any:
@@ -685,9 +767,11 @@ class TensorStore:
                      prev_d2h: Any = None, ready: Any = None) -> Any:
         """The payload write of one ring entry that the caller bound first (RingPool.bind): k, v (D,) kv_dtype and c
         () or (1,) bias_dtype (only with a bias dtype), on the store's device. On "compute": a stream wait on prev_d2h
-        (the bind's previous D2H event) and on `ready` (an optional producer event of another stream), then the copies.
-        The sources are held (kind "ring"): the hold is opened after the checks and before the copies are enqueued, and
-        released by poll() after the copy's event. Returns that event (the caller's RingPool.set_ready)."""
+        (the bind's previous D2H event) and on `ready` (an optional producer event of another stream; I9: None or ONE
+        native event of this backend, check_ready), then the copies. The sources are held (kind "ring"): the hold is
+        opened after the checks and before the copies are enqueued, and released by poll() after the copy's event and
+        `ready` (both recorded in the hold). Returns that event (the caller's RingPool.set_ready); publish_ring_block
+        waits it on "d2h", so the D2H of the entry is ordered after `ready` too."""
         own = self._owner(owner)
         where = "ring producer of owner %s layer %d entry %d" % (own, l, e)
         self._entry(l, e, where)
@@ -698,6 +782,7 @@ class TensorStore:
         elif c is not None:
             raise KStepError("tensor store: ring producer c given, but the store has no bias (%s)" % where)
         self._live_entry(l, e, where)
+        self.check_ready(ready, where)              # I9: before the hold, so a refusal changes nothing
         hid = self.holds.open(own, "ring", (k, v, c))
         with self.be.stream(PRODUCE):
             if prev_d2h is not None:
@@ -710,8 +795,10 @@ class TensorStore:
                 self.be.memcpy(self.ring_c[l][e:e + 1], c.reshape(1), PRODUCE)
             ev = self.be.event_rec(PRODUCE)
         self.holds.read(hid, PRODUCE, ev)
+        self.holds.read(hid, (READY, hid), ready)  # I9: held until its readiness too (None is ignored)
         self.holds.close(hid)
         self.stats["ring_produced"] += 1
+        self.stats["ready_produced"] += ready is not None
         return ev
 
     # -- historical publication (11.3, A5)
@@ -778,6 +865,7 @@ class TensorStore:
         elif c is not None:
             raise KStepError("tensor store: publish c given, but the store has no bias (%s)" % where)
         r0, r1 = j * bs, (j + 1) * bs
+        self.check_ready(ready, where)              # I9: before the hold, so a refusal changes nothing
         hid = self.holds.open(own, "publish", (k, v, c))
         with self.be.stream(PUBLISH):
             if ready is not None:
@@ -788,8 +876,10 @@ class TensorStore:
                 self.be.memcpy(self.host_c[l][b, r0:r1], c, PUBLISH)
             hist_ev = self.be.event_rec(PUBLISH)
         self.holds.read(hid, PUBLISH, hist_ev)
+        self.holds.read(hid, (READY, hid), ready)  # I9: held until its readiness too (None is ignored)
         self.holds.close(hid)
         self.stats["published"] += 1
+        self.stats["ready_published"] += ready is not None
         return hist_ev
 
     # -- readback detectors (instrumentation; host reads of the stores, after the caller's completion wait)
@@ -883,15 +973,24 @@ class TensorStore:
         block: Dispatcher._produce (the existing bind transaction) -> dispatch_produce -> admission_ring; 3. A_r's two
         dispatcher gates (a compute and a D2H event after the steps, as before; the A record stays in d.adm, visible in
         the reports, until _ring_retire), then close_admission (terminal; adm.gate). The A record carries no tensor
-        (k, v, c None): the store's hold owns and charges the A_r storages (K6 source_staging, not admission_kv)."""
+        (k, v, c None): the store's hold owns and charges the A_r storages (K6 source_staging, not admission_kv).
+        I9 (milestone 4; producer_ready): the executor call comes FIRST, and its result is checked
+        (_producer_result: the 4-tuple (k, v, c, ready), check_ready) before any dispatcher or store bookkeeping of
+        the admission; then admit(..., ready=ready). Without producer_ready the order and the calls are exactly
+        those of milestone 2 (ready None)."""
         bs, L, H = d.bs, d.L, d.H
         n0 = r.n
+        ready = None
+        if self.producer_ready:                          # I9: the executor's result is checked before any change
+            k, v, c, ready = self._producer_result(d.ex, d.ex.prefill_tensors(kv), "prefill_tensors",
+                                                   "admission of owner %s b %d" % ((r.uid, r.inc), r.b))
         r.rmap = [[{kind: {} for kind in RING_KINDS} for _ in range(H)] for _ in range(L)]
         rec = dict(step=d.t, uid=r.uid, b=r.b, P0=r.P0, n=n0, items=n0 * H * L,
                    live_start=[rp.n_live for rp in d.rings])
         d.adm_log.append(rec)
-        k, v, c = d.ex.prefill_tensors(kv)
-        adm = self.admit((r.uid, r.inc), r.b, k, v, c)
+        if not self.producer_ready:
+            k, v, c = d.ex.prefill_tensors(kv)
+        adm = self.admit((r.uid, r.inc), r.b, k, v, c, ready=ready)
         A = dict(uid=r.uid, b=r.b, n=n0, step=d.t, k=None, v=None, c=None, ready=adm.ready, cev=None, dev=None,
                  adm=adm)
         blocks0 = r.hist_blocks
@@ -922,12 +1021,23 @@ class TensorStore:
         of entry e. An AdmissionSource (the partial block of dispatch_admit) is copied from A_r (admission_ring); any
         other producer (DRAFT, PRE) passes its eager (k, v, c) and the executor gives the TENSORS
         (ex.payload(kvv, at=(uid, layer, head, kind, position))), which produce_ring holds until the copy's event.
-        Returns the ready event (the caller's RingPool.set_ready)."""
+        Returns the ready event (the caller's RingPool.set_ready).
+        I9 (milestone 4; producer_ready): the payload call returns (k, v, c, ready), checked by _producer_result before
+        produce_ring opens its hold or enqueues anything; then produce_ring(..., ready=ready). The bind transaction of
+        Dispatcher._produce (the lead's code, before this call) is not undone by a refusal. Without producer_ready the
+        call is exactly that of milestone 2 (ready None)."""
         if isinstance(k, AdmissionSource):
             return self.admission_ring(k.adm, l, h, k.pos, e, prev_d2h)
         pos = key[1] if isinstance(key, tuple) else key  # PRE: (cohort key, position); DRAFT / EXACT: the position
-        kt, vt, ct = d.ex.payload((k, v, c), at=(r.uid, l, h, kind, pos))
-        return self.produce_ring((r.uid, r.inc), l, e, kt, vt, ct, prev_d2h)
+        own = (r.uid, r.inc)
+        ready = None
+        if self.producer_ready:                          # I9: the executor's result is checked before any change
+            kt, vt, ct, ready = self._producer_result(d.ex, d.ex.payload((k, v, c), at=(r.uid, l, h, kind, pos)),
+                                                      "payload", "ring producer of owner %s layer %d entry %d"
+                                                      % (own, l, e))
+        else:
+            kt, vt, ct = d.ex.payload((k, v, c), at=(r.uid, l, h, kind, pos))
+        return self.produce_ring(own, l, e, kt, vt, ct, prev_d2h, ready=ready)
 
     def dispatch_expect_block(self, d: Any, r: Any, l: int, j: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The checked-mode expectation of block j of layer l: the executor's tensors of the eager exact items
@@ -1031,6 +1141,7 @@ def attach_dispatcher(d: Any, cfg: Any, ex: Any, be: Any) -> TensorStore:
     tensor_payload = True with prefill_tensors, payload, values and the torch dtypes kv_dtype / bias_dtype; the
     executor does not declare fresh_outputs = True (lead decision; module docstring, executor ordering); the backend
     has no stream Config.store_join (adm.gate). The transport is checked after make_transport (check_transport).
+    I9: store.producer_ready = producer_ready_of(ex) (the executor's class declares producer_ready = True).
     Returns the store (Dispatcher.store)."""
     if cfg.store not in STORE_MODES:
         raise ConfigError("store must be one of %s (got %r)" % (STORE_MODES, cfg.store))
@@ -1058,5 +1169,6 @@ def attach_dispatcher(d: Any, cfg: Any, ex: Any, be: Any) -> TensorStore:
     d.arena_k, d.arena_v, d.arena_c = st.arena_k, st.arena_v, st.arena_c
     d.ring_k, d.ring_v, d.ring_c = st.ring_k, st.ring_v, st.ring_c
     d.bias_dtype = st.bias_dtype
+    st.producer_ready = producer_ready_of(ex)         # I9: the opt-in, read once from the executor's class
     st.attach_executor(ex, d._register_read, d._register_ring_read)
     return st
