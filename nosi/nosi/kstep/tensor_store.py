@@ -91,9 +91,13 @@ the default "none" path is unchanged; sites named by function, as line numbers s
   transport       check_transport (unchanged since milestone 2): a typed staging Pipe must stage kv_dtype, else
                   ConfigError; transfer.AdversarialTransport copies rows as they are; a transport may declare
                   carries_dtype. Milestone 3 (I7): the factory of tests/kstep_toy.build passes the stores' dtype, so a
-                  bf16 store gets a bf16 S0 transport (the REAL Pipe stages bf16); S0Transport itself refuses, at
-                  construction, any store whose dtype differs from its staging dtype (OwnershipViolation "S0 transport:
-                  dtype mismatch at construction (...)", transfer.py HOOK-B3), before check_transport can run.
+                  bf16 store gets a bf16 S0 transport (the REAL Pipe stages bf16). At construction, S0Transport itself
+                  (transfer.py HOOK-B3) refuses a K / V store (host_k / host_v, arena_k / arena_v or slots_k /
+                  slots_v) whose dtype differs from its staging dtype, and bias stores (host_c / arena_c) whose dtypes
+                  differ from each other (the bias is not compared with the staging dtype): OwnershipViolation "S0
+                  transport: dtype mismatch at construction (...)", before check_transport can run. It also refuses
+                  a staging slot whose size is not a multiple of 8 when ring > 1 (OwnershipViolation "S0 transport:
+                  staging slot of ... bytes is not a multiple of 8 (...)"); it does not pad.
   executor        tensor_payload = True; fresh_outputs = True; kv_dtype / bias_dtype (torch dtypes);
                   prefill_tensors(kv) -> per-layer (k, v, c) tensors of the last prefill; payload(kvv, at=None) -> the
                   tensors of one eager item (at = (uid, layer, head, kind, position) for a producer, None for an
