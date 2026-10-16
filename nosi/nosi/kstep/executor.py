@@ -170,6 +170,14 @@ def reset_contract_of(ex) -> Optional[str]:
     return type(ex).__dict__.get("reset_contract")
 
 
+def reset_methods_missing(ex) -> List[str]:
+    """I10: the contract methods (reset_holders, detach_completed) that no class of type(ex).__mro__ defines in its own
+    __dict__. A method that only an attribute-forwarding __getattr__ (or an instance attribute) would supply does not
+    count: the dispatcher and the coordinator call only methods of the executor's own classes."""
+    return [m for m in ("reset_holders", "detach_completed")
+            if not any(m in vars(k) and callable(vars(k)[m]) for k in type(ex).__mro__)]
+
+
 def abi_of(ex) -> int:
     """The executor's declared ABI: 4 with abi = 4 (C1.1), else 3 (every earlier interface)."""
     abi = getattr(ex, "abi", 3)

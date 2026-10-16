@@ -249,7 +249,7 @@ from .compressed import CompressedChain, row_prefixes
 from .errors import (CapacityRefusal, ConfigError, ConsumptionMismatch, KStepError, NoProgress, OwnershipViolation,
                      ReadCorruption, StaleReader)
 from .executor import (DRAFT, RESET_CONTRACT, VERIFY, Row, abi_of, check_consumed_identity, check_executor,
-                       reset_contract_of)                       # HOOK-L4: RESET_CONTRACT, reset_contract_of (I10)
+                       reset_contract_of, reset_methods_missing)   # HOOK-L4: the I10 readers (executor.py)
 from .mutations import Mutations
 # HOOK-L3: DRAINING is imported for quiesce_state / detach_completed_events (INTERFACE_BC3 I8)
 from .ownership import (COUNTS, DRAINING, FREE, LIVE, LRU, PO, R_DRAFT, R_EXACT, R_PRE, R_PROV, RELEASING, RING_KINDS, VRES,
@@ -3166,12 +3166,25 @@ class Dispatcher:
             for s in range(pipe.ring):
                 put("transport", ("slot_h2d", s), pipe.slot_h2d[s])
                 put("transport", ("slot_sc", s), pipe.slot_sc[s])
-        if reset_contract_of(self.ex) == RESET_CONTRACT:              # HOOK-L4 (I10): the executor's own operational
-            for cls, loc, ev in self.ex.reset_holders():               # events, when its OWN class declares the
-                if not (isinstance(cls, str) and cls.startswith("executor:")):   # contract (else nothing is listed;
-                    raise OwnershipViolation("I10: the executor %s lists owner class %r (it must start with "   # the
-                                             "'executor:')" % (type(self.ex).__name__, cls))   # coordinator refuses)
-                put(cls, loc, ev)
+        for cls, loc, ev in self._executor_holders():                 # HOOK-L4 (I10): the executor's own events
+            put(cls, loc, ev)
+        return out
+
+    def _executor_holders(self) -> List[Tuple[str, Tuple, Any]]:
+        """HOOK-L4 (I10), READ-ONLY: the executor's reset_holders() when its OWN class declares the contract (else [];
+        the coordinator then refuses it). A declared executor whose classes do not define both contract methods, or an
+        owner class that does not start with "executor:", is refused (OwnershipViolation; nothing changes)."""
+        if reset_contract_of(self.ex) != RESET_CONTRACT:
+            return []
+        miss = reset_methods_missing(self.ex)
+        if miss:
+            raise OwnershipViolation("I10: the executor %s declares reset_contract %r without the class methods %s"
+                                     % (type(self.ex).__name__, RESET_CONTRACT, miss))
+        out = list(self.ex.reset_holders())
+        for cls, loc, ev in out:
+            if not (isinstance(cls, str) and cls.startswith("executor:")):
+                raise OwnershipViolation("I10: the executor %s lists owner class %r (it must start with 'executor:')"
+                                         % (type(self.ex).__name__, cls))
         return out
 
     def detach_completed_events(self) -> int:
@@ -3194,10 +3207,13 @@ class Dispatcher:
                                      % (bad, len(live), live[:6]))
         n_ex = 0
         if reset_contract_of(self.ex) == RESET_CONTRACT:              # HOOK-L4 (I10): the executor's own detach FIRST,
-            n_ex = self.ex.detach_completed()                          # before any dispatcher mutation, so that its
-            if isinstance(n_ex, bool) or not isinstance(n_ex, int) or n_ex < 0:   # refusal leaves everything as it
-                raise OwnershipViolation("I10: the executor %s detach_completed returned %r, not a count"   # was
-                                         % (type(self.ex).__name__, n_ex))
+            listed = len([1 for _, _, ev in self._executor_holders() if ev is not None])   # before any dispatcher
+            n_ex = self.ex.detach_completed()                          # mutation; then it is VERIFIED: a count equal
+            rest = [(c, loc) for c, loc, ev in self._executor_holders() if ev is not None]   # to what it listed and
+            if isinstance(n_ex, bool) or not isinstance(n_ex, int) or n_ex != listed or rest:   # nothing left
+                raise OwnershipViolation("I10: the executor %s detach_completed returned %r for %d listed references "
+                                         "and left %s (the dispatcher is unchanged; the executor's own state is as "
+                                         "its detach left it)" % (type(self.ex).__name__, n_ex, listed, rest[:6]))
         self._poll()
         if self.consume_ledger is not None:                            # _poll retires the bias ledger only
             self.consume_ledger.retire()
