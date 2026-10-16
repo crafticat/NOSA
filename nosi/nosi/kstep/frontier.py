@@ -115,6 +115,27 @@ model only.
    compute gate, Transfer.reader_ev): for example a join output whose inputs are all complete but whose record has not
    run yet (the CpuBackend runs "join" only when forced). A reset path must also check those holders (the pools' and
    the dispatcher's own references).
+
+8. QUIESCENT RESET (milestone 3; addendum I8). QuiescentReset(disp, backend_reset) is that reset path. It uses only the
+   lead's three Dispatcher hooks (HOOK-L3: quiesce_state, event_holders, detach_completed_events), this module's
+   reset_pending / before_reset, and track B's store API (drained_all, clear_caches). reset():
+   (1) the FULL check, with no mutation (pending()): every quiesce_state() value 0 (an OPEN dict: every key, whatever
+       its name); every event_holders() event complete (ev_done); the frontier table (incomplete components, installed
+       handles, cached joins) and every registered hold provider of every live incarnation at 0; store.drained_all()
+       when Dispatcher.store exists. Anything outstanding: OwnershipViolation "quiescent reset refused: <items>" that
+       names EVERY outstanding owner class, one item each, in a fixed order: "state:<key>=<n>" (quiesce_state keys,
+       sorted), "holder:<owner class>=<pending references>" (sorted), "frontier:components|handles|joins=<n>",
+       "provider:<name>(<uid>,<inc>)=<n>" (incarnations and names sorted), "store:not_drained=1". Nothing is changed.
+       The check never polls: a store record that completed but was not polled yet is refused; the caller runs the host
+       poll first (the dispatcher's _poll and finish do).
+   (2) Only then, in this order: detach_completed_events() (the hook runs the passive host poll, which also runs this
+       module's poll, then sets every remaining reference to a complete event to None); before_reset() (the identity
+       caches; it checks again); store.clear_caches(); backend_reset() (the point where pooled events may be
+       re-recorded); then the reset count.
+   The crucial case: the table can be drained (its components completed and pruned) while a JOINED output that it
+   installed stays referenced outside it (a slot's last reader) and incomplete. Only the holder enumeration sees it.
+   The no-reset path is unchanged: no coordinator exists unless a caller constructs one. No live-reset scheduling, no
+   uid-reuse redesign (Dispatcher.submit still refuses a uid that it knows).
 """
 from __future__ import annotations
 
@@ -759,3 +780,80 @@ class CompletionOwnership:
         u = self.table.entry_bytes
         return dict(mode="joined", entries=self.entries(), bytes=self.entries() * u, peak_entries=self.peak_entries,
                     peak_bytes=self.peak_entries * u, frontier=self.table.report(), finished=self.cohorts.report())
+
+
+# ------------------------------------------------------------------------------------------------- milestone 3: I8
+class QuiescentReset:
+    """Section 8 of the module docstring (addendum I8): the ONE reset path that may let pooled events be re-recorded.
+    disp: the Dispatcher (it must have the HOOK-L3 methods quiesce_state, event_holders and detach_completed_events);
+    backend_reset: the callable that resets the backend (for example CudaBackend.reset); it runs last. pending() is
+    READ-ONLY; reset() refuses with no mutation, else detaches, clears the identity caches, clears the store's caches
+    and resets the backend, in that order. Counts: resets (passed resets), detached (references the hook set to None)."""
+
+    HOOKS = ("quiesce_state", "event_holders", "detach_completed_events")
+    TABLE_PARTS = ("components", "handles", "joins")
+
+    def __init__(self, disp, backend_reset: Callable[[], Any]):
+        missing = [h for h in self.HOOKS if not callable(getattr(disp, h, None))]
+        if missing or not callable(backend_reset):
+            raise ConfigError("quiescent reset: the dispatcher lacks the HOOK-L3 methods %s, or backend_reset is not "
+                              "callable (I8)" % (missing,))
+        self.d = disp
+        self.backend_reset = backend_reset
+        self.resets = 0
+        self.detached = 0
+
+    def pending(self) -> Dict[str, Any]:
+        """READ-ONLY (no poll, no wait, no change): every outstanding item, by owner class. Returns state (the nonzero
+        quiesce_state counts), holders (owner class -> incomplete references), first (owner class -> the location of its
+        first incomplete reference, for diagnosis), frontier (the nonzero table parts), providers ({(uid, inc): {name:
+        count}}, nonzero only), store (True when a store exists and is not drained) and items (the refusal text items,
+        in the fixed order of section 8; empty when the reset may proceed)."""
+        d = self.d
+        state: Dict[str, int] = {}
+        for k, v in d.quiesce_state().items():
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise TypeError("quiescent reset: quiesce_state()[%r] is %r, not a count >= 0" % (k, v))
+            if v:
+                state[k] = v
+        holders: Dict[str, int] = {}
+        first: Dict[str, Any] = {}
+        for cls, loc, ev in d.event_holders():
+            if not ev_done(ev):
+                holders[cls] = holders.get(cls, 0) + 1
+                first.setdefault(cls, loc)
+        fo = getattr(d, "frontier", None)
+        table: Dict[str, int] = {}
+        providers: Dict[Tuple[Any, Any], Dict[str, int]] = {}
+        if fo is not None:
+            p = fo.reset_pending()
+            table = {k: p[k] for k in self.TABLE_PARTS if p[k]}
+            providers = p["holds"]
+        store = getattr(d, "store", None)
+        store_out = store is not None and not store.drained_all()
+        items = (["state:%s=%d" % (k, state[k]) for k in sorted(state)]
+                 + ["holder:%s=%d" % (c, holders[c]) for c in sorted(holders)]
+                 + ["frontier:%s=%d" % (k, table[k]) for k in self.TABLE_PARTS if k in table]
+                 + ["provider:%s(%s,%s)=%d" % (name, inc_[0], inc_[1], n)
+                    for inc_ in sorted(providers, key=repr) for name, n in sorted(providers[inc_].items())]
+                 + (["store:not_drained=1"] if store_out else []))
+        return dict(state=state, holders=holders, first=first, frontier=table, providers=providers, store=store_out,
+                    items=items)
+
+    def reset(self) -> None:
+        """I8: the full check (pending), then detach_completed_events, before_reset (the frontier's identity caches),
+        store.clear_caches, backend_reset and the count. A refusal names every outstanding owner class and changes
+        nothing."""
+        p = self.pending()
+        if p["items"]:
+            raise OwnershipViolation("quiescent reset refused: %s" % "; ".join(p["items"]))
+        n = self.d.detach_completed_events()
+        fo = getattr(self.d, "frontier", None)
+        if fo is not None:
+            fo.before_reset()
+        store = getattr(self.d, "store", None)
+        if store is not None:
+            store.clear_caches()
+        self.backend_reset()
+        self.resets += 1
+        self.detached += n
