@@ -126,8 +126,9 @@ model only.
        names EVERY outstanding owner class, one item each, in a fixed order: "state:<key>=<n>" (quiesce_state keys,
        sorted), "holder:<owner class>=<pending references>" (sorted), "frontier:components|handles|joins=<n>",
        "provider:<name>(<uid>,<inc>)=<n>" (incarnations and names sorted), "store:not_drained=1". Nothing is changed.
-       The check never polls: a store record that completed but was not polled yet is refused; the caller runs the host
-       poll first (the dispatcher's _poll and finish do).
+       The check never polls: a store record that completed but was not polled yet is refused, and so are registered
+       validators, D2H checks and admission buffers (the lead's quiesce_state counts them; their completion runs byte
+       checks that may raise). The caller drains them first: Dispatcher.finish, then one host poll.
    (2) Only then, in this order: detach_completed_events() (the hook runs the passive host poll, which also runs this
        module's poll, then sets every remaining reference to a complete event to None); before_reset() (the identity
        caches; it checks again); store.clear_caches(); backend_reset() (the point where pooled events may be
@@ -795,9 +796,13 @@ class QuiescentReset:
 
     def __init__(self, disp, backend_reset: Callable[[], Any]):
         missing = [h for h in self.HOOKS if not callable(getattr(disp, h, None))]
-        if missing or not callable(backend_reset):
-            raise ConfigError("quiescent reset: the dispatcher lacks the HOOK-L3 methods %s, or backend_reset is not "
-                              "callable (I8)" % (missing,))
+        faults = []
+        if missing:
+            faults.append("the dispatcher lacks the HOOK-L3 methods %s" % (missing,))
+        if not callable(backend_reset):
+            faults.append("backend_reset is not callable (%s)" % (type(backend_reset).__name__,))
+        if faults:                                              # names only the actual fault(s)
+            raise ConfigError("quiescent reset: %s (I8)" % "; ".join(faults))
         self.d = disp
         self.backend_reset = backend_reset
         self.resets = 0
