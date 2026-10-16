@@ -171,11 +171,17 @@ def reset_contract_of(ex) -> Optional[str]:
 
 
 def reset_methods_missing(ex) -> List[str]:
-    """I10: the contract methods (reset_holders, detach_completed) that no class of type(ex).__mro__ defines in its own
-    __dict__. A method that only an attribute-forwarding __getattr__ (or an instance attribute) would supply does not
-    count: the dispatcher and the coordinator call only methods of the executor's own classes."""
-    return [m for m in ("reset_holders", "detach_completed")
-            if not any(m in vars(k) and callable(vars(k)[m]) for k in type(ex).__mro__)]
+    """I10: the contract methods (reset_holders, detach_completed) that the executor's classes do not provide as
+    callables. As in Python's own attribute lookup, the FIRST class of type(ex).__mro__ that defines the name in its
+    __dict__ decides (a subclass that shadows a base method with a non-callable is missing it). A method that only an
+    attribute-forwarding __getattr__ (or an instance attribute) would supply does not count: the dispatcher and the
+    coordinator call only methods of the executor's own classes."""
+    out = []
+    for m in ("reset_holders", "detach_completed"):
+        owner = next((k for k in type(ex).__mro__ if m in vars(k)), None)
+        if owner is None or not callable(vars(owner)[m]):
+            out.append(m)
+    return out
 
 
 def abi_of(ex) -> int:
