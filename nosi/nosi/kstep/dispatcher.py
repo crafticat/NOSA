@@ -608,7 +608,7 @@ class Dispatcher:
                 continue
             prep = None
             if self.store is not None:                                 # HOOK-L5 (I9.1): the opt-in executor's prefill
-                prep = self.store.prepare_admit(self, self.queue[0][0], self.queue[0][1])   # result is obtained and
+                prep = self.store.prepare_admit(self, self.queue[0][0], self.queue[0][1], b)   # result (slot b) is
             uid, prompt, N = self.queue.pop(0)                         # checked BEFORE any mutation (None: opt-out)
             r = Request(uid, b, prompt, N, self.L, self.H, self.stride, self.ex.compress, self.chain_kernel)
             r.inc = self.inc_at_submit.pop(uid, 0)                     # HOOK-C: I3 (0: not queued through submit)
