@@ -291,6 +291,8 @@ class Config:
     consume: str = "none"                  # C1.2: "none" | "physical" (serialized physical consumption; see the docstring)
     progress_guard: str = "pin"            # "pin" (the pin guard, as before) | "rev6" (the rev6 guarantee REPLACES it; C81)
     reader_frontier: str = "single"        # HOOK-C: "single" (one ordered reader stream, as before) | "joined" (frontier.py)
+    store: str = "none"                    # HOOK-B2: "none" (the int64 stores, as before) | "tensor" (tensor_store.py)
+    store_join: str = "join"               # HOOK-B2: the backend stream of the admission gate (store "tensor" only)
 
 
 class Draft:
@@ -518,7 +520,13 @@ class Dispatcher:
         self._ring_reads: List[Tuple[int, int, int]] = []   # the (layer, entry, rgen) read by the current call's rows
         self._ring_exp: Dict[Tuple, Tuple] = {}    # (id(row), head, position) -> the eager (k, v) of the current call
         self._n_ring_val = 0
+        self.store = None                                              # HOOK-B2: Config.store (tensor_store.py)
+        if cfg.store != "none":                                        # HOOK-B2: the tensor stores replace the int64
+            from .tensor_store import attach_dispatcher               # HOOK-B2: stores and re-attach the executor,
+            self.store = attach_dispatcher(self, cfg, executor, be)   # HOOK-B2: BEFORE the transport takes them
         self.tp = make_transport(self)
+        if self.store is not None:                                     # HOOK-B2: the transport must carry the store's
+            self.store.check_transport(self.tp)                        # HOOK-B2: dtype (S0 stages int64 by default)
         geom = cfg.geom
         if self.abi4:
             if not getattr(self.tp, "carries_bias", False):
@@ -530,6 +538,8 @@ class Dispatcher:
             geom = replace(g0, bias_elem=el)
         self.acct = MemoryAccountant(geom, getattr(self.tp, "staging_bytes", 0), arena=self.arena_mode,
                                      ring=self.ring_mode, **(dict(consume=True) if self.consume else {}))
+        if self.store is not None:                                     # HOOK-B2: + the K6 category source_staging
+            self.acct.enable_sources()                                 # HOOK-B2: (the store's held source bytes)
         self.queue: List[Tuple] = []
         self.slot_req: List[Optional[Request]] = [None] * cfg.B
         self.reqs: Dict[Any, Request] = {}
@@ -1214,7 +1224,11 @@ class Dispatcher:
         if exp is None or pg is None or which not in (("k", "v", "c") if self.abi4 else ("k", "v")):
             raise KStepError("M2 B2: the executor registered a ring read of position %d (head %d, %s, identity copy %s) that "
                              "row (uid %s pos %d) does not attend" % (pos, h, which, pg is not None, row.uid, row.pos))
-        if which == "c":                                               # C1.1: the entry's bias (a 1-element read)
+        if self.store is not None:                                     # HOOK-B2: the expectation in the stores' dtypes
+            val = self.store.dispatch_expect_item(self, exp, which)  # HOOK-B2: (the executor's tensors of exp)
+            if which == "c":                                           # HOOK-B2: counted as below
+                self.c1stat["ring_bias_reads_registered"] += 1         # HOOK-B2
+        elif which == "c":                                             # HOOK-B2: "if" before; C1.1: the entry's bias
             val = torch.tensor([exp[2]], dtype=torch.int64)
             self.c1stat["ring_bias_reads_registered"] += 1
         else:
@@ -1485,6 +1499,10 @@ class Dispatcher:
         if self._checked():
             self._ring_live_check(l, r, h, e, kind, key, where)
         m[key] = (e, g)
+        if self.store is not None:                                     # HOOK-B2: the payload write through the store
+            ring.set_ready(e, g, self.store.dispatch_produce(self, l, r, h, e, prev_d2h, k, v, c,   # HOOK-B2: its
+                                                             kind, key))                        # HOOK-B2: hold owns
+            return                                                     # HOOK-B2: the sources (no bias entry)
         sk = k if torch.is_tensor(k) else torch.tensor(k, dtype=torch.int64)
         sv = v if torch.is_tensor(v) else torch.tensor(v, dtype=torch.int64)
         sc = None
@@ -1631,6 +1649,8 @@ class Dispatcher:
             else:
                 keep.append(A)
         self.adm = keep
+        if self.store is not None:                                     # HOOK-B2: the passive release of the store's
+            self.store.poll()                                         # HOOK-B2: source holds (per-stream rule)
 
     def _ring_scan(self) -> None:
         """Checked mode, the end of every joint call: every RingPool record (RingPool.check); every map entry of an active
@@ -1672,6 +1692,8 @@ class Dispatcher:
           3. A_r's gates: a compute event after step 2 and a D2H event after step 1, both recorded also when a step is
              empty. ring: A_r is held (charged in K6) until its ready, compute and D2H events completed (_ring_retire).
         The prompt is not truncated or split; the executor interface is unchanged."""
+        if self.store is not None:                                     # HOOK-B2: A_r = the executor's prefill tensors
+            return self.store.dispatch_admit(self, r, kv)            # HOOK-B2: (TensorStore.dispatch_admit)
         bs, L, H, D = self.bs, self.L, self.H, self.D
         n0 = r.n                                                       # P0 - 1 prompt positions
         r.rmap = [[{kind: {} for kind in RING_KINDS} for _ in range(H)] for _ in range(L)]
@@ -1732,6 +1754,8 @@ class Dispatcher:
         each entry's rgen copied at execution; hist_ev installed as its D2H gate), else (eager_matched) a fresh tensor of
         the eager values after the same waits on the markers. Then hist_ev; in checked mode the ordered snapshot of the
         destination rows on the same stream before any later "d2h" enqueue, and its record; the owner record hown."""
+        if self.store is not None:                                     # HOOK-B2: the D2H through the store
+            return self.store.dispatch_d2h_block(self, r, l, j, adm)  # HOOK-B2: (TensorStore.dispatch_d2h_block)
         bs, b, H = self.bs, r.b, self.H
         r0, r1 = j * bs, (j + 1) * bs
         ek = torch.tensor([[r.pub[l][h][pos][0] for h in range(H)] for pos in range(r0, r1)], dtype=torch.int64)
@@ -2460,6 +2484,9 @@ class Dispatcher:
                     self._n_new_val += 2
                 read_slots.append((l, r.b, h, idx))
                 self._read_keys.add(key)
+                if self.store is not None:                             # HOOK-B2: the eager read of the store's bytes in
+                    out.extend((j * bs + rr, kvv) for rr, kvv in enumerate(self.ex.values(ek, evv, ec)))   # HOOK-B2:
+                    continue                                           # HOOK-B2: the executor's value domain
                 for rr, (kk, vv_) in enumerate(zip(ek.tolist(), evv.tolist())):
                     out.append((j * bs + rr, (tuple(kk), tuple(vv_)) + ((int(ec[rr]),) if self.abi4 else ())))
             else:
@@ -3014,6 +3041,10 @@ class Dispatcher:
             counts["bias_staging_bytes"] = self.bias_ledger.held
         if self.consume:                                               # C1.2: the gather backings held now (0: each
             counts["consume_staging_bytes"] = self.consume_ledger.held  # call releases its own; a SAMPLED value)
+        if self.store is not None:                                     # HOOK-B2: the store owns the A_r bytes, so no
+            counts["admission_pos"] = 0                                # HOOK-B2: second charge as admission_kv; its
+            self.store.poll()                                         # HOOK-B2: held sources (passive release first;
+            counts["source_staging_bytes"] = self.store.holds.held   # HOOK-B2: a SAMPLED value) as source_staging
         self.acct.sample(counts)
 
     def finish(self, order: Optional[Tuple[str, ...]] = None) -> None:
@@ -3021,6 +3052,8 @@ class Dispatcher:
         every remaining D2H snapshot; every publication's snapshot must have been validated exactly once."""
         self.be.synchronize(order or self.cfg.drain_order)
         self._validate(all_=True)
+        if self.store is not None:                                     # HOOK-B2: every stream ran: release the store's
+            self.store.poll()                                          # HOOK-B2: holds BEFORE the frontier clears (I5)
         if self.frontier is not None:                                  # HOOK-C: every stream ran: prune and clear what
             self.frontier.poll(self)                                   # drained (non-blocking)
         if self.abi4:                                                  # C1.1 A9: after the drain, every event-held

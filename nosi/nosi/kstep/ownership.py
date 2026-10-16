@@ -918,6 +918,12 @@ BIAS_CATS = ("bias_staging",)
 # ledger's exact allocation-transition peak is reported apart.
 CONSUME_COUNTS = ("consume_staging_bytes",)
 CONSUME_CATS = ("consume_staging",)
+# HOOK-B2 (Config.store "tensor" only; MemoryAccountant.enable_sources): the bytes of the source backings that the
+# HOOK-B2: tensor store holds at the sample (tensor_store.SourceHolds.held: the A_r prefill tensors and the ring
+# HOOK-B2: producer sources, each distinct storage once at untyped_storage().nbytes()). A SAMPLED value; the exact
+# HOOK-B2: peak is the store's.
+SOURCE_COUNTS = ("source_staging_bytes",)                  # HOOK-B2
+SOURCE_CATS = ("source_staging",)                          # HOOK-B2
 
 
 class MemoryAccountant:
@@ -967,6 +973,19 @@ class MemoryAccountant:
         self.last: Dict[str, int] = {}
         self.last_counts: Dict[str, int] = {}
 
+    source = False                                         # HOOK-B2: True after enable_sources (Config.store "tensor")
+                                                           # HOOK-B2
+    def enable_sources(self) -> None:                      # HOOK-B2
+        """HOOK-B2 (Config.store "tensor"): adds the category source_staging (SOURCE_CATS), charged from the count
+        source_staging_bytes at each sample. Only before the first sample. (HOOK-B2)"""
+        if self.n or self.source:                          # HOOK-B2
+            raise ConfigError("K6: the source category is enabled once, before the first sample")   # HOOK-B2
+        self.source = True                                 # HOOK-B2
+        self.cats = self.cats + SOURCE_CATS                # HOOK-B2
+        for k in SOURCE_CATS:                              # HOOK-B2
+            self.peak[k] = 0                               # HOOK-B2
+            self.sum[k] = 0                                # HOOK-B2
+                                                           # HOOK-B2 (end)
     def bytes_of(self, n: Dict[str, int]) -> Dict[str, int]:
         missing = [k for k in COUNTS + (ARENA_COUNTS if self.arena else ()) + (RING_COUNTS if self.ring else ())
                    + (BIAS_COUNTS if self.bias else ()) + (CONSUME_COUNTS if self.consume else ()) if k not in n]
@@ -978,6 +997,10 @@ class MemoryAccountant:
             [] if self.consume else [k for k in CONSUME_COUNTS if k in n])
         if extra:
             raise KeyError("K6 sample has arena / ring counts %s outside their mode" % extra)
+        if self.source and SOURCE_COUNTS[0] not in n:                   # HOOK-B2: the store's source count
+            raise KeyError("K6 sample lacks counts %s" % list(SOURCE_COUNTS))                       # HOOK-B2
+        if not self.source and SOURCE_COUNTS[0] in n:                   # HOOK-B2
+            raise KeyError("K6 sample has the store's count %s outside its mode" % list(SOURCE_COUNTS))   # HOOK-B2
         u = self.u
         n_slots = n[FREE] + n[LRU] + n[PO] + n[VRES] + n[INFLIGHT] + n[RELEASING]
         b = dict(slots_free=n[FREE] * u["slot"], slots_lru=n[LRU] * u["slot"], slots_po=n[PO] * u["slot"],
@@ -1011,6 +1034,8 @@ class MemoryAccountant:
             b["bias_staging"] = int(n["bias_staging_bytes"])
         if self.consume:                                   # C1.2: bytes of the gather backings held at the sample
             b["consume_staging"] = int(n["consume_staging_bytes"])
+        if self.source:                                    # HOOK-B2: the store's held source backings at the sample
+            b["source_staging"] = int(n["source_staging_bytes"])   # HOOK-B2
         b["total"] = sum(b[k] for k in self.cats)
         return b
 
