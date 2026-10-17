@@ -817,12 +817,19 @@ class Dispatcher:
 
     def _resume_step(self) -> None:
         """I17: the step that a pending call stopped. ONE passive ticket poll (no wait): if the call's ticket is still
-        outstanding, return with nothing changed (dstat["pending_returns"]); else publish the call ONCE (live rows only;
-        a discarded row publishes nothing and advances nothing) and run the step's remaining layers, which may stop
-        again at the next pending call; a pending layer is never resubmitted."""
+        outstanding and its event is pending, return with nothing changed (dstat["pending_returns"]); outstanding with
+        the event complete (a BROKEN ticket) is KStepError, never a silent spin; else publish the call ONCE (live rows
+        only; a discarded row publishes nothing and advances nothing) and run the step's remaining layers, which may
+        stop again at the next pending call; a pending layer is never resubmitted."""
         ps, pc = self.pending_step, self.pending_call
-        self.tickets.poll()
+        self.tickets.poll()                                            # a finishing fault propagates from here
         if self.tickets.is_outstanding(pc["tid"]):                     # still outstanding (pending or broken)
+            if ev_done(pc["cev"]):                                     # complete, yet not finished: BROKEN (a
+                first = self.tickets.pending().get("first") or {}       # finishing fault earlier) or blocked: fail
+                raise KStepError("I17: the pending call %d (layer %d) is complete but its ticket %d was not finished "
+                                 "(state %r): no retry, no forced cleanup (the reset and the request end stay refused)"
+                                 % (pc["cid"], pc["l"], pc["tid"],
+                                    first.get("state") if first.get("id") == pc["tid"] else None))
             self.dstat["pending_returns"] += 1
             return
         self.pending_call = None
