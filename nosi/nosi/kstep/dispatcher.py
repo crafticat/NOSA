@@ -602,6 +602,11 @@ class Dispatcher:
             raise ConfigError("I17: deferred_calls 'one' needs consume 'physical' and result_tickets >= 1")
         self.pending_call: Optional[Dict[str, Any]] = None       # I17: the ONE submitted, unfinished layer call
         self.pending_step: Optional[Dict[str, Any]] = None       # I17: the step that waits on it (resumed by step())
+        ag = vars(type(executor)).get("admission_gate")          # I22 (lead): an executor whose OWN class declares
+        if ag is not None and not callable(ag):                  # admission_gate(ex, prompt) -> (ok, gate) may hold
+            raise ConfigError("I22: %s.admission_gate is not callable" % type(executor).__name__)   # back the queue
+        self.admission_gate = ag                                 # head (producer backpressure); None: never
+        self.admission_block: Optional[Dict[str, Any]] = None    # I22: the head held back at the last _admit, or None
         self.dstat = defaultdict(int)                            # I17: deferred counters (report()["deferred"])
         self.cancel_req: Dict[Any, int] = {}       # I20 (lead): uid -> inc of a cancellation requested during a stopped step
         self.cancelled: Dict[Any, Dict[str, Any]] = {}   # I20: uid -> the record of a cancelled incarnation (no results)
@@ -723,9 +728,24 @@ class Dispatcher:
         return [r for r in self.slot_req if r is not None]
 
     def _admit(self) -> None:
+        """Admit queued requests into free batch slots, in queue order. I22 (lead, minimal shared admission
+        integration): when the executor's own class declares admission_gate(ex, prompt) -> (ok, gate), it is asked
+        (READ-ONLY, passive: it never waits, forces or changes anything) BEFORE the head's admission; ok False holds the
+        head back (no overtaking, nothing of the head changes; dstat["admission_backpressure"]) and records
+        admission_block = dict(uid, b, gate, t), where gate is the native completion event whose completion makes the
+        head's producer storage reusable, or None while no drivable event exists yet (an operation whose handback is
+        not delivered: the next forwarding round delivers it). The dispatcher never waits on it: run() (the DRIVER)
+        host-waits exactly that gate. admission_block is recomputed at every _admit (None with an empty queue)."""
+        self.admission_block = None
         for b in range(self.cfg.B):
             if self.slot_req[b] is not None or not self.queue:
                 continue
+            if self.admission_gate is not None:                        # I22: the producer workspace may hold the head
+                ok, gate = self.admission_gate(self.ex, self.queue[0][1])
+                if not ok:
+                    self.admission_block = dict(uid=self.queue[0][0], b=b, gate=gate, t=self.t)
+                    self.dstat["admission_backpressure"] += 1
+                    break                                              # no overtaking: the head waits
             prep = None
             if self.store is not None:                                 # HOOK-L5 (I9.1): the opt-in executor's prefill
                 prep = self.store.prepare_admit(self, self.queue[0][0], self.queue[0][1], b)   # result (slot b) is
@@ -779,7 +799,7 @@ class Dispatcher:
             self._vfetch_drop(rk, "end")                                # this batch slot inherits nothing
         self.rel_layers = {k: v for k, v in self.rel_layers.items() if k[0] != r.uid}
         r.done = True
-        r.credits = None
+        self._return_credits(r, "end")                                 # I21 (lead): unused rev6 credits, exactly once
         if r.pub_hold:                                                 # H1: no reader of an ended request remains
             self.stats["rev6_h1_end_cleared_positions"] += len(r.pub_hold)
         r.pub_hold.clear()
@@ -810,11 +830,16 @@ class Dispatcher:
         run() (the DRIVER, not the call path) advances the backend by ONE host wait on that call's event (counted in
         dstat["driver_waits"]) and steps again. I20: on_pending(dispatcher, info), when given, is called ONCE per
         pending call, after step() returned with it and BEFORE the driver's host wait; info = dict(cid, l, tid, uids:
-        the sorted uids of the call's rows). It is a driver hook (for example cancel(uid)); it must not step or wait."""
+        the sorted uids of the call's rows). It is a driver hook (for example cancel(uid)); it must not step or wait.
+        I22: with no pending call and the queue head held back (admission_block), run() host-waits EXACTLY the reported
+        gate when it is an incomplete event (dstat["driver_admission_waits"]); a block that stays without a drivable
+        gate for two steps while no request is active is a named KStepError (no hidden progress, no retry)."""
         prev = None
+        blk_prev = None
         while self.queue or self.active() or self.pending_step is not None:
             self.step()
             pc = self.pending_call
+            blk = self.admission_block
             if pc is not None:
                 if pc is prev:                                         # waited, polled, and still not finished: a
                     raise KStepError("I17: run(): the pending call %d stays unfinished after the driver's wait on its "
@@ -824,7 +849,16 @@ class Dispatcher:
                                           uids=sorted({row.uid for row in pc["ctx"]["jrows"]})))
                 self.dstat["driver_waits"] += 1
                 self.be.host_wait(pc["cev"])
+            elif blk is not None:                                      # I22: the driver drives the REPORTED gate
+                g = blk["gate"]
+                if g is not None and not ev_done(g):
+                    self.dstat["driver_admission_waits"] += 1
+                    self.be.host_wait(g)
+                elif blk_prev is not None and blk_prev["uid"] == blk["uid"] and not self.active():
+                    raise KStepError("I22: run(): the admission of uid %r stays held back with no drivable gate (%r) "
+                                     "and no active request: no hidden progress, no retry" % (blk["uid"], g))
             prev = pc
+            blk_prev = blk
             if self.t > max_steps:
                 raise KStepError("run: more than %d steps" % max_steps)
         self.finish()
@@ -1187,6 +1221,24 @@ class Dispatcher:
                                      "holds no step credit (credits %s)" % (r.uid, l, h, why, cr))
         cr[l][h] -= 1
         self.stats["rev6_credits_" + why] += 1                         # rev6_credits_fetch / _join / _vres
+
+    def _return_credits(self, r: Request, why: str) -> int:
+        """I21 (lead; rev6 SC3 at a request end): the request's UNUSED step credits return EXACTLY ONCE, counted in
+        stats["rev6_credits_returned"] and stats["rev6_credits_returned_<why>"] (the keys change only when a credit
+        returns); then r.credits is None, so a later SC3 publication loop (a cancelled request's resumed step) and a
+        second call return nothing (0). A normal end holds no unused credit (every layer returned at its publication),
+        so it changes no stat. Only the LOGICAL credits return here: the request's physical positions (in-flight
+        destinations, readers, RELEASING / DRAINING slots) keep their charges, and its draft reservation (dres)
+        returns only when every slot it owned is FREE (_rev6_reserve, L4). Mode m1 holds no credit (r.credits None)."""
+        cr = r.credits
+        if cr is None:
+            return 0
+        n = sum(sum(x) for x in cr)
+        if n:
+            self.stats["rev6_credits_returned"] += n
+            self.stats["rev6_credits_returned_" + why] += n
+        r.credits = None
+        return n
 
     def _credits_held(self, b: int, l: int, h: int) -> int:
         r = self.slot_req[b]
