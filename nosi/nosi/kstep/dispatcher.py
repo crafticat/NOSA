@@ -609,7 +609,8 @@ class Dispatcher:
             prep = None
             if self.store is not None:                                 # HOOK-L5 (I9.1): the opt-in executor's prefill
                 prep = self.store.prepare_admit(self, self.queue[0][0], self.queue[0][1], b)   # result (slot b) is
-            uid, prompt, N = self.queue.pop(0)                         # checked BEFORE any mutation (None: opt-out)
+            uid, prompt, N = self.queue.pop(0)                         # checked BEFORE this admission's mutation (None:
+                                                                       # opt-out)
             r = Request(uid, b, prompt, N, self.L, self.H, self.stride, self.ex.compress, self.chain_kernel)
             r.inc = self.inc_at_submit.pop(uid, 0)                     # HOOK-C: I3 (0: not queued through submit)
             if self.frontier is not None:                              # HOOK-C2: the incarnation becomes live, the
