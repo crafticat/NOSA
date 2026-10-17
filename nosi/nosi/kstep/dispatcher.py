@@ -2658,6 +2658,10 @@ class Dispatcher:
         for (kind, r, obj, i), row, out in zip(owners, jrows, outs):
             if out is _DISCARDED:
                 continue
+            if self.cancelled and r.done:                              # I20 (fail closed): a cancelled request's row
+                raise KStepError("I20: call %d would publish a row of the cancelled request %s (incarnation %s, %s "  # is
+                                 "row at %d, layer %d): its ticket applied it" % (cid, r.uid, r.inc, row.kind,   # never
+                                                                                  row.pos, l))   # published
             if kind == "v":
                 c = obj
                 c.hidden[i] = out
