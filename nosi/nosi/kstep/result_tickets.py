@@ -18,7 +18,10 @@ behind a PASSIVE poll, so that a later milestone can defer the wait. The CPU evi
    of another call or layer, no completion event, holds that are not a sequence), then the capacity: with `capacity`
    tickets outstanding it raises CapacityRefusal BEFORE any change of the tickets (only the counter "refused"
    counts it): the handle and the holds are NOT taken, so the tickets hold nothing of the refused call (the caller
-   still owns them).
+   still owns them). Since milestone 7 the capacity counts outstanding tickets AND open reservations (outstanding()),
+   and so does <n> in enqueue's refusal text "... refused before enqueue: <n> of <cap> result tickets are outstanding
+   (...)": <n> is outstanding(). The text itself is the milestone-6 one (RT5 pins it); with no open reservation <n> is
+   the ticket count, as in milestone 6.
 2a. RESERVATION BEFORE ALLOCATION (milestone 7, INTERFACE_BC7 I15). reserve(call, layer) checks the capacity BEFORE
    the caller allocates or holds anything: outstanding tickets + OPEN reservations >= capacity -> CapacityRefusal
    "result tickets: call <c> layer <l>: refused before reservation: <n> of <cap> result tickets are outstanding (<t>
@@ -58,7 +61,7 @@ behind a PASSIVE poll, so that a later milestone can defer the wait. The CPU evi
    done(ev) -> bool (never waits); check(handle); resolve(handle) -> (outs, heads); reference(handle) -> (outs, heads);
    live(key) -> bool (READ-ONLY); apply(key, i, out); release(holds, handle).
 7. READ-ONLY QUERIES. pending() (the outstanding count, the first outstanding ticket: id, call, layer, keys, state,
-   and, only while a reservation is open, "reservations": [(id, call, layer)]); outstanding() (tickets AND open
+   and, only while a reservation is open, "reservations": [dict(id=, call=, layer=)]); outstanding() (tickets AND open
    reservations); is_outstanding(tid) (True while the TICKET tid is pending or broken; False once finished, for an
    unknown id and for an open reservation's id); holds_request(uid, inc) (tickets only: a reservation names no
    request). stats: enqueued (tickets created: every commit counts one, also commit through enqueue), pending_polls
@@ -131,7 +134,8 @@ class ResultTickets:
     def enqueue(self, call, layer, keys, handle, cev, holds) -> int:
         """Section 2 (milestone 6): enqueue's input checks, then reserve, then commit. The order and the texts are the
         milestone-6 ones: a malformed call is refused (KStepError) before the capacity is checked, and a refused
-        capacity has the text "... refused before enqueue: ..." (I14). Returns the ticket id."""
+        capacity has the text "... refused before enqueue: <n> of <cap> result tickets are outstanding ..." (I14), where
+        <n> is outstanding(): the tickets AND the open reservations (section 2). Returns the ticket id."""
         keys, holds = self._checked(call, layer, keys, cev, holds)
         rid = self._reserve(call, layer, "enqueue")
         return self._commit(rid, keys, handle, cev, holds)
@@ -251,8 +255,9 @@ class ResultTickets:
     # ----------------------------------------------------------------------------------------------- read-only queries
     def pending(self) -> Dict[str, Any]:
         """READ-ONLY: the outstanding count (tickets and open reservations), the first outstanding ticket (id, call,
-        layer, keys, state; None without a ticket) and, ONLY while a reservation is open, "reservations": [(id, call,
-        layer)] in reservation order (so the milestone-6 shape is unchanged without reservations)."""
+        layer, keys, state; None without a ticket) and, ONLY while a reservation is open, "reservations": a list of
+        dict(id=<rid>, call=<call>, layer=<layer>), one per open reservation in reservation order (so the milestone-6
+        shape is unchanged without reservations)."""
         t = self.q[0] if self.q else None
         first: Optional[Dict[str, Any]] = None if t is None else dict(id=t.tid, call=t.call, layer=t.layer,
                                                                       keys=t.keys, state=t.state)
