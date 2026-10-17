@@ -32,9 +32,15 @@ behind a PASSIVE poll, so that a later milestone can defer the wait. The CPU evi
    EARLIER outstanding ticket that names one of the same incarnations: a later complete ticket waits behind an
    earlier pending one (it is counted as a pending visit).
 5. FAULTS. An exception while a complete ticket is finished propagates from poll(). The ticket is then BROKEN: it stays
-   outstanding (so holds_request stays True, a request end and a quiescent reset stay refused), its holds stay held and
-   its handle is kept, and no later poll touches it again (no second check, no second apply). Rows applied before
-   the fault stay applied: this is NOT a transactional rollback.
+   outstanding (so holds_request stays True, a request end and a quiescent reset stay refused) and no later poll
+   touches it again (no second check, no second apply, no second release). A fault BEFORE view.release (in check,
+   resolve, reference, the comparison, live or apply) leaves every hold held and the handle kept. A fault INSIDE
+   view.release leaves what the view did until the fault: some holds may already be released and the handle may be
+   partly cleared; the ticket keeps its hold keys and its handle reference, but they are not released again. Rows
+   applied before the fault stay applied: this is NOT a transactional rollback.
+   A finished ticket gets the state "finished" before it is removed (it is no longer reachable from the queue). The
+   row-count text of a resolve / reference length mismatch ("result tickets: ticket <id> (call <c> layer <l>)
+   resolved ...") differs from the serialized consumer's text ("C1.2: call <c> resolved ..."); both are KStepError.
 6. VIEW PROTOCOL (the lead's DispatcherTicketView; a component test may use its own view on the REAL CpuBackend):
    done(ev) -> bool (never waits); check(handle); resolve(handle) -> (outs, heads); reference(handle) -> (outs, heads);
    live(key) -> bool (READ-ONLY); apply(key, i, out); release(holds, handle).
@@ -52,7 +58,7 @@ from .errors import CapacityRefusal, ConfigError, ConsumptionMismatch, KStepErro
 RowKey = namedtuple("RowKey", "uid inc epoch cohort pos kind layer call")
 VIEW_METHODS = ("done", "check", "resolve", "reference", "live", "apply", "release")
 STATS = ("enqueued", "pending_polls", "finished", "applied", "discarded", "refused")
-PENDING, BROKEN = "pending", "broken"
+PENDING, BROKEN, FINISHED = "pending", "broken", "finished"
 
 
 class _Ticket:
@@ -163,7 +169,8 @@ class ResultTickets:
                 self.stats["applied"] += 1
             else:
                 self.stats["discarded"] += 1
-        v.release(t.holds, t.handle)
+        v.release(t.holds, t.handle)           # a fault inside it: section 5 (partly released; BROKEN, never again)
+        t.state = FINISHED
         self.q.remove(t)
         t.handle = None                        # the ticket's reference is dropped with the ticket
         self.stats["finished"] += 1
