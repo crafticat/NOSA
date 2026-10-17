@@ -45,9 +45,19 @@ unread, <d> dead) (I18)" BEFORE any change: no hand-out, no write, no event chan
 It never waits.
 
 Sizing on the CpuBackend (fix round MINOR-2). An admission's reuse event is its join gate (tensor_store
-close_admission), and in a dispatcher run nothing forces the join stream before the final synchronize. So inside a run
-a prefill storage is NOT reused, and its class needs one storage per admission of the run. A fixture sizes the
-classes from a "fresh" baseline of the same trace (the test fixtures' ws_capacity reads peak_live) or forces the gates.
+close_admission), and in a dispatcher run nothing forces the join stream before the final synchronize, unless the
+driver drives it. WITHOUT the backpressure below, a prefill storage is therefore NOT reused inside a run, and its class
+needs one storage per admission of the run: a fixture sizes the classes from a "fresh" baseline of the same trace (the
+test fixtures' ws_capacity reads peak_live).
+
+Backpressure (milestone 9, INTERFACE_BC9 B2 / I22; the lead's Dispatcher._admit and run()). class_gate(kind, numel)
+is the READ-ONLY report of the gate that prevents the reuse of a class: (True, None) when an acquire would succeed now;
+else (False, the delivered reuse event of the OLDEST pending storage), or (False, None) when no storage is pending (an
+undelivered one gets its gate at the next forwarding round; an unread or dead one never gives a gate). An executor's
+admission_gate(prompt) returns it for the prompt's prefill class; the dispatcher holds the queue head back while it is
+not ok, and run() (the DRIVER) host-waits exactly that gate. So with the backpressure a prefill storage IS reused
+inside a run, after its own admission gate was driven: one storage of a prefill class serves every admission of the
+run, in order. The workspace itself never waits, forces or polls: the driver drives the reported gate.
 
 The mode "fresh" (the MATCHED BASELINE only; NOT bounded; it takes no classes). Every acquire allocates a NEW storage
 of any class and nothing is reused. The same tracking runs: at each acquire, the storages that became reusable are
@@ -87,15 +97,16 @@ REASONS = ("pending", "undelivered", "unread", "dead")     # why a storage that 
 
 class _Storage:
     """One storage of a class: the 1-D tensor t (the whole storage), its id sid (tensor_store.storage_id), its bytes,
-    its state, its generation (the number of hand-outs) and ops (the op ids of the delivered handbacks of the current
-    generation: at most one, else the storage is DEAD)."""
-    __slots__ = ("kind", "numel", "idx", "t", "sid", "nbytes", "state", "gen", "ops")
+    its state, its generation (the number of hand-outs), seq (the workspace's hand-out serial of its LAST hand-out; 0
+    before the first: the order that class_gate's "oldest" uses) and ops (the op ids of the delivered handbacks of the
+    current generation: at most one, else the storage is DEAD)."""
+    __slots__ = ("kind", "numel", "idx", "t", "sid", "nbytes", "state", "gen", "seq", "ops")
 
     def __init__(self, kind: str, numel: int, idx: int, t: torch.Tensor):
         self.kind, self.numel, self.idx, self.t = kind, numel, idx, t
         self.sid = storage_id(t)
         self.nbytes = t.untyped_storage().nbytes()
-        self.state, self.gen, self.ops = FREE, 0, []
+        self.state, self.gen, self.seq, self.ops = FREE, 0, 0, []
 
 
 def _class_name(key: Tuple[str, int]) -> str:
@@ -119,6 +130,8 @@ class ProducerWorkspace:
                        storage of this workspace is counted (foreign) and ignored.
       reason(kind, numel, index)
                        READ-ONLY: None (FREE or reusable now) or one of REASONS.
+      class_gate(kind, numel) -> (ok, gate)
+                       READ-ONLY, passive (I22): the gate that prevents the reuse of the class (its docstring).
       holders(), detach_completed()
                        I10 (module docstring).
       bound(), storage_count(), storage_bytes(), report()
@@ -151,6 +164,7 @@ class ProducerWorkspace:
         self.events: Dict[Tuple, Any] = {}             # I10: OPERATIONAL (module docstring); a PLAIN dict
         self.peak_live: Dict[Tuple[str, int], int] = {}   # fresh mode: instrumentation (the measured need)
         self._next: Dict[Tuple[str, int], int] = {}       # fresh mode: the next index of a class
+        self._seq = 0                                     # the hand-out serial (class_gate's "oldest")
         self.stats = dict(allocations=0, handouts=0, reuses=0, refusals=0, undeclared=0, delivered=0, failed=0,
                           second_op=0, foreign=0, late_dead=0, retired=0, spent=0)
         for key, count in self.declared.items():       # mode "reuse": the whole bound, now
@@ -218,6 +232,8 @@ class ProducerWorkspace:
             self.stats["reuses"] += 1
         s.state = OUT
         s.gen += 1
+        self._seq += 1
+        s.seq = self._seq
         self.stats["handouts"] += 1
         return s.t, (s.kind, s.numel, s.idx, s.gen)
 
@@ -301,6 +317,38 @@ class ProducerWorkspace:
 
     def reason(self, kind: str, numel: int, idx: int) -> Optional[str]:
         return self._why(self._get(kind, numel, idx))
+
+    def class_gate(self, kind: str, numel: int) -> Tuple[bool, Any]:
+        """I22 (milestone 9 B2), READ-ONLY and passive: may an acquire of class (kind, numel) succeed NOW, and if not,
+        which completion gate prevents the reuse? It uses only _why (the store's read-only source_ops and ev_done): it
+        never waits, forces, polls the store or changes anything. Returns (ok, gate):
+          (True, None)   a storage of the class is FREE or reusable now (an acquire right after it succeeds); also mode
+                         "fresh" (not bounded) and a class that is not declared (the acquire then refuses it by name:
+                         the bound is never bypassed and never hidden behind a stall);
+          (False, ev)    no storage may be overwritten and at least one is "pending": ev is the delivered reuse event
+                         of the OLDEST pending storage (the smallest hand-out serial). It is the ACTUAL gate: when ev
+                         completes (and nothing else is handed out first), that storage is reusable;
+          (False, None)  no storage may be overwritten and none is pending: an "undelivered" storage gets its gate at
+                         the next forwarding round; an "unread" or "dead" storage never gives a gate (fail closed)."""
+        if self.mode == FRESH:
+            return True, None
+        pool = self.classes.get((kind, numel))
+        if pool is None:
+            return True, None
+        oldest = None
+        for s in pool.values():
+            r = self._why(s)
+            if r is None:
+                return True, None
+            if r == "pending" and (oldest is None or s.seq < oldest.seq):
+                oldest = s
+        if oldest is None:
+            return False, None
+        for op in oldest.ops:
+            ev = self.events.get(self._key(oldest, op))
+            if ev is not None and not ev_done(ev):
+                return False, ev
+        return False, None                             # not reached: a pending storage holds a pending event
 
     def tensor(self, kind: str, numel: int, idx: int) -> torch.Tensor:
         return self._get(kind, numel, idx).t
