@@ -430,9 +430,11 @@ class DispatcherTicketView:
         key.cohort is RUNNING with epoch key.epoch and next_layer key.layer (not yet published at that layer); a draft
         row: the request is at epoch key.epoch and its current draft is RUNNING, the same draft (key.cohort ==
         (uid, epoch, m)) at position key.pos, with next_layer key.layer (I17: Draft.next_layer, the per-layer marker
-        that _call_publish advances, so a deferred call's draft row is live only at its own layer)."""
+        that _call_publish advances, so a deferred call's draft row is live only at its own layer). I20: never live once
+        the request's cancellation is requested (the lead's invalidation; C's ticket mark discards such a row without
+        asking, I19)."""
         r = self.d.reqs.get(key.uid)
-        if r is None or r.done or r.inc != key.inc:
+        if r is None or r.done or r.inc != key.inc or key.uid in self.d.cancel_req:
             return False
         if key.kind == VERIFY:
             return any(c.key == key.cohort and c.epoch == key.epoch and c.state == RUNNING and c.next_layer == key.layer
@@ -601,6 +603,10 @@ class Dispatcher:
         self.pending_call: Optional[Dict[str, Any]] = None       # I17: the ONE submitted, unfinished layer call
         self.pending_step: Optional[Dict[str, Any]] = None       # I17: the step that waits on it (resumed by step())
         self.dstat = defaultdict(int)                            # I17: deferred counters (report()["deferred"])
+        self.cancel_req: Dict[Any, int] = {}       # I20 (lead): uid -> inc of a cancellation requested during a stopped step
+        self.cancelled: Dict[Any, Dict[str, Any]] = {}   # I20: uid -> the record of a cancelled incarnation (no results)
+        self.cstat = defaultdict(int)              # I20: cancellation counters (report()["cancel"], after a first cancel)
+        self._in_step = False                      # I20: cancel() is a driver operation, refused inside step()
         self.consume_first: Dict[str, Tuple] = {}  # C1.2 instrumentation: per provenance kind its first consumed item
         self.rstat = defaultdict(int)              # M2 B2: ring / D2H-check counters (report()["ring"]; never self.stats)
         self.adm: List[Dict] = []                  # M2 B2 ring: the admission buffers A_r that are not FREE
@@ -755,7 +761,10 @@ class Dispatcher:
         """The chain element of one KV item: its key (ABI v3), or the pair (k, c) of the same item (ABI v4, V2)."""
         return (kvv[0], kvv[2]) if self.abi4 else kvv[0]
 
-    def _end_request(self, r: Request) -> None:
+    def _end_request(self, r: Request, cancelled: bool = False) -> None:
+        """The end of a request. I20: cancelled=True (only from _cancel_teardown) records the incarnation in
+        self.cancelled (inc, batch slot, step, the committed tokens) instead of a results entry, and counts
+        stats["requests_cancelled"]; every other part of the end is the same."""
         if self.tickets is not None and self.tickets.holds_request(r.uid, r.inc):   # HOOK-L8 (I14), before any change
             raise OwnershipViolation("HOOK-L8 (I14): the end of request %s (incarnation %s) is refused: a pending or "
                                      "broken result ticket still names it (%s)" % (r.uid, r.inc, self.tickets.pending()))
@@ -784,18 +793,24 @@ class Dispatcher:
                     for kind in RING_KINDS:
                         for key in list(r.rmap[l][h][kind]):
                             self._rdrop(l, r, h, kind, key, "end")
-        self.results[r.uid] = r.toks[r.P0:r.P0 + r.N]
+        if cancelled:                                                  # I20: no results entry for a cancelled request
+            self.cancelled[r.uid] = dict(inc=r.inc, b=r.b, t=self.t, committed=list(r.toks[r.P0:]))
+            self.trace[r.uid]["cancelled"] = True
+        else:
+            self.results[r.uid] = r.toks[r.P0:r.P0 + r.N]
         self.trace[r.uid]["final"] = list(r.toks)
         self.slot_req[r.b] = None
-        self.stats["requests_done"] += 1
+        self.stats["requests_cancelled" if cancelled else "requests_done"] += 1
         if self.frontier is not None:                                  # HOOK-C: its finished-cohort records are cleared
             self.frontier.end_request(self, r)                         # once every hold of the incarnation drained (I3)
 
     # ================================================================== the step
-    def run(self, max_steps: int = 200000) -> Dict[Any, List[int]]:
+    def run(self, max_steps: int = 200000, on_pending: Optional[Callable] = None) -> Dict[Any, List[int]]:
         """The synchronous driver. I17: step() itself never waits on a pending call; when it returns with one pending,
         run() (the DRIVER, not the call path) advances the backend by ONE host wait on that call's event (counted in
-        dstat["driver_waits"]) and steps again."""
+        dstat["driver_waits"]) and steps again. I20: on_pending(dispatcher, info), when given, is called ONCE per
+        pending call, after step() returned with it and BEFORE the driver's host wait; info = dict(cid, l, tid, uids:
+        the sorted uids of the call's rows). It is a driver hook (for example cancel(uid)); it must not step or wait."""
         prev = None
         while self.queue or self.active() or self.pending_step is not None:
             self.step()
@@ -804,6 +819,9 @@ class Dispatcher:
                 if pc is prev:                                         # waited, polled, and still not finished: a
                     raise KStepError("I17: run(): the pending call %d stays unfinished after the driver's wait on its "
                                      "completed event (a broken or blocked ticket): no retry" % pc["cid"])
+                if on_pending is not None:                             # I20: the driver's hook, before the wait
+                    on_pending(self, dict(cid=pc["cid"], l=pc["l"], tid=pc["tid"],
+                                          uids=sorted({row.uid for row in pc["ctx"]["jrows"]})))
                 self.dstat["driver_waits"] += 1
                 self.be.host_wait(pc["cev"])
             prev = pc
@@ -816,6 +834,99 @@ class Dispatcher:
         """I17, READ-ONLY: the completion event of the ONE pending layer call, or None (for a test or driver that
         advances the deferred backend itself)."""
         return None if self.pending_call is None else self.pending_call["cev"]
+
+    def cancel(self, uid) -> str:
+        """I20 (lead, INTERFACE_BC8): an EXPLICIT cancellation of the ADMITTED request uid. A driver operation: between
+        two steps, or while a deferred step is stopped (run()'s on_pending hook). Refused (KStepError) BEFORE any
+        change: inside step(); a session that is not "open" (OwnershipViolation, HOOK-L7); an unknown uid; a uid that
+        is queued but not admitted; a done (ended or cancelled) request; a second cancel; an incarnation that the
+        tickets cannot name (inc < 1, a request not queued through submit); and, with no stopped step, an outstanding
+        (broken) ticket that names it (no forced cleanup). Then frontier.cancel_entry (C, I19: ACTIVE -> CANCELLING;
+        its own refusals also come before any change) and tickets.cancel(uid, inc) (C, I19: the discard mark).
+          - A stopped deferred step (pending_step): the request is only MARKED (cancel_req; DispatcherTicketView.live
+            is False for it from now on). NOTHING else changes: the pending call's holds, handle and backings stay
+            charged until its event completes. _resume_step tears it down ONCE, after the call's ticket finished and
+            BEFORE the call's publication. Returns "deferred".
+          - Otherwise the teardown (_cancel_teardown) runs now. Returns "ended".
+        The batch slot of a torn-down request is free for the next admission (a new incarnation; submit keeps refusing
+        a known uid, so a cancelled uid is never resubmitted)."""
+        self._session_guard("cancel")
+        if self._in_step:
+            raise KStepError("I20: cancel of uid %r refused: inside step() (a driver operation between steps)" % (uid,))
+        r = self.reqs.get(uid)
+        if r is None:
+            if any(q[0] == uid for q in self.queue):
+                raise KStepError("I20: cancel of uid %r refused: it is queued, not admitted" % (uid,))
+            raise KStepError("I20: cancel of uid %r refused: unknown request" % (uid,))
+        if r.done:
+            raise KStepError("I20: cancel of uid %r (incarnation %s) refused: the request is done (%s)"
+                             % (uid, r.inc, "cancelled" if uid in self.cancelled else "ended"))
+        if uid in self.cancel_req:
+            raise KStepError("I20: cancel of uid %r (incarnation %s) refused: its cancellation is already requested"
+                             % (uid, r.inc))
+        stopped = self.pending_step is not None
+        if self.tickets is not None:
+            if r.inc < 1:
+                raise KStepError("I20: cancel of uid %r refused: incarnation %s (not queued through submit) cannot be "
+                                 "named by the result tickets" % (uid, r.inc))
+            if not stopped and self.tickets.holds_request(r.uid, r.inc):
+                raise KStepError("I20: cancel of uid %r (incarnation %s) refused: an outstanding result ticket names it "
+                                 "and no step is stopped (a broken ticket: no forced cleanup) (%s)"
+                                 % (uid, r.inc, self.tickets.pending()))
+        if self.frontier is not None:
+            self.frontier.cancel_entry(self, r)                        # C (I19): ACTIVE -> CANCELLING
+        n = self.tickets.cancel(r.uid, r.inc) if self.tickets is not None else 0   # C (I19): the discard mark
+        self.cstat["requested"] += 1
+        self.cstat["marked_tickets"] += n
+        if stopped:
+            self.cancel_req[uid] = r.inc
+            self.cstat["deferred"] += 1
+            return "deferred"
+        self._cancel_teardown(r)
+        return "ended"
+
+    def _cancel_teardown(self, r: Request) -> None:
+        """I20: the ONE teardown of a cancelled request, when no outstanding ticket names it any more. Every undecided
+        cohort and every open untriggered key of the current epoch is cancelled as the rejection path cancels them (C3:
+        the workspace cleared, the decision recorded through _finished_key (accepted while CANCELLING, I19), the
+        requester cancelled (T3: an in-flight destination is never freed early), the cohort freed (K6), its
+        verify-fetch metadata dropped); every uncommitted draft is recorded "cancelled" (the one in flight
+        "cancelled_in_flight"); then the request ends with cancelled=True: its streams end their owner, its ring
+        entries drain behind their gates, its batch slot is free, and it has no results entry. It never goes through
+        _apply, _finish_draft, _protect or _issue (refused while CANCELLING) and never waits."""
+        ep = self.trace[r.uid]["epochs"][-1]
+        m_acc = (min(c.m for c in r.cohorts) - 1) if r.cohorts else r.n_trig   # the epoch's accepted cohorts: 1..m_acc
+        for cc in list(r.cohorts):
+            if cc.state in (PENDING, RUNNING, DONE):
+                was = cc.state
+                cc.state = CANCELLED
+                self.cstat["cohorts"] += 1
+                self.cstat["cohort_rows"] += len(cc.positions)
+                cc.ws.clear()
+                ep["cohorts"].append(self._cohort_record(r, cc, was=was))
+                self._finished_key(cc.key)
+                self._cancel_requester(cc.key)
+                self._free_cohort(cc)
+                self._vfetch_drop_cohort(cc.key, "cancelled")
+        n_open = cad.cohort_of(len(r.drafts) + 1, self.K)
+        for m in range(m_acc + 1, n_open + 1):
+            k = (r.uid, r.epoch, m)
+            if not any(cc.key == k for cc in r.cohorts):
+                self._finished_key(k)
+                self._cancel_requester(k)
+                self.cstat["untriggered_keys"] += 1
+        for dd in r.drafts:
+            if cad.cohort_of(dd.s, self.K) > m_acc:
+                self._record_draft(r, dd, "cancelled")
+                self.cstat["drafts"] += 1
+        if r.cur is not None and r.cur.epoch == r.epoch:
+            self._record_draft(r, r.cur, "cancelled_in_flight")
+            self.cstat["drafts_in_flight"] += 1
+        ep["outcome"] = dict(kind="cancellation", n=r.n, t=self.t)
+        r.cohorts = []
+        r.cur = None
+        self._end_request(r, cancelled=True)
+        self.cstat["torn_down"] += 1
 
     def _forward_handbacks(self) -> None:
         """I17 / I16 (lead): every handback the store recorded since the last take goes, in op order, to the executor
@@ -851,6 +962,13 @@ class Dispatcher:
             self.dstat["pending_returns"] += 1
             return
         self.pending_call = None
+        if self.cancel_req:                                            # I20: each requested cancellation ONCE, after
+            for uid in list(self.cancel_req):                          # the call's ticket finished (its rows of the
+                self._cancel_teardown(self.reqs[uid])                  # cancelled request were discarded and its holds
+                del self.cancel_req[uid]                               # released by the ticket) and BEFORE the
+            n0 = len(ps["rows"])                                       # publication; the step resumes with the
+            ps["rows"] = [(r, dr) for r, dr in ps["rows"] if not r.done]   # remaining live rows only
+            self.cstat["rows_dropped_at_resume"] += n0 - len(ps["rows"])
         self._call_publish(pc["l"], pc["ctx"], self._ticket_outs(pc["l"], pc["ctx"], deferred=True))
         for l in range(pc["l"] + 1, self.L):
             if ps["vonly"]:
@@ -862,6 +980,13 @@ class Dispatcher:
 
     def step(self) -> None:
         self._session_guard("step")                                    # HOOK-L7 (I12): no resume unless "open"
+        self._in_step = True                                           # I20: cancel() is refused inside a step
+        try:
+            self._step()
+        finally:
+            self._in_step = False
+
+    def _step(self) -> None:
         if self.pending_step is not None:                              # I17: finish the stopped step first
             return self._resume_step()
         t = self.t
@@ -2525,6 +2650,10 @@ class Dispatcher:
         by a late output). Returns True (the call is finished)."""
         cid, rows, owners, jrows = ctx["cid"], ctx["rows"], ctx["owners"], ctx["jrows"]
         exec_cohorts, requests = ctx["exec_cohorts"], ctx["requests"]
+        if self.cancelled:                                             # I20: a request torn down at this call's resume
+            n0 = len(requests)                                         # issues no transfer (only after a cancellation)
+            requests = [q for q in requests if not q[1].done]
+            self.cstat["transfer_requests_dropped"] += n0 - len(requests)
         dropped = {id(obj) for (kind, r, obj, i), out in zip(owners, outs) if out is _DISCARDED}
         for (kind, r, obj, i), row, out in zip(owners, jrows, outs):
             if out is _DISCARDED:
@@ -2573,6 +2702,8 @@ class Dispatcher:
                 c.state = DONE
         if self.recent != "eager":                                     # M2 B2: a retained EXACT entry whose last WAITING
             for r in list({id(r): r for r, _ in exec_cohorts}.values()):   # holder executed now drains (its read is
+                if r.done:                                             # I20: a cancelled request's entries drained at
+                    continue                                           # its end
                 self._rsync(r, "exec")                                 # already the compute gate, installed above)
         # D1: per stream SUM and UNION of the selected blocks of the executing rows
         per = defaultdict(lambda: [0, set(), 0, set(), 0])
@@ -3431,6 +3562,8 @@ class Dispatcher:
         if self.deferred:                                              # exists only with tickets on. I17: a
             out["pending_calls"] = int(self.pending_call is not None)  # submitted, unpublished call or a stopped
             out["pending_steps"] = int(self.pending_step is not None)  # step blocks it too (only in deferred mode)
+        if self.cancel_req:                                            # I20: a requested, not yet torn-down
+            out["cancels_pending"] = len(self.cancel_req)              # cancellation (the key exists only then)
         return out
 
     def event_holders(self) -> List[Tuple[str, Tuple, Any]]:
@@ -3608,6 +3741,8 @@ class Dispatcher:
             out["tickets"] = dict(self.tickets.stats)                  # HOOK-L8 (I14): a copy, only with tickets on
         if self.deferred or self.cfg.store_handback:
             out["deferred"] = dict(self.dstat)                         # I17: only in deferred / handback mode
+        if self.cstat:
+            out["cancel"] = dict(self.cstat, cancelled=sorted(self.cancelled, key=repr))   # I20: only after a cancel
         return out
 
     def capacity_report(self) -> Dict[str, Any]:
