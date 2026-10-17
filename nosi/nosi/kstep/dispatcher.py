@@ -251,6 +251,7 @@ from .errors import (CapacityRefusal, ConfigError, ConsumptionMismatch, KStepErr
 from .executor import (DRAFT, RESET_CONTRACT, VERIFY, Row, abi_of, check_consumed_identity, check_executor,
                        reset_contract_of, reset_methods_missing)   # HOOK-L4: the I10 readers (executor.py)
 from .mutations import Mutations
+from .result_tickets import ResultTickets, RowKey
 # HOOK-L3: DRAINING is imported for quiesce_state / detach_completed_events (INTERFACE_BC3 I8)
 from .ownership import (COUNTS, DRAINING, FREE, LIVE, LRU, PO, R_DRAFT, R_EXACT, R_PRE, R_PROV, RELEASING, RING_KINDS, VRES,
                         Arena, BiasOpLedger, Geometry, LayerPool, MemoryAccountant, RingPool)
@@ -297,6 +298,8 @@ class Config:
     store_join: str = "join"               # HOOK-B2: the backend stream of the admission gate (store "tensor" only)
     store_gen: str = "host"                # HOOK-L6 (I11): "host" (the consumer reads the pools' mirrors, as before) |
                                            # "consumer" (the store's own consumer mirrors; store "tensor", arena, S0)
+    result_tickets: int = 0                # HOOK-L8 (I14): 0 (the serialized consumer, as before) | > 0: the capacity
+                                           # of the opt-in result tickets (consume "physical"; DispatcherTicketView)
 
 
 class Draft:
@@ -376,6 +379,63 @@ class Request:
 
     def generated(self) -> int:
         return len(self.toks) - self.P0
+
+
+class DispatcherTicketView:
+    """HOOK-L8 (INTERFACE_BC6 I14, lead, 2026-10-17): the view protocol of result_tickets.ResultTickets over the
+    serialized physical consumer of ONE dispatcher (Config.result_tickets > 0). Every method does what the serialized
+    Dispatcher._consume does at the same point, so the run is the serialized run:
+      done(ev)          ev_done (never waits);
+      check(handle)     the C1.2 identity check of every gathered block / entry (check_consumed_identity, StaleReader),
+                        counted in c1stat["consume_identity_checks"] as the serialized path counts it;
+      resolve / reference  the executor's (gathered bytes only / the same-order Row.kv reference);
+      live(key)         READ-ONLY: the row still exists with the same incarnation, epoch, cohort and layer progress;
+      apply(key, i, out)  row i's consumed output into out[(call, i)], once (a second apply is KStepError); _call
+                        publishes from there;
+      release(holds, handle)  the call's c1_gather holds (the consume ledger), then handle.clear().
+    Nothing here touches self.d.stats. No method keeps a reference to a row, a request, a cohort or a workspace."""
+
+    def __init__(self, d: "Dispatcher"):
+        self.d = d
+        self.out: Dict[Tuple[Any, int], Any] = {}
+
+    def done(self, ev) -> bool:
+        return ev_done(ev)
+
+    def check(self, handle) -> None:
+        d = self.d
+        d.c1stat["consume_identity_checks"] += check_consumed_identity(d.ex.consumed_identities(handle))
+
+    def resolve(self, handle):
+        return self.d.ex.resolve(handle)
+
+    def reference(self, handle):
+        return self.d.ex.reference(handle)
+
+    def live(self, key) -> bool:
+        """READ-ONLY. The request key.uid is active (not done) with incarnation key.inc; a verifier row: its cohort
+        key.cohort is RUNNING with epoch key.epoch and next_layer key.layer (not yet published at that layer); a draft
+        row: the request is at epoch key.epoch and its current draft is RUNNING at position key.pos."""
+        r = self.d.reqs.get(key.uid)
+        if r is None or r.done or r.inc != key.inc:
+            return False
+        if key.kind == VERIFY:
+            return any(c.key == key.cohort and c.epoch == key.epoch and c.state == RUNNING and c.next_layer == key.layer
+                       for c in r.cohorts)
+        dr = r.cur
+        return r.epoch == key.epoch and dr is not None and dr.state == RUNNING and dr.pos == key.pos
+
+    def apply(self, key, i: int, out) -> None:
+        k = (key.call, i)
+        if k in self.out:
+            raise KStepError("HOOK-L8 (I14): row %d of call %s (%s) applied twice" % (i, key.call, key))
+        self.out[k] = out
+
+    def release(self, holds, handle) -> None:
+        lg = self.d.consume_ledger
+        for h in holds:
+            lg.release_key("c1_gather", h)
+        handle.clear()                                                 # the handle's backing references are dropped
 
 
 class Dispatcher:
@@ -511,6 +571,12 @@ class Dispatcher:
         else:
             self.bias_dtype = self.host_c = self.arena_c = self.ring_c = self.bias_ledger = None
         self.consume_ledger = BiasOpLedger(BiasOpLedger.CONSUME_KINDS) if self.consume else None   # C1.2: the gathers
+        rtc = cfg.result_tickets                   # HOOK-L8 (INTERFACE_BC6 I14, lead): the opt-in result tickets
+        if isinstance(rtc, bool) or not isinstance(rtc, int) or rtc < 0:
+            raise ConfigError("HOOK-L8: result_tickets must be an int >= 0 (got %r)" % (rtc,))
+        if rtc and not self.consume:
+            raise ConfigError("HOOK-L8: result_tickets %d needs consume 'physical' (got %r)" % (rtc, cfg.consume))
+        self.tickets = ResultTickets(rtc, DispatcherTicketView(self)) if rtc else None
         self.consume_first: Dict[str, Tuple] = {}  # C1.2 instrumentation: per provenance kind its first consumed item
         self.rstat = defaultdict(int)              # M2 B2: ring / D2H-check counters (report()["ring"]; never self.stats)
         self.adm: List[Dict] = []                  # M2 B2 ring: the admission buffers A_r that are not FREE
@@ -656,6 +722,9 @@ class Dispatcher:
         return (kvv[0], kvv[2]) if self.abi4 else kvv[0]
 
     def _end_request(self, r: Request) -> None:
+        if self.tickets is not None and self.tickets.holds_request(r.uid, r.inc):   # HOOK-L8 (I14), before any change
+            raise OwnershipViolation("HOOK-L8 (I14): the end of request %s (incarnation %s) is refused: a pending or "
+                                     "broken result ticket still names it (%s)" % (r.uid, r.inc, self.tickets.pending()))
         if self.frontier is not None:                                  # HOOK-C2: a second or stale end is refused
             self.frontier.end_entry(self, r)                           # before any mutation (I3, I6)
         for l in range(self.L):
@@ -1355,6 +1424,36 @@ class Dispatcher:
             self.consume_ledger.release_key("c1_gather", key)
         handle.clear()                                                 # the handle's backing references are dropped
         return list(outs)
+
+    def _consume_ticket(self, l: int, jrows: List[Row], owners, handle, cev) -> List[Any]:
+        """HOOK-L8 (INTERFACE_BC6 I14, lead): C1.2 steps 3-6 of _consume through the opt-in result tickets, with the
+        same result and counters: enqueue the call (one RowKey per row: uid, incarnation, the row's cohort epoch, its
+        cohort, position, kind, layer, call; the call's c1_gather hold keys; the handle; cev); ONE passive poll while
+        the call's event is still pending (on the deferred backend nothing happens: a pending visit); the KEPT host
+        wait on cev; one poll (identity first, resolution, the exact comparison, apply once per live row, release);
+        the outputs in call order; then the counts. Every row of a serialized call is live, so a row without an applied
+        output is KStepError. The step stays synchronous: no ticket outlives its call."""
+        if not jrows:
+            return []
+        cid = self.call_id
+        if cev is None:
+            raise KStepError("C1.2: call %d consumes %d rows without a completion event" % (cid, len(jrows)))
+        keys = [RowKey(row.uid, r.inc, row.cohort[1], row.cohort, row.pos, row.kind, l, cid)
+                for (_, r, _, _), row in zip(owners, jrows)]
+        holds = [rec["key"] for rec in self.consume_ledger.recs.values() if rec["key"][0] == cid]
+        T = self.tickets
+        T.enqueue(cid, l, keys, handle, cev, holds)
+        T.poll()                                                       # passive: the call's event is still pending
+        self.be.host_wait(cev)                                         # the KEPT serialized wait (C1.2 step 3)
+        T.poll()
+        out = T.view.out
+        missing = [i for i in range(len(jrows)) if (cid, i) not in out]
+        if missing:
+            raise KStepError("HOOK-L8 (I14): call %d rows %s were not applied by their ticket (%s)"
+                             % (cid, missing, T.pending()))
+        outs = [out.pop((cid, i)) for i in range(len(jrows))]
+        self._consume_count(l, jrows)
+        return outs
 
     def _consume_count(self, l: int, jrows: List[Row]) -> None:
         """C1.2 counters and first witnesses (instrumentation), from Row.addr / Row.ring of every consumed (row, head) in
@@ -2265,7 +2364,10 @@ class Dispatcher:
             self._check_post_reads(jrows, read_slots, cev)             # 2. the same registration checks, then the
             self._install_reader(l, read_slots, cev)                   #    reader gates and the validators, BEFORE
             self._arm_validators(cev)                                  #    any wait (no poll or release in between)
-            outs = self._consume(l, jrows, handle, cev)                # 3-6. wait, identity, resolve, compare, release
+            if self.tickets is None:
+                outs = self._consume(l, jrows, handle, cev)            # 3-6. wait, identity, resolve, compare, release
+            else:                                                      # HOOK-L8 (I14): the same steps through one
+                outs = self._consume_ticket(l, jrows, owners, handle, cev)   # result ticket (the wait is kept)
         elif self.arena_mode:                                          # M2 B1 (contract 3.1): the executor's own event
             outs, read_ev = self.ex.joint_post(l, jrows) if jrows else ([], None)
             self._check_post_reads(jrows, read_slots, read_ev)
@@ -3149,7 +3251,7 @@ class Dispatcher:
         events are listed by event_holders(), and detach_completed_events() drains them passively."""
         def keyed(lg):
             return 0 if lg is None else sum(1 for rec in lg.recs.values() if rec["ev"] is None)
-        return dict(
+        out = dict(
             queued=len(self.queue),
             active=sum(1 for r in self.slot_req if r is not None),
             inflight=len(self.inflight),
@@ -3165,6 +3267,9 @@ class Dispatcher:
             bias_ledger_keyed=keyed(self.bias_ledger),
             consume_ledger_keyed=keyed(self.consume_ledger),
         )
+        if self.tickets is not None:                                   # HOOK-L8 (I14): outstanding result tickets
+            out["tickets"] = self.tickets.outstanding()                # (pending or broken) block the reset; the key
+        return out                                                     # exists only with tickets on
 
     def event_holders(self) -> List[Tuple[str, Tuple, Any]]:
         """HOOK-L3, READ-ONLY: one (owner_class, location, event) per event reference that the dispatcher, its pools,
@@ -3337,6 +3442,8 @@ class Dispatcher:
             out["physical"] = self.arena_report()                      # M2: addresses / allocation differ by construction
         if self.recent != "eager":
             out["ring"] = self.ring_report()                           # M2 B2: ring / D2H-check counters only
+        if self.tickets is not None:
+            out["tickets"] = self.tickets.stats                        # HOOK-L8 (I14): only with tickets on
         return out
 
     def capacity_report(self) -> Dict[str, Any]:
