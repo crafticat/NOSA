@@ -43,7 +43,8 @@ behind a PASSIVE poll, so that a later milestone can defer the wait. The CPU evi
    ConsumptionMismatch); then, for each row in call order, view.live(key): True -> view.apply(key, i, out) exactly
    once; False -> the row is discarded (never published); then view.release(holds, handle) (the gather backings and
    the handle are released only now: at application or safe discard). The comparison covers every row, also a row
-   that is discarded: the gathered bytes are checked whether or not they are published.
+   that is discarded: the gathered bytes are checked whether or not they are published. (I19: a row of a CANCELLED
+   incarnation is discarded before view.live is asked; section 8.)
 4. ORDER. A ticket names the request incarnations (uid, inc) of its rows. A ticket is finished only after every
    EARLIER outstanding ticket that names one of the same incarnations: a later complete ticket waits behind an
    earlier pending one (it is counted as a pending visit).
@@ -67,6 +68,29 @@ behind a PASSIVE poll, so that a later milestone can defer the wait. The CPU evi
    request). stats: enqueued (tickets created: every commit counts one, also commit through enqueue), pending_polls
    (ticket visits by poll() that left the ticket outstanding: pending, behind an earlier ticket, or broken), finished,
    applied, discarded, refused (by reserve or enqueue).
+8. CANCELLATION (milestone 8, INTERFACE_BC8 I19). cancel(uid, inc) is an EXPLICIT cancellation of a request
+   incarnation whose physical read may still be pending. It returns n, the number of OUTSTANDING tickets (pending or
+   broken) that name the incarnation (an open reservation names no request). With n > 0 it records ONE cancellation
+   mark; with n == 0 it records nothing. Refused (KStepError, no change): a malformed uid / inc ("... malformed (the uid
+   must not be None and the inc must be an int >= 1) (I19)" or "... (the uid is not hashable) (I19)"), and a second
+   cancel while the mark is open ("... its cancellation mark is already open (<n> outstanding tickets name it) (I19)").
+   cancel calls NO view method, queries no event, releases no hold and drops no handle: every ticket keeps its holds
+   and its handle (the CHARGED backing) until it finishes through poll, after its event completed. Nothing is forced.
+   At the finish of a ticket (section 3), check, resolve, reference and the exact comparison still cover EVERY row,
+   also a cancelled one. Then, per row in call order, a row of a MARKED incarnation is discarded WITHOUT calling
+   view.live (stats "cancelled_discarded"; it is never published, also when view.live would say True); every other row
+   is decided by view.live as before. Then view.release as before. When the LAST outstanding ticket that names a marked
+   incarnation finishes, the mark is dropped (stats "cancels_drained"). A BROKEN ticket stays outstanding, so a mark
+   that it names never drains (holds_request stays True; the lead's request end and the reset stay refused).
+   Stats: "cancels" (marks recorded), "cancelled_discarded" and "cancels_drained" exist from the FIRST recorded mark on;
+   while nothing was ever cancelled, the stats, pending() and every text are the milestone-6 / 7 ones. "discarded"
+   keeps its meaning (rows that view.live found not live); for a finished ticket, applied + discarded +
+   cancelled_discarded = its row count. READ-ONLY: cancel_pending(uid, inc); pending()["cancels"] = [dict(uid=, inc=,
+   tickets=<outstanding tickets that name it now>)], only while a mark is open.
+   THE BOUND: a mark exists only for an incarnation that at least one OUTSTANDING ticket names, and at most one per
+   incarnation (a second cancel is refused). So the open marks are at most the distinct incarnations named by the
+   outstanding tickets: at most capacity x R, with R the largest row count of an outstanding ticket. With the lead's
+   one global pending call (I17), at most the rows of that one call.
 """
 from __future__ import annotations
 
@@ -105,6 +129,7 @@ class ResultTickets:
         self.view = view
         self.q: List[_Ticket] = []
         self.res: Dict[int, Tuple[Any, Any]] = {}          # I15: the OPEN reservations, rid -> (call, layer), in order
+        self.marks: Dict[Tuple[Any, Any], int] = {}        # I19: OPEN cancellation marks, (uid, inc) -> tickets named
         self.next_id = 1                                   # one id space: a reservation's id becomes its ticket's id
         self.stats: Dict[str, int] = {k: 0 for k in STATS}
 
@@ -130,6 +155,43 @@ class ResultTickets:
         read: a committed ticket finishes only through poll (live -> apply, stale -> discard) or stays BROKEN."""
         self._open(rid, "abort")
         del self.res[rid]
+
+    # ------------------------------------------------------------------------------------------- I19: cancellation
+    CANCEL_STATS = ("cancels", "cancelled_discarded", "cancels_drained")
+
+    def cancel(self, uid, inc) -> int:
+        """I19 (section 8): an EXPLICIT cancellation of the request incarnation (uid, inc). Returns n, the number of
+        OUTSTANDING tickets (pending or broken) that name it; a reservation names no request, so it does not count.
+        n > 0: ONE cancellation mark is recorded (stats["cancels"]). n == 0: nothing is recorded (there is nothing to
+        discard). Refused (KStepError, no change): a malformed uid / inc, and a second cancel while the mark is open.
+        It calls NO view method, queries no event, releases no hold and drops no handle: every ticket keeps its holds
+        and its handle (the CHARGED backing) until it finishes through poll."""
+        if uid is None or isinstance(inc, bool) or not isinstance(inc, int) or inc < 1:
+            raise KStepError("result tickets: cancel of request incarnation (%r, %r): malformed (the uid must not be "
+                             "None and the inc must be an int >= 1) (I19)" % (uid, inc))
+        try:
+            hash(uid)
+        except TypeError:
+            raise KStepError("result tickets: cancel of request incarnation (%r, %r): malformed (the uid is not "
+                             "hashable) (I19)" % (uid, inc)) from None
+        if (uid, inc) in self.marks:
+            raise KStepError("result tickets: cancel of request incarnation (%s, %s): its cancellation mark is already "
+                             "open (%d outstanding tickets name it) (I19)"
+                             % (uid, inc, sum(1 for t in self.q if (uid, inc) in t.owners)))
+        n = sum(1 for t in self.q if (uid, inc) in t.owners)
+        if n:
+            for k in self.CANCEL_STATS:        # the cancel counters exist from the first recorded mark on, so the
+                self.stats.setdefault(k, 0)    # milestone-6 / 7 stats shape is unchanged while nothing is cancelled
+            self.marks[(uid, inc)] = n
+            self.stats["cancels"] += 1
+        return n
+
+    def cancel_pending(self, uid, inc) -> bool:
+        """I19, READ-ONLY: True while the cancellation mark of (uid, inc) is open."""
+        try:
+            return (uid, inc) in self.marks
+        except TypeError:
+            return False
 
     def enqueue(self, call, layer, keys, handle, cev, holds) -> int:
         """Section 2 (milestone 6): enqueue's input checks, then reserve, then commit. The order and the texts are the
@@ -241,7 +303,9 @@ class ResultTickets:
                 raise ConsumptionMismatch("C1 consumption mismatch: call %s row (%s, %s, %s) output: consumed %r != "
                                           "reference %r" % (t.call, k.uid, k.pos, k.kind, outs[i], ref_outs[i]))
         for i, k in enumerate(t.keys):         # call order; each row exactly once
-            if v.live(k):
+            if (k.uid, k.inc) in self.marks:   # I19: a cancelled incarnation: discarded WITHOUT asking view.live
+                self.stats["cancelled_discarded"] += 1
+            elif v.live(k):
                 v.apply(k, i, outs[i])
                 self.stats["applied"] += 1
             else:
@@ -251,19 +315,27 @@ class ResultTickets:
         self.q.remove(t)
         t.handle = None                        # the ticket's reference is dropped with the ticket
         self.stats["finished"] += 1
+        for inc_ in sorted(t.owners & set(self.marks), key=repr):   # I19: the LAST ticket of a mark drains it
+            if not any(inc_ in u.owners for u in self.q):
+                del self.marks[inc_]
+                self.stats["cancels_drained"] += 1
 
     # ----------------------------------------------------------------------------------------------- read-only queries
     def pending(self) -> Dict[str, Any]:
         """READ-ONLY: the outstanding count (tickets and open reservations), the first outstanding ticket (id, call,
         layer, keys, state; None without a ticket) and, ONLY while a reservation is open, "reservations": a list of
         dict(id=<rid>, call=<call>, layer=<layer>), one per open reservation in reservation order (so the milestone-6
-        shape is unchanged without reservations)."""
+        shape is unchanged without reservations); ONLY while a cancellation mark is open (I19), "cancels": a list of
+        dict(uid=<uid>, inc=<inc>, tickets=<outstanding tickets that name it now>), in cancel order."""
         t = self.q[0] if self.q else None
         first: Optional[Dict[str, Any]] = None if t is None else dict(id=t.tid, call=t.call, layer=t.layer,
                                                                       keys=t.keys, state=t.state)
         out: Dict[str, Any] = dict(outstanding=self.outstanding(), first=first)
         if self.res:
             out["reservations"] = [dict(id=rid, call=c, layer=l) for rid, (c, l) in self.res.items()]
+        if self.marks:                         # I19: only while a mark is open (else the milestone-7 shape)
+            out["cancels"] = [dict(uid=u, inc=i, tickets=sum(1 for t in self.q if (u, i) in t.owners))
+                              for (u, i) in self.marks]
         return out
 
     def outstanding(self) -> int:
