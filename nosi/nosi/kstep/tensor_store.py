@@ -55,7 +55,11 @@ of EVERY handback that names the storage ("workspace handback" below).
 Failures (lead integration, after the Track B review): a refused open leaves held exact, but the ledger's peak / log may
 show the charge and its rollback. An enqueue that raises after its hold opened leaves that hold OPEN on purpose: a
 partly queued copy may still read the source, so the hold is never released early (drained() stays False; a leak, not
-a corruption).
+a corruption). An admission keeps this rule after its close too (milestone-7 review fix): a fault in admission_d2h or
+admission_ring marks it faulted (adm.faulted; stats["admission_faults"]), because a copy that the fault left queued
+has no event in the hold. close_admission of a faulted admission is terminal (adm.closed, the references dropped) but
+leaves the hold OPEN and forms no gate (adm.gate None with gate_ok False: not a complete handle). poll() never
+releases its storages. The dispatcher aborts at the fault; such a close is a component caller's continuation only.
 
 Not claimed: NOSA or model numerics, CUDA stream safety, HBM fit or throughput. The pgen_t / rgen_t mirrors stay the
 pools' CPU int64 tensors (the opt-in consumer mirrors of I11 are separate; "consumer generation mirrors" below).
@@ -202,8 +206,9 @@ the default "none" path is unchanged; sites named by function, as line numbers s
                     failure    a fault after the operation's hold opened (admit's enqueue, a copy of admission_d2h or
                                admission_ring, close_admission's join, produce_ring's enqueue) records the handback at
                                once with issued False and reuse_ev None; then the error propagates. A later close of
-                               that admission records nothing more. Its sources are never reported reusable. A check
-                               that refuses before the hold changes nothing and records nothing.
+                               that admission records nothing more (and keeps its hold open: "Failures" above). Its
+                               sources are never reported reusable. A check that refuses before the hold changes
+                               nothing and records nothing.
                   take_handbacks() returns the recorded handbacks in op order and clears the list (the lead forwards
                   them to the executor). source_reusable(hb) is READ-ONLY: hb.issued, hb.reuse_ev not None and
                   ev_done(hb.reuse_ev). It never waits and never polls.
@@ -515,11 +520,12 @@ class Admission:
     the producer event `ready` (on "compute"), the latest D2H read `dev` and compute read `cev`, the source hold and,
     after close_admission, `gate`: the consumer handle that the executor's workspace reuse waits on (not the release
     rule of the hold; SourceHolds releases each storage by the per-stream rule). After the close the record drops its
-    tensor references (the hold keeps them until poll releases them) and refuses every further copy. I16 (handback on
-    at admit): hb_sources is the tuple of the hold's storage ids (else None), and hb_ended is True once the store
-    recorded this admission's handback (issued, or failed)."""
+    tensor references (the hold keeps them until poll releases them) and refuses every further copy. faulted is True
+    after a fault in admission_d2h or admission_ring (its close then keeps the hold open; module docstring
+    "Failures"). I16 (handback on at admit): hb_sources is the tuple of the hold's storage ids (else None), and
+    hb_ended is True once the store recorded this admission's handback (issued, or failed)."""
     __slots__ = ("owner", "b", "n", "k", "v", "c", "ready", "cev", "dev", "hold", "gate", "closed", "d2h_blocks",
-                 "ring_copies", "gate_ok", "hb_sources", "hb_ended")
+                 "ring_copies", "gate_ok", "faulted", "hb_sources", "hb_ended")
 
     def __init__(self, owner: Tuple, b: int, n: int, k: List[torch.Tensor], v: List[torch.Tensor],
                  c: Optional[List[torch.Tensor]], ready: Any, hold: int):
@@ -528,6 +534,7 @@ class Admission:
         self.d2h_blocks = []
         self.ring_copies = 0
         self.gate_ok = False                  # True once close_admission formed adm.gate (None is complete only then)
+        self.faulted = False                  # a copy faulted: the close keeps the hold open (module "Failures")
         self.hb_sources: Optional[Tuple] = None   # I16: the hold's storage ids (handback on at admit), else None
         self.hb_ended = False                 # I16: True once this admission's handback is recorded
 
@@ -594,7 +601,7 @@ class TensorStore:
         self.stats = dict(admissions=0, admission_d2h=0, admission_ring=0, admissions_closed=0, admission_joins=0,
                           ring_produced=0, ring_published=0, published=0, ready_admissions=0, ready_produced=0,
                           ready_published=0, gen_init_writes=0, gen_publishes=0, gen_arena_writes=0,
-                          gen_ring_writes=0, handbacks_issued=0, handbacks_failed=0)
+                          gen_ring_writes=0, admission_faults=0, handbacks_issued=0, handbacks_failed=0)
         self.admissions: List[Dict[str, Any]] = []   # dispatcher adapter (B2): each admission, its A_r storages
         self.producer_ready = False                   # I9: set by attach_dispatcher from the executor's class
         self.handback = False                         # I16: the opt-in (enable_handback); off by default
@@ -674,6 +681,15 @@ class TensorStore:
     def _open_admission(self, adm: Any, where: str) -> None:
         if not isinstance(adm, Admission) or adm.closed:
             raise KStepError("tensor store: the admission is closed or unknown (%s)" % where)
+
+    def _fault_admission(self, adm: Admission) -> None:
+        """A fault in admission_d2h or admission_ring after its checks: a copy may be queued with no event in the
+        hold. Mark the admission faulted (close_admission then keeps its hold open; module docstring "Failures"),
+        count it once, and record its I16 handback as failed (_hb_fail_admission). Changes no hold."""
+        if not adm.faulted:
+            adm.faulted = True
+            self.stats["admission_faults"] += 1
+        self._hb_fail_admission(adm)
 
     def check_ready(self, ready: Any, where: str) -> Any:
         """I9: `ready` is None (the sources are complete) or ONE native event of this store's backend
@@ -982,8 +998,9 @@ class TensorStore:
     def admission_d2h(self, adm: Admission, l: int, j: int) -> Any:
         """Step 1 for one COMPLETE prompt block j of layer l: on "d2h", a stream wait on A_r's ready event, then the K,
         V (and bias) rows of A_r into the host rows (b, j * bs ..). Returns the D2H event (hist_ev). The caller keeps
-        the snapshot, hown and hist_ev bookkeeping (dispatcher._d2h_block). I16: a fault after the checks records the
-        admission's handback as failed (_hb_fail_admission); then the error propagates."""
+        the snapshot, hown and hist_ev bookkeeping (dispatcher._d2h_block). A fault after the checks marks the
+        admission faulted (_fault_admission: its close keeps the hold open; I16: its handback is recorded as failed);
+        then the error propagates."""
         where = "admission D2H of owner %s layer %d block %d" % (getattr(adm, "owner", None), l, j)
         self._open_admission(adm, where)
         self._layer(l, where)
@@ -1005,7 +1022,7 @@ class TensorStore:
             adm.d2h_blocks.append((l, j))
             self.holds.read(adm.hold, PUBLISH, ev)
         except BaseException:
-            self._hb_fail_admission(adm)            # I16: a fault between the copies: never reusable
+            self._fault_admission(adm)              # the close keeps the hold open; I16: never reusable
             raise
         self.stats["admission_d2h"] += 1
         return ev
@@ -1015,8 +1032,9 @@ class TensorStore:
         "compute": a stream wait on the previous occupancy's D2H event (the second safeguard; prev_d2h from the bind),
         then the K, V (and bias) of A_r at (pos, h) into ring row e. Returns the copy's event (the entry's ready event:
         the caller installs it with RingPool.set_ready). I11 (consumer mirrors attached): after the data copies and
-        BEFORE that event, crgen[l][e] = the entry's rgen from a staging hold (_gen_stage), on "compute". I16: a fault
-        after the checks records the admission's handback as failed (_hb_fail_admission); then the error propagates."""
+        BEFORE that event, crgen[l][e] = the entry's rgen from a staging hold (_gen_stage), on "compute". A fault after
+        the checks marks the admission faulted (_fault_admission: its close keeps the hold open; I16: its handback is
+        recorded as failed); then the error propagates."""
         where = ("admission ring copy of owner %s layer %d head %d position %d entry %d"
                  % (getattr(adm, "owner", None), l, h, pos, e))
         self._open_admission(adm, where)
@@ -1044,7 +1062,7 @@ class TensorStore:
                 self.holds.read(gh, PRODUCE, ev)
                 self.holds.close(gh)
         except BaseException:
-            self._hb_fail_admission(adm)            # I16: a fault between the copies: never reusable
+            self._fault_admission(adm)              # the close keeps the hold open; I16: never reusable
             raise
         self.stats["admission_ring"] += 1
         return ev
@@ -1063,6 +1081,11 @@ class TensorStore:
         completed; nothing is forced and no hold is dropped), adm.gate stays None with adm.gate_ok False (None is NOT
         a complete handle then), and the error propagates. stats["admissions_closed"] and stats["admission_joins"]
         count SUCCESSFUL closes only: a failed join leaves both unchanged (TS9).
+        A FAULTED admission (adm.faulted: a fault in admission_d2h or admission_ring; milestone-7 review fix): the
+        close is terminal as above (closed, the references dropped), then it returns None at once. The hold stays
+        OPEN, so poll() never releases its storages (the copy that the fault left queued has no event in the hold; a
+        leak, not a corruption). No gate is formed: adm.gate None with gate_ok False (NOT a complete handle). The
+        counters are unchanged. The dispatcher never comes here: it aborts at the fault.
         I16 (handback on at admit): after gate_ok is True, the admission's handback is recorded with issued True and
         reuse_ev = adm.gate (when the gate is None, every joined event had completed; reuse_ev is then `first`, the
         compute-side event, which had completed). A fault in the hold close or the join records it as failed (issued
@@ -1072,6 +1095,8 @@ class TensorStore:
         self._open_admission(adm, where)
         adm.closed = True                     # milestone 2: terminal BEFORE anything that can fail
         adm.k = adm.v = adm.c = None
+        if adm.faulted:                       # review fix: a queued copy may have no event; keep the hold OPEN
+            return None
         first = adm.cev if adm.cev is not None else adm.ready
         try:
             self.holds.close(adm.hold)        # lead integration: the hold is closed before the join
