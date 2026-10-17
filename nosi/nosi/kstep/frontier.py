@@ -89,6 +89,22 @@ model only.
      head of the current epoch; a draft completion in the current epoch whose draft is not RUNNING or not the next one.
    - No uid-reuse promise beyond this: Dispatcher.submit refuses a uid that it knows, so a uid has one incarnation per
      dispatcher today. Under uid reuse the provider attribution would not be exact (CompletionOwnership docstring).
+   Milestone 8 (INTERFACE_BC8 I19): the incarnation state CANCELLING, between ACTIVE and ENDED.
+   - FinishedCohorts.cancel(uid, inc): ACTIVE -> CANCELLING, refused (I3) before any change for an incarnation that is
+     not live, that ended, or that is already cancelling. CompletionOwnership.cancel_entry(d, r) is the dispatcher's
+     entry (also refuses a stale Request object). The counter "cancelled" exists from the first cancellation on.
+   - In CANCELLING: a decision RECORD (check_finish / finish: the cancellation teardown records each cancelled cohort
+     key, as the rejection path's _finished_key does), late_queue and refuse_release work as in ACTIVE; a protection
+     (refuse_protect), a decision ENTRY (check_decision, decision_entry) and a draft completion entry (draft_entry) are
+     REFUSED by name ("... while it is cancelling (I19)"); end (and end_entry) accept ACTIVE or CANCELLING (-> ENDED;
+     a second end stays refused). A uid that is cancelling cannot start another incarnation.
+   - The records stay until every hold provider reports 0 for that incarnation (the existing rule; poll clears ENDED
+     incarnations only, so a CANCELLING one is never cleared before its end).
+   - A NEW incarnation that reuses the cancelled request's batch slot has a NEW uid (submit refuses a known uid). Every
+     provider attributes by uid ("transfers": Transfer.uid; "ring_gates": RingPool.owner[e][0] and A_r["uid"];
+     "d2h": d.reqs[uid].hist_ev when its inc matches, and the D2H records' "uid"; "reader_frontier": the table's
+     owner incarnation), so the counts of the CANCELLING / ENDED incarnation never include the new incarnation's work,
+     and it clears exactly when ITS OWN providers drain.
 
 5. ACCOUNTING. The entries are counted as the dispatcher counts its release-queue and reader-event entries (one
    Geometry.unit()["release_entry"] each, ownership.py:875): per frontier object one record plus one per component, one
@@ -150,7 +166,7 @@ model only.
        "state:<key>=<n>" (quiesce_state keys, sorted), "holder:<owner class>=<pending references>" (sorted; a declared
        executor's classes "executor:..." too), "frontier:components|handles|joins=<n>", "provider:<name>(<uid>,<inc>)=
        <n>" (incarnations and names sorted), "store:not_drained=1", "tickets:reservations=<n>" (I15),
-       "executor:no_reset_contract=1". Each class is
+       "tickets:cancels=<n>" (I19), "executor:no_reset_contract=1". Each class is
        named once with its count. Nothing is changed and the session stays "open"; so does an exception that the
        read-only check itself raises (for example a HOOK-L4 refusal inside event_holders()). The check never polls: a
        store record that completed but was not polled yet is refused, and so are registered validators, D2H checks
@@ -160,6 +176,8 @@ model only.
        key "tickets" (state:tickets=<n>); its gather backings are also counted (state:consume_ledger_keyed=<n>).
        An OPEN reservation of the tickets (I15: reserved, not yet committed or aborted) is counted in "tickets" too and
        is also named by its own item "tickets:reservations=<n>" (read-only, from Dispatcher.tickets.pending()).
+       An OPEN cancellation mark of the tickets (I19) implies an outstanding ticket (so the reset is refused already);
+       it is also named by its own item "tickets:cancels=<n>" (from pending()["cancels"]).
    (2) begin_reset(): the session becomes "resetting".
    (3) The MUTATING phases, in this order, each by its name:
        "detach"        detach_completed_events() (HOOK-L4: a declared executor's detach_completed() first; the hook
@@ -421,9 +439,10 @@ class FrontierTable:
 
 # ------------------------------------------------------------------------------------------------- finished cohorts
 class FinishedCohorts:
-    """Section 4 of the module docstring. live[(uid, inc)] = "active" | "ended"; rec[(uid, inc, key)] = the decision
-    serial; sources = [(name, fn(uid, inc) -> number of outstanding holds)]. Every check runs before any change."""
-    ACTIVE, ENDED = "active", "ended"
+    """Section 4 of the module docstring. live[(uid, inc)] = "active" | "cancelling" (I19) | "ended"; rec[(uid, inc,
+    key)] = the decision serial; sources = [(name, fn(uid, inc) -> number of outstanding holds)]. Every check runs
+    before any change."""
+    ACTIVE, CANCELLING, ENDED = "active", "cancelling", "ended"
 
     def __init__(self, entry_bytes: int = 16):
         self.entry_bytes = int(entry_bytes)
@@ -469,19 +488,25 @@ class FinishedCohorts:
         other = [i for (u, i), st in self.live.items() if u == uid and st == self.ACTIVE]
         if other:
             raise KStepError("I3: uid %s is active as incarnation %s; incarnation %s cannot start" % (uid, other[0], inc))
+        other = [i for (u, i), st in self.live.items() if u == uid and st == self.CANCELLING]
+        if other:                                              # I19: a cancelling incarnation still owns the uid
+            raise KStepError("I3: uid %s is cancelling as incarnation %s; incarnation %s cannot start (I19)"
+                             % (uid, other[0], inc))
         self.live[(uid, inc)] = self.ACTIVE
         self.stats["started"] += 1
         self._peak()
 
     def check_finish(self, uid, inc, key) -> bool:
         """The checks of a decision, before any change: the key belongs to uid and the incarnation is live. Returns True
-        for a DUPLICATE decision (counted; the caller changes nothing). A first decision after the end is refused."""
+        for a DUPLICATE decision (counted; the caller changes nothing). A first decision after the end is refused. I19:
+        a CANCELLING incarnation accepts it (the cancellation teardown records each cancelled cohort key, as the
+        rejection path's _finished_key does)."""
         self._own(uid, key)
         st = self.state(uid, inc, lambda: "the decision of cohort %s" % (key,))
         if (uid, inc, key) in self.rec:
             self.stats["duplicate_finish"] += 1
             return True
-        if st != self.ACTIVE:
+        if st == self.ENDED:
             raise KStepError("I3: decision of cohort %s of request incarnation (%s, %s) after its end" % (key, uid, inc))
         return False
 
@@ -489,10 +514,15 @@ class FinishedCohorts:
         """Milestone 2 (I6), the ENTRY of a decision (Dispatcher._apply), before any mutation: the key belongs to uid; the
         incarnation must be live (else I3 "... which is not live ...") and ACTIVE (else I3 "decision ... after its end",
         also for a finished key); a finished key returns True (the caller changes nothing and counts it by its kind).
-        Unlike check_finish, the incarnation state is checked BEFORE the finished-key test."""
+        Unlike check_finish, the incarnation state is checked BEFORE the finished-key test. I19: a CANCELLING
+        incarnation is refused by name ("I3: decision of cohort <key> of request incarnation (<uid>, <inc>) while it is
+        cancelling (I19)")."""
         self._own(uid, key)
         try:
             st = self.state(uid, inc, lambda: "the decision of cohort %s" % (key,))
+            if st == self.CANCELLING:
+                raise KStepError("I3: decision of cohort %s of request incarnation (%s, %s) while it is cancelling "
+                                 "(I19)" % (key, uid, inc))
             if st != self.ACTIVE:
                 raise KStepError("I3: decision of cohort %s of request incarnation (%s, %s) after its end"
                                  % (key, uid, inc))
@@ -515,13 +545,18 @@ class FinishedCohorts:
 
     def refuse_protect(self, uid, inc, key, l: int, block: int) -> None:
         """A protection of `block` at layer l for `key`: refused for a finished key (R1.5) and for an incarnation that
-        ended or is not live (I3)."""
+        ended or is not live (I3). I19: a CANCELLING incarnation is refused by name ("I3: protection of block <b> at
+        layer <l> for cohort <key> of request incarnation (<uid>, <inc>) while it is cancelling (I19)"), after the
+        finished-key test."""
         self._own(uid, key)
         st = self.state(uid, inc, lambda: "the protection of block %d at layer %d for cohort %s" % (block, l, key))
         if (uid, inc, key) in self.rec:
             self.stats["late_protect_refused"] += 1
             raise KStepError("R1.5: late protection of block %d at layer %d for cohort %s after the cohort finished "
                              "(durable finished-cohort record, incarnation %s)" % (block, l, key, inc))
+        if st == self.CANCELLING:
+            raise KStepError("I3: protection of block %d at layer %d for cohort %s of request incarnation (%s, %s) "
+                             "while it is cancelling (I19)" % (block, l, key, uid, inc))
         if st != self.ACTIVE:
             raise KStepError("I3: protection of block %d at layer %d for cohort %s of request incarnation (%s, %s) after "
                              "its end" % (block, l, key, uid, inc))
@@ -544,12 +579,26 @@ class FinishedCohorts:
                                      "incarnation %s; its layer records were pruned)" % (key, l, inc))
 
     def end(self, uid, inc) -> int:
-        """The request incarnation ended. Its records stay until every hold source reports nothing (poll)."""
-        if self.state(uid, inc, lambda: "the end of a request") != self.ACTIVE:
+        """The request incarnation ended (from ACTIVE, or from CANCELLING: I19). Its records stay until every hold
+        source reports nothing (poll)."""
+        if self.state(uid, inc, lambda: "the end of a request") == self.ENDED:
             raise KStepError("I3: request incarnation (%s, %s) ended twice" % (uid, inc))
         self.live[(uid, inc)] = self.ENDED
         self.stats["ended"] += 1
         return self.poll()
+
+    def cancel(self, uid, inc) -> None:
+        """I19: ACTIVE -> CANCELLING, refused (KStepError, I3) BEFORE any change for an incarnation that is not live
+        (the state() text, "the cancellation of a request"), that ended ("I3: cancellation of request incarnation
+        (<uid>, <inc>) after its end (I19)") or that is already cancelling ("I3: request incarnation (<uid>, <inc>) is
+        cancelled twice (I19)"). The counter stats["cancelled"] exists from the first cancellation on."""
+        st = self.state(uid, inc, lambda: "the cancellation of a request")
+        if st == self.CANCELLING:
+            raise KStepError("I3: request incarnation (%s, %s) is cancelled twice (I19)" % (uid, inc))
+        if st != self.ACTIVE:
+            raise KStepError("I3: cancellation of request incarnation (%s, %s) after its end (I19)" % (uid, inc))
+        self.live[(uid, inc)] = self.CANCELLING
+        self.stats["cancelled"] = self.stats.get("cancelled", 0) + 1
 
     def outstanding(self, uid, inc) -> Dict[str, int]:
         out: Dict[str, int] = {}
@@ -728,6 +777,9 @@ class CompletionOwnership:
         self._live_request(d, r, lambda: "the draft completion s%d" % (dr.s,))
         try:
             st = self.cohorts.state(r.uid, r.inc, lambda: "the draft completion s%d (epoch %d)" % (dr.s, dr.epoch))
+            if st == FinishedCohorts.CANCELLING:                         # I19: refused by name
+                raise KStepError("I3: draft completion s%d (epoch %d) of request incarnation (%s, %s) while it is "
+                                 "cancelling (I19)" % (dr.s, dr.epoch, r.uid, r.inc))
             if st != FinishedCohorts.ACTIVE:
                 raise KStepError("I3: draft completion s%d (epoch %d) of request incarnation (%s, %s) after its end"
                                  % (dr.s, dr.epoch, r.uid, r.inc))
@@ -746,11 +798,22 @@ class CompletionOwnership:
 
     def end_entry(self, d, r) -> None:
         """Dispatcher._end_request's entry, BEFORE any mutation: refused (I3) for a stale Request object, an incarnation
-        that is not live, or a second end."""
+        that is not live, or a second end. I19: an ACTIVE or a CANCELLING incarnation may end."""
         self._live_request(d, r, lambda: "the end of a request")
         try:
-            if self.cohorts.state(r.uid, r.inc, lambda: "the end of a request") != FinishedCohorts.ACTIVE:
+            if self.cohorts.state(r.uid, r.inc, lambda: "the end of a request") == FinishedCohorts.ENDED:
                 raise KStepError("I3: request incarnation (%s, %s) ended twice" % (r.uid, r.inc))
+        except KStepError:
+            self.cohorts.stats["stale_callbacks_refused"] += 1
+            raise
+
+    def cancel_entry(self, d, r) -> None:
+        """I19, the dispatcher's cancellation entry (Dispatcher.cancel), BEFORE any mutation: refused (KStepError, I3;
+        counted as stale_callbacks_refused) for a stale Request object, an incarnation that is not live, an ended one
+        and a second cancel (FinishedCohorts.cancel's texts); then FinishedCohorts.cancel (ACTIVE -> CANCELLING)."""
+        self._live_request(d, r, lambda: "the cancellation of a request")
+        try:
+            self.cohorts.cancel(r.uid, r.inc)
         except KStepError:
             self.cohorts.stats["stale_callbacks_refused"] += 1
             raise
@@ -951,7 +1014,9 @@ class QuiescentReset:
         store_out = store is not None and not store.drained_all()
         tk = getattr(d, "tickets", None)                               # I15: the result tickets' OPEN reservations
         tk_pending = getattr(tk, "pending", None)                      # (read-only; their count is also part of the
-        reservations = len(tk_pending().get("reservations", ())) if callable(tk_pending) else 0   # lead's "tickets")
+        tkp = tk_pending() if callable(tk_pending) else {}             # lead's "tickets"); I19: the OPEN
+        reservations = len(tkp.get("reservations", ()))                # cancellation marks (an open mark implies
+        cancels = len(tkp.get("cancels", ()))                          # an outstanding ticket: named, not new)
         items = (["state:%s=%d" % (k, state[k]) for k in sorted(state)]
                  + ["holder:%s=%d" % (c, holders[c]) for c in sorted(holders)]
                  + ["frontier:%s=%d" % (k, table[k]) for k in self.TABLE_PARTS if k in table]
@@ -959,9 +1024,10 @@ class QuiescentReset:
                     for inc_ in sorted(providers, key=repr) for name, n in sorted(providers[inc_].items())]
                  + (["store:not_drained=1"] if store_out else [])
                  + (["tickets:reservations=%d" % reservations] if reservations else [])
+                 + (["tickets:cancels=%d" % cancels] if cancels else [])
                  + (["executor:no_reset_contract=1"] if contract != self.contract else []))
         return dict(state=state, holders=holders, first=first, frontier=table, providers=providers, store=store_out,
-                    reservations=reservations, contract=contract, items=items)
+                    reservations=reservations, cancels=cancels, contract=contract, items=items)
 
     def _refuse_if_failed(self) -> None:
         """I12 (0): a latched failed session refuses at once (reads only Dispatcher.session / session_reason: no hook,
