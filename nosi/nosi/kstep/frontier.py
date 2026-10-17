@@ -103,8 +103,10 @@ model only.
    - A NEW incarnation that reuses the cancelled request's batch slot has a NEW uid (submit refuses a known uid). Every
      provider attributes by uid ("transfers": Transfer.uid; "ring_gates": RingPool.owner[e][0] and A_r["uid"];
      "d2h": d.reqs[uid].hist_ev when its inc matches, and the D2H records' "uid"; "reader_frontier": the table's
-     owner incarnation), so the counts of the CANCELLING / ENDED incarnation never include the new incarnation's work,
-     and it clears exactly when ITS OWN providers drain.
+     owner incarnation; "tensor_store", when Dispatcher.store exists: track B's source holds, exact by their (uid,
+     inc) owner), so the counts of the CANCELLING / ENDED incarnation never include the new incarnation's work, and it
+     clears exactly when ITS OWN providers drain. (The controls CC6-CC8 exercise d2h, ring_gates with A_r, and
+     transfers; tensor_store is not exercised there.)
 
 5. ACCOUNTING. The entries are counted as the dispatcher counts its release-queue and reader-event entries (one
    Geometry.unit()["release_entry"] each, ownership.py:875): per frontier object one record plus one per component, one

@@ -129,7 +129,9 @@ class ResultTickets:
         self.view = view
         self.q: List[_Ticket] = []
         self.res: Dict[int, Tuple[Any, Any]] = {}          # I15: the OPEN reservations, rid -> (call, layer), in order
-        self.marks: Dict[Tuple[Any, Any], int] = {}        # I19: OPEN cancellation marks, (uid, inc) -> tickets named
+        self.marks: Dict[Tuple[Any, Any], int] = {}        # I19: OPEN marks, (uid, inc) -> the outstanding tickets
+                                                           # that named it AT CANCEL TIME (a record only; pending()
+                                                           # and the drain count the outstanding tickets again)
         self.next_id = 1                                   # one id space: a reservation's id becomes its ticket's id
         self.stats: Dict[str, int] = {k: 0 for k in STATS}
 
@@ -175,7 +177,7 @@ class ResultTickets:
             raise KStepError("result tickets: cancel of request incarnation (%r, %r): malformed (the uid is not "
                              "hashable) (I19)" % (uid, inc)) from None
         if (uid, inc) in self.marks:
-            raise KStepError("result tickets: cancel of request incarnation (%s, %s): its cancellation mark is already "
+            raise KStepError("result tickets: cancel of request incarnation (%r, %r): its cancellation mark is already "
                              "open (%d outstanding tickets name it) (I19)"
                              % (uid, inc, sum(1 for t in self.q if (uid, inc) in t.owners)))
         n = sum(1 for t in self.q if (uid, inc) in t.owners)
