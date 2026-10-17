@@ -2272,7 +2272,8 @@ class Dispatcher:
         leaves the dispatcher, the pools, the rings, the store and the ledgers exactly as they were (only the tickets'
         stats["refused"] counts it). A call that ends with no consume row aborts its reservation (no read was issued);
         a failure after the reservation keeps it open (fail closed: the reset refuses; abort only before any issued
-        read, I15)."""
+        read, I15). The reservation is open during this call's _poll(), its progress hook and its "poll" observer
+        call; none of them reads the tickets today (a hook that does sees outstanding() count it)."""
         rid = None
         if self.tickets is not None:
             rid = self.tickets.reserve(self.call_id + 1, l)            # BEFORE any change of this call
