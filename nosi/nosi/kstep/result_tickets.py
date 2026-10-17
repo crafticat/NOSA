@@ -59,9 +59,11 @@ behind a PASSIVE poll, so that a later milestone can defer the wait. The CPU evi
    live(key) -> bool (READ-ONLY); apply(key, i, out); release(holds, handle).
 7. READ-ONLY QUERIES. pending() (the outstanding count, the first outstanding ticket: id, call, layer, keys, state,
    and, only while a reservation is open, "reservations": [(id, call, layer)]); outstanding() (tickets AND open
-   reservations); holds_request(uid, inc) (tickets only: a reservation names no request). stats: enqueued (tickets
-   created, by commit or enqueue), pending_polls (ticket visits by poll() that left the ticket outstanding: pending,
-   behind an earlier ticket, or broken), finished, applied, discarded, refused (by reserve or enqueue).
+   reservations); is_outstanding(tid) (True while the TICKET tid is pending or broken; False once finished, for an
+   unknown id and for an open reservation's id); holds_request(uid, inc) (tickets only: a reservation names no
+   request). stats: enqueued (tickets created: every commit counts one, also commit through enqueue), pending_polls
+   (ticket visits by poll() that left the ticket outstanding: pending, behind an earlier ticket, or broken), finished,
+   applied, discarded, refused (by reserve or enqueue).
 """
 from __future__ import annotations
 
@@ -263,6 +265,14 @@ class ResultTickets:
         """READ-ONLY: outstanding tickets (pending or broken) AND open reservations (I15: the lead's
         quiesce_state()["tickets"] uses it, so an open reservation blocks a reset)."""
         return len(self.q) + len(self.res)
+
+    def is_outstanding(self, tid) -> bool:
+        """READ-ONLY (no change, no view call): True while the TICKET tid is outstanding (pending or broken); False once
+        it finished, for an unknown id, and for the id of an open reservation (it is not a ticket until commit). Only an
+        int is an id (a bool is not: True == 1 must not name ticket 1)."""
+        if isinstance(tid, bool) or not isinstance(tid, int):
+            return False
+        return any(t.tid == tid for t in self.q)
 
     def holds_request(self, uid, inc) -> bool:
         """READ-ONLY: True while an outstanding ticket (pending or broken) names the incarnation (uid, inc). An open
