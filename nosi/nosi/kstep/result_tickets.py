@@ -19,6 +19,19 @@ behind a PASSIVE poll, so that a later milestone can defer the wait. The CPU evi
    tickets outstanding it raises CapacityRefusal BEFORE any change of the tickets (only the counter "refused"
    counts it): the handle and the holds are NOT taken, so the tickets hold nothing of the refused call (the caller
    still owns them).
+2a. RESERVATION BEFORE ALLOCATION (milestone 7, INTERFACE_BC7 I15). reserve(call, layer) checks the capacity BEFORE
+   the caller allocates or holds anything: outstanding tickets + OPEN reservations >= capacity -> CapacityRefusal
+   "result tickets: call <c> layer <l>: refused before reservation: <n> of <cap> result tickets are outstanding (<t>
+   tickets, <r> open reservations; nothing is allocated or held for this call) (I15)"; nothing changes but
+   stats["refused"], and no view method is called. A reservation names no row and no request. commit(rid, keys,
+   handle, cev, holds) runs enqueue's input checks first (KStepError before any change: the reservation stays OPEN),
+   then the reservation becomes the ticket (its id is the reservation's id; no second capacity check). abort(rid) drops
+   an OPEN reservation (the caller's allocation failed or was refused before any read was issued); no view call.
+   commit and abort raise KStepError for an unknown rid ("... unknown reservation (I15)") and for one that is no
+   longer open ("... the reservation is not open (it was committed or aborted) (I15)"). abort is NOT the cleanup of an
+   issued read: a committed ticket finishes only through poll (live -> apply, stale -> discard) or stays BROKEN.
+   enqueue is: the input checks, then reserve, then commit (so its order and its texts stay the milestone-6 ones).
+   Tickets keep their COMMIT order (section 4 "earlier" means committed earlier).
 3. POLL. poll() is PASSIVE: it never waits, never synchronizes, never forces an event; it asks view.done(cev) only.
    A ticket whose event is not complete is left exactly as it was: no check, resolve, reference, apply, layer
    advance or release. Completion alone releases nothing. A COMPLETE ticket is finished, in this order:
@@ -44,9 +57,11 @@ behind a PASSIVE poll, so that a later milestone can defer the wait. The CPU evi
 6. VIEW PROTOCOL (the lead's DispatcherTicketView; a component test may use its own view on the REAL CpuBackend):
    done(ev) -> bool (never waits); check(handle); resolve(handle) -> (outs, heads); reference(handle) -> (outs, heads);
    live(key) -> bool (READ-ONLY); apply(key, i, out); release(holds, handle).
-7. READ-ONLY QUERIES. pending() (the outstanding count and the first outstanding ticket: id, call, layer, keys, state),
-   outstanding(), holds_request(uid, inc). stats: enqueued, pending_polls (ticket visits by poll() that left the
-   ticket outstanding: pending, behind an earlier ticket, or broken), finished, applied, discarded, refused.
+7. READ-ONLY QUERIES. pending() (the outstanding count, the first outstanding ticket: id, call, layer, keys, state,
+   and, only while a reservation is open, "reservations": [(id, call, layer)]); outstanding() (tickets AND open
+   reservations); holds_request(uid, inc) (tickets only: a reservation names no request). stats: enqueued (tickets
+   created, by commit or enqueue), pending_polls (ticket visits by poll() that left the ticket outstanding: pending,
+   behind an earlier ticket, or broken), finished, applied, discarded, refused (by reserve or enqueue).
 """
 from __future__ import annotations
 
@@ -84,12 +99,76 @@ class ResultTickets:
         self.capacity = capacity
         self.view = view
         self.q: List[_Ticket] = []
-        self.next_id = 1
+        self.res: Dict[int, Tuple[Any, Any]] = {}          # I15: the OPEN reservations, rid -> (call, layer), in order
+        self.next_id = 1                                   # one id space: a reservation's id becomes its ticket's id
         self.stats: Dict[str, int] = {k: 0 for k in STATS}
 
-    # -------------------------------------------------------------------------------------------------------- enqueue
+    # ---------------------------------------------------------------------------------------- I15: reserve / commit
+    def reserve(self, call, layer) -> int:
+        """I15 (section 2a): checks the capacity BEFORE the caller allocates or holds anything: outstanding tickets +
+        open reservations >= capacity -> CapacityRefusal (nothing changes but stats["refused"]; no view call). The
+        reservation names no row. Returns its id (rid)."""
+        return self._reserve(call, layer, "reservation")
+
+    def commit(self, rid, keys, handle, cev, holds) -> int:
+        """I15: the reservation rid becomes a ticket: first enqueue's input checks (KStepError before any change; the
+        reservation stays OPEN), then the ticket takes ownership of handle and holds (no second capacity check).
+        KStepError for an unknown rid or one that is no longer open (committed or aborted). Returns the ticket id (=
+        rid)."""
+        call, layer = self._open(rid, "commit")
+        keys, holds = self._checked(call, layer, keys, cev, holds)
+        return self._commit(rid, keys, handle, cev, holds)
+
+    def abort(self, rid) -> None:
+        """I15: drops an OPEN reservation (the caller's allocation failed or was refused BEFORE any read was issued). No
+        view call. KStepError for an unknown rid or one that is no longer open. abort is NOT the cleanup of an issued
+        read: a committed ticket finishes only through poll (live -> apply, stale -> discard) or stays BROKEN."""
+        self._open(rid, "abort")
+        del self.res[rid]
+
     def enqueue(self, call, layer, keys, handle, cev, holds) -> int:
-        """Section 2: checks the input, then the capacity, then takes ownership of handle and holds. Returns the id."""
+        """Section 2 (milestone 6): enqueue's input checks, then reserve, then commit. The order and the texts are the
+        milestone-6 ones: a malformed call is refused (KStepError) before the capacity is checked, and a refused
+        capacity has the text "... refused before enqueue: ..." (I14). Returns the ticket id."""
+        keys, holds = self._checked(call, layer, keys, cev, holds)
+        rid = self._reserve(call, layer, "enqueue")
+        return self._commit(rid, keys, handle, cev, holds)
+
+    def _reserve(self, call, layer, what: str) -> int:
+        n = self.outstanding()
+        if n >= self.capacity:
+            self.stats["refused"] += 1
+            if what == "enqueue":
+                raise CapacityRefusal("result tickets: call %s layer %s: refused before enqueue: %d of %d result "
+                                      "tickets are outstanding (nothing of this call is held by the tickets) (I14)"
+                                      % (call, layer, n, self.capacity))
+            raise CapacityRefusal("result tickets: call %s layer %s: refused before reservation: %d of %d result "
+                                  "tickets are outstanding (%d tickets, %d open reservations; nothing is allocated or "
+                                  "held for this call) (I15)" % (call, layer, n, self.capacity, len(self.q),
+                                                                 len(self.res)))
+        rid = self.next_id
+        self.next_id += 1
+        self.res[rid] = (call, layer)
+        return rid
+
+    def _open(self, rid, what: str) -> Tuple[Any, Any]:
+        """The (call, layer) of the OPEN reservation rid, else KStepError (no change)."""
+        if isinstance(rid, bool) or not isinstance(rid, int) or not 1 <= rid < self.next_id:
+            raise KStepError("result tickets: %s of reservation %r: unknown reservation (I15)" % (what, rid))
+        if rid not in self.res:
+            raise KStepError("result tickets: %s of reservation %d: the reservation is not open (it was committed or "
+                             "aborted) (I15)" % (what, rid))
+        return self.res[rid]
+
+    def _commit(self, rid: int, keys, handle, cev, holds) -> int:
+        call, layer = self.res.pop(rid)
+        t = _Ticket(rid, call, layer, keys, handle, cev, holds)
+        self.q.append(t)
+        self.stats["enqueued"] += 1
+        return t.tid
+
+    def _checked(self, call, layer, keys, cev, holds) -> Tuple[Tuple[RowKey, ...], Tuple]:
+        """enqueue's input checks (section 2): KStepError before any change. Returns (keys, holds) as tuples."""
         where = "result tickets: call %s layer %s" % (call, layer)
         try:
             keys = tuple(keys)
@@ -114,15 +193,7 @@ class ResultTickets:
             holds = tuple(holds)
         except TypeError:
             raise KStepError("%s: the holds are not a sequence (%s) (I14)" % (where, type(holds).__name__)) from None
-        if len(self.q) >= self.capacity:
-            self.stats["refused"] += 1
-            raise CapacityRefusal("%s: refused before enqueue: %d of %d result tickets are outstanding (nothing of "
-                                  "this call is held by the tickets) (I14)" % (where, len(self.q), self.capacity))
-        t = _Ticket(self.next_id, call, layer, keys, handle, cev, holds)
-        self.next_id += 1
-        self.q.append(t)
-        self.stats["enqueued"] += 1
-        return t.tid
+        return keys, holds
 
     # ----------------------------------------------------------------------------------------------------------- poll
     def poll(self) -> int:
@@ -177,15 +248,23 @@ class ResultTickets:
 
     # ----------------------------------------------------------------------------------------------- read-only queries
     def pending(self) -> Dict[str, Any]:
-        """READ-ONLY: the outstanding count and the first outstanding ticket (id, call, layer, keys, state)."""
+        """READ-ONLY: the outstanding count (tickets and open reservations), the first outstanding ticket (id, call,
+        layer, keys, state; None without a ticket) and, ONLY while a reservation is open, "reservations": [(id, call,
+        layer)] in reservation order (so the milestone-6 shape is unchanged without reservations)."""
         t = self.q[0] if self.q else None
         first: Optional[Dict[str, Any]] = None if t is None else dict(id=t.tid, call=t.call, layer=t.layer,
                                                                       keys=t.keys, state=t.state)
-        return dict(outstanding=len(self.q), first=first)
+        out: Dict[str, Any] = dict(outstanding=self.outstanding(), first=first)
+        if self.res:
+            out["reservations"] = [dict(id=rid, call=c, layer=l) for rid, (c, l) in self.res.items()]
+        return out
 
     def outstanding(self) -> int:
-        return len(self.q)
+        """READ-ONLY: outstanding tickets (pending or broken) AND open reservations (I15: the lead's
+        quiesce_state()["tickets"] uses it, so an open reservation blocks a reset)."""
+        return len(self.q) + len(self.res)
 
     def holds_request(self, uid, inc) -> bool:
-        """READ-ONLY: True while an outstanding ticket (pending or broken) names the incarnation (uid, inc)."""
+        """READ-ONLY: True while an outstanding ticket (pending or broken) names the incarnation (uid, inc). An open
+        reservation names no request, so it does not count here (I15)."""
         return any((uid, inc) in t.owners for t in self.q)

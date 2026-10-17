@@ -149,7 +149,8 @@ model only.
        "quiescent reset refused: <items>" that names EVERY outstanding owner class, one item each, in a fixed order:
        "state:<key>=<n>" (quiesce_state keys, sorted), "holder:<owner class>=<pending references>" (sorted; a declared
        executor's classes "executor:..." too), "frontier:components|handles|joins=<n>", "provider:<name>(<uid>,<inc>)=
-       <n>" (incarnations and names sorted), "store:not_drained=1", "executor:no_reset_contract=1". Each class is
+       <n>" (incarnations and names sorted), "store:not_drained=1", "tickets:reservations=<n>" (I15),
+       "executor:no_reset_contract=1". Each class is
        named once with its count. Nothing is changed and the session stays "open"; so does an exception that the
        read-only check itself raises (for example a HOOK-L4 refusal inside event_holders()). The check never polls: a
        store record that completed but was not polled yet is refused, and so are registered validators, D2H checks
@@ -157,6 +158,8 @@ model only.
        The caller drains them first: session_end() (Dispatcher.finish, then one host poll). An outstanding deferred-
        result ticket (I14, result_tickets.py; Config.result_tickets > 0) is refused through the lead's quiesce_state
        key "tickets" (state:tickets=<n>); its gather backings are also counted (state:consume_ledger_keyed=<n>).
+       An OPEN reservation of the tickets (I15: reserved, not yet committed or aborted) is counted in "tickets" too and
+       is also named by its own item "tickets:reservations=<n>" (read-only, from Dispatcher.tickets.pending()).
    (2) begin_reset(): the session becomes "resetting".
    (3) The MUTATING phases, in this order, each by its name:
        "detach"        detach_completed_events() (HOOK-L4: a declared executor's detach_completed() first; the hook
@@ -918,9 +921,10 @@ class QuiescentReset:
         """READ-ONLY (no poll, no wait, no change): every outstanding item, by owner class. Returns state (the nonzero
         quiesce_state counts), holders (owner class -> incomplete references), first (owner class -> the location of its
         first incomplete reference, for diagnosis), frontier (the nonzero table parts), providers ({(uid, inc): {name:
-        count}}, nonzero only), store (True when a store exists and is not drained), contract (the executor's own
-        declaration, executor.reset_contract_of; None when undeclared) and items (the refusal text items, in the fixed
-        order of section 8; empty when the reset may proceed). A declared executor's operational events come through
+        count}}, nonzero only), store (True when a store exists and is not drained), reservations (the open
+        reservations of Dispatcher.tickets, I15; 0 without tickets), contract (the executor's own declaration,
+        executor.reset_contract_of; None when undeclared) and items (the refusal text items, in the fixed order of
+        section 8; empty when the reset may proceed). A declared executor's operational events come through
         event_holders() (HOOK-L4), so its owner classes are holder items like any other."""
         d = self.d
         contract = self.contract_of(getattr(d, "ex", None))           # I10: the own class body only
@@ -945,15 +949,19 @@ class QuiescentReset:
             providers = p["holds"]
         store = getattr(d, "store", None)
         store_out = store is not None and not store.drained_all()
+        tk = getattr(d, "tickets", None)                               # I15: the result tickets' OPEN reservations
+        tk_pending = getattr(tk, "pending", None)                      # (read-only; their count is also part of the
+        reservations = len(tk_pending().get("reservations", ())) if callable(tk_pending) else 0   # lead's "tickets")
         items = (["state:%s=%d" % (k, state[k]) for k in sorted(state)]
                  + ["holder:%s=%d" % (c, holders[c]) for c in sorted(holders)]
                  + ["frontier:%s=%d" % (k, table[k]) for k in self.TABLE_PARTS if k in table]
                  + ["provider:%s(%s,%s)=%d" % (name, inc_[0], inc_[1], n)
                     for inc_ in sorted(providers, key=repr) for name, n in sorted(providers[inc_].items())]
                  + (["store:not_drained=1"] if store_out else [])
+                 + (["tickets:reservations=%d" % reservations] if reservations else [])
                  + (["executor:no_reset_contract=1"] if contract != self.contract else []))
         return dict(state=state, holders=holders, first=first, frontier=table, providers=providers, store=store_out,
-                    contract=contract, items=items)
+                    reservations=reservations, contract=contract, items=items)
 
     def _refuse_if_failed(self) -> None:
         """I12 (0): a latched failed session refuses at once (reads only Dispatcher.session / session_reason: no hook,
