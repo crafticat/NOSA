@@ -866,7 +866,7 @@ class Dispatcher:
                              % (uid, r.inc))
         stopped = self.pending_step is not None
         if self.tickets is not None:                                   # every refusal of tickets.cancel, checked
-            if r.uid is None or r.inc < 1:                             # here BEFORE cancel_entry changes the frontier
+            if r.uid is None or isinstance(r.inc, bool) or r.inc < 1:  # here BEFORE cancel_entry changes the frontier
                 raise KStepError("I20: cancel of uid %r refused: incarnation %s cannot be named by the result tickets "
                                  "(the uid must not be None and the inc must be >= 1: queued through submit)"
                                  % (uid, r.inc))
@@ -878,7 +878,8 @@ class Dispatcher:
             self.frontier.cancel_entry(self, r)                        # C (I19): ACTIVE -> CANCELLING
         n = self.tickets.cancel(r.uid, r.inc) if self.tickets is not None else 0   # C (I19): the discard mark
         self.cstat["requested"] += 1
-        self.cstat["marked_tickets"] += n
+        if n:
+            self.cstat["marked_tickets"] += n
         if stopped:
             self.cancel_req[uid] = r.inc
             self.cstat["deferred"] += 1
