@@ -159,8 +159,9 @@ the default "none" path is unchanged; sites named by function, as line numbers s
                   (Q_l,) int64 on its device, equal to the host mirrors at attach (alloc_gen_mirrors: the initial
                   write completes before the return), attached to the executor in place of pgen_t / rgen_t (its
                   deferred identity copies read them; it never reads them on the host at call time). Writes are ONLY
-                  backend memcpys from ONE new immutable int64 staging tensor per write site, held as SourceHolds kind
-                  "gen_staging" (owner (GEN_OWNER, layer)) until its copy's event passed ev_done (poll releases it;
+                  backend memcpys from ONE new immutable int64 staging tensor per write site (the initial write: one
+                  clone per mirror), held as SourceHolds kind "gen_staging" (owner (GEN_OWNER, layer); the initial
+                  write's hold: (GEN_OWNER, "init")) until its copy's event passed ev_done (poll releases it;
                   drained_all covers it; it is part of source_staging):
                     arena  publish_arena_gens, installed as tp.gen_publisher: S0Transport._issue_pool calls it on
                            "scatter" after Pipe.layer and _issue_bias, so after the issue's reader waits (T3: the
@@ -778,10 +779,14 @@ class TensorStore:
         generation of the transfer's own bind, Stream.take -> Arena.bind), from one staging hold (_gen_stage), on
         `stream` after everything already queued there (the issue's reader waits, T3, and its data and bias
         scatters), then ONE event after those writes, which it returns: the caller makes it every transfer's tr.ev, so
-        arrival covers mirror visibility. Every check runs before any change: the mirrors exist, each transfer is of
-        `layer`, names a position of the arena and the generation that the pool's binding of that position has now
-        (Arena.pgen; the host bind identity), else OwnershipViolation "tensor store: I11: ...". An empty order
-        returns None."""
+        arrival covers mirror visibility. Every check runs before any change, each with its own text after
+        "tensor store: I11: consumer generation write of layer <l>: ": the mirrors exist ("... without consumer
+        mirrors (attach_gen_mirrors did not run)"); each transfer is of `layer` ("transfer seq <s> is of layer <x>"),
+        names a position of the arena ("transfer seq <s> names position <p>, not one of the <P> arena positions"),
+        has a pgen ("transfer seq <s> (position <p>) has no pgen") equal to the one that the pool's binding of that
+        position has now (Arena.pgen, a structural check of the transfer against its own bind: "transfer seq <s>
+        writes pgen <g> into position <p>, but the binding of that position has pgen <h>"); OwnershipViolation. An
+        empty order returns None."""
         where = "consumer generation write of layer %d" % layer
         if self.cpgen is None:
             raise OwnershipViolation("tensor store: I11: %s without consumer mirrors (attach_gen_mirrors did not run)"
@@ -792,13 +797,20 @@ class TensorStore:
         ar = self.arenas[layer]
         idx, gens = [], []
         for tr in order:
-            p, g = getattr(tr, "phys", None), getattr(tr, "pgen", None)
-            ok_p = p is not None and 0 <= int(p) < ar.P
-            if getattr(tr, "layer", None) != layer or not ok_p or g is None or int(ar.pgen[int(p)]) != int(g):
-                raise OwnershipViolation("tensor store: I11: %s: transfer seq %s (layer %s) names position %s with "
-                                         "pgen %s, but the binding of that position has pgen %s"
-                                         % (where, getattr(tr, "seq", None), getattr(tr, "layer", None), p, g,
-                                            ar.pgen[int(p)] if ok_p else None))
+            p, g, tl = getattr(tr, "phys", None), getattr(tr, "pgen", None), getattr(tr, "layer", None)
+            who = "transfer seq %s" % (getattr(tr, "seq", None),)
+            bad = None
+            if tl != layer:
+                bad = "%s is of layer %s" % (who, tl)
+            elif p is None or not 0 <= int(p) < ar.P:
+                bad = "%s names position %s, not one of the %d arena positions" % (who, p, ar.P)
+            elif g is None:
+                bad = "%s (position %s) has no pgen" % (who, p)
+            elif int(ar.pgen[int(p)]) != int(g):
+                bad = ("%s writes pgen %s into position %s, but the binding of that position has pgen %s"
+                       % (who, g, p, ar.pgen[int(p)]))
+            if bad is not None:
+                raise OwnershipViolation("tensor store: I11: %s: %s" % (where, bad))
             idx.append(int(p))
             gens.append(int(g))
         with self.be.stream(stream):
