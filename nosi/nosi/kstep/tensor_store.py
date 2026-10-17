@@ -49,7 +49,8 @@ until adm.gate completes. If the executor writes its next prefill into a reused 
 adm.gate of every admission that adopted the workspace (on the GPU: a stream wait on the executor's stream). The store
 cannot see such a reuse; its hold keeps the storage referenced, not unwritten. adm.gate covers this admission's own
 copies only: the strict condition for a reuse is holds_storage(t) is False for every adopted tensor t (lead
-integration, after the Track B review).
+integration, after the Track B review). With the opt-in I16 handback, the overwrite permission is source_reusable(hb)
+of EVERY handback that names the storage ("workspace handback" below).
 
 Failures (lead integration, after the Track B review): a refused open leaves held exact, but the ledger's peak / log may
 show the charge and its rollback. An enqueue that raises after its hold opened leaves that hold OPEN on purpose: a
@@ -108,7 +109,9 @@ the default "none" path is unchanged; sites named by function, as line numbers s
   executor ordering (lead decision; CUDA later) fresh_outputs = True states that the prefill and payload tensors are
                   fresh storage that the executor does not reuse while store.holds.holds_storage(t) is True. An
                   executor that writes them on its own stream hands the store a ready event of that write through
-                  the I9 opt-in below.
+                  the I9 opt-in below. With the I16 handback on, an executor that takes handbacks (the lead's I17
+                  forwarding) may overwrite a source storage earlier: when source_reusable(hb) is True for every
+                  handback that names it ("workspace handback" below). The attach check of fresh_outputs is unchanged.
   producer readiness (milestone 4, INTERFACE_BC4 I9) the executor's CLASS declares producer_ready = True
                   (producer_ready_of; attach_dispatcher sets store.producer_ready). Then prefill_tensors(kv) and a
                   producer payload(kvv, at=...) return (k, v, c, ready); payload(kvv) with at None (an expectation)
@@ -183,13 +186,43 @@ the default "none" path is unchanged; sites named by function, as line numbers s
                   Accounting: store_bytes()["gen_mirror"] = the distinct storages of cpgen / crgen at allocated
                   capacity (the dispatcher's K6 category gen_mirror reads it); the pools' host mirrors are never
                   counted here.
+  workspace handback (milestone 7, INTERFACE_BC7 I16; opt-in enable_handback, which the lead calls for
+                  Config.store_handback True). Without it nothing changes: no record, no new backend operation, the
+                  same returns. With it, each producer operation that reads producer-owned source tensors gets ONE
+                  Handback (op kind owner layer entry sources reuse_ev issued). The store adds no copy, no wait, no
+                  event and no ledger for it: sources are the storage ids of the operation's own hold (SourceHolds),
+                  and reuse_ev is an event that the operation already makes.
+                    admission  admit .. close_admission. When close_admission formed the gate (gate_ok True), the
+                               handback is recorded with issued True and reuse_ev = adm.gate. When the gate is None
+                               (every joined event had already completed), reuse_ev is the admission's compute-side
+                               event (adm.cev, else A_r's ready event), which had completed. An open admission has no
+                               handback yet.
+                    ring       produce_ring. After the hold closed, the handback is recorded with issued True and
+                               reuse_ev = the copy event that produce_ring returns (RingPool.set_ready).
+                    failure    a fault after the operation's hold opened (admit's enqueue, a copy of admission_d2h or
+                               admission_ring, close_admission's join, produce_ring's enqueue) records the handback at
+                               once with issued False and reuse_ev None; then the error propagates. A later close of
+                               that admission records nothing more. Its sources are never reported reusable. A check
+                               that refuses before the hold changes nothing and records nothing.
+                  take_handbacks() returns the recorded handbacks in op order and clears the list (the lead forwards
+                  them to the executor). source_reusable(hb) is READ-ONLY: hb.issued, hb.reuse_ev not None and
+                  ev_done(hb.reuse_ev). It never waits and never polls.
+                  Scope. The permission is per operation. A storage that several operations read (for example one
+                  workspace given to two producers) is reusable only when the handback of EVERY operation that names
+                  it is reusable; the store does not merge them. The handback covers the producer's SOURCE workspace
+                  only. The ring entries, the arena, the host rows and the gather backing stay under their own rules
+                  (RingPool gates, SourceHolds, the consume ledger). A reference prevents deallocation, not an
+                  overwrite: SourceHolds keeps a source referenced and charged until poll() releases it, and
+                  source_reusable can be True before that poll. publish_block (not wired) records no handback. The
+                  I11 generation staging is the store's own storage and is never a handback source.
   open items      eager / eager_matched in the store's mode; a CUDA executor's ready events (only the event type is
                   checked there: a torch.cuda.Event does not show its stream); device placement of the consumer mirrors
-                  other than the CPU model.
+                  other than the CPU model; a CUDA overlap of a handback reuse (not claimed).
 """
 from __future__ import annotations
 
 import sys
+from collections import namedtuple
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
@@ -465,15 +498,28 @@ class SourceHolds:
                 for hid, h in sorted(self.holds.items())]
 
 
+# --------------------------------------------------------------------------------------------------- I16: handback
+Handback = namedtuple("Handback", "op kind owner layer entry sources reuse_ev issued")
+Handback.__doc__ = """I16 (INTERFACE_BC7; opt-in TensorStore.enable_handback): the overwrite permission of ONE producer
+operation for its SOURCE workspace (module docstring, "workspace handback"). op: a running id (1, 2, ...), in the order
+in which the store records the handbacks. kind: "admission" (admit .. close_admission) or "ring" (produce_ring). owner:
+the I3 identity of the operation. layer, entry: the ring entry of a "ring" operation (None for an admission). sources:
+the ids (storage_id) of the distinct source storages that the operation's hold took, in hold order. reuse_ev: the
+native event after which the producer may overwrite those storages (None when issued is False). issued: True only
+after the operation enqueued ALL its copies. The one test is TensorStore.source_reusable(hb)."""
+
+
 # ----------------------------------------------------------------------------------------------------------- stores
 class Admission:
     """One request's admission buffer A_r (11.2): the adopted prefill tensors per layer (k, v: (n, H, D); c: (n, H)),
     the producer event `ready` (on "compute"), the latest D2H read `dev` and compute read `cev`, the source hold and,
     after close_admission, `gate`: the consumer handle that the executor's workspace reuse waits on (not the release
     rule of the hold; SourceHolds releases each storage by the per-stream rule). After the close the record drops its
-    tensor references (the hold keeps them until poll releases them) and refuses every further copy."""
+    tensor references (the hold keeps them until poll releases them) and refuses every further copy. I16 (handback on
+    at admit): hb_sources is the tuple of the hold's storage ids (else None), and hb_ended is True once the store
+    recorded this admission's handback (issued, or failed)."""
     __slots__ = ("owner", "b", "n", "k", "v", "c", "ready", "cev", "dev", "hold", "gate", "closed", "d2h_blocks",
-                 "ring_copies", "gate_ok")
+                 "ring_copies", "gate_ok", "hb_sources", "hb_ended")
 
     def __init__(self, owner: Tuple, b: int, n: int, k: List[torch.Tensor], v: List[torch.Tensor],
                  c: Optional[List[torch.Tensor]], ready: Any, hold: int):
@@ -482,6 +528,8 @@ class Admission:
         self.d2h_blocks = []
         self.ring_copies = 0
         self.gate_ok = False                  # True once close_admission formed adm.gate (None is complete only then)
+        self.hb_sources: Optional[Tuple] = None   # I16: the hold's storage ids (handback on at admit), else None
+        self.hb_ended = False                 # I16: True once this admission's handback is recorded
 
 
 class TensorStore:
@@ -546,9 +594,12 @@ class TensorStore:
         self.stats = dict(admissions=0, admission_d2h=0, admission_ring=0, admissions_closed=0, admission_joins=0,
                           ring_produced=0, ring_published=0, published=0, ready_admissions=0, ready_produced=0,
                           ready_published=0, gen_init_writes=0, gen_publishes=0, gen_arena_writes=0,
-                          gen_ring_writes=0)
+                          gen_ring_writes=0, handbacks_issued=0, handbacks_failed=0)
         self.admissions: List[Dict[str, Any]] = []   # dispatcher adapter (B2): each admission, its A_r storages
         self.producer_ready = False                   # I9: set by attach_dispatcher from the executor's class
+        self.handback = False                         # I16: the opt-in (enable_handback); off by default
+        self._handbacks: List[Handback] = []          # I16: recorded, not yet taken (take_handbacks)
+        self._hb_op = 0                               # I16: the last op id given
 
     # -- helpers
     @staticmethod
@@ -689,7 +740,7 @@ class TensorStore:
         h = self.holds
         return dict(stats=dict(self.stats), held=h.held, peak=h.peak, records=len(h.recs), holds=len(h.holds),
                     shared=h.shared, released=h.released, stores=self.store_bytes(),
-                    producer_ready=self.producer_ready, gen_mirrors=self.cpgen is not None)
+                    producer_ready=self.producer_ready, gen_mirrors=self.cpgen is not None, handback=self.handback)
 
     def poll(self) -> int:
         """The passive release of the source holds (call it at the existing host poll points). It also drops the
@@ -821,6 +872,50 @@ class TensorStore:
         self.stats["gen_publishes"] += 1
         return ev
 
+    # -- I16: producer-workspace completion handback (milestone 7; opt-in; module docstring "workspace handback")
+    def enable_handback(self) -> None:
+        """I16: switch the handback on (the lead calls it for Config.store_handback True). From now on each admission
+        that admit starts and each produce_ring records ONE Handback; an operation that started before this call gets
+        none. A second call changes nothing. There is no switch back."""
+        self.handback = True
+
+    def _hb_sources(self, hid: int) -> Optional[Tuple]:
+        """I16: the storage ids of hold hid, read right after SourceHolds.open (the hold's own distinct storages, in
+        hold order). None when the handback is off."""
+        return tuple(self.holds.holds[hid]["sids"]) if self.handback else None
+
+    def _hb_record(self, kind: str, owner: Tuple, layer: Optional[int], entry: Optional[int], sources: Tuple,
+                   reuse_ev: Any, issued: bool) -> Handback:
+        """I16: give the next op id and append the handback. A failed operation (issued False) always gets reuse_ev
+        None."""
+        self._hb_op += 1
+        hb = Handback(self._hb_op, kind, owner, layer, entry, tuple(sources), reuse_ev if issued else None,
+                      bool(issued))
+        self._handbacks.append(hb)
+        self.stats["handbacks_issued" if issued else "handbacks_failed"] += 1
+        return hb
+
+    def _hb_fail_admission(self, adm: Admission) -> None:
+        """I16: a fault after the admission's hold opened. If the admission has a handback that is not yet recorded,
+        record it now as failed (issued False, reuse_ev None). A later close records nothing more."""
+        if adm.hb_sources is not None and not adm.hb_ended:
+            adm.hb_ended = True
+            self._hb_record("admission", adm.owner, None, None, adm.hb_sources, None, False)
+
+    def take_handbacks(self) -> List[Handback]:
+        """I16: the recorded handbacks in op order; the list is then empty (the lead forwards them to the executor).
+        An empty list when the handback is off, and for an admission that is still open."""
+        out, self._handbacks = self._handbacks, []
+        return out
+
+    def source_reusable(self, hb: Any) -> bool:
+        """I16, READ-ONLY: may the producer overwrite the sources of hb now? True only when hb.issued is True,
+        hb.reuse_ev is not None and ev_done(hb.reuse_ev). It never waits, never polls and changes nothing. KStepError
+        "tensor store: I16: source_reusable of a <type>, not a Handback" for any other object."""
+        if not isinstance(hb, Handback):
+            raise KStepError("tensor store: I16: source_reusable of a %s, not a Handback" % (type(hb).__name__,))
+        return hb.issued is True and hb.reuse_ev is not None and bool(ev_done(hb.reuse_ev))
+
     # -- admission (11.2)
     def _admit_checks(self, b: int, k: Any, v: Any, c: Any, where: str) -> Tuple[List[Any], List[Any], Any, int]:
         """The read-only checks of an admission (admit; prepare_admit, I9.1): the batch slot, one k / v (and c with a
@@ -858,26 +953,37 @@ class TensorStore:
         event, which the stream order completes only after `ready` (held until ready). Every check runs before any
         enqueue or hold.
         PRECONDITION (module docstring): the executor does not reuse these tensors' storage until adm.gate (from
-        close_admission) completes; a next prefill into a reused workspace must wait on that adm.gate."""
+        close_admission) completes; a next prefill into a reused workspace must wait on that adm.gate.
+        I16 (handback on): the admission's handback starts here (its sources: the hold's storage ids) and is recorded
+        by close_admission; a fault in the enqueue below records it at once as failed."""
         own = self._owner(owner)
         where = "admission of owner %s b %d" % (own, b)
         ks, vs, cs, n = self._admit_checks(b, k, v, c, where)
         self.check_ready(ready, where)              # I9: before the hold, so a refusal changes nothing
         hid = self.holds.open(own, "admission", ks + vs + (cs if cs is not None else []))
-        with self.be.stream(PRODUCE):
-            if ready is not None:
-                self.be.stream_wait(PRODUCE, ready)
-            rev = self.be.event_rec(PRODUCE)
-        self.holds.read(hid, PRODUCE, rev)         # A_r stays held at least until its producer completed
-        self.holds.read(hid, (READY, hid), ready)  # I9: recorded too (the copy event above already implies it)
+        src = self._hb_sources(hid)                 # I16: None when the handback is off
+        try:
+            with self.be.stream(PRODUCE):
+                if ready is not None:
+                    self.be.stream_wait(PRODUCE, ready)
+                rev = self.be.event_rec(PRODUCE)
+            self.holds.read(hid, PRODUCE, rev)         # A_r stays held at least until its producer completed
+            self.holds.read(hid, (READY, hid), ready)  # I9: recorded too (the copy event above already implies it)
+        except BaseException:
+            if src is not None:                     # I16: a partly issued admission is never reusable
+                self._hb_record("admission", own, None, None, src, None, False)
+            raise
         self.stats["admissions"] += 1
         self.stats["ready_admissions"] += ready is not None
-        return Admission(own, b, n, ks, vs, cs, rev, hid)
+        adm = Admission(own, b, n, ks, vs, cs, rev, hid)
+        adm.hb_sources = src
+        return adm
 
     def admission_d2h(self, adm: Admission, l: int, j: int) -> Any:
         """Step 1 for one COMPLETE prompt block j of layer l: on "d2h", a stream wait on A_r's ready event, then the K,
         V (and bias) rows of A_r into the host rows (b, j * bs ..). Returns the D2H event (hist_ev). The caller keeps
-        the snapshot, hown and hist_ev bookkeeping (dispatcher._d2h_block)."""
+        the snapshot, hown and hist_ev bookkeeping (dispatcher._d2h_block). I16: a fault after the checks records the
+        admission's handback as failed (_hb_fail_admission); then the error propagates."""
         where = "admission D2H of owner %s layer %d block %d" % (getattr(adm, "owner", None), l, j)
         self._open_admission(adm, where)
         self._layer(l, where)
@@ -887,16 +993,20 @@ class TensorStore:
         if r1 > adm.n:
             raise KStepError("tensor store: block %d is not a complete block of the %d admitted positions (%s)"
                              % (j, adm.n, where))
-        with self.be.stream(PUBLISH):
-            self.be.stream_wait(PUBLISH, adm.ready)
-            self.be.memcpy(self.host_k[l][b, r0:r1], adm.k[l][r0:r1], PUBLISH)
-            self.be.memcpy(self.host_v[l][b, r0:r1], adm.v[l][r0:r1], PUBLISH)
-            if self.host_c is not None:
-                self.be.memcpy(self.host_c[l][b, r0:r1], adm.c[l][r0:r1], PUBLISH)
-            ev = self.be.event_rec(PUBLISH)
-        adm.dev = ev
-        adm.d2h_blocks.append((l, j))
-        self.holds.read(adm.hold, PUBLISH, ev)
+        try:
+            with self.be.stream(PUBLISH):
+                self.be.stream_wait(PUBLISH, adm.ready)
+                self.be.memcpy(self.host_k[l][b, r0:r1], adm.k[l][r0:r1], PUBLISH)
+                self.be.memcpy(self.host_v[l][b, r0:r1], adm.v[l][r0:r1], PUBLISH)
+                if self.host_c is not None:
+                    self.be.memcpy(self.host_c[l][b, r0:r1], adm.c[l][r0:r1], PUBLISH)
+                ev = self.be.event_rec(PUBLISH)
+            adm.dev = ev
+            adm.d2h_blocks.append((l, j))
+            self.holds.read(adm.hold, PUBLISH, ev)
+        except BaseException:
+            self._hb_fail_admission(adm)            # I16: a fault between the copies: never reusable
+            raise
         self.stats["admission_d2h"] += 1
         return ev
 
@@ -905,7 +1015,8 @@ class TensorStore:
         "compute": a stream wait on the previous occupancy's D2H event (the second safeguard; prev_d2h from the bind),
         then the K, V (and bias) of A_r at (pos, h) into ring row e. Returns the copy's event (the entry's ready event:
         the caller installs it with RingPool.set_ready). I11 (consumer mirrors attached): after the data copies and
-        BEFORE that event, crgen[l][e] = the entry's rgen from a staging hold (_gen_stage), on "compute"."""
+        BEFORE that event, crgen[l][e] = the entry's rgen from a staging hold (_gen_stage), on "compute". I16: a fault
+        after the checks records the admission's handback as failed (_hb_fail_admission); then the error propagates."""
         where = ("admission ring copy of owner %s layer %d head %d position %d entry %d"
                  % (getattr(adm, "owner", None), l, h, pos, e))
         self._open_admission(adm, where)
@@ -914,23 +1025,27 @@ class TensorStore:
             raise KStepError("tensor store: head %d / position %d outside H %d / the %d admitted positions (%s)"
                              % (h, pos, self.H, adm.n, where))
         self._live_entry(l, e, where)
-        with self.be.stream(PRODUCE):
-            if prev_d2h is not None:
-                self.be.stream_wait(PRODUCE, prev_d2h)
-            self.be.memcpy(self.ring_k[l][e], adm.k[l][pos, h], PRODUCE)
-            self.be.memcpy(self.ring_v[l][e], adm.v[l][pos, h], PRODUCE)
-            if self.ring_c is not None:
-                self.be.memcpy(self.ring_c[l][e:e + 1], adm.c[l][pos, h:h + 1], PRODUCE)
-            gh = None
-            if self.crgen is not None:              # I11: the entry's consumer generation, after its data, before ev
-                gh = self._gen_stage(l, "ring", [e], [self.rings[l].rgen[e]], PRODUCE)
-            ev = self.be.event_rec(PRODUCE)
-        adm.cev = ev
-        adm.ring_copies += 1
-        self.holds.read(adm.hold, PRODUCE, ev)
-        if gh is not None:
-            self.holds.read(gh, PRODUCE, ev)
-            self.holds.close(gh)
+        try:
+            with self.be.stream(PRODUCE):
+                if prev_d2h is not None:
+                    self.be.stream_wait(PRODUCE, prev_d2h)
+                self.be.memcpy(self.ring_k[l][e], adm.k[l][pos, h], PRODUCE)
+                self.be.memcpy(self.ring_v[l][e], adm.v[l][pos, h], PRODUCE)
+                if self.ring_c is not None:
+                    self.be.memcpy(self.ring_c[l][e:e + 1], adm.c[l][pos, h:h + 1], PRODUCE)
+                gh = None
+                if self.crgen is not None:          # I11: the entry's consumer generation, after its data, before ev
+                    gh = self._gen_stage(l, "ring", [e], [self.rings[l].rgen[e]], PRODUCE)
+                ev = self.be.event_rec(PRODUCE)
+            adm.cev = ev
+            adm.ring_copies += 1
+            self.holds.read(adm.hold, PRODUCE, ev)
+            if gh is not None:
+                self.holds.read(gh, PRODUCE, ev)
+                self.holds.close(gh)
+        except BaseException:
+            self._hb_fail_admission(adm)            # I16: a fault between the copies: never reusable
+            raise
         self.stats["admission_ring"] += 1
         return ev
 
@@ -947,19 +1062,32 @@ class TensorStore:
         closed with its pending per-stream events (poll releases each storage only after its own stream events
         completed; nothing is forced and no hold is dropped), adm.gate stays None with adm.gate_ok False (None is NOT
         a complete handle then), and the error propagates. stats["admissions_closed"] and stats["admission_joins"]
-        count SUCCESSFUL closes only: a failed join leaves both unchanged (TS9)."""
+        count SUCCESSFUL closes only: a failed join leaves both unchanged (TS9).
+        I16 (handback on at admit): after gate_ok is True, the admission's handback is recorded with issued True and
+        reuse_ev = adm.gate (when the gate is None, every joined event had completed; reuse_ev is then `first`, the
+        compute-side event, which had completed). A fault in the hold close or the join records it as failed (issued
+        False, reuse_ev None). An admission whose handback was already recorded as failed (a fault in admission_d2h or
+        admission_ring) gets no second handback."""
         where = "admission close of owner %s" % (getattr(adm, "owner", None),)
         self._open_admission(adm, where)
         adm.closed = True                     # milestone 2: terminal BEFORE anything that can fail
         adm.k = adm.v = adm.c = None
-        self.holds.close(adm.hold)            # lead integration: the hold is closed before the join
         first = adm.cev if adm.cev is not None else adm.ready
-        gate = join_events(self.be, self.join_stream, (first, adm.dev))
+        try:
+            self.holds.close(adm.hold)        # lead integration: the hold is closed before the join
+            gate = join_events(self.be, self.join_stream, (first, adm.dev))
+        except BaseException:
+            self._hb_fail_admission(adm)      # I16: no gate, so no permission
+            raise
         if gate is not None and gate is not first and gate is not adm.dev:
             self.stats["admission_joins"] += 1
         adm.gate = gate
         adm.gate_ok = True
         self.stats["admissions_closed"] += 1
+        if adm.hb_sources is not None and not adm.hb_ended:   # I16: every copy is enqueued and the gate is formed
+            adm.hb_ended = True
+            self._hb_record("admission", adm.owner, None, None, adm.hb_sources, gate if gate is not None else first,
+                            True)
         return adm.gate
 
     # -- ring production (11.2)
@@ -984,7 +1112,9 @@ class TensorStore:
         which the stream order puts after `ready` (held until ready). Returns that event (RingPool.set_ready);
         publish_ring_block waits it on "d2h", so the D2H of the entry is ordered after `ready` too. I11 (consumer
         mirrors attached): after the data copies and BEFORE that event, crgen[l][e] = the entry's rgen from a staging
-        hold (_gen_stage), on "compute"."""
+        hold (_gen_stage), on "compute". I16 (handback on): after the hold closed, ONE handback (kind "ring", layer l,
+        entry e, the hold's storage ids) with issued True and reuse_ev = the returned event; a fault after the hold
+        opened records it with issued False and reuse_ev None, then the error propagates."""
         own = self._owner(owner)
         where = "ring producer of owner %s layer %d entry %d" % (own, l, e)
         self._entry(l, e, where)
@@ -992,27 +1122,35 @@ class TensorStore:
         self._live_entry(l, e, where)
         self.check_ready(ready, where)              # I9: before the hold, so a refusal changes nothing
         hid = self.holds.open(own, "ring", (k, v, c))
-        with self.be.stream(PRODUCE):
-            if prev_d2h is not None:
-                self.be.stream_wait(PRODUCE, prev_d2h)
-            if ready is not None:
-                self.be.stream_wait(PRODUCE, ready)
-            self.be.memcpy(self.ring_k[l][e], k, PRODUCE)
-            self.be.memcpy(self.ring_v[l][e], v, PRODUCE)
-            if self.ring_c is not None:
-                self.be.memcpy(self.ring_c[l][e:e + 1], c.reshape(1), PRODUCE)
-            gh = None
-            if self.crgen is not None:              # I11: the entry's consumer generation, after its data, before ev
-                gh = self._gen_stage(l, "ring", [e], [self.rings[l].rgen[e]], PRODUCE)
-            ev = self.be.event_rec(PRODUCE)
-        self.holds.read(hid, PRODUCE, ev)
-        self.holds.read(hid, (READY, hid), ready)  # I9: recorded too (the copy event already implies it)
-        self.holds.close(hid)
-        if gh is not None:
-            self.holds.read(gh, PRODUCE, ev)
-            self.holds.close(gh)
+        src = self._hb_sources(hid)                 # I16: None when the handback is off
+        try:
+            with self.be.stream(PRODUCE):
+                if prev_d2h is not None:
+                    self.be.stream_wait(PRODUCE, prev_d2h)
+                if ready is not None:
+                    self.be.stream_wait(PRODUCE, ready)
+                self.be.memcpy(self.ring_k[l][e], k, PRODUCE)
+                self.be.memcpy(self.ring_v[l][e], v, PRODUCE)
+                if self.ring_c is not None:
+                    self.be.memcpy(self.ring_c[l][e:e + 1], c.reshape(1), PRODUCE)
+                gh = None
+                if self.crgen is not None:          # I11: the entry's consumer generation, after its data, before ev
+                    gh = self._gen_stage(l, "ring", [e], [self.rings[l].rgen[e]], PRODUCE)
+                ev = self.be.event_rec(PRODUCE)
+            self.holds.read(hid, PRODUCE, ev)
+            self.holds.read(hid, (READY, hid), ready)  # I9: recorded too (the copy event already implies it)
+            self.holds.close(hid)
+            if gh is not None:
+                self.holds.read(gh, PRODUCE, ev)
+                self.holds.close(gh)
+        except BaseException:
+            if src is not None:                     # I16: a partly issued ring copy is never reusable
+                self._hb_record("ring", own, l, e, src, None, False)
+            raise
         self.stats["ring_produced"] += 1
         self.stats["ready_produced"] += ready is not None
+        if src is not None:                         # I16: every copy is enqueued and the hold is closed
+            self._hb_record("ring", own, l, e, src, ev, True)
         return ev
 
     # -- historical publication (11.3, A5)
