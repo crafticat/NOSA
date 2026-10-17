@@ -156,6 +156,13 @@ RING_REQUIRED = ("attach_ring",)
 ABI4_REQUIRED = ("attach_bias",)                 # C1.1 ABI v4 (docstring)
 ABI4_ATTRS = ("chain_kernel",)
 CONSUME_REQUIRED = ("joint_post_consume", "gather_tensors", "consumed_identities", "resolve", "reference")   # C1.2
+# I16 / I17 (INTERFACE_BC7, lead, 2026-10-17), OPTIONAL: an executor that reuses its producer workspaces declares
+# accepts_handback = True in its OWN class and defines on_handback(hb). With Config.store_handback the dispatcher
+# forwards every tensor_store.Handback in op order (after each admission and after each layer call). The executor may
+# overwrite a source storage only when store.source_reusable(hb) is True for EVERY handback that names that storage,
+# and never while an operation that reads it has no handback yet (the store gives permission per operation; it does not
+# merge them). A handback covers the producer's SOURCE only: the ring / arena / gather backings stay protected by
+# their own lifetime rules. Without the declaration nothing is forwarded (the handbacks are taken and counted only).
 
 
 def check_consumed_identity(records: List[Dict[str, Any]]) -> int:

@@ -260,6 +260,7 @@ from .transfer import Transfer
 POISON = -7777777                         # no toy KV value is negative
 
 PENDING, RUNNING, DONE, ACCEPTED, CANCELLED = "pending", "running", "done", "accepted", "cancelled"
+_DISCARDED = object()                          # I17: the output slot of a row that its ticket discarded (stale)
 CAPACITY_MODES = ("m1", "rev6")
 PHYSICAL_MODES = ("per_stream", "arena")
 ARENA_BACKINGS = ("conservative", "reduced")
@@ -300,10 +301,15 @@ class Config:
                                            # "consumer" (the store's own consumer mirrors; store "tensor", arena, S0)
     result_tickets: int = 0                # HOOK-L8 (I14): 0 (the serialized consumer, as before) | > 0: the capacity
                                            # of the opt-in result tickets (consume "physical"; DispatcherTicketView)
+    deferred_calls: str = "off"            # I17 (lead): "off" (every call finishes inside _call, as before) | "one"
+                                           # (at most ONE pending physical layer call; result_tickets >= 1)
+    store_handback: bool = False           # I17 / I16: forward the store's producer-workspace handbacks to an
+                                           # executor that declares accepts_handback (store "tensor")
 
 
 class Draft:
-    __slots__ = ("s", "pos", "tok_in", "epoch", "n_at", "m", "sel", "avail", "hidden", "d", "q", "state", "step", "cks")
+    __slots__ = ("s", "pos", "tok_in", "epoch", "n_at", "m", "sel", "avail", "hidden", "d", "q", "state", "step", "cks",
+                 "next_layer")
 
     def __init__(self, s, pos, tok_in, epoch, n_at, m, step):
         self.s, self.pos, self.tok_in, self.epoch, self.n_at, self.m, self.step = s, pos, tok_in, epoch, n_at, m, step
@@ -312,6 +318,7 @@ class Draft:
         self.hidden = None
         self.d, self.q = None, None
         self.state = RUNNING
+        self.next_layer = 0                    # I17 (lead): the layer whose output the draft row publishes next
 
 
 class Cohort:
@@ -390,8 +397,8 @@ class DispatcherTicketView:
                         counted in c1stat["consume_identity_checks"] as the serialized path counts it;
       resolve / reference  the executor's (gathered bytes only / the same-order Row.kv reference);
       live(key)         READ-ONLY: the row still exists with the same incarnation and epoch; a verifier row also with
-                        the same cohort and layer progress; a draft row with the same draft (m) and position (a
-                        Draft has no per-layer marker: a deferred, asynchronous use needs one first);
+                        the same cohort and layer progress; a draft row with the same draft (m), position and layer
+                        progress (Draft.next_layer, I17);
       apply(key, i, out)  row i's consumed output into out[(call, i)], once (a second apply is KStepError); _call
                         publishes from there;
       release(holds, handle)  the call's c1_gather holds (the consume ledger), then handle.clear().
@@ -418,8 +425,8 @@ class DispatcherTicketView:
         """READ-ONLY. The request key.uid is active (not done) with incarnation key.inc; a verifier row: its cohort
         key.cohort is RUNNING with epoch key.epoch and next_layer key.layer (not yet published at that layer); a draft
         row: the request is at epoch key.epoch and its current draft is RUNNING, the same draft (key.cohort ==
-        (uid, epoch, m)) at position key.pos. A Draft keeps no per-layer progress, so a draft row's layer is not
-        checked: exact for the synchronous step (every ticket finishes inside its own call), NOT for a deferred use."""
+        (uid, epoch, m)) at position key.pos, with next_layer key.layer (I17: Draft.next_layer, the per-layer marker
+        that _call_publish advances, so a deferred call's draft row is live only at its own layer)."""
         r = self.d.reqs.get(key.uid)
         if r is None or r.done or r.inc != key.inc:
             return False
@@ -428,7 +435,7 @@ class DispatcherTicketView:
                        for c in r.cohorts)
         dr = r.cur
         return (r.epoch == key.epoch and dr is not None and dr.state == RUNNING and dr.pos == key.pos
-                and key.cohort == (r.uid, r.epoch, dr.m))
+                and key.cohort == (r.uid, r.epoch, dr.m) and dr.next_layer == key.layer)
 
     def apply(self, key, i: int, out) -> None:
         k = (key.call, i)
@@ -582,6 +589,14 @@ class Dispatcher:
         if rtc and not self.consume:
             raise ConfigError("HOOK-L8: result_tickets %d needs consume 'physical' (got %r)" % (rtc, cfg.consume))
         self.tickets = ResultTickets(rtc, DispatcherTicketView(self)) if rtc else None
+        if cfg.deferred_calls not in ("off", "one"):             # I17 (lead): the one-outstanding-call boundary
+            raise ConfigError("I17: deferred_calls must be 'off' or 'one' (got %r)" % (cfg.deferred_calls,))
+        self.deferred = cfg.deferred_calls == "one"
+        if self.deferred and self.tickets is None:
+            raise ConfigError("I17: deferred_calls 'one' needs consume 'physical' and result_tickets >= 1")
+        self.pending_call: Optional[Dict[str, Any]] = None       # I17: the ONE submitted, unfinished layer call
+        self.pending_step: Optional[Dict[str, Any]] = None       # I17: the step that waits on it (resumed by step())
+        self.dstat = defaultdict(int)                            # I17: deferred counters (report()["deferred"])
         self.consume_first: Dict[str, Tuple] = {}  # C1.2 instrumentation: per provenance kind its first consumed item
         self.rstat = defaultdict(int)              # M2 B2: ring / D2H-check counters (report()["ring"]; never self.stats)
         self.adm: List[Dict] = []                  # M2 B2 ring: the admission buffers A_r that are not FREE
@@ -624,6 +639,13 @@ class Dispatcher:
                                   % (cfg.store, cfg.physical, type(self.tp).__name__))
             self.store.attach_gen_mirrors(self, self.tp)               # HOOK-L6: re-attaches the executor with them and
             self.acct.enable_gen_mirror()                              # installs tp.gen_publisher; K6 gen_mirror
+        self.handback_to = None                                        # I17 / I16: the executor that takes handbacks
+        if cfg.store_handback:
+            if self.store is None:
+                raise ConfigError("I17: store_handback needs store 'tensor' (got %r)" % (cfg.store,))
+            self.store.enable_handback()                               # I16 (track B): one Handback per producer op
+            if getattr(type(executor), "accepts_handback", False):     # declared in the executor's own class
+                self.handback_to = executor
         self.session = "open"                                          # HOOK-L7 (I12): "open" | "resetting" | "failed"
         self.session_reason: Optional[str] = None                      # HOOK-L7: the failed phase and its error
         self.queue: List[Tuple] = []
@@ -764,17 +786,62 @@ class Dispatcher:
 
     # ================================================================== the step
     def run(self, max_steps: int = 200000) -> Dict[Any, List[int]]:
-        while self.queue or self.active():
+        """The synchronous driver. I17: step() itself never waits on a pending call; when it returns with one pending,
+        run() (the DRIVER, not the call path) advances the backend by ONE host wait on that call's event (counted in
+        dstat["driver_waits"]) and steps again."""
+        while self.queue or self.active() or self.pending_step is not None:
             self.step()
+            if self.pending_call is not None:
+                self.dstat["driver_waits"] += 1
+                self.be.host_wait(self.pending_call["cev"])
             if self.t > max_steps:
                 raise KStepError("run: more than %d steps" % max_steps)
         self.finish()
         return self.results
 
+    def pending_event(self) -> Any:
+        """I17, READ-ONLY: the completion event of the ONE pending layer call, or None (for a test or driver that
+        advances the deferred backend itself)."""
+        return None if self.pending_call is None else self.pending_call["cev"]
+
+    def _forward_handbacks(self) -> None:
+        """I17 / I16 (lead): every handback the store recorded since the last take goes, in op order, to the executor
+        that declares accepts_handback in its own class (on_handback(hb)); without one they are taken and counted."""
+        if not self.cfg.store_handback:
+            return
+        for hb in self.store.take_handbacks():
+            self.dstat["handbacks"] += 1
+            if self.handback_to is not None:
+                self.handback_to.on_handback(hb)
+                self.dstat["handbacks_forwarded"] += 1
+
+    def _resume_step(self) -> None:
+        """I17: the step that a pending call stopped. ONE passive ticket poll (no wait): if the call's ticket is still
+        outstanding, return with nothing changed (dstat["pending_returns"]); else publish the call ONCE (live rows only;
+        a discarded row publishes nothing and advances nothing) and run the step's remaining layers, which may stop
+        again at the next pending call; a pending layer is never resubmitted."""
+        ps, pc = self.pending_step, self.pending_call
+        self.tickets.poll()
+        if self.tickets.is_outstanding(pc["tid"]):                     # still outstanding (pending or broken)
+            self.dstat["pending_returns"] += 1
+            return
+        self.pending_call = None
+        self._call_publish(pc["l"], pc["ctx"], self._ticket_outs(pc["l"], pc["ctx"], deferred=True))
+        for l in range(pc["l"] + 1, self.L):
+            if ps["vonly"]:
+                self._force_for_layer(l)
+            if not self._call(l, ps["rows"]):
+                return                                                 # pending again: ps stays, pending_call is set
+        self.pending_step = None
+        self._step_tail(ps["t"], ps["rows"], ps["vonly"], ps["before"])
+
     def step(self) -> None:
         self._session_guard("step")                                    # HOOK-L7 (I12): no resume unless "open"
+        if self.pending_step is not None:                              # I17: finish the stopped step first
+            return self._resume_step()
         t = self.t
         self._admit()
+        self._forward_handbacks()                                      # I17 / I16: the admissions' handbacks
         if self.rev6:
             self._rev6_reserve()
         for r in self.active():
@@ -831,7 +898,13 @@ class Dispatcher:
         for l in range(self.L):
             if vonly:
                 self._force_for_layer(l)
-            self._call(l, rows)
+            if not self._call(l, rows):                                # I17: the call is pending (deferred "one")
+                self.pending_step = dict(t=t, rows=rows, vonly=vonly, before=before)
+                return
+        self._step_tail(t, rows, vonly, before)
+
+    def _step_tail(self, t: int, rows: List[Tuple[Request, Draft]], vonly: bool, before: int) -> None:
+        """The end of one step (unchanged order): _end_of_step, the D4 no-progress count, t + 1."""
         self._end_of_step(rows)
         if vonly and self.stats["progress"] == before:
             self._noprog += 1
@@ -1430,33 +1503,42 @@ class Dispatcher:
         handle.clear()                                                 # the handle's backing references are dropped
         return list(outs)
 
-    def _consume_ticket(self, l: int, jrows: List[Row], owners, handle, cev) -> List[Any]:
-        """HOOK-L8 (INTERFACE_BC6 I14, lead): C1.2 steps 3-6 of _consume through the opt-in result tickets, with the
-        same result and counters: enqueue the call (one RowKey per row: uid, incarnation, the row's cohort epoch, its
-        cohort, position, kind, layer, call; the call's c1_gather hold keys; the handle; cev); ONE passive poll while
-        the call's event is still pending (on the deferred backend nothing happens: a pending visit); the KEPT host
-        wait on cev; one poll (identity first, resolution, the exact comparison, apply once per live row, release);
-        the outputs in call order; then the counts. Every row of a serialized call is live, so a row without an applied
-        output is KStepError. The step stays synchronous: no ticket outlives its call."""
-        if not jrows:
-            return []
+    def _ticket_commit(self, rid: int, l: int, jrows: List[Row], owners, handle, cev) -> int:
+        """HOOK-L8 / I15 (lead): the reservation rid becomes the call's ticket: one RowKey per row (uid, incarnation,
+        the row's cohort epoch, its cohort, position, kind, layer, call), the call's c1_gather hold keys, the handle,
+        cev. Returns the ticket id. A commit refusal (malformed input) leaves the reservation open (a reset refuses)."""
         cid = self.call_id
         if cev is None:
             raise KStepError("C1.2: call %d consumes %d rows without a completion event" % (cid, len(jrows)))
         keys = [RowKey(row.uid, r.inc, row.cohort[1], row.cohort, row.pos, row.kind, l, cid)
                 for (_, r, _, _), row in zip(owners, jrows)]
         holds = [rec["key"] for rec in self.consume_ledger.recs.values() if rec["key"][0] == cid]
+        return self.tickets.commit(rid, keys, handle, cev, holds)
+
+    def _consume_ticket(self, l: int, ctx: Dict[str, Any], cev) -> List[Any]:
+        """HOOK-L8 (INTERFACE_BC6 I14, lead): C1.2 steps 3-6 of _consume through the committed ticket, serialized, with
+        the same result and counters: ONE passive poll while the call's event is still pending (on the deferred backend
+        nothing happens: a pending visit); the KEPT host wait on cev; one poll (identity first, resolution, the exact
+        comparison, apply once per live row, release); the outputs in call order and the counts (_ticket_outs). Every
+        row of a serialized call is live, so a row without an applied output is KStepError."""
         T = self.tickets
-        T.enqueue(cid, l, keys, handle, cev, holds)
         T.poll()                                                       # passive: the call's event is still pending
         self.be.host_wait(cev)                                         # the KEPT serialized wait (C1.2 step 3)
         T.poll()
-        out = T.view.out
+        return self._ticket_outs(l, ctx, deferred=False)
+
+    def _ticket_outs(self, l: int, ctx: Dict[str, Any], deferred: bool) -> List[Any]:
+        """The applied outputs of a finished call in call order, then the C1.2 counts (every consumed row, as the
+        serialized consumer counts them). Serialized: every row must have been applied (else KStepError). I17
+        (deferred): a row that its ticket did not apply (stale at application: a changed identity) is _DISCARDED."""
+        cid, jrows = ctx["cid"], ctx["jrows"]
+        out = self.tickets.view.out
         missing = [i for i in range(len(jrows)) if (cid, i) not in out]
-        if missing:
+        if missing and not deferred:
             raise KStepError("HOOK-L8 (I14): call %d rows %s were not applied by their ticket (%s)"
-                             % (cid, missing, T.pending()))
-        outs = [out.pop((cid, i)) for i in range(len(jrows))]
+                             % (cid, missing, self.tickets.pending()))
+        outs = [out.pop((cid, i)) if (cid, i) in out else _DISCARDED for i in range(len(jrows))]
+        self.dstat["rows_discarded"] += len(missing)
         self._consume_count(l, jrows)
         return outs
 
@@ -2156,7 +2238,10 @@ class Dispatcher:
             out.append((ready, infl, miss))
         return out
 
-    def _call(self, l: int, rows: List[Tuple[Request, Draft]]) -> None:
+    def _call(self, l: int, rows: List[Tuple[Request, Draft]]) -> bool:
+        """One joint layer call. Returns True when the call finished (published, _call_publish); I17 (deferred "one"):
+        False when the consume call is PENDING (submitted, its ticket committed, no host wait): self.pending_call names
+        it and step() publishes it later, once."""
         self.call_id += 1
         cid = self.call_id
         self._read_keys = set()
@@ -2364,15 +2449,31 @@ class Dispatcher:
             self._install_reader(l, read_slots, rev, "compute")      # HOOK-C (lead): rev was recorded on "compute"
             self._arm_validators(rev)
         self._draft_recency(l, rows, draft_pre, cid)
+        ctx = dict(cid=cid, rows=rows, owners=owners, jrows=jrows, exec_cohorts=exec_cohorts, requests=requests)
         if self.consume:                                               # C1.2 (12.9.2): the serialized consumer
+            rid = None
+            if self.tickets is not None and jrows:                     # I15 / I17: the ticket capacity is reserved
+                rid = self.tickets.reserve(cid, l)                     # BEFORE any gather allocation or hold (a
+                                                                       # refusal allocates and holds nothing)
+            # A failure from here to the commit KEEPS the open reservation: _consume_post may already have issued reads
+            # (abort is only for an allocation that failed before any read, I15), so the reservation and the call's
+            # keyed holds block a reset until the root decides (fail closed; no forced cleanup).
             handle, cev = self._consume_post(l, jrows)                 # 1. gather backings held at once
             self._check_post_reads(jrows, read_slots, cev)             # 2. the same registration checks, then the
             self._install_reader(l, read_slots, cev)                   #    reader gates and the validators, BEFORE
             self._arm_validators(cev)                                  #    any wait (no poll or release in between)
             if self.tickets is None:
                 outs = self._consume(l, jrows, handle, cev)            # 3-6. wait, identity, resolve, compare, release
-            else:                                                      # HOOK-L8 (I14): the same steps through one
-                outs = self._consume_ticket(l, jrows, owners, handle, cev)   # result ticket (the wait is kept)
+            elif not jrows:
+                outs = []
+            else:                                                      # HOOK-L8 (I14): one result ticket
+                tid = self._ticket_commit(rid, l, jrows, owners, handle, cev)
+                if self.deferred:                                      # I17: return PENDING, no host wait
+                    self.pending_call = dict(l=l, cid=cid, tid=tid, cev=cev, ctx=ctx)
+                    self.dstat["submitted"] += 1
+                    self._forward_handbacks()
+                    return False
+                outs = self._consume_ticket(l, ctx, cev)               # the serialized wait is kept
         elif self.arena_mode:                                          # M2 B1 (contract 3.1): the executor's own event
             outs, read_ev = self.ex.joint_post(l, jrows) if jrows else ([], None)
             self._check_post_reads(jrows, read_slots, read_ev)
@@ -2380,7 +2481,20 @@ class Dispatcher:
             self._arm_validators(read_ev)
         else:
             outs = self.ex.joint_post(l, jrows) if jrows else []
+        return self._call_publish(l, ctx, outs)
+
+    def _call_publish(self, l: int, ctx: Dict[str, Any], outs: List[Any]) -> bool:
+        """The publication of one layer call (the former second half of _call, in its order): the rows' outputs, the
+        executing cohorts' per-layer state and next_layer, the release queue, the D1 accounting, the call's transfer
+        issue, the samples, the invariant checks, the observer. I17: a row whose output is _DISCARDED (its ticket found
+        it stale: a changed identity) publishes nothing, and its cohort is not advanced (no replacement is advanced
+        by a late output). Returns True (the call is finished)."""
+        cid, rows, owners, jrows = ctx["cid"], ctx["rows"], ctx["owners"], ctx["jrows"]
+        exec_cohorts, requests = ctx["exec_cohorts"], ctx["requests"]
+        dropped = {id(obj) for (kind, r, obj, i), out in zip(owners, outs) if out is _DISCARDED}
         for (kind, r, obj, i), row, out in zip(owners, jrows, outs):
+            if out is _DISCARDED:
+                continue
             if kind == "v":
                 c = obj
                 c.hidden[i] = out
@@ -2388,7 +2502,11 @@ class Dispatcher:
                 self.stats["verifier_row_layers"] += 1
             else:
                 obj.hidden = out
+                obj.next_layer = l + 1                                 # I17: the draft row's layer progress
         for r, c in exec_cohorts:
+            if id(c) in dropped:                                       # I17: its rows were discarded: no advance
+                self.dstat["cohort_layers_discarded"] += 1
+                continue
             pre = c.ws[l]["pre"]
             c.prov[l] = [{pos: (pre[i][1][h], pre[i][2][h]) + ((pre[i][3][h],) if self.abi4 else ())   # C1.1: with c
                           for i, pos in enumerate(c.positions)} for h in range(self.H)]
@@ -2462,6 +2580,8 @@ class Dispatcher:
                 self._ring_scan()                                      # M2 B2: records, maps 1:1, rgen_t, LIVE bounds
         if self.observer is not None:
             self.observer(self, "call", cid, l)
+        self._forward_handbacks()                                      # I17 / I16: the call's ring productions
+        return True
 
     def _prov(self, r: Request, c: Cohort, l: int, h: int, qp: int):
         for cc in r.cohorts:
@@ -3274,7 +3394,10 @@ class Dispatcher:
         )
         if self.tickets is not None:                                   # HOOK-L8 (I14): outstanding result tickets
             out["tickets"] = self.tickets.outstanding()                # (pending or broken) block the reset; the key
-        return out                                                     # exists only with tickets on
+        if self.deferred:                                              # exists only with tickets on. I17: a
+            out["pending_calls"] = int(self.pending_call is not None)  # submitted, unpublished call or a stopped
+            out["pending_steps"] = int(self.pending_step is not None)  # step blocks it too (only in deferred mode)
+        return out
 
     def event_holders(self) -> List[Tuple[str, Tuple, Any]]:
         """HOOK-L3, READ-ONLY: one (owner_class, location, event) per event reference that the dispatcher, its pools,
@@ -3449,6 +3572,8 @@ class Dispatcher:
             out["ring"] = self.ring_report()                           # M2 B2: ring / D2H-check counters only
         if self.tickets is not None:
             out["tickets"] = dict(self.tickets.stats)                  # HOOK-L8 (I14): a copy, only with tickets on
+        if self.deferred or self.cfg.store_handback:
+            out["deferred"] = dict(self.dstat)                         # I17: only in deferred / handback mode
         return out
 
     def capacity_report(self) -> Dict[str, Any]:
