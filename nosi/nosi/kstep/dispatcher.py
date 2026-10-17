@@ -402,7 +402,11 @@ class DispatcherTicketView:
       apply(key, i, out)  row i's consumed output into out[(call, i)], once (a second apply is KStepError); _call
                         publishes from there;
       release(holds, handle)  the call's c1_gather holds (the consume ledger), then handle.clear().
-    Nothing here touches self.d.stats. No method keeps a reference to a row, a request, a cohort or a workspace."""
+    Nothing here touches self.d.stats. No method keeps a reference to a row, a request, a cohort or a workspace.
+    Milestone 7 (I15 / I17): every call reserves its ticket capacity at its start (Dispatcher._call). With tickets on,
+    deferred or not, a failure after that reservation and before the commit leaves the reservation OPEN, so a
+    QuiescentReset refuses (state:tickets, tickets:reservations) until the root decides; in milestone 6 such a failure
+    left no ticket state. This is fail closed, not a cleanup."""
 
     def __init__(self, d: "Dispatcher"):
         self.d = d
@@ -644,7 +648,10 @@ class Dispatcher:
             if self.store is None:
                 raise ConfigError("I17: store_handback needs store 'tensor' (got %r)" % (cfg.store,))
             self.store.enable_handback()                               # I16 (track B): one Handback per producer op
-            if getattr(type(executor), "accepts_handback", False):     # declared in the executor's own class
+            if vars(type(executor)).get("accepts_handback", False):    # declared in the executor's OWN class body
+                if not callable(getattr(type(executor), "on_handback", None)):
+                    raise ConfigError("I17: %s declares accepts_handback but has no callable on_handback"
+                                      % type(executor).__name__)
                 self.handback_to = executor
         self.session = "open"                                          # HOOK-L7 (I12): "open" | "resetting" | "failed"
         self.session_reason: Optional[str] = None                      # HOOK-L7: the failed phase and its error
@@ -789,11 +796,17 @@ class Dispatcher:
         """The synchronous driver. I17: step() itself never waits on a pending call; when it returns with one pending,
         run() (the DRIVER, not the call path) advances the backend by ONE host wait on that call's event (counted in
         dstat["driver_waits"]) and steps again."""
+        prev = None
         while self.queue or self.active() or self.pending_step is not None:
             self.step()
-            if self.pending_call is not None:
+            pc = self.pending_call
+            if pc is not None:
+                if pc is prev:                                         # waited, polled, and still not finished: a
+                    raise KStepError("I17: run(): the pending call %d stays unfinished after the driver's wait on its "
+                                     "completed event (a broken or blocked ticket): no retry" % pc["cid"])
                 self.dstat["driver_waits"] += 1
-                self.be.host_wait(self.pending_call["cev"])
+                self.be.host_wait(pc["cev"])
+            prev = pc
             if self.t > max_steps:
                 raise KStepError("run: more than %d steps" % max_steps)
         self.finish()
@@ -817,19 +830,24 @@ class Dispatcher:
 
     def _resume_step(self) -> None:
         """I17: the step that a pending call stopped. ONE passive ticket poll (no wait): if the call's ticket is still
-        outstanding and its event is pending, return with nothing changed (dstat["pending_returns"]); outstanding with
-        the event complete (a BROKEN ticket) is KStepError, never a silent spin; else publish the call ONCE (live rows
-        only; a discarded row publishes nothing and advances nothing) and run the step's remaining layers, which may
-        stop again at the next pending call; a pending layer is never resubmitted."""
+        outstanding, return with nothing changed (dstat["pending_returns"]); a BROKEN ticket (its own state) is
+        KStepError, and run() refuses a call that stays unfinished after its event completed, so neither spins; no
+        pending call at all (a failure after an earlier publication) is KStepError; else publish the call ONCE (the
+        live rows only; a discarded row publishes nothing and advances nothing) and run the step's remaining layers,
+        which may stop again at the next pending call; a pending layer is never resubmitted."""
         ps, pc = self.pending_step, self.pending_call
+        if pc is None:                                                 # review fix: a failure AFTER the publication
+            raise KStepError("I17: the stopped step of t %d has no pending call (its call was published, then a later "
+                             "part of the step failed): no retry; the reset stays refused (pending_steps)" % ps["t"])
         self.tickets.poll()                                            # a finishing fault propagates from here
-        if self.tickets.is_outstanding(pc["tid"]):                     # still outstanding (pending or broken)
-            if ev_done(pc["cev"]):                                     # complete, yet not finished: BROKEN (a
-                first = self.tickets.pending().get("first") or {}       # finishing fault earlier) or blocked: fail
-                raise KStepError("I17: the pending call %d (layer %d) is complete but its ticket %d was not finished "
-                                 "(state %r): no retry, no forced cleanup (the reset and the request end stay refused)"
-                                 % (pc["cid"], pc["l"], pc["tid"],
-                                    first.get("state") if first.get("id") == pc["tid"] else None))
+        # Still outstanding: pending, or BROKEN by a finishing fault. The ticket's OWN state decides: an event that
+        # completes on its own after the poll (an asynchronous backend) is no fault, the next poll finishes it.
+        if self.tickets.is_outstanding(pc["tid"]):
+            first = self.tickets.pending().get("first") or {}
+            if first.get("id") == pc["tid"] and first.get("state") == "broken":
+                raise KStepError("I17: the pending call %d (layer %d) has a BROKEN ticket %d (a finishing fault): no "
+                                 "retry, no forced cleanup (the reset and the request end stay refused)"
+                                 % (pc["cid"], pc["l"], pc["tid"]))
             self.dstat["pending_returns"] += 1
             return
         self.pending_call = None
@@ -2248,7 +2266,16 @@ class Dispatcher:
     def _call(self, l: int, rows: List[Tuple[Request, Draft]]) -> bool:
         """One joint layer call. Returns True when the call finished (published, _call_publish); I17 (deferred "one"):
         False when the consume call is PENDING (submitted, its ticket committed, no host wait): self.pending_call names
-        it and step() publishes it later, once."""
+        it and step() publishes it later, once.
+        I15 / I17 (review fix): with tickets on, the ticket capacity is reserved FIRST, before ANY state of this call
+        changes (call id, poll, progress hook, productions, protections, chains, recency, gathers): a CapacityRefusal
+        leaves the dispatcher, the pools, the rings, the store and the ledgers exactly as they were (only the tickets'
+        stats["refused"] counts it). A call that ends with no consume row aborts its reservation (no read was issued);
+        a failure after the reservation keeps it open (fail closed: the reset refuses; abort only before any issued
+        read, I15)."""
+        rid = None
+        if self.tickets is not None:
+            rid = self.tickets.reserve(self.call_id + 1, l)            # BEFORE any change of this call
         self.call_id += 1
         cid = self.call_id
         self._read_keys = set()
@@ -2458,13 +2485,12 @@ class Dispatcher:
         self._draft_recency(l, rows, draft_pre, cid)
         ctx = dict(cid=cid, rows=rows, owners=owners, jrows=jrows, exec_cohorts=exec_cohorts, requests=requests)
         if self.consume:                                               # C1.2 (12.9.2): the serialized consumer
-            rid = None
-            if self.tickets is not None and jrows:                     # I15 / I17: the ticket capacity is reserved
-                rid = self.tickets.reserve(cid, l)                     # BEFORE any gather allocation or hold (a
-                                                                       # refusal allocates and holds nothing)
-            # A failure from here to the commit KEEPS the open reservation: _consume_post may already have issued reads
-            # (abort is only for an allocation that failed before any read, I15), so the reservation and the call's
-            # keyed holds block a reset until the root decides (fail closed; no forced cleanup).
+            if rid is not None and not jrows:                          # I15: no consume row, no read issued: the
+                self.tickets.abort(rid)                                # reservation (taken at the call's start) is
+                rid = None                                             # dropped
+            # A failure from the reservation to the commit KEEPS the open reservation: _consume_post may already have
+            # issued reads (abort is only for an allocation that failed before any read, I15), so the reservation and
+            # the call's keyed holds block a reset until the root decides (fail closed; no forced cleanup).
             handle, cev = self._consume_post(l, jrows)                 # 1. gather backings held at once
             self._check_post_reads(jrows, read_slots, cev)             # 2. the same registration checks, then the
             self._install_reader(l, read_slots, cev)                   #    reader gates and the validators, BEFORE
