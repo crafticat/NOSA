@@ -540,15 +540,15 @@ class TensorStore:
             self.ring_k = self.ring_v = self.ring_c = None
         self.dev = self.arena_k[0].device
         self.hdev = self.host_k[0].device
-        self._store_ids = {storage_id(t) for t in self._stores()}
+        self.cpgen: Optional[List[torch.Tensor]] = None   # I11: the consumer arena generation mirrors (opt-in)
+        self.crgen: Optional[List[torch.Tensor]] = None   # I11: the consumer ring generation mirrors (with rings)
+        self._store_ids = {storage_id(t) for t in self._stores()}   # I13.0: after cpgen / crgen exist (None here)
         self.stats = dict(admissions=0, admission_d2h=0, admission_ring=0, admissions_closed=0, admission_joins=0,
                           ring_produced=0, ring_published=0, published=0, ready_admissions=0, ready_produced=0,
                           ready_published=0, gen_init_writes=0, gen_publishes=0, gen_arena_writes=0,
                           gen_ring_writes=0)
         self.admissions: List[Dict[str, Any]] = []   # dispatcher adapter (B2): each admission, its A_r storages
         self.producer_ready = False                   # I9: set by attach_dispatcher from the executor's class
-        self.cpgen: Optional[List[torch.Tensor]] = None   # I11: the consumer arena generation mirrors (opt-in)
-        self.crgen: Optional[List[torch.Tensor]] = None   # I11: the consumer ring generation mirrors (with rings)
 
     # -- helpers
     @staticmethod
