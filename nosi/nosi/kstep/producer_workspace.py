@@ -26,8 +26,14 @@ handed out) or REUSABLE. REUSABLE means:
       workspace tolerates that timing without a hook.
 ONE store operation per hand-out (the contract of the caller; fix round MINOR-3). A SECOND delivered handback in the
 same generation makes the storage DEAD (stats["second_op"]; fail closed). The rule cannot see an operation that has
-not started: a caller that gives one generation to a later operation breaks the contract, and the workspace detects
-it at that operation's delivery.
+not started: a caller that gives one generation to a later operation breaks the contract. The workspace detects it at
+that operation's delivery ONLY when no acquire handed the storage out again before that operation started. The
+detection can be ONE operation late: when an acquire happens in the window (the first operation delivered and
+complete, the late operation not started yet), the storage starts a new generation; the old generation's late
+operation is then the FIRST delivery of the new generation, and only the NEXT operation's delivery makes the storage
+DEAD. By then an overwrite may already have happened (the store's byte detectors, check_ring_entry and
+check_host_block, would catch it). WorkspaceConsumer cannot reach this path: each of its producer calls gives its
+storage to exactly one store operation.
 A storage that was handed out but that no store operation read is NOT reusable (fail closed; "unread"). A delivered
 handback with issued False (a failed or partially issued operation) makes its storage DEAD: never handed out again (a
 leak by design, never an early overwrite; stats["failed"]). The workspace keeps no second hold ledger, no scheduler and
