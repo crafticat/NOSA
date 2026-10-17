@@ -154,7 +154,9 @@ model only.
        read-only check itself raises (for example a HOOK-L4 refusal inside event_holders()). The check never polls: a
        store record that completed but was not polled yet is refused, and so are registered validators, D2H checks
        and admission buffers (the lead's quiesce_state counts them; their completion runs byte checks that may raise).
-       The caller drains them first: session_end() (Dispatcher.finish, then one host poll).
+       The caller drains them first: session_end() (Dispatcher.finish, then one host poll). An outstanding deferred-
+       result ticket (I14, result_tickets.py; Config.result_tickets > 0) is refused through the lead's quiesce_state
+       key "tickets" (state:tickets=<n>); its gather backings are also counted (state:consume_ledger_keyed=<n>).
    (2) begin_reset(): the session becomes "resetting".
    (3) The MUTATING phases, in this order, each by its name:
        "detach"        detach_completed_events() (HOOK-L4: a declared executor's detach_completed() first; the hook
