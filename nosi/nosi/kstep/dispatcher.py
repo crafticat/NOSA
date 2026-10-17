@@ -389,7 +389,9 @@ class DispatcherTicketView:
       check(handle)     the C1.2 identity check of every gathered block / entry (check_consumed_identity, StaleReader),
                         counted in c1stat["consume_identity_checks"] as the serialized path counts it;
       resolve / reference  the executor's (gathered bytes only / the same-order Row.kv reference);
-      live(key)         READ-ONLY: the row still exists with the same incarnation, epoch, cohort and layer progress;
+      live(key)         READ-ONLY: the row still exists with the same incarnation and epoch; a verifier row also with
+                        the same cohort and layer progress; a draft row with the same draft (m) and position (a
+                        Draft has no per-layer marker: a deferred, asynchronous use needs one first);
       apply(key, i, out)  row i's consumed output into out[(call, i)], once (a second apply is KStepError); _call
                         publishes from there;
       release(holds, handle)  the call's c1_gather holds (the consume ledger), then handle.clear().
@@ -415,7 +417,9 @@ class DispatcherTicketView:
     def live(self, key) -> bool:
         """READ-ONLY. The request key.uid is active (not done) with incarnation key.inc; a verifier row: its cohort
         key.cohort is RUNNING with epoch key.epoch and next_layer key.layer (not yet published at that layer); a draft
-        row: the request is at epoch key.epoch and its current draft is RUNNING at position key.pos."""
+        row: the request is at epoch key.epoch and its current draft is RUNNING, the same draft (key.cohort ==
+        (uid, epoch, m)) at position key.pos. A Draft keeps no per-layer progress, so a draft row's layer is not
+        checked: exact for the synchronous step (every ticket finishes inside its own call), NOT for a deferred use."""
         r = self.d.reqs.get(key.uid)
         if r is None or r.done or r.inc != key.inc:
             return False
@@ -423,7 +427,8 @@ class DispatcherTicketView:
             return any(c.key == key.cohort and c.epoch == key.epoch and c.state == RUNNING and c.next_layer == key.layer
                        for c in r.cohorts)
         dr = r.cur
-        return r.epoch == key.epoch and dr is not None and dr.state == RUNNING and dr.pos == key.pos
+        return (r.epoch == key.epoch and dr is not None and dr.state == RUNNING and dr.pos == key.pos
+                and key.cohort == (r.uid, r.epoch, dr.m))
 
     def apply(self, key, i: int, out) -> None:
         k = (key.call, i)
@@ -3443,7 +3448,7 @@ class Dispatcher:
         if self.recent != "eager":
             out["ring"] = self.ring_report()                           # M2 B2: ring / D2H-check counters only
         if self.tickets is not None:
-            out["tickets"] = self.tickets.stats                        # HOOK-L8 (I14): only with tickets on
+            out["tickets"] = dict(self.tickets.stats)                  # HOOK-L8 (I14): a copy, only with tickets on
         return out
 
     def capacity_report(self) -> Dict[str, Any]:
