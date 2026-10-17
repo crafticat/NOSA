@@ -3103,9 +3103,10 @@ class Dispatcher:
     # own state.
     # HOOK-L7 (INTERFACE_BC5 I12, lead, 2026-10-17): the session state. "open" (initial): submit, step and finish run.
     # begin_reset() -> "resetting"; end_reset() -> "open"; fail_reset(phase, text) -> "failed", LATCHED (no method
-    # returns a failed session to "open"). Outside "open", submit / step / finish refuse before any change, so a failed
-    # reset cannot be resumed silently, admit a request or use the backend again through them. Only the coordinator
-    # calls these hooks; a run without a coordinator stays "open" and is unchanged.
+    # returns a failed session to "open"). Outside "open", submit / step / finish / host_poll refuse before any change,
+    # and a "failed" session also refuses detach_completed_events, so a failed reset cannot be resumed silently, admit a
+    # request or use the backend again through them. Only the coordinator calls these hooks; a run without a
+    # coordinator stays "open" and is unchanged.
     def _session_guard(self, op: str) -> None:
         """HOOK-L7 (I12), READ-ONLY: OwnershipViolation "session <state>: <op> refused (<reason>)" unless "open"."""
         if self.session != "open":
@@ -3255,7 +3256,10 @@ class Dispatcher:
         remaining reference to a complete event is set to None (a FREE slot's or position's history readers, a FREE ring
         entry's gates, the requests' history events and map events, the S0 Pipe's slot events). Returns the number of
         references set to None. A later reader of any of these sees None (complete; no wait), never a pooled object that
-        a backend reset re-records."""
+        a backend reset re-records. HOOK-L7 (I12): a FAILED session refuses at once (no detach, no poll after a failed
+        reset); "open" (a direct caller) and "resetting" (the coordinator) proceed as before."""
+        if self.session == "failed":
+            raise OwnershipViolation("session failed: detach_completed_events refused (%s)" % (self.session_reason,))
         bad = {k: v for k, v in self.quiesce_state().items() if v}
         live = [(c, loc) for c, loc, ev in self.event_holders() if not ev_done(ev)]
         if bad or live:
