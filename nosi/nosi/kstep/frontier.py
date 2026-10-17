@@ -116,11 +116,22 @@ model only.
    run yet (the CpuBackend runs "join" only when forced). A reset path must also check those holders (the pools' and
    the dispatcher's own references).
 
-8. QUIESCENT RESET (milestone 3, addendum I8; milestone 4, addendum I10). QuiescentReset(disp, backend_reset) is that
-   reset path. It uses only the lead's Dispatcher hooks (HOOK-L3: quiesce_state, event_holders,
-   detach_completed_events; HOOK-L4 puts the executor's reset contract into the last two), the executor module's
-   reset_contract_of, this module's reset_pending / before_reset, and track B's store API (drained_all,
-   clear_caches). reset():
+8. QUIESCENT RESET (milestone 3, addendum I8; milestone 4, addendum I10; milestone 5, addendum I12).
+   QuiescentReset(disp, backend_reset) is that reset path. It uses only the lead's Dispatcher hooks (HOOK-L3:
+   quiesce_state, event_holders, detach_completed_events; HOOK-L4 puts the executor's reset contract into the last
+   two; HOOK-L7: session, session_reason, begin_reset, end_reset, fail_reset, host_poll, and finish), the executor
+   module's reset_contract_of / reset_methods_missing, this module's reset_pending / before_reset, and track B's store
+   API (drained_all, clear_caches).
+   THE SESSION (I12). Dispatcher.session is "open" (initial), "resetting" or "failed". Outside "open", the lead's
+   submit, step (so run), finish and host_poll refuse before any change. QuiescentReset is the only caller of
+   begin_reset ("open" -> "resetting"), end_reset ("resetting" -> "open") and fail_reset ("resetting" -> "failed",
+   LATCHED: nothing returns a failed session to "open"). session_end() is the explicit session-end sequence:
+   Dispatcher.finish (drain every stream and validate), then ONE explicit host poll (Dispatcher.host_poll), then
+   reset(). There is no waiting loop, no automatic retry and no speculative mid-cohort reset: an item that is still
+   outstanding after the one poll is a refusal (the session stays "open"), and the caller decides what comes next.
+   reset():
+   (0) a FAILED session refuses at once: OwnershipViolation "quiescent reset refused: the session is latched failed
+       (<reason>)", with no hook, store or backend call.
    (1) the FULL check, with no mutation (pending()): every quiesce_state() value 0 (an OPEN dict: every key, whatever
        its name); every event_holders() event complete (ev_done); the frontier table (incomplete components, installed
        handles, cached joins) and every registered hold provider of every live incarnation at 0; store.drained_all()
@@ -128,21 +139,36 @@ model only.
        "quiescent reset refused: <items>" that names EVERY outstanding owner class, one item each, in a fixed order:
        "state:<key>=<n>" (quiesce_state keys, sorted), "holder:<owner class>=<pending references>" (sorted; a declared
        executor's classes "executor:..." too), "frontier:components|handles|joins=<n>", "provider:<name>(<uid>,<inc>)=
-       <n>" (incarnations and names sorted), "store:not_drained=1", "executor:no_reset_contract=1". Nothing is changed.
-       The check never polls: a store record that completed but was not polled yet is refused, and so are registered
-       validators, D2H checks and admission buffers (the lead's quiesce_state counts them; their completion runs byte
-       checks that may raise). The caller drains them first: Dispatcher.finish, then one host poll.
-   (2) Only then, in this order: detach_completed_events() (HOOK-L4: a declared executor's detach_completed() first;
-       the hook VERIFIES it before any dispatcher change: its count must equal the references it listed, and nothing
-       may be left listed; a refusal leaves the dispatcher unchanged; then the passive host poll, which also runs this
-       module's poll; then every remaining reference to a complete event is set to None); the post-check:
-       event_holders() is empty, else OwnershipViolation "quiescent reset: the detach left <n> event references:
-       [<first 6 (class, location)>]; backend_reset did not run (I10)"; before_reset() (the identity caches; it
-       checks again); store.clear_caches(); backend_reset() (the point where pooled events may be re-recorded); then
-       the counts. The post-check is a SECOND guard, against a dispatcher hook defect (the hook already verifies the
-       executor's detach). A failed post-check is NOT a no-change refusal: the detach has already run, so the
-       dispatcher's (and the executor's) complete references are already set to None. Only the coordinator's counts
-       are unchanged, and before_reset, store.clear_caches and backend_reset do not run.
+       <n>" (incarnations and names sorted), "store:not_drained=1", "executor:no_reset_contract=1". Each class is
+       named once with its count. Nothing is changed and the session stays "open"; so does an exception that the
+       read-only check itself raises (for example a HOOK-L4 refusal inside event_holders()). The check never polls: a
+       store record that completed but was not polled yet is refused, and so are registered validators, D2H checks
+       and admission buffers (the lead's quiesce_state counts them; their completion runs byte checks that may raise).
+       The caller drains them first: session_end() (Dispatcher.finish, then one host poll).
+   (2) begin_reset(): the session becomes "resetting".
+   (3) The MUTATING phases, in this order, each by its name:
+       "detach"        detach_completed_events() (HOOK-L4: a declared executor's detach_completed() first; the hook
+                       VERIFIES it before any dispatcher change: its count must equal the references it listed, and
+                       nothing may be left listed; then the passive host poll, which also runs this module's poll; its
+                       post-condition; then every remaining reference to a complete event is set to None);
+       "post_check"    event_holders() is empty, else OwnershipViolation "quiescent reset: the detach left <n> event
+                       references: [<first 6 (class, location)>]; backend_reset did not run (I10)";
+       "before_reset"  this module's before_reset() (the identity caches; it checks again);
+       "clear_caches"  store.clear_caches() (when Dispatcher.store exists);
+       "backend_reset" backend_reset() (the point where pooled events may be re-recorded).
+       ANY exception in a phase calls fail_reset(phase, "<type>: <text>") and raises OwnershipViolation "quiescent
+       reset failed in phase <phase>: <type>: <text> (the session is latched failed: no resume, no admission, no
+       reset retry)" from it. The session is then "failed": no later submit, step, finish, host_poll or reset runs,
+       and the backend is not used again through them. (An exception that is not an Exception, such as
+       KeyboardInterrupt, also latches the session, and is raised again unchanged.)
+       A phase failure is NOT a no-change refusal and NOT a rollback: the phases before it, and the failing phase up
+       to its fault, have already changed state. In "detach" the executor's own detach may already have changed the
+       executor's state when the hook's verification refuses it (the dispatcher is unchanged at that point); after a
+       later fault, the dispatcher's complete references are already set to None. Only the coordinator's counts are
+       unchanged, and no later phase runs.
+       The post-check is a SECOND guard, against a dispatcher hook defect (the hook already verifies the executor's
+       detach).
+   (4) end_reset() (the session is "open" again), then the counts.
    The crucial case: the table can be drained (its components completed and pruned) while a JOINED output that it
    installed stays referenced outside it (a slot's last reader) and incomplete. Only the holder enumeration sees it.
    THE EXECUTOR (I10). An executor can keep OPERATIONAL events between calls (an event it will wait on, hand on or test
@@ -154,16 +180,20 @@ model only.
    "executor:no_reset_contract=1", even when nothing else is outstanding. Construction refuses a declared executor
    whose classes do not define reset_holders and detach_completed (executor.reset_methods_missing: the classes of
    type(ex).__mro__ only; __getattr__ forwarding and instance attributes do not count) with ConfigError "quiescent
-   reset: the executor <cls> declares reset_contract 'I10' without the class methods [...] (I10)". The hook's own I10
-   refusals (an owner class that does not start with "executor:", missing class methods, a detach that fails the
-   verification, and the TypeError of a wrapper over an undeclared toy) come out of pending() / reset() unchanged,
-   before any mutation. Instrumentation history that an executor keeps (logs, counters, eager copies that no later
-   decision reads) is not listed and not detached; its docstring names it.
+   reset: the executor <cls> declares reset_contract 'I10' without the class methods [...] (I10)". The hook calls the
+   two methods through the class (type(ex).reset_holders(ex)), so an instance attribute cannot shadow them. The hook's
+   own I10 refusals are of two kinds. Those raised inside event_holders() (an owner class that does not start with
+   "executor:", missing class methods, the TypeError of a wrapper over an undeclared toy) come out of pending()
+   unchanged, before any change; the session stays "open". A detach that fails the hook's verification is refused
+   AFTER the executor's own detach ran: the dispatcher is unchanged, but the executor's own state may already be
+   changed (no transactional rollback), and the coordinator latches the session "failed" in phase "detach".
+   Instrumentation history that an executor keeps (logs, counters, eager copies that no later decision reads) is not
+   listed and not detached; its docstring names it.
    BOUNDARY: the coordinator relies on the declared list. An operational event that reset_holders() leaves out is not
    seen (the omitted-provider hazard); every executor class is audited on its own. No claim for an arbitrary backend or
    an undeclared executor.
-   The no-reset path is unchanged: no coordinator exists unless a caller constructs one. No live-reset scheduling, no
-   uid-reuse redesign (Dispatcher.submit still refuses a uid that it knows).
+   The no-reset path is unchanged: no coordinator exists unless a caller constructs one, and without one the session
+   stays "open". No live-reset scheduling, no uid-reuse redesign (Dispatcher.submit still refuses a uid that it knows).
 """
 from __future__ import annotations
 
@@ -812,37 +842,49 @@ class CompletionOwnership:
 
 # -------------------------------------------------------------------------------------------- milestone 3-4: I8, I10
 class QuiescentReset:
-    """Section 8 of the module docstring (I8, I10): the ONE reset path that may let pooled events be re-recorded.
-    disp: the Dispatcher (it must have the HOOK-L3 methods quiesce_state, event_holders and detach_completed_events);
-    backend_reset: the callable that resets the backend (for example CudaBackend.reset); it runs last. pending() is
-    READ-ONLY; reset() refuses with no mutation, else detaches (the executor's references first), checks that no
-    event reference is left, clears the identity caches, clears the store's caches and resets the backend, in that
-    order. Counts: resets (passed resets), detached (references the hook set to None, the executor's included)."""
+    """Section 8 of the module docstring (I8, I10, I12): the ONE reset path that may let pooled events be re-recorded.
+    disp: the Dispatcher (it must have the HOOK-L3 methods quiesce_state, event_holders and detach_completed_events,
+    and the HOOK-L7 session API); backend_reset: the callable that resets the backend (for example CudaBackend.reset);
+    it runs last. pending() is READ-ONLY. reset() refuses a latched failed session at once; refuses with no change
+    while anything is outstanding (the session stays "open"); else begin_reset, the named mutating phases (detach, the
+    executor's references first; post_check; before_reset; clear_caches; backend_reset), end_reset. A failure in a
+    phase latches the session "failed". session_end(): finish, ONE host poll, reset(). Counts: resets (passed
+    resets), detached (references the hook set to None, the executor's included)."""
 
     HOOKS = ("quiesce_state", "event_holders", "detach_completed_events")
+    SESSION_API = ("session", "begin_reset", "end_reset", "fail_reset", "host_poll")   # HOOK-L7 (I12)
     TABLE_PARTS = ("components", "handles", "joins")
+    PHASES = ("detach", "post_check", "before_reset", "clear_caches", "backend_reset")  # I12 (3), in this order
+    FAILED = "failed"
+    LATCHED = "the session is latched failed: no resume, no admission, no reset retry"
 
     def __init__(self, disp, backend_reset: Callable[[], Any]):
         # I10 (HOOK-L4): the readers of an executor's declaration and of its contract methods. Imported here, so that
         # the milestone 1-2 parts of this module do not need them.
         from .executor import RESET_CONTRACT, reset_contract_of, reset_methods_missing
         missing = [h for h in self.HOOKS if not callable(getattr(disp, h, None))]
-        faults, tags = [], []
+        session = [h for h in self.SESSION_API
+                   if not (hasattr(disp, h) if h == "session" else callable(getattr(disp, h, None)))]
+        faults, tags = [], set()
         if missing:
             faults.append("the dispatcher lacks the HOOK-L3 methods %s" % (missing,))
+            tags.add("I8")
+        if session:
+            faults.append("the dispatcher lacks the HOOK-L7 session API %s" % (session,))
+            tags.add("I12")
         if not callable(backend_reset):
             faults.append("backend_reset is not callable (%s)" % (type(backend_reset).__name__,))
-        if faults:
-            tags.append("I8")
+            tags.add("I8")
         ex = getattr(disp, "ex", None)
         if reset_contract_of(ex) == RESET_CONTRACT:
             bad = reset_methods_missing(ex)                     # the classes of type(ex).__mro__ only (no forwarding)
             if bad:
                 faults.append("the executor %s declares reset_contract %r without the class methods %s"
                               % (type(ex).__name__, RESET_CONTRACT, bad))
-                tags.append("I10")
-        if faults:                                              # names only the actual fault(s)
-            raise ConfigError("quiescent reset: %s (%s)" % ("; ".join(faults), ", ".join(tags)))
+                tags.add("I10")
+        if faults:                                              # names only the actual fault(s); tags in a fixed order
+            raise ConfigError("quiescent reset: %s (%s)" % ("; ".join(faults),
+                                                            ", ".join(t for t in ("I8", "I10", "I12") if t in tags)))
         self.d = disp
         self.backend_reset = backend_reset
         self.contract_of, self.contract = reset_contract_of, RESET_CONTRACT
@@ -890,28 +932,70 @@ class QuiescentReset:
         return dict(state=state, holders=holders, first=first, frontier=table, providers=providers, store=store_out,
                     contract=contract, items=items)
 
-    def reset(self) -> None:
-        """I8 / I10: the full check (pending), then detach_completed_events (the executor's own detach first, verified
-        by the hook, HOOK-L4), the post-check (no event_holders() entry left), before_reset (the frontier's identity
-        caches), store.clear_caches, backend_reset and the counts. A refusal of pending() names every outstanding owner
-        class and changes nothing; so does a refusal of the hook (it raises before any dispatcher change). A failed
-        post-check (a dispatcher hook defect: a reference that the detach should have set to None is still listed) is
-        NOT a no-change refusal: the detach has already set the complete references to None. It raises before
-        before_reset, store.clear_caches and backend_reset, and only the coordinator's counts stay unchanged."""
-        p = self.pending()
-        if p["items"]:
-            raise OwnershipViolation("quiescent reset refused: %s" % "; ".join(p["items"]))
-        n = self.d.detach_completed_events()
+    def _refuse_if_failed(self) -> None:
+        """I12 (0): a latched failed session refuses at once (reads only Dispatcher.session / session_reason: no hook,
+        store or backend call)."""
+        if self.d.session == self.FAILED:
+            raise OwnershipViolation("quiescent reset refused: the session is latched failed (%s)"
+                                     % (self.d.session_reason,))
+
+    def _phase(self, phase: str, fn: Callable[[], Any]) -> Any:
+        """I12 (3): one named mutating phase. Any exception latches the session (fail_reset(phase, "<type>: <text>"))
+        and is raised again as the named OwnershipViolation (from it); a BaseException that is not an Exception (for
+        example KeyboardInterrupt) latches the session too and is raised again unchanged."""
+        try:
+            return fn()
+        except BaseException as e:
+            text = "%s: %s" % (type(e).__name__, e)
+            self.d.fail_reset(phase, text)
+            if not isinstance(e, Exception):
+                raise
+            raise OwnershipViolation("quiescent reset failed in phase %s: %s (%s)" % (phase, text, self.LATCHED)) from e
+
+    def _post_check(self) -> None:
         left = [(cls, loc) for cls, loc, _ in self.d.event_holders()]
         if left:                                                       # I10: complete references detach BEFORE reuse
             raise OwnershipViolation("quiescent reset: the detach left %d event references: %s; backend_reset did not "
                                      "run (I10)" % (len(left), left[:6]))
-        fo = getattr(self.d, "frontier", None)
-        if fo is not None:
-            fo.before_reset()
-        store = getattr(self.d, "store", None)
-        if store is not None:
-            store.clear_caches()
-        self.backend_reset()
+
+    @staticmethod
+    def _nothing() -> None:
+        return None
+
+    def reset(self) -> None:
+        """I12 (section 8): (0) a latched failed session refuses at once, with no hook, store or backend call; (1)
+        pending(), READ-ONLY: a refusal names every outstanding owner class, each once with its count, and changes
+        nothing (the session stays "open"; so does an exception that the check itself raises); (2) begin_reset; (3) the
+        named mutating phases detach (the executor's own detach first, verified by the hook, HOOK-L4), post_check (no
+        event_holders() entry left), before_reset (the frontier's identity caches), clear_caches (the store's),
+        backend_reset; (4) end_reset and the counts. A failure in a phase latches the session "failed" (fail_reset)
+        and raises "quiescent reset failed in phase <phase>: ...". It is NOT a no-change refusal and NOT a rollback:
+        the earlier phases (and the failing one up to its fault) already changed state; a detach that fails the hook's
+        verification may already have changed the executor's own state (the dispatcher is unchanged then); after a
+        later fault the complete references are already set to None. Only the coordinator's counts stay unchanged."""
+        self._refuse_if_failed()                                       # (0)
+        p = self.pending()                                             # (1) READ-ONLY
+        if p["items"]:
+            raise OwnershipViolation("quiescent reset refused: %s" % "; ".join(p["items"]))
+        d = self.d
+        d.begin_reset()                                                # (2) "open" -> "resetting"
+        n = self._phase("detach", d.detach_completed_events)           # (3) the mutating phases, in order
+        self._phase("post_check", self._post_check)
+        fo = getattr(d, "frontier", None)
+        self._phase("before_reset", fo.before_reset if fo is not None else self._nothing)
+        store = getattr(d, "store", None)
+        self._phase("clear_caches", store.clear_caches if store is not None else self._nothing)
+        self._phase("backend_reset", self.backend_reset)
+        d.end_reset()                                                  # (4) "resetting" -> "open", then the counts
         self.resets += 1
         self.detached += n
+
+    def session_end(self) -> None:
+        """I12: the explicit session-end sequence: Dispatcher.finish (drain every stream, validate every read), then ONE
+        explicit host poll (Dispatcher.host_poll), then reset(). No waiting loop and no retry: whatever is still
+        outstanding after the one poll is reset()'s refusal, and the session stays "open". A latched failed session
+        refuses at once (before finish), as reset() does."""
+        self._refuse_if_failed()
+        self.d.finish()
+        self.d.host_poll()
+        self.reset()
