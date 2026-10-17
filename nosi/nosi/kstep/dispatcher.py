@@ -865,10 +865,11 @@ class Dispatcher:
             raise KStepError("I20: cancel of uid %r (incarnation %s) refused: its cancellation is already requested"
                              % (uid, r.inc))
         stopped = self.pending_step is not None
-        if self.tickets is not None:
-            if r.inc < 1:
-                raise KStepError("I20: cancel of uid %r refused: incarnation %s (not queued through submit) cannot be "
-                                 "named by the result tickets" % (uid, r.inc))
+        if self.tickets is not None:                                   # every refusal of tickets.cancel, checked
+            if r.uid is None or r.inc < 1:                             # here BEFORE cancel_entry changes the frontier
+                raise KStepError("I20: cancel of uid %r refused: incarnation %s cannot be named by the result tickets "
+                                 "(the uid must not be None and the inc must be >= 1: queued through submit)"
+                                 % (uid, r.inc))
             if not stopped and self.tickets.holds_request(r.uid, r.inc):
                 raise KStepError("I20: cancel of uid %r (incarnation %s) refused: an outstanding result ticket names it "
                                  "and no step is stopped (a broken ticket: no forced cleanup) (%s)"
@@ -968,7 +969,8 @@ class Dispatcher:
                 del self.cancel_req[uid]                               # released by the ticket) and BEFORE the
             n0 = len(ps["rows"])                                       # publication; the step resumes with the
             ps["rows"] = [(r, dr) for r, dr in ps["rows"] if not r.done]   # remaining live rows only
-            self.cstat["rows_dropped_at_resume"] += n0 - len(ps["rows"])
+            if n0 != len(ps["rows"]):
+                self.cstat["rows_dropped_at_resume"] += n0 - len(ps["rows"])
         self._call_publish(pc["l"], pc["ctx"], self._ticket_outs(pc["l"], pc["ctx"], deferred=True))
         for l in range(pc["l"] + 1, self.L):
             if ps["vonly"]:
@@ -2653,7 +2655,8 @@ class Dispatcher:
         if self.cancelled:                                             # I20: a request torn down at this call's resume
             n0 = len(requests)                                         # issues no transfer (only after a cancellation)
             requests = [q for q in requests if not q[1].done]
-            self.cstat["transfer_requests_dropped"] += n0 - len(requests)
+            if n0 != len(requests):
+                self.cstat["transfer_requests_dropped"] += n0 - len(requests)
         dropped = {id(obj) for (kind, r, obj, i), out in zip(owners, outs) if out is _DISCARDED}
         for (kind, r, obj, i), row, out in zip(owners, jrows, outs):
             if out is _DISCARDED:
