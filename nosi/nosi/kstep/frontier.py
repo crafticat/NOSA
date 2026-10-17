@@ -129,6 +129,16 @@ model only.
    Dispatcher.finish (drain every stream and validate), then ONE explicit host poll (Dispatcher.host_poll), then
    reset(). There is no waiting loop, no automatic retry and no speculative mid-cohort reset: an item that is still
    outstanding after the one poll is a refusal (the session stays "open"), and the caller decides what comes next.
+   THE DRAIN (I12.1). finish and host_poll are the named DRAIN phases "finish" and "host_poll" of session_end. They
+   can change state and then raise: finish synchronizes every stream and then validates (_validate, the D2H checks);
+   host_poll removes an arrived transfer from inflight before its admission readback. So each one runs through the
+   same _phase as the mutating phases, with every lookup inside it, but with the session "open" (begin_reset is NOT
+   called before them: the lead's guards refuse finish and host_poll outside "open"). Any exception latches the
+   session from "open" (begin_reset, then fail_reset(<phase>, "<type>: <text>")) and raises OwnershipViolation
+   "quiescent reset failed in phase <phase>: <type>: <text> (the session is latched failed: ...)" from it; a drain
+   phase that returns but leaves the session other than "open" is a fault too. A successful drain keeps the session
+   "open" until reset()'s read-only check; a refusal there leaves it "open". session_end refuses a session that is
+   not "open" (for example "resetting") before any drain, with no change.
    reset():
    (0) a FAILED session refuses at once: OwnershipViolation "quiescent reset refused: the session is latched failed
        (<reason>)", with no hook, store or backend call.
@@ -144,7 +154,9 @@ model only.
        read-only check itself raises (for example a HOOK-L4 refusal inside event_holders()). The check never polls: a
        store record that completed but was not polled yet is refused, and so are registered validators, D2H checks
        and admission buffers (the lead's quiesce_state counts them; their completion runs byte checks that may raise).
-       The caller drains them first: session_end() (Dispatcher.finish, then one host poll).
+       The caller drains them first: session_end() (Dispatcher.finish, then one host poll). An outstanding deferred-
+       result ticket (I14, result_tickets.py; Config.result_tickets > 0) is refused through the lead's quiesce_state
+       key "tickets" (state:tickets=<n>); its gather backings are also counted (state:consume_ledger_keyed=<n>).
    (2) begin_reset(): the session becomes "resetting".
    (3) The MUTATING phases, in this order, each by its name:
        "detach"        detach_completed_events() (HOOK-L4: a declared executor's detach_completed() first; the hook
@@ -864,6 +876,7 @@ class QuiescentReset:
     SESSION_ATTRS = ("session", "session_reason")                                      # HOOK-L7 (I12): attributes
     SESSION_API = SESSION_ATTRS + ("begin_reset", "end_reset", "fail_reset", "host_poll", "finish")   # and methods
     TABLE_PARTS = ("components", "handles", "joins")
+    DRAIN_PHASES = ("finish", "host_poll")                                              # I12.1: session_end's drain
     PHASES = ("detach", "post_check", "before_reset", "clear_caches", "backend_reset")  # I12 (3): reset() runs these
     OPEN, RESETTING, FAILED = "open", "resetting", "failed"                              # in this order (_run_<phase>)
     LATCHED = "the session is latched failed: no resume, no admission, no reset retry"
@@ -983,14 +996,16 @@ class QuiescentReset:
         tail = self.LATCHED if why is None else "the session could NOT be latched failed: %s" % why
         return "quiescent reset failed in phase %s: %s (%s)" % (phase, text, tail)
 
-    def _phase(self, phase: str, fn: Callable[[], Any]) -> Any:
-        """I12 (3): one named mutating phase. fn does every attribute lookup itself, so a missing attribute is a fault
-        of the phase. Any exception latches the session (_latch(phase, "<type>: <text>")) and is raised again as the
-        named OwnershipViolation (from it); a BaseException that is not an Exception (for example KeyboardInterrupt)
-        latches the session too and is raised again unchanged. A phase that returns but leaves the session other than
-        "resetting" is a fault too: the session is latched as far as its state allows (_latch), and OwnershipViolation
-        "quiescent reset failed in phase <phase>: OwnershipViolation: the phase left the session <state> (expected
-        'resetting') (...)" is raised. The text in brackets says whether the session is latched."""
+    def _phase(self, phase: str, fn: Callable[[], Any], expect: str = "resetting") -> Any:
+        """One named phase: a mutating phase of reset() (I12 (3); the session is "resetting") or a drain phase of
+        session_end() (I12.1; expect "open"). fn does every attribute lookup itself, so a missing attribute is a fault
+        of the phase. Any exception latches the session (_latch(phase, "<type>: <text>"): from "resetting" by
+        fail_reset; from "open", in a drain phase, by begin_reset and then fail_reset) and is raised again as the named
+        OwnershipViolation (from it); a BaseException that is not an Exception (for example KeyboardInterrupt) latches
+        the session too and is raised again unchanged. A phase that returns but leaves the session other than `expect`
+        is a fault too: the session is latched as far as its state allows (_latch), and OwnershipViolation "quiescent
+        reset failed in phase <phase>: OwnershipViolation: the phase left the session <state> (expected <expect>)
+        (...)" is raised. The text in brackets says whether the session is latched."""
         try:
             out = fn()
         except BaseException as e:
@@ -999,10 +1014,19 @@ class QuiescentReset:
             if not isinstance(e, Exception):
                 raise
             raise OwnershipViolation(self._failure(phase, text, why)) from e
-        if self.d.session != self.RESETTING:
-            text = "OwnershipViolation: the phase left the session %r (expected %r)" % (self.d.session, self.RESETTING)
+        if self.d.session != expect:
+            text = "OwnershipViolation: the phase left the session %r (expected %r)" % (self.d.session, expect)
             raise OwnershipViolation(self._failure(phase, text, self._latch(phase, text)))
         return out
+
+    # I12.1: the drain phases of session_end, one method each, in the order of DRAIN_PHASES (each looks its target up
+    # when it runs). Both start and must end with the session "open" (the lead's guards refuse finish and host_poll
+    # outside "open", so begin_reset is NOT called before them).
+    def _run_finish(self) -> None:
+        self.d.finish()
+
+    def _run_host_poll(self) -> None:
+        self.d.host_poll()
 
     # I12 (3): the mutating phases, one method each, in the order of PHASES. Each one looks its target up when it runs.
     def _run_detach(self) -> int:
@@ -1056,11 +1080,19 @@ class QuiescentReset:
         self.detached += out["detach"]
 
     def session_end(self) -> None:
-        """I12: the explicit session-end sequence: Dispatcher.finish (drain every stream, validate every read), then ONE
-        explicit host poll (Dispatcher.host_poll), then reset(). No waiting loop and no retry: whatever is still
-        outstanding after the one poll is reset()'s refusal, and the session stays "open". A latched failed session
-        refuses at once (before finish), as reset() does."""
+        """I12 / I12.1: the explicit session-end sequence. (0) A latched failed session refuses at once, as reset()
+        does; a session that is not "open" (for example "resetting") refuses with no change. (1) The named DRAIN phases
+        "finish" (Dispatcher.finish: drain every stream, validate every read, the D2H checks) and "host_poll" (ONE
+        explicit host poll), in that order, through _phase with the session "open": finish and host_poll can change
+        state and then raise (a validation after the synchronize; an arrival removed from inflight before its
+        readback), so any exception latches the session "failed" from "open" (begin_reset, then fail_reset(<phase>,
+        "<type>: <text>")) and raises the named OwnershipViolation from it; a drain phase that returns but leaves the
+        session other than "open" is a fault too. (2) reset(): its read-only check; a refusal there leaves the session
+        "open". No waiting loop and no retry: whatever is still outstanding after the one poll is reset()'s refusal."""
         self._refuse_if_failed()
-        self.d.finish()
-        self.d.host_poll()
+        if self.d.session != self.OPEN:
+            raise OwnershipViolation("quiescent reset refused: session_end needs the session 'open', not %r (%s)"
+                                     % (self.d.session, self.d.session_reason))
+        for phase in self.DRAIN_PHASES:
+            self._phase(phase, getattr(self, "_run_" + phase), self.OPEN)
         self.reset()
