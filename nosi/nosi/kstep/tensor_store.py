@@ -57,7 +57,7 @@ partly queued copy may still read the source, so the hold is never released earl
 a corruption).
 
 Not claimed: NOSA or model numerics, CUDA stream safety, HBM fit or throughput. The pgen_t / rgen_t mirrors stay the
-pools' CPU int64 tensors.
+pools' CPU int64 tensors (the opt-in consumer mirrors of I11 are separate; "consumer generation mirrors" below).
 
 DISPATCHER ADAPTER (milestone 2; opt-in Config.store = "tensor"; every dispatcher / ownership edit is marked HOOK-B2;
 the default "none" path is unchanged; sites named by function, as line numbers shift when other tracks merge):
@@ -151,8 +151,40 @@ the default "none" path is unchanged; sites named by function, as line numbers s
                   (FinishedCohorts.add_source; duck-typed: Dispatcher.store.holds.outstanding_count) when the store's
                   mode and "joined" are both on. The dispatcher attribute is exactly `store` (None in the default path).
   reset (I4)      drained_all() and clear_caches(); Track C's reset guard calls them (the lead wires it).
-  open items      eager / eager_matched in the store's mode; device-resident pgen_t / rgen_t; a CUDA executor's ready
-                  events (only the event type is checked there: a torch.cuda.Event does not show its stream).
+  consumer generation mirrors (milestone 5, INTERFACE_BC5 I11; opt-in Config.store_gen "consumer"; the lead's
+                  HOOK-L6 calls attach_gen_mirrors(d, tp) after make_transport and refuses any combination other than
+                  store "tensor", physical "arena" and the S0 transport). The pools' host mirrors pgen_t / rgen_t stay
+                  exactly as they are (ownership and audit: check_arena, the Auditor, publish_ring_block's identity
+                  copy rg); nothing here writes them. The store owns SEPARATE mirrors cpgen[l] (P_l,) and crgen[l]
+                  (Q_l,) int64 on its device, equal to the host mirrors at attach (alloc_gen_mirrors: the initial
+                  write completes before the return), attached to the executor in place of pgen_t / rgen_t (its
+                  deferred identity copies read them; it never reads them on the host at call time). Writes are ONLY
+                  backend memcpys from ONE new immutable int64 staging tensor per write site, held as SourceHolds kind
+                  "gen_staging" (owner (GEN_OWNER, layer)) until its copy's event passed ev_done (poll releases it;
+                  drained_all covers it; it is part of source_staging):
+                    arena  publish_arena_gens, installed as tp.gen_publisher: S0Transport._issue_pool calls it on
+                           "scatter" after Pipe.layer and _issue_bias, so after the issue's reader waits (T3: the
+                           previous occupant's last reader, which read the OLD generation) and its data scatters; one
+                           write per transfer, cpgen[l][phys] = pgen, then ONE event that every transfer of the issue
+                           completes on (tr.ev), so arrival covers mirror visibility;
+                    ring   produce_ring and admission_ring: crgen[l][e] = rgen on "compute" after the entry's data
+                           copies and before the event that they return (the entry's ready gate); an entry is rebound
+                           only after FREE (RingPool.retire: every gate passed) and its readers ran on "compute".
+                  BIND SITES (every bind whose generation a consumer can read; each gets exactly one mirror write):
+                    ownership.py Stream.take -> Arena.bind: called only from dispatcher.py Dispatcher._issue, which
+                           puts each bound position into a Transfer of `batch` and issues that batch with tp.issue in
+                           the same call -> transfer.py S0Transport._issue_pool -> publish_arena_gens (covered);
+                    ownership.py RingPool.bind: called only from dispatcher.py Dispatcher._produce -> (store mode)
+                           dispatch_produce -> produce_ring (DRAFT / PRE / EXACT payloads) or admission_ring (the
+                           partial block of dispatch_admit) (covered);
+                    c13.py C13Stores (its own pgen_t / rgen_t, written by fill_): a separate C13 component, not the
+                           dispatcher's stores and not reachable with store "tensor" (not covered, not applicable).
+                  Accounting: store_bytes()["gen_mirror"] = the distinct storages of cpgen / crgen at allocated
+                  capacity (the dispatcher's K6 category gen_mirror reads it); the pools' host mirrors are never
+                  counted here.
+  open items      eager / eager_matched in the store's mode; a CUDA executor's ready events (only the event type is
+                  checked there: a torch.cuda.Event does not show its stream); device placement of the consumer mirrors
+                  other than the CPU model.
 """
 from __future__ import annotations
 
@@ -165,7 +197,8 @@ from .backend import check_backend, ev_done, record_join
 from .errors import ConfigError, KStepError, OwnershipViolation, ReadCorruption, StaleReader
 from .ownership import LIVE, R_EXACT, RING_KINDS, BiasOpLedger
 
-HOLD_KINDS = ("admission", "ring", "publish")      # I2: the hold kinds (the second part of a hold's owner key)
+HOLD_KINDS = ("admission", "ring", "publish", "gen_staging")   # I2 (+ I11 gen_staging): the hold kinds
+GEN_OWNER = "gen_mirror"                           # I11: the owner tag of a generation staging hold (GEN_OWNER, layer)
 INT_POISON = -7777777                              # the dispatcher's POISON for integer stores
 PRODUCE = "compute"                                # the stream of every producer copy (ring writes; A_r's ready event)
 PUBLISH = "d2h"                                    # the stream of every historical publication (D2H)
@@ -459,7 +492,8 @@ class TensorStore:
       ring_k[l], ring_v[l]  (Q_l, D) kv_dtype on device, Q_l = rings[l].Q; row e = entry e   (only with rings)
       ring_c[l]             (Q_l,) bias_dtype
     Every store row starts as `poison` (default: INT_POISON for int32 / int64, the most negative finite value for a
-    floating dtype). The generation mirrors stay arenas[l].pgen_t and rings[l].rgen_t."""
+    floating dtype). The pools' generation mirrors stay arenas[l].pgen_t and rings[l].rgen_t; with I11 the store also
+    owns the consumer mirrors cpgen[l] (P_l,) and crgen[l] (Q_l,) int64 (alloc_gen_mirrors; None before)."""
 
     def __init__(self, be: Any, *, L: int, H: int, D: int, bs: int, B: int, S_host: int, arenas: Sequence[Any],
                  rings: Optional[Sequence[Any]] = None, kv_dtype: torch.dtype, bias_dtype: Optional[torch.dtype] = None,
@@ -508,9 +542,12 @@ class TensorStore:
         self._store_ids = {storage_id(t) for t in self._stores()}
         self.stats = dict(admissions=0, admission_d2h=0, admission_ring=0, admissions_closed=0, admission_joins=0,
                           ring_produced=0, ring_published=0, published=0, ready_admissions=0, ready_produced=0,
-                          ready_published=0)
+                          ready_published=0, gen_init_writes=0, gen_publishes=0, gen_arena_writes=0,
+                          gen_ring_writes=0)
         self.admissions: List[Dict[str, Any]] = []   # dispatcher adapter (B2): each admission, its A_r storages
         self.producer_ready = False                   # I9: set by attach_dispatcher from the executor's class
+        self.cpgen: Optional[List[torch.Tensor]] = None   # I11: the consumer arena generation mirrors (opt-in)
+        self.crgen: Optional[List[torch.Tensor]] = None   # I11: the consumer ring generation mirrors (with rings)
 
     # -- helpers
     @staticmethod
@@ -528,9 +565,12 @@ class TensorStore:
                ("arena", self.arena_k + self.arena_v + (self.arena_c or []))]
         if self.rings is not None:
             out.append(("ring", self.ring_k + self.ring_v + (self.ring_c or [])))
+        if self.cpgen is not None:                    # I11: the consumer generation mirrors (the store's own)
+            out.append(("gen_mirror", self.cpgen + (self.crgen or [])))
         return out
 
     def _stores(self) -> List[torch.Tensor]:
+        """Every persistent tensor that a source must not alias: the store's groups and the pools' host mirrors."""
         out = [t for _, ts in self._groups() for t in ts]
         out += [a.pgen_t for a in self.arenas] + ([rp.rgen_t for rp in self.rings] if self.rings is not None else [])
         return out
@@ -622,23 +662,33 @@ class TensorStore:
 
     # -- wiring and reports
     def attach_executor(self, ex: Any, register: Any, register_ring: Any = None) -> None:
-        """The executor's attach calls, as Dispatcher.__init__ makes them (attach_arena, attach_ring, attach_bias)."""
-        ex.attach_arena(self.be, self.arena_k, self.arena_v, [a.pgen_t for a in self.arenas], register)
+        """The executor's attach calls, as Dispatcher.__init__ makes them (attach_arena, attach_ring, attach_bias). The
+        generation lists are the store's consumer mirrors once attach_gen_mirrors ran (I11), else the pools' host
+        mirrors pgen_t / rgen_t."""
+        pg = self.cpgen if self.cpgen is not None else [a.pgen_t for a in self.arenas]
+        ex.attach_arena(self.be, self.arena_k, self.arena_v, pg, register)
         if self.rings is not None:
-            ex.attach_ring(self.be, self.ring_k, self.ring_v, [rp.rgen_t for rp in self.rings], register_ring)
+            rg = self.crgen if self.crgen is not None else [rp.rgen_t for rp in self.rings]
+            ex.attach_ring(self.be, self.ring_k, self.ring_v, rg, register_ring)
         if self.bias_dtype is not None:
             ex.attach_bias(self.be, self.arena_c, self.ring_c)
 
     def store_bytes(self) -> Dict[str, int]:
-        """The ACTUAL persistent store bytes at allocated capacity (untyped_storage().nbytes() of each store tensor;
-        the generation mirrors belong to the pools). Instrumentation, not a fit claim."""
-        return {name: sum(t.untyped_storage().nbytes() for t in ts) for name, ts in self._groups()}
+        """The ACTUAL persistent store bytes at allocated capacity: per group, untyped_storage().nbytes() of each
+        DISTINCT storage of its tensors, once. With the consumer generation mirrors (I11) the group "gen_mirror" (cpgen
+        and crgen); the pools' host mirrors pgen_t / rgen_t are never counted here (the dispatcher's report keeps them).
+        Instrumentation, not a fit claim."""
+        out = {}
+        for name, ts in self._groups():
+            uniq = {storage_id(t): t.untyped_storage().nbytes() for t in ts}
+            out[name] = sum(uniq.values())
+        return out
 
     def report(self) -> Dict[str, Any]:
         h = self.holds
         return dict(stats=dict(self.stats), held=h.held, peak=h.peak, records=len(h.recs), holds=len(h.holds),
                     shared=h.shared, released=h.released, stores=self.store_bytes(),
-                    producer_ready=self.producer_ready)
+                    producer_ready=self.producer_ready, gen_mirrors=self.cpgen is not None)
 
     def poll(self) -> int:
         """The passive release of the source holds (call it at the existing host poll points). It also drops the
@@ -665,6 +715,99 @@ class TensorStore:
             raise ConfigError("tensor store: the transport %s (%s) carries %s, not the store's kv_dtype %s "
                               "(Config.store 'tensor')"
                               % (type(tp).__name__, getattr(tp, "name", None), dt, self.kv_dtype))
+
+    # -- I11: consumer generation mirrors (milestone 5; Config.store_gen "consumer"; module docstring)
+    def alloc_gen_mirrors(self) -> None:
+        """I11: allocate the consumer generation mirrors on the store's device, per layer cpgen[l] (P_l,) int64 and,
+        with rings, crgen[l] (Q_l,) int64, filled with -1, and make them EQUAL to the pools' host mirrors pgen_t /
+        rgen_t through backend copies on "compute" from immutable clones (one "gen_staging" hold). The copy completes
+        (host wait on its event) and its staging is released before this returns. Called by attach_gen_mirrors, or
+        directly by a component test that installs no publisher. Call it before any other operation is queued on
+        "compute" (the host wait runs that stream up to the copy's event). OwnershipViolation when the mirrors exist."""
+        if self.cpgen is not None:
+            raise OwnershipViolation("tensor store: I11: the consumer generation mirrors are already allocated")
+        self.cpgen = [torch.full((a.P,), -1, dtype=torch.int64, device=self.dev) for a in self.arenas]
+        if self.rings is not None:
+            self.crgen = [torch.full((rp.Q,), -1, dtype=torch.int64, device=self.dev) for rp in self.rings]
+        self._store_ids |= {storage_id(t) for t in self.cpgen + (self.crgen or [])}
+        pairs = list(zip(self.cpgen, [a.pgen_t for a in self.arenas]))
+        if self.rings is not None:
+            pairs += list(zip(self.crgen, [rp.rgen_t for rp in self.rings]))
+        staging = [h.to(self.dev).clone() for _, h in pairs]    # captured now, never written again
+        hid = self.holds.open((GEN_OWNER, "init"), "gen_staging", staging)
+        with self.be.stream(PRODUCE):
+            for (m, _), s in zip(pairs, staging):
+                self.be.memcpy(m, s, PRODUCE)
+            ev = self.be.event_rec(PRODUCE)
+        self.holds.read(hid, PRODUCE, ev)
+        self.holds.close(hid)
+        self.be.host_wait(ev)                                   # the initial write is complete before the return
+        self.holds.poll()
+        self.stats["gen_init_writes"] += len(pairs)
+
+    def attach_gen_mirrors(self, d: Any, tp: Any) -> None:
+        """HOOK-L6 (I11; Dispatcher.__init__, Config.store_gen "consumer", after make_transport, enable_sources and
+        check_transport): alloc_gen_mirrors; then the executor is attached again with the consumer mirrors in place of
+        pgen_t / rgen_t (attach_executor; the consumer's read code is unchanged); then tp.gen_publisher =
+        publish_arena_gens (S0Transport._issue_pool calls it, HOOK-L6). ConfigError when the transport does not accept
+        a publisher (accepts_gen_publisher); OwnershipViolation when the mirrors exist."""
+        if not getattr(tp, "accepts_gen_publisher", False):
+            raise ConfigError("tensor store: I11: the transport %s does not accept a gen_publisher (store_gen "
+                              "'consumer' needs the S0 transport)" % (type(tp).__name__,))
+        self.alloc_gen_mirrors()
+        self.attach_executor(d.ex, d._register_read, d._register_ring_read)
+        tp.gen_publisher = self.publish_arena_gens
+
+    def _gen_stage(self, layer: int, kind: str, idx: Sequence[int], gens: Sequence[int], stream: str) -> int:
+        """I11: inside the caller's `with be.stream(stream)` block and BEFORE the caller's completion event: ONE new
+        int64 staging tensor with the generations `gens` (captured now, at the binding's own write; never written
+        again), held (SourceHolds kind "gen_staging", owner (GEN_OWNER, layer)), and one backend memcpy per index into
+        the consumer mirror (kind "arena": cpgen[layer][idx[i]]; "ring": crgen[layer][idx[i]]). Returns the hold; the
+        caller records its event in it (holds.read) and closes it."""
+        mirror = (self.cpgen if kind == "arena" else self.crgen)[layer]
+        staging = torch.tensor([int(g) for g in gens], dtype=torch.int64, device=self.dev)
+        hid = self.holds.open((GEN_OWNER, layer), "gen_staging", [staging])
+        for i, p in enumerate(idx):
+            self.be.memcpy(mirror[p:p + 1], staging[i:i + 1], stream)
+        self.stats["gen_%s_writes" % kind] += len(idx)
+        return hid
+
+    def publish_arena_gens(self, layer: int, order: Sequence[Any], stream: str) -> Any:
+        """I11, tp.gen_publisher (S0Transport._issue_pool calls it after Pipe.layer and _issue_bias, with stream
+        "scatter"): ONE consumer-mirror write per transfer of the issue, cpgen[layer][tr.phys] = tr.pgen (the
+        generation of the transfer's own bind, Stream.take -> Arena.bind), from one staging hold (_gen_stage), on
+        `stream` after everything already queued there (the issue's reader waits, T3, and its data and bias
+        scatters), then ONE event after those writes, which it returns: the caller makes it every transfer's tr.ev, so
+        arrival covers mirror visibility. Every check runs before any change: the mirrors exist, each transfer is of
+        `layer`, names a position of the arena and the generation that the pool's binding of that position has now
+        (Arena.pgen; the host bind identity), else OwnershipViolation "tensor store: I11: ...". An empty order
+        returns None."""
+        where = "consumer generation write of layer %d" % layer
+        if self.cpgen is None:
+            raise OwnershipViolation("tensor store: I11: %s without consumer mirrors (attach_gen_mirrors did not run)"
+                                     % where)
+        self._layer(layer, where)
+        if not order:
+            return None
+        ar = self.arenas[layer]
+        idx, gens = [], []
+        for tr in order:
+            p, g = getattr(tr, "phys", None), getattr(tr, "pgen", None)
+            ok_p = p is not None and 0 <= int(p) < ar.P
+            if getattr(tr, "layer", None) != layer or not ok_p or g is None or int(ar.pgen[int(p)]) != int(g):
+                raise OwnershipViolation("tensor store: I11: %s: transfer seq %s (layer %s) names position %s with "
+                                         "pgen %s, but the binding of that position has pgen %s"
+                                         % (where, getattr(tr, "seq", None), getattr(tr, "layer", None), p, g,
+                                            ar.pgen[int(p)] if ok_p else None))
+            idx.append(int(p))
+            gens.append(int(g))
+        with self.be.stream(stream):
+            hid = self._gen_stage(layer, "arena", idx, gens, stream)
+            ev = self.be.event_rec(stream)
+        self.holds.read(hid, stream, ev)
+        self.holds.close(hid)
+        self.stats["gen_publishes"] += 1
+        return ev
 
     # -- admission (11.2)
     def _admit_checks(self, b: int, k: Any, v: Any, c: Any, where: str) -> Tuple[List[Any], List[Any], Any, int]:
@@ -749,7 +892,8 @@ class TensorStore:
         """Step 2 for one position of the final partial block: the caller bound entry e first (RingPool.bind). On
         "compute": a stream wait on the previous occupancy's D2H event (the second safeguard; prev_d2h from the bind),
         then the K, V (and bias) of A_r at (pos, h) into ring row e. Returns the copy's event (the entry's ready event:
-        the caller installs it with RingPool.set_ready)."""
+        the caller installs it with RingPool.set_ready). I11 (consumer mirrors attached): after the data copies and
+        BEFORE that event, crgen[l][e] = the entry's rgen from a staging hold (_gen_stage), on "compute"."""
         where = ("admission ring copy of owner %s layer %d head %d position %d entry %d"
                  % (getattr(adm, "owner", None), l, h, pos, e))
         self._open_admission(adm, where)
@@ -765,10 +909,16 @@ class TensorStore:
             self.be.memcpy(self.ring_v[l][e], adm.v[l][pos, h], PRODUCE)
             if self.ring_c is not None:
                 self.be.memcpy(self.ring_c[l][e:e + 1], adm.c[l][pos, h:h + 1], PRODUCE)
+            gh = None
+            if self.crgen is not None:              # I11: the entry's consumer generation, after its data, before ev
+                gh = self._gen_stage(l, "ring", [e], [self.rings[l].rgen[e]], PRODUCE)
             ev = self.be.event_rec(PRODUCE)
         adm.cev = ev
         adm.ring_copies += 1
         self.holds.read(adm.hold, PRODUCE, ev)
+        if gh is not None:
+            self.holds.read(gh, PRODUCE, ev)
+            self.holds.close(gh)
         self.stats["admission_ring"] += 1
         return ev
 
@@ -820,7 +970,9 @@ class TensorStore:
         native event of this backend, check_ready), then the copies. The sources are held (kind "ring"): the hold is
         opened after the checks and before the copies are enqueued, and released by poll() after the copy's event,
         which the stream order puts after `ready` (held until ready). Returns that event (RingPool.set_ready);
-        publish_ring_block waits it on "d2h", so the D2H of the entry is ordered after `ready` too."""
+        publish_ring_block waits it on "d2h", so the D2H of the entry is ordered after `ready` too. I11 (consumer
+        mirrors attached): after the data copies and BEFORE that event, crgen[l][e] = the entry's rgen from a staging
+        hold (_gen_stage), on "compute"."""
         own = self._owner(owner)
         where = "ring producer of owner %s layer %d entry %d" % (own, l, e)
         self._entry(l, e, where)
@@ -837,10 +989,16 @@ class TensorStore:
             self.be.memcpy(self.ring_v[l][e], v, PRODUCE)
             if self.ring_c is not None:
                 self.be.memcpy(self.ring_c[l][e:e + 1], c.reshape(1), PRODUCE)
+            gh = None
+            if self.crgen is not None:              # I11: the entry's consumer generation, after its data, before ev
+                gh = self._gen_stage(l, "ring", [e], [self.rings[l].rgen[e]], PRODUCE)
             ev = self.be.event_rec(PRODUCE)
         self.holds.read(hid, PRODUCE, ev)
         self.holds.read(hid, (READY, hid), ready)  # I9: recorded too (the copy event already implies it)
         self.holds.close(hid)
+        if gh is not None:
+            self.holds.read(gh, PRODUCE, ev)
+            self.holds.close(gh)
         self.stats["ring_produced"] += 1
         self.stats["ready_produced"] += ready is not None
         return ev
