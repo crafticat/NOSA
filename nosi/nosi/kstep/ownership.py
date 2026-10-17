@@ -924,6 +924,12 @@ CONSUME_CATS = ("consume_staging",)
 # HOOK-B2: peak is the store's.
 SOURCE_COUNTS = ("source_staging_bytes",)                  # HOOK-B2
 SOURCE_CATS = ("source_staging",)                          # HOOK-B2
+# HOOK-L6 (INTERFACE_BC5 I11; Config.store_gen "consumer" only; MemoryAccountant.enable_gen_mirror): the store's
+# consumer generation mirrors at allocated capacity (tensor_store store_bytes()["gen_mirror"], each storage once). The
+# host mirrors pgen_t / rgen_t stay in metadata (map_entries, ring_entries), so nothing is counted twice. The pending
+# generation staging is a store hold and is part of source_staging.
+GEN_COUNTS = ("gen_mirror_bytes",)                         # HOOK-L6
+GEN_CATS = ("gen_mirror",)                                 # HOOK-L6
 
 
 class MemoryAccountant:
@@ -986,6 +992,20 @@ class MemoryAccountant:
             self.peak[k] = 0                               # HOOK-B2
             self.sum[k] = 0                                # HOOK-B2
                                                            # HOOK-B2 (end)
+    gen = False                                            # HOOK-L6: True after enable_gen_mirror (store_gen "consumer")
+
+    def enable_gen_mirror(self) -> None:                   # HOOK-L6
+        """HOOK-L6 (I11; Config.store_gen "consumer"): adds the category gen_mirror (GEN_CATS), charged from the count
+        gen_mirror_bytes at each sample. Needs the source category (the store's mode). Only before the first sample."""
+        if self.n or self.gen or not self.source:
+            raise ConfigError("K6: the gen_mirror category is enabled once, after the source category and before the "
+                              "first sample")
+        self.gen = True
+        self.cats = self.cats + GEN_CATS
+        for k in GEN_CATS:
+            self.peak[k] = 0
+            self.sum[k] = 0
+
     def bytes_of(self, n: Dict[str, int]) -> Dict[str, int]:
         missing = [k for k in COUNTS + (ARENA_COUNTS if self.arena else ()) + (RING_COUNTS if self.ring else ())
                    + (BIAS_COUNTS if self.bias else ()) + (CONSUME_COUNTS if self.consume else ()) if k not in n]
@@ -1001,6 +1021,9 @@ class MemoryAccountant:
             raise KeyError("K6 sample lacks counts %s" % list(SOURCE_COUNTS))                       # HOOK-B2
         if not self.source and SOURCE_COUNTS[0] in n:                   # HOOK-B2
             raise KeyError("K6 sample has the store's count %s outside its mode" % list(SOURCE_COUNTS))   # HOOK-B2
+        if self.gen != (GEN_COUNTS[0] in n):                            # HOOK-L6: exactly in store_gen "consumer"
+            raise KeyError("K6 sample %s the count %s (gen_mirror category %s)"
+                           % ("lacks" if self.gen else "has", list(GEN_COUNTS), "on" if self.gen else "off"))
         u = self.u
         n_slots = n[FREE] + n[LRU] + n[PO] + n[VRES] + n[INFLIGHT] + n[RELEASING]
         b = dict(slots_free=n[FREE] * u["slot"], slots_lru=n[LRU] * u["slot"], slots_po=n[PO] * u["slot"],
@@ -1036,6 +1059,8 @@ class MemoryAccountant:
             b["consume_staging"] = int(n["consume_staging_bytes"])
         if self.source:                                    # HOOK-B2: the store's held source backings at the sample
             b["source_staging"] = int(n["source_staging_bytes"])   # HOOK-B2
+        if self.gen:                                       # HOOK-L6: the consumer mirrors at allocated capacity
+            b["gen_mirror"] = int(n["gen_mirror_bytes"])
         b["total"] = sum(b[k] for k in self.cats)
         return b
 

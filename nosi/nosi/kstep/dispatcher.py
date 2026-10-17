@@ -295,6 +295,8 @@ class Config:
     reader_frontier: str = "single"        # HOOK-C: "single" (one ordered reader stream, as before) | "joined" (frontier.py)
     store: str = "none"                    # HOOK-B2: "none" (the int64 stores, as before) | "tensor" (tensor_store.py)
     store_join: str = "join"               # HOOK-B2: the backend stream of the admission gate (store "tensor" only)
+    store_gen: str = "host"                # HOOK-L6 (I11): "host" (the consumer reads the pools' mirrors, as before) |
+                                           # "consumer" (the store's own consumer mirrors; store "tensor", arena, S0)
 
 
 class Draft:
@@ -542,6 +544,17 @@ class Dispatcher:
                                      ring=self.ring_mode, **(dict(consume=True) if self.consume else {}))
         if self.store is not None:                                     # HOOK-B2: + the K6 category source_staging
             self.acct.enable_sources()                                 # HOOK-B2: (the store's held source bytes)
+        if cfg.store_gen not in ("host", "consumer"):                  # HOOK-L6 (I11)
+            raise ConfigError("store_gen must be 'host' or 'consumer', not %r (I11)" % (cfg.store_gen,))
+        if cfg.store_gen == "consumer":                                # HOOK-L6 (I11): the store's consumer mirrors,
+            if self.store is None or not self.arena_mode or not getattr(self.tp, "accepts_gen_publisher", False):
+                raise ConfigError("store_gen 'consumer' needs store 'tensor', physical 'arena' and the S0 transport "
+                                  "(I11; store %r, physical %r, transport %s)"
+                                  % (cfg.store, cfg.physical, type(self.tp).__name__))
+            self.store.attach_gen_mirrors(self, self.tp)               # HOOK-L6: re-attaches the executor with them and
+            self.acct.enable_gen_mirror()                              # installs tp.gen_publisher; K6 gen_mirror
+        self.session = "open"                                          # HOOK-L7 (I12): "open" | "resetting" | "failed"
+        self.session_reason: Optional[str] = None                      # HOOK-L7: the failed phase and its error
         self.queue: List[Tuple] = []
         self.slot_req: List[Optional[Request]] = [None] * cfg.B
         self.reqs: Dict[Any, Request] = {}
@@ -589,6 +602,7 @@ class Dispatcher:
 
     # ================================================================== requests
     def submit(self, uid, prompt: List[int], max_new_tokens: int) -> None:
+        self._session_guard("submit")                                  # HOOK-L7 (I12): no admission unless "open"
         if uid in self.reqs or any(q[0] == uid for q in self.queue):
             raise ValueError("duplicate request uid %r" % (uid,))
         if len(prompt) < 1:
@@ -684,6 +698,7 @@ class Dispatcher:
         return self.results
 
     def step(self) -> None:
+        self._session_guard("step")                                    # HOOK-L7 (I12): no resume unless "open"
         t = self.t
         self._admit()
         if self.rev6:
@@ -3054,11 +3069,14 @@ class Dispatcher:
             counts["admission_pos"] = 0                                # HOOK-B2: second charge as admission_kv; its
             self.store.poll()                                         # HOOK-B2: held sources (passive release first;
             counts["source_staging_bytes"] = self.store.holds.held   # HOOK-B2: a SAMPLED value) as source_staging
+            if self.acct.gen:                                          # HOOK-L6 (I11): the consumer mirrors' bytes
+                counts["gen_mirror_bytes"] = int(self.store.store_bytes()["gen_mirror"])
         self.acct.sample(counts)
 
     def finish(self, order: Optional[Tuple[str, ...]] = None) -> None:
         """Drain every stream (deferred reads, scatters, history writes) and validate every deferred read. M2 B2: then
         every remaining D2H snapshot; every publication's snapshot must have been validated exactly once."""
+        self._session_guard("finish")                                  # HOOK-L7 (I12): no backend use unless "open"
         self.be.synchronize(order or self.cfg.drain_order)
         self._validate(all_=True)
         if self.store is not None:                                     # HOOK-B2: every stream ran: release the store's
@@ -3077,10 +3095,47 @@ class Dispatcher:
 
     # ================================================================== HOOK-L3: quiescent-reset hooks (lead; I8)
     # INTERFACE_BC3 I8 (frozen 2026-10-16). Only frontier.QuiescentReset (track C) calls them; nothing in the no-reset
-    # path does, so a run without a coordinator is unchanged. Not covered here: the executor's own events, and the
+    # path does, so a run without a coordinator is unchanged. The executor's own events are covered ONLY for an executor
+    # that declares the I10 contract in its own class (HOOK-L4: its audited reset_holders() list joins event_holders();
+    # an undeclared executor contributes nothing here, and the coordinator refuses it). Not covered: the
     # instrumentation logs (Arena / RingPool / Stream .log, the dispatcher's *_log lists), which keep event objects as
     # history and are never read for a decision. The frontier (reset_pending) and the store (drained_all) report their
     # own state.
+    # HOOK-L7 (INTERFACE_BC5 I12, lead, 2026-10-17): the session state. "open" (initial): submit, step and finish run.
+    # begin_reset() -> "resetting"; end_reset() -> "open"; fail_reset(phase, text) -> "failed", LATCHED (no method
+    # returns a failed session to "open"). Outside "open", submit / step / finish refuse before any change, so a failed
+    # reset cannot be resumed silently, admit a request or use the backend again through them. Only the coordinator
+    # calls these hooks; a run without a coordinator stays "open" and is unchanged.
+    def _session_guard(self, op: str) -> None:
+        """HOOK-L7 (I12), READ-ONLY: OwnershipViolation "session <state>: <op> refused (<reason>)" unless "open"."""
+        if self.session != "open":
+            raise OwnershipViolation("session %s: %s refused (%s)" % (self.session, op, self.session_reason))
+
+    def begin_reset(self) -> None:
+        """HOOK-L7 (I12): "open" -> "resetting" (the coordinator, after its read-only check passed)."""
+        if self.session != "open":
+            raise OwnershipViolation("session %s: begin_reset refused (%s)" % (self.session, self.session_reason))
+        self.session = "resetting"
+
+    def end_reset(self) -> None:
+        """HOOK-L7 (I12): "resetting" -> "open" (the coordinator, after every mutating phase passed)."""
+        if self.session != "resetting":
+            raise OwnershipViolation("session %s: end_reset refused (%s)" % (self.session, self.session_reason))
+        self.session = "open"
+
+    def fail_reset(self, phase: str, text: str) -> None:
+        """HOOK-L7 (I12): "resetting" -> "failed", LATCHED. session_reason = "<phase>: <text>" (at most 512
+        characters). A failed session stays failed: there is no transition back to "open"."""
+        if self.session != "resetting":
+            raise OwnershipViolation("session %s: fail_reset refused (%s)" % (self.session, self.session_reason))
+        self.session = "failed"
+        self.session_reason = ("%s: %s" % (phase, text))[:512]
+
+    def host_poll(self) -> None:
+        """HOOK-L7 (I12): exactly one passive host poll (the existing _poll), for the coordinator's explicit drain."""
+        self._session_guard("host_poll")
+        self._poll()
+
     def quiesce_state(self) -> Dict[str, int]:
         """HOOK-L3, READ-ONLY: every count that must be 0 before a quiescent reset (an OPEN dict; a caller requires every
         value 0 and names every nonzero key). The I8 counts: queued, active, inflight, validators, pending_release,
@@ -3181,7 +3236,7 @@ class Dispatcher:
         if miss:
             raise OwnershipViolation("I10: the executor %s declares reset_contract %r without the class methods %s"
                                      % (type(self.ex).__name__, RESET_CONTRACT, miss))
-        out = list(self.ex.reset_holders())
+        out = list(type(self.ex).reset_holders(self.ex))               # I12: through the class (no instance shadow)
         for cls, loc, ev in out:
             if not (isinstance(cls, str) and cls.startswith("executor:")):
                 raise OwnershipViolation("I10: the executor %s lists owner class %r (it must start with 'executor:')"
@@ -3209,7 +3264,7 @@ class Dispatcher:
         n_ex = 0
         if reset_contract_of(self.ex) == RESET_CONTRACT:              # HOOK-L4 (I10): the executor's own detach FIRST,
             listed = len([1 for _, _, ev in self._executor_holders() if ev is not None])   # before any dispatcher
-            n_ex = self.ex.detach_completed()                          # mutation; then it is VERIFIED: a count equal
+            n_ex = type(self.ex).detach_completed(self.ex)             # mutation; then it is VERIFIED: a count equal
             rest = [(c, loc) for c, loc, ev in self._executor_holders() if ev is not None]   # to what it listed and
             if isinstance(n_ex, bool) or not isinstance(n_ex, int) or n_ex != listed or rest:   # nothing left
                 raise OwnershipViolation("I10: the executor %s detach_completed returned %r for %d listed references "

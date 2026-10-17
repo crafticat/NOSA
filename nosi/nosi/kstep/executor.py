@@ -45,6 +45,13 @@ In addition to the arena protocol:
                           register_ring(l, row, h, pos, entry, rgen, kind, which, ws, pg) records ONE deferred ring read
                           (which "k" or "v"; ws the deferred copy of the entry's row; pg a one-element copy of
                           rgen[l][entry] made at the read's execution).
+  HOOK-L6 (INTERFACE_BC5 I11; Config.store_gen "consumer" only): the pgen[l] / rgen[l] that attach_arena / attach_ring
+                          receive are then the store's CONSUMER mirrors, not the pools' host mirrors (a later attach
+                          by TensorStore.attach_gen_mirrors replaces the earlier one). The store writes them only by
+                          backend copies, ordered before each binding's arrival (arena: the S0 issue's event) or ready
+                          event (ring). So an executor reads them only through its deferred copies (on its stream,
+                          after the data), never by a host read at call time; the generation it EXPECTS is the one in
+                          Row.addr / Row.ring (the host bind identity).
   Row.ring[h] = [(pos, entry, rgen, kind)] in position order for every NON-SLOT position the row attends at head h (tail
                           block, selected non-historical blocks, retained exact, own pre, predecessor prov, own draft).
   joint_post(l, rows) -> (outs, read_ev)
@@ -109,7 +116,10 @@ not audited) and provides:
                           with NO mutation while a listed event is not complete; else sets every listed reference to
                           None and returns the count.
 Dispatcher.event_holders appends reset_holders() of a declared executor; Dispatcher.detach_completed_events calls
-detach_completed() first after its pre-check. An executor without the declaration is refused by the coordinator.
+detach_completed() first after its pre-check (both through the class). An executor without the declaration is refused
+by the coordinator. The dispatcher VERIFIES a detach (its count and nothing left) before any dispatcher change; it does
+not undo the executor's own changes: a detach that fails its verification may already have changed the executor's own
+state (no transactional rollback; INTERFACE_BC5 I12, where such a failure latches the session "failed").
 """
 from __future__ import annotations
 
@@ -174,8 +184,10 @@ def reset_methods_missing(ex) -> List[str]:
     """I10: the contract methods (reset_holders, detach_completed) that the executor's classes do not provide as
     callables. As in Python's own attribute lookup, the FIRST class of type(ex).__mro__ that defines the name in its
     __dict__ decides (a subclass that shadows a base method with a non-callable is missing it). A method that only an
-    attribute-forwarding __getattr__ (or an instance attribute) would supply does not count: the dispatcher and the
-    coordinator call only methods of the executor's own classes."""
+    attribute-forwarding __getattr__ (or an instance attribute) would supply does not count. The one caller, the
+    dispatcher (HOOK-L4), calls the methods THROUGH THE CLASS (type(ex).reset_holders(ex), type(ex).detach_completed(ex);
+    INTERFACE_BC5 I12, 2026-10-17), so an instance attribute of the same name is never called; the coordinator calls
+    them only through those dispatcher hooks."""
     out = []
     for m in ("reset_holders", "detach_completed"):
         owner = next((k for k in type(ex).__mro__ if m in vars(k)), None)

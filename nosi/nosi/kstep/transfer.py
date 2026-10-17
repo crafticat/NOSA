@@ -50,6 +50,13 @@ arena only; host_c / arena_c given together, carries_bias = True). The per-posit
   AdversarialTransport: the payload read at issue holds the bias rows (ledger kind adv_payload, held until _land drops
   the payload), and _land writes K, V and bias together before the transfer counts as delivered. Transfer.expect's
   bias rows are a diagnostic readback copy (checked mode), not an operational backing.
+
+HOOK-L6 (INTERFACE_BC5 I11, lead, 2026-10-17; Config.store_gen "consumer" only): S0Transport.gen_publisher (None by
+default: every path unchanged). TensorStore.attach_gen_mirrors installs it. _issue_pool calls
+ev = gen_publisher(layer, order, "scatter") after Pipe.layer and _issue_bias: the store writes each transfer's
+generation (phys, pgen) into its consumer mirror on "scatter" (which already waited every destination's previous
+reader, T3) and records ev after those writes; every transfer of the issue then completes on ev. AdversarialTransport
+has no gen_publisher; the dispatcher refuses store_gen "consumer" with it.
 """
 from __future__ import annotations
 
@@ -96,6 +103,7 @@ class Transfer:
 
 class S0Transport:
     name = "s0"
+    accepts_gen_publisher = True                  # HOOK-L6 (I11): Config.store_gen "consumer" may install gen_publisher
 
     def __init__(self, core, be, host_k, host_v, slots_k, slots_v, bs: int, D: int, H: int, B: int, n_pos: int,
                  S_host: int, cap_groups: int = 4, ring: int = 2, dtype=torch.int64, arena_k=None, arena_v=None,
@@ -112,6 +120,7 @@ class S0Transport:
         self.host_c, self.arena_c = host_c, arena_c                 # C1.1: (B, S_host, H) and (P * bs,) per layer
         self.bias_ledger = bias_ledger                              # C1.1: owns each issue's bias stage / landing
         self.carries_bias = arena_c is not None
+        self.gen_publisher = None                 # HOOK-L6 (I11): set by TensorStore.attach_gen_mirrors (arena only)
         self.bias_readbacks = 0                   # C1.1: readbacks that compared the bias rows too
         self.bias_groups = 0                      # C1.1: groups whose bias rows joined their issue's frontier
         self._check_construction_dtypes(dtype)    # HOOK-B3: every store against dtype, BEFORE any staging or Pipe
@@ -243,6 +252,10 @@ class S0Transport:
             raise OwnershipViolation("S0 pool descriptor: %d of %d groups of layer %d were scattered" % (n, len(order), layer))
         if self.arena_c is not None:
             self._issue_bias(layer, desc, order)  # C1.1 A5: the issue's completion frontier moves past the bias rows
+        if self.gen_publisher is not None:        # HOOK-L6 (I11): the consumer generation mirrors of this issue, on
+            ev = self.gen_publisher(layer, order, "scatter")   # "scatter" after every reader wait (issue) and the data
+            for tr in order:                      # scatter: every transfer of the issue completes on that event, so
+                tr.ev = ev                        # arrival (done) covers mirror visibility
         self.n_layers_issued += 1
         self.chunks += len(recs)
         self.pool_checks += len(order)
