@@ -156,11 +156,20 @@ model only.
        "before_reset"  this module's before_reset() (the identity caches; it checks again);
        "clear_caches"  store.clear_caches() (when Dispatcher.store exists);
        "backend_reset" backend_reset() (the point where pooled events may be re-recorded).
-       ANY exception in a phase calls fail_reset(phase, "<type>: <text>") and raises OwnershipViolation "quiescent
-       reset failed in phase <phase>: <type>: <text> (the session is latched failed: no resume, no admission, no
-       reset retry)" from it. The session is then "failed": no later submit, step, finish, host_poll or reset runs,
-       and the backend is not used again through them. (An exception that is not an Exception, such as
-       KeyboardInterrupt, also latches the session, and is raised again unchanged.)
+       reset() runs PHASES in order, one method each (_run_<phase>), and each method looks its target up when it runs
+       (a missing frontier.before_reset or store.clear_caches is a fault of that phase). ANY exception in a phase
+       calls fail_reset(phase, "<type>: <text>") and raises OwnershipViolation "quiescent reset failed in phase
+       <phase>: <type>: <text> (the session is latched failed: no resume, no admission, no reset retry)" from it.
+       <text> is str() of the exception, else repr(), else "<unprintable <type>>". The session is then "failed": no
+       later submit, step, finish, host_poll, detach_completed_events or reset runs, and the backend is not used again
+       through them. (An exception that is not an Exception, such as KeyboardInterrupt, also latches the session, and
+       is raised again unchanged.) After each phase that returns, the session must still be "resetting"; else the
+       phase is a fault with the text "OwnershipViolation: the phase left the session <state> (expected
+       'resetting')". Latching follows the state that the phase left: "resetting" -> fail_reset; "open" ->
+       begin_reset, then fail_reset; "failed" -> nothing is called (already latched; its reason is kept); any other
+       state, or a hook that raises while latching -> the session is NOT latched, and the bracket says so instead:
+       "(the session could NOT be latched failed: [<hook error>; ]the session is <state>)". If begin_reset itself
+       leaves the session other than "resetting", reset() refuses before any mutating phase.
        A phase failure is NOT a no-change refusal and NOT a rollback: the phases before it, and the failing phase up
        to its fault, have already changed state. In "detach" the executor's own detach may already have changed the
        executor's state when the hook's verification refuses it (the dispatcher is unchanged at that point); after a
@@ -852,10 +861,11 @@ class QuiescentReset:
     resets), detached (references the hook set to None, the executor's included)."""
 
     HOOKS = ("quiesce_state", "event_holders", "detach_completed_events")
-    SESSION_API = ("session", "begin_reset", "end_reset", "fail_reset", "host_poll")   # HOOK-L7 (I12)
+    SESSION_ATTRS = ("session", "session_reason")                                      # HOOK-L7 (I12): attributes
+    SESSION_API = SESSION_ATTRS + ("begin_reset", "end_reset", "fail_reset", "host_poll", "finish")   # and methods
     TABLE_PARTS = ("components", "handles", "joins")
-    PHASES = ("detach", "post_check", "before_reset", "clear_caches", "backend_reset")  # I12 (3), in this order
-    FAILED = "failed"
+    PHASES = ("detach", "post_check", "before_reset", "clear_caches", "backend_reset")  # I12 (3): reset() runs these
+    OPEN, RESETTING, FAILED = "open", "resetting", "failed"                              # in this order (_run_<phase>)
     LATCHED = "the session is latched failed: no resume, no admission, no reset retry"
 
     def __init__(self, disp, backend_reset: Callable[[], Any]):
@@ -864,7 +874,7 @@ class QuiescentReset:
         from .executor import RESET_CONTRACT, reset_contract_of, reset_methods_missing
         missing = [h for h in self.HOOKS if not callable(getattr(disp, h, None))]
         session = [h for h in self.SESSION_API
-                   if not (hasattr(disp, h) if h == "session" else callable(getattr(disp, h, None)))]
+                   if not (hasattr(disp, h) if h in self.SESSION_ATTRS else callable(getattr(disp, h, None)))]
         faults, tags = [], set()
         if missing:
             faults.append("the dispatcher lacks the HOOK-L3 methods %s" % (missing,))
@@ -939,28 +949,83 @@ class QuiescentReset:
             raise OwnershipViolation("quiescent reset refused: the session is latched failed (%s)"
                                      % (self.d.session_reason,))
 
-    def _phase(self, phase: str, fn: Callable[[], Any]) -> Any:
-        """I12 (3): one named mutating phase. Any exception latches the session (fail_reset(phase, "<type>: <text>"))
-        and is raised again as the named OwnershipViolation (from it); a BaseException that is not an Exception (for
-        example KeyboardInterrupt) latches the session too and is raised again unchanged."""
+    @staticmethod
+    def _text(e: BaseException) -> str:
+        """"<type>: <text>" of an exception. str(e) can raise; then repr(e); then a fixed placeholder."""
         try:
-            return fn()
+            msg = str(e)
+        except Exception:
+            try:
+                msg = repr(e)
+            except Exception:
+                msg = "<unprintable %s>" % type(e).__name__
+        return "%s: %s" % (type(e).__name__, msg)
+
+    def _latch(self, phase: str, text: str) -> Optional[str]:
+        """Latches the session "failed" for `phase` through the lead's hooks, as far as its state allows:
+          "resetting"  fail_reset(phase, text) (the normal case);
+          "open"       (a phase reopened it) begin_reset, then fail_reset(phase, text);
+          "failed"     already latched: nothing is called and its reason is kept;
+          other        nothing is called.
+        Returns None when the session is "failed" afterwards, else why it is not (an Exception that a hook raised here
+        is caught and named; the session's state is named)."""
+        d = self.d
+        try:
+            if d.session == self.OPEN:
+                d.begin_reset()
+            if d.session == self.RESETTING:
+                d.fail_reset(phase, text)
+        except Exception as e:
+            return "%s; the session is %r" % (self._text(e), d.session)
+        return None if d.session == self.FAILED else "the session is %r" % (d.session,)
+
+    def _failure(self, phase: str, text: str, why: Optional[str]) -> str:
+        tail = self.LATCHED if why is None else "the session could NOT be latched failed: %s" % why
+        return "quiescent reset failed in phase %s: %s (%s)" % (phase, text, tail)
+
+    def _phase(self, phase: str, fn: Callable[[], Any]) -> Any:
+        """I12 (3): one named mutating phase. fn does every attribute lookup itself, so a missing attribute is a fault
+        of the phase. Any exception latches the session (_latch(phase, "<type>: <text>")) and is raised again as the
+        named OwnershipViolation (from it); a BaseException that is not an Exception (for example KeyboardInterrupt)
+        latches the session too and is raised again unchanged. A phase that returns but leaves the session other than
+        "resetting" is a fault too: the session is latched as far as its state allows (_latch), and OwnershipViolation
+        "quiescent reset failed in phase <phase>: OwnershipViolation: the phase left the session <state> (expected
+        'resetting') (...)" is raised. The text in brackets says whether the session is latched."""
+        try:
+            out = fn()
         except BaseException as e:
-            text = "%s: %s" % (type(e).__name__, e)
-            self.d.fail_reset(phase, text)
+            text = self._text(e)
+            why = self._latch(phase, text)
             if not isinstance(e, Exception):
                 raise
-            raise OwnershipViolation("quiescent reset failed in phase %s: %s (%s)" % (phase, text, self.LATCHED)) from e
+            raise OwnershipViolation(self._failure(phase, text, why)) from e
+        if self.d.session != self.RESETTING:
+            text = "OwnershipViolation: the phase left the session %r (expected %r)" % (self.d.session, self.RESETTING)
+            raise OwnershipViolation(self._failure(phase, text, self._latch(phase, text)))
+        return out
 
-    def _post_check(self) -> None:
+    # I12 (3): the mutating phases, one method each, in the order of PHASES. Each one looks its target up when it runs.
+    def _run_detach(self) -> int:
+        return self.d.detach_completed_events()
+
+    def _run_post_check(self) -> None:
         left = [(cls, loc) for cls, loc, _ in self.d.event_holders()]
         if left:                                                       # I10: complete references detach BEFORE reuse
             raise OwnershipViolation("quiescent reset: the detach left %d event references: %s; backend_reset did not "
                                      "run (I10)" % (len(left), left[:6]))
 
-    @staticmethod
-    def _nothing() -> None:
-        return None
+    def _run_before_reset(self) -> None:
+        fo = getattr(self.d, "frontier", None)
+        if fo is not None:
+            fo.before_reset()
+
+    def _run_clear_caches(self) -> None:
+        store = getattr(self.d, "store", None)
+        if store is not None:
+            store.clear_caches()
+
+    def _run_backend_reset(self) -> None:
+        self.backend_reset()
 
     def reset(self) -> None:
         """I12 (section 8): (0) a latched failed session refuses at once, with no hook, store or backend call; (1)
@@ -968,8 +1033,11 @@ class QuiescentReset:
         nothing (the session stays "open"; so does an exception that the check itself raises); (2) begin_reset; (3) the
         named mutating phases detach (the executor's own detach first, verified by the hook, HOOK-L4), post_check (no
         event_holders() entry left), before_reset (the frontier's identity caches), clear_caches (the store's),
-        backend_reset; (4) end_reset and the counts. A failure in a phase latches the session "failed" (fail_reset)
-        and raises "quiescent reset failed in phase <phase>: ...". It is NOT a no-change refusal and NOT a rollback:
+        backend_reset, run from PHASES (_phase: every lookup inside the phase; the session must still be "resetting"
+        after each one); (4) end_reset and the counts. A failure in a phase latches the session "failed" (_latch, as
+        far as the session's state allows; section 8) and raises "quiescent reset failed in phase <phase>: ...". If
+        begin_reset leaves the session other than "resetting", reset() refuses before any phase. A phase failure is
+        NOT a no-change refusal and NOT a rollback:
         the earlier phases (and the failing one up to its fault) already changed state; a detach that fails the hook's
         verification may already have changed the executor's own state (the dispatcher is unchanged then); after a
         later fault the complete references are already set to None. Only the coordinator's counts stay unchanged."""
@@ -979,16 +1047,13 @@ class QuiescentReset:
             raise OwnershipViolation("quiescent reset refused: %s" % "; ".join(p["items"]))
         d = self.d
         d.begin_reset()                                                # (2) "open" -> "resetting"
-        n = self._phase("detach", d.detach_completed_events)           # (3) the mutating phases, in order
-        self._phase("post_check", self._post_check)
-        fo = getattr(d, "frontier", None)
-        self._phase("before_reset", fo.before_reset if fo is not None else self._nothing)
-        store = getattr(d, "store", None)
-        self._phase("clear_caches", store.clear_caches if store is not None else self._nothing)
-        self._phase("backend_reset", self.backend_reset)
+        if d.session != self.RESETTING:                                # a hook defect; no mutating phase has run
+            raise OwnershipViolation("quiescent reset refused: begin_reset left the session %r (expected %r); no "
+                                     "mutating phase ran" % (d.session, self.RESETTING))
+        out = {phase: self._phase(phase, getattr(self, "_run_" + phase)) for phase in self.PHASES}   # (3), in order
         d.end_reset()                                                  # (4) "resetting" -> "open", then the counts
         self.resets += 1
-        self.detached += n
+        self.detached += out["detach"]
 
     def session_end(self) -> None:
         """I12: the explicit session-end sequence: Dispatcher.finish (drain every stream, validate every read), then ONE
