@@ -109,13 +109,16 @@ the default "none" path is unchanged; sites named by function, as line numbers s
                   prefill_tensors(kv) -> per-layer (k, v, c) tensors of the last prefill; payload(kvv, at=None) -> the
                   tensors of one eager item (at = (uid, layer, head, kind, position) for a producer, None for an
                   expectation); values(k, v, c) -> the eager items of rows read from the stores; optional
-                  store_device (default "cpu").
+                  store_device (default "cpu"); optional attach_store(store) on the class (I18, milestone 8).
   executor ordering (lead decision; CUDA later) fresh_outputs = True states that the prefill and payload tensors are
                   fresh storage that the executor does not reuse while store.holds.holds_storage(t) is True. An
                   executor that writes them on its own stream hands the store a ready event of that write through
                   the I9 opt-in below. With the I16 handback on, an executor that takes handbacks (the lead's I17
                   forwarding) may overwrite a source storage earlier: when source_reusable(hb) is True for every
-                  handback that names it ("workspace handback" below). The attach check of fresh_outputs is unchanged.
+                  handback that names it ("workspace handback" below). The attach check of fresh_outputs is unchanged
+                  for every executor except one case (I18, milestone 8): with Config.store_handback True, an executor
+                  whose OWN class body declares accepts_handback = True may declare fresh_outputs = False (a
+                  producer-workspace executor; "producer workspace" below).
   producer readiness (milestone 4, INTERFACE_BC4 I9) the executor's CLASS declares producer_ready = True
                   (producer_ready_of; attach_dispatcher sets store.producer_ready). Then prefill_tensors(kv) and a
                   producer payload(kvv, at=...) return (k, v, c, ready); payload(kvv) with at None (an expectation)
@@ -220,6 +223,13 @@ the default "none" path is unchanged; sites named by function, as line numbers s
                   overwrite: SourceHolds keeps a source referenced and charged until poll() releases it, and
                   source_reusable can be True before that poll. publish_block (not wired) records no handback. The
                   I11 generation staging is the store's own storage and is never a handback source.
+  producer workspace (milestone 8, INTERFACE_BC8 I18; producer_workspace.ProducerWorkspace, which owns the bound and
+                  the overwrite rule). The store adds two things and no ledger: source_ops(sid), READ-ONLY, (the open
+                  holds that name the storage, the recorded handbacks not yet taken that name it), so a workspace sees
+                  EVERY operation that reads a storage and has no delivered handback yet (also between the lead's
+                  forwarding points); and attach_store, an opt-in call of attach_executor for an executor whose class
+                  defines it. attach_dispatcher also accepts fresh_outputs = False for such an executor when it takes
+                  handbacks ("executor ordering" above).
   open items      eager / eager_matched in the store's mode; a CUDA executor's ready events (only the event type is
                   checked there: a torch.cuda.Event does not show its stream); device placement of the consumer mirrors
                   other than the CPU model; a CUDA overlap of a handback reuse (not claimed).
@@ -732,7 +742,9 @@ class TensorStore:
     def attach_executor(self, ex: Any, register: Any, register_ring: Any = None) -> None:
         """The executor's attach calls, as Dispatcher.__init__ makes them (attach_arena, attach_ring, attach_bias). The
         generation lists are the store's consumer mirrors once attach_gen_mirrors ran (I11), else the pools' host
-        mirrors pgen_t / rgen_t."""
+        mirrors pgen_t / rgen_t. I18 (milestone 8): an executor whose CLASS defines a callable attach_store (read on
+        the class, never through an instance __getattr__) also gets attach_store(store) last (a producer workspace
+        needs the store's read-only source_ops). Every other executor gets exactly the calls above."""
         pg = self.cpgen if self.cpgen is not None else [a.pgen_t for a in self.arenas]
         ex.attach_arena(self.be, self.arena_k, self.arena_v, pg, register)
         if self.rings is not None:
@@ -740,6 +752,9 @@ class TensorStore:
             ex.attach_ring(self.be, self.ring_k, self.ring_v, rg, register_ring)
         if self.bias_dtype is not None:
             ex.attach_bias(self.be, self.arena_c, self.ring_c)
+        att = getattr(type(ex), "attach_store", None)
+        if callable(att):                             # I18: opt-in by the executor's class
+            att(ex, self)
 
     def store_bytes(self) -> Dict[str, int]:
         """The ACTUAL persistent store bytes at allocated capacity: per group, untyped_storage().nbytes() of each
@@ -931,6 +946,17 @@ class TensorStore:
         if not isinstance(hb, Handback):
             raise KStepError("tensor store: I16: source_reusable of a %s, not a Handback" % (type(hb).__name__,))
         return hb.issued is True and hb.reuse_ev is not None and bool(ev_done(hb.reuse_ev))
+
+    def source_ops(self, sid: Any) -> Tuple[int, int]:
+        """I18 (milestone 8), READ-ONLY: the store operations that read the storage with id sid (storage_id) and have
+        no handback that the store already handed over. Returns (open, untaken): open = the OPEN holds that name sid
+        (SourceHolds' own record: an operation that did not end yet, or a faulted one that keeps its hold open);
+        untaken = the recorded handbacks that name sid and that take_handbacks did not return yet. (0, 0) when the
+        store has no record of sid. It reads the store's own records only (no second ledger), never waits, never
+        polls and changes nothing. A producer workspace (producer_workspace.py) reuses a storage only at (0, 0)."""
+        rec = self.holds.recs.get(sid)
+        n_open = rec["open"] if rec is not None else 0
+        return n_open, sum(1 for hb in self._handbacks if sid in hb.sources)
 
     # -- admission (11.2)
     def _admit_checks(self, b: int, k: Any, v: Any, c: Any, where: str) -> Tuple[List[Any], List[Any], Any, int]:
@@ -1608,8 +1634,11 @@ def attach_dispatcher(d: Any, cfg: Any, ex: Any, be: Any) -> TensorStore:
     attaches the executor to them (the same calls as Dispatcher.__init__, the same callbacks). ConfigError when:
     the mode is unknown; the dispatcher is not physical "arena", recent "ring" and ABI v4; the executor does not declare
     tensor_payload = True with prefill_tensors, payload, values and the torch dtypes kv_dtype / bias_dtype; the
-    executor does not declare fresh_outputs = True (lead decision; module docstring, executor ordering); the backend
-    has no stream Config.store_join (adm.gate). The transport is checked after make_transport (check_transport).
+    executor does not declare fresh_outputs = True (lead decision; module docstring, executor ordering), unless (I18,
+    milestone 8) Config.store_handback is True and the executor's OWN class body declares accepts_handback = True (a
+    producer-workspace executor that overwrites a source only under the handback rule; the refusal text of every other
+    executor is unchanged); the backend has no stream Config.store_join (adm.gate). The transport is checked after
+    make_transport (check_transport).
     I9: store.producer_ready = producer_ready_of(ex) (the executor's class declares producer_ready = True).
     Returns the store (Dispatcher.store)."""
     if cfg.store not in STORE_MODES:
@@ -1623,7 +1652,9 @@ def attach_dispatcher(d: Any, cfg: Any, ex: Any, be: Any) -> TensorStore:
         raise ConfigError("tensor store: Config.store 'tensor' needs an executor with tensor_payload = True, %s and "
                           "the torch dtypes kv_dtype / bias_dtype (executor %s; missing %s)"
                           % (" / ".join(ADAPTER_METHODS), type(ex).__name__, miss))
-    if getattr(ex, "fresh_outputs", False) is not True:
+    takes_handbacks = (getattr(cfg, "store_handback", False) is True
+                       and vars(type(ex)).get("accepts_handback", False) is True)   # I18: a reusing executor
+    if getattr(ex, "fresh_outputs", False) is not True and not takes_handbacks:
         raise ConfigError("tensor store: Config.store 'tensor' needs an executor that declares fresh_outputs = True: "
                           "its prefill and payload tensors are fresh storage that it does not reuse while "
                           "store.holds.holds_storage(t) is True (executor %s)" % (type(ex).__name__,))
