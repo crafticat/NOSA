@@ -964,31 +964,41 @@ class QuiescentReset:
 
     @staticmethod
     def _text(e: BaseException) -> str:
-        """"<type>: <text>" of an exception. str(e) can raise; then repr(e); then a fixed placeholder."""
+        """"<type>: <text>" of an exception. str(e) can raise (any BaseException, also KeyboardInterrupt from a
+        __str__); then repr(e), which can raise too; then the fixed placeholder "<unprintable <type>>". A BaseException
+        raised by str() or repr() here is NOT propagated: the failure path goes on with the placeholder."""
         try:
             msg = str(e)
-        except Exception:
+        except BaseException:
             try:
                 msg = repr(e)
-            except Exception:
+            except BaseException:
                 msg = "<unprintable %s>" % type(e).__name__
         return "%s: %s" % (type(e).__name__, msg)
 
     def _latch(self, phase: str, text: str) -> Optional[str]:
         """Latches the session "failed" for `phase` through the lead's hooks, as far as its state allows:
-          "resetting"  fail_reset(phase, text) (the normal case);
-          "open"       (a phase reopened it) begin_reset, then fail_reset(phase, text);
+          "resetting"  fail_reset(phase, text) (a mutating phase of reset(): the normal case);
+          "open"       begin_reset, then fail_reset(phase, text) (a drain phase of session_end: the normal case; or a
+                       mutating phase that reopened the session);
           "failed"     already latched: nothing is called and its reason is kept;
           other        nothing is called.
         Returns None when the session is "failed" afterwards, else why it is not (an Exception that a hook raised here
-        is caught and named; the session's state is named)."""
+        is caught and named; the session's state is named).
+        NOT COVERED: a BaseException that is not an Exception (for example KeyboardInterrupt) raised by begin_reset or
+        fail_reset THEMSELVES while they latch. It is not caught here: it propagates unchanged out of the failing
+        phase (with the phase's own exception as its __context__), no later phase runs, and the session can stay
+        unlatched: "open" (begin_reset did not finish; then the lead's guards still allow submit, step, finish and
+        host_poll) or "resetting" (fail_reset did not finish; then those guards refuse, and so does begin_reset, so
+        reset() and session_end() refuse too). A BaseException from str() / repr() of the phase's exception is
+        covered (_text)."""
         d = self.d
         try:
             if d.session == self.OPEN:
                 d.begin_reset()
             if d.session == self.RESETTING:
                 d.fail_reset(phase, text)
-        except Exception as e:
+        except Exception as e:                         # a BaseException that is not an Exception propagates (above)
             return "%s; the session is %r" % (self._text(e), d.session)
         return None if d.session == self.FAILED else "the session is %r" % (d.session,)
 
