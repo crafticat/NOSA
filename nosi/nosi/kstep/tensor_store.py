@@ -67,11 +67,13 @@ the default "none" path is unchanged; sites named by function, as line numbers s
                   ring K, V and bias (bias_dtype too); the executor is attached to it again; Dispatcher.store (None in
                   the default path). Then check_transport (right after make_transport) and the K6 category
                   source_staging (ownership.MemoryAccountant.enable_sources).
-  admission       Dispatcher._admit_recent -> dispatch_admit: A_r = ex.prefill_tensors(kv) via admit; complete blocks by
+  admission       (without producer_ready; with it, see "prepare")
+                  Dispatcher._admit_recent -> dispatch_admit: A_r = ex.prefill_tensors(kv) via admit; complete blocks by
                   _history -> _d2h_block -> dispatch_d2h_block -> admission_d2h; the partial block by the existing bind
                   (_produce) -> dispatch_produce -> admission_ring; the dispatcher's A record (no tensors) keeps ready /
                   cev / dev, is appended to d.adm and stays there until _ring_retire; then close_admission.
-  producers       Dispatcher._produce, after the bind and the map insert -> dispatch_produce -> produce_ring with the
+  producers       (without producer_ready; with it, see "prepare")
+                  Dispatcher._produce, after the bind and the map insert -> dispatch_produce -> produce_ring with the
                   executor's tensors (ex.payload(kvv, at=...)) or admission_ring; set_ready of the returned event.
   publication     Dispatcher._d2h_block -> dispatch_d2h_block: publish_ring_block (decode blocks) or admission_d2h
                   (prompt blocks); hist_ev, snapshot, hown, note_d2h and counters as before. In the store's mode recent
@@ -136,11 +138,14 @@ the default "none" path is unchanged; sites named by function, as line numbers s
                   without producer_ready (no executor call) and for an AdmissionSource producer; else a Prepared
                   (.kv for the admission). dispatch_admit / dispatch_produce(..., prepared=P) commit it with no second
                   executor call; with producer_ready and no P they are refused by name (OwnershipViolation "tensor
-                  store: I9.2: ..."). Scope (I9.2): a refused prefill result leaves the dispatcher as it was (the
-                  request is still queued); a refused payload leaves the producer's own bind transaction undone (no
-                  _ring_take, bind, map insert or store change), while the writes that the dispatcher made earlier
-                  in the same call (r.draft_kv, r.dchain; in the verifier's pre-pass c.ws) stay, and the refusal
-                  aborts the run.
+                  store: I9.2: ..."). Scope (I9.2 / I9.2a): a refused prefill result leaves the dispatcher as it was
+                  (the request is still queued). For a refused payload, the refused producer's own bind transaction
+                  is not started (no _ring_take, bind, map insert or store change). Nothing is rolled back: every
+                  EARLIER producer of the same call that already committed stays committed (its ring entry, map
+                  insert, store hold and copies; for example head h-1 of the same draft row, or the earlier
+                  (position, head) PRE producers of the same cohort), and the writes that the dispatcher made earlier
+                  in the same call (r.draft_kv, r.dchain; in the verifier's pre-pass c.ws) stay. The refusal aborts
+                  the run.
   hold provider   I5: hold_source() = ("tensor_store", holds.outstanding_count); Track C registers it
                   (FinishedCohorts.add_source; duck-typed: Dispatcher.store.holds.outstanding_count) when the store's
                   mode and "joined" are both on. The dispatcher attribute is exactly `store` (None in the default path).
@@ -582,8 +587,10 @@ class TensorStore:
         (native_event_types: the exact type; a subclass, a wrapper or a Python object that stands for several events is
         refused). A CpuBackend event shows the stream that recorded it: that stream must be one of this backend's
         streams (the same object), else the event belongs to another backend. A torch.cuda.Event does not show its
-        stream; only its type is checked. KStepError "tensor store: I9: ready ... (<where>)". Changes nothing.
-        Returns ready."""
+        stream; only its type is checked. KStepError "tensor store: I9: ready ... (<where>)". For a backend whose native
+        event type is unknown (neither cpupack_core backend, for example a duck-typed wrapper), a non-None ready gets
+        native_event_types' ConfigError "tensor store: I9: backend <name> has no known native event type (...)".
+        Changes nothing. Returns ready."""
         if ready is None:
             return None
         types = native_event_types(self.be)
@@ -1085,7 +1092,7 @@ class TensorStore:
             raise OwnershipViolation("tensor store: I9.2: dispatch_admit of owner %s b %d without a prepared result (a "
                                      "producer_ready executor is called only by prepare_admit, before any dispatcher "
                                      "mutation)" % ((r.uid, r.inc), r.b))
-        r.rmap =[[{kind: {} for kind in RING_KINDS} for _ in range(H)] for _ in range(L)]
+        r.rmap = [[{kind: {} for kind in RING_KINDS} for _ in range(H)] for _ in range(L)]
         rec = dict(step=d.t, uid=r.uid, b=r.b, P0=r.P0, n=n0, items=n0 * H * L,
                    live_start=[rp.n_live for rp in d.rings])
         d.adm_log.append(rec)
@@ -1126,9 +1133,11 @@ class TensorStore:
         I9 (milestone 4; producer_ready): the executor's checked payload (k, v, c, ready) comes from prepare_produce;
         produce_ring(..., ready=ready). Without producer_ready the call is exactly that of milestone 2 (ready None).
         I9.1 (HOOK-L5): `prepared` is prepare_produce's result, made BEFORE the dispatcher's _ring_take, bind and map
-        insert, so a refused producer result leaves the producer's own bind transaction undone (no _ring_take, bind,
-        map insert or store change; I9.2: the writes that the dispatcher made earlier in the same call, r.draft_kv,
-        r.dchain and in the verifier's pre-pass c.ws, stay, and the refusal aborts the run). It is committed here with
+        insert, so for a refused producer result the producer's own bind transaction is not started (no _ring_take,
+        bind, map insert or store change). Nothing is rolled back (I9.2 / I9.2a): every EARLIER producer of the same
+        call that already committed stays committed (its ring entry, map insert, store hold and copies), the writes
+        that the dispatcher made earlier in the same call (r.draft_kv, r.dchain; in the verifier's pre-pass c.ws)
+        stay, and the refusal aborts the run. It is committed here with
         NO second executor call (its who must be (uid, layer, head, kind, position) of this producer, else
         OwnershipViolation "tensor store: I9.1: ..."). I9.2: with producer_ready and no prepared result (and not an
         AdmissionSource) the call is refused by name (OwnershipViolation "tensor store: I9.2: dispatch_produce of
@@ -1243,11 +1252,11 @@ class AdmissionSource:
 
 class Prepared:
     """I9.1: the checked result of ONE producer call of a producer_ready executor, made by prepare_admit or
-    prepare_produce before any dispatcher or store mutation, and committed by dispatch_admit or dispatch_produce (no
-    second executor call). kv: the admission's eager prefill output (ex.prefill(prompt[:-1])), None for a ring
-    producer; k, v, c: the executor's tensors (per-layer lists for an admission); ready: None or the checked native
-    event; who: (uid, inc, b) of an admission or (uid, layer, head, kind, position) of a ring producer; where: the
-    refusal context."""
+    prepare_produce before the dispatcher's own mutation of that producer (I9.2 scope: module docstring, "prepare"),
+    and committed by dispatch_admit or dispatch_produce (no second executor call). kv: the admission's eager prefill
+    output (ex.prefill(prompt[:-1])), None for a ring producer; k, v, c: the executor's tensors (per-layer lists for
+    an admission); ready: None or the checked native event; who: (uid, inc, b) of an admission or (uid, layer, head,
+    kind, position) of a ring producer; where: the refusal context."""
     __slots__ = ("kv", "k", "v", "c", "ready", "who", "where")
 
     def __init__(self, kv: Any, k: Any, v: Any, c: Any, ready: Any, who: Tuple, where: str):
