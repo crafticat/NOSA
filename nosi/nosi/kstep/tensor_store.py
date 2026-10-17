@@ -139,7 +139,8 @@ the default "none" path is unchanged; sites named by function, as line numbers s
                   (.kv for the admission). dispatch_admit / dispatch_produce(..., prepared=P) commit it with no second
                   executor call; with producer_ready and no P they are refused by name (OwnershipViolation "tensor
                   store: I9.2: ..."). Scope (I9.2 / I9.2a): a refused prefill result leaves the dispatcher as it was
-                  (the request is still queued). For a refused payload, the refused producer's own bind transaction
+                  before this admission (the request is still queued; an earlier admission of the same _admit loop
+                  stays committed). For a refused payload, the refused producer's own bind transaction
                   is not started (no _ring_take, bind, map insert or store change). Nothing is rolled back: every
                   EARLIER producer of the same call that already committed stays committed (its ring entry, map
                   insert, store hold and copies; for example head h-1 of the same draft row, or the earlier
@@ -1082,7 +1083,7 @@ class TensorStore:
         bs, L, H = d.bs, d.L, d.H
         n0 = r.n
         ready = None
-        if prepared is not None:                         # I9.1: checked before any dispatcher mutation (prepare_admit)
+        if prepared is not None:                         # I9.1: checked before this admission's mutations
             self._check_prepared(prepared, (r.uid, r.inc, r.b), "admission")
             if prepared.kv is not kv:
                 raise OwnershipViolation("tensor store: I9.1: the prepared admission of %s is committed with another "
