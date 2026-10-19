@@ -142,6 +142,9 @@ class CacheSnapshot:
     """Preallocated once per document and reused, so a restore is a fixed set of
     copy_ calls with no allocation on the steady path."""
 
+    engine_tensors = _ENGINE_TENSORS   # CounterSnapshot narrows this
+    host_window = True                 # and skips the host window
+
     def __init__(self, cache, host_margin_blocks: int = 2):
         self.cache = cache
         self.host_margin_blocks = host_margin_blocks
@@ -169,9 +172,9 @@ class CacheSnapshot:
         for i, lay in enumerate(cache.layers):
             slot = self.layers[i]
             eng = lay.cache_engine
-            _grab(eng, _ENGINE_TENSORS, slot["engine"])
+            _grab(eng, self.engine_tensors, slot["engine"])
             _grab(eng, _ENGINE_SCALARS, slot["engine"])
-            lo, hi = self._host_window(eng)
+            lo, hi = self._host_window(eng) if self.host_window else (0, 0)
             slot["engine"]["_host_lo"] = lo
             slot["engine"]["_host_hi"] = hi
             if hi > lo:
@@ -196,7 +199,7 @@ class CacheSnapshot:
         for i, lay in enumerate(cache.layers):
             slot = self.layers[i]
             eng = lay.cache_engine
-            _put(eng, _ENGINE_TENSORS, slot["engine"])
+            _put(eng, self.engine_tensors, slot["engine"])
             _put(eng, _ENGINE_SCALARS, slot["engine"])
             lo, hi = slot["engine"]["_host_lo"], slot["engine"]["_host_hi"]
             if hi > lo:
@@ -207,6 +210,43 @@ class CacheSnapshot:
         cache._seen_tokens = self.top["_seen_tokens"]
         _sync_host_window()
         return self
+
+
+class CounterSnapshot(CacheSnapshot):
+    """The LIGHT snapshot of the verifier's COST mode (retroinfer-eval fork,
+    benchmarks/Efficiency/verify_pilot.py mode ``cost``): everything a Path 1
+    verify round mutates EXCEPT the three big engine tensors and the host
+    window, so that a batch-128 process (allocation ~35 GB at 128 slots) can
+    restore between rounds without a second copy of the allocation
+    (CacheSnapshot clones _k_gpu/_v_gpu/_kv_bias_gpu: ~34 GB there).
+
+    WHY IT IS EXACT for the shipped decode step and the next verify round
+    that follow a restore, by reading the writes of a round
+    (cache_engine.verify_round_update, spec 2a-2c) against the readers:
+      the round writes rows [tail_len, tail_len+U) of slot topk-1 and of the
+      mirror slot W-2 (tail_write.write_tail), the round region slots
+      (the gathers), _round_map, the counters restored here, the layer
+      cis/compress-k tables at the U new rows, and NOTHING else: no diff, no
+      _block_map write, no host write-back inside one tail block (the pilot's
+      budget (L % 64) + N < 64 rules a rollover out, and a rollover would
+      write _block_map[..., topk-1] += 1, which IS restored here).
+      After the restore the decode step writes row tail_len (over the
+      round's position-0 row) and its kernel reads slot rows < _cache_lens
+      (flash_attn_nosa cache_seqlens), so the stale rows above tail_len are
+      never read; the next round rebuilds the round region from -1 and its
+      masks name only slots the new union assigned, the mirror is re-copied
+      from slot topk-1 up to tail_len_0 and the causal rule cuts every row
+      >= seqused_k - U + u + 1, so no stale mirror row is read either. The
+      stale rows stay finite (real k/v/bias values), so the union-wide
+      exp(bias) * v copies stay finite.
+    The cost mode PROVES this at batch 64 with a full CacheSnapshot at one
+    step (cost-hyg: decode logits torch.equal with and without the rounds in
+    between, plus the positive control of a skipped restore); at batch 128 the
+    full snapshot does not fit and the proof is the batch-64 one.
+    """
+
+    engine_tensors = ("_block_map", "_new_block_map_buf", "_load_mask", "_cache_lens")
+    host_window = False
 
 
 def transient_ids(model) -> dict:
