@@ -20,6 +20,8 @@ Modules (each names the spec clauses it implements):
   mutations    R6      TEST-ONLY negative-control switches (all off by default): the 16 of R6, 5 of the fix round,
                        16 of repair 1 (R1 per-layer pin release, R2 draft-only LRU, R3 per-cohort join check) and 7 of
                        the capacity mode "rev6"
+  paper_metrics  -     the paper metrics of one dispatch (milestone 11; opt-in Config.paper_metrics; observation only):
+                       verify KV split, retained KV, prefetch use, IDEAL sharing (Dispatcher.paper_metrics())
 Capacity modes (dispatcher.Config.capacity): "m1" (default, the M1 rules unchanged) and "rev6" (retroinfer-eval
 docs/superpowers/specs/2026-10-12-kstep-m1-progress-policy-PROPOSAL.md rev 6, section 8: position ledger, step credits,
 aggregate draft admission, V-only verifier residuals with age-ordered all-or-nothing grants, no verifier eviction).

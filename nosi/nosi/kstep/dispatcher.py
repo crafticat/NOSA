@@ -231,6 +231,13 @@ note shows that it is needed only conditionally (the rev6 rules themselves, SC2a
 arrivals); that is not a minimum for every policy-preserving rule. Counters (this mode only; sampled at the end of every
 joint call, not maxima over every transition): stats rev6g_pin_guard_would_stall (draft steps the pin guard would have
 stalled), rev6g_peak_positions, rev6g_peak_positions_over_C, rev6g_peak_v_used; capacity_report()["guarantee"].
+
+PAPER METRICS (milestone 11, Track B; Config.paper_metrics, default False, or enable_paper_metrics() before the first
+call): paper_metrics.PaperMetrics observes the verifier looks (_call / _rev6_verifiers), the read call
+(_call: before the draft recency), the publication (_call_publish), the decision or cancellation
+(_vfetch_drop_cohort), every transfer issue (_issue), arrival (_poll), slot read (_row_kv) and K6 sample
+(_sample_memory). Observation only: no decision, reference, slot, event, stats key or report() entry changes;
+paper_metrics() returns the sections 4.3 / 4.5 / 4.6 / 4.8 with their exact definitions (paper_metrics.py).
 """
 from __future__ import annotations
 
@@ -257,6 +264,7 @@ from .result_tickets import ResultTickets, RowKey
 # HOOK-L3: DRAINING is imported for quiesce_state / detach_completed_events (INTERFACE_BC3 I8)
 from .ownership import (COUNTS, DRAINING, FREE, LIVE, LRU, PO, R_DRAFT, R_EXACT, R_PRE, R_PROV, RELEASING, RING_KINDS, VRES,
                         Arena, BiasOpLedger, Geometry, LayerPool, MemoryAccountant, RingPool)
+from .paper_metrics import PaperMetrics, disabled_report       # milestone 11 (B): Config.paper_metrics (opt-in)
 from .transfer import Transfer
 
 POISON = -7777777                         # no toy KV value is negative
@@ -330,6 +338,8 @@ class Config:
                                            # (at most ONE pending physical layer call; result_tickets >= 1)
     store_handback: bool = False           # I17 / I16: forward the store's producer-workspace handbacks to an
                                            # executor that declares accepts_handback (store "tensor")
+    paper_metrics: bool = False            # milestone 11 (B): the paper-metrics bookkeeping (paper_metrics.py;
+                                           # observation only); off: paper_metrics() gives the existing counters only
 
 
 class Draft:
@@ -745,6 +755,7 @@ class Dispatcher:
         if cfg.reader_frontier == "joined":
             from .frontier import CompletionOwnership
             self.frontier = CompletionOwnership(be, entry_bytes=self.acct.u["release_entry"])
+        self.paper: Optional[PaperMetrics] = PaperMetrics(self) if cfg.paper_metrics else None   # milestone 11 (B)
 
     # ================================================================== requests
     def submit(self, uid, prompt: List[int], max_new_tokens: int) -> None:
@@ -1326,6 +1337,8 @@ class Dispatcher:
         order = sorted(eligible, key=lambda rc: (rc[1].trigger_step, self.age[rc[0].uid], rc[1].m))
         for r, c in order:
             need = self._need(r, c.ws[l]["sel"], l, self._vhist(r, c, l))   # H1: the frozen boundary
+            if self.paper is not None:                                 # milestone 11 (B): the verifier look (4.3)
+                self.paper.look(r, c, l, need, self.call_id)
             n_new = sum(len(miss) for _, _, miss in need)
             if l in c.granted:
                 if n_new:
@@ -1494,6 +1507,8 @@ class Dispatcher:
             res = st.admit(tr.slot, tr.uid, tr.block, tr.gen, self.mut, demand=tr.demand)
             if self.arena_mode:
                 self.arenas[tr.layer].landed(tr.phys, tr.seq, tr.uid, tr.b, res["dropped"])
+            if self.paper is not None:                                 # milestone 11 (B): readiness stamp, lifetime
+                self.paper.arrived(tr, res)
             self.arrival_log.append(tr.seq)
             self.stats["progress"] += 1
             self.stats["traffic"] += 1                                  # N3 P1: an arrival (dropped ones too) is traffic
@@ -2552,6 +2567,8 @@ class Dispatcher:
             self._rev6_verifiers(l, eligible, requests, exec_cohorts)  # G1-G6 (capacity mode rev6)
         for r, c in ([] if self.rev6 else eligible):
             need = self._need(r, c.ws[l]["sel"], l)
+            if self.paper is not None:                                 # milestone 11 (B): the verifier look (4.3)
+                self.paper.look(r, c, l, need, cid)
             for h in range(self.H):
                 st = self.pools[l].stream(r.b, h)
                 for blocks in (need[h][1:] if self.mut.no_verifier_ready_protection else need[h]):
@@ -2622,6 +2639,8 @@ class Dispatcher:
                             self.vread_log.append((cid, l, r.b, h, j, (c.m, pos)))
                             if self.mut.verifier_touches_lru:
                                 st.touch(j)                            # NEGATIVE CONTROL (R2.6): the M1 rule
+        if self.paper is not None and exec_cohorts:                    # milestone 11 (B): 4.3 / 4.6 at the read call,
+            self.paper.exec_reads(self, l, exec_cohorts, cid)          # before the draft recency changes any state
         # phase 2: reads + executor
         jrows: List[Row] = []
         owners: List[Tuple] = []
@@ -2785,6 +2804,8 @@ class Dispatcher:
             c.vsel[l] = [[list(x) for x in row] for row in c.ws[l]["sel"]]
             c.vhist[l] = c.ws[l]["hist"]
             c.exec_call[l] = cid
+            if self.paper is not None:                                 # milestone 11 (B): the read call's record is
+                self.paper.executed(c.key, l)                          # committed with the publication
             self._vfetch_drop((c.key, l), "exec")                      # N3 P2: the layer-l obligation is met
             if self.rev6 and not self.mut.rev6_release_recent_before_gate:
                 self.h1_reads[(c.key, l)] = (c.ws[l]["hist"], [[list(x) for x in row] for row in c.ws[l]["sel"]])  # H1
@@ -3004,6 +3025,8 @@ class Dispatcher:
                     self._n_new_val += 2
                 read_slots.append((l, r.b, h, idx))
                 self._read_keys.add(key)
+                if self.paper is not None:                             # milestone 11 (B): the read of this lifetime;
+                    self.paper.read(l, r.b, h, idx, st.slots[idx].gen, readable is None)   # verifier rows pass None
                 if self.store is not None:                             # HOOK-B2: the eager read of the store's bytes in
                     out.extend((j * bs + rr, kvv) for rr, kvv in enumerate(self.ex.values(ek, evv, ec)))   # HOOK-B2:
                     continue                                           # HOOK-B2: the executor's value domain
@@ -3055,6 +3078,8 @@ class Dispatcher:
             self.stats["vfetch_records_dropped_" + why] += 1
 
     def _vfetch_drop_cohort(self, key, why: str) -> None:
+        if self.paper is not None:                                     # milestone 11 (B): abandoned looks, BEFORE the
+            self.paper.drop_cohort(self, key, why)                     # vfetch records (their own issues) are dropped
         for l in range(self.L):
             self._vfetch_drop((key, l), why)
 
@@ -3133,6 +3158,8 @@ class Dispatcher:
             issued[(r.b, h, j)] = tr
             batch.append(tr)
             self.stats["fetch_%s_issued" % kind] += 1
+            if self.paper is not None:                                 # milestone 11 (B): a new slot lifetime (4.8)
+                self.paper.issued(tr)
             if self.arena_mode and self._checked():
                 self._arena_reserve_check(l, order[i_req + 1:], seen)   # M2 2.3: bound + E + G <= P_l after the bind
             if kind == VERIFY:                                            # N3 P2: only a successful new verify issue
@@ -3547,6 +3574,8 @@ class Dispatcher:
                 n[k] += v                                              # physical slots (M2: positions) by state, FREE included
             for st in pool.streams.values():
                 n["prot_refs"] += sum(len(v) for v in st.prot.values())
+        if self.paper is not None:                                     # milestone 11 (B): the retained slots (4.6),
+            self.paper.retained_sample(n[PO], n[VRES])                 # before any negative-control rewrite of n
         if self.mut.mem_no_releasing:
             n["releasing"] = 0                                         # NEGATIVE CONTROL (fix round F4)
         if self.mut.vres_counted_as_lru:
@@ -3936,4 +3965,27 @@ class Dispatcher:
         sh = sum(x[7] for x in self.share)
         uh = sum(x[8] for x in self.share)
         return dict(sum=s, union=u, ratio=(u / s if s else 1.0), sum_hist=sh, union_hist=uh, ratio_hist=(uh / sh if sh else 1.0))
+
+    # ================================================================== milestone 11 (B): the paper metrics
+    def enable_paper_metrics(self) -> None:
+        """Switch the paper-metrics bookkeeping on (as Config.paper_metrics = True) for a dispatcher built without it:
+        only before the first joint call and before any transfer (else ConfigError: the counts would miss the start).
+        A second call keeps the existing bookkeeping."""
+        if self.paper is not None:
+            return
+        if self.call_id != 0 or self.seq != 0:
+            raise ConfigError("paper metrics: enable_paper_metrics after the first joint call (call %d, transfer %d); "
+                              "use Config.paper_metrics" % (self.call_id, self.seq))
+        self.paper = PaperMetrics(self)
+
+    def paper_metrics(self) -> Dict[str, Any]:
+        """READ-ONLY. The paper metrics of this dispatch (paper_metrics.py: the exact definitions, also returned under
+        "definitions"): verify_kv_split (4.3: ready / in_flight / new per verifier layer_call and summed, counts, bytes,
+        host-clock waits), retained_kv (4.6: the slot that served each verifier block, the retained PO / VRES share, the
+        refetches, the peak retained slots), prefetch_use (4.8: every transfer's lifetime by its reads, released or
+        still live, by issuer; distinct vs repeated), sharing_IDEAL (4.5: Dispatcher.sharing(), labelled). Without the
+        bookkeeping (Config.paper_metrics False): enabled False, the existing counters and sharing_IDEAL only."""
+        if self.paper is None:
+            return disabled_report(self)
+        return self.paper.report(self)
 
