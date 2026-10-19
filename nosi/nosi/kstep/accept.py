@@ -13,12 +13,19 @@ Sampling from a weight vector w (all w >= 0, total T > 0) with a uniform u: the 
 w_0 + ... + w_v > u * T (inverse CDF, fixed order). Reference semantics (cited, not copied): vLLM @99b44c7
 vllm/v1/sample/rejection_sampler.py:829-900 (accept rule), :1004-1083 (residual); SGLang @87db743
 python/sglang/kernels/ops/speculative/reject_sampling.py:5-160 (accept iff coin * q < p, residual over relu(p - q)).
+
+S3 (contract 14.7; the OPT-IN tensor greedy path, Config.dist "tensor", GREEDY only): the greedy rule is ONE integer
+function, accept_greedy(a, b, d, g), of the drafted tokens d and the verifier argmaxes g; accept_cohort's greedy rule
+calls it with g[i] = argmax(p_i) (computed lazily, only up to the first rejection), and the dispatcher's tensor path
+calls it with the argmaxes of its float32 probability tensors (the dispatcher's argmax_lowest_rows: the lowest id among
+the maxima, the same rule as argmax on [Fraction(float(p_v))], since Fraction(float) is exact and order-preserving).
+This module stays float-free. The sampled rule (A1) stays in Fractions (S4 is separate).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 SAMPLED, GREEDY = "sampled", "greedy"
 MODES = (SAMPLED, GREEDY)
@@ -84,24 +91,44 @@ class Outcome:
         return self.n_acc + (0 if self.i_star is None else 1)
 
 
+def accept_greedy(a: int, b: int, d: Dict[int, int], g: Any) -> Outcome:
+    """A2, the ONE greedy rule (integers only): for i in a .. b, accept iff g[i] == d[i] (g[i] the verifier's argmax at
+    index i); at the first difference the correction is g[i]. g is read in index order and never beyond the first
+    rejection (a mapping, or a lazy one)."""
+    out = Outcome(a=a, b=b, n_acc=0, i_star=None, correction=None)
+    for i in range(a, b + 1):
+        gi = g[i]
+        if gi == d[i]:
+            out.n_acc += 1
+            out.accepted.append(i)
+            continue
+        out.i_star, out.correction = i, gi
+        return out
+    return out
+
+
+class _LazyArgmax:
+    """g[i] = argmax(p[i]), computed when read (accept_cohort's greedy rule reads only up to the first rejection)."""
+
+    def __init__(self, p: Dict[int, Sequence[Fraction]]):
+        self.p = p
+
+    def __getitem__(self, i: int) -> int:
+        return argmax(self.p[i])
+
+
 def accept_cohort(mode: str, a: int, b: int, d: Dict[int, int], q: Dict[int, Sequence[Fraction]],
                   p: Dict[int, Sequence[Fraction]], uniform_of: Callable[[int, str], Fraction], mut=None) -> Outcome:
     """Decide cohort [a, b]. d[i], q[i] recorded at draft time; p[i] from the exact verifier; uniform_of(i, purpose)
     returns the keyed uniform of index i (the caller binds seed, uid, absolute position, epoch)."""
     if mode not in MODES:
         raise ValueError("mode %r" % (mode,))
-    out = Outcome(a=a, b=b, n_acc=0, i_star=None, correction=None)
     greedy_rule = (mode == GREEDY) or bool(mut and mut.greedy_in_sampled)
+    if greedy_rule:                                # S3: the one greedy rule (accept_greedy), argmax read lazily
+        return accept_greedy(a, b, d, _LazyArgmax(p))
+    out = Outcome(a=a, b=b, n_acc=0, i_star=None, correction=None)
     for i in range(a, b + 1):
         pi, di = p[i], d[i]
-        if greedy_rule:
-            g = argmax(pi)
-            if g == di:
-                out.n_acc += 1
-                out.accepted.append(i)
-                continue
-            out.i_star, out.correction = i, g
-            return out
         qi = pi if (mut and mut.verifier_recomputes_q) else q[i]
         if qi[di] <= 0:
             raise ValueError("A1: recorded q_%d(d_%d) = 0: d was not drawn from q" % (i, i))

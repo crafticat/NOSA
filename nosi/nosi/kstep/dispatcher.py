@@ -250,7 +250,8 @@ from .errors import (CapacityRefusal, ConfigError, ConsumptionMismatch, KStepErr
                      ReadCorruption, StaleReader)
 from .executor import (DRAFT, RESET_CONTRACT, VERIFY, Row, abi_of, check_consumed_identity, check_executor,
                        reset_contract_of, reset_methods_missing,   # HOOK-L4: the I10 readers (executor.py)
-                       values_differ, items_differ)                # milestone 10 (I23): tensor-valued comparisons
+                       values_differ, items_differ,                # milestone 10 (I23): tensor-valued comparisons
+                       TENSOR_DIST_REQUIRED)                       # S3: the optional probs of Config.dist "tensor"
 from .mutations import Mutations
 from .result_tickets import ResultTickets, RowKey
 # HOOK-L3: DRAINING is imported for quiesce_state / detach_completed_events (INTERFACE_BC3 I8)
@@ -268,6 +269,26 @@ ARENA_BACKINGS = ("conservative", "reduced")
 RECENT_MODES = ("eager", "ring", "eager_matched")
 CONSUME_MODES = ("none", "physical")
 PROGRESS_GUARDS = ("pin", "rev6")
+DIST_REPRS = ("fraction", "tensor")        # S3 (contract 14.7): Config.dist
+
+
+def argmax_lowest_rows(P: torch.Tensor) -> List[int]:
+    """S3: per row of the (n, V) float32 probability tensor P, the LOWEST id among the row's maxima: the rule of
+    acc.argmax on [Fraction(float(p_v))] (Fraction(float) is exact and order-preserving: equal floats give equal
+    Fractions, -0.0 and 0.0 included). The minimum id of the maxima is computed explicitly (no reliance on a tie order
+    of torch.argmax). A non-finite value is refused (ValueError; Fraction(nan) / Fraction(inf) raise too). ONE
+    device-to-host read for all rows (the ids and the non-finite flag together). Returns Python ints."""
+    if P.dim() != 2 or P.shape[0] < 1 or P.shape[1] < 1:
+        raise ValueError("S3 argmax_lowest_rows: need an (n, V) tensor, n, V >= 1 (got %s)" % (tuple(P.shape),))
+    V = P.shape[1]
+    ids = torch.arange(V, dtype=torch.long, device=P.device).expand(P.shape[0], V)
+    top = P.max(dim=1, keepdim=True).values
+    g = torch.where(P == top, ids, torch.full_like(ids, V)).min(dim=1).values
+    bad = (~torch.isfinite(P)).any().reshape(1).long()
+    host = torch.cat([g, bad]).cpu().tolist()
+    if host[-1]:
+        raise ValueError("S3 argmax_lowest_rows: a non-finite probability (no exact Fraction exists)")
+    return [int(x) for x in host[:-1]]
 
 
 @dataclass
@@ -280,6 +301,9 @@ class Config:
     R_ver: int
     S_host: int
     mode: str = acc.GREEDY
+    dist: str = "fraction"                 # S3 (contract 14.7): "fraction" (exact Fraction lists, as before) | "tensor"
+                                           # (GREEDY only: float32 probability tensors from executor.probs; the argmax
+                                           # by tensor comparison, lowest id among the maxima; see argmax_lowest_rows)
     seed: int = 0
     geom: Optional[Geometry] = None
     noprogress_passes: int = 6
@@ -339,7 +363,8 @@ class Cohort:
         self.chain: Dict[int, List[CompressedChain]] = {}
         self.exec_call: Dict[int, int] = {}
         self.vsel: Dict[int, List] = {}
-        self.p: Dict[int, List[Fraction]] = {}
+        self.p: Dict[int, List[Fraction]] = {}   # S3: with Config.dist "tensor", float32 probability tensors
+        self.g: Dict[int, int] = {}              # S3: the tensor path's verifier argmaxes (set at the decision)
         self.waits = 0
         self.row_layers = 0
         self.decided_step = None
@@ -465,6 +490,15 @@ class Dispatcher:
         self.K, self.LAMBDA = cad.check(cfg.K, cfg.LAMBDA)
         if cfg.mode not in acc.MODES:
             raise ConfigError("mode must be one of %s" % (acc.MODES,))
+        if cfg.dist not in DIST_REPRS:                                 # S3 (contract 14.7): the opt-in tensor path
+            raise ConfigError("S3: dist must be one of %s (got %r)" % (DIST_REPRS, cfg.dist))
+        self.dist_tensor = cfg.dist == "tensor"
+        if self.dist_tensor and cfg.mode != acc.GREEDY:
+            raise ConfigError("S3: dist 'tensor' needs mode 'greedy' (got %r): the sampled rule stays in exact "
+                              "Fractions" % (cfg.mode,))
+        if self.dist_tensor and not all(callable(getattr(executor, m, None)) for m in TENSOR_DIST_REQUIRED):
+            raise ConfigError("S3: dist 'tensor' needs an executor with probs(x) -> a float32 probability tensor (%s "
+                              "has none)" % type(executor).__name__)
         self.cfg, self.ex, self.be = cfg, executor, be
         self.mut = mut or Mutations()
         self.progress = progress
@@ -2767,7 +2801,7 @@ class Dispatcher:
             if self.rev6 and self.mut.rev6_release_recent_before_gate:
                 self._h1_release(r, c.key, l)                          # NEGATIVE CONTROL (H1): before the reader gate
             if l == self.L - 1:
-                c.p = {c.a + i: self.ex.dist(c.hidden[i]) for i in range(len(c.positions))}
+                c.p = {c.a + i: self._dist(c.hidden[i]) for i in range(len(c.positions))}
                 c.hidden = []                                          # K6: the rows' hidden states are no longer held
                 c.state = DONE
         if self.recent != "eager":                                     # M2 B2: a retained EXACT entry whose last WAITING
@@ -3153,6 +3187,20 @@ class Dispatcher:
             return rng.uniform(self.cfg.seed, r.uid, c.E + i, c.epoch, purpose)
         return f
 
+    def _dist(self, x):
+        """S3: the distribution of a final hidden: exact Fractions (executor.dist, as before) or, with Config.dist
+        "tensor", the float32 probability tensor (executor.probs; no Fraction is built in the decode)."""
+        return self.ex.probs(x) if self.dist_tensor else self.ex.dist(x)
+
+    def _argmax(self, p) -> int:
+        """The greedy argmax of one distribution of either representation (lowest id among the maxima)."""
+        return argmax_lowest_rows(p.reshape(1, -1))[0] if self.dist_tensor else acc.argmax(p)
+
+    @staticmethod
+    def _host(t) -> torch.Tensor:
+        """S3 trace: a host float32 copy of a probability tensor (instrumentation for the serial check)."""
+        return t.detach().to(device="cpu", dtype=torch.float32, copy=True)
+
     def _end_of_step(self, rows: List[Tuple[Request, Draft]]) -> None:
         outs = []
         for r in self.active():
@@ -3160,15 +3208,21 @@ class Dispatcher:
             if head is None or head.state != DONE:
                 continue
             d = {i: r.drafts[i - 1].d for i in range(head.a, head.b + 1)}
-            q = {i: r.drafts[i - 1].q for i in range(head.a, head.b + 1)}
-            o = acc.accept_cohort(self.cfg.mode, head.a, head.b, d, q, head.p, self._uniform_of(r, head), self.mut)
+            if self.dist_tensor:                                       # S3: every argmax of the cohort, ONE read
+                rng_ = range(head.a, head.b + 1)
+                g = dict(zip(rng_, argmax_lowest_rows(torch.stack([head.p[i] for i in rng_]))))
+                head.g = g
+                o = acc.accept_greedy(head.a, head.b, d, g)
+            else:
+                q = {i: r.drafts[i - 1].q for i in range(head.a, head.b + 1)}
+                o = acc.accept_cohort(self.cfg.mode, head.a, head.b, d, q, head.p, self._uniform_of(r, head), self.mut)
             outs.append((r, head, o))
         if self.mut.batch_min_commit and len(outs) > 1:                 # NEGATIVE CONTROL: the old lockstep rule
             cmin = 1 + min(o.n_acc for _, _, o in outs)
             for r, c, o in outs:
                 if o.committed > cmin:
                     i = c.a + cmin - 1
-                    o.n_acc, o.i_star, o.correction = cmin - 1, i, acc.argmax(c.p[i])
+                    o.n_acc, o.i_star, o.correction = cmin - 1, i, self._argmax(c.p[i])
         for r, c, o in outs:
             self._apply(r, c, o)
         for r, dr in rows:
@@ -3194,16 +3248,21 @@ class Dispatcher:
     def _finish_draft(self, r: Request, dr: Draft) -> None:
         if self.frontier is not None and self.frontier.draft_entry(self, r, dr):
             return                                                     # HOOK-C2: an old-epoch completion: no mutation
-        dist = self.ex.dist(dr.hidden)
+        dist = self._dist(dr.hidden)
         dr.hidden = None                                               # K6: only d and q are kept
         u = rng.uniform(self.cfg.seed, r.uid, dr.pos + 1, r.epoch, "draft")
-        dr.d, dr.q = acc.draft_token(self.cfg.mode, dist, u)
+        if self.dist_tensor:                                           # S3: greedy d by the tensor argmax; q (the
+            dr.d, dr.q = argmax_lowest_rows(dist.reshape(1, -1))[0], None   # one-hot of d) is not built: the greedy
+        else:                                                          # rule never reads it
+            dr.d, dr.q = acc.draft_token(self.cfg.mode, dist, u)
         dr.state = DONE
         r.drafts.append(dr)
         self.stats["draft_steps"] += 1
         self.stats["progress"] += 1
         self.stats["useful"] += 1                                      # N3 P1: a draft step completed
         self._record_draft(r, dr, "drafted")
+        if self.dist_tensor:                                           # S3 trace: the draft's probabilities (host
+            self.trace[r.uid]["epochs"][-1]["drafts"][-1].update(q_kind="onehot", p_draft=self._host(dist))
         m = cad.triggered_by(dr.s, self.K)
         if m is not None:
             a, b = cad.cohort_range(m, self.K)
@@ -3222,11 +3281,14 @@ class Dispatcher:
 
     def _cohort_record(self, r: Request, c: Cohort, o=None, was: Optional[str] = None) -> Dict:
         c.decided_step = self.t
-        return dict(m=c.m, a=c.a, b=c.b, E=c.E, positions=list(c.positions), trigger_step=c.trigger_step,
-                    join_step=c.join_step, decided_step=self.t, state=c.state, exec_call=dict(c.exec_call), vsel=dict(c.vsel),
-                    p={i: list(v) for i, v in c.p.items()}, waits=c.waits, row_layers=c.row_layers,
-                    layers_done=c.next_layer, state_at_decision=was or c.state,
-                    outcome=None if o is None else dict(n_acc=o.n_acc, i_star=o.i_star, correction=o.correction))
+        rec = dict(m=c.m, a=c.a, b=c.b, E=c.E, positions=list(c.positions), trigger_step=c.trigger_step,
+                   join_step=c.join_step, decided_step=self.t, state=c.state, exec_call=dict(c.exec_call), vsel=dict(c.vsel),
+                   p={i: (self._host(v) if self.dist_tensor else list(v)) for i, v in c.p.items()}, waits=c.waits,
+                   row_layers=c.row_layers, layers_done=c.next_layer, state_at_decision=was or c.state,
+                   outcome=None if o is None else dict(n_acc=o.n_acc, i_star=o.i_star, correction=o.correction))
+        if self.dist_tensor:                                           # S3 trace: the decision's argmaxes
+            rec["g"] = dict(c.g)
+        return rec
 
     @staticmethod
     def _free_cohort(c: Cohort) -> None:
@@ -3238,6 +3300,7 @@ class Dispatcher:
         c.vsel = {}
         c.vhist = {}
         c.p = {}
+        c.g = {}
 
     def _rebuild_dchain(self, r: Request) -> None:
         """D6 / A4 (fix round F5): after a full-acceptance publication the draft chain is the committed exact chain

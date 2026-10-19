@@ -188,6 +188,11 @@ class NosaExecutor:
     def dist(self, x):
         return self.model.dist(x)
 
+    def probs(self, x):
+        """S3 (contract 14.7; Config.dist "tensor"): the model's float32 probability tensor, whose Fraction list is
+        dist(x) (an explicit forward; __getattr__ would also reach it)."""
+        return self.model.probs(x)
+
     def prefill(self, tokens):
         return self.model.prefill(tokens)
 
