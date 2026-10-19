@@ -101,12 +101,14 @@ def _bias_rows(kv_bias):
 _us = None
 _tw = None
 _vs = None
+_sl = None
 if VERIFY_ROUND_SLOTS > 0:
     # pure torch, no extension; imported only under the knob so that R = 0
     # imports exactly what the shipped engine imports
     from .verify import union_store as _us
     from .verify import tail_write as _tw
     from .verify import verify_step as _vs
+    from . import spec_loop as _sl   # the speculative loop's CPU-provable core (2026-09-20)
 _pool = None
 _flash_pool_swap = None
 if POOL_BLOCKS > 0:
@@ -530,6 +532,109 @@ class CacheEngine:
             union=ur, tail=tail, seqused_k=seqused_k, U=U, W=lay.W,
             block_size=self.block_size, tail_slot=lay.tail_slot)
 
+    # -----------------------------------------------------------------------
+    # retroinfer-eval fork: SPECULATIVE DECODE LOOP (spec_loop.py, the
+    # CPU-provable core; driver benchmarks/Efficiency/spec_loop_pilot.py;
+    # tests retroinfer-eval tests/test_nosi_spec_loop.py). Three methods on
+    # the verifier's allocation (NOSI_VERIFY_ROUND_SLOTS > 0): the DRAFT step
+    # (no diff, no synchronous fetch: misses are requested on a side stream;
+    # attention gets the whole allocation with a per-row bias), the VERIFY
+    # round over the PERSISTENT store (window + round region as one LRU;
+    # late misses fetched here), the tail ROLLBACK. The S == 1 bodies below
+    # are untouched (the P = 0 promise; tests/test_nosi_verify_engine.py
+    # pins their text). ``ctx`` is a spec_loop.SpecContext.
+    # -----------------------------------------------------------------------
+    def spec_draft_update(self, key_states, value_states, kv_bias, topk_idx, ctx, layer_idx):
+        """ONE DRAFT STEP: (A) the one-token tail write with the S == 1
+        semantics (spec_loop.draft_tail_write; after the draft's own rollover
+        the rows go to mirror W-1 so block T's exact rows survive), (B) the
+        availability / prefetch plan (integer ops, no host sync), (C) the two
+        shipped Triton gathers of the plan's misses on the SIDE stream into
+        the slots the plan assigned, ordered after everything enqueued on the
+        main stream (the previous readers of an evicted slot, this step's
+        write-back) and recorded for arrival, (D) the bias with MASK_BIAS on
+        every row the draft may not see. Returns the WHOLE allocation, the
+        masked bias scratch and cache_seqlens = W * block_size: the decode
+        kernel reads every row and the bias decides."""
+        B, S, H, D = key_states.shape
+        assert S == 1 and H == self.head_num and D == self.head_dim, (tuple(key_states.shape), self.head_num, self.head_dim)
+        assert self.verify_round_slots > 0 and self.pool_blocks == 0, "the loop needs NOSI_VERIFY_ROUND_SLOTS > 0 and no victim pool"
+        st = ctx.store
+        lay = st.lay
+        assert lay.W * self.block_size == self._k_gpu.shape[1] and lay.tail_slot == self._tail_block_idx_on_gpu, (lay, tuple(self._k_gpu.shape))
+        assert topk_idx.dtype == torch.int64 and tuple(topk_idx.shape[:2]) == (H, B), (topk_idx.dtype, tuple(topk_idx.shape))
+        # A. the tail write
+        ctx.rolled[layer_idx] = _sl.draft_tail_write(self, key_states, value_states, _bias_rows(kv_bias), lay.mirror_hi, ctx.rolled[layer_idx])
+        ctx.mark("tail_end")
+        # B. the plan: what is attended, what is requested, into which slots
+        plan = _sl.plan_draft(st, layer_idx, topk_idx, ctx.tail_id, ctx.rolled[layer_idx], ctx.next_gen(), ctx.tick, ctx.tail_id)
+        ctx.mark("plan_end")
+        # C. the prefetch on the side stream (the gathers read strides and S_GPU off the tensors they are handed: the whole allocation, M = W slots)
+        ev_main = ctx.make_event()
+        ev_main.record(ctx.current_stream())
+        with ctx.on_side():
+            ctx.side.wait_event(ev_main)
+            flash_h2d_from_mask(self._k_gpu, self._k_cpu, plan.issue, self.block_size)
+            flash_h2d_from_mask_bias(self._v_gpu, self._v_cpu, self._kv_bias_gpu, kv_bias, plan.issue, self.block_size)
+            ev_side = ctx.make_event()
+            ev_side.record(ctx.side)
+        ctx.queue.push(ctx.gen, ev_side)
+        # D. the bias the draft attends with (never the allocation's own bias: avail_policy.py)
+        scratch, deny_buf = ctx.bias_scratch(layer_idx, self._kv_bias_gpu)
+        _sl.apply_draft_bias(scratch, self._kv_bias_gpu, plan.deny, deny_buf, lay, self.block_size,
+                             self._tail_block_len_on_gpu, ctx.rolled[layer_idx])
+        self._spec_last_draft = plan
+        return self._k_gpu, self._v_gpu, scratch, ctx.full_lengths(B, self._kv_bias_gpu.device)
+
+    def spec_round_update(self, key_states, value_states, kv_bias, sel, ctx, layer_idx):
+        """ONE VERIFY ROUND over the persistent store: the tail writes and the
+        mirror (tail_write.write_tail, from the ROUND-START counters, which
+        ctx.restore_before_verify put back), the union plan over the store
+        (spec_loop.plan_round: resident blocks need no fetch, in-flight ones
+        were waited for by the caller, the rest are LATE misses), the late
+        gathers on the main stream, and the VerifyRound for Path 1. One host
+        sync: the overflow / invalid read (counted in ctx.host_syncs)."""
+        B, U, H, D = key_states.shape
+        assert H == self.head_num and D == self.head_dim and U >= 1, (tuple(key_states.shape), self.head_num, self.head_dim)
+        assert tuple(value_states.shape) == (B, U, H, D), (tuple(value_states.shape), (B, U, H, D))
+        assert self.verify_round_slots > 0 and self.pool_blocks == 0, "the loop needs NOSI_VERIFY_ROUND_SLOTS > 0 and no victim pool"
+        assert sel.dtype == torch.int64 and sel.dim() == 4 and tuple(sel.shape[:3]) == (U, H, B), (sel.dtype, tuple(sel.shape))
+        st = ctx.store
+        lay = st.lay
+        lay_u = _us.union_layout(self.topk, self.pool_blocks, self.verify_round_slots)
+        assert (lay_u.W, lay_u.mirror_lo, lay_u.tail_slot) == (lay.W, lay.mirror_lo, lay.tail_slot), (lay_u, lay)
+        assert self._k_gpu.shape[1] == lay.W * self.block_size and self._tail_block_idx_on_gpu == lay.tail_slot
+        assert (int(self.seq_length), int(self._tail_block_len_on_gpu)) == (ctx.tail0.seq_length, ctx.tail0.tail_len), (
+            "the draft's counters were not restored before the verify: seq %d/%d tail_len %d/%d"
+            % (self.seq_length, ctx.tail0.seq_length, self._tail_block_len_on_gpu, ctx.tail0.tail_len))
+        tail = _tw.write_tail(self, key_states, value_states, _bias_rows(kv_bias), lay.mirror_lo)
+        self._spec_round_tail = tail
+        ctx.mark("tail_end")
+        plan = _sl.plan_round(st, layer_idx, sel, ctx.tail_id, tail.rollover_at, ctx.gen_round0, ctx.next_gen(), ctx.tick, ctx.was_inflight[layer_idx])
+        ctx.host_syncs += 1
+        ctx.mark("host_sync")
+        if bool(plan.overflow.any()) or bool(plan.invalid.any()):
+            raise _vs.RoundOverflow(
+                "spec round refused: overflow on %d stream(s) (max %d new blocks), invalid selection on %d stream(s)"
+                % (int(plan.overflow.sum()), int(plan.n_new.max()), int(plan.invalid.sum())),
+                n_new=plan.n_new, overflow=plan.overflow, invalid=plan.invalid)
+        ctx.mark("plan_end")
+        flash_h2d_from_mask(self._k_gpu, self._k_cpu, plan.fetch, self.block_size)
+        flash_h2d_from_mask_bias(self._v_gpu, self._v_cpu, self._kv_bias_gpu, kv_bias, plan.fetch, self.block_size)
+        seqused_k = torch.full((B,), tail.seqused_k, dtype=torch.int32, device=self.device)
+        self._spec_last_round = plan
+        return self._k_gpu, self._v_gpu, self._kv_bias_gpu, _vs.VerifyRound(
+            union=plan, tail=tail, seqused_k=seqused_k, U=U, W=lay.W,
+            block_size=self.block_size, tail_slot=lay.tail_slot)
+
+    def spec_rollback_tail(self, keep, mirror_lo):
+        """Truncate the round's U tail rows to the first ``keep`` in place
+        (spec_loop.truncate_tail). The layer tables are the journal's."""
+        tail = self._spec_round_tail
+        assert tail is not None, "spec_rollback_tail without a round"
+        self._spec_round_tail = None
+        return _sl.truncate_tail(self, tail, keep, mirror_lo)
+
     def decode_update_has_kv_bias(self, key_states, value_states, kv_bias, topk_idx):
         # 将 key_states 和 value_states 放入 cache
         # key_states: (batch_size, seq_len, head_num, head_dim)
@@ -904,6 +1009,16 @@ class InfLLMv2CacheLayer(DynamicLayer):
         self.seq_length += key_states.shape[1]
         return self.cache_engine.verify_round_update(key_states, value_states, kv_bias, sel)
 
+    def spec_draft_update_kv(self, key_states, value_states, kv_bias, topk_idx, ctx, layer_idx):
+        # retroinfer-eval fork, speculative loop: one draft token (B, H, D) -> (B, 1, H, D) as decode_update_kv does
+        self.seq_length += 1
+        return self.cache_engine.spec_draft_update(key_states.unsqueeze(1), value_states.unsqueeze(1), kv_bias, topk_idx, ctx, layer_idx)
+
+    def spec_round_update_kv(self, key_states, value_states, kv_bias, sel, ctx, layer_idx):
+        # retroinfer-eval fork, speculative loop: the verify round over the persistent store, (B, U, H, D)
+        self.seq_length += key_states.shape[1]
+        return self.cache_engine.spec_round_update(key_states, value_states, kv_bias, sel, ctx, layer_idx)
+
 
     def update(self, key_states, value_states, cache_kwargs=None):
         is_prefill = cache_kwargs.get("is_prefill", True)
@@ -1013,6 +1128,18 @@ class InfLLMv2Cache(DynamicCache):
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[1]
         return self.layers[layer_idx].verify_round_update_kv(key_states, value_states, kv_bias, sel)
+
+    def spec_draft_update_kv(self, key_states, value_states, kv_bias, layer_idx, topk_idx, ctx):
+        # retroinfer-eval fork, speculative loop (spec_loop.py)
+        if layer_idx == 0:
+            self._seen_tokens += 1
+        return self.layers[layer_idx].spec_draft_update_kv(key_states, value_states, kv_bias, topk_idx, ctx, layer_idx)
+
+    def spec_round_update_kv(self, key_states, value_states, kv_bias, layer_idx, sel, ctx):
+        # retroinfer-eval fork, speculative loop (spec_loop.py)
+        if layer_idx == 0:
+            self._seen_tokens += key_states.shape[1]
+        return self.layers[layer_idx].spec_round_update_kv(key_states, value_states, kv_bias, sel, ctx, layer_idx)
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         if layer_idx == 0:

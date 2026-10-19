@@ -35,10 +35,79 @@ import torch
 TRACE = None   # bound by the pilot's cost mode: VerifyTrace(num_layers)
 
 LAYER_MARKS = ("score_begin", "fetch_begin", "fetch_end", "attn_end")
+# The speculative loop's finer marks (2026-09-20, spec_loop_pilot.py): between
+# fetch_end and attn_end, verify_step.verify_attention reports the end of the
+# two union-wide value copies and of each of the two varlen calls, so the
+# attention bracket splits into copies / call 1 / call 2 / quotient. A mark
+# that a call site never records is simply absent from that layer's row.
+LAYER_MARKS_V2 = ("score_begin", "fetch_begin", "tail_end", "plan_end", "fetch_end",
+                  "copies_end", "attn1_end", "attn2_end", "attn_end")
+# (name, from, to). Inside the v1 fetch bracket the loop's engine methods record
+# tail_end (after the tail writes: torch copies) and plan_end (after the
+# union / availability plan: integer torch ops, plus the one host-sync guard
+# of a verify round), so gather_ms is the two Triton gathers alone (the
+# PCIe-bound part of a verify round; on a draft step it is the side-stream
+# launch plus the bias scratch build, the gathers themselves run elsewhere).
+WINDOWS_V2 = (("score_ms", "score_begin", "fetch_begin"), ("fetch_ms", "fetch_begin", "fetch_end"),
+              ("tail_ms", "fetch_begin", "tail_end"), ("plan_ms", "tail_end", "plan_end"),
+              ("gather_ms", "plan_end", "fetch_end"),
+              ("copies_ms", "fetch_end", "copies_end"), ("attn1_ms", "copies_end", "attn1_end"),
+              ("attn2_ms", "attn1_end", "attn2_end"), ("quot_ms", "attn2_end", "attn_end"),
+              ("attn_ms", "fetch_end", "attn_end"))
+# WHAT EACH WINDOW CONTAINS (for the kernel-vs-host table of the report):
+#   score   stage-1 kernel + the captured pooling/top-k graph (kernels) + the
+#           per-token cis / compress-k table updates (small torch ops)
+#   tail    write_tail / draft_tail_write: strided copies (memcpy kernels), a
+#           host write-back on a fill
+#   plan    plan_round / plan_draft: integer torch ops (~40 small kernels) and,
+#           in a verify round, ONE host sync (the overflow/invalid read): a
+#           GPU idle gap inside this window
+#   gather  verify: the two Triton gathers of the late misses (PCIe-bound);
+#           draft: the side-stream launch + the bias scratch copy/masked_fill
+#   copies  the two union-wide V * exp(cis) / exp(cis) copies (elementwise kernels)
+#           preceded by the two host-sync guards of build_varlen_args (idle gaps)
+#   attn1   varlen call 1 (kernel)     attn2   varlen call 2 (kernel)
+#   quot    the bf16 quotient (elementwise kernel)
+#   rest    GEMMs, norms, rope, embedding, lm_head (kernels) and every host gap
+#           between them
+KERNEL_WINDOWS = ("score_ms", "gather_ms", "attn1_ms", "attn2_ms")
+NONKERNEL_WINDOWS = ("tail_ms", "plan_ms", "copies_ms", "quot_ms")
+COUNTERS = ("host_sync",)
 
 
 def _ev():
     return torch.cuda.Event(enable_timing=True)
+
+
+def split_marks(total_ms: float, per_layer, counters=None) -> dict:
+    """per_layer: iterable of dicts mark -> ms offset from the call start (only
+    recorded marks present). Every window of WINDOWS_V2 whose two marks are
+    present in a layer is summed over the layers; ``rest_ms`` = total minus
+    the score / fetch / attn windows (the same partition as split_call, so a
+    v1 row and a v2 row are comparable). A negative window = marks out of
+    order: refuse, never clamp."""
+    if not (total_ms == total_ms) or total_ms < 0:
+        raise ValueError("split_marks: total %r" % total_ms)
+    out = {name: 0.0 for name, _, _ in WINDOWS_V2}
+    have = {name: 0 for name, _, _ in WINDOWS_V2}
+    n = 0
+    for d in per_layer:
+        for name, a, b in WINDOWS_V2:
+            if a in d and b in d:
+                w = float(d[b]) - float(d[a])
+                if not (w == w) or w < 0:
+                    raise ValueError("split_marks: layer %d window %s = %r is negative or NaN (marks out of order?)" % (n, name, w))
+                out[name] += w
+                have[name] += 1
+        n += 1
+    row = dict(total_ms=float(total_ms), layers=n)
+    for name, _, _ in WINDOWS_V2:
+        row[name] = out[name] if have[name] else None
+    core = sum(out[k] for k in ("score_ms", "fetch_ms", "attn_ms") if have[k])
+    row["rest_ms"] = float(total_ms) - core
+    for c in COUNTERS:
+        row[c] = int((counters or {}).get(c, 0))
+    return row
 
 
 def split_call(total_ms: float, per_layer) -> dict:
@@ -79,7 +148,8 @@ class VerifyTrace:
         self.next_label = label
 
     def begin_call(self):
-        c = dict(label=self.next_label, start=_ev(), end=_ev(), layers=[None] * self.num_layers)
+        c = dict(label=self.next_label, start=_ev(), end=_ev(), layers=[None] * self.num_layers,
+                 counters={k: 0 for k in COUNTERS})
         self.next_label = None
         c["start"].record()
         self.calls.append(c)
@@ -90,12 +160,24 @@ class VerifyTrace:
         if self.cur is None:
             return
         self.layer = layer_idx
-        self.cur["layers"][layer_idx] = {k: _ev() for k in LAYER_MARKS}
+        self.cur["layers"][layer_idx] = {}
 
     def rec(self, key: str):
-        if self.cur is None or self.layer is None:
+        """Record mark ``key`` on the current layer (an event, created on
+        first use), or count it when it is a COUNTERS name (a host sync)."""
+        if self.cur is None:
             return
-        self.cur["layers"][self.layer][key].record()
+        if key in COUNTERS:
+            self.cur["counters"][key] += 1
+            return
+        if self.layer is None:
+            return
+        if key not in LAYER_MARKS_V2:
+            raise KeyError("verify_trace: unknown mark %r" % key)
+        d = self.cur["layers"][self.layer]
+        if key not in d:
+            d[key] = _ev()
+        d[key].record()
 
     def end_call(self):
         if self.cur is not None:
@@ -112,6 +194,9 @@ class VerifyTrace:
         self.layer = None
 
     def harvest(self) -> list:
+        """One row per call: split_marks over the recorded marks (a call whose
+        layers recorded only the four v1 marks gets the v1 windows and None
+        for the finer ones), plus the counters and the caller's label."""
         torch.cuda.synchronize()
         rows = []
         for c in self.calls:
@@ -119,10 +204,8 @@ class VerifyTrace:
             for d in c["layers"]:
                 if d is None:
                     continue
-                per_layer.append((d["score_begin"].elapsed_time(d["fetch_begin"]),
-                                  d["fetch_begin"].elapsed_time(d["fetch_end"]),
-                                  d["fetch_end"].elapsed_time(d["attn_end"])))
-            row = split_call(c["start"].elapsed_time(c["end"]), per_layer)
+                per_layer.append({k: c["start"].elapsed_time(ev) for k, ev in d.items()})
+            row = split_marks(c["start"].elapsed_time(c["end"]), per_layer, c.get("counters"))
             row["label"] = c["label"]
             rows.append(row)
         return rows

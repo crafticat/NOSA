@@ -108,7 +108,10 @@ class VarlenArgs(NamedTuple):
     causal: bool                # True
 
 
-def build_varlen_args(q, k_gpu, v_gpu, kv_bias_gpu, rnd: VerifyRound) -> VarlenArgs:
+def build_varlen_args(q, k_gpu, v_gpu, kv_bias_gpu, rnd: VerifyRound, mark=None) -> VarlenArgs:
+    """``mark`` (optional callable of one str) is told "host_sync" before each
+    of the two device reads below, so a cost driver can count them
+    (verify_trace.py); None records nothing and changes no float."""
     U, W, bs = int(rnd.U), int(rnd.W), int(rnd.block_size)
     if bs != KERNEL_BLOCK:
         raise ValueError("block_size=%d: the varlen kernel's block is %d (flash_api.cpp:707, topk_to_uint64 :95)" % (bs, KERNEL_BLOCK))
@@ -143,6 +146,7 @@ def build_varlen_args(q, k_gpu, v_gpu, kv_bias_gpu, rnd: VerifyRound) -> VarlenA
     if not mask.is_contiguous() or mask.device != k_gpu.device:
         raise ValueError("topk_idx must be contiguous on the allocation's device (topk_to_uint64 reads data_ptr)")
     bad = (mask >= W) | (mask < -1) | (mask == int(rnd.tail_slot))
+    if mark is not None: mark("host_sync")
     if bool(bad.any()):
         raise ValueError("topk_idx names a slot >= W=%d, < -1, or the live tail slot %d (read through its mirror only); "
                          "ids >= ceil(max_seqlen_k/64) are silently dropped by the packer" % (W, int(rnd.tail_slot)))
@@ -154,6 +158,7 @@ def build_varlen_args(q, k_gpu, v_gpu, kv_bias_gpu, rnd: VerifyRound) -> VarlenA
     want = int(rnd.tail.seqused_k)
     if not (U <= want <= W * bs):
         raise ValueError("seqused_k=%d outside [U=%d, W*bs=%d]" % (want, U, W * bs))
+    if mark is not None: mark("host_sync")
     if bool((seqused_k != want).any()):
         raise ValueError("seqused_k must equal the tail write's %d on every request" % want)
 
@@ -170,9 +175,11 @@ def build_varlen_args(q, k_gpu, v_gpu, kv_bias_gpu, rnd: VerifyRound) -> VarlenA
                       softmax_scale=float(D) ** -0.5, causal=True)
 
 
-def varlen_attention(a: VarlenArgs) -> torch.Tensor:
+def varlen_attention(a: VarlenArgs, mark=None) -> torch.Tensor:
     """The two internal-op calls and the quotient (nosa_llama.py:305-337 with
-    ``seqused_k``). Returns ``(B*U, Hq, D)`` in the store dtype. GPU only."""
+    ``seqused_k``). Returns ``(B*U, Hq, D)`` in the store dtype. GPU only.
+    ``mark`` (optional) is told "attn1_end" after the first call and
+    "attn2_end" after the second: the per-call brackets of verify_trace.py."""
     # the INTERNAL op (infllmv2_sparse_attention.py:141): the public function drops seqused_k
     from infllm_v2.infllmv2_sparse_attention import _wrapped_infllmv2_attn_varlen_forward as _fwd
 
@@ -187,10 +194,16 @@ def varlen_attention(a: VarlenArgs) -> torch.Tensor:
         return out[0]
 
     out1 = call(a.v_scaled)          # :305-318, values scaled by exp(cis)
+    if mark is not None: mark("attn1_end")
     out2 = call(a.v_fake)            # :321-334, exp(cis) as the value: the real denominator
+    if mark is not None: mark("attn2_end")
     return out1 / out2[:, :, :1]     # :336-337, in the store dtype
 
 
-def verify_attention(q, k_gpu, v_gpu, kv_bias_gpu, rnd: VerifyRound) -> torch.Tensor:
-    """Path 1 attention for one round: ``(B*U, Hq, D)`` in the store dtype."""
-    return varlen_attention(build_varlen_args(q, k_gpu, v_gpu, kv_bias_gpu, rnd))
+def verify_attention(q, k_gpu, v_gpu, kv_bias_gpu, rnd: VerifyRound, mark=None) -> torch.Tensor:
+    """Path 1 attention for one round: ``(B*U, Hq, D)`` in the store dtype.
+    ``mark`` (optional callable of one str): "host_sync" x2 and "copies_end"
+    from the argument build, "attn1_end" / "attn2_end" from the two calls."""
+    a = build_varlen_args(q, k_gpu, v_gpu, kv_bias_gpu, rnd, mark=mark)
+    if mark is not None: mark("copies_end")
+    return varlen_attention(a, mark=mark)

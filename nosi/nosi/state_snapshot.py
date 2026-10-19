@@ -249,6 +249,56 @@ class CounterSnapshot(CacheSnapshot):
     host_window = False
 
 
+class PostPrefillSnapshot(CounterSnapshot):
+    """The state right after prefill, cheap enough to keep beside a batch-200
+    allocation (retroinfer-eval fork, spec_loop_pilot.py): the counters and
+    small tables of CounterSnapshot PLUS the host window and the TAIL SLOT's
+    rows of the three GPU tensors. Restoring it puts the engine back at the
+    prompt: _block_map is -1 on every window slot (the first decode step's
+    diff fetches the whole selection again, cache_engine.py), the tail slot
+    holds the prompt's tail rows, the host window holds the prompt's rows.
+    The window and round-region contents are stale afterwards and unread:
+    nothing names them until a gather rewrites them. The caller re-warms the
+    model (has_buffers = False) after a restore so the pooling graph is
+    recaptured at the restored length."""
+
+    host_window = True
+
+    def _tail_rows(self, eng):
+        bs = eng.block_size
+        t = eng._tail_block_idx_on_gpu * bs
+        return t, t + bs
+
+    @torch.inference_mode()
+    def take(self):
+        super().take()
+        for i, lay in enumerate(self.cache.layers):
+            eng = lay.cache_engine
+            lo, hi = self._tail_rows(eng)
+            slot = self.layers[i]["engine"]
+            for name in ("_k_gpu", "_v_gpu", "_kv_bias_gpu"):
+                src = getattr(eng, name)[:, lo:hi]
+                dst = slot.get("_tail" + name)
+                if torch.is_tensor(dst) and dst.shape == src.shape:
+                    dst.copy_(src)
+                else:
+                    slot["_tail" + name] = src.detach().clone()
+            slot["_tail_lo"], slot["_tail_hi"] = lo, hi
+        return self
+
+    @torch.inference_mode()
+    def restore(self):
+        super().restore()
+        for i, lay in enumerate(self.cache.layers):
+            eng = lay.cache_engine
+            slot = self.layers[i]["engine"]
+            lo, hi = slot["_tail_lo"], slot["_tail_hi"]
+            for name in ("_k_gpu", "_v_gpu", "_kv_bias_gpu"):
+                getattr(eng, name)[:, lo:hi].copy_(slot["_tail" + name])
+        _sync_host_window()
+        return self
+
+
 def transient_ids(model) -> dict:
     """Identity of every buffer that must NOT be restored. score_buf is aliased
     into the captured pooling graph (nosa_llama.py:433, replayed at :597); if a
