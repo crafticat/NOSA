@@ -150,6 +150,9 @@ class Row:
 
 
 REQUIRED = ("joint_pre", "select", "joint_post", "dist", "embed", "compress", "prefill")
+# S3 (contract 14.7), OPTIONAL: probs(x) -> the float32 probability TENSOR (V,) whose Fraction(float(p_v)) list is
+# dist(x). Required only with Config.dist "tensor" (greedy); the Dispatcher refuses that switch without it.
+TENSOR_DIST_REQUIRED = ("probs",)
 ATTRS = ("L", "H", "D", "V", "bs", "stride", "max_sel")
 ARENA_REQUIRED = ("attach_arena",)
 RING_REQUIRED = ("attach_ring",)

@@ -684,3 +684,8 @@ class NosaSerial:
 
     def feed(self, token: int) -> List[Fraction]:
         return self.m.dist(self.step(token))
+
+    def feed_probs(self, token: int) -> torch.Tensor:
+        """S3 (contract 14.7): feed's distribution as the model's float32 probability tensor (V,) (its Fraction list is
+        feed's dist); no Fraction is built."""
+        return self.m.probs(self.step(token))
