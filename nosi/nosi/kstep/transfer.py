@@ -127,8 +127,14 @@ class S0Transport:
         elem = torch.empty((), dtype=dtype).element_size()
         nb = core.slot_bytes(cap_groups, bs, D, elem)
         self._check_slot_alignment(nb, ring, cap_groups, elem)   # HOOK-B3: BEFORE the staging buffers and the Pipe
-        self.stage = torch.zeros((ring, nb), dtype=torch.uint8)
-        self.land = torch.zeros((ring, nb), dtype=torch.uint8)
+        # I24 (milestone 10, found by the first GPU run, K3X G1 2188818.9): the landing slots live on the device of the
+        # stores the scatter writes (arena or slots), and the host staging is pinned when that device is a GPU (the H2D
+        # is asynchronous on "copy"). On the CPU both stay ordinary host tensors, exactly as before.
+        ref = arena_k if arena_k is not None else slots_k
+        self.device = ref[0].device if ref else torch.device("cpu")
+        pin = self.device.type == "cuda"
+        self.stage = torch.zeros((ring, nb), dtype=torch.uint8, pin_memory=pin)
+        self.land = torch.zeros((ring, nb), dtype=torch.uint8, device=self.device)
         self.pipe = core.Pipe(be, self.stage, self.land, cap_groups, dtype=dtype, R=bs, D=D)
         self.staging_bytes = 2 * ring * nb
         self.n_layers_issued = 0
@@ -260,6 +266,22 @@ class S0Transport:
         self.chunks += len(recs)
         self.pool_checks += len(order)
 
+    @staticmethod
+    def _bias_buffers(src, src_idx, dst_idx, device):
+        """I24: the buffers of one bias issue: (stage, land, dst_host, dst). stage = the packed host rows (pinned when
+        the device is a GPU, so the H2D is asynchronous); land = the landing rows on `device`; dst = the destination
+        rows on `device`. On the CPU dst_host is None and dst is dst_idx itself (as before I24); on another device
+        dst_host is the host index tensor the copy reads (pinned on a GPU) and dst a fresh tensor on the device."""
+        dev = torch.device(device)
+        pin = dev.type == "cuda"
+        stage = torch.empty((src_idx.numel(),), dtype=src.dtype, pin_memory=pin)
+        torch.index_select(src, 0, src_idx, out=stage)
+        land = torch.empty(stage.shape, dtype=stage.dtype, device=dev)
+        if dev.type == "cpu":
+            return stage, land, None, dst_idx
+        dst_host = dst_idx.pin_memory() if pin else dst_idx
+        return stage, land, dst_host, torch.empty(dst_host.shape, dtype=dst_host.dtype, device=dev)
+
     def _issue_bias(self, layer: int, desc, order: List[Transfer]) -> None:
         """C1.1 A5 (module docstring): the bias rows of every group of this layer issue, after Pipe.layer: host pack at
         issue, one H2D on "copy", one scatter on "scatter" to the descriptor's own destination rows, then the frontier
@@ -267,10 +289,13 @@ class S0Transport:
         be = self.be
         cdst = desc.dst_idx                       # C1.1 A5: each group's bias rows land where its K / V rows land
         hc, ac = self.host_c[layer], self.arena_c[layer]
-        stage = torch.index_select(hc.reshape(-1), 0, desc.src_idx)   # the host pack, now (the K / V pack reads now)
-        land = torch.empty_like(stage)
+        # the host pack, now (the K / V pack reads now); I24: the landing and the destination rows on the arena's device
+        stage, land, cdst_h, cdst = self._bias_buffers(hc.reshape(-1), desc.src_idx, cdst, ac.device)
+        on_dev = cdst_h is not None
         with be.stream("copy"):
             be.memcpy(land, stage, "copy")
+            if on_dev:
+                be.memcpy(cdst, cdst_h, "copy")   # I24: the destination rows travel with the bias rows (same H2D event)
             h2d = be.event_rec("copy")
         with be.stream("scatter"):
             be.stream_wait("scatter", h2d)
@@ -281,6 +306,9 @@ class S0Transport:
         self.bias_groups += len(order)
         self.bias_ledger.hold("s0_stage", stage, ev=ev)          # C1.1 A9: both held until the issue's frontier ev
         self.bias_ledger.hold("s0_land", land, ev=ev)            # (the copy and the scatter that read them ran)
+        if on_dev:                                               # I24: the index copies, held the same way
+            self.bias_ledger.hold("s0_stage", cdst_h, ev=ev)
+            self.bias_ledger.hold("s0_land", cdst, ev=ev)
 
     def _check_pool_bounds(self, layer: int, desc) -> None:
         """Lower and upper bounds of every source row (< B * S_host * H) and destination row (< P * bs), the row counts,
@@ -357,6 +385,8 @@ class S0Transport:
                                      % tr.seq)
         p0 = tr.phys * self.bs
         k, v = self.arena_k[tr.layer][p0:p0 + self.bs], self.arena_v[tr.layer][p0:p0 + self.bs]
+        hd = tr.expect[0].device                  # I24: compared on the host (the transfer is complete: its event ran)
+        k, v = k.to(hd), v.to(hd)
         if not (torch.equal(k, tr.expect[0]) and torch.equal(v, tr.expect[1])):
             raise OwnershipViolation("S0 pool descriptor: payload readback mismatch: transfer seq %d (uid %s, l %d b %d h %d "
                                      "block %d) at position %d pgen %s: the arena rows differ from the rows its pack read"
@@ -365,7 +395,7 @@ class S0Transport:
             if len(tr.expect) != 3:
                 raise OwnershipViolation("S0 pool descriptor: payload readback of transfer seq %d without its bias rows"
                                          % tr.seq)
-            if not torch.equal(self.arena_c[tr.layer][p0:p0 + self.bs], tr.expect[2]):
+            if not torch.equal(self.arena_c[tr.layer][p0:p0 + self.bs].to(tr.expect[2].device), tr.expect[2]):
                 raise OwnershipViolation("S0 pool descriptor: payload readback mismatch: transfer seq %d (uid %s, l %d b %d "
                                          "h %d block %d) at position %d pgen %s: the arena bias rows differ from the bias "
                                          "rows its pack read" % (tr.seq, tr.uid, tr.layer, tr.b, tr.h, tr.block, tr.phys,
