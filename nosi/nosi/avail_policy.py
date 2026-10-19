@@ -114,6 +114,12 @@ SPEC = os.environ.get("NOSI_AVAIL", "").strip()
 MASK_BIAS = -3.0e4          # finite on purpose; see the module docstring
 INF = float("inf")
 
+# FAR-ONLY DENIAL (layer-sensitivity study). NOSA forces block 0 and the last
+# `local_blocks` block indices (the tail included) into every selection
+# (max_pooling_fused.py:60; local_blocks = window_blocks = 16 at nosa_llama.py:461,
+# :955). Those are the NEAR blocks; every other selected block is FAR.
+FAR_LOCAL = 16
+
 # The arrival delay of the VERIFIED trajectory. It is the shipped engine, whose
 # decode is synchronous, so every fetch it issues has landed by the next step.
 WARM_DELAY = 1.0
@@ -320,11 +326,16 @@ class AvailPolicy:
         self.present = {}                # stream -> protected blocks that were physically present
         self.prot_log = []               # (call, layer, protected_only, extra_ready)
         self.sel_log = None              # opt-in: {(call, layer, h, b): (sel digest, denied digest)}
+        # LAYER-SENSITIVITY extensions; inert unless a point sets deny_mode="far"
+        # or the driver sets bias_log to a list.
+        self.deny_mode = "all"
+        self.near_log = []               # (call, layer, h, b, near blocks selected) in far mode
+        self.bias_log = None             # opt-in: what mask_bias hands to attention, per layer
 
     # -- availability points ---------------------------------------------------
     def register_point(self, pid: int, capacity: int, delay: float, instep: float = 0.0,
                        ablate: str = "none", ready: float = 1.0, layer_caps=None,
-                       deny_layers=None, protect=None):
+                       deny_layers=None, protect=None, deny_mode=None):
         """`layer_caps` (a tuple, one capacity per layer), `deny_layers` (layers
         whose every non-tail slot a draft step denies: the positive control) and
         `protect` (rollout-local protection) are the accept-alloc extensions.
@@ -337,10 +348,12 @@ class AvailPolicy:
                 raise ValueError("layer_caps must be a non-empty tuple of capacities >= 1")
         if deny_layers is not None:
             deny_layers = frozenset(int(l) for l in deny_layers)
+        if deny_mode not in (None, "all", "far"):
+            raise ValueError("deny_mode=%r not in (None, 'all', 'far')" % (deny_mode,))
         self.points[int(pid)] = dict(C=int(capacity), d=float(delay), f=float(instep),
                                      ablate=ablate, ready=float(ready), streams={},
                                      caps=layer_caps, deny_layers=deny_layers,
-                                     protect=bool(protect))
+                                     protect=bool(protect), deny_mode=deny_mode or "all")
         return self.points[int(pid)]
 
     @staticmethod
@@ -375,6 +388,8 @@ class AvailPolicy:
             lab += ",deny_layers=%s" % "+".join(str(l) for l in sorted(c["deny_layers"]))
         if c.get("protect"):
             lab += ",protect=1"
+        if c.get("deny_layers") and c.get("deny_mode") == "far":
+            lab += ",deny_mode=far"
         return lab
 
     def is_natural(self, pid: int = None) -> bool:
@@ -473,6 +488,7 @@ class AvailPolicy:
         self.ablate, self.ready_target = c["ablate"], c["ready"]
         self.caps = c.get("caps")
         self.deny_layers = c.get("deny_layers")
+        self.deny_mode = c.get("deny_mode", "all")
         self.protect = bool(c.get("protect"))
         self.protected = {}
         self.present = {}
@@ -621,8 +637,20 @@ class AvailPolicy:
                     self._prot_extra += len(extra)
                     self._prot_only += len(pres - set(vc.res))
                 if self.deny_layers is not None and self.layer in self.deny_layers:
-                    # POSITIVE CONTROL: every non-tail slot of this layer denied
-                    avail = set()
+                    if self.deny_mode == "far":
+                        # FAR-ONLY DENIAL (layer-sensitivity study): keep the blocks
+                        # NOSA forces into every selection -- block 0 and the last
+                        # FAR_LOCAL block indices counting the tail
+                        # (max_pooling_fused.py:60, local_blocks = window_blocks = 16,
+                        # nosa_llama.py:461, :955) -- and deny every other selected
+                        # block. Natural misses are far blocks; this is their ceiling.
+                        tail_id = row_map[tail]
+                        near = {x for x in sel if x == 0 or x >= tail_id + 1 - FAR_LOCAL}
+                        self.near_log.append((self.call, self.layer, h, b, len(near)))
+                        avail = avail & near
+                    else:
+                        # POSITIVE CONTROL: every non-tail slot of this layer denied
+                        avail = set()
                 lru_match = -1
                 if (self.caps is None and self.capacity == 63 and self.delay == 1
                         and self.instep == 0.0):
@@ -694,6 +722,37 @@ class AvailPolicy:
 
     # -- the attention-side hook -------------------------------------------------
     def mask_bias(self, kv_bias):
+        """The attention-side hook. With `bias_log` set (a list), it also records
+        WHAT IS HANDED TO ATTENTION at this layer: whether it is the scratch or
+        the caller's own tensor, the number of entries the denial mask names,
+        whether every one of them carries MASK_BIAS, whether every other entry is
+        byte-equal to the caller's bias, and a digest of the exact bytes. That tensor is the fourth argument of
+        flash_attn_nosa_with_kvcache (nosa_llama.py:633 then :640). One small
+        device->host copy per layer; inert when bias_log is None."""
+        out = self._mask_bias_core(kv_bias)
+        if self.bias_log is not None:
+            # region = the rows the denial mask names; denied_ok: every one of
+            # them carries MASK_BIAS in what attention gets; rest_ok: every other
+            # entry is byte-equal to the caller's own bias.
+            B, S, H = kv_bias.shape
+            mval = torch.tensor(MASK_BIAS, dtype=out.dtype, device=out.device)
+            if (self._deny_dev is not None and self.role == ROLE_DRAFT
+                    and self.mech == "mask"):
+                M = self._deny_dev.shape[-1]
+                region = self._deny_dev.permute(1, 2, 0).unsqueeze(2).expand(B, M, S // M, H)
+                region = region.reshape(B, S, H)
+            else:
+                region = torch.zeros((B, S, H), dtype=torch.bool, device=out.device)
+            n_region = int(region.sum())
+            denied_ok = bool((out[region] == mval).all()) if n_region else True
+            rest_ok = bool(torch.equal(out[~region], kv_bias[~region]))
+            raw = out.detach().contiguous().view(torch.int16).cpu().numpy().tobytes()
+            self.bias_log.append((self.call, self.layer, self.role, int(out is not kv_bias),
+                                  n_region, int(denied_ok), int(rest_ok),
+                                  hashlib.sha256(raw).hexdigest()[:16]))
+        return out
+
+    def _mask_bias_core(self, kv_bias):
         """Called between cache_engine.decode_update_kv and
         flash_attn_nosa_with_kvcache (nosa_llama.py:603 -> :610). Returns the
         caller's own tensor unchanged in every case but a DENYING DRAFT step in
