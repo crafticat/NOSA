@@ -1,6 +1,7 @@
 """CPU tests of R2 milestone 2 step 4 (KERNELS): nosi/nosi/stage1_seqused.py (argument plumbing with a STUB extension,
 and the call compared by AST with the shipped wrapper's source) and nosi/nosi/max_pooling_per_request.py (the torch
-twin on a hand case; the Triton kernel under TRITON_INTERPRET=1 when triton is installed, else skipped). The GPU gate
+twin on a hand case; the Triton kernel under TRITON_INTERPRET=1 in a fresh process when triton is installed, else
+skipped). The GPU gate
 is benchmarks/Efficiency/r2_kernels_gate.py. Modules are loaded by path (nosi/nosi/__init__.py imports CUDA kernels).
 
     python -m pytest -q -p no:cacheprovider benchmarks/Efficiency/tests_cpu/test_r2_kernels.py
@@ -9,6 +10,8 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -149,25 +152,58 @@ def test_K4_the_pooling_twin_on_a_hand_case():
     assert float(pq[0, 1, 2]) == max(float(q[0, 1, 7]), float(q[0, 1, 8])) and float(pq[0, 1, 4]) == float("-inf")
 
 
-def test_K5_the_kernels_under_the_triton_interpreter(monkeypatch):
+K5_CHILD = r'''
+import importlib.util, os, sys
+sys.dont_write_bytecode = True
+assert os.environ.get("TRITON_INTERPRET") == "1", "K5 child: TRITON_INTERPRET must be 1 from process start"
+assert "triton" not in sys.modules, "K5 child: triton was imported before the interpreter flag was read"
+import torch
+
+
+def load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+new = load(sys.argv[1], "max_pooling_per_request_interpreted")
+old = load(sys.argv[2], "max_pooling_fused_interpreted")
+assert new.triton is not None, "K5 child: triton did not import"
+g = torch.Generator().manual_seed(5)
+H, B, N, M = 2, 3, 40, 10
+q = torch.randn((H, B, N), generator=g)
+c = torch.randn((H, B, N), generator=g)
+po, pc = torch.empty((H, B, M)), torch.empty((H, B, M))
+old.nosa_pooling(q, c, 37, po, pc, stride=16, block_size=64, local_blocks=2, init_blocks=1)
+qo, co = torch.empty((H, B, M)), torch.empty((H, B, M))
+new.nosa_pooling_per_request(q, c, torch.full((B,), 37, dtype=torch.int32), torch.full((B,), M, dtype=torch.int32),
+                             qo, co, stride=16, block_size=64, local_blocks=2, init_blocks=1)
+assert torch.equal(qo, po) and torch.equal(co, pc), "K5 child: uniform lengths differ from the shipped kernel"
+rq, rc = new.pool_reference(q, c, torch.full((B,), 37), torch.full((B,), M), M, init_blocks=1, local_blocks=2)
+assert torch.equal(po, rq) and torch.equal(pc, rc), "K5 child: the shipped kernel differs from pool_reference"
+nc, mb = torch.tensor([40, 21, 5], dtype=torch.int32), torch.tensor([10, 6, 2], dtype=torch.int32)
+qo.fill_(7.0); co.fill_(7.0)
+new.nosa_pooling_per_request(q, c, nc, mb, qo, co, stride=16, block_size=64, local_blocks=2, init_blocks=1)
+rq, rc = new.pool_reference(q, c, nc, mb, M, init_blocks=1, local_blocks=2)
+assert torch.equal(qo, rq) and torch.equal(co, rc), "K5 child: varied lengths differ from pool_reference"
+assert not torch.equal(qo, po), "K5 child: the varied case must differ from the uniform case (control)"
+print("K5 OK")
+'''
+
+
+def test_K5_the_kernels_under_the_triton_interpreter():
     """K5 (needs triton; skipped without it): with TRITON_INTERPRET=1, on CPU float32 tensors, the per-request kernel
     with every n_comp[b] = the shipped scalar and every M_b[b] = M equals the SHIPPED kernel (max_pooling_fused.py) on
-    both outputs, and with varied n_comp / M_b it equals pool_reference."""
-    pytest.importorskip("triton")
-    monkeypatch.setenv("TRITON_INTERPRET", "1")
-    new = _load(MPR, "max_pooling_per_request_interpreted")
-    old = _load(MPF, "max_pooling_fused_interpreted")
-    g = torch.Generator().manual_seed(5)
-    H, B, N, M = 2, 3, 40, 10
-    q = torch.randn((H, B, N), generator=g)
-    c = torch.randn((H, B, N), generator=g)
-    po, pc = torch.empty((H, B, M)), torch.empty((H, B, M))
-    old.nosa_pooling(q, c, 37, po, pc, stride=16, block_size=64, local_blocks=2, init_blocks=1)
-    qo, co = torch.empty((H, B, M)), torch.empty((H, B, M))
-    new.nosa_pooling_per_request(q, c, torch.full((B,), 37, dtype=torch.int32), torch.full((B,), M, dtype=torch.int32),
-                                 qo, co, stride=16, block_size=64, local_blocks=2, init_blocks=1)
-    assert torch.equal(qo, po) and torch.equal(co, pc)
-    nc, mb = torch.tensor([40, 21, 5], dtype=torch.int32), torch.tensor([10, 6, 2], dtype=torch.int32)
-    new.nosa_pooling_per_request(q, c, nc, mb, qo, co, stride=16, block_size=64, local_blocks=2, init_blocks=1)
-    rq, rc = mpr.pool_reference(q, c, nc, mb, M, init_blocks=1, local_blocks=2)
-    assert torch.equal(qo, rq) and torch.equal(co, rc)
+    both outputs (and both equal pool_reference), and with varied n_comp / M_b it equals pool_reference (and differs
+    from the uniform case: a control that the lengths are read). Triton reads TRITON_INTERPRET when it is FIRST
+    imported (its standard-library jit functions, e.g. tl.max, are decorated then); this module has already imported
+    triton through max_pooling_per_request.py, so the check runs in a FRESH process with the flag set from its start
+    (the first CPU run, job 2189872, failed with 'Cannot call @triton.jit'd outside of the scope of a kernel')."""
+    if importlib.util.find_spec("triton") is None:
+        pytest.skip("triton is not installed")
+    env = dict(os.environ, TRITON_INTERPRET="1", PYTHONDONTWRITEBYTECODE="1")
+    r = subprocess.run([sys.executable, "-c", K5_CHILD, str(MPR), str(MPF)], env=env, cwd=str(ROOT),
+                       capture_output=True, text=True, timeout=900)
+    assert r.returncode == 0 and r.stdout.strip().splitlines()[-1:] == ["K5 OK"], (
+        "K5 child exit %d\n--- stdout ---\n%s\n--- stderr ---\n%s" % (r.returncode, r.stdout[-4000:], r.stderr[-4000:]))
