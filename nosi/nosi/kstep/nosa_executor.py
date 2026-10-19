@@ -73,7 +73,8 @@ run on the current stream, and the backend's streams are independent (non-blocki
   values(k, v, c)                           the eager items [(k_i, v_i, c_i)] of rows read from the stores: views of the
                   caller's tensors (the dispatcher hands clones of the store bytes), never Python lists.
   producer ordering (I9; milestone-10 review MAJOR-1)
-                  host mode: the outputs are eager host tensors, complete when returned: ready None (as before).
+                  host mode: the outputs are eager host tensors, complete when returned: ready None, or, with a
+                  ready_stream, an event recorded on that (deferred) stream after them (as before).
                   device mode, every producer call: ev0 = be.event_rec(None) on the CURRENT stream (after the model's
                   writes of the call's inputs); with a ready_stream: be.stream_wait(ready_stream, ev0), then the copies
                   into fresh outputs inside be.stream(ready_stream) (backend memcpys), then ready = be.event_rec(
@@ -588,12 +589,14 @@ class NosaExecutor:
 
     def _produce(self, build) -> Tuple[List[torch.Tensor], Any]:
         """One producer call. build(stream) returns [(source tensor, dtype)]; it runs on the producer stream context
-        (device mode). Host mode: fresh eager tensors, ready None. Device mode: ev0 on the current stream; with a
+        (device mode). Host mode: fresh eager tensors, ready None (or an event recorded on the deferred ready_stream
+        after them, when one is configured). Device mode: ev0 on the current stream; with a
         ready_stream, a wait on ev0 there, the backend copies into fresh outputs there, ready recorded there; without
         one, the copies and ready on the current stream (module docstring, producer ordering)."""
-        if self.host_mode():
-            return [src.detach().to(device=self.store_device, dtype=dt).clone() for src, dt in build(None)], None
         be, rs = self.be, self.ready_stream
+        if self.host_mode():
+            outs = [src.detach().to(device=self.store_device, dtype=dt).clone() for src, dt in build(None)]
+            return outs, (be.event_rec(rs) if (rs is not None and be is not None) else None)
         ev0 = be.event_rec(None)                                       # after the model's writes (current stream)
         if rs is None:
             outs = [self._device_copy(src, dt, None) for src, dt in build(None)]
