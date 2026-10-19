@@ -1,9 +1,12 @@
 """Acceptance (spec A1, A2) in EXACT arithmetic (fractions.Fraction; no float anywhere).
 
-A1 (sampled, primary). d_s ~ q_s, recorded at draft time: q_s is the distribution the draft ACTUALLY used, under the
-availability it actually had. For i in I_m in order: accept with probability min(1, p_i(d_i) / q_i(d_i)), i.e. iff
-U_accept * q_i(d_i) < p_i(d_i); at the first rejection the correction is sampled from norm(max(0, p_i - q_i)) with
-U_residual. A residual of zero mass means the token cannot be rejected: it is accepted (zero-mass rule; in exact
+A1 (sampled, primary). d_s ~ q_s / Q_s, recorded at draft time: q_s is the distribution the draft ACTUALLY used, under
+the availability it actually had (float32 values, total Q_s, normalized by the sampler). For i in I_m in order, with
+P_i, Q_i the exact totals of p_i, q_i (S4: float32 totals need not be 1 nor equal): accept with probability
+min(1, (p_i(d_i) / P_i) / (q_i(d_i) / Q_i)), i.e. iff U_accept * q_i(d_i) * P_i < p_i(d_i) * Q_i; at the first rejection
+the correction is sampled from norm(max(0, p_i / P_i - q_i / Q_i)) (computed as max(0, p_i * Q_i - q_i * P_i)) with
+U_residual. The committed token then follows p_i / P_i exactly. (Before S4 the raw p, q were used: exact only when
+P_i == Q_i; receipt 101 / 102.) A residual of zero mass means the token cannot be rejected: it is accepted (zero-mass rule; in exact
 arithmetic a rejection implies p_i(d_i) < q_i(d_i), so the residual mass is positive and the rule is a guard). The
 verifier never recomputes q.
 A2 (GREEDY, reported separately). q = one-hot argmax of the draft distribution (lowest token id on a tie); accept iff
@@ -39,9 +42,22 @@ def argmax(dist: Sequence[Fraction]) -> int:
     return bi
 
 
+def exact_sum(xs: Sequence[Fraction]) -> Fraction:
+    """The exact sum. Fast path (S4): when every denominator is a power of two (every Fraction(float) is), one big-
+    integer sum at the largest denominator; otherwise Fraction addition."""
+    xs = list(xs)
+    if not xs:
+        return Fraction(0)
+    dens = [x.denominator for x in xs]
+    if all(dn & (dn - 1) == 0 for dn in dens):
+        D = max(dens)
+        return Fraction(sum(x.numerator * (D // x.denominator) for x in xs), D)
+    return sum(xs, Fraction(0))
+
+
 def sample_index(weights: Sequence[Fraction], u: Fraction) -> int:
     """Inverse CDF over non-negative weights (exact). Raises on a zero total."""
-    total = sum(weights, Fraction(0))
+    total = exact_sum(weights)
     if total <= 0:
         raise ValueError("sample_index: zero or negative total mass")
     target = u * total
@@ -132,13 +148,19 @@ def accept_cohort(mode: str, a: int, b: int, d: Dict[int, int], q: Dict[int, Seq
         qi = pi if (mut and mut.verifier_recomputes_q) else q[i]
         if qi[di] <= 0:
             raise ValueError("A1: recorded q_%d(d_%d) = 0: d was not drawn from q" % (i, i))
+        # S4 (A1 normalized): the target is p_i / P and the draft's law q_i / Q (sample_index draws d from q / Q); the
+        # float32 totals P, Q need not be 1 nor equal, so the test and the residual use the normalized values, cross-
+        # multiplied by P * Q > 0 (exact; identical to the raw rule whenever P == Q).
+        P, Q = exact_sum(pi), exact_sum(qi)
+        if P <= 0 or Q <= 0:
+            raise ValueError("A1: zero total mass at index %d (P %s, Q %s)" % (i, P, Q))
         u = uniform_of(i, "accept")
-        if u * qi[di] < pi[di]:                    # u < min(1, p/q)
+        if u * qi[di] * P < pi[di] * Q:            # u < min(1, (p/P) / (q/Q))
             out.n_acc += 1
             out.accepted.append(i)
             continue
         if mut and mut.residual_no_clamp:
-            w = [pv - qv for pv, qv in zip(pi, qi)]
+            w = [pv * Q - qv * P for pv, qv in zip(pi, qi)]
             target = uniform_of(i, "residual") * sum(w, Fraction(0))
             acc, c = Fraction(0), len(w) - 1
             for v, x in enumerate(w):
@@ -148,8 +170,8 @@ def accept_cohort(mode: str, a: int, b: int, d: Dict[int, int], q: Dict[int, Seq
                     break
             out.i_star, out.correction = i, c
             return out
-        w = [max(Fraction(0), pv - qv) for pv, qv in zip(pi, qi)]
-        if sum(w, Fraction(0)) == 0:
+        w = [max(Fraction(0), pv * Q - qv * P) for pv, qv in zip(pi, qi)]   # proportional to max(p/P - q/Q, 0)
+        if exact_sum(w) == 0:
             out.zero_mass_accepts += 1             # cannot be rejected
             out.n_acc += 1
             out.accepted.append(i)
