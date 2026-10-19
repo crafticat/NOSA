@@ -168,7 +168,8 @@ CONSUME_REQUIRED = ("joint_post_consume", "gather_tensors", "consumed_identities
 def values_differ(a: Any, b: Any) -> bool:
     """Milestone 10 (INTERFACE_K3X section 3, lead): the consumption comparison of one consumed value against its
     reference. Python values (the toys) compare with != exactly as before; when either is a torch tensor (a real
-    model's output), they are equal only as torch.equal tensors of the same dtype and shape (bitwise; no tolerance)."""
+    model's output), they are equal only as torch.equal tensors of the same dtype and shape: element by element BY
+    VALUE, no tolerance (not bitwise: +0.0 equals -0.0, and a NaN never equals anything, so a NaN output differs)."""
     import torch
     if torch.is_tensor(a) or torch.is_tensor(b):
         return not (torch.is_tensor(a) and torch.is_tensor(b) and a.dtype == b.dtype and a.shape == b.shape
@@ -178,7 +179,8 @@ def values_differ(a: Any, b: Any) -> bool:
 
 def items_differ(a: Any, b: Any) -> bool:
     """Milestone 10 (I23): two eager KV items ((k, v) or (k, v, c) tuples, or a single value) differ. Tuples and lists
-    compare element by element through values_differ (a different length differs); anything else as values_differ."""
+    compare element by element through values_differ (a different length differs; a tuple and a list of equal
+    elements do NOT differ: the container type is not compared); anything else as values_differ."""
     if isinstance(a, (tuple, list)) or isinstance(b, (tuple, list)):
         if not (isinstance(a, (tuple, list)) and isinstance(b, (tuple, list))) or len(a) != len(b):
             return True
