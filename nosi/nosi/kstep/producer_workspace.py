@@ -326,8 +326,8 @@ class ProducerWorkspace:
                          "fresh" (not bounded) and a class that is not declared (the acquire then refuses it by name:
                          the bound is never bypassed and never hidden behind a stall);
           (False, ev)    no storage may be overwritten and at least one is "pending": ev is the delivered reuse event
-                         of the OLDEST pending storage (the smallest hand-out serial). It is the ACTUAL gate: when ev
-                         completes (and nothing else is handed out first), that storage is reusable;
+                         of the OLDEST pending storage (the smallest hand-out serial): a gate whose completion makes
+                         a storage reusable (the oldest pending one; not necessarily the first to complete);
           (False, None)  no storage may be overwritten and none is pending: an "undelivered" storage gets its gate at
                          the next forwarding round; an "unread" or "dead" storage never gives a gate (fail closed)."""
         if self.mode == FRESH:
