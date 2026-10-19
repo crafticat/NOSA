@@ -791,6 +791,9 @@ class Dispatcher:
                                      "broken result ticket still names it (%s)" % (r.uid, r.inc, self.tickets.pending()))
         if self.frontier is not None:                                  # HOOK-C2: a second or stale end is refused
             self.frontier.end_entry(self, r)                           # before any mutation (I3, I6)
+        if r.done:                                                     # I21 (C review MINOR-1): also without a joined
+            raise KStepError("I21: a second end of request %s (incarnation %s) is refused before any change (its batch "
+                             "slot %s may already hold a later request)" % (r.uid, r.inc, r.b))   # frontier
         for l in range(self.L):
             for h in range(self.H):
                 self.pools[l].stream(r.b, h).end_owner()
