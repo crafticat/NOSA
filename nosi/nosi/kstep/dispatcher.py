@@ -249,7 +249,8 @@ from .compressed import CompressedChain, row_prefixes
 from .errors import (CapacityRefusal, ConfigError, ConsumptionMismatch, KStepError, NoProgress, OwnershipViolation,
                      ReadCorruption, StaleReader)
 from .executor import (DRAFT, RESET_CONTRACT, VERIFY, Row, abi_of, check_consumed_identity, check_executor,
-                       reset_contract_of, reset_methods_missing)   # HOOK-L4: the I10 readers (executor.py)
+                       reset_contract_of, reset_methods_missing,   # HOOK-L4: the I10 readers (executor.py)
+                       values_differ)                              # milestone 10: tensor-valued consumption checks
 from .mutations import Mutations
 from .result_tickets import ResultTickets, RowKey
 # HOOK-L3: DRAINING is imported for quiesce_state / detach_completed_events (INTERFACE_BC3 I8)
@@ -1700,11 +1701,11 @@ class Dispatcher:
                                                                                         len(jrows)))
         for i, row in enumerate(jrows):
             for h in range(self.H):
-                if heads[i][h] != ref_heads[i][h]:
+                if values_differ(heads[i][h], ref_heads[i][h]):         # milestone 10: tensor values (torch.equal)
                     raise ConsumptionMismatch("C1 consumption mismatch: call %d row (%s, %d, %s) head %d: consumed %r != "
                                               "reference %r" % (cid, row.uid, row.pos, row.kind, h, heads[i][h],
                                                                 ref_heads[i][h]))
-            if outs[i] != ref_outs[i]:
+            if values_differ(outs[i], ref_outs[i]):
                 raise ConsumptionMismatch("C1 consumption mismatch: call %d row (%s, %d, %s) output: consumed %r != "
                                           "reference %r" % (cid, row.uid, row.pos, row.kind, outs[i], ref_outs[i]))
         self._consume_count(l, jrows)

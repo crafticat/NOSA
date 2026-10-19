@@ -98,6 +98,7 @@ from collections import namedtuple
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from .errors import CapacityRefusal, ConfigError, ConsumptionMismatch, KStepError
+from .executor import values_differ          # milestone 10 (lead integration): tensor-valued consumption checks
 
 RowKey = namedtuple("RowKey", "uid inc epoch cohort pos kind layer call")
 VIEW_METHODS = ("done", "check", "resolve", "reference", "live", "apply", "release")
@@ -298,10 +299,10 @@ class ResultTickets:
                                           "reference heads" % (t.call, k.uid, k.pos, k.kind, len(heads[i]),
                                                                len(ref_heads[i])))
             for h, (a, b) in enumerate(zip(heads[i], ref_heads[i])):
-                if a != b:
+                if values_differ(a, b):
                     raise ConsumptionMismatch("C1 consumption mismatch: call %s row (%s, %s, %s) head %d: consumed %r "
                                               "!= reference %r" % (t.call, k.uid, k.pos, k.kind, h, a, b))
-            if outs[i] != ref_outs[i]:
+            if values_differ(outs[i], ref_outs[i]):
                 raise ConsumptionMismatch("C1 consumption mismatch: call %s row (%s, %s, %s) output: consumed %r != "
                                           "reference %r" % (t.call, k.uid, k.pos, k.kind, outs[i], ref_outs[i]))
         for i, k in enumerate(t.keys):         # call order; each row exactly once

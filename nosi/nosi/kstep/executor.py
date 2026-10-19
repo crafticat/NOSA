@@ -165,6 +165,17 @@ CONSUME_REQUIRED = ("joint_post_consume", "gather_tensors", "consumed_identities
 # their own lifetime rules. Without the declaration nothing is forwarded (the handbacks are taken and counted only).
 
 
+def values_differ(a: Any, b: Any) -> bool:
+    """Milestone 10 (INTERFACE_K3X section 3, lead): the consumption comparison of one consumed value against its
+    reference. Python values (the toys) compare with != exactly as before; when either is a torch tensor (a real
+    model's output), they are equal only as torch.equal tensors of the same dtype and shape (bitwise; no tolerance)."""
+    import torch
+    if torch.is_tensor(a) or torch.is_tensor(b):
+        return not (torch.is_tensor(a) and torch.is_tensor(b) and a.dtype == b.dtype and a.shape == b.shape
+                    and torch.equal(a, b))
+    return a != b
+
+
 def check_consumed_identity(records: List[Dict[str, Any]]) -> int:
     """C1.2 (12.9.2 step 4), BEFORE any gathered value is used: every gathered block / entry's copied generation
     (observed) equals the generation captured at call time (expected); else StaleReader. Returns the records checked."""
