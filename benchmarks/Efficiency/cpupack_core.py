@@ -438,6 +438,19 @@ class CpuBackend:
             self._run(st)
 
 
+def _deferred_host(be) -> bool:
+    """kstep milestone 10 revision 43 (N4): the deferred CpuBackend (or a subclass), also behind wrappers that keep it in
+    their own `be` attribute (feeder_core.OwnedBackend, the research fixtures' DropWaits). By class name in the MRO, so
+    a second loaded copy of this module (the tests load it under another module name) is recognized too."""
+    for _ in range(8):
+        if any(k.__name__ == "CpuBackend" for k in type(be).__mro__):
+            return True
+        be = getattr(be, "__dict__", {}).get("be")
+        if be is None:
+            return False
+    return False
+
+
 class CudaBackend:
     """The GPU mapping: named torch.cuda streams, timing events from a reusable pool, markers on an idle aux stream (an upper
     bound of the host instant, the hisparse_repro.make_bracket technique)."""
@@ -546,6 +559,11 @@ class Pipe:
         p0 = idx_region(self.cap, self.R)
         self.stage[:, :p0].zero_()
         self.land[:, :p0].zero_()
+        # kstep milestone 10 revision 43 (N4): on a device backend the landing zero above runs on the CURRENT stream, so
+        # an event is recorded there and the next H2D on "copy" waits it (layer); on the deferred CpuBackend (also a
+        # subclass, or behind a wrapper that keeps it in `be`) the zero is an eager host write, complete before any copy
+        # is queued (no event).
+        self.reset_ev = None if _deferred_host(self.be) else self.be.event_rec(None)
 
     def layer(self, desc: Desc, src_k2d, src_v2d, dst_k2d, dst_v2d, mode: str = "full", faults: Optional[Faults] = None,
               lite: bool = False, chunks: Optional[List[Tuple[int, int]]] = None, host_stamps: bool = False) -> List[Dict]:
@@ -592,6 +610,9 @@ class Pipe:
                 r["sub0"] = t
             if dma:
                 with be.stream("copy"):
+                    if self.reset_ev is not None:                # kstep revision 43 (N4): reset()'s landing zero first
+                        be.stream_wait("copy", self.reset_ev)
+                        self.reset_ev = None
                     if scat and self.slot_sc[s] is not None and not f.no_landing_wait:
                         be.stream_wait("copy", self.slot_sc[s])  # the scatter that last read this landing slot is done
                     if f.delay_copy_ms > 0 and ci == 0:

@@ -46,7 +46,8 @@ arena only; host_c / arena_c given together, carries_bias = True). The per-posit
   its chunk's sc1 alone. The readback compares the bias rows as well ("... the arena bias rows differ ..."). The fresh
   staging and landing tensors of EVERY issue are owned by the dispatcher's ownership.BiasOpLedger (kinds s0_stage /
   s0_land) until that issue's frontier event is seen complete (a passive check), so simultaneously held issues all
-  count (K6 category bias_staging; the ledger's exact peak).
+  count (K6 category bias_staging; the ledger's exact peak). On a device (I24), the destination-index copies of the
+  issue are held the same way under their own kind s0_index (milestone 10 revision 43, N1).
   AdversarialTransport: the payload read at issue holds the bias rows (ledger kind adv_payload, held until _land drops
   the payload), and _land writes K, V and bias together before the transfer counts as delivered. Transfer.expect's
   bias rows are a diagnostic readback copy (checked mode), not an operational backing.
@@ -306,9 +307,9 @@ class S0Transport:
         self.bias_groups += len(order)
         self.bias_ledger.hold("s0_stage", stage, ev=ev)          # C1.1 A9: both held until the issue's frontier ev
         self.bias_ledger.hold("s0_land", land, ev=ev)            # (the copy and the scatter that read them ran)
-        if on_dev:                                               # I24: the index copies, held the same way
-            self.bias_ledger.hold("s0_stage", cdst_h, ev=ev)
-            self.bias_ledger.hold("s0_land", cdst, ev=ev)
+        if on_dev:                                               # I24: the index copies, held the same way, under
+            self.bias_ledger.hold("s0_index", cdst_h, ev=ev)     # their own kind (revision 43, N1: the bias figures
+            self.bias_ledger.hold("s0_index", cdst, ev=ev)       # s0_stage / s0_land stay the bias bytes only)
 
     def _check_pool_bounds(self, layer: int, desc) -> None:
         """Lower and upper bounds of every source row (< B * S_host * H) and destination row (< P * bs), the row counts,

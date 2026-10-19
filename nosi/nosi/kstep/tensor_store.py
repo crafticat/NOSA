@@ -230,6 +230,10 @@ the default "none" path is unchanged; sites named by function, as line numbers s
                   forwarding points); and attach_store, an opt-in call of attach_executor for an executor whose class
                   defines it. attach_dispatcher also accepts fresh_outputs = False for such an executor when it takes
                   handbacks ("executor ordering" above).
+  device backends (milestone 10, revision 43; is_host_backend) the host backend is the deferred CpuBackend; on a
+                  DEVICE backend: alloc_gen_mirrors orders its copies after the current stream's fills (N3);
+                  publish_ring_block takes the identity from the device consumer mirror crgen and refuses without one
+                  (M3); the checked-mode D2H snapshot refuses pinned host stores (N2, check_snapshot_order).
   open items      eager / eager_matched in the store's mode; a CUDA executor's ready events (only the event type is
                   checked there: a torch.cuda.Event does not show its stream); device placement of the consumer mirrors
                   other than the CPU model; a CUDA overlap of a handback reuse (not claimed).
@@ -319,6 +323,22 @@ def native_event_types(be: Any) -> Tuple[type, ...]:
         return (cls,)
     raise ConfigError("tensor store: I9: backend %s has no known native event type (the cpupack_core CpuBackend _Ev "
                       "or the CudaBackend torch.cuda.Event)" % (type(be).__name__,))
+
+
+def is_host_backend(be: Any) -> bool:
+    """Milestone 10 (revision 43): the DEFERRED host backend (a cpupack_core CpuBackend or a subclass, by class name in
+    the MRO), also behind a wrapper that keeps it in its own `be` attribute (the research fixtures' DropWaits,
+    feeder_core.OwnedBackend). On it every stream is a deferred queue of host copies and torch ops run eagerly. Every
+    other backend (the CudaBackend, or a test backend of another class) is a DEVICE backend: torch ops and host-to-host
+    copies run on the current stream or at call time, and only the backend's own stream copies are ordered on its named
+    streams."""
+    seen = 0
+    while be is not None and seen < 8:
+        if any(k.__name__ == "CpuBackend" for k in type(be).__mro__):
+            return True
+        be = vars(be).get("be") if hasattr(be, "__dict__") else None
+        seen += 1
+    return False
 
 
 def producer_ready_of(ex: Any) -> bool:
@@ -806,7 +826,10 @@ class TensorStore:
         rgen_t through backend copies on "compute" from immutable clones (one "gen_staging" hold). The copy completes
         (host wait on its event) and its staging is released before this returns. Called by attach_gen_mirrors, or
         directly by a component test that installs no publisher. Call it before any other operation is queued on
-        "compute" (the host wait runs that stream up to the copy's event). OwnershipViolation when the mirrors exist."""
+        "compute" (the host wait runs that stream up to the copy's event). OwnershipViolation when the mirrors exist.
+        Revision 43 (N3): on a DEVICE backend (is_host_backend False) the mirrors' fills and the staging clones run on
+        the current stream, so an event is recorded there after them and "compute" waits it before its copies (on the
+        host backend they are eager host writes, complete before the copies are queued)."""
         if self.cpgen is not None:
             raise OwnershipViolation("tensor store: I11: the consumer generation mirrors are already allocated")
         self.cpgen = [torch.full((a.P,), -1, dtype=torch.int64, device=self.dev) for a in self.arenas]
@@ -818,7 +841,10 @@ class TensorStore:
             pairs += list(zip(self.crgen, [rp.rgen_t for rp in self.rings]))
         staging = [h.to(self.dev).clone() for _, h in pairs]    # captured now, never written again
         hid = self.holds.open((GEN_OWNER, "init"), "gen_staging", staging)
+        ev0 = None if is_host_backend(self.be) else self.be.event_rec(None)   # N3: the fills / clones, current stream
         with self.be.stream(PRODUCE):
+            if ev0 is not None:
+                self.be.stream_wait(PRODUCE, ev0)                # N3 (revision 43): the copies after them
             for (m, _), s in zip(pairs, staging):
                 self.be.memcpy(m, s, PRODUCE)
             ev = self.be.event_rec(PRODUCE)
@@ -1210,7 +1236,14 @@ class TensorStore:
         h; every entry LIVE with that rgen and a ready event, else OwnershipViolation. On "d2h": a stream wait on every
         entry's ready event, then per (position, head) the K, V (and bias) rows into the host rows and the entry's
         rgen_t into rg (the identity copy at execution); then hist_ev, installed as each entry's D2H gate
-        (RingPool.note_d2h). Returns (hist_ev, rg); check_ring_identity reads rg after the event completed."""
+        (RingPool.note_d2h). Returns (hist_ev, rg); check_ring_identity reads rg after the event completed.
+        Revision 43 (M3): the identity source is the pools' host mirror rgen_t on the HOST backend (its deferred copy
+        runs in the "d2h" order), and the store's device consumer mirror crgen[l] on a DEVICE backend (a host-to-host
+        copy would run at call time and compare the call-time value with itself); rg then lives on crgen's device and
+        is read after hist_ev. A device backend without consumer mirrors is refused before any change (ConfigError
+        "tensor store: ring D2H of layer <l> b <b> block <j> on backend <B>: the identity copy of the host mirror rgen_t
+        would run at call time, not in the 'd2h' order; the consumer mirrors are needed (Config.store_gen 'consumer',
+        I11 HOOK-L6)")."""
         where = "ring D2H of layer %d b %d block %d" % (l, b, j)
         self._layer(l, where)
         self._host_block(b, j, where)
@@ -1230,18 +1263,24 @@ class TensorStore:
                                            ring.rgen[e] if ok else None, (ring.ready[e] is not None) if ok else None,
                                            g))
         r0 = j * bs
+        host = is_host_backend(self.be)                 # M3 (revision 43): the identity source of the read
+        if not host and self.crgen is None:
+            raise ConfigError("tensor store: %s on backend %s: the identity copy of the host mirror rgen_t would run "
+                              "at call time, not in the 'd2h' order; the consumer mirrors are needed (Config.store_gen "
+                              "'consumer', I11 HOOK-L6)" % (where, type(self.be).__name__))
+        gsrc = ring.rgen_t if host else self.crgen[l]
         with self.be.stream(PUBLISH):
             for row in src:
                 for e, g in row:
                     self.be.stream_wait(PUBLISH, ring.ready[e])
-            rg = torch.full((bs, H), -1, dtype=torch.int64, device=ring.rgen_t.device)
+            rg = torch.full((bs, H), -1, dtype=torch.int64, device=gsrc.device)
             for i, row in enumerate(src):
                 for h, (e, g) in enumerate(row):
                     self.be.memcpy(self.host_k[l][b, r0 + i, h], self.ring_k[l][e], PUBLISH)
                     self.be.memcpy(self.host_v[l][b, r0 + i, h], self.ring_v[l][e], PUBLISH)
                     if self.host_c is not None:
                         self.be.memcpy(self.host_c[l][b, r0 + i, h:h + 1], self.ring_c[l][e:e + 1], PUBLISH)
-                    self.be.memcpy(rg[i, h:h + 1], ring.rgen_t[e:e + 1], PUBLISH)
+                    self.be.memcpy(rg[i, h:h + 1], gsrc[e:e + 1], PUBLISH)
             hist_ev = self.be.event_rec(PUBLISH)
         for row in src:
             for e, g in row:
@@ -1540,6 +1579,25 @@ class TensorStore:
         k, v, c = d.ex.payload(kvv)
         return {"k": k, "v": v, "c": c.reshape(1)}[which].to(self.dev)
 
+    def _host_pinned(self) -> bool:
+        """Are the host stores pinned (page-locked)? Called only on a device backend."""
+        return bool(self.host_k[0].is_pinned())
+
+    def check_snapshot_order(self, checked: bool) -> None:
+        """Revision 43 (N2), READ-ONLY: the checked-mode D2H snapshot (dispatch_d2h_block) copies the host rows into
+        the snapshot with a backend copy on "d2h". On the host backend that copy is deferred in the "d2h" order. On a
+        DEVICE backend it is a host-to-host copy that runs at CALL time: it reads the rows after the D2H copies only
+        while the host stores are PAGEABLE (a D2H copy into pageable memory completes before its call returns). With
+        PINNED host stores the D2H copies are asynchronous, so the snapshot could read the rows before them: refused,
+        ConfigError "tensor store: the checked-mode D2H snapshot reads pinned host rows host-to-host at call time on
+        backend <B>, outside the 'd2h' order; use pageable host stores (pin_host False) in checked mode". Nothing is
+        refused without checked mode, on the host backend, or with pageable host stores."""
+        if not checked or is_host_backend(self.be) or not self._host_pinned():
+            return
+        raise ConfigError("tensor store: the checked-mode D2H snapshot reads pinned host rows host-to-host at call "
+                          "time on backend %s, outside the 'd2h' order; use pageable host stores (pin_host False) in "
+                          "checked mode" % (type(self.be).__name__,))
+
     def dispatch_d2h_block(self, d: Any, r: Any, l: int, j: int, adm: Any) -> None:
         """HOOK-B2 (Dispatcher._d2h_block, store mode; recent "ring" only): contract 11.3 for block j of layer l with
         the dispatcher's bookkeeping kept exactly (publication serial, hist_ev, the ordered checked-mode snapshot, its
@@ -1547,10 +1605,12 @@ class TensorStore:
         block (adm = the A record) by admission_d2h from A_r; any other block by publish_ring_block from its LIVE EXACT
         entries (with the rgen identity copies). In checked mode only, the expectations (ek, evv, ec) are the
         executor's tensors of r.pub on the host device (dispatch_expect_block). Then hist_ev on "d2h" (after the store's
-        copies), the snapshot, the records."""
+        copies), the snapshot, the records. Revision 43 (N2): check_snapshot_order(checked) runs first, before any
+        change."""
         bs, b, H = self.bs, r.b, self.H
         r0, r1 = j * bs, (j + 1) * bs
         checked = d._checked()
+        self.check_snapshot_order(checked)
         ek = evv = ec = None
         if checked:
             ek, evv, ec = self.dispatch_expect_block(d, r, l, j)
