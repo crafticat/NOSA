@@ -61,6 +61,7 @@ No CUDA, triton, flashinfer or engine import at module import. No claim of equal
 decode, its cache engine or its graph-captured selection; no timing or memory claim."""
 from __future__ import annotations
 
+import collections
 import copy
 import functools
 import importlib
@@ -82,6 +83,51 @@ def _no_grad(fn):
         with torch.no_grad():
             return fn(*a, **kw)
     return run
+
+
+# ---------------------------------------------------------------- device-built index tensors (review MINOR-2)
+# The per-row path builds its small integer tensors ON THE DEVICE (torch.full / torch.arange: a kernel launch, no
+# pageable host-to-device copy of a Python list). Each equals the list-built tensor it replaces (dtype and values; the
+# CPU test NM13 checks every case against torch.tensor([...])).
+def index1(v: int, dtype: torch.dtype, device: Any) -> torch.Tensor:
+    """torch.tensor([v], dtype=dtype, device=device), built on the device."""
+    return torch.full((1,), int(v), dtype=dtype, device=device)
+
+
+def cu_pair(n: int, device: Any) -> torch.Tensor:
+    """torch.tensor([0, n], dtype=torch.int32, device=device), built on the device (arange(2) * n)."""
+    return torch.arange(2, dtype=torch.int32, device=device) * int(n)
+
+
+def attended_index(sel: Sequence[int], pos: int, bs: int, device: Any) -> torch.Tensor:
+    """The attended stored rows of a row at pos, in increasing position order: the bs rows of each selected complete
+    block (sel ascending, every id < pos // bs), then the own block's rows before pos. Equals torch.tensor([p for j in
+    sel for p in range(j bs, (j + 1) bs)] + list(range((pos // bs) bs, pos)), dtype=torch.long, device=device), built
+    on the device: one torch.arange per run of consecutive rows (adjacent blocks, and the own block's rows after the
+    block just before it, merge into one run), concatenated."""
+    runs: List[List[int]] = []
+    for j in sel:
+        a, b = int(j) * bs, (int(j) + 1) * bs
+        if runs and runs[-1][1] == a:
+            runs[-1][1] = b
+        else:
+            runs.append([a, b])
+    own0 = (pos // bs) * bs
+    if pos > own0:
+        if runs and runs[-1][1] == own0:
+            runs[-1][1] = pos
+        else:
+            runs.append([own0, pos])
+    if not runs:
+        return torch.empty((0,), dtype=torch.long, device=device)
+    parts = [torch.arange(a, b, dtype=torch.long, device=device) for a, b in runs]
+    return parts[0] if len(parts) == 1 else torch.cat(parts)
+
+
+def argmax_lowest(p: torch.Tensor) -> int:
+    """The lowest index among the maxima of a 1-D tensor (accept.argmax's tie rule on the same values); ONE
+    device-to-host read of the index."""
+    return int(torch.nonzero(p == p.max())[0, 0])
 
 
 # ================================================================================================== the op sets
@@ -193,6 +239,7 @@ class KernelOps:
             raise RuntimeError("KernelOps needs CUDA (the NOSA kernels); use TorchOps on the CPU")
         self.nl = nl if nl is not None else importlib.import_module("nosi.nosa_llama")
         self.splits = int(self.nl._ATTN_SPLITS if splits is None else splits)
+        self._cu_q = {}                                 # device -> the constant cu_seqlens_q [0, 1] (built once)
 
     def rmsnorm(self, x, w, eps):
         return self.nl.layer_norm(x, eps, w)
@@ -203,7 +250,7 @@ class KernelOps:
 
     def rope(self, pos, q, k, D, cos_sin):
         q2, k2 = q.clone().contiguous(), k.clone().contiguous()
-        p = torch.tensor([int(pos)], dtype=torch.long, device=q.device)
+        p = index1(pos, torch.long, q.device)
         self.nl.apply_rope_with_cos_sin_cache_inplace(p, q2, k2, D, cos_sin, True)
         return q2, k2
 
@@ -211,8 +258,10 @@ class KernelOps:
         nw = int(ck.shape[0])
         dev = q_h.device
         kk = ck.reshape(nw, 1, -1).contiguous()
-        cu_q = torch.tensor([0, 1], dtype=torch.int32, device=dev)
-        cu_k = torch.tensor([0, nw], dtype=torch.int32, device=dev)
+        cu_q = self._cu_q.get(dev)
+        if cu_q is None:
+            cu_q = self._cu_q[dev] = cu_pair(1, dev)
+        cu_k = cu_pair(nw, dev)
         score = self.nl.infllmv2_attn_stage1_fast(q_h.reshape(1, q_h.shape[0], -1).contiguous(), kk, kk,
                                                   cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=1,
                                                   max_seqlen_k=nw, causal=False)
@@ -229,7 +278,7 @@ class KernelOps:
     def attn(self, q_h, K, V, C):
         G, D = q_h.shape
         n = int(K.shape[0])
-        cs = torch.tensor([n], dtype=torch.int32, device=q_h.device)
+        cs = index1(n, torch.int32, q_h.device)
         out = self.nl.flash_attn_nosa_with_kvcache(q_h.reshape(1, 1, G, D).contiguous(),
                                                    K.reshape(1, n, 1, D).contiguous(),
                                                    V.reshape(1, n, 1, D).contiguous(),
@@ -329,7 +378,10 @@ class NosaModel:
     @classmethod
     def from_llama(cls, llama: Any, ops: Any = None, nl: Any = None, qk_select: Optional[int] = None) -> "NosaModel":
         """The real model from an nl.Llama instance (weights BY REFERENCE: no copy). ops None: KernelOps(nl).
-        qk_select None: nl.QK_SELECT (nl:45) when nl is given, else c13.QK_SELECT (the same 33)."""
+        qk_select None (review NIT-2): ops.nl.QK_SELECT (nl:45) when the ops are KernelOps; else nl.QK_SELECT when
+        nl is given; else c13.QK_SELECT (the same 33)."""
+        if ops is None:
+            ops = KernelOps(nl)
         lay0 = llama.layers[0]
         layers = [LayerWeights(wqkv=ly.wqkv, delta_w=ly.delta.weight.detach(), A=ly.A.detach(), q_size=int(ly.q_size),
                                kv_size=int(ly.kv_size), wo=ly.wo, gate_up=ly.gate_up_proj, down=ly.down_proj,
@@ -340,13 +392,17 @@ class NosaModel:
         w = NosaWeights(embed=llama.embed_tokens, cos_sin=llama.cos_sin_cache, norm_w=llama.norm_weight,
                         norm_eps=float(llama.norm_variance_epsilon), lm_head=llama.lm_head, layers=layers)
         if qk_select is None:
-            qk_select = int(getattr(nl, "QK_SELECT", c13.QK_SELECT)) if nl is not None else c13.QK_SELECT
+            if isinstance(ops, KernelOps):
+                qk_select = int(ops.nl.QK_SELECT)
+            elif nl is not None:
+                qk_select = int(nl.QK_SELECT)
+            else:
+                qk_select = c13.QK_SELECT
         return cls(w, L=int(llama.num_layers), HQ=int(llama.num_heads), H=int(llama.num_key_value_heads),
                    D=int(llama.head_dim), Dm=int(llama.hidden_size), V=int(llama.lm_head.shape[0]),
                    bs=int(lay0.block_size), stride=int(lay0.pooling_stride), chain_kernel=int(lay0.pooling_block_size),
                    max_sel=int(lay0.topk_blocks), qk_select=int(qk_select), init_blocks=int(lay0.init_blocks),
-                   local_blocks=int(lay0.window_blocks), ops=ops if ops is not None else KernelOps(nl),
-                   dtype=llama.dtype, device=llama.device)
+                   local_blocks=int(lay0.window_blocks), ops=ops, dtype=llama.dtype, device=llama.device)
 
     @classmethod
     def tiny(cls, seed: int = 0, ops: Any = None, dtype: torch.dtype = torch.bfloat16, device: Any = "cpu",
@@ -386,7 +442,7 @@ class NosaModel:
     @_no_grad
     def embed(self, token: int) -> torch.Tensor:
         """F.embedding of one token (nl:1075): (1, Dm)."""
-        return F.embedding(torch.tensor([int(token)], dtype=torch.long, device=self.device), self.w.embed)
+        return F.embedding(index1(token, torch.long, self.device), self.w.embed)
 
     @_no_grad
     def joint_pre(self, l: int, items: Sequence[Tuple[torch.Tensor, int]]):
@@ -423,17 +479,36 @@ class NosaModel:
         """NOSA's selection of one (row, KV head): sorted complete block ids < n_cand. M = n_cand + 1 <= max_sel: every
         complete block (c13, no score). Else P4 (block_scores) and P5: c13.select_blocks(M, PQ, PC, h, qk_select,
         max_sel) and complete_blocks (forced init / local ids, the tie rule value desc, id asc)."""
+        return self._select_many(l, [h], [q_h], [cks], n_cand)[0]
+
+    @_no_grad
+    def select_heads(self, l: int, q: Sequence[torch.Tensor],
+                     cks: Sequence[Sequence[Tuple[torch.Tensor, torch.Tensor]]], n_cand: int) -> List[List[int]]:
+        """select for EVERY KV head of one row (q and cks: lists over the KV heads): equal to [select(l, h, q[h],
+        cks[h], n_cand) for h], with ONE device-to-host read of the PQ / PC of all heads (review MINOR-2). A select
+        patched on the INSTANCE (a test-local control, NM11) is honoured: then it is called per head instead."""
+        if "select" in self.__dict__:
+            return [self.select(l, h, q[h], cks[h], n_cand) for h in range(self.H)]
+        return self._select_many(l, list(range(self.H)), q, cks, n_cand)
+
+    def _select_many(self, l: int, heads: Sequence[int], qs, ckss, n_cand: int) -> List[List[int]]:
         if n_cand < 0:
             raise ValueError("NosaModel.select: n_cand %d" % n_cand)
         M = n_cand + 1
         if M <= self.max_sel:
             sel, ties = c13.select_blocks(M, topk=self.max_sel)
-        else:
-            pq, pc = self.block_scores(l, h, q_h, cks, n_cand)
-            sel, ties = c13.select_blocks(M, pq.float().cpu().tolist(), pc.float().cpu().tolist(), head=h,
-                                          qk_select=self.qk_select, topk=self.max_sel)
-        self.last_ties = ties
-        return [int(j) for j in c13.complete_blocks(sel, M)]
+            self.last_ties = ties
+            comp = [int(j) for j in c13.complete_blocks(sel, M)]
+            return [list(comp) for _ in heads]
+        scores = [self.block_scores(l, h, q_h, cks, n_cand) for h, q_h, cks in zip(heads, qs, ckss)]
+        host = torch.stack([t.float() for pair in scores for t in pair]).cpu().tolist()   # ONE read: 2 x heads rows
+        out = []
+        for i, h in enumerate(heads):
+            sel, ties = c13.select_blocks(M, host[2 * i], host[2 * i + 1], head=h, qk_select=self.qk_select,
+                                          topk=self.max_sel)
+            self.last_ties = ties
+            out.append([int(j) for j in c13.complete_blocks(sel, M)])
+        return out
 
     @_no_grad
     def compress(self, elems: Sequence[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -468,9 +543,17 @@ class NosaModel:
 
     @_no_grad
     def probs(self, x: torch.Tensor) -> torch.Tensor:
-        """final norm, lm_head, .float(), softmax in float32 (nl:1121-1125): (V,) float32."""
+        """(V,) float32 probabilities: the final norm and lm_head with .float() as Llama.decode_inference
+        (nl:1119-1123), which RETURNS those float32 logits; the float32 softmax over them is this model's own step
+        (the engine has no softmax there)."""
         hn = self.ops.rmsnorm(x.reshape(1, self.Dm), self.w.norm_w, self.w.norm_eps)
         return torch.softmax(F.linear(hn, self.w.lm_head).float(), dim=-1)[0]
+
+    def argmax_token(self, x: torch.Tensor) -> int:
+        """The greedy token of x without building the Fractions: the lowest id among the maxima of probs(x), which
+        equals accept.argmax(dist(x)) (Fraction(float(p)) is exact and order-preserving; both take the first maximum).
+        dist itself is unchanged."""
+        return argmax_lowest(self.probs(x))
 
     def dist(self, x: torch.Tensor) -> List[Fraction]:
         """Each probability of probs(x) as Fraction(float(p)): the exact rational of the float32 value (the total need
@@ -550,9 +633,14 @@ class NosaSerial:
     current row), head_out; mix; then the row's (k, v, c) are stored and a window that ends at this position is
     compressed (visible from the next position on). The SAME model calls in the same order as the executor's per-row
     path: the correctness reference. kv[pos][l][h] = (k, v, c); cks[l][h] = [(ck, cc)]; sel_log = [(pos, l, h,
-    selection)]; hidden = the last final hidden."""
+    selection)]; hidden = the last final hidden.
+    Memory (review NIT-1): every position's (k, v, c) is kept TWICE, in kv (the fresh joint_pre tensors, for prefill
+    and the tests) and in the per-(layer, head) stores (store[l][h], the rows the attention gathers). sel_log grows by
+    L x H entries per position and is unbounded by default; sel_log_cap = n keeps only the last n entries (a deque).
+    Per layer, the selections of all KV heads come from model.select_heads (one device-to-host read of their scores);
+    the attended row index is built on the device (attended_index)."""
 
-    def __init__(self, model: NosaModel):
+    def __init__(self, model: NosaModel, sel_log_cap: Optional[int] = None):
         self.m = model
         self.pos = 0
         self.hidden: Optional[torch.Tensor] = None
@@ -560,23 +648,22 @@ class NosaSerial:
         self.store = [[_HeadStore(model.D, model.dtype, model.device) for _ in range(model.H)] for _ in range(model.L)]
         self.cks: List[List[List[Tuple[torch.Tensor, torch.Tensor]]]] = [[[] for _ in range(model.H)]
                                                                          for _ in range(model.L)]
-        self.sel_log: List[Tuple[int, int, int, Tuple[int, ...]]] = []
+        self.sel_log = [] if sel_log_cap is None else collections.deque(maxlen=int(sel_log_cap))
 
     @_no_grad
     def step(self, token: int) -> torch.Tensor:
         """Feed one token at position self.pos; returns the final hidden (1, Dm)."""
         m, pos, bs = self.m, self.pos, self.m.bs
         x = m.embed(token)
-        own = list(range((pos // bs) * bs, pos))
         kvp = []
         for l in range(m.L):
             q, k, v, c = m.joint_pre(l, [(x, pos)])[0]
             heads = []
+            sels = m.select_heads(l, q, self.cks[l], pos // bs)
             for h in range(m.H):
-                sel = m.select(l, h, q[h], self.cks[l][h], pos // bs)
+                sel = sels[h]
                 self.sel_log.append((pos, l, h, tuple(sel)))
-                idx = torch.tensor([p for j in sel for p in range(j * bs, (j + 1) * bs)] + own, dtype=torch.long,
-                                   device=m.device)
+                idx = attended_index(sel, pos, bs, m.device)
                 st = self.store[l][h]
                 K = torch.cat([st.K.index_select(0, idx), k[h].unsqueeze(0)])
                 V = torch.cat([st.V.index_select(0, idx), v[h].unsqueeze(0)])
