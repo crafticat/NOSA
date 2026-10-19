@@ -735,7 +735,8 @@ class Dispatcher:
         admission_block = dict(uid, b, gate, t), where gate is the native completion event whose completion makes the
         head's producer storage reusable, or None while no drivable event exists yet (an operation whose handback is
         not delivered: the next forwarding round delivers it). The dispatcher never waits on it: run() (the DRIVER)
-        host-waits exactly that gate. admission_block is recomputed at every _admit (None with an empty queue)."""
+        host-waits exactly that gate. admission_block is recomputed at every _admit (None with an empty queue) and
+        cleared by a resumed step (which runs no _admit), so run() never acts on a record of an earlier step."""
         self.admission_block = None
         for b in range(self.cfg.B):
             if self.slot_req[b] is not None or not self.queue:
@@ -1025,6 +1026,7 @@ class Dispatcher:
 
     def _step(self) -> None:
         if self.pending_step is not None:                              # I17: finish the stopped step first
+            self.admission_block = None                                # I22: no _admit here, so no stale hold record
             return self._resume_step()
         t = self.t
         self._admit()
