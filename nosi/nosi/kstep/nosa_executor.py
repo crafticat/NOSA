@@ -9,10 +9,13 @@ RING PROTOCOL v3, C1.1 ABI v4, C1.2 SERIALIZED PHYSICAL CONSUMPTION, I10) and te
 (tensor_payload, fresh_outputs, kv_dtype / bias_dtype, store_device, prefill_tensors, payload, values; I9
 producer_ready).
 
-Two backend modes (milestone-10 review fixes). The "host" mode is the cpupack_core CpuBackend (its class name), whose
-streams are DEFERRED queues of host copies: torch ops run eagerly, so only backend copies (memcpy) are stream-ordered.
-Every other backend (the CudaBackend, or any CpuBackend-shaped backend of another class) is a "device" mode: torch ops
-run on the current stream, and the backend's streams are independent (non-blocking) streams.
+Two backend modes (milestone-10 review fixes). The "host" mode is the cpupack_core CpuBackend (its class name; also
+behind a test wrapper that keeps it in its `be` attribute: tensor_store.is_host_backend), whose streams are DEFERRED
+queues of host copies: torch ops run eagerly, so only backend copies (memcpy) are stream-ordered. Every other backend
+(the CudaBackend, or any CpuBackend-shaped backend of another class) is a "device" mode: torch ops run on the current
+stream, and the backend's streams are independent (non-blocking) streams. Revision 43 (M1): in the device mode a
+consuming or validating call starts with "compute" waiting an event of the current stream (the Row.kv items that its
+validator expectations stack were cloned there by the dispatcher).
 
   NosaExecutor(model, check_identity=True, ready_stream=None, gather_events=False, check_divergence=None,
                gather=None, debug_cap=100000)
@@ -118,10 +121,11 @@ import torch
 
 from .backend import ev_done
 from .errors import CacheMismatch, ConfigError
+from .tensor_store import is_host_backend
 
 DIVERGE_OPS = ("gather_k", "gather_v", "gather_c", "head_out", "mix")   # the debug record's op names, in check order
 GATHER_MODES = ("copies", "batched")
-HOST_BACKEND = "CpuBackend"                    # the class name of the deferred host backend (cpupack_core)
+HOST_BACKEND = "CpuBackend"                    # the class name of the deferred host backend (is_host_backend)
 
 
 class NosaExecutor:
@@ -208,8 +212,18 @@ class NosaExecutor:
 
     # -- modes and helpers
     def host_mode(self) -> bool:
-        """True for the deferred host backend (cpupack_core CpuBackend) or before any attach (module docstring)."""
-        return self.be is None or type(self.be).__name__ == HOST_BACKEND
+        """True for the deferred host backend (tensor_store.is_host_backend: the cpupack_core CpuBackend, also behind a
+        test wrapper that keeps it in `be`) or before any attach (module docstring)."""
+        return self.be is None or is_host_backend(self.be)
+
+    def _enter_compute(self) -> None:
+        """M1 (revision 43): in the device mode, at the entry of a consuming / validating call, "compute" waits an
+        event recorded on the CURRENT stream, so its reads (and the stacks of the Row.kv items, which the dispatcher
+        cloned on the current stream) come after everything the current stream did before the call."""
+        if self.host_mode():
+            return
+        ev = self.be.event_rec(None)
+        self.be.stream_wait("compute", ev)
 
     def _divergence_on(self) -> bool:
         return self.host_mode() if self.check_divergence is None else bool(self.check_divergence)
@@ -234,8 +248,10 @@ class NosaExecutor:
 
     def _check_mirrors(self, l: int, rows) -> None:
         """MINOR-2: in the device mode, a call whose identity copies would read a HOST generation mirror is refused
-        (ConfigError) before any read of the call (module docstring, attach_arena)."""
-        if self.host_mode() or not self.check_identity:
+        (ConfigError) before any read of the call (module docstring, attach_arena). A backend that declares
+        orders_host_copies = True (its copies of host tensors are ordered on its named streams: a test backend over the
+        deferred host backend) accepts host mirrors."""
+        if self.host_mode() or not self.check_identity or getattr(self.be, "orders_host_copies", False) is True:
             return
         bad = []
         if any(row.addr for row in rows) and self.pgen[l].device.type == "cpu":
@@ -314,6 +330,7 @@ class NosaExecutor:
     def joint_post(self, l, rows):
         """The non-consuming protocol: the validator reads, outputs from Row.kv (the reference ops)."""
         self._check_mirrors(l, rows)
+        self._enter_compute()                                           # M1 (revision 43)
         outs = []
         for row in rows:
             heads = [self.model.head_out(l, row.q[h], *self._stack_row(row.kv[h])) for h in range(self.H)]
@@ -413,6 +430,7 @@ class NosaExecutor:
 
     def joint_post_consume(self, l, rows):
         self._check_mirrors(l, rows)
+        self._enter_compute()                                           # M1 (revision 43)
         call = self._call_id()
         mode = self._gather_mode()
         gathers = []

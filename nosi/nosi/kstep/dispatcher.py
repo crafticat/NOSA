@@ -1882,7 +1882,11 @@ class Dispatcher:
                     persistent_bytes=dict(host_c=el(self.host_c), arena_c=el(self.arena_c), ring_c=el(self.ring_c),
                                           admission_held=sum(el(A.get("c")) for A in self.adm),
                                           admission_peak=self.adm_bias_peak_bytes, gather=0),
+                    # revision 43 (lead's K6 decision: keep and label): the K6 figure stays the ledger total (the
+                    # s0_index copies are real device bytes); the per-kind held / peak bytes show them apart
                     operational=dict(held_bytes=lg.held, peak_bytes=lg.peak, held_records=len(lg.recs),
+                                     held_by_kind=dict(getattr(lg, "held_kind", {})),
+                                     peak_by_kind=dict(getattr(lg, "peak_kind", {})),
                                      peak_records=lg.peak_records, max_concurrent=dict(lg.max_concurrent),
                                      allocs=dict(lg.allocs), alloc_bytes=dict(lg.alloc_bytes),
                                      releases=dict(lg.releases), outstanding=lg.outstanding()),

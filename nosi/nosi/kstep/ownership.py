@@ -1092,11 +1092,13 @@ class BiasOpLedger:
     transition (held only falls at a release); log = every transition (instrumentation, not charged). A backing that
     shares storage with a held one is refused (no double count). Kinds: ring_producer (a ring payload's fresh bias),
     admission_src (A_r's bias source per layer), d2h_src (an eager_matched D2H source clone), s0_stage / s0_land (one
-    S0 issue's bias pack and landing), adv_payload (an adversarial transfer's bias payload). Not counted here (reported
+    S0 issue's bias pack and landing), s0_index (milestone 10 revision 43, N1: one S0 bias issue's destination-index
+    copies on a device backend, the host index rows and their device copy; separate from the bias bytes so that the
+    CPU and GPU bias figures compare), adv_payload (an adversarial transfer's bias payload). Not counted here (reported
     as excluded): the persistent stores (host / arena / ring / A_r bias rows, charged in full elsewhere), views of them,
     diagnostic copies (Transfer.expect, the D2H expected rows and snapshot, the validators' copies) and synchronous
     eager-reference temporaries. Not a Python-allocator or GPU measurement."""
-    KINDS = ("ring_producer", "admission_src", "d2h_src", "s0_stage", "s0_land", "adv_payload")
+    KINDS = ("ring_producer", "admission_src", "d2h_src", "s0_stage", "s0_land", "s0_index", "adv_payload")
     CONSUME_KINDS = ("c1_gather",)          # C1.2 (12.9.2): the consume ledger (gather K / V / bias / identity backings)
 
     def __init__(self, kinds: Optional[Tuple[str, ...]] = None):
@@ -1111,6 +1113,8 @@ class BiasOpLedger:
         self.alloc_bytes = {k: 0 for k in self.kinds}
         self.releases = {k: 0 for k in self.kinds}
         self.max_concurrent = {k: 0 for k in self.kinds}
+        self.held_kind = {k: 0 for k in self.kinds}     # revision 43 (N1): the bytes held now, per kind
+        self.peak_kind = {k: 0 for k in self.kinds}     # and each kind's own exact peak (instrumentation)
         self.log: List[Tuple] = []
 
     def hold(self, kind: str, t, ev=None, key=None) -> int:
@@ -1128,6 +1132,8 @@ class BiasOpLedger:
         if key is not None:
             self.by_key[(kind, key)] = s
         self.held += nb
+        self.held_kind[kind] += nb
+        self.peak_kind[kind] = max(self.peak_kind[kind], self.held_kind[kind])
         self.allocs[kind] += 1
         self.alloc_bytes[kind] += nb
         self.peak = max(self.peak, self.held)
@@ -1141,6 +1147,7 @@ class BiasOpLedger:
         if r["key"] is not None:
             del self.by_key[(r["kind"], r["key"])]
         self.held -= r["nbytes"]
+        self.held_kind[r["kind"]] -= r["nbytes"]
         self.releases[r["kind"]] += 1
         self.log.append(("release", s, r["kind"], r["nbytes"], self.held))
 
@@ -1155,6 +1162,11 @@ class BiasOpLedger:
         for s in done:
             self._release(s)
         return len(done)
+
+    def held_by(self, kinds) -> int:
+        """Revision 43 (N1): the bytes held now by the records of `kinds` (for example the bias bytes without the
+        s0_index copies: KINDS minus "s0_index")."""
+        return sum(self.held_kind[k] for k in kinds)
 
     def outstanding(self) -> List[Tuple[str, Any, int]]:
         """The records held now: (kind, key or None, bytes), in allocation order."""
