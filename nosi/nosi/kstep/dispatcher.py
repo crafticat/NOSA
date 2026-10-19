@@ -250,7 +250,7 @@ from .errors import (CapacityRefusal, ConfigError, ConsumptionMismatch, KStepErr
                      ReadCorruption, StaleReader)
 from .executor import (DRAFT, RESET_CONTRACT, VERIFY, Row, abi_of, check_consumed_identity, check_executor,
                        reset_contract_of, reset_methods_missing,   # HOOK-L4: the I10 readers (executor.py)
-                       values_differ)                              # milestone 10: tensor-valued consumption checks
+                       values_differ, items_differ)                # milestone 10 (I23): tensor-valued comparisons
 from .mutations import Mutations
 from .result_tickets import ResultTickets, RowKey
 # HOOK-L3: DRAINING is imported for quiesce_state / detach_completed_events (INTERFACE_BC3 I8)
@@ -3392,7 +3392,7 @@ class Dispatcher:
             self.pub_log.append((r.uid, pos))
             d_kv = [[r.draft_kv[l][h].get(pos) for h in range(self.H)] for l in range(self.L)]
             if all(x is not None for row in d_kv for x in row) and any(
-                    d_kv[l][h] != c.prov[l][h][pos] for l in range(self.L) for h in range(self.H)):
+                    items_differ(d_kv[l][h], c.prov[l][h][pos]) for l in range(self.L) for h in range(self.H)):
                 self.stats["published_draft_kv_differs"] += 1           # A4: committed input, draft KV != exact KV
             for l in range(self.L):
                 for h in range(self.H):

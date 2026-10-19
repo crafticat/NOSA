@@ -176,6 +176,16 @@ def values_differ(a: Any, b: Any) -> bool:
     return a != b
 
 
+def items_differ(a: Any, b: Any) -> bool:
+    """Milestone 10 (I23): two eager KV items ((k, v) or (k, v, c) tuples, or a single value) differ. Tuples and lists
+    compare element by element through values_differ (a different length differs); anything else as values_differ."""
+    if isinstance(a, (tuple, list)) or isinstance(b, (tuple, list)):
+        if not (isinstance(a, (tuple, list)) and isinstance(b, (tuple, list))) or len(a) != len(b):
+            return True
+        return any(values_differ(x, y) for x, y in zip(a, b))
+    return values_differ(a, b)
+
+
 def check_consumed_identity(records: List[Dict[str, Any]]) -> int:
     """C1.2 (12.9.2 step 4), BEFORE any gathered value is used: every gathered block / entry's copied generation
     (observed) equals the generation captured at call time (expected); else StaleReader. Returns the records checked."""
