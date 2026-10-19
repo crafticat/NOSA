@@ -9,11 +9,18 @@ RING PROTOCOL v3, C1.1 ABI v4, C1.2 SERIALIZED PHYSICAL CONSUMPTION, I10) and te
 (tensor_payload, fresh_outputs, kv_dtype / bias_dtype, store_device, prefill_tensors, payload, values; I9
 producer_ready).
 
-  NosaExecutor(model, check_identity=True, ready_stream=None, gather_events=False, check_divergence=True,
-               debug_cap=100000)
+Two backend modes (milestone-10 review fixes). The "host" mode is the cpupack_core CpuBackend (its class name), whose
+streams are DEFERRED queues of host copies: torch ops run eagerly, so only backend copies (memcpy) are stream-ordered.
+Every other backend (the CudaBackend, or any CpuBackend-shaped backend of another class) is a "device" mode: torch ops
+run on the current stream, and the backend's streams are independent (non-blocking) streams.
+
+  NosaExecutor(model, check_identity=True, ready_stream=None, gather_events=False, check_divergence=None,
+               gather=None, debug_cap=100000)
       The constructor of the lead's builders (kstep_toy.build passes the model as `toy`; store_kmod calls
       executor_cls(ex.toy, check_identity=ex.check_identity)). Unknown attributes are forwarded to the model (as
-      ArenaToy.__getattr__ does); "model" and dunder names are never forwarded.
+      ArenaToy.__getattr__ does); "model" and dunder names are never forwarded. check_divergence None: on in the host
+      mode, off in the device mode (the dispatcher's own C1.2 comparison runs anyway). gather None: "copies" in the host
+      mode, "batched" in the device mode (below).
   attributes      abi = 4, reads_arena, reads_ring, consumes_physical, tensor_payload, fresh_outputs = True (every
                   prefill / payload tensor is a fresh storage that it never touches again), producer_ready = True (I9:
                   prefill_tensors and a producer payload return (k, v, c, ready)), reset_contract = "I10"; from the
@@ -21,22 +28,37 @@ producer_ready).
                   store_device = model.device.
   forwarded       joint_pre, select, compress, embed, dist, prefill: the model's own methods, unchanged.
   attach_arena / attach_bias / attach_ring
-                  the protocol's store attachments (the generation mirrors are the store's consumer mirrors under
-                  HOOK-L6 when configured; this executor reads them only through deferred copies, never on the host).
+                  the protocol's store attachments. The generation mirrors are the pools' host mirrors, or the store's
+                  consumer mirrors under HOOK-L6 (Config.store_gen "consumer"). In the DEVICE mode the identity copies
+                  must read stream-ordered device mirrors: a call refuses (ConfigError, before any read of the call)
+                  when a generation mirror it reads is a host (CPU) tensor and check_identity is on, because a copy from
+                  a host mirror runs at call time, so the identity check would be vacuous. The dispatcher attaches the
+                  pools' host mirrors first and re-attaches the consumer mirrors later (HOOK-L6), so the refusal is
+                  at the first call, not at an attach.
   joint_post(l, rows) -> (outs, read_ev)
                   the validator reads (below), outputs from Row.kv (the non-consuming arena / ring protocol).
+  validator reads exactly the registrations and order of RingArenaToy._validator_reads. The EXPECTED bytes of an
+                  arena read are the row's eager Row.kv items of that block (as the ring validator's expectation is the
+                  eager value), never a clone of the store taken inside the stream context.
   joint_post_consume(l, rows) -> (handle, read_ev)
-                  exactly the validator reads of joint_post (same registrations, same order), then per (row, head)
-                  ONE gather on "compute" of K (n, D), V (n, D), bias (n,) in the declared logical order (Row.addr
-                  blocks as bs rows each, merged with Row.ring entries, increasing position), with ONE identity copy
-                  per block (pgen) or entry (rgen) AFTER its data; read_ev on "compute" after the call's LAST read. The
-                  handle is a dict that the dispatcher owns; this executor keeps no reference to it.
+                  exactly the validator reads of joint_post, then per (row, head) ONE gather on "compute" of K (n, D),
+                  V (n, D), bias (n,) in the declared logical order (Row.addr blocks as bs rows each, merged with
+                  Row.ring entries, increasing position), with ONE identity copy per block (pgen) or entry (rgen) AFTER
+                  its data; read_ev on "compute" after the call's LAST read. gather "copies": per block / entry backend
+                  memcpys (the host mode: deferred, as the toy); gather "batched": per (row, head) index_select /
+                  index_copy_ kernels from precomputed row indices on "compute" (data first, then the identity rows),
+                  the same bytes and order. On the host backend the batched gather runs EAGERLY (torch ops are not
+                  deferred there): it is correct only when no producer copy of the stores it reads is still queued; the
+                  default never chooses it there (tests use it on complete stores to compare the two). The handle is a
+                  dict that the dispatcher owns; this executor keeps no reference to it.
   gather_tensors / consumed_identities
                   as the protocol (every gather backing; one identity record per block / entry, expected = the
-                  Row.addr / Row.ring generation captured at call time, observed = the copied value).
+                  Row.addr / Row.ring generation captured at call time, observed = the copied value; ONE host transfer
+                  of each gather's identity tensor).
   resolve(handle) -> (outs, heads)
                   per row, in call order: heads[h] = model.head_out(l, q_h, K, V, C) on the GATHERED tensors only, then
-                  out = model.mix(l, x, heads). It never reads Row.kv for a result.
+                  out = model.mix(l, x, heads). It never reads Row.kv for a result. CUDA gather backings are marked
+                  record_stream(current stream) before use (the dispatcher drops them after the resolution).
   reference(handle) -> (outs, heads)
                   the same ops in the same order from Row.kv (the eager tensors, stacked in Row.kv order).
   check_gathered(handle)
@@ -44,57 +66,62 @@ producer_ready).
                   read_ev and its identity check, the first gathered K / V / bias row that differs (torch.equal) from
                   Row.kv raises CacheMismatch "C1.2 gathered cache mismatch: call <c> layer <l> row (<uid>, <pos>,
                   <kind>) head <h> position <p> tensor <K | V | bias>". Returns the gathers checked.
-  prefill_tensors(kv) -> (k, v, c, ready)   per layer (n, H, D), (n, H, D) and (n, H): FRESH stacks of the model's
-                  tensors kv[pos][l][h] in kv_dtype on store_device;
+  prefill_tensors(kv) -> (k, v, c, ready)   per layer (n, H, D), (n, H, D) and (n, H): FRESH tensors of the model's
+                  tensors kv[pos][l][h] in kv_dtype on store_device (ONE stack per layer and tensor kind);
   payload(kvv, at=None)                     the item's (k, v, c) as FRESH tensors (D,), (D,), (); a producer (at
                   given) gets (k, v, c, ready), an expectation (at None) (k, v, c);
   values(k, v, c)                           the eager items [(k_i, v_i, c_i)] of rows read from the stores: views of the
                   caller's tensors (the dispatcher hands clones of the store bytes), never Python lists.
-  ready (I9)      None when no ready_stream is configured: the outputs are complete tensors when they are returned (the
-                  CpuBackend, or a caller that synchronizes). With ready_stream (a stream name of the backend, for
-                  example on the CudaBackend), the stacks / copies run inside be.stream(ready_stream) and ONE event is
-                  recorded there after them (the ready event of the call).
+  producer ordering (I9; milestone-10 review MAJOR-1)
+                  host mode: the outputs are eager host tensors, complete when returned: ready None, or, with a
+                  ready_stream, an event recorded on that (deferred) stream after them (as before).
+                  device mode, every producer call: ev0 = be.event_rec(None) on the CURRENT stream (after the model's
+                  writes of the call's inputs); with a ready_stream: be.stream_wait(ready_stream, ev0), then the copies
+                  into fresh outputs inside be.stream(ready_stream) (backend memcpys), then ready = be.event_rec(
+                  ready_stream); without one: the copies on the current stream, then ready = be.event_rec(None). So
+                  ready is NEVER None in the device mode, and the store's copies (which wait ready) are ordered after
+                  the model's writes and the copies. A prefill's per-layer stack runs inside that stream context too.
 
-Instrumentation (kept in self.debug; it NEVER decides; nothing reads it for a decision):
+Instrumentation (kept in self.debug; it NEVER decides; nothing reads it for a decision; every list is bounded by
+debug_cap through _log, dropped counts the rest; NO backend event is kept after the call: booleans and times only):
   first_divergence / divergences
                   per call, the FIRST place where resolve and reference differ: dict(call, layer, uid, pos, kind,
                   head, op, index), op in "gather_k" | "gather_v" | "gather_c" (a gathered row differs from Row.kv;
                   index = the position), "head_out" (a head), "mix" (the row output; head None). The comparison runs
-                  when both results of a call exist (whichever of resolve / reference comes second), with torch.equal
-                  (check_divergence; on the GPU it synchronizes, so it is optional).
+                  when both results of a call exist (whichever of resolve / reference comes second), with torch.equal.
   identities      every consumed identity record (expected / observed generations), call, at consumed_identities.
-  gathers         per gather: call, layer, uid, pos, kind, head, n positions, bytes, ready_ev (an event recorded on
-                  "compute" right BEFORE the gather's first copy: every earlier producer copy on "compute" precedes
-                  it) and read_ev (right AFTER its last copy) when gather_events is True (else None and the call's
-                  read_ev), and consumed (True once resolve used it; the dispatcher releases the backing after the
-                  call's resolution: its consume ledger holds it until then). These events are instrumentation history
-                  (never waited on, never listed by reset_holders).
+  gathers         per gather: call, layer, uid, pos, kind, head, n positions, bytes, and, set by resolve: consumed True,
+                  events (gather_events True: an event was recorded on "compute" right before the gather's first copy
+                  and right after its last), ready_done / read_done (those events' ev_done at resolve) and gather_ns
+                  (the time between them when both completed: CUDA elapsed_time, or the CpuBackend completion times);
+                  the events stay in the dispatcher-owned handle only.
   calls           per call: call, layer, rows, gathers, bytes, pack_ns (building the gather plan and the backings),
                   gather_ns (enqueueing the copies), attn_ns / mix_ns (resolve's head_out / mix), ref_attn_ns /
                   ref_mix_ns (reference's): host wall time from time.perf_counter_ns (on the GPU without a synchronize
                   this is launch time, not kernel time).
   gathered_bytes_peak
                   the largest bytes of one call's gather backings (K, V, bias, identity copies).
-  identities and gathers keep at most debug_cap records each (dropped counts the rest).
 
 I10 (reset contract; declared in THIS class body). Audit: it keeps the model (weights and the model's own state; the
 section-1 model API holds no backend event), check_identity, the backend `be`, the attached stores and generation
-mirrors (ak, av, ac, pgen, rk, rv, rc, rgen), the register callbacks, disp (the harness's dispatcher handle) and the
-counters and the debug record (instrumentation history; its gather events are never waited on or read for a
-decision). Each call's handle and read_ev go to the dispatcher and are not kept; ready events are returned, not
-kept. So it keeps NO operational event between calls: reset_holders() == [], detach_completed() == 0.
+mirrors (ak, av, ac, pgen, rk, rv, rc, rgen), the register callbacks, disp (the harness's dispatcher handle), the
+counters and the debug record (instrumentation history WITHOUT event references). Each call's handle and read_ev go to
+the dispatcher and are not kept; ready events are returned, not kept. So it keeps NO operational event between calls:
+reset_holders() == [], detach_completed() == 0.
 """
 from __future__ import annotations
 
-import contextlib
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from .errors import CacheMismatch
+from .backend import ev_done
+from .errors import CacheMismatch, ConfigError
 
 DIVERGE_OPS = ("gather_k", "gather_v", "gather_c", "head_out", "mix")   # the debug record's op names, in check order
+GATHER_MODES = ("copies", "batched")
+HOST_BACKEND = "CpuBackend"                    # the class name of the deferred host backend (cpupack_core)
 
 
 class NosaExecutor:
@@ -110,7 +137,10 @@ class NosaExecutor:
     reset_contract = "I10"
 
     def __init__(self, model: Any, check_identity: bool = True, ready_stream: Optional[str] = None,
-                 gather_events: bool = False, check_divergence: bool = True, debug_cap: int = 100000):
+                 gather_events: bool = False, check_divergence: Optional[bool] = None, gather: Optional[str] = None,
+                 debug_cap: int = 100000):
+        if gather is not None and gather not in GATHER_MODES:
+            raise ConfigError("NosaExecutor: gather %r is not one of %s" % (gather, GATHER_MODES))
         self.model = model
         self.check_identity = bool(check_identity)
         self.L, self.H, self.D, self.V = model.L, model.H, model.D, model.V
@@ -120,7 +150,8 @@ class NosaExecutor:
         self.store_device = model.device
         self.ready_stream = ready_stream
         self.gather_events = bool(gather_events)
-        self.check_divergence = bool(check_divergence)
+        self.check_divergence = check_divergence
+        self.gather = gather
         self.debug_cap = int(debug_cap)
         self.be = self.ak = self.av = self.pgen = self.register = None
         self.ac = self.rc = None
@@ -175,7 +206,19 @@ class NosaExecutor:
     def attach_ring(self, be, rk, rv, rgen, register_ring) -> None:
         self.rk, self.rv, self.rgen, self.register_ring = rk, rv, rgen, register_ring
 
-    # -- helpers
+    # -- modes and helpers
+    def host_mode(self) -> bool:
+        """True for the deferred host backend (cpupack_core CpuBackend) or before any attach (module docstring)."""
+        return self.be is None or type(self.be).__name__ == HOST_BACKEND
+
+    def _divergence_on(self) -> bool:
+        return self.host_mode() if self.check_divergence is None else bool(self.check_divergence)
+
+    def _gather_mode(self) -> str:
+        if self.gather is not None:
+            return self.gather
+        return "copies" if self.host_mode() else "batched"
+
     def _call_id(self) -> Any:
         return getattr(self.disp, "call_id", None)
 
@@ -189,21 +232,21 @@ class NosaExecutor:
         else:
             self.debug["dropped"] += 1
 
-    def _ready(self) -> Any:
-        """I9: the ready event of a producer call, recorded on ready_stream after the call's writes (None without a
-        ready_stream: the outputs are complete when they are returned)."""
-        if self.ready_stream is None or self.be is None:
-            return None
-        return self.be.event_rec(self.ready_stream)
-
-    def _producer_stream(self):
-        """The context of a producer call's writes: be.stream(ready_stream) with a ready_stream, else nothing."""
-        if self.ready_stream is None or self.be is None:
-            return contextlib.nullcontext()
-        return self.be.stream(self.ready_stream)
-
-    def _fresh(self, t: Any, dtype: torch.dtype) -> torch.Tensor:
-        return t.detach().to(device=self.store_device, dtype=dtype).clone()
+    def _check_mirrors(self, l: int, rows) -> None:
+        """MINOR-2: in the device mode, a call whose identity copies would read a HOST generation mirror is refused
+        (ConfigError) before any read of the call (module docstring, attach_arena)."""
+        if self.host_mode() or not self.check_identity:
+            return
+        bad = []
+        if any(row.addr for row in rows) and self.pgen[l].device.type == "cpu":
+            bad.append("pgen")
+        if any(row.ring for row in rows) and self.rgen is not None and self.rgen[l].device.type == "cpu":
+            bad.append("rgen")
+        if bad:
+            raise ConfigError("NosaExecutor: on backend %s the generation mirrors %s of layer %d are host tensors: "
+                              "their identity copies would read the call-time value, not the stream-ordered one; use "
+                              "Config.store_gen 'consumer' (I11 HOOK-L6: device mirrors)"
+                              % (type(self.be).__name__, bad, l))
 
     @staticmethod
     def _stack_row(items: List[Tuple]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -211,15 +254,38 @@ class NosaExecutor:
         return (torch.stack([it[0] for it in items]), torch.stack([it[1] for it in items]),
                 torch.stack([it[2].reshape(()) for it in items]))
 
-    # -- the validator reads (RingArenaToy._validator_reads, unchanged in order and registrations)
+    def _plan(self, row, h: int) -> List[Tuple[int, str, int, int, Any]]:
+        """The declared logical order of one (row, head): Row.addr blocks (first position blk * bs) merged with the
+        Row.ring entries, by increasing position."""
+        bs = self.bs
+        items = [(blk * bs, "arena", p, g, blk) for blk, p, g in (row.addr[h] if row.addr else ())]
+        items += [(pos, "ring", e, g, kind) for pos, e, g, kind in (row.ring[h] if row.ring else ())]
+        items.sort(key=lambda x: x[0])
+        return items
+
+    def _block_offsets(self, row, h: int) -> Dict[int, int]:
+        """The index in Row.kv[h] of the first item of each Row.addr block (the plan's order is Row.kv's order)."""
+        out, off = {}, 0
+        for p0, where, a, g, tag in self._plan(row, h):
+            if where == "arena":
+                out[tag] = off
+                off += self.bs
+            else:
+                off += 1
+        return out
+
+    # -- the validator reads (RingArenaToy._validator_reads: the same registrations and order)
     def _validator_reads(self, l: int, rows) -> Tuple[int, int]:
         bs, n, nr = self.bs, 0, 0
         for row in rows:
             for h, ads in enumerate(row.addr or ()):
+                offs = self._block_offsets(row, h) if ads else {}
                 for blk, p, g in ads:
-                    for arena in self._arenas(l):
+                    items = row.kv[h][offs[blk]:offs[blk] + bs]             # MINOR-2: the eager expectation
+                    exps = self._stack_row(items)
+                    for j, arena in enumerate(self._arenas(l)):
                         src = arena[p * bs:(p + 1) * bs]
-                        exp = src.clone()                                   # the eager clone at call time
+                        exp = exps[j].to(dtype=src.dtype, device=src.device)
                         ws = torch.empty_like(src)
                         self.be.memcpy(ws, src, "compute")                  # the deferred read (a kernel read)
                         pg = None
@@ -247,6 +313,7 @@ class NosaExecutor:
 
     def joint_post(self, l, rows):
         """The non-consuming protocol: the validator reads, outputs from Row.kv (the reference ops)."""
+        self._check_mirrors(l, rows)
         outs = []
         for row in rows:
             heads = [self.model.head_out(l, row.q[h], *self._stack_row(row.kv[h])) for h in range(self.H)]
@@ -259,16 +326,7 @@ class NosaExecutor:
         return outs, read_ev
 
     # -- C1.2 consumption
-    def _plan(self, row, h: int) -> List[Tuple[int, str, int, int, Any]]:
-        """The declared logical order of one (row, head): Row.addr blocks (first position blk * bs) merged with the
-        Row.ring entries, by increasing position."""
-        bs = self.bs
-        items = [(blk * bs, "arena", p, g, blk) for blk, p, g in (row.addr[h] if row.addr else ())]
-        items += [(pos, "ring", e, g, kind) for pos, e, g, kind in (row.ring[h] if row.ring else ())]
-        items.sort(key=lambda x: x[0])
-        return items
-
-    def _gather(self, l: int, i: int, row, h: int, call: Any) -> Dict[str, Any]:
+    def _gather(self, l: int, i: int, row, h: int, call: Any, mode: str) -> Dict[str, Any]:
         bs, D, be = self.bs, self.D, self.be
         t0 = time.perf_counter_ns()
         items = self._plan(row, h)
@@ -277,48 +335,93 @@ class NosaExecutor:
         V = torch.empty((n, D), dtype=self.av[l].dtype, device=self.av[l].device)
         C = torch.empty((n,), dtype=self.ac[l].dtype, device=self.ac[l].device)
         ID = torch.empty((len(items),), dtype=torch.int64, device=self.pgen[l].device)
-        t1 = time.perf_counter_ns()
-        ready_ev = be.event_rec("compute") if self.gather_events else None
         idents, positions = [], []
-        k = 0
         for t, (p0, where, a, g, tag) in enumerate(items):
-            if where == "arena":
-                r0 = a * bs
-                be.memcpy(K[k:k + bs], self.ak[l][r0:r0 + bs], "compute")
-                be.memcpy(V[k:k + bs], self.av[l][r0:r0 + bs], "compute")
-                be.memcpy(C[k:k + bs], self.ac[l][r0:r0 + bs], "compute")
-                be.memcpy(ID[t:t + 1], self.pgen[l][a:a + 1], "compute")   # the generation AFTER its data
-                positions.extend(range(p0, p0 + bs))
-                k += bs
-            else:
-                be.memcpy(K[k], self.rk[l][a], "compute")
-                be.memcpy(V[k], self.rv[l][a], "compute")
-                be.memcpy(C[k:k + 1], self.rc[l][a:a + 1], "compute")
-                be.memcpy(ID[t:t + 1], self.rgen[l][a:a + 1], "compute")   # the generation AFTER its data
-                positions.append(p0)
-                k += 1
+            positions.extend(range(p0, p0 + bs) if where == "arena" else (p0,))
             idents.append(dict(where=where, layer=l, addr=a, expected=int(g), slot=t, head=h))
-        read_ev = be.event_rec("compute") if self.gather_events else None
+        t1 = time.perf_counter_ns()
+        ev_a = be.event_rec("compute") if self.gather_events else None
+        if mode == "batched":
+            self._gather_batched(l, items, K, V, C, ID)
+        else:
+            k = 0
+            for t, (p0, where, a, g, tag) in enumerate(items):
+                if where == "arena":
+                    r0 = a * bs
+                    be.memcpy(K[k:k + bs], self.ak[l][r0:r0 + bs], "compute")
+                    be.memcpy(V[k:k + bs], self.av[l][r0:r0 + bs], "compute")
+                    be.memcpy(C[k:k + bs], self.ac[l][r0:r0 + bs], "compute")
+                    be.memcpy(ID[t:t + 1], self.pgen[l][a:a + 1], "compute")   # the generation AFTER its data
+                    k += bs
+                else:
+                    be.memcpy(K[k], self.rk[l][a], "compute")
+                    be.memcpy(V[k], self.rv[l][a], "compute")
+                    be.memcpy(C[k:k + 1], self.rc[l][a:a + 1], "compute")
+                    be.memcpy(ID[t:t + 1], self.rgen[l][a:a + 1], "compute")   # the generation AFTER its data
+                    k += 1
+        ev_b = be.event_rec("compute") if self.gather_events else None
         t2 = time.perf_counter_ns()
         nbytes = sum(x.untyped_storage().nbytes() for x in (K, V, C, ID))
         log = dict(call=call, layer=l, uid=row.uid, pos=row.pos, kind=row.kind, head=h, n=n, bytes=nbytes,
-                   ready_ev=ready_ev, read_ev=read_ev, consumed=False)
+                   consumed=False, events=self.gather_events, ready_done=None, read_done=None, gather_ns=None)
         self._log("gathers", log)
         return dict(i=i, h=h, K=K, V=V, C=C, ID=ID, idents=idents, positions=positions, uid=row.uid, pos=row.pos,
-                    kind=row.kind, bytes=nbytes, log=log, pack_ns=t1 - t0, gather_ns=t2 - t1)
+                    kind=row.kind, bytes=nbytes, log=log, ev_a=ev_a, ev_b=ev_b, pack_ns=t1 - t0, gather_ns=t2 - t1)
+
+    def _gather_batched(self, l: int, items, K, V, C, ID) -> None:
+        """MINOR-3: the gather of one (row, head) as index kernels on the caller's "compute" stream context: the arena
+        rows and the ring rows each by ONE index_select from precomputed row indices, placed by ONE index_copy_ into
+        the declared order; then the identity rows (pgen / rgen) the same way, AFTER the data. Eager on the host
+        backend (module docstring)."""
+        bs = self.bs
+        dev = K.device
+        dst_a, src_a, dst_r, src_r, slot_a, gen_a, slot_r, gen_r = [], [], [], [], [], [], [], []
+        k = 0
+        for t, (p0, where, a, g, tag) in enumerate(items):
+            if where == "arena":
+                dst_a.extend(range(k, k + bs))
+                src_a.extend(range(a * bs, (a + 1) * bs))
+                slot_a.append(t)
+                gen_a.append(a)
+                k += bs
+            else:
+                dst_r.append(k)
+                src_r.append(a)
+                slot_r.append(t)
+                gen_r.append(a)
+                k += 1
+        if src_a:
+            si = torch.tensor(src_a, dtype=torch.int64, device=dev)
+            di = torch.tensor(dst_a, dtype=torch.int64, device=dev)
+            K.index_copy_(0, di, self.ak[l].index_select(0, si))
+            V.index_copy_(0, di, self.av[l].index_select(0, si))
+            C.index_copy_(0, di, self.ac[l].index_select(0, si))
+        if src_r:
+            si = torch.tensor(src_r, dtype=torch.int64, device=self.rk[l].device)
+            di = torch.tensor(dst_r, dtype=torch.int64, device=dev)
+            K.index_copy_(0, di, self.rk[l].index_select(0, si).to(dev))
+            V.index_copy_(0, di, self.rv[l].index_select(0, si).to(dev))
+            C.index_copy_(0, di, self.rc[l].index_select(0, si.to(self.rc[l].device)).to(dev))
+        if gen_a:                                                       # the identity rows AFTER the data
+            ID.index_copy_(0, torch.tensor(slot_a, dtype=torch.int64, device=ID.device),
+                           self.pgen[l].index_select(0, torch.tensor(gen_a, dtype=torch.int64,
+                                                                     device=self.pgen[l].device)).to(ID.device))
+        if gen_r:
+            ID.index_copy_(0, torch.tensor(slot_r, dtype=torch.int64, device=ID.device),
+                           self.rgen[l].index_select(0, torch.tensor(gen_r, dtype=torch.int64,
+                                                                     device=self.rgen[l].device)).to(ID.device))
 
     def joint_post_consume(self, l, rows):
+        self._check_mirrors(l, rows)
         call = self._call_id()
+        mode = self._gather_mode()
         gathers = []
         with self.be.stream("compute"):
             n, nr = self._validator_reads(l, rows)                      # exactly joint_post's validator reads
             for i, row in enumerate(rows):
                 for h in range(self.H):
-                    gathers.append(self._gather(l, i, row, h, call))
+                    gathers.append(self._gather(l, i, row, h, call, mode))
             read_ev = self.be.event_rec("compute") if (n or nr) else None   # after the call's LAST read
-        if not self.gather_events:
-            for gt in gathers:
-                gt["log"]["read_ev"] = read_ev
         self.reads += n
         self.ring_reads += nr
         self.gathers += len(gathers)
@@ -326,10 +429,10 @@ class NosaExecutor:
         self.consumed_rows += len(rows)
         nbytes = sum(gt["bytes"] for gt in gathers)
         self.debug["gathered_bytes_peak"] = max(self.debug["gathered_bytes_peak"], nbytes)
-        rec = dict(call=call, layer=l, rows=len(rows), gathers=len(gathers), bytes=nbytes,
+        rec = dict(call=call, layer=l, rows=len(rows), gathers=len(gathers), bytes=nbytes, mode=mode,
                    pack_ns=sum(gt["pack_ns"] for gt in gathers), gather_ns=sum(gt["gather_ns"] for gt in gathers),
                    attn_ns=None, mix_ns=None, ref_attn_ns=None, ref_mix_ns=None)
-        self.debug["calls"].append(rec)
+        self._log("calls", rec)
         return dict(l=l, call=call, rows=list(rows), gathers=gathers, rec=rec), read_ev
 
     def gather_tensors(self, handle):
@@ -337,25 +440,51 @@ class NosaExecutor:
                 for part, name in (("k", "K"), ("v", "V"), ("c", "C"), ("id", "ID"))]
 
     def consumed_identities(self, handle):
-        out = [dict(rec, observed=int(gt["ID"][rec["slot"]]), uid=gt["uid"], pos=gt["pos"], kind=gt["kind"])
-               for gt in handle["gathers"] for rec in gt["idents"]]
+        out = []
+        for gt in handle["gathers"]:
+            obs = gt["ID"].tolist()                                     # ONE host transfer per gather
+            for rec in gt["idents"]:
+                out.append(dict(rec, observed=int(obs[rec["slot"]]), uid=gt["uid"], pos=gt["pos"], kind=gt["kind"]))
         for rec in out:
             self._log("identities", dict(rec, call=handle.get("call")))
         return out
 
+    @staticmethod
+    def _elapsed_ns(a: Any, b: Any) -> Optional[int]:
+        """The time between two completed events: CUDA elapsed_time (ms), or the CpuBackend completion times."""
+        if a is None or b is None or not (ev_done(a) and ev_done(b)):
+            return None
+        et = getattr(a, "elapsed_time", None)
+        if callable(et):
+            try:
+                return int(et(b) * 1e6)
+            except Exception:
+                return None
+        ta, tb = getattr(a, "t_ns", None), getattr(b, "t_ns", None)
+        return None if ta is None or tb is None else int(tb - ta)
+
     def resolve(self, handle):
         l, rows = handle["l"], handle["rows"]
         per = {(gt["i"], gt["h"]): gt for gt in handle["gathers"]}
+        cur = torch.cuda.current_stream() if any(gt["K"].is_cuda for gt in handle["gathers"]) else None
         outs, heads = [], []
         attn = mix = 0
         for i, row in enumerate(rows):                                  # ONLY the gathered rows (never Row.kv)
             hh = []
             for h in range(self.H):
                 gt = per[(i, h)]
+                if cur is not None:                                     # NIT-5: the backings are used here
+                    for name in ("K", "V", "C", "ID"):
+                        if gt[name].is_cuda:
+                            gt[name].record_stream(cur)
                 t0 = time.perf_counter_ns()
                 hh.append(self.model.head_out(l, row.q[h], gt["K"], gt["V"], gt["C"]))
                 attn += time.perf_counter_ns() - t0
-                gt["log"]["consumed"] = True
+                log = gt["log"]
+                log["consumed"] = True
+                if gt["ev_a"] is not None:                              # NIT-4: booleans and times, no event kept
+                    log["ready_done"], log["read_done"] = bool(ev_done(gt["ev_a"])), bool(ev_done(gt["ev_b"]))
+                    log["gather_ns"] = self._elapsed_ns(gt["ev_a"], gt["ev_b"])
             t0 = time.perf_counter_ns()
             y = self.model.mix(l, row.hidden, hh)
             mix += time.perf_counter_ns() - t0
@@ -392,7 +521,7 @@ class NosaExecutor:
 
     # -- instrumentation: the first divergence of a call (never decides)
     def _compare(self, handle) -> None:
-        if not self.check_divergence or "resolved" not in handle or "referenced" not in handle \
+        if not self._divergence_on() or "resolved" not in handle or "referenced" not in handle \
                 or handle.get("compared"):
             return
         handle["compared"] = True
@@ -427,7 +556,7 @@ class NosaExecutor:
         row = rows[i]
         rec = dict(call=handle.get("call"), layer=l, uid=row.uid, pos=row.pos, kind=row.kind, head=h, op=op,
                    index=idx)
-        self.debug["divergences"].append(rec)
+        self._log("divergences", rec)
         if self.debug["first_divergence"] is None:
             self.debug["first_divergence"] = rec
 
@@ -452,37 +581,64 @@ class NosaExecutor:
             n += 1
         return n
 
-    # -- the store hooks (tensor_store.py DISPATCHER ADAPTER; I9)
+    # -- the store hooks (tensor_store.py DISPATCHER ADAPTER; I9 with the producer ordering of the module docstring)
+    def _device_copy(self, src: torch.Tensor, dtype: torch.dtype, stream: Optional[str]) -> torch.Tensor:
+        out = torch.empty(src.shape, dtype=dtype, device=self.store_device)
+        self.be.memcpy(out, src, stream)
+        return out
+
+    def _produce(self, build) -> Tuple[List[torch.Tensor], Any]:
+        """One producer call. build(stream) returns [(source tensor, dtype)]; it runs on the producer stream context
+        (device mode). Host mode: fresh eager tensors, ready None (or an event recorded on the deferred ready_stream
+        after them, when one is configured). Device mode: ev0 on the current stream; with a
+        ready_stream, a wait on ev0 there, the backend copies into fresh outputs there, ready recorded there; without
+        one, the copies and ready on the current stream (module docstring, producer ordering)."""
+        be, rs = self.be, self.ready_stream
+        if self.host_mode():
+            outs = [src.detach().to(device=self.store_device, dtype=dt).clone() for src, dt in build(None)]
+            return outs, (be.event_rec(rs) if (rs is not None and be is not None) else None)
+        ev0 = be.event_rec(None)                                       # after the model's writes (current stream)
+        if rs is None:
+            outs = [self._device_copy(src, dt, None) for src, dt in build(None)]
+            return outs, be.event_rec(None)
+        be.stream_wait(rs, ev0)
+        with be.stream(rs):
+            outs = [self._device_copy(src, dt, rs) for src, dt in build(rs)]
+            ready = be.event_rec(rs)
+        return outs, ready
+
     def prefill_tensors(self, kv):
-        """Per layer (n, H, D) K, V and (n, H) bias: FRESH stacks of kv[pos][l][h] = (k, v, c) in kv_dtype on
-        store_device; returns (k, v, c, ready) (I9; ready None without a ready_stream)."""
-        n, H, L = len(kv), self.H, self.L
-        ks, vs, cs = [], [], []
-        with self._producer_stream():
-            for l in range(L):
-                ks.append(torch.stack([torch.stack([kv[p][l][h][0] for h in range(H)]) for p in range(n)])
-                          .to(device=self.store_device, dtype=self.kv_dtype).clone())
-                vs.append(torch.stack([torch.stack([kv[p][l][h][1] for h in range(H)]) for p in range(n)])
-                          .to(device=self.store_device, dtype=self.kv_dtype).clone())
-                cs.append(torch.stack([torch.stack([kv[p][l][h][2].reshape(()) for h in range(H)]) for p in range(n)])
-                          .to(device=self.store_device, dtype=self.bias_dtype).clone())
-            ready = self._ready()
+        """Per layer (n, H, D) K, V and (n, H) bias: FRESH tensors of kv[pos][l][h] = (k, v, c) in kv_dtype on
+        store_device, from ONE stack per layer and kind; returns (k, v, c, ready) (I9; module docstring)."""
+        n, H, L, D = len(kv), self.H, self.L, self.D
+
+        def build(stream):
+            srcs = []
+            for part, dt, shape in ((0, self.kv_dtype, (n, H, D)), (1, self.kv_dtype, (n, H, D)),
+                                    (2, self.bias_dtype, (n, H))):
+                for l in range(L):
+                    flat = [kv[p][l][h][part].reshape(-1) if part < 2 else kv[p][l][h][part].reshape(())
+                            for p in range(n) for h in range(H)]
+                    srcs.append((torch.stack(flat).reshape(shape), dt))
+            return srcs
+        outs, ready = self._produce(build)
         self.prefills += 1
-        return ks, vs, cs, ready
+        return outs[:L], outs[L:2 * L], outs[2 * L:], ready
 
     def payload(self, kvv, at=None):
         """The item's (k, v, c) as FRESH tensors (D,), (D,), (); a producer (at given) gets (k, v, c, ready) (I9), an
-        expectation (at None) gets (k, v, c)."""
+        expectation (at None) gets (k, v, c) (fresh eager clones: the dispatcher's expectations, no ordering)."""
         k, v, c = kvv[0], kvv[1], kvv[2]
         self.payloads += 1
         if at is None:
             return (self._fresh(k, self.kv_dtype), self._fresh(v, self.kv_dtype),
                     self._fresh(c, self.bias_dtype).reshape(()))
-        with self._producer_stream():
-            out = (self._fresh(k, self.kv_dtype), self._fresh(v, self.kv_dtype),
-                   self._fresh(c, self.bias_dtype).reshape(()))
-            ready = self._ready()
-        return out + (ready,)
+        outs, ready = self._produce(lambda stream: [(k, self.kv_dtype), (v, self.kv_dtype),
+                                                    (c.reshape(()), self.bias_dtype)])
+        return outs[0], outs[1], outs[2], ready
+
+    def _fresh(self, t: Any, dtype: torch.dtype) -> torch.Tensor:
+        return t.detach().to(device=self.store_device, dtype=dtype).clone()
 
     def values(self, k, v, c):
         """The eager items of rows read from the stores: [(k[i], v[i], c[i])] views of the caller's tensors (the
