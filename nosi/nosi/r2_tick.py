@@ -856,7 +856,8 @@ class ResidencyBackend:
                             % (svc.B, svc.L, svc.H, svc.n_hist, eng.B, eng.L, eng.H, eng.NB))
         self.eng, self.svc, self.host_k, self.host_v = eng, svc, host_k, host_v
         self.new_event, self.K = new_event, int(K)
-        self.sb = hasattr(svc, "mirrors")                    # ResidencySB: the selection stays on the device
+        from .r2_residency_sb import ResidencySB             # S-B and S-C (its subclass): the selection stays on the
+        self.sb = isinstance(svc, ResidencySB)               # device (C's 41bc238 sets S-C's .mirrors to None)
         self.keys: Dict[int, tuple] = {}                     # b -> the verify key of the current tick
         self.ended = set()
         self.n_host = int(host_k[0].shape[1])
