@@ -38,7 +38,13 @@ Every part below runs on its own copy of BASE (BASE.clone()).
   SG4  the NEGATIVES, each SG1's teacher-forced tick over --sg4-steps tokens with ONE op replaced: (a) natural cuBLAS
        (gemm fast), (b) a batch-keyed split-KV attention (8 pages per split for <= B rows, else 4: r2_tick.
        BatchKeyedSplit), (c) torch.topk(sorted=False) selection (r2_tick.topk_select). MUST: each run completes;
-       REPORT: DETECTED (some verify row differs from REF) or BLIND.
+       REPORT: DETECTED (some verify row differs from REF) or BLIND. SG1 and SG4c count the NATURAL ties across the
+       two cuts of the selection per layer (r2_tick.tie_stats; REPORT: with none, the tie rule is unobservable).
+       SG4c PLANTED (lead, 2026-10-21): ties planted across the top-k cut (r2_tick.plant_tie) at layers 0, L / 2,
+       L - 1 for the rows of requests 0 and 1; MUST precondition (asserted first): the engine counts a top-k tie for
+       every planted (row, head, layer); MUST: torch.topk(sorted=False) changes some verify row against the stable
+       rule under the same plants; MUST control: the higher-id tie rule (r2_tick.high_select) changes some verify row
+       (by construction, so the plants reach the selection).
 REPORT: ticks, rows per tick (draft / verify), decision reads, ticks with verify rows, rollbacks, publications,
 write-backs, acceptance (NOT representative: the drafts are a stand-in), host ms per tick, ms per REF step, GPU peak.
 OUTPUT: --out/summary.json (written after every part). The last stdout line is R2_TICK_GATE_DONE failed=<n>; exit = n
@@ -150,6 +156,77 @@ def part_sg0(a, base, ref, gates, res):
     del eng
 
 
+def tie_summary(eng):
+    """The engine's tie counters (one read): per layer (pairs, ties at the QK_SELECT cut, ties at the top-k cut)."""
+    rows = eng.tie_report()
+    pairs = sum(r[0] for r in rows)
+    tq, tc = sum(r[1] for r in rows), sum(r[2] for r in rows)
+    text = ("%d (row, head, layer) selections: %d tie across the QK_SELECT cut, %d across the top-k cut (layers with a "
+            "top-k tie: %d of %d)%s" % (pairs, tq, tc, sum(1 for r in rows if r[2]), len(rows),
+                                        "" if tq or tc else "; NO natural tie at either cut: the tie rule (stable vs "
+                                        "torch.topk) is unobservable in practice on these pooled scores"))
+    return dict(per_layer=rows, pairs=pairs, ties_qk=tq, ties_topk=tc, text=text)
+
+
+def planted_run(a, base, ref, select, layers, requests, steps):
+    """SG4c PLANTED: SG1's teacher-forced tick over `steps` tokens with ties planted across the top-k cut (r2_tick.
+    plant_tie) at `layers` for the rows of `requests`, the selection rule `select`. Returns (verify logits in tick and
+    row order (GPU), the tie counters per layer, the planted (row, head, layer) pairs counted on the host)."""
+    import torch
+    from nosi.r2_tick import forced_schedule, run_round
+    eng = base.clone(select=select)
+    eng.count_ties()
+    eng.plant_ties(requests, layers)
+    B, S_list, toks = eng.B, eng.S_list, ref["tok_host"]
+    logits, planted = [], [0]
+    rq = set(requests)
+
+    def teacher(b, p):
+        return int(toks[p - S_list[b], b])
+
+    def on_tick(rows, tokens, out):
+        vi = [k for k, r in enumerate(rows) if r.kind == "v"]
+        if vi:
+            logits.append(out.logits.index_select(0, torch.tensor(vi, device=out.logits.device)).clone())
+        planted[0] += sum(1 for r in rows if r.b in rq) * eng.H * len(layers)
+    reject_at, _ = forced_schedule(a.K)
+    run_round(eng, [int(toks[0, b]) for b in range(B)], [steps] * B, K=a.K, LAMBDA=a.LAMBDA, teacher=teacher,
+              reject_at=reject_at, on_tick=on_tick)
+    out = (torch.cat(logits) if logits else None, eng.tie_report(), planted[0])
+    del eng
+    return out
+
+
+def part_planted(a, base, ref, gates, res):
+    """SG4c PLANTED (lead, 2026-10-21): the precondition (every planted (row, head, layer) has a tie across the top-k
+    cut, counted by the engine) asserted FIRST; then torch.topk(sorted=False) must change some verify row against the
+    stable rule under the same plants (MUST, the lead's requirement); the higher-id tie rule is the control that the
+    plants reach the selection (MUST: it differs by construction)."""
+    from nosi.r2_tick import high_select, topk_select
+    from nosi.r2_spec_core import select_blocks
+    layers = sorted({0, len(base.twins) // 2, len(base.twins) - 1})
+    requests = list(range(min(2, base.B)))
+    st_logits, st_ties, _ = planted_run(a, base, ref, select_blocks, layers, requests, a.sg4_steps)
+    planted = sum(st_ties[l][3] for l in layers)
+    got = sum(st_ties[l][4] for l in layers)
+    pre = st_logits is not None and planted > 0 and got == planted
+    gates.append(GB.gate("SG4c_planted_precondition", pre, True,
+                         "planted (row, head, layer) pairs %d (counted on the device); of them tie across the top-k cut "
+                         "%d (must be all)" % (planted, got)))
+    out = dict(layers=layers, requests=requests, planted=planted, ties_stable=st_ties)
+    for name, sel, label in (("SG4c_planted_topk", topk_select, "torch.topk(sorted=False)"),
+                             ("SG4d_planted_high", high_select, "ties to the higher block id (the control)")):
+        lg, ties, _ = planted_run(a, base, ref, sel, layers, requests, a.sg4_steps)
+        same_shape = lg is not None and st_logits is not None and lg.shape == st_logits.shape
+        differ = int((lg != st_logits).any(-1).sum()) if same_shape else -1
+        gates.append(GB.gate(name + "_detected", pre and same_shape and differ > 0, True,
+                             "%s under the planted ties: %d of %d verify rows differ from the stable rule's%s"
+                             % (label, differ, 0 if lg is None else lg.shape[0],
+                                "" if pre else " (the precondition FAILED: not a valid detection)")))
+        out[name] = dict(differ=differ, rows=None if lg is None else int(lg.shape[0]), ties=ties)
+    res["SG4c_planted"] = out
+
+
 def part_tick(a, base, ref, gates, res, forced, name=None, ready=None, eng_kw=None, steps=None, negative=None):
     """SG1 (forced), SG2 (free running), SG3 (forced + ready = phase_ready: the phase mix) and the SG4 negatives
     (forced, eng_kw replaces the ops or the selection; negative = its label: detection is a REPORT)."""
@@ -158,6 +235,8 @@ def part_tick(a, base, ref, gates, res, forced, name=None, ready=None, eng_kw=No
     name = name or ("SG1" if forced else "SG2")
     steps = steps or a.steps
     eng = base.clone(**(eng_kw or {}))                                     # draft rows drop --draft-drop in all
+    if name in ("SG1", "SG4c"):
+        eng.count_ties()                                                   # natural ties at the two cuts (report)
     B, S_list = eng.B, eng.S_list
     toks = ref["tok_host"]
     n_ref = ref["logits"].shape[0]
@@ -216,6 +295,9 @@ def part_tick(a, base, ref, gates, res, forced, name=None, ready=None, eng_kw=No
     bad = [records[j][:2] for j in cmp_idx if not eq[j]]
     ctrl = [records[j][:2] for j in cmp_idx if nx[j]]
     committed_ok = [rnd.reqs[b].out == [int(toks[s, b]) for s in range(steps)] for b in range(B)]
+    ties = tie_summary(eng) if eng.tie_acc is not None else None
+    if ties is not None:
+        gates.append(GB.gate("R_%s_natural_ties" % name, True, False, ties["text"]))
     if negative is not None:                                               # SG4: detection is a REPORT
         gates.append(GB.gate("R_%s_detected" % name, True, False,
                              ("DETECTED (%s): %d of %d verify rows differ from REF, first (request, position) %s"
@@ -225,7 +307,7 @@ def part_tick(a, base, ref, gates, res, forced, name=None, ready=None, eng_kw=No
         gates.append(GB.gate("%s_ran" % name, bool(cmp_idx) and all(committed_ok), True,
                              "the teacher-forced run completed: %d verify rows compared, committed == REF for %d of %d"
                              % (len(cmp_idx), sum(committed_ok), B)))
-        res[name] = dict(negative=negative, compared=len(cmp_idx), differ=len(bad), ticks=rnd.ticks)
+        res[name] = dict(negative=negative, compared=len(cmp_idx), differ=len(bad), ticks=rnd.ticks, ties=ties)
         del eng
         return
     must = a.gemm == "exact"
@@ -365,6 +447,7 @@ def main(argv=None) -> int:
                      dict(ops=SimpleNamespace(linear=ops.linear, attn=BatchKeyedSplit(attn, a.batch), mean=ops.mean))),
                     ("SG4c", "torch.topk(sorted=False) selection (the shipped tie rule)", dict(select=topk_select)))
             runs = [("SG0", None), ("SG1", None), ("SG2", None), ("SG3", None)] + [("SG4", n) for n in negs]
+            runs.append(("SG4", ("SG4c_planted", "planted ties", None)))
             for part, neg in runs:
                 if part not in a.parts:
                     continue
@@ -377,6 +460,8 @@ def main(argv=None) -> int:
                         part_tick(a, base, ref, gates, res, forced=(part == "SG1"))
                     elif part == "SG3":
                         part_tick(a, base, ref, gates, res, forced=True, name="SG3", ready=phase_ready(a.phase))
+                    elif neg[0] == "SG4c_planted":
+                        part_planted(a, base, ref, gates, res)
                     else:
                         part_tick(a, base, ref, gates, res, forced=True, name=neg[0], eng_kw=neg[2],
                                   steps=a.sg4_steps, negative=neg[1])

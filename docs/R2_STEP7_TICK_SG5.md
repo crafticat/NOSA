@@ -1,7 +1,9 @@
 # R2 step 7, piece 4: the SG5 harness (R-PERF) on piece 5's Residency (DESIGN)
 
-Branch `feature/nosi-r2-m2-tick`. Status: DESIGN, for review by C (the owner of piece 5) and the lead. Nothing in
-this note is built. SG0-SG4 are built (`benchmarks/Efficiency/r2_tick_gate.py`).
+Branch `feature/nosi-r2-m2-sg5` (worktree `/mnt/beegfs/ojerbi/nosi-r2-m2-sg5`, from a35037b with C's 2ec08da).
+Status: BUILT (source only, not run): the seam (`r2_tick.ResidentStore` / `ResidencyBackend`), `advance_unchecked`
+with the void rule, `TickTimer`, the gate `benchmarks/Efficiency/r2_tick_sg5.py` and its step
+`r2_tick_sg5_step.sh`; C's answers Q-S1 .. Q-S5 (2026-10-21) applied as below. The design text follows.
 Inputs: `docs/R2_STEP7_SPEC_ROUND.md` 1.2 and 7.3 (R-PERF, the budget); C's piece 5
 (`/mnt/beegfs/ojerbi/nosi-r2-m2-fetch` 8ee74bc: `nosi/nosi/r2_residency.py`, `docs/R2_STEP7_FETCH_RETENTION.md`
 section 8); C's sync-free twin step (4fe5fc9: `step_unchecked` / `advance_unchecked`); C's answers Q1-Q5

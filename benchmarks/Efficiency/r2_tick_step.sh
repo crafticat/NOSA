@@ -23,7 +23,7 @@
 # 124 / 137 the host timeout; 1 a STOP before the launch (a missing or malformed uuid file included); 5 an exit-0 step
 # whose record is incomplete or whose sacct row is not COMPLETED 0:0.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-m2-tick                                                  # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-m2-sg5                                                   # ROOT (the SG5 worktree; the tick tree stays pinned)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT

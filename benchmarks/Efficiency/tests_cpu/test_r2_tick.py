@@ -402,6 +402,79 @@ def make_engine(ops, S_list=S_TINY, steps=STEPS, seed=1, cls=None, width_S=max(S
                                   check=True, **kw)
 
 
+RES = _load("r2_residency")
+RSB = _load("r2_residency_sb")
+RSC = _load("r2_residency_sc")
+KTR = sys.modules[PKG + ".kstep.transfer"]
+
+
+class Ev:
+    """A CPU event (K3X's backend shape: .done); the CPU's reads are complete when recorded."""
+
+    def __init__(self, done=True):
+        self.done = done
+
+
+class Be:
+    def __init__(self):
+        self.waits = 0
+
+    def host_wait(self, ev):
+        if ev is not None and not ev.done:
+            ev.done = True
+            self.waits += 1
+
+
+def make_res_engine(ops, kind="v1", C=12, X=24, R_ver=4, S_list=S_TINY, steps=STEPS, seed=1, backend_cls=None,
+                    mode="delay", **kw):
+    """make_engine's state on the RESIDENCY layout (TickEngine.from_r2(hist_slots=C + X)): C + X empty historical
+    slots per stream, the same tail rings; the prompt's K / V in the host rows; piece 5's service (kind v1 / sb / sc,
+    C's 2ec08da) with K3X's adversarial transport (seeded delays, reordering, bursts) over the engine's store, the cis
+    tables = the twins' exact banks; a ResidencyBackend attached."""
+    ref = make_engine(ops, S_list=S_list, steps=steps, seed=seed)          # the twins and the data, then re-laid out
+    B, NBr = len(S_list), C + X
+    n_host = (ref.NB + 1) * BS
+    host_k = [torch.zeros(B, n_host, HKV, D) for _ in range(NL_LAYERS)]
+    host_v = [torch.zeros(B, n_host, HKV, D) for _ in range(NL_LAYERS)]
+    sk, sv, sb = [], [], []
+    for l in range(NL_LAYERS):
+        k = torch.zeros(B, (NBr + 4) * BS, HKV, D)
+        v = torch.zeros_like(k)
+        bias = torch.zeros(B, (NBr + 4) * BS, HKV)
+        for b, S in enumerate(S_list):
+            full = (S // BS) * BS
+            host_k[l][b, :full] = ref.store_k[l][b, :full]                  # the prompt's complete blocks
+            host_v[l][b, :full] = ref.store_v[l][b, :full]
+            e_ref, e_new = ref.NB * BS, NBr * BS                           # the four tail pages, as laid out
+            k[b, e_new:e_new + 4 * BS] = ref.store_k[l][b, e_ref:e_ref + 4 * BS]
+            v[b, e_new:e_new + 4 * BS] = ref.store_v[l][b, e_ref:e_ref + 4 * BS]
+            bias[b, e_new:e_new + 4 * BS] = ref.store_bias[l][b, e_ref:e_ref + 4 * BS]
+            if S > full:                                                   # the partial block's prompt rows too
+                r0 = (ref.NB + (S // BS) % 2) * BS
+                host_k[l][b, full:S] = ref.store_k[l][b, r0:r0 + S - full]
+                host_v[l][b, full:S] = ref.store_v[l][b, r0:r0 + S - full]
+        sk.append(k)
+        sv.append(v)
+        sb.append(bias)
+    eng = TK.TickEngine(ref.model, ops, ref.twins, sk, sv, sb, S_list, ref.M_alloc, nl=NL_CPU, stage1=_stage1,
+                        pool=_pool, check=True, **kw)
+    be = Be()
+    tp = KTR.AdversarialTransport(be, host_k, host_v, sk, sv, BS, seed, mode=mode, max_delay=3)
+    gather = RES.TorchGather(host_k, host_v, sk, sv)
+    cis = [t.total_cis[:B] for t in eng.twins]
+    args = (NL_LAYERS, B, HKV, C, X, R_ver, tp, gather)
+    skw = dict(store_b=sb, cis=cis, block_bytes=BS * 2 * D * 4, host_wait=be.host_wait)
+    if kind == "v1":
+        svc = RES.Residency(*args, **skw)
+    elif kind == "sb":
+        svc = RSB.ResidencySB(*args, device="cpu", nblk=n_host // BS, **skw)
+    else:
+        svc = RSC.ResidencySC(*args, device="cpu", nblk=n_host // BS, **skw)
+    eng.attach_backend((backend_cls or TK.ResidencyBackend)(eng, svc, host_k, host_v, lambda: Ev(True), 3))
+    eng.res_world = SimpleNamespace(svc=svc, tp=tp, be=be, host_k=host_k, host_v=host_v)
+    return eng
+
+
 FIRST = [3, 7, 11, 13]
 
 
@@ -578,6 +651,109 @@ def test_T14_negative_ops_and_phase_helpers(p3):
             SimpleNamespace(b=2, kind="d")]
     assert TK.compositions(rows) == [("d", True, True, True, 4), ("v", True, True, True, 4), ("v", False, True, True, 4),
                                      ("d", True, True, True, 4)]
+
+
+class NoHostCopy(TK.ResidencyBackend):
+    """NEGATIVE CONTROL: a write-back that registers the block (history_written) without copying its rows to the host."""
+
+    def commit_block(self, b, blk):
+        self.svc.history_written(b, blk, self.new_event())
+
+
+@pytest.mark.parametrize("kind", ["v1", "sb", "sc"])
+def test_T15_residency_backend_equals_the_resident_store(p3, ref, kind):
+    """T15 (the SG5 seam): the teacher-forced tick on piece 5's Residency (v1 / S-B / S-C, C's 2ec08da) under K3X's
+    adversarial transport: every verify row torch.equal to the serial row (= the ResidentStore tick, T4), the committed
+    sequences the teacher's, the twins' counters the mirrors; the service fetched blocks (transfers issued, urgent misses
+    or waits seen), the decoded blocks went through the host rows (write-backs registered), drafts read READY blocks
+    only. Negative control: a write-back that does not copy the rows to the host is caught."""
+    toks, logits = ref
+    eng = make_res_engine(make_ops(p3), kind=kind)
+    res = tick_check(eng, toks, logits, forced=True)
+    assert res["compared"] > 50 and not res["bad"], res["bad"][:5]
+    assert all(res["committed_ok"]) and not res["mirror_bad"] and not res["ctrl"]
+    svc = eng.res_world.svc
+    k43 = svc.metrics.k43
+    assert sum(svc.metrics.transferred.values()) > 0 and k43["layer_calls"] > 0
+    assert eng.stats["writebacks"] >= 3 and not svc.uid_b                    # write-backs; every request ended
+    bad = make_res_engine(make_ops(p3), kind=kind, backend_cls=NoHostCopy)
+    caught = False
+    try:
+        res2 = tick_check(bad, toks, logits, forced=True)
+        caught = bool(res2["bad"])
+    except (TK.TickError, RuntimeError):
+        caught = True
+    assert caught
+
+
+def test_T16_overflow_voids_the_tick_and_the_capacity_check(p3, ref):
+    """T16: the twins advance with advance_unchecked; a set overflow flag (any layer) is read WITH the decision read and
+    VOIDS the tick: TickError, nothing committed (the committed counters stay the prompt's), void_ticks counted.
+    Negative control: the same run without the flag completes (T4). The row table's ONE capacity check refuses a row
+    whose compressed rows would reach Lk_max."""
+    toks, logits = ref
+    eng = make_engine(make_ops(p3), draft_drop=0.5)
+    eng.twins[1].overflow.fill_(True)
+    with pytest.raises(TK.TickError, match="VOID"):
+        tick_check(eng, toks, logits, forced=True)
+    assert eng.void and eng.stats["void_ticks"] == 1 and eng.committed == S_TINY and eng.stats["publications"] == 0
+    eng2 = make_engine(make_ops(p3))
+    for t in eng2.twins:
+        t.lk_max = S_TINY[0] // 16 + 1
+    with pytest.raises(TK.TickError, match="capacity"):
+        eng2.row_table([SimpleNamespace(b=0, kind="v", pos=S_TINY[0])], [1])
+    src = (NOSI / "r2_tick.py").read_text()
+    assert "twin.advance_unchecked(keys, cis_b, n_dev)" in src and "twin.advance(keys" not in src
+
+
+def _planted(p3, ref, select, requests=(3,), layers=(0,), steps=20, apply=True):
+    """A teacher-forced tick with ties planted at `layers` for `requests`: (verify logits in order, tie counters)."""
+    toks, logits = ref
+    eng = make_engine(make_ops(p3), select=select)
+    eng.count_ties()
+    eng.plant_ties(requests, layers)
+    S_list = eng.S_list
+    out_l = []
+
+    def teacher(b, p):
+        return int(toks[p - S_list[b], b])
+
+    def on_tick(rows, tokens, out):
+        vi = [k for k, r in enumerate(rows) if r.kind == "v"]
+        if vi:
+            out_l.append(out.logits[vi].clone())
+    reject_at, _ = TK.forced_schedule(3)
+    saved = TK.plant_tie
+    if not apply:
+        TK.plant_tie = functools.partial(saved, apply=False)
+    try:
+        TK.run_round(eng, [int(toks[0, b]) for b in range(eng.B)], [steps] * eng.B, teacher=teacher,
+                     reject_at=reject_at, on_tick=on_tick)
+    finally:
+        TK.plant_tie = saved
+    return torch.cat(out_l), eng.tie_report()
+
+
+def test_T17_planted_ties_precondition_and_detection(p3, ref):
+    """T17 (SG4c PLANTED on the CPU): with ties planted across the top-k cut (request 3, layer 0), the engine counts a
+    top-k tie for EVERY planted (row, head) pair (the precondition), and the higher-id tie rule then changes some verify
+    row against the stable rule (detected by construction); torch.topk on the CPU is reported, not required (its tie
+    order is the kernel's). Negative control of the precondition: a plant that reports its pairs but does not write the
+    tie (apply False) leaves fewer ties than pairs; the higher-id rule's control: without any plant the counters see no
+    planted pair."""
+    st, ties = _planted(p3, ref, SC.select_blocks)
+    planted, got = ties[0][3], ties[0][4]
+    assert planted > 0 and got == planted, ties[0]
+    assert all(t[3] == 0 for t in ties[1:])
+    hi, _ = _planted(p3, ref, TK.high_select)
+    assert hi.shape == st.shape and bool((hi != st).any(-1).any())
+    _, ties0 = _planted(p3, ref, SC.select_blocks, apply=False)
+    assert ties0[0][3] > 0 and ties0[0][4] < ties0[0][3], ties0[0]
+    _, tiesn = _planted(p3, ref, SC.select_blocks, layers=())
+    assert all(t[3] == 0 for t in tiesn)
+    tk, _ = _planted(p3, ref, TK.topk_select)
+    print("T17 REPORT: torch.topk on the CPU under the planted ties: %d of %d verify rows differ"
+          % (int((tk != st).any(-1).sum()) if tk.shape == st.shape else -1, st.shape[0]))
 
 
 class NoTwinRollback(TK.TickEngine):
@@ -843,4 +1019,101 @@ def test_T11_step_script_uuid_file_and_pins(tmp_path):
     # printf %q writes a comma as "\," (CPU job 2190867; C's G8 the same): accept that form and the plain one
     assert "--sg4-steps 32" in r.stdout and "--phase 3" in r.stdout
     for plain in ("--parts SG0,SG1,SG2,SG3,SG4", "--deltas 0,1,17,63,64,65,777,4097"):
+        assert plain in r.stdout or plain.replace(",", "\\,") in r.stdout, plain
+
+
+# =====================================================================================================================
+# SG5: the harness and its step script
+# =====================================================================================================================
+def _sg5_gate():
+    spec = importlib.util.spec_from_file_location("r2_tick_sg5_cpu", str(EFF / "r2_tick_sg5.py"))
+    G = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(EFF))
+    spec.loader.exec_module(G)
+    return G
+
+
+def test_T18_sg5_harness_on_the_cpu(p3):
+    """T18: the SG5 harness's pieces on the tiny model: its defaults (B 64, the primary point C 80 / X 32 / R_ver 16,
+    m_fix 4B, the three backends, both modes) and refusals; the draft-only tick on the S-C Residency with the CPU
+    TickTimer (every category timed per tick: gemm, twin, sel, store, res, att, tick; host: rows, backend); its
+    summary and the budget (a run against itself: every term 0). Negative control: an unknown backend is refused."""
+    G = _sg5_gate()
+    base = ["--out", "o", "--workload", "w", "--biattn", "b", "--gilfree", "g", "--gilfree-build", "/x"]
+    a = G.parse_args(base)
+    assert (a.batch, a.C, a.X, a.R_ver, a.m_fix, a.backends, a.modes) == (64, 80, 32, 16, 256, ["sc", "sb", "v1"],
+                                                                         ["exact", "fast"])
+    assert G.parse_args(base + ["--sweep", "64:16,96:64"]).sweep_pts == [(64, 16, 8), (96, 64, 32)]
+    for bad in (["--backends", "s9"], ["--modes", "slow"], ["--m-fix", "8"], ["--R-ver", "40"]):
+        with pytest.raises(SystemExit):
+            G.parse_args(base + bad)
+    eng = make_res_engine(make_ops(p3), kind="sc")
+    eng.timer = TK.TickTimer(cuda=False)
+    G.run_draft_only(eng, FIRST, 6, 3)
+    rep = eng.timer.report()
+    assert rep["ticks"] == 6
+    for c in ("gemm", "twin", "sel", "store", "res", "att", "tick"):
+        assert c in rep["device_ms"] and len(rep["device_ms"][c]) == 6, c
+    for c in ("rows", "backend"):
+        assert c in rep["host_ms"], c
+    s = G.summarize(rep)
+    assert s["device_ms"]["tick"]["n"] == 5 and s["residual_ms"] is not None
+    assert all(abs(v) < 1e-9 for v in G.budget(s, s).values())
+    assert eng.stats["draft_rows"] == 6 * eng.B and not eng.mirror_failures()
+
+
+def test_T19_sg5_step_script_uuid_file_and_pins(tmp_path):
+    """T19: r2_tick_sg5_step.sh: the uuid file rules (missing, "GPU-" prefix, two lines: STOP before any other check;
+    SG5_HOLDERS outside DRYRUN refused); the pins (piece 3 v2, the packer's two blobs of f2b981a); on a clean checkout
+    at HEAD the DRYRUN prints the uuid, the pins and the arguments of the primary point and the sweep. Static: the
+    claim sg5_active, STEP_MIN, --export=NONE, no awk / python3 / perl outside comments."""
+    script = EFF / "r2_tick_sg5_step.sh"
+    text = script.read_text()
+    lines = text.splitlines()
+    assert lines[0] == "#!/bin/bash" and lines[-1] == 'main "$@"; exit $?' and "main() {" in text
+    assert 'mkdir "$OUTROOT/sg5_active"' in text and "STEP_MIN=120" in text and "--export=NONE" in text
+    assert text.index("UFILE=$HOLDERS/$JOB.gpu_uuid") < text.index('mkdir "$OUTROOT/sg5_active"')
+    for word in ("awk", "perl", "python3", " bc ", "node "):
+        for ln in lines:
+            if not ln.lstrip().startswith("#"):
+                assert word not in ln, (word, ln)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_"))}
+
+    def run(job, content=None, dry=True, sha="0" * 40):
+        if content is not None:
+            (tmp_path / ("%s.gpu_uuid" % job)).write_text(content)
+        e = dict(env, SG5_HOLDERS=str(tmp_path))
+        if dry:
+            e["DRYRUN"] = "1"
+        else:
+            e.pop("DRYRUN", None)
+        return subprocess.run(["bash", str(script), "--nosi", sha, str(job), "t1"], env=e, capture_output=True,
+                              text=True, timeout=120)
+    uid = "f31fc723-9dfe-407a-9947-28173556232a"
+    r = run(411)
+    assert r.returncode == 1 and "no GPU uuid file" in r.stderr
+    r = run(412, "GPU-%s\n" % uid)
+    assert r.returncode == 1 and "does not hold a uuid" in r.stderr
+    r = run(413, "%s\n%s\n" % (uid, uid))
+    assert r.returncode == 1 and "more than one line" in r.stderr
+    r = run(414, uid + "\n", dry=False)
+    assert r.returncode == 1 and "for DRYRUN" in r.stderr
+    r = run(415, uid + "\n")
+    assert r.returncode == 1 and "HEAD is not" in r.stderr and "uuid" not in r.stderr.lower()
+    head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
+    dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"], capture_output=True,
+                           text=True)
+    if head.returncode != 0 or dirty.stdout.strip():
+        pytest.skip("not a clean git checkout: the full DRYRUN needs one")
+    r = run(416, uid + "\n", sha=head.stdout.strip())
+    if r.returncode != 0:
+        pytest.skip("DRYRUN stopped on a pin outside the uuid stage: %s" % r.stderr.strip()[-200:])
+    assert "gpu_uuid %s (%s/416.gpu_uuid)" % (uid, tmp_path) in r.stdout
+    assert "piece 3 %s:%s blob %s" % (PIECE3_V2["sha"], PIECE3_V2["path"], PIECE3_V2["blob"]) in r.stdout
+    assert "45c56f679b017436810bea8e16fa2719d642ba54" in r.stdout and "df3e3c8026fb0a48cc2fe2597013c3f20ab1338b" in r.stdout
+    for arg in ("--batch 64", "--S 16128", "--steps 48", "--C 80", "--X 32", "--R-ver 16", "--sweep-steps 24",
+                "--pool-baseline", "--threads 8", "NOSI_R2_DECODE=1", "NOSI_POOL_BLOCKS=0",
+                "--gilfree /mnt/beegfs/ojerbi/r2-runs/sg5/sg5_t1_416.step/gilfree"):
+        assert arg in r.stdout, arg
+    for plain in ("--modes exact,fast", "--backends sc,sb,v1", "--sweep 64:16,64:32,64:64,80:16,80:32,80:64,96:16,96:32,96:64"):
         assert plain in r.stdout or plain.replace(",", "\\,") in r.stdout, plain

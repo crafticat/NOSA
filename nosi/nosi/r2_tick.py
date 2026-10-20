@@ -52,17 +52,37 @@ ROLLBACK and PUBLICATION (TickEngine.apply_events, after the decision):
                   from its own twin rows, THEN the bank is rebuilt (sync, then advance by them), and the draft ring
                   rows of the newly published positions take the exact rows.
 HOST SYNCS. TickEngine.run_rows and apply_events contain no host read of their own (one pinned H2D copy of the row
-table per tick); read_tokens is the one decision read. PositionalTwin.step (C's, r2_positional_twin.py) still reads
-device values for its refusal checks: those syncs are counted as twin syncs, not decisions (SG5 reports them).
+table and the per-bank counts per tick); read_tokens is the one decision read. The twins advance through
+PositionalTwin.advance_unchecked (C's 4fe5fc9, bitwise advance()'s): no host read; the capacity is checked ONCE per
+tick on the host mirrors (row_table: positions < N_max, compressed rows < Lk_max); the twins' sticky overflow flag is
+read WITH the decision read, and a set flag VOIDS the tick (C, 2026-10-21): every decision of it is refused (TickError,
+nothing commits). The decision path itself (twin.commit, the draft rebuild) still uses the checked twin calls.
+
+STORAGE BACKENDS (the SG5 seam, docs/R2_STEP7_TICK_SG5.md): the engine's arithmetic never changes; the backend says
+where a row's pages are and moves committed history.
+  ResidentStore (default; SG0-SG4)   the store above; pages built on the device; the draft drop stand-in.
+  ResidencyBackend (SG5)             piece 5's Residency / ResidencySB (r2_residency*.py, C's 89f30ee) over a store of
+                                     C + X historical slots per stream (NB = C + X) and the same tail rings: per layer
+                                     svc.resolve(l, rows, sel) gives the page tables (historical slots in ascending
+                                     block id, then the row's tail pages), read_done(l, plan, event) after the
+                                     attention, end_tick() once per tick, poll() at its start; a committed block is
+                                     copied to the pinned host rows and registered with history_written(uid, t, event);
+                                     a publication calls decided(key), a rejection decided(key) then cancel_epoch(uid,
+                                     old epoch); a finished request end_request(uid). Draft rows read the service's
+                                     READY blocks (paper 3.1); verify rows their whole selection (urgent misses).
+INSTRUMENTATION (SG5): engine.timer (a TickTimer) records CUDA event pairs around the GEMMs, the attention, the
+selection, the twin advance, the store writes, the backend calls and the whole tick (run_round), and host time for the
+row table, the backend and the decision read; read once at the end of a run. timer None: no event, no cost.
 
 SERIAL MODE (run_serial): one exact row per request per call and an immediate commit: the BI serial decode in this
 engine (the CPU tests' reference; the GPU gate's SG0 checks it bitwise against r2_bi_decode's).
 """
 from __future__ import annotations
 
+import contextlib
 import time
 from types import SimpleNamespace
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -303,22 +323,62 @@ class TickEngine:
         self.tok_log = torch.zeros(self.LOG, dtype=torch.int64, device=self.dev)
         self.n_tok = 0
         self.stats = dict(ticks=0, rows=0, draft_rows=0, verify_rows=0, decision_reads=0, writebacks=0,
-                          rollbacks=0, publications=0, ms_rows=0.0)
+                          rollbacks=0, publications=0, ms_rows=0.0, void_ticks=0)
         self.cu_q_cache = {}
+        self.backend = ResidentStore(self)
+        self.timer = None
+        self.void = False
+        self.tie_acc = None          # count_ties(): per layer (pairs, ties at the QK_SELECT cut, ties at the top-k cut)
+        self.plant = None            # plant_ties(): the gate SG4c's planted ties (tests and gates only)
+
+    def count_ties(self) -> None:
+        """Count, per layer, the (row, head) pairs whose pooled scores TIE across a cut of the two-step selection
+        (device counters; read once with tie_report)."""
+        self.tie_acc = torch.zeros((self.L, 5), dtype=torch.int64, device=self.dev)
+
+    def tie_report(self) -> List[List[int]]:
+        """TESTS AND GATES (one read): per layer [pairs, ties at the QK_SELECT cut, ties at the top-k cut, planted
+        pairs, planted pairs that tie across the top-k cut]."""
+        return self.tie_acc.tolist()
+
+    def plant_ties(self, requests: Sequence[int], layers: Sequence[int]) -> None:
+        """SG4c PLANTED (tests and gates only): at the given layers, the rows of the given requests get a TIE across
+        the top-k cut of the second step (plant_tie), so a tie rule other than the stable one changes the selection."""
+        self.plant = dict(layers=set(int(l) for l in layers),
+                          b_dev=torch.tensor(sorted(int(b) for b in requests), dtype=torch.int64, device=self.dev))
+
+    def attach_backend(self, backend) -> None:
+        """Replace the storage backend before the first tick (module docstring, STORAGE BACKENDS)."""
+        if self.stats["ticks"] or self.n_tok:
+            raise TickError("attach_backend before the first tick")
+        self.backend = backend
+
+    def _span(self, cat: str):
+        return self.timer.span(cat) if self.timer is not None else contextlib.nullcontext()
+
+    def _lin(self, x, w):
+        with self._span("gemm"):
+            return self.ops.linear(x, w)
 
     # ------------------------------------------------------------------ construction from the R2 state
     @classmethod
-    def from_r2(cls, model, cache, st, ops, **kw):
+    def from_r2(cls, model, cache, st, ops, hist_slots: Optional[int] = None, **kw):
         """A tick engine whose state is a COPY of a build_ragged state (body 'r2'; before its first decode step): the
         twins of every layer into both banks, the prompt's host K / V rows into the historical slots (complete
         blocks) and the exact ring (the partial last block), the twin's cis rows as the bias; the draft ring = the
-        exact ring. The source is not changed."""
+        exact ring. The source is not changed.
+        hist_slots None: the ResidentStore layout (a historical slot per block id). hist_slots = C + X: the Residency
+        layout (piece 5, C's D4): C + X EMPTY historical slots per stream (the service fills them from the host rows),
+        then the same tail rings; the caller attaches a ResidencyBackend."""
         from .r2_bi_decode import TWIN_FIELDS
         if st.body_mode != "r2" or st.steps != 0:
             raise TickError("from_r2 needs a fresh body-'r2' state (body %r, steps %d)" % (st.body_mode, st.steps))
         B = st.B
         S_list = [int(x) for x in st.pos_host.tolist()]
-        NB = st.n_max // BLOCK + 1
+        resident = hist_slots is None
+        NB = st.n_max // BLOCK + 1 if resident else int(hist_slots)
+        if NB < 1:
+            raise TickError("hist_slots must be >= 1")
         twins, sk, sv, sb = [], [], [], []
         for l, lay in enumerate(cache.layers):
             src = st.twins[l]
@@ -331,15 +391,16 @@ class TickEngine:
             t.ccis[:, B:].copy_(src.ccis)
             twins.append(t)
             eng = lay.cache_engine
-            dev, dt = eng._k_gpu.device, eng._k_gpu.dtype
+            dev, dt = src.ring.device, src.ring.dtype                         # the twin's = the engine's (build_ragged)
             k = torch.zeros((B, (NB + 4) * BLOCK, src.H, src.D), dtype=dt, device=dev)
             v = torch.zeros_like(k)
             bias = torch.zeros((B, (NB + 4) * BLOCK, src.H), dtype=dt, device=dev)
             for b, S in enumerate(S_list):
                 full = (S // BLOCK) * BLOCK
-                k[b, :full].copy_(eng._k_cpu[b, :full])
-                v[b, :full].copy_(eng._v_cpu[b, :full])
-                bias[b, :full].copy_(src.total_cis[b, :full])
+                if resident:
+                    k[b, :full].copy_(eng._k_cpu[b, :full])
+                    v[b, :full].copy_(eng._v_cpu[b, :full])
+                    bias[b, :full].copy_(src.total_cis[b, :full])
                 if S > full:
                     r0 = (NB + RING_EXACT + (S // BLOCK) % 2) * BLOCK
                     k[b, r0:r0 + S - full].copy_(eng._k_cpu[b, full:S])
@@ -404,8 +465,11 @@ class TickEngine:
             if T + 1 < topk:                                     # the BI serial decode's limit: pos // 64 >= topk - 1
                 raise TickError("row %d: position %d has %d blocks < topk %d (pos // 64 >= %d is needed: the selection "
                                 "would name absent blocks)" % (k, p, T + 1, topk, topk - 1))
-            if T + 1 >= self.NB or p >= self.twins[0].n_max:
-                raise TickError("row %d: position %d beyond the store (%d blocks) or N_max" % (k, p, self.NB))
+            t0 = self.twins[0]
+            if T + 1 >= self.backend.max_blocks() or p >= t0.n_max or p // 16 + 1 >= t0.lk_max:
+                raise TickError("row %d: position %d beyond the store's blocks (%d), N_max %d or Lk_max %d: the tick's ONE "
+                                "capacity check (the unchecked twin step must never meet a full table)"
+                                % (k, p, self.backend.max_blocks(), t0.n_max, t0.lk_max))
             if self.wb[b] < T - 1:
                 raise TickError("row %d: block %d is not written back (wb %d); the lead bound is broken" % (k, T - 2, self.wb[b]))
             if p < self.committed[b]:
@@ -440,9 +504,17 @@ class TickEngine:
         SimpleNamespace(logits (R, V) float, argmax (R,), slots [R ints], lo, hi)."""
         t_start = time.perf_counter()
         nl, ops, model = self.nl, self.ops, self.model
+        self.backend.begin_tick()
+        t_rows = time.perf_counter()
         tab, count, T = self.row_table(rows, tokens)
+        svc_rows = self.backend.prepare(rows)
         R = len(rows)
-        d = self._to_device(tab)
+        if self.timer is not None:
+            self.timer.host("backend", t_rows - t_start)
+            self.timer.host("rows", time.perf_counter() - t_rows)
+        buf = self._to_device(torch.cat([tab.reshape(-1), torch.tensor(count, dtype=torch.int64)]))
+        d = buf[:len(FIELDS) * R].view(len(FIELDS), R)
+        n_dev = buf[len(FIELDS) * R:]                                       # (2B,) per-bank counts, on the device
         pos, rb, bank, u = d[0], d[1], d[2], d[3]
         ring_row, prev_slot, tail_slot, is_draft = d[4], d[5].to(torch.int32), d[6].to(torch.int32), d[7] != 0
         lit, slot = d[8], d[9]
@@ -456,17 +528,21 @@ class TickEngine:
         if cu_q is None:
             cu_q = self.cu_q_cache[R] = torch.arange(R + 1, dtype=torch.int32, device=self.dev)
         ids = torch.where(lit >= 0, lit, self.tok_log[slot]).view(R, 1)
-        n_host = torch.tensor(count, dtype=torch.int64)                     # twin.advance copies it (a twin sync)
         any_draft = any(r.kind == "d" for r in rows)
+        ctx = SimpleNamespace(pos=pos, rb=rb, rb32=rb32, prev_slot=prev_slot, tail_slot=tail_slot, is_draft=is_draft,
+                              any_draft=any_draft, last=last, rows=svc_rows)
         pos0 = list(self.bank_pos)
         hidden = F.embedding(ids, model.embed_tokens)
         ctrs = []
         for l, layer in enumerate(model.layers):
-            hidden, ctr = self._layer(l, layer, hidden, R, T, n_host, pos, pos32, rb, rb32, bank, u, ring_row,
-                                      prev_slot, tail_slot, is_draft, any_draft, M_b, last, cu_q, cu_k)
+            hidden, ctr = self._layer(l, layer, hidden, R, T, n_dev, pos32, bank, u, ring_row, M_b, cu_q, cu_k, ctx)
             ctrs.append(ctr)
         hidden = nl.layer_norm(hidden, w=model.norm_weight, eps=model.norm_variance_epsilon)
-        logits = ops.linear(hidden, model.lm_head).float()[:, -1]
+        logits = self._lin(hidden, model.lm_head).float()[:, -1]
+        t_be = time.perf_counter()
+        self.backend.end_tick()
+        if self.timer is not None:
+            self.timer.host("backend", time.perf_counter() - t_be)
         arg = logits.argmax(-1)
         lo = self.n_tok
         if lo + R > self.LOG:
@@ -484,11 +560,11 @@ class TickEngine:
         self.stats["ms_rows"] += 1e3 * (time.perf_counter() - t_start)
         return SimpleNamespace(logits=logits, argmax=arg, slots=list(range(lo, lo + R)), lo=lo, hi=lo + R)
 
-    def _layer(self, l, layer, hidden, R, T, n_host, pos, pos32, rb, rb32, bank, u, ring_row, prev_slot, tail_slot,
-               is_draft, any_draft, M_b, last, cu_q, cu_k):
-        nl, lin = self.nl, self.ops.linear
+    def _layer(self, l, layer, hidden, R, T, n_dev, pos32, bank, u, ring_row, M_b, cu_q, cu_k, ctx):
+        nl, lin = self.nl, self._lin
         Hkv, D = layer.num_key_value_heads, layer.head_dim
         twin = self.twins[l]
+        pos, rb = ctx.pos, ctx.rb
         residual = hidden
         h = nl.layer_norm(hidden, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
         qkv = lin(h, layer.wqkv)
@@ -500,35 +576,52 @@ class TickEngine:
         k = k.reshape(R, Hkv, D)
         v = v.reshape(R, Hkv, D)
         cis = cis.reshape(R, Hkv)
-        # 2. the positional tables: every bank advances by its rows in position order
-        keys = torch.zeros((twin.B, T, Hkv, D), dtype=twin.ring.dtype, device=self.dev)
-        cis_b = torch.zeros((twin.B, T, Hkv), dtype=twin.total_cis.dtype, device=self.dev)
-        keys[bank, u] = k.to(twin.ring.dtype)
-        cis_b[bank, u] = cis.to(twin.total_cis.dtype)
-        ctr = twin.advance(keys, cis_b, n_host)                                       # (T + 1, 4, 2B)
-        n_used = ctr[u + 1, 1, bank].to(torch.int32).contiguous()
-        # 3. stage 1 with the alias
-        ck = twin.comp_k_flat()
-        score = self.stage1(q, ck, ck, cu_q, cu_k, 1, twin.lk_max, seqused_k=n_used)
-        # 4. pooling per row, the deterministic selection
-        ccis = twin.ccis.index_select(1, bank)
-        pq = torch.empty((Hkv, R, self.M_alloc), dtype=layer.wqkv.dtype, device=self.dev)
-        pc = torch.empty_like(pq)
-        self.pool(score, ccis, n_used, M_b, pq, pc, stride=layer.pooling_stride, block_size=layer.block_size,
-                  local_blocks=layer.window_blocks, init_blocks=layer.init_blocks)
-        sel = self.select(pq.float(), pc.float(), self.nl.QK_SELECT, layer.topk_blocks)   # (H, R, topk) int64 ascending
+        # 2. the positional tables: every bank advances by its rows in position order (no host read: C's 4fe5fc9)
+        with self._span("twin"):
+            keys = torch.zeros((twin.B, T, Hkv, D), dtype=twin.ring.dtype, device=self.dev)
+            cis_b = torch.zeros((twin.B, T, Hkv), dtype=twin.total_cis.dtype, device=self.dev)
+            keys[bank, u] = k.to(twin.ring.dtype)
+            cis_b[bank, u] = cis.to(twin.total_cis.dtype)
+            ctr = twin.advance_unchecked(keys, cis_b, n_dev)                          # (T + 1, 4, 2B)
+            n_used = ctr[u + 1, 1, bank].to(torch.int32).contiguous()
+        # 3. stage 1 with the alias; 4. pooling per row, the deterministic selection
+        with self._span("sel"):
+            ck = twin.comp_k_flat()
+            score = self.stage1(q, ck, ck, cu_q, cu_k, 1, twin.lk_max, seqused_k=n_used)
+            ccis = twin.ccis.index_select(1, bank)
+            pq = torch.empty((Hkv, R, self.M_alloc), dtype=layer.wqkv.dtype, device=self.dev)
+            pc = torch.empty_like(pq)
+            self.pool(score, ccis, n_used, M_b, pq, pc, stride=layer.pooling_stride, block_size=layer.block_size,
+                      local_blocks=layer.window_blocks, init_blocks=layer.init_blocks)
+            planted = None
+            if self.plant is not None and l in self.plant["layers"]:   # SG4c planted: a tie at the top-k boundary
+                planted = plant_tie(pq, pc, torch.isin(rb, self.plant["b_dev"]), self.nl.QK_SELECT, layer.topk_blocks)
+            if self.tie_acc is not None:                                  # SG4c: ties at the two cut boundaries
+                self.tie_acc[l] += tie_stats(pq, pc, self.nl.QK_SELECT, layer.topk_blocks, planted)
+            sel = self.select(pq.float(), pc.float(), self.nl.QK_SELECT, layer.topk_blocks)   # (H, R, topk) ascending
         if self.check:
             blk = (pos // BLOCK).view(1, R)
             if not (bool((sel[..., -1] == blk).all()) and bool((sel[..., -2] == blk - 1).all())):
                 raise TickError("layer %d: a selection does not end with the row's blocks T - 1, T" % l)
         # 5. the rows' own K / V / bias into their ring pages
-        self.store_k[l].index_put_((rb, ring_row), k.to(self.dtype))
-        self.store_v[l].index_put_((rb, ring_row), v.to(self.dtype))
-        self.store_bias[l].index_put_((rb, ring_row), cis.to(self.dtype))
-        # 6. the page lists and ONE BI attention call
-        table, npg = self.page_table(l, sel, pos, rb, prev_slot, tail_slot, is_draft, any_draft, layer)
-        attn = self.ops.attn.bi_paged_decode(q, self.store_k[l], self.store_v[l], self.store_bias[l], rb32, table,
-                                             npg, last)
+        with self._span("store"):
+            self.store_k[l].index_put_((rb, ring_row), k.to(self.dtype))
+            self.store_v[l].index_put_((rb, ring_row), v.to(self.dtype))
+            self.store_bias[l].index_put_((rb, ring_row), cis.to(self.dtype))
+        # 6. the page lists (the storage backend) and ONE BI attention call
+        t_res = time.perf_counter()
+        with self._span("res"):
+            table, npg, last, seq_idx, plan = self.backend.pages(l, ctx, sel, layer)
+        if self.timer is not None:
+            self.timer.host("backend", time.perf_counter() - t_res)
+        with self._span("att"):
+            attn = self.ops.attn.bi_paged_decode(q, self.store_k[l], self.store_v[l], self.store_bias[l], seq_idx,
+                                                 table, npg, last)
+        t_res = time.perf_counter()
+        with self._span("res"):
+            self.backend.after_attention(l, plan)
+        if self.timer is not None:
+            self.timer.host("backend", time.perf_counter() - t_res)
         attn = attn.view(R, 1, -1)
         hidden = residual + lin(attn, layer.wo)
         residual = hidden
@@ -561,27 +654,53 @@ class TickEngine:
         return out[:, :, :K].contiguous(), keep.sum(-1).to(torch.int32).contiguous()
 
     # ------------------------------------------------------------------ decisions
+    def overflow_flag(self) -> torch.Tensor:
+        """The OR of every twin's sticky overflow flag (device, int64 0 / 1)."""
+        return torch.stack([t.overflow for t in self.twins]).any().to(torch.int64).view(1)
+
     def read_tokens(self, lo: int, hi: int) -> List[int]:
-        """THE decision read: log slots [lo, hi) to the host (one sync)."""
+        """THE decision read: log slots [lo, hi) and the twins' overflow flag, to the host in ONE read. A set flag VOIDS
+        the tick (C, 2026-10-21): every decision of it is refused (TickError) and nothing commits."""
         self.stats["decision_reads"] += 1
-        return self.tok_log[lo:hi].tolist()
+        t0 = time.perf_counter()
+        vals = torch.cat([self.tok_log[lo:hi], self.overflow_flag()]).tolist()
+        if self.timer is not None:
+            self.timer.host("read", time.perf_counter() - t0)
+        if vals[-1]:
+            self.void = True
+            self.stats["void_ticks"] += 1
+            raise TickError("VOID tick: a twin met a full table (the overflow flag); every decision is refused")
+        return vals[:-1]
+
+    def check_overflow(self) -> None:
+        """The end of a run (tests and gates; one read): a set overflow flag voids the run's last ticks."""
+        if int(self.overflow_flag().item()):
+            self.void = True
+            self.stats["void_ticks"] += 1
+            raise TickError("VOID: a twin met a full table after the last decision read")
 
     def on_publish(self, b, epoch, upto):
-        self.events.append(("pub", int(b), int(upto)))
+        self.events.append(("pub", int(b), int(upto), int(epoch)))
 
     def on_rollback(self, b, old_epoch, keep):
-        self.events.append(("rb", int(b), int(keep)))
+        self.events.append(("rb", int(b), int(keep), int(old_epoch)))
+
+    def end_request(self, b: int) -> None:
+        self.backend.end_request(int(b))
 
     @torch.inference_mode()
     def apply_events(self) -> None:
         """The decisions of the tick (module docstring, ROLLBACK and PUBLICATION). Device ops and host bookkeeping."""
         if not self.events:
             return
-        rb, pub = {}, {}
-        for kind, b, p in self.events:
+        if self.void:
+            raise TickError("a void tick commits nothing")
+        rb, pub, rb_epoch = {}, {}, {}
+        for kind, b, p, ep in self.events:
             (rb if kind == "rb" else pub)[b] = p
             if kind == "rb":
                 pub.pop(b, None)
+                rb_epoch[b] = ep
         self.events = []
         B = self.B
         if rb:                                                                   # 1. the exact banks: ONE commit
@@ -606,6 +725,7 @@ class TickEngine:
             self.stats["publications"] += 1
         for b in set(rb) | set(pub):                                             # 2. write-back
             self.writeback(b)
+        self.backend.decisions(pub, rb_epoch)                                   # the residency's references
         for b in rb:                                                             # 3. the draft banks
             for l in range(self.L):
                 SC.sync_draft_bank(self.twins[l], b, B)
@@ -622,13 +742,10 @@ class TickEngine:
             self.synced[b] = p
 
     def writeback(self, b: int) -> None:
-        """Every block whose 64 positions are committed goes from its exact ring page to its historical slot."""
+        """Every block whose 64 positions are committed goes from its exact ring page to the backend's history (the
+        ResidentStore: its historical slot; the Residency: the pinned host rows, registered with history_written)."""
         while BLOCK * (self.wb[b] + 1) <= self.committed[b]:
-            blk = self.wb[b]
-            src = self.ring_slot(False, blk * BLOCK) * BLOCK
-            for l in range(self.L):
-                for st in (self.store_k[l], self.store_v[l], self.store_bias[l]):
-                    st[b, blk * BLOCK:(blk + 1) * BLOCK].copy_(st[b, src:src + BLOCK])
+            self.backend.commit_block(b, self.wb[b])
             self.wb[b] += 1
             self.stats["writebacks"] += 1
 
@@ -662,7 +779,9 @@ class TickEngine:
     @torch.inference_mode()
     def run_serial(self, tokens) -> SimpleNamespace:
         """One exact row per request at its next position, committed at once (no draft, no rollback): the BI serial
-        decode in this engine. tokens: B ints or Refs."""
+        decode in this engine. tokens: B ints or Refs. The ResidentStore only (the reference of SG0)."""
+        if not isinstance(self.backend, ResidentStore):
+            raise TickError("the serial mode runs on the ResidentStore")
         rows = [SimpleNamespace(b=b, kind="v", pos=self.bank_pos[b]) for b in range(self.B)]
         out = self.run_rows(rows, tokens)
         for b in range(self.B):
@@ -670,6 +789,197 @@ class TickEngine:
             self.writeback(b)
             self.synced[b] = self.committed[b]
         return out
+
+
+# =====================================================================================================================
+# storage backends (the SG5 seam)
+# =====================================================================================================================
+class ResidentStore:
+    """Every committed block resident in the historical slot named by its block id (SG0-SG4; module docstring)."""
+
+    name = "resident"
+
+    def __init__(self, eng: TickEngine):
+        self.eng = eng
+
+    def max_blocks(self) -> int:
+        return self.eng.NB
+
+    def begin_tick(self) -> None:
+        pass
+
+    def prepare(self, rows):
+        return None
+
+    def pages(self, l, ctx, sel, layer):
+        table, npg = self.eng.page_table(l, sel, ctx.pos, ctx.rb, ctx.prev_slot, ctx.tail_slot, ctx.is_draft,
+                                         ctx.any_draft, layer)
+        return table, npg, ctx.last, ctx.rb32, None
+
+    def after_attention(self, l, plan) -> None:
+        pass
+
+    def end_tick(self) -> None:
+        pass
+
+    def commit_block(self, b: int, blk: int) -> None:
+        eng = self.eng
+        src = eng.ring_slot(False, blk * BLOCK) * BLOCK
+        for l in range(eng.L):
+            for st in (eng.store_k[l], eng.store_v[l], eng.store_bias[l]):
+                st[b, blk * BLOCK:(blk + 1) * BLOCK].copy_(st[b, src:src + BLOCK])
+
+    def decisions(self, pub, rb_epoch) -> None:
+        pass
+
+    def end_request(self, b: int) -> None:
+        pass
+
+
+def cohort_of(i: int, K: int) -> int:
+    """The cohort m whose verify row i checks d_i (and writes position E + i - 1): r2_spec_core.cohort_range."""
+    return 1 if i <= K - 1 else i // K + 1
+
+
+class ResidencyBackend:
+    """Piece 5's Residency (or ResidencySB) as the tick's storage (module docstring, STORAGE BACKENDS; C's answers
+    Q-S1 .. Q-S5, 2026-10-21). svc: the service over THIS engine's store (svc.n_hist == eng.NB; its store_b is
+    eng.store_bias, its cis tables the exact banks of the twins); host_k / host_v: the pinned host rows per layer
+    (B, N_host, H, D); new_event(): an event recorded on the current stream (CUDA: torch.cuda.Event().record(); CPU
+    tests: a completed event); K: the cadence. The uid of request b is b."""
+
+    name = "residency"
+
+    def __init__(self, eng: TickEngine, svc, host_k, host_v, new_event: Callable[[], Any], K: int):
+        if svc.n_hist != eng.NB or svc.B != eng.B or svc.L != eng.L or svc.H != eng.H:
+            raise TickError("the service's store (B %d, L %d, H %d, C + X %d) is not the engine's (B %d, L %d, H %d, NB %d)"
+                            % (svc.B, svc.L, svc.H, svc.n_hist, eng.B, eng.L, eng.H, eng.NB))
+        self.eng, self.svc, self.host_k, self.host_v = eng, svc, host_k, host_v
+        self.new_event, self.K = new_event, int(K)
+        self.sb = hasattr(svc, "mirrors")                    # ResidencySB: the selection stays on the device
+        self.keys: Dict[int, tuple] = {}                     # b -> the verify key of the current tick
+        self.ended = set()
+        self.n_host = int(host_k[0].shape[1])
+        for b, S in enumerate(eng.S_list):
+            svc.begin_request(b, b, hist_blocks=S // BLOCK)
+
+    def max_blocks(self) -> int:
+        return self.n_host // BLOCK
+
+    def begin_tick(self) -> None:
+        self.svc.poll()
+
+    def prepare(self, rows):
+        """The service's rows of the tick (host, once per tick): the cohort key; the history boundary (block T - 1 is
+        served by the service once its write-back is registered, else from the row's ring); the tail pages."""
+        from .r2_residency import Row as SvcRow
+        eng, out = self.eng, []
+        self.keys = {}
+        for row in rows:
+            b, p, draft = int(row.b), int(row.pos), row.kind == "d"
+            T = p // BLOCK
+            if draft:
+                key = (b, int(row.epoch), cohort_of(int(row.i), self.K))
+            else:
+                key = (b, int(row.epoch), int(row.m))
+                self.keys[b] = key
+            if eng.wb[b] >= T:
+                hb, tail = T, [(T, eng.ring_slot(draft, p))]
+            else:
+                hb, tail = T - 1, [(T - 1, eng.ring_slot(draft, p - BLOCK)), (T, eng.ring_slot(draft, p))]
+            out.append(SvcRow(b, row.kind, key, p, hb, tail))
+        return out
+
+    def pages(self, l, ctx, sel, layer):
+        plan = self.svc.resolve(l, ctx.rows, sel if self.sb else sel.cpu())
+        dev = self.eng.dev
+        return (plan.page_table.to(dev).contiguous(), plan.num_pages.to(dev).contiguous(),
+                plan.last_len.to(dev).contiguous(), plan.seq_idx.to(dev).contiguous(), plan)
+
+    def after_attention(self, l, plan) -> None:
+        self.svc.read_done(l, plan, self.new_event())
+
+    def end_tick(self) -> None:
+        self.svc.end_tick()
+
+    def commit_block(self, b: int, blk: int) -> None:
+        """Q-S1: the exact ring page of block blk to the pinned host rows of every layer (on the current stream), ONE
+        event after them, history_written(uid, blk, event). The tick never waits on the host."""
+        eng = self.eng
+        if (blk + 1) * BLOCK > self.n_host:
+            raise TickError("block %d of request %d is past the host rows (%d)" % (blk, b, self.n_host))
+        src = eng.ring_slot(False, blk * BLOCK) * BLOCK
+        r0 = blk * BLOCK
+        for l in range(eng.L):
+            self.host_k[l][b, r0:r0 + BLOCK].copy_(eng.store_k[l][b, src:src + BLOCK], non_blocking=True)
+            self.host_v[l][b, r0:r0 + BLOCK].copy_(eng.store_v[l][b, src:src + BLOCK], non_blocking=True)
+        self.svc.history_written(b, blk, self.new_event())
+
+    def decisions(self, pub, rb_epoch) -> None:
+        """Q-S2 / Q-S3: a publication decided(key); a rejection decided(key), then cancel_epoch(uid, old epoch)."""
+        for b in pub:
+            self.svc.decided(self.keys[b])
+        for b, ep in rb_epoch.items():
+            self.svc.decided(self.keys[b])
+            self.svc.cancel_epoch(b, ep)
+
+    def end_request(self, b: int) -> None:
+        if b not in self.ended:
+            self.ended.add(b)
+            self.svc.end_request(b)
+
+
+class TickTimer:
+    """SG5's instrumentation (module docstring): per tick, CUDA event pairs per category (or perf_counter on the CPU),
+    and host seconds per category. Read once by report()."""
+
+    def __init__(self, cuda: bool):
+        self.cuda = bool(cuda)
+        self.tick = -1
+        self.spans: List[tuple] = []                         # (tick, cat, start, end)
+        self.hosts: Dict[tuple, float] = {}                  # (tick, cat) -> seconds
+
+    def next_tick(self) -> None:
+        self.tick += 1
+
+    def host(self, cat: str, sec: float) -> None:
+        k = (self.tick, cat)
+        self.hosts[k] = self.hosts.get(k, 0.0) + float(sec)
+
+    @contextlib.contextmanager
+    def span(self, cat: str):
+        if self.cuda:
+            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0.record()
+            try:
+                yield
+            finally:
+                e1.record()
+                self.spans.append((self.tick, cat, e0, e1))
+        else:
+            t0 = time.perf_counter()
+            try:
+                yield
+            finally:
+                self.spans.append((self.tick, cat, t0, time.perf_counter()))
+
+    def report(self) -> Dict[str, Any]:
+        """Per category: the per-tick device ms (sum of its spans) and host ms, as lists over the ticks (ONE sync)."""
+        if self.cuda:
+            torch.cuda.synchronize()
+        n = self.tick + 1
+        dev: Dict[str, List[float]] = {}
+        for (t, cat, a, b) in self.spans:
+            if t < 0:
+                continue
+            ms = a.elapsed_time(b) if self.cuda else 1e3 * (b - a)
+            dev.setdefault(cat, [0.0] * n)[t] += ms
+        host: Dict[str, List[float]] = {}
+        for (t, cat), s in self.hosts.items():
+            if t < 0:
+                continue
+            host.setdefault(cat, [0.0] * n)[t] += 1e3 * s
+        return dict(ticks=n, device_ms=dev, host_ms=host)
 
 
 # =====================================================================================================================
@@ -700,11 +1010,19 @@ def run_round(engine: TickEngine, first_tokens: Sequence[int], max_new: Sequence
             continue
         empty = 0
         tokens = [row.token for row in rows]
-        out = engine.run_rows(rows, tokens)
-        if on_tick is not None:
+        if engine.timer is not None:
+            engine.timer.next_tick()
+        with engine._span("tick"):
+            out = engine.run_rows(rows, tokens)
+        if on_tick is not None:                                  # the gates' checks: outside the tick's spans
             on_tick(rows, tokens, out)
-        rnd.finish_tick(rows, out.slots, out.hi)
-        engine.apply_events()
+        with engine._span("tick"):
+            rnd.finish_tick(rows, out.slots, out.hi)
+            engine.apply_events()
+        for b, r in enumerate(rnd.reqs):
+            if r.done:
+                engine.end_request(b)
+    engine.check_overflow()
     return rnd
 
 
@@ -739,6 +1057,57 @@ def topk_select(pq: torch.Tensor, pc: torch.Tensor, qk_select: int, k: int) -> t
     mask.scatter_(2, iq, True)
     pc2 = pc.masked_fill(mask, float("inf"))
     return torch.sort(torch.topk(pc2, k, dim=-1, sorted=False).indices, dim=-1).values
+
+
+def high_select(pq: torch.Tensor, pc: torch.Tensor, qk_select: int, k: int) -> torch.Tensor:
+    """SG4 (d), a CONTROL of the planted ties: the two-step rule with ties broken by the HIGHER block id (a stable sort
+    of the reversed rows). Under a tie across a cut it selects another block than select_blocks, by construction."""
+    def top(x, n):
+        M = x.shape[-1]
+        return (M - 1) - torch.sort(x.flip(-1), dim=-1, descending=True, stable=True).indices[..., :n]
+    iq = top(pq, qk_select)
+    mask = torch.zeros_like(pc, dtype=torch.bool)
+    mask.scatter_(2, iq, True)
+    pc2 = pc.masked_fill(mask, float("inf"))
+    return torch.sort(top(pc2, k), dim=-1).values
+
+
+def tie_stats(pq: torch.Tensor, pc: torch.Tensor, qk_select: int, k: int, planted=None) -> torch.Tensor:
+    """(5,) int64 on the device: the (head, row) pairs; those with EQUAL pooled q scores at ranks QK_SELECT - 1 /
+    QK_SELECT (the first cut); those with equal pooled cis at ranks k - 1 / k after the first step's +inf (the top-k
+    cut); the planted pairs (`planted`, (H, R) bool, from plant_tie); the planted pairs that tie across the top-k cut.
+    A tie across a cut is where a tie rule decides the selection; finite values only."""
+    q, c = pq.float(), pc.float()
+    vq, iq = torch.sort(q, dim=-1, descending=True, stable=True)
+    tq = (vq[..., qk_select - 1] == vq[..., qk_select]) & torch.isfinite(vq[..., qk_select - 1])
+    mask = torch.zeros_like(c, dtype=torch.bool)
+    mask.scatter_(-1, iq[..., :qk_select], True)
+    vc = torch.sort(c.masked_fill(mask, float("inf")), dim=-1, descending=True).values
+    tc = (vc[..., k - 1] == vc[..., k]) & torch.isfinite(vc[..., k - 1])
+    pl = torch.zeros_like(tc) if planted is None else planted
+    n = torch.full((), tq.numel(), dtype=torch.int64, device=pq.device)
+    return torch.stack([n, tq.sum().to(torch.int64), tc.sum().to(torch.int64), pl.sum().to(torch.int64),
+                        (pl & tc).sum().to(torch.int64)])
+
+
+def plant_tie(pq: torch.Tensor, pc: torch.Tensor, rows: torch.Tensor, qk_select: int, k: int,
+              apply: bool = True) -> torch.Tensor:
+    """SG4c PLANTED (in place on pc): for the rows marked in `rows` (R,) bool, every head, the block ranked k + 1 by
+    the second step (after the first step's +inf) gets the k-th block's pooled value: two blocks tie across the top-k
+    cut, so the stable rule keeps the lower block id and any other tie rule may keep the other one. Only where both
+    are real blocks (finite values). Returns the planted pairs (H, R) bool. apply False (a NEGATIVE CONTROL of the
+    precondition): the pairs are reported, pc is not changed."""
+    q, c = pq.float(), pc.float()
+    iq = torch.sort(q, dim=-1, descending=True, stable=True).indices[..., :qk_select]
+    mask = torch.zeros_like(c, dtype=torch.bool)
+    mask.scatter_(-1, iq, True)
+    vc, ic = torch.sort(c.masked_fill(mask, float("inf")), dim=-1, descending=True, stable=True)
+    v = vc[..., k - 1:k]
+    j = ic[..., k:k + 1]
+    ok = rows.view(1, -1, 1) & torch.isfinite(v) & torch.isfinite(vc[..., k:k + 1])
+    if apply:
+        pc.scatter_(-1, j, torch.where(ok, v.to(pc.dtype), pc.gather(-1, j)))
+    return ok[..., 0]
 
 
 class BatchKeyedSplit:
