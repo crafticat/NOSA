@@ -24,19 +24,40 @@ ONE DECODE STEP, per layer, in the shipped order (nosa_llama.py LlamaLayer.decod
   6. attention (flash_attn_nosa_with_kvcache, num_splits = NOSI_ATTN_SPLITS), wo, FFN: the shipped ops.
 Final rmsnorm and lm_head as shipped.
 
-PREFILL. The R2 path uses the SHIPPED prefill (batch_prefill: the host K/V, the slot cache, the engine tables), then
-R2State.attach BRIDGES each layer's positional tables into a PositionalTwin by copy (bridge_layer): the compressed
-keys [0, n), the live raw keys (positions [S - ncl, S)) into the ring rows q % 64, total_cis rows [0, S), the
-compressed cis [0, M), the counters (pos = S, n_comp = n, n_ccis = M), then twin.check_invariants(). Equal S for every
-request (the shipped prefill is lockstep).
+PREFILL, two builders:
+  R2State.attach (step 5, equal S): the SHIPPED batch prefill (batch_prefill: the host K/V, the slot cache, the engine
+    tables), then each layer's positional tables are BRIDGED into a PositionalTwin by copy (bridge_layer): the
+    compressed keys [0, n), the live raw keys (positions [S - ncl, S)) into the ring rows q % 64, total_cis rows
+    [0, S), the compressed cis [0, M), the counters, then twin.check_invariants(). Widths: the shipped out_len.
+  build_ragged (step 6, a prompt length per request): per request b, ONE B = 1 shipped prefill into a scratch cache
+    (its host K / V rows and its total_cis rows), then twin.prefill(b, keys, cis) (the twin's own compressions with the
+    shipped ops) and DecodeBody.prefill_request(eng, b, ...) into batch tables allocated by DecodeBody.allocate. The
+    WIDTHS are the R2 path's own, PREALLOCATED for the whole run from the horizon (no captured graph, no re-warm):
+    M_alloc = (S_max + horizon) // 64 + 1 pooled blocks, Lk_max = (S_max + horizon) // 16 + 1 compressed rows (the
+    stage-1 score width round128(Lk_max) is constant: no 128-column boundary is crossed by any launch), N_max =
+    n_host = S_max + horizon + 64 cis / host rows. Every kernel launch has the same shape whatever the neighbours'
+    lengths, which is what makes a request's arithmetic independent of its neighbours.
 
 F2 (docs/R2_ENGINE_FINDINGS.md): the shipped compressed cis never grows (an empty-slice copy_); the twin's grows. In
 the 64-step window of the G0 gate the extra twin columns are read by the pooling only inside the forced local window
 (+inf), so no selection changes. The G0 gate compares the prefix both hold and reports the twin's extra columns as the
 EXPECTED F2 difference. There is no f2_fix switch: the twin is the reference and keeps growing.
 
-NEGATIVE CONTROL HOOK (the G0 gate only): state.neg = dict(step=s0, request=b0, short=k) shortens the stage-1 and
-pooling key length of request b0 by k from decode step s0 on (pooling_lengths). Default None.
+NEGATIVE CONTROL HOOKS (gates only; state.neg, default None; pooling_lengths):
+  dict(step=s0, request=b0, short=k)            (kind "short", the G0 gate) request b0's key length - k from step s0;
+  dict(kind="shared", request=src, step=s0)     every request uses request src's key length and pooled width from
+                                                step s0 (a shared counter: it leaks the neighbour's length);
+  dict(kind="frozen")                           every request keeps the pooled width of the first decode step (a width
+                                                frozen at warm-up: wrong from the first block boundary on).
+
+ACTIVITY (step 6): the driver sets state.active (device) and state.active_host (CPU) before a step; an inactive
+request's row is computed and discarded (the twin and the body skip it); pos_host advances for active requests only.
+
+F3 (findings): the SHIPPED total_cis has S + 1024 rows, so the shipped decode stops at step 1025 (a silent no-op cis
+write, then a RuntimeError in the tail-bias copy). The R2 path never reads it: the twin's total_cis has N_max rows and
+the body bounds the write by min(n_host, N_max), both sized from the horizon (build_ragged). What still bounds a run:
+the preallocated Lk_max / N_max / M_alloc / n_host (TwinCapacityError / IndexError refuse, nothing is written past
+them), the RoPE cache (max_length + 1024 positions, 132096 by default) and the int64-cast gather offsets.
 """
 from __future__ import annotations
 
@@ -89,13 +110,25 @@ def bridge_layer(twin: PositionalTwin, lay, S: int) -> None:
     twin.check_invariants()
 
 
-def pooling_lengths(pos_before: torch.Tensor, n_comp: torch.Tensor, step: int, neg=None):
-    """(n_used, M_b) int32 contiguous: the key length of stage 1 and pooling (n_comp, shortened by the negative-control
-    hook), the pooled width M_b = pos_before // 64 + 1 (the block of the position being written is the last one)."""
+def pooling_lengths(pos_before: torch.Tensor, n_comp: torch.Tensor, step: int, neg=None, m0=None):
+    """(n_used, M_b) int32 contiguous: the key length of stage 1 and pooling (n_comp) and the pooled width
+    M_b = pos_before // 64 + 1 (the block of the position being written is the last one), per request; then the
+    negative-control hook (module docstring): "short" (default kind), "shared" (request src's values for every request
+    from step s0) or "frozen" (m0, the widths of the first step, for every step; m0 None = this is the first step)."""
     n_used = n_comp.to(torch.int32).clone()
-    if neg is not None and step >= int(neg["step"]):
+    m_b = (pos_before // BLOCK + 1).to(torch.int32)
+    kind = None if neg is None else neg.get("kind", "short")
+    if kind == "short" and step >= int(neg["step"]):
         n_used[int(neg["request"])] -= int(neg["short"])
-    return n_used.contiguous(), (pos_before // BLOCK + 1).to(torch.int32).contiguous()
+    elif kind == "shared" and step >= int(neg.get("step", 0)):
+        src = int(neg["request"])
+        n_used = n_used[src].expand_as(n_used).clone()
+        m_b = m_b[src].expand_as(m_b).clone()
+    elif kind == "frozen" and m0 is not None:
+        m_b = m0.to(torch.int32).clone()
+    elif kind not in (None, "short", "shared", "frozen"):
+        raise R2Error("unknown negative-control kind %r" % kind)
+    return n_used.contiguous(), m_b.contiguous()
 
 
 # ------------------------------------------------------------------ the body adapter
@@ -149,7 +182,13 @@ class R2State:
             bridge_layer(t, lay, S)
             self.twins.append(t)
         self.M_alloc = (S + 1 + BLOCK - 1) // BLOCK                   # the shipped warm-up out_len (nosa_llama.py:817-818)
+        self._common(model, B, H, dev, body, R2Body(f4_fix) if body == "r2" else None, f4_fix, neg,
+                     torch.full((B,), int(S), dtype=torch.int64))
+
+    def _common(self, model, B, H, dev, body, adapter, f4_fix, neg, pos_host):
+        """The buffers and fields shared by both builders (widths M_alloc set before)."""
         NL = _nl()
+        lay0 = model.layers[0]
         bdt = lay0.wqkv.dtype
         self.pq = torch.empty((H, B, self.M_alloc), dtype=bdt, device=dev)
         self.pc = torch.empty((H, B, self.M_alloc), dtype=bdt, device=dev)
@@ -160,13 +199,14 @@ class R2State:
         self.mask = torch.empty((H, B, self.M_alloc), dtype=torch.bool, device=dev)
         self.cu_q = torch.arange(B + 1, dtype=torch.int32, device=dev)
         self.active = torch.ones(B, dtype=torch.bool, device=dev)
-        self.pos_host = torch.full((B,), int(S), dtype=torch.int64)         # host mirrors of the counter (no sync)
+        self.pos_host = pos_host.clone()                                   # host mirrors of the counter (no sync)
         self.active_host = torch.ones(B, dtype=torch.bool)
         self.body_mode = body
-        self.body = R2Body(f4_fix) if body == "r2" else None
+        self.body = adapter
         self.f4_fix = f4_fix
         self.neg = neg
         self.steps = 0
+        self.M0 = None                                                     # the widths of the first step ("frozen")
         self.topk_log = [None] * len(model.layers)
         self.meta = dict(S=self.S, B=B, lk_max=self.lk_max, n_max=self.n_max, M_alloc=self.M_alloc, body=body,
                          f4_fix=f4_fix, neg=neg,
@@ -174,11 +214,74 @@ class R2State:
                             "not (findings F2); the gate compares the prefix both hold and reports the twin's extra "
                             "columns as the expected F2 difference")
 
+    def set_active(self, active_host: torch.Tensor) -> None:
+        """The activity of the next step: (B,) bool on the CPU (copied to the device; no sync)."""
+        a = torch.as_tensor(active_host, dtype=torch.bool)
+        if tuple(a.shape) != (self.B,):
+            raise R2Error("active must be (%d,)" % self.B)
+        self.active_host.copy_(a)
+        self.active.copy_(self.active_host)                              # pageable source: the copy is synchronous
+
     @classmethod
     def attach(cls, model, cache, S: int, **kw) -> "R2State":
         st = cls(model, cache, S, **kw)
         cache.r2_state = st
         return st
+
+
+def ragged_widths(S_list, horizon: int):
+    """The R2 path's own preallocated widths for prompts S_list and `horizon` decode steps (module docstring)."""
+    end = max(int(s) for s in S_list) + int(horizon)
+    lk_max = end // STRIDE + 1
+    return dict(M_alloc=end // BLOCK + 1, lk_max=lk_max, n_max=end + BLOCK, n_host=end + BLOCK,
+                score_width=(lk_max + 127) // 128 * 128)
+
+
+def build_ragged(model, prompts, horizon: int, f4_fix: bool, neg=None, pin: bool = True):
+    """A batch with a prompt length per request (module docstring, PREFILL). prompts: B 1-D token tensors (CPU), each
+    >= 32 tokens. Returns (cache, state, first tokens (B, 1) int64 on the device). Body 'r2' only (the lockstep
+    shipped body cannot hold different lengths)."""
+    import gc
+    from .cache_engine import InfLLMv2Cache
+    S_list = [int(p.numel()) for p in prompts]
+    if not S_list or min(S_list) < 32:
+        raise R2Error("every prompt needs >= 32 tokens (got %s)" % S_list)
+    B = len(S_list)
+    w = ragged_widths(S_list, horizon)
+    lay0 = model.layers[0]
+    H, D = lay0.num_key_value_heads, lay0.head_dim
+    cfg = model.config
+    cache = InfLLMv2Cache(config=cfg, num_hidden_layers=cfg.num_hidden_layers, has_kv_bias=True)
+    adapter = R2Body(f4_fix)
+    for lay in cache.layers:
+        adapter.body.allocate(lay.cache_engine, B, w["n_host"], pin)
+    eng0 = cache.layers[0].cache_engine
+    dev, dt = eng0._k_gpu.device, eng0._k_gpu.dtype
+    twins = [PositionalTwin(B, H, D, w["lk_max"], w["n_max"], dtype=dt, device=dev) for _ in cache.layers]
+    first = torch.empty((B, 1), dtype=torch.int64, device=dev)
+    for b, ids in enumerate(prompts):
+        tmp = InfLLMv2Cache(config=cfg, num_hidden_layers=cfg.num_hidden_layers, has_kv_bias=True)
+        logits, _ = model.batch_prefill(ids.view(1, -1).to(dev), tmp)
+        first[b, 0] = logits[0, -1].argmax()
+        Sb = S_list[b]
+        for l, lay in enumerate(tmp.layers):
+            e = lay.cache_engine
+            k = e._k_cpu[0, :Sb].to(dev)
+            v = e._v_cpu[0, :Sb].to(dev)
+            twins[l].prefill(b, k, lay.total_cis[0, :Sb])
+            adapter.body.prefill_request(cache.layers[l].cache_engine, b, k, v, twins[l].total_cis[b, :Sb])
+        del tmp, logits
+        gc.collect()
+    torch.cuda.synchronize()
+    st = R2State.__new__(R2State)
+    st.B, st.H, st.S = B, H, max(S_list)
+    st.lk_max, st.n_max, st.M_alloc = w["lk_max"], w["n_max"], w["M_alloc"]
+    st.twins = twins
+    st._common(model, B, H, dev, "r2", adapter, f4_fix, neg, torch.tensor(S_list, dtype=torch.int64))
+    st.meta.update(S_list=S_list, horizon=int(horizon), builder="build_ragged",
+                   widths=dict(w, rule="preallocated from the horizon: no captured graph, no re-warm"))
+    cache.r2_state = st
+    return cache, st, first
 
 
 def body_update(st: R2State, cache, l: int, key, value, twin: PositionalTwin, topk_idx, pos_before):
@@ -208,7 +311,9 @@ def layer_decode(st: R2State, l: int, layer, hidden, pos_flat, cos_sin_cache, ca
     v = v.reshape(B, Hkv, D)
     pos_before = twin.pos.clone()
     twin.step(k, cis.view(B, Hkv), active=st.active)
-    n_used, M_b = pooling_lengths(pos_before, twin.n_comp, st.steps, st.neg)
+    n_used, M_b = pooling_lengths(pos_before, twin.n_comp, st.steps, st.neg, st.M0)
+    if st.M0 is None:
+        st.M0 = M_b.clone()                                            # the first step's widths ("frozen" control)
     ck = twin.comp_k_flat()
     score = stage1_seqused(q, ck, ck, st.cu_q, twin.cu, 1, twin.lk_max, seqused_k=n_used)
     nosa_pooling_per_request(score, twin.ccis, n_used, M_b, st.pq, st.pc, stride=layer.pooling_stride,

@@ -231,11 +231,19 @@ class PositionalTwin:
             raise TwinCapacityError("a compressed table is full (Lk_max %d)" % self.lk_max)
         keys = keys.to(device=dev, dtype=self.ring.dtype)
         cis = cis.to(device=dev, dtype=self.total_cis.dtype)
+        # SHAPE-STABLE SUMMARIES (R2 step 6, the ragged isolation gate): both means below are computed for EVERY
+        # request of the batch ((B, 32, H, D) and (H, B, 32)) and only the due requests are written. The reduction
+        # kernel, and so the summation order of request b's summary, then never depends on how many requests are due
+        # this step: a ragged batch computes request b's summary with the same kernel launch as an equal-advance
+        # batch of the same B. The windows of the requests that are not due are finite reads (ring rows, total_cis
+        # rows, clamped), and they are discarded. With every request due (equal advance) this is the former call.
+        all_b = torch.arange(self.B, device=dev)
         # 1. deferred key compression
         bk = b[due_k]
         if bk.numel():
             nk = n_k[due_k]
-            self.comp_k[bk, nk] = self.key_window(bk, STRIDE * nk).mean(dim=1)
+            means = self.key_window(all_b, STRIDE * self.n_comp).mean(dim=1)              # (B, H, D)
+            self.comp_k[bk, nk] = means[bk]
             self.n_comp[bk] = nk + 1
         # 2. raw key
         self.ring[b, p % RING] = keys[b]
@@ -245,8 +253,10 @@ class PositionalTwin:
         bc = b[due_c]
         if bc.numel():
             nc = n_c[due_c]
-            win = self.total_cis[bc[:, None], STRIDE * nc[:, None] + self._win[None, :]]   # (k, 32, H)
-            self.ccis[:, bc, nc] = win.permute(2, 0, 1).contiguous().mean(dim=-1)        # (H, k)
+            rows = (STRIDE * self.n_ccis[:, None] + self._win[None, :]).clamp(max=self.n_max - 1)
+            win = self.total_cis[all_b[:, None], rows]                                     # (B, 32, H)
+            means_c = win.permute(2, 0, 1).contiguous().mean(dim=-1)                       # (H, B)
+            self.ccis[:, bc, nc] = means_c[:, bc]
             self.n_ccis[bc] = nc + 1
         # 5.
         self.pos[b] = p + 1
