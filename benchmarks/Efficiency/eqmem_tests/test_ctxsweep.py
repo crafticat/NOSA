@@ -276,9 +276,9 @@ def test_CS5_latency():
 def test_CS6_cell_list_and_time():
     entries = CS.parse_cell_list((EFF / "ctxsweep_cells.txt").read_text())
     tiers = [e["tier"] for e in entries]
-    assert len(entries) == 9 and tiers.count("1") == 7 and tiers.count("2") == 2
-    assert {e["S"] for e in entries} == set(CTXS)
-    assert sum(e["cell"].startswith("spec:") for e in entries) == 7 and sum(e["batch"] == "max" for e in entries) == 4
+    assert len(entries) == 10 and tiers.count("1") == 8 and tiers.count("2") == 2
+    assert {e["S"] for e in entries} == set(CTXS) and (entries[0]["S"], entries[0]["cell"]) == (16128, "spec:2")
+    assert sum(e["cell"].startswith("spec:") for e in entries) == 8 and sum(e["batch"] == "max" for e in entries) == 4
     f = CS.prior_fit()
     dflt = CS.sweep_plan(entries, 75.0, 512, f, CS.HostFit())                 # no measured row: still admitted
     assert not [p for p in dflt if "error" in p], [p for p in dflt if "error" in p]
@@ -337,7 +337,7 @@ def test_CS7_driver_cpu(tmp_path, monkeypatch):
     out = tmp_path / "plan.json"
     assert CB.main(["--mode", "plan", "--budget-gb", "75", "--cells-file", cells, "--out", str(out)]) == 0
     pj = json.loads(out.read_text())
-    assert len(pj["cells"]) == 9 and pj["hfit"]["mode"] == "2x" and set(pj["tier_minutes"]) == {"1", "2"}
+    assert len(pj["cells"]) == 10 and pj["hfit"]["mode"] == "2x" and set(pj["tier_minutes"]) == {"1", "2"}
     assert CB.main(["--mode", "plan", "--budget-gb", "75", "--cells-file", cells, "--out", str(out)]) == 2
     bad = tmp_path / "bad.txt"
     bad.write_text("130816 original 64 440\n")

@@ -18,8 +18,11 @@
 # --mem: ctxsweep_core.mem_need_gib under the default '2x' host model (+ 10 GiB for the small cells); 440 for the max
 # cells (the refit power-of-two model needs 310 GiB at 128K x 63 and 64K x 127).
 #
-# Total of tier 1: about 105 min; tier 2: about 59 min more.
+# Total of tier 1: about 110 min; tier 2: about 59 min more.
 # tier 1
+# --- kernel warm-up: the first cell of a run compiles every kernel (cs1: +100 s in the 64K x 8 prefill); a spec cell
+#     compiles the shipped and the spec paths. A valid extra point, but its e2e includes the compile.
+16128  spec:2     4    64     # ~4.0 min (+ ~1.7 min compile)
 # --- spec at the batch sizes the baselines already have (matched-batch comparisons)
 16128  spec:2     16   64     # ~4.7 min
 65280  spec:2     8    80     # ~5.6 min
