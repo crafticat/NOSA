@@ -43,6 +43,10 @@ from .r2_spec_core import PaddedLinear, select_blocks
 from .stage1_seqused import stage1_seqused
 
 
+TOPK = 64                        # the shipped selection size (topk_blocks)
+MIN_POS = (TOPK - 1) * BLOCK     # 4032: the first position whose pooled width pos // 64 + 1 holds 64 blocks
+
+
 def fixed_order_mean(x: torch.Tensor, dim: int) -> torch.Tensor:
     """The mean along dim as a chain of elementwise float32 adds in index order, then / n, cast to x's dtype. The
     order is a function of n only (no reduction kernel, so nothing depends on the other dims)."""
@@ -165,6 +169,11 @@ def decode_inference(model, input_ids, cu_seqlens, position_ids, cache):
     st = cache.r2_state
     if input_ids.shape[1] != 1:
         raise RP.R2Error("the BI decode takes one token per request")
+    low = st.pos_host[st.active_host]
+    if low.numel() and int(low.min()) < MIN_POS:                  # the host mirror: no device read
+        raise RP.R2Error("a row writes position %d < %d: the selection takes the top %d of pos // 64 + 1 pooled "
+                         "blocks, so fewer than 64 blocks would name blocks that do not exist"
+                         % (int(low.min()), MIN_POS, TOPK))
     hidden = F.embedding(input_ids, model.embed_tokens)
     pos_flat = position_ids.flatten()
     for l, layer in enumerate(model.layers):

@@ -1,8 +1,8 @@
 # R2 step 7, piece 5: speculative fetch and retention on the R2 path (DESIGN NOTE)
 
 Branch `feature/nosi-r2-m2-fetch` (worktree `/mnt/beegfs/ojerbi/nosi-r2-m2-fetch`, from cf58fbc).
-Status: DESIGN. No code and no GPU result in this note. The CPU stand-ins follow after the lead confirms the
-decisions of section 10.
+Status: design e58975d; decisions D1-D5 accepted (section 10). The CPU stand-ins (`nosi/nosi/r2_residency.py`,
+`benchmarks/Efficiency/tests_cpu/test_r2_residency.py`, F1-F9) are in the commit after e58975d. No GPU result.
 
 Sources (read, not copied):
 
@@ -218,17 +218,27 @@ svc.report()                                       # 4.3 / 4.6 / 4.8 / 4.9 count
 | rollback, cancel | `_apply :3367-3430`, `_cancel_requester :3469-3480` |
 | request end | `_end_request :831-875` |
 
-## 10. Decisions for the lead
+## 10. Decisions (ACCEPTED by the lead, 2026-10-20 / 21)
 
-- D1 REUSE BY VENDORING: bring K3X's `kstep/{__init__, errors, backend, executor, ownership, transfer, mutations}.py`
-  into this branch BYTE-IDENTICAL at 91e6e47 (`git show 91e6e47:<path>`; a CPU test checks each blob id), and import
-  `nosi.kstep.ownership` etc. No edit of those files; R2 specifics live in a new `nosi/nosi/r2_residency.py`. The
-  alternative (re-implement the ownership) duplicates 1173 tested lines.
-- D2 v1 verifier resolution host-side per layer (section 6), measured as dHOST; device-side stages later.
-- D3 a refused draft fetch continues MASKED (K3X), not a pause; the paper's wording "pauses" is to be aligned.
-- D4 per-stream physical backing (M1: B x H x (C + X + 4) slots per layer); the shared arena (M2) later if memory
-  needs it.
-- D5 the transport default for GPU runs: `gilfree` once its GPU step passes, else `s0`; `gather` as the 4.4 baseline.
+- D1 REUSE BY VENDORING: K3X's `kstep/{__init__, errors, backend, executor, ownership, transfer, mutations}.py` are in
+  this branch BYTE-IDENTICAL at 91e6e47 (`git checkout 91e6e47 -- <paths>`; CPU test F9 checks each blob id). They
+  are never edited; the R2 specifics live in `nosi/nosi/r2_residency.py`. CREDIT: the ownership model, its states,
+  rules K1-K5, the transfer record and the transports are K3X's (tracks B / C, `nosi-kstep-bc`); this piece adds the
+  R2 call sites, the store layout, the bias rule and the R2 metric recorder.
+- D2 v1 resolution is host-side per layer (section 6): the CORRECTNESS REFERENCE. SG5 reports its cost (dHOST)
+  SEPARATELY. S-B (device-side draft rows) and S-C (device-side verifier) are REQUIRED before any throughput claim
+  that includes this service.
+- D3 a refused draft fetch continues MASKED (K3X). The service records the refused-fetch count and the masked
+  fraction (draft (row, head) pairs that did not read every selected block) per resolve; the tick sums them per tick.
+  The paper's 3.1 "pauses until verification catches up" (the lead bound) stays; its 3.4 "drafting pauses when it
+  cannot safely reserve the space" must become the masked behaviour (on the author's decision list).
+- D4 per-stream physical backing (M1: B x H x (C + X + 4) slots per layer). The extra memory against the shipped
+  64-slot window (+4.9 GB at B 64 for 100 slots per stream) is charged in the equal-memory budget and reported. The
+  shared arena (M2) comes later if memory needs it.
+- D5 transport default for GPU runs: `gilfree` (its GPU step PASSED its registered prediction, 2026-10-21:
+  cpu_native:64:32 +0.96 % decode slowdown with a bounded backlog; cpu_native:192:96 +1.82 % with a GROWING backlog,
+  `/mnt/beegfs/ojerbi/nosi-sustained-gilfree/results/sustained/b64_s512_gilfree`); `s0` as the fallback; `gather` as
+  the 4.4 baseline.
 
 ## 11. Metrics on the R2 path (requirement (e)); K3X definitions verbatim (`paper_metrics.py:9-37`)
 
@@ -244,8 +254,13 @@ svc.report()                                       # 4.3 / 4.6 / 4.8 / 4.9 count
 ## 12. CPU stand-ins and tests (next commit), each with a negative control
 
 Module `nosi/nosi/r2_residency.py` (torch only) over the vendored K3X ownership and transports; tests
-`benchmarks/Efficiency/tests_cpu/test_r2_residency.py`. The store tensors are CPU tensors; events are K3X's CPU
-backend events; the adversarial transport delays, reorders and bursts deliveries.
+`benchmarks/Efficiency/tests_cpu/test_r2_residency.py`. The store tensors are CPU tensors; events are CPU objects
+with a done flag (the shape of K3X's CPU backend events); the adversarial transport delays, reorders and bursts
+deliveries ("force_only" for the scripted tests). The negative controls are K3X mutation switches where one exists
+(prot_release_no_reader_gate, release_drops_all_keys, free_on_cancel, no_reader_wait, release_first_reader,
+vres_counted_as_lru) and defect subclasses of the service otherwise (InflightReadable, NoDedup, DraftTakesReserve).
+F5b (the verifier reserve) and G10 in `test_r2_g0bi.py` (the serial path refuses rows below position 4032, the verify
+agent's Q4) are added.
 
 | Id | Test | Negative control (must be caught) |
 |---|---|---|
