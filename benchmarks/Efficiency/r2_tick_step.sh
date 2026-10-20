@@ -3,7 +3,8 @@
 # r2_tick_gate.py: the flattened joint tick (nosi/nosi/r2_tick.py) against the BI serial decode (nosi/nosi/
 # r2_bi_decode.py). MUST: SG0 (the engine's serial mode equals the BI serial decode), SG1 (teacher-forced tick, every
 # verify row incl. the rejected ones torch.equal to the BI serial row; the schedule covers every rejection offset and
-# both sides of block boundaries), SG2 (free-running greedy tick, committed sequences equal), each with its control.
+# both sides of block boundaries), SG2 (free-running greedy tick, committed sequences equal), each with its control;
+# SG3 (the phase mix: SG1 with the requests' cohorts staggered over 3 ticks); SG4 (three negatives, detection REPORT).
 # B = 8 ragged documents of pg19-test-c16k (S = 16128 minus the ragged gate's deltas), 96 committed tokens per
 # request, GEMM mode exact (G-b PaddedLinear, M_FIX = 4B = 32), piece 3 v2's attention.
 # The pattern of benchmarks/Efficiency/r2_g0bi_step.sh: the GPU uuid comes from the lead-owned file
@@ -43,7 +44,7 @@ SPLITS=4
 STEPS=96
 DROP=0.5
 SELF=benchmarks/Efficiency/r2_tick_step.sh
-STEP_MIN=45
+STEP_MIN=60
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 tick step: STOP: $*" >&2; exit 1; }
@@ -111,7 +112,7 @@ ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) sr
       "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_tick_gate.py" --out "$OUT" --model "$MODEL"
       --workload "$WL" --biattn "$ATTN_MOD" --gemm "$GEMM" --batch 8 --S 16128 --deltas 0,1,17,63,64,65,777,4097
       --steps "$STEPS" --sg0-steps 64 --K 3 --LAMBDA 7 --draft-drop "$DROP" --seed 7 --m-fix "$M_FIX"
-      --parts SG0,SG1,SG2)
+      --sg4-steps 32 --phase 3 --parts SG0,SG1,SG2,SG3,SG4)
 if [ "$DRY" = 1 ]; then
     echo "R2 tick step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob workload $WL_SHA gpu_uuid $GPU_UUID ($UFILE)"
     echo "R2 tick step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; gemm $GEMM; M_FIX $M_FIX"

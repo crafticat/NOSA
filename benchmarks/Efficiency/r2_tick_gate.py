@@ -1,7 +1,8 @@
 """R2 step 7, PIECE 4: the GPU gate of the FLATTENED JOINT TICK (nosi/nosi/r2_tick.py) against the BI SERIAL DECODE
-(nosi/nosi/r2_bi_decode.py, C's G0-BI path, dd5c4b9): SG0, SG1 and SG2 of docs/R2_STEP7_SPEC_ROUND.md 7.2 (SG3-SG5
-come after). Holder step: benchmarks/Efficiency/r2_tick_step.sh. CPU tests: benchmarks/Efficiency/tests_cpu/
-test_r2_tick.py. One model, the parts run one after another in one process.
+(nosi/nosi/r2_bi_decode.py, C's G0-BI path, dd5c4b9): SG0 - SG4 of docs/R2_STEP7_SPEC_ROUND.md 7.2 (SG5, the R-PERF
+budget, is designed in docs/R2_STEP7_TICK_SG5.md against piece 5's Residency). Holder step: benchmarks/Efficiency/
+r2_tick_step.sh. CPU tests: benchmarks/Efficiency/tests_cpu/test_r2_tick.py. One model, the parts run one after
+another in one process.
 
 THE OPS (one BIOps object for the reference and the tick, C's contract): piece 3 v2's paged attention (--biattn, a
 pinned copy), the GEMM mode --gemm (exact = G-b PaddedLinear(--m-fix) for wqkv / wo / gate_up / down / lm_head; fast =
@@ -28,8 +29,18 @@ Every part below runs on its own copy of BASE (BASE.clone()).
        decisions by the verifier's argmax (r2_spec_core.Round). Every request's committed --steps tokens torch.equal
        to REF's; every verify row ON REF'S PATH (its input and its cohort's earlier inputs equal REF's tokens) torch.equal
        to REF's row. MUST preconditions: rejections > 0 and publications > 0.
+  SG3  (MUST) the PHASE MIX: SG1's teacher-forced tick with request b's cohorts gated to the ticks t with
+       (t + b) % --phase == 0 (r2_tick.phase_ready): requests verify at different ticks, a request drafts while others
+       verify, a request whose cohort waits reaches its lead bound and verifies without its own draft row. Every verify
+       row torch.equal to REF's row, counted per composition class (own draft row in the tick, another request's verify
+       rows, another request's draft row). MUST precondition: verify rows with and without their own draft row, with
+       and without another request's verify rows, and >= 3 tick sizes.
+  SG4  the NEGATIVES, each SG1's teacher-forced tick over --sg4-steps tokens with ONE op replaced: (a) natural cuBLAS
+       (gemm fast), (b) a batch-keyed split-KV attention (8 pages per split for <= B rows, else 4: r2_tick.
+       BatchKeyedSplit), (c) torch.topk(sorted=False) selection (r2_tick.topk_select). MUST: each run completes;
+       REPORT: DETECTED (some verify row differs from REF) or BLIND.
 REPORT: ticks, rows per tick (draft / verify), decision reads, ticks with verify rows, rollbacks, publications,
-write-backs, acceptance, host ms per tick, ms per REF step, GPU peak.
+write-backs, acceptance (NOT representative: the drafts are a stand-in), host ms per tick, ms per REF step, GPU peak.
 OUTPUT: --out/summary.json (written after every part). The last stdout line is R2_TICK_GATE_DONE failed=<n>; exit = n
 (2 = refused). ENVIRONMENT: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0, NOSI_POOL_BLOCKS = 0 (the BI serial decode's).
 """
@@ -47,7 +58,7 @@ sys.path.insert(0, HERE)
 import r2_g0_gate as G0  # noqa: E402  (load_workload)
 import r2_g0bi_gate as GB  # noqa: E402  (decode_loop, load_by_path, free, gate)
 
-PARTS = ("SG0", "SG1", "SG2")
+PARTS = ("SG0", "SG1", "SG2", "SG3", "SG4")
 
 
 def log(msg):
@@ -66,13 +77,15 @@ def parse_args(argv):
     ap.add_argument("--deltas", default="0,1,17,63,64,65,777,4097")
     ap.add_argument("--steps", type=int, default=96, help="committed tokens per request (the first token included)")
     ap.add_argument("--sg0-steps", type=int, default=64)
+    ap.add_argument("--sg4-steps", type=int, default=32, help="committed tokens per request in each SG4 negative")
+    ap.add_argument("--phase", type=int, default=3, help="SG3: request b's cohort runs at ticks t, (t + b) % phase == 0")
     ap.add_argument("--K", type=int, default=3)
     ap.add_argument("--LAMBDA", type=int, default=7)
     ap.add_argument("--draft-drop", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--m-fix", type=int, default=0, help="G-b's row count; 0 = 4B")
     ap.add_argument("--no-check", action="store_true", help="skip the per-layer selection check (a host read)")
-    ap.add_argument("--parts", default="SG0,SG1,SG2")
+    ap.add_argument("--parts", default="SG0,SG1,SG2,SG3,SG4")
     a = ap.parse_args(argv)
     a.deltas = [int(x) for x in a.deltas.split(",") if x != ""]
     a.parts = [p for p in a.parts.split(",") if p]
@@ -88,6 +101,8 @@ def parse_args(argv):
         ap.error("m_fix %d < (1 + K) B = %d: a tick has up to (1 + K) B rows" % (a.m_fix, (1 + a.K) * a.batch))
     if a.steps < 2 or not 1 <= a.sg0_steps <= a.steps or not 0.0 <= a.draft_drop < 1.0:
         ap.error("steps >= 2, 1 <= sg0-steps <= steps, draft-drop in [0, 1)")
+    if not 2 <= a.sg4_steps <= a.steps or a.phase < 2:
+        ap.error("2 <= sg4-steps <= steps, phase >= 2")
     return a
 
 
@@ -135,15 +150,18 @@ def part_sg0(a, base, ref, gates, res):
     del eng
 
 
-def part_tick(a, base, ref, gates, res, forced):
+def part_tick(a, base, ref, gates, res, forced, name=None, ready=None, eng_kw=None, steps=None, negative=None):
+    """SG1 (forced), SG2 (free running), SG3 (forced + ready = phase_ready: the phase mix) and the SG4 negatives
+    (forced, eng_kw replaces the ops or the selection; negative = its label: detection is a REPORT)."""
     import torch
-    from nosi.r2_tick import Ref, forced_schedule, run_round
-    name = "SG1" if forced else "SG2"
-    eng = base.clone()                                                     # draft rows drop --draft-drop in both
+    from nosi.r2_tick import Ref, compositions, forced_schedule, run_round
+    name = name or ("SG1" if forced else "SG2")
+    steps = steps or a.steps
+    eng = base.clone(**(eng_kw or {}))                                     # draft rows drop --draft-drop in all
     B, S_list = eng.B, eng.S_list
     toks = ref["tok_host"]
     n_ref = ref["logits"].shape[0]
-    records, eqs, nxts = [], [], []
+    records, eqs, nxts, comps = [], [], [], []
     per_tick = []
     skipped = [0]
 
@@ -152,6 +170,7 @@ def part_tick(a, base, ref, gates, res, forced):
 
     def on_tick(rows, tokens, out):
         picks = []
+        comp = compositions(rows)
         for k, row in enumerate(rows):
             if row.kind != "v":
                 continue
@@ -161,6 +180,7 @@ def part_tick(a, base, ref, gates, res, forced):
                 continue
             picks.append((k, row.b, row.pos))
             records.append((row.b, row.pos, tokens[k], (row.b, row.epoch, row.m), row.i))
+            comps.append(comp[k][1:])
         e, n = cmp_rows(out.logits, ref["logits"], S_list, picks)
         eqs.append(e)
         nxts.append(n)
@@ -168,8 +188,8 @@ def part_tick(a, base, ref, gates, res, forced):
 
     reject_at, sched = (forced_schedule(a.K) if forced else (None, []))
     t0 = time.time()
-    rnd = run_round(eng, [int(toks[0, b]) for b in range(B)], [a.steps] * B, K=a.K, LAMBDA=a.LAMBDA,
-                    teacher=teacher if forced else None, reject_at=reject_at, on_tick=on_tick)
+    rnd = run_round(eng, [int(toks[0, b]) for b in range(B)], [steps] * B, K=a.K, LAMBDA=a.LAMBDA,
+                    teacher=teacher if forced else None, reject_at=reject_at, on_tick=on_tick, ready=ready)
     torch.cuda.synchronize()
     sec = time.time() - t0
     eq = torch.cat(eqs).cpu().tolist() if eqs else []
@@ -195,7 +215,19 @@ def part_tick(a, base, ref, gates, res, forced):
         cmp_idx = [j for j in range(len(records)) if on_path[j]]
     bad = [records[j][:2] for j in cmp_idx if not eq[j]]
     ctrl = [records[j][:2] for j in cmp_idx if nx[j]]
-    committed_ok = [rnd.reqs[b].out == [int(toks[s, b]) for s in range(a.steps)] for b in range(B)]
+    committed_ok = [rnd.reqs[b].out == [int(toks[s, b]) for s in range(steps)] for b in range(B)]
+    if negative is not None:                                               # SG4: detection is a REPORT
+        gates.append(GB.gate("R_%s_detected" % name, True, False,
+                             ("DETECTED (%s): %d of %d verify rows differ from REF, first (request, position) %s"
+                              % (negative, len(bad), len(cmp_idx), bad[:3])) if bad else
+                             ("BLIND (%s): every one of %d verify rows equals REF: the check could not see this "
+                              "negative here" % (negative, len(cmp_idx)))))
+        gates.append(GB.gate("%s_ran" % name, bool(cmp_idx) and all(committed_ok), True,
+                             "the teacher-forced run completed: %d verify rows compared, committed == REF for %d of %d"
+                             % (len(cmp_idx), sum(committed_ok), B)))
+        res[name] = dict(negative=negative, compared=len(cmp_idx), differ=len(bad), ticks=rnd.ticks)
+        del eng
+        return
     must = a.gemm == "exact"
     gates.append(GB.gate("%s_verify_rows_equal_BI_serial" % name, not bad and not wrong_in and cmp_idx, must,
                          "%d of %d compared verify rows differ (first (request, position) %s); %d rows with a non-REF "
@@ -204,7 +236,7 @@ def part_tick(a, base, ref, gates, res, forced):
     gates.append(GB.gate("%s_control_next_position_differs" % name, not ctrl and cmp_idx, True,
                          "%d of %d compared rows equal REF's row at the next position" % (len(ctrl), len(cmp_idx))))
     gates.append(GB.gate("%s_committed_equal_BI_serial" % name, all(committed_ok), must or forced,
-                         "requests whose %d committed tokens equal REF's: %d of %d" % (a.steps, sum(committed_ok), B)))
+                         "requests whose %d committed tokens equal REF's: %d of %d" % (steps, sum(committed_ok), B)))
     mirror = eng.mirror_failures()
     gates.append(GB.gate("%s_bookkeeping_twin_counters_match" % name, not mirror, True,
                          "%d (layer, bank) twin position counters differ from the host mirrors%s"
@@ -221,7 +253,22 @@ def part_tick(a, base, ref, gates, res, forced):
                          info["decision_reads"] == info["ticks_with_verify"] == rnd.syncs, True,
                          "decision reads %d, ticks with verify rows %d, round syncs %d"
                          % (info["decision_reads"], info["ticks_with_verify"], rnd.syncs)))
-    if forced:
+    if ready is not None:                                                  # SG3: the phase mix
+        classes = {}
+        for j in cmp_idx:
+            c = comps[j][:3]
+            n_all, n_bad = classes.get(c, (0, 0))
+            classes[c] = (n_all + 1, n_bad + (0 if eq[j] else 1))
+        sizes = sorted({c[3] for c in comps})
+        need = [any(c[0] for c in classes), any(not c[0] for c in classes), any(c[1] for c in classes),
+                any(not c[1] for c in classes), len(sizes) >= 3]
+        gates.append(GB.gate("SG3_precondition_compositions", all(need), True,
+                             "verify rows WITH / WITHOUT their own draft row in the tick %s / %s, WITH / WITHOUT another "
+                             "request's verify rows %s / %s, %d distinct tick sizes %s"
+                             % (need[0], need[1], need[2], need[3], len(sizes), sizes[:12])))
+        info_classes = {"own_draft=%s other_verify=%s other_draft=%s" % c: dict(rows=v[0], differ=v[1])
+                        for c, v in sorted(classes.items())}
+    if forced and name == "SG1":
         from nosi.r2_tick import schedule_coverage
         cov = schedule_coverage(sched, a.K)
         gates.append(GB.gate("SG1_precondition_schedule_coverage", cov["complete"], True,
@@ -233,7 +280,7 @@ def part_tick(a, base, ref, gates, res, forced):
                              "positions and counts only)" % (len(sched), "equal" if sched == a.sim_log else "DIFFER from",
                                                              len(a.sim_log))))
         info.update(schedule=cov)
-    else:
+    elif not forced:
         pre = info["rollbacks"] > 0 and info["publications"] > 0
         gates.append(GB.gate("SG2_precondition_rejects_and_publishes", pre, True,
                              "rollbacks %d, publications %d (a run that never rolls back is blind)"
@@ -241,6 +288,8 @@ def part_tick(a, base, ref, gates, res, forced):
         info["acceptance_NOT_REPRESENTATIVE"] = round(st["accepted"] / max(1, st["accepted"] + st["rejected"]), 4)
     info["draft_stand_in"] = ("draft rows miss a hashed %g of their middle blocks (all-resident store): NO r, acceptance "
                               "or R-PERF number of this run is representative (C, Q2 2026-10-21)" % eng.draft_drop)
+    if ready is not None:
+        info["compositions"] = info_classes
     res[name] = info
     del eng
 
@@ -308,18 +357,32 @@ def main(argv=None) -> int:
             del cache, st, r
             GB.free()
             save()
-            for part in ("SG0", "SG1", "SG2"):
+            from types import SimpleNamespace
+            from nosi.r2_tick import BatchKeyedSplit, phase_ready, topk_select
+            negs = (("SG4a", "natural cuBLAS in the flattened call (gemm fast)",
+                     dict(ops=BIOps(attn, a.m_fix, gemm="fast"))),
+                    ("SG4b", "split-KV attention with a batch-keyed split size (8 pages for <= B rows, else 4)",
+                     dict(ops=SimpleNamespace(linear=ops.linear, attn=BatchKeyedSplit(attn, a.batch), mean=ops.mean))),
+                    ("SG4c", "torch.topk(sorted=False) selection (the shipped tie rule)", dict(select=topk_select)))
+            runs = [("SG0", None), ("SG1", None), ("SG2", None), ("SG3", None)] + [("SG4", n) for n in negs]
+            for part, neg in runs:
                 if part not in a.parts:
                     continue
-                log(part)
+                label = neg[0] if neg else part
+                log(label)
                 try:
                     if part == "SG0":
                         part_sg0(a, base, ref, gates, res)
-                    else:
+                    elif part in ("SG1", "SG2"):
                         part_tick(a, base, ref, gates, res, forced=(part == "SG1"))
+                    elif part == "SG3":
+                        part_tick(a, base, ref, gates, res, forced=True, name="SG3", ready=phase_ready(a.phase))
+                    else:
+                        part_tick(a, base, ref, gates, res, forced=True, name=neg[0], eng_kw=neg[2],
+                                  steps=a.sg4_steps, negative=neg[1])
                 except Exception as e:
                     traceback.print_exc()
-                    gates.append(GB.gate("PART_%s" % part, False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:400])))
+                    gates.append(GB.gate("PART_%s" % label, False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:400])))
                 GB.free()
                 save()
         meta["peak_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 2)

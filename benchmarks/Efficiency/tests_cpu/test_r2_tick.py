@@ -416,26 +416,30 @@ def serial_ref(eng, n=N_REF, first=FIRST):
     return torch.tensor(toks), torch.stack(lg)
 
 
-def tick_check(eng, toks, logits, forced, K=3, LAMBDA=7):
-    """The SG1 / SG2 checks on the CPU. Returns dict(bad, ctrl, compared, committed_ok, rnd, log, wrong_in)."""
+def tick_check(eng, toks, logits, forced, K=3, LAMBDA=7, ready=None):
+    """The SG1 / SG2 / SG3 checks on the CPU. Returns dict(bad, ctrl, compared, committed_ok, rnd, log, wrong_in,
+    comps: per compared row (own draft, other verify, other draft, R, equal))."""
     S_list = eng.S_list
     n_ref = logits.shape[0]
     recs = []
+    comps = []
 
     def teacher(b, p):
         return int(toks[p - S_list[b], b])
 
     def on_tick(rows, tokens, out):
+        comp = TK.compositions(rows)
         for k, row in enumerate(rows):
             if row.kind != "v" or row.pos - S_list[row.b] >= n_ref:
                 continue
             s = row.pos - S_list[row.b]
             nxt = s + 1 < n_ref and torch.equal(out.logits[k], logits[s + 1, row.b])
-            recs.append((row.b, row.pos, tokens[k], (row.b, row.epoch, row.m), row.i,
-                         torch.equal(out.logits[k], logits[s, row.b]), nxt))
+            same = torch.equal(out.logits[k], logits[s, row.b])
+            recs.append((row.b, row.pos, tokens[k], (row.b, row.epoch, row.m), row.i, same, nxt))
+            comps.append(comp[k][1:] + (same,))
     reject_at, log = TK.forced_schedule(K) if forced else (None, [])
     rnd = TK.run_round(eng, [int(toks[0, b]) for b in range(eng.B)], [STEPS] * eng.B, K=K, LAMBDA=LAMBDA,
-                       teacher=teacher if forced else None, reject_at=reject_at, on_tick=on_tick)
+                       teacher=teacher if forced else None, reject_at=reject_at, on_tick=on_tick, ready=ready)
     tl = eng.tok_log[:eng.n_tok].tolist()
     inp = [tl[t.slot] if isinstance(t, TK.Ref) else int(t) for (_, _, t, _, _, _, _) in recs]
     ref_in = [int(toks[p - S_list[b], b]) for (b, p, _, _, _, _, _) in recs]
@@ -452,7 +456,7 @@ def tick_check(eng, toks, logits, forced, K=3, LAMBDA=7):
     return dict(bad=[recs[j][:2] for j in idx if not recs[j][5]], ctrl=[recs[j][:2] for j in idx if recs[j][6]],
                 compared=len(idx), wrong_in=[j for j in range(len(recs)) if forced and inp[j] != ref_in[j]],
                 committed_ok=[rnd.reqs[b].out == [int(toks[s, b]) for s in range(STEPS)] for b in range(eng.B)],
-                mirror_bad=eng.mirror_failures(), rnd=rnd, log=log, eng=eng)
+                mirror_bad=eng.mirror_failures(), rnd=rnd, log=log, eng=eng, comps=comps)
 
 
 @pytest.fixture(scope="module")
@@ -514,6 +518,66 @@ def test_T5_free_running_tick_equals_serial(p3, ref):
     assert eng.stats["rollbacks"] > 0 and eng.stats["publications"] > 0, eng.stats
     res0 = tick_check(make_engine(make_ops(p3), draft_drop=0.0), toks, logits, forced=False)
     assert all(res0["committed_ok"]) and res0["eng"].stats["rollbacks"] == 0 and not res0["bad"]
+
+
+def test_T13_phase_mix_equals_serial(p3, ref):
+    """T13 (SG3 on the CPU): the teacher-forced tick with the requests' cohorts staggered over 3 ticks (phase_ready):
+    every verify row torch.equal to the serial row in every composition class; the run holds verify rows with and
+    without their own draft row in the tick, with and without another request's verify rows, and >= 3 tick sizes; it
+    has empty ticks or stalls handled (the round completes). Negative control: with the M-dependent GEMM some class
+    differs."""
+    toks, logits = ref
+    res = tick_check(make_engine(make_ops(p3), draft_drop=0.5), toks, logits, forced=True, ready=TK.phase_ready(3))
+    assert res["compared"] > 50 and not res["bad"], res["bad"][:5]
+    assert all(res["committed_ok"]) and not res["mirror_bad"] and not res["ctrl"]
+    comps = res["comps"]
+    assert any(c[0] for c in comps) and any(not c[0] for c in comps), "own draft row with / without"
+    assert any(c[1] for c in comps) and any(not c[1] for c in comps), "another request's verify rows with / without"
+    assert len({c[3] for c in comps}) >= 3
+    neg = tick_check(make_engine(make_ops(p3, mdep_linear), draft_drop=0.5), toks, logits, forced=True,
+                     ready=TK.phase_ready(3))
+    assert neg["bad"]
+
+
+def test_T14_negative_ops_and_phase_helpers(p3):
+    """T14: the SG4 negatives' ops and the SG3 helpers. BatchKeyedSplit runs piece 3 with 8 pages per split for
+    <= `rows` rows and 4 above (equal to the direct calls; the two differ on 8-page rows: the precondition);
+    topk_select equals select_blocks where no value ties at a cut and returns ascending ids (on tie-heavy rows the
+    two may differ: reported, not required, as the CPU kernel may break ties like the stable rule); phase_ready gates by
+    (tick + request) % period; compositions classifies the rows."""
+    g = torch.Generator().manual_seed(14)
+    R, Hk, Dh, S = 6, 2, 16, 12
+    q = torch.randn(R, Hk * 2, Dh, generator=g)
+    k = torch.randn(2, S * BS, Hk, Dh, generator=g)
+    v = torch.randn(2, S * BS, Hk, Dh, generator=g)
+    bias = torch.rand(2, S * BS, Hk, generator=g)
+    req = torch.tensor([0, 1, 0, 1, 0, 1], dtype=torch.int32)
+    pt = torch.stack([torch.stack([torch.sort(torch.randperm(S, generator=g)[:8]).values for _ in range(Hk)])
+                      for _ in range(R)]).to(torch.int32)
+    npg = torch.full((R, Hk), 8, dtype=torch.int32)
+    last = torch.tensor([5, 64, 1, 33, 17, 40], dtype=torch.int32)
+    bk = TK.BatchKeyedSplit(SimpleNamespace(bi_paged_decode=p3.bi_paged_decode_reference,
+                                            build_page_table=p3.build_page_table), rows=4)
+    args = (k, v, bias, req, pt, npg, last)
+    alone = bk.bi_paged_decode(q[:4], k, v, bias, req[:4], pt[:4], npg[:4], last[:4])
+    full = bk.bi_paged_decode(q, *args)
+    assert torch.equal(alone, p3.bi_paged_decode_reference(q[:4], k, v, bias, req[:4], pt[:4], npg[:4], last[:4],
+                                                           pages_per_split=8))
+    assert torch.equal(full, p3.bi_paged_decode_reference(q, *args, pages_per_split=4))
+    assert not torch.equal(full[:4], alone), "precondition: 4 and 8 pages per split give other bits on 8-page rows"
+    pq = torch.randn(2, 5, 40, generator=g)
+    pc = torch.randn(2, 5, 40, generator=g)
+    pq[..., -3:] = float("inf")
+    assert torch.equal(TK.topk_select(pq, pc, 6, 12), SC.select_blocks(pq, pc, 6, 12))
+    out = TK.topk_select(pq, pc, 6, 12)
+    assert torch.equal(out, torch.sort(out, -1).values)
+    rnd = SimpleNamespace(ticks=4)
+    pr = TK.phase_ready(3)
+    assert [pr(rnd, b, None) for b in range(6)] == [False, False, True, False, False, True]
+    rows = [SimpleNamespace(b=0, kind="d"), SimpleNamespace(b=0, kind="v"), SimpleNamespace(b=1, kind="v"),
+            SimpleNamespace(b=2, kind="d")]
+    assert TK.compositions(rows) == [("d", True, True, True, 4), ("v", True, True, True, 4), ("v", False, True, True, 4),
+                                     ("d", True, True, True, 4)]
 
 
 class NoTwinRollback(TK.TickEngine):
@@ -708,8 +772,10 @@ def test_T10_gate_helpers_and_defaults():
     sys.path.insert(0, str(EFF))
     spec.loader.exec_module(G)
     a = G.parse_args(["--out", "x", "--workload", "w", "--biattn", "p"])
-    assert a.m_fix == 32 and a.batch == 8 and a.parts == ["SG0", "SG1", "SG2"] and a.gemm == "exact" and a.steps == 96
-    for bad in (["--m-fix", "16"], ["--deltas", "0,1"], ["--parts", "SG9"], ["--S", "4100"]):
+    assert a.m_fix == 32 and a.batch == 8 and a.parts == ["SG0", "SG1", "SG2", "SG3", "SG4"] and a.gemm == "exact"
+    assert a.steps == 96 and a.sg4_steps == 32 and a.phase == 3
+    for bad in (["--m-fix", "16"], ["--deltas", "0,1"], ["--parts", "SG9"], ["--S", "4100"], ["--phase", "1"],
+                ["--sg4-steps", "200"]):
         with pytest.raises(SystemExit):
             G.parse_args(["--out", "x", "--workload", "w", "--biattn", "p"] + bad)
     ref = torch.randn(5, 2, 7)
@@ -731,7 +797,7 @@ def test_T11_step_script_uuid_file_and_pins(tmp_path):
     text = script.read_text()
     lines = text.splitlines()
     assert lines[0] == "#!/bin/bash" and lines[-1] == 'main "$@"; exit $?' and "main() {" in text
-    assert 'mkdir "$OUTROOT/tick_active"' in text and "STEP_MIN=45" in text and "--export=NONE" in text
+    assert 'mkdir "$OUTROOT/tick_active"' in text and "STEP_MIN=60" in text and "--export=NONE" in text
     assert text.index("UFILE=$HOLDERS/$JOB.gpu_uuid") < text.index('mkdir "$OUTROOT/tick_active"')
     for word in ("awk", "perl", "python3", " bc ", "node "):
         for ln in lines:
@@ -775,5 +841,6 @@ def test_T11_step_script_uuid_file_and_pins(tmp_path):
                 "NOSI_R2_DECODE=1", "NOSI_ATTN_SPLITS=4", "NOSI_POOL_BLOCKS=0"):
         assert arg in r.stdout, arg
     # printf %q writes a comma as "\," (CPU job 2190867; C's G8 the same): accept that form and the plain one
-    for plain in ("--parts SG0,SG1,SG2", "--deltas 0,1,17,63,64,65,777,4097"):
+    assert "--sg4-steps 32" in r.stdout and "--phase 3" in r.stdout
+    for plain in ("--parts SG0,SG1,SG2,SG3,SG4", "--deltas 0,1,17,63,64,65,777,4097"):
         assert plain in r.stdout or plain.replace(",", "\\,") in r.stdout, plain

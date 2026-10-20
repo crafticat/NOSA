@@ -676,18 +676,29 @@ class TickEngine:
 # the driver
 # =====================================================================================================================
 def run_round(engine: TickEngine, first_tokens: Sequence[int], max_new: Sequence[int], K: int = 3, LAMBDA: int = 7,
-              teacher: Callable = None, reject_at: Callable = None, on_tick: Callable = None, max_ticks: int = 100000):
+              teacher: Callable = None, reject_at: Callable = None, on_tick: Callable = None, max_ticks: int = 100000,
+              ready: Callable = None):
     """The speculative round on the engine until every request has max_new committed tokens (the first token
     included, as r2_spec_core.Round counts them). on_tick(rows, tokens, out) sees every tick's rows, their input
-    tokens (ints or Refs) and run_rows' result before the decision. Returns the TickRound."""
+    tokens (ints or Refs) and run_rows' result before the decision. ready(rnd, b, cohort) -> bool gates a TRIGGERED
+    cohort (default: always; phase_ready staggers the requests: the gate SG3). A tick that plans no row (every live
+    request waits for a gated cohort at its lead bound) runs nothing and counts as a tick. Returns the TickRound."""
     rnd = TickRound(first_tokens, engine.S_list, engine.read_tokens, K=K, LAMBDA=LAMBDA, max_new=max_new,
                     on_publish=engine.on_publish, on_rollback=engine.on_rollback, teacher=teacher, reject_at=reject_at)
+    if ready is not None:
+        rnd.ready = lambda b, c: bool(ready(rnd, b, c))
+    empty = 0
     while not all(r.done for r in rnd.reqs):
-        rows = rnd.plan_tick()
-        if not rows:
-            raise TickError("tick %d plans no row" % rnd.ticks)
         if rnd.ticks >= max_ticks:
             raise TickError("no progress after %d ticks" % max_ticks)
+        rows = rnd.plan_tick()
+        if not rows:
+            empty += 1
+            if empty > 64:
+                raise TickError("64 ticks in a row plan no row (tick %d)" % rnd.ticks)
+            rnd.finish_tick([], [], engine.n_tok)
+            continue
+        empty = 0
         tokens = [row.token for row in rows]
         out = engine.run_rows(rows, tokens)
         if on_tick is not None:
@@ -695,6 +706,52 @@ def run_round(engine: TickEngine, first_tokens: Sequence[int], max_new: Sequence
         rnd.finish_tick(rows, out.slots, out.hi)
         engine.apply_events()
     return rnd
+
+
+def phase_ready(period: int = 3):
+    """The gate SG3's PHASE MIX: request b's TRIGGERED cohort may run only at ticks t with (t + b) % period == 0, so the
+    requests verify at different ticks, a request drafts while others verify, and a request whose cohort waits reaches
+    its lead bound and verifies without a draft row of its own."""
+    if period < 1:
+        raise TickError("period >= 1")
+    return lambda rnd, b, c: (rnd.ticks + b) % period == 0
+
+
+def compositions(rows) -> List[tuple]:
+    """Per row, (kind, own draft row in the tick, another request's verify rows in the tick, another request's draft
+    row in the tick, R): the composition classes of the gate SG3."""
+    R = len(rows)
+    dr = {r.b for r in rows if r.kind == "d"}
+    vr = {r.b for r in rows if r.kind == "v"}
+    return [(r.kind, r.b in dr, bool(vr - {r.b}), bool(dr - {r.b}), R) for r in rows]
+
+
+# =====================================================================================================================
+# the gate SG4's NEGATIVE CONTROLS (each must make a verify row differ from the BI serial decode, or the gate says
+# that it could not see it)
+# =====================================================================================================================
+def topk_select(pq: torch.Tensor, pc: torch.Tensor, qk_select: int, k: int) -> torch.Tensor:
+    """SG4 (c): the SHIPPED two-step rule with torch.topk(sorted=False) (nosa_llama decode graph): the set at a tie can
+    depend on the row count and the algorithm. The result sorted ascending (the canonical page order), so only the
+    tie rule differs from r2_spec_core.select_blocks."""
+    iq = torch.topk(pq, qk_select, dim=-1, sorted=False).indices
+    mask = torch.zeros_like(pc, dtype=torch.bool)
+    mask.scatter_(2, iq, True)
+    pc2 = pc.masked_fill(mask, float("inf"))
+    return torch.sort(torch.topk(pc2, k, dim=-1, sorted=False).indices, dim=-1).values
+
+
+class BatchKeyedSplit:
+    """SG4 (b): piece 3's attention with a split size chosen by the BATCH (8 pages per split for <= `rows` rows, else
+    4), as a heuristic split-KV kernel does; the BI serial decode's calls have `rows` = B rows."""
+
+    def __init__(self, attn, rows: int):
+        self.attn, self.rows = attn, int(rows)
+        self.build_page_table = attn.build_page_table
+
+    def bi_paged_decode(self, q, *args, **kw):
+        kw["pages_per_split"] = 8 if q.shape[0] <= self.rows else 4
+        return self.attn.bi_paged_decode(q, *args, **kw)
 
 
 def forced_schedule(K: int, block: int = BLOCK):
