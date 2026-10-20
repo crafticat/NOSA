@@ -40,18 +40,36 @@ PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67
 M_SAMPLE = sorted(set(list(range(1, 21)) + PRIMES + [63, 64, 65, 127, 128, 129, 191, 192, 193, 255, 256, 299, 300]))
 
 
-def make(seed, M=300, N=96, K=192, dtype=torch.float32):
+def make(seed, M=300, N=96, K=256, dtype=torch.float32):
+    """K = 256 = FOUR 64-column chunks by default: with three chunks (K = 192) every in-order K-split gives the same
+    fold ((c0 + c1) + c2), so a split change is invisible (CPU job 2190757; test_three_chunks_hide_any_split)."""
     g = torch.Generator().manual_seed(500 + seed)
     x = torch.randn(M, K, generator=g).to(dtype)
     w = (torch.randn(N, K, generator=g) * 0.1).to(dtype)
     return x, w
 
 
+def make_wide(seed, M=300, N=96, K=256):
+    """fp32 data with a wide dynamic range (each value scaled by e**u, u uniform in [-4, 4]): partial sums of very
+    different sizes, so a different grouping of the chunk sums changes the fp32 rounding."""
+    g = torch.Generator().manual_seed(700 + seed)
+    x = torch.randn(M, K, generator=g) * torch.exp(torch.rand(M, K, generator=g) * 8 - 4)
+    w = torch.randn(N, K, generator=g) * torch.exp(torch.rand(N, K, generator=g) * 8 - 4)
+    return x, w
+
+
 def m_dependent(cfg):
-    """NEGATIVE CONTROL: a split-K chosen by M (what a heuristic GEMM does): no split up to 64 rows, else 2 more."""
+    """NEGATIVE CONTROL: a split-K chosen by M (what a heuristic GEMM does): no split up to 64 rows, 2 above. At
+    K = 256 (four chunks) split 1 folds ((c0 + c1) + c2) + c3 and split 2 adds (c0 + c1) + (c2 + c3)."""
     def pick(M):
-        return cfg._replace(split_k=1 if M <= 64 else cfg.split_k + 1)
+        return cfg._replace(split_k=1 if M <= 64 else 2)
     return pick
+
+
+def orders_differ(fn, x, w, cfg):
+    """The PRECONDITION of every negative control: split 1 and split 2 give different bits on these rows. Without it
+    the control (and the invariance checks on the same data) would be blind."""
+    return not torch.equal(fn(x, w, config=cfg._replace(split_k=1)), fn(x, w, config=cfg._replace(split_k=2)))
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +110,8 @@ def test_twin_equals_the_float64_product(dtype, tol, shape):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_twin_rows_do_not_depend_on_m_order_or_neighbours(dtype):
     x, w = make(2, dtype=dtype)
+    # the data can show a split change (fp32 partials; the precondition is checked in fp32 on the same values)
+    assert orders_differ(bl.bi_linear_reference, x.float(), w.float(), bl.config_for(96, 256))
     full = bl.bi_linear_reference(x, w)
     for M in (1, 2, 7, 64, 65, 193, 299):
         assert torch.equal(bl.bi_linear_reference(x[:M], w), full[:M]), M
@@ -102,9 +122,21 @@ def test_twin_rows_do_not_depend_on_m_order_or_neighbours(dtype):
     assert torch.equal(bl.bi_linear_reference(x2, w)[::7], full[::7])
 
 
+def test_three_chunks_hide_any_split():
+    """Why the first control was blind (CPU job 2190757): at K = 192 (three chunks) splits 1, 2 and 3 all compute
+    ((c0 + c1) + c2) -- 0 + c0 == c0 exactly and the partials are added in split order -- so they are bitwise equal.
+    Pinned so that a future control never uses fewer than four chunks."""
+    x, w = make_wide(5, M=20, K=192)
+    cfg = bl.config_for(96, 192)
+    outs = [bl.bi_linear_reference(x, w, config=cfg._replace(split_k=s)) for s in (1, 2, 3)]
+    assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2])
+
+
 def test_negative_m_dependent_split_k_is_caught_in_the_twin():
-    x, w = make(4)
-    pick = m_dependent(bl.config_for(96, 192))
+    x, w = make_wide(4)                                     # fp32, K = 256: four chunks
+    cfg = bl.config_for(96, 256)
+    assert orders_differ(bl.bi_linear_reference, x[:10], w, cfg), "precondition: split 1 and 2 differ on these rows"
+    pick = m_dependent(cfg)
     small = bl.bi_linear_reference(x[:10], w, config=pick(10))
     big = bl.bi_linear_reference(x, w, config=pick(300))[:10]
     assert not torch.equal(small, big)
@@ -131,7 +163,12 @@ def load(path, name):
 bl = load(sys.argv[1], "bi_linear_interp")
 t = load(sys.argv[2], "bi_linear_tests")
 fails = []
-for N, K in ((96, 192), (70, 100)):                    # split 2 with a masked last chunk; odd N and K
+# the data can show a split change on the KERNEL (four chunks): else every invariance check below is blind
+x, w = t.make(10, N=96, K=256)
+if not t.orders_differ(bl.bi_linear, x, w, bl.config_for(96, 256)):
+    print("FAILS [('precondition-unmet: the interpreted kernel gives the same bits for split 1 and 2 at K = 256',)]")
+    sys.exit(1)
+for N, K in ((96, 256), (70, 100)):                    # split 2 over four chunks; odd N and K (a masked chunk)
     x, w = t.make(10, N=N, K=K)
     full = bl.bi_linear(x, w)
     ref = x.double() @ w.double().t()
@@ -158,17 +195,22 @@ for N, K in ((96, 192), (70, 100)):                    # split 2 with a masked l
         fails.append(("workspace", N, K))
 # the no-split path (split 1) is invariant too
 x, w = t.make(11)
-one = bl.config_for(96, 192)._replace(split_k=1)
+one = bl.config_for(96, 256)._replace(split_k=1)
 full1 = bl.bi_linear(x, w, config=one)
 for M in t.M_SAMPLE:
     if not torch.equal(bl.bi_linear(x[:M], w, config=one), full1[:M]):
         fails.append(("split1-M", M))
-# NEGATIVE CONTROL: a split-K chosen by M must be caught
-pick = t.m_dependent(bl.config_for(96, 192))
-caught = any(not torch.equal(bl.bi_linear(x[:M], w, config=pick(M)), bl.bi_linear(x, w, config=pick(300))[:M])
-             for M in (5, 33, 64))
-if not caught:
-    fails.append(("negative-not-caught",))
+# NEGATIVE CONTROL: a split-K chosen by M must be caught; its precondition first (the two orders differ on the rows)
+xw, ww = t.make_wide(12)
+cfg = bl.config_for(96, 256)
+if not t.orders_differ(bl.bi_linear, xw[:64], ww, cfg):
+    fails.append(("negative-precondition-unmet",))
+else:
+    pick = t.m_dependent(cfg)
+    caught = any(not torch.equal(bl.bi_linear(xw[:M], ww, config=pick(M)), bl.bi_linear(xw, ww, config=pick(300))[:M])
+                 for M in (5, 33, 64))
+    if not caught:
+        fails.append(("negative-not-caught",))
 if fails:
     print("FAILS", fails[:20])
     sys.exit(1)

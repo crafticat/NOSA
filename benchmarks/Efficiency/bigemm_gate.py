@@ -8,8 +8,9 @@ MUST gates (each counted in the exit code), per linear:
   G1 semantics: 8 rows against the float64 product: max |d| <= 0.02 * max|ref| + 1e-3.
   G2 row invariance (torch.equal): bi_linear(x[:M]) == bi_linear(x)[:M] for M in MS; a permutation of the 320 rows;
      new neighbours (every row but every 5th replaced); a preallocated, larger, NaN-filled workspace.
-  G3 negative control: a split-K chosen by M (no split up to 64 rows, one more split above) must differ from the
-     fixed table somewhere between M = 64 and M = 320; else the check is blind and the gate FAILS.
+  G3 negative control: a split-K chosen by M (no split up to 64 rows, 2 splits above) must differ between M = 64
+     and M = 320; its PRECONDITION (split 1 and split 2 give different bits on the same rows) is checked first. If
+     either fails, the invariance check is blind for this linear and the gate FAILS.
 REPORT: G4 cuBLAS's own row variance (F.linear(x[:M]) against F.linear(x)[:M], rows that differ); the timing table
 (median of 20 CUDA-event calls after 3 warm-ups): bi_linear at M, F.linear at the natural M, F.linear on rows padded
 to M_FIX; per-step totals 32 x (wqkv + wo + gate_up + down) + lm_head against the registered prediction (PRED).
@@ -102,14 +103,17 @@ def main() -> int:
                 bad.append("workspace")
         gate("G2-row-invariance[%s]" % name, not bad, "M in %s, permutation, neighbours%s: differing %s" % (
             list(MS), ", workspace" if cfg.split_k > 1 else "", bad))
-        # G3 negative control
-        def pick(M):
-            return cfg._replace(split_k=1 if M <= 64 else cfg.split_k + 1)
-        neg_small = bl.bi_linear(x[:64], w, config=pick(64))
-        neg_big = bl.bi_linear(x, w, config=pick(M_FIX))[:64]
-        caught = not torch.equal(neg_small, neg_big)
-        gate("G3-negative-split-caught[%s]" % name, caught, "an M-dependent split-K (1 at M <= 64, %d above) %s" % (
-            cfg.split_k + 1, "differs (detected)" if caught else "did NOT differ: the invariance check is blind"))
+        # G3 negative control: an M-dependent split-K (1 at M <= 64, 2 above). PRECONDITION first: split 1 and split
+        # 2 give different bits on the same 64 rows (K / 64 >= 64 chunks here, so the groupings differ; at 3 chunks
+        # every in-order split is the same fold and a control is blind: CPU job 2190757)
+        one, two = cfg._replace(split_k=1), cfg._replace(split_k=2)
+        pre = not torch.equal(bl.bi_linear(x[:64], w, config=one), bl.bi_linear(x[:64], w, config=two))
+        neg_small = bl.bi_linear(x[:64], w, config=one)
+        neg_big = bl.bi_linear(x, w, config=two)[:64]
+        caught = pre and not torch.equal(neg_small, neg_big)
+        gate("G3-negative-split-caught[%s]" % name, caught,
+             "precondition (split 1 and 2 differ on the rows): %s; the M-dependent split-K %s" % (
+                 pre, "differs (detected)" if caught else "is NOT detected: the invariance check is blind"))
         # G4 cuBLAS report
         cf = F.linear(x, w)
         var = {M: int((F.linear(x[:M], w) != cf[:M]).any(dim=1).sum()) for M in MS}
