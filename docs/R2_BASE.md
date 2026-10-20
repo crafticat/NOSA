@@ -99,14 +99,24 @@ GPU (after the capture gate passes; DRYRUN on the login node first; one cell per
     DRYRUN=1 bash benchmarks/Efficiency/r2_base_step.sh --nosi <sha> <holder job> <run id> b64
     bash benchmarks/Efficiency/r2_base_step.sh --nosi <sha> <holder job> <run id> b64      # then b128, b219
 
-| Cell | STEP_MIN | --mem | Pinned host KV per arm |
-|---|---|---|---|
-| b64 | 25 | 100G | about 35 GB |
-| b128 | 35 | 160G | about 70 GB |
-| b219 | 50 | 220G | about 120 GB |
+| Cell | STEP_MIN | --mem | Pinned host KV per arm | If each tensor is rounded up to a power of two |
+|---|---|---|---|---|
+| b64 | 25 | 140G | 35 GB | 69 GB |
+| b128 | 35 | 220G | 70 GB | 137 GB |
+| b219 | 50 | 220G | 120 GB | 137 GB |
 
-The `--mem` must fit the holder's allocation. Prefill is about 2.5 s per 16K request and per arm,
-so b219 spends about 18 minutes in its two prefills.
+- The pinned host KV is 64 tensors (32 layers, K and V) of B x 16704 x 256 x 2 bytes.
+- PyTorch's caching host allocator can round each block up to a power of two. It also keeps freed
+  pinned blocks cached. So after the SH arm, the cell collects the garbage and calls
+  `torch._C._host_emptyCache` before the R2 arm. Without that release, the two arms together could
+  hold about 275 GB at B 128 and 219.
+- The cell records the host memory (VmRSS, VmHWM, VmLck, VmPin) after the model load, after SH,
+  after the release and after R2 (`meta.host_mem`). It also records the GPU memory allocated at
+  the start of each arm (`gpu_base_alloc_GB`). The shipped layers keep their last stage-1 score,
+  compressed cis and pooling graph after SH, so a small part of SH stays in R2's base.
+- The `--mem` must fit the holder's allocation. `a100_hold.sbatch` asks for 480G.
+- Prefill is about 2.5 s per 16K request and per arm, so b219 spends about 18 minutes in its two
+  prefills.
 
 The GPU uuid comes from `/mnt/beegfs/ojerbi/kstep-cpu-runs/holders/<job>.gpu_uuid`; claim
 directory `/mnt/beegfs/ojerbi/r2-runs/base/base_active`.
@@ -119,3 +129,10 @@ directory `/mnt/beegfs/ojerbi/r2-runs/base/base_active`.
   shipped behaviour; the sustained runs survived it.
 - The capture-safe step is proven bitwise on the CPU and by the capture gate at B 8; B 64 .. 219
   are new shapes.
+- The sustained harness re-warmed the NON-offload engine (`cache_engine_gpu`). This cell re-warms
+  the offload engine (`cache_engine`). The re-warm is model code only (new pooling buffers and new
+  pooling graphs), and the cell reads the same counters (`get_seq_length`, `no_compress_k_len`,
+  `cached_compressed_max_seqlen`, `cache_engine.py:653, :678, :687, :849`). But no run has re-warmed
+  the offload engine past its first block yet.
+- Order: SH runs first. Kernels that both arms use are compiled in SH's first steps, so R2's eager
+  warm-up can be cheaper. This changes only the effective tok/s (P4), not the steady numbers.

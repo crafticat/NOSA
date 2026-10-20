@@ -21,8 +21,11 @@ METRICS per arm (CUDA events; a step's period = start of step t to start of step
                        after the capture step)
   steady decode tok/s  B / steady step; per-request rate = 1 / steady step (tok/s of one request)
   effective tok/s      B x N / (sum of all periods): includes SH's re-warms and R2's warm-up + capture
-  GPU peak             torch.cuda.max_memory_allocated / reserved over the arm (prefill included)
+  GPU peak             torch.cuda.max_memory_allocated / reserved over the arm (prefill included); the allocated
+                       memory at the arm's start (gpu_base_alloc_GB)
   prefill s            the arm's prefill wall time
+  host memory          REPORT: VmRSS / VmHWM / VmLck / VmPin after the load, after SH, after the release of SH's
+                       cached pinned blocks (free(host=True)), after R2 (meta.host_mem)
 AGREEMENT (R2 vs SH): teacher-forced agreement over (request, step); the free-running FIRST DIVERGENCE per request =
 its first teacher-forced disagreement (before it the two runs have equal inputs, so the teacher-forced run IS the
 free-running run up to there); the prefill first tokens (REPORT: the logits GEMM runs at M = B in SH, M = 1 in R2's
@@ -325,11 +328,35 @@ def gpu_peak():
     return round(torch.cuda.max_memory_allocated() / 1e9, 3), round(torch.cuda.max_memory_reserved() / 1e9, 3)
 
 
-def free():
+def host_mem():
+    """REPORT: this process's host memory (GB) from /proc/self/status. Never raises."""
+    out = {}
+    try:
+        with open("/proc/self/status") as f:
+            for ln in f:
+                if ln.startswith(("VmRSS", "VmHWM", "VmLck", "VmPin")):
+                    k, v = ln.split(":", 1)
+                    out[k + "_GB"] = round(int(v.split()[0]) / 1048576, 1)
+    except Exception as e:   # the instrument never stops the cell
+        out["error"] = "%s: %s" % (type(e).__name__, e)
+    return out
+
+
+def free(host: bool = False):
+    """Collect the arm's garbage (an InfLLMv2Cache can be cyclic), then release the CUDA caches. host=True also
+    releases PyTorch's CACHED PINNED HOST blocks (torch._C._host_emptyCache): the two arms allocate the same host-row
+    shape, and the caching host allocator may round each block up to a power of two (about 137 GB per arm at B 128
+    and 219), so the shipped arm's blocks must not stay cached beside the R2 arm's. Returns whether it ran."""
     import torch
     gc.collect()
+    torch.cuda.synchronize()
     torch.cuda.empty_cache()
+    ran = False
+    if host and hasattr(torch._C, "_host_emptyCache"):
+        torch._C._host_emptyCache()
+        ran = True
     torch.cuda.reset_peak_memory_stats()
+    return ran
 
 
 def main(argv=None) -> int:
@@ -361,9 +388,11 @@ def main(argv=None) -> int:
     log("model loaded in %.0f s" % (time.time() - t0))
     gates, sh, r2, agree = [], None, None, None
     expected = expected_rewarms(S0, a.steps)
+    mem = dict(after_load=host_mem())
     with torch.inference_mode():
         free()
-        log("arm SH (B %d, %d steps)" % (a.batch, a.steps))
+        sh_base = round(torch.cuda.memory_allocated() / 1e9, 3)
+        log("arm SH (B %d, %d steps); host %s" % (a.batch, a.steps, mem["after_load"]))
         try:
             out = run_shipped(model, ids, a.steps, clock)
             pa, pr = gpu_peak()
@@ -371,26 +400,33 @@ def main(argv=None) -> int:
             steady = period_stats(out["periods"], [t for t in range(a.steps) if t not in rw])
             sh = dict(rewarms=out["rewarms"], prefill_s=out["prefill_s"], steady=steady,
                       rates=rates(a.batch, a.steps, out["periods"], steady), gpu_peak_alloc_GB=pa,
-                      gpu_peak_reserved_GB=pr, rewarm_ms=[round(out["periods"][t], 1) for t, _ in out["rewarms"]])
+                      gpu_peak_reserved_GB=pr, gpu_base_alloc_GB=sh_base,
+                      rewarm_ms=[round(out["periods"][t], 1) for t, _ in out["rewarms"]])
             inputs = out["inputs"]
-            gates.append(("SH-RUN", True, True, "%d steps, %d re-warms" % (a.steps, len(out["rewarms"]))))
+            del out
+            gates.append(("SH-RUN", True, True, "%d steps, %d re-warms" % (a.steps, len(sh["rewarms"]))))
         except Exception as e:
             traceback.print_exc()
             gates.append(("SH-RUN", True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
             inputs = None
-        free()
+        mem["after_SH"] = host_mem()
+        mem["host_cache_released_after_SH"] = free(host=True)
+        mem["after_SH_release"] = host_mem()
+        log("host after SH %s, after the release %s" % (mem["after_SH"], mem["after_SH_release"]))
         if "R2" in a.arms:
             if inputs is None:
                 gates.append(("R2-RUN", True, False, "NOT_RUN: SH failed (R2 is teacher-forced on SH's tokens)"))
             else:
                 log("arm R2")
+                r2_base = round(torch.cuda.memory_allocated() / 1e9, 3)
                 try:
                     res = run_r2(model, ids, inputs, a.steps, a.warmup, clock)
                     pa, pr = gpu_peak()
                     steady = period_stats(res["periods"], list(range(a.warmup + 1, a.steps)))
                     r2 = dict(prefill_s=res["prefill_s"], warmup=a.warmup, capture_ms=res["capture_ms"], steady=steady,
                               rates=rates(a.batch, a.steps, res["periods"], steady), gpu_peak_alloc_GB=pa,
-                              gpu_peak_reserved_GB=pr, first_token_agreement=res["first_token_agreement"],
+                              gpu_peak_reserved_GB=pr, gpu_base_alloc_GB=r2_base,
+                              first_token_agreement=res["first_token_agreement"],
                               widths=res["widths"], body_err=res["body_err"], twin_err=res["twin_err"])
                     agree = agreement(res["pred"], inputs, min(a.batch, N_DOCS))
                     gates.append(("R2-RUN", True, True, "%d steps" % a.steps))
@@ -403,12 +439,13 @@ def main(argv=None) -> int:
                 except Exception as e:
                     traceback.print_exc()
                     gates.append(("R2-RUN", True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+            mem["after_R2"] = host_mem()
             free()
     preds = verdicts(a.batch, sh, r2, agree, expected)
     meta = dict(batch=a.batch, steps=a.steps, warmup=a.warmup, S0=S0, doc_rows=rows, n_unique_docs=min(a.batch, N_DOCS),
                 workload_sha256=sha, expected_rewarms=expected, attn_splits=NL._ATTN_SPLITS, predictions=PRED,
                 nosi_commit=os.environ.get("BASE_COMMIT", "unknown"), torch=torch.__version__,
-                gpu=torch.cuda.get_device_name(0))
+                gpu=torch.cuda.get_device_name(0), host_mem=mem)
     out = dict(meta=meta, SH=sh, R2=r2, agreement=agree,
                gates=[dict(name=g[0], must=g[1], passed=bool(g[2]), detail=g[3]) for g in gates],
                predictions=[dict(name=p[0], verdict=p[1], detail=p[2]) for p in preds])

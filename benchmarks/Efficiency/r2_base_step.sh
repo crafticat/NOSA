@@ -10,11 +10,13 @@
 #   DRYRUN=1 bash benchmarks/Efficiency/r2_base_step.sh --nosi <sha> <holder job> <run id> <b64|b128|b219>
 #        (login node: the pin checks, the uuid file read and the printed step command; no squeue, claim, srun or write)
 #
-# CELLS (S 16128, N 512 steps, the PG19 94-document workload; host rows S + N + 64 per request on both engines):
-#   b64   B  64, STEP_MIN 25, --mem 100G (about 35 GB of pinned host KV per arm)
-#   b128  B 128, STEP_MIN 35, --mem 160G (about 70 GB)
-#   b219  B 219, STEP_MIN 50, --mem 220G (about 120 GB; two prefills of 219 x 16K tokens, about 2.5 s each)
-# The --mem must fit the holder's allocation (the lead checks it before staging the cell).
+# CELLS (S 16128, N 512 steps, the PG19 94-document workload; host rows S + N + 64 per request on both engines;
+# pinned host KV per arm = 64 tensors of B x 16704 x 256 x 2 bytes, and PyTorch's caching host allocator may round
+# each one up to a power of two; the cell releases the shipped arm's cached pinned blocks before the R2 arm):
+#   b64   B  64, STEP_MIN 25, --mem 140G (35 GB of pinned host KV per arm, 69 GB if rounded)
+#   b128  B 128, STEP_MIN 35, --mem 220G (70 GB, 137 GB if rounded)
+#   b219  B 219, STEP_MIN 50, --mem 220G (120 GB, 137 GB if rounded; two prefills of 219 x 16K tokens, ~2.5 s each)
+# The --mem must fit the holder's allocation (a100_hold.sbatch asks 480G; the lead checks it before staging the cell).
 # OUTPUT: OUTROOT/base_<run>_<holder>_<cell>/summary.json and the step record OUTROOT/base_<run>_<holder>_<cell>.step/
 # (command + pins incl. the uuid and its file, stdout, stderr, exit + accounting, sacct row), both frozen. EXIT: the
 # cell's exit = the number of failed MUST gates (0-19); 20 the cell refused; 30 the cell raised; 2 a usage error of
@@ -49,8 +51,8 @@ DRY=${DRYRUN:-0}
 case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
 [[ $RUN =~ ^[a-z0-9]{1,16}$ ]] || stop "run id '$RUN' (1-16 of a-z 0-9)"
 case $CELL in
-    b64) BATCH=64 STEP_MIN=25 MEM=100G ;;
-    b128) BATCH=128 STEP_MIN=35 MEM=160G ;;
+    b64) BATCH=64 STEP_MIN=25 MEM=140G ;;
+    b128) BATCH=128 STEP_MIN=35 MEM=220G ;;
     b219) BATCH=219 STEP_MIN=50 MEM=220G ;;
     *) stop "cell '$CELL' (b64, b128 or b219)" ;;
 esac
