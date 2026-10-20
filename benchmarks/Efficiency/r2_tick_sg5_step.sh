@@ -10,8 +10,9 @@
 # loaded by path (the packer is built into the step's JIT directory).
 # SOURCE ONLY until reviewed: it never submits, renews, cancels or replaces an allocation, never retries.
 #
-#   bash benchmarks/Efficiency/r2_tick_sg5_step.sh --nosi <sha> <holder job> <run id>
-#   DRYRUN=1 bash benchmarks/Efficiency/r2_tick_sg5_step.sh --nosi <sha> <holder job> <run id>
+#   bash benchmarks/Efficiency/r2_tick_sg5_step.sh --nosi <sha> <holder job> <run id> [gilfree|gather]
+#   DRYRUN=1 bash benchmarks/Efficiency/r2_tick_sg5_step.sh --nosi <sha> <holder job> <run id> [gilfree|gather]
+#        (the transport: gilfree, the default; gather = NOSI's Triton gather on a side stream, r2_tick_sg5.py)
 #        (login node: the pin checks and the printed step command; no squeue, claim, srun or write)
 #   In DRYRUN only, SG5_HOLDERS=<dir> replaces HOLDERS (the CPU test uses it); a real run refuses SG5_HOLDERS.
 #
@@ -48,9 +49,10 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id>" >&2; exit 2; }
-[ $# = 4 ] && [ "$1" = --nosi ] || usage
-NSHA=$2 JOB=$3 RUN=$4
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [gilfree|gather]" >&2; exit 2; }
+{ [ $# = 4 ] || [ $# = 5 ]; } && [ "$1" = --nosi ] || usage
+NSHA=$2 JOB=$3 RUN=$4 TRANSPORT=${5:-gilfree}
+case $TRANSPORT in gilfree|gather) ;; *) usage ;; esac
 DRY=${DRYRUN:-0}
 [[ $NSHA =~ ^[0-9a-f]{40}$ ]] || stop "--nosi '$NSHA' is not a full commit id"
 case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
@@ -118,11 +120,11 @@ ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) sr
       /bin/sh -c "$CHILD" sg5-child "$GPU_UUID" "$APPTAINER" --bind /mnt/beegfs/ojerbi:/mnt/beegfs/ojerbi "${ENVS[@]}"
       "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_tick_sg5.py" --out "$OUT" --model "$MODEL"
       --workload "$WL" --biattn "$ATTN_MOD" --gilfree "$GF_DIR" --gilfree-build "$JIT/gilfree_build"
-      --threads "$THREADS" --batch 64 --S 16128 --steps 48 --K 3 --LAMBDA 7 --modes exact,fast --backends sc,sb,v1
+      --threads "$THREADS" --transport "$TRANSPORT" --batch 64 --S 16128 --steps 48 --K 3 --LAMBDA 7 --modes exact,fast --backends sc,sb,v1
       --C 80 --X 32 --R-ver 16 --sweep "$SWEEP" --sweep-steps 24 --draft-ticks 12 --shipped-steps 24 --pool-baseline)
 if [ "$DRY" = 1 ]; then
     echo "R2 SG5 step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob workload $WL_SHA gpu_uuid $GPU_UUID ($UFILE)"
-    echo "R2 SG5 step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; packer $GF_SHA:$GF_PY blob $GF_PY_BLOB, $GF_CPP blob $GF_CPP_BLOB -> $GF_DIR"
+    echo "R2 SG5 step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; packer $GF_SHA:$GF_PY blob $GF_PY_BLOB, $GF_CPP blob $GF_CPP_BLOB -> $GF_DIR; transport $TRANSPORT"
     printf '%q ' "${ARGV[@]}"
     echo
     exit 0
@@ -157,8 +159,9 @@ printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/comman
 printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s workload=%s utc_start=%s\n' "$NSHA" \
     "$blob" "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "$WL_SHA" "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
     stop "cannot write $REC (sg5_active stays)"
-printf 'biattn=%s:%s blob=%s packer=%s py=%s cpp=%s threads=%s sweep=%s splits=%s\n' "$BIATTN_SHA" "$BIATTN_PATH" \
-    "$BIATTN_BLOB" "$GF_SHA" "$GF_PY_BLOB" "$GF_CPP_BLOB" "$THREADS" "$SWEEP" "$SPLITS" >> "$REC/command.txt" ||
+printf 'biattn=%s:%s blob=%s packer=%s py=%s cpp=%s threads=%s transport=%s sweep=%s splits=%s\n' "$BIATTN_SHA" \
+    "$BIATTN_PATH" "$BIATTN_BLOB" "$GF_SHA" "$GF_PY_BLOB" "$GF_CPP_BLOB" "$THREADS" "$TRANSPORT" "$SWEEP" "$SPLITS" \
+    >> "$REC/command.txt" ||
     stop "cannot write $REC (sg5_active stays)"
 "${ARGV[@]}" < /dev/null > "$REC/stdout.txt" 2> "$REC/stderr.txt"
 rc=$?

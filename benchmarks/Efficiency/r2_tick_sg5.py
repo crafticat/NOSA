@@ -15,6 +15,8 @@ documents when B > 94, labelled):
   sc = ResidencySC, sb = ResidencySB, v1 = Residency; C's 2ec08da), at the PRIMARY point (--C, --X, --R-ver):
     T_d    the DRAFT-ONLY tick: --draft-ticks ticks of B draft rows (each draft key decided when its cohort's positions
            are drafted), per-op CUDA events.
+    TRANSPORT  --transport gilfree (D5, the default: C's adapter over agent E's packer v2) or gather (GatherTransport
+           below: NOSI's Triton gather on a side stream), so one transport's failure does not hide the other terms.
     ROUND  the free-running greedy round (r2_tick.run_round) to --steps committed tokens per request, per-op CUDA
            events (TickTimer): T_tick per tick, r = committed tokens / request-ticks, r x T_shipped / T_tick, the
            budget dGEMM / dATT / dSEL / dTWIN / dSTORE / dRES (tick minus T_d, per category), the host ms per
@@ -48,6 +50,7 @@ import r2_g0bi_gate as GB  # noqa: E402  (load_by_path, free, gate)
 
 BACKENDS = ("sc", "sb", "v1")
 MODES = ("exact", "fast")
+TRANSPORTS = ("gilfree", "gather")
 
 
 def log(msg):
@@ -63,6 +66,8 @@ def parse_args(argv):
     ap.add_argument("--gilfree", required=True, help="the directory of the pinned gilfree_pack.py / .cpp (E's f2b981a)")
     ap.add_argument("--gilfree-build", required=True, help="the extension's build directory")
     ap.add_argument("--threads", type=int, default=8, help="the gilfree packer's OpenMP team")
+    ap.add_argument("--transport", default="gilfree", choices=TRANSPORTS,
+                    help="gilfree (D5, the default) or gather (GatherTransport: NOSI's Triton gather on a side stream)")
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--S", type=int, default=16128)
     ap.add_argument("--repeat-docs", action="store_true")
@@ -173,6 +178,73 @@ def run_child(a, argv, pool, path):
 
 
 # ------------------------------------------------------------------ the engine on the Residency
+class GatherTransport:
+    """SG5's "gather" transport (C's note, section 4: the GPU-gather baseline of paper 4.4), so the tick's arms can run
+    while another transport is fixed: K3X's interface issue / poll / done / force, plus stream_wait (the verifier waits
+    on the device). One issue = ONE launch per tensor of NOSI's zero-copy Triton gather flash_h2d_from_mask (it reads
+    the pinned host rows) on a SIDE stream, with a load map (H, B, C + X) over the store's historical slots; the side
+    stream first waits (device waits) on every transfer's hist_ev (T4: the tick's write-back of the host rows) and
+    reader_ev (T3: the destination slot's last reader). One completion event per issue. The bias rows are not moved: the
+    service fills them from the GPU cis table at take."""
+
+    name = "gather"
+
+    def __init__(self, host_k, host_v, store_k, store_v, n_slots: int, bs: int = 64):
+        import torch
+        from nosi.flash_cache_engine.flash_h2d_mask import flash_h2d_from_mask
+        self.h2d = flash_h2d_from_mask
+        self.host_k, self.host_v, self.store_k, self.store_v = host_k, host_v, store_k, store_v
+        self.n_slots, self.bs = int(n_slots), int(bs)
+        self.side = torch.cuda.Stream(device=store_k[0].device)
+        self.stats = dict(releases=0, transfers=0, threads_min=None, threads_max=None)
+
+    def issue(self, layer, transfers):
+        import torch
+        if not transfers:
+            return
+        B, H = int(self.store_k[layer].shape[0]), int(self.store_k[layer].shape[2])
+        ids = torch.full((H, B, self.n_slots), -1, dtype=torch.int64)
+        for tr in transfers:
+            if ids[tr.h, tr.b, tr.slot] != -1:
+                raise ValueError("gather: two transfers into one slot (b %d h %d slot %d)" % (tr.b, tr.h, tr.slot))
+            ids[tr.h, tr.b, tr.slot] = tr.block
+        with torch.cuda.stream(self.side):
+            for tr in transfers:
+                for ev in (tr.hist_ev, tr.reader_ev):
+                    if ev is not None:
+                        self.side.wait_event(ev)
+            d = ids.pin_memory().to(self.store_k[layer].device, non_blocking=True)
+            self.h2d(self.store_k[layer], self.host_k[layer], d, self.bs)
+            self.h2d(self.store_v[layer], self.host_v[layer], d, self.bs)
+            ev = torch.cuda.Event()
+            ev.record(self.side)
+        for tr in transfers:
+            tr.ev = ev
+        self.stats["releases"] += 1
+        self.stats["transfers"] += len(transfers)
+
+    def poll(self):
+        pass
+
+    def done(self, tr):
+        return tr.ev is not None and tr.ev.query()
+
+    def force(self, tr):
+        if tr.ev is None:
+            raise RuntimeError("gather: transfer seq %d was never issued" % tr.seq)
+        tr.ev.synchronize()
+
+    def stream_wait(self, tr):
+        import torch
+        torch.cuda.current_stream().wait_event(tr.ev)
+
+    def threads_ok(self):
+        return True
+
+    def close(self):
+        pass
+
+
 class _LazyOps:
     """S-C's device operations bound after the service exists (CudaDeviceOps takes the service)."""
 
@@ -208,8 +280,11 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
     n_host = int(host_k[0].shape[1])
     cis = [t.total_cis[:B] for t in eng.twins]
     hw = lambda ev: ev.synchronize()                                 # noqa: E731
-    tp = GilfreeTransport(ext, host_k, host_v, eng.store_k, eng.store_v, 64, eng.D, threads=a.threads, host_wait=hw,
-                          background=True)
+    if a.transport == "gilfree":
+        tp = GilfreeTransport(ext, host_k, host_v, eng.store_k, eng.store_v, 64, eng.D, threads=a.threads, host_wait=hw,
+                              background=True)
+    else:
+        tp = GatherTransport(host_k, host_v, eng.store_k, eng.store_v, C + X)
     gather = TorchGather(host_k, host_v, eng.store_k, eng.store_v)
     args = (L, B, H, C, X, R_ver, tp, gather)
     kw = dict(store_b=eng.store_bias, cis=cis, block_bytes=64 * 2 * eng.D * 2, host_wait=hw)
@@ -395,9 +470,12 @@ def main(argv=None) -> int:
         docs, sha, rep = load_docs(a)
         meta.update(workload_sha256=sha, repeated_docs=rep, torch=torch.__version__, gpu=torch.cuda.get_device_name(0))
         attn = GB.load_by_path(a.biattn, "piece3_bi_paged_attention")
-        gp = GB.load_by_path(os.path.join(a.gilfree, "gilfree_pack.py"), "gilfree_pack_pinned")
-        ext = gp.load(a.gilfree_build)
-        meta["gilfree_openmp"] = int(getattr(ext, "OPENMP", 0))
+        ext = None
+        if a.transport == "gilfree":
+            gp = GB.load_by_path(os.path.join(a.gilfree, "gilfree_pack.py"), "gilfree_pack_pinned")
+            ext = gp.load(a.gilfree_build)
+            meta["gilfree_openmp"] = int(getattr(ext, "OPENMP", 0))
+        meta["transport"] = a.transport
         t0 = time.time()
         model = Llama(model_name=a.model, device="cuda", offload=True)
         log("model loaded in %.0f s" % (time.time() - t0))

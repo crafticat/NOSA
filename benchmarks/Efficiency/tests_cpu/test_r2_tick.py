@@ -1044,9 +1044,14 @@ def test_T18_sg5_harness_on_the_cpu(p3):
     assert (a.batch, a.C, a.X, a.R_ver, a.m_fix, a.backends, a.modes) == (64, 80, 32, 16, 256, ["sc", "sb", "v1"],
                                                                          ["exact", "fast"])
     assert G.parse_args(base + ["--sweep", "64:16,96:64"]).sweep_pts == [(64, 16, 8), (96, 64, 32)]
-    for bad in (["--backends", "s9"], ["--modes", "slow"], ["--m-fix", "8"], ["--R-ver", "40"]):
+    assert a.transport == "gilfree" and G.parse_args(base + ["--transport", "gather"]).transport == "gather"
+    for bad in (["--backends", "s9"], ["--modes", "slow"], ["--m-fix", "8"], ["--R-ver", "40"], ["--transport", "s9"]):
         with pytest.raises(SystemExit):
             G.parse_args(base + bad)
+    gsrc = ast.get_source_segment(src_all := (EFF / "r2_tick_sg5.py").read_text(), next(
+        n for n in ast.parse(src_all).body if isinstance(n, ast.ClassDef) and n.name == "GatherTransport"))
+    for need in ("self.side.wait_event(ev)", "tr.hist_ev, tr.reader_ev", "def stream_wait", "flash_h2d_from_mask"):
+        assert need in gsrc, need
     src = (EFF / "r2_tick_sg5.py").read_text()
     fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "run_draft_only")
     assert "from nosi." not in ast.get_source_segment(src, fn)        # the engine's own module (job 2190926)
@@ -1120,3 +1125,11 @@ def test_T19_sg5_step_script_uuid_file_and_pins(tmp_path):
         assert arg in r.stdout, arg
     for plain in ("--modes exact,fast", "--backends sc,sb,v1", "--sweep 64:16,64:32,64:64,80:16,80:32,80:64,96:16,96:32,96:64"):
         assert plain in r.stdout or plain.replace(",", "\\,") in r.stdout, plain
+    assert "--transport gilfree" in r.stdout
+    e = dict(env, SG5_HOLDERS=str(tmp_path), DRYRUN="1")
+    r = subprocess.run(["bash", str(script), "--nosi", head.stdout.strip(), "416", "t1", "gather"], env=e,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and "--transport gather" in r.stdout and "transport gather" in r.stdout
+    r = subprocess.run(["bash", str(script), "--nosi", head.stdout.strip(), "416", "t1", "s9"], env=e,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 2 and "usage" in r.stderr

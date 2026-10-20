@@ -42,9 +42,12 @@ Every part below runs on its own copy of BASE (BASE.clone()).
        two cuts of the selection per layer (r2_tick.tie_stats; REPORT: with none, the tie rule is unobservable).
        SG4c PLANTED (lead, 2026-10-21): ties planted across the top-k cut (r2_tick.plant_tie) at layers 0, L / 2,
        L - 1 for the rows of requests 0 and 1; MUST precondition (asserted first): the engine counts a top-k tie for
-       every planted (row, head, layer); MUST: torch.topk(sorted=False) changes some verify row against the stable
-       rule under the same plants; MUST control: the higher-id tie rule (r2_tick.high_select) changes some verify row
-       (by construction, so the plants reach the selection).
+       every planted (row, head, layer); MUST control: the higher-id tie rule (r2_tick.high_select) changes some verify
+       row (by construction, so the plants reach the selection); REPORT: torch.topk(sorted=False) against the stable
+       rule under the same plants. Tick v3 (A100, torch 2.6; tick_v3_2190876): natural ties are COMMON (106506 of
+       147136 selections tie across the top-k cut, 32 / 32 layers), every planted pair tied, the control differed in
+       300 / 300 rows and torch.topk in 0 / 300: CUDA's topk breaks ties toward the lower block id exactly as the
+       stable rule, so the shipped tie rule IS the stable rule there (a REPORT since then, lead 2026-10-21).
 REPORT: ticks, rows per tick (draft / verify), decision reads, ticks with verify rows, rollbacks, publications,
 write-backs, acceptance (NOT representative: the drafts are a stand-in), host ms per tick, ms per REF step, GPU peak.
 OUTPUT: --out/summary.json (written after every part). The last stdout line is R2_TICK_GATE_DONE failed=<n>; exit = n
@@ -199,9 +202,9 @@ def planted_run(a, base, ref, select, layers, requests, steps):
 
 def part_planted(a, base, ref, gates, res):
     """SG4c PLANTED (lead, 2026-10-21): the precondition (every planted (row, head, layer) has a tie across the top-k
-    cut, counted by the engine) asserted FIRST; then torch.topk(sorted=False) must change some verify row against the
-    stable rule under the same plants (MUST, the lead's requirement); the higher-id tie rule is the control that the
-    plants reach the selection (MUST: it differs by construction)."""
+    cut, counted by the engine) asserted FIRST; the higher-id tie rule is the control that the plants reach the
+    selection (MUST: it differs by construction); torch.topk(sorted=False) against the stable rule under the same
+    plants is a REPORT (tick v3: CUDA's topk breaks ties toward the lower id, as the stable rule; module docstring)."""
     from nosi.r2_tick import high_select, topk_select
     from nosi.r2_spec_core import select_blocks
     layers = sorted({0, len(base.twins) // 2, len(base.twins) - 1})
@@ -214,16 +217,30 @@ def part_planted(a, base, ref, gates, res):
                          "planted (row, head, layer) pairs %d (counted on the device); of them tie across the top-k cut "
                          "%d (must be all)" % (planted, got)))
     out = dict(layers=layers, requests=requests, planted=planted, ties_stable=st_ties)
-    for name, sel, label in (("SG4c_planted_topk", topk_select, "torch.topk(sorted=False)"),
-                             ("SG4d_planted_high", high_select, "ties to the higher block id (the control)")):
+    runs = {}
+    for name, sel in (("SG4d_planted_high", high_select), ("SG4c_planted_topk", topk_select)):
         lg, ties, _ = planted_run(a, base, ref, sel, layers, requests, a.sg4_steps)
         same_shape = lg is not None and st_logits is not None and lg.shape == st_logits.shape
         differ = int((lg != st_logits).any(-1).sum()) if same_shape else -1
-        gates.append(GB.gate(name + "_detected", pre and same_shape and differ > 0, True,
-                             "%s under the planted ties: %d of %d verify rows differ from the stable rule's%s"
-                             % (label, differ, 0 if lg is None else lg.shape[0],
-                                "" if pre else " (the precondition FAILED: not a valid detection)")))
-        out[name] = dict(differ=differ, rows=None if lg is None else int(lg.shape[0]), ties=ties)
+        runs[name] = (differ, 0 if lg is None else int(lg.shape[0]))
+        out[name] = dict(differ=differ, rows=runs[name][1], ties=ties)
+    d_hi, n_hi = runs["SG4d_planted_high"]
+    gates.append(GB.gate("SG4d_planted_high_detected", pre and d_hi > 0, True,
+                         "ties to the higher block id (the CONTROL: the plants reach the selection) under the planted "
+                         "ties: %d of %d verify rows differ from the stable rule's%s"
+                         % (d_hi, n_hi, "" if pre else " (the precondition FAILED: not a valid detection)")))
+    d_tk, n_tk = runs["SG4c_planted_topk"]
+    # REPORT (lead, 2026-10-21, after tick v3 on the A100 / torch 2.6): torch.topk(sorted=False) broke every planted
+    # tie toward the lower block id, exactly as the stable rule (0 / 300 rows differ, the control 300 / 300)
+    if pre and d_hi > 0 and d_tk == 0:
+        why = ("SAME RULE: on this GPU / torch, torch.topk(sorted=False) breaks the planted ties toward the LOWER block id "
+               "exactly as the stable rule (0 of %d rows differ while the higher-id control differs in %d): the shipped "
+               "tie rule IS the stable rule here, so the stable selection costs no fidelity and this negative cannot be "
+               "a negative on this kernel" % (n_tk, d_hi))
+    else:
+        why = "torch.topk(sorted=False) under the planted ties: %d of %d verify rows differ from the stable rule's" % (
+            d_tk, n_tk)
+    gates.append(GB.gate("R_SG4c_planted_topk", True, False, why))
     res["SG4c_planted"] = out
 
 
