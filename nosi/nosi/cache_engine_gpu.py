@@ -298,7 +298,10 @@ class InfLLMv2CacheLayer(DynamicLayer):
             self.cached_compressed_cu_seqlens = torch.empty((total_bsz+1,), dtype=cu_seqlens.dtype, device=cu_seqlens.device)
             self.cached_compressed_cu_seqlens[:cu_seqlens.shape[-1]].copy_(cu_seqlens)
             self.cached_compressed_max_seqlen = max_seqlen
-            self.cached_compressed_cu_seqlens_adder = torch.arange(total_bsz, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+            # F4 (2026-10-20, sustained run b64_s960_v1): cu_seqlens has total_bsz + 1 entries, so the adder must too
+            # (cu[i] += i per compress event), as cache_engine.py:658 builds it; arange(total_bsz) raised a size
+            # mismatch at the first decode compress event.
+            self.cached_compressed_cu_seqlens_adder = torch.arange(total_bsz + 1, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
         else:
             self.cached_compressed_cu_seqlens[current_batch_pos:current_batch_pos+cu_seqlens.shape[-1]].copy_(cu_seqlens + self.cached_compressed_cu_seqlens[current_batch_pos])
 
