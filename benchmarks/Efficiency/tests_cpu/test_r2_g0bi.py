@@ -302,6 +302,25 @@ def test_G5_subset_state_copies_the_rows():
         BD.subset_state(model, cache, st, [0], pin=False, new_cache=new, adapter=types.SimpleNamespace(body=None))
 
 
+def test_G10_bi_decode_refuses_rows_below_position_4032(monkeypatch):
+    """G10 (the verify agent's Q4, 2026-10-21): the selection takes the top 64 of pos // 64 + 1 pooled blocks, so a row
+    needs pos >= 4032; decode_inference refuses an ACTIVE row below it from the host mirror pos_host, before any
+    device op. Negative control: an inactive row below the limit is not refused, and the call then runs (a stub model
+    with no layers: embedding, norm, lm_head) and advances the active rows' host positions."""
+    st = types.SimpleNamespace(pos_host=torch.tensor([4031, 5000]), active_host=torch.tensor([True, True]), steps=0)
+    cache = types.SimpleNamespace(r2_state=st)
+    with pytest.raises(RP.R2Error, match="4031 < 4032"):
+        BD.decode_inference(None, torch.zeros(2, 1, dtype=torch.int64), None, None, cache)
+    assert BD.MIN_POS == 4032
+    st.active_host = torch.tensor([False, True])
+    st.bi = types.SimpleNamespace(linear=torch.nn.functional.linear)
+    monkeypatch.setattr(sys.modules[PKG + ".nosa_llama"], "layer_norm", lambda h, w=None, eps=None: h, raising=False)
+    model = types.SimpleNamespace(embed_tokens=torch.randn(10, 4), layers=[], cos_sin_cache=None,
+                                  norm_weight=torch.ones(4), norm_variance_epsilon=1e-6, lm_head=torch.randn(6, 4))
+    out = BD.decode_inference(model, torch.zeros(2, 1, dtype=torch.int64), None, torch.zeros(2, 1), cache)
+    assert tuple(out.shape) == (2, 1, 6) and st.pos_host.tolist() == [4031, 5001] and st.steps == 1
+
+
 def test_G6_dispatch_to_the_bi_decode(monkeypatch):
     """G6: r2_decode_path.decode_inference runs r2_bi_decode.decode_inference when the state carries BI ops and the R2
     body otherwise (negative control: without state.bi a 2-token input reaches the R2 path's own refusal)."""
