@@ -26,7 +26,7 @@
 # exists, 3 another GPU, 4 refused, 6 module origin; 124 / 137 the host timeout); 1 a STOP before the launch; 5 an
 # exit-0 step whose record is incomplete or whose sacct row is not COMPLETED 0:0.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-eqmem                                                       # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-eqmem-fix                                                   # ROOT (feature/nosi-equal-memory-fix: the slot-map fix)
 GPU_UUID=f31fc723-9dfe-407a-9947-28173556232a                                            # PIN (holder 2188818)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
