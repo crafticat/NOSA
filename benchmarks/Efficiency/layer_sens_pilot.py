@@ -38,9 +38,13 @@ run; an inconclusive control is a MEASURED outcome and is recorded:
   the same job (sbatch).
 
 Before ANY stop a bounded failing-comparison packet is written
-(packets/NNN_<tag>.json always; .npz with the logits, selection / denial
-identity, the actual attention inputs of the affected layer and both local
-outputs while the PACKET_BYTES_MAX budget lasts). Every exit, including a
+(packets/NNN_<tag>.json + .npz: the target / reference / intervention logits,
+the selection / denial identity, the actual q / K / V / bias / cache length of
+the affected layer, both local outputs and both fp32 references). Every byte on
+disk (.npz and .json) counts against PACKET_BYTES_MAX, and PACKET_RESERVE_BYTES
+of it is kept for these TERMINAL packets: an inconclusive (nonterminal) packet
+never carries the full K / V caches, may use only the rest, and past it is
+counted, not written. Every exit, including a
 deadline, a SIGTERM from the sbatch hard cap and an unexpected exception, ends
 with a manifest carrying an explicit terminal status and the partial round.
 
@@ -101,7 +105,9 @@ RC_DIGEST, RC_ROWS, RC_C0, RC_C1, RC_C2, RC_C3, RC_TWIN, RC_DEADLINE, RC_D0 = (
 RC_EXC = 239                     # unexpected exception (traceback in the log, message in the manifest)
 RC_KILLED = 229                  # SIGTERM (the sbatch hard cap): partial results kept
 RC_TERMINAL = 228                # the terminal manifest itself could not be written
+RC_PACKET = 227                  # the packet reserve cannot hold two full terminal comparisons
 STATUS_OF = {0: "COMPLETE", RC_DEADLINE: "INCOMPLETE_DEADLINE", RC_KILLED: "KILLED_SIGTERM",
+             RC_PACKET: "FAILED_PACKET_RESERVE",
              RC_DIGEST: "FAILED_DIGEST", RC_ROWS: "FAILED_ROWS", RC_C0: "FAILED_C0", RC_C1: "FAILED_C1",
              RC_C2: "FAILED_C2", RC_C3: "FAILED_C3", RC_TWIN: "FAILED_TWIN", RC_D0: "FAILED_D0",
              RC_EXC: "FAILED_EXCEPTION"}
@@ -191,51 +197,109 @@ def _np(t):
     return t.contiguous().numpy(), str(t.dtype)
 
 
-class Packets:
-    BULK = ("k_x", "v_x", "k_r", "v_r")          # dropped first when the budget runs out
+def _nbytes(t):
+    return t.nbytes if isinstance(t, np.ndarray) else t.numel() * t.element_size()
 
-    def __init__(self, out_dir, budget):
+
+class Packets:
+    """Every byte written (.npz and .json) counts against `budget`. A TERMINAL
+    packet (the comparison that stops the run) may use all of it; a NONTERMINAL
+    one never carries BULK and may use only budget - reserve, so `reserve` is
+    always free for the stop. A packet that cannot fit is counted, not written."""
+    BULK = ("k_x", "v_x", "k_r", "v_r")          # the full K / V caches
+
+    def __init__(self, out_dir, budget, reserve):
+        if not 0 <= int(reserve) <= int(budget):
+            raise ValueError("reserve %r outside the budget %r" % (reserve, budget))
         self.dir = out_dir
-        self.budget = int(budget)
+        self.budget, self.reserve = int(budget), int(reserve)
         self.used = 0
         self.n = 0
         self.tags = []
+        self.terminal = []
         self.truncated = 0
+        self.suppressed = 0
+        self.bound = 0
         os.makedirs(out_dir, exist_ok=True)
 
-    def write(self, tag, meta, arrays=None):
+    @staticmethod
+    def cost(arrays):
+        """Upper bound of the .npz bytes of `arrays` (0 when there is none)."""
+        a = [v for v in arrays.values() if v is not None]
+        return sum(_nbytes(v) for v in a) + ls.PACKET_NPZ_OVERHEAD * (len(a) + 1) if a else 0
+
+    def need(self, arrays, rc):
+        """Stop (rc) if one full terminal comparison (`arrays` plus the JSON
+        bound) could not fit half the reserve: two terminal packets (both sides
+        of one C2 step) must always fit."""
+        b = self.cost(arrays) + ls.PACKET_JSON_MAX
+        self.bound = max(self.bound, b)
+        if 2 * b > self.reserve:
+            die(rc, "packet reserve %d B cannot hold two full terminal comparisons of %d B" % (self.reserve, b))
+
+    @staticmethod
+    def _json(rec):
+        js = json.dumps(rec, indent=1, default=str).encode()
+        cut = []
+        while len(js) > ls.PACKET_JSON_MAX:      # drop the largest fields, and name them
+            k = max((k for k in rec if k not in ("packet", "check", "outcome", "arrays", "dropped")),
+                    key=lambda k: len(json.dumps(rec[k], default=str)), default=None)
+            if k is None:
+                break
+            cut.append(k)
+            rec = {kk: v for kk, v in rec.items() if kk != k}
+            rec["json_dropped"] = cut
+            js = json.dumps(rec, indent=1, default=str).encode()
+        return js
+
+    def write(self, tag, meta, arrays=None, terminal=False):
         self.n += 1
         base = "%03d_%s" % (self.n, tag)
-        arrs, dtypes = {}, {}
-        for k, v in (arrays or {}).items():
-            if v is not None:
-                arrs[k], dtypes[k] = _np(v)
-        size = lambda: sum(a.nbytes for a in arrs.values())
+        arrs = {k: v for k, v in (arrays or {}).items() if v is not None}
         dropped = []
-        for k in self.BULK:
-            if self.used + size() <= self.budget:
+        if not terminal:
+            dropped = [k for k in self.BULK if k in arrs]
+            arrs = {k: v for k, v in arrs.items() if k not in self.BULK}
+        limit = self.budget if terminal else self.budget - self.reserve
+        shapes = {k: [list(v.shape), str(v.dtype)] for k, v in (arrays or {}).items() if v is not None}
+        if terminal:                             # one at a time: BULK first, the logits last
+            order = [[k] for k in self.BULK if k in arrs] + [[k] for k in sorted(arrs) if k not in self.BULK
+                                                             and not k.startswith("logits")] \
+                + [[k] for k in sorted(arrs) if k.startswith("logits")]
+        else:                                    # the reduced capture whole, or JSON only
+            order = [sorted(arrs)] if arrs else []
+        while True:
+            rec = dict(meta, packet=base, terminal=bool(terminal), arrays=sorted(arrs), shapes=shapes,
+                       dtypes={k: ("bfloat16 (stored as int16 bits)" if arrs[k].dtype == torch.bfloat16
+                                   else str(arrs[k].dtype)) for k in arrs},
+                       dropped=dropped, budget_used_before=self.used, budget=self.budget, reserve=self.reserve)
+            js = self._json(rec)
+            if self.used + self.cost(arrs) + len(js) <= limit:
                 break
-            if k in arrs:
+            if not order:
+                self.suppressed += 1
+                return None
+            for k in order.pop(0):
                 dropped.append(k)
                 del arrs[k]
-        if self.used + size() > self.budget:
-            dropped += sorted(arrs)
-            arrs = {}
-        if dropped:
+        if dropped and (terminal or any(k not in self.BULK for k in dropped)):
             self.truncated += 1
         if arrs:
-            np.savez(os.path.join(self.dir, base + ".npz"), **arrs)
-            self.used += os.path.getsize(os.path.join(self.dir, base + ".npz"))
-        rec = dict(meta, packet=base, arrays=sorted(arrs), dtypes={k: dtypes[k] for k in arrs},
-                   dropped=dropped, budget_used=self.used, budget=self.budget)
-        with open(os.path.join(self.dir, base + ".json"), "w") as fh:
-            json.dump(rec, fh, indent=1, default=str)
+            path = os.path.join(self.dir, base + ".npz")
+            np.savez(path, **{k: _np(v)[0] for k, v in arrs.items()})
+            self.used += os.path.getsize(path)
+        with open(os.path.join(self.dir, base + ".json"), "wb") as fh:
+            fh.write(js)
+        self.used += len(js)
         self.tags.append(base)
+        if terminal:
+            self.terminal.append(base)
         return base
 
     def summary(self):
-        return dict(n=self.n, bytes=self.used, budget=self.budget, truncated=self.truncated,
-                    first=self.tags[:20])
+        return dict(n=self.n, written=len(self.tags), bytes=self.used, budget=self.budget, reserve=self.reserve,
+                    truncated=self.truncated, suppressed=self.suppressed, terminal=self.terminal,
+                    terminal_bound=self.bound, first=self.tags[:20])
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +429,16 @@ def packet_arrays(cx, cr, lg_T, lg_r, lg_x, info):
     for k in ("ref_x", "ref_r"):
         if info.get(k) is not None:
             a[k] = info[k]
+    return a
+
+
+def full_arrays(cx, cr, lg_T, lg_r, lg_x):
+    """packet_arrays of a full terminal comparison with these shapes, the two
+    fp32 references included (meta tensors: sizes only, nothing allocated)."""
+    ref = torch.empty(cx["out"].shape, dtype=torch.float32, device="meta")
+    a = packet_arrays(cx, cr, lg_T, lg_r, lg_x, dict(ref_x=ref, ref_r=ref))
+    for side, c in (("x", cx), ("r", cr)):           # a denying arm also carries its denial mask
+        a.setdefault("deny_" + side, torch.empty(c["block_map"].shape, dtype=torch.bool, device="meta"))
     return a
 
 
@@ -564,7 +638,7 @@ def body(run, deadline):
                 lg, recs, blog, nlog, cap = run.draft(arm, first, witness=wl)
                 restore()
                 check_c0(arm, blog, packet=lambda tag, m: pk.write(tag, dict(m, **where(arm)),
-                                                                   dict(logits_target=lg_T, logits_x=lg)))
+                                                                   dict(logits_target=lg_T, logits_x=lg), terminal=True))
                 cfg = run.cfgs[i]
                 if cfg["mode"] == "far" and cfg["deny"] is not None:
                     bad = [x for x in nlog if x[4] != ls.NEAR_PER_STREAM]
@@ -573,10 +647,12 @@ def body(run, deadline):
                                % (arm, sorted({x[4] for x in nlog}), ls.NEAR_PER_STREAM))
                         pk.write("C3_%s" % arm, dict(where(arm), check="C3", message=msg,
                                                      near_log=[list(x) for x in nlog]),
-                                 dict(logits_target=lg_T, logits_x=lg))
+                                 dict(logits_target=lg_T, logits_x=lg), terminal=True)
                         die(RC_C3, msg)
                 if arm == "U81":
                     capU = cap
+                    c0 = need_cap(capU, 0, "U81", RC_C1)
+                    pk.need(full_arrays(c0, c0, lg_T, lg, lg), RC_PACKET)       # every comparison has these shapes
                 if arm in ("U81", "U81v") or arm.startswith("A"):
                     logits[arm] = lg
                 q = pil.dist(lg[0])
@@ -586,13 +662,13 @@ def body(run, deadline):
                     msg = "D0 is not the target at doc %d site %d" % (d, site)
                     pk.write("D0", dict(where(arm), check="D0", message=msg,
                                         logits_dmax=float((lg - lg_T).abs().max())),
-                             dict(logits_target=lg_T, logits_x=lg))
+                             dict(logits_target=lg_T, logits_x=lg), terminal=True)
                     die(RC_D0, msg)
                 if arm == "U81v" and not torch.equal(lg, logits["U81"]):
                     msg = "U81v != U81 bitwise at doc %d site %d" % (d, site)
                     pk.write("TWIN", dict(where(arm), check="twin", message=msg,
                                           logits_dmax=float((lg - logits["U81"]).abs().max())),
-                             dict(logits_target=lg_T, logits_ref=logits["U81"], logits_x=lg))
+                             dict(logits_target=lg_T, logits_ref=logits["U81"], logits_x=lg), terminal=True)
                     die(RC_TWIN, msg)
                 c1 = None
                 if arm.startswith("A"):
@@ -603,7 +679,7 @@ def body(run, deadline):
                         meta = dict(where(arm), check="C1", layer=l, ref="U81", outcome=c1,
                                     records_x=rec_layer(recs, l), **jsonable(info))
                         pk.write("C1_%s_%s" % (c1, arm), meta,
-                                 packet_arrays(cx, cr, lg_T, logits["U81"], lg, info))
+                                 packet_arrays(cx, cr, lg_T, logits["U81"], lg, info), terminal=c1 in ls.DEFECTS)
                     if c1 in ls.DEFECTS:
                         die(RC_C1, "C1 %s at layer %d (doc %d site %d): untouched inputs equal=%s, local "
                             "output equal=%s, logits equal=%s; packet written"
@@ -627,7 +703,7 @@ def body(run, deadline):
                                    % (arm, l_, nreg.get(l_), per_layer[l_][1], per_layer[l_][1] * 64))
                             pk.write("C0_%s_L%d" % (arm, l_), dict(where(arm), check="C0", layer=l_, message=msg,
                                                                   records_x=rec_layer(recs, l_)),
-                                     dict(logits_target=lg_T, logits_x=lg))
+                                     dict(logits_target=lg_T, logits_x=lg), terminal=True)
                             die(RC_C0, msg)
                 row_ = dict(arm=arm, doc=d, row=row, site=site, j=1, tv=tv, overlap=ov,
                             accept_prob=a, x=int(x), argmax_agree=int(np.argmax(p) == np.argmax(q)),
@@ -659,7 +735,7 @@ def body(run, deadline):
                                                            witness=(l,))
                     restore()
                     check_c0("P%d" % l, blogP, packet=lambda tag, m: pk.write(
-                        tag, dict(m, **where("P%d" % l)), dict(logits_target=lg_T, logits_x=lgP)))
+                        tag, dict(m, **where("P%d" % l)), dict(logits_target=lg_T, logits_x=lgP), terminal=True))
                     lgV, recsV, _, _, capV = run.draft("U81", first, poison=(l, "visible", d * 1009 + site),
                                                        witness=(l,))
                     restore()
@@ -674,7 +750,8 @@ def body(run, deadline):
                             meta = dict(where(name), check="C2", layer=l, ref=rn, outcome=out_,
                                         poison=("denied" if name[0] == "P" else "visible"),
                                         records_x=rec_layer(rx, l), **jsonable(info))
-                            pk.write("C2_%s_%s" % (out_, name), meta, packet_arrays(cx, cr, lg_T, lr_, lx, info))
+                            pk.write("C2_%s_%s" % (out_, name), meta, packet_arrays(cx, cr, lg_T, lr_, lx, info),
+                                     terminal=out_ in ls.DEFECTS)
                         res.append((name, out_, info))
                         run.cons_fh.write(json.dumps(dict(
                             arm=name, doc=d, row=row, site=site, layer=l, ok=out_ not in ls.DEFECTS, outcome=out_,
@@ -701,7 +778,7 @@ def _on_sigterm(signum, frame):
 
 def main() -> int:
     os.makedirs(os.path.join(OUT, "vectors"), exist_ok=True)
-    TERM.packets = Packets(os.path.join(OUT, "packets"), ls.PACKET_BYTES_MAX)
+    TERM.packets = Packets(os.path.join(OUT, "packets"), ls.PACKET_BYTES_MAX, ls.PACKET_RESERVE_BYTES)
     TERM.start(OUT, dict(study="layer-sensitivity diagnostic", sites=list(ls.SITES), K=ls.K, L=ap.L,
                          arm_digest=ls.digest(), arms=ls.arms(), terms=ls.terms(),
                          sampling=dict(temperature=ap.TEMP, top_p=ap.TOPP, top_k=ap.TOPK),
