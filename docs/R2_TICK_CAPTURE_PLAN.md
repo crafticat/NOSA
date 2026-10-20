@@ -501,6 +501,61 @@ The capture itself, the replay, PTR and the timings need the GPU.
   tick voids every decision since the last read, and the run stops. Is that the intended use
   of "A TRUE FLAG VOIDS THE TICK"?
 
+## 12a. Answers and status (2026-10-21)
+
+The lead:
+
+- **Q-T1:** the verify cap stays K (R_cap = B(1 + K) = 4B = m_fix). It is a parameter
+  (`v_cap`), and a tick above it is refused.
+- **Q-T4:** `apply_events` is not captured now. E1 (sync-free, eager) first; E2 is decided from
+  SG5's dHOST.
+
+C, at `nosi-r2-m2-fetch` 41bc238:
+
+- **Q-T2:** YES. The trash slot is the slot after the four tail-ring slots, and the store has
+  (NB + 5) x 64 rows (C + X + 5 in the Residency). Nothing else touches it.
+- **Q-T3 (a):** YES, the host state is constant inside a tick. C splits S-C's `resolve` into a
+  host part before the replay and a device part per layer. `sync_mirror` runs before the replay;
+  `DeviceMirror.layer(l)` runs in the graph; the mirror stays on the device with one delta per
+  tick (ca38648).
+- **Q-T3 (b):** the superset wait before the replay is correct but removes all prefetch overlap.
+  C is designing an exact device wait.
+- **Q-T3 (c):** NO slot is released and taken again inside a tick. One reader event after the
+  replay is equivalent and safer.
+- **Q-T3 (d):** YES, with four conditions:
+  - padded rows have `hist_bound` = 0 and `n_tail` = 0;
+  - the live rows come first;
+  - the draft pair count comes from the host's live count;
+  - the index buffers have fixed length.
+  The stable sorts carry OP-1.
+- **Q-T3 (e):** NO deferral of the per-tick read. It can be made asynchronous: a pinned copy
+  and an event, waited at the next tick start.
+- **Q-T5:** YES. A sticky flag voids every tick since the last clean read. C adds a hook so that
+  the twin flag rides in S-C's per-tick read.
+
+BUILT (W0-W3, source only, this branch):
+
+- **W0:** C's 4fe5fc9 cherry-picked (313baa2).
+- **W1:** the lint, shared: `benchmarks/Efficiency/tests_cpu/r2_capture_lint.py` (e5fc694's,
+  unchanged, plus `unexplained()` for documented findings).
+- **W2:** `nosi/nosi/r2_tick_fixed.py` `FixedTickEngine` (a subclass; `r2_tick.TickEngine` is
+  unchanged and stays the reference):
+  - `choose_cap` (G_d / G_v, `cap_mode` family / max / exact) and the refusals;
+  - `capacity_check` (C's condition);
+  - `padded_table`, `CapBuffers`, one `upload` per tick;
+  - the region `_forward_fixed` / `_layer_fixed`;
+  - `read_tokens` with the flags (one transfer).
+  - The trash slot follows C's Q-T2 (`from_engine` / `from_r2` add it).
+- **W3 (E1):** `commit_banks` (the commit's checks on the host mirrors, including an epoch
+  mirror), `commit_unchecked`, `rebuild_from_own_rows_unchecked`, `apply_events`.
+- **CPU tests C1-C7:** `benchmarks/Efficiency/tests_cpu/test_r2_tick_capture.py`.
+
+W4 (the capture) and W5 (S-C in the graph, on C's answers above) are next.
+
+    env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA \
+        benchmarks/Efficiency/tests_cpu/test_r2_tick_capture.py benchmarks/Efficiency/tests_cpu/test_r2_tick.py \
+        benchmarks/Efficiency/tests_cpu/test_r2_twin_unchecked.py
+
 ## 13. Risks
 
 - **OP-1:** the stable `torch.sort` of `select_blocks` under capture is not yet proven here.
