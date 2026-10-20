@@ -21,8 +21,10 @@ the number of failed MUST gates; summary.json records every gate):
       kernels captured together in one graph and replayed with a new case.
   W4  NEGATIVE CONTROLS: the kernel with row shift -1, with row shift +1 and unmasked: the W1 comparison must FAIL for
       each (3 of 3 caught).
-REPORT (no claim is made from it): W5 timing with CUDA events, median of 30: the kernel, the graph replay, and the
-torch backend's per-request copies, for n_full 1, 8, 64.
+REPORT (no claim is made from it): W5 timing with CUDA events: 20 back-to-back calls between two events, per call,
+median of 10: the kernel, the graph replay, and the torch backend's per-request copies, for n_full 1, 8, 64.
+summary.json is written after W4 and again after W5; W5 cannot fail the gate (an exception there is recorded).
+EXIT: the number of failed MUST gates (0-5); 20 refused (--out exists, triton did not import); 30 an exception.
 Run (inside the image, one GPU):
     python benchmarks/Efficiency/r2_wb_gate.py --out <new dir>
 """
@@ -69,14 +71,14 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if os.path.exists(a.out):
         print("r2 wb gate: --out %s exists" % a.out, file=sys.stderr)
-        return 2
+        return 20
     os.makedirs(a.out)
     wb = _load("nosi_r2_writeback_gate", "r2_writeback.py")
     rb = _load("nosi_r2_decode_body_wb_gate", "r2_decode_body.py")
     h2d = _load("nosi_flash_h2d_mask_wb_gate", os.path.join("flash_cache_engine", "flash_h2d_mask.py"))
     if wb.triton is None:
         print("r2 wb gate: triton did not import", file=sys.stderr)
-        return 2
+        return 20
     dev = torch.device("cuda")
     bf = torch.bfloat16
     gcpu = torch.Generator().manual_seed(a.seed)
@@ -233,37 +235,53 @@ def main(argv=None) -> int:
         caught[name] = not (beq(k_cpu, rk) and beq(v_cpu, rv))
     gate("W4", all(caught.values()), "the W1 comparison catches each planted defect: %s" % caught)
 
-    # ---- W5: timing (REPORT)
-    def timed(fn, reps=30):
+    def write_summary():
+        rec.update(failed=nfail, t1=time.time())
+        with open(os.path.join(a.out, "summary.json"), "w") as out_f:
+            json.dump(rec, out_f, indent=1)
+
+    write_summary()                                      # the MUST record exists before the REPORT part runs
+
+    # ---- W5: timing (REPORT): `inner` back-to-back calls between two events, per call, median over `reps`
+    def timed(fn, reps=10, inner=20):
         ts = []
         for _ in range(reps):
+            torch.cuda.synchronize()
             s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             s.record()
-            fn()
+            for _ in range(inner):
+                fn()
             e.record()
             torch.cuda.synchronize()
-            ts.append(s.elapsed_time(e) * 1000.0)
+            ts.append(s.elapsed_time(e) * 1000.0 / inner)
         return round(statistics.median(ts), 1)
 
-    eng = types.SimpleNamespace(block_size=BS, _tail_block_idx_on_gpu=TOPK - 1, _k_gpu=k_gpu, _v_gpu=v_gpu,
-                                _k_cpu=k_cpu2, _v_cpu=v_cpu2)
-    torch_body = rb.DecodeBody(False)
-    for n_full in (1, 8, 64):
-        f, p = case(n_full)
-        set_inputs(f, p, fresh_tail=False)
-        fh, ph = full.cpu(), pos.cpu()
-        rec["report"]["n_full_%d" % n_full] = dict(
-            kernel_us=timed(lambda: wb.masked_writeback(k_gpu, v_gpu, k_cpu, v_cpu, full, pos, TAIL0, BS)),
-            graph_us=timed(graph.replay),
-            torch_backend_us=timed(lambda: torch_body.writeback(eng, full, fh, pos, ph)))
-    gate("W5", True, "REPORT median us (kernel, graph replay, torch backend): %s" % rec["report"], must=False)
-
-    rec.update(failed=nfail, t1=time.time())
-    with open(os.path.join(a.out, "summary.json"), "w") as out_f:
-        json.dump(rec, out_f, indent=1)
+    try:
+        eng = types.SimpleNamespace(block_size=BS, _tail_block_idx_on_gpu=TOPK - 1, _k_gpu=k_gpu, _v_gpu=v_gpu,
+                                    _k_cpu=k_cpu2, _v_cpu=v_cpu2)
+        torch_body = rb.DecodeBody(False)
+        for n_full in (1, 8, 64):
+            f, p = case(n_full)
+            set_inputs(f, p, fresh_tail=False)
+            fh, ph = full.cpu(), pos.cpu()
+            rec["report"]["n_full_%d" % n_full] = dict(
+                kernel_us=timed(lambda: wb.masked_writeback(k_gpu, v_gpu, k_cpu, v_cpu, full, pos, TAIL0, BS)),
+                graph_us=timed(graph.replay),
+                torch_backend_us=timed(lambda: torch_body.writeback(eng, full, fh, pos, ph)))
+        gate("W5", True, "REPORT per-call us (kernel, graph replay, torch backend): %s" % rec["report"], must=False)
+    except Exception as ex:                              # REPORT only: recorded, never a failure of the gate
+        rec["report"]["error"] = repr(ex)
+        gate("W5", False, "REPORT timing raised %r" % (ex,), must=False)
+    write_summary()
     print("r2 wb gate: %d MUST gate(s) failed" % nfail, flush=True)
     return nfail
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        rc = 30
+    sys.exit(rc)

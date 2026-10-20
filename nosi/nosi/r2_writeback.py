@@ -22,14 +22,12 @@ Constraints: block_size and head_dim are powers of two (tl.arange); K and V shar
 host tensors must be pinned when the GPU tensors are on CUDA (checked, except while a graph is being captured, where
 the check would be a CUDA API call inside the capture). Gate and commands: docs/R2_WRITEBACK.md.
 """
-from __future__ import annotations
-
-import torch
+import torch            # no `from __future__ import annotations`: the kernel's constexpr annotations must be objects
 
 try:                                                   # triton is needed only to launch the kernel; the reference and
     import triton                                      # the checks work without it (CPU tests without triton)
     import triton.language as tl
-except ImportError:                                    # pragma: no cover - environment dependent
+except Exception:                                      # pragma: no cover - not installed, or a broken install
     triton = tl = None
 
 
@@ -68,10 +66,12 @@ def check_args(k_gpu, v_gpu, k_cpu, v_cpu, full, pos, tail0: int, block_size: in
         raise ValueError("all four tables must have one dtype")
     if tuple(v_gpu.stride()) != tuple(k_gpu.stride()) or tuple(v_cpu.stride()) != tuple(k_cpu.stride()):
         raise ValueError("K and V must share one stride set on each side")
-    if tuple(full.shape) != (B,) or full.dtype != torch.bool or full.device != k_gpu.device:
-        raise ValueError("full must be (%d,) bool on %s" % (B, k_gpu.device))
-    if tuple(pos.shape) != (B,) or pos.dtype != torch.int64 or pos.device != k_gpu.device:
-        raise ValueError("pos must be (%d,) int64 on %s" % (B, k_gpu.device))
+    if v_gpu.device != k_gpu.device or v_cpu.device != k_cpu.device:
+        raise ValueError("K and V must be on the same device on each side")
+    if tuple(full.shape) != (B,) or full.dtype != torch.bool or full.device != k_gpu.device or full.stride(0) != 1:
+        raise ValueError("full must be a contiguous (%d,) bool on %s" % (B, k_gpu.device))
+    if tuple(pos.shape) != (B,) or pos.dtype != torch.int64 or pos.device != k_gpu.device or pos.stride(0) != 1:
+        raise ValueError("pos must be a contiguous (%d,) int64 on %s" % (B, k_gpu.device))
     if not isinstance(tail0, int) or not isinstance(block_size, int) or tail0 < 0 or tail0 + block_size > S_GPU:
         raise ValueError("tail rows [%r, %r + %r) outside the %d GPU rows" % (tail0, tail0, block_size, S_GPU))
     if block_size < 1 or block_size & (block_size - 1) or D & (D - 1):

@@ -70,6 +70,12 @@ edited here), after the GPU gate passes:
     from . import r2_writeback as WB
     self.body = RB.DeviceWritebackBody(bool(f4_fix), WB.masked_writeback)
 
+When the write-back is later captured inside a decode graph: warm it up
+eagerly on the SAME `full` / `pos` / table tensors that the capture uses.
+Triton specialises on pointer alignment (`data_ptr % 16`) and on integer
+arguments divisible by 16; another buffer can trigger a compile inside the
+capture.
+
 ## Gates
 
 CPU (inside a CPU job):
@@ -81,9 +87,10 @@ CPU (inside a CPU job):
 * W2: argument refusals. W3: no host sync in the launch path (AST).
 * W5: the KERNEL under `TRITON_INTERPRET=1` in a fresh process (the pattern
   of `benchmarks/Efficiency/tests_cpu/test_r2_kernels.py` K5): == the
-  reference and == `DecodeBody.writeback` on four cases (one is the row
-  guard); the negative controls row shift -1, row shift +1 and unmasked are
-  each caught (3 of 3). Skipped without triton.
+  reference on four cases (the fourth is the row guard) and ==
+  `DecodeBody.writeback` on the three in-range ones; the negative controls
+  row shift -1, row shift +1 and unmasked are each caught (3 of 3). Skipped
+  without triton.
 * In `tests/test_r2_decode_body.py`: `DeviceWritebackBody` (with the torch
   reference as its kernel) passes G-EQ (against the shipped body), G-RAG and
   G-POISON; a counting kernel shows `decode()` hands it the device mask
@@ -100,10 +107,14 @@ GPU (`r2_wb_gate.py`; B 64, H 2, D 128, bf16, N_host 24384 pinned):
   block on the same stream: the read-back rows == the tail rows (eager, and
   both kernels captured in one graph and replayed).
 * W4: row shift -1, row shift +1, unmasked: each caught by the W1 comparison.
-* W5 REPORT: median microseconds of the kernel, the graph replay and the torch
-  backend for n_full 1, 8, 64. No claim is made from it; the plan's open
-  question (the kernel's PCIe store efficiency against the copy engine) is
-  answered by these numbers, not predicted here.
+* W5 REPORT: per-call microseconds (20 back-to-back calls between two events,
+  median of 10) of the kernel, the graph replay and the torch backend for
+  n_full 1, 8, 64. No claim is made from it. Order of magnitude, not a
+  prediction: one full request moves 64 x 2 x 128 x 2 bytes x 2 (K, V) =
+  64 KiB, about 3 us at 20 GB/s; 64 full requests about 4 MiB, about 200 us.
+  `summary.json` is written after W4 and again after W5; W5 cannot fail the
+  gate.
+* Exit: the number of failed MUST gates (0-5); 20 refused; 30 an exception.
 
 Every comparison is bitwise over the whole host buffers (int16 views of
 bf16), NaN-poisoned before every case.

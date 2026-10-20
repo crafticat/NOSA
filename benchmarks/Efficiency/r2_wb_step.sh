@@ -13,10 +13,10 @@
 #
 # OUTPUT: OUTROOT/wb_<run>_<holder>/summary.json (every gate: passed, must, detail; the timing report) and the step
 # record OUTROOT/wb_<run>_<holder>.step/ (command + pins incl. the uuid and its file, stdout with one line per gate,
-# stderr, exit + accounting, sacct row), both frozen. EXIT: the gate's exit = the number of failed MUST gates (W0-W4;
-# W5 is REPORT); 2 the gate refused (--out exists, or triton did not import); 3 another GPU; 4 not exactly one GPU;
-# 124 / 137 the host timeout; 1 a STOP before the launch; 5 an exit-0 step whose record is incomplete or whose sacct
-# row is not COMPLETED 0:0.
+# stderr, exit + accounting, sacct row), both frozen. EXIT: the gate's exit = the number of failed MUST gates (0-5;
+# W0-W4, W5 is REPORT); 20 the gate refused (--out exists, or triton did not import); 30 the gate raised (traceback
+# in stderr.txt); 2 a usage error of this script; 3 another GPU; 4 not exactly one GPU; 124 / 137 the host timeout;
+# 1 a STOP before the launch; 5 an exit-0 step whose record is incomplete or whose sacct row is not COMPLETED 0:0.
 # Checks before the claim (each STOPS with exit 1): no SLURM_ / SRUN_ / SALLOC_ / SBATCH_ variable in the login shell;
 # the checkout at --nosi <sha>, no tracked change, no untracked file under nosi/; this file is the blob of <sha>; the
 # gate files are tracked at <sha>; the image exists; HOLDERS/<holder>.gpu_uuid is readable and holds exactly one uuid;
@@ -93,6 +93,7 @@ left=0
 case $sl in
     *-*:*:*) left=$(( ${sl%%-*} * 86400 + 10#$(echo "${sl#*-}" | cut -d: -f1) * 3600 + 10#$(echo "$sl" | cut -d: -f2) * 60 )) ;;
     *:*:*) left=$(( 10#$(echo "$sl" | cut -d: -f1) * 3600 + 10#$(echo "$sl" | cut -d: -f2) * 60 )) ;;
+    *:*) left=$(( 10#${sl%%:*} * 60 )) ;;                       # squeue prints MM:SS below one hour
 esac
 [ "$left" -ge "$MIN_LEFT" ] || stop "holder $JOB has $sl left (< $MIN_LEFT s)"
 nosteps() {

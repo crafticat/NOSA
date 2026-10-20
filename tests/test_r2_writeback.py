@@ -13,9 +13,9 @@ W2  check_args refuses malformed arguments (no triton needed).
 W3  no host sync in the launch path: masked_writeback / _launch / check_args call none of .item / .cpu / .tolist /
     .numpy / .nonzero / synchronize (AST).
 W5  the Triton KERNEL under TRITON_INTERPRET=1 in a fresh process (triton reads the flag at its first import):
-    == the torch reference and == DecodeBody.writeback on four cases (one checks the row-range guard), and the three
-    negative controls (row shift -1, row shift +1, unmasked) are each caught by the same comparison. Skipped without
-    triton.
+    == the torch reference on four cases (the fourth checks the row-range guard) and == DecodeBody.writeback on the
+    three in-range ones, and the three negative controls (row shift -1, row shift +1, unmasked) are each caught by the
+    same comparison. Skipped without triton.
 The decode-body integration (DeviceWritebackBody through G-EQ, G-RAG, G-POISON) is in tests/test_r2_decode_body.py.
 """
 from __future__ import annotations
@@ -97,6 +97,7 @@ def test_W2_check_args_refusals():
         (k, v, kc, vc, full[:-1], pos, TAIL0, BS),                     # mask shape
         (k, v, kc, vc, full, pos, TAIL0 + 1, BS),                      # tail rows past the GPU rows
         (k, v, kc, vc, full, pos, TAIL0, 48),                          # block size not a power of two
+        (k, v, kc, vc, full, torch.zeros(2 * B, dtype=torch.int64)[::2], TAIL0, BS),   # positions not contiguous
     ]
     for i, args in enumerate(bad):
         with pytest.raises(ValueError):
