@@ -184,6 +184,11 @@ The logical limit is K3X's: |LRU| <= C per stream, extras borrowed <= X per laye
 Retained bytes = (PO + VRES) x block bytes; peak_retained per K3X 4.6. Example at B 64, 32 layers, H 2:
 C + X + 4 = 100 slots per (request, head) = 32,896 B x 100 x 2 x 32 x 64 = 13.5 GB, against the shipped window's 64
 slots = 8.6 GB (and the 16.4 GB model). The sizes are run parameters; SG5 reports the peak.
+The captured tick (Q-T2) adds ONE TRASH SLOT per (request, head, layer) after the tail rings, at C + X + 4
+(`Residency(trash_slots=1)`; counted in `memory()["slots_physical"]`; CPU test F15): C + X + 5 = 101 slots, i.e.
+32,896 B x 101 x 2 x 32 x 64 = 13.61 GB (+0.13 GB), about +5.0 GB against the 64-slot window. Only the padded rows of
+the captured tick write and read it; it is outside every LayerPool (no take, no transfer, no gather) and outside the
+tail range (no Row can name it).
 
 ## 8. The interface piece 4 calls (one service per run)
 

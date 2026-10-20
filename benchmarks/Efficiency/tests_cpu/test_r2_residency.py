@@ -68,12 +68,14 @@ class Be:
             self.waits += 1
 
 
-def world(C=4, X=4, R_ver=2, seed=0, mode="force_only", mut=None, cls=None, max_delay=3, svc_kw=None):
+def world(C=4, X=4, R_ver=2, seed=0, mode="force_only", mut=None, cls=None, max_delay=3, svc_kw=None, trash=0):
     g = torch.Generator().manual_seed(seed)
     host_k = [torch.randn(B, NB * BS, H, D, generator=g) for _ in range(L)]
     host_v = [torch.randn(B, NB * BS, H, D, generator=g) for _ in range(L)]
     cis = [torch.randn(B, NB * BS, H, generator=g) for _ in range(L)]
-    n = (C + X + RES.N_TAIL) * BS
+    n = (C + X + RES.N_TAIL + trash) * BS
+    if trash:
+        svc_kw = dict(svc_kw or {}, trash_slots=trash)
     store_k = [torch.zeros(B, n, H, D) for _ in range(L)]
     store_v = [torch.zeros(B, n, H, D) for _ in range(L)]
     store_b = [torch.zeros(B, n, H) for _ in range(L)]
@@ -848,7 +850,23 @@ def _isolated(trace, kind):
     return False
 
 
-def _lockstep_sc(seed, C, X, R_ver, sched, sc_mut=None, hb=15, mirror_drop=None, trace=False):
+TRASH_VALUE = 7.0                                             # the sentinel of the trash slot (F15)
+
+
+def _fill_trash(w):
+    s0 = w.svc.trash_slot * BS
+    for t in (w.store_k, w.store_v, w.store_b):
+        for l in range(L):
+            t[l][:, s0:s0 + BS] = TRASH_VALUE
+
+
+def _trash_intact(w):
+    s0 = w.svc.trash_slot * BS
+    return all(bool((t[l][:, s0:s0 + BS] == TRASH_VALUE).all()) for t in (w.store_k, w.store_v, w.store_b)
+               for l in range(L))
+
+
+def _lockstep_sc(seed, C, X, R_ver, sched, sc_mut=None, hb=15, mirror_drop=None, trace=False, trash=0):
     """v1 under the S-C schedule (arrivals at the tick's start, draft transfers at end_tick, waited and urgent blocks
     read in place and admitted at the next poll) and S-C driven by the same schedule, transports seeded alike, reader
     events completed two ticks late in both. At the start of every tick (after the poll and S-C's mirror delta) S-C's
@@ -856,8 +874,11 @@ def _lockstep_sc(seed, C, X, R_ver, sched, sc_mut=None, hb=15, mirror_drop=None,
     page tables per layer; the content of every verify page at the read point, in both worlds; state and counters per
     tick), the two worlds and the largest number of shared extras borrowed in v1 after a tick."""
     common = dict(C=C, X=X, R_ver=R_ver, seed=seed, mode="delay", max_delay=4)
-    wv = world(**common, svc_kw=dict(poll_in_resolve=False, defer_issue=True, defer_admit=True))
-    ws = world(**common, cls=SC.ResidencySC, svc_kw=dict(nblk=NB, sc_mut=sc_mut, mirror_drop=mirror_drop))
+    wv = world(**common, svc_kw=dict(poll_in_resolve=False, defer_issue=True, defer_admit=True), trash=trash)
+    ws = world(**common, cls=SC.ResidencySC, svc_kw=dict(nblk=NB, sc_mut=sc_mut, mirror_drop=mirror_drop), trash=trash)
+    if trash:
+        for w in (wv, ws):
+            _fill_trash(w)
     if trace:
         ws.trace = _trace_journal(ws.svc)
     uids = ("u0", "u1")
@@ -1229,3 +1250,35 @@ def test_F14b_owner_changes_reach_the_device_mirror():
         assert (diffs == []) == ok, (drop, diffs)
         if ok:                                          # the precondition: slot 0's only change was the owner change
             assert _isolated(trace, "owner")
+
+
+# =====================================================================================================================
+# F15 the trash slot of the captured tick (Q-T2)
+# =====================================================================================================================
+def test_F15_the_trash_slot():
+    """F15 (Q-T2): with trash_slots=1 the store has one slot after the tail rings, at C + X + 4. memory()
+    ["slots_physical"] equals the slots of the store tensors (L x B x H x (C + X + 5)); no Row can name the trash slot
+    (the tail check refuses it, v1 and S-C); over F6's schedule (v1 and S-C in lockstep, equal as F12) no service
+    operation writes it (a sentinel in its K, V and bias rows stays). Negative controls: the accounting without the
+    trash slot disagrees with the store; a planted write into the trash slot is seen by the same sentinel check."""
+    C, X = 8, 48
+    bad, wv, ws, _ = _lockstep_sc(1, C=C, X=X, R_ver=8, sched=_sched(101, 24, True), trash=1)
+    assert bad == [], bad[:3]
+    for w in (wv, ws):
+        svc = w.svc
+        assert svc.trash_slot == C + X + RES.N_TAIL
+        physical = L * B * H * (w.store_k[0].shape[1] // BS)
+        assert svc.memory()["slots_physical"] == physical == L * B * H * (C + X + RES.N_TAIL + 1)
+        assert _trash_intact(w)
+    v1 = dict(poll_in_resolve=False, defer_issue=True, defer_admit=True)
+    for cls, kw in ((None, v1), (SC.ResidencySC, dict(nblk=NB))):
+        w = world(C=4, X=4, R_ver=1, cls=cls, svc_kw=kw, trash=1)
+        w.svc.begin_request(0, "u0")
+        w.svc.poll()
+        with pytest.raises(ValueError, match="tail slot"):
+            w.svc.resolve(0, [Row(0, "d", ("u0", 1, 1), 300, 10, [(10, w.svc.trash_slot)])], S([[1], []]))
+    # negative controls
+    ws.svc.n_trash = 0
+    assert ws.svc.memory()["slots_physical"] != L * B * H * (ws.store_k[0].shape[1] // BS)
+    ws.store_v[1][1, ws.svc.trash_slot * BS + 3, 0, 0] = 0.0
+    assert not _trash_intact(ws)

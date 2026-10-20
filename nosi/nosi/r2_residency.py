@@ -8,10 +8,12 @@ reference per (block, cohort key (uid, epoch, m)); reader-gated release), kstep.
 interface issue / poll / done / force. This module re-implements, for the R2 tick, the K3X dispatcher's RESIDENCY call
 sites (cited per method, dispatcher.py at 91e6e47); it imports no dispatcher code.
 
-THE STORE (decision D4: per-stream backing): per layer l, store_k[l] / store_v[l] (B, (C + X + N_TAIL) * 64, H, D)
-and store_b[l] (B, (C + X + N_TAIL) * 64, H). Slots 0 .. C + X - 1 hold historical blocks (the streams' slots); slots
-C + X .. C + X + 3 are the request's tail rings (2 exact + 2 draft pages, note 5.2), written by the tick, never by this
-service. A page table over this store serves piece 3's attention for draft and verify rows alike.
+THE STORE (decision D4: per-stream backing): per layer l, store_k[l] / store_v[l] (B, (C + X + N_TAIL + T) * 64, H, D)
+and store_b[l] (B, (C + X + N_TAIL + T) * 64, H), T = trash_slots (0 or 1). Slots 0 .. C + X - 1 hold historical
+blocks (the streams' slots); slots C + X .. C + X + 3 are the request's tail rings (2 exact + 2 draft pages, note
+5.2), written by the tick, never by this service; slot C + X + 4 (with trash_slots=1) is the captured tick's TRASH
+slot: only its padded rows write and read it, never this service, never a live row (note 7). A page table over this
+store serves piece 3's attention for draft and verify rows alike.
 
 ONE LAYER (resolve, v1 = host-side per layer, decision D2): the tick passes the rows and their selections (CPU int64).
   verify rows (first; K3X issues verifier requests before drafts, dispatcher.py:3103): protect the whole selection
@@ -117,7 +119,9 @@ class Residency:
     def __init__(self, L: int, B: int, H: int, C: int, X: int, R_ver: int, transport, urgent_gather: Callable,
                  store_b=None, cis=None, block: int = BLOCK, block_bytes: int = 0, host_wait: Callable = None,
                  mut: Mutations = None, clock: Callable[[], int] = time.perf_counter_ns, poll_in_resolve: bool = True,
-                 defer_issue: bool = False, defer_admit: bool = False):
+                 defer_issue: bool = False, defer_admit: bool = False, trash_slots: int = 0):
+        if trash_slots not in (0, 1):
+            raise ValueError("trash_slots must be 0 or 1 (got %r)" % (trash_slots,))
         self.poll_in_resolve, self.defer_issue = bool(poll_in_resolve), bool(defer_issue)
         # defer_admit (the S-C schedule): the verifier's waited and urgent blocks are read in place on the device and
         # admitted at the next poll, never in the middle of a tick
@@ -128,6 +132,10 @@ class Residency:
         self.pools = [LayerPool(l, self.B, self.H, self.C, self.X, self.R_ver) for l in range(self.L)]
         self.n_hist = self.C + self.X                       # historical slots per stream; the tail rings follow
         self.tail0 = self.n_hist                            # first tail slot
+        # the TRASH slot (the captured tick's padded rows, Q-T2): after the tail rings; outside every LayerPool (no take,
+        # no transfer, no gather lands there) and outside the tail range (no Row can name it); None without it
+        self.n_trash = int(trash_slots)
+        self.trash_slot = self.n_hist + N_TAIL if self.n_trash else None
         self.tp = transport
         self.gather = urgent_gather
         self.store_b, self.cis = store_b, cis               # bias rows, filled from the cis table at take
@@ -652,7 +660,7 @@ class Residency:
             c["lru"] += cnt[VRES] if self.mut.vres_counted_as_lru else 0
             c["releasing"] += cnt[RELEASING] if not self.mut.mem_no_releasing else 0
         c["slots_used"] = sum(c.values())
-        c["slots_physical"] = self.L * self.B * self.H * (self.n_hist + N_TAIL)
+        c["slots_physical"] = self.L * self.B * self.H * (self.n_hist + N_TAIL + self.n_trash)
         c["retained"] = c["po"] + c["vres"]
         return c
 
