@@ -91,9 +91,20 @@ dtype, `IndexError` if an active request has `pos < 0` or
 `pos >= min(N_host, N)`.
 
 `body.resync(eng, pos, mask) -> None`: `pos` (B,) int64 device = the twin
-counter AFTER a commit, `mask` (B,) bool device. Sets
-`_block_map[:, b, 63] = pos // 64` and `_cache_lens[b]` for masked `b`.
-Slot 63 rows are not restored (B's masked tail copy).
+counter AFTER a commit, `mask` (B,) bool device. For masked `b`: sets every
+window entry `_block_map[:, b, s]`, `s < 63`, that names a block
+`>= pos // 64` to -1 (a free slot), then `_block_map[:, b, 63] = pos // 64`
+and `_cache_lens[b]`. Without the clear, a rollback across a block boundary
+names the tail block twice (the drafts loaded the completed block into a
+window slot), and `diff_offload` needs distinct ids (cache_engine.py:145-147;
+found by the static review of e048b3d). Slot 63 rows are not restored here:
+after a rollback across a boundary, rows `[0, pos % 64)` of slot 63 must be
+copied back from the host rows of block `pos // 64` (K, V) and from
+`total_cis` (bias). That is B's masked tail copy; `run_cross` in the tests
+simulates it.
+
+`allocate` also refuses `pin=False` for a CUDA engine (the Triton gathers
+read the host rows directly).
 
 `body.tail_in_selection(eng, topk_idx, pos) -> (B,) bool` (host sync; tests
 and debug only).
@@ -185,11 +196,19 @@ Run inside a CPU job:
 * NEGATIVE CONTROLS: an unmasked write-back (`full = active`) and a
   write-back that ignores activity both fail G-POISON. An unmasked
   write-back fails G-EQ. A shared tail counter (one position for the batch)
-  fails G-RAG and passes G-EQ.
+  fails G-RAG and passes G-EQ. A selection that does not mask inactive
+  requests fails G-RAG. An unconditional tail write fails the
+  inactive-request unit. `f4_fix=True` fails G-EQ (G-EQ sees the attention
+  length). A `resync` without the window clear fails the cross-boundary
+  rollback test (duplicate block id).
 * UNITS: an inactive request changes nothing, the F4 switch, the tail-id
-  precondition helper, `resync` after a rollback inside a block, the slot
-  cache stays coherent (each slot holds the host rows of the block its map
-  names), `allocate` refusals, imports only torch.
+  precondition helper, `resync` after a rollback inside a block (against a
+  committed-only run), `resync` after a rollback ACROSS a block boundary
+  (junk drafts, simulated tail copy, 70 re-advanced steps against a
+  committed-only run, the block written back again), the slot cache stays
+  coherent (each slot holds the host rows of the block its map names), no
+  duplicate ids (the diff stand-in asserts it on every call), `allocate`
+  refusals, imports only torch.
 
 ## Interfaces with B and C
 

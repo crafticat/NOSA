@@ -87,6 +87,8 @@ class DecodeBody:
             raise RuntimeError("the R2 decode body has no victim pool; pool_blocks must be 0")
         if batch < 1 or n_host < eng.block_size:
             raise ValueError("batch must be >= 1 and n_host >= block_size")
+        if torch.device(eng.device).type == "cuda" and not pin:
+            raise ValueError("a CUDA engine needs pinned host rows: the Triton gathers read them directly")
         H, D, bs, topk = eng.head_num, eng.head_dim, eng.block_size, eng.topk
         dt, dev = eng.dtype, torch.device(eng.device)
         rows = topk * bs
@@ -138,7 +140,9 @@ class DecodeBody:
         the cis table (B, N, H) with row p_b already written; topk_idx (H, B,
         topk) int64; pos (B,) int64 and active (B,) bool on the device;
         pos_host, active_host the same values on the CPU. Returns what the
-        shipped body returns (cache_engine.py:412)."""
+        shipped body returns (cache_engine.py:412). Raises before any write if
+        an input is malformed or if ANY active request writes out of range
+        (the whole batch is refused)."""
         B, S, H, D = key_states.shape
         if S != 1 or H != eng.head_num or D != eng.head_dim:
             raise ValueError("key_states must be (B, 1, %d, %d), got %s" % (eng.head_num, eng.head_dim, tuple(key_states.shape)))
@@ -159,26 +163,14 @@ class DecodeBody:
             raise IndexError("an active request writes outside [0, %d)" % limit)
 
         bs = eng.block_size
-        t0 = eng._tail_block_idx_on_gpu * bs
         p = self.positions(pos)
         p_host = self.positions(pos_host)
-        bi = torch.arange(B, device=p.device)
 
         # A. the tail row (cache_engine.py:349-354)
-        row = t0 + p % bs
-        a3 = active.view(B, 1, 1)
-        eng._k_gpu[bi, row] = torch.where(a3, key_states[:, 0].to(eng._k_gpu.dtype), eng._k_gpu[bi, row])
-        eng._v_gpu[bi, row] = torch.where(a3, value_states[:, 0].to(eng._v_gpu.dtype), eng._v_gpu[bi, row])
-        prow = p.clamp(min=0, max=int(kv_bias.shape[1]) - 1)
-        eng._kv_bias_gpu[bi, row] = torch.where(active.view(B, 1), kv_bias[bi, prow].to(eng._kv_bias_gpu.dtype),
-                                                eng._kv_bias_gpu[bi, row])
+        self.write_tail(eng, key_states, value_states, kv_bias, p, active)
 
-        # B. the selection (:363, :377); an inactive request keeps its map and loads nothing
-        diff_offload(eng._block_map, topk_idx, eng._new_block_map_buf, eng._load_mask)
-        am = active.view(1, B, 1)
-        eng._new_block_map_buf.copy_(torch.where(am, eng._new_block_map_buf, eng._block_map))
-        eng._load_mask.masked_fill_(~am, -1)
-        eng._block_map.copy_(eng._new_block_map_buf, non_blocking=True)
+        # B. the selection (:363, :377)
+        self.select(eng, topk_idx, active, diff_offload)
 
         # C. the gathers (:381-382)
         gather_k(eng._k_gpu, eng._k_cpu, eng._load_mask, bs)
@@ -195,6 +187,29 @@ class DecodeBody:
                                           eng._cache_lens.to(torch.int64)).to(torch.int32))
         return eng._k_gpu, eng._v_gpu, eng._kv_bias_gpu, eng._cache_lens
 
+    def write_tail(self, eng, key_states, value_states, kv_bias, p, active) -> None:
+        """Row 4032 + p_b % 64 of K, V and bias <- the step's K, V and cis row
+        p_b, active requests only (an inactive request rewrites its own row)."""
+        B = p.shape[0]
+        row = eng._tail_block_idx_on_gpu * eng.block_size + p % eng.block_size
+        bi = torch.arange(B, device=p.device)
+        a3 = active.view(B, 1, 1)
+        eng._k_gpu[bi, row] = torch.where(a3, key_states[:, 0].to(eng._k_gpu.dtype), eng._k_gpu[bi, row])
+        eng._v_gpu[bi, row] = torch.where(a3, value_states[:, 0].to(eng._v_gpu.dtype), eng._v_gpu[bi, row])
+        prow = p.clamp(min=0, max=int(kv_bias.shape[1]) - 1)
+        eng._kv_bias_gpu[bi, row] = torch.where(active.view(B, 1), kv_bias[bi, prow].to(eng._kv_bias_gpu.dtype),
+                                                eng._kv_bias_gpu[bi, row])
+
+    def select(self, eng, topk_idx, active, diff_offload) -> None:
+        """diff_offload, then an inactive request keeps its map and loads
+        nothing, then the map takes the new assignment."""
+        B = active.shape[0]
+        diff_offload(eng._block_map, topk_idx, eng._new_block_map_buf, eng._load_mask)
+        am = active.view(1, B, 1)
+        eng._new_block_map_buf.copy_(torch.where(am, eng._new_block_map_buf, eng._block_map))
+        eng._load_mask.masked_fill_(~am, -1)
+        eng._block_map.copy_(eng._new_block_map_buf, non_blocking=True)
+
     def writeback(self, eng, full, full_host, p, p_host) -> None:
         """The masked write-back, torch backend: for each full request (host
         mask), host rows [p_b - 63, p_b] <- slot 63 rows [0, 64)."""
@@ -207,12 +222,23 @@ class DecodeBody:
 
     # ----------------------------------------------------------------- helpers
     def resync(self, eng, pos: torch.Tensor, mask: torch.Tensor) -> None:
-        """After a rollback (twin commit): re-derive the tail id and the
-        attention length of the masked requests from pos (the next write
-        position). Slot 63's rows are NOT restored here: a rollback that crosses
-        a block boundary also needs B's masked copy of the tail slot."""
+        """After a rollback (twin commit): for the masked requests, clear every
+        window entry (slots 0 .. 62) that names a block >= pos // 64, then
+        re-derive the tail id and the attention length from pos (the next write
+        position).
+
+        WHY THE CLEAR. When the drafts completed a block T and the next step
+        loaded T into a window slot, a rollback into block T makes T the tail
+        again: without the clear the map would name T twice, and diff_offload
+        needs distinct ids (cache_engine.py:145-147). A cleared entry (-1) is a
+        free slot. Slot 63's rows are NOT restored here: after a rollback that
+        crosses a block boundary, rows [0, pos % 64) of slot 63 must be copied
+        back from the host rows of block T (B's masked tail copy)."""
         B = pos.shape[0]
         tail_col = eng._tail_block_idx_on_gpu
+        tail = (pos // eng.block_size).view(1, B, 1)
+        window = eng._block_map[:, :, :tail_col]
+        window.masked_fill_(mask.view(1, B, 1) & (window >= tail), -1)
         eng._block_map[..., tail_col] = torch.where(mask.view(1, B), (pos // eng.block_size).view(1, B),
                                                     eng._block_map[..., tail_col])
         eng._cache_lens.copy_(torch.where(mask, self.cache_lens_value(eng, pos - 1),

@@ -74,6 +74,11 @@ def diff_offload_ref(old_map, new_act, new_map, load_map):
     selected id that is not resident goes to the k-th slot whose old id is not
     selected (load = that id). Entries the kernel does not write keep their value."""
     H, B, M = old_map.shape
+    s = old_map.sort(-1).values
+    assert not bool(((s[..., 1:] == s[..., :-1]) & (s[..., 1:] >= 0)).any()), \
+        "duplicate block id in a map row (diff_kernel needs distinct ids)"
+    t = new_act.sort(-1).values
+    assert not bool((t[..., 1:] == t[..., :-1]).any()), "duplicate id in the selection"
     old_hit = (old_map.unsqueeze(-1) == new_act.unsqueeze(-2)).any(-1)
     new_hit = (new_act.unsqueeze(-1) == old_map.unsqueeze(-2)).any(-1)
     new_map[old_hit] = old_map[old_hit]
@@ -207,6 +212,24 @@ def _topk(seed, p):
     return torch.stack([_selection(seed, b, int(p[b])) for b in range(p.shape[0])], dim=1).contiguous()
 
 
+def _selection_local(seed, b, p):
+    """Like _selection, but the previous block p // 64 - 1 is always selected
+    too (a forced local window), so a just-completed block enters the window."""
+    T = p // BS
+    g = torch.Generator().manual_seed(seed * 1_000_003 + b * 100_003 + p)
+    rows = []
+    for _ in range(H_):
+        row = torch.cat([torch.randperm(T - 1, generator=g)[:TOPK - 2], torch.tensor([T - 1, T])])
+        rows.append(row[torch.randperm(TOPK, generator=g)])
+    return torch.stack(rows)
+
+
+def _assert_distinct_ids(eng, where):
+    s = eng._block_map.sort(-1).values
+    dup = (s[..., 1:] == s[..., :-1]) & (s[..., 1:] >= 0)
+    assert not bool(dup.any()), "%s: duplicate block id in a map row" % where
+
+
 def _shipped_prefill(e, keys, values, bias, S):
     """cache_engine.py:187-189 and :309-331 for current_batch_pos = 0, total_bsz = B, pool off."""
     B = e._k_gpu.shape[0]
@@ -277,6 +300,27 @@ class _IgnoresActivity(rb.DecodeBody):
 class _SharedTail(rb.DecodeBody):
     def positions(self, pos):
         return pos.max().expand_as(pos).clone()      # one tail position for the batch
+
+
+class _UnconditionalTail(rb.DecodeBody):
+    def write_tail(self, eng, key_states, value_states, kv_bias, p, active):
+        super().write_tail(eng, key_states, value_states, kv_bias, p, torch.ones_like(active))
+
+
+class _NoInactiveMask(rb.DecodeBody):
+    def select(self, eng, topk_idx, active, diff_offload):
+        diff_offload(eng._block_map, topk_idx, eng._new_block_map_buf, eng._load_mask)
+        eng._block_map.copy_(eng._new_block_map_buf)
+
+
+class _ResyncNoClear(rb.DecodeBody):
+    def resync(self, eng, pos, mask):                # the first version: the tail id and length only
+        B = pos.shape[0]
+        col = eng._tail_block_idx_on_gpu
+        eng._block_map[..., col] = torch.where(mask.view(1, B), (pos // eng.block_size).view(1, B),
+                                               eng._block_map[..., col])
+        eng._cache_lens.copy_(torch.where(mask, self.cache_lens_value(eng, pos - 1),
+                                          eng._cache_lens.to(torch.int64)).to(torch.int32))
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +494,17 @@ def test_negctl_shared_tail_passes_geq():
     run_eq(_SharedTail(False), 6017, 4, steps=70)
 
 
+def test_negctl_unmasked_selection_fails_grag():
+    with pytest.raises(AssertionError, match="request 1: _k_gpu differs"):
+        run_rag(_NoInactiveMask(False), [6016, 6017, 6079, 6100], steps=5)
+
+
+def test_negctl_f4_fix_fails_geq():
+    """G-EQ sees a different attention length: the corrected F4 is not the shipped one."""
+    with pytest.raises(AssertionError, match="_cache_lens differs"):
+        run_eq(rb.DecodeBody(True), 6079, 1, steps=2)
+
+
 # ---------------------------------------------------------------------------
 # units
 # ---------------------------------------------------------------------------
@@ -475,16 +530,25 @@ def _step(body, eng, twin, keys, values, cis, act, seed=21):
     return p
 
 
-def test_inactive_request_changes_nothing():
+def run_inactive(body):
     eng, twin, keys, values, cis = _setup([6016, 6040, 6079])
     for _ in range(3):
-        _step(REF, eng, twin, keys, values, cis, torch.ones(3, dtype=torch.bool))
+        _step(body, eng, twin, keys, values, cis, torch.ones(3, dtype=torch.bool))
     before = {k: _req(eng, k, 1).clone() for k in PERSIST}
-    _step(REF, eng, twin, keys, values, cis, torch.tensor([True, False, True]))
+    _step(body, eng, twin, keys, values, cis, torch.tensor([True, False, True]))
     for k in PERSIST:
         assert torch.equal(_req(eng, k, 1), before[k]), "inactive request: %s changed" % k
     assert bool((eng._load_mask[:, 1] == -1).all())
     assert torch.equal(eng._new_block_map_buf[:, 1], eng._block_map[:, 1])
+
+
+def test_inactive_request_changes_nothing():
+    run_inactive(REF)
+
+
+def test_negctl_unconditional_tail_write_fails_inactive():
+    with pytest.raises(AssertionError, match="inactive request: _k_gpu changed"):
+        run_inactive(_UnconditionalTail(False))
 
 
 def test_f4_switch():
@@ -556,6 +620,81 @@ def test_resync_after_a_rollback_inside_a_block():
         _assert_coherent(eng, b, keys, values, twin.total_cis, pos, "after resync, request %d" % b)
 
 
+def run_cross(body, keep=2, drafts=10, readvance=70):
+    """Drafts run from S = 6076 over the end of block 94 (p = 6079) into block
+    95, then a rollback keeps 2 tokens: the tail is block 94 again. The
+    rejected drafts carry junk K / V / cis. After resync and B's masked tail
+    copy (simulated here), the engine and a committed-only engine decode the
+    true tokens; block 94 completes again and is written back."""
+    S = 6076
+    eng, twin, keys, values, cis = _setup([S], extra=150)
+    single = _single(eng, 0)
+    t1 = tw.PositionalTwin(1, H_, D_, twin.lk_max, twin.n_max)
+    t1.prefill(0, keys[0, :S], cis[0, :S])
+    g = torch.Generator().manual_seed(41)
+
+    def junk(*shape):
+        return torch.randint(100, 121, shape, generator=g).to(DT)
+
+    def go(e, t, k, v, c):
+        p = t.pos.clone()
+        t.step(k, c, active=ONE)
+        body.decode(e, k.unsqueeze(1), v.unsqueeze(1), t.total_cis,
+                    _selection_local(31, 0, int(p[0])).unsqueeze(1).contiguous(), p, ONE, p.clone(), ONE.clone(), *STUBS)
+
+    ctr = [twin.counters()]
+    for u in range(drafts):                                  # positions 6076 .. 6085
+        q = S + u
+        if u < keep:
+            go(eng, twin, keys[0:1, q], values[0:1, q], cis[0:1, q])
+        else:
+            go(eng, twin, junk(1, H_, D_), junk(1, H_, D_), junk(1, H_))
+        ctr.append(twin.counters())
+    assert int(eng._block_map[0, 0, TOPK - 1]) == 95
+    assert bool((eng._block_map[:, 0, :TOPK - 1] == 94).any()), "the drafts loaded block 94 into the window"
+    twin.commit(torch.stack(ctr), [keep])
+    pos = int(twin.pos[0])
+    assert pos == S + keep
+    body.resync(eng, twin.pos, ONE)
+    _assert_distinct_ids(eng, "after resync")
+    assert int(eng._block_map[0, 0, TOPK - 1]) == pos // BS
+    assert not bool((eng._block_map[:, 0, :TOPK - 1] >= pos // BS).any())
+    _assert_twin_agrees(eng, twin, "after resync")
+    T, n = pos // BS, pos % BS                               # B's masked tail copy, simulated
+    eng._k_gpu[0, TAIL0:TAIL0 + n] = eng._k_cpu[0, T * BS:T * BS + n]
+    eng._v_gpu[0, TAIL0:TAIL0 + n] = eng._v_cpu[0, T * BS:T * BS + n]
+    eng._kv_bias_gpu[0, TAIL0:TAIL0 + n] = twin.total_cis[0, T * BS:T * BS + n]
+    _assert_coherent(eng, 0, keys, values, twin.total_cis, pos, "after resync and tail copy")
+    for u in range(keep):                                    # the committed-only run catches up
+        go(single, t1, keys[0:1, S + u], values[0:1, S + u], cis[0:1, S + u])
+    for i in range(readvance):
+        q = pos + i
+        for e, t in ((eng, twin), (single, t1)):
+            go(e, t, keys[0:1, q], values[0:1, q], cis[0:1, q])
+        w = "re-advance step %d" % (i + 1)
+        P = int(twin.pos[0])
+        assert P == int(t1.pos[0])
+        Tn, nn = P // BS, P % BS
+        assert torch.equal(eng._block_map[:, 0, TOPK - 1], single._block_map[:, 0, TOPK - 1]), "%s: tail id" % w
+        assert torch.equal(eng._cache_lens, single._cache_lens), "%s: cache_lens" % w
+        for k in ("_k_gpu", "_v_gpu", "_kv_bias_gpu"):
+            assert torch.equal(getattr(eng, k)[0, TAIL0:TAIL0 + nn], getattr(single, k)[0, TAIL0:TAIL0 + nn]), \
+                "%s: tail %s" % (w, k)
+        assert torch.equal(eng._k_cpu[0, :Tn * BS], single._k_cpu[0, :Tn * BS]), "%s: host K" % w
+        assert torch.equal(eng._v_cpu[0, :Tn * BS], single._v_cpu[0, :Tn * BS]), "%s: host V" % w
+        _assert_distinct_ids(eng, w)
+        _assert_coherent(eng, 0, keys, values, twin.total_cis, P, w)
+
+
+def test_resync_after_a_rollback_across_a_block_boundary():
+    run_cross(REF)
+
+
+def test_negctl_resync_without_the_clear_duplicates_a_block():
+    with pytest.raises(AssertionError, match="duplicate block id"):
+        run_cross(_ResyncNoClear(False))
+
+
 def test_allocate_shapes_and_refusals():
     eng = types.SimpleNamespace(head_num=H_, head_dim=D_, block_size=BS, topk=TOPK, dtype=DT,
                                 device=torch.device("cpu"), pool_blocks=0)
@@ -568,6 +707,10 @@ def test_allocate_shapes_and_refusals():
     eng.pool_blocks = 2
     with pytest.raises(RuntimeError, match="pool"):
         REF.allocate(eng, 3, 5000, False)
+    cuda_eng = types.SimpleNamespace(head_num=H_, head_dim=D_, block_size=BS, topk=TOPK, dtype=DT,
+                                     device=torch.device("cuda"), pool_blocks=0)
+    with pytest.raises(ValueError, match="pinned"):
+        REF.allocate(cuda_eng, 1, 5000, False)          # refused before any allocation: no GPU needed
 
 
 def test_decode_refuses_out_of_range_and_bad_inputs():
