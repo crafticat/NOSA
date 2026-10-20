@@ -167,6 +167,13 @@ class FixedTickEngine(TickEngine):
                 raise TickError("the layers' twins disagree on their epochs")
         self.ctr_epoch = None
         self.stats.update(padded_rows=0, caps={})
+        # W5 seams (docs/R2_TICK_CAPTURE_PLAN.md 12b): pre_region(eng, cb, rows) runs on the host before the region
+        # (a captured tick: before the replay; S-C's host part: sync_mirror, the fixed row buffers), post_region(eng,
+        # cb, rows) after it (S-C: the reader event, end_tick); flag_watcher: an S-C service that reads err_dev and the
+        # twins' overflow flags with its one read per tick (watch_flags_with)
+        self.pre_region = None
+        self.post_region = None
+        self.flag_watcher = None
 
     # ------------------------------------------------------------------ construction
     @classmethod
@@ -280,7 +287,11 @@ class FixedTickEngine(TickEngine):
         cb = self.cap_buffers(R_cap, T_cap)
         self.upload(cb, self.padded_table(tab, count, R, cb, lo))
         pos0 = list(self.bank_pos)
+        if self.pre_region is not None:
+            self.pre_region(self, cb, rows)
         logits, arg = self.forward(cb)
+        if self.post_region is not None:
+            self.post_region(self, cb, rows)
         self.n_tok = lo + R
         for bk, c in enumerate(count):
             self.bank_pos[bk] += c
@@ -387,13 +398,25 @@ class FixedTickEngine(TickEngine):
     # ------------------------------------------------------------------ the decision read
     def read_tokens(self, lo: int, hi: int) -> List[int]:
         """THE decision read: token-log slots [lo, hi), err_dev and every twin's overflow flag in ONE transfer. A set
-        flag voids every tick since the last clean read (TickError)."""
+        flag voids every tick since the last clean read (TickError). With a flag_watcher (S-C, watch_flags_with) the
+        flags ride in S-C's own read at every tick, and this read holds the tokens only."""
         self.stats["decision_reads"] += 1
-        flags = torch.stack([self.err_dev] + [t.overflow for t in self.twins]).to(torch.int64)
-        vals = torch.cat([self.tok_log[lo:hi], flags]).tolist()
+        flags = None
+        if self.flag_watcher is None:
+            flags = torch.stack([self.err_dev] + [t.overflow for t in self.twins]).to(torch.int64)
+        vals = (self.tok_log[lo:hi] if flags is None else torch.cat([self.tok_log[lo:hi], flags])).tolist()
         n = hi - lo
         self._raise_on_flags(vals[n:])
         return vals[:n]
+
+    def watch_flags_with(self, svc) -> None:
+        """C's watch_flag (r2_residency_sc.py, 0d3a94a, Q-T5): S-C reads err_dev ("tick.err") and every twin's sticky
+        overflow ("twin<l>.overflow") with its ONE device read at every end_tick; a set flag refuses that tick
+        (CapacityRefusal). The decision read then reads the tokens only."""
+        svc.watch_flag("tick.err", self.err_dev)
+        for l, t in enumerate(self.twins):
+            svc.watch_flag("twin%d.overflow" % l, t.overflow)
+        self.flag_watcher = svc
 
     def check_flags(self) -> None:
         """The flags alone (one read): for the end of a run and the tests."""

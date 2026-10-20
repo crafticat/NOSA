@@ -556,6 +556,76 @@ W4 (the capture) and W5 (S-C in the graph, on C's answers above) are next.
         benchmarks/Efficiency/tests_cpu/test_r2_tick_capture.py benchmarks/Efficiency/tests_cpu/test_r2_tick.py \
         benchmarks/Efficiency/tests_cpu/test_r2_twin_unchecked.py
 
+## 12b. W4 and W5 built (source only, 2026-10-21)
+
+BASE: C's fetch line 41078e8 is MERGED into this branch (6a7271b). It does not contain the
+tick (a35037b), so a rebase onto it would drop `r2_tick.py`. The merge brings:
+
+- the trash slot (f321c03);
+- the watched flags (0d3a94a);
+- the exact device wait (41078e8);
+- the device mirror (ca38648).
+
+C's twin commit 4fe5fc9 is on both sides (my 313baa2 is its cherry-pick). The merge was clean.
+
+W4, the captured tick:
+
+- `nosi/nosi/r2_tick_capture.py`, `CapturedTickEngine(FixedTickEngine)`:
+  - one CUDA graph per capacity, one shared pool (`torch.cuda.graph_pool_handle`);
+  - per capacity: `warm` eager ticks (Triton compiles, PaddedLinear buffers), then one capture
+    that is replayed, then replays;
+  - the static outputs are returned as views;
+  - `state_pointers` / `pointer_diff` for PTR.
+- `r2_tick_fixed.py` gains `pre_region` / `post_region` (the host seams around the region) and
+  `watch_flags_with(svc)`. The latter is C's `watch_flag`: S-C reads `tick.err` and every
+  twin's overflow at every end_tick, and the decision read then reads the tokens only.
+- `benchmarks/Efficiency/r2_tick_capture_gate.py`, the TC gate:
+  - the arms TE / TF / TG / TX / TS / TR;
+  - PTR and ERR;
+  - NG1 / NG2 / NG3 with exact predicted first ticks (`predicted_pad_leak`, `--stale-at`,
+    `predicted_frozen_capture`);
+  - T.
+  NG3 is a real capture fault: the region writes the token log at a host offset, which the graph
+  freezes.
+- `benchmarks/Efficiency/r2_tick_capture_step.sh`: the holder step (uuid file, the piece 3 pins,
+  STEP_MIN 30, claim `tickcap_active`).
+- `benchmarks/Efficiency/tests_cpu/test_r2_tick_graph.py`, G1-G5. A CPU `FakeGraph` replays the
+  region with the host values held at their capture-time values. G5 runs the gate's own
+  `fault_classes` and `compare_run` on the CPU.
+
+W5, S-C at fixed capacity for the capture:
+
+- `nosi/nosi/r2_residency_capture.py`, `CaptureSC`, on C's Q-T3 answers:
+  - `host_part` before the replay: the row checks of every layer, `sync_mirror`, the T4 waits
+    on the GPU, one copy of the fixed row buffers;
+  - `device_part` per layer, inside the region: C's `device_verify` / `device_draft` / the
+    mirror / wait / gather on Rv_cap / Rd_cap entries, padded entries on an INERT row;
+  - `after_replay`: `read_done` with one reader event, then `end_tick`, one read.
+  - On the GPU it requires `CudaDeviceOps(wait_mode="exact")`.
+- `benchmarks/Efficiency/tests_cpu/test_r2_residency_capture.py`, S1-S5:
+  - S1 / S2: lockstep against `ResidencySC.resolve` on F6's schedule (probe and exact wait):
+    pages, state, counters, the device mirror, the stores and the copy counts are equal every
+    tick;
+  - S3: negative controls: a live "inert" row, no `sync_mirror`, a watched flag;
+  - S4: the lint;
+  - S5: `watch_flags_with`.
+
+NOT BUILT: the tick on the Residency, i.e. SG5's seam steps 1-2. This covers the pages from the
+plan instead of the ResidentStore's renaming, the history write-back to the host rows,
+`decided` / `cancel_epoch`, `begin_request` / `end_request`, and the store layout of C + X + 5
+slots. Until it exists, the GPU gate runs the captured tick on the ResidentStore (the trash slot
+NB + 4 included), and `CaptureSC` is CPU-proven against S-C's `resolve`. `pre_region` /
+`post_region` are the seams it plugs into.
+
+CPU (inside a CPU job, from this worktree):
+
+    env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA benchmarks/Efficiency/tests_cpu/test_r2_tick_graph.py benchmarks/Efficiency/tests_cpu/test_r2_residency_capture.py benchmarks/Efficiency/tests_cpu/test_r2_tick_capture.py benchmarks/Efficiency/tests_cpu/test_r2_tick.py benchmarks/Efficiency/tests_cpu/test_r2_residency.py benchmarks/Efficiency/tests_cpu/test_r2_twin_unchecked.py
+
+GPU (after the CPU tests; DRYRUN on the login node first):
+
+    DRYRUN=1 bash benchmarks/Efficiency/r2_tick_capture_step.sh --nosi <sha> <holder job> <run id>
+    bash benchmarks/Efficiency/r2_tick_capture_step.sh --nosi <sha> <holder job> <run id>
+
 ## 13. Risks
 
 - **OP-1:** the stable `torch.sort` of `select_blocks` under capture is not yet proven here.
