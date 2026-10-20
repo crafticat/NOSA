@@ -13,6 +13,7 @@ keeps them; its outputs are fixed tensors (the graph's static outputs). The worl
       arguments and refusals.
   G5  the gate's planted faults (its own fault_classes on the CPU engine) and its own compare_run: NG1 / NG2 / NG3
       first differ from the eager tick at EXACTLY the predicted tick; the fixed and the captured engines do not differ.
+      G5a: the CPU argument set parses and is the C tests' forced round (the plan the predictions read).
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA \
         benchmarks/Efficiency/tests_cpu/test_r2_tick_graph.py
@@ -193,8 +194,21 @@ def nosi_alias(monkeypatch):
 
 
 def _args():
+    """The gate's arguments for the CPU world: B 4, TT.STEPS committed tokens per request. --ts-steps is passed
+    because the gate refuses ts-steps > steps (its default 64 > TT.STEPS 40: CPU job 2190950, SystemExit 2 in G5 /
+    G5b); G5 does not run the TS part, any value in [1, steps] is valid."""
     return GATE.parse_args(["--out", "x", "--workload", "w", "--biattn", "p", "--batch", "4", "--deltas", "0,0,0,0",
-                            "--steps", str(TT.STEPS), "--S", "16128"])
+                            "--steps", str(TT.STEPS), "--ts-steps", str(TT.STEPS), "--S", "16128"])
+
+
+def test_G5a_the_cpu_arguments_are_the_run_the_predictions_assume():
+    """G5a: _args() parses (the defect of 2190950), and it is the C tests' forced round (TC.record: steps TT.STEPS,
+    K 3, LAMBDA 7, warm 1, stale-at 10 < the > 20 ticks of the round), so the gate's plan is te_forced's plan."""
+    a = _args()
+    assert (a.steps, a.ts_steps, a.K, a.LAMBDA, a.warm, a.stale_at, a.batch) == (TT.STEPS, TT.STEPS, 3, 7, 1, 10, 4)
+    with pytest.raises(SystemExit):                                    # NEGATIVE CONTROL: the 2190950 argument set
+        GATE.parse_args(["--out", "x", "--workload", "w", "--biattn", "p", "--batch", "4", "--deltas", "0,0,0,0",
+                         "--steps", str(TT.STEPS), "--S", "16128"])
 
 
 @pytest.mark.parametrize("ng", ["NG1", "NG2", "NG3"])
