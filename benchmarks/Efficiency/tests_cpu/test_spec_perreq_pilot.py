@@ -1,0 +1,952 @@
+"""R2 milestone 2: the per-request rounds RUN in the pilot (NOSI_SPEC_COMMIT=perreq). CPU tests of every piece:
+
+  EP  the engine methods cache_engine.spec_draft_update_perreq / spec_round_update_perreq / spec_commit_perreq, executed
+      from the source (AST) against a fake engine with the twins of the two Triton gathers, as the pilot's tests do:
+      EP1 two full rounds (draft K = 3, restore, verify, ragged commit) on a ragged batch equal B independent B = 1
+      runs of the LOCKSTEP methods, bit for bit, after every phase; EP2 an overflowing request is isolated (its store
+      back, no fetch, a finite placeholder mask, ctx.round_bad) and the round goes on for the others; negative control:
+      the plan alone leaves the overflowing stream claiming never-fetched blocks; EP3 (a finding of the LOCKSTEP pilot,
+      documented): spec_round_update raises RoundOverflow AFTER plan_round marked unfetched blocks RESIDENT; EP4 the
+      lockstep and per-request methods refuse each other's engines.
+  VS  verify_step.build_varlen_args takes the per-request seqused_k (and refuses a wrong one); the lockstep path holds.
+  MP  spec_perreq_model: MP1 the bridge equals the twin after the shipped prefill and decode steps (the twin suite's
+      ShippedRef with the shipped F2 line), and refuses an F2-short table; MP2 score_position on a ragged batch equals
+      B = 1 scoring (stand-ins for the two kernels: a torch stage 1, pool_reference); MP3 the per-request rollback probe
+      passes after a real round and fails on a corrupted tail row and on a round without the masked restore.
+  PL  the pilot's host side: perreq_keep and PerReqLoop (ragged sequences, finished requests stop committing, the K = 0
+      fallback, refusals), aggregate_rounds_perreq (the measured yield), the report's gates for a per-request cell.
+  ST / PIN  the step script's per-request cells (bash -n, text) and the wiring pins.
+
+    env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA \
+        "benchmarks/Efficiency/tests_cpu/test_spec_perreq_pilot.py::<test>"
+
+Modules of nosi/nosi are imported as members of a stand-in package (no nosi/nosi/__init__.py, which imports CUDA
+modules); the pilot is loaded by path in report mode. Data: integer-valued float32 in [-8, 8] (exact in bf16).
+"""
+from __future__ import annotations
+
+import ast
+import importlib
+import importlib.util
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
+import types
+from collections import Counter
+from pathlib import Path
+
+import pytest
+import torch
+
+ROOT = Path(__file__).resolve().parents[3]
+PKG = "nosipkg_perreq_pilot_test"
+if PKG not in sys.modules:
+    _pkg = types.ModuleType(PKG)
+    _pkg.__path__ = [str(ROOT / "nosi/nosi")]
+    sys.modules[PKG] = _pkg
+spm = importlib.import_module(PKG + ".spec_perreq_model")
+sl = spm._sl                                    # ONE spec_loop instance for the engine bodies, the model module, the tests
+tw = spm._tw
+twin_mod = importlib.import_module(PKG + ".r2_positional_twin")
+us = importlib.import_module(PKG + ".verify.union_store")
+vs = importlib.import_module(PKG + ".verify.verify_step")
+mp = importlib.import_module(PKG + ".max_pooling_per_request")
+
+
+def _load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+os.environ.setdefault("NOSI_SPEC_OUT", tempfile.mkdtemp(prefix="nosi_spec_perreq_pilot_test_"))
+os.environ["NOSI_SPEC_MODE"] = "report"
+pilot = _load(ROOT / "benchmarks/Efficiency/spec_loop_pilot.py", "nosi_spec_loop_pilot_perreq_test")
+SRC_ENGINE = (ROOT / "nosi/nosi/cache_engine.py").read_text()
+SRC_LLAMA = (ROOT / "nosi/nosi/nosa_llama.py").read_text()
+SRC_SPM = (ROOT / "nosi/nosi/spec_perreq_model.py").read_text()
+STEP = ROOT / "benchmarks/Efficiency/spec_loop_r2_step.sh"
+
+BS, TOPK, R, H, D = 64, 8, 5, 2, 4                # W = 15 slots
+KSEL = 6
+LAY = sl.store_layout(TOPK, R)
+EDT = torch.bfloat16
+
+
+def _g(*parts):
+    s = 0
+    for p in parts:
+        s = (s * 1000003 + int(p)) % (2 ** 61 - 1)
+    return torch.Generator().manual_seed(s)
+
+
+def _ints(shape, g):
+    return torch.randint(-8, 9, tuple(shape), generator=g).to(torch.float32)
+
+
+# ===========================================================================
+# the fake engine: the attributes the spec bodies read, the bodies from the source, the gathers' twins
+# ===========================================================================
+METHODS = ("spec_draft_update", "spec_round_update", "spec_rollback_tail",
+           "spec_draft_update_perreq", "spec_round_update_perreq", "spec_commit_perreq")
+
+
+def _method_src(name):
+    tree = ast.parse(SRC_ENGINE)
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "CacheEngine")
+    fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
+    return textwrap.dedent(ast.get_source_segment(SRC_ENGINE, fn))
+
+
+def _gather_k(gpu, cpu, ids, bs):
+    """flash_h2d_from_mask's effect: slot m of (h, b) <- host block ids[h, b, m]."""
+    for h, b, m in (ids >= 0).nonzero().tolist():
+        blk = int(ids[h, b, m])
+        gpu[b, m * bs:(m + 1) * bs, h] = cpu[b, blk * bs:(blk + 1) * bs, h]
+
+
+def _gather_v(gpu, cpu, bias_buf, bias, ids, bs):
+    """flash_h2d_from_mask_bias's effect: the values and the bias rows of the same blocks."""
+    _gather_k(gpu, cpu, ids, bs)
+    for h, b, m in (ids >= 0).nonzero().tolist():
+        blk = int(ids[h, b, m])
+        bias_buf[b, m * bs:(m + 1) * bs, h] = bias[b, blk * bs:(blk + 1) * bs, h].to(bias_buf.dtype)
+
+
+NS = {"torch": torch, "_sl": sl, "_tw": tw, "_us": us, "_vs": vs, "_bias_rows": lambda x: x,
+      "flash_h2d_from_mask": _gather_k, "flash_h2d_from_mask_bias": _gather_v}
+
+
+def _bind(eng):
+    for name in METHODS:
+        ns = dict(NS)
+        exec(_method_src(name), ns)
+        setattr(eng, name, types.MethodType(ns[name], eng))
+    return eng
+
+
+def _engine(pos, rids, seed, l, n_max, perreq):
+    """One layer's engine for requests ``rids`` at positions ``pos``; request rid's data from its own generator, so a
+    B = 1 engine of request rid equals slice b of a batched one."""
+    B = len(pos)
+    eng = types.SimpleNamespace(block_size=BS, topk=TOPK, head_num=H, head_dim=D, _tail_block_idx_on_gpu=TOPK - 1,
+                                verify_round_slots=R, pool_blocks=0, device=None)
+    parts = {k: [] for k in ("k_gpu", "v_gpu", "b_gpu", "k_cpu", "v_cpu")}
+    eng._block_map = torch.full((H, B, TOPK), -1, dtype=torch.int64)
+    for b, (p, rid) in enumerate(zip(pos, rids)):
+        g = _g(seed, rid, l, 1)
+        parts["k_gpu"].append(_ints((LAY.W * BS, H, D), g))
+        parts["v_gpu"].append(_ints((LAY.W * BS, H, D), g))
+        parts["b_gpu"].append(_ints((LAY.W * BS, H), g))
+        parts["k_cpu"].append(_ints((n_max, H, D), g))
+        parts["v_cpu"].append(_ints((n_max, H, D), g))
+        T = p // BS
+        for h in range(H):
+            eng._block_map[h, b, :TOPK - 1] = torch.randperm(T, generator=g)[:TOPK - 1]
+        eng._block_map[:, b, TOPK - 1] = T
+    eng._k_gpu = torch.stack(parts["k_gpu"]).to(EDT)
+    eng._v_gpu = torch.stack(parts["v_gpu"]).to(EDT)
+    eng._kv_bias_gpu = torch.stack(parts["b_gpu"]).to(EDT)
+    eng._k_cpu = torch.stack(parts["k_cpu"]).to(EDT)
+    eng._v_cpu = torch.stack(parts["v_cpu"]).to(EDT)
+    pt = torch.tensor(pos, dtype=torch.int64)
+    eng._cache_lens = ((TOPK - 1) * BS + pt % BS).to(torch.int32)
+    if len(set(pos)) == 1:
+        eng.seq_length, eng._tail_block_len_on_gpu = pos[0], pos[0] % BS
+        if perreq:
+            sl.to_perreq(eng)
+    else:
+        assert perreq, "a lockstep engine holds one seq_length"
+        eng.seq_length = eng._tail_block_len_on_gpu = None
+        eng._pos = pt.clone()
+        sl.check_tail_state(eng, eng._pos)
+    return _bind(eng)
+
+
+def _tables(pos, rids, seed, l, n_max):
+    t = twin_mod.PositionalTwin(len(pos), H, D, lk_max=n_max // 16, n_max=n_max)
+    for b, (S, rid) in enumerate(zip(pos, rids)):
+        g = _g(seed, rid, l, 2)
+        t.prefill(b, _ints((S, H, D), g), _ints((S, H), g))
+    return t
+
+
+class FakeEvent:
+    def __init__(self):
+        self.done = False
+        self.stream = None
+
+    def record(self, stream=None):
+        self.stream = stream
+
+    def query(self):
+        return self.done
+
+
+class _Side:
+    def __init__(self):
+        self.waited = []
+
+    def wait_event(self, e):
+        self.waited.append(e)
+
+
+class _Null:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class Uni:
+    """One batch of NL layers: engines with the bound spec bodies, twins, one store, a context; per-request or
+    lockstep."""
+
+    def __init__(self, pos, rids, seed, n_max, perreq, NL=1):
+        self.B, self.NL, self.perreq = len(pos), NL, perreq
+        self.engines = [_engine(pos, rids, seed, l, n_max, perreq) for l in range(NL)]
+        self.twins = [_tables(pos, rids, seed, l, n_max) for l in range(NL)]
+        self.store = sl.Store(NL, H, self.B, LAY)
+        cls = sl.PerReqSpecContext if perreq else sl.SpecContext
+        self.ctx = cls(self.store, side=_Side(), make_event=FakeEvent, current_stream=lambda: "main",
+                       stream_ctx=lambda s: _Null(), num_layers=NL, block_size=BS, kernel_size=32, kernel_stride=16)
+        tick = self.ctx.next_tick()
+        for l, e in enumerate(self.engines):
+            self.store.sync_window(l, e._block_map, tick)
+        self.state = spm.PerReqState(self.twins, self.engines, 4, 6, n_max // BS + 2, torch.float32, "cpu")
+        self.view = self.state.view
+
+    def pos(self):
+        e = self.engines[0]
+        return e._pos.clone() if self.perreq else torch.full((self.B,), int(e.seq_length), dtype=torch.int64)
+
+
+def _sel(g, maxid, k=KSEL):
+    rows = []
+    for _ in range(H):
+        r = torch.randperm(maxid + 1, generator=g)[:k].clone()
+        if int(torch.randint(0, 2, (1,), generator=g)) == 1:
+            r[-1] = -1
+        rows.append(r)
+    return torch.stack(rows)
+
+
+def _inputs(seed, rnd, rids, pos0, K, n_acc, NL=1):
+    """Round inputs per request from its own generator, stacked; a selection at position p names blocks <= p // 64."""
+    U = K + 1
+    per = []
+    for rid, p, na in zip(rids, pos0.tolist(), n_acc):
+        g = _g(seed, rid, 1000 + rnd, 3)
+        d = dict(dk=_ints((K, H, D), g), dv=_ints((K, H, D), g), dc=_ints((K, H), g),
+                 vk=_ints((U, H, D), g), vv=_ints((U, H, D), g), vc=_ints((U, H), g),
+                 sd=[[_sel(g, (p + j) // BS) for _ in range(NL)] for j in range(K)],
+                 sv=[torch.stack([_sel(g, (p + u) // BS) for u in range(U)]) for _ in range(NL)])
+        drafted = torch.randint(0, 1000, (K,), generator=g)
+        va = torch.randint(0, 1000, (U,), generator=g)
+        va[:K] = drafted
+        if na < K:
+            va[na] = (drafted[na] + 1) % 1000
+        d["drafted"], d["va"] = drafted, va
+        per.append(d)
+    return types.SimpleNamespace(
+        K=K, U=U,
+        dk=[torch.stack([x["dk"][j] for x in per]) for j in range(K)],
+        dv=[torch.stack([x["dv"][j] for x in per]) for j in range(K)],
+        dc=[torch.stack([x["dc"][j] for x in per]) for j in range(K)],
+        vk=torch.stack([x["vk"] for x in per]), vv=torch.stack([x["vv"] for x in per]), vc=torch.stack([x["vc"] for x in per]),
+        sd=[[torch.stack([x["sd"][j][l] for x in per], 1) for l in range(NL)] for j in range(K)],
+        sv=[torch.stack([x["sv"][l] for x in per], 2) for l in range(NL)],
+        drafted=torch.stack([x["drafted"] for x in per]), va=torch.stack([x["va"] for x in per]))
+
+
+# ===========================================================================
+# the two engine pipelines (the order of the model's forwards: the tables step before each engine update)
+# ===========================================================================
+def _draft_and_restore_perreq(u, inp, rec):
+    ctx, st = u.ctx, u.store
+    ctx.begin_round(u.view)
+    done = ctx.gen
+    for j in range(inp.K):
+        ctx.next_tick()
+        st.mark_arrived(done)
+        done = ctx.gen
+        for l in range(u.NL):
+            e, t = u.engines[l], u.twins[l]
+            t.step(inp.dk[j], inp.dc[j])
+            k_all, v_all, bias, lens = e.spec_draft_update_perreq(inp.dk[j].unsqueeze(1), inp.dv[j].unsqueeze(1), t.total_cis,
+                                                                 inp.sd[j][l], ctx, l)
+            assert k_all is e._k_gpu and v_all is e._v_gpu and lens.tolist() == [LAY.W * BS] * u.B
+            rec["draft"].append(dict(plan=e._spec_last_draft, bias=bias.clone(), rolled=ctx.rolled[l].clone()))
+    ctx.restore_before_verify(u.view)
+    ctx.was_inflight = (st.state == sl.INFLIGHT).clone()
+    st.mark_arrived(ctx.gen)
+    ctx.next_tick()
+
+
+def _verify_perreq(u, inp, rec):
+    ctx = u.ctx
+    rnds = []
+    for l in range(u.NL):
+        e, t = u.engines[l], u.twins[l]
+        ctr = [t.counters()]
+        for v in range(inp.U):
+            t.step(inp.vk[:, v], inp.vc[:, v])
+            ctr.append(t.counters())
+        u.state.ctrs[l] = torch.stack(ctr)
+        u.state.round_inputs[l] = (inp.vk, inp.vv, inp.vc)
+        k_all, v_all, b_all, rnd = e.spec_round_update_perreq(inp.vk, inp.vv, t.total_cis, inp.sv[l], ctx, l)
+        rnds.append(rnd)
+        rec["round"].append(rnd.union)
+        rec["tails"].append(dict(rolled_over=rnd.tail.rolled_over, rollover_at=rnd.tail.rollover_at, seqused_k=rnd.seqused_k))
+    return rnds
+
+
+def _round_perreq(u, inp, keep_fn=None):
+    rec = dict(draft=[], round=[], tails=[], tr=[])
+    _draft_and_restore_perreq(u, inp, rec)
+    rec["rnds"] = _verify_perreq(u, inp, rec)
+    acc = sl.accept_perreq(inp.va, inp.drafted)
+    keep = acc.keep if keep_fn is None else keep_fn(acc.keep)
+    keep = pilot.perreq_keep(keep, torch.zeros(u.B, dtype=torch.bool), u.ctx.round_bad)
+    tr = spm.spec_rollback(u.view, u.ctx, u.state, keep)
+    for l in range(u.NL):
+        assert torch.equal(u.twins[l].pos, u.engines[l]._pos)
+    rec["tr"].append(dict(undo=tr.undo_rollover, restored=tr.rows_restored))
+    rec["keep"] = keep
+    return rec
+
+
+def _round_lock(u, inp):
+    """B = 1 (or equal positions): the LOCKSTEP bodies spec_draft_update / spec_round_update / spec_rollback_tail."""
+    ctx, st = u.ctx, u.store
+    T = int(u.engines[0].seq_length) // BS
+    tc = [sl.capture_tail_counters(e, T) for e in u.engines]
+    t0 = [t.counters().unsqueeze(0) for t in u.twins]
+    ctx.round_idx += 1
+    ctx.tail_id, ctx.tail0, ctx.rolled, ctx.gen_round0 = T, tc[0], [False] * u.NL, ctx.gen + 1
+    rec = dict(draft=[], round=[], tails=[], tr=[])
+    done = ctx.gen
+    for j in range(inp.K):
+        ctx.next_tick()
+        st.mark_arrived(done)
+        done = ctx.gen
+        for l in range(u.NL):
+            e, t = u.engines[l], u.twins[l]
+            t.step(inp.dk[j], inp.dc[j])
+            _, _, bias, _ = e.spec_draft_update(inp.dk[j].unsqueeze(1), inp.dv[j].unsqueeze(1), t.total_cis, inp.sd[j][l], ctx, l)
+            rec["draft"].append(dict(plan=e._spec_last_draft, bias=bias.clone(), rolled=torch.full((u.B,), ctx.rolled[l])))
+    for l, (e, t) in enumerate(zip(u.engines, u.twins)):
+        sl.restore_tail_counters(e, tc[l], ctx.rolled[l])
+        t.commit(t0[l], torch.zeros(u.B, dtype=torch.int64))
+    ctx.was_inflight = (st.state == sl.INFLIGHT).clone()
+    st.mark_arrived(ctx.gen)
+    ctx.next_tick()
+    ctrs, rnds = [], []
+    for l, (e, t) in enumerate(zip(u.engines, u.twins)):
+        ctrs.append(t.advance(inp.vk, inp.vc, torch.full((u.B,), inp.U, dtype=torch.int64)))
+        _, _, _, rnd = e.spec_round_update(inp.vk, inp.vv, t.total_cis, inp.sv[l], ctx, l)
+        rnds.append(rnd)
+        rec["round"].append(rnd.union)
+        rec["tails"].append(dict(rolled_over=torch.full((u.B,), rnd.tail.rolled_over),
+                                 rollover_at=torch.full((u.B,), rnd.tail.rollover_at, dtype=torch.int64), seqused_k=rnd.seqused_k))
+    rec["rnds"] = rnds
+    acc = sl.accept_commit(inp.va, inp.drafted)
+    for l, (e, t) in enumerate(zip(u.engines, u.twins)):
+        t.commit(ctrs[l], torch.full((u.B,), acc.c, dtype=torch.int64))
+        tr = e.spec_rollback_tail(acc.c, LAY.mirror_lo)
+    rec["tr"].append(dict(undo=torch.full((u.B,), tr.undo_rollover), restored=torch.full((u.B,), tr.rows_restored, dtype=torch.int64)))
+    rec["keep"] = torch.full((u.B,), acc.c, dtype=torch.int64)
+    return rec
+
+
+TWIN_FIELDS = ("pos", "n_comp", "n_ccis", "prefilled", "comp_k", "ring", "total_cis")
+PLAN_FIELDS = ("deny", "issue", "n_sel", "n_hit", "n_inflight", "n_issue", "n_unrequested", "n_forbidden", "n_evicted_unused")
+ROUND_FIELDS = ("fetch", "overflow", "invalid", "n_new", "n_need", "n_hit_old", "n_timely", "n_late_wait", "n_late_fetch", "union_size")
+
+
+def _state(u, b):
+    d = {}
+    for l, (e, t) in enumerate(zip(u.engines, u.twins)):
+        pos = int(e._pos[b]) if u.perreq else int(e.seq_length)
+        d["L%d.pos" % l] = torch.tensor(pos)
+        d["L%d.tail_len" % l] = torch.tensor(pos % BS if u.perreq else int(e._tail_block_len_on_gpu))
+        for name in ("_k_gpu", "_v_gpu", "_kv_bias_gpu", "_k_cpu", "_v_cpu", "_cache_lens"):
+            d["L%d.%s" % (l, name)] = getattr(e, name)[b]
+        d["L%d._block_map" % l] = e._block_map[:, b]
+        for name in TWIN_FIELDS:
+            d["L%d.tables.%s" % (l, name)] = getattr(t, name)[b]
+        d["L%d.tables.ccis" % l] = t.ccis[:, b]
+    for name in sl.STORE_FIELDS + u.store.COUNTERS:
+        d["store.%s" % name] = getattr(u.store, name)[:, :, b]
+    return d
+
+
+def _rec_state(rec, b, U):
+    d = {}
+    for i, x in enumerate(rec["draft"]):
+        for f in PLAN_FIELDS:
+            d["draft%d.%s" % (i, f)] = getattr(x["plan"], f)[:, b]
+        d["draft%d.bias" % i] = x["bias"][b]
+        d["draft%d.rolled" % i] = x["rolled"][b]
+    for l, rp in enumerate(rec["round"]):
+        d["round%d.mask" % l] = rp.mask[:, b * U:(b + 1) * U]
+        for f in ROUND_FIELDS:
+            d["round%d.%s" % (l, f)] = getattr(rp, f)[:, b]
+    for l, x in enumerate(rec["tails"]):
+        for k, v in x.items():
+            d["tail%d.%s" % (l, k)] = v[b]
+    for l, x in enumerate(rec["tr"]):
+        for k, v in x.items():
+            d["truncate%d.%s" % (l, k)] = v[b]
+    d["keep"] = rec["keep"][b]
+    return d
+
+
+def _first_diff(da, db):
+    if list(da) != list(db):
+        return "keys differ: %s" % sorted(set(da) ^ set(db))
+    for k in da:
+        a, c = da[k], db[k]
+        if a.dtype != c.dtype or a.shape != c.shape or not torch.equal(a, c):
+            return "%s differs" % k
+    return None
+
+
+# ===========================================================================
+# EP: the engine methods
+# ===========================================================================
+def test_EP1_two_ragged_rounds_through_the_engine_bodies_equal_B1_lockstep_runs():
+    pos = [9 * BS + 61, 10 * BS + 3, 9 * BS + 63, 11 * BS + 0]
+    K, U, B, NL = 3, 4, 4, 2
+    n_max = max(pos) + 4 * U + 2 * BS
+    P = Uni(pos, list(range(B)), 21, n_max, perreq=True, NL=NL)
+    refs = [Uni([pos[b]], [b], 21, n_max, perreq=False, NL=NL) for b in range(B)]
+    cov = Counter()
+    for r, nacc in enumerate(([0, 3, 1, 2], [3, 0, 2, 1])):
+        pos0 = P.pos()
+        inp = _inputs(21, r, list(range(B)), pos0, K, nacc, NL)
+        rp = _round_perreq(P, inp)
+        for b in range(B):
+            rb = _round_lock(refs[b], _inputs(21, r, [b], pos0[b:b + 1], K, [nacc[b]], NL))
+            bad = _first_diff(_state(refs[b], 0), _state(P, b)) or _first_diff(_rec_state(rb, 0, U), _rec_state(rp, b, U))
+            assert bad is None, "round %d request %d: %s" % (r, b, bad)
+            # the verify call's arguments: request b's mask rows and length equal its B = 1 round's
+            q = _ints((B * U, 4, D), _g(r, b)).to(EDT)
+            a = vs.build_varlen_args(q, P.engines[0]._k_gpu, P.engines[0]._v_gpu, P.engines[0]._kv_bias_gpu, rp["rnds"][0])
+            a1 = vs.build_varlen_args(q[b * U:(b + 1) * U].contiguous(), refs[b].engines[0]._k_gpu, refs[b].engines[0]._v_gpu,
+                                      refs[b].engines[0]._kv_bias_gpu, rb["rnds"][0])
+            assert torch.equal(a.topk_idx[:, b * U:(b + 1) * U], a1.topk_idx) and int(a.seqused_k[b]) == int(a1.seqused_k[0])
+        assert len(set(rp["keep"].tolist())) > 1                                      # a ragged commit
+        assert _no_slot_at_or_beyond_the_tail(P) == []
+        cov["undo_restored"] += int((rp["tr"][0]["undo"] & (rp["tr"][0]["restored"] > 0)).sum())
+        cov["undo_last"] += int((rp["tr"][0]["undo"] & (rp["tr"][0]["restored"] == 0)).sum())
+        cov["kept_fill"] += int((rp["tails"][0]["rolled_over"] & ~rp["tr"][0]["undo"]).sum())
+        cov["draft_rolled"] += sum(int(x["rolled"].sum()) for x in rp["draft"])
+    for k in ("undo_restored", "kept_fill", "draft_rolled"):
+        assert cov[k] > 0, (k, dict(cov))
+    with pytest.raises(AssertionError):
+        P.engines[0].spec_commit_perreq(P.twins[0], torch.zeros((U + 1, 4, B), dtype=torch.int64), torch.ones(B, dtype=torch.int64),
+                                        LAY.mirror_lo)                                 # the round was consumed
+
+
+def _no_slot_at_or_beyond_the_tail(u):
+    """THE INVARIANT that makes a rollback across a block boundary safe without a resync: no slot of the store (window
+    or round region, RESIDENT or INFLIGHT) names a block id >= the request's live tail id pos // 64. (plan_draft fetches
+    only ids < T_b, the round-start tail; plan_round serves T_b and T_b + 1 from the mirrors and flags anything above
+    as invalid; a commit never goes below the round-start position.) Returns the offending (layer, head, request,
+    slot) list."""
+    bad = []
+    for l, e in enumerate(u.engines):
+        tail = (e._pos // BS).view(1, -1, 1)
+        live = u.store.state[l] != sl.FREE
+        hit = live & (u.store.ids[l] >= tail) & (u.store.ids[l] >= 0)
+        bad += [(l,) + tuple(x) for x in hit.nonzero().tolist()]
+    return bad
+
+
+def test_EP5_a_rollback_across_a_block_boundary_restores_slot_63_and_leaves_no_slot_at_or_beyond_the_tail():
+    """Request 0 starts at row 62 of block 9: the draft fills block 9 at its 2nd step (prefetching into the store), the
+    verify fills it at token 1 and writes tokens 2, 3 into block 10 (slot 63 rows 0, 1), and the commit keeps ONE
+    token: pos 639, block 9 live again. Slot 63's rows [0, 62) are the round-start rows again (the masked restore),
+    row 62 is the kept token, the map's tail column is 9, and no store slot names block 9 or 10. The next round runs
+    from there and equals the B = 1 lockstep run."""
+    pos = [9 * BS + 62, 10 * BS + 5]
+    K, U, B, NL = 3, 4, 2, 2
+    n_max = max(pos) + 3 * U + 2 * BS
+    P = Uni(pos, [0, 1], 23, n_max, perreq=True, NL=NL)
+    refs = [Uni([pos[b]], [b], 23, n_max, perreq=False, NL=NL) for b in range(B)]
+    ts = LAY.tail_slot * BS
+    rows0 = [e._k_gpu[0, ts:ts + 62].clone() for e in P.engines]
+    for r, nacc in enumerate(([0, 2], [3, 1])):
+        pos0 = P.pos()
+        rp = _round_perreq(P, _inputs(23, r, [0, 1], pos0, K, nacc, NL))
+        for b in range(B):
+            rb = _round_lock(refs[b], _inputs(23, r, [b], pos0[b:b + 1], K, [nacc[b]], NL))
+            bad = _first_diff(_state(refs[b], 0), _state(P, b)) or _first_diff(_rec_state(rb, 0, U), _rec_state(rp, b, U))
+            assert bad is None, "round %d request %d: %s" % (r, b, bad)
+        assert _no_slot_at_or_beyond_the_tail(P) == []
+        if r == 0:
+            assert bool(rp["tr"][0]["undo"][0]) and int(rp["tr"][0]["restored"][0]) == 2 and int(P.engines[0]._pos[0]) == 9 * BS + 63
+            assert sum(int(x["rolled"][0]) for x in rp["draft"]) > 0                     # the draft had crossed too
+            for l, e in enumerate(P.engines):
+                assert torch.equal(e._k_gpu[0, ts:ts + 62], rows0[l]) and torch.equal(e._k_gpu[0, ts + 62], _inputs(23, 0, [0, 1], pos0, K, nacc, NL).vk[0, 0].to(EDT))
+                assert int(e._block_map[0, 0, TOPK - 1]) == 9 and int(e._cache_lens[0]) == (TOPK - 1) * BS + 63
+
+
+def _overflow_setup(seed):
+    """Request 0 at 9*64+10 with an ordinary selection; request 1 at 30*64+5 naming 32 distinct blocks over the round:
+    more new blocks than the 12 evictable slots of its stream (overflow)."""
+    pos = [9 * BS + 10, 30 * BS + 5]
+    B, U = 2, 4
+    n_max = max(pos) + 2 * BS
+    P = Uni(pos, [0, 1], seed, n_max, perreq=True)
+    g = _g(seed, 9)
+    sel0 = torch.stack([_sel(g, 9) for _ in range(U)])                                       # (U, H, KSEL)
+    big = torch.arange(32, dtype=torch.int64).view(U, 1, 8).expand(U, H, 8) % 30           # 30 distinct ids < T = 30
+    sel = torch.full((U, H, B, 8), -1, dtype=torch.int64)
+    sel[:, :, 0, :KSEL] = sel0
+    sel[:, :, 1] = big
+    k, v, c = _ints((B, U, H, D), g), _ints((B, U, H, D), g), _ints((B, U, H), g)
+    return P, sel, k, v, c, pos
+
+
+def test_EP2_an_overflowing_request_is_isolated_and_the_round_goes_on():
+    P, sel, k, v, c, pos = _overflow_setup(31)
+    B, U = 2, 4
+    ctx, st, e, t = P.ctx, P.store, P.engines[0], P.twins[0]
+    ctx.begin_round(P.view)
+    ctx.was_inflight = torch.zeros_like(st.state, dtype=torch.bool)
+    before = sl.store_layer_copy(st, 0)
+    ref_store = sl.Store(1, H, 1, LAY)                     # request 0 alone, the lockstep plan
+    for n in sl.STORE_FIELDS + st.COUNTERS:
+        getattr(ref_store, n).copy_(getattr(st, n)[:, :, 0:1])
+    ctr = [t.counters()]
+    for w in range(U):
+        t.step(k[:, w], c[:, w])
+        ctr.append(t.counters())
+    _, _, _, rnd = e.spec_round_update_perreq(k, v, t.total_cis, sel, ctx, 0)            # no RoundOverflow
+    assert ctx.round_bad.tolist() == [False, True] and ctx.host_syncs == 1
+    p = rnd.union
+    assert bool(p.overflow[:, 1].all()) and not bool(p.overflow[:, 0].any())
+    for n in sl.STORE_FIELDS + st.COUNTERS:                                                 # its store is back
+        assert torch.equal(getattr(st, n)[0, :, 1], before[n][:, 1]), n
+    assert bool((p.fetch[:, 1] == -1).all())
+    m = p.mask.view(H, B, U, -1)
+    assert bool((m[:, 1, :, 0] == LAY.mirror_lo).all()) and bool((m[:, 1, :, 1:] == -1).all())
+    rb = sl.plan_round(ref_store, 0, sel[:, :, 0:1], int(pos[0]) // BS, int(rnd.tail.rollover_at[0]), ctx.gen_round0, ctx.gen,
+                       ctx.tick, torch.zeros((H, 1, LAY.W), dtype=torch.bool))
+    assert torch.equal(p.mask.view(H, B, U, -1)[:, 0], rb.mask.view(H, 1, U, -1)[:, 0]) and torch.equal(p.fetch[:, 0:1], rb.fetch)
+    for n in sl.STORE_FIELDS + st.COUNTERS:                                                 # request 0's round is the lockstep one
+        assert torch.equal(getattr(st, n)[:, :, 0:1], getattr(ref_store, n)), n
+    vs.build_varlen_args(_ints((B * U, 4, D), _g(1)).to(EDT), e._k_gpu, e._v_gpu, e._kv_bias_gpu, rnd)   # a valid verify call
+    # the commit: request 1 keeps nothing (the pilot's perreq_keep), request 0 two tokens
+    keep = pilot.perreq_keep(torch.tensor([2, 3]), torch.zeros(2, dtype=torch.bool), ctx.round_bad)
+    assert keep.tolist() == [2, 0]
+    tr = e.spec_commit_perreq(t, torch.stack(ctr), keep, LAY.mirror_lo)
+    assert tr.pos.tolist() == [pos[0] + 2, pos[1]] and t.pos.tolist() == tr.pos.tolist()
+    # NEGATIVE CONTROL: the plan alone (no isolation) leaves request 1's stream claiming blocks nobody fetched
+    st2 = sl.Store(1, H, B, LAY)
+    for n in sl.STORE_FIELDS + st.COUNTERS:
+        getattr(st2, n)[0].copy_(before[n])
+    p2 = sl.plan_round_perreq(st2, 0, sel, rnd.tail.tail_id, rnd.tail.rollover_at, 1, 2, 3, torch.zeros((H, B, LAY.W), dtype=torch.bool))
+    claimed = (st2.state[0, :, 1] == sl.RESIDENT) & (st2.ids[0, :, 1] != before["ids"][:, 1])
+    assert bool(claimed.any()) and bool((p2.fetch[:, 1] == -1).all())
+
+
+def test_EP3_finding_lockstep_round_overflow_leaves_unfetched_blocks_resident():
+    """DOCUMENTS a defect of the LOCKSTEP pilot (unchanged here; its fallback path): plan_round marks the slots it
+    assigned RESIDENT before spec_round_update raises RoundOverflow, and the caller's fallback restores only the
+    counters and tables, so the U = 1 re-verify plans on a store that names blocks whose rows were never gathered."""
+    pos = [30 * BS + 5]
+    n_max = pos[0] + 2 * BS
+    u = Uni(pos, [1], 41, n_max, perreq=False)
+    e, st, ctx = u.engines[0], u.store, u.ctx
+    T = pos[0] // BS
+    ctx.tail_id, ctx.tail0, ctx.rolled, ctx.gen_round0 = T, sl.capture_tail_counters(e, T), [False], ctx.gen + 1
+    ctx.was_inflight = torch.zeros_like(st.state, dtype=torch.bool)
+    U = 4
+    big = (torch.arange(32, dtype=torch.int64).view(U, 1, 1, 8) % 30).expand(U, H, 1, 8).contiguous()
+    g = _g(41, 2)
+    before_ids, before_state = st.ids.clone(), st.state.clone()
+    with pytest.raises(vs.RoundOverflow):
+        e.spec_round_update(_ints((1, U, H, D), g), _ints((1, U, H, D), g), u.twins[0].total_cis, big, ctx, 0)
+    claimed = ((st.state == sl.RESIDENT) & (st.ids != before_ids))[0, :, 0]                 # (H, W)
+    assert bool(claimed.any())
+    h, w = [int(x) for x in claimed.nonzero()[0].tolist()]
+    blk = int(st.ids[0, h, 0, w])
+    assert not torch.equal(e._k_gpu[0, w * BS:(w + 1) * BS, h], e._k_cpu[0, blk * BS:(blk + 1) * BS, h])   # stale rows
+
+
+def test_EP4_the_lockstep_and_per_request_bodies_refuse_each_others_engines():
+    pos = [9 * BS + 10] * 2
+    n_max = pos[0] + 2 * BS
+    P = Uni(pos, [0, 1], 51, n_max, perreq=True)
+    L = Uni(pos, [0, 1], 51, n_max, perreq=False)
+    k, v = _ints((2, 1, H, D), _g(5)), _ints((2, 1, H, D), _g(6))
+    sel = torch.full((H, 2, KSEL), -1, dtype=torch.int64)
+    P.ctx.begin_round(P.view)
+    lock_ctx = L.ctx
+    lock_ctx.tail_id, lock_ctx.rolled, lock_ctx.gen_round0 = 9, [False], 1
+    before = P.engines[0]._k_gpu.clone()
+    with pytest.raises(TypeError):                         # the lockstep body: seq_length is None on a per-request engine
+        P.engines[0].spec_draft_update(k, v, P.twins[0].total_cis, sel, lock_ctx, 0)
+    assert torch.equal(P.engines[0]._k_gpu, before)
+    with pytest.raises(AssertionError):                    # the per-request body on a lockstep engine
+        L.engines[0].spec_draft_update_perreq(k, v, L.twins[0].total_cis, sel, P.ctx, 0)
+    with pytest.raises(AssertionError):
+        L.engines[0].spec_round_update_perreq(k, v, L.twins[0].total_cis, sel.unsqueeze(0), P.ctx, 0)
+    with pytest.raises(AssertionError):                    # a commit without a round
+        P.engines[0].spec_commit_perreq(P.twins[0], torch.zeros((2, 4, 2), dtype=torch.int64), torch.ones(2, dtype=torch.int64), LAY.mirror_lo)
+
+
+# ===========================================================================
+# VS: the verify call's per-request lengths
+# ===========================================================================
+def test_VS1_build_varlen_args_takes_per_request_lengths_and_refuses_a_wrong_one():
+    pos = [9 * BS + 61, 10 * BS + 3]
+    B, U = 2, 3
+    n_max = max(pos) + 2 * BS
+    P = Uni(pos, [0, 1], 61, n_max, perreq=True)
+    e, t, ctx, st = P.engines[0], P.twins[0], P.ctx, P.store
+    ctx.begin_round(P.view)
+    ctx.was_inflight = torch.zeros_like(st.state, dtype=torch.bool)
+    g = _g(61)
+    k, v, c = _ints((B, U, H, D), g), _ints((B, U, H, D), g), _ints((B, U, H), g)
+    for w in range(U):
+        t.step(k[:, w], c[:, w])
+    sel = torch.stack([torch.stack([_sel(g, (p + w) // BS) for p in pos], 1) for w in range(U)])
+    _, _, _, rnd = e.spec_round_update_perreq(k, v, t.total_cis, sel, ctx, 0)
+    want = [LAY.mirror_hi * BS + (pos[0] + U) % BS, LAY.mirror_lo * BS + (pos[1] + U) % BS]   # request 0 rolled over
+    assert rnd.seqused_k.dtype == torch.int32 and rnd.seqused_k.tolist() == want
+    q = _ints((B * U, 4, D), g).to(EDT)
+    a = vs.build_varlen_args(q, e._k_gpu, e._v_gpu, e._kv_bias_gpu, rnd)
+    assert a.seqused_k.tolist() == want
+    with pytest.raises(ValueError):
+        vs.build_varlen_args(q, e._k_gpu, e._v_gpu, e._kv_bias_gpu, rnd._replace(seqused_k=rnd.seqused_k + torch.tensor([0, 1], dtype=torch.int32)))
+    bad_tail = rnd.tail._replace(seqused_k=torch.tensor([U - 1, want[1]]))
+    with pytest.raises(ValueError):                        # a length below U, even when the call agrees with it
+        vs.build_varlen_args(q, e._k_gpu, e._v_gpu, e._kv_bias_gpu, rnd._replace(tail=bad_tail, seqused_k=torch.tensor([U - 1, want[1]], dtype=torch.int32)))
+    # the lockstep path: an int length, unchanged
+    lock_tail = types.SimpleNamespace(seqused_k=want[1])
+    ok = rnd._replace(tail=lock_tail, seqused_k=torch.full((B,), want[1], dtype=torch.int32))
+    vs.build_varlen_args(q, e._k_gpu, e._v_gpu, e._kv_bias_gpu, ok)
+    with pytest.raises(ValueError):
+        vs.build_varlen_args(q, e._k_gpu, e._v_gpu, e._kv_bias_gpu, ok._replace(seqused_k=torch.tensor(want, dtype=torch.int32)))
+
+
+# ===========================================================================
+# MP: the model module on CPU
+# ===========================================================================
+def _shipped_ref_module():
+    return _load(ROOT / "tests/test_r2_positional_twin.py", "nosi_r2_twin_suite_for_bridge")
+
+
+def _fake_layer(ref):
+    return types.SimpleNamespace(cached_compressed_max_seqlen=ref.ck_max, compress_k_cache_varlen=ref.ck,
+                                 no_compress_k_len=ref.nck_len, no_compress_k_cache=ref.nck,
+                                 compressed_cis=ref.compressed_cis, comp_cis_len=ref.comp_cis_len,
+                                 total_cis=ref.total_cis, cis_len=ref.cis_len)
+
+
+@pytest.mark.parametrize("S,steps", [(16 * 40, 1), (16 * 40 + 1, 1), (16 * 40 + 7, 1), (16 * 40, 3)])
+def test_MP1_bridge_equals_the_twin_after_the_shipped_prefill_and_steps(S, steps):
+    suite = _shipped_ref_module()
+    B = 3
+    g = _g(71, S, steps)
+    keys, cis = _ints((B, S, H, D), g), _ints((B, S, H), g)
+    ref = suite.ShippedRef(keys, cis, f2_as_shipped=True)                  # the shipped tables, the shipped F2 line
+    want = twin_mod.PositionalTwin(B, H, D, lk_max=80, n_max=S + 64)
+    for b in range(B):
+        want.prefill(b, keys[b], cis[b])
+    for s in range(steps):
+        k1, c1 = _ints((B, H, D), g), _ints((B, H), g)
+        ref.decode_step(k1, c1)
+        want.step(k1, c1)
+    got = twin_mod.PositionalTwin(B, H, D, lk_max=80, n_max=S + 64)
+    spm.bridge_layer_at(got, _fake_layer(ref), S + steps)
+    for b in range(B):
+        suite._assert_request_equal(got, b, want, b, "bridge S=%d steps=%d request %d" % (S, steps, b))
+
+
+def test_MP1b_bridge_refuses_an_F2_short_table_and_a_wrong_length_and_copies_nothing():
+    suite = _shipped_ref_module()
+    B, S = 2, 16 * 40 + 15                                   # the warm-up step completes a cis window: F2 drops it
+    g = _g(72)
+    keys, cis = _ints((B, S, H, D), g), _ints((B, S, H), g)
+    ref = suite.ShippedRef(keys, cis, f2_as_shipped=True)
+    ref.decode_step(_ints((B, H, D), g), _ints((B, H), g))
+    got = twin_mod.PositionalTwin(B, H, D, lk_max=80, n_max=S + 64)
+    with pytest.raises(spm.PerReqModelError):
+        spm.bridge_layer_at(got, _fake_layer(ref), S + 1)
+    with pytest.raises(spm.PerReqModelError):
+        spm.bridge_layer_at(got, _fake_layer(ref), S + 2)
+    assert int(got.pos.abs().sum()) == 0 and float(got.comp_k.abs().sum()) == 0.0 and not bool(got.prefilled.any())
+    ok = suite.ShippedRef(keys, cis, f2_as_shipped=False)    # the intended table (the summary appended): accepted
+    ok.decode_step(_ints((B, H, D), _g(73)), _ints((B, H), _g(73)))
+    lay = _fake_layer(ok)
+    lay.comp_cis_len = int(ok.compressed_cis.shape[-1])       # the counter of a table that grows with it
+    spm.bridge_layer_at(got, lay, S + 1)
+    assert got.n_ccis.tolist() == [spm.complete_windows(S + 1)] * B
+
+
+def _stage1_stub(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, seqused_k=None):
+    """A torch stage 1 with the op's output contract: (Hkv, total_q, round128(max_seqlen_k)); request b's columns
+    >= seqused_k[b] are zero (the op's zero fill)."""
+    B = cu_seqlens_q.numel() - 1
+    Hq, Hkv = q.shape[1], k.shape[1]
+    grp = Hq // Hkv
+    N = (max_seqlen_k + 127) // 128 * 128
+    out = torch.zeros((Hkv, B, N), dtype=q.dtype)
+    for b in range(B):
+        kb = k[int(cu_seqlens_k[b]):int(cu_seqlens_k[b]) + max_seqlen_k]                 # (Lk, Hkv, D)
+        for h in range(Hkv):
+            s = (q[b, h * grp:(h + 1) * grp].unsqueeze(1) * kb[:, h].unsqueeze(0)).sum(-1).sum(0)   # (Lk,)
+            n = int(seqused_k[b])
+            out[h, b, :n] = s[:n]
+    return out
+
+
+def _pool_stub(q_score, cis_score, n_comp, M_b, q_out, c_out, stride, block_size, local_blocks, init_blocks):
+    N = q_score.shape[-1]
+    cis = torch.zeros_like(q_score)
+    cis[..., :cis_score.shape[-1]] = cis_score
+    a, b = mp.pool_reference(q_score, cis, n_comp, M_b, q_out.shape[-1], init_blocks=init_blocks, local_blocks=local_blocks)
+    q_out.copy_(a)
+    c_out.copy_(b)
+
+
+def test_MP2_score_position_on_a_ragged_batch_equals_B1_scoring():
+    pos = [9 * BS + 61, 10 * BS + 3, 9 * BS + 40]
+    B, Hq = len(pos), 4
+    n_max = max(pos) + 2 * BS
+    twins = [_tables(pos, list(range(B)), 81, 0, n_max)]
+    st = spm.PerReqState(twins, [None], 4, 6, n_max // BS + 2, torch.float32, "cpu")
+    singles = [spm.PerReqState([_tables([pos[b]], [b], 81, 0, n_max)], [None], 4, 6, n_max // BS + 2, torch.float32, "cpu")
+               for b in range(B)]
+    g = _g(81)
+    for step in range(3):
+        q, k, c = _ints((B, Hq, D), g), _ints((B, H, D), g), _ints((B, H), g)
+        before = twins[0].pos.clone()
+        sel = spm.score_position(st, 0, q, k, c, 16, 32, 2, 1, stage1=_stage1_stub, pool=_pool_stub)
+        assert torch.equal(twins[0].pos, before + 1)
+        for b in range(B):
+            s1 = spm.score_position(singles[b], 0, q[b:b + 1], k[b:b + 1], c[b:b + 1], 16, 32, 2, 1, stage1=_stage1_stub, pool=_pool_stub)
+            assert torch.equal(sel[:, b].sort(-1).values, s1[:, 0].sort(-1).values), (step, b)
+            T, Mb = int(before[b]) // BS, int(before[b]) // BS + 1
+            ids = set(sel[:, b].flatten().tolist())
+            assert T in ids and 0 in ids and max(ids) < Mb, (step, b, sorted(ids))   # the local window and block 0 forced
+            suite_eq = [int(getattr(twins[0], n)[b]) == int(getattr(singles[b].twins[0], n)[0]) for n in ("pos", "n_comp", "n_ccis")]
+            assert all(suite_eq)
+
+
+def _probe_universe(seed):
+    pos = [9 * BS + 61, 10 * BS + 3, 9 * BS + 63, 11 * BS + 0]
+    B, K, NL = 4, 3, 2
+    n_max = max(pos) + 4 * (K + 1) + 2 * BS
+    return Uni(pos, list(range(B)), seed, n_max, perreq=True, NL=NL), pos, K
+
+
+def test_MP3_the_per_request_rollback_probe_passes_after_a_round_and_its_controls_fail(monkeypatch):
+    u, pos, K = _probe_universe(91)
+    U = K + 1
+    nacc = [0, 3, 1, 2]                         # keep 1 (undo, 1 row restored), 4, 2 (kept fill), 3
+    snap = spm.ProbeSnapshot(u.view, u.state, LAY, U).take()
+    rec = _round_perreq(u, _inputs(91, 0, list(range(4)), u.pos(), K, nacc, u.NL))
+    keep = rec["keep"]
+    assert keep.tolist() == [1, 4, 2, 3] and bool(rec["tr"][0]["undo"][0]) and int(rec["tr"][0]["restored"][0]) == 1
+    pr = spm.probe(u.view, u.state, snap, keep, U, LAY)
+    assert pr["passed"] and pr["same"] and pr["control_differs"] and pr["replay_deterministic"], pr
+    assert pr["control_keep"][0] == 2
+    # CONTROL 1: a corrupted committed tail row is caught
+    u2, _, _ = _probe_universe(91)
+    snap2 = spm.ProbeSnapshot(u2.view, u2.state, LAY, U).take()
+    rec2 = _round_perreq(u2, _inputs(91, 0, list(range(4)), u2.pos(), K, nacc, u2.NL))
+    u2.engines[0]._k_gpu[1, LAY.tail_slot * BS + 2] += 1                            # request 1 holds rows [0, 7) of its tail
+    pr2 = spm.probe(u2.view, u2.state, snap2, rec2["keep"], U, LAY)
+    assert not pr2["same"] and pr2["detail"] == "layer 0 request 1 k_tail differs", pr2
+    # CONTROL 2: a round without the masked restore is caught at the request whose fill it undid
+    u3, _, _ = _probe_universe(91)
+    snap3 = spm.ProbeSnapshot(u3.view, u3.state, LAY, U).take()
+    monkeypatch.setattr(sl, "_masked_tail_restore", lambda *a, **k: None)
+    rec3 = _round_perreq(u3, _inputs(91, 0, list(range(4)), u3.pos(), K, nacc, u3.NL))
+    monkeypatch.undo()
+    pr3 = spm.probe(u3.view, u3.state, snap3, rec3["keep"], U, LAY)
+    assert not pr3["same"] and pr3["detail"].startswith("layer 0 request 0 ") and "_tail" in pr3["detail"], pr3
+
+
+# ===========================================================================
+# PL: the pilot's host side
+# ===========================================================================
+def test_PL1_perreq_keep_and_the_loop_bookkeeping():
+    assert pilot.perreq_keep(torch.tensor([3, 1, 2]), torch.tensor([False, True, False]), torch.tensor([False, False, True])).tolist() == [3, 0, 0]
+    t0, t1 = torch.tensor([[10], [20], [30]]), torch.tensor([[11], [21], [31]])
+    lp = pilot.PerReqLoop(t0, t1, total=5, K=2)
+    assert lp.next_K() == 2 and not lp.finished()
+    com = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+    lp.after_round(2, torch.tensor([3, 1, 2]), torch.zeros(3, dtype=torch.bool), com)
+    assert lp.n_comm.tolist() == [4, 2, 3] and lp.seqs[0] == [10, 11, 1, 2, 3] and lp.seqs[1] == [20, 21, 4]
+    bad = torch.tensor([False, True, False])
+    keep = pilot.perreq_keep(torch.tensor([3, 2, 1]), lp.done(), bad)
+    lp.after_round(2, keep, bad, com)
+    assert keep.tolist() == [3, 0, 1] and lp.n_comm.tolist() == [7, 2, 4] and lp.done().tolist() == [True, False, False]
+    assert lp.next_K() == 0                                               # the fallback round after an overflow
+    keep = pilot.perreq_keep(torch.tensor([1, 1, 1]), lp.done(), torch.zeros(3, dtype=torch.bool))
+    lp.after_round(0, keep, torch.zeros(3, dtype=torch.bool), com[:, :1])
+    assert keep.tolist() == [0, 1, 1] and lp.next_K() == 2 and lp.n_comm.tolist() == [7, 3, 5]
+    keep = pilot.perreq_keep(torch.tensor([3, 3, 3]), lp.done(), torch.zeros(3, dtype=torch.bool))
+    lp.after_round(2, keep, torch.zeros(3, dtype=torch.bool), com)
+    assert keep.tolist() == [0, 3, 0] and lp.finished() and lp.lengths() == [8, 7, 6]
+    assert lp.trimmed(6).tolist()[2] == [30, 31, 7, 8, 7, 7] and lp.padded().shape == (3, 8) and int(lp.padded()[2, 7]) == -1
+    with pytest.raises(ValueError):
+        lp.trimmed(7)
+    # refusals
+    lp2 = pilot.PerReqLoop(t0, t1, total=3, K=1, max_rounds=2)
+    with pytest.raises(RuntimeError):                                     # an overflowing request that commits
+        lp2.after_round(1, torch.tensor([1, 1, 1]), torch.tensor([True, False, False]), com)
+    with pytest.raises(RuntimeError):                                     # a K = 0 round that overflows
+        lp2.after_round(0, torch.tensor([0, 1, 1]), torch.tensor([True, False, False]), com[:, :1])
+    with pytest.raises(ValueError):                                       # more tokens than the round has
+        lp2.after_round(1, torch.tensor([3, 1, 1]), torch.zeros(3, dtype=torch.bool), com[:, :2])
+    lp2.after_round(1, torch.tensor([2, 2, 2]), torch.zeros(3, dtype=torch.bool), com)
+    with pytest.raises(RuntimeError):                                     # a finished request that commits
+        lp2.after_round(1, torch.tensor([1, 0, 0]), torch.zeros(3, dtype=torch.bool), com)
+    lp2.after_round(1, torch.tensor([0, 0, 0]), torch.zeros(3, dtype=torch.bool), com)
+    with pytest.raises(RuntimeError):                                     # the progress guard
+        lp2.next_K()
+
+
+def _round(K, keep, nacc, bad, done, vms=10.0):
+    return dict(K=K, keep=keep, n_acc=nacc, bad=bad, done_before=done, draft_ms=[1.0] * K, verify_ms=vms, rollback_ms=1.0,
+                verify_split={"total_ms": vms}, draft_split=[{"total_ms": 1.0}] * K)
+
+
+def test_PL2_aggregate_rounds_perreq_measures_the_yield():
+    F, T = False, True
+    rounds = [_round(2, [3, 1, 2], [2, 0, 1], [F, F, F], [F, F, F], vms=100.0),     # timing: excluded (first spec round)
+              _round(2, [2, 0, 3], [1, 2, 2], [F, T, F], [F, F, F], vms=10.0),
+              _round(0, [1, 1, 1], [0, 0, 0], [F, F, F], [F, F, F], vms=5.0),       # the fallback round
+              _round(2, [0, 3, 1], [2, 2, 0], [F, F, F], [T, F, F], vms=20.0)]      # request 0 finished
+    ag = pilot.aggregate_rounds_perreq(rounds)
+    assert (ag["rounds"], ag["spec_rounds"], ag["fallback_rounds"], ag["overflow_rounds"], ag["overflow_request_rounds"]) == (4, 3, 1, 1, 1)
+    assert ag["active_request_rounds"] == 11 and ag["committed_tokens"] == 3 + 1 + 2 + 2 + 0 + 3 + 1 + 1 + 1 + 3 + 1
+    assert ag["yield_measured_per_round"] == pytest.approx(18 / 11)
+    assert ag["yield_measured_spec_rounds"] == pytest.approx((6 + 5 + 4) / 8)
+    assert ag["n_acc_mean_per_request"] == pytest.approx((2 + 0 + 1 + 1 + 2 + 2 + 0) / 7)
+    assert ag["yield_lockstep_equivalent_per_round"] == pytest.approx(((1 + 0) + (1 + 1) + (1 + 0)) / 3)
+    assert ag["verify_ms"] == pytest.approx(15.0) and ag["draft_step_ms"] == pytest.approx(1.0)
+
+
+def _payload(seq_spec, overflow_rounds=0, probe_passed=True):
+    B, n = seq_spec.shape
+    ship = torch.arange(B * n).view(B, n) % 97
+    margins = torch.full((B, n - 1), 5.0)
+    margins[1, 2] = 0.1                                       # a near tie at request 1, position 3
+    agg = dict(rounds=4, spec_rounds=3, fallback_rounds=overflow_rounds, overflow_rounds=overflow_rounds,
+               overflow_request_rounds=overflow_rounds, yield_measured_per_round=1.8, yield_measured_spec_rounds=2.0,
+               yield_lockstep_equivalent_per_round=1.2, n_acc_mean_per_request=1.0, verify_split={}, draft_split={})
+    probe = dict(round=3, keep=[1, 2], U=3, same=probe_passed, detail="equal", control_keep=[2, 2], control_differs=True,
+                 control_detail="layer 0 request 0 pos 1 vs 2", replay_deterministic=True, passed=probe_passed)
+    cell = dict(commit="perreq", K=2, U=3, W=128, R=62, tokens=n - 1, tokens_per_request=[n - 1] * B, seq=seq_spec, probe=probe,
+                agg=agg, counters={}, wire=dict(wire_bytes=10 ** 6, late_bytes=10 ** 5, prefetch_bytes=9 * 10 ** 5, wasted_bytes=0),
+                timely_recall=0.5, host_syncs=7, committed_tokens_after_warmup=10, tok_s_after_warmup=100.0, wall_s_after_warmup=0.1,
+                peak_gb=1.0, reserved_gb=1.0)
+    arm = dict(seq=ship, margins=margins, tokens=n - 1, tok_s_after_warmup=50.0, peak_gb=1.0, reserved_gb=1.0)
+    return dict(L=16128, batch=B, distinct_docs=2, docs=[1, 2], arms=dict(shipped=arm), cells=dict(K2=cell),
+                engine_knobs=dict(NOSI_POOL_BLOCKS=0, NOSI_ATTN_SPLITS=4), host_pinned_gb=1.0, schedule="s",
+                overlap_evidence={}, custom_kernels="none", commit="perreq"), ship
+
+
+def test_PL3_the_report_gates_a_per_request_cell(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setattr(pilot, "OUT", str(tmp_path))
+    monkeypatch.setenv("NOSI_SPEC_TAU_CTRL", "0.4844")
+    p, ship = _payload(torch.zeros((2, 6), dtype=torch.int64))
+    p["cells"]["K2"]["seq"] = ship.clone()
+    torch.save(p, str(tmp_path / "spec_sperreqb2d2.pt"))
+    assert pilot.report() == 0
+    js = json.loads((tmp_path / "spec_loop.json").read_text())
+    g = js["gates"]
+    assert g["identity[spec_sperreqb2d2/K2 vs spec_sperreqb2d2]"]["passed"] and g["rollback-probe[spec_sperreqb2d2/K2]"]["passed"]
+    assert g["overflow[spec_sperreqb2d2/K2]"]["passed"] and "spec_sperreqb2d2/K2" in js["perreq_cells"] and js["cells"] == {}
+    assert "per-request cells" in (tmp_path / "spec_loop.md").read_text()
+    # a near-tie mismatch, an overflow, a failed probe: three failed gates, the near tie recorded as the expected failure
+    for f in tmp_path.iterdir():
+        f.unlink()
+    p, ship = _payload(torch.zeros((2, 6), dtype=torch.int64), overflow_rounds=2, probe_passed=False)
+    seq = ship.clone()
+    seq[1, 3] += 1
+    p["cells"]["K2"]["seq"] = seq
+    torch.save(p, str(tmp_path / "spec_sperreqb2d2.pt"))
+    assert pilot.report() == 3
+    g = json.loads((tmp_path / "spec_loop.json").read_text())["gates"]
+    idg = g["identity[spec_sperreqb2d2/K2 vs spec_sperreqb2d2]"]
+    assert not idg["passed"] and "near-tie 1, above tol 0" in idg["detail"] and "expected until the bit-exact verifier lands" in idg["detail"]
+    assert not g["overflow[spec_sperreqb2d2/K2]"]["passed"] and "2 K = 0 fallback rounds" in g["overflow[spec_sperreqb2d2/K2]"]["detail"]
+    assert not g["rollback-probe[spec_sperreqb2d2/K2]"]["passed"] and "per request" in g["rollback-probe[spec_sperreqb2d2/K2]"]["detail"]
+    # a mismatch above the tolerance is NOT the expected failure
+    cl = pilot.classify_mismatches(dict(mismatches=[dict(ref_margin=9.0)]), 1.9)
+    assert "NOT the expected" in pilot.perreq_identity_note(dict(passed=False), cl)
+
+
+# ===========================================================================
+# ST / PIN: the step script and the wiring
+# ===========================================================================
+def test_ST1_the_step_script_has_the_per_request_cells():
+    src = STEP.read_text()
+    assert subprocess.run(["bash", "-n", str(STEP)]).returncode == 0
+    assert "spec_perreq) MODE=spec R=$R_SLOTS COMMIT=perreq STEP_MIN=120 TAG=sperreqb${B}d${D} ;;" in src
+    assert "probe_perreq) MODE=spec R=$R_SLOTS COMMIT=perreq PROBE=1 KL=2 STEP_MIN=60 TAG=pperreqb${B}d${D} ;;" in src
+    for old in ("ref) MODE=decode_ref R=0 STEP_MIN=40 TAG=refb${B}d${D} ;;", "spec) MODE=spec R=$R_SLOTS STEP_MIN=90 TAG=specb${B}d${D} ;;",
+                "probe) MODE=spec R=$R_SLOTS PROBE=1 KL=2 STEP_MIN=60 TAG=probeb${B}d${D} ;;"):
+        assert old in src, old                             # the milestone-1 cells keep their tags (TAG=${kind}b${B}d${D} before)
+    assert "--env NOSI_SPEC_COMMIT=$COMMIT)" in src and "COMMIT=lockstep" in src
+    assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-perreq " in src
+
+
+def _bodies(src, cls_name):
+    tree = ast.parse(src)
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls_name)
+    return {n.name: ast.get_source_segment(src, n) for n in cls.body if isinstance(n, ast.FunctionDef)}
+
+
+def test_PIN1_the_engine_model_and_module_wiring():
+    e = SRC_ENGINE
+    order = [e.index("    def spec_rollback_tail("), e.index("    def spec_draft_update_perreq("), e.index("    def spec_round_update_perreq("),
+             e.index("    def spec_commit_perreq("), e.index("    def decode_update_has_kv_bias(self,")]
+    assert order == sorted(order)
+    for name, needs in (("spec_draft_update_perreq", ("_sl.draft_tail_write_perreq(", "_sl.plan_draft_perreq(", "_sl.apply_draft_bias_perreq(")),
+                        ("spec_round_update_perreq", ("_sl.write_tail_perreq(", "_sl.plan_round_perreq(", "_sl.isolate_bad_streams(", "ctx.round_bad |= bad.any(0)")),
+                        ("spec_commit_perreq", ("_sl.commit_layer_perreq(",))):
+        src = _method_src(name)
+        assert "diff.diff_offload" not in src and "raise _vs.RoundOverflow" not in src
+        for s in needs:
+            assert s in src, (name, s)
+    lb = _bodies(SRC_LLAMA, "Llama")
+    for name, call in (("draft_inference_perreq", "_spm.draft_inference("), ("spec_verify_inference_perreq", "_spm.spec_verify_inference("),
+                       ("spec_rollback_perreq", "_spm.spec_rollback(")):
+        assert "from . import spec_perreq_model as _spm" in lb[name] and call in lb[name], name
+    rb = lb["spec_rollback"]                               # the lockstep rollback is the pinned one
+    assert rb.count("spec_rollback_tail(keep, mirror_lo)") == 1 and "ctx.journals[l].replay(" in rb
+    tree = ast.parse(SRC_SPM)
+    fns = {n.name: ast.get_source_segment(SRC_SPM, n) for n in tree.body if isinstance(n, ast.FunctionDef)}
+    d, v = fns["draft_layer"], fns["verify_layer"]
+    assert d.count("spec_draft_update_perreq(") == 1 and d.count("flash_attn_nosa_with_kvcache(") == 1 and "num_splits=NL._ATTN_SPLITS" in d
+    assert v.count("spec_round_update_perreq(") == 1 and v.count("verify_attention(") == 1 and "st.ctrs[l] = torch.stack(ctr)" in v
+    for node in tree.body:                                 # the GPU modules are imported only inside the forwards
+        if isinstance(node, ast.ImportFrom):
+            assert node.module not in ("nosa_llama", "cache_engine"), node.module
+    assert pilot.COMMIT == "lockstep"                      # the default
+
+
+def test_PIN2_spec_loop_still_imports_only_torch_typing_and_collections():
+    tree = ast.parse((ROOT / "nosi/nosi/spec_loop.py").read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                assert a.name.split(".")[0] in ("torch", "typing", "collections"), a.name
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0 and node.module.split(".")[0] in ("torch", "typing", "collections", "__future__"), node.module

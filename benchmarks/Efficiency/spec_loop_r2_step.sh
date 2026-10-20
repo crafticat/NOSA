@@ -23,6 +23,15 @@
 #   probe:<B>:<D>  spec with NOSI_SPEC_PROBE=1 (round 3) and K 2 only: THE ROLLBACK PROBE of the pilot's docstring
 #                  (the post-round engine state torch.equal to a fresh replay of the c committed tokens from the
 #                  round-start snapshot, with the positive control: a replay of another length differs).
+#   spec_perreq:<B>:<D>   (R2 milestone 2) spec with NOSI_SPEC_COMMIT=perreq: the in-process shipped arm, then per K
+#                  in K_LIST the PER-REQUEST loop (keep(b) = 1 + n_acc(b); tables bridged after the shipped warm-up
+#                  step; no re-warm; a finished request stops committing; an overflowing request commits nothing and
+#                  the next round is K = 0): the MEASURED per-request yield. The report gates it like a spec cell:
+#                  identity with the near-tie classification (expected to fail at near ties as the lockstep cells
+#                  do until the bit-exact verifier lands; the report records it), overflow 0.
+#   probe_perreq:<B>:<D>  spec_perreq with NOSI_SPEC_PROBE=1 (the 3rd round with K > 0) and K 2 only: the rollback
+#                  probe in per-request form (the post-round state torch.equal to a fresh replay of keep(b) tokens
+#                  per request from the round-start snapshot; control: one request's keep changed by one differs).
 #   report         NOSI_SPEC_MODE report over the run's .pt files (exit = failed gates): the SEQUENCE IDENTITY gate
 #                  (every spec cell and every shipped_ref arm torch.equal to the shipped arm of the same (L, batch,
 #                  distinct, documents) over the compared tokens; a mismatch is classified by the shipped top-2 margin
@@ -33,6 +42,8 @@
 # REGISTERED ORDER (the lead runs the cells one invocation at a time; a STOP rule is binding):
 #   gates   ref:64:2, spec:64:2, probe:64:2, report  -> every gate PASS, else milestone 1 STOPS (no timing is reported)
 #   timing  ref:64:64, spec:64:64, ref:128:2, spec:128:2, ref:128:128, spec:128:128, report
+#   per-request (R2 milestone 2, a new run id): spec_perreq:64:2, probe_perreq:64:2, report; then spec_perreq:64:64,
+#           spec_perreq:128:128, report (the shipped arm of each cell is in its own payload)
 # OUTPUTS (per run: OUTROOT/r2m1_<run>_<holder>/): decode_ref_<tag>.pt / spec_<tag>.pt (frozen after their step): the
 # arms' committed sequences, per-round records (rounds[r].n_acc = the per-request ACCEPTED LENGTHS of round r, c, the
 # re-warm rounds, the timing brackets), the committed tok/s (after warm-up and over the window after 64 tokens), the
@@ -48,7 +59,7 @@
 # one GPU; 124 / 137 the host timeout); 1 a STOP before the launch; 5 an exit-0 step whose record is incomplete or whose
 # sacct row is not COMPLETED 0:0.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2                                                          # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-perreq                                                   # ROOT (feature/nosi-r2-perreq)
 GPU_UUID=f31fc723-9dfe-407a-9947-28173556232a                                            # PIN (holder 2188818)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -62,29 +73,31 @@ L=16128 TOTAL=112 GATE=64 R_SLOTS=62 SPLITS=4 TAU=0.4844 K_LIST="1 2 3"
 MIN_LEFT=7200
 main() {
 stop() { echo "R2 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: spec_loop_r2_step.sh --nosi <sha> <holder> <run id> <ref:B:D|spec:B:D|probe:B:D|report>" >&2; exit 2; }
+usage() { echo "usage: spec_loop_r2_step.sh --nosi <sha> <holder> <run id> <ref:B:D|spec:B:D|probe:B:D|spec_perreq:B:D|probe_perreq:B:D|report>" >&2; exit 2; }
 [ $# = 5 ] && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4 CELL=$5
 DRY=${DRYRUN:-0}
 [[ $NSHA =~ ^[0-9a-f]{40}$ ]] || stop "--nosi '$NSHA' is not a full commit id"
 case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
 [[ $RUN =~ ^[a-z0-9]{1,16}$ ]] || stop "run id '$RUN' (1-16 of a-z 0-9)"
-MODE= B=0 D=0 R=0 PROBE=0 KL=$K_LIST
+MODE= B=0 D=0 R=0 PROBE=0 KL=$K_LIST COMMIT=lockstep
 case $CELL in
     report) MODE=report STEP_MIN=15 TAG=report ;;
-    ref:*:*|spec:*:*|probe:*:*)
+    ref:*:*|spec:*:*|probe:*:*|spec_perreq:*:*|probe_perreq:*:*)
         kind=${CELL%%:*} rest=${CELL#*:}
         B=${rest%%:*} D=${rest#*:}
         case $B in 64|128) ;; *) stop "batch '$B' (64 or 128)" ;; esac
         [ "$D" = 2 ] || [ "$D" = "$B" ] || stop "distinct '$D' (2 or the batch $B)"
-        TAG=${kind}b${B}d${D}
         case $kind in
-            ref) MODE=decode_ref R=0 STEP_MIN=40 ;;
-            spec) MODE=spec R=$R_SLOTS STEP_MIN=90 ;;
-            probe) MODE=spec R=$R_SLOTS PROBE=1 KL=2 STEP_MIN=60 ;;
+            ref) MODE=decode_ref R=0 STEP_MIN=40 TAG=refb${B}d${D} ;;
+            spec) MODE=spec R=$R_SLOTS STEP_MIN=90 TAG=specb${B}d${D} ;;
+            probe) MODE=spec R=$R_SLOTS PROBE=1 KL=2 STEP_MIN=60 TAG=probeb${B}d${D} ;;
+            spec_perreq) MODE=spec R=$R_SLOTS COMMIT=perreq STEP_MIN=120 TAG=sperreqb${B}d${D} ;;
+            probe_perreq) MODE=spec R=$R_SLOTS COMMIT=perreq PROBE=1 KL=2 STEP_MIN=60 TAG=pperreqb${B}d${D} ;;
         esac ;;
     *) stop "cell '$CELL'" ;;
 esac
+[ $((STEP_MIN * 60 + 600)) -le "$MIN_LEFT" ] || MIN_LEFT=$((STEP_MIN * 60 + 600))      # a longer step needs a longer holder
 for v in $(compgen -e); do case $v in SLURM_*|SRUN_*|SALLOC_*|SBATCH_*) stop "the environment exports $v" ;; esac; done
 [ "$(git -C "$NOSI" rev-parse HEAD)" = "$NSHA" ] || stop "$NOSI HEAD is not $NSHA"
 [ -z "$(git -C "$NOSI" status --porcelain --untracked-files=no)" ] || stop "$NOSI has tracked changes"
@@ -107,7 +120,7 @@ ENVS=(--env PYTHONPATH="$NOSI/nosi" --env PYTHONDONTWRITEBYTECODE=1 --env HF_HUB
       --env NOSI_SPEC_OUT="$OUT" --env NOSI_SPEC_MODE=$MODE --env NOSI_SPEC_TAG=$TAG --env NOSI_SPEC_L=$L
       --env NOSI_SPEC_DOCS=$B --env NOSI_SPEC_DISTINCT=$D --env NOSI_SPEC_GATE_TOKENS=$GATE
       --env NOSI_SPEC_TOTAL_TOKENS=$TOTAL --env NOSI_SPEC_K_LIST="$KL" --env NOSI_SPEC_PROBE=$PROBE
-      --env NOSI_SPEC_PROBE_ROUND=3 --env NOSI_SPEC_TAU_CTRL=$TAU)
+      --env NOSI_SPEC_PROBE_ROUND=3 --env NOSI_SPEC_TAU_CTRL=$TAU --env NOSI_SPEC_COMMIT=$COMMIT)
 CHILD='case "${CUDA_VISIBLE_DEVICES:-}" in
     ""|*,*) echo "R2 child: CUDA_VISIBLE_DEVICES must name exactly one GPU (is \"${CUDA_VISIBLE_DEVICES:-}\")" >&2
             exit 4 ;;

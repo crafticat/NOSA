@@ -635,6 +635,112 @@ class CacheEngine:
         self._spec_round_tail = None
         return _sl.truncate_tail(self, tail, keep, mirror_lo)
 
+    # -----------------------------------------------------------------------
+    # retroinfer-eval fork, R2 milestone 2: the PER-REQUEST forms of the three
+    # spec methods above (spec_loop.py, section PER-REQUEST ROUNDS; the
+    # pilot's NOSI_SPEC_COMMIT=perreq; the model side is spec_perreq_model.py).
+    # The engine holds one counter per request, self._pos (B,), set by
+    # spec_loop.to_perreq, which also sets seq_length and
+    # _tail_block_len_on_gpu to None: the lockstep methods above refuse such an
+    # engine, and these refuse a lockstep one. ctx is a
+    # spec_loop.PerReqSpecContext. The lockstep methods are unchanged.
+    # -----------------------------------------------------------------------
+    def spec_draft_update_perreq(self, key_states, value_states, kv_bias, topk_idx, ctx, layer_idx):
+        """spec_draft_update per request: (A) spec_loop.draft_tail_write_perreq
+        (each request writes at its own position; after ITS rollover into
+        mirror W-1), (B) plan_draft_perreq (T_b, rolled_b, forbid_ge = T_b),
+        (C) the same side-stream gathers as spec_draft_update, (D)
+        apply_draft_bias_perreq (the tail / mirror row limits per request).
+        key_states / value_states (B, 1, H, D). Returns the whole allocation,
+        the masked bias scratch and cache_seqlens = W * block_size."""
+        B, S, H, D = key_states.shape
+        assert S == 1 and H == self.head_num and D == self.head_dim, (tuple(key_states.shape), self.head_num, self.head_dim)
+        assert self.verify_round_slots > 0 and self.pool_blocks == 0, "the loop needs NOSI_VERIFY_ROUND_SLOTS > 0 and no victim pool"
+        assert self.seq_length is None and getattr(self, "_pos", None) is not None, "a per-request engine (spec_loop.to_perreq) is needed"
+        st = ctx.store
+        lay = st.lay
+        assert lay.W * self.block_size == self._k_gpu.shape[1] and lay.tail_slot == self._tail_block_idx_on_gpu, (lay, tuple(self._k_gpu.shape))
+        assert topk_idx.dtype == torch.int64 and tuple(topk_idx.shape[:2]) == (H, B), (topk_idx.dtype, tuple(topk_idx.shape))
+        # A. the tail write, per request
+        _sl.draft_tail_write_perreq(self, key_states, value_states, _bias_rows(kv_bias), lay.mirror_hi, ctx.tail_id)
+        tail_len, rolled = _sl.draft_tail_state(self._pos, ctx.tail_id, self.block_size)
+        ctx.rolled[layer_idx] = rolled
+        ctx.mark("tail_end")
+        # B. the plan, per request
+        plan = _sl.plan_draft_perreq(st, layer_idx, topk_idx, ctx.tail_id, rolled, ctx.next_gen(), ctx.tick, ctx.tail_id)
+        ctx.mark("plan_end")
+        # C. the prefetch on the side stream (as spec_draft_update)
+        ev_main = ctx.make_event()
+        ev_main.record(ctx.current_stream())
+        with ctx.on_side():
+            ctx.side.wait_event(ev_main)
+            flash_h2d_from_mask(self._k_gpu, self._k_cpu, plan.issue, self.block_size)
+            flash_h2d_from_mask_bias(self._v_gpu, self._v_cpu, self._kv_bias_gpu, kv_bias, plan.issue, self.block_size)
+            ev_side = ctx.make_event()
+            ev_side.record(ctx.side)
+        ctx.queue.push(ctx.gen, ev_side)
+        # D. the bias the draft attends with, per request
+        scratch, deny_buf = ctx.bias_scratch(layer_idx, self._kv_bias_gpu)
+        _sl.apply_draft_bias_perreq(scratch, self._kv_bias_gpu, plan.deny, deny_buf, lay, self.block_size, tail_len, rolled)
+        self._spec_last_draft = plan
+        return self._k_gpu, self._v_gpu, scratch, ctx.full_lengths(B, self._kv_bias_gpu.device)
+
+    def spec_round_update_perreq(self, key_states, value_states, kv_bias, sel, ctx, layer_idx):
+        """spec_round_update per request: the U tail writes and the mirror from
+        each request's round-start counter (spec_loop.write_tail_perreq), the
+        union with the live tail per request (plan_round_perreq), the late
+        gathers, and a VerifyRound whose tail and seqused_k (B,) are per
+        request. A stream whose union overflows or names an invalid id does NOT
+        stop the round (the lockstep method raises): spec_loop.isolate_bad_streams
+        gives it its store back, fetches nothing for it and gives its mask rows a
+        finite placeholder; ctx.round_bad marks its request, which commits
+        nothing this round (the per-request overflow fallback; the pilot then
+        runs one K = 0 round). One host sync, the overflow / invalid read, as
+        in spec_round_update."""
+        B, U, H, D = key_states.shape
+        assert H == self.head_num and D == self.head_dim and U >= 1, (tuple(key_states.shape), self.head_num, self.head_dim)
+        assert tuple(value_states.shape) == (B, U, H, D), (tuple(value_states.shape), (B, U, H, D))
+        assert self.verify_round_slots > 0 and self.pool_blocks == 0, "the loop needs NOSI_VERIFY_ROUND_SLOTS > 0 and no victim pool"
+        assert self.seq_length is None and getattr(self, "_pos", None) is not None, "a per-request engine (spec_loop.to_perreq) is needed"
+        assert sel.dtype == torch.int64 and sel.dim() == 4 and tuple(sel.shape[:3]) == (U, H, B), (sel.dtype, tuple(sel.shape))
+        st = ctx.store
+        lay = st.lay
+        lay_u = _us.union_layout(self.topk, self.pool_blocks, self.verify_round_slots)
+        assert (lay_u.W, lay_u.mirror_lo, lay_u.tail_slot) == (lay.W, lay.mirror_lo, lay.tail_slot), (lay_u, lay)
+        assert self._k_gpu.shape[1] == lay.W * self.block_size and self._tail_block_idx_on_gpu == lay.tail_slot
+        assert torch.equal(self._pos, ctx.tail0.pos), "the draft's counters were not restored before the verify"
+        tail = _sl.write_tail_perreq(self, key_states, value_states, _bias_rows(kv_bias), lay.mirror_lo)
+        self._spec_round_tail = tail
+        ctx.mark("tail_end")
+        before = _sl.store_layer_copy(st, layer_idx)
+        plan = _sl.plan_round_perreq(st, layer_idx, sel, tail.tail_id, tail.rollover_at, ctx.gen_round0, ctx.next_gen(), ctx.tick, ctx.was_inflight[layer_idx])
+        bad = plan.overflow | plan.invalid
+        ctx.host_syncs += 1
+        ctx.mark("host_sync")
+        if bool(bad.any()):
+            plan = _sl.isolate_bad_streams(st, layer_idx, plan, bad, before, lay)
+            ctx.round_bad |= bad.any(0)
+        ctx.mark("plan_end")
+        flash_h2d_from_mask(self._k_gpu, self._k_cpu, plan.fetch, self.block_size)
+        flash_h2d_from_mask_bias(self._v_gpu, self._v_cpu, self._kv_bias_gpu, kv_bias, plan.fetch, self.block_size)
+        self._spec_last_round = plan
+        seqused_k = tail.seqused_k.to(device=self._k_gpu.device, dtype=torch.int32).contiguous()
+        return self._k_gpu, self._v_gpu, self._kv_bias_gpu, _vs.VerifyRound(
+            union=plan, tail=tail, seqused_k=seqused_k, U=U, W=lay.W,
+            block_size=self.block_size, tail_slot=lay.tail_slot)
+
+    def spec_commit_perreq(self, tables, ctr, keep, mirror_lo):
+        """The per-request commit of this layer after the verify round
+        (spec_loop.commit_layer_perreq): the tables commit ctr[keep_b, :, b]
+        and the tail is truncated to keep_b (a counter reset plus one masked
+        copy). Every check runs before either side changes; the round is
+        consumed only by a commit that succeeded."""
+        tail = getattr(self, "_spec_round_tail", None)
+        assert tail is not None, "spec_commit_perreq without a round"
+        tr = _sl.commit_layer_perreq(self, tail, tables, ctr, keep, mirror_lo)
+        self._spec_round_tail = None
+        return tr
+
     def decode_update_has_kv_bias(self, key_states, value_states, kv_bias, topk_idx):
         # 将 key_states 和 value_states 放入 cache
         # key_states: (batch_size, seq_len, head_num, head_dim)

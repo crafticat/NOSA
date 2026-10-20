@@ -1393,6 +1393,42 @@ def plan_round_perreq(store: Store, l: int, sel: torch.Tensor, tail_id: torch.Te
                      n_late_wait=late_wait.sum(-1), n_late_fetch=fits.sum(-1), union_size=present2.sum(-1))
 
 
+STORE_FIELDS = ("ids", "state", "gen", "stamp", "used")
+
+
+def store_layer_copy(store: Store, l: int) -> dict:
+    """Layer l's store state and counters (clones): what isolate_bad_streams puts back."""
+    d = {n: getattr(store, n)[l].clone() for n in STORE_FIELDS}
+    d.update({n: getattr(store, n)[l].clone() for n in store.COUNTERS})
+    return d
+
+
+def isolate_bad_streams(store: Store, l: int, plan: RoundPlan, bad: torch.Tensor, before: dict,
+                        layout: StoreLayout) -> RoundPlan:
+    """THE PER-REQUEST OVERFLOW FALLBACK of one layer's round. ``bad`` (H, B) bool: the streams whose union overflowed
+    or named an invalid id (plan.overflow | plan.invalid). Every bad stream gets its store state and counters back
+    from ``before`` (store_layer_copy taken before plan_round_perreq: plan_round marks the slots it assigned RESIDENT
+    before the caller knows whether the round is refused), fetches nothing, and its mask rows name only mirror_lo (a
+    finite placeholder: block T's rows up to each query's causal limit, so attention stays finite; its request
+    commits nothing this round). The other streams are untouched. Returns the plan with the new mask, fetch and
+    union_size. Pure, per (h, b)."""
+    H, B = bad.shape
+    for n in STORE_FIELDS:
+        t = getattr(store, n)
+        t[l] = torch.where(bad.unsqueeze(-1), before[n], t[l])
+    for n in store.COUNTERS:
+        t = getattr(store, n)
+        t[l] = torch.where(bad, before[n], t[l])
+    K = plan.mask.shape[2]
+    U = plan.mask.shape[1] // B
+    m = plan.mask.view(H, B, U, K)
+    ph = torch.full_like(m, -1)
+    ph[..., 0] = layout.mirror_lo
+    mask = torch.where(bad.view(H, B, 1, 1), ph, m).reshape(H, B * U, K).contiguous()
+    fetch = torch.where(bad.unsqueeze(-1), torch.full_like(plan.fetch, -1), plan.fetch)
+    return plan._replace(mask=mask, fetch=fetch, union_size=(store.state[l] == RESIDENT).sum(-1))
+
+
 # -- accept and commit, per request --------------------------------------------
 class PerReqAccept(NamedTuple):
     n_acc: torch.Tensor       # (B,) accepted draft tokens per request
@@ -1510,6 +1546,9 @@ class PerReqSpecContext(SpecContext):
         self.rolled = [torch.zeros((B,), dtype=torch.bool, device=tc.pos.device) for _ in range(self.num_layers)]
         self.gen_round0 = self.gen + 1
         self.tables0 = tables0
+        # the requests whose union overflowed (or named an invalid id) on some layer this round
+        # (cache_engine.spec_round_update_perreq, isolate_bad_streams): they commit nothing this round
+        self.round_bad = torch.zeros((B,), dtype=torch.bool, device=tc.pos.device)
 
     def restore_before_verify(self, cache):
         """The draft's K steps undone: the tail counters (restore_tail_

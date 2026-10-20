@@ -83,8 +83,8 @@ class VerifyRound(NamedTuple):
     """What ``CacheEngine.verify_round_update`` hands to ``verify_attention``."""
 
     union: Any                  # union_store.UnionRound: mask (Hkv, B*U, K) int32, round_map, n_new, ...
-    tail: Any                   # tail_write.TailWriteResult: seqused_k, rollover_at, mirror rows, ...
-    seqused_k: torch.Tensor     # (B,) int32 on the engine's device (all requests roll together)
+    tail: Any                   # tail_write.TailWriteResult (seqused_k an int), or spec_loop.PerReqTail (seqused_k (B,))
+    seqused_k: torch.Tensor     # (B,) int32 on the engine's device (lockstep: one value; per-request rounds: per request)
     U: int
     W: int                      # slots in the allocation = _k_gpu.shape[1] // block_size
     block_size: int
@@ -155,12 +155,23 @@ def build_varlen_args(q, k_gpu, v_gpu, kv_bias_gpu, rnd: VerifyRound, mark=None)
         raise ValueError("seqused_k must be int32 contiguous (B=%d,), got %s %s" % (B, seqused_k.dtype, tuple(seqused_k.shape)))
     if seqused_k.device != k_gpu.device:
         raise ValueError("seqused_k must be on the allocation's device")
-    want = int(rnd.tail.seqused_k)
-    if not (U <= want <= W * bs):
-        raise ValueError("seqused_k=%d outside [U=%d, W*bs=%d]" % (want, U, W * bs))
+    tail_k = rnd.tail.seqused_k
+    if torch.is_tensor(tail_k):
+        # PER-REQUEST rounds (spec_loop.write_tail_perreq, R2 milestone 2): one length per request; its range is
+        # checked in the same host read as the equality below
+        want = tail_k.to(device=seqused_k.device, dtype=torch.int32)
+        if tuple(want.shape) != (B,):
+            raise ValueError("the per-request tail write's seqused_k must be (B=%d,), got %s" % (B, tuple(want.shape)))
+        bad_len = (seqused_k != want) | (want < U) | (want > W * bs)
+    else:
+        want = int(tail_k)
+        if not (U <= want <= W * bs):
+            raise ValueError("seqused_k=%d outside [U=%d, W*bs=%d]" % (want, U, W * bs))
+        bad_len = seqused_k != want
     if mark is not None: mark("host_sync")
-    if bool((seqused_k != want).any()):
-        raise ValueError("seqused_k must equal the tail write's %d on every request" % want)
+    if bool(bad_len.any()):
+        raise ValueError("seqused_k must equal the tail write's %s on every request (per request: within [U=%d, W*bs=%d])"
+                         % (want if isinstance(want, int) else want.tolist(), U, W * bs))
 
     total_k = B * W * bs
     k = k_gpu.view(total_k, Hkv, D)

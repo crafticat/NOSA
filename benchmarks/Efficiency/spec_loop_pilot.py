@@ -42,13 +42,27 @@ same batch composition, the same engine knobs):
              the overflow count, the tables and spec_loop.json.
              Exit code = failed gates.
 
-THE COMMIT IS LOCKSTEP (spec_loop.py, module docstring): the batch commits
-c = 1 + min_b n_acc(b) per round, exact for every request. The per-request
-n_acc is recorded so the ragged-engine yield (1 + mean n_acc) is reported
-beside it as a PROJECTION. NOSI_SPEC_DISTINCT limits the distinct documents
-in the batch (cycled, as the verify cost mode does): with 2 distinct
+THE COMMIT IS LOCKSTEP BY DEFAULT (spec_loop.py, module docstring): the batch
+commits c = 1 + min_b n_acc(b) per round, exact for every request. The
+per-request n_acc is recorded so the ragged-engine yield (1 + mean n_acc) is
+reported beside it as a PROJECTION. NOSI_SPEC_DISTINCT limits the distinct
+documents in the batch (cycled, as the verify cost mode does): with 2 distinct
 documents the lockstep yield is 1 + a^2 and the loop is not degenerate; with
 B distinct documents it is 1 + a^B.
+
+NOSI_SPEC_COMMIT=perreq (R2 milestone 2; default lockstep): the spec cells
+commit PER REQUEST, keep(b) = 1 + n_acc(b), and MEASURE the per-request yield
+(run_spec_arm_perreq). After the shipped warm-up step the layer tables are
+bridged into per-request tables (spec_perreq_model.PerReqState) and the engines
+take one counter per request (spec_loop.to_perreq); every round scores, drafts,
+verifies and commits per request (cache_engine.spec_*_perreq,
+nosa_llama.*_perreq). The committed sequences are ragged (a request that has
+its tokens stops committing; its row keeps its shape and its work is still
+done); a request whose union overflows commits nothing in that round and the
+next round is a K = 0 round for every request (the per-request overflow
+fallback). No re-warm: the scoring buffers cover the cell. The report gates a
+per-request cell as a lockstep one (identity with the near-tie classification,
+the rollback probe in per-request form, overflow 0).
 
 TOKEN BUDGET. The pooling buffers are sized at warm-up (nosa_llama.py
 decode_inference: out_len = ceil((L+1)/64)), so a run past the next 64-token
@@ -62,8 +76,8 @@ Environment: NOSI_MODEL_PATH, NOSI_PG19_PARQUET, NOSI_SPEC_OUT, NOSI_SPEC_MODE,
 NOSI_SPEC_TAG, NOSI_SPEC_L (16128), NOSI_SPEC_DOCS (= batch), NOSI_SPEC_DISTINCT
 (distinct documents, default = batch), NOSI_SPEC_GATE_TOKENS (64),
 NOSI_SPEC_TOTAL_TOKENS (112), NOSI_SPEC_K_LIST ("1 2"), NOSI_SPEC_PROBE (0),
-NOSI_SPEC_PROBE_ROUND (3), NOSI_SPEC_TAU_CTRL (report: the margin classifier,
-0.4844 at 16K; no default), NOSI_VERIFY_ROUND_SLOTS / NOSI_POOL_BLOCKS /
+NOSI_SPEC_PROBE_ROUND (3), NOSI_SPEC_COMMIT (lockstep | perreq), NOSI_SPEC_TAU_CTRL (report: the margin
+classifier, 0.4844 at 16K; no default), NOSI_VERIFY_ROUND_SLOTS / NOSI_POOL_BLOCKS /
 NOSI_ATTN_SPLITS (read by the engine at import; recorded in the provenance).
 """
 import hashlib
@@ -86,6 +100,7 @@ TOTAL_TOKENS = int(os.environ.get("NOSI_SPEC_TOTAL_TOKENS", "112"))
 K_LIST = tuple(int(x) for x in os.environ.get("NOSI_SPEC_K_LIST", "1 2").split())
 PROBE = os.environ.get("NOSI_SPEC_PROBE", "0") == "1"
 PROBE_ROUND = int(os.environ.get("NOSI_SPEC_PROBE_ROUND", "3"))
+COMMIT = os.environ.get("NOSI_SPEC_COMMIT", "lockstep")     # lockstep | perreq (R2 milestone 2)
 SCHEDULE = "round:K-draft-then-verify"
 os.makedirs(OUT, exist_ok=True)
 
@@ -171,6 +186,19 @@ def classify_mismatches(gate: dict, tol: float) -> dict:
     return dict(near_tie=near, above_tol=bug, unknown=unknown, tol=tol)
 
 
+def perreq_identity_note(gate: dict, cl: dict) -> str:
+    """The note the report records beside a per-request cell's identity verdict (the verdict itself is the lockstep
+    cells' gate, unchanged): until the bit-exact verifier lands (nosi-r2-verify), a spec cell's committed sequence
+    leaves the shipped one at near ties of the Path-1 numerics, and a per-request cell is expected to fail the same
+    way; a mismatch above the tolerance, or one without a margin, is not that failure."""
+    if gate["passed"]:
+        return ""
+    if cl["above_tol"] == 0 and cl["unknown"] == 0:
+        return ("; per-request cell: every mismatch is a near tie, the lockstep cells' failure: expected until the "
+                "bit-exact verifier lands (nosi-r2-verify)")
+    return "; per-request cell: a mismatch above the tolerance or without a margin: NOT the expected near-tie failure"
+
+
 def kernel_host_table(split: dict) -> dict:
     """One verify (or draft) split row from verify_trace.split_marks -> the
     kernel-vs-non-kernel partition the author asked for. score, gather, the
@@ -243,6 +271,151 @@ def sha(row: torch.Tensor) -> str:
 
 
 # ---------------------------------------------------------------------------
+# per-request commit (NOSI_SPEC_COMMIT=perreq): the host bookkeeping, pure
+# (CPU-tested in benchmarks/Efficiency/tests_cpu/test_spec_perreq_pilot.py)
+# ---------------------------------------------------------------------------
+def perreq_keep(acc_keep: torch.Tensor, done: torch.Tensor, bad: torch.Tensor) -> torch.Tensor:
+    """The tokens each request commits this round: accept_perreq's keep = 1 + n_acc(b), and 0 for a request that has
+    its tokens already (it stops committing; its row keeps its shape) or whose union overflowed this round (its
+    verify rows are placeholders). No host sync."""
+    return torch.where(done | bad, torch.zeros_like(acc_keep), acc_keep)
+
+
+class PerReqLoop:
+    """The host side of the per-request loop. t0, t1 (B, 1): the token after the prompt and the warm-up step's token
+    (committed; the count starts at 1). Holds the ragged committed sequences and the per-request counts, decides
+    termination (every request has ``total`` tokens after t0) and the next round's K (0 right after a round in
+    which a request's union overflowed: the per-request overflow fallback), and refuses what cannot happen: a
+    finished or overflowing request that commits, a K = 0 round that overflows (U = 1 needs at most topk - 1 new
+    blocks, the store has at least that many evictable slots), more than max_rounds rounds."""
+
+    def __init__(self, t0, t1, total: int, K: int, max_rounds: int = 0):
+        a, b = torch.as_tensor(t0).reshape(-1).tolist(), torch.as_tensor(t1).reshape(-1).tolist()
+        if len(a) != len(b) or not a:
+            raise ValueError("t0 and t1 must name the same B >= 1 requests")
+        self.seqs = [[int(x), int(y)] for x, y in zip(a, b)]
+        self.B = len(self.seqs)
+        self.total, self.K = int(total), int(K)
+        if self.total < 1 or self.K < 0:
+            raise ValueError("total >= 1 and K >= 0")
+        self.n_comm = torch.ones(self.B, dtype=torch.int64)
+        self.fallback = False
+        self.rounds = 0
+        self.max_rounds = int(max_rounds) or (4 * self.total + 16)
+
+    def done(self) -> torch.Tensor:
+        return self.n_comm >= self.total
+
+    def finished(self) -> bool:
+        return bool(self.done().all())
+
+    def next_K(self) -> int:
+        if self.rounds >= self.max_rounds:
+            raise RuntimeError("per-request loop: %d rounds and a request still below %d tokens" % (self.rounds, self.total))
+        return 0 if self.fallback else self.K
+
+    def after_round(self, K_r: int, keep, bad, committed):
+        """keep, bad (B,); committed (B, U) (accept_perreq.committed): request b's first keep[b] tokens are appended."""
+        keep = torch.as_tensor(keep, dtype=torch.int64).reshape(-1).cpu()
+        bad = torch.as_tensor(bad, dtype=torch.bool).reshape(-1).cpu()
+        committed = torch.as_tensor(committed).cpu()
+        if keep.shape[0] != self.B or bad.shape[0] != self.B or committed.dim() != 2 or committed.shape[0] != self.B:
+            raise ValueError("keep, bad (B=%d,) and committed (B, U)" % self.B)
+        if bool(((keep < 0) | (keep > committed.shape[1])).any()):
+            raise ValueError("keep outside [0, U=%d]" % committed.shape[1])
+        done = self.done()
+        if bool((keep[done] != 0).any()):
+            raise RuntimeError("a finished request committed tokens")
+        if bool((keep[bad] != 0).any()):
+            raise RuntimeError("a request whose union overflowed committed tokens")
+        if K_r == 0 and bool(bad.any()):
+            raise RuntimeError("a K = 0 round overflowed (requests %s): an engine error" % bad.nonzero().flatten().tolist())
+        for b in range(self.B):
+            k = int(keep[b])
+            if k > 0:
+                self.seqs[b].extend(int(x) for x in committed[b, :k].tolist())
+        self.n_comm += keep
+        self.fallback = bool(bad.any())
+        self.rounds += 1
+
+    def lengths(self):
+        return [len(s) for s in self.seqs]
+
+    def trimmed(self, n: int) -> torch.Tensor:
+        """(B, n): the first n tokens of every request (t0 first)."""
+        if min(self.lengths()) < n:
+            raise ValueError("a request has %d < %d tokens" % (min(self.lengths()), n))
+        return torch.tensor([s[:n] for s in self.seqs], dtype=torch.int64)
+
+    def padded(self) -> torch.Tensor:
+        m = max(self.lengths())
+        return torch.tensor([s + [-1] * (m - len(s)) for s in self.seqs], dtype=torch.int64)
+
+
+def _timing_means(timed: list) -> dict:
+    """The timing means of aggregate_rounds over the given round records."""
+    def mean(vals):
+        vals = [float(v) for v in vals if v is not None]
+        return (sum(vals) / len(vals)) if vals else None
+    out = dict(draft_step_ms=mean([d for r in timed for d in r["draft_ms"]]), verify_ms=mean([r["verify_ms"] for r in timed]),
+               rollback_ms=mean([r["rollback_ms"] for r in timed]))
+    keys = set()
+    for r in timed:
+        keys |= set((r.get("verify_split") or {}).keys())
+    out["verify_split"] = {k: mean([(r.get("verify_split") or {}).get(k) for r in timed]) for k in sorted(keys)
+                           if k not in ("label", "layers")}
+    dkeys = set()
+    for r in timed:
+        for d in r.get("draft_split") or []:
+            dkeys |= set((d or {}).keys())
+    out["draft_split"] = {k: mean([(d or {}).get(k) for r in timed for d in (r.get("draft_split") or [])]) for k in sorted(dkeys)
+                          if k not in ("label", "layers")}
+    out["round_ms"] = mean([sum(r["draft_ms"]) + float(r["verify_ms"] or 0) + float(r["rollback_ms"] or 0) for r in timed])
+    return out
+
+
+def aggregate_rounds_perreq(rounds: list) -> dict:
+    """The per-round records of one per-request cell -> the cell's numbers. A record: K (0 = a fallback round), keep,
+    n_acc, bad, done_before (one entry per request), draft_ms (per step), verify_ms, verify_split, draft_split,
+    rollback_ms. ACTIVE = not finished before the round. THE MEASURED YIELD: committed tokens per active request per
+    round (yield_measured_per_round, every round; yield_measured_spec_rounds, the rounds with K > 0). The lockstep
+    equivalent (1 + min n_acc over the active requests without an overflow, rounds with K > 0) is what the lockstep
+    commit would have committed with the same acceptances: a projection, for comparison. Timing as aggregate_rounds:
+    the rounds with K > 0, the first one excluded (JIT)."""
+    out = dict(rounds=len(rounds), spec_rounds=sum(1 for r in rounds if r["K"] > 0),
+               fallback_rounds=sum(1 for r in rounds if r["K"] == 0),
+               overflow_rounds=sum(1 for r in rounds if any(r["bad"])),
+               overflow_request_rounds=sum(1 for r in rounds for x in r["bad"] if x))
+    act = [(r, b) for r in rounds for b in range(len(r["keep"])) if not r["done_before"][b]]
+    spec_act = [(r, b) for r, b in act if r["K"] > 0]
+    clean = [(r, b) for r, b in spec_act if not r["bad"][b]]
+    out["active_request_rounds"] = len(act)
+    out["committed_tokens"] = sum(int(r["keep"][b]) for r, b in act)
+    if act:
+        out["yield_measured_per_round"] = out["committed_tokens"] / len(act)
+        keeps = [int(r["keep"][b]) for r, b in act]
+        out["keep_hist"] = {str(k): keeps.count(k) for k in sorted(set(keeps))}
+    if spec_act:
+        out["yield_measured_spec_rounds"] = sum(int(r["keep"][b]) for r, b in spec_act) / len(spec_act)
+    if clean:
+        nacc = [int(r["n_acc"][b]) for r, b in clean]
+        out["n_acc_mean_per_request"] = sum(nacc) / len(nacc)
+        out["n_acc_hist_per_request"] = {str(k): nacc.count(k) for k in sorted(set(nacc))}
+    lock = []
+    for r in rounds:
+        idx = [b for b in range(len(r["keep"])) if not r["done_before"][b] and not r["bad"][b]]
+        if r["K"] > 0 and idx:
+            lock.append(1 + min(int(r["n_acc"][b]) for b in idx))
+    if lock:
+        out["yield_lockstep_equivalent_per_round"] = sum(lock) / len(lock)
+    spec = [r for r in rounds if r["K"] > 0]
+    timed = spec[1:] if len(spec) > 1 else spec
+    if timed:
+        out.update(_timing_means(timed))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # data
 # ---------------------------------------------------------------------------
 def load_docs(path):
@@ -275,7 +448,7 @@ def provenance():
     here = os.path.dirname(os.path.abspath(__file__))
     nosa_src = open(os.path.join(here, "..", "..", "nosi", "nosi", "nosa_llama.py")).read()
     return dict(
-        schedule=SCHEDULE, mode=MODE, tag=TAG, L=L, batch=NDOCS, distinct_docs=DISTINCT,
+        schedule=SCHEDULE, mode=MODE, tag=TAG, L=L, batch=NDOCS, distinct_docs=DISTINCT, commit=COMMIT,
         gate_tokens=GATE_TOKENS, total_tokens=TOTAL_TOKENS, K_list=list(K_LIST),
         engine_knobs=dict(NOSI_VERIFY_ROUND_SLOTS=_ce.VERIFY_ROUND_SLOTS, NOSI_POOL_BLOCKS=_ce.POOL_BLOCKS,
                           NOSI_ATTN_SPLITS=int(os.environ.get("NOSI_ATTN_SPLITS", "0") or 0),
@@ -645,6 +818,184 @@ def run_spec_arm(model, cache, t0, position_ids, K: int, total: int, probe: bool
     return result
 
 
+@torch.inference_mode()
+def run_spec_arm_perreq(model, cache, t0, position_ids, K: int, total: int, probe: bool) -> dict:
+    """THE PER-REQUEST CELL (NOSI_SPEC_COMMIT=perreq). The shipped warm-up step (every request at the prompt length;
+    outside the clock, as in every arm); the per-request tables bridged from the shipped ones and the engines moved to
+    per-request counters; then rounds until every request has ``total`` tokens: K draft steps per request
+    (nosa_llama.draft_inference_perreq), the restore (counter resets), one verify of U = K + 1 positions per request
+    (spec_verify_inference_perreq: a request whose union overflows is isolated, ctx.round_bad), accept_perreq, the
+    commit keep(b) = 1 + n_acc(b), 0 for a finished or overflowing request (spec_rollback_perreq). ONE host read per
+    round (keep, overflow, n_acc, the layer-0 truncate counts) plus the committed tokens. After a round with an
+    overflow, one K = 0 round (U = 1) for every request. The probe (NOSI_SPEC_PROBE=1) runs at the PROBE_ROUND-th round
+    with K > 0 (spec_perreq_model.probe)."""
+    from nosi import spec_loop as _sl
+    from nosi import spec_perreq_model as _spm
+    from nosi import verify_trace as _vtr
+    from nosi.cache_engine import _bias_rows
+    B = t0.shape[0]
+    eng0 = cache.layers[0].cache_engine
+    H, bs = eng0.head_num, eng0.block_size
+    layout = _sl.store_layout(eng0.topk, eng0.verify_round_slots)
+    store = _sl.Store(model.num_layers, H, B, layout, device="cuda")
+    ctx = _sl.PerReqSpecContext(store, side=torch.cuda.Stream(), make_event=torch.cuda.Event,
+                                current_stream=torch.cuda.current_stream, stream_ctx=torch.cuda.stream,
+                                num_layers=model.num_layers, block_size=bs,
+                                kernel_size=model.layers[0].pooling_block_size, kernel_stride=model.layers[0].pooling_stride)
+    vt = _vtr.VerifyTrace(model.num_layers)
+    _vtr.TRACE = vt
+    ctx.mark = vt.rec
+    cu = torch.arange(0, B + 1, dtype=torch.int, device="cuda")
+    U = K + 1
+    # warm-up: the shipped exact step (feeds t0 -> t1), lockstep, outside the clock in every arm
+    model.has_buffers = False
+    lg = model.decode_inference(t0, cu, position_ids, cache)
+    next_tok = lg[:, -1, :].argmax(-1, keepdim=True)
+    tick = ctx.next_tick()
+    for l, lay in enumerate(cache.layers):
+        store.sync_window(l, lay.cache_engine._block_map, tick)
+    pos = position_ids + 1
+    horizon = total + 2 * U + bs
+    st = _spm.PerReqState.bridge(model, cache, horizon)
+    for lay in cache.layers:
+        _sl.to_perreq(lay.cache_engine)
+    loop = PerReqLoop(t0.cpu(), next_tok.cpu(), total, K)
+    torch.cuda.synchronize()
+    t_warm = time.time()
+    t_gate = n_gate = None
+    rounds = []
+    probe_result = None
+    spec_r = 0
+    while not loop.finished():
+        if t_gate is None and int(loop.n_comm.min()) >= GATE_TOKENS:
+            torch.cuda.synchronize()
+            t_gate, n_gate = time.time(), int(loop.n_comm.sum())
+        Kr = loop.next_K()
+        Ur = Kr + 1
+        r = loop.rounds + 1
+        spec_r += int(Kr > 0)
+        done = loop.done()
+        do_probe = probe and Kr > 0 and spec_r == PROBE_ROUND and probe_result is None
+        if do_probe:
+            torch.cuda.synchronize()
+            ctx.side.synchronize()
+            ctx.queue.drain()
+            store.mark_arrived(ctx.gen)
+            psnap = _spm.ProbeSnapshot(cache, st, layout, Ur).take()
+        ctx.begin_round(st.view)
+        rec = dict(r=r, K=Kr, fallback=Kr == 0 and K > 0, done_before=done.tolist(), committed_before=loop.n_comm.tolist(),
+                   ev_draft=[], ev_roll=None)
+        # DRAFT
+        drafted = []
+        tok, p = next_tok, pos
+        for j in range(Kr):
+            ctx.next_tick()
+            store.mark_arrived(ctx.queue.done_gen())
+            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            vt.label(("draft", r, j))
+            e0.record()
+            lg = model.draft_inference_perreq(tok, cu, p, cache, ctx, st)
+            e1.record()
+            tok = lg[:, -1, :].argmax(-1, keepdim=True)
+            drafted.append(tok)
+            p = p + 1
+            rec["ev_draft"].append((e0, e1))
+        ctx.restore_before_verify(st.view)
+        store.mark_arrived(ctx.queue.done_gen())
+        ctx.was_inflight = (store.state == _sl.INFLIGHT).clone()
+        if ctx.queue.last_event is not None:
+            torch.cuda.current_stream().wait_event(ctx.queue.last_event)
+        ctx.queue.drain()
+        store.mark_arrived(ctx.gen)
+        ctx.next_tick()
+        # VERIFY (no RoundOverflow in this path: an overflowing stream is isolated, ctx.round_bad)
+        toks = torch.cat([next_tok] + drafted, dim=1)                       # (B, Ur)
+        pu = pos + torch.arange(Ur, device="cuda", dtype=pos.dtype).unsqueeze(0)
+        vt.label(("verify", r))
+        drafted_t = torch.cat(drafted, dim=1) if drafted else torch.zeros((B, 0), dtype=torch.int64, device="cuda")
+        lv = model.spec_verify_inference_perreq(toks, cu, pu, cache, ctx, st)
+        # ACCEPT, per request
+        acc = _sl.accept_perreq(lv.argmax(-1), drafted_t)
+        keep = perreq_keep(acc.keep, done.to(acc.keep.device), ctx.round_bad)
+        # COMMIT, per request
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        tr = model.spec_rollback_perreq(cache, ctx, st, keep)
+        e1.record()
+        rec["ev_roll"] = (e0, e1)
+        next_tok = torch.where((keep > 0).view(B, 1), acc.next_token, next_tok)
+        pos = pos + keep.view(B, 1).to(pos.dtype)
+        host = torch.stack([keep, ctx.round_bad.to(torch.int64), acc.n_acc, tr.undo_rollover.to(torch.int64), tr.rows_restored]).cpu()
+        ctx.host_syncs += 1
+        committed = acc.committed.cpu()
+        loop.after_round(Kr, host[0], host[1].bool(), committed)
+        rec.update(n_acc=host[2].tolist(), keep=host[0].tolist(), bad=host[1].bool().tolist(),
+                   committed=[committed[b, :int(host[0][b])].tolist() for b in range(B)],
+                   truncate=dict(undo_rollover=int(host[3].sum()), rows_restored=int(host[4].sum())),
+                   counters={k: v.sum().clone() for k, v in store.counters().items()},
+                   union_size_mean=store.resident_count().float().mean().clone())
+        if do_probe:
+            torch.cuda.synchronize()
+            probe_result = dict(round=r, **_spm.probe(cache, st, psnap, host[0], Ur, layout, _bias_rows))
+            print("[spec_loop] per-request rollback probe at round %d (keep %s, U=%d): state == replay(keep): %s (%s); control "
+                  "replay(%s) differs: %s (%s); deterministic %s"
+                  % (r, probe_result["keep"][:8], Ur, probe_result["same"], probe_result["detail"], probe_result["control_keep"][:8],
+                     probe_result["control_differs"], probe_result["control_detail"], probe_result["replay_deterministic"]), flush=True)
+            del psnap
+        st.probe_inputs = [None] * model.num_layers
+        rounds.append(rec)
+    torch.cuda.synchronize()
+    t_end = time.time()
+    ctx.side.synchronize()
+    _vtr.TRACE = None
+    timing = {row["label"]: row for row in vt.harvest()}
+    out_rounds = []
+    prev = None
+    for rec in rounds:
+        row = dict(r=rec["r"], K=rec["K"], fallback=rec["fallback"], done_before=rec["done_before"], committed_before=rec["committed_before"],
+                   n_acc=rec["n_acc"], keep=rec["keep"], bad=rec["bad"], committed=rec["committed"], truncate=rec["truncate"],
+                   draft_ms=[a.elapsed_time(b) for a, b in rec["ev_draft"]],
+                   draft_split=[timing.get(("draft", rec["r"], j)) for j in range(rec["K"])],
+                   rollback_ms=rec["ev_roll"][0].elapsed_time(rec["ev_roll"][1]),
+                   union_size_mean=float(rec["union_size_mean"]))
+        vrow = timing.get(("verify", rec["r"]))
+        row["verify_ms"] = None if vrow is None else vrow["total_ms"]
+        row["verify_split"] = vrow
+        cnt = {k: int(v) for k, v in rec["counters"].items()}
+        row["counters_cum"] = cnt
+        row["counters"] = {k: cnt[k] - (prev or {}).get(k, 0) for k in cnt}
+        prev = cnt
+        out_rounds.append(row)
+    final_counters = final_counter_sums(store)
+    per_request_counters = {k: v.sum(dim=(0, 1)).cpu().tolist() for k, v in store.counters().items()}
+    wire = _sl.wire_bytes(final_counters)
+    committed_after_warmup = int(loop.n_comm.sum()) - B
+    wall = t_end - t_warm
+    result = dict(commit="perreq", K=K, U=U, schedule=SCHEDULE, tokens=total, tokens_per_request=loop.n_comm.tolist(),
+                  seq=loop.trimmed(total + 1), seq_padded=loop.padded(), lengths=loop.lengths(), rounds=out_rounds,
+                  counters=final_counters, counters_per_request=per_request_counters, wire=wire,
+                  timely_recall=_sl.timely_recall(final_counters), host_syncs=ctx.host_syncs, wall_s_after_warmup=wall,
+                  committed_tokens_after_warmup=committed_after_warmup, tok_s_after_warmup=committed_after_warmup / wall,
+                  peak_gb=torch.cuda.max_memory_allocated() / 1e9, reserved_gb=torch.cuda.max_memory_reserved() / 1e9,
+                  probe=probe_result, W=layout.W, R=layout.R, horizon=horizon, M_alloc=st.M_alloc, lk_max=st.twins[0].lk_max,
+                  n_max=st.twins[0].n_max)
+    if t_gate is not None and int(loop.n_comm.sum()) > n_gate:
+        result["wall_s_window"] = t_end - t_gate
+        result["window_tokens"] = int(loop.n_comm.sum()) - n_gate
+        result["tok_s_window"] = result["window_tokens"] / (t_end - t_gate)
+    agg = aggregate_rounds_perreq(out_rounds)
+    result["agg"] = agg
+    print("[spec_loop] PER-REQUEST K=%d: %d rounds (%d with K > 0, %d K = 0 fallback rounds, %d overflow request-rounds); measured "
+          "yield %.3f tokens per active request per round (K > 0 rounds: %s; lockstep equivalent %s); n_acc mean %s; draft %s ms/step, "
+          "verify %s ms, rollback %s ms; %.1f tok/s after warm-up, window %s; recall %s; peak %.1f GB; host syncs %d"
+          % (K, agg["rounds"], agg["spec_rounds"], agg["fallback_rounds"], agg["overflow_request_rounds"],
+             agg.get("yield_measured_per_round", float("nan")), _f(agg.get("yield_measured_spec_rounds"), "%.3f"),
+             _f(agg.get("yield_lockstep_equivalent_per_round"), "%.3f"), _f(agg.get("n_acc_mean_per_request"), "%.3f"),
+             _f(agg.get("draft_step_ms")), _f(agg.get("verify_ms")), _f(agg.get("rollback_ms")), result["tok_s_after_warmup"],
+             _f(result.get("tok_s_window")), _f(result["timely_recall"], "%.3f"), result["peak_gb"], ctx.host_syncs), flush=True)
+    return result
+
+
 def run_spec_process(path, ids, rows, distinct):
     from nosi import state_snapshot as ss
     model, cache, logits, position_ids, meta = _setup(path, ids)
@@ -655,11 +1006,13 @@ def run_spec_process(path, ids, rows, distinct):
     arms = {}
     arms["shipped"] = run_decode_arm(model, cache, t0, pos0, TOTAL_TOKENS, "shipped")
     cells = {}
+    arm = run_spec_arm_perreq if COMMIT == "perreq" else run_spec_arm
     for K in K_LIST:
         snap.restore()
         torch.cuda.reset_peak_memory_stats()
-        cells["K%d" % K] = run_spec_arm(model, cache, t0, pos0, K, TOTAL_TOKENS, PROBE)
-    payload = dict(meta, docs=rows, distinct_docs=distinct, arms=arms, cells=cells, peak_gb=torch.cuda.max_memory_allocated() / 1e9)
+        cells["K%d" % K] = arm(model, cache, t0, pos0, K, TOTAL_TOKENS, PROBE)
+    payload = dict(meta, docs=rows, distinct_docs=distinct, arms=arms, cells=cells, commit=COMMIT,
+                   peak_gb=torch.cuda.max_memory_allocated() / 1e9)
     return payload
 
 
@@ -707,6 +1060,7 @@ def report() -> int:
     lines.append("identity tolerance for the near-tie classification: 4 x tau_ctrl = 4 x %.4f = %.4f\n" % (tau, tol))
     lines.append("| gate | result | detail |\n|---|---|---|")
     cells_out = {}
+    perreq_out = {}
     shipped_by_key = {}
     for name, p in payloads.items():
         key = (int(p["L"]), int(p["batch"]), int(p.get("distinct_docs", p["batch"])), tuple(p["docs"]))
@@ -717,20 +1071,46 @@ def report() -> int:
         ref = shipped_by_key.get(key)
         for cname, c in p["cells"].items():
             tag = "%s/%s" % (name, cname)
+            perreq = c.get("commit") == "perreq"
             if ref is None:
                 gate("identity[%s]" % tag, False, "no shipped arm with the same (L, batch, distinct, docs)")
             else:
                 g = identity_gate(c["seq"], ref[1]["seq"], ref[1]["margins"])
                 cl = classify_mismatches(g, tol)
                 gate("identity[%s vs %s]" % (tag, ref[0]), g["passed"],
-                     "%d requests x %d tokens; mismatches %d (near-tie %d, above tol %d, unknown %d)%s"
+                     "%d requests x %d tokens; mismatches %d (near-tie %d, above tol %d, unknown %d)%s%s"
                      % (g["requests"], g["compared_tokens"], len(g["mismatches"]), cl["near_tie"], cl["above_tol"], cl["unknown"],
-                        ("; first: %r" % (g["mismatches"][0],)) if g["mismatches"] else ""))
+                        ("; first: %r" % (g["mismatches"][0],)) if g["mismatches"] else "",
+                        perreq_identity_note(g, cl) if perreq else ""))
             if c.get("probe") is not None:
                 pr = c["probe"]
-                gate("rollback-probe[%s]" % tag, pr["passed"],
-                     "round %d c=%d U=%d: state == replay(c) %s (%s); control replay(%d) differs %s (%s); deterministic %s"
-                     % (pr["round"], pr["c"], pr["U"], pr["same"], pr["detail"], pr["control_keep"], pr["control_differs"], pr["control_detail"], pr["replay_deterministic"]))
+                if perreq:
+                    gate("rollback-probe[%s]" % tag, pr["passed"],
+                         "round %d, per request (keep %s, U=%d): state == replay(keep) %s (%s); control replay(keep of request 0 "
+                         "= %d) differs %s (%s); deterministic %s"
+                         % (pr["round"], pr["keep"][:16], pr["U"], pr["same"], pr["detail"], pr["control_keep"][0],
+                            pr["control_differs"], pr["control_detail"], pr["replay_deterministic"]))
+                else:
+                    gate("rollback-probe[%s]" % tag, pr["passed"],
+                         "round %d c=%d U=%d: state == replay(c) %s (%s); control replay(%d) differs %s (%s); deterministic %s"
+                         % (pr["round"], pr["c"], pr["U"], pr["same"], pr["detail"], pr["control_keep"], pr["control_differs"], pr["control_detail"], pr["replay_deterministic"]))
+            if perreq:
+                ag = c["agg"]
+                gate("overflow[%s]" % tag, ag["overflow_rounds"] == 0,
+                     "%d rounds with an overflowing request (%d request-rounds committed nothing), %d K = 0 fallback rounds"
+                     % (ag["overflow_rounds"], ag["overflow_request_rounds"], ag["fallback_rounds"]))
+                perreq_out[tag] = dict(payload=name, K=c["K"], U=c["U"], batch=p["batch"], distinct_docs=p.get("distinct_docs"), L=p["L"],
+                                       W=c["W"], R=c["R"], tokens=c["tokens"], tokens_per_request=c["tokens_per_request"], agg=ag,
+                                       counters=c["counters"], wire=c["wire"], timely_recall=c["timely_recall"], host_syncs=c["host_syncs"],
+                                       committed_tokens_after_warmup=c["committed_tokens_after_warmup"],
+                                       tok_s_after_warmup=c["tok_s_after_warmup"], tok_s_window=c.get("tok_s_window"),
+                                       wall_s_after_warmup=c["wall_s_after_warmup"], wall_s_window=c.get("wall_s_window"),
+                                       peak_gb=c["peak_gb"], reserved_gb=c["reserved_gb"], host_pinned_gb=p["host_pinned_gb"],
+                                       kernel_host=kernel_host_table(ag.get("verify_split") or {}),
+                                       draft_kernel_host=kernel_host_table(ag.get("draft_split") or {}),
+                                       provenance=dict(schedule=p.get("schedule"), commit="perreq", engine_knobs=p["engine_knobs"],
+                                                       overlap_evidence=p["overlap_evidence"], custom_kernels=p["custom_kernels"]))
+                continue
             gate("overflow[%s]" % tag, c["agg"]["overflow_rounds"] == 0, "%d overflow rounds (fell back to U=1)" % c["agg"]["overflow_rounds"])
             cells_out[tag] = dict(payload=name, K=c["K"], U=c["U"], batch=p["batch"], distinct_docs=p.get("distinct_docs"), L=p["L"],
                                   W=c["W"], R=c["R"], tokens=c["tokens"], agg=c["agg"], counters=c["counters"], wire=c["wire"],
@@ -778,9 +1158,22 @@ def report() -> int:
             _f(ag.get("draft_step_ms")), _f(ag.get("verify_ms")), _f(ag.get("rollback_ms")), _f(ag.get("round_ms")),
             c["tok_s_after_warmup"], _f(c.get("tok_s_window")), _f(c["timely_recall"], "%.3f"),
             c["wire"]["wire_bytes"] / ntok / 1e6, c["wire"]["late_bytes"] / ntok / 1e6, c["wire"]["wasted_bytes"] / 1e6, c["peak_gb"], c["host_syncs"]))
+    lines.append("\n## per-request cells (NOSI_SPEC_COMMIT=perreq): the yield is MEASURED, committed tokens per active request per round; the lockstep equivalent is what 1 + min n_acc would have committed with the same acceptances (a projection)\n")
+    lines.append("| cell | batch | distinct | K | rounds K>0 / K=0 | overflow request-rounds | yield measured/round | yield K>0 rounds | lockstep equivalent (proj) | n_acc mean/req | draft ms/step | verify ms | rollback ms | round ms | tok/s after warm-up | tok/s window | recall | wire MB/tok | late MB/tok | peak GB | host syncs |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for tag, c in perreq_out.items():
+        ag = c["agg"]
+        ntok = max(1, c["committed_tokens_after_warmup"])
+        lines.append("| %s | %d | %s | %d | %d / %d | %d | %s | %s | %s | %s | %s | %s | %s | %s | %.1f | %s | %s | %.3f | %.3f | %.1f | %d |" % (
+            tag, c["batch"], c["distinct_docs"], c["K"], ag["spec_rounds"], ag["fallback_rounds"], ag["overflow_request_rounds"],
+            _f(ag.get("yield_measured_per_round"), "%.3f"), _f(ag.get("yield_measured_spec_rounds"), "%.3f"),
+            _f(ag.get("yield_lockstep_equivalent_per_round"), "%.3f"), _f(ag.get("n_acc_mean_per_request"), "%.3f"),
+            _f(ag.get("draft_step_ms")), _f(ag.get("verify_ms")), _f(ag.get("rollback_ms")), _f(ag.get("round_ms")),
+            c["tok_s_after_warmup"], _f(c.get("tok_s_window")), _f(c["timely_recall"], "%.3f"),
+            c["wire"]["wire_bytes"] / ntok / 1e6, c["wire"]["late_bytes"] / ntok / 1e6, c["peak_gb"], c["host_syncs"]))
+    timing_cells = list(cells_out.items()) + list(perreq_out.items())
     lines.append("\n## verify round: kernel windows vs torch-op / host-gap windows (ms, mean over timed rounds; the brackets are GPU-timeline windows: a torch-op window is launch-bound small kernels, a host sync is idle time inside plan_ms)\n")
     lines.append("| cell | score (stage-1 + graph + table ops) | gather (late-miss stall, Triton) | attn call 1 | attn call 2 | KERNEL total | tail writes | plan (+1 host sync/layer) | value copies (+2 host syncs/layer) | quotient | NON-KERNEL total | rest (GEMMs + gaps) | total | host syncs/call |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
-    for tag, c in cells_out.items():
+    for tag, c in timing_cells:
         k = c["kernel_host"]
         lines.append("| %s | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %d |" % (
             tag, k["kernel"]["score_ms"], k["kernel"]["gather_ms"], k["kernel"]["attn1_ms"], k["kernel"]["attn2_ms"], k["kernel_total_ms"],
@@ -788,7 +1181,7 @@ def report() -> int:
             k["rest_ms"], k["total_ms"], k["host_syncs"]))
     lines.append("\n## draft step: windows (ms, mean over timed steps; gather = side-stream launch + bias scratch build on the main stream, the gathers run on the side stream)\n")
     lines.append("| cell | score | tail write | plan | launch + bias | attention (whole allocation, biased) | rest | total |\n|---|---|---|---|---|---|---|---|")
-    for tag, c in cells_out.items():
+    for tag, c in timing_cells:
         k = c["draft_kernel_host"]
         lines.append("| %s | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f |" % (
             tag, k["kernel"]["score_ms"], k["non_kernel"]["tail_ms"], k["non_kernel"]["plan_ms"], k["kernel"]["gather_ms"],
@@ -799,8 +1192,12 @@ def report() -> int:
     with open(os.path.join(OUT, "spec_loop.md"), "w") as f:
         f.write(text + "\n")
     with open(os.path.join(OUT, "spec_loop.json"), "w") as f:
-        json.dump(dict(schedule=SCHEDULE, tau_ctrl=tau, tol=tol, gates=gates, failed=nfail, cells=cells_out, references=refs_out,
+        json.dump(dict(schedule=SCHEDULE, tau_ctrl=tau, tol=tol, gates=gates, failed=nfail, cells=cells_out, perreq_cells=perreq_out,
+                       references=refs_out,
                        columns=dict(
+                           yield_measured_per_round="per-request cells: committed tokens per active request (not finished before the round) per round, every round (K = 0 fallback rounds included); a MEASUREMENT",
+                           yield_lockstep_equivalent_per_round="per-request cells: 1 + min n_acc over the active requests without an overflow, rounds with K > 0: what the lockstep commit would have committed with the same acceptances (a projection)",
+                           tok_s_after_warmup_perreq="per-request cells: committed tokens after the warm-up step (every request; its overshoot past the budget included) / wall seconds",
                            tok_s_after_warmup="committed tokens x batch / wall seconds from the end of the warm-up decode step to the end of the run (every arm), re-warm steps included",
                            tok_s_window="the same over the rounds after the gate window (NOSI_SPEC_GATE_TOKENS)",
                            yield_lockstep="tokens committed per round under c = 1 + min_b n_acc (the exact lockstep policy this engine allows)",
@@ -822,6 +1219,8 @@ if __name__ == "__main__":
         sys.exit(report())
     if TOTAL_TOKENS < 2 or GATE_TOKENS < 1:
         die("need NOSI_SPEC_TOTAL_TOKENS >= 2 and NOSI_SPEC_GATE_TOKENS >= 1")
+    if COMMIT not in ("lockstep", "perreq") or (COMMIT == "perreq" and MODE != "spec"):
+        die("NOSI_SPEC_COMMIT=%r with NOSI_SPEC_MODE=%r (lockstep, or perreq in spec mode)" % (COMMIT, MODE))
     path = os.environ["NOSI_MODEL_PATH"]
     ids, rows, distinct = load_docs(path)
     print("[docs] %s (%d distinct)  L=%d" % (rows, distinct, L), flush=True)

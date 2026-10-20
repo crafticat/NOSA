@@ -1204,6 +1204,28 @@ class Llama:
         cache_engine._seen_tokens = ctx.seen0 + keep
         return first
 
+    # -- retroinfer-eval fork, R2 milestone 2: the PER-REQUEST round (spec_perreq_model.py; the pilot's
+    # NOSI_SPEC_COMMIT=perreq). The three lockstep methods above are unchanged. ``state`` is a
+    # spec_perreq_model.PerReqState (the per-request tables bridged after the warm-up step), ``ctx`` a
+    # spec_loop.PerReqSpecContext; the engines carry per-request counters (spec_loop.to_perreq).
+    def draft_inference_perreq(self, input_ids: torch.LongTensor, cu_seqlens: torch.Tensor, position_ids: torch.LongTensor, cache_engine, ctx, state):
+        """draft_inference per request: one draft token per request at its own position (B, 1) -> (B, 1, V)."""
+        from . import spec_perreq_model as _spm
+        return _spm.draft_inference(self, input_ids, cu_seqlens, position_ids, cache_engine, ctx, state)
+
+    def spec_verify_inference_perreq(self, input_ids: torch.LongTensor, cu_seqlens: torch.Tensor, position_ids: torch.LongTensor, cache_engine, ctx, state):
+        """spec_verify_inference per request: U positions per request from its own position (B, U) -> (B, U, V)."""
+        from . import spec_perreq_model as _spm
+        return _spm.spec_verify_inference(self, input_ids, cu_seqlens, position_ids, cache_engine, ctx, state)
+
+    def spec_rollback_perreq(self, cache_engine, ctx, state, keep: torch.Tensor):
+        """spec_rollback per request: keep (B,) int64, request b keeps the first keep[b] of the round's U positions
+        (0 = nothing: a finished request, or one whose union overflowed). Per layer the tables commit
+        ctr[keep_b, :, b] and the tail is truncated to keep_b (cache_engine.spec_commit_perreq: a counter reset plus
+        one masked copy). Returns the layer-0 spec_loop.PerReqTruncate."""
+        from . import spec_perreq_model as _spm
+        return _spm.spec_rollback(cache_engine, ctx, state, keep)
+
     @torch.inference_mode()
     def batch_prefill(self, input_ids: torch.Tensor, cache_engine=None):
         batch_size = input_ids.size(0)
