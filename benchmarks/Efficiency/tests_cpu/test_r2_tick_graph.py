@@ -217,6 +217,24 @@ def test_G5_planted_faults_first_differ_at_the_predicted_tick(p3, ref, nosi_alia
     assert r["first"] is not None and r["first"][0] == pred, (ng, r["first"], pred, r["error"])
 
 
+def test_G6_the_captured_engine_keeps_the_eager_engines_ops(p3, ref):
+    """G6 (be8bce7's defect, CPU job 2190947): CapturedTickEngine named its graph pool `pool` and so replaced
+    TickEngine.pool, the pooling op the region calls. The subclasses keep every op of the eager engine (nl, stage1,
+    pool, select, ops) after construction and after clone; the graph pool has its own name."""
+    base = TT.make_engine(TT.make_ops(p3), draft_drop=0.5)
+    for eng in (FX.FixedTickEngine.from_engine(base, v_cap=3),
+                CAPM.CapturedTickEngine.from_engine(base, v_cap=3, graph_factory=fake_factory)):
+        for e in (eng, eng.clone()):
+            for name in ("nl", "stage1", "pool", "select", "ops"):
+                assert getattr(e, name) is getattr(base, name), (type(e).__name__, name)
+            assert e.NB == base.NB and callable(e.pool)
+    cap = CAPM.CapturedTickEngine.from_engine(base, v_cap=3, graph_factory=fake_factory)
+    assert cap.graph_pool is None
+    out = cap.run_serial([int(x) for x in ref[0][0]])                 # the warm tick (eager) calls the pooling op
+    out = cap.run_serial([int(x) for x in ref[0][1]])                 # the capture tick (fake graph) too
+    assert torch.equal(out.logits, ref[1][1]) and cap.stats["captures"] == 1
+
+
 def test_G5b_the_gate_comparison_passes_the_fixed_and_the_captured_tick(p3, ref, nosi_alias):
     a = _args()
     toks = ref[0]

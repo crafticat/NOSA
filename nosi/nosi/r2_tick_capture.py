@@ -40,7 +40,10 @@ class CapturedTickEngine(FixedTickEngine):
         self.warm = int(warm)
         self.graph_factory = graph_factory
         self.graphs: Dict[tuple, dict] = {}
-        self.pool = None
+        # the graphs' shared memory pool. NOT `self.pool`: TickEngine.pool is the pooling op (r2_tick.py:266) that the
+        # region calls (r2_tick_fixed.py _layer_fixed); be8bce7 named this attribute `pool` and overwrote it with None
+        # (CPU job 2190947: G1-G5 "NoneType is not callable"). Test G6 pins the pooling op after construction and clone.
+        self.graph_pool = None
         self.stats.update(captures=0, replays=0, eager_region=0, capture_ms=0.0)
 
     def clone(self, ops=None, **kw):
@@ -68,9 +71,9 @@ class CapturedTickEngine(FixedTickEngine):
             import torch
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
-            if self.pool is None:
-                self.pool = torch.cuda.graph_pool_handle()
-            with torch.cuda.graph(graph, pool=self.pool):
+            if self.graph_pool is None:
+                self.graph_pool = torch.cuda.graph_pool_handle()
+            with torch.cuda.graph(graph, pool=self.graph_pool):
                 logits, arg = self._forward_fixed(cb)
             torch.cuda.synchronize()
         self.stats["captures"] += 1
