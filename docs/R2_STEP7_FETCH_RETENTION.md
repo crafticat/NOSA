@@ -422,6 +422,42 @@ with real selections; FG3 the packer's sustained rate (4.9) against the tick's d
   unchanged), ticks 0-2 ran normally. Negative control (no watch): no end_tick refuses, tick 3 and later apply their
   decisions, and the flag is seen only after them.
 
+## 12f. The EXACT device wait (Q-T3 (b), Q6; design and CPU stand-in, 2026-10-21)
+
+The superset wait (`CudaDeviceOps(wait_mode="superset")`) makes the main stream wait on the completion event of EVERY
+transfer in flight at the layer, and host-waits a gilfree pack that is not submitted yet. Before a captured replay it
+would wait for every in-flight transfer of every layer: no overlap. The exact wait waits for exactly the slots that the
+layer's verify rows read in flight, on the device, with no host step:
+
+- THE BOARD (`GenBoard`, owned by S-C, attached to the transport): (L, B, H, C + X) int64 on the device; per slot, the
+  generation of the last transfer whose rows LANDED there (0: none). A take makes gen >= 1; a slot's generations only
+  grow; a slot in flight is never taken again (T3). So "board >= gen" means "the awaited transfer landed".
+- PUBLICATION: the transport writes (slot, gen) into the board on the stream that landed the rows, AFTER them.
+  gilfree (`GilfreeTransport.attach_board` / `_publish`): after each `NativePipe.release`, a pinned copy and an
+  `index_put_` enqueued on the SCATTER stream (CPU mode: at once), before the release's completion event. The tests'
+  AdversarialTransport cannot publish (vendored): `PublishingTransport` wraps it and publishes every transfer it sees
+  landed after a poll / force, with the same deliveries and pending list (the stand-in of the scatter stream).
+- THE WAIT LIST (`wait_list`): from `device_verify`'s decision, per entry the board index of its in-flight slot (-1 if
+  none) and the generation; fixed length, on the device: capturable.
+- THE KERNEL (`_wait_kernel`, Triton, SOURCE ONLY, NOT RUN): ONE program on the main stream (one SM; the scatter
+  stream keeps the others), the list in blocks of 1024, VOLATILE loads of the board, spinning until every entry
+  reached its generation or `max_spin` rounds passed; then an entry short or past raises `err` (int32, atomic max).
+  The board write that ends the spin is enqueued after the scatter, so the rows are complete when the main stream's
+  next kernel (the attention) reads them. A CPU pack not yet submitted needs no host wait: the feeder submits it and
+  the spin sees its publication.
+- NO HANG: `err` is watched by S-C (`watch_flag`, 12e): a spin that ran out refuses its tick at that tick's end_tick.
+- `CudaDeviceOps(wait_mode="exact")` launches the kernel per layer; `"superset"` keeps the event waits. FG1 runs both
+  and reports per layer the 4.3 layer_wait_ns, per tick the ms, the submission host-waits (superset only) and `err`.
+- CPU stand-in: `ExactWaitSim` reads only device data (the wait list and the board; never the host's transfer
+  records); a spin round is the stand-in of time (`PublishingTransport.progress_slot`: the transfer into that slot
+  lands now); at most `max_spin` rounds; then `err`. `ResidencySC(wait_mode="exact")` selects it on the CPU.
+- Tests: F17 (S-C with the exact wait equals v1 over F6's 24 ticks: pages, verify content, state, counters and the
+  device mirror every tick; the wait spun, `err` False; the board is never ahead of a slot's generation); F17b (a
+  REUSED slot: generation 1 published, generation 2 in flight: the wait spins until 2, the verifier reads the right
+  block; negative controls: a wait that accepts the previous generation reads the old block (content check); a
+  transport that never publishes runs the spin out and the watched `err` refuses the tick); GT4 (gilfree publishes
+  exactly its transfers' (slot, generation) after the release; negative: no board attached, no publication).
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,
@@ -439,4 +475,5 @@ with real selections; FG3 the packer's sustained rate (4.9) against the tick's d
   and updates it by one batched delta per tick; the full scan stays as the reference (F14). S-B keeps the full scan
   (S-C supersedes it for runs).
 - Q6 CudaDeviceOps' superset wait may stall the main stream on draft transfers that no verify row reads. The 4.3
-  layer_wait_ns measures it in FG1; the exact device spin on published generations is the fallback.
+  layer_wait_ns measures it in FG1; the exact device wait (12f) is built as a design and a CPU stand-in, and FG1 runs
+  both.

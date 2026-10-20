@@ -45,6 +45,7 @@ def _load(mod):
 
 GF = _load("r2_transport_gilfree")
 TR = sys.modules[PKG + ".kstep.transfer"]
+SCG = _load("r2_residency_sc")                                # the generation board (GT4)
 
 
 def _by_path(path, name):
@@ -196,3 +197,29 @@ def test_GT3_a_release_on_another_team_is_refused(pinned, tmp_path_factory):
     for i, (layer, groups) in enumerate(plans):
         gf1.issue(layer, _transfers(layer, groups, 10 * i))
     assert gf1.threads_ok() and _truth_ok(gk1, gv1, host_k, host_v, plans)
+
+
+def test_GT4_a_release_publishes_its_slot_generations(pinned):
+    """GT4 (S-C's exact device wait, residency note 12f): with a generation board attached, every release publishes
+    (slot, generation) of its transfers into the board after its rows (CPU mode: at once): exactly the destinations of
+    the issued transfers hold their generations, every other entry stays 0, and the rows are the host truth. Negative
+    control: the same issues without attach_board leave the board at 0."""
+    for attach in (True, False):
+        host_k, host_v, gk, gv, _, _ = _world()
+        gf = GF.GilfreeTransport(pinned.ext, host_k, host_v, gk, gv, BS, D, threads=2, host_wait=lambda ev: None,
+                                 cap_groups=4)
+        board = SCG.GenBoard(L, B, H, NPOS, "cpu")
+        if attach:
+            gf.attach_board(board)
+        want = torch.zeros_like(board.t)
+        seq = 0
+        plans = _plans()
+        for layer, groups in plans:
+            trs = _transfers(layer, groups, seq)
+            for i, tr in enumerate(trs):
+                tr.gen = seq + i + 2
+                want[layer, tr.b, tr.h, tr.slot] = tr.gen
+            seq += len(groups)
+            gf.issue(layer, trs)
+        assert _truth_ok(gk, gv, host_k, host_v, plans)
+        assert torch.equal(board.t, want if attach else torch.zeros_like(want)), attach

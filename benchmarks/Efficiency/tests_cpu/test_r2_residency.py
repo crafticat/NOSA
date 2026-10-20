@@ -1,4 +1,4 @@
-"""CPU tests F1-F13 of R2 step 7, piece 5 (docs/R2_STEP7_FETCH_RETENTION.md sections 12, 12b, 12c):
+"""CPU tests F1-F17 of R2 step 7, piece 5 (docs/R2_STEP7_FETCH_RETENTION.md sections 7, 12 and 12b-12f):
 nosi/nosi/r2_residency.py (v1, the reference), r2_residency_sb.py (S-B) and r2_residency_sc.py (S-C), the residency
 service of the spec round, over K3X's ownership and transports VENDORED byte-identical in nosi/nosi/kstep/ (91e6e47). CPU tensors, K3X's AdversarialTransport (seeded delays, reordering, bursts; "force_only" for
 the scripted tests), CPU events with a done flag. Each test has a negative control (a K3X mutation switch or a defect
@@ -68,7 +68,10 @@ class Be:
             self.waits += 1
 
 
-def world(C=4, X=4, R_ver=2, seed=0, mode="force_only", mut=None, cls=None, max_delay=3, svc_kw=None, trash=0):
+def world(C=4, X=4, R_ver=2, seed=0, mode="force_only", mut=None, cls=None, max_delay=3, svc_kw=None, trash=0,
+          publish=None):
+    """publish (S-C's exact wait, F17): None = the plain adversarial transport; True / False = wrapped in S-C's
+    PublishingTransport (False: it never publishes, a negative control)."""
     g = torch.Generator().manual_seed(seed)
     host_k = [torch.randn(B, NB * BS, H, D, generator=g) for _ in range(L)]
     host_v = [torch.randn(B, NB * BS, H, D, generator=g) for _ in range(L)]
@@ -81,6 +84,8 @@ def world(C=4, X=4, R_ver=2, seed=0, mode="force_only", mut=None, cls=None, max_
     store_b = [torch.zeros(B, n, H) for _ in range(L)]
     be = Be()
     tp = TR.AdversarialTransport(be, host_k, host_v, store_k, store_v, BS, seed, mode=mode, max_delay=max_delay)
+    if publish is not None:
+        tp = SC.PublishingTransport(tp, publish=publish)
     gather = RES.TorchGather(host_k, host_v, store_k, store_v)
     svc = (cls or RES.Residency)(L, B, H, C, X, R_ver, tp, gather, store_b=store_b, cis=cis,
                                  block_bytes=BS * 2 * D * 4, host_wait=be.host_wait, mut=mut, **(svc_kw or {}))
@@ -866,7 +871,7 @@ def _trash_intact(w):
                for l in range(L))
 
 
-def _lockstep_sc(seed, C, X, R_ver, sched, sc_mut=None, hb=15, mirror_drop=None, trace=False, trash=0):
+def _lockstep_sc(seed, C, X, R_ver, sched, sc_mut=None, hb=15, mirror_drop=None, trace=False, trash=0, exact=False):
     """v1 under the S-C schedule (arrivals at the tick's start, draft transfers at end_tick, waited and urgent blocks
     read in place and admitted at the next poll) and S-C driven by the same schedule, transports seeded alike, reader
     events completed two ticks late in both. At the start of every tick (after the poll and S-C's mirror delta) S-C's
@@ -875,7 +880,8 @@ def _lockstep_sc(seed, C, X, R_ver, sched, sc_mut=None, hb=15, mirror_drop=None,
     tick), the two worlds and the largest number of shared extras borrowed in v1 after a tick."""
     common = dict(C=C, X=X, R_ver=R_ver, seed=seed, mode="delay", max_delay=4)
     wv = world(**common, svc_kw=dict(poll_in_resolve=False, defer_issue=True, defer_admit=True), trash=trash)
-    ws = world(**common, cls=SC.ResidencySC, svc_kw=dict(nblk=NB, sc_mut=sc_mut, mirror_drop=mirror_drop), trash=trash)
+    ws = world(**common, cls=SC.ResidencySC, trash=trash, publish=True if exact else None,
+               svc_kw=dict(nblk=NB, sc_mut=sc_mut, mirror_drop=mirror_drop, wait_mode="exact" if exact else "probe"))
     if trash:
         for w in (wv, ws):
             _fill_trash(w)
@@ -1002,7 +1008,8 @@ H2D = ("torch.tensor(", "as_tensor(", "from_numpy(", ".copy_(", "non_blocking", 
 
 def test_F12d_sc_per_layer_path_has_no_host_transfer():
     """F12d: the per-layer path of S-C (ResidencySC.resolve, DeviceMirror.layer, device_verify, device_draft,
-    rank_in_group and the GPU device operations) holds no host read of a device value, no call of the counted device
+    rank_in_group, the GPU device operations with both waits, wait_list) holds no host read of a device value, no call
+    of the counted device
     read (_d2h), and no host-to-device copy (no tensor built from host data, no copy_, no move to the device, no mirror
     refresh, no _h2d). resolve reaches the two per-tick copies (sync_mirror, _tick_rows) only at a tick's first layer;
     F12 / F12b / F14 count them. Negative controls: the same checks find the per-layer read in S-B's resolve, and the
@@ -1010,7 +1017,7 @@ def test_F12d_sc_per_layer_path_has_no_host_transfer():
     import inspect
     d2h = FORBIDDEN + ("_d2h(",)
     for fn in (SC.ResidencySC.resolve, SC.DeviceMirror.layer, SC.device_verify, SB.device_draft, SB.rank_in_group,
-               SC.CudaDeviceOps.wait, SC.CudaDeviceOps.gather):
+               SC.CudaDeviceOps.wait, SC.CudaDeviceOps.gather, SC.wait_list):
         src = inspect.getsource(fn)
         assert [tok for tok in d2h + H2D if tok in src] == [], fn.__qualname__
     assert [tok for tok in d2h if tok in inspect.getsource(SB.ResidencySB.resolve)] != []
@@ -1345,3 +1352,77 @@ def test_F16_a_twin_overflow_is_refused_at_the_tick_it_happens():
     assert t2 is None and len(log2) == 6
     assert log2[T0][5] > log2[T0][4]                          # tick T0's decisions were applied: the void spreads
     assert bool(twin2.overflow)                               # seen only now, after the tick
+
+
+# =====================================================================================================================
+# F17 the EXACT device wait on the generation board (Q-T3 (b), note 12f)
+# =====================================================================================================================
+def _board_never_ahead(svc):
+    """Every board entry is at most its slot's generation (a publication never runs ahead of a take)."""
+    gens = torch.zeros_like(svc.board.t)
+    for l, pool in enumerate(svc.pools):
+        for (b, h), st in pool.streams.items():
+            for i, s in enumerate(st.slots):
+                gens[l, b, h, i] = s.gen
+    return bool((svc.board.t <= gens).all())
+
+
+def test_F17_the_exact_wait_equals_v1_on_the_f6_schedule():
+    """F17: S-C with the EXACT wait (ExactWaitSim: it reads only the decision's wait list and the generation board,
+    which the transport publishes after each landing) equals v1 over F6's 24 ticks: pages, the content of every verify
+    page at the read point, the state and the counters every tick, the device mirror every tick. The exact wait drove
+    transfers (it spun), never ran out (err False), and the board is never ahead of a slot's generation."""
+    bad, _, ws, _ = _lockstep_sc(1, C=8, X=48, R_ver=8, sched=_sched(101, 24, True), exact=True)
+    assert bad == [], bad[:3]
+    dev = ws.svc.dev
+    assert isinstance(dev, SC.ExactWaitSim) and dev.spins > 0 and not bool(dev.err)
+    assert _board_never_ahead(ws.svc)
+
+
+def _f17(publish=True, stale_ok=False):
+    """The exact wait on a REUSED slot: u0's block 3 lands in slot 0 (generation 1, published when publish); u0 ends
+    and slot 0 is freed; u1's draft takes slot 0 again for its block 5 (generation 2, in flight: force_only); u1's
+    verifier then selects block 5 and waits for slot 0's generation 2. S-C watches the wait's error flag. Returns
+    (world, rows, sel, the verifier's plan, the exception of that tick's end_tick or None)."""
+    w = world(C=4, X=4, R_ver=1, cls=SC.ResidencySC, publish=publish, svc_kw=dict(nblk=NB, wait_mode="exact"))
+    svc = w.svc
+    svc.dev.stale_ok = stale_ok
+    svc.watch_flag("wait_err", svc.dev.err)
+    svc.begin_request(0, "u0")
+    svc.poll()
+    p = svc.resolve(0, [Row(0, "d", ("u0", 1, 1), 300, 10)], S([[3], []]))
+    svc.read_done(0, p, Ev(done=True))
+    svc.end_tick()                                          # slot 0 <- block 3, generation 1
+    land_all(w)                                             # it lands and arrives (LRU)
+    svc.end_request("u0")
+    svc.poll()                                              # slot 0: RELEASING -> FREE (never read)
+    assert svc.stream(0, 0, 0).slots[0].state == OWN.FREE
+    svc.begin_request(0, "u1")
+    p = svc.resolve(0, [Row(0, "d", ("u1", 1, 1), 300, 10)], S([[5], []]))
+    svc.read_done(0, p, Ev(done=True))
+    svc.end_tick()                                          # slot 0 <- block 5, generation 2, in flight
+    assert svc.stream(0, 0, 0).slots[0].gen == 2 and svc.stream(0, 0, 0).slots[0].state == OWN.INFLIGHT
+    svc.poll()
+    rows, sel = [Row(0, "v", ("u1", 1, 1), 301, 10)], S([[5], []])
+    p = svc.resolve(0, rows, sel)
+    svc.read_done(0, p, Ev(done=True))
+    try:
+        svc.end_tick()
+        return w, rows, sel, p, None
+    except ER.CapacityRefusal as e:
+        return w, rows, sel, p, e
+
+
+def test_F17b_the_exact_wait_on_a_reused_slot_and_its_negative_controls():
+    """F17b: on a reused slot (generation 1 published, generation 2 in flight) the exact wait spins until the board
+    shows generation 2, so the verifier reads block 5 (the content check holds) and the tick ends normally. Negative
+    controls: (1) a wait that accepts the slot's previous generation reads block 3's rows (caught by the content
+    check); (2) a transport that never publishes makes the bounded spin run out: the error flag, watched with S-C's
+    one read per tick, refuses the tick (no hang)."""
+    w, rows, sel, p, exc = _f17()
+    assert exc is None and _content_ok(w, 0, rows, sel, p) and w.svc.dev.spins >= 1 and not bool(w.svc.dev.err)
+    assert int(w.svc.board.t[0, 0, 0, 0]) == 2 and _board_never_ahead(w.svc)
+    w1, rows1, sel1, p1, exc1 = _f17(stale_ok=True)
+    assert not _content_ok(w1, 0, rows1, sel1, p1)
+    w2, _, _, _, exc2 = _f17(publish=False)
+    assert exc2 is not None and "wait_err" in str(exc2) and bool(w2.svc.dev.err)

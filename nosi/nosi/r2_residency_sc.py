@@ -51,7 +51,10 @@ THE DEVICE OPERATIONS (dev):
                  it completes); it changes only when the main stream runs. gather: NOSI's flash_h2d_from_mask_bias (K
                  and bias) and flash_h2d_from_mask (V) with the decision's device load ids, after a main-stream wait on
                  every host write-back registered since the last gather (T4). The slots are FREE, so their last reader
-                 completed (K4, T3).
+                 completed (K4, T3). wait_mode="exact" (note 12f) replaces the event waits by ONE Triton program that
+                 spins on the generation board (GenBoard; the transport publishes (slot, gen) after the rows) for
+                 exactly the slots of the layer's wait list; err reports a spin that ran out (watch_flag).
+  ExactWaitSim   the CPU stand-in of the exact wait (device data only: the wait list and the board).
 
 THE SCHEDULE and v1's reference: arrivals polled at the tick's start; draft transfers issued at end_tick; the waited
 and the urgent blocks read in place and admitted at the next poll: Residency(poll_in_resolve=False, defer_issue=True,
@@ -365,21 +368,191 @@ class CpuDeviceSim:
                     self.gathered += 1
 
 
-class CudaDeviceOps:
-    """S-C's device operations on the GPU (module docstring). SOURCE ONLY, NOT RUN YET (GPU gate FG1)."""
+# ====================================================================================================================
+# the EXACT device wait (note 12f): a generation board the transports publish into, a wait on exactly the needed slots
+# ====================================================================================================================
+class GenBoard:
+    """The generation board (L, B, H, C + X) int64 on the device: per slot, the generation of the last transfer whose
+    rows LANDED there. The transport writes it on the stream that landed the rows, AFTER them (gilfree: the scatter
+    stream after the release; CPU tests: PublishingTransport). 0 = nothing landed yet (a take makes gen >= 1). The
+    generations of a slot only grow, and a slot in flight is never taken again (T3), so "board >= gen" means "the
+    awaited transfer landed"."""
 
-    def __init__(self, svc: "ResidencySC", host_k, host_v, store_k, store_v, store_b, cis, block: int = BLOCK):
+    def __init__(self, L: int, B: int, H: int, npos: int, device):
+        self.L, self.B, self.H, self.npos = int(L), int(B), int(H), int(npos)
+        self.t = torch.zeros((self.L, self.B, self.H, self.npos), dtype=torch.int64, device=device)
+
+    def flat(self, l: int, b: int, h: int, slot: int) -> int:
+        return ((l * self.B + b) * self.H + h) * self.npos + slot
+
+    def unflat(self, f: int) -> Tuple[int, int, int, int]:
+        f, slot = divmod(f, self.npos)
+        f, h = divmod(f, self.H)
+        l, b = divmod(f, self.B)
+        return l, b, h, slot
+
+
+def wait_list(dec: VerifyDecision, l: int, board: GenBoard) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The exact wait's list, on the device, from one layer's verify decision: per entry the board index of its
+    in-flight slot (-1 for an entry that waits for nothing) and the generation it waits for. Fixed length (the
+    decision's N): capturable."""
+    bb, hh = dec.bh
+    f = ((l * board.B + bb) * board.H + hh) * board.npos + dec.t["infl_slot"].clamp(min=0)
+    return torch.where(dec.t["infl"] != 0, f, torch.full_like(f, -1)), dec.t["infl_gen"]
+
+
+class PublishingTransport:
+    """The CPU stand-in of the publication, around a K3X transport that cannot publish itself (the tests'
+    AdversarialTransport): the K3X interface passes through unchanged (the same deliveries, the same pending list),
+    and every transfer the inner transport has LANDED (observed after its poll / force) is published into the board:
+    board[slot] = gen. progress_slot() is the stand-in of TIME for the CPU spin: the transfer in flight into that slot
+    lands now. publish=False is a NEGATIVE CONTROL (a transport that never publishes)."""
+
+    def __init__(self, inner, publish: bool = True):
+        self.inner = inner
+        self.publish = bool(publish)
+        self.board: GenBoard = None
+        self._open: Dict[int, object] = {}                # seq -> a transfer issued and not seen landed
+
+    @property
+    def name(self):
+        return self.inner.name
+
+    @property
+    def pending(self):
+        return self.inner.pending
+
+    def attach_board(self, board: GenBoard) -> None:
+        self.board = board
+
+    def _publish_landed(self) -> None:
+        for seq, tr in list(self._open.items()):
+            if self.inner.done(tr):
+                del self._open[seq]
+                if self.publish and self.board is not None:
+                    self.board.t.view(-1)[self.board.flat(tr.layer, tr.b, tr.h, tr.slot)] = tr.gen
+
+    def issue(self, layer: int, transfers) -> None:
+        self.inner.issue(layer, transfers)
+        for tr in transfers:
+            self._open[tr.seq] = tr
+        self._publish_landed()
+
+    def poll(self) -> None:
+        self.inner.poll()
+        self._publish_landed()
+
+    def done(self, tr) -> bool:
+        return self.inner.done(tr)
+
+    def force(self, tr) -> None:
+        self.inner.force(tr)
+        self._publish_landed()
+
+    def progress_slot(self, l: int, b: int, h: int, slot: int) -> bool:
+        for tr in list(self._open.values()):
+            if (tr.layer, tr.b, tr.h, tr.slot) == (l, b, h, slot):
+                self.force(tr)
+                return True
+        return False
+
+
+class ExactWaitSim(CpuDeviceSim):
+    """The CPU stand-in of the EXACT device wait. It reads only DEVICE data: the decision's wait list (wait_list) and
+    the generation board; never the host's transfer records. Per entry, in K3X order, it spins while the board is
+    below the awaited generation; a spin round is the stand-in of time (the transport's progress_slot), at most
+    max_spin rounds. An entry still short (or past) after the spin sets the device error flag `err` (the GPU kernel's
+    bounded spin does the same); S-C watches it (watch_flag), so such a tick is refused at its end_tick, never a hang.
+    stale_ok is a NEGATIVE CONTROL: the spin accepts the slot's previous generation (gen - 1)."""
+
+    def __init__(self, svc: "ResidencySC", max_spin: int = 4, stale_ok: bool = False):
+        super().__init__(svc)
+        if not callable(getattr(svc.tp, "progress_slot", None)):
+            raise ValueError("ExactWaitSim needs a publishing transport (progress_slot, attach_board)")
+        self.max_spin, self.stale_ok = int(max_spin), bool(stale_ok)
+        self.err = torch.zeros((), dtype=torch.bool, device=svc.device)
+        self.spins = 0
+
+    def wait(self, l: int, dec: VerifyDecision) -> None:
+        board = self.svc.board
+        idx, gen = wait_list(dec, l, board)
+        flat = board.t.view(-1)
+        for f, g in zip(idx.tolist(), gen.tolist()):
+            if f < 0:
+                continue
+            want = g - 1 if self.stale_ok else g
+            k = 0
+            while flat[f] < want and k < self.max_spin:
+                self.svc.tp.progress_slot(*board.unflat(f))
+                k += 1
+            got = flat[f]
+            if got < want or (not self.stale_ok and got != g):
+                self.err |= True
+            self.spins += k
+            self.waited += 1
+
+
+_WAIT_KERNEL = None
+
+
+def _wait_kernel():
+    """The exact wait's Triton kernel, built on first use. SOURCE ONLY, NOT RUN YET (GPU gate FG1). ONE program (one
+    SM: the scatter stream's kernels keep the others) walks the wait list in blocks; per block it spins with VOLATILE
+    loads of the board until every listed entry reached its generation, at most max_spin rounds; then any entry short
+    or past raises err (int32, atomic max). The board write that ends a spin is enqueued after the scatter on the
+    scatter stream, so the slot's rows are complete when the main stream's next kernel reads them."""
+    global _WAIT_KERNEL
+    if _WAIT_KERNEL is None:
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def kernel(board_ptr, idx_ptr, gen_ptr, n, err_ptr, max_spin, BLOCK: tl.constexpr):
+            for start in range(0, n, BLOCK):
+                offs = start + tl.arange(0, BLOCK)
+                inb = offs < n
+                idx = tl.load(idx_ptr + offs, mask=inb, other=-1)
+                want = tl.load(gen_ptr + offs, mask=inb, other=0)
+                live = idx >= 0
+                safe = tl.where(live, idx, 0)
+                got = tl.load(board_ptr + safe, mask=live, other=0, volatile=True)
+                k = 0
+                while (tl.max((live & (got < want)).to(tl.int32), axis=0) > 0) & (k < max_spin):
+                    got = tl.load(board_ptr + safe, mask=live, other=0, volatile=True)
+                    k += 1
+                tl.atomic_max(err_ptr, tl.max((live & (got != want)).to(tl.int32), axis=0))
+        _WAIT_KERNEL = kernel
+    return _WAIT_KERNEL
+
+
+class CudaDeviceOps:
+    """S-C's device operations on the GPU (module docstring). SOURCE ONLY, NOT RUN YET (GPU gate FG1).
+    wait_mode "superset": the main stream waits on the completion event of every transfer in flight at the layer.
+    wait_mode "exact" (note 12f): one Triton program on the main stream spins on the generation board for exactly the
+    in-flight slots that the layer's verify rows read (wait_list); no host loop, no host wait; err (int32, on the
+    device) reports a spin that ran out; S-C watches it. FG1 compares the two."""
+
+    def __init__(self, svc: "ResidencySC", host_k, host_v, store_k, store_v, store_b, cis, block: int = BLOCK,
+                 wait_mode: str = "superset", max_spin: int = 1 << 22):
         from .flash_cache_engine.flash_h2d_mask import flash_h2d_from_mask
         from .flash_cache_engine.flash_h2d_mask_bias import flash_h2d_from_mask_bias
+        if wait_mode not in ("superset", "exact"):
+            raise ValueError("wait_mode %r" % (wait_mode,))
         self.svc = svc
         self.h2d, self.h2d_bias = flash_h2d_from_mask, flash_h2d_from_mask_bias
         self.host_k, self.host_v, self.store_k, self.store_v = host_k, host_v, store_k, store_v
         self.store_b, self.cis = store_b, cis
         self.bs = block
+        self.wait_mode, self.max_spin = wait_mode, int(max_spin)
+        self.err = torch.zeros((), dtype=torch.int32, device=svc.device)
         self.events_waited = 0
         self.submission_waits = 0
 
     def wait(self, l: int, dec: VerifyDecision) -> None:
+        if self.wait_mode == "exact":
+            idx, gen = wait_list(dec, l, self.svc.board)
+            _wait_kernel()[(1,)](self.svc.board.t, idx, gen, idx.shape[0], self.err, self.max_spin, BLOCK=1024)
+            return
         main = torch.cuda.current_stream()
         seen = set()
         for tr in list(self.svc.inflight.values()):
@@ -412,11 +585,17 @@ class ResidencySC(ResidencySB):
     """Residency with the verify and the draft rows decided on the device (module docstring). Extra arguments (beyond
     S-B's device, nblk, sb_mut): sc_mut (negative controls: device_verify's, and no_wait: the device does not wait for
     the in-flight blocks), devops (the device operations; on the CPU the stand-in by default), mirror_drop (NEGATIVE
-    CONTROL, tests only: the journal kinds, or "owner", whose changes are NOT sent to the device mirror)."""
+    CONTROL, tests only: the journal kinds, or "owner", whose changes are NOT sent to the device mirror), wait_mode
+    (the CPU stand-in's wait: "probe" = CpuDeviceSim, the host's transfer records; "exact" = ExactWaitSim, the
+    generation board, which needs a publishing transport; on the GPU CudaDeviceOps' own wait_mode decides).
+    The generation board (self.board, note 12f) is attached to every transport that publishes (attach_board)."""
 
-    def __init__(self, *args, sc_mut=None, devops=None, mirror_drop=None, **kw):
+    def __init__(self, *args, sc_mut=None, devops=None, mirror_drop=None, wait_mode: str = "probe", **kw):
         kw["defer_admit"] = True
         super().__init__(*args, **kw)
+        self.board = GenBoard(self.L, self.B, self.H, self.n_hist, self.device)
+        if callable(getattr(self.tp, "attach_board", None)):
+            self.tp.attach_board(self.board)
         self.mirrors = None                               # S-B's per-layer host-refreshed mirrors are not used
         self.dmirror = DeviceMirror(self.L, self.B, self.H, self.nblk, self.n_hist, self.device)
         self.mirror_drop = set(mirror_drop or ())
@@ -432,7 +611,9 @@ class ResidencySC(ResidencySB):
         if devops is None:
             if self.device.type != "cpu":
                 raise ValueError("S-C on %s needs its device operations (CudaDeviceOps)" % self.device)
-            devops = CpuDeviceSim(self)
+            if wait_mode not in ("probe", "exact"):
+                raise ValueError("wait_mode %r" % (wait_mode,))
+            devops = ExactWaitSim(self) if wait_mode == "exact" else CpuDeviceSim(self)
         self.dev = devops
         self._tick: List[Dict] = []
         self._hist_unwaited: List = []                    # host write-backs the main stream did not wait on yet

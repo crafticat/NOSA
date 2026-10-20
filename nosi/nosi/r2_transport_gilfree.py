@@ -78,6 +78,7 @@ class GilfreeTransport:
         self.stats.update(releases=0, threads_min=None, threads_max=None)
         self.staging_bytes = 2 * ring * nb
         self.background = bool(background)
+        self.board = None                                      # the generation board (attach_board), or None
         self._error: Optional[BaseException] = None
         if self.background:
             self._q: "queue.Queue" = queue.Queue()
@@ -100,6 +101,24 @@ class GilfreeTransport:
                 self._error = e
             finally:
                 flag.set()
+
+    def attach_board(self, board) -> None:
+        """The exact device wait (residency note 12f): after each release, (slot, generation) of its transfers is
+        published into the board (board.t, board.flat) on the stream that landed the rows, AFTER them: the scatter
+        stream on the GPU (a pinned copy and an index_put_ enqueued there), at once on the CPU."""
+        self.board = board
+
+    def _publish(self, transfers: List[Transfer]) -> None:
+        if self.board is None or not transfers:
+            return
+        host = torch.tensor([[self.board.flat(tr.layer, tr.b, tr.h, tr.slot) for tr in transfers],
+                             [tr.gen for tr in transfers]], dtype=torch.int64)
+        if self.cuda:
+            with torch.cuda.stream(self.scatter):
+                d = host.pin_memory().to(self.board.t.device, non_blocking=True)
+                self.board.t.view(-1).index_put_((d[0],), d[1])
+        else:
+            self.board.t.view(-1).index_put_((host[0],), host[1])
 
     def threads_ok(self) -> bool:
         """Agent E's rule (gilfree_pack.threads_ok): every chunk so far ran on exactly the requested team."""
@@ -142,6 +161,7 @@ class GilfreeTransport:
             lo, hi = self.stats["threads_min"], self.stats["threads_max"]
             self.stats["threads_min"] = st[7] if lo is None else min(lo, st[7])
             self.stats["threads_max"] = st[8] if hi is None else max(hi, st[8])
+        self._publish(transfers)                               # after the rows, on the scatter stream (exact wait)
         if self.cuda:
             ev = torch.cuda.Event()
             ev.record(self.scatter)
