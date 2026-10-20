@@ -337,7 +337,10 @@ def test_G7_quality_helpers():
     rec = GATE.quality_records(ref, tok, bi)
     assert rec["ref_token_mismatch"] == 0 and int((~rec["agree"]).sum()) == 2
     summ, diffs = GATE.summarize_quality([("t", rec)], "T")
-    assert summ["comparisons"] == N * B and summ["differences"] == 2 and abs(summ["agreement"] - 16 / 18) < 1e-9
+    assert summ["comparisons"] == N * B and summ["differences"] == 2
+    assert summ["agree_count"] == 16 and summ["agreement"] == 16 / 18                       # exact counts, float64
+    assert summ["agree_count_per_doc"] == [6, 5, 5] and summ["agreement_per_doc"] == [1.0, 5 / 6, 5 / 6]
+    assert summ["agreement_per_label"] == {"t": 16 / 18}
     got = sorted((d["step"], d["doc"], d["bi_token"], d["margin_class"]) for d in diffs)
     assert got == [(2, 1, 3, "[0.01, 0.1)"), (4, 2, 7, "[0.1, 0.5)")]
     assert all(d["regret"] > 0 for d in diffs)
@@ -429,6 +432,8 @@ def test_G8_step_script_uuid_file_and_pins(tmp_path):
     script = EFF / "r2_g0bi_step.sh"
     env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_"))}
     sha = "0" * 40
+    dflt = GATE.parse_args(["--out", "o", "--workload", "w", "--biattn", "b"])
+    assert dflt.parts == ["C", "NI", "W"] and dflt.gemm == "exact"          # the gate's defaults equal the step's choice
 
     def run(job, content=None, dry=True):
         if content is not None:
@@ -462,9 +467,10 @@ def test_G8_step_script_uuid_file_and_pins(tmp_path):
     assert "gpu_uuid %s (%s/216.gpu_uuid)" % (uid, tmp_path) in r.stdout
     assert ("piece 3 %s:%s blob %s" % (PIECE3_V2["sha"], PIECE3_V2["path"], PIECE3_V2["blob"])) in r.stdout
     assert "BI GEMM unset" in r.stdout
+    # the command is printed with printf %q, which writes a comma as "\,": --parts C,NI,W prints as "--parts C\,NI\,W"
     for arg in ("--biattn /mnt/beegfs/ojerbi/r2-runs/g0bi/g0bi_t1_216.step/piece3_bi_paged_attention.py", "--gemm exact",
                 "--batch 8",
-                "--S 16128", "--steps-c 256", "--windows 4", "--steps-w 64", "--m-fix 32", "--parts C,NI,W",
+                "--S 16128", "--steps-c 256", "--windows 4", "--steps-w 64", "--m-fix 32", "--parts C\\,NI\\,W",
                 "NOSI_R2_DECODE=1", "NOSI_ATTN_SPLITS=4", "NOSI_POOL_BLOCKS=0"):
         assert arg in r.stdout, arg
     assert "--bigemm" not in r.stdout

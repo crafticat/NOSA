@@ -219,10 +219,15 @@ def summarize_quality(recs, tag):
         k = int(sel.sum())
         d = int((sel & ~cat["agree"]).sum())
         classes.append(dict(cls="[%g, %g)" % (lo, hi), steps=k, differences=d, rate=(d / k if k else None)))
-    per_doc = cat["agree"].float().mean(0).tolist() if cat["agree"].dim() == 2 else None
-    summ = dict(part=tag, comparisons=n, agreement=float(cat["agree"].float().mean()), differences=len(diffs),
-                agreement_per_doc=per_doc,
-                agreement_per_label={label: float(r["agree"].float().mean()) for label, r in recs},
+    # every fraction is an exact count over an exact count, divided in float64 (Python floats)
+    agree_n = int(cat["agree"].sum())
+    per_doc_n = cat["agree"].sum(0).tolist() if cat["agree"].dim() == 2 else None
+    steps_n = int(cat["agree"].shape[0])
+    summ = dict(part=tag, comparisons=n, agree_count=agree_n, agreement=(agree_n / n if n else None),
+                differences=len(diffs),
+                agree_count_per_doc=per_doc_n, steps_per_doc=steps_n,
+                agreement_per_doc=([c / steps_n for c in per_doc_n] if per_doc_n is not None and steps_n else None),
+                agreement_per_label={label: int(r["agree"].sum()) / int(r["agree"].numel()) for label, r in recs},
                 max_d=dict(quantiles=quantiles(cat["max_d"]), histogram=histogram(cat["max_d"], D_BINS),
                            exact_zero=int((cat["max_d"] == 0).sum())),
                 ref_margin=dict(quantiles=quantiles(cat["ref_margin"]), histogram=histogram(cat["ref_margin"], MARGIN_BINS)),
@@ -418,7 +423,7 @@ def part_w(a, model, ops, docs, res, gates, diffs, save):
         timing[label] = dict(sh_ms_per_step=round(1e3 * sh["sec"] / n, 2), bi_ms_per_step=round(1e3 * tf["sec"] / n, 2))
         del sh, tf, frw
         free()
-        log("W%d: agreement %.4f" % (w, float(rec["agree"].float().mean())))
+        log("W%d: agreement %d / %d" % (w, int(rec["agree"].sum()), int(rec["agree"].numel())))
     summ, d = summarize_quality(recs, "W")
     diffs += d
     res["W"] = dict(windows=a.windows, steps_per_window=n, batch=B, quality=summ, free_running=fr, timing=timing,
