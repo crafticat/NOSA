@@ -40,10 +40,12 @@ checks it with one host sync). pos_host / active_host are CPU copies of
 pos / active with the same values (the host loop of the write-back reads
 them; reading the device values would sync).
 
-WRITE-BACK BACKEND. The torch backend here is host-driven: one
-copy_(non_blocking=True) per full request and tensor. It is not
-CUDA-graph-capturable. The device-driven Triton alternative is the open GPU
-question of the plan.
+WRITE-BACK BACKEND. DecodeBody's own backend is host-driven: one
+copy_(non_blocking=True) per full request and tensor; it is not
+CUDA-graph-capturable. DeviceWritebackBody (end of this module) takes a
+device-driven kernel instead (r2_writeback.masked_writeback: Triton, stores
+through the pinned host pointer, reads the mask and the positions on the
+device). It is injected, so this module still imports only torch.
 
 Imports only torch.
 """
@@ -248,3 +250,21 @@ class DecodeBody:
         """(B,) bool: the tail id pos // 64 is in the selection of every head."""
         tail = (self.positions(pos) // eng.block_size).view(1, -1, 1)
         return (topk_idx == tail).any(-1).all(0)
+
+
+class DeviceWritebackBody(DecodeBody):
+    """DecodeBody with a DEVICE-DRIVEN write-back: the kernel reads the device mask `full` and the device positions
+    `p` (both computed on the device inside decode()); the host mirrors are not read by the write-back (decode() still
+    validates them on the host before any write). writeback_kernel has the signature of
+    r2_writeback.masked_writeback(k_gpu, v_gpu, k_cpu, v_cpu, full, pos, tail0, block_size); it is REQUIRED (no
+    default), like f4_fix. Everything else is DecodeBody's."""
+
+    def __init__(self, f4_fix: bool, writeback_kernel):
+        super().__init__(f4_fix)
+        if not callable(writeback_kernel):
+            raise TypeError("writeback_kernel must be callable, got %r" % (writeback_kernel,))
+        self.writeback_kernel = writeback_kernel
+
+    def writeback(self, eng, full, full_host, p, p_host) -> None:
+        self.writeback_kernel(eng._k_gpu, eng._v_gpu, eng._k_cpu, eng._v_cpu, full, p,
+                              int(eng._tail_block_idx_on_gpu) * int(eng.block_size), int(eng.block_size))

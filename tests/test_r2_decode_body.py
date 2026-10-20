@@ -735,6 +735,58 @@ def test_decode_refuses_out_of_range_and_bad_inputs():
         assert torch.equal(getattr(eng, k), snap[k]), k
 
 
+# ---------------------------------------------------------------------------
+# the device-driven write-back backend (r2_writeback.py) inside the body
+# ---------------------------------------------------------------------------
+WBMOD = N / "r2_writeback.py"
+wbm = _load(WBMOD, "nosi_r2_writeback_for_body_test") if WBMOD.is_file() else None
+
+
+class _CountingKernel:
+    """masked_writeback_torch that records what decode() hands it: the DEVICE mask and positions."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, k_gpu, v_gpu, k_cpu, v_cpu, full, pos, tail0, block_size):
+        self.calls.append((full.clone(), pos.clone(), tail0, block_size))
+        wbm.masked_writeback_torch(k_gpu, v_gpu, k_cpu, v_cpu, full, pos, tail0, block_size)
+
+
+def _dev_body(f4_fix=False):
+    if wbm is None:
+        pytest.skip("no nosi/nosi/r2_writeback.py")
+    return rb.DeviceWritebackBody(f4_fix, wbm.masked_writeback_torch)
+
+
+def test_device_writeback_body_geq():
+    run_eq(_dev_body(), 6079, 4, steps=70)
+
+
+def test_device_writeback_body_grag():
+    run_rag(_dev_body(), [6016, 6017, 6079, 6100], steps=120)
+
+
+def test_device_writeback_body_gpoison():
+    assert run_poison(_dev_body()) == [0]
+
+
+def test_device_writeback_body_reads_the_device_mask():
+    if wbm is None:
+        pytest.skip("no nosi/nosi/r2_writeback.py")
+    k = _CountingKernel()
+    body = rb.DeviceWritebackBody(False, k)
+    eng, twin, keys, values, cis = _setup([6079, 6016, 6143])
+    act = torch.tensor([True, True, False])
+    p = _step(body, eng, twin, keys, values, cis, act)
+    assert len(k.calls) == 1, "the kernel runs once per decode step"
+    full, pos, tail0, bs = k.calls[0]
+    assert full.tolist() == [True, False, False], "full = active & (p + 1) % 64 == 0, computed on the device"
+    assert torch.equal(pos, p) and (tail0, bs) == (TAIL0, BS)
+    with pytest.raises(TypeError):
+        rb.DeviceWritebackBody(False, None)
+
+
 def test_body_imports_only_torch():
     tree = ast.parse(BODY.read_text(encoding="utf-8"))
     mods = set()

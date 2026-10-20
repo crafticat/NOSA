@@ -51,15 +51,20 @@ ONE STEP. Request b writes position p = pos[b], in the shipped order
 (nosa_llama.py:575-585, then :618):
   1. key compression, DEFERRED: if 16 n_comp + 32 <= p, take the 32 keys of
      window n_comp (positions 16 n_comp .. 16 n_comp + 31, all < p) from the
-     ring IN POSITION ORDER, shape (k, 32, H, D), and .mean(1)
-     (nosa_llama.py:577). Write comp_k[b, n_comp]; n_comp += 1.
+     ring IN POSITION ORDER and .mean(1) (nosa_llama.py:577). The mean is
+     taken over ALL B requests, shape (B, 32, H, D), and only the due rows are
+     written (step 6, shape-stable summaries: the reduction's launch never
+     depends on how many requests are due). Write comp_k[b, n_comp];
+     n_comp += 1.
      Shipped: cache_engine.py:683 fires when no_compress_k_len >= 32 BEFORE
      the write of the new key.
   2. ring[b, p % 64] = key.
   3. total_cis[b, p] = cis.
   4. cis compression, IMMEDIATE: if 16 n_ccis + 32 <= p + 1, take total_cis
-     rows 16 n_ccis .. 16 n_ccis + 31 (all <= p), permute to (H, k, 32) and
-     .mean(-1) (cache_engine.py:757). Write ccis[:, b, n_ccis]; n_ccis += 1.
+     rows 16 n_ccis .. 16 n_ccis + 31 (all <= p), permute to (H, B, 32) and
+     .mean(-1) (cache_engine.py:757), again over ALL B requests (rows clamped
+     below N_max); only the due rows are written. Write ccis[:, b, n_ccis];
+     n_ccis += 1.
      Shipped: :754 fires when tail_cis_len reaches 32 AFTER the write; the
      twin appends the summary as the commented-out cat at :758 intends.
   5. pos += 1.
@@ -195,7 +200,9 @@ class PositionalTwin:
     # -------------------------------------------------------------------- step
     def key_window(self, b: torch.Tensor, start: torch.Tensor) -> torch.Tensor:
         """Raw keys at positions start .. start + 31 of requests b, in position
-        order: (k, 32, H, D). The caller guarantees the positions are live."""
+        order: (k, 32, H, D). For a request whose window is due the positions
+        are live; step() also reads the windows of the other requests (finite,
+        possibly stale ring rows) and discards them."""
         rows = (start[:, None] + self._win[None, :]) % RING
         return self.ring[b[:, None], rows]
 
