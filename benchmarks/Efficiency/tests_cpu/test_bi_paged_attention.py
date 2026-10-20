@@ -172,29 +172,102 @@ def test_bias_is_added_to_the_raw_dot_before_the_scale_and_only_listed_rows_coun
     assert torch.equal(run(bi.bi_paged_decode_reference, dict(c, bias=b3), softmax_scale=scale), out)
 
 
-@pytest.mark.parametrize("last", [1, 2, 37, 63, 64])
+def _read_rows(c, r):
+    """The exact (entry, cache row, head) set that row r attends: every listed page in full except the last, which
+    is cut at its last_len."""
+    n, last = int(c["seq_idx"][r]), int(c["last_len"][r])
+    out = set()
+    for h in range(c["table"].shape[1]):
+        npg = int(c["num_pages"][r, h])
+        for i in range(npg):
+            s = int(c["table"][r, h, i])
+            out.update((n, s * PAGE + j, h) for j in range(PAGE if i < npg - 1 else last))
+    return out
+
+
+def _extent_cut_failures(fn, c):
+    """The cut of the last page, checked two ways (an empty list = pass):
+    (a) each row ALONE: NaN in K, V and bias at every row of its last page at or beyond its own last_len (every head)
+        leaves its output bitwise unchanged; +7 on the key of its LAST READ row (last_len - 1) changes it;
+    (b) the BATCH: NaN at the rows beyond EVERY row's extent (the union M); a row whose exact read set (_read_rows)
+        misses M is bitwise unchanged, a row that reads part of M (a page that is another row's last page, read in
+        full, or the same last page with a longer extent) is changed; at least one row is unchanged.
+    The first version (c866d7c) excluded only rows whose OWN last page another row read in full, so a row that read
+    another row's last page in full was wrongly expected unchanged (CPU job 2190749, row 7)."""
+    bad = []
+    R, Hkv = c["table"].shape[:2]
+    nan = float("nan")
+    tab, npg, si, ll = c["table"].tolist(), c["num_pages"].tolist(), c["seq_idx"].tolist(), c["last_len"].tolist()
+    out = run(fn, c)
+    for r in range(R):
+        alone = run(fn, c, rows=[r])[0]
+        beyond = {key: c[key].clone() for key in ("k", "v", "bias")}
+        lastrow = c["k"].clone()
+        n, L = si[r], ll[r]
+        for h in range(Hkv):
+            s = tab[r][h][npg[r][h] - 1]
+            for key in ("k", "v", "bias"):
+                beyond[key][n, s * PAGE + L:(s + 1) * PAGE, h] = nan
+            lastrow[n, s * PAGE + L - 1, h] += 7.0
+        if not torch.equal(run(fn, dict(c, **beyond), rows=[r])[0], alone):
+            bad.append(("alone: a row beyond the extent was read", r))
+        if torch.equal(run(fn, dict(c, k=lastrow), rows=[r])[0], alone):
+            bad.append(("alone: the last row of the extent was not read", r))
+    pois = {key: c[key].clone() for key in ("k", "v", "bias")}
+    M = set()
+    for r in range(R):
+        n, L = si[r], ll[r]
+        for h in range(Hkv):
+            s = tab[r][h][npg[r][h] - 1]
+            M.update((n, s * PAGE + j, h) for j in range(L, PAGE))
+            for key in ("k", "v", "bias"):
+                pois[key][n, s * PAGE + L:(s + 1) * PAGE, h] = nan
+    out2 = run(fn, dict(c, **pois))
+    untouched = 0
+    for r in range(R):
+        if _read_rows(c, r) & M:
+            if torch.equal(out2[r], out[r]):
+                bad.append(("batch: reads a changed row but did not change", r))
+        else:
+            untouched += 1
+            if not torch.equal(out2[r], out[r]):
+                bad.append(("batch: reads no changed row but changed", r))
+    if untouched == 0:
+        bad.append(("batch: no untouched row (vacuous)",))
+    return bad
+
+
+def _cut_shifted(delta):
+    """A WRONG attention for the negative controls: the twin with every last_len moved by delta (clamped to 1..64),
+    i.e. a cut one row too late (+1) or too early (-1)."""
+    def fn(q, k, v, b, si, t, npg, ll, **kw):
+        moved = (ll.to(torch.int64) + delta).clamp(1, PAGE).to(torch.int32).contiguous()
+        return bi.bi_paged_decode_reference(q, k, v, b, si, t, npg, moved, **kw)
+    return fn
+
+
+@pytest.mark.parametrize("last", [1, 2, 37, 63, 64, None])
 def test_the_last_page_is_cut_at_the_rows_extent(last):
-    c = make_case(4)
-    c["last_len"] = torch.full_like(c["last_len"], last)
+    """None = the case's random per-row last_len (rows of one entry with different extents on one page). S = 16
+    slots keep rows that read no changed row likely (the check refuses a vacuous batch)."""
+    c = make_case(4, S=16)
+    if last is not None:
+        c["last_len"] = torch.full_like(c["last_len"], last)
     out = run(bi.bi_paged_decode_reference, c)
     assert float((out.double() - run(bi.attention_oracle, c)).abs().max()) <= 2e-5
-    # rows beyond the extent of the last page: change them, nothing moves
-    k2 = c["k"].clone()
-    tab, npg, si = c["table"], c["num_pages"], c["seq_idx"]
-    for r in range(tab.shape[0]):
-        for h in range(tab.shape[1]):
-            s = int(tab[r, h, int(npg[r, h]) - 1])
-            k2[int(si[r]), s * PAGE + last:(s + 1) * PAGE, h] += 7.0
-    # (another row may list that page as a full page: compare only rows whose last page no other row lists in full)
-    out2 = run(bi.bi_paged_decode_reference, dict(c, k=k2))
-    full = set()
-    for r in range(tab.shape[0]):
-        for h in range(tab.shape[1]):
-            for i in range(int(npg[r, h]) - 1):
-                full.add((int(si[r]), h, int(tab[r, h, i])))
-    for r in range(tab.shape[0]):
-        if all((int(si[r]), h, int(tab[r, h, int(npg[r, h]) - 1])) not in full for h in range(tab.shape[1])):
-            assert torch.equal(out2[r], out[r]), r
+    bad = _extent_cut_failures(bi.bi_paged_decode_reference, c)
+    assert not bad, bad[:6]
+
+
+def test_negative_a_cut_one_row_late_or_early_is_caught():
+    """The extent check cannot pass wrongly: a cut one row too late reads the poisoned row L (caught in (a) and
+    (b)); a cut one row too early skips row L-1 (caught by (a)'s positive control)."""
+    c = make_case(4, S=16)
+    assert bool((c["last_len"] < PAGE).any()) and bool((c["last_len"] > 1).any()), "precondition: room on both sides"
+    late = _extent_cut_failures(_cut_shifted(+1), c)
+    early = _extent_cut_failures(_cut_shifted(-1), c)
+    assert any(k[0].startswith("alone: a row beyond") for k in late), late[:4]
+    assert any(k[0].startswith("alone: the last row") for k in early), early[:4]
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -330,6 +403,11 @@ for seed in (20, 21):
     dirty = t.run(bi.bi_paged_decode, p)
     if not (bool(torch.isfinite(dirty).all()) and torch.equal(dirty, k_out)):
         fails.append(("nan-poison", seed))
+# the cut of the last page on the KERNEL: per row alone and in the batch (exact read sets), random extents
+c = t.make_case(23, R=8, N=4, S=16, P=6)
+bad = t._extent_cut_failures(bi.bi_paged_decode, c)
+if bad:
+    fails.append(("extent-cut", bad[:4]))
 # negative control on the KERNEL: a batch-keyed tile (2 pages per tile for the batch, 1 alone) must be caught
 c = t.make_case(22, R=8, N=3, S=10, P=6)
 full2 = t.run(bi.bi_paged_decode, c, pages_per_tile=2)
