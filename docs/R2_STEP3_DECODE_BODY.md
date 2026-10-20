@@ -30,6 +30,74 @@ Inputs: `nosi/nosi/r2_positional_twin.py` (the per-request counters),
   (`nosa_llama.py:584`), then the body runs (`:618`) with
   `kv_bias = twin.total_cis`.
 
+## FINAL interface (code: e048b3d, `nosi/nosi/r2_decode_body.py`)
+
+Load the module by file path or as `from . import r2_decode_body` inside the
+package; it imports only torch. Notation: `B` batch, `H` = `eng.head_num`,
+`D` = `eng.head_dim`, `bs` = `eng.block_size` (64), `topk` = `eng.topk` (64),
+`N` = rows of the cis table, `N_host` = host rows. "device" = `eng.device`.
+
+`body = DecodeBody(f4_fix)`: `f4_fix` is a `bool`, REQUIRED, no default
+(anything else raises `TypeError`). `False` = the shipped `_cache_lens` (F4
+reproduced; the G0 setting). `True` = the corrected length.
+
+`body.allocate(eng, batch, n_host, pin) -> None`. Needs `eng.head_num`,
+`head_dim`, `block_size`, `topk`, `dtype`, `device`, and `pool_blocks`
+absent or 0 (else `RuntimeError`). Sets on `eng`: `_k_cpu`, `_v_cpu`
+(batch, n_host, H, D) `eng.dtype` on the CPU (pinned when `pin`); `_k_gpu`,
+`_v_gpu` (batch, topk*bs, H, D) on the device; `_kv_bias_gpu` (batch,
+topk*bs, H); `_block_map` (H, batch, topk) int64 = -1; `_new_block_map_buf`,
+`_load_mask` (same shape, uninitialised); `_cache_lens` (batch,) int32 =
+4032; `_tail_block_idx_on_gpu = topk - 1`. A caller may also allocate these
+itself with the same shapes.
+
+`body.prefill_request(eng, b, key_states, value_states, kv_bias) -> None`.
+`b` a Python int; `key_states`, `value_states` (S, H, D); `kv_bias` (S, H) =
+`twin.total_cis[b, :S]` after `twin.prefill(b, ...)`; all on the device of
+the tables they go to (or castable by `copy_`). Mutates request `b` only:
+slot 63 rows `[0, S % 64)` of `_k_gpu`, `_v_gpu`, `_kv_bias_gpu`;
+`_block_map[:, b, :] = -1` and `[:, b, 63] = S // 64`;
+`_cache_lens[b] = 4032 + S % 64`; host rows `[0, S)` of `_k_cpu`, `_v_cpu`.
+Raises `IndexError` / `ValueError` before writing on a bad `b`, shape or
+`S > N_host`.
+
+`body.decode(eng, key_states, value_states, kv_bias, topk_idx, pos, active,
+pos_host, active_host, diff_offload, gather_k, gather_v_bias)`
+-> `(eng._k_gpu, eng._v_gpu, eng._kv_bias_gpu, eng._cache_lens)`, the same
+tuple as the shipped body (cache_engine.py:412), the full allocations.
+
+| argument | shape / dtype / device | meaning |
+|---|---|---|
+| `key_states`, `value_states` | (B, 1, H, D), the table dtype, device | the step's K, V (`decode_update_kv` already unsqueezes, cache_engine.py:702) |
+| `kv_bias` | (B, N, H), device | `twin.total_cis`; row `pos[b]` already written by `twin.step` |
+| `topk_idx` | (H, B, topk) int64, contiguous, device | the selection; must hold `pos[b] // 64` for active b (C's per-request pooling with `M_b = twin.grid_width()` read before `twin.step`) |
+| `pos` | (B,) int64, device | write positions = the twin counter BEFORE `twin.step` for this token |
+| `active` | (B,) bool, device | which requests write this step |
+| `pos_host`, `active_host` | (B,) int64 / bool, CPU | the same values on the host (the write-back loop reads them; no device sync) |
+| `diff_offload`, `gather_k`, `gather_v_bias` | callables | on the GPU: `cache_engine.diff.diff_offload`, `cache_engine.flash_h2d_from_mask`, `cache_engine.flash_h2d_from_mask_bias` (called exactly as at cache_engine.py:363, :381, :382) |
+
+Call order in one layer, one step:
+`p = twin.pos.clone(); twin.step(k, cis, active); body.decode(eng, k1, v1, twin.total_cis, topk, p, active, p_host, active_host, ...)`.
+(The twin is per layer for its compressed tables but `pos` is the same for
+every layer; the model keeps one `pos`.)
+
+Mutates: `_k_gpu`, `_v_gpu`, `_kv_bias_gpu` (the tail row of each active
+request, the gathered slots), `_block_map`, `_new_block_map_buf`,
+`_load_mask`, `_cache_lens` (active requests), `_k_cpu`, `_v_cpu` (host rows
+`[p_b - 63, p_b]` of full active requests). An inactive request's persistent
+tables do not change (its `_load_mask` row is -1, its `_new_block_map_buf`
+row equals its map). Raises before any write: `ValueError` on a shape or
+dtype, `IndexError` if an active request has `pos < 0` or
+`pos >= min(N_host, N)`.
+
+`body.resync(eng, pos, mask) -> None`: `pos` (B,) int64 device = the twin
+counter AFTER a commit, `mask` (B,) bool device. Sets
+`_block_map[:, b, 63] = pos // 64` and `_cache_lens[b]` for masked `b`.
+Slot 63 rows are not restored (B's masked tail copy).
+
+`body.tail_in_selection(eng, topk_idx, pos) -> (B,) bool` (host sync; tests
+and debug only).
+
 ## Table (1): shipped line -> per-request form
 
 Request `b`, write position `p_b = pos[b]`, block 64, tail slot 63, base
