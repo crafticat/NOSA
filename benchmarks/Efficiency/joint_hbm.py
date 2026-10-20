@@ -41,7 +41,9 @@ T, ids < T); G2 window content (sampled windows equal the host KV / the kept tai
 plan says); G3 logits (every form, every row: max |logit - shipped logit| <= 4 x tau_ctrl, tau_ctrl = 0.4844 at 16128;
 argmax agreement reported); G4 mask control (joint_shared with the masks off must DIFFER from masked); G5 accounting
 (sum >= union_sep >= union_request per version and layer; private layouts attend no masked token); R1 selection
-agreement (report); R2 cross-form logits (report). Orchestrator: U ran (exit 0), each P variant ran and every window
+agreement (report); R2 cross-form logits (report); R3 (report, prediction P-JH-1) the sep_private draft call (B rows,
+the engine's own window, slot order and allocation) equals the shipped logits of step W + K bitwise.
+Orchestrator: U ran (exit 0), each P variant ran and every window
 was found, P_none single-pass (MUST); untagged kernels (report).
 """
 from __future__ import annotations
@@ -701,6 +703,14 @@ def mode_cell(a):
     gates.append(gate("G5_accounting", not bad_acc, True, "; ".join(bad_acc[:6]) or "sum >= union_sep >= union_request; private masked 0"))
     gates.append(gate("R1_selection", True, False, json.dumps(sel_g)))
     gates.append(gate("R2_cross_form", True, False, json.dumps(cross)))
+    if "sep_private" in ref_out:                     # P-JH-1: M = B, the engine's own window, order and allocation
+        d0 = ref_out["sep_private"][0]
+        sh = S["shipped"][S["W"] + S["K"]].cpu()
+        r3 = dict(torch_equal=bool(torch.equal(d0, sh)), max_abs=float((d0 - sh).abs().max()))
+        gates.append(gate("R3_bitwise_draft_private", r3["torch_equal"], False,
+                          "prediction P-JH-1: the sep_private draft call (B rows, the engine's window at step W + K in "
+                          "its slot order, 4096 rows, the same split count) equals the shipped logits of step W + K "
+                          "bitwise; " + json.dumps(r3)))
     hb = {lvl: acc_tot[lvl]["hist_blocks"] for lvl in acc_tot}
     meta = dict(S["meta"], reps=a.reps, warm=a.warm, timing_order=order_log[:64],
                 hist_block_ratio=dict(union_request_over_sum=hb["union_request"] / max(hb["sum"], 1),
