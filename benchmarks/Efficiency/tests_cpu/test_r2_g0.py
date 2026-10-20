@@ -134,13 +134,34 @@ def test_W3_pooling_lengths_and_the_negative_hook():
     assert n.tolist() == [1007, 1010, 1011]                                          # the counters are not touched
 
 
-def test_W4_the_r2_body_adapter_refuses_without_the_module():
-    """W4: body 'r2' needs nosi/nosi/r2_decode_body.py; at e1178d8 it is absent, so R2Body raises R2Error (G0F / NEGF
-    are then NOT_RUN in the gate). Skipped once the module exists."""
-    if (NOSI / "r2_decode_body.py").exists():
-        pytest.skip("r2_decode_body.py is present")
-    with pytest.raises(RD.R2Error, match="r2_decode_body.py is not in this tree"):
-        RD.R2Body(f4_fix=False)
+def test_W4_the_r2_body_adapter_calls_DecodeBody_decode_in_its_order():
+    """W4: DecodeBody.decode (r2_decode_body.py, e048b3d) has the parameters of the FINAL interface (eng, key_states,
+    value_states, kv_bias, topk_idx, pos, active, pos_host, active_host, diff_offload, gather_k, gather_v_bias), and
+    R2Body.update passes them in that order: K and V unsqueezed to (B, 1, H, D), the kernels last; the tuple the body
+    returns is returned. DecodeBody refuses a non-bool f4_fix."""
+    import importlib
+    import inspect
+    RB = importlib.import_module("r2cpu.r2_decode_body")
+    assert list(inspect.signature(RB.DecodeBody.decode).parameters) == [
+        "self", "eng", "key_states", "value_states", "kv_bias", "topk_idx", "pos", "active", "pos_host", "active_host",
+        "diff_offload", "gather_k", "gather_v_bias"]
+    with pytest.raises(TypeError):
+        RB.DecodeBody(None)
+    rec = []
+
+    class FakeBody:
+        def decode(self, *args):
+            rec.append(args)
+            return "tuple"
+
+    ad = object.__new__(RD.R2Body)
+    ad.body, ad.kernels = FakeBody(), ("diff", "gk", "gvb")
+    k, v = torch.randn(3, 2, 4), torch.randn(3, 2, 4)
+    assert ad.update("eng", k, v, "bias", "topk", "pos", "act", "ph", "ah") == "tuple"
+    args = rec[0]
+    assert args[0] == "eng" and args[1].shape == (3, 1, 2, 4) and torch.equal(args[1][:, 0], k)
+    assert args[2].shape == (3, 1, 2, 4) and torch.equal(args[2][:, 0], v)
+    assert args[3:] == ("bias", "topk", "pos", "act", "ph", "ah", "diff", "gk", "gvb")
 
 
 def test_W5_the_switch_is_appended_and_default_off():

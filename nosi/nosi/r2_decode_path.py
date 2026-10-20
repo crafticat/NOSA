@@ -18,9 +18,9 @@ ONE DECODE STEP, per layer, in the shipped order (nosa_llama.py LlamaLayer.decod
   5. the offloading update through ONE adapter (body_update):
        body "shipped": InfLLMv2Cache.decode_update_kv with kv_bias = twin.total_cis (the lockstep shipped body: valid
                        under equal advance only; refused otherwise);
-       body "r2":      the per-request body (r2_decode_body.py of feature/nosi-r2-m2-engine, NOT YET COMMITTED; its
-                       interface is docs/R2_STEP3_DECODE_BODY.md: pos BEFORE the step, active, kv_bias =
-                       twin.total_cis, f4_fix explicit). R2Body binds it; until the module exists it raises.
+       body "r2":      the per-request body r2_decode_body.DecodeBody (feature/nosi-r2-m2-engine e048b3d; the FINAL
+                       interface of docs/R2_STEP3_DECODE_BODY.md at 4b8a658: pos BEFORE the step, active, their
+                       host mirrors, kv_bias = twin.total_cis, f4_fix explicit, the shipped kernels). R2Body binds it.
   6. attention (flash_attn_nosa_with_kvcache, num_splits = NOSI_ATTN_SPLITS), wo, FFN: the shipped ops.
 Final rmsnorm and lm_head as shipped.
 
@@ -100,21 +100,27 @@ def pooling_lengths(pos_before: torch.Tensor, n_comp: torch.Tensor, step: int, n
 
 # ------------------------------------------------------------------ the body adapter
 class R2Body:
-    """Binds the per-request decode body (r2_decode_body.py, feature/nosi-r2-m2-engine). The module is not committed
-    at e1178d8; until it is, construction raises R2Error. The call below follows docs/R2_STEP3_DECODE_BODY.md and is
-    the ONE place to adapt to the committed signature."""
+    """Binds the per-request decode body: r2_decode_body.DecodeBody (feature/nosi-r2-m2-engine e048b3d; the FINAL
+    interface of docs/R2_STEP3_DECODE_BODY.md at 4b8a658):
+        body.decode(eng, key_states (B, 1, H, D), value_states, kv_bias = twin.total_cis, topk_idx (H, B, 64) int64,
+                    pos (B,) int64 device = the twin counter BEFORE twin.step, active (B,) bool device, pos_host,
+                    active_host (the same on the CPU), diff_offload, gather_k, gather_v_bias)
+          -> (_k_gpu, _v_gpu, _kv_bias_gpu, _cache_lens), the shipped tuple.
+    The kernels are the shipped body's own: cache_engine.diff.diff_offload, flash_h2d_from_mask,
+    flash_h2d_from_mask_bias (cache_engine.py:363, :381, :382). Without the module, construction raises R2Error."""
 
     def __init__(self, f4_fix: bool):
         try:
-            from . import r2_decode_body as RB                       # noqa: F401  (not committed yet)
+            from . import r2_decode_body as RB
         except ImportError as e:
             raise R2Error("body 'r2': nosi/nosi/r2_decode_body.py is not in this tree (%s)" % e)
-        self.RB = RB
-        self.f4_fix = bool(f4_fix)
+        from . import cache_engine as CE
+        self.body = RB.DecodeBody(bool(f4_fix))
+        self.kernels = (CE.diff.diff_offload, CE.flash_h2d_from_mask, CE.flash_h2d_from_mask_bias)
 
-    def update(self, eng, key, value, kv_bias, topk_idx, pos, active):
-        return self.RB.decode_update(eng, key.unsqueeze(1), value.unsqueeze(1), kv_bias, topk_idx, pos=pos, active=active,
-                                     f4_fix=self.f4_fix)
+    def update(self, eng, key, value, kv_bias, topk_idx, pos, active, pos_host, active_host):
+        return self.body.decode(eng, key.unsqueeze(1), value.unsqueeze(1), kv_bias, topk_idx, pos, active, pos_host,
+                                active_host, *self.kernels)
 
 
 # ------------------------------------------------------------------ the state
@@ -154,6 +160,8 @@ class R2State:
         self.mask = torch.empty((H, B, self.M_alloc), dtype=torch.bool, device=dev)
         self.cu_q = torch.arange(B + 1, dtype=torch.int32, device=dev)
         self.active = torch.ones(B, dtype=torch.bool, device=dev)
+        self.pos_host = torch.full((B,), int(S), dtype=torch.int64)         # host mirrors of the counter (no sync)
+        self.active_host = torch.ones(B, dtype=torch.bool)
         self.body_mode = body
         self.body = R2Body(f4_fix) if body == "r2" else None
         self.f4_fix = f4_fix
@@ -178,7 +186,8 @@ def body_update(st: R2State, cache, l: int, key, value, twin: PositionalTwin, to
         if not bool(st.active.all()):
             raise R2Error("body 'shipped' is the lockstep body: every request must advance")
         return cache.decode_update_kv(key, value, twin.total_cis, l, topk_idx)
-    return st.body.update(cache.layers[l].cache_engine, key, value, twin.total_cis, topk_idx, pos_before, st.active)
+    return st.body.update(cache.layers[l].cache_engine, key, value, twin.total_cis, topk_idx, pos_before, st.active,
+                          st.pos_host, st.active_host)
 
 
 # ------------------------------------------------------------------ the decode
@@ -238,4 +247,5 @@ def decode_inference(model, input_ids, cu_seqlens, position_ids, cache):
     hidden = NL.layer_norm(hidden, w=model.norm_weight, eps=model.norm_variance_epsilon)
     logits = F.linear(hidden, model.lm_head).float()
     st.steps += 1
+    st.pos_host += st.active_host.to(torch.int64)
     return logits

@@ -20,8 +20,8 @@ the comparison):
   G0F   shipped vs the R2 path with body "r2" (r2_decode_body.py, f4_fix False): must be bitwise equal.
   NEGF  G0F with f4_fix True: the first difference exactly at the block-completing step (S + s + 1 = 0 mod 64) and
         none before.
-G0F / NEGF need nosi/nosi/r2_decode_body.py (not committed at e1178d8): without it they are NOT_RUN (a failed MUST
-gate). Run --phases P,G0T,NEGT until the body lands.
+G0F / NEGF need nosi/nosi/r2_decode_body.py (merged from feature/nosi-r2-m2-engine 4b8a658): without it they are
+NOT_RUN (a failed MUST gate).
 
 F2 (docs/R2_ENGINE_FINDINGS.md): the compressed cis is compared on the prefix both arms hold (the shipped width M =
 S // 16 - 1, which never grows); the twin's extra columns are reported as the EXPECTED F2 difference (no f2_fix switch).
