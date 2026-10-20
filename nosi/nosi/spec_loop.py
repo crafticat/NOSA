@@ -40,6 +40,12 @@ the same run. At batch B with per-token acceptance a the lockstep yield is
 1 + a^B (K = 1): meaningful at small B or few distinct documents, ~1 at 128
 distinct documents. The pilot reports both.
 
+PER-REQUEST ROUNDS (R2 milestone 2): the section at the end of this file
+keeps one counter per request (pos (B,), the positional twin's counter) and
+commits keep(b) = 1 + n_acc(b) per request: a counter reset plus one masked
+copy of the tail slot. The lockstep functions above are unchanged; the
+per-request ones are tested against them.
+
 STORE (per layer, KV head, request; slots of block_size rows; W = topk + R + 2):
     0 .. topk-2        window, evictable      ids[..., s] >= 0 when occupied
     topk-1             LIVE TAIL, FIXED       id T = tail_id (an int, all layers
@@ -889,3 +895,627 @@ def timely_recall(counters: dict) -> Optional[float]:
     t, w, f = int(counters["timely_blocks"]), int(counters["late_wait_blocks"]), int(counters["late_fetch_blocks"])
     n = t + w + f
     return None if n == 0 else t / n
+
+
+# ===========================================================================
+# PER-REQUEST ROUNDS (R2 milestone 2, 2026-10-20; SOURCE ONLY; CPU tests
+# benchmarks/Efficiency/tests_cpu/test_spec_perreq.py)
+# ===========================================================================
+# ONE COUNTER PER REQUEST. pos (B,) int64 is the number of tokens that
+# request b holds: the shipped seq_length of one request, and the ``pos`` row
+# of the positional twin (nosi-r2-m2, r2_positional_twin.py at 65b7341:
+# counters() is (4, B) = pos, n_comp, n_ccis, epoch). The tail state is
+# DERIVED from pos, as the twin derives it (tail_row, tail_block, cache_lens):
+#     tail_len   = pos % bs                 shipped _tail_block_len_on_gpu
+#     tail id    = pos // bs                shipped _block_map[..., topk-1]
+#     cache_lens = (topk-1)*bs + pos % bs   shipped _cache_lens, int32 (findings
+#                                           F4 kept on purpose: parity target)
+# The engine carries the counter as ``engine._pos`` (to_perreq). There,
+# seq_length and _tail_block_len_on_gpu are None, so a lockstep function
+# that gets a per-request engine raises.
+#
+# THE ROUND, per request (the lockstep schedule; K drafted positions, U = K+1):
+#   DRAFT    draft_tail_write_perreq writes one row per request at ITS
+#            position. After ITS rollover the rows go to mirror_hi, so the
+#            exact rows of block T_b stay. draft_tail_state gives (tail_len,
+#            rolled) per request. plan_draft_perreq and
+#            apply_draft_bias_perreq are the lockstep plans with T_b,
+#            rolled_b and forbid_ge = T_b per request.
+#   RESTORE  restore_tail_counters_perreq: pos = pos0, a counter reset (the
+#            map's tail column and cache_lens follow). The tables commit to
+#            their round-start counters (keep 0).
+#   VERIFY   write_tail_perreq writes U rows per request from its own
+#            tail_len. It returns rollover_at and seqused_k per request (the
+#            varlen verify call already takes seqused_k as (B,)) and the
+#            counter trajectory ctr[u] = pos0 + u. plan_round_perreq is the
+#            lockstep union; the live tail of request b at position u is
+#            T_b + (u >= rollover_at_b).
+#   ACCEPT   accept_perreq: keep (B,) = 1 + n_acc(b). No host sync.
+#   COMMIT   commit_layer_perreq: the tables commit ctr[keep_b, :, b] (the
+#            twin: a counter reset; no table row is copied, because the
+#            twin's key ring has 64 >= 32 + U rows: a rollback over at most
+#            32 positions, its MAX_ROLLBACK, never overwrites a live key; the
+#            compressed tables and total_cis are only written at or above
+#            their counters). The tail:
+#            truncate_perreq sets pos = ctr[keep_b, b] (a counter reset) and
+#            does ONE masked copy. For each request whose kept prefix undoes
+#            a rollover, rows [0, U - (f_b + 1)) of slot topk-1 come back
+#            from mirror_lo (torch.where); f_b = bs - 1 - tail_len0_b.
+# EXACTNESS. The argument of accept_commit holds per request: any c_b <=
+# 1 + n_acc(b) is exact for request b. No request reads the rows or the
+# counters of another request (every op below is per (h, b) or per b).
+# HOST SYNCS. accept_perreq: none. The host write-back of a filled block
+# reads the (B,) fill mask (_host_write_back). commit_layer_perreq compares
+# the two trajectories (a guard). The engine can keep pos on the host: the
+# loop reads keep (B,) once per round, as the lockstep loop reads c.
+# NOT HERE: the engine and model wiring (cache_engine spec_*, the twin's
+# tables in the model, the per-request kernels of nosi-r2-m2-kernels), the
+# per-request pooling width (findings F1), the ragged outputs of the host
+# loop.
+# ---------------------------------------------------------------------------
+def _bvec(x, B: int, name: str, dtype=torch.int64) -> torch.Tensor:
+    """A (B,) tensor, checked, as ``dtype``. The per-request functions take
+    tensors only: an int is a lockstep value."""
+    if not torch.is_tensor(x) or tuple(x.shape) != (B,):
+        got = tuple(x.shape) if torch.is_tensor(x) else type(x).__name__
+        raise ValueError("%s must be a (B=%d,) tensor, got %s" % (name, B, got))
+    return x.to(dtype)
+
+
+def _batch(engine) -> int:
+    return int(engine._k_gpu.shape[0])
+
+
+def _set_tail_state(engine, pos: torch.Tensor, tail_ids: torch.Tensor, tail_len: torch.Tensor):
+    """Write the counter and the state derived from it: the map's tail column
+    (every KV head) and cache_lens = (topk-1)*bs + tail_len."""
+    engine._pos.copy_(pos)
+    engine._block_map[..., int(engine._tail_block_idx_on_gpu)] = tail_ids.view(1, -1).to(engine._block_map.dtype)
+    engine._cache_lens.copy_(((int(engine.topk) - 1) * int(engine.block_size) + tail_len).to(engine._cache_lens.dtype))
+
+
+def check_tail_state(engine, pos: torch.Tensor):
+    """The shipped invariants against per-request counters: the map's tail
+    column (every head) == pos // bs and _cache_lens == (topk-1)*bs +
+    pos % bs. Raises ValueError (a guard; one host read)."""
+    bs = int(engine.block_size)
+    B = _batch(engine)
+    pos = _bvec(pos, B, "pos")
+    tail = engine._block_map[..., int(engine._tail_block_idx_on_gpu)]
+    if not bool((tail == (pos // bs).view(1, B)).all()):
+        raise ValueError("the block map's tail column is not pos // %d" % bs)
+    want = ((int(engine.topk) - 1) * bs + pos % bs).to(engine._cache_lens.dtype)
+    if not torch.equal(engine._cache_lens, want):
+        raise ValueError("_cache_lens is not (topk-1)*%d + pos %% %d" % (bs, bs))
+
+
+def to_perreq(engine) -> torch.Tensor:
+    """Move a lockstep engine to per-request counters: ``engine._pos`` = (B,)
+    int64, every request at seq_length. seq_length and
+    _tail_block_len_on_gpu become None, so a lockstep reader raises. Refuses
+    an engine whose tail state is not its counters' (check_tail_state).
+    Returns engine._pos."""
+    bs = int(engine.block_size)
+    if getattr(engine, "seq_length", None) is None:
+        raise ValueError("to_perreq: the engine has no lockstep seq_length (per-request already?)")
+    seq, tl = int(engine.seq_length), int(engine._tail_block_len_on_gpu)
+    if tl != seq % bs:
+        raise ValueError("to_perreq: tail_len %d != seq_length %d %% %d" % (tl, seq, bs))
+    pos = torch.full((_batch(engine),), seq, dtype=torch.int64, device=engine._block_map.device)
+    check_tail_state(engine, pos)
+    engine._pos = pos
+    engine.seq_length = None
+    engine._tail_block_len_on_gpu = None
+    return engine._pos
+
+
+def _host_write_back(engine, mask: torch.Tensor, block_ids: torch.Tensor, src_slot: int):
+    """cache_engine.py:402-405 for the requests in ``mask``: block
+    block_ids[b] of request b goes to the host from slot ``src_slot``. One
+    host read of the (B,) mask, then one contiguous copy per filled request
+    (the shipped write-back is one copy for the whole batch)."""
+    bs = int(engine.block_size)
+    s = int(src_slot) * bs
+    for b in mask.nonzero().flatten().tolist():
+        base = int(block_ids[b]) * bs
+        engine._k_cpu[b, base:base + bs].copy_(engine._k_gpu[b, s:s + bs], non_blocking=True)
+        engine._v_cpu[b, base:base + bs].copy_(engine._v_gpu[b, s:s + bs], non_blocking=True)
+
+
+def _masked_slot_copy(engine, dst_slot: int, src_slot: int, nrows: torch.Tensor):
+    """Per request, rows [0, nrows[b]) of slot ``dst_slot`` <- the same rows
+    of slot ``src_slot``, for K, V and the bias: ONE torch.where over the
+    slot. Rows at or above nrows[b] keep their values."""
+    bs = int(engine.block_size)
+    B = _batch(engine)
+    m = torch.arange(bs, device=nrows.device).view(1, bs) < nrows.view(B, 1)
+    d, s = int(dst_slot) * bs, int(src_slot) * bs
+    for name in ("_k_gpu", "_v_gpu"):
+        t = getattr(engine, name)
+        t[:, d:d + bs].copy_(torch.where(m.view(B, bs, 1, 1), t[:, s:s + bs], t[:, d:d + bs]))
+    t = engine._kv_bias_gpu
+    t[:, d:d + bs].copy_(torch.where(m.view(B, bs, 1), t[:, s:s + bs], t[:, d:d + bs]))
+
+
+def _masked_tail_restore(engine, tail_slot: int, mirror_lo: int, nrows: torch.Tensor):
+    """The restore of truncate_perreq. It has its own name so that the
+    negative control can remove it."""
+    _masked_slot_copy(engine, tail_slot, mirror_lo, nrows)
+
+
+# -- the draft, per request ----------------------------------------------------
+class PerReqTailCounters(NamedTuple):
+    """The tail state per request at round start: pos0 (B,) and tail_id =
+    pos0 // bs (B,)."""
+    pos: torch.Tensor
+    tail_id: torch.Tensor
+
+
+def capture_tail_counters_perreq(engine) -> PerReqTailCounters:
+    pos = engine._pos.clone()
+    return PerReqTailCounters(pos, pos // int(engine.block_size))
+
+
+def restore_tail_counters_perreq(engine, tc: PerReqTailCounters):
+    """restore_tail_counters per request: pos = pos0. The map's tail column
+    and cache_lens follow, so a rename by the draft's rollover is undone with
+    them. The verify's write overwrites the draft's rows."""
+    bs = int(engine.block_size)
+    pos = _bvec(tc.pos, _batch(engine), "pos0")
+    _set_tail_state(engine, pos, pos // bs, pos % bs)
+
+
+def draft_tail_state(pos: torch.Tensor, tail_id0: torch.Tensor, block_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """(tail_len, rolled) per request inside a draft that started with tail
+    id T = tail_id0. rolled: the draft filled block T (pos >= (T+1)*bs).
+    tail_len: the rows of the live block (T before the rollover, T+1 after),
+    in [0, bs]. This is the lockstep counter, which reaches bs when the draft
+    writes the last row of T+1. Refuses pos outside [T*bs, (T+2)*bs]."""
+    bs = int(block_size)
+    lo = tail_id0 * bs
+    if bool(((pos < lo) | (pos > lo + 2 * bs)).any()):
+        raise ValueError("draft_tail_state: a position is outside [T*%d, (T+2)*%d]" % (bs, bs))
+    rolled = pos >= lo + bs
+    tail_len = pos - lo - rolled.to(pos.dtype) * bs
+    return tail_len, rolled
+
+
+def draft_row_limits_perreq(tail_len: torch.Tensor, rolled: torch.Tensor, block_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """draft_row_limits per request: the rows of the tail slot and the rows
+    of mirror_hi that the draft may see (exclusive bounds), each (B,)."""
+    bs = int(block_size)
+    if bool(((tail_len < 0) | (tail_len > bs)).any()):
+        raise ValueError("tail_len outside [0, %d]" % bs)
+    return (torch.where(rolled, torch.full_like(tail_len, bs), tail_len),
+            torch.where(rolled, tail_len, torch.zeros_like(tail_len)))
+
+
+def draft_tail_write_perreq(engine, key_states, value_states, kv_bias, mirror_hi: int, tail_id0: torch.Tensor) -> torch.Tensor:
+    """draft_tail_write per request. Request b writes its token at position
+    p_b = engine._pos[b]: to slot topk-1, row p_b % bs, while p_b is in block
+    T_b = tail_id0[b]; to mirror_hi, row p_b % bs, after the draft filled
+    T_b. The bias row is kv_bias[b, p_b] (the shipped row seq_length - 1
+    after the increment, :354). A request whose write fills T_b writes the
+    block back to the host from slot topk-1 (:402-405), and its map tail
+    column becomes T_b + 1 (:407). A write into block T_b + 2 (a second
+    rollover) is refused, as in the lockstep function. Returns rolled (B,)
+    bool after the write."""
+    bs = int(engine.block_size)
+    B = _batch(engine)
+    if key_states.dim() != 4 or tuple(key_states.shape[:2]) != (B, 1):
+        raise ValueError("draft_tail_write_perreq takes one token (B=%d, 1, H, D), got %s" % (B, tuple(key_states.shape)))
+    if tuple(value_states.shape) != tuple(key_states.shape):
+        raise ValueError("value_states %s != key_states %s" % (tuple(value_states.shape), tuple(key_states.shape)))
+    W = engine._k_gpu.shape[1] // bs
+    if int(mirror_hi) != W - 1:
+        raise ValueError("mirror_hi=%d must be W-1=%d" % (mirror_hi, W - 1))
+    T = _bvec(tail_id0, B, "tail_id0")
+    p = engine._pos.clone()
+    tail_len, rolled = draft_tail_state(p, T, bs)
+    if bool((rolled & (tail_len >= bs)).any()):
+        raise ValueError("a second rollover inside one draft is not supported")
+    if kv_bias.shape[0] != B or kv_bias.shape[1] <= int(p.max()):
+        raise ValueError("kv_bias %s has no row %d" % (tuple(kv_bias.shape), int(p.max())))
+    ts = int(engine._tail_block_idx_on_gpu)
+    row = torch.where(rolled, int(mirror_hi) * bs + tail_len, ts * bs + tail_len)
+    bi = torch.arange(B, device=p.device)
+    engine._k_gpu[bi, row] = key_states[:, 0].to(engine._k_gpu.dtype)
+    engine._v_gpu[bi, row] = value_states[:, 0].to(engine._v_gpu.dtype)
+    engine._kv_bias_gpu[bi, row] = kv_bias[bi, p].to(engine._kv_bias_gpu.dtype)
+    _host_write_back(engine, ~rolled & (tail_len + 1 == bs), T, ts)
+    p1 = p + 1
+    tl1, rolled1 = draft_tail_state(p1, T, bs)
+    _set_tail_state(engine, p1, T + rolled1.to(T.dtype), tl1)
+    return rolled1
+
+
+def plan_draft_perreq(store: Store, l: int, sel: torch.Tensor, tail_id: torch.Tensor, rolled: torch.Tensor,
+                      gen_now: int, stamp_now: int, forbid_ge: torch.Tensor) -> DraftPlan:
+    """plan_draft with the tail per request: tail_id, rolled and forbid_ge
+    are (B,) tensors (T_b at round start, the draft's rollover of request b,
+    T_b). The lines that use them are the only change; every other line is
+    plan_draft's."""
+    lay = store.lay
+    ids, state, gen, stamp, used = store.ids[l], store.state[l], store.gen[l], store.stamp[l], store.used[l]
+    if sel.dim() != 3 or tuple(sel.shape[:2]) != (store.H, store.B) or sel.dtype != torch.int64:
+        raise ValueError("sel must be int64 (H=%d, B=%d, K), got %s %s" % (store.H, store.B, sel.dtype, tuple(sel.shape)))
+    H, B, K = sel.shape
+    W = lay.W
+    t = _bvec(tail_id, B, "tail_id").view(1, B, 1)
+    r = _bvec(rolled, B, "rolled", torch.bool).view(1, B, 1)
+    fg = _bvec(forbid_ge, B, "forbid_ge").view(1, B, 1)
+    valid = sel >= 0
+    is_tail = valid & ((sel == t) | (r & (sel == t + 1)))
+    present = (state == INFLIGHT) | (state == RESIDENT)
+    first = _first_occurrence(sel)
+    eq = (sel.unsqueeze(-1) == ids.unsqueeze(-2)) & present.unsqueeze(-2)     # (H, B, K, W)
+    found = eq.any(-1) & valid & ~is_tail & first
+    slot = eq.to(torch.int64).argmax(-1)
+    slot_state = torch.gather(state.to(torch.int64), -1, slot)
+    hit = found & (slot_state == RESIDENT)
+    inflight = found & (slot_state == INFLIGHT)
+    named = torch.zeros((H, B, W + 1), dtype=torch.bool, device=sel.device)
+    named.scatter_(-1, torch.where(found, slot, torch.full_like(slot, W)), torch.ones_like(slot, dtype=torch.bool))
+    named = named[..., :W]
+    attended = named & (state == RESIDENT)
+    deny = ~attended
+    deny[..., lay.tail_slot] = False
+    deny[..., lay.mirror_hi] = False
+    deny[..., lay.mirror_lo] = True
+
+    miss = valid & ~is_tail & ~found & first
+    fetchable = miss & (sel < fg)
+    forbidden = miss & ~fetchable
+    cand = store.evictable.view(1, 1, W) & ~named & (state != INFLIGHT) & ((state == FREE) | (state == RESIDENT))
+    key = _slot_key(state, stamp, cand)
+    issue, fits, _ = _assign(fetchable, sel, cand, key)
+    newly = issue >= 0
+    evicted_unused = newly & (state == RESIDENT) & ~used
+
+    store.ids[l] = torch.where(newly, issue, ids)
+    store.state[l] = torch.where(newly, torch.full_like(state, INFLIGHT), state)
+    store.gen[l] = torch.where(newly, torch.full_like(gen, int(gen_now)), gen)
+    store.stamp[l] = torch.where(named | newly, torch.full_like(stamp, int(stamp_now)), stamp)
+    store.used[l] = torch.where(newly, torch.zeros_like(used), used | attended)
+
+    n_issue = fits.sum(-1)
+    n_unreq = (fetchable & ~fits).sum(-1)
+    store.prefetch_blocks[l] += n_issue
+    store.unrequested_blocks[l] += n_unreq
+    store.forbidden_blocks[l] += forbidden.sum(-1)
+    store.wasted_blocks[l] += evicted_unused.sum(-1)
+    n_sel = (valid & ~is_tail & first).sum(-1)
+    store.draft_sel_blocks[l] += n_sel
+    store.draft_hit_blocks[l] += hit.sum(-1)
+    store.draft_inflight_blocks[l] += inflight.sum(-1)
+    return DraftPlan(deny=deny, issue=issue, n_sel=n_sel, n_hit=hit.sum(-1),
+                     n_inflight=inflight.sum(-1), n_issue=n_issue, n_unrequested=n_unreq,
+                     n_forbidden=forbidden.sum(-1), n_evicted_unused=evicted_unused.sum(-1))
+
+
+def apply_draft_bias_perreq(scratch: torch.Tensor, kv_bias_gpu: torch.Tensor, deny: torch.Tensor,
+                            deny_buf: torch.Tensor, layout: StoreLayout, block_size: int,
+                            tail_len: torch.Tensor, rolled: torch.Tensor, mask_bias: float = MASK_BIAS) -> torch.Tensor:
+    """apply_draft_bias with the row limits per request
+    (draft_row_limits_perreq): MASK_BIAS on the rows of the tail slot at or
+    above tail_ok[b] and on the rows of mirror_hi at or above hi_ok[b]."""
+    B, S, H = kv_bias_gpu.shape
+    W = layout.W
+    if S != W * block_size or tuple(scratch.shape) != (B, S, H) or tuple(deny.shape) != (H, B, W):
+        raise ValueError("apply_draft_bias_perreq: bias %s scratch %s deny %s W=%d bs=%d" % (
+            tuple(kv_bias_gpu.shape), tuple(scratch.shape), tuple(deny.shape), W, block_size))
+    if tuple(deny_buf.shape) != (B, W, 1, H):
+        raise ValueError("deny_buf must be (B, W, 1, H)=%s, got %s" % ((B, W, 1, H), tuple(deny_buf.shape)))
+    tail_ok, hi_ok = draft_row_limits_perreq(_bvec(tail_len, B, "tail_len"), _bvec(rolled, B, "rolled", torch.bool), block_size)
+    scratch.copy_(kv_bias_gpu)
+    deny_buf.copy_(deny.permute(1, 2, 0).unsqueeze(2))
+    scratch.view(B, W, block_size, H).masked_fill_(deny_buf, mask_bias)
+    rows = torch.arange(block_size, device=scratch.device).view(1, block_size, 1)
+    ts, hs = layout.tail_slot * block_size, layout.mirror_hi * block_size
+    scratch[:, ts:ts + block_size].masked_fill_(rows >= tail_ok.view(B, 1, 1), mask_bias)
+    scratch[:, hs:hs + block_size].masked_fill_(rows >= hi_ok.view(B, 1, 1), mask_bias)
+    return scratch
+
+
+# -- the verify, per request ---------------------------------------------------
+class PerReqTail(NamedTuple):
+    """What write_tail_perreq wrote: TailWriteResult's fields per request."""
+    U: int
+    pos0: torch.Tensor              # (B,) tokens held before the round
+    tail_len_before: torch.Tensor   # (B,) pos0 % bs
+    tail_id: torch.Tensor           # (B,) T_b = pos0 // bs
+    rolled_over: torch.Tensor       # (B,) bool: a token of the round filled T_b (tail_len_before + U >= bs)
+    fill_at: torch.Tensor           # (B,) bs - 1 - tail_len_before: the token that fills T_b (where rolled_over)
+    rollover_at: torch.Tensor       # (B,) the first token in T_b + 1; U when no token is (no fill, or a fill on the last token)
+    tail_len_after: torch.Tensor    # (B,) (pos0 + U) % bs
+    mirror_lo: int
+    mirror_hi: int
+    last_used_slot: torch.Tensor    # (B,) mirror_hi where rolled_over, else mirror_lo
+    seqused_k: torch.Tensor         # (B,) int32: last_used_slot * bs + tail_len_after
+    ctr: torch.Tensor               # (U + 1, B) int64: pos after u tokens, pos0 + u (row 0 of the twin's ctr)
+
+
+def write_tail_perreq(engine, key_states, value_states, kv_bias, mirror_slot: int) -> PerReqTail:
+    """tail_write.write_tail per request: request b writes its U tokens from
+    its own position pos0_b = engine._pos[b]. Token i of request b (position
+    p = pos0_b + i) goes to slot topk-1, row p % bs, and to the mirror
+    (mirror_lo row p % bs while p is in T_b, mirror_hi row p % bs after). Its
+    bias row is kv_bias[b, p]. At round start, rows [0, tail_len0_b) of slot
+    topk-1 are copied to mirror_lo (one masked copy), so mirror_lo holds T_b
+    complete after the round. The token that fills T_b writes the block back
+    to the host from slot topk-1 (:402-405) before the tokens of T_b + 1
+    reuse its rows. After the round pos = pos0 + U, and the map's tail column
+    and cache_lens follow. The refusals are those of write_tail, per
+    request; a refused call changes nothing."""
+    k_gpu = engine._k_gpu
+    bs = int(engine.block_size)
+    topk = int(engine.topk)
+    ts = int(engine._tail_block_idx_on_gpu)
+    if key_states.dim() != 4:
+        raise ValueError("key_states must be (B, U, H, D), got %s" % (tuple(key_states.shape),))
+    B, U, H, D = key_states.shape
+    if tuple(value_states.shape) != (B, U, H, D):
+        raise ValueError("value_states %s != key_states %s" % (tuple(value_states.shape), (B, U, H, D)))
+    if U < 1:
+        raise ValueError("write_tail_perreq: U must be >= 1, got %d" % U)
+    if k_gpu.shape[0] != B or k_gpu.shape[2] != H or k_gpu.shape[3] != D or k_gpu.shape[1] % bs != 0:
+        raise ValueError("_k_gpu %s does not match key_states %s (block_size %d)" % (tuple(k_gpu.shape), (B, U, H, D), bs))
+    W = k_gpu.shape[1] // bs
+    if ts != topk - 1:
+        raise ValueError("_tail_block_idx_on_gpu=%d but topk-1=%d" % (ts, topk - 1))
+    mirror_lo = int(mirror_slot)
+    mirror_hi = mirror_lo + 1
+    if mirror_lo != W - 2 or mirror_lo < topk:
+        raise ValueError("mirror_slot=%d must be W-2=%d and outside the decode window (topk=%d)" % (mirror_lo, W - 2, topk))
+    pos0 = engine._pos.clone()
+    tl0 = pos0 % bs
+    T = pos0 // bs
+    if bool((tl0 + U >= 2 * bs).any()):
+        raise ValueError("tail_len + U >= 2*block_size for a request: more than one rollover per round is not supported")
+    top = int(pos0.max()) + U
+    if kv_bias.shape[0] != B or kv_bias.shape[1] < top or kv_bias.shape[2] != H:
+        raise ValueError("kv_bias %s must be (B=%d, >= max pos + U = %d, H=%d)" % (tuple(kv_bias.shape), B, top, H))
+    if engine._k_cpu.shape[1] < top:
+        raise ValueError("host window has %d rows, need %d" % (engine._k_cpu.shape[1], top))
+
+    _masked_slot_copy(engine, mirror_lo, ts, tl0)                 # round start: mirror_lo <- rows [0, tail_len0_b)
+    bi = torch.arange(B, device=pos0.device)
+    for i in range(U):
+        p = pos0 + i
+        r = p % bs
+        in_T = (p // bs) == T
+        kk = key_states[:, i].to(engine._k_gpu.dtype)
+        vv = value_states[:, i].to(engine._v_gpu.dtype)
+        bb = kv_bias[bi, p].to(engine._kv_bias_gpu.dtype)
+        for row in (ts * bs + r, torch.where(in_T, mirror_lo * bs + r, mirror_hi * bs + r)):
+            engine._k_gpu[bi, row] = kk
+            engine._v_gpu[bi, row] = vv
+            engine._kv_bias_gpu[bi, row] = bb
+        _host_write_back(engine, in_T & (r == bs - 1), T, ts)
+    pos1 = pos0 + U
+    tl1 = pos1 % bs
+    _set_tail_state(engine, pos1, pos1 // bs, tl1)
+    rolled = tl0 + U >= bs
+    fill_at = bs - 1 - tl0
+    rollover_at = torch.where(rolled & (fill_at + 1 < U), fill_at + 1, torch.full_like(fill_at, U))
+    last_used = torch.where(rolled, torch.full_like(T, mirror_hi), torch.full_like(T, mirror_lo))
+    ctr = pos0.view(1, B) + torch.arange(U + 1, dtype=pos0.dtype, device=pos0.device).view(U + 1, 1)
+    return PerReqTail(U=U, pos0=pos0, tail_len_before=tl0, tail_id=T, rolled_over=rolled, fill_at=fill_at,
+                      rollover_at=rollover_at, tail_len_after=tl1, mirror_lo=mirror_lo, mirror_hi=mirror_hi,
+                      last_used_slot=last_used, seqused_k=(last_used * bs + tl1).to(torch.int32), ctr=ctr)
+
+
+def plan_round_perreq(store: Store, l: int, sel: torch.Tensor, tail_id: torch.Tensor, rollover_at: torch.Tensor,
+                      gen_round0: int, gen_now: int, stamp_now: int, was_inflight: torch.Tensor) -> RoundPlan:
+    """plan_round with the live tail per request: tail_id and rollover_at
+    are (B,) tensors (PerReqTail.tail_id / rollover_at), so the live tail of
+    request b at position u is T_b + (u >= rollover_at_b) (the lockstep
+    live-tail list, :511, per request). The lines that use them are the only
+    change; every other line is plan_round's."""
+    lay = store.lay
+    ids, state, gen, stamp, used = store.ids[l], store.state[l], store.gen[l], store.stamp[l], store.used[l]
+    if sel.dim() != 4 or tuple(sel.shape[1:3]) != (store.H, store.B) or sel.dtype != torch.int64:
+        raise ValueError("sel must be int64 (U, H=%d, B=%d, K), got %s %s" % (store.H, store.B, sel.dtype, tuple(sel.shape)))
+    U, H, B, K = sel.shape
+    W = lay.W
+    T = _bvec(tail_id, B, "tail_id")
+    ra = _bvec(rollover_at, B, "rollover_at")
+    if bool(((ra < 1) | (ra > U)).any()):
+        raise ValueError("rollover_at must be in [1, U=%d] for every request" % U)
+    if tuple(was_inflight.shape) != (H, B, W):
+        raise ValueError("was_inflight must be (H, B, W)")
+    if bool((state == INFLIGHT).any()):
+        raise RuntimeError("plan_round_perreq: INFLIGHT slots remain; the caller must wait for the side stream and mark_arrived first")
+    valid = sel >= 0
+    after = torch.arange(U, device=sel.device).view(U, 1, 1, 1) >= ra.view(1, 1, B, 1)     # (U, 1, B, 1)
+    Tv = T.view(1, 1, B, 1)
+    live_tail = Tv + after.to(torch.int64)
+    invalid = ((valid & (sel > live_tail)) | (sel < -1)).any(-1).any(0)          # (H, B)
+    is_tail = valid & (sel == Tv)
+    is_tail_next = valid & (sel == Tv + 1) & after
+
+    need = sel.permute(1, 2, 0, 3).reshape(H, B, U * K)
+    need_valid = (valid & ~is_tail & ~is_tail_next).permute(1, 2, 0, 3).reshape(H, B, U * K)
+    need_ids = torch.where(need_valid, need, torch.full_like(need, -2))
+    first = _first_occurrence(need_ids) & need_valid
+    present = state == RESIDENT
+    eq = (need_ids.unsqueeze(-1) == ids.unsqueeze(-2)) & present.unsqueeze(-2)   # (H, B, U*K, W)
+    found = eq.any(-1) & first
+    slot = eq.to(torch.int64).argmax(-1)
+    slot_gen = torch.gather(gen, -1, slot)
+    slot_infl = torch.gather(was_inflight, -1, slot)
+    late_wait = found & slot_infl
+    timely = found & ~slot_infl & (slot_gen >= int(gen_round0))
+    hit_old = found & ~slot_infl & (slot_gen < int(gen_round0))
+    new = first & ~found
+    named = torch.zeros((H, B, W + 1), dtype=torch.bool, device=sel.device)
+    named.scatter_(-1, torch.where(found, slot, torch.full_like(slot, W)), torch.ones_like(slot, dtype=torch.bool))
+    named = named[..., :W]
+
+    cand = store.evictable.view(1, 1, W) & ~named & ((state == FREE) | (state == RESIDENT))
+    key = _slot_key(state, stamp, cand)
+    fetch, fits, n_cand = _assign(new, need_ids, cand, key)
+    n_new = new.sum(-1)
+    overflow = n_new > n_cand
+    bad = overflow | invalid
+    newly = fetch >= 0
+    evicted_unused = newly & (state == RESIDENT) & ~used
+
+    ids2 = torch.where(newly, fetch, ids)
+    state2 = torch.where(newly, torch.full_like(state, RESIDENT), state)
+    store.ids[l] = ids2
+    store.state[l] = state2
+    store.gen[l] = torch.where(newly, torch.full_like(gen, int(gen_now)), gen)
+    store.stamp[l] = torch.where(named | newly, torch.full_like(stamp, int(stamp_now)), stamp)
+    store.used[l] = used | named | newly
+    fetch = torch.where(bad.unsqueeze(-1), torch.full_like(fetch, -1), fetch)
+
+    present2 = state2 == RESIDENT
+    masks = []
+    for u in range(U):
+        eq_u = (sel[u].unsqueeze(-1) == ids2.unsqueeze(-2)) & present2.unsqueeze(-2)   # (H, B, K, W)
+        found_u = eq_u.any(-1)
+        slot_u = eq_u.to(torch.int64).argmax(-1)
+        m = torch.where(found_u, slot_u, torch.full_like(slot_u, -1))
+        m = torch.where(is_tail[u], torch.full_like(m, lay.mirror_lo), m)
+        m = torch.where(is_tail_next[u], torch.full_like(m, lay.mirror_hi), m)
+        m = torch.where(bad.unsqueeze(-1), torch.full_like(m, -1), m)
+        masks.append(m)
+    mask = torch.stack(masks, dim=2).reshape(H, B * U, K).to(torch.int32)
+
+    store.late_fetch_blocks[l] += fits.sum(-1)
+    store.late_wait_blocks[l] += late_wait.sum(-1)
+    store.timely_blocks[l] += timely.sum(-1)
+    store.hit_old_blocks[l] += hit_old.sum(-1)
+    store.wasted_blocks[l] += evicted_unused.sum(-1)
+    return RoundPlan(mask=mask, fetch=fetch, overflow=overflow, invalid=invalid, n_new=n_new,
+                     n_need=first.sum(-1), n_hit_old=hit_old.sum(-1), n_timely=timely.sum(-1),
+                     n_late_wait=late_wait.sum(-1), n_late_fetch=fits.sum(-1), union_size=present2.sum(-1))
+
+
+# -- accept and commit, per request --------------------------------------------
+class PerReqAccept(NamedTuple):
+    n_acc: torch.Tensor       # (B,) accepted draft tokens per request
+    keep: torch.Tensor        # (B,) 1 + n_acc: the tokens request b commits this round
+    committed: torch.Tensor   # (B, U) int64: argmax(verify[b, u]) for u < keep[b], -1 after
+    next_token: torch.Tensor  # (B, 1) int64: committed[b, keep[b] - 1], fed first next round
+
+
+def accept_perreq(verify_argmax: torch.Tensor, drafted: torch.Tensor) -> PerReqAccept:
+    """accept_commit per request: request b commits keep_b = 1 + n_acc(b)
+    tokens, argmax(verify[b, 0:keep_b]). This is the argument of
+    accept_commit applied to request b alone (any c_b <= 1 + n_acc(b) is
+    exact for b). No host sync."""
+    n_acc = accept_lengths(verify_argmax, drafted)
+    keep = 1 + n_acc
+    B, U = verify_argmax.shape
+    u = torch.arange(U, device=verify_argmax.device).view(1, U)
+    committed = torch.where(u < keep.view(B, 1), verify_argmax, torch.full_like(verify_argmax, -1))
+    next_token = verify_argmax.gather(1, (keep - 1).view(B, 1))
+    return PerReqAccept(n_acc=n_acc, keep=keep, committed=committed, next_token=next_token)
+
+
+class PerReqTruncate(NamedTuple):
+    keep: torch.Tensor           # (B,)
+    pos: torch.Tensor            # (B,) pos0 + keep
+    tail_len: torch.Tensor       # (B,) pos % bs
+    tail_id: torch.Tensor        # (B,) pos // bs
+    undo_rollover: torch.Tensor  # (B,) bool: the round filled T_b and keep_b does not reach the fill
+    rows_restored: torch.Tensor  # (B,) rows of slot topk-1 copied back from mirror_lo
+
+
+def _check_truncate(engine, tail: PerReqTail, keep, mirror_lo: int) -> torch.Tensor:
+    keep = _bvec(keep, _batch(engine), "keep")
+    if bool(((keep < 0) | (keep > tail.U)).any()):
+        raise ValueError("keep outside [0, U=%d]" % tail.U)
+    if int(mirror_lo) != int(tail.mirror_lo):
+        raise ValueError("mirror_lo=%d != the write's %d" % (mirror_lo, tail.mirror_lo))
+    if not torch.equal(engine._pos, tail.ctr[tail.U]):
+        raise ValueError("the engine is not at the end of this round's write (truncated already, or another round)")
+    return keep
+
+
+def _reset_counters(ctr: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+    """ctr (U + 1, B), keep (B,) -> ctr[keep[b], b]: the counter reset."""
+    return ctr.gather(0, keep.view(1, -1)).view(-1)
+
+
+def truncate_perreq(engine, tail: PerReqTail, keep: torch.Tensor, mirror_lo: int) -> PerReqTruncate:
+    """truncate_tail per request: request b keeps the first keep[b] of the
+    round's U tokens (0 <= keep[b] <= U), after write_tail_perreq.
+    pos = ctr[keep_b, b], a counter reset; the map's tail column and
+    cache_lens follow. With f_b = fill_at[b]: a request whose round filled
+    T_b and whose keep_b < f_b + 1 undoes the fill. Rows [0, U - (f_b + 1))
+    of slot topk-1, which the tokens of T_b + 1 overwrote, come back from
+    mirror_lo (complete T_b after the write): one masked copy for the batch
+    (_masked_tail_restore). The host write-back of an undone fill stays
+    beyond the committed length, as in truncate_tail. Not touched: the
+    store, mirror_hi, the rows of slot topk-1 at or above the tail length."""
+    keep = _check_truncate(engine, tail, keep, mirror_lo)
+    bs = int(engine.block_size)
+    U = int(tail.U)
+    f = tail.fill_at
+    undo = tail.rolled_over & (keep < f + 1)
+    restored = torch.where(undo, U - (f + 1), torch.zeros_like(f))
+    _masked_tail_restore(engine, int(engine._tail_block_idx_on_gpu), int(mirror_lo), restored)
+    pos = _reset_counters(tail.ctr, keep)
+    _set_tail_state(engine, pos, pos // bs, pos % bs)
+    return PerReqTruncate(keep=keep, pos=pos, tail_len=pos % bs, tail_id=pos // bs, undo_rollover=undo, rows_restored=restored)
+
+
+def commit_layer_perreq(engine, tail: PerReqTail, tables, ctr: torch.Tensor, keep: torch.Tensor, mirror_lo: int) -> PerReqTruncate:
+    """The per-request commit of one layer. The tables commit ctr[keep_b, :, b]
+    (``tables`` has the twin's interface: commit(ctr, keep), a counter reset),
+    then the tail is truncated to keep_b (truncate_perreq). ctr is the
+    tables' trajectory of the verify (the twin's advance(): (U + 1, C, B),
+    row 0 = pos). Row 0 must equal the tail's trajectory: the two counters
+    are one counter. Every check runs before either side changes."""
+    keep = _check_truncate(engine, tail, keep, mirror_lo)
+    B = _batch(engine)
+    if ctr.dim() != 3 or ctr.shape[0] != tail.U + 1 or ctr.shape[2] != B:
+        raise ValueError("ctr must be (U + 1 = %d, C, B = %d), got %s" % (tail.U + 1, B, tuple(ctr.shape)))
+    if not torch.equal(ctr[:, 0].to(device=tail.ctr.device, dtype=tail.ctr.dtype), tail.ctr):
+        raise ValueError("the tables' pos trajectory is not the tail's: the two counters of the layer differ")
+    tables.commit(ctr, keep)
+    return truncate_perreq(engine, tail, keep, mirror_lo)
+
+
+class PerReqSpecContext(SpecContext):
+    """SpecContext with the round state per request (the lockstep fields
+    tail0 / tail_id / rolled, per request): tail0 is a PerReqTailCounters,
+    tail_id the (B,) round-start tail ids, rolled[l] a (B,) bool per layer,
+    tables0[l] the round-start counters of layer l's tables ((1, C, B), the
+    twin's counters()). The cache is duck-typed: ``cache.layers[l]`` has
+    ``cache_engine`` (per-request: _pos) and ``tables`` (counters(),
+    commit(ctr, keep)). The journals of the lockstep context are not used:
+    the tables roll back by a counter reset."""
+
+    def begin_round(self, cache, tail_id=None):
+        eng0 = cache.layers[0].cache_engine
+        B = _batch(eng0)
+        tc = capture_tail_counters_perreq(eng0)
+        tables0 = []
+        for lay in cache.layers:
+            if not torch.equal(lay.cache_engine._pos, tc.pos):
+                raise ValueError("begin_round: the layers' tail counters differ")
+            c0 = lay.tables.counters().unsqueeze(0)
+            if not torch.equal(c0[0, 0].to(device=tc.pos.device, dtype=tc.pos.dtype), tc.pos):
+                raise ValueError("begin_round: the tables' pos is not the tail's")
+            tables0.append(c0)
+        if tail_id is not None and not torch.equal(_bvec(tail_id, B, "tail_id"), tc.tail_id):
+            raise ValueError("begin_round: tail_id is not pos // block_size")
+        self.round_idx += 1
+        self.tail0 = tc
+        self.tail_id = tc.tail_id
+        self.rolled = [torch.zeros((B,), dtype=torch.bool, device=tc.pos.device) for _ in range(self.num_layers)]
+        self.gen_round0 = self.gen + 1
+        self.tables0 = tables0
+
+    def restore_before_verify(self, cache):
+        """The draft's K steps undone: the tail counters (restore_tail_
+        counters_perreq) and the tables (commit to the round start, keep 0)."""
+        B = int(self.tail0.pos.shape[0])
+        zeros = torch.zeros((B,), dtype=torch.int64, device=self.tail0.pos.device)
+        for l, lay in enumerate(cache.layers):
+            restore_tail_counters_perreq(lay.cache_engine, self.tail0)
+            lay.tables.commit(self.tables0[l], zeros)
