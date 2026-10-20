@@ -10,6 +10,16 @@ InfLLMv2Cache of cache_engine_gpu.py, offload=False; only its unused headroom ma
                      chunk of <= --cap-groups groups on a copy stream, a GPU scatter on a scatter stream)
   gpu:<MiB>:<frag>   + the matched GPU gather (the W8 persistent kernel: --w8-ctas CTAs x --w8-warps warps) of the SAME
                      plans, bytes and destinations, on a gather stream
+  V3 options (sustained_core.parse_arms), appended as key=value:
+  cpu:<MiB>:<frag>:mode=LP   the same feeder Python and the host packing into the pinned staging; no H2D, no scatter
+  cpu:<MiB>:<frag>:mode=L    the same per-layer Python skeleton only (plan, descriptor, chunking, views); no packing
+  <arm>:sleep=<ms>           a GPU sleep on the decode stream at the start of every step, before the decode (its
+                             launches queue up behind it, as in the finite-burst harness of job 2179735); the arm is
+                             scored on decode_ms against 'alone:sleep=<ms>' (required, exit 4 otherwise)
+  Per step the decode thread also records host_cpu_ms (its own CPU time, time.thread_time_ns) and decode_ms (the GPU time
+  from after the sleep to the end of the step); summary.json per arm: host (iter / cpu / off-CPU means), decode_mean_ms,
+  sleep_gap_ms, slowdown {metric, reference}; host_numa (allowed CPUs / nodes, per-node MemFree drop over the source
+  allocation, numa_maps over the source ranges).
 The feeder starts at step --feed-start, releases one release per step until step steps - deadline, then drains. The
 same documents and the same deterministic decode give the same trajectory in every arm (checked: the token sha256), so
 decode-step times pair by step index.
@@ -62,6 +72,7 @@ import sustained_core as SC  # noqa: E402
 
 CIS_HEADROOM = 1024                          # cache_engine_gpu.py update_uncompressed_cis: total_cis (B, S + 1024, H)
 CTX = 16128
+SLEEP_CLOCK_HZ = 1.41e9                      # A100 SM clock for torch.cuda._sleep (cycles); decode_ms is measured anyway
 
 
 # --------------------------------------------------------------------------------------------------------- config
@@ -128,6 +139,9 @@ def check_config(a, rows_available: int, cpus: List[int]) -> Dict[str, Any]:
             SC.Schedule(geom, nreq[arm.name], arm.frag)
         except ValueError as e:
             errs.append("arm %s: %s" % (arm.name, e))
+    alone_sleeps = {arm.sleep_ms for arm in arms if arm.method == "alone"}
+    for s in sorted({arm.sleep_ms for arm in arms if arm.method != "alone" and arm.sleep_ms > 0} - alone_sleeps):
+        errs.append("arms with sleep=%g need an 'alone:sleep=%g' arm (their slowdown is decode_ms against it)" % (s, s))
     need = 1 + a.pack_threads
     if a.pin == "on" and len(cpus) < need:
         errs.append("--pin on needs %d allowed CPUs (decode 1 + feeder %d), the process has %d" % (need, a.pack_threads,
@@ -184,20 +198,27 @@ class ArmContext:
                    .get_seq_length(0) and .layers[i].cache_engine.max_gen_len
       clock        sustained_core.CudaClock / HostClock
       transport    (arm) -> (work fn (sustained_core.cpu_work_fn / gpu_work_fn), prepare () -> None (drain, reset the
-                   pipe and the event pool, poison the scratch), finish (schedule) -> {"k": check, "v": check})
+                   pipe and the event pool, poison the scratch and the staging), finish (schedule) -> {"k": check,
+                   "v": check[, "ok": bool, "stage": staged_check]})
       device       where ids, tokens live
-      sync         () -> None: a full device synchronize"""
+      sync         () -> None: a full device synchronize
+      sleep        (ms) -> None: a sleep on the decode's stream (GPU: torch.cuda._sleep; the CPU tests: a host sleep);
+                   None = arms with sleep_ms > 0 are refused"""
 
-    def __init__(self, model, make_cache, clock, transport, device, ids, sync: Callable[[], None]):
+    def __init__(self, model, make_cache, clock, transport, device, ids, sync: Callable[[], None],
+                 sleep: Optional[Callable[[float], None]] = None):
         self.model, self.make_cache, self.clock, self.transport = model, make_cache, clock, transport
-        self.device, self.ids, self.sync = device, ids, sync
+        self.device, self.ids, self.sync, self.sleep = device, ids, sync, sleep
 
 
 def run_arm(ctx: ArmContext, arm: SC.ArmSpec, cfg: Dict[str, Any], a) -> Dict[str, Any]:
     """One trajectory (module docstring). Returns the arm record with its raw per-step and per-release rows."""
     N, d, w0, w1 = a.steps, a.deadline, cfg["w0"], cfg["w1"]
     model, clock = ctx.model, ctx.clock
-    rec: Dict[str, Any] = dict(arm=arm.name, method=arm.method, rate_mb=arm.rate_mb, frag=arm.frag)
+    if arm.sleep_ms > 0 and ctx.sleep is None:
+        raise ValueError("arm %s asks for a %g ms sleep but the context has no sleep" % (arm.name, arm.sleep_ms))
+    rec: Dict[str, Any] = dict(arm=arm.name, method=arm.method, rate_mb=arm.rate_mb, frag=arm.frag, mode=arm.mode,
+                               sleep_ms=arm.sleep_ms)
     cache = ctx.make_cache()
     for layer in cache.layers:
         layer.cache_engine.max_gen_len = cfg["max_gen"]
@@ -225,8 +246,10 @@ def run_arm(ctx: ArmContext, arm: SC.ArmSpec, cfg: Dict[str, Any], a) -> Dict[st
         feeder = SC.Feeder(work, affinity=cfg["feeder_cores"], name="feeder-" + arm.method)
         feeder.start()
     ev_s = [clock.event() for _ in range(N + 1)]
+    ev_d = [clock.event() for _ in range(N)]                      # the decode's start, after the optional sleep
     ev_e = [clock.event() for _ in range(N)]
     host_ns = [0] * N
+    host_cpu_ns = [0] * N                                         # the decode thread's own CPU time per step
     rewarm = [""] * N
     backlog, outst, pause_ns = [0] * N, [0] * N, [0] * N
     warm = None
@@ -240,6 +263,7 @@ def run_arm(ctx: ArmContext, arm: SC.ArmSpec, cfg: Dict[str, Any], a) -> Dict[st
             os.sched_setaffinity(0, {cfg["main_core"]})
         for t in range(N):
             h0 = time.perf_counter_ns()
+            c0 = time.thread_time_ns()
             if feeder is not None:
                 feeder.raise_if_failed()
                 backlog[t] = feeder.backlog()
@@ -257,6 +281,9 @@ def run_arm(ctx: ArmContext, arm: SC.ArmSpec, cfg: Dict[str, Any], a) -> Dict[st
             if feeder is not None and w0 <= t < w1:
                 feeder.release(SC.Release(spec=releases[t], deadline_t=t + d,
                                           gate=(ev_s[t] if a.gate == "gpu" else None)))
+            if arm.sleep_ms > 0:
+                ctx.sleep(arm.sleep_ms)                           # the decode's launches queue up behind it
+            clock.record(ev_d[t])
             if need:
                 model.has_buffers = False
             logits = model.decode_inference(next_ids, cu, pos, cache)
@@ -267,6 +294,7 @@ def run_arm(ctx: ArmContext, arm: SC.ArmSpec, cfg: Dict[str, Any], a) -> Dict[st
             if need and feeder is not None:
                 feeder.resume()
             host_ns[t] = time.perf_counter_ns() - h0
+            host_cpu_ns[t] = time.thread_time_ns() - c0
         clock.record(ev_s[N])
         cpu_b, wall_b = SC.cpu_snapshot(), time.perf_counter()
     finally:
@@ -279,17 +307,23 @@ def run_arm(ctx: ArmContext, arm: SC.ArmSpec, cfg: Dict[str, Any], a) -> Dict[st
         feeder.raise_if_failed()
     ref = ev_s[0]
     ts = [0.0] + [clock.elapsed(ref, e) for e in ev_s[1:]]
+    td = [clock.elapsed(ref, e) for e in ev_d]
     te = [clock.elapsed(ref, e) for e in ev_e]
     per = SC.periods(ts)
+    dec = [te[t] - td[t] for t in range(N)]
     steps_rows = []
     for t in range(N):
         steps_rows.append(dict(arm=arm.name, t=t, rewarm=bool(rewarm[t]), rewarm_why=rewarm[t], start_ms=ts[t],
                                period_ms=per[t], span_ms=te[t] - ts[t], host_iter_ms=host_ns[t] / 1e6,
                                released_groups=(releases[t].n_groups if t in releases else 0), backlog_host=backlog[t],
-                               outstanding_host=outst[t], pause_ms=pause_ns[t] / 1e6))
+                               outstanding_host=outst[t], pause_ms=pause_ns[t] / 1e6, decode_ms=dec[t],
+                               host_cpu_ms=host_cpu_ns[t] / 1e6))
     rec["rewarm_steps"] = [dict(t=t, why=rewarm[t]) for t in range(N) if rewarm[t]]
     rec["tokens_sha256"] = SC.sha256_bytes(toks.cpu().contiguous().numpy().tobytes())
     rec["periods"] = per
+    rec["decode_ms"] = dec
+    rec["host_iter_ms"] = [x / 1e6 for x in host_ns]
+    rec["host_cpu_ms"] = [x / 1e6 for x in host_cpu_ns]
     rec["steps_rows"] = steps_rows
     rec["cores"] = SC.cores_used(cpu_a or {}, cpu_b or {}, wall_b - wall_a, main_tid,
                                  feeder.tid if feeder is not None else None)
@@ -334,9 +368,26 @@ def steady_steps(arm_rec: Dict[str, Any], a, cfg) -> List[int]:
     return [t for t in range(cfg["w0"] + a.settle, cfg["w1"]) if t not in bad]
 
 
+def reference_arms(arms: List[Dict[str, Any]]) -> Dict[float, Dict[str, Any]]:
+    """sleep_ms -> the alone arm with that sleep (each arm's slowdown denominator)."""
+    return {float(r.get("sleep_ms") or 0.0): r for r in arms if r.get("method") == "alone" and "periods" in r}
+
+
+def slowdown_metric(r: Dict[str, Any]) -> str:
+    """The registered metric: the step period without a sleep; decode_ms (the GPU time after the sleep) with one."""
+    return "decode_ms" if float(r.get("sleep_ms") or 0.0) > 0 else "period"
+
+
+def _series(r: Dict[str, Any], metric: str) -> List[float]:
+    return r["decode_ms"] if metric == "decode_ms" else r["periods"]
+
+
 def finalize(arms: List[Dict[str, Any]], a, cfg) -> Dict[str, Any]:
-    """Paired slowdowns, trajectory equality and the verdict."""
-    alone = next((r for r in arms if r.get("method") == "alone" and "periods" in r), None)
+    """Paired slowdowns (each arm against the alone arm of the SAME sleep, on slowdown_metric), trajectory equality, the
+    sleep self-check (a sleep arm's median period - decode_ms must be >= half the sleep), the decode thread's CPU
+    summary, the content / staging checks, and the verdict."""
+    refs = reference_arms(arms)
+    alone = refs.get(0.0)
     fails = []
     shas = {r["arm"]: r.get("tokens_sha256") for r in arms if "tokens_sha256" in r}
     ref_sha = alone["tokens_sha256"] if alone else (next(iter(shas.values())) if shas else None)
@@ -349,17 +400,41 @@ def finalize(arms: List[Dict[str, Any]], a, cfg) -> Dict[str, Any]:
             fails.append("%s trajectory differs from %s" % (r["arm"], "alone" if alone else "the first arm"))
         st = steady_steps(r, a, cfg)
         pr = r["periods"]
+        dm = r.get("decode_ms") or pr
         r["decode"] = dict(steady_steps=len(st), period_mean_ms=SC.mean([pr[t] for t in st]),
                            period_p50_ms=SC.pctl([pr[t] for t in st], 50), period_p95_ms=SC.pctl([pr[t] for t in st], 95),
+                           decode_mean_ms=SC.mean([dm[t] for t in st]), decode_p50_ms=SC.pctl([dm[t] for t in st], 50),
                            rewarm_period_ms=[dict(t=x["t"], why=x["why"], ms=pr[x["t"]]) for x in r["rewarm_steps"]])
-        if alone is not None and r is not alone:
-            r["slowdown"] = SC.paired_slowdown({t: alone["periods"][t] for t in st},
-                                               {t: pr[t] for t in st}, st, n_boot=a.boot, seed=a.seed)
+        hi, hc = r.get("host_iter_ms"), r.get("host_cpu_ms")
+        if hi and hc:
+            r["host"] = dict(iter_mean_ms=SC.mean([hi[t] for t in st]), cpu_mean_ms=SC.mean([hc[t] for t in st]),
+                             off_cpu_mean_ms=SC.mean([hi[t] - hc[t] for t in st]),
+                             off_cpu_p50_ms=SC.pctl([hi[t] - hc[t] for t in st], 50))
+        sl = float(r.get("sleep_ms") or 0.0)
+        if sl > 0:
+            gap = SC.pctl([pr[t] - dm[t] for t in st], 50)
+            r["sleep_gap_ms"] = gap
+            if gap is None or gap < 0.5 * sl:
+                fails.append("%s: the %g ms sleep is not in the period (median period - decode_ms = %s ms)"
+                             % (r["arm"], sl, gap))
+        ref = refs.get(sl)
+        if ref is None and sl > 0:
+            fails.append("%s: no alone arm with sleep %g ms (its slowdown denominator)" % (r["arm"], sl))
+        if ref is not None and r is not ref:
+            m = slowdown_metric(r)
+            r["slowdown"] = SC.paired_slowdown({t: _series(ref, m)[t] for t in st}, {t: _series(r, m)[t] for t in st}, st,
+                                               n_boot=a.boot, seed=a.seed)
+            r["slowdown"].update(metric=m, reference=ref["arm"])
+            if m != "period":
+                r["slowdown_period"] = SC.paired_slowdown({t: ref["periods"][t] for t in st}, {t: pr[t] for t in st}, st,
+                                                          n_boot=a.boot, seed=a.seed)
         c = r.get("content")
         if c is not None:
             for kv in ("k", "v"):
                 if c[kv]["groups_bad"] or c[kv]["untouched_bad"]:
-                    fails.append("%s content %s: %s" % (r["arm"], kv, c[kv]))
+                    fails.append("%s content %s (expect %s): %s" % (r["arm"], kv, c.get("expect", "last writes"), c[kv]))
+            if c.get("stage") is not None and not SC.stage_ok(r.get("mode", "full"), c["stage"]):
+                fails.append("%s staging (mode %s): %s" % (r["arm"], r.get("mode"), c["stage"]))
     return dict(verdict="PASS" if not fails else "FAIL", failures=fails)
 
 
@@ -383,6 +458,7 @@ def gpu_context(a, cfg, wl, rec) -> ArmContext:
     model = nl.Llama(model_name=os.path.realpath(a.model), device="cuda", offload=False)
     rec["model_load_s"] = time.perf_counter() - t0
     g = cfg["geom"]
+    numa: Dict[str, Any] = dict(topology=SC.host_topology(), memfree_before_kB=SC.node_memfree())
     t0 = time.perf_counter()
     src_k, src_v = [], []
     for l in range(a.src_layers):
@@ -392,6 +468,18 @@ def gpu_context(a, cfg, wl, rec) -> ArmContext:
         src_v.append(SC.fill_source(v, l, 1))
     rec["source_s"] = time.perf_counter() - t0
     rec["source_bytes"] = 2 * a.src_layers * g.B * g.S * g.H * g.D * 2
+    # where the pinned source landed: per-node MemFree drop over its allocation, and numa_maps over its address ranges
+    # (driver-mapped pinned pages may carry no page counts: then uncounted_bytes ~ range_bytes and the drop decides)
+    try:
+        numa["memfree_after_kB"] = SC.node_memfree()
+        numa["memfree_drop_GB"] = {n: (kb - numa["memfree_after_kB"].get(n, kb)) * 1024 / 1e9
+                                   for n, kb in numa["memfree_before_kB"].items()}
+        t1 = time.perf_counter()
+        numa["source_maps"] = SC.numa_record(src_k + src_v)
+        numa["numa_maps_s"] = time.perf_counter() - t1
+    except Exception as e:                                               # noqa: BLE001 (a record, never fatal)
+        numa["error"] = "%s: %s" % (type(e).__name__, e)
+    rec["host_numa"] = numa
     streams = {n: torch.cuda.Stream() for n in ("copy", "scatter", "gather")}
     be = K.CudaBackend(streams, torch.cuda.Stream())
     sb = K.slot_bytes(a.cap_groups)
@@ -412,19 +500,25 @@ def gpu_context(a, cfg, wl, rec) -> ArmContext:
         pipe.reset()
         SC.poison(scr_k)
         SC.poison(scr_v)
+        SC.poison_stage(stage, a.cap_groups, g.R)                   # an unpacked slot stays POISON (staged_check)
         torch.cuda.synchronize()
 
     def transport(arm):
         if arm.method == "cpu":
-            work = SC.cpu_work_fn(K, be, pipe, g, src_k, src_v, scr_k, scr_v)
+            work = SC.cpu_work_fn(K, be, pipe, g, src_k, src_v, scr_k, scr_v, mode=arm.mode)
         else:
             work = SC.gpu_work_fn(be, gather, g, src_k, src_v, scr_k, scr_v, ids_host, ids_dev)
 
         def finish(sched):
             torch.cuda.synchronize()
-            return dict(k=SC.check_scratch(scr_k, src_k, sched.last_l, sched.last_blk, g.R),
-                        v=SC.check_scratch(scr_v, src_v, sched.last_l, sched.last_blk, g.R))
+            out = SC.content_check(scr_k, scr_v, src_k, src_v, sched, arm.moves_data, g.R)
+            if arm.method == "cpu":
+                out["stage"] = SC.staged_check(K, pipe, work.last, src_k, src_v, g.R)
+            return out
         return work, reset_all, finish
+
+    def gpu_sleep(ms):
+        torch.cuda._sleep(int(ms * 1e-3 * SLEEP_CLOCK_HZ))          # on the current (decode) stream
 
     # pre-warm both transports (Triton JIT of the W8 kernel, the packer's first calls) on a throwaway release
     t0 = time.perf_counter()
@@ -442,7 +536,7 @@ def gpu_context(a, cfg, wl, rec) -> ArmContext:
     ids = wl["ids"].to("cuda")
     return ArmContext(model, lambda: NoOffloadCache(config=model.config, num_hidden_layers=model.config.num_hidden_layers,
                                                     has_kv_bias=True),
-                      SC.CudaClock(), transport, "cuda", ids, torch.cuda.synchronize)
+                      SC.CudaClock(), transport, "cuda", ids, torch.cuda.synchronize, sleep=gpu_sleep)
 
 
 def _err(e: BaseException) -> Dict[str, Any]:
@@ -461,7 +555,8 @@ def write_outputs(out: Path, rec: Dict[str, Any], arms: List[Dict[str, Any]]) ->
                 f.write(SC.jsonl_line(SC.RELEASE_FIELDS, row))
     slim = []
     for r in arms:
-        s = {k: v for k, v in r.items() if k not in ("steps_rows", "release_rows", "periods")}
+        s = {k: v for k, v in r.items() if k not in ("steps_rows", "release_rows", "periods", "decode_ms", "host_iter_ms",
+                                                      "host_cpu_ms")}
         if "delivery" in s:
             s["delivery"] = {k: v for k, v in s["delivery"].items() if k not in ("delivered_cum_bytes", "outstanding_gpu")}
         slim.append(s)

@@ -5,13 +5,17 @@
 #   bash benchmarks/Efficiency/sustained_step.sh <nosi commit (40 hex)> <holder job> <tag> [driver args ...]
 #
 # Checks before the launch (each STOPS with exit 1, nothing launched): no SLURM_ / SRUN_ / SALLOC_ / SBATCH_ variable
-# in the environment; this worktree's HEAD is <nosi commit> with no tracked change and no untracked file under
-# benchmarks/Efficiency and nosi/nosi; the output directory results/sustained/<tag> and its record <tag>.step do not
-# exist. The step: srun --jobid=<holder> --job-name=sustained-<tag> --ntasks=1 --cpus-per-task=16 --mem=240G
-# --gres=gpu:a100:1 --time=$STEP_MIN --export=NONE, a /bin/sh child that requires CUDA_VISIBLE_DEVICES to name exactly
-# one GPU and passes it into the image (apptainer exec --nv --cleanenv) with fresh JIT roots, PYTHONPATH = this
-# worktree's nosi/ and NOSI_REPO = this worktree, the driver with --gpu-uuid, under a host timeout of STEP_MIN minutes +
-# 60 s (KILL 15 s later). Record: <tag>.step/ (command.txt, stdout.txt, stderr.txt, exit.txt). Exit: the step's exit
+# in the environment; the holder's GPU uuid file $HOLDERS/<holder job>.gpu_uuid exists and holds one uuid (v3: the uuid
+# is read from there, never hard-coded; HOLDERS = /mnt/beegfs/ojerbi/kstep-cpu-runs/holders unless
+# SUSTAINED_HOLDERS_DIR names another directory, for the CPU tests); this worktree's HEAD is <nosi commit> with no
+# tracked change and no untracked file under benchmarks/Efficiency and nosi/nosi; the output directory
+# results/sustained/<tag> and its record <tag>.step do not exist. The step: srun --jobid=<holder>
+# --job-name=sustained-<tag> --ntasks=1 --cpus-per-task=16 --mem=240G --gres=gpu:a100:1 --time=$STEP_MIN --export=NONE,
+# a /bin/sh child that requires CUDA_VISIBLE_DEVICES to name exactly one GPU, writes the node record (<tag>.step/
+# lscpu.txt, numactl.txt, nvidia_topo.txt, allowed.txt) and passes the GPU into the image (apptainer exec --nv
+# --cleanenv) with fresh JIT roots, PYTHONPATH = this worktree's nosi/ and NOSI_REPO = this worktree, the driver with
+# --gpu-uuid, under a host timeout of STEP_MIN minutes + 60 s (KILL 15 s later). Record: <tag>.step/ (command.txt,
+# stdout.txt, stderr.txt, exit.txt and the node record). Exit: the step's exit
 # (sustained_feed.py: 0 PASS, 1 FAIL, 2 out exists, 3 another GPU, 4 refused config, 6 module origin; 124 / 137 the
 # host timeout; srun's own nonzero exit when the step's --time ends it); 1 a STOP before the launch.
 set -u
@@ -23,7 +27,7 @@ APPTAINER=/usr/bin/apptainer                                                    
 MODEL=/mnt/beegfs/ojerbi/models/NOSA-8B                                                  # ROOT
 WL=/mnt/beegfs/ojerbi/kstep-cpu-runs/workload/pg19-test-c16k                             # ROOT
 JITBASE=/mnt/beegfs/ojerbi/nosa-env/jit                                                  # ROOT
-GPU_UUID=f31fc723-9dfe-407a-9947-28173556232a                                            # PIN (holder 2188818)
+HOLDERS=${SUSTAINED_HOLDERS_DIR:-/mnt/beegfs/ojerbi/kstep-cpu-runs/holders}              # ROOT (the lead's uuid files)
 STEP_MIN=${STEP_MIN:-60}
 stop() { echo "sustained step: STOP: $*" >&2; exit 1; }
 [ $# -ge 3 ] || { echo "usage: sustained_step.sh <nosi commit> <holder job> <tag> [driver args ...]" >&2; exit 2; }
@@ -34,6 +38,10 @@ case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
 [[ $TAG =~ ^[A-Za-z0-9_.-]+$ ]] || stop "tag '$TAG'"
 case $STEP_MIN in *[!0-9]*|"") stop "STEP_MIN '$STEP_MIN'" ;; esac
 for v in $(compgen -e); do case $v in SLURM_*|SRUN_*|SALLOC_*|SBATCH_*) stop "the environment exports $v" ;; esac; done
+UF=$HOLDERS/$JOB.gpu_uuid
+[ -f "$UF" ] || stop "the holder's gpu_uuid file $UF is missing"
+GPU_UUID=$(head -n 1 "$UF" | tr -d '[:space:]')
+[[ $GPU_UUID =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || stop "malformed gpu uuid '$GPU_UUID' in $UF"
 [ "$(git -C "$NOSI" rev-parse HEAD)" = "$SHA" ] || stop "$NOSI HEAD is not $SHA"
 [ -z "$(git -C "$NOSI" status --porcelain --untracked-files=no)" ] || stop "$NOSI has tracked changes"
 [ -z "$(git -C "$NOSI" status --porcelain --untracked-files=all -- benchmarks/Efficiency nosi/nosi)" ] \
@@ -48,12 +56,19 @@ CHILD='case "${CUDA_VISIBLE_DEVICES:-}" in
     ""|*,*) echo "sustained child: CUDA_VISIBLE_DEVICES must name exactly one GPU (is \"${CUDA_VISIBLE_DEVICES:-}\")" >&2
             exit 4 ;;
 esac
-A=$1
-shift
+R=$1
+A=$2
+shift 2
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+{ echo "host $(hostname) utc $(date -u +%FT%TZ)"; lscpu; } > "$R/lscpu.txt" 2>&1
+if command -v numactl > /dev/null 2>&1; then numactl -H > "$R/numactl.txt" 2>&1; else echo "numactl: not found" > "$R/numactl.txt"; fi
+nvidia-smi topo -m > "$R/nvidia_topo.txt" 2>&1
+grep -E "^(Cpus|Mems)_allowed_list" /proc/self/status > "$R/allowed.txt" 2>&1
 exec "$A" exec --nv --cleanenv --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" "$@"'
 CMD=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60))
      srun --jobid="$JOB" --job-name="sustained-$TAG" --ntasks=1 --cpus-per-task=16 --mem=240G --gres=gpu:a100:1
-     --time="$STEP_MIN" --export=NONE /bin/sh -c "$CHILD" sustained-child "$APPTAINER"
+     --time="$STEP_MIN" --export=NONE /bin/sh -c "$CHILD" sustained-child "$REC" "$APPTAINER"
      --bind /mnt/beegfs/ojerbi:/mnt/beegfs/ojerbi
      --env PYTHONPATH="$NOSI/nosi" --env NOSI_REPO="$NOSI" --env PYTHONDONTWRITEBYTECODE=1
      --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env TORCH_CUDA_ARCH_LIST=8.0
@@ -64,7 +79,8 @@ CMD=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60))
      --model "$MODEL" --tokens "$WL/c16k_tokens.bin" --manifest "$WL/c16k_manifest.json" --out "$OUT"
      --gpu-uuid "$GPU_UUID" "$@")
 printf '%q ' "${CMD[@]}" > "$REC/command.txt"
-printf '\nnosi=%s holder=%s utc_start=%s\n' "$SHA" "$JOB" "$(date -u +%FT%TZ)" >> "$REC/command.txt"
+printf '\nnosi=%s holder=%s gpu_uuid=%s (from %s) utc_start=%s\n' "$SHA" "$JOB" "$GPU_UUID" "$UF" "$(date -u +%FT%TZ)" \
+    >> "$REC/command.txt"
 "${CMD[@]}" > "$REC/stdout.txt" 2> "$REC/stderr.txt"
 RC=$?
 printf '%s\nutc_end=%s\n' "$RC" "$(date -u +%FT%TZ)" > "$REC/exit.txt"

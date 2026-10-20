@@ -41,6 +41,13 @@ score_buf.copy_ would raise). The decode thread computes both from the live cach
 cached_compressed_max_seqlen m, no_compress_k_len n; this step compresses iff n >= KERNEL) and sets has_buffers False.
 A warm-up captures CUDA graphs (torch.cuda.graph, global capture mode): the feeder is PAUSED at a safe point (between
 layers, no CUDA call in progress) for the whole warm-up step and resumed after it; the pause time is recorded.
+
+V3 (feature/nosi-sustained-v3, the host-side diagnosis of run b64_s960_v2). ARM OPTIONS (parse_arms): a cpu arm's mode
+(CPU_MODES: full; LP = pack into the pinned staging, no CUDA call; L = the per-layer Python skeleton only) and any arm's
+sleep (a GPU sleep at the start of every step, before the decode: the decode's launches queue up behind it, as in the
+finite-burst harness of job 2179735). Per step the decode thread also records its own CPU time (host_cpu_ms, from
+time.thread_time_ns) and the GPU time after the sleep (decode_ms). A mode arm that moves no data must leave the scratch
+POISON (content_check) and its last staging slot packed (LP) or still POISON (L) (staged_check).
 """
 from __future__ import annotations
 
@@ -74,31 +81,77 @@ PATTERN_MOD = 32512                                    # source int16 values in 
 
 
 # ------------------------------------------------------------------------------------------------------------ arms
+CPU_MODES = ("full", "L", "LP")      # cpupack_core.MODES used by a cpu arm: full = pack + H2D + scatter; LP = pack only
+                                     # (host gather into pinned staging, no CUDA call); L = the Python skeleton only (plan,
+                                     # descriptor, chunking, views: no pack, no index write, no CUDA call)
+ARM_OPTIONS = ("mode", "sleep")
+MAX_SLEEP_MS = 1000.0
+
+
 @dataclass(frozen=True)
 class ArmSpec:
     method: str                      # alone | cpu | gpu
     rate_mb: float = 0.0             # useful MiB per decode step (cpu / gpu)
     frag: int = 0                    # groups per served request per step
+    mode: str = "full"               # cpu arms only: CPU_MODES
+    sleep_ms: float = 0.0            # a GPU sleep enqueued on the decode stream at the start of every step (0 = none)
 
     @property
     def name(self) -> str:
-        return "alone" if self.method == "alone" else "%s_r%g_f%d" % (self.method, self.rate_mb, self.frag)
+        base = "alone" if self.method == "alone" else "%s_r%g_f%d" % (self.method, self.rate_mb, self.frag)
+        if self.mode != "full":
+            base += "_m" + self.mode
+        if self.sleep_ms > 0:
+            base += "_s%g" % self.sleep_ms
+        return base
+
+    @property
+    def moves_data(self) -> bool:
+        """True when the arm's work writes the GPU scratch (the content check expects the last writes); False for alone
+        and for the cpu modes L / LP (the scratch must stay POISON)."""
+        return self.method in ("cpu", "gpu") and self.mode == "full"
 
 
 def parse_arms(text: str) -> List[ArmSpec]:
-    """'alone,cpu:64:32,gpu:64:32' -> ArmSpecs. A transport arm is method:rate_MiB_per_step:frag."""
+    """'alone,cpu:64:32,gpu:64:32' -> ArmSpecs. A transport arm is method:rate_MiB_per_step:frag. Options follow the
+    positional parts as key=value: mode=full|L|LP (cpu arms only) and sleep=<ms> (any arm, 0 .. MAX_SLEEP_MS), e.g.
+    'cpu:64:32:mode=L', 'alone:sleep=30', 'cpu:64:32:sleep=30'. Without options the names are the v2 names."""
     out = []
     for item in [x.strip() for x in text.split(",") if x.strip()]:
         parts = item.split(":")
-        if parts[0] == "alone" and len(parts) == 1:
-            out.append(ArmSpec("alone"))
-        elif parts[0] in ("cpu", "gpu") and len(parts) == 3:
-            rate, frag = float(parts[1]), int(parts[2])
+        method, pos, opts = parts[0], [], {}
+        for p in parts[1:]:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                if k not in ARM_OPTIONS or k in opts:
+                    raise ValueError("arm %r: unknown or repeated option %r (options: %s)" % (item, k, ARM_OPTIONS))
+                opts[k] = v
+            elif opts:
+                raise ValueError("arm %r: positional part %r after an option" % (item, p))
+            else:
+                pos.append(p)
+        try:
+            sleep = float(opts.get("sleep", "0"))
+        except ValueError:
+            raise ValueError("arm %r: sleep must be a number of ms" % item)
+        if not 0.0 <= sleep <= MAX_SLEEP_MS:
+            raise ValueError("arm %r: sleep %r ms outside [0, %g]" % (item, opts.get("sleep"), MAX_SLEEP_MS))
+        mode = opts.get("mode", "full")
+        if method == "alone" and not pos:
+            if "mode" in opts:
+                raise ValueError("arm %r: the alone arm takes no mode" % item)
+            out.append(ArmSpec("alone", sleep_ms=sleep))
+        elif method in ("cpu", "gpu") and len(pos) == 2:
+            rate, frag = float(pos[0]), int(pos[1])
             if rate <= 0 or frag < 1:
                 raise ValueError("arm %r: rate and frag must be positive" % item)
-            out.append(ArmSpec(parts[0], rate, frag))
+            if "mode" in opts and method != "cpu":
+                raise ValueError("arm %r: mode applies to cpu arms only" % item)
+            if mode not in CPU_MODES:
+                raise ValueError("arm %r: mode %r not in %s" % (item, mode, CPU_MODES))
+            out.append(ArmSpec(method, rate, frag, mode, sleep))
         else:
-            raise ValueError("arm %r: expected 'alone' or 'cpu|gpu:<MiB per step>:<frag>'" % item)
+            raise ValueError("arm %r: expected 'alone' or 'cpu|gpu:<MiB per step>:<frag>', then key=value options" % item)
     if len({a.name for a in out}) != len(out):
         raise ValueError("duplicate arms in %r" % text)
     return out
@@ -523,11 +576,17 @@ def _query(ev) -> bool:
 
 # ------------------------------------------------------------------------------------------------- transport work
 def cpu_work_fn(K, be, pipe, geom: Geometry, src_k: Sequence[torch.Tensor], src_v: Sequence[torch.Tensor],
-                scr_k: torch.Tensor, scr_v: torch.Tensor):
+                scr_k: torch.Tensor, scr_v: torch.Tensor, mode: str = "full"):
     """The CPU-packing arm's work: per layer of the release (ascending), a LIVE descriptor (cpupack_core.build_desc, row
-    packer / row placer, orig layouts, no tail slot) and Pipe.layer (pack -> H2D on "copy" -> scatter on "scatter");
-    the release's done event is recorded on "scatter" after its last chunk."""
+    packer / row placer, orig layouts, no tail slot) and Pipe.layer in `mode` (CPU_MODES). full: pack -> H2D on "copy"
+    -> scatter on "scatter", the release's done event on "scatter" after its last chunk. L / LP: the same Python per
+    layer without the H2D and the scatter (LP still packs into the pinned staging); their only CUDA call is the done
+    marker on the idle aux stream (an upper bound of the host instant). work.last = the last chunk (descriptor, chunk
+    record, layer) for staged_check."""
+    if mode not in CPU_MODES:
+        raise ValueError("mode %r not in %s" % (mode, CPU_MODES))
     S_dst = geom.M * geom.R
+    last: Dict[str, Any] = {}
 
     def work(rel: Release, fd: Feeder) -> None:
         spec = rel.spec
@@ -538,10 +597,67 @@ def cpu_work_fn(K, be, pipe, geom: Geometry, src_k: Sequence[torch.Tensor], src_
                                 placer="row", R=geom.R, tail_slot=None)
             sk, dk = K.views_for(desc, src_k[l % len(src_k)], scr_k, geom.R)
             sv, dv = K.views_for(desc, src_v[l % len(src_v)], scr_v, geom.R)
-            pipe.layer(desc, sk, sv, dk, dv, lite=True)
+            recs = pipe.layer(desc, sk, sv, dk, dv, mode=mode, lite=True)
+            if recs:
+                last.update(desc=desc, rec=recs[-1], l=l)
             rel.layers += 1
-        rel.done = be.event_rec("scatter")
+        rel.done = be.event_rec("scatter") if mode == "full" else be.marker()
+    work.last = last
+    work.mode = mode
     return work
+
+
+def poison_stage(stage_u8: torch.Tensor, cap_groups: int, R: int = R_TOK) -> torch.Tensor:
+    """Fill the payload region [P0, end) of every staging slot with POISON_I16 (the index region [0, P0) is the Pipe's,
+    zeroed by Pipe.reset). Run before every arm, so a slot that a mode did not pack still holds the poison."""
+    p0 = 8 * cap_groups * R                                  # cpupack_core.idx_region(cap, R): int64 indices
+    for s in range(stage_u8.shape[0]):
+        stage_u8[s, p0:].view(torch.int16).fill_(POISON_I16)
+    return stage_u8
+
+
+def staged_check(K, pipe, last: Dict[str, Any], src_k: Sequence[torch.Tensor], src_v: Sequence[torch.Tensor],
+                 R: int = R_TOK) -> Dict[str, Any]:
+    """The last chunk's staging slot against its source rows (after a full synchronize): packed = K and V payload equal
+    the rows the descriptor names; poisoned = both still the POISON pattern. A cpu arm in full / LP must be packed and
+    not poisoned; in L poisoned and not packed (stage_ok)."""
+    if not last:
+        return dict(chunks_seen=False, packed=False, poisoned=False)
+    desc, r, l = last["desc"], last["rec"], last["l"]
+    n = int(r["g1"]) - int(r["g0"])
+    kst, vst, _, _, _ = K.stage_views(pipe.stage[r["slot"]], n, desc.packer, desc.placer, pipe.cap, pipe.dtype, R, pipe.D)
+    sp = desc.src_per_group
+    idx = desc.src_idx[int(r["g0"]) * sp:int(r["g1"]) * sp]
+    out = {}
+    for name, st, src in (("k", kst, src_k), ("v", vst, src_v)):
+        s2, _ = K.views_for(desc, src[l % len(src)], src[l % len(src)], R)
+        ref = s2.index_select(0, idx)
+        out[name + "_packed"] = bool(torch.equal(st.view(torch.int16), ref.view(torch.int16)))
+        out[name + "_poisoned"] = bool((st.view(torch.int16) == POISON_I16).all())
+    return dict(chunks_seen=True, layer=l, slot=int(r["slot"]), groups=n, packed=out["k_packed"] and out["v_packed"],
+                poisoned=out["k_poisoned"] and out["v_poisoned"])
+
+
+def stage_ok(mode: str, st: Dict[str, Any]) -> bool:
+    if not st.get("chunks_seen"):
+        return False
+    if mode == "L":
+        return bool(st["poisoned"] and not st["packed"])
+    return bool(st["packed"] and not st["poisoned"])
+
+
+def content_check(scr_k: torch.Tensor, scr_v: torch.Tensor, src_k: Sequence[torch.Tensor], src_v: Sequence[torch.Tensor],
+                  sched: "Schedule", moves_data: bool, R: int = R_TOK) -> Dict[str, Any]:
+    """The scratch check of one drained arm: an arm that moves data must hold the schedule's last writes (and POISON
+    elsewhere); an arm that moves none (cpu L / LP) must leave EVERY slot POISON (a stray write = a broken mode)."""
+    if moves_data:
+        ll, lb = sched.last_l, sched.last_blk
+    else:
+        ll, lb = torch.full_like(sched.last_l, -1), torch.full_like(sched.last_blk, -1)
+    k = check_scratch(scr_k, src_k, ll, lb, R)
+    v = check_scratch(scr_v, src_v, ll, lb, R)
+    ok = all(not c["groups_bad"] and not c["untouched_bad"] for c in (k, v))
+    return dict(k=k, v=v, expect=("last writes" if moves_data else "untouched"), ok=ok)
 
 
 def gpu_work_fn(be, gather, geom: Geometry, src_k: Sequence[torch.Tensor], src_v: Sequence[torch.Tensor],
@@ -823,9 +939,136 @@ def cores_used(a: Dict[int, Tuple], b: Dict[int, Tuple], wall_s: float, main_tid
     return dict(wall_s=wall_s, total=tot, main=main, feeder=feed, other=other, threads=per)
 
 
+# ------------------------------------------------------------------------------------------- host / NUMA record
+def parse_maps(text: str) -> List[Tuple[int, int]]:
+    """(start, end) of every line of /proc/<pid>/maps."""
+    out = []
+    for line in text.splitlines():
+        f = line.split()
+        if not f or "-" not in f[0]:
+            continue
+        a, b = f[0].split("-", 1)
+        out.append((int(a, 16), int(b, 16)))
+    return out
+
+
+def parse_numa_maps(text: str) -> Dict[int, Dict[str, Any]]:
+    """start -> {policy, nodes {node: pages}, kpage_kB, raw} from /proc/<pid>/numa_maps (proc(5)). A mapping the
+    kernel cannot count (VM_PFNMAP / VM_IO, e.g. driver-mapped pinned memory) has no N<node>= fields."""
+    out: Dict[int, Dict[str, Any]] = {}
+    for line in text.splitlines():
+        f = line.split()
+        if len(f) < 2:
+            continue
+        try:
+            start = int(f[0], 16)
+        except ValueError:
+            continue
+        nodes, kp = {}, 4
+        for tok in f[2:]:
+            if tok.startswith("N") and "=" in tok and tok[1:].split("=", 1)[0].isdigit():
+                k, v = tok[1:].split("=", 1)
+                nodes[int(k)] = int(v)
+            elif tok.startswith("kernelpagesize_kB="):
+                kp = int(tok.split("=", 1)[1])
+        out[start] = dict(policy=f[1], nodes=nodes, kpage_kB=kp, raw=line.strip())
+    return out
+
+
+def bytes_by_node(ranges: Sequence[Tuple[int, int]], maps: Sequence[Tuple[int, int]],
+                  numa: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+    """Bytes per NUMA node of the address ranges: every mapping that overlaps a range contributes its counted pages
+    per node times the overlapped fraction of the mapping (pro rata: exact when a range covers whole mappings).
+    uncounted_bytes = overlap inside mappings without page counts."""
+    per: Dict[int, float] = {}
+    lines, uncounted, covered = [], 0, 0
+    for s, e in maps:
+        ov = sum(max(0, min(e, b) - max(s, a)) for a, b in ranges)
+        if ov <= 0:
+            continue
+        covered += ov
+        info = numa.get(s)
+        if info is None or not info["nodes"]:
+            uncounted += ov
+            if info is not None:
+                lines.append(info["raw"])
+            continue
+        frac = ov / float(e - s)
+        for node, pages in info["nodes"].items():
+            per[node] = per.get(node, 0.0) + pages * info["kpage_kB"] * 1024.0 * frac
+        lines.append(info["raw"])
+    return dict(bytes_by_node={str(k): v for k, v in sorted(per.items())}, covered_bytes=covered,
+                uncounted_bytes=uncounted, n_mappings=len(lines), lines=lines[:64])
+
+
+def parse_node_meminfo(text: str) -> Dict[str, int]:
+    """{key: kB} from /sys/devices/system/node/node<N>/meminfo ('Node 0 MemFree:  123 kB')."""
+    out = {}
+    for line in text.splitlines():
+        f = line.split()
+        if len(f) >= 4 and f[0] == "Node" and f[2].endswith(":"):
+            try:
+                out[f[2][:-1]] = int(f[3])
+            except ValueError:
+                continue
+    return out
+
+
+def node_memfree(root: str = "/sys/devices/system/node") -> Dict[str, int]:
+    """{node: MemFree kB} of every NUMA node (empty when the sysfs tree is absent)."""
+    out = {}
+    try:
+        names = sorted(n for n in os.listdir(root) if n.startswith("node") and n[4:].isdigit())
+    except OSError:
+        return out
+    for n in names:
+        try:
+            with open(os.path.join(root, n, "meminfo")) as f:
+                out[n[4:]] = parse_node_meminfo(f.read()).get("MemFree", -1)
+        except OSError:
+            continue
+    return out
+
+
+def host_topology(root: str = "/sys/devices/system/node", status: str = "/proc/self/status") -> Dict[str, Any]:
+    """This process's allowed CPUs / memory nodes and every node's CPU list."""
+    out: Dict[str, Any] = dict(nodes={})
+    try:
+        with open(status) as f:
+            for line in f:
+                if line.startswith(("Cpus_allowed_list", "Mems_allowed_list")):
+                    k, v = line.split(":", 1)
+                    out[k] = v.strip()
+    except OSError:
+        pass
+    try:
+        for n in sorted(x for x in os.listdir(root) if x.startswith("node") and x[4:].isdigit()):
+            with open(os.path.join(root, n, "cpulist")) as f:
+                out["nodes"][n[4:]] = f.read().strip()
+    except OSError:
+        pass
+    return out
+
+
+def numa_record(tensors: Sequence[torch.Tensor], proc: str = "/proc/self") -> Dict[str, Any]:
+    """Where the host pages of `tensors` live: /proc/self/maps + numa_maps, restricted to the tensors' address ranges
+    (bytes_by_node). Best effort: an unreadable file gives an 'error' entry, never an exception."""
+    ranges = sorted((int(t.data_ptr()), int(t.data_ptr()) + t.numel() * t.element_size()) for t in tensors)
+    try:
+        with open(os.path.join(proc, "maps")) as f:
+            maps = parse_maps(f.read())
+        with open(os.path.join(proc, "numa_maps")) as f:
+            numa = parse_numa_maps(f.read())
+    except OSError as e:
+        return dict(error="%s: %s" % (type(e).__name__, e), ranges=len(ranges))
+    out = bytes_by_node(ranges, maps, numa)
+    out["range_bytes"] = sum(b - a for a, b in ranges)
+    return out
+
+
 # --------------------------------------------------------------------------------------------------------- output
 STEP_FIELDS = ("arm", "t", "rewarm", "rewarm_why", "start_ms", "period_ms", "span_ms", "host_iter_ms", "released_groups",
-               "backlog_host", "outstanding_host", "pause_ms")
+               "backlog_host", "outstanding_host", "pause_ms", "decode_ms", "host_cpu_ms")
 RELEASE_FIELDS = ("arm", "t", "deadline_t", "groups", "useful", "layers", "gate_ms", "done_ms", "lateness_ms",
                   "on_time", "queue_wait_ms", "gate_wait_ms", "service_ms", "pause_ms")
 
