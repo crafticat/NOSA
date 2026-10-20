@@ -150,3 +150,55 @@ GPU (from /mnt/beegfs/ojerbi/nosi-r2-base-p3; DRYRUN on the login node first):
 
     DRYRUN=1 bash benchmarks/Efficiency/r2_p3_step.sh --nosi <sha> <holder job> <run id>
     bash benchmarks/Efficiency/r2_p3_step.sh --nosi <sha> <holder job> <run id>
+
+## 6. M-P3 ran (holder 2190876, fca556f): the class defect and the offline re-analysis
+
+Run: `/mnt/beegfs/ojerbi/r2-runs/p3/p3_mp3_2190876/`. Q1, Q2, Q3, Q5 and Q6 were CONFIRMED.
+Q4 was REFUTED with ATTN 0.000 / 0.000 ms.
+
+**The defect.** The rules were applied in order, and GEMM was first. The flash kernels' names
+hold `cutlass::bfloat16_t` (a template argument), so the GEMM rule (`cutlass`) took them. Three
+kernels were counted as GEMM:
+
+- `flash_fwd_splitkv_kernel` (attention),
+- `flash_fwd_splitkv_combine_kernel` (attention),
+- `flash_fwd_splitkv_stage1_kernel` (stage 1).
+
+So Q4 compared nothing for ATTN, and Q5 had STAGE1 = 0 in both arms.
+
+**By hand, from the recorded names (summary.json), ms per step, R2G / SH:**
+
+| class  | R2G    | SH     | difference |
+|--------|--------|--------|------------|
+| GEMM   | 13.121 | 13.220 | -0.75 %    |
+| ATTN   | 5.984  | 6.035  | -0.85 %    |
+| STAGE1 | 2.049  | 2.057  | -0.4 %     |
+
+Q4 is CONFIRMED with the correct classes. Q5 with STAGE1 is +0.110 ms (CONFIRMED).
+
+**The fix.** `CLASS_RULES` now has STAGE1 and ATTN before GEMM. The ATTN rule no longer has a
+bare `splitkv`, so cuBLAS's `splitKreduce_kernel` stays GEMM. P1 has the real names of 2190876.
+Its negative control is the run's own rules: they put exactly the three flash kernels in GEMM.
+`classify` and `parse_trace` take a `rules` argument. `parse_trace` also gives each op its
+range instance (`rid`), its device start (`ts`) and its correlation id (`corr`).
+
+**The offline re-analysis** (`benchmarks/Efficiency/r2_p3_reclass.py`; CPU job; reads the run,
+writes one new JSON file):
+
+- REPARSE (MUST): the run's own recorded rules reproduce its recorded profile exactly.
+- COVER (MUST): no `flash_fwd` kernel is GEMM under the corrected rules.
+- RECLASS: the profile and Q1-Q6 with the corrected rules.
+- RANGES: every kernel name per range; `r2.body - sh.kv` per name.
+- SEQ: per range, the kernel sequence of one call (one layer), with the median us per position.
+  The position order is the program order, so each position maps to a source line of
+  `decode_fixed` (48 ops per layer) or `step_fixed` (72 ops per layer).
+- GRAPH: the R2G replays have no ranges. Each replayed step is aligned by kernel name to the R2E
+  step of the same index. A matched kernel takes the range of its R2E kernel, which gives device
+  ms per range in the graph. It is UNDETERMINED below 99 % matched.
+
+CPU (inside a CPU job; it imports torch through `r2_p3_profile`'s helpers):
+
+    env NOSI_REPO=/mnt/beegfs/ojerbi/nosi-r2-p3-reclass python -m pytest -q tests/test_r2_p3.py
+    cd /mnt/beegfs/ojerbi/nosi-r2-p3-reclass && env RECLASS_COMMIT=<sha> python \
+        benchmarks/Efficiency/r2_p3_reclass.py --run /mnt/beegfs/ojerbi/r2-runs/p3/p3_mp3_2190876 \
+        --out /mnt/beegfs/ojerbi/r2-runs/p3/reclass_mp3_2190876.json

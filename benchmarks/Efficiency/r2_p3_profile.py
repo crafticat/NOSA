@@ -51,11 +51,14 @@ RANGE_PREFIXES = ("sh.", "r2.")
 SH_RANGES = dict(update_no_compress_k_decode="sh.k", update_compress_k_decode="sh.k", update_uncompressed_cis="sh.cis",
                  update_cis="sh.cis", decode_update_kv="sh.kv")
 
-# kernel-name classes, first match wins (case-insensitive); gpu_memcpy / gpu_memset are COPY
+# kernel-name classes, first match wins (case-insensitive); gpu_memcpy / gpu_memset are COPY. STAGE1 and ATTN come
+# BEFORE GEMM: the flash kernels' template arguments name cutlass::bfloat16_t, and run 2190876 (fca556f, GEMM first)
+# counted the attention (flash_fwd_splitkv_kernel, _combine_kernel) and stage 1 (flash_fwd_splitkv_stage1_kernel) as
+# GEMM, so Q4's ATTN was 0 in both arms. ATTN no longer takes a bare "splitkv": cuBLAS's splitKreduce stays GEMM.
 CLASS_RULES = (
+    ("STAGE1", r"splitkv_stage1|stage1_kernel|infllm"),
+    ("ATTN", r"flash_fwd|flash_attn"),
     ("GEMM", r"gemm|gemv|xmma|cutlass|cublas"),
-    ("STAGE1", r"stage1|infllm"),
-    ("ATTN", r"flash_fwd|flash_attn|splitkv"),
     ("POOL", r"pool"),
     ("SELECT", r"topk|sort|radix"),
     ("H2D", r"h2d"),
@@ -87,20 +90,23 @@ def parse_args(argv):
 
 
 # ------------------------------------------------------------------ pure parts (CPU-tested: tests/test_r2_p3.py)
-def classify(name: str, cat: str = "kernel") -> str:
+def classify(name: str, cat: str = "kernel", rules=None) -> str:
+    """The name class of a GPU op by `rules` (default CLASS_RULES; the offline re-analysis passes a run's recorded
+    rules to reproduce its profile)."""
     if cat in ("gpu_memcpy", "gpu_memset"):
         return "COPY"
-    for cls, rx in CLASS_RULES:
+    for cls, rx in (CLASS_RULES if rules is None else rules):
         if re.search(rx, name, re.IGNORECASE):
             return cls
     return "OTHER"
 
 
-def parse_trace(trace, prefixes=RANGE_PREFIXES):
-    """Every GPU op of a Kineto chrome trace: [dict(name, cat, cls, dur_us, range)]. range = the innermost
-    user_annotation whose name starts with one of `prefixes`, on the thread that launched the op (the launch is the
-    cuda_runtime / cuda_driver event with the op's correlation id), containing the launch's start; None otherwise (a
-    graph replay's kernels share its launch: no range)."""
+def parse_trace(trace, prefixes=RANGE_PREFIXES, rules=None):
+    """Every GPU op of a Kineto chrome trace: [dict(name, cat, cls, dur_us, range, ts, rid, corr)]. range = the
+    innermost user_annotation whose name starts with one of `prefixes`, on the thread that launched the op (the launch
+    is the cuda_runtime / cuda_driver event with the op's correlation id), containing the launch's start; None
+    otherwise (a graph replay's kernels share its launch: no range). rid = that range INSTANCE (pid, tid, start) or
+    None; ts = the op's device start (us); corr = its correlation id (offline sequence analysis: r2_p3_reclass.py)."""
     ev = trace.get("traceEvents", []) if isinstance(trace, dict) else trace
     X = [e for e in ev if e.get("ph") == "X"]
     by_thread = {}
@@ -124,7 +130,7 @@ def parse_trace(trace, prefixes=RANGE_PREFIXES):
         if cat not in GPU_CATS:
             continue
         name = str(e.get("name", ""))
-        rng = None
+        rng = rid = None
         c = (e.get("args") or {}).get("correlation")
         if c in launch:
             pid, tid, ts = launch[c]
@@ -136,8 +142,10 @@ def parse_trace(trace, prefixes=RANGE_PREFIXES):
                     s, t_end, nm = rs[k]
                     if s <= ts <= t_end and (best is None or t_end - s < best[1] - best[0]):
                         best = (s, t_end, nm)
-                rng = best[2] if best else None
-        ops.append(dict(name=name, cat=cat, cls=classify(name, cat), dur_us=float(e.get("dur", 0.0)), range=rng))
+                if best:
+                    rng, rid = best[2], (pid, tid, best[0])
+        ops.append(dict(name=name, cat=cat, cls=classify(name, cat, rules), dur_us=float(e.get("dur", 0.0)), range=rng,
+                        ts=float(e.get("ts", 0.0)), rid=rid, corr=c))
     return ops
 
 
