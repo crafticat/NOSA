@@ -591,6 +591,101 @@ def gate(name, passed, must, detail):
     return dict(name=name, passed=bool(passed), must=bool(must), detail=detail)
 
 
+RELEASE_SLACK_GB = 0.5
+
+
+class CudaOps:
+    """The CUDA calls of a group run, in one place (the CPU test replaces them with stand-ins)."""
+
+    def __init__(self):
+        import torch
+        self.torch = torch
+
+    def sync(self):
+        self.torch.cuda.synchronize()
+
+    def event(self):
+        return self.torch.cuda.Event(enable_timing=True)
+
+    def profile(self):
+        P = self.torch.profiler
+        return P.profile(activities=[P.ProfilerActivity.CPU, P.ProfilerActivity.CUDA])
+
+    def release(self):
+        import gc
+        gc.collect()
+        self.torch.cuda.synchronize()
+        self.torch.cuda.empty_cache()
+
+    def allocated(self):
+        return self.torch.cuda.memory_allocated()
+
+
+def run_group(S, a, group, forms, scrub, acc_tot, R, ops):
+    """Build, gate, time and profile the forms of ONE group. Every reference to the group's plans (its windows, bias
+    stores, buffers) is LOCAL to this call; R receives host numbers and CPU logits only. So the caller's ops.release()
+    frees the group before the next one is built. Job b64 (2188818) ran out of memory in the shared group because a
+    loop variable of the former inline loop still referenced a private plan (52.8 GB of windows stayed allocated)."""
+    import torch
+    plans, iss = build_group(S, group, forms)
+    R["issues2"] += iss
+    for f in forms:
+        for cp in plans[f]:
+            if cp["layout"] == "private" and cp["metrics"]["masked_tokens"] != 0:
+                R["bad_acc"].append("form %s call %s: a private layout attends %d masked tokens" % (f, cp["name"], cp["metrics"]["masked_tokens"]))
+            if cp["metrics"]["masked_tokens"] < 0:
+                R["bad_acc"].append("form %s call %s: negative masked tokens" % (f, cp["name"]))
+    for f in forms:                                                      # warm (JIT, cuBLAS) and the gate outputs
+        for _ in range(max(1, a.warm)):
+            outs = run_form(S, plans, f)
+        ops.sync()
+        R["logits"][f] = logits_gate(S, plans, f, outs)
+        R["selection"][f] = selection_agreement(S, plans, f)
+        R["ref_out"][f] = [o.cpu() for o in outs]
+        R["analytic"][f] = analytic(S, plans, f, acc_tot)
+    if "joint_shared" in forms:                                          # G4: the masks matter
+        un = run_call(S, plans["joint_shared"][0], unmasked=True).cpu()
+        ops.sync()
+        ms = R["ref_out"]["joint_shared"][0]
+        R["mask_ctl"] = dict(max_abs_unmasked_vs_masked=float((un - ms).abs().max()), differs=not torch.equal(un, ms))
+    ms_rec = {f: [] for f in forms}
+    host_rec = {f: [] for f in forms}
+    call_rec = {f: [] for f in forms}
+    for rep in range(a.reps):
+        k0 = rep % len(forms)
+        for f in forms[k0:] + forms[:k0]:
+            scrub.add_(1)
+            ops.sync()
+            evs = [ops.event() for _ in range(len(plans[f]) + 1)]
+            h0 = time.perf_counter()
+            evs[0].record()
+            run_form(S, plans, f, events=evs[1:])
+            h1 = time.perf_counter()
+            ops.sync()
+            ms_rec[f].append(evs[0].elapsed_time(evs[-1]))
+            call_rec[f].append([evs[i].elapsed_time(evs[i + 1]) for i in range(len(evs) - 1)])
+            host_rec[f].append((h1 - h0) * 1e3)
+            R["order_log"].append(f)
+    for f in forms:
+        xs = sorted(ms_rec[f])
+        R["timing"][f] = dict(median_ms=statistics.median(xs), p95_ms=xs[min(len(xs) - 1, int(round(0.95 * (len(xs) - 1))))],
+                              min_ms=xs[0], reps=len(xs), host_median_ms=statistics.median(host_rec[f]),
+                              per_call_median_ms=[statistics.median(c) for c in zip(*call_rec[f])], group=group,
+                              all_ms=ms_rec[f])
+        scrub.add_(1)
+        ops.sync()
+        with ops.profile() as prof:
+            run_form(S, plans, f)
+            ops.sync()
+        tp = os.path.join(a.out, "trace_%s.json" % f)
+        prof.export_chrome_trace(tp)
+        R["kineto"][f] = JP.trace_busy(json.load(open(tp)))
+        t, k = R["timing"][f], R["kineto"][f]
+        log("form %s: median %.2f ms (p95 %.2f), host %.2f ms, kernels %d busy %.2f idle %.2f ms, max |dlogit| %.3f"
+            % (f, t["median_ms"], t["p95_ms"], t["host_median_ms"], k["n"], k["busy_ms"], k["idle_ms"],
+               R["logits"][f]["max_abs"]))
+
+
 # =====================================================================================================================
 # modes
 # =====================================================================================================================
@@ -610,76 +705,23 @@ def mode_cell(a):
                 bad_acc.append("layer %d version %s: %d / %d / %d" % (l, v, x["sum"][v], x["union_sep"][v], x["union_request"][v]))
     torch.save(dict(bms=[b.cpu() for b in S["bms"]], tks=[t.cpu() for t in S["tks"]],
                     inputs={s: t.cpu() for s, t in S["inputs"].items()}, meta=S["meta"]), os.path.join(a.out, "capture.pt"))
-    timing, kineto, analytic_b, logit_g, sel_g, cross, issues2, mask_ctl = {}, {}, {}, {}, {}, {}, [], None
-    ref_out = {}
-    order_log = []
+    R = dict(timing={}, kineto={}, analytic={}, logits={}, selection={}, issues2=[], bad_acc=bad_acc, mask_ctl=None,
+             ref_out={}, order_log=[], release=[])
+    ops = CudaOps()
     scrub = torch.empty(SCRUB_BYTES, dtype=torch.uint8, device="cuda")
     with torch.inference_mode():
         for group, gforms in JP.GROUPS:
             forms = [f for f in gforms if f in a.forms]
             if not forms:
                 continue
-            plans, iss = build_group(S, group, forms)
-            issues2 += iss
-            for f in forms:
-                for cp in plans[f]:
-                    if cp["layout"] == "private" and cp["metrics"]["masked_tokens"] != 0:
-                        bad_acc.append("form %s call %s: a private layout attends %d masked tokens" % (f, cp["name"], cp["metrics"]["masked_tokens"]))
-                    if cp["metrics"]["masked_tokens"] < 0:
-                        bad_acc.append("form %s call %s: negative masked tokens" % (f, cp["name"]))
-            for f in forms:                                              # warm (JIT, cuBLAS) and the gate outputs
-                for _ in range(max(1, a.warm)):
-                    outs = run_form(S, plans, f)
-                torch.cuda.synchronize()
-                logit_g[f] = logits_gate(S, plans, f, outs)
-                sel_g[f] = selection_agreement(S, plans, f)
-                ref_out[f] = [o.cpu() for o in outs]
-                analytic_b[f] = analytic(S, plans, f, acc_tot)
-            if "joint_shared" in forms:                                  # G4: the masks matter
-                cp = plans["joint_shared"][0]
-                un = run_call(S, cp, unmasked=True)
-                torch.cuda.synchronize()
-                ms = ref_out["joint_shared"][0]
-                d = float((un.cpu() - ms).abs().max())
-                mask_ctl = dict(max_abs_unmasked_vs_masked=d, differs=not torch.equal(un.cpu(), ms))
-            ms_rec = {f: [] for f in forms}
-            host_rec = {f: [] for f in forms}
-            call_rec = {f: [] for f in forms}
-            for rep in range(a.reps):
-                k0 = rep % len(forms)
-                for f in forms[k0:] + forms[:k0]:
-                    scrub.add_(1)
-                    torch.cuda.synchronize()
-                    evs = [torch.cuda.Event(enable_timing=True) for _ in range(len(plans[f]) + 1)]
-                    h0 = time.perf_counter()
-                    evs[0].record()
-                    run_form(S, plans, f, events=evs[1:])
-                    h1 = time.perf_counter()
-                    torch.cuda.synchronize()
-                    ms_rec[f].append(evs[0].elapsed_time(evs[-1]))
-                    call_rec[f].append([evs[i].elapsed_time(evs[i + 1]) for i in range(len(evs) - 1)])
-                    host_rec[f].append((h1 - h0) * 1e3)
-                    order_log.append(f)
-            for f in forms:
-                xs = sorted(ms_rec[f])
-                timing[f] = dict(median_ms=statistics.median(xs), p95_ms=xs[min(len(xs) - 1, int(round(0.95 * (len(xs) - 1))))],
-                                 min_ms=xs[0], reps=len(xs), host_median_ms=statistics.median(host_rec[f]),
-                                 per_call_median_ms=[statistics.median(c) for c in zip(*call_rec[f])], group=group, all_ms=ms_rec[f])
-                scrub.add_(1)
-                torch.cuda.synchronize()
-                with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                                        torch.profiler.ProfilerActivity.CUDA]) as prof:
-                    run_form(S, plans, f)
-                    torch.cuda.synchronize()
-                tp = os.path.join(a.out, "trace_%s.json" % f)
-                prof.export_chrome_trace(tp)
-                kineto[f] = JP.trace_busy(json.load(open(tp)))
-                log("form %s: median %.2f ms (p95 %.2f), host %.2f ms, kernels %d busy %.2f idle %.2f ms, max |dlogit| %.3f"
-                    % (f, timing[f]["median_ms"], timing[f]["p95_ms"], timing[f]["host_median_ms"], kineto[f]["n"],
-                       kineto[f]["busy_ms"], kineto[f]["idle_ms"], logit_g[f]["max_abs"]))
-            del plans
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+            before = ops.allocated()
+            run_group(S, a, group, forms, scrub, acc_tot, R, ops)       # every plan tensor is local to this call
+            ops.release()
+            after = ops.allocated()
+            R["release"].append(dict(group=group, allocated_before_gb=before / 1e9, allocated_after_gb=after / 1e9))
+            log("group %s released: allocated %.2f GB before the group, %.2f GB after" % (group, before / 1e9, after / 1e9))
+    timing, kineto, analytic_b, logit_g, sel_g = R["timing"], R["kineto"], R["analytic"], R["logits"], R["selection"]
+    issues2, mask_ctl, ref_out, order_log, cross = R["issues2"], R["mask_ctl"], R["ref_out"], R["order_log"], {}
     forms = [f for f in JP.FORMS if f in a.forms]
     if len(forms) > 1:
         base = forms[0]
@@ -703,6 +745,9 @@ def mode_cell(a):
     gates.append(gate("G5_accounting", not bad_acc, True, "; ".join(bad_acc[:6]) or "sum >= union_sep >= union_request; private masked 0"))
     gates.append(gate("R1_selection", True, False, json.dumps(sel_g)))
     gates.append(gate("R2_cross_form", True, False, json.dumps(cross)))
+    leak = [r for r in R["release"] if r["allocated_after_gb"] - r["allocated_before_gb"] > RELEASE_SLACK_GB]
+    gates.append(gate("R4_group_release", not leak, False,
+                      "allocated after each group minus before (slack %.1f GB): %s" % (RELEASE_SLACK_GB, json.dumps(R["release"]))))
     if "sep_private" in ref_out:                     # P-JH-1: M = B, the engine's own window, order and allocation
         d0 = ref_out["sep_private"][0]
         sh = S["shipped"][S["W"] + S["K"]].cpu()
@@ -732,6 +777,31 @@ def rows_of(form, S):
     return out
 
 
+def ncu_group(S, a, group, forms, scrub, cudart, wins):
+    """The profiled windows of ONE group (window k = the k-th form overall: k = len(wins) + 1). The plans are local to
+    this call (run_group's rule)."""
+    import torch
+    plans, _ = build_group(S, group, forms)
+    for f in forms:
+        for _ in range(max(1, a.warm)):
+            run_form(S, plans, f)
+    torch.cuda.synchronize()
+    for f in forms:
+        k = len(wins) + 1
+        run_form(S, plans, f)                                           # the identical warm-up of every window
+        torch.cuda.synchronize()
+        scrub.add_(1)                                                   # identical L2 state: the scrub buffer
+        torch.cuda.synchronize()
+        cudart.cudaProfilerStart()
+        for _ in range(k):
+            torch.cuda._sleep(1000)
+        run_form(S, plans, f)
+        torch.cuda.synchronize()
+        cudart.cudaProfilerStop()
+        wins.append(dict(form=f, group=group, markers=k, order=k, cache_control=a.cc))
+        log("profiled window %d: %s" % (k, f))
+
+
 def mode_ncu_cell(a):
     import torch
     os.makedirs(a.out, exist_ok=False)
@@ -739,34 +809,15 @@ def mode_ncu_cell(a):
     cudart = torch.cuda.cudart()
     scrub = torch.empty(SCRUB_BYTES, dtype=torch.uint8, device="cuda")
     wins = []
-    k = 0
+    ops = CudaOps()
     with torch.inference_mode():
         for group, gforms in JP.GROUPS:
             forms = [f for f in gforms if f in a.forms]
             if not forms:
                 continue
-            plans, _ = build_group(S, group, forms)
-            for f in forms:
-                for _ in range(max(1, a.warm)):
-                    run_form(S, plans, f)
-            torch.cuda.synchronize()
-            for f in forms:
-                k += 1
-                run_form(S, plans, f)                                   # the identical warm-up of every window
-                torch.cuda.synchronize()
-                scrub.add_(1)                                           # identical L2 state: the scrub buffer
-                torch.cuda.synchronize()
-                cudart.cudaProfilerStart()
-                for _ in range(k):
-                    torch.cuda._sleep(1000)
-                run_form(S, plans, f)
-                torch.cuda.synchronize()
-                cudart.cudaProfilerStop()
-                wins.append(dict(form=f, group=group, markers=k, order=k, cache_control=a.cc))
-                log("profiled window %d: %s" % (k, f))
-            del plans
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+            ncu_group(S, a, group, forms, scrub, cudart, wins)          # every plan tensor is local to this call
+            ops.release()
+            log("group %s released: allocated %.2f GB" % (group, ops.allocated() / 1e9))
     write_json(os.path.join(a.out, "windows.json"), dict(windows=wins, meta=S["meta"], cache_control=a.cc,
                                                          protocol="per window: a warm run of the form, a write of 2 x L2 "
                                                                   "(scrub) outside the window, then the window"))

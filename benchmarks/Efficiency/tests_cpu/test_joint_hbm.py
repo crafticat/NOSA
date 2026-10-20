@@ -442,6 +442,125 @@ def test_J10_summarize_end_to_end(tmp_path):
     assert JH.main(["--mode", "summarize", "--out", str(out), "--variants", "none", "--forms", ",".join(forms)]) == 1
 
 
+class _FakeEvent:
+    def record(self):
+        pass
+
+    def elapsed_time(self, other):
+        return 1.0
+
+
+class _FakeProfile:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def export_chrome_trace(self, path):
+        Path(path).write_text(json.dumps(dict(traceEvents=[])))
+
+
+class _FakeOps:
+    def sync(self):
+        pass
+
+    def event(self):
+        return _FakeEvent()
+
+    def profile(self):
+        return _FakeProfile()
+
+    def release(self):
+        import gc
+        gc.collect()
+
+    def allocated(self):
+        return 0
+
+
+def _fake_engine(monkeypatch, refs, kept):
+    """Stand-ins for the GPU functions run_group calls; every plan tensor is registered by a weakref."""
+    import weakref
+
+    def build(S, group, forms):
+        plans = {}
+        for f in forms:
+            calls = []
+            for name, kinds, layout in JP.FORM_CALLS[f]:
+                t = torch.zeros(4, 3)
+                refs.append(weakref.ref(t))
+                calls.append(dict(name=name, layout=layout, metrics=dict(masked_tokens=0), layers=[dict(kwin=t)], R=2))
+            plans[f] = calls
+        if S.get("keep"):
+            kept.append(plans)                           # what the old inline loop's variable did
+        return plans, []
+
+    def run_form(S, plans, f, events=None):
+        outs = []
+        for i, cp in enumerate(plans[f]):
+            outs.append(torch.zeros(2, 5))
+            if events is not None:
+                events[i].record()
+        return outs
+
+    monkeypatch.setattr(JH, "build_group", build)
+    monkeypatch.setattr(JH, "run_form", run_form)
+    monkeypatch.setattr(JH, "run_call", lambda S, cp, unmasked=False: torch.ones(2, 5))
+    monkeypatch.setattr(JH, "logits_gate", lambda S, plans, f, outs: dict(max_abs=0.0, argmax_agree=1.0))
+    monkeypatch.setattr(JH, "selection_agreement", lambda S, plans, f: {})
+    monkeypatch.setattr(JH, "analytic", lambda S, plans, f, acc: {})
+
+
+def _R():
+    return dict(timing={}, kineto={}, analytic={}, logits={}, selection={}, issues2=[], bad_acc=[], mask_ctl=None,
+                ref_out={}, order_log=[], release=[])
+
+
+def test_J13_run_group_releases_its_plans(tmp_path, monkeypatch):
+    """J13: run_group (the per-group body of mode_cell) keeps NO reference to its group's plans: after it returns, the
+    weakref of every plan tensor is dead, so ops.release() frees the windows before the next group (job b64 ran out of
+    memory in the shared group: a loop variable of the former inline loop kept a private plan, 52.8 GB, alive). It
+    still fills the results (timing, kernel trace, the mask control, CPU logits). Negative control: a reference kept
+    outside (the old loop variable) keeps the tensors alive and the check sees it."""
+    import gc
+    import types
+    a = types.SimpleNamespace(warm=1, reps=2, out=str(tmp_path))
+    refs, kept = [], []
+    _fake_engine(monkeypatch, refs, kept)
+    R = _R()
+    JH.run_group({}, a, "shared", ["sep_shared", "joint_shared"], torch.zeros(4, dtype=torch.uint8), {}, R, _FakeOps())
+    gc.collect()
+    assert len(refs) == 3 and all(r() is None for r in refs)
+    assert set(R["timing"]) == {"sep_shared", "joint_shared"} and R["timing"]["sep_shared"]["per_call_median_ms"] == [1.0, 1.0]
+    assert R["kineto"]["joint_shared"]["n"] == 0 and R["mask_ctl"]["differs"] is True
+    assert R["ref_out"]["joint_shared"][0].device.type == "cpu" and len(R["order_log"]) == 4
+    refs.clear()
+    JH.run_group({"keep": True}, a, "private", ["sep_private", "joint_private"], torch.zeros(4, dtype=torch.uint8), {},
+                 _R(), _FakeOps())
+    gc.collect()
+    assert refs and all(r() is not None for r in refs)
+    kept.clear()
+    gc.collect()
+    assert all(r() is None for r in refs)
+
+
+def test_J14_mode_cell_builds_groups_only_through_run_group():
+    """J14 (AST of joint_hbm.py): mode_cell and mode_ncu_cell call build_group only through run_group / ncu_group,
+    and release after each group (ops.release() right after the call inside the loop over JP.GROUPS)."""
+    tree = ast.parse((EFF / "joint_hbm.py").read_text())
+    fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    for mode, helper in (("mode_cell", "run_group"), ("mode_ncu_cell", "ncu_group")):
+        src = ast.unparse(fns[mode])
+        assert "build_group(" not in src, mode
+        loop = next(n for n in ast.walk(fns[mode]) if isinstance(n, ast.For) and "JP.GROUPS" in ast.unparse(n.iter))
+        calls = [ast.unparse(s) for s in loop.body if isinstance(s, ast.Expr)]
+        i = next(k for k, c in enumerate(calls) if c.startswith(helper + "("))
+        assert calls[i + 1] == "ops.release()", (mode, calls)
+    for helper in ("run_group", "ncu_group"):
+        assert "build_group(" in ast.unparse(fns[helper])
+
+
 def test_J11_arguments_and_child_argv(tmp_path):
     """J11: unknown forms and variants are refused; the child command carries every knob of the parent; orchestrate
     refuses an existing --out (exit 2) and missing model / workload (exit 2)."""
