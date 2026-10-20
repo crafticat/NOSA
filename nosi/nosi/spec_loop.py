@@ -69,7 +69,10 @@ EXACT VERIFY (R2 verify branch, the section at the end of this file): every
 verified position is the shipped decode step, so its logits are bitwise the
 shipped decode's (conditions E1-E7 there); no host sync per layer; one
 decision sync per round (round mode) or one per computed position but the
-last (early mode).
+last (early mode). IT IS THE CORRECTNESS REFERENCE, NOT THE THROUGHPUT PATH:
+a round costs about U shipped steps (U x 167 ms at B 64, 16K), so it serves
+to check the commit / rollback / store-hook bookkeeping bit for bit; a faster
+verifier must be judged against it.
 """
 from __future__ import annotations
 
@@ -279,7 +282,12 @@ def _assign(want: torch.Tensor, ids: torch.Tensor, cand: torch.Tensor, key: torc
     dst_c = torch.where(fits, dst, dump)
     ext = torch.full((H, B, W + 1), -1, dtype=torch.int64, device=ids.device)
     ext.scatter_(-1, dst_c, torch.where(fits, ids, torch.full_like(ids, -1)))
-    return ext[..., :W], fits, n_cand
+    # CONTIGUOUS (R2 verify fix, CPU run 2190738): the issue map goes straight to the two Triton gathers, which read
+    # load_ids at the flat offset h*B*M + b*M + m (flash_h2d_mask.py:31, flash_h2d_mask_bias.py:34) and never call
+    # .contiguous(). ext[..., :W] alone is a view with row stride W + 1: every (h, b) row but the first was read
+    # shifted, so the draft's prefetch wrote blocks into slots its bookkeeping did not name (window and mirror slots
+    # included). plan_round's fetch was safe only because it is rebuilt by torch.where.
+    return ext[..., :W].contiguous(), fits, n_cand
 
 
 def _first_occurrence(ids: torch.Tensor) -> torch.Tensor:
@@ -987,6 +995,11 @@ def timely_recall(counters: dict) -> Optional[float]:
 # HOST SYNCS. The exact round has none per layer or per position: the hook, the marks, the rollback and the store
 # sync are device ops and host ints. Round mode: ONE decision sync per round (accept_commit's min). Early mode
 # (stop_after): one per computed position except the last, at most U - 1, and no rollback.
+#
+# ROLE. This path is the CORRECTNESS REFERENCE for the commit, the rollback and the store hook, not the throughput
+# path: bit-exactness forces one shipped step per position (M = B GEMMs, one attention call over that position's own
+# window slot order), so a round costs about U x the shipped step (U x 167 ms at B 64, L 16128) minus the fetch the
+# store serves. A batched verifier is judged against these logits and this state, bit for bit.
 # ===========================================================================
 EXACT_MODES = ("round", "early")
 

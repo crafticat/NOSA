@@ -738,6 +738,36 @@ def test_pinned_window_is_never_a_prefetch_target_and_the_unpinned_one_is():
         assert hit_window is (not pinned), "pinned=%s" % pinned
 
 
+def _kernel_read(t):
+    """What the gathers load (flash_h2d_mask.py:31, flash_h2d_mask_bias.py:34): numel entries of the storage at the
+    tensor's data pointer, read flat as a contiguous (H, B, M) array."""
+    return torch.as_strided(t, (t.numel(),), (1,), t.storage_offset())
+
+
+def test_draft_issue_map_is_contiguous_as_the_gather_kernels_read_it():
+    """CPU run 2190738 found it: _assign returned ext[..., :W] (row stride W + 1) and spec_draft_update handed it to
+    the gathers, which read it flat. Now the issue map (and plan_round's fetch) is contiguous, so the kernel's flat
+    read equals the map; negative control: the old view's flat read is a different map."""
+    lay = sl.store_layout(TOPK, R)
+    st = sl.pin_window(sl.Store(1, H, B, lay))
+    st.sync_window(0, torch.arange(TOPK).view(1, 1, TOPK).expand(H, B, TOPK).contiguous(), 1)
+    sel = torch.cat([torch.full((H, B, 1), 50),
+                     torch.arange(H * B * (TOPK - 1)).view(H, B, TOPK - 1) % 40 + 100], -1).contiguous()
+    plan = sl.plan_draft(st, 0, sel, 50, False, 1, 2, 10 ** 6)
+    assert plan.issue.is_contiguous()
+    assert bool(((plan.issue >= 0).sum(-1) > 0).all()), "precondition: every (h, b) row issues a prefetch"
+    assert torch.equal(_kernel_read(plan.issue), plan.issue.reshape(-1))
+    ext = torch.full((H, B, lay.W + 1), -1, dtype=torch.int64)
+    ext[..., :lay.W] = plan.issue
+    old = ext[..., :lay.W]
+    assert not old.is_contiguous() and not torch.equal(_kernel_read(old), old.reshape(-1))
+    st2 = sl.Store(1, H, B, lay)
+    st2.sync_window(0, torch.arange(H * B * TOPK).view(H, B, TOPK) % 20, 1)
+    sel2 = (torch.arange(2 * H * B * TOPK).view(2, H, B, TOPK) % 20).to(torch.int64)
+    rp = sl.plan_round(st2, 0, sel2, 20, 2, 1, 2, 2, torch.zeros(H, B, lay.W, dtype=torch.bool))
+    assert rp.fetch.is_contiguous()
+
+
 # ===========================================================================
 # (3) one shipped step served from the store is byte-identical to the plain step
 # ===========================================================================
