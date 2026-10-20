@@ -410,6 +410,18 @@ with real selections; FG3 the packer's sustained rate (4.9) against the tick's d
   fell into one interval (not traced). The control (_scn_late_reader) releases a slot whose last reader (a
   verify read) is still pending, syncs while it is RELEASING, then completes the reader so that the next poll frees it.
 
+## 12e. Watched device flags in S-C's one read per tick (Q-T5, 2026-10-21)
+
+- `ResidencySC.watch_flag(name, flag)`: a 0-dim device tensor (the twin's sticky `overflow`,
+  `r2_positional_twin.py:152`) is read with S-C's ONE device read at every end_tick (also on a tick without rows). A
+  nonzero value refuses THAT tick (CapacityRefusal) before any of its decisions is applied; `svc.flag_values` holds
+  the values of the last read. A twin overflow so voids one tick, not every tick since the last decision read, at no
+  extra sync.
+- Test F16: a real twin (prompts of 38 tokens, N_max 41) overflows in its step of tick 3, a draft-only tick; S-C
+  watching it refuses tick 3 at its own end_tick (one device read, the ownership state and the applied counters
+  unchanged), ticks 0-2 ran normally. Negative control (no watch): no end_tick refuses, tick 3 and later apply their
+  decisions, and the flag is seen only after them.
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,

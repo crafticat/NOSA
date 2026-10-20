@@ -436,6 +436,20 @@ class ResidencySC(ResidencySB):
         self.dev = devops
         self._tick: List[Dict] = []
         self._hist_unwaited: List = []                    # host write-backs the main stream did not wait on yet
+        self._flags: Dict[str, torch.Tensor] = {}         # watched device flags (watch_flag)
+        self.flag_values: Dict[str, int] = {}             # their values at the last end_tick read
+
+    def watch_flag(self, name: str, flag: torch.Tensor) -> None:
+        """Watch a device flag (a 0-dim bool or integer tensor on the service's device; e.g. the twin's sticky
+        `overflow`, r2_positional_twin.py:152) with S-C's ONE device read per tick: every end_tick reads it together
+        with the decisions, also on a tick without rows, and a nonzero value REFUSES THAT TICK (CapacityRefusal) before
+        any of its decisions is applied. So a raised flag voids one tick, not every tick since the last decision read
+        (Q-T5), and it costs no extra sync. The tensor is read by reference: an in-place update (|=) is seen."""
+        if not torch.is_tensor(flag) or flag.dim() != 0 or flag.device.type != self.device.type:
+            raise ValueError("watch_flag: a 0-dim tensor on %s expected" % self.device)
+        if name in self._flags:
+            raise ValueError("watch_flag: %r is already watched" % name)
+        self._flags[name] = flag
 
     # ------------------------------------------------------------------------------------------------ the mirror delta
     def _journal(self, key: Tuple[int, int, int], item) -> None:
@@ -577,15 +591,22 @@ class ResidencySC(ResidencySB):
     def end_tick(self) -> None:
         steps, self._tick = self._tick, []
         self._rows = None
-        parts = []
+        names = list(self._flags)
+        parts = [self._flags[n].to(torch.int64).reshape(1) for n in names]   # the watched flags first
         for st in steps:
             for dec, fields in ((st["vdec"], FIELDS_V), (st["ddec"], FIELDS)):
                 if dec is not None:
                     parts.append(torch.stack([dec.t[f] for f in fields]).reshape(-1))
                     parts.append(dec.counters)
         if parts:
-            flat = self._d2h(torch.cat(parts)).tolist()               # ONE read per tick
-            at = 0
+            flat = self._d2h(torch.cat(parts)).tolist()               # ONE read per tick (flags and decisions)
+            self.flag_values = dict(zip(names, flat[:len(names)]))
+            raised = sorted(n for n, v in self.flag_values.items() if v)
+            if raised:
+                self._layer_ev = {}
+                raise CapacityRefusal("S-C: the watched device flag(s) %s are set at this tick: the tick is void (none "
+                                      "of its decisions is applied)" % raised)
+            at = len(names)
             parsed = []
             for st in steps:
                 v = d = None

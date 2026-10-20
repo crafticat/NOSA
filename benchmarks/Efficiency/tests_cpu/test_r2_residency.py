@@ -1282,3 +1282,66 @@ def test_F15_the_trash_slot():
     assert ws.svc.memory()["slots_physical"] != L * B * H * (ws.store_k[0].shape[1] // BS)
     ws.store_v[1][1, ws.svc.trash_slot * BS + 3, 0, 0] = 0.0
     assert not _trash_intact(ws)
+
+
+# =====================================================================================================================
+# F16 a watched device flag rides in S-C's one read per tick (Q-T5)
+# =====================================================================================================================
+TWIN = _load("r2_positional_twin")
+T0 = 3                                                        # the twin's table is full at this (draft-only) tick
+
+
+def _f16(watch):
+    """S-C over F6's first 6 ticks; a REAL positional twin (B banks, prompts of 38 tokens, N_max 41) takes one
+    step_unchecked per tick for every bank, so its sticky overflow flag turns True in the step of tick T0 = 3 (a
+    draft-only tick: no decision read there). With watch, the service watches twin.overflow. Returns (the tick whose
+    end_tick refused, or None; per tick (state before end_tick, state after, device reads before, after, draft pairs
+    applied before, after); the twin)."""
+    w = world(C=8, X=48, R_ver=8, seed=1, mode="delay", max_delay=4, cls=SC.ResidencySC, svc_kw=dict(nblk=NB))
+    svc = w.svc
+    g = torch.Generator().manual_seed(5)
+    twin = TWIN.PositionalTwin(B, H, D, 4, 41)
+    for b in range(B):
+        twin.prefill(b, torch.randn(38, H, D, generator=g), torch.randn(38, H, generator=g))
+    if watch:
+        svc.watch_flag("twin_overflow", twin.overflow)
+    uids = ("u0", "u1")
+    for b, u in enumerate(uids):
+        svc.begin_request(b, u)
+    tail, hb, log = svc.tail0, 15, []
+    for (t, m, ends, layers) in _sched(101, 6, True):
+        svc.poll()
+        for l, spec in enumerate(layers):
+            rows = [Row(b, kind, key, 1000 + t, hb, [(hb, tail)]) for (b, kind, key, _) in spec]
+            p = svc.resolve(l, rows, S(*[s for (_, _, _, s) in spec]))
+            svc.read_done(l, p, Ev(done=True))
+        twin.step_unchecked(torch.randn(B, H, D, generator=g), torch.randn(B, H, generator=g),
+                            torch.ones(B, dtype=torch.bool))
+        before, r0, n0 = _state(w), svc.d2h_reads, svc.metrics.draft_pairs
+        try:
+            svc.end_tick()
+        except ER.CapacityRefusal:
+            log.append((before, _state(w), r0, svc.d2h_reads, n0, svc.metrics.draft_pairs))
+            return t, log, twin
+        log.append((before, _state(w), r0, svc.d2h_reads, n0, svc.metrics.draft_pairs))
+        if ends:
+            for u in uids:
+                svc.decided((u, 1, m))
+    return None, log, twin
+
+
+def test_F16_a_twin_overflow_is_refused_at_the_tick_it_happens():
+    """F16 (Q-T5): the twin's sticky overflow flag, watched by S-C, is read with S-C's ONE device read per tick: the
+    tick T0 whose twin step overflowed (a draft-only tick) is refused by its own end_tick (CapacityRefusal), with one
+    device read (no extra sync) and none of its decisions applied (the ownership state is the one before end_tick);
+    every tick before T0 ran normally. Negative control (no watch): the flag rises at T0 but no end_tick refuses, the
+    ticks T0 .. 5 apply their decisions, and the flag is seen only later (at the next decision read)."""
+    t, log, twin = _f16(True)
+    assert t == T0 and len(log) == T0 + 1
+    before, after, r0, r1, n0, n1 = log[-1]
+    assert r1 == r0 + 1 and before == after and n1 == n0 and bool(twin.overflow)
+    assert all(e[3] == e[2] + 1 and e[5] > e[4] for e in log[:-1])   # one read each; the earlier ticks were applied
+    t2, log2, twin2 = _f16(False)
+    assert t2 is None and len(log2) == 6
+    assert log2[T0][5] > log2[T0][4]                          # tick T0's decisions were applied: the void spreads
+    assert bool(twin2.overflow)                               # seen only now, after the tick
