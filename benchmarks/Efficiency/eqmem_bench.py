@@ -22,6 +22,10 @@ steps, the pilot's aggregates for spec, module origins, error), tokens.pt (the c
 EXIT: 0 the cell ran and is VALID (inside the budget); 1 an error or OVER_BUDGET; 2 --out exists; 3 another GPU; 4 a
 refused configuration (no batch fits, a knob in the environment differs from the cell's); 6 a module from outside
 NOSI_REPO.
+4.2 ADDITIONS (ctxsweep_bench.py calls run_arm with an S-aware plan; the 4.1 behaviour is unchanged): the workload
+context is the plan's S; every device sample carries the host memory (VmRSS / VmHWM, the memory cgroup); result.json
+adds memory.phase_peaks (prefill / decode: the peak statistics are reset after the prefill), host (host_record) and
+latency (ctxsweep_core.latency_metrics, CUDA-event clock); fit_row.json adds S, max_gen, host_peak_gib and the phase peaks.
 REPORT: every result.json under --results (one comparison: the same budget, margin, N, S) -> report.json / report.md:
 the cells (repetitions summarized), the best VALID cell per family, the speedups, the prefix agreement of every cell's
 tokens with the original cell's (an observation), and the DERIVED time to serve Q requests in static batches.
@@ -44,6 +48,7 @@ sys.path.insert(0, str(HERE))
 sys.dont_write_bytecode = True
 
 import eqmem_core as EC  # noqa: E402
+import ctxsweep_core as CS  # noqa: E402  (paper 4.2: the host-memory parsers and the latency metrics)
 
 
 class Refused(Exception):
@@ -100,12 +105,13 @@ def plan_for(a, cell: EC.Cell, fit: EC.MemFit) -> Dict[str, Any]:
         raise Refused(str(e))
 
 
-def load_workload(tokens: Path, manifest: Path, rows: List[int]):
-    """The int32-le rows of the (n, 16128) token file; each used row's sha256 must equal the manifest's."""
+def load_workload(tokens: Path, manifest: Path, rows: List[int], want_ctx: int = EC.CTX):
+    """The int32-le rows of the (n, want_ctx) token file (16128 for 4.1; the 4.2 context sweep passes its S); each
+    used row's sha256 must equal the manifest's."""
     import torch
     man = json.loads(manifest.read_text())
     n, ctx = man["shape"]
-    if ctx != EC.CTX or man.get("dtype") != "int32-le":
+    if ctx != int(want_ctx) or man.get("dtype") != "int32-le":
         raise Refused("manifest shape %s dtype %s" % (man["shape"], man.get("dtype")))
     raw = tokens.read_bytes()
     if len(raw) != n * ctx * 4:
@@ -164,10 +170,54 @@ class EngineProbe:
         return int(self.loads), sum(a.elapsed_time(b) for a, b in self.windows), len(self.windows)
 
 
+def host_now() -> Dict[str, Any]:
+    """The process's host memory now, GiB: /proc/self/status (rss, hwm = the peak resident set, lck, pin) and the
+    memory cgroup's usage and peak (ctxsweep_core.cgroup_memory_files); a value that cannot be read is absent / None."""
+    out: Dict[str, Any] = {}
+    try:
+        out.update(CS.parse_proc_status(Path("/proc/self/status").read_text()))
+    except Exception:                                                         # noqa: BLE001 (best effort)
+        pass
+    try:
+        files = CS.cgroup_memory_files(Path("/proc/self/cgroup").read_text())
+    except Exception:                                                         # noqa: BLE001
+        files = None
+    if files:
+        out["cgroup_version"] = files["version"]
+        for k in ("usage", "peak"):
+            try:
+                out["cgroup_%s_gib" % k] = int(Path(files[k]).read_text().split()[0]) / CS.GIB
+            except Exception:                                                 # noqa: BLE001
+                out["cgroup_%s_gib" % k] = None
+    return out
+
+
+def host_record(torch, samples: List[Dict[str, Any]], pinned_nbytes: List[int]) -> Dict[str, Any]:
+    """The cell's host memory: peak_gib = the largest VmHWM seen (the process's peak resident set; the pinned KV is
+    resident: ctxsweep_core HOST_EVIDENCE), the memory cgroup's peak, the pinned tensors (nominal and power-of-two
+    sizes) and torch's host-allocator statistics when this torch has them."""
+    now = host_now()
+    hs = [s.get("host") or {} for s in samples] + [now]
+
+    def mx(k):
+        v = [h[k] for h in hs if h.get(k) is not None]
+        return max(v) if v else None
+    stats = None
+    f = getattr(torch.cuda, "host_memory_stats", None)
+    if f is not None:
+        try:
+            stats = {k: v for k, v in dict(f()).items() if isinstance(v, (int, float))}
+        except Exception as e:                                                # noqa: BLE001 (recorded)
+            stats = dict(error=str(e)[:300])
+    return dict(peak_gib=mx("hwm_gib"), rss_end_gib=now.get("rss_gib"), cgroup_peak_gib=mx("cgroup_peak_gib"),
+                cgroup_usage_max_gib=mx("cgroup_usage_gib"), pinned=CS.pinned_summary(pinned_nbytes),
+                torch_host_memory_stats=stats, now=now)
+
+
 def mem_sample(torch, label: str) -> Dict[str, Any]:
     free, total = torch.cuda.mem_get_info()
     return dict(label=label, used_gb=(total - free) / 1e9, reserved_gb=torch.cuda.memory_reserved() / 1e9,
-                alloc_gb=torch.cuda.memory_allocated() / 1e9, total_gb=total / 1e9)
+                alloc_gb=torch.cuda.memory_allocated() / 1e9, total_gb=total / 1e9, host=host_now())
 
 
 def live_rewarm(model, cache, lookahead: int):
@@ -181,9 +231,10 @@ def live_rewarm(model, cache, lookahead: int):
                           lookahead)
 
 
-def decode_shipped(torch, model, cache, t0, pos0, N: int, samples: List) -> Dict[str, Any]:
+def decode_shipped(torch, model, cache, t0, pos0, N: int, samples: List, e_prev=None) -> Dict[str, Any]:
     """original / cached: N - 1 greedy decode steps of NOSA's decode_inference; per-step CUDA events; re-warm by
-    live_rewarm (lookahead 1); device samples every 16 steps (between steps)."""
+    live_rewarm (lookahead 1); device samples every 16 steps (between steps). e_prev (the prefill-end event): itl_ms =
+    the intervals between consecutive step-end events, the first from e_prev (host gaps included)."""
     B = t0.shape[0]
     cu = torch.arange(0, B + 1, dtype=torch.int, device="cuda")
     tok, pos = t0, pos0.clone()
@@ -208,8 +259,12 @@ def decode_shipped(torch, model, cache, t0, pos0, N: int, samples: List) -> Dict
                 samples.append(mem_sample(torch, "decode %d" % it))
     torch.cuda.synchronize()
     ms = [a.elapsed_time(b) for a, b in evs]
+    itl = None
+    if e_prev is not None:
+        ends = [e_prev] + [b for _, b in evs]
+        itl = [ends[i].elapsed_time(ends[i + 1]) for i in range(len(ends) - 1)]
     return dict(seq=torch.cat(seq, dim=1).cpu(), unit_tokens=[1.0] * len(ms), unit_ms=ms, rewarms=rewarms,
-                gen_tokens=N, rounds=None)
+                gen_tokens=N, rounds=None, itl_ms=itl)
 
 
 def decode_spec(torch, model, cache, t0, pos0, N: int, cell: EC.Cell, out: Path) -> Dict[str, Any]:
@@ -238,17 +293,22 @@ def decode_spec(torch, model, cache, t0, pos0, N: int, cell: EC.Cell, out: Path)
                 spec_wire_blocks=int(res["counters"]["prefetch_blocks"]) + int(res["counters"]["late_fetch_blocks"]))
 
 
-def run_arm(a) -> int:
+def run_arm(a, plan: Optional[Dict[str, Any]] = None) -> int:
+    """One cell. plan: None = the 4.1 plan (plan_for at 16128); the 4.2 context sweep passes ctxsweep_core's S-aware
+    plan (ctxsweep_bench.py). Beyond the 4.1 record: the prefill and decode phase peaks (the peak statistics are reset
+    after the prefill; memory_record gets the larger of the two), the host memory (host_record), the latency on the
+    CUDA-event clock (ctxsweep_core.latency_metrics), and fit_row.json carries S, max_gen and the host peak."""
     cell = EC.parse_cell(a.cell)
-    fit = load_fit(a)
-    plan = plan_for(a, cell, fit)
+    if plan is None:
+        fit = load_fit(a)
+        plan = plan_for(a, cell, fit)
     knobs = check_env(cell)
     out = Path(a.out)
     if out.exists():
         print("eqmem: --out %s exists" % out, file=sys.stderr)
         return 2
     sched = EC.doc_rows(plan["B"], json.loads(Path(a.manifest).read_text())["shape"][0], a.doc_offset)
-    ids, wl = load_workload(Path(a.tokens), Path(a.manifest), sched["rows"])
+    ids, wl = load_workload(Path(a.tokens), Path(a.manifest), sched["rows"], int(plan["S"]))
     out.mkdir(parents=True)
     rec: Dict[str, Any] = dict(cell=cell.name, family=cell.family, rep=a.rep, plan=plan, plan_key=list(EC.plan_key(plan)),
                                knobs=knobs, docs=dict(sched, workload=wl), argv=sys.argv, status="running",
@@ -267,7 +327,10 @@ def run_arm(a) -> int:
             return 3
         import nosi.nosa_llama as nl
         import nosi.cache_engine as ce
-        mods = dict(nosa_llama=nl, cache_engine=ce, eqmem_core=EC, eqmem_bench=sys.modules[__name__])
+        mods = dict(nosa_llama=nl, cache_engine=ce, eqmem_core=EC, eqmem_bench=sys.modules[__name__], ctxsweep_core=CS)
+        drv = sys.modules.get("__main__")
+        if getattr(drv, "__file__", None) and Path(drv.__file__).name in ("eqmem_bench.py", "ctxsweep_bench.py"):
+            mods["driver"] = drv
         rec["modules"] = {k: dict(file=str(Path(m.__file__).resolve()),
                                   sha256=hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest()) for k, m in mods.items()}
         repo = os.environ.get("NOSI_REPO")
@@ -316,33 +379,48 @@ def run_arm(a) -> int:
         prefill_done = [e_start.elapsed_time(e) for e in pre_ev]
         first_token = e_start.elapsed_time(e_pre)
         samples.append(mem_sample(torch, "prefill"))
+        peak_pre = dict(alloc_gb=torch.cuda.max_memory_allocated() / 1e9, reserved_gb=torch.cuda.max_memory_reserved() / 1e9)
+        torch.cuda.reset_peak_memory_stats()
         t0tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
         pos0 = position_ids[:, -1:] + 1
         if cell.family == "spec":
             dec = decode_spec(torch, model, cache, t0tok, pos0, a.n_new, cell, out)
         else:
-            dec = decode_shipped(torch, model, cache, t0tok, pos0, a.n_new, samples)
+            dec = decode_shipped(torch, model, cache, t0tok, pos0, a.n_new, samples, e_prev=e_pre)
+        e_end = torch.cuda.Event(enable_timing=True)
+        e_end.record()
         torch.cuda.synchronize()
         t_end = time.time()
         samples.append(mem_sample(torch, "end"))
+        peak_dec = dict(alloc_gb=torch.cuda.max_memory_allocated() / 1e9, reserved_gb=torch.cuda.max_memory_reserved() / 1e9)
         loads, wait_ms, n_windows = probe.harvest()
         if cell.family == "spec":
             loads += dec["spec_wire_blocks"]
             wait_ms += dec["spec_gather_ms"]
         rec["metrics"] = EC.arm_metrics(plan["B"], dec["gen_tokens"], t_start, t_pre, t_end, prefill_done, first_token,
                                         dec["unit_tokens"], dec["unit_ms"], loads, wait_ms, n_boot=a.boot, seed=a.seed)
-        rec["memory"] = EC.memory_record(torch.cuda.max_memory_allocated() / 1e9, torch.cuda.max_memory_reserved() / 1e9,
-                                         samples, plan["budget_gb"])
+        rec["memory"] = EC.memory_record(max(peak_pre["alloc_gb"], peak_dec["alloc_gb"]),
+                                         max(peak_pre["reserved_gb"], peak_dec["reserved_gb"]), samples, plan["budget_gb"])
+        rec["memory"]["phase_peaks"] = dict(prefill=peak_pre, decode=peak_dec,
+                                            binding="prefill" if peak_pre["alloc_gb"] >= peak_dec["alloc_gb"] else "decode")
+        rec["latency"] = CS.latency_metrics(plan["B"], dec["gen_tokens"], first_token, prefill_done, dec["unit_tokens"],
+                                            dec["unit_ms"], dec.get("itl_ms"), e_start.elapsed_time(e_end))
         rec["rewarms"] = dec["rewarms"]
         rec["decode_update_windows"] = n_windows
         rec["spec"] = dec["rounds"]
-        rec["host_pinned_gb"] = sum(t.numel() * t.element_size() for lay in cache.layers
-                                    for t in (lay.cache_engine._k_cpu, lay.cache_engine._v_cpu)) / 1e9
+        pinned = [t.numel() * t.element_size() for lay in cache.layers
+                  for t in (lay.cache_engine._k_cpu, lay.cache_engine._v_cpu)]
+        rec["host_pinned_gb"] = sum(pinned) / 1e9
+        rec["host"] = host_record(torch, samples, pinned)
         torch.save(dict(seq=dec["seq"], rows=sched["rows"]), out / "tokens.pt")
         (out / "fit_row.json").write_text(json.dumps(dict(family=cell.family, cell=cell.name, B=plan["B"], slots=cell.slots,
                                                           alloc_peak_gb=rec["memory"]["alloc_peak_gb"],
                                                           reserved_peak_gb=rec["memory"]["reserved_peak_gb"],
-                                                          nonpt_gb=rec["memory"]["nonpt_gb"])) + "\n")
+                                                          nonpt_gb=rec["memory"]["nonpt_gb"], S=int(plan["S"]),
+                                                          max_gen=int(plan["max_gen"]),
+                                                          host_peak_gib=rec["host"]["peak_gib"],
+                                                          prefill_alloc_peak_gb=peak_pre["alloc_gb"],
+                                                          decode_alloc_peak_gb=peak_dec["alloc_gb"])) + "\n")
         rec["status"] = "done"
     except ModuleOrigin as e:
         rec["error"], rec["status"] = _err(e), "module_origin"

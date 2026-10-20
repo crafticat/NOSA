@@ -1,0 +1,45 @@
+# CONTEXT SWEEP (paper 4.2) cell list for a chain: one line = one ctxsweep_step.sh invocation (one process, one fresh
+# prefill), in this order. Fields: <ctx> <cell> <batch|max> <srun --mem GiB>. Budget 75 GB, N 512, margin 1 GB in every
+# cell (the 4.1 plan key: the 4.1 run directory eqmem_h41_2188818_b75 gives the 16K max-batch cells: cached p33 B 219,
+# cached p50 B 191, spec k2 / k3 B 161, original B 304 at 440G). After the last cell: ctxsweep_step.sh ... report.
+#
+#   while read -r ctx cell batch mem; do
+#       bash benchmarks/Efficiency/ctxsweep_step.sh --nosi <sha> <holder> <run> 75 "$ctx" "$cell" "$batch" "$mem"
+#   done < <(grep -v '^#' benchmarks/Efficiency/ctxsweep_cells.txt | sed 's/#.*//' | grep .)
+#
+# Minutes: ctxsweep_core.est_minutes (prefill 0.160 / 0.191 / 0.204 ms per prompt token at 16K / 64K / 128K dominates
+# every long-context cell); 'ctxsweep_bench.py --mode plan --cells-file ctxsweep_cells.txt' prints the exact values.
+# The 'max' cells assume the probes measured the power-of-two host model (plan with --host-pow2-base-gib 18); with the
+# default '2x' model the 128K max cells stop at B 47 (host_memory). --mem: ctxsweep_core.mem_need_gib under the '2x'
+# model (+ 10 GiB margin for the small cells), 440 for the max cells.
+#
+# Total of tier 1: about 172 min (2.9 GPU-hours); tier 2: about 57 min more.
+# tier 1
+# --- probes: the first cell of each long context refits A(S), b(S) and the host model (VmHWM) for the cells after it
+65280  original   8    80     # ~3.6 min  PROBE 64K
+130816 original   4    80     # ~3.7 min  PROBE 128K
+# --- 16K, small batch (the max batch is 4.1's)
+16128  original   16   64     # ~2.6 min
+16128  cached:33  16   64     # ~2.6 min
+16128  spec:2     16   64     # ~4.1 min
+# --- 64K and 128K, mid batch: the three families (the second batch size calibrates b(S))
+65280  original   32   180    # ~8.8 min
+65280  cached:50  32   180    # ~8.8 min
+65280  spec:2     32   180    # ~10.7 min
+130816 original   16   180    # ~9.2 min
+130816 cached:50  16   180    # ~9.2 min
+130816 spec:2     16   180    # ~11.0 min
+# --- 64K and 128K, small batch: the other families at the probe's batch
+65280  cached:50  8    80     # ~3.6 min
+65280  spec:2     8    80     # ~5.1 min
+130816 cached:50  4    80     # ~3.7 min
+130816 spec:2     4    80     # ~5.1 min
+# --- a third cache capacity (is pool 50 the best baseline at long context?)
+65280  cached:97  32   180    # ~8.8 min
+130816 cached:97  16   180    # ~9.2 min
+# --- 128K at the largest batch the budget admits (int32 envelope 63 for cached; GPU memory ~57 for spec)
+130816 cached:50  max  440    # ~30.9 min (B 63)
+130816 spec:2     max  440    # ~31.1 min (B ~57)
+# tier 2 (optional, beyond 3 h): 64K at the largest batch (int32 127 for cached; GPU memory ~101 for spec)
+65280  cached:50  max  440    # ~29.5 min (B 127)
+65280  spec:2     max  440    # ~27.1 min (B ~101)
