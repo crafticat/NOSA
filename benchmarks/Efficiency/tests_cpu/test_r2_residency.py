@@ -1,4 +1,4 @@
-"""CPU tests F1-F17 of R2 step 7, piece 5 (docs/R2_STEP7_FETCH_RETENTION.md sections 7, 12 and 12b-12f):
+"""CPU tests F1-F19 of R2 step 7, piece 5 (docs/R2_STEP7_FETCH_RETENTION.md sections 7, 12 and 12b-12g):
 nosi/nosi/r2_residency.py (v1, the reference), r2_residency_sb.py (S-B) and r2_residency_sc.py (S-C), the residency
 service of the spec round, over K3X's ownership and transports VENDORED byte-identical in nosi/nosi/kstep/ (91e6e47). CPU tensors, K3X's AdversarialTransport (seeded delays, reordering, bursts; "force_only" for
 the scripted tests), CPU events with a done flag. Each test has a negative control (a K3X mutation switch or a defect
@@ -12,6 +12,8 @@ import collections
 import importlib.util
 import subprocess
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -1426,3 +1428,79 @@ def test_F17b_the_exact_wait_on_a_reused_slot_and_its_negative_controls():
     assert not _content_ok(w1, 0, rows1, sel1, p1)
     w2, _, _, _, exc2 = _f17(publish=False)
     assert exc2 is not None and "wait_err" in str(exc2) and bool(w2.svc.dev.err)
+
+
+# =====================================================================================================================
+# F18 S-C's journal counts, F19 the exact wait's liveness rule (ported from the FG branch 0781b1d, note 12g)
+# =====================================================================================================================
+def _f18(unhook=False):
+    """Two draft takes in (b 0, h 0) of layer 0; they land and arrive (LRU); the request ends (both released); the next
+    poll frees them. unhook: the stream's log is a plain list again (the journal hook removed)."""
+    w = world(C=4, X=4, R_ver=1, cls=SC.ResidencySC, svc_kw=dict(nblk=NB))
+    svc = w.svc
+    if unhook:
+        svc.pools[0].stream(0, 0).log = []
+    svc.begin_request(0, "u0")
+    svc.poll()
+    p = svc.resolve(0, [Row(0, "d", ("u0", 1, 1), 300, 10)], S([[2, 3], []]))
+    svc.read_done(0, p, Ev(done=True))
+    svc.end_tick()
+    land_all(w)
+    svc.end_request("u0")
+    svc.poll()
+    return svc
+
+
+def test_F18_journal_counts():
+    """F18: S-C counts every stream transition per kind as the journal reports it, a release by its reason: two draft
+    takes, their two arrivals into the LRU, two releases at the request's end, two frees, exactly. Negative control: a
+    stream whose log is a plain list again (the journal hook removed) is not counted."""
+    svc = _f18()
+    assert svc.journal_counts == {"take": 2, "admit": 2, "release:end": 2, "free": 2}, svc.journal_counts
+    assert _f18(unhook=True).journal_counts == {}
+
+
+def test_F19_the_exact_wait_host_waits_the_submission_first():
+    """F19 (the eager tick's liveness rule, note 12g): CudaDeviceOps._submitted(l) returns only after every transfer
+    in flight at layer l without a completion event had its pack SUBMITTED (its threading.Event set by the feeder),
+    counting the submission waits; a transfer with an event or of another layer is not waited; the exact branch of
+    CudaDeviceOps.wait calls it before it launches the spin. Negative control: a layer-0 pack that is never submitted
+    keeps _submitted(0) blocked (it really waits)."""
+    import inspect
+
+    def ops_with(trs):
+        ops = object.__new__(SC.CudaDeviceOps)                 # the host part only: no CUDA object is built
+        ops.svc = types.SimpleNamespace(inflight={tr.seq: tr for tr in trs})
+        ops.submission_waits = 0
+        return ops
+
+    def tr(seq, layer, submitted_by=None, ev=None):
+        t = TR.Transfer(seq, "u0", layer, 0, 0, seq, seq, 1, "draft", ("u0", 1, 1))
+        t.payload, t.ev = threading.Event(), ev
+        return t
+    pending = tr(1, 0)
+    done_ev = tr(2, 0, ev=Ev(True))
+    other = tr(3, 1)                                           # layer 1: never submitted, must not be waited
+    ops = ops_with([pending, done_ev, other])
+
+    def feeder():
+        time.sleep(0.2)
+        pending.ev = Ev(True)
+        pending.payload.set()
+    th = threading.Thread(target=feeder)
+    th.start()
+    t0 = time.time()
+    ops._submitted(0)
+    th.join()
+    assert pending.payload.is_set() and time.time() - t0 >= 0.15 and ops.submission_waits == 1
+    src = inspect.getsource(SC.CudaDeviceOps.wait)
+    assert 0 <= src.index("self._submitted(l)") < src.index("_wait_kernel()")
+    stuck = tr(4, 0)
+    ops2 = ops_with([stuck])
+    runner = threading.Thread(target=ops2._submitted, args=(0,), daemon=True)
+    runner.start()
+    runner.join(timeout=0.5)
+    assert runner.is_alive()                                   # blocked on the unsubmitted pack
+    stuck.payload.set()
+    runner.join(timeout=5)
+    assert not runner.is_alive() and ops2.submission_waits == 1

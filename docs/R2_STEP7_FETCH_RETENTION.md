@@ -443,8 +443,8 @@ layer's verify rows read in flight, on the device, with no host step:
   stream keeps the others), the list in blocks of 1024, VOLATILE loads of the board, spinning until every entry
   reached its generation or `max_spin` rounds passed; then an entry short or past raises `err` (int32, atomic max).
   The board write that ends the spin is enqueued after the scatter, so the rows are complete when the main stream's
-  next kernel (the attention) reads them. A CPU pack not yet submitted needs no host wait: the feeder submits it and
-  the spin sees its publication.
+  next kernel (the attention) reads them. In the eager tick a CPU pack not yet submitted is host-waited for its
+  SUBMISSION first (the liveness rule of 12g); its completion is waited on the device.
 - NO HANG: `err` is watched by S-C (`watch_flag`, 12e): a spin that ran out refuses its tick at that tick's end_tick.
 - `CudaDeviceOps(wait_mode="exact")` launches the kernel per layer; `"superset"` keeps the event waits. FG1 runs both
   and reports per layer the 4.3 layer_wait_ns, per tick the ms, the submission host-waits (superset only) and `err`.
@@ -457,6 +457,44 @@ layer's verify rows read in flight, on the device, with no host step:
   block; negative controls: a wait that accepts the previous generation reads the old block (content check); a
   transport that never publishes runs the spin out and the watched `err` refuses the tick); GT4 (gilfree publishes
   exactly its transfers' (slot, generation) after the release; negative: no board attached, no publication).
+
+## 12g. The GPU gates FG1 - FG3 on the real tick (`benchmarks/Efficiency/r2_fetch_fg.py`, 2026-10-21)
+
+The gates live on branch `feature/nosi-r2-m2-fg` (worktree `/mnt/beegfs/ojerbi/nosi-r2-m2-fg`, 0781b1d, accepted with
+CPU job 2190942): the verify agent's SG5 795dbc1 (the tick with its ResidencyBackend) with this branch's 41078e8
+merged. Step `benchmarks/Efficiency/r2_fetch_fg_step.sh`; CPU tests of the plumbing
+`benchmarks/Efficiency/tests_cpu/test_r2_fetch_fg.py` (FGC1-FGC6); the gather transport
+`nosi/nosi/r2_transport_gather.py`. THIS branch carries the gates' library changes (ported, with tests F18 / F19 and
+GT4): the liveness rule below, `ResidencySC.journal_counts`, and gilfree's `stats["published"]`.
+
+- SETUP: B 8 distinct ragged documents (S 16128 minus the tick gate's deltas), one build_ragged; every engine a
+  from_r2 copy; TEACHER = the serial mode's greedy tokens (SG0's BI serial decode); RES = the ALL-RESIDENT tick
+  (ResidentStore) teacher-forced with forced_schedule, 64 committed tokens per request: its verify rows (float32, with
+  their (request, position)) are the reference of every S-C arm, which MUST give the same row sequence and BITWISE equal
+  rows. The host rows past the prompts are zeroed before every S-C arm.
+- FG1 THE WAIT (gilfree, C 80 / X 32 / R_ver 16): superset vs exact; per layer the device time of the wait (CUDA events
+  around it on the main stream; in S-C both the look and the read are on the device, so this is the 4.3 layer wait)
+  and its host time; ms per tick; the submission host-waits; exact: err 0, published == packed transfers, no board entry
+  ahead of its slot's generation. NEGATIVE: exact without publication (the board never attached), max_spin 65536: a
+  tick is refused (CapacityRefusal naming wait_err) within 900 s.
+- LIVENESS RULE (found while writing FG1): in the EAGER tick the exact wait first host-waits the SUBMISSION of every
+  transfer in flight at the layer (`CudaDeviceOps._submitted`: a threading.Event, the GIL released), then spins on the
+  device. Without it the main stream could spin on a pack that the feeder cannot submit, because the host thread holds
+  the GIL while it blocks in a kernel launch behind the spinning stream (the launch queue is full). The completion is
+  still waited on the device and only for the needed slots. In a captured tick the submission waits move before the
+  replay (the tick-capture plan 8.8).
+- FG2 THE TRANSPORTS (superset wait): gather (NOSI's Triton flash_h2d_from_mask on a side stream; T4 / T3 as side-stream
+  event waits; the board published on the side stream), s0 (K3X S0Transport over cpupack_core 91e6e47, its CUDA
+  backend; n_pos = C + X + 4 so the destination rows match the store with its tail rings) and gilfree (8 threads):
+  bitwise RES, and every 8 ticks every resident slot holds the host truth (K, V, bias); the 4.3 / 4.6 / 4.8 report per
+  transport.
+- FG3 FETCH PRESSURE (exact wait, gilfree): C:X:R_ver 72:128:64 and 64:256:128 (C below the primary 80: blocks are
+  evicted and fetched again; X large enough that the verifier's urgent misses find extras at B 8 x H 8 = 64 streams per
+  layer). Every completed point bitwise RES; a CapacityRefusal is reported as a configuration result. Precondition: a
+  completed point re-fetched (4.8 repeated > 0) and evicted LRU entries (`ResidencySC.journal_counts`: evict_po,
+  release:evict). NEGATIVE: NoHostCopy (a write-back that does not copy the rows to the host) differs or refuses.
+- STEP_MIN 90 (estimate: model and build about 6 min, the extension build about 2 min, TEACHER and RES about 3 min,
+  8.5 S-C arms at about 2 - 4 min each: S-C's host applies are Python loops over B x K x H x 64 entries per layer).
 
 ## 13. Open questions
 

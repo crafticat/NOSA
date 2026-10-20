@@ -75,7 +75,7 @@ class GilfreeTransport:
         self.npipe.set_sources(self.host_k, self.host_v)
         self.npipe.set_threads(self.threads)
         self.stats: Dict[str, int] = {k: 0 for k in STATS[:7]}
-        self.stats.update(releases=0, threads_min=None, threads_max=None)
+        self.stats.update(releases=0, threads_min=None, threads_max=None, published=0)   # published: (slot, gen) pairs
         self.staging_bytes = 2 * ring * nb
         self.background = bool(background)
         self.board = None                                      # the generation board (attach_board), or None
@@ -119,6 +119,7 @@ class GilfreeTransport:
                 self.board.t.view(-1).index_put_((d[0],), d[1])
         else:
             self.board.t.view(-1).index_put_((host[0],), host[1])
+        self.stats["published"] += len(transfers)
 
     def threads_ok(self) -> bool:
         """Agent E's rule (gilfree_pack.threads_ok): every chunk so far ran on exactly the requested team."""

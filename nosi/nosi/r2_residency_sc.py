@@ -529,7 +529,8 @@ class CudaDeviceOps:
     """S-C's device operations on the GPU (module docstring). SOURCE ONLY, NOT RUN YET (GPU gate FG1).
     wait_mode "superset": the main stream waits on the completion event of every transfer in flight at the layer.
     wait_mode "exact" (note 12f): one Triton program on the main stream spins on the generation board for exactly the
-    in-flight slots that the layer's verify rows read (wait_list); no host loop, no host wait; err (int32, on the
+    in-flight slots that the layer's verify rows read (wait_list), after the host waited the layer's packs' SUBMISSION
+    (_submitted: the eager tick's liveness rule, note 12g); no device read on the host; err (int32, on the
     device) reports a spin that ran out; S-C watches it. FG1 compares the two."""
 
     def __init__(self, svc: "ResidencySC", host_k, host_v, store_k, store_v, store_b, cis, block: int = BLOCK,
@@ -548,8 +549,19 @@ class CudaDeviceOps:
         self.events_waited = 0
         self.submission_waits = 0
 
+    def _submitted(self, l: int) -> None:
+        """LIVENESS (the eager tick): every transfer in flight at layer l is SUBMITTED before the main stream may wait
+        for it. A gilfree pack still queued in the feeder is host-waited for its submission (a threading.Event: the GIL
+        is released). Otherwise the main stream could spin on a pack whose feeder needs the GIL while the host thread
+        holds it, blocked in a kernel launch behind the spinning stream. The completion is waited on the device."""
+        for tr in list(self.svc.inflight.values()):
+            if tr.layer == l and tr.ev is None and isinstance(tr.payload, threading.Event):
+                tr.payload.wait()
+                self.submission_waits += 1
+
     def wait(self, l: int, dec: VerifyDecision) -> None:
         if self.wait_mode == "exact":
+            self._submitted(l)
             idx, gen = wait_list(dec, l, self.svc.board)
             _wait_kernel()[(1,)](self.svc.board.t, idx, gen, idx.shape[0], self.err, self.max_spin, BLOCK=1024)
             return
@@ -599,6 +611,7 @@ class ResidencySC(ResidencySB):
         self.mirrors = None                               # S-B's per-layer host-refreshed mirrors are not used
         self.dmirror = DeviceMirror(self.L, self.B, self.H, self.nblk, self.n_hist, self.device)
         self.mirror_drop = set(mirror_drop or ())
+        self.journal_counts: Dict[str, int] = {}                     # the stream transitions per kind (reports)
         self._dirty: Set[Tuple[int, int, int, int]] = set()          # (l, b, h, slot) changed since the last sync
         for l, pool in enumerate(self.pools):
             for (b, h), st in pool.streams.items():
@@ -634,7 +647,10 @@ class ResidencySC(ResidencySB):
 
     # ------------------------------------------------------------------------------------------------ the mirror delta
     def _journal(self, key: Tuple[int, int, int], item) -> None:
-        """Every stream transition, as the vendored ownership code logs it: (event, block, slot, gen, detail)."""
+        """Every stream transition, as the vendored ownership code logs it: (event, block, slot, gen, detail); counted
+        per kind in journal_counts (a release by its reason: release:evict, release:unprotect, release:end, ...)."""
+        kind = item[0] if item[0] != "release" else "release:%s" % (item[4],)
+        self.journal_counts[kind] = self.journal_counts.get(kind, 0) + 1
         if item[0] == "touch" or item[0] in self.mirror_drop:
             return
         self._dirty.add(key + (item[2],))

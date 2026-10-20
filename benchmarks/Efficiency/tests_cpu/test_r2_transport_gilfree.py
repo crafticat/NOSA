@@ -202,8 +202,9 @@ def test_GT3_a_release_on_another_team_is_refused(pinned, tmp_path_factory):
 def test_GT4_a_release_publishes_its_slot_generations(pinned):
     """GT4 (S-C's exact device wait, residency note 12f): with a generation board attached, every release publishes
     (slot, generation) of its transfers into the board after its rows (CPU mode: at once): exactly the destinations of
-    the issued transfers hold their generations, every other entry stays 0, and the rows are the host truth. Negative
-    control: the same issues without attach_board leave the board at 0."""
+    the issued transfers hold their generations, every other entry stays 0, the rows are the host truth, and
+    stats["published"] counts every packed transfer (FG1's published == groups). Negative control: the same issues
+    without attach_board leave the board at 0 and publish nothing."""
     for attach in (True, False):
         host_k, host_v, gk, gv, _, _ = _world()
         gf = GF.GilfreeTransport(pinned.ext, host_k, host_v, gk, gv, BS, D, threads=2, host_wait=lambda ev: None,
@@ -223,3 +224,4 @@ def test_GT4_a_release_publishes_its_slot_generations(pinned):
             gf.issue(layer, trs)
         assert _truth_ok(gk, gv, host_k, host_v, plans)
         assert torch.equal(board.t, want if attach else torch.zeros_like(want)), attach
+        assert gf.stats["published"] == (seq if attach else 0) and gf.stats["groups"] == seq   # every packed transfer
