@@ -58,9 +58,14 @@
 # decides). Exit: the step's exit (0; the report's failed-gate count; 2 a pilot refusal; 3 another GPU; 4 not exactly
 # one GPU; 124 / 137 the host timeout); 1 a STOP before the launch; 5 an exit-0 step whose record is incomplete or whose
 # sacct row is not COMPLETED 0:0.
+# HOLDER GPU (2026-10-20; holder 2188818 ends about 19:46Z, and its pinned uuid would stop a step in a renewed holder):
+# the GPU uuid of the holder is read from HOLDERS/<holder
+# job>.gpu_uuid (written read-only by the lead after an nvidia-smi check in that holder; the uuid without the GPU-
+# prefix): a missing or malformed file STOPS before anything is claimed, and the step's child still checks the visible
+# GPU against it. (The same reader as feature/nosi-r2-accept aea8862 and the eqmem v2 step.)
 set -u
 NOSI=/mnt/beegfs/ojerbi/nosi-r2-perreq                                                   # ROOT (feature/nosi-r2-perreq)
-GPU_UUID=f31fc723-9dfe-407a-9947-28173556232a                                            # PIN (holder 2188818)
+HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (<job>.gpu_uuid, lead-written)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
 MODEL=/mnt/beegfs/ojerbi/models/NOSA-8B                                                  # ROOT
@@ -71,6 +76,14 @@ OUTROOT=/mnt/beegfs/ojerbi/r2-runs/m1                                           
 SELF=benchmarks/Efficiency/spec_loop_r2_step.sh
 L=16128 TOTAL=112 GATE=64 R_SLOTS=62 SPLITS=4 TAU=0.4844 K_LIST="1 2 3"
 MIN_LEFT=7200
+read_holder_uuid() {      # $1 = the holders directory, $2 = the holder job id; prints the uuid, or STOPS (exit 1)
+    local f=$1/$2.gpu_uuid u=
+    [ -f "$f" ] || { echo "R2 step: STOP: no $f (the lead writes it after an nvidia-smi check in holder $2)" >&2; exit 1; }
+    IFS= read -r u < "$f" || [ -n "$u" ] || { echo "R2 step: STOP: $f is empty" >&2; exit 1; }
+    [[ $u =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+        || { echo "R2 step: STOP: $f holds '$u', not a uuid without the GPU- prefix" >&2; exit 1; }
+    printf '%s\n' "$u"
+}
 main() {
 stop() { echo "R2 step: STOP: $*" >&2; exit 1; }
 usage() { echo "usage: spec_loop_r2_step.sh --nosi <sha> <holder> <run id> <ref:B:D|spec:B:D|probe:B:D|spec_perreq:B:D|probe_perreq:B:D|report>" >&2; exit 2; }
@@ -79,6 +92,7 @@ NSHA=$2 JOB=$3 RUN=$4 CELL=$5
 DRY=${DRYRUN:-0}
 [[ $NSHA =~ ^[0-9a-f]{40}$ ]] || stop "--nosi '$NSHA' is not a full commit id"
 case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
+GPU_UUID=$(read_holder_uuid "$HOLDERS" "$JOB") || exit 1
 [[ $RUN =~ ^[a-z0-9]{1,16}$ ]] || stop "run id '$RUN' (1-16 of a-z 0-9)"
 MODE= B=0 D=0 R=0 PROBE=0 KL=$K_LIST COMMIT=lockstep
 case $CELL in

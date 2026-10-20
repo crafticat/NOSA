@@ -30,7 +30,7 @@
   PL  the pilot's host side: perreq_keep and PerReqLoop (ragged sequences, finished requests stop committing, the K = 0
       fallback, refusals), aggregate_rounds_perreq (the measured yield), the report's gates for a per-request cell.
   AN  benchmarks/Efficiency/r2_payload_analysis.py on a synthetic payload.
-  ST / PIN  the step script's per-request cells (bash -n, text) and the wiring pins.
+  ST / PIN  the step script's per-request cells (bash -n, text), its holder uuid file reader (ST2), the wiring pins.
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA \
         "benchmarks/Efficiency/tests_cpu/test_spec_perreq_pilot.py::<test>"
@@ -1363,6 +1363,32 @@ def test_ST1_the_step_script_has_the_per_request_cells():
         assert old in src, old                             # the milestone-1 cells keep their tags (TAG=${kind}b${B}d${D} before)
     assert "--env NOSI_SPEC_COMMIT=$COMMIT)" in src and "COMMIT=lockstep" in src
     assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-perreq " in src
+
+
+def _r2_holder_uuid(d, job):
+    src = STEP.read_text()
+    fn = src[src.index("read_holder_uuid() {"):src.index("\nmain() {")]
+    p = subprocess.run(["bash", "-c", fn + '\nread_holder_uuid "$1" "$2"', "t", str(d), job], capture_output=True, text=True)
+    return p.returncode, p.stdout.strip(), p.stderr
+
+
+def test_ST2_the_step_script_reads_the_holder_uuid_file_and_stops_without_it(tmp_path):
+    """The R2 step reads the holder's GPU uuid from HOLDERS/<job>.gpu_uuid (the eqmem v2 pattern); no uuid is pinned in
+    the script; the child keeps its nvidia-smi check. NEGATIVE CONTROLS: missing, empty, GPU- prefixed, short and
+    uppercase files STOP."""
+    src = STEP.read_text()
+    assert "HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders " in src and 'GPU_UUID=$(read_holder_uuid "$HOLDERS" "$JOB") || exit 1' in src
+    assert "f31fc723" not in src and '[ "$seen" = "GPU-$U" ]' in src and '"$GPU_UUID" "$APPTAINER"' in src
+    assert src.index('GPU_UUID=$(read_holder_uuid') < src.index('if [ "$DRY" = 1 ]')
+    u = "f31fc723-9dfe-407a-9947-28173556232a"
+    (tmp_path / "123.gpu_uuid").write_text(u + "\n")
+    assert _r2_holder_uuid(tmp_path, "123") == (0, u, "")
+    rc, out, err = _r2_holder_uuid(tmp_path, "999")
+    assert rc == 1 and out == "" and "STOP: no" in err
+    for job, text in (("125", ""), ("126", "GPU-" + u + "\n"), ("127", "f31fc723-9dfe\n"), ("128", u.upper() + "\n")):
+        (tmp_path / ("%s.gpu_uuid" % job)).write_text(text)
+        rc, out, err = _r2_holder_uuid(tmp_path, job)
+        assert rc == 1 and out == "" and "STOP" in err, (job, rc, out, err)
 
 
 def _bodies(src, cls_name):
