@@ -28,11 +28,14 @@ historical slot named by its block id; slots NB, NB + 1 are the exact ring, NB +
 is content (note 5.1): the page order is the block-id order, so the slot numbers never reach a row's bits. The
 store is filled from the R2 state of build_ragged (the host K / V rows of the prompt, the twin's cis rows), so the
 tick and the BI serial decode start from the same bytes. The paper's residency mover (a bounded slot store, the
-background and urgent gathers, note 5.3) is NOT built here: it is SG5's term dXFER.
+background and urgent gathers, note 5.3) is NOT built here: it is SG5's term dXFER. C's answer (Q1, 2026-10-21):
+this store is valid for SG1-SG4 (exactness), NOT for SG5 or any memory / transfer claim.
 DRAFT ROWS attend the RESIDENT blocks of their selection only (paper 3.1). With full residency every block is
 resident, so a run parameter draft_drop marks a deterministic fraction of a draft row's MIDDLE blocks (not the init
-block, not the local window) as not resident: a hash of (request, layer, head, block id, seed), never of the batch.
-Verify rows always read their whole selection.
+block, not the local window) as not resident: a hash of (request, layer, head, block id, seed), never of the batch;
+the kept pages stay in ascending block id, num_pages varies per row, the table width P = topk is a run constant.
+Verify rows always read their whole selection. C's answer (Q2): a valid SG2 draft, but NO r / acceptance / R-PERF
+number from this stand-in is representative (the gate labels it).
 
 DECISIONS (TickRound). The draft tokens stay on the device (the token log); a row's input is a literal token or a log
 slot. ONE host read per tick that finishes a cohort (with the flatten: every tick with verify rows), none in the
@@ -44,10 +47,10 @@ ROLLBACK and PUBLICATION (TickEngine.apply_events, after the decision):
                   the counters after position keep - 1 (note 6); a publication: nothing (the bank is there already).
   tail pages      nothing: rows beyond the committed position are outside every later extent (note 5.2).
   write-back      a block whose 64 positions are COMMITTED is copied from its exact ring page to its historical slot.
-  draft bank      a rejection: sync_draft_bank and the draft ring := the exact ring. A publication (K3X F5): the draft
-                  bank's keys / cis of its still-unverified positions are read from its own twin rows, the bank is
-                  rebuilt (rebuild_draft_bank), and the draft ring rows of the newly published positions take the
-                  exact rows.
+  draft bank      a rejection: sync_draft_bank and the draft ring := the exact ring. A publication (K3X F5,
+                  rebuild_from_own_rows): FIRST the draft bank's keys / cis of its still-unverified positions are read
+                  from its own twin rows, THEN the bank is rebuilt (sync, then advance by them), and the draft ring
+                  rows of the newly published positions take the exact rows.
 HOST SYNCS. TickEngine.run_rows and apply_events contain no host read of their own (one pinned H2D copy of the row
 table per tick); read_tokens is the one decision read. PositionalTwin.step (C's, r2_positional_twin.py) still reads
 device values for its refusal checks: those syncs are counted as twin syncs, not decisions (SG5 reports them).
@@ -65,14 +68,15 @@ import torch
 import torch.nn.functional as F
 
 from . import r2_spec_core as SC
+from .r2_decode_path import R2Error
 from .r2_positional_twin import BLOCK, PositionalTwin
 
 RING_EXACT, RING_DRAFT = 0, 2              # ring page offsets past the NB historical slots
 FIELDS = ("pos", "b", "bank", "u", "ring_row", "prev_slot", "tail_slot", "draft", "lit", "slot")
 
 
-class TickError(RuntimeError):
-    pass
+class TickError(R2Error):
+    """A refusal of the tick (an R2Error, as the BI serial decode refuses: C's Q4 answer, 2026-10-21)."""
 
 
 class Ref:
@@ -84,6 +88,20 @@ class Ref:
 
     def __repr__(self):
         return "Ref(%d)" % self.slot
+
+
+def rebuild_from_own_rows(twin: PositionalTwin, b: int, B: int, p: int, dpos: int):
+    """K3X F5 on the draft bank B + b after a publication up to position p (C's Q5 answer, 2026-10-21): FIRST capture
+    the draft's own unverified rows, positions [p, dpos) (its ring rows q % 64 and its total_cis rows q), THEN
+    r2_spec_core.rebuild_draft_bank (sync_draft_bank: the exact bank's tables and counters, then advance by the
+    captured rows). Returns the captured (keys (n, H, D), cis (n, H))."""
+    if not 0 <= dpos - p <= 64:
+        raise TickError("draft bank %d: %d unverified rows (the ring holds 64)" % (B + b, dpos - p))
+    idx = torch.arange(int(p), int(dpos), dtype=torch.int64, device=twin.pos.device)
+    dk = twin.ring[B + b, idx % BLOCK].clone()
+    dc = twin.total_cis[B + b, idx].clone()
+    SC.rebuild_draft_bank(twin, b, B, dk, dc)
+    return dk, dc
 
 
 def default_nl():
@@ -383,9 +401,9 @@ class TickEngine:
             if p != self.bank_pos[bank] + len(g):
                 raise TickError("row %d: bank %d writes position %d, its next is %d" % (k, bank, p, self.bank_pos[bank] + len(g)))
             T = p // BLOCK
-            if T + 1 < topk:
-                raise TickError("row %d: position %d has %d blocks < topk %d (the selection would name absent blocks)"
-                                % (k, p, T + 1, topk))
+            if T + 1 < topk:                                     # the BI serial decode's limit: pos // 64 >= topk - 1
+                raise TickError("row %d: position %d has %d blocks < topk %d (pos // 64 >= %d is needed: the selection "
+                                "would name absent blocks)" % (k, p, T + 1, topk, topk - 1))
             if T + 1 >= self.NB or p >= self.twins[0].n_max:
                 raise TickError("row %d: position %d beyond the store (%d blocks) or N_max" % (k, p, self.NB))
             if self.wb[b] < T - 1:
@@ -598,12 +616,8 @@ class TickEngine:
             dpos = self.bank_pos[B + b]
             if dpos < p:
                 raise TickError("request %d: the draft bank (%d) is behind the publication (%d)" % (b, dpos, p))
-            idx = torch.arange(p, dpos, dtype=torch.int64, device=self.dev)
             for l in range(self.L):
-                t = self.twins[l]
-                dk = t.ring[B + b, idx % BLOCK].clone()                          # the draft's own unverified rows
-                dc = t.total_cis[B + b, idx].clone()
-                SC.rebuild_draft_bank(t, b, B, dk, dc)
+                rebuild_from_own_rows(self.twins[l], b, B, p, dpos)
                 self.copy_rows(l, b, range(self.synced[b], p))
             self.synced[b] = p
 

@@ -175,13 +175,32 @@ def _teacher(b, p):
     return (p * 7 + b * 13 + (p // 5)) % 50
 
 
+def test_T2a_forced_schedule_kinds():
+    """T2a: forced_schedule's four kinds on constructed cohorts (block 8; row i wrote position E + i - 1; a rejection
+    at j keeps the positions < E + j): a cohort far from a boundary cycles its offsets (0, then 1, then accepted
+    whole); a cohort ending 1 or 2 positions before the boundary X is STEERED to j = X - 1 - E (the next epoch starts at
+    X - 1); a crossing cohort is rejected at the row that wrote X (cross_new: X kept) and, the next time, at the row
+    before it (cross_old: X rolled back)."""
+    C = SC.Cohort
+    rj, log = TK.forced_schedule(3, block=8)
+    assert rj(0, C(1, 1, 2), 0) == 1 and rj(0, C(1, 1, 2), 0) == 2 and rj(0, C(1, 1, 2), 0) is None   # cycle 0, 1, L
+    assert rj(1, C(1, 1, 2), 5) == 2                                    # rows at 5, 6; X = 8: steer, keep < 7
+    assert rj(1, C(2, 3, 5), 3) == 4                                    # rows at 5, 6, 7; X = 8: steer, keep < 7
+    assert rj(2, C(1, 1, 2), 7) == 2                                    # rows at 7, 8: cross_new, keep < 9 (8 kept)
+    assert rj(3, C(2, 3, 5), 4) == 4                                    # rows at 6, 7, 8: cross_old, keep < 8
+    assert [e[5] for e in log] == ["cycle"] * 3 + ["steer", "steer", "cross_new", "cross_old"]
+    assert [e[4] for e in log] == [0, 1, None, 1, 1, 1, 1]
+
+
 def test_T2_forced_schedule_covers_every_kind_and_commits_the_teacher():
-    """T2: the teacher-forced round with forced_schedule (block 8 here: many boundaries) commits the teacher's tokens;
-    its log covers every rejection offset, full acceptances, and both boundary kinds; every steered decision makes the
-    next epoch start at X - 1; every cross_new decision keeps exactly the new block's first row, every cross_old one
-    keeps none of the new block; simulate_schedule gives the same log. Negative controls: a reject_at outside the
-    cohort is refused; a schedule without steering and boundary handling is not complete for these lengths."""
-    S_list, max_new, blk = [10, 21, 30, 44], [40, 33, 57, 21], 8
+    """T2: the teacher-forced round with forced_schedule (block 32 here: several boundaries per request, room for the
+    cycle between them) commits the teacher's tokens; its log covers every rejection offset, full acceptances, and
+    both boundary kinds; every steered decision makes the next epoch start at X - 1; every cross_new decision keeps
+    exactly the new block's first row, every cross_old one keeps none of the new block; simulate_schedule gives the
+    same log. Negative controls: a reject_at outside the cohort is refused; a schedule without steering and boundary
+    handling is not complete for these lengths. (Block 8, CPU job 2190867: almost every cohort crosses or is steered,
+    so the cycle never reached every offset: the schedule needs room between boundaries, as at block 64.)"""
+    S_list, max_new, blk = [10, 21, 30, 44], [40, 33, 57, 21], 32
     reject_at, log = TK.forced_schedule(3, block=blk)
     n = [0]
     rnd = TK.TickRound([_teacher(b, S) for b, S in enumerate(S_list)], S_list, lambda lo, hi: [0] * (hi - lo), K=3,
@@ -195,7 +214,7 @@ def test_T2_forced_schedule_covers_every_kind_and_commits_the_teacher():
     for b, S in enumerate(S_list):
         assert rnd.reqs[b].out == [_teacher(b, S + j) for j in range(max_new[b])]
     cov = TK.schedule_coverage(log, 3)
-    assert cov["complete"] and cov["steer"] > 0, cov
+    assert cov["complete"], cov
     for (b, a, e, E, o, kind) in log:
         if kind == "cross_new":
             assert (E + a + o - 1) % blk == 0                         # the kept rows end at the new block's first row
@@ -291,7 +310,7 @@ def _rope(pos, q, k, Dh, cache, neox):
 
 def _silu_and_mul(h, out):
     d = h.shape[-1] // 2
-    out.copy_(F.silu(h[..., :d]) * h[..., d:])
+    out.copy_((F.silu(h[..., :d].double()) * h[..., d:].double()).to(out.dtype))   # float64: no vector-tail path
 
 
 NL_CPU = SimpleNamespace(layer_norm=_layer_norm, nosa_linear=_nosa_linear, apply_rope_with_cos_sin_cache_inplace=_rope,
@@ -344,16 +363,17 @@ STEPS = 40
 N_REF = STEPS + 16
 
 
-def make_engine(ops, S_list=S_TINY, steps=STEPS, seed=1, cls=None, **kw):
+def make_engine(ops, S_list=S_TINY, steps=STEPS, seed=1, cls=None, width_S=max(S_TINY), **kw):
     """The tiny model's state after a synthetic prefill (random keys / values / cis of the prompt), in both banks of
     every layer's 2B twin and in the store (complete blocks in their historical slots, the partial block in the exact
-    ring, the draft ring = the exact ring): the layout TickEngine.from_r2 builds from build_ragged."""
+    ring, the draft ring = the exact ring): the layout TickEngine.from_r2 builds from build_ragged. Request b's data
+    of layer l come from their OWN seeded generator and the widths (Lk_max, N_max, M_alloc) from width_S, so a request
+    has the same state in any batch (CPU job 2190867: one shared generator gave request 0 other layer-1 data alone)."""
     model = tiny_model()
     B = len(S_list)
-    end = max(S_list) + steps + 80
+    end = max(width_S, max(S_list)) + steps + 80
     lk_max, n_max, M_alloc = end // 16 + 1, end + 64, end // 64 + 1
     NB = n_max // BS + 1
-    g = torch.Generator().manual_seed(seed)
     twins, sk, sv, sb = [], [], [], []
     for l in range(NL_LAYERS):
         t = TW.PositionalTwin(2 * B, HKV, D, lk_max, n_max)
@@ -361,6 +381,7 @@ def make_engine(ops, S_list=S_TINY, steps=STEPS, seed=1, cls=None, **kw):
         v = torch.zeros_like(k)
         bias = torch.zeros(B, (NB + 4) * BS, HKV)
         for b, S in enumerate(S_list):
+            g = torch.Generator().manual_seed(seed * 100003 + l * 1009 + b)
             keys = torch.randn(S, HKV, D, generator=g)
             vals = torch.randn(S, HKV, D, generator=g)
             cis = -torch.rand(S, HKV, generator=g)
@@ -579,6 +600,59 @@ def test_T7_page_table_and_draft_drop(p3):
     assert torch.equal(tab1[0, :, :int(npg1[0, 0])], tab[0, :, :int(npg1[0, 0])]) and torch.equal(npg1[0], npg[0])
 
 
+def _same_bank(a, ka, b, kb):
+    assert int(a.pos[ka]) == int(b.pos[kb]) and int(a.n_comp[ka]) == int(b.n_comp[kb]) and int(a.n_ccis[ka]) == int(b.n_ccis[kb])
+    n, m, p = int(b.n_comp[kb]), int(b.n_ccis[kb]), int(b.pos[kb])
+    assert torch.equal(a.comp_k[ka, :n], b.comp_k[kb, :n]) and torch.equal(a.ccis[:, ka, :m], b.ccis[:, kb, :m])
+    assert torch.equal(a.total_cis[ka, :p], b.total_cis[kb, :p]) and torch.equal(a.live_keys(ka), b.live_keys(kb))
+
+
+def test_T12_rebuild_from_own_rows():
+    """T12 (C's Q5): after a publication up to p = 205, the draft bank rebuilt from its OWN unverified rows (positions
+    205 .. 211, captured BEFORE the sync) equals, by content, a bank re-advanced from an INDEPENDENT record of the
+    same keys and cis (the prompt, the 5 exact rows, then the 7 draft rows); the replayed span holds a cis compression
+    (position 207) and a key compression (208), whose windows now cover the exact rows 200 .. 204; fixed_order_mean
+    is the twins' mean. Negative control: rows read AFTER the sync (the exact bank's rows) differ, and so does the
+    bank re-advanced with them."""
+    B, H, Dh, S = 2, 2, 8, 200
+
+    def build():
+        g = torch.Generator().manual_seed(12)
+        pk, pc = torch.randn(S, H, Dh, generator=g), torch.randn(S, H, generator=g)
+        ek, ec = torch.randn(5, H, Dh, generator=g), torch.randn(5, H, generator=g)
+        dk, dc = torch.randn(12, H, Dh, generator=g), torch.randn(12, H, generator=g)
+        t = TW.PositionalTwin(2 * B, H, Dh, 40, 400)
+        t.mean_fn = BD.fixed_order_mean
+        for bank in range(2 * B):
+            t.prefill(bank, pk, pc)
+        SC.flatten_advance(t, {B + 0: (dk, dc)})                        # the draft ran ahead: positions 200 .. 211
+        SC.flatten_advance(t, {0: (ek, ec)})                            # the verifier published 200 .. 204
+        return t, (pk, pc, ek, ec, dk, dc)
+    t, (pk, pc, ek, ec, dk, dc) = build()
+    assert int(t.n_comp[0]) == 11 and int(t.n_ccis[0]) == 11 and int(t.pos[B]) == 212    # events due at 207 / 208
+    got_k, got_c = TK.rebuild_from_own_rows(t, 0, B, 205, 212)
+    assert torch.equal(got_k, dk[5:]) and torch.equal(got_c, dc[5:])
+    ref = TW.PositionalTwin(1, H, Dh, 40, 400)
+    ref.mean_fn = BD.fixed_order_mean
+    ref.prefill(0, pk, pc)
+    ref.advance(torch.cat([ek, dk[5:]]).unsqueeze(0), torch.cat([ec, dc[5:]]).unsqueeze(0), [12])
+    assert int(ref.n_comp[0]) == 12 and int(ref.n_ccis[0]) == 12                          # both events replayed
+    _same_bank(t, B + 0, ref, 0)
+    bad, _ = build()                                                    # NEGATIVE: read after the sync
+    SC.sync_draft_bank(bad, 0, B)
+    idx = torch.arange(205, 212)
+    wk, wc = bad.ring[B, idx % BS].clone(), bad.total_cis[B, idx].clone()
+    assert not torch.equal(wk, dk[5:]) and not torch.equal(wc, dc[5:])
+    cnt = torch.zeros(2 * B, dtype=torch.int64)
+    cnt[B] = 7
+    kk = torch.zeros(2 * B, 7, H, Dh)
+    cc = torch.zeros(2 * B, 7, H)
+    kk[B], cc[B] = wk, wc
+    bad.advance(kk, cc, cnt)
+    with pytest.raises(AssertionError):
+        _same_bank(bad, B + 0, ref, 0)
+
+
 def test_T8_row_table_refusals(p3):
     """T8: the row table refuses a position that is not its bank's next one, a row before 64 blocks of selection,
     a committed position, and a token slot not yet written."""
@@ -697,6 +771,9 @@ def test_T11_step_script_uuid_file_and_pins(tmp_path):
     assert "gpu_uuid %s (%s/316.gpu_uuid)" % (uid, tmp_path) in r.stdout
     assert ("piece 3 %s:%s blob %s" % (PIECE3_V2["sha"], PIECE3_V2["path"], PIECE3_V2["blob"])) in r.stdout
     for arg in ("--biattn /mnt/beegfs/ojerbi/r2-runs/tick/tick_t1_316.step/piece3_bi_paged_attention.py", "--gemm exact",
-                "--batch 8", "--S 16128", "--steps 96", "--m-fix 32", "--parts SG0,SG1,SG2", "--draft-drop 0.5",
+                "--batch 8", "--S 16128", "--steps 96", "--m-fix 32", "--draft-drop 0.5",
                 "NOSI_R2_DECODE=1", "NOSI_ATTN_SPLITS=4", "NOSI_POOL_BLOCKS=0"):
         assert arg in r.stdout, arg
+    # printf %q writes a comma as "\," (CPU job 2190867; C's G8 the same): accept that form and the plain one
+    for plain in ("--parts SG0,SG1,SG2", "--deltas 0,1,17,63,64,65,777,4097"):
+        assert plain in r.stdout or plain.replace(",", "\\,") in r.stdout, plain

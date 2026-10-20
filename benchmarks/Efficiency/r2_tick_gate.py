@@ -238,7 +238,9 @@ def part_tick(a, base, ref, gates, res, forced):
         gates.append(GB.gate("SG2_precondition_rejects_and_publishes", pre, True,
                              "rollbacks %d, publications %d (a run that never rolls back is blind)"
                              % (info["rollbacks"], info["publications"])))
-        info["acceptance"] = round(st["accepted"] / max(1, st["accepted"] + st["rejected"]), 4)
+        info["acceptance_NOT_REPRESENTATIVE"] = round(st["accepted"] / max(1, st["accepted"] + st["rejected"]), 4)
+    info["draft_stand_in"] = ("draft rows miss a hashed %g of their middle blocks (all-resident store): NO r, acceptance "
+                              "or R-PERF number of this run is representative (C, Q2 2026-10-21)" % eng.draft_drop)
     res[name] = info
     del eng
 
@@ -284,7 +286,8 @@ def main(argv=None) -> int:
                     bi=ops.describe(), biattn=a.biattn, parts=a.parts, check=not a.no_check,
                     attn_splits=NL._ATTN_SPLITS, workload_sha256=sha, nosi_commit=os.environ.get("TICK_COMMIT", "unknown"),
                     torch=torch.__version__, gpu=torch.cuda.get_device_name(0),
-                    storage="ResidentStore: every committed block resident (the residency mover is SG5's dXFER)")
+                    storage="ResidentStore: every committed block resident (the residency mover is SG5's dXFER); "
+                            "valid for SG1-SG4 exactness, NOT for SG5 or any memory / transfer claim (C, Q1)")
 
         def save():
             json.dump(dict(meta=meta, gates=gates, results=res), open(os.path.join(a.out, "summary.json"), "w"),
