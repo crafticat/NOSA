@@ -42,7 +42,8 @@ import torch
 NOSI_REPO = Path(os.environ.get("NOSI_REPO") or Path(__file__).resolve().parents[1])
 N = NOSI_REPO / "nosi/nosi"
 FILES = {name: N / (name + ".py") for name in ("r2_positional_twin", "r2_decode_body", "r2_writeback",
-                                                "max_pooling_per_request", "stage1_seqused", "r2_decode_path")}
+                                                "max_pooling_per_request", "stage1_seqused", "r2_decode_path",
+                                                "r2_capture")}
 if not all(p.is_file() for p in FILES.values()):
     pytest.skip("the R2 modules are not all under NOSI_REPO=%s" % NOSI_REPO, allow_module_level=True)
 
@@ -99,9 +100,10 @@ def lint_function(fn):
     for node in ast.walk(fn):
         if isinstance(node, ast.Call):
             name = _callname(node)
-            if isinstance(node.func, ast.Name) and name in ("bool", "float"):
+            literal = bool(node.args) and all(isinstance(x, ast.Constant) for x in node.args)
+            if isinstance(node.func, ast.Name) and name in ("bool", "float") and not literal:
                 add("SYNC", node)
-            elif isinstance(node.func, ast.Name) and name == "int" and not (
+            elif isinstance(node.func, ast.Name) and name == "int" and not literal and not (
                     node.args and INT_OK.search(ast.unparse(node.args[0]))):
                 add("SYNC", node)
             if isinstance(node.func, ast.Attribute) and name in SYNC_ATTRS:
@@ -159,6 +161,7 @@ CAPTURED = [
     ("r2_writeback", "masked_writeback"), ("r2_writeback", "_launch"), ("r2_writeback", "check_args"),
     ("max_pooling_per_request", "nosa_pooling_per_request"), ("max_pooling_per_request", "check_lengths"),
     ("stage1_seqused", "stage1_seqused"), ("stage1_seqused", "check_seqused"),
+    ("r2_capture", "layer_decode_fixed"), ("r2_capture", "decode_step_fixed"),
 ]
 
 EAGER = {   # the classes the audit documents for each validated eager function (the lint must find AT LEAST these)
@@ -170,6 +173,10 @@ EAGER = {   # the classes the audit documents for each validated eager function 
     ("r2_decode_path", "pooling_lengths"): {"ALLOC", "BRANCH", "HOSTSTATE"},
     ("r2_decode_path", "body_update"): {"SYNC", "BRANCH", "CALLS_EAGER"},
     ("r2_decode_path", "R2Body.update"): {"CALLS_EAGER"},
+    # the driver of the captured step: it runs on the host, OUTSIDE the captured region, by design
+    ("r2_capture", "prepare_step"): {"ALLOC"},
+    ("r2_capture", "finish_step"): {"HOSTSTATE"},
+    ("r2_capture", "errors"): {"SYNC"},
 }
 
 

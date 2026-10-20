@@ -4,8 +4,7 @@
 # capture-safe step), CG (warm-up, ONE captured decode step replayed with ragged activity), NG1 / NG2 (negative
 # controls), T (timing REPORT)). The pattern of benchmarks/Efficiency/r2_ragged_step.sh, with the GPU uuid READ from
 # the lead-owned file HOLDERS/<holder job>.gpu_uuid (one line, the uuid without "GPU-"; never a constant here).
-# SOURCE ONLY until reviewed: it never submits, renews, cancels or replaces an allocation, never retries. It STOPs at
-# the pin checks until the gate file and nosi/nosi/r2_capture.py are tracked at the pinned commit (the next milestone).
+# SOURCE ONLY until reviewed: it never submits, renews, cancels or replaces an allocation, never retries.
 #
 #   bash benchmarks/Efficiency/r2_capture_step.sh --nosi <sha> <holder job> <run id>
 #   DRYRUN=1 bash benchmarks/Efficiency/r2_capture_step.sh --nosi <sha> <holder job> <run id>
@@ -13,7 +12,7 @@
 #
 # OUTPUT: OUTROOT/cap_<run>_<holder>/summary.json and the step record OUTROOT/cap_<run>_<holder>.step/ (command + pins
 # incl. the uuid and its file, stdout, stderr, exit + accounting, sacct row), both frozen. EXIT: the gate's exit = the
-# number of failed MUST gates; 20 the gate refused; 30 the gate raised; 2 a usage error of this script; 3 another GPU;
+# number of failed MUST gates (0-19); 20 the gate refused; 30 the gate raised; 2 a usage error of this script; 3 another GPU;
 # 4 not exactly one GPU; 124 / 137 the host timeout; 1 a STOP before the launch; 5 an exit-0 step whose record is
 # incomplete or whose sacct row is not COMPLETED 0:0.
 # Checks before the claim (each STOPS with exit 1): no SLURM_ / SRUN_ / SALLOC_ / SBATCH_ variable in the login shell;

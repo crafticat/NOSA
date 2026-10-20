@@ -73,13 +73,35 @@ planned (next section); "OP" needs a decision.
 | `r2_decode_path.py:354-355` | `decode_inference` | HOSTSTATE | `st.steps += 1`, `st.pos_host += ...` | X4: the driver, after each replay |
 | `r2_decode_path.py:223` | `R2State.set_active` | (sync) | pageable host -> device copy | outside the region: the driver writes the static mask before a replay |
 
-## Table B: op-internal allocations (DECISION NEEDED: "OP")
+## The allocation rule (a stated deviation from the strict reading of law 3)
+
+DECISION (lead, 2026-10-20):
+
+- TRANSIENT INTERMEDIATES may come from the CUDA graph's private pool. These are
+  the tensors that live only inside one step: rmsnorm, `nosa_linear`, the
+  stage-1 score, attention, `F.linear`, `torch.where` temporaries (Table B).
+- STATE must be written in place into preallocated buffers and never allocated
+  inside the graph. State is the twin tables, the body tables, the slot window,
+  the host buffers, the counters, the error bits, and every tensor that is read
+  after the graph.
+
+REASON: a pool allocation made during the capture gets one address, and every
+replay reuses that address. That is the intent of law 3 ("fixed device
+addresses"). State must outlive a step and be read by the host or by the next
+step, so it cannot live in the pool.
+
+EVIDENCE (the capture gate):
+
+- CG == CE bitwise for every request and every step, plus NG1 / NG2: the replay
+  computes what the validated eager path computes;
+- CG-PTR: every state tensor's `data_ptr` is the same before the capture and
+  after the last replay (`r2_capture.state_pointers`: the twins, the engines,
+  the R2State buffers, the CaptureBuffers, the body's index cache).
+
+## Table B: op-internal allocations (transient: allowed by the rule above)
 
 These allocate inside an op. Under `torch.cuda.graph` they come from the
-graph's private pool and keep their addresses across replays. Law 3 read
-strictly forbids them. Either the law accepts graph-pool allocations, with the
-capture gate proving captured == eager bitwise, or each needs an `out=`
-variant.
+graph's private pool and keep their addresses across replays.
 
 | Site | Allocation | out= available |
 |---|---|---|
@@ -136,10 +158,14 @@ first call, which the eager warm-up makes before the capture.
     - the cross-boundary rollback;
     - the device refusal.
 
-## X4 and the capture gate (plan; the next milestone)
+## X4 and the capture gate (implemented; SOURCE ONLY, not run)
 
-`nosi/nosi/r2_capture.py`, a new module (C's `r2_decode_path.py` is not
-edited, so it cannot collide with step 7):
+`nosi/nosi/r2_capture.py` (new; C's `r2_decode_path.py` is not edited). Its
+module docstring has the line-by-line table against `layer_decode`. The parts
+are listed below; the lint (`tests/test_r2_capture.py`) finds nothing in
+`layer_decode_fixed` and `decode_step_fixed`. The driver functions
+(`prepare_step`, `finish_step`, `errors`) run on the host, outside the region,
+by design:
 
 * `CaptureBuffers`, built once after `build_ragged`:
   - input ids (B, 1), positions (B, 1), the active mask (B,);
@@ -161,24 +187,50 @@ edited, so it cannot collide with step 7):
   and fill the `_index` cache. A warm-up step is a real step: the arms below
   count it.
 
-Gate `benchmarks/Efficiency/r2_capture_gate.py` (to write; one process, the
-model loaded once, `build_ragged` per arm, the ragged gate's documents,
-activity table and deltas):
+Gate `benchmarks/Efficiency/r2_capture_gate.py`. It runs in one process, loads
+the model once, and builds every arm with `build_ragged` and the ragged gate's
+workload loader and activity table. It records EVERY request, not only request
+0: NG2's change shows only in requests whose activity varies, and request 0
+is always active.
+
+Per step it records:
+
+- the logits, float32 (B, V);
+- every layer's selection (L, H, B, 64);
+- `_block_map` and `_cache_lens`;
+- the twins' counters.
+
+After the last step it records a sha256 digest per (layer, request, table) of
+the live rows of eight tables: compressed keys, compressed cis, `total_cis`,
+host K and V, and the window K, V and bias.
 
 | Arm | What | Gate |
 |---|---|---|
-| CE | the validated eager path (`layer_decode`, body "r2") | the reference |
-| CF | eager `decode_step_fixed` | MUST: bitwise CE at every step: logits, every layer's selection, twin counters, `cache_lens`, the tail id; the final tables |
-| CG | 2 eager warm-up steps, then ONE captured `decode_step_fixed`, replayed for the remaining steps with the ragged activity | MUST: bitwise CE at every step, as CF; every `err` 0 |
-| NG1 | CG with `M_b` taken from a host value frozen at capture | MUST differ from CE, first at a request's first block boundary after the capture |
-| NG2 | CG with the active mask not rewritten before a replay | MUST differ from CE, first at the first step whose activity differs |
-| T | step time CF vs CG | REPORT |
+| CE | the validated eager path (`model.decode_inference`, body "r2") | the reference |
+| CF | eager `decode_step_fixed` with the driver | MUST bitwise CE every step and in the final digests; CF-ERR: refusal bits 0 |
+| CG | `--warmup` 2 eager steps, then ONE captured step replayed for the rest | MUST bitwise CE; CG-ERR; CG-PTR: no state `data_ptr` moves across the replays |
+| NG1 | CG with `cb.freeze_widths` right before the capture (the widths of the capture step) | MUST differ first at `ng1_first_step` (the first step whose widths differ) |
+| NG2 | CG with the device mask not written after the capture | MUST differ first at `ng2_first_step` (the first step whose activity differs) |
+| T | median ms per step of CE, CF, CG | REPORT |
 
-Size: B 8, S0 16128, deltas 0,1,17,63,64,65,777,4097, 192 steps (every
-request crosses at least two block boundaries), p-active 0.7, seed 6.
+Exit: the number of failed MUST gates (at most 19); 20 refused; 30 an exception
+outside an arm. Size: B 8, S0 16128, deltas 0,1,17,63,64,65,777,4097, 192
+steps, warm-up 2, p-active 0.7, seed 6.
 
-Step script (committed now; it STOPs until the gate file is tracked at the
-pinned sha):
+CPU proof (`tests/test_r2_capture_step.py`). A tiny fake NOSA model on the CPU
+(B 4, two layers) uses torch stand-ins for the CUDA ops; both paths get the
+same stand-ins.
+
+- S1: CF == CE on every request, every step and the final digests; 80 ragged
+  steps across block boundaries; refusal bits 0; no pointer moves.
+- S2 / S3: NG1 and NG2 first differ exactly at the gate's predicted steps.
+- S4: a driver without `finish_step` differs at step 1.
+- S5: a rebound buffer is named by the pointer check.
+- S6: the gate's pure parts.
+
+The capture and the replay themselves need the GPU.
+
+Step script:
 
     DRYRUN=1 bash benchmarks/Efficiency/r2_capture_step.sh --nosi <sha> <holder job> <run id>
     bash benchmarks/Efficiency/r2_capture_step.sh --nosi <sha> <holder job> <run id>
@@ -194,7 +246,7 @@ It is the pattern of `r2_ragged_step.sh`:
 
 ## CPU command (inside a CPU job)
 
-    env NOSI_REPO=/mnt/beegfs/ojerbi/nosi-r2-m2-capture python -m pytest -q tests/test_r2_capture.py tests/test_r2_positional_twin.py tests/test_r2_decode_body.py tests/test_r2_writeback.py tests/test_r2_engine_findings.py
+    env NOSI_REPO=/mnt/beegfs/ojerbi/nosi-r2-m2-capture python -m pytest -q tests/test_r2_capture.py tests/test_r2_capture_step.py tests/test_r2_positional_twin.py tests/test_r2_decode_body.py tests/test_r2_writeback.py tests/test_r2_engine_findings.py
 
 and C's `benchmarks/Efficiency/tests_cpu` (R1 / R2 / R7 inspect and run the
 unchanged `step()`).
