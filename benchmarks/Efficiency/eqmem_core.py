@@ -491,3 +491,194 @@ def comparison(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                     sp["%s_vs_%s" % (f, ref)] = bv[f] / bv[ref] - 1.0
         out["speedup_" + key] = sp
     return out
+
+
+# ================================================================================================================
+# v2 (2026-10-20): per-step timings, host memory, capacity scans, the agreement reference
+# ================================================================================================================
+P_MAX = 160
+
+
+def expand_cells(text: str) -> List[Cell]:
+    """A cell LIST: comma-separated items, each one of
+         original | cached:<P> | spec:<K>[:<R>]          (parse_cell)
+         cached:<P1>/<P2>/...                            a capacity scan over the listed pools
+         scan:<LO>-<HI>:<STEP>                           a capacity scan cached:LO, LO + STEP, ..., <= HI
+    Pools in [1, P_MAX]. Refuses (ValueError) an empty list, a malformed item and a cell named twice."""
+    cells: List[Cell] = []
+    for item in [x.strip() for x in text.split(",") if x.strip()]:
+        if item.startswith("scan:"):
+            m = item[5:].split(":")
+            try:
+                lo, hi = [int(x) for x in m[0].split("-")]
+                step = int(m[1])
+            except (ValueError, IndexError):
+                raise ValueError("scan %r: expected scan:<LO>-<HI>:<STEP>" % item)
+            if len(m) != 2 or step < 1 or not (1 <= lo <= hi <= P_MAX):
+                raise ValueError("scan %r: need 1 <= LO <= HI <= %d and STEP >= 1" % (item, P_MAX))
+            cells += [Cell("cached", P=p) for p in range(lo, hi + 1, step)]
+        elif item.startswith("cached:") and "/" in item:
+            try:
+                ps = [int(x) for x in item[7:].split("/")]
+            except ValueError:
+                raise ValueError("cached list %r: expected cached:<P1>/<P2>/..." % item)
+            cells += [parse_cell("cached:%d" % p) for p in ps]
+        else:
+            cells.append(parse_cell(item))
+    if not cells:
+        raise ValueError("an empty cell list")
+    for c in cells:
+        if c.family == "cached" and not (1 <= c.P <= P_MAX):
+            raise ValueError("pool %d outside [1, %d]" % (c.P, P_MAX))
+    names = [c.name for c in cells]
+    dup = sorted(n for n in set(names) if names.count(n) > 1)
+    if dup:
+        raise ValueError("cells named twice: %s" % dup)
+    return cells
+
+
+def split_step_windows(window_vals: Sequence[float], marks: Sequence[int], per_step: int) -> List[float]:
+    """Per-step sums of the decode_update windows (or of their load counts). window_vals: one value per window, in
+    launch order; marks[i] = the number of windows recorded before step i, marks[-1] = after the last step. The marks
+    must cover every window (marks[0] == 0, marks[-1] == len(window_vals)) and every step must hold exactly `per_step`
+    windows (one per layer: each step's offloading update runs once per layer); anything else is refused (ValueError),
+    so a window is never charged to the wrong step or dropped."""
+    if len(marks) < 2 or marks[0] != 0 or marks[-1] != len(window_vals):
+        raise ValueError("marks %s ... %s do not cover the %d windows" % (list(marks)[:2], list(marks)[-1:], len(window_vals)))
+    out = []
+    for i in range(len(marks) - 1):
+        a, b = int(marks[i]), int(marks[i + 1])
+        if b - a != per_step:
+            raise ValueError("step %d holds %d windows, expected %d" % (i, b - a, per_step))
+        out.append(float(sum(window_vals[a:b])))
+    return out
+
+
+def rewarm_unit_windows(window_vals: Sequence[float], n_rewarm: int, per_step: int, leading_steps: int = 1) -> List[float]:
+    """spec cells: the probe's decode_update windows come from the shipped steps only: the pilot's warm-up step(s)
+    (`leading_steps`, not units of the record) and then one step per re-warm round, in order. Returns the per-re-warm-
+    round sums (split_step_windows' refusals apply: every window covered, `per_step` per step)."""
+    marks = [k * per_step for k in range(leading_steps + n_rewarm + 1)]
+    return split_step_windows(window_vals, marks, per_step)[leading_steps:]
+
+
+def step_record(step_ms: Sequence[float], wait_ms: Sequence[float], blocks: Sequence[float], rewarm: Sequence[int],
+                unit: str = "step", tokens: Optional[Sequence[float]] = None, wait_label: str = "decode_update windows",
+                tol_ms: float = 0.05) -> Dict[str, Any]:
+    """The compact per-unit record of a cell's decode (eqmem_bench writes it to steps.json; result.json keeps the
+    summary): per unit the total GPU ms (events around the step / round), the data-wait ms inside it, the rest
+    (total - wait), the blocks fetched, the re-warm flag (0/1), the tokens committed per request. Refuses unequal
+    lengths and a unit whose wait exceeds its total by more than tol_ms (the windows are recorded inside the unit's
+    events). Summary: totals, the re-warm units, and the STEADY units (no re-warm): mean / median / p90 of total, wait
+    and rest, the wait share."""
+    n = len(step_ms)
+    tokens = list(tokens) if tokens is not None else [1.0] * n
+    if not (len(wait_ms) == len(blocks) == len(rewarm) == len(tokens) == n) or n == 0:
+        raise ValueError("step_record: lengths %s" % [len(step_ms), len(wait_ms), len(blocks), len(rewarm), len(tokens)])
+    over = [i for i in range(n) if wait_ms[i] > step_ms[i] + tol_ms]
+    if over:
+        raise ValueError("step_record: wait above the total in %d units (first %d: %.3f > %.3f ms)"
+                         % (len(over), over[0], wait_ms[over[0]], step_ms[over[0]]))
+    rest = [s - w for s, w in zip(step_ms, wait_ms)]
+    steady = [i for i in range(n) if not rewarm[i]]
+
+    def stats(xs):
+        xs = sorted(xs)
+        if not xs:
+            return None
+        return dict(mean=sum(xs) / len(xs), median=pctl(xs, 50), p90=pctl(xs, 90), n=len(xs))
+
+    r4 = lambda xs: [round(float(x), 4) for x in xs]
+    summary = dict(unit=unit, n=n, total_ms=sum(step_ms), wait_ms=sum(wait_ms), rest_ms=sum(rest), blocks=sum(blocks),
+                   tokens=sum(tokens), wait_share=(sum(wait_ms) / sum(step_ms)) if sum(step_ms) > 0 else None,
+                   rewarm_units=n - len(steady), rewarm_ms=sum(step_ms[i] for i in range(n) if rewarm[i]),
+                   steady_total=stats([step_ms[i] for i in steady]), steady_wait=stats([wait_ms[i] for i in steady]),
+                   steady_rest=stats([rest[i] for i in steady]),
+                   steady_wait_share=(sum(wait_ms[i] for i in steady) / sum(step_ms[i] for i in steady)) if steady else None,
+                   wait_label=wait_label)
+    return dict(unit=unit, n=n, step_ms=r4(step_ms), wait_ms=r4(wait_ms), rest_ms=r4(rest),
+                blocks=[int(round(b)) for b in blocks], rewarm=[int(bool(x)) for x in rewarm], tokens=r4(tokens),
+                summary=summary)
+
+
+def parse_proc_status(text: str) -> Dict[str, Optional[int]]:
+    """VmRSS / VmHWM / VmPin / VmLck (kB) from the text of /proc/self/status; None when a field is absent."""
+    out: Dict[str, Optional[int]] = dict(VmRSS=None, VmHWM=None, VmPin=None, VmLck=None)
+    for line in text.splitlines():
+        k, _, v = line.partition(":")
+        if k in out:
+            parts = v.split()
+            if len(parts) == 2 and parts[1] == "kB":
+                out[k] = int(parts[0])
+    return out
+
+
+def host_record(samples: Sequence[Dict[str, Any]], status_end: Dict[str, Optional[int]], ru_maxrss_kb: Optional[int],
+                pinned_kv_bytes: int) -> Dict[str, Any]:
+    """The process's host memory (GB = 1e9 B): rss_peak_gb (VmHWM at the end: the peak resident set, pinned pages
+    included once touched), ru_maxrss_gb (getrusage, the same peak by another counter), pinned_kv_gb (the engines' host
+    K / V buffers, pinned, from their sizes), vm_pin_gb (VmPin, when the kernel reports it), rss_samples (VmRSS at the
+    labelled points). The peak is refused when absent (a Linux /proc is required)."""
+    if status_end.get("VmHWM") is None:
+        raise ValueError("host_record: no VmHWM in /proc/self/status")
+    kb = 1e3 / 1e9
+    return dict(rss_peak_gb=status_end["VmHWM"] * kb, rss_end_gb=(status_end.get("VmRSS") or 0) * kb,
+                ru_maxrss_gb=(ru_maxrss_kb * kb) if ru_maxrss_kb is not None else None,
+                pinned_kv_gb=pinned_kv_bytes / 1e9,
+                vm_pin_gb=(status_end["VmPin"] * kb) if status_end.get("VmPin") is not None else None,
+                rss_samples=[dict(label=s["label"], rss_gb=s.get("host_rss_gb")) for s in samples],
+                source="/proc/self/status VmHWM / VmRSS / VmPin; resource.getrusage ru_maxrss; the engines' _k_cpu / _v_cpu sizes")
+
+
+def agreement_reference(entries: Sequence[Tuple[str, int, str, bool]], cell: str = "original") -> Optional[Tuple[str, int]]:
+    """(cell, rep) of the FIRST COMPLETED repetition of `cell`: the lowest rep whose status is done and whose tokens
+    were written. entries: (cell, rep, status, has_tokens). None when no repetition of the cell completed."""
+    reps = sorted(r for c, r, s, t in entries if c == cell and s == "done" and t)
+    return (cell, reps[0]) if reps else None
+
+
+def first_completed(entries: Sequence[Tuple[str, int, str, bool]]) -> Dict[str, int]:
+    """Per cell, the lowest completed repetition (status done, tokens written)."""
+    out: Dict[str, int] = {}
+    for c, r, s, t in entries:
+        if s == "done" and t and (c not in out or r < out[c]):
+            out[c] = r
+    return out
+
+
+def capacity_scan(results: Sequence[Dict[str, Any]], key: str = "decode_tok_s") -> Dict[str, Any]:
+    """The cached capacity scan on MEASURED cells: per pool P (VALID repetitions, no error) the mean of `key` and of
+    e2e tokens / s, the batch, the transferred bytes per token; the measured best P; whether it is INTERIOR (a smaller
+    and a larger measured pool exist, both lower) or at an EDGE of the scan (then the optimum may lie outside: extend
+    the scan); the original (P = 0) as the reference row."""
+    rows: Dict[int, Dict[str, Any]] = {}
+    for r in results:
+        if r.get("family") not in ("cached", "original") or r.get("error") or r.get("memory", {}).get("verdict") != "VALID":
+            continue
+        P = 0
+        if r["family"] == "cached":
+            P = r.get("plan", {}).get("P")
+            P = int(P) if P is not None else int(r["cell"].split("cached_p", 1)[1])
+        row = rows.setdefault(P, dict(P=P, cell=r["cell"], vals=[], e2e=[], batch=r["metrics"]["batch"], bpt=[]))
+        row["vals"].append(r["metrics"][key])
+        row["e2e"].append(r["metrics"]["e2e_tok_s"])
+        row["bpt"].append(r["metrics"]["transferred"]["bytes_per_committed_token"])
+    table = []
+    for P in sorted(rows):
+        x = rows[P]
+        table.append(dict(P=P, cell=x["cell"], reps=len(x["vals"]), batch=x["batch"], **{key: mean(x["vals"])},
+                          e2e_tok_s=mean(x["e2e"]), bytes_per_committed_token=mean(x["bpt"])))
+    cached = [t for t in table if t["P"] > 0]
+    out = dict(key=key, table=table, best=None, position=None)
+    if not cached:
+        return out
+    best = max(cached, key=lambda t: t[key])
+    lower = [t for t in cached if t["P"] < best["P"]]
+    upper = [t for t in cached if t["P"] > best["P"]]
+    out["best"] = dict(P=best["P"], cell=best["cell"], value=best[key], batch=best["batch"])
+    out["position"] = "interior" if lower and upper else ("edge_low" if not lower and upper else
+                                                          "edge_high" if lower and not upper else "single")
+    ref = next((t for t in table if t["P"] == 0), None)
+    if ref and ref[key]:
+        out["best_vs_original"] = best[key] / ref[key] - 1.0
+    return out

@@ -25,9 +25,14 @@
 # claim leaves it (the lead decides). Exit: the step's exit (eqmem_bench: 0 VALID, 1 error or OVER_BUDGET, 2 out
 # exists, 3 another GPU, 4 refused, 6 module origin; 124 / 137 the host timeout); 1 a STOP before the launch; 5 an
 # exit-0 step whose record is incomplete or whose sacct row is not COMPLETED 0:0.
+# v2 (2026-10-20): the GPU uuid of the holder is read from HOLDERS/<holder job>.gpu_uuid (written read-only by the lead
+# after an nvidia-smi check in that holder; the uuid without the GPU- prefix); a missing or malformed file STOPS before
+# anything is claimed; the step's child still checks the visible GPU against it. A capacity scan (cached:P1/P2/... or
+# scan:LO-HI:STEP) is one invocation per pool: eqmem_bench.py --mode plan --cells <list> --step-nosi/--step-holder/
+# --step-run [--step-reps] prints the step commands.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-eqmem-fix                                                   # ROOT (feature/nosi-equal-memory-fix: the slot-map fix)
-GPU_UUID=f31fc723-9dfe-407a-9947-28173556232a                                            # PIN (holder 2188818)
+NOSI=/mnt/beegfs/ojerbi/nosi-eqmem-v2                                                    # ROOT (feature/nosi-equal-memory-v2)
+HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (<job>.gpu_uuid, lead-written)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
 MODEL=/mnt/beegfs/ojerbi/models/NOSA-8B                                                  # ROOT
@@ -40,6 +45,14 @@ OUTROOT=/mnt/beegfs/ojerbi/eqmem-runs                                           
 SELF=benchmarks/Efficiency/eqmem_step.sh
 N=512 MARGIN=1.0 SPLITS=0 R_SLOTS=62
 MIN_LEFT=7200
+read_holder_uuid() {      # $1 = the holders directory, $2 = the holder job id; prints the uuid, or STOPS (exit 1)
+    local f=$1/$2.gpu_uuid u=
+    [ -f "$f" ] || { echo "eqmem step: STOP: no $f (the lead writes it after an nvidia-smi check in holder $2)" >&2; exit 1; }
+    IFS= read -r u < "$f" || [ -n "$u" ] || { echo "eqmem step: STOP: $f is empty" >&2; exit 1; }
+    [[ $u =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+        || { echo "eqmem step: STOP: $f holds '$u', not a uuid without the GPU- prefix" >&2; exit 1; }
+    printf '%s\n' "$u"
+}
 main() {
 stop() { echo "eqmem step: STOP: $*" >&2; exit 1; }
 usage() { echo "usage: eqmem_step.sh --nosi <sha> <holder> <run id> <budget GB> <original|cached:P|spec:K|report> [<rep>]" >&2
@@ -49,6 +62,7 @@ NSHA=$2 JOB=$3 RUN=$4 BUDGET=$5 CELL=$6 REP=${7:-0}
 DRY=${DRYRUN:-0}
 [[ $NSHA =~ ^[0-9a-f]{40}$ ]] || stop "--nosi '$NSHA' is not a full commit id"
 case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
+GPU_UUID=$(read_holder_uuid "$HOLDERS" "$JOB") || exit 1
 [[ $RUN =~ ^[a-z0-9]{1,16}$ ]] || stop "run id '$RUN' (1-16 of a-z 0-9)"
 [[ $BUDGET =~ ^[0-9]{2}(\.[0-9])?$ ]] || stop "budget '$BUDGET' (GB, e.g. 75 or 72.5)"
 case $REP in [0-9]) ;; *) stop "rep '$REP' (0-9)" ;; esac
