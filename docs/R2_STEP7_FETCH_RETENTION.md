@@ -385,11 +385,25 @@ with real selections; FG3 the packer's sustained rate (4.9) against the tick's d
   copies and one device-to-host read; per layer: none.
 - Tests: F14 (the delta-maintained mirror equals the full scan, `VerifyMirror.refresh`, at every layer and in every
   field at the start of every tick of F6's schedule and of F12b's pressure schedule; deltas smaller than the table);
-  F14c negative controls (a delta that drops one transition kind: take, admit, admit_vres, release, free; caught at the
-  start of a later tick, before any decision reads it); F14b (an owner change with a transfer in flight that the
-  device already holds; negative: the owner change dropped); F12d extended (no host-to-device copy in the per-layer
-  path; S-B's resolve and the full-scan refresh are caught). F12 / F12b now run on the delta mirror and count one row
-  copy and at most one mirror copy per tick.
+  F14c negative controls, one per transition kind (take, admit, release, admit_vres, free), each with its PRECONDITION
+  asserted first on the run without the drop: in some closed sync interval a slot is changed by that kind ONLY (a
+  test-side trace of the journal and the owner marks per sync interval); then the run with that kind dropped from the
+  delta must leave the device mirror unequal to the full scan; F14b (an owner change with a transfer in flight that
+  the device already holds; precondition: the owner change is the slot's only change; negative: the owner change
+  dropped); F12d extended (no host-to-device copy in the per-layer path; S-B's resolve and the full-scan refresh are
+  caught). F12 / F12b now run on the delta mirror and count one row copy and at most one mirror copy per tick.
+- WHY admit_vres AND free NEED THEIR OWN SCENARIOS (job 2190925: their F6 controls were not caught). A dropped kind can
+  leave a stale record only when it is the slot's only change between two syncs; any other change of the slot in the
+  same interval sends the slot's CURRENT record anyway. (1) admit_vres: only a transfer whose demand is {verify} alone
+  is admitted VRES, and that is only a verifier urgent transfer (a draft transfer always carries "draft"). S-C takes it
+  at end_tick and admits it at the very next poll (it landed in place), and S-C's own sync is at the next tick's first
+  resolve, after that poll: so in S-C's own schedule its take and its arrival are ALWAYS in one interval, and a dropped
+  admit_vres cannot leave a stale record. The control (_scn_split) therefore syncs between end_tick and the poll (an
+  urgent block that no draft row merges, its key still protecting it at the arrival). (2) free: a slot frees in the
+  poll that sees its last reader complete. In F6's 24 ticks no free was a slot's only change in an interval (job
+  2190925); the likely reason: the released slots' last readers had already completed, so the release and the free
+  fell into one interval (not traced). The control (_scn_late_reader) releases a slot whose last reader (a
+  verify read) is still pending, syncs while it is RELEASING, then completes the reader so that the next poll frees it.
 
 ## 13. Open questions
 
