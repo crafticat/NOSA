@@ -650,9 +650,12 @@ class CacheEngine:
         (each request writes at its own position; after ITS rollover into
         mirror W-1), (B) plan_draft_perreq (T_b, rolled_b, forbid_ge = T_b),
         (C) the same side-stream gathers as spec_draft_update, (D)
-        apply_draft_bias_perreq (the tail / mirror row limits per request).
-        key_states / value_states (B, 1, H, D). Returns the whole allocation,
-        the masked bias scratch and cache_seqlens = W * block_size."""
+        apply_draft_bias_perreq (the tail / mirror row limits per request;
+        with ctx.f4 = "shipped", the default, a request whose write filled its
+        tail block, p % bs == bs - 1, gets its whole tail slot masked: findings
+        F4, spec_loop.py F4 PARITY). key_states / value_states (B, 1, H, D).
+        Returns the whole allocation, the masked bias scratch and
+        cache_seqlens = W * block_size."""
         B, S, H, D = key_states.shape
         assert S == 1 and H == self.head_num and D == self.head_dim, (tuple(key_states.shape), self.head_num, self.head_dim)
         assert self.verify_round_slots > 0 and self.pool_blocks == 0, "the loop needs NOSI_VERIFY_ROUND_SLOTS > 0 and no victim pool"
@@ -661,6 +664,7 @@ class CacheEngine:
         lay = st.lay
         assert lay.W * self.block_size == self._k_gpu.shape[1] and lay.tail_slot == self._tail_block_idx_on_gpu, (lay, tuple(self._k_gpu.shape))
         assert topk_idx.dtype == torch.int64 and tuple(topk_idx.shape[:2]) == (H, B), (topk_idx.dtype, tuple(topk_idx.shape))
+        f4_shipped = _sl.check_f4_mode(ctx.f4) == _sl.F4_SHIPPED
         # A. the tail write, per request
         _sl.draft_tail_write_perreq(self, key_states, value_states, _bias_rows(kv_bias), lay.mirror_hi, ctx.tail_id)
         tail_len, rolled = _sl.draft_tail_state(self._pos, ctx.tail_id, self.block_size)
@@ -681,7 +685,8 @@ class CacheEngine:
         ctx.queue.push(ctx.gen, ev_side)
         # D. the bias the draft attends with, per request
         scratch, deny_buf = ctx.bias_scratch(layer_idx, self._kv_bias_gpu)
-        _sl.apply_draft_bias_perreq(scratch, self._kv_bias_gpu, plan.deny, deny_buf, lay, self.block_size, tail_len, rolled)
+        f4 = _sl.f4_steps(self._pos - 1, self.block_size) if f4_shipped else None    # _pos - 1: the position just written
+        _sl.apply_draft_bias_perreq(scratch, self._kv_bias_gpu, plan.deny, deny_buf, lay, self.block_size, tail_len, rolled, f4=f4)
         self._spec_last_draft = plan
         return self._k_gpu, self._v_gpu, scratch, ctx.full_lengths(B, self._kv_bias_gpu.device)
 
@@ -695,8 +700,12 @@ class CacheEngine:
         gives it its store back, fetches nothing for it and gives its mask rows a
         finite placeholder; ctx.round_bad marks its request, which commits
         nothing this round (the per-request overflow fallback; the pilot then
-        runs one K = 0 round). One host sync, the overflow / invalid read, as
-        in spec_round_update."""
+        runs one K = 0 round). With ctx.f4 = "shipped" (the default) the mask
+        rows of the positions p % bs == bs - 1 name no tail mirror
+        (spec_loop.drop_tail_on_f4: findings F4, the shipped decode skips the
+        tail block at that step); applied before the isolation, so a bad
+        stream keeps its finite placeholder. One host sync, the overflow /
+        invalid read, as in spec_round_update."""
         B, U, H, D = key_states.shape
         assert H == self.head_num and D == self.head_dim and U >= 1, (tuple(key_states.shape), self.head_num, self.head_dim)
         assert tuple(value_states.shape) == (B, U, H, D), (tuple(value_states.shape), (B, U, H, D))
@@ -709,11 +718,14 @@ class CacheEngine:
         assert (lay_u.W, lay_u.mirror_lo, lay_u.tail_slot) == (lay.W, lay.mirror_lo, lay.tail_slot), (lay_u, lay)
         assert self._k_gpu.shape[1] == lay.W * self.block_size and self._tail_block_idx_on_gpu == lay.tail_slot
         assert torch.equal(self._pos, ctx.tail0.pos), "the draft's counters were not restored before the verify"
+        f4_shipped = _sl.check_f4_mode(ctx.f4) == _sl.F4_SHIPPED
         tail = _sl.write_tail_perreq(self, key_states, value_states, _bias_rows(kv_bias), lay.mirror_lo)
         self._spec_round_tail = tail
         ctx.mark("tail_end")
         before = _sl.store_layer_copy(st, layer_idx)
         plan = _sl.plan_round_perreq(st, layer_idx, sel, tail.tail_id, tail.rollover_at, ctx.gen_round0, ctx.next_gen(), ctx.tick, ctx.was_inflight[layer_idx])
+        if f4_shipped:                                       # tail.ctr[:U] = pos0 + u: the positions the U tokens write
+            plan = plan._replace(mask=_sl.drop_tail_on_f4(plan.mask, _sl.f4_steps(tail.ctr[:U], self.block_size), lay))
         bad = plan.overflow | plan.invalid
         ctx.host_syncs += 1
         ctx.mark("host_sync")

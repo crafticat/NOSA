@@ -18,6 +18,15 @@
       every draft prefetch lands in the slot the plan names and slot 63 is untouched (negative control: the pre-fix map
       misplaces blocks); FX2 the maps are contiguous, and the verify's fetch already was before the fix (the reach);
       FX3 both gather wrappers refuse a non-contiguous map. MP3b: replay_deterministic compares two replays.
+  F4  findings F4 parity (added 2026-10-20 after run p2: every above-tolerance identity mismatch was at p % 64 == 63,
+      where the shipped decode attends rows [0, 4032) only). The rows the shipped decode attends are written down from
+      the shipped lines (_shipped_tail_rows / _shipped_reads). F4V1: for every (request, position, KV head) of a
+      ragged round with F4 positions at u = 0, 2, 3 and of a U = 1 round, the per-request verify (default f4 =
+      "shipped") reads exactly those positions; NEGATIVE CONTROL f4 = "fixed": the F4 positions read the tail block
+      more, nothing else differs. F4D1: the same for the draft's bias (the tail block rows it leaves visible).
+      F4R1: a bad mode is refused before anything changes; the F4 drop runs before the overflow isolation. F4P1:
+      the pilot's NOSI_SPEC_F4 defaults to "shipped", is recorded in the cell and shown in the report.
+      EP1 / EP5 compare against the LOCKSTEP bodies, which read the tail block at an F4 step: they run f4 = "fixed".
   PL  the pilot's host side: perreq_keep and PerReqLoop (ragged sequences, finished requests stop committing, the K = 0
       fallback, refusals), aggregate_rounds_perreq (the measured yield), the report's gates for a per-request cell.
   AN  benchmarks/Efficiency/r2_payload_analysis.py on a synthetic payload.
@@ -245,16 +254,17 @@ class _Null:
 
 class Uni:
     """One batch of NL layers: engines with the bound spec bodies, twins, one store, a context; per-request or
-    lockstep."""
+    lockstep. ``f4``: the per-request context's F4 mode (None: the context's default, "shipped")."""
 
-    def __init__(self, pos, rids, seed, n_max, perreq, NL=1, ns_base=None):
+    def __init__(self, pos, rids, seed, n_max, perreq, NL=1, ns_base=None, f4=None):
         self.B, self.NL, self.perreq = len(pos), NL, perreq
         self.engines = [_engine(pos, rids, seed, l, n_max, perreq, ns_base) for l in range(NL)]
         self.twins = [_tables(pos, rids, seed, l, n_max) for l in range(NL)]
         self.store = sl.Store(NL, H, self.B, LAY)
         cls = sl.PerReqSpecContext if perreq else sl.SpecContext
+        kw = dict(f4=f4) if (perreq and f4 is not None) else {}
         self.ctx = cls(self.store, side=_Side(), make_event=FakeEvent, current_stream=lambda: "main",
-                       stream_ctx=lambda s: _Null(), num_layers=NL, block_size=BS, kernel_size=32, kernel_stride=16)
+                       stream_ctx=lambda s: _Null(), num_layers=NL, block_size=BS, kernel_size=32, kernel_stride=16, **kw)
         tick = self.ctx.next_tick()
         for l, e in enumerate(self.engines):
             self.store.sync_window(l, e._block_map, tick)
@@ -461,10 +471,13 @@ def _first_diff(da, db):
 # EP: the engine methods
 # ===========================================================================
 def test_EP1_two_ragged_rounds_through_the_engine_bodies_equal_B1_lockstep_runs():
+    """f4 = "fixed": the LOCKSTEP bodies read the tail block at a findings-F4 step (p % 64 == 63; this batch has such
+    steps), so the per-request run they equal bit for bit is the fixed one. F4V1 / F4D1 tie the default mode
+    ("shipped") to the shipped decode and to this run."""
     pos = [9 * BS + 61, 10 * BS + 3, 9 * BS + 63, 11 * BS + 0]
     K, U, B, NL = 3, 4, 4, 2
     n_max = max(pos) + 4 * U + 2 * BS
-    P = Uni(pos, list(range(B)), 21, n_max, perreq=True, NL=NL)
+    P = Uni(pos, list(range(B)), 21, n_max, perreq=True, NL=NL, f4="fixed")
     refs = [Uni([pos[b]], [b], 21, n_max, perreq=False, NL=NL) for b in range(B)]
     cov = Counter()
     for r, nacc in enumerate(([0, 3, 1, 2], [3, 0, 2, 1])):
@@ -514,11 +527,11 @@ def test_EP5_a_rollback_across_a_block_boundary_restores_slot_63_and_leaves_no_s
     verify fills it at token 1 and writes tokens 2, 3 into block 10 (slot 63 rows 0, 1), and the commit keeps ONE
     token: pos 639, block 9 live again. Slot 63's rows [0, 62) are the round-start rows again (the masked restore),
     row 62 is the kept token, the map's tail column is 9, and no store slot names block 9 or 10. The next round runs
-    from there and equals the B = 1 lockstep run."""
+    from there and equals the B = 1 lockstep run. f4 = "fixed", as in EP1 (request 0's round has an F4 step)."""
     pos = [9 * BS + 62, 10 * BS + 5]
     K, U, B, NL = 3, 4, 2, 2
     n_max = max(pos) + 3 * U + 2 * BS
-    P = Uni(pos, [0, 1], 23, n_max, perreq=True, NL=NL)
+    P = Uni(pos, [0, 1], 23, n_max, perreq=True, NL=NL, f4="fixed")
     refs = [Uni([pos[b]], [b], 23, n_max, perreq=False, NL=NL) for b in range(B)]
     ts = LAY.tail_slot * BS
     rows0 = [e._k_gpu[0, ts:ts + 62].clone() for e in P.engines]
@@ -744,6 +757,226 @@ def test_EP4_the_lockstep_and_per_request_bodies_refuse_each_others_engines():
         L.engines[0].spec_round_update_perreq(k, v, L.twins[0].total_cis, sel.unsqueeze(0), P.ctx, 0)
     with pytest.raises(AssertionError):                    # a commit without a round
         P.engines[0].spec_commit_perreq(P.twins[0], torch.zeros((2, 4, 2), dtype=torch.int64), torch.ones(2, dtype=torch.int64), LAY.mirror_lo)
+
+
+# ===========================================================================
+# F4: findings F4 parity (docs/R2_ENGINE_FINDINGS.md F4; run p2: every above-tolerance identity mismatch was at
+# p % 64 == 63). The shipped decode's attended rows are written down from the shipped lines, and the per-request
+# draft and verify are checked against them, position by position.
+# ===========================================================================
+MASKV = torch.tensor(sl.MASK_BIAS, dtype=EDT)
+
+
+def _shipped_tail_rows(p):
+    """Rows of the tail slot the SHIPPED decode attends at the step that writes position p: the cache_engine.py
+    lines that set _cache_lens (pinned by tests/test_r2_engine_findings.py), mirrored."""
+    tail_len = p % BS                                   # _tail_block_len_on_gpu before the step
+    cache_lens = (TOPK - 1) * BS + tail_len             # :327 / the previous step's value
+    cache_lens += 1                                     # :346
+    tail_len += 1                                       # :357
+    if tail_len == BS:                                  # :359 tail_full -> section D
+        tail_len = 0                                    # :408
+        cache_lens = (TOPK - 1) * BS + tail_len         # :409, returned at :412: findings F4
+    return cache_lens - (TOPK - 1) * BS
+
+
+def _shipped_reads(p, sel_row):
+    """Absolute positions the SHIPPED decode attends at the step that writes p, for one (KV head, request): slots
+    0 .. topk-2 hold the selection's blocks other than the tail block p // 64 (all rows: diff_offload maps them there),
+    slot topk-1 holds the tail block, of which rows [0, _shipped_tail_rows(p)) are below cache_seqlens."""
+    T = p // BS
+    out = {x * BS + r for x in sel_row if x >= 0 and x != T for r in range(BS)}
+    return out | {T * BS + r for r in range(_shipped_tail_rows(p))}
+
+
+def _f4_sel(g, pos0, n):
+    """(n, H, B, KSEL) selections for positions pos0_b + w, as the model's forced local window makes them: the live
+    tail block p // 64, the round-start block T_b when p is already in T_b + 1, and 1 to 3 blocks of a per-(h, b) set of
+    3 host blocks < T_b; -1 padded. The union of a round fits the store (no overflow)."""
+    B = len(pos0)
+    sel = torch.full((n, H, B, KSEL), -1, dtype=torch.int64)
+    for b, p0 in enumerate(pos0):
+        T = p0 // BS
+        for h in range(H):
+            base = torch.randperm(T, generator=g)[:3].tolist()
+            for w in range(n):
+                p = p0 + w
+                ids = [p // BS] + ([T] if p // BS > T else []) + base[:1 + int(torch.randint(0, 3, (1,), generator=g))]
+                sel[w, h, b, :len(ids)] = torch.tensor(ids, dtype=torch.int64)
+    return sel
+
+
+def _f4_round(f4, pos, K, seed):
+    """One per-request round (K draft steps, the restore, the verify of U = K + 1 positions; no commit) on one layer
+    with the _f4_sel selections, in F4 mode ``f4``. Returns (universe, inputs, record, verify rounds)."""
+    B = len(pos)
+    n_max = max(pos) + 2 * (K + 1) + 2 * BS
+    P = Uni(pos, list(range(B)), seed, n_max, perreq=True, f4=f4)
+    assert P.ctx.f4 == f4
+    inp = _inputs(seed, 0, list(range(B)), P.pos(), K, [K] * B)
+    g = _g(seed, 77)
+    sd = _f4_sel(g, pos, K)
+    inp.sd = [[sd[j]] for j in range(K)]
+    inp.sv = [_f4_sel(g, pos, K + 1)]
+    rec = dict(draft=[], round=[], tails=[], tr=[])
+    _draft_and_restore_perreq(P, inp, rec)
+    rnds = _verify_perreq(P, inp, rec)
+    return P, inp, rec, rnds
+
+
+def _verify_reads(P, rnd, b, w, h):
+    """Absolute positions the Path-1 call reads for request b, position w, KV head h: build_varlen_args' mask row
+    b*U + w and seqused_k; the rows of every named slot below the causal limit seqused_k[b] - U + w + 1 (the kernel's
+    rule, verify_step.py docstring); a store slot holds block store.ids (RESIDENT), mirror_lo T_b, mirror_hi T_b + 1."""
+    e, U = P.engines[0], rnd.U
+    a = vs.build_varlen_args(torch.zeros((P.B * U, 4, D), dtype=EDT), e._k_gpu, e._v_gpu, e._kv_bias_gpu, rnd)
+    T = int(rnd.tail.tail_id[b])
+    lim = int(a.seqused_k[b]) - U + w + 1
+    out = set()
+    for s in a.topk_idx[h, b * U + w].tolist():
+        if s < 0:
+            continue
+        if s == LAY.mirror_lo:
+            blk = T
+        elif s == LAY.mirror_hi:
+            blk = T + 1
+        else:
+            assert int(P.store.state[0, h, b, s]) == sl.RESIDENT
+            blk = int(P.store.ids[0, h, b, s])
+        out |= {blk * BS + r for r in range(BS) if s * BS + r < lim}
+    return out
+
+
+F4_CASES = (([9 * BS + 63, 10 * BS + 61, 9 * BS + 60, 11 * BS + 10, 10 * BS + 0], 3),   # F4 at u = 0 (then T + 1), 2, 3 (last); none; none
+            ([9 * BS + 63, 10 * BS + 5], 0))                                            # the K = 0 fallback round (U = 1)
+
+
+def test_F4V1_the_verify_reads_what_the_shipped_decode_reads_at_every_position_and_the_fixed_mode_does_not():
+    """For every (request, position, KV head) of a round with F4 positions at u = 0, 2 and 3 (and of a U = 1 round),
+    the positions the per-request verify reads equal the positions the shipped decode attends at that step
+    (_shipped_reads, from the shipped lines: at p % 64 == 63 no row of the tail block). NEGATIVE CONTROL, f4 = "fixed":
+    each F4 position reads exactly the tail block more (positions [64 T_b, p]), every other position reads the same;
+    the two runs differ only in the mirror entries of the F4 rows of the mask (store, engine, twin, fetch, tail equal)."""
+    for pos, K in F4_CASES:
+        U = K + 1
+        runs = {m: _f4_round(m, pos, K, 131) for m in sl.F4_MODES}
+        f4_pos = [(b, w) for b in range(len(pos)) for w in range(U) if (pos[b] + w) % BS == BS - 1]
+        assert len(f4_pos) == (3 if K == 3 else 1)
+        for m, (P, inp, rec, rnds) in runs.items():
+            for b, p0 in enumerate(pos):
+                for w in range(U):
+                    p = p0 + w
+                    for h in range(H):
+                        got = _verify_reads(P, rnds[0], b, w, h)
+                        want = _shipped_reads(p, inp.sv[0][w, h, b].tolist())
+                        if m == sl.F4_SHIPPED or (b, w) not in f4_pos:
+                            assert got == want, (m, b, w, h, sorted(got ^ want)[:8])
+                        else:
+                            assert want <= got and got - want == set(range((p // BS) * BS, p + 1)), (m, b, w, h)
+        (Ps, _, rs, _), (Pf, _, rf, _) = runs[sl.F4_SHIPPED], runs[sl.F4_FIXED]
+        for b in range(len(pos)):
+            assert _first_diff(_state(Pf, b), _state(Ps, b)) is None, b
+        ms, mf = rs["round"][0].mask, rf["round"][0].mask
+        for f in ROUND_FIELDS:
+            assert torch.equal(getattr(rs["round"][0], f), getattr(rf["round"][0], f)), f
+        want_mask = mf.clone()
+        for b, w in f4_pos:
+            row = want_mask[:, b * U + w]
+            row[(row == LAY.mirror_lo) | (row == LAY.mirror_hi)] = -1
+        assert torch.equal(ms, want_mask) and not torch.equal(ms, mf) and ms.is_contiguous() and ms.dtype == torch.int32
+
+
+def test_F4D1_the_draft_masks_the_whole_tail_block_at_an_F4_step_and_the_fixed_mode_does_not():
+    """The DRAFT steps of the same round (position pos0_b + j; F4 at request 0 step 0 and request 1 step 2). The tail
+    rows the draft's bias leaves visible (slot topk-1: block T_b; mirror_hi: T_b + 1) equal the tail-block positions
+    the shipped decode attends at that step: none at an F4 step with f4 = "shipped". NEGATIVE CONTROL, f4 = "fixed":
+    at an F4 step the draft sees all 64 rows of T_b. The two runs' biases differ only there; every plan field is equal."""
+    pos, K = F4_CASES[0]
+    runs = {m: _f4_round(m, pos, K, 132) for m in sl.F4_MODES}
+    f4_steps = [(b, j) for b in range(len(pos)) for j in range(K) if (pos[b] + j) % BS == BS - 1]
+    assert f4_steps == [(0, 0), (1, 2)]
+    ts, hs = LAY.tail_slot * BS, LAY.mirror_hi * BS
+    tail_rows = torch.zeros(LAY.W * BS, dtype=torch.bool)
+    tail_rows[ts:ts + BS] = True
+    tail_rows[hs:hs + BS] = True
+    for m, (P, inp, rec, _) in runs.items():
+        for j in range(K):
+            bias = rec["draft"][j]["bias"]
+            for b, p0 in enumerate(pos):
+                T0, p = p0 // BS, p0 + j
+                for h in range(H):
+                    hidden = bias[b, :, h] == MASKV
+                    got = {T0 * BS + r for r in range(BS) if not bool(hidden[ts + r])}
+                    got |= {(T0 + 1) * BS + r for r in range(BS) if not bool(hidden[hs + r])}
+                    want = {x for x in _shipped_reads(p, inp.sd[j][0][h, b].tolist()) if x >= T0 * BS}
+                    if m == sl.F4_SHIPPED or (b, j) not in f4_steps:
+                        assert got == want, (m, b, j, h, sorted(got ^ want)[:8])
+                    else:
+                        assert want == set() and got == set(range(T0 * BS, (T0 + 1) * BS)), (m, b, j, h)
+    rs, rf = runs[sl.F4_SHIPPED][2], runs[sl.F4_FIXED][2]
+    for j in range(K):
+        bs_, bf_ = rs["draft"][j]["bias"], rf["draft"][j]["bias"]
+        assert torch.equal(bs_[:, ~tail_rows], bf_[:, ~tail_rows])
+        for b in range(len(pos)):
+            assert torch.equal(bs_[b], bf_[b]) == ((b, j) not in f4_steps), (b, j)
+        for f in PLAN_FIELDS:
+            assert torch.equal(getattr(rs["draft"][j]["plan"], f), getattr(rf["draft"][j]["plan"], f)), (j, f)
+
+
+def test_F4R1_the_mode_is_checked_before_anything_changes_and_the_wiring_order():
+    with pytest.raises(ValueError):
+        sl.check_f4_mode("junk")
+    with pytest.raises(ValueError):
+        Uni([9 * BS + 10], [0], 141, 12 * BS, perreq=True, f4="junk")
+    assert sl.F4_MODES == ("shipped", "fixed") and Uni([9 * BS + 10], [0], 141, 12 * BS, perreq=True).ctx.f4 == "shipped"
+    pos = [9 * BS + 63, 10 * BS + 5]
+    P = Uni(pos, [0, 1], 141, max(pos) + 4 * BS, perreq=True)
+    e, t, ctx = P.engines[0], P.twins[0], P.ctx
+    ctx.begin_round(P.view)
+    ctx.was_inflight = torch.zeros_like(P.store.state, dtype=torch.bool)
+    ctx.f4 = "junk"
+    snap = {n: getattr(e, n).clone() for n in ("_k_gpu", "_v_gpu", "_kv_bias_gpu", "_k_cpu", "_pos", "_block_map", "_cache_lens")}
+    store0 = sl.store_layer_copy(P.store, 0)
+    g = _g(141)
+    with pytest.raises(ValueError):
+        e.spec_draft_update_perreq(_ints((2, 1, H, D), g), _ints((2, 1, H, D), g), t.total_cis, _f4_sel(g, pos, 1)[0], ctx, 0)
+    with pytest.raises(ValueError):
+        e.spec_round_update_perreq(_ints((2, 2, H, D), g), _ints((2, 2, H, D), g), t.total_cis, _f4_sel(g, pos, 2), ctx, 0)
+    for n, v in snap.items():
+        assert torch.equal(getattr(e, n), v), n
+    for n, v in store0.items():
+        assert torch.equal(getattr(P.store, n)[0], v), n
+    with pytest.raises(ValueError):                        # a mask and a flag table that do not agree
+        sl.drop_tail_on_f4(torch.zeros((H, 6, KSEL), dtype=torch.int32), torch.zeros((2, 2), dtype=torch.bool), LAY)
+    src_d, src_r = _method_src("spec_draft_update_perreq"), _method_src("spec_round_update_perreq")
+    assert src_d.index("_sl.check_f4_mode(ctx.f4)") < src_d.index("_sl.draft_tail_write_perreq(") < src_d.index("f4=f4)")
+    assert (src_r.index("_sl.check_f4_mode(ctx.f4)") < src_r.index("_sl.write_tail_perreq(") < src_r.index("_sl.plan_round_perreq(")
+            < src_r.index("_sl.drop_tail_on_f4(") < src_r.index("_sl.isolate_bad_streams("))   # a bad stream keeps its placeholder
+
+
+def test_F4P1_the_pilot_knob_defaults_to_shipped_parity_is_recorded_and_shown(tmp_path, monkeypatch):
+    import json
+    assert pilot.F4 == "shipped" and pilot.F4_MODES == sl.F4_MODES
+    src = (ROOT / "benchmarks/Efficiency/spec_loop_pilot.py").read_text()
+    tree = ast.parse(src)
+    fns = {n.name: ast.get_source_segment(src, n) for n in tree.body if isinstance(n, ast.FunctionDef)}
+    arm = fns["run_spec_arm_perreq"]
+    assert "f4=F4)" in arm and "commit=\"perreq\", f4=ctx.f4," in arm
+    assert "f4=F4 if COMMIT == \"perreq\" else None" in fns["provenance"]
+    assert "if F4 not in F4_MODES:" in src and "die(\"NOSI_SPEC_F4=%r" in src
+    monkeypatch.setattr(pilot, "OUT", str(tmp_path))
+    monkeypatch.setenv("NOSI_SPEC_TAU_CTRL", "0.4844")
+    for f4, shown in (("shipped", "shipped"), (None, "-")):
+        for f in tmp_path.iterdir():
+            f.unlink()
+        p, ship = _payload(torch.zeros((2, 6), dtype=torch.int64))
+        p["cells"]["K2"]["seq"] = ship.clone()
+        if f4 is not None:
+            p["cells"]["K2"]["f4"] = f4
+        torch.save(p, str(tmp_path / "spec_sperreqb2d2.pt"))
+        assert pilot.report() == 0
+        assert "| spec_sperreqb2d2/K2 | %s | 2 |" % shown in (tmp_path / "spec_loop.md").read_text()
+        assert json.loads((tmp_path / "spec_loop.json").read_text())["perreq_cells"]["spec_sperreqb2d2/K2"]["f4"] == f4
 
 
 # ===========================================================================

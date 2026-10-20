@@ -44,7 +44,10 @@ PER-REQUEST ROUNDS (R2 milestone 2): the section at the end of this file
 keeps one counter per request (pos (B,), the positional twin's counter) and
 commits keep(b) = 1 + n_acc(b) per request: a counter reset plus one masked
 copy of the tail slot. The lockstep functions above are unchanged; the
-per-request ones are tested against them.
+per-request ones are tested against them. The one intended difference: at a
+findings-F4 step (p % 64 == 63) the per-request draft and verify skip the tail
+block as the shipped decode does, unless PerReqSpecContext.f4 = "fixed"
+(section F4 PARITY).
 
 STORE (per layer, KV head, request; slots of block_size rows; W = topk + R + 2):
     0 .. topk-2        window, evictable      ids[..., s] >= 0 when occupied
@@ -945,6 +948,23 @@ def timely_recall(counters: dict) -> Optional[float]:
 #            does ONE masked copy. For each request whose kept prefix undoes
 #            a rollover, rows [0, U - (f_b + 1)) of slot topk-1 come back
 #            from mirror_lo (torch.where); f_b = bs - 1 - tail_len0_b.
+# F4 PARITY (2026-10-20; run p2: every above-tolerance identity mismatch was
+# at a position p with p % 64 == 63). The per-request attention does not read
+# _cache_lens: the draft attends the whole allocation through a masked bias,
+# and the verify attends a mask of union slots with seqused_k. So the cache_lens
+# formula above does not give findings F4 to the attention. The shipped decode,
+# at a step that writes p % bs == bs - 1, reads rows [0, (topk-1)*bs) only: it
+# skips the tail block, the current token included (docs/R2_ENGINE_FINDINGS.md
+# F4). PerReqSpecContext.f4 selects the behaviour of the per-request round:
+#   "shipped" (the default, the parity target): the verify drops the mirror
+#            ids from the mask rows of the F4 positions (drop_tail_on_f4,
+#            f4_steps of ctr[u] = pos0 + u); the draft masks the whole tail
+#            slot at a step whose write filled T_b (apply_draft_bias_perreq,
+#            f4 = f4_steps of the position written; mirror_hi has no row yet).
+#   "fixed"  the tail block is read on every step, as the lockstep functions
+#            read it (they are unchanged).
+# The store, the fetches, the counters and the tables are the same in both
+# modes: only the attention masks of the F4 positions differ.
 # EXACTNESS. The argument of accept_commit holds per request: any c_b <=
 # 1 + n_acc(b) is exact for request b. No request reads the rows or the
 # counters of another request (every op below is per (h, b) or per b).
@@ -968,6 +988,45 @@ def _bvec(x, B: int, name: str, dtype=torch.int64) -> torch.Tensor:
 
 def _batch(engine) -> int:
     return int(engine._k_gpu.shape[0])
+
+
+F4_SHIPPED, F4_FIXED = "shipped", "fixed"
+F4_MODES = (F4_SHIPPED, F4_FIXED)
+
+
+def check_f4_mode(mode) -> str:
+    """The F4 mode of the per-request round (see F4 PARITY above): "shipped"
+    or "fixed". Raises ValueError for any other value."""
+    if mode not in F4_MODES:
+        raise ValueError("f4 mode %r: must be one of %s" % (mode, F4_MODES))
+    return mode
+
+
+def f4_steps(p: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Elementwise bool: the step that writes position p is a findings-F4
+    step (p % bs == bs - 1: the write fills the tail block, and the shipped
+    attention reads rows [0, (topk-1)*bs) only)."""
+    bs = int(block_size)
+    return p % bs == bs - 1
+
+
+def drop_tail_on_f4(mask: torch.Tensor, f4: torch.Tensor, layout: StoreLayout) -> torch.Tensor:
+    """The verify's F4 parity. mask: (H, B*U, K) int32 union slot ids, row
+    b*U + u (RoundPlan.mask). f4: (U, B) bool (f4_steps of the positions
+    pos0_b + u). On every row with f4[u, b], each entry that names a tail
+    mirror (mirror_lo: block T_b; mirror_hi: T_b + 1) becomes -1, so that
+    position reads only its non-tail selected blocks, as the shipped decode
+    reads rows [0, (topk-1)*bs) at that step. Every other row and entry is
+    unchanged. Pure; returns a new contiguous int32 mask."""
+    if mask.dim() != 3 or f4.dim() != 2 or f4.dtype != torch.bool:
+        raise ValueError("drop_tail_on_f4: mask (H, B*U, K) and f4 (U, B) bool, got %s and %s %s"
+                         % (tuple(mask.shape), f4.dtype, tuple(f4.shape)))
+    U, B = f4.shape
+    if mask.shape[1] != B * U:
+        raise ValueError("drop_tail_on_f4: mask has %d rows, f4 names B*U = %d" % (mask.shape[1], B * U))
+    rows = f4.t().reshape(1, B * U, 1).to(mask.device)               # row b*U + u
+    tail = (mask == int(layout.mirror_lo)) | (mask == int(layout.mirror_hi))
+    return torch.where(rows & tail, torch.full_like(mask, -1), mask).contiguous()
 
 
 def _set_tail_state(engine, pos: torch.Tensor, tail_ids: torch.Tensor, tail_len: torch.Tensor):
@@ -1199,10 +1258,16 @@ def plan_draft_perreq(store: Store, l: int, sel: torch.Tensor, tail_id: torch.Te
 
 def apply_draft_bias_perreq(scratch: torch.Tensor, kv_bias_gpu: torch.Tensor, deny: torch.Tensor,
                             deny_buf: torch.Tensor, layout: StoreLayout, block_size: int,
-                            tail_len: torch.Tensor, rolled: torch.Tensor, mask_bias: float = MASK_BIAS) -> torch.Tensor:
+                            tail_len: torch.Tensor, rolled: torch.Tensor, mask_bias: float = MASK_BIAS,
+                            f4: Optional[torch.Tensor] = None) -> torch.Tensor:
     """apply_draft_bias with the row limits per request
     (draft_row_limits_perreq): MASK_BIAS on the rows of the tail slot at or
-    above tail_ok[b] and on the rows of mirror_hi at or above hi_ok[b]."""
+    above tail_ok[b] and on the rows of mirror_hi at or above hi_ok[b].
+    f4 (B,) bool, optional: the requests whose step is a findings-F4 step
+    (f4_steps of the position just written): tail_ok and hi_ok are 0 for
+    them, so the whole tail slot is masked, as the shipped decode reads rows
+    [0, (topk-1)*bs) only at that step. None: no request (the lockstep
+    behaviour; F4 PARITY above)."""
     B, S, H = kv_bias_gpu.shape
     W = layout.W
     if S != W * block_size or tuple(scratch.shape) != (B, S, H) or tuple(deny.shape) != (H, B, W):
@@ -1211,6 +1276,10 @@ def apply_draft_bias_perreq(scratch: torch.Tensor, kv_bias_gpu: torch.Tensor, de
     if tuple(deny_buf.shape) != (B, W, 1, H):
         raise ValueError("deny_buf must be (B, W, 1, H)=%s, got %s" % ((B, W, 1, H), tuple(deny_buf.shape)))
     tail_ok, hi_ok = draft_row_limits_perreq(_bvec(tail_len, B, "tail_len"), _bvec(rolled, B, "rolled", torch.bool), block_size)
+    if f4 is not None:
+        f4 = _bvec(f4, B, "f4", torch.bool)
+        tail_ok = torch.where(f4, torch.zeros_like(tail_ok), tail_ok)
+        hi_ok = torch.where(f4, torch.zeros_like(hi_ok), hi_ok)
     scratch.copy_(kv_bias_gpu)
     deny_buf.copy_(deny.permute(1, 2, 0).unsqueeze(2))
     scratch.view(B, W, block_size, H).masked_fill_(deny_buf, mask_bias)
@@ -1528,7 +1597,14 @@ class PerReqSpecContext(SpecContext):
     twin's counters()). The cache is duck-typed: ``cache.layers[l]`` has
     ``cache_engine`` (per-request: _pos) and ``tables`` (counters(),
     commit(ctr, keep)). The journals of the lockstep context are not used:
-    the tables roll back by a counter reset."""
+    the tables roll back by a counter reset. ``f4`` (keyword; default
+    "shipped", the parity target): how the engine's per-request draft and
+    verify treat a findings-F4 step (F4 PARITY in the section header;
+    check_f4_mode refuses any other value)."""
+
+    def __init__(self, *args, f4: str = F4_SHIPPED, **kwargs):
+        self.f4 = check_f4_mode(f4)
+        super().__init__(*args, **kwargs)
 
     def begin_round(self, cache, tail_id=None):
         eng0 = cache.layers[0].cache_engine

@@ -64,6 +64,15 @@ fallback). No re-warm: the scoring buffers cover the cell. The report gates a
 per-request cell as a lockstep one (identity with the near-tie classification,
 the rollback probe in per-request form, overflow 0).
 
+NOSI_SPEC_F4 (per-request cells; "shipped" by default, or "fixed"): findings F4
+parity. The shipped decode, at a step that writes p % 64 == 63, attends rows
+[0, 4032) only (it skips the tail block, the current token included;
+docs/R2_ENGINE_FINDINGS.md F4). With "shipped" the per-request draft and verify
+skip it at the same positions (spec_loop.py, F4 PARITY), so the identity gate
+compares like with like there (run p2, efc3a66, before this knob: every
+above-tolerance first mismatch was at that step). "fixed" reads the tail block
+on every step, as the lockstep cells do. The cell and the provenance record it.
+
 TOKEN BUDGET. The pooling buffers are sized at warm-up (nosa_llama.py
 decode_inference: out_len = ceil((L+1)/64)), so a run past the next 64-token
 block boundary needs a RE-WARM (has_buffers = False -> the next decode step
@@ -76,7 +85,8 @@ Environment: NOSI_MODEL_PATH, NOSI_PG19_PARQUET, NOSI_SPEC_OUT, NOSI_SPEC_MODE,
 NOSI_SPEC_TAG, NOSI_SPEC_L (16128), NOSI_SPEC_DOCS (= batch), NOSI_SPEC_DISTINCT
 (distinct documents, default = batch), NOSI_SPEC_GATE_TOKENS (64),
 NOSI_SPEC_TOTAL_TOKENS (112), NOSI_SPEC_K_LIST ("1 2"), NOSI_SPEC_PROBE (0),
-NOSI_SPEC_PROBE_ROUND (3), NOSI_SPEC_COMMIT (lockstep | perreq), NOSI_SPEC_TAU_CTRL (report: the margin
+NOSI_SPEC_PROBE_ROUND (3), NOSI_SPEC_COMMIT (lockstep | perreq), NOSI_SPEC_F4 (shipped | fixed; per-request
+cells), NOSI_SPEC_TAU_CTRL (report: the margin
 classifier, 0.4844 at 16K; no default), NOSI_VERIFY_ROUND_SLOTS / NOSI_POOL_BLOCKS /
 NOSI_ATTN_SPLITS (read by the engine at import; recorded in the provenance).
 """
@@ -101,6 +111,8 @@ K_LIST = tuple(int(x) for x in os.environ.get("NOSI_SPEC_K_LIST", "1 2").split()
 PROBE = os.environ.get("NOSI_SPEC_PROBE", "0") == "1"
 PROBE_ROUND = int(os.environ.get("NOSI_SPEC_PROBE_ROUND", "3"))
 COMMIT = os.environ.get("NOSI_SPEC_COMMIT", "lockstep")     # lockstep | perreq (R2 milestone 2)
+F4_MODES = ("shipped", "fixed")                              # = spec_loop.F4_MODES (pinned by a CPU test)
+F4 = os.environ.get("NOSI_SPEC_F4", "shipped")               # per-request cells: findings F4 parity (spec_loop.py F4 PARITY)
 SCHEDULE = "round:K-draft-then-verify"
 os.makedirs(OUT, exist_ok=True)
 
@@ -449,7 +461,7 @@ def provenance():
     nosa_src = open(os.path.join(here, "..", "..", "nosi", "nosi", "nosa_llama.py")).read()
     return dict(
         schedule=SCHEDULE, mode=MODE, tag=TAG, L=L, batch=NDOCS, distinct_docs=DISTINCT, commit=COMMIT,
-        gate_tokens=GATE_TOKENS, total_tokens=TOTAL_TOKENS, K_list=list(K_LIST),
+        f4=F4 if COMMIT == "perreq" else None, gate_tokens=GATE_TOKENS, total_tokens=TOTAL_TOKENS, K_list=list(K_LIST),
         engine_knobs=dict(NOSI_VERIFY_ROUND_SLOTS=_ce.VERIFY_ROUND_SLOTS, NOSI_POOL_BLOCKS=_ce.POOL_BLOCKS,
                           NOSI_ATTN_SPLITS=int(os.environ.get("NOSI_ATTN_SPLITS", "0") or 0),
                           NOSI_KV_BIAS_SCALE=_ce.KV_BIAS_SCALE, NOSI_AVAIL=os.environ.get("NOSI_AVAIL", ""),
@@ -844,7 +856,8 @@ def run_spec_arm_perreq(model, cache, t0, position_ids, K: int, total: int, prob
     ctx = _sl.PerReqSpecContext(store, side=torch.cuda.Stream(), make_event=torch.cuda.Event,
                                 current_stream=torch.cuda.current_stream, stream_ctx=torch.cuda.stream,
                                 num_layers=model.num_layers, block_size=bs,
-                                kernel_size=model.layers[0].pooling_block_size, kernel_stride=model.layers[0].pooling_stride)
+                                kernel_size=model.layers[0].pooling_block_size, kernel_stride=model.layers[0].pooling_stride,
+                                f4=F4)
     vt = _vtr.VerifyTrace(model.num_layers)
     _vtr.TRACE = vt
     ctx.mark = vt.rec
@@ -974,7 +987,7 @@ def run_spec_arm_perreq(model, cache, t0, position_ids, K: int, total: int, prob
     wire = _sl.wire_bytes(final_counters)
     committed_after_warmup = int(loop.n_comm.sum()) - B
     wall = t_end - t_warm
-    result = dict(commit="perreq", K=K, U=U, schedule=SCHEDULE, tokens=total, tokens_per_request=loop.n_comm.tolist(),
+    result = dict(commit="perreq", f4=ctx.f4, K=K, U=U, schedule=SCHEDULE, tokens=total, tokens_per_request=loop.n_comm.tolist(),
                   seq=loop.trimmed(total + 1), seq_padded=loop.padded(), lengths=loop.lengths(), rounds=out_rounds,
                   counters=final_counters, counters_per_request=per_request_counters, wire=wire,
                   timely_recall=_sl.timely_recall(final_counters), host_syncs=ctx.host_syncs, wall_s_after_warmup=wall,
@@ -988,10 +1001,10 @@ def run_spec_arm_perreq(model, cache, t0, position_ids, K: int, total: int, prob
         result["tok_s_window"] = result["window_tokens"] / (t_end - t_gate)
     agg = aggregate_rounds_perreq(out_rounds)
     result["agg"] = agg
-    print("[spec_loop] PER-REQUEST K=%d: %d rounds (%d with K > 0, %d K = 0 fallback rounds, %d overflow request-rounds); measured "
+    print("[spec_loop] PER-REQUEST K=%d (f4 %s): %d rounds (%d with K > 0, %d K = 0 fallback rounds, %d overflow request-rounds); measured "
           "yield %.3f tokens per active request per round (K > 0 rounds: %s; lockstep equivalent %s); n_acc mean %s; draft %s ms/step, "
           "verify %s ms, rollback %s ms; %.1f tok/s after warm-up, window %s; recall %s; peak %.1f GB; host syncs %d"
-          % (K, agg["rounds"], agg["spec_rounds"], agg["fallback_rounds"], agg["overflow_request_rounds"],
+          % (K, ctx.f4, agg["rounds"], agg["spec_rounds"], agg["fallback_rounds"], agg["overflow_request_rounds"],
              agg.get("yield_measured_per_round", float("nan")), _f(agg.get("yield_measured_spec_rounds"), "%.3f"),
              _f(agg.get("yield_lockstep_equivalent_per_round"), "%.3f"), _f(agg.get("n_acc_mean_per_request"), "%.3f"),
              _f(agg.get("draft_step_ms")), _f(agg.get("verify_ms")), _f(agg.get("rollback_ms")), result["tok_s_after_warmup"],
@@ -1102,7 +1115,7 @@ def report() -> int:
                 gate("overflow[%s]" % tag, ag["overflow_rounds"] == 0,
                      "%d rounds with an overflowing request (%d request-rounds committed nothing), %d K = 0 fallback rounds"
                      % (ag["overflow_rounds"], ag["overflow_request_rounds"], ag["fallback_rounds"]))
-                perreq_out[tag] = dict(payload=name, K=c["K"], U=c["U"], batch=p["batch"], distinct_docs=p.get("distinct_docs"), L=p["L"],
+                perreq_out[tag] = dict(payload=name, f4=c.get("f4"), K=c["K"], U=c["U"], batch=p["batch"], distinct_docs=p.get("distinct_docs"), L=p["L"],
                                        W=c["W"], R=c["R"], tokens=c["tokens"], tokens_per_request=c["tokens_per_request"], agg=ag,
                                        counters=c["counters"], wire=c["wire"], timely_recall=c["timely_recall"], host_syncs=c["host_syncs"],
                                        committed_tokens_after_warmup=c["committed_tokens_after_warmup"],
@@ -1162,12 +1175,13 @@ def report() -> int:
             c["tok_s_after_warmup"], _f(c.get("tok_s_window")), _f(c["timely_recall"], "%.3f"),
             c["wire"]["wire_bytes"] / ntok / 1e6, c["wire"]["late_bytes"] / ntok / 1e6, c["wire"]["wasted_bytes"] / 1e6, c["peak_gb"], c["host_syncs"]))
     lines.append("\n## per-request cells (NOSI_SPEC_COMMIT=perreq): the yield is MEASURED, committed tokens per active request per round; the lockstep equivalent is what 1 + min n_acc would have committed with the same acceptances (a projection)\n")
-    lines.append("| cell | batch | distinct | K | rounds K>0 / K=0 | overflow request-rounds | yield measured/round | yield K>0 rounds | lockstep equivalent (proj) | n_acc mean/req | draft ms/step | verify ms | rollback ms | round ms | tok/s after warm-up | tok/s window | recall | wire MB/tok | late MB/tok | peak GB | host syncs |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("F4 = NOSI_SPEC_F4 of the cell (shipped: the draft and the verify skip the tail block at p % 64 == 63 as the shipped decode does; fixed: they read it; '-': a payload from before the knob, which read it)\n")
+    lines.append("| cell | F4 | batch | distinct | K | rounds K>0 / K=0 | overflow request-rounds | yield measured/round | yield K>0 rounds | lockstep equivalent (proj) | n_acc mean/req | draft ms/step | verify ms | rollback ms | round ms | tok/s after warm-up | tok/s window | recall | wire MB/tok | late MB/tok | peak GB | host syncs |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for tag, c in perreq_out.items():
         ag = c["agg"]
         ntok = max(1, c["committed_tokens_after_warmup"])
-        lines.append("| %s | %d | %s | %d | %d / %d | %d | %s | %s | %s | %s | %s | %s | %s | %s | %.1f | %s | %s | %.3f | %.3f | %.1f | %d |" % (
-            tag, c["batch"], c["distinct_docs"], c["K"], ag["spec_rounds"], ag["fallback_rounds"], ag["overflow_request_rounds"],
+        lines.append("| %s | %s | %d | %s | %d | %d / %d | %d | %s | %s | %s | %s | %s | %s | %s | %s | %.1f | %s | %s | %.3f | %.3f | %.1f | %d |" % (
+            tag, c.get("f4") or "-", c["batch"], c["distinct_docs"], c["K"], ag["spec_rounds"], ag["fallback_rounds"], ag["overflow_request_rounds"],
             _f(ag.get("yield_measured_per_round"), "%.3f"), _f(ag.get("yield_measured_spec_rounds"), "%.3f"),
             _f(ag.get("yield_lockstep_equivalent_per_round"), "%.3f"), _f(ag.get("n_acc_mean_per_request"), "%.3f"),
             _f(ag.get("draft_step_ms")), _f(ag.get("verify_ms")), _f(ag.get("rollback_ms")), _f(ag.get("round_ms")),
@@ -1224,6 +1238,8 @@ if __name__ == "__main__":
         die("need NOSI_SPEC_TOTAL_TOKENS >= 2 and NOSI_SPEC_GATE_TOKENS >= 1")
     if COMMIT not in ("lockstep", "perreq") or (COMMIT == "perreq" and MODE != "spec"):
         die("NOSI_SPEC_COMMIT=%r with NOSI_SPEC_MODE=%r (lockstep, or perreq in spec mode)" % (COMMIT, MODE))
+    if F4 not in F4_MODES:
+        die("NOSI_SPEC_F4=%r (one of %s)" % (F4, ", ".join(F4_MODES)))
     path = os.environ["NOSI_MODEL_PATH"]
     ids, rows, distinct = load_docs(path)
     print("[docs] %s (%d distinct)  L=%d" % (rows, distinct, L), flush=True)
