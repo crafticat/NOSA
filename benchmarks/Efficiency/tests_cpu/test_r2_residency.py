@@ -801,15 +801,65 @@ def _sched_pressure(seed, steps, hb=8, window=4, nver=3, uids=("u0", "u1")):
     return out
 
 
-def _lockstep_sc(seed, C, X, R_ver, sched, sc_mut=None, hb=15):
+def _mirror_diff(svc, l):
+    """The fields in which S-C's device-maintained mirror of layer l differs from the full-scan reference
+    (VerifyMirror.refresh over the host state)."""
+    ref = SC.VerifyMirror(svc.B, svc.H, svc.nblk, svc.n_hist, svc.device)
+    ref.refresh(svc, l)
+    got = svc.dmirror.layer(l)
+    return [f for f in SC.MIRROR_FIELDS if not torch.equal(getattr(ref, f), getattr(got, f))]
+
+
+def _trace_journal(svc):
+    """TEST INSTRUMENTATION of an S-C service: every change that marks a slot for the device mirror (the stream
+    journals' kinds, and "owner" for an owner change), per SYNC INTERVAL: a list of {(l, b, h, slot): [kinds]}; every
+    sync_mirror call (by resolve or by the test) closes the current interval (the last one stays open)."""
+    trace = [collections.defaultdict(list)]
+    for pool in svc.pools:
+        for st in pool.streams.values():
+            def sink(key, item, inner=st.log.sink):
+                trace[-1][key + (item[2],)].append(item[0])
+                inner(key, item)
+            st.log.sink = sink
+    mark, sync = svc._mark_batch_slot, svc.sync_mirror
+
+    def traced_mark(b):
+        for tr in svc.inflight.values():
+            if tr.b == b:
+                trace[-1][(tr.layer, tr.b, tr.h, tr.slot)].append("owner")
+        mark(b)
+
+    def traced_sync():
+        out = sync()
+        trace.append(collections.defaultdict(list))
+        return out
+    svc._mark_batch_slot, svc.sync_mirror = traced_mark, traced_sync
+    return trace
+
+
+def _isolated(trace, kind):
+    """The precondition of a dropped-kind control: in some CLOSED sync interval a slot changed by `kind` only (no other
+    kind marked that slot in the same interval, so nothing else sends its record before the next sync)."""
+    for interval in trace[:-1]:
+        for evs in interval.values():
+            evs = [e for e in evs if e != "touch"]
+            if evs and all(e == kind for e in evs):
+                return True
+    return False
+
+
+def _lockstep_sc(seed, C, X, R_ver, sched, sc_mut=None, hb=15, mirror_drop=None, trace=False):
     """v1 under the S-C schedule (arrivals at the tick's start, draft transfers at end_tick, waited and urgent blocks
     read in place and admitted at the next poll) and S-C driven by the same schedule, transports seeded alike, reader
-    events completed two ticks late in both. Returns the first differences (page tables per layer; the content of
-    every verify page at the read point, in both worlds; state and counters per tick), the two worlds and the largest
-    number of shared extras borrowed in v1 after a tick."""
+    events completed two ticks late in both. At the start of every tick (after the poll and S-C's mirror delta) S-C's
+    device mirror of every layer is compared with the full-scan reference. Returns the first differences (the mirror;
+    page tables per layer; the content of every verify page at the read point, in both worlds; state and counters per
+    tick), the two worlds and the largest number of shared extras borrowed in v1 after a tick."""
     common = dict(C=C, X=X, R_ver=R_ver, seed=seed, mode="delay", max_delay=4)
     wv = world(**common, svc_kw=dict(poll_in_resolve=False, defer_issue=True, defer_admit=True))
-    ws = world(**common, cls=SC.ResidencySC, svc_kw=dict(nblk=NB, sc_mut=sc_mut))
+    ws = world(**common, cls=SC.ResidencySC, svc_kw=dict(nblk=NB, sc_mut=sc_mut, mirror_drop=mirror_drop))
+    if trace:
+        ws.trace = _trace_journal(ws.svc)
     uids = ("u0", "u1")
     for w in (wv, ws):
         for b, u in enumerate(uids):
@@ -820,6 +870,13 @@ def _lockstep_sc(seed, C, X, R_ver, sched, sc_mut=None, hb=15):
     for (t, m, ends, layers) in sched:
         for w in (wv, ws):
             w.svc.poll()
+        ws.svc.sync_mirror()                                  # the tick's delta (the first resolve would send it)
+        for l in range(L):
+            d = _mirror_diff(ws.svc, l)
+            if d:
+                bad.append(("mirror", t, l, d))
+        if bad:
+            break
         for l, spec in enumerate(layers):
             rows = [Row(b, kind, key, 1000 + t, hb, [(hb, tail)]) for (b, kind, key, _) in spec]
             sel = S(*[s for (_, _, _, s) in spec])
@@ -856,6 +913,12 @@ def _lockstep_sc(seed, C, X, R_ver, sched, sc_mut=None, hb=15):
             bad.append(("counters", t, _counters(wv.svc), _counters(ws.svc)))
         if bad:
             break
+    if not bad:                                               # the last tick's changes reach the device mirror too
+        ws.svc.sync_mirror()
+        for l in range(L):
+            d = _mirror_diff(ws.svc, l)
+            if d:
+                bad.append(("mirror", "end", l, d))
     return bad, wv, ws, peak_borrowed
 
 
@@ -872,7 +935,7 @@ def test_F12_sc_equals_v1_on_the_f6_schedule():
     (S-C's overflow precondition). The device is read ONCE per tick (verify and draft decisions together)."""
     bad, wv, ws, _ = _lockstep_sc(1, C=8, X=48, R_ver=8, sched=_sched(101, 24, True))
     assert bad == [], bad[:3]
-    assert ws.svc.d2h_reads == 24
+    assert ws.svc.d2h_reads == 24 and ws.svc.row_uploads == 24 and ws.svc.mirror_uploads <= 24 + 1   # + the final check
     k43 = wv.svc.metrics.k43
     assert k43["layer_calls"] > 0 and k43["ready"] > 0 and k43["in_flight"] > 0 and k43["new"] > 0, k43
     assert ws.svc.dev.waited > 0 and ws.svc.dev.gathered > 0
@@ -887,7 +950,7 @@ def test_F12b_sc_equals_v1_under_capacity_pressure():
     read once per tick."""
     bad, wv, ws, peak = _lockstep_sc(3, C=2, X=96, R_ver=88, sched=_sched_pressure(103, 15), hb=8)
     assert bad == [], bad[:3]
-    assert ws.svc.d2h_reads == 15
+    assert ws.svc.d2h_reads == 15 and ws.svc.row_uploads == 15 and ws.svc.mirror_uploads <= 15 + 1   # + the final check
     assert wv.svc.metrics.refused > 0 and peak > 96 - 88, (wv.svc.metrics.refused, peak)
     assert wv.svc.metrics.k43["new"] > 0 and _no_verifier_force(wv.svc)
 
@@ -912,17 +975,26 @@ def test_F12c_sc_negative_controls(mut, sched):
         assert bad, mut
 
 
-def test_F12d_sc_reads_nothing_on_the_host_per_layer():
-    """F12d: the per-layer path of S-C holds no host read of a device value and no call of the counted device read
-    (_d2h): device_verify, device_draft, rank_in_group, ResidencySC.resolve and _row_inputs, the mirror refresh
-    (host to device only) and the GPU device operations. Negative control: the same check finds the per-layer read in
-    S-B's resolve (its host-side verify rows)."""
+H2D = ("torch.tensor(", "as_tensor(", "from_numpy(", ".copy_(", "non_blocking", "pin_memory", ".cuda(", ".to(dv",
+       ".to(dev", ".to(self.device", ".refresh(", "_h2d(")
+
+
+def test_F12d_sc_per_layer_path_has_no_host_transfer():
+    """F12d: the per-layer path of S-C (ResidencySC.resolve, DeviceMirror.layer, device_verify, device_draft,
+    rank_in_group and the GPU device operations) holds no host read of a device value, no call of the counted device
+    read (_d2h), and no host-to-device copy (no tensor built from host data, no copy_, no move to the device, no mirror
+    refresh, no _h2d). resolve reaches the two per-tick copies (sync_mirror, _tick_rows) only at a tick's first layer;
+    F12 / F12b / F14 count them. Negative controls: the same checks find the per-layer read in S-B's resolve, and the
+    per-layer host-to-device copies of S-B's resolve and of the full-scan mirror refresh."""
     import inspect
-    forbidden = FORBIDDEN + ("_d2h(",)
-    for fn in (SC.device_verify, SB.device_draft, SB.rank_in_group, SC.ResidencySC.resolve, SC.ResidencySC._row_inputs,
-               SC.VerifyMirror.refresh, SB.DraftMirror.refresh, SC.CudaDeviceOps.wait, SC.CudaDeviceOps.gather):
-        assert [tok for tok in forbidden if tok in inspect.getsource(fn)] == [], fn.__qualname__
-    assert [tok for tok in forbidden if tok in inspect.getsource(SB.ResidencySB.resolve)] != []
+    d2h = FORBIDDEN + ("_d2h(",)
+    for fn in (SC.ResidencySC.resolve, SC.DeviceMirror.layer, SC.device_verify, SB.device_draft, SB.rank_in_group,
+               SC.CudaDeviceOps.wait, SC.CudaDeviceOps.gather):
+        src = inspect.getsource(fn)
+        assert [tok for tok in d2h + H2D if tok in src] == [], fn.__qualname__
+    assert [tok for tok in d2h if tok in inspect.getsource(SB.ResidencySB.resolve)] != []
+    assert [tok for tok in H2D if tok in inspect.getsource(SB.ResidencySB.resolve)] != []
+    assert [tok for tok in H2D if tok in inspect.getsource(SC.VerifyMirror.refresh)] != []
 
 
 def _f12e(sc_mut=None, check_t3=True):
@@ -1038,3 +1110,122 @@ def test_F13_a_transfer_of_an_ended_request_is_never_read_by_the_next():
             assert p.looks[0]["new"] == [5] and len(p.urgent) == 1 and p.waited == []
     w, rows, sel, p = _f13(OwnerBlindInFlight, v1)
     assert p.waited and not _content_ok(w, 0, rows, sel, p)
+
+
+# =====================================================================================================================
+# F14 S-C's device mirror: one delta per tick, equal to the full scan
+# =====================================================================================================================
+def test_F14_the_delta_mirror_equals_the_full_scan():
+    """F14: S-C's mirror lives on the device and is updated by ONE batched delta per tick (the slots that the stream
+    journals and the owner changes marked); after every tick of F6's schedule and of F12b's pressure schedule it
+    equals the full-scan mirror (VerifyMirror.refresh) at every layer and in every field, and a delta is smaller than
+    the table (it is a delta, not a copy of every slot)."""
+    for args, ticks in ((dict(seed=1, C=8, X=48, R_ver=8, sched=_sched(101, 24, True)), 24),
+                        (dict(seed=3, C=2, X=96, R_ver=88, sched=_sched_pressure(103, 15), hb=8), 15)):
+        bad, _, ws, _ = _lockstep_sc(**args)
+        assert not [x for x in bad if x[0] == "mirror"] and bad == [], bad[:3]
+        svc = ws.svc
+        assert 0 < svc.mirror_uploads <= ticks + 1                       # one per tick, + the final check
+        assert svc.mirror_slots_uploaded < svc.mirror_uploads * svc.L * svc.B * svc.H * svc.n_hist
+
+
+def _scn_f6(drop):
+    """F6's schedule under the lockstep (the mirror compared at the start of every tick). Returns (trace, caught)."""
+    bad, _, ws, _ = _lockstep_sc(1, C=8, X=48, R_ver=8, sched=_sched(101, 24, True), mirror_drop=drop, trace=True)
+    assert drop or bad == [], bad[:2]
+    return ws.trace, bool(bad) and bad[0][0] == "mirror"
+
+
+def _scn_split(drop):
+    """admit_vres ISOLATED: an urgent verify block that no draft row merges is taken at end_tick and arrives at the next
+    poll as verifier-resident (its key still protects it). In S-C's own schedule the take and the arrival always fall
+    into ONE sync interval (note 12d), so this scenario syncs between them. Returns (trace, caught)."""
+    w = world(C=4, X=4, R_ver=1, cls=SC.ResidencySC, svc_kw=dict(nblk=NB, mirror_drop=drop))
+    svc = w.svc
+    trace = _trace_journal(svc)
+    svc.begin_request(0, "u0")
+    svc.poll()
+    p = svc.resolve(0, [Row(0, "v", ("u0", 1, 1), 300, 10)], S([[5], []]))
+    svc.read_done(0, p, Ev())                               # the reader is pending: the key keeps its reference
+    svc.end_tick()                                          # the urgent take of block 5
+    svc.sync_mirror()                                       # the device holds it in flight
+    svc.poll()                                              # the landed block arrives: VRES, the slot's only change
+    st = svc.stream(0, 0, 0)
+    assert 5 in st.vres, (st.vres, st.lru)
+    svc.sync_mirror()
+    return trace, bool([(l, d) for l in range(L) for d in _mirror_diff(svc, l)])
+
+
+def _scn_late_reader(drop):
+    """free ISOLATED: a slot read by the verifier is released (its request ends) while that reader is pending, so it
+    stays RELEASING across a sync; the reader ends and the next poll frees the slot, the slot's only change in that
+    interval. Returns (trace, caught)."""
+    w = world(C=2, X=4, R_ver=2, cls=SC.ResidencySC, svc_kw=dict(nblk=NB, mirror_drop=drop))
+    svc = w.svc
+    trace = _trace_journal(svc)
+    svc.begin_request(0, "u0")
+    svc.poll()
+    p = svc.resolve(0, [Row(0, "d", ("u0", 1, 1), 300, 10)], S([[0], []]))
+    svc.read_done(0, p, Ev(done=True))
+    svc.end_tick()                                          # the draft takes slot 0 for block 0
+    land_all(w)                                             # it arrives: LRU
+    ev1 = Ev()
+    p = svc.resolve(0, [Row(0, "v", ("u0", 1, 1), 300, 10)], S([[0], []]))
+    svc.read_done(0, p, ev1)
+    svc.end_tick()                                          # the verifier read slot 0 (reader ev1, pending)
+    svc.end_request("u0")                                   # slot 0 -> RELEASING behind ev1
+    svc.poll()
+    svc.sync_mirror()                                       # the device holds slot 0 RELEASING
+    assert svc.stream(0, 0, 0).slots[0].state == OWN.RELEASING
+    ev1.done = True                                         # the last reader ends
+    svc.poll()                                              # RELEASING -> FREE
+    assert svc.stream(0, 0, 0).slots[0].state == OWN.FREE
+    svc.sync_mirror()
+    return trace, bool([(l, d) for l in range(L) for d in _mirror_diff(svc, l)])
+
+
+F14C = {"take": _scn_f6, "admit": _scn_f6, "release": _scn_f6, "admit_vres": _scn_split, "free": _scn_late_reader}
+
+
+@pytest.mark.parametrize("kind", sorted(F14C))
+def test_F14c_a_dropped_delta_kind_is_caught(kind):
+    """F14c (negative controls), per transition kind: first the PRECONDITION on the run without the drop (the mirror
+    equals the full scan, and in some closed sync interval a slot is changed by that kind only, so nothing else would
+    send its record), then the run with that kind dropped from the delta must leave the device mirror unequal to the
+    full scan (in F6's lockstep: at the start of a tick, before any decision reads it). take, admit and release are
+    isolated in F6's schedule; admit_vres and free are not (note 12d) and have their own scenarios."""
+    scenario = F14C[kind]
+    trace, caught = scenario(None)
+    assert not caught
+    assert _isolated(trace, kind), "precondition not met: %s never isolated in %s" % (kind, scenario.__name__)
+    _, caught = scenario({kind})
+    assert caught, kind
+
+
+def test_F14b_owner_changes_reach_the_device_mirror():
+    """F14b: a request ends with a transfer in flight that the device mirror already holds as the owner's; the next
+    request of the batch slot begins. The owner change reaches the device (that transfer is no longer the owner's in
+    flight) and the mirror equals the full scan. Negative control: a delta without the owner changes leaves the old
+    transfer in flight on the device: caught."""
+    for drop, ok in ((None, True), ({"owner"}, False)):
+        w = world(C=4, X=4, R_ver=1, cls=SC.ResidencySC, svc_kw=dict(nblk=NB, mirror_drop=drop))
+        svc = w.svc
+        trace = _trace_journal(svc)
+        svc.begin_request(0, "u0")
+        diffs = []
+        for blocks in ([5], [6]):                       # tick 1 takes block 5 (force_only: it stays in flight)
+            svc.poll()
+            svc.sync_mirror()                           # tick 2 sends it to the device as the owner's transfer
+            diffs += [(l, d) for l in range(L) for d in _mirror_diff(svc, l)]
+            p = svc.resolve(0, [Row(0, "d", ("u0", 1, 1), 300, 10)], S([blocks, []]))
+            svc.read_done(0, p, Ev(done=True))
+            svc.end_tick()
+        assert diffs == [] and svc.dmirror.layer(0).inflight[0, 0, 5]
+        svc.end_request("u0")
+        svc.begin_request(0, "u1")
+        svc.poll()
+        svc.sync_mirror()
+        diffs = [(l, d) for l in range(L) for d in _mirror_diff(svc, l)]
+        assert (diffs == []) == ok, (drop, diffs)
+        if ok:                                          # the precondition: slot 0's only change was the owner change
+            assert _isolated(trace, "owner")

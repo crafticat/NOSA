@@ -192,7 +192,8 @@ svc = Residency(L, B, H, C, X, R_ver, transport, urgent_gather, store_b=, cis=, 
 svc = ResidencySB(..., device=, nblk=)              # S-B (r2_residency_sb.py): the draft rows on the device
 svc = ResidencySC(..., device=, nblk=, devops=)     # S-C (r2_residency_sc.py): verify and draft rows on the device;
                                                     # devops = CudaDeviceOps(svc, host_k, host_v, store_k, store_v,
-                                                    # store_b, cis) on the GPU (the CPU stand-in by default)
+                                                    # store_b, cis) on the GPU (the CPU stand-in by default); the
+                                                    # mirror lives on the device (12d); sel must be on the device
 svc.begin_request(b, uid, hist_blocks=S // 64)      # the prefill wrote the host rows of blocks < hist_blocks
 # a tick
 svc.poll()                                          # arrivals (admit), queued releases (reader gates), FREE
@@ -200,7 +201,9 @@ for l in layers:
     sel = selection of all rows ((H, R, k) int64; on the device for S-B; tail included)
     plan = svc.resolve(l, rows, sel)                # SAME signature in v1, S-B and S-C; rows: Row(b, kind, key,
                                                     # pos, hist_bound, tail); v1: a host read per layer; S-B: only
-                                                    # for the verify rows; S-C: none (one resolve per layer per tick)
+                                                    # for the verify rows; S-C: none (one resolve per layer per tick,
+                                                    # the same rows at every layer; the first layer sends the tick's
+                                                    # mirror delta and row inputs)
     # plan.page_table (R, H, P) int32, plan.num_pages (R, H) int32, plan.last_len / seq_idx (R,) int32 over the store;
     # the urgent gathers and the stream waits are already enqueued on the main stream. S-B: plan.reads / plan.blocks
     # hold the verify rows only (the draft reads are applied at end_tick)
@@ -365,6 +368,43 @@ with real selections; FG3 the packer's sustained rate (4.9) against the tick's d
   Stream.pending). device_draft's (N, B x H) one-hot ranks are replaced by a sort-based rank (O(N) memory; same
   values; F10 re-checks).
 
+## 12d. S-C's mirror on the device, one delta per tick (Q5, 2026-10-21)
+
+- `DeviceMirror`: the ownership state the device decides on, for EVERY layer, as a per-slot table on the device
+  (L, B, H, C + X): state code, block, generation, and the flag "the current owner's transfer in flight". Each resolve
+  derives its layer's mirror (S-B's fields plus the in-flight slot and generation per block) from the table with
+  device ops only (`DeviceMirror.layer`).
+- The delta: the vendored K3X ownership code logs every stream transition (`Stream.log`: take, release, evict_po,
+  acquire, admit, admit_vres, drop_unowned, drop_vres_unprotected, free; `ownership.py:206-450`). S-C replaces each
+  stream's log list by a list that also reports every append, so the slot becomes dirty AS IT CHANGES (no scan; the
+  vendored files are unchanged). An owner change (begin_request / end_request) marks the batch slot's transfers in
+  flight (their "current owner" flag changes). At the first resolve of a tick, `sync_mirror` sends the records of the
+  dirty slots in ONE host-to-device copy (pinned, asynchronous on the GPU) and the table takes them. The tick's row
+  inputs go in one more copy (every layer of a tick resolves the same rows; a later layer with other rows is refused).
+  A host change in the middle of a tick is refused (the mirror would be stale). Per tick: at most two host-to-device
+  copies and one device-to-host read; per layer: none.
+- Tests: F14 (the delta-maintained mirror equals the full scan, `VerifyMirror.refresh`, at every layer and in every
+  field at the start of every tick of F6's schedule and of F12b's pressure schedule; deltas smaller than the table);
+  F14c negative controls, one per transition kind (take, admit, release, admit_vres, free), each with its PRECONDITION
+  asserted first on the run without the drop: in some closed sync interval a slot is changed by that kind ONLY (a
+  test-side trace of the journal and the owner marks per sync interval); then the run with that kind dropped from the
+  delta must leave the device mirror unequal to the full scan; F14b (an owner change with a transfer in flight that
+  the device already holds; precondition: the owner change is the slot's only change; negative: the owner change
+  dropped); F12d extended (no host-to-device copy in the per-layer path; S-B's resolve and the full-scan refresh are
+  caught). F12 / F12b now run on the delta mirror and count one row copy and at most one mirror copy per tick.
+- WHY admit_vres AND free NEED THEIR OWN SCENARIOS (job 2190925: their F6 controls were not caught). A dropped kind can
+  leave a stale record only when it is the slot's only change between two syncs; any other change of the slot in the
+  same interval sends the slot's CURRENT record anyway. (1) admit_vres: only a transfer whose demand is {verify} alone
+  is admitted VRES, and that is only a verifier urgent transfer (a draft transfer always carries "draft"). S-C takes it
+  at end_tick and admits it at the very next poll (it landed in place), and S-C's own sync is at the next tick's first
+  resolve, after that poll: so in S-C's own schedule its take and its arrival are ALWAYS in one interval, and a dropped
+  admit_vres cannot leave a stale record. The control (_scn_split) therefore syncs between end_tick and the poll (an
+  urgent block that no draft row merges, its key still protecting it at the arrival). (2) free: a slot frees in the
+  poll that sees its last reader complete. In F6's 24 ticks no free was a slot's only change in an interval (job
+  2190925); the likely reason: the released slots' last readers had already completed, so the release and the free
+  fell into one interval (not traced). The control (_scn_late_reader) releases a slot whose last reader (a
+  verify read) is still pending, syncs while it is RELEASING, then completes the reader so that the next poll frees it.
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,
@@ -377,9 +417,9 @@ with real selections; FG3 the packer's sustained rate (4.9) against the tick's d
 - Q3 C + X must hold the union of a cohort's selections plus the LRU (measured union over 4 positions about 71 blocks);
   a CapacityRefusal names the shortfall. SG5 sweeps C and X.
 - Q4 Joint reads (paper 3.3: queries that use the same KV share its reads) are out of scope here.
-- Q5 The mirror refresh of S-B / S-C is a full host scan of the layer's streams and slots (Python, per layer, per
-  tick): correct and simple for the CPU equality tests, too slow for SG5 at B 64 x H 8 x (C + X) slots x 32 layers.
-  Before a throughput run the mirror must be kept on the device and updated from the host's transitions (take, admit,
-  release, free) by one batched host-to-device copy per tick.
+- Q5 (DONE for S-C, 12d) The mirror refresh of S-B is a full host scan of the layer's streams and slots (Python, per
+  layer, per tick): too slow for SG5 at B 64 x H 8 x (C + X) slots x 32 layers. S-C now keeps the mirror on the device
+  and updates it by one batched delta per tick; the full scan stays as the reference (F14). S-B keeps the full scan
+  (S-C supersedes it for runs).
 - Q6 CudaDeviceOps' superset wait may stall the main stream on draft transfers that no verify row reads. The 4.3
   layer_wait_ns measures it in FG1; the exact device spin on published generations is the fallback.

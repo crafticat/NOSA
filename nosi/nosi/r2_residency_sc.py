@@ -4,9 +4,18 @@ S-B decides the draft rows on the device, but its verify rows stay host-side (v1
 selection back at every layer. S-C moves the verify rows to the device too. resolve() reads NO device value on the
 host; end_tick() makes ONE batched device-to-host read per tick, for the verify and the draft decisions together.
 
-ONE LAYER (resolve). The host refreshes the layer's device MIRROR (S-B's mirror, plus the slot and generation of the
-transfer in flight per block; a host-to-device copy, no sync). Then device_verify() decides the verify rows with
-tensor ops, in K3X order (verify row, head, ascending block; dispatcher.py:2568-2589):
+THE DEVICE MIRROR (DeviceMirror, note Q5). The ownership state the device decides on lives ON THE DEVICE as a per-slot
+table of every layer (state code, block, generation, "the current owner's transfer in flight"). The host keeps no copy
+of it and never scans it: every transition of a stream (K3X Stream.log: take, release, evict_po, acquire, admit,
+admit_vres, drop_unowned, drop_vres_unprotected, free) marks its slot dirty as it happens, and so does an owner change
+(begin_request / end_request: the batch slot's transfers in flight). At the FIRST resolve of a tick the host sends the
+records of the dirty slots in ONE batched host-to-device copy (sync_mirror), and the tick's row inputs in one more
+(every layer of a tick resolves the same rows). Each resolve derives its layer's mirror from the table with device ops
+only. The full host scan (VerifyMirror.refresh) stays as the reference (CPU test F14).
+
+ONE LAYER (resolve). No host-to-device copy and no host read. The layer's mirror (S-B's fields plus the slot and
+generation of the transfer in flight per block) is derived on the device. Then device_verify() decides the verify rows
+with tensor ops, in K3X order (verify row, head, ascending block; dispatcher.py:2568-2589):
   READY      resident in the mirror: read in place (a verifier read does not touch the LRU, K1).
   IN FLIGHT  a transfer of the stream's owner in flight in the mirror: the read WAITS for it on the device (below);
              the demand {verify} is merged at end_tick.
@@ -47,23 +56,99 @@ THE DEVICE OPERATIONS (dev):
 THE SCHEDULE and v1's reference: arrivals polled at the tick's start; draft transfers issued at end_tick; the waited
 and the urgent blocks read in place and admitted at the next poll: Residency(poll_in_resolve=False, defer_issue=True,
 defer_admit=True). Under it S-C's page tables, ownership state and counters equal v1's (CPU tests F12, F12b).
-device_verify, ResidencySC.resolve and the GPU operations read no device value on the host (F12d checks their source).
+The per-layer path (resolve, DeviceMirror.layer, device_verify, device_draft, the GPU operations) reads no device value
+on the host and copies nothing from the host to the device (F12d checks their source); per tick there are at most two
+host-to-device copies (the mirror delta, the row inputs) and one device-to-host read (end_tick).
 """
 from __future__ import annotations
 
 import threading
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Set, Tuple
 
 import torch
 
 from .kstep.backend import ev_done
 from .kstep.errors import CapacityRefusal, OwnershipViolation
-from .kstep.ownership import RELEASING
+from .kstep.ownership import FREE, INFLIGHT, LRU, PO, RELEASING, VRES
 from .r2_residency import BLOCK, N_TAIL, VERIFY, Plan, Residency, Row
 from .r2_residency_sb import FIELDS, DraftMirror, ResidencySB, device_draft, rank_in_group
 
 FIELDS_V = ("blk", "valid", "ready", "slot", "infl", "infl_slot", "infl_gen", "dup", "granted", "take_slot", "rslot",
             "protect")
+C_FREE, C_INFLIGHT, C_LRU, C_PO, C_VRES, C_RELEASING = range(6)
+CODE = {FREE: C_FREE, INFLIGHT: C_INFLIGHT, LRU: C_LRU, PO: C_PO, VRES: C_VRES, RELEASING: C_RELEASING}
+MIRROR_FIELDS = ("slot_of", "inflight", "infl_slot", "infl_gen", "free", "usage", "releasing")
+JOURNAL_KINDS = ("take", "release", "evict_po", "acquire", "admit", "admit_vres", "drop_unowned",
+                 "drop_vres_unprotected", "free")        # "touch" changes only the LRU order: not mirrored
+
+
+class _Journal(list):
+    """A stream's transition log (K3X Stream.log, appended by the vendored ownership code) that also reports every
+    transition to the service as it is appended: the slot becomes dirty for the next mirror delta."""
+
+    def __init__(self, key: Tuple[int, int, int], sink, items=()):
+        super().__init__(items)
+        self.key, self.sink = key, sink
+
+    def append(self, item) -> None:
+        super().append(item)
+        self.sink(self.key, item)
+
+
+class LayerMirror:
+    """One layer's mirror as device_verify and device_draft read it (the fields of VerifyMirror, MIRROR_FIELDS)."""
+
+    def __init__(self, **fields):
+        for k, v in fields.items():
+            setattr(self, k, v)
+
+
+class DeviceMirror:
+    """The residency mirror of EVERY layer on the device (module docstring): a per-slot table (L, B, H, C + X) of the
+    state code, the block, the generation and the flag "the current owner's transfer in flight". apply() writes the
+    records of one delta; layer() derives one layer's mirror with device ops only."""
+
+    def __init__(self, L: int, B: int, H: int, nblk: int, npos: int, device):
+        shape = (L, B, H, npos)
+        self.nblk = int(nblk)
+        self.code = torch.zeros(shape, dtype=torch.int64, device=device)          # every slot FREE
+        self.block = torch.full(shape, -1, dtype=torch.int64, device=device)
+        self.gen = torch.zeros(shape, dtype=torch.int64, device=device)
+        self.cur = torch.zeros(shape, dtype=torch.int64, device=device)
+
+    def apply(self, recs: torch.Tensor) -> None:
+        """recs (5, n) int64 ON THE DEVICE: flat slot index, state code, block, generation, current-owner flag; the
+        slot indices are distinct."""
+        f = recs[0]
+        for t, row in ((self.code, 1), (self.block, 2), (self.gen, 3), (self.cur, 4)):
+            t.view(-1)[f] = recs[row]
+
+    def layer(self, l: int) -> LayerMirror:
+        """Layer l's mirror, derived from the table on the device (fresh tensors: the decisions may change them)."""
+        code, blk, gen, cur = self.code[l], self.block[l], self.gen[l], self.cur[l]   # (B, H, NPOS)
+        B, H, NPOS = code.shape
+        NBLK = self.nblk
+        dev = code.device
+        okb = (blk >= 0) & (blk < NBLK)
+        base = (torch.arange(B, device=dev).view(B, 1, 1) * H + torch.arange(H, device=dev).view(1, H, 1)) * NBLK
+        dummy = B * H * NBLK                                                       # one extra element takes the rest
+        flat = base + blk.clamp(min=0, max=NBLK - 1)
+        idx = torch.arange(NPOS, device=dev).view(1, 1, NPOS).expand(B, H, NPOS).reshape(-1)
+        res = okb & ((code == C_LRU) | (code == C_PO) | (code == C_VRES))
+        fly = okb & (code == C_INFLIGHT) & (cur != 0)
+        at_res = torch.where(res, flat, torch.full_like(flat, dummy)).reshape(-1)
+        at_fly = torch.where(fly, flat, torch.full_like(flat, dummy)).reshape(-1)
+        slot_of = torch.full((dummy + 1,), -1, dtype=torch.int64, device=dev)
+        slot_of[at_res] = idx                                                      # one resident slot per block (K3)
+        infl_slot = torch.full((dummy + 1,), -1, dtype=torch.int64, device=dev)
+        infl_slot[at_fly] = idx                                                    # one owner transfer per block
+        infl_gen = torch.zeros((dummy + 1,), dtype=torch.int64, device=dev)
+        infl_gen[at_fly] = gen.reshape(-1)
+        shp = (B, H, NBLK)
+        return LayerMirror(slot_of=slot_of[:dummy].view(shp), inflight=(infl_slot[:dummy] >= 0).view(shp),
+                           infl_slot=infl_slot[:dummy].view(shp), infl_gen=infl_gen[:dummy].view(shp),
+                           free=code == C_FREE, usage=(code != C_FREE).to(torch.int64).sum(-1),
+                           releasing=code == C_RELEASING)
 
 
 class VerifyMirror(DraftMirror):
@@ -326,12 +411,23 @@ class CudaDeviceOps:
 class ResidencySC(ResidencySB):
     """Residency with the verify and the draft rows decided on the device (module docstring). Extra arguments (beyond
     S-B's device, nblk, sb_mut): sc_mut (negative controls: device_verify's, and no_wait: the device does not wait for
-    the in-flight blocks), devops (the device operations; on the CPU the stand-in by default)."""
+    the in-flight blocks), devops (the device operations; on the CPU the stand-in by default), mirror_drop (NEGATIVE
+    CONTROL, tests only: the journal kinds, or "owner", whose changes are NOT sent to the device mirror)."""
 
-    def __init__(self, *args, sc_mut=None, devops=None, **kw):
+    def __init__(self, *args, sc_mut=None, devops=None, mirror_drop=None, **kw):
         kw["defer_admit"] = True
         super().__init__(*args, **kw)
-        self.mirrors = [VerifyMirror(self.B, self.H, self.nblk, self.n_hist, self.device) for _ in range(self.L)]
+        self.mirrors = None                               # S-B's per-layer host-refreshed mirrors are not used
+        self.dmirror = DeviceMirror(self.L, self.B, self.H, self.nblk, self.n_hist, self.device)
+        self.mirror_drop = set(mirror_drop or ())
+        self._dirty: Set[Tuple[int, int, int, int]] = set()          # (l, b, h, slot) changed since the last sync
+        for l, pool in enumerate(self.pools):
+            for (b, h), st in pool.streams.items():
+                st.log = _Journal((l, b, h), self._journal, st.log)
+        self.mirror_uploads = 0                           # host-to-device copies of the mirror delta
+        self.mirror_slots_uploaded = 0                    # slot records sent in them
+        self.row_uploads = 0                              # host-to-device copies of the tick's row inputs
+        self._rows = None                                 # the tick's row inputs on the device
         self.sc_mut = dict(sc_mut or {})
         if devops is None:
             if self.device.type != "cpu":
@@ -341,14 +437,67 @@ class ResidencySC(ResidencySB):
         self._tick: List[Dict] = []
         self._hist_unwaited: List = []                    # host write-backs the main stream did not wait on yet
 
-    def history_written(self, uid, block: int, ev) -> None:
-        super().history_written(uid, block, ev)
-        self._hist_unwaited.append(ev)
+    # ------------------------------------------------------------------------------------------------ the mirror delta
+    def _journal(self, key: Tuple[int, int, int], item) -> None:
+        """Every stream transition, as the vendored ownership code logs it: (event, block, slot, gen, detail)."""
+        if item[0] == "touch" or item[0] in self.mirror_drop:
+            return
+        self._dirty.add(key + (item[2],))
 
-    def _row_inputs(self, rows: Sequence[Row], idxs: List[int]):
-        """The device inputs of the rows idxs (host data of the Row records, copied to the device)."""
-        for i in idxs:
-            r = rows[i]
+    def _mark_batch_slot(self, b: int) -> None:
+        """An owner change of batch slot b: its transfers in flight change their "current owner" flag."""
+        if "owner" in self.mirror_drop:
+            return
+        for tr in self.inflight.values():
+            if tr.b == b:
+                self._dirty.add((tr.layer, tr.b, tr.h, tr.slot))
+
+    def begin_request(self, b: int, uid, hist_blocks=None) -> None:
+        super().begin_request(b, uid, hist_blocks)
+        self._mark_batch_slot(b)
+
+    def end_request(self, uid) -> None:
+        b = self.uid_b[uid]
+        super().end_request(uid)
+        self._mark_batch_slot(b)
+
+    def _h2d(self, host: torch.Tensor) -> torch.Tensor:
+        """Every host-to-device copy of S-C goes through here (per tick: the mirror delta and the row inputs). On the
+        GPU from pinned memory, asynchronous on the current stream (no host sync)."""
+        if self.device.type == "cuda":
+            return host.pin_memory().to(self.device, non_blocking=True)
+        return host.to(self.device)
+
+    def sync_mirror(self) -> bool:
+        """The ONE batched host-to-device delta of the device mirror: the record of every slot that changed since the
+        last sync (state code, block, generation, current-owner flag). Called by the first resolve of a tick (and by
+        tests); returns whether a delta was sent."""
+        if not self._dirty:
+            return False
+        B, H, NPOS = self.B, self.H, self.n_hist
+        recs = []
+        for (l, b, h, i) in sorted(self._dirty):
+            s = self.pools[l].stream(b, h).slots[i]
+            cur = 0
+            if s.state == INFLIGHT:
+                tr = self._in_flight(l, b, h, s.block)
+                cur = 1 if tr is not None and tr.slot == i else 0
+            recs.append((((l * B + b) * H + h) * NPOS + i, CODE[s.state], s.block, s.gen, cur))
+        self._dirty = set()
+        self.dmirror.apply(self._h2d(torch.tensor(recs, dtype=torch.int64).t().contiguous()))
+        self.mirror_uploads += 1
+        self.mirror_slots_uploaded += len(recs)
+        return True
+
+    # ------------------------------------------------------------------------------------------------ the tick's rows
+    @staticmethod
+    def _row_sig(rows: Sequence[Row]):
+        return tuple((r.b, r.kind, r.key, r.pos, r.hist_bound, tuple(r.tail)) for r in rows)
+
+    def _tick_rows(self, rows: Sequence[Row]) -> Dict:
+        """The tick's row inputs on the device, in ONE host-to-device copy (every layer of a tick resolves the same
+        rows; only the selection differs)."""
+        for i, r in enumerate(rows):
             if r.hist_bound > self.nblk:
                 raise ValueError("row %d: hist_bound %d > nblk %d (the mirror names blocks < nblk only)"
                                  % (i, r.hist_bound, self.nblk))
@@ -357,56 +506,77 @@ class ResidencySC(ResidencySB):
             for (_, s) in r.tail:
                 if not self.tail0 <= s < self.tail0 + N_TAIL:
                     raise ValueError("tail slot %d outside [%d, %d)" % (s, self.tail0, self.tail0 + N_TAIL))
-        dv = self.device
-        tl = torch.tensor([[s for (_, s) in rows[i].tail] + [-1] * (N_TAIL - len(rows[i].tail)) for i in idxs],
-                          dtype=torch.int64)
-        rb = torch.tensor([rows[i].b for i in idxs], dtype=torch.int64)
-        hb = torch.tensor([rows[i].hist_bound for i in idxs], dtype=torch.int64)
-        nt = torch.tensor([len(rows[i].tail) for i in idxs], dtype=torch.int64)
-        ix = torch.tensor(idxs, dtype=torch.int64)
-        return rb.to(dv), hb.to(dv), tl.to(dv), nt.to(dv), ix.to(dv)
+        R = len(rows)
+        vrows = [i for i, r in enumerate(rows) if r.kind == "v"]
+        drows = [i for i, r in enumerate(rows) if r.kind == "d"]
+        tails_flat: List[int] = []
+        for r in rows:
+            tails_flat += [s for (_, s) in r.tail] + [-1] * (N_TAIL - len(r.tail))
+        flat = ([r.b for r in rows] + [r.hist_bound for r in rows] + [len(r.tail) for r in rows] + tails_flat
+                + [r.pos % self.bs + 1 for r in rows] + vrows + drows)
+        d = self._h2d(torch.tensor(flat, dtype=torch.int64))
+        self.row_uploads += 1
+        rb, hb, nt = d[:R], d[R:2 * R], d[2 * R:3 * R]
+        at = 3 * R + R * N_TAIL
+        tails = d[3 * R:at].view(R, N_TAIL)
+        last_len = d[at:at + R]
+        vix = d[at + R:at + R + len(vrows)]
+        dix = d[at + R + len(vrows):at + R + len(vrows) + len(drows)]
 
+        def part(ix):
+            return rb[ix], hb[ix], tails[ix], nt[ix], ix
+        return dict(sig=self._row_sig(rows), vrows=vrows, drows=drows, v=part(vix) if vrows else None,
+                    d=part(dix) if drows else None, last_len=last_len.to(torch.int32), seq_idx=rb.to(torch.int32))
+
+    # ------------------------------------------------------------------------------------------------ one layer
     def resolve(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> Plan:
         H, R = self.H, len(rows)
         if any(st["l"] == l for st in self._tick):
             raise ValueError("S-C: layer %d resolved twice in one tick (its decisions are applied at end_tick)" % l)
+        if sel.device.type != self.device.type:
+            raise ValueError("S-C: the selection must be on the service's device %s (got %s)" % (self.device, sel.device))
         self._check_rows(l, rows, sel)
+        if not self._tick:                                            # the tick's first layer: the per-tick copies
+            self.sync_mirror()
+            self._rows = self._tick_rows(rows)
+        elif self._dirty:
+            raise OwnershipViolation("S-C: the host state changed in the middle of a tick (the device mirror is stale)")
+        elif self._row_sig(rows) != self._rows["sig"]:
+            raise ValueError("S-C: every layer of a tick resolves the same rows (layer %d differs)" % l)
+        tk = self._rows
         plan = self._new_plan(rows)
-        vrows = [i for i, r in enumerate(rows) if r.kind == "v"]
-        drows = [i for i, r in enumerate(rows) if r.kind == "d"]
         dv = self.device
         P = sel.shape[2] + N_TAIL
         page = torch.full((R, H, P), -1, dtype=torch.int64, device=dv)
         npg = torch.zeros((R, H), dtype=torch.int64, device=dv)
-        sel_d = sel.to(dv)
-        m = self.mirrors[l]
-        m.refresh(self, l)
-        step = dict(l=l, vrows=[rows[i] for i in vrows], vidx=vrows, vdec=None, drows=[rows[i] for i in drows],
-                    ddec=None)
-        if vrows:                                                     # the verify rows: on the device, no host read
-            rb, hb, tl, nt, ix = self._row_inputs(rows, vrows)
-            vdec = device_verify(m, rb, hb, tl, nt, sel_d[:, ix], self.C, self.X, self.sc_mut)
+        m = self.dmirror.layer(l)
+        step = dict(l=l, vrows=[rows[i] for i in tk["vrows"]], vidx=tk["vrows"], vdec=None,
+                    drows=[rows[i] for i in tk["drows"]], ddec=None)
+        if tk["v"] is not None:                                       # the verify rows: on the device, no host read
+            rb, hb, tl, nt, ix = tk["v"]
+            vdec = device_verify(m, rb, hb, tl, nt, sel[:, ix], self.C, self.X, self.sc_mut)
             if not self.sc_mut.get("no_wait"):                        # NEGATIVE CONTROL: read before the event
                 self.dev.wait(l, vdec)
             self.dev.gather(l, vdec)
             page[ix] = vdec.page
             npg[ix] = vdec.num_pages
             step["vdec"] = vdec
-        if drows:                                                     # the draft rows: S-B, on the mirror after verify
-            rb, hb, tl, nt, ix = self._row_inputs(rows, drows)
-            ddec = device_draft(m, rb, hb, tl, nt, sel_d[:, ix], self.C, self.X, self.R_ver, self.sb_mut)
+        if tk["d"] is not None:                                       # the draft rows: S-B, on the mirror after verify
+            rb, hb, tl, nt, ix = tk["d"]
+            ddec = device_draft(m, rb, hb, tl, nt, sel[:, ix], self.C, self.X, self.R_ver, self.sb_mut)
             page[ix] = ddec.page
             npg[ix] = ddec.num_pages
             step["ddec"] = ddec
         self._tick.append(step)
         plan.page_table = page.to(torch.int32)
         plan.num_pages = npg.to(torch.int32)
-        plan.last_len = torch.tensor([r.pos % self.bs + 1 for r in rows], dtype=torch.int32).to(dv)
-        plan.seq_idx = torch.tensor([r.b for r in rows], dtype=torch.int32).to(dv)
+        plan.last_len = tk["last_len"]
+        plan.seq_idx = tk["seq_idx"]
         return plan
 
     def end_tick(self) -> None:
         steps, self._tick = self._tick, []
+        self._rows = None
         parts = []
         for st in steps:
             for dec, fields in ((st["vdec"], FIELDS_V), (st["ddec"], FIELDS)):
