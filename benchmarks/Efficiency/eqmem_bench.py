@@ -19,13 +19,21 @@ every 16 decode steps (original / cached; never inside a step), at the end.
 OUTPUT (--out, refused when it exists): result.json (plan, docs, metrics, memory with the budget verdict, re-warm
 steps, the pilot's aggregates for spec, module origins, error), tokens.pt (the committed token matrix), fit_row.json
 (the measured row for eqmem_core.fit_from_rows), SHA256SUMS.
+v2 (2026-10-20): steps.json, the per-unit record of the decode (eqmem_core.step_record: per step / round the GPU ms,
+the data-wait ms, the rest, the blocks, the re-warm flag, the tokens; result.json keeps its summary as steps_summary,
+or steps_error when a window could not be charged to its step); result.json "host": the process's host memory
+(rss_peak_gb = VmHWM, ru_maxrss_gb, pinned_kv_gb = the engines' pinned K / V, vm_pin_gb, rss_samples[].rss_gb at the
+device sample points). Plan mode takes a cell LIST with capacity scans (eqmem_core.expand_cells) and prints the step
+commands (--step-nosi / --step-holder / --step-run / --step-reps). Report: the token agreement is keyed on the FIRST
+COMPLETED original repetition (agreement_reference), plus the capacity-scan table and the per-step split.
 EXIT: 0 the cell ran and is VALID (inside the budget); 1 an error or OVER_BUDGET; 2 --out exists; 3 another GPU; 4 a
 refused configuration (no batch fits, a knob in the environment differs from the cell's); 6 a module from outside
 NOSI_REPO.
-4.2 ADDITIONS (ctxsweep_bench.py calls run_arm with an S-aware plan; the 4.1 behaviour is unchanged): the workload
-context is the plan's S; every device sample carries the host memory (VmRSS / VmHWM, the memory cgroup); result.json
-adds memory.phase_peaks (prefill / decode: the peak statistics are reset after the prefill), host (host_record) and
-latency (ctxsweep_core.latency_metrics, CUDA-event clock); fit_row.json adds S, max_gen, host_peak_gib and the phase peaks.
+4.2 ADDITIONS (ONE harness for 4.1 and 4.2: ctxsweep_bench.py calls run_arm with an S-aware plan; a 4.1 cell plans as
+before): the workload context is the plan's S; result.json adds memory.phase_peaks (prefill / decode: the peak
+statistics are reset after the prefill; the budget verdict takes the larger), host += host_extras (pinned_kv_pow2_gb,
+cgroup_peak_gb, torch's host-allocator statistics) and latency (ctxsweep_core.latency_metrics, CUDA-event clock);
+fit_row.json adds S, max_gen, host_peak_gib (= host.rss_peak_gb in GiB, the unit of srun --mem) and the phase peaks.
 REPORT: every result.json under --results (one comparison: the same budget, margin, N, S) -> report.json / report.md:
 the cells (repetitions summarized), the best VALID cell per family, the speedups, the prefix agreement of every cell's
 tokens with the original cell's (an observation), and the DERIVED time to serve Q requests in static batches.
@@ -48,7 +56,7 @@ sys.path.insert(0, str(HERE))
 sys.dont_write_bytecode = True
 
 import eqmem_core as EC  # noqa: E402
-import ctxsweep_core as CS  # noqa: E402  (paper 4.2: the host-memory parsers and the latency metrics)
+import ctxsweep_core as CS  # noqa: E402  (paper 4.2: the cgroup reader, the pinned sizes, the latency metrics)
 
 
 class Refused(Exception):
@@ -82,7 +90,37 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--results", default=None)
     ap.add_argument("--workload-q", type=int, default=None, help="report: the request count of the derived time")
+    # v2, plan mode: the step commands of a cell list (a capacity scan: cached:P1/P2/... or scan:LO-HI:STEP)
+    ap.add_argument("--step-nosi", default=None, help="plan: the full NOSI sha for the printed step commands")
+    ap.add_argument("--step-holder", default=None, help="plan: the holder job id for the printed step commands")
+    ap.add_argument("--step-run", default=None, help="plan: the run id for the printed step commands")
+    ap.add_argument("--step-reps", default="0", help="plan: comma-separated repetitions (default 0)")
     return ap
+
+
+def step_cell_text(cell: EC.Cell) -> str:
+    """The cell as eqmem_step.sh takes it (spec only with the step's R = 62)."""
+    if cell.family == "original":
+        return "original"
+    if cell.family == "cached":
+        return "cached:%d" % cell.P
+    if cell.R != EC.DEFAULT_R:
+        raise Refused("eqmem_step.sh runs spec cells with R %d only, not %s" % (EC.DEFAULT_R, cell.name))
+    return "spec:%d" % cell.K
+
+
+def step_commands(cells: List[EC.Cell], budget: float, nosi: str, holder: str, run: str, reps: List[int]) -> List[str]:
+    """One eqmem_step.sh invocation per (rep, cell), reps outer, then the report; the lead runs them one at a time."""
+    import re
+    if not re.fullmatch(r"[0-9a-f]{40}", nosi or "") or not re.fullmatch(r"[0-9]+", holder or "") \
+            or not re.fullmatch(r"[a-z0-9]{1,16}", run or ""):
+        raise Refused("--step-nosi (40 hex), --step-holder (digits) and --step-run ([a-z0-9]{1,16}) are required for commands")
+    if any(r < 0 or r > 9 for r in reps):
+        raise Refused("reps must be 0 .. 9")
+    b = ("%.1f" % budget).rstrip("0").rstrip(".")
+    head = "bash benchmarks/Efficiency/eqmem_step.sh --nosi %s %s %s %s" % (nosi, holder, run, b)
+    cmds = ["%s %s %d" % (head, step_cell_text(c), r) for r in reps for c in cells]
+    return cmds + ["%s report" % head]
 
 
 def load_fit(a) -> EC.MemFit:
@@ -145,7 +183,7 @@ class EngineProbe:
     the real H2D on both the shipped and the pooled path) accumulated on the device; no host sync."""
 
     def __init__(self, torch, cache):
-        self.torch, self.cache, self.windows = torch, cache, []
+        self.torch, self.cache, self.windows, self.window_loads = torch, cache, [], []
         with torch.inference_mode():
             self.loads = torch.zeros((), dtype=torch.int64, device="cuda")
 
@@ -161,7 +199,9 @@ class EngineProbe:
                 e0.record()
                 out = _orig(*a, **kw)
                 e1.record()
-                self.loads += (_eng._load_mask >= 0).sum()
+                n = (_eng._load_mask >= 0).sum()
+                self.loads += n
+                self.window_loads.append(n)            # v2: per window, for the per-step split (device scalar, no sync)
                 self.windows.append((e0, e1))
                 return out
             eng.decode_update = wrapped
@@ -169,39 +209,44 @@ class EngineProbe:
     def harvest(self):
         return int(self.loads), sum(a.elapsed_time(b) for a, b in self.windows), len(self.windows)
 
+    def per_window(self):
+        """After a synchronize: (ms per window, blocks per window), in launch order."""
+        ms = [a.elapsed_time(b) for a, b in self.windows]
+        loads = self.torch.stack(self.window_loads).tolist() if self.window_loads else []
+        return ms, [int(x) for x in loads]
 
-def host_now() -> Dict[str, Any]:
-    """The process's host memory now, GiB: /proc/self/status (rss, hwm = the peak resident set, lck, pin) and the
-    memory cgroup's usage and peak (ctxsweep_core.cgroup_memory_files); a value that cannot be read is absent / None."""
-    out: Dict[str, Any] = {}
+
+def proc_status() -> Dict[str, Any]:
     try:
-        out.update(CS.parse_proc_status(Path("/proc/self/status").read_text()))
-    except Exception:                                                         # noqa: BLE001 (best effort)
-        pass
+        return EC.parse_proc_status(Path("/proc/self/status").read_text())
+    except OSError:
+        return dict(VmRSS=None, VmHWM=None, VmPin=None, VmLck=None)
+
+
+def cgroup_memory() -> Dict[str, Any]:
+    """The memory cgroup of this process (ctxsweep_core.cgroup_memory_files): version, usage and PEAK in GB (v1
+    memory.max_usage_in_bytes, v2 memory.peak: the step's peak, page cache included); None where unreadable."""
     try:
         files = CS.cgroup_memory_files(Path("/proc/self/cgroup").read_text())
-    except Exception:                                                         # noqa: BLE001
+    except OSError:
         files = None
-    if files:
-        out["cgroup_version"] = files["version"]
-        for k in ("usage", "peak"):
-            try:
-                out["cgroup_%s_gib" % k] = int(Path(files[k]).read_text().split()[0]) / CS.GIB
-            except Exception:                                                 # noqa: BLE001
-                out["cgroup_%s_gib" % k] = None
+    if not files:
+        return dict(cgroup_version=None, cgroup_usage_gb=None, cgroup_peak_gb=None)
+    out: Dict[str, Any] = dict(cgroup_version=files["version"])
+    for k in ("usage", "peak"):
+        try:
+            out["cgroup_%s_gb" % k] = int(Path(files[k]).read_text().split()[0]) / 1e9
+        except (OSError, ValueError, IndexError):
+            out["cgroup_%s_gb" % k] = None
     return out
 
 
-def host_record(torch, samples: List[Dict[str, Any]], pinned_nbytes: List[int]) -> Dict[str, Any]:
-    """The cell's host memory: peak_gib = the largest VmHWM seen (the process's peak resident set; the pinned KV is
-    resident: ctxsweep_core HOST_EVIDENCE), the memory cgroup's peak, the pinned tensors (nominal and power-of-two
-    sizes) and torch's host-allocator statistics when this torch has them."""
-    now = host_now()
-    hs = [s.get("host") or {} for s in samples] + [now]
-
-    def mx(k):
-        v = [h[k] for h in hs if h.get(k) is not None]
-        return max(v) if v else None
+def host_extras(torch, pinned_nbytes: List[int]) -> Dict[str, Any]:
+    """4.2 additions to the host record (eqmem_core.host_record keeps B's fields: rss_peak_gb, rss_end_gb, ru_maxrss_gb,
+    pinned_kv_gb, vm_pin_gb, rss_samples): the pinned K / V tensors at their POWER-OF-TWO size (what the CUDA caching
+    host allocator reserves: ctxsweep_core HOST_EVIDENCE), the memory cgroup's peak, torch's host-allocator statistics
+    when this torch has them."""
+    ps = CS.pinned_summary(pinned_nbytes)
     stats = None
     f = getattr(torch.cuda, "host_memory_stats", None)
     if f is not None:
@@ -209,15 +254,18 @@ def host_record(torch, samples: List[Dict[str, Any]], pinned_nbytes: List[int]) 
             stats = {k: v for k, v in dict(f()).items() if isinstance(v, (int, float))}
         except Exception as e:                                                # noqa: BLE001 (recorded)
             stats = dict(error=str(e)[:300])
-    return dict(peak_gib=mx("hwm_gib"), rss_end_gib=now.get("rss_gib"), cgroup_peak_gib=mx("cgroup_peak_gib"),
-                cgroup_usage_max_gib=mx("cgroup_usage_gib"), pinned=CS.pinned_summary(pinned_nbytes),
-                torch_host_memory_stats=stats, now=now)
+    out = dict(pinned_kv_tensors=ps["tensors"], pinned_kv_pow2_gb=ps["pow2_gib"] * CS.GIB / 1e9,
+               torch_host_memory_stats=stats)
+    out.update(cgroup_memory())
+    return out
 
 
 def mem_sample(torch, label: str) -> Dict[str, Any]:
     free, total = torch.cuda.mem_get_info()
+    rss = proc_status().get("VmRSS")
     return dict(label=label, used_gb=(total - free) / 1e9, reserved_gb=torch.cuda.memory_reserved() / 1e9,
-                alloc_gb=torch.cuda.memory_allocated() / 1e9, total_gb=total / 1e9, host=host_now())
+                alloc_gb=torch.cuda.memory_allocated() / 1e9, total_gb=total / 1e9,
+                host_rss_gb=(rss * 1e3 / 1e9) if rss is not None else None)
 
 
 def live_rewarm(model, cache, lookahead: int):
@@ -231,15 +279,19 @@ def live_rewarm(model, cache, lookahead: int):
                           lookahead)
 
 
-def decode_shipped(torch, model, cache, t0, pos0, N: int, samples: List, e_prev=None) -> Dict[str, Any]:
+def decode_shipped(torch, model, cache, t0, pos0, N: int, samples: List, probe: "EngineProbe",
+                   e_prev=None) -> Dict[str, Any]:
     """original / cached: N - 1 greedy decode steps of NOSA's decode_inference; per-step CUDA events; re-warm by
-    live_rewarm (lookahead 1); device samples every 16 steps (between steps). e_prev (the prefill-end event): itl_ms =
-    the intervals between consecutive step-end events, the first from e_prev (host gaps included)."""
+    live_rewarm (lookahead 1); device samples every 16 steps (between steps). v2: the probe's window count is marked
+    before every step and after the last, so every decode_update window (one per layer per step, the re-warm steps'
+    warm-up path included) and its load count are charged to their own step (eqmem_core.split_step_windows).
+    e_prev (the prefill-end event; 4.2): itl_ms = the intervals between consecutive step-end events, the first from
+    e_prev (host gaps included)."""
     B = t0.shape[0]
     cu = torch.arange(0, B + 1, dtype=torch.int, device="cuda")
     tok, pos = t0, pos0.clone()
     seq = [t0]
-    evs, rewarms = [], []
+    evs, rewarms, marks = [], [], []
     model.has_buffers = False
     with torch.inference_mode():
         for it in range(N - 1):
@@ -248,6 +300,7 @@ def decode_shipped(torch, model, cache, t0, pos0, N: int, samples: List, e_prev=
                 model.has_buffers = False
                 rewarms.append(dict(step=it, why=why))
             e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            marks.append(len(probe.windows))
             e0.record()
             lg = model.decode_inference(tok, cu, pos, cache)
             tok = lg[:, -1, :].argmax(-1, keepdim=True)
@@ -257,40 +310,80 @@ def decode_shipped(torch, model, cache, t0, pos0, N: int, samples: List, e_prev=
             evs.append((e0, e1))
             if it % 16 == 15:
                 samples.append(mem_sample(torch, "decode %d" % it))
+        marks.append(len(probe.windows))
     torch.cuda.synchronize()
     ms = [a.elapsed_time(b) for a, b in evs]
     itl = None
     if e_prev is not None:
         ends = [e_prev] + [b for _, b in evs]
         itl = [ends[i].elapsed_time(ends[i + 1]) for i in range(len(ends) - 1)]
+    steps, steps_error = None, None
+    try:
+        wms, wl = probe.per_window()
+        nL = len(cache.layers)
+        rw = set(r["step"] for r in rewarms)
+        steps = EC.step_record(ms, EC.split_step_windows(wms, marks, nL), EC.split_step_windows(wl, marks, nL),
+                               [1 if i in rw else 0 for i in range(len(ms))], unit="step")
+    except ValueError as e:                   # recorded; the cell's metrics stand
+        steps_error = str(e)
     return dict(seq=torch.cat(seq, dim=1).cpu(), unit_tokens=[1.0] * len(ms), unit_ms=ms, rewarms=rewarms,
-                gen_tokens=N, rounds=None, itl_ms=itl)
+                gen_tokens=N, rounds=None, steps=steps, steps_error=steps_error, itl_ms=itl)
 
 
-def decode_spec(torch, model, cache, t0, pos0, N: int, cell: EC.Cell, out: Path) -> Dict[str, Any]:
+def decode_spec(torch, model, cache, t0, pos0, N: int, cell: EC.Cell, out: Path, probe: "EngineProbe") -> Dict[str, Any]:
     """spec: the R2 pilot's run_spec_arm (LOCKSTEP) committing >= N - 1 tokens after t0, with its re-warm test
-    replaced by live_rewarm(lookahead K + 1)."""
+    replaced by live_rewarm(lookahead K + 1). v2 per-unit record: a ROUND (its draft + verify + rollback ms; wait =
+    the verify's late-fetch gather ms on the main stream (the draft's prefetch runs on a side stream); blocks = the
+    round's prefetch + late-fetch counters; tokens = c) or a RE-WARM step (its ms; wait and blocks = the probe's
+    windows of that step: only the shipped re-warm steps call decode_update in a spec cell, one window per layer)."""
     os.environ["NOSI_SPEC_OUT"] = str(out / "pilot")                 # the pilot creates its output directory at import
     import spec_loop_pilot as pilot
     pilot.needs_rewarm = lambda m, c: live_rewarm(m, c, cell.K + 1)[0]
     res = pilot.run_spec_arm(model, cache, t0, pos0, cell.K, N - 1, False)
     torch.cuda.synchronize()
     units_t, units_ms, gather = [], [], 0.0
+    u_wait, u_blocks, u_rw = [], [], []
     for r in res["rounds"]:
         if r.get("rewarm"):
             units_t.append(1.0)
             units_ms.append(float(r["step_ms"]))
+            u_wait.append(None)
+            u_blocks.append(None)
+            u_rw.append(1)
             continue
         units_t.append(float(r["c"]))
         units_ms.append(sum(r["draft_ms"]) + float(r["verify_ms"] or 0.0) + float(r["rollback_ms"] or 0.0))
         vs = r.get("verify_split") or {}
-        gather += float(vs.get("gather_ms") or 0.0)
+        g = float(vs.get("gather_ms") or 0.0)
+        gather += g
+        cn = r.get("counters") or {}
+        u_wait.append(g)
+        u_blocks.append(int(cn.get("prefetch_blocks", 0)) + int(cn.get("late_fetch_blocks", 0)))
+        u_rw.append(0)
+    steps, steps_error = None, None
+    try:
+        wms, wl = probe.per_window()
+        nL = len(cache.layers)
+        n_rw = sum(u_rw)
+        # the probe's windows: the pilot's warm-up step (before the first round; not a round record), then one step per
+        # re-warm round, in order
+        rw_wait, rw_blocks = EC.rewarm_unit_windows(wms, n_rw, nL), EC.rewarm_unit_windows(wl, n_rw, nL)
+        k = 0
+        for i, f in enumerate(u_rw):
+            if f:
+                u_wait[i], u_blocks[i] = rw_wait[k], rw_blocks[k]
+                k += 1
+        steps = EC.step_record(units_ms, u_wait, u_blocks, u_rw, unit="round", tokens=units_t,
+                               wait_label="rounds: the verify's late-fetch gathers (main stream); re-warm steps: their decode_update windows")
+    except ValueError as e:
+        steps_error = str(e)
     keep = {k: res.get(k) for k in ("K", "U", "W", "R", "tokens", "counters", "wire", "timely_recall", "host_syncs",
                                      "yield_lockstep_tokens", "yield_ragged_projection_tokens", "agg")}
     return dict(seq=res["seq"], unit_tokens=units_t, unit_ms=units_ms, rewarms=[dict(round=r["r"]) for r in res["rounds"]
                                                                                  if r.get("rewarm")],
                 gen_tokens=1 + int(res["tokens"]), rounds=keep, spec_gather_ms=gather,
-                spec_wire_blocks=int(res["counters"]["prefetch_blocks"]) + int(res["counters"]["late_fetch_blocks"]))
+                spec_wire_blocks=int(res["counters"]["prefetch_blocks"]) + int(res["counters"]["late_fetch_blocks"]),
+                steps=steps, steps_error=steps_error)
 
 
 def run_arm(a, plan: Optional[Dict[str, Any]] = None) -> int:
@@ -384,9 +477,9 @@ def run_arm(a, plan: Optional[Dict[str, Any]] = None) -> int:
         t0tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
         pos0 = position_ids[:, -1:] + 1
         if cell.family == "spec":
-            dec = decode_spec(torch, model, cache, t0tok, pos0, a.n_new, cell, out)
+            dec = decode_spec(torch, model, cache, t0tok, pos0, a.n_new, cell, out, probe)
         else:
-            dec = decode_shipped(torch, model, cache, t0tok, pos0, a.n_new, samples, e_prev=e_pre)
+            dec = decode_shipped(torch, model, cache, t0tok, pos0, a.n_new, samples, probe, e_prev=e_pre)
         e_end = torch.cuda.Event(enable_timing=True)
         e_end.record()
         torch.cuda.synchronize()
@@ -408,17 +501,30 @@ def run_arm(a, plan: Optional[Dict[str, Any]] = None) -> int:
         rec["rewarms"] = dec["rewarms"]
         rec["decode_update_windows"] = n_windows
         rec["spec"] = dec["rounds"]
-        pinned = [t.numel() * t.element_size() for lay in cache.layers
-                  for t in (lay.cache_engine._k_cpu, lay.cache_engine._v_cpu)]
-        rec["host_pinned_gb"] = sum(pinned) / 1e9
-        rec["host"] = host_record(torch, samples, pinned)
+        pinned_list = [t.numel() * t.element_size() for lay in cache.layers
+                       for t in (lay.cache_engine._k_cpu, lay.cache_engine._v_cpu)]
+        pinned = sum(pinned_list)
+        rec["host_pinned_gb"] = pinned / 1e9
+        # v2: the process's host memory (field names: host.rss_peak_gb, host.ru_maxrss_gb, host.pinned_kv_gb,
+        # host.vm_pin_gb, host.rss_samples[].rss_gb) and the per-step timings (steps.json; the summary here)
+        import resource
+        try:
+            rec["host"] = EC.host_record(samples, proc_status(), resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, pinned)
+        except ValueError as e:
+            rec["host"] = dict(error=str(e), pinned_kv_gb=pinned / 1e9)
+        rec["host"].update(host_extras(torch, pinned_list))                  # 4.2: power-of-two size, cgroup peak
+        if dec.get("steps") is not None:
+            (out / "steps.json").write_text(json.dumps(dec["steps"], separators=(",", ":")) + "\n")
+            rec["steps_summary"] = dec["steps"]["summary"]
+        rec["steps_error"] = dec.get("steps_error")
         torch.save(dict(seq=dec["seq"], rows=sched["rows"]), out / "tokens.pt")
+        rss_peak = rec["host"].get("rss_peak_gb")
         (out / "fit_row.json").write_text(json.dumps(dict(family=cell.family, cell=cell.name, B=plan["B"], slots=cell.slots,
                                                           alloc_peak_gb=rec["memory"]["alloc_peak_gb"],
                                                           reserved_peak_gb=rec["memory"]["reserved_peak_gb"],
                                                           nonpt_gb=rec["memory"]["nonpt_gb"], S=int(plan["S"]),
                                                           max_gen=int(plan["max_gen"]),
-                                                          host_peak_gib=rec["host"]["peak_gib"],
+                                                          host_peak_gib=(rss_peak * 1e9 / CS.GIB) if rss_peak is not None else None,
                                                           prefill_alloc_peak_gb=peak_pre["alloc_gb"],
                                                           decode_alloc_peak_gb=peak_dec["alloc_gb"])) + "\n")
         rec["status"] = "done"
@@ -443,7 +549,7 @@ def _err(e: BaseException) -> Dict[str, Any]:
 
 def write(out: Path, rec: Dict[str, Any]) -> None:
     (out / "result.json").write_text(json.dumps(rec, indent=1, default=str) + "\n")
-    names = [n for n in ("fit_row.json", "result.json", "tokens.pt") if (out / n).exists()]
+    names = [n for n in ("fit_row.json", "result.json", "steps.json", "tokens.pt") if (out / n).exists()]
     (out / "SHA256SUMS").write_text("".join("%s  %s\n" % (hashlib.sha256((out / n).read_bytes()).hexdigest(), n)
                                             for n in names))
 
@@ -455,15 +561,26 @@ def run_plan(a) -> int:
     if out.exists():
         print("eqmem: --out %s exists" % out, file=sys.stderr)
         return 2
-    plans = []
-    for c in [x for x in a.cells.split(",") if x.strip()]:
-        plans.append(plan_for(a, EC.parse_cell(c), fit))
+    try:
+        cells = EC.expand_cells(a.cells)
+    except ValueError as e:
+        raise Refused(str(e))
+    plans = [plan_for(a, c, fit) for c in cells]
+    commands = None
+    if a.step_nosi or a.step_holder or a.step_run:
+        try:
+            reps = [int(x) for x in a.step_reps.split(",") if x.strip()]
+        except ValueError:
+            raise Refused("--step-reps %r" % a.step_reps)
+        commands = step_commands(cells, a.budget_gb, a.step_nosi, a.step_holder, a.step_run, reps)
     out.write_text(json.dumps(dict(budget_gb=a.budget_gb, n_new=a.n_new, margin_gb=a.margin_gb, fit=fit.as_dict(),
-                                   plans=plans), indent=1) + "\n")
+                                   cells=[c.name for c in cells], plans=plans, commands=commands), indent=1) + "\n")
     for p in plans:
         print("%-14s B %4d (bound %-11s) slots %3d usable %3d predicted used %.1f GB alloc %.1f GB host %.0f GB"
               % (p["cell"], p["B"], p["bound_by"], p["slots"], p["usable"], p["predicted_used_gb"], p["predicted_alloc_gb"],
                  p["predicted_host_gb"]))
+    for c in commands or []:
+        print(c)
     return 0
 
 
@@ -473,9 +590,10 @@ def run_report(a) -> int:
     if out.exists():
         print("eqmem: --out %s exists" % out, file=sys.stderr)
         return 2
-    results, dirs = [], {}
+    results, dirs, entries = [], {}, []
     for p in sorted(root.glob("*/result.json")):
         r = json.loads(p.read_text())
+        entries.append((r.get("cell"), int(r.get("rep", 0)), r.get("status"), (p.parent / "tokens.pt").exists()))
         if r.get("status") in ("running", "refused", "wrong_gpu", "module_origin") or "plan_key" not in r:
             continue
         if r.get("status") != "done":
@@ -487,14 +605,21 @@ def run_report(a) -> int:
         return 1
     rep = EC.comparison(results)
     import torch
-    ref = dirs.get(("original", 0))
+    # v2: the agreement reference is the FIRST COMPLETED repetition of the original cell (rep 0 may have failed:
+    # h41 original_rep0 was OOM-killed and original_rep1 completed); every other completed (cell, rep) is compared
+    ref = EC.agreement_reference(entries)
     agree = {}
-    if ref is not None and (ref / "tokens.pt").exists():
-        rt = torch.load(ref / "tokens.pt")["seq"].tolist()
+    if ref is not None:
+        rt = torch.load(dirs[ref] / "tokens.pt")["seq"].tolist()
         for (cell, r_), d in sorted(dirs.items()):
-            if (cell, r_) != ("original", 0) and (d / "tokens.pt").exists():
+            if (cell, r_) != ref and (d / "tokens.pt").exists():
                 agree["%s_rep%d" % (cell, r_)] = EC.prefix_agreement(torch.load(d / "tokens.pt")["seq"].tolist(), rt)
-    rep["agreement_vs_original_rep0"] = agree
+    rep["agreement_reference"] = ("%s_rep%d" % ref) if ref else None
+    rep["agreement_vs_original"] = agree
+    rep["first_completed_rep"] = EC.first_completed(entries)
+    rep["capacity_scan"] = EC.capacity_scan(results)
+    rep["steps_summary"] = {"%s_rep%d" % (r["cell"], r.get("rep", 0)): r.get("steps_summary") for r in results}
+    rep["host"] = {"%s_rep%d" % (r["cell"], r.get("rep", 0)): r.get("host") for r in results}
     valid = [r for r in results if not r.get("error") and r["memory"]["verdict"] == "VALID"]
     Q = a.workload_q or max((r["metrics"]["batch"] for r in valid), default=0)
     derived = {}
@@ -520,7 +645,29 @@ def run_report(a) -> int:
             _f(c.get("latency_e2e_s")), _f(c.get("used_peak_est_gb")), c["over_budget"]))
     lines += ["", "best per family: %s" % {f: (b or {}).get("cell") for f, b in rep["best"].items()},
               "speedups e2e: %s" % rep["speedup_e2e_tok_s"], "speedups decode: %s" % rep["speedup_decode_tok_s"],
-              "LABEL: the spec family is LOCKSTEP (c = 1 + min_b n_acc per round): a LOWER BOUND of stage 3 until R2-M2"]
+              "LABEL: the spec family is LOCKSTEP (c = 1 + min_b n_acc per round): a LOWER BOUND of stage 3 until R2-M2",
+              "token agreement reference (the first completed original repetition): %s" % rep["agreement_reference"]]
+    cs = rep["capacity_scan"]
+    if cs["table"]:
+        lines += ["", "## capacity scan (MEASURED cells; %s)" % cs["key"], "",
+                  "| P | cell | reps | batch | decode tok/s | e2e tok/s | bytes/token |", "|---|---|---|---|---|---|---|"]
+        for t in cs["table"]:
+            lines.append("| %d | %s | %d | %d | %s | %s | %s |" % (t["P"], t["cell"], t["reps"], t["batch"], _f(t.get(cs["key"]), "%.1f"),
+                                                             _f(t["e2e_tok_s"], "%.1f"), _f(t["bytes_per_committed_token"], "%.0f")))
+        if cs["best"]:
+            lines.append("measured best P %d (%s, %.1f), %s of the scan%s" % (
+                cs["best"]["P"], cs["best"]["cell"], cs["best"]["value"], cs["position"],
+                ("; %+.1f%% over the original" % (100 * cs["best_vs_original"])) if cs.get("best_vs_original") is not None else ""))
+    steps_rows = [(k, s) for k, s in sorted(rep["steps_summary"].items()) if s]
+    if steps_rows:
+        lines += ["", "## per-step split (MEASURED per unit: CUDA events; steady = units without a re-warm)", "",
+                  "| cell | unit | units | re-warm units | steady total ms (median) | steady wait ms (median) | steady rest ms (median) | steady wait share |",
+                  "|---|---|---|---|---|---|---|---|"]
+        for k, s in steps_rows:
+            med = lambda x: _f((x or {}).get("median"), "%.1f")
+            lines.append("| %s | %s | %d | %d | %s | %s | %s | %s |" % (k, s["unit"], s["n"], s["rewarm_units"], med(s["steady_total"]),
+                                                                    med(s["steady_wait"]), med(s["steady_rest"]),
+                                                                    _f(s["steady_wait_share"], "%.3f")))
     (out / "report.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
     return 0

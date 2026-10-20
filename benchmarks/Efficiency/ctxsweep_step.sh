@@ -13,9 +13,11 @@
 #   ctx     16128 | 65280 | 130816 (the workload files of that context, sha256 pinned below)
 #   cell    original | cached:<P> (P 1 .. 160) | spec:<K> (K 1 .. 8; NOSI_VERIFY_ROUND_SLOTS 62, pool 0, LOCKSTEP)
 #   batch   an explicit B (1 .. 4096, at most the int32 envelope of the context) or max (the largest B that
-#           ctxsweep_core.plan_ctx_cell admits; the arm refits from the fit_row.json files already in the run directory)
+#           ctxsweep_core.plan_ctx_cell admits; the arm refits from the fit_row.json files already in the run directory
+#           and, at budget 75, in the earlier runs PRIOR_RUNS: run cs1)
 #   mem     the srun --mem in GiB, 64 .. 440 (the holder has 480G; the pinned host KV is rounded up to powers of two)
-#   report  ctxsweep_bench.py --mode report over the run directory (and the 4.1 run directory EQ41 at budget 75)
+#   report  ctxsweep_bench.py --mode report over the run directory (and, at budget 75, PRIOR_RUNS and the 4.1 run
+#           directory EQ41)
 # GPU PIN: GPU_UUID is read from the lead-owned file HOLDERS/<holder>.gpu_uuid (one line, the uuid without "GPU-").
 # A missing, unreadable or malformed file STOPS (exit 1) before any claim. The value and the file's path go into
 # command.txt; the child checks the visible GPU against it (exit 3). DRYRUN only: CTXSWEEP_DRYRUN_HOLDERS=<dir> reads the
@@ -34,7 +36,7 @@
 # GPU, 4 refused, 6 module origin; 124 / 137 the host timeout); 1 a STOP before the launch; 2 a usage error; 5 an exit-0
 # step whose record is incomplete or whose sacct row is not COMPLETED 0:0.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-ctxsweep                                                    # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-ctxsweep-v2                                                 # ROOT (feature/nosi-ctxsweep-v2)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned, mode 444)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -50,6 +52,7 @@ MAN_SHA_130816=6f64ce9aa9d003ef05c8491cd6753ae98d84baeba971090ab766885a926a7bee 
 JITBASE=/mnt/beegfs/ojerbi/nosa-env/jit                                                  # ROOT
 OUTROOT=/mnt/beegfs/ojerbi/ctxsweep-runs                                                 # ROOT
 EQ41=/mnt/beegfs/ojerbi/eqmem-runs/eqmem_h41_2188818_b75                                 # ROOT (4.1: the 16K max-batch cells)
+PRIOR_RUNS="/mnt/beegfs/ojerbi/ctxsweep-runs/ctxsweep_cs1_2188818_b75"                   # ROOT (4.2 runs at budget 75 before this one)
 SELF=benchmarks/Efficiency/ctxsweep_step.sh
 N=512 MARGIN=1.0 SPLITS=0 R_SLOTS=62 MEM_MAX=440
 main() {
@@ -132,10 +135,15 @@ if [ "$MODE" = arm ]; then
 fi
 RUNDIR=$OUTROOT/ctxsweep_${RUN}_${JOB}_b$BUDGET
 JIT=$JITBASE/ctxsweep_${RUN}_$JOB
+PRIOR=()                  # budget 75: the earlier 4.2 runs (their measured rows refit this run's plans; the report reads them)
+if [ "$BUDGET" = 75 ]; then
+    for d in $PRIOR_RUNS; do [ -d "$d" ] && [ "$d" != "$RUNDIR" ] && PRIOR+=("$d"); done
+fi
 if [ "$MODE" = report ]; then
     STEM=report
     NAME=ctxs-report-b$BUDGET-$RUN-$JOB
     DRV=(--mode report --results "$RUNDIR")
+    for d in "${PRIOR[@]}"; do DRV+=(--results "$d"); done
     [ "$BUDGET" = 75 ] && [ -d "$EQ41" ] && DRV+=(--results "$EQ41")
 else
     STEM=s${CTX}_${NAME_CELL}_b${BATCH}_rep$REP
@@ -143,6 +151,7 @@ else
     DRV=(--mode arm --ctx "$CTX" --cell "$CELL" --batch "$BATCH" --mem-gib "$MEM" --budget-gb "$BUDGET" --n-new "$N"
          --margin-gb "$MARGIN" --rep "$REP" --fit-rows-dir "$RUNDIR" --model "$MODEL"
          --tokens "$WL/${STEMF}_tokens.bin" --manifest "$WL/${STEMF}_manifest.json" --gpu-uuid "$GPU_UUID")
+    for d in "${PRIOR[@]}"; do DRV+=(--fit-rows-dir "$d"); done
 fi
 ENVS=(--env PYTHONPATH="$NOSI/nosi" --env NOSI_REPO="$NOSI" --env PYTHONDONTWRITEBYTECODE=1 --env HF_HUB_OFFLINE=1
       --env TRANSFORMERS_OFFLINE=1 --env TORCH_CUDA_ARCH_LIST=8.0 --env TRITON_LIBCUDA_PATH=/.singularity.d/libs
@@ -206,9 +215,9 @@ mkdir -p "$JIT" || stop "cannot create $JIT (ctxsweep_active stays)"
 busy=$(nosteps) || stop "a step is running in $JOB under the claim: '$busy' (ctxsweep_active stays)"
 argv_for "$OUT"
 printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/command.txt (ctxsweep_active stays)"
-printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s ctx=%s cell=%s batch=%s mem=%s rep=%s budget=%s run=%s step_min=%s utc_start=%s\n' \
+printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s ctx=%s cell=%s batch=%s mem=%s rep=%s budget=%s run=%s step_min=%s prior_runs=%s utc_start=%s\n' \
     "$NSHA" "$blob" "$GPU_UUID" "$UUID_FILE" "$JOB" "$sl" "${CTX:-}" "${CELL:-report}" "${BATCH:-}" "$STEP_MEM" \
-    "${REP:-}" "$BUDGET" "$RUN" "$STEP_MIN" "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
+    "${REP:-}" "$BUDGET" "$RUN" "$STEP_MIN" "${PRIOR[*]:-none}" "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
     stop "cannot write $REC (ctxsweep_active stays)"
 "${ARGV[@]}" < /dev/null > "$REC/stdout.txt" 2> "$REC/stderr.txt"
 rc=$?

@@ -196,16 +196,16 @@ def run_report(a) -> int:
             lines.append("| %s | %s | %d | %s | %s | %s | %s | %d | %d |" % (
                 name, c["family"], c["runs"], c.get("batch"), EB._m(c.get("e2e_tok_s")), EB._m(c.get("decode_tok_s")),
                 _f(c.get("used_peak_est_gb"), "%.2f"), c["over_budget"], c["errors"]))
-        lines += ["", "| B | cell | e2e tok/s | decode tok/s (GPU units) [CI] | TTFT s | token p50 / p95 ms | vs | verdict |",
-                  "|---|---|---|---|---|---|---|---|"]
+        lines += ["", "| B | cell | e2e tok/s | decode tok/s (GPU units) [CI] | steady tok/s | TTFT s | token p50 / p95 ms "
+                      "| vs | verdict | steady verdict |", "|---|---|---|---|---|---|---|---|---|---|"]
         for B, mb in blk["matched"].items():
             for name, c in sorted(mb["cells"].items()):
                 cand = mb["candidates"].get(name)
-                lines.append("| %s | %s | %s | %s [%s, %s] | %s | %s / %s | %s | %s |" % (
+                lines.append("| %s | %s | %s | %s [%s, %s] | %s | %s | %s / %s | %s | %s | %s |" % (
                     B, name, _f(c["e2e_tok_s"]), _f(c["decode_tok_s_gpu_units"]), _f(c["decode_ci"][0]),
-                    _f(c["decode_ci"][1]), _f(c["ttft_s"], "%.2f"), _f(c["token_p50_ms"]), _f(c["token_p95_ms"]),
-                    mb["baseline"] if cand else "(baseline)" if name == mb["baseline"] else "",
-                    cand["verdict"] if cand else ""))
+                    _f(c["decode_ci"][1]), _f(c["steady_tok_s"]), _f(c["ttft_s"], "%.2f"), _f(c["token_p50_ms"]),
+                    _f(c["token_p95_ms"]), mb["baseline"] if cand else "(baseline)" if name == mb["baseline"] else "",
+                    cand["verdict"] if cand else "", cand["verdict_steady"] if cand else ""))
         eq = blk["equal_memory"]
         lines += ["", "equal memory: best per family %s; best baseline %s; candidates %s" % (
             {f: (b or {}).get("cell") for f, b in eq["best"].items()}, eq["best_baseline"], eq["speedup_e2e"]), ""]

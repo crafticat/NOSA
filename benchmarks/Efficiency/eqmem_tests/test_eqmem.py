@@ -274,7 +274,8 @@ def test_EM8_driver_cpu(tmp_path, monkeypatch):
     assert EB.main(["--mode", "report", "--results", str(run), "--out", str(rep_out)]) == 0
     rep = json.loads((rep_out / "report.json").read_text())
     assert rep["best"]["cached"]["cell"] == "cached_p50" and rep["speedup_e2e_tok_s"]["cached_vs_original"] == pytest.approx(0.5)
-    ag = rep["agreement_vs_original_rep0"]["cached_p50_rep0"]
+    assert rep["agreement_reference"] == "original_rep0"                                 # v2: the first completed original
+    ag = rep["agreement_vs_original"]["cached_p50_rep0"]
     assert ag["requests"] == 3 and ag["full_agreement"] == 2 and ag["prefix_min"] == 3
     assert rep["derived_workload"]["original"]["batches"] == 1 and rep["derived_workload"]["cached"]["batches"] == 2
     assert "LOCKSTEP" in (rep_out / "report.md").read_text()

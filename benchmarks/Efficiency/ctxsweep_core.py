@@ -17,7 +17,7 @@ width change of the compressed length; at all three contexts the first width cha
 (N + K + 1 <= 1024). F4 is parity (kept). The findings document has no F5 (F1-F4 only).
 
 GPU MEMORY (SMemFit; PyTorch allocated peak, GB; the budget is compared with the DEVICE-LEVEL use, as in 4.1):
-    alloc(S, B, slots) = A(S) + b(S) * B + c * B * slots   (+ spec_fixed + spec_req(S) * B for the spec family)
+    alloc(S, B, slots) = A(S) + b(S) * B + c(S) * B * slots   (+ spec_fixed + spec_req(S) * B for the spec family)
     A(S) = A16 + a1 * (S - S0) + a2 * (S^2 - S0^2), S0 = 16128: the weights, the cos/sin cache and the PREFILL
         transient (one request at a time: the MLP activations grow with S, the stage-1 scores with S^2 / 16)
     b(S) = b16 + b1 * (S - S0): per-request tables. B1_BYTES = 1180.3 B per prompt token per request: the compressed
@@ -25,23 +25,32 @@ GPU MEMORY (SMemFit; PyTorch allocated peak, GB; the budget is compared with the
         the pooling buffers 0.28, the prompt ids and positions on the GPU 12
     spec_req(S) = spec_req16 + spec_b1 * (S - S0): the round journal keeps the round-start compressed-key tensor while
         a draft re-binds it (spec_loop.LayerJournal.compress_k_ref): 1024 B per prompt token per request
-  prior_fit (MODELLED until refit): c = max(the code's bytes per slot per request, 0.0021053; the measured slopes at
-  long context: 64K x 64 over P 0..97, job 2174639; 128K x 60 over P 0 / 50, job 2174878); b16 = the least-squares
-  slope and A16 = the upper envelope (no row above the line) of B's six 16K frontier peaks (job 2175389) at that c; b1
-  from the code; a1, a2 solved so that the two long-context P = 0 peaks (64K x 64: 40.82 GB, 128K x 60: 55.11 GB) are
-  exact. The old harness (test_nosa_pg19) read 2.5-3 GB ABOVE the 4.1 harness at 16K (job 2188818 h41 rows), so the
-  prior is conservative there.
+  prior_fit (MODELLED until refit): the 16K ANCHOR is B's 4.1 fit (eqmem_core.MemFit: A16 18.83, b16 0.04115,
+  c16 0.002035, the spec terms, the reserve and non-PyTorch terms), so at S = 16128 every 4.1 cell plans exactly as
+  4.1 (CPU test CS10). c(S): c16 at 16128, c_long = max(the code's bytes per slot per request, 0.0021053; the measured
+  slopes at long context: 64K x 64 over P 0..97, job 2174639; 128K x 60 over P 0 / 50, job 2174878) from 65280 on,
+  linear in between (B's three-term fit puts part of the per-request bytes into b16). b1 from the code; a1, a2 solved
+  so that the two long-context P = 0 peaks (64K x 64: 40.82 GB, 128K x 60: 55.11 GB) are exact. The old harness
+  (test_nosa_pg19) read 2.5-3 GB ABOVE the 4.1 harness at 16K (job 2188818 h41 rows), so the prior is conservative.
   fit_ctx_from_rows: every measured cell writes a row (S, B, slots, peaks). Per context, the baseline rows refit
   (A_S, b_S): two or more batch sizes give the least-squares slope and the upper-envelope intercept; one batch size
   gives b_S = 1.25 x the prior's b(S) and the envelope intercept. A cell is VALID only when its MEASURED device-level
   peak is <= the budget (eqmem_core.memory_record).
+  PHASES (run cs1, CS1_ROWS): the PREFILL phase sets every measured peak (128K x 4: 38.5 GB in prefill, 17.6 GB in
+  decode). The decode-phase peaks lie on their own line: A_dec 16.45 GB at 64K and 128K, b_dec 0.081 / 0.162 GB per
+  request, the same slot term. With two batch sizes of decode rows at a context, the peak model there is the larger of
+  the prefill line (A_S + b_S B + c B slots) and the decode line (A_dec + b_dec B + c B slots + the spec terms: the
+  pilot's scratch and the journal exist only in the decode). Without them, the 4.1 rule (spec terms on the prefill
+  line) stays, which is conservative for spec.
 
 HOST MEMORY (HostFit; GiB, the unit of srun --mem). The pinned host KV is 64 tensors (32 layers x K, V) of
   B * (S + max_gen) * 2 heads * 128 * 2 B. MEASURED (HOST_EVIDENCE, 8 rows, VmHWM): the CUDA caching host allocator
   ROUNDS EVERY PINNED TENSOR UP TO A POWER OF TWO. 16K x 222..344, 64K x 64 and 128K x 60 all read 273.0-273.1 GiB =
   64 x 4 GiB + 17 GiB; 16K x 16 reads 32.9 = 64 x 0.25 + 17. The nominal size explains none of the large rows (64K x 64
   is 143.5 GiB nominal). The 4.1 original cell (16K x 304, max_gen 576) was OOM-killed at 240G with 30 of 32 layers
-  pinned: 60 x 4 GiB = 240 GiB (step 2188818.38). Its nominal KV (155 GiB) could not have been killed.
+  pinned: 60 x 4 GiB = 240 GiB (step 2188818.38). Its nominal KV (155 GiB) could not have been killed. This harness
+  (run cs1, 11 cells, CS1_ROWS): 64K x 8 and 128K x 4 read 48.86 GiB = 64 x 0.5 + 16.86; 64K x 32 and 128K x 16 read
+  144.8-144.9 GiB = 64 x 2 + 16.85-16.91; 16K x 16 reads 32.86-32.89 = 64 x 0.25 + 16.86. Refit base 17.9 GiB.
   Modes: '2x' is the DEFAULT until this harness measures a row (twice the nominal KV; always >= the power-of-two size);
   'pow2' comes from fit_host_from_rows (the base from the measured rows + 1 GiB); 'nominal' is for the evidence test.
   host(B) = base + KV + the prompt ids on the host (2 x B x S x 8 B). The step's --mem: need = ceil10(1.08 x host + 6),
@@ -64,12 +73,16 @@ LATENCY (latency_metrics; ONE clock, the arm's CUDA events from the prefill star
   TPOT = (end - first token) / (N - 1); the committed tokens / s on the same clock (the wall-clock e2e stays in
   eqmem_core.arm_metrics).
 
-TIME (est_minutes, per cell; MEASURED inputs): prefill 0.160 / 0.191 / 0.204 ms per prompt token at 16K / 64K / 128K
-  (4.1 h41: 2.55-2.63 s per 16K request; 2174639: about 798 s per 64 x 64K; 2174878: about 1604 s per 60 x 128K); the
-  first decode step about 10 s at every context; a re-warm 4 + B * S / 1612800 s; a shipped step
-  15 + B * (0.60 + 0.0018 * S / 1000) ms (x 0.8 with a pool); the spec family x 2.0 / 2.6 / 3.9 for K = 1 / 2 / 3
-  (4.1 h41: spec k2 287 s and k3 436 s of decode at B 161, against 113 s estimated for the shipped decode); 1 min of
-  process overhead. Check: 4.1 cached p50 at B 191 is estimated 11.1 min; the step took 10:22.
+  steady_tok_s (the report): B x 1000 / the p50 per-token latency, a decode rate without the re-warm steps.
+
+TIME (est_minutes, per cell; MEASURED inputs, run cs1): prefill 0.168 / 0.1894 / 0.2140 ms per prompt token at
+  16K / 64K / 128K (cs1: 2.71 s per 16K request, 12.36 per 64K, 28.0 per 128K; 4.1 h41: 2.55-2.63 per 16K); the first
+  decode step about 9 s; a RE-WARM step about 6 s at every context and batch (the warm-up path re-captures the CUDA
+  graphs; 8 re-warms in N = 512 take 75-80 % of the decode time at B <= 32); a steady shipped step (step_ms)
+  15 + 0.11 S / 1000 + B (0.45 + 0.0012 S / 1000) ms, the per-request part x 0.8 with a pool; the spec family x 2.2 /
+  2.8 / 4.3 for K = 1 / 2 / 3 (4.1 h41, the pre-fix pilot: spec k2 287 s and k3 436 s of decode at B 161 against 103 s
+  estimated shipped); 0.7 min of process overhead; the FIRST cell of a run also compiles its kernels (+100 s of prefill:
+  cs1 64K x 8). Check: 4.1 cached p50 at B 191 is estimated 11.0 min; the step took 10:22.
 """
 from __future__ import annotations
 
@@ -174,11 +187,15 @@ def envelope_line(points: Sequence[Tuple[float, float]], slope: Optional[float] 
     return max(y - sl * x for x, y in points), sl
 
 
+C_LONG_FROM = 65280                           # c(S) = c_long from this context on (linear from c16 at S0)
+
+
 @dataclass(frozen=True)
 class SMemFit:
     A16: float
     b16: float
-    c: float
+    c16: float
+    c_long: float
     a1: float
     a2: float
     b1: float = B1_BYTES / 1e9
@@ -188,8 +205,14 @@ class SMemFit:
     spec_fixed_gb: float = 1.5
     spec_req16_gb: float = 0.012
     spec_b1: float = SPEC_B1_BYTES / 1e9
-    per_ctx: Tuple[Tuple[int, float, float, int], ...] = ()      # (S, A_S, b_S, distinct batch sizes) measured
+    # measured, per context: (S, A_S, b_S, distinct batch sizes, A_dec, b_dec); A_dec / b_dec = the DECODE-phase line
+    # (decode_alloc_peak_gb rows; None when no row has it): with it the peak is the larger of the two phases
+    per_ctx: Tuple[Tuple[Any, ...], ...] = ()
     source: str = "prior_fit"
+
+    def c_at(self, S: int) -> float:
+        w = min(1.0, max(0.0, (int(S) - self.S0) / float(C_LONG_FROM - self.S0)))
+        return self.c16 + (self.c_long - self.c16) * w
 
     def _cal(self, S: int):
         for row in self.per_ctx:
@@ -218,47 +241,81 @@ class SMemFit:
         cal = self._cal(S)
         return int(cal[3]) if cal is not None else 0
 
+    def dec_at(self, S: int) -> Optional[Tuple[float, float]]:
+        """(A_dec, b_dec) of the measured decode phase at S, or None (then the prefill-phase model holds alone)."""
+        cal = self._cal(S)
+        if cal is None or len(cal) < 6 or cal[4] is None or cal[5] is None:
+            return None
+        return float(cal[4]), float(cal[5])
+
+    def phases(self, cell: EC.Cell, S: int) -> Dict[str, Any]:
+        """The peak model of a cell at S as two lines in B (alloc = max over the phases of fixed + per_req * B):
+        prefill = A(S) + b(S) B + c(S) B slots (the spec terms too while the decode phase is not measured: the 4.1
+        rule); decode (measured contexts only) = A_dec + b_dec B + c(S) B slots + the spec terms."""
+        spec = cell.family == "spec"
+        sf, sr = (self.spec_fixed_gb, self.spec_req_at(S)) if spec else (0.0, 0.0)
+        c = self.c_at(S)
+        dec = self.dec_at(S)
+        if dec is None:
+            return dict(prefill=(self.A_at(S) + sf, self.b_at(S) + c * cell.slots + sr), decode=None)
+        return dict(prefill=(self.A_at(S), self.b_at(S) + c * cell.slots),
+                    decode=(dec[0] + sf, dec[1] + c * cell.slots + sr))
+
+    def alloc_gb(self, cell: EC.Cell, S: int, B: int) -> float:
+        ph = self.phases(cell, S)
+        lines = [ph["prefill"]] + ([ph["decode"]] if ph["decode"] is not None else [])
+        return max(f + p * B for f, p in lines)
+
+    def used_gb(self, cell: EC.Cell, S: int, B: int) -> float:
+        return self.alloc_gb(cell, S, B) * (1.0 + self.reserve_frac) + self.nonpt_gb
+
     def at(self, S: int) -> EC.MemFit:
         """The 4.1 fit (eqmem_core.MemFit) evaluated at S: eqmem_core.plan_cell / stage_breakdown use it unchanged."""
-        return EC.MemFit(A=self.A_at(S), b=self.b_at(S), c=self.c, reserve_frac=self.reserve_frac,
+        return EC.MemFit(A=self.A_at(S), b=self.b_at(S), c=self.c_at(S), reserve_frac=self.reserve_frac,
                          nonpt_gb=self.nonpt_gb, spec_fixed_gb=self.spec_fixed_gb,
                          spec_per_req_gb=self.spec_req_at(S),
                          source="ctxsweep_core.SMemFit at S %d (%s)" % (int(S), self.source))
 
     def as_dict(self) -> Dict[str, Any]:
-        return dict(A16=self.A16, b16=self.b16, c=self.c, a1=self.a1, a2=self.a2, b1=self.b1, S0=self.S0,
+        return dict(A16=self.A16, b16=self.b16, c16=self.c16, c_long=self.c_long, a1=self.a1, a2=self.a2, b1=self.b1,
+                    S0=self.S0,
                     reserve_frac=self.reserve_frac, nonpt_gb=self.nonpt_gb, spec_fixed_gb=self.spec_fixed_gb,
                     spec_req16_gb=self.spec_req16_gb, spec_b1=self.spec_b1, per_ctx=[list(r) for r in self.per_ctx],
                     source=self.source)
 
 
-def prior_fit() -> SMemFit:
-    """The MODELLED S-aware fit (module docstring GPU MEMORY), computed from the evidence constants."""
+def prior_fit(anchor: Optional[EC.MemFit] = None) -> SMemFit:
+    """The MODELLED S-aware fit (module docstring GPU MEMORY), computed from the evidence constants. anchor: the 16K
+    fit (default eqmem_core.MemFit(), the 4.1 plan's): A16, b16, c16 and the reserve / non-PyTorch / spec terms."""
+    m = anchor or EC.MemFit()
     s64 = _slope([(64.0 * P, gb) for P, gb in SLOT_SWEEP_64K])
     (p0, g0), (p1, g1) = SLOT_PAIR_128K
     s128 = (g1 - g0) / (60.0 * (p1 - p0))
-    c = max(C_SLOT_BYTES / 1e9, s64, s128)
-    A16, b16 = envelope_line([(float(B), gb - c * B * (EC.TOPK + P)) for B, P, gb in EC.FRONTIER_2175389])
+    c_long = max(C_SLOT_BYTES / 1e9, s64, s128)
     b1 = B1_BYTES / 1e9
     rows = []
     for S, B, gb in LONG_P0:
-        r = gb - (A16 + b16 * B + c * B * EC.TOPK) - b1 * B * (S - S0)
+        r = gb - (m.A + m.b * B + c_long * B * EC.TOPK) - b1 * B * (S - S0)
         rows.append((float(S - S0), float(S * S - S0 * S0), r))
     (d1, q1, r1), (d2, q2, r2) = rows
     det = d1 * q2 - d2 * q1
     a1 = (r1 * q2 - r2 * q1) / det
     a2 = (d1 * r2 - d2 * r1) / det
-    return SMemFit(A16=A16, b16=b16, c=c, a1=a1, a2=a2, b1=b1,
-                   source=("prior: c = max(code %.7f, 64K slope %.7f, 128K slope %.7f); A16, b16 the envelope of the 16K "
-                           "frontier (2175389); b1 code bytes; a1, a2 exact through 64K x 64 and 128K x 60 at P 0"
-                           % (C_SLOT_BYTES / 1e9, s64, s128)))
+    return SMemFit(A16=m.A, b16=m.b, c16=m.c, c_long=c_long, a1=a1, a2=a2, b1=b1, reserve_frac=m.reserve_frac,
+                   nonpt_gb=m.nonpt_gb, spec_fixed_gb=m.spec_fixed_gb, spec_req16_gb=m.spec_per_req_gb,
+                   source=("prior: the 16K anchor = the 4.1 fit (%s); c_long = max(code %.7f, 64K slope %.7f, 128K slope "
+                           "%.7f); b1 code bytes; a1, a2 exact through 64K x 64 and 128K x 60 at P 0"
+                           % (m.source[:60], C_SLOT_BYTES / 1e9, s64, s128)))
 
 
 def fit_ctx_from_rows(rows: Sequence[Dict[str, Any]], prior: Optional[SMemFit] = None) -> SMemFit:
     """Refit from MEASURED cell rows (fit_row.json: family, S (default 16128: the 4.1 rows), B, slots, alloc_peak_gb,
     reserved_peak_gb, nonpt_gb). Per context, the baseline rows give (A_S, b_S) (module docstring); reserve_frac = the
     mean (reserved - alloc) / alloc and nonpt_gb = the max non-PyTorch use over all rows; spec_fixed = the LARGEST
-    excess of a spec row over the refit baseline terms and spec_req(S) (never below 0)."""
+    excess of a spec row over the refit baseline terms and spec_req(S) (never below 0), over the DECODE phase when that
+    phase is measured at the row's context (the spec scratch and the journal live in the decode only).
+    The decode-phase line (A_dec, b_dec) comes the same way from decode_alloc_peak_gb (rows of this harness only); a
+    context with fewer than two batch sizes keeps no decode line (the prefill-phase model alone, conservative)."""
     prior = prior or prior_fit()
     cal = {int(r[0]): tuple(r) for r in prior.per_ctx}
     src = []
@@ -266,19 +323,28 @@ def fit_ctx_from_rows(rows: Sequence[Dict[str, Any]], prior: Optional[SMemFit] =
     for r in rows:
         if r.get("family") in BASELINE_FAMILIES:
             by_s.setdefault(int(r.get("S") or S0), []).append(r)
-    for S, rs in sorted(by_s.items()):
-        pts = [(float(r["B"]), float(r["alloc_peak_gb"]) - prior.c * int(r["B"]) * int(r["slots"])) for r in rs]
+
+    def line(rs, key, S, b_one):
+        pts = [(float(r["B"]), float(r[key]) - prior.c_at(S) * int(r["B"]) * int(r["slots"])) for r in rs]
         nb = len({int(x) for x, _ in pts})
         if nb >= 2:
-            A_S, b_S = envelope_line(pts)
-            if b_S < 0:
-                A_S, b_S = envelope_line(pts, 0.0)
-            how = "slope over %d batch sizes" % nb
-        else:
-            A_S, b_S = envelope_line(pts, 1.25 * prior.b_at(S))
-            how = "one batch size: b = 1.25 x the prior"
-        cal[S] = (S, A_S, b_S, nb)
-        src.append("S %d: A %.2f b %.4f from %d rows (%s)" % (S, A_S, b_S, len(rs), how))
+            A, b = envelope_line(pts)
+            if b < 0:
+                A, b = envelope_line(pts, 0.0)
+            return A, b, nb
+        if b_one is None:
+            return None, None, nb
+        A, b = envelope_line(pts, b_one)
+        return A, b, nb
+
+    for S, rs in sorted(by_s.items()):
+        A_S, b_S, nb = line(rs, "alloc_peak_gb", S, 1.25 * prior.b_at(S))
+        drs = [r for r in rs if r.get("decode_alloc_peak_gb") is not None]
+        A_d, b_d, nbd = line(drs, "decode_alloc_peak_gb", S, None) if drs else (None, None, 0)
+        cal[S] = (S, A_S, b_S, nb, A_d, b_d)
+        src.append("S %d: A %.2f b %.4f from %d rows (%s)%s" % (
+            S, A_S, b_S, len(rs), "slope over %d batch sizes" % nb if nb >= 2 else "one batch size: b = 1.25 x the prior",
+            "; decode phase A %.2f b %.4f" % (A_d, b_d) if A_d is not None else ""))
     fit = replace(prior, per_ctx=tuple(cal[k] for k in sorted(cal)))
     rf, npt, sf = prior.reserve_frac, prior.nonpt_gb, prior.spec_fixed_gb
     if rows:
@@ -291,8 +357,12 @@ def fit_ctx_from_rows(rows: Sequence[Dict[str, Any]], prior: Optional[SMemFit] =
         ex = []
         for r in spec_rows:
             S, B = int(r.get("S") or S0), int(r["B"])
-            ex.append(float(r["alloc_peak_gb"]) - (fit.A_at(S) + fit.b_at(S) * B + fit.c * B * int(r["slots"])
-                                                   + fit.spec_req_at(S) * B))
+            dec = fit.dec_at(S)
+            if dec is not None and r.get("decode_alloc_peak_gb") is not None:
+                base, peak = dec[0] + dec[1] * B, float(r["decode_alloc_peak_gb"])
+            else:
+                base, peak = fit.A_at(S) + fit.b_at(S) * B, float(r["alloc_peak_gb"])
+            ex.append(peak - (base + fit.c_at(S) * B * int(r["slots"]) + fit.spec_req_at(S) * B))
         sf = max(0.0, max(ex))
         src.append("spec_fixed from %d spec rows" % len(spec_rows))
     return replace(fit, reserve_frac=rf, nonpt_gb=npt, spec_fixed_gb=sf,
@@ -310,6 +380,28 @@ HOST_EVIDENCE = (        # (S, B, max_gen, VmHWM GiB, source): one row per cell 
     (65280, 64, 8192, 273.1, "2174639 p0_L65280_B64"),
     (130816, 60, 8192, 273.1, "2174878 p0_L130816_B60"))
 HOST_OOM_4_1 = (16128, 304, 576, 30, 240)   # (S, B, max_gen, layers pinned, --mem GiB): step 2188818.38 OUT_OF_MEMORY
+
+# run cs1 (60b5b03, holder 2188818, 2026-10-20; /mnt/beegfs/ojerbi/ctxsweep-runs/ctxsweep_cs1_2188818_b75/*/fit_row.json):
+# (family, S, B, slots, alloc_peak_gb, reserved_peak_gb, nonpt_gb, decode_alloc_peak_gb, host_peak_gib); max_gen 576
+CS1_ROWS = (
+    ("original", 16128, 16, 64, 21.497161728, 21.755854848, 0.600702976, 18.95066624, 32.863956451416016),
+    ("cached", 16128, 16, 97, 22.60993024, 22.810722304, 0.600702976, 20.063434752, 32.8900260925293),
+    ("original", 65280, 8, 64, 28.556770304, 29.746003968, 0.634257408, 18.181823488, 48.862632751464844),
+    ("cached", 65280, 8, 114, 29.3996288, 30.50307584, 0.634257408, 19.024681984, 48.851234436035156),
+    ("original", 65280, 32, 64, 33.672712704, 35.160850432, 0.835584, 23.369504256, 144.8959083557129),
+    ("cached", 65280, 32, 114, 37.044081152, 38.155583488, 0.835584, 26.740872704, 144.84499740600586),
+    ("cached", 65280, 32, 161, 40.212058624, 41.357934592, 0.835584, 29.908850176, 144.83872604370117),
+    ("original", 130816, 4, 64, 38.454758912, 41.605398528, 0.634257408, 17.636417024, 48.866207122802734),
+    ("cached", 130816, 4, 114, 38.876204544, 41.67041024, 0.634257408, 18.057862656, 48.833824157714844),
+    ("original", 130816, 16, 64, 41.961658368, 43.541069824, 0.835584, 21.20457216, 144.89682388305664),
+    ("cached", 130816, 16, 114, 43.647342592, 46.0849152, 0.835584, 22.890256384, 144.82362365722656),
+    ("cached", 130816, 16, 161, 45.231347712, 47.666167808, 0.835584, 24.474261504, 144.94398498535156))
+
+
+def cs1_fit_rows() -> List[Dict[str, Any]]:
+    """CS1_ROWS in the fit_row.json format."""
+    return [dict(family=f, S=S, B=B, slots=sl, alloc_peak_gb=a, reserved_peak_gb=r, nonpt_gb=n, decode_alloc_peak_gb=d,
+                 host_peak_gib=h, max_gen=576) for f, S, B, sl, a, r, n, d, h in CS1_ROWS]
 
 
 def pow2ceil(x: int) -> int:
@@ -391,17 +483,6 @@ def pinned_summary(nbytes: Sequence[int]) -> Dict[str, Any]:
                 pow2_gib=sum(pow2ceil(int(x)) for x in nbytes) / GIB)
 
 
-def parse_proc_status(text: str) -> Dict[str, float]:
-    """VmRSS, VmHWM (the peak resident set), VmLck, VmPin of /proc/self/status, in GiB."""
-    keys = dict(VmRSS="rss_gib", VmHWM="hwm_gib", VmLck="lck_gib", VmPin="pin_gib")
-    out: Dict[str, float] = {}
-    for line in text.splitlines():
-        k, _, v = line.partition(":")
-        if k in keys and v.strip():
-            out[keys[k]] = int(v.split()[0]) * 1024 / GIB
-    return out
-
-
 def cgroup_memory_files(text: str) -> Optional[Dict[str, Any]]:
     """The memory cgroup's usage and peak files from /proc/self/cgroup: v1 '<n>:memory:<path>' ->
     /sys/fs/cgroup/memory<path>/memory.usage_in_bytes, memory.max_usage_in_bytes; v2 '0::<path>' ->
@@ -424,9 +505,9 @@ def cgroup_memory_files(text: str) -> Optional[Dict[str, Any]]:
 
 
 # ------------------------------------------------------------------------------------------------------------- time
-PREFILL_MS_PER_TOKEN = ((16128, 0.160), (65280, 0.191), (130816, 0.204))
-FIRST_STEP_S, OVERHEAD_MIN = 10.0, 1.0
-SPEC_DECODE_FACTOR = {1: 2.0, 2: 2.6, 3: 3.9}
+PREFILL_MS_PER_TOKEN = ((16128, 0.168), (65280, 0.1894), (130816, 0.2140))   # MEASURED, run cs1 (module docstring)
+FIRST_STEP_S, REWARM_S, OVERHEAD_MIN = 9.0, 6.0, 0.7
+SPEC_DECODE_FACTOR = {1: 2.2, 2: 2.8, 3: 4.3}
 
 
 def prefill_ms_per_token(S: int) -> float:
@@ -440,11 +521,16 @@ def prefill_ms_per_token(S: int) -> float:
 
 
 def step_ms(S: int, B: int, P: int = 0) -> float:
-    return 15.0 + B * (0.60 + 0.0018 * S / 1000.0) * (0.8 if P > 0 else 1.0)
+    """A steady shipped decode step (ms): 15 + 0.11 S / 1000 + B (0.45 + 0.0012 S / 1000), the per-request part x 0.8
+    with a pool. cs1 p50: 16K x 16 24.7 (24.3), 64K x 8 26.7 (26.4), 64K x 32 39.7 (39.1), 128K x 4 31.0 (31.8),
+    128K x 16 37.3 (39.1); old evidence 128K x 60 65 (65.8), 64K x 64 57.7 (56.0)."""
+    return 15.0 + 0.11 * S / 1000.0 + B * (0.45 + 0.0012 * S / 1000.0) * (0.8 if P > 0 else 1.0)
 
 
 def rewarm_s(S: int, B: int) -> float:
-    return min(12.0, max(4.0, 4.0 + B * S / 1612800.0))
+    """A re-warm step (warm-up path, CUDA-graph capture): about 6 s at every measured context and batch (cs1: decode
+    time - 502 x the p50 step = 8 re-warms x 5.6-6.1 s + a first step of 8.4-9.8 s)."""
+    return REWARM_S
 
 
 def spec_factor(K: int) -> float:
@@ -481,18 +567,23 @@ def plan_ctx_cell(cell: EC.Cell, S: int, budget_gb: float, N: int, sfit: Optiona
                          "+ 1024, nosa_llama.py _set_cos_sin_cache)" % (S, N, 2 * cell.K, pos, ROPE_POSITIONS))
     fit = sfit.at(S)
     spec = cell.family == "spec"
-    per_req = fit.b + fit.c * cell.slots + (fit.spec_per_req_gb if spec else 0.0)
-    fixed = fit.A + (fit.spec_fixed_gb if spec else 0.0)
-    room = (budget_gb - margin_gb - fit.nonpt_gb) / (1.0 + fit.reserve_frac) - fixed
+    ph = sfit.phases(cell, S)                    # without a measured decode phase: the 4.1 model (= EC.plan_cell's)
+    fixed, per_req = ph["prefill"]
+    cap_alloc = (budget_gb - margin_gb - fit.nonpt_gb) / (1.0 + fit.reserve_frac)
+    room = cap_alloc - fixed
     if room < per_req:
         raise ValueError("prefill: at S %d the fixed part A(S) %.2f GB (A16 %.2f + the S terms %.2f: the weights and the "
                          "one-request prefill transient)%s leaves %.2f GB for the requests, < one request's %.3f GB "
                          "(budget %.1f, margin %.1f)" % (S, fit.A, sfit.A16, fit.A - sfit.A16,
-                                                         " + spec %.2f" % fit.spec_fixed_gb if spec else "",
+                                                         " + spec %.2f" % fit.spec_fixed_gb
+                                                         if spec and ph["decode"] is None else "",
                                                          room, per_req, budget_gb, margin_gb))
     base = EC.plan_cell(cell, budget_gb, N, fit, margin_gb, S, host_budget_gb=1e12, b_cap=b_cap)
     mg = int(base["max_gen"])
     bounds = dict(base["bounds"])
+    lines = [ph["prefill"]] + ([ph["decode"]] if ph["decode"] is not None else [])
+    if ph["decode"] is not None:                 # measured context: the larger of the two phases must fit
+        bounds["memory"] = min(int(math.floor((cap_alloc - f) / p)) if cap_alloc > f else 0 for f, p in lines)
     bounds["host_memory"] = host_bound(hfit, S, mg, mem_gib, int(b_cap) + 1)    # > b_cap when the host never binds
     order = list(bounds)
     top = min(bounds, key=lambda k: (bounds[k], order.index(k)))
@@ -518,11 +609,15 @@ def plan_ctx_cell(cell: EC.Cell, S: int, budget_gb: float, N: int, sfit: Optiona
     rw_round = rewarm_schedule(S, N - 1, cell.lookahead) if cell.lookahead > 1 else rw
     stages = EC.stage_breakdown(fit, cell, B)
     stages["of_which_S_terms_in_A"] = fit.A - sfit.A16
+    peaks = [f + p * B for f, p in lines]
     plan = dict(base)
     plan.pop("predicted_host_gb", None)
     plan.update(
         B=B, bound_by=why, B_max=B_max, B_max_bound_by=top, bounds=bounds, batch_request=str(batch),
-        predicted_alloc_gb=fit.alloc_gb(cell, B), predicted_used_gb=fit.used_gb(cell, B), stages=stages,
+        predicted_alloc_gb=fit.alloc_gb(cell, B) if ph["decode"] is None else sfit.alloc_gb(cell, S, B),
+        predicted_used_gb=fit.used_gb(cell, B) if ph["decode"] is None else sfit.used_gb(cell, S, B), stages=stages,
+        phases=dict(prefill=list(ph["prefill"]), decode=list(ph["decode"]) if ph["decode"] is not None else None,
+                    binding=("prefill", "decode")[peaks.index(max(peaks))]),
         fit=fit.as_dict(), sfit=sfit.as_dict(), calibrated_batch_sizes=sfit.calibrated(S),
         host=dict(mode=hfit.mode, base_gib=hfit.base_gib, predicted_gib=host_pred, need_gib=mem_need_gib(host_pred),
                   mem_gib=mem_gib, kv_nominal_gib=HostFit(base_gib=0.0, mode="nominal").kv_gib(B, S, mg),
@@ -640,12 +735,29 @@ def _cell_stats(rs: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     else:
         ci = [None, None]
     lat = [x.get("latency") or {} for x in rs]
-    return dict(cell=rs[0]["cell"], family=rs[0]["family"], B=_batch_of(rs[0]), reps=len(rs), e2e_tok_s=EC.mean(e2e),
+    B = _batch_of(rs[0])
+    p50 = [x["token_latency_ms"]["p50"] for x in lat if (x.get("token_latency_ms") or {}).get("p50")]
+    return dict(cell=rs[0]["cell"], family=rs[0]["family"], B=B, reps=len(rs), e2e_tok_s=EC.mean(e2e),
                 decode_tok_s_gpu_units=EC.mean(dec), decode_ci=ci,
+                steady_tok_s=EC.mean([B * 1000.0 / v for v in p50]),
                 ttft_s=EC.mean([x["ttft_s"] for x in lat if x.get("ttft_s") is not None]),
-                token_p50_ms=EC.mean([x["token_latency_ms"]["p50"] for x in lat if x.get("token_latency_ms")]),
+                token_p50_ms=EC.mean(p50),
                 token_p95_ms=EC.mean([x["token_latency_ms"]["p95"] for x in lat if x.get("token_latency_ms")]),
                 used_peak_est_gb=max(x["memory"]["used_peak_est_gb"] for x in rs))
+
+
+STEADY_THRESHOLD = 0.02
+
+
+def verdict_steady(cand: Dict[str, Any], base: Optional[Dict[str, Any]]) -> str:
+    """The steady decode rate (B x 1000 / the p50 per-token latency: the re-warm steps excluded; a point estimate):
+    'helps' / 'hurts' beyond +/- 2 %, else 'within 2 %'."""
+    if base is None:
+        return "no baseline at this batch"
+    if not cand.get("steady_tok_s") or not base.get("steady_tok_s"):
+        return "no latency record"
+    r = cand["steady_tok_s"] / base["steady_tok_s"] - 1.0
+    return "helps" if r > STEADY_THRESHOLD else ("hurts" if r < -STEADY_THRESHOLD else "within 2 %")
 
 
 def verdict(cand: Dict[str, Any], base: Optional[Dict[str, Any]]) -> str:
@@ -683,10 +795,10 @@ def matched_batches(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 continue
             sp = {}
             if base is not None:
-                for k in ("e2e_tok_s", "decode_tok_s_gpu_units"):
+                for k in ("e2e_tok_s", "decode_tok_s_gpu_units", "steady_tok_s"):
                     if s[k] and base[k]:
                         sp[k] = s[k] / base[k] - 1.0
-            cands[name] = dict(speedup=sp, verdict=verdict(s, base))
+            cands[name] = dict(speedup=sp, verdict=verdict(s, base), verdict_steady=verdict_steady(s, base))
         out[str(B)] = dict(cells=st, baseline=base["cell"] if base else None, candidates=cands)
     return out
 
@@ -722,7 +834,8 @@ def sweep_report(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         for B, blkb in mb.items():
             for name, c in blkb["candidates"].items():
                 out["verdicts"].append(dict(S=S, kind="matched_batch", B=int(B), cell=name, vs=blkb["baseline"],
-                                            speedup=c["speedup"], verdict=c["verdict"]))
+                                            speedup=c["speedup"], verdict=c["verdict"],
+                                            verdict_steady=c["verdict_steady"]))
         blk.update(cells=cmp_["cells"], equal_memory=eq, matched=mb)
         out["contexts"][str(S)] = blk
     return out

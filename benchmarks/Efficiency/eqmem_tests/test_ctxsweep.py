@@ -4,11 +4,11 @@ ctxsweep_step.sh, ctxsweep_cells.txt, and the eqmem_bench additions). No GPU, no
   CS1  contexts: the engine state after the prefill, the F1 window, re-warm at 65280 / 130816 (every 64 tokens, the
        width change at token 288; rounds of U tokens stay inside one shape; the matched negative: lookahead 1 with
        rounds of 3 / 5 tokens crosses)
-  CS2  the S-aware GPU fit: the long-context peaks exact, the slot sweeps within 0.1 GB, the 16K frontier never
-       under-read; the per-context refit (two batch sizes recover the truth, one batch size, the envelope over noisy
-       rows, spec_fixed, the 4.1 rows)
-  CS3  the host model: the 8 measured RSS rows are the power-of-two model (one base, ~17 GiB), not the nominal one;
-       the 4.1 OOM; '2x' >= 'pow2'; the refit; the --mem need; the host bound
+  CS2  the S-aware GPU fit: the 16K anchor is the 4.1 fit, the long-context peaks exact, the slot sweeps within
+       0.1 GB; the per-context refit (two batch sizes recover the truth, one batch size, the envelope over noisy rows,
+       spec_fixed, the 4.1 rows); the decode-phase line from the run cs1 rows and the two-phase peak model
+  CS3  the host model: the 8 old RSS rows and the 12 cs1 rows are the power-of-two model (one base, ~17 GiB), not the
+       nominal one; the 4.1 OOM; '2x' >= 'pow2'; the refit (base 17.9 GiB from cs1); the --mem need; the host bound
   CS4  the plan: each bound binds where it must and refuses a cell above it (int32_host, host_memory, memory,
        int32_gpu, cap) and each refusal (F3, rope, prefill, --mem, batch < 1); document reuse reported
   CS5  latency on one clock: shipped steps and spec rounds
@@ -17,11 +17,15 @@ ctxsweep_step.sh, ctxsweep_cells.txt, and the eqmem_bench additions). No GPU, no
   CS7  the driver on the CPU: plan mode (exit 0 / 2 / 4, the refit from a run directory), arm refusals (another
        context's manifest, a batch above the bound, the knob, missing arguments), report mode (helps / hurts, equal
        memory, a mixed comparison refused per context, 4.1-style rows)
-  CS8  host parsing: /proc/self/status, /proc/self/cgroup (v1, v2), pinned sizes, eqmem_bench.host_record
+  CS8  host parsing: /proc/self/cgroup (v1, v2), pinned sizes, eqmem_bench.host_extras / cgroup_memory (B's
+       /proc/self/status parser and host_record are tested in test_eqmem_v2.py V2)
   CS9  the step script: the GPU uuid file (missing, unreadable, malformed: STOP 1; a good file passes to the next
        check; the DRYRUN-only override); the workload pins equal each SHA256SUMS
+  CS10 ONE harness: a 4.1 cell planned by the merged code at 16128 (ctxsweep_core.plan_ctx_cell, no measured rows)
+       equals the 4.1 plan (eqmem_core.plan_cell with eqmem_core.MemFit(): B 304 / 219 / 191 / 161 / 161), and the
+       eqmem_bench plan mode prints the same batches
 
-From the worktree root (inside the image; the 4.1 tests EM1-EM8 must pass too):
+From the worktree root (inside the image; the 4.1 tests EM1-EM8 and V1-V5 must pass too):
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA benchmarks/Efficiency/eqmem_tests
 """
 from __future__ import annotations
@@ -84,17 +88,24 @@ def test_CS2_gpu_fit():
         assert abs(f.at(130816).alloc_gb(EC.Cell("cached", P=P) if P else o, 60) - gb) <= 0.1
     for B, P, gb in EC.FRONTIER_2175389:
         d = f.at(16128).alloc_gb(EC.Cell("cached", P=P) if P else o, B) - gb
-        assert -1e-6 <= d <= 1.0, (B, P, d)                                    # the upper envelope at 16K
+        assert abs(d) <= 0.15, (B, P, d)                                        # the 4.1 fit at 16K (EM2)
+    m = EC.MemFit()
+    a16 = f.at(16128)
+    assert (a16.A, a16.b, a16.c, a16.reserve_frac, a16.nonpt_gb, a16.spec_fixed_gb, a16.spec_per_req_gb) == \
+        (m.A, m.b, m.c, m.reserve_frac, m.nonpt_gb, m.spec_fixed_gb, m.spec_per_req_gb)        # the 16K anchor
     assert f.A_at(16128) == f.A16 and f.b_at(16128) == f.b16 and f.calibrated(16128) == 0
     assert f.A16 < f.A_at(65280) < f.A_at(130816) and f.b16 < f.b_at(65280) < f.b_at(130816)
     assert f.a1 > 0 and f.a2 > 0
-    assert CS.C_SLOT_BYTES == 2105344 and f.c == pytest.approx(0.0021133, abs=2e-6)
+    assert CS.C_SLOT_BYTES == 2105344 and f.c_long == pytest.approx(0.0021133, abs=2e-6)
+    assert f.c_at(16128) == m.c and f.c_at(65280) == pytest.approx(f.c_long, rel=1e-12)
+    assert f.c_at(130816) == pytest.approx(f.c_long, rel=1e-12)
+    assert f.c_at(40704) == pytest.approx((m.c + f.c_long) / 2)                  # linear between 16128 and 65280
     assert CS.B1_BYTES == pytest.approx(1180.28125) and CS.SPEC_B1_BYTES == 1024
     assert f.spec_req_at(130816) - f.spec_req_at(16128) == pytest.approx(1024 * (130816 - 16128) / 1e9)
     assert f.spec_req_at(16128) == pytest.approx(0.012)
 
     def row(fam, S, B, slots, extra=0.0):
-        a = 30.0 + 0.25 * B + f.c * B * slots + extra
+        a = 30.0 + 0.25 * B + f.c_at(S) * B * slots + extra
         return dict(family=fam, S=S, B=B, slots=slots, alloc_peak_gb=a, reserved_peak_gb=a * 1.03, nonpt_gb=0.9)
     rows = [row("original", 130816, 4, 64), row("original", 130816, 16, 64), row("cached", 130816, 16, 114)]
     g = CS.fit_ctx_from_rows(rows, f)
@@ -123,6 +134,26 @@ def test_CS2_gpu_fit():
     for r in h41:
         assert k.at(16128).alloc_gb(EC.Cell("cached", P=r["slots"] - 64), r["B"]) >= r["alloc_peak_gb"] - 1e-9
         assert f.at(16128).alloc_gb(EC.Cell("cached", P=r["slots"] - 64), r["B"]) > r["alloc_peak_gb"]  # prior above
+    # run cs1 (12 measured cells): two batch sizes at 64K and 128K give both phase lines; 16K (one size) no decode line
+    rows1 = CS.cs1_fit_rows()
+    q = CS.fit_ctx_from_rows(rows1, f)
+    assert q.calibrated(65280) == q.calibrated(130816) == 2 and q.calibrated(16128) == 1 and q.dec_at(16128) is None
+    for S in (65280, 130816):
+        (Ad, bd), A, b = q.dec_at(S), q.A_at(S), q.b_at(S)
+        assert 16.3 <= Ad <= 16.6 and 9.0 <= A - Ad <= 22.0                      # the prefill transient above the decode
+        assert 0.5 <= bd / b <= 1.5
+    assert 26.5 <= q.A_at(65280) <= 27.2 and 37.0 <= q.A_at(130816) <= 37.6
+    assert 0.06 <= q.b_at(65280) <= 0.10 and 0.14 <= q.b_at(130816) <= 0.18
+    for fam, S, B, sl, a, r, n, d, h in CS.CS1_ROWS:                            # never under a measured peak
+        cell = EC.Cell("cached", P=sl - 64) if fam == "cached" else o
+        assert q.alloc_gb(cell, S, B) >= max(a, d) - 1e-9
+    spec2 = EC.parse_cell("spec:2")
+    ph = q.phases(spec2, 130816)
+    assert ph["decode"] is not None and ph["decode"][0] == pytest.approx(q.dec_at(130816)[0] + q.spec_fixed_gb)
+    assert ph["prefill"][1] == pytest.approx(q.b_at(130816) + q.c_at(130816) * 128)   # no spec terms in the prefill
+    assert q.alloc_gb(spec2, 130816, 63) == pytest.approx(max(ph["prefill"][0] + 63 * ph["prefill"][1],
+                                                               ph["decode"][0] + 63 * ph["decode"][1]))
+    assert f.phases(spec2, 130816)["decode"] is None                           # uncalibrated: the 4.1 rule
 
 
 # ------------------------------------------------------------------------------------------------------------ CS3
@@ -149,6 +180,15 @@ def test_CS3_host_model():
     h = CS.fit_host_from_rows([m])
     assert h.mode == "pow2" and h.base_gib == pytest.approx(15.0 + CS.HOST_REFIT_SLACK_GIB)
     assert CS.fit_host_from_rows([dict(S=65280, B=8, max_gen=576)]) == CS.HostFit()   # no measured host: the default
+    rows1 = CS.cs1_fit_rows()                                                     # this harness, run cs1
+    r1 = [r["host_peak_gib"] - p2.host_gib(r["B"], r["S"], r["max_gen"]) for r in rows1]
+    assert all(16.7 <= x <= 17.0 for x in r1), r1                                # the power-of-two size, every cell
+    assert all(r["host_peak_gib"] - nom.host_gib(r["B"], r["S"], r["max_gen"]) > 20.0 for r in rows1)   # not nominal
+    hc = CS.fit_host_from_rows(rows1)
+    assert hc.mode == "pow2" and hc.base_gib == pytest.approx(max(r1) + CS.HOST_REFIT_SLACK_GIB) and 17.8 <= hc.base_gib <= 18.0
+    for r in rows1:
+        assert CS.HostFit(base_gib=max(r1), mode="2x").host_gib(r["B"], r["S"], r["max_gen"]) >= r["host_peak_gib"]
+    assert CS.mem_need_gib(hc.host_gib(63, 130816, 576)) == 310                  # the 128K int32-maximal batch
     assert CS.HostFit().mode == "2x" and CS.HostFit().base_gib == pytest.approx(24e9 / 2 ** 30)
     assert (CS.mem_need_gib(54.5), CS.mem_need_gib(10.0), CS.mem_need_gib(150.0)) == (70, 64, 170)
     hd = CS.HostFit()
@@ -201,6 +241,21 @@ def test_CS4_plan_bounds_and_refusals():
     pd = CS.plan_ctx_cell(o, 130816, 75.0, 512, f, p2, batch=32)
     assert pd["docs"] == dict(n_docs=24, distinct=24, reused=True, repeats=8) and pd["bound_by"] == "requested"
     assert CS.plan_ctx_cell(o, 65280, 75.0, 512, f, p2, batch=32)["docs"]["reused"] is False
+    # after run cs1: the measured decode phase carries the spec terms, so spec is no longer charged them on top of
+    # the prefill transient; the memory bound must still hold for BOTH phases (maximal for the larger one)
+    rows1 = CS.cs1_fit_rows()
+    q, hc = CS.fit_ctx_from_rows(rows1, f), CS.fit_host_from_rows(rows1)
+    s2 = CS.plan_ctx_cell(spec2, 65280, 75.0, 512, q, hc, mem_gib=440)
+    assert s2["bound_by"] == "memory" and s["B"] < s2["B"] <= 127 and s2["phases"]["decode"] is not None
+    cap = (75.0 - 1.0 - q.nonpt_gb) / (1.0 + q.reserve_frac)
+    for B, ok in ((s2["B"], True), (s2["B"] + 1, False)):
+        fits = all(fx + pr * B <= cap for fx, pr in (s2["phases"]["prefill"], s2["phases"]["decode"]))
+        assert fits is ok, (B, s2["phases"])
+    assert s2["predicted_used_gb"] <= 74.0 and s2["predicted_used_gb"] == pytest.approx(q.used_gb(spec2, 65280, s2["B"]))
+    s3 = CS.plan_ctx_cell(spec2, 130816, 75.0, 512, q, hc, mem_gib=440)
+    assert (s3["B"], s3["bound_by"]) == (63, "int32_host") and s3["phases"]["binding"] == "prefill"
+    with pytest.raises(ValueError, match="bound_by memory"):
+        CS.plan_ctx_cell(spec2, 65280, 75.0, 512, q, hc, mem_gib=440, batch=s2["B"] + 1)
 
 
 # ------------------------------------------------------------------------------------------------------------ CS5
@@ -221,22 +276,31 @@ def test_CS5_latency():
 def test_CS6_cell_list_and_time():
     entries = CS.parse_cell_list((EFF / "ctxsweep_cells.txt").read_text())
     tiers = [e["tier"] for e in entries]
-    assert len(entries) == 21 and tiers.count("1") == 19 and tiers.count("2") == 2
-    assert {e["S"] for e in entries} == set(CTXS) and (entries[0]["S"], entries[1]["S"]) == (65280, 130816)
+    assert len(entries) == 9 and tiers.count("1") == 7 and tiers.count("2") == 2
+    assert {e["S"] for e in entries} == set(CTXS)
+    assert sum(e["cell"].startswith("spec:") for e in entries) == 7 and sum(e["batch"] == "max" for e in entries) == 4
     f = CS.prior_fit()
-    dflt = CS.sweep_plan(entries, 75.0, 512, f, CS.HostFit())
+    dflt = CS.sweep_plan(entries, 75.0, 512, f, CS.HostFit())                 # no measured row: still admitted
     assert not [p for p in dflt if "error" in p], [p for p in dflt if "error" in p]
     for p in dflt:
         assert p["plan"]["host"]["need_gib"] <= p["entry"]["mem_gib"] <= 440
-    pw = CS.sweep_plan(entries, 75.0, 512, f, CS.HostFit(base_gib=18.0, mode="pow2"))
-    assert not [p for p in pw if "error" in p]
+    rows1 = CS.cs1_fit_rows()
+    pw = CS.sweep_plan(entries, 75.0, 512, CS.fit_ctx_from_rows(rows1, f), CS.fit_host_from_rows(rows1))   # after cs1
+    assert not [p for p in pw if "error" in p], [p for p in pw if "error" in p]
+    for p in pw:
+        assert p["plan"]["host"]["need_gib"] <= p["entry"]["mem_gib"] <= 440
     tm = CS.tier_minutes(pw)
-    assert 150.0 <= tm["1"] <= 195.0 and 40.0 <= tm["2"] <= 75.0, tm
+    assert 90.0 <= tm["1"] <= 120.0 and 50.0 <= tm["2"] <= 70.0, tm
     mx = {(p["entry"]["S"], p["entry"]["cell"]): p["plan"]["B"] for p in pw if p["entry"]["batch"] == "max"}
-    assert mx[(130816, "cached:50")] == 63 and mx[(65280, "cached:50")] == 127 and 45 <= mx[(130816, "spec:2")] < 63
+    assert mx[(130816, "cached:50")] == 63 and mx[(130816, "spec:2")] == 63 and mx[(65280, "cached:50")] == 127
+    assert 110 <= mx[(65280, "spec:2")] <= 127
     e = CS.est_minutes(16128, 191, EC.Cell("cached", P=50), 512, 9)          # 4.1 cached p50: the step took 10:22
-    assert e["prefill_s"] == pytest.approx(191 * 16128 * 0.160e-3) and 9.5 <= e["minutes"] <= 12.5
-    assert CS.prefill_ms_per_token(40000) == pytest.approx(0.160 + 0.031 * (40000 - 16128) / (65280 - 16128))
+    assert e["prefill_s"] == pytest.approx(191 * 16128 * 0.168e-3) and 9.5 <= e["minutes"] <= 12.5
+    assert CS.prefill_ms_per_token(40000) == pytest.approx(0.168 + (0.1894 - 0.168) * (40000 - 16128) / (65280 - 16128))
+    for S, B, P, meas in ((16128, 16, 0, 67.08), (65280, 32, 0, 77.12), (65280, 32, 50, 73.04), (130816, 4, 0, 70.32),
+                          (130816, 16, 0, 74.20)):                          # run cs1: the measured decode seconds
+        d = CS.est_minutes(S, B, EC.Cell("cached", P=P) if P else EC.Cell("original"), 512, 9)["decode_s"]
+        assert abs(d / meas - 1.0) <= 0.15, (S, B, P, d, meas)
     for bad in ("65280 original 8", "20000 original 8 80", "65280 original 0 80", "65280 original 8 500",
                 "65280 foo 8 80"):
         with pytest.raises(ValueError):
@@ -273,7 +337,7 @@ def test_CS7_driver_cpu(tmp_path, monkeypatch):
     out = tmp_path / "plan.json"
     assert CB.main(["--mode", "plan", "--budget-gb", "75", "--cells-file", cells, "--out", str(out)]) == 0
     pj = json.loads(out.read_text())
-    assert len(pj["cells"]) == 21 and pj["hfit"]["mode"] == "2x" and set(pj["tier_minutes"]) == {"1", "2"}
+    assert len(pj["cells"]) == 9 and pj["hfit"]["mode"] == "2x" and set(pj["tier_minutes"]) == {"1", "2"}
     assert CB.main(["--mode", "plan", "--budget-gb", "75", "--cells-file", cells, "--out", str(out)]) == 2
     bad = tmp_path / "bad.txt"
     bad.write_text("130816 original 64 440\n")
@@ -341,9 +405,8 @@ def test_CS7_driver_cpu(tmp_path, monkeypatch):
 
 # ------------------------------------------------------------------------------------------------------------ CS8
 def test_CS8_host_parsing():
-    st = "Name:\tpython\nVmHWM:\t 2097152 kB\nVmRSS:\t 1048576 kB\nVmLck:\t       0 kB\nVmPin:\t  524288 kB\nThreads:\t4\n"
-    assert CS.parse_proc_status(st) == dict(hwm_gib=2.0, rss_gib=1.0, lck_gib=0.0, pin_gib=0.5)
-    v1 = "12:memory:/slurm/uid_1/job_2/step_3/task_0\n11:cpuset:/slurm/uid_1/job_2/step_3\n"
+    assert not hasattr(CS, "parse_proc_status")                               # one parser: eqmem_core's (V2)
+    v1 ="12:memory:/slurm/uid_1/job_2/step_3/task_0\n11:cpuset:/slurm/uid_1/job_2/step_3\n"
     assert CS.cgroup_memory_files(v1) == dict(
         version=1, usage="/sys/fs/cgroup/memory/slurm/uid_1/job_2/step_3/task_0/memory.usage_in_bytes",
         peak="/sys/fs/cgroup/memory/slurm/uid_1/job_2/step_3/task_0/memory.max_usage_in_bytes")
@@ -353,13 +416,20 @@ def test_CS8_host_parsing():
         peak="/sys/fs/cgroup/system.slice/slurmstepd.scope/job_2/step_3/user/task_0/memory.peak")
     assert CS.cgroup_memory_files("") is None and CS.cgroup_memory_files("5:cpu,cpuacct:/x\n") is None
     assert CS.pinned_summary([2 ** 30, 3 * 2 ** 30]) == dict(tensors=2, nominal_gib=4.0, pow2_gib=5.0)
-    now = EB.host_now()
-    assert isinstance(now, dict)
+    cg = EB.cgroup_memory()                                                      # this node: values or None, no error
+    assert set(cg) == {"cgroup_version", "cgroup_usage_gb", "cgroup_peak_gb"}
     fake = types.SimpleNamespace(cuda=types.SimpleNamespace())
-    rec = EB.host_record(fake, [dict(host=dict(hwm_gib=5.0)), dict(host=dict(hwm_gib=7.5, cgroup_peak_gib=9.0)), dict()],
-                         [2 ** 30, 3 * 2 ** 30])
-    assert rec["peak_gib"] >= 7.5 and rec["cgroup_peak_gib"] >= 9.0 and rec["pinned"]["pow2_gib"] == 5.0
-    assert rec["torch_host_memory_stats"] is None
+    ex = EB.host_extras(fake, [2 ** 30, 3 * 2 ** 30])
+    assert ex["pinned_kv_tensors"] == 2 and ex["pinned_kv_pow2_gb"] == pytest.approx(5 * 2 ** 30 / 1e9)
+    assert ex["torch_host_memory_stats"] is None and "cgroup_peak_gb" in ex
+    stats = types.SimpleNamespace(cuda=types.SimpleNamespace(host_memory_stats=lambda: {"allocated_bytes.current": 7,
+                                                                                        "nested": {"x": 1}}))
+    assert EB.host_extras(stats, [])["torch_host_memory_stats"] == {"allocated_bytes.current": 7}
+    rec = EC.host_record([dict(label="end", host_rss_gb=1.0)], dict(VmRSS=1000, VmHWM=2000, VmPin=None, VmLck=None),
+                         None, 3 * 2 ** 30)
+    rec.update(ex)                                                                # the merged record: B's names + extras
+    assert {"rss_peak_gb", "rss_end_gb", "ru_maxrss_gb", "pinned_kv_gb", "vm_pin_gb", "rss_samples",
+            "pinned_kv_pow2_gb", "cgroup_peak_gb"} <= set(rec)
 
 
 # ------------------------------------------------------------------------------------------------------------ CS9
@@ -417,3 +487,28 @@ def test_CS9_step_workload_pins():
                     if x.strip())
         assert sums["%s_tokens.bin" % c.stem] == pins["TOK_SHA_%d" % S]
         assert sums["%s_manifest.json" % c.stem] == pins["MAN_SHA_%d" % S]
+
+
+# ----------------------------------------------------------------------------------------------------------- CS10
+def test_CS10_one_harness_41_cells_plan_as_41(tmp_path):
+    f = CS.prior_fit()
+    want = {"original": 304, "cached:33": 219, "cached:50": 191, "spec:2": 161, "spec:3": 161}     # EM3 / the h41 run
+    for text, B in want.items():
+        cell = EC.parse_cell(text)
+        old = EC.plan_cell(cell, 75.0, 512, EC.MemFit())
+        new = CS.plan_ctx_cell(cell, 16128, 75.0, 512, f, CS.HostFit(), mem_gib=440)
+        assert old["B"] == new["B"] == B and old["bound_by"] == new["bound_by"] == "memory", (text, old["B"], new["B"])
+        assert new["max_gen"] == old["max_gen"] and EC.plan_key(new) == EC.plan_key(old) == (75.0, 1.0, 512, 16128)
+        assert new["predicted_used_gb"] == pytest.approx(old["predicted_used_gb"], abs=1e-9)
+        assert new["predicted_alloc_gb"] == pytest.approx(old["predicted_alloc_gb"], abs=1e-9)
+        for k in ("memory", "int32_host", "int32_gpu", "cap"):
+            assert new["bounds"][k] == old["bounds"][k], (text, k)
+        assert new["phases"]["decode"] is None and new["calibrated_batch_sizes"] == 0
+    out = tmp_path / "p41.json"
+    assert EB.main(["--mode", "plan", "--budget-gb", "75", "--cells", ",".join(want), "--out", str(out)]) == 0
+    assert [p["B"] for p in json.loads(out.read_text())["plans"]] == list(want.values())
+    cl = tmp_path / "c41.txt"
+    cl.write_text("".join("16128 %s max 440\n" % t for t in want))
+    out2 = tmp_path / "p42.json"
+    assert CB.main(["--mode", "plan", "--budget-gb", "75", "--cells-file", str(cl), "--out", str(out2)]) == 0
+    assert [c["plan"]["B"] for c in json.loads(out2.read_text())["cells"]] == list(want.values())

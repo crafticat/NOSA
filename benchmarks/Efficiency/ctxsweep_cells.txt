@@ -1,45 +1,34 @@
-# CONTEXT SWEEP (paper 4.2) cell list for a chain: one line = one ctxsweep_step.sh invocation (one process, one fresh
-# prefill), in this order. Fields: <ctx> <cell> <batch|max> <srun --mem GiB>. Budget 75 GB, N 512, margin 1 GB in every
-# cell (the 4.1 plan key: the 4.1 run directory eqmem_h41_2188818_b75 gives the 16K max-batch cells: cached p33 B 219,
-# cached p50 B 191, spec k2 / k3 B 161, original B 304 at 440G). After the last cell: ctxsweep_step.sh ... report.
+# CONTEXT SWEEP (paper 4.2) cell list for the RENEWED holder, at the merged commit (feature/nosi-ctxsweep-v2: B's v2
+# with the draft-prefetch fix f9dc346). One line = one ctxsweep_step.sh invocation (one process, one fresh prefill), in
+# this order. Fields: <ctx> <cell> <batch|max> <srun --mem GiB>. Budget 75 GB, N 512, margin 1 GB in every cell.
+# ALREADY MEASURED (run cs1, 60b5b03, holder 2188818: ctxsweep-runs/ctxsweep_cs1_2188818_b75; the step script reads it
+# as PRIOR_RUNS: its rows refit these plans, the report includes it): 16K original / cached:33 B16; 64K original /
+# cached:50 B8 and B32, cached:97 B32; 128K original / cached:50 B4 and B16, cached:97 B16. 4.1 (eqmem_h41_2188818_b75)
+# gives the 16K max-batch baselines; its spec k2 / k3 cells ran BEFORE the fix (rerun them with eqmem_step.sh).
 #
 #   while read -r ctx cell batch mem; do
 #       bash benchmarks/Efficiency/ctxsweep_step.sh --nosi <sha> <holder> <run> 75 "$ctx" "$cell" "$batch" "$mem"
 #   done < <(grep -v '^#' benchmarks/Efficiency/ctxsweep_cells.txt | sed 's/#.*//' | grep .)
+#   bash benchmarks/Efficiency/ctxsweep_step.sh --nosi <sha> <holder> <run> 75 report
 #
-# Minutes: ctxsweep_core.est_minutes (prefill 0.160 / 0.191 / 0.204 ms per prompt token at 16K / 64K / 128K dominates
-# every long-context cell); 'ctxsweep_bench.py --mode plan --cells-file ctxsweep_cells.txt' prints the exact values.
-# The 'max' cells assume the probes measured the power-of-two host model (plan with --host-pow2-base-gib 18); with the
-# default '2x' model the 128K max cells stop at B 47 (host_memory). --mem: ctxsweep_core.mem_need_gib under the '2x'
-# model (+ 10 GiB margin for the small cells), 440 for the max cells.
+# Minutes: ctxsweep_core.est_minutes after the cs1 refit ('ctxsweep_bench.py --mode plan --cells-file ctxsweep_cells.txt
+# --fit-rows-dir <cs1 run dir>' prints the exact values); the FIRST cell of a new run also compiles its kernels (about
+# +100 s). The spec decode time is an estimate from the pre-fix 4.1 cells (x 2.8 the shipped decode); a spec round of
+# lookahead K + 1 = 3 re-warms up to 3 times per 64-token boundary, and each re-warm costs about 6 s (run cs1).
+# --mem: ctxsweep_core.mem_need_gib under the default '2x' host model (+ 10 GiB for the small cells); 440 for the max
+# cells (the refit power-of-two model needs 310 GiB at 128K x 63 and 64K x 127).
 #
-# Total of tier 1: about 172 min (2.9 GPU-hours); tier 2: about 57 min more.
+# Total of tier 1: about 105 min; tier 2: about 59 min more.
 # tier 1
-# --- probes: the first cell of each long context refits A(S), b(S) and the host model (VmHWM) for the cells after it
-65280  original   8    80     # ~3.6 min  PROBE 64K
-130816 original   4    80     # ~3.7 min  PROBE 128K
-# --- 16K, small batch (the max batch is 4.1's)
-16128  original   16   64     # ~2.6 min
-16128  cached:33  16   64     # ~2.6 min
-16128  spec:2     16   64     # ~4.1 min
-# --- 64K and 128K, mid batch: the three families (the second batch size calibrates b(S))
-65280  original   32   180    # ~8.8 min
-65280  cached:50  32   180    # ~8.8 min
-65280  spec:2     32   180    # ~10.7 min
-130816 original   16   180    # ~9.2 min
-130816 cached:50  16   180    # ~9.2 min
-130816 spec:2     16   180    # ~11.0 min
-# --- 64K and 128K, small batch: the other families at the probe's batch
-65280  cached:50  8    80     # ~3.6 min
-65280  spec:2     8    80     # ~5.1 min
-130816 cached:50  4    80     # ~3.7 min
-130816 spec:2     4    80     # ~5.1 min
-# --- a third cache capacity (is pool 50 the best baseline at long context?)
-65280  cached:97  32   180    # ~8.8 min
-130816 cached:97  16   180    # ~9.2 min
-# --- 128K at the largest batch the budget admits (int32 envelope 63 for cached; GPU memory ~57 for spec)
-130816 cached:50  max  440    # ~30.9 min (B 63)
-130816 spec:2     max  440    # ~31.1 min (B ~57)
-# tier 2 (optional, beyond 3 h): 64K at the largest batch (int32 127 for cached; GPU memory ~101 for spec)
-65280  cached:50  max  440    # ~29.5 min (B 127)
-65280  spec:2     max  440    # ~27.1 min (B ~101)
+# --- spec at the batch sizes the baselines already have (matched-batch comparisons)
+16128  spec:2     16   64     # ~4.7 min
+65280  spec:2     8    80     # ~5.6 min
+130816 spec:2     4    80     # ~6.0 min
+65280  spec:2     32   180    # ~10.9 min
+130816 spec:2     16   180    # ~11.7 min
+# --- 128K at the largest batch the budget admits (int32 envelope 63 for both, after the cs1 refit)
+130816 cached:50  max  440    # ~31.6 min (B 63)
+130816 spec:2     max  440    # ~34.3 min (B 63; the measured decode phase carries the spec terms)
+# tier 2 (optional): 64K at the largest batch (int32 127 for cached; GPU memory ~124 for spec)
+65280  cached:50  max  440    # ~28.5 min (B 127)
+65280  spec:2     max  440    # ~31.0 min (B ~124)
