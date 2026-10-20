@@ -64,12 +64,28 @@ class DraftMirror:
                 else:
                     usage[b, h] += 1
         for (ll, b, h, blk) in svc.pending:
-            if ll == l and 0 <= blk < nblk:
+            if ll == l and 0 <= blk < nblk and svc._in_flight(l, b, h, blk) is not None:   # the current owner's only
                 inflight[b, h, blk] = True
         self.slot_of.copy_(slot_of, non_blocking=True)
         self.inflight.copy_(inflight, non_blocking=True)
         self.free.copy_(free, non_blocking=True)
         self.usage.copy_(usage, non_blocking=True)
+
+
+def rank_in_group(key: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """For every entry i (1-D tensors of N >= 1 entries, in K3X order): the number of entries j < i with mask[j] and
+    key[j] == key[i]. A stable sort groups equal keys in their original order, then an exclusive count runs per
+    group: O(N) memory (a one-hot (N, streams) matrix would need N x B x H)."""
+    n = key.shape[0]
+    ks, perm = torch.sort(key, stable=True)
+    mk = mask.to(torch.int64)[perm]
+    c = mk.cumsum(0) - mk                                                         # masked entries before, sorted order
+    pos = torch.arange(n, device=key.device)
+    start = torch.cat([torch.ones_like(ks[:1], dtype=torch.bool), ks[1:] != ks[:-1]])
+    gstart = torch.cummax(torch.where(start, pos, torch.zeros_like(pos)), 0).values
+    out = torch.empty_like(c)
+    out[perm] = c - c[gstart]
+    return out
 
 
 class DraftDecision:
@@ -110,7 +126,6 @@ def device_draft(m: DraftMirror, rb, hb, tails, nt, sel, C: int, X: int, R_ver: 
         infl0 = torch.zeros_like(infl0)
     miss = valid & ~ready & ~infl0
     N = Rd * H * k
-    order = torch.arange(N, device=dev)
     sid = (bb * H + hh).reshape(N)
     blk_f = blk.reshape(N)
     miss_f = miss.reshape(N)
@@ -126,9 +141,7 @@ def device_draft(m: DraftMirror, rb, hb, tails, nt, sel, C: int, X: int, R_ver: 
     dup = miss_f & ~first
     # K5 in K3X order: a stream's first (C - usage) takes are free, later ones need a shared extra; extras are granted
     # while more than R_ver stay free, i.e. to the first (X - borrowed - R_ver) extra-needing misses of the layer
-    oh = torch.zeros((N, S), dtype=torch.int64, device=dev)
-    oh[order, sid] = fmiss.to(torch.int64)
-    rank_s = (oh.cumsum(0) - oh)[order, sid]
+    rank_s = rank_in_group(sid, fmiss)
     usage = m.usage.reshape(S)
     free_local = (C - usage).clamp(min=0)
     needs_extra = fmiss & (rank_s >= free_local[sid])
@@ -139,9 +152,7 @@ def device_draft(m: DraftMirror, rb, hb, tails, nt, sel, C: int, X: int, R_ver: 
     granted = fmiss & (~needs_extra | (g < budget))
     refused = fmiss & ~granted
     # the q-th grant of a stream takes its q-th FREE slot (K3X first_free after the earlier takes)
-    ohg = torch.zeros((N, S), dtype=torch.int64, device=dev)
-    ohg[order, sid] = granted.to(torch.int64)
-    q = (ohg.cumsum(0) - ohg)[order, sid]
+    q = rank_in_group(sid, granted)
     ar = torch.arange(NPOS, device=dev).view(1, NPOS).expand(S, NPOS)
     free_sorted = torch.sort(torch.where(m.free.reshape(S, NPOS), ar, torch.full_like(ar, NPOS)), dim=-1).values
     take_slot = torch.where(granted, free_sorted[sid, q.clamp(max=NPOS - 1)], torch.full_like(q, -1))

@@ -1,6 +1,6 @@
-"""CPU tests F1-F9 of R2 step 7, piece 5 (docs/R2_STEP7_FETCH_RETENTION.md section 12): nosi/nosi/r2_residency.py,
-the residency service of the spec round, over K3X's ownership and transports VENDORED byte-identical in
-nosi/nosi/kstep/ (91e6e47). CPU tensors, K3X's AdversarialTransport (seeded delays, reordering, bursts; "force_only" for
+"""CPU tests F1-F13 of R2 step 7, piece 5 (docs/R2_STEP7_FETCH_RETENTION.md sections 12, 12b, 12c):
+nosi/nosi/r2_residency.py (v1, the reference), r2_residency_sb.py (S-B) and r2_residency_sc.py (S-C), the residency
+service of the spec round, over K3X's ownership and transports VENDORED byte-identical in nosi/nosi/kstep/ (91e6e47). CPU tensors, K3X's AdversarialTransport (seeded delays, reordering, bursts; "force_only" for
 the scripted tests), CPU events with a done flag. Each test has a negative control (a K3X mutation switch or a defect
 subclass) that the same check must catch.
 
@@ -752,3 +752,289 @@ def test_F10d_device_draft_reads_nothing_on_the_host():
     import inspect
     assert host_reads(inspect.getsource(SB.device_draft)) == []
     assert host_reads("n = int(x.sum().item())") != []
+
+
+# =====================================================================================================================
+# F12 S-C: the verify rows on the device, against v1 (and F13: the next request of a batch slot)
+# =====================================================================================================================
+SC = _load("r2_residency_sc")
+
+
+def _content_ok(w, l, rows, sel, plan):
+    """At the read point (after resolve, before the attention): every verify row lists its whole selection (the
+    selected historical blocks, ascending) and every listed page holds the host truth of its block (K, V and bias)."""
+    for i, r in enumerate(rows):
+        if r.kind != "v":
+            continue
+        for h in range(H):
+            want = sorted({z for z in sel[h, i].tolist() if 0 <= z < r.hist_bound})
+            got = plan.page_table[i, h, :len(want)].tolist()
+            if int(plan.num_pages[i, h]) < len(want):
+                return False
+            if not all(slot_holds(w, l, r.b, h, s, z) for z, s in zip(want, got)):
+                return False
+    return True
+
+
+def _sched_pressure(seed, steps, hb=8, window=4, nver=3, uids=("u0", "u1")):
+    """The pressure schedule: per tick, layer and request a draft row (a window of `window` historical blocks and the
+    tail block); every third tick TWO verify rows of the ending cohort per request (the flattened round: one key, two
+    positions), each with up to `nver` random historical blocks per head, so the rows' selections overlap."""
+    g = torch.Generator().manual_seed(seed)
+    out = []
+    for t in range(steps):
+        m = t // 3 + 1
+        ends = t % 3 == 2
+        layers = []
+        for _ in range(L):
+            spec = []
+            for b, u in enumerate(uids):
+                x = int(torch.randint(0, hb - window + 1, (1,), generator=g))
+                spec.append((b, "d", (u, 1, m + 1 if ends else m), [list(range(x, x + window)) + [hb] for _ in range(H)]))
+                if ends:
+                    for _ in range(2):
+                        v = [sorted(set(int(z) for z in torch.randint(0, hb, (nver,), generator=g))) + [hb]
+                             for _ in range(H)]
+                        spec.append((b, "v", (u, 1, m), v))
+            layers.append(spec)
+        out.append((t, m, ends, layers))
+    return out
+
+
+def _lockstep_sc(seed, C, X, R_ver, sched, sc_mut=None, hb=15):
+    """v1 under the S-C schedule (arrivals at the tick's start, draft transfers at end_tick, waited and urgent blocks
+    read in place and admitted at the next poll) and S-C driven by the same schedule, transports seeded alike, reader
+    events completed two ticks late in both. Returns the first differences (page tables per layer; the content of
+    every verify page at the read point, in both worlds; state and counters per tick), the two worlds and the largest
+    number of shared extras borrowed in v1 after a tick."""
+    common = dict(C=C, X=X, R_ver=R_ver, seed=seed, mode="delay", max_delay=4)
+    wv = world(**common, svc_kw=dict(poll_in_resolve=False, defer_issue=True, defer_admit=True))
+    ws = world(**common, cls=SC.ResidencySC, svc_kw=dict(nblk=NB, sc_mut=sc_mut))
+    uids = ("u0", "u1")
+    for w in (wv, ws):
+        for b, u in enumerate(uids):
+            w.svc.begin_request(b, u)
+    tail = wv.svc.tail0
+    readers, bad = [], []
+    peak_borrowed = 0
+    for (t, m, ends, layers) in sched:
+        for w in (wv, ws):
+            w.svc.poll()
+        for l, spec in enumerate(layers):
+            rows = [Row(b, kind, key, 1000 + t, hb, [(hb, tail)]) for (b, kind, key, _) in spec]
+            sel = S(*[s for (_, _, _, s) in spec])
+            pv = wv.svc.resolve(l, rows, sel)
+            ps = ws.svc.resolve(l, rows, sel)
+            for i in range(len(rows)):
+                for h in range(H):
+                    a = pv.page_table[i, h, :int(pv.num_pages[i, h])].tolist()
+                    c = ps.page_table[i, h, :int(ps.num_pages[i, h])].tolist()
+                    if a != c:
+                        bad.append(("pages", t, l, i, h, a, c))
+            for name, w, p in (("v1", wv, pv), ("sc", ws, ps)):
+                if not _content_ok(w, l, rows, sel, p):
+                    bad.append(("content", name, t, l))
+            ev_v, ev_s = Ev(), Ev()
+            readers.append((t, ev_v, ev_s))
+            wv.svc.read_done(l, pv, ev_v)
+            ws.svc.read_done(l, ps, ev_s)
+        for w in (wv, ws):
+            w.svc.end_tick()
+        peak_borrowed = max([peak_borrowed] + [pool.borrowed() for pool in wv.svc.pools])
+        for (tt, a, c) in readers:
+            if tt <= t - 2:
+                a.done = c.done = True
+        if ends:
+            for w in (wv, ws):
+                for u in uids:
+                    w.svc.decided((u, 1, m))
+        sv, ss = _state(wv), _state(ws)
+        if sv != ss:
+            first = next(i for i, (x, y) in enumerate(zip(sv, ss)) if x != y)
+            bad.append(("state", t, sv[first], ss[first]))
+        if _counters(wv.svc) != _counters(ws.svc):
+            bad.append(("counters", t, _counters(wv.svc), _counters(ws.svc)))
+        if bad:
+            break
+    return bad, wv, ws, peak_borrowed
+
+
+def _no_verifier_force(svc):
+    return not any(k in svc.metrics.counts for k in ("verifier_evictions", "verifier_force_waits"))
+
+
+def test_F12_sc_equals_v1_on_the_f6_schedule():
+    """F12: over F6's 24-tick schedule (2 requests, 2 layers, draft rows every tick, verify rows every third tick,
+    seeded delays / reordering / bursts), S-C's page tables (every row and head, every layer), the ownership state
+    after every tick and the counters (masked, draft pairs, refusals, 4.3, 4.6, transfers) equal v1's under the S-C
+    schedule, and every verify page holds the host truth of its block at the read point in both. The verify rows
+    met ready, in-flight (waited on the device) and new (gathered) blocks; v1 never evicted or forced for the verifier
+    (S-C's overflow precondition). The device is read ONCE per tick (verify and draft decisions together)."""
+    bad, wv, ws, _ = _lockstep_sc(1, C=8, X=48, R_ver=8, sched=_sched(101, 24, True))
+    assert bad == [], bad[:3]
+    assert ws.svc.d2h_reads == 24
+    k43 = wv.svc.metrics.k43
+    assert k43["layer_calls"] > 0 and k43["ready"] > 0 and k43["in_flight"] > 0 and k43["new"] > 0, k43
+    assert ws.svc.dev.waited > 0 and ws.svc.dev.gathered > 0
+    assert _no_verifier_force(wv.svc), wv.svc.metrics.counts
+
+
+def test_F12b_sc_equals_v1_under_capacity_pressure():
+    """F12b: C 2, X 96, R_ver 88 (draft fetches may borrow 8 extras per layer; the rest is the verifier's reserve),
+    8 historical blocks, two overlapping verify rows per cohort and request (the flattened round): S-C equals v1 every
+    tick (pages, content, state, counters), draft fetches are refused, the verifier borrowed beyond the drafts' limit
+    (it used the reserve), a block that two verify rows of one cohort miss is transferred once, and the device is
+    read once per tick."""
+    bad, wv, ws, peak = _lockstep_sc(3, C=2, X=96, R_ver=88, sched=_sched_pressure(103, 15), hb=8)
+    assert bad == [], bad[:3]
+    assert ws.svc.d2h_reads == 15
+    assert wv.svc.metrics.refused > 0 and peak > 96 - 88, (wv.svc.metrics.refused, peak)
+    assert wv.svc.metrics.k43["new"] > 0 and _no_verifier_force(wv.svc)
+
+
+@pytest.mark.parametrize("mut, sched", [("no_wait", "f6"), ("no_verify_protect", "f6"), ("no_verify_dedup", "pressure"),
+                                        ("no_verify_protect", "pressure")])
+def test_F12c_sc_negative_controls(mut, sched):
+    """F12c: the same lockstep catches a device that reads an in-flight block before its transfer landed (no_wait:
+    caught by the CONTENT check of S-C's verify pages at the read point), a verify read without protection, and a
+    device that transfers one block twice for two verify rows of a cohort (no_verify_dedup): by a difference from v1
+    or by the host's check of a device decision (OwnershipViolation)."""
+    args = (dict(seed=1, C=8, X=48, R_ver=8, sched=_sched(101, 24, True)) if sched == "f6" else
+            dict(seed=3, C=2, X=96, R_ver=88, sched=_sched_pressure(103, 15), hb=8))
+    try:
+        bad, _, _, _ = _lockstep_sc(sc_mut={mut: True}, **args)
+    except ER.OwnershipViolation:
+        assert mut != "no_wait"
+        return
+    if mut == "no_wait":
+        assert any(x[0] == "content" and x[1] == "sc" for x in bad), bad[:3]
+    else:
+        assert bad, mut
+
+
+def test_F12d_sc_reads_nothing_on_the_host_per_layer():
+    """F12d: the per-layer path of S-C holds no host read of a device value and no call of the counted device read
+    (_d2h): device_verify, device_draft, rank_in_group, ResidencySC.resolve and _row_inputs, the mirror refresh
+    (host to device only) and the GPU device operations. Negative control: the same check finds the per-layer read in
+    S-B's resolve (its host-side verify rows)."""
+    import inspect
+    forbidden = FORBIDDEN + ("_d2h(",)
+    for fn in (SC.device_verify, SB.device_draft, SB.rank_in_group, SC.ResidencySC.resolve, SC.ResidencySC._row_inputs,
+               SC.VerifyMirror.refresh, SB.DraftMirror.refresh, SC.CudaDeviceOps.wait, SC.CudaDeviceOps.gather):
+        assert [tok for tok in forbidden if tok in inspect.getsource(fn)] == [], fn.__qualname__
+    assert [tok for tok in forbidden if tok in inspect.getsource(SB.ResidencySB.resolve)] != []
+
+
+def _f12e(sc_mut=None, check_t3=True):
+    """A slot read by u0's verifier (reader ev1, pending) is RELEASING after u0 ends; u1's verifier then misses block
+    5 in the same stream. Returns (world, plan, ev1)."""
+    w = world(C=2, X=4, R_ver=2, cls=SC.ResidencySC, svc_kw=dict(nblk=NB, sc_mut=sc_mut))
+    svc = w.svc
+    svc.dev.check_t3 = check_t3
+    svc.begin_request(0, "u0")
+    svc.poll()
+    p = svc.resolve(0, [Row(0, "d", ("u0", 1, 1), 300, 10)], S([[0, 1], []]))
+    svc.read_done(0, p, Ev(done=True))
+    svc.end_tick()                                          # the draft takes slots 0 and 1 of (b 0, h 0)
+    land_all(w)                                             # both land: LRU
+    ev1 = Ev()
+    p = svc.resolve(0, [Row(0, "v", ("u0", 1, 1), 300, 10)], S([[0, 1], []]))
+    svc.read_done(0, p, ev1)
+    svc.end_tick()                                          # u0's verifier read slots 0 and 1 (reader ev1, pending)
+    svc.end_request("u0")
+    svc.poll()
+    st = svc.stream(0, 0, 0)
+    assert [s.state for s in st.slots[:3]] == [OWN.RELEASING, OWN.RELEASING, OWN.FREE]
+    svc.begin_request(0, "u1")
+    p = svc.resolve(0, [Row(0, "v", ("u1", 1, 1), 300, 10)], S([[5], []]))
+    return w, p, ev1
+
+
+def test_F12e_the_urgent_gather_never_writes_a_slot_still_read():
+    """F12e: S-C's urgent gather takes a FREE slot (slot 2), never a RELEASING one whose last reader is pending
+    (slots 0 and 1); the page holds block 5 and the host accepts the take at end_tick. Negative controls: a device
+    that counts RELEASING slots as FREE writes slot 0 under its pending reader: the device's T3 check refuses the
+    gather; with that check off, the host refuses the take at end_tick (first_free is 2)."""
+    w, p, ev1 = _f12e()
+    assert p.page_table[0, 0, 0] == 2 and slot_holds(w, 0, 0, 0, 2, 5)
+    w.svc.read_done(0, p, Ev(done=True))
+    w.svc.end_tick()
+    assert w.svc.stream(0, 0, 0).slots[2].state == OWN.INFLIGHT and not ev1.done
+    with pytest.raises(ER.OwnershipViolation, match="last reader is pending"):
+        _f12e(sc_mut={"gather_into_releasing": True})
+    w2, p2, _ = _f12e(sc_mut={"gather_into_releasing": True}, check_t3=False)
+    assert p2.page_table[0, 0, 0] == 0
+    w2.svc.read_done(0, p2, Ev(done=True))
+    with pytest.raises(ER.OwnershipViolation, match="the host would take 2"):
+        w2.svc.end_tick()
+
+
+def test_F12f_the_overflow_flag():
+    """F12f: a verify row that needs 3 slots where K5 grants 2 (C 1, X 1): S-C points the third block's page at an
+    in-bounds slot (the content check sees the hole at the read point) and end_tick raises CapacityRefusal after its
+    one device read, before any change of the host state; v1 refuses the same selection at resolve. Negative control:
+    a device that does not report the overflow lets the hole reach the host, which refuses it (OwnershipViolation)."""
+    rows, sel = [Row(0, "v", ("u0", 1, 1), 300, 10)], S([[0, 1, 2], []])
+    for sc_mut in (None, {"no_overflow_flag": True}):
+        w = world(C=1, X=1, R_ver=1, cls=SC.ResidencySC, svc_kw=dict(nblk=NB, sc_mut=sc_mut))
+        svc = w.svc
+        svc.begin_request(0, "u0")
+        svc.poll()
+        p = svc.resolve(0, rows, sel)
+        assert not _content_ok(w, 0, rows, sel, p)
+        svc.read_done(0, p, Ev(done=True))
+        if sc_mut is None:
+            with pytest.raises(ER.CapacityRefusal):
+                svc.end_tick()
+            assert svc.d2h_reads == 1 and not svc.inflight and not svc.stream(0, 0, 0).prot
+        else:
+            with pytest.raises(ER.OwnershipViolation, match="did not flag an overflow"):
+                svc.end_tick()
+    wv = world(C=1, X=1, R_ver=1)
+    wv.svc.begin_request(0, "u0")
+    with pytest.raises(ER.CapacityRefusal):
+        wv.svc.resolve(0, rows, sel)
+
+
+class OwnerBlindInFlight(RES.Residency):
+    """DEFECT: the in-flight lookup ignores the stream's owner (a transfer of an ended request is merged and read)."""
+
+    def _in_flight(self, l, b, h, t):
+        return self.pending.get((l, b, h, t))
+
+
+def _f13(cls=None, svc_kw=None):
+    """u0's draft transfer of block 5 is in flight (force_only: it does not land) when u0 ends; u1 takes batch slot 0
+    (its prefill writes other host rows) and its verifier selects block 5."""
+    w = world(C=4, X=4, R_ver=1, cls=cls, svc_kw=svc_kw)
+    svc = w.svc
+    svc.begin_request(0, "u0")
+    svc.poll()
+    p = svc.resolve(0, [Row(0, "d", ("u0", 1, 1), 300, 10)], S([[5], []]))
+    svc.read_done(0, p, Ev(done=True))
+    svc.end_tick()
+    svc.end_request("u0")
+    svc.begin_request(0, "u1")
+    g = torch.Generator().manual_seed(77)
+    for l in range(L):
+        w.host_k[l][0] = torch.randn(w.host_k[l][0].shape, generator=g)
+        w.host_v[l][0] = torch.randn(w.host_v[l][0].shape, generator=g)
+        w.cis[l][0] = torch.randn(w.cis[l][0].shape, generator=g)
+    svc.poll()
+    rows, sel = [Row(0, "v", ("u1", 1, 1), 300, 10)], S([[5], []])
+    return w, rows, sel, svc.resolve(0, rows, sel)
+
+
+def test_F13_a_transfer_of_an_ended_request_is_never_read_by_the_next():
+    """F13: a transfer in flight for a request that ended carries that request's rows; the next request of the batch
+    slot does not merge with it or wait for it: its verifier takes its own urgent slot and reads its own rows (v1
+    under the S-C schedule, and S-C). Negative control: an owner-blind in-flight lookup reads the old request's rows
+    (caught by the content check)."""
+    v1 = dict(poll_in_resolve=False, defer_issue=True, defer_admit=True)
+    for cls, kw in ((None, v1), (SC.ResidencySC, dict(nblk=NB))):
+        w, rows, sel, p = _f13(cls, kw)
+        assert _content_ok(w, 0, rows, sel, p)
+        if cls is None:
+            assert p.looks[0]["new"] == [5] and len(p.urgent) == 1 and p.waited == []
+    w, rows, sel, p = _f13(OwnerBlindInFlight, v1)
+    assert p.waited and not _content_ok(w, 0, rows, sel, p)

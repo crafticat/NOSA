@@ -108,7 +108,7 @@ ev, demand) (`transfer.py:74-102`). The destination slot is INFLIGHT and never r
 
 | transport | what moves the bytes | notes |
 |---|---|---|
-| `gilfree` (default for runs) | agent E's NativePipe: GIL-free C++ pack of host rows into a pinned staging ring (OpenMP), `copy_(non_blocking)` on a COPY stream (copy engine), `index_copy_` scatter on a SCATTER stream into the destination slots (`gilfree_pack.cpp:150-281`) | ring lifetime waits ev_h2d / ev_sc (`:16-18`); completion = the done event on the scatter stream; source only until its GPU step passes |
+| `gilfree` (default for runs) | agent E's NativePipe: GIL-free C++ pack of host rows into a pinned staging ring (OpenMP), `copy_(non_blocking)` on a COPY stream (copy engine), `index_copy_` scatter on a SCATTER stream into the destination slots (`gilfree_pack.cpp:150-281`) | ring lifetime waits ev_h2d / ev_sc (`:16-18`); completion = the done event on the scatter stream. ADAPTER `nosi/nosi/r2_transport_gilfree.py` (packer v2, f2b981a): one `issue(layer, transfers)` = one `NativePipe.release` (groups b, h, l = layer, m = slot, blk) into the layer's store; T4 host-waits each `hist_ev` before the pack; T3 `scatter.wait_event(reader_ev)` (CPU: host wait); `set_threads(N)`, more than 1 thread refused from a build without OpenMP, every release's team checked (`threads_min == threads_max == N`, agent E's `threads_ok`); `background=True` runs the releases in one feeder thread pinned with `os.sched_setaffinity(cores)` (the OpenMP team inherits it). CPU tests GT1-GT3 (`test_r2_transport_gilfree.py`): bytes equal to `s0` on the same plans and to the host truth; T4; the team rule with agent E's no-OpenMP build as the negative control |
 | `s0` | K3X S0Transport: `index_select` pack into pinned staging, H2D on the copy stream, `index_copy_` scatter (`transfer.py:105-415`) | the K3X reference transport; runs on the CPU backend for tests |
 | `gather` | NOSI's zero-copy Triton gather `flash_h2d_from_mask` reading the pinned host rows, launched on a SIDE stream with a load mask over the store's slots (`flash_h2d_mask.py:65-88`) | uses SMs and HBM bandwidth: the GPU-gather baseline of paper 4.4 |
 | `adversarial` | K3X AdversarialTransport: seeded delays, reordering, bursts; delivery waits for reader_ev (`transfer.py:418-509`) | CPU tests |
@@ -190,14 +190,17 @@ slots = 8.6 GB (and the 16.4 GB model). The sizes are run parameters; SG5 report
 ```
 svc = Residency(L, B, H, C, X, R_ver, transport, urgent_gather, store_b=, cis=, block_bytes=, host_wait=)   # v1
 svc = ResidencySB(..., device=, nblk=)              # S-B (r2_residency_sb.py): the draft rows on the device
+svc = ResidencySC(..., device=, nblk=, devops=)     # S-C (r2_residency_sc.py): verify and draft rows on the device;
+                                                    # devops = CudaDeviceOps(svc, host_k, host_v, store_k, store_v,
+                                                    # store_b, cis) on the GPU (the CPU stand-in by default)
 svc.begin_request(b, uid, hist_blocks=S // 64)      # the prefill wrote the host rows of blocks < hist_blocks
 # a tick
 svc.poll()                                          # arrivals (admit), queued releases (reader gates), FREE
 for l in layers:
     sel = selection of all rows ((H, R, k) int64; on the device for S-B; tail included)
-    plan = svc.resolve(l, rows, sel)                # SAME signature in v1 and S-B; rows: Row(b, kind, key, pos,
-                                                    # hist_bound, tail); v1: a host read per layer; S-B: only for
-                                                    # the verify rows (S-C removes it)
+    plan = svc.resolve(l, rows, sel)                # SAME signature in v1, S-B and S-C; rows: Row(b, kind, key,
+                                                    # pos, hist_bound, tail); v1: a host read per layer; S-B: only
+                                                    # for the verify rows; S-C: none (one resolve per layer per tick)
     # plan.page_table (R, H, P) int32, plan.num_pages (R, H) int32, plan.last_len / seq_idx (R,) int32 over the store;
     # the urgent gathers and the stream waits are already enqueued on the main stream. S-B: plan.reads / plan.blocks
     # hold the verify rows only (the draft reads are applied at end_tick)
@@ -205,7 +208,9 @@ for l in layers:
                           plan.last_len)
     svc.read_done(l, plan, torch.cuda.Event recorded on the main stream)
 svc.end_tick()                                      # S-B: ONE device read, the draft decisions applied, the draft
-                                                    # transfers issued; v1 (defer_issue): the draft transfers issued
+                                                    # transfers issued; v1 (defer_issue): the draft transfers issued;
+                                                    # S-C: ONE device read for verify and draft decisions; an
+                                                    # overflow flag raises CapacityRefusal (the tick is invalid)
 svc.history_written(uid, block, ev)                 # the tick wrote block back to the host rows; ev = its D2H copy
 svc.decided(key)                                    # the verified cohort: its references queued behind the readers
 svc.cancel(key) / svc.cancel_epoch(uid, epoch)      # a rejection: every later key of the old epoch (draft-only keys too)
@@ -269,8 +274,8 @@ deliveries ("force_only" for the scripted tests). The negative controls are K3X 
 (prot_release_no_reader_gate, release_drops_all_keys, free_on_cancel, no_reader_wait, release_first_reader,
 vres_counted_as_lru) and defect subclasses of the service otherwise (InflightReadable, NoDedup, DraftTakesReserve).
 F5b (the verifier reserve) and G10 in `test_r2_g0bi.py` (the serial path refuses rows below position 4032, the verify
-agent's Q4) are added. F10-F10d (S-B, 12b) and F11 (history_written and the host write-back order: K3X T4; cancel_epoch)
-follow.
+agent's Q4) are added. F10-F10d (S-B, 12b), F11 (history_written and the host write-back order: K3X T4; cancel_epoch)
+and F12-F13 (S-C and the next request of a batch slot, 12c) follow.
 
 | Id | Test | Negative control (must be caught) |
 |---|---|---|
@@ -308,6 +313,58 @@ with real selections; FG3 the packer's sustained rate (4.9) against the tick's d
   Negative controls (F10c): no dedup, K5 without the reserve, no hit protection. F10d: device_draft's source holds no
   host read. Device reads counted: one per tick (+ one per layer of a verify tick, v1's verify rows).
 
+## 12c. S-C: the verify rows on the device (`nosi/nosi/r2_residency_sc.py`, 2026-10-21)
+
+- Per layer, NO host read: the host refreshes the layer's mirror (S-B's, plus the slot and generation of the owner's
+  transfer in flight per block), then `device_verify` decides the verify rows in K3X order (verify row, head,
+  ascending block): READY (resident), IN FLIGHT (the mirror's transfer: the read waits for it on the device), NEW (the
+  first occurrence per (stream, block) takes a slot; a later occurrence, another verify row of the cohort, reads the
+  same slot: one transfer per stream and block). K5 for the verifier: a stream's first C - usage takes are local,
+  later ones take a shared extra while any is free, the reserve R_ver included (the PRE-RESERVED VERIFIER POOL: draft
+  fetches never borrow its last R_ver extras); the slot is the stream's q-th FREE slot (K3X first_free). A first miss
+  that K5 cannot grant sets the OVERFLOW FLAG (its page points at slot 0, in bounds) and end_tick raises
+  CapacityRefusal before any change of the host state: the tick is invalid and the run stops (C + X or R_ver too
+  small). v1 instead evicts an unprotected LRU entry or host-waits releases there (`dispatcher.py:2416-2443`); S-C
+  does neither, so the equality tests assert that v1 never did either.
+- The device then waits for the in-flight blocks, gathers the urgent blocks (K, V, bias) on the main stream before the
+  layer's attention, and updates the mirror (urgent blocks in flight, their slots taken, usage); `device_draft` (S-B)
+  then decides the layer's draft rows on it.
+- At end_tick ONE batched device read of every layer's verify and draft decisions; per layer the host applies the
+  verify decisions in v1's order and checks each (a ready slot the host does not hold, an in-flight slot or generation
+  the host does not have, a take K5 or first_free would not make, a valid block without a slot and without the flag:
+  OwnershipViolation), then the draft decisions (S-B).
+- DEVICE OPERATIONS. `CpuDeviceSim` (the CPU tests): the needed transfers land (the transport's force, exactly v1's
+  waits); the gather copies K, V and the cis rows, host-waits the block's write-back (T4) and refuses a slot whose last
+  reader is pending (T3). `CudaDeviceOps` (the GPU; SOURCE ONLY, NOT RUN: GPU gate FG1): the main stream waits
+  (`cudaStreamWaitEvent`) on the completion event of EVERY transfer in flight at the layer, a SUPERSET of the needed
+  ones because the host does not read the selection (a gilfree pack not submitted yet is host-waited for its
+  submission, Q2); a wait changes no ownership state, only when the main stream runs. The gather is NOSI's
+  `flash_h2d_from_mask_bias` (K and bias) and `flash_h2d_from_mask` (V) with the decision's device load ids (H, B,
+  C + X), after a main-stream wait on every host write-back registered since the last gather (T4); its slots are FREE,
+  so their last reader completed (K4, T3). The exact alternative to the superset wait (a device spin on the slot
+  generation that the scatter stream publishes) is left for a measured need.
+- The S-C schedule (v1's reference): arrivals at the tick's start, draft transfers at end_tick, the waited and the
+  urgent blocks read IN PLACE (their INFLIGHT slot) and admitted at the next poll: `Residency(poll_in_resolve=False,
+  defer_issue=True, defer_admit=True)`.
+- Tests (`test_r2_residency.py`): F12 S-C == v1 on F6's 24-tick schedule (pages, verify page content at the read
+  point in both worlds, state, counters every tick; ready, in-flight and new blocks met; one device read per tick);
+  F12b under capacity pressure (C 2, X 96, R_ver 88, 8 blocks, two overlapping verify rows per cohort: refusals, the
+  verifier borrows beyond the drafts' limit, one transfer per block); F12c negative controls (a read before the
+  in-flight block landed: caught by the content check; no verify protection; a second transfer of one block for two
+  verify rows); F12d the source check (device_verify, device_draft, rank_in_group, resolve, the mirror refresh, the GPU
+  operations: no host read, no `_d2h`; S-B's resolve is caught); F12e the urgent gather never writes a RELEASING slot
+  (negative: RELEASING counted as FREE, caught by the device's T3 check and, with it off, by the host's first_free
+  check); F12f the overflow flag (CapacityRefusal at end_tick; v1 refuses at resolve; negative: no flag, the host
+  refuses the hole); F13 a transfer of an ended request is never merged with or read by the next request of the batch
+  slot (negative: an owner-blind lookup reads the old rows).
+- FIXES IN v1 found while building S-C (each covered above): (1) a block that an EARLIER verify row of the same layer
+  fetched urgently was also put on the wait list (a force of a transfer the transport never had); (2) the 4.3 / 4.6
+  looks counted a block once per verify row: now once per (cohort, layer, head, block), the first look classifies it;
+  (3) the in-flight lookup ignored the stream's owner, so the next request of a batch slot could merge with (and,
+  under defer_admit, read) an ended request's transfer (K3X keeps only the current owner's transfers in
+  Stream.pending). device_draft's (N, B x H) one-hot ranks are replaced by a sort-based rank (O(N) memory; same
+  values; F10 re-checks).
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,
@@ -320,3 +377,9 @@ with real selections; FG3 the packer's sustained rate (4.9) against the tick's d
 - Q3 C + X must hold the union of a cohort's selections plus the LRU (measured union over 4 positions about 71 blocks);
   a CapacityRefusal names the shortfall. SG5 sweeps C and X.
 - Q4 Joint reads (paper 3.3: queries that use the same KV share its reads) are out of scope here.
+- Q5 The mirror refresh of S-B / S-C is a full host scan of the layer's streams and slots (Python, per layer, per
+  tick): correct and simple for the CPU equality tests, too slow for SG5 at B 64 x H 8 x (C + X) slots x 32 layers.
+  Before a throughput run the mirror must be kept on the device and updated from the host's transitions (take, admit,
+  release, free) by one batched host-to-device copy per tick.
+- Q6 CudaDeviceOps' superset wait may stall the main stream on draft transfers that no verify row reads. The 4.3
+  layer_wait_ns measures it in FG1; the exact device spin on published generations is the fallback.
