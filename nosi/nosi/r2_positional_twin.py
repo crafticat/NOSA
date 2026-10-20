@@ -152,6 +152,15 @@ class PositionalTwin:
         self._win = torch.arange(KERNEL, dtype=torch.int64, device=dev)
         self._all_b = torch.arange(self.B, dtype=torch.int64, device=dev)   # step_fixed's row index (preallocated)
         self.err = torch.zeros((), dtype=torch.int32, device=dev)            # step_fixed's refusal bits (ERR_*)
+        # the decode summaries' mean (step): None = torch's .mean (the shipped op); the BI mode of R2 step 7
+        # (r2_bi_decode.attach_bi) sets a fixed-order mean, whose summation order does not depend on B
+        self.mean_fn = None
+        # step_unchecked (R2 step 7 tick): a STICKY device flag, True once an unchecked step met a full table or a
+        # bank without a prefill (that step wrote nothing for that bank); the caller reads it once per tick
+        self.overflow = torch.zeros((), dtype=torch.bool, device=dev)
+
+    def _mean(self, x: torch.Tensor, dim: int) -> torch.Tensor:
+        return x.mean(dim=dim) if self.mean_fn is None else self.mean_fn(x, dim)
 
     # ------------------------------------------------------------------ events
     def _key_due(self, p: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
@@ -252,7 +261,7 @@ class PositionalTwin:
         bk = b[due_k]
         if bk.numel():
             nk = n_k[due_k]
-            means = self.key_window(all_b, STRIDE * self.n_comp).mean(dim=1)              # (B, H, D)
+            means = self._mean(self.key_window(all_b, STRIDE * self.n_comp), 1)            # (B, H, D)
             self.comp_k[bk, nk] = means[bk]
             self.n_comp[bk] = nk + 1
         # 2. raw key
@@ -265,7 +274,7 @@ class PositionalTwin:
             nc = n_c[due_c]
             rows = (STRIDE * self.n_ccis[:, None] + self._win[None, :]).clamp(max=self.n_max - 1)
             win = self.total_cis[all_b[:, None], rows]                                     # (B, 32, H)
-            means_c = win.permute(2, 0, 1).contiguous().mean(dim=-1)                       # (H, B)
+            means_c = self._mean(win.permute(2, 0, 1).contiguous(), -1)                    # (H, B)
             self.ccis[:, bc, nc] = means_c[:, bc]
             self.n_ccis[bc] = nc + 1
         # 5.
@@ -336,6 +345,73 @@ class PositionalTwin:
 
     def clear_error(self) -> None:
         self.err.zero_()
+
+    # ------------------------------------------------- the unchecked step (R2 step 7 tick)
+    def step_unchecked(self, keys: torch.Tensor, cis: torch.Tensor, active: torch.Tensor) -> None:
+        """step() WITHOUT A HOST READ (the flattened tick, R2 step 7; step() stays the default and the reference).
+        keys (B, H, D), cis (B, H), active (B,) bool ON THE TWIN'S DEVICE. Every bank goes through the same masked
+        ops (no nonzero, no bool(), no index list): the events of step() for the active banks, a write-back of the
+        value read for the others. The summaries are step()'s: the same shape-stable means over ALL B banks through
+        the same mean_fn hook, so a bank's tables are bitwise step()'s.
+        CAPACITY. The caller guarantees it from the preallocated widths with ONE batched host check per tick on its
+        host mirrors (pos + n <= N_max and (pos + n) // 16 + 1 <= Lk_max for every bank). Should a bank still meet a
+        full table (or lack a prefill), that bank writes NOTHING in this step (no clamped write lands) and the sticky
+        flag self.overflow turns True; the caller reads it once per tick. Never a silent out-of-range write.
+        A TRUE FLAG VOIDS THE TICK: the flagged bank did not advance while its rows were computed, so the caller must
+        refuse every decision of that tick (raise), never commit it. (Contributed by the verify agent, reviewed by
+        track C under conditions (a)-(d) of the Q3 answer, 2026-10-21.)"""
+        dev = self.pos.device
+        if tuple(keys.shape) != (self.B, self.H, self.D) or tuple(cis.shape) != (self.B, self.H):
+            raise ValueError("keys (%d, %d, %d) and cis (%d, %d) expected" % (self.B, self.H, self.D, self.B, self.H))
+        if not torch.is_tensor(active) or active.dtype != torch.bool or tuple(active.shape) != (self.B,) \
+                or active.device != dev:
+            raise ValueError("active must be a (%d,) bool tensor on %s" % (self.B, dev))
+        all_b = torch.arange(self.B, device=dev)
+        p, n_k, n_c = self.pos.clone(), self.n_comp.clone(), self.n_ccis.clone()
+        due_k = active & self._key_due(p, n_k)
+        due_c = active & self._cis_due(p, n_c)
+        bad = (active & ((p >= self.n_max) | ~self.prefilled)) | (due_k & (n_k >= self.lk_max)) \
+            | (due_c & (n_c >= self.lk_max))
+        self.overflow |= bad.any()
+        a = active & ~bad
+        keys = keys.to(device=dev, dtype=self.ring.dtype)
+        cis = cis.to(device=dev, dtype=self.total_cis.dtype)
+        # 1. deferred key compression: step()'s mean over all banks; the due banks write it
+        means = self._mean(self.key_window(all_b, STRIDE * n_k), 1)                    # (B, H, D)
+        wk = due_k & a
+        ik = n_k.clamp(max=self.lk_max - 1)
+        self.comp_k[all_b, ik] = torch.where(wk.view(-1, 1, 1), means, self.comp_k[all_b, ik])
+        self.n_comp += wk.to(self.n_comp.dtype)
+        # 2. raw key
+        r = p % RING
+        self.ring[all_b, r] = torch.where(a.view(-1, 1, 1), keys, self.ring[all_b, r])
+        # 3. raw cis
+        ip = p.clamp(max=self.n_max - 1)
+        self.total_cis[all_b, ip] = torch.where(a.view(-1, 1), cis, self.total_cis[all_b, ip])
+        # 4. immediate cis compression: step()'s window and mean over all banks; the due banks write it
+        rows = (STRIDE * n_c[:, None] + self._win[None, :]).clamp(max=self.n_max - 1)
+        win = self.total_cis[all_b[:, None], rows]                                     # (B, 32, H)
+        means_c = self._mean(win.permute(2, 0, 1).contiguous(), -1)                    # (H, B)
+        wc = due_c & a
+        ic = n_c.clamp(max=self.lk_max - 1)
+        self.ccis[:, all_b, ic] = torch.where(wc.view(1, -1), means_c, self.ccis[:, all_b, ic])
+        self.n_ccis += wc.to(self.n_ccis.dtype)
+        # 5.
+        self.pos += a.to(self.pos.dtype)
+
+    def advance_unchecked(self, keys: torch.Tensor, cis: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+        """advance() over step_unchecked: keys (B, T, H, D), cis (B, T, H), n (B,) int64 ON THE DEVICE (T, the host
+        bound, is keys.shape[1]). Returns ctr (T + 1, 4, B) on the device, without a host read."""
+        T = int(keys.shape[1])
+        if keys.dim() != 4 or keys.shape[0] != self.B or tuple(cis.shape) != (self.B, T, self.H):
+            raise ValueError("keys (B, T, H, D) and cis (B, T, H) expected")
+        if not torch.is_tensor(n) or n.dtype != torch.int64 or tuple(n.shape) != (self.B,) or n.device != self.pos.device:
+            raise ValueError("n must be a (%d,) int64 tensor on the twin's device" % self.B)
+        ctr = [self.counters()]
+        for u in range(T):
+            self.step_unchecked(keys[:, u], cis[:, u], n > u)
+            ctr.append(self.counters())
+        return torch.stack(ctr)
 
     # ------------------------------------------------------- commit / rollback
     def counters(self) -> torch.Tensor:

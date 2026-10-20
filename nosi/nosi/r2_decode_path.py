@@ -53,6 +53,10 @@ NEGATIVE CONTROL HOOKS (gates only; state.neg, default None; pooling_lengths):
 ACTIVITY (step 6): the driver sets state.active (device) and state.active_host (CPU) before a step; an inactive
 request's row is computed and discarded (the twin and the body skip it); pos_host advances for active requests only.
 
+BI MODE (R2 step 7, G0-BI): r2_bi_decode.attach_bi(state, ops) sets state.bi; decode_inference then runs the
+batch-invariant serial decode of r2_bi_decode.py (G-b / G-a GEMMs, the fixed-order twin means, the deterministic
+selection, piece 3's paged attention). Without it nothing here changes.
+
 F3 (findings): the SHIPPED total_cis has S + 1024 rows, so the shipped decode stops at step 1025 (a silent no-op cis
 write, then a RuntimeError in the tail-bias copy). The R2 path never reads it: the twin's total_cis has N_max rows and
 the body bounds the write by min(n_host, N_max), both sized from the horizon (build_ragged). What still bounds a run:
@@ -343,6 +347,9 @@ def decode_inference(model, input_ids, cu_seqlens, position_ids, cache):
     """The R2 twin of Llama.decode_inference: input_ids (B, 1), position_ids (B, 1). Returns logits (B, 1, V) float."""
     NL = _nl()
     st = cache.r2_state
+    if getattr(st, "bi", None) is not None:                            # the BI serial decode (step 7, G0-BI)
+        from . import r2_bi_decode
+        return r2_bi_decode.decode_inference(model, input_ids, cu_seqlens, position_ids, cache)
     if input_ids.shape[1] != 1:
         raise R2Error("the R2 decode takes one token per request")
     hidden = F.embedding(input_ids, model.embed_tokens)
