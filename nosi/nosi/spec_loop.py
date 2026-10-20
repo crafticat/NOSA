@@ -251,7 +251,11 @@ def _assign(want: torch.Tensor, ids: torch.Tensor, cand: torch.Tensor, key: torc
     dst_c = torch.where(fits, dst, dump)
     ext = torch.full((H, B, W + 1), -1, dtype=torch.int64, device=ids.device)
     ext.scatter_(-1, dst_c, torch.where(fits, ids, torch.full_like(ids, -1)))
-    return ext[..., :W], fits, n_cand
+    # CONTIGUOUS (2026-10-20 fix): the map goes to the two Triton gathers, which read entry (h, b, m) at
+    # h * B * M + b * M + m from the data pointer (flash_h2d_mask.py:34, flash_h2d_mask_bias.py:34). The narrowed
+    # view ext[..., :W] has rows of W + 1: the kernels read shifted entries and put blocks into other slots, other
+    # requests' slots and the tail slot (runs r2m1_g2 / r2m1_p1: rollback probe 'layer 0 ... k_tail differs').
+    return ext[..., :W].contiguous(), fits, n_cand
 
 
 def _first_occurrence(ids: torch.Tensor) -> torch.Tensor:

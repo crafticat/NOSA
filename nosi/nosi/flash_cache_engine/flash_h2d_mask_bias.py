@@ -89,6 +89,9 @@ def flash_h2d_from_mask_bias(
     load_ids, # (H,B,M)
     block_size: int = 64,
 ):
+    # the kernel reads load_ids[h, b, m] at h * B * M + b * M + m from the data pointer (above): a view with other
+    # strides (for example a narrowed (H, B, M + 1) map) would put blocks into the wrong slots (2026-10-20)
+    assert load_ids.is_contiguous(), "flash_h2d_from_mask_bias: load_ids must be contiguous, got strides %s" % (load_ids.stride(),)
     B, S_GPU, H, D = gpu_data.shape
     _, S_CPU, _, _ = cpu_data.shape
     H2, B2, M = load_ids.shape

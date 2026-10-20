@@ -13,8 +13,14 @@
       ShippedRef with the shipped F2 line), and refuses an F2-short table; MP2 score_position on a ragged batch equals
       B = 1 scoring (stand-ins for the two kernels: a torch stage 1, pool_reference); MP3 the per-request rollback probe
       passes after a real round and fails on a corrupted tail row and on a round without the masked restore.
+  FX  the slot-map stride defect (fixed 2026-10-20: spec_loop._assign returned a narrowed view; the Triton gathers
+      read their map from the data pointer as if contiguous): FX1 with gathers that ADDRESS THE MAP AS THE KERNELS DO,
+      every draft prefetch lands in the slot the plan names and slot 63 is untouched (negative control: the pre-fix map
+      misplaces blocks); FX2 the maps are contiguous, and the verify's fetch already was before the fix (the reach);
+      FX3 both gather wrappers refuse a non-contiguous map. MP3b: replay_deterministic compares two replays.
   PL  the pilot's host side: perreq_keep and PerReqLoop (ragged sequences, finished requests stop committing, the K = 0
       fallback, refusals), aggregate_rounds_perreq (the measured yield), the report's gates for a per-request cell.
+  AN  benchmarks/Efficiency/r2_payload_analysis.py on a synthetic payload.
   ST / PIN  the step script's per-request cells (bash -n, text) and the wiring pins.
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA \
@@ -120,15 +126,50 @@ NS = {"torch": torch, "_sl": sl, "_tw": tw, "_us": us, "_vs": vs, "_bias_rows": 
       "flash_h2d_from_mask": _gather_k, "flash_h2d_from_mask_bias": _gather_v}
 
 
-def _bind(eng):
+def _flat_ids(ids):
+    """What the Triton gathers read: entry (h, b, m) at h * B * M + b * M + m FROM THE DATA POINTER
+    (flash_h2d_mask.py:34, flash_h2d_mask_bias.py:34), whatever the strides of the tensor they are handed."""
+    Hn, Bn, Mn = ids.shape
+    return torch.as_strided(ids, (Hn * Bn * Mn,), (1,), ids.storage_offset())
+
+
+def _kernel_gather_k(gpu, cpu, ids, bs):
+    """flash_h2d_from_mask as the KERNEL addresses its map (the twins above index the tensor, so they cannot see a
+    stride defect)."""
+    Hn, Bn, Mn = ids.shape
+    flat = _flat_ids(ids)
+    for h in range(Hn):
+        for b in range(Bn):
+            for m in range(Mn):
+                blk = int(flat[h * Bn * Mn + b * Mn + m])
+                if blk >= 0:
+                    gpu[b, m * bs:(m + 1) * bs, h] = cpu[b, blk * bs:(blk + 1) * bs, h]
+
+
+def _kernel_gather_v(gpu, cpu, bias_buf, bias, ids, bs):
+    _kernel_gather_k(gpu, cpu, ids, bs)
+    Hn, Bn, Mn = ids.shape
+    flat = _flat_ids(ids)
+    for h in range(Hn):
+        for b in range(Bn):
+            for m in range(Mn):
+                blk = int(flat[h * Bn * Mn + b * Mn + m])
+                if blk >= 0:
+                    bias_buf[b, m * bs:(m + 1) * bs, h] = bias[b, blk * bs:(blk + 1) * bs, h].to(bias_buf.dtype)
+
+
+NS_KERNEL = dict(NS, flash_h2d_from_mask=_kernel_gather_k, flash_h2d_from_mask_bias=_kernel_gather_v)
+
+
+def _bind(eng, ns_base=None):
     for name in METHODS:
-        ns = dict(NS)
+        ns = dict(ns_base or NS)
         exec(_method_src(name), ns)
         setattr(eng, name, types.MethodType(ns[name], eng))
     return eng
 
 
-def _engine(pos, rids, seed, l, n_max, perreq):
+def _engine(pos, rids, seed, l, n_max, perreq, ns_base=None):
     """One layer's engine for requests ``rids`` at positions ``pos``; request rid's data from its own generator, so a
     B = 1 engine of request rid equals slice b of a batched one."""
     B = len(pos)
@@ -163,7 +204,7 @@ def _engine(pos, rids, seed, l, n_max, perreq):
         eng.seq_length = eng._tail_block_len_on_gpu = None
         eng._pos = pt.clone()
         sl.check_tail_state(eng, eng._pos)
-    return _bind(eng)
+    return _bind(eng, ns_base)
 
 
 def _tables(pos, rids, seed, l, n_max):
@@ -206,9 +247,9 @@ class Uni:
     """One batch of NL layers: engines with the bound spec bodies, twins, one store, a context; per-request or
     lockstep."""
 
-    def __init__(self, pos, rids, seed, n_max, perreq, NL=1):
+    def __init__(self, pos, rids, seed, n_max, perreq, NL=1, ns_base=None):
         self.B, self.NL, self.perreq = len(pos), NL, perreq
-        self.engines = [_engine(pos, rids, seed, l, n_max, perreq) for l in range(NL)]
+        self.engines = [_engine(pos, rids, seed, l, n_max, perreq, ns_base) for l in range(NL)]
         self.twins = [_tables(pos, rids, seed, l, n_max) for l in range(NL)]
         self.store = sl.Store(NL, H, self.B, LAY)
         cls = sl.PerReqSpecContext if perreq else sl.SpecContext
@@ -497,6 +538,108 @@ def test_EP5_a_rollback_across_a_block_boundary_restores_slot_63_and_leaves_no_s
                 assert int(e._block_map[0, 0, TOPK - 1]) == 9 and int(e._cache_lens[0]) == (TOPK - 1) * BS + 63
 
 
+# ===========================================================================
+# FX: the slot-map stride defect (fixed 2026-10-20): _assign returned ext[..., :W], a view with rows of W + 1, and the
+# Triton gathers read their map at h * B * M + b * M + m from the data pointer
+# ===========================================================================
+def _old_assign(orig):
+    """The pre-fix _assign: the same values as a narrowed (H, B, W + 1) view."""
+    def f(want, ids, cand, key):
+        issue, fits, n_cand = orig(want, ids, cand, key)
+        Hn, Bn, Wn = issue.shape
+        ext = torch.full((Hn, Bn, Wn + 1), -1, dtype=issue.dtype)
+        ext[..., :Wn] = issue
+        return ext[..., :Wn], fits, n_cand
+    return f
+
+
+def _draft_landing_violations(seed, steps=4):
+    """Draft steps on a ragged batch with the KERNEL-faithful gathers. Returns the number of (head, request, slot)
+    whose prefetch does not hold the host rows of the block the plan named, plus the number of requests whose slot-63
+    rows below the round-start tail length changed (both 0 when the map is read as the plan wrote it)."""
+    pos = [9 * BS + 50, 10 * BS + 3, 9 * BS + 40, 11 * BS + 0]
+    B = len(pos)
+    n_max = max(pos) + steps + 2 * BS
+    P = Uni(pos, list(range(B)), seed, n_max, perreq=True, ns_base=NS_KERNEL)
+    e, t, ctx, st = P.engines[0], P.twins[0], P.ctx, P.store
+    ts = LAY.tail_slot * BS
+    tl0 = [p % BS for p in pos]
+    rows0 = [e._k_gpu[b, ts:ts + tl0[b]].clone() for b in range(B)]
+    inp = _inputs(seed, 0, list(range(B)), P.pos(), steps, [0] * B)
+    ctx.begin_round(P.view)
+    bad = issued = 0
+    for j in range(steps):
+        ctx.next_tick()
+        t.step(inp.dk[j], inp.dc[j])
+        e.spec_draft_update_perreq(inp.dk[j].unsqueeze(1), inp.dv[j].unsqueeze(1), t.total_cis, inp.sd[j][0], ctx, 0)
+        issue = e._spec_last_draft.issue
+        for h, b, w in (issue >= 0).nonzero().tolist():
+            issued += 1
+            blk = int(issue[h, b, w])
+            if not torch.equal(e._k_gpu[b, w * BS:(w + 1) * BS, h], e._k_cpu[b, blk * BS:(blk + 1) * BS, h]):
+                bad += 1
+    tail_hit = sum(1 for b in range(B) if not torch.equal(e._k_gpu[b, ts:ts + tl0[b]], rows0[b]))
+    return bad, tail_hit, issued
+
+
+def test_FX1_draft_prefetch_lands_in_the_slots_the_plan_names_with_the_kernels_addressing(monkeypatch):
+    bad, tail_hit, issued = _draft_landing_violations(101)
+    assert issued > 0 and bad == 0 and tail_hit == 0, (bad, tail_hit, issued)
+    # NEGATIVE CONTROL: the pre-fix map (a narrowed view) puts blocks into slots the plan did not name
+    monkeypatch.setattr(sl, "_assign", _old_assign(sl._assign))
+    bad2, tail_hit2, _ = _draft_landing_violations(101)
+    assert bad2 > 0, (bad2, tail_hit2)
+
+
+def test_FX2_the_maps_handed_to_the_gathers_are_contiguous_and_the_verify_fetch_was_contiguous_before_the_fix(monkeypatch):
+    """The fixed producer: plan_draft(_perreq).issue and plan_round(_perreq).fetch are contiguous. THE REACH of the
+    defect: with the pre-fix _assign, plan_round's fetch was still contiguous (rebuilt by torch.where), so only the
+    draft's prefetch (plan.issue) was misplaced; the verify's late fetch was not."""
+    g = _g(102)
+    st = sl.Store(1, H, 3, LAY)
+    bm = torch.full((H, 3, TOPK), -1, dtype=torch.int64)
+    for b in range(3):
+        for h in range(H):
+            bm[h, b, :TOPK - 1] = torch.randperm(10, generator=g)[:TOPK - 1]
+        bm[:, b, TOPK - 1] = 10
+    st.sync_window(0, bm, 1)
+    sel = torch.stack([_sel(g, 10) for _ in range(3)], 1)                       # (H, 3, KSEL)
+    T = torch.full((3,), 10, dtype=torch.int64)
+    for old in (False, True):
+        if old:
+            monkeypatch.setattr(sl, "_assign", _old_assign(sl._assign))
+        s1 = sl.Store(1, H, 3, LAY)
+        for n in sl.STORE_FIELDS + st.COUNTERS:
+            getattr(s1, n).copy_(getattr(st, n))
+        d = sl.plan_draft(s1, 0, sel, 10, False, 1, 2, 10)
+        dp = sl.plan_draft_perreq(s1, 0, sel, T, torch.zeros(3, dtype=torch.bool), 2, 3, T)
+        s1.mark_arrived(10)
+        su = torch.stack([sel, sel])                                             # (U = 2, H, 3, KSEL)
+        r = sl.plan_round(s1, 0, su, 10, 2, 1, 4, 5, torch.zeros((H, 3, LAY.W), dtype=torch.bool))
+        rp = sl.plan_round_perreq(s1, 0, su, T, torch.full((3,), 2), 1, 6, 7, torch.zeros((H, 3, LAY.W), dtype=torch.bool))
+        assert r.fetch.is_contiguous() and rp.fetch.is_contiguous()             # the verify fetch, before and after the fix
+        assert d.issue.is_contiguous() == (not old) and dp.issue.is_contiguous() == (not old)
+
+
+def test_FX3_the_gather_wrappers_refuse_a_non_contiguous_map():
+    fce = ROOT / "nosi/nosi/flash_cache_engine"
+    for fname, fn in (("flash_h2d_mask.py", "flash_h2d_from_mask"), ("flash_h2d_mask_bias.py", "flash_h2d_from_mask_bias")):
+        src = (fce / fname).read_text()
+        tree = ast.parse(src)
+        f = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == fn)
+        first = f.body[0]
+        assert isinstance(first, ast.Assert) and "load_ids.is_contiguous()" in ast.get_source_segment(src, first), fn
+    m1 = _load(fce / "flash_h2d_mask.py", "nosi_flash_h2d_mask_guard_test")              # imports triton (no launch here)
+    m2 = _load(fce / "flash_h2d_mask_bias.py", "nosi_flash_h2d_mask_bias_guard_test")
+    ext = torch.full((H, 2, LAY.W + 1), -1, dtype=torch.int64)
+    view = ext[..., :LAY.W]
+    gpu, cpu = torch.zeros((2, LAY.W * BS, H, D)), torch.zeros((2, 4 * BS, H, D))
+    with pytest.raises(AssertionError):
+        m1.flash_h2d_from_mask(gpu, cpu, view, BS)
+    with pytest.raises(AssertionError):
+        m2.flash_h2d_from_mask_bias(gpu, cpu, torch.zeros((2, LAY.W * BS, H)), torch.zeros((2, 4 * BS, H)), view, BS)
+
+
 def _overflow_setup(seed):
     """Request 0 at 9*64+10 with an ordinary selection; request 1 at 30*64+5 naming 32 distinct blocks over the round:
     more new blocks than the 12 evictable slots of its stream (overflow)."""
@@ -776,6 +919,33 @@ def test_MP3_the_per_request_rollback_probe_passes_after_a_round_and_its_control
     monkeypatch.undo()
     pr3 = spm.probe(u3.view, u3.state, snap3, rec3["keep"], U, LAY)
     assert not pr3["same"] and pr3["detail"].startswith("layer 0 request 0 ") and "_tail" in pr3["detail"], pr3
+    assert pr3["replay_deterministic"], pr3                 # the replay itself is repeatable: 'same' decides
+
+
+def test_MP3b_replay_deterministic_compares_the_two_replays_and_catches_a_non_repeatable_replay(monkeypatch):
+    """replay_deterministic is the FIRST replay(keep) against the THIRD (a repeat), not the post-round state against
+    the third. Negative control: a replay whose tail write is perturbed only on its third pass fails it while 'same'
+    (post-round state == first replay) still holds."""
+    u, pos, K = _probe_universe(92)
+    U = K + 1
+    snap = spm.ProbeSnapshot(u.view, u.state, LAY, U).take()
+    rec = _round_perreq(u, _inputs(92, 0, list(range(4)), u.pos(), K, [0, 3, 1, 2], u.NL))
+    keep = rec["keep"]
+    n_writes = u.NL * int((keep > 0).sum())                  # write_tail calls of one replay (the control's too: keep 2 at request 0)
+    orig = spm._tw.write_tail
+    calls = [0]
+
+    def write_tail(engine, key_states, value_states, kv_bias, mirror_slot):
+        calls[0] += 1
+        if calls[0] > 2 * n_writes:                            # the third replay
+            key_states = key_states + 1
+        return orig(engine, key_states, value_states, kv_bias, mirror_slot)
+
+    monkeypatch.setattr(spm._tw, "write_tail", write_tail)
+    pr = spm.probe(u.view, u.state, snap, keep, U, LAY)
+    assert calls[0] == 3 * n_writes
+    assert pr["same"] and pr["control_differs"] and not pr["replay_deterministic"] and not pr["passed"], pr
+    assert pr["deterministic_detail"] != "equal"
 
 
 # ===========================================================================
@@ -890,6 +1060,61 @@ def test_PL3_the_report_gates_a_per_request_cell(tmp_path, monkeypatch):
     # a mismatch above the tolerance is NOT the expected failure
     cl = pilot.classify_mismatches(dict(mismatches=[dict(ref_margin=9.0)]), 1.9)
     assert "NOT the expected" in pilot.perreq_identity_note(dict(passed=False), cl)
+
+
+# ===========================================================================
+# AN: the payload analysis (benchmarks/Efficiency/r2_payload_analysis.py) on a synthetic payload
+# ===========================================================================
+def _analysis_payload():
+    """B = 4, documents [7, 8, 7, 8], L = 186, 10 tokens, one per-request cell (K = 2, three rounds of keep 3).
+    Request 1 leaves the shipped sequence at j = 3 (margin 0.1: a near tie); request 2 at j = 5 (margin 3.0) while its
+    partner 0, with the same prefix, keeps the shipped token; request 3 at j = 6 (margin 4.0) at position 191
+    (191 % 64 == 63: an F4 step), after its group disagreed on n_acc in round 0."""
+    L, B, n = 186, 4, 10
+    ship = torch.zeros((B, n), dtype=torch.int64)
+    ship[0] = ship[2] = torch.arange(1, n + 1)
+    ship[1] = ship[3] = torch.arange(11, n + 11)
+    margins = torch.full((B, n - 1), 5.0)
+    margins[1, 2], margins[2, 4], margins[3, 5] = 0.1, 3.0, 4.0
+    seq = ship.clone()
+    seq[1, 3:] += 100
+    seq[2, 5:] += 100
+    seq[3, 6:] += 100
+    F = False
+    rounds = [dict(K=2, committed_before=[1, 1, 1, 1], keep=[3, 3, 3, 3], n_acc=[2, 1, 2, 2], bad=[F] * 4, done_before=[F] * 4),
+              dict(K=2, committed_before=[4, 4, 4, 4], keep=[3, 3, 3, 3], n_acc=[2, 2, 1, 2], bad=[F] * 4, done_before=[F] * 4),
+              dict(K=2, committed_before=[7, 7, 7, 7], keep=[3, 3, 3, 3], n_acc=[2, 2, 2, 2], bad=[F] * 4, done_before=[F] * 4)]
+    probe = dict(passed=False, same=False, replay_deterministic=True, detail="layer 0 request 2 k_tail differs")
+    cell = dict(commit="perreq", K=2, seq=seq, rounds=rounds, probe=probe)
+    return dict(L=L, batch=B, distinct_docs=2, docs=[7, 8, 7, 8], arms=dict(shipped=dict(seq=ship, margins=margins)),
+                cells=dict(K2=cell))
+
+
+def test_AN1_the_payload_analysis_reports_first_mismatches_groups_and_the_above_tolerance_facts(tmp_path):
+    ra = _load(ROOT / "benchmarks/Efficiency/r2_payload_analysis.py", "nosi_r2_payload_analysis_under_test")
+    res = ra.analyse({"run/spec_x": _analysis_payload()}, 0.5)          # tol 2.0
+    c = res["cells"][0]
+    assert c["classes"] == {"near_tie": 1, "above_tol": 2} and c["mismatching_requests"] == 3 and c["f4_first_mismatches"] == 1
+    assert c["spec_groups_with_differing_members"] == 2 and c["ref_groups_with_differing_members"] == 0
+    assert c["nacc_disagreement_rounds"] == 2
+    above = {r["request"]: r for r in c["above_tol"]}
+    r2, r3 = above[2], above[3]
+    assert (r2["j"], r2["position"], r2["f4_step"], r2["round"], r2["u"], r2["bonus"]) == (5, 190, False, 1, 0, False)
+    assert r2["state_left_partners_before_j"] is False and r2["partners_same_prefix_and_shipped_token_at_j"] == [0]
+    assert (r3["j"], r3["position"], r3["f4_step"], r3["round"], r3["u"]) == (6, 191, True, 1, 1)
+    assert r3["state_left_partners_before_j"] is True and r3["first_partner_disagreement_round"] == 0
+    assert r3["partners_same_prefix_and_shipped_token_at_j"] == []
+    assert (r3["round_start_pos"], r3["tail_len0"], r3["rolled"], r3["u_after_fill"]) == (190, 62, True, False)
+    # the CLI: payloads from a run directory, analysis.json / .md written, a fresh output directory required
+    run = tmp_path / "r2m1_x_1"
+    run.mkdir()
+    torch.save(_analysis_payload(), str(run / "spec_x.pt"))
+    out = tmp_path / "out"
+    assert ra.main(["--run", str(run), "--tau", "0.5", "--out", str(out)]) == 0
+    md = (out / "analysis.md").read_text()
+    assert "ABOVE TOL r2m1_x_1/spec_x/K2 request 3: j=6 position 191 (F4 step True)" in md
+    with pytest.raises(FileExistsError):
+        ra.main(["--run", str(run), "--tau", "0.5", "--out", str(out)])
 
 
 # ===========================================================================

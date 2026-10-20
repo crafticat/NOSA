@@ -460,20 +460,24 @@ def replay(cache, st: PerReqState, snap: ProbeSnapshot, keep, layout, bias_rows=
 
 
 def probe(cache, st: PerReqState, snap: ProbeSnapshot, keep, U: int, layout, bias_rows=None) -> dict:
-    """THE ROLLBACK PROBE in per-request form: the post-round state equals replay(keep); the control replay(keep') with
-    ONE request's keep changed by one (+1, or -1 at U) differs; replay(keep) is deterministic. Leaves the engine in the
-    replay(keep) state (= the committed state)."""
+    """THE ROLLBACK PROBE in per-request form: the post-round state equals replay(keep) (same); the control
+    replay(keep') with ONE request's keep changed by one (+1, or -1 at U) differs (control_differs); a second
+    replay(keep) equals the FIRST one (replay_deterministic: the replay is repeatable, so 'same' can decide; until
+    2026-10-20 this field compared the post-round state with the second replay, which only repeated 'same').
+    Leaves the engine in the replay(keep) state (= the committed state)."""
     keep_h = [int(x) for x in torch.as_tensor(keep).tolist()]
     pos0 = snap.slots[0]["_pos"].clone()
     after = capture(cache, st, pos0, layout)
     replay(cache, st, snap, keep_h, layout, bias_rows)
-    same, why = states_equal(after, capture(cache, st, pos0, layout))
+    first = capture(cache, st, pos0, layout)
+    same, why = states_equal(after, first)
     alt = list(keep_h)
     j = 0
     alt[j] = alt[j] + 1 if alt[j] < U else alt[j] - 1
     replay(cache, st, snap, alt, layout, bias_rows)
     diff, why_alt = states_equal(after, capture(cache, st, pos0, layout))
     replay(cache, st, snap, keep_h, layout, bias_rows)
-    same2, _ = states_equal(after, capture(cache, st, pos0, layout))
+    det, why_det = states_equal(first, capture(cache, st, pos0, layout))
     return dict(keep=keep_h, U=int(U), same=bool(same), detail=why, control_keep=alt, control_differs=not bool(diff),
-                control_detail=why_alt, replay_deterministic=bool(same2), passed=bool(same and not diff and same2))
+                control_detail=why_alt, replay_deterministic=bool(det), deterministic_detail=why_det,
+                passed=bool(same and not diff and det))

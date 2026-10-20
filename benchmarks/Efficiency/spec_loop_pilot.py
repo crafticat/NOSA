@@ -747,11 +747,14 @@ def run_spec_arm(model, cache, t0, position_ids, K: int, total: int, probe: bool
                 torch.cuda.synchronize()
                 return _capture_state(cache, int(eng0._tail_block_len_on_gpu), int(eng0.seq_length), host_lo)
 
-            same, why = _states_equal(e1s, replay(c))
+            r1 = replay(c)
+            same, why = _states_equal(e1s, r1)
             alt = c + 1 if c < U else c - 1
             diff, why_alt = _states_equal(e1s, replay(alt))
             e2 = replay(c)          # leave the engine at the committed state
-            same2, _ = _states_equal(e1s, e2)
+            # replay_deterministic: the second replay(c) equals the FIRST (until 2026-10-20 it was compared with the
+            # post-round state, which only repeated 'same' and was read as 'the replay is not repeatable')
+            same2, _ = _states_equal(r1, e2)
             probe_result = dict(round=r, c=c, U=U, same=bool(same), detail=why, control_keep=alt,
                                 control_differs=not bool(diff), control_detail=why_alt, replay_deterministic=bool(same2),
                                 passed=bool(same and not diff and same2))
