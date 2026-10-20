@@ -1234,7 +1234,7 @@ def rollback_exact(cache, ops: GatherOps, store: Store, marks: RoundMarks, c: in
         # D. tables
         marks.journals[t][l].restore(layer)
     cache._seen_tokens = marks.seen[t]
-    return dict(c=c, U=U, rows_restored=rows_restored, undo_fill=bool(u_fill is not None and u_fill > t))
+    return dict(c=c, U=U, rows_restored=rows_restored, undo_fill=(u_fill is not None and u_fill > t))
 
 
 def stop_after(argmax_u: torch.Tensor, next_input: torch.Tensor) -> bool:

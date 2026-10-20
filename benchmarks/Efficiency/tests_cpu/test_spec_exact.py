@@ -1,7 +1,10 @@
 """R2 verify branch (2026-10-20): CPU tests of the EXACT verify (nosi/nosi/spec_loop.py, section EXACT VERIFY) and of
 its GPU gate (benchmarks/Efficiency/spec_exact_gate.py, spec_exact_r2_step.sh).
 
-    python -m pytest -q -p no:cacheprovider -rA benchmarks/Efficiency/tests_cpu/test_spec_exact.py
+    env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA benchmarks/Efficiency/tests_cpu/test_spec_exact.py
+
+(on a compute node, never the login node; PYTHONDONTWRITEBYTECODE=1 because this repository does not ignore
+__pycache__, and spec_exact_r2_step.sh refuses a checkout with untracked files under nosi/ or benchmarks/.)
 
 HOW THE SHIPPED CODE RUNS HERE. cache_engine.py compiles a CUDA extension at import, so it cannot be imported. The
 SOURCE of the shipped methods (CacheEngine.decode_update_has_kv_bias, decode_update_has_kv_bias_verify_slots,
