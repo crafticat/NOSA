@@ -433,17 +433,17 @@ def test_gate2_ragged_equals_independent_runs():
 # negative controls
 # ---------------------------------------------------------------------------
 def test_negctl_key_event_off_by_one_fails_gate1():
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="n_comp"):
         run_gate1(_OffByOneKey, 4033, 1, invariants=False)
 
 
 def test_negctl_cis_event_off_by_one_fails_gate1():
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="n_ccis"):
         run_gate1(_OffByOneCis, 4033, 1, invariants=False)
 
 
 def test_negctl_shared_counter_fails_gate2():
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match=": pos "):
         run_gate2(_SharedCounter, [4033] * 4, invariants=False)
 
 
@@ -482,22 +482,29 @@ def _worst_case_pair():
     for t in (twin, ref):
         t.step(keys[:, S], cis[:, S])
     assert int(twin.pos[0]) - STRIDE * int(twin.n_comp[0]) == 32
-    return twin, ref, g
+    return twin, ref, g, keys, cis
 
 
 def test_rollback_over_32_positions_is_exact():
-    twin, ref, g = _worst_case_pair()
+    twin, ref, g, keys, cis = _worst_case_pair()
     ctr = twin.advance(_ints((1, 32, H_, D_), g, 100, 120), _ints((1, 32, H_), g, 100, 120), [32])
     assert int(twin.n_comp[0]) > int(ctr[0, 1, 0]), "the rejected tokens crossed a compression event"
     twin.commit(ctr, [0])
     _assert_request_equal(twin, 0, ref, 0, "after a 32-position rollback")
+    # direct evidence: over the next 40 committed tokens (key summaries at p = 4048, 4064, 4080,
+    # cis summaries at p = 4063, 4079) they still agree
+    p0 = int(ref.pos[0])
+    for p in range(p0, p0 + 40):
+        for t in (twin, ref):
+            t.step(keys[:, p], cis[:, p])
+        _assert_request_equal(twin, 0, ref, 0, "position %d after the rollback" % p)
 
 
 def test_rollback_over_33_positions_is_refused_and_would_corrupt():
-    twin, ref, g = _worst_case_pair()
+    twin, ref, g, _, _ = _worst_case_pair()
     ctr = twin.advance(_ints((1, 33, H_, D_), g, 100, 120), _ints((1, 33, H_), g, 100, 120), [33])
     snap = _state(twin)
-    with pytest.raises(tw.TwinRollbackError):
+    with pytest.raises(tw.TwinRollbackError, match="over 33"):
         twin.commit(ctr, [0])
     _assert_state_equal(twin, snap, "refused commit")
     # what the guard prevents: force the reset, and a live key row is gone
