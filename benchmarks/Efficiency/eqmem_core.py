@@ -426,8 +426,12 @@ def prefix_agreement(a: Sequence[Sequence[int]], b: Sequence[Sequence[int]]) -> 
         while k < min(len(x), len(y)) and int(x[k]) == int(y[k]):
             k += 1
         lens.append(k)
-    full = sum(1 for i, k in enumerate(lens) if k >= min(len(a[i]), len(b[i])))
-    return dict(requests=n, full_agreement=full, prefix_p50=pctl(lens, 50), prefix_min=min(lens) if lens else None)
+    agree = [k >= min(len(a[i]), len(b[i])) for i, k in enumerate(lens)]
+    parted = [k for k, ok in zip(lens, agree) if not ok]
+    # prefix_min: the EARLIEST divergence among the requests that part (None when every request agrees); a short
+    # request that agrees fully is not a divergence (the first version took the minimum over all requests)
+    return dict(requests=n, full_agreement=sum(agree), prefix_p50=pctl(lens, 50),
+                prefix_min=min(parted) if parted else None)
 
 
 # ------------------------------------------------------------------------------------------------------------ report
