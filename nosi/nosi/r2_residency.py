@@ -23,6 +23,8 @@ ONE LAYER (resolve, v1 = host-side per layer, decision D2): the tick passes the 
     DRAFT transfer, deduplicated (one per stream and block), or REFUSED by K5 (counted; the draft continues masked,
     decision D3); dispatcher.py:2592-2629, :2955-2970.
   The page table lists, per (row, head), the historical slots in ascending block id, then the row's tail slots.
+  defer_admit (the S-C schedule, r2_residency_sc.py): the waited and the urgent blocks are read IN PLACE (their
+  INFLIGHT slot, after the wait / the gather) and admitted at the next poll, never in the middle of a tick.
 After the layer's attention the tick calls read_done(l, plan, event): the event becomes the last reader of every slot
 read and of every (key, l); a verify key's (key, l) references are QUEUED and dropped when that event completed (K4 as
 amended by repair 1 R1; dispatcher.py:1553-1588, :1671-1694, :2821).
@@ -115,8 +117,12 @@ class Residency:
     def __init__(self, L: int, B: int, H: int, C: int, X: int, R_ver: int, transport, urgent_gather: Callable,
                  store_b=None, cis=None, block: int = BLOCK, block_bytes: int = 0, host_wait: Callable = None,
                  mut: Mutations = None, clock: Callable[[], int] = time.perf_counter_ns, poll_in_resolve: bool = True,
-                 defer_issue: bool = False):
+                 defer_issue: bool = False, defer_admit: bool = False):
         self.poll_in_resolve, self.defer_issue = bool(poll_in_resolve), bool(defer_issue)
+        # defer_admit (the S-C schedule): the verifier's waited and urgent blocks are read in place on the device and
+        # admitted at the next poll, never in the middle of a tick
+        self.defer_admit = bool(defer_admit)
+        self._landed: Set[int] = set()                       # seqs landed by the main stream (urgent gathers)
         self._deferred: List[Tuple[int, List[Transfer]]] = []
         self.L, self.B, self.H, self.C, self.X, self.R_ver = int(L), int(B), int(H), int(C), int(X), int(R_ver)
         self.pools = [LayerPool(l, self.B, self.H, self.C, self.X, self.R_ver) for l in range(self.L)]
@@ -202,8 +208,9 @@ class Residency:
         return res
 
     def poll_arrivals(self) -> int:
-        """K3X _poll, the arrival half (dispatcher.py:1499-1539): every transfer whose OWN completion is observed is
-        admitted with its merged demand set (non-blocking; no arrival order is assumed). Admission order: by (layer,
+        """K3X _poll, the arrival half (dispatcher.py:1499-1539): every transfer whose OWN completion is observed (or
+        that the main stream landed in place: an urgent gather under defer_admit) is admitted with its merged demand set
+        (non-blocking; no arrival order is assumed). Admission order: by (layer,
         batch slot, head, issue sequence): per stream the issue order, and streams are independent, so the state does
         not depend on how the issues of different layers interleave (S-B issues its draft transfers at end_tick)."""
         self.tp.poll()
@@ -211,7 +218,8 @@ class Residency:
         order = sorted(self.inflight.values(), key=lambda tr: (tr.layer, tr.b, tr.h, tr.seq))
         for tr0 in order:
             tr = self.inflight.get(tr0.seq)
-            if tr is not None and self.tp.done(tr):
+            if tr is not None and (tr.seq in self._landed or self.tp.done(tr)):
+                self._landed.discard(tr.seq)
                 self._admit(tr)
                 n += 1
         return n
@@ -286,20 +294,24 @@ class Residency:
     def _take(self, l: int, b: int, h: int, block: int, key: Tuple, kind: str, at: Optional[int] = None) -> Optional[Transfer]:
         """K3X _issue (dispatcher.py:3098-3179): take a FREE slot (K5 decides a draft may borrow), forward the slot's
         previous last reader to the transfer (T3), fill the bias rows. A refused draft fetch returns None.
-        at: the slot a DEVICE decision chose (S-B); the host checks it is what v1 would take (K5 allows the take, the
-        block is not in flight, the slot is K3X first_free), and raises otherwise."""
+        at: the slot a DEVICE decision chose (S-B: a draft take; S-C: a verifier urgent take); the host checks it is
+        what v1 would take (K5 allows the take for that kind, the block is neither in flight nor resident, the slot is
+        K3X first_free), and raises otherwise. A verifier urgent take of S-C does not fill the bias rows: the device's
+        urgent gather wrote them with K and V before the layer's reads."""
         pool = self.pools[l]
         st = pool.stream(b, h)
         hev = self._hist_ev_for(b, int(block))                       # T4: refused before any change of state
         if at is not None:
-            if kind != DRAFT:
-                raise ValueError("a device-chosen slot is for draft takes only")
+            if kind not in (DRAFT, VERIFY):
+                raise ValueError("kind %r" % (kind,))
             if self._in_flight(l, b, h, block) is not None or st.resident(block) is not None:
-                raise OwnershipViolation("S-B: a duplicate take of block %d (layer %d b %d h %d)" % (block, l, b, h))
-            if not pool.can_take(st, DRAFT) or pool.first_free(st) != at:
-                raise OwnershipViolation("S-B: the device took slot %d for block %d (layer %d b %d h %d), the host would "
-                                         "take %s" % (at, block, l, b, h, pool.first_free(st) if pool.can_take(st, DRAFT)
-                                                      else "nothing (K5 refuses)"))
+                raise OwnershipViolation("device decision: a duplicate take of block %d (layer %d b %d h %d)"
+                                         % (block, l, b, h))
+            if not pool.can_take(st, kind) or pool.first_free(st) != at:
+                raise OwnershipViolation("device decision: the device took slot %d for the %s block %d (layer %d b %d "
+                                         "h %d), the host would take %s"
+                                         % (at, kind, block, l, b, h, pool.first_free(st) if pool.can_take(st, kind)
+                                            else "nothing (K5 refuses)"))
             idx = at
         elif kind == DRAFT:
             idx = pool.first_free(st) if self._draft_can_take(pool, st) else None
@@ -318,7 +330,8 @@ class Residency:
         tr = Transfer(self.seq, st.owner, l, b, h, int(block), idx, gen, kind, key, hist_ev=hev, reader_ev=prev_reader)
         self.inflight[tr.seq] = tr
         self.pending[(l, b, h, int(block))] = tr
-        self._fill_bias(l, b, h, idx, int(block))
+        if not (at is not None and kind == VERIFY):
+            self._fill_bias(l, b, h, idx, int(block))
         self.metrics.issued(tr)
         return tr
 
@@ -333,7 +346,8 @@ class Residency:
             return
         if not self.tp.done(tr):
             self.tp.force(tr)
-        self._admit(tr)
+        if not self.defer_admit:
+            self._admit(tr)
 
     # ------------------------------------------------------------------------------------------------ one layer
     @staticmethod
@@ -341,8 +355,14 @@ class Residency:
         return sorted({int(t) for t in sel_row.tolist() if 0 <= int(t) < bound})
 
     def _in_flight(self, l: int, b: int, h: int, t: int) -> Optional[Transfer]:
-        """The transfer in flight for (l, b, h, block t), if any (one per stream and block: the dedup)."""
-        return self.pending.get((l, b, h, t))
+        """The transfer in flight for (l, b, h, block t) of the stream's CURRENT owner, if any (one per stream and
+        block: the dedup). A transfer of a request that ended stays in flight until it lands and is dropped (T3); it
+        carries the old request's rows, so the next request of the batch slot never merges with it or reads it (K3X
+        Stream.pending holds the current owner's transfers only)."""
+        tr = self.pending.get((l, b, h, t))
+        if tr is not None and tr.uid != self.pools[l].stream(b, h).owner:
+            return None
+        return tr
 
     def _draft_can_take(self, pool, st) -> bool:
         """K5: a draft fetch may borrow a shared extra only while more than R_ver extras are free."""
@@ -431,8 +451,8 @@ class Residency:
                     tr = self._in_flight(l, r.b, h, t)
                     if not self.mut.drop_demand_merge:
                         tr.demand.add(VERIFY)
-                    if tr not in plan.waited:
-                        plan.waited.append(tr)
+                    if tr not in plan.waited and tr not in plan.urgent:   # an urgent block of an earlier row of this
+                        plan.waited.append(tr)                            # layer is landed by the gather, not waited
                 for t in new:
                     plan.urgent.append(self._take(l, r.b, h, t, r.key, VERIFY))
         for tr in plan.waited:
@@ -446,7 +466,10 @@ class Residency:
                         self.host_wait(gate)
             self.gather(l, plan.urgent)                       # main stream, before every read of this layer
             for tr in plan.urgent:
-                self._admit(tr)
+                if self.defer_admit:
+                    self._landed.add(tr.seq)                  # read in place; admitted at the next poll
+                else:
+                    self._admit(tr)
         for lk in plan.looks:
             self.metrics.look(l, lk)
         # the verify rows' slots, fixed NOW (a later draft eviction can only make a protected entry PO, same slot)
@@ -460,7 +483,8 @@ class Residency:
                     idx = st.resident(t)
                     if idx is None:
                         tr = self._in_flight(l, r.b, h, t)
-                        if tr is not None and (callable(getattr(self.tp, "stream_wait", None)) or self.mut.read_not_ready):
+                        if tr is not None and (self.defer_admit or callable(getattr(self.tp, "stream_wait", None))
+                                               or self.mut.read_not_ready):
                             idx = tr.slot                     # waited on the device (or the NEGATIVE CONTROL: not waited)
                         else:
                             raise OwnershipViolation("layer %d row %d head %d: block %d is not readable" % (l, i, h, t))
@@ -701,29 +725,41 @@ class Metrics:
             rec["rv" if verify else "rd"] += 1
 
     def look(self, l: int, lk: Dict) -> None:
-        call = self.open_calls.setdefault((lk["key"], l), dict(t=lk["t"], ready=0, in_flight=0, new=0, wait_ns=0))
-        call["ready"] += len(lk["ready"])
-        call["in_flight"] += len(lk["in_flight"])
-        call["new"] += len(lk["new"])
+        """One verify (row, head) look of a layer_call. The unit is one block (request, layer, KV head, block id) per
+        layer_call: when several verify rows of one cohort select a block (the flattened round), the FIRST look
+        classifies it and later looks do not count it again (a block that an earlier row of the cohort fetched is
+        "new", never "in_flight": the cohort fetched it)."""
+        call = self.open_calls.setdefault((lk["key"], l), dict(t=lk["t"], ready=0, in_flight=0, new=0, wait_ns=0,
+                                                               seen=set()))
         st = self.svc.stream(l, self.svc.uid_b[lk["key"][0]], lk["h"])
-        for t in lk["ready"]:
-            idx = st.resident(t)
-            state = st.slots[idx].state if idx is not None else None
-            self.k46[{LRU: "lru", PO: "po", VRES: "vres"}.get(state, "not_resident")] += 1
-        for t in lk["in_flight"] + lk["new"]:
-            idx = st.resident(t)
-            if idx is None:                                   # a device-side wait: not admitted on the host yet
-                self.k46["inflight_waited" if t in lk["in_flight"] else "not_resident"] += 1
-                continue
-            rec = self.lifetimes.get((l, st.b, st.h, idx, st.slots[idx].gen))
-            own = t in lk["new"]
-            if own:
-                self.k46["fetched_refetch" if rec is not None and rec["refetch"] else "fetched_first"] += 1
-            else:
-                state = st.slots[idx].state
-                self.k46[{LRU: "lru", PO: "po", VRES: "vres"}.get(state, "not_resident")] += 1
-            if rec is not None and rec["seq"] in self.arrival_ns:
-                call["wait_ns"] += max(0, self.arrival_ns[rec["seq"]] - lk["t"])
+        for cls in ("ready", "in_flight", "new"):
+            for t in lk[cls]:
+                if (lk["h"], t) in call["seen"]:
+                    continue
+                call["seen"].add((lk["h"], t))
+                call[cls] += 1
+                idx = st.resident(t)
+                if cls == "ready":
+                    state = st.slots[idx].state if idx is not None else None
+                    self.k46[{LRU: "lru", PO: "po", VRES: "vres"}.get(state, "not_resident")] += 1
+                    continue
+                own = cls == "new"
+                if idx is None:
+                    tr = self.svc._in_flight(l, st.b, st.h, t)
+                    if own and tr is not None:
+                        idx = tr.slot                         # its own transfer, landed in place (S-C schedule), admitted
+                    else:                                     # at the next poll
+                        # another requester's transfer waited on the device: not admitted on the host yet
+                        self.k46["inflight_waited" if not own else "not_resident"] += 1
+                        continue
+                rec = self.lifetimes.get((l, st.b, st.h, idx, st.slots[idx].gen))
+                if own:
+                    self.k46["fetched_refetch" if rec is not None and rec["refetch"] else "fetched_first"] += 1
+                else:
+                    state = st.slots[idx].state
+                    self.k46[{LRU: "lru", PO: "po", VRES: "vres"}.get(state, "not_resident")] += 1
+                if rec is not None and rec["seq"] in self.arrival_ns:
+                    call["wait_ns"] += max(0, self.arrival_ns[rec["seq"]] - lk["t"])
 
     def executed(self, l: int, lk: Dict) -> None:
         call = self.open_calls.pop((lk["key"], l), None)
