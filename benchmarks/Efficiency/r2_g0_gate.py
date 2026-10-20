@@ -70,7 +70,7 @@ def parse_args(argv):
     ap.add_argument("--steps", type=int, default=64)
     ap.add_argument("--phases", default="P,G0T,NEGT,G0F,NEGF")
     ap.add_argument("--neg-step", type=int, default=40)
-    ap.add_argument("--neg-short", type=int, default=200)
+    ap.add_argument("--neg-short", type=int, default=400)   # 1007 - 400: blocks >= 152 lose keys
     a = ap.parse_args(argv)
     a.batches = [int(x) for x in a.batches.split(",") if x]
     a.phases = [p for p in a.phases.split(",") if p]

@@ -96,7 +96,7 @@ ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) sr
       --ntasks=1 --cpus-per-task=16 --mem=120G --gres=gpu:a100:1 --time="$STEP_MIN" --export=NONE
       /bin/sh -c "$CHILD" r2g0-child "$GPU_UUID" "$APPTAINER" --bind /mnt/beegfs/ojerbi:/mnt/beegfs/ojerbi "${ENVS[@]}"
       "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_g0_gate.py" --out "$OUT" --model "$MODEL"
-      --workload "$WL" --batches 1,8 --S 16128 --steps 64 --phases "$PHASES" --neg-step 40 --neg-short 200)
+      --workload "$WL" --batches 1,8 --S 16128 --steps 64 --phases "$PHASES" --neg-step 40 --neg-short 400)
 if [ "$DRY" = 1 ]; then
     echo "R2 G0 step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob workload $WL_SHA"
     printf '%q ' "${ARGV[@]}"
