@@ -19,8 +19,14 @@ ARMS (in this order):
   CG   --warmup eager capture-safe steps, then ONE captured step replayed for the rest: MUST == CE likewise; refusal
        bits 0; MUST (PTR) every state tensor's data_ptr (r2_capture.state_pointers) is the same before the capture and
        after the last replay.
+       "== CE" is the DEFINED result: every state view and table, and the logits / selection rows of the requests
+       ACTIVE at that step. The rows of an inactive request are discarded by the driver and, before the request's
+       first active step, read attention-window memory that nothing has written (compare_step, "UNDEFINED ROWS"
+       below the pure parts). MUST (CF-UNDEF, CG-UNDEF): every inactive-row difference is before that request's
+       first active step (undefined_ok).
   NG1  CG with the pooled widths frozen at the capture (cb.freeze_widths right before capture_step): MUST differ
-       from CE first at ng1_first_step (the first step whose widths differ from the capture step's).
+       from CE first at ng1_first_step (the first step at which an ACTIVE request's widths differ from the capture
+       step's).
   NG2  CG with the device activity mask left stale after the capture (prepare_step write_active=False): MUST differ
        from CE first at ng2_first_step (the first step whose activity differs from the capture step's).
   T    REPORT: median ms per decode step of CE, CF and CG (CUDA-synchronised wall time around the step only).
@@ -90,12 +96,14 @@ def positions_before(S_list, act):
 
 
 def ng1_first_step(S_list, act, capture_step: int):
-    """The first step s > capture_step whose pooled widths (pos_before // 64 + 1) differ from the capture step's
-    for some request (None: never). NG1 freezes the capture step's widths."""
+    """The first step s > capture_step at which a request ACTIVE at s has pooled widths (pos_before // 64 + 1) that
+    differ from the capture step's (None: never). NG1 freezes the capture step's widths. A request inactive at s is
+    not counted: its logits / selection rows are not compared (compare_step) and it writes no state, so its frozen
+    width shows only at its next active step."""
     pb = positions_before(S_list, act)
     w = pb // 64 + 1
     for s in range(capture_step + 1, act.shape[0]):
-        if not bool((w[s] == w[capture_step]).all()):
+        if bool(((w[s] != w[capture_step]) & act[s]).any()):
             return s
     return None
 
@@ -107,6 +115,59 @@ def ng2_first_step(act, capture_step: int):
         if not bool((act[s] == act[capture_step]).all()):
             return s
     return None
+
+
+def first_active(act):
+    """Per request, the first step at which it is active (None: never)."""
+    out = []
+    for b in range(act.shape[1]):
+        idx = act[:, b].nonzero()
+        out.append(int(idx[0, 0]) if idx.numel() else None)
+    return out
+
+
+# The rows of a step's result that belong to an INACTIVE request (UNDEFINED ROWS, docs/R2_CAPTURE_AUDIT.md "Undefined
+# rows"). The driver discards them: an inactive request keeps its token, and no state write uses them. Until the
+# request's FIRST ACTIVE STEP they also read memory that nothing has written: build_ragged allocates the attention
+# window with torch.empty (r2_decode_body.py:110-112), prefill_request fills only slot 63 (:140-145), yet _cache_lens
+# = 4032 + tail (:145), so attention reads rows 0 .. 4031, and only an active step's gathers fill them. Two arms
+# built one after the other read different garbage there (the first capture gate run, 2188818 step 94: CF and CG
+# differed from CE only in the logits and the selection of requests 2 and 7 at step 0, every table equal).
+# compare_step compares the DEFINED result (inactive rows blanked) and returns the inactive requests whose raw rows
+# differ; undefined_ok checks that each such difference is before the request's first active step.
+def mask_inactive(view, active):
+    """A copy of a step view (record_all) with the logits and selection rows of the inactive requests blanked (0.0 /
+    -1); the state views are not touched."""
+    import torch
+    a = torch.as_tensor(active, dtype=torch.bool).cpu()
+    out = dict(view)
+    lg, d = view["logits"]
+    out["logits"] = (torch.where(a.view(-1, 1), lg, torch.zeros_like(lg)), d)
+    tk, d = view["topk"]
+    out["topk"] = (torch.where(a.view(1, 1, -1, 1), tk, torch.full_like(tk, -1)), d)
+    return out
+
+
+def compare_step(ref, rec, active):
+    """(compare_views of the DEFINED result, [inactive requests whose raw logits or selection differ])."""
+    import torch
+    a = torch.as_tensor(active, dtype=torch.bool).cpu()
+    diffs = C.compare_views(mask_inactive(ref, a), mask_inactive(rec, a))
+    raw = C.compare_views({k: ref[k] for k in ("logits", "topk")}, {k: rec[k] for k in ("logits", "topk")})
+    undef = sorted({int(r) for v in raw.values() if isinstance(v, list) for r in v if not bool(a[int(r)])})
+    return diffs, undef
+
+
+def undefined_ok(pairs, act):
+    """(ok, detail): every (step, request) whose raw rows differed while inactive is before that request's first
+    active step (where the rows read unwritten memory). A pair at or after it is a real difference."""
+    fa = first_active(act)
+    late = [(s, b) for s, b in pairs if fa[b] is not None and s >= fa[b]]
+    detail = "%d undefined (step, request) row differences, requests %s, last step %s; first active steps %s" % (
+        len(pairs), sorted({b for _, b in pairs}), max((s for s, _ in pairs), default=None), fa)
+    if late:
+        return False, "differences AFTER the request's first active step %s; %s" % (late[:10], detail)
+    return True, detail
 
 
 def digest(t) -> int:
@@ -161,7 +222,7 @@ def run_arm(name, a, model, docs, act, ref):
     B, steps, W = a.batch, a.steps, a.warmup
     prompts = [docs[b, :S_list[b]] for b in range(B)]
     keep = name == "CE"
-    recs, tr = [], C.Tracker()
+    recs, tr, undef_pairs = [], C.Tracker(), []
     res = dict(arm=name)
     times = []
     with torch.inference_mode():
@@ -212,7 +273,9 @@ def run_arm(name, a, model, docs, act, ref):
             if keep:
                 recs.append(r)
             else:
-                tr.update(s, None, C.compare_views(ref["steps"][s], r))
+                diffs, undef = compare_step(ref["steps"][s], r, act[s])
+                tr.update(s, None, diffs)
+                undef_pairs.extend((s, b) for b in undef)
         torch.cuda.synchronize()
         tab = tables_digest(cache, st.twins)
         if keep:
@@ -222,6 +285,9 @@ def run_arm(name, a, model, docs, act, ref):
         if ptr_before is not None:
             res["pointers_changed"] = pointer_diff(ptr_before, RC.state_pointers(st, cb, cache))
             res["pointers_checked"] = len(ptr_before)
+        if not keep:
+            res["undefined_rows"] = [list(p) for p in undef_pairs[:200]]
+            res["undefined_ok"] = undefined_ok(undef_pairs, act)
         res.update(errors=err_seen[:10], n_error_steps=len(err_seen),
                    ms_per_step=round(1e3 * statistics.median(times), 2) if times else None,
                    warmup=W if name in ("CG", "NG1", "NG2") else None)
@@ -240,8 +306,10 @@ def verdicts(name, res, tr, a, act):
         return [(name, True, False, "EXCEPTION " + res["error"])]
     if name in ("CF", "CG"):
         ok, why = C.verdict_equal(tr)
-        out.append((name, True, ok, why))
+        out.append((name, True, ok, why + " (the defined result: inactive requests' logits / selection rows blanked)"))
         out.append((name + "-ERR", True, res["n_error_steps"] == 0, "refusal bits: %s" % (res["errors"] or "none")))
+        uok, udetail = res["undefined_ok"]
+        out.append((name + "-UNDEF", True, uok, udetail))
     if name == "CG":
         ch = res.get("pointers_changed")
         out.append(("CG-PTR", True, ch == [], "%s of %s state pointers changed across the replays: %s"
@@ -307,6 +375,7 @@ def main(argv=None) -> int:
                 seed=a.seed, arms=a.arms, prompt_lengths=prompt_lengths(a),
                 ng1_first_step=ng1_first_step(prompt_lengths(a), act, a.warmup),
                 ng2_first_step=ng2_first_step(act, a.warmup), active_steps=[int(x) for x in act.sum(0)],
+                first_active=first_active(act), active_at_step0=[bool(x) for x in act[0]],
                 workload_sha256=sha, attn_splits=NL._ATTN_SPLITS, nosi_commit=os.environ.get("CAP_COMMIT", "unknown"),
                 allocation_rule="transient intermediates from the graph's private pool; state preallocated, in place",
                 torch=torch.__version__, gpu=torch.cuda.get_device_name(0))

@@ -207,15 +207,83 @@ host K and V, and the window K, V and bias.
 | Arm | What | Gate |
 |---|---|---|
 | CE | the validated eager path (`model.decode_inference`, body "r2") | the reference |
-| CF | eager `decode_step_fixed` with the driver | MUST bitwise CE every step and in the final digests; CF-ERR: refusal bits 0 |
-| CG | `--warmup` 2 eager steps, then ONE captured step replayed for the rest | MUST bitwise CE; CG-ERR; CG-PTR: no state `data_ptr` moves across the replays |
-| NG1 | CG with `cb.freeze_widths` right before the capture (the widths of the capture step) | MUST differ first at `ng1_first_step` (the first step whose widths differ) |
+| CF | eager `decode_step_fixed` with the driver | MUST bitwise CE (the defined result, below) every step and in the final digests; CF-ERR: refusal bits 0; CF-UNDEF |
+| CG | `--warmup` 2 eager steps, then ONE captured step replayed for the rest | MUST bitwise CE (the defined result); CG-ERR; CG-UNDEF; CG-PTR: no state `data_ptr` moves across the replays |
+| NG1 | CG with `cb.freeze_widths` right before the capture (the widths of the capture step) | MUST differ first at `ng1_first_step` (the first step at which an ACTIVE request's widths differ) |
 | NG2 | CG with the device mask not written after the capture | MUST differ first at `ng2_first_step` (the first step whose activity differs) |
 | T | median ms per step of CE, CF, CG | REPORT |
 
 Exit: the number of failed MUST gates (at most 19); 20 refused; 30 an exception
 outside an arm. Size: B 8, S0 16128, deltas 0,1,17,63,64,65,777,4097, 192
 steps, warm-up 2, p-active 0.7, seed 6.
+
+### Undefined rows (the first gate run, and the fix)
+
+The first run (holder 2188818, sacct step 2188818.94, at 09e683a) failed CF and CG
+with the same detail: `first difference at step 0: {'logits': (0, None, [2, 7]),
+'topk': (0, None, [2, 7])}`. All other parts passed: CF-ERR, CG-ERR, CG-PTR (0 of 724
+pointers moved) and T (CE 68.18, CF 66.89, CG 25.07 ms per step). No state view
+and no final table differed. NG1 and NG2 failed only because of this step-0
+difference. Their own state differences start at the predicted steps: NG1
+`block_map` at step 4 for request 7, NG2 `block_map` / `cache_lens` / `counters`
+at step 3 for requests 3 and 7.
+
+The cause is in the comparison, not in the step:
+
+1. An inactive request is still computed, because every kernel runs on all B
+   rows. The driver discards its result: it keeps its token, and no state write
+   uses its rows (`write_tail`, `select`, the twin and the write-back are all
+   masked).
+2. Until its FIRST ACTIVE STEP, its attention reads memory that nothing has
+   written:
+   - `build_ragged` allocates the window with `torch.empty`
+     (`r2_decode_body.py:110-112`);
+   - `prefill_request` fills only slot 63 (`:140-145`);
+   - but `_cache_lens` is 4032 + tail (`:145`), so attention reads rows
+     0 .. 4031;
+   - only an active step's gathers fill those rows.
+3. Two arms that are built one after the other read different garbage there. So
+   the logits differ, and so do the selections of the layers after the first
+   one.
+4. The run itself shows that request 7 was inactive at step 0. Its prompt has
+   12031 tokens (offset 63 in its block), and NG1's first width change is at
+   step 4. So request 7 was still at 12031 at step 2, and NG2 shows its activity
+   changing at step 3. Request 2 must also have been inactive at step 0: an
+   active request loads all 63 window slots before its attention runs. The
+   rerun records `first_active` and `active_at_step0` in `meta`.
+5. The CPU proof could not see this. Its `build` zeroes the window (the same
+   zeros in both arms).
+
+The fix (no change to the step or to any state):
+
+- `compare_step` compares the DEFINED result. It blanks the logits and selection
+  rows of the requests inactive at that step in both views (0.0 / -1); the state
+  views and the tables are never blanked.
+- It also returns the inactive requests whose RAW rows differ. CF-UNDEF and
+  CG-UNDEF (MUST, `undefined_ok`) require each such (step, request) to be before
+  that request's first active step. After that step, an inactive request's rows
+  read loaded state and must be equal. So a real difference on an inactive row
+  is still a failure.
+- `meta.first_active` and `meta.active_at_step0` are recorded.
+- `ng1_first_step` counts only the requests that are ACTIVE at the step. A frozen
+  width on an inactive request changes only its blanked rows, and it writes no
+  state, so the change shows at its next active step. On this run it is still 4:
+  request 7's `block_map` changed at step 4, so request 7 was active there. NG2
+  is unchanged: a stale activity bit always changes a state view.
+
+CPU proof of the fix (`tests/test_r2_capture_step.py`):
+
+- S7 reproduces the GPU signature. The never-written window rows get different
+  seeded noise in CE and CF, and requests 1 and 3 are inactive at step 0. The
+  raw comparison then differs only in logits / selection, first at step 0, only
+  for requests 1 and 3. `compare_step` is bitwise equal, and every raw
+  difference is before the request's first active step.
+- S8 has the negative controls:
+  - the same noise in both arms gives no difference, even raw;
+  - a window corrupted after request 3's first active step fails
+    `undefined_ok` at exactly (10, 3);
+  - NG2 still differs first at exactly `ng2_first_step`.
+- S9 tests the pure parts on hand cases.
 
 CPU proof (`tests/test_r2_capture_step.py`). A tiny fake NOSA model on the CPU
 (B 4, two layers) uses torch stand-ins for the CUDA ops; both paths get the
@@ -227,6 +295,8 @@ same stand-ins.
 - S4: a driver without `finish_step` differs at step 1.
 - S5: a rebound buffer is named by the pointer check.
 - S6: the gate's pure parts.
+- S7 / S8 / S9: the undefined rows (above): the first run's failure
+  reproduced, the fix, and its negative controls.
 
 The capture and the replay themselves need the GPU.
 
