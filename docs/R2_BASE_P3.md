@@ -122,3 +122,31 @@ bitwise equal to `step_fixed`, so that about 72 launches per layer become 1. The
 step serves the tick (2B banks, `step_unchecked`). If Q3 holds, the same applies to the
 body's masked bookkeeping. Prediction for the fused twin alone: R2's step at B 64 drops by
 >= 3 ms. That prediction is registered when the kernel is built, with its own gate.
+
+## 5. Built (source only): the cell, its step, its CPU test
+
+- `benchmarks/Efficiency/r2_p3_profile.py`: the M-P3 cell. The shipped step is SH. The captured
+  R2 step's replays are R2G, and its eager steps on the same state are R2E. Each arm has 16 timed
+  steps (CUDA events), then 16 profiled steps (torch.profiler, Kineto chrome trace, gzipped beside
+  the summary).
+  - The GPU ops are classified by name, and each kernel is attributed to the innermost `sh.` /
+    `r2.` range of its launch (by correlation id).
+  - The output is ops and device ms per step, per class and per range; every kernel name; the
+    periods and the gaps; and a verdict for each of Q1-Q6.
+  - MUST: SH-RUN, SH-STEADY, R2-RUN, PROF.
+  - torch.profiler is the tool because the HBM sweep (job 2175791, `nosa-env.sif`) already
+    produced Kineto traces of NOSI on this image.
+- `benchmarks/Efficiency/r2_p3_step.sh`: the holder step. It reads the GPU uuid from the holders
+  file; STEP_MIN 20, `--mem` 140G, claim `/mnt/beegfs/ojerbi/r2-runs/p3/p3_active`.
+- `tests/test_r2_p3.py`: P1-P5 on the pure parts. It covers the classification, the attribution
+  on a synthetic trace (with negative controls), the per-step aggregation, the verdicts (each Q
+  refuted alone), and the windows.
+
+CPU (inside a CPU job):
+
+    env NOSI_REPO=/mnt/beegfs/ojerbi/nosi-r2-base-p3 python -m pytest -q tests/test_r2_p3.py tests/test_r2_base.py
+
+GPU (from /mnt/beegfs/ojerbi/nosi-r2-base-p3; DRYRUN on the login node first):
+
+    DRYRUN=1 bash benchmarks/Efficiency/r2_p3_step.sh --nosi <sha> <holder job> <run id>
+    bash benchmarks/Efficiency/r2_p3_step.sh --nosi <sha> <holder job> <run id>
