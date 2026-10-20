@@ -940,3 +940,23 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
+
+# R2 milestone 2 step 5: the per-request decode SWITCH. It is appended at the end of the module, so every line above
+# keeps its number at 6e6f80a (cited by docs/R2_ENGINE_FINDINGS.md and tests/test_r2_engine_findings.py).
+# NOSI_R2_DECODE (default 0): Llama.decode_inference stays the shipped function object. With 1, a decode step whose
+# cache carries an R2State (r2_decode_path.R2State.attach) takes r2_decode_path.decode_inference; a step whose cache
+# carries none takes the shipped function.
+R2_DECODE = os.environ.get("NOSI_R2_DECODE", "0") == "1"
+_shipped_decode_inference = Llama.decode_inference
+
+
+def _decode_inference_r2_switch(self, input_ids, cu_seqlens, position_ids, cache_engine=None, warmup=False):
+    if getattr(cache_engine, "r2_state", None) is not None:
+        from . import r2_decode_path as _r2
+        return _r2.decode_inference(self, input_ids, cu_seqlens, position_ids, cache_engine)
+    return _shipped_decode_inference(self, input_ids, cu_seqlens, position_ids, cache_engine, warmup)
+
+
+if R2_DECODE:
+    Llama.decode_inference = _decode_inference_r2_switch
+
