@@ -59,10 +59,21 @@ class DecodeBody:
     reproduces the shipped _cache_lens (findings F4), True gives attention the
     whole tail block on the step that fills it."""
 
+    device_writeback = False      # True for a backend that reads no host mirror (DeviceWritebackBody)
+    ERR_POS = 8                   # decode_fixed's refusal bit in the caller's err tensor
+
     def __init__(self, f4_fix: bool):
         if not isinstance(f4_fix, bool):
             raise TypeError("f4_fix must be a bool, got %r" % (f4_fix,))
         self.f4_fix = f4_fix
+        self._idx = {}            # (B, device) -> arange(B): built on the first call (an eager warm-up), then reused
+
+    def _index(self, B: int, device) -> torch.Tensor:
+        """The row index 0 .. B-1 on `device`, allocated once (docs/R2_CAPTURE_AUDIT.md, fix X2)."""
+        key = (int(B), str(device))
+        if key not in self._idx:
+            self._idx[key] = torch.arange(B, device=device)
+        return self._idx[key]
 
     # ------------------------------------------- the pieces a negative control replaces
     def positions(self, pos: torch.Tensor) -> torch.Tensor:
@@ -189,12 +200,53 @@ class DecodeBody:
                                           eng._cache_lens.to(torch.int64)).to(torch.int32))
         return eng._k_gpu, eng._v_gpu, eng._kv_bias_gpu, eng._cache_lens
 
+    def decode_fixed(self, eng, key_states, value_states, kv_bias, topk_idx, pos, active, err,
+                     diff_offload, gather_k, gather_v_bias):
+        """CAPTURE-SAFE decode() (docs/R2_CAPTURE_AUDIT.md, fix X3): the same writes in the same order, bit for bit
+        (tests/test_r2_decode_body.py, the *_fixed nodes), with no host mirror and no host work that depends on a device
+        value. It needs a device-driven write-back (DeviceWritebackBody; refused at capture time otherwise). Where
+        decode() raises IndexError (an active request at pos < 0 or pos >= min(N_host, N)), decode_fixed changes
+        NOTHING and ORs ERR_POS into err, an int32 0-d tensor on the device that the caller owns and reads at its
+        next sync. Only static (shape / dtype) checks raise, and they run when the region is captured."""
+        if not self.device_writeback:
+            raise TypeError("decode_fixed needs a device-driven write-back (DeviceWritebackBody)")
+        B, S, H, D = key_states.shape
+        if S != 1 or H != eng.head_num or D != eng.head_dim or tuple(value_states.shape) != (B, 1, H, D):
+            raise ValueError("key_states / value_states must be (B, 1, %d, %d)" % (eng.head_num, eng.head_dim))
+        if kv_bias.dim() != 3 or kv_bias.shape[0] != B or kv_bias.shape[2] != H:
+            raise ValueError("kv_bias must be (%d, N, %d), got %s" % (B, H, tuple(kv_bias.shape)))
+        if tuple(topk_idx.shape) != (H, B, eng.topk) or topk_idx.dtype != torch.int64:
+            raise ValueError("topk_idx must be (%d, %d, %d) int64" % (H, B, eng.topk))
+        if tuple(pos.shape) != (B,) or pos.dtype != torch.int64 or tuple(active.shape) != (B,) \
+                or active.dtype != torch.bool:
+            raise ValueError("pos must be (%d,) int64 and active (%d,) bool" % (B, B))
+        if tuple(err.shape) != () or err.dtype != torch.int32 or err.device != pos.device:
+            raise ValueError("err must be an int32 0-d tensor on %s" % pos.device)
+        limit = min(int(eng._k_cpu.shape[1]), int(kv_bias.shape[1]))
+        bad = active & ((pos < 0) | (pos >= limit))
+        err.bitwise_or_(bad.any().to(torch.int32) * self.ERR_POS)
+        act = active & ~bad.any()                       # the whole batch or nothing, as decode()'s refusal
+        bs = eng.block_size
+        p = self.positions(pos)
+        self.write_tail(eng, key_states, value_states, kv_bias, p, act)
+        self.select(eng, topk_idx, act, diff_offload)
+        gather_k(eng._k_gpu, eng._k_cpu, eng._load_mask, bs)
+        gather_v_bias(eng._v_gpu, eng._v_cpu, eng._kv_bias_gpu, kv_bias, eng._load_mask, bs)
+        full = self.full_mask(eng, p, act)
+        self.writeback(eng, full, None, p, None)
+        tail_col = eng._tail_block_idx_on_gpu
+        eng._block_map[..., tail_col] = torch.where(act.view(1, B), ((p + 1) // bs).view(1, B),
+                                                    eng._block_map[..., tail_col])
+        eng._cache_lens.copy_(torch.where(act, self.cache_lens_value(eng, p),
+                                          eng._cache_lens.to(torch.int64)).to(torch.int32))
+        return eng._k_gpu, eng._v_gpu, eng._kv_bias_gpu, eng._cache_lens
+
     def write_tail(self, eng, key_states, value_states, kv_bias, p, active) -> None:
         """Row 4032 + p_b % 64 of K, V and bias <- the step's K, V and cis row
         p_b, active requests only (an inactive request rewrites its own row)."""
         B = p.shape[0]
         row = eng._tail_block_idx_on_gpu * eng.block_size + p % eng.block_size
-        bi = torch.arange(B, device=p.device)
+        bi = self._index(B, p.device)
         a3 = active.view(B, 1, 1)
         eng._k_gpu[bi, row] = torch.where(a3, key_states[:, 0].to(eng._k_gpu.dtype), eng._k_gpu[bi, row])
         eng._v_gpu[bi, row] = torch.where(a3, value_states[:, 0].to(eng._v_gpu.dtype), eng._v_gpu[bi, row])
@@ -258,6 +310,8 @@ class DeviceWritebackBody(DecodeBody):
     validates them on the host before any write). writeback_kernel has the signature of
     r2_writeback.masked_writeback(k_gpu, v_gpu, k_cpu, v_cpu, full, pos, tail0, block_size); it is REQUIRED (no
     default), like f4_fix. Everything else is DecodeBody's."""
+
+    device_writeback = True
 
     def __init__(self, f4_fix: bool, writeback_kernel):
         super().__init__(f4_fix)

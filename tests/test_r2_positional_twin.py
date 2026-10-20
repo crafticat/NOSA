@@ -455,9 +455,9 @@ def test_negctl_shared_counter_passes_gate1():
 # ---------------------------------------------------------------------------
 # units: rollback bound, refusals, layout, derived values
 # ---------------------------------------------------------------------------
-def _twin_from(keys, cis, S, lk=None, nmax=None):
+def _twin_from(keys, cis, S, lk=None, nmax=None, cls=None):
     B, total = keys.shape[0], keys.shape[1]
-    t = tw.PositionalTwin(B, keys.shape[2], keys.shape[3], lk or total // STRIDE, nmax or total)
+    t = (cls or tw.PositionalTwin)(B, keys.shape[2], keys.shape[3], lk or total // STRIDE, nmax or total)
     for b in range(B):
         t.prefill(b, keys[b, :S], cis[b, :S])
     return t
@@ -641,6 +641,58 @@ def test_derived_values_match_the_shipped_prefill(S):
     assert int(twin.tail_row()[0]) == S % BLOCK                          # cache_engine.py:309
     assert int(twin.tail_block()[0]) == S // BLOCK                       # cache_engine.py:321
     assert int(twin.n_comp[0]) == int(twin.n_ccis[0]) == S // STRIDE - 1
+
+
+# ---------------------------------------------------------------------------
+# the capture-safe step (step_fixed, docs/R2_CAPTURE_AUDIT.md fix X1) through the same gates
+# ---------------------------------------------------------------------------
+class _FixedTwin(tw.PositionalTwin):
+    """step() routed through step_fixed, with step()'s return value and its refusals (check_error raises)."""
+
+    def step(self, keys, cis, active=None):
+        if active is None:
+            active = torch.ones(self.B, dtype=torch.bool)
+        active = torch.as_tensor(active).to(torch.bool)
+        before = self.pos.clone()
+        self.clear_error()
+        self.step_fixed(keys, cis, active)
+        self.check_error()
+        return torch.where(active, before, torch.full_like(before, -1))
+
+
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("S", [4032, 4033, 4047])
+def test_gate1_step_fixed_equals_shipped_tables(S, B):
+    run_gate1(_FixedTwin, S, B)
+
+
+def test_gate1_step_fixed_bf16():
+    run_gate1(_FixedTwin, 4033, 4, data="normals")
+
+
+def test_gate2_step_fixed_ragged_equals_independent_runs():
+    stats = run_gate2(_FixedTwin, [4032, 4033, 4047, 4100])
+    assert stats["ragged_steps"] > 0 and stats["rollbacks"] > 0 and stats["undone_compressions"] > 0
+
+
+def test_step_fixed_capacity_refusal_changes_nothing():
+    g = torch.Generator().manual_seed(10)
+    S = 64
+    keys, cis = _ints((1, 200, H_, D_), g), _ints((1, 200, H_), g)
+    twin = _twin_from(keys, cis, S, lk=S // STRIDE - 1, nmax=200, cls=_FixedTwin)
+    for p in range(S, 79):
+        twin.step(keys[:, p], cis[:, p])
+    snap = _state(twin)
+    with pytest.raises(tw.TwinCapacityError):
+        twin.step(keys[:, 79], cis[:, 79])
+    _assert_state_equal(twin, snap, "Lk_max refusal (step_fixed)")
+    twin = _twin_from(keys, cis, S, lk=50, nmax=S + 2, cls=_FixedTwin)
+    twin.step(keys[:, 64], cis[:, 64])
+    twin.step(keys[:, 65], cis[:, 65])
+    snap = _state(twin)
+    with pytest.raises(tw.TwinCapacityError):
+        twin.step(keys[:, 66], cis[:, 66])
+    _assert_state_equal(twin, snap, "N_max refusal (step_fixed)")
 
 
 def test_twin_imports_only_torch():

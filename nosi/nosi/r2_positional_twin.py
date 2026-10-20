@@ -116,6 +116,7 @@ TOPK = 64            # attended slots; tail slot TOPK - 1 (nosa_llama.py:681; ca
 RING = 64            # raw-key ring rows
 MAX_ROLLBACK = RING - KERNEL          # 32, see ROLLBACK above
 TAIL_BASE = (TOPK - 1) * BLOCK        # 4032
+ERR_NO_PREFILL, ERR_N_MAX, ERR_LK_MAX = 1, 2, 4   # step_fixed's refusal bits in PositionalTwin.err
 
 
 class TwinCapacityError(RuntimeError):
@@ -149,6 +150,8 @@ class PositionalTwin:
         self.total_cis = torch.zeros(self.B, self.n_max, self.H, dtype=dtype, device=dev)
         self.ccis = torch.zeros(self.H, self.B, self.lk_max, dtype=dtype, device=dev)
         self._win = torch.arange(KERNEL, dtype=torch.int64, device=dev)
+        self._all_b = torch.arange(self.B, dtype=torch.int64, device=dev)   # step_fixed's row index (preallocated)
+        self.err = torch.zeros((), dtype=torch.int32, device=dev)            # step_fixed's refusal bits (ERR_*)
 
     # ------------------------------------------------------------------ events
     def _key_due(self, p: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
@@ -269,6 +272,70 @@ class PositionalTwin:
         self.pos[b] = p + 1
         written[b] = p
         return written
+
+    def step_fixed(self, keys: torch.Tensor, cis: torch.Tensor, active: torch.Tensor) -> None:
+        """CAPTURE-SAFE step (docs/R2_CAPTURE_AUDIT.md, fix X1): the writes of step() on every table and counter,
+        bit for bit (tests/test_r2_capture.py, tests/test_r2_positional_twin.py), with fixed shapes and no host work
+        that depends on a device value: no nonzero, no boolean-mask shapes, no host branch, no raise after the static
+        checks, no allocation besides op temporaries. Every request runs every operation; a request that does not
+        write rewrites its own old values (torch.where). A step that step() would refuse (an active request without a
+        prefill, a full total_cis, a full compressed table) changes NOTHING and ORs a bit into self.err (ERR_*); the
+        driver reads it at its next sync (check_error). keys (B, H, D), cis (B, H), active (B,) bool on the twin's
+        device: all REQUIRED. Returns None (the written positions are pos before the step, where active)."""
+        dev = self.pos.device
+        if tuple(keys.shape) != (self.B, self.H, self.D) or tuple(cis.shape) != (self.B, self.H):
+            raise ValueError("keys must be (%d, %d, %d) and cis (%d, %d), got %s and %s"
+                             % (self.B, self.H, self.D, self.B, self.H, tuple(keys.shape), tuple(cis.shape)))
+        if tuple(active.shape) != (self.B,) or active.dtype != torch.bool or active.device != dev:
+            raise ValueError("active must be a (%d,) bool tensor on %s" % (self.B, dev))
+        all_b = self._all_b
+        p = self.pos
+        due_k = active & self._key_due(p, self.n_comp)
+        due_c = active & self._cis_due(p, self.n_ccis)
+        bad_pre = active & ~self.prefilled
+        bad_n = active & (p >= self.n_max)
+        bad_k = (due_k & (self.n_comp >= self.lk_max)) | (due_c & (self.n_ccis >= self.lk_max))
+        ok = ~(bad_pre | bad_n | bad_k).any()                              # 0-d: the whole step or nothing
+        self.err.bitwise_or_(bad_pre.any().to(torch.int32) * ERR_NO_PREFILL | bad_n.any().to(torch.int32) * ERR_N_MAX
+                             | bad_k.any().to(torch.int32) * ERR_LK_MAX)
+        act = active & ok
+        dk = due_k & ok
+        dc = due_c & ok
+        keys = keys.to(device=dev, dtype=self.ring.dtype)
+        cis = cis.to(device=dev, dtype=self.total_cis.dtype)
+        # 1. deferred key compression: the mean of every request (as step()), written where due
+        means = self.key_window(all_b, STRIDE * self.n_comp).mean(dim=1)                  # (B, H, D)
+        ik = self.n_comp.clamp(max=self.lk_max - 1)
+        self.comp_k[all_b, ik] = torch.where(dk.view(-1, 1, 1), means, self.comp_k[all_b, ik])
+        self.n_comp.add_(dk.to(torch.int64))
+        # 2. raw key
+        rr = p % RING
+        self.ring[all_b, rr] = torch.where(act.view(-1, 1, 1), keys, self.ring[all_b, rr])
+        # 3. raw cis
+        pr = p.clamp(max=self.n_max - 1)
+        self.total_cis[all_b, pr] = torch.where(act.view(-1, 1), cis, self.total_cis[all_b, pr])
+        # 4. immediate cis compression: the mean of every request (as step()), written where due
+        rows = (STRIDE * self.n_ccis[:, None] + self._win[None, :]).clamp(max=self.n_max - 1)
+        win = self.total_cis[all_b[:, None], rows]                                        # (B, 32, H)
+        means_c = win.permute(2, 0, 1).contiguous().mean(dim=-1)                          # (H, B)
+        ic = self.n_ccis.clamp(max=self.lk_max - 1)
+        self.ccis[:, all_b, ic] = torch.where(dc.view(1, -1), means_c, self.ccis[:, all_b, ic])
+        self.n_ccis.add_(dc.to(torch.int64))
+        # 5.
+        self.pos.add_(act.to(torch.int64))
+
+    def check_error(self) -> None:
+        """Host side (ONE sync): raise if a step_fixed since the last clear_error was refused (and changed nothing)."""
+        code = int(self.err)
+        if code & ERR_NO_PREFILL:
+            raise RuntimeError("step for a request without a prefill (err %d)" % code)
+        if code & ERR_N_MAX:
+            raise TwinCapacityError("total_cis is full (N_max %d; err %d)" % (self.n_max, code))
+        if code & ERR_LK_MAX:
+            raise TwinCapacityError("a compressed table is full (Lk_max %d; err %d)" % (self.lk_max, code))
+
+    def clear_error(self) -> None:
+        self.err.zero_()
 
     # ------------------------------------------------------- commit / rollback
     def counters(self) -> torch.Tensor:

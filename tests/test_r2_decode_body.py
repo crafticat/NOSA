@@ -787,6 +787,70 @@ def test_device_writeback_body_reads_the_device_mask():
         rb.DeviceWritebackBody(False, None)
 
 
+# ---------------------------------------------------------------------------
+# the capture-safe decode (decode_fixed, docs/R2_CAPTURE_AUDIT.md fix X3) through the same gates
+# ---------------------------------------------------------------------------
+class _FixedBody(rb.DeviceWritebackBody):
+    """decode() routed through decode_fixed (no host mirror read), raising IndexError as decode() does when the
+    device refusal bit is set."""
+
+    def __init__(self, f4_fix, kernel):
+        super().__init__(f4_fix, kernel)
+        self.err = torch.zeros((), dtype=torch.int32)
+
+    def decode(self, eng, key_states, value_states, kv_bias, topk_idx, pos, active, pos_host, active_host,
+               diff_offload, gather_k, gather_v_bias):
+        self.err.zero_()
+        out = self.decode_fixed(eng, key_states, value_states, kv_bias, topk_idx, pos, active, self.err,
+                                diff_offload, gather_k, gather_v_bias)
+        if int(self.err):
+            raise IndexError("decode_fixed refused the step (err %d)" % int(self.err))
+        return out
+
+
+def _fixed_body(f4_fix=False):
+    if wbm is None:
+        pytest.skip("no nosi/nosi/r2_writeback.py")
+    return _FixedBody(f4_fix, wbm.masked_writeback_torch)
+
+
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("S", [6016, 6017, 6079])
+def test_geq_decode_fixed_equals_shipped_body(S, B):
+    run_eq(_fixed_body(), S, B)
+
+
+def test_grag_decode_fixed_equals_independent_runs():
+    stats = run_rag(_fixed_body(), [6016, 6017, 6079, 6100])
+    assert stats["ragged_steps"] > 0 and stats["writebacks"] >= 4
+
+
+def test_gpoison_decode_fixed():
+    assert run_poison(_fixed_body()) == [0]
+
+
+def test_decode_fixed_inactive_and_cross_boundary_rollback():
+    run_inactive(_fixed_body())
+    run_cross(_fixed_body())
+
+
+def test_decode_fixed_refuses_on_the_device():
+    eng, twin, keys, values, cis = _setup([6016, 6050], extra=0)
+    total = eng._k_cpu.shape[1]
+    snap = {k: getattr(eng, k).clone() for k in PERSIST}
+    body = _fixed_body()
+    err = torch.zeros((), dtype=torch.int32)
+    bad = torch.tensor([total, 6050])
+    act = torch.ones(2, dtype=torch.bool)
+    body.decode_fixed(eng, keys[:, :1], values[:, :1], twin.total_cis, _topk(21, twin.pos), bad, act, err, *STUBS)
+    assert int(err) == rb.DecodeBody.ERR_POS
+    for k in PERSIST:
+        assert torch.equal(getattr(eng, k), snap[k]), "refused decode_fixed changed %s" % k
+    with pytest.raises(TypeError):                       # the torch backend reads host mirrors: not capture-safe
+        rb.DecodeBody(False).decode_fixed(eng, keys[:, :1], values[:, :1], twin.total_cis, _topk(21, twin.pos),
+                                          twin.pos, act, err, *STUBS)
+
+
 def test_body_imports_only_torch():
     tree = ast.parse(BODY.read_text(encoding="utf-8"))
     mods = set()
