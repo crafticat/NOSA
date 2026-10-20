@@ -1047,6 +1047,9 @@ def test_T18_sg5_harness_on_the_cpu(p3):
     for bad in (["--backends", "s9"], ["--modes", "slow"], ["--m-fix", "8"], ["--R-ver", "40"]):
         with pytest.raises(SystemExit):
             G.parse_args(base + bad)
+    src = (EFF / "r2_tick_sg5.py").read_text()
+    fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "run_draft_only")
+    assert "from nosi." not in ast.get_source_segment(src, fn)        # the engine's own module (job 2190926)
     eng = make_res_engine(make_ops(p3), kind="sc")
     eng.timer = TK.TickTimer(cuda=False)
     G.run_draft_only(eng, FIRST, 6, 3)

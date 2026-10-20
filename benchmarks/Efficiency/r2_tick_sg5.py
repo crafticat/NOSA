@@ -237,7 +237,8 @@ def run_draft_only(eng, first, n, K):
     """n ticks of B draft rows (the draft-only tick T_d); a draft key is decided once its cohort's positions are all
     drafted (as a verification would)."""
     from types import SimpleNamespace
-    from nosi.r2_tick import Ref, cohort_of
+    tick = sys.modules[type(eng).__module__]                         # the engine's own module: nosi.r2_tick on the
+    Ref, cohort_of = tick.Ref, tick.cohort_of                        # GPU, the CPU tests' path-loaded copy (job 2190926)
     B = eng.B
     toks = list(first)
     for t in range(n):
