@@ -19,9 +19,12 @@ CONTENTS
                      page's row count (the row's own extent); tail pages are a ring of two per bank (tail_page).
   paged_attention_reference
                      the BI paged attention in torch, page by page, online softmax in float32: an INDEPENDENT twin of
-                     the piece-3 contract (nosi-r2-m2-biattn 4c1243f, bi_paged_attention.bi_paged_decode: logit =
-                     (q.k + bias) * scale, one 64-row page per step, the last page cut at last_len). The CPU test S7b
-                     and the GPU microgate B4 compare piece 3 with it.
+                     the piece-3 contract (nosi-r2-m2-biattn, bi_paged_attention.bi_paged_decode: logit =
+                     (q.k + bias) * scale, one 64-row page per online-softmax step, the last page cut at last_len), in
+                     piece 3 v1's order (4c1243f: no split). Piece 3 v2 (7c826c1, the step's pin since 2026-10-20)
+                     splits a row's list every 8 pages and combines the splits in a fixed order, so for rows of more
+                     than 8 pages it agrees with this twin to rounding only, not bitwise. The CPU tests S7b (v1) and
+                     G9 (v2, test_r2_g0bi.py) and the GPU microgate B4 compare piece 3 with it.
   PaddedLinear       option G-b of the M-invariant GEMM: cuBLAS (F.linear) at ONE fixed row count m_fix; the live rows
                      are copied into a persistent (m_fix, K) buffer, the rows past them are never cleared.
   SlotStore         per (request, head) residency by CONTENT (block id -> slot): FREE / REQUESTED / ARRIVED, holders
@@ -372,8 +375,8 @@ def slot_of_tail_ring(slot_of, r, h, blk):
 
 def paged_attention_reference(q, k_store, v_store, b_store, req, pages, n_pages, last_len, scale, page=BLOCK,
                               p_dtype=None):
-    """The BI paged attention, torch, in the piece-3 kernel's order (bi_paged_attention.bi_paged_decode, 4c1243f): for
-    row r and KV head h, its q heads h*G .. h*G+G-1; pages in list order; per page s = (q k^T + bias) * scale (bias
+    """The BI paged attention, torch, in piece 3 v1's order (bi_paged_attention.bi_paged_decode, 4c1243f; v2 7c826c1
+    splits every 8 pages: equal to rounding only for longer lists, see the module docstring): for row r and KV head h, its q heads h*G .. h*G+G-1; pages in list order; per page s = (q k^T + bias) * scale (bias
     before the scale, as FA2-NOSA), masked beyond the row's last-page length; online softmax in float32 (base 2: exp2((s - m) log2 e));
     acc += P V with P cast to p_dtype (default the store dtype). q (R, Hq, D); stores (Bq, slots * page, Hk[, D]);
     req (R,); pages (R, Hk, P); n_pages (R, Hk); last_len (R,). Returns (R, Hq, D) in q's dtype."""

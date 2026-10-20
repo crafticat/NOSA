@@ -144,6 +144,12 @@ class PositionalTwin:
         self.total_cis = torch.zeros(self.B, self.n_max, self.H, dtype=dtype, device=dev)
         self.ccis = torch.zeros(self.H, self.B, self.lk_max, dtype=dtype, device=dev)
         self._win = torch.arange(KERNEL, dtype=torch.int64, device=dev)
+        # the decode summaries' mean (step): None = torch's .mean (the shipped op); the BI mode of R2 step 7
+        # (r2_bi_decode.attach_bi) sets a fixed-order mean, whose summation order does not depend on B
+        self.mean_fn = None
+
+    def _mean(self, x: torch.Tensor, dim: int) -> torch.Tensor:
+        return x.mean(dim=dim) if self.mean_fn is None else self.mean_fn(x, dim)
 
     # ------------------------------------------------------------------ events
     def _key_due(self, p: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
@@ -242,7 +248,7 @@ class PositionalTwin:
         bk = b[due_k]
         if bk.numel():
             nk = n_k[due_k]
-            means = self.key_window(all_b, STRIDE * self.n_comp).mean(dim=1)              # (B, H, D)
+            means = self._mean(self.key_window(all_b, STRIDE * self.n_comp), 1)            # (B, H, D)
             self.comp_k[bk, nk] = means[bk]
             self.n_comp[bk] = nk + 1
         # 2. raw key
@@ -255,7 +261,7 @@ class PositionalTwin:
             nc = n_c[due_c]
             rows = (STRIDE * self.n_ccis[:, None] + self._win[None, :]).clamp(max=self.n_max - 1)
             win = self.total_cis[all_b[:, None], rows]                                     # (B, 32, H)
-            means_c = win.permute(2, 0, 1).contiguous().mean(dim=-1)                       # (H, B)
+            means_c = self._mean(win.permute(2, 0, 1).contiguous(), -1)                    # (H, B)
             self.ccis[:, bc, nc] = means_c[:, bc]
             self.n_ccis[bc] = nc + 1
         # 5.

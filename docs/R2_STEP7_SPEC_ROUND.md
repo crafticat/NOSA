@@ -1,10 +1,14 @@
 # R2 step 7: the speculative round on the R2 path (DESIGN NOTE and CPU test plan)
 
-Branch `feature/nosi-r2-m2-spec` (worktree `/mnt/beegfs/ojerbi/nosi-r2-m2-spec`, from `54ea1d6`).
-Status: DESIGN, confirmed by the lead at f1f9f56. The commit after f1f9f56 adds the portable core
-(`nosi/nosi/r2_spec_core.py`), the CPU tests S1-S15 and the GPU microgate step B1-B5 (source only, no GPU result).
-The BI paged attention is piece 3 (`/mnt/beegfs/ojerbi/nosi-r2-m2-biattn`, 4c1243f, the verify agent). The BI GEMM
-(G-a) is built in `/mnt/beegfs/ojerbi/nosi-r2-m2-bigemm` (the verify agent). This branch builds G-b only.
+Branch `feature/nosi-r2-m2-spec` (worktree `/mnt/beegfs/ojerbi/nosi-r2-m2-spec`, from `54ea1d6`); G0-BI continues on
+`feature/nosi-r2-m2-g0bi` (worktree `/mnt/beegfs/ojerbi/nosi-r2-m2-g0bi`, from eadd87a).
+Status: DESIGN, confirmed by the lead at f1f9f56. 972579c / eadd87a add the portable core
+(`nosi/nosi/r2_spec_core.py`), the CPU tests S1-S15 and the GPU microgate step B1-B5 (RAN 2026-10-20, holder step
+2188818.88, every MUST gate PASS; `/mnt/beegfs/ojerbi/r2-runs/bi/bi_bi1_2188818`). The G0-BI commit adds the BI
+serial decode (`nosi/nosi/r2_bi_decode.py`), its gate and step (source only, not run).
+The BI paged attention is piece 3 (`/mnt/beegfs/ojerbi/nosi-r2-m2-biattn`, the verify agent; v2 7c826c1 is the pin).
+The BI GEMM (G-a) is built in `/mnt/beegfs/ojerbi/nosi-r2-m2-bigemm` (26c45bd, the verify agent); this branch built
+G-b, and G-b is the decision (3.3). The flattened tick (piece 4, SG1-SG5) is the verify agent's, on this note.
 Prior-art gate: CLEARED by the lead (retroinfer-eval 3650572). The rows are in
 `/mnt/beegfs/ojerbi/kstep-cpu-runs/paper-notes/r2-prior-art-rows.md`; this note cites them as [PA-n] (row n) and
 [PA-b n] / [PA-c] (sections b, c).
@@ -208,6 +212,37 @@ G-b (`padded_ms`, the copy included) and G-a (`bi_ms`, when its pins are set), w
 M. This is the coordinator's "cost of the M-invariant GEMM path against cuBLAS". The registered predictions are in
 the commit message of this step.
 
+MEASURED (2026-10-20; microgate eadd87a, `/mnt/beegfs/ojerbi/r2-runs/bi/bi_bi1_2188818`; the bigemm gate 26c45bd,
+`/mnt/beegfs/ojerbi/r2-runs/bigemm/bigemm_v1_2188818/bigemm_gate.md`). Ratios against cuBLAS at the natural M:
+
+| linear | G-b at M = B, B 64 | G-b at M = B, B 128 | G-b at M = 4B (B 64 / 128) | G-a at M = 64 / 128 / 256 |
+|---|---|---|---|---|
+| wqkv | 2.00 | 2.24 | 1.19 / 1.13 | 2.62 / 2.46 / 2.83 |
+| wo | 2.21 | 2.35 | 1.19 / 1.12 | 2.85 / 2.49 / 2.63 |
+| gate_up | 1.41 | 2.23 | 1.06 / 1.02 | 1.15 / 1.40 / 1.77 |
+| down | 1.71 | 2.70 | 1.07 / 1.05 | 1.55 / 1.86 / 2.33 |
+
+- P1 (cuBLAS at the natural M depends on M) HELD: wqkv, wo and down differ on ALL rows at M = B and 2B (B 64 and
+  128) and at 3B for wo / down at B 128. gate_up showed no difference at the tested M (empirical; not relied on).
+- P2 (G-b invariance) HELD: 0 differing rows (random vs zero padding, shuffled rows).
+- P3 (G-b cost) mostly HELD: at M = B inside 1.4-2.2 (B 64; wo 2.21 at the edge) and 2.0-3.2 (B 128). At M = 4B the
+  1.00-1.15 band is MISSED by wqkv / wo at B 64 (1.19): the copy and one launch cost about 13 us on a 67 us GEMM.
+- P4 (G-a cost) PARTLY FALSIFIED: wqkv / wo 2.5-2.9 at M <= 2B (band 1.3-2.5), gate_up 1.77 / 1.61 at M >= 256
+  (band 1.1-1.5); gate_up and down at M <= 2B inside.
+
+DECISION (lead, 2026-10-20): G-b, PaddedLinear with M_fix = 4B, for ALL FIVE linears in the EXACT mode.
+- A per-linear choice is lawful (fixed per linear, not a function of M); G-b wins or ties for every linear at the
+  tick's row mix. B 64, ms per layer: wqkv 0.080 (G-b) vs 0.104-0.188 (G-a, M 64-256); wo 0.079 vs 0.099-0.175;
+  gate_up 0.380 vs 0.405 (G-a in-phase mean) / 0.372 (M 128); down 0.193 vs 0.252; lm_head 0.74 vs 0.79.
+  Per tick: G-b 24.2 ms, G-a 30.0 ms in phase, 28.1 ms at M 128. B 128: G-b about 41 ms, G-a 46 ms or more.
+- A per-M switch is NOT lawful: a row's bits would depend on M.
+- DECLINED: keeping gate_up on natural cuBLAS after an empirical sweep over M. Equality over the tested M is no
+  guarantee (the library may pick another kernel at an untested M), and it is a shape-keyed choice in spirit.
+- THE GEMM MODE IS A RUN PARAMETER: EXACT (G-b; the exact claim) and FAST (natural cuBLAS; the weaker claim of 3.5).
+  SG5 measures both, so the paper states the measured cost of exactness (about 7 ms per tick at B 64, all of it the
+  G-b padding, section 7.3). `r2_bi_decode.BIOps(gemm="exact" | "fast" | "bigemm")`; the piece-4 tick takes the same
+  parameter.
+
 ### 3.4 The BI paged attention
 
 - Each row reads its KV through its OWN PAGE LIST: the slots that hold its selected blocks, in ASCENDING BLOCK-ID
@@ -227,8 +262,12 @@ the commit message of this step.
 - Cost against FA2-NOSA split 4 at B = 64 and B = 128 (the lead's sizes). No split-KV costs parallelism at small B;
   this is measured, not assumed. B4 also measures the SG5 attention term (section 7.3).
 
-The kernel is PIECE 3 (the verify agent; `/mnt/beegfs/ojerbi/nosi-r2-m2-biattn` 4c1243f, CPU 24/24 accepted;
-`nosi/nosi/bi_paged_attention.py`, blob 7477ddd):
+The kernel is PIECE 3 (the verify agent; `/mnt/beegfs/ojerbi/nosi-r2-m2-biattn`, `nosi/nosi/bi_paged_attention.py`).
+v1 (4c1243f, blob 7477ddd) is correct and slow (7.3). The PIN is v2 (7c826c1, blob 39ed5e1894ca1662f92e384a10e01a4eaab99042;
+GPU gate PASS): a FIXED 8-page split-KV (PAGES_PER_SPLIT = 8, a module constant), a GQA tile, a fixed-order combine.
+Its float order equals v1's for rows of at most 8 pages and differs for longer rows; the reference twin
+`r2_spec_core.paged_attention_reference` (v1's order) agrees with v2 to rounding there (CPU test G9). The interface
+is unchanged (v2 adds an optional workspace):
 
 - `bi_paged_decode(q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len, softmax_scale=None,
   out=None) -> (R, Hq, D)`.
@@ -273,6 +312,8 @@ second kernel. B4 loads piece 3 BY PATH: the step script copies the pinned blob 
 - WEAKER CLAIM, if the M-invariant GEMM is not adopted (cost): every non-GEMM term is bitwise as above, and the
   logits differ from the reference only by the GEMM kernel choice. This is measured per tick (max \|d\|), and every
   greedy difference is classified by margin. The gate then says so and does not call itself exact.
+- Both are RUN MODES (3.3): EXACT (G-b) gives the claim; FAST (natural cuBLAS) gives the weaker claim. SG5 and the
+  paper report both.
 
 ## 4. Flattened rows and the positional tables
 
@@ -379,12 +420,38 @@ own CPU tests (`test_bi_paged_attention.py` in its branch); S7b checks that the 
 | S14 | G-b `PaddedLinear`: equal to x @ w.T; lead dims kept; more than m_fix rows refused; one buffer per (K, dtype, device); the live rows do not depend on the buffer rows past them (random vs zero) | a stand-in whose rows read the padding |
 | S15 | the microgate's GEMM shapes equal the shapes derived from `/mnt/beegfs/ojerbi/models/NOSA-8B/config.json` (gate_up 32768 x 4096, down 4096 x 16384; 972579c had the Llama-3-8B values) | the Llama-3-8B MLP shapes are refused |
 
+G0-BI's CPU tests are `benchmarks/Efficiency/tests_cpu/test_r2_g0bi.py` (G1-G9): the fixed-order mean (alone vs
+batch; the reverse order caught), the twin's mean hook (default unchanged; B = 1 vs 3 bitwise), the page-table glue
+(slot order and a short extent caught), BIOps / attach_bi and the GEMM modes, subset_state (the other order caught),
+the dispatch, the quality helpers on planted logits, the step script's uuid file and pins, and the contract of the
+v2 pin against the reference twin (20-, 9-, 8- and 3-page rows; bias-after-scale caught).
+
 ### 7.2 GPU gates (holder steps)
 
 | Id | Gate | Kind |
 |---|---|---|
 | B1-B5 | the BI microgates of section 3, one step `r2_bi_step.sh` (B1 rmsnorm / nosa_linear / rope; B2 stage 1 with the alias; B3 GEMM row invariance and the cost table: natural, G-b, G-a when pinned; B4 piece 3's attention: invariance, the independent twin, the cost against FA2-NOSA and the SG5 attention term; B5 the deterministic selection) | MUST for B1, B2, B4, B5, G-b's B3 and G-a's B3 when pinned; cost REPORT |
 | G0-BI | the BI serial decode against the shipped decode. QUALITY (lead, 2026-10-20): greedy token agreement over >= 256 steps on >= 8 documents (teacher-forced on the shipped tokens, so every step compares the same prefix; and free-running: the first divergence step per document); the distribution of the logit max \|d\| per step and of the shipped top-2 margin (quantiles and histogram), every argmax difference classified by its margin | REPORT (the fidelity cost of BI); E / E2 determinism of the BI serial decode MUST |
+
+G0-BI as built (`benchmarks/Efficiency/r2_g0bi_gate.py`, step `r2_g0bi_step.sh`; `nosi/nosi/r2_bi_decode.py`):
+
+- The BI serial decode is a MODE of the R2 path: `attach_bi(state, BIOps(...))` on a body-'r2' R2State; then
+  `r2_decode_path.decode_inference` dispatches to it. Ops: the GEMM mode (EXACT = G-b PaddedLinear(M_fix)), piece 3
+  v2 on the body's GPU window (page table = the 64 selected slots in ascending block id, slot 63 named by the row's
+  own block, cut at p % 64 + 1), the deterministic selection, and a FIXED-ORDER mean for the twin's two decode
+  summaries (torch's `.mean` may pick its reduction strategy from the shape, i.e. from B).
+- THE SHIPPED DECODE IS VALID FOR 64 STEPS ONLY (findings F1). So the quality has two parts:
+  - part W, against the SHIPPED DECODE ITSELF: 4 windows per document, prefixes S - 192, S - 128, S - 64, S (all
+    0 mod 64), each a full F1 window of 64 steps: 8 documents x 256 steps;
+  - part C, CONTINUOUS 256 steps against the R2 shipped-order path (body r2, f4_fix False: the shipped ops in the
+    shipped order, F4 reproduced; bitwise the shipped decode inside the F1 window by G0F), built by build_ragged.
+- MUST (part C): E2 = E again, torch.equal at all 256 steps; I1 = request 0 ALONE (B = 1, cut from E's own build
+  by `subset_state` before E's first step), torch.equal to E's row 0 at all steps; I2 = the batch REVERSED, equal row
+  by row; the first tokens of every build equal. MUST (part W): the three prefill logits of every window equal.
+- REPORT: the quality of both parts (as the table row above), the free-running first divergence per document (and
+  its consistency with the teacher-forced first disagreement), the negative control NI (I1 with the GEMMs at the
+  natural row count: must be detected), ms per decode step per arm.
+- The step runs EXACT, B 8, M_fix 32 (= 4B), S 16128, attention pin 7c826c1.
 | SG1 | teacher-forced: the decisions follow a schedule that rejects at every index and across a block boundary; every computed verify row `torch.equal` to the BI serial row at the same (request, position), rejected rows included | MUST; control: row 0 against the next serial step must differ |
 | SG2 | free-running greedy, B = 8 ragged: committed sequences `torch.equal` to the BI serial greedy sequences | MUST |
 | SG3 | phase mix: ticks with draft rows of the same request and verify rows of other requests; the SG1 equality holds in every composition | MUST |
@@ -432,7 +499,28 @@ MEASURED (piece 3's own GPU gate, lead 2026-10-20): BI / FA2-NOSA split 4 = 8.8 
 - SG5 measures a and g with per-op CUDA events in the draft-only run, and every term above per tick in the
   flattened run. It reports which term exceeds its share. The target is a design target, not a gate.
 
-## 8. The step script (`benchmarks/Efficiency/r2_bi_step.sh`)
+MEASURED, v2 and the registered predictions of 972579c (2026-10-20):
+
+- Piece 3 v2 (7c826c1; fixed 8-page split): BI / FA2-NOSA split 4 over the B rows = 1.31 / 1.50 / 2.25 at
+  1 + u = 1 / 2 / 4 (B 64) and 1.13 / 1.40 / 2.10 (B 128); back to back 1.07 / 1.27 / 2.04 and 1.06 / 1.32 / 2.20
+  (`/mnt/beegfs/ojerbi/r2-runs/biattn/biattn_v2_2188818`).
+- P5 (the SG5 attention term): FALSIFIED by v1 (8.85 / 13.5 / 21.9 and 9.4 / 12.0 / 23.2, my microgate); v2 is
+  inside the registered bands except B 64 at 1 + u = 2 (1.50 against 1.6-2.6: faster than predicted).
+- P6 (attention on the same rows): FALSIFIED by v1 (6.26 / 6.22 against the falsifier 3). Not measured for v2.
+- P7 (invariance and twin): HELD; max \|piece 3 - twin\| = 0.00049 (predicted about 0.004, limit 0.02); against the
+  float64 oracle 0.00035.
+- P8, the budget at B 64, with T_d = 139 ms (B's pilot number; possibly tainted, SG5 measures it again):
+  - dGEMM (EXACT, G-b): 32 layers padded to 256 rows = 23.4 ms, plus lm_head about 0.75 ms, against 14.5 ms natural
+    at M = 64 (the draft-only tick): about +9.7 ms.
+  - dATT (v2): FA2 split 4 over 64 rows = 0.205 ms x 32 = 6.6 ms; the v2 tick mean is 1.50 (out of phase) to 1.62
+    (in phase): about +3.3 to +4.1 ms.
+  - Together about 13-14 ms = 9.4-10 % of T_d, BEFORE dSEL, dXFER and dHOST: the 8 % target is MISSED by GEMM and
+    attention alone in the EXACT mode.
+  - FAST (natural cuBLAS): the GEMM term is the extra rows only, +2.5 ms (in-phase mean 17.0 ms), so GEMM and
+    attention are about 6 ms = 4.5 %.
+  - So EXACTNESS COSTS ABOUT 7 MS PER TICK AT B 64, all of it the G-b padding. SG5 measures both modes.
+
+## 8. The step scripts (`benchmarks/Efficiency/r2_bi_step.sh`, `r2_g0bi_step.sh`)
 
 - The pattern of `r2_g0_step.sh` (pins, claim, frozen record, sacct row, a main() body).
 - Modules of OTHER branches (piece 3 now; the BI GEMM when its interface is forwarded) are pinned by commit, path and
@@ -450,12 +538,13 @@ MEASURED (piece 3's own GPU gate, lead 2026-10-20): BI / FA2-NOSA split 4 = 8.8 
 ## 9. Order of work after this note
 
 1. The CPU stand-ins and tests S1-S15 (portable). DONE in the commits after f1f9f56.
-2. GPU microgates B1-B5 and the GEMM / attention cost tables, one holder step (`r2_bi_step.sh`). Then the decision
-   on G-a vs G-b (cost) or the weaker claim. G-a comes from the bigemm branch (pins in the step script).
-3. The BI paged attention kernel (Triton) with its CPU interpreter test: piece 3, the verify agent (4c1243f
-   accepted; its own GPU gate).
-4. G0-BI with the QUALITY numbers (7.2).
-5. The flattened tick on the GPU: SG1, SG2, SG3, then SG4, SG5 (7.3).
+2. GPU microgates B1-B5 and the GEMM / attention cost tables, one holder step (`r2_bi_step.sh`). DONE (eadd87a,
+   all MUST PASS). The decision: G-b in the EXACT mode, FAST as the second run mode (3.3).
+3. The BI paged attention kernel (Triton) with its CPU interpreter test: piece 3, the verify agent. DONE (v2
+   7c826c1, GPU gate PASS; the pin).
+4. G0-BI with the QUALITY numbers (7.2): the G0-BI commit (source; the lead runs it).
+5. The flattened tick on the GPU: SG1, SG2, SG3, then SG4, SG5 (7.3): piece 4, the verify agent, with the GEMM mode
+   as a run parameter; this branch owns the interfaces (`r2_spec_core`, `r2_bi_decode`) and reviews the tick.
 
 ## 10. Open questions and risks
 
