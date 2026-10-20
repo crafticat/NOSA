@@ -626,6 +626,105 @@ GPU (after the CPU tests; DRYRUN on the login node first):
     DRYRUN=1 bash benchmarks/Efficiency/r2_tick_capture_step.sh --nosi <sha> <holder job> <run id>
     bash benchmarks/Efficiency/r2_tick_capture_step.sh --nosi <sha> <holder job> <run id>
 
+## 12c. Plan: merging the verify agent's seam (795dbc1) so that S-C runs inside the graph (DESIGN ONLY)
+
+THE SEAM. `feature/nosi-r2-m2-sg5` 795dbc1 (`nosi/nosi/r2_tick.py`, +494 lines over a35037b) puts
+the tick's storage behind `eng.backend`:
+
+- `begin_tick()`;
+- `prepare(rows)`, the service's rows, once per tick;
+- `pages(l, ctx, sel, layer) -> (table, npg, last, seq_idx, plan)`;
+- `after_attention(l, plan)`;
+- `end_tick()`;
+- `commit_block(b, blk)` (the write-back);
+- `decisions(pub, rb_epoch)`;
+- `end_request(b)`.
+
+There are two backends:
+
+- `ResidentStore`: today's pages and history.
+- `ResidencyBackend`: C's Residency, S-B or S-C. `pages` calls `svc.resolve(l, ...)`,
+  `after_attention` calls `read_done` with a new event, and the history goes to the pinned host
+  rows through `history_written`.
+
+The seam also changes the engine around it:
+
+- `_layer` now takes `(..., n_dev, pos32, bank, u, ring_row, M_b, cu_q, cu_k, ctx)`;
+- the events are 4-tuples with the epoch;
+- a `void` rule: the twins' OR-ed overflow is read with the decision read;
+- `TickTimer` spans (`_span`) and `_lin`;
+- the SG4c tie instruments (`plant`, `tie_acc`).
+
+THE MERGE (git). Merge `feature/nosi-r2-m2-sg5` at 795dbc1 into `feature/nosi-r2-tick-capture`
+(a merge, not a rebase).
+
+- 41078e8 contains 41bc238, so C's files fast-forward.
+- `r2_positional_twin.py` and `test_r2_twin_unchecked.py` carry the same 4fe5fc9 on both sides.
+- This branch never edits `r2_tick.py`, `test_r2_tick.py` or `r2_tick_gate.py`.
+
+So I expect no textual conflict. The work is in this branch's own files.
+
+THE ADAPTATION (`r2_tick_fixed.py`, `r2_tick_capture.py`, `r2_residency_capture.py`):
+
+1. **`FixedTickEngine.run_rows` / `_forward_fixed` / `_layer_fixed`.** Re-derive them from the
+   seam's `run_rows` / `_layer`; the fixes of section 8 stay. The backend calls are split at the
+   graph boundary:
+   - before the region (the driver, `pre_region`): `backend.begin_tick()` and
+     `backend.prepare(rows)`, live rows only;
+   - inside the region: `backend.pages(l, ctx, sel, layer)`, with `sel` of all R_cap rows; then
+     F7 (a padded row gets one trash page);
+   - after the region (`post_region`): `after_attention(l, plan_l)` for every layer with ONE event
+     (C's Q-T3 (c): equivalent and safer), then `end_tick()`.
+
+   For the ResidentStore the after-calls are no-ops. `ctx` is built from the static row table.
+   `_lin` stays: G-b's `PaddedLinear` is captured. `_span` must be inert in the region
+   (`timer is None`): a CUDA event record inside a capture needs external events. `plant` and
+   `tie_acc` are refused in fixed engines (SG4c instruments, eager only).
+2. **`CapturedResidencyBackend(ResidencyBackend)`, new, over `CaptureSC`:**
+   - `prepare` = the seam's rows, then `cap.host_part(rows)`: row checks, `sync_mirror`, T4
+     waits, one copy;
+   - `pages` = `cap.device_part(l, sel)`, plan None;
+   - `after_attention` = no-op;
+   - `end_tick` = `cap.after_replay(event)`: `read_done` for all layers, `end_tick` with the
+     watched flags.
+
+   `commit_block`, `decisions` and `end_request` are the seam's (outside the region, in
+   `apply_events`). The store is C's: NB = C + X, tails at C + X .. C + X + 3, the trash slot at
+   C + X + 4 (`Residency(trash_slots=1)`, f321c03), which is this branch's NB + 4 convention.
+   Rv_cap = B x K and Rd_cap = B (live rows first), R_cap = B (1 + K), k = topk.
+3. **E1 on the seam's `apply_events`.** The 4-tuple events; the void rule (a void tick commits
+   nothing); `backend.decisions(pub, rb_epoch)`; the write-back through `backend.commit_block`.
+   Inside it, `commit_banks` and `rebuild_from_own_rows_unchecked` stay as they are.
+4. **The flags.**
+   - With the ResidentStore: the seam's `overflow_flag()` plus `err_dev` in the one decision read
+     (the void rule).
+   - With S-C: `watch_flags_with(svc)` (C's `watch_flag`, one read per tick); the decision read
+     holds the tokens only.
+
+THE PROOF (CPU first, then the GPU):
+
+- **C1-C7 and G1-G6 against the merged TickEngine** with `ResidentStore`. The seam's
+  ResidentStore is the old path; the verify agent's T-tests pin that.
+- **NEW R1:** fixed tick on `ResidencyBackend` (eager: S-C's `resolve` per layer) == the seam's
+  eager tick on the same backend, bitwise every tick (rows, live logits, state, the service's
+  ownership state and counters).
+- **NEW R2:** captured tick (CPU `FakeGraph`) on `CapturedResidencyBackend` == R1's reference.
+  This is the tick-level form of S1 (the split against `resolve`), with padded TICK rows.
+- **NEW R3:** negative controls: the inert row made live; `sync_mirror` skipped; a void tick
+  (twin overflow) refused through `watch_flag`.
+- **GPU (after C's FG1 passes: `CudaDeviceOps` is not yet run):** the TC gate gains TE-R (the
+  seam's eager tick on S-C with the exact wait) and TG-R (the captured tick on
+  `CapturedResidencyBackend`), MUST bitwise equal, PTR, the watched flags clear. Then SG5's
+  terms on the captured tick.
+
+RISKS:
+
+- **`after_attention` once per tick.** A reader event per layer becomes one per tick. C's Q-T3
+  (c) says no slot is released and taken again inside a tick, so the residency's decisions do not
+  change; only the reader-gated release waits for the whole tick.
+- **Draft-only ticks.** They now read the device once per tick (S-C's `end_tick`, C's Q-T3 (e));
+  the asynchronous form (a pinned copy and an event, waited at the next tick start) is C's.
+
 ## 13. Risks
 
 - **OP-1:** the stable `torch.sort` of `select_blocks` under capture is not yet proven here.
