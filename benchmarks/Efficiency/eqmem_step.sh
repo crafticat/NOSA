@@ -106,7 +106,7 @@ shift
 exec "$A" exec --nv --cleanenv --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" "$@"'
 argv_for() {      # $1 = the driver's --out
     ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) srun --jobid="$JOB" --job-name="$NAME"
-          --ntasks=1 --cpus-per-task=16 --mem=240G --gres=gpu:a100:1 --time="$STEP_MIN" --export=NONE
+          --ntasks=1 --cpus-per-task=16 --mem=440G --gres=gpu:a100:1 --time="$STEP_MIN" --export=NONE
           /bin/sh -c "$CHILD" eqmem-child "$GPU_UUID" "$APPTAINER" --bind /mnt/beegfs/ojerbi:/mnt/beegfs/ojerbi "${ENVS[@]}"
           "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/eqmem_bench.py" "${DRV[@]}" --out "$1")
 }
