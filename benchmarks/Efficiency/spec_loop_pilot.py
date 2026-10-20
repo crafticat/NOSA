@@ -409,6 +409,13 @@ def _states_equal(a, b) -> tuple:
     return True, "equal"
 
 
+def final_counter_sums(store) -> dict:
+    """The store's counters summed over layers, heads and requests, as Python ints (the per-round records sum them the
+    same way, and wire_bytes / timely_recall expect sums). R2 milestone 1 g1: int(v) of the per-(layer, head, request)
+    tensors raised 'only one element tensors can be converted to Python scalars' after the K arm (step 2188818.23)."""
+    return {k: int(v.sum()) for k, v in store.counters().items()}
+
+
 @torch.inference_mode()
 def run_spec_arm(model, cache, t0, position_ids, K: int, total: int, probe: bool) -> dict:
     from nosi import spec_loop as _sl
@@ -607,7 +614,7 @@ def run_spec_arm(model, cache, t0, position_ids, K: int, total: int, probe: bool
         row["counters"] = {k: cnt[k] - (prev_counters or {}).get(k, 0) for k in cnt}
         prev_counters = cnt
         out_rounds.append(row)
-    final_counters = {k: int(v) for k, v in store.counters().items()}
+    final_counters = final_counter_sums(store)
     wire = _sl.wire_bytes(final_counters)
     seq = torch.cat(committed, dim=1).cpu()
     result = dict(K=K, U=U, schedule=SCHEDULE, tokens=n_committed, seq=seq, rounds=out_rounds,
