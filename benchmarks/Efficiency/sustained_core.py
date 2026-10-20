@@ -71,7 +71,8 @@ LABEL = ("SUSTAINED natural greedy decode (NOSA shipped batched decode, offload=
 R_TOK, H_DEF, D_DEF, ELEM = 64, 2, 128, 2
 GROUP_USEFUL = 2 * R_TOK * D_DEF * ELEM                # K + V bytes of one group: 32768
 KERNEL, STRIDE, ROUND = 32, 16, 128                    # pooling_block_size, pooling_stride, flash_api seqlen_k rounding
-METHODS = ("alone", "cpu", "gpu")
+METHODS = ("alone", "cpu", "gpu", "cpu_native")
+TRANSPORTS = ("cpu", "gpu", "cpu_native")             # cpu_native: gilfree_pack (one GIL-released native call per release)
 GATES = ("gpu", "host")
 DEADLINE_TABLE = (1, 2, 3, 4, 8)
 SLOPE_MAX = 0.5                                        # releases per 100 steps
@@ -109,13 +110,14 @@ class ArmSpec:
     def moves_data(self) -> bool:
         """True when the arm's work writes the GPU scratch (the content check expects the last writes); False for alone
         and for the cpu modes L / LP (the scratch must stay POISON)."""
-        return self.method in ("cpu", "gpu") and self.mode == "full"
+        return self.method in TRANSPORTS and self.mode == "full"
 
 
 def parse_arms(text: str) -> List[ArmSpec]:
     """'alone,cpu:64:32,gpu:64:32' -> ArmSpecs. A transport arm is method:rate_MiB_per_step:frag. Options follow the
     positional parts as key=value: mode=full|L|LP (cpu arms only) and sleep=<ms> (any arm, 0 .. MAX_SLEEP_MS), e.g.
-    'cpu:64:32:mode=L', 'alone:sleep=30', 'cpu:64:32:sleep=30'. Without options the names are the v2 names."""
+    'cpu:64:32:mode=L', 'alone:sleep=30', 'cpu:64:32:sleep=30'. Without options the names are the v2 names.
+    'cpu_native:64:32' (gilfree branch) is the CPU-packing arm through gilfree_pack: name cpu_native_r64_f32."""
     out = []
     for item in [x.strip() for x in text.split(",") if x.strip()]:
         parts = item.split(":")
@@ -141,7 +143,7 @@ def parse_arms(text: str) -> List[ArmSpec]:
             if "mode" in opts:
                 raise ValueError("arm %r: the alone arm takes no mode" % item)
             out.append(ArmSpec("alone", sleep_ms=sleep))
-        elif method in ("cpu", "gpu") and len(pos) == 2:
+        elif method in TRANSPORTS and len(pos) == 2:
             rate, frag = float(pos[0]), int(pos[1])
             if rate <= 0 or frag < 1:
                 raise ValueError("arm %r: rate and frag must be positive" % item)
@@ -151,7 +153,8 @@ def parse_arms(text: str) -> List[ArmSpec]:
                 raise ValueError("arm %r: mode %r not in %s" % (item, mode, CPU_MODES))
             out.append(ArmSpec(method, rate, frag, mode, sleep))
         else:
-            raise ValueError("arm %r: expected 'alone' or 'cpu|gpu:<MiB per step>:<frag>', then key=value options" % item)
+            raise ValueError("arm %r: expected 'alone' or 'cpu|gpu|cpu_native:<MiB per step>:<frag>', then key=value "
+                             "options" % item)
     if len({a.name for a in out}) != len(out):
         raise ValueError("duplicate arms in %r" % text)
     return out

@@ -16,6 +16,9 @@ InfLLMv2Cache of cache_engine_gpu.py, offload=False; only its unused headroom ma
   <arm>:sleep=<ms>           a GPU sleep on the decode stream at the start of every step, before the decode (its
                              launches queue up behind it, as in the finite-burst harness of job 2179735); the arm is
                              scored on decode_ms against 'alone:sleep=<ms>' (required, exit 4 otherwise)
+  cpu_native:<MiB>:<frag>    (gilfree branch) the same CPU packing through gilfree_pack.cpp: ONE GIL-released native call
+                             per release (descriptor, packing, H2D + scatter submission), built JIT under
+                             $TORCH_EXTENSIONS_DIR (exit 4 when unset or under HOME); the same rings, streams and checks
   Per step the decode thread also records host_cpu_ms (its own CPU time, time.thread_time_ns) and decode_ms (the GPU time
   from after the sleep to the end of the step); summary.json per arm: host (iter / cpu / off-CPU means), decode_mean_ms,
   sleep_gap_ms, slowdown {metric, reference}; host_numa (allowed CPUs / nodes, per-node MemFree drop over the source
@@ -142,6 +145,12 @@ def check_config(a, rows_available: int, cpus: List[int]) -> Dict[str, Any]:
     alone_sleeps = {arm.sleep_ms for arm in arms if arm.method == "alone"}
     for s in sorted({arm.sleep_ms for arm in arms if arm.method != "alone" and arm.sleep_ms > 0} - alone_sleeps):
         errs.append("arms with sleep=%g need an 'alone:sleep=%g' arm (their slowdown is decode_ms against it)" % (s, s))
+    if any(arm.method == "cpu_native" for arm in arms):
+        import gilfree_pack as GF
+        try:
+            GF.build_dir_from_env()
+        except ValueError as e:
+            errs.append("cpu_native: %s" % e)
     need = 1 + a.pack_threads
     if a.pin == "on" and len(cpus) < need:
         errs.append("--pin on needs %d allowed CPUs (decode 1 + feeder %d), the process has %d" % (need, a.pack_threads,
@@ -444,16 +453,30 @@ def gpu_context(a, cfg, wl, rec) -> ArmContext:
     import nosi.nosa_llama as nl
     from nosi.cache_engine_gpu import InfLLMv2Cache as NoOffloadCache
     from nosi.flash_cache_engine.flash_h2d_persistent import flash_h2d_persistent
+    GF = None
+    if any(x.method == "cpu_native" for x in cfg["arms"]):
+        import gilfree_pack as GF
+    mods = [("nosa_llama", nl), ("cache_engine_gpu", sys.modules["nosi.cache_engine_gpu"]),
+            ("flash_h2d_persistent", sys.modules["nosi.flash_cache_engine.flash_h2d_persistent"]),
+            ("cpupack_core", K), ("sustained_core", SC), ("sustained_feed", sys.modules[__name__])]
+    if GF is not None:
+        mods.append(("gilfree_pack", GF))
     rec["modules"] = {name: dict(file=str(Path(m.__file__).resolve()), sha256=hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest())
-                      for name, m in (("nosa_llama", nl), ("cache_engine_gpu", sys.modules["nosi.cache_engine_gpu"]),
-                                      ("flash_h2d_persistent", sys.modules["nosi.flash_cache_engine.flash_h2d_persistent"]),
-                                      ("cpupack_core", K), ("sustained_core", SC), ("sustained_feed", sys.modules[__name__]))}
+                      for name, m in mods}
+    if GF is not None:
+        rec["modules"]["gilfree_pack.cpp"] = dict(file=str(GF.SOURCE), sha256=GF.source_sha256())
     repo = os.environ.get("NOSI_REPO")
     if repo:
         root = Path(repo).resolve()
         outside = {n: m["file"] for n, m in rec["modules"].items() if not Path(m["file"]).is_relative_to(root)}
         if outside:
             raise ModuleOrigin("modules loaded from outside NOSI_REPO %s: %s" % (root, outside))
+    ext = None
+    if GF is not None:                       # build first: the compiler runs before the model and the 34 GB pinned source
+        t0 = time.perf_counter()
+        ext = GF.load(GF.build_dir_from_env())
+        rec["gilfree"] = dict(build_load_s=time.perf_counter() - t0, ext=GF.EXT_NAME, version=int(ext.VERSION),
+                              so=str(getattr(ext, "__file__", "")), build_dir=GF.build_dir_from_env())
     t0 = time.perf_counter()
     model = nl.Llama(model_name=os.path.realpath(a.model), device="cuda", offload=False)
     rec["model_load_s"] = time.perf_counter() - t0
@@ -491,6 +514,12 @@ def gpu_context(a, cfg, wl, rec) -> ArmContext:
     ids_host = [torch.empty((g.H, g.B, g.M), dtype=torch.int32, pin_memory=True) for _ in range(a.ring)]
     ids_dev = [torch.empty((g.H, g.B, g.M), dtype=torch.int32, device="cuda") for _ in range(a.ring)]
 
+    npipe = None
+    if ext is not None:                                          # the cpu_native arm shares the rings and the streams
+        npipe = ext.NativePipe(stage, land, a.cap_groups, g.R, GF.stream_triple(streams["copy"]),
+                               GF.stream_triple(streams["scatter"]))
+        npipe.set_sources(src_k, src_v)
+
     def gather(dst, src, ids):
         flash_h2d_persistent(dst, src, ids, g.R, n_ctas=a.w8_ctas, num_warps=a.w8_warps)
 
@@ -498,6 +527,8 @@ def gpu_context(a, cfg, wl, rec) -> ArmContext:
         torch.cuda.synchronize()
         be.reset()
         pipe.reset()
+        if npipe is not None:
+            npipe.reset()
         SC.poison(scr_k)
         SC.poison(scr_v)
         SC.poison_stage(stage, a.cap_groups, g.R)                   # an unpacked slot stays POISON (staged_check)
@@ -506,6 +537,8 @@ def gpu_context(a, cfg, wl, rec) -> ArmContext:
     def transport(arm):
         if arm.method == "cpu":
             work = SC.cpu_work_fn(K, be, pipe, g, src_k, src_v, scr_k, scr_v, mode=arm.mode)
+        elif arm.method == "cpu_native":
+            work = GF.native_work_fn(npipe, be, g, scr_k, scr_v)
         else:
             work = SC.gpu_work_fn(be, gather, g, src_k, src_v, scr_k, scr_v, ids_host, ids_dev)
 
@@ -514,6 +547,8 @@ def gpu_context(a, cfg, wl, rec) -> ArmContext:
             out = SC.content_check(scr_k, scr_v, src_k, src_v, sched, arm.moves_data, g.R)
             if arm.method == "cpu":
                 out["stage"] = SC.staged_check(K, pipe, work.last, src_k, src_v, g.R)
+            if arm.method == "cpu_native":
+                out["native"] = dict(work.stats)
             return out
         return work, reset_all, finish
 
@@ -522,7 +557,7 @@ def gpu_context(a, cfg, wl, rec) -> ArmContext:
 
     # pre-warm both transports (Triton JIT of the W8 kernel, the packer's first calls) on a throwaway release
     t0 = time.perf_counter()
-    for method in ("cpu", "gpu"):
+    for method in ("cpu", "gpu") + (("cpu_native",) if npipe is not None else ()):
         reset_all()
         w = transport(SC.ArmSpec(method, 1.0, 1))[0]
         sch = SC.Schedule(g, 1, min(64, 2 * g.M), seed=a.seed + 99)
