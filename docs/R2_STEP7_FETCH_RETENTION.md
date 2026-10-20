@@ -188,20 +188,29 @@ slots = 8.6 GB (and the 16.4 GB model). The sizes are run parameters; SG5 report
 ## 8. The interface piece 4 calls (one service per run)
 
 ```
-svc = Residency(L, B, H, C, X, R_ver, transport, store, host_k, host_v, cis, metrics=True)
+svc = Residency(L, B, H, C, X, R_ver, transport, urgent_gather, store_b=, cis=, block_bytes=, host_wait=)   # v1
+svc = ResidencySB(..., device=, nblk=)              # S-B (r2_residency_sb.py): the draft rows on the device
+svc.begin_request(b, uid, hist_blocks=S // 64)      # the prefill wrote the host rows of blocks < hist_blocks
 # a tick
-svc.poll()                                         # arrivals (admit), queued releases (reader gates), FREE
+svc.poll()                                          # arrivals (admit), queued releases (reader gates), FREE
 for l in layers:
-    sel = selection of all rows (device, (H, R, 64) int64, ascending; tail included)
-    plan = svc.resolve(l, rows, sel)               # rows: (b, kind, cohort key, position); v1: host sync if verify rows
-    # plan.page_table (R, H, P) int32, plan.num_pages (R, H) int32, plan.last_len (R,) int32 over the store tensor;
-    # the urgent gathers and the stream waits are already enqueued on the main stream
+    sel = selection of all rows ((H, R, k) int64; on the device for S-B; tail included)
+    plan = svc.resolve(l, rows, sel)                # SAME signature in v1 and S-B; rows: Row(b, kind, key, pos,
+                                                    # hist_bound, tail); v1: a host read per layer; S-B: only for
+                                                    # the verify rows (S-C removes it)
+    # plan.page_table (R, H, P) int32, plan.num_pages (R, H) int32, plan.last_len / seq_idx (R,) int32 over the store;
+    # the urgent gathers and the stream waits are already enqueued on the main stream. S-B: plan.reads / plan.blocks
+    # hold the verify rows only (the draft reads are applied at end_tick)
     out = bi_paged_decode(q, store_k[l], store_v[l], store_b[l], plan.seq_idx, plan.page_table, plan.num_pages,
                           plan.last_len)
     svc.read_done(l, plan, torch.cuda.Event recorded on the main stream)
-svc.decided(key, accepted_upto, rejected)         # queue the cohort's remaining references; cancel later cohorts
-svc.end_request(uid)                               # K3X end_owner: LRU / PO / VRES released, in-flight stays in flight
-svc.report()                                       # 4.3 / 4.6 / 4.8 / 4.9 counters and the memory peak
+svc.end_tick()                                      # S-B: ONE device read, the draft decisions applied, the draft
+                                                    # transfers issued; v1 (defer_issue): the draft transfers issued
+svc.history_written(uid, block, ev)                 # the tick wrote block back to the host rows; ev = its D2H copy
+svc.decided(key)                                    # the verified cohort: its references queued behind the readers
+svc.cancel(key) / svc.cancel_epoch(uid, epoch)      # a rejection: every later key of the old epoch (draft-only keys too)
+svc.end_request(uid)                                # K3X end_owner: LRU / PO / VRES released, in-flight stays in flight
+svc.report()                                        # 4.3 / 4.6 / 4.8 counters, refusals, masked fraction, memory
 ```
 
 ## 9. K3X call sites mirrored (re-implemented for the R2 tick, cited)
@@ -260,7 +269,8 @@ deliveries ("force_only" for the scripted tests). The negative controls are K3X 
 (prot_release_no_reader_gate, release_drops_all_keys, free_on_cancel, no_reader_wait, release_first_reader,
 vres_counted_as_lru) and defect subclasses of the service otherwise (InflightReadable, NoDedup, DraftTakesReserve).
 F5b (the verifier reserve) and G10 in `test_r2_g0bi.py` (the serial path refuses rows below position 4032, the verify
-agent's Q4) are added.
+agent's Q4) are added. F10-F10d (S-B, 12b) and F11 (history_written and the host write-back order: K3X T4; cancel_epoch)
+follow.
 
 | Id | Test | Negative control (must be caught) |
 |---|---|---|
@@ -277,6 +287,26 @@ agent's Q4) are added.
 GPU gates (after the CPU tests and piece 4's tick): FG1 content and reader safety with real streams and the gilfree /
 s0 / gather transports (the F6 property with CUDA events); FG2 the 4.3 / 4.6 / 4.8 metrics on the R2 path at B 8 / 64
 with real selections; FG3 the packer's sustained rate (4.9) against the tick's demand.
+
+## 12b. S-B: the draft rows on the device (`nosi/nosi/r2_residency_sb.py`, 2026-10-21)
+
+- Per layer, no host read for the draft rows: after the host-side verify rows (v1), the host refreshes the layer's
+  DEVICE MIRROR (block -> resident slot, in-flight flags, FREE slots, usage per stream; a host-to-device copy) and
+  `device_draft` decides with tensor ops: READY blocks and the page tables, the protections (hits included), the
+  dedup per (stream, block) (in flight, or a later duplicate of the layer), K5 grants and refusals in K3X order (a
+  stream's first C - usage takes are free; extras go to the first X - borrowed - R_ver extra-needing misses), the
+  slot of each take (the stream's q-th FREE slot = K3X first_free), the masked and refusal counters.
+- At end_tick ONE batched device read; the host APPLIES the decisions to the K3X state in v1's order and CHECKS each
+  (a read of a block the host does not hold there, a merge of a block not in flight, a take K5 or first_free would
+  not make, a refusal K5 would grant: OwnershipViolation), then the O1 recency, then the draft transfers.
+- v1 now follows K3X's ordering contract O1 exactly (every draft row's READY set from the state before the recency
+  update; the recency after all draft rows), and admits arrivals per stream in issue order (layer, b, h, seq).
+- The S-B schedule: arrivals polled at the tick's start; draft transfers issued at end_tick. Under it S-B equals v1
+  (Residency(poll_in_resolve=False, defer_issue=True)): F10 (F6's 24 ticks, verify rows every third tick, seeded
+  delays / reordering / bursts) and F10b (C 2, X 4, R_ver 2, refusals): page tables, ownership state (LRU order,
+  PO, VRES, protections with kinds, slots, in-flight transfers, the transport's pending list) and counters, every tick.
+  Negative controls (F10c): no dedup, K5 without the reserve, no hit protection. F10d: device_draft's source holds no
+  host read. Device reads counted: one per tick (+ one per layer of a verify tick, v1's verify rows).
 
 ## 13. Open questions
 

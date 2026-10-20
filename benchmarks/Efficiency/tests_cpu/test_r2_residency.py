@@ -41,6 +41,7 @@ def _load(mod):
 
 
 RES = _load("r2_residency")
+SB = _load("r2_residency_sb")
 CORE = _load("r2_spec_core")
 OWN = sys.modules[PKG + ".kstep.ownership"]
 TR = sys.modules[PKG + ".kstep.transfer"]
@@ -67,7 +68,7 @@ class Be:
             self.waits += 1
 
 
-def world(C=4, X=4, R_ver=2, seed=0, mode="force_only", mut=None, cls=None, max_delay=3):
+def world(C=4, X=4, R_ver=2, seed=0, mode="force_only", mut=None, cls=None, max_delay=3, svc_kw=None):
     g = torch.Generator().manual_seed(seed)
     host_k = [torch.randn(B, NB * BS, H, D, generator=g) for _ in range(L)]
     host_v = [torch.randn(B, NB * BS, H, D, generator=g) for _ in range(L)]
@@ -80,7 +81,7 @@ def world(C=4, X=4, R_ver=2, seed=0, mode="force_only", mut=None, cls=None, max_
     tp = TR.AdversarialTransport(be, host_k, host_v, store_k, store_v, BS, seed, mode=mode, max_delay=max_delay)
     gather = RES.TorchGather(host_k, host_v, store_k, store_v)
     svc = (cls or RES.Residency)(L, B, H, C, X, R_ver, tp, gather, store_b=store_b, cis=cis,
-                                 block_bytes=BS * 2 * D * 4, host_wait=be.host_wait, mut=mut)
+                                 block_bytes=BS * 2 * D * 4, host_wait=be.host_wait, mut=mut, **(svc_kw or {}))
     return types.SimpleNamespace(svc=svc, tp=tp, be=be, host_k=host_k, host_v=host_v, cis=cis, store_k=store_k,
                                  store_v=store_v, store_b=store_b)
 
@@ -179,15 +180,20 @@ def _f1(cls=None):
 def test_F1_draft_reads_ready_blocks_only_and_requests_each_miss_once():
     """F1: a draft row lists its tail pages and ONLY the selected blocks that are resident with an observed arrival,
     in ascending block id; every miss is requested once per (stream, block) across the rows and heads of a tick; an
-    in-flight block is not requested again. Negative controls: a row that reads an in-flight block, and a service that
-    does not find in-flight blocks (duplicate transfers), are both caught."""
+    in-flight block is not requested again. Negative controls: a row that reads an in-flight block (caught by the read
+    check, or by the O1 recency update, which refuses a read block that is not resident), and a service that does not
+    find in-flight blocks (duplicate transfers), are both caught."""
     w, p2 = _f1()
     assert p2.blocks == [[[0], [1]], [[0, 1], [0]]]
     assert reads_ok(w, 0, p2) and dedup_ok(w.svc)
     assert sorted((tr.h, tr.block) for tr in p2.issued) == [(0, 4), (0, 5), (1, 4), (1, 5)]
     assert p2.masked == 4 and p2.draft_pairs == 4 and p2.refused == 0
-    w2, q2 = _f1(InflightReadable)
-    assert not reads_ok(w2, 0, q2)
+    try:                                               # caught by the read check, or earlier by K3X's O1 recency check
+        w2, q2 = _f1(InflightReadable)
+        caught = not reads_ok(w2, 0, q2)
+    except ER.OwnershipViolation:
+        caught = True
+    assert caught
     w3, q3 = _f1(NoDedup)
     assert not dedup_ok(w3.svc)
 
@@ -541,3 +547,208 @@ def test_F9_vendored_k3x_files_are_byte_identical(tmp_path):
     want = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "%s:nosi/nosi/kstep/ownership.py" % K3X],
                           capture_output=True, text=True).stdout.strip()
     assert _blob(bad) != want
+
+
+# =====================================================================================================================
+# F10 S-B: the draft rows on the device, against v1
+# =====================================================================================================================
+def _sched(seed, steps, verify, hb=15, uids=("u0", "u1")):
+    """F6's schedule as data: per tick (t, cohort m, the cohort ends, per layer [(b, kind, key, sel per head)]). A draft
+    row selects a window of 6 historical blocks and its tail block; with verify, every third tick adds a verify row
+    of 8 random historical blocks per request (and that tick's draft row belongs to the next cohort)."""
+    g = torch.Generator().manual_seed(seed)
+    out = []
+    for t in range(steps):
+        m = t // 3 + 1
+        ends = t % 3 == 2
+        layers = []
+        for _ in range(L):
+            spec = []
+            for b, u in enumerate(uids):
+                x = int(torch.randint(0, hb - 6, (1,), generator=g))
+                spec.append((b, "d", (u, 1, m + 1 if ends else m), [list(range(x, x + 6)) + [hb] for _ in range(H)]))
+                if verify and ends:
+                    v = sorted(set(int(z) for z in torch.randint(0, hb, (8,), generator=g)))
+                    spec.append((b, "v", (u, 1, m), [v + [hb] for _ in range(H)]))
+            layers.append(spec)
+        out.append((t, m, ends, layers))
+    return out
+
+
+def _state(w):
+    """Everything the decisions change: per stream the owner, the LRU in order, PO, VRES, the pending map, every
+    protection with its kinds and every slot (state, block, gen, class); the service's in-flight transfers (without
+    their issue sequence) and the transport's pending list in order."""
+    svc = w.svc
+    out = []
+    for l, pool in enumerate(svc.pools):
+        for (b, h) in sorted(pool.streams):
+            st = pool.streams[(b, h)]
+            out.append((l, b, h, st.owner, list(st.lru.items()), sorted(st.po.items()), sorted(st.vres.items()),
+                        sorted(st.pending.items()),
+                        sorted((blk, sorted(repr(k) for k in keys)) for blk, keys in st.prot.items()),
+                        sorted((blk, sorted((repr(k), sorted(v)) for k, v in kk.items())) for blk, kk in st.pin_kind.items()),
+                        [(s.state, s.block, s.gen, s.cls) for s in st.slots]))
+    out.append(sorted((key, tr.slot, tr.gen, tr.kind, repr(tr.requester), sorted(tr.demand))
+                      for key, tr in svc.pending.items()))
+    out.append([(tr.layer, tr.b, tr.h, tr.block, tr.slot, tr.gen, sorted(tr.demand)) for tr in w.tp.pending])
+    return out
+
+
+def _counters(svc):
+    m = svc.metrics                                    # wait_ns / layer_wait_ns are clocks: not compared
+    return (m.masked, m.draft_pairs, m.refused, sorted(m.counts.items()),
+            (m.k43["ready"], m.k43["in_flight"], m.k43["new"], m.k43["layer_calls"]),
+            sorted(m.k46.items()), sorted(m.transferred.items()))
+
+
+def _lockstep(seed, C, X, R_ver, steps, verify, sb_mut=None, hb=15):
+    """v1 (host, the S-B schedule: arrivals at the tick's start, draft transfers at end_tick) and S-B driven by the same
+    schedule, transports seeded alike (delays, reordering, bursts), reader events completed two ticks late in both.
+    Returns the first differences (page tables per layer; state and counters per tick), and the two worlds."""
+    common = dict(C=C, X=X, R_ver=R_ver, seed=seed, mode="delay", max_delay=4)
+    wv = world(**common, svc_kw=dict(poll_in_resolve=False, defer_issue=True))
+    ws = world(**common, cls=SB.ResidencySB, svc_kw=dict(nblk=NB, sb_mut=sb_mut))
+    uids = ("u0", "u1")
+    for w in (wv, ws):
+        for b, u in enumerate(uids):
+            w.svc.begin_request(b, u)
+    tail = wv.svc.tail0
+    readers, bad = [], []
+    for (t, m, ends, layers) in _sched(seed + 100, steps, verify, hb):
+        for w in (wv, ws):
+            w.svc.poll()
+        for l, spec in enumerate(layers):
+            rows = [Row(b, kind, key, 1000 + t, hb, [(hb, tail)]) for (b, kind, key, _) in spec]
+            sel = S(*[s for (_, _, _, s) in spec])
+            pv = wv.svc.resolve(l, rows, sel)
+            ps = ws.svc.resolve(l, rows, sel)
+            for i in range(len(rows)):
+                for h in range(H):
+                    a = pv.page_table[i, h, :int(pv.num_pages[i, h])].tolist()
+                    c = ps.page_table[i, h, :int(ps.num_pages[i, h])].tolist()
+                    if a != c:
+                        bad.append(("pages", t, l, i, h, a, c))
+            ev_v, ev_s = Ev(), Ev()
+            readers.append((t, ev_v, ev_s))
+            wv.svc.read_done(l, pv, ev_v)
+            ws.svc.read_done(l, ps, ev_s)
+        for w in (wv, ws):
+            w.svc.end_tick()
+        for (tt, a, c) in readers:
+            if tt <= t - 2:
+                a.done = c.done = True
+        if ends:
+            for w in (wv, ws):
+                for u in uids:
+                    w.svc.decided((u, 1, m))
+        sv, ss = _state(wv), _state(ws)
+        if sv != ss:
+            first = next(i for i, (x, y) in enumerate(zip(sv, ss)) if x != y)
+            bad.append(("state", t, sv[first], ss[first]))
+        if _counters(wv.svc) != _counters(ws.svc):
+            bad.append(("counters", t, _counters(wv.svc), _counters(ws.svc)))
+        if bad:
+            break
+    return bad, wv, ws
+
+
+def test_F10_sb_equals_v1_on_the_f6_schedule():
+    """F10: over F6's 24-tick schedule (2 requests, 2 layers, draft rows every tick, verify rows every third tick,
+    seeded delays / reordering / bursts), S-B's page tables (every row and head, every layer), the ownership state
+    after every tick (LRU order, PO, VRES, protections with kinds, slots, in-flight transfers, the transport's pending
+    list) and the counters (masked, draft pairs, refusals, 4.3, 4.6, transfers) equal v1's under the S-B schedule. The
+    device is read once per tick for the draft rows, plus once per layer of a verify tick (v1's verify rows)."""
+    bad, wv, ws = _lockstep(1, C=8, X=48, R_ver=8, steps=24, verify=True)
+    assert bad == [], bad[:3]
+    assert ws.svc.d2h_reads == 24 + 8 * L
+    assert wv.svc.metrics.k43["layer_calls"] > 0 and wv.svc.metrics.draft_pairs == 24 * L * B * H
+
+
+def test_F10b_sb_equals_v1_under_capacity_pressure():
+    """F10b: a draft-only schedule with C 2, X 4, R_ver 2 (K5 refusals, LRU evictions to PO, borrowed extras):
+    S-B equals v1 every tick, refusals happen, and the device is read exactly once per tick."""
+    bad, wv, ws = _lockstep(3, C=2, X=4, R_ver=2, steps=12, verify=False)
+    assert bad == [], bad[:3]
+    assert wv.svc.metrics.refused > 0 and ws.svc.d2h_reads == 12
+
+
+@pytest.mark.parametrize("mut, verify, cap", [("no_dedup", True, (8, 48, 8)), ("ignore_reserve", False, (2, 4, 2)),
+                                              ("no_hit_protect", True, (8, 48, 8))])
+def test_F10c_sb_negative_controls(mut, verify, cap):
+    """F10c: the same lockstep catches a device without the dedup (a block in flight requested again), a device whose
+    K5 ignores the verifier reserve, and a device that does not protect the hits: by a difference from v1 or by the
+    host's check of a device decision (OwnershipViolation)."""
+    C, X, R_ver = cap
+    try:
+        bad, _, _ = _lockstep(1 if verify else 3, C=C, X=X, R_ver=R_ver, steps=24 if verify else 12, verify=verify,
+                              sb_mut={mut: True})
+        caught = bool(bad)
+    except ER.OwnershipViolation:
+        caught = True
+    assert caught
+
+
+class NoHistForward(RES.Residency):
+    """DEFECT: the transfer does not carry the block's host write-back event."""
+
+    def _hist_ev_for(self, b, block):
+        return None
+
+
+def test_F11_history_events_and_the_end_of_an_epoch():
+    """F11 (the verify agent's Q-S1 / Q-S2): a block past the prefill may be requested only after the tick registered
+    its host write-back (history_written): before, the take is refused (no slot taken, no transfer); after, the
+    transfer carries the event and the transport waits on it before it reads the host rows (K3X T4). cancel_epoch
+    cancels every key of the epoch, the keys only draft rows used included, and leaves the next epoch's keys alone.
+    Negative controls: a service that does not forward the event lets the transport read without waiting; a single
+    cancel leaves the epoch's other key usable."""
+    w = world(C=4, X=4, R_ver=1)
+    svc = w.svc
+    svc.begin_request(0, "u0", hist_blocks=10)
+    with pytest.raises(ER.OwnershipViolation, match="no registered host write-back"):
+        svc.resolve(0, [Row(0, "d", ("u0", 1, 1), 800, 13)], S([[12], []]))
+    assert all(s.state == OWN.FREE for s in svc.stream(0, 0, 0).slots) and not svc.inflight
+    ev = Ev()
+    svc.history_written("u0", 12, ev)
+    waits = w.be.waits
+    p = svc.resolve(0, [Row(0, "d", ("u0", 1, 2), 801, 13)], S([[12], []]))
+    assert p.issued[0].hist_ev is ev and ev.done and w.be.waits == waits + 1
+    w2 = world(C=4, X=4, R_ver=1, cls=NoHistForward)
+    w2.svc.begin_request(0, "u0", hist_blocks=10)
+    ev2 = Ev()
+    w2.svc.history_written("u0", 12, ev2)
+    p2 = w2.svc.resolve(0, [Row(0, "d", ("u0", 1, 2), 801, 13)], S([[12], []]))
+    assert p2.issued[0].hist_ev is None and not ev2.done
+    # the end of an epoch
+    for single in (False, True):
+        w3 = world(C=4, X=4, R_ver=1)
+        s3 = w3.svc
+        s3.begin_request(0, "u0")
+        for l, m in ((0, 1), (1, 2)):
+            s3.resolve(l, [Row(0, "d", ("u0", 1, m), 300, 10)], S([[1, 2], []]))
+        if single:
+            s3.cancel(("u0", 1, 1))
+            s3.resolve(1, [Row(0, "d", ("u0", 1, 2), 301, 10)], S([[3], []]))      # still usable: not the epoch's end
+        else:
+            assert s3.cancel_epoch("u0", 1) == [("u0", 1, 1), ("u0", 1, 2)]
+            for l, m in ((0, 1), (1, 2)):
+                with pytest.raises(ER.OwnershipViolation, match="cancelled"):
+                    s3.resolve(l, [Row(0, "d", ("u0", 1, m), 301, 10)], S([[3], []]))
+            s3.resolve(0, [Row(0, "d", ("u0", 2, 1), 302, 10)], S([[3], []]))        # the next epoch resolves
+
+
+FORBIDDEN = (".item(", ".tolist(", ".nonzero(", ".cpu(", ".numpy(", "bool(", "int(", "float(", ".any()", ".all()")
+
+
+def host_reads(src):
+    return [tok for tok in FORBIDDEN if tok in src]
+
+
+def test_F10d_device_draft_reads_nothing_on_the_host():
+    """F10d: the source of device_draft holds no host read of a device value (.item, .tolist, .nonzero, .cpu, .numpy,
+    Python bool / int / float of a tensor, .any() / .all()); the mirror refresh and the per-tick read are outside it.
+    Negative control: the same check finds a .item() call."""
+    import inspect
+    assert host_reads(inspect.getsource(SB.device_draft)) == []
+    assert host_reads("n = int(x.sum().item())") != []

@@ -114,7 +114,10 @@ class Residency:
 
     def __init__(self, L: int, B: int, H: int, C: int, X: int, R_ver: int, transport, urgent_gather: Callable,
                  store_b=None, cis=None, block: int = BLOCK, block_bytes: int = 0, host_wait: Callable = None,
-                 mut: Mutations = None, clock: Callable[[], int] = time.perf_counter_ns):
+                 mut: Mutations = None, clock: Callable[[], int] = time.perf_counter_ns, poll_in_resolve: bool = True,
+                 defer_issue: bool = False):
+        self.poll_in_resolve, self.defer_issue = bool(poll_in_resolve), bool(defer_issue)
+        self._deferred: List[Tuple[int, List[Transfer]]] = []
         self.L, self.B, self.H, self.C, self.X, self.R_ver = int(L), int(B), int(H), int(C), int(X), int(R_ver)
         self.pools = [LayerPool(l, self.B, self.H, self.C, self.X, self.R_ver) for l in range(self.L)]
         self.n_hist = self.C + self.X                       # historical slots per stream; the tail rings follow
@@ -135,23 +138,43 @@ class Residency:
         self.key_reader: Dict[Tuple, Any] = {}              # (key, l) -> the key's latest reader event at layer l
         self.queue: List[Tuple] = []                        # (key, l) reference releases waiting for their reader gate
         self.queued: Set[Tuple] = set()
+        self.hist_ev: Dict[Tuple[int, int], Any] = {}       # (b, block) -> the event of its host-row write-back (T4)
+        self.hist_from: Dict[int, int] = {}                 # b -> first block that needs a registered write-back
+        self.keys_seen: Dict[Tuple, Set] = {}               # (uid, epoch) -> the cohorts m of the keys that resolved
         self.metrics = Metrics(self)
 
     # ------------------------------------------------------------------------------------------------ requests
     def stream(self, l: int, b: int, h: int):
         return self.pools[l].stream(b, h)
 
-    def begin_request(self, b: int, uid) -> None:
+    def history_written(self, uid, block: int, ev) -> None:
+        """The tick wrote block `block` of request uid back to the host rows (all layers); ev completes when that
+        device-to-host copy has landed. A transfer of the block carries it as hist_ev: the host packer waits on it
+        before it reads the rows (K3X T4), the urgent gather is ordered after it. The tick never waits on the host."""
+        self.hist_ev[(self.uid_b[uid], int(block))] = ev
+
+    def _hist_ev_for(self, b: int, block: int):
+        if b in self.hist_from and block >= self.hist_from[b] and (b, block) not in self.hist_ev:
+            raise OwnershipViolation("block %d of batch slot %d has no registered host write-back (history_written): its "
+                                     "host rows may not exist yet" % (block, b))
+        return self.hist_ev.get((b, block))
+
+    def begin_request(self, b: int, uid, hist_blocks: Optional[int] = None) -> None:
+        """hist_blocks: the blocks whose host rows the prefill wrote; a later block may be requested only after its
+        history_written (None: no check)."""
         if uid in self.uid_b or not 0 <= b < self.B:
             raise OwnershipViolation("begin_request: uid %s already holds a batch slot, or slot %d is out of range"
                                      % (uid, b))
         for pool in self.pools:
             for h in range(self.H):
-                st = pool.stream(b, h)
-                if st.owner is not None:
-                    raise OwnershipViolation("begin_request: batch slot %d is owned by %s" % (b, st.owner))
-                st.owner = uid
+                if pool.stream(b, h).owner is not None:
+                    raise OwnershipViolation("begin_request: batch slot %d is owned by %s" % (b, pool.stream(b, h).owner))
+        for pool in self.pools:
+            for h in range(self.H):
+                pool.stream(b, h).owner = uid
         self.uid_b[uid] = b
+        if hist_blocks is not None:
+            self.hist_from[b] = int(hist_blocks)
 
     def end_request(self, uid) -> None:
         """K3X _end_request / Stream.end_owner (dispatcher.py:831-875): LRU / PO / VRES released through the reader
@@ -160,6 +183,9 @@ class Residency:
         for pool in self.pools:
             for h in range(self.H):
                 pool.stream(b, h).end_owner()
+        for k in [k for k in self.hist_ev if k[0] == b]:
+            del self.hist_ev[k]
+        self.hist_from.pop(b, None)
         for (key, l) in list(self.queued):
             if key[0] == uid:
                 self.cancelled.add(key)
@@ -177,11 +203,14 @@ class Residency:
 
     def poll_arrivals(self) -> int:
         """K3X _poll, the arrival half (dispatcher.py:1499-1539): every transfer whose OWN completion is observed is
-        admitted with its merged demand set (non-blocking; no arrival order is assumed)."""
+        admitted with its merged demand set (non-blocking; no arrival order is assumed). Admission order: by (layer,
+        batch slot, head, issue sequence): per stream the issue order, and streams are independent, so the state does
+        not depend on how the issues of different layers interleave (S-B issues its draft transfers at end_tick)."""
         self.tp.poll()
         n = 0
-        for seq in sorted(self.inflight):
-            tr = self.inflight.get(seq)
+        order = sorted(self.inflight.values(), key=lambda tr: (tr.layer, tr.b, tr.h, tr.seq))
+        for tr0 in order:
+            tr = self.inflight.get(tr0.seq)
             if tr is not None and self.tp.done(tr):
                 self._admit(tr)
                 n += 1
@@ -254,12 +283,25 @@ class Residency:
             pool.poll_releases(self.mut)
         return None
 
-    def _take(self, l: int, b: int, h: int, block: int, key: Tuple, kind: str) -> Optional[Transfer]:
+    def _take(self, l: int, b: int, h: int, block: int, key: Tuple, kind: str, at: Optional[int] = None) -> Optional[Transfer]:
         """K3X _issue (dispatcher.py:3098-3179): take a FREE slot (K5 decides a draft may borrow), forward the slot's
-        previous last reader to the transfer (T3), fill the bias rows. A refused draft fetch returns None."""
+        previous last reader to the transfer (T3), fill the bias rows. A refused draft fetch returns None.
+        at: the slot a DEVICE decision chose (S-B); the host checks it is what v1 would take (K5 allows the take, the
+        block is not in flight, the slot is K3X first_free), and raises otherwise."""
         pool = self.pools[l]
         st = pool.stream(b, h)
-        if kind == DRAFT:
+        hev = self._hist_ev_for(b, int(block))                       # T4: refused before any change of state
+        if at is not None:
+            if kind != DRAFT:
+                raise ValueError("a device-chosen slot is for draft takes only")
+            if self._in_flight(l, b, h, block) is not None or st.resident(block) is not None:
+                raise OwnershipViolation("S-B: a duplicate take of block %d (layer %d b %d h %d)" % (block, l, b, h))
+            if not pool.can_take(st, DRAFT) or pool.first_free(st) != at:
+                raise OwnershipViolation("S-B: the device took slot %d for block %d (layer %d b %d h %d), the host would "
+                                         "take %s" % (at, block, l, b, h, pool.first_free(st) if pool.can_take(st, DRAFT)
+                                                      else "nothing (K5 refuses)"))
+            idx = at
+        elif kind == DRAFT:
             idx = pool.first_free(st) if self._draft_can_take(pool, st) else None
             if idx is None:
                 self.metrics.count("draft_refused")
@@ -273,7 +315,7 @@ class Residency:
         prev_reader = st.slots[idx].last_reader
         self.seq += 1
         gen = st.take(idx, st.owner, int(block), self.seq, cls="v" if kind == VERIFY else "ad")
-        tr = Transfer(self.seq, st.owner, l, b, h, int(block), idx, gen, kind, key, reader_ev=prev_reader)
+        tr = Transfer(self.seq, st.owner, l, b, h, int(block), idx, gen, kind, key, hist_ev=hev, reader_ev=prev_reader)
         self.inflight[tr.seq] = tr
         self.pending[(l, b, h, int(block))] = tr
         self._fill_bias(l, b, h, idx, int(block))
@@ -310,8 +352,7 @@ class Residency:
         """The slot a draft row may read for block t: resident (LRU / PO / VRES), arrival observed; else None."""
         return st.resident(t)
 
-    def resolve(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> Plan:
-        """One layer of a tick (module docstring). sel (H, R, k) int64 (CPU): each row's selection per head."""
+    def _check_rows(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> None:
         H, R = self.H, len(rows)
         if sel.dim() != 3 or tuple(sel.shape[:2]) != (H, R):
             raise ValueError("sel must be (H=%d, R=%d, k), got %s" % (H, R, tuple(sel.shape)))
@@ -324,13 +365,52 @@ class Residency:
                 raise OwnershipViolation("row of uid %s names batch slot %d" % (r.key[0], r.b))
             if (r.key, l) in self.queued and not self.mut.no_late_protection_guard:
                 raise OwnershipViolation("cohort %s protects at layer %d after its release was queued" % (r.key, l))
-        self.poll_arrivals()
+        for r in rows:
+            self.keys_seen.setdefault((r.key[0], r.key[1]), set()).add(r.key[2])
+
+    def _new_plan(self, rows: Sequence[Row]) -> Plan:
+        plan = Plan(page_table=None, num_pages=None, last_len=None, seq_idx=None,
+                    blocks=[[[] for _ in range(self.H)] for _ in range(len(rows))])
+        plan.keys = [r.key for r in rows]
+        return plan
+
+    def resolve(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> Plan:
+        """One layer of a tick (module docstring). sel (H, R, k) int64 (CPU): each row's selection per head.
+        The draft rows follow K3X's ORDERING CONTRACT O1 (dispatcher.py:2899-2932): every draft row's READY set is read
+        from the state before the draft recency update; the recency (touch / acquire, then the oldest eviction per
+        (row, stream)) runs after all draft rows. poll_in_resolve False: arrivals are polled at the tick's start only;
+        defer_issue True: the draft transfers are issued at end_tick (the S-B schedule, r2_residency_sb.py)."""
+        H, R = self.H, len(rows)
+        self._check_rows(l, rows, sel)
+        if self.poll_in_resolve:
+            self.poll_arrivals()
+        plan = self._new_plan(rows)
+        hist = [[self._hist(sel[h, i], rows[i].hist_bound) for h in range(H)] for i in range(R)]
+        entries = self._verify_part(l, rows, hist, plan)
+        got, issued = self._draft_phase_a(l, rows, hist, plan)
+        entries.update(got)
+        self._draft_recency(l, rows, got)
+        if issued:
+            plan.issued = issued
+            if self.defer_issue:
+                self._deferred.append((l, issued))
+            else:
+                self.tp.issue(l, issued)
+        self._finish_plan(l, rows, entries, plan)
+        return plan
+
+    def end_tick(self) -> None:
+        """The end of a tick: the deferred draft transfers are issued, layer by layer, in their order."""
+        for (l, trs) in self._deferred:
+            self.tp.issue(l, trs)
+        self._deferred = []
+
+    def _verify_part(self, l: int, rows: Sequence[Row], hist, plan: Plan) -> Dict[Tuple[int, int], List]:
+        """The verify rows of the layer (host, v1): protect, look, merge / wait / urgent; returns their (row, head)
+        entries [(block, slot, gen)] in ascending block id."""
+        H = self.H
         pool = self.pools[l]
         now = self.clock()
-        plan = Plan(page_table=None, num_pages=None, last_len=None, seq_idx=None, blocks=[[[] for _ in range(H)] for _ in range(R)])
-        plan.keys = [r.key for r in rows]
-        hist = [[self._hist(sel[h, i], rows[i].hist_bound) for h in range(H)] for i in range(R)]
-        # ---- verify rows: protect, look, merge / wait / urgent
         vrows = [i for i, r in enumerate(rows) if r.kind == "v"]
         for i in vrows:
             r = rows[i]
@@ -358,11 +438,12 @@ class Residency:
         for tr in plan.waited:
             self._wait(tr)
         if plan.urgent:
-            for tr in plan.urgent:                            # stream order: the slot's previous reader first (on the
-                if not ev_done(tr.reader_ev):                 # GPU the gather is on the readers' main stream)
-                    if self.host_wait is None:
-                        raise OwnershipViolation("urgent gather into slot %d before its previous reader" % tr.slot)
-                    self.host_wait(tr.reader_ev)
+            for tr in plan.urgent:                            # stream order: the slot's previous reader and the block's
+                for gate in (tr.reader_ev, tr.hist_ev):       # host write-back first (on the GPU the gather runs on
+                    if not ev_done(gate):                     # the main stream, after both)
+                        if self.host_wait is None:
+                            raise OwnershipViolation("urgent gather into slot %d before its gate" % tr.slot)
+                        self.host_wait(gate)
             self.gather(l, plan.urgent)                       # main stream, before every read of this layer
             for tr in plan.urgent:
                 self._admit(tr)
@@ -385,13 +466,20 @@ class Residency:
                             raise OwnershipViolation("layer %d row %d head %d: block %d is not readable" % (l, i, h, t))
                     ent.append((t, idx, st.slots[idx].gen))
                 entries[(i, h)] = ent
-        # ---- draft rows: protect (hits included), read the READY blocks, request the misses
+        return entries
+
+    def _draft_phase_a(self, l: int, rows: Sequence[Row], hist, plan: Plan):
+        """The draft rows (host, v1), K3X order (row, head, ascending block): protect every selected historical block
+        (hits included); a READY block (resident, read from the state BEFORE the recency update, O1) is read; an
+        in-flight one gets the draft demand; a miss is taken (K5) or refused (counted; the row continues masked).
+        Returns ({(row, head): [(block, slot, gen)]}, the transfers taken)."""
+        pool = self.pools[l]
+        got_all: Dict[Tuple[int, int], List[Tuple[int, int, int]]] = {}
         issued: List[Transfer] = []
         for i, r in enumerate(rows):
             if r.kind != "d":
                 continue
-            touched = []
-            for h in range(H):
+            for h in range(self.H):
                 st = pool.stream(r.b, h)
                 got = []
                 for t in hist[i][h]:
@@ -401,12 +489,6 @@ class Residency:
                         st.protect(t, r.key, DRAFT)
                     if idx is not None:
                         got.append((t, idx, st.slots[idx].gen))   # the slot read, fixed at the decision
-                    if resident is not None:
-                        if t in st.lru:
-                            st.touch(t)
-                        elif not self.mut.skip_acquisition:
-                            st.acquire(t, self.mut, evict=False)
-                        touched.append(st)
                     elif self._in_flight(l, r.b, h, t) is not None:
                         if not self.mut.drop_demand_merge:
                             self._in_flight(l, r.b, h, t).demand.add(DRAFT)
@@ -419,13 +501,34 @@ class Residency:
                 plan.draft_pairs += 1
                 if len(got) < len(hist[i][h]):
                     plan.masked += 1
-                entries[(i, h)] = got
-            for st in {id(s): s for s in touched}.values():
-                st.evict_to_c(self.mut)                        # repair 1c (O1): once after the row's whole batch
-        if issued:
-            self.tp.issue(l, issued)
-            plan.issued = issued
-        # ---- the page tables
+                got_all[(i, h)] = got
+        return got_all, issued
+
+    def _draft_recency(self, l: int, rows: Sequence[Row], got_all) -> None:
+        """K3X _draft_recency (dispatcher.py:2899-2932, O1): per draft row and stream, the blocks it read in ascending
+        block id move to MRU (an LRU hit) or enter the LRU (a PO / VRES entry: acquisition, no transfer); then the
+        oldest entries leave while the LRU holds more than C (protected ones become PO, others are released)."""
+        pool = self.pools[l]
+        for i, r in enumerate(rows):
+            if r.kind != "d":
+                continue
+            for h in range(self.H):
+                st = pool.stream(r.b, h)
+                for (t, idx, gen) in sorted(got_all.get((i, h), [])):
+                    if t in st.lru:
+                        st.touch(t)
+                    elif t in st.po or t in st.vres:
+                        if not self.mut.skip_acquisition:
+                            st.acquire(t, self.mut, evict=False)
+                    else:
+                        raise OwnershipViolation("the draft row %d read block %d (layer %d head %d), which is no longer "
+                                                 "resident at the recency update" % (i, t, l, h))
+                st.evict_to_c(self.mut)
+
+    def _finish_plan(self, l: int, rows: Sequence[Row], entries, plan: Plan) -> None:
+        """The reads and the page tables of the plan: per (row, head) the historical slots (ascending block id), then
+        the row's tail slots."""
+        H, R = self.H, len(rows)
         P = 1
         lists: List[List[List[Tuple[int, int, int]]]] = []    # [row][head] -> [(block, slot, gen)]
         for i, r in enumerate(rows):
@@ -457,7 +560,6 @@ class Residency:
         plan.seq_idx = torch.tensor([r.b for r in rows], dtype=torch.int32)
         self.metrics.layer_plan(plan)
         self.metrics.sample_memory()
-        return plan
 
     def read_done(self, l: int, plan: Plan, ev) -> None:
         """After the layer's attention: ev (recorded on the main stream after it) is the last reader of every slot the
@@ -501,6 +603,18 @@ class Residency:
         if not self.mut.leak_cancelled_protection:
             for l in range(self.L):
                 self._queue(key, l)
+
+    def cancel_epoch(self, uid, epoch: int) -> List[Tuple]:
+        """The end of an epoch (a rejection): cancel every key (uid, epoch, m) that resolved and is not cancelled yet,
+        the keys only draft rows used included. Returns the keys cancelled. The verified cohort's own key takes
+        decided() first (its verify read happened); cancelling it afterwards only refuses it from then on."""
+        out = []
+        for m in sorted(self.keys_seen.get((uid, epoch), ())):
+            key = (uid, epoch, m)
+            if key not in self.cancelled:
+                self.cancel(key)
+                out.append(key)
+        return out
 
     # ------------------------------------------------------------------------------------------------ report
     def memory(self) -> Dict[str, int]:
