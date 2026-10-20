@@ -6,7 +6,8 @@ GATES (MUST unless marked; "row-equal" = torch.equal of a row's output whatever 
   B1  rmsnorm (flashinfer), nosa_linear (Triton), rope (flashinfer): row-equal at R in {B, 4B}.
   B2  stage 1 (stage1_seqused) on a flattened call: rows share their bank's compressed-key table (cu_seqlens_k
       repeated, seqused_k per row, r2_spec_core.stage1_alias); every row's score row-equal to its call alone.
-  B3  GEMMs for wqkv (4608 x 4096), wo (4096 x 4096), gate_up (28672 x 4096), down (4096 x 14336), at M in
+  B3  GEMMs for wqkv (4608 x 4096), wo (4096 x 4096), gate_up (32768 x 4096), down (4096 x 16384) (NOSA-8B:
+      SHAPES = shapes_from_config(models/NOSA-8B/config.json), the CPU test S15 checks it), at M in
       {B, 2B, 3B, 4B} live rows (the tick has B draft rows plus 0 .. U B verify rows; U = 3):
         natural  cuBLAS (F.linear) at M = the live row count (REPORT: the number of rows that differ from the same
                  rows at M = 4B; the M-dependence premise of the design),
@@ -45,7 +46,20 @@ import sys
 import time
 import traceback
 
-SHAPES = dict(wqkv=(4608, 4096), wo=(4096, 4096), gate_up=(28672, 4096), down=(4096, 14336))
+# (N, K) of F.linear's weight for NOSA-8B's decode linears (nosa_llama.py: wqkv, wo, gate_up_proj = cat(gate, up),
+# down_proj). The values follow /mnt/beegfs/ojerbi/models/NOSA-8B/config.json (hidden 4096, 32 heads, 2 KV heads,
+# head_dim 128, intermediate 16384) through shapes_from_config; test S15 keeps them equal. They are also the values
+# of the bigemm branch's bi_linear.NOSA8B_SHAPES (without lm_head).
+SHAPES = dict(wqkv=(4608, 4096), wo=(4096, 4096), gate_up=(32768, 4096), down=(4096, 16384))
+
+
+def shapes_from_config(cfg: dict) -> dict:
+    """The four decode GEMM shapes (N, K) from a HF config dict."""
+    hidden, heads, kv_heads = int(cfg["hidden_size"]), int(cfg["num_attention_heads"]), int(cfg["num_key_value_heads"])
+    head_dim = int(cfg.get("head_dim") or hidden // heads)
+    inter = int(cfg["intermediate_size"])
+    return dict(wqkv=(heads * head_dim + 2 * kv_heads * head_dim, hidden), wo=(hidden, heads * head_dim),
+                gate_up=(2 * inter, hidden), down=(hidden, inter))
 # piece 3's registered time ratios (the coordinator's message of 2026-10-20): BI over B x (1 + u) rows against
 # FA2-NOSA split 4 over the B rows, keyed by (B, 1 + u)
 PIECE3_REGISTERED = {(64, 1): 1.4, (64, 2): 1.9, (64, 4): 2.8, (128, 1): 1.1, (128, 2): 1.6, (128, 4): 2.4}

@@ -2,7 +2,7 @@
 
 Branch `feature/nosi-r2-m2-spec` (worktree `/mnt/beegfs/ojerbi/nosi-r2-m2-spec`, from `54ea1d6`).
 Status: DESIGN, confirmed by the lead at f1f9f56. The commit after f1f9f56 adds the portable core
-(`nosi/nosi/r2_spec_core.py`), the CPU tests S1-S14 and the GPU microgate step B1-B5 (source only, no GPU result).
+(`nosi/nosi/r2_spec_core.py`), the CPU tests S1-S15 and the GPU microgate step B1-B5 (source only, no GPU result).
 The BI paged attention is piece 3 (`/mnt/beegfs/ojerbi/nosi-r2-m2-biattn`, 4c1243f, the verify agent). The BI GEMM
 (G-a) is built in `/mnt/beegfs/ojerbi/nosi-r2-m2-bigemm` (the verify agent). This branch builds G-b only.
 Prior-art gate: CLEARED by the lead (retroinfer-eval 3650572). The rows are in
@@ -356,7 +356,7 @@ second kernel. B4 loads piece 3 BY PATH: the step script copies the pinned blob 
 
 ### 7.1 CPU test plan
 
-File: `benchmarks/Efficiency/tests_cpu/test_r2_spec_round.py` (S1-S14), on `nosi/nosi/r2_spec_core.py`. No CUDA and
+File: `benchmarks/Efficiency/tests_cpu/test_r2_spec_round.py` (S1-S15), on `nosi/nosi/r2_spec_core.py`. No CUDA and
 no Triton launch. The attention is the torch reference (float32, and float64 inputs where stated). Piece 3 has its
 own CPU tests (`test_bi_paged_attention.py` in its branch); S7b checks that the two agree on the contract.
 
@@ -377,6 +377,7 @@ own CPU tests (`test_bi_paged_attention.py` in its branch); S7b checks that the 
 | S7b | the contract agreement with piece 3 (its pinned blob, loaded by path in a fresh process): the reference vs piece 3's torch twin and float64 oracle within 1e-5; last_len 1, 2, 9, 37, 63, 64; tail pairs; one-page rows | the bias added after the scale; a cut one row late |
 | S13 | the step script: GPU uuid from the lead's holder file (section 8); piece 3's pins (commit, path, blob) and the BI GEMM pins (unset); the gate arguments | a missing or malformed uuid file STOPs |
 | S14 | G-b `PaddedLinear`: equal to x @ w.T; lead dims kept; more than m_fix rows refused; one buffer per (K, dtype, device); the live rows do not depend on the buffer rows past them (random vs zero) | a stand-in whose rows read the padding |
+| S15 | the microgate's GEMM shapes equal the shapes derived from `/mnt/beegfs/ojerbi/models/NOSA-8B/config.json` (gate_up 32768 x 4096, down 4096 x 16384; 972579c had the Llama-3-8B values) | the Llama-3-8B MLP shapes are refused |
 
 ### 7.2 GPU gates (holder steps)
 
@@ -412,8 +413,19 @@ The attention term with piece 3's registered ratios (BI over B x (1 + u) rows / 
 | 64 | 1.4 | 1.9 | 2.8 | 1.87 | 1.9 |
 | 128 | 1.1 | 1.6 | 2.4 | 1.53 | 1.6 |
 
-- So dATT is about 0.9 x a x T_d at B 64 and about 0.6 x a x T_d at B 128. Here a is the attention share of T_d
-  (FA2-NOSA). The draft rows pay the BI ratio at 1 + u = 1 too, because they ride in the same BI call.
+MEASURED (piece 3's own GPU gate, lead 2026-10-20): BI / FA2-NOSA split 4 = 8.8 / 13.4 / 21.7 at 1 + u = 1 / 2 / 4
+(B 64) and 9.0 / 13.3 / 22.1 (B 128). The registered 1.1-2.8 is FALSIFIED (and so is P5 of 972579c for this kernel).
+
+- With these numbers the tick mean is about 13.1 (B 64, in phase) to 13.4 (out of phase), so dATT is about
+  12 x a x T_d: the 8 % target holds only if attention is below about 0.65 % of the draft-only tick. a is not
+  measured yet (SG5 measures it), but 0.65 % is a very small share for a step that reads 64 blocks per KV head.
+- So the one-page-per-step, no-split kernel is not expected to carry the tick. The verify agent builds a FIXED-SIZE
+  split-KV version: a split size that is a run constant (not a function of the batch or of the longest row), so a
+  row's partition and combine order depend on its own page count only, and law 1 still holds.
+- The table above keeps the registered values for reference; SG5 uses the measured ones of the kernel it runs.
+
+- With the registered ratios, dATT is about 0.9 x a x T_d at B 64 and about 0.6 x a x T_d at B 128. Here a is the
+  attention share of T_d (FA2-NOSA). The draft rows pay the BI ratio at 1 + u = 1 too, because they ride in the same BI call.
 - The attention term alone uses the 8 % target when a >= 0.08 / 0.9 = 9 % (B 64) or a >= 13 % (B 128).
 - dGEMM = (rho_pad - 1) x g x T_d for G-b, where g is the GEMM share of T_d and rho_pad is B3's padded ratio at
   M = B (M_fix = 4B on every tick). G-a: rho_bi averaged over the tick's M.
@@ -437,7 +449,7 @@ The attention term with piece 3's registered ratios (BI over B x (1 + u) rows / 
 
 ## 9. Order of work after this note
 
-1. The CPU stand-ins and tests S1-S14 (portable). DONE in the commit after f1f9f56.
+1. The CPU stand-ins and tests S1-S15 (portable). DONE in the commits after f1f9f56.
 2. GPU microgates B1-B5 and the GEMM / attention cost tables, one holder step (`r2_bi_step.sh`). Then the decision
    on G-a vs G-b (cost) or the weaker claim. G-a comes from the bigemm branch (pins in the step script).
 3. The BI paged attention kernel (Triton) with its CPU interpreter test: piece 3, the verify agent (4c1243f

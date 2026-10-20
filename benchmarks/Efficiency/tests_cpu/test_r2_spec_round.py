@@ -1,7 +1,7 @@
-"""CPU tests S1-S14 of R2 step 7 (docs/R2_STEP7_SPEC_ROUND.md section 7.1): nosi/nosi/r2_spec_core.py (cadence, the
+"""CPU tests S1-S15 of R2 step 7 (docs/R2_STEP7_SPEC_ROUND.md section 7.1): nosi/nosi/r2_spec_core.py (cadence, the
 round state machine, the flattened bank advance, the stage-1 alias, the deterministic selection, page lists, the BI
 paged attention reference, rollback by content with the two-page tail ring, the draft bank and the F5 rebuild, the
-slot store, the G-b PaddedLinear), the contract agreement of the reference with piece 3 (nosi-r2-m2-biattn 4c1243f,
+slot store, the G-b PaddedLinear), the microgate's GEMM shapes against the model config (S15), the contract agreement of the reference with piece 3 (nosi-r2-m2-biattn 4c1243f,
 bi_paged_attention.py, copied from the shared object store into a fresh process), and the pins of
 benchmarks/Efficiency/r2_bi_step.sh. No CUDA, no Triton launch. Each gate has a negative control.
 
@@ -700,6 +700,27 @@ def test_S14_padded_linear_g_b():
         rest = buf[M:]
         return y + (rest.mean() if rest.numel() else 0.0)
     assert _padding_leaks(leaky, x, w, m_fix, buf) != []
+
+
+NOSA8B_CONFIG = Path("/mnt/beegfs/ojerbi/models/NOSA-8B/config.json")
+
+
+def test_S15_microgate_shapes_are_nosa8b():
+    """S15: the microgate's GEMM shapes (r2_bi_microgate.SHAPES) equal the shapes derived from the model's own config
+    (/mnt/beegfs/ojerbi/models/NOSA-8B/config.json: hidden, heads, KV heads, head_dim, intermediate), and the literal
+    NOSA-8B values (the bigemm branch's bi_linear.NOSA8B_SHAPES without lm_head). Negative control: the Llama-3-8B MLP
+    shapes of 972579c (gate_up 28672 x 4096, down 4096 x 14336) and a config with that intermediate size are refused."""
+    import json
+    spec = importlib.util.spec_from_file_location("r2_bi_microgate_s15", str(EFF / "r2_bi_microgate.py"))
+    mg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mg)
+    assert NOSA8B_CONFIG.is_file(), "the model config %s is needed (the gate's shapes are pinned to it)" % NOSA8B_CONFIG
+    cfg = json.loads(NOSA8B_CONFIG.read_text())
+    assert mg.shapes_from_config(cfg) == mg.SHAPES
+    assert mg.SHAPES == dict(wqkv=(4608, 4096), wo=(4096, 4096), gate_up=(32768, 4096), down=(4096, 16384))
+    old = dict(mg.SHAPES, gate_up=(28672, 4096), down=(4096, 14336))
+    assert old != mg.shapes_from_config(cfg)
+    assert mg.shapes_from_config(dict(cfg, intermediate_size=14336)) == old != mg.SHAPES
 
 
 def test_S13_step_script_reads_the_uuid_file(tmp_path):
