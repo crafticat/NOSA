@@ -18,11 +18,14 @@ MUST gates (each counted in the exit code):
   G3 NaN poison: every row nobody lists set to NaN (unlisted slots; tail-page rows at or beyond the request's largest
      extent): the batch output torch.equal the clean one and finite; and per sampled row, alone, every row beyond
      ITS extent poisoned: equal.
-  G4 negative control: the same batch with 2 pages per tile (a batch-keyed tile) against the rows alone at 1 page per
-     tile must differ somewhere; else the invariance check is blind and the gate FAILS.
+  G4 negative control: the split size chosen by the batch (8 pages per split for a row alone, 4 in the batch) must
+     differ somewhere; its PRECONDITION first (8 and 4 pages per split give different bits on the same batch); if either
+     fails, the invariance check is blind and the gate FAILS. (Version 1's G4 used a 2-page tile; version 2 has no
+     tile knob.)
 REPORT: G5 page order (rows that change when the same pages are listed in slot order), the timing table (median of 20
-CUDA-event timed calls after 3 warm-ups) with the BI time / FA2-NOSA split-4 time ratio against the prediction
-registered in the commit message (PRED below).
+CUDA-event timed calls after 3 warm-ups, as for version 1; BI with a preallocated workspace) with the BI time /
+FA2-NOSA split-4 time ratio against the prediction registered in the commit message (PRED below); also the program
+count and a back-to-back time (10 calls per event pair: the host launch gap mostly drops out), report only.
 OUTPUT: --out DIR/biattn_gate.json and .md; the last stdout line is BIATTN_GATE_DONE failed=<n>; exit = n (2 = refused).
 """
 import argparse
@@ -47,10 +50,14 @@ TAIL_SLOT = 71
 TAIL_ROWS0 = 10                  # position L + 10 + u -> last_len 11 + u
 BATCHES = (64, 128)
 ROWS_PER_REQ = (1, 2, 4)
-# REGISTERED PREDICTION (commit message): BI time over B*(1+U) rows / FA2-NOSA split-4 time over B rows,
-# (central, low, high)
-PRED = {(64, 1): (1.4, 0.9, 2.5), (64, 2): (1.9, 1.2, 3.2), (64, 4): (2.8, 1.8, 4.5),
-        (128, 1): (1.1, 0.8, 1.8), (128, 2): (1.6, 1.0, 2.6), (128, 4): (2.4, 1.5, 3.8)}
+# REGISTERED PREDICTION for VERSION 2 (the fixed-size split-KV; commit message): BI time over B*(1+U) rows /
+# FA2-NOSA split-4 time over B rows, (central, low, high)
+PRED = {(64, 1): (1.8, 1.1, 3.5), (64, 2): (2.4, 1.4, 4.5), (64, 4): (3.6, 2.0, 7.0),
+        (128, 1): (1.7, 1.0, 3.5), (128, 2): (2.3, 1.3, 4.5), (128, 4): (3.4, 1.9, 7.0)}
+# VERSION 1's prediction (c866d7c), REFUTED by run biattn_v1_2188818: measured 8.82 / 13.42 / 21.71 (B 64) and
+# 8.95 / 13.25 / 22.13 (B 128). Kept for the record; not used.
+PRED_V1 = {(64, 1): (1.4, 0.9, 2.5), (64, 2): (1.9, 1.2, 3.2), (64, 4): (2.8, 1.8, 4.5),
+           (128, 1): (1.1, 0.8, 1.8), (128, 2): (1.6, 1.0, 2.6), (128, 4): (2.4, 1.5, 3.8)}
 
 
 def load_module():
@@ -91,7 +98,7 @@ def build(bi, B, U1, seed):
                 last_len=last_len, B=B, U1=U1, R=R)
 
 
-def call(bi, c, rows=None, table=None, k=None, v=None, bias=None, q=None, pages_per_tile=1):
+def call(bi, c, rows=None, table=None, k=None, v=None, bias=None, q=None, pages_per_split=None):
     t = c["table"] if table is None else table
     qq = c["q"] if q is None else q
     if rows is None:
@@ -101,7 +108,7 @@ def call(bi, c, rows=None, table=None, k=None, v=None, bias=None, q=None, pages_
         args = tuple(x.index_select(0, idx).contiguous() for x in (qq, t, c["seq_idx"], c["num_pages"], c["last_len"]))
     return bi.bi_paged_decode(args[0], c["k"] if k is None else k, c["v"] if v is None else v,
                               c["bias"] if bias is None else bias, args[2], args[1], args[3], args[4],
-                              pages_per_tile=pages_per_tile)
+                              pages_per_split=bi.PAGES_PER_SPLIT if pages_per_split is None else pages_per_split)
 
 
 def used_rows(bi, c, own_rows_only=None):
@@ -148,6 +155,25 @@ def time_ms(fn, iters=20, warm=3):
     return ts[len(ts) // 2]
 
 
+def time_b2b_ms(fn, calls=10, iters=10, warm=3):
+    """REPORT only: the median over `iters` of (one event pair around `calls` back-to-back calls) / calls. The host
+    enqueues ahead of the GPU, so the launch gap that time_ms sees after each sync mostly drops out."""
+    for _ in range(warm):
+        fn()
+    torch.cuda.synchronize()
+    ts = []
+    for _ in range(iters):
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        for _ in range(calls):
+            fn()
+        e1.record()
+        torch.cuda.synchronize()
+        ts.append(e0.elapsed_time(e1) / calls)
+    ts.sort()
+    return ts[len(ts) // 2]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -160,7 +186,7 @@ def main() -> int:
     from flash_attn_nosa import flash_attn_with_kvcache as fa2_nosa
     gates, report = [], dict(timing=[], page_order=[], meta=dict(
         L=L, HQ=HQ, HKV=HKV, D=D, pages_per_row=HIST + 1, page=bi.PAGE, num_warps=bi.NUM_WARPS,
-        num_stages=bi.NUM_STAGES, pages_per_tile=bi.PAGES_PER_TILE, torch=torch.__version__,
+        num_stages=bi.NUM_STAGES, pages_per_split=bi.PAGES_PER_SPLIT, torch=torch.__version__,
         device=torch.cuda.get_device_name(0)))
 
     def gate(name, ok, detail):
@@ -219,11 +245,13 @@ def main() -> int:
                 own_bad.append(r)
         gate("G3-nan-poison[B%d]" % B, ok and not own_bad, "batch equal and finite: %s; rows alone with every unread "
              "row poisoned that differ: %s" % (ok, own_bad))
-        # G4 negative control: a batch-keyed tile must be caught
-        neg = call(bi, c, pages_per_tile=2)
-        caught = [r for r in rows64 if not torch.equal(call(bi, c, rows=[r])[0], neg[r])]
-        gate("G4-negative-tile-caught[B%d]" % B, bool(caught), "rows where 2-page tiles in the batch differ from the "
-             "1-page row alone: %d of %d" % (len(caught), len(rows64)))
+        # G4 negative control: a split size chosen by the batch (8 alone, 4 in the batch); its precondition first
+        neg = call(bi, c, pages_per_split=4)
+        pre = not torch.equal(call(bi, c, pages_per_split=8), neg)
+        caught = [r for r in rows64 if not torch.equal(call(bi, c, rows=[r], pages_per_split=8)[0], neg[r])] if pre else []
+        gate("G4-negative-split-caught[B%d]" % B, pre and bool(caught), "precondition (8 vs 4 pages per split differ "
+             "on the batch): %s; rows where 4 pages per split in the batch differ from 8 alone: %d of %d" % (
+                 pre, len(caught), len(rows64)))
         # G5 page order (report)
         so = c["table"].clone()
         head = torch.sort(so[..., :HIST], dim=-1).values                  # slot order (the tail page stays last)
@@ -248,35 +276,47 @@ def main() -> int:
         fa = {}
         for sp in (4, 1):
             fa[sp] = time_ms(lambda: fa2_nosa(qf, kf, vf, bfias, cache_seqlens=cl, num_splits=sp))
+        fa_b2b = time_b2b_ms(lambda: fa2_nosa(qf, kf, vf, bfias, cache_seqlens=cl, num_splits=4))
         for U1 in ROWS_PER_REQ:
             c = build(bi, B, U1, seed=1000 + B + U1)
             out = torch.empty_like(c["q"])
-            t_bi = time_ms(lambda: bi.bi_paged_decode(c["q"], c["k"], c["v"], c["bias"], c["seq_idx"], c["table"],
-                                                      c["num_pages"], c["last_len"], out=out))
+            nsp = bi.splits_for(c["table"].shape[2])
+            bh = bi.block_h_for(HQ // HKV)
+            ws = (torch.empty((c["R"], HKV, nsp, bh, D), dtype=torch.float32, device="cuda"),   # a fixed buffer, as
+                  torch.empty((c["R"], HKV, nsp, 2, bh), dtype=torch.float32, device="cuda"))   # a graphed tick has
+            fn = lambda: bi.bi_paged_decode(c["q"], c["k"], c["v"], c["bias"], c["seq_idx"], c["table"],
+                                            c["num_pages"], c["last_len"], out=out, workspace=ws)
+            t_bi = time_ms(fn)
+            t_b2b = time_b2b_ms(fn)
             rows_read = c["R"] * HKV * (HIST * 64 + TAIL_ROWS0 + 1)
             gbs = rows_read * D * 2 * 2 / (t_bi * 1e-3) / 1e9
             ratio = t_bi / fa[4]
             cen, lo, hi = PRED[(B, U1)]
             row = dict(B=B, rows_per_request=U1, rows=c["R"], bi_ms=t_bi, fa2_split4_ms=fa[4], fa2_split1_ms=fa[1],
                        ratio_bi_over_fa2_split4=ratio, ratio_bi_over_fa2_split1=t_bi / fa[1],
-                       bi_logical_GBps=gbs, predicted=cen, predicted_band=[lo, hi], inside_band=lo <= ratio <= hi)
+                       bi_b2b_ms=t_b2b, fa2_split4_b2b_ms=fa_b2b, ratio_b2b=t_b2b / fa_b2b, splits=nsp,
+                       programs=c["R"] * HKV * nsp, bi_logical_GBps=gbs, predicted=cen, predicted_band=[lo, hi],
+                       inside_band=lo <= ratio <= hi)
             report["timing"].append(row)
             print("[biattn] timing B=%d 1+U=%d rows=%d: BI %.3f ms, FA2-NOSA split4 %.3f / split1 %.3f ms; ratio %.2f "
-                  "(predicted %.1f, band [%.1f, %.1f]: %s); BI logical %.0f GB/s" % (
+                  "(predicted %.1f, band [%.1f, %.1f]: %s); back-to-back BI %.3f / FA2 %.3f ms (ratio %.2f, report); "
+                  "%d programs; BI logical %.0f GB/s" % (
                       B, U1, c["R"], t_bi, fa[4], fa[1], ratio, cen, lo, hi, "inside" if lo <= ratio <= hi else "OUTSIDE",
-                      gbs), flush=True)
-            del c, out
+                      t_b2b, fa_b2b, t_b2b / fa_b2b, c["R"] * HKV * nsp, gbs), flush=True)
+            del c, out, ws, fn
             torch.cuda.empty_cache()
         del kf, vf, bfias, qf
 
     nfail = sum(1 for g in gates if not g["passed"])
     lines = ["# BI paged attention gate", "", "| gate | result | detail |", "|---|---|---|"]
     lines += ["| %s | %s | %s |" % (g["gate"], "PASS" if g["passed"] else "FAIL", g["detail"]) for g in gates]
-    lines += ["", "| B | 1+U | rows | BI ms | FA2-NOSA split4 ms | split1 ms | ratio vs split4 | predicted [band] | inside |",
-              "|---|---|---|---|---|---|---|---|---|"]
-    lines += ["| %d | %d | %d | %.3f | %.3f | %.3f | %.2f | %.1f [%.1f, %.1f] | %s |" % (
-        t["B"], t["rows_per_request"], t["rows"], t["bi_ms"], t["fa2_split4_ms"], t["fa2_split1_ms"],
-        t["ratio_bi_over_fa2_split4"], t["predicted"], t["predicted_band"][0], t["predicted_band"][1], t["inside_band"])
+    lines += ["", "| B | 1+U | rows | programs | BI ms | FA2-NOSA split4 ms | split1 ms | ratio vs split4 | "
+              "predicted [band] | inside | b2b BI ms | b2b FA2 ms | b2b ratio |",
+              "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    lines += ["| %d | %d | %d | %d | %.3f | %.3f | %.3f | %.2f | %.1f [%.1f, %.1f] | %s | %.3f | %.3f | %.2f |" % (
+        t["B"], t["rows_per_request"], t["rows"], t["programs"], t["bi_ms"], t["fa2_split4_ms"], t["fa2_split1_ms"],
+        t["ratio_bi_over_fa2_split4"], t["predicted"], t["predicted_band"][0], t["predicted_band"][1], t["inside_band"],
+        t["bi_b2b_ms"], t["fa2_split4_b2b_ms"], t["ratio_b2b"])
         for t in report["timing"]]
     lines += ["", "failed MUST gates: %d" % nfail]
     with open(os.path.join(args.out, "biattn_gate.md"), "w") as f:

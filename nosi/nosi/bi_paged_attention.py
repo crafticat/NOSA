@@ -1,8 +1,23 @@
-"""R2-M2 step 7, piece 3: the BATCH-INVARIANT PAGED decode attention (BI attention) of the spec round.
+"""R2-M2 step 7, piece 3: the BATCH-INVARIANT PAGED decode attention (BI attention) of the spec round, version 2
+(FAST: a fixed-size split-KV).
 
 Design note: docs/R2_STEP7_SPEC_ROUND.md (f1f9f56) sections 3.4 (the BI paged attention), 5.1-5.2 (slot store, tail
 pages). CPU tests: benchmarks/Efficiency/tests_cpu/test_bi_paged_attention.py. GPU gate: benchmarks/Efficiency/
 biattn_gate.py (holder step benchmarks/Efficiency/biattn_step.sh).
+
+LEDGER: VERSION 1 WAS CORRECT AND SLOW, AND ITS REGISTERED TIME PREDICTION IS REFUTED. Version 1 (commit c866d7c,
+test fix 4c1243f) passed every correctness gate on the A100 (run /mnt/beegfs/ojerbi/r2-runs/biattn/biattn_v1_2188818:
+G1-G4 at B 64 and 128). Its time ratio against FA2-NOSA's decode attention (split 4, B rows, 0.205 ms at B 64,
+0.393 ms at B 128) was predicted 1.4 / 1.9 / 2.8 (B 64, 1 + U = 1 / 2 / 4) and 1.1 / 1.6 / 2.4 (B 128); MEASURED
+8.82 / 13.42 / 21.71 and 8.95 / 13.25 / 22.13 (BI 1.805 / 2.748 / 4.445 ms at B 64): every value outside its band.
+The diagnosis (inferred from the measured 147-244 GB/s logical bandwidth and the structure; NOT profiled):
+  * one program per (row, KV head) walking all 64 pages: 128 programs at B 64, about one 4-warp CTA per SM;
+  * the unit last-dim strides were in do_not_specialize, so Triton could not prove contiguity along D and could not
+    vectorize the K / V loads;
+  * a vector page-table load fed every tile's addresses, which left little to overlap.
+Version 2 changes the schedule, never the law below: a FIXED-SIZE split-KV (PAGES_PER_SPLIT pages per program: 8x
+the programs at 64 pages), the unit last-dim stride assumed (checked by the launcher) and not passed, one SCALAR
+page-table load per page.
 
 WHAT IT COMPUTES. Every ROW r (a verify row or a draft row of the flattened tick; several rows may belong to one
 request) and every KV head h read their own keys through their OWN PAGE LIST: page_table[r, h, 0 : num_pages[r, h]]
@@ -17,43 +32,43 @@ extent: its position % 64 + 1 in its tail page). For each query head j of the KV
 
 THE LAW (AGENTS.md law 1; note 3.1, 3.4): the float reduction order of a row is a function of its OWN page list,
 num_pages, last_len and data only, never of the batch, the row count, the row order or a neighbour:
-  * one program per (row, KV head) (grid (R, Hkv)); a program reads only its own row of q, its own page list and the
-    rows of the pages it lists. No program reads another row's pages (block-diagonality is structural, as in T10).
-  * NO SPLIT-KV: one program walks all of a row's pages; there is no partition whose seams depend on the longest row
-    or on the number of programs, and no combine kernel.
-  * ONE TILE SIZE for every row (draft and verify alike): a tile is ONE 64-row page (PAGES_PER_TILE = 1), so the
-    online-softmax update sequence is exactly the canonical page sequence. NUM_WARPS / NUM_STAGES are module constants;
-    there is no autotune and no shape-keyed choice (an autotuner keyed on the batch would make the order a function
-    of the batch).
-  * the loop runs ceil(P / PAGES_PER_TILE) tiles, P = page_table.shape[2] (the caller's table width). A tile past
-    the row's own pages is an EXACT identity (every score -inf: m unchanged, alpha = 2**0 = 1, p = 0, l and acc
-    unchanged; a -0.0 accumulator can become +0.0, which torch.equal treats as equal), so P never reaches a row's
-    bits. The integer arguments are not specialized (do_not_specialize), so one compiled kernel serves every call.
+  * SPLIT k of a row covers ITS list positions [k * PPS, (k + 1) * PPS), PPS = PAGES_PER_SPLIT, a module constant:
+    the partition is a function of the row's own page count and the constant only (not of the longest row, the batch,
+    or the number of SMs). One program per (row, KV head, split), grid (R, Hkv, ceil(P / PPS)); a program whose split
+    starts past the row's pages returns at once and writes nothing.
+  * inside a split: ONE 64-row page per online-softmax step in list order (all GROUP query heads of the KV head in one
+    (16, 64) tile: GQA), fp32 (m, l, acc) partials written to a workspace. A page position past the row's last page
+    (only in its last split) is an exact identity step (scores -inf: m unchanged, alpha = 2**0 = 1, p = 0).
+  * the COMBINE (one program per (row, KV head)) reads the row's own splits in the FIXED order 0, 1, ...:
+    M = max over m_k (in that order), then L = sum l_k * 2**(m_k - M) and ACC = sum acc_k * 2**(m_k - M) in that order,
+    out = ACC / L. It loops over ceil(P / PPS) slots and masks the ones past the row's split count with exact
+    identities (weight 0, other = 0), so the table width P never reaches a row's bits. A row with one split gets
+    acc / l exactly (the weight is 2**0 = 1).
+  * NUM_WARPS / NUM_STAGES are module constants; no autotune; integer arguments that change with the table width or
+    the workspace shape are not specialized; unit last-dim strides are not arguments (Triton may vectorize along D,
+    which changes no float op).
   * CANONICAL PAGE ORDER: the caller lists a row's pages in ASCENDING BLOCK-ID order (build_page_table). The tail
-    page(s) carry the largest ids, so they come last and the last page is the live tail. Residency is content: the
-    slot that holds a block never reaches the arithmetic, only the block order does.
-  * masked rows (beyond last_len in the last page, beyond num_pages) are never LOADED: masked loads with other = 0,
-    so NaN / Inf in any unlisted page or unused row cannot reach the output (no 0 * NaN in P.V).
+    page(s) carry the largest ids, so they come last and the last page is the live tail.
+  * masked rows (beyond last_len in the last page, beyond num_pages) are never LOADED: masked loads with other = 0.
 
-NUMERICS (the GPU path). q / k / v / bias in bf16 (the engine's dtype); the two dots on the tensor cores with fp32
-accumulation (tl.dot, bf16 operands); online softmax in fp32 in base 2 (exp2, scale * log2(e), the FA2 form); P is
-cast to v's dtype before the P.V dot (as FA2 casts P to bf16); the output acc / l in fp32, stored in q's dtype. fp32
-operands are accepted ONLY for the CPU interpreter (on the GPU an fp32 tl.dot would run as TF32).
-bi_paged_decode_reference is the SAME tiled reduction in torch (per row and head, page by page, the same update
-formulas): the CPU twin. It is not bitwise equal to the GPU kernel (a CPU matmul is not a tensor-core dot); it is
-the executable definition of the order, and its invariance under batching is provable on CPU. Its two NEGATIVE
-CONTROL knobs (split_by_batch, tile_by_batch) make the order depend on the batch, as a split-KV kernel and a
-batch-keyed tile would; the tests must catch both.
+NUMERICS (the GPU path). q / k / v / bias in bf16; the two dots on the tensor cores with fp32 accumulation; online
+softmax in fp32 in base 2 (exp2, scale * log2(e)); P cast to v's dtype before P.V (as FA2 casts P to bf16); partials
+and the combine in fp32; one rounding to q's dtype at the end. fp32 operands are for the CPU interpreter only.
+bi_paged_decode_reference is the SAME split structure and update formulas in torch (the CPU twin): not bitwise the
+GPU kernel (a CPU matmul is not a tensor-core dot), but the executable definition of the order. Its NEGATIVE CONTROL
+knob batch_keyed_split chooses the pages per split from the batch size, as a heuristic split-KV kernel does; the tests
+must catch it.
 
 PRIOR ART (cited; no code copied, so no third-party header): the in-house T10 block-diagonal kernel (retroinfer-eval
-speckv/kernels/blockdiag_attend.py: one program per (group, row), fixed tile, no autotune, a torch twin with the same
-tiled online softmax, the G-Kinv gate); vLLM's unified attention under batch invariance (one tile size for decode and
-prefill rows, no split-KV: the design rule, PA-3 of the step-7 note). FA2-NOSA's paged mode is NOT usable: it needs
-page_block_size % 256 == 0 and indexes the bias by the logical column, not through the block table (note section 5).
+speckv/kernels/blockdiag_attend.py: fixed tiling, no autotune, a torch twin, the G-Kinv gate); vLLM's unified
+attention under batch invariance (one tile size for decode and prefill rows, no batch-keyed split: PA-3 of the step-7
+note); flash-decoding's split-KV with a log-sum-exp combine (here with a CONSTANT split size). FA2-NOSA's paged mode
+is NOT usable: page_block_size % 256 == 0 and a bias indexed by the logical column (note section 5).
 
-INTERFACE (fixed; the spec round's tick builds these per layer):
+INTERFACE (fixed since c866d7c; workspace is new and optional; pages_per_split is for the negative controls only and
+every production caller leaves it at PAGES_PER_SPLIT):
     bi_paged_decode(q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len,
-                    softmax_scale=None, out=None) -> (R, Hq, D)
+                    softmax_scale=None, out=None, workspace=None, pages_per_split=PAGES_PER_SPLIT) -> (R, Hq, D)
       q           (R, Hq, D)        bf16 (fp16; fp32 interpreter only), stride(-1) == 1
       k_cache     (N, S*64, Hkv, D) q's dtype, stride(-1) == 1          N storage entries (a request's slot store,
       v_cache     (N, S*64, Hkv, D)                                      its tail pages included as slots)
@@ -63,7 +78,9 @@ INTERFACE (fixed; the spec round's tick builds these per layer):
       num_pages   (R, Hkv)    int32  >= 1 (the tail page is always listed)
       last_len    (R,)        int32  1 .. 64 (last_len_of(position))
       softmax_scale  float, default D ** -0.5
-    No host sync (no device value is read on the host); validate_inputs reads values and is for tests / gates only.
+      workspace   optional (wacc fp32 (R', Hkv, S', BLOCK_H, D), wml fp32 (R', Hkv, S', 2, BLOCK_H)), R' >= R,
+                  S' >= ceil(P / PAGES_PER_SPLIT): a fixed buffer (CUDA-graph friendly)
+    No host sync; validate_inputs reads values and is for tests / gates only.
 """
 from __future__ import annotations
 
@@ -79,7 +96,7 @@ except ImportError:                                    # pragma: no cover - envi
     triton = tl = None
 
 PAGE = 64                    # rows per page = NOSA's 64-token block
-PAGES_PER_TILE = 1           # ONE tile size for every row: one page per online-softmax step (the law; not a knob)
+PAGES_PER_SPLIT = 8          # the FIXED split size (the law: a constant, never a function of the batch)
 NUM_WARPS = 4                # fixed launch constants (no autotune)
 NUM_STAGES = 2
 LOG2E = 1.4426950408889634
@@ -92,6 +109,11 @@ def block_h_for(group: int) -> int:
     while b < group:
         b *= 2
     return b
+
+
+def splits_for(table_width: int, pages_per_split: int = PAGES_PER_SPLIT) -> int:
+    """Split slots per (row, head) for a page table of width P: ceil(P / pages_per_split)."""
+    return -(-int(table_width) // int(pages_per_split))
 
 
 def last_len_of(position: torch.Tensor) -> torch.Tensor:
@@ -174,77 +196,119 @@ def _check_shapes(q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_page
 
 
 if triton is not None:
-    @triton.jit(do_not_specialize=["s_qr", "s_qh", "s_qd", "s_kn", "s_ks", "s_kh", "s_kd", "s_vn", "s_vs", "s_vh",
-                                   "s_vd", "s_bn", "s_bs", "s_bh", "s_or", "s_oh", "s_od", "s_ptr", "s_pth", "s_ptp",
-                                   "s_npr", "s_nph", "n_tiles"])
-    def _bi_paged_decode_kernel(
-            Q, K, V, BIAS, OUT, SEQ, PT, NP, LAST,
-            s_qr, s_qh, s_qd,
-            s_kn, s_ks, s_kh, s_kd,
-            s_vn, s_vs, s_vh, s_vd,
+    @triton.jit(do_not_specialize=["s_ptr", "s_pth", "s_wr", "s_wh", "s_ws", "s_mr", "s_mh", "s_ms"])
+    def _bi_split_kernel(
+            Q, K, V, BIAS, SEQ, PT, NP, LAST, WACC, WML,
+            s_qr, s_qh,
+            s_kn, s_ks, s_kh,
+            s_vn, s_vs, s_vh,
             s_bn, s_bs, s_bh,
-            s_or, s_oh, s_od,
-            s_ptr, s_pth, s_ptp,
-            s_npr, s_nph,
-            n_tiles, scale_log2,
-            GROUP: tl.constexpr, BLOCK_H: tl.constexpr, D: tl.constexpr, PAGE_C: tl.constexpr,
-            PPT: tl.constexpr, TILE: tl.constexpr):
+            s_ptr, s_pth,
+            s_npr,
+            s_wr, s_wh, s_ws, s_wg,
+            s_mr, s_mh, s_ms,
+            scale_log2,
+            GROUP: tl.constexpr, BLOCK_H: tl.constexpr, D: tl.constexpr, PAGE_C: tl.constexpr, PPS: tl.constexpr):
         r = tl.program_id(0)
         h = tl.program_id(1)
-        n = tl.load(SEQ + r).to(tl.int64)
-        npg = tl.load(NP + r * s_npr + h * s_nph)
-        last = tl.load(LAST + r)
+        sp = tl.program_id(2)
+        npg = tl.load(NP + r * s_npr + h)
+        p0 = sp * PPS
+        if p0 < npg:                                      # a split past the row's pages writes nothing
+            n = tl.load(SEQ + r).to(tl.int64)
+            last = tl.load(LAST + r)
+            offs_h = tl.arange(0, BLOCK_H)
+            offs_d = tl.arange(0, D)
+            offs_r = tl.arange(0, PAGE_C)
+            h_ok = offs_h < GROUP
+            q = tl.load(Q + r * s_qr + (h * GROUP + offs_h)[:, None] * s_qh + offs_d[None, :], mask=h_ok[:, None],
+                        other=0.0)
+            m_i = tl.full([BLOCK_H], float("-inf"), tl.float32)
+            l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
+            acc = tl.zeros([BLOCK_H, D], dtype=tl.float32)
+            k_base = K + n * s_kn + h * s_kh
+            v_base = V + n * s_vn + h * s_vh
+            b_base = BIAS + n * s_bn + h * s_bh
+            pt_base = PT + r * s_ptr + h * s_pth
+            for i in range(0, PPS):
+                p = p0 + i
+                p_ok = p < npg
+                slot = tl.load(pt_base + p, mask=p_ok, other=0).to(tl.int64)       # one scalar per page
+                ok = p_ok & ((p < npg - 1) | (offs_r < last))                     # the last page cut at the extent
+                rows = slot * PAGE_C + offs_r
+                k = tl.load(k_base + rows[:, None] * s_ks + offs_d[None, :], mask=ok[:, None], other=0.0)
+                b = tl.load(b_base + rows * s_bs, mask=ok, other=0.0).to(tl.float32)
+                sc = tl.dot(q, tl.trans(k)) + b[None, :]
+                sc = tl.where(ok[None, :], sc * scale_log2, float("-inf"))
+                m_new = tl.maximum(m_i, tl.max(sc, 1))
+                alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp2(m_i - m_new))
+                pr = tl.where(ok[None, :], tl.exp2(sc - m_new[:, None]), 0.0)
+                l_i = l_i * alpha + tl.sum(pr, 1)
+                v = tl.load(v_base + rows[:, None] * s_vs + offs_d[None, :], mask=ok[:, None], other=0.0)
+                acc = acc * alpha[:, None] + tl.dot(pr.to(v.dtype), v)
+                m_i = m_new
+            w_base = WACC + r * s_wr + h * s_wh + sp * s_ws
+            tl.store(w_base + offs_h[:, None] * s_wg + offs_d[None, :], acc)
+            ml_base = WML + r * s_mr + h * s_mh + sp * s_ms
+            tl.store(ml_base + offs_h, m_i)
+            tl.store(ml_base + BLOCK_H + offs_h, l_i)
+
+    @triton.jit(do_not_specialize=["s_wr", "s_wh", "s_ws", "s_mr", "s_mh", "s_ms", "n_split_slots"])
+    def _bi_combine_kernel(
+            WACC, WML, NP, OUT,
+            s_wr, s_wh, s_ws, s_wg,
+            s_mr, s_mh, s_ms,
+            s_npr,
+            s_or, s_oh,
+            n_split_slots,
+            GROUP: tl.constexpr, BLOCK_H: tl.constexpr, D: tl.constexpr, PPS: tl.constexpr):
+        r = tl.program_id(0)
+        h = tl.program_id(1)
+        npg = tl.load(NP + r * s_npr + h)
+        ns = (npg + PPS - 1) // PPS
         offs_h = tl.arange(0, BLOCK_H)
         offs_d = tl.arange(0, D)
-        offs_t = tl.arange(0, TILE)
         h_ok = offs_h < GROUP
-        qh = h * GROUP + offs_h
-        q = tl.load(Q + r * s_qr + qh[:, None] * s_qh + offs_d[None, :] * s_qd, mask=h_ok[:, None], other=0.0)
-        m_i = tl.full([BLOCK_H], float("-inf"), tl.float32)
-        l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
+        ml_row = WML + r * s_mr + h * s_mh
+        w_row = WACC + r * s_wr + h * s_wh
+        mx = tl.full([BLOCK_H], float("-inf"), tl.float32)
+        for k in range(0, n_split_slots):                 # pass 1: the max, splits in order
+            ok = k < ns
+            m_k = tl.load(ml_row + k * s_ms + offs_h, mask=ok & (offs_h >= 0), other=float("-inf"))
+            mx = tl.maximum(mx, m_k)
+        lsum = tl.zeros([BLOCK_H], dtype=tl.float32)
         acc = tl.zeros([BLOCK_H, D], dtype=tl.float32)
-        k_base = K + n * s_kn + h * s_kh
-        v_base = V + n * s_vn + h * s_vh
-        b_base = BIAS + n * s_bn + h * s_bh
-        pt_base = PT + r * s_ptr + h * s_pth
-        for t in range(0, n_tiles):
-            pidx = t * PPT + offs_t // PAGE_C                     # the page (list index) of each tile row
-            prow = offs_t % PAGE_C
-            p_ok = pidx < npg
-            slot = tl.load(pt_base + pidx * s_ptp, mask=p_ok, other=0)
-            ok = p_ok & ((pidx < npg - 1) | (prow < last))        # the last listed page is cut at the row's extent
-            row = slot.to(tl.int64) * PAGE_C + prow
-            k = tl.load(k_base + row[:, None] * s_ks + offs_d[None, :] * s_kd, mask=ok[:, None], other=0.0)
-            b = tl.load(b_base + row * s_bs, mask=ok, other=0.0).to(tl.float32)
-            s = tl.dot(q, tl.trans(k)) + b[None, :]
-            s = tl.where(ok[None, :], s * scale_log2, float("-inf"))
-            m_new = tl.maximum(m_i, tl.max(s, 1))
-            alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp2(m_i - m_new))
-            p = tl.where(ok[None, :], tl.exp2(s - m_new[:, None]), 0.0)
-            l_i = l_i * alpha + tl.sum(p, 1)
-            v = tl.load(v_base + row[:, None] * s_vs + offs_d[None, :] * s_vd, mask=ok[:, None], other=0.0)
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
-            m_i = m_new
-        denom = tl.where(l_i == 0.0, 1.0, l_i)
-        o = acc / denom[:, None]
-        tl.store(OUT + r * s_or + qh[:, None] * s_oh + offs_d[None, :] * s_od, o.to(OUT.dtype.element_ty),
-                 mask=h_ok[:, None])
+        for k in range(0, n_split_slots):                 # pass 2: the weighted sums, splits in order
+            ok = k < ns
+            m_k = tl.load(ml_row + k * s_ms + offs_h, mask=ok & (offs_h >= 0), other=float("-inf"))
+            l_k = tl.load(ml_row + k * s_ms + BLOCK_H + offs_h, mask=ok & (offs_h >= 0), other=0.0)
+            a_k = tl.load(w_row + k * s_ws + offs_h[:, None] * s_wg + offs_d[None, :],
+                          mask=ok & (offs_h[:, None] >= 0) & (offs_d[None, :] >= 0), other=0.0)
+            wgt = tl.where(ok & (offs_h >= 0), tl.exp2(m_k - mx), 0.0)
+            lsum = lsum + l_k * wgt
+            acc = acc + a_k * wgt[:, None]
+        o = acc / tl.where(lsum == 0.0, 1.0, lsum)[:, None]
+        tl.store(OUT + r * s_or + (h * GROUP + offs_h)[:, None] * s_oh + offs_d[None, :],
+                 o.to(OUT.dtype.element_ty), mask=h_ok[:, None])
 else:                                                  # pragma: no cover
-    _bi_paged_decode_kernel = None
+    _bi_split_kernel = _bi_combine_kernel = None
 
 
 def bi_paged_decode(q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len,
                     softmax_scale: Optional[float] = None, out: Optional[torch.Tensor] = None,
-                    pages_per_tile: int = PAGES_PER_TILE) -> torch.Tensor:
-    """The BI paged decode attention (module docstring). One launch, grid (R, Hkv), fixed constants. Shape / dtype
-    checks only (no device read). pages_per_tile exists ONLY for the GPU gate's negative control (a batch-dependent
-    tile must be caught); every production caller leaves it at PAGES_PER_TILE."""
-    if _bi_paged_decode_kernel is None:
+                    workspace=None, pages_per_split: int = PAGES_PER_SPLIT) -> torch.Tensor:
+    """The BI paged decode attention (module docstring): the split launch (R, Hkv, ceil(P / PPS)) and the combine
+    launch (R, Hkv), fixed constants. Shape / dtype checks only (no device read). pages_per_split exists ONLY for
+    the tests' and the gate's NEGATIVE control (a split size chosen by the batch must be caught); every production
+    caller leaves it at PAGES_PER_SPLIT."""
+    if _bi_split_kernel is None:
         raise RuntimeError("triton is not installed: use bi_paged_decode_reference")
     R, Hq, D, N, Hkv = _check_shapes(q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len)
-    if pages_per_tile not in (1, 2):
-        raise ValueError("pages_per_tile %r (1 = the law; 2 = the negative control)" % (pages_per_tile,))
+    pps = int(pages_per_split)
+    if pps < 1:
+        raise ValueError("pages_per_split %r" % (pages_per_split,))
     group = Hq // Hkv
+    bh = block_h_for(group)
     scale = float(softmax_scale) if softmax_scale is not None else 1.0 / math.sqrt(D)
     if out is None:
         out = torch.empty_like(q)
@@ -252,106 +316,115 @@ def bi_paged_decode(q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pa
         raise ValueError("out must be q's shape and dtype with a unit last stride")
     if R == 0:
         return out
-    P = page_table.shape[2]
-    n_tiles = (P + pages_per_tile - 1) // pages_per_tile
-    _bi_paged_decode_kernel[(R, Hkv)](
-        q, k_cache, v_cache, bias_cache, out, seq_idx, page_table, num_pages, last_len,
-        q.stride(0), q.stride(1), q.stride(2),
-        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
-        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
+    if k_cache.stride(-1) != 1 or v_cache.stride(-1) != 1 or page_table.stride(-1) != 1 or num_pages.stride(-1) != 1:
+        raise ValueError("unit last strides are assumed by the kernels")
+    S = splits_for(page_table.shape[2], pps)
+    if workspace is None:
+        wacc = torch.empty((R, Hkv, S, bh, D), dtype=torch.float32, device=q.device)
+        wml = torch.empty((R, Hkv, S, 2, bh), dtype=torch.float32, device=q.device)
+    else:
+        wacc, wml = workspace
+        if wacc.dtype != torch.float32 or wml.dtype != torch.float32 or wacc.dim() != 5 or wml.dim() != 5 \
+                or wacc.shape[0] < R or wacc.shape[1] != Hkv or wacc.shape[2] < S or tuple(wacc.shape[3:]) != (bh, D) \
+                or wml.shape[0] < R or wml.shape[1] != Hkv or wml.shape[2] < S or tuple(wml.shape[3:]) != (2, bh) \
+                or not (wacc.is_contiguous() and wml.is_contiguous()):
+            raise ValueError("workspace must be contiguous fp32 wacc (>= R, Hkv, >= S, %d, %d) and wml (>= R, Hkv, "
+                             ">= S, 2, %d)" % (bh, D, bh))
+    _bi_split_kernel[(R, Hkv, S)](
+        q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len, wacc, wml,
+        q.stride(0), q.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
         bias_cache.stride(0), bias_cache.stride(1), bias_cache.stride(2),
-        out.stride(0), out.stride(1), out.stride(2),
-        page_table.stride(0), page_table.stride(1), page_table.stride(2),
-        num_pages.stride(0), num_pages.stride(1),
-        n_tiles, scale * LOG2E,
-        GROUP=group, BLOCK_H=block_h_for(group), D=D, PAGE_C=PAGE, PPT=pages_per_tile, TILE=PAGE * pages_per_tile,
-        num_warps=NUM_WARPS, num_stages=NUM_STAGES)
+        page_table.stride(0), page_table.stride(1),
+        num_pages.stride(0),
+        wacc.stride(0), wacc.stride(1), wacc.stride(2), wacc.stride(3),
+        wml.stride(0), wml.stride(1), wml.stride(2),
+        scale * LOG2E,
+        GROUP=group, BLOCK_H=bh, D=D, PAGE_C=PAGE, PPS=pps, num_warps=NUM_WARPS, num_stages=NUM_STAGES)
+    _bi_combine_kernel[(R, Hkv)](
+        wacc, wml, num_pages, out,
+        wacc.stride(0), wacc.stride(1), wacc.stride(2), wacc.stride(3),
+        wml.stride(0), wml.stride(1), wml.stride(2),
+        num_pages.stride(0),
+        out.stride(0), out.stride(1),
+        S,
+        GROUP=group, BLOCK_H=bh, D=D, PPS=pps, num_warps=NUM_WARPS)
     return out
 
 
 def bi_paged_decode_reference(q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len,
-                              softmax_scale: Optional[float] = None, pages_per_tile: int = PAGES_PER_TILE,
-                              split_by_batch: bool = False, tile_by_batch: bool = False) -> torch.Tensor:
-    """The CPU TWIN: the kernel's tiled online softmax in torch, per (row, KV head), tile by tile in list order, with
-    the kernel's formulas (fp32 scores = q.k + bias, scaled by scale*log2(e); exp2; alpha; l; acc += P (cast to the
-    value dtype) . V in fp32; out = acc / l). A row's result is computed from its own q row, page list, num_pages,
-    last_len and the rows of its own pages only, so it is batch-invariant by construction. Host loops: tests only.
+                              softmax_scale: Optional[float] = None, pages_per_split: int = PAGES_PER_SPLIT,
+                              batch_keyed_split: bool = False) -> torch.Tensor:
+    """The CPU TWIN: the kernels' order in torch, per (row, KV head): split k = list positions [k*PPS, (k+1)*PPS),
+    page by page inside a split (fp32 scores = q.k + bias, scaled by scale*log2(e); exp2; alpha; l; acc += P (cast to
+    the value dtype) . V in fp32), then the combine over the row's own splits in order 0, 1, ... (the max first, then
+    l and acc weighted by 2**(m_k - M)), out = acc / l. A row's result is computed from its own q row, page list,
+    num_pages, last_len and the rows of its own pages only, so it is batch-invariant by construction. Host loops:
+    tests only.
 
-    NEGATIVE CONTROLS (they break the law on purpose; the tests must catch both):
-      split_by_batch  split-KV with num_splits = 1 + (max num_pages over the BATCH) // 4, each split its own online
-                      softmax, then the log-sum-exp combine: a row's partition depends on the longest row it is
-                      batched with (what a heuristic split-KV kernel does);
-      tile_by_batch   pages_per_tile = 1 for a batch of <= 4 rows, else 2: a batch-keyed tile size."""
+    NEGATIVE CONTROL: batch_keyed_split chooses the pages per split from the BATCH SIZE (8 pages for a batch of <= 4
+    rows, else 4), as a heuristic split-KV kernel does; a row's partition then depends on its neighbours."""
     R, Hq, D, N, Hkv = _check_shapes(q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len)
     group = Hq // Hkv
     scale_log2 = (float(softmax_scale) if softmax_scale is not None else 1.0 / math.sqrt(D)) * LOG2E
-    ppt = (1 if R <= 4 else 2) if tile_by_batch else int(pages_per_tile)
+    pps = (8 if R <= 4 else 4) if batch_keyed_split else int(pages_per_split)
     f32 = torch.float32
+    ninf = float("-inf")
     np_l = num_pages.to(torch.int64).cpu().tolist()
     ll_l = last_len.to(torch.int64).cpu().tolist()
     si_l = seq_idx.to(torch.int64).cpu().tolist()
     pt_l = page_table.to(torch.int64).cpu().tolist()
-    n_splits = 1 + max(max(row) for row in np_l) // 4 if split_by_batch else 1
     out = torch.empty_like(q)
     for r in range(R):
         n = si_l[r]
+        last = ll_l[r]
         for h in range(Hkv):
-            npg, last = np_l[r][h], ll_l[r]
+            npg = np_l[r][h]
             pages = pt_l[r][h][:npg]
             qf = q[r, h * group:(h + 1) * group].to(f32)                       # (G, D)
-            # the list positions of every tile; with a split, contiguous chunks of the list
-            chunks = [list(range(npg))]
-            if n_splits > 1:
-                per = -(-npg // n_splits)
-                chunks = [list(range(i, min(i + per, npg))) for i in range(0, npg, per)]
             parts = []
-            for ch in chunks:
-                m = torch.full((group,), float("-inf"), dtype=f32)
+            for p0 in range(0, npg, pps):
+                m = torch.full((group,), ninf, dtype=f32)
                 l = torch.zeros(group, dtype=f32)
                 acc = torch.zeros(group, D, dtype=f32)
-                for t0 in range(0, len(ch), ppt):
-                    tile = ch[t0:t0 + ppt]
-                    ks, vs, bs, oks = [], [], [], []
-                    for i in tile:
-                        s0 = pages[i] * PAGE
-                        rows = PAGE if i < npg - 1 else last
-                        ok = torch.arange(PAGE) < rows
-                        kp = k_cache[n, s0:s0 + PAGE, h].to(f32)
-                        vp = v_cache[n, s0:s0 + PAGE, h]
-                        bp = bias_cache[n, s0:s0 + PAGE, h].to(f32)
-                        ks.append(torch.where(ok.unsqueeze(-1), kp, torch.zeros_like(kp)))
-                        vs.append(torch.where(ok.unsqueeze(-1), vp, torch.zeros_like(vp)))
-                        bs.append(torch.where(ok, bp, torch.zeros_like(bp)))
-                        oks.append(ok)
-                    kt, vt, bt, okt = torch.cat(ks), torch.cat(vs), torch.cat(bs), torch.cat(oks)
-                    s = qf @ kt.t() + bt.unsqueeze(0)                          # (G, T)
-                    s = torch.where(okt.unsqueeze(0), s * scale_log2, torch.full_like(s, float("-inf")))
+                for p in range(p0, min(p0 + pps, npg)):
+                    s0 = pages[p] * PAGE
+                    rows = PAGE if p < npg - 1 else last
+                    ok = torch.arange(PAGE) < rows
+                    kp = k_cache[n, s0:s0 + PAGE, h].to(f32)
+                    vp = v_cache[n, s0:s0 + PAGE, h]
+                    bp = bias_cache[n, s0:s0 + PAGE, h].to(f32)
+                    kp = torch.where(ok.unsqueeze(-1), kp, torch.zeros_like(kp))
+                    vp = torch.where(ok.unsqueeze(-1), vp, torch.zeros_like(vp))
+                    bp = torch.where(ok, bp, torch.zeros_like(bp))
+                    s = qf @ kp.t() + bp.unsqueeze(0)                          # (G, 64)
+                    s = torch.where(ok.unsqueeze(0), s * scale_log2, torch.full_like(s, ninf))
                     m_new = torch.maximum(m, s.max(dim=1).values)
-                    alpha = torch.where(m_new == float("-inf"), torch.ones_like(m_new), torch.exp2(m - m_new))
-                    p = torch.where(okt.unsqueeze(0), torch.exp2(s - m_new.unsqueeze(1)), torch.zeros_like(s))
-                    l = l * alpha + p.sum(dim=1)
-                    acc = acc * alpha.unsqueeze(1) + p.to(vt.dtype).to(f32) @ vt.to(f32)
+                    alpha = torch.where(m_new == ninf, torch.ones_like(m_new), torch.exp2(m - m_new))
+                    pr = torch.where(ok.unsqueeze(0), torch.exp2(s - m_new.unsqueeze(1)), torch.zeros_like(s))
+                    l = l * alpha + pr.sum(dim=1)
+                    acc = acc * alpha.unsqueeze(1) + pr.to(vp.dtype).to(f32) @ vp.to(f32)
                     m = m_new
                 parts.append((m, l, acc))
-            if len(parts) == 1:
-                m, l, acc = parts[0]
-            else:                                                              # the split-KV combine (negative control)
-                mx = torch.stack([p_[0] for p_ in parts]).max(dim=0).values
-                l = torch.zeros(group, dtype=f32)
-                acc = torch.zeros(group, D, dtype=f32)
-                for m_c, l_c, a_c in parts:
-                    w = torch.exp2(m_c - mx)
-                    l = l + l_c * w
-                    acc = acc + a_c * w.unsqueeze(1)
-            denom = torch.where(l == 0, torch.ones_like(l), l)
-            out[r, h * group:(h + 1) * group] = (acc / denom.unsqueeze(1)).to(q.dtype)
+            mx = torch.full((group,), ninf, dtype=f32)
+            for m_k, _, _ in parts:                                            # the combine: max, in order
+                mx = torch.maximum(mx, m_k)
+            lsum = torch.zeros(group, dtype=f32)
+            tot = torch.zeros(group, D, dtype=f32)
+            for m_k, l_k, a_k in parts:                                        # then the sums, in order
+                wgt = torch.exp2(m_k - mx)
+                lsum = lsum + l_k * wgt
+                tot = tot + a_k * wgt.unsqueeze(1)
+            denom = torch.where(lsum == 0, torch.ones_like(lsum), lsum)
+            out[r, h * group:(h + 1) * group] = (tot / denom.unsqueeze(1)).to(q.dtype)
     return out
 
 
 def attention_oracle(q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len,
                      softmax_scale: Optional[float] = None) -> torch.Tensor:
     """The SEMANTICS in float64, one softmax over the concatenated listed rows: softmax((q.k + bias) * scale) . v.
-    Agrees with the kernel and the twin to rounding (not bitwise); the tests' and the gate's correctness check."""
+    Agrees with the kernels and the twin to rounding (not bitwise); the tests' and the gate's correctness check."""
     R, Hq, D, N, Hkv = _check_shapes(q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len)
     group = Hq // Hkv
     scale = float(softmax_scale) if softmax_scale is not None else 1.0 / math.sqrt(D)

@@ -121,7 +121,8 @@ def test_build_page_table_is_canonical_and_independent_of_input_order_and_slots(
 def test_last_len_and_query_head_tile():
     assert bi.last_len_of(torch.tensor([16128, 16191, 16192, 63, 64])).tolist() == [1, 64, 1, 64, 1]
     assert [bi.block_h_for(g) for g in (1, 4, 16, 17, 32)] == [16, 16, 16, 32, 32]
-    assert bi.PAGES_PER_TILE == 1 and bi.PAGE == 64
+    assert bi.PAGES_PER_SPLIT == 8 and bi.PAGE == 64
+    assert [bi.splits_for(p) for p in (1, 8, 9, 64, 65, 66)] == [1, 1, 2, 8, 9, 9]
 
 
 def test_validate_inputs_refuses_bad_tables():
@@ -143,9 +144,11 @@ def test_validate_inputs_refuses_bad_tables():
 # ---------------------------------------------------------------------------
 # (2) the twin: semantics, bias, extents, NaN poison
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("P", [8, 20])
 @pytest.mark.parametrize("dtype,atol", [(torch.float32, 2e-5), (torch.bfloat16, 3e-2)])
-def test_twin_equals_the_float64_semantics(dtype, atol):
-    c = make_case(2, dtype=dtype)
+def test_twin_equals_the_float64_semantics(dtype, atol, P):
+    """P = 20: rows with up to three splits (the combine's semantics)."""
+    c = make_case(2, dtype=dtype, S=max(12, P + 4), P=P)
     out = run(bi.bi_paged_decode_reference, c)
     ref = run(bi.attention_oracle, c)
     assert out.dtype == dtype
@@ -327,21 +330,22 @@ def _invariance_failures(fn, c, **kw):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_twin_row_is_invariant_under_any_batch_composition(dtype):
+    """Up to 20 pages per row: up to three splits of 8, so the combine is exercised."""
     for seed in (6, 7):
-        c = make_case(seed, dtype=dtype)
+        c = make_case(seed, dtype=dtype, S=24, P=20)
+        assert int(c["num_pages"].max()) > bi.PAGES_PER_SPLIT, "precondition: some row has several splits"
         assert not _invariance_failures(bi.bi_paged_decode_reference, c)
 
 
-def test_negative_split_kv_by_the_batchs_longest_row_is_caught():
-    c = make_case(8, R=10, P=12)
-    assert int(c["num_pages"].max()) >= 8, "precondition: a long row exists"
-    bad = _invariance_failures(bi.bi_paged_decode_reference, c, split_by_batch=True)
-    assert any(kind == "alone" for kind, _ in bad), bad
-
-
-def test_negative_batch_keyed_tile_is_caught():
-    c = make_case(9, R=10, P=8)
-    bad = _invariance_failures(bi.bi_paged_decode_reference, c, tile_by_batch=True)
+def test_negative_batch_keyed_split_is_caught():
+    """NEGATIVE CONTROL: the pages per split chosen by the batch size (8 alone, 4 in a batch of 10). PRECONDITION
+    first: on these rows 8 and 4 pages per split give different bits (rows with more than 4 pages), else the control
+    and the invariance checks on this data would be blind (the lesson of the GEMM controls, CPU job 2190757)."""
+    c = make_case(8, R=10, S=24, P=20)
+    pre = [r for r in range(10) if differs(run(bi.bi_paged_decode_reference, c, pages_per_split=8)[r],
+                                           run(bi.bi_paged_decode_reference, c, pages_per_split=4)[r])]
+    assert pre, "precondition: the split size reaches the bits of some row"
+    bad = _invariance_failures(bi.bi_paged_decode_reference, c, batch_keyed_split=True)
     assert any(kind == "alone" for kind, _ in bad), bad
 
 
@@ -386,8 +390,8 @@ bi = load(sys.argv[1], "bi_interp")
 t = load(sys.argv[2], "bi_tests")                # the test module: its case builders (it imports no triton itself
                                                  # beyond the module under test, already loaded under the flag)
 fails = []
-for seed in (20, 21):
-    c = t.make_case(seed, R=8, N=3, S=10, P=6)
+for seed, S, P in ((20, 10, 6), (21, 24, 20)):           # one split per row; up to three splits (the combine)
+    c = t.make_case(seed, R=8, N=3, S=S, P=P)
     k_out = t.run(bi.bi_paged_decode, c)
     ref = t.run(bi.attention_oracle, c)
     twin = t.run(bi.bi_paged_decode_reference, c)
@@ -404,16 +408,26 @@ for seed in (20, 21):
     if not (bool(torch.isfinite(dirty).all()) and torch.equal(dirty, k_out)):
         fails.append(("nan-poison", seed))
 # the cut of the last page on the KERNEL: per row alone and in the batch (exact read sets), random extents
-c = t.make_case(23, R=8, N=4, S=16, P=6)
-bad = t._extent_cut_failures(bi.bi_paged_decode, c)
-if bad:
-    fails.append(("extent-cut", bad[:4]))
-# negative control on the KERNEL: a batch-keyed tile (2 pages per tile for the batch, 1 alone) must be caught
-c = t.make_case(22, R=8, N=3, S=10, P=6)
-full2 = t.run(bi.bi_paged_decode, c, pages_per_tile=2)
-caught = any(not torch.equal(t.run(bi.bi_paged_decode, c, rows=[r])[0], full2[r]) for r in range(8))
-if not caught:
-    fails.append(("negative-tile-not-caught",))
+for seed, N, S, P in ((23, 4, 16, 6), (24, 8, 30, 20)):
+    c = t.make_case(seed, R=8, N=N, S=S, P=P)
+    if N == 8:          # rows 0-6 on entries 0-6, row 7 ALONE on entry 7: an untouched row by construction (the
+        si = c["seq_idx"] % 7                           # batch check refuses a vacuous case)
+        si[7] = 7
+        c["seq_idx"] = si.to(torch.int32).contiguous()
+    bad = t._extent_cut_failures(bi.bi_paged_decode, c)
+    if bad:
+        fails.append(("extent-cut", seed, bad[:4]))
+# NEGATIVE CONTROL on the KERNEL: a split size chosen by the batch (8 pages alone, 4 in the batch) must be caught;
+# its PRECONDITION first: 8 and 4 pages per split give different bits on these rows
+c = t.make_case(22, R=8, N=3, S=24, P=20)
+b8 = t.run(bi.bi_paged_decode, c, pages_per_split=8)
+b4 = t.run(bi.bi_paged_decode, c, pages_per_split=4)
+if torch.equal(b8, b4):
+    fails.append(("negative-precondition-unmet: 8 and 4 pages per split give the same bits",))
+else:
+    caught = any(not torch.equal(t.run(bi.bi_paged_decode, c, rows=[r], pages_per_split=8)[0], b4[r]) for r in range(8))
+    if not caught:
+        fails.append(("negative-split-not-caught",))
 if fails:
     print("FAILS", fails)
     sys.exit(1)
@@ -424,7 +438,8 @@ print("BIATTN-INTERP OK")
 def test_kernel_under_the_triton_interpreter():
     """The Triton kernel itself on CPU float32 (TRITON_INTERPRET=1, a fresh process): equal to the float64 semantics
     and to the twin within rounding; row-invariant (alone, permuted, new neighbours, a request's own rows, a wider
-    table: torch.equal); NaN poison never read; the batch-keyed tile (pages_per_tile=2 for the batch) is caught."""
+    table: torch.equal), with one split per row and with up to three; NaN poison never read; the extent cut; the
+    batch-keyed split size (8 pages alone, 4 in the batch) is caught after its precondition."""
     if importlib.util.find_spec("triton") is None:
         pytest.skip("triton is not installed")
     env = dict(os.environ, TRITON_INTERPRET="1", PYTHONDONTWRITEBYTECODE="1")
@@ -442,20 +457,24 @@ def test_kernel_source_keeps_the_law():
     tree = ast.parse(src)
     assert "triton.autotune" not in src and "triton.heuristics" not in src
     launch = ast.get_source_segment(src, next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "bi_paged_decode"))
-    assert "_bi_paged_decode_kernel[(R, Hkv)](" in launch
+    assert "_bi_split_kernel[(R, Hkv, S)](" in launch and "_bi_combine_kernel[(R, Hkv)](" in launch
+    assert "S = splits_for(page_table.shape[2], pps)" in launch           # split slots from the table, not the batch
     assert "num_warps=NUM_WARPS, num_stages=NUM_STAGES" in launch
     code = "\n".join(l.split("#")[0] for l in launch.split('"""')[2].splitlines())
     for bad in (".item(", ".tolist(", ".cpu(", "bool(", "synchronize", "num_splits"):
         assert bad not in code, bad
-    assert "PAGES_PER_TILE = 1 " in src and "NUM_WARPS = 4 " in src and "NUM_STAGES = 2" in src
-    assert '"n_tiles"])' in src and '"s_ptp"' in src
+    assert "PAGES_PER_SPLIT = 8 " in src and "NUM_WARPS = 4 " in src and "NUM_STAGES = 2" in src
+    assert '"n_split_slots"])' in src and '"s_ptr", "s_pth"' in src
+    for unit in ('"s_kd"', '"s_vd"', '"s_qd"'):                         # v1's slowdown: unit strides unspecialized
+        assert unit not in src
+    assert "REFUTED" in src and "8.82 / 13.42 / 21.71" in src and "8.95 / 13.25 / 22.13" in src
 
 
 def test_gate_driver_shape():
     src = GATE.read_text()
     assert src.rstrip().endswith('if __name__ == "__main__":\n    sys.exit(main())')
     assert 'print("BIATTN_GATE_DONE failed=%d" % nfail, flush=True)' in src
-    assert "pages_per_tile=2" in src and "flash_attn_with_kvcache" in src
+    assert "pages_per_split=" in src and "flash_attn_with_kvcache" in src and "PRED_V1" in src
 
 
 def test_step_script_reads_the_holder_uuid_and_keeps_its_pins():
