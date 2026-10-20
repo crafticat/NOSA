@@ -73,8 +73,8 @@ def activity(seed=6):
 
 def poison_window(cache, seed, request=None):
     """Seeded noise in the attention-window rows 0 .. (topk - 1) * 64 - 1 (slots 0 .. 62) of every engine: on the
-    GPU, build_ragged leaves them as torch.empty memory until a request's first active step loads them (the CPU build
-    above zeroes them). request None: every request; else only that one."""
+    GPU, build_ragged leaves them as torch.empty memory until a request's first active step loads them (the CPU build,
+    tests/r2_fake_world.py, zeroes them). request None: every request; else only that one."""
     g = torch.Generator().manual_seed(seed)
     for lay in cache.layers:
         e = lay.cache_engine

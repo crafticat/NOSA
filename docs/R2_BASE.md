@@ -1,8 +1,10 @@
 # r2base: the captured R2 decode step against the shipped decode (throughput cell)
 
-Branch `feature/nosi-r2-base` (from `feature/nosi-r2-m2-capture` 09e683a, the commit the
-capture gate pins). Status: SOURCE ONLY. Nothing here comes from a GPU run. It runs AFTER
-the capture gate passes.
+Branch `feature/nosi-r2-base`, rebased onto `feature/nosi-r2-m2-capture` e5fc694 (the
+capture gate's fix for the undefined rows of inactive requests; first built on 09e683a).
+Status: SOURCE ONLY. Nothing here comes from a GPU run. It runs AFTER the capture gate
+passes. Every request is active at every step here, so the undefined rows of
+docs/R2_CAPTURE_AUDIT.md do not occur in this cell.
 
 Code: `benchmarks/Efficiency/r2_base_cell.py`; step `benchmarks/Efficiency/r2_base_step.sh`;
 CPU tests `tests/test_r2_base.py` (the fake world moved to `tests/r2_fake_world.py`, shared
