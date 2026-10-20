@@ -1,7 +1,10 @@
 # R2 step 7: the speculative round on the R2 path (DESIGN NOTE and CPU test plan)
 
 Branch `feature/nosi-r2-m2-spec` (worktree `/mnt/beegfs/ojerbi/nosi-r2-m2-spec`, from `54ea1d6`).
-Status: DESIGN. This note contains no engine code and no GPU result.
+Status: DESIGN, confirmed by the lead at f1f9f56. The commit after f1f9f56 adds the portable core
+(`nosi/nosi/r2_spec_core.py`), the CPU tests S1-S14 and the GPU microgate step B1-B5 (source only, no GPU result).
+The BI paged attention is piece 3 (`/mnt/beegfs/ojerbi/nosi-r2-m2-biattn`, 4c1243f, the verify agent). The BI GEMM
+(G-a) is built in `/mnt/beegfs/ojerbi/nosi-r2-m2-bigemm` (the verify agent). This branch builds G-b only.
 Prior-art gate: CLEARED by the lead (retroinfer-eval 3650572). The rows are in
 `/mnt/beegfs/ojerbi/kstep-cpu-runs/paper-notes/r2-prior-art-rows.md`; this note cites them as [PA-n] (row n) and
 [PA-b n] / [PA-c] (sections b, c).
@@ -72,6 +75,22 @@ Requirement R-PERF, per tick:
 
 The 4.5 harness supplies the GEMM / attention split per row count. At b64 its private group measured 74.84 ms
 separate vs 57.66 ms joint (weight sharing alone).
+
+The 8 % is the DESIGN TARGET (lead, 2026-10-20). SG5 measures it (section 7.3).
+
+Taint of the pilot numbers (lead, 2026-10-20):
+
+- The pilot's `spec_loop._assign` gave a non-contiguous issue map to Triton gathers that read `load_ids` flat. The
+  fix is nosi-r2-verify 333eb41. The g2 / p1 / 4.1-spec pilot numbers are tainted.
+- If the numbers above (139 / 167 ms, 229-338 ms, 272-302 tok/s) come from those runs, they are tainted too. So SG5
+  measures T_shipped and the draft-only tick again in its own run and states the budget from them.
+- The R2 path does not use `spec_loop._assign`. Static check on this branch (2026-10-20):
+  - `git ls-files | grep spec_loop` is empty: the tree has no spec_loop module.
+  - `grep -n "_assign\|spec_loop"` over `nosi/nosi/r2_*.py`, `benchmarks/Efficiency/r2_*` and
+    `benchmarks/Efficiency/tests_cpu/test_r2_*` finds one line only: `r2_kernels_step.sh:5`, a comment that names the
+    step-script pattern `spec_loop_r2_step.sh`.
+  - The R2 modules import only `r2_positional_twin`, `r2_decode_body`, `stage1_seqused`, `max_pooling_per_request`,
+    `nosa_llama` and `cache_engine` from the package. None of these files contains `spec_loop` or `_assign`.
 
 ## 2. Per-request state and the round state machine
 
@@ -165,22 +184,29 @@ Two candidates. The step measures both against cuBLAS and keeps the cheaper one 
 - (G-a) a batch-invariant Triton matmul. SGLang's `batch_invariant_ops` (adapted from thinking-machines-lab;
   Apache-2.0; keep the attribution header if adapted) [PA-3]. It has fixed tiles and no split-K, so the per-row
   result is independent of M.
-- (G-b) cuBLAS at a FIXED padded M_fix per run: every flattened call pads its rows to M_fix with zero rows.
+  - OWNER: the verify agent, `/mnt/beegfs/ojerbi/nosi-r2-m2-bigemm`, with its own GPU gate (lead, 2026-10-20). This
+    branch builds no BI matmul. B3 loads that module BY PATH when its pins are set in `r2_bi_step.sh` (empty now).
+- (G-b) cuBLAS at a FIXED padded M_fix per run: `r2_spec_core.PaddedLinear(m_fix)` (this branch).
+  - Every call copies its live rows into rows 0 .. M-1 of a persistent (M_fix, K) buffer and runs `F.linear` on the
+    whole buffer. The rows past M are NOT cleared: B3 proves that their content does not reach a live row.
   - The kernel choice then never changes in a run.
   - A GEMM has no cross-row reduction, so a row's result does not depend on the values of the other rows.
-  - The float order is a function of M_fix, a run constant, not of the batch. The serial reference pads to the same
-    M_fix.
-  - Cost: GEMM work for M_fix rows on every tick.
+  - The float order is a function of M_fix, a run constant, not of the batch. The serial reference uses the same
+    PaddedLinear (one live row).
+  - Cost: GEMM work for M_fix rows on every tick, plus the copy into the buffer.
 
 Microgate B3 (GPU):
 
-- (i) a row's output is `torch.equal` whatever the other rows hold;
-- (ii) the same holds at every row index;
-- (iii) for G-a, also at every M.
+- (i) a row's output is `torch.equal` whatever the other rows hold (G-b: random rows vs zero rows past M);
+- (ii) the same holds at every row index (G-b: the live rows in a shuffled order);
+- (iii) for G-a, also at every M;
+- natural cuBLAS: REPORT the number of rows that differ between M and M = 4B (the premise of this section).
 
-Cost table: wqkv, wo, gate_up, down and lm_head at the tick's row counts (B in {16, 64}, 1 + U in {1, 2, 4}). The
-columns are cuBLAS at the natural M, G-a and G-b. This is the coordinator's "cost of the M-invariant GEMM path
-against cuBLAS".
+Cost table (lead, 2026-10-20): wqkv, wo, gate_up and down of NOSA-8B at B 64 and B 128, M in {B, 2B, 3B, 4B}
+(the tick has B draft rows plus 0 .. 3B verify rows, U = 3), M_fix = 4B. The columns are cuBLAS at the natural M,
+G-b (`padded_ms`, the copy included) and G-a (`bi_ms`, when its pins are set), with the ratios against the natural
+M. This is the coordinator's "cost of the M-invariant GEMM path against cuBLAS". The registered predictions are in
+the commit message of this step.
 
 ### 3.4 The BI paged attention
 
@@ -198,8 +224,36 @@ against cuBLAS".
   - the in-house T10 `blockdiag_attend.py` (per-request fixed tiling, G-Kinv) [PA-3].
 - Microgate B4: a row's output is `torch.equal` when it is computed alone, in a batch of 64 rows, and next to rows of
   its own request at other positions.
-- Cost against FA2-NOSA split 4 at B = 64 and B = 16. No split-KV costs parallelism at small B; this is measured, not
-  assumed.
+- Cost against FA2-NOSA split 4 at B = 64 and B = 128 (the lead's sizes). No split-KV costs parallelism at small B;
+  this is measured, not assumed. B4 also measures the SG5 attention term (section 7.3).
+
+The kernel is PIECE 3 (the verify agent; `/mnt/beegfs/ojerbi/nosi-r2-m2-biattn` 4c1243f, CPU 24/24 accepted;
+`nosi/nosi/bi_paged_attention.py`, blob 7477ddd):
+
+- `bi_paged_decode(q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len, softmax_scale=None,
+  out=None) -> (R, Hq, D)`.
+  - q (R, Hq, D) bf16, one row per draft or verify row of the tick.
+  - k_cache / v_cache (N, S*64, Hkv, D); bias_cache (N, S*64, Hkv), the token's CIS.
+  - seq_idx (R,) int32, the storage entry of each row.
+  - page_table (R, Hkv, P) int32, slots in CANONICAL order (ascending block id), from `build_page_table`.
+  - num_pages (R, Hkv) int32 >= 1 (the tail page is always listed); last_len (R,) int32 = position % 64 + 1.
+- Two tail pages: for a position in block T+1, the list has T's page (read whole), then T+1's page (cut at
+  last_len). `r2_spec_core.page_lists` gives the same list when T is in the row's selection (NOSA's local window
+  always selects it).
+- One 64-row page per online-softmax step, no split-KV, fixed num_warps 4 / num_stages 2, no autotune, P constant
+  per run.
+
+THE BIAS SEMANTICS ARE THE SAME (lead's question, 2026-10-20). The reference `r2_spec_core.paged_attention_reference`
+computes `s = (q k^T + bias) * scale`, with the bias added before the scale, as FA2-NOSA does
+(`flash_fwd_kernel.h:950-985`) and as piece 3 does. Two executable checks:
+
+- CPU S7b: the reference against piece 3's torch twin and its float64 oracle, within 1e-5. The last_len values are
+  1, 2, 9, 37, 63 and 64, with tail pairs and one-page rows. Negative controls: the bias-after-scale semantics and a
+  cut one row late both differ by far more than the tolerance.
+- GPU B4: piece 3's kernel against the reference, max |d| <= 0.02 (MUST).
+
+`r2_spec_core.paged_attention_reference` stays as the INDEPENDENT twin of the contract. This branch builds no
+second kernel. B4 loads piece 3 BY PATH: the step script copies the pinned blob into the step record.
 
 ### 3.5 The declared reference and the claim
 
@@ -208,6 +262,9 @@ against cuBLAS".
   - Its extent is the row's own position + 1, so F4 is NOT reproduced: the BI reference is a new declared target.
   - Its relation to the shipped decode is a REPORT, gate G0-BI (section 7.2): tolerance, argmax agreement, and every
     greedy difference classified by the shipped top-2 margin.
+  - The exactness claim is accepted against the BI reference (lead, 2026-10-20). Because the BI reference is not the
+    shipped decode, G0-BI must also give a QUALITY number against the shipped decode, so that the paper can say what
+    BI costs in FIDELITY, not only in time (section 7.2).
 - CLAIM (the gate's exact claim): for every request and every verified position p, in any tick composition (any
   number of positions per request, other requests, draft rows of the same request), the flattened verify row's
   logits are `torch.equal` to the BI serial decode row of that request at p.
@@ -299,8 +356,9 @@ against cuBLAS".
 
 ### 7.1 CPU test plan
 
-Files: `tests/test_r2_spec_round.py`, `benchmarks/Efficiency/tests_cpu/test_r2_spec_round.py`. The kernels are torch
-stand-ins: a BI paged attention reference in float64, stand-in gathers.
+File: `benchmarks/Efficiency/tests_cpu/test_r2_spec_round.py` (S1-S14), on `nosi/nosi/r2_spec_core.py`. No CUDA and
+no Triton launch. The attention is the torch reference (float32, and float64 inputs where stated). Piece 3 has its
+own CPU tests (`test_bi_paged_attention.py` in its branch); S7b checks that the two agree on the contract.
 
 | Id | Test | Negative control |
 |---|---|---|
@@ -316,23 +374,59 @@ stand-ins: a BI paged attention reference in float64, stand-in gathers.
 | S10 | draft bank sync and the F5 rebuild: the draft chain equals a chain recomputed from the exact rows | a draft bank that keeps its old rows |
 | S11 | end to end on a CPU stand-in model (torch R2 path with the BI ops, B = 4 ragged), teacher-forced and free-running: every flattened verify row `torch.equal` to the BI serial decode row; committed tokens and counters equal the bookkeeping oracle | GEMM rows grouped at a varying M with an M-dependent rounding stand-in |
 | S12 | slot store: request / arrive / hold / release after decision + reader event, epoch-versioned; urgent miss on the main stream; no double fetch | release before the reader event; a late arrival of an old epoch |
-| S13 | the step script: GPU uuid from the lead's holder file (section 8); the gate arguments | a missing or malformed uuid file STOPs |
+| S7b | the contract agreement with piece 3 (its pinned blob, loaded by path in a fresh process): the reference vs piece 3's torch twin and float64 oracle within 1e-5; last_len 1, 2, 9, 37, 63, 64; tail pairs; one-page rows | the bias added after the scale; a cut one row late |
+| S13 | the step script: GPU uuid from the lead's holder file (section 8); piece 3's pins (commit, path, blob) and the BI GEMM pins (unset); the gate arguments | a missing or malformed uuid file STOPs |
+| S14 | G-b `PaddedLinear`: equal to x @ w.T; lead dims kept; more than m_fix rows refused; one buffer per (K, dtype, device); the live rows do not depend on the buffer rows past them (random vs zero) | a stand-in whose rows read the padding |
 
 ### 7.2 GPU gates (holder steps)
 
 | Id | Gate | Kind |
 |---|---|---|
-| B1-B4 | the BI microgates of section 3 (rmsnorm / nosa_linear, stage 1, GEMM row invariance and the cost table, BI attention invariance and its cost against FA2-NOSA split 4) | MUST for B1, B2, B4 and the chosen GEMM's B3; cost REPORT |
-| G0-BI | the BI serial decode against the shipped decode, 64 steps, B 1 and 8 | REPORT (tolerance, argmax, margin classes); E / E2 determinism of the BI serial decode MUST |
+| B1-B5 | the BI microgates of section 3, one step `r2_bi_step.sh` (B1 rmsnorm / nosa_linear / rope; B2 stage 1 with the alias; B3 GEMM row invariance and the cost table: natural, G-b, G-a when pinned; B4 piece 3's attention: invariance, the independent twin, the cost against FA2-NOSA and the SG5 attention term; B5 the deterministic selection) | MUST for B1, B2, B4, B5, G-b's B3 and G-a's B3 when pinned; cost REPORT |
+| G0-BI | the BI serial decode against the shipped decode. QUALITY (lead, 2026-10-20): greedy token agreement over >= 256 steps on >= 8 documents (teacher-forced on the shipped tokens, so every step compares the same prefix; and free-running: the first divergence step per document); the distribution of the logit max \|d\| per step and of the shipped top-2 margin (quantiles and histogram), every argmax difference classified by its margin | REPORT (the fidelity cost of BI); E / E2 determinism of the BI serial decode MUST |
 | SG1 | teacher-forced: the decisions follow a schedule that rejects at every index and across a block boundary; every computed verify row `torch.equal` to the BI serial row at the same (request, position), rejected rows included | MUST; control: row 0 against the next serial step must differ |
 | SG2 | free-running greedy, B = 8 ragged: committed sequences `torch.equal` to the BI serial greedy sequences | MUST |
 | SG3 | phase mix: ticks with draft rows of the same request and verify rows of other requests; the SG1 equality holds in every composition | MUST |
 | SG4 | negatives: (a) cuBLAS at the natural M in the flattened call, (b) split-KV attention, (c) `torch.topk(sorted=False)`. Each must differ from SG1 somewhere, or the gate reports that it could not detect it | MUST to run; detection REPORT |
-| SG5 | R-PERF: T_tick, r, r x T_shipped / T_tick at B 16 / 64; the separate-verify time that no longer exists; slot-store peak; urgent misses per tick; decision syncs per tick | REPORT |
+| SG5 | R-PERF: T_tick, r, r x T_shipped / T_tick at B 64 / 128; T_shipped and the draft-only tick measured again in the same run; the budget terms of 7.3 per tick; the separate-verify time that no longer exists; slot-store peak; urgent misses per tick; decision syncs per tick | REPORT (the 8 % design target) |
 
-## 8. The step script (when written)
+### 7.3 SG5: the tick budget (the 8 % design target)
+
+The budget per tick, against the draft-only tick T_d (B rows, the shipped ops):
+
+    T_tick - T_d = dGEMM + dATT + dSEL + dXFER + dHOST
+
+- dGEMM: the M-invariant GEMM at the tick's rows against cuBLAS at the B draft rows (B3's table at the tick's M).
+- dATT: piece 3's BI attention over the tick's rows against FA2-NOSA over the B draft rows (B4's SG5 term).
+- dSEL: stage 1, pooling and the deterministic top-k for the extra rows.
+- dXFER: the verify rows' blocks made resident (urgent misses, waits on transfers in flight).
+- dHOST: the plan, the page lists and one decision sync per tick that has a DONE cohort.
+
+Rows per tick. With K = 3 a request adds K verify rows per K draft steps (I_1 has K - 1). So a request has 1 + u = 2
+rows per tick on average. When the requests are in phase, one tick in three has 1 + 3 rows and two have 1 row.
+
+The attention term with piece 3's registered ratios (BI over B x (1 + u) rows / FA2-NOSA split 4 over B rows):
+
+| B | 1 + u = 1 | 2 | 4 | mean in phase (4, 1, 1) | out of phase (2) |
+|---|---|---|---|---|---|
+| 64 | 1.4 | 1.9 | 2.8 | 1.87 | 1.9 |
+| 128 | 1.1 | 1.6 | 2.4 | 1.53 | 1.6 |
+
+- So dATT is about 0.9 x a x T_d at B 64 and about 0.6 x a x T_d at B 128. Here a is the attention share of T_d
+  (FA2-NOSA). The draft rows pay the BI ratio at 1 + u = 1 too, because they ride in the same BI call.
+- The attention term alone uses the 8 % target when a >= 0.08 / 0.9 = 9 % (B 64) or a >= 13 % (B 128).
+- dGEMM = (rho_pad - 1) x g x T_d for G-b, where g is the GEMM share of T_d and rho_pad is B3's padded ratio at
+  M = B (M_fix = 4B on every tick). G-a: rho_bi averaged over the tick's M.
+- SG5 measures a and g with per-op CUDA events in the draft-only run, and every term above per tick in the
+  flattened run. It reports which term exceeds its share. The target is a design target, not a gate.
+
+## 8. The step script (`benchmarks/Efficiency/r2_bi_step.sh`)
 
 - The pattern of `r2_g0_step.sh` (pins, claim, frozen record, sacct row, a main() body).
+- Modules of OTHER branches (piece 3 now; the BI GEMM when its interface is forwarded) are pinned by commit, path and
+  blob id. Before the claim, the script checks `git rev-parse <commit>:<path>` against the blob id. After the claim,
+  it copies the blob from the shared object store into the step record (`git show <blob>`), checks the copy with
+  `git hash-object`, and the gate loads the copy by path. The pins and the copy path are in `command.txt`.
 - GPU_UUID is NOT hard-coded:
   - it is read from the lead-owned file `/mnt/beegfs/ojerbi/kstep-cpu-runs/holders/<holder job id>.gpu_uuid` (one
     line, no "GPU-" prefix);
@@ -343,11 +437,13 @@ stand-ins: a BI paged attention reference in float64, stand-in gathers.
 
 ## 9. Order of work after this note
 
-1. The CPU stand-ins and tests S1-S13 (portable).
-2. GPU microgates B1-B4 and the GEMM / attention cost tables, one holder step. Then the decision on G-a vs G-b
-   (cost) or the weaker claim.
-3. The BI paged attention kernel (Triton) with its CPU interpreter test.
-4. The flattened tick on the GPU: SG1, SG2, SG3, then SG4, SG5.
+1. The CPU stand-ins and tests S1-S14 (portable). DONE in the commit after f1f9f56.
+2. GPU microgates B1-B5 and the GEMM / attention cost tables, one holder step (`r2_bi_step.sh`). Then the decision
+   on G-a vs G-b (cost) or the weaker claim. G-a comes from the bigemm branch (pins in the step script).
+3. The BI paged attention kernel (Triton) with its CPU interpreter test: piece 3, the verify agent (4c1243f
+   accepted; its own GPU gate).
+4. G0-BI with the QUALITY numbers (7.2).
+5. The flattened tick on the GPU: SG1, SG2, SG3, then SG4, SG5 (7.3).
 
 ## 10. Open questions and risks
 
