@@ -148,6 +148,9 @@ class XPool:
         # [integ3] the request that bound each lane last (lane A: the dummy) and the lanes handed between requests
         self.owner = torch.full((L_, H_, self.A + 1), -1, dtype=torch.int64, device=self.device)
         self.handoffs = torch.zeros((), dtype=torch.int64, device=self.device)
+        # [integ5] the diagnostics (handoffs, peak) on by default (x1 / bigb report peak_lanes, unchanged); the stack
+        # TIMING cells set witness False (r2_tick_sg5 --stack-role time) so the timed path holds no diagnostic op
+        self.witness = True
         self.binds = 0                                                               # bind calls (host count)
         self.plant_log: List[Dict] = []
         self.early_log: List[Dict] = []                                              # the early-release controls
@@ -232,16 +235,19 @@ class XPool:
         tgt = torch.where(assign, newpos, torch.full_like(newpos, A))
         mark.scatter_(1, tgt, torch.ones_like(assign))
         occ |= mark[:, :A]
-        # [integ3] REPORT / GPU witness (review M2): a lane HANDED between requests (its new slot's request differs from
-        # the request that bound it last); the dummy lane A absorbs unassigned entries. Device ops only.
-        breq = (torch.arange(B * NS, device=dev) // NS).view(1, B * NS).expand(H, B * NS)
-        prev = torch.gather(self.owner[l], 1, tgt)
-        self.handoffs += (assign & (prev >= 0) & (prev != breq)).to(torch.int64).sum()
-        self.owner[l].scatter_(1, tgt, torch.where(assign, breq, torch.full_like(breq, -1)))
-        self.owner[l, :, A] = -1
-        self.err.bitwise_or_(torch.any(over).to(torch.int64) * ERR_FULL)
-        self.peak[l] = torch.maximum(self.peak[l], occ.to(torch.int64).sum(-1))
-        self.audit(l)
+        if self.witness:
+            # [integ3] REPORT / GPU witness (review M2): a lane HANDED between requests (its new slot's request differs
+            # from the request that bound it last); the dummy lane A absorbs unassigned entries. Device ops only.
+            # [integ5] DIAGNOSTIC, opt-out: witness False (the stack TIMING cells) skips it and the peak update below
+            breq = (torch.arange(B * NS, device=dev) // NS).view(1, B * NS).expand(H, B * NS)
+            prev = torch.gather(self.owner[l], 1, tgt)
+            self.handoffs += (assign & (prev >= 0) & (prev != breq)).to(torch.int64).sum()
+            self.owner[l].scatter_(1, tgt, torch.where(assign, breq, torch.full_like(breq, -1)))
+            self.owner[l, :, A] = -1
+        self.err.bitwise_or_(torch.any(over).to(torch.int64) * ERR_FULL)      # production: the full-arena refusal
+        if self.witness:
+            self.peak[l] = torch.maximum(self.peak[l], occ.to(torch.int64).sum(-1))
+        self.audit(l)                                 # production safety check (xpool_err; no sync): always on
 
     def _plant_alias(self, l: int, assign: torch.Tensor, newpos: torch.Tensor) -> torch.Tensor:
         """NEGATIVE CONTROL: per head, the first new slot keeps its lane and the first new slot of ANOTHER request gets
@@ -374,6 +380,7 @@ class XPool:
         return dict(mode=self.mode, B=self.B, H=self.H, C=self.C, X_pool=self.X_pool, n_hist=self.n_hist, A=self.A,
                     M=self.M, binds=self.binds, peak_lanes=self.peak.tolist(), err=int(self.err),
                     plant_log=list(self.plant_log),
+                    witness=self.witness,                                            # [integ5] False: not measured
                     handoffs=int(self.handoffs),                                     # [integ3] review M2 witnesses
                     max_peak_lanes=int(self.peak.max()) if self.peak.numel() else 0,
                     # the per-(layer, head) peak (not one layer's: review-integ2 M2 read layer 0's 6007; x1's max over

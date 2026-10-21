@@ -625,6 +625,23 @@ def _dummy_counter(device) -> torch.Tensor:
     return _DUMMY_CNT[key]
 
 
+def _check_cache_layout(cache: torch.Tensor, name: str) -> None:
+    """[integ3, L28; integ5: a helper outside the linted launcher] The storage layout the kernel's address arithmetic
+    assumes: each storage entry dense ((rows, H[, D]) row-major) and stride(0) 0 (the xpool flat mode, zero-stride
+    views) or the entry's size. Shape and stride METADATA only (no device read)."""
+    dims = list(cache.shape)
+    inner = 1
+    for s in dims[1:]:
+        inner *= s
+    dense = [1] * (len(dims) - 1)                     # row-major strides of dims 1 .. n-1
+    for i in range(len(dims) - 3, -1, -1):
+        dense[i] = dense[i + 1] * dims[i + 2]
+    strides = list(cache.stride())
+    if strides[1:] != dense or strides[0] not in (0, inner):
+        raise ValueError("%s strides %s: a dense (rows, H[, D]) entry with stride(0) 0 (xpool) or %d expected"
+                         % (name, tuple(strides), inner))
+
+
 def bi_paged_decode_shared(base, q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len, page_key,
                            rows_max: int = ROWS_MAX, mode: str = "split", softmax_scale: Optional[float] = None,
                            out: Optional[torch.Tensor] = None, workspace=None, pages_per_split: Optional[int] = None,
@@ -654,16 +671,8 @@ def bi_paged_decode_shared(base, q, k_cache, v_cache, bias_cache, seq_idx, page_
         return out
     if k_cache.stride(-1) != 1 or v_cache.stride(-1) != 1 or page_table.stride(-1) != 1 or num_pages.stride(-1) != 1:
         raise ValueError("unit last strides are assumed by the kernels")
-    for t, name in ((k_cache, "k_cache"), (v_cache, "v_cache"), (bias_cache, "bias_cache")):   # [integ3] L28 (m5):
-        inner = 1                                     # the storage layouts the kernel's address arithmetic assumes:
-        for s in t.shape[1:]:                         # each storage entry dense ((rows, H[, D]) row-major) and
-            inner *= int(s)                           # stride(0) 0 (the xpool flat mode) or the entry's size
-        dense = [1] * (t.dim() - 1)
-        for i in range(t.dim() - 3, -1, -1):          # row-major strides of dims 1 .. n-1
-            dense[i] = dense[i + 1] * int(t.shape[i + 2])
-        if list(t.stride()[1:]) != dense or t.stride(0) not in (0, inner):
-            raise ValueError("%s strides %s: a dense (rows, H[, D]) entry with stride(0) 0 (xpool) or %d expected"
-                             % (name, tuple(t.stride()), inner))
+    for cache, name in ((k_cache, "k_cache"), (v_cache, "v_cache"), (bias_cache, "bias_cache")):   # [integ3] L28
+        _check_cache_layout(cache, name)              # [integ5] a helper: shape metadata only, no device read
     whole = mode == "whole"
     if union is None:
         union = build_union(seq_idx, page_table, num_pages, page_key, NR, pps, whole)

@@ -183,6 +183,19 @@ def parse_args(argv):
                     help="three arms per point: none (every component OFF), the --stack arm, none again (the "
                          "replica); MUST gates <label>_ST_replica / _ST_committed / _ST_bitwise (needs "
                          "--arrival-lag >= 1)")
+    ap.add_argument("--stack-role", default="", choices=("", "validate", "time"),               # [integ5]
+                    help="validate: the equality cells (needs --stack-compare; the witnesses ON); time: the timing "
+                         "cells (needs --validated-by, --arrival-lag >= 1 and --bare; no --sel-check, no "
+                         "--stack-compare; the diagnostic witnesses OFF: XPool.witness False, SharedKV.count_saved "
+                         "False; the pool's invariant checks stay ON, they are the production safety refusal)")
+    ap.add_argument("--validated-by", default="",                                               # [integ5]
+                    help="comma list of the passing validation cells' summary.json (stack1a, stack1a128); a time "
+                         "cell refuses unless each exists and every MUST gate in it passed, the ST replica and "
+                         "bitwise gates included; recorded in meta.validated_by")
+    ap.add_argument("--free-arm", action="store_true",                                          # [integ5]
+                    help="time cells: also one REPORT arm at free arrival (--arrival-lag 0) after the headline arm, "
+                         "MUST only on the lag-free invariants (completed, bookkeeping / void ticks 0, err flags, "
+                         "acted); bitwise equality is proven only at the validated lag")
     ap.add_argument("--require-xregion", action="store_true",                                   # [integ3] M2
                     help="make <label>_ST_xregion MUST: the pool's per-(layer, head) peak lanes exceed B x C (the "
                          "shared X region was bound); default REPORT")
@@ -254,6 +267,19 @@ def parse_args(argv):
         a.stack_bands_v = v
     if a.require_xregion and not (a.stack and a.layout == "pool"):                             # [integ3] M2
         ap.error("--require-xregion needs a --stack with the pool layout")
+    if a.stack_role and not a.stack:                                                             # [integ5]
+        ap.error("--stack-role needs --stack")
+    if a.stack_role == "validate" and not a.stack_compare:
+        ap.error("--stack-role validate needs --stack-compare")
+    if a.stack_role == "time":
+        if a.sel_check or a.stack_compare or not a.validated_by or a.arrival_lag < 1 or not a.bare \
+                or a.require_xregion:
+            ap.error("--stack-role time: --validated-by, --arrival-lag >= 1 (the validated schedule) and --bare; no "
+                     "--sel-check, --stack-compare or --require-xregion (the witnesses are OFF here)")
+    if a.free_arm and a.stack_role != "time":
+        ap.error("--free-arm needs --stack-role time")
+    if a.validated_by and a.stack_role != "time":
+        ap.error("--validated-by needs --stack-role time")
     if a.layout != "stream" and any(b not in XPOOL_BACKENDS for b in a.backends):                # [xpool]
         ap.error("--layout %s: the shared pool runs on %s only (S-C's device path binds the lanes)"
                  % (a.layout, XPOOL_BACKENDS))
@@ -549,8 +575,13 @@ def select_attn(a, attn):                                                       
         return attn
     sk = GB.load_by_path(a.sharedkv, "sharedkv_bi_paged_attention")
     obj = sk.SharedKV(attn, mode="whole" if a.attn.endswith("whole") else "split", union=a.union)
-    obj.count_saved = True               # [integ3] review M2: the union's saved row pages, a device counter (no read)
-    return obj
+    obj.count_saved = witness_on(a)      # [integ3] review M2: the union's saved row pages, a device counter (no read);
+    return obj                           # [integ5] OFF in a time cell (a diagnostic)
+
+
+def witness_on(a):                                                                              # [integ5]
+    """[integ5] The diagnostic witnesses (XPool handoffs / peak, SharedKV.pages_saved) run except in a time cell."""
+    return getattr(a, "stack_role", "") != "time"
 
 
 def skv_report(obj):                                                                            # [integ]
@@ -559,7 +590,8 @@ def skv_report(obj):                                                            
         return None
     return dict(stats=dict(obj.stats), by_rows_max={str(k): v for k, v in dict(obj.by_rows_max).items()},
                 union_builds=dict(getattr(obj, "union_builds", {})), mode=obj.mode, union=getattr(obj, "union", None),
-                pages_saved=(int(obj.pages_saved) if getattr(obj, "pages_saved", None) is not None else None))  # [integ3]
+                pages_saved=(int(obj.pages_saved) if getattr(obj, "pages_saved", None) is not None else None),  # [integ3]
+                count_saved=bool(getattr(obj, "count_saved", False)))                                     # [integ5]
 
 
 def arm_layout(a, layout=None):                                                                 # [xpool]
@@ -594,6 +626,8 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
     else:                                                                                        # [xpool]
         eng = TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin, xpool=xspec, **ekw)
     eng.check = bool(getattr(a, "sel_check", False))        # [integ] --sel-check (TickEngine's check; default False)
+    if eng.xpool is not None:                               # [integ5] the diagnostics OFF in a time cell
+        eng.xpool.witness = witness_on(a)
     eng.rebuild = getattr(a, "rebuild", "per_call")         # [batched-rebuild] the arm's rebuild (parse_variants checks)
     B, L, H = eng.B, eng.L, eng.H
     xp = eng.xpool                                                                               # [xpool] or None
@@ -688,11 +722,43 @@ def stack_bands_verdict(v, peak_gb, ticks_ms, failed_must):                     
     return "IN" if (v[0] <= peak_gb <= v[1] and v[2] <= t <= v[3]) else "OUT"
 
 
+def check_validated(paths):                                                                    # [integ5]
+    """[integ5] The time cells' evidence chain: each path is a validation cell's summary.json; every MUST gate in it
+    passed, and it holds a passed *_ST_replica and *_ST_bitwise gate. Returns [(path, record)] or raises SystemExit
+    ("REFUSED ...": the harness exits 2 before any build)."""
+    out = []
+    for p in [x for x in paths.split(",") if x]:
+        try:
+            s = json.load(open(p))
+            gates = s["gates"]
+        except Exception as e:                                       # noqa: BLE001 - a refusal names the cause
+            raise SystemExit("REFUSED: --validated-by %s: not a readable summary (%s: %s)" % (p, type(e).__name__, e))
+        bad = [g["name"] for g in gates if g.get("must") and not g.get("passed")]
+        rep = [g["name"] for g in gates if g["name"].endswith("_ST_replica") and g.get("passed")]
+        bit = [g["name"] for g in gates if g["name"].endswith("_ST_bitwise") and g.get("passed")]
+        if bad or not rep or not bit:
+            raise SystemExit("REFUSED: --validated-by %s: failed MUST %s, passed replica %s, passed bitwise %s"
+                             % (p, bad[:5], rep, bit))
+        m = s.get("meta", {})
+        out.append(dict(path=p, nosi_commit=m.get("nosi_commit"), batch=m.get("args", {}).get("batch"),
+                        stack=m.get("stack"), bitwise=bit, n_must=sum(1 for g in gates if g.get("must"))))
+    if not out:
+        raise SystemExit("REFUSED: --validated-by names no summary")
+    return out
+
+
+def headline_tick_ms(p):                                                                        # [integ5]
+    """[integ5] A point's headline T_tick: the --bare round's tick mean (no per-category events) when present, else
+    the instrumented round's."""
+    bare = p.get("bare_T_tick")
+    return bare["mean"] if isinstance(bare, dict) and bare.get("mean") is not None else p.get("T_tick_ms")
+
+
 def write_stack_bands(a, meta, res, gates):                                                     # [integ3] M3
     """[integ3] <out>/stack_bands.txt: one line per value, then STACK_BANDS_VERDICT IN|OUT (the combined step cell
     stack1 greps that exact line before it runs stack1b; no interpreter in the step). REPORT gate R_stack_bands."""
     pts = res.get("points", [])
-    ticks = [p.get("T_tick_ms") for p in pts]
+    ticks = [headline_tick_ms(p) for p in pts]                       # [integ5] the --bare round's when present
     nfail = sum(1 for g in gates if g["must"] and not g["passed"])
     v = a.stack_bands_v
     verdict = stack_bands_verdict(v, meta.get("peak_gb"), ticks, nfail)
@@ -717,6 +783,7 @@ def stack_acted(w, B, C):                                                       
     and the shared-region witness of the pool (the per-(layer, head) peak above B x C)."""
     fu, xp, skv = w.get("fused"), w.get("xpool"), w.get("skv")
     ub = (skv or {}).get("union_builds", {})
+    wit = w.get("witness", True)          # [integ5] a time cell: no handoff / saved-pages witness (it is not run there)
     out = dict(
         twin=(w.get("twin_variant") == "fused", "twin_variant %s" % w.get("twin_variant")),
         rebuild=(w.get("batched_calls", 0) > 0 and w.get("batched_max", 0) >= 2,
@@ -724,11 +791,12 @@ def stack_acted(w, B, C):                                                       
         resolve=(fu is not None and fu.get("launches", 0) > 0 and fu.get("layers", 0) > 0,
                  "fused launches %s layers %s" % (None if fu is None else fu.get("launches"),
                                                  None if fu is None else fu.get("layers"))),
-        layout=(xp is not None and xp.get("binds", 0) > 0 and xp.get("handoffs", 0) > 0,
-                "xpool binds %s, lanes handed between requests %s" % (None if xp is None else xp.get("binds"),
-                                                                       None if xp is None else xp.get("handoffs"))),
+        layout=(xp is not None and xp.get("binds", 0) > 0 and (xp.get("handoffs", 0) > 0 or not wit),
+                "xpool binds %s, lanes handed between requests %s%s"
+                % (None if xp is None else xp.get("binds"), None if xp is None else xp.get("handoffs"),
+                   "" if wit else " (witness OFF in a time cell: binds only)")),
         attn=(skv is not None and skv["stats"].get("shared", 0) > 0 and ub.get("fused", 0) > 0
-              and ub.get("torch", 0) == 0 and (skv.get("pages_saved") or 0) > 0,
+              and ub.get("torch", 0) == 0 and ((skv.get("pages_saved") or 0) > 0 or not wit),
               "shared calls %s, union builds %s, row pages saved by the union %s"
               % (None if skv is None else skv["stats"].get("shared"), ub, None if skv is None else skv.get("pages_saved"))),
         warmup=(w.get("warm_calls") == 1, "transport warm_calls %s" % w.get("warm_calls")))
@@ -753,10 +821,16 @@ def stack_acted_gates(a, label, w, B, C):                                       
             gates.append(GB.gate("%s_ST_acted_%s" % (label, c), ok, True, detail))
         else:
             gates.append(GB.gate("%s_ST_off_%s" % (label, c), not ok, True, "OFF in this arm: " + detail))
-    if on["layout"]:
+    if on["layout"] and w.get("witness", True):                 # [integ5] measured only where the witness runs
         req = bool(getattr(a, "require_xregion", False))
         gates.append(GB.gate(("" if req else "R_") + "%s_ST_xregion" % label, region[0], req,
                              "the shared X region bound: " + region[1]))
+    if getattr(a, "stack_role", "") == "time":                  # [integ5] a time cell refuses a diagnostic in its path
+        xp, skv = w.get("xpool"), w.get("skv")
+        on_now = [n for n, v in (("xpool.witness", xp is not None and xp.get("witness")),
+                                 ("SharedKV.count_saved", skv is not None and skv.get("count_saved"))) if v]
+        gates.append(GB.gate("%s_ST_witness_off" % label, not on_now, True,
+                             "time cell: diagnostics in the timed path: %s" % (on_now or "none")))
     return gates
 
 
@@ -984,7 +1058,8 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
         wit = dict(twin_variant=getattr(eng, "twin_variant", None),                          # [integ3] review M2
                    batched_calls=getattr(eng, "batched_calls", 0), batched_max=getattr(eng, "batched_max", 0),
                    fused=svc.fusedres.report() if getattr(svc, "fusedres", None) is not None else None,
-                   xpool=info.get("xpool"), skv=skv, warm_calls=info["transport_warm_calls"])
+                   xpool=info.get("xpool"), skv=skv, warm_calls=info["transport_warm_calls"],
+                   witness=witness_on(a))                     # [integ5] the arm's role (the actual state: below)
         info["stack_witness"] = {k: v for k, v in wit.items() if k not in ("fused", "xpool", "skv")}
         gates.extend(stack_acted_gates(a, label, wit, eng.B, C))
         mirror = eng.mirror_failures()
@@ -1280,6 +1355,13 @@ def main(argv=None) -> int:
     if not a.model:
         print("REFUSED: no --model / NOSI_MODEL_PATH", file=sys.stderr)
         return 2
+    validated = None
+    if a.validated_by:                                               # [integ5] the evidence chain, before any work
+        try:
+            validated = check_validated(a.validated_by)
+        except SystemExit as e:
+            print(str(e), file=sys.stderr)
+            return 2
     try:
         os.makedirs(a.out)
         gates, res = [], {}
@@ -1341,6 +1423,9 @@ def main(argv=None) -> int:
                     sel_check=a.sel_check, shared_unchecked=a.shared_unchecked, gilfree_warm_up=a.gilfree_warm_up,
                     b2_resolve=a.b2_resolve, shipped_batch=a.shipped_batch or a.batch,
                     sharedkv=a.sharedkv if a.attn != "per_row" else None)
+        meta.update(stack_role=a.stack_role or None, validated_by=validated, free_arm=a.free_arm,   # [integ5]
+                    witness=witness_on(a), validated_note=(None if a.stack_role != "time" else
+                    "bitwise equality proven at the validated cells' B and lag only (see validated_by)"))
         if a.variants:                                                                         # [batched-rebuild]
             meta["variants"] = ["%s/%s" % v for v in a.variant_list]                            # [batched-rebuild]
         a.twin, a.rebuild = a.variant_list[0]           # [batched-rebuild] the preflight / sweep arms: the first one
@@ -1384,6 +1469,20 @@ def main(argv=None) -> int:
                                            T_shipped, gates, label, bare=a.bare)
                             pt["twin"], pt["rebuild"] = variant                                # [batched-rebuild]
                             res["points"].append(pt)
+                            if a.free_arm:                         # [integ5] REPORT: free arrival, after the headline
+                                import copy
+                                af = copy.copy(a)
+                                af.arrival_lag = 0
+                                log("%s_free: the same stack at free arrival (REPORT timing)" % label)
+                                pf = one_point(af, model, cache, st, first,
+                                               BIOps(select_attn(af, attn), a.m_fix, gemm=mode), kind, a.C, a.X,
+                                               a.R_ver, ext, a.steps, T_shipped, gates, label + "_free", bare=False)
+                                res["free_arm"] = pf
+                                gates.append(GB.gate("R_%s_free_tick" % label, True, False,
+                                                     "free arrival T_tick %s ms (instrumented) vs the headline (lag "
+                                                     "%d, bare) %s ms; bitwise equality is proven only at lag %d"
+                                                     % (pf.get("T_tick_ms"), a.arrival_lag, headline_tick_ms(pt),
+                                                        a.arrival_lag)))
                         except Exception as e:
                             traceback.print_exc()
                             gates.append(GB.gate(label + "_completed", False, True, "EXCEPTION %s: %s"

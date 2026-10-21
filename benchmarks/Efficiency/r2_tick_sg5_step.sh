@@ -46,8 +46,20 @@
 #            Its ROOT is NOSI_X1 (nosi-r2-xpool); every other cell keeps NOSI (review m8)
 #   stack1a  [integ] THE FULL STACK (docs/R2_INTEG_PLAN.md) at p5b2's point, EXACT, B 64: --stack full --stack-compare
 #            --X-pool 64 --arrival-lag 2 --sel-check (arms none, full, none2; MUST _ST_replica / _ST_committed /
-#            _ST_bitwise), no --pool-baseline. ROOT NOSI_INTEG (nosi-r2-integ4 since integ4), as every stack1* cell.
+#            _ST_bitwise), no --pool-baseline. ROOT NOSI_INTEG (nosi-r2-integ5 since integ5), as every stack1* cell.
 #            [integ3] + --require-xregion; per arm MUST _ST_acted_<c> / _ST_off_<c> and _ST_xregion (review M2)
+#            [integ5] + --stack-role validate (the diagnostic witnesses ON)
+#   stack1a128 [integ5] stack1a at B 128 (--repeat-docs, --log-slots -1, --mem 200G): required before stack1b. Its
+#            none arms are per-stream (bigb model at B 128, C 96: pool 51.78 GB, per-stream about 69 GB, one engine
+#            at a time); a B 216 comparison does not fit (per-stream about 104 GB), so stack1b is validated at B 64
+#            and B 128, NOT at 216
+#   [integ5] THE TIME CELLS (stack1t, stack1b), the lead's decisions of 2026-10-21: the HEADLINE arm runs the
+#            validated schedule (--arrival-lag 2) with --bare (tick events only), the instrumented round of the same
+#            arm gives the category split; --stack-role time turns the diagnostic witnesses OFF (MUST
+#            <label>_ST_witness_off) and keeps the pool's invariant checks ON (the production safety refusal, no sync);
+#            --free-arm adds one REPORT arm at free arrival, MUST only on the lag-free invariants; --validated-by names
+#            stack1a's (and stack1b: stack1a128's) summary.json: the harness refuses (exit 2) unless every MUST gate in
+#            each passed, replica and bitwise included
 #   stack1p  [integ3] stack1a at the pressure point C 80 (X 64, R_ver 16, X_pool 64): more shared X demand; a
 #            DIAGNOSTIC (a CapacityRefusal there is a configuration result); it never stops the stack1 chain
 #   stack1n-<c>  [integ3] c in twin, rebuild, resolve, layout, attn, warmup: stack1a with --stack full-no-<c> (layout:
@@ -56,7 +68,8 @@
 #            --shared-unchecked (the selection precondition is checked in stack1a), --pool-baseline (100);
 #            [integ3] --stack-bands 33:36:220:450 writes stack_bands.txt (peak GB and T_tick ms against the bands)
 #   stack1   [integ3] THE COMBINED CELL (review M3), each sub-cell its own step, claim and record: stack1a; if it
-#            fails, the six stack1n-<c> diagnostics, then STOP (exit = stack1a's); else stack1p (diagnostic), stack1t
+#            fails, the six stack1n-<c> diagnostics, then STOP (exit = stack1a's); [integ5] else stack1a128 (STOP on
+#            a nonzero exit); then stack1p (diagnostic), stack1t
 #            (STOP on a nonzero exit), then STOP with exit 6 unless stack1t's stack_bands.txt holds the exact line
 #            "STACK_BANDS_VERDICT IN"; then stack1b (exit = stack1b's)
 #   NOTE (review m7): the x1, bigb*, frg* and the default / p4* / p5b2 / p6 cells keep their own ROOTs; this script's
@@ -103,6 +116,13 @@
 # fused union only and row pages saved > 0; warm_calls 1) and _ST_off_<c> for each OFF; stack1a / stack1p / stack1n-*
 # MUST _ST_xregion: the per-(layer, head) peak lanes exceed B x C (x1 measured 6208 > 6144 at this point, layer 9
 # head 0, SCORING_x1.md item 8). stack1p, stack1n-*: no timing claim. The stack1 chain stops on stack1t's bands.
+# REVISED in integ5 (2026-10-21T14:28:52Z, before any stack1 run; the lead's timing-boundary decisions,
+# paper-notes/stack1-timing-boundaries.md): stack1t's HEADLINE is the lag-2 --bare round (the schedule stack1a
+# validated; no witness, no selection check): T_tick 0.20-0.50 s (was 0.22-0.45 s at free timing, instrumented: the
+# lag's forced waits are not modelled, so the band is widened, not re-derived), peak 33-36 GB; --stack-bands
+# 33:36:200:500. The free-arrival arm and the instrumented category split are REPORT. stack1a128 MUST the same gates
+# as stack1a at B 128. stack1b: headline lag 2 --bare, bands as integ2 (peak 74-78 GB, T_tick 0.6-1.2 s, REPORT),
+# labelled "validated at B 64 and B 128, not at 216".
 #
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
@@ -176,7 +196,7 @@
 set -u
 NOSI=/mnt/beegfs/ojerbi/nosi-r2-sg5-p6                                                   # ROOT (p6; [b2] p5b2: nosi-r2-m2-sg5-b2; p4sc64: -p4d; p4a: -p4c; p3: nosi-r2-m2-sg5)
 NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                                 # ROOT of cell x1 only ([xpool], review m8)
-NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-integ4                                             # ROOT of the stack1 cells only ([integ], integ4)
+NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-integ5                                             # ROOT of the stack1 cells only ([integ], integ5)
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
@@ -204,7 +224,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -216,7 +236,7 @@ for w in "$@"; do
         p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1a|stack1t|stack1b)
             [ -z "$CELL" ] || usage; CELL=$w ;;
         frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg) [ -z "$CELL" ] || usage; CELL=$w ;;          # [fusedres2]
-        stack1|stack1p|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup)
+        stack1|stack1a128|stack1p|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup)
             [ -z "$CELL" ] || usage; CELL=$w ;;                                                  # [integ3]
         *) usage ;;
     esac
@@ -252,7 +272,15 @@ if [ "$CELL" = stack1 ]; then                               # [integ3] review-in
             sub "stack1n-$c"
             echo "R2 SG5 stack1: diagnostic stack1n-$c exit $?"
         done
-        echo "R2 SG5 stack1: STOP after stack1a (exit $src); stack1p, stack1t and stack1b not run"
+        echo "R2 SG5 stack1: STOP after stack1a (exit $src); stack1a128, stack1p, stack1t and stack1b not run"
+        [ "$src" -le 125 ] || src=125
+        exit "$src"
+    fi
+    sub stack1a128                                          # [integ5] the comparison at B 128, before stack1b
+    src=$?
+    echo "R2 SG5 stack1: cell stack1a128 exit $src"
+    if [ "$src" != 0 ]; then
+        echo "R2 SG5 stack1: STOP after stack1a128 (exit $src); stack1p, stack1t and stack1b not run"
         [ "$src" -le 125 ] || src=125
         exit "$src"
     fi
@@ -302,19 +330,30 @@ case $CELL in
         VARIANTS=torch/per_call,fused/per_call,torch/batched,fused/batched ;;
     x1) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_x1 ; XPOOL=64 ; NOSI=$NOSI_X1 ;;   # [xpool] p5b2's point
     stack1a) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1a ; NOSI=$NOSI_INTEG ; POOLB=()
-             STACKARG=(--stack full --stack-compare --X-pool 64 --arrival-lag 2 --sel-check --require-xregion) ;;
+             STACKARG=(--stack full --stack-compare --X-pool 64 --arrival-lag 2 --sel-check --require-xregion
+                       --stack-role validate) ;;
+    stack1a128) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1a128 ; NOSI=$NOSI_INTEG ; POOLB=()
+             BATCH=128 ; MEMG=200G                                                                  # [integ5] B 128
+             STACKARG=(--stack full --stack-compare --X-pool 64 --arrival-lag 2 --sel-check --require-xregion
+                       --stack-role validate --repeat-docs --log-slots -1) ;;
     stack1p) MODES=exact ; BACKENDS=b2 ; PC=80 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1p ; NOSI=$NOSI_INTEG ; POOLB=()
-             STACKARG=(--stack full --stack-compare --X-pool 64 --arrival-lag 2 --sel-check --require-xregion) ;;
+             STACKARG=(--stack full --stack-compare --X-pool 64 --arrival-lag 2 --sel-check --require-xregion
+                       --stack-role validate) ;;
     stack1n-layout) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_${CELL//-/_} ; NOSI=$NOSI_INTEG
-             POOLB=() ; STACKARG=(--stack full-no-layout --stack-compare --arrival-lag 2 --sel-check) ;;   # [integ3]
+             POOLB=() ; STACKARG=(--stack full-no-layout --stack-compare --arrival-lag 2 --sel-check
+                                  --stack-role validate) ;;                                         # [integ3]
     stack1n-*) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_${CELL//-/_} ; NOSI=$NOSI_INTEG ; POOLB=()
              STACKARG=(--stack "full-no-${CELL#stack1n-}" --stack-compare --X-pool 64 --arrival-lag 2 --sel-check
-                       --require-xregion) ;;                                                        # [integ3] M1
-    stack1t) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1t ; NOSI=$NOSI_INTEG
-             STACKARG=(--stack full --X-pool 64 --shared-unchecked --stack-bands 33:36:220:450) ;;   # [integ3] M3
+                       --require-xregion --stack-role validate) ;;                                  # [integ3] M1
+    stack1t) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1t ; NOSI=$NOSI_INTEG    # [integ5] the
+             STACKARG=(--stack full --X-pool 64 --shared-unchecked --stack-role time --arrival-lag 2 --bare   # headline
+                       --free-arm --validated-by "$OUTROOT/sg5_${RUN}_${JOB}_stack1a/summary.json"   # = stack1a's
+                       --stack-bands 33:36:200:500) ;;                                              # validated path
     stack1b) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1b ; NOSI=$NOSI_INTEG ; POOLB=()
              BATCH=216 ; MEMG=240G                                                                  # [integ2] B 216
-             STACKARG=(--stack full --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1) ;;
+             STACKARG=(--stack full --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1
+                       --stack-role time --arrival-lag 2 --bare --free-arm                          # [integ5]
+                       --validated-by "$OUTROOT/sg5_${RUN}_${JOB}_stack1a/summary.json,$OUTROOT/sg5_${RUN}_${JOB}_stack1a128/summary.json") ;;
     bigb*) MODES=exact ; BACKENDS=b2 ; PX=64 ; PRV=16 ; SWEEP_RUN= ; SUFFIX=_${CELL//-/_} ; NOSI=$NOSI_BIGB   # [bigb]
         BIGB=$CELL ; PC=${CELL:4:2} ; BATCH=${CELL#bigb??-} ; STEPS=24 ; MEMG=200G ; POOLB=()
         BIGBARG=(--layout pool --X-pool 64 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped) ;;

@@ -31,6 +31,9 @@ ST4b [integ3] review M5: check mode compares the fused lane map with a SHADOW po
 ST10 [integ3] the GPU witnesses (review M2): XPool's handoff counter and per-(layer, head) peak, the engine's batched
      counters, SharedKV's pages_saved; stack_acted / stack_acted_gates; the fused dispatch gate is REPORT in a stack
      cell (M1); stack_bands_verdict and write_stack_bands (M3).
+ST11 [integ5] the time cells: XPool.witness False skips the diagnostics (the audit stays), _ST_witness_off, the
+     reduced acted witnesses, --validated-by's evidence chain, the time role's argument rules, the --bare headline,
+     the L28 helper outside the linted launcher.
 ST2  THE 2^k-LITE MATRIX: full minus each one component (six arms) also equals the default, and in each arm the
      removed component is really OFF (its precondition does not hold) while the others stay ON.
 ST3  NEGATIVE CONTROL of the matrix comparison: the full stack with the fused resolve's plant 2 (a draft grant takes
@@ -771,6 +774,81 @@ def test_ST10_the_gpu_witnesses_and_gates():
     assert ok.stack_bands_v == [33.0, 36.0, 220.0, 450.0] and ok.require_xregion
 
 
+def test_ST11_time_cells_have_no_diagnostics_and_cite_their_validation(tmp_path):
+    """[integ5] the lead's timing-boundary decisions (paper-notes/stack1-timing-boundaries.md): the witnesses are
+    OFF in a time cell (XPool.witness False skips the handoff counter and the peak update; the invariant audit stays);
+    a time cell's gates: _ST_witness_off MUST, acted gates from the reduced witness, no xregion gate; --validated-by
+    refuses a missing / failed / bitwise-less summary; the headline tick is the --bare round's; the L28 helper."""
+    XP = TT._load("r2_xpool")
+    xp = XP.XPool(1, 2, 1, 4, mode="pool", C=1, X_pool=3)
+    assert xp.witness is True                                               # the default: unchanged
+    xp.witness = False
+    z = torch.zeros(4, dtype=torch.int64)
+    xp.bind(0, z, z, torch.arange(4), torch.ones(4, dtype=torch.bool))
+    assert int(xp.handoffs) == 0 and int(xp.peak.max()) == 0                # no diagnostic op ran
+    assert int(xp.occ.sum()) == 4 and int(xp.err) == 0                      # the binding and its audit did
+    xp.pos_of[0, 0, 0, 0] = xp.pos_of[0, 0, 0, 1]                            # a planted alias: the audit (kept) sees it
+    xp.audit(0)
+    assert int(xp.err) & XP.ERR_ALIAS
+    assert xp.report()["witness"] is False
+    G = TT._sg5_gate()
+    t = SimpleNamespace(stack="full", stack_applied="full", stack_role="time", twin="fused", rebuild="batched",
+                        b2_resolve="fused", layout="pool", attn="shared", gilfree_warm_up="on", require_xregion=False)
+    w = dict(twin_variant="fused", batched_calls=3, batched_max=2, fused=dict(launches=12, layers=4),
+             xpool=dict(binds=8, handoffs=0, max_peak_lanes=0, witness=False),
+             skv=dict(stats=dict(shared=7), union_builds=dict(fused=7, torch=0), pages_saved=None, count_saved=False),
+             warm_calls=1, witness=False)
+    g = {x["name"]: x for x in G.stack_acted_gates(t, "T", w, 64, 96)}
+    assert all(g["T_ST_acted_%s" % c]["passed"] for c in COMPONENTS), g      # the reduced witness suffices
+    assert g["T_ST_witness_off"]["passed"] and g["T_ST_witness_off"]["must"] and "T_ST_xregion" not in g
+    w_on = dict(w, xpool=dict(w["xpool"], witness=True))
+    assert not {x["name"]: x for x in G.stack_acted_gates(t, "T", w_on, 64, 96)}["T_ST_witness_off"]["passed"]
+    assert G.witness_on(t) is False and G.witness_on(SimpleNamespace(stack_role="validate")) is True
+    # --validated-by: the evidence chain
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps(dict(meta=dict(nosi_commit="x", args=dict(batch=64), stack="full"),
+                                    gates=[dict(name="L_ST_replica", must=True, passed=True),
+                                           dict(name="L_ST_bitwise", must=True, passed=True),
+                                           dict(name="R_x", must=False, passed=False)])))
+    assert G.check_validated(str(good))[0]["bitwise"] == ["L_ST_bitwise"]
+    failed = tmp_path / "failed.json"
+    failed.write_text(json.dumps(dict(meta={}, gates=[dict(name="L_ST_replica", must=True, passed=True),
+                                                      dict(name="L_ST_bitwise", must=True, passed=False)])))
+    nobit = tmp_path / "nobit.json"
+    nobit.write_text(json.dumps(dict(meta={}, gates=[dict(name="L_completed", must=True, passed=True)])))
+    for p in (str(failed), str(nobit), str(tmp_path / "missing.json"), "", "%s,%s" % (good, failed)):
+        with pytest.raises(SystemExit):
+            G.check_validated(p)
+    # the time role's argument rules
+    base = BASE + ["--backends", "b2", "--X", "64", "--stack", "full", "--shared-unchecked"]
+    ok = G.parse_args(base + ["--stack-role", "time", "--arrival-lag", "2", "--bare", "--free-arm",
+                              "--validated-by", str(good)])
+    assert ok.stack_role == "time" and ok.free_arm
+    for bad in (["--stack-role", "time", "--arrival-lag", "2", "--bare"],                        # no --validated-by
+                ["--stack-role", "time", "--bare", "--validated-by", "x"],                       # no lag
+                ["--stack-role", "time", "--arrival-lag", "2", "--validated-by", "x"],           # no --bare
+                ["--stack-role", "time", "--arrival-lag", "2", "--bare", "--validated-by", "x", "--sel-check"],
+                ["--stack-role", "validate"],                                                    # validate: compare
+                ["--free-arm"], ["--validated-by", "x"]):
+        with pytest.raises(SystemExit):
+            G.parse_args(base + bad)
+    # the headline tick: the bare round's
+    assert G.headline_tick_ms(dict(T_tick_ms=330.0, bare_T_tick=dict(mean=300.0))) == 300.0
+    assert G.headline_tick_ms(dict(T_tick_ms=330.0)) == 330.0
+    # L28 helper (outside the linted launcher): zero-stride views and dense entries pass, other layouts refuse
+    T = _shared("test_bi_paged_attention_shared_st", "test_bi_paged_attention_shared.py")
+    flat = torch.zeros(6 * 64, 2, 16)
+    T.sk._check_cache_layout(flat.unsqueeze(0).expand(3, 6 * 64, 2, 16), "k")
+    T.sk._check_cache_layout(torch.zeros(3, 6 * 64, 2, 16), "k")
+    T.sk._check_cache_layout(torch.zeros(3, 6 * 64, 2), "bias")
+    for badc in (torch.zeros(3, 2, 6 * 64, 16).transpose(1, 2), torch.zeros(3, 6 * 64, 2, 32)[..., :16]):
+        with pytest.raises(ValueError):
+            T.sk._check_cache_layout(badc, "k")
+    src = (NOSI / "bi_paged_attention_shared.py").read_text()
+    seg = src[src.index("def bi_paged_decode_shared("):src.index("def bi_paged_decode_shared_reference(")]
+    assert "_check_cache_layout(cache, name)" in seg and "int(t" not in seg
+
+
 def test_ST7_one_point_stacks_gates_with_a_stand_in():
     G = TT._sg5_gate()
 
@@ -830,11 +908,11 @@ def test_ST8_the_step_cells_stack1(tmp_path):
                 assert word not in ln, (word, ln)
     lines = text.splitlines()
     root = next(ln for ln in lines if ln.startswith("NOSI_INTEG=")).split()[0][len("NOSI_INTEG="):]
-    assert root == "/mnt/beegfs/ojerbi/nosi-r2-integ4"                      # [integ4] the stack cells' ROOT
+    assert root == "/mnt/beegfs/ojerbi/nosi-r2-integ5"                      # [integ5] the stack cells' ROOT
     # [integ3] M3: the combined cell's order and its stop rules (static; a DRYRUN of it would recurse)
     blk = text[text.index('if [ "$CELL" = stack1 ]; then'):text.index("MODES=exact,fast")]
-    order = [blk.index(s) for s in ("sub stack1a", 'sub "stack1n-$c"', "sub stack1p", "sub stack1t",
-                                    "grep -qx 'STACK_BANDS_VERDICT IN' \"$bands\"", "sub stack1b")]
+    order = [blk.index(s) for s in ("sub stack1a\n", 'sub "stack1n-$c"', "sub stack1a128", "sub stack1p",
+                                    "sub stack1t", "grep -qx 'STACK_BANDS_VERDICT IN' \"$bands\"", "sub stack1b")]
     assert order == sorted(order), order
     assert "bands=$OUTROOT/sg5_${RUN}_${JOB}_stack1t/stack_bands.txt" in blk and "exit 6" in blk
     assert "for c in twin rebuild resolve layout attn warmup; do" in blk
@@ -854,19 +932,25 @@ def test_ST8_the_step_cells_stack1(tmp_path):
     env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_"))}
     env.update(SG5_HOLDERS=str(tmp_path), DRYRUN="1")
     G = TT._sg5_gate()
-    cmp_args = "--stack-compare --X-pool 64 --arrival-lag 2 --sel-check --require-xregion"
+    cmp_args = "--stack-compare --X-pool 64 --arrival-lag 2 --sel-check --require-xregion --stack-role validate"
+    sa = "/mnt/beegfs/ojerbi/r2-runs/sg5/sg5_t1_418_stack1a/summary.json"
+    sa128 = "/mnt/beegfs/ojerbi/r2-runs/sg5/sg5_t1_418_stack1a128/summary.json"
+    timing = "--stack-role time --arrival-lag 2 --bare --free-arm --validated-by "
     want = {"stack1a": (["--stack full " + cmp_args, "--batch 64", "--C 96 ", "--mem=120G"],
-                        ["--pool-baseline", "--shared-unchecked", "--stack-bands"]),
+                        ["--pool-baseline", "--shared-unchecked", "--stack-bands", "--stack-role time"]),
+            "stack1a128": (["--stack full " + cmp_args + " --repeat-docs --log-slots -1", "--batch 128", "--C 96 ",
+                            "--mem=200G"], ["--pool-baseline", "--shared-unchecked", "--stack-bands"]),
             "stack1p": (["--stack full " + cmp_args, "--batch 64", "--C 80 ", "--mem=120G"],
                         ["--pool-baseline", "--shared-unchecked", "--stack-bands"]),
-            "stack1n-layout": (["--stack full-no-layout --stack-compare --arrival-lag 2 --sel-check", "--batch 64",
-                                "--C 96 "], ["--X-pool", "--require-xregion", "--pool-baseline"]),
-            "stack1t": (["--stack full --X-pool 64 --shared-unchecked --stack-bands 33:36:220:450", "--batch 64",
-                         "--C 96 ", "--pool-baseline", "--mem=120G"],
-                        ["--stack-compare", "--arrival-lag", "--sel-check"]),
-            "stack1b": (["--stack full --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1",
-                         "--batch 216", "--mem=240G"], ["--pool-baseline", "--stack-compare", "--arrival-lag",
-                                                       "--skip-shipped"])}                    # [integ2] B 216
+            "stack1n-layout": (["--stack full-no-layout --stack-compare --arrival-lag 2 --sel-check --stack-role "
+                                "validate", "--batch 64", "--C 96 "], ["--X-pool", "--require-xregion",
+                                                                      "--pool-baseline"]),
+            "stack1t": (["--stack full --X-pool 64 --shared-unchecked " + timing + sa + " --stack-bands 33:36:200:500",
+                         "--batch 64", "--C 96 ", "--pool-baseline", "--mem=120G"],
+                        ["--stack-compare", "--sel-check", "--require-xregion", "--stack-role validate"]),
+            "stack1b": (["--stack full --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1 "
+                         + timing + sa + "," + sa128, "--batch 216", "--mem=240G"],
+                        ["--pool-baseline", "--stack-compare", "--skip-shipped", "--sel-check"])}   # [integ5]
     for c in ("twin", "rebuild", "resolve", "attn", "warmup"):                                  # [integ3] M1
         want["stack1n-" + c] = (["--stack full-no-%s %s" % (c, cmp_args), "--batch 64", "--C 96 "],
                                 ["--pool-baseline", "--shared-unchecked"])
@@ -879,12 +963,12 @@ def test_ST8_the_step_cells_stack1(tmp_path):
         line = r.stdout.strip().splitlines()[-1]
         got = line.split("r2_tick_sg5.py ", 1)[1].strip().replace("\\,", ",")
         for w in has + ["--modes exact --backends b2", "--X 64 --R-ver 16", "--steps 48",
-                        "PYTHONPATH=/mnt/beegfs/ojerbi/nosi-r2-integ4/nosi"]:
+                        "PYTHONPATH=/mnt/beegfs/ojerbi/nosi-r2-integ5/nosi"]:
             assert w in got or w in line, (cell, w)
         for w in hasnt + ["--sweep ", "--variants", "--b2-checked", "--layout both"]:
             assert w not in got, (cell, w)
         assert "--job-name=sg5-t1-418-%s " % cell.replace("_", "-") in r.stdout and "cell %s" % cell in r.stdout
-        assert "[integ] root /mnt/beegfs/ojerbi/nosi-r2-integ4," in r.stdout
+        assert "[integ] root /mnt/beegfs/ojerbi/nosi-r2-integ5," in r.stdout
         pa = G.parse_args(got.split())
         assert pa.backends == ["b2"], cell
         if cell == "stack1n-layout":
@@ -895,9 +979,13 @@ def test_ST8_the_step_cells_stack1(tmp_path):
             assert pa.stack == "full" and pa.X_pool == 64 and pa.layout == "pool"
         if cell == "stack1b":                                             # [integ2] bigb's token log, sized
             assert pa.batch == 216 and pa.log_slots == -1 and pa.log_slots_n is not None
-        if cell == "stack1t":                                             # [integ3] M3
-            assert pa.stack_bands_v == [33.0, 36.0, 220.0, 450.0]
-    for bad in (("stack1a", "stack1b"), ("stack1", "stack1a"), ("stack1c",), ("stack1n-bogus",)):
+            assert pa.validated_by == sa + "," + sa128 and pa.stack_role == "time"   # [integ5]
+        if cell == "stack1t":                                             # [integ3] M3; [integ5] lag-2 bare headline
+            assert pa.stack_bands_v == [33.0, 36.0, 200.0, 500.0]
+            assert (pa.stack_role, pa.arrival_lag, pa.bare, pa.free_arm, pa.validated_by) == ("time", 2, True, True, sa)
+        if cell == "stack1a128":
+            assert pa.batch == 128 and pa.stack_role == "validate" and pa.stack_compare
+    for bad in (("stack1a", "stack1b"), ("stack1", "stack1a"), ("stack1c",), ("stack1n-bogus",), ("stack1a256",)):
         rb = subprocess.run(["bash", str(script), "--nosi", head.stdout.strip(), "418", "t1", *bad], env=env,
                             capture_output=True, text=True, timeout=120)
         assert rb.returncode == 2 and "usage" in rb.stderr, bad

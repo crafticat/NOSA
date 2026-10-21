@@ -209,6 +209,36 @@ Branch r2-integ3 (/mnt/beegfs/ojerbi/nosi-r2-integ3, from be3eea9); NOSI_INTEG n
 THE COMMAND (from /mnt/beegfs/ojerbi/nosi-r2-integ3 at the integ3 commit):
 `bash benchmarks/Efficiency/r2_tick_sg5_step.sh --nosi <integ3 sha> <holder> <run id> stack1`
 
+### 5.4d integ5 (2026-10-21T14:28:52Z, before any stack1 run): the timing boundary (lead's decisions)
+
+Basis: paper-notes/stack1-timing-boundaries.md. Branch r2-integ5 (/mnt/beegfs/ojerbi/nosi-r2-integ5, from integ4
+dd15c93); NOSI_INTEG points here.
+- The time cells (stack1t, stack1b; `--stack-role time`) time the path stack1a validated minus pure checks: no
+  `--sel-check`; the diagnostic witnesses OFF (XPool.witness False: no handoff counter, no peak update;
+  SharedKV.count_saved False); MUST `<label>_ST_witness_off` checks it. The validation cells (`--stack-role
+  validate`) keep every witness and gate.
+- The pool's invariant checks STAY in the timed path: the per-bind audit, the ERR_FULL / ERR_UNBOUND flags of bind,
+  translate, gather_entries and draft_bias_fill_flat. They are the production safety refusal (xpool_err is read in
+  the tick's one blocking decision read, which runs anyway): device ops, no extra synchronisation.
+- Bitwise equality is proven ONLY at arrival lag 2 (stack1a, stack1a128). So the HEADLINE arm of stack1t / stack1b
+  runs lag 2 with `--bare` (tick events only); the same arm's instrumented round gives the category split (REPORT);
+  `--free-arm` adds one free-arrival arm (REPORT timing; MUST only the lag-free invariants: completed, bookkeeping /
+  void ticks 0, the fused and pool err flags, acted, witness off).
+- stack1a128 (B 128, the stack1a comparison) must pass before stack1b. Memory (bigb's one-engine model, one engine at
+  a time: one_point frees each arm): the stack arm 51.78 GB (bigb96-128); the none arms per-stream: + 128 x (345.28
+  - 212.64) MB = + 17.0 GB, about 68.8 GB. A B 216 comparison does not fit: its none arms are about 75.89 + 216 x
+  0.1326 = 104.5 GB. So stack1b is labelled "validated at B 64 and B 128, not at 216" (meta.validated_note).
+- stack1t / stack1b cite their validation: `--validated-by` names stack1a's (stack1b: also stack1a128's)
+  summary.json; the harness refuses (exit 2, before any build) unless every MUST gate passed there, the ST replica
+  and bitwise gates included; meta.validated_by records the path, its nosi commit, B and the bitwise gate names.
+- The combined chain: stack1a (on failure the six stack1n-<c>, STOP) -> stack1a128 (STOP on failure) -> stack1p
+  (diagnostic) -> stack1t (STOP on failure) -> stack1t's bands (STOP, exit 6, unless IN) -> stack1b.
+- stack1t's bands are those of the lag-2 bare headline: 33:36:200:500 (peak GB, T_tick ms). The T_tick band is the
+  free-timing 0.22-0.45 s widened for the lag's forced waits (not modelled: x1's arrival forced / held counts are the
+  only evidence), not re-derived.
+- The L28 stride check moved into a helper (`_check_cache_layout`) outside the linted launcher (job 2191357:
+  test_shared_source_keeps_piece3_constants_and_no_host_read forbids "int(t" in the launcher); the lint is unchanged.
+
 ### 5.5 Falsifiers (each stops the claim it names)
 
 - F-ST1 any stack1a MUST fails (with the replica passed): a component changes numbers on the GPU when combined; the
