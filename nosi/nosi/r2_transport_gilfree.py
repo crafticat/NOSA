@@ -2,12 +2,31 @@
 (nosi-sustained-gilfree2 f2b981a, benchmarks/Efficiency/gilfree_pack.{py,cpp}: module gilfree_pack_v2, NativePipe) behind
 K3X's transport interface (kstep/transfer.py:8-10): issue(layer, transfers), poll(), done(tr), force(tr).
 
-ONE issue(layer, transfers) = ONE NativePipe.release of the layer's transfers as groups (b, h, l = layer, m = slot,
-blk = block): the extension packs the host rows (b*S + blk*R + r)*H + h of layer l into its pinned staging ring with
-an OpenMP team of set_threads(N) threads, GIL released, copies each chunk to the landing ring on the COPY stream (copy
-engine) and scatters it on the SCATTER stream into the destination rows (b*S_dst + m*R + r)*H + h of the layer's store
-(S_dst = the store's rows per request). Completion: an event recorded on the scatter stream after the release (every
-transfer of the issue completes on it).
+ONE issue(layer, transfers) = ONE NativePipe.release of the layer's transfers: the extension packs host rows into its
+pinned staging ring with an OpenMP team of set_threads(N) threads, GIL released, copies each chunk to the landing ring
+on the COPY stream (copy engine) and scatters it on the SCATTER stream into the destination rows of the layer's store.
+Completion: an event recorded on the scatter stream after the release (every transfer of the issue completes on it).
+
+THE GEOMETRY (FG / SG5 run on holder 2190876, 2026-10-21: "S and S_dst must be multiples of R"; E's R contract,
+FIX_DESIGN.md at f2b981a). The packer reads source row (b*S + blk*R + r)*H + h of a contiguous TOKEN-MAJOR (B, S, H, D)
+source and writes destination row (b*S_dst + m*R + r)*H + h of a (rows, D) view of a token-major store with the same
+B, H, D and dtype; it REFUSES S % R != 0 or S_dst % R != 0 (gilfree_pack.cpp order_and_check; R = 64), and its error
+does not say which side.
+- The production SOURCE side violated it. The host rows are token-major (B, n_host, H, D) (R2Body.allocate,
+  r2_decode_body.py), with n_host = S_max + horizon + 64 (r2_decode_path.ragged_widths): 16128 + 119 + 64 = 16311 in
+  SG5 p1 (horizon 48 + LAMBDA 7 + 64), 16128 + 160 + 64 = 16352 in FG (horizon 64 + 16 + 80). Neither is a multiple
+  of 64. (Not 16128 + 64: n_host holds the horizon too.)
+- The DESTINATION side holds: the store is (B, (C + X + 4 [+ 1 trash]) * 64, H, D) (TickEngine), whole 64-row slots.
+- FIX: the adapter hands the packer ONE SOURCE PER (layer, request): the zero-copy view host[l][b:b+1, :S_floor],
+  S_floor = (S_host // 64) * 64. It is contiguous (its leading dimension has size 1) and holds every complete block of
+  the host rows. A block past S_floor is never complete, so it is never history and never fetched; the adapter
+  refuses it at release. A transfer (b, h, slot, block) of layer l becomes the group (b' = 0, h, l' = l * B + b,
+  m' = b * n_slots + slot, blk = block). With the source's B = 1 the packer sees S_dst = B * rows_per_request, and
+  (0 * S_dst + m' * R + r)*H + h = (b * rows_per_request + slot * R + r)*H + h, the transfer's own destination rows.
+- CONSTRUCTION CHECKS (each names its side): the host rows and the store are 4-D token-major tensors of the same B, H,
+  D and dtype (a head-major (B, H, S, D) host is refused here, not read as S = H); the host holds at least one
+  complete block; the store's rows per request are a multiple of 64 (the tail rings and the trash slot are whole
+  slots). The release's "layers" stat counts the sources it read ((layer, request) pairs).
 
 THE ORDER RULES of K3X's transfers, kept here:
   T4  hist_ev (the tick's write-back of the block's host rows): the packer reads host rows only after it, so the
@@ -71,8 +90,35 @@ class GilfreeTransport:
         else:
             self.copy = self.scatter = None
             cs, ss = [], []
+        # the geometry (module docstring, E's R contract): token-major sources and store; one source per (layer,
+        # request), the complete blocks of the host rows; every refusal names its side
+        hk0, sk0 = self.host_k[0], slots_k[0]
+        if hk0.dim() != 4 or any(t.shape != hk0.shape or t.dtype != hk0.dtype for t in self.host_k + self.host_v):
+            raise ValueError("gilfree SOURCE: the host rows must be 4-D (B, S, H, D) tensors of one shape and dtype "
+                             "(got %s)" % (tuple(hk0.shape),))
+        if sk0.dim() != 4 or any(t.shape != sk0.shape or t.dtype != sk0.dtype for t in list(slots_k) + list(slots_v)):
+            raise ValueError("gilfree DESTINATION: the store must be 4-D (B, rows, H, D) tensors of one shape and dtype "
+                             "(got %s)" % (tuple(sk0.shape),))
+        self.B, S_host, Hh, Dh = (int(x) for x in hk0.shape)
+        rows = int(sk0.shape[1])
+        if (int(sk0.shape[0]), int(sk0.shape[2]), int(sk0.shape[3])) != (self.B, Hh, Dh) or Dh != self.D \
+                or sk0.dtype != hk0.dtype:
+            raise ValueError("gilfree: the host rows %s (SOURCE) and the store %s (DESTINATION) must both be TOKEN-MAJOR "
+                             "(B, S, H, D) with the same B, H, D (D %d) and dtype (%s, %s); a head-major (B, H, S, D) "
+                             "tensor is refused" % (tuple(hk0.shape), tuple(sk0.shape), self.D, hk0.dtype, sk0.dtype))
+        self.S_floor = (S_host // self.bs) * self.bs
+        if self.S_floor < self.bs:
+            raise ValueError("gilfree SOURCE: the host rows (%d per request) hold no complete block of %d"
+                             % (S_host, self.bs))
+        if rows % self.bs:
+            raise ValueError("gilfree DESTINATION: the store's rows per request (%d) are not a multiple of %d (a tail "
+                             "ring or a trash slot that is not a whole slot)" % (rows, self.bs))
+        self.n_slots = rows // self.bs
+        self.nblk = self.S_floor // self.bs
+        src_k = [hk[b:b + 1, :self.S_floor] for hk in self.host_k for b in range(self.B)]
+        src_v = [hv[b:b + 1, :self.S_floor] for hv in self.host_v for b in range(self.B)]
         self.npipe = ext.NativePipe(stage, land, int(cap_groups), self.bs, cs, ss)
-        self.npipe.set_sources(self.host_k, self.host_v)
+        self.npipe.set_sources(src_k, src_v)
         self.npipe.set_threads(self.threads)
         self.stats: Dict[str, int] = {k: 0 for k in STATS[:7]}
         self.stats.update(releases=0, threads_min=None, threads_max=None, published=0)   # published: (slot, gen) pairs
@@ -147,9 +193,14 @@ class GilfreeTransport:
             if (tr.b, tr.h, tr.slot) in dst:
                 raise ValueError("two transfers into one destination (b %d h %d slot %d)" % (tr.b, tr.h, tr.slot))
             dst.add((tr.b, tr.h, tr.slot))
+            if not (0 <= tr.block < self.nblk and 0 <= tr.slot < self.n_slots and 0 <= tr.b < self.B):
+                raise ValueError("gilfree: transfer seq %d (b %d, block %d, slot %d) outside the geometry (B %d, %d "
+                                 "complete host blocks, %d slots)" % (tr.seq, tr.b, tr.block, tr.slot, self.B,
+                                                                     self.nblk, self.n_slots))
         i64 = lambda xs: torch.tensor(xs, dtype=torch.int64)   # noqa: E731
-        st = self.npipe.release(i64([tr.b for tr in transfers]), i64([tr.h for tr in transfers]),
-                                i64([layer] * len(transfers)), i64([tr.slot for tr in transfers]),
+        st = self.npipe.release(i64([0] * len(transfers)), i64([tr.h for tr in transfers]),
+                                i64([layer * self.B + tr.b for tr in transfers]),
+                                i64([tr.b * self.n_slots + tr.slot for tr in transfers]),
                                 i64([tr.block for tr in transfers]), self.slots_k[layer].view(-1, self.D),
                                 self.slots_v[layer].view(-1, self.D))
         st = [int(x) for x in st]

@@ -225,3 +225,68 @@ def test_GT4_a_release_publishes_its_slot_generations(pinned):
         assert _truth_ok(gk, gv, host_k, host_v, plans)
         assert torch.equal(board.t, want if attach else torch.zeros_like(want)), attach
         assert gf.stats["published"] == (seq if attach else 0) and gf.stats["groups"] == seq   # every packed transfer
+
+
+@pytest.mark.parametrize("s_host, n_slots", [(16128 + 119 + 64, 80 + 32 + 4), (16128 + 160 + 64, 80 + 32 + 4),
+                                             (16128 + 160 + 64, 80 + 32 + 5), (16128 + 64, 80 + 32 + 5),
+                                             (16128 + 119 + 64, 96 + 32 + 4)])
+def test_GT5_the_production_geometry(pinned, s_host, n_slots):
+    """GT5 (the FG / SG5 run on holder 2190876: "S and S_dst must be multiples of R"): the PRODUCTION geometry. The host
+    rows per request are build_ragged's n_host = S_max + horizon + 64 (r2_decode_path.ragged_widths): SG5 p1 16128 +
+    119 + 64 = 16311 (horizon 48 + LAMBDA 7 + 64), FG 16128 + 160 + 64 = 16352 (horizon 64 + 16 + 80); both are not
+    multiples of 64; and 16128 + 64, a multiple. The store holds C + X + 4 slots per request (C 80 / X 32; + 5 with the
+    trash slot; C 96). The adapter lands every transfer's rows equal to the host truth, the last complete host block,
+    the first and the last slot of a request included; a block past the complete host blocks is refused by the adapter,
+    before the packer. Negative control: the packer called as the adapter called it before (one batched (B, S_host, H,
+    D) source per layer) refuses that geometry ("S and S_dst must be multiples of R") whenever S_host is not a multiple
+    of 64."""
+    Bp, Hp, Dp = 2, 2, 4
+    g = torch.Generator().manual_seed(11)
+    host_k = [torch.randn(Bp, s_host, Hp, Dp, generator=g) for _ in range(L)]
+    host_v = [torch.randn(Bp, s_host, Hp, Dp, generator=g) for _ in range(L)]
+    sk = [torch.zeros(Bp, n_slots * BS, Hp, Dp) for _ in range(L)]
+    sv = [torch.zeros(Bp, n_slots * BS, Hp, Dp) for _ in range(L)]
+    gf = GF.GilfreeTransport(pinned.ext, host_k, host_v, sk, sv, BS, Dp, threads=2, host_wait=lambda ev: None,
+                             cap_groups=4)
+    nblk = s_host // BS
+    assert (gf.nblk, gf.n_slots, gf.S_floor) == (nblk, n_slots, nblk * BS)
+    groups = [(0, 0, nblk - 1, n_slots - 1), (1, 1, nblk - 1, 0), (1, 0, 0, n_slots - 2), (0, 1, 7, 5)]
+    gf.issue(1, _transfers(1, groups, 0))
+    assert _truth_ok(sk, sv, host_k, host_v, [(1, groups)]) and gf.threads_ok()
+    with pytest.raises(ValueError, match="outside the geometry"):
+        gf.issue(0, _transfers(0, [(0, 0, nblk, 1)], 10))
+    if s_host % BS:
+        elem = host_k[0].element_size()
+        nb = 4 * BS * 8 + 2 * 4 * BS * Dp * elem
+        npipe = pinned.ext.NativePipe(torch.zeros((2, nb), dtype=torch.uint8), torch.zeros((2, nb), dtype=torch.uint8),
+                                      4, BS, [], [])
+        npipe.set_sources(host_k, host_v)
+        i64 = lambda xs: torch.tensor(xs, dtype=torch.int64)   # noqa: E731
+        with pytest.raises(RuntimeError, match="multiples of R"):
+            npipe.release(i64([0]), i64([0]), i64([1]), i64([3]), i64([2]), sk[1].view(-1, Dp), sv[1].view(-1, Dp))
+
+
+def test_GT5b_a_geometry_outside_the_contract_is_refused_at_construction(pinned):
+    """GT5b (E's R contract, FIX_DESIGN.md at f2b981a): the adapter refuses, at construction and naming the side, every
+    geometry the packer would refuse or misread: a HEAD-MAJOR (B, H, S, D) host (the packer would read S = H), a store
+    whose rows per request are not whole 64-row slots (DESTINATION), host rows without one complete block (SOURCE), a
+    store of another B. Positive control: a token-major host whose rows are not a multiple of 64 (5 x 64 + 55) and a
+    store of C + X + 5 whole slots are accepted (GT5 checks the bytes of such geometries)."""
+    Bp, Hp, Dp, s_host, n_slots = 2, 2, 4, 5 * BS + 55, 80 + 32 + 5
+
+    def build(host_shape, store_shape):
+        hk = [torch.zeros(*host_shape) for _ in range(L)]
+        hv = [torch.zeros(*host_shape) for _ in range(L)]
+        sk = [torch.zeros(*store_shape) for _ in range(L)]
+        sv = [torch.zeros(*store_shape) for _ in range(L)]
+        return GF.GilfreeTransport(pinned.ext, hk, hv, sk, sv, BS, Dp, threads=2, host_wait=lambda ev: None,
+                                   cap_groups=4)
+    gf = build((Bp, s_host, Hp, Dp), (Bp, n_slots * BS, Hp, Dp))
+    assert (gf.nblk, gf.n_slots) == (5, n_slots)
+    for host_shape, store_shape, match in (
+            ((Bp, Hp, s_host, Dp), (Bp, n_slots * BS, Hp, Dp), "must both be TOKEN-MAJOR"),
+            ((Bp, s_host, Hp, Dp), (Bp, n_slots * BS + 32, Hp, Dp), "DESTINATION: the store's rows per request"),
+            ((Bp, BS - 1, Hp, Dp), (Bp, n_slots * BS, Hp, Dp), "SOURCE: the host rows .* hold no complete block"),
+            ((Bp, s_host, Hp, Dp), (Bp + 1, n_slots * BS, Hp, Dp), "must both be TOKEN-MAJOR")):
+        with pytest.raises(ValueError, match=match):
+            build(host_shape, store_shape)
