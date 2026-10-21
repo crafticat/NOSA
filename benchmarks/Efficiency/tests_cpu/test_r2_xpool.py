@@ -730,6 +730,37 @@ def _pool_content_ok(w, l, rows, sel, plan):
     return True
 
 
+def _lane_hooks(w, cnt):
+    """TEST INSTRUMENTATION of a pool world (the lane-level order): read_done records each read lane's last reader;
+    after every bind, a lane bound anew counts in cnt["rebinds"] if it was read before, and in cnt["hazards"] if that
+    last reader is still pending."""
+    svc, xp = w.svc, w.xp
+    NS = svc.n_hist
+    lane_reader = {}
+    bind0, rd0 = xp.bind, svc.read_done
+
+    def bind(l, bb, hh, slot, mask):
+        before = xp.pos_of[l, :, :, :NS].clone()
+        bind0(l, bb, hh, slot, mask)
+        new = (before < 0) & (xp.pos_of[l, :, :, :NS] >= 0)
+        for (b, h, s) in new.nonzero().tolist():
+            key = (l, h, int(xp.pos_of[l, b, h, s]))
+            if key in lane_reader:
+                cnt["rebinds"] += 1
+                if not lane_reader[key].done:
+                    cnt["hazards"] += 1
+
+    def read_done(l, plan, ev):
+        sq = plan.seq_idx.tolist()
+        for i in range(plan.page_table.shape[0]):
+            for h in range(TRM.H):
+                for s in plan.page_table[i, h, :int(plan.num_pages[i, h])].tolist():
+                    if 0 <= s < NS and int(xp.pos_of[l, sq[i], h, s]) >= 0:
+                        lane_reader[(l, h, int(xp.pos_of[l, sq[i], h, s]))] = ev
+        return rd0(l, plan, ev)
+    xp.bind, svc.read_done = bind, read_done
+
+
 def _svc_run(w, case, pool, lane_check=False):
     """One schedule on one world (test_r2_residency._lockstep_sc's tick, one world): per tick the logical pages, the
     content at the read point, the state and the counters; readers complete two ticks late. lane_check (pool): every
@@ -741,30 +772,7 @@ def _svc_run(w, case, pool, lane_check=False):
     log, readers = [], []
     cnt = dict(hazards=0, rebinds=0)
     if pool and lane_check:
-        xp, NS = w.xp, svc.n_hist
-        lane_reader = {}
-        bind0, rd0 = xp.bind, svc.read_done
-
-        def bind(l, bb, hh, slot, mask):
-            before = xp.pos_of[l, :, :, :NS].clone()
-            bind0(l, bb, hh, slot, mask)
-            new = (before < 0) & (xp.pos_of[l, :, :, :NS] >= 0)
-            for (b, h, s) in new.nonzero().tolist():
-                key = (l, h, int(xp.pos_of[l, b, h, s]))
-                if key in lane_reader:
-                    cnt["rebinds"] += 1
-                    if not lane_reader[key].done:
-                        cnt["hazards"] += 1
-
-        def read_done(l, plan, ev):
-            sq = plan.seq_idx.tolist()
-            for i in range(plan.page_table.shape[0]):
-                for h in range(TRM.H):
-                    for s in plan.page_table[i, h, :int(plan.num_pages[i, h])].tolist():
-                        if 0 <= s < NS and int(xp.pos_of[l, sq[i], h, s]) >= 0:
-                            lane_reader[(l, h, int(xp.pos_of[l, sq[i], h, s]))] = ev
-            return rd0(l, plan, ev)
-        xp.bind, svc.read_done = bind, read_done
+        _lane_hooks(w, cnt)
     for b, u in enumerate(("u0", "u1")):
         svc.begin_request(b, u)
     tail = svc.tail0
@@ -870,14 +878,81 @@ def test_XP13_the_pool_service_equals_the_per_stream_service_and_early_unbinds_a
     assert p.cnt["rebinds"] > 0, ("precondition: lanes were rebound after a read", p.cnt)
     assert _svc_diff(s, p) is None, (_svc_diff(s, p), p.err)
     assert p.cnt["hazards"] == 0 and int(p.w.xp.err) == 0, p.cnt
-    _, rr = _svc_pair(F20B, xp_mut={"release_releasing": True}, lane_check=True)
-    el = rr.w.xp.early_log
-    assert el and any(e["to"] is not None for e in el), ("precondition: no early-unbound lane was bound again", el[:3])
+    # The plants on F20b were no-ops (job 2191239: early_log empty): there a RELEASING slot's reader is done before the
+    # next tick's poll frees it. The plants therefore run on two SCRIPTS that force the case (test_r2_residency's F12e
+    # shape, one stream, C 2, X 4: the arena's lowest free lanes are exactly the released ones).
+    clean = _script_releasing(None)
+    assert clean.early == [] and clean.cnt["hazards"] == 0 and clean.lane5 not in clean.old_lanes, clean
+    rr = _script_releasing({"release_releasing": True})
+    assert rr.states == ["RELEASING", "RELEASING", "FREE"], ("precondition: slots 0, 1 RELEASING, reader pending", rr)
+    assert rr.early and any(e["to"] is not None for e in rr.early), ("precondition: no early-unbound lane was bound "
+                                                                     "again", rr.early)
     assert rr.cnt["hazards"] > 0, rr.cnt
-    s2, ri = _svc_pair(F20B, xp_mut={"release_inflight": True})
-    el = ri.w.xp.early_log
-    assert el and any(e["to"] is not None for e in el), ("precondition: no early-unbound lane was bound again", el[:3])
-    assert _svc_diff(s2, ri) is not None
+    ok = _script_inflight(None)
+    assert ok.early == [] and ok.content_ok, ok
+    ri = _script_inflight({"release_inflight": True})
+    assert ri.early and any(e["to"] is not None for e in ri.early), ("precondition: no early-unbound lane was bound "
+                                                                     "again", ri.early)
+    assert not ri.content_ok, ri                                       # the comparison with the clean script differs
+
+
+def _script_world(mut):
+    w = _pool_svc_world(2, 4, 2, 0, mode="force_only", xp_mut=mut)
+    cnt = dict(hazards=0, rebinds=0)
+    _lane_hooks(w, cnt)
+    return w, cnt
+
+
+def _script_releasing(mut):
+    """F12e's script on the flat layout: u0's draft takes slots 0, 1 (lanes 0, 1); they land; u0's verifier reads them
+    (reader ev1, PENDING); u0 ends, so slots 0, 1 are RELEASING; u1's verifier misses block 5 and takes slot 2. Clean:
+    slot 2 gets a NEW lane (2). release_releasing: lanes 0, 1 are unbound early and slot 2 takes lane 0 under ev1."""
+    w, cnt = _script_world(mut)
+    svc, Row, S = w.svc, TRM.Row, TRM.S
+    svc.begin_request(0, "u0")
+    svc.poll()
+    p = svc.resolve(0, [Row(0, "d", ("u0", 1, 1), 300, 10)], S([[0, 1], []]))
+    svc.read_done(0, p, TRM.Ev(done=True))
+    svc.end_tick()
+    TRM.land_all(w)
+    old = [int(w.xp.pos_of[0, 0, 0, s]) for s in (0, 1)]
+    ev1 = TRM.Ev()
+    p = svc.resolve(0, [Row(0, "v", ("u0", 1, 1), 300, 10)], S([[0, 1], []]))
+    svc.read_done(0, p, ev1)
+    svc.end_tick()
+    svc.end_request("u0")
+    svc.poll()
+    states = [s.state for s in svc.stream(0, 0, 0).slots[:3]]
+    svc.begin_request(0, "u1")
+    p = svc.resolve(0, [Row(0, "v", ("u1", 1, 1), 300, 10)], S([[5], []]))
+    return SimpleNamespace(cnt=dict(cnt), early=list(w.xp.early_log), old_lanes=old, ev1_done=ev1.done,
+                           lane5=int(w.xp.pos_of[0, 0, 0, int(p.page_table[0, 0, 0])]),
+                           states=["RELEASING" if x == TRM.OWN.RELEASING else "FREE" if x == TRM.OWN.FREE else str(x)
+                                   for x in states])
+
+
+def _script_inflight(mut):
+    """u0's draft takes slots 0, 1 (blocks 0, 1; lanes 0, 1); the transfers do NOT land (force_only); next tick u0's
+    verifier reads blocks 0, 1 (in flight: waited) and misses block 5. Clean: block 5 takes lane 2 and every listed page
+    holds its block. release_inflight: lanes 0, 1 are unbound while their transfers are in flight; block 5 takes lane
+    0; the read point's content check fails (an in-flight slot without a lane, or a lane overwritten)."""
+    w, cnt = _script_world(mut)
+    svc, Row, S = w.svc, TRM.Row, TRM.S
+    svc.begin_request(0, "u0")
+    svc.poll()
+    p = svc.resolve(0, [Row(0, "d", ("u0", 1, 1), 300, 10)], S([[0, 1], []]))
+    svc.read_done(0, p, TRM.Ev(done=True))
+    svc.end_tick()                                                    # issued with lanes 0, 1; not landed
+    svc.poll()
+    rows = [Row(0, "v", ("u0", 1, 1), 300, 10)]
+    sel = S([[0, 1, 5], []])
+    err, content = None, False
+    try:
+        p = svc.resolve(0, rows, sel)
+        content = _pool_content_ok(w, 0, rows, sel, p)
+    except Exception as e:                                            # noqa: BLE001 - a refusal counts as caught
+        err = e
+    return SimpleNamespace(cnt=dict(cnt), early=list(w.xp.early_log), content_ok=content and err is None, err=err)
 
 
 def test_XP10_the_pool_needs_a_blocking_decision_read():
