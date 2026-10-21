@@ -907,12 +907,21 @@ class OwnResidency(ResidencySparse):
                         self.rec_mut_done = (self.tick_no, kind)
                         return
             if kind == "drop_d_merge" and D is not None:              # a merge whose transfer lacks the draft bit
+                # C's predicate (r2_residency_sparse.py:491-495): the transfer in flight lacks the draft demand, OR it
+                # does not exist yet: the layer's OWN urgent verify take of this tick (demand {verify}), created at
+                # apply; the tick-start slot_of cannot name it, the layer's verify GRANT / EVICT records do
                 so = O.slot_of(self.own)
+                vtake = set()
+                if V is not None:
+                    for iv in (torch.bitwise_and(V[2], O.GRANT | O.EVICT) != 0).nonzero().view(-1).tolist():
+                        jv, hv = int(V[0, iv]) // (G.H * kx), (int(V[0, iv]) // kx) % G.H
+                        vtake.add(((l * G.B + int(rows.vb[jv])) * G.H + hv, int(V[1, iv])))
                 for i in (torch.bitwise_and(D[2], O.INFL) != 0).nonzero().view(-1).tolist():
                     j, h = int(D[0, i]) // (G.H * kx), (int(D[0, i]) // kx) % G.H
                     s = (l * G.B + int(rows.db[j])) * G.H + h
                     sl = int(so[s, int(D[1, i])])
-                    if sl >= 0 and int(dem[s * G.NPOS + sl]) & O.DEM_D == 0:
+                    if (sl < 0 and (s, int(D[1, i])) in vtake) or \
+                            (sl >= 0 and int(dem[s * G.NPOS + sl]) & O.DEM_D == 0):
                         x["drec"] = _without(D, i)
                         self.rec_mut_done = (self.tick_no, kind)
                         return
