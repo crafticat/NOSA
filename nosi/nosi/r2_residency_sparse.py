@@ -68,6 +68,7 @@ import torch.nn.functional as F_nn
 
 from .kstep.errors import CapacityRefusal, OwnershipViolation
 from .kstep.executor import DRAFT, VERIFY
+from . import r2_xpool as XP
 from .r2_residency import Plan, Row
 from .r2_residency_sc import C_LRU, C_PO, C_VRES, ResidencySC
 
@@ -307,7 +308,10 @@ class ResidencySparse(ResidencySC):
         step["caps"] = (args[11], args[12])
         ddec, bbd, hhd = args[5], args[7], args[8]
         if ddec is not None and self.store_b is not None and self.cis is not None:
-            draft_bias_fill(self.store_b[l], self.cis[l], ddec, bbd, hhd, self.bs)
+            if self.xpool is not None:                                # [xpool] the takes' lanes (bound in resolve)
+                XP.draft_bias_fill_flat(self.xpool, l, self.store_b[l], self.cis[l], ddec, bbd, hhd, self.bs)
+            else:
+                draft_bias_fill(self.store_b[l], self.cis[l], ddec, bbd, hhd, self.bs)
 
     # ------------------------------------------------------------------------------------------------ the consumer
     def apply_tick(self, steps: List[Dict]) -> None:

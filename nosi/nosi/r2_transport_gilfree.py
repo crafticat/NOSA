@@ -27,6 +27,9 @@ does not say which side.
   D and dtype (a head-major (B, H, S, D) host is refused here, not read as S = H); the host holds at least one
   complete block; the store's rows per request are a multiple of 64 (the tail rings and the trash slot are whole
   slots). The release's "layers" stat counts the sources it read ((layer, request) pairs).
+- [xpool] (xpool=r2_xpool.XPool, the shared-pool layout, opt-in): the destination is the FLAT store (M * 64, H, D); a
+  transfer's group is (b' = 0, h, l' = l * B + b, m' = Transfer.phys, blk), so (m' * R + r) * H + h is lane h of its
+  position (S_dst = M * 64; the packer's m' < M check is the lane bound). The duplicate check is per (h, lane).
 
 THE ORDER RULES of K3X's transfers, kept here:
   T4  hist_ev (the tick's write-back of the block's host rows): the packer reads host rows only after it, so the
@@ -80,7 +83,7 @@ class GilfreeTransport:
     def __init__(self, ext, host_k: Sequence[torch.Tensor], host_v: Sequence[torch.Tensor], slots_k, slots_v, bs: int,
                  D: int, threads: int, host_wait: Callable[[Any], None], cap_groups: int = 256, ring: int = 2,
                  cores: Optional[Sequence[int]] = None, background: bool = False, skip_hist_wait: bool = False,
-                 thread_modes: bool = True):
+                 thread_modes: bool = True, xpool=None):
         if not 1 <= int(threads) <= 256:
             raise ValueError("threads must be in 1 .. 256 (got %r)" % (threads,))
         if int(threads) > 1 and int(getattr(ext, "OPENMP", 0)) != 1:
@@ -109,13 +112,28 @@ class GilfreeTransport:
         if hk0.dim() != 4 or any(t.shape != hk0.shape or t.dtype != hk0.dtype for t in self.host_k + self.host_v):
             raise ValueError("gilfree SOURCE: the host rows must be 4-D (B, S, H, D) tensors of one shape and dtype "
                              "(got %s)" % (tuple(hk0.shape),))
-        if sk0.dim() != 4 or any(t.shape != sk0.shape or t.dtype != sk0.dtype for t in list(slots_k) + list(slots_v)):
+        self.xpool = xpool
+        if xpool is not None:
+            # [xpool] the flat store (M * 64, H, D) of r2_xpool: the packer's destination row (0 * S_dst + m' * R + r)
+            # * H + h with S_dst = M * 64 (the source's B is 1) is lane h of position m' = Transfer.phys
+            if sk0.dim() != 3 or any(t.shape != sk0.shape or t.dtype != sk0.dtype for t in list(slots_k) + list(slots_v)):
+                raise ValueError("gilfree DESTINATION (xpool): the store must be flat (M * 64, H, D) tensors of one shape "
+                                 "and dtype (got %s)" % (tuple(sk0.shape),))
+            self.B, S_host, Hh, Dh = (int(x) for x in hk0.shape)
+            rows = int(sk0.shape[0])
+            if rows != xpool.M * self.bs or (int(sk0.shape[1]), int(sk0.shape[2])) != (Hh, Dh) or Dh != self.D \
+                    or sk0.dtype != hk0.dtype or xpool.B != self.B or xpool.H != Hh:
+                raise ValueError("gilfree (xpool): the host rows %s and the flat store %s must share H, D (D %d) and "
+                                 "dtype, with M * %d = %d rows and the xpool's B, H"
+                                 % (tuple(hk0.shape), tuple(sk0.shape), self.D, self.bs, xpool.M * self.bs))
+        elif sk0.dim() != 4 or any(t.shape != sk0.shape or t.dtype != sk0.dtype for t in list(slots_k) + list(slots_v)):
             raise ValueError("gilfree DESTINATION: the store must be 4-D (B, rows, H, D) tensors of one shape and dtype "
                              "(got %s)" % (tuple(sk0.shape),))
-        self.B, S_host, Hh, Dh = (int(x) for x in hk0.shape)
-        rows = int(sk0.shape[1])
-        if (int(sk0.shape[0]), int(sk0.shape[2]), int(sk0.shape[3])) != (self.B, Hh, Dh) or Dh != self.D \
-                or sk0.dtype != hk0.dtype:
+        else:
+            self.B, S_host, Hh, Dh = (int(x) for x in hk0.shape)
+            rows = int(sk0.shape[1])
+        if xpool is None and ((int(sk0.shape[0]), int(sk0.shape[2]), int(sk0.shape[3])) != (self.B, Hh, Dh)
+                              or Dh != self.D or sk0.dtype != hk0.dtype):
             raise ValueError("gilfree: the host rows %s (SOURCE) and the store %s (DESTINATION) must both be TOKEN-MAJOR "
                              "(B, S, H, D) with the same B, H, D (D %d) and dtype (%s, %s); a head-major (B, H, S, D) "
                              "tensor is refused" % (tuple(hk0.shape), tuple(sk0.shape), self.D, hk0.dtype, sk0.dtype))
@@ -223,18 +241,23 @@ class GilfreeTransport:
                 else:
                     self.host_wait(tr.reader_ev)
         dst = set()
+        flat = self.xpool is not None                          # [xpool] the destination is the transfer's lane
         for tr in transfers:
-            if (tr.b, tr.h, tr.slot) in dst:
-                raise ValueError("two transfers into one destination (b %d h %d slot %d)" % (tr.b, tr.h, tr.slot))
-            dst.add((tr.b, tr.h, tr.slot))
-            if not (0 <= tr.block < self.nblk and 0 <= tr.slot < self.n_slots and 0 <= tr.b < self.B):
+            d = (tr.h, tr.phys) if flat else (tr.b, tr.h, tr.slot)
+            if d in dst:
+                raise ValueError("two transfers into one destination %s (b %d h %d slot %d)" % (d, tr.b, tr.h, tr.slot))
+            dst.add(d)
+            if flat and (tr.phys is None or not 0 <= tr.phys < self.xpool.A):   # the history arena (review m2)
+                raise ValueError("gilfree (xpool): transfer seq %d (b %d h %d slot %d) has lane %r outside the history "
+                                 "arena [0, %d)" % (tr.seq, tr.b, tr.h, tr.slot, tr.phys, self.xpool.A))
+            if not (0 <= tr.block < self.nblk and (flat or 0 <= tr.slot < self.n_slots) and 0 <= tr.b < self.B):
                 raise ValueError("gilfree: transfer seq %d (b %d, block %d, slot %d) outside the geometry (B %d, %d "
                                  "complete host blocks, %d slots)" % (tr.seq, tr.b, tr.block, tr.slot, self.B,
                                                                      self.nblk, self.n_slots))
         i64 = lambda xs: torch.tensor(xs, dtype=torch.int64)   # noqa: E731
         st = self.npipe.release(i64([0] * len(transfers)), i64([tr.h for tr in transfers]),
                                 i64([layer * self.B + tr.b for tr in transfers]),
-                                i64([tr.b * self.n_slots + tr.slot for tr in transfers]),
+                                i64([tr.phys if flat else tr.b * self.n_slots + tr.slot for tr in transfers]),
                                 i64([tr.block for tr in transfers]), self.slots_k[layer].view(-1, self.D),
                                 self.slots_v[layer].view(-1, self.D))
         st = [int(x) for x in st]

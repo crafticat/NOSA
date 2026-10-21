@@ -35,6 +35,14 @@ documents when B > 94, labelled):
            the same report.
 MUST gates: every run completes (no exception; a CapacityRefusal is reported with its configuration), no void tick,
 the twins' counters equal the host mirrors after each round, the gilfree team ran on the requested threads.
+[xpool] THE SHARED X POOL LAYOUT (step S6, opt-in; nosi/nosi/r2_xpool.py, docs/R2_XPOOL_PLAN.md): --layout stream (the
+default: every arm as before) | pool (the store of B (C + 4) + X_pool positions per layer; --X-pool, default X; sc and
+b2 only) | both (each point runs three arms, stream, pool, stream2, labelled <label>_<arm>; needs --arrival-lag >= 1
+and no sweep; the preflight runs the pool layout; one_point_both: MUST gates <label>_XP_replica (stream2 = stream),
+<label>_XP_committed, <label>_XP_bitwise (rows and per-row logit fingerprints; VOID without the replica); REPORTS
+<label>_XP_peak and <label>_XP_tick against the mean of the two stream arms). --arrival-lag D (default 0 = free
+timing): the residency's fixed arrival lag (note 12k) for every engine of the run. --pool-rule stream (default:
+NOSI_POOL_BLOCKS = C + X + 4 - 64) | k5 (r2_xpool.equal_memory_pool: C + 4 - 64 + floor(X_pool / B)) | both.
 OUTPUT: --out/summary.json (after every run). The last stdout line is R2_TICK_SG5_DONE failed=<n>; exit = n (2 =
 refused). ENVIRONMENT: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0, NOSI_POOL_BLOCKS = 0 (the parent; a child sets its own).
 """
@@ -58,6 +66,9 @@ import r2_g0bi_gate as GB  # noqa: E402  (load_by_path, free, gate)
 BACKENDS = ("sc", "sb", "v1", "b2")                                                     # [b2] b2: OwnResidency
 MODES = ("exact", "fast")
 TRANSPORTS = ("gilfree", "gather")
+LAYOUTS = ("stream", "pool", "both")                                                    # [xpool]
+XPOOL_BACKENDS = ("sc", "b2")                                                           # [xpool] S-C's device path
+_PEAK = [0]                                                                             # [xpool] the max before resets
 
 
 def log(msg):
@@ -111,6 +122,15 @@ def parse_args(argv):
     ap.add_argument("--b2-res-profile", action="store_true",                                    # [fusedres2] M3
                     help="b2: torch.profiler over the draft-only phase; the device time per draft tick of the kernels "
                          "launched inside the 't.res' spans (r2_fusedres_prof.py); its spans are NOT timings")
+    ap.add_argument("--layout", default="stream", choices=LAYOUTS,                               # [xpool]
+                    help="the store: stream (per-stream, the default), pool (the shared X pool), both (compare)")
+    ap.add_argument("--X-pool", type=int, default=-1,                                            # [xpool]
+                    help="the pool's positions per layer (H lanes each); -1: X (K5's own bound)")
+    ap.add_argument("--pool-rule", default="stream", choices=("stream", "k5", "both"),          # [xpool]
+                    help="the equal-memory shipped baseline's NOSI_POOL_BLOCKS rule (with --pool-baseline)")
+    ap.add_argument("--arrival-lag", type=int, default=0,                                        # [xpool] review B1
+                    help="the residency's fixed arrival lag D (note 12k; 0: free timing, the default); --layout both "
+                         "needs D >= 1, so the arms are comparable tick by tick")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -132,7 +152,32 @@ def parse_args(argv):
     if a.variant_list is None:                                                                   # [batched-rebuild]
         ap.error("--variants: twin/rebuild,... with twin in torch|fused and rebuild in per_call|batched, distinct")
     a.rebuild = a.variant_list[0][1]                                                             # [batched-rebuild]
+    if a.layout != "stream" and any(b not in XPOOL_BACKENDS for b in a.backends):                # [xpool]
+        ap.error("--layout %s: the shared pool runs on %s only (S-C's device path binds the lanes)"
+                 % (a.layout, XPOOL_BACKENDS))
+    if a.X_pool != -1 and (a.layout == "stream" or a.X_pool < a.X):                              # [xpool]
+        ap.error("--X-pool needs --layout pool / both and X_pool >= X (K5's bound per head)")
+    if a.arrival_lag < 0 or (a.layout == "both" and a.arrival_lag < 1):                         # [xpool] review B1
+        ap.error("--arrival-lag >= 0; --layout both needs --arrival-lag >= 1 (free timing makes two runs differ, "
+                 "note 12k)")
+    if a.layout == "both" and a.sweep_pts:                                                       # [xpool] review m4
+        ap.error("--layout both runs no sweep (the sweep's points would run the pool arm only)")
     return a
+
+
+def pool_positions(a, X):                                                                       # [xpool]
+    """[xpool] The pool's positions per layer at a point with K5 bound X: --X-pool, or X when it is -1."""
+    return X if a.X_pool < 0 else a.X_pool
+
+
+def pool_rule_value(a, rule):                                                                   # [xpool]
+    """[xpool] NOSI_POOL_BLOCKS of the equal-memory shipped baseline at the primary point under `rule` (before max(0,
+    .)): "stream" C + X + 4 - 64; "k5" C + 4 - 64 + floor(X_pool / B) = r2_xpool.equal_memory_pool's k5 rule with
+    pool_lanes = H X_pool (H cancels: a position has H lanes, one per head; review m5). Rounded DOWN (the audit's Q4.4
+    wrote ceil; at x1 both give 37). The CPU test XP4 pins the two together; the parent does not import nosi here."""
+    if rule == "stream":
+        return a.C + a.X + 4 - 64
+    return a.C + 4 - 64 + pool_positions(a, a.X) // a.batch
 
 
 def parse_variants(text, twin):                                                                 # [batched-rebuild]
@@ -241,19 +286,49 @@ class GatherTransport:
 
     name = "gather"
 
-    def __init__(self, host_k, host_v, store_k, store_v, n_slots: int, bs: int = 64):
+    def __init__(self, host_k, host_v, store_k, store_v, n_slots: int, bs: int = 64, xpool=None):
         import torch
         from nosi.flash_cache_engine.flash_h2d_mask import flash_h2d_from_mask
         self.h2d = flash_h2d_from_mask
         self.host_k, self.host_v, self.store_k, self.store_v = host_k, host_v, store_k, store_v
         self.n_slots, self.bs = int(n_slots), int(bs)
+        self.xpool = xpool                          # [xpool] the flat store: one entry per transfer, its lane (phys)
         self.side = torch.cuda.Stream(device=store_k[0].device)
         self.stats = dict(releases=0, transfers=0, threads_min=None, threads_max=None)
+
+    def _issue_flat(self, layer, transfers):                                                     # [xpool]
+        """[xpool] ONE launch of r2_xpool.h2d_entries (entries b, h, block, lane) on the side stream, after the same
+        waits; the bias rows are not moved (the service fills them at take)."""
+        import torch
+        from nosi.r2_xpool import h2d_entries
+        dst = set()
+        for tr in transfers:
+            if tr.phys is None or (tr.h, tr.phys) in dst:
+                raise ValueError("gather (xpool): transfer seq %d has no lane or shares (h %d, lane %r)"
+                                 % (tr.seq, tr.h, tr.phys))
+            dst.add((tr.h, tr.phys))
+        ent = torch.tensor([[tr.b, tr.h, tr.block, tr.phys, 1] for tr in transfers], dtype=torch.int64).t().contiguous()
+        with torch.cuda.stream(self.side):
+            for tr in transfers:
+                for ev in (tr.hist_ev, tr.reader_ev):
+                    if ev is not None:
+                        self.side.wait_event(ev)
+            d = ent.pin_memory().to(self.store_k[layer].device, non_blocking=True)
+            h2d_entries(self.store_k[layer], self.store_v[layer], None, self.host_k[layer], self.host_v[layer], None, d,
+                        self.bs)
+            ev = torch.cuda.Event()
+            ev.record(self.side)
+        for tr in transfers:
+            tr.ev = ev
+        self.stats["releases"] += 1
+        self.stats["transfers"] += len(transfers)
 
     def issue(self, layer, transfers):
         import torch
         if not transfers:
             return
+        if self.xpool is not None:                                                               # [xpool]
+            return self._issue_flat(layer, transfers)
         B, H = int(self.store_k[layer].shape[0]), int(self.store_k[layer].shape[2])
         ids = torch.full((H, B, self.n_slots), -1, dtype=torch.int64)
         for tr in transfers:
@@ -317,17 +392,34 @@ def cuda_event():
     return e
 
 
-def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=None, transport=None):
-    """A fresh engine on the Residency layout with its service and gilfree transport (module docstring)."""
+def arm_layout(a, layout=None):                                                                 # [xpool]
+    """[xpool] The store layout of an arm: the caller's, else --layout ("both": the pool, e.g. in the preflight)."""
+    lay = layout or getattr(a, "layout", "stream")
+    return "pool" if lay == "both" else lay
+
+
+def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=None, transport=None, layout=None):
+    """A fresh engine on the Residency layout with its service and gilfree transport (module docstring). [xpool]
+    layout (default --layout): "pool" builds the shared-pool store (sc / b2 only) and hands its XPool to the
+    transports and the service."""
     import torch
     from nosi.r2_residency import Residency, TorchGather
     from nosi.r2_residency_sb import ResidencySB
     from nosi.r2_residency_sc import CudaDeviceOps, ResidencySC
     from nosi.r2_tick import ResidencyBackend, TickEngine, TickTimer
     from nosi.r2_transport_gilfree import GilfreeTransport
-    eng = TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin)               # [twin-variant]
+    xspec = None                                                                                 # [xpool]
+    if arm_layout(a, layout) == "pool":                                                          # [xpool]
+        if kind not in XPOOL_BACKENDS:                                                           # [xpool]
+            raise RuntimeError("the shared pool runs on %s only (got %s)" % (XPOOL_BACKENDS, kind))
+        xspec = (C, pool_positions(a, X))                                                        # [xpool]
+    if xspec is None:                                                                            # the default layout
+        eng = TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin)           # [twin-variant]
+    else:                                                                                        # [xpool]
+        eng = TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin, xpool=xspec)
     eng.rebuild = getattr(a, "rebuild", "per_call")         # [batched-rebuild] the arm's rebuild (parse_variants checks)
     B, L, H = eng.B, eng.L, eng.H
+    xp = eng.xpool                                                                               # [xpool] or None
     host_k = [lay.cache_engine._k_cpu for lay in cache.layers]
     host_v = [lay.cache_engine._v_cpu for lay in cache.layers]
     n_host = int(host_k[0].shape[1])
@@ -337,12 +429,16 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
         if ext is None:
             raise RuntimeError("the gilfree transport needs the packer extension (not built in this run)")
         tp = GilfreeTransport(ext, host_k, host_v, eng.store_k, eng.store_v, 64, eng.D, threads=a.threads, host_wait=hw,
-                              background=True)
+                              background=True, xpool=xp)                                         # [xpool] xp or None
     else:
-        tp = GatherTransport(host_k, host_v, eng.store_k, eng.store_v, C + X)
+        tp = GatherTransport(host_k, host_v, eng.store_k, eng.store_v, C + X, xpool=xp)          # [xpool] xp or None
     gather = TorchGather(host_k, host_v, eng.store_k, eng.store_v)
     args = (L, B, H, C, X, R_ver, tp, gather)
     kw = dict(store_b=eng.store_bias, cis=cis, block_bytes=64 * 2 * eng.D * 2, host_wait=hw)
+    if xp is not None:                                                                           # [xpool]
+        kw["xpool"] = xp
+    if getattr(a, "arrival_lag", 0) > 0:                                                         # [xpool] review B1
+        kw["arrival_lag"] = a.arrival_lag
     if kind == "v1":
         svc = Residency(*args, **kw)
     elif kind == "sb":
@@ -474,15 +570,40 @@ def sc_counters(svc):
     return out or None
 
 
-def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_shipped, gates, label, bare=False):
+def logit_fingerprint(logits):                                                                  # [xpool]
+    """[xpool] Per row, sum_i bits(logit_i) * (2 i + 1) over the raw float32 bits as int64 (wrapping): device ops, no
+    read. One differing element always changes it (odd weights: w 2^k != 0 mod 2^64 for k < 32); several could cancel
+    in principle, so equal fingerprints are strong evidence of bitwise rows, not a proof."""
+    import torch
+    V = logits.shape[-1]
+    w = 2 * torch.arange(V, device=logits.device, dtype=torch.int64) + 1
+    return (logits.float().contiguous().view(torch.int32).to(torch.int64) * w).sum(-1)
+
+
+def _reset_peak():                                                                              # [xpool]
+    """[xpool] Remember the run's peak so far (meta.peak_gb keeps its meaning), then reset the counter for one arm."""
+    import torch
+    _PEAK[0] = max(_PEAK[0], torch.cuda.max_memory_allocated())
+    torch.cuda.reset_peak_memory_stats()
+
+
+def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_shipped, gates, label, bare=False,
+              layout=None, fp=None):
+    """One point (module docstring). [xpool] layout None: --layout (the default arm, unchanged); "stream" / "pool":
+    that arm, with the round's peak GB after a reset (peak_gb_round) and fp (a list): per tick (rows, the rows' logit
+    fingerprints on the device) and info["committed_tokens"]."""
     import torch
     from nosi.r2_tick import run_round
     info = dict(backend=kind, C=C, X=X, R_ver=R_ver, gemm=ops.mode, steps=steps)
     if kind == "b2":                                                 # [b2] the mode (report()["b2"] repeats it)
         info["b2_checked"] = bool(getattr(a, "b2_checked", False))
         info["b2_resolve"] = getattr(a, "b2_resolve", "torch")                    # [fusedres]
+    if layout is not None or getattr(a, "layout", "stream") != "stream":                         # [xpool]
+        info["layout"] = arm_layout(a, layout)
+        if info["layout"] == "pool":
+            info["X_pool"] = pool_positions(a, X)
     # T_d: the draft-only tick
-    eng, svc, tp = make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext)
+    eng, svc, tp = make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, layout=layout)
     try:
         if kind == "b2" and getattr(a, "b2_res_profile", False):    # [fusedres2] M3: the kernel time of res
             info["draft_only_res_profile"] = profile_draft_only(a, eng, first, label)
@@ -498,16 +619,31 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
         del eng, svc, tp
         GB.free()
     # the round
-    eng, svc, tp = make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext)
+    if layout is not None:                                                                       # [xpool] this arm's peak
+        _reset_peak()
+    eng, svc, tp = make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, layout=layout)
     req_ticks = [0]
 
     def on_tick(rows, tokens, out):
         req_ticks[0] += len({r.b for r in rows})
+        if fp is not None:                                                                       # [xpool] no read here
+            fp.append(([(r.b, r.kind, r.pos) for r in rows], logit_fingerprint(out.logits)))
     try:
         t0 = time.time()
         rnd = run_round(eng, first, [steps] * eng.B, K=a.K, LAMBDA=a.LAMBDA, on_tick=on_tick)
         torch.cuda.synchronize()
         info["wall_s"] = round(time.time() - t0, 1)
+        if layout is not None:                                                                   # [xpool]
+            info["peak_gb_round"] = round(torch.cuda.max_memory_allocated() / 1e9, 3)
+            info["store_gb"] = round(sum(t.numel() * t.element_size() for t in eng.store_k + eng.store_v
+                                         + eng.store_bias) / 1e9, 3)
+            if eng.xpool is not None:
+                info["xpool"] = eng.xpool.report()
+            info["arrival"] = dict(lag=getattr(svc, "arrival_lag", None),                       # review B1: REPORT
+                                   forced=getattr(svc, "arrival_forced", None),
+                                   held=getattr(svc, "arrival_held", None))
+        if fp is not None:                                                                       # [xpool]
+            info["committed_tokens"] = [list(r.out) for r in rnd.reqs]
         rs = summarize(eng.timer.report())
         info["round"] = rs
         committed = sum(len(r.out) - 1 for r in rnd.reqs)
@@ -543,7 +679,8 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
         del eng, svc, tp
         GB.free()
     if bare:
-        eng, svc, tp = make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=("tick",))
+        eng, svc, tp = make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=("tick",),
+                                   layout=layout)
         try:
             run_round(eng, first, [steps] * eng.B, K=a.K, LAMBDA=a.LAMBDA)
             bs = summarize(eng.timer.report())
@@ -553,6 +690,94 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
             del eng, svc, tp
             GB.free()
     return info
+
+
+XP_TICK_BAND = 0.15                                                                             # [xpool] registered
+
+
+def compare_layouts(recs, a_key="stream", b_key="pool"):                                       # [xpool]
+    """[xpool] recs[arm] = (per-tick rows, per-tick fingerprint lists, committed tokens). Returns (equal, compared
+    rows, the first difference or None) of arms a_key and b_key."""
+    s, p = recs[a_key], recs[b_key]
+    if s[2] != p[2]:
+        return False, 0, "committed tokens differ"
+    if len(s[0]) != len(p[0]):
+        return False, 0, "tick counts differ (%d / %d)" % (len(s[0]), len(p[0]))
+    n = 0
+    for t, (rs, rp, fs, fq) in enumerate(zip(s[0], p[0], s[1], p[1])):
+        if rs != rp:
+            return False, n, "tick %d: rows differ" % t
+        for k, (x, y) in enumerate(zip(fs, fq)):
+            if x != y:
+                return False, n, "tick %d row %d %s: fingerprint %d / %d" % (t, k, rs[k], x, y)
+            n += 1
+    return True, n, None
+
+
+def one_point_both(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_shipped, gates, label,
+                   bare=False, point_fn=None):
+    """[xpool] --layout both (docs/R2_XPOOL_PLAN.md section 6; review B1, m6a): three arms in the order stream, pool,
+    stream2 (one_point with a layout and fingerprints; every arm with the run's fixed --arrival-lag). Gates:
+      <label>_XP_replica    MUST: stream2 equals stream under the SAME comparison (the gate can pass at all: L34)
+      <label>_XP_committed  MUST: the pool arm's committed tokens equal the stream arm's (whatever the replica says)
+      <label>_XP_bitwise    MUST: rows and every row's fingerprint equal, stream vs pool; VOID (not passed) when the
+                            replica failed
+      R_<label>_XP_peak / R_<label>_XP_tick  REPORTS: the pool vs the MEAN of the two stream arms (no order
+                            confound); the stream arms' own spread is printed with it.
+    point_fn: the CPU test's stand-in of one_point."""
+    import torch
+    point_fn = point_fn or one_point
+    out, recs = {}, {}
+    for arm, lay in (("stream", "stream"), ("pool", "pool"), ("stream2", "stream")):
+        fp = []
+        info = point_fn(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_shipped, gates,
+                        "%s_%s" % (label, arm), bare=bare, layout=lay, fp=fp)
+        vals = torch.cat([v for (_, v) in fp]).tolist() if fp else []             # ONE read per arm, after it
+        per_tick, at = [], 0
+        for (rows, v) in fp:
+            per_tick.append(vals[at:at + len(rows)])
+            at += len(rows)
+        recs[arm] = ([r for (r, _) in fp], per_tick, info.pop("committed_tokens", None))
+        out[arm] = info
+    rep_ok, rep_n, rep_diff = compare_layouts(recs, "stream", "stream2")
+    rep_ok = rep_ok and rep_n > 0
+    gates.append(GB.gate(label + "_XP_replica", rep_ok, True, "stream vs stream2 (the same layout twice): %s, %d rows "
+                         "compared" % ("EQUAL" if rep_ok else "DIFFER (%s)" % (rep_diff or "no row compared"), rep_n)))
+    com_ok = recs["stream"][2] is not None and recs["stream"][2] == recs["pool"][2]
+    gates.append(GB.gate(label + "_XP_committed", com_ok, True, "committed tokens stream vs pool: %s"
+                         % ("equal" if com_ok else "DIFFER")))
+    same, n, diff = compare_layouts(recs)
+    ok = rep_ok and same and n > 0
+    if not rep_ok:
+        detail = "VOID: the replica differs, so this comparison cannot pass under the run's timing (pool vs stream: %s)" \
+                 % ("equal" if same and n > 0 else diff)
+    else:
+        detail = "%s: %d rows of %d ticks compared" % ("EQUAL" if ok else "DIFFER (%s)" % (diff or "no row compared"), n,
+                                                      len(recs["stream"][0]))
+    gates.append(GB.gate(label + "_XP_bitwise", ok, True, detail))
+
+    def mean2(key):
+        x, y = out["stream"].get(key), out["stream2"].get(key)
+        return None if x is None or y is None else (x + y) / 2.0
+    ps, pp = mean2("peak_gb_round"), out["pool"].get("peak_gb_round")
+    ss, sp = out["stream"].get("store_gb"), out["pool"].get("store_gb")
+    drop = None if ps is None or pp is None else round(ps - pp, 3)
+    gates.append(GB.gate("R_" + label + "_XP_peak", True, False, "round peak GB stream (mean of 2) %s pool %s (drop %s); "
+                         "store GB stream %s pool %s (drop %s)" % (ps, pp, drop, ss, sp,
+                                                                   None if ss is None or sp is None else round(ss - sp, 3))))
+    ts, tq = mean2("T_tick_ms"), out["pool"].get("T_tick_ms")
+    t1, t2 = out["stream"].get("T_tick_ms"), out["stream2"].get("T_tick_ms")
+    ratio = None if not ts or tq is None else tq / ts
+    spread = None if not t1 or t2 is None else t2 / t1
+    gates.append(GB.gate("R_" + label + "_XP_tick", True, False, "T_tick stream %s / %s ms (stream2 / stream %s) pool %s "
+                         "ms: ratio pool / mean(stream) %s (registered: prediction 0.97-1.05, falsified outside 1 +- "
+                         "%.2f: %s)" % (t1, t2, None if spread is None else round(spread, 4), tq,
+                                        None if ratio is None else round(ratio, 4), XP_TICK_BAND,
+                                        "inside" if ratio is not None and abs(ratio - 1) <= XP_TICK_BAND
+                                        else "OUTSIDE")))
+    return dict(backend=kind, layouts=out, xp=dict(replica=rep_ok, replica_difference=rep_diff, committed=com_ok,
+                                                    bitwise=ok, rows_compared=n, first_difference=diff,
+                                                    peak_drop_gb=drop, tick_ratio=ratio, stream_spread=spread))
 
 
 def preflight(a, model, cache, st, first, ops, ext, gates, res, engine_fn=None, round_fn=None):
@@ -673,10 +898,17 @@ def main(argv=None) -> int:
                              % base["stats"]["median"]))
         if a.pool_baseline:
             pool = a.C + a.X + 4 - 64
-            eq, err = run_child(a, argv, max(0, pool), os.path.join(a.out, "shipped_pool_eq.json"))
-            res["shipped_equal_memory"] = eq
-            gates.append(GB.gate("R_shipped_equal_memory", True, False, err or "NOSI_POOL_BLOCKS %d: median %.2f ms"
-                                 % (pool, eq["stats"]["median"])))
+            if a.pool_rule in ("stream", "both"):                                              # [xpool] the default
+                eq, err = run_child(a, argv, max(0, pool), os.path.join(a.out, "shipped_pool_eq.json"))
+                res["shipped_equal_memory"] = eq
+                gates.append(GB.gate("R_shipped_equal_memory", True, False, err or "NOSI_POOL_BLOCKS %d: median %.2f ms"
+                                     % (pool, eq["stats"]["median"])))
+            if a.pool_rule in ("k5", "both"):                                                  # [xpool] the K5 rule
+                pk = pool_rule_value(a, "k5")
+                eq, err = run_child(a, argv, max(0, pk), os.path.join(a.out, "shipped_pool_eq_k5.json"))
+                res["shipped_equal_memory_k5"] = eq
+                gates.append(GB.gate("R_shipped_equal_memory_k5", True, False, err or "NOSI_POOL_BLOCKS %d (k5 rule): "
+                                     "median %.2f ms" % (pk, eq["stats"]["median"])))
         save()
         T_shipped = base["stats"]["median"] if base else None
         import torch
@@ -696,6 +928,7 @@ def main(argv=None) -> int:
             ext = gp.load(a.gilfree_build)
             meta["gilfree_openmp"] = int(getattr(ext, "OPENMP", 0))
         meta["transport"] = a.transport
+        meta["layout"] = a.layout                                                              # [xpool]
         meta["twin"] = a.twin                                                                  # [twin-variant]
         if a.variants:                                                                         # [batched-rebuild]
             meta["variants"] = ["%s/%s" % v for v in a.variant_list]                            # [batched-rebuild]
@@ -727,8 +960,9 @@ def main(argv=None) -> int:
                         label = variant_label(a, mode, kind, variant)                          # [batched-rebuild]
                         log("%s at C %d X %d R_ver %d" % (label, a.C, a.X, a.R_ver))
                         try:
-                            pt = one_point(a, model, cache, st, first, ops, kind, a.C, a.X, a.R_ver, ext, a.steps,
-                                           T_shipped, gates, label, bare=a.bare)
+                            point = one_point_both if a.layout == "both" else one_point                # [xpool]
+                            pt = point(a, model, cache, st, first, ops, kind, a.C, a.X, a.R_ver, ext, a.steps,
+                                       T_shipped, gates, label, bare=a.bare)
                             pt["twin"], pt["rebuild"] = variant                                # [batched-rebuild]
                             res["points"].append(pt)
                         except Exception as e:
@@ -741,7 +975,7 @@ def main(argv=None) -> int:
             run_sweep(a, lambda: BIOps(attn, a.m_fix, gemm=a.modes[0]), backends, gates, res, save,
                       lambda ops, kind, C, X, R_ver, label: one_point(a, model, cache, st, first, ops, kind, C, X, R_ver,
                                                                       ext, a.sweep_steps, T_shipped, gates, label))
-        meta["peak_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 2)
+        meta["peak_gb"] = round(max(_PEAK[0], torch.cuda.max_memory_allocated()) / 1e9, 2)     # [xpool] resets
         save()
         for g in gates:
             print("%s %s %s: %s" % ("GATE" if g["must"] else "REPORT", g["name"], "PASS" if g["passed"] else "FAIL",

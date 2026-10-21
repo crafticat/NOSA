@@ -95,6 +95,7 @@ except ImportError:                                       # pragma: no cover - e
 from .kstep.backend import ev_done
 from .kstep.errors import CapacityRefusal, OwnershipViolation
 from .kstep.ownership import FREE, INFLIGHT, LRU, PO, RELEASING, VRES
+from . import r2_xpool as XP
 from .r2_residency import BLOCK, N_TAIL, VERIFY, Plan, Residency, Row
 from .r2_residency_sb import FIELDS, DraftMirror, ResidencySB, device_draft, rank_in_group
 
@@ -581,6 +582,14 @@ class CpuDeviceSim:
                     if not ev_done(hev):
                         svc.host_wait(hev)                # the main stream's wait on the host write-back (T4)
                     r0, s0 = t * bs, m * bs
+                    if svc.xpool is not None:                     # [xpool] the slot's lane in the flat store
+                        p0 = svc.xpool.pos_host(l, b, h, m) * bs
+                        g.store_k[l][p0:p0 + bs, h].copy_(g.host_k[l][b, r0:r0 + bs, h])
+                        g.store_v[l][p0:p0 + bs, h].copy_(g.host_v[l][b, r0:r0 + bs, h])
+                        if svc.store_b is not None and svc.cis is not None:
+                            svc.store_b[l][p0:p0 + bs, h].copy_(svc.cis[l][b, r0:r0 + bs, h])
+                        self.gathered += 1
+                        continue
                     g.store_k[l][b, s0:s0 + bs, h].copy_(g.host_k[l][b, r0:r0 + bs, h])
                     g.store_v[l][b, s0:s0 + bs, h].copy_(g.host_v[l][b, r0:r0 + bs, h])
                     if svc.store_b is not None and svc.cis is not None:
@@ -914,6 +923,14 @@ class CudaDeviceOps:
         for ev in self.svc._hist_unwaited:
             main.wait_event(ev)
         self.svc._hist_unwaited = []
+        xp = self.svc.xpool
+        if xp is not None:                                # [xpool] one launch over the decision's entries (r2_xpool)
+            bb, hh = dec.bh
+            t = dec.t
+            ent = xp.gather_entries(l, bb, hh, t["blk"], t["take_slot"], (t["granted"] | t["evict"]) != 0)
+            XP.h2d_entries(self.store_k[l], self.store_v[l], self.store_b[l], self.host_k[l], self.host_v[l],
+                           self.cis[l], ent, self.bs)
+            return
         self.h2d_bias(self.store_k[l], self.host_k[l], self.store_b[l], self.cis[l], dec.load_ids, self.bs)
         self.h2d(self.store_v[l], self.host_v[l], dec.load_ids, self.bs)
 
@@ -963,6 +980,8 @@ class ResidencySC(ResidencySB):
     key_plant = None                                      # [sharedkv2] NEGATIVE CONTROL (tests only)
     key_plant_live = 0                                    # [sharedkv2] device count: plants inside num_pages
 
+    XPOOL_OK = True                                       # [xpool] resolve binds the lanes (r2_xpool.XPool)
+
     def __init__(self, *args, sc_mut=None, devops=None, mirror_drop=None, wait_mode: str = "probe", **kw):
         kw["defer_admit"] = True
         super().__init__(*args, **kw)
@@ -1001,6 +1020,10 @@ class ResidencySC(ResidencySB):
         # its peak with the tick and layer, and each layer's maximum; refused ticks included
         self.k5_peak: Tuple = (0, None, None)
         self.k5_by_layer: List[int] = [0] * self.L
+        if self.xpool is not None:                        # [xpool] the binder's / translator's error flag rides in the
+            # tick's ONE decision read (a set flag refuses the tick). S-C's own watch_flag, called by name: a subclass
+            # override may read state its __init__ sets only after this one returns (B2's b2_mut, r2_own2.py:416-417)
+            ResidencySC.watch_flag(self, "xpool_err", self.xpool.err)
 
     def watch_flag(self, name: str, flag: torch.Tensor) -> None:
         """Watch a device flag (a 0-dim bool or integer tensor on the service's device; e.g. the twin's sticky
@@ -1163,6 +1186,11 @@ class ResidencySC(ResidencySB):
         if not self._tick:                                            # the tick's first layer: the per-tick copies
             self.sync_mirror()
             self._rows = self._tick_rows(rows)
+            if self.xpool is not None:                                # [xpool] every FREE slot gives its lane back;
+                if not self.DECISION_READ_BLOCKING:                   # safe only behind a BLOCKING decision read
+                    raise OwnershipViolation("xpool: lanes are reused across requests only behind a blocking decision "
+                                             "read (r2_xpool.py, the lane-level order); this class's is not")
+                self.xpool.release_free(self.dmirror.code)
         elif self._dirty:
             raise OwnershipViolation("S-C: the host state changed in the middle of a tick (the device mirror is stale)")
         elif self._row_sig(rows) != self._rows["sig"]:
@@ -1184,6 +1212,9 @@ class ResidencySC(ResidencySB):
                 others.append((rbd, hbd, sel[:, ixd]))
             vdec = device_verify(m, rb, hb, tl, nt, sel[:, ix], self.C, self.X, self.sc_mut, others=others,
                                  inflight=self.policy_e_inflight)
+            if self.xpool is not None:                                # [xpool] the takes' lanes, before the gather
+                self.xpool.bind(l, vdec.bh[0], vdec.bh[1], vdec.t["take_slot"],
+                                (vdec.t["granted"] | vdec.t["evict"]) != 0)
             if not self.sc_mut.get("no_wait"):                        # NEGATIVE CONTROL: read before the event
                 self.dev.wait(l, vdec)
             self.dev.gather(l, vdec)
@@ -1193,6 +1224,11 @@ class ResidencySC(ResidencySB):
         if tk["d"] is not None:                                       # the draft rows: S-B, on the mirror after verify
             rb, hb, tl, nt, ix = tk["d"]
             ddec = device_draft(m, rb, hb, tl, nt, sel[:, ix], self.C, self.X, self.R_ver, self.sb_mut)
+            if self.xpool is not None:                                # [xpool] the draft takes' lanes, before the
+                Rd, kd = ddec.Rd, ddec.k                              # bias fill (_layer_record) and the issue
+                self.xpool.bind(l, rb.view(Rd, 1, 1).expand(Rd, H, kd),
+                                torch.arange(H, device=dv).view(1, H, 1).expand(Rd, H, kd), ddec.t["take_slot"],
+                                ddec.t["granted"] != 0)
             page[ix] = ddec.page
             npg[ix] = ddec.num_pages
             step["ddec"] = ddec
@@ -1263,7 +1299,7 @@ class ResidencySC(ResidencySB):
             flat = self._d2h(torch.cat(parts)).tolist()               # ONE read per tick (flags and decisions)
             self.flag_values = dict(zip(names, flat[:len(names)]))
             raised = sorted(n for n, v in self.flag_values.items() if v)
-            if raised:
+            if raised and raised != ["xpool_err"]:                    # ([xpool]: xpool_err alone waits, see below)
                 raise CapacityRefusal("S-C: the watched device flag(s) %s are set at this tick: the tick is void (none "
                                       "of its decisions is applied)" % raised)
             at = len(names)
@@ -1288,6 +1324,9 @@ class ResidencySC(ResidencySB):
             over = [(st["l"], v[1]) for (st, v, _) in parsed if v is not None and v[1] > 0]
             if over:
                 raise self._refusal(over, self._overflow_report(parsed))
+            if raised:                                                # [xpool] after the overflow: an overflowed page
+                raise CapacityRefusal("S-C: the watched device flag(s) %s are set at this tick: the tick is void (none "
+                                      "of its decisions is applied)" % raised)   # names slot 0 (review m7)
             for (st, v, d) in parsed:
                 if v is not None:
                     self._apply_verify(st["l"], st["vrows"], st["vidx"], st["vdec"], v[0],
