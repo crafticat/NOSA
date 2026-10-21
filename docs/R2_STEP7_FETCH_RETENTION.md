@@ -598,6 +598,32 @@ RECOMMENDED POINTS (arithmetic above). The FG and SG5 step scripts change on the
 - SG5's sweep keeps C in {64, 80, 96}. Points with C <= 80 may still refuse at the first verify tick; that is a
   configuration result.
 
+## 12i. SG5 p2 (holder 2190876): the gilfree feeder thread and torch's thread-local modes (2026-10-21)
+
+The geometry fix of 12h worked in SG5 p2 (`/mnt/beegfs/ojerbi/r2-runs/sg5/sg5_p2_2190876`): there was no "multiples
+of R". But every gilfree arm failed: "Inplace update to inference tensor outside InferenceMode is not allowed".
+- Where: the packer's in-place writes (the landing ring copy_, the store's index_copy_), in the adapter's background
+  feeder thread (`_feeder` -> `_release` -> NativePipe.release), re-raised by `poll`.
+- Why: torch.inference_mode is THREAD-LOCAL. The tick makes the host rows and the store under inference mode on the
+  main thread. A new thread starts with inference mode off, so it may not update those tensors in place.
+- FIX (`r2_transport_gilfree.py`):
+  - At construction the adapter records the modes the feeder needs. Inference mode is on when the constructing
+    thread is in inference mode, or when any store, host or ring tensor is an inference tensor. Grad mode is the
+    constructing thread's (off under inference mode). On the GPU it records the store's device.
+  - The feeder enters them around its whole loop: `torch.inference_mode(...)`, `torch.set_grad_enabled(...)`,
+    `torch.cuda.set_device(...)`.
+  - The current CUDA stream needs nothing. Every CUDA operation of a release names its stream: the extension's copy
+    and scatter streams, the publication under `torch.cuda.stream(scatter)`, and `scatter.wait_event`.
+  - The OpenMP team's threads copy raw bytes only (pack_range).
+- The other transports and device operations start no thread: gather (a side stream of the tick's thread), s0 (it
+  packs on the tick's thread at end_tick) and CudaDeviceOps (the tick's thread). grep finds no other Thread in
+  nosi/nosi, and none in the pinned cpupack_core.
+- CPU test GT6 (two cases): the host rows and the store are made under inference mode; the adapter is built either
+  inside inference mode or outside it from those tensors. The releases run in the background feeder: it ran with
+  inference on and grad off, and a two-request plan lands the host truth.
+- GT6 negative control: thread_modes=False (the feeder keeps a new thread's defaults) gives the run's exact error,
+  re-raised at force().
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,
