@@ -74,7 +74,7 @@ test_r2_tick_b2.py, test_r2_tick_p6.py, test_r2_twin_fused.py, test_r2_residency
 ## 5. REGISTERED GPU cell stack1 (2026-10-21T11:51:27Z, before any run)
 
 Step: `bash benchmarks/Efficiency/r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> <cell>`, cell ROOT
-`NOSI_INTEG` (this worktree), in the order stack1a, stack1t, stack1b; stop at the first nonzero exit (stack1t and
+`NOSI_INTEG` (since integ2: /mnt/beegfs/ojerbi/nosi-r2-integ2), in the order stack1a, stack1t, stack1b; stop at the first nonzero exit (stack1t and
 stack1b are timing claims only after stack1a passed). Every cell: p5b2's point `--modes exact --backends b2 --C 96
 --X 64 --R-ver 16 --X-pool 64 --stack full`, 48 steps, gilfree 8 threads, unchecked b2, the superset wait.
 
@@ -82,7 +82,7 @@ stack1b are timing claims only after stack1a passed). Every cell: p5b2's point `
 |---|---|---|---|
 | stack1a | 64 | `--stack-compare --arrival-lag 2 --sel-check`, no `--pool-baseline` | EQUALITY: none / full / none2 |
 | stack1t | 64 | `--shared-unchecked --pool-baseline` (free timing, as p5b2) | TIMING at p5b2's point |
-| stack1b | 264 | `--shared-unchecked --repeat-docs --shipped-batch 64`, `--mem=240G` | TIMING at the largest B (MODEL) |
+| stack1b | 216 (integ2; was 264) | `--shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1`, `--mem=240G` | TIMING at the largest B (bigb MODEL, 5.4b) |
 
 ### 5.1 The basis (MEASURED, p5b2's record `r2-runs/sg5/sg5_p5_2190876_p5b2/summary.json`, exact, per round tick,
 as tabulated in docs/R2_SG5_P6_PLAN.md section 0)
@@ -140,6 +140,39 @@ to 16.37 + 264 x 0.25463 = 83.6 GB (case A). Host memory (MODEL): the pinned hos
 | tok_per_s | 150-330 | r x B / T_tick = 0.87 x 264 / (0.7-1.5 s) |
 | shipped_tok_per_s | REPORT | the shipped decode at B 64 (`--shipped-batch 64`): `ratio` is None |
 
+### 5.4b REVISION in integ2 (2026-10-21T12:12:13Z, before any stack1 run): stack1b at B 216, not B 264
+
+The xpool model of 5.4 has no twins, no build state and no workspace. bigb's one-engine model (docs/R2_BIGB_PLAN.md
+section 2, bigb_core.MemModel, its byte terms checked against the code's tensors in BG3, F0 and R_FIX fitted to p5b2,
+checked on p4sc64: 67.38 predicted, 67.41 measured) gives, at C 96, pool layout, X_pool 64, b2, 24 steps: B 128
+51.78 GB, B 216 75.89 GB (its B_max at a 76 GB budget), 84 GB at B 245. Linear in B between its points (slope
+(75.89 - 51.78) / 88 = 0.274 GB per request; it reproduces the model's own 245 at 84 GB), B 264 is 75.89 + 48 x
+0.274 = 89.0 GB: above the A100's 80 GB. So stack1b moves to B 216 (`--batch 216`), the same B as bigb96-216 (the
+stack OFF, 24 steps, lag 2): a direct with / without comparison at one B, protocol differences named below.
+The stack adds no tensor the model lacks at this size (the shared kernel's workspace replaces piece 3's of the same
+shape; the fused resolve's per-tick scratch is a few MB); 48 steps instead of 24 add < 0.1 GB (twin widths and the
+token log; `--log-slots -1` sizes the log).
+Host memory: pinned host rows 216 x 16352 x 2 x 128 x 2 B x 2 x 32 = 115.7 GB + about 17 GiB base (bigb_core
+HOST_BASE_GIB); the shipped child runs first and alone at B 64. `--mem=240G` (the holder has 480G).
+stack1t (B 64): with the preflight leak fixed (bigb), meta.peak_gb is ONE engine: 42.73 GB per-stream (bigb's side
+prediction) minus the pool's 8.49 GB = 34.2 GB, band 33-36 GB (this replaces "p5b2's minus 7.9-8.9 GB": p5b2's 67.49 GB
+was two engines).
+
+| term | full stack at B 216 (replaces the B 264 table) | derivation (MODEL) |
+|---|---|---|
+| peak GB | 74-78 | bigb one-engine model 75.89 |
+| twin | 7-20 ms | B 64's 2-6 ms x 3.375 |
+| res | 25-130 ms | as 5.4, over 3.375x the entries |
+| end_tick | 0.41-0.56 s | 143 ms x 3.375 (+-15 %) |
+| REST | 0.05-0.25 s | as 5.4 |
+| device | 130-200 ms | GEMMs at 864 rows (2.2-3.4x), attention x 3.375 |
+| T_tick | 0.6-1.2 s, point 0.85 s | sum |
+| tok_per_s | 155-315 | 0.87 x 216 / (0.6-1.2 s) |
+| comparison | REPORT | bigb96-216's T_tick (bigb_core.tick_bands(216)) over stack1b's; protocol differs: stack1b 48 steps, free timing, shipped child at B 64; bigb96-216 24 steps, lag 2, no shipped child |
+
+F-ST4 now reads: an out-of-memory error, or peak above 78 GB (the model is wrong at the stack); T_tick outside
+0.6-1.2 s.
+
 ### 5.5 Falsifiers (each stops the claim it names)
 
 - F-ST1 any stack1a MUST fails (with the replica passed): a component changes numbers on the GPU when combined; the
@@ -168,5 +201,9 @@ to 16.37 + 264 x 0.25463 = 83.6 GB (case A). Host memory (MODEL): the pinned hos
   here (srun refuses at launch if not).
 - `--repeat-docs` tiles the 94 documents at B 264, so requests repeat; the shared kernel's union is per request, so
   repeats do not share reads.
-- test_r2_tick.py T21 checks one_point's gate names with a lowercase regex; the new `<label>_SKV_ran` gate (capital
-  letters) is outside that regex, so T21 neither sees nor forbids it.
+- test_r2_tick.py T21 checked one_point's gate names with a lowercase regex that could not see `<label>_SKV_ran`.
+  FIXED in integ2: the pattern reads any case, the expected list holds SKV_ran, and a second check fails on a gate
+  name the pattern cannot read. fusedres2's FR-g gates (fused_gates) are appended through gates.extend, outside it.
+- [integ2] fusedres2's fused_gates now also apply to the stack arms with `--b2-resolve fused`: MUST
+  `<label>_draft_only_fused_err`, `_round_fused_err` and `_draft_only_fused_dispatch` (3.0 launches per layer, no sel
+  conversion, no bias cast; the pool path counts no bias cast). These join stack1a / t / b's MUST gates.

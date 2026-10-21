@@ -394,7 +394,8 @@ def test_P6d_the_harness_variants_and_the_engine_option(p3):
     assert G.variant_label(a, "exact", "b2", ("torch", "per_call")) == "SG5_exact_b2"          # p3's labels
     assert G.variant_label(b, "exact", "b2", ("fused", "batched")) == "SG5_exact_b2_fused_batched"
     src = (TT.EFF / "r2_tick_sg5.py").read_text()
-    assert "TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin)" in src       # [twin-variant] pin
+    assert "TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin, **ekw)" in src   # [twin-variant]
+    #                                                      pin ([integ2]: bigb 91e2fef added **ekw, the token-log size)
     assert 'eng.rebuild = getattr(a, "rebuild", "per_call")' in src
     main = ast.get_source_segment(src, next(n for n in ast.parse(src).body
                                             if isinstance(n, ast.FunctionDef) and n.name == "main"))

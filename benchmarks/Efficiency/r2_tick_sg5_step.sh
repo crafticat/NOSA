@@ -49,9 +49,10 @@
 #            _ST_bitwise), no --pool-baseline. ROOT NOSI_INTEG (nosi-r2-integ2 since integ2), as the two cells below
 #   stack1t  [integ] the full stack's TIMING at p5b2's point, B 64, free timing: --stack full --X-pool 64
 #            --shared-unchecked (the selection precondition is checked in stack1a), --pool-baseline (100)
-#   stack1b  [integ] the full stack's TIMING at B 264 (the largest B of the xpool model, X_pool 64): --stack full
-#            --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1, --mem=240G (141 GB
-#            pinned host rows; the holder has 480G); [integ2] the bigb one-engine fix makes it fit (R2_INTEG_PLAN 5.4)
+#   stack1b  [integ2] the full stack's TIMING at B 216 (bigb's one-engine B_max at C 96, pool, X_pool 64, 76 GB budget;
+#            B 264 of integ e869342 is 89 GB in that model: it would not fit): --stack full --X-pool 64
+#            --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1, --mem=240G (about 116 GB pinned host
+#            rows + 17 GiB base; the holder has 480G). The same B as bigb96-216 (the stack OFF there). R2_INTEG_PLAN 5.4
 #   bigb81-128 | bigb81-244 | bigb96-128 | bigb96-216
 #            [bigb] LARGE B on the SHARED POOL layout (docs/R2_BIGB_PLAN.md section 4; bigb_core.cell_plan): C 81 or
 #            96, B 128 (the stepping stone) or B_max (the largest B whose MODEL peak <= 76 GB: 244 at C 81, 216 at
@@ -80,6 +81,10 @@
 # exit. stack1a: the three ST MUST gates and <label>_stack_SKV_ran PASS; R ST_tick 0.15-0.40. stack1t (B 64): twin
 # 2-6 ms, REST 30-110 ms, res 20-80 ms, end_tick 122-170 ms, device 45-70 ms, T_tick 0.22-0.45 s (point 0.31 s), r
 # 0.84-0.90, peak p5b2's minus 7.9-8.9 GB. stack1b (B 264): peak 78-84 GB, T_tick 0.7-1.5 s, tok_per_s 150-330.
+# REVISED in integ2 (2026-10-21T12:12:13Z, before any stack1 run; bigb's one-engine memory model, docs/R2_BIGB_PLAN.md
+# section 2): stack1t meta.peak_gb 33-36 GB (one engine 42.73 GB per-stream minus the pool's 8.49 GB; the old "p5b2's
+# minus" counted p5b2's two engines); stack1b moves to B 216: peak 74-78 GB (bigb model 75.89 GB at 24 steps; 48
+# steps add < 0.1 GB), T_tick 0.6-1.2 s (point 0.85 s), tok_per_s 155-315; every other stack1 band unchanged.
 #
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
@@ -245,7 +250,7 @@ case $CELL in
     stack1t) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1t ; NOSI=$NOSI_INTEG
              STACKARG=(--stack full --X-pool 64 --shared-unchecked) ;;                              # [integ] timing, B 64
     stack1b) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1b ; NOSI=$NOSI_INTEG ; POOLB=()
-             BATCH=264 ; MEMG=240G
+             BATCH=216 ; MEMG=240G                                                                  # [integ2] B 216
              STACKARG=(--stack full --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1) ;;
     bigb*) MODES=exact ; BACKENDS=b2 ; PX=64 ; PRV=16 ; SWEEP_RUN= ; SUFFIX=_${CELL//-/_} ; NOSI=$NOSI_BIGB   # [bigb]
         BIGB=$CELL ; PC=${CELL:4:2} ; BATCH=${CELL#bigb??-} ; STEPS=24 ; MEMG=200G ; POOLB=()

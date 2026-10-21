@@ -615,7 +615,10 @@ def test_ST8_the_step_cells_stack1(tmp_path):
                 assert word not in ln, (word, ln)
     lines = text.splitlines()
     root = next(ln for ln in lines if ln.startswith("NOSI_INTEG=")).split()[0][len("NOSI_INTEG="):]
-    assert root == "/mnt/beegfs/ojerbi/nosi-r2-integ"
+    assert root == "/mnt/beegfs/ojerbi/nosi-r2-integ2"                      # [integ2] the stack cells' ROOT
+    for fam, path in (("NOSI_X1", "nosi-r2-xpool"), ("NOSI_BIGB", "nosi-r2-bigb"), ("FRNOSI", "nosi-r2-fusedres2")):
+        got_root = next(ln for ln in lines if ln.startswith(fam + "=")).split()[0][len(fam) + 1:]
+        assert got_root == "/mnt/beegfs/ojerbi/" + path, (fam, got_root)   # [integ2] no other family repointed
     assert next(ln for ln in lines if ln.startswith("NOSI=")).split()[0] == "NOSI=/mnt/beegfs/ojerbi/nosi-r2-sg5-p6"
     head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
     dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"], capture_output=True,
@@ -633,8 +636,9 @@ def test_ST8_the_step_cells_stack1(tmp_path):
                          "--mem=120G"], ["--pool-baseline", "--shared-unchecked"]),
             "stack1t": (["--stack full --X-pool 64 --shared-unchecked", "--batch 64", "--pool-baseline", "--mem=120G"],
                         ["--stack-compare", "--arrival-lag", "--sel-check"]),
-            "stack1b": (["--stack full --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64",
-                         "--batch 264", "--mem=240G"], ["--pool-baseline", "--stack-compare", "--arrival-lag"])}
+            "stack1b": (["--stack full --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1",
+                         "--batch 216", "--mem=240G"], ["--pool-baseline", "--stack-compare", "--arrival-lag",
+                                                       "--skip-shipped"])}                    # [integ2] B 216
     for cell, (has, hasnt) in want.items():
         r = subprocess.run(["bash", str(script), "--nosi", head.stdout.strip(), "418", "t1", cell], env=env,
                            capture_output=True, text=True, timeout=120)
@@ -644,14 +648,16 @@ def test_ST8_the_step_cells_stack1(tmp_path):
         line = r.stdout.strip().splitlines()[-1]
         got = line.split("r2_tick_sg5.py ", 1)[1].strip().replace("\\,", ",")
         for w in has + ["--modes exact --backends b2", "--C 96 --X 64 --R-ver 16", "--steps 48",
-                        "PYTHONPATH=/mnt/beegfs/ojerbi/nosi-r2-integ/nosi"]:
+                        "PYTHONPATH=/mnt/beegfs/ojerbi/nosi-r2-integ2/nosi"]:
             assert w in got or w in line, (cell, w)
         for w in hasnt + ["--sweep ", "--variants", "--b2-checked", "--layout both"]:
             assert w not in got, (cell, w)
         assert "--job-name=sg5-t1-418-%s " % cell in r.stdout and "cell %s" % cell in r.stdout
-        assert "[integ] root /mnt/beegfs/ojerbi/nosi-r2-integ" in r.stdout
+        assert "[integ] root /mnt/beegfs/ojerbi/nosi-r2-integ2," in r.stdout
         pa = G.parse_args(got.split())
         assert pa.stack == "full" and pa.backends == ["b2"] and pa.X_pool == 64 and pa.layout == "pool"
+        if cell == "stack1b":                                             # [integ2] bigb's token log, sized
+            assert pa.batch == 216 and pa.log_slots == -1 and pa.log_slots_n is not None
     for bad in (("stack1a", "stack1b"), ("stack1",), ("stack1c",)):
         rb = subprocess.run(["bash", str(script), "--nosi", head.stdout.strip(), "418", "t1", *bad], env=env,
                             capture_output=True, text=True, timeout=120)

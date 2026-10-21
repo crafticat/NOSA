@@ -1359,5 +1359,6 @@ def test_T21_sc_counters_are_a_report_only_snapshot(p3):
     op = ast.get_source_segment(src, next(n for n in tree.body if isinstance(n, ast.FunctionDef)
                                            and n.name == "one_point"))
     assert 'info["draft_only"]["sc"] = sc_counters(svc)' in op and "sc=sc_counters(svc)" in op
-    names = sorted(set(re.findall(r'GB\.gate\("%s_([a-z_]+)"', op)))
-    assert names == ["bookkeeping", "completed", "gilfree_team"], names
+    names = sorted(set(re.findall(r'GB\.gate\("%s_([A-Za-z0-9_]+)"', op)))      # [integ2] any case: SKV_ran too
+    assert names == ["SKV_ran", "bookkeeping", "completed", "gilfree_team"], names  # [integ] SKV_ran: --attn shared
+    assert not re.findall(r'GB\.gate\("%s_[^A-Za-z0-9_"]', op), "a gate name the pattern above would not read"
