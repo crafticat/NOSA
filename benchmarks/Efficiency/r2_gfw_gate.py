@@ -1,0 +1,898 @@
+"""R2 step 7, piece 5: the GPU gate GFW of the gilfree C++ WORKER (Q-C2, 2026-10-21): packer v3's worker
+(feature/nosi-r2-gilfree-worker: benchmarks/Efficiency/gilfree_pack.cpp, nosi/nosi/r2_transport_gilfree.py
+worker="cpp"), proven on the A100 before the captured tick depends on it. Holder step: r2_gfw_step.sh (run id gfw1).
+The packers are loaded BY PATH from the step record (v3: the blobs of this commit; v2: the pins of f2b981a), the nosi
+modules by path from --nosi-pkg (a bare package: nosi/__init__.py is not imported).
+
+MUST
+  GFW_ready  packer v3 (VERSION 3, the OpenMP build, NativePipe.submit) and the pinned v2 (the OpenMP build) built.
+  GFW1       THE CAPTURED-TICK PROTOCOL: S-C's exact wait WITHOUT its submission wait (CudaDeviceOps._submitted,
+             r2_residency_sc.py:675-683) on the C++ worker, with FEW launches behind the spin, as a captured tick has
+             (one replay plus the host's few launches): a 4-transfer release whose T4 event completes only after a
+             --spin-cycles GPU sleep on a side stream is issued (queued: the host does not wait), the main stream spins
+             on the generation board (r2_residency_sc._wait_kernel, compiled before), then --launches-few launches go
+             behind the spin. PASS: the T4 event was still pending at issue, err 0, the spin waited > 10 ms (a real
+             spin), every launch ran, the rows are the host truth, torch's Stream.wait_event accepts the job's event
+             (_JobEv.wait, S-C's superset path), the worker ran on the requested team.
+  GFW1e      THE EAGER-TICK PROTOCOL: the same release, then the host waits (the GIL released) until the job is
+             SUBMITTED (GilfreeTransport.wait_submitted: the worker's GPU work enqueued), then the spin and --launches
+             launches behind it (more than the ~1024-entry launch queue, as an eager tick has). PASS: the T4 event was
+             pending at issue, the host's submission wait lasted >= 50 ms (it waited for the T4-gated submission), err
+             0, every launch ran, the rows are the host truth, the superset wait accepted, the team the requested one.
+  GFW1n      the negative control: GFW1's shape with the worker's publication planted off (set_skip_publish): the
+             spin ends by its bound (max_spin 2^16) with err 1; every launch still ran; the rows are the host truth.
+  WHY TWO PROTOCOLS (gfw1b on holder 2190876, 3462ba3: GFW1 with 1500 launches behind the spin and no submission wait
+             FAILED: err 1, the spin ran to its bound, 8620.6 ms; the main thread's enqueue took 8656.8 ms; the board
+             and the rows were right afterwards). The worker waited for ONE event, the T4 event on the side stream,
+             recorded BEFORE the spin (no main-stream event); its H2D (copy stream) and scatter (scatter stream) were
+             enqueued AFTER the spin from the worker thread and ran only when the spin gave up: the launches behind the
+             spin filled the launch queue (or the streams share a hardware queue), a serialization below the worker.
+             So in the eager tick the host must wait for the submission before the spin (now without the GIL), and the
+             no-wait protocol holds only with few launches behind the spin (the captured tick). R_GFW1x keeps the
+             hazard on record.
+  R_GFW1x    REPORT, the eager hazard: GFW1's release with --launches behind the spin and NO submission wait, the spin
+             bounded at --hazard-spin rounds: expected err 1 (the hazard of gfw1b reproduced); PASS = as expected.
+REPORT
+  GFW_T<MiB> per release of <MiB> of K + V (bf16, D 128, R 64: 32 KiB per group; B 64 x H 8 streams, the groups over
+             32 layers' sources, the destinations distinct, cap 256 groups per chunk), on --threads OpenMP threads, the
+             device idle at each release's start (as one release per decode step): the extension-measured service time
+             (total_ns: pack + ring waits + submission) of the C++ WORKER (submit; the worker's own total) against
+             packer v2's release() in the same step (A-B-A: v2, worker, v3 release(), v2), and the worker's handoff
+             (submit -> the submitted counter, the main thread polling it). Beside: v2's record in b64_s512_gilfree2
+             (8 threads: service p50 4.59 ms at 64 MiB, 12.36 ms at 192 MiB; native total 4.20 / 11.43; 4 threads
+             15.86 ms at 192 MiB), measured beside a decode.
+REGISTERED (frozen 2026-10-21 before gfw1; the step script's header holds the same numbers): per size,
+  ratio = median(worker total) / median(v2 total, both v2 blocks):
+  PREDICTION |ratio - 1| <= 0.15; FALSIFIER ratio >= 1.30 (the worker slower by 30 % or more); otherwise GREY.
+THE CELLS (--cell): gfw1 = GFW_ready, GFW1, GFW1n, GFW_T (above). gfw2 = GFW_ready, GFW2, GFW2n, R_GFW2_host: the
+descriptor issue (Q-B3, issue_desc) on the GPU, tests_cpu GT8's lockstep at the B 64 geometry:
+  GFW2   MUST: --takes takes (B2's ~6.5 k draft takes of one tick) over --l2-layers layers of the production geometry
+         (B 64, KV heads 2, D 128, bf16, host rows 16311 per request: 254 complete blocks; store C + X + 4 = 132 slots;
+         board C + X = 128), the destinations distinct per layer, issued (after one warm-up take) on two fresh stores:
+         as per-layer Transfer objects (issue, unchanged) and as ONE (6, n) descriptor (issue_desc), each with its T3 /
+         T4 events PENDING at issue (recorded after a --l2-sleep-cycles GPU sleep; the descriptor path through
+         mark_reader / mark_hist). PASS: the two stores (K and V, every layer) and the two boards are BITWISE equal; the
+         board holds every take; 256 sampled takes are the host truth; groups and publications are counted alike;
+         landed_upto() reaches the descriptor job; both on the requested team.
+  GFW2n  MUST, the negative control: the descriptor path with the planted slot shift (set_plant_slot_shift(1)) on a
+         fresh store does NOT land the object path's store.
+  R_GFW2_host  REPORT: the main thread's issue time of the tick: issue_desc (one call) against the L issue() calls of
+         the object path (the Transfer objects are built beforehand, not timed).
+REGISTERED2 (frozen 2026-10-21 before gfw2; the step script's header holds the same numbers): PREDICTION the issue_desc
+  call takes <= 1.0 ms at --takes 6496; FALSIFIER >= 5.0 ms; otherwise GREY.
+gfw1d / gfw1e: REPORT-only probes (their REGISTERED blocks below). gfw1f = GFW_ready, then REPORT R_GFW1f_builtin /
+R_GFW1f_nowarm / R_GFW1f: GFW1's captured protocol (no submission wait, 64 launches behind the spin) in two FRESH child
+processes with lazy loading: builtin = the production transport with its built-in warm-up (GilfreeTransport warm_up,
+default on), nowarm = the same with warm_up=False (the control); REGISTERED1F below.
+OUTPUT: --out/summary.json. The last stdout line is R2_GFW_DONE failed=<n>; exit = n (2 = refused).
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import time
+import traceback
+import types
+
+REGISTERED = dict(pred_band=0.15, falsifier_ratio=1.30)
+REGISTERED2 = dict(desc_issue_pred_ms=1.0, desc_issue_fals_ms=5.0)
+CELLS = ("gfw1", "gfw2", "gfw1d", "gfw1e", "gfw1f")
+ARMS_1E = ("eager", "warm")
+# REGISTERED GFW1E (frozen 2026-10-21 before gfw1e; the step script's header holds the same block): GFW1's captured
+# protocol (64 launches behind the spin, no submission wait), each arm in a FRESH child process: (a) eager:
+# CUDA_MODULE_LOADING=EAGER in the child's environment; (b) warm: the default (lazy) loading, but before the spin one
+# add_ on the main stream and one index_copy_ + one board index_put_ on the scatter stream. gfw1d: the main thread's
+# own enqueue (64 launches) blocked as long as the spin (8584 / 8583 ms), and gfw1c's GFW1 failed as the FIRST arm
+# while GFW1e passed second. PREDICTION if CUDA's lazy module loading is the cause: BOTH arms pass (err 0, a real spin
+# > 10 ms, every launch ran, the rows the host truth). FALSIFIER: either arm ends at the spin's bound (err 1).
+REGISTERED1E = dict(env="CUDA_MODULE_LOADING", eager="EAGER")
+
+
+def child_env_1e(base, arm):
+    """The environment of gfw1e's child for `arm`: eager sets CUDA_MODULE_LOADING=EAGER; warm removes the variable
+    (torch then sets its own default at its CUDA init; the child records what it sees before and after)."""
+    if arm not in ARMS_1E:
+        raise ValueError("arm %r" % (arm,))
+    env = dict(base)
+    if arm == "eager":
+        env[REGISTERED1E["env"]] = REGISTERED1E["eager"]
+    else:
+        env.pop(REGISTERED1E["env"], None)
+    return env
+
+
+def arm_ok_1e(r, launches):
+    """One gfw1e arm passed: its environment as intended (eager: EAGER seen after torch's CUDA init), err 0, a real
+    spin, every launch ran, the rows the host truth, the T4 event pending at issue."""
+    if not r or "error" in r:
+        return False
+    if r.get("arm") == "eager" and r.get("module_loading_after") != REGISTERED1E["eager"]:
+        return False
+    return (r["err"] == 0 and r["spin_ms"] > 10.0 and r["launches_done"] == float(launches) and r["rows_ok"]
+            and r["t4_pending_at_issue"])
+
+
+def verdict_1e(results, launches):
+    """REGISTERED GFW1E: HELD = both arms passed; FALSIFIED = an arm with its intended environment ended at the spin's
+    bound (err 1); INVALID otherwise (an arm missing, failed, or not in its intended environment)."""
+    if all(arm_ok_1e(results.get(arm), launches) for arm in ARMS_1E):
+        return "HELD"
+    for arm in ARMS_1E:
+        r = results.get(arm) or {}
+        env_ok = arm != "eager" or r.get("module_loading_after") == REGISTERED1E["eager"]
+        if "error" not in r and r.get("err") == 1 and env_ok:
+            return "FALSIFIED"
+    return "INVALID"
+
+
+ARMS_1F = ("builtin", "nowarm")
+# REGISTERED GFW1F (frozen 2026-10-21 before gfw1f; the step script's header and docs/R2_GFW1F_PLAN.md hold the same
+# block): gfw1e (holder 2190876, 372fe55): the EAGER arm stalled (err 1, spin 7255 ms, enqueue 9.2 ms), the WARM arm
+# passed (err 0, spin 143 ms, enqueue 0.89 ms). The PRODUCTION transport now warms up in its constructor
+# (GilfreeTransport(..., warm_up=True), the default: add_ on the current stream, index_copy_ of the store's dtype +
+# index_put_ int64 on the scatter stream, a synchronize). GFW1's captured protocol (64 launches behind the spin, NO
+# submission wait, the gate's own warm-up OFF), each arm in a FRESH child process with the default (lazy) loading:
+# (A) builtin: the production transport (its warm-up on); (B) nowarm: the same with warm_up=False (the control).
+# PREDICTION: A passes (err 0, 10 ms < spin < 1000 ms, every launch ran, the rows the host truth, T4 pending at issue,
+# the transport's warm_calls 1); B stalls (err 1: the spin ends at its bound; warm_calls 0).
+# FALSIFIER: A ends with err 1 or a spin >= 1000 ms. CONTROL_BLIND: A passes and B passes too (the stall did not
+# reproduce without the warm-up: A's pass is then no evidence that the warm-up is what prevents it). INVALID otherwise
+# (an arm missing, a child error, a child not in lazy loading, warm_calls not as built).
+REGISTERED1F = dict(env="CUDA_MODULE_LOADING", lazy="LAZY", spin_max_ms=1000.0, spin_min_ms=10.0)
+
+
+def child_env_1f(base, arm):
+    """gfw1f's child environment: both arms the default (lazy) loading (the variable removed, as gfw1e's warm arm)."""
+    if arm not in ARMS_1F:
+        raise ValueError("arm %r" % (arm,))
+    env = dict(base)
+    env.pop(REGISTERED1F["env"], None)
+    return env
+
+
+def _arm_valid_1f(r, arm):
+    """The arm ran, in lazy loading, with the transport's warm-up as built (builtin: 1 call; nowarm: 0)."""
+    return (bool(r) and "error" not in r and r.get("arm") == arm
+            and r.get("module_loading_after") == REGISTERED1F["lazy"]
+            and r.get("tp_warm_calls") == (1 if arm == "builtin" else 0))
+
+
+def arm_ok_1f(r, arm, launches):
+    """gfw1f's arm met ITS registered expectation: builtin passes (err 0, 10 ms < spin < 1000 ms, every launch ran, the
+    rows the host truth, T4 pending at issue); nowarm stalls (err 1; every launch still ran)."""
+    if not _arm_valid_1f(r, arm):
+        return False
+    if arm == "builtin":
+        return (r["err"] == 0 and REGISTERED1F["spin_min_ms"] < r["spin_ms"] < REGISTERED1F["spin_max_ms"]
+                and r["launches_done"] == float(launches) and r["rows_ok"] and r["t4_pending_at_issue"])
+    return r["err"] == 1 and r["launches_done"] == float(launches) and r["t4_pending_at_issue"]
+
+
+def verdict_1f(results, launches):
+    """REGISTERED GFW1F: HELD = A passes and B stalls; FALSIFIED = a valid A with err 1 or spin >= 1000 ms;
+    CONTROL_BLIND = A passes, B valid but not stalled; INVALID otherwise."""
+    a, b = results.get("builtin"), results.get("nowarm")
+    if not _arm_valid_1f(a, "builtin"):
+        return "INVALID"
+    if a["err"] == 1 or a["spin_ms"] >= REGISTERED1F["spin_max_ms"]:
+        return "FALSIFIED"
+    if not arm_ok_1f(a, "builtin", launches) or not _arm_valid_1f(b, "nowarm"):
+        return "INVALID"
+    if arm_ok_1f(b, "nowarm", launches):
+        return "HELD"
+    return "CONTROL_BLIND" if b["err"] == 0 else "INVALID"
+# REGISTERED GFW1D (frozen 2026-10-21 before gfw1d; the step script's header holds the same block): GFW1's captured
+# protocol (64 launches behind the spin, no submission wait) in a process with CUDA_DEVICE_MAX_CONNECTIONS=32.
+# PREDICTION if the shared hardware queue is the cause (gfw1c: GFW1 failed with only 64 launches, so not the launch
+# queue): err 0, a real spin (> 10 ms), every launch ran, the rows are the host truth. FALSIFIER of that hypothesis:
+# err 1 at the spin's bound with the variable set to 32. Information only: the rule (wait in both modes) stands.
+REGISTERED1D = dict(env="CUDA_DEVICE_MAX_CONNECTIONS", value="32")
+V2_RECORD = {64: dict(svc_p50_ms=4.59, native_total_ms=4.20), 192: dict(svc_p50_ms=12.36, native_total_ms=11.43,
+                                                                       svc_p50_ms_t4=15.86)}
+B_T, H_T, D_T, R_T, LAYERS_T, NSRC_T, NBLK_T, M_T, CAP_T = 64, 8, 128, 64, 32, 4, 64, 16, 256
+GROUP_BYTES = R_T * D_T * 2 * 2                                # K + V of one (b, h, block) in bf16: 32 KiB
+
+
+def log(msg):
+    print("[r2_gfw %s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+
+
+def gate(name, passed, must, detail):
+    return dict(name=name, passed=bool(passed), must=bool(must), detail=detail)
+
+
+def parse_args(argv):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--nosi-pkg", required=True, help="the nosi package directory (nosi/nosi) of the step's commit")
+    ap.add_argument("--v3", required=True, help="the directory of packer v3's gilfree_pack.py / .cpp (this commit)")
+    ap.add_argument("--v3-build", required=True)
+    ap.add_argument("--v2", required=True, help="the directory of the pinned packer v2 (f2b981a)")
+    ap.add_argument("--v2-build", required=True)
+    ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--releases", type=int, default=20, help="timed releases per arm and size (after the warm-ups)")
+    ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--sizes", default="64,192", help="MiB of K + V per release")
+    ap.add_argument("--launches", type=int, default=1500, help="launches behind the spin (> the ~1024-entry queue)")
+    ap.add_argument("--launches-few", type=int, default=64, help="GFW1: the captured tick's few launches behind the spin")
+    ap.add_argument("--hazard-spin", type=int, default=1 << 20, help="R_GFW1x: the spin's bound (rounds)")
+    ap.add_argument("--spin-cycles", type=int, default=200_000_000, help="the GPU sleep before the T4 event")
+    ap.add_argument("--arm", default="", choices=("",) + ARMS_1E + ARMS_1F, help=argparse.SUPPRESS)  # gfw1e/f child
+    ap.add_argument("--arm-out", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--cell", default="gfw1", choices=CELLS,
+                    help="gfw1: GFW1 / GFW1e / GFW1n / GFW_T; gfw2: GFW2 / GFW2n; gfw1d: R_GFW1d, gfw1e: R_GFW1e, "
+                         "gfw1f: R_GFW1f (REPORT only)")
+    ap.add_argument("--takes", type=int, default=6496, help="gfw2: the takes of the tick (B2: ~6.49 k)")
+    ap.add_argument("--l2-layers", type=int, default=4)
+    ap.add_argument("--l2-batch", type=int, default=64)
+    ap.add_argument("--l2-heads", type=int, default=2)
+    ap.add_argument("--l2-s-host", type=int, default=16311, help="host rows per request (build_ragged's n_host)")
+    ap.add_argument("--l2-c", type=int, default=96)
+    ap.add_argument("--l2-x", type=int, default=32)
+    ap.add_argument("--l2-sleep-cycles", type=int, default=50_000_000, help="the GPU sleep before the T3 / T4 events")
+    a = ap.parse_args(argv)
+    if a.arm and a.arm not in dict(gfw1e=ARMS_1E, gfw1f=ARMS_1F).get(a.cell, ()):
+        ap.error("--arm %s is not an arm of the cell %s" % (a.arm, a.cell))
+    npos = a.l2_c + a.l2_x
+    if (a.l2_layers < 1 or a.takes < a.l2_layers or a.takes % a.l2_layers
+            or a.takes // a.l2_layers > a.l2_batch * a.l2_heads * (npos - 1) or a.l2_s_host < 64 * 2
+            or a.l2_sleep_cycles < 1_000_000):
+        ap.error("gfw2: takes a multiple of l2-layers, at most l2-batch x l2-heads x (C + X - 1) per layer; "
+                 "l2-s-host >= 128; l2-sleep-cycles >= 1e6")
+    a.sizes = [int(s) for s in a.sizes.split(",") if s]
+    if not a.sizes or any(s <= 0 or s % 16 or s > 256 for s in a.sizes):
+        ap.error("--sizes: MiB multiples of 16 up to 256 (32 KiB groups spread evenly over B 64 x H 8 streams, <= 16 "
+                 "destinations each)")
+    if not 0 <= a.launches_few <= 256 or a.hazard_spin < 1 << 10:
+        ap.error("launches-few 0 .. 256 (well below the ~1024-entry queue), hazard-spin >= 1024")
+    if not 1 <= a.threads <= 64 or a.releases < 3 or a.warmup < 0 or a.launches < 1100 or a.spin_cycles < 1_000_000:
+        ap.error("threads 1 .. 64, releases >= 3, warmup >= 0, launches >= 1100, spin-cycles >= 1e6")
+    return a
+
+
+def by_path(path, name):
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[name] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+def load_nosi(pkg_dir, pkg="r2gfw"):
+    """r2_transport_gilfree and r2_residency_sc from pkg_dir as the bare package `pkg` (their relative imports resolve
+    inside it; nosi/__init__.py, the model's imports, is not run)."""
+    if pkg not in sys.modules:
+        p = types.ModuleType(pkg)
+        p.__path__ = [str(pkg_dir)]
+        sys.modules[pkg] = p
+
+    def ld(mod):
+        full = pkg + "." + mod
+        if full not in sys.modules:
+            by_path(os.path.join(str(pkg_dir), mod + ".py"), full)
+        return sys.modules[full]
+    return ld("r2_transport_gilfree"), ld("r2_residency_sc")
+
+
+def stats(xs):
+    xs = sorted(float(x) for x in xs)
+    if not xs:
+        return None
+    n = len(xs)
+    return dict(n=n, mean=sum(xs) / n, median=xs[n // 2], p90=xs[min(n - 1, int(0.9 * n))], min=xs[0], max=xs[-1])
+
+
+def verdict(ratio):
+    """REGISTERED: HELD if |ratio - 1| <= pred_band; FALSIFIED if ratio >= falsifier_ratio; else GREY."""
+    if ratio is None:
+        return "MISSING"
+    if abs(ratio - 1.0) <= REGISTERED["pred_band"]:
+        return "HELD"
+    return "FALSIFIED" if ratio >= REGISTERED["falsifier_ratio"] else "GREY"
+
+
+def plan(mib, seed, B=B_T, H=H_T, layers=LAYERS_T, M=M_T, nblk=NBLK_T):
+    """One release of mib MiB: groups = mib MiB / 32 KiB, every (b, h) stream gets groups / (B H) destinations
+    m = 0 .. k - 1 (distinct in the release), each group a random layer (0 .. layers - 1) and block. Returns the five
+    int64 CPU vectors (b, h, l, m, blk)."""
+    import torch
+    groups = mib * (1 << 20) // GROUP_BYTES
+    per = groups // (B * H)
+    if per * B * H != groups or not 1 <= per <= M:
+        raise ValueError("%d MiB = %d groups do not spread evenly over %d streams with <= %d destinations" % (
+            mib, groups, B * H, M))
+    g = torch.Generator().manual_seed(seed)
+    b = torch.arange(B).repeat_interleave(H * per)
+    h = torch.arange(H).repeat_interleave(per).repeat(B)
+    m = torch.arange(per).repeat(B * H)
+    l = torch.randint(0, layers, (groups,), generator=g)
+    blk = torch.randint(0, nblk, (groups,), generator=g)
+    return [t.to(torch.int64).contiguous() for t in (b, h, l, m, blk)]
+
+
+def plan_ok(vecs, B=B_T, H=H_T, M=M_T, nblk=NBLK_T):
+    """The plan's destinations (b, h, m) are distinct and every field is in range."""
+    b, h, l, m, blk = (v.tolist() for v in vecs)
+    dst = list(zip(b, h, m))
+    return (len(set(dst)) == len(dst) and all(0 <= x < B for x in b) and all(0 <= x < H for x in h)
+            and all(0 <= x < M for x in m) and all(0 <= x < nblk for x in blk) and all(x >= 0 for x in l))
+
+
+# ------------------------------------------------------------------------------------------------ GFW1 / GFW1n
+def gfw1(GF, SCG, ext3, planted, max_spin, spin_cycles, launches, threads, wait_submission=False, warm=False,
+         tp_warm_up=False):
+    """GTG1 as a gate (module docstring: GFW1 / GFW1e / GFW1n / R_GFW1x / gfw1e / gfw1f). wait_submission: the host
+    waits until the job is submitted before the spin (GFW1e). warm (gfw1e's arm b): before the spin, one add_ on the
+    main stream and one index_copy_ + one int64 index_put_ on the transport's scatter stream (the kernels the launches
+    and the worker use behind the spin), then a synchronize. tp_warm_up: the transport's own warm-up (GilfreeTransport
+    warm_up, the production default since r2-gfw-warm); False here by default, so the cells gfw1 / gfw1d / gfw1e keep
+    the protocol they were registered with; gfw1f sets it per arm. Returns its observations."""
+    import torch
+    dev = torch.device("cuda")
+    L, Bp, Hp, Dp, nblk, npos, BS = 2, 2, 2, 64, 16, 12, 64
+    g = torch.Generator().manual_seed(5 + int(planted))
+    host_k = [torch.randn(Bp, nblk * BS, Hp, Dp, generator=g) for _ in range(L)]
+    host_v = [torch.randn(Bp, nblk * BS, Hp, Dp, generator=g) for _ in range(L)]
+    sk = [torch.zeros(Bp, npos * BS, Hp, Dp, device=dev) for _ in range(L)]
+    sv = [torch.zeros(Bp, npos * BS, Hp, Dp, device=dev) for _ in range(L)]
+    gf = GF.GilfreeTransport(ext3, host_k, host_v, sk, sv, BS, Dp, threads=threads,
+                             host_wait=lambda ev: ev.synchronize(), cap_groups=4, worker="cpp",
+                             warm_up=bool(tp_warm_up))
+    board = SCG.GenBoard(L, Bp, Hp, npos, dev)
+    gf.attach_board(board)
+    if planted:
+        gf.npipe.set_skip_publish(True)                        # NEGATIVE CONTROL
+    groups = [(b, h, (3 * b + h) % nblk, 2 * h + b) for b in range(Bp) for h in range(Hp)]
+    gens = [i + 5 for i in range(len(groups))]
+    idx = torch.tensor([board.flat(1, b, h, s) for (b, h, _, s) in groups], dtype=torch.int64, device=dev)
+    gen = torch.tensor(gens, dtype=torch.int64, device=dev)
+    err = torch.zeros((), dtype=torch.int32, device=dev)
+    x = torch.zeros((), device=dev)
+    kern = SCG._wait_kernel()
+    # C's 74c7d9b (on r2-gfw-warm through 9508109): the kernel takes a spin-round counter (spins_ptr) before BLOCK
+    spins = torch.zeros((1,), dtype=torch.int64, device=dev)
+    kern[(1,)](board.t, torch.full_like(idx, -1), gen, idx.shape[0], err, max_spin, spins, BLOCK=1024)   # compile
+    warmed = None
+    if warm:                                                   # gfw1e (b): the kernels behind the spin, loaded first
+        wx = torch.zeros((), device=dev)
+        wx.add_(1.0)                                           # the launches' kernel, on the main stream
+        with torch.cuda.stream(gf.scatter):                    # the worker's two kernels, on its scatter stream
+            wd = torch.zeros(2 * BS, Dp, device=dev)
+            wd.index_copy_(0, torch.arange(BS, device=dev), torch.ones(BS, Dp, device=dev))
+            wb = torch.zeros(8, dtype=torch.int64, device=dev)
+            wb.index_put_((torch.tensor([1, 2], device=dev),), torch.tensor([3, 4], device=dev))
+        warmed = "add_ (main); index_copy_ float32 + index_put_ int64 (scatter)"
+    torch.cuda.synchronize()                                   # BEFORE the sleep: the T4 event must be pending
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(int(spin_cycles))
+        hist = torch.cuda.Event()
+        hist.record(side)
+    trs = [GF.Transfer(i, "u%d" % b, 1, b, h, blk, s, gens[i], "draft", ("u%d" % b, 1, 1), hist_ev=hist)
+           for i, (b, h, blk, s) in enumerate(groups)]
+    pending_at_issue = not hist.query()
+    e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    t0 = time.perf_counter()
+    gf.issue(1, trs)                                           # queued: the host does not wait for the submission
+    issue_ms = 1e3 * (time.perf_counter() - t0)
+    submission_wait_ms = None
+    if wait_submission:                                        # GFW1e: the eager tick's rule, before the spin
+        t1 = time.perf_counter()
+        gf.wait_submitted(trs[0])
+        submission_wait_ms = 1e3 * (time.perf_counter() - t1)
+    e0.record()
+    kern[(1,)](board.t, idx, gen, idx.shape[0], err, max_spin, spins, BLOCK=1024)
+    e1.record()
+    for _ in range(int(launches)):
+        x.add_(1.0)
+    enqueue_ms = 1e3 * (time.perf_counter() - t0)
+    superset = "ok"
+    try:
+        torch.cuda.current_stream().wait_event(trs[0].ev)      # _JobEv.wait: the superset protocol
+    except Exception as e:                                     # an observation, judged by the gate
+        superset = "%s: %s" % (type(e).__name__, str(e)[:200])
+    torch.cuda.synchronize()
+    gf.close()
+    rows_ok = all(torch.equal(sk[1][b, s * BS:(s + 1) * BS, h].cpu(), host_k[1][b, k * BS:(k + 1) * BS, h])
+                  and torch.equal(sv[1][b, s * BS:(s + 1) * BS, h].cpu(), host_v[1][b, k * BS:(k + 1) * BS, h])
+                  for (b, h, k, s) in groups)
+    return dict(planted=bool(planted), max_spin=int(max_spin), err=int(err.item()), launches_done=float(x.item()),
+                spin_ms=float(e0.elapsed_time(e1)), rows_ok=bool(rows_ok), superset_wait=superset,
+                threads_ok=bool(gf.threads_ok()), stats=dict(gf.stats), t4_pending_at_issue=bool(pending_at_issue),
+                issue_ms=round(issue_ms, 3), enqueue_ms=round(enqueue_ms, 3), launches=int(launches),
+                wait_submission=bool(wait_submission),
+                submission_wait_ms=None if submission_wait_ms is None else round(submission_wait_ms, 3),
+                warmed=warmed, tp_warm_calls=int(gf.warm_calls), tp_warmed=gf.warmed, spin_rounds=int(spins.item()),
+                board=[int(v) for v in board.t.view(-1)[idx].tolist()],
+                want=[int(v) for v in gen.tolist()])
+
+
+# ------------------------------------------------------------------------------------------------ GFW_T
+def timing(ext2, ext3, sizes, threads, releases, warmup):
+    """GFW_T (module docstring): per size the arms v2 release() | v3 worker | v3 release() | v2 release() (A-B-A),
+    each `warmup` + `releases` releases of one plan per release (seeded), the device idle at each release's start."""
+    import torch
+    dev = torch.device("cuda")
+    dt = torch.bfloat16
+    src_k = [torch.full((B_T, NBLK_T * R_T, H_T, D_T), float(i + 1), dtype=dt) for i in range(NSRC_T)]
+    src_v = [torch.full((B_T, NBLK_T * R_T, H_T, D_T), float(-i - 1), dtype=dt) for i in range(NSRC_T)]
+    scr_k = torch.zeros((B_T, M_T * R_T, H_T, D_T), dtype=dt, device=dev)
+    scr_v = torch.zeros_like(scr_k)
+    elem = 2
+    keep = []
+
+    def pipe(ext):
+        extra = int(getattr(ext, "SLOT_EXTRA_PER_GROUP", 0))
+        nb = CAP_T * R_T * 8 + CAP_T * extra + 2 * CAP_T * R_T * D_T * elem
+        stage = torch.zeros((2, nb), dtype=torch.uint8, pin_memory=True)
+        land = torch.zeros((2, nb), dtype=torch.uint8, device=dev)
+        cs, ss = torch.cuda.Stream(), torch.cuda.Stream()
+        trip = lambda s: [int(s.stream_id), int(s.device_index), int(s.device_type)]   # noqa: E731
+        p = ext.NativePipe(stage, land, CAP_T, R_T, trip(cs), trip(ss))
+        p.set_sources(src_k, src_v)
+        p.set_threads(threads)
+        keep.append((stage, land, cs, ss))
+        return p
+    p2, p3r, p3w = pipe(ext2), pipe(ext3), pipe(ext3)
+    p3w.start_worker(False, False, int(dev.index if dev.index is not None else torch.cuda.current_device()), [])
+    dk, dv = scr_k.view(-1, D_T), scr_v.view(-1, D_T)
+    out = {}
+    for mib in sizes:
+        plans = [plan(mib, 1000 * mib + i) for i in range(warmup + releases)]
+        lists = [[v.tolist() for v in pl] for pl in plans]
+
+        def run_release(p, tag):
+            rec = dict(total_ms=[], wall_ms=[], pack_ms=[], wait_ms=[], submit_ms=[], team=[])
+            for i, pl in enumerate(plans):
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                st = [int(v) for v in p.release(pl[0], pl[1], pl[2], pl[3], pl[4], dk, dv)]
+                wall = 1e3 * (time.perf_counter() - t0)
+                if i >= warmup:
+                    rec["total_ms"].append(st[6] / 1e6)
+                    rec["wall_ms"].append(wall)
+                    rec["pack_ms"].append(st[3] / 1e6)
+                    rec["wait_ms"].append(st[4] / 1e6)
+                    rec["submit_ms"].append(st[5] / 1e6)
+                    rec["team"].append((st[7], st[8]))
+            torch.cuda.synchronize()
+            return rec
+
+        def run_worker():
+            rec = dict(total_ms=[], wall_ms=[], handoff_ms=[], pack_ms=[], wait_ms=[], submit_ms=[], team=[])
+            for i, ls in enumerate(lists):
+                torch.cuda.synchronize()
+                w0 = [int(v) for v in p3w.worker_stats()]
+                t0 = time.perf_counter()
+                seq = int(p3w.submit(ls[0], ls[1], ls[2], ls[3], ls[4], scr_k, scr_v, [], [], [], []))
+                while int(p3w.submitted) < seq:                # the main thread polls (the worker needs no GIL)
+                    pass
+                wall = 1e3 * (time.perf_counter() - t0)
+                w1 = [int(v) for v in p3w.worker_stats()]
+                err = p3w.take_error()
+                if err:
+                    raise RuntimeError("the worker's job %d failed: %s" % (seq, err))
+                if i >= warmup:
+                    tot = (w1[6] - w0[6]) / 1e6
+                    rec["total_ms"].append(tot)
+                    rec["wall_ms"].append(wall)
+                    rec["handoff_ms"].append(wall - tot)
+                    rec["pack_ms"].append((w1[3] - w0[3]) / 1e6)
+                    rec["wait_ms"].append((w1[4] - w0[4]) / 1e6)
+                    rec["submit_ms"].append((w1[5] - w0[5]) / 1e6)
+                    rec["team"].append((w1[7], w1[8]))
+            torch.cuda.synchronize()
+            return rec
+        log("GFW_T %d MiB: v2, worker, v3 release, v2" % mib)
+        arms = dict(v2_a=run_release(p2, "v2_a"), v3_worker=run_worker(), v3_release=run_release(p3r, "v3_release"),
+                    v2_b=run_release(p2, "v2_b"))
+        summ = {k: {f: stats(v) for f, v in r.items() if f != "team"} for k, r in arms.items()}
+        teams = {k: sorted(set(map(tuple, r["team"]))) for k, r in arms.items()}
+        v2_all = arms["v2_a"]["total_ms"] + arms["v2_b"]["total_ms"]
+        v2_med = stats(v2_all)["median"]
+        w_med = summ["v3_worker"]["total_ms"]["median"]
+        ratio = w_med / v2_med if v2_med else None
+        out[mib] = dict(groups=len(plans[0][0]), bytes=len(plans[0][0]) * GROUP_BYTES, arms=summ, teams=teams,
+                        v2_total_median_ms=v2_med, worker_total_median_ms=w_med, ratio=ratio, verdict=verdict(ratio),
+                        teams_ok=all(t == [(threads, threads)] for t in teams.values()), record_v2=V2_RECORD.get(mib))
+    p3w.stop_worker()
+    return out
+
+
+# ------------------------------------------------------------------------------------------------ GFW2 (cell gfw2)
+def verdict2(ms):
+    """REGISTERED2: HELD if the issue_desc call took <= desc_issue_pred_ms; FALSIFIED at >= desc_issue_fals_ms."""
+    if ms is None:
+        return "MISSING"
+    if ms <= REGISTERED2["desc_issue_pred_ms"]:
+        return "HELD"
+    return "FALSIFIED" if ms >= REGISTERED2["desc_issue_fals_ms"] else "GREY"
+
+
+def l2_takes(a, seed=17):
+    """gfw2's takes (CPU): the (6, n) int64 rows l, b, h, block, slot, gen: per layer takes / layers DISTINCT
+    destinations (b, h, slot < C + X - 1: room for the planted shift), blocks below the complete host blocks,
+    generations 2 .. n + 1."""
+    import torch
+    g = torch.Generator().manual_seed(seed)
+    L, B, H = a.l2_layers, a.l2_batch, a.l2_heads
+    ns = a.l2_c + a.l2_x - 1
+    per = a.takes // L
+    nblk = a.l2_s_host // 64
+    cols = []
+    for l in range(L):
+        dst = torch.randperm(B * H * ns, generator=g)[:per]
+        cols.append(torch.stack([torch.full((per,), l, dtype=torch.int64), dst // (H * ns), (dst // ns) % H,
+                                 torch.randint(0, nblk, (per,), generator=g), dst % ns,
+                                 torch.zeros(per, dtype=torch.int64)]))
+    desc = torch.cat(cols, 1).contiguous()
+    desc[5] = torch.arange(2, desc.shape[1] + 2)
+    return desc
+
+
+def gfw2(GF, SCG, ext3, a):
+    """GFW2 / GFW2n (module docstring): the object path (A), the descriptor path (B), the planted shift (C)."""
+    import torch
+    dev = torch.device("cuda")
+    L, B, H, D, R = a.l2_layers, a.l2_batch, a.l2_heads, 128, 64
+    npos = a.l2_c + a.l2_x
+    slots = npos + 4
+    dt = torch.bfloat16
+    g = torch.Generator().manual_seed(23)
+    host_k = [torch.empty(B, a.l2_s_host, H, D, dtype=dt).uniform_(-1, 1, generator=g) for _ in range(L)]
+    host_v = [torch.empty(B, a.l2_s_host, H, D, dtype=dt).uniform_(-1, 1, generator=g) for _ in range(L)]
+    desc = l2_takes(a)
+    n = int(desc.shape[1])
+    rows = desc.t().tolist()
+    marks = list(range(L))                                     # tick 0: mark = 0 * L + layer
+
+    def stores():
+        return ([torch.zeros(B, slots * R, H, D, dtype=dt, device=dev) for _ in range(L)],
+                [torch.zeros(B, slots * R, H, D, dtype=dt, device=dev) for _ in range(L)])
+
+    def transport(sk, sv):
+        gf = GF.GilfreeTransport(ext3, host_k, host_v, sk, sv, R, D, threads=a.threads,
+                                 host_wait=lambda ev: ev.synchronize(), cap_groups=256, worker="cpp")
+        bd = SCG.GenBoard(L, B, H, npos, dev)
+        gf.attach_board(bd)
+        return gf, bd
+
+    def pending_events():
+        torch.cuda._sleep(int(a.l2_sleep_cycles))           # the main stream: the events complete after the sleep
+        evr = []
+        for _ in range(L):
+            e = torch.cuda.Event()
+            e.record()
+            evr.append(e)
+        eh = torch.cuda.Event()
+        eh.record()
+        return evr, eh
+
+    def objects(sel, evr=None, eh=None):
+        per = {}
+        for i in sel:
+            l, b, h, blk, s, gen = rows[i]
+            per.setdefault(l, []).append(GF.Transfer(i, "u%d" % b, l, b, h, blk, s, gen, "draft", ("u%d" % b, 1, 1),
+                                                     hist_ev=eh, reader_ev=None if evr is None else evr[l]))
+        return per
+    out = dict(n=n, layers=L)
+    # A: the object path (issue, unchanged)
+    sa = stores()
+    ga, ba = transport(*sa)
+    for l, trs in objects([0]).items():
+        ga.issue(l, trs)                                       # the warm-up take (starts the worker)
+    ga.flush()
+    evr, eh = pending_events()
+    batch = objects(range(n), evr, eh)
+    out["a_pending_at_issue"] = not eh.query()
+    t0 = time.perf_counter()
+    for l in sorted(batch):
+        ga.issue(l, batch[l])
+    out["object_issue_ms"] = 1e3 * (time.perf_counter() - t0)
+    ga.flush()
+    torch.cuda.synchronize()
+    out.update(a_stats=dict(ga.stats), a_threads_ok=bool(ga.threads_ok()), a_error=ga.npipe.take_error())
+    ga.close()
+    # B: the descriptor path (issue_desc)
+    sb = stores()
+    gb, bb = transport(*sb)
+    gb.issue_desc(desc[:, :1].contiguous())                    # the same warm-up take (the worker, the stores)
+    gb.flush()
+    evr, eh = pending_events()
+    for l in range(L):
+        gb.mark_reader(marks[l], evr[l])
+    gb.mark_hist(0, eh)
+    out["b_pending_at_issue"] = not eh.query()
+    t0 = time.perf_counter()
+    seq = gb.issue_desc(desc, marks, 0)
+    out["desc_issue_ms"] = 1e3 * (time.perf_counter() - t0)
+    gb.flush()
+    torch.cuda.synchronize()
+    out.update(desc_seq=int(seq), landed_upto=int(gb.landed_upto()), b_stats=dict(gb.stats),
+               b_threads_ok=bool(gb.threads_ok()), b_error=gb.npipe.take_error())
+    gb.close()
+    out["stores_equal"] = all(torch.equal(sa[0][l], sb[0][l]) and torch.equal(sa[1][l], sb[1][l]) for l in range(L))
+    out["boards_equal"] = bool(torch.equal(ba.t, bb.t))
+    out["board_entries"] = int((bb.t != 0).sum().item())
+    sample = torch.randperm(n, generator=torch.Generator().manual_seed(29))[:256].tolist()
+    out["truth_sampled"] = len(sample)
+    out["truth_ok"] = all(
+        torch.equal(sb[0][l][b, s * R:(s + 1) * R, h].cpu(), host_k[l][b, blk * R:(blk + 1) * R, h])
+        and torch.equal(sb[1][l][b, s * R:(s + 1) * R, h].cpu(), host_v[l][b, blk * R:(blk + 1) * R, h])
+        for (l, b, h, blk, s, _) in (rows[i] for i in sample))
+    # C: the planted slot shift (NEGATIVE CONTROL), on B's stores zeroed
+    for t in sb[0] + sb[1]:
+        t.zero_()
+    torch.cuda.synchronize()
+    gc, _ = transport(*sb)
+    gc.npipe.set_plant_slot_shift(1)
+    gc.issue_desc(desc[:, :1].contiguous())
+    gc.issue_desc(desc)
+    gc.flush()
+    torch.cuda.synchronize()
+    out["c_error"] = gc.npipe.take_error()
+    gc.close()
+    out["planted_equal"] = all(torch.equal(sa[0][l], sb[0][l]) and torch.equal(sa[1][l], sb[1][l]) for l in range(L))
+    return out
+
+
+def run_arm_1e(a) -> int:
+    """gfw1e's / gfw1f's CHILD (a fresh process, its environment from child_env_1e / child_env_1f): records
+    CUDA_MODULE_LOADING before torch is imported and after torch's CUDA init, runs ONE arm of GFW1's captured protocol
+    (gfw1e eager: as is; gfw1e warm: with the gate's warm-up; gfw1f builtin: the transport's own warm-up on; gfw1f
+    nowarm: off; the gate's warm-up only in gfw1e's warm arm), and writes its observations to --arm-out (the parent
+    reads them)."""
+    out = dict(arm=a.arm, module_loading_before=os.environ.get(REGISTERED1E["env"]))
+    try:
+        import torch
+        torch.cuda.init()                                      # torch sets its default here when the variable is unset
+        out["module_loading_after"] = os.environ.get(REGISTERED1E["env"])
+        GF, SCG = load_nosi(a.nosi_pkg)
+        gp3 = by_path(os.path.join(a.v3, "gilfree_pack.py"), "gilfree_pack_v3_gate")
+        ext3 = gp3.load(a.v3_build)                            # the parent built it: loaded, not rebuilt
+        r = gfw1(GF, SCG, ext3, False, 1 << 24, a.spin_cycles, a.launches_few, a.threads, wait_submission=False,
+                 warm=(a.arm == "warm"), tp_warm_up=(a.arm == "builtin"))
+        r.update(out)
+        out = r
+    except Exception as e:
+        traceback.print_exc()
+        out["error"] = "%s: %s" % (type(e).__name__, str(e)[:400])
+    json.dump(out, open(a.arm_out, "w"), indent=1, sort_keys=True, default=str)
+    return 0 if "error" not in out else 1
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    a = parse_args(argv)
+    if a.arm:                                                  # gfw1e's / gfw1f's child (its --out is the parent's)
+        return run_arm_1e(a)
+    if os.path.exists(a.out):
+        print("REFUSED: --out %s exists" % a.out, file=sys.stderr)
+        return 2
+    try:
+        os.makedirs(a.out)
+        gates, res = [], {}
+        meta = dict(args=vars(a), commit=os.environ.get("GFW_COMMIT", "unknown"), registered=REGISTERED,
+                    registered2=REGISTERED2, v2_record=V2_RECORD, cell=a.cell,
+                    cuda_module_loading_at_start=os.environ.get(REGISTERED1E["env"]))
+
+        def save():
+            json.dump(dict(meta=meta, gates=gates, results=res), open(os.path.join(a.out, "summary.json"), "w"),
+                      indent=1, sort_keys=True, default=str)
+        import torch
+        if not torch.cuda.is_available():
+            raise SystemExit("REFUSED: no CUDA device")
+        meta.update(torch=torch.__version__, gpu=torch.cuda.get_device_name(0),
+                    cuda_device_max_connections=os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS"),
+                    cuda_module_loading_after_init=os.environ.get(REGISTERED1E["env"]))
+        GF, SCG = load_nosi(a.nosi_pkg)
+        ext3 = ext2 = None
+        try:
+            t0 = time.time()
+            gp3 = by_path(os.path.join(a.v3, "gilfree_pack.py"), "gilfree_pack_v3_gate")
+            ext3 = gp3.load(a.v3_build)
+            gp2 = by_path(os.path.join(a.v2, "gilfree_pack.py"), "gilfree_pack_v2_gate")
+            ext2 = gp2.load(a.v2_build)
+            ready = (int(getattr(ext3, "VERSION", 0)) == 3 and int(ext3.OPENMP) == 1 and int(ext2.OPENMP) == 1
+                     and callable(getattr(ext3.NativePipe, "submit", None)))
+            detail = "v3 VERSION %s OPENMP %s; v2 OPENMP %s; built in %.0f s" % (
+                getattr(ext3, "VERSION", None), ext3.OPENMP, ext2.OPENMP, time.time() - t0)
+        except Exception as e:
+            traceback.print_exc()
+            ready, detail = False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:400])
+        gates.append(gate("GFW_ready", ready, True, detail))
+        save()
+        if ready and a.cell == "gfw1e":                        # REPORT only: the lazy-module-loading hypothesis
+            res["R_GFW1e"] = {}
+            for arm in ARMS_1E:
+                log("R_GFW1e_%s (a fresh process)" % arm)
+                path = os.path.join(a.out, "arm_%s.json" % arm)
+                cmd = [sys.executable, os.path.abspath(__file__)] + list(argv) + ["--arm", arm, "--arm-out", path]
+                t0 = time.time()
+                try:
+                    p = subprocess.run(cmd, env=child_env_1e(os.environ, arm), timeout=600)
+                    r = json.load(open(path)) if os.path.exists(path) else dict(arm=arm, error="no result")
+                    r["child_exit"] = p.returncode
+                except Exception as e:
+                    traceback.print_exc()
+                    r = dict(arm=arm, error="%s: %s" % (type(e).__name__, str(e)[:300]))
+                r["child_wall_s"] = round(time.time() - t0, 1)
+                res["R_GFW1e"][arm] = r
+                gates.append(gate("R_GFW1e_" + arm, arm_ok_1e(r, a.launches_few), False, (
+                    "CUDA_MODULE_LOADING before torch %r, after its CUDA init %r; err %s, launches %s/%d, spin %s ms "
+                    "(bound %d), rows %s, T4 pending at issue %s, enqueue %s ms, warm-up %s; child exit %s, %s s%s" % (
+                        r.get("module_loading_before"), r.get("module_loading_after"), r.get("err"),
+                        r.get("launches_done"), a.launches_few, r.get("spin_ms"), 1 << 24, r.get("rows_ok"),
+                        r.get("t4_pending_at_issue"), r.get("enqueue_ms"), r.get("warmed"), r.get("child_exit"),
+                        r.get("child_wall_s"), ("; ERROR " + r["error"]) if "error" in r else ""))))
+                save()
+            v = verdict_1e(res["R_GFW1e"], a.launches_few)
+            gates.append(gate("R_GFW1e", v == "HELD", False, "%s: REGISTERED GFW1E (lazy module loading is the cause: "
+                                                           "both arms pass)" % v))
+            save()
+        if ready and a.cell == "gfw1f":                        # REPORT only: the production transport's warm-up
+            res["R_GFW1f"] = {}
+            for arm in ARMS_1F:
+                log("R_GFW1f_%s (a fresh process)" % arm)
+                path = os.path.join(a.out, "arm_%s.json" % arm)
+                cmd = [sys.executable, os.path.abspath(__file__)] + list(argv) + ["--arm", arm, "--arm-out", path]
+                t0 = time.time()
+                try:
+                    p = subprocess.run(cmd, env=child_env_1f(os.environ, arm), timeout=600)
+                    r = json.load(open(path)) if os.path.exists(path) else dict(arm=arm, error="no result")
+                    r["child_exit"] = p.returncode
+                except Exception as e:
+                    traceback.print_exc()
+                    r = dict(arm=arm, error="%s: %s" % (type(e).__name__, str(e)[:300]))
+                r["child_wall_s"] = round(time.time() - t0, 1)
+                res["R_GFW1f"][arm] = r
+                gates.append(gate("R_GFW1f_" + arm, arm_ok_1f(r, arm, a.launches_few), False, (
+                    "expected %s; CUDA_MODULE_LOADING before torch %r, after its CUDA init %r; transport warm-up calls "
+                    "%s (%s); err %s, launches %s/%d, spin %s ms (bound %d), rows %s, T4 pending at issue %s, enqueue "
+                    "%s ms; child exit %s, %s s%s" % (
+                        "PASS (err 0, spin < 1000 ms)" if arm == "builtin" else "STALL (err 1, the control)",
+                        r.get("module_loading_before"), r.get("module_loading_after"), r.get("tp_warm_calls"),
+                        r.get("tp_warmed"), r.get("err"), r.get("launches_done"), a.launches_few, r.get("spin_ms"),
+                        1 << 24, r.get("rows_ok"), r.get("t4_pending_at_issue"), r.get("enqueue_ms"),
+                        r.get("child_exit"), r.get("child_wall_s"), ("; ERROR " + r["error"]) if "error" in r else ""))))
+                save()
+            v = verdict_1f(res["R_GFW1f"], a.launches_few)
+            gates.append(gate("R_GFW1f", v == "HELD", False, "%s: REGISTERED GFW1F (the production transport's built-in "
+                                                           "warm-up passes; without it the control stalls)" % v))
+            save()
+        if ready and a.cell == "gfw1d":                        # REPORT only: the shared-hardware-queue hypothesis
+            log("R_GFW1d")
+            env = os.environ.get(REGISTERED1D["env"])
+            try:
+                r = gfw1(GF, SCG, ext3, False, 1 << 24, a.spin_cycles, a.launches_few, a.threads, wait_submission=False)
+                r["env"] = env
+                res["R_GFW1d"] = r
+                ok = (env == REGISTERED1D["value"] and r["err"] == 0 and r["launches_done"] == float(a.launches_few)
+                      and r["spin_ms"] > 10.0 and r["rows_ok"] and r["t4_pending_at_issue"])
+                verdict_1d = ("HELD (the shared hardware queue was the cause)" if ok else
+                              "FALSIFIED (err 1 at the bound with %s=%s)" % (REGISTERED1D["env"], env)
+                              if env == REGISTERED1D["value"] and r["err"] == 1 else "INVALID (env %r)" % (env,))
+                detail = ("%s: %s=%s; err %d, launches %d/%d, spin %.1f ms (bound %d), rows %s, T4 pending at issue %s, "
+                          "enqueue %.1f ms, board %s want %s" % (
+                              verdict_1d, REGISTERED1D["env"], env, r["err"], int(r["launches_done"]), a.launches_few,
+                              r["spin_ms"], 1 << 24, r["rows_ok"], r["t4_pending_at_issue"], r["enqueue_ms"],
+                              r["board"], r["want"]))
+            except Exception as e:
+                traceback.print_exc()
+                res["R_GFW1d"] = dict(error="%s: %s" % (type(e).__name__, str(e)[:400]), env=env)
+                ok, detail = False, "EXCEPTION " + res["R_GFW1d"]["error"]
+            gates.append(gate("R_GFW1d", ok, False, detail))
+            save()
+        if ready and a.cell == "gfw2":
+            log("GFW2")
+            try:
+                r = gfw2(GF, SCG, ext3, a)
+                res["GFW2"] = r
+                sa, sb, n = r["a_stats"], r["b_stats"], r["n"]
+                ok2 = (r["stores_equal"] and r["boards_equal"] and r["board_entries"] == n and r["truth_ok"]
+                       and sa["groups"] == sb["groups"] == n + 1 and sa["published"] == sb["published"] == n + 1
+                       and r["landed_upto"] == r["desc_seq"] == 2 and r["a_threads_ok"] and r["b_threads_ok"]
+                       and not r["a_error"] and not r["b_error"])
+                gates.append(gate("GFW2", ok2, True, (
+                    "%d takes over %d layers: stores equal %s, boards equal %s, board entries %d, truth %s (%d "
+                    "sampled), groups %s / %s, published %s / %s, releases %s / %s, landed_upto %d of job %d, teams "
+                    "%s / %s, T3/T4 pending at issue %s / %s, errors %r / %r" % (
+                        n, r["layers"], r["stores_equal"], r["boards_equal"], r["board_entries"], r["truth_ok"],
+                        r["truth_sampled"], sa["groups"], sb["groups"], sa["published"], sb["published"],
+                        sa["releases"], sb["releases"], r["landed_upto"], r["desc_seq"], r["a_threads_ok"],
+                        r["b_threads_ok"], r["a_pending_at_issue"], r["b_pending_at_issue"], r["a_error"],
+                        r["b_error"]))))
+                gates.append(gate("GFW2n", not r["planted_equal"], True,
+                                  "the planted slot shift lands %s store (error %r)" % (
+                                      "the SAME" if r["planted_equal"] else "another", r["c_error"])))
+                v = verdict2(r["desc_issue_ms"])
+                gates.append(gate("R_GFW2_host", v == "HELD", False,
+                                  "%s: issue_desc %.3f ms (prediction <= %.1f, falsifier >= %.1f) vs the object path's "
+                                  "%d issue() calls %.2f ms, for %d takes" % (
+                                      v, r["desc_issue_ms"], REGISTERED2["desc_issue_pred_ms"],
+                                      REGISTERED2["desc_issue_fals_ms"], r["layers"], r["object_issue_ms"], n)))
+            except Exception as e:
+                traceback.print_exc()
+                res["GFW2"] = dict(error="%s: %s" % (type(e).__name__, str(e)[:400]))
+                for name in ("GFW2", "GFW2n"):
+                    gates.append(gate(name, False, True, "EXCEPTION " + res["GFW2"]["error"]))
+            save()
+        if ready and a.cell == "gfw1":
+            # (name, MUST, planted, max_spin, launches behind the spin, the host's submission wait first)
+            arms1 = (("GFW1", True, False, 1 << 24, a.launches_few, False),
+                     ("GFW1e", True, False, 1 << 24, a.launches, True),
+                     ("GFW1n", True, True, 1 << 16, a.launches_few, False),
+                     ("R_GFW1x", False, False, a.hazard_spin, a.launches, False))
+            for name, must, planted, max_spin, launches, waits in arms1:
+                log(name)
+                try:
+                    r = gfw1(GF, SCG, ext3, planted, max_spin, a.spin_cycles, launches, a.threads,
+                             wait_submission=waits)
+                    res[name] = r
+                    done = r["launches_done"] == float(launches)
+                    if name == "GFW1n":
+                        ok = r["err"] == 1 and done and r["rows_ok"]
+                    elif name == "R_GFW1x":
+                        ok = r["err"] == 1 and done and r["rows_ok"]      # the hazard reproduced, as expected
+                    elif name == "GFW1e":
+                        ok = (r["err"] == 0 and done and r["rows_ok"] and r["superset_wait"] == "ok"
+                              and r["threads_ok"] and r["t4_pending_at_issue"]
+                              and (r["submission_wait_ms"] or 0.0) >= 50.0)
+                    else:
+                        ok = (r["err"] == 0 and done and r["spin_ms"] > 10.0 and r["rows_ok"]
+                              and r["superset_wait"] == "ok" and r["threads_ok"] and r["t4_pending_at_issue"])
+                    detail = ("err %d, launches %d/%d, spin %.1f ms (bound %d), rows %s, superset wait %s, team ok %s, "
+                              "T4 pending at issue %s, submission wait %s ms, issue %.2f ms, enqueue %.1f ms, board %s "
+                              "want %s" % (
+                                  r["err"], int(r["launches_done"]), launches, r["spin_ms"], max_spin, r["rows_ok"],
+                                  r["superset_wait"], r["threads_ok"], r["t4_pending_at_issue"],
+                                  r["submission_wait_ms"], r["issue_ms"], r["enqueue_ms"], r["board"], r["want"]))
+                    if name == "R_GFW1x":
+                        detail = ("the eager hazard (no submission wait, %d launches behind the spin): %s; %s" % (
+                            launches, "reproduced as expected" if ok else "NOT reproduced", detail))
+                except Exception as e:
+                    traceback.print_exc()
+                    res[name] = dict(error="%s: %s" % (type(e).__name__, str(e)[:400]))
+                    ok, detail = False, "EXCEPTION " + res[name]["error"]
+                gates.append(gate(name, ok, must, detail))
+                save()
+            log("GFW_T")
+            try:
+                t = timing(ext2, ext3, a.sizes, a.threads, a.releases, a.warmup)
+                res["GFW_T"] = t
+                for mib, r in t.items():
+                    rec = r["record_v2"] or {}
+                    hs = r["arms"]["v3_worker"]["handoff_ms"]
+                    gates.append(gate("R_GFW_T%d" % mib, r["verdict"] == "HELD" and r["teams_ok"], False,
+                                      "%s: worker %.2f ms vs v2 %.2f ms (ratio %.3f; band +-%.0f %%, falsifier >= %.2f);"
+                                      " v3 release() %.2f ms; worker handoff median %.3f ms; teams ok %s; v2 record "
+                                      "(beside a decode) svc p50 %s ms, native %s ms" % (
+                                          r["verdict"], r["worker_total_median_ms"], r["v2_total_median_ms"],
+                                          r["ratio"], 100 * REGISTERED["pred_band"], REGISTERED["falsifier_ratio"],
+                                          r["arms"]["v3_release"]["total_ms"]["median"],
+                                          hs["median"] if hs else float("nan"), r["teams_ok"],
+                                          rec.get("svc_p50_ms"), rec.get("native_total_ms"))))
+            except Exception as e:
+                traceback.print_exc()
+                res["GFW_T"] = dict(error="%s: %s" % (type(e).__name__, str(e)[:400]))
+                gates.append(gate("R_GFW_T", False, False, "EXCEPTION " + res["GFW_T"]["error"]))
+            save()
+        meta["peak_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 2)
+        save()
+        for g in gates:
+            print("%s %s %s: %s" % ("GATE" if g["must"] else "REPORT", g["name"], "PASS" if g["passed"] else "FAIL",
+                                    g["detail"][:600]), flush=True)
+        nfail = sum(1 for g in gates if g["must"] and not g["passed"])
+        print("R2_GFW_DONE failed=%d" % nfail, flush=True)
+        return min(nfail, 125)
+    except SystemExit as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
