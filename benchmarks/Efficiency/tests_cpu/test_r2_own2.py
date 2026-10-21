@@ -289,7 +289,10 @@ REC_PLANTS = dict(                                # (schedule, how it is caught:
     take_nonfree=("f6", "raise"), take_swap=("f6", "raise"), k5_over=("f12b", "raise"),
     pe_not_first=("f20b", "raise"), drop_refusal=("f12b", "raise"), drop_v_merge=("f6", "state"),
     drop_d_merge=("f6", "state"), drop_ready=("f6", "readers"), drop_rowsel=("f6", "state"),
-    drop_vread=("f6", "readers"), reverse_stamps=("f6", "state"), evict_po_unpinned=("f20b", "raise"),
+    drop_vread=("f6", "readers"), reverse_stamps=("f6", "state"),
+    # the K1 eviction at admission (poll) and at evict_to_c; F6 admits over C with unpinned victims; the checked poll's
+    # I3 (or the apply's post-write I3) refuses the unpinned PO entry
+    evict_po_unpinned=("f6", "raise"),
     gen_plus_two=("f6", "raise"),
 )
 

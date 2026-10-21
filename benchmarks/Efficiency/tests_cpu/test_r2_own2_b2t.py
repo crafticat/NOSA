@@ -694,6 +694,11 @@ def test_B2T_G3_step_script_uuid_file_pins_dryrun_and_registration(tmp_path):
     assert r.returncode == 1 and "for DRYRUN" in r.stderr
     r = run(615, uid + "\n")
     assert r.returncode == 1 and "HEAD is not" in r.stderr
+    pinned = next(ln.split("=", 1)[1].split()[0] for ln in lines if ln.startswith("NOSI="))
+    if Path(pinned).resolve() != ROOT.resolve():
+        pytest.skip("the step script pins its root NOSI=%s (the GPU step runs from that worktree); this checkout is %s: "
+                    "the full DRYRUN at HEAD runs only there (the uuid, pin and static checks above ran here)"
+                    % (pinned, ROOT))
     head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
     dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"],
                            capture_output=True, text=True)
@@ -711,8 +716,8 @@ ALLOWED_LOOPS = {
     "SLOT_COLS", "ARRAYS", "mine.items()", "mine", "reversed(self.log)", "range(self.lo, self.next)",
     "range(1, pw.shape[0])", "(k_i, k_i + g.KEYS)",
     '(("V", "vrec", 9, rows.vb, rows.vk), ("D", "drec", 5, rows.db, rows.dk))', "layers", "recs", "parts",
-    '("l", "s", "b", "h", "blk", "take_slot", "key", "kind", "part", "o", "src")',
-    '("l", "s", "b", "h", "blk", "take_slot", "key", "o")', "cols.items()", "ev.items()",
+    '("l", "s", "b", "h", "j", "blk", "take_slot", "key", "kind", "part", "o", "src")',
+    '("l", "s", "b", "h", "j", "blk", "take_slot", "key", "o")', "cols.items()", "ev.items()",
     '(("v", rows.vb, rows.vk), ("d", rows.db, rows.dk))', '("take_slot", "blk")', "range(n)",
     "((fv, DEM_V), (fd, DEM_D))", "plan", "((rows.vb, rows.vk), (rows.db, rows.dk))",
 }

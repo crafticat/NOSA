@@ -353,7 +353,8 @@ def poll_arrivals(T: Table, tick: int, landed_upto: int, lag: Optional[int], und
       else rd_first := -1, and: draft in the demand -> LRU at MRU (stamps in issue order), then one K1 eviction per
       admission (bulk: the least recent leave, evict_over_c); else pinned -> VRES; else RELEASING, rd_last := -1
       (drop_vres_unprotected). seq := -1.
-    mut: "keep_rd_last_on_drop" (NEGATIVE CONTROL: the two resets are skipped)."""
+    mut: "keep_rd_last_on_drop" (NEGATIVE CONTROL: the two resets are skipped); "evict_po_unpinned" (NEGATIVE CONTROL:
+    the admissions' K1 victims all become PO)."""
     g = T.geo
     d = T.dev
     code = T.flat("code")
@@ -396,7 +397,8 @@ def poll_arrivals(T: Table, tick: int, landed_upto: int, lag: Optional[int], und
         order = torch.argsort(old_stamp[to_lru], stable=True)          # per stream the issue order (take stamps)
         _put(undo, T.flat("stamp"), fl[order], torch.arange(fl.numel(), dtype=torch.int64, device=d) + T.clock)
         T.clock += int(fl.numel())
-        out.update(evict_over_c(T, torch.unique(s[to_lru]), any_pin_words(T), undo))
+        out.update(evict_over_c(T, torch.unique(s[to_lru]), any_pin_words(T), undo,
+                                {"evict_po_unpinned": True} if mut and mut.get("evict_po_unpinned") else None))
     out["admitted"] = int(f.numel())
     out["admit_lru"] = to_lru.sum()
     out["admit_vres"] = to_vres.sum()
@@ -505,9 +507,12 @@ def parse(T: Table, layers: List[Dict], rows: Rows) -> Dict[str, Dict[str, torch
         R = torch.cat(recs, 1)
         n = torch.tensor([r.shape[1] for r in recs], dtype=torch.int64, device=d)
         l = torch.repeat_interleave(torch.tensor(ls, dtype=torch.int64, device=d), n, output_size=int(R.shape[1]))
+        # k is PER LAYER (each layer resolves its own selection; k = its widest row): the layer's own k decodes o
+        ks = [x.get("k", rows.k) for x in layers if x.get(name) is not None]
+        kr = torch.repeat_interleave(torch.tensor(ks, dtype=torch.int64, device=d), n, output_size=int(R.shape[1]))
         o = R[0]
-        j = torch.div(o, g.H * rows.k, rounding_mode="floor")
-        h = torch.div(o, rows.k, rounding_mode="floor").remainder(g.H)
+        j = torch.div(o, g.H * kr, rounding_mode="floor")
+        h = torch.div(o, kr, rounding_mode="floor").remainder(g.H)
         b = rb[j]
         dd = dict(l=l, j=j, h=h, b=b, key=rk[j], s=(l * g.B + b) * g.H + h, o=o, blk=R[1], flags=R[2], slot=R[3])
         if part == "V":
@@ -546,10 +551,10 @@ def k5_events(P: Dict, T: Table) -> Dict[str, torch.Tensor]:
         m = has(D["flags"], GRANT) | has(D["flags"], REFUSED)
         kind = torch.where(has(D["flags"], REFUSED), torch.full_like(D["o"], 2), torch.zeros_like(D["o"]))
         parts.append((D, m, kind, 1))
-    cols = {n: [] for n in ("l", "s", "b", "h", "blk", "take_slot", "key", "kind", "part", "o", "src")}
+    cols = {n: [] for n in ("l", "s", "b", "h", "j", "blk", "take_slot", "key", "kind", "part", "o", "src")}
     for (R, m, kind, part) in parts:
         idx = m.nonzero().squeeze(1)
-        for n in ("l", "s", "b", "h", "blk", "take_slot", "key", "o"):
+        for n in ("l", "s", "b", "h", "j", "blk", "take_slot", "key", "o"):
             cols[n].append(R[n][idx])
         cols["kind"].append(kind[idx])
         cols["part"].append(torch.full_like(idx, part))

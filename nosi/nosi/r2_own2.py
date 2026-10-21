@@ -381,11 +381,17 @@ class OwnResidency(ResidencySparse):
                 raise OwnershipViolation("arrival (uid %s, block %d, slot %d gen %d): slot is %s/%d"
                                          % (tr.uid, tr.block, tr.slot, tr.gen, STATE_OF[code[i]], blk[i]))
         T.flat("landed")[f] = True                                    # the transport's arrivals (urgent: landed)
-        mut = {"keep_rd_last_on_drop": True} if self.b2_mut.get("keep_rd_last_on_drop") else None
+        mut = {}
+        if self.b2_mut.get("keep_rd_last_on_drop"):
+            mut["keep_rd_last_on_drop"] = True
+        if self.b2_mut.get("rec_mut") == "evict_po_unpinned":         # the admissions' K1 eviction (own.py:347-351)
+            mut["evict_po_unpinned"] = True
         if self.b2_mut.get("no_uid_check"):                           # NEGATIVE CONTROL (T3): every arrival owned
             T.flat("uid")[f] = T.owner[torch.div(torch.div(f, G.NPOS, rounding_mode="floor"), G.H,
                                                  rounding_mode="floor").remainder(G.B)]
-        res = O.poll_arrivals(T, self.tick_no, -1, None, None, mut)
+        res = O.poll_arrivals(T, self.tick_no, -1, None, None, mut or None)
+        if int(res.get("forced_po", 0)) > 0 and self.rec_mut_done is None:
+            self.rec_mut_done = (self.tick_no, "evict_po_unpinned")   # the control had an effect at this poll
         self._count("admit", int(res["admit_lru"]))
         self._count("admit_vres", int(res["admit_vres"]))
         self._count("drop_unowned", int(res["drop_unowned"]))
@@ -403,11 +409,11 @@ class OwnResidency(ResidencySparse):
             self.metrics.arrived(tr, None, tr.requester in self.cancelled)
         self._changed()
         if self.checked:
-            pc = O.post_checks(T, None, 0, which=("I1", "I2"))
-            i1, i2 = torch.stack([pc["I1"], pc["I2"]]).tolist()
-            if i1 or i2:
+            pc = O.post_checks(T, None, 0, which=("I1", "I2", "I3"))
+            fails = [n for n, v in zip(("I1", "I2", "I3"), torch.stack([pc["I1"], pc["I2"], pc["I3"]]).tolist()) if v]
+            if fails:
                 raise OwnershipViolation("B2 poll: after the arrivals %s fails (I1: one slot per resident or in-flight "
-                                         "block; I2: the LRU holds at most C)" % ("I1" if i1 else "I2"))
+                                         "block; I2: the LRU holds at most C; I3: a PO / VRES slot is pinned)" % fails)
         return len(arrived)
 
     def _poll_drops(self) -> None:
@@ -541,7 +547,8 @@ class OwnResidency(ResidencySparse):
         for p in info:
             st = p["st"]
             rec = st["rec"]
-            layers.append(dict(l=st["l"], vrec=rec["vrec"][:, :p["nv"]].clone() if st["vdec"] is not None else None,
+            layers.append(dict(l=st["l"], k=int((st["vdec"] if st["vdec"] is not None else st["ddec"]).k),
+                               vrec=rec["vrec"][:, :p["nv"]].clone() if st["vdec"] is not None else None,
                                drec=rec["drec"][:, :p["nd"]].clone() if st["ddec"] is not None else None))
         Wb, Wp = G.WB, G.WP
         R = len(trows)
@@ -704,15 +711,14 @@ class OwnResidency(ResidencySparse):
         # the takes, in K3X order (the vendored _take's Transfer, res.py:476-489)
         tk = (ev["kind"] != 2).nonzero().squeeze(1).tolist()
         part = ev["part"].tolist()
-        o = ev["o"].tolist()
-        H, kk = self.H, rows.k
+        jrow = ev["j"].tolist()                                       # the record's row (decoded with its layer's k)
         lt, bt, ht = takes["l"].tolist(), takes["b"].tolist(), takes["h"].tolist()
         blk, slot, gen = takes["blk"].tolist(), takes["slot"].tolist(), takes["gen"].tolist()
         rdo = takes["rd_old"].tolist()
         by_layer: Dict[int, List[Transfer]] = {}
         new_trs = []
         for i, q in enumerate(tk):
-            j = o[q] // (H * kk)
+            j = jrow[q]
             isv = part[q] == 0
             r = vrows[j] if isv else drows[j]
             self.seq += 1
@@ -837,12 +843,13 @@ class OwnResidency(ResidencySparse):
         code = self.own.c["code"].view(G.S, G.NPOS)
         for x in layers:
             l = x["l"]
+            kx = x.get("k", rows.k)                                   # the layer's own k (its selection width)
             D, V = x.get("drec"), x.get("vrec")
             if kind == "take_nonfree" and D is not None:
                 g = (torch.bitwise_and(D[2], O.GRANT) != 0).nonzero().view(-1)
                 if g.numel():
                     i = int(g[0])
-                    j, h = int(D[0, i]) // (G.H * rows.k), (int(D[0, i]) // rows.k) % G.H
+                    j, h = int(D[0, i]) // (G.H * kx), (int(D[0, i]) // kx) % G.H
                     s = (l * G.B + int(rows.db[j])) * G.H + h
                     busy = (code[s] != C_FREE).nonzero().view(-1)
                     if busy.numel():
@@ -854,7 +861,7 @@ class OwnResidency(ResidencySparse):
                 for a in range(len(g)):
                     for c in range(a + 1, len(g)):
                         ia, ic = g[a], g[c]
-                        if int(D[0, ia]) // rows.k == int(D[0, ic]) // rows.k and int(D[4, ia]) != int(D[4, ic]):
+                        if int(D[0, ia]) // kx == int(D[0, ic]) // kx and int(D[4, ia]) != int(D[4, ic]):
                             D[4, ia], D[4, ic] = D[4, ic].clone(), D[4, ia].clone()
                             self.rec_mut_done = (self.tick_no, kind)
                             return
@@ -862,7 +869,7 @@ class OwnResidency(ResidencySparse):
                 g = (torch.bitwise_and(D[2], O.REFUSED) != 0).nonzero().view(-1)
                 if g.numel():
                     i = int(g[0])
-                    j, h = int(D[0, i]) // (G.H * rows.k), (int(D[0, i]) // rows.k) % G.H
+                    j, h = int(D[0, i]) // (G.H * kx), (int(D[0, i]) // kx) % G.H
                     s = (l * G.B + int(rows.db[j])) * G.H + h
                     fr = (code[s] == C_FREE).nonzero().view(-1)
                     if fr.numel():
@@ -874,7 +881,7 @@ class OwnResidency(ResidencySparse):
                 g = (torch.bitwise_and(V[2], O.EVICT) != 0).nonzero().view(-1)
                 if g.numel():
                     i = int(g[0])
-                    j, h = int(V[0, i]) // (G.H * rows.k), (int(V[0, i]) // rows.k) % G.H
+                    j, h = int(V[0, i]) // (G.H * kx), (int(V[0, i]) // kx) % G.H
                     s = (l * G.B + int(rows.vb[j])) * G.H + h
                     lru = (code[s] == C_LRU).nonzero().view(-1).tolist()
                     other = [x2 for x2 in lru if x2 != int(V[7, i])]
@@ -893,7 +900,7 @@ class OwnResidency(ResidencySparse):
                     return
             if kind == "drop_v_merge" and V is not None:              # a merge whose transfer lacks the verify bit
                 for i in (torch.bitwise_and(V[2], O.INFL) != 0).nonzero().view(-1).tolist():
-                    j, h = int(V[0, i]) // (G.H * rows.k), (int(V[0, i]) // rows.k) % G.H
+                    j, h = int(V[0, i]) // (G.H * kx), (int(V[0, i]) // kx) % G.H
                     s = (l * G.B + int(rows.vb[j])) * G.H + h
                     if int(dem[s * G.NPOS + int(V[4, i])]) & O.DEM_V == 0:
                         x["vrec"] = _without(V, i)
@@ -902,7 +909,7 @@ class OwnResidency(ResidencySparse):
             if kind == "drop_d_merge" and D is not None:              # a merge whose transfer lacks the draft bit
                 so = O.slot_of(self.own)
                 for i in (torch.bitwise_and(D[2], O.INFL) != 0).nonzero().view(-1).tolist():
-                    j, h = int(D[0, i]) // (G.H * rows.k), (int(D[0, i]) // rows.k) % G.H
+                    j, h = int(D[0, i]) // (G.H * kx), (int(D[0, i]) // kx) % G.H
                     s = (l * G.B + int(rows.db[j])) * G.H + h
                     sl = int(so[s, int(D[1, i])])
                     if sl >= 0 and int(dem[s * G.NPOS + sl]) & O.DEM_D == 0:
@@ -912,7 +919,7 @@ class OwnResidency(ResidencySparse):
             if kind == "drop_ready" and D is not None:                # a draft read that no verify row repeats
                 vbits = O.unpack_words(vread[l], G.NPOS)
                 for i in (torch.bitwise_and(D[2], O.READY) != 0).nonzero().view(-1).tolist():
-                    j, h = int(D[0, i]) // (G.H * rows.k), (int(D[0, i]) // rows.k) % G.H
+                    j, h = int(D[0, i]) // (G.H * kx), (int(D[0, i]) // kx) % G.H
                     if not bool(vbits[int(rows.db[j]), h, int(D[3, i])]):
                         x["drec"] = _without(D, i)
                         self.rec_mut_done = (self.tick_no, kind)
@@ -938,7 +945,7 @@ class OwnResidency(ResidencySparse):
                 dset = set()
                 if D is not None:
                     for i in (torch.bitwise_and(D[2], O.READY) != 0).nonzero().view(-1).tolist():
-                        j, h = int(D[0, i]) // (G.H * rows.k), (int(D[0, i]) // rows.k) % G.H
+                        j, h = int(D[0, i]) // (G.H * kx), (int(D[0, i]) // kx) % G.H
                         dset.add((int(rows.db[j]), h, int(D[3, i])))
                 for (b, h, sl) in O.unpack_words(vread[l], G.NPOS).nonzero().tolist():
                     if (b, h, sl) not in dset:
