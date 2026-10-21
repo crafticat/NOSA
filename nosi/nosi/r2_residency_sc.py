@@ -81,6 +81,12 @@ from typing import Dict, List, Sequence, Set, Tuple
 
 import torch
 
+try:                                                      # triton is needed only to launch the exact wait's kernel on
+    import triton                                         # the GPU: a CPU test without triton imports this module
+    import triton.language as tl
+except ImportError:                                       # pragma: no cover - environment dependent
+    triton = tl = None
+
 from .kstep.backend import ev_done
 from .kstep.errors import CapacityRefusal, OwnershipViolation
 from .kstep.ownership import FREE, INFLIGHT, LRU, PO, RELEASING, VRES
@@ -699,37 +705,38 @@ class ExactWaitSim(CpuDeviceSim):
             self.waited += 1
 
 
-_WAIT_KERNEL = None
+# The exact wait's Triton kernel (note 12f). ONE program (one SM: the scatter stream's kernels keep the others) walks
+# the wait list in blocks; per block it spins with VOLATILE loads of the board until every listed entry reached its
+# generation, at most max_spin rounds; then any entry short or past raises err (int32, atomic max). The board write
+# that ends a spin is enqueued after the scatter on the scatter stream, so the slot's rows are complete when the main
+# stream's next kernel reads them. It is defined at MODULE level: Triton's GPU compiler resolves a kernel's names in
+# its module globals (fn.__globals__), never in an enclosing function (fg5 on holder 2190876: "NameError: tl is not
+# defined" from a factory's local import; test F23 guards every kernel we own).
+if triton is not None:
+    @triton.jit
+    def board_wait_kernel(board_ptr, idx_ptr, gen_ptr, n, err_ptr, max_spin, BLOCK: tl.constexpr):
+        for start in range(0, n, BLOCK):
+            offs = start + tl.arange(0, BLOCK)
+            inb = offs < n
+            idx = tl.load(idx_ptr + offs, mask=inb, other=-1)
+            want = tl.load(gen_ptr + offs, mask=inb, other=0)
+            live = idx >= 0
+            safe = tl.where(live, idx, 0)
+            got = tl.load(board_ptr + safe, mask=live, other=0, volatile=True)
+            k = 0
+            while (tl.max((live & (got < want)).to(tl.int32), axis=0) > 0) & (k < max_spin):
+                got = tl.load(board_ptr + safe, mask=live, other=0, volatile=True)
+                k += 1
+            tl.atomic_max(err_ptr, tl.max((live & (got != want)).to(tl.int32), axis=0))
+else:                                                     # pragma: no cover - environment dependent
+    board_wait_kernel = None
 
 
 def _wait_kernel():
-    """The exact wait's Triton kernel, built on first use. SOURCE ONLY, NOT RUN YET (GPU gate FG1). ONE program (one
-    SM: the scatter stream's kernels keep the others) walks the wait list in blocks; per block it spins with VOLATILE
-    loads of the board until every listed entry reached its generation, at most max_spin rounds; then any entry short
-    or past raises err (int32, atomic max). The board write that ends a spin is enqueued after the scatter on the
-    scatter stream, so the slot's rows are complete when the main stream's next kernel reads them."""
-    global _WAIT_KERNEL
-    if _WAIT_KERNEL is None:
-        import triton
-        import triton.language as tl
-
-        @triton.jit
-        def kernel(board_ptr, idx_ptr, gen_ptr, n, err_ptr, max_spin, BLOCK: tl.constexpr):
-            for start in range(0, n, BLOCK):
-                offs = start + tl.arange(0, BLOCK)
-                inb = offs < n
-                idx = tl.load(idx_ptr + offs, mask=inb, other=-1)
-                want = tl.load(gen_ptr + offs, mask=inb, other=0)
-                live = idx >= 0
-                safe = tl.where(live, idx, 0)
-                got = tl.load(board_ptr + safe, mask=live, other=0, volatile=True)
-                k = 0
-                while (tl.max((live & (got < want)).to(tl.int32), axis=0) > 0) & (k < max_spin):
-                    got = tl.load(board_ptr + safe, mask=live, other=0, volatile=True)
-                    k += 1
-                tl.atomic_max(err_ptr, tl.max((live & (got != want)).to(tl.int32), axis=0))
-        _WAIT_KERNEL = kernel
-    return _WAIT_KERNEL
+    """The exact wait's Triton kernel (board_wait_kernel); triton is needed only here, on the GPU."""
+    if board_wait_kernel is None:
+        raise RuntimeError("the exact device wait needs triton (the CPU stand-in is ExactWaitSim)")
+    return board_wait_kernel
 
 
 class CudaDeviceOps:
@@ -760,7 +767,12 @@ class CudaDeviceOps:
         """LIVENESS (the eager tick): every transfer in flight at layer l is SUBMITTED before the main stream may wait
         for it. A gilfree pack still queued in the feeder is host-waited for its submission (a threading.Event: the GIL
         is released). Otherwise the main stream could spin on a pack whose feeder needs the GIL while the host thread
-        holds it, blocked in a kernel launch behind the spinning stream. The completion is waited on the device."""
+        holds it, blocked in a kernel launch behind the spinning stream. The completion is waited on the device.
+        A transport that submits without the GIL (submits_without_gil: E's C++ feeder worker, GilfreeTransport(...,
+        worker="cpp"), Q-C2) cannot be blocked by this thread: no host wait at all (the board's bounded spin with err
+        stays the guard)."""
+        if getattr(getattr(self.svc, "tp", None), "submits_without_gil", False):
+            return                  # Q-C2: the C++ worker submits with no GIL; the exact spin cannot block it
         for tr in list(self.svc.inflight.values()):
             if tr.layer == l and tr.ev is None and isinstance(tr.payload, threading.Event):
                 tr.payload.wait()
@@ -957,8 +969,9 @@ class ResidencySC(ResidencySB):
         tails_flat: List[int] = []
         for r in rows:
             tails_flat += [s for (_, s) in r.tail] + [-1] * (N_TAIL - len(r.tail))
+        extra = self._tick_extra(rows)                                # the sparse record's per-tick inputs (or [])
         flat = ([r.b for r in rows] + [r.hist_bound for r in rows] + [len(r.tail) for r in rows] + tails_flat
-                + [r.pos % self.bs + 1 for r in rows] + vrows + drows)
+                + [r.pos % self.bs + 1 for r in rows] + vrows + drows + extra)
         d = self._h2d(torch.tensor(flat, dtype=torch.int64))
         self.row_uploads += 1
         rb, hb, nt = d[:R], d[R:2 * R], d[2 * R:3 * R]
@@ -971,7 +984,17 @@ class ResidencySC(ResidencySB):
         def part(ix):
             return rb[ix], hb[ix], tails[ix], nt[ix], ix
         return dict(sig=self._row_sig(rows), vrows=vrows, drows=drows, v=part(vix) if vrows else None,
-                    d=part(dix) if drows else None, last_len=last_len.to(torch.int32), seq_idx=rb.to(torch.int32))
+                    d=part(dix) if drows else None, last_len=last_len.to(torch.int32), seq_idx=rb.to(torch.int32),
+                    extra=d[len(flat) - len(extra):])
+
+    def _tick_extra(self, rows: Sequence[Row]) -> List[int]:
+        """Hook (the sparse record, r2_residency_sparse.py): more per-tick integers for the ONE row copy."""
+        return []
+
+    def _layer_record(self, l: int, step: Dict, tk: Dict) -> None:
+        """Hook (the sparse record): the layer's device-side record, device ops only. S-C: none (the dense record is
+        the decision tensors themselves)."""
+        return None
 
     # ------------------------------------------------------------------------------------------------ one layer
     def resolve(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> Plan:
@@ -1017,6 +1040,7 @@ class ResidencySC(ResidencySB):
             page[ix] = ddec.page
             npg[ix] = ddec.num_pages
             step["ddec"] = ddec
+        self._layer_record(l, step, tk)                               # device ops only (the sparse record's hook)
         self._tick.append(step)
         plan.page_table = page.to(torch.int32)
         plan.num_pages = npg.to(torch.int32)
@@ -1027,6 +1051,20 @@ class ResidencySC(ResidencySB):
     def end_tick(self) -> None:
         steps, self._tick = self._tick, []
         self._rows = None
+        try:
+            self.apply_tick(steps)
+        finally:
+            self._layer_ev = {}
+        Residency.end_tick(self)                                      # the draft transfers, layer by layer
+        self.metrics.sample_memory()
+
+    def apply_tick(self, steps: List[Dict]) -> None:
+        """THE HOST CONSUMER of one tick's device decisions (note 12l; the capture seam calls exactly this after the
+        replay). steps: the tick's layers in resolve order, each dict(l, vrows, vidx, vdec, drows, ddec[, rec]) with
+        the decision tensors (fixed buffers in a captured tick). It makes the ONE device-to-host read of the tick
+        (the watched flags and the decisions), refuses a void tick (a set flag, an overflow) before any change of the
+        host state, and applies the decisions in v1's order. This class: the DENSE record (every entry of every
+        layer); ResidencySparse (r2_residency_sparse.py) replaces it with the sparse record, same signature."""
         names = list(self._flags)
         parts = [self._flags[n].to(torch.int64).reshape(1) for n in names]   # the watched flags first
         for st in steps:
@@ -1039,7 +1077,6 @@ class ResidencySC(ResidencySB):
             self.flag_values = dict(zip(names, flat[:len(names)]))
             raised = sorted(n for n, v in self.flag_values.items() if v)
             if raised:
-                self._layer_ev = {}
                 raise CapacityRefusal("S-C: the watched device flag(s) %s are set at this tick: the tick is void (none "
                                       "of its decisions is applied)" % raised)
             at = len(names)
@@ -1063,7 +1100,6 @@ class ResidencySC(ResidencySB):
                 parsed.append((st, v, d))
             over = [(st["l"], v[1]) for (st, v, _) in parsed if v is not None and v[1] > 0]
             if over:
-                self._layer_ev = {}
                 raise CapacityRefusal("S-C: the verifier's urgent misses found no slot: K5 grants none and Policy E has "
                                       "no candidate, every LRU entry and in-flight draft prefetch being protected or "
                                       "read by the layer (layer, blocks without a slot: %s; C %d, X %d, R_ver %d): the "
@@ -1076,9 +1112,6 @@ class ResidencySC(ResidencySB):
                                        st["ddec"] if d is not None else None)
                 if d is not None:
                     self._apply(st["l"], st["drows"], st["ddec"], d[0], d[1], d[2], d[3])
-        self._layer_ev = {}
-        Residency.end_tick(self)                                      # the draft transfers, layer by layer
-        self.metrics.sample_memory()
 
     def _overflow_report(self, parsed, per_layer: int = 3) -> str:
         """For a refused tick: the capacity report (v1's _capacity_report, host state = the tick's start: nothing is
