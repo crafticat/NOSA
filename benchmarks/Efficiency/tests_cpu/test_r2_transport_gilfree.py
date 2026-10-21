@@ -332,3 +332,46 @@ def test_GT6_the_feeder_thread_enters_the_inference_mode(pinned, where):
             gf2.force(trs2[0])
     gf2.close()
     assert gf2.feeder_seen == dict(inference=False, grad=True)
+
+
+def test_GT6b_the_feeder_publishes_into_an_inference_board(pinned):
+    """GT6b (FG1's exact arms: the PUBLICATION path, residency note 12f): the feeder's second in-place write is the
+    board publication (_publish: board.t index_put_). Here the host rows, the store and the adapter are NOT inference
+    tensors (built outside inference mode), only the generation board is (S-C builds it in the tick's inference mode).
+    attach_board turns the feeder's inference mode on; the background feeder lands the host truth and publishes every
+    transfer's (slot, generation). Negative control: the feeder without the board's mode (thread_inference forced off
+    after attach_board, as 7ab1ca2 had it) packs and lands the rows, then the publication raises the run's error,
+    re-raised at force(); its traceback names the frames _feeder, _release and _publish."""
+    import traceback
+    for neg in (False, True):
+        host_k, host_v, gk, gv, _, _ = _world()
+        gf = GF.GilfreeTransport(pinned.ext, host_k, host_v, gk, gv, BS, D, threads=2, host_wait=lambda ev: None,
+                                 cap_groups=4, background=True)
+        assert not gf.thread_inference and not gk[0].is_inference()
+        with torch.inference_mode():
+            board = SCG.GenBoard(L, B, H, NPOS, "cpu")
+        assert board.t.is_inference()
+        gf.attach_board(board)
+        assert gf.thread_inference and not gf.thread_grad
+        if neg:
+            gf.thread_inference, gf.thread_grad = False, True     # NEGATIVE CONTROL: the board's mode ignored
+        groups = [(0, 0, 3, 1), (1, 1, 4, 2), (1, 0, NB - 1, NPOS - 1)]
+        trs = _transfers(1, groups, 0)
+        want = torch.zeros_like(board.t)
+        for i, tr in enumerate(trs):
+            tr.gen = i + 2
+            want[1, tr.b, tr.h, tr.slot] = tr.gen
+        gf.issue(1, trs)
+        if neg:
+            with pytest.raises(RuntimeError, match="Inplace update to inference tensor outside InferenceMode") as ei:
+                gf.force(trs[0])
+            tb = "".join(traceback.format_exception(ei.type, ei.value, ei.value.__traceback__))
+            assert all(f in tb for f in ("_feeder", "_release", "_publish")), tb[-600:]
+            assert gf.feeder_seen == dict(inference=False, grad=True) and gf.stats["published"] == 0
+        else:
+            for tr in trs:
+                gf.force(tr)
+            assert gf.feeder_seen == dict(inference=True, grad=False)
+            assert torch.equal(board.t, want) and gf.stats["published"] == len(groups)
+        gf.close()
+        assert _truth_ok(gk, gv, host_k, host_v, [(1, groups)]), neg
