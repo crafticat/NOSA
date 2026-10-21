@@ -162,6 +162,9 @@ Per verify row (cohort key k, layer l, head h), the exact selection is classifie
 - If no slot can be taken even after evictions (all protected), the layer cannot run: the service host-waits the
   needed in-flight transfers and pending reader events and retries (K3X `_force_for_layer`, `dispatcher.py:2416-2443`);
   a second failure is a CapacityRefusal (a configuration error: C + X too small for the cohort's union).
+  SUPERSEDED for v1 and S-C by POLICY E (note 12h, 2026-10-21): the eviction candidate is the least recent LRU entry
+  that is unprotected and selected by no row of the layer; it is evicted and its slot reused at once; there is no
+  force-and-retry path; no candidate is a CapacityRefusal.
 
 v1 RESOLUTION IS HOST-SIDE PER LAYER (decision D2), for draft and verify rows alike: at every layer the tick copies
 the rows' selection to the host (one D2H, then one sync), the service classifies, protects, issues the background
@@ -184,6 +187,11 @@ The logical limit is K3X's: |LRU| <= C per stream, extras borrowed <= X per laye
 Retained bytes = (PO + VRES) x block bytes; peak_retained per K3X 4.6. Example at B 64, 32 layers, H 2:
 C + X + 4 = 100 slots per (request, head) = 32,896 B x 100 x 2 x 32 x 64 = 13.5 GB, against the shipped window's 64
 slots = 8.6 GB (and the 16.4 GB model). The sizes are run parameters; SG5 reports the peak.
+The captured tick (Q-T2) adds ONE TRASH SLOT per (request, head, layer) after the tail rings, at C + X + 4
+(`Residency(trash_slots=1)`; counted in `memory()["slots_physical"]`; CPU test F15): C + X + 5 = 101 slots, i.e.
+32,896 B x 101 x 2 x 32 x 64 = 13.61 GB (+0.13 GB), about +5.0 GB against the 64-slot window. Only the padded rows of
+the captured tick write and read it; it is outside every LayerPool (no take, no transfer, no gather) and outside the
+tail range (no Row can name it).
 
 ## 8. The interface piece 4 calls (one service per run)
 
@@ -405,6 +413,191 @@ with real selections; FG3 the packer's sustained rate (4.9) against the tick's d
   fell into one interval (not traced). The control (_scn_late_reader) releases a slot whose last reader (a
   verify read) is still pending, syncs while it is RELEASING, then completes the reader so that the next poll frees it.
 
+## 12e. Watched device flags in S-C's one read per tick (Q-T5, 2026-10-21)
+
+- `ResidencySC.watch_flag(name, flag)`: a 0-dim device tensor (the twin's sticky `overflow`,
+  `r2_positional_twin.py:152`) is read with S-C's ONE device read at every end_tick (also on a tick without rows). A
+  nonzero value refuses THAT tick (CapacityRefusal) before any of its decisions is applied; `svc.flag_values` holds
+  the values of the last read. A twin overflow so voids one tick, not every tick since the last decision read, at no
+  extra sync.
+- Test F16: a real twin (prompts of 38 tokens, N_max 41) overflows in its step of tick 3, a draft-only tick; S-C
+  watching it refuses tick 3 at its own end_tick (one device read, the ownership state and the applied counters
+  unchanged), ticks 0-2 ran normally. Negative control (no watch): no end_tick refuses, tick 3 and later apply their
+  decisions, and the flag is seen only after them.
+
+## 12f. The EXACT device wait (Q-T3 (b), Q6; design and CPU stand-in, 2026-10-21)
+
+The superset wait (`CudaDeviceOps(wait_mode="superset")`) makes the main stream wait on the completion event of EVERY
+transfer in flight at the layer, and host-waits a gilfree pack that is not submitted yet. Before a captured replay it
+would wait for every in-flight transfer of every layer: no overlap. The exact wait waits for exactly the slots that the
+layer's verify rows read in flight, on the device, with no host step:
+
+- THE BOARD (`GenBoard`, owned by S-C, attached to the transport): (L, B, H, C + X) int64 on the device; per slot, the
+  generation of the last transfer whose rows LANDED there (0: none). A take makes gen >= 1; a slot's generations only
+  grow; a slot in flight is never taken again (T3). So "board >= gen" means "the awaited transfer landed".
+- PUBLICATION: the transport writes (slot, gen) into the board on the stream that landed the rows, AFTER them.
+  gilfree (`GilfreeTransport.attach_board` / `_publish`): after each `NativePipe.release`, a pinned copy and an
+  `index_put_` enqueued on the SCATTER stream (CPU mode: at once), before the release's completion event. The tests'
+  AdversarialTransport cannot publish (vendored): `PublishingTransport` wraps it and publishes every transfer it sees
+  landed after a poll / force, with the same deliveries and pending list (the stand-in of the scatter stream).
+- THE WAIT LIST (`wait_list`): from `device_verify`'s decision, per entry the board index of its in-flight slot (-1 if
+  none) and the generation; fixed length, on the device: capturable.
+- THE KERNEL (`_wait_kernel`, Triton, SOURCE ONLY, NOT RUN): ONE program on the main stream (one SM; the scatter
+  stream keeps the others), the list in blocks of 1024, VOLATILE loads of the board, spinning until every entry
+  reached its generation or `max_spin` rounds passed; then an entry short or past raises `err` (int32, atomic max).
+  The board write that ends the spin is enqueued after the scatter, so the rows are complete when the main stream's
+  next kernel (the attention) reads them. In the eager tick a CPU pack not yet submitted is host-waited for its
+  SUBMISSION first (the liveness rule of 12g); its completion is waited on the device.
+- NO HANG: `err` is watched by S-C (`watch_flag`, 12e): a spin that ran out refuses its tick at that tick's end_tick.
+- `CudaDeviceOps(wait_mode="exact")` launches the kernel per layer; `"superset"` keeps the event waits. FG1 runs both
+  and reports per layer the 4.3 layer_wait_ns, per tick the ms, the submission host-waits (superset only) and `err`.
+- CPU stand-in: `ExactWaitSim` reads only device data (the wait list and the board; never the host's transfer
+  records); a spin round is the stand-in of time (`PublishingTransport.progress_slot`: the transfer into that slot
+  lands now); at most `max_spin` rounds; then `err`. `ResidencySC(wait_mode="exact")` selects it on the CPU.
+- Tests: F17 (S-C with the exact wait equals v1 over F6's 24 ticks: pages, verify content, state, counters and the
+  device mirror every tick; the wait spun, `err` False; the board is never ahead of a slot's generation); F17b (a
+  REUSED slot: generation 1 published, generation 2 in flight: the wait spins until 2, the verifier reads the right
+  block; negative controls: a wait that accepts the previous generation reads the old block (content check); a
+  transport that never publishes runs the spin out and the watched `err` refuses the tick); GT4 (gilfree publishes
+  exactly its transfers' (slot, generation) after the release; negative: no board attached, no publication).
+
+## 12g. The GPU gates FG1 - FG3 on the real tick (`benchmarks/Efficiency/r2_fetch_fg.py`, 2026-10-21)
+
+The gates live on branch `feature/nosi-r2-m2-fg` (worktree `/mnt/beegfs/ojerbi/nosi-r2-m2-fg`, 0781b1d, accepted with
+CPU job 2190942): the verify agent's SG5 795dbc1 (the tick with its ResidencyBackend) with this branch's 41078e8
+merged. Step `benchmarks/Efficiency/r2_fetch_fg_step.sh`; CPU tests of the plumbing
+`benchmarks/Efficiency/tests_cpu/test_r2_fetch_fg.py` (FGC1-FGC6); the gather transport
+`nosi/nosi/r2_transport_gather.py`. THIS branch carries the gates' library changes (ported, with tests F18 / F19 and
+GT4): the liveness rule below, `ResidencySC.journal_counts`, and gilfree's `stats["published"]`.
+
+- SETUP: B 8 distinct ragged documents (S 16128 minus the tick gate's deltas), one build_ragged; every engine a
+  from_r2 copy; TEACHER = the serial mode's greedy tokens (SG0's BI serial decode); RES = the ALL-RESIDENT tick
+  (ResidentStore) teacher-forced with forced_schedule, 64 committed tokens per request: its verify rows (float32, with
+  their (request, position)) are the reference of every S-C arm, which MUST give the same row sequence and BITWISE equal
+  rows. The host rows past the prompts are zeroed before every S-C arm.
+- FG1 THE WAIT (gilfree, C 80 / X 32 / R_ver 16): superset vs exact; per layer the device time of the wait (CUDA events
+  around it on the main stream; in S-C both the look and the read are on the device, so this is the 4.3 layer wait)
+  and its host time; ms per tick; the submission host-waits; exact: err 0, published == packed transfers, no board entry
+  ahead of its slot's generation. NEGATIVE: exact without publication (the board never attached), max_spin 65536: a
+  tick is refused (CapacityRefusal naming wait_err) within 900 s.
+- LIVENESS RULE (found while writing FG1): in the EAGER tick the exact wait first host-waits the SUBMISSION of every
+  transfer in flight at the layer (`CudaDeviceOps._submitted`: a threading.Event, the GIL released), then spins on the
+  device. Without it the main stream could spin on a pack that the feeder cannot submit, because the host thread holds
+  the GIL while it blocks in a kernel launch behind the spinning stream (the launch queue is full). The completion is
+  still waited on the device and only for the needed slots. In a captured tick the submission waits move before the
+  replay (the tick-capture plan 8.8).
+- FG2 THE TRANSPORTS (superset wait): gather (NOSI's Triton flash_h2d_from_mask on a side stream; T4 / T3 as side-stream
+  event waits; the board published on the side stream), s0 (K3X S0Transport over cpupack_core 91e6e47, its CUDA
+  backend; n_pos = C + X + 4 so the destination rows match the store with its tail rings) and gilfree (8 threads):
+  bitwise RES, and every 8 ticks every resident slot holds the host truth (K, V, bias); the 4.3 / 4.6 / 4.8 report per
+  transport.
+- FG3 FETCH PRESSURE (exact wait, gilfree): C:X:R_ver 72:128:64 and 64:256:128 (C below the primary 80: blocks are
+  evicted and fetched again; X large enough that the verifier's urgent misses find extras at B 8 x H 8 = 64 streams per
+  layer). Every completed point bitwise RES; a CapacityRefusal is reported as a configuration result. Precondition: a
+  completed point re-fetched (4.8 repeated > 0) and evicted LRU entries (`ResidencySC.journal_counts`: evict_po,
+  release:evict). NEGATIVE: NoHostCopy (a write-back that does not copy the rows to the host) differs or refuses.
+- STEP_MIN 90 (estimate: model and build about 6 min, the extension build about 2 min, TEACHER and RES about 3 min,
+  8.5 S-C arms at about 2 - 4 min each: S-C's host applies are Python loops over B x K x H x 64 entries per layer).
+
+## 12h. The first GPU run (FG fg1 and SG5 p1, holder 2190876): two defects and their fixes (2026-10-21)
+
+Both runs failed before any tick with verify rows finished
+(`/mnt/beegfs/ojerbi/r2-runs/fg/fg_fg1_2190876/summary.json`, `/mnt/beegfs/ojerbi/r2-runs/sg5/sg5_p1_2190876`).
+
+DEFECT 1, every gilfree arm: "S and S_dst must be multiples of R" (gilfree_pack.cpp order_and_check).
+- E's R contract (FIX_DESIGN.md at f2b981a): R = 64. The sources are contiguous TOKEN-MAJOR (B, S, H, D) CPU
+  tensors with S a multiple of 64. The destination is a (rows, D) view of a token-major store of the same B, H, D and
+  dtype, with whole 64-row slots. The error does not say which side failed.
+- Which side failed: the SOURCE side, by its row count, not by its layout.
+  - The host rows are token-major, (B, n_host, H, D) (R2Body.allocate, r2_decode_body.py).
+  - n_host = S_max + horizon + 64 per request (r2_decode_path.ragged_widths), not 16128 + 64:
+    SG5 p1: 16128 + (48 + LAMBDA 7 + 64) + 64 = 16311; FG: 16128 + (64 + 16 + 80) + 64 = 16352.
+    Neither is a multiple of 64.
+  - The destination holds: the store is (B, (C + X + 4 [+ 1 trash]) x 64, H, D) (TickEngine), whole slots.
+- The CPU tests used S_host = 12 x 64, so the defect stayed hidden.
+- FIX (no packer change; E's R contract stands): the adapter hands the packer one zero-copy source per
+  (layer, request), `host[l][b:b+1, :S_floor]`, with S_floor = (S_host // 64) x 64. It addresses the request in
+  the destination row: m' = b x n_slots + slot.
+- The adapter checks at construction, and each message names its side:
+  - the host rows and the store are 4-D token-major tensors of the same B, H, D and dtype (a head-major host is
+    refused, not read as S = H);
+  - the host holds at least one complete block (SOURCE);
+  - the store's rows per request are a multiple of 64 (DESTINATION).
+- At release, the adapter refuses a block past S_floor. Such a block is never complete, so the service never
+  requests it (the drivers pass nblk = n_host // 64).
+- CPU test GT5: the production geometries (S_host 16311 / 16352 / 16192; C + X + 4 = 116 slots, with the trash slot
+  117; C 96: 132). The bytes equal the host truth: the last complete block, and the first and last slot of a
+  request. A block past the floor is refused.
+- GT5 negative control: the former batched call is refused by the packer itself, for every S_host that is not a
+  multiple of 64.
+- CPU test GT5b: the construction refusals (a head-major host, a store of partial slots, a host without a complete
+  block, a store of another B); positive control: a token-major host of 5 x 64 + 55 rows is accepted.
+
+DEFECT 2, FG2 gather and s0 at C 80 / X 32 / R_ver 16: CapacityRefusal at layers 18 and 23 (10 and 6 blocks).
+What the data shows (FG2_gather):
+- NOSA-8B has H = 2 KV heads (slots_physical 59392 = 32 x 8 x 2 x 116), so a layer has 16 streams at B 8.
+- 3 draft-only ticks ran. The 4th tick, the first with verify rows, refused.
+- The drafts took 36311 blocks: 70.9 per stream. Journal: take 36311, admit 36311, evict_po 47, no release:evict.
+  No cohort had been decided (decision_reads 0), so every resident block was protected by a live draft cohort.
+- So no policy could free a slot there. v1 too would refuse: its eviction needs an unprotected LRU entry.
+- The verifier had only C - usage, about 9 local slots per stream on average, plus at least 16 shared extras
+  (X 32 minus the drafts' borrowing; drafts may borrow X - R_ver = 16). It needed about 10 more at layer 18.
+- Its first-verify demand is therefore about 16 x 9 + 16 + 10 = 170 urgent blocks per layer, about 11 per stream.
+CONCLUSION:
+- (a) This refusal is a CONFIGURATION result. The first verify tick needs C above the drafts' protected union plus
+  the verifier's urgent misses, per stream: about 71 + 11.
+- (b) The data also shows the POLICY GAP. Once the LRU is full (usage >= C), every urgent miss of S-C needs a shared
+  extra, because S-C could not evict. Those extras do not scale with B: per-stream backing gives every stream X
+  physical extra slots, but the whole layer has only X in total.
+- v1 (and K3X) instead evict an unprotected LRU entry. So both changes are made.
+
+POLICY E (v1 `_verifier_candidates` / `_evict_now`; S-C `device_verify`, `_apply_verify`):
+- Trigger: K5 grants the verifier's urgent miss no slot.
+- Choice: the stream's least recent LRU entry that is UNPROTECTED at the start of the layer and selected by NO row
+  of the layer (draft or verify), so no read of the layer uses it.
+- It is evicted (release: verifier_evict) and its slot reused at once. Its last reader read it in an earlier tick,
+  so on the GPU that read is ordered before the main-stream gather. On the host the reader is host-waited if
+  pending (counted: verifier_force_waits). Then poll_releases' FREE transition runs for that one slot.
+- With no candidate: CapacityRefusal, the configuration case.
+- K3X's former force path is not used. It host-waits every RELEASING gate of the stream and polls the whole pool
+  mid-tick, which a device decision cannot do.
+- S-C's device mirror now also carries, per slot, the protection flag and the LRU recency stamp:
+  - touch / admit / acquire give the slot a new stamp;
+  - the stream's protection map reports protection changes (_ProtDict);
+  - both go with the one delta per tick (F14 compares the lru_rank and prot fields too).
+- The host checks every device eviction against v1's candidate list.
+- S-B keeps v1's verify rows but sees no draft selection there. Its candidates spare only the verify rows' blocks:
+  S-B is superseded and is not equal to v1 once evictions happen. It stays safe: its draft decision reads the mirror
+  refreshed after the verify part, so an evicted block is a miss there, never a read of the reused slot. The S-B
+  lockstep tests (F10) use C 8 / X 48 / R_ver 8 on F6's schedule (F12 asserts that v1 makes no verifier eviction
+  there) or no verify rows (F10b); if F10 met an eviction, its lockstep would report the difference.
+
+Tests:
+- F20 (scripted, one stream, C 2, X 0):
+  - all protected: both refuse;
+  - the oldest protected: evict the next;
+  - the oldest read by the tick's draft row: evict the next;
+  - none excluded: evict the oldest.
+  - v1 and S-C reach the same state. Negative controls: a device that evicts a protected entry, a read entry, or
+    the newest one is refused by the host's check.
+- F20b: the lockstep under eviction pressure (C 24 of 36 blocks, X 2). Precondition: v1 evicts. S-C equals v1 in
+  every tick.
+- F14c gains the kinds touch and prot.
+
+RECOMMENDED POINTS (arithmetic above). The FG and SG5 step scripts change on their branches, not here:
+- Primary point: C 96 / X 32 / R_ver 16.
+  - It gives about 25 local slots per stream at the first verify tick, about 400 per layer at B 8, against a demand
+    of about 170.
+  - The cost: 132 slots per (request, head, layer) instead of 116. At 32,896 B per slot (the sizes above), B 64,
+    H 2, 32 layers: 17.79 GB instead of 15.63 GB (+2.16 GB); at B 8: 2.22 GB instead of 1.95 GB.
+  - The per-stream numbers do not depend on B, so the same C holds at B 64.
+- FG3 pressure points: 72:384:256 and 64:512:384.
+  - With C below the drafts' union, the verifier needs about 10 to 16 extras per stream at the first verify tick.
+    R_ver >= 256 covers 16 streams.
+  - The cost at B 8 (460 and 580 slots): 7.75 GB and 9.77 GB of store.
+- SG5's sweep keeps C in {64, 80, 96}. Points with C <= 80 may still refuse at the first verify tick; that is a
+  configuration result.
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,
@@ -422,4 +615,5 @@ with real selections; FG3 the packer's sustained rate (4.9) against the tick's d
   and updates it by one batched delta per tick; the full scan stays as the reference (F14). S-B keeps the full scan
   (S-C supersedes it for runs).
 - Q6 CudaDeviceOps' superset wait may stall the main stream on draft transfers that no verify row reads. The 4.3
-  layer_wait_ns measures it in FG1; the exact device spin on published generations is the fallback.
+  layer_wait_ns measures it in FG1; the exact device wait (12f) is built as a design and a CPU stand-in, and FG1 runs
+  both.
