@@ -75,7 +75,13 @@ import types
 
 REGISTERED = dict(pred_band=0.15, falsifier_ratio=1.30)
 REGISTERED2 = dict(desc_issue_pred_ms=1.0, desc_issue_fals_ms=5.0)
-CELLS = ("gfw1", "gfw2")
+CELLS = ("gfw1", "gfw2", "gfw1d")
+# REGISTERED GFW1D (frozen 2026-10-21 before gfw1d; the step script's header holds the same block): GFW1's captured
+# protocol (64 launches behind the spin, no submission wait) in a process with CUDA_DEVICE_MAX_CONNECTIONS=32.
+# PREDICTION if the shared hardware queue is the cause (gfw1c: GFW1 failed with only 64 launches, so not the launch
+# queue): err 0, a real spin (> 10 ms), every launch ran, the rows are the host truth. FALSIFIER of that hypothesis:
+# err 1 at the spin's bound with the variable set to 32. Information only: the rule (wait in both modes) stands.
+REGISTERED1D = dict(env="CUDA_DEVICE_MAX_CONNECTIONS", value="32")
 V2_RECORD = {64: dict(svc_p50_ms=4.59, native_total_ms=4.20), 192: dict(svc_p50_ms=12.36, native_total_ms=11.43,
                                                                        svc_p50_ms_t4=15.86)}
 B_T, H_T, D_T, R_T, LAYERS_T, NSRC_T, NBLK_T, M_T, CAP_T = 64, 8, 128, 64, 32, 4, 64, 16, 256
@@ -106,7 +112,8 @@ def parse_args(argv):
     ap.add_argument("--launches-few", type=int, default=64, help="GFW1: the captured tick's few launches behind the spin")
     ap.add_argument("--hazard-spin", type=int, default=1 << 20, help="R_GFW1x: the spin's bound (rounds)")
     ap.add_argument("--spin-cycles", type=int, default=200_000_000, help="the GPU sleep before the T4 event")
-    ap.add_argument("--cell", default="gfw1", choices=CELLS, help="gfw1: GFW1 / GFW1n / GFW_T; gfw2: GFW2 / GFW2n")
+    ap.add_argument("--cell", default="gfw1", choices=CELLS,
+                    help="gfw1: GFW1 / GFW1e / GFW1n / GFW_T; gfw2: GFW2 / GFW2n; gfw1d: R_GFW1d (REPORT only)")
     ap.add_argument("--takes", type=int, default=6496, help="gfw2: the takes of the tick (B2: ~6.49 k)")
     ap.add_argument("--l2-layers", type=int, default=4)
     ap.add_argument("--l2-batch", type=int, default=64)
@@ -517,7 +524,8 @@ def main(argv=None) -> int:
         import torch
         if not torch.cuda.is_available():
             raise SystemExit("REFUSED: no CUDA device")
-        meta.update(torch=torch.__version__, gpu=torch.cuda.get_device_name(0))
+        meta.update(torch=torch.__version__, gpu=torch.cuda.get_device_name(0),
+                    cuda_device_max_connections=os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS"))
         GF, SCG = load_nosi(a.nosi_pkg)
         ext3 = ext2 = None
         try:
@@ -535,6 +543,29 @@ def main(argv=None) -> int:
             ready, detail = False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:400])
         gates.append(gate("GFW_ready", ready, True, detail))
         save()
+        if ready and a.cell == "gfw1d":                        # REPORT only: the shared-hardware-queue hypothesis
+            log("R_GFW1d")
+            env = os.environ.get(REGISTERED1D["env"])
+            try:
+                r = gfw1(GF, SCG, ext3, False, 1 << 24, a.spin_cycles, a.launches_few, a.threads, wait_submission=False)
+                r["env"] = env
+                res["R_GFW1d"] = r
+                ok = (env == REGISTERED1D["value"] and r["err"] == 0 and r["launches_done"] == float(a.launches_few)
+                      and r["spin_ms"] > 10.0 and r["rows_ok"] and r["t4_pending_at_issue"])
+                verdict_1d = ("HELD (the shared hardware queue was the cause)" if ok else
+                              "FALSIFIED (err 1 at the bound with %s=%s)" % (REGISTERED1D["env"], env)
+                              if env == REGISTERED1D["value"] and r["err"] == 1 else "INVALID (env %r)" % (env,))
+                detail = ("%s: %s=%s; err %d, launches %d/%d, spin %.1f ms (bound %d), rows %s, T4 pending at issue %s, "
+                          "enqueue %.1f ms, board %s want %s" % (
+                              verdict_1d, REGISTERED1D["env"], env, r["err"], int(r["launches_done"]), a.launches_few,
+                              r["spin_ms"], 1 << 24, r["rows_ok"], r["t4_pending_at_issue"], r["enqueue_ms"],
+                              r["board"], r["want"]))
+            except Exception as e:
+                traceback.print_exc()
+                res["R_GFW1d"] = dict(error="%s: %s" % (type(e).__name__, str(e)[:400]), env=env)
+                ok, detail = False, "EXCEPTION " + res["R_GFW1d"]["error"]
+            gates.append(gate("R_GFW1d", ok, False, detail))
+            save()
         if ready and a.cell == "gfw2":
             log("GFW2")
             try:

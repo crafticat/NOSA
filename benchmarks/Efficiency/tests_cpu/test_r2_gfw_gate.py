@@ -145,7 +145,7 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
     assert lines[0] == "#!/bin/bash" and lines[-1] == 'main "$@"; exit $?' and "main() {" in text
     assert 'mkdir "$OUTROOT/gfw_active"' in text and "STEP_MIN=12" in text and "--export=NONE" in text
     assert text.index("UFILE=$HOLDERS/$JOB.gpu_uuid") < text.index('mkdir "$OUTROOT/gfw_active"')
-    assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw1c " in text
+    assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw1d " in text
     for word in ("awk", "perl", "python3", " bc ", "node "):
         for ln in lines:
             if not ln.lstrip().startswith("#"):
@@ -197,7 +197,7 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
     rec = "/mnt/beegfs/ojerbi/r2-runs/gfw/gfw_t1_516.step"
     for arg in ("--threads 8", "--releases 20", "--warmup 3", "--launches 1500", "--spin-cycles 200000000",
                 "--launches-few 64", "--hazard-spin 1048576",
-                "--export=NONE", "--gres=gpu:a100:1", "--nosi-pkg /mnt/beegfs/ojerbi/nosi-r2-gfw1c/nosi/nosi",
+                "--export=NONE", "--gres=gpu:a100:1", "--nosi-pkg /mnt/beegfs/ojerbi/nosi-r2-gfw1d/nosi/nosi",
                 "--v3 %s/packer_v3" % rec, "--v2 %s/packer_v2" % rec, "r2_gfw_gate.py", "--cell gfw1", "; cell gfw1"):
         assert arg in r.stdout, arg
     assert "--sizes 64,192" in r.stdout or "--sizes 64\\,192" in r.stdout
@@ -208,6 +208,15 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
                 "--l2-c 96", "--l2-x 32", "--l2-sleep-cycles 50000000", "--threads 8", "--export=NONE", "; cell gfw2"):
         assert arg in r2.stdout, arg
     assert "--releases" not in r2.stdout and "--launches" not in r2.stdout
+    r3 = run(516, sha=head.stdout.strip(), cell="gfw1d")
+    assert r3.returncode == 0, r3.stderr[-300:]
+    for arg in ("--cell gfw1d", "--env CUDA_DEVICE_MAX_CONNECTIONS=32", "--launches-few 64", "--spin-cycles 200000000",
+                "--threads 8", "--export=NONE", "; cell gfw1d"):
+        assert arg in r3.stdout, arg
+    assert "--releases" not in r3.stdout and "--takes" not in r3.stdout
+    # the variable is set in gfw1d's child only (NEGATIVE CONTROL: the other cells' commands do not carry it)
+    assert r3.stdout.index("--env CUDA_DEVICE_MAX_CONNECTIONS=32") < r3.stdout.index("nosa-env.sif")
+    assert "CUDA_DEVICE_MAX_CONNECTIONS" not in r.stdout and "CUDA_DEVICE_MAX_CONNECTIONS" not in r2.stdout
 
 
 def _global_loads(code):
@@ -225,6 +234,27 @@ def _name_problems(jit):
     code = fn.__code__
     return list(code.co_freevars) + [n for n in _global_loads(code)
                                      if n not in fn.__globals__ and not hasattr(builtins, n)]
+
+
+def test_GFWC5_the_gfw1d_cell_is_report_only_and_registered():
+    """GFWC5 (cell gfw1d, the shared-hardware-queue hypothesis after gfw1c): --cell gfw1d parses; its only line besides
+    GFW_ready is R_GFW1d, REPORT (must False), GFW1's captured protocol (64 launches, no submission wait), and it
+    requires the variable CUDA_DEVICE_MAX_CONNECTIONS = 32 in the process (else INVALID) and records it in the summary;
+    the gate's REGISTERED1D and the step script's REGISTERED GFW1D block name the same variable and value, the
+    prediction (err 0 if the shared queue is the cause) and the falsifier (err 1 at the bound with the variable set)."""
+    G = _gate()
+    base = ["--out", "o", "--nosi-pkg", "n", "--v3", "a", "--v3-build", "/b", "--v2", "c", "--v2-build", "/d"]
+    assert G.parse_args(base + ["--cell", "gfw1d"]).cell == "gfw1d" and "gfw1d" in G.CELLS
+    src = (EFF / "r2_gfw_gate.py").read_text()
+    for need in ('if ready and a.cell == "gfw1d":', 'gates.append(gate("R_GFW1d", ok, False, detail))',
+                 "gfw1(GF, SCG, ext3, False, 1 << 24, a.spin_cycles, a.launches_few, a.threads, wait_submission=False)",
+                 'env == REGISTERED1D["value"] and r["err"] == 0', 'cuda_device_max_connections=os.environ.get('):
+        assert need in src, need
+    assert G.REGISTERED1D == dict(env="CUDA_DEVICE_MAX_CONNECTIONS", value="32")
+    block = _registered((EFF / "r2_gfw_step.sh").read_text(), tag="GFW1D")
+    for frag in ("CUDA_DEVICE_MAX_CONNECTIONS=32", "PREDICTION if the shared hardware queue is the cause: err 0",
+                 "FALSIFIER of that hypothesis: err 1 at the spin's bound"):
+        assert frag in block, frag
 
 
 def test_GFWC4_the_gate_loads_the_fixed_exact_wait_kernel():

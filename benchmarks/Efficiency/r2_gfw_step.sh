@@ -27,14 +27,23 @@
 # PREDICTION <= 1.0 ms
 # FALSIFIER >= 5.0 ms; otherwise GREY
 # REGISTERED GFW2 END
+# CELL gfw1d (REPORT only; GFW_ready stays MUST): GFW1's captured protocol (64 launches behind the spin, no submission
+# wait) with CUDA_DEVICE_MAX_CONNECTIONS=32 set in the child (this cell only), the value recorded. gfw1c failed GFW1
+# with 64 launches: not the launch queue; this tests the shared-hardware-queue hypothesis. Information only: the rule
+# (the submission wait in both tick modes) stands either way.
+# REGISTERED GFW1D BEGIN
+# frozen 2026-10-21 before gfw1d; GFW1's captured protocol with CUDA_DEVICE_MAX_CONNECTIONS=32
+# PREDICTION if the shared hardware queue is the cause: err 0, a real spin > 10 ms, every launch ran, rows the host truth
+# FALSIFIER of that hypothesis: err 1 at the spin's bound with the variable set to 32
+# REGISTERED GFW1D END
 # The pattern of benchmarks/Efficiency/r2_fetch_fg_step.sh (feature/nosi-r2-m2-fg): the GPU uuid from
 # HOLDERS/<holder job id>.gpu_uuid; packer v2 (gilfree_pack.py / .cpp of f2b981a) pinned by commit, path and blob;
 # packer v3 = the blobs of benchmarks/Efficiency/gilfree_pack.{py,cpp} at --nosi; both copied into the step record and
 # loaded by path (built into the step's JIT directory). No model, no workload.
 # SOURCE ONLY until reviewed: it never submits, renews, cancels or replaces an allocation, never retries.
 #
-#   bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id> [gfw1|gfw2]
-#   DRYRUN=1 bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id> [gfw1|gfw2]
+#   bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id> [gfw1|gfw2|gfw1d]
+#   DRYRUN=1 bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id> [gfw1|gfw2|gfw1d]
 #        (login node: the pin checks and the printed step command; no squeue, claim, srun or write)
 #   In DRYRUN only, GFW_HOLDERS=<dir> replaces HOLDERS (the CPU test uses it); a real run refuses GFW_HOLDERS.
 #
@@ -45,7 +54,7 @@
 # 124 / 137 the host timeout; 1 a STOP before the launch (a missing or malformed uuid file included); 5 an exit-0 step
 # whose record is incomplete or whose sacct row is not COMPLETED 0:0.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw1c                                                    # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw1d                                                    # ROOT
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -63,14 +72,17 @@ STEP_MIN=12
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 GFW step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_gfw_step.sh --nosi <sha> <holder> <run id> [gfw1|gfw2]" >&2; exit 2; }
+usage() { echo "usage: r2_gfw_step.sh --nosi <sha> <holder> <run id> [gfw1|gfw2|gfw1d]" >&2; exit 2; }
 { [ $# = 4 ] || [ $# = 5 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4 CELL=${5:-gfw1}
+CELL_ENVS=()
 case $CELL in
     gfw1) CELL_ARGS=(--releases 20 --warmup 3 --sizes "$SIZES" --launches 1500 --launches-few 64
                      --hazard-spin 1048576 --spin-cycles 200000000) ;;
     gfw2) CELL_ARGS=(--takes 6496 --l2-layers 4 --l2-batch 64 --l2-heads 2 --l2-s-host 16311 --l2-c 96 --l2-x 32
                      --l2-sleep-cycles 50000000) ;;
+    gfw1d) CELL_ARGS=(--launches-few 64 --spin-cycles 200000000)
+           CELL_ENVS=(--env CUDA_DEVICE_MAX_CONNECTIONS=32) ;;
     *) usage ;;
 esac
 DRY=${DRYRUN:-0}
@@ -130,6 +142,7 @@ exec "$A" exec --nv --cleanenv --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES
 ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) srun --jobid="$JOB" --job-name="$NAME"
       --ntasks=1 --cpus-per-task=16 --mem=32G --gres=gpu:a100:1 --time="$STEP_MIN" --export=NONE
       /bin/sh -c "$CHILD" gfw-child "$GPU_UUID" "$APPTAINER" --bind /mnt/beegfs/ojerbi:/mnt/beegfs/ojerbi "${ENVS[@]}"
+      ${CELL_ENVS[@]+"${CELL_ENVS[@]}"}
       "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_gfw_gate.py" --out "$OUT" --nosi-pkg "$NOSI/nosi/nosi"
       --v3 "$V3_DIR" --v3-build "$JIT/gfw_v3_build" --v2 "$V2_DIR" --v2-build "$JIT/gfw_v2_build"
       --threads "$THREADS" --cell "$CELL" "${CELL_ARGS[@]}")
@@ -173,8 +186,9 @@ printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/comman
 printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s utc_start=%s\n' "$NSHA" \
     "$blob" "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
     stop "cannot write $REC (gfw_active stays)"
-printf 'packer_v3=%s py=%s cpp=%s packer_v2=%s py=%s cpp=%s threads=%s sizes=%s cell=%s\n' "$NSHA" "$V3_PY_BLOB" \
-    "$V3_CPP_BLOB" "$GF_SHA" "$GF_PY_BLOB" "$GF_CPP_BLOB" "$THREADS" "$SIZES" "$CELL" >> "$REC/command.txt" ||
+printf 'packer_v3=%s py=%s cpp=%s packer_v2=%s py=%s cpp=%s threads=%s sizes=%s cell=%s cell_envs=%s\n' "$NSHA" \
+    "$V3_PY_BLOB" "$V3_CPP_BLOB" "$GF_SHA" "$GF_PY_BLOB" "$GF_CPP_BLOB" "$THREADS" "$SIZES" "$CELL" \
+    "${CELL_ENVS[*]+${CELL_ENVS[*]}}" >> "$REC/command.txt" ||
     stop "cannot write $REC (gfw_active stays)"
 "${ARGV[@]}" < /dev/null > "$REC/stdout.txt" 2> "$REC/stderr.txt"
 rc=$?
