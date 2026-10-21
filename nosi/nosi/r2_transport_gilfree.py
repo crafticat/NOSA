@@ -68,9 +68,23 @@ the board; no Python object exists per transfer. T3 / T4 become marks: the tick 
 stream, so they complete in mark order, and the job waits only the newest mark per layer (T3, a device wait before the
 layer's scatters) and the newest write-back (T4, a host wait in the worker). The host admits the takes of every job
 seq <= landed_upto() (the job watermark: it only grows; a failed job never lands). S-C's exact wait reads the board.
+THE WARM-UP (gfw1e on holder 2190876, job record /mnt/beegfs/ojerbi/r2-runs/gfw/gfw_gfw1e_2190876/summary.json, source
+372fe55). GFW1's captured protocol (no submission wait, 64 launches behind the spin) in a fresh process: with
+CUDA_MODULE_LOADING=EAGER it still stalled (err 1, spin 7255 ms, enqueue 9.2 ms); with lazy loading and, before the
+spin, one add_ on the main stream and one float32 index_copy_ + one int64 index_put_ on the scatter stream, it passed
+(err 0, spin 143 ms, enqueue 0.89 ms). So the stall comes from the FIRST CALL of those operations behind the spin, not
+from module loading. The constructor therefore calls warm_up() ONCE, before any issue (so before the first tick, in the
+eager and the captured tick alike): the same operations, on tiny tensors, on the store's device and dtype (index_copy_
+of the store's dtype into a (rows, D) tensor with an int64 index, the C++ worker's and v2's scatter; index_put_ of int64
+values with an int64 index into a 1-D int64 tensor, the board publication), each on the stream production uses (add_ on
+the constructing thread's current stream; index_copy_ / index_put_ on the scatter stream), then a device synchronize. On
+the CPU the same operations run on CPU tensors (no stream, no synchronize). warm_up=False (NEGATIVE CONTROL, tests and
+gfw1f's control arm only) skips it. warm_calls counts the calls; warmed names what ran (None when skipped). The host
+still waits the submission in both tick modes (S-C's _submitted, 9508109): the warm-up does not replace that rule.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import queue
 import threading
@@ -134,7 +148,7 @@ class GilfreeTransport:
     def __init__(self, ext, host_k: Sequence[torch.Tensor], host_v: Sequence[torch.Tensor], slots_k, slots_v, bs: int,
                  D: int, threads: int, host_wait: Callable[[Any], None], cap_groups: int = 256, ring: int = 2,
                  cores: Optional[Sequence[int]] = None, background: bool = False, skip_hist_wait: bool = False,
-                 thread_modes: bool = True, worker: str = "python"):
+                 thread_modes: bool = True, worker: str = "python", warm_up: bool = True):
         if not 1 <= int(threads) <= 256:
             raise ValueError("threads must be in 1 .. 256 (got %r)" % (threads,))
         if int(threads) > 1 and int(getattr(ext, "OPENMP", 0)) != 1:
@@ -219,10 +233,41 @@ class GilfreeTransport:
         self.thread_modes = bool(thread_modes)                 # NEGATIVE CONTROL (tests only) when False
         self._feeder_seen: Optional[Dict[str, bool]] = None    # the modes the feeder ran with (feeder_seen)
         self._cores = list(cores) if cores else None           # the feeder's (or the C++ worker's) CPU affinity
+        self.warm_calls = 0                                    # THE WARM-UP (module docstring): once, before any issue
+        self.warmed: Optional[str] = None
+        if warm_up:                                            # False: NEGATIVE CONTROL (tests, gfw1f's control arm)
+            self.warm_up()
         if self.background and worker == "python":
             self._q: "queue.Queue" = queue.Queue()
             self._thread = threading.Thread(target=self._feeder, name="gilfree-feeder", daemon=True)
             self._thread.start()
+
+    # ------------------------------------------------------------------------------------------------ the warm-up
+    WARM_OPS = "add_ (current stream); index_copy_ %s + index_put_ int64 (scatter)"
+
+    def warm_up(self) -> None:
+        """THE WARM-UP (module docstring; gfw1e's warm arm): runs once each operation that the releases use behind S-C's
+        spin, on tiny tensors of the production device and dtypes, each on its production stream, then synchronizes
+        the device. The constructor calls it once, before any issue; it refuses a second call or a call after the
+        first issue (the warm-up must precede the first submission)."""
+        if self.warm_calls:
+            raise RuntimeError("gilfree: warm_up runs once (at construction)")
+        if self._last_seq or self._stats.get("releases") or self._last_flag is not None or self._worker_modes:
+            raise RuntimeError("gilfree: warm_up after the first issue")
+        dev, dt, bs, D = self.slots_k[0].device, self.slots_k[0].dtype, self.bs, self.D
+        x = torch.zeros((), device=dev)
+        x.add_(1.0)                                            # the main stream's kernel (gfw1e: the launches)
+        ctx = torch.cuda.stream(self.scatter) if self.cuda else contextlib.nullcontext()
+        with ctx:                                              # the scatter stream: the worker's / v2's scatter kernels
+            d = torch.zeros(2 * bs, D, dtype=dt, device=dev)
+            d.index_copy_(0, torch.arange(bs, dtype=torch.int64, device=dev), torch.ones(bs, D, dtype=dt, device=dev))
+            b = torch.zeros(8, dtype=torch.int64, device=dev)
+            b.index_put_((torch.tensor([1, 2], dtype=torch.int64, device=dev),),
+                         torch.tensor([3, 4], dtype=torch.int64, device=dev))
+        if self.cuda:
+            torch.cuda.synchronize(dev)                        # loaded and run before the first tick
+        self.warm_calls += 1
+        self.warmed = self.WARM_OPS % (str(dt).replace("torch.", ""),)
 
     # ------------------------------------------------------------------------------------------------ the feeder
     def _feeder(self) -> None:

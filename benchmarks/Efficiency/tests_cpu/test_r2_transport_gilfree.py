@@ -7,7 +7,9 @@ pinned v2 build and the Python feeder (the default; these tests' meaning before 
 this tree (benchmarks/Efficiency/gilfree_pack.{py,cpp}) and its C++ worker (asynchronous: the tests' sync point is
 flush(), a no-op in the synchronous mode). GT4b: the worker's board publication, and a planted missing one. GT7: the
 worker runs while the main thread HOLDS the GIL (negative control: the Python feeder cannot). GTG1: GPU-only (the later
-GPU gate), S-C's exact wait without its submission wait, more than 1024 launches behind the spin.
+GPU gate), S-C's exact wait without its submission wait, more than 1024 launches behind the spin. GT12 (gfw1e): the
+production transport's warm-up runs once, in its constructor, before the first submission, in the eager and the
+captured tick; negative control: warm_up=False is detected.
 
     python -m pytest -q -p no:cacheprovider benchmarks/Efficiency/tests_cpu/test_r2_transport_gilfree.py
 """
@@ -681,6 +683,126 @@ def test_GT11_wait_submitted_waits_for_the_submission(v3, worker):
             gf.wait_submitted(_transfers(0, [(0, 0, 1, 1)], 50)[0])   # NEGATIVE CONTROL: no ev
 
 
+def _logging_ext(ext, log):
+    """`ext` with a NativePipe that appends "submit" to `log` at each submission (submit, submit_desc: the C++ worker;
+    release: v2, the Python feeder and the synchronous mode) and forwards everything else to the real pipe."""
+    class Pipe:
+        def __init__(self, *a):
+            self._p = ext.NativePipe(*a)
+
+        def __getattr__(self, name):
+            return getattr(self._p, name)
+
+        def _logged(name):                                     # noqa: N805 (a class-body factory)
+            def f(self, *a):
+                log.append("submit")
+                return getattr(self._p, name)(*a)
+            return f
+        submit, submit_desc, release = _logged("submit"), _logged("submit_desc"), _logged("release")
+
+    ns = types.SimpleNamespace(**{k: getattr(ext, k) for k in ("OPENMP", "SLOT_EXTRA_PER_GROUP", "DESC", "VERSION")
+                                  if hasattr(ext, k)})
+    ns.NativePipe = Pipe
+    return ns
+
+
+def _warm_first(log):
+    """THE PROPERTY GT12 checks: exactly one warm-up, and it comes before the first submission."""
+    return log.count("warm") == 1 and "submit" in log and log.index("warm") < log.index("submit")
+
+
+@pytest.mark.parametrize("mode", ["eager", "captured"])
+@pytest.mark.parametrize("worker", ["cpp", "python"])
+def test_GT12_the_warm_up_runs_once_before_the_first_submission(v3, monkeypatch, worker, mode):
+    """GT12 (gfw1e on holder 2190876: GFW1's captured protocol without a submission wait stalled with
+    CUDA_MODULE_LOADING=EAGER, err 1, spin 7255 ms, and passed with a warm-up of add_ (main) and float32 index_copy_ +
+    int64 index_put_ (scatter) before the spin, err 0, spin 143 ms: the first call of those operations is the cause).
+    The PRODUCTION transport (warm_up default True) calls warm_up() exactly ONCE, inside its constructor, so before the
+    first submission; three ticks follow, each an issue then S-C's tick host part (CudaDeviceOps._submitted(l,
+    captured)) in the EAGER or the CAPTURED tick mode, with the C++ worker or the Python feeder. Checked from outside:
+    a spy on GilfreeTransport.warm_up and a pipe that logs every submission. The 9508109 rule is unchanged: with the
+    C++ worker the host waits each job's submission in both tick modes (submission_waits 3). The warm-up's operations,
+    seen by spies on torch.Tensor during construction: add_ on a float32 scalar, index_copy_ into a tensor of the
+    STORE's dtype (float32 here, bfloat16 for a bfloat16 store) with an int64 index, index_put_ into int64; a second
+    call is refused. NEGATIVE CONTROL: warm_up=False (the test-only flag): no warm-up before the first submission, and
+    _warm_first DETECTS it (False); the rows are the host truth in both runs (the flag changes only the warm-up)."""
+    log = []
+    orig = GF.GilfreeTransport.warm_up
+
+    def spy(self):
+        log.append("warm")
+        orig(self)
+    monkeypatch.setattr(GF.GilfreeTransport, "warm_up", spy)
+
+    def build(dtype=torch.float32, **flag):
+        host_k, host_v, gk, gv, _, _ = _world()
+        host_k, host_v, gk, gv = ([t.to(dtype) for t in ts] for ts in (host_k, host_v, gk, gv))
+        kw = dict(worker="cpp") if worker == "cpp" else dict(background=True)
+        gf = GF.GilfreeTransport(_logging_ext(v3.ext, log), host_k, host_v, gk, gv, BS, D, threads=2,
+                                 host_wait=lambda ev: None, cap_groups=4, **kw, **flag)
+        return gf, host_k, host_v, gk, gv
+
+    def run(**flag):
+        del log[:]
+        gf, host_k, host_v, gk, gv = build(**flag)
+        at_construction = list(log)
+        ops = object.__new__(SCG.CudaDeviceOps)                # the host part only: no CUDA object is built
+        ops.svc = types.SimpleNamespace(inflight={}, tp=gf, _landed=set())
+        ops.submission_waits = 0
+        plans = _plans()
+        for i, (layer, groups) in enumerate(plans):            # three ticks
+            trs = _transfers(layer, groups, 10 * i)
+            gf.issue(layer, trs)
+            ops.svc.inflight = {t.seq: t for t in trs}
+            ops._submitted(layer, mode == "captured")          # S-C's tick host part, in this tick mode
+        gf.flush()
+        gf.poll()
+        ok = gf.threads_ok() and _truth_ok(gk, gv, host_k, host_v, plans)
+        gf.close()
+        return gf, at_construction, list(log), ops.submission_waits, ok
+
+    gf, at_c, seen, waits, ok = run()
+    assert at_c == ["warm"] and gf.warm_calls == 1, (at_c, gf.warm_calls)
+    assert _warm_first(seen) and seen.count("submit") == 3, seen
+    assert gf.warmed == "add_ (current stream); index_copy_ float32 + index_put_ int64 (scatter)", gf.warmed
+    assert ok
+    if worker == "cpp":
+        assert waits == 3, waits                               # 9508109: one GIL-free wait per job, both modes
+    with pytest.raises(RuntimeError, match="runs once"):
+        gf.warm_up()                                           # a second call (orig: the spy would log it)
+
+    ops_seen = []                                              # the warm-up's operations, by spies on torch.Tensor
+    saved = {n: getattr(torch.Tensor, n) for n in ("add_", "index_copy_", "index_put_")}
+    own = {n for n in saved if n in vars(torch.Tensor)}        # restored exactly: set back, or the class attr removed
+
+    def op_spy(name):
+        def f(self, *a, **k):
+            idx = a[1] if name == "index_copy_" else (a[0][0] if name == "index_put_" else None)
+            ops_seen.append((name, self.dtype, None if idx is None else idx.dtype))
+            return saved[name](self, *a, **k)
+        return f
+    for dt in (torch.float32, torch.bfloat16):
+        del ops_seen[:]
+        try:
+            for n in saved:
+                setattr(torch.Tensor, n, op_spy(n))
+            gfd = build(dtype=dt)[0]
+        finally:
+            for n, f in saved.items():
+                if n in own:
+                    setattr(torch.Tensor, n, f)
+                else:
+                    delattr(torch.Tensor, n)
+        gfd.close()
+        assert ops_seen == [("add_", torch.float32, None), ("index_copy_", dt, torch.int64),
+                            ("index_put_", torch.int64, torch.int64)], (dt, ops_seen)
+
+    gf0, at_c0, seen0, _, ok0 = run(warm_up=False)             # NEGATIVE CONTROL
+    assert at_c0 == [] and gf0.warm_calls == 0 and gf0.warmed is None, (at_c0, gf0.warm_calls, gf0.warmed)
+    assert not _warm_first(seen0), seen0                       # DETECTED
+    assert seen0.count("submit") == 3 and ok0
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU-only: the later GPU gate runs it")
 def test_GTG1_gpu_exact_wait_without_the_submission_wait(v3):
     """GTG1 (GPU-ONLY; the later GPU gate): S-C's exact wait WITHOUT its submission wait (CudaDeviceOps._submitted,
@@ -693,7 +815,9 @@ def test_GTG1_gpu_exact_wait_without_the_submission_wait(v3):
     (wait_submitted, the GIL released) and only then spins, with 1500 launches behind (more than the ~1024-entry queue):
     err 0. (gfw1b: 1500 launches behind a spin with NO submission wait ran the spin to its bound: the worker's H2D /
     scatter, enqueued after the spin, were held behind it.) Negative control: the worker's publication planted off
-    (set_skip_publish): the spin ends by its bound with err 1, the launches still run."""
+    (set_skip_publish): the spin ends by its bound with err 1, the launches still run. Since gfw1f's source (r2-gfw-warm)
+    the transport is built with its default warm_up=True (GT12), the production protocol; gfw1e showed the captured arm
+    stalls without it."""
     dev = torch.device("cuda")
     Bp, Hp, Dp, nblk, npos = 2, 2, 64, 16, 12
     g = torch.Generator().manual_seed(5)
@@ -716,7 +840,8 @@ def test_GTG1_gpu_exact_wait_without_the_submission_wait(v3):
         err = torch.zeros((), dtype=torch.int32, device=dev)
         x = torch.zeros((), device=dev)
         kern = SCG._wait_kernel()
-        kern[(1,)](board.t, torch.full_like(idx, -1), gen, idx.shape[0], err, max_spin, BLOCK=1024)   # compile
+        spins = torch.zeros((1,), dtype=torch.int64, device=dev)   # 74c7d9b: the kernel's spin-round counter
+        kern[(1,)](board.t, torch.full_like(idx, -1), gen, idx.shape[0], err, max_spin, spins, BLOCK=1024)   # compile
         torch.cuda.synchronize()                               # before the sleep: the T4 event must be pending
         side = torch.cuda.Stream()
         with torch.cuda.stream(side):
@@ -731,7 +856,7 @@ def test_GTG1_gpu_exact_wait_without_the_submission_wait(v3):
         if wait_submission:
             gf.wait_submitted(trs[0])                          # the eager tick's rule, the GIL released
         e0.record()
-        kern[(1,)](board.t, idx, gen, idx.shape[0], err, max_spin, BLOCK=1024)
+        kern[(1,)](board.t, idx, gen, idx.shape[0], err, max_spin, spins, BLOCK=1024)
         e1.record()
         for _ in range(launches):
             x.add_(1.0)

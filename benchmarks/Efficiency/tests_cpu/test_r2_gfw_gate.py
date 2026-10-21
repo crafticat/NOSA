@@ -145,7 +145,7 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
     assert lines[0] == "#!/bin/bash" and lines[-1] == 'main "$@"; exit $?' and "main() {" in text
     assert 'mkdir "$OUTROOT/gfw_active"' in text and "STEP_MIN=12" in text and "--export=NONE" in text
     assert text.index("UFILE=$HOLDERS/$JOB.gpu_uuid") < text.index('mkdir "$OUTROOT/gfw_active"')
-    assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw1e " in text
+    assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw-warm " in text
     for word in ("awk", "perl", "python3", " bc ", "node "):
         for ln in lines:
             if not ln.lstrip().startswith("#"):
@@ -197,7 +197,7 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
     rec = "/mnt/beegfs/ojerbi/r2-runs/gfw/gfw_t1_516.step"
     for arg in ("--threads 8", "--releases 20", "--warmup 3", "--launches 1500", "--spin-cycles 200000000",
                 "--launches-few 64", "--hazard-spin 1048576",
-                "--export=NONE", "--gres=gpu:a100:1", "--nosi-pkg /mnt/beegfs/ojerbi/nosi-r2-gfw1e/nosi/nosi",
+                "--export=NONE", "--gres=gpu:a100:1", "--nosi-pkg /mnt/beegfs/ojerbi/nosi-r2-gfw-warm/nosi/nosi",
                 "--v3 %s/packer_v3" % rec, "--v2 %s/packer_v2" % rec, "r2_gfw_gate.py", "--cell gfw1", "; cell gfw1"):
         assert arg in r.stdout, arg
     assert "--sizes 64,192" in r.stdout or "--sizes 64\\,192" in r.stdout
@@ -223,6 +223,12 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
         assert arg in r4.stdout, arg
     # the gate sets each child's loading itself: the step's command carries neither variable
     assert "CUDA_MODULE_LOADING" not in r4.stdout and "CUDA_DEVICE_MAX_CONNECTIONS" not in r4.stdout
+    r5 = run(516, sha=head.stdout.strip(), cell="gfw1f")
+    assert r5.returncode == 0, r5.stderr[-300:]
+    for arg in ("--cell gfw1f", "--launches-few 64", "--spin-cycles 200000000", "--threads 8", "--export=NONE",
+                "--nosi-pkg /mnt/beegfs/ojerbi/nosi-r2-gfw-warm/nosi/nosi", "; cell gfw1f"):
+        assert arg in r5.stdout, arg
+    assert "CUDA_MODULE_LOADING" not in r5.stdout and "--releases" not in r5.stdout and "--takes" not in r5.stdout
 
 
 def _global_loads(code):
@@ -285,6 +291,63 @@ def test_GFWC6_the_gfw1e_probe_arms_envs_and_verdict():
     for frag in ("arm eager (CUDA_MODULE_LOADING=EAGER) and arm warm",
                  "PREDICTION if CUDA's lazy module loading is the cause: both arms pass",
                  "FALSIFIER: either arm ends at the spin's bound (err 1)"):
+        assert frag in block, frag
+
+
+def test_GFWC7_the_gfw1f_arms_expectations_and_verdict():
+    """GFWC7 (cell gfw1f, the production transport's built-in warm-up after gfw1e): both children run in lazy loading
+    (the variable removed); arm builtin passes only with err 0, 10 ms < spin < 1000 ms, every launch, right rows, T4
+    pending, LAZY after torch's CUDA init and the transport's warm_calls 1; arm nowarm meets its expectation only when
+    it STALLS (err 1) with warm_calls 0. Verdict: HELD = builtin passes and nowarm stalls; FALSIFIED = builtin err 1 or a
+    spin >= 1000 ms; CONTROL_BLIND = nowarm passes too; INVALID otherwise. Negative controls: a builtin arm whose
+    transport did not warm up (warm_calls 0), a nowarm arm that warmed up, an EAGER child, a missing arm, a child error,
+    an arm of the other cell. Static: the child's transport flag, gfw1's default keeps the old cells unwarmed, the
+    kernel gets C's spin counter, the lines are REPORT, the REGISTERED GFW1F block."""
+    G = _gate()
+    assert G.child_env_1f({"A": "1", "CUDA_MODULE_LOADING": "EAGER"}, "builtin") == {"A": "1"}
+    assert G.child_env_1f({"A": "1"}, "nowarm") == {"A": "1"}
+    with pytest.raises(ValueError):
+        G.child_env_1f({}, "warm")                                                    # gfw1e's arm, not gfw1f's
+    good = dict(err=0, spin_ms=143.0, launches_done=64.0, rows_ok=True, t4_pending_at_issue=True,
+                module_loading_after="LAZY")
+    a = dict(good, arm="builtin", tp_warm_calls=1)
+    b = dict(good, arm="nowarm", tp_warm_calls=0, err=1, spin_ms=7255.0)
+    assert G.arm_ok_1f(a, "builtin", 64) and G.arm_ok_1f(b, "nowarm", 64)
+    assert not G.arm_ok_1f(dict(a, tp_warm_calls=0), "builtin", 64)                  # NEGATIVE: not warmed
+    assert not G.arm_ok_1f(dict(b, tp_warm_calls=1), "nowarm", 64)                   # NEGATIVE: the control warmed
+    assert not G.arm_ok_1f(dict(a, module_loading_after="EAGER"), "builtin", 64)     # NEGATIVE: not lazy
+    assert not G.arm_ok_1f(dict(a, spin_ms=1000.0), "builtin", 64)
+    assert not G.arm_ok_1f(dict(a, spin_ms=5.0), "builtin", 64)
+    assert not G.arm_ok_1f(dict(b, err=0, spin_ms=140.0), "nowarm", 64)             # the control did not stall
+    assert G.verdict_1f(dict(builtin=a, nowarm=b), 64) == "HELD"
+    assert G.verdict_1f(dict(builtin=dict(a, err=1, spin_ms=8600.0), nowarm=b), 64) == "FALSIFIED"
+    assert G.verdict_1f(dict(builtin=dict(a, spin_ms=1200.0), nowarm=b), 64) == "FALSIFIED"
+    assert G.verdict_1f(dict(builtin=a, nowarm=dict(b, err=0, spin_ms=140.0)), 64) == "CONTROL_BLIND"
+    assert G.verdict_1f(dict(builtin=dict(a, tp_warm_calls=0), nowarm=b), 64) == "INVALID"
+    assert G.verdict_1f(dict(builtin=a), 64) == "INVALID"                            # NEGATIVE: an arm missing
+    assert G.verdict_1f(dict(builtin=a, nowarm=dict(arm="nowarm", error="boom")), 64) == "INVALID"
+    assert G.verdict_1f(dict(builtin=dict(a, module_loading_after="EAGER"), nowarm=b), 64) == "INVALID"
+    base = ["--out", "o", "--nosi-pkg", "n", "--v3", "a", "--v3-build", "/b", "--v2", "c", "--v2-build", "/d"]
+    p = G.parse_args(base + ["--cell", "gfw1f", "--arm", "nowarm", "--arm-out", "/x.json"])
+    assert (p.cell, p.arm) == ("gfw1f", "nowarm") and G.ARMS_1F == ("builtin", "nowarm") and "gfw1f" in G.CELLS
+    with pytest.raises(SystemExit):
+        G.parse_args(base + ["--cell", "gfw1e", "--arm", "builtin"])                 # NEGATIVE: the other cell's arm
+    with pytest.raises(SystemExit):
+        G.parse_args(base + ["--cell", "gfw1f", "--arm", "warm"])
+    src = (EFF / "r2_gfw_gate.py").read_text()
+    for need in ('if ready and a.cell == "gfw1f":', "subprocess.run(cmd, env=child_env_1f(os.environ, arm), timeout=600)",
+                 'gates.append(gate("R_GFW1f_" + arm, arm_ok_1f(r, arm, a.launches_few), False',
+                 'gates.append(gate("R_GFW1f", v == "HELD", False', 'tp_warm_up=(a.arm == "builtin")',
+                 "tp_warm_up=False):", "warm_up=bool(tp_warm_up))", "tp_warm_calls=int(gf.warm_calls)",
+                 "err, max_spin, spins, BLOCK=1024)"):
+        assert need in src, need
+    assert "max_spin, BLOCK=1024)" not in src                                         # C's 7-argument kernel only
+    assert G.REGISTERED1F["spin_max_ms"] == 1000.0
+    block = _registered((EFF / "r2_gfw_step.sh").read_text(), tag="GFW1F")
+    for frag in ("arm builtin and arm nowarm, lazy loading",
+                 "PREDICTION: arm builtin passes (err 0, 10 ms < spin < 1000 ms",
+                 "PREDICTION: arm nowarm stalls as the control (err 1",
+                 "FALSIFIER: arm builtin ends with err 1 or a spin >= 1000 ms", "CONTROL_BLIND"):
         assert frag in block, frag
 
 

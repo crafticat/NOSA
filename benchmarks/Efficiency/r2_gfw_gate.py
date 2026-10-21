@@ -60,6 +60,10 @@ descriptor issue (Q-B3, issue_desc) on the GPU, tests_cpu GT8's lockstep at the 
          the object path (the Transfer objects are built beforehand, not timed).
 REGISTERED2 (frozen 2026-10-21 before gfw2; the step script's header holds the same numbers): PREDICTION the issue_desc
   call takes <= 1.0 ms at --takes 6496; FALSIFIER >= 5.0 ms; otherwise GREY.
+gfw1d / gfw1e: REPORT-only probes (their REGISTERED blocks below). gfw1f = GFW_ready, then REPORT R_GFW1f_builtin /
+R_GFW1f_nowarm / R_GFW1f: GFW1's captured protocol (no submission wait, 64 launches behind the spin) in two FRESH child
+processes with lazy loading: builtin = the production transport with its built-in warm-up (GilfreeTransport warm_up,
+default on), nowarm = the same with warm_up=False (the control); REGISTERED1F below.
 OUTPUT: --out/summary.json. The last stdout line is R2_GFW_DONE failed=<n>; exit = n (2 = refused).
 """
 from __future__ import annotations
@@ -76,7 +80,7 @@ import types
 
 REGISTERED = dict(pred_band=0.15, falsifier_ratio=1.30)
 REGISTERED2 = dict(desc_issue_pred_ms=1.0, desc_issue_fals_ms=5.0)
-CELLS = ("gfw1", "gfw2", "gfw1d", "gfw1e")
+CELLS = ("gfw1", "gfw2", "gfw1d", "gfw1e", "gfw1f")
 ARMS_1E = ("eager", "warm")
 # REGISTERED GFW1E (frozen 2026-10-21 before gfw1e; the step script's header holds the same block): GFW1's captured
 # protocol (64 launches behind the spin, no submission wait), each arm in a FRESH child process: (a) eager:
@@ -123,6 +127,64 @@ def verdict_1e(results, launches):
         if "error" not in r and r.get("err") == 1 and env_ok:
             return "FALSIFIED"
     return "INVALID"
+
+
+ARMS_1F = ("builtin", "nowarm")
+# REGISTERED GFW1F (frozen 2026-10-21 before gfw1f; the step script's header and docs/R2_GFW1F_PLAN.md hold the same
+# block): gfw1e (holder 2190876, 372fe55): the EAGER arm stalled (err 1, spin 7255 ms, enqueue 9.2 ms), the WARM arm
+# passed (err 0, spin 143 ms, enqueue 0.89 ms). The PRODUCTION transport now warms up in its constructor
+# (GilfreeTransport(..., warm_up=True), the default: add_ on the current stream, index_copy_ of the store's dtype +
+# index_put_ int64 on the scatter stream, a synchronize). GFW1's captured protocol (64 launches behind the spin, NO
+# submission wait, the gate's own warm-up OFF), each arm in a FRESH child process with the default (lazy) loading:
+# (A) builtin: the production transport (its warm-up on); (B) nowarm: the same with warm_up=False (the control).
+# PREDICTION: A passes (err 0, 10 ms < spin < 1000 ms, every launch ran, the rows the host truth, T4 pending at issue,
+# the transport's warm_calls 1); B stalls (err 1: the spin ends at its bound; warm_calls 0).
+# FALSIFIER: A ends with err 1 or a spin >= 1000 ms. CONTROL_BLIND: A passes and B passes too (the stall did not
+# reproduce without the warm-up: A's pass is then no evidence that the warm-up is what prevents it). INVALID otherwise
+# (an arm missing, a child error, a child not in lazy loading, warm_calls not as built).
+REGISTERED1F = dict(env="CUDA_MODULE_LOADING", lazy="LAZY", spin_max_ms=1000.0, spin_min_ms=10.0)
+
+
+def child_env_1f(base, arm):
+    """gfw1f's child environment: both arms the default (lazy) loading (the variable removed, as gfw1e's warm arm)."""
+    if arm not in ARMS_1F:
+        raise ValueError("arm %r" % (arm,))
+    env = dict(base)
+    env.pop(REGISTERED1F["env"], None)
+    return env
+
+
+def _arm_valid_1f(r, arm):
+    """The arm ran, in lazy loading, with the transport's warm-up as built (builtin: 1 call; nowarm: 0)."""
+    return (bool(r) and "error" not in r and r.get("arm") == arm
+            and r.get("module_loading_after") == REGISTERED1F["lazy"]
+            and r.get("tp_warm_calls") == (1 if arm == "builtin" else 0))
+
+
+def arm_ok_1f(r, arm, launches):
+    """gfw1f's arm met ITS registered expectation: builtin passes (err 0, 10 ms < spin < 1000 ms, every launch ran, the
+    rows the host truth, T4 pending at issue); nowarm stalls (err 1; every launch still ran)."""
+    if not _arm_valid_1f(r, arm):
+        return False
+    if arm == "builtin":
+        return (r["err"] == 0 and REGISTERED1F["spin_min_ms"] < r["spin_ms"] < REGISTERED1F["spin_max_ms"]
+                and r["launches_done"] == float(launches) and r["rows_ok"] and r["t4_pending_at_issue"])
+    return r["err"] == 1 and r["launches_done"] == float(launches) and r["t4_pending_at_issue"]
+
+
+def verdict_1f(results, launches):
+    """REGISTERED GFW1F: HELD = A passes and B stalls; FALSIFIED = a valid A with err 1 or spin >= 1000 ms;
+    CONTROL_BLIND = A passes, B valid but not stalled; INVALID otherwise."""
+    a, b = results.get("builtin"), results.get("nowarm")
+    if not _arm_valid_1f(a, "builtin"):
+        return "INVALID"
+    if a["err"] == 1 or a["spin_ms"] >= REGISTERED1F["spin_max_ms"]:
+        return "FALSIFIED"
+    if not arm_ok_1f(a, "builtin", launches) or not _arm_valid_1f(b, "nowarm"):
+        return "INVALID"
+    if arm_ok_1f(b, "nowarm", launches):
+        return "HELD"
+    return "CONTROL_BLIND" if b["err"] == 0 else "INVALID"
 # REGISTERED GFW1D (frozen 2026-10-21 before gfw1d; the step script's header holds the same block): GFW1's captured
 # protocol (64 launches behind the spin, no submission wait) in a process with CUDA_DEVICE_MAX_CONNECTIONS=32.
 # PREDICTION if the shared hardware queue is the cause (gfw1c: GFW1 failed with only 64 launches, so not the launch
@@ -159,10 +221,11 @@ def parse_args(argv):
     ap.add_argument("--launches-few", type=int, default=64, help="GFW1: the captured tick's few launches behind the spin")
     ap.add_argument("--hazard-spin", type=int, default=1 << 20, help="R_GFW1x: the spin's bound (rounds)")
     ap.add_argument("--spin-cycles", type=int, default=200_000_000, help="the GPU sleep before the T4 event")
-    ap.add_argument("--arm", default="", choices=("",) + ARMS_1E, help=argparse.SUPPRESS)    # gfw1e's child
+    ap.add_argument("--arm", default="", choices=("",) + ARMS_1E + ARMS_1F, help=argparse.SUPPRESS)  # gfw1e/f child
     ap.add_argument("--arm-out", default="", help=argparse.SUPPRESS)
     ap.add_argument("--cell", default="gfw1", choices=CELLS,
-                    help="gfw1: GFW1 / GFW1e / GFW1n / GFW_T; gfw2: GFW2 / GFW2n; gfw1d: R_GFW1d (REPORT only)")
+                    help="gfw1: GFW1 / GFW1e / GFW1n / GFW_T; gfw2: GFW2 / GFW2n; gfw1d: R_GFW1d, gfw1e: R_GFW1e, "
+                         "gfw1f: R_GFW1f (REPORT only)")
     ap.add_argument("--takes", type=int, default=6496, help="gfw2: the takes of the tick (B2: ~6.49 k)")
     ap.add_argument("--l2-layers", type=int, default=4)
     ap.add_argument("--l2-batch", type=int, default=64)
@@ -172,6 +235,8 @@ def parse_args(argv):
     ap.add_argument("--l2-x", type=int, default=32)
     ap.add_argument("--l2-sleep-cycles", type=int, default=50_000_000, help="the GPU sleep before the T3 / T4 events")
     a = ap.parse_args(argv)
+    if a.arm and a.arm not in dict(gfw1e=ARMS_1E, gfw1f=ARMS_1F).get(a.cell, ()):
+        ap.error("--arm %s is not an arm of the cell %s" % (a.arm, a.cell))
     npos = a.l2_c + a.l2_x
     if (a.l2_layers < 1 or a.takes < a.l2_layers or a.takes % a.l2_layers
             or a.takes // a.l2_layers > a.l2_batch * a.l2_heads * (npos - 1) or a.l2_s_host < 64 * 2
@@ -258,11 +323,14 @@ def plan_ok(vecs, B=B_T, H=H_T, M=M_T, nblk=NBLK_T):
 
 
 # ------------------------------------------------------------------------------------------------ GFW1 / GFW1n
-def gfw1(GF, SCG, ext3, planted, max_spin, spin_cycles, launches, threads, wait_submission=False, warm=False):
-    """GTG1 as a gate (module docstring: GFW1 / GFW1e / GFW1n / R_GFW1x / gfw1e). wait_submission: the host waits until
-    the job is submitted before the spin (GFW1e). warm (gfw1e's arm b): before the spin, one add_ on the main stream and
-    one index_copy_ + one int64 index_put_ on the transport's scatter stream (the kernels the launches and the worker
-    use behind the spin), then a synchronize. Returns its observations."""
+def gfw1(GF, SCG, ext3, planted, max_spin, spin_cycles, launches, threads, wait_submission=False, warm=False,
+         tp_warm_up=False):
+    """GTG1 as a gate (module docstring: GFW1 / GFW1e / GFW1n / R_GFW1x / gfw1e / gfw1f). wait_submission: the host
+    waits until the job is submitted before the spin (GFW1e). warm (gfw1e's arm b): before the spin, one add_ on the
+    main stream and one index_copy_ + one int64 index_put_ on the transport's scatter stream (the kernels the launches
+    and the worker use behind the spin), then a synchronize. tp_warm_up: the transport's own warm-up (GilfreeTransport
+    warm_up, the production default since r2-gfw-warm); False here by default, so the cells gfw1 / gfw1d / gfw1e keep
+    the protocol they were registered with; gfw1f sets it per arm. Returns its observations."""
     import torch
     dev = torch.device("cuda")
     L, Bp, Hp, Dp, nblk, npos, BS = 2, 2, 2, 64, 16, 12, 64
@@ -272,7 +340,8 @@ def gfw1(GF, SCG, ext3, planted, max_spin, spin_cycles, launches, threads, wait_
     sk = [torch.zeros(Bp, npos * BS, Hp, Dp, device=dev) for _ in range(L)]
     sv = [torch.zeros(Bp, npos * BS, Hp, Dp, device=dev) for _ in range(L)]
     gf = GF.GilfreeTransport(ext3, host_k, host_v, sk, sv, BS, Dp, threads=threads,
-                             host_wait=lambda ev: ev.synchronize(), cap_groups=4, worker="cpp")
+                             host_wait=lambda ev: ev.synchronize(), cap_groups=4, worker="cpp",
+                             warm_up=bool(tp_warm_up))
     board = SCG.GenBoard(L, Bp, Hp, npos, dev)
     gf.attach_board(board)
     if planted:
@@ -284,7 +353,9 @@ def gfw1(GF, SCG, ext3, planted, max_spin, spin_cycles, launches, threads, wait_
     err = torch.zeros((), dtype=torch.int32, device=dev)
     x = torch.zeros((), device=dev)
     kern = SCG._wait_kernel()
-    kern[(1,)](board.t, torch.full_like(idx, -1), gen, idx.shape[0], err, max_spin, BLOCK=1024)   # compile, no spin
+    # C's 74c7d9b (on r2-gfw-warm through 9508109): the kernel takes a spin-round counter (spins_ptr) before BLOCK
+    spins = torch.zeros((1,), dtype=torch.int64, device=dev)
+    kern[(1,)](board.t, torch.full_like(idx, -1), gen, idx.shape[0], err, max_spin, spins, BLOCK=1024)   # compile
     warmed = None
     if warm:                                                   # gfw1e (b): the kernels behind the spin, loaded first
         wx = torch.zeros((), device=dev)
@@ -314,7 +385,7 @@ def gfw1(GF, SCG, ext3, planted, max_spin, spin_cycles, launches, threads, wait_
         gf.wait_submitted(trs[0])
         submission_wait_ms = 1e3 * (time.perf_counter() - t1)
     e0.record()
-    kern[(1,)](board.t, idx, gen, idx.shape[0], err, max_spin, BLOCK=1024)
+    kern[(1,)](board.t, idx, gen, idx.shape[0], err, max_spin, spins, BLOCK=1024)
     e1.record()
     for _ in range(int(launches)):
         x.add_(1.0)
@@ -335,7 +406,8 @@ def gfw1(GF, SCG, ext3, planted, max_spin, spin_cycles, launches, threads, wait_
                 issue_ms=round(issue_ms, 3), enqueue_ms=round(enqueue_ms, 3), launches=int(launches),
                 wait_submission=bool(wait_submission),
                 submission_wait_ms=None if submission_wait_ms is None else round(submission_wait_ms, 3),
-                warmed=warmed, board=[int(v) for v in board.t.view(-1)[idx].tolist()],
+                warmed=warmed, tp_warm_calls=int(gf.warm_calls), tp_warmed=gf.warmed, spin_rounds=int(spins.item()),
+                board=[int(v) for v in board.t.view(-1)[idx].tolist()],
                 want=[int(v) for v in gen.tolist()])
 
 
@@ -569,9 +641,11 @@ def gfw2(GF, SCG, ext3, a):
 
 
 def run_arm_1e(a) -> int:
-    """gfw1e's CHILD (a fresh process, its environment from child_env_1e): records CUDA_MODULE_LOADING before torch is
-    imported and after torch's CUDA init, runs ONE arm of GFW1's captured protocol (eager: as is; warm: with the
-    warm-up), and writes its observations to --arm-out (the parent reads them)."""
+    """gfw1e's / gfw1f's CHILD (a fresh process, its environment from child_env_1e / child_env_1f): records
+    CUDA_MODULE_LOADING before torch is imported and after torch's CUDA init, runs ONE arm of GFW1's captured protocol
+    (gfw1e eager: as is; gfw1e warm: with the gate's warm-up; gfw1f builtin: the transport's own warm-up on; gfw1f
+    nowarm: off; the gate's warm-up only in gfw1e's warm arm), and writes its observations to --arm-out (the parent
+    reads them)."""
     out = dict(arm=a.arm, module_loading_before=os.environ.get(REGISTERED1E["env"]))
     try:
         import torch
@@ -581,7 +655,7 @@ def run_arm_1e(a) -> int:
         gp3 = by_path(os.path.join(a.v3, "gilfree_pack.py"), "gilfree_pack_v3_gate")
         ext3 = gp3.load(a.v3_build)                            # the parent built it: loaded, not rebuilt
         r = gfw1(GF, SCG, ext3, False, 1 << 24, a.spin_cycles, a.launches_few, a.threads, wait_submission=False,
-                 warm=(a.arm == "warm"))
+                 warm=(a.arm == "warm"), tp_warm_up=(a.arm == "builtin"))
         r.update(out)
         out = r
     except Exception as e:
@@ -594,7 +668,7 @@ def run_arm_1e(a) -> int:
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     a = parse_args(argv)
-    if a.arm:                                                  # gfw1e's child (its --out is the parent's)
+    if a.arm:                                                  # gfw1e's / gfw1f's child (its --out is the parent's)
         return run_arm_1e(a)
     if os.path.exists(a.out):
         print("REFUSED: --out %s exists" % a.out, file=sys.stderr)
@@ -659,6 +733,36 @@ def main(argv=None) -> int:
             v = verdict_1e(res["R_GFW1e"], a.launches_few)
             gates.append(gate("R_GFW1e", v == "HELD", False, "%s: REGISTERED GFW1E (lazy module loading is the cause: "
                                                            "both arms pass)" % v))
+            save()
+        if ready and a.cell == "gfw1f":                        # REPORT only: the production transport's warm-up
+            res["R_GFW1f"] = {}
+            for arm in ARMS_1F:
+                log("R_GFW1f_%s (a fresh process)" % arm)
+                path = os.path.join(a.out, "arm_%s.json" % arm)
+                cmd = [sys.executable, os.path.abspath(__file__)] + list(argv) + ["--arm", arm, "--arm-out", path]
+                t0 = time.time()
+                try:
+                    p = subprocess.run(cmd, env=child_env_1f(os.environ, arm), timeout=600)
+                    r = json.load(open(path)) if os.path.exists(path) else dict(arm=arm, error="no result")
+                    r["child_exit"] = p.returncode
+                except Exception as e:
+                    traceback.print_exc()
+                    r = dict(arm=arm, error="%s: %s" % (type(e).__name__, str(e)[:300]))
+                r["child_wall_s"] = round(time.time() - t0, 1)
+                res["R_GFW1f"][arm] = r
+                gates.append(gate("R_GFW1f_" + arm, arm_ok_1f(r, arm, a.launches_few), False, (
+                    "expected %s; CUDA_MODULE_LOADING before torch %r, after its CUDA init %r; transport warm-up calls "
+                    "%s (%s); err %s, launches %s/%d, spin %s ms (bound %d), rows %s, T4 pending at issue %s, enqueue "
+                    "%s ms; child exit %s, %s s%s" % (
+                        "PASS (err 0, spin < 1000 ms)" if arm == "builtin" else "STALL (err 1, the control)",
+                        r.get("module_loading_before"), r.get("module_loading_after"), r.get("tp_warm_calls"),
+                        r.get("tp_warmed"), r.get("err"), r.get("launches_done"), a.launches_few, r.get("spin_ms"),
+                        1 << 24, r.get("rows_ok"), r.get("t4_pending_at_issue"), r.get("enqueue_ms"),
+                        r.get("child_exit"), r.get("child_wall_s"), ("; ERROR " + r["error"]) if "error" in r else ""))))
+                save()
+            v = verdict_1f(res["R_GFW1f"], a.launches_few)
+            gates.append(gate("R_GFW1f", v == "HELD", False, "%s: REGISTERED GFW1F (the production transport's built-in "
+                                                           "warm-up passes; without it the control stalls)" % v))
             save()
         if ready and a.cell == "gfw1d":                        # REPORT only: the shared-hardware-queue hypothesis
             log("R_GFW1d")

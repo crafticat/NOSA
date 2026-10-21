@@ -46,14 +46,26 @@
 # PREDICTION if CUDA's lazy module loading is the cause: both arms pass (err 0, a real spin > 10 ms, rows right)
 # FALSIFIER: either arm ends at the spin's bound (err 1)
 # REGISTERED GFW1E END
+# CELL gfw1f (REPORT only; GFW_ready stays MUST): gfw1e's result made production. gfw1e (holder 2190876, 372fe55):
+# eager stalled (err 1, spin 7255 ms), warm passed (err 0, spin 143 ms): the first call of the scatter operations is the
+# cause. The transport (nosi/nosi/r2_transport_gilfree.py) now warms up in its constructor (warm_up=True, the default).
+# Two arms of GFW1's captured protocol (no submission wait, 64 launches), each in a FRESH child process with lazy
+# loading: builtin (the production transport) and nowarm (warm_up=False, the control). The gate's own warm-up is off.
+# REGISTERED GFW1F BEGIN
+# frozen 2026-10-21 before gfw1f; GFW1's captured protocol, no submission wait, arm builtin and arm nowarm, lazy loading
+# PREDICTION: arm builtin passes (err 0, 10 ms < spin < 1000 ms, every launch ran, rows right, warm_calls 1)
+# PREDICTION: arm nowarm stalls as the control (err 1 at the spin's bound, warm_calls 0)
+# FALSIFIER: arm builtin ends with err 1 or a spin >= 1000 ms
+# CONTROL_BLIND: arm builtin passes and arm nowarm passes too (the warm-up's role not shown)
+# REGISTERED GFW1F END
 # The pattern of benchmarks/Efficiency/r2_fetch_fg_step.sh (feature/nosi-r2-m2-fg): the GPU uuid from
 # HOLDERS/<holder job id>.gpu_uuid; packer v2 (gilfree_pack.py / .cpp of f2b981a) pinned by commit, path and blob;
 # packer v3 = the blobs of benchmarks/Efficiency/gilfree_pack.{py,cpp} at --nosi; both copied into the step record and
 # loaded by path (built into the step's JIT directory). No model, no workload.
 # SOURCE ONLY until reviewed: it never submits, renews, cancels or replaces an allocation, never retries.
 #
-#   bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id> [gfw1|gfw2|gfw1d|gfw1e]
-#   DRYRUN=1 bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id> [gfw1|gfw2|gfw1d|gfw1e]
+#   bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id> [gfw1|gfw2|gfw1d|gfw1e|gfw1f]
+#   DRYRUN=1 bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id> [gfw1|gfw2|gfw1d|gfw1e|gfw1f]
 #        (login node: the pin checks and the printed step command; no squeue, claim, srun or write)
 #   In DRYRUN only, GFW_HOLDERS=<dir> replaces HOLDERS (the CPU test uses it); a real run refuses GFW_HOLDERS.
 #
@@ -64,7 +76,7 @@
 # 124 / 137 the host timeout; 1 a STOP before the launch (a missing or malformed uuid file included); 5 an exit-0 step
 # whose record is incomplete or whose sacct row is not COMPLETED 0:0.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw1e                                                    # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw-warm                                                 # ROOT
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -82,7 +94,7 @@ STEP_MIN=12
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 GFW step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_gfw_step.sh --nosi <sha> <holder> <run id> [gfw1|gfw2|gfw1d|gfw1e]" >&2; exit 2; }
+usage() { echo "usage: r2_gfw_step.sh --nosi <sha> <holder> <run id> [gfw1|gfw2|gfw1d|gfw1e|gfw1f]" >&2; exit 2; }
 { [ $# = 4 ] || [ $# = 5 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4 CELL=${5:-gfw1}
 CELL_ENVS=()
@@ -94,6 +106,7 @@ case $CELL in
     gfw1d) CELL_ARGS=(--launches-few 64 --spin-cycles 200000000)
            CELL_ENVS=(--env CUDA_DEVICE_MAX_CONNECTIONS=32) ;;
     gfw1e) CELL_ARGS=(--launches-few 64 --spin-cycles 200000000) ;;   # the gate sets each child's loading itself
+    gfw1f) CELL_ARGS=(--launches-few 64 --spin-cycles 200000000) ;;   # lazy loading in both children (the gate)
     *) usage ;;
 esac
 DRY=${DRYRUN:-0}
