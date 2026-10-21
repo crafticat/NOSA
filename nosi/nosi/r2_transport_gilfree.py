@@ -38,6 +38,17 @@ when more than one thread is asked; every release reports the team it used (thre
 REFUSES a release whose team differs from the request (v1's defect: a serial loop, unseen until its stats were read).
 The OpenMP team is created by the calling thread and inherits its CPU affinity: with background=True the adapter runs
 the releases in ONE feeder thread pinned to `cores` (os.sched_setaffinity) before its first release.
+THE FEEDER THREAD'S MODES (SG5 p2 on holder 2190876, 2026-10-21: "Inplace update to inference tensor outside
+InferenceMode is not allowed", raised by the packer's index_copy_ into the store in the feeder). torch's inference mode,
+grad mode and current CUDA device are THREAD-LOCAL; a new thread starts with the defaults (inference mode off).
+- The feeder enters, around its whole loop, the inference mode that the release's in-place writes need: on when the
+  constructing thread was in inference mode or any store, host or ring tensor is an inference tensor. It enters the
+  constructing thread's grad mode (off under inference mode) and, on the GPU, the store's device.
+- Every CUDA operation of a release names its stream (the extension's copy and scatter streams; the publication under
+  torch.cuda.stream(scatter); scatter.wait_event), so the thread's current stream is never used.
+- The OpenMP team's threads copy raw bytes only (pack_range: no tensor operation, no dispatcher state).
+- thread_modes=False (NEGATIVE CONTROL, tests only): the feeder keeps the thread's defaults.
+- The synchronous mode (background False) runs in the caller's thread with the caller's modes.
 """
 from __future__ import annotations
 
@@ -67,7 +78,8 @@ class GilfreeTransport:
 
     def __init__(self, ext, host_k: Sequence[torch.Tensor], host_v: Sequence[torch.Tensor], slots_k, slots_v, bs: int,
                  D: int, threads: int, host_wait: Callable[[Any], None], cap_groups: int = 256, ring: int = 2,
-                 cores: Optional[Sequence[int]] = None, background: bool = False, skip_hist_wait: bool = False):
+                 cores: Optional[Sequence[int]] = None, background: bool = False, skip_hist_wait: bool = False,
+                 thread_modes: bool = True):
         if not 1 <= int(threads) <= 256:
             raise ValueError("threads must be in 1 .. 256 (got %r)" % (threads,))
         if int(threads) > 1 and int(getattr(ext, "OPENMP", 0)) != 1:
@@ -126,6 +138,13 @@ class GilfreeTransport:
         self.background = bool(background)
         self.board = None                                      # the generation board (attach_board), or None
         self._error: Optional[BaseException] = None
+        # the feeder thread's modes (module docstring): thread-local in torch, so recorded here and entered there
+        self.thread_inference = bool(torch.is_inference_mode_enabled()) or any(
+            t.is_inference() for t in list(slots_k) + list(slots_v) + self.host_k + self.host_v + [stage, land])
+        self.thread_grad = False if self.thread_inference else bool(torch.is_grad_enabled())
+        self.thread_device = dev if self.cuda else None
+        self.thread_modes = bool(thread_modes)                 # NEGATIVE CONTROL (tests only) when False
+        self.feeder_seen: Optional[Dict[str, bool]] = None     # the modes the feeder ran with (tests, reports)
         if self.background:
             self._q: "queue.Queue" = queue.Queue()
             self._cores = list(cores) if cores else None
@@ -136,6 +155,16 @@ class GilfreeTransport:
     def _feeder(self) -> None:
         if self._cores:
             os.sched_setaffinity(0, self._cores)               # the OpenMP team inherits this thread's affinity
+        if not self.thread_modes:                              # NEGATIVE CONTROL: the new thread's defaults
+            self._feed()
+            return
+        if self.thread_device is not None:
+            torch.cuda.set_device(self.thread_device)
+        with torch.inference_mode(self.thread_inference), torch.set_grad_enabled(self.thread_grad):
+            self._feed()
+
+    def _feed(self) -> None:
+        self.feeder_seen = dict(inference=bool(torch.is_inference_mode_enabled()), grad=bool(torch.is_grad_enabled()))
         while True:
             item = self._q.get()
             if item is None:

@@ -290,3 +290,45 @@ def test_GT5b_a_geometry_outside_the_contract_is_refused_at_construction(pinned)
             ((Bp, s_host, Hp, Dp), (Bp + 1, n_slots * BS, Hp, Dp), "must both be TOKEN-MAJOR")):
         with pytest.raises(ValueError, match=match):
             build(host_shape, store_shape)
+
+
+@pytest.mark.parametrize("where", ["built_in_inference_mode", "inference_tensors_only"])
+def test_GT6_the_feeder_thread_enters_the_inference_mode(pinned, where):
+    """GT6 (SG5 p2 on holder 2190876: "Inplace update to inference tensor outside InferenceMode is not allowed", raised
+    by the packer in the feeder thread): torch's inference mode is THREAD-LOCAL. The host rows and the store are made
+    under torch.inference_mode() on the main thread (as the tick makes them); built_in_inference_mode: the adapter too;
+    inference_tensors_only: the adapter is built outside inference mode from those inference tensors. The releases run
+    in the BACKGROUND feeder thread: it enters inference mode (grad off), and a two-request plan lands the host truth.
+    Negative control: thread_modes=False (the feeder keeps a new thread's defaults: inference off, grad on) reproduces
+    the run's error, re-raised at force()."""
+    def build(thread_modes):
+        with torch.inference_mode():
+            host_k, host_v, gk, gv, _, _ = _world()
+            gf = None
+            if where == "built_in_inference_mode":
+                gf = GF.GilfreeTransport(pinned.ext, host_k, host_v, gk, gv, BS, D, threads=2, host_wait=lambda ev: None,
+                                         cap_groups=4, background=True, thread_modes=thread_modes)
+        assert host_k[0].is_inference() and gk[0].is_inference()
+        if gf is None:
+            gf = GF.GilfreeTransport(pinned.ext, host_k, host_v, gk, gv, BS, D, threads=2, host_wait=lambda ev: None,
+                                     cap_groups=4, background=True, thread_modes=thread_modes)
+        return gf, host_k, host_v, gk, gv
+    groups = [(0, 0, 3, 1), (1, 1, 4, 2), (1, 0, NB - 1, NPOS - 1), (0, 1, 0, 0), (1, 1, 7, 5)]
+    gf, host_k, host_v, gk, gv = build(True)
+    assert gf.thread_inference and not gf.thread_grad
+    with torch.inference_mode():
+        trs = _transfers(0, groups, 0)
+        gf.issue(0, trs)
+        for tr in trs:
+            gf.force(tr)
+    gf.close()
+    assert gf.feeder_seen == dict(inference=True, grad=False)
+    assert _truth_ok(gk, gv, host_k, host_v, [(0, groups)]) and gf.threads_ok() and gf.stats["groups"] == len(groups)
+    gf2, _, _, _, _ = build(False)
+    with torch.inference_mode():
+        trs2 = _transfers(0, groups, 10)
+        gf2.issue(0, trs2)
+        with pytest.raises(RuntimeError, match="Inplace update to inference tensor outside InferenceMode"):
+            gf2.force(trs2[0])
+    gf2.close()
+    assert gf2.feeder_seen == dict(inference=False, grad=True)
