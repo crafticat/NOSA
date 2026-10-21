@@ -120,7 +120,7 @@ us each: 6-10 ms) and the fused union's groups (once per tick) in the res span. 
   arms carry the same 32 host reads per tick of the selection check and the same arrival-lag waits.
 - REPORT `residency.report.b2.fused` of the full arm: err 0, launches_per_layer between 3.0 and 6.0.
 
-### 5.4 stack1b (B 264, the largest B the xpool model admits)
+### 5.4 stack1b (B 264, the largest B the xpool model admits) [SUPERSEDED by 5.4b: kept for the record only]
 
 The B (MODEL, docs/R2_XPOOL_PLAN.md section 4.1, X_pool 64 rows): B at 84 GB is 265.6 (case A, F 16.37 GB, the most
 conservative X_pool-64 row) to 287.8 (case B, F 13.12). B 264 is below the most conservative value (the largest
@@ -168,10 +168,46 @@ was two engines).
 | device | 130-200 ms | GEMMs at 864 rows (2.2-3.4x), attention x 3.375 |
 | T_tick | 0.6-1.2 s, point 0.85 s | sum |
 | tok_per_s | 155-315 | 0.87 x 216 / (0.6-1.2 s) |
-| comparison | REPORT | bigb96-216's T_tick (bigb_core.tick_bands(216)) over stack1b's; protocol differs: stack1b 48 steps, free timing, shipped child at B 64; bigb96-216 24 steps, lag 2, no shipped child |
+| comparison | REPORT | bigb96-216's T_tick (bigb_core.tick_bands(216)) over stack1b's; protocol differs: stack1b 48 steps, free timing, shipped child at B 64, gilfree WARM-UP ON (integ3, review m1); bigb96-216 24 steps, lag 2, no shipped child, NO warm-up (bigb 91e2fef does not contain 000870e) |
 
 F-ST4 now reads: an out-of-memory error, or peak above 78 GB (the model is wrong at the stack); T_tick outside
 0.6-1.2 s.
+
+### 5.4c integ3 (2026-10-21T12:53:53Z, before any stack1 run): review-integ2-be3eea9 M1-M5
+
+Branch r2-integ3 (/mnt/beegfs/ojerbi/nosi-r2-integ3, from be3eea9); NOSI_INTEG now points here.
+- M1 (localisation): cells `stack1n-<c>` for c in twin, rebuild, resolve, layout, attn, warmup = stack1a with
+  `--stack full-no-<c>` (layout: no `--X-pool`, no `--require-xregion`). The fused dispatch gate
+  (`_draft_only_fused_dispatch`: 3.0 launches per layer) is REPORT (`R_` prefix) in a stack cell until FR-g2 measures
+  it; in the frg cells it stays MUST.
+- M2 (acted): per stack arm, MUST `<label>_ST_acted_<c>` for each component ON and `<label>_ST_off_<c>` for each OFF:
+  twin_variant "fused"; a batched rebuild call with >= 2 publications (TickEngine.batched_calls / batched_max, host
+  counters); fused launches and layers > 0; pool binds > 0 and lanes HANDED between requests > 0 (XPool.handoffs, a
+  device counter in bind: the new slot's request differs from the lane's last binder); shared calls > 0 with the fused
+  union only and union-saved row pages > 0 (SharedKV.pages_saved, opt-in device counter); warm_calls == 1. The pool's
+  shared X region: `<label>_ST_xregion` = the per-(layer, head) peak lanes exceed B x C, MUST with `--require-xregion`
+  (stack1a, stack1p, stack1n-* but layout). Evidence that p5b2's point reaches it: x1's peak over every (layer, head)
+  was 6208 = A > 6144 (layer 9 head 0; 17 of 64 pairs above 6144; SCORING_x1.md item 8). The review's "max 6007" was
+  layer 0's entry only (head 1), not the maximum over pairs. A pressure point stack1p (C 80) is added as a diagnostic.
+- M3 (stop rule on values): `--stack-bands 33:36:220:450` on stack1t writes `stack_bands.txt` (meta.peak_gb and the
+  point's T_tick_ms against the bands, "STACK_BANDS_VERDICT IN|OUT"; OUT also on a failed MUST or a missing value);
+  the combined cell `stack1` runs stack1a (on failure: the six stack1n-<c>, then STOP), stack1p (diagnostic),
+  stack1t (STOP on a nonzero exit), then STOPS with exit 6 unless that file holds "STACK_BANDS_VERDICT IN", then
+  stack1b.
+- M4 (CPU production context): ST9 runs the forced pressure round with the shared Triton KERNEL and the fused union
+  KERNEL against piece 3's KERNEL (interpreter), under inference_mode, with the gilfree feeder thread and B2
+  unchecked, plus a pool-path fault that changes LOGITS (one translated page one position off). ST1's claim is scoped
+  (the twins in that round).
+- M5 (bind compare): check mode keeps a SHADOW XPool bound by S-C's rule from the torch path's decisions; per layer
+  the lane maps (pos_of, occ) are compared and the reference bias rows are filled on the shadow lanes. ST4b plants a
+  fused-only bind fault.
+- MINOR: stale B 264 text marked superseded (5.4, F-ST4, section 6, step header); the warm-up difference vs bigb96-216
+  in 5.4b's table; L28 stride check in `bi_paged_decode_shared` (stride(-1) 1, entries dense, stride(0) 0 or the entry
+  size); T21 also counts every GB.gate in one_point and the helpers it extends from; the step header notes that the
+  other families' cells run only from their own roots.
+
+THE COMMAND (from /mnt/beegfs/ojerbi/nosi-r2-integ3 at the integ3 commit):
+`bash benchmarks/Efficiency/r2_tick_sg5_step.sh --nosi <integ3 sha> <holder> <run id> stack1`
 
 ### 5.5 Falsifiers (each stops the claim it names)
 
@@ -181,8 +217,11 @@ F-ST4 now reads: an out-of-memory error, or peak above 78 GB (the model is wrong
 - F-ST3 stack1t T_tick outside 0.22-0.45 s; then each term against its band names the component whose model is wrong
   (twin outside 2-6 ms: p6's fused twin; REST outside 30-110 ms: the batched rebuild; res outside 20-80 ms: the
   fused resolve / pool / keys model; device outside 45-70 ms: sharedkv).
-- F-ST4 stack1b: an out-of-memory error (device or host), or peak above 84 GB: the B model is wrong at the stack;
-  T_tick outside 0.7-1.5 s: the B scaling model is wrong (end_tick is the largest assumed term).
+- F-ST4 stack1b (B 216; the B 264 wording of integ is SUPERSEDED): an out-of-memory error (device or host), or peak
+  above 78 GB: the B model is wrong at the stack; T_tick outside 0.6-1.2 s: the B scaling model is wrong (end_tick is
+  the largest assumed term).
+- F-ST6 [integ3] any `_ST_acted_<c>` / `_ST_off_<c>` / `_ST_xregion` MUST fails: that component did not act (or was not
+  removed) in the arm; the equality claim does not cover it.
 - F-ST5 `transport_warm_calls` != 1 or a gilfree stall (a spin at its bound) in any arm.
 
 ## 6. Doubts (not claims)
@@ -195,12 +234,18 @@ F-ST4 now reads: an out-of-memory error, or peak above 78 GB (the model is wrong
   it (`--shared-unchecked`): the precondition is checked only in stack1a.
 - `--gilfree-warm-up` defaults to on (the transport's default after 000870e), so every SG5 cell run from this branch
   warms up; the stack's OFF value (warm-up off) is p5b2's code path.
-- The res and B 264 terms are MODEL with wide bands; end_tick at B 264 (B2's host consumer) is an assumption of
-  linear scaling, not a measurement.
-- B 264 needs about 141 GB of pinned host rows; whether the holder's allocation admits `--mem=240G` is not checked
-  here (srun refuses at launch if not).
-- `--repeat-docs` tiles the 94 documents at B 264, so requests repeat; the shared kernel's union is per request, so
+- The res and B 216 terms are MODEL with wide bands; end_tick at B 216 (B2's host consumer) is an assumption of
+  linear scaling, not a measurement. (integ's B 264 lines are superseded by 5.4b.)
+- B 216 needs about 116 GB of pinned host rows; `--mem=240G` (the holder has 480G).
+- `--repeat-docs` tiles the 94 documents at B 216, so requests repeat; the shared kernel's union is per request, so
   repeats do not share reads.
+- [integ3, review m2] r2_residency.py imports r2_xpool at module import, which imports triton on every default path:
+  harmless on the GPU; on the CPU the first triton import moves earlier (L36: the CPU children set TRITON_INTERPRET
+  before any import).
+- [integ3, review m4] `peak_gb_cum` is the CUDA peak since the last reset: in the compare / both arms `_reset_peak`
+  resets it per arm, so it is per arm there; meta.peak_gb (with _PEAK) is the run's peak.
+- [integ3, review m8] stack1a's R ST_tick compares arms that all pay the selection check's per-layer reads: never a
+  speedup claim; stack1t carries the timing.
 - test_r2_tick.py T21 checked one_point's gate names with a lowercase regex that could not see `<label>_SKV_ran`.
   FIXED in integ2: the pattern reads any case, the expected list holds SKV_ran, and a second check fails on a gate
   name the pattern cannot read. fusedres2's FR-g gates (fused_gates) are appended through gates.extend, outside it.

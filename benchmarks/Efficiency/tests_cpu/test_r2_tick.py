@@ -1362,3 +1362,8 @@ def test_T21_sc_counters_are_a_report_only_snapshot(p3):
     names = sorted(set(re.findall(r'GB\.gate\("%s_([A-Za-z0-9_]+)"', op)))      # [integ2] any case: SKV_ran too
     assert names == ["SKV_ran", "bookkeeping", "completed", "gilfree_team"], names  # [integ] SKV_ran: --attn shared
     assert not re.findall(r'GB\.gate\("%s_[^A-Za-z0-9_"]', op), "a gate name the pattern above would not read"
+    # [integ3] review-integ2 m6: every GB.gate( in one_point uses that "%s_<name>" form (no label + "...", no "R_%s",
+    # no other first argument); the helpers' gates (fused_gates, stack_acted_gates) come in through gates.extend
+    assert op.count("GB.gate(") == len(re.findall(r'GB\.gate\("%s_[A-Za-z0-9_]+" % label', op)), \
+        "a GB.gate in one_point that the name check does not read"
+    assert sorted(set(re.findall(r"gates\.extend\((\w+)\(", op))) == ["fused_gates", "stack_acted_gates"]

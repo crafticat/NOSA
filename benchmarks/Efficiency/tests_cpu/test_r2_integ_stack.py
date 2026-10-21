@@ -17,7 +17,20 @@ ST1  THE FULL STACK EQUALS THE DEFAULT STACK BITWISE on a teacher-forced round (
      precondition is asserted on the full arm BEFORE the claim (L34): evictions > 0; a pool lane changed hands
      between two requests; the shared kernel ran (keyed calls with >= 2 rows) with the FUSED union build only; the
      fused resolve launched kernels with err 0; the twins are the fused ones; a batched rebuild call published >= 2
-     banks; the warm-up ran once.
+     banks; the warm-up ran once. SCOPE ([integ3], review-integ2 M4): the attn component runs the shared kernel's
+     torch TWIN and the fused union's torch twin in this round (impl "reference"), the transport synchronously, B2
+     checked, no inference mode; the production context is ST9's.
+ST9  [integ3] THE PRODUCTION CONTEXT (review M4): the same forced pressure round with the shared Triton KERNEL and the
+     fused union KERNEL (TRITON_INTERPRET) against piece 3's KERNEL, under torch.inference_mode, the gilfree FEEDER
+     thread (background), B2 UNCHECKED: full == default bitwise, every component acted; and a pool-path fault that
+     changes LOGITS (one translated page one position off at the 9th translate call; L34 precondition: the entry
+     changed) is caught with its first difference in the logits.
+ST4b [integ3] review M5: check mode compares the fused lane map with a SHADOW pool bound by S-C's rule from the torch
+     path's decisions (and fills the reference bias rows on the shadow lanes); a planted fused-only bind fault (one
+     bind one slot off; precondition: the map changed) is reported as a difference.
+ST10 [integ3] the GPU witnesses (review M2): XPool's handoff counter and per-(layer, head) peak, the engine's batched
+     counters, SharedKV's pages_saved; stack_acted / stack_acted_gates; the fused dispatch gate is REPORT in a stack
+     cell (M1); stack_bands_verdict and write_stack_bands (M3).
 ST2  THE 2^k-LITE MATRIX: full minus each one component (six arms) also equals the default, and in each arm the
      removed component is really OFF (its precondition does not hold) while the others stay ON.
 ST3  NEGATIVE CONTROL of the matrix comparison: the full stack with the fused resolve's plant 2 (a draft grant takes
@@ -123,16 +136,26 @@ C, X, R_VER, LAG = 8, 40, 4, 2                       # the PRESSURE point (test_
 COMPONENTS = ("twin", "rebuild", "resolve", "layout", "attn", "warmup")
 
 
+CTX = dict(impl="reference", background=False, checked=True)    # [integ3] the "real" part: kernel, feeder, unchecked
+
+
 def build(on, plant=0, resolve_mode="fused"):
-    """make_res_engine's / make_pool_engine's world with the components in `on` switched ON; every arm: b2 (checked),
-    the gilfree transport (pinned v2, Python worker, synchronous), the arrival lag LAG, TickEngine(check=True)."""
+    """make_res_engine's / make_pool_engine's world with the components in `on` switched ON; every arm: b2 (checked
+    unless CTX says otherwise), the gilfree transport (pinned v2, Python worker, synchronous unless CTX["background"]),
+    the arrival lag LAG, TickEngine(check=True). CTX["impl"] "kernel" ([integ3] review M4): piece 3's Triton KERNEL in
+    the default arms and the shared Triton kernel + the fused union KERNEL in the attn arms (the interpreter)."""
     base_ops = TT.make_ops(P3)
+    if CTX["impl"] == "kernel":
+        base_ops = SimpleNamespace(linear=base_ops.linear, mean=base_ops.mean,
+                                   attn=SimpleNamespace(bi_paged_decode=P3.bi_paged_decode,
+                                                        build_page_table=P3.build_page_table))
     sk = None
     ops = base_ops
     if "attn" in on:
-        sk = SKM.SharedKV(P3, mode="split", impl="reference", union="fused")
+        sk = SKM.SharedKV(P3, mode="split", impl=CTX["impl"], union="fused")
+        sk.count_saved = True
         ops = SimpleNamespace(linear=base_ops.linear, attn=sk, mean=base_ops.mean)
-    ref = TT.make_engine(base_ops, S_list=TT.S_TINY, steps=TT.STEPS, seed=1)
+    ref = TT.make_engine(TT.make_ops(P3), S_list=TT.S_TINY, steps=TT.STEPS, seed=1)
     S_list = TT.S_TINY
     B, NBr = len(S_list), C + X
     n_host = (ref.NB + 1) * BS
@@ -176,10 +199,11 @@ def build(on, plant=0, resolve_mode="fused"):
                         rebuild="batched" if "rebuild" in on else "per_call")
     be = TT.Be()
     tp = GF.GilfreeTransport(EXT, host_k, host_v, sk_, sv_, BS, TT.D, threads=2, host_wait=be.host_wait, xpool=xp,
-                             warm_up="warmup" in on)
+                             warm_up="warmup" in on, background=CTX["background"])
     cis = [t.total_cis[:B] for t in eng.twins]
     args = (TT.NL_LAYERS, B, TT.HKV, C, X, R_VER, tp, RES.TorchGather(host_k, host_v, sk_, sv_))
-    skw = dict(store_b=sb_, cis=cis, block_bytes=BS * 2 * TT.D * 4, host_wait=be.host_wait, arrival_lag=LAG)
+    skw = dict(store_b=sb_, cis=cis, block_bytes=BS * 2 * TT.D * 4, host_wait=be.host_wait, arrival_lag=LAG,
+               checked=CTX["checked"])
     if xp is not None:
         skw["xpool"] = xp
     if "resolve" in on:
@@ -213,8 +237,10 @@ def handoffs(maps, NS):
     return n
 
 
-def run(on, toks, plant=0, resolve_mode="fused"):
+def run(on, toks, plant=0, resolve_mode="fused", hook=None):
     eng, w = build(on, plant, resolve_mode)
+    if hook is not None:                                              # [integ3] a planted fault (its own record)
+        hook(eng, w)
     svc = w.svc
     pages, ticks, maps, batched = [], [], [], []
     resolve0 = svc.resolve
@@ -267,7 +293,11 @@ def run(on, toks, plant=0, resolve_mode="fused"):
                                            compared=fr["compared"], diffs=fr["diffs"], first_diffs=fr["first_diffs"],
                                            d_grant=fr["stats"]["d_grant"]),
         twin=eng.twin_variant, rebuild=eng.rebuild, batched_max=max(batched) if batched else 0,
-        warm_calls=w.tp.warm_calls)
+        warm_calls=w.tp.warm_calls,
+        xpool_handoffs=int(w.xp.handoffs) if w.xp is not None else 0,                 # [integ3] the GPU witnesses
+        xpool_report=w.xp.report() if w.xp is not None else None,
+        pages_saved=int(w.sk.pages_saved) if w.sk is not None and w.sk.pages_saved is not None else 0,
+        eng_batched=[eng.batched_calls, eng.batched_max])
     rec = dict(ticks=ticks, err=err, out=[list(r.out) for r in rnd.reqs] if rnd is not None else None, journal=js,
                mirror=eng.mirror_failures(), stats={k: eng.stats[k] for k in ("ticks", "rows", "rollbacks",
                                                                              "publications", "void_ticks")})
@@ -306,6 +336,56 @@ elif PART == "check":
     rec, pre = run(set(COMPONENTS), toks, resolve_mode="check")
     base, _ = run(set(), toks)
     OUT["check"] = dict(pre=pre, err=rec["err"], diff=first_diff(base, rec))
+    # [integ3] review M5: a fused-path-only BIND fault (the fused pool binds the draft takes one slot off) must show
+    # as a check-mode difference in the lane map; L34 precondition: the planted bind changed the map
+    plant_log = []
+
+    def bind_plant(eng, w):
+        xp = w.xp
+        orig = xp.bind
+
+        def planted(l, bb, hh, slot, mask):
+            if plant_log or not bool((mask.reshape(-1) != 0).any()):
+                return orig(l, bb, hh, slot, mask)
+            clean = xp.clone()                                        # (its __dict__ holds this plant: call the
+            XPM.XPool.bind(clean, l, bb, hh, slot, mask)              # class's bind on the copy)
+            out = orig(l, bb, hh, (slot + 1).clamp(max=xp.n_hist - 1), mask)
+            plant_log.append(dict(l=int(l), changed=not torch.equal(clean.pos_of, xp.pos_of)))
+            return out
+        xp.bind = planted
+    recp, prep = run(set(COMPONENTS), toks, resolve_mode="check", hook=bind_plant)
+    OUT["check_plant"] = dict(pre=prep, err=recp["err"], plant=plant_log)
+elif PART == "real":
+    # [integ3] review M4: the production context on the CPU: the shared Triton KERNEL and the fused union KERNEL
+    # (the interpreter) against piece 3's KERNEL, torch.inference_mode, the gilfree feeder thread, B2 unchecked
+    CTX.update(impl="kernel", background=True, checked=False)
+    with torch.inference_mode():
+        base, pre0 = run(set(), toks)
+        full, pre1 = run(set(COMPONENTS), toks)
+        tlog = []
+
+        def translate_plant(eng, w):                                  # a pool-path fault that changes LOGITS: one
+            xp = w.xp                                                 # translated page of one row goes one position
+            orig = xp.translate                                       # off, at the 9th keyed call (mid-round)
+            calls = [0]
+
+            def planted(l, table, seq_idx):
+                p = orig(l, table, seq_idx)
+                calls[0] += 1
+                if calls[0] == 9 and not tlog:
+                    ok = (p[:, 0, 0] >= 0).nonzero().view(-1)
+                    if ok.numel():
+                        r = int(ok[0])
+                        before = int(p[r, 0, 0])
+                        p = p.clone()
+                        p[r, 0, 0] = (before + 1) % xp.A
+                        tlog.append(dict(call=calls[0], l=int(l), row=r, before=before, after=int(p[r, 0, 0])))
+                return p
+            xp.translate = planted
+        plant, prep = run(set(COMPONENTS), toks, hook=translate_plant)
+    OUT["real"] = dict(none=dict(pre=pre0, err=base["err"], ticks=len(base["ticks"])),
+                       full=dict(pre=pre1, err=full["err"], diff=first_diff(base, full), mirror=full["mirror"]),
+                       plant=dict(log=tlog, err=plant["err"], diff=first_diff(full, plant)))
 print("ST_JSON " + json.dumps(OUT))
 '''
 
@@ -385,13 +465,39 @@ def test_ST3_the_matrix_comparison_sees_a_planted_fault(matrix):
 def test_ST4_fused_resolve_check_mode_on_the_full_stack(p3, pinned):
     if not _has_triton():
         pytest.skip("triton is not installed")
-    r = _child("check", p3, pinned)["check"]
+    out = _child("check", p3, pinned)
+    r = out["check"]
     fu = r["pre"]["fused"]
     assert r["err"] is None, r["err"]
     assert fu is not None and fu["compared"] > 0 and fu["compared"] == fu["layers"], fu
     assert fu["diffs"] == 0 and fu["err"] == 0, (fu["first_diffs"], fu["err"])
     assert r["pre"]["xpool"] and r["pre"]["handoffs"] > 0 and r["pre"]["want_keys"], r["pre"]
     assert r["diff"] is None, r["diff"]
+    # ST4b (review M5): the shadow pool sees a fused-only bind fault
+    p = out["check_plant"]
+    assert p["plant"] and p["plant"][0]["changed"], ("precondition (L34): the planted bind left the map as it was", p)
+    pf = p["pre"]["fused"]
+    assert pf is not None and pf["diffs"] > 0, ("the planted bind fault was NOT seen by check mode", pf)
+    assert any("xpool" in str(d[-1]) or "store_b" in str(d[-1]) for d in pf["first_diffs"]), pf["first_diffs"]
+
+
+# =====================================================================================================================
+# ST9 the production context: real kernels, inference mode, the feeder thread, B2 unchecked (review M4)
+# =====================================================================================================================
+def test_ST9_the_production_context_round_with_the_real_kernels(p3, pinned):
+    if not _has_triton():
+        pytest.skip("triton is not installed")
+    r = _child("real", p3, pinned)["real"]
+    assert r["none"]["err"] is None and r["none"]["ticks"] > 10, r["none"]
+    full = r["full"]
+    on = _on(full["pre"])
+    assert all(on.values()), ("precondition: a component did not act in the production context", on, full["pre"])
+    assert full["pre"]["pages_saved"] > 0, ("precondition: the union never saved a row page", full["pre"])
+    assert full["err"] is None and full["mirror"] == [], (full["err"], full["mirror"])
+    assert full["diff"] is None, ("kernels / feeder / inference mode: the full stack differs", full["diff"])
+    pl = r["plant"]
+    assert pl["log"] and pl["log"][0]["before"] != pl["log"][0]["after"], ("precondition (L34): no entry planted", pl)
+    assert pl["diff"] is not None and pl["diff"][1] == "logits", ("the planted page was not seen in the logits", pl)
 
 
 # =====================================================================================================================
@@ -545,8 +651,8 @@ def test_ST7_the_sg5_stack_presets_and_refusals():
         with pytest.raises(SystemExit):
             G.parse_args(BASE + bad)
     ok = G.parse_args(BASE + ["--backends", "b2", "--stack", "full", "--shared-unchecked", "--repeat-docs",
-                              "--batch", "264", "--shipped-batch", "64"])
-    assert ok.shared_unchecked and ok.shipped_batch == 64 and ok.m_fix == 4 * 264
+                              "--batch", "216", "--shipped-batch", "64"])                   # [integ3] stack1b's B
+    assert ok.shared_unchecked and ok.shipped_batch == 64 and ok.m_fix == 4 * 216
     src = (EFF / "r2_tick_sg5.py").read_text()
     rc = ast.get_source_segment(src, next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef)
                                           and n.name == "run_child"))
@@ -554,6 +660,100 @@ def test_ST7_the_sg5_stack_presets_and_refusals():
     me = ast.get_source_segment(src, next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef)
                                           and n.name == "make_engine"))
     assert 'warm_up=getattr(a, "gilfree_warm_up", "on") == "on"' in me and 'eng.check = bool(getattr(a, "sel_check"' in me
+
+
+def test_ST10_the_gpu_witnesses_and_gates():
+    """[integ3] review M1 / M2 / M3: the witnesses the stack cells read, and their gates."""
+    XP = TT._load("r2_xpool")
+    # XPool's handoff counter and per-(layer, head) peak: request 0 binds lanes, releases them, request 1 takes them
+    xp = XP.XPool(1, 2, 1, 4, mode="pool", C=1, X_pool=3)                   # A = 2 x 1 + 3 = 5
+    z = torch.zeros(4, dtype=torch.int64)
+    xp.bind(0, z, z, torch.arange(4), torch.ones(4, dtype=torch.bool))      # request 0 takes slots 0..3
+    assert int(xp.handoffs) == 0 and int(xp.peak.max()) == 4 and int(xp.err) == 0
+    code = torch.full((1, 2, 1, 4), XP.CODE_FREE, dtype=torch.int64)
+    xp.release_free(code)                                                   # every slot FREE: lanes back
+    one = torch.ones(2, dtype=torch.int64)
+    xp.bind(0, one, torch.zeros(2, dtype=torch.int64), torch.arange(2), torch.ones(2, dtype=torch.bool))
+    assert int(xp.handoffs) == 2, int(xp.handoffs)                          # two lanes went from request 0 to 1
+    rep = xp.report()
+    assert rep["handoffs"] == 2 and rep["max_peak_lanes"] == 4 and rep["shared_region_used"] is True
+    assert rep["pairs_over_base"] == 1                                      # 4 > B x C = 2 at (layer 0, head 0)
+    c = xp.clone()
+    assert int(c.handoffs) == 2 and c.owner is not xp.owner and torch.equal(c.owner, xp.owner)
+    # the engine's batched counters exist from construction (constructor order, C12)
+    src = (NOSI / "r2_tick.py").read_text()
+    init = src[src.index("        self.rebuild = rebuild"):src.index("        self.model, self.ops = model, ops")]
+    assert "self.batched_calls = 0" in init and "self.batched_max = 0" in init
+    # SharedKV's pages_saved (device counter, opt-in): a group case with shared pages saves > 0 row pages
+    T = _shared("test_bi_paged_attention_shared_st", "test_bi_paged_attention_shared.py")
+    sk = T.sk                                                               # the module under test (by path)
+    cse = T.make_group_case(4, "same", rows_per_req=[3, 2, 1, 2])
+    obj = sk.SharedKV(T.bi, mode="split", impl="reference", union="torch")
+    obj.bi_paged_decode(*T.args_of(cse), page_key=cse["key"], rows_max=3)
+    assert obj.pages_saved is None                                          # off by default: no counter
+    obj.count_saved = True
+    obj.bi_paged_decode(*T.args_of(cse), page_key=cse["key"], rows_max=3)
+    assert int(obj.pages_saved) > 0, int(obj.pages_saved)
+    # stack_acted / stack_acted_gates and the REPORT dispatch gate (M1)
+    G = TT._sg5_gate()
+    a = SimpleNamespace(stack="full", stack_applied="full", twin="fused", rebuild="batched", b2_resolve="fused",
+                        layout="pool", attn="shared", gilfree_warm_up="on", require_xregion=True, b2_fused_plant=0,
+                        b2_res_profile=False)
+    w = dict(twin_variant="fused", batched_calls=3, batched_max=2, fused=dict(launches=12, layers=4),
+             xpool=dict(binds=8, handoffs=5, max_peak_lanes=6208, pairs_over_base=17),
+             skv=dict(stats=dict(shared=7), union_builds=dict(fused=7, torch=0), pages_saved=40), warm_calls=1)
+    g = {x["name"]: x for x in G.stack_acted_gates(a, "L", w, 64, 96)}
+    assert all(g["L_ST_acted_%s" % c]["passed"] and g["L_ST_acted_%s" % c]["must"] for c in COMPONENTS), g
+    assert g["L_ST_xregion"]["passed"] and g["L_ST_xregion"]["must"]
+    for c, bad in (("twin", dict(twin_variant="torch")), ("rebuild", dict(batched_max=1)),
+                   ("resolve", dict(fused=None)), ("layout", dict(xpool=dict(binds=8, handoffs=0))),
+                   ("attn", dict(skv=dict(stats=dict(shared=7), union_builds=dict(fused=7), pages_saved=0))),
+                   ("warmup", dict(warm_calls=0))):
+        g2 = {x["name"]: x for x in G.stack_acted_gates(a, "L", dict(w, **bad), 64, 96)}
+        assert not g2["L_ST_acted_%s" % c]["passed"], c                     # each witness discriminates
+    w_low = dict(w, xpool=dict(binds=8, handoffs=5, max_peak_lanes=6007))
+    assert not {x["name"]: x for x in G.stack_acted_gates(a, "L", w_low, 64, 96)}["L_ST_xregion"]["passed"]
+    off = SimpleNamespace(stack="full", stack_applied="none", twin="torch", rebuild="per_call", b2_resolve="torch",
+                          layout="stream", attn="per_row", gilfree_warm_up="off")
+    g3 = {x["name"]: x for x in G.stack_acted_gates(off, "N", dict(w, fused=None, xpool=None, skv=None,
+                                                                      twin_variant="torch", batched_calls=0,
+                                                                      warm_calls=0), 64, 96)}
+    assert all(g3["N_ST_off_%s" % c]["passed"] for c in COMPONENTS) and "N_ST_xregion" not in g3
+    assert G.stack_acted_gates(SimpleNamespace(), "X", w, 64, 96) == []      # not a stack arm: no gate
+    rep = dict(err=0, err_bits=[], launches_per_layer=6.0, sel_conversions=0, bias_casts=0, compiled={})
+    a_fused = SimpleNamespace(b2_resolve="fused", b2_fused_plant=0, b2_res_profile=False, stack="full")
+    gd = [x for x in G.fused_gates(a_fused, "L", "draft_only", rep) if x["name"].endswith("_fused_dispatch")]
+    assert len(gd) == 1 and gd[0]["name"].startswith("R_") and not gd[0]["must"] and not gd[0]["passed"]
+    a_fused.stack = ""
+    gd = [x for x in G.fused_gates(a_fused, "L", "draft_only", rep) if x["name"].endswith("_fused_dispatch")]
+    assert gd[0]["must"] and not gd[0]["name"].startswith("R_")              # FR-g's own cells: MUST, unchanged
+    # stack_bands_verdict / write_stack_bands (M3)
+    v = [33.0, 36.0, 220.0, 450.0]
+    assert G.stack_bands_verdict(v, 34.2, [310.0], 0) == "IN"
+    for args in ((37.0, [310.0], 0), (34.2, [500.0], 0), (34.2, [310.0], 1), (None, [310.0], 0), (34.2, [], 0),
+                 (34.2, [310.0, 300.0], 0), (34.2, [None], 0)):
+        assert G.stack_bands_verdict(v, *args) == "OUT", args
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        gates = []
+        G.write_stack_bands(SimpleNamespace(stack_bands_v=v, out=d), dict(peak_gb=34.2),
+                            dict(points=[dict(T_tick_ms=310.0)]), gates)
+        lines = open(os.path.join(d, "stack_bands.txt")).read().splitlines()
+        assert lines[-1] == "STACK_BANDS_VERDICT IN" and gates[-1]["name"] == "R_stack_bands"
+        gates2 = [dict(name="x", must=True, passed=False)]
+        G.write_stack_bands(SimpleNamespace(stack_bands_v=v, out=d), dict(peak_gb=34.2),
+                            dict(points=[dict(T_tick_ms=310.0)]), gates2)
+        assert open(os.path.join(d, "stack_bands.txt")).read().splitlines()[-1] == "STACK_BANDS_VERDICT OUT"
+    for bad in (["--backends", "b2", "--stack", "full", "--sel-check", "--stack-bands", "1:2:3"],
+                ["--backends", "b2", "--stack", "full", "--sel-check", "--stack-compare", "--arrival-lag", "2",
+                 "--stack-bands", "33:36:220:450"],
+                ["--backends", "b2", "--stack", "full-no-layout", "--sel-check", "--require-xregion"],
+                ["--backends", "b2", "--require-xregion"]):
+        with pytest.raises(SystemExit):
+            G.parse_args(BASE + bad)
+    ok = G.parse_args(BASE + ["--backends", "b2", "--X", "64", "--stack", "full", "--shared-unchecked",
+                              "--stack-bands", "33:36:220:450", "--require-xregion"])
+    assert ok.stack_bands_v == [33.0, 36.0, 220.0, 450.0] and ok.require_xregion
 
 
 def test_ST7_one_point_stacks_gates_with_a_stand_in():
@@ -615,7 +815,14 @@ def test_ST8_the_step_cells_stack1(tmp_path):
                 assert word not in ln, (word, ln)
     lines = text.splitlines()
     root = next(ln for ln in lines if ln.startswith("NOSI_INTEG=")).split()[0][len("NOSI_INTEG="):]
-    assert root == "/mnt/beegfs/ojerbi/nosi-r2-integ2"                      # [integ2] the stack cells' ROOT
+    assert root == "/mnt/beegfs/ojerbi/nosi-r2-integ3"                      # [integ3] the stack cells' ROOT
+    # [integ3] M3: the combined cell's order and its stop rules (static; a DRYRUN of it would recurse)
+    blk = text[text.index('if [ "$CELL" = stack1 ]; then'):text.index("MODES=exact,fast")]
+    order = [blk.index(s) for s in ("sub stack1a", 'sub "stack1n-$c"', "sub stack1p", "sub stack1t",
+                                    "grep -qx 'STACK_BANDS_VERDICT IN' \"$bands\"", "sub stack1b")]
+    assert order == sorted(order), order
+    assert "bands=$OUTROOT/sg5_${RUN}_${JOB}_stack1t/stack_bands.txt" in blk and "exit 6" in blk
+    assert "for c in twin rebuild resolve layout attn warmup; do" in blk
     for fam, path in (("NOSI_X1", "nosi-r2-xpool"), ("NOSI_BIGB", "nosi-r2-bigb"), ("FRNOSI", "nosi-r2-fusedres2")):
         got_root = next(ln for ln in lines if ln.startswith(fam + "=")).split()[0][len(fam) + 1:]
         assert got_root == "/mnt/beegfs/ojerbi/" + path, (fam, got_root)   # [integ2] no other family repointed
@@ -632,13 +839,22 @@ def test_ST8_the_step_cells_stack1(tmp_path):
     env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_"))}
     env.update(SG5_HOLDERS=str(tmp_path), DRYRUN="1")
     G = TT._sg5_gate()
-    want = {"stack1a": (["--stack full --stack-compare --X-pool 64 --arrival-lag 2 --sel-check", "--batch 64",
-                         "--mem=120G"], ["--pool-baseline", "--shared-unchecked"]),
-            "stack1t": (["--stack full --X-pool 64 --shared-unchecked", "--batch 64", "--pool-baseline", "--mem=120G"],
+    cmp_args = "--stack-compare --X-pool 64 --arrival-lag 2 --sel-check --require-xregion"
+    want = {"stack1a": (["--stack full " + cmp_args, "--batch 64", "--C 96 ", "--mem=120G"],
+                        ["--pool-baseline", "--shared-unchecked", "--stack-bands"]),
+            "stack1p": (["--stack full " + cmp_args, "--batch 64", "--C 80 ", "--mem=120G"],
+                        ["--pool-baseline", "--shared-unchecked", "--stack-bands"]),
+            "stack1n-layout": (["--stack full-no-layout --stack-compare --arrival-lag 2 --sel-check", "--batch 64",
+                                "--C 96 "], ["--X-pool", "--require-xregion", "--pool-baseline"]),
+            "stack1t": (["--stack full --X-pool 64 --shared-unchecked --stack-bands 33:36:220:450", "--batch 64",
+                         "--C 96 ", "--pool-baseline", "--mem=120G"],
                         ["--stack-compare", "--arrival-lag", "--sel-check"]),
             "stack1b": (["--stack full --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1",
                          "--batch 216", "--mem=240G"], ["--pool-baseline", "--stack-compare", "--arrival-lag",
                                                        "--skip-shipped"])}                    # [integ2] B 216
+    for c in ("twin", "rebuild", "resolve", "attn", "warmup"):                                  # [integ3] M1
+        want["stack1n-" + c] = (["--stack full-no-%s %s" % (c, cmp_args), "--batch 64", "--C 96 "],
+                                ["--pool-baseline", "--shared-unchecked"])
     for cell, (has, hasnt) in want.items():
         r = subprocess.run(["bash", str(script), "--nosi", head.stdout.strip(), "418", "t1", cell], env=env,
                            capture_output=True, text=True, timeout=120)
@@ -647,18 +863,26 @@ def test_ST8_the_step_cells_stack1(tmp_path):
             pytest.skip("DRYRUN stopped outside the stack cells' ROOT: %s" % r.stderr.strip()[-200:])
         line = r.stdout.strip().splitlines()[-1]
         got = line.split("r2_tick_sg5.py ", 1)[1].strip().replace("\\,", ",")
-        for w in has + ["--modes exact --backends b2", "--C 96 --X 64 --R-ver 16", "--steps 48",
-                        "PYTHONPATH=/mnt/beegfs/ojerbi/nosi-r2-integ2/nosi"]:
+        for w in has + ["--modes exact --backends b2", "--X 64 --R-ver 16", "--steps 48",
+                        "PYTHONPATH=/mnt/beegfs/ojerbi/nosi-r2-integ3/nosi"]:
             assert w in got or w in line, (cell, w)
         for w in hasnt + ["--sweep ", "--variants", "--b2-checked", "--layout both"]:
             assert w not in got, (cell, w)
-        assert "--job-name=sg5-t1-418-%s " % cell in r.stdout and "cell %s" % cell in r.stdout
-        assert "[integ] root /mnt/beegfs/ojerbi/nosi-r2-integ2," in r.stdout
+        assert "--job-name=sg5-t1-418-%s " % cell.replace("_", "-") in r.stdout and "cell %s" % cell in r.stdout
+        assert "[integ] root /mnt/beegfs/ojerbi/nosi-r2-integ3," in r.stdout
         pa = G.parse_args(got.split())
-        assert pa.stack == "full" and pa.backends == ["b2"] and pa.X_pool == 64 and pa.layout == "pool"
+        assert pa.backends == ["b2"], cell
+        if cell == "stack1n-layout":
+            assert pa.stack == "full-no-layout" and pa.layout == "stream" and not pa.require_xregion
+        elif cell.startswith("stack1n-"):
+            assert pa.stack == "full-no-" + cell[len("stack1n-"):] and pa.layout == "pool" and pa.require_xregion
+        else:
+            assert pa.stack == "full" and pa.X_pool == 64 and pa.layout == "pool"
         if cell == "stack1b":                                             # [integ2] bigb's token log, sized
             assert pa.batch == 216 and pa.log_slots == -1 and pa.log_slots_n is not None
-    for bad in (("stack1a", "stack1b"), ("stack1",), ("stack1c",)):
+        if cell == "stack1t":                                             # [integ3] M3
+            assert pa.stack_bands_v == [33.0, 36.0, 220.0, 450.0]
+    for bad in (("stack1a", "stack1b"), ("stack1", "stack1a"), ("stack1c",), ("stack1n-bogus",)):
         rb = subprocess.run(["bash", str(script), "--nosi", head.stdout.strip(), "418", "t1", *bad], env=env,
                             capture_output=True, text=True, timeout=120)
         assert rb.returncode == 2 and "usage" in rb.stderr, bad

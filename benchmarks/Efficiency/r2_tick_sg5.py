@@ -183,6 +183,13 @@ def parse_args(argv):
                     help="three arms per point: none (every component OFF), the --stack arm, none again (the "
                          "replica); MUST gates <label>_ST_replica / _ST_committed / _ST_bitwise (needs "
                          "--arrival-lag >= 1)")
+    ap.add_argument("--require-xregion", action="store_true",                                   # [integ3] M2
+                    help="make <label>_ST_xregion MUST: the pool's per-(layer, head) peak lanes exceed B x C (the "
+                         "shared X region was bound); default REPORT")
+    ap.add_argument("--stack-bands", default="",                                                # [integ3] M3
+                    help="PEAK_LO:PEAK_HI:TICK_LO_MS:TICK_HI_MS: after the run, <out>/stack_bands.txt holds the "
+                         "verdict of meta.peak_gb and the point's T_tick_ms against the bands (the combined cell "
+                         "stack1 reads it before stack1b); REPORT gate R_stack_bands")
     ap.add_argument("--shipped-batch", type=int, default=0,                                     # [integ]
                     help="the shipped decode's batch (0: --batch); another value makes 'ratio' None and reports "
                          "tokens per second on both sides")
@@ -236,6 +243,17 @@ def parse_args(argv):
                  "two runs differ, note 12k)")
     if a.shipped_batch < 0:
         ap.error("--shipped-batch >= 0")
+    a.stack_bands_v = None                                                                       # [integ3] M3
+    if a.stack_bands:
+        try:
+            v = [float(x) for x in a.stack_bands.split(":")]
+        except ValueError:
+            v = []
+        if len(v) != 4 or not (v[0] < v[1] and v[2] < v[3]) or not a.stack or a.stack_compare:
+            ap.error("--stack-bands PEAK_LO:PEAK_HI:TICK_LO_MS:TICK_HI_MS needs --stack without --stack-compare")
+        a.stack_bands_v = v
+    if a.require_xregion and not (a.stack and a.layout == "pool"):                             # [integ3] M2
+        ap.error("--require-xregion needs a --stack with the pool layout")
     if a.layout != "stream" and any(b not in XPOOL_BACKENDS for b in a.backends):                # [xpool]
         ap.error("--layout %s: the shared pool runs on %s only (S-C's device path binds the lanes)"
                  % (a.layout, XPOOL_BACKENDS))
@@ -530,7 +548,9 @@ def select_attn(a, attn):                                                       
     if getattr(a, "attn", "per_row") == "per_row":
         return attn
     sk = GB.load_by_path(a.sharedkv, "sharedkv_bi_paged_attention")
-    return sk.SharedKV(attn, mode="whole" if a.attn.endswith("whole") else "split", union=a.union)
+    obj = sk.SharedKV(attn, mode="whole" if a.attn.endswith("whole") else "split", union=a.union)
+    obj.count_saved = True               # [integ3] review M2: the union's saved row pages, a device counter (no read)
+    return obj
 
 
 def skv_report(obj):                                                                            # [integ]
@@ -538,7 +558,8 @@ def skv_report(obj):                                                            
     if not getattr(obj, "needs_page_key", False):
         return None
     return dict(stats=dict(obj.stats), by_rows_max={str(k): v for k, v in dict(obj.by_rows_max).items()},
-                union_builds=dict(getattr(obj, "union_builds", {})), mode=obj.mode, union=getattr(obj, "union", None))
+                union_builds=dict(getattr(obj, "union_builds", {})), mode=obj.mode, union=getattr(obj, "union", None),
+                pages_saved=(int(obj.pages_saved) if getattr(obj, "pages_saved", None) is not None else None))  # [integ3]
 
 
 def arm_layout(a, layout=None):                                                                 # [xpool]
@@ -650,10 +671,93 @@ def fused_gates(a, label, phase, rep):
                            % (rep["stats"]["d_grant"], rep["diffs"], rep["first_diff_at"], fe)))
     if mode == "fused" and phase == "draft_only" and not getattr(a, "b2_res_profile", False):
         ok = rep["launches_per_layer"] == 3.0 and rep["sel_conversions"] == 0 and rep["bias_casts"] == 0
-        out.append(GB.gate(tag + "_fused_dispatch", ok, True, "launches/layer %s sel_conversions %d bias_casts %d "
-                           "compiled %s" % (rep["launches_per_layer"], rep["sel_conversions"], rep["bias_casts"],
-                                            rep["compiled"])))
+        stack = bool(getattr(a, "stack", ""))                # [integ3] review-integ2 M1: REPORT in the stack cells
+        out.append(GB.gate(("R_" if stack else "") + tag + "_fused_dispatch", ok, not stack,      # until FR-g
+                           "launches/layer %s sel_conversions %d bias_casts %d compiled %s%s"     # measures it
+                           % (rep["launches_per_layer"], rep["sel_conversions"], rep["bias_casts"], rep["compiled"],
+                              " (REPORT in a stack cell until FR-g2 measured it)" if stack else "")))
     return out
+
+
+def stack_bands_verdict(v, peak_gb, ticks_ms, failed_must):                                     # [integ3] M3
+    """[integ3] IN when the run's peak GB and its ONE point's T_tick (ms) lie in v = (peak lo, hi, tick lo, hi) and no
+    MUST gate failed; OUT otherwise (a missing value is OUT, never IN)."""
+    if failed_must or peak_gb is None or len(ticks_ms) != 1 or ticks_ms[0] is None:
+        return "OUT"
+    t = ticks_ms[0]
+    return "IN" if (v[0] <= peak_gb <= v[1] and v[2] <= t <= v[3]) else "OUT"
+
+
+def write_stack_bands(a, meta, res, gates):                                                     # [integ3] M3
+    """[integ3] <out>/stack_bands.txt: one line per value, then STACK_BANDS_VERDICT IN|OUT (the combined step cell
+    stack1 greps that exact line before it runs stack1b; no interpreter in the step). REPORT gate R_stack_bands."""
+    pts = res.get("points", [])
+    ticks = [p.get("T_tick_ms") for p in pts]
+    nfail = sum(1 for g in gates if g["must"] and not g["passed"])
+    v = a.stack_bands_v
+    verdict = stack_bands_verdict(v, meta.get("peak_gb"), ticks, nfail)
+    text = ("STACK_BANDS peak_gb=%s band=%s:%s\nSTACK_BANDS T_tick_ms=%s band=%s:%s points=%d failed_must=%d\n"
+            "STACK_BANDS_VERDICT %s\n" % (meta.get("peak_gb"), v[0], v[1], ticks[0] if len(ticks) == 1 else ticks,
+                                          v[2], v[3], len(pts), nfail, verdict))
+    with open(os.path.join(a.out, "stack_bands.txt"), "w") as f:
+        f.write(text)
+    gates.append(GB.gate("R_stack_bands", True, False, text.replace("\n", "; ")))
+
+
+def stack_components_on(a):                                                                     # [integ3]
+    """[integ3] The stack components an arm has ON, from its own arguments (STACK_COMPONENTS order)."""
+    return dict(twin=getattr(a, "twin", "torch") == "fused", rebuild=getattr(a, "rebuild", "per_call") == "batched",
+                resolve=getattr(a, "b2_resolve", "torch") == "fused", layout=arm_layout(a) == "pool",
+                attn=getattr(a, "attn", "per_row") != "per_row", warmup=getattr(a, "gilfree_warm_up", "on") == "on")
+
+
+def stack_acted(w, B, C):                                                                       # [integ3]
+    """[integ3] review-integ2 M2: per component, did it ACT in this arm (its own GPU witness)? w: the arm's witnesses
+    (one_point: twin_variant, batched_calls, batched_max, fused, xpool, skv, warm_calls). Returns {c: (acted, detail)}
+    and the shared-region witness of the pool (the per-(layer, head) peak above B x C)."""
+    fu, xp, skv = w.get("fused"), w.get("xpool"), w.get("skv")
+    ub = (skv or {}).get("union_builds", {})
+    out = dict(
+        twin=(w.get("twin_variant") == "fused", "twin_variant %s" % w.get("twin_variant")),
+        rebuild=(w.get("batched_calls", 0) > 0 and w.get("batched_max", 0) >= 2,
+                 "batched calls %s, most publications in one call %s" % (w.get("batched_calls"), w.get("batched_max"))),
+        resolve=(fu is not None and fu.get("launches", 0) > 0 and fu.get("layers", 0) > 0,
+                 "fused launches %s layers %s" % (None if fu is None else fu.get("launches"),
+                                                 None if fu is None else fu.get("layers"))),
+        layout=(xp is not None and xp.get("binds", 0) > 0 and xp.get("handoffs", 0) > 0,
+                "xpool binds %s, lanes handed between requests %s" % (None if xp is None else xp.get("binds"),
+                                                                       None if xp is None else xp.get("handoffs"))),
+        attn=(skv is not None and skv["stats"].get("shared", 0) > 0 and ub.get("fused", 0) > 0
+              and ub.get("torch", 0) == 0 and (skv.get("pages_saved") or 0) > 0,
+              "shared calls %s, union builds %s, row pages saved by the union %s"
+              % (None if skv is None else skv["stats"].get("shared"), ub, None if skv is None else skv.get("pages_saved"))),
+        warmup=(w.get("warm_calls") == 1, "transport warm_calls %s" % w.get("warm_calls")))
+    region = (xp is not None and xp.get("max_peak_lanes", 0) > B * C,
+              "per-(layer, head) peak lanes max %s vs B x C = %d; pairs above %s"
+              % (None if xp is None else xp.get("max_peak_lanes"), B * C, None if xp is None else xp.get("pairs_over_base")))
+    return out, region
+
+
+def stack_acted_gates(a, label, w, B, C):                                                       # [integ3]
+    """[integ3] review-integ2 M2: MUST <label>_ST_acted_<c> for every component ON in a stack arm (its witness shows
+    it acted) and MUST <label>_ST_off_<c> for every component OFF (its witness shows nothing: a full-no-<c> cell
+    really removed c); the pool's shared X region (<label>_ST_xregion) is MUST with --require-xregion, else REPORT."""
+    if not getattr(a, "stack_applied", None):
+        return []
+    on = stack_components_on(a)
+    acted, region = stack_acted(w, B, C)
+    gates = []
+    for c in STACK_COMPONENTS:
+        ok, detail = acted[c]
+        if on[c]:
+            gates.append(GB.gate("%s_ST_acted_%s" % (label, c), ok, True, detail))
+        else:
+            gates.append(GB.gate("%s_ST_off_%s" % (label, c), not ok, True, "OFF in this arm: " + detail))
+    if on["layout"]:
+        req = bool(getattr(a, "require_xregion", False))
+        gates.append(GB.gate(("" if req else "R_") + "%s_ST_xregion" % label, region[0], req,
+                             "the shared X region bound: " + region[1]))
+    return gates
 
 
 def profile_draft_only(a, eng, first, label):
@@ -828,11 +932,11 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
             info["peak_gb_round"] = round(torch.cuda.max_memory_allocated() / 1e9, 3)
             info["store_gb"] = round(sum(t.numel() * t.element_size() for t in eng.store_k + eng.store_v
                                          + eng.store_bias) / 1e9, 3)
-            if eng.xpool is not None:
-                info["xpool"] = eng.xpool.report()
             info["arrival"] = dict(lag=getattr(svc, "arrival_lag", None),                       # review B1: REPORT
                                    forced=getattr(svc, "arrival_forced", None),
                                    held=getattr(svc, "arrival_held", None))
+        if eng.xpool is not None:                       # [xpool]; [integ3] every pool arm (the M2 witnesses)
+            info["xpool"] = eng.xpool.report()
         if fp is not None:                                                                       # [xpool]
             info["committed_tokens"] = [list(r.out) for r in rnd.reqs]
         rs = summarize(eng.timer.report())
@@ -877,6 +981,12 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
             info["residency"]["report_error"] = "%s: %s" % (type(e).__name__, str(e)[:200])
         if getattr(svc, "fusedres", None) is not None:                 # [fusedres2] FR-g gates of the round
             gates.extend(fused_gates(a, label, "round", svc.fusedres.report()))
+        wit = dict(twin_variant=getattr(eng, "twin_variant", None),                          # [integ3] review M2
+                   batched_calls=getattr(eng, "batched_calls", 0), batched_max=getattr(eng, "batched_max", 0),
+                   fused=svc.fusedres.report() if getattr(svc, "fusedres", None) is not None else None,
+                   xpool=info.get("xpool"), skv=skv, warm_calls=info["transport_warm_calls"])
+        info["stack_witness"] = {k: v for k, v in wit.items() if k not in ("fused", "xpool", "skv")}
+        gates.extend(stack_acted_gates(a, label, wit, eng.B, C))
         mirror = eng.mirror_failures()
         gates.append(GB.gate("%s_completed" % label, True, True, "ticks %d, T_tick %s ms, r %.3f, ratio %s"
                              % (rnd.ticks, None if T_tick is None else round(T_tick, 2), r,
@@ -1285,6 +1395,8 @@ def main(argv=None) -> int:
                       lambda ops, kind, C, X, R_ver, label: one_point(a, model, cache, st, first, ops, kind, C, X, R_ver,
                                                                       ext, a.sweep_steps, T_shipped, gates, label))
         meta["peak_gb"] = round(max(_PEAK[0], torch.cuda.max_memory_allocated()) / 1e9, 2)     # [xpool] resets
+        if a.stack_bands_v is not None:                                                        # [integ3] M3
+            write_stack_bands(a, meta, res, gates)
         save()
         for g in gates:
             print("%s %s %s: %s" % ("GATE" if g["must"] else "REPORT", g["name"], "PASS" if g["passed"] else "FAIL",

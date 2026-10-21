@@ -145,6 +145,9 @@ class XPool:
         self.occ = torch.full((L_, H_, self.A), mode == "resident", dtype=torch.bool, device=self.device)
         self.err = torch.zeros((), dtype=torch.int64, device=self.device)
         self.peak = torch.zeros((L_, H_), dtype=torch.int64, device=self.device)   # REPORT: most lanes bound at once
+        # [integ3] the request that bound each lane last (lane A: the dummy) and the lanes handed between requests
+        self.owner = torch.full((L_, H_, self.A + 1), -1, dtype=torch.int64, device=self.device)
+        self.handoffs = torch.zeros((), dtype=torch.int64, device=self.device)
         self.binds = 0                                                               # bind calls (host count)
         self.plant_log: List[Dict] = []
         self.early_log: List[Dict] = []                                              # the early-release controls
@@ -185,7 +188,7 @@ class XPool:
     def clone(self) -> "XPool":
         c = XPool.__new__(XPool)
         c.__dict__.update(self.__dict__)
-        for name in ("pos_of", "occ", "err", "peak"):
+        for name in ("pos_of", "occ", "err", "peak", "owner", "handoffs"):           # [integ3] owner, handoffs
             setattr(c, name, getattr(self, name).clone())
         c.mut = dict(self.mut)
         c.plant_log = list(self.plant_log)
@@ -226,8 +229,16 @@ class XPool:
         cur_h = cur.permute(1, 0, 2).reshape(H, B * NS)
         self.pos_of[l, :, :, :NS] = torch.where(assign, newpos, cur_h).view(H, B, NS).permute(1, 0, 2)
         mark = torch.zeros((H, A + 1), dtype=torch.bool, device=dev)
-        mark.scatter_(1, torch.where(assign, newpos, torch.full_like(newpos, A)), torch.ones_like(assign))
+        tgt = torch.where(assign, newpos, torch.full_like(newpos, A))
+        mark.scatter_(1, tgt, torch.ones_like(assign))
         occ |= mark[:, :A]
+        # [integ3] REPORT / GPU witness (review M2): a lane HANDED between requests (its new slot's request differs from
+        # the request that bound it last); the dummy lane A absorbs unassigned entries. Device ops only.
+        breq = (torch.arange(B * NS, device=dev) // NS).view(1, B * NS).expand(H, B * NS)
+        prev = torch.gather(self.owner[l], 1, tgt)
+        self.handoffs += (assign & (prev >= 0) & (prev != breq)).to(torch.int64).sum()
+        self.owner[l].scatter_(1, tgt, torch.where(assign, breq, torch.full_like(breq, -1)))
+        self.owner[l, :, A] = -1
         self.err.bitwise_or_(torch.any(over).to(torch.int64) * ERR_FULL)
         self.peak[l] = torch.maximum(self.peak[l], occ.to(torch.int64).sum(-1))
         self.audit(l)
@@ -362,7 +373,13 @@ class XPool:
         """REPORT (one read; after a run): the layout and the most lanes bound at once per (layer, head)."""
         return dict(mode=self.mode, B=self.B, H=self.H, C=self.C, X_pool=self.X_pool, n_hist=self.n_hist, A=self.A,
                     M=self.M, binds=self.binds, peak_lanes=self.peak.tolist(), err=int(self.err),
-                    plant_log=list(self.plant_log))
+                    plant_log=list(self.plant_log),
+                    handoffs=int(self.handoffs),                                     # [integ3] review M2 witnesses
+                    max_peak_lanes=int(self.peak.max()) if self.peak.numel() else 0,
+                    # the per-(layer, head) peak (not one layer's: review-integ2 M2 read layer 0's 6007; x1's max over
+                    # every (layer, head) was 6208 = A, SCORING_x1.md item 8)
+                    shared_region_used=(int(self.peak.max()) > self.B * self.C) if self.mode == "pool" else None,
+                    pairs_over_base=int((self.peak > self.B * self.C).sum()) if self.mode == "pool" else None)
 
 
 # ====================================================================================================================

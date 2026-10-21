@@ -831,6 +831,10 @@ class FusedResolver:
         if self.xp is not None and getattr(self.xp, "mode", None) != "pool":
             raise ValueError("resolve='fused': an attached xpool must be in mode 'pool' (got %r)"
                              % (getattr(self.xp, "mode", None),))
+        # [integ3] review-integ2 M5: check mode keeps a SHADOW pool bound by S-C's rule from the torch path's decisions
+        # (verify takes, then draft takes, per layer; the same release per tick); _compare compares the lane maps and
+        # fills the reference bias rows on the SHADOW lanes, so a fused-only bind fault shows as a difference
+        self.xp_ref = self.xp.clone() if (self.xp is not None and check) else None
         if plant not in PLANTS:
             raise ValueError("fused plant %r (one of %s)" % (plant, sorted(PLANTS)))
         if getattr(svc, "record_cap", None) is not None:
@@ -918,6 +922,8 @@ class FusedResolver:
                     raise OwnershipViolation("xpool: lanes are reused across requests only behind a blocking decision "
                                              "read (r2_xpool.py, the lane-level order); this class's is not")
                 self.xp.release_free(svc.dmirror.code)
+                if self.xp_ref is not None:                           # [integ3] M5: the shadow, the same release
+                    self.xp_ref.release_free(svc.dmirror.code)
         elif svc._dirty:
             raise OwnershipViolation("S-C: the host state changed in the middle of a tick (the device mirror is stale)")
         elif svc._row_sig(rows) != svc._rows["sig"]:
@@ -1222,12 +1228,20 @@ class FusedResolver:
         cmp("plan.page_table", page, ref["page"])
         cmp("plan.num_pages", npg, ref["npg"])
         cmp("caps", torch.tensor(step["caps"]), torch.tensor(ref["caps"]))
+        args = ref["args"]
+        if self.xp_ref is not None:                                   # [integ3] M5: S-C's binds on the shadow pool
+            xr, rv, rd = self.xp_ref, ref["vdec"], ref["ddec"]        # (ResidencySC.resolve's order and masks)
+            if rv is not None:
+                xr.bind(l, rv.bh[0], rv.bh[1], rv.t["take_slot"], (rv.t["granted"] | rv.t["evict"]) != 0)
+            if rd is not None:
+                xr.bind(l, args[7], args[8], rd.t["take_slot"], rd.t["granted"] != 0)
+            cmp("xpool.pos_of", self.xp.pos_of[l], xr.pos_of[l])
+            cmp("xpool.occ", self.xp.occ[l], xr.occ[l])
         if sb_before is not None and ref["ddec"] is not None:
-            args = ref["args"]
-            if self.xp is not None:                                   # [integ][xpool] the torch path's flat fill on
-                XP.draft_bias_fill_flat(self.xp, l, sb_before, svc.cis[l], ref["ddec"], args[7], args[8],   # the
-                                        svc.bs)                       # lanes the fused takes bound (same take slots
-            else:                                                     # when the decisions are equal)
+            if self.xp is not None:                                   # [integ3] the torch path's flat fill on the
+                XP.draft_bias_fill_flat(self.xp_ref, l, sb_before, svc.cis[l], ref["ddec"], args[7], args[8],  # S-C
+                                        svc.bs)                       # lanes (the shadow), not on the fused ones
+            else:
                 draft_bias_fill(sb_before, svc.cis[l], ref["ddec"], args[7], args[8], svc.bs)
             cmp("store_b", svc.store_b[l], sb_before)
         self.diffs += out

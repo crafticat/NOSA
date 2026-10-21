@@ -365,6 +365,8 @@ class TickEngine:
         if rebuild not in REBUILD_MODES:                                                        # [batched-rebuild]
             raise TickError("rebuild must be one of %s (got %r)" % (REBUILD_MODES, rebuild))    # [batched-rebuild]
         self.rebuild = rebuild                                                                  # [batched-rebuild]
+        self.batched_calls = 0                  # [integ3] GPU witness (review M2): _publish_batched calls with an item
+        self.batched_max = 0                    # [integ3] and the most publications one call rebuilt
         self.model, self.ops = model, ops
         self.LOG = type(self).LOG if log_slots is None else int(log_slots)    # instance size; the check below reads it
         if self.LOG < 1:
@@ -985,6 +987,8 @@ class TickEngine:
             items.append((b, p, dpos))
         if not items:
             return
+        self.batched_calls += 1                                                  # [integ3] host counters only
+        self.batched_max = max(self.batched_max, len(items))
         dev_items = self._to_device(torch.tensor([[b for (b, _, _) in items], [p for (_, p, _) in items],
                                                   [d - p for (_, p, d) in items]], dtype=torch.int64))
         cp = self.rows_to_copy([(b, range(self.synced[b], p)) for (b, p, _) in items])

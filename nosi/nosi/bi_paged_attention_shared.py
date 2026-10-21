@@ -654,6 +654,16 @@ def bi_paged_decode_shared(base, q, k_cache, v_cache, bias_cache, seq_idx, page_
         return out
     if k_cache.stride(-1) != 1 or v_cache.stride(-1) != 1 or page_table.stride(-1) != 1 or num_pages.stride(-1) != 1:
         raise ValueError("unit last strides are assumed by the kernels")
+    for t, name in ((k_cache, "k_cache"), (v_cache, "v_cache"), (bias_cache, "bias_cache")):   # [integ3] L28 (m5):
+        inner = 1                                     # the storage layouts the kernel's address arithmetic assumes:
+        for s in t.shape[1:]:                         # each storage entry dense ((rows, H[, D]) row-major) and
+            inner *= int(s)                           # stride(0) 0 (the xpool flat mode) or the entry's size
+        dense = [1] * (t.dim() - 1)
+        for i in range(t.dim() - 3, -1, -1):          # row-major strides of dims 1 .. n-1
+            dense[i] = dense[i + 1] * int(t.shape[i + 2])
+        if list(t.stride()[1:]) != dense or t.stride(0) not in (0, inner):
+            raise ValueError("%s strides %s: a dense (rows, H[, D]) entry with stride(0) 0 (xpool) or %d expected"
+                             % (name, tuple(t.stride()), inner))
     whole = mode == "whole"
     if union is None:
         union = build_union(seq_idx, page_table, num_pages, page_key, NR, pps, whole)
@@ -841,6 +851,8 @@ class SharedKV:
         self.__file__ = "%s + sharedkv(%s, %s)" % (getattr(base, "__file__", "piece3"), mode, impl)
         self.stats = dict(shared=0, base_no_key=0, base_single_row=0)
         self.by_rows_max = {}                             # [review MINOR-3] shared calls per rows_max (host ints)
+        self.count_saved = False                          # [integ3] opt-in: pages_saved, a device counter (no read)
+        self.pages_saved = None                           # sum over shared calls of (row pages - union pages)
 
     def _base(self, args, softmax_scale, pps, out=None, workspace=None):
         if self.impl == "reference":
@@ -879,6 +891,9 @@ class SharedKV:
     def _shared(self, args, page_key, nr, softmax_scale, pps, out=None, workspace=None, union=None):
         if union is None:                                 # [sharedkv4] always the selector's build (counted)
             union = self._build(args, page_key, nr, pps)
+        if self.count_saved:                              # [integ3] the union read each shared page once: the row
+            d = args[6].to(torch.int64).sum() - union["ucnt"].to(torch.int64).sum()   # pages it saved (device ops)
+            self.pages_saved = d if self.pages_saved is None else self.pages_saved + d
         if self.impl == "reference":
             return bi_paged_decode_shared_reference(self.base, *args, page_key, rows_max=nr, mode=self.mode,
                                                     softmax_scale=softmax_scale, pages_per_split=pps, union=union)
