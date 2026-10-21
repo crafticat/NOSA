@@ -20,6 +20,8 @@ ONE LAYER (resolve, v1 = host-side per layer, decision D2): the tick passes the 
     (kind verify); classify at the FIRST LOOK: READY (resident: LRU / PO / VRES), IN_FLIGHT (a transfer of any
     requester: the demand is merged and the read WAITS for it), NEW (an URGENT miss: a slot is taken, verifier reserve
     included, and the block is gathered on the main stream before the layer's reads); dispatcher.py:2568-2589, :2492.
+    When K5 grants the verifier no slot, POLICY E (note 12h) evicts the stream's least recent LRU entry that is
+    unprotected and selected by no row of the layer, and reuses its slot; with no such entry: CapacityRefusal.
   draft rows: protect the whole selection, hits included (kind draft); read only the READY blocks (touch / acquire,
     one eviction pass after the row: dispatcher.py:2899-2932); in-flight -> demand merged; a miss -> a background
     DRAFT transfer, deduplicated (one per stream and block), or REFUSED by K5 (counted; the draft continues masked,
@@ -45,6 +47,7 @@ Torch only; runs on CPU tensors (the tests) and on CUDA tensors (the store on th
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -54,7 +57,7 @@ from .kstep.backend import ev_done
 from .kstep.errors import CapacityRefusal, OwnershipViolation
 from .kstep.executor import DRAFT, VERIFY
 from .kstep.mutations import Mutations
-from .kstep.ownership import INFLIGHT, LRU, PO, RELEASING, VRES, LayerPool
+from .kstep.ownership import FREE, INFLIGHT, LRU, PO, RELEASING, VRES, LayerPool
 from .kstep.transfer import Transfer
 
 BLOCK = 64
@@ -127,6 +130,7 @@ class Residency:
         # admitted at the next poll, never in the middle of a tick
         self.defer_admit = bool(defer_admit)
         self._landed: Set[int] = set()                       # seqs landed by the main stream (urgent gathers)
+        self._vcands: Dict[Tuple[int, int], Any] = {}        # Policy E: the layer's verifier eviction candidates
         self._deferred: List[Tuple[int, List[Transfer]]] = []
         self.L, self.B, self.H, self.C, self.X, self.R_ver = int(L), int(B), int(H), int(C), int(X), int(R_ver)
         self.pools = [LayerPool(l, self.B, self.H, self.C, self.X, self.R_ver) for l in range(self.L)]
@@ -269,53 +273,87 @@ class Residency:
         s0, r0 = slot * self.bs, block * self.bs
         self.store_b[l][b, s0:s0 + self.bs, h].copy_(self.cis[l][b, r0:r0 + self.bs, h], non_blocking=True)
 
-    def _evict_for_verifier(self, pool, st) -> bool:
-        """K3X's counted verifier eviction under pressure (dispatcher.py:3128-3129, 3187-3207): the least recent
-        UNPROTECTED LRU entry of the stream is released (its slot becomes FREE behind its reader gate)."""
-        for blk in list(st.lru):
-            if not st.prot.get(blk):
-                idx = st.lru.pop(blk)
-                st.release(idx, "verifier_evict")
-                self.metrics.count("verifier_evictions")
-                return True
-        return False
+    def _verifier_candidates(self, l: int, rows: Sequence[Row], hist) -> Dict[Tuple[int, int], Any]:
+        """POLICY E, the verifier's eviction (note 12h): per stream (b, h) of a verify row of layer l, the LRU entries
+        the verifier may evict when K5 grants it no slot: UNPROTECTED at the start of the layer and selected by NO row
+        of the layer (so no read of this layer uses them), least recent first. Computed once per layer, before any
+        verify protection or take (those touch only selected blocks, so the list stays valid)."""
+        pool = self.pools[l]
+        sel: Dict[Tuple[int, int], Set[int]] = {}
+        for i, r in enumerate(rows):
+            for h in range(self.H):
+                sel.setdefault((r.b, h), set()).update(hist[i][h])
+        out: Dict[Tuple[int, int], Any] = {}
+        for r in rows:
+            if r.kind != "v":
+                continue
+            for h in range(self.H):
+                if (r.b, h) in out:
+                    continue
+                st = pool.stream(r.b, h)
+                out[(r.b, h)] = deque((blk, idx) for blk, idx in st.lru.items()
+                                      if not st.prot.get(blk) and blk not in sel[(r.b, h)])
+        return out
+
+    def _evict_now(self, st, blk: int, idx: int) -> None:
+        """Policy E: evict the LRU entry (blk, slot idx) for the verifier and make its slot FREE at once. Its last
+        reader read it in an EARLIER tick (the entry is selected by no row of this layer): on the GPU it is ordered
+        before the urgent gather on the main stream; here it is host-waited if pending (counted). The FREE transition
+        is LayerPool.poll_releases' for this one slot (the vendored code is unchanged)."""
+        s = st.slots[idx]
+        if st.lru.get(blk) != idx or st.prot.get(blk) or s.state != LRU or s.block != blk:
+            raise OwnershipViolation("verifier eviction: block %d at slot %d of (l %d b %d h %d) is not an unprotected LRU "
+                                     "entry" % (blk, idx, st.l, st.b, st.h))
+        st.lru.pop(blk)
+        st.release(idx, "verifier_evict")
+        self.metrics.count("verifier_evictions")
+        if not ev_done(s.last_reader):
+            if self.host_wait is None:
+                raise OwnershipViolation("verifier eviction of slot %d: its last reader is pending" % idx)
+            self.host_wait(s.last_reader)
+            self.metrics.count("verifier_force_waits")
+        s.state = FREE
+        s.block, s.owner, s.cls = -1, None, None
+        st.log.append(("free", -1, s.idx, s.gen, None))
 
     def _free_slot_for_verifier(self, pool, st) -> Optional[int]:
-        """A FREE slot for an urgent miss: the reserve first (can_take verify), then a counted eviction, then K3X's
-        force path (dispatcher.py:2416-2443): host-wait the RELEASING gates of the stream and poll the releases."""
-        for attempt in range(3):
-            if pool.can_take(st, VERIFY):
-                idx = pool.first_free(st)
-                if idx is not None:
-                    return idx
-            if attempt == 0 and self._evict_for_verifier(pool, st):
-                pool.poll_releases(self.mut)
-                continue
-            gates = [s.last_reader for s in st.slots if s.state == RELEASING and not ev_done(s.last_reader)]
-            if gates and self.host_wait is not None:
-                for g in gates:
-                    self.host_wait(g)
-                self.metrics.count("verifier_force_waits", len(gates))
-            pool.poll_releases(self.mut)
+        """A FREE slot for an urgent miss: K5 for the verifier first (local, then the shared extras with the reserve
+        R_ver), else Policy E: the stream's next eviction candidate (_verifier_candidates), evicted and reused at once.
+        None: no slot (every LRU entry is protected or read by this layer): a CapacityRefusal (a configuration result)."""
+        if pool.can_take(st, VERIFY):
+            idx = pool.first_free(st)
+            if idx is not None:
+                return idx
+        cands = self._vcands.get((st.b, st.h))
+        if cands:
+            blk, idx = cands.popleft()
+            self._evict_now(st, blk, idx)
+            return idx
         return None
 
-    def _take(self, l: int, b: int, h: int, block: int, key: Tuple, kind: str, at: Optional[int] = None) -> Optional[Transfer]:
+    def _take(self, l: int, b: int, h: int, block: int, key: Tuple, kind: str, at: Optional[int] = None,
+              evicted: bool = False) -> Optional[Transfer]:
         """K3X _issue (dispatcher.py:3098-3179): take a FREE slot (K5 decides a draft may borrow), forward the slot's
         previous last reader to the transfer (T3), fill the bias rows. A refused draft fetch returns None.
         at: the slot a DEVICE decision chose (S-B: a draft take; S-C: a verifier urgent take); the host checks it is
         what v1 would take (K5 allows the take for that kind, the block is neither in flight nor resident, the slot is
-        K3X first_free), and raises otherwise. A verifier urgent take of S-C does not fill the bias rows: the device's
-        urgent gather wrote them with K and V before the layer's reads."""
+        K3X first_free), and raises otherwise; evicted: the slot is the one Policy E just evicted and freed for this
+        verify take (it must be FREE; K5 refused). A verifier urgent take of S-C does not fill the bias rows: the
+        device's urgent gather wrote them with K and V before the layer's reads."""
         pool = self.pools[l]
         st = pool.stream(b, h)
         hev = self._hist_ev_for(b, int(block))                       # T4: refused before any change of state
         if at is not None:
-            if kind not in (DRAFT, VERIFY):
-                raise ValueError("kind %r" % (kind,))
+            if kind not in (DRAFT, VERIFY) or (evicted and kind != VERIFY):
+                raise ValueError("kind %r (evicted %s)" % (kind, evicted))
             if self._in_flight(l, b, h, block) is not None or st.resident(block) is not None:
                 raise OwnershipViolation("device decision: a duplicate take of block %d (layer %d b %d h %d)"
                                          % (block, l, b, h))
-            if not pool.can_take(st, kind) or pool.first_free(st) != at:
+            if evicted:
+                if st.slots[at].state != FREE:
+                    raise OwnershipViolation("device decision: the evicted slot %d of (l %d b %d h %d) is not FREE"
+                                             % (at, l, b, h))
+            elif not pool.can_take(st, kind) or pool.first_free(st) != at:
                 raise OwnershipViolation("device decision: the device took slot %d for the %s block %d (layer %d b %d "
                                          "h %d), the host would take %s"
                                          % (at, kind, block, l, b, h, pool.first_free(st) if pool.can_take(st, kind)
@@ -330,8 +368,9 @@ class Residency:
             idx = self._free_slot_for_verifier(pool, st)
             if idx is None:
                 raise CapacityRefusal("layer %d stream (b %d h %d): no slot for the verifier's urgent block %d (C %d, "
-                                      "X %d, R_ver %d): C + X is too small for the cohort's union"
-                                      % (l, b, h, block, self.C, self.X, self.R_ver))
+                                      "X %d, R_ver %d): K5 grants none and every LRU entry is protected or read by "
+                                      "this layer (Policy E has no candidate)" % (l, b, h, block, self.C, self.X,
+                                                                                    self.R_ver))
         prev_reader = st.slots[idx].last_reader
         self.seq += 1
         gen = st.take(idx, st.owner, int(block), self.seq, cls="v" if kind == VERIFY else "ad")
@@ -434,12 +473,13 @@ class Residency:
         self._deferred = []
 
     def _verify_part(self, l: int, rows: Sequence[Row], hist, plan: Plan) -> Dict[Tuple[int, int], List]:
-        """The verify rows of the layer (host, v1): protect, look, merge / wait / urgent; returns their (row, head)
-        entries [(block, slot, gen)] in ascending block id."""
+        """The verify rows of the layer (host, v1): protect, look, merge / wait / urgent (K5, else Policy E); returns
+        their (row, head) entries [(block, slot, gen)] in ascending block id."""
         H = self.H
         pool = self.pools[l]
         now = self.clock()
         vrows = [i for i, r in enumerate(rows) if r.kind == "v"]
+        self._vcands = self._verifier_candidates(l, rows, hist) if vrows else {}
         for i in vrows:
             r = rows[i]
             for h in range(H):

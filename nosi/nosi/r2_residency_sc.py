@@ -5,9 +5,11 @@ selection back at every layer. S-C moves the verify rows to the device too. reso
 host; end_tick() makes ONE batched device-to-host read per tick, for the verify and the draft decisions together.
 
 THE DEVICE MIRROR (DeviceMirror, note Q5). The ownership state the device decides on lives ON THE DEVICE as a per-slot
-table of every layer (state code, block, generation, "the current owner's transfer in flight"). The host keeps no copy
-of it and never scans it: every transition of a stream (K3X Stream.log: take, release, evict_po, acquire, admit,
-admit_vres, drop_unowned, drop_vres_unprotected, free) marks its slot dirty as it happens, and so does an owner change
+table of every layer (state code, block, generation, "the current owner's transfer in flight", "a resident block
+protected by a live cohort", the LRU recency stamp). The host keeps no copy of it and never scans it: every transition
+of a stream (K3X Stream.log: take, release, evict_po, acquire, admit, admit_vres, drop_unowned, drop_vres_unprotected,
+free, touch) marks its slot dirty as it happens (touch / admit / acquire also give it a new recency stamp), so does a
+protection change of a resident block (the stream's protection map reports it: _ProtDict), and so does an owner change
 (begin_request / end_request: the batch slot's transfers in flight). At the FIRST resolve of a tick the host sends the
 records of the dirty slots in ONE batched host-to-device copy (sync_mirror), and the tick's row inputs in one more
 (every layer of a tick resolves the same rows). Each resolve derives its layer's mirror from the table with device ops
@@ -24,10 +26,14 @@ with tensor ops, in K3X order (verify row, head, ascending block; dispatcher.py:
              verifier reserve R_ver INCLUDED (the PRE-RESERVED VERIFIER POOL: draft fetches cannot borrow its last
              R_ver extras, K5). Its slot is the stream's q-th FREE slot (K3X first_free). A later occurrence (another
              verify row of the cohort, same stream) reads the same slot: one transfer per stream and block.
-  OVERFLOW   a first miss that K5 cannot grant (v1 evicts or forces there, dispatcher.py:2416-2443). The device sets
-             the OVERFLOW FLAG and points the page at slot 0 (in bounds); end_tick raises CapacityRefusal before any
-             change of the host state. The tick's outputs are invalid and the run stops: C + X or R_ver is too small
-             (a configuration error, as v1's own CapacityRefusal).
+  POLICY E   a first miss that K5 cannot grant takes the stream's next EVICTION CANDIDATE (note 12h): an LRU slot
+             whose block is unprotected and selected by no row of the layer, least recent first (the mirror's
+             protection flags and recency stamps), as v1 does; the host applies the eviction at end_tick and checks it
+             is v1's choice.
+  OVERFLOW   a first miss without a slot from K5 or Policy E. The device sets the OVERFLOW FLAG and points the page at
+             slot 0 (in bounds); end_tick raises CapacityRefusal before any change of the host state. The tick's
+             outputs are invalid and the run stops: every LRU entry is protected or read by the layer and C + X or
+             R_ver is too small (a configuration result, as v1's own CapacityRefusal).
   protect    every valid selected block (K2), applied at end_tick.
 Then the device (a) WAITS for the in-flight blocks the verify rows read, (b) GATHERS the urgent blocks (K, V, bias)
 into their slots on the main stream before the layer's attention, (c) updates the mirror (the urgent blocks in flight,
@@ -66,6 +72,7 @@ host-to-device copies (the mirror delta, the row inputs) and one device-to-host 
 from __future__ import annotations
 
 import threading
+from collections import deque
 from typing import Dict, List, Sequence, Set, Tuple
 
 import torch
@@ -77,12 +84,50 @@ from .r2_residency import BLOCK, N_TAIL, VERIFY, Plan, Residency, Row
 from .r2_residency_sb import FIELDS, DraftMirror, ResidencySB, device_draft, rank_in_group
 
 FIELDS_V = ("blk", "valid", "ready", "slot", "infl", "infl_slot", "infl_gen", "dup", "granted", "take_slot", "rslot",
-            "protect")
+            "protect", "evict", "evict_blk")
 C_FREE, C_INFLIGHT, C_LRU, C_PO, C_VRES, C_RELEASING = range(6)
 CODE = {FREE: C_FREE, INFLIGHT: C_INFLIGHT, LRU: C_LRU, PO: C_PO, VRES: C_VRES, RELEASING: C_RELEASING}
-MIRROR_FIELDS = ("slot_of", "inflight", "infl_slot", "infl_gen", "free", "usage", "releasing")
+MIRROR_FIELDS = ("slot_of", "inflight", "infl_slot", "infl_gen", "free", "usage", "releasing", "lru_rank", "prot")
 JOURNAL_KINDS = ("take", "release", "evict_po", "acquire", "admit", "admit_vres", "drop_unowned",
-                 "drop_vres_unprotected", "free")        # "touch" changes only the LRU order: not mirrored
+                 "drop_vres_unprotected", "free", "touch")     # touch / admit / acquire: the LRU recency (Policy E)
+RECENCY_KINDS = ("touch", "admit", "acquire")             # the events that put a block at the LRU's most recent end
+BIG_STAMP = 1 << 62
+
+
+class _ProtDict(dict):
+    """A stream's protection map (K3X Stream.prot: block -> cohort keys) that reports every block whose protection
+    may change (a new entry, a removed one), so its resident slot is sent with the next mirror delta (Policy E reads
+    "protected" on the device). Adding a key to an existing entry changes nothing ("protected" stays true)."""
+
+    def __init__(self, key: Tuple[int, int, int], sink, items=()):
+        super().__init__(items)
+        self.key, self.sink = key, sink
+
+    def setdefault(self, block, default=None):
+        new = block not in self
+        out = super().setdefault(block, default)
+        if new:
+            self.sink(self.key, block)
+        return out
+
+    def __setitem__(self, block, value) -> None:
+        super().__setitem__(block, value)
+        self.sink(self.key, block)
+
+    def __delitem__(self, block) -> None:
+        super().__delitem__(block)
+        self.sink(self.key, block)
+
+    def pop(self, block, *default):
+        out = super().pop(block, *default)
+        self.sink(self.key, block)
+        return out
+
+    def clear(self) -> None:
+        blocks = list(self.keys())
+        super().clear()
+        for blk in blocks:
+            self.sink(self.key, blk)
 
 
 class _Journal(list):
@@ -108,8 +153,9 @@ class LayerMirror:
 
 class DeviceMirror:
     """The residency mirror of EVERY layer on the device (module docstring): a per-slot table (L, B, H, C + X) of the
-    state code, the block, the generation and the flag "the current owner's transfer in flight". apply() writes the
-    records of one delta; layer() derives one layer's mirror with device ops only."""
+    state code, the block, the generation, the flag "the current owner's transfer in flight", the flag "a resident
+    block protected by a live cohort" and the LRU recency stamp (the larger, the more recent; Policy E). apply()
+    writes the records of one delta; layer() derives one layer's mirror with device ops only."""
 
     def __init__(self, L: int, B: int, H: int, nblk: int, npos: int, device):
         shape = (L, B, H, npos)
@@ -118,12 +164,14 @@ class DeviceMirror:
         self.block = torch.full(shape, -1, dtype=torch.int64, device=device)
         self.gen = torch.zeros(shape, dtype=torch.int64, device=device)
         self.cur = torch.zeros(shape, dtype=torch.int64, device=device)
+        self.prot = torch.zeros(shape, dtype=torch.int64, device=device)
+        self.stamp = torch.zeros(shape, dtype=torch.int64, device=device)
 
     def apply(self, recs: torch.Tensor) -> None:
-        """recs (5, n) int64 ON THE DEVICE: flat slot index, state code, block, generation, current-owner flag; the
-        slot indices are distinct."""
+        """recs (7, n) int64 ON THE DEVICE: flat slot index, state code, block, generation, current-owner flag,
+        protected flag, recency stamp; the slot indices are distinct."""
         f = recs[0]
-        for t, row in ((self.code, 1), (self.block, 2), (self.gen, 3), (self.cur, 4)):
+        for t, row in ((self.code, 1), (self.block, 2), (self.gen, 3), (self.cur, 4), (self.prot, 5), (self.stamp, 6)):
             t.view(-1)[f] = recs[row]
 
     def layer(self, l: int) -> LayerMirror:
@@ -148,10 +196,19 @@ class DeviceMirror:
         infl_gen = torch.zeros((dummy + 1,), dtype=torch.int64, device=dev)
         infl_gen[at_fly] = gen.reshape(-1)
         shp = (B, H, NBLK)
+        # Policy E: the LRU slots by recency (stamp) and the protection of the resident slots
+        lru = code == C_LRU
+        lru_stamp = torch.where(lru, self.stamp[l], torch.full_like(code, BIG_STAMP))
+        order = torch.sort(lru_stamp.view(B * H, NPOS), dim=-1).indices
+        rank = torch.empty_like(order)
+        rank.scatter_(1, order, torch.arange(NPOS, device=dev).view(1, NPOS).expand(B * H, NPOS).contiguous())
+        resident = (code == C_LRU) | (code == C_PO) | (code == C_VRES)
         return LayerMirror(slot_of=slot_of[:dummy].view(shp), inflight=(infl_slot[:dummy] >= 0).view(shp),
                            infl_slot=infl_slot[:dummy].view(shp), infl_gen=infl_gen[:dummy].view(shp),
                            free=code == C_FREE, usage=(code != C_FREE).to(torch.int64).sum(-1),
-                           releasing=code == C_RELEASING)
+                           releasing=code == C_RELEASING,
+                           lru_rank=torch.where(lru, rank.view(B, H, NPOS), torch.full_like(code, -1)),
+                           prot=resident & (self.prot[l] != 0), lru_stamp=lru_stamp, slot_block=blk.clone())
 
 
 class VerifyMirror(DraftMirror):
@@ -163,6 +220,8 @@ class VerifyMirror(DraftMirror):
         self.infl_slot = torch.full((B, H, nblk), -1, dtype=torch.int64, device=device)
         self.infl_gen = torch.zeros((B, H, nblk), dtype=torch.int64, device=device)
         self.releasing = torch.zeros((B, H, npos), dtype=torch.bool, device=device)
+        self.lru_rank = torch.full((B, H, npos), -1, dtype=torch.int64, device=device)
+        self.prot = torch.zeros((B, H, npos), dtype=torch.bool, device=device)
 
     def refresh(self, svc: Residency, l: int) -> None:
         super().refresh(svc, l)
@@ -171,6 +230,8 @@ class VerifyMirror(DraftMirror):
         infl_slot = torch.full((B, H, nblk), -1, dtype=torch.int64)
         infl_gen = torch.zeros((B, H, nblk), dtype=torch.int64)
         releasing = torch.zeros((B, H, npos), dtype=torch.bool)
+        lru_rank = torch.full((B, H, npos), -1, dtype=torch.int64)
+        prot = torch.zeros((B, H, npos), dtype=torch.bool)
         for (ll, b, h, blk), tr in svc.pending.items():
             if ll == l and 0 <= blk < nblk and svc._in_flight(l, b, h, blk) is tr:
                 infl_slot[b, h, blk] = tr.slot
@@ -179,9 +240,16 @@ class VerifyMirror(DraftMirror):
             for i, s in enumerate(st.slots):
                 if s.state == RELEASING:
                     releasing[b, h, i] = True
+            for r, (blk, idx) in enumerate(st.lru.items()):              # the LRU order, least recent first
+                lru_rank[b, h, idx] = r
+            for blk, idx in list(st.lru.items()) + list(st.po.items()) + list(st.vres.items()):
+                if st.prot.get(blk):
+                    prot[b, h, idx] = True
         self.infl_slot.copy_(infl_slot, non_blocking=True)
         self.infl_gen.copy_(infl_gen, non_blocking=True)
         self.releasing.copy_(releasing, non_blocking=True)
+        self.lru_rank.copy_(lru_rank, non_blocking=True)
+        self.prot.copy_(prot, non_blocking=True)
 
 
 class VerifyDecision:
@@ -197,14 +265,33 @@ class VerifyDecision:
         self.counters = counters                     # (1,) int64: the overflowed first misses
 
 
-def device_verify(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, mut=None) -> VerifyDecision:
+def _selected_mask(S: int, H: int, NBLK: int, parts, dev) -> torch.Tensor:
+    """(S * NBLK,) bool: the blocks that some row of the layer selects (a valid historical selection), per stream.
+    parts: [(rb (R,), hb (R,), sel (H, R, k))]."""
+    acc = torch.zeros(S * NBLK + 1, dtype=torch.int64, device=dev)
+    for (rb_, hb_, sel_) in parts:
+        _, R_, _ = sel_.shape
+        s_ = sel_.permute(1, 0, 2)
+        ok = (s_ >= 0) & (s_ < hb_.view(R_, 1, 1)) & (s_ < NBLK)
+        sid_ = rb_.view(R_, 1, 1) * H + torch.arange(H, device=dev).view(1, H, 1)
+        f = torch.where(ok, sid_ * NBLK + s_.clamp(min=0), torch.full_like(s_, S * NBLK))
+        acc.index_add_(0, f.reshape(-1), ok.reshape(-1).to(torch.int64))
+    return acc[:S * NBLK] > 0
+
+
+def device_verify(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, mut=None, others=None) -> VerifyDecision:
     """One layer's verify rows on the device (module docstring), then the mirror update for the layer's draft rows.
     rb, hb (Rv,) int64: batch slot and history boundary of each verify row; tails (Rv, T) int64 tail slots (-1
-    padded), nt (Rv,) int64 their count; sel (H, Rv, k) int64 the selections.
+    padded), nt (Rv,) int64 their count; sel (H, Rv, k) int64 the selections; others: the layer's other rows
+    [(rb, hb, sel)] (the draft rows: Policy E never evicts a block that a row of the layer selects).
+    POLICY E (note 12h): a first miss that K5 refuses takes the stream's next eviction candidate: an LRU slot whose
+    block is unprotected and selected by no row of the layer, least recent first (the mirror's recency stamps); only
+    a miss without a candidate is an overflow.
     mut (NEGATIVE CONTROLS, tests only): gather_into_releasing (a RELEASING slot counts as FREE: the urgent gather
     writes a slot whose last reader may be pending), no_verify_protect (the verify read protects nothing),
     no_verify_dedup (a later occurrence of a miss takes a second slot: two transfers of one block), no_overflow_flag
-    (an overflow is not reported)."""
+    (an overflow is not reported), evict_protected / evict_selected / evict_newest (Policy E ignores the protection,
+    ignores the layer's selections, takes the most recent candidate first)."""
     mut = mut or {}
     H, Rv, k = sel.shape
     dev = sel.device
@@ -251,13 +338,36 @@ def device_verify(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, mut=N
     ne = needs_extra.to(torch.int64)
     g = ne.cumsum(0) - ne
     granted = fmiss & (~needs_extra | (g < budget))
-    over = fmiss & ~granted
+    refused_k5 = fmiss & ~granted
     # the q-th grant of a stream takes its q-th FREE slot (K3X first_free after the earlier takes)
     q = rank_in_group(sid, granted)
     freem = (m.free | m.releasing) if mut.get("gather_into_releasing") else m.free
     ar = torch.arange(NPOS, device=dev).view(1, NPOS).expand(S, NPOS)
     free_sorted = torch.sort(torch.where(freem.reshape(S, NPOS), ar, torch.full_like(ar, NPOS)), dim=-1).values
-    take_slot = torch.where(granted, free_sorted[sid, q.clamp(max=NPOS - 1)], torch.full_like(q, -1))
+    # Policy E: the r-th K5-refused first miss of a stream evicts the stream's r-th candidate (least recent first)
+    selm = _selected_mask(S, H, NBLK, [(rb, hb, sel)] + list(others or []), dev)
+    sblk = m.slot_block.reshape(S, NPOS)
+    sid_slot = torch.arange(S, device=dev).view(S, 1).expand(S, NPOS)
+    in_sel = (sblk >= 0) & (sblk < NBLK) & selm[sid_slot * NBLK + sblk.clamp(min=0, max=NBLK - 1)]
+    cand = m.lru_stamp.reshape(S, NPOS) < BIG_STAMP                                 # LRU slots
+    if not mut.get("evict_protected"):
+        cand = cand & ~m.prot.reshape(S, NPOS)
+    if not mut.get("evict_selected"):
+        cand = cand & ~in_sel
+    ckey = m.lru_stamp.reshape(S, NPOS)
+    if mut.get("evict_newest"):
+        ckey = -ckey
+    ckey = torch.where(cand, ckey, torch.full_like(ckey, BIG_STAMP))
+    cand_sorted = torch.sort(ckey, dim=-1).indices                                  # candidates first, oldest first
+    n_cand = cand.to(torch.int64).sum(-1)                                           # (S,)
+    r_ev = rank_in_group(sid, refused_k5)
+    evicted = refused_k5 & (r_ev < n_cand[sid])
+    ev_slot = cand_sorted[sid, r_ev.clamp(max=NPOS - 1)]
+    ev_blk = torch.where(evicted, sblk[sid, ev_slot], torch.full_like(ev_slot, -1))
+    over = refused_k5 & ~evicted
+    taken = granted | evicted
+    take_slot = torch.where(granted, free_sorted[sid, q.clamp(max=NPOS - 1)],
+                            torch.where(evicted, ev_slot, torch.full_like(q, -1)))
     # a later occurrence reads the slot of its group's first occurrence
     pos = torch.arange(N, device=dev)
     gstart = torch.cummax(torch.where(first_sorted, pos, torch.zeros_like(pos)), 0).values
@@ -286,23 +396,28 @@ def device_verify(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, mut=N
                        torch.full((Rv, H, T), -1, dtype=torch.int64, device=dev))
     page.scatter_(-1, nvalid.unsqueeze(-1) + post, tval)
     num_pages = nvalid + nt.view(Rv, 1)
-    # the urgent gather's load ids: slot -> block for every grant (a dummy column takes the other entries)
-    col = torch.where(granted, take_slot, torch.full_like(take_slot, NPOS))
+    # the urgent gather's load ids: slot -> block for every take (a dummy column takes the other entries)
+    col = torch.where(taken, take_slot, torch.full_like(take_slot, NPOS))
     ids = torch.full((H, B, NPOS + 1), -1, dtype=torch.int64, device=dev)
-    ids.index_put_((hh_f, bb_f, col), torch.where(granted, blk_f, torch.full_like(blk_f, -1)))
+    ids.index_put_((hh_f, bb_f, col), torch.where(taken, blk_f, torch.full_like(blk_f, -1)))
     load_ids = ids[..., :NPOS].contiguous()
-    # the mirror after the verify rows (device_draft reads it): urgent blocks in flight, their slots taken
+    # the mirror after the verify rows (device_draft reads it): urgent blocks in flight; granted slots no longer FREE
+    # (usage + 1); an evicted slot is reused (usage unchanged) and its old block is no longer resident
     tk = granted.to(torch.int64)
-    d_infl = torch.zeros(S * NBLK, dtype=torch.int64, device=dev).index_add_(0, sid * NBLK + blk_f, tk)
+    d_infl = torch.zeros(S * NBLK, dtype=torch.int64, device=dev).index_add_(0, sid * NBLK + blk_f,
+                                                                              taken.to(torch.int64))
     m.inflight |= d_infl.view(B, H, NBLK) > 0
     d_free = torch.zeros(S * NPOS, dtype=torch.int64, device=dev).index_add_(0, sid * NPOS + take_slot.clamp(min=0), tk)
     m.free &= ~(d_free.view(B, H, NPOS) > 0)
     m.usage += torch.zeros(S, dtype=torch.int64, device=dev).index_add_(0, sid, tk).view(B, H)
+    d_gone = torch.zeros(S * NBLK, dtype=torch.int64, device=dev).index_add_(0, sid * NBLK + ev_blk.clamp(min=0),
+                                                                              evicted.to(torch.int64))
+    m.slot_of.masked_fill_(d_gone.view(B, H, NBLK) > 0, -1)
     n_over = over.to(torch.int64).sum()
     counters = torch.stack([torch.zeros_like(n_over) if mut.get("no_overflow_flag") else n_over])
     t = dict(blk=blk_f, valid=valid_f, ready=ready.reshape(N), slot=slot.reshape(N), infl=infl.reshape(N),
              infl_slot=islot.reshape(N), infl_gen=igen.reshape(N), dup=dup, granted=granted, take_slot=take_slot,
-             rslot=rslot, protect=protect.reshape(N))
+             rslot=rslot, protect=protect.reshape(N), evict=evicted, evict_blk=ev_blk)
     return VerifyDecision(Rv, H, k, {f: v.to(torch.int64) for f, v in t.items()}, page, num_pages, load_ids,
                           (bb_f, hh_f), counters)
 
@@ -344,16 +459,24 @@ class CpuDeviceSim:
     def gather(self, l: int, dec: VerifyDecision) -> None:
         """The urgent gather on the main stream: every (h, b, slot) with a block id in the load ids gets the block's
         host K / V rows and its cis rows (bias), after the block's host write-back (T4); a slot whose last reader is
-        pending is refused (T3)."""
+        pending is refused (T3). A slot that Policy E EVICTED was last read in an earlier tick, before this gather in
+        the main stream's order: its pending reader is host-waited here (the stand-in of that order; counted as
+        verifier_force_waits, as v1 counts it)."""
         svc = self.svc
         g = svc.gather                                    # the host rows and the store (TorchGather's tensors)
         bs = svc.bs
+        bb, hh = dec.bh
+        evicted = {(b, h, s) for (b, h, s, e) in zip(bb.tolist(), hh.tolist(), dec.t["take_slot"].tolist(),
+                                                    dec.t["evict"].tolist()) if e}
         for h, per_b in enumerate(dec.load_ids.tolist()):
             for b, per_m in enumerate(per_b):
                 for m, t in enumerate(per_m):
                     if t < 0:
                         continue
                     s = svc.stream(l, b, h).slots[m]
+                    if (b, h, m) in evicted and not ev_done(s.last_reader):
+                        svc.host_wait(s.last_reader)
+                        svc.metrics.count("verifier_force_waits")
                     if self.check_t3 and not ev_done(s.last_reader):
                         raise OwnershipViolation("S-C device: the urgent gather of block %d writes slot %d (layer %d b %d "
                                                  "h %d) while the slot's last reader is pending (T3)" % (t, m, l, b, h))
@@ -613,9 +736,12 @@ class ResidencySC(ResidencySB):
         self.mirror_drop = set(mirror_drop or ())
         self.journal_counts: Dict[str, int] = {}                     # the stream transitions per kind (reports)
         self._dirty: Set[Tuple[int, int, int, int]] = set()          # (l, b, h, slot) changed since the last sync
+        self._stamp: Dict[Tuple[int, int, int, int], int] = {}       # (l, b, h, slot) -> its LRU recency (Policy E)
+        self._clock = 0
         for l, pool in enumerate(self.pools):
             for (b, h), st in pool.streams.items():
                 st.log = _Journal((l, b, h), self._journal, st.log)
+                st.prot = _ProtDict((l, b, h), self._prot_changed, st.prot)
         self.mirror_uploads = 0                           # host-to-device copies of the mirror delta
         self.mirror_slots_uploaded = 0                    # slot records sent in them
         self.row_uploads = 0                              # host-to-device copies of the tick's row inputs
@@ -651,9 +777,20 @@ class ResidencySC(ResidencySB):
         per kind in journal_counts (a release by its reason: release:evict, release:unprotect, release:end, ...)."""
         kind = item[0] if item[0] != "release" else "release:%s" % (item[4],)
         self.journal_counts[kind] = self.journal_counts.get(kind, 0) + 1
-        if item[0] == "touch" or item[0] in self.mirror_drop:
+        if item[0] in RECENCY_KINDS:                       # the block is now the LRU's most recent entry
+            self._clock += 1
+            self._stamp[key + (item[2],)] = self._clock
+        if item[0] in self.mirror_drop:
             return
         self._dirty.add(key + (item[2],))
+
+    def _prot_changed(self, key: Tuple[int, int, int], block: int) -> None:
+        """A block's protection may have changed (_ProtDict): its resident slot, if any, goes with the next delta."""
+        if "prot" in self.mirror_drop:
+            return
+        idx = self.pools[key[0]].stream(key[1], key[2]).resident(block)
+        if idx is not None:
+            self._dirty.add(key + (idx,))
 
     def _mark_batch_slot(self, b: int) -> None:
         """An owner change of batch slot b: its transfers in flight change their "current owner" flag."""
@@ -681,19 +818,22 @@ class ResidencySC(ResidencySB):
 
     def sync_mirror(self) -> bool:
         """The ONE batched host-to-device delta of the device mirror: the record of every slot that changed since the
-        last sync (state code, block, generation, current-owner flag). Called by the first resolve of a tick (and by
-        tests); returns whether a delta was sent."""
+        last sync (state code, block, generation, current-owner flag, protected flag, recency stamp). Called by the
+        first resolve of a tick (and by tests); returns whether a delta was sent."""
         if not self._dirty:
             return False
         B, H, NPOS = self.B, self.H, self.n_hist
         recs = []
         for (l, b, h, i) in sorted(self._dirty):
-            s = self.pools[l].stream(b, h).slots[i]
+            st = self.pools[l].stream(b, h)
+            s = st.slots[i]
             cur = 0
             if s.state == INFLIGHT:
                 tr = self._in_flight(l, b, h, s.block)
                 cur = 1 if tr is not None and tr.slot == i else 0
-            recs.append((((l * B + b) * H + h) * NPOS + i, CODE[s.state], s.block, s.gen, cur))
+            prot = 1 if s.state in (LRU, PO, VRES) and st.prot.get(s.block) else 0
+            recs.append((((l * B + b) * H + h) * NPOS + i, CODE[s.state], s.block, s.gen, cur, prot,
+                         self._stamp.get((l, b, h, i), 0)))
         self._dirty = set()
         self.dmirror.apply(self._h2d(torch.tensor(recs, dtype=torch.int64).t().contiguous()))
         self.mirror_uploads += 1
@@ -765,7 +905,11 @@ class ResidencySC(ResidencySB):
                     drows=[rows[i] for i in tk["drows"]], ddec=None)
         if tk["v"] is not None:                                       # the verify rows: on the device, no host read
             rb, hb, tl, nt, ix = tk["v"]
-            vdec = device_verify(m, rb, hb, tl, nt, sel[:, ix], self.C, self.X, self.sc_mut)
+            others = []
+            if tk["d"] is not None:                                   # Policy E spares the draft rows' blocks too
+                rbd, hbd, _, _, ixd = tk["d"]
+                others.append((rbd, hbd, sel[:, ixd]))
+            vdec = device_verify(m, rb, hb, tl, nt, sel[:, ix], self.C, self.X, self.sc_mut, others=others)
             if not self.sc_mut.get("no_wait"):                        # NEGATIVE CONTROL: read before the event
                 self.dev.wait(l, vdec)
             self.dev.gather(l, vdec)
@@ -825,25 +969,56 @@ class ResidencySC(ResidencySB):
             over = [(st["l"], v[1]) for (st, v, _) in parsed if v is not None and v[1] > 0]
             if over:
                 self._layer_ev = {}
-                raise CapacityRefusal("S-C: the verifier's urgent misses found no FREE slot within K5 (layer, blocks "
-                                      "without a slot: %s; C %d, X %d, R_ver %d): the tick's outputs are invalid"
+                raise CapacityRefusal("S-C: the verifier's urgent misses found no slot: K5 grants none and Policy E has "
+                                      "no candidate, every LRU entry being protected or read by the layer (layer, "
+                                      "blocks without a slot: %s; C %d, X %d, R_ver %d): the tick's outputs are invalid"
                                       % (over, self.C, self.X, self.R_ver))
             for (st, v, d) in parsed:
                 if v is not None:
-                    self._apply_verify(st["l"], st["vrows"], st["vidx"], st["vdec"], v[0])
+                    self._apply_verify(st["l"], st["vrows"], st["vidx"], st["vdec"], v[0],
+                                       st["drows"] if d is not None else None, d[0] if d is not None else None,
+                                       st["ddec"] if d is not None else None)
                 if d is not None:
                     self._apply(st["l"], st["drows"], st["ddec"], d[0], d[1], d[2], d[3])
         self._layer_ev = {}
         Residency.end_tick(self)                                      # the draft transfers, layer by layer
         self.metrics.sample_memory()
 
-    def _apply_verify(self, l: int, vrow_objs: List[Row], vidx: List[int], dec: VerifyDecision, c) -> None:
+    def _host_candidates(self, l: int, vrow_objs, dec, c, drow_objs, dcols, ddec):
+        """Policy E's candidates on the host (v1's _verifier_candidates), from the host state at the start of the
+        layer's apply and the layer's selections as the device decided them (the valid blocks of the verify and the
+        draft entries): the reference every device eviction is checked against."""
+        H = dec.H
+        sel: Dict[Tuple[int, int], Set[int]] = {}
+        for rows_, cols, n_rows, k_ in ((vrow_objs, c, dec.Rv, dec.k),
+                                        (drow_objs, dcols, ddec.Rd if ddec is not None else 0,
+                                         ddec.k if ddec is not None else 0)):
+            if not n_rows:
+                continue
+            for o in range(n_rows * H * k_):
+                if cols["valid"][o]:
+                    j, h = o // (H * k_), (o // k_) % H
+                    sel.setdefault((rows_[j].b, h), set()).add(cols["blk"][o])
+        pool = self.pools[l]
+        out = {}
+        for r in vrow_objs:
+            for h in range(H):
+                if (r.b, h) in out:
+                    continue
+                st = pool.stream(r.b, h)
+                out[(r.b, h)] = deque((blk, idx) for blk, idx in st.lru.items()
+                                      if not st.prot.get(blk) and blk not in sel.get((r.b, h), ()))
+        return out
+
+    def _apply_verify(self, l: int, vrow_objs: List[Row], vidx: List[int], dec: VerifyDecision, c, drow_objs=None,
+                      dcols=None, ddec=None) -> None:
         """The host applies one layer's verify decisions in v1's order (_verify_part under defer_admit), checking each
-        against the host state."""
+        against the host state; a Policy E eviction must be the host's next candidate of its stream."""
         H, k = dec.H, dec.k
         pool = self.pools[l]
         now = self.clock()
         looks, entries = [], {}
+        cands = self._host_candidates(l, vrow_objs, dec, c, drow_objs, dcols, ddec) if any(c["evict"]) else {}
         for j, r in enumerate(vrow_objs):
             for h in range(H):
                 st = pool.stream(r.b, h)
@@ -872,14 +1047,22 @@ class ResidencySC(ResidencySB):
                             tr.demand.add(VERIFY)
                         infl.append(t)
                         ent.append((t, tr.slot))
-                    elif c["granted"][o]:
+                    elif c["granted"][o] or c["evict"][o]:
                         new.append(t)
-                        takes.append((t, c["take_slot"][o]))
+                        takes.append((t, c["take_slot"][o], c["evict_blk"][o] if c["evict"][o] else None))
                     else:
                         raise OwnershipViolation("S-C: block %d of verify row %d (layer %d b %d h %d) has no slot and the "
                                                  "device did not flag an overflow" % (t, vidx[j], l, r.b, h))
-                for (t, at) in takes:
-                    tr = self._take(l, r.b, h, t, r.key, VERIFY, at=at)
+                for (t, at, ev_blk) in takes:
+                    if ev_blk is not None:                            # Policy E: the host's next candidate, evicted
+                        q = cands.get((r.b, h))
+                        nxt = q.popleft() if q else None
+                        if nxt != (ev_blk, at):
+                            raise OwnershipViolation("S-C Policy E: the device evicted block %d at slot %d (layer %d b %d "
+                                                     "h %d); the host's next candidate is %s" % (ev_blk, at, l, r.b, h,
+                                                                                                nxt))
+                        self._evict_now(st, ev_blk, at)
+                    tr = self._take(l, r.b, h, t, r.key, VERIFY, at=at, evicted=ev_blk is not None)
                     tr.delivered = True                               # the device's urgent gather landed it
                     self._landed.add(tr.seq)
                     ent.append((t, at))

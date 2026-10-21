@@ -162,6 +162,9 @@ Per verify row (cohort key k, layer l, head h), the exact selection is classifie
 - If no slot can be taken even after evictions (all protected), the layer cannot run: the service host-waits the
   needed in-flight transfers and pending reader events and retries (K3X `_force_for_layer`, `dispatcher.py:2416-2443`);
   a second failure is a CapacityRefusal (a configuration error: C + X too small for the cohort's union).
+  SUPERSEDED for v1 and S-C by POLICY E (note 12h, 2026-10-21): the eviction candidate is the least recent LRU entry
+  that is unprotected and selected by no row of the layer; it is evicted and its slot reused at once; there is no
+  force-and-retry path; no candidate is a CapacityRefusal.
 
 v1 RESOLUTION IS HOST-SIDE PER LAYER (decision D2), for draft and verify rows alike: at every layer the tick copies
 the rows' selection to the host (one D2H, then one sync), the service classifies, protects, issues the background
@@ -495,6 +498,105 @@ GT4): the liveness rule below, `ResidencySC.journal_counts`, and gilfree's `stat
   release:evict). NEGATIVE: NoHostCopy (a write-back that does not copy the rows to the host) differs or refuses.
 - STEP_MIN 90 (estimate: model and build about 6 min, the extension build about 2 min, TEACHER and RES about 3 min,
   8.5 S-C arms at about 2 - 4 min each: S-C's host applies are Python loops over B x K x H x 64 entries per layer).
+
+## 12h. The first GPU run (FG fg1 and SG5 p1, holder 2190876): two defects and their fixes (2026-10-21)
+
+Both runs failed before any tick with verify rows finished
+(`/mnt/beegfs/ojerbi/r2-runs/fg/fg_fg1_2190876/summary.json`, `/mnt/beegfs/ojerbi/r2-runs/sg5/sg5_p1_2190876`).
+
+DEFECT 1, every gilfree arm: "S and S_dst must be multiples of R" (gilfree_pack.cpp order_and_check).
+- E's R contract (FIX_DESIGN.md at f2b981a): R = 64. The sources are contiguous TOKEN-MAJOR (B, S, H, D) CPU
+  tensors with S a multiple of 64. The destination is a (rows, D) view of a token-major store of the same B, H, D and
+  dtype, with whole 64-row slots. The error does not say which side failed.
+- Which side failed: the SOURCE side, by its row count, not by its layout.
+  - The host rows are token-major, (B, n_host, H, D) (R2Body.allocate, r2_decode_body.py).
+  - n_host = S_max + horizon + 64 per request (r2_decode_path.ragged_widths), not 16128 + 64:
+    SG5 p1: 16128 + (48 + LAMBDA 7 + 64) + 64 = 16311; FG: 16128 + (64 + 16 + 80) + 64 = 16352.
+    Neither is a multiple of 64.
+  - The destination holds: the store is (B, (C + X + 4 [+ 1 trash]) x 64, H, D) (TickEngine), whole slots.
+- The CPU tests used S_host = 12 x 64, so the defect stayed hidden.
+- FIX (no packer change; E's R contract stands): the adapter hands the packer one zero-copy source per
+  (layer, request), `host[l][b:b+1, :S_floor]`, with S_floor = (S_host // 64) x 64. It addresses the request in
+  the destination row: m' = b x n_slots + slot.
+- The adapter checks at construction, and each message names its side:
+  - the host rows and the store are 4-D token-major tensors of the same B, H, D and dtype (a head-major host is
+    refused, not read as S = H);
+  - the host holds at least one complete block (SOURCE);
+  - the store's rows per request are a multiple of 64 (DESTINATION).
+- At release, the adapter refuses a block past S_floor. Such a block is never complete, so the service never
+  requests it (the drivers pass nblk = n_host // 64).
+- CPU test GT5: the production geometries (S_host 16311 / 16352 / 16192; C + X + 4 = 116 slots, with the trash slot
+  117; C 96: 132). The bytes equal the host truth: the last complete block, and the first and last slot of a
+  request. A block past the floor is refused.
+- GT5 negative control: the former batched call is refused by the packer itself, for every S_host that is not a
+  multiple of 64.
+- CPU test GT5b: the construction refusals (a head-major host, a store of partial slots, a host without a complete
+  block, a store of another B); positive control: a token-major host of 5 x 64 + 55 rows is accepted.
+
+DEFECT 2, FG2 gather and s0 at C 80 / X 32 / R_ver 16: CapacityRefusal at layers 18 and 23 (10 and 6 blocks).
+What the data shows (FG2_gather):
+- NOSA-8B has H = 2 KV heads (slots_physical 59392 = 32 x 8 x 2 x 116), so a layer has 16 streams at B 8.
+- 3 draft-only ticks ran. The 4th tick, the first with verify rows, refused.
+- The drafts took 36311 blocks: 70.9 per stream. Journal: take 36311, admit 36311, evict_po 47, no release:evict.
+  No cohort had been decided (decision_reads 0), so every resident block was protected by a live draft cohort.
+- So no policy could free a slot there. v1 too would refuse: its eviction needs an unprotected LRU entry.
+- The verifier had only C - usage, about 9 local slots per stream on average, plus at least 16 shared extras
+  (X 32 minus the drafts' borrowing; drafts may borrow X - R_ver = 16). It needed about 10 more at layer 18.
+- Its first-verify demand is therefore about 16 x 9 + 16 + 10 = 170 urgent blocks per layer, about 11 per stream.
+CONCLUSION:
+- (a) This refusal is a CONFIGURATION result. The first verify tick needs C above the drafts' protected union plus
+  the verifier's urgent misses, per stream: about 71 + 11.
+- (b) The data also shows the POLICY GAP. Once the LRU is full (usage >= C), every urgent miss of S-C needs a shared
+  extra, because S-C could not evict. Those extras do not scale with B: per-stream backing gives every stream X
+  physical extra slots, but the whole layer has only X in total.
+- v1 (and K3X) instead evict an unprotected LRU entry. So both changes are made.
+
+POLICY E (v1 `_verifier_candidates` / `_evict_now`; S-C `device_verify`, `_apply_verify`):
+- Trigger: K5 grants the verifier's urgent miss no slot.
+- Choice: the stream's least recent LRU entry that is UNPROTECTED at the start of the layer and selected by NO row
+  of the layer (draft or verify), so no read of the layer uses it.
+- It is evicted (release: verifier_evict) and its slot reused at once. Its last reader read it in an earlier tick,
+  so on the GPU that read is ordered before the main-stream gather. On the host the reader is host-waited if
+  pending (counted: verifier_force_waits). Then poll_releases' FREE transition runs for that one slot.
+- With no candidate: CapacityRefusal, the configuration case.
+- K3X's former force path is not used. It host-waits every RELEASING gate of the stream and polls the whole pool
+  mid-tick, which a device decision cannot do.
+- S-C's device mirror now also carries, per slot, the protection flag and the LRU recency stamp:
+  - touch / admit / acquire give the slot a new stamp;
+  - the stream's protection map reports protection changes (_ProtDict);
+  - both go with the one delta per tick (F14 compares the lru_rank and prot fields too).
+- The host checks every device eviction against v1's candidate list.
+- S-B keeps v1's verify rows but sees no draft selection there. Its candidates spare only the verify rows' blocks:
+  S-B is superseded and is not equal to v1 once evictions happen. It stays safe: its draft decision reads the mirror
+  refreshed after the verify part, so an evicted block is a miss there, never a read of the reused slot. The S-B
+  lockstep tests (F10) use C 8 / X 48 / R_ver 8 on F6's schedule (F12 asserts that v1 makes no verifier eviction
+  there) or no verify rows (F10b); if F10 met an eviction, its lockstep would report the difference.
+
+Tests:
+- F20 (scripted, one stream, C 2, X 0):
+  - all protected: both refuse;
+  - the oldest protected: evict the next;
+  - the oldest read by the tick's draft row: evict the next;
+  - none excluded: evict the oldest.
+  - v1 and S-C reach the same state. Negative controls: a device that evicts a protected entry, a read entry, or
+    the newest one is refused by the host's check.
+- F20b: the lockstep under eviction pressure (C 24 of 36 blocks, X 2). Precondition: v1 evicts. S-C equals v1 in
+  every tick.
+- F14c gains the kinds touch and prot.
+
+RECOMMENDED POINTS (arithmetic above). The FG and SG5 step scripts change on their branches, not here:
+- Primary point: C 96 / X 32 / R_ver 16.
+  - It gives about 25 local slots per stream at the first verify tick, about 400 per layer at B 8, against a demand
+    of about 170.
+  - The cost: 132 slots per (request, head, layer) instead of 116. At 32,896 B per slot (the sizes above), B 64,
+    H 2, 32 layers: 17.79 GB instead of 15.63 GB (+2.16 GB); at B 8: 2.22 GB instead of 1.95 GB.
+  - The per-stream numbers do not depend on B, so the same C holds at B 64.
+- FG3 pressure points: 72:384:256 and 64:512:384.
+  - With C below the drafts' union, the verifier needs about 10 to 16 extras per stream at the first verify tick.
+    R_ver >= 256 covers 16 streams.
+  - The cost at B 8 (460 and 580 slots): 7.75 GB and 9.77 GB of store.
+- SG5's sweep keeps C in {64, 80, 96}. Points with C <= 80 may still refuse at the first verify tick; that is a
+  configuration result.
 
 ## 13. Open questions
 

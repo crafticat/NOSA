@@ -821,8 +821,9 @@ def _mirror_diff(svc, l):
 
 def _trace_journal(svc):
     """TEST INSTRUMENTATION of an S-C service: every change that marks a slot for the device mirror (the stream
-    journals' kinds, and "owner" for an owner change), per SYNC INTERVAL: a list of {(l, b, h, slot): [kinds]}; every
-    sync_mirror call (by resolve or by the test) closes the current interval (the last one stays open)."""
+    journals' kinds, "prot" for a protection change of a resident block, and "owner" for an owner change), per SYNC
+    INTERVAL: a list of {(l, b, h, slot): [kinds]}; every sync_mirror call (by resolve or by the test) closes the
+    current interval (the last one stays open)."""
     trace = [collections.defaultdict(list)]
     for pool in svc.pools:
         for st in pool.streams.values():
@@ -830,6 +831,13 @@ def _trace_journal(svc):
                 trace[-1][key + (item[2],)].append(item[0])
                 inner(key, item)
             st.log.sink = sink
+
+            def psink(key, block, inner=st.prot.sink, stream=st):
+                idx = stream.resident(block)
+                if idx is not None:
+                    trace[-1][key + (idx,)].append("prot")
+                inner(key, block)
+            st.prot.sink = psink
     mark, sync = svc._mark_batch_slot, svc.sync_mirror
 
     def traced_mark(b):
@@ -848,10 +856,10 @@ def _trace_journal(svc):
 
 def _isolated(trace, kind):
     """The precondition of a dropped-kind control: in some CLOSED sync interval a slot changed by `kind` only (no other
-    kind marked that slot in the same interval, so nothing else sends its record before the next sync)."""
+    kind marked that slot in the same interval, so nothing else sends its record before the next sync). Every kind
+    counts, touch included (the LRU recency is mirrored for Policy E)."""
     for interval in trace[:-1]:
         for evs in interval.values():
-            evs = [e for e in evs if e != "touch"]
             if evs and all(e == kind for e in evs):
                 return True
     return False
@@ -1019,7 +1027,7 @@ def test_F12d_sc_per_layer_path_has_no_host_transfer():
     import inspect
     d2h = FORBIDDEN + ("_d2h(",)
     for fn in (SC.ResidencySC.resolve, SC.DeviceMirror.layer, SC.device_verify, SB.device_draft, SB.rank_in_group,
-               SC.CudaDeviceOps.wait, SC.CudaDeviceOps.gather, SC.wait_list):
+               SC.CudaDeviceOps.wait, SC.CudaDeviceOps.gather, SC.wait_list, SC._selected_mask):
         src = inspect.getsource(fn)
         assert [tok for tok in d2h + H2D if tok in src] == [], fn.__qualname__
     assert [tok for tok in d2h if tok in inspect.getsource(SB.ResidencySB.resolve)] != []
@@ -1214,7 +1222,8 @@ def _scn_late_reader(drop):
     return trace, bool([(l, d) for l in range(L) for d in _mirror_diff(svc, l)])
 
 
-F14C = {"take": _scn_f6, "admit": _scn_f6, "release": _scn_f6, "admit_vres": _scn_split, "free": _scn_late_reader}
+F14C = {"take": _scn_f6, "admit": _scn_f6, "release": _scn_f6, "admit_vres": _scn_split, "free": _scn_late_reader,
+        "touch": _scn_f6, "prot": _scn_f6}
 
 
 @pytest.mark.parametrize("kind", sorted(F14C))
@@ -1504,3 +1513,96 @@ def test_F19_the_exact_wait_host_waits_the_submission_first():
     stuck.payload.set()
     runner.join(timeout=5)
     assert not runner.is_alive() and ops2.submission_waits == 1
+
+
+# =====================================================================================================================
+# F20 Policy E: the verifier evicts an LRU entry it does not protect (FG2's CapacityRefusal, holder 2190876; note 12h)
+# =====================================================================================================================
+def _f20(scenario, sc=False, sc_mut=None):
+    """One stream (b 0, h 0, layer 0), C 2, X 0, R_ver 0: K5 never grants the verifier a slot once the stream holds two,
+    so its urgent miss of block 5 (the last tick) needs Policy E. Returns (world, the exception of the last tick).
+      config            0 and 1 protected by the live cohort k1: no candidate (a configuration result, as FG2's)
+      protected_oldest  0 protected (k1 live), 1 unprotected (k2 decided, dropped): evict 1
+      selected_oldest   0 and 1 unprotected; the tick's draft row reads 0: evict 1
+      lru_order         0 and 1 unprotected, none read by the tick: evict 0, the least recent"""
+    kw = dict(nblk=NB, sc_mut=sc_mut) if sc else dict(poll_in_resolve=False, defer_issue=True, defer_admit=True)
+    w = world(C=2, X=0, R_ver=0, cls=SC.ResidencySC if sc else None, svc_kw=kw)
+    svc = w.svc
+    svc.begin_request(0, "u0")
+    k1, k2, k3 = ("u0", 1, 1), ("u0", 1, 2), ("u0", 1, 3)
+
+    def tick(*rs):
+        svc.poll()
+        p = svc.resolve(0, [r for r, _ in rs], S(*[[blocks, []] for _, blocks in rs]))
+        svc.read_done(0, p, Ev(done=True))
+        svc.end_tick()
+
+    def d(key, blocks):
+        return Row(0, "d", key, 300, 10), blocks
+
+    def v(key, blocks):
+        return Row(0, "v", key, 300, 10), blocks
+    if scenario == "config":
+        tick(d(k1, [0, 1]))
+        land_all(w)
+        last = (v(k1, [5]),)
+    elif scenario == "protected_oldest":
+        tick(d(k1, [0]))
+        land_all(w)
+        tick(d(k2, [1]))
+        land_all(w)
+        svc.decided(k2)
+        svc.poll()                                              # k2's references drop: block 1 is unprotected
+        last = (v(k1, [5]),)
+    else:
+        tick(d(k1, [0]))
+        land_all(w)
+        tick(d(k1, [1]))
+        land_all(w)
+        svc.decided(k1)
+        svc.poll()                                              # 0 and 1 are unprotected
+        last = (d(k3, [0]), v(k2, [5])) if scenario == "selected_oldest" else (v(k2, [5]),)
+    try:
+        tick(*last)
+        return w, None
+    except ER.CapacityRefusal as e:
+        return w, e
+
+
+def test_F20_policy_e_the_verifier_evicts_an_unprotected_lru_entry():
+    """F20 (Policy E, note 12h; FG2 / SG5 on holder 2190876 refused at the first verify tick, every resident block
+    protected by a live draft cohort): K5 refusing the verifier's urgent miss, v1 and S-C both evict the stream's least
+    recent LRU entry that is unprotected and read by no row of the layer, and reuse its slot for the urgent block (its
+    rows the host truth); with no candidate both refuse (CapacityRefusal: v1 at resolve, S-C at its end_tick), the
+    configuration case of FG2's data. v1 and S-C reach the same ownership state. Negative controls: a device that
+    evicts a protected entry, one that evicts an entry the layer reads, one that evicts the most recent candidate: the
+    host's check of every device eviction refuses each (OwnershipViolation)."""
+    wv, ev = _f20("config")
+    ws, es = _f20("config", sc=True)
+    assert ev is not None and es is not None and "no candidate" in str(es)
+    for scenario, gone, kept in (("protected_oldest", 1, 0), ("selected_oldest", 1, 0), ("lru_order", 0, 1)):
+        wv, ev = _f20(scenario)
+        ws, es = _f20(scenario, sc=True)
+        assert ev is None and es is None, (scenario, ev, es)
+        for w in (wv, ws):
+            st = w.svc.stream(0, 0, 0)
+            assert st.resident(gone) is None and st.resident(kept) is not None, scenario
+            assert st.slots[gone].block == 5 and st.slots[gone].state == OWN.INFLIGHT, scenario   # slot gone = block gone
+            assert slot_holds(w, 0, 0, 0, gone, 5) and w.svc.metrics.counts.get("verifier_evictions") == 1
+        assert _state(wv) == _state(ws), scenario
+    for scenario, mut in (("protected_oldest", "evict_protected"), ("selected_oldest", "evict_selected"),
+                          ("lru_order", "evict_newest")):
+        with pytest.raises(ER.OwnershipViolation, match="Policy E"):
+            _f20(scenario, sc=True, sc_mut={mut: True})
+
+
+def test_F20b_sc_equals_v1_under_verifier_eviction_pressure():
+    """F20b: the lockstep (pages, verify content, state, counters and the device mirror every tick) over a schedule in
+    which the LRU fills (C 24 of 36 blocks, windows of 3) and the verifier has 2 shared extras per layer (X 2, R_ver 2:
+    drafts never borrow): v1 evicts for its verifier (precondition: verifier_evictions > 0) and S-C makes the same
+    evictions, every tick."""
+    bad, wv, ws, _ = _lockstep_sc(5, C=24, X=2, R_ver=2, sched=_sched_pressure(105, 18, hb=36, window=3, nver=3),
+                                  hb=36)
+    assert bad == [], bad[:3]
+    n = wv.svc.metrics.counts.get("verifier_evictions", 0)
+    assert n > 0 and ws.svc.metrics.counts.get("verifier_evictions", 0) == n, wv.svc.metrics.counts
