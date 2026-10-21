@@ -22,6 +22,11 @@ F3  the body kernel (interpreter): FusedBody.decode_fixed against DeviceWritebac
     and an inactive request's load mask kept are each caught.
 F4  the tick profile's pure parts (benchmarks/Efficiency/r2_tick_profile.py): window, cuts, labels (with a refused
     sequence as the negative control), tables, means, verdicts TK2-TK4.
+F5  why PLANT 1 is blind on bfloat16 data (M-F f1 GT-NEG): close exponents -> the float32 chain is exact in any order;
+    the GT gate's N(0, 1) bfloat16 data: the means almost never change; the ORDER PROBE changes every mean. F2's child
+    also runs the probe through the kernels: unplanted == torch, PLANT 1 effective and caught (float32, bfloat16).
+F6  the negative-control verdicts of the GPU cell (plant_status, neg_gates) and the fused r2base predictions
+    (r2_base_cell.verdicts_fused, --r2 fused / --gt arguments).
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider benchmarks/Efficiency/tests_cpu/test_r2_fused.py
 """
@@ -248,8 +253,50 @@ for plant in (1, 2, 3):
     first, ev, _ = run(torch.float32, plant=plant)
     caught[plant] = first
 assert all(v is not None for v in caught.values()), "F2 child: a negative control was not caught: %s" % caught
-print("F2 OK float32 + bfloat16 bitwise (ragged steps, advance T 3, overflow); 3 of 3 negative controls caught: %s"
-      % {k: v[0] for k, v in caught.items()})
+
+
+def run_order(dtype, steps=20):
+    """GT-NEG-ORDER on the CPU: three twins of one state with the order probe in their rings (order_probe_ring), fed
+    the same inputs (every bank active, the probe's keys at its positions): a (torch), u (unplanted kernel), p
+    (PLANT 1). Returns the first step where u != a (must be None), p != u (effective) and p != a (caught)."""
+    g = torch.Generator().manual_seed(7)
+    S_list, H, D = (230, 233, 250, 190), 2, 8
+    data = [(torch.randn(S, H, D, generator=g), torch.randn(S, H, generator=g)) for S in S_list]
+    tw3 = []
+    for _ in range(3):
+        t = TW.PositionalTwin(len(S_list), H, D, 40, 420)
+        for b, (k, c) in enumerate(data):
+            t.prefill(b, k, c)
+        for name in ("comp_k", "ring", "total_cis", "ccis"):
+            setattr(t, name, getattr(t, name).to(dtype).contiguous())
+        t.mean_fn = BD.fixed_order_mean
+        FU.order_probe_ring(t)
+        tw3.append(t)
+    a, u, p = tw3
+    act = torch.ones(len(S_list), dtype=torch.bool)
+    broke = eff = got = None
+    for s in range(steps):
+        keys = FU.order_probe_keys(a.pos, H, D).to(dtype)
+        cis = torch.randn(len(S_list), H, generator=g).to(dtype)
+        a.step_unchecked(keys, cis, act)
+        FU.step_fused(u, keys, cis, act)
+        FU.step_fused(p, keys, cis, act, plant=1)
+        if broke is None and diff(a, u):
+            broke = s
+        if eff is None and diff(u, p):
+            eff = s
+        if got is None and diff(a, p):
+            got = s
+    return broke, eff, got
+
+
+order = {}
+for dtype in (torch.float32, torch.bfloat16):
+    order[str(dtype)] = run_order(dtype)
+    broke, eff, got = order[str(dtype)]
+    assert broke is None and eff is not None and got is not None, ("F2 child: order probe", dtype, broke, eff, got)
+print("F2 OK float32 + bfloat16 bitwise (ragged steps, advance T 3, overflow); 3 of 3 negative controls caught: %s; "
+      "order probe (unplanted break, plant 1 effective, caught): %s" % ({k: v[0] for k, v in caught.items()}, order))
 '''
 
 BODY_CHILD = CHILD_HEAD + r'''
@@ -405,3 +452,102 @@ def test_F4_tick_profile_pure_parts():
 
 def test_F3_the_body_kernel_under_the_interpreter():
     _child(BODY_CHILD, "F3")
+
+
+def _chain(x, reverse=False):
+    """The kernel's key summary arithmetic over dim 0: acc = row_0; acc = acc + row_w in float32 (rows reversed:
+    PLANT 1)."""
+    rows = list(x.float().unbind(0))
+    if reverse:
+        rows = rows[::-1]
+    acc = rows[0].clone()
+    for r in rows[1:]:
+        acc = acc + r
+    return acc
+
+
+def _rev_mean(x, dim):
+    return BD.fixed_order_mean(x.flip(dim), dim)
+
+
+def test_F5_why_plant_1_is_blind_on_bfloat16_and_the_order_probe():
+    """F5 (the GT-NEG failure of M-F f1: PLANT 1 'no-op on this data'): (a) 32 bfloat16 values per column whose
+    exponents lie within 8 of each other: the float32 chain is EXACT (it equals the float64 sum) in both orders, so the
+    reversed chain and the reversed fixed-order mean give the SAME bits; (b) the GT gate's own data, N(0, 1) in
+    bfloat16: more than 95 % of the column sums are exact and at most 1e-4 of the bfloat16 means change when the order is
+    reversed; (c) NEGATIVE CONTROL of the claim, the order probe (r2_twin_fused.order_probe_keys): every 32-row window
+    from a multiple of 16 sums to 0 in window order and to 14 t reversed, and the means differ in every element."""
+    g = torch.Generator().manual_seed(5)
+    n = 1 << 16
+    e = torch.randint(-4, 4, (32, n), generator=g).float()
+    sign = torch.where(torch.rand(32, n, generator=g) < 0.5, -1.0, 1.0)
+    x = (torch.pow(2.0, e) * (1 + torch.rand(32, n, generator=g)) * sign).to(torch.bfloat16)
+    f, r = _chain(x), _chain(x, True)
+    assert torch.equal(f.view(torch.int32), r.view(torch.int32))
+    assert torch.equal(f.double(), x.double().sum(0))                                  # exact, in any order
+    assert torch.equal(BD.fixed_order_mean(x, 0).view(torch.int16), _rev_mean(x, 0).view(torch.int16))
+    y = torch.randn(32, 1 << 18, generator=g).to(torch.bfloat16)
+    f, r = _chain(y), _chain(y, True)
+    exact = float((f.double() == y.double().sum(0)).double().mean())
+    fp32_diff = int((f.view(torch.int32) != r.view(torch.int32)).sum())
+    bf_diff = int((BD.fixed_order_mean(y, 0).view(torch.int16) != _rev_mean(y, 0).view(torch.int16)).sum())
+    assert exact > 0.95 and bf_diff <= 1e-4 * y.shape[1], (exact, fp32_diff, bf_diff)
+    q = torch.arange(16 * 40)
+    keys = FU.order_probe_keys(q, 2, 3)
+    kb = keys.to(torch.bfloat16)
+    assert torch.equal(kb.float(), keys)                                               # exact in bfloat16
+    for s in range(0, 16 * 38, 16):
+        w = kb[s:s + 32]
+        f, r = _chain(w), _chain(w, True)
+        assert bool((f == 0).all()) and bool((r == 14 * FU.PROBE_T).all()), s
+        m_f, m_r = BD.fixed_order_mean(w, 0), _rev_mean(w, 0)
+        assert bool((m_f.view(torch.int16) != m_r.view(torch.int16)).all()), s
+        assert bool((m_r.float() == 14 * FU.PROBE_T / 32).all()) and bool((m_f.float() == 0).all()), s
+
+
+def test_F6_negative_control_verdicts_and_the_fused_r2base_predictions():
+    """F6: (a) r2_fused_cell.plant_status / neg_gates: a plant that never changes the kernel's output is 'no-op on this
+    data' (allowed for plant 1 on the run's data, refused for plants 2 and 3), an effective plant the comparison misses
+    fails GT-NEG, an unplanted kernel that differs from torch fails both gates, GT-NEG-ORDER needs plant 1 caught on the
+    probe; (b) r2_base_cell.verdicts_fused: CONFIRMED inside the registered bands, REFUTED outside, REPORT at a B without
+    a band; --gt only with --r2 fused."""
+    sys.path.insert(0, str(ROOT / "benchmarks/Efficiency"))
+    import r2_base_cell as BCF
+    import r2_fused_cell as FC
+    assert FC.plant_status(None, None) == FC.NOOP and FC.plant_status((0, ["ring"]), (0, ["ring"])) == "caught"
+    assert FC.plant_status((0, ["ring"]), None) == "MISSED"
+
+    def run(status, broke=None):
+        eff = None if status == FC.NOOP else (3, ["comp_k"])
+        got = (3, ["comp_k"]) if status == "caught" else None
+        return dict(status=status, effective=eff, caught=got, unplanted_differs_at=broke)
+
+    def g(data, order):
+        return {x[0]: x[2] for x in FC.neg_gates(data, order)}
+    good = {1: run(FC.NOOP), 2: run("caught"), 3: run("caught")}
+    assert g(good, run("caught")) == {"GT-NEG": True, "GT-NEG-ORDER": True}
+    assert g({**good, 1: run("caught")}, run("caught"))["GT-NEG"]
+    assert not g({**good, 1: run("MISSED")}, run("caught"))["GT-NEG"]
+    assert not g({**good, 2: run(FC.NOOP)}, run("caught"))["GT-NEG"]
+    assert not g({**good, 3: run("caught", broke=5)}, run("caught"))["GT-NEG"]
+    assert not g(good, run(FC.NOOP))["GT-NEG-ORDER"] and not g(good, run("caught", broke=0))["GT-NEG-ORDER"]
+    assert not g({1: run(FC.NOOP)}, None)["GT-NEG"] and not g(good, None)["GT-NEG-ORDER"]
+    exp = BCF.expected_rewarms(BCF.S0, 512)
+    sh = dict(rewarms=[list(x) for x in exp], rates=dict(steady_step_ms=100.0, effective_tok_s=100.0),
+              gpu_peak_alloc_GB=50.0)
+    good = dict(warmup=2, rates=dict(steady_step_ms=97.0, effective_tok_s=290.0), gpu_peak_alloc_GB=55.0)
+    ag = dict(n_diverged=0, tf_agreement=1.0, n_requests=64, first_divergence_min=None)
+    v = {n: x for n, x, _ in BCF.verdicts_fused(64, sh, good, ag, exp)}
+    assert v == dict(P1F="CONFIRMED", P2="CONFIRMED", P3F="CONFIRMED", P4F="CONFIRMED", P5="CONFIRMED"), v
+    bad = dict(good, rates=dict(steady_step_ms=100.5, effective_tok_s=250.0))
+    v = {n: x for n, x, _ in BCF.verdicts_fused(64, sh, bad, dict(ag, tf_agreement=0.998), exp)}
+    assert (v["P1F"], v["P3F"], v["P4F"]) == ("REFUTED", "REFUTED", "REFUTED"), v
+    v = {n: x for n, x, _ in BCF.verdicts_fused(100, sh, good, ag, exp)}
+    assert (v["P3F"], v["P4F"]) == ("REPORT", "REPORT")
+    v = {n: x for n, x, _ in BCF.verdicts_fused(219, sh, dict(good, rates=dict(steady_step_ms=99.0,
+                                                                                 effective_tok_s=180.0)), ag, exp)}
+    assert (v["P3F"], v["P4F"]) == ("CONFIRMED", "CONFIRMED"), v
+    base = ["--out", "x", "--workload", "w", "--batch", "64"]
+    assert BCF.parse_args(base).r2 == "built" and BCF.parse_args(base + ["--r2", "fused", "--gt"]).gt
+    with pytest.raises(SystemExit):
+        BCF.parse_args(base + ["--gt"])

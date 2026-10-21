@@ -34,6 +34,13 @@ per-request prefill).
 MUST: SH-RUN and R2-RUN (N steps each), R2-ERR (no refusal bit), R2-PTR (no state data_ptr moves across the
 replays). REPORT: everything else, and the registered predictions P1-P5 (docs/R2_BASE.md) with their verdicts.
 EXIT: the number of failed MUST gates; 20 refused; 30 an exception outside an arm.
+
+--r2 fused (docs/R2_FUSED.md section 8): the R2 arm runs the FUSED twin step (r2_twin_fused.attach on step_fixed, a
+DECLARED change: per-bank refusal through the overflow flag, the fixed-order mean) and the LEAN body
+(r2_body_fused.FusedBody), attached before the warm-up, so the capture records them. R2-ERR then also requires every
+twin's overflow flag clear. The predictions are P1F (agreement), P3F (steady ratio per B), P4F (effective ratio per B)
+and P5. --gt (with --r2 fused): r2_fused_cell.part_gt first, before the model loads (its gates GT-EQ, GT-COVER,
+GT-NEG, GT-NEG-ORDER are MUST gates of this cell).
 """
 from __future__ import annotations
 
@@ -54,6 +61,10 @@ S0 = 16128
 N_DOCS = 94
 R_TOK, KERNEL, STRIDE, ROUND = 64, 32, 16, 128
 PRED = dict(P3_ratio_b64=0.8, P3_ratio_b219=0.9, P4_eff_ratio_b64=1.5, P5_peak_ratio=1.15)
+# --r2 fused (registered with the commit that adds them; basis: rb1 2190876 and M-F f1 2190876, docs/R2_FUSED.md 8)
+PRED_FUSED = dict(P1F_agreement=0.999,
+                  P3F_ratio={64: (0.95, 0.99), 128: (0.95, 1.00), 219: (0.95, 1.00)},
+                  P4F_eff_ratio={64: (2.6, 3.2), 128: (2.05, 2.5), 219: (1.65, 1.95)})
 
 
 def log(msg):
@@ -69,10 +80,15 @@ def parse_args(argv):
     ap.add_argument("--steps", type=int, default=512)
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--arms", default="SH,R2")
+    ap.add_argument("--r2", default="built", choices=("built", "fused"),
+                    help="the R2 arm: as built (step_fixed, DeviceWritebackBody) or fused (docs/R2_FUSED.md 8)")
+    ap.add_argument("--gt", action="store_true", help="with --r2 fused: r2_fused_cell.part_gt first (MUST gates)")
     a = ap.parse_args(argv)
     a.arms = [x for x in a.arms.split(",") if x]
     if a.arms not in (["SH", "R2"], ["SH"]):
         ap.error("arms must be SH,R2 or SH (R2 is teacher-forced on SH's tokens)")
+    if a.gt and a.r2 != "fused":
+        ap.error("--gt goes with --r2 fused")
     if a.batch < 1 or not 1 <= a.warmup < a.steps or a.steps > 1000:
         ap.error("--batch >= 1, --warmup in 1 .. steps - 1, --steps <= 1000 (the shipped total_cis holds S + 1024)")
     return a
@@ -184,6 +200,32 @@ def verdicts(B: int, sh, r2, agree, expected):
         pr = r2["gpu_peak_alloc_GB"] / sh["gpu_peak_alloc_GB"]
         out.append(("P5", "CONFIRMED" if pr <= PRED["P5_peak_ratio"] else "REFUTED",
                     "R2 / SH peak allocated %.3f (limit %s)" % (pr, PRED["P5_peak_ratio"])))
+    return out
+
+
+def verdicts_fused(B: int, sh, r2, agree, expected):
+    """--r2 fused: P1F (teacher-forced agreement >= P1F_agreement), P2 (as verdicts), P3F / P4F (the steady and the
+    effective R2 / SH ratios inside the band registered for B; REPORT at another B), P5 (as verdicts)."""
+    out = []
+    if agree is not None:
+        lim = PRED_FUSED["P1F_agreement"]
+        out.append(("P1F", "CONFIRMED" if agree["tf_agreement"] >= lim else "REFUTED",
+                    "teacher-forced agreement %.6f (>= %s), %d of %d requests diverged (first at step %s)" % (
+                        agree["tf_agreement"], lim, agree["n_diverged"], agree["n_requests"],
+                        agree["first_divergence_min"])))
+    base = {p[0]: p for p in verdicts(B, sh, r2, None, expected)}
+    if "P2" in base:
+        out.append(base["P2"])
+    if sh is not None and r2 is not None and sh["rates"]["steady_step_ms"] and r2["rates"]["steady_step_ms"]:
+        for name, key, val in (("P3F", "P3F_ratio", r2["rates"]["steady_step_ms"] / sh["rates"]["steady_step_ms"]),
+                               ("P4F", "P4F_eff_ratio",
+                                r2["rates"]["effective_tok_s"] / sh["rates"]["effective_tok_s"])):
+            band = PRED_FUSED[key].get(B)
+            v = "REPORT" if band is None else ("CONFIRMED" if band[0] <= val <= band[1] else "REFUTED")
+            what = "steady step time" if name == "P3F" else "effective tok/s"
+            out.append((name, v, "R2 (fused) / SH %s %.3f (band %s at B %d)" % (what, val, band, B)))
+        if "P5" in base:
+            out.append(base["P5"])
     return out
 
 
@@ -303,7 +345,7 @@ def run_shipped(model, ids, steps: int, clock):
     return dict(inputs=inputs, periods=periods, rewarms=rewarms, prefill_s=round(prefill_s, 1))
 
 
-def run_r2(model, ids, inputs, steps: int, warmup: int, clock):
+def run_r2(model, ids, inputs, steps: int, warmup: int, clock, mode: str = "built"):
     import torch
     from nosi import r2_capture as RC
     from nosi.r2_decode_path import build_ragged
@@ -317,8 +359,15 @@ def run_r2(model, ids, inputs, steps: int, warmup: int, clock):
     first_agree = int((first.view(-1) == inputs[:, 0]).sum())
     kernels, wb = RC.default_kernels()
     cb = RC.CaptureBuffers(model, st, False, kernels, wb)
+    if mode == "fused":                                  # before the warm-up: the capture records the fused kernels
+        from nosi import r2_twin_fused as FU
+        from nosi.r2_body_fused import FusedBody
+        for t in st.twins:
+            FU.attach(t, methods=("step_fixed",), require_fixed_order=False)
+        cb.body = FusedBody(False, wb)
     res = r2_teacher_forced(RC, model, st, cb, cache, inputs, warmup, True, clock)
-    res.update(prefill_s=round(prefill_s, 1), first_token_agreement=first_agree, widths=st.meta.get("widths"))
+    res.update(prefill_s=round(prefill_s, 1), first_token_agreement=first_agree, widths=st.meta.get("widths"),
+               mode=mode, overflow=[int(t.overflow) for t in st.twins] if mode == "fused" else None)
     del res["graph"], cb, st, cache
     return res
 
@@ -380,13 +429,22 @@ def main(argv=None) -> int:
         print(str(e), file=sys.stderr)
         return 20
     os.makedirs(a.out)
+    gates, sh, r2, agree, gt = [], None, None, None, {}
+    if a.gt:                                             # the fused twin's GPU gate, before the model loads
+        log("GT (r2_fused_cell.part_gt)")
+        try:
+            import r2_fused_cell as FC
+            FC.part_gt(gates, gt)
+        except Exception as e:
+            traceback.print_exc()
+            gates.append(("GT-RAN", True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+        free()
     rows = doc_rows(a.batch)
     ids = docs[rows].contiguous().to("cuda")
     clock = CudaClock()
     t0 = time.time()
     model = Llama(model_name=a.model, device="cuda", offload=True)
     log("model loaded in %.0f s" % (time.time() - t0))
-    gates, sh, r2, agree = [], None, None, None
     expected = expected_rewarms(S0, a.steps)
     mem = dict(after_load=host_mem())
     with torch.inference_mode():
@@ -420,19 +478,21 @@ def main(argv=None) -> int:
                 log("arm R2")
                 r2_base = round(torch.cuda.memory_allocated() / 1e9, 3)
                 try:
-                    res = run_r2(model, ids, inputs, a.steps, a.warmup, clock)
+                    res = run_r2(model, ids, inputs, a.steps, a.warmup, clock, a.r2)
                     pa, pr = gpu_peak()
                     steady = period_stats(res["periods"], list(range(a.warmup + 1, a.steps)))
                     r2 = dict(prefill_s=res["prefill_s"], warmup=a.warmup, capture_ms=res["capture_ms"], steady=steady,
                               rates=rates(a.batch, a.steps, res["periods"], steady), gpu_peak_alloc_GB=pa,
                               gpu_peak_reserved_GB=pr, gpu_base_alloc_GB=r2_base,
                               first_token_agreement=res["first_token_agreement"],
-                              widths=res["widths"], body_err=res["body_err"], twin_err=res["twin_err"])
+                              widths=res["widths"], body_err=res["body_err"], twin_err=res["twin_err"],
+                              mode=res["mode"], overflow=res["overflow"])
                     agree = agreement(res["pred"], inputs, min(a.batch, N_DOCS))
-                    gates.append(("R2-RUN", True, True, "%d steps" % a.steps))
-                    errs = res["body_err"] or any(res["twin_err"])
-                    gates.append(("R2-ERR", True, not errs, "refusal bits body %s twins %s" % (
-                        res["body_err"], sorted(set(res["twin_err"])))))
+                    gates.append(("R2-RUN", True, True, "%d steps (R2 %s)" % (a.steps, res["mode"])))
+                    errs = res["body_err"] or any(res["twin_err"]) or any(res["overflow"] or [])
+                    gates.append(("R2-ERR", True, not errs, "refusal bits body %s twins %s; overflow flags %s" % (
+                        res["body_err"], sorted(set(res["twin_err"])),
+                        sorted(set(res["overflow"])) if res["overflow"] is not None else "n/a (built)")))
                     ch = res["pointers_changed"]
                     gates.append(("R2-PTR", True, ch == [], "%s of %s state pointers moved: %s" % (
                         len(ch) if ch is not None else "?", res["pointers_checked"], (ch or [])[:10])))
@@ -441,12 +501,13 @@ def main(argv=None) -> int:
                     gates.append(("R2-RUN", True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
             mem["after_R2"] = host_mem()
             free()
-    preds = verdicts(a.batch, sh, r2, agree, expected)
+    preds = (verdicts_fused if a.r2 == "fused" else verdicts)(a.batch, sh, r2, agree, expected)
     meta = dict(batch=a.batch, steps=a.steps, warmup=a.warmup, S0=S0, doc_rows=rows, n_unique_docs=min(a.batch, N_DOCS),
-                workload_sha256=sha, expected_rewarms=expected, attn_splits=NL._ATTN_SPLITS, predictions=PRED,
+                workload_sha256=sha, expected_rewarms=expected, attn_splits=NL._ATTN_SPLITS,
+                predictions=(PRED_FUSED if a.r2 == "fused" else PRED), r2=a.r2, gt=a.gt,
                 nosi_commit=os.environ.get("BASE_COMMIT", "unknown"), torch=torch.__version__,
                 gpu=torch.cuda.get_device_name(0), host_mem=mem)
-    out = dict(meta=meta, SH=sh, R2=r2, agreement=agree,
+    out = dict(meta=meta, SH=sh, R2=r2, agreement=agree, GT=gt or None,
                gates=[dict(name=g[0], must=g[1], passed=bool(g[2]), detail=g[3]) for g in gates],
                predictions=[dict(name=p[0], verdict=p[1], detail=p[2]) for p in preds])
     with open(os.path.join(a.out, "summary.json"), "w") as f:

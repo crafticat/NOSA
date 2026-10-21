@@ -5,9 +5,15 @@ PARTS (--parts, default all):
       BITWISE on the GPU, bfloat16 tables at the R2 sizes (B 64, H 8, D 128, Lk 1013, N 16259; ragged prompts
       16000 .. 16141): 40 single steps with ragged activity, then 10 advance ticks of T 4 with ragged n (0 .. 4), every
       table, counter, the overflow flag and ctr compared after every call (MUST GT-EQ; the key / cis events and block
-      crossings are counted: MUST GT-COVER). The three planted faults (r2_twin_fused.PLANTS) are each caught on a copy
-      of the state (MUST GT-NEG). REPORT: device ms per call (CUDA events, 20 calls, all active) of the torch ops and of
-      the kernel.
+      crossings are counted: MUST GT-COVER). The planted faults (r2_twin_fused.PLANTS), each on three copies of the
+      state fed the same inputs: the torch ops (a), the unplanted kernel (u) and the planted kernel (p). A plant is
+      EFFECTIVE at the first step where p differs from u (kernel to kernel, before the gate's comparison) and CAUGHT at
+      the first step where p differs from a; a plant that is never effective is "no-op on this data" (REPORTED, not
+      caught). MUST GT-NEG, on the run's data (random bfloat16): plants 2 and 3 caught, no effective plant missed, u ==
+      a throughout; plant 1 caught or no-op (bfloat16 sums of 32 rows are exact in float32 when the exponents are close,
+      r2_twin_fused.order_probe_keys). MUST GT-NEG-ORDER, on the ORDER PROBE (every key summary order-sensitive,
+      order_probe_ring / order_probe_keys, all banks active): plant 1 effective AND caught, u == a throughout. REPORT:
+      device ms per call (CUDA events, 20 calls, all active) of the torch ops and of the kernel.
   GB  nosi/nosi/r2_body_fused.py FusedBody.decode_fixed == DeviceWritebackBody.decode_fixed BITWISE with the real
       kernels (diff_offload, flash_h2d_from_mask(_bias), the Triton write-back) on a synthetic engine (B 64, H 8, D 128,
       prompts 6016 .. 6079, pinned host rows): 96 steps with ragged activity; every engine table and err after every step
@@ -112,6 +118,40 @@ def verdicts(agg, timing):
 
 
 # ------------------------------------------------------------------ GT
+NOOP = "no-op on this data"
+
+
+def plant_status(effective, caught):
+    """'caught' (the plant changed the kernel's output and the gate's comparison saw it), 'MISSED' (it changed the
+    output, the comparison did not see it), NOOP (it never changed the output on this data: not a catch)."""
+    if effective is None:
+        return NOOP
+    return "caught" if caught is not None else "MISSED"
+
+
+def neg_gates(data, order):
+    """GT-NEG (the run's data: {plant: run}) and GT-NEG-ORDER (plant 1 on the order probe); a run is dict(status,
+    effective, caught, unplanted_differs_at). Returns [(name, must, passed, detail)]."""
+    if set(data) != {1, 2, 3}:
+        g1 = (False, "plant runs %s (expected 1, 2, 3)" % sorted(data))
+    else:
+        broke = [p for p, r in sorted(data.items()) if r["unplanted_differs_at"] is not None]
+        missed = [p for p, r in sorted(data.items()) if r["status"] == "MISSED"]
+        weak = [p for p in (2, 3) if data[p]["status"] != "caught"]
+        p1 = data[1]["status"] in ("caught", NOOP)
+        g1 = (not broke and not missed and not weak and p1,
+              "per plant (status, effective, caught) %s; unplanted kernel != torch in %s; missed %s; plants 2 / 3 not "
+              "caught %s" % ({p: (r["status"], r["effective"], r["caught"]) for p, r in sorted(data.items())}, broke,
+                             missed, weak))
+    if order is None:
+        g2 = (False, "no order-probe run")
+    else:
+        g2 = (order["status"] == "caught" and order["unplanted_differs_at"] is None,
+              "plant 1 on the order probe: %s (effective %s, caught %s); unplanted kernel != torch at step %s" % (
+                  order["status"], order["effective"], order["caught"], order["unplanted_differs_at"]))
+    return [("GT-NEG", True) + g1, ("GT-NEG-ORDER", True) + g2]
+
+
 def _bits(t):
     import torch
     t = t.contiguous()
@@ -198,24 +238,40 @@ def part_gt(gates, res):
                   "overflow %s" % (ev["calls"], first, bool(ref.overflow))))
     gates.append(("GT-COVER", True, ev["key"] >= 64 and ev["cis"] >= 64 and ev["cross"] >= 16 and ev["inactive"] > 0,
                   "events %s (needs key >= 64, cis >= 64, cross >= 16, inactive > 0)" % ev))
-    caught = {}
-    for plant in (1, 2, 3):
-        a, b2 = _twin_copy(ref), _twin_copy(ref)
-        found = None
-        for s in range(24):                     # plant 1 in bfloat16 differs only where the float32 sums round apart
-            act =(torch.rand(B, generator=gh) < 0.7).to(dev)
-            keys = torch.randn(B, H, D, generator=gc, device=dev).to(torch.bfloat16)
+    def plant_run(plant, src, steps, probe):
+        """Three copies of src fed the same inputs: a (torch ops), u (unplanted kernel), p (planted kernel)."""
+        a, u, p = _twin_copy(src), _twin_copy(src), _twin_copy(src)
+        eff = got = broke = None
+        for s in range(steps):
+            if probe:                                     # every bank active, the probe's keys at its own positions
+                act = torch.ones(B, dtype=torch.bool, device=dev)
+                keys = FU.order_probe_keys(a.pos, H, D).to(torch.bfloat16)
+            else:
+                act = (torch.rand(B, generator=gh) < 0.7).to(dev)
+                keys = torch.randn(B, H, D, generator=gc, device=dev).to(torch.bfloat16)
             cis = torch.randn(B, H, generator=gc, device=dev).to(torch.bfloat16)
             a.step_unchecked(keys, cis, act)
-            FU.step_fused(b2, keys, cis, act, plant=plant)
-            d = _twin_diff(a, b2)
-            if d:
-                found = (s, d)
+            FU.step_fused(u, keys, cis, act)
+            FU.step_fused(p, keys, cis, act, plant=plant)
+            if broke is None and _twin_diff(a, u):
+                broke = s
+            if eff is None:
+                d = _twin_diff(u, p)
+                eff = (s, d) if d else None
+            if got is None:
+                d = _twin_diff(a, p)
+                got = (s, d) if d else None
+            if eff is not None and got is not None:
                 break
-        caught[plant] = found
-        del a, b2
-    gates.append(("GT-NEG", True, all(v is not None for v in caught.values()),
-                  "planted faults caught (first step, fields): %s" % caught))
+        del a, u, p
+        return dict(status=plant_status(eff, got), effective=eff, caught=got, unplanted_differs_at=broke)
+    data = {plant: plant_run(plant, ref, 24, False) for plant in (1, 2, 3)}
+    src = _twin_copy(ref)
+    FU.order_probe_ring(src)
+    order = plant_run(1, src, 20, True)
+    del src
+    gates.extend(neg_gates(data, order))
+    caught = dict(data=data, order=order)
     # REPORT: device ms per call, all active, on copies
     t1, t2 = _twin_copy(ref), _twin_copy(ref)
     act = torch.ones(B, dtype=torch.bool, device=dev)

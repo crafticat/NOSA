@@ -277,3 +277,35 @@ def attach(twin, methods=("step_unchecked", "advance_unchecked"), require_fixed_
             raise ValueError("cannot attach %r (one of %s)" % (m, sorted(table)))
         setattr(twin, m, functools.partial(table[m], twin))
     return twin
+
+
+# ------------------------------------------------------------------ the order probe (negative control of PLANT 1)
+PROBE_T = 2.0 ** -30          # exact in bfloat16 and float32
+PROBE_A = 1.0
+
+
+def order_probe_keys(q: torch.Tensor, H: int, D: int) -> torch.Tensor:
+    """float32 keys (len(q), H, D), exact in bfloat16, for the positions q, on which EVERY key summary is ORDER-SENSITIVE.
+    WHY PLANT 1 CAN BE BLIND: the key summary is a float32 chain over 32 bfloat16 rows. A bfloat16 value has 8
+    significant bits, so when the nonzero values of a column lie within 11 binary exponents of each other, every partial
+    sum is an integer multiple of 2^(e_min - 7) below 2^(e_max + 6): at most 24 bits, exact in float32. The sum is then
+    exact in ANY order, the reversed chain gives the same bits, and PLANT 1 changes nothing. Inputs with a wider spread
+    round, but the bfloat16 rounding of the mean hides a last-bit difference except near a rounding boundary.
+    THE PROBE: per period of 16 positions, 14 rows of t = 2^-30, then A = 1, then -A (a window starts at a multiple of
+    16 and holds two periods). Window order: 14 t (exact), + A rounds to A (14 t < half an ulp of 1), - A gives 0, the
+    same again: 0. Reverse order: -A + A = 0, + 14 t, - A rounds to -A, + A = 0, + 14 t: 14 t. The means 0 and 14 t / 32
+    = 7 * 2^-34 differ in float32 and in bfloat16."""
+    r = (q.to(torch.int64) % STRIDE).view(-1, 1, 1).expand(-1, H, D)
+    x = torch.full(r.shape, PROBE_T, dtype=torch.float32, device=q.device)
+    x = torch.where(r == STRIDE - 2, torch.full_like(x, PROBE_A), x)
+    return torch.where(r == STRIDE - 1, torch.full_like(x, -PROBE_A), x)
+
+
+def order_probe_ring(twin) -> None:
+    """Fill every bank's key ring with order_probe_keys of the positions it holds (row r holds the position q in
+    [pos - 64, pos) with q % 64 == r), in the ring's dtype: the windows of the next key summaries are probe rows."""
+    p = twin.pos.view(-1, 1)
+    r = torch.arange(RING, device=p.device).view(1, -1)
+    q = p - RING + (r - p) % RING                                           # (B, 64)
+    twin.ring.copy_(order_probe_keys(q.reshape(-1), twin.H, twin.D).view(twin.B, RING, twin.H, twin.D)
+                    .to(twin.ring.dtype))

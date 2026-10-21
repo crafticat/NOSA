@@ -25,7 +25,7 @@
 # seconds left, no step besides batch / extern. The claim: OUTROOT/fused_active (mkdir, atomic); a stop after the claim
 # leaves it (the lead decides).
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-fused                                                    # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-fused2                                                   # ROOT
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                         # ROOT (lead-owned)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT

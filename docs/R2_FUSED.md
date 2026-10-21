@@ -204,3 +204,75 @@ capacity):**
 | TK3: TGF t.twin | 32 - 40 ops, <= 1.0 ms | 32 - 40 ops, <= 0.5 ms |
 | TK4: TG - TGF device ms | 21 - 44.5 | 6.5 - 15.5 |
 | TK1 (MUST TGF-EQ) | bitwise | bitwise |
+
+## 8. M-F f1 (holder 2190876) and what follows
+
+**The result.** All 5 registered predictions were CONFIRMED:
+- F is 44.936 ms per step.
+- F - SH is -0.532 ms device and -1.400 ms in the median period.
+- G - F is 7.588 ms.
+- F has 1193 GPU ops per step.
+
+GT-EQ, GT-COVER, GB-EQ and GB-NEG passed. GT-NEG failed: PLANT 1 (the key sum in reverse order)
+was not caught.
+
+**Why PLANT 1 was blind (proof: test F5).**
+
+The kernel's key summary works per bank and per (head, dim) column:
+- It sums 32 bfloat16 ring rows, the positions 16 n_comp .. 16 n_comp + 31.
+- Each row is decoded exactly to float32.
+- One float32 chain adds them in window order (PLANT 1: in reverse order).
+- It multiplies by 2^-5 and rounds the result to bfloat16.
+
+A bfloat16 value has 8 significant bits. Let e_min and e_max be the smallest and the largest
+exponent of the nonzero values in a column. If e_max - e_min <= 11, every partial sum is a
+multiple of 2^(e_min - 7) and is below 2^(e_max + 6). That is at most 24 bits, so it is exact in
+float32. The sum is then exact in any order, and the reversed chain gives the same bits. When the
+spread is wider, a reordering changes only the last float32 bits. The bfloat16 rounding of the
+mean removes that change, unless the sum is within about 2^-16 of a rounding boundary.
+
+The GT gate's data was synthetic N(0, 1) keys in bfloat16, not model keys. On that data more than
+95 % of the column sums are exact, and at most 1e-4 of the bfloat16 means change. So PLANT 1 did
+not change the output: the control was blind, and the twin has no defect. The CPU test F2 caught
+PLANT 1 because its plant runs use float32 tables (24-bit inputs, whose sums do round).
+
+**The fix (GT, unchanged thresholds elsewhere).**
+- Each plant runs on three copies fed the same inputs:
+  - the torch ops (a);
+  - the unplanted kernel (u);
+  - the planted kernel (p).
+- A plant is EFFECTIVE at the first step where p differs from u, and CAUGHT at the first step where
+  p differs from a.
+- A plant that is never effective is "no-op on this data". It is REPORTED, not counted as caught.
+- GT-NEG (the run's data): plants 2 and 3 must be caught. No effective plant may be missed. u must
+  equal a throughout. Plant 1 may be caught or no-op.
+- GT-NEG-ORDER (new, MUST): the ORDER PROBE (`order_probe_keys` / `order_probe_ring`) puts every key
+  summary on order-sensitive rows. Per 16 positions there are 14 rows of 2^-30, then 1, then -1.
+  - In window order the sum is 0. Reversed, it is 14 x 2^-30.
+  - Plant 1 must be effective AND caught, and u must equal a.
+
+**The next job: r2base-fused** (`r2_base_cell.py --r2 fused`, `r2_base_fused_step.sh`).
+- It is the r2base cell of cd77de2: B 64 / 128 / 219, S 16128, N 512, agreement against shipped.
+- The R2 arm has the fused twin on `step_fixed` and `FusedBody`, attached before the warm-up.
+- R2-ERR also requires every overflow flag clear.
+- The cell `gt64` runs GT first (its gates are MUST gates of the cell), then B 64. So ONE job holds
+  the GT f2 gate and the B 64 row. b128 and b219 are separate steps.
+
+**Registered predictions (r2base-fused).** The basis is rb1 2190876 (R2 / SH steady 1.129 / 1.090
+/ 1.068, effective 2.784 / 2.170 / 1.755) and M-F f1 (the fusion removes about 7.4 ms of period at
+B 64, and F - SH = -1.40 ms).
+
+| B | P3F steady R2 / SH | P4F effective R2 / SH |
+|---|---|---|
+| 64 | 0.95 - 0.99 | 2.6 - 3.2 |
+| 128 | 0.95 - 1.00 | 2.05 - 2.5 |
+| 219 | 0.95 - 1.00 | 1.65 - 1.95 |
+
+- P1F: the teacher-forced agreement is >= 0.999 at each B. The point prediction is 1.000000, as
+  rb1. The shipped compression and torch's `.mean` add in float32, and float32 sums of 32 bfloat16
+  keys are exact almost always (above), so the fixed-order mean gives the same bits.
+- P2 and P5 are unchanged.
+- **Falsifiers:**
+  - a steady ratio above the band at any B (the fused R2 step is not at parity);
+  - an agreement below 0.999 (the fixed-order mean differs from torch's on model keys);
+  - an effective ratio below the band.
