@@ -55,7 +55,8 @@ CIS bias in FlashInfer: the JIT custom variant R2FiCisBias (the ALiBi-branch pat
 - Rows of one request sit at consecutive positions. Row u > 0 swaps 4 scattered blocks of the request's base list.
 - bf16 q / K / V from N(0, 1). The bias is uniform in [-8, 8], so it moves the logits by about +-0.7 (gate C can see
   a missing bias: witness CW).
-- Cells: B in {8, 32} x rows per request in {1, 4}. Order: 8x1 (the inspected miniature), 8x4, 32x1, 32x4.
+- Cells: B in {8, 32} x rows per request in {1, 4}. Order in fia1: 8x1 (the inspected miniature), 8x4, 32x1, 32x4;
+  from fia2: 32x4, 32x1, 8x4, 8x1 (section 9).
 - Extra batches: "alt" (each odd row gets a new q and new lists), "hazard" (the full batch plus 3 short rows of 5, 8
   and 9 pages on an extra storage entry).
 
@@ -189,3 +190,28 @@ and after (lessons L37); the 8x1 cell runs first inside the step and is the insp
    not refuse it.
 7. q per head is a strided view. The kernel reads q_stride_n / q_stride_h (prefill.cuh:448); gate C would show a
    wrong read.
+
+## 9. Fix round after fia1 (job 2191262, commit 693da86; the predictions in section 6 are UNCHANGED)
+
+What the fia1 record shows (/mnt/beegfs/ojerbi/r2-runs/fiattn/fiattn_fia1_2191262.step/stdout.txt):
+- All four cells ran. The record holds 81 GATE lines, all PASS, including every MUST gate of 32x1 and 32x4.
+  "0 MUST gate(s) failed" and exit 0 were therefore correct for that run.
+- The traceback in stderr.txt came from the REPORT-only STRIDED probe at 32x4 (bench line 706,
+  FIStridedArm.prepare). Option B makes 256 requests x 8 chunks. Its split partials need 256 MiB (tmp_v) + 2 MiB
+  (tmp_s), above the fixed 256 MiB float workspace. The F8 / FH arms need half of that per head, so they fit.
+- pack/layer 0.31 ms was the same at R 8 and R 128: launch-bound. About 12 small torch ops per head, two heads.
+
+Changes (source only, not run):
+1. The float workspace is sized per plan from FlashInfer's own formula (fi_float_need: G x padded x cta_tile_q x D
+   x 4 B + G x padded x cta_tile_q x 4 B, padded = sum of chunks; heuristic bound max(requests, 2 x SMs)). It starts
+   at 1 MiB and grows. T reports the need, the allocation and what the plan reserves (and flags a need below use).
+2. Gate COMPLETE (MUST) per requested cell: every expected MUST gate of the cell must be present. A cell or an arm
+   that never reports now fails the run instead of passing by absence. (Before: a cell exception or a budget skip
+   already failed a MUST gate; a partial arm only failed through its exception gate.)
+3. Packing: pack_all_heads makes both heads in one pass (the ragged path). With constant counts (every row and head
+   lists 64 pages: NOSA's fixed top-k) pack_fixed is one elementwise op that writes in place into the indices buffer
+   the plan already holds. Plan depends only on indptr / last_page_len / counts, and the kernel reads the indices
+   at run time, so ONE plan per tick (per KV head) can serve all 32 layers when the counts are equal. REPORT
+   R_REUSE checks it bitwise (plan on one layer, write another layer's lists in place, compare with a fresh plan);
+   T times "pack/layer (constant counts)" and "layer with the tick's plan reused".
+4. The step runs the cells in the order 32x4, 32x1, 8x4, 8x1.

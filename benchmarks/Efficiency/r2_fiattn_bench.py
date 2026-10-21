@@ -62,6 +62,12 @@ GATES (MUST unless noted; P, F8 and F0 each; "bitwise" = equal int16 views of th
   T    REPORT: CUDA-event time of the attention call (FlashInfer: both head calls + the output interleave; and the
        runs alone), plan() host time with host indptr and with device indptr (a D2H sync inside plan), packing time,
        JIT build / load time, workspace bytes and the peak allocated delta of one call. Bands from PRED.
+  COMPLETE  [fix after fia1] per requested cell: every expected MUST gate of the cell is present (a cell or arm
+       that never reported fails here, not by absence).
+  REUSE  REPORT [fix after fia1]: one plan, a second layer's lists written in place into the planned indices
+       buffer (constant counts), bitwise vs a fresh plan; timed as "layer with the tick's plan reused".
+  The FlashInfer float workspace is sized from FlashInfer's own formula for each plan (fi_float_need; fia1's fixed
+  256 MiB overflowed the option-B probe at 32x4) and reported as memory (need, allocated, reserved by the plan).
   NCU  REPORT (--ncu): one ncu process per cell (all arms of the cell, NVTX range fia|<arm> each), kernel filter
        KERNEL_FILTER (the attention kernels only), --cache-control all (cold L2 per kernel), hard cap min(600 s, the
        budget left); DRAM bytes read / write per arm vs the per-row ideal and the request-union ideal. Label: every
@@ -111,7 +117,8 @@ MUST_ARMS = ("P", "F8", "F0")
 FI_VERSION = "0.5.3"
 TOL_C = 1.0e-3                              # REGISTERED: max |arm - fp64| (absolute), every arm
 WITNESS_FACTOR = 10.0                       # CW precondition: the bias moves the reference by >= 10 x TOL_C
-FLOAT_WS_BYTES = 256 << 20                  # FlashInfer float workspace per FlashInfer arm (shared by its 2 wrappers)
+MIN_FLOAT_WS = 1 << 20                      # [fix after fia1] the float workspace starts here and grows to the
+                                            # plans' need (fi_float_need; fia1's fixed 256 MiB overflowed option B)
 N_SAMPLE = 16                               # rows per cell for C, I1 and N
 CELL_RESERVE_S = 300                        # a cell starts only with this much budget left
 NCU_ORDER = ((32, 4), (32, 1), (8, 4), (8, 1))
@@ -481,22 +488,46 @@ def union_bytes(b, geom, n_entries, s_slots):
 
 
 # ------------------------------------------------------------------ FlashInfer packing and addressing
-def pack_option_a(b, s_slots, h):
-    """FlashInfer CSR for KV head h, requests = rows: indptr (R + 1), indices (an R * P buffer; the first indptr[R]
-    entries are the pages: entry * S + slot in the row's canonical order), last_page_len (R). Device ops only."""
+def pack_all_heads(b, s_slots):
+    """[fix after fia1] FlashInfer CSR for EVERY KV head in one pass (the per-head version cost about 12 small
+    launches per head: 0.31 ms per layer, launch-bound). Per head h: (indptr (R + 1), indices (an R * P buffer; the
+    first indptr[R] entries are the pages: entry * S + slot in the row's canonical order), last_page_len (R)).
+    Ragged counts allowed. Device ops only (cumsum + scatter, no host read)."""
     pt = b["page_table"]
     dev = pt.device
-    r_, _, p_ = pt.shape
-    npg = b["num_pages"][:, h].to(torch.int64)
-    indptr = torch.zeros(r_ + 1, dtype=torch.int64, device=dev)
-    indptr[1:] = torch.cumsum(npg, 0)
-    j = torch.arange(p_, device=dev)
-    valid = j.view(1, -1) < npg.view(-1, 1)
-    gid = b["seq_idx"].to(torch.int64).view(-1, 1) * s_slots + pt[:, h, :].to(torch.int64)
-    pos = torch.where(valid, indptr[:-1].view(-1, 1) + j.view(1, -1), torch.full_like(gid, r_ * p_))
-    buf = torch.zeros(r_ * p_ + 1, dtype=torch.int32, device=dev)
+    r_, hkv, p_ = pt.shape
+    npg = b["num_pages"].to(torch.int64).t()                                       # (Hkv, R)
+    indptr = torch.zeros(hkv, r_ + 1, dtype=torch.int64, device=dev)
+    indptr[:, 1:] = torch.cumsum(npg, 1)
+    j = torch.arange(p_, device=dev).view(1, 1, -1)
+    valid = j < npg.unsqueeze(-1)                                                 # (Hkv, R, P)
+    gid = b["seq_idx"].to(torch.int64).view(1, -1, 1) * s_slots + pt.permute(1, 0, 2).to(torch.int64)
+    row = r_ * p_ + 1                                                             # per head: R * P + a dump slot
+    base = (torch.arange(hkv, device=dev) * row).view(-1, 1, 1)
+    pos = base + torch.where(valid, indptr[:, :-1].unsqueeze(-1) + j, torch.full_like(gid, r_ * p_))
+    buf = torch.zeros(hkv * row, dtype=torch.int32, device=dev)
     buf.scatter_(0, pos.reshape(-1), gid.to(torch.int32).reshape(-1))             # invalid entries -> the dump slot
-    return indptr.to(torch.int32), buf[:r_ * p_], b["last_len"].to(torch.int32).contiguous()
+    bv = buf.view(hkv, row)
+    ip = indptr.to(torch.int32)
+    last = b["last_len"].to(torch.int32).contiguous()
+    return [(ip[h], bv[h, :r_ * p_], last) for h in range(hkv)]
+
+
+def pack_option_a(b, s_slots, h):
+    """KV head h of pack_all_heads (the tests' per-head view)."""
+    return pack_all_heads(b, s_slots)[h]
+
+
+def pack_fixed(b, s_slots, out):
+    """[fix after fia1] The constant-count path: every (row, head) lists exactly P pages (NOSA's fixed top-k; the
+    caller's structural guarantee, checked from host counts in FIArm.prepare). Then indptr is r * P for all layers and
+    a layer's indices are ONE elementwise expression, written IN PLACE into out (Hkv, R * P) int32: the buffer a plan
+    already holds, so one plan per tick serves every layer with these counts (plan depends on indptr / last_page_len
+    only; the kernel reads the indices buffer at run time)."""
+    pt = b["page_table"]
+    r_, hkv, p_ = pt.shape
+    torch.add(pt.permute(1, 0, 2), b["seq_idx"].view(1, -1, 1) * s_slots, out=out.view(hkv, r_, p_))
+    return out
 
 
 def pack_option_b(b, s_slots):
@@ -584,6 +615,34 @@ def plan_info_of(w):
                 chunk_tokens=int.from_bytes(raw, "little", signed=True))
 
 
+def cta_tile_for(g):
+    """FA2DetermineCtaTileQ (utils.cuh:349-368, sm80+) for one query row per request: packed length = the group."""
+    return 16 if g <= 16 else (64 if g <= 64 else 128)
+
+
+def _a16(x):
+    return (int(x) + 15) // 16 * 16
+
+
+def fi_float_need(counts, split, g, d, sms, fixed=FIXED_SPLIT):
+    """[fix after fia1] FlashInfer's float workspace for ONE plan, by its own formula (scheduler.cuh:750-755 in
+    PrefillPlan, padded = new_batch_size without CUDA graph from PrefillSplitQOKVIndptr): tmp_v = G * padded * cta *
+    D * 4 B and tmp_s = G * padded * cta * 4 B, each 16-aligned. counts = the pages of each request (one query row).
+    'fixed': padded = sum ceil(c / F); 'none': 0 (never split); 'heuristic': the bound max(requests, 2 * SMs) (the
+    binary search keeps a split batch <= 2 * SMs / num_kv_heads, num_kv_heads 1 here; unsplit = the requests).
+    fia1: option B at 32x4 = 256 requests x 8 chunks -> 256 MiB + 2 MiB, above the fixed 256 MiB (the overflow)."""
+    if split == "none":
+        return 0
+    cta = cta_tile_for(g)
+    if split == "fixed":
+        nb = sum(max(1, -(-int(c) // fixed)) for c in counts)
+    elif split == "heuristic":
+        nb = max(len(counts), 2 * int(sms))
+    else:
+        raise ValueError(split)
+    return _a16(g * nb * cta * d * 4) + _a16(g * nb * cta * 4)
+
+
 # ------------------------------------------------------------------ arms (GPU)
 class P3Arm:
     """Piece 3 v2 with a fixed workspace (R_max rows)."""
@@ -634,15 +693,34 @@ class FIArm:
         self.fi, self.name, self.split, self.geom, self.S = fi, name, split, geom, s_slots
         self.custom = jit_args is not None
         self.scale = geom["D"] ** -0.5
-        self.fws = torch.zeros(FLOAT_WS_BYTES, dtype=torch.uint8, device=device)
+        self.sms = torch.cuda.get_device_properties(torch.device(device)).multi_processor_count
+        self.fws = torch.zeros(MIN_FLOAT_WS, dtype=torch.uint8, device=device)     # grown from the plan's need
+        self.float_need = 0
         kw = dict(use_tensor_cores=True, backend="fa2")
         if jit_args is not None:
             kw["jit_args"] = jit_args
         self.wr = [fi.BatchDecodeWithPagedKVCacheWrapper(self.fws, "NHD", **kw) for _ in range(geom["Hkv"])]
-        self.workspace_bytes = FLOAT_WS_BYTES + sum(w._int_workspace_buffer.numel() for w in self.wr)
-        self.pinned_bytes = sum(w._pin_memory_int_workspace_buffer.numel() for w in self.wr)
         self.info = None
-        self._b = self._oh = None
+        self.fixed_counts = False
+        self._b = self._oh = self._ix = None
+
+    @property
+    def workspace_bytes(self):
+        """Device workspace now held: the float buffer (sized from the plans' need) + the 8 MiB int buffers."""
+        return self.fws.numel() + sum(w._int_workspace_buffer.numel() for w in self.wr)
+
+    @property
+    def pinned_bytes(self):
+        return sum(w._pin_memory_int_workspace_buffer.numel() for w in self.wr)
+
+    def ensure_ws(self, need):
+        """Grow (never shrink) the shared float workspace to FlashInfer's need for the coming plans (MiB-rounded)."""
+        self.float_need = int(need)
+        if need > self.fws.numel():
+            size = (int(need) + (1 << 20) - 1) >> 20 << 20
+            self.fws = torch.zeros(size, dtype=torch.uint8, device=self.fws.device)
+            for w in self.wr:
+                w.reset_workspace_buffer(self.fws, w._int_workspace_buffer)
 
     def plan_kwargs(self):
         if self.split == "fixed":
@@ -652,7 +730,7 @@ class FIArm:
         return {}
 
     def pack(self, b):
-        return [pack_option_a(b, self.S, h) for h in range(self.geom["Hkv"])]
+        return pack_all_heads(b, self.S)
 
     def plan_packed(self, packed):
         """plan() per head. indptr / last_page_len on the host or on the device (then plan's own .to('cpu') is the
@@ -665,13 +743,37 @@ class FIArm:
         self.info = [plan_info_of(w) for w in self.wr]
 
     def prepare(self, b):
+        """Pack + plan for batch b. With constant counts (every (row, head) lists P pages, read from the host copy)
+        the indices live in ONE persistent (Hkv, R * P) buffer written by pack_fixed, so relayer() can serve further
+        layers with the same plan; ragged counts use pack_all_heads."""
         check_store(b["k"], b["v"], b["bias"])
         torch.cuda.synchronize()
-        packed = [(ip.cpu(), ix, ll.cpu()) for ip, ix, ll in self.pack(b)]
+        r_, hkv, p_ = b["page_table"].shape
+        counts = b["num_pages"].cpu()
+        self.fixed_counts = bool((counts == p_).all())
+        if self.fixed_counts:
+            self._ix = torch.empty((hkv, r_ * p_), dtype=torch.int32, device=b["q"].device)
+            pack_fixed(b, self.S, self._ix)
+            ip = torch.arange(r_ + 1, dtype=torch.int32) * p_
+            last = b["last_len"].to("cpu", torch.int32)
+            packed = [(ip, self._ix[h], last) for h in range(hkv)]
+        else:
+            self._ix = None
+            packed = [(ip.cpu(), ix, ll.cpu()) for ip, ix, ll in self.pack(b)]
+        self.ensure_ws(max(fi_float_need(counts[:, h].tolist(), self.split, self.geom["G"], self.geom["D"], self.sms)
+                           for h in range(hkv)))
         self.plan_packed(packed)
-        r_ = b["q"].shape[0]
         self._oh = [torch.empty((r_, self.geom["G"], self.geom["D"]), dtype=torch.bfloat16, device=b["q"].device)
-                    for _ in range(self.geom["Hkv"])]
+                    for _ in range(hkv)]
+        self._b = b
+
+    def relayer(self, b):
+        """[fix after fia1] The next LAYER under the same plan: b must have the planned batch's row count, constant
+        counts and last_len (the plan depends on those only); its page lists are written in place into the planned
+        indices buffer. No plan, no host read."""
+        if not self.fixed_counts or self._ix is None or b["page_table"].shape[0] != self._b["page_table"].shape[0]:
+            raise ValueError("relayer needs a prepared constant-count batch of the same size")
+        pack_fixed(b, self.S, self._ix)
         self._b = b
 
     def launch_runs(self):
@@ -696,13 +798,13 @@ class FIStridedArm(FIArm):
     def __init__(self, fi, geom, s_slots, jit_args, device):
         super().__init__(fi, "STRIDED", "fixed", geom, s_slots, jit_args, device)
         self.wr = self.wr[:1]
-        self.workspace_bytes = FLOAT_WS_BYTES + self.wr[0]._int_workspace_buffer.numel()
-        self.pinned_bytes = self.wr[0]._pin_memory_int_workspace_buffer.numel()
 
     def prepare(self, b):
         check_store(b["k"], b["v"], b["bias"])
         torch.cuda.synchronize()
         ip, ix, ll = pack_option_b(b, self.S)
+        self.ensure_ws(fi_float_need(b["num_pages"].cpu().reshape(-1).tolist(), "fixed", self.geom["G"],
+                                     self.geom["D"], self.sms))
         self.wr[0].plan(ip.cpu(), ix, ll.cpu(), self.geom["G"], 1, self.geom["D"], PAGE, q_data_type=torch.bfloat16,
                         kv_data_type=torch.bfloat16, sm_scale=self.scale, fixed_split_size=FIXED_SPLIT)
         self.info = [plan_info_of(self.wr[0])]
@@ -842,6 +944,41 @@ def negative_control(tag, arm, bf, rows, must):
                 "differing %d" % (st, len(pre), len(rows), sorted(chunks)[:4], len(det)), status=st), full
 
 
+def plan_reuse_check(name, tag, arm, b_plan, b_layer):
+    """[fix after fia1] REPORT (the assessment's open item): one plan serves a second "layer" with the same counts.
+    Plan on b_plan, write b_layer's lists in place (relayer), run; compare bitwise with a fresh plan on b_layer.
+    b_layer = the alt batch (other q and lists in the odd rows, the same counts and extents)."""
+    arm.prepare(b_plan)
+    if not arm.fixed_counts:
+        return gate("R_REUSE_%s_%s" % (name, tag), False, False, "not run: the batch has ragged counts")
+    arm.relayer(b_layer)
+    reused = arm.launch()
+    fresh = arm(b_layer)
+    bad = [r for r in range(fresh.shape[0]) if not bits_equal(reused[r], fresh[r])]
+    return gate("R_REUSE_%s_%s" % (name, tag), not bad, False,
+                "one plan, the next layer's lists written in place: %d of %d rows differ from a fresh plan %s"
+                % (len(bad), fresh.shape[0], bad[:10]))
+
+
+def completeness_gates(gates, cells, arms, custom):
+    """[fix after fia1] MUST per requested cell: every expected gate of that cell is present (whatever its result),
+    so a cell or an arm that never reported cannot pass by absence."""
+    have = {g["name"] for g in gates}
+    out = []
+    for b, rpr in cells:
+        tag = cell_tag(b, rpr)
+        want = ["%s_%s_%s" % (p, a, tag) for a in MUST_ARMS if a in arms
+                for p in ("I1_alone", "I2_order", "I3_siblings", "I4_split_switch", "I5_poison", "C")]
+        if "FH" in arms:
+            want.append("N_heuristic_negative_%s" % tag)
+        if custom and "F8" in arms:
+            want.append("CW_bias_witness_%s" % tag)
+        miss = [w for w in want if w not in have]
+        out.append(gate("COMPLETE_%s" % tag, not miss, True, "%d of %d expected gates present; missing %s"
+                        % (len(want) - len(miss), len(want), miss[:8])))
+    return out
+
+
 def bits_vs(name, tag, out, ref_out):
     """D (REPORT): rows / elements of out that differ bitwise from piece 3's, and the max |difference|."""
     it = torch.int16
@@ -914,11 +1051,21 @@ def time_arm(name, arm, b, warm, reps, geom):
         host = [(ip.cpu(), ix, ll.cpu()) for ip, ix, ll in packed]
         rep["plan_host_indptr_ms_per_tick"] = host_time(lambda: arm.plan_packed(host), 50)
         rep["plan_device_indptr_ms_per_tick"] = host_time(lambda: arm.plan_packed(packed), 50)
-        rep["pack_ms_per_layer"] = cuda_time(lambda: arm.pack(b), 5, 50)
+        rep["pack_ms_per_layer"] = cuda_time(lambda: arm.pack(b), 5, 50)          # the ragged path, both heads
         rep["plan_info"] = arm.info
         rep["float_ws_used_bytes"] = max(fi_float_used(i, geom["G"], geom["D"]) for i in arm.info)
         rep["pinned_host_bytes"] = arm.pinned_bytes
         arm.prepare(b)
+        rep["float_ws_need_bytes"] = arm.float_need                              # FlashInfer's formula (the cost)
+        rep["float_ws_alloc_bytes"] = arm.fws.numel()
+        rep["float_ws_need_covers_use"] = arm.float_need >= rep["float_ws_used_bytes"]
+        if arm.fixed_counts:                                                     # one plan per tick, every layer
+            rep["pack_fixed_ms_per_layer"] = cuda_time(lambda: pack_fixed(b, arm.S, arm._ix), 5, 50)
+
+            def layer():
+                arm.relayer(b)
+                return arm.launch()
+            rep["layer_with_plan_reuse_ms"] = cuda_time(layer, warm, reps)
     rep["workspace_bytes"] = arm.workspace_bytes
     rep["peak_alloc_delta_bytes"] = peak_delta(arm.launch)
     return rep
@@ -1105,6 +1252,14 @@ def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates):
         for name in ("F8", "F0", "S5"):
             if name in outs:
                 gates.append(bits_vs(name, tag, outs[name], outs["P"]))
+    for name in ("F8", "F0"):
+        if name in arms and name in outs:
+            try:
+                gates.append(plan_reuse_check(name, tag, arms[name], bf, ba))
+            except Exception as e:
+                traceback.print_exc()
+                gates.append(gate("R_REUSE_%s_%s" % (name, tag), False, False, "EXCEPTION %s: %s"
+                                  % (type(e).__name__, str(e)[:300])))
     tp = None
     for name in ("P", "F8", "F0", "FH", "S5"):
         if name not in arms:
@@ -1131,6 +1286,14 @@ def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates):
                         t["pack_ms_per_layer"]["median"], band_text(t["pack_ms_per_layer"]["median"],
                                                                     PRED["pack_ms_per_layer"]),
                         t["runs_only_ms"]["median"])
+                    if "pack_fixed_ms_per_layer" in t:
+                        txt += "; constant counts: pack/layer %.4f (%s), layer with the tick's plan reused %.4f" % (
+                            t["pack_fixed_ms_per_layer"]["median"],
+                            band_text(t["pack_fixed_ms_per_layer"]["median"], PRED["pack_ms_per_layer"]),
+                            t["layer_with_plan_reuse_ms"]["median"])
+                    txt += "; float workspace need %d B (FlashInfer's formula), allocated %d B, plan reserves %d B%s" % (
+                        t["float_ws_need_bytes"], t["float_ws_alloc_bytes"], t["float_ws_used_bytes"],
+                        "" if t["float_ws_need_covers_use"] else " (NEED BELOW USE: formula wrong)")
             txt += "; workspace %d B, peak delta %d B" % (t["workspace_bytes"], t["peak_alloc_delta_bytes"])
             gates.append(gate("R_T_%s_%s" % (name, tag), True, False, txt))
         except Exception as e:
@@ -1262,6 +1425,7 @@ def mode_main(a):
         except Exception as e:
             traceback.print_exc()
             gates.append(gate("CELL_%s" % tag, False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+    gates.extend(completeness_gates(gates, a.cells, a.arms, jit is not None))
     if a.ncu != "none":
         try:
             run_ncu(a, geom, jit is None, deadline, gates, report)

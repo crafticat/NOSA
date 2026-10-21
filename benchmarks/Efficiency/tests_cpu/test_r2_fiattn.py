@@ -520,7 +520,7 @@ def test_FA12_step_dryrun_refusals_and_pins(tmp_path):
     assert "piece 3 7c826c1bc7235ee9153e3af82c99d85836915416:%s blob %s" % (PIECE3_PATH, PIECE3_BLOB) in r.stdout
     assert "sharedkv5 5eb75144644d547e5c601f28606b91136ab9df3a:nosi/nosi/bi_paged_attention_shared.py blob %s" \
         % SKV_BLOB in r.stdout
-    for wd in ("--mode main", "--cells 8x1\\,8x4\\,32x1\\,32x4", "--arms P\\,F8\\,F0\\,FH\\,S5",
+    for wd in ("--mode main", "--cells 32x4\\,32x1\\,8x4\\,8x1", "--arms P\\,F8\\,F0\\,FH\\,S5",
                "--ncu /opt/nvidia/nsight-compute/2025.1.0/ncu", "--ncu-cap 600", "--budget-s 2400",
                "--config /mnt/beegfs/ojerbi/models/NOSA-8B/config.json", "--time=45",
                "FLASHINFER_WORKSPACE_BASE=/mnt/beegfs/ojerbi/nosa-env/jit/fiattn_t1_326/flashinfer",
@@ -541,3 +541,64 @@ def test_FA13_step_static_shape():
     assert "BIATTN_BLOB=%s" % PIECE3_BLOB in src and "SKV_BLOB=%s" % SKV_BLOB in src
     for word in ("awk", "perl", "python3 -", "sed -i", "<<"):
         assert word not in src, word
+
+
+# ------------------------------------------------------------------ fixes after fia1 (job 2191262)
+def test_FA14_float_workspace_formula_covers_the_fia1_overflow():
+    """FA14: fi_float_need is FlashInfer's formula: option B at 32x4 (256 requests x 64 pages, 8 per chunk) needs
+    256 MiB of tmp_v + 2 MiB of tmp_s, i.e. MORE than the fixed 256 MiB that overflowed in fia1 (the exact tmp_s
+    size 2097152 of the error); option A per head at 32x4 needs half of tmp_v and tmp_s each; no split needs 0; the
+    heuristic bound covers 2 x SMs chunks; short requests count one chunk."""
+    need_b = M.fi_float_need([64] * 256, "fixed", 16, 128, 108)
+    assert need_b == 256 * 2 ** 20 + 2097152 and need_b > 256 << 20
+    assert M.fi_float_need([64] * 128, "fixed", 16, 128, 108) == 128 * 2 ** 20 + 2 ** 20
+    assert M.fi_float_need([64] * 128, "none", 16, 128, 108) == 0
+    assert M.fi_float_need([64] * 8, "heuristic", 16, 128, 108) == M.fi_float_need([8] * 216, "fixed", 16, 128, 108)
+    assert M.fi_float_need([5, 8, 9], "fixed", 16, 128, 108) == M.fi_float_need([8] * 4, "fixed", 16, 128, 108)
+    assert M.cta_tile_for(16) == 16 and M.cta_tile_for(32) == 64
+    with pytest.raises(ValueError):
+        M.fi_float_need([1], "other", 16, 128, 108)
+
+
+def test_FA15_vectorized_and_constant_count_packing(case):
+    """FA15: pack_all_heads gives, per head, exactly the per-head CSR of FA3 (ragged hazard batch); with constant
+    counts pack_fixed writes, in place, the same first indptr[R] indices per head (indptr = r * P), and a second
+    layer's lists overwrite the same buffer (the plan-reuse path)."""
+    bh = M.batch_of(case, "hazard")
+    S, hkv = case["S"], GEOM["Hkv"]
+    allh = M.pack_all_heads(bh, S)
+    for h in range(hkv):
+        ip, ix, ll = allh[h]
+        assert torch.equal(ll, bh["last_len"])
+        for r in range(bh["q"].shape[0]):
+            c = int(bh["num_pages"][r, h])
+            want = (int(bh["seq_idx"][r]) * S + bh["page_table"][r, h, :c].to(torch.int64)).tolist()
+            assert ix[int(ip[r]):int(ip[r + 1])].tolist() == want
+    bf, ba = M.batch_of(case, "full"), M.batch_of(case, "alt")
+    r_, p_ = case["R"], case["P"]
+    buf = torch.full((hkv, r_ * p_), -7, dtype=torch.int32)
+    ptr = buf.data_ptr()
+    for b in (bf, ba):
+        M.pack_fixed(b, S, buf)
+        assert buf.data_ptr() == ptr
+        gen = M.pack_all_heads(b, S)
+        for h in range(hkv):
+            assert gen[h][0].tolist() == [r * p_ for r in range(r_ + 1)]
+            assert torch.equal(buf[h], gen[h][1][:r_ * p_])
+
+
+def test_FA16_completeness_gate():
+    """FA16: COMPLETE fails a requested cell whose expected gates are absent (a cell that never ran, or an arm that
+    stopped early) and passes when all are present, whatever their results."""
+    arms = ["P", "F8", "F0", "FH"]
+    names = ["%s_%s_8x1" % (p, a) for a in ("P", "F8", "F0")
+             for p in ("I1_alone", "I2_order", "I3_siblings", "I4_split_switch", "I5_poison", "C")]
+    names += ["N_heuristic_negative_8x1", "CW_bias_witness_8x1"]
+    gates = [M.gate(n, n != "C_F0_8x1", True, "") for n in names]
+    out = {g["name"]: g for g in M.completeness_gates(gates, [(8, 1), (32, 4)], arms, True)}
+    assert out["COMPLETE_8x1"]["passed"] and out["COMPLETE_8x1"]["must"]
+    assert not out["COMPLETE_32x4"]["passed"]
+    out = {g["name"]: g for g in M.completeness_gates(gates[:-3], [(8, 1)], arms, True)}
+    assert not out["COMPLETE_8x1"]["passed"] and "I5_poison_F0_8x1" not in out["COMPLETE_8x1"]["detail"]
+    out = {g["name"]: g for g in M.completeness_gates(gates[:-1], [(8, 1)], arms, False)}
+    assert out["COMPLETE_8x1"]["passed"]                                 # no CW expected in the bias-free mode
