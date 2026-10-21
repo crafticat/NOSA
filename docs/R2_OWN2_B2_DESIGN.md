@@ -69,6 +69,19 @@ B2 does not store readers as ticks. It stores READER EVENT IDS:
   - Each round ends with `evict_to_c` on the round's streams.
 - The number of rounds = the largest number of draft rows of one b (a host scalar).
 - R2's planner gives 1 round (`core.py:157-164`). C's two-row script tests round 2.
+- **A finding (B2-T test R3):** one eviction after all rows reaches the SAME end state, under two conditions. The pins
+  do not change during the recency, and phase A pins every block a draft row reads (`res.py:668`). The reasons:
+  - the final LRU is the C entries with the largest final stamps either way;
+  - an entry that a round evicts and a later row reads is pinned, so it becomes PO and is acquired back;
+  - every other victim leaves in both orders, with the same pin test.
+
+  So the "one batch" defect (C's missing kind 8) changes only the transition counts (`evict_po` / `acquire`), not the
+  state. The test asserts this on 300 random one-to-three-row cases. C reached the same result independently
+  (correction 1 to its review; fixture `o1_two_rows`: rounds acquire 2 + evict_po 2, batch acquire 1 + touch 1 +
+  evict_po 1; the stamps and mirror marks are equal).
+- **Decision: B2 REPORTS the journal counts** (touch, acquire, evict_po, evict_rel per tick: `recency()` returns them).
+  So B2 keeps the per-row rounds: with them, the counts equal the vendored journal's. They are REPORT counts: `_counters`
+  (`test.py:607-611`) does not compare them. R2 runs one round per tick, so the rounds cost nothing there.
 
 **(3) I1 without the dedup. ACCEPTED.**
 - I1 counts the resident slots (LRU, PO, VRES) and the current owner's INFLIGHT slots (`uid == owner`) together:
@@ -194,7 +207,7 @@ Shapes: per slot (L, B, H, NPOS); per block (L, B, H, NBLK); per request (B,).
 | `demand`, `issuer`, `req_key`, `landed` | int8 bits / int8 / int8 key slot / bool | `Transfer.demand`, `.kind`, `.requester`, `Residency._landed` |
 | `hist_gate` | int64 write-back id of the slot's transfer | `Transfer.hist_ev` |
 | `rd_n`, `rv_n` | int32 (4.8 lifetimes; reset at a take) | `Metrics.lifetimes` |
-| `pin` | int16 per block: bit k = key slot k for verify, bit 8 + k for draft (KEYS <= 7) | `Stream.prot`, `Stream.pin_kind` |
+| `pin_w` | BIT PLANES of C's 32-bit words: (2 KEYS, L, B, H, ceil(NBLK / 32)) int64; plane k = key slot k for verify, KEYS + k for draft (KEYS <= 7). The rowsel OR is a word OR (B2-T: about 54 k words per tick), and a key drop clears two planes at (l, b). | `Stream.prot`, `Stream.pin_kind` |
 | `owner` | (B,) int32 | `Stream.owner` (one per batch slot) |
 | `key_of`, `kcancel` | (B, KEYS) the (epoch, m) of a live key slot; cancelled | the cohort keys; `Residency.cancelled` |
 | `key_rd`, `rel_q` | (L, B, KEYS) reader id; queued for release | `Residency.key_reader`, `queue` / `queued` |
@@ -263,6 +276,16 @@ wrong `sel` bitmap.
 
   For each tick, B2 is fed C's sparse record from S-C's device decisions (`ResidencySparse._layer_record`). The
   vendored side runs as today (v1 and S-C).
+- **C's shared fixtures** (`nosi-r2-m2-sparse` `827bbae`,
+  `benchmarks/Efficiency/tests_cpu/r2_lockstep_fixtures.py`, note 12m) drive the scripts:
+  - `run(fixture, worlds, snapshot, Row)` applies each op to every world and compares the exception class, the
+    value and the snapshot; the first difference names its op and field;
+  - a VENDORED world goes first (the counted preconditions read world 0), B2's world after it, with its own
+    `land()`;
+  - the fixtures: end_request (dedup merge, release "end", drop_unowned), cancel (cancel_epoch, the late guard),
+    o1_two_rows, void_overflow, void_flag, t4, trash, nonmono, vres_drop (the poll order), key_alias.
+
+  B2 imports the module by path (read only).
 - **The comparison.** After every `end_tick` and every `poll`, `project(svc)` maps the vendored state onto B2's arrays,
   and they must be equal in every column:
   - LRU order as stamp ranks; pins through the key slots; readers as event ids; `pending` / `inflight` as slot
@@ -276,9 +299,13 @@ wrong `sel` bitmap.
     3. a row of a cancelled key, or after its (key, l) release was queued (P, I11 / I12);
     4. a key slot reused while its pins remain (P, I13);
     5. the poll order swapped (lockstep);
-    6. a drop_unowned / drop_vres_unprotected that keeps `rd_last` (lockstep: it frees one poll late);
+    6. a drop_unowned / drop_vres_unprotected that keeps `rd_last`. It shows in the READERS only (C's correction 2:
+       the kept reader is the take's forwarded reader, which the transport waited for before the land, so the slot
+       frees at the same poll). B2-T's control `keep_rd_last_on_drop` is caught by the reader compare;
     7. a take that drops `rd_last` (lockstep, and E's reader mark);
-    8. two draft rows of one stream with one batch eviction (lockstep on the two-row script).
+    8. two draft rows of one stream with one batch eviction. It is NOT observable in the state (section 0.1 (2)), only
+       in the transition counts. The stamp-order defect (`reverse_stamps`) replaces it as the recency's negative
+       control.
   - Plus: an in-flight Policy E victim of a previous owner (P, I7).
 
 ## 5. B2-T: the component microbench (built first; host CPU tensors at p3's geometry)
