@@ -371,6 +371,38 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
     return eng, svc, tp
 
 
+def fused_gates(a, label, phase, rep):
+    """[fusedres2] the FR-g gates of docs/R2_FUSEDRES_PLAN.md section 7 as harness gates (a failed MUST counts in the
+    exit, so r2_tick_sg5_step.sh's combined cell frg can stop on it). phase: "draft_only" or "round".
+      F2   err_any == 0 (MUST, every fused mode)
+      G0   check, no plant: 0 differences and every layer compared (MUST); the coverage gate (REPORT: a counter at 0
+           is "NOT GATED"; FR-g0 and FR-g0x together decide it)
+      G0p  check, plant 2: d_grant > 0, differences > 0, first_diff_at == first_effective["d_grant"] (MUST in the
+           draft-only phase, REPORT in the round)
+      G2   fused, not profiled, draft-only phase: launches_per_layer == 3.0, sel_conversions == 0, bias_casts == 0
+           (MUST)"""
+    mode, plant = getattr(a, "b2_resolve", "torch"), int(getattr(a, "b2_fused_plant", 0))
+    tag = "%s_%s" % (label, phase)
+    out = [GB.gate(tag + "_fused_err", rep["err"] == 0, True, "err_any %s %s" % (rep["err"], rep["err_bits"]))]
+    if mode == "check" and not plant:
+        ok = rep["diffs"] == 0 and rep["compared"] == rep["layers"] > 0
+        out.append(GB.gate(tag + "_fused_equal", ok, True, "diffs %d compared %d layers %d first %s"
+                           % (rep["diffs"], rep["compared"], rep["layers"], rep["first_diffs"][:2])))
+        out.append(GB.gate(tag + "_fused_coverage", True, False, "gate %s stats %s" % (rep["gate"], rep["stats"])))
+    if mode == "check" and plant == 2:
+        fe = rep["first_effective"].get("d_grant")
+        ok = rep["stats"]["d_grant"] > 0 and rep["diffs"] > 0 and fe is not None and rep["first_diff_at"] == fe
+        out.append(GB.gate(tag + "_fused_plant_caught", ok, phase == "draft_only",
+                           "d_grant %d diffs %d first_diff_at %s first_effective %s"
+                           % (rep["stats"]["d_grant"], rep["diffs"], rep["first_diff_at"], fe)))
+    if mode == "fused" and phase == "draft_only" and not getattr(a, "b2_res_profile", False):
+        ok = rep["launches_per_layer"] == 3.0 and rep["sel_conversions"] == 0 and rep["bias_casts"] == 0
+        out.append(GB.gate(tag + "_fused_dispatch", ok, True, "launches/layer %s sel_conversions %d bias_casts %d "
+                           "compiled %s" % (rep["launches_per_layer"], rep["sel_conversions"], rep["bias_casts"],
+                                            rep["compiled"])))
+    return out
+
+
 def profile_draft_only(a, eng, first, label):
     """[fusedres2] M3 of review-fusedres-0e28cf6: the draft-only phase under torch.profiler (CPU + CUDA), every
     TickTimer span also a record_function range "t.<cat>"; the trace is written to --out and parsed by
@@ -493,6 +525,7 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
         info["draft_only"]["sc"] = sc_counters(svc)                    # REPORT (RES_SC.md 6)
         if getattr(svc, "fusedres", None) is not None:                 # [fusedres] REPORT: launches, stats, err,
             info["draft_only"]["fused"] = svc.fusedres.report()        # check-mode differences
+            gates.extend(fused_gates(a, label, "draft_only", info["draft_only"]["fused"]))   # [fusedres2] FR-g
     finally:
         tp.close()
         del eng, svc, tp
@@ -529,6 +562,8 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
             info["residency"]["report"] = svc.report()
         except Exception as e:                                        # the report is a REPORT
             info["residency"]["report_error"] = "%s: %s" % (type(e).__name__, str(e)[:200])
+        if getattr(svc, "fusedres", None) is not None:                 # [fusedres2] FR-g gates of the round
+            gates.extend(fused_gates(a, label, "round", svc.fusedres.report()))
         mirror = eng.mirror_failures()
         gates.append(GB.gate("%s_completed" % label, True, True, "ticks %d, T_tick %s ms, r %.3f, ratio %s"
                              % (rnd.ticks, None if T_tick is None else round(T_tick, 2), r,

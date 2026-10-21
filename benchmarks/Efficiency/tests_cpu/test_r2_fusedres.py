@@ -669,3 +669,88 @@ def test_FR9_the_sg5_flags_for_the_plant_and_the_profile():
     assert "profile_draft_only(a, eng, first, label)" in fns["one_point"]
     assert 'record_function("t." + cat)' in fns["profile_draft_only"]
     assert "FP.parse_res_trace(" in fns["profile_draft_only"]
+
+
+# =====================================================================================================================
+# FR11 the FR-g step cells of r2_tick_sg5_step.sh (T19's DRYRUN pattern)
+# =====================================================================================================================
+FRNOSI = Path("/mnt/beegfs/ojerbi/nosi-r2-fusedres2")
+P6_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-sg5-p6"
+FR_CELLS = dict(              # resolve, plant, profile, (C, X, R_ver), steps, draft ticks, pool baseline, STEP_MIN
+    frg0=("check", 0, False, (96, 64, 16), 48, 4, False, 120),
+    frg0x=("check", 0, False, (24, 8, 4), 48, 4, False, 120),
+    frg0p=("check", 2, False, (96, 64, 16), 8, 4, False, 60),
+    frg1=("torch", 0, False, (96, 64, 16), 48, 12, True, 60),
+    frg2=("fused", 0, False, (96, 64, 16), 48, 12, True, 60),
+    frg3=("fused", 0, True, (96, 64, 16), 8, 12, False, 60),
+    frg3t=("torch", 0, True, (96, 64, 16), 8, 12, False, 90))
+FR_ORDER = ("frg0", "frg0x", "frg0p", "frg1", "frg2", "frg3", "frg3t")
+
+
+def test_FR11_the_frg_step_cells(tmp_path):
+    """The cells frg0 .. frg3t and frg of r2_tick_sg5_step.sh: static pins (FRNOSI is the root of the frg* cells only;
+    the NOSI line is p6's), refusals (unknown / two cells: usage, exit 2; a sha that is not the root's HEAD: STOP,
+    exit 1; p5b2 with the fusedres2 HEAD stops at p6's root: the root is not repointed), and on a checkout whose step
+    script is the fusedres2 HEAD's blob, each cell's DRYRUN through the harness's own parse_args (its flags, point,
+    steps, draft ticks, pool baseline, STEP_MIN, names, PYTHONPATH) and the combined cell's order. frg1 / frg2 are
+    p5b2's arguments token for token plus the resolve flag."""
+    script = ROOT / "benchmarks/Efficiency/r2_tick_sg5_step.sh"
+    text = script.read_text()
+    lines = text.splitlines()
+    assert "NOSI=%s " % P6_ROOT in text and "FRNOSI=%s " % FRNOSI in text
+    assert text.count("NOSI=$FRNOSI") == 1 and text.index("frg*) BACKENDS=b2") < text.index("NOSI=$FRNOSI")
+    assert lines[-1] == 'main "$@"; exit $?'
+    for word in ("awk", "perl", "python3", " bc ", "node "):
+        for ln in lines:
+            if not ln.lstrip().startswith("#"):
+                assert word not in ln, (word, ln)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_"))}
+    uid = "f31fc723-9dfe-407a-9947-28173556232a"
+    (tmp_path / "416.gpu_uuid").write_text(uid + "\n")
+    e = dict(env, SG5_HOLDERS=str(tmp_path), DRYRUN="1")
+
+    def dry(sha, *words):
+        return subprocess.run(["bash", str(script), "--nosi", sha, "416", "t1", *words], env=e, capture_output=True,
+                              text=True, timeout=600)
+    for bad in (("frg9",), ("frg0", "frg1"), ("FRG0",), ("frg", "p5b2"), ("frg0x", "frg0x"), ("frg3", "x")):
+        r = dry("0" * 40, *bad)
+        assert r.returncode == 2 and "usage" in r.stderr, bad
+    r = dry("0" * 40, "frg0")
+    assert r.returncode == 1 and "%s HEAD is not" % FRNOSI in r.stderr, r.stderr[-300:]
+    if not (FRNOSI / ".git").exists():
+        pytest.skip("no %s worktree here" % FRNOSI)
+    fr_head = subprocess.run(["git", "-C", str(FRNOSI), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    r = dry(fr_head, "p5b2")                                            # the other cells keep p6's root
+    assert r.returncode == 1 and "%s HEAD is not" % P6_ROOT in r.stderr, r.stderr[-300:]
+    blob = subprocess.run(["git", "-C", str(FRNOSI), "rev-parse", "%s:benchmarks/Efficiency/r2_tick_sg5_step.sh" % fr_head],
+                          capture_output=True, text=True).stdout.strip()
+    mine = subprocess.run(["git", "hash-object", "--", str(script)], capture_output=True, text=True).stdout.strip()
+    dirty = subprocess.run(["git", "-C", str(FRNOSI), "status", "--porcelain", "--untracked-files=no"],
+                           capture_output=True, text=True).stdout.strip()
+    if blob != mine or dirty:
+        pytest.skip("this step script is not the fusedres2 HEAD's blob, or that worktree has tracked changes")
+    TTP = TT                                                            # p3's argument string (T19)
+    p5b2 = (TTP.P3_SG5_ARGS.format(n="t1_416_{c}").replace(TTP.P3_SG5_SWEEP, "")
+            .replace(TTP.P3_SG5_POINTS, "--modes exact,fast --backends b2").replace(" --X 32 ", " --X 64 "))
+    G = TT._sg5_gate()
+    for cell, (resolve, plant, prof, (C, X, R_ver), steps, dticks, pool, step_min) in FR_CELLS.items():
+        r = dry(fr_head, cell)
+        assert r.returncode == 0, (cell, r.stderr[-400:])
+        got = r.stdout.strip().splitlines()[-1].split("r2_tick_sg5.py ", 1)[1].strip().replace("\\,", ",")
+        pa = G.parse_args(got.split())
+        assert pa.backends == ["b2"] and pa.modes == ["exact", "fast"] and pa.sweep_pts == [], cell
+        assert (pa.C, pa.X, pa.R_ver, pa.steps, pa.draft_ticks, pa.pool_baseline) == (C, X, R_ver, steps, dticks, pool)
+        assert (pa.b2_resolve, pa.b2_fused_plant, pa.b2_res_profile, pa.b2_checked) == (resolve, plant, prof, False)
+        assert "nosi root %s; STEP_MIN %d; MIN_LEFT %d s" % (FRNOSI, step_min, step_min * 60 + 600) in r.stdout
+        assert "--time=%d " % step_min in r.stdout and "--job-name=sg5-t1-416-%s " % cell in r.stdout
+        assert "PYTHONPATH=%s/nosi" % FRNOSI in r.stdout and "%s/benchmarks/Efficiency/r2_tick_sg5.py" % FRNOSI in r.stdout
+        assert "TRITON_CACHE_DIR=/mnt/beegfs/ojerbi/nosa-env/jit/sg5_t1_416_%s/triton" % cell in r.stdout
+        if cell in ("frg1", "frg2"):                                    # p5b2's arguments + the resolve flag only
+            assert got == p5b2.format(c=cell) + " --b2-resolve " + resolve, (cell, got)
+    r = dry(fr_head, "frg")
+    assert r.returncode == 0, r.stderr[-400:]
+    order = [ln.split()[4] for ln in r.stdout.splitlines() if ln.startswith("R2 SG5 frg: cell ")]
+    assert order == list(FR_ORDER), order
+    assert "R2 SG5 frg: done; cells failed or refused 0; first MUST failure none" in r.stdout
+    src = (ROOT / "benchmarks/Efficiency/r2_tick_sg5_step.sh").read_text()
+    assert 'case $sub in frg1|frg3t) ctl=1 ;; *) ctl=0 ;; esac' in src            # the controls always run

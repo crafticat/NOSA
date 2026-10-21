@@ -125,6 +125,17 @@ set per job by the step launcher (r2_tick_sg5_step.sh:191, C1).
 | FR-g3 | `--b2-resolve fused --b2-res-profile --draft-ticks 12` | KERNEL time of res (M3; its spans are not timings) |
 | FR-g3t | `--b2-resolve torch --b2-res-profile --draft-ticks 12` | the same for the torch path (b2) |
 
+STEP CELLS (benchmarks/Efficiency/r2_tick_sg5_step.sh, NOSI root = /mnt/beegfs/ojerbi/nosi-r2-fusedres2 for these
+cells only): frg0 (STEP_MIN 120), frg0x (120), frg0p (60), frg1 (60), frg2 (60), frg3 (60), frg3t (90), and frg = all
+seven in this order, each its own step; after the first cell that exits non-zero the remaining non-control cells are
+skipped, frg1 and frg3t always run. The cells drop the equal-memory pool baseline except frg1 / frg2 (p5b2's
+arguments token for token plus --b2-resolve); frg0p, frg3, frg3t run 8 steps. The gates below are harness gates
+(r2_tick_sg5.py fused_gates): F2 err (MUST), G0 equal (MUST) + coverage (REPORT), G0p plant caught (MUST in the
+draft-only phase), G2 dispatch (MUST); so a cell's exit counts its failed MUST gates.
+
+    bash /mnt/beegfs/ojerbi/nosi-r2-fusedres2/benchmarks/Efficiency/r2_tick_sg5_step.sh --nosi <sha> <holder> <run> frg
+    (or one cell: ... <run> frg0 | frg0x | frg0p | frg1 | frg2 | frg3 | frg3t; DRYRUN=1 first)
+
 GATES (decided before any timing claim):
 - G0 (FR-g0, FR-g0x): in `draft_only.fused` and `residency.report.b2.fused`: diffs == 0, compared == layers,
   err == 0 (err_any: every tick's bits), no CapacityRefusal naming fused_res_err. COVERAGE: each of
