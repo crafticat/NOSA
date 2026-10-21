@@ -48,6 +48,12 @@ skipped when triton is not installed.
   BC-T   bigc_tune helpers: candidates, pick, build_table (tuned, check_table), BUCKET_REPS vs the buckets; load_table
          refuses a wrong digest.
   BC-G   bigc_gate driver: shape, M set, refusals through main.
+  BC-G2  bigc_gate.main EXECUTED on a CPU env with the twin as the kernel: every gate and report of every shape and
+         variant, the three controls DETECTED, exit 0 (run bgcb 2191262 crashed in the controls' path: no test ran it).
+  BC-G3  main on broken fakes: strict M-dependent (MUST fails), bucket M-dependent (REPORT only, exit 0), a no-op
+         split control (BLIND, fails), an M-invariant natural GEMM (G3b precondition unmet, fails).
+  BC-G4  main with the REAL module under the interpreter (strict, integer inputs), every path, exit 0.
+  BC-G5  the checker's rows functions take one argument; a two-argument one raises (the 2191262 class).
   BC-S   r2_bi_step.sh cells: refusals, the table pins, own claim, DRYRUN commands (full DRYRUN at a clean checkout of
          the step's ROOT only).
 
@@ -700,6 +706,166 @@ def test_BC_G_gate_driver(tmp_path):
     (tmp_path / "c").mkdir()
     assert G.main(["--out", str(tmp_path / "c")]) == 2
     assert not (tmp_path / "a").exists() and not (tmp_path / "b").exists()
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# BC-G2 .. G4: bigc_gate.main EXECUTED on the CPU, every code path (the controls included). Run bgcb 2191262 crashed in
+# the controls' path (a two-argument rows function handed to the one-argument checker): no CPU test had run main.
+# ---------------------------------------------------------------------------------------------------------------------
+G_SHAPES = {"a": (24, 256), "b": (20, 320)}                # K: four / five 64-column chunks (the plant needs >= 4)
+
+
+def cpu_env(natural_invariant=False):
+    """A CPU environment for bigc_gate.main: fp32, small shapes, 150 rows; a fake natural GEMM whose row 0 changes
+    when it is called alone (M 1, as cuBLAS's GEMV) and whose 'kernel names' say so; graph capture = the call."""
+    calls = []
+
+    def natural(x, w):
+        calls.append(x.shape[0])
+        y = (x.double() @ w.double().t()).float()
+        return y + 1e-3 if (x.shape[0] == 1 and not natural_invariant) else y
+
+    def names(fn):
+        fn()
+        return ["fake_gemm"] if natural_invariant or calls[-1] != 1 else ["fake_gemv"]
+    return SimpleNamespace(dev="cpu", dtype=torch.float32, shapes=dict(G_SHAPES), ms=(1, 7, 17, 65, 129), rows=150,
+                           windows=((1, 7), (63, 65)), graph_ms=(17, 65), natural=natural, capture=lambda fn: fn,
+                           quantize=None,
+                           kernel_names=names, sync=lambda: None, empty_cache=lambda: None,
+                           device_name=lambda: "cpu-fake")
+
+
+def fake_bl(**over):
+    """bi_linear_c with its kernel replaced by the CPU twin (the controls by the twin's orders); `over` replaces
+    attributes (the negative fakes)."""
+    def outp(y, out):
+        if out is None:
+            return y
+        out.copy_(y)
+        return out
+
+    def no_ptx(*a, **k):
+        raise RuntimeError("fake: no PTX on the CPU")
+    ns = SimpleNamespace(
+        NOSA8B_SHAPES=bl.NOSA8B_SHAPES, REFERENCE_NOTE=bl.REFERENCE_NOTE, describe=bl.describe, use_table=bl.use_table,
+        load_table=bl.load_table, plant_order_rows=bl.plant_order_rows, strict_launch_for=bl.strict_launch_for,
+        launch_for=bl.launch_for, _launch=no_ptx,
+        bi_c_linear_strict=lambda x, w, out=None: outp(bl.bi_c_reference(x, w), out),
+        bi_c_linear_bucket=lambda x, w, out=None: outp(bl.bi_c_reference(x, w), out),
+        control_split_k=lambda x, w, L, splits=2: bl.bi_c_reference(x, w, split_k=splits),
+        control_k_reversed=lambda x, w, L: bl.bi_c_reference(x, w, reverse_k=True),
+        bi_c_with_launch=lambda x, w, L, out=None, block_k=64: outp(bl.bi_c_reference(x, w, block_k=block_k), out))
+    for k, v in over.items():
+        setattr(ns, k, v)
+    return ns
+
+
+def run_gate(tmp_path, tag, env, mod, variants="strict,bucket"):
+    G = _load_path(EFF / "bigc_gate.py", "bigc_gate_run_%s" % tag)
+    out = tmp_path / tag
+    rc = G.main(["--out", str(out), "--variants", variants], env=env, bl=mod)
+    s = json.loads((out / "bigc_gate.json").read_text())
+    return rc, {g["gate"]: g for g in s["gates"]}, {r["report"]: r for r in s["reports"]}, s
+
+
+def expected_gates(shapes, variants=("strict", "bucket")):
+    out = set()
+    for n in shapes:
+        for v in variants:
+            p = "" if v == "strict" else "R_"
+            out |= {"%s%s[%s:%s]" % (p, g, v, n) for g in ("G1-semantics", "G2-rows-across-M", "G2w-windows-perm",
+                                                          "G2g-cuda-graph")}
+        out |= {"G3a-negative-split-K-2-caught[%s]" % n, "G3c-negative-K-reversed-caught[%s]" % n,
+                "G3b-negative-natural-cuBLAS-caught[%s]" % n}
+    return out
+
+
+def test_BC_G2_gate_main_on_fakes_every_path(tmp_path):
+    """BC-G2: bigc_gate.main on the CPU env with the twin as the kernel: every gate of every shape and variant ran and
+    PASSED (G1, G2, G2w, G2g; the three controls DETECTED after their preconditions), every report written (R3 takes
+    its error path: no PTX on the CPU), exit 0."""
+    rc, g, r, s = run_gate(tmp_path, "ok", cpu_env(), fake_bl())
+    assert set(g) == expected_gates(G_SHAPES), sorted(set(g) ^ expected_gates(G_SHAPES))
+    assert rc == 0 and all(x["passed"] for x in g.values()), [k for k, x in g.items() if not x["passed"]]
+    for n in G_SHAPES:
+        for c in ("G3a-negative-split-K-2-caught", "G3c-negative-K-reversed-caught", "G3b-negative-natural-cuBLAS-caught"):
+            assert "DETECTED" in g["%s[%s]" % (c, n)]["detail"] and g["%s[%s]" % (c, n)]["must"], (c, n)
+        for rep in ("R1-blockk32-vs-64", "R3-ptx", "R4-strict-vs-bucket-bits", "R5-reference-change-vs-cuBLAS",
+                    "G3b-kernel-names"):
+            assert "%s[%s]" % (rep, n) in r, (rep, n)
+        assert "error" in r["R3-ptx[%s]" % n]["detail"]
+    assert s["meta"]["device"] == "cpu-fake" and s["meta"]["shapes"] == {k: list(v) for k, v in G_SHAPES.items()}
+
+
+def test_BC_G3_gate_main_negative_fakes(tmp_path):
+    """BC-G3: the gate's own detection on broken fakes. (1) strict M-dependent (a last-bit change above 64 rows): its
+    MUST G2 fails and the exit counts it. (2) bucket M-dependent: R_ G2 fails, exit 0 (research arm: REPORT). (3) the
+    split-K control a no-op: G3a FAILS as precondition-unmet (BLIND), never counted as caught. (4) natural GEMM
+    M-invariant with one kernel name: G3b FAILS (precondition unmet)."""
+    def mdep(x, w, out=None):
+        y = bl.bi_c_reference(x, w)
+        y = y + 1e-3 if x.shape[0] > 64 else y
+        if out is not None:
+            out.copy_(y)
+            return out
+        return y
+    env1 = cpu_env()
+    env1.shapes = {"a": G_SHAPES["a"]}
+    rc, g, _, _ = run_gate(tmp_path, "strict_mdep", env1, fake_bl(bi_c_linear_strict=mdep), variants="strict")
+    assert rc >= 1 and not g["G2-rows-across-M[strict:a]"]["passed"] and g["G2-rows-across-M[strict:a]"]["must"]
+    env2 = cpu_env()
+    env2.shapes = {"a": G_SHAPES["a"]}
+    rc, g, _, _ = run_gate(tmp_path, "bucket_mdep", env2, fake_bl(bi_c_linear_bucket=mdep))
+    assert rc == 0 and not g["R_G2-rows-across-M[bucket:a]"]["passed"] and not g["R_G2-rows-across-M[bucket:a]"]["must"]
+    env3 = cpu_env()
+    env3.shapes = {"a": G_SHAPES["a"]}
+    noop = fake_bl(control_split_k=lambda x, w, L, splits=2: bl.bi_c_reference(x, w))
+    rc, g, _, _ = run_gate(tmp_path, "noop_split", env3, noop, variants="strict")
+    d = g["G3a-negative-split-K-2-caught[a]"]
+    assert rc >= 1 and not d["passed"] and "precondition planted (control != contract at M 7): False" in d["detail"]
+    assert "BLIND" in d["detail"] and g["G3c-negative-K-reversed-caught[a]"]["passed"]
+    env4 = cpu_env(natural_invariant=True)
+    env4.shapes = {"a": G_SHAPES["a"]}
+    rc, g, _, _ = run_gate(tmp_path, "nat_inv", env4, fake_bl(), variants="strict")
+    d = g["G3b-negative-natural-cuBLAS-caught[a]"]
+    assert rc >= 1 and not d["passed"] and "precondition (>= 2 kernel sets over M): False" in d["detail"]
+
+
+def case_G():
+    """BC-G4 (interpreter child): bigc_gate.main with the REAL bi_linear_c (Triton interpreter) on the CPU env, one
+    shape, the strict variant (the bucket variant crosses launch configs, which the interpreter cannot judge: L36)."""
+    G = _load_path(EFF / "bigc_gate.py", "bigc_gate_interp")
+    env = cpu_env()
+    env.shapes = {"a": G_SHAPES["a"]}
+    # integer-valued inputs: numpy's order on the interpreter is not the tensor core's, so the windows / permutation
+    # checks would judge numpy, not the kernel (L36); the planted control rows are built after this and stay exact
+    env.quantize = lambda t: torch.round(t / t.abs().max() * 8)
+    d = tempfile.mkdtemp()
+    rc = G.main(["--out", os.path.join(d, "g"), "--variants", "strict"], env=env, bl=bl)
+    s = json.loads(Path(d, "g", "bigc_gate.json").read_text())
+    g = {x["gate"]: x for x in s["gates"]}
+    assert set(g) == expected_gates({"a": 0}, variants=("strict",)), sorted(g)
+    assert rc == 0 and all(x["passed"] for x in g.values()), [(k, x["detail"]) for k, x in g.items() if not x["passed"]]
+    assert "DETECTED" in g["G3a-negative-split-K-2-caught[a]"]["detail"]
+    assert "DETECTED" in g["G3c-negative-K-reversed-caught[a]"]["detail"]
+    assert {r["report"] for r in s["reports"]} >= {"R1-blockk32-vs-64[a]", "R3-ptx[a]", "R5-reference-change-vs-cuBLAS[a]"}
+
+
+def test_BC_G4_gate_main_real_module_interpreter():
+    _interp("G")
+
+
+def test_BC_G5_rows_functions_take_one_argument():
+    """BC-G5: every rows function handed to row_check is one-argument (the 2191262 crash class): m_dependent's result
+    called with the rows only; a two-argument function raises TypeError in row_check (the negative control)."""
+    G = _load_path(EFF / "bigc_gate.py", "bigc_gate_g5")
+    x, w = planted(5, M=80)
+    L = bl.strict_launch_for(*w.shape)
+    f = G.m_dependent(lambda xx, ww, l: bl.bi_c_reference(xx, ww, split_k=2), lambda xx, ww: bl.bi_c_reference(xx, ww),
+                      L, w)
+    assert G.row_check(f, x, ms=(7,), windows=(), perm=None)                 # the control is seen at M 7 vs 80 rows
+    with pytest.raises(TypeError):
+        G.row_check(lambda xx, ww: bl.bi_c_reference(xx, ww), x, ms=(7,), windows=(), perm=None)
 
 
 # =====================================================================================================================

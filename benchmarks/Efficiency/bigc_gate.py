@@ -1,6 +1,8 @@
 """GPU cell bigc-gate: batch invariance of G-c (nosi/nosi/bi_linear_c.py; design note
 /mnt/beegfs/ojerbi/kstep-cpu-runs/paper-notes/bi-gemm-design.md section 5.2). Holder step: r2_bi_step.sh ... bigc-gate.
-CPU tests: benchmarks/Efficiency/tests_cpu/test_bi_linear_c.py.
+CPU tests: benchmarks/Efficiency/tests_cpu/test_bi_linear_c.py (BC-G*: every code path of main, the controls
+included, on fakes and on the real module under the Triton interpreter; fix 2 after run bgcb 2191262, where the
+controls' path crashed with a TypeError that no CPU test had executed).
 
 VARIANTS (--variants, default strict,bucket):
   strict  THE CANDIDATE (one launch per weight shape for every M): its gates are MUST.
@@ -31,6 +33,11 @@ torch / Triton build and this table digest, the strict variant's rows are bitwis
 row position, and the checker sees the three planted M-dependences. It does NOT prove other M, other inputs, another
 Triton version, or equality to the G-b reference (R5 measures that they differ).
 OUTPUT: --out DIR/bigc_gate.json; last stdout line BIGC_GATE_DONE failed=<n>; exit = n (2 = refused).
+
+THE ENVIRONMENT (env): everything device-specific goes through one object, so that the CPU tests run main itself:
+cuda_env() (production) holds the device, dtype bf16, the shapes / M / windows / graph M of this note, the natural
+linear F.linear, the CUDA-graph capture, the profiler's kernel names, empty_cache and the device name. The tests pass
+a CPU env (fp32, small shapes, fewer rows) and a module (a fake or the real one under the interpreter).
 """
 import argparse
 import importlib.util
@@ -38,6 +45,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
 MOD = ROOT / "nosi/nosi/bi_linear_c.py"
@@ -58,10 +66,10 @@ def load_module():
     return mod
 
 
-def row_check(f, X, ms=MS, windows=WINDOWS, perm=None):
-    """THE CHECKER (the same for the variants and the controls): {case: rows differing} for f(X[:M]) vs f(X)[:M],
-    windows f(X[a:a+M]) vs f(X)[a:a+M] and a permutation. Empty = invariant on these cases."""
-    import torch
+def row_check(f, X, ms=MS, windows=WINDOWS, perm=None, empty_cache=None):
+    """THE CHECKER (the same for the variants and the controls). f takes ONE argument, the rows: f(rows) -> outputs.
+    {case: rows differing} for f(X[:M]) vs f(X)[:M], windows f(X[a:a+M]) vs f(X)[a:a+M] and a permutation. Empty =
+    invariant on these cases."""
     full = f(X)
     bad = {}
     for M in ms:
@@ -77,8 +85,17 @@ def row_check(f, X, ms=MS, windows=WINDOWS, perm=None):
         if n:
             bad["perm"] = n
     del full
-    torch.cuda.empty_cache()
+    if empty_cache is not None:
+        empty_cache()
     return bad
+
+
+def m_dependent(control, clean, launch, ww):
+    """NEGATIVE CONTROL as ONE-ARGUMENT rows function (row_check's interface; run bgcb 2191262 crashed on a two-argument
+    one): the contract up to SPLIT_AT rows, the control above (what a heuristic GEMM does by M)."""
+    def f(x):
+        return control(x, ww, launch) if x.shape[0] > SPLIT_AT else clean(x, ww)
+    return f
 
 
 def kernel_names(fn):
@@ -96,7 +113,31 @@ def kernel_names(fn):
         return None
 
 
-def main(argv=None) -> int:
+def cuda_capture(fn):
+    """Warm fn on a side stream, capture it in a CUDA graph; returns the graph's replay."""
+    import torch
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        fn()
+    torch.cuda.current_stream().wait_stream(s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    return graph.replay
+
+
+def cuda_env():
+    import torch
+    import torch.nn.functional as F
+    return SimpleNamespace(dev="cuda", dtype=torch.bfloat16, shapes=None, ms=MS, rows=ROWS, windows=WINDOWS,
+                           graph_ms=GRAPH_MS, natural=F.linear, capture=cuda_capture, kernel_names=kernel_names,
+                           sync=torch.cuda.synchronize, empty_cache=torch.cuda.empty_cache,
+                           device_name=lambda: torch.cuda.get_device_name(0))
+
+
+def main(argv=None, env=None, bl=None) -> int:
+    """argv: the command line. env / bl: the CPU tests only (a CPU environment and a module); production None."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--variants", default="strict,bucket")
@@ -115,12 +156,13 @@ def main(argv=None) -> int:
         print("[bigc] REFUSED: %s exists" % a.out, flush=True)
         return 2
     import torch
-    import torch.nn.functional as F
-    bl = load_module()
+    env = env if env is not None else cuda_env()
+    bl = bl if bl is not None else load_module()
     if a.table:
         bl.use_table(bl.load_table(a.table, a.table_sha))
     os.makedirs(a.out)
-    dev, bf = "cuda", torch.bfloat16
+    dev, dt = env.dev, env.dtype
+    shapes = env.shapes if env.shapes is not None else bl.NOSA8B_SHAPES
     g = torch.Generator(device=dev).manual_seed(a.seed)
     fns = dict(strict=bl.bi_c_linear_strict, bucket=bl.bi_c_linear_bucket)
     gates, reports = [], []
@@ -133,10 +175,17 @@ def main(argv=None) -> int:
         reports.append(dict(report=name, detail=detail))
         print("[bigc] REPORT %s: %s" % (name, json.dumps(detail, default=str)), flush=True)
 
-    perm = torch.randperm(ROWS, device=dev, generator=g)
-    for name, (N, K) in bl.NOSA8B_SHAPES.items():
-        w = (torch.randn(N, K, generator=g, device=dev) * 0.02).to(bf)
-        Xr = torch.randn(ROWS, K, generator=g, device=dev).to(bf)
+    def check(f, X, **kw):
+        return row_check(f, X, empty_cache=env.empty_cache, **kw)
+
+    rows = env.rows
+    perm = torch.randperm(rows, device=dev, generator=g)
+    for name, (N, K) in shapes.items():
+        w = (torch.randn(N, K, generator=g, device=dev) * 0.02).to(dt)
+        Xr = torch.randn(rows, K, generator=g, device=dev).to(dt)
+        q = getattr(env, "quantize", None)        # the interpreter test only: integer-valued inputs (L36); production None
+        if q is not None:
+            w, Xr = q(w), q(Xr)
         Xo = Xr.clone()
         Xo[:, torch.randperm(K, device=dev, generator=g)[:8]] *= 50
         Xp, wp = Xr.clone(), w.clone()
@@ -152,42 +201,31 @@ def main(argv=None) -> int:
             d = float((full[:8].double() - ref).abs().max())
             lim = 0.02 * float(ref.abs().max()) + 1e-3
             gate(tag % ("G1-semantics", v, name), d <= lim, must, "max |bi - float64| %.3e (limit %.3e)" % (d, lim))
-            bad = {s: row_check(lambda x, ww=ww: f(x, ww), X, ms=MS, windows=(), perm=None) for s, (X, ww) in sets.items()}
+            bad = {s: check(lambda x, ww=ww: f(x, ww), X, ms=env.ms, windows=(), perm=None) for s, (X, ww) in sets.items()}
             bad = {s: b for s, b in bad.items() if b}
             gate(tag % ("G2-rows-across-M", v, name), not bad, must, "M in %s, sets randn / outlier / planted: "
-                 "differing %s" % (list(MS), bad or "none"))
-            badw = row_check(lambda x: f(x, w), Xr, ms=(), windows=WINDOWS, perm=perm)
+                 "differing %s" % (list(env.ms), bad or "none"))
+            badw = check(lambda x: f(x, w), Xr, ms=(), windows=env.windows, perm=perm)
             gate(tag % ("G2w-windows-perm", v, name), not badw, must, "windows %s + a permutation: differing %s"
-                 % (list(WINDOWS), badw or "none"))
+                 % (list(env.windows), badw or "none"))
             gbad = {}
-            for M in GRAPH_MS:
+            for M in env.graph_ms:
                 xs = Xr[:M].clone()
-                oe = torch.empty(M, N, dtype=bf, device=dev)
-                og = torch.empty(M, N, dtype=bf, device=dev)
+                oe = torch.empty(M, N, dtype=dt, device=dev)
+                og = torch.empty(M, N, dtype=dt, device=dev)
                 f(xs, w, out=oe)                                       # compile + warm outside the capture
-                s = torch.cuda.Stream()
-                s.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(s):
-                    f(xs, w, out=og)
-                torch.cuda.current_stream().wait_stream(s)
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    f(xs, w, out=og)
+                replay = env.capture(lambda: f(xs, w, out=og))
                 og.zero_()
-                graph.replay()
-                torch.cuda.synchronize()
+                replay()
+                env.sync()
                 n = int((og != oe).any(dim=1).sum()) + int((og != full[:M]).any(dim=1).sum())
                 if n:
                     gbad["M%d" % M] = n
-                del graph, xs, oe, og
+                del replay, xs, oe, og
             gate(tag % ("G2g-cuda-graph", v, name), not gbad, must, "captured vs eager vs f(X)[:M] at M %s: differing %s"
-                 % (list(GRAPH_MS), gbad or "none"))
+                 % (list(env.graph_ms), gbad or "none"))
             del full
         # ---- negative controls (on the strict launch; the checker is row_check) ----
-        def mdep(control):
-            def f(x, ww):
-                return control(x, ww, strict) if x.shape[0] > SPLIT_AT else bl.bi_c_linear_strict(x, ww)
-            return f
         for gid, cname, control in (("G3a", "split-K-2", lambda x, ww, l: bl.control_split_k(x, ww, l, 2)),
                                     ("G3c", "K-reversed", bl.control_k_reversed)):
             pre = {}
@@ -197,27 +235,28 @@ def main(argv=None) -> int:
             seen = {}
             if pre["planted"]:
                 X, ww = sets["planted"]
-                seen = row_check(mdep(control), X, ms=(7,), windows=(), perm=None)
+                seen = check(m_dependent(control, bl.bi_c_linear_strict, strict, ww), X, ms=(7,), windows=(), perm=None)
             ok = pre["planted"] and bool(seen)
             gate("%s-negative-%s-caught[%s]" % (gid, cname, name), ok, True,
                  "precondition planted (control != contract at M 7): %s; randn: %s; the checker %s" % (
                      pre["planted"], "effective" if pre["randn"] else "NO-OP on randn (reported, not counted)",
                      ("reports %s (DETECTED)" % seen) if seen else "reports nothing: BLIND"))
-        names = {M: kernel_names(lambda M=M: F.linear(Xr[:M], w)) for M in MS}
+        names = {M: env.kernel_names(lambda M=M: env.natural(Xr[:M], w)) for M in env.ms}
         distinct = sorted({n for v in names.values() if v for n in v})
         pre = all(v is not None for v in names.values()) and len({tuple(v) for v in names.values()}) >= 2
-        seen = row_check(lambda x: F.linear(x, w), Xr, ms=MS, windows=(), perm=None) if pre else {}
+        seen = check(lambda x: env.natural(x, w), Xr, ms=env.ms, windows=(), perm=None) if pre else {}
         gate("G3b-negative-natural-cuBLAS-caught[%s]" % name, pre and bool(seen), True,
              "precondition (>= 2 kernel sets over M): %s (%d distinct names); the checker %s" % (
                  pre, len(distinct), ("reports %s (DETECTED)" % seen) if seen else "reports nothing: BLIND"))
         report("G3b-kernel-names[%s]" % name, {str(M): v for M, v in names.items()})
         # ---- reports ----
-        x287 = Xr[:287]
-        r1 = torch.equal(bl.bi_c_with_launch(x287, w, strict, block_k=32), bl.bi_c_with_launch(x287, w, strict))
-        report("R1-blockk32-vs-64[%s]" % name, dict(equal=r1, note="expected equal; NOT a control"))
+        mr = env.graph_ms[0]
+        xr1 = Xr[:mr]
+        r1 = torch.equal(bl.bi_c_with_launch(xr1, w, strict, block_k=32), bl.bi_c_with_launch(xr1, w, strict))
+        report("R1-blockk32-vs-64[%s]" % name, dict(M=mr, equal=r1, note="expected equal; NOT a control"))
         try:
-            o2 = torch.empty(287, N, dtype=bf, device=dev)
-            h = bl._launch(x287.contiguous(), w, o2, strict, 0, K)
+            o2 = torch.empty(mr, N, dtype=dt, device=dev)
+            h = bl._launch(xr1.contiguous(), w, o2, strict, 0, K)
             ptx = h.asm.get("ptx", "") if hasattr(h, "asm") else ""
             report("R3-ptx[%s]" % name, dict(mma_m16n8k16=ptx.count("mma.sync.aligned.m16n8k16"),
                                              red_or_atom_lines=sum(1 for ln in ptx.splitlines()
@@ -227,24 +266,25 @@ def main(argv=None) -> int:
             report("R3-ptx[%s]" % name, dict(error=str(e)[:200]))
         if "bucket" in variants and "strict" in variants:
             diff = {}
-            for M in MS:
+            for M in env.ms:
                 n = int((bl.bi_c_linear_bucket(Xr[:M], w) != bl.bi_c_linear_strict(Xr[:M], w)).any(dim=1).sum())
                 if n:
                     diff["M%d" % M] = n
             report("R4-strict-vs-bucket-bits[%s]" % name, dict(differing=diff, launches={
-                str(M): list(bl.launch_for(N, K, M)) for M in MS}, strict=list(strict)))
-        ys, yc = bl.bi_c_linear_strict(Xr, w), F.linear(Xr, w)
+                str(M): list(bl.launch_for(N, K, M)) for M in env.ms}, strict=list(strict)))
+        ys, yc = bl.bi_c_linear_strict(Xr, w), env.natural(Xr, w)
         report("R5-reference-change-vs-cuBLAS[%s]" % name, dict(
-            rows_differing=int((ys != yc).any(dim=1).sum()), of=ROWS,
+            rows_differing=int((ys != yc).any(dim=1).sum()), of=rows,
             max_abs=float((ys.float() - yc.float()).abs().max()), note=bl.REFERENCE_NOTE))
         del w, Xr, Xo, Xp, wp, sets, ys, yc
-        torch.cuda.empty_cache()
+        env.empty_cache()
 
     nfail = sum(1 for x in gates if x["must"] and not x["passed"])
-    meta = dict(cell="bigc-gate", variants=variants, ms=list(MS), windows=list(WINDOWS), graph_ms=list(GRAPH_MS),
-                rows=ROWS, seed=a.seed, table=a.table, table_sha_pinned=a.table_sha,
-                describe={v: bl.describe(v) for v in variants}, device=torch.cuda.get_device_name(0),
-                torch=torch.__version__, commit=os.environ.get("BI_COMMIT", "unknown"),
+    meta = dict(cell="bigc-gate", variants=variants, ms=list(env.ms), windows=list(env.windows),
+                graph_ms=list(env.graph_ms), rows=rows, shapes={k: list(v) for k, v in shapes.items()}, seed=a.seed,
+                table=a.table, table_sha_pinned=a.table_sha, describe={v: bl.describe(v) for v in variants},
+                device=env.device_name(), dtype=str(dt), torch=torch.__version__,
+                commit=os.environ.get("BI_COMMIT", "unknown"),
                 proves=("strict: rows bitwise independent of row count and position for these shapes / M / windows / "
                         "inputs / GPU / build / table digest, with the three planted M-dependences detected; NOT other "
                         "M or inputs, NOT another Triton, NOT equality to the G-b reference (R5)"))
