@@ -818,6 +818,7 @@ class ResidencySC(ResidencySB):
         self.mirrors = None                               # S-B's per-layer host-refreshed mirrors are not used
         self.dmirror = DeviceMirror(self.L, self.B, self.H, self.nblk, self.n_hist, self.device)
         self.mirror_drop = set(mirror_drop or ())
+        self._ending = False                                         # inside end_request (_prot_changed)
         self.journal_counts: Dict[str, int] = {}                     # the stream transitions per kind (reports)
         self._dirty: Set[Tuple[int, int, int, int]] = set()          # (l, b, h, slot) changed since the last sync
         self._stamp: Dict[Tuple[int, int, int, int], int] = {}       # (l, b, h, slot) -> its LRU recency (Policy E)
@@ -870,12 +871,13 @@ class ResidencySC(ResidencySB):
 
     def _prot_changed(self, key: Tuple[int, int, int], block: int) -> None:
         """A block's protection may have changed (_ProtDict): its resident slot, or its slot in flight (Policy E's
-        in-flight candidates, 12j), goes with the next delta."""
+        in-flight candidates, 12j), goes with the next delta. Not the slot in flight while its request ENDS
+        (end_request): that transfer stops being the owner's, and the owner change marks it (F14b's control)."""
         if "prot" in self.mirror_drop:
             return
         st = self.pools[key[0]].stream(key[1], key[2])
         idx = st.resident(block)
-        if idx is None:
+        if idx is None and not self._ending:
             idx = st.pending.get(block)
         if idx is not None:
             self._dirty.add(key + (idx,))
@@ -894,7 +896,11 @@ class ResidencySC(ResidencySB):
 
     def end_request(self, uid) -> None:
         b = self.uid_b[uid]
-        super().end_request(uid)
+        self._ending = True                    # its transfers in flight stop being the owner's: no protection marks
+        try:
+            super().end_request(uid)
+        finally:
+            self._ending = False
         self._mark_batch_slot(b)
 
     def _h2d(self, host: torch.Tensor) -> torch.Tensor:

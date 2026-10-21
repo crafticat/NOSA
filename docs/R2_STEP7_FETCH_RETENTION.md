@@ -712,6 +712,21 @@ TESTS:
     off, the slot's content is wrong.
 - F21b: the lockstep with a force_only transport (probe and exact). Precondition: v1 supersedes prefetches.
 
+AFTER THE FIRST CPU RUN (2051f9b: 5 failed, 138 passed, 2 skipped;
+`/mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/fetch_2051f9b_fail.txt`):
+- F14b (the owner control's precondition): at a request's end, end_owner clears the protection map while the
+  request's transfers are still in Stream.pending, so `_prot_changed` marked their slots. The owner change was no
+  longer the only change of its slot, and a delta without the owner changes would no longer have been caught.
+  - Fix: ResidencySC.end_request sets `_ending`; `_prot_changed` then marks resident slots only. A transfer of an
+    ended request stops being the owner's, and the owner change marks its slot.
+  - The test instrumentation (`_trace_journal`) follows the same rule.
+- F21: the test's expectation was wrong. Stream.pending also holds the urgent block (landed in place, admitted at the
+  next poll): {kept: kept, 5: gone}. The service behaved as designed.
+- F21b: the precondition was not met (17 LRU evictions, 0 in flight). In `_sched_pressure` the verify rows read
+  prefetched blocks, the waits landed them, and the LRU always had a candidate. The new schedule `_sched_split`
+  puts the drafts in blocks 0 .. 19 and the verify reads in 20 .. 29 (C 16, 30 ticks). No prefetch lands, so only
+  in-flight candidates can serve the verifier.
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,

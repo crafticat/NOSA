@@ -834,8 +834,8 @@ def _trace_journal(svc):
 
             def psink(key, block, inner=st.prot.sink, stream=st):
                 idx = stream.resident(block)
-                if idx is None:
-                    idx = stream.pending.get(block)          # a slot in flight (Policy E's in-flight candidates, 12j)
+                if idx is None and not svc._ending:          # as _prot_changed: a slot in flight (12j), not while
+                    idx = stream.pending.get(block)          # its request ends
                 if idx is not None:
                     trace[-1][key + (idx,)].append("prot")
                 inner(key, block)
@@ -1692,9 +1692,10 @@ def test_F21_policy_e_takes_an_unprotected_inflight_prefetch(scenario):
             c = svc.metrics.counts
             assert st.slots[gone].block == 5 and st.slots[gone].state == OWN.INFLIGHT and slot_holds(w, 0, 0, 0, gone, 5)
             assert c.get("verifier_evictions") == 1 and c.get("verifier_inflight_evictions", 0) == (0 if sync else 1), c
-            if not sync:
-                assert [tr.block for tr in w.tp.pending] == [kept] and st.pending == {kept: kept}, (w.tp.pending, st.pending)
-                assert all(tr.block != gone for tr in svc.inflight.values())
+            if not sync:                                    # in flight: the kept prefetch and the urgent block (landed
+                assert [tr.block for tr in w.tp.pending] == [kept], w.tp.pending      # in place, admitted at the next
+                assert st.pending == {kept: kept, 5: gone}, st.pending                 # poll); never the superseded one
+                assert sorted(tr.block for tr in svc.inflight.values()) == sorted([kept, 5])
             states.setdefault(sync, []).append(_state(w))
             svc.poll()
             land_all(w)                                     # the kept prefetch lands; the superseded one never does
@@ -1718,15 +1719,45 @@ def test_F21c_policy_e_inflight_negative_controls():
     assert e is None and w.svc.stream(0, 0, 0).slots[gone].block == 5 and not slot_holds(w, 0, 0, 0, gone, 5)
 
 
+def _sched_split(seed, steps, hb, d_hi, window=2, nver=1, uids=("u0", "u1")):
+    """_sched_pressure's structure (per tick, layer and request a draft row; every third tick two verify rows of the
+    ending cohort), with the draft windows in blocks [0, d_hi) and the verify blocks in [d_hi, hb): a verify row never
+    reads a prefetched block, so (force_only) no prefetch lands and the LRU stays empty: K5's refusals can only be
+    served by Policy E's in-flight candidates (12j)."""
+    g = torch.Generator().manual_seed(seed)
+    out = []
+    for t in range(steps):
+        m = t // 3 + 1
+        ends = t % 3 == 2
+        layers = []
+        for _ in range(L):
+            spec = []
+            for b, u in enumerate(uids):
+                x = int(torch.randint(0, d_hi - window + 1, (1,), generator=g))
+                spec.append((b, "d", (u, 1, m + 1 if ends else m), [list(range(x, x + window)) + [hb] for _ in range(H)]))
+                if ends:
+                    for _ in range(2):
+                        v = [sorted(set(int(z) for z in torch.randint(d_hi, hb, (nver,), generator=g))) + [hb]
+                             for _ in range(H)]
+                        spec.append((b, "v", (u, 1, m), v))
+            layers.append(spec)
+        out.append((t, m, ends, layers))
+    return out
+
+
 @pytest.mark.parametrize("exact", [False, True])
 def test_F21b_sc_equals_v1_with_an_asynchronous_transport(exact):
     """F21b: the lockstep (pages, verify content, state, counters and the device mirror every tick, the mirror's
-    in-flight protection and issue order included) with the ASYNCHRONOUS extreme: a force_only transport (a prefetch
-    lands only when a verify read waits for it), C 12 of 30 blocks, windows of 2, X 2 / R_ver 2 (drafts never borrow),
-    one random block per verify row and head. Precondition: v1 supersedes in-flight prefetches for its verifier
-    (verifier_inflight_evictions > 0). S-C makes the same decisions every tick, on the probe and on the exact wait."""
+    in-flight protection and issue order included) with the ASYNCHRONOUS extreme: a force_only transport and the split
+    schedule (_sched_split: drafts prefetch blocks 0 .. 19, verify rows read blocks 20 .. 29, so no prefetch ever lands
+    and the LRU stays empty), C 16, X 2 / R_ver 2 (drafts never borrow): once the prefetches fill a stream, K5 refuses
+    the verifier past the 2 extras and only Policy E's in-flight candidates (the decided cohorts' prefetches) can serve
+    it. Precondition: v1 supersedes in-flight prefetches (verifier_inflight_evictions > 0). S-C makes the same
+    decisions every tick, on the probe and on the exact wait. (2051f9b's schedule, _sched_pressure with windows of 2,
+    let verify reads land prefetches into the LRU, and Policy E never needed an in-flight candidate.)"""
     try:
-        bad, wv, ws, _ = _lockstep_sc(7, C=12, X=2, R_ver=2, sched=_sched_pressure(109, 24, hb=30, window=2, nver=1),
+        bad, wv, ws, _ = _lockstep_sc(7, C=16, X=2, R_ver=2, sched=_sched_split(109, 30, hb=30, d_hi=20, window=2,
+                                                                              nver=1),
                                       hb=30, exact=exact, mode="force_only")
     except ER.CapacityRefusal as e:
         pytest.fail("the schedule refused (a configuration result, not this test's subject): %s" % e)
