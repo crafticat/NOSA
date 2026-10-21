@@ -6,6 +6,8 @@ GPU only (GFW1 is tests_cpu/test_r2_transport_gilfree.py GTG1 as a gate). Each c
 """
 from __future__ import annotations
 
+import builtins
+import dis
 import importlib.util
 import os
 import subprocess
@@ -136,7 +138,7 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
     assert lines[0] == "#!/bin/bash" and lines[-1] == 'main "$@"; exit $?' and "main() {" in text
     assert 'mkdir "$OUTROOT/gfw_active"' in text and "STEP_MIN=12" in text and "--export=NONE" in text
     assert text.index("UFILE=$HOLDERS/$JOB.gpu_uuid") < text.index('mkdir "$OUTROOT/gfw_active"')
-    assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw2 " in text
+    assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw1b " in text
     for word in ("awk", "perl", "python3", " bc ", "node "):
         for ln in lines:
             if not ln.lstrip().startswith("#"):
@@ -187,7 +189,7 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
             % (V2["sha"], V2["py"], V2["cpp"])) in r.stdout
     rec = "/mnt/beegfs/ojerbi/r2-runs/gfw/gfw_t1_516.step"
     for arg in ("--threads 8", "--releases 20", "--warmup 3", "--launches 1500", "--spin-cycles 200000000",
-                "--export=NONE", "--gres=gpu:a100:1", "--nosi-pkg /mnt/beegfs/ojerbi/nosi-r2-gfw2/nosi/nosi",
+                "--export=NONE", "--gres=gpu:a100:1", "--nosi-pkg /mnt/beegfs/ojerbi/nosi-r2-gfw1b/nosi/nosi",
                 "--v3 %s/packer_v3" % rec, "--v2 %s/packer_v2" % rec, "r2_gfw_gate.py", "--cell gfw1", "; cell gfw1"):
         assert arg in r.stdout, arg
     assert "--sizes 64,192" in r.stdout or "--sizes 64\\,192" in r.stdout
@@ -198,3 +200,49 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
                 "--l2-c 96", "--l2-x 32", "--l2-sleep-cycles 50000000", "--threads 8", "--export=NONE", "; cell gfw2"):
         assert arg in r2.stdout, arg
     assert "--releases" not in r2.stdout and "--launches" not in r2.stdout
+
+
+def _global_loads(code):
+    out = [ins.argval for ins in dis.get_instructions(code) if ins.opname == "LOAD_GLOBAL"]
+    for c in code.co_consts:
+        if hasattr(c, "co_code"):
+            out += _global_loads(c)
+    return out
+
+
+def _name_problems(jit):
+    """F23's property: the kernel's code has no free variable and every global it loads resolves in its module or in
+    builtins (Triton's compiler resolves a kernel's names in fn.__globals__)."""
+    fn = getattr(jit, "fn", jit)
+    code = fn.__code__
+    return list(code.co_freevars) + [n for n in _global_loads(code)
+                                     if n not in fn.__globals__ and not hasattr(builtins, n)]
+
+
+def test_GFWC4_the_gate_loads_the_fixed_exact_wait_kernel():
+    """GFWC4 (gfw1 on holder 2190876: GFW1 / GFW1n failed with "CompilationError: at 1:69" = fg5's "NameError: tl is
+    not defined": the branch predated C's fix 30b404b). Through the GATE's own loader (load_nosi of this tree's nosi
+    package, as GFW1 loads it), r2_residency_sc._wait_kernel() returns the MODULE-LEVEL board_wait_kernel, a Triton
+    JITFunction with no free variable whose every global resolves in its module or in builtins (C's F23 property; F23
+    itself runs in this tree: test_r2_residency.py); GFW1 launches exactly that call; 30b404b is an ancestor of HEAD.
+    Negative control: a kernel built in a factory with a local-only `import triton.language` fails the same check."""
+    triton = pytest.importorskip("triton")
+    from triton.runtime.jit import JITFunction
+    G = _gate()
+    _, SCG = G.load_nosi(str(ROOT / "nosi/nosi"), pkg="r2gfw_c4")
+    k = SCG._wait_kernel()
+    assert isinstance(k, JITFunction) and k is SCG.board_wait_kernel, type(k)
+    assert _name_problems(k) == [], _name_problems(k)
+    assert "kern = SCG._wait_kernel()" in (EFF / "r2_gfw_gate.py").read_text()
+    anc = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", "30b404b", "HEAD"])
+    assert anc.returncode == 0
+
+    def factory():
+        import triton.language as tl_local
+
+        @triton.jit
+        def planted(x_ptr, BLOCK: tl_local.constexpr):
+            offs = tl_local.arange(0, BLOCK)
+            tl_local.store(x_ptr + offs, offs)
+        return planted
+    assert _name_problems(factory()) == ["tl_local"]           # NEGATIVE CONTROL
