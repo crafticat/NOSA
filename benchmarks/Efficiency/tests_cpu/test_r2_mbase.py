@@ -203,8 +203,8 @@ def test_GM3_verdicts():
     assert v["GM-EXACT-574-1148"] == "REPORT" and v["GM-DENSE-FAST"] == "CONFIRMED" and v["GM-DENSE-EXACT"] == "CONFIRMED"
     d = {n: x for n, _, x in mg.gm1_verdicts(nat, pad)}
     assert "not binding" in d["GM-DENSE-FAST"] and "BINDING" in d["GM-DENSE-EXACT"]
-    moved = dict(nat, **{861: 90.0, 64: 20.0})
-    v = {n: x for n, x, _ in mg.gm1_verdicts(moved, dict(pad, **{(287, 1148): 50.0}))}
+    moved = {**nat, 861: 90.0, 64: 20.0}                   # non-string keys: dict literal, not dict(**) (job 2191286)
+    v = {n: x for n, x, _ in mg.gm1_verdicts(moved, {**pad, (287, 1148): 50.0})}
     assert (v["GM-NAT-861"], v["GM-NAT-64"], v["GM-EXACT-287-1148"]) == ("REFUTED", "REFUTED", "REFUTED"), v
     v = {n: x for n, x, _ in mg.gm1_verdicts({}, {})}
     assert all(x == "REPORT" for x in v.values()) and "GM-DENSE-FAST" not in v and "GM-DENSE-EXACT" not in v
