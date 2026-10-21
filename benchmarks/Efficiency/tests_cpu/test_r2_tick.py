@@ -1077,7 +1077,7 @@ def test_T19_sg5_step_script_uuid_file_and_pins(tmp_path):
     """T19: r2_tick_sg5_step.sh: the uuid file rules (missing, "GPU-" prefix, two lines: STOP before any other check;
     SG5_HOLDERS outside DRYRUN refused); the pins (piece 3 v2, the packer's two blobs of f2b981a); on a clean checkout
     at HEAD the DRYRUN prints the uuid, the pins and the arguments of the primary point and the sweep, and the cells
-    (_t19_cells: default = p3's arguments, p4a, p4b-<b>); in the step's own ROOT a DRYRUN stop FAILS (no skip).
+    (_t19_cells: default = p3's arguments, p4a, p4b-<b>, p4sc64); in the step's own ROOT a DRYRUN stop FAILS.
     Static: the claim sg5_active, STEP_MIN, --export=NONE, no awk / python3 / perl outside comments."""
     script = EFF / "r2_tick_sg5_step.sh"
     text = script.read_text()
@@ -1163,9 +1163,11 @@ P3_SG5_POINTS = "--modes exact,fast --backends sc,sb,v1"
 def _t19_cells(script, env, sha):
     """T19, the CELLS (the lead's two-step p4 plan): the DEFAULT prints p3's arguments token for token; p4a = p3's
     arguments without the sweep (the harness's --sweep default "" gives no sweep point); p4b-<b> = --modes exact
-    --backends <b> with the 9-point sweep; the cell and the transport in either order; the cell's names
-    (out, record, JIT, job name). Negative controls: every cell's arguments differ from p3's (the comparison
-    discriminates); a bare p4b, an unknown cell or backend, two cells, two transports, or 7 words: usage, exit 2."""
+    --backends <b> with the 9-point sweep; p4sc64 = --backends sc --X 64, both modes, no sweep, and the harness's
+    equal-memory pool C + X + 4 - 64 = 100 (68 elsewhere; printed by the DRYRUN, the harness's line pinned); the cell
+    and the transport in either order; the cell's names (out, record, JIT, job name). Negative controls: every cell's
+    arguments differ from p3's (the comparison discriminates); a bare p4b, an unknown cell or backend (p4sc32), two
+    cells, two transports, or 7 words: usage, exit 2."""
     def dry(*words):
         return subprocess.run(["bash", str(script), "--nosi", sha, "416", "t1", *words], env=env, capture_output=True,
                               text=True, timeout=120)
@@ -1181,12 +1183,21 @@ def _t19_cells(script, env, sha):
     G = _sg5_gate()
     base = ["--out", "o", "--workload", "w", "--biattn", "b", "--gilfree", "g", "--gilfree-build", "/x"]
     assert G.parse_args(base).sweep == "" and G.parse_args(base).sweep_pts == []     # p4a: no --sweep = no sweep
+    # the equal-memory baseline: the harness derives NOSI_POOL_BLOCKS from the parsed C and X (main, --pool-baseline)
+    src = (EFF / "r2_tick_sg5.py").read_text()
+    assert "if a.pool_baseline:\n            pool = a.C + a.X + 4 - 64\n" in src
+    assert "NOSI_POOL_BLOCKS = C + X + 4 - 64 = 68" in r.stdout and "C 96 X 32 R_ver 16" in r.stdout
     want = {"p4a": P3_SG5_ARGS.format(n="t1_416_p4a").replace(P3_SG5_SWEEP, "")}
+    shape = {"p4a": (["sc", "sb", "v1"], ["exact", "fast"], 0, 32)}            # backends, modes, sweep points, X
     for b in ("sc", "sb", "v1"):
         want["p4b-" + b] = P3_SG5_ARGS.format(n="t1_416_p4b-" + b).replace(P3_SG5_POINTS,
                                                                            "--modes exact --backends " + b)
+        shape["p4b-" + b] = ([b], ["exact"], 9, 32)
+    want["p4sc64"] = (P3_SG5_ARGS.format(n="t1_416_p4sc64").replace(P3_SG5_SWEEP, "")
+                      .replace(P3_SG5_POINTS, "--modes exact,fast --backends sc").replace(" --X 32 ", " --X 64 "))
+    shape["p4sc64"] = (["sc"], ["exact", "fast"], 0, 64)
     for cell, exp in want.items():
-        assert exp != p3 and (P3_SG5_SWEEP in exp) == (cell != "p4a")
+        assert exp != p3 and (P3_SG5_SWEEP in exp) == (shape[cell][2] == 9)
         for words in ((cell,), (cell, "gilfree"), ("gilfree", cell)):
             r = dry(*words)
             assert r.returncode == 0, (words, r.stderr.strip()[-300:])
@@ -1195,13 +1206,19 @@ def _t19_cells(script, env, sha):
             assert "--job-name=sg5-t1-416-%s " % cell in r.stdout and "cell %s" % cell in r.stdout
             assert "TRITON_CACHE_DIR=/mnt/beegfs/ojerbi/nosa-env/jit/sg5_t1_416_%s/triton" % cell in r.stdout
             pa = G.parse_args(got.split())                             # the harness's own reading of the cell
-            assert pa.backends == (["sc", "sb", "v1"] if cell == "p4a" else [cell[4:]])
-            assert pa.modes == (["exact", "fast"] if cell == "p4a" else ["exact"])
-            assert len(pa.sweep_pts) == (0 if cell == "p4a" else 9) and pa.steps == 48 and pa.sweep_steps == 24
+            backends, modes, n_sweep, X = shape[cell]
+            assert pa.backends == backends and pa.modes == modes, (cell, pa.backends, pa.modes)
+            assert len(pa.sweep_pts) == n_sweep and pa.steps == 48 and pa.sweep_steps == 24
+            assert (pa.C, pa.X, pa.R_ver, pa.batch, pa.S, pa.transport, pa.threads) == (96, X, 16, 64, 16128,
+                                                                                         "gilfree", 8)
+            pool = pa.C + pa.X + 4 - 64                                # the harness's rule (asserted above)
+            assert pool == (100 if cell == "p4sc64" else 68)
+            assert "NOSI_POOL_BLOCKS = C + X + 4 - 64 = %d" % pool in r.stdout, cell
+            assert "C 96 X %d R_ver 16" % X in r.stdout
     r = dry("gather", "p4a")
     assert r.returncode == 0 and args(r.stdout) == want["p4a"].replace("--transport gilfree", "--transport gather")
     for bad in (("p4b",), ("p4c",), ("p4b-s9",), ("p4a", "p4a"), ("p4a", "p4b-sb"), ("gather", "gilfree"),
-                ("p4a", "gather", "x"), ("P4A",)):
+                ("p4a", "gather", "x"), ("P4A",), ("p4sc32",), ("p4sc64", "p4a")):
         r = dry(*bad)
         assert r.returncode == 2 and "usage" in r.stderr, bad
 

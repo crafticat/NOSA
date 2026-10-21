@@ -102,3 +102,43 @@ of the run (no sync in the tick). With T_d's per-op sums from the draft-only run
    ResidentStore (C's F6 property at the tick level), with a negative control (a read of an in-flight slot).
 3. `advance_unchecked` in the tick, with the host capacity check and the overflow read; the T9 pin extended.
 4. The instrumented engine and the SG5 gate (T_shipped, T_d, T_tick, the budget terms) at B 64 / 128, EXACT and FAST.
+
+## 6. The p4 step cells, and the p4sc64 registration (2026-10-21, before the run)
+
+The step `benchmarks/Efficiency/r2_tick_sg5_step.sh` takes an optional cell. The default is p3's arguments, token for token. Test T19 (`_t19_cells`) pins every cell's printed arguments and the harness's own reading of them (`parse_args`).
+
+| cell | modes | backends | C / X / R_ver | sweep | equal-memory pool (C + X + 4 - 64) |
+|---|---|---|---|---|---|
+| (default) | exact, fast | sc, sb, v1 | 96 / 32 / 16 | 9 points, 24 steps | 68 |
+| p4a | exact, fast | sc, sb, v1 | 96 / 32 / 16 | none | 68 |
+| p4b-<b> | exact | b | 96 / 32 / 16 | 9 points, 24 steps | 68 |
+| p4sc64 | exact, fast | sc | 96 / 64 / 16 | none | 100 |
+
+Every cell runs 48 steps with gilfree at 8 threads, the superset wait, the torch twin and STEP_MIN 120. No gate or threshold changes.
+
+**Why p4sc64.** In p4a, the S-C gilfree preflight refused at C 96 / X 32 (record `sg5_p4_2190876_p4a.step/stderr.txt`). C's diagnosis (note 12o in docs/R2_STEP7_FETCH_RETENTION.md):
+- The policy is right.
+- Layer 16's first verify misses needed at least 48 shared extras. X is ONE pool per layer for its 128 streams, and it held 32.
+- Every LRU entry was protected by the topk-64 draft selections.
+- v1 refuses the same state (C's CPU test F25).
+
+The lead's decision is to measure S-C at X 64. The step's merge base is C's 7c1387f, which adds the K5 decision report (`_k5_report`) to every refusal.
+
+**Registered for p4sc64, with the scoring rules:**
+
+| ID | registered | key paths | rule |
+|---|---|---|---|
+| A1' | the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report names the per-layer demand | gate `SG5_preflight_gilfree_sc` (MUST); on a refusal, the FULL message in the record's `stderr.txt` (the gate detail is cut at 400 characters, r2_tick_sg5.py:472) | PASS = CONFIRMED (first branch). Refusal + a report = CONFIRMED (second branch), and the report is tabulated. A refusal without the report, or any other exception = REFUTED. The report must name, per layer: the first misses that need a shared extra, the free extras at the tick start, the granted ones and those with no slot. Per refused stream it must name base + extras + Policy E + no slot. |
+| R-T | REPORT: the S-C round tick 5.0-5.9 s and the draft-only tick 3.1-3.2 s (the engine agent's 1d1b956 section 3.2, derived at X 32) | `T_tick_ms` and `draft_only.device_ms.tick.mean` of both S-C points | REPORT only. X 64 changes the store size, so these are not falsifiers. I give the distance to each band and the host split per tick: device, twin, res, end_tick = host backend - res, and the rest. |
+| R-EQ | REPORT: the equal-memory shipped baseline at NOSI_POOL_BLOCKS 100 | `results.shipped_equal_memory.pool_blocks` (must be 100) and `.stats.median`; gate `R_shipped_equal_memory` | REPORT. ratio_eq for P-SG5-1 uses this run's own median. |
+| P-SG5-1..8 | as frozen for p3 (registry line 98), at both S-C points | as in analysis/sg5_p3/SCORING.md | Unchanged. P-SG5-6's bound (32 x 64 x 2 x 128 slots) was written for C + X = 128, and I score it as frozen. At X 64 there are C + X = 160 historical slots per stream: 32 x 64 x 2 x 160 = 655360. I report the peak against both numbers. |
+
+**Expected record shape (integrity, before any score):**
+- command.txt holds `cell=p4sc64 modes=exact,fast backends=sc C=96 X=64 R_ver=16 eq_pool=100`, and `sweep=none`.
+- stdout holds 10 gate lines:
+  - shipped_baseline and R_shipped_equal_memory;
+  - `SG5_preflight_gilfree_sc` (MUST) and `R_SG5_preflight_gather_sc`;
+  - for `SG5_exact_sc` and `SG5_fast_sc` each: `_completed`, `_bookkeeping` and `_gilfree_team`.
+- `results.sweep` is [] and `results.sweep_backend` is null.
+- `meta.args.X` is 64.
+- `meta.build_gb` should rise against p3's 17.73 GB, because the store holds C + X + 4 = 164 slots per stream instead of 132. The expected value is about 22 GB (REPORT).
