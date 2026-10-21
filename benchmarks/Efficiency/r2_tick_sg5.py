@@ -103,6 +103,9 @@ def parse_args(argv):
                          "the one variant --twin/per_call with p3's labels")
     ap.add_argument("--b2-checked", action="store_true",                                         # [b2]
                     help="b2: every B2 predicate (checked mode); default: unchecked (the timed path)")
+    ap.add_argument("--b2-resolve", default="torch", choices=("torch", "fused", "check"),        # [fusedres]
+                    help="b2: the per-layer resolve: S-C's torch ops (default), r2_fusedres (fused), or fused with "
+                         "the torch path compared at every layer (check: an equality gate, not a timing)")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -343,7 +346,8 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
         from nosi.r2_own2 import OwnResidency                        # [b2] device path: CudaDeviceOps (the superset
         lazy = _LazyOps()                                            # [b2] wait) behind _LazyOps, as sc
         svc = OwnResidency(*args, device=eng.store_k[0].device, nblk=n_host // 64, devops=lazy,             # [b2]
-                           checked=bool(getattr(a, "b2_checked", False)), **kw)                               # [b2]
+                           checked=bool(getattr(a, "b2_checked", False)),                                     # [b2]
+                           resolve=getattr(a, "b2_resolve", "torch"), **kw)                                   # [fusedres]
         lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)       # [b2]
     else:
         lazy = _LazyOps()
@@ -437,6 +441,7 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
     info = dict(backend=kind, C=C, X=X, R_ver=R_ver, gemm=ops.mode, steps=steps)
     if kind == "b2":                                                 # [b2] the mode (report()["b2"] repeats it)
         info["b2_checked"] = bool(getattr(a, "b2_checked", False))
+        info["b2_resolve"] = getattr(a, "b2_resolve", "torch")                    # [fusedres]
     # T_d: the draft-only tick
     eng, svc, tp = make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext)
     try:
@@ -444,6 +449,8 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
         info["draft_only"] = summarize(eng.timer.report())
         info["draft_only"]["d2h_reads"] = getattr(svc, "d2h_reads", None)
         info["draft_only"]["sc"] = sc_counters(svc)                    # REPORT (RES_SC.md 6)
+        if getattr(svc, "fusedres", None) is not None:                 # [fusedres] REPORT: launches, stats, err,
+            info["draft_only"]["fused"] = svc.fusedres.report()        # check-mode differences
     finally:
         tp.close()
         del eng, svc, tp
