@@ -218,6 +218,8 @@ class OwnResidency(ResidencySparse):
                  releasing=0 if self.mut.mem_no_releasing else rel)
         c["slots_used"] = sum(c.values())
         c["slots_physical"] = self.L * self.B * self.H * (self.n_hist + N_TAIL + self.n_trash)
+        if self.xpool is not None:                                    # [xpool] the flat store's (position, head) lanes
+            c["slots_physical"] = self.L * self.H * self.xpool.M
         c["retained"] = c["po"] + c["vres"]
         return c
 

@@ -14,6 +14,9 @@ blocks (the streams' slots); slots C + X .. C + X + 3 are the request's tail rin
 5.2), written by the tick, never by this service; slot C + X + 4 (with trash_slots=1) is the captured tick's TRASH
 slot: only its padded rows write and read it, never this service, never a live row (note 7). A page table over this
 store serves piece 3's attention for draft and verify rows alike.
+[xpool] OPT-IN (xpool=r2_xpool.XPool, step S6; S-C's device path only): the store is ONE flat store per layer (a shared
+arena of B * C + X_pool lanes per head plus the tail rings) and this service's slots stay LOGICAL; xpool.pos_of maps
+them to lanes (bound at the device's take, unbound when FREE). Ownership, K5 and Policy E are unchanged.
 
 ONE LAYER (resolve, v1 = host-side per layer, decision D2): the tick passes the rows and their selections (CPU int64).
   verify rows (first; K3X issues verifier requests before drafts, dispatcher.py:3103): protect the whole selection
@@ -132,9 +135,24 @@ class Residency:
                  store_b=None, cis=None, block: int = BLOCK, block_bytes: int = 0, host_wait: Callable = None,
                  mut: Mutations = None, clock: Callable[[], int] = time.perf_counter_ns, poll_in_resolve: bool = True,
                  defer_issue: bool = False, defer_admit: bool = False, trash_slots: int = 0,
-                 policy_e_inflight: bool = True, arrival_lag: Optional[int] = None):
+                 policy_e_inflight: bool = True, arrival_lag: Optional[int] = None, xpool=None):
         if trash_slots not in (0, 1):
             raise ValueError("trash_slots must be 0 or 1 (got %r)" % (trash_slots,))
+        # [xpool] the SHARED X POOL layout (r2_xpool.py, step S6, opt-in): the store is flat and every slot this
+        # service names is translated through xpool.pos_of; the device path binds the lanes (ResidencySC.resolve), so
+        # only services with XPOOL_OK (S-C and its subclasses: sparse, b2) take it; no trash slot
+        if xpool is not None:
+            if not getattr(type(self), "XPOOL_OK", False):
+                raise ValueError("xpool: the shared pool needs S-C's device path (ResidencySC and its subclasses), not "
+                                 "%s" % type(self).__name__)
+            if trash_slots:
+                raise ValueError("xpool: no trash slot in the shared-pool layout")
+            if (xpool.L, xpool.B, xpool.H, xpool.n_hist, xpool.mode, xpool.C) != (int(L), int(B), int(H),
+                                                                                   int(C) + int(X), "pool", int(C)):
+                raise ValueError("xpool (L %d, B %d, H %d, n_hist %d, mode %s, C %s) is not this service's (L %d, B %d, "
+                                 "H %d, C + X %d, pool, C %d)" % (xpool.L, xpool.B, xpool.H, xpool.n_hist, xpool.mode,
+                                                                 xpool.C, L, B, H, int(C) + int(X), C))
+        self.xpool = xpool
         if arrival_lag is not None and (isinstance(arrival_lag, bool) or not isinstance(arrival_lag, int)
                                         or arrival_lag < 1):
             raise ValueError("arrival_lag must be None or an int >= 1 (got %r)" % (arrival_lag,))
@@ -313,6 +331,12 @@ class Residency:
     # ------------------------------------------------------------------------------------------------ slots
     def _fill_bias(self, l: int, b: int, h: int, slot: int, block: int) -> None:
         if self.store_b is None or self.cis is None:
+            return
+        if self.xpool is not None:                                     # [xpool] the slot's lane, device ops only
+            p = self.xpool.pos_of[l, b, h, slot]
+            rows = p * self.bs + torch.arange(self.bs, device=p.device)
+            self.store_b[l].index_put_((rows, torch.full_like(rows, h)),
+                                       self.cis[l][b, block * self.bs:(block + 1) * self.bs, h].to(self.store_b[l].dtype))
             return
         s0, r0 = slot * self.bs, block * self.bs
         self.store_b[l][b, s0:s0 + self.bs, h].copy_(self.cis[l][b, r0:r0 + self.bs, h], non_blocking=True)
@@ -573,7 +597,10 @@ class Residency:
 
     def end_tick(self) -> None:
         """The end of a tick: the deferred draft transfers are issued, layer by layer, in their order; the tick index
-        advances (arrival_lag counts ticks by it)."""
+        advances (arrival_lag counts ticks by it). [xpool] First every deferred transfer gets its lane (Transfer.phys):
+        ONE device read for the tick."""
+        if self.xpool is not None:
+            self.xpool.assign_phys([tr for (_, trs) in self._deferred for tr in trs])
         for (l, trs) in self._deferred:
             self.tp.issue(l, trs)
         self._deferred = []
@@ -808,6 +835,8 @@ class Residency:
             c["releasing"] += cnt[RELEASING] if not self.mut.mem_no_releasing else 0
         c["slots_used"] = sum(c.values())
         c["slots_physical"] = self.L * self.B * self.H * (self.n_hist + N_TAIL + self.n_trash)
+        if self.xpool is not None:                                     # [xpool] the flat store's (position, head) lanes
+            c["slots_physical"] = self.L * self.H * self.xpool.M
         c["retained"] = c["po"] + c["vres"]
         return c
 

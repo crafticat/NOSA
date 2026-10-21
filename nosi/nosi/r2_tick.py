@@ -70,6 +70,11 @@ where a row's pages are and moves committed history.
                                      a publication calls decided(key), a rejection decided(key) then cancel_epoch(uid,
                                      old epoch); a finished request end_request(uid). Draft rows read the service's
                                      READY blocks (paper 3.1); verify rows their whole selection (urgent misses).
+[xpool] THE SHARED X POOL LAYOUT (step S6, OPT-IN; r2_xpool.py, docs/R2_XPOOL_PLAN.md): TickEngine(xpool=XPool) takes per
+layer ONE flat store (K / V (M * 64, H, D), bias (M * 64, H)); NB = the service's logical C + X (or the resident
+slots); the row table's ring_row is a FLAT row; the backends translate their logical page tables (xpool.translate);
+the attention gets xpool.attn_view(store) (stride(0) = 0: absolute positions; the kernel is unchanged). xpool None (the
+default): every line of the per-stream layout runs as before.
 INSTRUMENTATION (SG5): engine.timer (a TickTimer) records CUDA event pairs around the GEMMs, the attention, the
 selection, the twin advance, the store writes, the backend calls and the whole tick (run_round), and host time for the
 row table, the backend and the decision read; read once at the end of a run. timer None: no event, no cost.
@@ -347,7 +352,8 @@ class TickEngine:
     def __init__(self, model, ops, twins: List[PositionalTwin], store_k, store_v, store_bias, S_list, M_alloc: int,
                  nl=None, stage1=None, pool=None, select=SC.select_blocks, draft_drop: float = 0.0, drop_seed: int = 0,
                  check: bool = False, twin: str = "torch",                                      # [twin-variant]
-                 rebuild: str = "per_call"):                                                    # [batched-rebuild]
+                 rebuild: str = "per_call",                                                     # [batched-rebuild]
+                 xpool=None):                                                                   # [xpool]
         if rebuild not in REBUILD_MODES:                                                        # [batched-rebuild]
             raise TickError("rebuild must be one of %s (got %r)" % (REBUILD_MODES, rebuild))    # [batched-rebuild]
         self.rebuild = rebuild                                                                  # [batched-rebuild]
@@ -367,10 +373,14 @@ class TickEngine:
         self.B = t0.B // 2
         self.H, self.D = t0.H, t0.D
         self.store_k, self.store_v, self.store_bias = list(store_k), list(store_v), list(store_bias)
-        rows = int(self.store_k[0].shape[1])
-        if rows % BLOCK or rows // BLOCK < 5 or tuple(self.store_k[0].shape) != (self.B, rows, self.H, self.D):
-            raise TickError("store (B, (NB + 4) * 64, Hkv, D) expected, got %s" % (tuple(self.store_k[0].shape),))
-        self.NB = rows // BLOCK - 4
+        self.xpool = xpool                                                                      # [xpool]
+        if xpool is None:
+            rows = int(self.store_k[0].shape[1])
+            if rows % BLOCK or rows // BLOCK < 5 or tuple(self.store_k[0].shape) != (self.B, rows, self.H, self.D):
+                raise TickError("store (B, (NB + 4) * 64, Hkv, D) expected, got %s" % (tuple(self.store_k[0].shape),))
+            self.NB = rows // BLOCK - 4
+        else:                                                                                   # [xpool]
+            self._init_xpool(xpool)                                                             # [xpool]
         self.dev = t0.pos.device
         self.dtype = self.store_k[0].dtype
         self.M_alloc = int(M_alloc)
@@ -436,6 +446,27 @@ class TickEngine:
             raise TickError("attach_backend before the first tick")
         self.backend = backend
 
+    def _init_xpool(self, xp) -> None:                                                          # [xpool]
+        """[xpool] The flat stores of the shared-pool layout (r2_xpool.XPool): one per layer, of xp's shape; NB = xp's
+        logical history slots; the attention's views (stride(0) = 0) made once."""
+        if (xp.L, xp.B, xp.H) != (self.L, self.B, self.H):
+            raise TickError("xpool (L %d, B %d, H %d) is not the engine's (L %d, B %d, H %d)"
+                            % (xp.L, xp.B, xp.H, self.L, self.B, self.H))
+        for l in range(self.L):
+            try:
+                xp.check_store(self.store_k[l], self.store_v[l], self.store_bias[l])
+            except Exception as e:                                                              # XPoolError
+                raise TickError("layer %d: %s" % (l, e))
+            if self.store_k[l].shape[2] != self.D or self.store_k[l].device != xp.device:
+                raise TickError("layer %d: the flat store's D or device is not the engine's / the xpool's" % l)
+        self.NB = xp.n_hist
+        self.att = [(xp.attn_view(self.store_k[l]), xp.attn_view(self.store_v[l]), xp.attn_view(self.store_bias[l]))
+                    for l in range(self.L)]
+
+    def flat_ring_row(self, b: int, draft: bool, pos: int) -> int:                              # [xpool]
+        """[xpool] The flat row of position pos in request b's exact / draft ring."""
+        return self.xpool.tail_pos(b, self.ring_slot(draft, pos) - self.NB) * BLOCK + int(pos) % BLOCK
+
     def _span(self, cat: str):
         return self.timer.span(cat) if self.timer is not None else contextlib.nullcontext()
 
@@ -445,14 +476,17 @@ class TickEngine:
 
     # ------------------------------------------------------------------ construction from the R2 state
     @classmethod
-    def from_r2(cls, model, cache, st, ops, hist_slots: Optional[int] = None, **kw):
+    def from_r2(cls, model, cache, st, ops, hist_slots: Optional[int] = None, xpool=None, **kw):
         """A tick engine whose state is a COPY of a build_ragged state (body 'r2'; before its first decode step): the
         twins of every layer into both banks, the prompt's host K / V rows into the historical slots (complete
         blocks) and the exact ring (the partial last block), the twin's cis rows as the bias; the draft ring = the
         exact ring. The source is not changed.
         hist_slots None: the ResidentStore layout (a historical slot per block id). hist_slots = C + X: the Residency
         layout (piece 5, C's D4): C + X EMPTY historical slots per stream (the service fills them from the host rows),
-        then the same tail rings; the caller attaches a ResidencyBackend."""
+        then the same tail rings; the caller attaches a ResidencyBackend.
+        [xpool] xpool None (the default): the per-stream stores above. xpool = (C, X_pool) with hist_slots = C + X: the
+        SHARED POOL layout (r2_xpool.XPool mode "pool": flat stores of B (C + 4) + X_pool positions; the history arena
+        empty, the tail rings filled as above); xpool = "resident" without hist_slots: the flat ResidentStore layout."""
         from .r2_bi_decode import TWIN_FIELDS
         if st.body_mode != "r2" or st.steps != 0:
             raise TickError("from_r2 needs a fresh body-'r2' state (body %r, steps %d)" % (st.body_mode, st.steps))
@@ -462,6 +496,8 @@ class TickEngine:
         NB = st.n_max // BLOCK + 1 if resident else int(hist_slots)
         if NB < 1:
             raise TickError("hist_slots must be >= 1")
+        if xpool is not None:                                                                   # [xpool]
+            return cls._from_r2_xpool(model, cache, st, ops, NB, resident, xpool, S_list, **kw)  # [xpool]
         twins, sk, sv, sb = [], [], [], []
         for l, lay in enumerate(cache.layers):
             src = st.twins[l]
@@ -500,6 +536,58 @@ class TickEngine:
             torch.cuda.synchronize()
         return cls(model, ops, twins, sk, sv, sb, S_list, st.M_alloc, **kw)
 
+    @classmethod
+    def _from_r2_xpool(cls, model, cache, st, ops, NB, resident, spec, S_list, **kw):           # [xpool]
+        """[xpool] from_r2 on the flat layout (r2_xpool.XPool): the same twins; the tail rings at their static
+        positions; resident: every complete block at its static position b * NB + block."""
+        from .r2_bi_decode import TWIN_FIELDS
+        from .r2_xpool import XPool
+        B = st.B
+        src0 = st.twins[0]
+        if resident:
+            if spec != "resident":
+                raise TickError("xpool without hist_slots must be 'resident' (got %r)" % (spec,))
+            xp = XPool(len(cache.layers), B, src0.H, NB, mode="resident", device=src0.pos.device)
+        else:
+            if not (isinstance(spec, tuple) and len(spec) == 2):
+                raise TickError("xpool with hist_slots = C + X must be (C, X_pool) (got %r)" % (spec,))
+            xp = XPool(len(cache.layers), B, src0.H, NB, mode="pool", C=int(spec[0]), X_pool=int(spec[1]),
+                       device=src0.pos.device)
+        twins, sk, sv, sb = [], [], [], []
+        for l, lay in enumerate(cache.layers):
+            src = st.twins[l]
+            t = PositionalTwin(2 * B, src.H, src.D, src.lk_max, src.n_max, dtype=src.ring.dtype, device=src.pos.device)
+            for name in TWIN_FIELDS:
+                dst = getattr(t, name)
+                dst[:B].copy_(getattr(src, name))
+                dst[B:].copy_(getattr(src, name))
+            t.ccis[:, :B].copy_(src.ccis)
+            t.ccis[:, B:].copy_(src.ccis)
+            twins.append(t)
+            eng = lay.cache_engine
+            k, v, bias = xp.new_store(src.D, dtype=src.ring.dtype, device=src.ring.device)
+            for b, S in enumerate(S_list):
+                full = (S // BLOCK) * BLOCK
+                if resident:
+                    h0 = xp.hist_pos_static(b, 0) * BLOCK
+                    k[h0:h0 + full].copy_(eng._k_cpu[b, :full])
+                    v[h0:h0 + full].copy_(eng._v_cpu[b, :full])
+                    bias[h0:h0 + full].copy_(src.total_cis[b, :full])
+                if S > full:
+                    r0 = xp.tail_pos(b, RING_EXACT + (S // BLOCK) % 2) * BLOCK
+                    k[r0:r0 + S - full].copy_(eng._k_cpu[b, full:S])
+                    v[r0:r0 + S - full].copy_(eng._v_cpu[b, full:S])
+                    bias[r0:r0 + S - full].copy_(src.total_cis[b, full:S])
+                e0, d0 = xp.tail_pos(b, RING_EXACT) * BLOCK, xp.tail_pos(b, RING_DRAFT) * BLOCK
+                for x in (k, v, bias):
+                    x[d0:d0 + 2 * BLOCK].copy_(x[e0:e0 + 2 * BLOCK])
+            sk.append(k)
+            sv.append(v)
+            sb.append(bias)
+        if torch.device(st.cu_q.device).type == "cuda":
+            torch.cuda.synchronize()
+        return cls(model, ops, twins, sk, sv, sb, S_list, st.M_alloc, xpool=xp, **kw)
+
     def clone(self, ops=None, **kw):
         """An independent copy of the engine's state before its first tick (the gate's arms start from it). ops and
         the keyword arguments of the constructor (draft_drop, check, ...) may be replaced."""
@@ -514,6 +602,8 @@ class TickEngine:
         args = dict(nl=self.nl, stage1=self.stage1, pool=self.pool, select=self.select, draft_drop=self.draft_drop,
                     drop_seed=self.drop_seed, check=self.check, twin=self.twin_variant)                 # [twin-variant]
         args.setdefault("rebuild", self.rebuild)                                                # [batched-rebuild]
+        if self.xpool is not None:                                                              # [xpool] its own map
+            args["xpool"] = self.xpool.clone()                                                  # [xpool]
         args.update(kw)
         return type(self)(self.model, ops if ops is not None else self.ops, twins, [x.clone() for x in self.store_k],
                           [x.clone() for x in self.store_v], [x.clone() for x in self.store_bias], self.S_list,
@@ -568,7 +658,8 @@ class TickEngine:
                 lit, slot = int(tok), 0
                 if lit < 0:
                     raise TickError("row %d: token %d" % (k, lit))
-            tab[:, k] = torch.tensor([p, b, bank, len(g), tail * BLOCK + p % BLOCK, prev, tail, int(draft), lit, slot])
+            ring_row = tail * BLOCK + p % BLOCK if self.xpool is None else self.flat_ring_row(b, draft, p)   # [xpool]
+            tab[:, k] = torch.tensor([p, b, bank, len(g), ring_row, prev, tail, int(draft), lit, slot])
             g.append(k)
         count = [0] * (2 * self.B)
         for bank, g in groups.items():
@@ -689,9 +780,14 @@ class TickEngine:
                 raise TickError("layer %d: a selection does not end with the row's blocks T - 1, T" % l)
         # 5. the rows' own K / V / bias into their ring pages
         with self._span("store"):
-            self.store_k[l].index_put_((rb, ring_row), k.to(self.dtype))
-            self.store_v[l].index_put_((rb, ring_row), v.to(self.dtype))
-            self.store_bias[l].index_put_((rb, ring_row), cis.to(self.dtype))
+            if self.xpool is None:
+                self.store_k[l].index_put_((rb, ring_row), k.to(self.dtype))
+                self.store_v[l].index_put_((rb, ring_row), v.to(self.dtype))
+                self.store_bias[l].index_put_((rb, ring_row), cis.to(self.dtype))
+            else:                                                     # [xpool] ring_row is the FLAT row
+                self.store_k[l].index_put_((ring_row,), k.to(self.dtype))
+                self.store_v[l].index_put_((ring_row,), v.to(self.dtype))
+                self.store_bias[l].index_put_((ring_row,), cis.to(self.dtype))
         # 6. the page lists (the storage backend) and ONE BI attention call
         t_res = time.perf_counter()
         with self._span("res"):
@@ -699,8 +795,12 @@ class TickEngine:
         if self.timer is not None:
             self.timer.host("backend", time.perf_counter() - t_res)
         with self._span("att"):
-            attn = self.ops.attn.bi_paged_decode(q, self.store_k[l], self.store_v[l], self.store_bias[l], seq_idx,
-                                                 table, npg, last)
+            if self.xpool is None:
+                attn = self.ops.attn.bi_paged_decode(q, self.store_k[l], self.store_v[l], self.store_bias[l], seq_idx,
+                                                     table, npg, last)
+            else:                                                     # [xpool] FLAT ADDRESS MODE: stride(0) = 0 views,
+                ak, av, ab = self.att[l]                              # the table holds absolute positions
+                attn = self.ops.attn.bi_paged_decode(q, ak, av, ab, seq_idx, table, npg, last)
         t_res = time.perf_counter()
         with self._span("res"):
             self.backend.after_attention(l, plan)
@@ -859,6 +959,10 @@ class TickEngine:
         for b, positions in per_bank:
             for p in positions:
                 bb.append(int(b))
+                if self.xpool is not None:                                       # [xpool] flat rows
+                    src.append(self.flat_ring_row(b, False, p))
+                    dst.append(self.flat_ring_row(b, True, p))
+                    continue
                 src.append(self.ring_slot(False, p) * BLOCK + p % BLOCK)
                 dst.append(self.ring_slot(True, p) * BLOCK + p % BLOCK)
         if not bb:
@@ -868,6 +972,10 @@ class TickEngine:
     def copy_rows_many(self, l: int, cp) -> None:                                # [batched-rebuild]
         """[batched-rebuild] copy_rows for every (bank, position) of cp at once: the draft ring rows take the exact
         ring rows (distinct destinations; the sources are the exact ring, never a destination)."""
+        if self.xpool is not None:                                               # [xpool] rows are flat
+            for st in (self.store_k[l], self.store_v[l], self.store_bias[l]):
+                st[cp[2]] = st[cp[1]]
+            return
         for st in (self.store_k[l], self.store_v[l], self.store_bias[l]):
             st[cp[0], cp[2]] = st[cp[0], cp[1]]
 
@@ -880,6 +988,11 @@ class TickEngine:
             self.stats["writebacks"] += 1
 
     def copy_ring(self, l: int, b: int, exact_to_draft: bool = True) -> None:
+        if self.xpool is not None:                                               # [xpool] the ring pages are adjacent
+            e0, d0 = self.xpool.tail_pos(b, RING_EXACT) * BLOCK, self.xpool.tail_pos(b, RING_DRAFT) * BLOCK
+            for st in (self.store_k[l], self.store_v[l], self.store_bias[l]):
+                st[d0:d0 + 2 * BLOCK].copy_(st[e0:e0 + 2 * BLOCK])
+            return
         e0, d0 = (self.NB + RING_EXACT) * BLOCK, (self.NB + RING_DRAFT) * BLOCK
         for st in (self.store_k[l], self.store_v[l], self.store_bias[l]):
             st[b, d0:d0 + 2 * BLOCK].copy_(st[b, e0:e0 + 2 * BLOCK])
@@ -888,6 +1001,12 @@ class TickEngine:
         """The draft ring rows of `positions` take the exact ring rows (a publication)."""
         ps = list(positions)
         if not ps:
+            return
+        if self.xpool is not None:                                               # [xpool] flat rows
+            src = self._to_device(torch.tensor([self.flat_ring_row(b, False, p) for p in ps], dtype=torch.int64))
+            dst = self._to_device(torch.tensor([self.flat_ring_row(b, True, p) for p in ps], dtype=torch.int64))
+            for st in (self.store_k[l], self.store_v[l], self.store_bias[l]):
+                st[dst] = st[src]
             return
         src = torch.tensor([self.ring_slot(False, p) * BLOCK + p % BLOCK for p in ps], dtype=torch.int64)
         dst = torch.tensor([self.ring_slot(True, p) * BLOCK + p % BLOCK for p in ps], dtype=torch.int64)
@@ -941,9 +1060,19 @@ class ResidentStore:
     def prepare(self, rows):
         return None
 
+    def _xp(self):                                                               # [xpool]
+        xp = self.eng.xpool
+        if xp is not None and xp.mode != "resident":
+            raise TickError("the ResidentStore runs on the per-stream or the flat RESIDENT layout (xpool mode %r)"
+                            % xp.mode)
+        return xp
+
     def pages(self, l, ctx, sel, layer):
         table, npg = self.eng.page_table(l, sel, ctx.pos, ctx.rb, ctx.prev_slot, ctx.tail_slot, ctx.is_draft,
                                          ctx.any_draft, layer)
+        xp = self._xp()                                                          # [xpool] logical -> positions
+        if xp is not None:
+            table = xp.translate(l, table, ctx.rb32)
         return table, npg, ctx.last, ctx.rb32, None
 
     def after_attention(self, l, plan) -> None:
@@ -954,6 +1083,14 @@ class ResidentStore:
 
     def commit_block(self, b: int, blk: int) -> None:
         eng = self.eng
+        xp = self._xp()
+        if xp is not None:                                                       # [xpool] flat rows
+            src = eng.flat_ring_row(b, False, blk * BLOCK)
+            dst = xp.hist_pos_static(b, blk) * BLOCK
+            for l in range(eng.L):
+                for st in (eng.store_k[l], eng.store_v[l], eng.store_bias[l]):
+                    st[dst:dst + BLOCK].copy_(st[src:src + BLOCK])
+            return
         src = eng.ring_slot(False, blk * BLOCK) * BLOCK
         for l in range(eng.L):
             for st in (eng.store_k[l], eng.store_v[l], eng.store_bias[l]):
@@ -984,6 +1121,8 @@ class ResidencyBackend:
         if svc.n_hist != eng.NB or svc.B != eng.B or svc.L != eng.L or svc.H != eng.H:
             raise TickError("the service's store (B %d, L %d, H %d, C + X %d) is not the engine's (B %d, L %d, H %d, NB %d)"
                             % (svc.B, svc.L, svc.H, svc.n_hist, eng.B, eng.L, eng.H, eng.NB))
+        if getattr(svc, "xpool", None) is not eng.xpool:                                       # [xpool]
+            raise TickError("the service and the engine must share ONE XPool (or both none)")
         self.eng, self.svc, self.host_k, self.host_v = eng, svc, host_k, host_v
         self.new_event, self.K = new_event, int(K)
         from .r2_residency_sb import ResidencySB             # S-B and S-C (its subclass): the selection stays on the
@@ -1027,8 +1166,11 @@ class ResidencyBackend:
     def pages(self, l, ctx, sel, layer):
         plan = self.svc.resolve(l, ctx.rows, sel if self.sb else sel.cpu())
         dev = self.eng.dev
-        return (plan.page_table.to(dev).contiguous(), plan.num_pages.to(dev).contiguous(),
-                plan.last_len.to(dev).contiguous(), plan.seq_idx.to(dev).contiguous(), plan)
+        table = plan.page_table.to(dev).contiguous()
+        seq_idx = plan.seq_idx.to(dev).contiguous()
+        if self.eng.xpool is not None:                                           # [xpool] the plan stays logical
+            table = self.eng.xpool.translate(l, table, seq_idx)
+        return (table, plan.num_pages.to(dev).contiguous(), plan.last_len.to(dev).contiguous(), seq_idx, plan)
 
     def after_attention(self, l, plan) -> None:
         self.svc.read_done(l, plan, self.new_event())
@@ -1044,6 +1186,13 @@ class ResidencyBackend:
             raise TickError("block %d of request %d is past the host rows (%d)" % (blk, b, self.n_host))
         src = eng.ring_slot(False, blk * BLOCK) * BLOCK
         r0 = blk * BLOCK
+        if eng.xpool is not None:                                                # [xpool] the ring page's flat rows
+            src = eng.flat_ring_row(b, False, blk * BLOCK)
+            for l in range(eng.L):
+                self.host_k[l][b, r0:r0 + BLOCK].copy_(eng.store_k[l][src:src + BLOCK], non_blocking=True)
+                self.host_v[l][b, r0:r0 + BLOCK].copy_(eng.store_v[l][src:src + BLOCK], non_blocking=True)
+            self.svc.history_written(b, blk, self.new_event())
+            return
         for l in range(eng.L):
             self.host_k[l][b, r0:r0 + BLOCK].copy_(eng.store_k[l][b, src:src + BLOCK], non_blocking=True)
             self.host_v[l][b, r0:r0 + BLOCK].copy_(eng.store_v[l][b, src:src + BLOCK], non_blocking=True)
