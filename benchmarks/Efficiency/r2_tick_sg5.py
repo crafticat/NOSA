@@ -43,6 +43,11 @@ and no sweep; the preflight runs the pool layout; one_point_both: MUST gates <la
 <label>_XP_peak and <label>_XP_tick against the mean of the two stream arms). --arrival-lag D (default 0 = free
 timing): the residency's fixed arrival lag (note 12k) for every engine of the run. --pool-rule stream (default:
 NOSI_POOL_BLOCKS = C + X + 4 - 64) | k5 (r2_xpool.equal_memory_pool: C + 4 - 64 + floor(X_pool / B)) | both.
+[bigb] LARGE B (docs/R2_BIGB_PLAN.md; bigb_core.py): --log-slots 0 (default: the engine's 1 << 16) | -1 (bigb_core.
+log_slots_for the round) | N; --skip-shipped (opt-in: no shipped child, a REPORT gate R_shipped_skipped). The preflight
+and one_point now release the round (a TickRound holds its engine) with the engine, so no two engines coexist (before:
+the preflight's first engine lived while the second was built: p5b2's 67.49 GB peak was two engines). REPORTS:
+meta.build_peak_gb, meta.preflight_peak_gb, each point's peak_gb_cum, meta.log_slots.
 OUTPUT: --out/summary.json (after every run). The last stdout line is R2_TICK_SG5_DONE failed=<n>; exit = n (2 =
 refused). ENVIRONMENT: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0, NOSI_POOL_BLOCKS = 0 (the parent; a child sets its own).
 """
@@ -123,6 +128,12 @@ def parse_args(argv):
     ap.add_argument("--arrival-lag", type=int, default=0,                                        # [xpool] review B1
                     help="the residency's fixed arrival lag D (note 12k; 0: free timing, the default); --layout both "
                          "needs D >= 1, so the arms are comparable tick by tick")
+    ap.add_argument("--log-slots", type=int, default=0,                                          # [bigb]
+                    help="the engines' token-log slots: 0 (default) the engine's 1 << 16; -1 bigb_core.log_slots_for("
+                         "B, max(steps, sweep-steps), K, LAMBDA); N > 0: N")
+    ap.add_argument("--skip-shipped", action="store_true",                                       # [bigb]
+                    help="no shipped child (T_shipped None, ratio None; a REPORT gate says so); not with "
+                         "--pool-baseline")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -154,7 +165,23 @@ def parse_args(argv):
                  "note 12k)")
     if a.layout == "both" and a.sweep_pts:                                                       # [xpool] review m4
         ap.error("--layout both runs no sweep (the sweep's points would run the pool arm only)")
+    if a.log_slots < -1:                                                                         # [bigb]
+        ap.error("--log-slots: 0 (the engine's default), -1 (log_slots_for) or a positive size")
+    if a.skip_shipped and a.pool_baseline:                                                       # [bigb]
+        ap.error("--skip-shipped runs no shipped child, so no --pool-baseline either")
+    a.log_slots_n = resolve_log_slots(a)                                                         # [bigb]
     return a
+
+
+def resolve_log_slots(a):                                                                       # [bigb]
+    """[bigb] The engines' token-log size: None (the engine's default 1 << 16) for --log-slots 0; for -1 the round's
+    size bigb_core.log_slots_for(B, max(steps, sweep-steps, preflight-steps), K, LAMBDA); else the given size."""
+    if a.log_slots == 0:
+        return None
+    if a.log_slots > 0:
+        return int(a.log_slots)
+    import bigb_core
+    return bigb_core.log_slots_for(a.batch, max(a.steps, a.sweep_steps, a.preflight_steps), a.K, a.LAMBDA)
 
 
 def pool_positions(a, X):                                                                       # [xpool]
@@ -395,7 +422,8 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
     """A fresh engine on the Residency layout with its service and gilfree transport (module docstring). [xpool]
     layout (default --layout): "pool" builds the shared-pool store (sc / b2 only) and hands its XPool to the
     transports and the service. engine_kw: extra TickEngine arguments through from_r2 (the context sweep's tick
-    family passes log_slots); None = as before."""
+    family passes log_slots); None = as before. [bigb] --log-slots (a.log_slots_n) sizes the token log when
+    engine_kw does not name it (--log-slots 0: the engine's default, as before)."""
     import torch
     from nosi.r2_residency import Residency, TorchGather
     from nosi.r2_residency_sb import ResidencySB
@@ -403,6 +431,8 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
     from nosi.r2_tick import ResidencyBackend, TickEngine, TickTimer
     from nosi.r2_transport_gilfree import GilfreeTransport
     ekw = dict(engine_kw or {})
+    if getattr(a, "log_slots_n", None) is not None:                                              # [bigb]
+        ekw.setdefault("log_slots", int(a.log_slots_n))                                          # [bigb]
     xspec = None                                                                                 # [xpool]
     if arm_layout(a, layout) == "pool":                                                          # [xpool]
         if kind not in XPOOL_BACKENDS:                                                           # [xpool]
@@ -576,7 +606,8 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
     if layout is not None:                                                                       # [xpool] this arm's peak
         _reset_peak()
     eng, svc, tp = make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, layout=layout)
-    req_ticks = [0]
+    rnd = None                                                       # [bigb] released with the engine (the TickRound
+    req_ticks = [0]                                                  # holds its bound methods)
 
     def on_tick(rows, tokens, out):
         req_ticks[0] += len({r.b for r in rows})
@@ -628,9 +659,11 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
         gates.append(GB.gate("%s_gilfree_team" % label, tp.threads_ok() or tp.stats["releases"] == 0, True,
                              "requested %d threads; teams %s .. %s over %d releases" % (
                                  a.threads, tp.stats["threads_min"], tp.stats["threads_max"], tp.stats["releases"])))
+        info["peak_gb_cum"] = round(torch.cuda.max_memory_allocated() / 1e9, 3) if torch.cuda.is_available() \
+            else None                                                # [bigb] REPORT: the run's peak so far
     finally:
         tp.close()
-        del eng, svc, tp
+        del eng, svc, tp, rnd                                        # [bigb] rnd too (it held the round's engine)
         GB.free()
     if bare:
         eng, svc, tp = make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=("tick",),
@@ -755,7 +788,7 @@ def preflight(a, model, cache, st, first, ops, ext, gates, res, engine_fn=None, 
             log(label)
             must = tpname == a.transport
             t0 = time.time()
-            eng = svc = tp = None
+            eng = svc = tp = rnd = None     # [bigb] rnd too: a TickRound holds the engine (read_tokens, on_publish)
             try:
                 eng, svc, tp = engine_fn(a, model, cache, st, ops, kind, a.C, a.X, a.R_ver, ext, timer_cats=("tick",),
                                          transport=tpname)
@@ -772,7 +805,7 @@ def preflight(a, model, cache, st, first, ops, ext, gates, res, engine_fn=None, 
             finally:
                 if tp is not None:
                     tp.close()
-                del eng, svc, tp
+                del eng, svc, tp, rnd       # [bigb] before: rnd kept this engine alive while the next one was built
                 GB.free()
             gates.append(GB.gate(label if must else "R_" + label, good or not must, must,
                                  detail if good else "FAILED: " + detail))
@@ -845,11 +878,18 @@ def main(argv=None) -> int:
         def save():
             json.dump(dict(meta=meta, gates=gates, results=res), open(os.path.join(a.out, "summary.json"), "w"),
                       indent=1, sort_keys=True, default=str)
-        log("SHIPPED baselines in child processes")
-        base, err = run_child(a, argv, 0, os.path.join(a.out, "shipped_pool0.json"))
-        res["shipped"] = base
-        gates.append(GB.gate("shipped_baseline", base is not None, True, err or "T_shipped median %.2f ms"
-                             % base["stats"]["median"]))
+        if a.skip_shipped:                                                                     # [bigb] opt-in
+            base = None
+            res["shipped"] = None
+            gates.append(GB.gate("R_shipped_skipped", True, False, "--skip-shipped: no shipped child; T_shipped None, "
+                                 "ratio None"))
+        else:
+            log("SHIPPED baselines in child processes")
+            base, err = run_child(a, argv, 0, os.path.join(a.out, "shipped_pool0.json"))
+            res["shipped"] = base
+            gates.append(GB.gate("shipped_baseline", base is not None, True, err or "T_shipped median %.2f ms"
+                                 % base["stats"]["median"]))
+        meta["log_slots"] = a.log_slots_n                                                      # [bigb] None: 1 << 16
         if a.pool_baseline:
             pool = a.C + a.X + 4 - 64
             if a.pool_rule in ("stream", "both"):                                              # [xpool] the default
@@ -900,7 +940,9 @@ def main(argv=None) -> int:
             GB.free()
             first = [int(x) for x in first_t.view(-1).tolist()]
             meta["build_gb"] = round(torch.cuda.memory_allocated() / 1e9, 2)
+            meta["build_peak_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 3)             # [bigb] REPORT
             backends = preflight(a, model, cache, st, first, BIOps(attn, a.m_fix, gemm=a.modes[0]), ext, gates, res)
+            meta["preflight_peak_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 3)         # [bigb] REPORT
             save()
             if not backends:
                 log("PREFLIGHT: no backend ran a short round on the %s transport: the long arms are skipped"
