@@ -83,6 +83,7 @@ except Exception:                                      # pragma: no cover - not 
     triton = tl = None
 
 from .kstep.errors import OwnershipViolation
+from . import r2_xpool as XP                                 # [integ] the shared X pool's binder and flat bias fill
 from .r2_residency import N_TAIL
 from .r2_residency_sb import FIELDS, DraftDecision, device_draft
 from .r2_residency_sc import (C_FREE, C_INFLIGHT, C_LRU, C_PO, C_RELEASING, C_VRES, FIELDS_V, HALF_STAMP,
@@ -822,9 +823,14 @@ class FusedResolver:
     def __init__(self, svc, check: bool = False, plant: int = 0, num_warps: int = 8, guard: bool = False):
         if triton is None:
             raise RuntimeError("resolve='fused' needs triton (not installed)")
-        if getattr(svc, "xpool", None) is not None:
-            raise ValueError("resolve='fused' does not bind the shared X pool's lanes yet (docs/R2_FUSEDRES_PLAN.md, "
-                             "section 5: the merge with nosi-r2-xpool)")
+        # [integ] the shared X pool (docs/R2_FUSEDRES_PLAN.md section 5, implemented): the kernels decide on LOGICAL
+        # slots (I1-I5); the lanes are bound after V2 and after D2 (XPool.bind, torch ops), the draft bias rows go
+        # through r2_xpool.draft_bias_fill_flat (D2 runs with BIAS 0), and the FREE slots' lanes are released after the
+        # tick's sync_mirror, exactly where ResidencySC.resolve does it
+        self.xp = getattr(svc, "xpool", None)
+        if self.xp is not None and getattr(self.xp, "mode", None) != "pool":
+            raise ValueError("resolve='fused': an attached xpool must be in mode 'pool' (got %r)"
+                             % (getattr(self.xp, "mode", None),))
         if plant not in PLANTS:
             raise ValueError("fused plant %r (one of %s)" % (plant, sorted(PLANTS)))
         if getattr(svc, "record_cap", None) is not None:
@@ -902,9 +908,16 @@ class FusedResolver:
         if sel.device.type != svc.device.type:
             raise ValueError("S-C: the selection must be on the service's device %s (got %s)" % (svc.device, sel.device))
         svc._check_rows(l, rows, sel)
+        if svc.want_keys and not svc._tick:                           # [integ] S-C's [sharedkv2] hook, kept (host
+            svc._check_tail_keys(rows)                                # rows only, once per tick)
         if not svc._tick:                                             # the tick's first layer: the per-tick copies
             svc.sync_mirror()
             svc._rows = svc._tick_rows(rows)
+            if self.xp is not None:                                   # [integ][xpool] S-C's unbind, same place and
+                if not svc.DECISION_READ_BLOCKING:                    # the same blocking-read precondition
+                    raise OwnershipViolation("xpool: lanes are reused across requests only behind a blocking decision "
+                                             "read (r2_xpool.py, the lane-level order); this class's is not")
+                self.xp.release_free(svc.dmirror.code)
         elif svc._dirty:
             raise OwnershipViolation("S-C: the host state changed in the middle of a tick (the device mirror is stale)")
         elif svc._row_sig(rows) != svc._rows["sig"]:
@@ -920,7 +933,9 @@ class FusedResolver:
         plan.num_pages = npg
         plan.last_len = tk["last_len"]
         plan.seq_idx = tk["seq_idx"]
-        return plan
+        if svc.want_keys:                                             # [integ] S-C's [sharedkv2] hook, kept: the keys
+            plan.page_key = svc._page_keys(len(rows), sel.shape[2] + N_TAIL, step, tk, plan.num_pages)   # from the
+        return plan                                                   # FUSED decisions' (blk, valid / ready) columns
 
     # ----------------------------------------------------------------------------------------------- per tick
     def _tick_setup(self, rows, tk):
@@ -992,6 +1007,19 @@ class FusedResolver:
             bb = fz["v"][0].view(Rv, 1, 1).expand(Rv, H, k).reshape(-1)
             hh = torch.arange(H, device=svc.device).view(1, H, 1).expand(Rv, H, k).reshape(-1)
             out = fz["bh"][k] = (bb, hh)
+        return out
+
+    def _bhd(self, fz, k):
+        """[integ][xpool] (b, h) of every draft entry (K3X order), as ResidencySparse._record_inputs builds bbd / hhd
+        for draft_bias_fill (device ops, once per tick and width)."""
+        key = ("d", k)
+        out = fz["bh"].get(key)
+        if out is None:
+            svc = self.svc
+            H, Rd = svc.H, fz["Rd"]
+            bb = fz["d"][0].view(Rd, 1, 1).expand(Rd, H, k).reshape(-1)
+            hh = torch.arange(H, device=svc.device).view(1, H, 1).expand(Rd, H, k).reshape(-1)
+            out = fz["bh"][key] = (bb, hh)
         return out
 
     # ----------------------------------------------------------------------------------------------- one layer
@@ -1066,6 +1094,9 @@ class FusedResolver:
             vdec = VerifyDecision(Rv, H, k, {f: tv[i] for i, f in enumerate(FIELDS_V)}, vpage, vnpg, ids,
                                   self._bh(fz, k), cntv)
             rec.update(vrec=vrec, vcnt=vcnt, vlook=vlook, vread=vread)
+            if self.xp is not None:                                   # [integ][xpool] recipe (2): the takes' lanes,
+                self.xp.bind(l, vdec.bh[0], vdec.bh[1], vdec.t["take_slot"],   # before the wait and the gather
+                             (vdec.t["granted"] | vdec.t["evict"]) != 0)
             if ref is None:
                 svc.dev.wait(l, vdec)                                 # S-C's order: wait, gather, then the drafts
                 svc.dev.gather(l, vdec)
@@ -1083,7 +1114,11 @@ class FusedResolver:
             bias = 0
             sb = cis = sel
             rows_s = rows_c = 0
-            if svc.store_b is not None and svc.cis is not None:
+            flat_bias = self.xp is not None and svc.store_b is not None and svc.cis is not None   # [integ][xpool]
+            if flat_bias:                                             # recipe (3): D2 with BIAS 0; the bias rows go
+                if self.check:                                        # through draft_bias_fill_flat after the bind
+                    sb_before = svc.store_b[l].clone()
+            elif svc.store_b is not None and svc.cis is not None:
                 sb_t, cis_t = svc.store_b[l], svc.cis[l]
                 if (not sb_t.is_contiguous() or not cis_t.is_contiguous() or sb_t.dim() != 3 or cis_t.dim() != 3
                         or not sb_t.dtype.is_floating_point or not cis_t.dtype.is_floating_point):
@@ -1116,6 +1151,11 @@ class FusedResolver:
             self.launches += 3
             ddec = DraftDecision(Rd, H, k, {f: td[i] for i, f in enumerate(FIELDS)}, dpage, dnpg, cntd4[:3])
             rec.update(drec=drec, dcnt=dcnt)
+            if self.xp is not None:                                   # [integ][xpool] recipe (3): the draft takes'
+                bbd, hhd = self._bhd(fz, k)                           # lanes, then their bias rows on the lanes
+                self.xp.bind(l, bbd, hhd, ddec.t["take_slot"], ddec.t["granted"] != 0)
+                if flat_bias:
+                    XP.draft_bias_fill_flat(self.xp, l, svc.store_b[l], svc.cis[l], ddec, bbd, hhd, svc.bs)
         rec.update(sel=selw, rowsel=rowsel)
         self.layers += 1
         step = dict(l=l, vrows=[rows[i] for i in tk["vrows"]], vidx=tk["vrows"], vdec=vdec,
@@ -1184,7 +1224,11 @@ class FusedResolver:
         cmp("caps", torch.tensor(step["caps"]), torch.tensor(ref["caps"]))
         if sb_before is not None and ref["ddec"] is not None:
             args = ref["args"]
-            draft_bias_fill(sb_before, svc.cis[l], ref["ddec"], args[7], args[8], svc.bs)
+            if self.xp is not None:                                   # [integ][xpool] the torch path's flat fill on
+                XP.draft_bias_fill_flat(self.xp, l, sb_before, svc.cis[l], ref["ddec"], args[7], args[8],   # the
+                                        svc.bs)                       # lanes the fused takes bound (same take slots
+            else:                                                     # when the decisions are equal)
+                draft_bias_fill(sb_before, svc.cis[l], ref["ddec"], args[7], args[8], svc.bs)
             cmp("store_b", svc.store_b[l], sb_before)
         self.diffs += out
         self.compared += 1

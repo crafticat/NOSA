@@ -43,6 +43,11 @@ and no sweep; the preflight runs the pool layout; one_point_both: MUST gates <la
 <label>_XP_peak and <label>_XP_tick against the mean of the two stream arms). --arrival-lag D (default 0 = free
 timing): the residency's fixed arrival lag (note 12k) for every engine of the run. --pool-rule stream (default:
 NOSI_POOL_BLOCKS = C + X + 4 - 64) | k5 (r2_xpool.equal_memory_pool: C + 4 - 64 + floor(X_pool / B)) | both.
+[integ] THE STACK (docs/R2_INTEG_PLAN.md, opt-in): --attn shared[-whole] (+ --union, --sharedkv; sc / b2 page keys;
+needs --sel-check or an explicit --shared-unchecked), --gilfree-warm-up on|off (default on: the transport's default),
+--stack full | full-no-<c> | none (presets of twin, rebuild, b2 resolve, layout, attn, warm-up; an explicit component
+flag next to --stack is refused), --stack-compare (arms none, <stack>, none2: MUST <label>_ST_replica /
+_ST_committed / _ST_bitwise), --shipped-batch (the shipped decode at another batch: ratio None, tok_per_s reported).
 OUTPUT: --out/summary.json (after every run). The last stdout line is R2_TICK_SG5_DONE failed=<n>; exit = n (2 =
 refused). ENVIRONMENT: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0, NOSI_POOL_BLOCKS = 0 (the parent; a child sets its own).
 """
@@ -69,6 +74,23 @@ TRANSPORTS = ("gilfree", "gather")
 LAYOUTS = ("stream", "pool", "both")                                                    # [xpool]
 XPOOL_BACKENDS = ("sc", "b2")                                                           # [xpool] S-C's device path
 _PEAK = [0]                                                                             # [xpool] the max before resets
+# [integ] the shared-KV selector in the SG5 tick (docs/R2_SHAREDKV_PLAN.md; r2_tick_gate.select_attn's choices that
+# drive the tick: the probes stay in r2_tick_gate.py)
+ATTN_CHOICES = ("per_row", "shared", "shared-whole")
+KEY_BACKENDS = ("sc", "b2")                                                             # the plans that carry page keys
+# [integ] THE STACK (docs/R2_INTEG_PLAN.md): every gap-closing build at once. Each component has an OFF value (the
+# pre-integration path, p5b2's code) and an ON value; --stack full turns every one ON, full-no-<c> all but <c>.
+STACK_COMPONENTS = ("twin", "rebuild", "resolve", "layout", "attn", "warmup")
+STACK_ON = dict(twin=dict(twin="fused"), rebuild=dict(rebuild="batched"), resolve=dict(b2_resolve="fused"),
+                layout=dict(layout="pool"), attn=dict(attn="shared", union="fused"),
+                warmup=dict(gilfree_warm_up="on"))
+STACK_OFF = dict(twin=dict(twin="torch"), rebuild=dict(rebuild="per_call"), resolve=dict(b2_resolve="torch"),
+                 layout=dict(layout="stream"), attn=dict(attn="per_row", union="torch"),
+                 warmup=dict(gilfree_warm_up="off"))
+STACK_CHOICES = ("", "none", "full") + tuple("full-no-" + c for c in STACK_COMPONENTS)
+# the flags a stack sets: each must be at its parse default when --stack is given (never silently overridden)
+STACK_FLAG_DEFAULTS = dict(twin="torch", variants="", b2_resolve="torch", layout="stream", attn="per_row",
+                           union="torch", gilfree_warm_up="on")
 
 
 def log(msg):
@@ -131,6 +153,34 @@ def parse_args(argv):
     ap.add_argument("--arrival-lag", type=int, default=0,                                        # [xpool] review B1
                     help="the residency's fixed arrival lag D (note 12k; 0: free timing, the default); --layout both "
                          "needs D >= 1, so the arms are comparable tick by tick")
+    ap.add_argument("--attn", default="per_row", choices=ATTN_CHOICES,                           # [integ] sharedkv
+                    help="the tick's attention: per_row = piece 3 (default, unchanged); shared[-whole] = the "
+                         "shared-read kernel (bi_paged_attention_shared.SharedKV) on the plan's page keys (sc / b2)")
+    ap.add_argument("--union", default="torch", choices=("torch", "fused"),                     # [integ] sharedkv3
+                    help="the shared side's union build: torch (build_union) or fused (one kernel per call)")
+    ap.add_argument("--sharedkv", default=os.path.join(os.path.dirname(os.path.dirname(HERE)),   # [integ]
+                                                       "nosi", "nosi", "bi_paged_attention_shared.py"),
+                    help="the shared-read module (loaded by path; it imports nothing from nosi)")
+    ap.add_argument("--sel-check", action="store_true",                                         # [integ]
+                    help="TickEngine(check=True): the selection's last two blocks T - 1, T are checked every layer "
+                         "(one host read per layer; the shared union build assumes it: sharedkv4 MINOR-3)")
+    ap.add_argument("--shared-unchecked", action="store_true",                                  # [integ]
+                    help="allow --attn shared* WITHOUT --sel-check (a timing arm; the precondition must be checked "
+                         "in another invocation of the same cell; recorded in meta)")
+    ap.add_argument("--gilfree-warm-up", default="on", choices=("on", "off"),                   # [integ] gfw1f
+                    help="GilfreeTransport(warm_up=...): on = the transport's production default since 000870e; "
+                         "off = the pre-warm-up path (p5b2's code; gfw1f's control)")
+    ap.add_argument("--stack", default="", choices=STACK_CHOICES,                                # [integ]
+                    help="a preset of the gap-closing builds (docs/R2_INTEG_PLAN.md): full = twin fused, rebuild "
+                         "batched, b2 resolve fused, layout pool (X_pool from --X-pool), attn shared split + union "
+                         "fused, gilfree warm-up; full-no-<c> = full minus one component; none = every one OFF")
+    ap.add_argument("--stack-compare", action="store_true",                                      # [integ]
+                    help="three arms per point: none (every component OFF), the --stack arm, none again (the "
+                         "replica); MUST gates <label>_ST_replica / _ST_committed / _ST_bitwise (needs "
+                         "--arrival-lag >= 1)")
+    ap.add_argument("--shipped-batch", type=int, default=0,                                     # [integ]
+                    help="the shipped decode's batch (0: --batch); another value makes 'ratio' None and reports "
+                         "tokens per second on both sides")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -148,10 +198,33 @@ def parse_args(argv):
         ap.error("m_fix >= (1 + K) B, C >= 1, 0 <= R_ver <= X")
     if a.S < 64 * 64 or a.steps < 4 or a.draft_ticks < 2 or a.shipped_steps < 2:
         ap.error("S >= 4096, steps >= 4, draft-ticks >= 2, shipped-steps >= 2")
+    if a.stack:                                                                                  # [integ]
+        given = sorted(k for k, v in STACK_FLAG_DEFAULTS.items() if getattr(a, k) != v)
+        if given:
+            ap.error("--stack %s sets the components itself: do not pass %s" % (a.stack, ", ".join(
+                "--" + k.replace("_", "-") for k in given)))
+        apply_stack(a, a.stack)
+    elif a.stack_compare:
+        ap.error("--stack-compare needs --stack")
     a.variant_list = parse_variants(a.variants, a.twin)                                          # [batched-rebuild]
     if a.variant_list is None:                                                                   # [batched-rebuild]
         ap.error("--variants: twin/rebuild,... with twin in torch|fused and rebuild in per_call|batched, distinct")
+    if a.stack:                                                                                  # [integ] the preset's
+        a.variant_list = [(a.twin, a.stack_rebuild)]                                             # one variant
     a.rebuild = a.variant_list[0][1]                                                             # [batched-rebuild]
+    if a.attn != "per_row":                                                                      # [integ] sharedkv
+        if any(b not in KEY_BACKENDS for b in a.backends):
+            ap.error("--attn %s needs page keys: --backends in %s (v1 / sb give none)" % (a.attn, KEY_BACKENDS))
+        if not a.sel_check and not a.shared_unchecked:
+            ap.error("--attn %s needs --sel-check (the union build assumes the selection's tail T - 1, T: sharedkv4 "
+                     "MINOR-3), or an explicit --shared-unchecked for a timing arm" % a.attn)
+    if a.b2_resolve != "torch" and any(b != "b2" for b in a.backends):                          # [integ]
+        ap.error("--b2-resolve %s (or a --stack with it) runs on --backends b2 only" % a.b2_resolve)
+    if a.stack_compare and (a.layout == "both" or a.arrival_lag < 1 or a.sweep_pts or a.bare):  # [integ]
+        ap.error("--stack-compare: no --layout both, no sweep, no --bare, and --arrival-lag >= 1 (free timing makes "
+                 "two runs differ, note 12k)")
+    if a.shipped_batch < 0:
+        ap.error("--shipped-batch >= 0")
     if a.layout != "stream" and any(b not in XPOOL_BACKENDS for b in a.backends):                # [xpool]
         ap.error("--layout %s: the shared pool runs on %s only (S-C's device path binds the lanes)"
                  % (a.layout, XPOOL_BACKENDS))
@@ -180,6 +253,32 @@ def pool_rule_value(a, rule):                                                   
     return a.C + 4 - 64 + pool_positions(a, a.X) // a.batch
 
 
+def stack_values(name):                                                                         # [integ]
+    """[integ] The attribute values of a stack: "none" every component OFF, "full" every one ON, "full-no-<c>" every
+    one ON except <c>. Returns a dict of argparse attributes (twin, stack_rebuild, b2_resolve, layout, attn, union,
+    gilfree_warm_up)."""
+    if name == "none":
+        on = set()
+    elif name == "full":
+        on = set(STACK_COMPONENTS)
+    elif name.startswith("full-no-") and name[len("full-no-"):] in STACK_COMPONENTS:
+        on = set(STACK_COMPONENTS) - {name[len("full-no-"):]}
+    else:
+        raise ValueError("stack %r (one of %s)" % (name, STACK_CHOICES[1:]))
+    out = {}
+    for c in STACK_COMPONENTS:
+        out.update((STACK_ON if c in on else STACK_OFF)[c])
+    out["stack_rebuild"] = out.pop("rebuild")
+    return out
+
+
+def apply_stack(a, name):                                                                       # [integ]
+    """[integ] Set a stack's values on the parsed arguments (parse_args checked that none was passed explicitly)."""
+    for k, v in stack_values(name).items():
+        setattr(a, k, v)
+    a.stack_applied = name
+
+
 def parse_variants(text, twin):                                                                 # [batched-rebuild]
     """[batched-rebuild] --variants -> [(twin, rebuild)]; "" -> [(twin, "per_call")] (p3's arm, its labels unchanged);
     None for a malformed list (an unknown twin or rebuild, a duplicate, an empty item)."""
@@ -197,7 +296,10 @@ def parse_variants(text, twin):                                                 
 
 
 def variant_label(a, mode, kind, variant):                                                       # [batched-rebuild]
-    """[batched-rebuild] the point's label: p3's SG5_<mode>_<backend> without --variants, else with _<twin>_<rebuild>."""
+    """[batched-rebuild] the point's label: p3's SG5_<mode>_<backend> without --variants, else with _<twin>_<rebuild>.
+    [integ] with --stack: SG5_<mode>_<backend>_stack_<name> (e.g. SG5_exact_b2_stack_full)."""
+    if getattr(a, "stack", ""):
+        return "SG5_%s_%s_stack_%s" % (mode, kind, a.stack.replace("-", "_"))
     if not a.variants:
         return "SG5_%s_%s" % (mode, kind)
     return "SG5_%s_%s_%s_%s" % (mode, kind, variant[0], variant[1])
@@ -265,6 +367,8 @@ def shipped_child(a) -> int:
 def run_child(a, argv, pool, path):
     env = dict(os.environ, NOSI_POOL_BLOCKS=str(pool))
     cmd = [sys.executable, os.path.abspath(__file__)] + list(argv) + ["--baseline-only", str(pool), "--baseline-out", path]
+    if getattr(a, "shipped_batch", 0) > 0:                          # [integ] the shipped decode at its own batch
+        cmd += ["--batch", str(a.shipped_batch)]                    # (argparse: the last --batch wins)
     t0 = time.time()
     r = subprocess.run(cmd, env=env)
     if r.returncode != 0 or not os.path.exists(path):
@@ -392,6 +496,24 @@ def cuda_event():
     return e
 
 
+def select_attn(a, attn):                                                                       # [integ] sharedkv
+    """[integ] The tick's attention object for --attn (r2_tick_gate.select_attn's tick choices): per_row = piece 3's
+    module itself (default, unchanged); shared / shared-whole = a NEW SharedKV over the same loaded piece 3 module
+    (its stats count the shared calls: the gate <label>_SKV_ran), union --union."""
+    if getattr(a, "attn", "per_row") == "per_row":
+        return attn
+    sk = GB.load_by_path(a.sharedkv, "sharedkv_bi_paged_attention")
+    return sk.SharedKV(attn, mode="whole" if a.attn.endswith("whole") else "split", union=a.union)
+
+
+def skv_report(obj):                                                                            # [integ]
+    """[integ] REPORT of a SharedKV selector (None for piece 3): stats, calls per rows_max, union builds per kind."""
+    if not getattr(obj, "needs_page_key", False):
+        return None
+    return dict(stats=dict(obj.stats), by_rows_max={str(k): v for k, v in dict(obj.by_rows_max).items()},
+                union_builds=dict(getattr(obj, "union_builds", {})), mode=obj.mode, union=getattr(obj, "union", None))
+
+
 def arm_layout(a, layout=None):                                                                 # [xpool]
     """[xpool] The store layout of an arm: the caller's, else --layout ("both": the pool, e.g. in the preflight)."""
     lay = layout or getattr(a, "layout", "stream")
@@ -417,6 +539,7 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
         eng = TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin)           # [twin-variant]
     else:                                                                                        # [xpool]
         eng = TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin, xpool=xspec)
+    eng.check = bool(getattr(a, "sel_check", False))        # [integ] --sel-check (TickEngine's check; default False)
     eng.rebuild = getattr(a, "rebuild", "per_call")         # [batched-rebuild] the arm's rebuild (parse_variants checks)
     B, L, H = eng.B, eng.L, eng.H
     xp = eng.xpool                                                                               # [xpool] or None
@@ -429,7 +552,8 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
         if ext is None:
             raise RuntimeError("the gilfree transport needs the packer extension (not built in this run)")
         tp = GilfreeTransport(ext, host_k, host_v, eng.store_k, eng.store_v, 64, eng.D, threads=a.threads, host_wait=hw,
-                              background=True, xpool=xp)                                         # [xpool] xp or None
+                              background=True, xpool=xp,                                         # [xpool] xp or None
+                              warm_up=getattr(a, "gilfree_warm_up", "on") == "on")              # [integ] gfw1f
     else:
         tp = GatherTransport(host_k, host_v, eng.store_k, eng.store_v, C + X, xpool=xp)          # [xpool] xp or None
     gather = TorchGather(host_k, host_v, eng.store_k, eng.store_v)
@@ -661,6 +785,25 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
                                    counts=dict(svc.metrics.counts), d2h_reads=getattr(svc, "d2h_reads", None),
                                    sc=sc_counters(svc)),                 # REPORT (RES_SC.md 6)
                     transport=dict(tp.stats), threads_ok=tp.threads_ok())
+        info["transport_warm_calls"] = getattr(tp, "warm_calls", None)                           # [integ] gfw1f
+        sb_ = getattr(a, "shipped_batch", 0) or eng.B                                            # [integ]
+        if sb_ != eng.B:                                       # the shipped decode ran at another batch: no ratio
+            info["ratio"] = None
+        if T_tick:                                                                               # [integ] REPORT
+            info["tok_per_s"] = committed / (rnd.ticks * T_tick / 1e3) if rnd.ticks else None
+        info["shipped_tok_per_s"] = (sb_ / (T_shipped / 1e3)) if T_shipped else None
+        info["shipped_batch"] = sb_
+        info["shipped_source"] = "shipped_pool0.json (NOSI_POOL_BLOCKS 0)"                       # [integ] T_shipped's child
+        skv = skv_report(ops.attn)                                                               # [integ] sharedkv
+        if skv is not None:
+            info["skv"] = skv
+            want = getattr(a, "union", "torch")
+            other = "fused" if want == "torch" else "torch"
+            ub = skv["union_builds"]
+            gates.append(GB.gate("%s_SKV_ran" % label, skv["stats"].get("shared", 0) > 0 and ub.get(want, 0) > 0
+                                 and ub.get(other, 0) == 0, True,
+                                 "the shared kernel ran on keyed calls (a silent fallback to piece 3 would pass every "
+                                 "gate): stats %s, union builds %s (--union %s)" % (skv["stats"], ub, want)))
         try:
             info["residency"]["report"] = svc.report()
         except Exception as e:                                        # the report is a REPORT
@@ -778,6 +921,82 @@ def one_point_both(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, step
     return dict(backend=kind, layouts=out, xp=dict(replica=rep_ok, replica_difference=rep_diff, committed=com_ok,
                                                     bitwise=ok, rows_compared=n, first_difference=diff,
                                                     peak_drop_gb=drop, tick_ratio=ratio, stream_spread=spread))
+
+
+ST_TICK_BAND = (0.15, 0.40)                                                                     # [integ] registered
+
+
+def stack_args(a, name):                                                                        # [integ]
+    """[integ] A copy of the parsed arguments with stack `name` applied (the arm's own twin / rebuild / resolve /
+    layout / attn / union / warm-up); everything else (point, lag, transport, sel_check) is the run's."""
+    import copy
+    aa = copy.copy(a)
+    apply_stack(aa, name)
+    aa.rebuild = aa.stack_rebuild
+    aa.variant_list = [(aa.twin, aa.rebuild)]
+    return aa
+
+
+def one_point_stacks(a, model, cache, st, first, ops_for, kind, C, X, R_ver, ext, steps, T_shipped, gates, label,
+                     point_fn=None):
+    """[integ] --stack-compare (docs/R2_INTEG_PLAN.md, cell stack1a): three arms in the order none, <--stack>, none2
+    (one_point with the arm's layout and fingerprints; every arm with the run's fixed --arrival-lag; each arm builds
+    its own ops (ops_for(arm args): a fresh SharedKV when the arm's attn is shared)). Gates, as one_point_both's:
+      <label>_ST_replica    MUST: none2 equals none (rows, every row's logit fingerprint, committed tokens)
+      <label>_ST_committed  MUST: the stack arm's committed tokens equal the none arm's
+      <label>_ST_bitwise    MUST: rows and fingerprints equal, none vs stack; VOID when the replica failed
+      R_<label>_ST_tick / R_<label>_ST_peak  REPORTS against the MEAN of the two none arms.
+    point_fn: the CPU test's stand-in of one_point."""
+    import torch
+    point_fn = point_fn or one_point
+    out, recs = {}, {}
+    for arm, name in (("none", "none"), ("stack", a.stack), ("none2", "none")):
+        aa = stack_args(a, name)
+        fp = []
+        info = point_fn(aa, model, cache, st, first, ops_for(aa), kind, C, X, R_ver, ext, steps, T_shipped, gates,
+                        "%s_%s" % (label, arm), layout=aa.layout, fp=fp)
+        vals = torch.cat([v for (_, v) in fp]).tolist() if fp else []             # ONE read per arm, after it
+        per_tick, at = [], 0
+        for (rows, v) in fp:
+            per_tick.append(vals[at:at + len(rows)])
+            at += len(rows)
+        recs[arm] = ([r for (r, _) in fp], per_tick, info.pop("committed_tokens", None))
+        info["stack"] = name
+        out[arm] = info
+    rep_ok, rep_n, rep_diff = compare_layouts(recs, "none", "none2")
+    rep_ok = rep_ok and rep_n > 0
+    gates.append(GB.gate(label + "_ST_replica", rep_ok, True, "none vs none2 (the same stack twice): %s, %d rows "
+                         "compared" % ("EQUAL" if rep_ok else "DIFFER (%s)" % (rep_diff or "no row compared"), rep_n)))
+    com_ok = recs["none"][2] is not None and recs["none"][2] == recs["stack"][2]
+    gates.append(GB.gate(label + "_ST_committed", com_ok, True, "committed tokens none vs %s: %s"
+                         % (a.stack, "equal" if com_ok else "DIFFER")))
+    same, n, diff = compare_layouts(recs, "none", "stack")
+    ok = rep_ok and same and n > 0
+    if not rep_ok:
+        detail = "VOID: the replica differs, so this comparison cannot pass under the run's timing (stack vs none: %s)" \
+                 % ("equal" if same and n > 0 else diff)
+    else:
+        detail = "%s: %d rows of %d ticks compared (stack %s)" % (
+            "EQUAL" if ok else "DIFFER (%s)" % (diff or "no row compared"), n, len(recs["none"][0]), a.stack)
+    gates.append(GB.gate(label + "_ST_bitwise", ok, True, detail))
+
+    def mean2(key):
+        x, y = out["none"].get(key), out["none2"].get(key)
+        return None if x is None or y is None else (x + y) / 2.0
+    ps, pp = mean2("peak_gb_round"), out["stack"].get("peak_gb_round")
+    gates.append(GB.gate("R_" + label + "_ST_peak", True, False, "round peak GB none (mean of 2) %s stack %s (drop %s)"
+                         % (ps, pp, None if ps is None or pp is None else round(ps - pp, 3))))
+    ts, tq = mean2("T_tick_ms"), out["stack"].get("T_tick_ms")
+    ratio = None if not ts or tq is None else tq / ts
+    lo, hi = ST_TICK_BAND
+    gates.append(GB.gate("R_" + label + "_ST_tick", True, False, "T_tick none %s / %s ms, stack %s ms: ratio stack / "
+                         "mean(none) %s (registered band %.2f-%.2f: %s)"
+                         % (out["none"].get("T_tick_ms"), out["none2"].get("T_tick_ms"), tq,
+                            None if ratio is None else round(ratio, 4), lo, hi,
+                            "inside" if ratio is not None and lo <= ratio <= hi else "OUTSIDE")))
+    return dict(backend=kind, stacks=out, st=dict(replica=rep_ok, replica_difference=rep_diff, committed=com_ok,
+                                                   bitwise=ok, rows_compared=n, first_difference=diff,
+                                                   tick_ratio=ratio))
 
 
 def preflight(a, model, cache, st, first, ops, ext, gates, res, engine_fn=None, round_fn=None):
@@ -930,6 +1149,10 @@ def main(argv=None) -> int:
         meta["transport"] = a.transport
         meta["layout"] = a.layout                                                              # [xpool]
         meta["twin"] = a.twin                                                                  # [twin-variant]
+        meta.update(stack=a.stack or None, stack_compare=a.stack_compare, attn=a.attn, union=a.union,   # [integ]
+                    sel_check=a.sel_check, shared_unchecked=a.shared_unchecked, gilfree_warm_up=a.gilfree_warm_up,
+                    b2_resolve=a.b2_resolve, shipped_batch=a.shipped_batch or a.batch,
+                    sharedkv=a.sharedkv if a.attn != "per_row" else None)
         if a.variants:                                                                         # [batched-rebuild]
             meta["variants"] = ["%s/%s" % v for v in a.variant_list]                            # [batched-rebuild]
         a.twin, a.rebuild = a.variant_list[0]           # [batched-rebuild] the preflight / sweep arms: the first one
@@ -946,23 +1169,29 @@ def main(argv=None) -> int:
             GB.free()
             first = [int(x) for x in first_t.view(-1).tolist()]
             meta["build_gb"] = round(torch.cuda.memory_allocated() / 1e9, 2)
-            backends = preflight(a, model, cache, st, first, BIOps(attn, a.m_fix, gemm=a.modes[0]), ext, gates, res)
+            backends = preflight(a, model, cache, st, first, BIOps(select_attn(a, attn), a.m_fix, gemm=a.modes[0]),
+                                 ext, gates, res)                                              # [integ] --attn
             save()
             if not backends:
                 log("PREFLIGHT: no backend ran a short round on the %s transport: the long arms are skipped"
                     % a.transport)
             res["points"] = []
             for mode in a.modes:
-                ops = BIOps(attn, a.m_fix, gemm=mode)
+                ops = BIOps(select_attn(a, attn), a.m_fix, gemm=mode)                          # [integ] --attn
                 for kind in backends:
                     for variant in a.variant_list:                                             # [batched-rebuild]
                         a.twin, a.rebuild = variant                                            # [batched-rebuild]
                         label = variant_label(a, mode, kind, variant)                          # [batched-rebuild]
                         log("%s at C %d X %d R_ver %d" % (label, a.C, a.X, a.R_ver))
                         try:
-                            point = one_point_both if a.layout == "both" else one_point                # [xpool]
-                            pt = point(a, model, cache, st, first, ops, kind, a.C, a.X, a.R_ver, ext, a.steps,
-                                       T_shipped, gates, label, bare=a.bare)
+                            if a.stack_compare:                                                # [integ]
+                                pt = one_point_stacks(a, model, cache, st, first,
+                                                      lambda aa, m=mode: BIOps(select_attn(aa, attn), a.m_fix, gemm=m),
+                                                      kind, a.C, a.X, a.R_ver, ext, a.steps, T_shipped, gates, label)
+                            else:
+                                point = one_point_both if a.layout == "both" else one_point            # [xpool]
+                                pt = point(a, model, cache, st, first, ops, kind, a.C, a.X, a.R_ver, ext, a.steps,
+                                           T_shipped, gates, label, bare=a.bare)
                             pt["twin"], pt["rebuild"] = variant                                # [batched-rebuild]
                             res["points"].append(pt)
                         except Exception as e:
@@ -972,7 +1201,7 @@ def main(argv=None) -> int:
                         GB.free()
                         save()
             a.twin, a.rebuild = a.variant_list[0]                                              # [batched-rebuild]
-            run_sweep(a, lambda: BIOps(attn, a.m_fix, gemm=a.modes[0]), backends, gates, res, save,
+            run_sweep(a, lambda: BIOps(select_attn(a, attn), a.m_fix, gemm=a.modes[0]), backends, gates, res, save,
                       lambda ops, kind, C, X, R_ver, label: one_point(a, model, cache, st, first, ops, kind, C, X, R_ver,
                                                                       ext, a.sweep_steps, T_shipped, gates, label))
         meta["peak_gb"] = round(max(_PEAK[0], torch.cuda.max_memory_allocated()) / 1e9, 2)     # [xpool] resets

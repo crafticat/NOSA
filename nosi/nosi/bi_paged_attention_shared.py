@@ -51,8 +51,9 @@ host read). The grid's first dimension is R (an upper bound of the group count, 
 group find an empty window and return.
 
 ADDRESS COMPUTATION: unchanged from piece 3 (k_base = K + n * s_kn + h * s_kh; rows = slot * PAGE_C + offs_r; the
-same strides). The flat-position X-pool addressing of the parallel branch (nosi-r2-xpool, docs/R2_XPOOL_PLAN.md) is a
-separate change to piece 3's kernel; porting it here is a follow-up after both are gated.
+same strides). [integ] The X pool's flat address mode (docs/R2_XPOOL_PLAN.md section 3) needs NO change here: it is
+a convention of the arguments (stride(0) == 0 views, a page table of absolute positions), and the kernel takes its
+strides from the tensors, so n * s_kn adds 0 (docs/R2_INTEG_PLAN.md section 2.3; CPU check ST5, not run).
 
 INTERFACE:
     SharedKV(base, mode="split", rows_max=ROWS_MAX)    base = the loaded piece 3 module (pinned blob)

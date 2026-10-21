@@ -44,7 +44,20 @@
 #            engine with the fixed arrival lag 2 (note 12k); MUST <label>_XP_replica, _XP_committed, _XP_bitwise; the
 #            equal-memory baselines NOSI_POOL_BLOCKS = 100 (stream rule) and 37 (k5 rule: 96 + 4 - 64 + 64 // 64).
 #            Its ROOT is NOSI_X1 (nosi-r2-xpool); every other cell keeps NOSI (review m8)
+#   stack1a  [integ] THE FULL STACK (docs/R2_INTEG_PLAN.md) at p5b2's point, EXACT, B 64: --stack full --stack-compare
+#            --X-pool 64 --arrival-lag 2 --sel-check (arms none, full, none2; MUST _ST_replica / _ST_committed /
+#            _ST_bitwise), no --pool-baseline. ROOT NOSI_INTEG (nosi-r2-integ), as the two cells below
+#   stack1t  [integ] the full stack's TIMING at p5b2's point, B 64, free timing: --stack full --X-pool 64
+#            --shared-unchecked (the selection precondition is checked in stack1a), --pool-baseline (100)
+#   stack1b  [integ] the full stack's TIMING at B 264 (the largest B of the xpool model, X_pool 64): --stack full
+#            --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64, --mem=240G (141 GB pinned host rows)
 #   STEP_MIN 120 in every cell.
+#
+# REGISTERED for stack1 ([integ], 2026-10-21T11:51:27Z, SOURCE ONLY, not run; docs/R2_INTEG_PLAN.md section 5 has
+# every band, its derivation and the falsifiers F-ST1..5). Order stack1a, stack1t, stack1b; stop at the first nonzero
+# exit. stack1a: the three ST MUST gates and <label>_stack_SKV_ran PASS; R ST_tick 0.15-0.40. stack1t (B 64): twin
+# 2-6 ms, REST 30-110 ms, res 20-80 ms, end_tick 122-170 ms, device 45-70 ms, T_tick 0.22-0.45 s (point 0.31 s), r
+# 0.84-0.90, peak p5b2's minus 7.9-8.9 GB. stack1b (B 264): peak 78-84 GB, T_tick 0.7-1.5 s, tok_per_s 150-330.
 #
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
@@ -101,6 +114,7 @@
 set -u
 NOSI=/mnt/beegfs/ojerbi/nosi-r2-sg5-p6                                                   # ROOT (p6; [b2] p5b2: nosi-r2-m2-sg5-b2; p4sc64: -p4d; p4a: -p4c; p3: nosi-r2-m2-sg5)
 NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                                 # ROOT of cell x1 only ([xpool], review m8)
+NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-integ                                              # ROOT of the stack1 cells only ([integ])
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -126,7 +140,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|stack1a|stack1t|stack1b] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -135,7 +149,7 @@ TRANSPORT= CELL=
 for w in "$@"; do
     case $w in
         gilfree|gather) [ -z "$TRANSPORT" ] || usage; TRANSPORT=$w ;;
-        p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1) [ -z "$CELL" ] || usage; CELL=$w ;;
+        p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|stack1a|stack1t|stack1b) [ -z "$CELL" ] || usage; CELL=$w ;;
         *) usage ;;
     esac
 done
@@ -146,6 +160,10 @@ SWEEP_RUN=$SWEEP
 SUFFIX=
 VARIANTS=
 XPOOL=                                                      # [xpool] x1 only
+STACKARG=()                                                 # [integ] the stack1 cells only
+BATCH=64                                                    # [integ] stack1b: 264
+STEPMEM=120G                                                # [integ] stack1b: 240G (the pinned host rows, B 264)
+POOLBASE=(--pool-baseline)                                  # [integ] stack1a / stack1b: none
 PC=96 PX=32 PRV=16                                          # the primary point (C, X, R_ver)
 case $CELL in
     "") ;;                                                  # the default: p3's arguments
@@ -156,6 +174,13 @@ case $CELL in
     p6) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_p6         # p5b2's point, EXACT, the 2 x 2
         VARIANTS=torch/per_call,fused/per_call,torch/batched,fused/batched ;;
     x1) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_x1 ; XPOOL=64 ; NOSI=$NOSI_X1 ;;   # [xpool] p5b2's point
+    stack1a) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1a ; NOSI=$NOSI_INTEG ; POOLBASE=()
+             STACKARG=(--stack full --stack-compare --X-pool 64 --arrival-lag 2 --sel-check) ;;   # [integ] equality
+    stack1t) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1t ; NOSI=$NOSI_INTEG
+             STACKARG=(--stack full --X-pool 64 --shared-unchecked) ;;                              # [integ] timing, B 64
+    stack1b) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1b ; NOSI=$NOSI_INTEG ; POOLBASE=()
+             BATCH=264 ; STEPMEM=240G
+             STACKARG=(--stack full --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64) ;;   # [integ] B 264
 esac
 VARIANTARG=()                                               # [batched-rebuild] no --variants in every other cell
 [ -z "$VARIANTS" ] || VARIANTARG=(--variants "$VARIANTS")
@@ -195,6 +220,11 @@ for f in benchmarks/Efficiency/r2_tick_sg5.py benchmarks/Efficiency/r2_g0bi_gate
 done
 [ -z "$XPOOL" ] || git -C "$NOSI" rev-parse -q --verify "$NSHA:nosi/nosi/r2_xpool.py" > /dev/null ||
     stop "nosi/nosi/r2_xpool.py is not tracked at $NSHA (cell x1)"
+if [ "${#STACKARG[@]}" -gt 0 ]; then                        # [integ] the stack's modules, tracked at the pinned commit
+    for f in nosi/nosi/r2_xpool.py nosi/nosi/r2_fusedres.py nosi/nosi/bi_paged_attention_shared.py; do
+        git -C "$NOSI" rev-parse -q --verify "$NSHA:$f" > /dev/null || stop "$f is not tracked at $NSHA (cell $CELL)"
+    done
+fi
 [ "$(git -C "$NOSI" rev-parse -q --verify "$BIATTN_SHA:$BIATTN_PATH")" = "$BIATTN_BLOB" ] ||
     stop "piece 3: $BIATTN_PATH at $BIATTN_SHA is not the blob $BIATTN_BLOB"
 [ "$(git -C "$NOSI" rev-parse -q --verify "$GF_SHA:$GF_PY")" = "$GF_PY_BLOB" ] ||
@@ -230,18 +260,19 @@ A=$1
 shift
 exec "$A" exec --nv --cleanenv --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" "$@"'
 ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) srun --jobid="$JOB" --job-name="$NAME"
-      --ntasks=1 --cpus-per-task=16 --mem=120G --gres=gpu:a100:1 --time="$STEP_MIN" --export=NONE
+      --ntasks=1 --cpus-per-task=16 --mem="$STEPMEM" --gres=gpu:a100:1 --time="$STEP_MIN" --export=NONE
       /bin/sh -c "$CHILD" sg5-child "$GPU_UUID" "$APPTAINER" --bind /mnt/beegfs/ojerbi:/mnt/beegfs/ojerbi "${ENVS[@]}"
       "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_tick_sg5.py" --out "$OUT" --model "$MODEL"
       --workload "$WL" --biattn "$ATTN_MOD" --gilfree "$GF_DIR" --gilfree-build "$JIT/gilfree_build"
-      --threads "$THREADS" --transport "$TRANSPORT" --batch 64 --S 16128 --steps 48 --K 3 --LAMBDA 7 --modes "$MODES"
+      --threads "$THREADS" --transport "$TRANSPORT" --batch "$BATCH" --S 16128 --steps 48 --K 3 --LAMBDA 7 --modes "$MODES"
       --backends "$BACKENDS" --C "$PC" --X "$PX" --R-ver "$PRV" "${SWEEPARG[@]}" --sweep-steps 24 --draft-ticks 12 --shipped-steps 24
-      --pool-baseline --preflight-steps 4 "${VARIANTARG[@]}" "${XPOOLARG[@]}")
+      "${POOLBASE[@]}" --preflight-steps 4 "${VARIANTARG[@]}" "${XPOOLARG[@]}" "${STACKARG[@]}")
 if [ "$DRY" = 1 ]; then
     echo "R2 SG5 step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob workload $WL_SHA gpu_uuid $GPU_UUID ($UFILE)"
     echo "R2 SG5 step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; packer $GF_SHA:$GF_PY blob $GF_PY_BLOB, $GF_CPP blob $GF_CPP_BLOB -> $GF_DIR; transport $TRANSPORT; cell ${CELL:-default}"
     echo "R2 SG5 step: primary point C $PC X $PX R_ver $PRV; equal-memory shipped baseline NOSI_POOL_BLOCKS = C + X + 4 - 64 = $EQ_POOL"
     [ -z "$XPOOL" ] || echo "R2 SG5 step: [xpool] root $NOSI, layout both (stream, pool, stream2), X_pool $XPOOL, arrival lag 2; k5 rule NOSI_POOL_BLOCKS = C + 4 - 64 + X_pool / 64 = $((PC + 4 - 64 + XPOOL / 64))"
+    [ "${#STACKARG[@]}" -eq 0 ] || echo "R2 SG5 step: [integ] root $NOSI, batch $BATCH, step memory $STEPMEM, stack arguments ${STACKARG[*]}"
     printf '%q ' "${ARGV[@]}"
     echo
     exit 0
@@ -276,10 +307,10 @@ printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/comman
 printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s workload=%s utc_start=%s\n' "$NSHA" \
     "$blob" "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "$WL_SHA" "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
     stop "cannot write $REC (sg5_active stays)"
-printf 'biattn=%s:%s blob=%s packer=%s py=%s cpp=%s threads=%s transport=%s sweep=%s splits=%s cell=%s modes=%s backends=%s C=%s X=%s R_ver=%s eq_pool=%s variants=%s xpool=%s\n' \
+printf 'biattn=%s:%s blob=%s packer=%s py=%s cpp=%s threads=%s transport=%s sweep=%s splits=%s cell=%s modes=%s backends=%s C=%s X=%s R_ver=%s eq_pool=%s variants=%s xpool=%s batch=%s stepmem=%s stack=%s\n' \
     "$BIATTN_SHA" "$BIATTN_PATH" "$BIATTN_BLOB" "$GF_SHA" "$GF_PY_BLOB" "$GF_CPP_BLOB" "$THREADS" "$TRANSPORT" \
     "${SWEEP_RUN:-none}" "$SPLITS" "${CELL:-default}" "$MODES" "$BACKENDS" "$PC" "$PX" "$PRV" "$EQ_POOL" "${VARIANTS:-none}" \
-    "${XPOOL:-none}" >> "$REC/command.txt" ||
+    "${XPOOL:-none}" "$BATCH" "$STEPMEM" "${STACKARG[*]:-none}" >> "$REC/command.txt" ||
     stop "cannot write $REC (sg5_active stays)"
 "${ARGV[@]}" < /dev/null > "$REC/stdout.txt" 2> "$REC/stderr.txt"
 rc=$?

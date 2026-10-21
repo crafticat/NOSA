@@ -86,6 +86,8 @@ after device_verify and after device_draft, `draft_bias_fill_flat` instead of `d
 (2) after V2: `svc.xpool.bind(l, vdec.bh[0], vdec.bh[1], vdec.t["take_slot"], (granted | evict) != 0)` before the
 wait; (3) D2 with `BIAS=0`, then `svc.xpool.bind(...)` on the draft takes and `XP.draft_bias_fill_flat(...)`; (4) drop
 the xpool refusal in `FusedResolver.__init__`. That costs xpool's own launches on top of 3 / 6.
+[integ] Implemented on branch r2-integ (docs/R2_INTEG_PLAN.md section 2): steps (1)-(4), check mode on the flat bias
+store, and S-C's [sharedkv2] page-key hooks in `FusedResolver.resolve`. Not run.
 
 ## 6. CPU tests (benchmarks/Efficiency/tests_cpu/test_r2_fusedres.py; Triton interpreter in a fresh process, L36)
 
