@@ -1520,36 +1520,74 @@ def test_F19_the_exact_wait_host_waits_the_submission_first():
     assert not runner.is_alive() and ops2.submission_waits == 1
 
 
-def test_F19b_a_transport_that_submits_without_the_gil_needs_no_submission_wait():
-    """F19b (Q-C2, E's C++ feeder worker: GilfreeTransport(..., worker="cpp") sets submits_without_gil): with such a
-    transport _submitted(l) returns at once, even for a layer-0 pack that is never submitted (the main thread cannot
-    block that worker; the exact spin with its bounded err is the guard), and waits for nothing. Negative control: the
-    same never-submitted pack with a transport without the attribute (or with it False) keeps _submitted(0) blocked."""
-    def ops_with(trs, tp):
-        ops = object.__new__(SC.CudaDeviceOps)                 # the host part only: no CUDA object is built
-        ops.svc = types.SimpleNamespace(inflight={tr.seq: tr for tr in trs}, tp=tp)
-        ops.submission_waits = 0
-        return ops
+class OldSubmittedRule(SC.CudaDeviceOps):
+    """DEFECT (7902b7a's rule, refuted by gfw1c): a transport that submits without the GIL is not waited at all."""
 
-    def stuck_tr():
-        t = TR.Transfer(1, "u0", 0, 0, 0, 1, 1, 1, "draft", ("u0", 1, 1))
-        t.payload, t.ev = threading.Event(), None              # queued, never submitted
-        return t
-    ops = ops_with([stuck_tr()], types.SimpleNamespace(submits_without_gil=True))
-    runner = threading.Thread(target=ops._submitted, args=(0,), daemon=True)
-    runner.start()
-    runner.join(timeout=5)
-    assert not runner.is_alive() and ops.submission_waits == 0
-    for tp in (types.SimpleNamespace(), types.SimpleNamespace(submits_without_gil=False)):
-        t = stuck_tr()
-        ops2 = ops_with([t], tp)
-        runner = threading.Thread(target=ops2._submitted, args=(0,), daemon=True)
+    def _submitted(self, l, captured=False):
+        if getattr(getattr(self.svc, "tp", None), "submits_without_gil", False):
+            return
+        super()._submitted(l, captured)
+
+
+class CapturedSkipsSubmission(SC.CudaDeviceOps):
+    """DEFECT (gfw1c's GFW1 protocol): the captured tick skips the submission wait."""
+
+    def _submitted(self, l, captured=False):
+        if captured and getattr(getattr(self.svc, "tp", None), "submits_without_gil", False):
+            return
+        super()._submitted(l, captured)
+
+
+def test_F19b_a_gilfree_worker_is_waited_for_its_submission_in_both_tick_modes():
+    """F19b (gfw1c on holder 2190876: the captured protocol without a submission wait, GFW1, ran the spin to its bound,
+    8.6 s, err 1, because the C++ worker's GPU work serializes behind the spinning main stream; the eager protocol with
+    the GIL-free wait first, GFW1e, passed). With a transport that submits without the GIL (submits_without_gil and
+    wait_submitted: E's C++ worker), _submitted(l) waits GIL-free, once per job, for every in-flight transfer of layer
+    l that is not landed in place, in the EAGER and the CAPTURED tick: it stays blocked until layer 0's job is
+    submitted; the urgent transfer (landed in place) and layer 1's job (never submitted) are not waited; one wait
+    counted. Negative controls: 7902b7a's rule (no wait for such a transport) returns before the job is submitted; a
+    captured tick that skips the wait returns before it with captured=True."""
+    class Job:
+        def __init__(self):
+            self.submitted = threading.Event()
+
+    class CppTransport:
+        submits_without_gil = True
+
+        def __init__(self):
+            self.calls = []
+
+        def wait_submitted(self, tr):                          # E's GilfreeTransport.wait_submitted: blocks until the
+            self.calls.append(tr.seq)                          # job's GPU work is enqueued
+            tr.ev.submitted.wait()
+
+    def case(cls, captured):
+        """Returns (blocked before the submission, the transport's calls, submission_waits after it)."""
+        job0, job1 = Job(), Job()
+        trs = []
+        for seq, layer, ev, kind in ((1, 0, job0, "draft"), (2, 0, job0, "draft"), (3, 0, None, "verify"),
+                                     (4, 1, job1, "draft")):
+            t = TR.Transfer(seq, "u0", layer, 0, 0, seq, seq, 1, kind, ("u0", 1, 1))
+            t.ev = ev
+            trs.append(t)
+        tp = CppTransport()
+        ops = object.__new__(cls)                              # the host part only: no CUDA object is built
+        ops.svc = types.SimpleNamespace(inflight={t.seq: t for t in trs}, tp=tp, _landed={3})   # seq 3: urgent
+        ops.submission_waits = 0
+        runner = threading.Thread(target=ops._submitted, args=(0, captured), daemon=True)
         runner.start()
         runner.join(timeout=0.5)
-        assert runner.is_alive()                               # the host wait remains: blocked on the pack
-        t.payload.set()
+        blocked = runner.is_alive()
+        job0.submitted.set()
         runner.join(timeout=5)
-        assert not runner.is_alive() and ops2.submission_waits == 1
+        assert not runner.is_alive()
+        return blocked, tp.calls, ops.submission_waits
+
+    for captured in (False, True):
+        assert case(SC.CudaDeviceOps, captured) == (True, [1], 1), captured
+    assert case(OldSubmittedRule, False) == (False, [], 0)      # returns before the submission: detected
+    assert case(CapturedSkipsSubmission, False) == (True, [1], 1)
+    assert case(CapturedSkipsSubmission, True) == (False, [], 0)   # the captured skip: detected
 
 
 # =====================================================================================================================

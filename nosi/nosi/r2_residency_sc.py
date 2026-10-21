@@ -803,7 +803,8 @@ class CudaDeviceOps:
     wait_mode "superset": the main stream waits on the completion event of every transfer in flight at the layer.
     wait_mode "exact" (note 12f): one Triton program on the main stream spins on the generation board for exactly the
     in-flight slots that the layer's verify rows read (wait_list), after the host waited the layer's packs' SUBMISSION
-    (_submitted: the eager tick's liveness rule, note 12g); no device read on the host; err (int32, on the
+    (_submitted: the liveness rule, note 12g; GIL-free for E's C++ worker, in the eager and the captured tick, gfw1c);
+    no device read on the host; err (int32, on the
     device) reports a spin that ran out; S-C watches it. FG1 compares the two."""
 
     def __init__(self, svc: "ResidencySC", host_k, host_v, store_k, store_v, store_b, cis, block: int = BLOCK,
@@ -844,16 +845,31 @@ class CudaDeviceOps:
         torch.cuda.synchronize()
         return wait_profile_summary(self.profile or [], self.svc.L, self.spin_counts())
 
-    def _submitted(self, l: int) -> None:
-        """LIVENESS (the eager tick): every transfer in flight at layer l is SUBMITTED before the main stream may wait
-        for it. A gilfree pack still queued in the feeder is host-waited for its submission (a threading.Event: the GIL
-        is released). Otherwise the main stream could spin on a pack whose feeder needs the GIL while the host thread
-        holds it, blocked in a kernel launch behind the spinning stream. The completion is waited on the device.
-        A transport that submits without the GIL (submits_without_gil: E's C++ feeder worker, GilfreeTransport(...,
-        worker="cpp"), Q-C2) cannot be blocked by this thread: no host wait at all (the board's bounded spin with err
-        stays the guard)."""
-        if getattr(getattr(self.svc, "tp", None), "submits_without_gil", False):
-            return                  # Q-C2: the C++ worker submits with no GIL; the exact spin cannot block it
+    def _submitted(self, l: int, captured: bool = False) -> None:
+        """LIVENESS: every transfer in flight at layer l is SUBMITTED (its GPU work enqueued) before the main stream may
+        spin on it; the landing is waited on the device.
+        A transport that submits without the GIL (submits_without_gil: E's C++ worker, GilfreeTransport(...,
+        worker="cpp")) is waited GIL-FREE: tp.wait_submitted(tr) (E's _JobEv.wait_submitted, the GIL released), once per
+        job (its transfers share the job's event), for every in-flight transfer of the layer that is not landed in place
+        (an urgent take is not the transport's), in the eager AND the captured tick. gfw1c on holder 2190876: the
+        captured protocol WITHOUT this wait (GFW1) ran its spin to the bound (8.6 s, err 1), because the worker's GPU
+        work serializes behind the spinning main stream; with the wait first (GFW1e) it passed. This replaces 7902b7a's
+        "no wait for such a transport". captured (the captured tick's host part passes True) does not skip the wait.
+        Any other transport: a pack still queued in a Python feeder is host-waited for its submission (a
+        threading.Event: the GIL is released), as before. Each wait counts in submission_waits."""
+        tp = getattr(self.svc, "tp", None)
+        if getattr(tp, "submits_without_gil", False) and callable(getattr(tp, "wait_submitted", None)):
+            seen = set()
+            for tr in list(self.svc.inflight.values()):
+                if tr.layer != l or tr.seq in self.svc._landed:
+                    continue
+                job = id(tr.ev) if tr.ev is not None else ("seq", tr.seq)    # a transfer never released raises there
+                if job in seen:
+                    continue
+                seen.add(job)
+                tp.wait_submitted(tr)
+                self.submission_waits += 1
+            return
         for tr in list(self.svc.inflight.values()):
             if tr.layer == l and tr.ev is None and isinstance(tr.payload, threading.Event):
                 tr.payload.wait()

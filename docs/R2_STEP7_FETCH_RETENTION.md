@@ -779,6 +779,23 @@ Q-C2, the submission wait (E's C++ feeder worker, feature/nosi-r2-gilfree-worker
   constructor; a late inference-mode board is refused by E's worker.
 - CPU test F19b: an unsubmitted pack does not block `_submitted` with the attribute. Negative control: without the
   attribute (or with it False) the host wait remains.
+- SUPERSEDED (2026-10-21, gfw1c on holder 2190876, E's f494a98). The "return at once" rule is WRONG:
+  - the captured protocol without a submission wait (GFW1) ran the spin to its bound (8.6 s, err 1);
+  - the worker's GPU work serializes behind the spinning main stream; it is not the launch queue;
+  - the eager protocol with the GIL-free submission wait first (GFW1e) passed (err 0, spin 0.2 ms).
+- THE NEW RULE (`_submitted(l, captured=False)`):
+  - For a transport with `submits_without_gil` and `wait_submitted`, the host waits GIL-free
+    (`tp.wait_submitted(tr)`, E's `_JobEv.wait_submitted`), once per job.
+  - It waits for every in-flight transfer of the layer that is not landed in place (an urgent take is not the
+    transport's).
+  - It waits in the eager AND the captured tick: `captured` stays as a parameter (the captured tick's host part
+    passes True at the engine agent's next merge), and it does not skip the wait.
+  - Each wait counts in `submission_waits`. Other transports keep the Python feeder's flag wait.
+- F19b (rewritten):
+  - The wait blocks until layer 0's job is submitted, in both modes. The urgent transfer and layer 1's job are not
+    waited; one wait is counted.
+  - Negative controls: 7902b7a's rule returns before the submission; a captured tick that skips the wait is
+    detected.
 
 ## 12l. (B1) the sparse decision record on the vendored ownership objects (`nosi/nosi/r2_residency_sparse.py`)
 
