@@ -362,7 +362,8 @@ def poll_arrivals(T: Table, tick: int, landed_upto: int, lag: Optional[int], und
     landed = T.flat("landed")
     tport = infl & ~landed & (seq <= landed_upto)                     # landed by the transport
     zero = torch.zeros((), dtype=torch.int64, device=d)
-    out = dict(admitted=0, admit_lru=zero, admit_vres=zero, drop_unowned=zero, drop_vres_unprotected=zero, held=zero)
+    out = dict(admitted=0, admit_lru=zero, admit_vres=zero, drop_unowned=zero, drop_vres_unprotected=zero, held=zero,
+               evict_po=zero, evict_rel=zero)               # (an arrival set without an LRU admission evicts none)
     if lag is not None:
         due = infl & ~landed & (T.flat("issue_tick").to(torch.int64) + lag <= tick)
         out["held"] = (tport & ~due).sum()

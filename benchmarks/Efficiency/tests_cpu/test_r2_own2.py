@@ -5,8 +5,9 @@ is the array-backed table, against the vendored worlds (v1 under the S-C schedul
          exceptions, returns the same page tables and has equal snapshots (state, counters, readers, forwarded readers
          and write-backs, the journal per kind, the pending gates, the device mirror against the full scan, the trash
          sentinel) after EVERY operation; the vendored world is first (its preconditions).
-  B2I-2  each fixture PLANT in its B2 form is caught at C's predicted operation and field (B2_PLANTS; one exception
-         and one skip, with their reasons: owner_blind, void_keeps_pins).
+  B2I-2  each fixture PLANT in its B2 form is caught at C's predicted operation and field (B2_PLANTS), except two
+         caught at the same operation as a RAISE (owner_blind: B2's merge predicate; no_reader_wait: the device's T3
+         check) and one skip (void_keeps_pins: B1's pin table), with their reasons.
   B2I-3  the PLANT MAP covers every fixture plant, and the review's 8 kinds.
   B2I-4  the F-SCHEDULE LOCKSTEP, B2 against v1 (pages, verify content, state, counters, readers, B2's mirror every
          tick): F6 / F12 (24 ticks, ready + in flight + new), F12b (capacity pressure, refusals, the reserve), F20b
@@ -96,9 +97,11 @@ B2_PLANTS = dict(
     dup_take_device=(dict(svc_kw=dict(sb_mut={"no_dedup": True})), None),            # B2's dedup predicate refuses
     dup_take_host=(dict(checked=False, svc_kw=dict(sb_mut={"no_dedup": True})), None),   # unchecked: a second take
     owner_not_mirrored=(dict(b2_mut={"mirror_ignores_owner": True}), None),
-    # B2's "in-flight lookup" IS the mirror's current-owner flag (and slot_of): ignoring the owner shows at the owner
-    # change, in the mirror (op 5), before v1's page difference (op 7)
-    owner_blind=(dict(b2_mut={"mirror_ignores_owner": True, "owner_blind": True}), (5, "mirror")),
+    # B2's in-flight lookup is the mirror's current-owner flag AND _in_flight; both blind, the full-scan reference
+    # (_mirror_diff, through the same _in_flight) agrees with the mirror at op 5. At op 7 the blind device merges u1's
+    # verify into u0's transfer; B2's checked merge predicate (the table's uid against the owner, not the blind lookup)
+    # refuses it before any change: (7, raise) where v1, which has no such check, differs in its pages (7, value)
+    owner_blind=(dict(b2_mut={"mirror_ignores_owner": True, "owner_blind": True}), (7, "raise")),
     no_uid_check=(dict(b2_mut={"no_uid_check": True}), None),                        # I1 after the poll
     free_on_cancel=(dict(b2_mut={"free_on_cancel": True}), None),
     cancel_refusal_off=(dict(cls=CancelledAcceptedB2, mut=MU.Mutations(no_late_protection_guard=True)), None),
@@ -108,7 +111,10 @@ B2_PLANTS = dict(
     flag_ignored=(dict(b2_mut={"ignore_flags": True}), None),
     no_t4_refusal=(dict(b2_mut={"no_t4": True}), None),
     trash_written=(dict(cls=OWN2.TrashWriterB2), None),
-    no_reader_wait=(dict(b2_mut={"no_reader_wait": True}), None),
+    # B2 inherits S-C's device path: the freed slot 0 is chosen for the urgent block and the device stand-in's T3 check
+    # (CpuDeviceSim.gather) refuses to write it under its pending reader e1: (6, raise) where v1 (host) differs in its
+    # pages (6, value)
+    no_reader_wait=(dict(b2_mut={"no_reader_wait": True}), (6, "raise")),
     lost_forward=(dict(b2_mut={"drop_rd_last": True}), None),
     drop_keeps_reader=(dict(b2_mut={"keep_rd_last_on_drop": True}), None),
     poll_order_swapped=(dict(b2_mut={"poll_order_swapped": True}), None),
