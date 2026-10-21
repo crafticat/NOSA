@@ -610,8 +610,8 @@ of R". But every gilfree arm failed: "Inplace update to inference tensor outside
   - At construction the adapter records the modes the feeder needs. Inference mode is on when the constructing
     thread is in inference mode, or when any store, host or ring tensor is an inference tensor. Grad mode is the
     constructing thread's (off under inference mode). On the GPU it records the store's device.
-  - The feeder enters them around its whole loop: `torch.inference_mode(...)`, `torch.set_grad_enabled(...)`,
-    `torch.cuda.set_device(...)`.
+  - The feeder enters them: `torch.cuda.set_device(...)` once at its start; `torch.inference_mode(...)` and
+    `torch.set_grad_enabled(...)` around each release (since the fg2 follow-up below; first around its whole loop).
   - The current CUDA stream needs nothing. Every CUDA operation of a release names its stream: the extension's copy
     and scatter streams, the publication under `torch.cuda.stream(scatter)`, and `scatter.wait_event`.
   - The OpenMP team's threads copy raw bytes only (pack_range).
@@ -623,6 +623,15 @@ of R". But every gilfree arm failed: "Inplace update to inference tensor outside
   inference on and grad off, and a two-request plan lands the host truth.
 - GT6 negative control: thread_modes=False (the feeder keeps a new thread's defaults) gives the run's exact error,
   re-raised at force().
+- FG fg2 (2026-10-21) failed the same way in every gilfree arm (FG1 superset / exact / negative, FG2 gilfree, both
+  FG3 points: all transport "gilfree", 1 tick each); gather and s0 (no thread) passed. The feeder has a SECOND
+  in-place write: the board publication (`_publish`, FG1's exact wait). 7ab1ca2 covered it only when the adapter or
+  its tensors were in inference mode. Now attach_board also turns the feeder's inference mode on for an
+  inference-mode board, and the feeder enters its modes around EACH release (it reads them per release).
+- GT6b: the host rows, the store and the adapter are normal tensors; only the board is an inference tensor. The
+  background feeder lands the host truth and publishes every transfer. Negative control: the board's mode ignored
+  (as in 7ab1ca2): the rows land, then the publication raises the run's error; its traceback names _feeder,
+  _release and _publish.
 
 ## 13. Open questions
 
