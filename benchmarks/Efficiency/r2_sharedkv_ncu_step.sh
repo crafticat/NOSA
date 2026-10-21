@@ -7,7 +7,11 @@
 #   b32-split | b32-whole   --backend resident (the ResidentStore), B 32, M_FIX 128
 #   b64-split | b64-whole   --backend b2 (OwnResidency on the SG5 path, the plan's page keys), B 64, M_FIX 256,
 #                           C 96, X 32, R_ver 16 (SG5's primary point), the gather transport
-# Order (the plan): b32-split, b64-split, b32-whole, b64-whole; stop at the first MUST failure.
+#   b32-split-fused | b64-split-fused   [sharedkv3] the same with --union fused (the groups once per tick + one union
+#                           kernel per call; docs/R2_SHAREDKV3_UNION.md)
+# Order (the plan): b32-split, b64-split, b32-whole, b64-whole; stop at the first MUST failure. [sharedkv3] then
+# b32-split-fused, b64-split-fused.
+# [sharedkv3] NOSI is the r2-sharedkv3 worktree.
 # SOURCE ONLY, NOT RUN, NOT REVIEWED: it never submits, renews, cancels or replaces an allocation, never retries.
 #
 #   bash benchmarks/Efficiency/r2_sharedkv_ncu_step.sh --nosi <sha> <holder job> <run id> <arm>
@@ -20,7 +24,7 @@
 # count; 2 refusal; 3 / 4 GPU identity; 124 / 137 timeout; 1 STOP before the launch; 5 an exit-0 step with an
 # incomplete record or a non-COMPLETED 0:0 sacct row.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-sharedkv2                                                # ROOT (this branch)
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-sharedkv3                                                # ROOT (this branch)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -43,15 +47,18 @@ STEP_MIN=90
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 sharedkv S3 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_sharedkv_ncu_step.sh --nosi <sha> <holder> <run id> b32-split|b32-whole|b64-split|b64-whole" >&2
+usage() { echo "usage: r2_sharedkv_ncu_step.sh --nosi <sha> <holder> <run id> b32-split|b32-whole|b64-split|b64-whole|b32-split-fused|b64-split-fused" >&2
           exit 2; }
 [ $# = 5 ] && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4 ARM=$5
+UNION=torch
 case $ARM in
     b32-split) BACKEND=resident BATCH=32 M_FIX=128 MODE=split ;;
     b32-whole) BACKEND=resident BATCH=32 M_FIX=128 MODE=whole ;;
     b64-split) BACKEND=b2 BATCH=64 M_FIX=256 MODE=split ;;
     b64-whole) BACKEND=b2 BATCH=64 M_FIX=256 MODE=whole ;;
+    b32-split-fused) BACKEND=resident BATCH=32 M_FIX=128 MODE=split UNION=fused ;;
+    b64-split-fused) BACKEND=b2 BATCH=64 M_FIX=256 MODE=split UNION=fused ;;
     *) usage ;;
 esac
 DRY=${DRYRUN:-0}
@@ -121,11 +128,11 @@ ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) sr
       /bin/sh -c "$CHILD" skv2-child "$GPU_UUID" "$APPTAINER" --bind /mnt/beegfs/ojerbi:/mnt/beegfs/ojerbi "${ENVS[@]}"
       "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_sharedkv_ncu.py" --mode orchestrate --out "$OUT"
       --model "$MODEL" --workload "$WL" --biattn "$ATTN_MOD" --sharedkv "$SKV_MOD" --backend "$BACKEND"
-      --attn-mode "$MODE" --batch "$BATCH" --S 16128 --steps "$STEPS" --K 3 --LAMBDA 7 --m-fix "$M_FIX"
+      --attn-mode "$MODE" --union "$UNION" --batch "$BATCH" --S 16128 --steps "$STEPS" --K 3 --LAMBDA 7 --m-fix "$M_FIX"
       --C 96 --X 32 --R-ver 16 --window "$WINDOW" --ncu "$NCU" --variants all,none --child-timeout 2400)
 if [ "$DRY" = 1 ]; then
     echo "R2 sharedkv S3 step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob workload $WL_SHA gpu_uuid $GPU_UUID ($UFILE)"
-    echo "R2 sharedkv S3 step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; shared $SKV_BLOB -> $SKV_MOD; arm $ARM backend $BACKEND B $BATCH M_FIX $M_FIX mode $MODE window $WINDOW"
+    echo "R2 sharedkv S3 step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; shared $SKV_BLOB -> $SKV_MOD; arm $ARM backend $BACKEND B $BATCH M_FIX $M_FIX mode $MODE union $UNION window $WINDOW"
     printf '%q ' "${ARGV[@]}"
     echo
     exit 0

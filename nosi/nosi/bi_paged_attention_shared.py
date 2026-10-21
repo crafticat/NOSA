@@ -174,6 +174,136 @@ def plant_drop_page(union: dict, g: int = 0, h: int = 0, u: Optional[int] = None
     return dict(union, rowpos=rp.contiguous())
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# [sharedkv3] the union build in TWO parts (docs/R2_SHAREDKV3_UNION.md): the GROUPS once per tick (they depend on
+# seq_idx only: build_groups, cached by the selector per seq_idx object), and the per-layer UNION in ONE Triton kernel
+# (_union_kernel via build_union_fused) instead of about 50 torch ops. Same output as build_union, bit for bit (int
+# tensors): the union index of an entry is the number of DISTINCT (key, slot) values below it, counted over the
+# first occurrences (an entry whose value no earlier row of the group lists); ascending order and dedup follow.
+# ---------------------------------------------------------------------------------------------------------------------
+def build_groups(seq_idx: torch.Tensor, rows_max: int) -> torch.Tensor:
+    """grow (R, NR) int32 contiguous: build_union's group step, the same ops in the same order (device, no host read).
+    It depends on seq_idx and rows_max only: the same for every layer of a tick."""
+    R = seq_idx.shape[0]
+    NR = int(rows_max)
+    dev = seq_idx.device
+    i64 = torch.int64
+    seq = seq_idx.to(i64)
+    order = torch.sort(seq, stable=True).indices
+    s_sorted = seq[order]
+    idx = torch.arange(R, device=dev, dtype=i64)
+    newg = torch.ones(R, dtype=torch.bool, device=dev)
+    newg[1:] = s_sorted[1:] != s_sorted[:-1]
+    start = torch.where(newg, idx, torch.zeros_like(idx)).cummax(0).values
+    m = idx - start
+    gid = (m % NR == 0).to(i64).cumsum(0) - 1
+    grow = torch.full((R, NR), -1, dtype=i64, device=dev)
+    grow[gid, m % NR] = order
+    return grow.to(torch.int32).contiguous()
+
+
+def _windows(uidx: torch.Tensor, ucnt: torch.Tensor, pps: int, whole: bool) -> torch.Tensor:
+    """build_union's window step on (uidx, ucnt), the same ops (the torch twin of the fused build uses it)."""
+    R, Hkv, NR, P = uidx.shape
+    if whole:
+        return torch.stack([torch.zeros_like(ucnt), ucnt], -1).view(R, Hkv, 1, 2)
+    S = -(-P // int(pps))
+    pad = S * int(pps) - P
+    ux = torch.nn.functional.pad(uidx, (0, pad), value=-1).view(R, Hkv, NR, S, int(pps))
+    v = ux >= 0
+    lo = torch.where(v, ux, torch.full_like(ux, _BIG)).amin(dim=(2, 4))
+    hi = torch.where(v, ux, torch.full_like(ux, -1)).amax(dim=(2, 4)) + 1
+    lo = torch.where(hi > 0, lo, torch.zeros_like(lo))
+    return torch.stack([lo, hi], -1)
+
+
+def build_union_fused_reference(seq_idx, page_table, num_pages, page_key, rows_max: int, pps: int, whole: bool = False,
+                                groups: Optional[torch.Tensor] = None, dedup: bool = True) -> dict:
+    """The torch TWIN of _union_kernel's algorithm (CPU tests, the CPU tick): per (group, head) the entries
+    v = key << 32 | slot of its rows; FIRST = listed and no earlier row of the group lists v; uid = the count of FIRST
+    entries with a smaller v; ut[uid] = slot (FIRST entries), rowpos[j, uid] = i, uidx = uid. dedup False is the
+    NEGATIVE CONTROL (every listed entry counts as first: duplicates inflate ucnt and shift the uids)."""
+    NR = int(rows_max)
+    R, Hkv, P = page_table.shape
+    i64 = torch.int64
+    dev = page_table.device
+    grow = (groups if groups is not None else build_groups(seq_idx, NR)).to(i64)
+    N = NR * P
+    U = N
+    gv = grow.clamp(min=0)
+    live = grow >= 0
+    pos = torch.arange(P, device=dev, dtype=i64)
+    npg = num_pages.to(i64)[gv]                                                     # (R, NR, Hkv)
+    ok = live.view(R, NR, 1, 1) & (pos.view(1, 1, 1, P) < npg.unsqueeze(-1))         # (R, NR, Hkv, P)
+    v = (page_key.to(i64)[gv] << 32) | page_table.to(i64)[gv]
+    ok = ok.permute(0, 2, 1, 3).reshape(R, Hkv, N)
+    v = torch.where(ok, v.permute(0, 2, 1, 3).reshape(R, Hkv, N), torch.full((R, Hkv, N), -1, dtype=i64, device=dev))
+    jj = (torch.arange(N, device=dev) // P).view(1, 1, N)
+    ii = (torch.arange(N, device=dev) % P).view(1, 1, N)
+    if dedup:
+        earlier = (v.unsqueeze(-1) == v.unsqueeze(-2)) & ok.unsqueeze(-1) & (jj.view(1, 1, N, 1) < jj.view(1, 1, 1, N))
+        first = ok & ~earlier.any(dim=-2)                                            # [e, f]: e earlier than f
+    else:
+        first = ok.clone()
+    uid = ((v.unsqueeze(-2) < v.unsqueeze(-1)) & first.unsqueeze(-2)).to(i64).sum(-1)   # [e, f]: v_f < v_e
+    ucnt = first.to(i64).sum(-1)
+    ut = torch.full((R, Hkv, U + 1), -1, dtype=i64, device=dev)
+    ut.scatter_(-1, torch.where(first, uid, torch.full_like(uid, U)),
+                torch.where(first, v & 0xFFFFFFFF, torch.full_like(v, -1)))
+    rowpos = torch.full((R, Hkv, NR * (U + 1)), -1, dtype=i64, device=dev)
+    rowpos.scatter_(-1, jj.expand(R, Hkv, N) * (U + 1) + torch.where(ok, uid, torch.full_like(uid, U)),
+                    torch.where(ok, ii.expand(R, Hkv, N), torch.full_like(uid, -1)))
+    rowpos = rowpos.view(R, Hkv, NR, U + 1)[..., :U]
+    uidx = torch.where(ok, uid, torch.full_like(uid, -1)).view(R, Hkv, NR, P)
+    win = _windows(uidx, ucnt, pps, whole)
+    c = lambda t: t.to(torch.int32).contiguous()                                    # noqa: E731
+    return dict(grow=c(grow), ut=c(ut[..., :U]), ucnt=c(ucnt), rowpos=c(rowpos), win=c(win), uidx=c(uidx),
+                rows_max=NR, whole=whole is True, pps=int(pps))
+
+
+def build_union_fused(seq_idx, page_table, num_pages, page_key, rows_max: int, pps: int, whole: bool = False,
+                      groups: Optional[torch.Tensor] = None, dedup: bool = True, te: int = 64) -> dict:
+    """[sharedkv3] build_union's dict from ONE kernel launch per call (plus build_groups unless `groups` is given:
+    the selector passes its per-tick cache). Outputs are allocated with torch.empty (no launch) and written whole by
+    the kernel. Shape / dtype / contiguity checks only (no device read)."""
+    if _union_kernel is None:
+        raise RuntimeError("triton is not installed")
+    NR = int(rows_max)
+    R, Hkv, P = page_table.shape
+    if page_key.shape != page_table.shape or page_key.dtype != torch.int32 or page_table.dtype != torch.int32 \
+            or not (page_key.is_contiguous() and page_table.is_contiguous() and num_pages.is_contiguous()) \
+            or num_pages.dtype != torch.int32:
+        raise ValueError("page_table / page_key: contiguous int32 of one shape; num_pages contiguous int32 (L28: the "
+                         "kernel reads the keys with the table's strides)")
+    grow = groups if groups is not None else build_groups(seq_idx, NR)
+    if grow.shape != (R, NR) or grow.dtype != torch.int32 or not grow.is_contiguous():
+        raise ValueError("groups must be build_groups(seq_idx, rows_max): (R, NR) contiguous int32")
+    N = NR * P
+    U = N
+    S = 1 if whole else -(-P // int(pps))
+    SP = 2                                             # tl.arange needs a power of two; 2 avoids a 1-wide range
+    while SP < S:
+        SP *= 2
+    dev = page_table.device
+    e32 = dict(dtype=torch.int32, device=dev)
+    ut = torch.empty((R, Hkv, U), **e32)
+    ucnt = torch.empty((R, Hkv), **e32)
+    rowpos = torch.empty((R, Hkv, NR, U), **e32)
+    win = torch.empty((R, Hkv, S, 2), **e32)
+    uidx = torch.empty((R, Hkv, NR, P), **e32)
+    first = torch.empty((R, Hkv, N), **e32)
+    if R > 0:
+        _union_kernel[(R, Hkv)](
+            page_table, num_pages, page_key, grow, ut, ucnt, rowpos, win, uidx, first,
+            page_table.stride(0), page_table.stride(1), num_pages.stride(0), grow.stride(0),
+            ut.stride(0), ut.stride(1), ucnt.stride(0), rowpos.stride(0), rowpos.stride(1), rowpos.stride(2),
+            win.stride(0), win.stride(1), win.stride(2), uidx.stride(0), uidx.stride(1), uidx.stride(2),
+            first.stride(0), first.stride(1),
+            NR=NR, P=P, N=N, PPS=int(pps), S=S, SP=SP, TE=int(te), WHOLE=whole is True, DEDUP=bool(dedup))
+    return dict(grow=grow, ut=ut, ucnt=ucnt, rowpos=rowpos, win=win, uidx=uidx, rows_max=NR, whole=whole is True,
+                pps=int(pps))
+
+
 def validate_keys(page_table: torch.Tensor, num_pages: torch.Tensor, page_key: torch.Tensor) -> None:
     """HOST READS (tests / gates only): every row's keys strictly ascending over its listed pages, all >= 0 and < 2**31
     (the union order needs it: each row's list must be a subsequence of the (key, slot) order)."""
@@ -369,6 +499,98 @@ if triton is not None:
                                   s_mr, s_mh, s_ms, offs_h, offs_d, BLOCK_H)
 else:                                                  # pragma: no cover
     _bi_shared_kernel = None
+
+
+if triton is not None:      # [sharedkv3] the fused union build (a second triton block, after the shared kernel's)
+    @triton.jit
+    def _union_entries(PT, NP, KEY, GROW, g, h, e, s_ptr, s_pth, s_npr, s_gr, N: tl.constexpr, P: tl.constexpr):
+        """Entries e (a vector of flat indices j * P + i) of group g, head h: (v = key << 32 | slot, listed, j, i)."""
+        j = e // P
+        i = e % P
+        inn = e < N
+        r = tl.load(GROW + g * s_gr + j, mask=inn, other=-1)
+        live = r >= 0
+        rc = tl.maximum(r, 0)
+        npg = tl.load(NP + rc * s_npr + h, mask=inn & live, other=0)
+        ok = inn & live & (i < npg)
+        slot = tl.load(PT + rc * s_ptr + h * s_pth + i, mask=ok, other=0).to(tl.int64)
+        key = tl.load(KEY + rc * s_ptr + h * s_pth + i, mask=ok, other=0).to(tl.int64)
+        v = tl.where(ok, (key << 32) | slot, -1)
+        return v, ok, j, i
+
+    @triton.jit
+    def _union_kernel(PT, NP, KEY, GROW, UT, UCNT, ROWPOS, WIN, UIDX, FIRST,
+                      s_ptr, s_pth, s_npr, s_gr, s_utr, s_uth, s_ucr, s_rpr, s_rph, s_rpj, s_wr, s_wh, s_ws,
+                      s_uxr, s_uxh, s_uxj, s_fr, s_fh,
+                      NR: tl.constexpr, P: tl.constexpr, N: tl.constexpr, PPS: tl.constexpr, S: tl.constexpr,
+                      SP: tl.constexpr, TE: tl.constexpr, WHOLE: tl.constexpr, DEDUP: tl.constexpr):
+        """[sharedkv3] ONE program per (group g, KV head h): build_union's per-layer outputs for (g, h) (the twin is
+        build_union_fused_reference). Pass 0 fills ut / rowpos with -1; pass A marks the FIRST entries (listed, and no
+        earlier row of the group lists the same value) into the scratch FIRST; pass B gives each listed entry its uid
+        (the count of FIRST entries with a smaller value), writes uidx, ut[uid] (FIRST entries), rowpos[j, uid] and the
+        split windows (min / max uid per split k of the rows' list positions). Barriers order the passes (global
+        writes of the CTA are visible after the barrier). DEDUP False is the NEGATIVE CONTROL."""
+        g = tl.program_id(0)
+        h = tl.program_id(1)
+        ar = tl.arange(0, TE)
+        neg = tl.full([TE], -1, tl.int32)
+        for u0 in range(0, N, TE):                                   # pass 0: -1 everywhere the scatters may skip
+            uu = u0 + ar
+            mu = uu < N
+            tl.store(UT + g * s_utr + h * s_uth + uu, neg, mask=mu)
+            for j in tl.static_range(NR):
+                tl.store(ROWPOS + g * s_rpr + h * s_rph + j * s_rpj + uu, neg, mask=mu)
+        tl.debug_barrier()
+        for f0 in range(0, N, TE):                                   # pass A: the first occurrences
+            f = f0 + ar
+            vf, okf, jf, i_f = _union_entries(PT, NP, KEY, GROW, g, h, f, s_ptr, s_pth, s_npr, s_gr, N, P)
+            dup = tl.zeros([TE], dtype=tl.int32)
+            if DEDUP:
+                for e0 in range(0, N, TE):
+                    e = e0 + ar
+                    ve, oke, je, ie = _union_entries(PT, NP, KEY, GROW, g, h, e, s_ptr, s_pth, s_npr, s_gr, N, P)
+                    hit = (ve[:, None] == vf[None, :]) & oke[:, None] & (je[:, None] < jf[None, :])
+                    dup = dup + tl.sum(hit.to(tl.int32), 0)
+            first = okf & (dup == 0)
+            tl.store(FIRST + g * s_fr + h * s_fh + f, first.to(tl.int32), mask=f < N)
+        tl.debug_barrier()
+        cnt = tl.zeros([TE], dtype=tl.int32)
+        kk = tl.arange(0, SP)
+        lo = tl.full([SP], 2147483647, tl.int32)
+        hi = tl.full([SP], -1, tl.int32)
+        for e0 in range(0, N, TE):                                   # pass B: uid, uidx, ut, rowpos, windows
+            e = e0 + ar
+            ve, oke, je, ie = _union_entries(PT, NP, KEY, GROW, g, h, e, s_ptr, s_pth, s_npr, s_gr, N, P)
+            uid = tl.zeros([TE], dtype=tl.int32)
+            for f0 in range(0, N, TE):
+                f = f0 + ar
+                vf, okf, jf, i_f = _union_entries(PT, NP, KEY, GROW, g, h, f, s_ptr, s_pth, s_npr, s_gr, N, P)
+                fst = tl.load(FIRST + g * s_fr + h * s_fh + f, mask=f < N, other=0)
+                lt = (vf[None, :] < ve[:, None]) & (fst[None, :] != 0)
+                uid = uid + tl.sum(lt.to(tl.int32), 1)
+            fe = tl.load(FIRST + g * s_fr + h * s_fh + e, mask=e < N, other=0)
+            cnt = cnt + fe
+            me = e < N
+            tl.store(UIDX + g * s_uxr + h * s_uxh + je * s_uxj + ie, tl.where(oke, uid, -1), mask=me)
+            tl.store(UT + g * s_utr + h * s_uth + uid, (ve & 0xFFFFFFFF).to(tl.int32), mask=me & (fe != 0))
+            tl.store(ROWPOS + g * s_rpr + h * s_rph + je * s_rpj + uid, ie.to(tl.int32), mask=me & oke)
+            if not WHOLE:
+                sel = oke[:, None] & ((ie // PPS)[:, None] == kk[None, :])
+                lo = tl.minimum(lo, tl.min(tl.where(sel, uid[:, None], 2147483647), 0))
+                hi = tl.maximum(hi, tl.max(tl.where(sel, uid[:, None], -1), 0))
+        total = tl.sum(cnt, 0)
+        tl.store(UCNT + g * s_ucr + h, total)
+        if WHOLE:
+            tl.store(WIN + g * s_wr + h * s_wh, 0)
+            tl.store(WIN + g * s_wr + h * s_wh + 1, total)
+        else:
+            hi1 = hi + 1
+            lo = tl.where(hi1 > 0, lo, 0)
+            mk = kk < S
+            tl.store(WIN + g * s_wr + h * s_wh + kk * s_ws, lo, mask=mk)
+            tl.store(WIN + g * s_wr + h * s_wh + kk * s_ws + 1, hi1, mask=mk)
+else:                                                  # pragma: no cover
+    _union_kernel = None
 
 
 _DUMMY_CNT = {}
@@ -572,13 +794,21 @@ class SharedKV:
     needs_page_key = True
 
     IMPLS = ("kernel", "reference")
+    UNIONS = ("torch", "fused")
 
-    def __init__(self, base, mode: str = "split", rows_max: int = ROWS_MAX, impl: str = "kernel"):
+    def __init__(self, base, mode: str = "split", rows_max: int = ROWS_MAX, impl: str = "kernel", union: str = "torch"):
         """impl 'kernel': the Triton kernels (GPU, or the interpreter); 'reference': the torch twins (the CPU tick
-        tests): piece 3's bi_paged_decode_reference and bi_paged_decode_shared_reference."""
-        if mode not in MODES or impl not in self.IMPLS:
-            raise ValueError("mode %r not in %s / impl %r not in %s" % (mode, MODES, impl, self.IMPLS))
+        tests): piece 3's bi_paged_decode_reference and bi_paged_decode_shared_reference.
+        [sharedkv3] union 'torch' (default: build_union, about 50 ops per call) or 'fused': the groups once per tick
+        (build_groups, cached per seq_idx object and version) and the union in ONE kernel per call
+        (build_union_fused; with impl 'reference' its torch twin build_union_fused_reference)."""
+        if mode not in MODES or impl not in self.IMPLS or union not in self.UNIONS:
+            raise ValueError("mode %r not in %s / impl %r not in %s / union %r not in %s"
+                             % (mode, MODES, impl, self.IMPLS, union, self.UNIONS))
         self.base, self.mode, self.rows_max, self.impl = base, mode, int(rows_max), impl
+        self.union = union
+        self._gcache = None                               # (seq_idx object, its _version, rows_max, grow)
+        self.group_builds = 0                             # build_groups calls (tests: once per tick, not per layer)
         self.build_page_table = base.build_page_table
         self.PAGE, self.PAGES_PER_SPLIT = base.PAGE, base.PAGES_PER_SPLIT
         self.__file__ = "%s + sharedkv(%s, %s)" % (getattr(base, "__file__", "piece3"), mode, impl)
@@ -591,7 +821,33 @@ class SharedKV:
         return self.base.bi_paged_decode(*args, softmax_scale=softmax_scale, out=out, workspace=workspace,
                                          pages_per_split=pps)
 
+    def _groups(self, seq_idx, nr):
+        """[sharedkv3] build_groups once per tick: the cache holds the seq_idx OBJECT (so its storage cannot be reused
+        by another tensor while cached) and its in-place version counter; another object, an in-place change or
+        another rows_max rebuilds."""
+        c = self._gcache
+        if c is not None and c[0] is seq_idx and c[1] == seq_idx._version and c[2] == nr:
+            return c[3]
+        grow = build_groups(seq_idx, nr)
+        self.group_builds += 1
+        self._gcache = (seq_idx, seq_idx._version, nr, grow)
+        return grow
+
+    def _build(self, args, page_key, nr, pps):
+        """The union of one call by the selected build ('torch': build_union; 'fused': the cached groups + the fused
+        kernel, or its torch twin with impl 'reference')."""
+        seq_idx, page_table, num_pages = args[4], args[5], args[6]
+        whole = self.mode == "whole"
+        if self.union == "torch":
+            return build_union(seq_idx, page_table, num_pages, page_key, nr, pps, whole)
+        grow = self._groups(seq_idx, nr)
+        if self.impl == "reference":
+            return build_union_fused_reference(seq_idx, page_table, num_pages, page_key, nr, pps, whole, groups=grow)
+        return build_union_fused(seq_idx, page_table, num_pages, page_key, nr, pps, whole, groups=grow)
+
     def _shared(self, args, page_key, nr, softmax_scale, pps, out=None, workspace=None, union=None):
+        if union is None and self.union != "torch":       # [sharedkv3] the launcher's own build is build_union
+            union = self._build(args, page_key, nr, pps)
         if self.impl == "reference":
             return bi_paged_decode_shared_reference(self.base, *args, page_key, rows_max=nr, mode=self.mode,
                                                     softmax_scale=softmax_scale, pages_per_split=pps, union=union)
@@ -622,7 +878,7 @@ class SharedKVProbe(SharedKV):
 
     def __init__(self, base, mode: str = "split", rows_max: int = ROWS_MAX, timing: bool = True, plant: bool = False,
                  impl: str = "kernel", count: bool = True, ncu_window=None, sleep_cycles: int = 2000000,
-                 record_tables: int = 4):
+                 record_tables: int = 4, union: str = "torch"):
         """[sharedkv2] ncu_window (skip, count) (the S3 cell, benchmarks/Efficiency/r2_sharedkv_ncu.py): among the
         keyed calls with rows_max == self.rows_max, calls skip .. skip + count - 1 are MARKED: one profiler window
         (cudaProfilerStart / Stop; ncu --profile-from-start off profiles nothing else) around the two sides, each in
@@ -633,7 +889,7 @@ class SharedKVProbe(SharedKV):
         work and not the Python launch path (0: off). The shared side's span includes the union build (MAJOR-2).
         record_tables (MAJOR-1): the inputs of the first N keyed calls with rows_max == self.rows_max are kept (device
         clones) for F4's offline check against the CPU oracle (report_tables)."""
-        super().__init__(base, mode, rows_max, impl)
+        super().__init__(base, mode, rows_max, impl, union=union)
         self.sleep_cycles = int(sleep_cycles)
         self.record_tables = int(record_tables)
         self.tables = []                                  # the recorded inputs (MAJOR-1)
@@ -682,8 +938,8 @@ class SharedKVProbe(SharedKV):
             finally:
                 torch.cuda.nvtx.range_pop()
 
-        def build():
-            un = build_union(seq_idx, page_table, num_pages, page_key, nr, pps, whole)
+        def build():                                      # [sharedkv3] the selected build (torch / fused)
+            un = self._build(args, page_key, nr, pps)
             return plant_drop_page(un) if self.plant else un
 
         def per_row():

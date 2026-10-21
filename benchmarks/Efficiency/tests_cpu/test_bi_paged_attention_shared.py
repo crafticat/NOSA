@@ -555,7 +555,7 @@ def test_step_script_shape_and_its_sg1_schedule_is_not_blind():
     assert lines[0] == "#!/bin/bash" and lines[-1] == 'main "$@"; exit $?' and "main() {" in text
     assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-sharedkv" in text and "BIATTN_BLOB=%s" % PIECE3_BLOB in text
     assert 'UFILE=$HOLDERS/$JOB.gpu_uuid' in text and text.index("UFILE=$HOLDERS") < text.index('mkdir "$OUTROOT/skv_active"')
-    assert "--export=NONE" in text and '--attn "$ARM"' in text
+    assert "--export=NONE" in text and '--attn "$ATTN" --union "$UNION"' in text
     assert "<<" not in text and "ulimit" not in text
     for word in ("awk", "perl", "python3", " bc ", "node "):
         for ln in lines:
@@ -807,7 +807,7 @@ def test_step_dryrun_refusals_and_pins(tmp_path):
     assert r.returncode == 1 and "for DRYRUN" in r.stderr and "TICK_PIN" in r.stderr
     r = run(416, uid + "\n")
     assert r.returncode == 1 and "HEAD is not" in r.stderr
-    nosi = "/mnt/beegfs/ojerbi/nosi-r2-sharedkv2"
+    nosi = "/mnt/beegfs/ojerbi/nosi-r2-sharedkv3"
     head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
     dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"], capture_output=True,
                            text=True)
@@ -816,15 +816,21 @@ def test_step_dryrun_refusals_and_pins(tmp_path):
     sha = head.stdout.strip()
     skv = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD:nosi/nosi/bi_paged_attention_shared.py"],
                          capture_output=True, text=True).stdout.strip()
-    for arm, parts, drop in (("per_row", "SG1", "0.0"), ("probe-plant", "SG1", "0.0"), ("probe", "SG1", "0.0"),
-                             ("probe-whole", "SG1", "0.0"), ("shared", "SG0,SG1,SG2,SG3", "0.5"),
-                             ("shared-whole", "SG0,SG1,SG2,SG3", "0.5")):
+    for arm, parts, drop, attn, union in (
+            ("per_row", "SG1", "0.0", "per_row", "torch"), ("probe-plant", "SG1", "0.0", "probe-plant", "torch"),
+            ("probe", "SG1", "0.0", "probe", "torch"), ("probe-whole", "SG1", "0.0", "probe-whole", "torch"),
+            ("shared", "SG0,SG1,SG2,SG3", "0.5", "shared", "torch"),
+            ("shared-whole", "SG0,SG1,SG2,SG3", "0.5", "shared-whole", "torch"),
+            ("probe-plant-fused", "SG1", "0.0", "probe-plant", "fused"),                  # [sharedkv3]
+            ("probe-fused", "SG1", "0.0", "probe", "fused"),
+            ("shared-fused", "SG0,SG1,SG2,SG3", "0.5", "shared", "fused")):
         r = run(417, uid + "\n", arm=arm, sha=sha)
         assert r.returncode == 0, (arm, r.stderr[-400:])
-        assert "arm %s parts %s drop %s" % (arm, parts, drop) in r.stdout, arm
+        assert "arm %s parts %s drop %s attn %s union %s" % (arm, parts, drop, attn, union) in r.stdout, arm
         assert "piece 3 7c826c1bc7235ee9153e3af82c99d85836915416:nosi/nosi/bi_paged_attention.py blob %s" % PIECE3_BLOB \
             in r.stdout and "shared %s" % skv in r.stdout
-        for w in ("--attn %s" % arm, "--parts %s" % parts.replace(",", "\\,"), "--draft-drop %s" % drop,
+        for w in ("--attn %s --union %s" % (attn, union), "--parts %s" % parts.replace(",", "\\,"),
+                  "--draft-drop %s" % drop,
                   "--sharedkv /mnt/beegfs/ojerbi/r2-runs/sharedkv/skv_%s_t1_417.step/bi_paged_attention_shared.py" % arm):
             assert w in r.stdout, (arm, w)
     r = run(418, uid + "\n", sha=sha, extra=dict(TICK_PIN_BIATTN_BLOB="0" * 40))

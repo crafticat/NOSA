@@ -198,7 +198,7 @@ def test_N5_step_dryrun_refusals_and_pins(tmp_path):
     assert r.returncode == 1 and "for DRYRUN" in r.stderr
     r = run(315, uid + "\n")
     assert r.returncode == 1 and "HEAD is not" in r.stderr
-    nosi = "/mnt/beegfs/ojerbi/nosi-r2-sharedkv2"
+    nosi = "/mnt/beegfs/ojerbi/nosi-r2-sharedkv3"
     head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
     dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"], capture_output=True,
                            text=True)
@@ -208,7 +208,9 @@ def test_N5_step_dryrun_refusals_and_pins(tmp_path):
     skv = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD:nosi/nosi/bi_paged_attention_shared.py"],
                          capture_output=True, text=True).stdout.strip()
     for arm, words in (("b32-split", ("--backend resident", "--batch 32", "--m-fix 128", "--attn-mode split")),
-                       ("b64-whole", ("--backend b2", "--batch 64", "--m-fix 256", "--attn-mode whole"))):
+                       ("b64-whole", ("--backend b2", "--batch 64", "--m-fix 256", "--attn-mode whole",
+                                      "--union torch")),
+                       ("b64-split-fused", ("--backend b2", "--batch 64", "--attn-mode split", "--union fused"))):
         r = run(316, uid + "\n", arm=arm, sha=sha)
         assert r.returncode == 0, r.stderr[-400:]
         assert "piece 3 7c826c1bc7235ee9153e3af82c99d85836915416:nosi/nosi/bi_paged_attention.py blob %s" % PIECE3_BLOB \

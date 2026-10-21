@@ -70,6 +70,10 @@ S3_PRED = {
     # shared + combine) / (piece 3 split + combine), on the cache-control none variant (the tick's L2 state; all =
     # cold, REPORT); and the kernel-only ratio (the plan's P3, unchanged)
     "time_with_build": dict(split=(1.30, 0.80, 2.20), whole=(2.10, 1.00, 4.00)),
+    # [sharedkv3] --union fused (docs/R2_SHAREDKV3_UNION.md): the build is one kernel per call (+ the groups once per
+    # tick); and the build alone per marked call, in microseconds of device time
+    "time_with_fused_build": dict(split=(0.90, 0.60, 1.25), whole=(1.75, 0.85, 3.70)),
+    "build_us_fused": dict(split=(15.0, 5.0, 60.0), whole=(15.0, 5.0, 60.0)),
     "time_kernel": dict(split=(0.80, 0.55, 1.10), whole=(1.60, 0.80, 3.50)),
 }
 
@@ -92,6 +96,7 @@ def parse_args(argv):
     ap.add_argument("--sharedkv", default="", help="bi_paged_attention_shared.py")
     ap.add_argument("--backend", default="resident", choices=("resident", "b2", "sc"))
     ap.add_argument("--attn-mode", default="split", choices=("split", "whole"))
+    ap.add_argument("--union", default="torch", choices=("torch", "fused"), help="[sharedkv3] the union build")
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--S", type=int, default=16128)
     ap.add_argument("--steps", type=int, default=16, help="committed tokens per request")
@@ -138,7 +143,7 @@ def mode_cell(a):
     os.makedirs(a.out)
     attn = GB.load_by_path(a.biattn, "piece3_bi_paged_attention")
     sk = GB.load_by_path(a.sharedkv, "sharedkv_bi_paged_attention")
-    probe = sk.SharedKVProbe(attn, mode=a.attn_mode, timing=True, count=True, ncu_window=a.window)
+    probe = sk.SharedKVProbe(attn, mode=a.attn_mode, timing=True, count=True, ncu_window=a.window, union=a.union)
     ops = BIOps(probe, a.m_fix, gemm="exact")
     docs, sha = G0.load_workload(a.workload, a.batch, a.S)
     model = Llama(model_name=a.model, device="cuda", offload=True)
@@ -302,6 +307,7 @@ def summarize_variant(cc, rows, cell, mode, fields):
              time_with_build=(d["sh"]["time_ns_all"] + d["bd"]["time_ns_all"]) / d["pr"]["time_ns_all"]
              if d["pr"]["time_ns_all"] else None)
     q["time_kernel"] = q["time_ratio_all"]
+    q["build_us_per_call"] = d["bd"]["time_ns_all"] / 1000.0 / len(marked) if marked else None   # [sharedkv3]
     hk = OPTIONAL[0] if OPTIONAL[0] in fields else None
     q["hit_pr"] = d["pr"][hk] if hk else d["pr"]["hit_derived_pct"]
     q["hit_sh"] = d["sh"][hk] if hk else d["sh"]["hit_derived_pct"]
@@ -366,7 +372,10 @@ def mode_summarize(a, og=None):
                               "%s device kernel time (ncu gpu__time_duration, serialized, %s L2): %s; %s; main "
                               "kernels only %s; build %d kernels %.0f ns"
                               % ("PRIMARY" if cc == "none" else "REPORT", "cold" if cc == "all" else "tick",
-                                 band("time_with_build", mode, q["time_with_build"]),
+                                 (band("time_with_fused_build", mode, q["time_with_build"]) + "; " +
+                                  band("build_us_fused", mode, q["build_us_per_call"])
+                                  if getattr(a, "union", "torch") == "fused" else
+                                  band("time_with_build", mode, q["time_with_build"])),
                                  band("time_kernel", mode, q["time_kernel"]), q["time_ratio_main"],
                                  d["bd"]["kernels"], d["bd"]["time_ns_all"])))
     if "all" in out["variants"] and "none" in out["variants"]:
@@ -387,7 +396,7 @@ def mode_summarize(a, og=None):
 def child_argv(a, out, cc):
     return [sys.executable, os.path.abspath(__file__), "--mode", "cell", "--out", out, "--model", a.model,
             "--workload", a.workload, "--biattn", a.biattn, "--sharedkv", a.sharedkv, "--backend", a.backend,
-            "--attn-mode", a.attn_mode, "--batch", str(a.batch), "--S", str(a.S), "--steps", str(a.steps),
+            "--attn-mode", a.attn_mode, "--union", a.union, "--batch", str(a.batch), "--S", str(a.S), "--steps", str(a.steps),
             "--K", str(a.K), "--LAMBDA", str(a.LAMBDA), "--m-fix", str(a.m_fix), "--C", str(a.C), "--X", str(a.X),
             "--R-ver", str(a.R_ver), "--window", "%d,%d" % a.window, "--cc", cc]
 

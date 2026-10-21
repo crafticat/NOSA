@@ -76,8 +76,10 @@ ROOT = Path(HERE).resolve().parents[1]                                          
 # expected_tile_ratio) and the measured ratio must lie in RHO_BAND x that expectation. Time (REPORT; the primary time
 # ratio is the S3 cell's device kernel time): over the keyed calls of rows_max 4, the order-pooled median of (union
 # build + shared kernel + combine) / (piece 3's split + combine), CUDA events behind a pre-queued GPU.
-SKV_PRED = {"split": dict(time_with_build=(1.30, 0.80, 2.20)),        # (central, lo, hi)
-            "whole": dict(time_with_build=(2.10, 1.00, 4.00))}
+SKV_PRED = {"split": dict(time_with_build=(1.30, 0.80, 2.20),        # (central, lo, hi), --union torch
+                          time_with_fused_build=(0.90, 0.60, 1.25)),  # [sharedkv3] --union fused (registered)
+            "whole": dict(time_with_build=(2.10, 1.00, 4.00),
+                          time_with_fused_build=(1.75, 0.85, 3.70))}
 
 
 def select_attn(a, attn):
@@ -89,8 +91,8 @@ def select_attn(a, attn):
     sk = GB.load_by_path(a.sharedkv, "sharedkv_bi_paged_attention")
     mode = "whole" if a.attn.endswith("whole") else "split"
     if a.attn.startswith("probe"):
-        return sk.SharedKVProbe(attn, mode=mode, plant=(a.attn == "probe-plant"))
-    return sk.SharedKV(attn, mode=mode)
+        return sk.SharedKVProbe(attn, mode=mode, plant=(a.attn == "probe-plant"), union=a.union)
+    return sk.SharedKV(attn, mode=mode, union=a.union)
 
 
 def sharedkv_gates(a, obj, gates, res):
@@ -131,7 +133,7 @@ def sharedkv_gates(a, obj, gates, res):
                              "%d calls checked (whole: tiles = union pages; split: union <= tiles <= sum); bad %s"
                              % (rep["tile_identity_checked"], rep["tile_identity_bad"][:4])))
     pred = SKV_PRED[rep["mode"]]
-    c, lo, hi = pred["time_with_build"]
+    c, lo, hi = pred["time_with_fused_build" if getattr(a, "union", "torch") == "fused" else "time_with_build"]
     pooled = {}
     for (nr, first, pr), (_, _, sh) in zip(rep["per_row_ms"], rep["shared_ms"]):
         pooled.setdefault(nr, []).append(sh / pr if pr > 0 else float("nan"))
@@ -192,6 +194,9 @@ def parse_args(argv):
                          "shared-read kernel IN the tick (SG1-SG3 then gate it bitwise against the BI serial REF); "
                          "probe[-whole] = both kernels on every keyed call, piece 3's output returned, bitwise and "
                          "time A/B; probe-plant = probe with one union page dropped (the negative control)")
+    ap.add_argument("--union", default="torch", choices=("torch", "fused"),                     # [sharedkv3]
+                    help="the shared side's union build: torch (build_union, about 50 ops per call) or fused (the "
+                         "groups once per tick + one kernel per call, build_union_fused)")
     ap.add_argument("--sharedkv", default=str(ROOT / "nosi/nosi/bi_paged_attention_shared.py"),   # [sharedkv]
                     help="the shared-read module (loaded by path; it imports nothing from nosi)")
     a = ap.parse_args(argv)

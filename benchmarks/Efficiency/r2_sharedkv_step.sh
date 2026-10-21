@@ -15,6 +15,10 @@
 # shared-whole; stop at the first MUST failure. A probe result without a passed probe-plant is VOID (F2).
 # The shared module is frozen into the record (git show <sha>:<path>, hash checked) and the gate loads that copy
 # (review MINOR-7). [sharedkv2] NOSI is the r2-sharedkv2 worktree (the review fixes live there).
+# [sharedkv3] NOSI is now the r2-sharedkv3 worktree; more arms with --union fused (docs/R2_SHAREDKV3_UNION.md):
+#   probe-fused | probe-plant-fused     --attn probe / probe-plant --union fused, SG1, drop 0.0
+#   shared-fused                        --attn shared --union fused, SG0-SG3, drop 0.5
+#   order after the torch arms: probe-plant-fused, probe-fused, shared-fused.
 # SOURCE ONLY, NOT RUN, NOT REVIEWED: it never submits, renews, cancels or replaces an allocation, never retries.
 #
 #   bash benchmarks/Efficiency/r2_sharedkv_step.sh --nosi <sha> <holder job> <run id> <arm>
@@ -27,7 +31,7 @@
 # both frozen. EXIT: as r2_tick_step.sh (the gate's failed MUST count; 2 refusal; 3 / 4 GPU identity; 124 / 137
 # timeout; 1 STOP before the launch; 5 an exit-0 step with an incomplete record or a non-COMPLETED 0:0 sacct row).
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-sharedkv2                                                # ROOT (this branch)
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-sharedkv3                                                # ROOT (this branch)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -52,13 +56,16 @@ STEP_MIN=90
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 sharedkv step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_sharedkv_step.sh --nosi <sha> <holder> <run id> per_row|probe|probe-whole|probe-plant|shared|shared-whole" >&2
+usage() { echo "usage: r2_sharedkv_step.sh --nosi <sha> <holder> <run id> per_row|probe|probe-whole|probe-plant|shared|shared-whole|probe-fused|probe-plant-fused|shared-fused" >&2
           exit 2; }
 [ $# = 5 ] && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4 ARM=$5
+ATTN=$ARM UNION=torch
 case $ARM in
     per_row|probe|probe-whole|probe-plant) PARTS=SG1 DROP=0.0 ;;
     shared|shared-whole) PARTS=SG0,SG1,SG2,SG3 DROP=0.5 ;;
+    probe-fused|probe-plant-fused) PARTS=SG1 DROP=0.0 ATTN=${ARM%-fused} UNION=fused ;;      # [sharedkv3]
+    shared-fused) PARTS=SG0,SG1,SG2,SG3 DROP=0.5 ATTN=shared UNION=fused ;;                  # [sharedkv3]
     *) usage ;;
 esac
 DRY=${DRYRUN:-0}
@@ -131,10 +138,10 @@ ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) sr
       "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_tick_gate.py" --out "$OUT" --model "$MODEL"
       --workload "$WL" --biattn "$ATTN_MOD" --gemm "$GEMM" --batch "$BATCH" --S 16128 --deltas "$DELTAS"
       --steps "$STEPS" --sg0-steps 64 --K 3 --LAMBDA 7 --draft-drop "$DROP" --seed 7 --m-fix "$M_FIX"
-      --sg4-steps 32 --phase 3 --parts "$PARTS" --attn "$ARM" --sharedkv "$SKV_MOD")
+      --sg4-steps 32 --phase 3 --parts "$PARTS" --attn "$ATTN" --union "$UNION" --sharedkv "$SKV_MOD")
 if [ "$DRY" = 1 ]; then
     echo "R2 sharedkv step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob workload $WL_SHA gpu_uuid $GPU_UUID ($UFILE)"
-    echo "R2 sharedkv step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; shared $SKV_BLOB -> $SKV_MOD; arm $ARM parts $PARTS drop $DROP; B $BATCH M_FIX $M_FIX"
+    echo "R2 sharedkv step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; shared $SKV_BLOB -> $SKV_MOD; arm $ARM parts $PARTS drop $DROP attn $ATTN union $UNION; B $BATCH M_FIX $M_FIX"
     printf '%q ' "${ARGV[@]}"
     echo
     exit 0
