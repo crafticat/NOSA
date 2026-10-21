@@ -36,14 +36,24 @@
 # PREDICTION if the shared hardware queue is the cause: err 0, a real spin > 10 ms, every launch ran, rows the host truth
 # FALSIFIER of that hypothesis: err 1 at the spin's bound with the variable set to 32
 # REGISTERED GFW1D END
+# CELL gfw1e (REPORT only; GFW_ready stays MUST): the lazy-module-loading hypothesis after gfw1d (the main thread's own
+# enqueue of 64 launches blocked as long as the spin). The gate runs two arms of GFW1's captured protocol, each in a
+# FRESH child process: eager (CUDA_MODULE_LOADING=EAGER in the child) and warm (the default loading; one add_ on the
+# main stream and one index_copy_ + one board index_put_ on the scatter stream before the spin). Each child records
+# CUDA_MODULE_LOADING before torch and after torch's CUDA init.
+# REGISTERED GFW1E BEGIN
+# frozen 2026-10-21 before gfw1e; GFW1's captured protocol, arm eager (CUDA_MODULE_LOADING=EAGER) and arm warm
+# PREDICTION if CUDA's lazy module loading is the cause: both arms pass (err 0, a real spin > 10 ms, rows right)
+# FALSIFIER: either arm ends at the spin's bound (err 1)
+# REGISTERED GFW1E END
 # The pattern of benchmarks/Efficiency/r2_fetch_fg_step.sh (feature/nosi-r2-m2-fg): the GPU uuid from
 # HOLDERS/<holder job id>.gpu_uuid; packer v2 (gilfree_pack.py / .cpp of f2b981a) pinned by commit, path and blob;
 # packer v3 = the blobs of benchmarks/Efficiency/gilfree_pack.{py,cpp} at --nosi; both copied into the step record and
 # loaded by path (built into the step's JIT directory). No model, no workload.
 # SOURCE ONLY until reviewed: it never submits, renews, cancels or replaces an allocation, never retries.
 #
-#   bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id> [gfw1|gfw2|gfw1d]
-#   DRYRUN=1 bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id> [gfw1|gfw2|gfw1d]
+#   bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id> [gfw1|gfw2|gfw1d|gfw1e]
+#   DRYRUN=1 bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id> [gfw1|gfw2|gfw1d|gfw1e]
 #        (login node: the pin checks and the printed step command; no squeue, claim, srun or write)
 #   In DRYRUN only, GFW_HOLDERS=<dir> replaces HOLDERS (the CPU test uses it); a real run refuses GFW_HOLDERS.
 #
@@ -54,7 +64,7 @@
 # 124 / 137 the host timeout; 1 a STOP before the launch (a missing or malformed uuid file included); 5 an exit-0 step
 # whose record is incomplete or whose sacct row is not COMPLETED 0:0.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw1d                                                    # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw1e                                                    # ROOT
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -72,7 +82,7 @@ STEP_MIN=12
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 GFW step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_gfw_step.sh --nosi <sha> <holder> <run id> [gfw1|gfw2|gfw1d]" >&2; exit 2; }
+usage() { echo "usage: r2_gfw_step.sh --nosi <sha> <holder> <run id> [gfw1|gfw2|gfw1d|gfw1e]" >&2; exit 2; }
 { [ $# = 4 ] || [ $# = 5 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4 CELL=${5:-gfw1}
 CELL_ENVS=()
@@ -83,6 +93,7 @@ case $CELL in
                      --l2-sleep-cycles 50000000) ;;
     gfw1d) CELL_ARGS=(--launches-few 64 --spin-cycles 200000000)
            CELL_ENVS=(--env CUDA_DEVICE_MAX_CONNECTIONS=32) ;;
+    gfw1e) CELL_ARGS=(--launches-few 64 --spin-cycles 200000000) ;;   # the gate sets each child's loading itself
     *) usage ;;
 esac
 DRY=${DRYRUN:-0}

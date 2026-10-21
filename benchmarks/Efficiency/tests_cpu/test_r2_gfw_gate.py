@@ -145,7 +145,7 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
     assert lines[0] == "#!/bin/bash" and lines[-1] == 'main "$@"; exit $?' and "main() {" in text
     assert 'mkdir "$OUTROOT/gfw_active"' in text and "STEP_MIN=12" in text and "--export=NONE" in text
     assert text.index("UFILE=$HOLDERS/$JOB.gpu_uuid") < text.index('mkdir "$OUTROOT/gfw_active"')
-    assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw1d " in text
+    assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw1e " in text
     for word in ("awk", "perl", "python3", " bc ", "node "):
         for ln in lines:
             if not ln.lstrip().startswith("#"):
@@ -197,7 +197,7 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
     rec = "/mnt/beegfs/ojerbi/r2-runs/gfw/gfw_t1_516.step"
     for arg in ("--threads 8", "--releases 20", "--warmup 3", "--launches 1500", "--spin-cycles 200000000",
                 "--launches-few 64", "--hazard-spin 1048576",
-                "--export=NONE", "--gres=gpu:a100:1", "--nosi-pkg /mnt/beegfs/ojerbi/nosi-r2-gfw1d/nosi/nosi",
+                "--export=NONE", "--gres=gpu:a100:1", "--nosi-pkg /mnt/beegfs/ojerbi/nosi-r2-gfw1e/nosi/nosi",
                 "--v3 %s/packer_v3" % rec, "--v2 %s/packer_v2" % rec, "r2_gfw_gate.py", "--cell gfw1", "; cell gfw1"):
         assert arg in r.stdout, arg
     assert "--sizes 64,192" in r.stdout or "--sizes 64\\,192" in r.stdout
@@ -217,6 +217,12 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
     # the variable is set in gfw1d's child only (NEGATIVE CONTROL: the other cells' commands do not carry it)
     assert r3.stdout.index("--env CUDA_DEVICE_MAX_CONNECTIONS=32") < r3.stdout.index("nosa-env.sif")
     assert "CUDA_DEVICE_MAX_CONNECTIONS" not in r.stdout and "CUDA_DEVICE_MAX_CONNECTIONS" not in r2.stdout
+    r4 = run(516, sha=head.stdout.strip(), cell="gfw1e")
+    assert r4.returncode == 0, r4.stderr[-300:]
+    for arg in ("--cell gfw1e", "--launches-few 64", "--spin-cycles 200000000", "--threads 8", "; cell gfw1e"):
+        assert arg in r4.stdout, arg
+    # the gate sets each child's loading itself: the step's command carries neither variable
+    assert "CUDA_MODULE_LOADING" not in r4.stdout and "CUDA_DEVICE_MAX_CONNECTIONS" not in r4.stdout
 
 
 def _global_loads(code):
@@ -234,6 +240,52 @@ def _name_problems(jit):
     code = fn.__code__
     return list(code.co_freevars) + [n for n in _global_loads(code)
                                      if n not in fn.__globals__ and not hasattr(builtins, n)]
+
+
+def test_GFWC6_the_gfw1e_probe_arms_envs_and_verdict():
+    """GFWC6 (cell gfw1e, the lazy-module-loading hypothesis after gfw1d): the children's environments (eager sets
+    CUDA_MODULE_LOADING=EAGER; warm removes the variable, whatever the parent's torch set); an arm passes only with err
+    0, a real spin, every launch, right rows, T4 pending, and (eager) EAGER seen after torch's CUDA init; the verdict is
+    HELD only when both arms pass, FALSIFIED when an arm in its intended environment ends at the bound (err 1), else
+    INVALID (negative controls: an eager arm that saw LAZY, a missing arm, a child error). --arm / --arm-out parse (the
+    child), the child runs before the --out check, the warm-up's kernels, the REGISTERED GFW1E block; the lines are
+    REPORT."""
+    G = _gate()
+    assert G.child_env_1e({"A": "1"}, "eager") == {"A": "1", "CUDA_MODULE_LOADING": "EAGER"}
+    assert G.child_env_1e({"A": "1", "CUDA_MODULE_LOADING": "LAZY"}, "warm") == {"A": "1"}
+    with pytest.raises(ValueError):
+        G.child_env_1e({}, "cold")
+    good = dict(err=0, spin_ms=150.0, launches_done=64.0, rows_ok=True, t4_pending_at_issue=True)
+    eager = dict(good, arm="eager", module_loading_after="EAGER")
+    warm = dict(good, arm="warm", module_loading_after="LAZY")
+    assert G.arm_ok_1e(eager, 64) and G.arm_ok_1e(warm, 64)
+    assert not G.arm_ok_1e(dict(eager, module_loading_after="LAZY"), 64)          # NEGATIVE CONTROL: not EAGER
+    assert not G.arm_ok_1e(dict(warm, spin_ms=5.0), 64) and not G.arm_ok_1e(dict(warm, launches_done=63.0), 64)
+    assert G.verdict_1e(dict(eager=eager, warm=warm), 64) == "HELD"
+    bound = dict(good, err=1, spin_ms=8600.0)
+    assert G.verdict_1e(dict(eager=eager, warm=dict(bound, arm="warm")), 64) == "FALSIFIED"
+    assert G.verdict_1e(dict(eager=dict(bound, arm="eager", module_loading_after="EAGER"), warm=warm), 64) == "FALSIFIED"
+    assert G.verdict_1e(dict(eager=dict(bound, arm="eager", module_loading_after="LAZY"), warm=warm), 64) == "INVALID"
+    assert G.verdict_1e(dict(eager=eager), 64) == "INVALID"                          # NEGATIVE CONTROL: an arm missing
+    assert G.verdict_1e(dict(eager=eager, warm=dict(arm="warm", error="boom")), 64) == "INVALID"
+    base = ["--out", "o", "--nosi-pkg", "n", "--v3", "a", "--v3-build", "/b", "--v2", "c", "--v2-build", "/d"]
+    a = G.parse_args(base + ["--cell", "gfw1e", "--arm", "warm", "--arm-out", "/x.json"])
+    assert (a.cell, a.arm, a.arm_out) == ("gfw1e", "warm", "/x.json") and G.ARMS_1E == ("eager", "warm")
+    with pytest.raises(SystemExit):
+        G.parse_args(base + ["--arm", "cold"])
+    src = (EFF / "r2_gfw_gate.py").read_text()
+    assert src.index("if a.arm:") < src.index("if os.path.exists(a.out):")             # the child before the check
+    for need in ('if ready and a.cell == "gfw1e":', "subprocess.run(cmd, env=child_env_1e(os.environ, arm), timeout=600)",
+                 'gates.append(gate("R_GFW1e_" + arm, arm_ok_1e(r, a.launches_few), False',
+                 'gates.append(gate("R_GFW1e", v == "HELD", False', "torch.cuda.init()", "wx.add_(1.0)",
+                 "with torch.cuda.stream(gf.scatter):", "wd.index_copy_(0,", "wb.index_put_((",
+                 'warm=(a.arm == "warm")', '"--arm", arm, "--arm-out", path'):
+        assert need in src, need
+    block = _registered((EFF / "r2_gfw_step.sh").read_text(), tag="GFW1E")
+    for frag in ("arm eager (CUDA_MODULE_LOADING=EAGER) and arm warm",
+                 "PREDICTION if CUDA's lazy module loading is the cause: both arms pass",
+                 "FALSIFIER: either arm ends at the spin's bound (err 1)"):
+        assert frag in block, frag
 
 
 def test_GFWC5_the_gfw1d_cell_is_report_only_and_registered():

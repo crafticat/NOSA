@@ -68,6 +68,7 @@ import argparse
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -75,7 +76,53 @@ import types
 
 REGISTERED = dict(pred_band=0.15, falsifier_ratio=1.30)
 REGISTERED2 = dict(desc_issue_pred_ms=1.0, desc_issue_fals_ms=5.0)
-CELLS = ("gfw1", "gfw2", "gfw1d")
+CELLS = ("gfw1", "gfw2", "gfw1d", "gfw1e")
+ARMS_1E = ("eager", "warm")
+# REGISTERED GFW1E (frozen 2026-10-21 before gfw1e; the step script's header holds the same block): GFW1's captured
+# protocol (64 launches behind the spin, no submission wait), each arm in a FRESH child process: (a) eager:
+# CUDA_MODULE_LOADING=EAGER in the child's environment; (b) warm: the default (lazy) loading, but before the spin one
+# add_ on the main stream and one index_copy_ + one board index_put_ on the scatter stream. gfw1d: the main thread's
+# own enqueue (64 launches) blocked as long as the spin (8584 / 8583 ms), and gfw1c's GFW1 failed as the FIRST arm
+# while GFW1e passed second. PREDICTION if CUDA's lazy module loading is the cause: BOTH arms pass (err 0, a real spin
+# > 10 ms, every launch ran, the rows the host truth). FALSIFIER: either arm ends at the spin's bound (err 1).
+REGISTERED1E = dict(env="CUDA_MODULE_LOADING", eager="EAGER")
+
+
+def child_env_1e(base, arm):
+    """The environment of gfw1e's child for `arm`: eager sets CUDA_MODULE_LOADING=EAGER; warm removes the variable
+    (torch then sets its own default at its CUDA init; the child records what it sees before and after)."""
+    if arm not in ARMS_1E:
+        raise ValueError("arm %r" % (arm,))
+    env = dict(base)
+    if arm == "eager":
+        env[REGISTERED1E["env"]] = REGISTERED1E["eager"]
+    else:
+        env.pop(REGISTERED1E["env"], None)
+    return env
+
+
+def arm_ok_1e(r, launches):
+    """One gfw1e arm passed: its environment as intended (eager: EAGER seen after torch's CUDA init), err 0, a real
+    spin, every launch ran, the rows the host truth, the T4 event pending at issue."""
+    if not r or "error" in r:
+        return False
+    if r.get("arm") == "eager" and r.get("module_loading_after") != REGISTERED1E["eager"]:
+        return False
+    return (r["err"] == 0 and r["spin_ms"] > 10.0 and r["launches_done"] == float(launches) and r["rows_ok"]
+            and r["t4_pending_at_issue"])
+
+
+def verdict_1e(results, launches):
+    """REGISTERED GFW1E: HELD = both arms passed; FALSIFIED = an arm with its intended environment ended at the spin's
+    bound (err 1); INVALID otherwise (an arm missing, failed, or not in its intended environment)."""
+    if all(arm_ok_1e(results.get(arm), launches) for arm in ARMS_1E):
+        return "HELD"
+    for arm in ARMS_1E:
+        r = results.get(arm) or {}
+        env_ok = arm != "eager" or r.get("module_loading_after") == REGISTERED1E["eager"]
+        if "error" not in r and r.get("err") == 1 and env_ok:
+            return "FALSIFIED"
+    return "INVALID"
 # REGISTERED GFW1D (frozen 2026-10-21 before gfw1d; the step script's header holds the same block): GFW1's captured
 # protocol (64 launches behind the spin, no submission wait) in a process with CUDA_DEVICE_MAX_CONNECTIONS=32.
 # PREDICTION if the shared hardware queue is the cause (gfw1c: GFW1 failed with only 64 launches, so not the launch
@@ -112,6 +159,8 @@ def parse_args(argv):
     ap.add_argument("--launches-few", type=int, default=64, help="GFW1: the captured tick's few launches behind the spin")
     ap.add_argument("--hazard-spin", type=int, default=1 << 20, help="R_GFW1x: the spin's bound (rounds)")
     ap.add_argument("--spin-cycles", type=int, default=200_000_000, help="the GPU sleep before the T4 event")
+    ap.add_argument("--arm", default="", choices=("",) + ARMS_1E, help=argparse.SUPPRESS)    # gfw1e's child
+    ap.add_argument("--arm-out", default="", help=argparse.SUPPRESS)
     ap.add_argument("--cell", default="gfw1", choices=CELLS,
                     help="gfw1: GFW1 / GFW1e / GFW1n / GFW_T; gfw2: GFW2 / GFW2n; gfw1d: R_GFW1d (REPORT only)")
     ap.add_argument("--takes", type=int, default=6496, help="gfw2: the takes of the tick (B2: ~6.49 k)")
@@ -209,9 +258,11 @@ def plan_ok(vecs, B=B_T, H=H_T, M=M_T, nblk=NBLK_T):
 
 
 # ------------------------------------------------------------------------------------------------ GFW1 / GFW1n
-def gfw1(GF, SCG, ext3, planted, max_spin, spin_cycles, launches, threads, wait_submission=False):
-    """GTG1 as a gate (module docstring: GFW1 / GFW1e / GFW1n / R_GFW1x). wait_submission: the host waits until the
-    job is submitted before the spin (GFW1e). Returns its observations."""
+def gfw1(GF, SCG, ext3, planted, max_spin, spin_cycles, launches, threads, wait_submission=False, warm=False):
+    """GTG1 as a gate (module docstring: GFW1 / GFW1e / GFW1n / R_GFW1x / gfw1e). wait_submission: the host waits until
+    the job is submitted before the spin (GFW1e). warm (gfw1e's arm b): before the spin, one add_ on the main stream and
+    one index_copy_ + one int64 index_put_ on the transport's scatter stream (the kernels the launches and the worker
+    use behind the spin), then a synchronize. Returns its observations."""
     import torch
     dev = torch.device("cuda")
     L, Bp, Hp, Dp, nblk, npos, BS = 2, 2, 2, 64, 16, 12, 64
@@ -234,6 +285,16 @@ def gfw1(GF, SCG, ext3, planted, max_spin, spin_cycles, launches, threads, wait_
     x = torch.zeros((), device=dev)
     kern = SCG._wait_kernel()
     kern[(1,)](board.t, torch.full_like(idx, -1), gen, idx.shape[0], err, max_spin, BLOCK=1024)   # compile, no spin
+    warmed = None
+    if warm:                                                   # gfw1e (b): the kernels behind the spin, loaded first
+        wx = torch.zeros((), device=dev)
+        wx.add_(1.0)                                           # the launches' kernel, on the main stream
+        with torch.cuda.stream(gf.scatter):                    # the worker's two kernels, on its scatter stream
+            wd = torch.zeros(2 * BS, Dp, device=dev)
+            wd.index_copy_(0, torch.arange(BS, device=dev), torch.ones(BS, Dp, device=dev))
+            wb = torch.zeros(8, dtype=torch.int64, device=dev)
+            wb.index_put_((torch.tensor([1, 2], device=dev),), torch.tensor([3, 4], device=dev))
+        warmed = "add_ (main); index_copy_ float32 + index_put_ int64 (scatter)"
     torch.cuda.synchronize()                                   # BEFORE the sleep: the T4 event must be pending
     side = torch.cuda.Stream()
     with torch.cuda.stream(side):
@@ -274,7 +335,8 @@ def gfw1(GF, SCG, ext3, planted, max_spin, spin_cycles, launches, threads, wait_
                 issue_ms=round(issue_ms, 3), enqueue_ms=round(enqueue_ms, 3), launches=int(launches),
                 wait_submission=bool(wait_submission),
                 submission_wait_ms=None if submission_wait_ms is None else round(submission_wait_ms, 3),
-                board=[int(v) for v in board.t.view(-1)[idx].tolist()], want=[int(v) for v in gen.tolist()])
+                warmed=warmed, board=[int(v) for v in board.t.view(-1)[idx].tolist()],
+                want=[int(v) for v in gen.tolist()])
 
 
 # ------------------------------------------------------------------------------------------------ GFW_T
@@ -506,9 +568,34 @@ def gfw2(GF, SCG, ext3, a):
     return out
 
 
+def run_arm_1e(a) -> int:
+    """gfw1e's CHILD (a fresh process, its environment from child_env_1e): records CUDA_MODULE_LOADING before torch is
+    imported and after torch's CUDA init, runs ONE arm of GFW1's captured protocol (eager: as is; warm: with the
+    warm-up), and writes its observations to --arm-out (the parent reads them)."""
+    out = dict(arm=a.arm, module_loading_before=os.environ.get(REGISTERED1E["env"]))
+    try:
+        import torch
+        torch.cuda.init()                                      # torch sets its default here when the variable is unset
+        out["module_loading_after"] = os.environ.get(REGISTERED1E["env"])
+        GF, SCG = load_nosi(a.nosi_pkg)
+        gp3 = by_path(os.path.join(a.v3, "gilfree_pack.py"), "gilfree_pack_v3_gate")
+        ext3 = gp3.load(a.v3_build)                            # the parent built it: loaded, not rebuilt
+        r = gfw1(GF, SCG, ext3, False, 1 << 24, a.spin_cycles, a.launches_few, a.threads, wait_submission=False,
+                 warm=(a.arm == "warm"))
+        r.update(out)
+        out = r
+    except Exception as e:
+        traceback.print_exc()
+        out["error"] = "%s: %s" % (type(e).__name__, str(e)[:400])
+    json.dump(out, open(a.arm_out, "w"), indent=1, sort_keys=True, default=str)
+    return 0 if "error" not in out else 1
+
+
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     a = parse_args(argv)
+    if a.arm:                                                  # gfw1e's child (its --out is the parent's)
+        return run_arm_1e(a)
     if os.path.exists(a.out):
         print("REFUSED: --out %s exists" % a.out, file=sys.stderr)
         return 2
@@ -516,7 +603,8 @@ def main(argv=None) -> int:
         os.makedirs(a.out)
         gates, res = [], {}
         meta = dict(args=vars(a), commit=os.environ.get("GFW_COMMIT", "unknown"), registered=REGISTERED,
-                    registered2=REGISTERED2, v2_record=V2_RECORD, cell=a.cell)
+                    registered2=REGISTERED2, v2_record=V2_RECORD, cell=a.cell,
+                    cuda_module_loading_at_start=os.environ.get(REGISTERED1E["env"]))
 
         def save():
             json.dump(dict(meta=meta, gates=gates, results=res), open(os.path.join(a.out, "summary.json"), "w"),
@@ -525,7 +613,8 @@ def main(argv=None) -> int:
         if not torch.cuda.is_available():
             raise SystemExit("REFUSED: no CUDA device")
         meta.update(torch=torch.__version__, gpu=torch.cuda.get_device_name(0),
-                    cuda_device_max_connections=os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS"))
+                    cuda_device_max_connections=os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS"),
+                    cuda_module_loading_after_init=os.environ.get(REGISTERED1E["env"]))
         GF, SCG = load_nosi(a.nosi_pkg)
         ext3 = ext2 = None
         try:
@@ -543,6 +632,34 @@ def main(argv=None) -> int:
             ready, detail = False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:400])
         gates.append(gate("GFW_ready", ready, True, detail))
         save()
+        if ready and a.cell == "gfw1e":                        # REPORT only: the lazy-module-loading hypothesis
+            res["R_GFW1e"] = {}
+            for arm in ARMS_1E:
+                log("R_GFW1e_%s (a fresh process)" % arm)
+                path = os.path.join(a.out, "arm_%s.json" % arm)
+                cmd = [sys.executable, os.path.abspath(__file__)] + list(argv) + ["--arm", arm, "--arm-out", path]
+                t0 = time.time()
+                try:
+                    p = subprocess.run(cmd, env=child_env_1e(os.environ, arm), timeout=600)
+                    r = json.load(open(path)) if os.path.exists(path) else dict(arm=arm, error="no result")
+                    r["child_exit"] = p.returncode
+                except Exception as e:
+                    traceback.print_exc()
+                    r = dict(arm=arm, error="%s: %s" % (type(e).__name__, str(e)[:300]))
+                r["child_wall_s"] = round(time.time() - t0, 1)
+                res["R_GFW1e"][arm] = r
+                gates.append(gate("R_GFW1e_" + arm, arm_ok_1e(r, a.launches_few), False, (
+                    "CUDA_MODULE_LOADING before torch %r, after its CUDA init %r; err %s, launches %s/%d, spin %s ms "
+                    "(bound %d), rows %s, T4 pending at issue %s, enqueue %s ms, warm-up %s; child exit %s, %s s%s" % (
+                        r.get("module_loading_before"), r.get("module_loading_after"), r.get("err"),
+                        r.get("launches_done"), a.launches_few, r.get("spin_ms"), 1 << 24, r.get("rows_ok"),
+                        r.get("t4_pending_at_issue"), r.get("enqueue_ms"), r.get("warmed"), r.get("child_exit"),
+                        r.get("child_wall_s"), ("; ERROR " + r["error"]) if "error" in r else ""))))
+                save()
+            v = verdict_1e(res["R_GFW1e"], a.launches_few)
+            gates.append(gate("R_GFW1e", v == "HELD", False, "%s: REGISTERED GFW1E (lazy module loading is the cause: "
+                                                           "both arms pass)" % v))
+            save()
         if ready and a.cell == "gfw1d":                        # REPORT only: the shared-hardware-queue hypothesis
             log("R_GFW1d")
             env = os.environ.get(REGISTERED1D["env"])
