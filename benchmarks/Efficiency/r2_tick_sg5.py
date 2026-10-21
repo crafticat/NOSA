@@ -390,25 +390,28 @@ def arm_layout(a, layout=None):                                                 
     return "pool" if lay == "both" else lay
 
 
-def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=None, transport=None, layout=None):
+def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=None, transport=None, layout=None,
+                engine_kw=None):
     """A fresh engine on the Residency layout with its service and gilfree transport (module docstring). [xpool]
     layout (default --layout): "pool" builds the shared-pool store (sc / b2 only) and hands its XPool to the
-    transports and the service."""
+    transports and the service. engine_kw: extra TickEngine arguments through from_r2 (the context sweep's tick
+    family passes log_slots); None = as before."""
     import torch
     from nosi.r2_residency import Residency, TorchGather
     from nosi.r2_residency_sb import ResidencySB
     from nosi.r2_residency_sc import CudaDeviceOps, ResidencySC
     from nosi.r2_tick import ResidencyBackend, TickEngine, TickTimer
     from nosi.r2_transport_gilfree import GilfreeTransport
+    ekw = dict(engine_kw or {})
     xspec = None                                                                                 # [xpool]
     if arm_layout(a, layout) == "pool":                                                          # [xpool]
         if kind not in XPOOL_BACKENDS:                                                           # [xpool]
             raise RuntimeError("the shared pool runs on %s only (got %s)" % (XPOOL_BACKENDS, kind))
         xspec = (C, pool_positions(a, X))                                                        # [xpool]
     if xspec is None:                                                                            # the default layout
-        eng = TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin)           # [twin-variant]
+        eng = TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin, **ekw)    # [twin-variant]
     else:                                                                                        # [xpool]
-        eng = TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin, xpool=xspec)
+        eng = TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin, xpool=xspec, **ekw)
     eng.rebuild = getattr(a, "rebuild", "per_call")         # [batched-rebuild] the arm's rebuild (parse_variants checks)
     B, L, H = eng.B, eng.L, eng.H
     xp = eng.xpool                                                                               # [xpool] or None
