@@ -14,6 +14,7 @@ import ast
 import functools
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import types
@@ -1287,3 +1288,49 @@ def test_T20_the_sweep_runs_on_the_first_backend_that_passed_its_preflight():
     for name in ("run_sweep", "main"):
         fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == name)
         assert "a.backends[0]" not in ast.get_source_segment(src, fn), name
+
+
+def test_T21_sc_counters_are_a_report_only_snapshot(p3):
+    """T21 (REPORT only, analysis/sg5_p4/RES_SC.md section 6): sc_counters reads the service's OWN counters after a
+    run. S-C on the CPU stand-in after 6 draft-only ticks: mirror_uploads >= 1 and mirror_slots_uploaded > 0, equal to
+    the service's attributes; row_uploads = one per tick; journal_counts holds the takes; devops = CpuDeviceSim's
+    waited / gathered. Behind _LazyOps (the GPU path) it reads CudaDeviceOps' events_waited / submission_waits. v1 and
+    sb: None. Negative controls: a planted change of the live counters shows in a new read (it reads the live values)
+    and not in the earlier snapshot (it copies, journal_counts included). Static: one_point stores it as
+    draft_only["sc"] and residency["sc"]; sc_counters makes no gate (no GB.gate / gates in its source) and one_point's
+    gate names are unchanged."""
+    G = _sg5_gate()
+    eng = make_res_engine(make_ops(p3), kind="sc")
+    eng.timer = TK.TickTimer(cuda=False)
+    G.run_draft_only(eng, FIRST, 6, 3)
+    svc = eng.res_world.svc
+    c = G.sc_counters(svc)
+    assert c["service"] == "ResidencySC" and c["mirror_uploads"] >= 1
+    assert c["mirror_slots_uploaded"] == svc.mirror_slots_uploaded > 0 and c["mirror_uploads"] == svc.mirror_uploads
+    assert c["row_uploads"] == svc.row_uploads == 6                     # ONE row copy per tick (_tick_rows)
+    assert c["journal_counts"] == dict(svc.journal_counts) and c["journal_counts"].get("take", 0) > 0
+    assert c["devops"]["kind"] == "CpuDeviceSim" and set(c["devops"]) >= {"waited", "gathered"}
+    svc.mirror_slots_uploaded += 7                                       # NEGATIVE CONTROL: planted live changes
+    svc.journal_counts["take"] = svc.journal_counts["take"] + 1
+    c2 = G.sc_counters(svc)
+    assert c2["mirror_slots_uploaded"] == c["mirror_slots_uploaded"] + 7
+    assert c2["journal_counts"]["take"] == c["journal_counts"]["take"] + 1
+    assert c["mirror_slots_uploaded"] == svc.mirror_slots_uploaded - 7   # the snapshot did not move
+    lazy = G._LazyOps()
+    lazy.impl = SimpleNamespace(events_waited=5, submission_waits=2)
+    fake = SimpleNamespace(mirror_uploads=3, mirror_slots_uploaded=40, row_uploads=3, journal_counts={"touch": 9},
+                           dev=lazy)
+    assert G.sc_counters(fake)["devops"] == dict(events_waited=5, submission_waits=2, kind="SimpleNamespace")
+    for kind in ("v1", "sb"):
+        e2 = make_res_engine(make_ops(p3), kind=kind)
+        assert G.sc_counters(e2.res_world.svc) is None, kind
+    src = (EFF / "r2_tick_sg5.py").read_text()
+    tree = ast.parse(src)
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "sc_counters")
+    seg = ast.get_source_segment(src, fn)
+    assert "GB.gate" not in seg and "gates" not in seg
+    op = ast.get_source_segment(src, next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                                           and n.name == "one_point"))
+    assert 'info["draft_only"]["sc"] = sc_counters(svc)' in op and "sc=sc_counters(svc)" in op
+    names = sorted(set(re.findall(r'GB\.gate\("%s_([a-z_]+)"', op)))
+    assert names == ["bookkeeping", "completed", "gilfree_team"], names

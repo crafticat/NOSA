@@ -364,6 +364,31 @@ def budget(rnd_sum, d_sum):
     return out
 
 
+SC_COUNTERS = ("mirror_uploads", "mirror_slots_uploaded", "row_uploads")   # ResidencySC's own (r2_residency_sc.py)
+DEV_COUNTERS = ("events_waited", "submission_waits", "waited", "gathered")  # CudaDeviceOps; CpuDeviceSim (CPU tests)
+
+
+def sc_counters(svc):
+    """REPORT only (no gate; analysis/sg5_p4/RES_SC.md section 6): a SNAPSHOT of the counters the service itself
+    keeps, read once after its run: mirror_uploads (the host-to-device mirror deltas), mirror_slots_uploaded (the slot
+    records in them), row_uploads, journal_counts (the stream transitions per kind), and its device operations' wait
+    counters (devops: events_waited / submission_waits of CudaDeviceOps behind _LazyOps; waited / gathered of the CPU
+    stand-in), each with the object's class name. Cumulative over the service's life (the draft-only engine: its
+    --draft-ticks ticks, tick 0 included; the round: every tick). None for a service that keeps none of them (sb,
+    v1); a subclass of S-C (e.g. b2) reports whichever it has."""
+    out = {k: int(getattr(svc, k)) for k in SC_COUNTERS if hasattr(svc, k)}
+    if hasattr(svc, "journal_counts"):
+        out["journal_counts"] = {str(k): int(v) for k, v in dict(svc.journal_counts).items()}
+    dev = getattr(svc, "dev", None)
+    dev = getattr(dev, "impl", dev)                                 # _LazyOps -> its CudaDeviceOps
+    d = {k: int(getattr(dev, k)) for k in DEV_COUNTERS if dev is not None and hasattr(dev, k)}
+    if d:
+        out["devops"] = dict(d, kind=type(dev).__name__)
+    if out:
+        out["service"] = type(svc).__name__
+    return out or None
+
+
 def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_shipped, gates, label, bare=False):
     import torch
     from nosi.r2_tick import run_round
@@ -374,6 +399,7 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
         run_draft_only(eng, first, a.draft_ticks, a.K)
         info["draft_only"] = summarize(eng.timer.report())
         info["draft_only"]["d2h_reads"] = getattr(svc, "d2h_reads", None)
+        info["draft_only"]["sc"] = sc_counters(svc)                    # REPORT (RES_SC.md 6)
     finally:
         tp.close()
         del eng, svc, tp
@@ -403,7 +429,8 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
                                    refused=svc.metrics.refused, masked=svc.metrics.masked,
                                    draft_pairs=svc.metrics.draft_pairs,
                                    masked_fraction=svc.metrics.masked / max(1, svc.metrics.draft_pairs),
-                                   counts=dict(svc.metrics.counts), d2h_reads=getattr(svc, "d2h_reads", None)),
+                                   counts=dict(svc.metrics.counts), d2h_reads=getattr(svc, "d2h_reads", None),
+                                   sc=sc_counters(svc)),                 # REPORT (RES_SC.md 6)
                     transport=dict(tp.stats), threads_ok=tp.threads_ok())
         try:
             info["residency"]["report"] = svc.report()
