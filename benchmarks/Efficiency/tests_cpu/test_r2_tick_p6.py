@@ -9,8 +9,9 @@ The world is the SG5 tick's (test_r2_tick.py: the tiny model, piece 3 v2, make_e
   P6b  the SG5-shaped rounds with rebuild="batched" == rebuild="per_call", bitwise every tick (rows, live logits,
        argmax, twin counters) and at the end (every twin table, the stores, the token log, the committed tokens):
        teacher-forced on the ResidentStore and on v1 / sb / sc / b2, free-running on b2. Precondition: a tick published
-       two or more requests. NEGATIVE CONTROL: the swap planted in the engine's batched call differs, first at or after
-       the tick after its first tick with two or more publications.
+       two or more requests. NEGATIVE CONTROL: ONE swap planted in the engine's batched call, at the first tick whose
+       two publications' replay rows differ (precondition, L34), changes the twin tables (planted != clean on copies)
+       and is caught, with the twin tables recorded every tick, first at or after the tick after the plant.
   P6c  (the Triton interpreter, a child process) the free-running round on b2 with twin "fused" and rebuild "batched" ==
        twin "torch" and rebuild "per_call", bitwise (rows, argmax, twin counters every tick, committed tokens, decision
        counts, tables); PLANT 2 in the fused path effective and caught.
@@ -100,11 +101,74 @@ def test_P6a_batched_rebuild_equals_the_checked_per_call_path():
 # =====================================================================================================================
 # P6b
 # =====================================================================================================================
+def _copy_twin(t):
+    """An independent copy of a twin's tables and counters (TickEngine.clone's copy), same mean_fn."""
+    c = TW.PositionalTwin(t.B, t.H, t.D, t.lk_max, t.n_max, dtype=t.ring.dtype, device=t.pos.device)
+    for k in TWIN_KEYS + ("overflow",):
+        if hasattr(t, k) and hasattr(c, k):
+            getattr(c, k).copy_(getattr(t, k))
+    c.mean_fn = t.mean_fn
+    return c
+
+
+def _replay_rows(twin, B, b, p, d):
+    """Draft bank B + b's own unverified rows [p, d) (rebuild_banks_unchecked's gather, before the sync)."""
+    idx = torch.arange(int(p), int(d), dtype=torch.int64, device=twin.pos.device)
+    return twin.ring[B + b, idx % TK.BLOCK], twin.total_cis[B + b, idx]
+
+
+def _first_rows(x, n):
+    """The first n rows of x, zero-padded (rebuild_banks_unchecked pads every item's rows to T with zeros)."""
+    if x.shape[0] >= n:
+        return x[:n]
+    return torch.cat([x, torch.zeros((n - x.shape[0],) + tuple(x.shape[1:]), dtype=x.dtype, device=x.device)])
+
+
+def _swap_changes(twin, B, it0, it1):
+    """PRECONDITION (L34): the swap of items it0 = (b0, p0, d0) and it1 feeds bank B + b0 the first n0 rows of it1's
+    (zero-padded) rows and bank B + b1 the first n1 of it0's (the counts stay each bank's own: cnt is the unswapped hn).
+    True iff either bank then gets a key or cis row that is not its own."""
+    (b0, p0, d0), (b1, p1, d1) = it0, it1
+    n0, n1 = int(d0) - int(p0), int(d1) - int(p1)
+    k0, c0 = _replay_rows(twin, B, b0, p0, d0)
+    k1, c1 = _replay_rows(twin, B, b1, p1, d1)
+    same = (torch.equal(_first_rows(k1, n0), k0) and torch.equal(_first_rows(c1, n0), c0)
+            and torch.equal(_first_rows(k0, n1), k1) and torch.equal(_first_rows(c0, n1), c1))
+    return not same
+
+
 class SwapEngine(TK.TickEngine):
-    """NEGATIVE CONTROL: the batched call with the first two banks' rows exchanged."""
+    """NEGATIVE CONTROL: ONE batched call with two banks' replay rows exchanged (rebuild_banks_unchecked swap=True), at
+    the first call with two publications whose exchange changes a bank's rows (precondition, L34; the pair goes first
+    in pub, since the swap exchanges the first two items; the banks are independent, so the order alone changes
+    nothing: P6a). The plant is checked against a clean rebuild of copies of the twins (planted != clean).
+    seen: (tick, [(bank, replay rows)], the exchange of pub's FIRST two items changes rows) of every call with two or
+    more publications up to the plant (the diagnosis of the old always-on control's no-op)."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.plant = None
+        self.seen = []
 
     def _publish_batched(self, pub, swap=False):
-        super()._publish_batched(pub, swap=True)
+        if self.plant is not None or len(pub) < 2:
+            return super()._publish_batched(pub)
+        B, tick = self.B, self.stats["ticks"] - 1
+        items = [(b, p, self.bank_pos[B + b]) for b, p in pub.items()]
+
+        def changes(i, j):
+            return any(_swap_changes(t, B, items[i], items[j]) for t in self.twins)
+        self.seen.append((tick, [(b, d - p) for (b, p, d) in items], changes(0, 1)))
+        pair = next(((i, j) for i in range(len(items)) for j in range(i + 1, len(items)) if changes(i, j)), None)
+        if pair is None:
+            return super()._publish_batched(pub)
+        order = [pair[0], pair[1]] + [k for k in range(len(items)) if k not in pair]
+        clean = [_copy_twin(t) for t in self.twins]                 # BEFORE the plant
+        super()._publish_batched({items[k][0]: items[k][1] for k in order}, swap=True)
+        for c in clean:
+            TK.rebuild_banks_unchecked(c, [items[k] for k in order], B)
+        self.plant = dict(tick=tick, items=[items[k] for k in order[:2]],
+                          effective=not all(_same_twin(c, t) for c, t in zip(clean, self.twins)))
 
 
 def _probe(eng):
@@ -119,7 +183,7 @@ def _probe(eng):
     return calls
 
 
-def _record(eng, toks, forced=True, catch=False):
+def _record(eng, toks, forced=True, catch=False, tables=False):
     S_list = eng.S_list
     ticks = []
 
@@ -129,6 +193,8 @@ def _record(eng, toks, forced=True, catch=False):
     def on_tick(rows, tokens, out):
         ticks.append(dict(rows=[(r.b, r.kind, r.pos) for r in rows], logits=out.logits.clone(), arg=out.argmax.clone(),
                           ctr=torch.stack([torch.stack((t.pos, t.n_comp, t.n_ccis, t.epoch)) for t in eng.twins])))
+        if tables:                                                     # the negative control: every twin table
+            ticks[-1]["tab"] = [getattr(t, k).clone() for t in eng.twins for k in TWIN_KEYS]
     reject_at = TK.forced_schedule(3)[0] if forced else None
     rec = dict(ticks=ticks, error=None, eng=eng)
     try:
@@ -154,6 +220,8 @@ def _first_diff(a, b):
         for k in ("logits", "arg", "ctr"):
             if not torch.equal(x[k], y[k]):
                 return t, k
+        if "tab" in x and "tab" in y and not all(torch.equal(u, v) for u, v in zip(x["tab"], y["tab"])):
+            return t, "twin tables"
     n = min(len(a["ticks"]), len(b["ticks"]))
     if len(a["ticks"]) != len(b["ticks"]) or a["error"] or b["error"]:
         return n, "tick count %d / %d, errors %s / %s" % (len(a["ticks"]), len(b["ticks"]), a["error"], b["error"])
@@ -187,12 +255,18 @@ def test_P6b_batched_rounds_equal_per_call_rounds(p3, ref, kind, forced):
     assert eng.stats["rollbacks"] == per["eng"].stats["rollbacks"] and not eng.mirror_failures()
     if kind != "resident" or not forced:
         return
-    bad = TT.make_engine(TT.make_ops(p3), draft_drop=0.5, cls=SwapEngine, rebuild="batched")   # NEGATIVE CONTROL
-    sc = _probe(bad)
-    rb = _record(bad, toks, forced, catch=True)
-    t0 = next(t for t, n in sc if n >= 2)
-    fd = _first_diff(per, rb)
-    assert fd is not None and fd[0] >= t0 + 1, (fd, t0)                            # caught, never before the plant
+    # NEGATIVE CONTROL (L34): the old always-on swap of pub's first two items was a no-op on this data (job 2191107)
+    per_t = _record(_engine(p3, kind), toks, forced, tables=True)                 # the clean run, tables every tick
+    assert _first_diff(per, per_t) is None, _first_diff(per, per_t)
+    bad = TT.make_engine(TT.make_ops(p3), draft_drop=0.5, cls=SwapEngine, rebuild="batched")
+    rb = _record(bad, toks, forced, catch=True, tables=True)
+    print("P6b control: calls with >= 2 publications (tick, [(bank, replay rows)], pub's first two exchange rows): "
+          "%s; plant %s" % (bad.seen, bad.plant))
+    assert bad.plant is not None, ("precondition: no tick published two banks with different replay rows", bad.seen)
+    assert bad.plant["effective"], ("precondition: the plant left every twin table as the clean rebuild", bad.plant)
+    t0 = bad.plant["tick"]
+    fd = _first_diff(per_t, rb)
+    assert fd is not None and fd[0] >= t0 + 1, (fd, t0, bad.plant)              # caught, never before the plant
 
 
 # =====================================================================================================================
