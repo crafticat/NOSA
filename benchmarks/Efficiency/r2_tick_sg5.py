@@ -90,6 +90,8 @@ def parse_args(argv):
     ap.add_argument("--bare", action="store_true", help="also each round with the tick events only")
     ap.add_argument("--preflight-steps", type=int, default=4,
                     help="PREFLIGHT: a short round per backend and transport before the long arms (0: none)")
+    ap.add_argument("--twin", default="torch", choices=("torch", "fused"),                       # [twin-variant]
+                    help="the twins' unchecked step: torch ops (default) or r2_twin_fused (one kernel per layer)")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -277,7 +279,7 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
     from nosi.r2_residency_sc import CudaDeviceOps, ResidencySC
     from nosi.r2_tick import ResidencyBackend, TickEngine, TickTimer
     from nosi.r2_transport_gilfree import GilfreeTransport
-    eng = TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X)
+    eng = TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin)               # [twin-variant]
     B, L, H = eng.B, eng.L, eng.H
     host_k = [lay.cache_engine._k_cpu for lay in cache.layers]
     host_v = [lay.cache_engine._v_cpu for lay in cache.layers]
@@ -527,6 +529,7 @@ def main(argv=None) -> int:
             ext = gp.load(a.gilfree_build)
             meta["gilfree_openmp"] = int(getattr(ext, "OPENMP", 0))
         meta["transport"] = a.transport
+        meta["twin"] = a.twin                                                                  # [twin-variant]
         t0 = time.time()
         model = Llama(model_name=a.model, device="cuda", offload=True)
         log("model loaded in %.0f s" % (time.time() - t0))

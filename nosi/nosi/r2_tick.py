@@ -92,6 +92,7 @@ from .r2_decode_path import R2Error
 from .r2_positional_twin import BLOCK, PositionalTwin
 
 RING_EXACT, RING_DRAFT = 0, 2              # ring page offsets past the NB historical slots
+TWIN_VARIANTS = ("torch", "fused")         # [twin-variant] TickEngine(twin=...): the twins' unchecked step
 FIELDS = ("pos", "b", "bank", "u", "ring_row", "prev_slot", "tail_slot", "draft", "lit", "slot")
 
 
@@ -271,13 +272,16 @@ class TickEngine:
     store_k / store_v (B, (NB + 4) * 64, Hkv, D) and store_bias (B, (NB + 4) * 64, Hkv) per layer. S_list: the prompt
     lengths. M_alloc: the pooled width of the run (the BI serial decode's). nl, stage1, pool: the nosa_llama ops, the
     stage-1 call and the pooling (defaults: the CUDA ones; the CPU tests pass torch stand-ins). check: host checks of
-    the selection's last two blocks (T - 1, T) every layer (tests and gates; one read per layer)."""
+    the selection's last two blocks (T - 1, T) every layer (tests and gates; one read per layer).
+    twin ([twin-variant]): "torch" (the default, unchanged) or "fused": every twin's step_unchecked / advance_unchecked
+    is bound on the instance to r2_twin_fused (ONE Triton kernel per layer, bitwise with ops.mean = fixed_order_mean);
+    the call sites are unchanged."""
 
     LOG = 1 << 16
 
     def __init__(self, model, ops, twins: List[PositionalTwin], store_k, store_v, store_bias, S_list, M_alloc: int,
                  nl=None, stage1=None, pool=None, select=SC.select_blocks, draft_drop: float = 0.0, drop_seed: int = 0,
-                 check: bool = False):
+                 check: bool = False, twin: str = "torch"):                                     # [twin-variant]
         self.model, self.ops = model, ops
         self.nl = nl if nl is not None else default_nl()
         if stage1 is None or pool is None:
@@ -306,6 +310,16 @@ class TickEngine:
             raise TickError("S_list needs %d lengths" % self.B)
         for t in self.twins:
             t.mean_fn = ops.mean
+        if twin not in TWIN_VARIANTS:                                                           # [twin-variant]
+            raise TickError("twin must be one of %s (got %r)" % (TWIN_VARIANTS, twin))          # [twin-variant]
+        self.twin_variant = twin                                                                # [twin-variant]
+        if twin == "fused":                                                                     # [twin-variant]
+            from . import r2_twin_fused                                                         # [twin-variant]
+            for t in self.twins:                                                                # [twin-variant]
+                try:                                                                            # [twin-variant]
+                    r2_twin_fused.attach(t)                                                     # [twin-variant]
+                except ValueError as e:                                                         # [twin-variant]
+                    raise TickError("twin 'fused': %s" % e)                                     # [twin-variant]
         self.draft_drop = float(draft_drop)
         if not 0.0 <= self.draft_drop < 1.0:
             raise TickError("draft_drop in [0, 1)")
@@ -429,7 +443,7 @@ class TickEngine:
                 getattr(c, name).copy_(getattr(t, name))
             twins.append(c)
         args = dict(nl=self.nl, stage1=self.stage1, pool=self.pool, select=self.select, draft_drop=self.draft_drop,
-                    drop_seed=self.drop_seed, check=self.check)
+                    drop_seed=self.drop_seed, check=self.check, twin=self.twin_variant)                 # [twin-variant]
         args.update(kw)
         return type(self)(self.model, ops if ops is not None else self.ops, twins, [x.clone() for x in self.store_k],
                           [x.clone() for x in self.store_v], [x.clone() for x in self.store_bias], self.S_list,
