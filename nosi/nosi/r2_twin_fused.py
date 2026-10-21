@@ -116,7 +116,9 @@ if triton is not None:
             a = act & (bad == 0)
             wk = due_k & a
             wc = due_c & a
-            tl.store(ovf_ptr + hh * 0, tl.full([HP], 1, tl.uint8), mask=(hh == 0) & bad)
+            # a 2-lane vector store of one value (never a scalar mask: the interpreter stores through a False one)
+            ln = tl.arange(0, 2)
+            tl.store(ovf_ptr + ln * 0, tl.full([2], 1, tl.uint8), mask=(ln == 0) & bad)
             # ---- loads (state BEFORE this step)
             k0 = STRC * nk
             if PLANT == 1:

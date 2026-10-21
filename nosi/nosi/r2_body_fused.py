@@ -55,6 +55,10 @@ if triton is not None:
                      TOPK: tl.constexpr, BS: tl.constexpr, F4FIX: tl.constexpr, ERR_POS: tl.constexpr,
                      PLANT: tl.constexpr):
         b = tl.program_id(0).to(tl.int64)
+        # ln: a 2-lane vector for the masked stores of ONE value. A scalar mask must not be used: the Triton
+        # interpreter's store reads `if not mask` on its scalar mask, so a False scalar mask stores anyway (CPU job
+        # 2190958, F3: an inactive request's _cache_lens overwritten); the compiled kernel is not affected.
+        ln = tl.arange(0, 2)
         lanes = tl.arange(0, BP)
         ml = lanes < B
         pa = tl.load(pos_ptr + lanes, mask=ml, other=0)
@@ -62,7 +66,7 @@ if triton is not None:
         badv = aa & ((pa < 0) | (pa >= limit))
         any_bad = tl.max(badv.to(tl.int32), axis=0)                       # 0 or 1
         e = tl.load(err_ptr)
-        tl.store(err_ptr, e | (any_bad * ERR_POS), mask=b == 0)
+        tl.store(err_ptr + ln * 0, (e | (any_bad * ERR_POS)) + ln * 0, mask=(ln == 0) & (b == 0))
         p = tl.load(pos_ptr + b)
         act = (tl.load(act_ptr + b) != 0) & (any_bad == 0)
         hh = tl.arange(0, HP).to(tl.int64)
@@ -103,7 +107,7 @@ if triton is not None:
             val = base_len + p % BS + 1
         else:
             val = base_len + (p + 1) % BS
-        tl.store(lens_ptr + b, val.to(tl.int32), mask=act)
+        tl.store(lens_ptr + b + ln * 0, val.to(tl.int32) + ln * 0, mask=(ln == 0) & act)
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
