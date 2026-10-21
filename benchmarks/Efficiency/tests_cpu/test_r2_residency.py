@@ -2450,3 +2450,107 @@ def test_R6c_the_fixtures_plant_every_review_kind():
     assert sorted(_FX_PLANT_KW) == sorted(p.name for _, p in plants)
     assert all(p.world in fx.worlds for fx, p in plants)
     assert all(fx.worlds[0] in _FX_BASE for fx in FXM.FIXTURES.values())
+
+
+# =====================================================================================================================
+# F24 T4 on the GPU path: the main stream waits every registered write-back before the urgent gather (TC-R review 5.1)
+# =====================================================================================================================
+class _MainStream:
+    """The stand-in of torch.cuda.current_stream() for CudaDeviceOps on the CPU: it logs each wait_event."""
+
+    def __init__(self, log):
+        self.log = log
+
+    def wait_event(self, ev):
+        self.log.append(("wait", ev))
+
+
+class NoHistProducer(SC.ResidencySC):
+    """DEFECT (the code before F24): history_written registers the event for the takes (hist_ev) only; the main
+    stream's wait list (_hist_unwaited) never gets it."""
+
+    def history_written(self, uid, block, ev):
+        RES.Residency.history_written(self, uid, block, ev)
+
+
+def _cuda_ops_on_cpu(svc, w, log):
+    """CudaDeviceOps (superset wait) without its GPU kernels: the K / bias and V copies by the load ids are CPU copies,
+    each logged after the waits that precede it (the order of the main stream)."""
+    ops = object.__new__(SC.CudaDeviceOps)
+    ops.svc, ops.bs = svc, BS
+    ops.host_k, ops.host_v, ops.store_k, ops.store_v = w.host_k, w.host_v, w.store_k, w.store_v
+    ops.store_b, ops.cis = w.store_b, w.cis
+    ops.wait_mode, ops.max_spin = "superset", 1
+    ops.err = torch.zeros((), dtype=torch.int32)
+    ops.events_waited = ops.submission_waits = 0
+
+    def copy(dst, src, ids, what):
+        for h, per_b in enumerate(ids.tolist()):
+            for b, per_m in enumerate(per_b):
+                for m, t in enumerate(per_m):
+                    if t >= 0:
+                        dst[b, m * BS:(m + 1) * BS, h] = src[b, t * BS:(t + 1) * BS, h]
+                        log.append((what, b, h, m, t))
+
+    def h2d_bias(sk, hk, sb, cis, ids, bs):
+        copy(sk, hk, ids, "k")
+        copy(sb, cis, ids, "bias")
+
+    def h2d(sv, hv, ids, bs):
+        copy(sv, hv, ids, "v")
+    ops.h2d_bias, ops.h2d = h2d_bias, h2d
+    return ops
+
+
+def _f24(cls, monkeypatch):
+    """u0's prefill wrote blocks 0-3 (hist_blocks 4). Block 5 was written back to the host rows with an event wb that
+    was recorded on ANOTHER stream (pending here). Then a verify row misses block 5 (an urgent gather) on the GPU path
+    (_cuda_ops_on_cpu). Returns the main stream's log (waits and copies, in order), wb and the world."""
+    w = world(C=4, X=4, R_ver=1, cls=cls, svc_kw=dict(nblk=NB))
+    svc = w.svc
+    log = []
+    svc.dev = _cuda_ops_on_cpu(svc, w, log)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a, **k: _MainStream(log))
+    svc.begin_request(0, "u0", hist_blocks=4)
+    wb = Ev()
+    svc.history_written("u0", 5, wb)
+    svc.poll()
+    rows = [Row(0, "v", ("u0", 1, 1), 300, 10)]
+    for l in range(L):
+        p = svc.resolve(l, rows, S([[5], []]))
+        svc.read_done(l, p, Ev(done=True))
+    svc.end_tick()
+    return log, wb, w
+
+
+def test_F24_the_main_stream_waits_every_registered_write_back_before_the_urgent_gather(monkeypatch):
+    """F24 (TC-R review note 5.1): history_written puts the write-back's event on S-C's main-stream wait list
+    (_hist_unwaited). The GPU gather (CudaDeviceOps.gather, here with CPU copies and a logging stand-in of the main
+    stream) waits on it ONCE, BEFORE its first copy, also when the write-back ran on another stream (the event is
+    pending; the host never waits on it), and it empties the list. The take still carries the event (hist_ev) for the
+    transports. The CPU stand-in (CpuDeviceSim) host-waits a pending registered write-back at its gather and empties
+    the list too. Negative control: without the producer (the code before F24) the gather copies block 5 with no
+    wait on its write-back."""
+    log, wb, w = _f24(SC.ResidencySC, monkeypatch)
+    copies = [i for i, e in enumerate(log) if e[0] != "wait"]
+    assert copies and ("wait", wb) in log and log.index(("wait", wb)) < copies[0], log[:4]
+    assert ("k", 0, 0, 0, 5) in log and sum(1 for e in log if e == ("wait", wb)) == 1, log[:6]
+    assert w.svc._hist_unwaited == [] and not wb.done
+    assert any(tr.block == 5 and tr.hist_ev is wb for tr in w.svc.inflight.values())
+    # the CPU stand-in: a pending write-back that no row of the tick reads is host-waited at the gather
+    wc = world(C=4, X=4, R_ver=1, cls=SC.ResidencySC, svc_kw=dict(nblk=NB))
+    sc = wc.svc
+    sc.begin_request(0, "u0", hist_blocks=4)
+    ev7 = Ev()
+    sc.history_written("u0", 7, ev7)
+    sc.history_written("u0", 5, Ev(done=True))
+    sc.poll()
+    rows = [Row(0, "v", ("u0", 1, 1), 300, 10)]
+    for l in range(L):
+        p = sc.resolve(l, rows, S([[5], []]))
+        sc.read_done(l, p, Ev(done=True))
+    sc.end_tick()
+    assert ev7.done and sc._hist_unwaited == []
+    # negative control
+    log2, wb2, _ = _f24(NoHistProducer, monkeypatch)
+    assert ("wait", wb2) not in log2 and ("k", 0, 0, 0, 5) in log2, log2[:4]

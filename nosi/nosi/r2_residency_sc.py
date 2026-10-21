@@ -53,7 +53,9 @@ THE DEVICE OPERATIONS (dev):
   CpuDeviceSim   the CPU stand-in (tests). The CPU is the device here, so the stand-in reads its own decision
                  tensors; it never changes the host's ownership state. wait: the needed transfers land (the
                  transport's force), exactly v1's waits. gather: the copies; it refuses a gather into a slot whose
-                 last reader is pending (T3) and waits for the block's host write-back first (T4), as v1's gather.
+                 last reader is pending (T3) and waits for the block's host write-back first (T4), as v1's gather;
+                 before it, it host-waits every write-back registered since its last gather (history_written ->
+                 _hist_unwaited: the stand-in of the GPU main stream's wait).
   CudaDeviceOps  the GPU. SOURCE ONLY, NOT RUN YET (GPU gate FG1). wait: the main stream waits (cudaStreamWaitEvent)
                  on the completion event of EVERY transfer in flight at the layer: a SUPERSET of the needed transfers,
                  because the host does not read the selection; a CPU pack that is not submitted yet is host-waited for
@@ -533,8 +535,13 @@ class CpuDeviceSim:
         host K / V rows and its cis rows (bias), after the block's host write-back (T4); a slot whose last reader is
         pending is refused (T3). A slot that Policy E EVICTED was last read in an earlier tick, before this gather in
         the main stream's order: its pending reader is host-waited here (the stand-in of that order; counted as
-        verifier_force_waits, as v1 counts it)."""
+        verifier_force_waits, as v1 counts it). First, the stand-in of the main stream's wait on every host
+        write-back registered since the last gather (CudaDeviceOps.gather, T4): each pending one is host-waited."""
         svc = self.svc
+        for ev in svc._hist_unwaited:
+            if not ev_done(ev):
+                svc.host_wait(ev)
+        svc._hist_unwaited = []
         g = svc.gather                                    # the host rows and the store (TorchGather's tensors)
         bs = svc.bs
         bb, hh = dec.bh
@@ -905,6 +912,14 @@ class ResidencySC(ResidencySB):
     def begin_request(self, b: int, uid, hist_blocks=None) -> None:
         super().begin_request(b, uid, hist_blocks)
         self._mark_batch_slot(b)
+
+    def history_written(self, uid, block: int, ev) -> None:
+        """Residency.history_written, and the event joins the write-backs that the main stream has not waited on yet
+        (_hist_unwaited, T4). The GPU gather waits on every one of them before its copies (CudaDeviceOps.gather; a
+        captured tick waits them before the replay, outside the graph); the CPU stand-in host-waits them. Without
+        this producer the GPU urgent gather was ordered after a write-back only when both ran on one stream."""
+        super().history_written(uid, block, ev)
+        self._hist_unwaited.append(ev)
 
     def end_request(self, uid) -> None:
         b = self.uid_b[uid]

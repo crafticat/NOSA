@@ -979,6 +979,31 @@ TESTS (`test_r2_residency.py`, R6):
 NOT RUN (static work only, no interpreter). The predicted operations and fields come from reading the code; the CPU
 run decides.
 
+## 12n. T4 on the GPU path: the write-back wait list gets its producer (the TC-R review, note 5.1)
+
+THE GAP. S-C's `_hist_unwaited` ("host write-backs the main stream did not wait on yet") had consumers but no
+producer:
+- Consumers: `CudaDeviceOps.gather` (a main-stream `wait_event` per entry before its copies), and the captured
+  tick's host part (the same waits before the replay, outside the graph).
+- Producer: none. `history_written` registered the event only for the takes (`hist_ev`, which the transports wait).
+- So the GPU urgent gather (zero-copy reads of the pinned host rows) was ordered after a write-back ONLY when both
+  ran on one stream. That is true today (`commit_block` uses the current stream), but nothing guarded it.
+
+THE FIX (`r2_residency_sc.py`):
+- `ResidencySC.history_written` calls v1's and appends the event to `_hist_unwaited`.
+- The CPU stand-in's gather (`CpuDeviceSim.gather`) host-waits every pending entry first and empties the list. This
+  is the stand-in of the main stream's wait, and it keeps the list bounded on the CPU.
+- On the GPU the list is now non-empty after every write-back. The captured tick's host part must keep emptying it
+  before the replay: a capture cannot wait on an event recorded outside it. It does (r2_residency_capture.py
+  host_part).
+
+TEST F24:
+- Positive: on the GPU path (CudaDeviceOps with CPU copies and a logging stand-in of the main stream), a write-back
+  on another stream (a pending event) is waited ONCE, before the first copy of the urgent gather. The list is empty
+  after it, and the take still carries the event.
+- The CPU stand-in host-waits a pending write-back at its gather.
+- Negative control: without the producer, the gather copies block 5 with no wait.
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,
