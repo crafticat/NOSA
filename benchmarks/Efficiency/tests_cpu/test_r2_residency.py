@@ -834,6 +834,8 @@ def _trace_journal(svc):
 
             def psink(key, block, inner=st.prot.sink, stream=st):
                 idx = stream.resident(block)
+                if idx is None and not svc._ending:          # as _prot_changed: a slot in flight (12j), not while
+                    idx = stream.pending.get(block)          # its request ends
                 if idx is not None:
                     trace[-1][key + (idx,)].append("prot")
                 inner(key, block)
@@ -881,14 +883,16 @@ def _trash_intact(w):
                for l in range(L))
 
 
-def _lockstep_sc(seed, C, X, R_ver, sched, sc_mut=None, hb=15, mirror_drop=None, trace=False, trash=0, exact=False):
+def _lockstep_sc(seed, C, X, R_ver, sched, sc_mut=None, hb=15, mirror_drop=None, trace=False, trash=0, exact=False,
+                 mode="delay", max_delay=4):
     """v1 under the S-C schedule (arrivals at the tick's start, draft transfers at end_tick, waited and urgent blocks
     read in place and admitted at the next poll) and S-C driven by the same schedule, transports seeded alike, reader
     events completed two ticks late in both. At the start of every tick (after the poll and S-C's mirror delta) S-C's
     device mirror of every layer is compared with the full-scan reference. Returns the first differences (the mirror;
     page tables per layer; the content of every verify page at the read point, in both worlds; state and counters per
-    tick), the two worlds and the largest number of shared extras borrowed in v1 after a tick."""
-    common = dict(C=C, X=X, R_ver=R_ver, seed=seed, mode="delay", max_delay=4)
+    tick), the two worlds and the largest number of shared extras borrowed in v1 after a tick. mode / max_delay: the
+    transports' (force_only: a transfer lands only when a wait forces it, the asynchronous extreme)."""
+    common = dict(C=C, X=X, R_ver=R_ver, seed=seed, mode=mode, max_delay=max_delay)
     wv = world(**common, svc_kw=dict(poll_in_resolve=False, defer_issue=True, defer_admit=True), trash=trash)
     ws = world(**common, cls=SC.ResidencySC, trash=trash, publish=True if exact else None,
                svc_kw=dict(nblk=NB, sc_mut=sc_mut, mirror_drop=mirror_drop, wait_mode="exact" if exact else "probe"))
@@ -1606,3 +1610,220 @@ def test_F20b_sc_equals_v1_under_verifier_eviction_pressure():
     assert bad == [], bad[:3]
     n = wv.svc.metrics.counts.get("verifier_evictions", 0)
     assert n > 0 and ws.svc.metrics.counts.get("verifier_evictions", 0) == n, wv.svc.metrics.counts
+
+
+# =====================================================================================================================
+# F21 Policy E with an ASYNCHRONOUS transport: the unprotected in-flight prefetch (SG5 p3 preflight, holder 2190876;
+# note 12j)
+# =====================================================================================================================
+def _f21(scenario, sync, sc=False, sc_mut=None, inflight=True, check_t3=True, exact=False):
+    """One stream (b 0, h 0, layer 0), C 2, X 0, R_ver 0: once the stream holds two slots K5 never grants the verifier
+    one. The transport is force_only (nothing lands by itself: the ASYNCHRONOUS stand-in, a gilfree feeder that lags);
+    sync=True lands every transfer at the end of each tick (land_all: the SYNCHRONOUS stand-in, the gather transport).
+      plain             tick 1: cohort k1's draft row prefetches blocks 0 and 1 (slots 0, 1); k1 is decided, so nothing
+                        protects them; tick 2: cohort k2's verify row misses block 5. Expected: slot 0 (block 0, the
+                        oldest candidate) is reused for block 5; block 1 stays.
+      protected_oldest  tick 1: k1 prefetches block 0; tick 2: k3 prefetches block 1; k3 is decided, k1 stays live;
+                        tick 3: k1's verify row misses block 5. Expected: slot 1 (block 1) is reused; block 0 stays.
+    Returns (world, the CapacityRefusal or None, the slot reused, the block kept)."""
+    if sc:
+        kw = dict(nblk=NB, sc_mut=sc_mut, wait_mode="exact" if exact else "probe")
+    else:
+        kw = dict(poll_in_resolve=False, defer_issue=True, defer_admit=True)
+    kw["policy_e_inflight"] = inflight
+    w = world(C=2, X=0, R_ver=0, cls=SC.ResidencySC if sc else None, svc_kw=kw,
+              publish=True if (sc and exact) else None)
+    svc = w.svc
+    if sc:
+        svc.dev.check_t3 = check_t3
+    svc.begin_request(0, "u0")
+    k1, k2, k3 = ("u0", 1, 1), ("u0", 1, 2), ("u0", 1, 3)
+
+    def tick(row, blocks, land, done=True):
+        svc.poll()
+        p = svc.resolve(0, [row], S([blocks, []]))
+        svc.read_done(0, p, Ev(done=done))                # done=False (the last tick): its key keeps its reference
+        svc.end_tick()
+        if land:
+            land_all(w)
+    if scenario == "plain":
+        tick(Row(0, "d", k1, 300, 10), [0, 1], sync)
+        svc.decided(k1)
+        last, gone, kept = Row(0, "v", k2, 300, 10), 0, 1
+    else:
+        tick(Row(0, "d", k1, 300, 10), [0], sync)
+        tick(Row(0, "d", k3, 300, 10), [1], sync)
+        svc.decided(k3)
+        last, gone, kept = Row(0, "v", k1, 300, 10), 1, 0
+    try:
+        tick(last, [5], False, done=False)
+        return w, None, gone, kept
+    except ER.CapacityRefusal as e:
+        return w, e, gone, kept
+
+
+@pytest.mark.parametrize("scenario", ["plain", "protected_oldest"])
+def test_F21_policy_e_takes_an_unprotected_inflight_prefetch(scenario):
+    """F21 (SG5 p3's preflight on holder 2190876: S-C on the asynchronous gilfree transport refused at C 96 / X 32 /
+    R_ver 16, the same point passed on the synchronous gather transport). The REPRODUCTION: with 12h's rule
+    (policy_e_inflight False) the asynchronous round refuses (CapacityRefusal, v1 and S-C alike: every slot is held by
+    an in-flight prefetch that no live cohort protects, and in-flight slots were no candidates; the message's capacity
+    report says so), while the synchronous round passes (its prefetches landed and became unprotected LRU entries).
+    THE FIX (12j): Policy E's second candidate kind. Asynchronous, v1 and S-C (probe and exact waits) supersede the
+    oldest unprotected in-flight prefetch that no row reads: its write lands first (the transport's force / the
+    device's wait), then the urgent block takes its slot (the host truth); the service forgets the superseded transfer
+    (it is never admitted: after more polls and landing the rest, the slot still holds the urgent block); the kept
+    prefetch stays in flight; v1 and S-C reach the same state. Synchronous rounds are unchanged (an LRU eviction)."""
+    for sync in (True, False):
+        for sc, exact in ((False, False), (True, False), (True, True)):
+            w, e, gone, kept = _f21(scenario, sync, sc=sc, inflight=False, exact=exact)
+            if sync:
+                assert e is None, (scenario, sc, exact, e)
+            else:
+                assert e is not None and "no candidate" in str(e), (scenario, sc, exact)
+                if scenario == "plain":
+                    assert "LRU 0, unprotected 0; in flight 2, unprotected draft prefetches 2" in str(e), str(e)
+    states = {}
+    for sync in (True, False):
+        for sc, exact in ((False, False), (True, False), (True, True)):
+            w, e, gone, kept = _f21(scenario, sync, sc=sc, exact=exact)
+            assert e is None, (scenario, sync, sc, exact, e)
+            svc, st = w.svc, w.svc.stream(0, 0, 0)
+            c = svc.metrics.counts
+            assert st.slots[gone].block == 5 and st.slots[gone].state == OWN.INFLIGHT and slot_holds(w, 0, 0, 0, gone, 5)
+            assert c.get("verifier_evictions") == 1 and c.get("verifier_inflight_evictions", 0) == (0 if sync else 1), c
+            if not sync:                                    # in flight: the kept prefetch and the urgent block (landed
+                assert [tr.block for tr in w.tp.pending] == [kept], w.tp.pending      # in place, admitted at the next
+                assert st.pending == {kept: kept, 5: gone}, st.pending                 # poll); never the superseded one
+                assert sorted(tr.block for tr in svc.inflight.values()) == sorted([kept, 5])
+            states.setdefault(sync, []).append(_state(w))
+            svc.poll()
+            land_all(w)                                     # the kept prefetch lands; the superseded one never does
+            assert slot_holds(w, 0, 0, 0, gone, 5) and st.resident(5) == gone and st.resident(gone) != gone
+            assert sync or st.resident(kept) == kept
+    for sync, ss in states.items():
+        assert all(s == ss[0] for s in ss), sync          # v1 == S-C (probe) == S-C (exact)
+
+
+def test_F21c_policy_e_inflight_negative_controls():
+    """F21c (negative controls of 12j, S-C, asynchronous): a device that supersedes a PROTECTED in-flight prefetch is
+    refused by the host's check (OwnershipViolation "Policy E"); a device whose wait omits the superseded prefetch
+    (no_inflight_wait) makes its urgent gather write before that write landed: the device's T3 check refuses the
+    gather; with that check off, the superseded write lands after the urgent block's rows and the slot's content is
+    wrong (caught by the content check)."""
+    with pytest.raises(ER.OwnershipViolation, match="Policy E"):
+        _f21("protected_oldest", False, sc=True, sc_mut={"evict_protected": True})
+    with pytest.raises(ER.OwnershipViolation, match="before the prefetch it supersedes landed"):
+        _f21("plain", False, sc=True, sc_mut={"no_inflight_wait": True})
+    w, e, gone, _ = _f21("plain", False, sc=True, sc_mut={"no_inflight_wait": True}, check_t3=False)
+    assert e is None and w.svc.stream(0, 0, 0).slots[gone].block == 5 and not slot_holds(w, 0, 0, 0, gone, 5)
+
+
+def _sched_split(seed, steps, hb, d_hi, window=2, nver=1, uids=("u0", "u1")):
+    """_sched_pressure's structure (per tick, layer and request a draft row; every third tick two verify rows of the
+    ending cohort), with the draft windows in blocks [0, d_hi) and the verify blocks in [d_hi, hb): a verify row never
+    reads a prefetched block, so (force_only) no prefetch lands and the LRU stays empty: K5's refusals can only be
+    served by Policy E's in-flight candidates (12j)."""
+    g = torch.Generator().manual_seed(seed)
+    out = []
+    for t in range(steps):
+        m = t // 3 + 1
+        ends = t % 3 == 2
+        layers = []
+        for _ in range(L):
+            spec = []
+            for b, u in enumerate(uids):
+                x = int(torch.randint(0, d_hi - window + 1, (1,), generator=g))
+                spec.append((b, "d", (u, 1, m + 1 if ends else m), [list(range(x, x + window)) + [hb] for _ in range(H)]))
+                if ends:
+                    for _ in range(2):
+                        v = [sorted(set(int(z) for z in torch.randint(d_hi, hb, (nver,), generator=g))) + [hb]
+                             for _ in range(H)]
+                        spec.append((b, "v", (u, 1, m), v))
+            layers.append(spec)
+        out.append((t, m, ends, layers))
+    return out
+
+
+@pytest.mark.parametrize("exact", [False, True])
+def test_F21b_sc_equals_v1_with_an_asynchronous_transport(exact):
+    """F21b: the lockstep (pages, verify content, state, counters and the device mirror every tick, the mirror's
+    in-flight protection and issue order included) with the ASYNCHRONOUS extreme: a force_only transport and the split
+    schedule (_sched_split: drafts prefetch blocks 0 .. 19, verify rows read blocks 20 .. 29, so no prefetch ever lands
+    and the LRU stays empty), C 16, X 2 / R_ver 2 (drafts never borrow): once the prefetches fill a stream, K5 refuses
+    the verifier past the 2 extras and only Policy E's in-flight candidates (the decided cohorts' prefetches) can serve
+    it. Precondition: v1 supersedes in-flight prefetches (verifier_inflight_evictions > 0). S-C makes the same
+    decisions every tick, on the probe and on the exact wait. (2051f9b's schedule, _sched_pressure with windows of 2,
+    let verify reads land prefetches into the LRU, and Policy E never needed an in-flight candidate.)"""
+    try:
+        bad, wv, ws, _ = _lockstep_sc(7, C=16, X=2, R_ver=2, sched=_sched_split(109, 30, hb=30, d_hi=20, window=2,
+                                                                              nver=1),
+                                      hb=30, exact=exact, mode="force_only")
+    except ER.CapacityRefusal as e:
+        pytest.fail("the schedule refused (a configuration result, not this test's subject): %s" % e)
+    assert bad == [], bad[:3]
+    n = wv.svc.metrics.counts.get("verifier_inflight_evictions", 0)
+    assert n > 0 and ws.svc.metrics.counts.get("verifier_inflight_evictions", 0) == n, wv.svc.metrics.counts
+
+
+# =====================================================================================================================
+# F23 every Triton kernel we own resolves its names in its MODULE globals (fg5 on holder 2190876)
+# =====================================================================================================================
+def _kernel_name_problems(jf):
+    """The names a @triton.jit kernel needs but Triton's GPU compiler cannot see: its free (closure) variables, and
+    every global it loads (LOAD_GLOBAL, nested code included) that is neither in its module globals (fn.__globals__)
+    nor a builtin."""
+    import builtins
+    import dis
+    fn = getattr(jf, "fn", jf)
+    out = list(fn.__code__.co_freevars)
+
+    def walk(code):
+        for ins in dis.get_instructions(code):
+            if ins.opname == "LOAD_GLOBAL" and ins.argval not in fn.__globals__ and not hasattr(builtins, ins.argval):
+                out.append(ins.argval)
+        for c in code.co_consts:
+            if hasattr(c, "co_code"):
+                walk(c)
+    walk(fn.__code__)
+    return out
+
+
+def test_F23_every_triton_kernel_resolves_its_names_in_its_module():
+    """F23 (fg5 on holder 2190876: the exact wait's kernel failed to compile on the GPU, "NameError: tl is not
+    defined". It was built inside a factory whose local `import triton.language as tl` is invisible to Triton's
+    compiler, which resolves a kernel's names in fn.__globals__; no CPU test compiled it). For every @triton.jit
+    kernel in the Triton modules of the R2 line (nosi/nosi/r2_*.py, max_pooling_per_request.py, and the
+    flash_cache_engine h2d kernels CudaDeviceOps launches), its code has no free variable and every global it
+    loads resolves in its module or in builtins. Precondition: S-C's board_wait_kernel is among them. Negative
+    control: a planted kernel built in a factory with a local-only import fails the check."""
+    triton = pytest.importorskip("triton")
+    from triton.runtime.jit import JITFunction
+    paths = sorted(p for p in NOSI.glob("r2_*.py") if "triton.jit" in p.read_text())
+    paths += [NOSI / "max_pooling_per_request.py", NOSI / "flash_cache_engine/flash_h2d_mask.py",
+              NOSI / "flash_cache_engine/flash_h2d_mask_bias.py"]
+    kernels = []
+    for p in paths:
+        name = PKG + "." + ".".join(p.relative_to(NOSI).with_suffix("").parts)
+        if name not in sys.modules:
+            spec = importlib.util.spec_from_file_location(name, str(p))
+            m = importlib.util.module_from_spec(spec)
+            sys.modules[name] = m
+            spec.loader.exec_module(m)
+        for v in vars(sys.modules[name]).values():
+            if isinstance(v, JITFunction):
+                kernels.append((name, v))
+    assert any(v is getattr(SC, "board_wait_kernel", None) for _, v in kernels), [n for n, _ in kernels]
+    bad = [(n, getattr(getattr(v, "fn", v), "__name__", "?"), _kernel_name_problems(v)) for n, v in kernels
+           if _kernel_name_problems(v)]
+    assert bad == [], bad
+
+    def factory():
+        import triton.language as tl_local
+
+        @triton.jit
+        def planted(x_ptr, BLOCK: tl_local.constexpr):
+            offs = tl_local.arange(0, BLOCK)
+            tl_local.store(x_ptr + offs, offs)
+        return planted
+    assert _kernel_name_problems(factory()) == ["tl_local"]
