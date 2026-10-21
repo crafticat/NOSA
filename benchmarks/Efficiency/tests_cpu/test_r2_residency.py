@@ -1031,7 +1031,8 @@ def test_F12d_sc_per_layer_path_has_no_host_transfer():
     import inspect
     d2h = FORBIDDEN + ("_d2h(",)
     for fn in (SC.ResidencySC.resolve, SC.DeviceMirror.layer, SC.device_verify, SB.device_draft, SB.rank_in_group,
-               SC.CudaDeviceOps.wait, SC.CudaDeviceOps.gather, SC.wait_list, SC._selected_mask):
+               SC.CudaDeviceOps.wait, SC.CudaDeviceOps._superset_wait, SC.CudaDeviceOps.gather, SC.wait_list,
+               SC._selected_mask):
         src = inspect.getsource(fn)
         assert [tok for tok in d2h + H2D if tok in src] == [], fn.__qualname__
     assert [tok for tok in d2h if tok in inspect.getsource(SB.ResidencySB.resolve)] != []
@@ -1519,36 +1520,74 @@ def test_F19_the_exact_wait_host_waits_the_submission_first():
     assert not runner.is_alive() and ops2.submission_waits == 1
 
 
-def test_F19b_a_transport_that_submits_without_the_gil_needs_no_submission_wait():
-    """F19b (Q-C2, E's C++ feeder worker: GilfreeTransport(..., worker="cpp") sets submits_without_gil): with such a
-    transport _submitted(l) returns at once, even for a layer-0 pack that is never submitted (the main thread cannot
-    block that worker; the exact spin with its bounded err is the guard), and waits for nothing. Negative control: the
-    same never-submitted pack with a transport without the attribute (or with it False) keeps _submitted(0) blocked."""
-    def ops_with(trs, tp):
-        ops = object.__new__(SC.CudaDeviceOps)                 # the host part only: no CUDA object is built
-        ops.svc = types.SimpleNamespace(inflight={tr.seq: tr for tr in trs}, tp=tp)
-        ops.submission_waits = 0
-        return ops
+class OldSubmittedRule(SC.CudaDeviceOps):
+    """DEFECT (7902b7a's rule, refuted by gfw1c): a transport that submits without the GIL is not waited at all."""
 
-    def stuck_tr():
-        t = TR.Transfer(1, "u0", 0, 0, 0, 1, 1, 1, "draft", ("u0", 1, 1))
-        t.payload, t.ev = threading.Event(), None              # queued, never submitted
-        return t
-    ops = ops_with([stuck_tr()], types.SimpleNamespace(submits_without_gil=True))
-    runner = threading.Thread(target=ops._submitted, args=(0,), daemon=True)
-    runner.start()
-    runner.join(timeout=5)
-    assert not runner.is_alive() and ops.submission_waits == 0
-    for tp in (types.SimpleNamespace(), types.SimpleNamespace(submits_without_gil=False)):
-        t = stuck_tr()
-        ops2 = ops_with([t], tp)
-        runner = threading.Thread(target=ops2._submitted, args=(0,), daemon=True)
+    def _submitted(self, l, captured=False):
+        if getattr(getattr(self.svc, "tp", None), "submits_without_gil", False):
+            return
+        super()._submitted(l, captured)
+
+
+class CapturedSkipsSubmission(SC.CudaDeviceOps):
+    """DEFECT (gfw1c's GFW1 protocol): the captured tick skips the submission wait."""
+
+    def _submitted(self, l, captured=False):
+        if captured and getattr(getattr(self.svc, "tp", None), "submits_without_gil", False):
+            return
+        super()._submitted(l, captured)
+
+
+def test_F19b_a_gilfree_worker_is_waited_for_its_submission_in_both_tick_modes():
+    """F19b (gfw1c on holder 2190876: the captured protocol without a submission wait, GFW1, ran the spin to its bound,
+    8.6 s, err 1, because the C++ worker's GPU work serializes behind the spinning main stream; the eager protocol with
+    the GIL-free wait first, GFW1e, passed). With a transport that submits without the GIL (submits_without_gil and
+    wait_submitted: E's C++ worker), _submitted(l) waits GIL-free, once per job, for every in-flight transfer of layer
+    l that is not landed in place, in the EAGER and the CAPTURED tick: it stays blocked until layer 0's job is
+    submitted; the urgent transfer (landed in place) and layer 1's job (never submitted) are not waited; one wait
+    counted. Negative controls: 7902b7a's rule (no wait for such a transport) returns before the job is submitted; a
+    captured tick that skips the wait returns before it with captured=True."""
+    class Job:
+        def __init__(self):
+            self.submitted = threading.Event()
+
+    class CppTransport:
+        submits_without_gil = True
+
+        def __init__(self):
+            self.calls = []
+
+        def wait_submitted(self, tr):                          # E's GilfreeTransport.wait_submitted: blocks until the
+            self.calls.append(tr.seq)                          # job's GPU work is enqueued
+            tr.ev.submitted.wait()
+
+    def case(cls, captured):
+        """Returns (blocked before the submission, the transport's calls, submission_waits after it)."""
+        job0, job1 = Job(), Job()
+        trs = []
+        for seq, layer, ev, kind in ((1, 0, job0, "draft"), (2, 0, job0, "draft"), (3, 0, None, "verify"),
+                                     (4, 1, job1, "draft")):
+            t = TR.Transfer(seq, "u0", layer, 0, 0, seq, seq, 1, kind, ("u0", 1, 1))
+            t.ev = ev
+            trs.append(t)
+        tp = CppTransport()
+        ops = object.__new__(cls)                              # the host part only: no CUDA object is built
+        ops.svc = types.SimpleNamespace(inflight={t.seq: t for t in trs}, tp=tp, _landed={3})   # seq 3: urgent
+        ops.submission_waits = 0
+        runner = threading.Thread(target=ops._submitted, args=(0, captured), daemon=True)
         runner.start()
         runner.join(timeout=0.5)
-        assert runner.is_alive()                               # the host wait remains: blocked on the pack
-        t.payload.set()
+        blocked = runner.is_alive()
+        job0.submitted.set()
         runner.join(timeout=5)
-        assert not runner.is_alive() and ops2.submission_waits == 1
+        assert not runner.is_alive()
+        return blocked, tp.calls, ops.submission_waits
+
+    for captured in (False, True):
+        assert case(SC.CudaDeviceOps, captured) == (True, [1], 1), captured
+    assert case(OldSubmittedRule, False) == (False, [], 0)      # returns before the submission: detected
+    assert case(CapturedSkipsSubmission, False) == (True, [1], 1)
+    assert case(CapturedSkipsSubmission, True) == (False, [], 0)   # the captured skip: detected
 
 
 # =====================================================================================================================
@@ -2483,6 +2522,7 @@ def _cuda_ops_on_cpu(svc, w, log):
     ops.wait_mode, ops.max_spin = "superset", 1
     ops.err = torch.zeros((), dtype=torch.int32)
     ops.events_waited = ops.submission_waits = 0
+    ops.spins, ops.profile = torch.zeros((svc.L,), dtype=torch.int64), None     # the REPORT fields (F27), off
 
     def copy(dst, src, ids, what):
         for h, per_b in enumerate(ids.tolist()):
@@ -2830,3 +2870,66 @@ def test_F26_the_k5_report_holds_the_peak_shared_extra_demand_of_a_passing_run(k
     if kind == "sc":
         kn = _f26(WrongLayerK5).svc.report()["k5"]
         assert (kn["at_layer"], kn["by_layer"]) != (0, [7, 6]), kn
+
+
+# =====================================================================================================================
+# F27 REPORT: the exact wait's spin rounds per layer and the wait's phases (fg6's layer-0 excess, R2_FG6_PAPER_METRICS)
+# =====================================================================================================================
+def _f27(publish=True, max_spin=4):
+    """The drafts of u0 take blocks 5, 6, 7 at both layers (in flight: force_only); one verify row then reads 3 of them
+    at layer 0 and 2 at layer 1 with the exact wait (the CPU stand-in: one spin round per entry and spin, each round
+    lands the awaited transfer). publish False: the transport never publishes (the spins run out)."""
+    w = world(C=8, X=4, R_ver=1, cls=SC.ResidencySC, publish=publish, svc_kw=dict(nblk=NB, wait_mode="exact"))
+    svc = w.svc
+    svc.dev.max_spin = max_spin
+    svc.begin_request(0, "u0")
+    svc.poll()
+    rows = [Row(0, "d", ("u0", 1, 1), 300, 10)]
+    for l in range(L):
+        p = svc.resolve(l, rows, S([[5, 6, 7], []]))
+        svc.read_done(l, p, Ev(done=True))
+    svc.end_tick()
+    svc.poll()
+    rows = [Row(0, "v", ("u0", 1, 1), 301, 10)]
+    for l, blocks in ((0, [5, 6, 7]), (1, [5, 6])):
+        p = svc.resolve(l, rows, S([blocks, []]))
+        svc.read_done(l, p, Ev(done=True))
+    svc.end_tick()
+    return w
+
+
+class _FakeEv:
+    """A timing event of the profile summary's CPU test: elapsed_time in ms between two device times."""
+
+    def __init__(self, t_ms):
+        self.t = t_ms
+
+    def elapsed_time(self, other):
+        return other.t - self.t
+
+
+def test_F27_the_exact_wait_counts_its_spin_rounds_and_the_wait_profile_splits_its_phases():
+    """F27 (REPORT, the lead's task after fg6): the exact wait counts its spin rounds PER LAYER (CudaDeviceOps.spins,
+    on the device, added by the program per call; the stand-in's spin_counts). Known count: 3 in-flight entries at
+    layer 0 and 2 at layer 1, each landed by one round: [3, 2], err clear. Negative control: a transport that never
+    publishes makes every entry spin max_spin rounds: [3 * 4, 2 * 4], err set. The profile summary
+    (wait_profile_summary, the per-layer host / device split of the wait's phases pre / list / wait) sums known calls:
+    two exact calls at layer 0, one superset call at layer 1 (its pre and list phases are one mark: device 0)."""
+    w = _f27()
+    assert w.svc.dev.spin_counts() == [3, 2] and not bool(w.svc.dev.err), w.svc.dev.spin_counts()
+    w2 = _f27(publish=False)
+    assert w2.svc.dev.spin_counts() == [3 * 4, 2 * 4] and bool(w2.svc.dev.err), w2.svc.dev.spin_counts()
+
+    def m(host_s, dev_ms):
+        return host_s, _FakeEv(dev_ms)
+    s0 = m(0.0, 0.0)
+    entries = [(0, m(0.0, 0.0), m(0.0010, 1.0), m(0.0012, 1.1), m(0.0013, 5.1)),     # layer 0: pre 1 / list .1 / spin 4
+               (0, m(1.0, 100.0), m(1.0005, 100.5), m(1.0006, 100.6), m(1.0007, 100.8)),
+               (1, s0, s0, s0, m(0.0002, 0.3))]                                       # layer 1: superset, wait only
+    s = SC.wait_profile_summary(entries, 2, [9, 0])
+    p0, p1 = s["per_layer"]
+    assert (p0["calls"], p0["spins"], p1["calls"], p1["spins"]) == (2, 9, 1, 0), s
+    assert (p0["device_pre_ms"], p0["device_list_ms"], p0["device_wait_ms"]) == (1.5, 0.2, 4.2), p0
+    assert (p0["host_pre_ms"], p0["host_list_ms"], p0["host_wait_ms"]) == (1.5, 0.3, 0.2), p0
+    assert (p1["device_pre_ms"], p1["device_list_ms"], p1["device_wait_ms"], p1["host_wait_ms"]) == (0.0, 0.0, 0.3, 0.2)
+    assert s["total"]["calls"] == 3 and s["total"]["spins"] == 9 and s["total"]["device_wait_ms"] == 4.5, s["total"]

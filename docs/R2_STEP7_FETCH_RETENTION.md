@@ -779,6 +779,23 @@ Q-C2, the submission wait (E's C++ feeder worker, feature/nosi-r2-gilfree-worker
   constructor; a late inference-mode board is refused by E's worker.
 - CPU test F19b: an unsubmitted pack does not block `_submitted` with the attribute. Negative control: without the
   attribute (or with it False) the host wait remains.
+- SUPERSEDED (2026-10-21, gfw1c on holder 2190876, E's f494a98). The "return at once" rule is WRONG:
+  - the captured protocol without a submission wait (GFW1) ran the spin to its bound (8.6 s, err 1);
+  - the worker's GPU work serializes behind the spinning main stream; it is not the launch queue;
+  - the eager protocol with the GIL-free submission wait first (GFW1e) passed (err 0, spin 0.2 ms).
+- THE NEW RULE (`_submitted(l, captured=False)`):
+  - For a transport with `submits_without_gil` and `wait_submitted`, the host waits GIL-free
+    (`tp.wait_submitted(tr)`, E's `_JobEv.wait_submitted`), once per job.
+  - It waits for every in-flight transfer of the layer that is not landed in place (an urgent take is not the
+    transport's).
+  - It waits in the eager AND the captured tick: `captured` stays as a parameter (the captured tick's host part
+    passes True at the engine agent's next merge), and it does not skip the wait.
+  - Each wait counts in `submission_waits`. Other transports keep the Python feeder's flag wait.
+- F19b (rewritten):
+  - The wait blocks until layer 0's job is submitted, in both modes. The urgent transfer and layer 1's job are not
+    waited; one wait is counted.
+  - Negative controls: 7902b7a's rule returns before the submission; a captured tick that skips the wait is
+    detected.
 
 ## 12l. (B1) the sparse decision record on the vendored ownership objects (`nosi/nosi/r2_residency_sparse.py`)
 
@@ -1133,6 +1150,42 @@ TEST F26 (dense and sparse):
   [7, 6]; one device read per tick.
 - F25's refused p4a case reports 48 at layer 0, tick 1.
 - Negative control: a service that notes the demand against the next layer reports another layer.
+
+## 12r. REPORT: the exact wait's spin rounds and the wait's phases (fg6's layer-0 excess; R2_FG6_PAPER_METRICS.md)
+
+THE QUESTION. In fg6 the exact wait cost 331.8 of its 1,002.1 ms in layer 0 (4.0 ms per verify tick); every other
+layer cost 0.26 ms per tick. The record cannot tell whether layer 0 spun on the board (a late publication), or
+whether the main stream idled while the host enqueued the wait (the submission waits, the wait list, the launch).
+
+THE INSTRUMENTS (`r2_residency_sc.py`):
+- SPIN ROUNDS per layer, on the device:
+  - `board_wait_kernel` adds each call's rounds (summed over its blocks of up to 1,024 entries) into
+    `CudaDeviceOps.spins[l]`, an int64 cell. The program is a single program, so it uses a plain read and write.
+  - It is a fixed buffer, so a captured tick counts too.
+  - `spin_counts()` reads it after a run, never in a tick. The CPU stand-in (`ExactWaitSim`) counts one round per
+    entry and spin, in `spins_by_layer` / `spin_counts()`.
+- THE PHASES of every wait call (opt-in: `CudaDeviceOps.profile = []`; eager ticks only; a capture records nothing):
+  - a host clock and a timing event on the main stream at four bounds;
+  - pre (exact: `_submitted`), list (exact: `wait_list`) and wait (exact: the spin program; superset: the event
+    waits);
+  - `wait_profile()` (one synchronize, after the run) returns `wait_profile_summary`: per layer and in total, the
+    calls, each phase's host and device ms, and the spin rounds.
+- How to read it:
+  - a device phase much longer than its host phase: the main stream waited on the device (spinning, or event waits);
+  - a host phase as long as its device phase: the stream waited for the host to enqueue.
+
+THE FG DRIVER (`r2_fetch_fg.py`, on the FG branch, not on this branch) needs three lines at its next merge:
+1. `dops.profile = []` after `make_sc` builds the devops.
+2. `info["wait_profile"] = dops.wait_profile()` after the arm.
+3. Print the per-layer rows of layers 0-2.
+Its own `TimedOps` span stays as the outer total.
+
+TEST F27:
+- The stand-in counts [3, 2] spin rounds (3 in-flight entries at layer 0, 2 at layer 1, each landed by one round),
+  err clear.
+- Negative control: a transport that never publishes: [12, 8] (max_spin 4 per entry), err set.
+- The profile summary sums known calls (two exact calls at layer 0, one superset call at layer 1) to the expected
+  per-layer host and device phases.
 
 ## 13. Open questions
 
