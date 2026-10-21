@@ -276,3 +276,84 @@ B 64, and F - SH = -1.40 ms).
   - a steady ratio above the band at any B (the fused R2 step is not at parity);
   - an agreement below 0.999 (the fixed-order mean differs from torch's on model keys);
   - an effective ratio below the band.
+
+## 9. r2-mbase: the matched baseline and the GEMM scan (SOURCE ONLY, not run)
+
+Purpose: two missing inputs of the +17 % model (paper-notes/reconciliation-17pct.md rows 2 and 7;
+recon-rows-2-3.md). The reference of the model is 3,160.82 tok/s: C 128, B 216, eager median
+68.336639 ms (job 2175791). Q is 3,703.54 tok/s.
+
+### 9.1 What the code can and cannot run
+
+- C = 63 + P. P is the victim pool (NOSI_POOL_BLOCKS).
+- The R2 decode body has NO victim pool. `DecodeBody.allocate` raises when `pool_blocks` is not 0
+  (nosi/nosi/r2_decode_body.py:99-100). So a captured R2 fused step at C > 63 does not exist.
+- At P > 0 the cells run the SH arm only. The SH steady statistic excludes every re-warm period
+  (a re-warm re-captures the shipped after-pooling graph). So the SH steady step is the shipped decode
+  WITHOUT the re-capture cost. The recon accepts this definition (row 2: "or the SH steady step").
+- The fused step at C > 63 is a MODEL only: SH steady x 0.990 (the C 63 P3F ratio at B 219). The cells
+  report it as MB-R2C and never as a measurement.
+
+### 9.2 Cells (benchmarks/Efficiency/r2_base_fused_step.sh; 512 steps, 16,128 tokens, splits 4)
+
+| cell | C | P | B | arms | STEP_MIN | --mem | estimated wall |
+|---|---|---|---|---|---|---|---|
+| mb1 | 128 | 65 | 216 | SH | 35 | 240G | 16-18 min |
+| mb2c113 | 113 | 50 | 240 | SH | 35 | 240G | 18-20 min |
+| mb2c96 | 96 | 33 | 280 | SH | 40 | 340G | 20-23 min |
+| mb2c79 | 79 | 16 | 328 | SH | 45 | 340G | 23-26 min |
+| mb2c63 | 63 | 0 | 344 | SH + R2 fused | 70 | 340G | 40-45 min |
+| fit<C>b<B> | any of the five | | B | SH, 16 steps | 30 | 240G / 340G | 5-20 min |
+
+- Wall estimate: load + pool JIT build (about 4 min) + SH prefill 3.03 s per request (basef b219:
+  664 s at B 219) + 512 steps + 9 re-warms (about 0.0275 s per request each). mb2c63 adds the R2 arm
+  (prefill 2.85 s per request). basef b219 (SH + R2, B 219) took 26 min 18 s.
+- B per C: `mbase_batch(C)`, the largest multiple of 8 whose modeled prefill peak is <= 82.04 GB.
+  Model: peak = 19.0 + B x (0.155 + (C - 63) x 0.002105) GB (2175791 output 2; basef b219 52.925 GB
+  against 52.945). C 128 gives 216 (2175791: 216 fits, 224 OOM). C 63 uses B 344, 2175791's measured
+  point, not the modeled GPU limit (400): it calibrates the harness at a second C.
+- Host: pinned host blocks round up to a power of two: 128 GiB up to B 251, 256 GiB above.
+- gm1 (benchmarks/Efficiency/r2_bi_step.sh ... gm1): r2_bi_microgate.py --gemm-scan. STEP_MIN 15,
+  estimated wall 3-6 min. It needs no model and no workload.
+
+### 9.3 Registered predictions (MB)
+
+- MB-STEP, the SH steady step (ms), point and band:
+  - C 128 B 216: 68.0, [64.92, 70.39] (2175791 eager 68.34 x [0.95, 1.03]).
+  - C 113 B 240: 74.5, [68.0, 81.0].
+  - C 96 B 280: 85.6, [78.0, 94.0].
+  - C 79 B 328: 106.0, [92.0, 118.0].
+  - C 63 B 344: 180.6, [174.5, 185.3] (2175791 eager 179.87 x [0.97, 1.03]).
+  - Basis for C 79 / 96 / 113: the C 63 resident step R(B) of 2175791 + 1.26 us per load (64 x the
+    misses per request-step of cache_engine.py:31-34, x 0.7-1.0) + the pool's device copies.
+- MB-FIT: the SH peak allocated is within 5 % of the model.
+- MB-F: at C 63 B 344, R2 fused / SH steady is in (0.95, 1.00).
+- ACROSS CELLS (the lead scores it; no cell can): the best SH steady tok/s over the five C is in
+  [3,100, 3,450], at C 96 or C 113. C 128 is within 5 % of the best.
+- Falsifiers:
+  - any cell's SH steady step outside its band;
+  - the best C at or above 3,703.54 tok/s: then the model's gain is gone;
+  - the best C is C 63 or C 79;
+  - a registered B does not fit (SH-RUN fails with an OOM): the peak model is wrong. Then run a fit
+    probe at B - 8 and B - 16, and report the C at the B that fits.
+
+### 9.4 Registered predictions (gm1)
+
+- GM-NAT, cuBLAS natural per step (32 x four linears + lm_head), ms, point and band: M 64 14.46
+  [13.0, 16.0]; 128 16.12 [14.5, 17.8]; 256 22.13 [19.9, 24.4]; 320 28.13 [25.3, 31.0]; 512 38.26
+  [34.4, 42.1]; 768 57.54 [51.8, 63.3]; 861 67.2 [57.5, 77.0]; 1024 76.8 [65.0, 88.0]; 1148 96.1
+  [77.0, 106.0]. Basis: the old M-scan (2175525, graph timing) x 1.105 (bigemm_v1 eager / old scan
+  at M 128 / 256 / 320); past 768 by 256-row tiles.
+- GM-EXACT at B 287 (M_fix 1148): EXACT / natural = 3.8 [2.8, 4.6] at 287 live rows, 1.43 [1.1, 1.8]
+  at 861 live rows.
+- GM-DENSE at B 287, K 3: FAST = 3 natural(287) + natural(861) = 142.5 [120, 165] ms, NOT binding
+  (HBM 213.90 ms). EXACT = 3 padded(287, 1148) + padded(861, 1148) = 385 [300, 430] ms, BINDING.
+- Falsifiers: a natural per-step total outside its band; FAST dense above 213.90 ms (then the GEMM
+  binds even in FAST); EXACT dense below 213.90 ms (then EXACT does not bind).
+
+### 9.5 Doubts
+
+- The fused step at C > 63 is not measurable without a victim pool in the R2 body.
+- The C 79 / 96 / 113 bands come from a step model, not from a run at those C.
+- The holder's memory must allow --mem 340G. Read the holder's allocation before the queue entry.
+- The pool path has run at 63 steps (2175791). It has not run for 512 steps.

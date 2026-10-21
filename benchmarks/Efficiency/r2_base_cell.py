@@ -41,6 +41,19 @@ DECLARED change: per-bank refusal through the overflow flag, the fixed-order mea
 twin's overflow flag clear. The predictions are P1F (agreement), P3F (steady ratio per B), P4F (effective ratio per B)
 and P5. --gt (with --r2 fused): r2_fused_cell.part_gt first, before the model loads (its gates GT-EQ, GT-COVER,
 GT-NEG, GT-NEG-ORDER are MUST gates of this cell).
+
+--pool P (r2-mbase, the MATCHED BASELINE; paper-notes/recon-rows-2-3.md row 2): the cache capacity C = 63 + P, P the
+victim pool of the offload engine (NOSI_POOL_BLOCKS, read once at import by cache_engine; the cell REFUSES a run whose
+knob differs from --pool, so the record names its C). P > 0 runs the SH arm ONLY: the R2 decode body has no victim pool
+(r2_decode_body.DecodeBody.allocate raises on pool_blocks), so a captured R2 / fused step at C > 63 does not exist yet.
+The SH "steady" statistic excludes every re-warm (= re-capture of the shipped after-pooling graph) period, so the SH
+steady step IS the shipped decode without the re-capture cost (the recon's definition; R2 fused / SH = 0.990 at C 63,
+B 219, basef 2190876). --mbase selects the registered mbase predictions (verdicts_mbase, PRED_MBASE):
+  MB-STEP  the SH steady step inside the band registered for (C, B) (REPORT at an unregistered pair);
+  MB-FIT   the SH peak allocated within 5 % of the prefill-peak model mbase_peak_model(C, B) (2175791's output 2);
+  MB-F     at C 63 with the R2 arm: R2 (fused) / SH steady inside (0.95, 1.00);
+  MB-R2C   REPORT (a MODEL, not a measurement): SH steady x MBASE_FUSED_FACTOR, the fused step this C would have.
+The cell also reports the device memory in use (cudaMemGetInfo) at the end of the SH arm, beside the allocator peak.
 """
 from __future__ import annotations
 
@@ -65,6 +78,19 @@ PRED = dict(P3_ratio_b64=0.8, P3_ratio_b219=0.9, P4_eff_ratio_b64=1.5, P5_peak_r
 PRED_FUSED = dict(P1F_agreement=0.999,
                   P3F_ratio={64: (0.95, 0.99), 128: (0.95, 1.00), 219: (0.95, 1.00)},
                   P4F_eff_ratio={64: (2.6, 3.2), 128: (2.05, 2.5), 219: (1.65, 1.95)})
+# --mbase (registered with the commit that adds them; basis: job 2175791 = retroinfer-eval docs/evidence/
+# hbm_sweep_2175791 output 2 (prefill peaks) and output 3 (eager medians), basef 2190876 (SH steady at C 63; P3F 0.990))
+C_BASE = 63
+POOL_MAX = 65
+MBASE_PEAK = dict(intercept_GB=19.0, slope_c63_GB=0.155, slope_per_block_GB=0.002105, fit_GB=82.04, tol=0.05)
+MBASE_FUSED_FACTOR = 0.990
+MBASE_REF = dict(C=128, B=216, eager_median_ms=68.336639, tok_s=3160.822684, gain_q_tok_s=3703.54)
+# SH steady step (ms): (point, low, high) per (C, B). C 128 / C 63: 2175791's eager median x [0.95, 1.03] / [0.97, 1.03]
+# (our SH steady vs its eager at C 63: 0.9973 / 0.9956 / 1.0071 at B 64 / 128 / 219); C 79 / 96 / 113: the step model
+# R(B) (2175791's C 63 resident step) + 1.26 us per load (64 x misses(C) per request, x 0.7-1.0) + the pool's copies.
+PRED_MBASE = {(128, 216): (68.0, 64.92, 70.39), (113, 240): (74.5, 68.0, 81.0), (96, 280): (85.6, 78.0, 94.0),
+              (79, 328): (106.0, 92.0, 118.0), (63, 344): (180.6, 174.5, 185.3)}
+MBASE_F_BAND = (0.95, 1.00)
 
 
 def log(msg):
@@ -83,12 +109,19 @@ def parse_args(argv):
     ap.add_argument("--r2", default="built", choices=("built", "fused"),
                     help="the R2 arm: as built (step_fixed, DeviceWritebackBody) or fused (docs/R2_FUSED.md 8)")
     ap.add_argument("--gt", action="store_true", help="with --r2 fused: r2_fused_cell.part_gt first (MUST gates)")
+    ap.add_argument("--pool", type=int, default=0,
+                    help="the victim pool P (C = 63 + P); must equal NOSI_POOL_BLOCKS; P > 0 needs --arms SH")
+    ap.add_argument("--mbase", action="store_true", help="the registered mbase predictions (verdicts_mbase)")
     a = ap.parse_args(argv)
     a.arms = [x for x in a.arms.split(",") if x]
     if a.arms not in (["SH", "R2"], ["SH"]):
         ap.error("arms must be SH,R2 or SH (R2 is teacher-forced on SH's tokens)")
     if a.gt and a.r2 != "fused":
         ap.error("--gt goes with --r2 fused")
+    if not 0 <= a.pool <= POOL_MAX:
+        ap.error("--pool in 0 .. %d" % POOL_MAX)
+    if a.pool > 0 and "R2" in a.arms:
+        ap.error("--pool > 0 needs --arms SH (the R2 decode body has no victim pool)")
     if a.batch < 1 or not 1 <= a.warmup < a.steps or a.steps > 1000:
         ap.error("--batch >= 1, --warmup in 1 .. steps - 1, --steps <= 1000 (the shipped total_cis holds S + 1024)")
     return a
@@ -229,6 +262,59 @@ def verdicts_fused(B: int, sh, r2, agree, expected):
     return out
 
 
+def mbase_peak_model(C: int, B: int) -> float:
+    """The prefill-peak model (GB allocated) of the offload engine at capacity C and batch B, fitted on 2175791's
+    output 2: C 63 B 64 28.93, C 128 B 64 37.69 / B 216 82.04 -> 19.0 + B x (0.155 + (C - 63) x 0.002105). Check
+    (outside the fit): basef 2190876 SH C 63 B 219 peak 52.925 (model 52.945)."""
+    p = MBASE_PEAK
+    return p["intercept_GB"] + int(B) * (p["slope_c63_GB"] + (int(C) - C_BASE) * p["slope_per_block_GB"])
+
+
+def mbase_batch(C: int) -> int:
+    """The registered batch of capacity C: the largest multiple of 8 whose modeled peak is <= fit_GB (82.04, the
+    largest peak that fitted in 2175791). C 128 -> 216 (2175791: 216 fits, 224 OOM); C 63 -> 400 (the sweep uses 344,
+    2175791's measured point, instead: see the step script)."""
+    B = 8
+    while mbase_peak_model(C, B + 8) <= MBASE_PEAK["fit_GB"]:
+        B += 8
+    return B
+
+
+def verdicts_mbase(C: int, B: int, sh, r2):
+    """--mbase: MB-STEP, MB-FIT, MB-F (C 63 with R2 only), MB-R2C (REPORT, a model) and the tok/s REPORT against
+    the forecast reference and the gain threshold Q (paper-notes/recon-rows-2-3.md)."""
+    out = []
+    if sh is None or not sh["rates"]["steady_step_ms"]:
+        return [("MB-STEP", "NOT_RUN", "no SH steady step")]
+    ms = sh["rates"]["steady_step_ms"]
+    reg = PRED_MBASE.get((int(C), int(B)))
+    if reg is None:
+        out.append(("MB-STEP", "REPORT", "SH steady %.3f ms at C %d B %d (no registered band)" % (ms, C, B)))
+    else:
+        pt, lo, hi = reg
+        out.append(("MB-STEP", "CONFIRMED" if lo <= ms <= hi else "REFUTED",
+                    "SH steady %.3f ms at C %d B %d (point %s, band [%s, %s])" % (ms, C, B, pt, lo, hi)))
+    model = mbase_peak_model(C, B)
+    r = sh["gpu_peak_alloc_GB"] / model
+    out.append(("MB-FIT", "CONFIRMED" if abs(r - 1) <= MBASE_PEAK["tol"] else "REFUTED",
+                "SH peak allocated %.3f GB / model %.3f GB = %.4f (tolerance %s)" % (
+                    sh["gpu_peak_alloc_GB"], model, r, MBASE_PEAK["tol"])))
+    if r2 is not None and r2["rates"]["steady_step_ms"]:
+        f = r2["rates"]["steady_step_ms"] / ms
+        lo, hi = MBASE_F_BAND
+        out.append(("MB-F", ("CONFIRMED" if lo <= f <= hi else "REFUTED") if int(C) == C_BASE else "REPORT",
+                    "R2 / SH steady %.4f (band %s at C 63)" % (f, MBASE_F_BAND)))
+    model_ms = ms * MBASE_FUSED_FACTOR
+    out.append(("MB-R2C", "REPORT", "MODEL: SH steady x %.3f = %.3f ms, %.1f tok/s (a C 63 ratio moved to C %d)" % (
+        MBASE_FUSED_FACTOR, model_ms, 1e3 * B / model_ms, C)))
+    tok = 1e3 * B / ms
+    out.append(("MB-TOK", "REPORT", "SH steady %.1f tok/s at C %d B %d: / reference %.2f = %.4f; Q %.2f / this = %.4f "
+                "(gain %+.2f %% if this is the matched reference)" % (
+                    tok, C, B, MBASE_REF["tok_s"], tok / MBASE_REF["tok_s"], MBASE_REF["gain_q_tok_s"],
+                    MBASE_REF["gain_q_tok_s"] / tok, 100 * (MBASE_REF["gain_q_tok_s"] / tok - 1))))
+    return out
+
+
 class CudaClock:
     def event(self):
         import torch
@@ -341,8 +427,10 @@ def run_shipped(model, ids, steps: int, clock):
     clock.record(ev[steps])
     clock.sync()
     periods = [clock.elapsed(ev[t], ev[t + 1]) for t in range(steps)]
+    fr, tot = torch.cuda.mem_get_info()                  # REPORT: device memory in use (context + reserved) at the end
     del cache
-    return dict(inputs=inputs, periods=periods, rewarms=rewarms, prefill_s=round(prefill_s, 1))
+    return dict(inputs=inputs, periods=periods, rewarms=rewarms, prefill_s=round(prefill_s, 1),
+                device_used_end_GB=round((tot - fr) / 1e9, 3))
 
 
 def run_r2(model, ids, inputs, steps: int, warmup: int, clock, mode: str = "built"):
@@ -420,8 +508,9 @@ def main(argv=None) -> int:
     import nosi.cache_engine as CEN
     import nosi.nosa_llama as NL
     from nosi import NOSALlama as Llama
-    if NL._ATTN_SPLITS <= 0 or CEN.POOL_BLOCKS != 0:
-        print("REFUSED: needs NOSI_ATTN_SPLITS > 0 and NOSI_POOL_BLOCKS=0", file=sys.stderr)
+    if NL._ATTN_SPLITS <= 0 or CEN.POOL_BLOCKS != a.pool:
+        print("REFUSED: needs NOSI_ATTN_SPLITS > 0 and NOSI_POOL_BLOCKS == --pool (%d; the knob is %d)" % (
+            a.pool, CEN.POOL_BLOCKS), file=sys.stderr)
         return 20
     try:
         docs, sha = RG.load_docs(a.workload, N_DOCS, S0)
@@ -459,6 +548,7 @@ def main(argv=None) -> int:
             sh = dict(rewarms=out["rewarms"], prefill_s=out["prefill_s"], steady=steady,
                       rates=rates(a.batch, a.steps, out["periods"], steady), gpu_peak_alloc_GB=pa,
                       gpu_peak_reserved_GB=pr, gpu_base_alloc_GB=sh_base,
+                      device_used_end_GB=out["device_used_end_GB"],
                       rewarm_ms=[round(out["periods"][t], 1) for t, _ in out["rewarms"]])
             inputs = out["inputs"]
             del out
@@ -502,8 +592,16 @@ def main(argv=None) -> int:
             mem["after_R2"] = host_mem()
             free()
     preds = (verdicts_fused if a.r2 == "fused" else verdicts)(a.batch, sh, r2, agree, expected)
+    C = C_BASE + a.pool
+    if a.mbase:
+        preds = preds + verdicts_mbase(C, a.batch, sh, r2)
     meta = dict(batch=a.batch, steps=a.steps, warmup=a.warmup, S0=S0, doc_rows=rows, n_unique_docs=min(a.batch, N_DOCS),
                 workload_sha256=sha, expected_rewarms=expected, attn_splits=NL._ATTN_SPLITS,
+                pool_blocks=CEN.POOL_BLOCKS, capacity_C=C, arms=a.arms, mbase=a.mbase,
+                mbase_predictions=(dict(steady_ms={"%d_%d" % k: v for k, v in PRED_MBASE.items()}, peak=MBASE_PEAK,
+                                        fused_factor=MBASE_FUSED_FACTOR, f_band=MBASE_F_BAND, reference=MBASE_REF,
+                                        peak_model_GB=round(mbase_peak_model(C, a.batch), 3))
+                                   if a.mbase else None),
                 predictions=(PRED_FUSED if a.r2 == "fused" else PRED), r2=a.r2, gt=a.gt,
                 nosi_commit=os.environ.get("BASE_COMMIT", "unknown"), torch=torch.__version__,
                 gpu=torch.cuda.get_device_name(0), host_mem=mem)

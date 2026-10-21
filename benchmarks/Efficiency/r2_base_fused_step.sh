@@ -17,6 +17,18 @@
 #   b64   B  64, STEP_MIN 25, --mem 140G
 #   b128  B 128, STEP_MIN 35, --mem 220G
 #   b219  B 219, STEP_MIN 50, --mem 220G
+# MBASE CELLS (r2-mbase: the matched baseline of the +17 % model, paper-notes/recon-rows-2-3.md row 2; r2_base_cell
+# --pool P --mbase; C = 63 + P = NOSI_POOL_BLOCKS + 63; B = r2_base_cell.mbase_batch(C) except C 63; 512 steps; the
+# SH steady step excludes every re-warm / re-capture). P > 0: the SH arm only (the R2 body has no victim pool).
+#   mb1     C 128 (P 65) B 216, SH;                 STEP_MIN 35, --mem 240G   (2175791's reference cell)
+#   mb2c113 C 113 (P 50) B 240, SH;                 STEP_MIN 35, --mem 240G
+#   mb2c96  C  96 (P 33) B 280, SH;                 STEP_MIN 40, --mem 340G
+#   mb2c79  C  79 (P 16) B 328, SH;                 STEP_MIN 45, --mem 340G
+#   mb2c63  C  63 (P  0) B 344, SH + R2 fused;      STEP_MIN 70, --mem 340G   (2175791's C 63 maximum, not the GPU's)
+#   fit<C>b<B>  a FIT PROBE (C in 63 79 96 113 128, B a multiple of 8 in 8 .. 400): SH only, 16 steps, no --mbase;
+#           STEP_MIN 30, --mem 240G (B <= 248) or 340G. Exit 0 = B fits (prefill + 16 steps); SH-RUN FAIL = it did not.
+# Host memory: the pinned host rows are rounded up to a power of two per (layer, K / V) block (r2_base_cell.free):
+# 2 GiB blocks (128 GiB) up to B 251, 4 GiB (256 GiB) above; hence 240G / 340G.
 # OUTPUT: OUTROOT/basef_<run>_<holder>_<cell>/summary.json and the step record OUTROOT/basef_<run>_<holder>_<cell>.step/
 # (command + pins incl. the uuid and its file, stdout, stderr, exit + accounting, sacct row), both frozen. EXIT: the
 # cell's exit = the number of failed MUST gates (0-19); 20 the cell refused; 30 the cell raised; 2 a usage error of
@@ -25,7 +37,7 @@
 # Checks before the claim (each STOPS with exit 1): as r2_base_step.sh. The claim: OUTROOT/basef_active (mkdir,
 # atomic); a stop after the claim leaves it (the lead decides).
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-fused2                                                   # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-mbase                                                    # ROOT
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                         # ROOT (lead-owned)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -39,7 +51,7 @@ SELF=benchmarks/Efficiency/r2_base_fused_step.sh
 SPLITS=4
 main() {
 stop() { echo "R2 base-fused step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_base_fused_step.sh --nosi <sha> <holder> <run id> <gt64|b64|b128|b219>" >&2; exit 2; }
+usage() { echo "usage: r2_base_fused_step.sh --nosi <sha> <holder> <run id> <gt64|b64|b128|b219|mb1|mb2c<C>|fit<C>b<B>>" >&2; exit 2; }
 [ $# = 5 ] && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4 CELL=$5
 DRY=${DRYRUN:-0}
@@ -47,12 +59,26 @@ DRY=${DRYRUN:-0}
 case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
 [[ $RUN =~ ^[a-z0-9]{1,16}$ ]] || stop "run id '$RUN' (1-16 of a-z 0-9)"
 GT=()
+POOL=0 STEPS=512 ARMS=SH,R2 MB=()
 case $CELL in
     gt64) BATCH=64 STEP_MIN=30 MEM=140G GT=(--gt) ;;
     b64) BATCH=64 STEP_MIN=25 MEM=140G ;;
     b128) BATCH=128 STEP_MIN=35 MEM=220G ;;
     b219) BATCH=219 STEP_MIN=50 MEM=220G ;;
-    *) stop "cell '$CELL' (gt64, b64, b128 or b219)" ;;
+    mb1) POOL=65 BATCH=216 ARMS=SH STEP_MIN=35 MEM=240G MB=(--mbase) ;;
+    mb2c113) POOL=50 BATCH=240 ARMS=SH STEP_MIN=35 MEM=240G MB=(--mbase) ;;
+    mb2c96) POOL=33 BATCH=280 ARMS=SH STEP_MIN=40 MEM=340G MB=(--mbase) ;;
+    mb2c79) POOL=16 BATCH=328 ARMS=SH STEP_MIN=45 MEM=340G MB=(--mbase) ;;
+    mb2c63) POOL=0 BATCH=344 STEP_MIN=70 MEM=340G MB=(--mbase) ;;
+    fit*b*)
+        fc=${CELL#fit} fc=${fc%%b*} fb=${CELL##*b}
+        case $fc in 63|79|96|113|128) ;; *) stop "cell '$CELL': C '$fc' (63, 79, 96, 113 or 128)" ;; esac
+        [[ $fb =~ ^[1-9][0-9]{0,2}$ ]] && [ $((fb % 8)) = 0 ] && [ "$fb" -le 400 ] ||
+            stop "cell '$CELL': B '$fb' (a multiple of 8 in 8 .. 400)"
+        [ "$CELL" = "fit${fc}b$fb" ] || stop "cell '$CELL' (fit<C>b<B>)"
+        POOL=$((fc - 63)) BATCH=$fb ARMS=SH STEPS=16 STEP_MIN=30 MEM=240G
+        [ "$fb" -le 248 ] || MEM=340G ;;
+    *) stop "cell '$CELL' (gt64, b64, b128, b219, mb1, mb2c113, mb2c96, mb2c79, mb2c63 or fit<C>b<B>)" ;;
 esac
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 for v in $(compgen -e); do case $v in SLURM_*|SRUN_*|SALLOC_*|SBATCH_*) stop "the environment exports $v" ;; esac; done
@@ -66,7 +92,9 @@ for f in benchmarks/Efficiency/r2_base_cell.py benchmarks/Efficiency/r2_fused_ce
          benchmarks/Efficiency/r2_g0_compare.py nosi/nosi/r2_capture.py nosi/nosi/r2_decode_path.py \
          nosi/nosi/r2_decode_body.py nosi/nosi/r2_positional_twin.py nosi/nosi/r2_writeback.py \
          nosi/nosi/r2_twin_fused.py nosi/nosi/r2_body_fused.py nosi/nosi/r2_bi_decode.py \
-         nosi/nosi/stage1_seqused.py nosi/nosi/max_pooling_per_request.py; do
+         nosi/nosi/stage1_seqused.py nosi/nosi/max_pooling_per_request.py nosi/nosi/cache_engine.py \
+         nosi/nosi/flash_cache_engine/pool_update.cpp nosi/nosi/flash_cache_engine/pool_update_kernel.cu \
+         nosi/nosi/flash_cache_engine/flash_pool_swap.py; do
     git -C "$NOSI" rev-parse -q --verify "$NSHA:$f" > /dev/null || stop "$f is not tracked at $NSHA"
 done
 [ -f "$SIF" ] || stop "no image $SIF"
@@ -87,7 +115,7 @@ ENVS=(--env PYTHONPATH="$NOSI/nosi" --env PYTHONDONTWRITEBYTECODE=1 --env PYTHON
       --env TRITON_LIBCUDA_PATH=/.singularity.d/libs --env TRITON_CACHE_DIR="$JIT/triton"
       --env TORCH_EXTENSIONS_DIR="$JIT/torch_ext" --env FLASHINFER_WORKSPACE_BASE="$JIT/flashinfer"
       --env TVM_FFI_CACHE_DIR="$JIT/tvm_ffi" --env TMPDIR="$JIT/tmp"
-      --env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True --env NOSI_ATTN_SPLITS=$SPLITS --env NOSI_POOL_BLOCKS=0
+      --env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True --env NOSI_ATTN_SPLITS=$SPLITS --env NOSI_POOL_BLOCKS=$POOL
       --env NOSI_R2_DECODE=0 --env NOSI_MODEL_PATH="$MODEL" --env BASE_COMMIT="$NSHA")
 CHILD='case "${CUDA_VISIBLE_DEVICES:-}" in
     ""|*,*) echo "R2 base-fused child: CUDA_VISIBLE_DEVICES must name exactly one GPU (is \"${CUDA_VISIBLE_DEVICES:-}\")" >&2
@@ -104,9 +132,11 @@ ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) sr
       --ntasks=1 --cpus-per-task=16 --mem="$MEM" --gres=gpu:a100:1 --time="$STEP_MIN" --export=NONE
       /bin/sh -c "$CHILD" basef-child "$GPU_UUID" "$APPTAINER" --bind /mnt/beegfs/ojerbi:/mnt/beegfs/ojerbi "${ENVS[@]}"
       "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_base_cell.py" --out "$OUT" --model "$MODEL"
-      --workload "$WL" --batch "$BATCH" --steps 512 --warmup 2 --r2 fused "${GT[@]}")
+      --workload "$WL" --batch "$BATCH" --steps "$STEPS" --warmup 2 --r2 fused --arms "$ARMS" --pool "$POOL" "${GT[@]}"
+      "${MB[@]}")
 if [ "$DRY" = 1 ]; then
     echo "R2 base-fused step: DRYRUN (nothing claimed, written or launched); cell $CELL; pins OK: nosi $NSHA blob $blob workload $WL_SHA gpu_uuid $GPU_UUID (from $UFILE)"
+    echo "R2 base-fused step: cell $CELL: C $((63 + POOL)) (pool $POOL) B $BATCH arms $ARMS steps $STEPS STEP_MIN $STEP_MIN mem $MEM"
     printf '%q ' "${ARGV[@]}"
     echo
     exit 0
@@ -133,8 +163,9 @@ mkdir "$OUTROOT/basef_active" 2>/dev/null || stop "$OUTROOT/basef_active exists 
 mkdir "$REC" && mkdir -p "$JIT/tmp" || stop "cannot create $REC / $JIT (basef_active stays)"
 busy=$(nosteps) || stop "a step is running in $JOB under the claim: '$busy' (basef_active stays)"
 printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/command.txt (basef_active stays)"
-printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s cell=%s workload=%s utc_start=%s\n' \
-    "$NSHA" "$blob" "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "$CELL" "$WL_SHA" "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
+printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s cell=%s pool=%s batch=%s arms=%s steps=%s workload=%s utc_start=%s\n' \
+    "$NSHA" "$blob" "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "$CELL" "$POOL" "$BATCH" "$ARMS" "$STEPS" "$WL_SHA" \
+    "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
     stop "cannot write $REC (basef_active stays)"
 "${ARGV[@]}" < /dev/null > "$REC/stdout.txt" 2> "$REC/stderr.txt"
 rc=$?

@@ -34,6 +34,21 @@ GATES (MUST unless marked; "row-equal" = torch.equal of a row's output whatever 
 
 OUTPUT: --out/summary.json (gates, cost tables, environment); one GATE / REPORT line per gate on stdout; exit = the
 number of failed MUST gates, 2 = refused (--out exists).
+
+--gemm-scan (r2-mbase cell gm1; paper-notes/reconciliation-17pct.md row 7, "GEMM above M 320"): ONLY the GEMM cost
+scan, no B1-B5. The five decode linears (SHAPES + LM_HEAD, NOSA-8B) with random bf16 weights, CUDA-event medians
+(timed, --warm / --reps):
+  natural  cuBLAS F.linear at M live rows, for M in --ms (default SCAN_MS: 64 .. 1148) and every live count of the
+           EXACT pairs below;
+  padded   r2_spec_core.PaddedLinear(m_fix) called with M live rows (the copy into the fixed buffer included), for
+           (M, M) with M in --ms (all rows live) and the EXACT tick's pairs (u B, 4 B), u = 1 .. 4, B in --exact-b
+           (default 287, 216, 64): the tick's EXACT mode pads EVERY call to M_fix = 4 B (REG "step 7 budget").
+Per-step totals: 32 x (wqkv + wo + gate_up + down) + 1 x lm_head (the old M-scan's projection, 2175525). The dense
+verify term of the +17 % model at B 287, K 3: FAST = 3 natural(287) + natural(861); EXACT = 3 padded(287, 1148) +
+padded(861, 1148). MUST: GM-RAN (every (shape, M) timed, finite and > 0). REPORT: the padded rows' invariance at the
+largest pair (garbage vs zero past the live rows). PREDICTIONS: PRED_GM1 (natural per-step at each M; the old M-scan
+curve x the eager factor), PRED_GM1_RATIO (EXACT / natural at B 287), PRED_GM1_DENSE (FAST / EXACT dense vs HBM 213.90).
+--device cpu and --shape-div N exist for the CPU test only (host timer, shapes / N); the meta records both.
 """
 from __future__ import annotations
 
@@ -63,6 +78,28 @@ def shapes_from_config(cfg: dict) -> dict:
 # piece 3's registered time ratios (the coordinator's message of 2026-10-20): BI over B x (1 + u) rows against
 # FA2-NOSA split 4 over the B rows, keyed by (B, 1 + u)
 PIECE3_REGISTERED = {(64, 1): 1.4, (64, 2): 1.9, (64, 4): 2.8, (128, 1): 1.1, (128, 2): 1.6, (128, 4): 2.4}
+
+# --gemm-scan (gm1). lm_head (vocab_size, hidden_size) of /mnt/beegfs/ojerbi/models/NOSA-8B/config.json (test GM1).
+LM_HEAD = (73448, 4096)
+LAYERS = 32
+SCAN_MS = (64, 128, 256, 320, 512, 768, 861, 1024, 1148)
+SCAN_EXACT_B = (287, 216, 64)
+SCAN_U = 3
+# The old M-scan (retroinfer-eval docs/evidence/rows_bench_2175525/gemm_mscan.md, nova07, graph timing with an L2
+# flush): per-step ms. bigemm_v1 (2188818, this GPU f31fc723, eager CUDA events as here) measured cuBLAS natural
+# 16.13 / 22.00 / 28.31 at M 128 / 256 / 320: 1.106 / 1.098 / 1.112 x the old curve -> EAGER_FACTOR 1.105.
+OLD_MSCAN = {128: 14.59, 256: 20.03, 320: 25.46, 384: 27.26, 512: 34.62, 640: 42.93, 672: 51.68, 768: 52.07}
+EAGER_FACTOR = 1.105
+# natural per-step (point, low, high), ms. 64: bigemm_v1's 14.46. 128 .. 768: OLD x 1.105, +-10 %. Past 768
+# (extrapolated by 256-row tiles, about 17.45 ms per tile from 512 -> 768): 861 between 768 and 1024, 1024 = 4 tiles,
+# 1148 = 4.5-5 tiles; wider bands.
+PRED_GM1 = {64: (14.46, 13.0, 16.0), 128: (16.12, 14.5, 17.8), 256: (22.13, 19.9, 24.4), 320: (28.13, 25.3, 31.0),
+            512: (38.26, 34.4, 42.1), 768: (57.54, 51.8, 63.3), 861: (67.2, 57.5, 77.0), 1024: (76.8, 65.0, 88.0),
+            1148: (96.1, 77.0, 106.0)}
+# EXACT / natural per-step at B 287 (live rows u x 287, m_fix 1148): (point, low, high)
+PRED_GM1_RATIO = {287: (3.8, 2.8, 4.6), 861: (1.43, 1.1, 1.8)}
+# the dense verify term (ms) at B 287, K 3 against the model's HBM term 213.90 ms (FC:26, recon row 7):
+PRED_GM1_DENSE = dict(fast=(142.5, 120.0, 165.0), exact=(385.0, 300.0, 430.0), hbm_ms=213.90, model_dense_ms=126.34)
 
 
 def log(msg):
@@ -370,6 +407,197 @@ def b5(B, gen):
     return gate("B5_deterministic_selection", not bad, True, "R %d, ties at the cut; differing %s" % (R, bad[:10]))
 
 
+# ------------------------------------------------------------------ --gemm-scan (gm1)
+def lm_head_from_config(cfg: dict):
+    """(N, K) of lm_head from a HF config dict."""
+    return (int(cfg["vocab_size"]), int(cfg["hidden_size"]))
+
+
+def scan_shapes(div: int = 1) -> dict:
+    """The five linears (SHAPES + lm_head), every dimension divided by div (the CPU test only)."""
+    out = dict(SHAPES, lm_head=LM_HEAD)
+    return {k: (n // div, kk // div) for k, (n, kk) in out.items()}
+
+
+def scan_plan(ms, exact_bs, U: int = SCAN_U):
+    """(natural live counts, padded (live, m_fix) pairs), both sorted and without repeats: natural at every M of ms and
+    every live count u B (u = 1 .. U + 1) of the EXACT pairs; padded (M, M) for M in ms and (u B, (U + 1) B)."""
+    ms, bs = [int(m) for m in ms], [int(b) for b in exact_bs]
+    if not ms or min(ms) < 1 or any(b < 1 for b in bs):
+        raise ValueError("--ms and --exact-b need positive row counts")
+    nat = set(ms)
+    pad = {(m, m) for m in ms}
+    for b in bs:
+        for u in range(1, U + 2):
+            nat.add(u * b)
+            pad.add((u * b, (U + 1) * b))
+    return sorted(nat), sorted(pad)
+
+
+def per_step_totals(rows, key: str, layers: int = LAYERS):
+    """{group: layers x (wqkv + wo + gate_up + down) + lm_head} over the rows (dicts with 'shape', the group key and
+    'ms'). Refuses a group that lacks one of the five shapes or holds one twice."""
+    need = set(SHAPES) | {"lm_head"}
+    acc = {}
+    for r in rows:
+        g = acc.setdefault(r[key] if not isinstance(r[key], list) else tuple(r[key]), {})
+        if r["shape"] in g:
+            raise ValueError("group %s: shape %s twice" % (r[key], r["shape"]))
+        g[r["shape"]] = float(r["ms"])
+    out = {}
+    for g, d in acc.items():
+        if set(d) != need:
+            raise ValueError("group %s: shapes %s, need %s" % (g, sorted(d), sorted(need)))
+        out[g] = sum(v * (1 if s == "lm_head" else layers) for s, v in d.items())
+    return out
+
+
+def gemm_scan(ms, exact_bs, gen, warm, reps, U: int = SCAN_U, div: int = 1, dev: str = "cuda", timer=None):
+    """The gm1 timing scan. timer(fn) -> ms (default: the CUDA-event median timed(fn, warm, reps)). Returns the
+    natural rows, the padded rows and the padded-invariance report at the largest pair."""
+    import torch
+    import torch.nn.functional as F
+    from nosi.r2_spec_core import PaddedLinear
+    timer = timer or (lambda fn: timed(fn, warm, reps))
+    nat_ms, pad_pairs = scan_plan(ms, exact_bs, U)
+    rows_max = max(max(nat_ms), max(f for _, f in pad_pairs))
+    natural, padded, inv = [], [], {}
+    big = max(pad_pairs, key=lambda p: (p[1], -p[0]))                 # the largest m_fix, its smallest live count
+    for name, (N, K) in scan_shapes(div).items():
+        W = (torch.randn(N, K, generator=gen) * 0.02).to(dev, torch.bfloat16)
+        x = torch.randn(rows_max, K, generator=gen).to(dev, torch.bfloat16)
+        for M in nat_ms:
+            xm = x[:M].contiguous()
+            t = timer(lambda: F.linear(xm, W))
+            natural.append(dict(shape=name, N=N, K=K, M=M, ms=round(t, 5)))
+        pls = {}
+        for live, mfix in pad_pairs:
+            pl = pls.setdefault(mfix, PaddedLinear(mfix))
+            xm = x[:live].contiguous()
+            t = timer(lambda: pl(xm, W))
+            padded.append(dict(shape=name, N=N, K=K, M=live, M_fix=mfix, pair=[live, mfix], ms=round(t, 5)))
+        live, mfix = big
+        pl = pls[mfix]
+        buf = pl.buffer(K, torch.bfloat16, dev)
+        full = pl(x[:mfix], W).clone()
+        buf.copy_(torch.randn(mfix, K, generator=gen).to(dev, torch.bfloat16))
+        y1 = pl(x[:live], W).clone()
+        buf.zero_()
+        y2 = pl(x[:live], W).clone()
+        inv[name] = dict(live=live, m_fix=mfix, rows_differing_garbage=int((~(y1 == full[:live]).all(1)).sum()),
+                         rows_differing_zero=int((~(y2 == full[:live]).all(1)).sum()))
+        log("gm1 %s (%d x %d): natural %s; padded %s" % (name, N, K, [r["ms"] for r in natural if r["shape"] == name],
+                                                         [r["ms"] for r in padded if r["shape"] == name]))
+        del W, x, pls, buf
+        if dev == "cuda":
+            torch.cuda.empty_cache()
+    return natural, padded, inv
+
+
+def gm1_verdicts(nat_step, pad_step, U: int = SCAN_U):
+    """The registered gm1 predictions against the per-step totals (nat_step {M: ms}, pad_step {(live, m_fix): ms}):
+    [(name, verdict, detail)]; REPORT where a needed total is absent."""
+    out = []
+    for M, (pt, lo, hi) in sorted(PRED_GM1.items()):
+        v = nat_step.get(M)
+        out.append(("GM-NAT-%d" % M, "REPORT" if v is None else ("CONFIRMED" if lo <= v <= hi else "REFUTED"),
+                    "cuBLAS natural per step %s ms at M %d (point %s, band [%s, %s])" % (
+                        "n/a" if v is None else "%.3f" % v, M, pt, lo, hi)))
+    for B in SCAN_EXACT_B:
+        mfix = (U + 1) * B
+        for u in range(1, U + 2):
+            n, p = nat_step.get(u * B), pad_step.get((u * B, mfix))
+            if n is None or p is None:
+                continue
+            reg = PRED_GM1_RATIO.get(u * B) if B == 287 else None
+            r = p / n
+            v = "REPORT" if reg is None else ("CONFIRMED" if reg[1] <= r <= reg[2] else "REFUTED")
+            out.append(("GM-EXACT-%d-%d" % (u * B, mfix), v, "EXACT (live %d, M_fix %d) %.3f ms / natural %.3f ms = "
+                        "%.3f%s" % (u * B, mfix, p, n, r, "" if reg is None else " (point %s, band [%s, %s])" % reg)))
+    B, K = 287, U
+    mfix = (U + 1) * B
+    need_n, need_p = (B, K * B), ((B, mfix), (K * B, mfix))
+    hbm = PRED_GM1_DENSE["hbm_ms"]
+    if all(m in nat_step for m in need_n):
+        fast = 3 * nat_step[B] + nat_step[K * B]
+        pt, lo, hi = PRED_GM1_DENSE["fast"]
+        out.append(("GM-DENSE-FAST", "CONFIRMED" if lo <= fast <= hi else "REFUTED",
+                    "3 x natural(%d) + natural(%d) = %.2f ms (point %s, band [%s, %s]; model %s; HBM %s: %s)" % (
+                        B, K * B, fast, pt, lo, hi, PRED_GM1_DENSE["model_dense_ms"], hbm,
+                        "BINDING" if fast > hbm else "not binding")))
+    if all(p in pad_step for p in need_p):
+        ex = 3 * pad_step[need_p[0]] + pad_step[need_p[1]]
+        pt, lo, hi = PRED_GM1_DENSE["exact"]
+        out.append(("GM-DENSE-EXACT", "CONFIRMED" if lo <= ex <= hi else "REFUTED",
+                    "3 x padded(%d, %d) + padded(%d, %d) = %.2f ms (point %s, band [%s, %s]; HBM %s: %s)" % (
+                        B, mfix, K * B, mfix, ex, pt, lo, hi, hbm, "BINDING" if ex > hbm else "not binding")))
+    return out
+
+
+def run_gemm_scan(a) -> int:
+    """--gemm-scan: the gm1 cell (no B1-B5). Writes --out/summary.json; exit = the failed MUST gates."""
+    import math
+    import torch
+    os.makedirs(a.out)
+    gen = torch.Generator().manual_seed(a.seed)
+    ms = [int(x) for x in a.ms.split(",") if x]
+    bs = [int(x) for x in a.exact_b.split(",") if x]
+    gates, preds, tables = [], [], {}
+    timer = None
+    if a.device == "cpu":
+        def timer(fn):
+            for _ in range(a.warm):
+                fn()
+            xs = []
+            for _ in range(a.reps):
+                t0 = time.perf_counter()
+                fn()
+                xs.append((time.perf_counter() - t0) * 1e3)
+            return statistics.median(xs)
+    try:
+        natural, padded, inv = gemm_scan(ms, bs, gen, a.warm, a.reps, a.U, a.shape_div, a.device, timer)
+        nat_ms, pad_pairs = scan_plan(ms, bs, a.U)
+        want = len(scan_shapes(a.shape_div)) * (len(nat_ms) + len(pad_pairs))
+        got = natural + padded
+        bad = [r for r in got if not (isinstance(r["ms"], float) and math.isfinite(r["ms"]) and r["ms"] > 0)]
+        gates.append(gate("GM-RAN", len(got) == want and not bad, True,
+                          "%d of %d timings, %d not finite or <= 0" % (len(got), want, len(bad))))
+        nat_step = per_step_totals(natural, "M", LAYERS)
+        pad_step = per_step_totals(padded, "pair", LAYERS)
+        tables = dict(natural=natural, padded=padded, invariance=inv,
+                      per_step_natural={str(k): round(v, 4) for k, v in sorted(nat_step.items())},
+                      per_step_padded={"%d_%d" % k: round(v, 4) for k, v in sorted(pad_step.items())})
+        nbad = {k: v for k, v in inv.items() if v["rows_differing_garbage"] or v["rows_differing_zero"]}
+        gates.append(gate("R_GM_padded_invariance", True, False, "largest pair, rows differing: %s" % (
+            json.dumps(nbad) if nbad else "none (%s)" % json.dumps(inv))))
+        preds = gm1_verdicts(nat_step, pad_step, a.U)
+        for M, v in sorted(nat_step.items()):
+            log("gm1 per step natural M %d: %.3f ms" % (M, v))
+        for p, v in sorted(pad_step.items()):
+            log("gm1 per step padded live %d M_fix %d: %.3f ms" % (p[0], p[1], v))
+    except Exception as e:
+        traceback.print_exc()
+        gates.append(gate("GM-RAN", False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+    meta = dict(cell="gm1", ms=ms, exact_b=bs, U=a.U, warm=a.warm, reps=a.reps, seed=a.seed, device=a.device,
+                shape_div=a.shape_div, shapes=scan_shapes(a.shape_div), layers=LAYERS, torch=torch.__version__,
+                gpu=torch.cuda.get_device_name(0) if a.device == "cuda" else "cpu",
+                commit=os.environ.get("BI_COMMIT", "unknown"), old_mscan=OLD_MSCAN, eager_factor=EAGER_FACTOR,
+                predictions=dict(natural={str(k): v for k, v in PRED_GM1.items()},
+                                 ratio={str(k): v for k, v in PRED_GM1_RATIO.items()}, dense=PRED_GM1_DENSE))
+    with open(os.path.join(a.out, "summary.json"), "w") as f:
+        json.dump(dict(meta=meta, gates=gates, tables=tables,
+                       predictions=[dict(name=p[0], verdict=p[1], detail=p[2]) for p in preds]),
+                  f, indent=1, sort_keys=True, default=str)
+    for g in gates:
+        print("%s %s %s: %s" % ("GATE" if g["must"] else "REPORT", g["name"], "PASS" if g["passed"] else "FAIL",
+                                g["detail"][:400]))
+    for p in preds:
+        print("PREDICTION %s %s: %s" % p)
+    nfail = sum(1 for g in gates if g["must"] and not g["passed"])
+    print("r2_bi_microgate gm1: %d MUST gate(s) failed" % nfail)
+    return min(nfail, 125)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -381,10 +609,26 @@ def main(argv=None) -> int:
     ap.add_argument("--biattn", default=None, help="piece 3's bi_paged_attention.py (a pinned copy)")
     ap.add_argument("--bigemm", default=None, help="the BI GEMM module of the bigemm branch (a pinned copy)")
     ap.add_argument("--bigemm-fn", default=None, help="its function: fn(x (M, K), w (N, K)) -> (M, N)")
+    ap.add_argument("--gemm-scan", action="store_true", help="the gm1 cell: the GEMM cost scan only (no B1-B5)")
+    ap.add_argument("--ms", default=",".join(str(m) for m in SCAN_MS))
+    ap.add_argument("--exact-b", default=",".join(str(b) for b in SCAN_EXACT_B))
+    ap.add_argument("--device", default="cuda", choices=("cuda", "cpu"), help="cpu: the CPU test only (--gemm-scan)")
+    ap.add_argument("--shape-div", type=int, default=1, help="shapes / N: the CPU test only (--gemm-scan)")
     a = ap.parse_args(sys.argv[1:] if argv is None else argv)
     if os.path.exists(a.out):
         print("REFUSED: --out %s exists" % a.out, file=sys.stderr)
         return 2
+    if (a.device != "cuda" or a.shape_div != 1) and not a.gemm_scan:
+        print("REFUSED: --device / --shape-div go with --gemm-scan", file=sys.stderr)
+        return 2
+    if a.shape_div < 1:
+        print("REFUSED: --shape-div >= 1", file=sys.stderr)
+        return 2
+    if a.gemm_scan:
+        if a.biattn or a.bigemm:
+            print("REFUSED: --gemm-scan takes no --biattn / --bigemm", file=sys.stderr)
+            return 2
+        return run_gemm_scan(a)
     if (a.bigemm is None) != (a.bigemm_fn is None):
         print("REFUSED: --bigemm and --bigemm-fn go together", file=sys.stderr)
         return 2

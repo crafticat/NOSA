@@ -15,6 +15,9 @@
 #   DRYRUN=1 bash benchmarks/Efficiency/r2_bi_step.sh --nosi <sha> <holder job> <run id>
 #        (login node: the pin checks and the printed step command; no squeue, claim, srun or write)
 #   In DRYRUN only, BI_HOLDERS=<dir> replaces HOLDERS (the CPU test S13 uses it); a real run refuses BI_HOLDERS.
+#   bash benchmarks/Efficiency/r2_bi_step.sh --nosi <sha> <holder job> <run id> gm1
+#        (r2-mbase cell gm1: r2_bi_microgate.py --gemm-scan, the GEMM cost scan at M 64 .. 1148 and the EXACT tick's
+#        pairs (u B, 4 B) for B 287 / 216 / 64; no B1-B5, no piece 3; STEP_MIN 15; output bi_<run>_<holder>_gm1)
 #
 # OUTPUT: OUTROOT/bi_<run>_<holder>/summary.json and the step record OUTROOT/bi_<run>_<holder>.step/ (command with the
 # uuid and its file, stdout with one GATE / REPORT line per gate, stderr, exit + accounting, sacct row), both frozen.
@@ -22,7 +25,7 @@
 # 124 / 137 the host timeout; 1 a STOP before the launch (a missing or malformed uuid file included); 5 an exit-0 step
 # whose record is incomplete or whose sacct row is not COMPLETED 0:0.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-m2-spec                                                  # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-mbase                                                    # ROOT
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -39,12 +42,17 @@ BIGEMM_BLOB=                                                                    
 BIGEMM_FN=                                                                               # PIN (unset)
 SELF=benchmarks/Efficiency/r2_bi_step.sh
 STEP_MIN=30
-MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 BI step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_bi_step.sh --nosi <sha> <holder> <run id>" >&2; exit 2; }
-[ $# = 4 ] && [ "$1" = --nosi ] || usage
-NSHA=$2 JOB=$3 RUN=$4
+usage() { echo "usage: r2_bi_step.sh --nosi <sha> <holder> <run id> [gm1]" >&2; exit 2; }
+{ [ $# = 4 ] || [ $# = 5 ]; } && [ "$1" = --nosi ] || usage
+NSHA=$2 JOB=$3 RUN=$4 CELL=${5:-}
+case $CELL in
+    "") ;;
+    gm1) STEP_MIN=15 ;;
+    *) stop "cell '$CELL' (none or gm1)" ;;
+esac
+MIN_LEFT=$((STEP_MIN * 60 + 600))
 DRY=${DRYRUN:-0}
 [[ $NSHA =~ ^[0-9a-f]{40}$ ]] || stop "--nosi '$NSHA' is not a full commit id"
 case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
@@ -79,12 +87,15 @@ if [ -n "$BIGEMM_SHA$BIGEMM_PATH$BIGEMM_BLOB$BIGEMM_FN" ]; then
         stop "BI GEMM: $BIGEMM_PATH at $BIGEMM_SHA is not the blob $BIGEMM_BLOB"
 fi
 [ -f "$SIF" ] || stop "no image $SIF"
-OUT=$OUTROOT/bi_${RUN}_$JOB
+OUT=$OUTROOT/bi_${RUN}_$JOB${CELL:+_$CELL}
 REC=$OUT.step
-JIT=$JITBASE/bi_${RUN}_$JOB
-NAME=bi-${RUN}-$JOB
+JIT=$JITBASE/bi_${RUN}_$JOB${CELL:+_$CELL}
+NAME=bi-${RUN}-$JOB${CELL:+-$CELL}
 ATTN_MOD=$REC/piece3_bi_paged_attention.py
-[ -z "$BIGEMM_SHA" ] || GEMM_ARGS=(--bigemm "$REC/bigemm_$(basename "$BIGEMM_PATH")" --bigemm-fn "$BIGEMM_FN")
+[ -z "$BIGEMM_SHA" ] || [ -n "$CELL" ] || GEMM_ARGS=(--bigemm "$REC/bigemm_$(basename "$BIGEMM_PATH")" --bigemm-fn "$BIGEMM_FN")
+PYARGS=(--batches 64,128 --U 3 --warm 5 --reps 30 --seed 7 --biattn "$ATTN_MOD" ${GEMM_ARGS[@]+"${GEMM_ARGS[@]}"})
+[ "$CELL" != gm1 ] || PYARGS=(--gemm-scan --ms 64,128,256,320,512,768,861,1024,1148 --exact-b 287,216,64 --U 3 --warm 5
+                              --reps 30 --seed 7)
 ENVS=(--env PYTHONPATH="$NOSI/nosi" --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONUNBUFFERED=1 --env TORCH_CUDA_ARCH_LIST=8.0
       --env TRITON_LIBCUDA_PATH=/.singularity.d/libs --env TRITON_CACHE_DIR="$JIT/triton"
       --env TORCH_EXTENSIONS_DIR="$JIT/torch_ext" --env FLASHINFER_WORKSPACE_BASE="$JIT/flashinfer"
@@ -103,10 +114,10 @@ exec "$A" exec --nv --cleanenv --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES
 ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) srun --jobid="$JOB" --job-name="$NAME"
       --ntasks=1 --cpus-per-task=8 --mem=64G --gres=gpu:a100:1 --time="$STEP_MIN" --export=NONE
       /bin/sh -c "$CHILD" bi-child "$GPU_UUID" "$APPTAINER" --bind /mnt/beegfs/ojerbi:/mnt/beegfs/ojerbi "${ENVS[@]}"
-      "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_bi_microgate.py" --out "$OUT" --batches 64,128 --U 3
-      --warm 5 --reps 30 --seed 7 --biattn "$ATTN_MOD" ${GEMM_ARGS[@]+"${GEMM_ARGS[@]}"})
+      "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_bi_microgate.py" --out "$OUT" "${PYARGS[@]}")
 if [ "$DRY" = 1 ]; then
     echo "R2 BI step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob gpu_uuid $GPU_UUID ($UFILE)"
+    echo "R2 BI step: cell ${CELL:-default} STEP_MIN $STEP_MIN"
     echo "R2 BI step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; BI GEMM ${BIGEMM_SHA:-unset}${BIGEMM_SHA:+:$BIGEMM_PATH blob $BIGEMM_BLOB fn $BIGEMM_FN}"
     printf '%q ' "${ARGV[@]}"
     echo
@@ -120,6 +131,7 @@ left=0
 case $sl in
     *-*:*:*) left=$(( ${sl%%-*} * 86400 + 10#$(echo "${sl#*-}" | cut -d: -f1) * 3600 + 10#$(echo "$sl" | cut -d: -f2) * 60 )) ;;
     *:*:*) left=$(( 10#$(echo "$sl" | cut -d: -f1) * 3600 + 10#$(echo "$sl" | cut -d: -f2) * 60 )) ;;
+    *:*) left=$(( 10#${sl%%:*} * 60 )) ;;                       # squeue prints MM:SS below one hour
 esac
 [ "$left" -ge "$MIN_LEFT" ] || stop "holder $JOB has $sl left (< $MIN_LEFT s)"
 nosteps() {
@@ -132,15 +144,18 @@ mkdir "$OUTROOT/bi_active" 2>/dev/null || stop "$OUTROOT/bi_active exists (anoth
 [ ! -e "$OUT" ] && [ ! -e "$REC" ] && [ ! -e "$JIT" ] || stop "$OUT, $REC or $JIT exists: a new run id (bi_active stays)"
 mkdir "$REC" && mkdir -p "$JIT/tmp" || stop "cannot create $REC / $JIT (bi_active stays)"
 busy=$(nosteps) || stop "a step is running in $JOB under the claim: '$busy' (bi_active stays)"
-git -C "$NOSI" show "$BIATTN_BLOB" > "$ATTN_MOD" && [ "$(git hash-object -- "$ATTN_MOD")" = "$BIATTN_BLOB" ] ||
-    stop "cannot copy piece 3's blob $BIATTN_BLOB to $ATTN_MOD (bi_active stays)"
-if [ -n "$BIGEMM_SHA" ]; then
+if [ -z "$CELL" ]; then                                  # gm1 loads neither piece 3 nor the BI GEMM
+    git -C "$NOSI" show "$BIATTN_BLOB" > "$ATTN_MOD" && [ "$(git hash-object -- "$ATTN_MOD")" = "$BIATTN_BLOB" ] ||
+        stop "cannot copy piece 3's blob $BIATTN_BLOB to $ATTN_MOD (bi_active stays)"
+fi
+if [ -n "$BIGEMM_SHA" ] && [ -z "$CELL" ]; then
     git -C "$NOSI" show "$BIGEMM_BLOB" > "${GEMM_ARGS[1]}" && [ "$(git hash-object -- "${GEMM_ARGS[1]}")" = "$BIGEMM_BLOB" ] ||
         stop "cannot copy the BI GEMM blob $BIGEMM_BLOB to ${GEMM_ARGS[1]} (bi_active stays)"
 fi
 printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/command.txt (bi_active stays)"
-printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s utc_start=%s\n' "$NSHA" "$blob" \
-    "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "$(date -u +%FT%TZ)" >> "$REC/command.txt" || stop "cannot write $REC (bi_active stays)"
+printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s cell=%s utc_start=%s\n' "$NSHA" \
+    "$blob" "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "${CELL:-default}" "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
+    stop "cannot write $REC (bi_active stays)"
 printf 'biattn=%s:%s blob=%s copy=%s bigemm=%s:%s blob=%s fn=%s\n' "$BIATTN_SHA" "$BIATTN_PATH" "$BIATTN_BLOB" "$ATTN_MOD" \
     "${BIGEMM_SHA:-unset}" "${BIGEMM_PATH:-}" "${BIGEMM_BLOB:-}" "${BIGEMM_FN:-}" >> "$REC/command.txt" ||
     stop "cannot write $REC (bi_active stays)"
