@@ -101,7 +101,7 @@ the xpool refusal in `FusedResolver.__init__`. That costs xpool's own launches o
 | `test_FR4_every_triton_function_resolves_its_names_in_its_module` | L36 lint incl. `_fr_scan` |
 | `test_FR5_a_free_running_round_on_b2_check_equals_torch` | one tick-level round, check == torch |
 | `test_FR6a_overflow_dup_behind_overflow_and_an_in_row_duplicate` | M5 hand case: v_over, v_dup_over, sel_dup > 0 asserted first; equal at both layers; then CapacityRefusal |
-| `test_FR6b_two_draft_rows_of_one_batch_slot` | M5 hand case, ONE tick: 2 draft rows of one b, d_dup > 0 first; equal at both layers; then the SAME B2 refusal (d_merge) in torch and check mode; proof that production never builds the case: r2_tick.py RoundState.finish_tick (228-230) refuses "two draft rows" (source pin) |
+| `test_FR6b_two_draft_rows_of_one_batch_slot` | M5 hand case (fusedres2d): up to six ticks with 2 draft rows of one b, stopping at B2's first refusal; d_dup > 0 first; equal at every resolved layer; the SAME refusal (d_merge) at the SAME tick in torch and check mode (job 2191261: tick 0 alone does not refuse); proof that production never builds the case: r2_tick.py RoundState.finish_tick (228-230) refuses "two draft rows" (source pin) |
 | `test_FR7_the_shared_fixtures_in_check_mode` | every C fixture: B2 (fused) == reference; fused == torch; void_overflow reaches v_over |
 | `test_FR8_the_kernel_time_parser_and_its_negative_control` | M3 parser on synthetic Kineto traces; a launch moved out of t.res is not counted; orphans counted; no t.tick refused |
 | `test_FR9_the_sg5_flags_for_the_plant_and_the_profile` | the two SG5 flags and their wiring |

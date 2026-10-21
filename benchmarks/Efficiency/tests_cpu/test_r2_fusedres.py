@@ -215,33 +215,43 @@ if PART == "lockstep":
                     diffs=[list(d) for d in fr.diffs[:8]], stats=rep["stats"], err=rep["err"], L=L)
 
     def hand_two_drafts(mode):
-        """ONE tick with two draft rows of batch slot 0 whose selections overlap (the draft first-miss dedup across
-        rows). Production never builds it (r2_tick.py RoundState.finish_tick refuses "two draft rows"), and B2's
+        """Ticks with two draft rows of batch slot 0 whose selections overlap (the draft first-miss dedup across
+        rows), up to B2's first refusal. Production never builds it (r2_tick.py RoundState.finish_tick refuses "two draft rows"), and B2's
         consumer refuses its draft merges into a take of the same tick (d_merge): so the claim is decision equality
         at both layers, and the SAME refusal at end_tick in torch and in check mode."""
+        # job 2191261: tick 0 alone does not refuse (its dups are merged into same-tick takes without a d_merge
+        # violation); 2191259's six-tick world (landing after each tick) did refuse with d_merge. So the same six
+        # ticks run in both modes and stop at the FIRST raise: the claim is the same tick and the same text.
         w = TRM.world(C=2, X=4, R_ver=2, cls=OWN2.OwnResidency, svc_kw=dict(nblk=TRM.NB, resolve=mode))
         svc = w.svc
         svc.begin_request(0, "u0")
         svc.begin_request(1, "u1")
         hb, tail = 15, svc.tail0
-        rows = [Row(0, "d", ("u0", 1, 1), 1000, hb, [(hb, tail)]), Row(0, "d", ("u0", 1, 2), 1000, hb, [(hb, tail)]),
-                Row(1, "d", ("u1", 1, 1), 1000, hb, [(hb, tail)])]
-        sel = S_([[2, 3, 4, hb], [2, 3, 4, hb]], [[3, 4, 5, hb], [3, 4, 5, hb]], [[4, 6, hb], [4, 6, hb]])
-        svc.poll()
-        for l in range(L):
-            plan = svc.resolve(l, rows, sel)
-            svc.read_done(l, plan, Ev(True))
-        raised = None
-        try:
-            svc.end_tick()
-        except Exception as e:                                        # noqa: BLE001
-            raised = "%s: %s" % (type(e).__name__, str(e)[:160])
+        raised = raised_tick = None
+        for t in range(6):
+            x = t % 5
+            rows = [Row(0, "d", ("u0", 1, 1), 1000 + t, hb, [(hb, tail)]),
+                    Row(0, "d", ("u0", 1, 2), 1000 + t, hb, [(hb, tail)]),
+                    Row(1, "d", ("u1", 1, 1), 1000 + t, hb, [(hb, tail)])]
+            sel = S_([[x, x + 1, x + 2, hb], [x, x + 1, x + 2, hb]],
+                     [[x + 1, x + 2, x + 3, hb], [x + 1, x + 2, x + 3, hb]],
+                     [[x + 2, x + 4, hb], [x + 2, x + 4, hb]])
+            try:
+                svc.poll()
+                for l in range(L):
+                    plan = svc.resolve(l, rows, sel)
+                    svc.read_done(l, plan, Ev(True))
+                svc.end_tick()
+                TRM.land_all(w)
+            except Exception as e:                                    # noqa: BLE001
+                raised, raised_tick = "%s: %s" % (type(e).__name__, str(e)[:160]), t
+                break
         fr = svc.fusedres
         if fr is None:
-            return dict(raised=raised)
+            return dict(raised=raised, raised_tick=raised_tick)
         rep = fr.report()
-        return dict(raised=raised, L=L, compared=fr.compared, layers=fr.layers, n_diffs=len(fr.diffs),
-                    diffs=[list(d) for d in fr.diffs[:8]], stats=rep["stats"], err=rep["err"],
+        return dict(raised=raised, raised_tick=raised_tick, L=L, compared=fr.compared, layers=fr.layers,
+                    n_diffs=len(fr.diffs), diffs=[list(d) for d in fr.diffs[:8]], stats=rep["stats"], err=rep["err"],
                     max_rows_per_b=rep["max_rows_per_b"])
 
     OUT["hand"] = dict(overflow=hand_overflow(), two_drafts=hand_two_drafts("check"),
@@ -552,11 +562,12 @@ def test_FR6b_two_draft_rows_of_one_batch_slot(lockstep):
     r, t = lockstep["hand"]["two_drafts"], lockstep["hand"]["two_drafts_torch"]
     assert r["max_rows_per_b"][1] == 2 and r["stats"]["d_dup"] > 0, ("precondition", r["max_rows_per_b"],
                                                                       r["stats"])
-    assert r["compared"] == r["layers"] == r["L"], r
-    assert r["n_diffs"] == 0, r["diffs"]                               # fused == torch at both layers
-    assert r["err"] == 0, r["err"]
-    assert r["raised"] is not None and r["raised"] == t["raised"], (r["raised"], t["raised"])   # same refusal
+    assert r["raised"] is not None, "the six-tick world must reach B2's refusal (2191259 saw d_merge)"
+    assert (r["raised_tick"], r["raised"]) == (t["raised_tick"], t["raised"]), (r, t)   # same tick, same text
     assert "d_merge" in r["raised"], r["raised"]
+    assert r["compared"] == r["layers"] == (r["raised_tick"] + 1) * r["L"], r   # every resolved layer compared
+    assert r["n_diffs"] == 0, r["diffs"]                               # fused == torch at every layer
+    assert r["err"] == 0, r["err"]
     src = (NOSI / "r2_tick.py").read_text()
     assert 'raise RuntimeError("tick: request %d has two draft rows" % row.b)' in src   # the production refusal
 
