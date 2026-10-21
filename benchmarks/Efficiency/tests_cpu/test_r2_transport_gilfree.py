@@ -495,6 +495,162 @@ def test_GT7_the_cpp_worker_runs_while_the_main_thread_holds_the_gil(v3, worker)
         assert (reached, seen) == (0, 0) and ms >= 3000, (reached, seen, ms)   # NEGATIVE CONTROL
 
 
+def _takes(seed=3, per_layer=9):
+    """Q-B3 takes over both layers: (l, b, h, block, slot, gen), the destinations distinct per layer, slot < NPOS - 1
+    (room for the planted shift), the generations distinct."""
+    rnd = random.Random(seed)
+    out = []
+    for l in range(L):
+        dst = rnd.sample([(b, h, s) for b in range(B) for h in range(H) for s in range(NPOS - 1)], per_layer)
+        out += [(l, b, h, rnd.randrange(NB), s, 3 + len(out) + i) for i, (b, h, s) in enumerate(dst)]
+    return out
+
+
+def _desc(takes):
+    return torch.tensor([list(col) for col in zip(*takes)], dtype=torch.int64)       # (6, n)
+
+
+def _cpp(v3, host_wait=lambda ev: None, board=True):
+    host_k, host_v, gk, gv, _, _ = _world()
+    gf = GF.GilfreeTransport(v3.ext, host_k, host_v, gk, gv, BS, D, threads=2, host_wait=host_wait, cap_groups=4,
+                             worker="cpp")
+    bd = None
+    if board:
+        bd = SCG.GenBoard(L, B, H, NPOS, "cpu")
+        gf.attach_board(bd)
+    return gf, host_k, host_v, gk, gv, bd
+
+
+def test_GT8_issue_desc_lands_what_issue_lands(v3):
+    """GT8 (Q-B3, the CPU LOCKSTEP): the same takes over both layers, issued as per-layer Transfer objects
+    (issue(layer, transfers), unchanged) and as ONE (6, n) descriptor (issue_desc), land BITWISE the same store rows
+    and the same generation board; the rows are the host truth; groups and publications are counted alike; one job.
+    Negative control: the descriptor path with a planted wrong slot mapping (set_plant_slot_shift(1): every take one
+    slot off) does not land the same store."""
+    takes = _takes()
+    ga, hk, hv, ak, av, aboard = _cpp(v3)
+    seq = 0
+    for l in range(L):
+        mine = [t for t in takes if t[0] == l]
+        trs = [TR.Transfer(seq + i, "u%d" % b, l, b, h, blk, s, gen, "draft", ("u%d" % b, 1, 1))
+               for i, (_, b, h, blk, s, gen) in enumerate(mine)]
+        seq += len(trs)
+        ga.issue(l, trs)
+    ga.flush()
+    ga.close()
+    gb, _, _, bk, bv, bboard = _cpp(v3)
+    s1 = gb.issue_desc(_desc(takes))
+    gb.flush()
+    assert s1 == 1 and gb.landed_upto() == 1
+    gb.close()
+    for l in range(L):
+        assert torch.equal(ak[l], bk[l]) and torch.equal(av[l], bv[l]), l
+    assert torch.equal(aboard.t, bboard.t) and int(bboard.t.count_nonzero()) == len(takes)
+    by_layer = [(l, [(b, h, blk, s) for (ll, b, h, blk, s, _) in takes if ll == l]) for l in range(L)]
+    assert _truth_ok(bk, bv, hk, hv, by_layer)
+    assert gb.stats["groups"] == ga.stats["groups"] == len(takes) and gb.stats["published"] == len(takes)
+    assert gb.stats["releases"] == 1 and ga.stats["releases"] == L and gb.threads_ok()
+    gc, _, _, ck, cv, _ = _cpp(v3)
+    gc.npipe.set_plant_slot_shift(1)                           # NEGATIVE CONTROL: a wrong slot mapping
+    gc.issue_desc(_desc(takes))
+    gc.flush()
+    gc.close()
+    assert not all(torch.equal(ak[l], ck[l]) and torch.equal(av[l], cv[l]) for l in range(L))
+
+
+class _Stream:
+    """The CPU stand-in of ONE device stream: its events complete in record order (waiting one completes the earlier)."""
+
+    def __init__(self):
+        self.done_upto, self.n = -1, 0
+
+    def record(self):
+        ev = _StreamEv(self, self.n)
+        self.n += 1
+        return ev
+
+
+class _StreamEv:
+    def __init__(self, stream, k):
+        self.stream, self.k = stream, k
+
+    def query(self):
+        return self.k <= self.stream.done_upto
+
+    def synchronize(self):
+        self.stream.done_upto = max(self.stream.done_upto, self.k)
+
+
+def test_GT9_reader_and_write_back_marks(v3):
+    """GT9 (Q-B3, T3 / T4 as marks): three ticks of per-layer reader events and write-back events on ONE stream
+    (completing in record order), registered by mark (mark_reader(tick * L + l), mark_hist(tick)). Every take's slot
+    has a last-reader tick; issue_desc gets per layer the newest mark of its takes and the newest write-back tick.
+    Then, before the rows land, every take's last-reader event is complete, and the job lands the host truth. A mark
+    that was never registered is refused. Negative control: an OLDER reader mark for layer 1 (one tick early) leaves a
+    take's last reader pending when its rows land."""
+    takes = _takes()
+    rt = []                                                    # each take's last-reader tick
+    for i, t in enumerate(takes):
+        rt.append(i % 2 if t[0] == 0 else i % 3)              # layer 0: ticks 0 / 1; layer 1: ticks 0 / 1 / 2
+    assert max(r for r, t in zip(rt, takes) if t[0] == 1) == 2 and max(r for r, t in zip(rt, takes) if t[0] == 0) == 1
+
+    def run(older):
+        st = _Stream()
+        gf, hk, hv, gk, gv, _ = _cpp(v3, host_wait=lambda ev: ev.synchronize(), board=False)
+        evs = {}
+        for t in range(3):
+            for l in range(L):
+                evs[(t, l)] = st.record()
+                gf.mark_reader(t * L + l, evs[(t, l)])
+            gf.mark_hist(t, st.record())
+        marks = [max(r * L + l for r, tk in zip(rt, takes) if tk[0] == l) for l in range(L)]
+        if older:
+            marks[1] -= L                                      # NEGATIVE CONTROL: one tick early for layer 1
+        gf.issue_desc(_desc(takes), torch.tensor(marks), hist_mark=1)
+        pending = [i for i, (r, tk) in enumerate(zip(rt, takes)) if not evs[(r, tk[0])].query()]
+        gf.flush()
+        with pytest.raises(ValueError, match="never registered"):
+            gf.issue_desc(_desc(takes[:1]), torch.tensor([-1, 99]), hist_mark=-1)
+        gf.close()
+        by_layer = [(l, [(b, h, blk, s) for (ll, b, h, blk, s, _) in takes if ll == l]) for l in range(L)]
+        return pending, _truth_ok(gk, gv, hk, hv, by_layer)
+    pending, ok = run(False)
+    assert pending == [] and ok, pending
+    pending2, ok2 = run(True)
+    assert pending2 and ok2, pending2                          # detected: a take landed before its last reader
+
+
+def test_GT10_the_job_watermark_grows_and_a_failed_job_never_lands(v3):
+    """GT10 (Q-B3, host admission): landed_upto() over a run of descriptor jobs and one object job: it never shrinks,
+    never passes the submitted jobs, and reaches the last job after flush. A failed job (a block past the host rows)
+    never lands: the watermark stops below it (also after later good jobs), and its error is raised at the next poll
+    (negative control of a watermark that would count jobs, not landings)."""
+    gf, _, _, _, _, _ = _cpp(v3)
+    takes = _takes()
+    seen, seqs = [], []
+    for k in range(6):
+        if k == 3:
+            gf.issue(0, [TR.Transfer(900 + i, "u%d" % b, 0, b, h, blk, s, gen, "draft", ("u%d" % b, 1, 1))
+                         for i, (_, b, h, blk, s, gen) in enumerate(takes[:4])])
+            seqs.append(gf._last_seq)
+        else:
+            seqs.append(gf.issue_desc(_desc(_takes(seed=10 + k))))
+        seen.append(gf.landed_upto())
+    gf.flush()
+    seen.append(gf.landed_upto())
+    assert seqs == list(range(1, 7)), seqs
+    assert seen == sorted(seen) and seen[-1] == 6 and all(0 <= v <= s for v, s in zip(seen, seqs)), seen
+    bad = gf.issue_desc(_desc([(0, 0, 0, NB, 1, 99)]))         # block NB: past the complete host blocks
+    gf.flush()
+    assert bad == 7 and gf.landed_upto() == 6
+    with pytest.raises(RuntimeError, match="outside the geometry"):
+        gf.poll()
+    good = gf.issue_desc(_desc(takes))
+    gf.flush()
+    assert good == 8 and gf.landed_upto() == 6                 # a failed job never lands, nor what follows it
+    gf.close()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU-only: the later GPU gate runs it")
 def test_GTG1_gpu_exact_wait_without_the_submission_wait(v3):
     """GTG1 (GPU-ONLY; the later GPU gate): S-C's exact wait WITHOUT its submission wait (CudaDeviceOps._submitted,

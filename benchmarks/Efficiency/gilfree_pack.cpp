@@ -61,6 +61,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <tuple>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -250,6 +251,8 @@ struct Job {
   std::vector<int64_t> stats;                               // release_impl's stats
   std::string error;                                        // "" = the job ran
   at::cuda::CUDAEvent done_ev;                              // CUDA: recorded on the scatter stream after the release
+  bool is_desc = false;                                     // Q-B3: a descriptor job (submit_desc)
+  std::vector<int64_t> desc;                                // its (6, n) rows l, b, h, block, slot, gen (a copy)
 };
 
 constexpr int kStats = 10;                    // groups, chunks, layers, pack, wait, submit, total, team lo, team hi, published
@@ -380,6 +383,73 @@ class NativePipe {
     return j->seq;
   }
 
+  // ------------------------------------------------------------------------------------------------ Q-B3
+  // The descriptor path: the layers' stores (the base tensors, alive in Python), registered once. The sources must be
+  // the adapter's: one (1, S, H, D) per (layer, request), in the order layer * B + b.
+  void set_stores(std::vector<at::Tensor> sk, std::vector<at::Tensor> sv) {
+    TORCH_CHECK(have_src_, "set_sources first");
+    TORCH_CHECK(!sk.empty() && sk.size() == sv.size(), "set_stores: K and V lists of one length");
+    const at::Tensor& s0 = sk[0];
+    TORCH_CHECK(s0.dim() == 4 && s0.size(3) == src_.D && s0.size(2) == src_.H && s0.size(1) % R_ == 0,
+                "set_stores: the stores are (B, rows, H, D) with whole R-row slots and the sources' H and D");
+    for (size_t i = 0; i < sk.size(); ++i) {
+      for (const at::Tensor* t : {&sk[i], &sv[i]}) {
+        TORCH_CHECK(t->sizes() == s0.sizes() && t->is_contiguous() && t->scalar_type() == src_.dtype &&
+                        t->device() == land_.device(),
+                    "set_stores: every store is contiguous, of the first one's shape, the sources' dtype, where the "
+                    "landing ring lives");
+      }
+    }
+    TORCH_CHECK(src_.B == 1 && static_cast<int64_t>(src_.k.size()) == static_cast<int64_t>(sk.size()) * s0.size(0),
+                "set_stores: the sources must be one (1, S, H, D) per (layer, request) (the adapter's)");
+    stores_k_ = std::move(sk);
+    stores_v_ = std::move(sv);
+    dB_ = s0.size(0);
+    dH_ = s0.size(2);
+    dslots_ = s0.size(1) / R_;
+  }
+
+  // ONE job of a whole tick's takes: desc (6, n) int64 CPU rows l, b, h, block, slot, gen (copied here: the tensor
+  // stays in Python); readers: per layer the raw cudaEvent_t of the newest last reader of its destinations (0 none);
+  // hist: the raw cudaEvent_t of the newest write-back the job's host rows need (0 none). -> its job seq.
+  int64_t submit_desc(at::Tensor desc, std::vector<int64_t> readers, int64_t hist) {
+    TORCH_CHECK(!stores_k_.empty(), "set_stores first");
+    TORCH_CHECK(desc.device().is_cpu() && desc.scalar_type() == at::kLong && desc.dim() == 2 && desc.size(0) == 6 &&
+                    desc.size(1) > 0 && desc.is_contiguous(),
+                "submit_desc: desc is a non-empty contiguous (6, n) int64 CPU tensor (l, b, h, block, slot, gen)");
+    TORCH_CHECK(readers.empty() || readers.size() == stores_k_.size(), "submit_desc: one reader handle per layer");
+    auto j = std::make_shared<Job>();
+    j->is_desc = true;
+    const int64_t* p = desc.data_ptr<int64_t>();
+    j->desc.assign(p, p + desc.numel());
+    j->readers = std::move(readers);
+    if (hist != 0) j->hist.push_back(hist);
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      TORCH_CHECK(running_ && !stop_, "start_worker first (and not after stop_worker)");
+      j->seq = ++next_seq_;
+      jobs_.push_back(j);
+      pending_.push_back(j);
+    }
+    cv_work_.notify_one();
+    return j->seq;
+  }
+
+  // The job watermark: the largest seq such that every job up to it ran without error and (CUDA) its completion
+  // event is done. Jobs run in FIFO order and complete in order on one scatter stream, so it only grows; a failed job
+  // never lands (the watermark stops there; its error is raised at the next poll / issue).
+  int64_t landed_upto() {
+    std::lock_guard<std::mutex> lk(mu_);
+    while (landed_ < submitted_.load()) {
+      const std::shared_ptr<Job>& j = jobs_[landed_];
+      if (!j->error.empty() || (cuda_ && !j->done_ev.query())) break;
+      ++landed_;
+    }
+    return landed_;
+  }
+
+  void set_plant_slot_shift(int64_t s) { plant_slot_ = s; }   // NEGATIVE CONTROL (tests only): a wrong slot mapping
+
   int64_t submitted() const { return submitted_.load(); }
   int64_t completed() const { return completed_.load(); }
 
@@ -448,7 +518,7 @@ class NativePipe {
  private:
   std::vector<int64_t> release_impl(const at::Tensor& b, const at::Tensor& h, const at::Tensor& l,
                                     const at::Tensor& m, const at::Tensor& blk, at::Tensor scr_k2d, at::Tensor scr_v2d,
-                                    const at::Tensor* bflat, const at::Tensor* bgen) {
+                                    const at::Tensor* bflat, const at::Tensor* bgen, bool count = true) {
     TORCH_CHECK(have_src_, "set_sources first");
     const Release r = check_release(b, h, l, m, blk);
     TORCH_CHECK(scr_k2d.dim() == 2 && scr_k2d.size(1) == src_.D && scr_v2d.sizes() == scr_k2d.sizes() &&
@@ -540,8 +610,95 @@ class NativePipe {
       ++k_;
       ++chunks;
     }
-    completed_.fetch_add(1);
+    if (count) completed_.fetch_add(1);
     return {r.n, chunks, layers, pack, wait, sub, now_ns() - t_all, team_lo, team_hi, pub ? r.n : 0};
+  }
+
+  // A descriptor job (Q-B3): the adapter's geometry in C++ (one source per (layer, request): l' = l * B + b, the
+  // destination m' = b * slots + slot of the layer's store), its checks (inside the geometry and the board, one
+  // destination per (l, b, h, slot)), then ONE release per layer present, in layer order, each after its layer's T3
+  // wait (the newest last reader of its destinations) on the scatter stream; the board pairs from the entries.
+  std::vector<int64_t> release_desc(Job& j) {
+    TORCH_CHECK(!stores_k_.empty(), "set_stores first");
+    const int64_t n = static_cast<int64_t>(j.desc.size() / 6);
+    const int64_t* Dl = j.desc.data();
+    const int64_t* Db = Dl + n;
+    const int64_t* Dh = Db + n;
+    const int64_t* Dk = Dh + n;
+    const int64_t* Ds = Dk + n;
+    const int64_t* Dg = Ds + n;
+    const int64_t L = static_cast<int64_t>(stores_k_.size());
+    const int64_t nblk = src_.S / R_;
+    const bool pub = board_.defined() && !skip_publish_;
+    int64_t bL = 0, bB = 0, bH = 0, bN = 0;
+    if (pub) {
+      TORCH_CHECK(board_.dim() == 4, "the board is (L, B, H, npos) (GenBoard.t)");
+      bL = board_.size(0);
+      bB = board_.size(1);
+      bH = board_.size(2);
+      bN = board_.size(3);
+    }
+    for (int64_t i = 0; i < n; ++i) {
+      TORCH_CHECK(Dl[i] >= 0 && Dl[i] < L && Db[i] >= 0 && Db[i] < dB_ && Dh[i] >= 0 && Dh[i] < dH_ && Dk[i] >= 0 &&
+                      Dk[i] < nblk && Ds[i] >= 0 && Ds[i] < dslots_,
+                  "gilfree desc: entry ", i, " (l ", Dl[i], ", b ", Db[i], ", h ", Dh[i], ", block ", Dk[i], ", slot ",
+                  Ds[i], ") outside the geometry (L ", L, ", B ", dB_, ", H ", dH_, ", ", nblk,
+                  " complete host blocks, ", dslots_, " slots)");
+      if (pub) {
+        TORCH_CHECK(Dl[i] < bL && Db[i] < bB && Dh[i] < bH && Ds[i] < bN, "gilfree desc: entry ", i,
+                    " outside the board (", bL, ", ", bB, ", ", bH, ", ", bN, ")");
+      }
+    }
+    std::vector<int64_t> o(n);
+    std::iota(o.begin(), o.end(), 0);
+    auto key = [&](int64_t e) { return std::make_tuple(Dl[e], Db[e], Dh[e], Ds[e]); };
+    std::stable_sort(o.begin(), o.end(), [&](int64_t x, int64_t y) { return key(x) < key(y); });
+    for (int64_t i = 1; i < n; ++i) {
+      TORCH_CHECK(key(o[i]) != key(o[i - 1]), "gilfree desc: two transfers into one destination (l ", Dl[o[i]],
+                  " b ", Db[o[i]], " h ", Dh[o[i]], " slot ", Ds[o[i]], ")");
+    }
+    std::vector<int64_t> tot(kStats, 0);
+    tot[7] = tot[8] = -1;
+    const auto opt = at::TensorOptions().dtype(at::kLong);
+    for (int64_t i0 = 0; i0 < n;) {
+      const int64_t l = Dl[o[i0]];
+      int64_t i1 = i0;
+      while (i1 < n && Dl[o[i1]] == l) ++i1;
+      if (cuda_ && !j.readers.empty() && j.readers[l] != 0) {  // T3 of this layer, before its scatters
+        C10_CUDA_CHECK(cudaStreamWaitEvent(scatter_->stream(), reinterpret_cast<cudaEvent_t>(j.readers[l]), 0));
+      }
+      const int64_t k = i1 - i0;
+      std::vector<int64_t> vb(k, 0), vh(k), vl(k), vm(k), vk(k), vf, vg;
+      if (pub) {
+        vf.resize(k);
+        vg.resize(k);
+      }
+      for (int64_t q = 0; q < k; ++q) {
+        const int64_t e = o[i0 + q];
+        vh[q] = Dh[e];
+        vl[q] = l * dB_ + Db[e];                       // the source of (layer, request)
+        vm[q] = Db[e] * dslots_ + Ds[e] + plant_slot_; // the destination slot in the layer's store
+        vk[q] = Dk[e];
+        if (pub) {
+          vf[q] = ((l * bB + Db[e]) * bH + Dh[e]) * bN + Ds[e];
+          vg[q] = Dg[e];
+        }
+      }
+      auto t = [&](std::vector<int64_t>& v) { return at::from_blob(v.data(), {static_cast<int64_t>(v.size())}, opt); };
+      at::Tensor tb = t(vb), th = t(vh), tl = t(vl), tm = t(vm), tk = t(vk);
+      at::Tensor tf = pub ? t(vf) : at::empty({0}, opt), tg = pub ? t(vg) : at::empty({0}, opt);
+      std::vector<int64_t> st = release_impl(tb, th, tl, tm, tk, stores_k_[l].view({-1, src_.D}),
+                                             stores_v_[l].view({-1, src_.D}), &tf, &tg, /*count=*/false);
+      for (int c = 0; c < 7; ++c) tot[c] += st[c];
+      if (st[1] > 0) {
+        tot[7] = tot[7] < 0 ? st[7] : std::min(tot[7], st[7]);
+        tot[8] = std::max(tot[8], st[8]);
+      }
+      tot[9] += st[9];
+      i0 = i1;
+    }
+    completed_.fetch_add(1);
+    return tot;
   }
 
   std::shared_ptr<Job> wait_submitted(int64_t seq) {
@@ -559,18 +716,24 @@ class NativePipe {
         for (int64_t e : j.hist) {                   // T4: the host rows exist before the pack reads them
           if (e != 0) C10_CUDA_CHECK(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(e)));
         }
-        for (int64_t e : j.readers) {                // T3: the scatter writes a slot after its last reader
-          if (e != 0) C10_CUDA_CHECK(cudaStreamWaitEvent(scatter_->stream(), reinterpret_cast<cudaEvent_t>(e), 0));
+        if (!j.is_desc) {
+          for (int64_t e : j.readers) {              // T3: the scatter writes a slot after its last reader
+            if (e != 0) C10_CUDA_CHECK(cudaStreamWaitEvent(scatter_->stream(), reinterpret_cast<cudaEvent_t>(e), 0));
+          }
         }
       }
-      const auto opt = at::TensorOptions().dtype(at::kLong);
-      auto vec = [&](std::vector<int64_t>& v) {      // a non-owning view: no Python object, no GIL at its death
-        return v.empty() ? at::empty({0}, opt) : at::from_blob(v.data(), {static_cast<int64_t>(v.size())}, opt);
-      };
-      at::Tensor tb = vec(j.b), th = vec(j.h), tl = vec(j.l), tm = vec(j.m), tk = vec(j.blk);
-      at::Tensor tf = vec(j.bflat), tg = vec(j.bgen);
-      j.stats = release_impl(tb, th, tl, tm, tk, j.store_k.view({-1, src_.D}), j.store_v.view({-1, src_.D}), &tf,
-                             &tg);
+      if (j.is_desc) {                               // Q-B3: per layer, after that layer's T3 wait
+        j.stats = release_desc(j);
+      } else {
+        const auto opt = at::TensorOptions().dtype(at::kLong);
+        auto vec = [&](std::vector<int64_t>& v) {    // a non-owning view: no Python object, no GIL at its death
+          return v.empty() ? at::empty({0}, opt) : at::from_blob(v.data(), {static_cast<int64_t>(v.size())}, opt);
+        };
+        at::Tensor tb = vec(j.b), th = vec(j.h), tl = vec(j.l), tm = vec(j.m), tk = vec(j.blk);
+        at::Tensor tf = vec(j.bflat), tg = vec(j.bgen);
+        j.stats = release_impl(tb, th, tl, tm, tk, j.store_k.view({-1, src_.D}), j.store_v.view({-1, src_.D}), &tf,
+                               &tg);
+      }
       TORCH_CHECK(j.stats[1] == 0 || (j.stats[7] == nt_ && j.stats[8] == nt_), "gilfree: packing teams of ",
                   j.stats[7], " .. ", j.stats[8], " threads != requested ", nt_);
       if (cuda_) j.done_ev.record(*scatter_);
@@ -581,7 +744,9 @@ class NativePipe {
     }
     j.store_k = at::Tensor();                         // Python keeps the store alive: no Python call here
     j.store_v = at::Tensor();
-    for (std::vector<int64_t>* v : {&j.b, &j.h, &j.l, &j.m, &j.blk, &j.bflat, &j.bgen}) std::vector<int64_t>().swap(*v);
+    for (std::vector<int64_t>* v : {&j.b, &j.h, &j.l, &j.m, &j.blk, &j.bflat, &j.bgen, &j.desc}) {
+      std::vector<int64_t>().swap(*v);
+    }
   }
 
   void worker_loop(bool inference, bool grad, int64_t device, std::vector<int64_t> cores) {
@@ -656,6 +821,9 @@ class NativePipe {
   std::thread worker_;
   bool running_ = false, stop_ = false;
   int64_t next_seq_ = 0, jobs_run_ = 0, ok_jobs_ = 0, worker_inference_ = -1, worker_grad_ = -1;
+  // Q-B3: the layers' stores, the store geometry, the job watermark, the planted slot shift (tests only)
+  std::vector<at::Tensor> stores_k_, stores_v_;
+  int64_t dB_ = 0, dH_ = 0, dslots_ = 0, landed_ = 0, plant_slot_ = 0;
   std::atomic<int64_t> submitted_{0}, completed_{0};
   std::vector<int64_t> totals_;
   std::string error_, fatal_;
@@ -703,6 +871,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mod) {
       .def("submit", &NativePipe::submit, py::call_guard<py::gil_scoped_release>(),
            "queue one release for the worker: (b, h, l, m, blk lists, the layer's store K and V (B, rows, H, D), "
            "board indices, board generations, T4 event handles, T3 event handles) -> its job seq")
+      .def("set_stores", &NativePipe::set_stores, "Q-B3: the layers' stores (B, rows, H, D), K and V lists")
+      .def("submit_desc", &NativePipe::submit_desc, py::call_guard<py::gil_scoped_release>(),
+           "Q-B3: queue a whole tick's takes as ONE job: desc (6, n) int64 rows l, b, h, block, slot, gen; per-layer "
+           "T3 event handles; one T4 event handle -> its job seq")
+      .def("landed_upto", &NativePipe::landed_upto, py::call_guard<py::gil_scoped_release>(),
+           "Q-B3: the job watermark (every job up to it ran and landed)")
+      .def("set_plant_slot_shift", &NativePipe::set_plant_slot_shift, "NEGATIVE CONTROL (tests only)")
       .def("job_done", &NativePipe::job_done, py::call_guard<py::gil_scoped_release>())
       .def("wait_job", &NativePipe::wait_job, py::call_guard<py::gil_scoped_release>())
       .def("stream_wait_job", &NativePipe::stream_wait_job, py::call_guard<py::gil_scoped_release>())
@@ -716,6 +891,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mod) {
       .def_property_readonly("cuda", &NativePipe::is_cuda)
       .def_property_readonly("p0", &NativePipe::p0);
   mod.attr("VERSION") = 3;
+  mod.attr("DESC") = 1;                       // Q-B3: set_stores / submit_desc / landed_upto
   mod.attr("SLOT_EXTRA_PER_GROUP") = kPairBytes;
 #ifdef _OPENMP
   mod.attr("OPENMP") = 1;

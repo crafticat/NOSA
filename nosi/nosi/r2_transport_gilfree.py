@@ -60,6 +60,14 @@ enters the modes above (inference, grad, device) ONCE, when it starts (at the fi
 before). Every transfer of a job gets tr.ev = _JobEv at issue: query / synchronize, and torch's Stream.wait_event
 protocol (wait(stream): the host waits the submission, then the stream waits on the device). submits_without_gil = True
 tells S-C (CudaDeviceOps._submitted, C's named change) that its exact wait needs no host wait for the submission.
+THE DESCRIPTOR ISSUE (Q-B3; worker="cpp"; issue(layer, transfers) is unchanged for every current gate). issue_desc(
+desc, reader_marks, hist_mark) takes a whole tick's takes as ONE (6, n) int64 tensor (l, b, h, block, slot, gen: B2's
+take list) and queues ONE job: C++ applies the adapter's geometry and checks, releases layer by layer, and publishes
+the board; no Python object exists per transfer. T3 / T4 become marks: the tick registers its per-layer reader events
+(mark_reader(tick * L + layer, ev)) and its write-back event (mark_hist(tick, ev)); all are recorded on the main
+stream, so they complete in mark order, and the job waits only the newest mark per layer (T3, a device wait before the
+layer's scatters) and the newest write-back (T4, a host wait in the worker). The host admits the takes of every job
+seq <= landed_upto() (the job watermark: it only grows; a failed job never lands). S-C's exact wait reads the board.
 """
 from __future__ import annotations
 
@@ -190,6 +198,12 @@ class GilfreeTransport:
         self._worker_modes: Optional[tuple] = None             # (inference, grad) the C++ worker started with
         self._keep: Dict[int, list] = {}                       # job seq -> the Python events its raw handles name
         self._last_seq = 0
+        # Q-B3 (issue_desc): the registered events per kind, mark -> event; every mark below the floor was registered,
+        # completed and dropped; the window (in marks) kept beyond the newest
+        self._marks: Dict[str, Dict[int, Any]] = dict(reader={}, hist={})
+        self._mark_floor: Dict[str, int] = dict(reader=0, hist=0)
+        self._mark_window: Dict[str, int] = dict(reader=4 * len(self.slots_k), hist=4)
+        self._stores_set = False
         self._last_flag: Optional[threading.Event] = None
         self.board = None                                      # the generation board (attach_board), or None
         self._error: Optional[BaseException] = None
@@ -362,6 +376,87 @@ class GilfreeTransport:
         if keep:
             self._keep[seq] = keep
         self._last_seq = int(seq)
+
+    # ------------------------------------------------------------------------------------------------ Q-B3: descriptors
+    def mark_reader(self, mark: int, ev) -> None:
+        """Registers the tick's reader event of one layer: mark = tick * L + layer (ResidencyBackend.after_attention's
+        event). Marks grow; all reader events are on the main stream, so they complete in mark order."""
+        self._mark("reader", mark, ev)
+
+    def mark_hist(self, mark: int, ev) -> None:
+        """Registers the tick's write-back event: mark = the tick (its last commit_block event; main stream)."""
+        self._mark("hist", mark, ev)
+
+    def _mark(self, kind: str, mark: int, ev) -> None:
+        ring = self._marks[kind]
+        mark = int(mark)
+        if mark < self._mark_floor[kind] or (ring and mark <= max(ring)):
+            raise ValueError("gilfree: %s mark %d does not grow (newest %s, floor %d)"
+                             % (kind, mark, max(ring) if ring else None, self._mark_floor[kind]))
+        ring[mark] = ev
+        lim = mark - self._mark_window[kind]
+        for mk in sorted(ring):                                # drop the old marks whose events completed, in order
+            if mk >= lim or not ev_done(ring[mk]):
+                break
+            del ring[mk]
+            self._mark_floor[kind] = mk + 1
+
+    def _mark_handle(self, kind: str, mark: int, keep: list) -> int:
+        """The raw cudaEvent_t to wait for `mark` (0: nothing to wait); CPU mode: host-waits it here."""
+        mark = int(mark)
+        if mark < 0 or mark < self._mark_floor[kind]:
+            return 0                                           # none, or registered, completed and dropped
+        ev = self._marks[kind].get(mark)
+        if ev is None:
+            raise ValueError("gilfree: %s mark %d was never registered (mark_%s)" % (kind, mark, kind))
+        if ev_done(ev):
+            return 0
+        handle = int(getattr(ev, "cuda_event", 0) or 0) if self.cuda else 0
+        if handle:
+            keep.append(ev)                                    # alive until the worker used its handle
+            return handle
+        self.host_wait(ev)                                     # CPU mode (synchronous copies): waited here
+        return 0
+
+    def issue_desc(self, desc: torch.Tensor, reader_marks=None, hist_mark: int = -1) -> int:
+        """Q-B3 (worker="cpp"): a whole tick's takes as ONE job, no Python object per transfer. desc: (6, n) int64 CPU
+        rows l, b, h, block, slot, gen (B2's take list); reader_marks: per layer the newest mark (tick * L + layer) of
+        its destinations' last readers (-1: none); hist_mark: the newest write-back tick of the job's host rows (-1:
+        none). C++ builds the pack plan (the adapter's geometry and checks) and publishes the board; returns the job's
+        seq (0: no take). The host admits the takes of every job seq <= landed_upto()."""
+        if self.worker != "cpp" or not int(getattr(self.ext, "DESC", 0)):
+            raise RuntimeError("gilfree: issue_desc needs worker='cpp' and packer v3 with DESC (submit_desc)")
+        if (not torch.is_tensor(desc) or desc.dtype != torch.int64 or desc.dim() != 2 or desc.shape[0] != 6
+                or desc.device.type != "cpu"):
+            raise ValueError("gilfree: desc must be a (6, n) int64 CPU tensor (l, b, h, block, slot, gen)")
+        self._raise_pending_error()
+        self._reap()
+        if desc.shape[1] == 0:
+            return 0
+        keep: list = []
+        readers = []
+        if reader_marks is not None:
+            marks = [int(x) for x in torch.as_tensor(reader_marks).reshape(-1).tolist()]
+            if len(marks) != len(self.slots_k):
+                raise ValueError("gilfree: reader_marks needs one mark per layer (%d)" % len(self.slots_k))
+            readers = [self._mark_handle("reader", mk, keep) for mk in marks]
+        hist = 0 if self.skip_hist_wait else self._mark_handle("hist", hist_mark, keep)
+        self._start_worker()
+        if not self._stores_set:
+            self.npipe.set_stores(list(self.slots_k), list(self.slots_v))
+            self._stores_set = True
+        seq = int(self.npipe.submit_desc(desc.contiguous(), readers, int(hist)))
+        if keep:
+            self._keep[seq] = keep
+        self._last_seq = seq
+        return seq
+
+    def landed_upto(self) -> int:
+        """Q-B3: the job watermark (worker="cpp"): every job up to this seq ran without error and its rows landed
+        (CUDA: its completion event on the scatter stream is done). It only grows; a failed job never lands."""
+        if self.worker != "cpp":
+            raise RuntimeError("gilfree: landed_upto needs worker='cpp'")
+        return int(self.npipe.landed_upto())
 
     # ------------------------------------------------------------------------------------------------ one release
     def _check(self, layer: int, transfers: List[Transfer]) -> None:
