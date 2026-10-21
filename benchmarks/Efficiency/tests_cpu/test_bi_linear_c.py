@@ -726,8 +726,14 @@ def test_BC_S_step_cells(tmp_path):
     assert r.returncode == 1 and "partly set" in r.stderr
     r = run("bigc-gate", sha=sha, env=dict(e, BIGC_TEST_TABLE=STAND_IN_TABLE, BIGC_TEST_TABLE_SHA="xyz"))
     assert r.returncode == 1 and "not a sha256" in r.stderr
-    r = run("bigc-gate", sha=sha, env=dict(e, BIGC_TEST_TABLE=str(tmp_path / "t.json"), BIGC_TEST_TABLE_SHA="a" * 64))
-    assert r.returncode == 1 and "not under /mnt/beegfs/ojerbi" in r.stderr
+    # a path outside the bound root (pytest's tmp_path may itself lie under /mnt/beegfs/ojerbi: job 2191402); the
+    # root check comes before the existence check, so the file need not exist
+    r = run("bigc-gate", sha=sha, env=dict(e, BIGC_TEST_TABLE="/tmp/bigc-not-bound/t.json", BIGC_TEST_TABLE_SHA="a" * 64))
+    assert r.returncode == 1 and "not under /mnt/beegfs/ojerbi" in r.stderr, r.stderr[-300:]
+    missing = "/mnt/beegfs/ojerbi/models/NOSA-8B/no-such-bigc-table.json"
+    assert not os.path.exists(missing)
+    r = run("bigc-gate", sha=sha, env=dict(e, BIGC_TEST_TABLE=missing, BIGC_TEST_TABLE_SHA="a" * 64))
+    assert r.returncode == 1 and "no table file %s" % missing in r.stderr, r.stderr[-300:]
     r = run("bigc-tune", sha=sha)
     if r.returncode != 0:
         pytest.skip("DRYRUN stopped on a pin outside the cell stage: %s" % r.stderr.strip()[-200:])

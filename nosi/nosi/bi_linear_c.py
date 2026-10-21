@@ -426,7 +426,7 @@ def plant_order_rows(x: torch.Tensor, weight: torch.Tensor, rows, cols, block_k:
             weight[c, k] = v
 
 
-VARIANTS = {"strict": "G-c STRICT (the candidate: one launch per weight shape for every M)",
+VARIANTS = {"strict": "G-c STRICT (THE CANDIDATE: one launch per weight shape for every M)",
             "bucket": "G-c BUCKET RESEARCH ARM (launch chosen by M; relaxed law NOT approved; not a contract claim)"}
 REFERENCE_NOTE = ("G-c is a NEW target reference: its bits differ from G-b PaddedLinear's; G0-BI agreement and "
                   "SG0-SG3 must re-run against it; the old reference and its tests are unchanged")
