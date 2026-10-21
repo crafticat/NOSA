@@ -1519,6 +1519,38 @@ def test_F19_the_exact_wait_host_waits_the_submission_first():
     assert not runner.is_alive() and ops2.submission_waits == 1
 
 
+def test_F19b_a_transport_that_submits_without_the_gil_needs_no_submission_wait():
+    """F19b (Q-C2, E's C++ feeder worker: GilfreeTransport(..., worker="cpp") sets submits_without_gil): with such a
+    transport _submitted(l) returns at once, even for a layer-0 pack that is never submitted (the main thread cannot
+    block that worker; the exact spin with its bounded err is the guard), and waits for nothing. Negative control: the
+    same never-submitted pack with a transport without the attribute (or with it False) keeps _submitted(0) blocked."""
+    def ops_with(trs, tp):
+        ops = object.__new__(SC.CudaDeviceOps)                 # the host part only: no CUDA object is built
+        ops.svc = types.SimpleNamespace(inflight={tr.seq: tr for tr in trs}, tp=tp)
+        ops.submission_waits = 0
+        return ops
+
+    def stuck_tr():
+        t = TR.Transfer(1, "u0", 0, 0, 0, 1, 1, 1, "draft", ("u0", 1, 1))
+        t.payload, t.ev = threading.Event(), None              # queued, never submitted
+        return t
+    ops = ops_with([stuck_tr()], types.SimpleNamespace(submits_without_gil=True))
+    runner = threading.Thread(target=ops._submitted, args=(0,), daemon=True)
+    runner.start()
+    runner.join(timeout=5)
+    assert not runner.is_alive() and ops.submission_waits == 0
+    for tp in (types.SimpleNamespace(), types.SimpleNamespace(submits_without_gil=False)):
+        t = stuck_tr()
+        ops2 = ops_with([t], tp)
+        runner = threading.Thread(target=ops2._submitted, args=(0,), daemon=True)
+        runner.start()
+        runner.join(timeout=0.5)
+        assert runner.is_alive()                               # the host wait remains: blocked on the pack
+        t.payload.set()
+        runner.join(timeout=5)
+        assert not runner.is_alive() and ops2.submission_waits == 1
+
+
 # =====================================================================================================================
 # F20 Policy E: the verifier evicts an LRU entry it does not protect (FG2's CapacityRefusal, holder 2190876; note 12h)
 # =====================================================================================================================
@@ -1764,3 +1796,863 @@ def test_F21b_sc_equals_v1_with_an_asynchronous_transport(exact):
     assert bad == [], bad[:3]
     n = wv.svc.metrics.counts.get("verifier_inflight_evictions", 0)
     assert n > 0 and ws.svc.metrics.counts.get("verifier_inflight_evictions", 0) == n, wv.svc.metrics.counts
+
+
+# =====================================================================================================================
+# F22 the ARRIVAL RULE (Q-C3, note 12k): a fixed lag makes two runs with different transport timing comparable
+# =====================================================================================================================
+def _lag_pair(cls, D, seeds=(11, 12), steps=24, hb=15):
+    """Two services of one kind driven by F6's schedule, their transports seeded differently ("delay", max_delay 4,
+    bursts: they land at different polls). v1 runs its own schedule (polls at every resolve, issues at once, admits
+    a waited block at once); S-C its own. Readers complete two ticks late, cohorts are decided at their ends. Returns
+    (the first tick whose ownership states differ (_state without the transport's list) or None, the first tick whose
+    transports' pending lists differ or None, the two worlds)."""
+    worlds = []
+    for sd in seeds:
+        kw = dict(arrival_lag=D) if cls is None else dict(nblk=NB, arrival_lag=D)
+        worlds.append(world(C=8, X=48, R_ver=8, seed=sd, mode="delay", max_delay=4, cls=cls, svc_kw=kw))
+    uids = ("u0", "u1")
+    for w in worlds:
+        for b, u in enumerate(uids):
+            w.svc.begin_request(b, u)
+    tail = worlds[0].svc.tail0
+    readers, first_state, first_tp = [], None, None
+    for (t, m, ends, layers) in _sched(101, steps, True, hb):
+        for w in worlds:
+            w.svc.poll()
+        for l, spec in enumerate(layers):
+            rows = [Row(b, kind, key, 1000 + t, hb, [(hb, tail)]) for (b, kind, key, _) in spec]
+            sel = S(*[s for (_, _, _, s) in spec])
+            evs = [Ev() for _ in worlds]
+            for w, ev in zip(worlds, evs):
+                w.svc.read_done(l, w.svc.resolve(l, rows, sel), ev)
+            readers.append((t, evs))
+        for w in worlds:
+            w.svc.end_tick()
+        for (tt, evs) in readers:
+            if tt <= t - 2:
+                for ev in evs:
+                    ev.done = True
+        if ends:
+            for w in worlds:
+                for u in uids:
+                    w.svc.decided((u, 1, m))
+        if first_state is None and _state(worlds[0])[:-1] != _state(worlds[1])[:-1]:
+            first_state = t
+        if first_tp is None and [tr.seq for tr in worlds[0].tp.pending] != [tr.seq for tr in worlds[1].tp.pending]:
+            first_tp = t
+    return first_state, first_tp, worlds
+
+
+@pytest.mark.parametrize("kind", ["v1", "sc"])
+def test_F22_a_fixed_arrival_lag_makes_two_runs_comparable(kind):
+    """F22 (Q-C3): arrival_lag D = 2. Precondition: the two transports land differently (their pending lists differ at
+    some tick), and both branches of the rule ran (a transfer forced at its admission tick, a landed one held back).
+    Claim: the two services' ownership states are equal after every tick (v1 and S-C). Negative control: free timing
+    (arrival_lag None) with the same seeds gives different states. The forced waits are reported."""
+    cls = None if kind == "v1" else SC.ResidencySC
+    fs, ft, ws = _lag_pair(cls, 2)
+    assert ft is not None, "precondition: the two transports landed alike"
+    assert sum(w.svc.arrival_forced for w in ws) > 0 and sum(w.svc.arrival_held for w in ws) > 0, \
+        [(w.svc.arrival_forced, w.svc.arrival_held) for w in ws]
+    assert fs is None, fs
+    rep = ws[0].svc.report()["arrival"]
+    assert rep["lag"] == 2 and rep["forced"] == ws[0].svc.arrival_forced and rep["forced_ns"] >= 0
+    fs0, ft0, _ = _lag_pair(cls, None)
+    assert ft0 is not None and fs0 is not None, (ft0, fs0)
+    with pytest.raises(ValueError, match="arrival_lag"):
+        world(cls=cls, svc_kw=dict(arrival_lag=0) if cls is None else dict(nblk=NB, arrival_lag=0))
+
+
+# =====================================================================================================================
+# R5 the SPARSE decision record (B1, note 12l): sparse == dense, planted defects, capacity, swapped records, lint,
+# and the REPORT microbench
+# =====================================================================================================================
+SP = _load("r2_residency_sparse")
+
+
+def _reader_tags(svc, tags):
+    """Every slot's first / last reader, named by the (tick, layer) of its event (the two worlds' events differ)."""
+    out = []
+    for l, pool in enumerate(svc.pools):
+        for (b, h) in sorted(pool.streams):
+            for s in pool.streams[(b, h)].slots:
+                out.append((l, b, h, s.idx, None if s.first_reader is None else tags.get(id(s.first_reader), "?"),
+                            None if s.last_reader is None else tags.get(id(s.last_reader), "?")))
+    return out
+
+
+def _lockstep_sparse(seed, C, X, R_ver, sched, hb=15, mode="delay", max_delay=4, exact=False, sparse_mut=None,
+                     record_cap=None, on_tick=None):
+    """R5a's harness: the DENSE S-C and the SPARSE S-C (B1) driven by the same schedule, transports seeded alike,
+    readers completed two ticks late. Per tick: both device mirrors against the full scan (at the tick's start), the
+    pages, the verify content at the read point (both worlds), and after end_tick the ownership state, the counters
+    and every slot's first / last reader. A sparse world's exception (a host check or a refusal) is a difference at
+    its tick. Every entry of the returned list has its tick second. Returns (bad, dense world, sparse world,
+    ticks completed)."""
+    common = dict(C=C, X=X, R_ver=R_ver, seed=seed, mode=mode, max_delay=max_delay, publish=True if exact else None)
+    wm = "exact" if exact else "probe"
+    ws = world(**common, cls=SC.ResidencySC, svc_kw=dict(nblk=NB, wait_mode=wm))
+    wx = world(**common, cls=SP.ResidencySparse, svc_kw=dict(nblk=NB, wait_mode=wm, sparse_mut=sparse_mut,
+                                                             record_cap=record_cap))
+    uids = ("u0", "u1")
+    for w in (ws, wx):
+        for b, u in enumerate(uids):
+            w.svc.begin_request(b, u)
+    tail = ws.svc.tail0
+    readers, bad, tags, ticks = [], [], {}, 0
+    for (t, m, ends, layers) in sched:
+        for w in (ws, wx):
+            w.svc.poll()
+            w.svc.sync_mirror()
+            for l in range(L):
+                d = _mirror_diff(w.svc, l)
+                if d:
+                    bad.append(("mirror", t, "sparse" if w is wx else "dense", l, d))
+        if bad:
+            break
+        for l, spec in enumerate(layers):
+            rows = [Row(b, kind, key, 1000 + t, hb, [(hb, tail)]) for (b, kind, key, _) in spec]
+            sel = S(*[s for (_, _, _, s) in spec])
+            ps = ws.svc.resolve(l, rows, sel)
+            px = wx.svc.resolve(l, rows, sel)
+            for i in range(len(rows)):
+                for h in range(H):
+                    a = ps.page_table[i, h, :int(ps.num_pages[i, h])].tolist()
+                    c = px.page_table[i, h, :int(px.num_pages[i, h])].tolist()
+                    if a != c:
+                        bad.append(("pages", t, l, i, h, a, c))
+            for name, w, p in (("dense", ws, ps), ("sparse", wx, px)):
+                if not _content_ok(w, l, rows, sel, p):
+                    bad.append(("content", t, name, l))
+            ev_s, ev_x = Ev(), Ev()
+            tags[id(ev_s)] = tags[id(ev_x)] = (t, l)
+            readers.append((t, ev_s, ev_x))
+            ws.svc.read_done(l, ps, ev_s)
+            wx.svc.read_done(l, px, ev_x)
+        ws.svc.end_tick()
+        try:
+            wx.svc.end_tick()
+        except (ER.OwnershipViolation, ER.CapacityRefusal) as e:
+            bad.append(("raise", t, type(e).__name__, str(e)[:300]))
+            break
+        ticks += 1
+        if on_tick is not None:
+            on_tick(t, ws, wx)
+        for (tt, a, c) in readers:
+            if tt <= t - 2:
+                a.done = c.done = True
+        if ends:
+            for w in (ws, wx):
+                for u in uids:
+                    w.svc.decided((u, 1, m))
+        sv, sx = _state(ws), _state(wx)
+        if sv != sx:
+            first = next(i for i, (x, y) in enumerate(zip(sv, sx)) if x != y)
+            bad.append(("state", t, sv[first], sx[first]))
+        if _counters(ws.svc) != _counters(wx.svc):
+            bad.append(("counters", t, _counters(ws.svc), _counters(wx.svc)))
+        if _reader_tags(ws.svc, tags) != _reader_tags(wx.svc, tags):
+            bad.append(("readers", t))
+        if bad:
+            break
+    if not bad:
+        for w in (ws, wx):
+            w.svc.sync_mirror()
+            for l in range(L):
+                d = _mirror_diff(w.svc, l)
+                if d:
+                    bad.append(("mirror", "end", "sparse" if w is wx else "dense", l, d))
+    return bad, ws, wx, ticks
+
+
+def _r5_case(name):
+    """The schedules of R5a: F6's, F12b's pressure, F20b's eviction pressure, F21b's asynchronous split."""
+    return dict(
+        f6=dict(seed=1, C=8, X=48, R_ver=8, sched=_sched(101, 24, True)),
+        f6_exact=dict(seed=1, C=8, X=48, R_ver=8, sched=_sched(101, 24, True), exact=True),
+        f12b=dict(seed=3, C=2, X=96, R_ver=88, sched=_sched_pressure(103, 15), hb=8),
+        f20b=dict(seed=5, C=24, X=2, R_ver=2, sched=_sched_pressure(105, 18, hb=36, window=3, nver=3), hb=36),
+        f21b=dict(seed=7, C=16, X=2, R_ver=2, sched=_sched_split(109, 30, hb=30, d_hi=20, window=2, nver=1), hb=30,
+                  mode="force_only"),
+        f21b_exact=dict(seed=7, C=16, X=2, R_ver=2, sched=_sched_split(109, 30, hb=30, d_hi=20, window=2, nver=1),
+                        hb=30, mode="force_only", exact=True),
+    )[name]
+
+
+@pytest.mark.parametrize("case", ["f6", "f6_exact", "f12b", "f20b", "f21b", "f21b_exact"])
+def test_R5a_the_sparse_record_equals_the_dense_one(case):
+    """R5a: the sparse S-C (B1) and the dense S-C on one schedule: equal pages, verify content, device mirrors (both
+    equal the full scan), ownership state, counters (4.3, 4.6, refusals, masked, transfers) and readers after every
+    tick; ONE device read per tick (both). Preconditions: records were applied; per schedule, f6 urgent misses and
+    draft touches, f12b draft refusals, f20b Policy E LRU evictions and draft touches, f21b in-flight supersedes.
+    (f21b's split schedule never lands a prefetch, so it has no READY draft read and no touch by construction; the
+    touch path is f6's and f20b's.)"""
+    args = _r5_case(case)
+    bad, ws, wx, ticks = _lockstep_sparse(**args)
+    assert bad == [], bad[:3]
+    assert ticks == len(args["sched"]) and wx.svc.d2h_reads == ticks == ws.svc.d2h_reads
+    assert wx.svc.records_applied > 0
+    if not case.startswith("f21b"):
+        assert wx.svc.journal_counts.get("touch", 0) > 0, wx.svc.journal_counts
+    pre = {"f6": wx.svc.metrics.k43["new"] > 0, "f6_exact": wx.svc.metrics.k43["new"] > 0,
+           "f12b": wx.svc.metrics.refused > 0,
+           "f20b": wx.svc.metrics.counts.get("verifier_evictions", 0) > 0,
+           "f21b": wx.svc.metrics.counts.get("verifier_inflight_evictions", 0) > 0,
+           "f21b_exact": wx.svc.metrics.counts.get("verifier_inflight_evictions", 0) > 0}[case]
+    assert pre, (case, wx.svc.metrics.counts, wx.svc.metrics.k43)
+
+
+@pytest.mark.parametrize("kind", ["v_pin", "v_merge", "v_take", "v_read", "d_pin", "d_ready", "d_merge", "d_take",
+                                  "d_refused"])
+def test_R5b_a_dropped_record_is_caught_at_its_tick(kind):
+    """R5b (planted defects): the first state-changing record of one kind is dropped once (sparse_mut drop=<kind>;
+    precondition: such a record occurred, sparse_dropped_at). The lockstep against the dense S-C reports a
+    difference (state, counters, readers, or a host check's exception) at THAT tick, not later."""
+    args = _r5_case("f12b" if kind == "d_refused" else "f6")
+    bad, ws, wx, _ = _lockstep_sparse(**args, sparse_mut={"drop": kind})
+    assert wx.svc.sparse_dropped_at is not None, "precondition: no state-changing %s record occurred" % kind
+    tick = wx.svc.sparse_dropped_at[0]
+    assert bad and bad[0][1] == tick, (kind, tick, bad[:2])
+
+
+def test_R5c_a_record_over_its_capacity_voids_the_tick():
+    """R5c: record_cap (6, 6). The uncapped run's record sizes per tick (last_counts) predict the first tick whose
+    record exceeds 6 entries; the capped run refuses exactly that tick (CapacityRefusal naming the capacity), before
+    any change of the host state. Negative control: no_cap_check (the record silently truncated) differs from the
+    dense S-C at that tick."""
+    sizes = {}
+    bad, _, _, _ = _lockstep_sparse(**_r5_case("f6"), on_tick=lambda t, ws, wx: sizes.__setitem__(t, list(
+        wx.svc.last_counts)))
+    assert bad == []
+    first = min(t for t, (nv, nd) in sizes.items() if nv > 6 or nd > 6)
+    bad, _, wx, _ = _lockstep_sparse(**_r5_case("f6"), record_cap=(6, 6))
+    assert bad and bad[0][0] == "raise" and bad[0][1] == first and "capacity" in bad[0][3], bad[:1]
+    bad2, _, _, _ = _lockstep_sparse(**_r5_case("f6"), record_cap=(6, 6), sparse_mut={"no_cap_check": True})
+    assert bad2 and bad2[0][1] == first and bad2[0][0] != "raise", bad2[:1]
+
+
+def test_R5d_swapped_take_records_are_refused():
+    """R5d: two draft take records of one stream exchange their slots (sparse_mut swap_takes; precondition: a layer
+    with two takes in one stream). The host's per-record check (v1's _take: K3X first_free) refuses that tick."""
+    bad, _, wx, _ = _lockstep_sparse(**_r5_case("f6"), sparse_mut={"swap_takes": True})
+    assert wx.svc.sparse_dropped_at is not None, "precondition: no stream with two draft takes in one layer"
+    tick = wx.svc.sparse_dropped_at[0]
+    assert bad and bad[0][0] == "raise" and bad[0][1] == tick and "would take" in bad[0][3], bad[:1]
+
+
+def test_R5e_the_sparse_per_layer_path_has_no_host_transfer():
+    """R5e (lint): the sparse record's per-layer device path (sparse_layer_record, its helpers, the bias fill, the
+    resolve hook, S-C's resolve) holds no host read of a device value and no host-to-device copy; the consumer
+    (apply_tick) is where the one read happens (negative control: its source does read)."""
+    import inspect
+    d2h = FORBIDDEN + ("_d2h(",)
+    for fn in (SP.sparse_layer_record, SP._compact, SP._pack_bits, SP._first_in_group, SP.draft_bias_fill,
+               SP.ResidencySparse._layer_record, SC.ResidencySC.resolve):
+        src = inspect.getsource(fn)
+        assert [tok for tok in d2h + H2D if tok in src] == [], fn.__qualname__
+    assert [tok for tok in d2h if tok in inspect.getsource(SP.ResidencySparse.apply_tick)] != []
+
+
+def _bench_world(cls, Bq, Lq, NBq, C, X, R_ver, seed=0, svc_kw=None):
+    """A world of the B 64 geometry (H 2; D 4: the host apply does not depend on D)."""
+    Dq = 4
+    g = torch.Generator().manual_seed(seed)
+    host_k = [torch.randn(Bq, NBq * BS, H, Dq, generator=g) for _ in range(Lq)]
+    host_v = [torch.randn(Bq, NBq * BS, H, Dq, generator=g) for _ in range(Lq)]
+    cis = [torch.randn(Bq, NBq * BS, H, generator=g) for _ in range(Lq)]
+    n = (C + X + RES.N_TAIL) * BS
+    store_k = [torch.zeros(Bq, n, H, Dq) for _ in range(Lq)]
+    store_v = [torch.zeros(Bq, n, H, Dq) for _ in range(Lq)]
+    store_b = [torch.zeros(Bq, n, H) for _ in range(Lq)]
+    be = Be()
+    tp = TR.AdversarialTransport(be, host_k, host_v, store_k, store_v, BS, seed, mode="delay", max_delay=2)
+    gather = RES.TorchGather(host_k, host_v, store_k, store_v)
+    svc = cls(Lq, Bq, H, C, X, R_ver, tp, gather, store_b=store_b, cis=cis, block_bytes=BS * 2 * Dq * 4,
+              host_wait=be.host_wait, nblk=NBq, **(svc_kw or {}))
+    return types.SimpleNamespace(svc=svc, tp=tp)
+
+
+def test_R5_microbench_host_apply_dense_vs_sparse(capsys):
+    """REPORT (not a gate): the host time of apply_tick (the consumer), dense S-C vs sparse S-C, at the B 64
+    geometry (64 requests, H 2, C 96 / X 16 over 96 blocks: no capacity pressure, stable draft windows of 40 blocks
+    drifting by one, 2 verify rows of 16 random blocks every third tick), 2 layers, 9 ticks; printed (always) per
+    tick kind with the extrapolation to 32 layers. The two services end in the same ownership state (so the times
+    compare like for like). The target is SG5 p3's S-B draft tick: 7.06 s of backend host time."""
+    Bq, Lq, NBq, steps = 64, 2, 96, 9
+    gen = torch.Generator().manual_seed(7)
+    x0 = [int(torch.randint(0, NBq - 41, (1,), generator=gen)) for _ in range(Bq)]
+    sched = []
+    for t in range(steps):
+        m, ends = t // 3 + 1, t % 3 == 2
+        x0 = [min(max(x + int(torch.randint(-1, 2, (1,), generator=gen)), 0), NBq - 41) for x in x0]
+        rows, sels = [], []
+        for b in range(Bq):
+            u = "q%d" % b
+            rows.append(Row(b, "d", (u, 1, m + 1 if ends else m), 1000 + t, NBq, []))
+            sels.append([list(range(x0[b], x0[b] + 40)), list(range(x0[b], x0[b] + 40))])
+            if ends:
+                for _ in range(2):
+                    v = sorted(set(int(z) for z in torch.randint(0, NBq, (16,), generator=gen)))
+                    rows.append(Row(b, "v", (u, 1, m), 1000 + t, NBq, []))
+                    sels.append([v, v])
+        sched.append((t, m, ends, rows, sels))
+    times = {}
+    worlds = {}
+    for name, cls in (("dense", SC.ResidencySC), ("sparse", SP.ResidencySparse)):
+        w = _bench_world(cls, Bq, Lq, NBq, C=96, X=16, R_ver=8)
+        svc = w.svc
+        orig = svc.apply_tick
+        per = []
+
+        def timed(steps_, orig=orig, per=per):
+            t0 = time.perf_counter_ns()
+            orig(steps_)
+            per.append(time.perf_counter_ns() - t0)
+        svc.apply_tick = timed
+        for b in range(Bq):
+            svc.begin_request(b, "q%d" % b)
+        for (t, m, ends, rows, sels) in sched:
+            svc.poll()
+            k = max(len(s[0]) for s in sels)
+            sel = torch.full((H, len(rows), k), -1, dtype=torch.int64)
+            for i, s in enumerate(sels):
+                for h in range(H):
+                    sel[h, i, :len(s[h])] = torch.tensor(s[h])
+            for l in range(Lq):
+                p = svc.resolve(l, rows, sel)
+                svc.read_done(l, p, Ev(done=True))
+            svc.end_tick()
+            if ends:
+                for b in range(Bq):
+                    svc.decided(("q%d" % b, 1, m))
+        times[name] = per
+        worlds[name] = w
+    assert _state(worlds["dense"])[:-1] == _state(worlds["sparse"])[:-1]
+    vt = [t for (t, _, ends, _, _) in sched if ends]
+    dt = [t for (t, _, ends, _, _) in sched if not ends]
+
+    def ms(name, ts):
+        return sum(times[name][t] for t in ts) / len(ts) / 1e6
+    with capsys.disabled():
+        print("\nREPORT R5 microbench (B 64, H 2, %d layers, CPU): apply_tick ms per tick: dense verify %.1f / draft %.1f;"
+              " sparse verify %.1f / draft %.1f; x16 for 32 layers: dense %.0f / %.0f, sparse %.0f / %.0f; sparse "
+              "records applied %d" % (Lq, ms("dense", vt), ms("dense", dt), ms("sparse", vt), ms("sparse", dt),
+                                      16 * ms("dense", vt), 16 * ms("dense", dt), 16 * ms("sparse", vt),
+                                      16 * ms("sparse", dt), worlds["sparse"].svc.records_applied))
+
+
+# =====================================================================================================================
+# F23 every Triton kernel we own resolves its names in its MODULE globals (fg5 on holder 2190876)
+# =====================================================================================================================
+def _kernel_name_problems(jf):
+    """The names a @triton.jit kernel needs but Triton's GPU compiler cannot see: its free (closure) variables, and
+    every global it loads (LOAD_GLOBAL, nested code included) that is neither in its module globals (fn.__globals__)
+    nor a builtin."""
+    import builtins
+    import dis
+    fn = getattr(jf, "fn", jf)
+    out = list(fn.__code__.co_freevars)
+
+    def walk(code):
+        for ins in dis.get_instructions(code):
+            if ins.opname == "LOAD_GLOBAL" and ins.argval not in fn.__globals__ and not hasattr(builtins, ins.argval):
+                out.append(ins.argval)
+        for c in code.co_consts:
+            if hasattr(c, "co_code"):
+                walk(c)
+    walk(fn.__code__)
+    return out
+
+
+def test_F23_every_triton_kernel_resolves_its_names_in_its_module():
+    """F23 (fg5 on holder 2190876: the exact wait's kernel failed to compile on the GPU, "NameError: tl is not
+    defined". It was built inside a factory whose local `import triton.language as tl` is invisible to Triton's
+    compiler, which resolves a kernel's names in fn.__globals__; no CPU test compiled it). For every @triton.jit
+    kernel in the Triton modules of the R2 line (nosi/nosi/r2_*.py, max_pooling_per_request.py, and the
+    flash_cache_engine h2d kernels CudaDeviceOps launches), its code has no free variable and every global it
+    loads resolves in its module or in builtins. Precondition: S-C's board_wait_kernel is among them. Negative
+    control: a planted kernel built in a factory with a local-only import fails the check."""
+    triton = pytest.importorskip("triton")
+    from triton.runtime.jit import JITFunction
+    paths = sorted(p for p in NOSI.glob("r2_*.py") if "triton.jit" in p.read_text())
+    paths += [NOSI / "max_pooling_per_request.py", NOSI / "flash_cache_engine/flash_h2d_mask.py",
+              NOSI / "flash_cache_engine/flash_h2d_mask_bias.py"]
+    kernels = []
+    for p in paths:
+        name = PKG + "." + ".".join(p.relative_to(NOSI).with_suffix("").parts)
+        if name not in sys.modules:
+            spec = importlib.util.spec_from_file_location(name, str(p))
+            m = importlib.util.module_from_spec(spec)
+            sys.modules[name] = m
+            spec.loader.exec_module(m)
+        for v in vars(sys.modules[name]).values():
+            if isinstance(v, JITFunction):
+                kernels.append((name, v))
+    assert any(v is getattr(SC, "board_wait_kernel", None) for _, v in kernels), [n for n, _ in kernels]
+    bad = [(n, getattr(getattr(v, "fn", v), "__name__", "?"), _kernel_name_problems(v)) for n, v in kernels
+           if _kernel_name_problems(v)]
+    assert bad == [], bad
+
+    def factory():
+        import triton.language as tl_local
+
+        @triton.jit
+        def planted(x_ptr, BLOCK: tl_local.constexpr):
+            offs = tl_local.arange(0, BLOCK)
+            tl_local.store(x_ptr + offs, offs)
+        return planted
+    assert _kernel_name_problems(factory()) == ["tl_local"]
+
+
+# =====================================================================================================================
+# R6 the SHARED LOCKSTEP FIXTURES (r2_lockstep_fixtures.py, note 12m): v1 == S-C dense == S-C sparse on the scripts
+# that the lockstep schedules never reach, and planted defects (the review's 8 missing kinds included) caught at
+# their predicted operations
+# =====================================================================================================================
+def _load_fixtures():
+    name = "r2_lockstep_fixtures"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, str(Path(__file__).resolve().parent / (name + ".py")))
+        m = importlib.util.module_from_spec(spec)
+        sys.modules[name] = m
+        spec.loader.exec_module(m)
+    return sys.modules[name]
+
+
+FXM = _load_fixtures()
+
+
+class BatchRecency(RES.Residency):
+    """DEFECT (review kind 8): the layer's draft recency touches / acquires the READY blocks of EVERY draft row first
+    and evicts once per stream after all rows, instead of K3X O1's evict_to_c after each (row, stream)."""
+
+    def _draft_recency(self, l, rows, got_all):
+        pool = self.pools[l]
+        streams = []
+        for i, r in enumerate(rows):
+            if r.kind != "d":
+                continue
+            for h in range(self.H):
+                st = pool.stream(r.b, h)
+                for (t, idx, gen) in sorted(got_all.get((i, h), [])):
+                    if t in st.lru:
+                        st.touch(t)
+                    elif t in st.po or t in st.vres:
+                        st.acquire(t, self.mut, evict=False)
+                if st not in streams:
+                    streams.append(st)
+        for st in streams:
+            st.evict_to_c(self.mut)
+
+
+class NoT4Refusal(RES.Residency):
+    """DEFECT (review kind 2): a take of a block past the prefill without a registered host write-back is accepted."""
+
+    def _hist_ev_for(self, b, block):
+        return self.hist_ev.get((b, block))
+
+
+class CancelledAccepted(RES.Residency):
+    """DEFECT (review kind 3, with no_late_protection_guard): the cancelled-key check of _check_rows is skipped."""
+
+    def _check_rows(self, l, rows, sel):
+        cancelled, self.cancelled = self.cancelled, set()
+        try:
+            super()._check_rows(l, rows, sel)
+        finally:
+            self.cancelled = cancelled
+
+
+class PollOrderSwapped(RES.Residency):
+    """DEFECT (review kind 5): poll runs the queued reference drops BEFORE the arrivals."""
+
+    def poll(self):
+        keep = []
+        for (key, l) in self.queue:
+            if RES.ev_done(self.key_reader.get((key, l))):
+                self._drop(key, l)
+            else:
+                keep.append((key, l))
+        self.queue = keep
+        self.poll_arrivals()
+        for pool in self.pools:
+            pool.poll_releases(self.mut)
+        self.metrics.sample_memory()
+
+
+class DropKeepsReader(RES.Residency):
+    """DEFECT (review kind 6): a dropped arrival (drop_unowned, drop_vres_unprotected) keeps the slot's last reader."""
+
+    def _admit(self, tr):
+        s = self.stream(tr.layer, tr.b, tr.h).slots[tr.slot]
+        keep = s.last_reader
+        res = super()._admit(tr)
+        if s.state == OWN.RELEASING:
+            s.last_reader = keep
+        return res
+
+
+class LostForward(RES.Residency):
+    """DEFECT (review kind 7): a take drops the slot's last reader (the T3 forward to the transfer is lost)."""
+
+    def _take(self, l, b, h, block, key, kind, at=None, evicted=False, bias=True):
+        tr = super()._take(l, b, h, block, key, kind, at=at, evicted=evicted, bias=bias)
+        if tr is not None:
+            tr.reader_ev = None
+            self.stream(l, b, h).slots[tr.slot].last_reader = None
+        return tr
+
+
+class TrashWriter(RES.Residency):
+    """DEFECT (F15's control): the bias fill of a take also writes the trash slot."""
+
+    def _fill_bias(self, l, b, h, slot, block):
+        super()._fill_bias(l, b, h, slot, block)
+        if self.trash_slot is not None and self.store_b is not None:
+            s0 = self.trash_slot * self.bs
+            self.store_b[l][b, s0:s0 + self.bs, h] = 0.0
+
+
+class IgnoresFlags(SC.ResidencySC):
+    """DEFECT (F16's control): the watched device flags are never read."""
+
+    def watch_flag(self, name, flag):
+        return None
+
+
+class VoidKeepsPins(SP.ResidencySparse):
+    """DEFECT (B1): a void tick keeps the device pin table's entries (no epoch bump)."""
+
+    def _void_pins(self):
+        return None
+
+
+class KeyAliasSparse(SP.ResidencySparse):
+    """DEFECT (review kind 4, B1's form): one key id per REQUEST in the device pin table, so two live keys alias."""
+
+    def _tick_extra(self, rows):
+        kids = [self._kids.setdefault(r.key[0], len(self._kids) + 1) for r in rows]
+        return kids + [e for per_l in self._epoch for e in per_l]
+
+
+_FX_BASE = dict(v1=(RES.Residency, dict(poll_in_resolve=False, defer_issue=True, defer_admit=True)),
+                sc=(SC.ResidencySC, dict(nblk=NB)), sparse=(SP.ResidencySparse, dict(nblk=NB)))
+_FX_PLANT_KW = dict(
+    dup_take_device=lambda: dict(svc_kw=dict(sb_mut={"no_dedup": True})),
+    dup_take_host=lambda: dict(cls=NoDedup),
+    owner_not_mirrored=lambda: dict(svc_kw=dict(mirror_drop={"owner"})),
+    owner_blind=lambda: dict(cls=OwnerBlindInFlight),
+    no_uid_check=lambda: dict(mut=MU.Mutations(no_uid_check=True)),
+    free_on_cancel=lambda: dict(mut=MU.Mutations(free_on_cancel=True)),
+    cancel_refusal_off=lambda: dict(cls=CancelledAccepted, mut=MU.Mutations(no_late_protection_guard=True)),
+    late_guard_off=lambda: dict(mut=MU.Mutations(no_late_protection_guard=True)),
+    batch_recency=lambda: dict(cls=BatchRecency),
+    no_overflow_flag=lambda: dict(svc_kw=dict(sc_mut={"no_overflow_flag": True})),
+    flag_ignored=lambda: dict(cls=IgnoresFlags),
+    void_keeps_pins=lambda: dict(cls=VoidKeepsPins),
+    no_t4_refusal=lambda: dict(cls=NoT4Refusal),
+    trash_written=lambda: dict(cls=TrashWriter),
+    no_reader_wait=lambda: dict(mut=MU.Mutations(no_reader_wait=True)),
+    lost_forward=lambda: dict(cls=LostForward),
+    drop_keeps_reader=lambda: dict(cls=DropKeepsReader),
+    poll_order_swapped=lambda: dict(cls=PollOrderSwapped),
+    key_alias=lambda: dict(cls=KeyAliasSparse),
+)
+
+
+def _fx_world(fx, name, cls=None, mut=None, svc_kw=None):
+    """World `name` ("v1": v1 under the S-C schedule; "sc": S-C dense; "sparse": S-C sparse, B1) of fixture fx:
+    force_only (a transfer lands only when a wait or a "land" forces it), the fixture's capacities and trash slot."""
+    base_cls, base_kw = _FX_BASE[name]
+    w = world(C=fx.C, X=fx.X, R_ver=fx.R_ver, seed=0, mode="force_only", mut=mut, cls=cls or base_cls,
+              svc_kw=dict(base_kw, **(svc_kw or {})), trash=fx.trash)
+    if fx.trash:
+        _fill_trash(w)
+    return w
+
+
+def _journal_kinds(svc):
+    """The stream transitions per kind (a release by its reason): S-C's journal_counts, or v1's Stream.log counted
+    the same way (the sparse record counts its draft touches without a log record)."""
+    jc = getattr(svc, "journal_counts", None)
+    if jc is None:
+        jc = collections.Counter()
+        for pool in svc.pools:
+            for st in pool.streams.values():
+                for e in st.log:
+                    jc[e[0] if e[0] != "release" else "release:%s" % (e[4],)] += 1
+    return sorted((k, v) for k, v in jc.items() if v)
+
+
+def _fx_snapshot(w, tags):
+    """The vendored snapshot of the fixtures, after every operation: the ownership state (_state), the counters, every
+    slot's first / last reader by name, the transfers in flight with their forwarded reader and write-back flag (T3,
+    T4), the transitions per kind, the RELEASING slots with a pending last reader, S-C's device mirror against the
+    full scan (after its delta; v1: none), and the trash sentinel."""
+    svc = w.svc
+    mirror = []
+    if hasattr(svc, "dmirror"):
+        svc.sync_mirror()
+        mirror = [(l, d) for l in range(L) for d in _mirror_diff(svc, l)]
+
+    def tag(ev):
+        return "-" if ev is None else tags.get(id(ev), "?")
+    return dict(
+        state=_state(w), counters=_counters(svc), readers=_reader_tags(svc, tags),
+        forward=sorted((tr.layer, tr.b, tr.h, tr.block, tr.slot, tr.gen, tag(tr.reader_ev), tr.hist_ev is not None)
+                       for tr in svc.inflight.values()),
+        journal=_journal_kinds(svc), gates=sum(len(pool.releasing_gates()) for pool in svc.pools),
+        mirror=mirror, trash=_trash_intact(w) if svc.trash_slot is not None else None)
+
+
+@pytest.mark.parametrize("name", sorted(FXM.FIXTURES))
+def test_R6a_the_worlds_agree_on_each_shared_fixture(name):
+    """R6a: on each shared fixture (r2_lockstep_fixtures.py) v1 under the S-C schedule, S-C dense and S-C sparse (B1)
+    raise the same exceptions, return the same values (a tick: its page tables) and have equal snapshots after EVERY
+    operation (state, counters, readers, forwarded readers and write-backs, transitions per kind, pending gates, the
+    device mirror against the full scan, the trash sentinel). Every operation runs (a terminal raise is the last
+    one). The fixture's precondition holds: its transition happened (counted)."""
+    fx = FXM.FIXTURES[name]
+    worlds = {n: _fx_world(fx, n) for n in fx.worlds}
+    res = FXM.run(fx, worlds, _fx_snapshot, Row)
+    assert res.diffs == [], res.diffs[:1]
+    assert len(res.raised) == len(fx.ops), (name, len(res.raised), len(fx.ops))
+    assert fx.pre(res, worlds[fx.worlds[0]]), (name, fx.doc)
+
+
+_R6_PLANTS = [pytest.param(name, p, id="%s-%s" % (name, p.name)) for name in sorted(FXM.FIXTURES)
+              for p in FXM.FIXTURES[name].plants]
+
+
+@pytest.mark.parametrize("name, plant", _R6_PLANTS)
+def test_R6b_a_planted_defect_is_caught_at_its_operation(name, plant):
+    """R6b (planted defects): one world of the fixture carries the plant's defect. The lockstep reports its FIRST
+    difference at the predicted operation, by the predicted field ("raise": the worlds raise differently; "value": a
+    tick's page tables differ; else the first differing snapshot field). R6a is the precondition (without the defect
+    the worlds agree)."""
+    fx = FXM.FIXTURES[name]
+    worlds = {n: _fx_world(fx, n, **(_FX_PLANT_KW[plant.name]() if n == plant.world else {})) for n in fx.worlds}
+    res = FXM.run(fx, worlds, _fx_snapshot, Row)
+    assert res.diffs, (name, plant.name, "not caught", plant.defect)
+    i, what, detail = res.diffs[0]
+    assert (i, what if what != "snapshot" else detail["field"]) == (plant.at, plant.field), (name, plant.name,
+                                                                                            res.diffs[0])
+
+
+def test_R6c_the_fixtures_plant_every_review_kind():
+    """R6c: the plants cover the review's 8 missing kinds (docs/R2_OWN2_B2_REVIEW_C.md section 3); every plant has a
+    defective world here and names a world of its fixture; every fixture's first world is a vendored one (its
+    precondition reads it)."""
+    plants = [(fx, p) for fx in FXM.FIXTURES.values() for p in fx.plants]
+    missing = set(FXM.REVIEW_KINDS) - {p.kind for _, p in plants}
+    assert not missing, sorted(missing)
+    assert sorted(_FX_PLANT_KW) == sorted(p.name for _, p in plants)
+    assert all(p.world in fx.worlds for fx, p in plants)
+    assert all(fx.worlds[0] in _FX_BASE for fx in FXM.FIXTURES.values())
+
+
+# =====================================================================================================================
+# F24 T4 on the GPU path: the main stream waits every registered write-back before the urgent gather (TC-R review 5.1)
+# =====================================================================================================================
+class _MainStream:
+    """The stand-in of torch.cuda.current_stream() for CudaDeviceOps on the CPU: it logs each wait_event."""
+
+    def __init__(self, log):
+        self.log = log
+
+    def wait_event(self, ev):
+        self.log.append(("wait", ev))
+
+
+class NoHistProducer(SC.ResidencySC):
+    """DEFECT (the code before F24): history_written registers the event for the takes (hist_ev) only; the main
+    stream's wait list (_hist_unwaited) never gets it."""
+
+    def history_written(self, uid, block, ev):
+        RES.Residency.history_written(self, uid, block, ev)
+
+
+def _cuda_ops_on_cpu(svc, w, log):
+    """CudaDeviceOps (superset wait) without its GPU kernels: the K / bias and V copies by the load ids are CPU copies,
+    each logged after the waits that precede it (the order of the main stream)."""
+    ops = object.__new__(SC.CudaDeviceOps)
+    ops.svc, ops.bs = svc, BS
+    ops.host_k, ops.host_v, ops.store_k, ops.store_v = w.host_k, w.host_v, w.store_k, w.store_v
+    ops.store_b, ops.cis = w.store_b, w.cis
+    ops.wait_mode, ops.max_spin = "superset", 1
+    ops.err = torch.zeros((), dtype=torch.int32)
+    ops.events_waited = ops.submission_waits = 0
+
+    def copy(dst, src, ids, what):
+        for h, per_b in enumerate(ids.tolist()):
+            for b, per_m in enumerate(per_b):
+                for m, t in enumerate(per_m):
+                    if t >= 0:
+                        dst[b, m * BS:(m + 1) * BS, h] = src[b, t * BS:(t + 1) * BS, h]
+                        log.append((what, b, h, m, t))
+
+    def h2d_bias(sk, hk, sb, cis, ids, bs):
+        copy(sk, hk, ids, "k")
+        copy(sb, cis, ids, "bias")
+
+    def h2d(sv, hv, ids, bs):
+        copy(sv, hv, ids, "v")
+    ops.h2d_bias, ops.h2d = h2d_bias, h2d
+    return ops
+
+
+def _f24(cls, monkeypatch):
+    """u0's prefill wrote blocks 0-3 (hist_blocks 4). Block 5 was written back to the host rows with an event wb that
+    was recorded on ANOTHER stream (pending here). Then a verify row misses block 5 (an urgent gather) on the GPU path
+    (_cuda_ops_on_cpu). Returns the main stream's log (waits and copies, in order), wb and the world."""
+    w = world(C=4, X=4, R_ver=1, cls=cls, svc_kw=dict(nblk=NB))
+    svc = w.svc
+    log = []
+    svc.dev = _cuda_ops_on_cpu(svc, w, log)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a, **k: _MainStream(log))
+    svc.begin_request(0, "u0", hist_blocks=4)
+    wb = Ev()
+    svc.history_written("u0", 5, wb)
+    svc.poll()
+    rows = [Row(0, "v", ("u0", 1, 1), 300, 10)]
+    for l in range(L):
+        p = svc.resolve(l, rows, S([[5], []]))
+        svc.read_done(l, p, Ev(done=True))
+    svc.end_tick()
+    return log, wb, w
+
+
+def test_F24_the_main_stream_waits_every_registered_write_back_before_the_urgent_gather(monkeypatch):
+    """F24 (TC-R review note 5.1): history_written puts the write-back's event on S-C's main-stream wait list
+    (_hist_unwaited). The GPU gather (CudaDeviceOps.gather, here with CPU copies and a logging stand-in of the main
+    stream) waits on it ONCE, BEFORE its first copy, also when the write-back ran on another stream (the event is
+    pending; the host never waits on it), and it empties the list. The take still carries the event (hist_ev) for the
+    transports. The CPU stand-in (CpuDeviceSim) host-waits a pending registered write-back at its gather and empties
+    the list too. Negative control: without the producer (the code before F24) the gather copies block 5 with no
+    wait on its write-back."""
+    log, wb, w = _f24(SC.ResidencySC, monkeypatch)
+    copies = [i for i, e in enumerate(log) if e[0] != "wait"]
+    assert copies and ("wait", wb) in log and log.index(("wait", wb)) < copies[0], log[:4]
+    assert ("k", 0, 0, 0, 5) in log and sum(1 for e in log if e == ("wait", wb)) == 1, log[:6]
+    assert w.svc._hist_unwaited == [] and not wb.done
+    assert any(tr.block == 5 and tr.hist_ev is wb for tr in w.svc.inflight.values())
+    # the CPU stand-in: a pending write-back that no row of the tick reads is host-waited at the gather
+    wc = world(C=4, X=4, R_ver=1, cls=SC.ResidencySC, svc_kw=dict(nblk=NB))
+    sc = wc.svc
+    sc.begin_request(0, "u0", hist_blocks=4)
+    ev7 = Ev()
+    sc.history_written("u0", 7, ev7)
+    sc.history_written("u0", 5, Ev(done=True))
+    sc.poll()
+    rows = [Row(0, "v", ("u0", 1, 1), 300, 10)]
+    for l in range(L):
+        p = sc.resolve(l, rows, S([[5], []]))
+        sc.read_done(l, p, Ev(done=True))
+    sc.end_tick()
+    assert ev7.done and sc._hist_unwaited == []
+    # negative control
+    log2, wb2, _ = _f24(NoHistProducer, monkeypatch)
+    assert ("wait", wb2) not in log2 and ("k", 0, 0, 0, 5) in log2, log2[:4]
+
+
+# =====================================================================================================================
+# F25 K5 for the verifier at SG5 p4a's numbers (usage 86 of C 96, the 32 extras free, 16 first misses with no slot
+# over 3 streams): the free base slots and every shared extra are granted; the refusal report shows the decision
+# =====================================================================================================================
+NB_K5 = 128
+P4A_MISSES = {(0, 0): 38, (0, 1): 20, (1, 0): 15, (1, 1): 15}      # first misses per stream (b, h): 16 find no slot
+EDGE_MISSES = {(0, 0): 38, (0, 1): 14, (1, 0): 10, (1, 1): 10}     # exactly the allowance: 32 shared extras needed
+
+
+def _k5_world(cls, svc_kw=None):
+    """One layer, B 2, H 2, 128 host blocks, C 96, X 32, R_ver 16 (p4a's K5 numbers); a force_only transport."""
+    g = torch.Generator().manual_seed(25)
+    host_k = [torch.randn(B, NB_K5 * BS, H, D, generator=g)]
+    host_v = [torch.randn(B, NB_K5 * BS, H, D, generator=g)]
+    cis = [torch.randn(B, NB_K5 * BS, H, generator=g)]
+    n = (96 + 32 + RES.N_TAIL) * BS
+    store_k, store_v, store_b = [torch.zeros(B, n, H, D)], [torch.zeros(B, n, H, D)], [torch.zeros(B, n, H)]
+    be = Be()
+    tp = TR.AdversarialTransport(be, host_k, host_v, store_k, store_v, BS, 0, mode="force_only")
+    gather = RES.TorchGather(host_k, host_v, store_k, store_v)
+    svc = cls(1, B, H, 96, 32, 16, tp, gather, store_b=store_b, cis=cis, block_bytes=BS * 2 * D * 4,
+              host_wait=be.host_wait, **(svc_kw or {}))
+    return types.SimpleNamespace(svc=svc, tp=tp, be=be)
+
+
+def _k5_case(cls, misses, svc_kw=None):
+    """Both requests draft blocks 0-85 in every stream (86 takes, all in the base slots); blocks 0-76 land (LRU 77,
+    protected by the drafts' key), blocks 77-85 stay in flight (9, protected): usage 86 of C 96 in every stream, the
+    layer's 32 extras free, no Policy E candidate. Then ONE verify tick of the same key: stream (b, h) misses
+    misses[(b, h)] blocks (86, 87, ...). Returns (world, the CapacityRefusal or None)."""
+    w = _k5_world(cls, svc_kw)
+    svc = w.svc
+    keys = [("u%d" % b, 1, 1) for b in range(B)]
+    for b in range(B):
+        svc.begin_request(b, "u%d" % b)
+    svc.poll()
+    rows = [Row(b, "d", keys[b], 300, NB_K5) for b in range(B)]
+    p = svc.resolve(0, rows, S(*[[list(range(86)), list(range(86))] for _ in range(B)]))
+    svc.read_done(0, p, Ev(done=True))
+    svc.end_tick()
+    for tr in list(svc.inflight.values()):
+        if tr.block < 77 and not tr.delivered and tr in w.tp.pending:
+            w.tp.force(tr)
+    svc.poll()
+    sts = [svc.stream(0, b, h) for b in range(B) for h in range(H)]
+    assert all(s.usage() == 86 and len(s.lru) == 77 and len(s.pending) == 9 for s in sts)
+    assert all(s.prot.get(blk) for s in sts for blk in list(s.lru) + list(s.pending))
+    assert svc.pools[0].free_extras() == 32
+    svc.poll()
+    vrows = [Row(b, "v", keys[b], 301, NB_K5) for b in range(B)]
+    vsel = S(*[[list(range(86, 86 + misses[(b, 0)])), list(range(86, 86 + misses[(b, 1)]))] for b in range(B)])
+    try:
+        p = svc.resolve(0, vrows, vsel)
+        svc.read_done(0, p, Ev(done=True))
+        svc.end_tick()
+    except ER.CapacityRefusal as e:
+        return w, e
+    return w, None
+
+
+@pytest.mark.parametrize("kind", ["sc", "sparse"])
+def test_F25_k5_grants_the_free_base_slots_and_every_shared_extra_to_the_verifier(kind):
+    """F25 (SG5 p4a's refusal; K5 = LayerPool.can_take, ownership.py:419-427, usage :135-136, borrowed :409-413;
+    device_verify's K5). At p4a's numbers (usage 86 of C 96 in every stream, the layer's 32 extras free, every LRU
+    entry and in-flight prefetch protected) the verifier's first misses 38 / 20 / 15 / 15 (K3X order) get: 10 FREE
+    base slots each, then the 32 SHARED extras of the layer (the R_ver 16 reserve included) in K3X order (28 to the
+    first stream, 4 to the second), and 16 find no slot over 3 streams: S-C (dense and sparse) refuses the tick with a
+    report of exactly that decision, before any change; v1 refuses the same state at its 15th miss of stream (0, 1)
+    (block 100). At exactly the allowance (38 / 14 / 10 / 10: 32 extras needed) S-C and v1 pass with equal states and
+    all 32 extras borrowed. Negative controls (planted K5 defects on the device): a verifier that keeps the R_ver
+    reserve (the draft rule), and one that grants no base slot under C, both refuse the allowance case that v1
+    passes."""
+    cls = dict(sc=SC.ResidencySC, sparse=SP.ResidencySparse)[kind]
+    kw = dict(nblk=NB_K5)
+    v1kw = dict(poll_in_resolve=False, defer_issue=True, defer_admit=True)
+    w, e = _k5_case(cls, P4A_MISSES, kw)
+    assert e is not None
+    msg = str(e)
+    assert "first misses with no slot: [(0, 16)]" in msg, msg[:400]
+    assert ("layer 0: 4 streams had verify first misses, 48 of the misses needed a shared extra; the layer's 32 free "
+            "extras (X 32, borrowed 0 at the tick start) went to the first 32 of them in K3X order; 16 found no "
+            "slot") in msg, msg
+    for (b, h, n, ex, no) in ((0, 1, 20, 4, 6), (1, 0, 15, 0, 5), (1, 1, 15, 0, 5)):
+        assert ("(l 0 b %d h %d: first misses %d = 10 in its free base slots (C 96 - usage 86) + %d shared extras + 0 "
+                "by Policy E + %d with no slot)" % (b, h, n, ex, no)) in msg, msg
+    assert "(l 0 b 0 h 0:" not in msg                                 # the first stream got all it needed
+    assert [w.svc.stream(0, b, h).usage() for b in range(B) for h in range(H)] == [86] * 4   # nothing applied
+    _, ev = _k5_case(RES.Residency, P4A_MISSES, v1kw)
+    assert ev is not None and "urgent block 100" in str(ev), str(ev)[:300]
+    # exactly the allowance
+    ws, es = _k5_case(cls, EDGE_MISSES, kw)
+    wv, ev2 = _k5_case(RES.Residency, EDGE_MISSES, v1kw)
+    assert es is None and ev2 is None, (str(es)[:300], str(ev2)[:300])
+    assert _state(ws) == _state(wv)
+    assert ws.svc.pools[0].borrowed() == 32 and ws.svc.pools[0].free_extras() == 0
+    assert [ws.svc.stream(0, b, h).usage() for b in range(B) for h in range(H)] == [124, 100, 96, 96]
+    # negative controls: planted K5 defects of the device
+    for mut in ({"verify_reserve": 16}, {"verify_no_local": True}):
+        _, en = _k5_case(cls, EDGE_MISSES, dict(kw, sc_mut=mut))
+        assert en is not None and "found no slot" in str(en), mut
