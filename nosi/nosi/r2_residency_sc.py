@@ -921,6 +921,33 @@ class CudaDeviceOps:
 # ====================================================================================================================
 # the service
 # ====================================================================================================================
+def page_keys_of(dec, listed: str, hb: torch.Tensor, nt: torch.Tensor) -> torch.Tensor:
+    """[sharedkv2] The BLOCK ID of every entry of one decision's page-table rows (dec.page, (n, H, k + T)), device ops
+    only (no host read, no host-to-device copy; docs/R2_SHAREDKV2_KEYS_S3.md). The entries the decision lists come
+    first: listed = "valid" for device_verify (every valid selected block), "ready" for device_draft (the READY
+    blocks); both decisions order their slots by ascending block id (vkey / rkey sorted), so the sorted listed block
+    ids are the keys of the same positions. Then the tail pages: block hist_bound + u for u < nt (the tick's rows name
+    their tail blocks so; ResidencySC._check_tail_keys refuses rows that do not). -1 padded, int32, dec.page's shape.
+    Derived from the decision's (blk, listed) columns, not from its slot choices, so a change of the slot allocation
+    does not touch it."""
+    n, H, P = dec.page.shape
+    k = dec.k
+    T = P - k
+    dv_ = dec.page.device
+    blk = dec.t["blk"].view(n, H, k)
+    ok = dec.t[listed].view(n, H, k) != 0
+    big = torch.iinfo(torch.int64).max
+    srt = torch.sort(torch.where(ok, blk, torch.full_like(blk, big)), dim=-1).values
+    cnt = ok.to(torch.int64).sum(-1)                                                # (n, H): the listed entries
+    posk = torch.arange(k, device=dv_).view(1, 1, k)
+    key = torch.full((n, H, P), -1, dtype=torch.int64, device=dv_)
+    key[..., :k] = torch.where(posk < cnt.unsqueeze(-1), srt, torch.full_like(srt, -1))
+    post = torch.arange(T, device=dv_).view(1, 1, T)
+    tkey = torch.where(post < nt.view(n, 1, 1), hb.view(n, 1, 1) + post, torch.full_like(post, -1))
+    key.scatter_(-1, (cnt.unsqueeze(-1) + post).expand(n, H, T).contiguous(), tkey.expand(n, H, T).contiguous())
+    return key.to(torch.int32).contiguous()
+
+
 class ResidencySC(ResidencySB):
     """Residency with the verify and the draft rows decided on the device (module docstring). Extra arguments (beyond
     S-B's device, nblk, sb_mut): sc_mut (negative controls: device_verify's, and no_wait: the device does not wait for
@@ -928,7 +955,13 @@ class ResidencySC(ResidencySB):
     CONTROL, tests only: the journal kinds, or "owner", whose changes are NOT sent to the device mirror), wait_mode
     (the CPU stand-in's wait: "probe" = CpuDeviceSim, the host's transfer records; "exact" = ExactWaitSim, the
     generation board, which needs a publishing transport; on the GPU CudaDeviceOps' own wait_mode decides).
-    The generation board (self.board, note 12f) is attached to every transport that publishes (attach_board)."""
+    The generation board (self.board, note 12f) is attached to every transport that publishes (attach_board).
+    [sharedkv2] want_keys (default False: nothing changes): resolve also fills plan.page_key (page_keys_of);
+    key_plant (NEGATIVE CONTROL, tests only): (head, position) of the first verify row's key that gets + 1."""
+
+    want_keys = False                                     # [sharedkv2] set by the tick's ResidencyBackend
+    key_plant = None                                      # [sharedkv2] NEGATIVE CONTROL (tests only)
+    key_plant_live = 0                                    # [sharedkv2] device count: plants inside num_pages
 
     def __init__(self, *args, sc_mut=None, devops=None, mirror_drop=None, wait_mode: str = "probe", **kw):
         kw["defer_admit"] = True
@@ -1125,6 +1158,8 @@ class ResidencySC(ResidencySB):
         if sel.device.type != self.device.type:
             raise ValueError("S-C: the selection must be on the service's device %s (got %s)" % (self.device, sel.device))
         self._check_rows(l, rows, sel)
+        if self.want_keys and not self._tick:                         # [sharedkv2] host rows only, once per tick
+            self._check_tail_keys(rows)
         if not self._tick:                                            # the tick's first layer: the per-tick copies
             self.sync_mirror()
             self._rows = self._tick_rows(rows)
@@ -1167,7 +1202,38 @@ class ResidencySC(ResidencySB):
         plan.num_pages = npg.to(torch.int32)
         plan.last_len = tk["last_len"]
         plan.seq_idx = tk["seq_idx"]
+        if self.want_keys:                                            # [sharedkv2] device ops only
+            plan.page_key = self._page_keys(R, P, step, tk, plan.num_pages)
         return plan
+
+    # ------------------------------------------------------------------------------------------------ [sharedkv2] keys
+    def _check_tail_keys(self, rows: Sequence[Row]) -> None:
+        """[sharedkv2] page_keys_of names tail page u of a row block hist_bound + u (the tick's ResidencyBackend.prepare
+        builds its rows so: tail [(T, ring)] with hist_bound T, or [(T - 1, ring), (T, ring)] with hist_bound T - 1).
+        A row whose tail names other blocks is refused (host rows only; never guessed)."""
+        for i, r in enumerate(rows):
+            got = [t for (t, _) in r.tail]
+            want = list(range(r.hist_bound, r.hist_bound + len(r.tail)))
+            if got != want:
+                raise ValueError("sharedkv2: row %d tail blocks %s are not hist_bound %d, %d + 1, ... (the page keys "
+                                 "assume it)" % (i, got, r.hist_bound, r.hist_bound))
+
+    def _page_keys(self, R: int, P: int, step: Dict, tk: Dict, num_pages: torch.Tensor) -> torch.Tensor:
+        """[sharedkv2] plan.page_key (R, H, P) int32: the verify rows' keys from device_verify's decision (valid
+        blocks), the draft rows' from device_draft's (READY blocks), each then its tail blocks (page_keys_of). Device
+        ops only. key_plant (head h, position j): + 1 on the first verify row's key (h, j); key_plant_live counts the
+        layers where that entry lies inside the row's num_pages (the plant's precondition, read by the test)."""
+        key = torch.full((R, self.H, P), -1, dtype=torch.int32, device=self.device)
+        for dec, part, listed in ((step["vdec"], tk["v"], "valid"), (step["ddec"], tk["d"], "ready")):
+            if dec is not None:
+                _, hb, _, nt, ix = part
+                key[ix] = page_keys_of(dec, listed, hb, nt)
+        if self.key_plant is not None and tk["vrows"]:                # NEGATIVE CONTROL (tests only)
+            h, j = self.key_plant
+            r0 = tk["vrows"][0]
+            key[r0, h, j] += 1
+            self.key_plant_live = self.key_plant_live + (num_pages[r0, h] > j).to(torch.int64)
+        return key.contiguous()
 
     def end_tick(self) -> None:
         steps, self._tick = self._tick, []

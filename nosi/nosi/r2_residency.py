@@ -104,6 +104,8 @@ class Plan:
     masked: int = 0                           # draft (row, head) pairs that did not read every selected block
     draft_pairs: int = 0                      # draft (row, head) pairs
     refused: int = 0                          # draft fetches refused by K5
+    page_key: Optional[torch.Tensor] = None   # [sharedkv2] (R, H, P) int32 on the device: the block id of every
+                                              # page_table entry (-1 padded); S-C / B2 with want_keys only (else None)
 
 
 class TorchGather:

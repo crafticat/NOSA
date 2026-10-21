@@ -603,8 +603,17 @@ class SharedKVProbe(SharedKV):
     everything once at the end."""
 
     def __init__(self, base, mode: str = "split", rows_max: int = ROWS_MAX, timing: bool = True, plant: bool = False,
-                 impl: str = "kernel", count: bool = True):
+                 impl: str = "kernel", count: bool = True, ncu_window=None):
+        """[sharedkv2] ncu_window (skip, count) (the S3 cell, benchmarks/Efficiency/r2_sharedkv_ncu.py): among the
+        keyed calls with rows_max == self.rows_max, calls skip .. skip + count - 1 are MARKED: one profiler window
+        (cudaProfilerStart / Stop; ncu --profile-from-start off profiles nothing else) around the two launches, each
+        in its NVTX range "skv|pr|c<j>" (piece 3: split + combine) / "skv|sh|c<j>" (shared + combine), and the call's
+        logical page counts (sum of num_pages; the union size) are kept on the device for the byte bounds. The union
+        build and the counting launch stay OUTSIDE the window."""
         super().__init__(base, mode, rows_max, impl)
+        self.ncu_window = None if ncu_window is None else (int(ncu_window[0]), int(ncu_window[1]))
+        self.full_calls = 0                               # keyed calls with rows_max == self.rows_max
+        self.marked = []                                  # (j, rows, first, sum pages (device), union pages (device))
         self.timing = bool(timing)
         self.count = bool(count)                          # an extra UNTIMED counting launch per keyed call
         self.tiles = dict(shared=0, per_row=0, rows_shared=0, rows_per_row=0)   # device sums (0 until a count)
@@ -635,13 +644,30 @@ class SharedKVProbe(SharedKV):
         if self.plant:
             un = plant_drop_page(un)
 
+        mark = self._ncu_mark(nr)                         # [sharedkv2] None, or the marked call's index j
+        prof = mark is not None and q.is_cuda             # the CPU tests mark calls without a profiler / NVTX
+
+        def ranged(tag, fn):
+            if not prof:
+                return fn()
+            torch.cuda.nvtx.range_push("skv|%s|c%d" % (tag, mark))
+            try:
+                return fn()
+            finally:
+                torch.cuda.nvtx.range_pop()
+
         def per_row():
-            return self._base(args, softmax_scale, pps)
+            return ranged("pr", lambda: self._base(args, softmax_scale, pps))
 
         def shared():
-            return self._shared(args, page_key, nr, softmax_scale, pps, union=un)
+            return ranged("sh", lambda: self._shared(args, page_key, nr, softmax_scale, pps, union=un))
         first = "per_row" if self.calls % 2 == 0 else "shared"
         self.calls += 1
+        if mark is not None:
+            self.marked.append((mark, int(q.shape[0]), first, num_pages.to(torch.int64).sum(),
+                                un["ucnt"].to(torch.int64).sum()))
+        if prof:
+            torch.cuda.cudart().cudaProfilerStart()
         if ev:
             ev[0].record()
         a = per_row() if first == "per_row" else shared()
@@ -651,6 +677,8 @@ class SharedKVProbe(SharedKV):
         if ev:
             ev[2].record()
             self.events.append((nr, first, ev[0], ev[1], ev[2], ev[3], ev[4]))
+        if prof:
+            torch.cuda.cudart().cudaProfilerStop()
         if self.count and self.impl == "kernel":        # untimed: the kernel's own tile counter (the byte model)
             cnt = torch.zeros(2, dtype=torch.int32, device=q.device)
             bi_paged_decode_shared(self.base, *args, page_key, rows_max=nr, mode=self.mode,
@@ -670,6 +698,25 @@ class SharedKVProbe(SharedKV):
             out.copy_(ref)
             return out
         return ref
+
+    def _ncu_mark(self, nr: int):
+        """[sharedkv2] the index j of this keyed call if it lies in ncu_window (counted over the calls with
+        nr == rows_max), else None."""
+        if self.ncu_window is None or nr < self.rows_max:
+            return None
+        j = self.full_calls
+        self.full_calls += 1
+        skip, count = self.ncu_window
+        return j if skip <= j < skip + count else None
+
+    def ncu_report(self) -> dict:
+        """[sharedkv2] the marked calls (ONE host read): per call j its row count, which kernel ran first, the sum of
+        num_pages (the per-row reads: (row, head) pages) and the union size (the distinct (key, slot) pages per
+        (group, head)); a (row, head) page is 64 rows of K and V (bf16, D 128): 32768 B."""
+        out = []
+        for (j, R, first, s, u) in self.marked:
+            out.append(dict(call=j, rows=R, first=first, sum_pages=int(s), union_pages=int(u)))
+        return dict(window=self.ncu_window, full_calls=self.full_calls, marked=out)
 
     def report(self) -> dict:
         """ONE host read at the end: the differing-row count and the per-call times (ms) of both kernels."""

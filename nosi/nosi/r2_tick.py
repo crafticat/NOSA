@@ -23,7 +23,8 @@ row reading only its own state:
      [sharedkv] SELECTOR: when ops.attn has needs_page_key (bi_paged_attention_shared.SharedKV; default: piece 3
      itself, no change), the call also gets page_key (the block ids, backend.page_keys) and rows_max (the most rows
      of one request in this tick), and a request's rows read each page once (docs/R2_SHAREDKV_PLAN.md). The
-     ResidentStore gives keys; the ResidencyBackend refuses (not built).
+     ResidentStore gives keys; [sharedkv2] the ResidencyBackend gives the plan's keys on S-C / B2 (plan.page_key,
+     r2_residency_sc.page_keys_of) and refuses on v1 / S-B.
   7. wo, gate_up, silu_and_mul, down through ops.linear.
 Final rmsnorm, lm_head through ops.linear, .float(); the argmax of every row goes to the DEVICE TOKEN LOG.
 
@@ -711,7 +712,7 @@ class TickEngine:
         akw = {}
         if getattr(self.ops.attn, "needs_page_key", False):                # [sharedkv] the selector (default: piece 3)
             with self._span("res"):
-                akw = dict(page_key=self.backend.page_keys(l, ctx, sel, layer), rows_max=ctx.rows_max)
+                akw = dict(page_key=self.backend.page_keys(l, ctx, sel, layer, plan=plan), rows_max=ctx.rows_max)
         with self._span("att"):
             attn = self.ops.attn.bi_paged_decode(q, self.store_k[l], self.store_v[l], self.store_bias[l], seq_idx,
                                                  table, npg, last, **akw)
@@ -981,8 +982,8 @@ class ResidentStore:
                                          ctx.any_draft, layer)
         return table, npg, ctx.last, ctx.rb32, None
 
-    def page_keys(self, l, ctx, sel, layer):
-        """[sharedkv] the block id of every page_table entry (TickEngine.page_keys)."""
+    def page_keys(self, l, ctx, sel, layer, plan=None):
+        """[sharedkv] the block id of every page_table entry (TickEngine.page_keys). plan: unused here ([sharedkv2])."""
         return self.eng.page_keys(l, sel, ctx.pos, ctx.rb, ctx.is_draft, ctx.any_draft, layer)
 
     def after_attention(self, l, plan) -> None:
@@ -1032,6 +1033,8 @@ class ResidencyBackend:
         self.n_host = int(host_k[0].shape[1])
         for b, S in enumerate(eng.S_list):
             svc.begin_request(b, b, hist_blocks=S // BLOCK)
+        if getattr(eng.ops.attn, "needs_page_key", False) and hasattr(svc, "want_keys"):   # [sharedkv2] S-C / B2
+            svc.want_keys = True                             # resolve builds plan.page_key (page_keys)
         if callable(getattr(svc, "watch_flag", None)):       # S-C (C's 0d3a94a, Q-T5): the twins' overflow flags ride
             for l, t in enumerate(eng.twins):                 # in its ONE read per tick; a raised flag refuses that tick
                 svc.watch_flag("twin_overflow_%d" % l, t.overflow)
@@ -1069,10 +1072,15 @@ class ResidencyBackend:
         return (plan.page_table.to(dev).contiguous(), plan.num_pages.to(dev).contiguous(),
                 plan.last_len.to(dev).contiguous(), plan.seq_idx.to(dev).contiguous(), plan)
 
-    def page_keys(self, l, ctx, sel, layer):
-        """[sharedkv] NOT BUILT: the Residency's plan compacts a draft row by readiness on its own, so the keys would
-        need the plan's own block-id tensor (a follow-up with C). Refused, never guessed."""
-        raise TickError("sharedkv: the Residency backend gives no page keys yet (use the ResidentStore, or per_row)")
+    def page_keys(self, l, ctx, sel, layer, plan=None):
+        """[sharedkv2] the plan's own block-id tensor (plan.page_key, (R, H, P) int32 on the device, aligned with
+        plan.page_table): S-C / B2 build it in resolve when want_keys is set (__init__ sets it when ops.attn has
+        needs_page_key; r2_residency_sc.page_keys_of). v1 / S-B build none: refused, never guessed."""
+        key = getattr(plan, "page_key", None)
+        if key is None:
+            raise TickError("sharedkv: this Residency service gave no page keys (S-C / B2 with want_keys only; use "
+                            "sc / b2, the ResidentStore, or per_row)")
+        return key.to(self.eng.dev).contiguous()
 
     def after_attention(self, l, plan) -> None:
         self.svc.read_done(l, plan, self.new_event())
