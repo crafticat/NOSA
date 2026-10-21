@@ -1034,14 +1034,14 @@ def _sg5_gate():
 
 
 def test_T18_sg5_harness_on_the_cpu(p3):
-    """T18: the SG5 harness's pieces on the tiny model: its defaults (B 64, the primary point C 80 / X 32 / R_ver 16,
+    """T18: the SG5 harness's pieces on the tiny model: its defaults (B 64, the primary point C 96 / X 32 / R_ver 16,
     m_fix 4B, the three backends, both modes) and refusals; the draft-only tick on the S-C Residency with the CPU
     TickTimer (every category timed per tick: gemm, twin, sel, store, res, att, tick; host: rows, backend); its
     summary and the budget (a run against itself: every term 0). Negative control: an unknown backend is refused."""
     G = _sg5_gate()
     base = ["--out", "o", "--workload", "w", "--biattn", "b", "--gilfree", "g", "--gilfree-build", "/x"]
     a = G.parse_args(base)
-    assert (a.batch, a.C, a.X, a.R_ver, a.m_fix, a.backends, a.modes) == (64, 80, 32, 16, 256, ["sc", "sb", "v1"],
+    assert (a.batch, a.C, a.X, a.R_ver, a.m_fix, a.backends, a.modes) == (64, 96, 32, 16, 256, ["sc", "sb", "v1"],
                                                                          ["exact", "fast"])
     assert G.parse_args(base + ["--sweep", "64:16,96:64"]).sweep_pts == [(64, 16, 8), (96, 64, 32)]
     assert a.transport == "gilfree" and G.parse_args(base + ["--transport", "gather"]).transport == "gather"
@@ -1119,7 +1119,7 @@ def test_T19_sg5_step_script_uuid_file_and_pins(tmp_path):
     assert "gpu_uuid %s (%s/416.gpu_uuid)" % (uid, tmp_path) in r.stdout
     assert "piece 3 %s:%s blob %s" % (PIECE3_V2["sha"], PIECE3_V2["path"], PIECE3_V2["blob"]) in r.stdout
     assert "45c56f679b017436810bea8e16fa2719d642ba54" in r.stdout and "df3e3c8026fb0a48cc2fe2597013c3f20ab1338b" in r.stdout
-    for arg in ("--batch 64", "--S 16128", "--steps 48", "--C 80", "--X 32", "--R-ver 16", "--sweep-steps 24",
+    for arg in ("--batch 64", "--S 16128", "--steps 48", "--C 96", "--X 32", "--R-ver 16", "--sweep-steps 24",
                 "--pool-baseline", "--threads 8", "NOSI_R2_DECODE=1", "NOSI_POOL_BLOCKS=0",
                 "--gilfree /mnt/beegfs/ojerbi/r2-runs/sg5/sg5_t1_416.step/gilfree"):
         assert arg in r.stdout, arg

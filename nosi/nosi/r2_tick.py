@@ -863,6 +863,9 @@ class ResidencyBackend:
         self.n_host = int(host_k[0].shape[1])
         for b, S in enumerate(eng.S_list):
             svc.begin_request(b, b, hist_blocks=S // BLOCK)
+        if callable(getattr(svc, "watch_flag", None)):       # S-C (C's 0d3a94a, Q-T5): the twins' overflow flags ride
+            for l, t in enumerate(eng.twins):                 # in its ONE read per tick; a raised flag refuses that tick
+                svc.watch_flag("twin_overflow_%d" % l, t.overflow)
 
     def max_blocks(self) -> int:
         return self.n_host // BLOCK

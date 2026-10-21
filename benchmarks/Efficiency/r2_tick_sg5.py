@@ -77,7 +77,7 @@ def parse_args(argv):
     ap.add_argument("--m-fix", type=int, default=0, help="G-b's row count; 0 = (1 + K) B")
     ap.add_argument("--modes", default="exact,fast")
     ap.add_argument("--backends", default="sc,sb,v1")
-    ap.add_argument("--C", type=int, default=80)
+    ap.add_argument("--C", type=int, default=96, help="C's recommendation after holder 2190876 (132 slots, 17.79 GB)")
     ap.add_argument("--X", type=int, default=32)
     ap.add_argument("--R-ver", type=int, default=16)
     ap.add_argument("--sweep", default="", help="C:X,... (R_ver = X / 2); empty: none")
