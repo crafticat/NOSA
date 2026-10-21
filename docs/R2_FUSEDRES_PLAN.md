@@ -105,6 +105,7 @@ the xpool refusal in `FusedResolver.__init__`. That costs xpool's own launches o
 | `test_FR7_the_shared_fixtures_in_check_mode` | every C fixture: B2 (fused) == reference; fused == torch; void_overflow reaches v_over |
 | `test_FR8_the_kernel_time_parser_and_its_negative_control` | M3 parser on synthetic Kineto traces; a launch moved out of t.res is not counted; orphans counted; no t.tick refused |
 | `test_FR9_the_sg5_flags_for_the_plant_and_the_profile` | the two SG5 flags and their wiring |
+| `test_FR10_no_kernel_writes_past_a_buffer_and_the_guard_detector_works` | fusedres2b: guard mode (sentinels after every kernel-written buffer, checked after EVERY launch) on f20b / f21b / f6 / f12b; no hit; negative control: a changed guard is named |
 
 Also re-run test_r2_own2.py, test_r2_tick_b2.py (TB5 pins the SG5 b2 lines) and test_r2_residency.py F23.
 
@@ -225,3 +226,26 @@ overhead), hence FR-g3 is its own arm.
 | m9 | dtypes confirmed equal at p5b2 (code facts above); an in-kernel cast (BIAS 2) replaces the torch fallback |
 | m10 | unchanged: stats validated by FR2 / FR6 on CPU and G0p on the GPU |
 | m11 | unchanged (section 9) |
+
+### fusedres2b: the interpreter heap corruption of d2be560 (job 2191246)
+
+- Symptom: every interpreter child (lockstep, tick) died with SIGABRT, glibc "corrupted size vs. prev_size"; 0e28cf6
+  passed the same tests. Under TRITON_INTERPRET the kernels write straight into the CPU tensors' storage, so a write
+  past a buffer's end corrupts the heap.
+- Diff 0e28cf6 -> d2be560, kernel stores whose lanes reach past their buffer (static analysis; not confirmed by a
+  run). In 0e28cf6 the largest such overshoot was a few elements:
+  - r2_fusedres.py:255-256 (d2be560), the new SCAN chunk stores: 1,024 lanes on a buffer of R x H elements (8-64 in
+    the tests);
+  - :287, the new vlook zeroing: 256 lanes on Rv x 4;
+  - :541 and :754, the stats atomics: 16 lanes on an 11-element buffer.
+  These lanes are masked. The most likely cause is a masked lane that the interpreter's store / atomic path still
+  touched far past the allocation. The pinpoint is open: FR10 names the kernel and the buffer if any write still
+  lands past an end.
+- Fix by construction:
+  - every buffer a kernel writes is allocated with LANE_PAD = 2,048 spare elements (`FusedResolver._buf`; more than
+    any lane overshoot);
+  - the stats buffer holds all 16 atomic lanes; the draft counters hold all 4;
+  - the SCAN chunk is pow2(max(R H, S)) capped at 1,024, the vlook chunk pow2(Rv x 4) capped at 256;
+  - a masked bias lane clamps its slot to 0, so its address stays inside the table.
+- The detector: OwnResidency(fused_guard=True) fills the spare elements with a sentinel and checks every guard after
+  every launch (`_check_guards`); FR10 runs four schedules under it, plus a negative control.

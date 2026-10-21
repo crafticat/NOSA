@@ -266,6 +266,28 @@ if PART == "lockstep":
                             n_diffs=len(fr.diffs), diffs=[list(d) for d in fr.diffs[:5]], stats=rep["stats"])
     OUT["fixtures"] = fx_out
 
+elif PART == "guard":
+    # FR10 (fusedres2b, job 2191246): every kernel-written buffer has a sentinel guard after its end, checked after
+    # EVERY launch; a separate process so a crash elsewhere cannot hide its result
+    OWN = load("test_r2_own2_frguard", os.path.join(HERE, "test_r2_own2.py"))
+    TRM, OWN2 = OWN.TRM, OWN.OWN2
+    FR = TRM._load("r2_fusedres")
+    res = {}
+    for name in ("f20b", "f21b", "f6", "f12b"):
+        kw = OWN.SCHEDULES[name]()
+        bad, wv, wb = OWN._lockstep_b2(svc_kw=dict(resolve="check", fused_guard=True), **kw)
+        fr = wb.svc.fusedres
+        res[name] = dict(n_bad=len(bad), bad=[repr(x)[:300] for x in bad[:2]], hits=[list(x) for x in fr.guard_hits],
+                         checks=fr.guard_checks, n_diffs=len(fr.diffs), layers=fr.layers,
+                         guarded=len(fr._g_persist) + len(fr._g_tick) + len(fr._g_layer))
+    # NEGATIVE CONTROL: a changed guard element is found and named (the detector's own precondition)
+    name, full, n = fr._g_persist[-1]
+    full[n + 5] = 7
+    before = len(fr.guard_hits)
+    fr._check_guards((99, 0), "control")
+    res["control"] = dict(buffer=name, new_hits=[list(x) for x in fr.guard_hits[before:]])
+    OUT["guard"] = res
+
 elif PART == "tick":
     P3PATH = sys.argv[3]
     TT = load("test_r2_tick", os.path.join(HERE, "test_r2_tick.py"))
@@ -546,6 +568,21 @@ def test_FR7_the_shared_fixtures_in_check_mode(lockstep):
                                                                     for n, v in fx.items()}
     assert "void_overflow" in fx and fx["void_overflow"]["stats"]["v_over"] > 0, fx.get("void_overflow")
     assert sum(v["compared"] for v in fx.values()) > 0
+
+
+# =====================================================================================================================
+# FR10 the out-of-bounds detector (fusedres2b): sentinel guards after every kernel-written buffer, every launch
+# =====================================================================================================================
+def test_FR10_no_kernel_writes_past_a_buffer_and_the_guard_detector_works():
+    if not _has_triton():
+        pytest.skip("triton is not installed")
+    g = _child("guard")["guard"]
+    c = g.pop("control")
+    assert c["new_hits"] == [[99, 0, "control", c["buffer"]]], c        # NEGATIVE CONTROL: a changed guard is named
+    for name, r in g.items():
+        assert r["checks"] > 0 and r["guarded"] > 0, (name, "precondition: guards were checked", r)
+        assert r["hits"] == [], (name, "a kernel wrote past a buffer (tick, layer, kernel, buffer)", r["hits"][:5])
+        assert r["n_bad"] == 0 and r["n_diffs"] == 0, (name, r["bad"])
 
 
 # =====================================================================================================================

@@ -67,7 +67,7 @@ class OwnResidency(ResidencySparse):
     cohort key slots per request, KEYS <= 7), checked, b2_mut (negative controls, tests only)."""
 
     def __init__(self, *args, keys: int = 7, checked: bool = True, b2_mut=None, resolve: str = "torch",
-                 fused_plant: int = 0, **kw):
+                 fused_plant: int = 0, fused_guard: bool = False, **kw):
         kw["pin_records"] = False
         self.__dict__["_own_ready"] = False
         if resolve not in ("torch", "fused", "check"):                # [fusedres] r2_fusedres.RESOLVE_MODES
@@ -108,7 +108,8 @@ class OwnResidency(ResidencySparse):
         self.fusedres = None
         if resolve != "torch":
             from . import r2_fusedres
-            self.fusedres = r2_fusedres.FusedResolver(self, check=resolve == "check", plant=int(fused_plant))
+            self.fusedres = r2_fusedres.FusedResolver(self, check=resolve == "check", plant=int(fused_plant),
+                                                      guard=bool(fused_guard))   # [fusedres2b] tests: OOB guards
         self.__dict__["_own_ready"] = True
 
     def resolve(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> Plan:

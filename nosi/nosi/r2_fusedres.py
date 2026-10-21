@@ -109,7 +109,15 @@ GATE_STATS = ("v_evict", "pe_flip_effective", "v_grant", "d_grant", "d_refused")
 ERR_BITS = {1: "A1: a block has two resident slots in a stream", 2: "A1: a block has two owner slots in flight",
             4: "A3: a K5 grant found no FREE slot", 8: "A2: a Policy E candidate stamp outside [0, 2^47)",
             16: "self-check: phase 2's classification count differs from phase 1's (the global prefix is wrong)"}
-SCAN_BLOCK = 1024
+SCAN_BLOCK = 1024                      # the most lanes of a SCAN chunk (pow2(R H) when smaller)
+NSTAT_LANES = 16                       # the stats atomics' lanes; the stats buffer holds all of them (fusedres2b)
+# fusedres2b (job 2191246: glibc "corrupted size vs. prev_size" in the interpreter child): every buffer a kernel
+# writes is allocated with LANE_PAD spare elements after its logical end, so a masked lane past the end (SCAN's chunk,
+# the vlook zeroing chunk, KP / PP / NP / ZP tile lanes) addresses allocated memory in the interpreter too. With
+# guard > 0 (tests) the spare elements hold GUARD_SENTINEL and are checked after EVERY launch (a direct OOB detector
+# that names the kernel and the buffer).
+LANE_PAD = 2048
+GUARD_SENTINEL = -95443717
 MAX_NPOS = 512                                         # Policy E's sort key holds the slot index in 9 bits
 
 
@@ -273,7 +281,7 @@ if triton is not None:
                vix_ptr, vhb_ptr, vstart_ptr, vcnt_ptr, vorder_ptr,
                ne_ptr, rec_ptr, usg_ptr, err_ptr, cntv_ptr, look_ptr,
                H, R, K, NBLK, NPOS, C, Rv, MAXRV, NLOOK,
-               KP: tl.constexpr, NP: tl.constexpr):
+               KP: tl.constexpr, NP: tl.constexpr, LZ: tl.constexpr):
         pid = tl.program_id(0)
         b = pid // H
         h = pid % H
@@ -282,9 +290,9 @@ if triton is not None:
             code_ptr, blk_ptr, gen_ptr, cur_ptr, prot_ptr, stamp_ptr, base, NPOS, NBLK, NP)
         free_local = tl.maximum(C - usage, 0)
         _put1(usg_ptr + pid, usage, pid >= 0)
-        lk = tl.arange(0, 256)                                                    # program 0 zeroes V2's sums
-        for c0 in range(0, NLOOK, 256):
-            tl.store(look_ptr + c0 + lk, tl.zeros([256], tl.int64), mask=(c0 + lk < NLOOK) & (pid == 0))
+        lk = tl.arange(0, LZ)                                                     # program 0 zeroes V2's sums
+        for c0 in range(0, NLOOK, LZ):
+            tl.store(look_ptr + c0 + lk, tl.zeros([LZ], tl.int64), mask=(c0 + lk < NLOOK) & (pid == 0))
         _put1(cntv_ptr, tl.sum(tl.zeros([2], tl.int64), axis=0), pid == 0)
         start = tl.load(vstart_ptr + b)
         cnt = tl.load(vcnt_ptr + b)
@@ -758,7 +766,8 @@ if triton is not None:
                 gm = (granted & act & (take >= 0) & (take < NPOS))[:, None] & (bb[None, :] < BS)
                 b64 = b.to(tl.int64)
                 src = cis_ptr + ((b64 * ROWS_C + blk[:, None].to(tl.int64) * BS + bb[None, :]) * H + h)
-                dst = sb_ptr + ((b64 * ROWS_S + take[:, None].to(tl.int64) * BS + bb[None, :]) * H + h)
+                dst = sb_ptr + ((b64 * ROWS_S + tl.maximum(take, 0)[:, None].to(tl.int64) * BS + bb[None, :]) * H
+                                + h)                          # a masked lane (take -1) still addresses the table
                 x = tl.load(src, mask=gm, other=0)
                 if BIAS == 2:
                     x = x.to(sb_ptr.dtype.element_ty)
@@ -805,7 +814,7 @@ class FusedResolver:
     every layer and record every differing output in self.diffs (tests, the GPU equality gate; it reads the device).
     plant: a NEGATIVE CONTROL (PLANTS), tests only."""
 
-    def __init__(self, svc, check: bool = False, plant: int = 0, num_warps: int = 8):
+    def __init__(self, svc, check: bool = False, plant: int = 0, num_warps: int = 8, guard: bool = False):
         if triton is None:
             raise RuntimeError("resolve='fused' needs triton (not installed)")
         if getattr(svc, "xpool", None) is not None:
@@ -831,9 +840,13 @@ class FusedResolver:
         self.num_warps = int(num_warps)
         self.pe_inflight = bool(svc.policy_e_inflight)
         dev = svc.device
-        self.err = torch.zeros((), dtype=torch.int32, device=dev)          # this tick's (zeroed at each tick's start)
-        self.err_any = torch.zeros((), dtype=torch.int32, device=dev)      # m1: every tick's, OR-ed (sticky REPORT)
-        self.stats = torch.zeros((len(STATS),), dtype=torch.int64, device=dev)
+        self.guard = bool(guard)                           # tests: sentinel guards checked after every launch
+        self.guard_hits = []                               # (tick, layer, kernel, buffer) whose guard changed
+        self.guard_checks = 0                              # guard checks run (the detector's precondition)
+        self._g_persist, self._g_tick, self._g_layer = [], [], []
+        self.err = self._buf((), torch.int32, "err", self._g_persist).zero_()   # this tick's (zeroed per tick)
+        self.err_any = self._buf((), torch.int32, "err_any", self._g_persist).zero_()   # m1: every tick's bits
+        self.stats = self._buf((NSTAT_LANES,), torch.int64, "stats", self._g_persist).zero_()   # all 16 lanes
         svc.watch_flag("fused_res_err", self.err)
         self.launches = 0                                  # Triton launches (all layers, all ticks)
         self.layers = 0                                    # fused layers resolved
@@ -843,6 +856,35 @@ class FusedResolver:
         self.compared = 0                                  # check: layers compared with the torch path
         self.diffs = []                                    # check: (tick, layer, output) that differ
         self.trace = []                                    # check: (tick, layer, stats after the layer)
+
+    # ----------------------------------------------------------------------------------------------- buffers
+    def _buf(self, shape, dtype, name, group):
+        """A kernel-written buffer: the logical tensor is a view of an allocation with LANE_PAD spare elements after
+        it (fusedres2b). guard: the spare elements hold GUARD_SENTINEL and the buffer joins `group` for the checks."""
+        n = 1
+        for s in shape:
+            n *= s
+        full = torch.empty((n + LANE_PAD,), dtype=dtype, device=self.svc.device)
+        if self.guard:
+            full[n:].fill_(GUARD_SENTINEL)
+            group.append((name, full, n))
+        return full[:n].view(shape)
+
+    def _check_guards(self, where, kernel):
+        """guard: every guarded buffer's spare elements still hold the sentinel after `kernel` (host reads; tests).
+        A changed guard is recorded with the kernel and the buffer, then restored."""
+        self.guard_checks += 1
+        for (name, full, n) in self._g_persist + self._g_tick + self._g_layer:
+            tail = full[n:]
+            if not bool((tail == GUARD_SENTINEL).all()):
+                self.guard_hits.append((int(where[0]), int(where[1]), kernel, name))
+                tail.fill_(GUARD_SENTINEL)
+
+    def _go(self, where, name, kernel, grid, *args, **kw):
+        """One launch (through _launch: tests count them), then the guard check in guard mode."""
+        _launch(kernel, grid, *args, **kw)
+        if self.guard:
+            self._check_guards(where, name)
 
     # ----------------------------------------------------------------------------------------------- the service hook
     def resolve(self, l, rows, sel):
@@ -921,16 +963,19 @@ class FusedResolver:
         bad = [n for n, t in named if t.dtype != torch.int64 or not t.is_contiguous() or t.device.type != dev.type]
         if bad:
             raise ValueError("resolve='fused': not a contiguous int64 tensor on %s: %s" % (dev, bad))
-        i32 = dict(dtype=torch.int32, device=dev)
+        self._g_tick = []                                   # this tick's guarded scratch (guard mode)
 
-        def scan_bufs(n):
-            return dict(ne=torch.empty(n, **i32), rec=torch.empty(n, **i32), bne=torch.empty(n, **i32),
-                        brec=torch.empty(n, **i32), misc=torch.empty(4, **i32))
+        def b32(shape, name):
+            return self._buf(shape, torch.int32, name, self._g_tick)
+
+        def scan_bufs(n, p):
+            return dict(ne=b32((n,), p + "ne"), rec=b32((n,), p + "rec"), bne=b32((n,), p + "bne"),
+                        brec=b32((n,), p + "brec"), misc=b32((4,), p + "misc"))
         return dict(vstart=parts[0], vcnt=parts[1], vorder=parts[2], dstart=parts[3], dcnt=parts[4],
                     dorder=parts[5], maxrv=mv, maxrd=md, Rv=Rv, Rd=Rd, v=v, d=dd, kid=kid,
-                    sv=scan_bufs(max(Rv * H, 1)), sd=scan_bufs(max(Rd * H, 1)),
-                    usg=torch.empty(S, **i32), usg2=torch.empty(S, **i32), usgd=torch.empty(S, **i32),
-                    post=torch.empty((4, S, NP), **i32), NP=NP, bh={})
+                    sv=scan_bufs(max(Rv * H, 1), "v."), sd=scan_bufs(max(Rd * H, 1), "d."),
+                    usg=b32((S,), "usg"), usg2=b32((S,), "usg2"), usgd=b32((S,), "usgd"),
+                    post=b32((4, S, NP), "post"), NP=NP, bh={})
 
     def _bh(self, fz, k):
         """(b, h) of every verify entry (K3X order; VerifyDecision.bh, read by S-C's device wait), per selection width
@@ -968,11 +1013,14 @@ class FusedResolver:
         dm = svc.dmirror
         tabs = (dm.code[l], dm.block[l], dm.gen[l], dm.cur[l], dm.prot[l], dm.stamp[l])
         kid = fz["kid"]
-        i64 = dict(dtype=torch.int64, device=dev)
-        page = torch.empty((R, H, P), dtype=torch.int32, device=dev)
-        npg = torch.empty((R, H), dtype=torch.int32, device=dev)
-        selw = torch.empty((B, H, WB), **i64)
-        rowsel = torch.empty((R, H, WB), **i64)
+        self._g_layer = []                                  # this layer's guarded outputs (guard mode)
+
+        def b64(shape, name):                                # every kernel-written output: LANE_PAD spare elements
+            return self._buf(shape, torch.int64, name, self._g_layer)
+        page = self._buf((R, H, P), torch.int32, "plan.page", self._g_layer)
+        npg = self._buf((R, H), torch.int32, "plan.npg", self._g_layer)
+        selw = b64((B, H, WB), "sel")
+        rowsel = b64((R, H, WB), "rowsel")
         rec = {}
         vrb, vhb, vtl, vnt, vix = fz["v"]
         drb, dhb, dtl, dnt, dix = fz["d"]
@@ -984,22 +1032,23 @@ class FusedResolver:
         where = (svc.tick_no, l)
         sv, sd = fz["sv"], fz["sd"]
         if Rv:
-            tv = torch.empty((len(FIELDS_V), nv), **i64)
-            vpage = torch.empty((Rv, H, P), **i64)
-            vnpg = torch.empty((Rv, H), **i64)
-            ids = torch.empty((H, B, NPOS), **i64)
-            vrec = torch.empty((len(VREC), caps[0]), **i64)
-            vcnt = torch.empty((1,), **i64)
-            cntv = torch.empty((1,), **i64)
-            vlook = torch.empty((Rv, 4), **i64)
-            vread = torch.empty((B, H, WP), **i64)
-            _launch(_fr_v1, (S,), *tabs, sel, kid, vix, vhb, fz["vstart"], fz["vcnt"], fz["vorder"],
-                    sv["ne"], sv["rec"], fz["usg"], self.err, cntv, vlook,
-                    H, R, k, NBLK, NPOS, svc.C, Rv, fz["maxrv"], Rv * 4,
-                    KP=KP, NP=NP, num_warps=nw)
-            _launch(_fr_scan, (1,), sv["ne"], sv["rec"], fz["usg"], sv["bne"], sv["brec"], sv["misc"],
-                    Rv * H, S, svc.C, svc.X, 0, BLOCK=SCAN_BLOCK, num_warps=4)
-            _launch(_fr_v2, (S,), *tabs, sel, kid, vix, vhb, vtl, vnt, fz["vstart"], fz["vcnt"], fz["vorder"],
+            tv = b64((len(FIELDS_V), nv), "v.t")
+            vpage = b64((Rv, H, P), "v.page")
+            vnpg = b64((Rv, H), "v.num_pages")
+            ids = b64((H, B, NPOS), "v.load_ids")
+            vrec = b64((len(VREC), caps[0]), "vrec")
+            vcnt = b64((1,), "vcnt")
+            cntv = b64((1,), "v.counters")
+            vlook = b64((Rv, 4), "vlook")
+            vread = b64((B, H, WP), "vread")
+            self._go(where, "_fr_v1", _fr_v1, (S,), *tabs, sel, kid, vix, vhb, fz["vstart"], fz["vcnt"],
+                     fz["vorder"], sv["ne"], sv["rec"], fz["usg"], self.err, cntv, vlook,
+                     H, R, k, NBLK, NPOS, svc.C, Rv, fz["maxrv"], Rv * 4,
+                     KP=KP, NP=NP, LZ=min(256, max(_pow2(Rv * 4), 2)), num_warps=nw)
+            self._go(where, "_fr_scan.v", _fr_scan, (1,), sv["ne"], sv["rec"], fz["usg"], sv["bne"], sv["brec"],
+                     sv["misc"], Rv * H, S, svc.C, svc.X, 0, BLOCK=min(SCAN_BLOCK, max(_pow2(max(Rv * H, S)), 2)),
+                     num_warps=4)
+            self._go(where, "_fr_v2", _fr_v2, (S,), *tabs, sel, kid, vix, vhb, vtl, vnt, fz["vstart"], fz["vcnt"], fz["vorder"],
                     dix, dhb, fz["dstart"], fz["dcnt"], fz["dorder"],
                     sv["ne"], sv["rec"], sv["bne"], sv["brec"], sv["misc"],
                     tv, vpage, vnpg, page, npg, ids, vrec, vcnt, cntv, vlook, vread, fz["post"], fz["usg2"], selw,
@@ -1020,12 +1069,12 @@ class FusedResolver:
                 self._wait_gather_traced(l, vdec, where)
         sb_before = None
         if Rd:
-            td = torch.empty((len(FIELDS), nd), **i64)
-            dpage = torch.empty((Rd, H, P), **i64)
-            dnpg = torch.empty((Rd, H), **i64)
-            drec = torch.empty((len(DREC), caps[1]), **i64)
-            dcnt = torch.empty((1,), **i64)
-            cntd = torch.empty((3,), **i64)
+            td = b64((len(FIELDS), nd), "d.t")
+            dpage = b64((Rd, H, P), "d.page")
+            dnpg = b64((Rd, H), "d.num_pages")
+            drec = b64((len(DREC), caps[1]), "drec")
+            dcnt = b64((1,), "dcnt")
+            cntd4 = b64((4,), "d.counters")                   # the 4 lanes of the counter atomics; counters = [:3]
             bias = 0
             sb = cis = sel
             rows_s = rows_c = 0
@@ -1044,22 +1093,23 @@ class FusedResolver:
                     bias, sb, cis = 2, sb_t, cis_t                    # m9: the cast in the kernel (counted)
                     self.bias_casts += 1
                 rows_s, rows_c = sb_t.shape[1], cis_t.shape[1]
-            _launch(_fr_d1, (S,), *tabs, sel, kid, dix, dhb, fz["dstart"], fz["dcnt"], fz["dorder"],
-                    fz["post"], fz["usg2"], sd["ne"], sd["rec"], fz["usgd"], self.err, cntd,
-                    H, R, k, NBLK, NPOS, svc.C, Rd, fz["maxrd"], S, Rd * H,
-                    KP=KP, NP=NP, HAS_V=Rv > 0, num_warps=nw)
-            _launch(_fr_scan, (1,), sd["ne"], sd["rec"], fz["usgd"], sd["bne"], sd["brec"], sd["misc"],
-                    Rd * H, S, svc.C, svc.X, svc.R_ver, BLOCK=SCAN_BLOCK, num_warps=4)
-            _launch(_fr_d2, (S,), *tabs, sel, kid, vix, vhb, fz["vstart"], fz["vcnt"], fz["vorder"],
-                    dix, dhb, dtl, dnt, fz["dstart"], fz["dcnt"], fz["dorder"],
-                    fz["post"], sd["ne"], sd["rec"], sd["bne"], sd["brec"], sd["misc"], fz["usgd"],
-                    td, dpage, dnpg, page, npg, drec, dcnt, cntd, selw, rowsel, self.err, self.stats, sb, cis,
-                    H, B, R, k, NBLK, NPOS, svc.C, max(Rv, 1), Rd, fz["maxrv"], fz["maxrd"], nd,
-                    caps[1], S, WB, N_TAIL, P, svc.bs, rows_s, rows_c,
-                    KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, BSP=max(_pow2(svc.bs), 2), HAS_V=Rv > 0,
-                    BIAS=bias, PLANT=self.plant, NSTAT=len(STATS), num_warps=nw)
+            self._go(where, "_fr_d1", _fr_d1, (S,), *tabs, sel, kid, dix, dhb, fz["dstart"], fz["dcnt"],
+                     fz["dorder"], fz["post"], fz["usg2"], sd["ne"], sd["rec"], fz["usgd"], self.err, cntd4,
+                     H, R, k, NBLK, NPOS, svc.C, Rd, fz["maxrd"], S, Rd * H,
+                     KP=KP, NP=NP, HAS_V=Rv > 0, num_warps=nw)
+            self._go(where, "_fr_scan.d", _fr_scan, (1,), sd["ne"], sd["rec"], fz["usgd"], sd["bne"], sd["brec"],
+                     sd["misc"], Rd * H, S, svc.C, svc.X, svc.R_ver,
+                     BLOCK=min(SCAN_BLOCK, max(_pow2(max(Rd * H, S)), 2)), num_warps=4)
+            self._go(where, "_fr_d2", _fr_d2, (S,), *tabs, sel, kid, vix, vhb, fz["vstart"], fz["vcnt"],
+                     fz["vorder"], dix, dhb, dtl, dnt, fz["dstart"], fz["dcnt"], fz["dorder"],
+                     fz["post"], sd["ne"], sd["rec"], sd["bne"], sd["brec"], sd["misc"], fz["usgd"],
+                     td, dpage, dnpg, page, npg, drec, dcnt, cntd4, selw, rowsel, self.err, self.stats, sb, cis,
+                     H, B, R, k, NBLK, NPOS, svc.C, max(Rv, 1), Rd, fz["maxrv"], fz["maxrd"], nd,
+                     caps[1], S, WB, N_TAIL, P, svc.bs, rows_s, rows_c,
+                     KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, BSP=max(_pow2(svc.bs), 2), HAS_V=Rv > 0,
+                     BIAS=bias, PLANT=self.plant, NSTAT=len(STATS), num_warps=nw)
             self.launches += 3
-            ddec = DraftDecision(Rd, H, k, {f: td[i] for i, f in enumerate(FIELDS)}, dpage, dnpg, cntd)
+            ddec = DraftDecision(Rd, H, k, {f: td[i] for i, f in enumerate(FIELDS)}, dpage, dnpg, cntd4[:3])
             rec.update(drec=drec, dcnt=dcnt)
         rec.update(sel=selw, rowsel=rowsel)
         self.layers += 1
@@ -1098,7 +1148,7 @@ class FusedResolver:
 
     def _trace(self, where):
         """check: the stats and the err flag after a layer (the L34 preconditions per layer)."""
-        self.trace.append((int(where[0]), int(where[1]), self.stats.to("cpu").tolist(), int(self.err)))
+        self.trace.append((int(where[0]), int(where[1]), self.stats[:len(STATS)].to("cpu").tolist(), int(self.err)))
 
     def _wait_gather_traced(self, l, vdec, where):
         """check: S-C's device wait and gather; a raise (a wrong decision the CPU stand-in refuses) still leaves the
@@ -1154,6 +1204,7 @@ class FusedResolver:
                     first_diff_at=list(self.diffs[0][:2]) if self.diffs else None, first_effective=first_eff,
                     stats=stats, gate={s: ("gated" if stats[s] > 0 else "NOT GATED") for s in GATE_STATS},
                     err=err_any, err_bits=[m for b, m in sorted(ERR_BITS.items()) if err_any & b],
+                    guard=self.guard, guard_checks=self.guard_checks, guard_hits=[list(x) for x in self.guard_hits],
                     compiled=compiled_variants())
 
 
