@@ -2554,3 +2554,105 @@ def test_F24_the_main_stream_waits_every_registered_write_back_before_the_urgent
     # negative control
     log2, wb2, _ = _f24(NoHistProducer, monkeypatch)
     assert ("wait", wb2) not in log2 and ("k", 0, 0, 0, 5) in log2, log2[:4]
+
+
+# =====================================================================================================================
+# F25 K5 for the verifier at SG5 p4a's numbers (usage 86 of C 96, the 32 extras free, 16 first misses with no slot
+# over 3 streams): the free base slots and every shared extra are granted; the refusal report shows the decision
+# =====================================================================================================================
+NB_K5 = 128
+P4A_MISSES = {(0, 0): 38, (0, 1): 20, (1, 0): 15, (1, 1): 15}      # first misses per stream (b, h): 16 find no slot
+EDGE_MISSES = {(0, 0): 38, (0, 1): 14, (1, 0): 10, (1, 1): 10}     # exactly the allowance: 32 shared extras needed
+
+
+def _k5_world(cls, svc_kw=None):
+    """One layer, B 2, H 2, 128 host blocks, C 96, X 32, R_ver 16 (p4a's K5 numbers); a force_only transport."""
+    g = torch.Generator().manual_seed(25)
+    host_k = [torch.randn(B, NB_K5 * BS, H, D, generator=g)]
+    host_v = [torch.randn(B, NB_K5 * BS, H, D, generator=g)]
+    cis = [torch.randn(B, NB_K5 * BS, H, generator=g)]
+    n = (96 + 32 + RES.N_TAIL) * BS
+    store_k, store_v, store_b = [torch.zeros(B, n, H, D)], [torch.zeros(B, n, H, D)], [torch.zeros(B, n, H)]
+    be = Be()
+    tp = TR.AdversarialTransport(be, host_k, host_v, store_k, store_v, BS, 0, mode="force_only")
+    gather = RES.TorchGather(host_k, host_v, store_k, store_v)
+    svc = cls(1, B, H, 96, 32, 16, tp, gather, store_b=store_b, cis=cis, block_bytes=BS * 2 * D * 4,
+              host_wait=be.host_wait, **(svc_kw or {}))
+    return types.SimpleNamespace(svc=svc, tp=tp, be=be)
+
+
+def _k5_case(cls, misses, svc_kw=None):
+    """Both requests draft blocks 0-85 in every stream (86 takes, all in the base slots); blocks 0-76 land (LRU 77,
+    protected by the drafts' key), blocks 77-85 stay in flight (9, protected): usage 86 of C 96 in every stream, the
+    layer's 32 extras free, no Policy E candidate. Then ONE verify tick of the same key: stream (b, h) misses
+    misses[(b, h)] blocks (86, 87, ...). Returns (world, the CapacityRefusal or None)."""
+    w = _k5_world(cls, svc_kw)
+    svc = w.svc
+    keys = [("u%d" % b, 1, 1) for b in range(B)]
+    for b in range(B):
+        svc.begin_request(b, "u%d" % b)
+    svc.poll()
+    rows = [Row(b, "d", keys[b], 300, NB_K5) for b in range(B)]
+    p = svc.resolve(0, rows, S(*[[list(range(86)), list(range(86))] for _ in range(B)]))
+    svc.read_done(0, p, Ev(done=True))
+    svc.end_tick()
+    for tr in list(svc.inflight.values()):
+        if tr.block < 77 and not tr.delivered and tr in w.tp.pending:
+            w.tp.force(tr)
+    svc.poll()
+    sts = [svc.stream(0, b, h) for b in range(B) for h in range(H)]
+    assert all(s.usage() == 86 and len(s.lru) == 77 and len(s.pending) == 9 for s in sts)
+    assert all(s.prot.get(blk) for s in sts for blk in list(s.lru) + list(s.pending))
+    assert svc.pools[0].free_extras() == 32
+    svc.poll()
+    vrows = [Row(b, "v", keys[b], 301, NB_K5) for b in range(B)]
+    vsel = S(*[[list(range(86, 86 + misses[(b, 0)])), list(range(86, 86 + misses[(b, 1)]))] for b in range(B)])
+    try:
+        p = svc.resolve(0, vrows, vsel)
+        svc.read_done(0, p, Ev(done=True))
+        svc.end_tick()
+    except ER.CapacityRefusal as e:
+        return w, e
+    return w, None
+
+
+@pytest.mark.parametrize("kind", ["sc", "sparse"])
+def test_F25_k5_grants_the_free_base_slots_and_every_shared_extra_to_the_verifier(kind):
+    """F25 (SG5 p4a's refusal; K5 = LayerPool.can_take, ownership.py:419-427, usage :135-136, borrowed :409-413;
+    device_verify's K5). At p4a's numbers (usage 86 of C 96 in every stream, the layer's 32 extras free, every LRU
+    entry and in-flight prefetch protected) the verifier's first misses 38 / 20 / 15 / 15 (K3X order) get: 10 FREE
+    base slots each, then the 32 SHARED extras of the layer (the R_ver 16 reserve included) in K3X order (28 to the
+    first stream, 4 to the second), and 16 find no slot over 3 streams: S-C (dense and sparse) refuses the tick with a
+    report of exactly that decision, before any change; v1 refuses the same state at its 15th miss of stream (0, 1)
+    (block 100). At exactly the allowance (38 / 14 / 10 / 10: 32 extras needed) S-C and v1 pass with equal states and
+    all 32 extras borrowed. Negative controls (planted K5 defects on the device): a verifier that keeps the R_ver
+    reserve (the draft rule), and one that grants no base slot under C, both refuse the allowance case that v1
+    passes."""
+    cls = dict(sc=SC.ResidencySC, sparse=SP.ResidencySparse)[kind]
+    kw = dict(nblk=NB_K5)
+    v1kw = dict(poll_in_resolve=False, defer_issue=True, defer_admit=True)
+    w, e = _k5_case(cls, P4A_MISSES, kw)
+    assert e is not None
+    msg = str(e)
+    assert "first misses with no slot: [(0, 16)]" in msg, msg[:400]
+    assert ("layer 0: 4 streams had verify first misses, 48 of the misses needed a shared extra; the layer's 32 free "
+            "extras (X 32, borrowed 0 at the tick start) went to the first 32 of them in K3X order; 16 found no "
+            "slot") in msg, msg
+    for (b, h, n, ex, no) in ((0, 1, 20, 4, 6), (1, 0, 15, 0, 5), (1, 1, 15, 0, 5)):
+        assert ("(l 0 b %d h %d: first misses %d = 10 in its free base slots (C 96 - usage 86) + %d shared extras + 0 "
+                "by Policy E + %d with no slot)" % (b, h, n, ex, no)) in msg, msg
+    assert "(l 0 b 0 h 0:" not in msg                                 # the first stream got all it needed
+    assert [w.svc.stream(0, b, h).usage() for b in range(B) for h in range(H)] == [86] * 4   # nothing applied
+    _, ev = _k5_case(RES.Residency, P4A_MISSES, v1kw)
+    assert ev is not None and "urgent block 100" in str(ev), str(ev)[:300]
+    # exactly the allowance
+    ws, es = _k5_case(cls, EDGE_MISSES, kw)
+    wv, ev2 = _k5_case(RES.Residency, EDGE_MISSES, v1kw)
+    assert es is None and ev2 is None, (str(es)[:300], str(ev2)[:300])
+    assert _state(ws) == _state(wv)
+    assert ws.svc.pools[0].borrowed() == 32 and ws.svc.pools[0].free_extras() == 0
+    assert [ws.svc.stream(0, b, h).usage() for b in range(B) for h in range(H)] == [124, 100, 96, 96]
+    # negative controls: planted K5 defects of the device
+    for mut in ({"verify_reserve": 16}, {"verify_no_local": True}):
+        _, en = _k5_case(cls, EDGE_MISSES, dict(kw, sc_mut=mut))
+        assert en is not None and "found no slot" in str(en), mut

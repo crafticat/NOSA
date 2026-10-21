@@ -1004,6 +1004,80 @@ TEST F24:
 - The CPU stand-in host-waits a pending write-back at its gather.
 - Negative control: without the producer, the gather copies block 5 with no wait.
 
+## 12o. SG5 p4a's K5 refusal: the policy is right, the report misled (2026-10-21)
+
+THE RECORD (`/mnt/beegfs/ojerbi/r2-runs/sg5/sg5_p4_2190876_p4a.step/stderr.txt:7083`; gilfree, B 64, C 96, X 32,
+R_ver 16):
+- Layer 16 had 16 first misses with no slot. No other layer overflowed.
+- Refused streams: (b 45 h 1), (b 47 h 0), (b 51 h 1), with usage 86 / 86 / 89 of C 96.
+- In each: LRU 77, all protected; in flight 9 / 9 / 12, all protected; PO, VRES and RELEASING 0.
+- The layer had all 32 extras free at the tick start.
+
+THE K5 RULE:
+- Stream.usage = every non-FREE slot (INFLIGHT + LRU + PO + VRES + RELEASING), ownership.py:135-136.
+- LayerPool.borrowed = sum over the layer's streams of max(0, usage - C), :409-410. free_extras = X - borrowed,
+  :412-413.
+- can_take, :419-427:
+  - usage < C: yes (a base slot);
+  - else, for the verifier: free_extras > 0 (the R_ver reserve included);
+  - for a draft: free_extras > R_ver.
+- device_verify (r2_residency_sc.py, K5 block) implements the same rule in K3X order (row, head, block): a stream's
+  first C - usage first misses take its FREE base slots, and every later one needs a shared extra. Extras go to the
+  first X - borrowed such misses of the LAYER. Policy E serves the rest if it can.
+
+THE ANSWERS:
+1. Usage counts every non-FREE slot (86 = 77 LRU + 9 in flight). The free base slots ARE granted: 10 / 10 / 7 first
+   misses per stream.
+2. The verifier DOES take from the R_ver reserve: R_ver limits only drafts.
+3. The 32 extras are ONE pool per LAYER, shared by its B x H = 128 streams (0.25 per stream on average). The report
+   says "free 32" because it shows the host state at the tick START: a void tick applies nothing.
+   - The decision gave all 32 to earlier first misses of layer 16 in K3X order. A first miss is refused by K5 only
+     after the budget is spent, so all 32 were granted.
+   - At least 16 more first misses needed one, with no Policy E candidate left. The refused streams have high batch
+     slots, late in K3X order.
+   - So layer 16's verify demand beyond the base slots was at least 48 first misses (32 granted + 16 with no slot,
+     plus any Policy E evictions), and the allowance was 32. The "16" is the LAYER's total, not per stream.
+
+WHY THE DEMAND IS THIS LARGE:
+- NOSA-8B selects topk 64 blocks per row and head (nosa_llama.py:672-681); about 62 are historical.
+- Every draft row protects its whole selection. With LAMBDA 7 and K 3, a stream holds the union of about 7-10 draft
+  positions' selections, here 77-89 blocks. Q3's measured union over 4 positions was about 71.
+- A verify cohort's own selection then misses about 10-30 blocks per stream, while 10 base slots and 0.25 extras per
+  stream are free.
+
+S-B AND v1 PASSED THE SAME PREFLIGHT (no traceback after the S-C one). That is NOT evidence of an S-C defect:
+- With free timing their trajectories differ from S-C's. v1 polls arrivals inside resolve. S-C's draft rows see the
+  verifier's urgent blocks of the same layer as in flight, not ready.
+- The draft READY sets, so the draft tokens, the selections and the protected unions, all differ.
+- On the SAME state v1 refuses at the same point (F25).
+
+THE FIX (code):
+- The refusal now reports the DECISION. `_k5_report`, shared by the dense and the sparse consumer, gives:
+  - per layer: the streams with first misses, how many needed an extra, the free extras at the tick start, how many
+    were granted, and how many found no slot;
+  - per refused stream: first misses = base slots + shared extras + Policy E + no slot;
+  - then v1's capacity report.
+- `device_verify` gets two test-only negative controls: `verify_no_local` and `verify_reserve`.
+
+TEST F25 (dense and sparse):
+- p4a's state: usage 86 of C 96 in all 4 streams, LRU 77 and 9 in flight (all protected), the 32 extras free.
+- First misses 38 / 20 / 15 / 15: S-C refuses with exactly this decision:
+  - the base slots 10 each;
+  - the shared extras 28, then 4;
+  - no slot 6 + 5 + 5 = 16 over 3 streams;
+  - nothing applied.
+- v1 refuses the same state at block 100, the 15th first miss of stream (0, 1).
+- At exactly the allowance (38 / 14 / 10 / 10), S-C and v1 pass with equal states and all 32 extras borrowed.
+- Negative controls: a device K5 that keeps the reserve from the verifier, or grants no base slot, refuses the
+  allowance case.
+
+WHAT IT MEANS FOR MEASURING S-C:
+- At C 96 / X 32 the first verify ticks at B 64 exceed the allowance in at least one layer.
+- That tick needed X >= 48 at layer 16. The run's maximum is unknown; the new report gives it.
+- X is per stream in the store (C + X slots per (layer, request, head)). At D 128, bf16 K and V, one slot per stream
+  over L 32 x B 64 x H 2 is about 128 MiB, so X 64 costs about 4 GiB more than X 32.
+- The alternative is fewer protected blocks per stream, for example a smaller LAMBDA (fewer draft positions ahead).
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,

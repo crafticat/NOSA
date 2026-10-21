@@ -333,9 +333,7 @@ class ResidencySparse(ResidencySC):
             parsed.append(p)
         if over:
             self._void_pins()
-            raise CapacityRefusal("S-C: the verifier's urgent misses found no slot: K5 grants none and Policy E has "
-                                  "no candidate (layer, blocks without a slot: %s; C %d, X %d, R_ver %d): the tick's "
-                                  "outputs are invalid" % (over, self.C, self.X, self.R_ver))
+            raise self._refusal(over, self._sparse_overflow_report(parsed, capped))
         if capped and not self.sparse_mut.get("no_cap_check"):
             self._void_pins()
             raise CapacityRefusal("S-C sparse record: a layer's record holds more entries than its capacity (layer, "
@@ -348,6 +346,31 @@ class ResidencySparse(ResidencySC):
                 self._apply_verify_sparse(st["l"], st["vrows"], st["vidx"], st["vdec"], p)
             if st["ddec"] is not None:
                 self._apply_draft_sparse(st["l"], st["drows"], st["ddec"], p)
+
+    def _sparse_overflow_report(self, parsed: List[Dict], capped) -> str:
+        """S-C's overflow report (_k5_report) from the verify records: the first misses are the GRANT, EVICT and HOLE
+        records (a ready entry, a merge and a later occurrence of a miss are none of these), in entry order (K3X). A
+        capped verify record holds only its first entries: the report says so."""
+        out = []
+        for p in parsed:
+            st = p["st"]
+            dec = st["vdec"]
+            if dec is None:
+                continue
+            firsts = []
+            for rec in p["vrec"]:
+                o, fl = rec[0], rec[2]
+                if not fl & (GRANT | EVICT | HOLE):
+                    continue
+                bh = (st["vrows"][o // (dec.H * dec.k)].b, (o // dec.k) % dec.H)
+                firsts.append((bh, "grant" if fl & GRANT else ("evict" if fl & EVICT else "none")))
+            n_none = sum(1 for _, what in firsts if what == "none")
+            if not n_none:
+                continue
+            part = any(c[0] == st["l"] and c[1] == "verify" for c in capped)
+            out.append(self._k5_report(st["l"], firsts, n_none,
+                                       note=" (the verify record is capped: these counts are partial)" if part else ""))
+        return " | ".join(out)
 
     # ------------------------------------------------------------------------------------------------ controls
     def _mutate(self, parsed: List[Dict]) -> None:
