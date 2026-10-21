@@ -23,8 +23,12 @@ THE LAW IS KEPT (bitwise equal to piece 3 per row, by construction; the GPU gate
     -inf: m unchanged, alpha = 1, p = 0, l + 0, acc * 1 + 0 . 0). Piece 3 runs the same step past a row's last page.
     The one known non-identity: an identity step maps an acc entry of exactly -0.0 to +0.0 (the dot of zeros is +0);
     piece 3 would keep -0.0 there until its next step. It changes only the sign of an exact zero of the output, and
-    only when a row's acc entry is -0.0 at that moment (an underflow of a negative acc times a tiny alpha). The bitwise
-    gate would report it as a sign-of-zero difference.
+    only when a row's acc entry is -0.0 at that moment (an underflow of a negative acc times a tiny alpha). It goes
+    BOTH ways (review MINOR-1): the shared kernel runs more identity steps in the middle of a split, and it can run
+    FEWER trailing ones than piece 3 (piece 3 runs PPS - n_last steps past a row's last page; the shared kernel only
+    the union pages after it inside the window), so piece 3 can turn a -0.0 into +0.0 where the shared kernel keeps
+    -0.0. The bitwise gate counts either as a difference; the probe's report splits sign-of-zero-only elements from
+    value differences (F1's triage).
   * union order: the (block id, slot) pairs ascending. Each row lists its pages in ascending block id (piece 3's
     canonical order), so every row's own list is a subsequence of the union order and a row sees its pages in its own
     order. The block ids come from the caller (page_key); the slots alone do not give the order (ring slots).
@@ -367,6 +371,18 @@ else:                                                  # pragma: no cover
     _bi_shared_kernel = None
 
 
+_DUMMY_CNT = {}
+
+
+def _dummy_counter(device) -> torch.Tensor:
+    """[review MAJOR-3] the COUNT pointer of an uncounted launch: one persistent (2,) int32 buffer per device (the
+    kernel never touches it with COUNT off), so the production launch has no torch.zeros launch of its own."""
+    key = str(device)
+    if key not in _DUMMY_CNT:
+        _DUMMY_CNT[key] = torch.zeros(2, dtype=torch.int32, device=device)
+    return _DUMMY_CNT[key]
+
+
 def bi_paged_decode_shared(base, q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len, page_key,
                            rows_max: int = ROWS_MAX, mode: str = "split", softmax_scale: Optional[float] = None,
                            out: Optional[torch.Tensor] = None, workspace=None, pages_per_split: Optional[int] = None,
@@ -413,7 +429,7 @@ def bi_paged_decode_shared(base, q, k_cache, v_cache, bias_cache, seq_idx, page_
                 or not (wacc.is_contiguous() and wml.is_contiguous()):
             raise ValueError("workspace must be contiguous fp32 wacc (>= R, Hkv, >= S, %d, %d) and wml (>= R, Hkv, "
                              ">= S, 2, %d)" % (bh, D, bh))
-    cnt = count_loads if count_loads is not None else torch.zeros(2, dtype=torch.int32, device=q.device)
+    cnt = count_loads if count_loads is not None else _dummy_counter(q.device)   # [review MAJOR-3] no extra launch
     grow, ut, rowpos, win = union["grow"], union["ut"], union["rowpos"], union["win"]
     _bi_shared_kernel[(R, Hkv, win.shape[2])](
         q, k_cache, v_cache, bias_cache, seq_idx, num_pages, last_len, grow, ut, rowpos, win, wacc, wml, cnt,
@@ -567,6 +583,7 @@ class SharedKV:
         self.PAGE, self.PAGES_PER_SPLIT = base.PAGE, base.PAGES_PER_SPLIT
         self.__file__ = "%s + sharedkv(%s, %s)" % (getattr(base, "__file__", "piece3"), mode, impl)
         self.stats = dict(shared=0, base_no_key=0, base_single_row=0)
+        self.by_rows_max = {}                             # [review MINOR-3] shared calls per rows_max (host ints)
 
     def _base(self, args, softmax_scale, pps, out=None, workspace=None):
         if self.impl == "reference":
@@ -592,6 +609,7 @@ class SharedKV:
             self.stats["base_no_key" if page_key is None else "base_single_row"] += 1
             return self._base(args, softmax_scale, pps, out=out, workspace=workspace)
         self.stats["shared"] += 1
+        self.by_rows_max[nr] = self.by_rows_max.get(nr, 0) + 1
         return self._shared(args, page_key, nr, softmax_scale, pps, out=out, workspace=workspace)
 
 
@@ -603,14 +621,26 @@ class SharedKVProbe(SharedKV):
     everything once at the end."""
 
     def __init__(self, base, mode: str = "split", rows_max: int = ROWS_MAX, timing: bool = True, plant: bool = False,
-                 impl: str = "kernel", count: bool = True, ncu_window=None):
+                 impl: str = "kernel", count: bool = True, ncu_window=None, sleep_cycles: int = 2000000,
+                 record_tables: int = 4):
         """[sharedkv2] ncu_window (skip, count) (the S3 cell, benchmarks/Efficiency/r2_sharedkv_ncu.py): among the
         keyed calls with rows_max == self.rows_max, calls skip .. skip + count - 1 are MARKED: one profiler window
-        (cudaProfilerStart / Stop; ncu --profile-from-start off profiles nothing else) around the two launches, each
-        in its NVTX range "skv|pr|c<j>" (piece 3: split + combine) / "skv|sh|c<j>" (shared + combine), and the call's
-        logical page counts (sum of num_pages; the union size) are kept on the device for the byte bounds. The union
-        build and the counting launch stay OUTSIDE the window."""
+        (cudaProfilerStart / Stop; ncu --profile-from-start off profiles nothing else) around the two sides, each in
+        its NVTX range: "skv|pr|c<j>" (piece 3: split + combine), "skv|bd|c<j>" (the union build: torch ops) and
+        "skv|sh|c<j>" (shared + combine); the call's logical page counts (sum of num_pages; the union size) are kept
+        on the device for the byte bounds. The counting launch stays OUTSIDE the window.
+        sleep_cycles (review MAJOR-3): a torch.cuda._sleep before the timed pair, so the CUDA events time the device
+        work and not the Python launch path (0: off). The shared side's span includes the union build (MAJOR-2).
+        record_tables (MAJOR-1): the inputs of the first N keyed calls with rows_max == self.rows_max are kept (device
+        clones) for F4's offline check against the CPU oracle (report_tables)."""
         super().__init__(base, mode, rows_max, impl)
+        self.sleep_cycles = int(sleep_cycles)
+        self.record_tables = int(record_tables)
+        self.tables = []                                  # the recorded inputs (MAJOR-1)
+        self.mixes = []                                   # per keyed call: (call, nr, mix (3, 5), sum pages, tiles)
+        self.diff_zero = 0                                # differing elements whose floats are equal (+-0.0 only)
+        self.diff_value = 0                               # differing elements with another value
+        self.samples = []                                 # per keyed call: (call, (flag, flat index, bits ref, bits sh))
         self.ncu_window = None if ncu_window is None else (int(ncu_window[0]), int(ncu_window[1]))
         self.full_calls = 0                               # keyed calls with rows_max == self.rows_max
         self.marked = []                                  # (j, rows, first, sum pages (device), union pages (device))
@@ -635,17 +665,13 @@ class SharedKVProbe(SharedKV):
         pps = self.base.PAGES_PER_SPLIT if pages_per_split is None else pages_per_split
         args = (q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len)
 
-        ev = [torch.cuda.Event(enable_timing=True) for _ in range(5)] if self.timing and q.is_cuda else None
-        if ev:
-            ev[3].record()
-        un = build_union(seq_idx, page_table, num_pages, page_key, nr, pps, self.mode == "whole")
-        if ev:
-            ev[4].record()                                # the union build, timed on its own
-        if self.plant:
-            un = plant_drop_page(un)
-
+        whole = self.mode == "whole"
+        call = self.calls
+        self.calls += 1
+        self.by_rows_max[nr] = self.by_rows_max.get(nr, 0) + 1          # host ints (review MINOR-3: F3's check)
         mark = self._ncu_mark(nr)                         # [sharedkv2] None, or the marked call's index j
         prof = mark is not None and q.is_cuda             # the CPU tests mark calls without a profiler / NVTX
+        box = {}
 
         def ranged(tag, fn):
             if not prof:
@@ -656,17 +682,22 @@ class SharedKVProbe(SharedKV):
             finally:
                 torch.cuda.nvtx.range_pop()
 
+        def build():
+            un = build_union(seq_idx, page_table, num_pages, page_key, nr, pps, whole)
+            return plant_drop_page(un) if self.plant else un
+
         def per_row():
             return ranged("pr", lambda: self._base(args, softmax_scale, pps))
 
-        def shared():
-            return ranged("sh", lambda: self._shared(args, page_key, nr, softmax_scale, pps, union=un))
-        first = "per_row" if self.calls % 2 == 0 else "shared"
-        self.calls += 1
-        if mark is not None:
-            self.marked.append((mark, int(q.shape[0]), first, num_pages.to(torch.int64).sum(),
-                                un["ucnt"].to(torch.int64).sum()))
-        if prof:
+        def shared():                                     # [review MAJOR-2] the union build is part of the shared side
+            box["un"] = ranged("bd", build)
+            return ranged("sh", lambda: self._shared(args, page_key, nr, softmax_scale, pps, union=box["un"]))
+        first = "per_row" if call % 2 == 0 else "shared"
+        timed = self.timing and q.is_cuda
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(3)] if timed else None
+        if timed and self.sleep_cycles > 0:               # [review MAJOR-3] pre-queue the GPU: while it sleeps the host
+            torch.cuda._sleep(self.sleep_cycles)          # enqueues both sides, so the events time the device, not the
+        if prof:                                          # Python launch path (outside the profiler window)
             torch.cuda.cudart().cudaProfilerStart()
         if ev:
             ev[0].record()
@@ -676,23 +707,55 @@ class SharedKVProbe(SharedKV):
         b = shared() if first == "per_row" else per_row()
         if ev:
             ev[2].record()
-            self.events.append((nr, first, ev[0], ev[1], ev[2], ev[3], ev[4]))
+            self.events.append((nr, first, ev[0], ev[1], ev[2]))
         if prof:
             torch.cuda.cudart().cudaProfilerStop()
+        un = box["un"]
+        if mark is not None:
+            self.marked.append((mark, int(q.shape[0]), first, num_pages.to(torch.int64).sum(),
+                                un["ucnt"].to(torch.int64).sum()))
+        npg = num_pages.to(torch.int64)
+        # [review MAJOR-1] the call's group mix on the device: per group size s = 1 .. ROWS_MAX, the groups, their
+        # summed per-row pages (both heads) and their union pages; the expected tile ratio is derived from this mix
+        grow = un["grow"].to(torch.int64)
+        live = grow >= 0
+        gsz = live.sum(1)                                                       # (R,) 0 = no group
+        gsum = torch.where(live, npg.sum(1)[grow.clamp(min=0)], torch.zeros_like(grow)).sum(1)
+        guni = un["ucnt"].to(torch.int64).sum(1)
+        mix = torch.zeros((3, ROWS_MAX + 1), dtype=torch.int64, device=q.device)
+        mix[0].index_add_(0, gsz, torch.ones_like(gsz))
+        mix[1].index_add_(0, gsz, gsum)
+        mix[2].index_add_(0, gsz, guni)
+        tiles_call = None
         if self.count and self.impl == "kernel":        # untimed: the kernel's own tile counter (the byte model)
             cnt = torch.zeros(2, dtype=torch.int32, device=q.device)
             bi_paged_decode_shared(self.base, *args, page_key, rows_max=nr, mode=self.mode,
                                    softmax_scale=softmax_scale, pages_per_split=pps, union=un, count_loads=cnt)
-            npg = num_pages.to(torch.int64)
-            self.tiles["shared"] = self.tiles["shared"] + cnt[0].to(torch.int64)
+            tiles_call = cnt[0].to(torch.int64)
+            self.tiles["shared"] = self.tiles["shared"] + tiles_call
             self.tiles["per_row"] = self.tiles["per_row"] + npg.sum()
             self.tiles["rows_shared"] = self.tiles["rows_shared"] + cnt[1].to(torch.int64)
             self.tiles["rows_per_row"] = self.tiles["rows_per_row"] + ((npg - 1) * self.base.PAGE).sum() \
                 + (last_len.to(torch.int64) * num_pages.shape[1]).sum()
+        self.mixes.append((call, nr, mix, npg.sum(), tiles_call))
+        if len(self.tables) < self.record_tables and nr == self.rows_max:      # [review MAJOR-1] F4's own tables
+            self.tables.append(dict(call=call, rows_max=nr, mode=self.mode, seq_idx=seq_idx.clone(),
+                                    page_table=page_table.clone(), num_pages=num_pages.clone(),
+                                    last_len=last_len.clone(), page_key=page_key.clone(), tiles=tiles_call))
         ref, sh = (a, b) if first == "per_row" else (b, a)
         iv = torch.int16 if ref.element_size() == 2 else torch.int32
-        d = (ref.view(iv) != sh.view(iv)).flatten(1).any(1).sum()
+        rv, sv = ref.view(iv), sh.view(iv)
+        dm = rv != sv                                                           # bits differ
+        same_val = ref == sh                                                    # floats equal: -0.0 == +0.0
+        d = dm.flatten(1).any(1).sum()
         self.diff_rows = d if self.diff_rows is None else self.diff_rows + d
+        # [review MINOR-2] F1's triage on the device: sign-of-zero-only elements vs value elements, and the first
+        # differing element of the call (flag, flat index, both bit patterns), read once in report()
+        self.diff_zero = self.diff_zero + (dm & same_val).sum()
+        self.diff_value = self.diff_value + (dm & ~same_val).sum()
+        fi = torch.argmax(dm.flatten().to(torch.int32))
+        self.samples.append((call, torch.stack([dm.any().to(torch.int64), fi.to(torch.int64),
+                                                rv.flatten()[fi].to(torch.int64), sv.flatten()[fi].to(torch.int64)])))
         self.rows_cmp += int(q.shape[0])
         if out is not None:
             out.copy_(ref)
@@ -718,21 +781,77 @@ class SharedKVProbe(SharedKV):
             out.append(dict(call=j, rows=R, first=first, sum_pages=int(s), union_pages=int(u)))
         return dict(window=self.ncu_window, full_calls=self.full_calls, marked=out)
 
-    def report(self) -> dict:
-        """ONE host read at the end: the differing-row count and the per-call times (ms) of both kernels."""
+    def report(self, n_samples: int = 32) -> dict:
+        """ONE host read at the end: the differing rows and elements (sign-of-zero only vs value) with the first
+        n_samples differing calls' first element; the per-call event times (ms; the shared side includes the union
+        build; REPORT only, the S3 cell's device kernel time is the primary time ratio); the tiles; the group mix:
+        per group size s the groups, their per-row pages and union pages (all keyed calls, and the calls with
+        rows_max == self.rows_max), the counter's identity checks (whole: tiles = union pages; split: union <= tiles <=
+        sum) and the mix-derived expectation of the tile ratio (expected_tile_ratio with the registered RHO)."""
         if self.events:
             torch.cuda.synchronize()
-        t_pr, t_sh, t_b = [], [], []
-        for nr, first, e0, e1, e2, b0, b1 in self.events:
+        t_pr, t_sh = [], []
+        for nr, first, e0, e1, e2 in self.events:
             x, y = e0.elapsed_time(e1), e1.elapsed_time(e2)
             pr, sh = (x, y) if first == "per_row" else (y, x)
             t_pr.append((nr, first, pr))
             t_sh.append((nr, first, sh))
-            t_b.append((nr, first, b0.elapsed_time(b1)))
         tiles = {k: int(v) for k, v in self.tiles.items()}
-        return dict(stats=dict(self.stats), keyed_calls=self.calls, rows_compared=self.rows_cmp, plant=self.plant,
+        samples = []
+        rows = torch.stack([s for _, s in self.samples]).tolist() if self.samples else []
+        for (call, _), (flag, fi, ba, bb) in zip(self.samples, rows):
+            if flag and len(samples) < n_samples:
+                samples.append(dict(call=call, flat_index=fi, bits_per_row=ba, bits_shared=bb))
+        mix_all = [[0] * (ROWS_MAX + 1) for _ in range(3)]
+        mix_full = [[0] * (ROWS_MAX + 1) for _ in range(3)]
+        ident_bad = []
+        per_call = []
+        for call, nr, mix, s, t in self.mixes:
+            m = mix.tolist()
+            for i in range(3):
+                for k in range(ROWS_MAX + 1):
+                    mix_all[i][k] += m[i][k]
+                    if nr == self.rows_max:
+                        mix_full[i][k] += m[i][k]
+            tc = None if t is None else int(t)
+            uni, sm = sum(m[2][1:]), int(s)
+            if tc is not None and ((self.mode == "whole" and tc != uni) or not uni <= tc <= sm):
+                ident_bad.append(dict(call=call, tiles=tc, union=uni, sum=sm))
+            if len(per_call) < 4096:
+                per_call.append(dict(call=call, rows_max=nr, groups=m[0], sum_pages=m[1], union_pages=m[2], tiles=tc))
+        return dict(stats=dict(self.stats), keyed_calls=self.calls, by_rows_max=dict(self.by_rows_max),
+                    rows_compared=self.rows_cmp, plant=self.plant,
                     diff_rows=int(self.diff_rows) if self.diff_rows is not None else 0,
-                    per_row_ms=t_pr, shared_ms=t_sh, build_ms=t_b, tiles=tiles,
+                    diff_elements_zero_sign=int(self.diff_zero), diff_elements_value=int(self.diff_value),
+                    diff_samples=samples, per_row_ms=t_pr, shared_ms=t_sh, tiles=tiles,
                     tile_ratio=tiles["shared"] / tiles["per_row"] if tiles["per_row"] else None,
                     row_ratio=tiles["rows_shared"] / tiles["rows_per_row"] if tiles["rows_per_row"] else None,
-                    mode=self.mode)
+                    mix_all=mix_all, mix_full=mix_full, tile_identity_bad=ident_bad[:16],
+                    tile_identity_checked=sum(1 for x in self.mixes if x[4] is not None),
+                    expected_tile_ratio=expected_tile_ratio(mix_all, self.mode),
+                    union_ratio_by_size=[(mix_all[2][k] / mix_all[1][k]) if mix_all[1][k] else None
+                                         for k in range(ROWS_MAX + 1)],
+                    per_call=per_call, mode=self.mode)
+
+    def report_tables(self) -> list:
+        """The recorded inputs (MAJOR-1), moved to the host (one read; the gate saves them with torch.save)."""
+        out = []
+        for t in self.tables:
+            out.append({k: (v.cpu() if torch.is_tensor(v) else v) for k, v in t.items()})
+        return out
+
+
+# [review MAJOR-1] REGISTERED per group size s (docs/R2_SHAREDKV_PLAN.md P2, revised): the expected tile / sum ratio
+# of a group of s rows of one request. s = 4 is the 4.5 harness basis (whole 0.282 -> 0.29; split 0.45, an estimate);
+# s = 1 reads its own list (1.0); s = 2, 3 interpolate by the union of s rows' selections (U(3 verify) = 69 of 3 x 63).
+RHO = {"whole": {1: 1.00, 2: 0.55, 3: 0.40, 4: 0.29}, "split": {1: 1.00, 2: 0.70, 3: 0.55, 4: 0.45}}
+RHO_BAND = (0.80, 1.25)          # the measured tile ratio / the mix-derived expectation
+
+
+def expected_tile_ratio(mix, mode: str):
+    """The registered formula: sum_s RHO[mode][s] x (per-row pages of the groups of size s) / sum_s (per-row pages);
+    mix = [groups by size, per-row pages by size, union pages by size]. None without pages."""
+    den = sum(mix[1][s] for s in range(1, ROWS_MAX + 1))
+    if den <= 0:
+        return None
+    return sum(RHO[mode][s] * mix[1][s] for s in range(1, ROWS_MAX + 1)) / den

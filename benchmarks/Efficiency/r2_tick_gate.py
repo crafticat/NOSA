@@ -71,10 +71,13 @@ import r2_g0bi_gate as GB  # noqa: E402  (decode_loop, load_by_path, free, gate)
 PARTS = ("SG0", "SG1", "SG2", "SG3", "SG4")
 ATTN_VARIANTS = ("per_row", "shared", "shared-whole", "probe", "probe-whole", "probe-plant")   # [sharedkv]
 ROOT = Path(HERE).resolve().parents[1]                                                          # [sharedkv]
-# [sharedkv] REGISTERED bands (docs/R2_SHAREDKV_PLAN.md section 4), over ALL keyed calls (tiles) and over the keyed
-# calls of rows_max 4 (time: shared kernel + combine over piece 3's split + combine, the union build excluded)
-SKV_PRED = {"split": dict(tiles=(0.30, 0.60), time=(0.55, 1.10)),
-            "whole": dict(tiles=(0.24, 0.36), time=(0.80, 3.50))}
+# [sharedkv] REGISTERED bands (docs/R2_SHAREDKV_PLAN.md section 5, revised after the review of f79d0df). Tiles: no
+# fixed band; the expectation is DERIVED from the recorded group mix (bi_paged_attention_shared.RHO per group size,
+# expected_tile_ratio) and the measured ratio must lie in RHO_BAND x that expectation. Time (REPORT; the primary time
+# ratio is the S3 cell's device kernel time): over the keyed calls of rows_max 4, the order-pooled median of (union
+# build + shared kernel + combine) / (piece 3's split + combine), CUDA events behind a pre-queued GPU.
+SKV_PRED = {"split": dict(time_with_build=(1.30, 0.80, 2.20)),        # (central, lo, hi)
+            "whole": dict(time_with_build=(2.10, 1.00, 4.00))}
 
 
 def select_attn(a, attn):
@@ -98,37 +101,65 @@ def sharedkv_gates(a, obj, gates, res):
         return
     st = dict(obj.stats)
     gates.append(GB.gate("SKV_shared_kernel_ran", st.get("shared", 0) > 0, True, "stats %s" % st))
+    n4 = obj.by_rows_max.get(4, 0)                                         # [review MINOR-3] F3, machine-checked
+    gates.append(GB.gate("SKV_rows_max4_calls", n4 > 0, True, "keyed calls per rows_max %s (F3: none with 4 rows of "
+                         "one request = the cell did not test the 4-row groups)" % (dict(obj.by_rows_max),)))
     if not a.attn.startswith("probe"):
-        res["SKV"] = dict(attn=a.attn, stats=st)
+        res["SKV"] = dict(attn=a.attn, stats=st, by_rows_max=dict(obj.by_rows_max))
         return
     rep = obj.report()
     res["SKV"] = rep
+    try:                                                                   # [review MAJOR-1] F4's own tables
+        import torch
+        path = os.path.join(a.out, "skv_tables.pt")
+        torch.save(obj.report_tables(), path)
+        gates.append(GB.gate("R_SKV_tables", True, False, "%d recorded calls -> %s" % (len(obj.tables), path)))
+    except Exception as e:
+        gates.append(GB.gate("R_SKV_tables", False, False, "not saved: %s: %s" % (type(e).__name__, str(e)[:200])))
     if a.attn == "probe-plant":
         gates.append(GB.gate("SKV_plant_detected", rep["diff_rows"] > 0, True,
                              "%d of %d compared rows differ (0 = the plant was a NO-OP on these inputs: BLIND)"
                              % (rep["diff_rows"], rep["rows_compared"])))
         return
     gates.append(GB.gate("SKV_bitwise_shared_equals_per_row", rep["diff_rows"] == 0 and rep["rows_compared"] > 0, True,
-                         "%d of %d compared rows differ (int views: a sign-of-zero difference counts)"
-                         % (rep["diff_rows"], rep["rows_compared"])))
-    by = {}
-    for (nr, first, pr), (_, _, sh), (_, _, bd) in zip(rep["per_row_ms"], rep["shared_ms"], rep["build_ms"]):
-        by.setdefault((nr, first), []).append((sh / pr if pr > 0 else float("nan"), (sh + bd) / pr if pr > 0 else float("nan")))
-    txt = []
+                         "%d of %d compared rows differ (int views: a sign-of-zero difference counts); differing "
+                         "elements: sign-of-zero only %d, value %d (F1 triage); first samples %s"
+                         % (rep["diff_rows"], rep["rows_compared"], rep["diff_elements_zero_sign"],
+                            rep["diff_elements_value"], rep["diff_samples"][:4])))
+    if rep["tile_identity_checked"] > 0:                                   # [review MAJOR-1] the counter's identities
+        gates.append(GB.gate("SKV_tile_identity", not rep["tile_identity_bad"], True,
+                             "%d calls checked (whole: tiles = union pages; split: union <= tiles <= sum); bad %s"
+                             % (rep["tile_identity_checked"], rep["tile_identity_bad"][:4])))
     pred = SKV_PRED[rep["mode"]]
-    for key in sorted(by):
-        k_only = sorted(x for x, _ in by[key])
-        with_b = sorted(y for _, y in by[key])
-        med, medb = k_only[len(k_only) // 2], with_b[len(with_b) // 2]
-        band = pred["time"] if key[0] == 4 else None
-        txt.append("rows_max %d first %s: n %d median shared/per_row %.3f (with the union build %.3f)%s"
-                   % (key[0], key[1], len(k_only), med, medb,
-                      "" if band is None else " band %s %s" % (band, "IN" if band[0] <= med <= band[1] else "OUT")))
-    gates.append(GB.gate("R_SKV_time_ratio", True, False, "; ".join(txt) or "no timed call"))
-    tr = rep["tile_ratio"]
-    gates.append(GB.gate("R_SKV_tile_ratio", True, False, "tiles shared / per-row %s, 64-row tile rows %s; band %s %s"
-                         % (tr, rep["row_ratio"], pred["tiles"],
-                            "n/a" if tr is None else ("IN" if pred["tiles"][0] <= tr <= pred["tiles"][1] else "OUT"))))
+    c, lo, hi = pred["time_with_build"]
+    pooled = {}
+    for (nr, first, pr), (_, _, sh) in zip(rep["per_row_ms"], rep["shared_ms"]):
+        pooled.setdefault(nr, []).append(sh / pr if pr > 0 else float("nan"))
+    txt = []
+    for nr in sorted(pooled):                                              # [review MINOR-10] order-pooled median
+        xs = sorted(pooled[nr])
+        med = xs[len(xs) // 2]
+        txt.append("rows_max %d: n %d median (build + shared) / per_row %.3f%s" % (
+            nr, len(xs), med, "" if nr != 4 else " band [%s, %s] central %s %s" % (lo, hi, c, "IN" if lo <= med <= hi
+                                                                                   else "OUT")))
+    gates.append(GB.gate("R_SKV_time_ratio", True, False, "CUDA events behind a pre-queued GPU, REPORT only (the "
+                         "primary time ratio is the S3 cell's device kernel time): " + ("; ".join(txt) or "no timed call")))
+    tr, ex = rep["tile_ratio"], rep["expected_tile_ratio"]
+    if tr is None or ex is None:
+        verdict = "n/a"
+    else:
+        verdict = "IN" if RHO_BAND(obj)[0] * ex <= tr <= RHO_BAND(obj)[1] * ex else "OUT"
+    gates.append(GB.gate("R_SKV_tile_ratio", True, False,
+                         "tiles shared / per-row %s; expected from the recorded group mix %s (RHO %s, band %s x "
+                         "expected) %s; union / sum per group size %s; groups per size %s"
+                         % (tr, ex, type(obj).report.__globals__.get("RHO", {}).get(rep["mode"]),
+                            RHO_BAND(obj), verdict, rep["union_ratio_by_size"], rep["mix_all"][0])))
+
+
+def RHO_BAND(obj):
+    """[review MAJOR-1] the registered relative band of the tile ratio around its mix-derived expectation (the shared
+    module's RHO_BAND, read from the probe class's own module globals: the module may be loaded by path)."""
+    return type(obj).report.__globals__.get("RHO_BAND", (0.80, 1.25))
 
 
 def log(msg):
@@ -180,6 +211,9 @@ def parse_args(argv):
         ap.error("steps >= 2, 1 <= sg0-steps <= steps, draft-drop in [0, 1)")
     if not 2 <= a.sg4_steps <= a.steps or a.phase < 2:
         ap.error("2 <= sg4-steps <= steps, phase >= 2")
+    if a.attn.startswith("shared") and a.no_check:                       # [review MINOR-5]
+        ap.error("--attn %s needs the per-layer selection check (it guarantees the keys' last two entries T - 1, T; "
+                 "without it the shared arm can break the law silently): drop --no-check" % a.attn)
     return a
 
 

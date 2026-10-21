@@ -61,8 +61,12 @@ without a plan).
 * cell: `SharedKVProbe(..., ncu_window=(32, 64))`: among keyed calls with 4 rows of one request, calls 32 .. 95 are
   marked (the first 32 compile the kernels). Each marked call: one `cudaProfilerStart / Stop` window around piece
   3's launch (NVTX `skv|pr|c<j>`: `_bi_split_kernel` + `_bi_combine_kernel`) and the shared launch (`skv|sh|c<j>`:
-  `_bi_shared_kernel` + combine), on the same inputs. The union build and the counting launch are outside.
-  `--profile-from-start off`, so nothing else is profiled.
+  `_bi_shared_kernel` + combine), on the same inputs; the union build is in the window as `skv|bd|c<j>` (review
+  MAJOR-2, second commit); the counting launch is outside. `--profile-from-start off`, so nothing else is profiled.
+* time (review MAJOR-3, second commit): the PRIMARY time ratio is the device kernel time (`gpu__time_duration`) on
+  the cache-control `none` variant: (build + shared + combine) / (split + combine), registered split 1.30
+  [0.80, 2.20], whole 2.10 [1.00, 4.00]; kernel only (the plan's P3) split 0.80 [0.55, 1.10], whole 1.60
+  [0.80, 3.50] (`R_S3_device_time_<cc>`; `all` = cold, REPORT).
 * arms: `b32-split`, `b32-whole` (ResidentStore, B 32), `b64-split`, `b64-whole` (B2 on the SG5 path with the page
   keys of section 1, C 96 X 32 R_ver 16, gather transport). 16 committed tokens per request, free-running,
   draft_drop 0 on the ResidentStore.
@@ -119,14 +123,15 @@ The prediction (x_pr 0.43) sits just under the break-even: D1 is the central exp
 * F-S3-3 sh_over_union outside its band: the shared kernel does not read the union (the byte model of P2 is wrong;
   check the counter `tile_ratio` in the same summary).
 * F-S3-4 x_pr(all) and x_pr(none) more than 20 % apart: the cold measurement does not represent the tick.
-* Device kernel time under ncu (`R_S3_kernel_time`): serialized and cold, a REPORT, not the tick's time.
+* F-S3-5 (second commit) device time with the build above its band: the selector loses in the tick at this schedule
+  unless the build is hoisted (grow once per tick).
 
 ### CPU tests (`benchmarks/Efficiency/tests_cpu/test_r2_sharedkv_ncu.py`)
 
 | node | what |
 |---|---|
 | `test_N1_summary_on_a_synthetic_export` | parser, window check, bounds, exact quantities, D2, last line |
-| `test_N2_summary_negatives[missing_kernel]`, `[untagged]`, `[below_union]`, `[above_sum]`, `[bitwise]`, `[no_hit]` | each defect fails its MUST gate; a dropped hit metric is not read as 0 |
+| `test_N2_summary_negatives[missing_kernel]`, `[missing_build]`, `[untagged]`, `[below_union]`, `[above_sum]`, `[bitwise]`, `[no_hit]` | each defect fails its MUST gate; a dropped hit metric is not read as 0 |
 | `test_N3_probe_marks_calls_with_four_rows_in_the_tick` | marking through the production tick (CPU tiny model) |
 | `test_N4_parse_args_refusals` | window / variants |
 | `test_N5_step_dryrun_refusals_and_pins` | the step: usage, uuid file, TICK_HOLDERS, HEAD; full DRYRUN prints both blobs and the arm's arguments (clean checkout of this worktree only, else skipped) |

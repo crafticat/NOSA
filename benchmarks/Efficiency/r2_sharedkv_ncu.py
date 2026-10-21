@@ -12,8 +12,8 @@ build_ragged, then ONE engine:
 whose ops.attn is SharedKVProbe(piece 3, mode, ncu_window=(skip, count)): every keyed call runs BOTH kernels on the
 same inputs (piece 3's output drives the tick); among the calls with 4 rows of one request (rows_max 4), calls
 skip .. skip + count - 1 are wrapped in one profiler window each (cudaProfilerStart / Stop) with NVTX ranges
-skv|pr|c<j> and skv|sh|c<j>. ncu runs with --profile-from-start off, so ONLY those launches are profiled (the union
-build and the counting launch stay outside). A free-running round of --steps committed tokens per request
+skv|pr|c<j>, skv|bd|c<j> (the union build, part of the shared side) and skv|sh|c<j>. ncu runs with
+--profile-from-start off, so ONLY those launches are profiled (the counting launch stays outside). A free-running round of --steps committed tokens per request
 (draft_drop 0 on the ResidentStore: full draft selections, as the 4.5 harness and the forecast).
 cell.json: the probe's report (diff_rows: the bitwise A/B of every keyed call) and ncu_report (per marked call: rows,
 sum of num_pages, union pages).
@@ -56,7 +56,7 @@ BREAK_EVEN = 0.466                      # docs/R2_SHAREDKV_PLAN.md P4: tiles / (
 REQUIRED = ("gpu__time_duration.sum", "dram__bytes_read.sum", "dram__bytes_write.sum",
             "lts__t_sectors_srcunit_tex_op_read.sum")
 OPTIONAL = ("lts__t_sector_op_read_hit_rate.pct", "lts__t_sector_hit_rate.pct")
-TAG_RE = re.compile(r"skv\|(pr|sh)\|c(\d+)")
+TAG_RE = re.compile(r"skv\|(pr|sh|bd)\|c(\d+)")                      # bd: the union build (torch ops), shared side
 KERNELS = dict(pr=("_bi_split_kernel", "_bi_combine_kernel"), sh=("_bi_shared_kernel", "_bi_combine_kernel"))
 # REGISTERED before any run (docs/R2_SHAREDKV2_KEYS_S3.md section 3): (central, lo, hi) per mode, cache-control all
 S3_PRED = {
@@ -66,6 +66,11 @@ S3_PRED = {
     "f": dict(split=(0.20, 0.05, 0.50), whole=(0.20, 0.05, 0.50)),
     "hit_pr": dict(split=(55.0, 30.0, 80.0), whole=(55.0, 30.0, 80.0)),
     "hit_sh": dict(split=(15.0, 0.0, 40.0), whole=(10.0, 0.0, 35.0)),
+    # [review MAJOR-2 / MAJOR-3] the PRIMARY time ratio: device kernel time (gpu__time_duration) of (union build +
+    # shared + combine) / (piece 3 split + combine), on the cache-control none variant (the tick's L2 state; all =
+    # cold, REPORT); and the kernel-only ratio (the plan's P3, unchanged)
+    "time_with_build": dict(split=(1.30, 0.80, 2.20), whole=(2.10, 1.00, 4.00)),
+    "time_kernel": dict(split=(0.80, 0.55, 1.10), whole=(1.60, 0.80, 3.50)),
 }
 
 
@@ -243,6 +248,8 @@ def summarize_variant(cc, rows, cell, mode, fields):
             want = sorted(KERNELS[kind])
             if names != want:
                 wrong.append((j, kind, names))
+        if not by.get(("bd", j)):                                       # the build ran inside the window
+            wrong.append((j, "bd", []))
     extra = sorted({j for (_, j) in by} - set(marked))
     ok = not wrong and not untagged and not extra and bool(marked)
     win = gate("O_windows_%s" % cc, ok, True, "%d marked calls; wrong %s; untagged %d; unmarked tags %s"
@@ -280,6 +287,9 @@ def summarize_variant(cc, rows, cell, mode, fields):
                 d[kind][f] = num / den if den else None
         sec = d[kind]["l2_read_sectors_main"]
         d[kind]["hit_derived_pct"] = 100.0 * (1.0 - d[kind]["dram_read_main"] / (32.0 * sec)) if sec else None
+    d["bd"] = dict(dram_read_all=tot("bd", "dram__bytes_read.sum", False),
+                   time_ns_all=tot("bd", "gpu__time_duration.sum", False),
+                   kernels=sum(len(rs) for (k, j), rs in by.items() if k == "bd" and j in marked))
     pr, sh = d["pr"]["dram_read_main"], d["sh"]["dram_read_main"]
     q = dict(sum_bytes=SUM, union_bytes=UNI, union_over_sum=UNI / SUM if SUM else None,
              x_pr=pr / SUM if SUM else None, x_sh=sh / SUM if SUM else None,
@@ -288,7 +298,10 @@ def summarize_variant(cc, rows, cell, mode, fields):
              sh_over_union=sh / UNI if UNI else None,
              f=(pr - UNI) / (SUM - UNI) if SUM > UNI else None,
              time_ratio_main=d["sh"]["time_ns_main"] / d["pr"]["time_ns_main"] if d["pr"]["time_ns_main"] else None,
-             time_ratio_all=d["sh"]["time_ns_all"] / d["pr"]["time_ns_all"] if d["pr"]["time_ns_all"] else None)
+             time_ratio_all=d["sh"]["time_ns_all"] / d["pr"]["time_ns_all"] if d["pr"]["time_ns_all"] else None,
+             time_with_build=(d["sh"]["time_ns_all"] + d["bd"]["time_ns_all"]) / d["pr"]["time_ns_all"]
+             if d["pr"]["time_ns_all"] else None)
+    q["time_kernel"] = q["time_ratio_all"]
     hk = OPTIONAL[0] if OPTIONAL[0] in fields else None
     q["hit_pr"] = d["pr"][hk] if hk else d["pr"]["hit_derived_pct"]
     q["hit_sh"] = d["sh"][hk] if hk else d["sh"]["hit_derived_pct"]
@@ -348,10 +361,14 @@ def mode_summarize(a, og=None):
                        % (x_pr, x_sh, BREAK_EVEN))
                 gates.append(gate("R_S3_decision", True, False, dec + "; f (the paid part of the logical excess) "
                                   "%s" % (None if q["f"] is None else round(q["f"], 4))))
-            gates.append(gate("R_S3_kernel_time_%s" % cc, True, False,
-                              "device kernel time under ncu (serialized, %s L2): shared / piece 3 main %s, with "
-                              "combine %s" % ("cold" if cc == "all" else "tick", q["time_ratio_main"],
-                                              q["time_ratio_all"])))
+        if win["passed"]:                                               # [review MAJOR-2 / MAJOR-3] device time
+            gates.append(gate("R_S3_device_time_%s" % cc, True, False,
+                              "%s device kernel time (ncu gpu__time_duration, serialized, %s L2): %s; %s; main "
+                              "kernels only %s; build %d kernels %.0f ns"
+                              % ("PRIMARY" if cc == "none" else "REPORT", "cold" if cc == "all" else "tick",
+                                 band("time_with_build", mode, q["time_with_build"]),
+                                 band("time_kernel", mode, q["time_kernel"]), q["time_ratio_main"],
+                                 d["bd"]["kernels"], d["bd"]["time_ns_all"])))
     if "all" in out["variants"] and "none" in out["variants"]:
         ra, rn = out["variants"]["all"]["quantities"]["x_pr"], out["variants"]["none"]["quantities"]["x_pr"]
         gates.append(gate("R_S3_cache_state", True, False, "x_pr all %s none %s (F-S3-4: > 20 %% apart = the cold "

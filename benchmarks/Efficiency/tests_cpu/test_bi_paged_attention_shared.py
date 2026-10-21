@@ -259,6 +259,14 @@ def test_negative_drop_one_union_page_is_caught(mode):
     # the device default (u None = the last union page) also plants a listed page
     last = sk.plant_drop_page(un, g, h)
     assert bool((last["rowpos"][g, h] != un["rowpos"][g, h]).any())
+    # [review MINOR-12] L34 on the EXACT variant the GPU uses (u None): it changes the output on these inputs, only on
+    # the rows that list the last union page
+    ul = int(un["ucnt"][g, h]) - 1
+    listers_l = [int(un["grow"][g, j]) for j in range(4) if int(un["rowpos"][g, h, j, ul]) >= 0]
+    out_l = sk.bi_paged_decode_shared_reference(bi, *args_of(c), c["key"], rows_max=4, mode=mode, union=last)
+    changed_l = [r for r in range(ref.shape[0]) if not bits_equal(out_l[r], ref[r])]
+    assert listers_l and changed_l, "the default plant was a NO-OP on these inputs"
+    assert set(changed_l) == set(listers_l), (changed_l, listers_l)
 
 
 def test_negative_union_order_must_follow_the_keys():
@@ -521,6 +529,20 @@ def test_gate_selector_default_is_piece3_and_choices():
     gates = []
     G.sharedkv_gates(a, fake, gates, {})
     assert not {g["name"]: g for g in gates}["SKV_plant_detected"]["passed"]
+    # [review MINOR-3] F3 machine-checked: a MUST gate on the keyed calls with 4 rows of one request
+    a = G.parse_args(base_args + ["--attn", "probe"])
+    for counts, ok in (({}, False), ({2: 5, 3: 1}, False), ({4: 2}, True)):
+        fake.by_rows_max = dict(counts)
+        gates = []
+        G.sharedkv_gates(a, fake, gates, {})
+        g4 = {g["name"]: g for g in gates}["SKV_rows_max4_calls"]
+        assert g4["must"] and g4["passed"] is ok, (counts, g4)
+    # [review MINOR-5] the shared arms refuse --no-check; per_row / probe keep it
+    for choice in ("shared", "shared-whole"):
+        with pytest.raises(SystemExit):
+            G.parse_args(base_args + ["--attn", choice, "--no-check"])
+    assert G.parse_args(base_args + ["--attn", "probe", "--no-check"]).no_check
+    assert G.parse_args(base_args + ["--no-check"]).no_check
 
 
 def test_step_script_shape_and_its_sg1_schedule_is_not_blind():
@@ -658,3 +680,164 @@ def test_shared_source_keeps_piece3_constants_and_no_host_read():
                  "l_i = l_i * alpha + tl.sum(pr, 1)",
                  "acc = acc * alpha[:, None] + tl.dot(pr.to(v.dtype), v)"):
         assert line in base_src, line
+
+
+# ---------------------------------------------------------------------------
+# (8) [sharedkv2] the review fixes of f79d0df (kstep-cpu-runs/paper-notes/review-sharedkv-f79d0df.md)
+# ---------------------------------------------------------------------------
+def test_probe_records_the_group_mix_and_the_expectation():
+    """MAJOR-1: the probe records, per keyed call, the group mix on the device: per group size s the groups, their
+    per-row pages (both heads) and their union pages. Oracle: the case's own requests (rows_of; one group per
+    request with <= 4 rows) counted on the host. expected_tile_ratio is the registered formula on that mix. The tile
+    identity check flags a call whose counter breaks union <= tiles <= sum (a planted bad count; the CPU twin has no
+    counter of its own). The recorded tables are the call's inputs."""
+    c = make_group_case(2, "half", rows_per_req=[4, 3, 1, 2])
+    pr = sk.SharedKVProbe(bi, timing=False, impl="reference", record_tables=2)
+    pr.bi_paged_decode(*args_of(c), page_key=c["key"], rows_max=4)
+    rep = pr.report()
+    want = [[0] * 5 for _ in range(3)]
+    want[0][0] = c["seq_idx"].shape[0] - len(c["rows_of"])                # empty group slots (grid rows past the last)
+    for b, rows in c["rows_of"].items():
+        s = len(rows)
+        want[0][s] += 1
+        want[1][s] += int(sum(int(c["num_pages"][r].sum()) for r in rows))
+        for h in range(c["num_pages"].shape[1]):
+            pairs = {(int(c["key"][r, h, i]), int(c["table"][r, h, i])) for r in rows
+                     for i in range(int(c["num_pages"][r, h]))}
+            want[2][s] += len(pairs)
+    assert rep["mix_all"] == want and rep["mix_full"] == want, (rep["mix_all"], want)
+    rho = sk.RHO["split"]
+    exp = sum(rho[s] * want[1][s] for s in range(1, 5)) / sum(want[1][s] for s in range(1, 5))
+    assert abs(rep["expected_tile_ratio"] - exp) < 1e-12
+    assert rep["by_rows_max"] == {4: 1} and rep["tile_identity_checked"] == 0
+    tabs = pr.report_tables()
+    assert len(tabs) == 1 and torch.equal(tabs[0]["page_key"], c["key"]) and torch.equal(tabs[0]["page_table"], c["table"])
+    call, nr, mix, s, _ = pr.mixes[0]
+    pr.mixes.append((1, nr, mix, s, s + 1))                               # NEGATIVE: more tiles than the sum
+    pr.mixes.append((2, nr, mix, s, torch.tensor(sum(want[2][1:]))))     # the union exactly: fine in split
+    rep2 = pr.report()
+    assert rep2["tile_identity_checked"] == 2 and [x["call"] for x in rep2["tile_identity_bad"]] == [1]
+
+
+def test_probe_triages_sign_of_zero_and_value_differences():
+    """MINOR-2: the probe splits differing elements into sign-of-zero only (the floats compare equal) and value
+    differences, and records the first differing element of each call (flat index, both bit patterns). Planted on
+    the CPU: the shared side returns piece 3's output with one +0.0 turned into -0.0 (call 0), then with one value
+    changed (call 1); a clean call (call 2) adds nothing."""
+    c = make_group_case(2, "half", rows_per_req=[4, 3, 1, 2])
+    plants = []
+
+    class Planted(sk.SharedKVProbe):
+        def _base(self, args, softmax_scale, pps, out=None, workspace=None):
+            o = super()._base(args, softmax_scale, pps)
+            o[1, 2, 3] = 0.0
+            return o
+
+        def _shared(self, args, page_key, nr, softmax_scale, pps, out=None, workspace=None, union=None):
+            o = self._base(args, softmax_scale, pps)
+            kind = plants[self.calls - 1]
+            if kind == "zero":
+                o[1, 2, 3] = -0.0
+            elif kind == "value":
+                o[0, 0, 0] = o[0, 0, 0] + 1.0
+            return o
+    pr = Planted(bi, timing=False, impl="reference")
+    for kind in ("zero", "value", "clean"):
+        plants.append(kind)
+        pr.bi_paged_decode(*args_of(c), page_key=c["key"], rows_max=4)
+    rep = pr.report()
+    assert rep["diff_rows"] == 2 and rep["diff_elements_zero_sign"] == 1 and rep["diff_elements_value"] == 1, rep
+    Hq, D = c["q"].shape[1], c["q"].shape[2]
+    s0, s1 = rep["diff_samples"]
+    assert (s0["call"], s0["flat_index"]) == (0, 1 * Hq * D + 2 * D + 3) and s0["bits_per_row"] != s0["bits_shared"]
+    assert (s1["call"], s1["flat_index"]) == (1, 0)
+
+
+def test_probe_times_the_build_with_the_shared_side_and_launches_no_extra_zeros():
+    """MAJOR-2 / MAJOR-3 (source): the probe's shared side builds the union inside its own timed span (NVTX range
+    bd); a torch.cuda._sleep pre-queues the GPU before the timed pair; the uncounted launch passes the persistent
+    dummy counter (no torch.zeros launch per call)."""
+    src = SK_PATH.read_text()
+    tree = ast.parse(src)
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SharedKVProbe")
+    body = ast.get_source_segment(src, next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                                             and n.name == "bi_paged_decode"))
+    assert 'box["un"] = ranged("bd", build)' in body
+    assert body.index("torch.cuda._sleep(self.sleep_cycles)") < body.index("ev[0].record()")
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "bi_paged_decode_shared")
+    code = "\n".join(l.split("#")[0] for l in ast.get_source_segment(src, fn).split('"""')[2].splitlines())
+    assert "torch.zeros(" not in code and "_dummy_counter(q.device)" in code
+
+
+def test_step_dryrun_refusals_and_pins(tmp_path):
+    """MAJOR-4 (as test_r2_g0bi.py G8): r2_sharedkv_step.sh EXECUTED in DRYRUN. A wrong arm is a usage error (2); a
+    missing uuid file, a GPU- prefix and two lines STOP (1); TICK_HOLDERS and TICK_PIN_* outside DRYRUN are refused; a
+    wrong --nosi stops at HEAD. On a clean checkout of the step's own worktree at HEAD: each arm prints its PARTS /
+    DROP / --attn (per_row and the probes SG1 0.0, the shared arms SG0-SG3 0.5) and both blobs; piece 3's FIRST pin
+    (at 7c826c1) refuses a wrong blob, the SECOND (in this tree) refuses an older piece 3 blob that the first pin
+    accepts (its commit from git log)."""
+    script = Path(__file__).resolve().parents[1] / "r2_sharedkv_step.sh"
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_", "TICK_"))}
+    uid = "f31fc723-9dfe-407a-9947-28173556232a"
+
+    def run(job, content=None, dry=True, arm="probe", sha="0" * 40, holders=True, extra=None):
+        if content is not None:
+            (tmp_path / ("%s.gpu_uuid" % job)).write_text(content)
+        e = dict(env)
+        if holders:
+            e["TICK_HOLDERS"] = str(tmp_path)
+        e.update(extra or {})
+        if dry:
+            e["DRYRUN"] = "1"
+        else:
+            e.pop("DRYRUN", None)
+        return subprocess.run(["bash", str(script), "--nosi", sha, str(job), "t1", arm], env=e, capture_output=True,
+                              text=True, timeout=300)
+    r = run(410, arm="probe-fast")
+    assert r.returncode == 2 and "usage" in r.stderr
+    r = run(411)
+    assert r.returncode == 1 and "no GPU uuid file" in r.stderr
+    r = run(412, "GPU-%s\n" % uid)
+    assert r.returncode == 1 and "does not hold a uuid" in r.stderr
+    r = run(413, "%s\n%s\n" % (uid, uid))
+    assert r.returncode == 1 and "more than one line" in r.stderr
+    r = run(414, uid + "\n", dry=False)
+    assert r.returncode == 1 and "TICK_HOLDERS is for DRYRUN" in r.stderr
+    r = run(415, dry=False, holders=False, extra=dict(TICK_PIN_BIATTN_BLOB="0" * 40))
+    assert r.returncode == 1 and "for DRYRUN" in r.stderr and "TICK_PIN" in r.stderr
+    r = run(416, uid + "\n")
+    assert r.returncode == 1 and "HEAD is not" in r.stderr
+    nosi = "/mnt/beegfs/ojerbi/nosi-r2-sharedkv2"
+    head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
+    dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"], capture_output=True,
+                           text=True)
+    if head.returncode != 0 or dirty.stdout.strip() or ROOT.resolve() != Path(nosi).resolve():
+        pytest.skip("the full DRYRUN needs a clean checkout of %s itself" % nosi)
+    sha = head.stdout.strip()
+    skv = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD:nosi/nosi/bi_paged_attention_shared.py"],
+                         capture_output=True, text=True).stdout.strip()
+    for arm, parts, drop in (("per_row", "SG1", "0.0"), ("probe-plant", "SG1", "0.0"), ("probe", "SG1", "0.0"),
+                             ("probe-whole", "SG1", "0.0"), ("shared", "SG0,SG1,SG2,SG3", "0.5"),
+                             ("shared-whole", "SG0,SG1,SG2,SG3", "0.5")):
+        r = run(417, uid + "\n", arm=arm, sha=sha)
+        assert r.returncode == 0, (arm, r.stderr[-400:])
+        assert "arm %s parts %s drop %s" % (arm, parts, drop) in r.stdout, arm
+        assert "piece 3 7c826c1bc7235ee9153e3af82c99d85836915416:nosi/nosi/bi_paged_attention.py blob %s" % PIECE3_BLOB \
+            in r.stdout and "shared %s" % skv in r.stdout
+        for w in ("--attn %s" % arm, "--parts %s" % parts.replace(",", "\\,"), "--draft-drop %s" % drop,
+                  "--sharedkv /mnt/beegfs/ojerbi/r2-runs/sharedkv/skv_%s_t1_417.step/bi_paged_attention_shared.py" % arm):
+            assert w in r.stdout, (arm, w)
+    r = run(418, uid + "\n", sha=sha, extra=dict(TICK_PIN_BIATTN_BLOB="0" * 40))
+    assert r.returncode == 1 and "piece 3: nosi/nosi/bi_paged_attention.py at" in r.stderr, r.stderr[-300:]
+    hist = subprocess.run(["git", "-C", str(ROOT), "log", "--format=%H", "7c826c1bc7235ee9153e3af82c99d85836915416",
+                           "--", "nosi/nosi/bi_paged_attention.py"], capture_output=True, text=True).stdout.split()
+    older = None
+    for h in hist:
+        b = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "-q", "--verify", h + ":nosi/nosi/bi_paged_attention.py"],
+                           capture_output=True, text=True).stdout.strip()
+        if b and b != PIECE3_BLOB:
+            older = (h, b)
+            break
+    assert older is not None, "precondition: an older piece 3 blob exists in the history (c866d7c at the time of writing)"
+    r = run(419, uid + "\n", sha=sha, extra=dict(TICK_PIN_BIATTN_SHA=older[0], TICK_PIN_BIATTN_BLOB=older[1]))
+    assert r.returncode == 1 and "piece 3 in this tree" in r.stderr, r.stderr[-300:]

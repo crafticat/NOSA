@@ -126,6 +126,9 @@ through occupancy. Cells:
 
 ### Registered predictions (written before any run; the gate prints IN / OUT for P2 / P3)
 
+[sharedkv2] P2's fixed tile bands, P3's kernel-only time band, F3, F4 and F5 below are REVISED by section 8 (the
+review of f79d0df, `kstep-cpu-runs/paper-notes/review-sharedkv-f79d0df.md`); the original text stays for the record.
+
 * P1 (MUST, exactness). S1-probe and S1-probe-whole: 0 differing rows (int views) over all keyed calls;
   `SKV_shared_kernel_ran`. S1-shared / S1-shared-whole: every SG0-SG3 MUST gate PASS. S1-plant: diff rows > 0.
 * P2 (tiles; the kernel's own counter over all keyed calls; shared / per-row = sum of num_pages). Basis: the 4.5
@@ -169,10 +172,54 @@ through occupancy. Cells:
 shared | shared-whole) that selects `--parts` / `--draft-drop`; B 32 with 32 deltas, M_FIX 128; STEP_MIN 90; it also
 checks that this tree's `nosi/nosi/bi_paged_attention.py` IS the pinned blob and that the shared module is tracked;
 it passes `--attn "$ARM" --sharedkv "$NOSI/nosi/nosi/bi_paged_attention_shared.py"`. Order: S1-probe, S1-plant,
-S1-probe-whole, S1-shared, S1-shared-whole; stop at the first MUST failure.
+S1-probe-whole, S1-shared, S1-shared-whole; stop at the first MUST failure. [sharedkv2] SUPERSEDED by section 8:
+the order is per_row, probe-plant, probe, probe-whole, shared, shared-whole, and the shared module is a frozen copy.
 
 ## 7. Merge notes (the parallel X-pool branch, `nosi-r2-xpool`)
 
 Piece 3's file is unchanged here. The shared kernel copies piece 3's address arithmetic (module lines 291-294 bases,
-311-314 tile rows and loads, 198 q, 236 / 239 workspace). When the X-pool's flat-position mode lands in piece 3's
-kernel, the same constexpr change is needed at those lines of `_bi_shared_kernel` (a follow-up after both gates).
+311-314 tile rows and loads, 198 q, 236 / 239 workspace, at f79d0df; [sharedkv2] at the review-fix commit + 4:
+295-298, 315-318, 202, 240 / 243). When the X-pool's flat-position mode lands in piece 3's kernel, the same constexpr
+change is needed at those lines of `_bi_shared_kernel` (a follow-up after both gates).
+
+## 8. [sharedkv2] Review fixes (review of f79d0df; SOURCE ONLY, not run)
+
+* MAJOR-1 (P2, F4). No fixed tile band. The probe records per keyed call the GROUP MIX on the device (per group size
+  s = 1 .. 4: groups, their per-row pages, their union pages; `report()["mix_all"]`, `["mix_full"]`, `["per_call"]`),
+  and the inputs of the first 4 keyed calls with 4 rows (`report_tables()`; the gate saves `skv_tables.pt`: F4's
+  offline check against the CPU twin). REGISTERED FORMULA (`bi_paged_attention_shared.RHO`, `expected_tile_ratio`):
+  expected = sum_s RHO[mode][s] x pages_s / sum_s pages_s, with RHO whole {1: 1.00, 2: 0.55, 3: 0.40, 4: 0.29},
+  split {1: 1.00, 2: 0.70, 3: 0.55, 4: 0.45}; the measured tile ratio must lie in [0.80, 1.25] x expected
+  (`R_SKV_tile_ratio`, which also prints the measured union / sum per size: the direct test of RHO). The counter's
+  identities are MUST (`SKV_tile_identity`): whole tiles = the union pages; split union <= tiles <= sum.
+* MAJOR-2 (P3, F5). The shared side's timed span includes the union build (NVTX `bd` in the S3 window too).
+  REGISTERED with the build: split central 1.30 [0.80, 2.20], whole 2.10 [1.00, 4.00] (the build is about 50 small
+  ops per call; at B 32 the kernel is of order 0.1 ms, so we expect the build to cost about as much as the sharing
+  saves). F5 now reads: (build + shared) / per_row > 1.10 (split) = the selector does not pay in the tick at this
+  schedule; the follow-up is to hoist `grow` (seq_idx only) to once per tick. The kernel-only band of P3 stays as a
+  REPORT.
+* MAJOR-3. The primary time ratio is the S3 cell's DEVICE kernel time (ncu `gpu__time_duration`, cache-control none
+  = the tick's L2 state; `R_S3_device_time_none`, docs/R2_SHAREDKV2_KEYS_S3.md). The gate's CUDA-event ratio
+  (`R_SKV_time_ratio`) is REPORT only; the probe now pre-queues the GPU (`torch.cuda._sleep`) so the events time the
+  device, and the uncounted launch passes a persistent dummy counter (no `torch.zeros` launch per call).
+* MAJOR-4. `test_step_dryrun_refusals_and_pins` runs the step in DRYRUN: usage, the uuid-file rules, TICK_HOLDERS and
+  the new TICK_PIN_* overrides refused outside DRYRUN, a wrong --nosi, the per-arm PARTS / DROP / --attn on a clean
+  checkout, and both piece-3 blob pins (the second with an older piece 3 blob from git log, c866d7c).
+* MINOR-1. The -0.0 exception goes both ways (module docstring corrected).
+* MINOR-2 (F1 triage). The probe counts differing ELEMENTS as sign-of-zero only (floats equal) or value, and keeps the
+  first differing element per call (flat index, both bit patterns); the bitwise gate prints them.
+* MINOR-3 (F3). MUST `SKV_rows_max4_calls`: keyed calls with 4 rows of one request exist (`by_rows_max`).
+* MINOR-5. `--attn shared` / `shared-whole` refuse `--no-check` (parse_args).
+* MINOR-7. The step freezes the shared module into the record (`git show`, hash checked) and the gate loads that copy.
+* MINOR-9 / MINOR-11. Arm order: `per_row` (piece 3 only, SG1, B 32: the miniature that checks memory and SG1
+  coverage at this batch), `probe-plant`, `probe`, `probe-whole`, `shared`, `shared-whole`; stop at the first MUST
+  failure; a probe result without a passed probe-plant is VOID.
+* MINOR-12. `test_negative_drop_one_union_page_is_caught` asserts that the DEFAULT plant (the last union page, the GPU
+  variant) changes the output on the CPU data, only on the listing rows.
+* NOSI in `r2_sharedkv_step.sh` is now `/mnt/beegfs/ojerbi/nosi-r2-sharedkv2` (the fixes live there).
+
+New / changed CPU nodes (`benchmarks/Efficiency/tests_cpu/test_bi_paged_attention_shared.py`):
+`test_probe_records_the_group_mix_and_the_expectation`, `test_probe_triages_sign_of_zero_and_value_differences`,
+`test_probe_times_the_build_with_the_shared_side_and_launches_no_extra_zeros`, `test_step_dryrun_refusals_and_pins`;
+changed: `test_negative_drop_one_union_page_is_caught[split]` / `[whole]` (MINOR-12),
+`test_gate_selector_default_is_piece3_and_choices` (MINOR-3, MINOR-5).

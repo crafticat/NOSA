@@ -71,6 +71,8 @@ def write_case(d, calls=2, sum_pages=100, union_pages=40, pr_pages=50.0, sh_page
             if drop != (kind, j):
                 row("skv|%s|c%d" % (kind, j), main, pages * PB, hp)
             row("skv|%s|c%d" % (kind, j), "_bi_combine_kernel", 1000.0, 90.0)
+        if drop != ("bd", j):                                               # the union build (torch ops)
+            row("skv|bd|c%d" % j, "void at::native::bitonicSortKVInPlace<long>", 100.0, 0.0)
     if untagged:
         row(None, "void at::native::vectorized_elementwise_kernel<4>", 5.0, 0.0)
     (d / "all_raw.csv").write_text(buf.getvalue())
@@ -100,20 +102,28 @@ def test_N1_summary_on_a_synthetic_export(tmp_path, capsys):
     assert abs(q["hit_pr"] - 50.0) < 1e-9 and abs(q["hit_sh"] - 12.0) < 1e-9
     assert g["R_S3_decision"]["detail"].startswith("D2")
     assert "x_pr 0.5000 IN" in g["R_S3_bands_all"]["detail"]
+    # device time (every kernel 1000 ns): (build + shared + combine) / (split + combine) = (2 + 4) / 4; kernel only 1
+    assert abs(q["time_with_build"] - 1.5) < 1e-12 and abs(q["time_kernel"] - 1.0) < 1e-12
+    assert "time_with_build 1.5000 IN" in g["R_S3_device_time_all"]["detail"]
+    assert s["variants"]["all"]["kinds"]["bd"]["kernels"] == 2
     assert capsys.readouterr().out.strip().splitlines()[-1] == "R2_SKV_NCU_DONE failed=0"
 
 
-@pytest.mark.parametrize("case", ["missing_kernel", "untagged", "below_union", "above_sum", "bitwise", "no_hit"])
+@pytest.mark.parametrize("case", ["missing_kernel", "missing_build", "untagged", "below_union", "above_sum", "bitwise",
+                                  "no_hit"])
 def test_N2_summary_negatives(tmp_path, case):
     """N2: each defect fails its MUST gate (exit >= 1), the others stay as in N1: a marked call without its shared
-    kernel (O_windows_all), an untagged kernel in the export (O_windows_all), piece 3 reading less than 0.9 x the
+    kernel or without its union build in the window (O_windows_all), an untagged kernel in the export
+    (O_windows_all), piece 3 reading less than 0.9 x the
     union from a cold L2 (O_bounds_all: physics), more than 1.15 x the sum (O_bounds_all), a differing row in the cell
     (O_cell_bitwise). no_hit: the L2 hit-rate metric dropped: NOT read as 0, the derived rate is used and named."""
-    kw = dict(missing_kernel=dict(drop=("sh", 2)), untagged=dict(untagged=True), below_union=dict(pr_pages=30.0),
-              above_sum=dict(pr_pages=120.0), bitwise=dict(diff_rows=1), no_hit=dict(hit=False))[case]
+    kw = dict(missing_kernel=dict(drop=("sh", 2)), missing_build=dict(drop=("bd", 1)), untagged=dict(untagged=True),
+              below_union=dict(pr_pages=30.0), above_sum=dict(pr_pages=120.0), bitwise=dict(diff_rows=1),
+              no_hit=dict(hit=False))[case]
     write_case(tmp_path, **kw)
     rc, g, s = summarize(tmp_path)
-    want = dict(missing_kernel="O_windows_all", untagged="O_windows_all", below_union="O_bounds_all",
+    want = dict(missing_kernel="O_windows_all", missing_build="O_windows_all", untagged="O_windows_all",
+                below_union="O_bounds_all",
                 above_sum="O_bounds_all", bitwise="O_cell_bitwise").get(case)
     if want is None:
         q = s["variants"]["all"]["quantities"]

@@ -9,18 +9,25 @@
 #                                        negative control)
 #   shared | shared-whole               --parts SG0,SG1,SG2,SG3 --draft-drop 0.5  (the shared kernel's output drives
 #                                        the tick; SG1-SG3 gate it bitwise against the BI serial REF)
+#   per_row                             --parts SG1 --draft-drop 0.0 --attn per_row (piece 3 only: the B 32 miniature
+#                                        that checks memory and SG1 coverage at this batch first; review MINOR-11)
+# ORDER (review MINOR-9, docs/R2_SHAREDKV_PLAN.md section 6): per_row, probe-plant, probe, probe-whole, shared,
+# shared-whole; stop at the first MUST failure. A probe result without a passed probe-plant is VOID (F2).
+# The shared module is frozen into the record (git show <sha>:<path>, hash checked) and the gate loads that copy
+# (review MINOR-7). [sharedkv2] NOSI is the r2-sharedkv2 worktree (the review fixes live there).
 # SOURCE ONLY, NOT RUN, NOT REVIEWED: it never submits, renews, cancels or replaces an allocation, never retries.
 #
 #   bash benchmarks/Efficiency/r2_sharedkv_step.sh --nosi <sha> <holder job> <run id> <arm>
 #   DRYRUN=1 bash benchmarks/Efficiency/r2_sharedkv_step.sh --nosi <sha> <holder job> <run id> <arm>
 #        (login node: the pin checks and the printed step command; no squeue, claim, srun or write)
-#   In DRYRUN only, TICK_HOLDERS=<dir> replaces HOLDERS (the CPU test uses it); a real run refuses TICK_HOLDERS.
+#   In DRYRUN only, TICK_HOLDERS=<dir> replaces HOLDERS, and TICK_PIN_BIATTN_SHA / TICK_PIN_BIATTN_BLOB replace the
+#   piece-3 pins (the CPU test test_step_dryrun_refusals_and_pins uses them); a real run refuses all three.
 #
 # OUTPUT: OUTROOT/skv_<arm>_<run>_<holder>/summary.json and the step record OUTROOT/skv_<arm>_<run>_<holder>.step/,
 # both frozen. EXIT: as r2_tick_step.sh (the gate's failed MUST count; 2 refusal; 3 / 4 GPU identity; 124 / 137
 # timeout; 1 STOP before the launch; 5 an exit-0 step with an incomplete record or a non-COMPLETED 0:0 sacct row).
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-sharedkv                                                 # ROOT (this branch)
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-sharedkv2                                                # ROOT (this branch)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -45,12 +52,12 @@ STEP_MIN=90
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 sharedkv step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_sharedkv_step.sh --nosi <sha> <holder> <run id> probe|probe-whole|probe-plant|shared|shared-whole" >&2
+usage() { echo "usage: r2_sharedkv_step.sh --nosi <sha> <holder> <run id> per_row|probe|probe-whole|probe-plant|shared|shared-whole" >&2
           exit 2; }
 [ $# = 5 ] && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4 ARM=$5
 case $ARM in
-    probe|probe-whole|probe-plant) PARTS=SG1 DROP=0.0 ;;
+    per_row|probe|probe-whole|probe-plant) PARTS=SG1 DROP=0.0 ;;
     shared|shared-whole) PARTS=SG0,SG1,SG2,SG3 DROP=0.5 ;;
     *) usage ;;
 esac
@@ -61,6 +68,11 @@ case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
 if [ -n "${TICK_HOLDERS:-}" ]; then
     [ "$DRY" = 1 ] || stop "TICK_HOLDERS is for DRYRUN (the CPU test) only"
     HOLDERS=$TICK_HOLDERS
+fi
+if [ -n "${TICK_PIN_BIATTN_SHA:-}${TICK_PIN_BIATTN_BLOB:-}" ]; then                     # the pin controls (CPU test)
+    [ "$DRY" = 1 ] || stop "TICK_PIN_BIATTN_SHA / TICK_PIN_BIATTN_BLOB are for DRYRUN (the CPU test) only"
+    BIATTN_SHA=${TICK_PIN_BIATTN_SHA:-$BIATTN_SHA}
+    BIATTN_BLOB=${TICK_PIN_BIATTN_BLOB:-$BIATTN_BLOB}
 fi
 UFILE=$HOLDERS/$JOB.gpu_uuid
 [ -f "$UFILE" ] || stop "no GPU uuid file $UFILE (the lead writes it for each holder)"
@@ -84,6 +96,7 @@ done
     stop "piece 3: $BIATTN_PATH at $BIATTN_SHA is not the blob $BIATTN_BLOB"
 [ "$(git -C "$NOSI" rev-parse -q --verify "$NSHA:$BIATTN_PATH")" = "$BIATTN_BLOB" ] ||
     stop "piece 3 in this tree ($NSHA:$BIATTN_PATH) is not the pinned blob $BIATTN_BLOB"
+SKV_BLOB=$(git -C "$NOSI" rev-parse -q --verify "$NSHA:$SKV_PATH") || stop "$SKV_PATH is not tracked at $NSHA"
 [ -f "$SIF" ] || stop "no image $SIF"
 [ "$(stat -c %s "$MODEL/model.safetensors" 2>/dev/null)" = "$MODEL_SIZE" ] || stop "model size is not $MODEL_SIZE"
 wl=$(sha256sum "$WL/c16k_tokens.bin" 2>/dev/null) || stop "no $WL/c16k_tokens.bin"
@@ -93,6 +106,7 @@ REC=$OUT.step
 JIT=$JITBASE/skv_${ARM}_${RUN}_$JOB
 NAME=skv-${ARM}-${RUN}-$JOB
 ATTN_MOD=$REC/piece3_bi_paged_attention.py
+SKV_MOD=$REC/bi_paged_attention_shared.py
 ENVS=(--env PYTHONPATH="$NOSI/nosi" --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONUNBUFFERED=1 --env HF_HUB_OFFLINE=1
       --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env TORCH_CUDA_ARCH_LIST=8.0
       --env TRITON_LIBCUDA_PATH=/.singularity.d/libs --env TRITON_CACHE_DIR="$JIT/triton"
@@ -117,10 +131,10 @@ ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) sr
       "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_tick_gate.py" --out "$OUT" --model "$MODEL"
       --workload "$WL" --biattn "$ATTN_MOD" --gemm "$GEMM" --batch "$BATCH" --S 16128 --deltas "$DELTAS"
       --steps "$STEPS" --sg0-steps 64 --K 3 --LAMBDA 7 --draft-drop "$DROP" --seed 7 --m-fix "$M_FIX"
-      --sg4-steps 32 --phase 3 --parts "$PARTS" --attn "$ARM" --sharedkv "$NOSI/$SKV_PATH")
+      --sg4-steps 32 --phase 3 --parts "$PARTS" --attn "$ARM" --sharedkv "$SKV_MOD")
 if [ "$DRY" = 1 ]; then
     echo "R2 sharedkv step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob workload $WL_SHA gpu_uuid $GPU_UUID ($UFILE)"
-    echo "R2 sharedkv step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; arm $ARM parts $PARTS drop $DROP; B $BATCH M_FIX $M_FIX"
+    echo "R2 sharedkv step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; shared $SKV_BLOB -> $SKV_MOD; arm $ARM parts $PARTS drop $DROP; B $BATCH M_FIX $M_FIX"
     printf '%q ' "${ARGV[@]}"
     echo
     exit 0
@@ -147,12 +161,14 @@ mkdir "$REC" && mkdir -p "$JIT/tmp" || stop "cannot create $REC / $JIT (skv_acti
 busy=$(nosteps) || stop "a step is running in $JOB under the claim: '$busy' (skv_active stays)"
 git -C "$NOSI" show "$BIATTN_BLOB" > "$ATTN_MOD" && [ "$(git hash-object -- "$ATTN_MOD")" = "$BIATTN_BLOB" ] ||
     stop "cannot copy piece 3's blob $BIATTN_BLOB to $ATTN_MOD (skv_active stays)"
+git -C "$NOSI" show "$SKV_BLOB" > "$SKV_MOD" && [ "$(git hash-object -- "$SKV_MOD")" = "$SKV_BLOB" ] ||
+    stop "cannot copy the shared module's blob $SKV_BLOB to $SKV_MOD (skv_active stays)"
 printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/command.txt (skv_active stays)"
 printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s workload=%s utc_start=%s\n' "$NSHA" \
     "$blob" "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "$WL_SHA" "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
     stop "cannot write $REC (skv_active stays)"
-printf 'biattn=%s:%s blob=%s copy=%s sharedkv=%s arm=%s parts=%s gemm=%s batch=%s m_fix=%s splits=%s steps=%s draft_drop=%s\n' \
-    "$BIATTN_SHA" "$BIATTN_PATH" "$BIATTN_BLOB" "$ATTN_MOD" "$NSHA:$SKV_PATH" "$ARM" "$PARTS" "$GEMM" "$BATCH" "$M_FIX" \
+printf 'biattn=%s:%s blob=%s copy=%s sharedkv=%s blob=%s copy=%s arm=%s parts=%s gemm=%s batch=%s m_fix=%s splits=%s steps=%s draft_drop=%s\n' \
+    "$BIATTN_SHA" "$BIATTN_PATH" "$BIATTN_BLOB" "$ATTN_MOD" "$NSHA:$SKV_PATH" "$SKV_BLOB" "$SKV_MOD" "$ARM" "$PARTS" "$GEMM" "$BATCH" "$M_FIX" \
     "$SPLITS" "$STEPS" "$DROP" >> "$REC/command.txt" || stop "cannot write $REC (skv_active stays)"
 "${ARGV[@]}" < /dev/null > "$REC/stdout.txt" 2> "$REC/stderr.txt"
 rc=$?
