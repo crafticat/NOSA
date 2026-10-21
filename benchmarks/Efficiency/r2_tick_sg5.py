@@ -27,7 +27,10 @@ documents when B > 94, labelled):
            in-flight wait of S-C, C's Q6), memory (peak retained, slots), refusals, masked fraction, decision reads,
            void ticks, the twins' step cost (the 'twin' category: both shape-stable means every step).
     BARE   with --bare, the same round with only the tick events (the instrumentation's own cost).
-  SWEEP    --sweep C:X,... (R_ver = X / 2) with the first mode and backend, --sweep-steps tokens: the same report.
+  SWEEP    --sweep C:X,... (R_ver = X / 2) with the first mode and the FIRST BACKEND OF --backends THAT PASSED ITS
+           PREFLIGHT (recorded as sweep_backend; none passed: a REPORT "sweep skipped: no backend passed"; p3 took the
+           first backend of the list and so skipped the whole sweep when S-C's preflight failed), --sweep-steps tokens:
+           the same report.
 MUST gates: every run completes (no exception; a CapacityRefusal is reported with its configuration), no void tick,
 the twins' counters equal the host mirrors after each round, the gilfree team ran on the requested threads.
 OUTPUT: --out/summary.json (after every run). The last stdout line is R2_TICK_SG5_DONE failed=<n>; exit = n (2 =
@@ -430,14 +433,17 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
     return info
 
 
-def preflight(a, model, cache, st, first, ops, ext, gates, res):
+def preflight(a, model, cache, st, first, ops, ext, gates, res, engine_fn=None, round_fn=None):
     """PREFLIGHT (lead, 2026-10-22: an integration fault must cost minutes, not the whole step): before the long arms,
     a SHORT free-running round (--preflight-steps committed tokens per request: draft rows, the first verify ticks,
     their decisions) per backend on the run's transport (MUST; a backend that fails is not run in the long arms), and
     on the gather transport too when the run's is gilfree (REPORT: does the fault follow the transport?). Returns the
-    backends that passed on the run's transport (all of them with --preflight-steps 0)."""
+    backends that passed on the run's transport (all of them with --preflight-steps 0). engine_fn / round_fn: the
+    CPU test's stand-ins of make_engine / r2_tick.run_round (default: the real ones)."""
     import torch
-    from nosi.r2_tick import run_round
+    if round_fn is None:
+        from nosi.r2_tick import run_round as round_fn
+    engine_fn = engine_fn or make_engine
     if a.preflight_steps <= 0:
         return list(a.backends)
     tps = [a.transport] + (["gather"] if a.transport == "gilfree" else [])
@@ -450,10 +456,11 @@ def preflight(a, model, cache, st, first, ops, ext, gates, res):
             t0 = time.time()
             eng = svc = tp = None
             try:
-                eng, svc, tp = make_engine(a, model, cache, st, ops, kind, a.C, a.X, a.R_ver, ext, timer_cats=("tick",),
-                                           transport=tpname)
-                rnd = run_round(eng, first, [a.preflight_steps] * eng.B, K=a.K, LAMBDA=a.LAMBDA)
-                torch.cuda.synchronize()
+                eng, svc, tp = engine_fn(a, model, cache, st, ops, kind, a.C, a.X, a.R_ver, ext, timer_cats=("tick",),
+                                         transport=tpname)
+                rnd = round_fn(eng, first, [a.preflight_steps] * eng.B, K=a.K, LAMBDA=a.LAMBDA)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 mirror = eng.mirror_failures()
                 good = not mirror and rnd.syncs > 0
                 detail = "%d ticks, %d decision ticks, twin counters %s, %.0f s" % (
@@ -473,6 +480,46 @@ def preflight(a, model, cache, st, first, ops, ext, gates, res):
                 ok.append(kind)
     res["preflight"] = out
     return ok
+
+
+def sweep_backend(order, passed):
+    """The sweep's backend: the FIRST backend of the step's --backends order that PASSED its preflight; None when none
+    did. (p3 used order[0] whatever its preflight: its S-C preflight failed, so the whole sweep was skipped.)"""
+    for kind in order:
+        if kind in passed:
+            return kind
+    return None
+
+
+def run_sweep(a, make_ops, passed, gates, res, save, point):
+    """The sweep (--sweep C:X,...; R_ver = X / 2) on sweep_backend(a.backends, passed), recorded as
+    res["sweep_backend"]; with no backend passed, a REPORT "sweep skipped: no backend passed". point(ops, kind, C, X,
+    R_ver, label) runs one sweep point (one_point); its failures are REPORTS (a configuration result, e.g. a
+    CapacityRefusal), as before."""
+    res["sweep"] = []
+    if not a.sweep_pts:
+        res["sweep_backend"] = None
+        return
+    kind = sweep_backend(a.backends, passed)
+    res["sweep_backend"] = kind
+    if kind is None:
+        gates.append(GB.gate("R_SG5sweep_skipped", True, False, "sweep skipped: no backend passed (preflight order %s)"
+                             % (list(a.backends),)))
+        save()
+        return
+    log("SWEEP on %s: the first backend of %s that passed its preflight" % (kind, list(a.backends)))
+    ops = make_ops()
+    for (C, X, R_ver) in a.sweep_pts:
+        label = "SG5sweep_%s_C%d_X%d" % (kind, C, X)
+        log(label)
+        try:
+            res["sweep"].append(point(ops, kind, C, X, R_ver, label))
+        except Exception as e:
+            traceback.print_exc()
+            gates.append(GB.gate("R_" + label, True, False, "EXCEPTION %s: %s (a configuration result, "
+                                 "e.g. a CapacityRefusal)" % (type(e).__name__, str(e)[:400])))
+        GB.free()
+        save()
 
 
 def main(argv=None) -> int:
@@ -560,21 +607,9 @@ def main(argv=None) -> int:
                                              % (type(e).__name__, str(e)[:400])))
                     GB.free()
                     save()
-            res["sweep"] = []
-            if a.sweep_pts and a.backends[0] in backends:
-                ops = BIOps(attn, a.m_fix, gemm=a.modes[0])
-                for (C, X, R_ver) in a.sweep_pts:
-                    label = "SG5sweep_%s_C%d_X%d" % (a.backends[0], C, X)
-                    log(label)
-                    try:
-                        res["sweep"].append(one_point(a, model, cache, st, first, ops, a.backends[0], C, X, R_ver, ext,
-                                                      a.sweep_steps, T_shipped, gates, label))
-                    except Exception as e:
-                        traceback.print_exc()
-                        gates.append(GB.gate("R_" + label, True, False, "EXCEPTION %s: %s (a configuration result, "
-                                             "e.g. a CapacityRefusal)" % (type(e).__name__, str(e)[:400])))
-                    GB.free()
-                    save()
+            run_sweep(a, lambda: BIOps(attn, a.m_fix, gemm=a.modes[0]), backends, gates, res, save,
+                      lambda ops, kind, C, X, R_ver, label: one_point(a, model, cache, st, first, ops, kind, C, X, R_ver,
+                                                                      ext, a.sweep_steps, T_shipped, gates, label))
         meta["peak_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 2)
         save()
         for g in gates:

@@ -1136,3 +1136,69 @@ def test_T19_sg5_step_script_uuid_file_and_pins(tmp_path):
     r = subprocess.run(["bash", str(script), "--nosi", head.stdout.strip(), "416", "t1", "s9"], env=e,
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 2 and "usage" in r.stderr
+
+
+def test_T20_the_sweep_runs_on_the_first_backend_that_passed_its_preflight():
+    """T20 (the p3 sweep flaw): with --backends sc,sb,v1 and S-C failing its stand-in preflight (an engine stand-in that
+    raises a CapacityRefusal-like error for sc), preflight returns [sb, v1] and the sweep runs every point on sb,
+    recording sweep_backend sb; with no backend passed it runs nothing and records the REPORT "sweep skipped: no
+    backend passed"; with all passed it uses the list's first. Negative controls: a planted chooser that takes
+    order[0] (p3's rule) fails the same property check; run_sweep and main contain no a.backends[0]."""
+    G = _sg5_gate()
+    base = ["--out", "o", "--workload", "w", "--biattn", "b", "--gilfree", "g", "--gilfree-build", "/x"]
+    a = G.parse_args(base + ["--sweep", "64:16,96:32", "--transport", "gather"])
+    assert a.backends == ["sc", "sb", "v1"]
+
+    class Eng:
+        B = 2
+
+        def mirror_failures(self):
+            return []
+
+    class Tp:
+        def close(self):
+            pass
+
+    def engine_fn(a_, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=None, transport=None):
+        if kind == "sc":
+            raise RuntimeError("CapacityRefusal (stand-in): the verifier's urgent misses found no slot")
+        return Eng(), None, Tp()
+    gates, res = [], {}
+    passed = G.preflight(a, None, None, None, [0, 0], None, None, gates, res, engine_fn=engine_fn,
+                         round_fn=lambda eng, first, max_new, K, LAMBDA: SimpleNamespace(ticks=9, syncs=5))
+    assert passed == ["sb", "v1"]
+    pf = {g["name"]: g for g in gates}
+    assert not pf["SG5_preflight_gather_sc"]["passed"] and pf["SG5_preflight_gather_sb"]["passed"]
+    calls = []
+
+    def point(ops, kind, C, X, R_ver, label):
+        calls.append((kind, C, X, R_ver, label, ops))
+        return dict(kind=kind, C=C)
+    G.run_sweep(a, lambda: "OPS", passed, gates, res, lambda: None, point)
+    assert [c[0] for c in calls] == ["sb", "sb"] and res["sweep_backend"] == "sb"
+    assert [c[4] for c in calls] == ["SG5sweep_sb_C64_X16", "SG5sweep_sb_C96_X32"] and [c[3] for c in calls] == [8, 16]
+    assert all(c[5] == "OPS" for c in calls) and len(res["sweep"]) == 2
+    g2, r2, c2 = [], {}, []
+    G.run_sweep(a, lambda: "OPS", [], g2, r2, lambda: None, lambda *x: c2.append(x))
+    assert not c2 and r2["sweep_backend"] is None and r2["sweep"] == []
+    assert g2[-1]["name"] == "R_SG5sweep_skipped" and not g2[-1]["must"] and g2[-1]["passed"]
+    assert "sweep skipped: no backend passed" in g2[-1]["detail"]
+    g3, r3, c3 = [], {}, []
+    G.run_sweep(a, lambda: "OPS", ["v1", "sc", "sb"], g3, r3, lambda: None, lambda ops, kind, *x: c3.append(kind))
+    assert c3 == ["sc", "sc"] and r3["sweep_backend"] == "sc"
+
+    def property_holds(choose):
+        import itertools
+        for order in itertools.permutations(["sc", "sb", "v1"]):
+            for n in range(4):
+                for passed_ in itertools.combinations(order, n):
+                    want = next((k for k in order if k in passed_), None)
+                    if choose(list(order), list(passed_)) != want:
+                        return False
+        return True
+    assert property_holds(G.sweep_backend)
+    assert not property_holds(lambda order, passed_: order[0])          # NEGATIVE CONTROL: p3's rule
+    src = (EFF / "r2_tick_sg5.py").read_text()
+    for name in ("run_sweep", "main"):
+        fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == name)
+        assert "a.backends[0]" not in ast.get_source_segment(src, fn), name
