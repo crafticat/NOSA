@@ -406,6 +406,7 @@ def make_engine(ops, S_list=S_TINY, steps=STEPS, seed=1, cls=None, width_S=max(S
 RES = _load("r2_residency")
 RSB = _load("r2_residency_sb")
 RSC = _load("r2_residency_sc")
+OWN2 = _load("r2_own2")                                                    # [b2] OwnResidency (B's B2)
 KTR = sys.modules[PKG + ".kstep.transfer"]
 
 
@@ -427,11 +428,12 @@ class Be:
 
 
 def make_res_engine(ops, kind="v1", C=12, X=24, R_ver=4, S_list=S_TINY, steps=STEPS, seed=1, backend_cls=None,
-                    mode="delay", **kw):
+                    mode="delay", svc_kw=None, **kw):
     """make_engine's state on the RESIDENCY layout (TickEngine.from_r2(hist_slots=C + X)): C + X empty historical
     slots per stream, the same tail rings; the prompt's K / V in the host rows; piece 5's service (kind v1 / sb / sc,
-    C's 2ec08da) with K3X's adversarial transport (seeded delays, reordering, bursts) over the engine's store, the cis
-    tables = the twins' exact banks; a ResidencyBackend attached."""
+    C's 2ec08da; [b2] b2 = OwnResidency, checked unless svc_kw says otherwise) with K3X's adversarial transport (seeded
+    delays, reordering, bursts) over the engine's store, the cis tables = the twins' exact banks; a ResidencyBackend
+    attached. [b2] svc_kw: more service arguments (b2: checked, b2_mut)."""
     ref = make_engine(ops, S_list=S_list, steps=steps, seed=seed)          # the twins and the data, then re-laid out
     B, NBr = len(S_list), C + X
     n_host = (ref.NB + 1) * BS
@@ -465,10 +467,13 @@ def make_res_engine(ops, kind="v1", C=12, X=24, R_ver=4, S_list=S_TINY, steps=ST
     cis = [t.total_cis[:B] for t in eng.twins]
     args = (NL_LAYERS, B, HKV, C, X, R_ver, tp, gather)
     skw = dict(store_b=sb, cis=cis, block_bytes=BS * 2 * D * 4, host_wait=be.host_wait)
+    skw.update(svc_kw or {})                                                # [b2]
     if kind == "v1":
         svc = RES.Residency(*args, **skw)
     elif kind == "sb":
         svc = RSB.ResidencySB(*args, device="cpu", nblk=n_host // BS, **skw)
+    elif kind == "b2":                                                      # [b2] B2 on the CPU stand-in device
+        svc = OWN2.OwnResidency(*args, device="cpu", nblk=n_host // BS, **skw)
     else:
         svc = RSC.ResidencySC(*args, device="cpu", nblk=n_host // BS, **skw)
     eng.attach_backend((backend_cls or TK.ResidencyBackend)(eng, svc, host_k, host_v, lambda: Ev(True), 3))
@@ -661,9 +666,9 @@ class NoHostCopy(TK.ResidencyBackend):
         self.svc.history_written(b, blk, self.new_event())
 
 
-@pytest.mark.parametrize("kind", ["v1", "sb", "sc"])
+@pytest.mark.parametrize("kind", ["v1", "sb", "sc", "b2"])                    # [b2] b2: OwnResidency, checked
 def test_T15_residency_backend_equals_the_resident_store(p3, ref, kind):
-    """T15 (the SG5 seam): the teacher-forced tick on piece 5's Residency (v1 / S-B / S-C, C's 2ec08da) under K3X's
+    """T15 (the SG5 seam): the teacher-forced tick on piece 5's Residency (v1 / S-B / S-C, C's 2ec08da; B2) under K3X's
     adversarial transport: every verify row torch.equal to the serial row (= the ResidentStore tick, T4), the committed
     sequences the teacher's, the twins' counters the mirrors; the service fetched blocks (transfers issued, urgent misses
     or waits seen), the decoded blocks went through the host rows (write-backs registered), drafts read READY blocks
@@ -1078,7 +1083,7 @@ def test_T19_sg5_step_script_uuid_file_and_pins(tmp_path):
     """T19: r2_tick_sg5_step.sh: the uuid file rules (missing, "GPU-" prefix, two lines: STOP before any other check;
     SG5_HOLDERS outside DRYRUN refused); the pins (piece 3 v2, the packer's two blobs of f2b981a); on a clean checkout
     at HEAD the DRYRUN prints the uuid, the pins and the arguments of the primary point and the sweep, and the cells
-    (_t19_cells: default = p3's arguments, p4a, p4b-<b>, p4sc64); in the step's own ROOT a DRYRUN stop FAILS.
+    (_t19_cells: default = p3's arguments, p4a, p4b-<b>, p4sc64, [b2] p5b2); in the step's own ROOT a DRYRUN stop FAILS.
     Static: the claim sg5_active, STEP_MIN, --export=NONE, no awk / python3 / perl outside comments."""
     script = EFF / "r2_tick_sg5_step.sh"
     text = script.read_text()
@@ -1165,10 +1170,11 @@ def _t19_cells(script, env, sha):
     """T19, the CELLS (the lead's two-step p4 plan): the DEFAULT prints p3's arguments token for token; p4a = p3's
     arguments without the sweep (the harness's --sweep default "" gives no sweep point); p4b-<b> = --modes exact
     --backends <b> with the 9-point sweep; p4sc64 = --backends sc --X 64, both modes, no sweep, and the harness's
-    equal-memory pool C + X + 4 - 64 = 100 (68 elsewhere; printed by the DRYRUN, the harness's line pinned); the cell
-    and the transport in either order; the cell's names (out, record, JIT, job name). Negative controls: every cell's
-    arguments differ from p3's (the comparison discriminates); a bare p4b, an unknown cell or backend (p4sc32), two
-    cells, two transports, or 7 words: usage, exit 2."""
+    equal-memory pool C + X + 4 - 64 = 100 (68 elsewhere; printed by the DRYRUN, the harness's line pinned); [b2] p5b2
+    = p4sc64's arguments with --backends b2 (unchecked: no --b2-checked), pool 100; the cell and the transport in either
+    order; the cell's names (out, record, JIT, job name). Negative controls: every cell's arguments differ from p3's
+    (the comparison discriminates); a bare p4b, an unknown cell or backend (p4sc32, p5sc, p5b2c), two cells (p5b2 with
+    p4sc64 too), two transports, or 7 words: usage, exit 2."""
     def dry(*words):
         return subprocess.run(["bash", str(script), "--nosi", sha, "416", "t1", *words], env=env, capture_output=True,
                               text=True, timeout=120)
@@ -1197,6 +1203,10 @@ def _t19_cells(script, env, sha):
     want["p4sc64"] = (P3_SG5_ARGS.format(n="t1_416_p4sc64").replace(P3_SG5_SWEEP, "")
                       .replace(P3_SG5_POINTS, "--modes exact,fast --backends sc").replace(" --X 32 ", " --X 64 "))
     shape["p4sc64"] = (["sc"], ["exact", "fast"], 0, 64)
+    want["p5b2"] = want["p4sc64"].replace("t1_416_p4sc64", "t1_416_p5b2").replace("--backends sc ",      # [b2]
+                                                                                   "--backends b2 ")
+    shape["p5b2"] = (["b2"], ["exact", "fast"], 0, 64)                                             # [b2]
+    assert "--b2-checked" not in want["p5b2"] and want["p5b2"] != want["p4sc64"]                  # [b2] unchecked
     for cell, exp in want.items():
         assert exp != p3 and (P3_SG5_SWEEP in exp) == (shape[cell][2] == 9)
         for words in ((cell,), (cell, "gilfree"), ("gilfree", cell)):
@@ -1213,13 +1223,16 @@ def _t19_cells(script, env, sha):
             assert (pa.C, pa.X, pa.R_ver, pa.batch, pa.S, pa.transport, pa.threads) == (96, X, 16, 64, 16128,
                                                                                          "gilfree", 8)
             pool = pa.C + pa.X + 4 - 64                                # the harness's rule (asserted above)
-            assert pool == (100 if cell == "p4sc64" else 68)
+            assert pool == (100 if cell in ("p4sc64", "p5b2") else 68)                       # [b2] p5b2
+            if cell == "p5b2":                                                                  # [b2]
+                assert pa.b2_checked is False                                               # the timed path
             assert "NOSI_POOL_BLOCKS = C + X + 4 - 64 = %d" % pool in r.stdout, cell
             assert "C 96 X %d R_ver 16" % X in r.stdout
     r = dry("gather", "p4a")
     assert r.returncode == 0 and args(r.stdout) == want["p4a"].replace("--transport gilfree", "--transport gather")
     for bad in (("p4b",), ("p4c",), ("p4b-s9",), ("p4a", "p4a"), ("p4a", "p4b-sb"), ("gather", "gilfree"),
-                ("p4a", "gather", "x"), ("P4A",), ("p4sc32",), ("p4sc64", "p4a")):
+                ("p4a", "gather", "x"), ("P4A",), ("p4sc32",), ("p4sc64", "p4a"),
+                ("p5sc",), ("p5b2c",), ("p5b2", "p4sc64")):                                    # [b2]
         r = dry(*bad)
         assert r.returncode == 2 and "usage" in r.stderr, bad
 

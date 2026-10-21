@@ -1,8 +1,9 @@
 #!/bin/bash
 # R2 MILESTONE 2, STEP 7, PIECE 4, SG5: ONE bounded GPU step in an EXISTING holder that runs benchmarks/Efficiency/
 # r2_tick_sg5.py: the R-PERF budget of the flattened tick (nosi/nosi/r2_tick.py) on piece 5's Residency (r2_residency*.py,
-# C's 2ec08da: backends sc / sb / v1; the gilfree transport over agent E's packer v2), in EXACT and FAST GEMM modes,
-# at the primary point C 96 / X 32 / R_ver 16 (C's recommendation after holder 2190876: at C 80 the verifier's urgent
+# C's 2ec08da: backends sc / sb / v1; [b2] b2 = r2_own2.py; the gilfree transport over agent E's packer v2), in EXACT
+# and FAST GEMM modes, at the primary point C 96 / X 32 / R_ver 16 (C's recommendation after holder 2190876: at C 80 the
+# verifier's urgent
 # misses were refused), then C's sweep C {64, 80, 96} x X {16, 32, 64} (R_ver = X / 2; a refusal there is REPORTED).
 # B = 64 documents of pg19-test-c16k, S = 16128, 48 committed tokens per request (24 in the sweep). T_shipped (and the
 # equal-memory shipped decode, NOSI_POOL_BLOCKS = C + X + 4 - 64) in child processes. REPORT; MUST = the runs complete.
@@ -30,6 +31,10 @@
 #            --R-ver 16, no sweep, 48 steps, gilfree 8 threads, the superset wait (CudaDeviceOps' default). The
 #            harness's equal-memory shipped baseline follows: NOSI_POOL_BLOCKS = C + X + 4 - 64 = 100 (the DRYRUN
 #            prints it)
+#   p5b2     [b2] B2 as the service (OwnResidency, r2_own2.py: B's array-backed ownership table on the store's device,
+#            S-C's device path, UNCHECKED: the harness's default without --b2-checked) at p4sc64's point: --modes
+#            exact,fast --backends b2 --C 96 --X 64 --R-ver 16, no sweep, 48 steps, gilfree 8 threads, the superset
+#            wait; NOSI_POOL_BLOCKS = 100
 #   STEP_MIN 120 in every cell.
 #
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
@@ -41,6 +46,18 @@
 #   R-EQ REPORT: the equal-memory shipped baseline at NOSI_POOL_BLOCKS 100
 #   P-SG5-1..8 (frozen for p3) apply to both S-C points
 #
+# REGISTERED for p5b2 ([b2], 2026-10-21, before the run; docs/R2_STEP7_TICK_SG5.md section 7 has the derivation and
+# the scoring rules; the reference is p4sc64's record sg5_p4_2190876_p4sc64, S-C at the same point):
+#   B-A  the b2 gilfree preflight PASSES (MUST); a refusal or an exception there is REFUTED
+#   B-T  the b2 EXACT round tick 1.2-2.6 s (point 2.1 s; S-C 6.61 s); FALSIFIED above 3.3 s or below 0.9 s
+#   B-F  REPORT: the b2 FAST round tick within 10 % of b2 EXACT's
+#   B-S  residual (T_tick minus the categorized device time) 0.85-1.2 s (S-C 5.49 s): the end_tick term is gone;
+#        FALSIFIED above 1.5 s
+#   B-R  REPORT: twin, gemm, att, sel, store within 15 % of S-C's; res 0.1-1.0 s (S-C 0.94 s)
+#   B-D  REPORT: the b2 draft-only tick 0.5-1.5 s (S-C 4.72 s)
+#   B-Q  REPORT: ratio about 0.02 (S-C 0.006)
+#   B-K  REPORT: report()["k5"] (the demand peak), report()["b2"], draft_only.sc / residency.sc, meta.peak_gb
+#
 # OUTPUT: OUTROOT/sg5_<run>_<holder>[_<cell>]/summary.json (+ the children's shipped_*.json), and the step record
 # OUTROOT/sg5_<run>_<holder>[_<cell>].step/ (command with the uuid, its file, the pins and the cell, the copies, stdout
 # with one GATE / REPORT line per gate, stderr, exit + accounting, sacct row), both frozen. The job name is
@@ -49,7 +66,7 @@
 # 124 / 137 the host timeout; 1 a STOP before the launch (a missing or malformed uuid file included); 5 an exit-0 step
 # whose record is incomplete or whose sacct row is not COMPLETED 0:0.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-m2-sg5-p4d                                               # ROOT (p4d; p4a: -p4c; p3: nosi-r2-m2-sg5)
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-m2-sg5-b2                                                # ROOT ([b2] p5b2; p4sc64: -p4d; p4a: -p4c; p3: nosi-r2-m2-sg5)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -75,7 +92,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -84,7 +101,7 @@ TRANSPORT= CELL=
 for w in "$@"; do
     case $w in
         gilfree|gather) [ -z "$TRANSPORT" ] || usage; TRANSPORT=$w ;;
-        p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64) [ -z "$CELL" ] || usage; CELL=$w ;;
+        p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2) [ -z "$CELL" ] || usage; CELL=$w ;;
         *) usage ;;
     esac
 done
@@ -99,6 +116,7 @@ case $CELL in
     p4a) SWEEP_RUN= ; SUFFIX=_p4a ;;                        # the six points; --sweep left out (its default "": none)
     p4b-*) MODES=exact ; BACKENDS=${CELL#p4b-} ; SUFFIX=_$CELL ;;   # one backend, EXACT, then the 9-point sweep
     p4sc64) BACKENDS=sc ; PX=64 ; SWEEP_RUN= ; SUFFIX=_p4sc64 ;;   # S-C only at X 64, both modes, no sweep
+    p5b2) BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_p5b2 ;;       # [b2] B2 only at p4sc64's point, unchecked
 esac
 EQ_POOL=$((PC + PX + 4 - 64))                               # r2_tick_sg5.py's equal-memory NOSI_POOL_BLOCKS
 SWEEPARG=()
@@ -128,6 +146,7 @@ for f in benchmarks/Efficiency/r2_tick_sg5.py benchmarks/Efficiency/r2_g0bi_gate
          nosi/nosi/r2_decode_path.py nosi/nosi/r2_decode_body.py nosi/nosi/r2_positional_twin.py \
          nosi/nosi/r2_spec_core.py nosi/nosi/stage1_seqused.py nosi/nosi/max_pooling_per_request.py \
          nosi/nosi/r2_residency.py nosi/nosi/r2_residency_sb.py nosi/nosi/r2_residency_sc.py \
+         nosi/nosi/r2_residency_sparse.py nosi/nosi/r2_own2.py nosi/nosi/r2_own2_ops.py \
          nosi/nosi/r2_transport_gilfree.py nosi/nosi/kstep/ownership.py nosi/nosi/kstep/transfer.py; do
     git -C "$NOSI" rev-parse -q --verify "$NSHA:$f" > /dev/null || stop "$f is not tracked at $NSHA"
 done

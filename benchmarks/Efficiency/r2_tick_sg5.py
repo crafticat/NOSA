@@ -12,7 +12,9 @@ documents when B > 94, labelled):
            its own store); its pinned host rows are the Residency's host rows; its twins are copied into every engine
            (TickEngine.from_r2(hist_slots = C + X): the store of C + X historical slots + 4 tail pages per stream).
   per GEMM mode (--modes: exact = G-b PaddedLinear(4B), fast = natural cuBLAS) and per residency backend (--backends:
-  sc = ResidencySC, sb = ResidencySB, v1 = Residency; C's 2ec08da), at the PRIMARY point (--C, --X, --R-ver):
+  sc = ResidencySC, sb = ResidencySB, v1 = Residency; C's 2ec08da; [b2] b2 = OwnResidency, B's array-backed ownership
+  table on the store's device over S-C's device path, unchecked unless --b2-checked: r2_own2.py), at the PRIMARY
+  point (--C, --X, --R-ver):
     T_d    the DRAFT-ONLY tick: --draft-ticks ticks of B draft rows (each draft key decided when its cohort's positions
            are drafted), per-op CUDA events.
     TRANSPORT  --transport gilfree (D5, the default: C's adapter over agent E's packer v2) or gather (GatherTransport
@@ -53,7 +55,7 @@ sys.path.insert(0, HERE)
 import r2_g0_gate as G0  # noqa: E402  (load_workload)
 import r2_g0bi_gate as GB  # noqa: E402  (load_by_path, free, gate)
 
-BACKENDS = ("sc", "sb", "v1")
+BACKENDS = ("sc", "sb", "v1", "b2")                                                     # [b2] b2: OwnResidency
 MODES = ("exact", "fast")
 TRANSPORTS = ("gilfree", "gather")
 
@@ -95,6 +97,8 @@ def parse_args(argv):
                     help="PREFLIGHT: a short round per backend and transport before the long arms (0: none)")
     ap.add_argument("--twin", default="torch", choices=("torch", "fused"),                       # [twin-variant]
                     help="the twins' unchecked step: torch ops (default) or r2_twin_fused (one kernel per layer)")
+    ap.add_argument("--b2-checked", action="store_true",                                         # [b2]
+                    help="b2: every B2 predicate (checked mode); default: unchecked (the timed path)")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -303,6 +307,12 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
         svc = Residency(*args, **kw)
     elif kind == "sb":
         svc = ResidencySB(*args, device="cuda", nblk=n_host // 64, **kw)
+    elif kind == "b2":                                               # [b2] B2's table on the store's device; S-C's
+        from nosi.r2_own2 import OwnResidency                        # [b2] device path: CudaDeviceOps (the superset
+        lazy = _LazyOps()                                            # [b2] wait) behind _LazyOps, as sc
+        svc = OwnResidency(*args, device=eng.store_k[0].device, nblk=n_host // 64, devops=lazy,             # [b2]
+                           checked=bool(getattr(a, "b2_checked", False)), **kw)                               # [b2]
+        lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)       # [b2]
     else:
         lazy = _LazyOps()
         svc = ResidencySC(*args, device="cuda", nblk=n_host // 64, devops=lazy, **kw)
@@ -393,6 +403,8 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
     import torch
     from nosi.r2_tick import run_round
     info = dict(backend=kind, C=C, X=X, R_ver=R_ver, gemm=ops.mode, steps=steps)
+    if kind == "b2":                                                 # [b2] the mode (report()["b2"] repeats it)
+        info["b2_checked"] = bool(getattr(a, "b2_checked", False))
     # T_d: the draft-only tick
     eng, svc, tp = make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext)
     try:

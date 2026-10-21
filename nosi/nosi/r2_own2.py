@@ -44,17 +44,19 @@ from . import r2_own2_ops as O
 from .kstep.backend import ev_done
 from .kstep.errors import CapacityRefusal, OwnershipViolation, StaleGeneration
 from .kstep.executor import DRAFT, VERIFY
-from .kstep.ownership import FREE, INFLIGHT, LRU, PO, RELEASING, VRES, LayerPool
+from .kstep.ownership import FREE, INFLIGHT, LRU, PO, RELEASING, VRES, LayerPool, Stream
 from .kstep.transfer import Transfer
-from .r2_residency import Plan, Row
+from .r2_residency import N_TAIL, Plan, Row
 from .r2_residency_sc import C_FREE, C_INFLIGHT, C_LRU, C_PO, C_RELEASING, C_VRES
 from .r2_residency_sparse import DREC, VREC, ResidencySparse
 
 STATE_OF = {C_FREE: FREE, C_INFLIGHT: INFLIGHT, C_LRU: LRU, C_PO: PO, C_VRES: VRES, C_RELEASING: RELEASING}
 CLS_OF = {0: None, O.CLS_AD: "ad", O.CLS_V: "v"}
+_SH32 = torch.arange(32, dtype=torch.int64)
+# no_read_harvest (SG5 b2): the 4.8 lifetimes get no read counts from the table (report()["k48"] differs from S-C's)
 B2_MUTS = ("no_dedup_check", "mirror_ignores_owner", "owner_blind", "no_uid_check", "free_on_cancel", "one_batch",
            "ignore_flags", "no_t4", "no_reader_wait", "drop_rd_last", "keep_rd_last_on_drop", "poll_order_swapped",
-           "key_alias", "rec_mut")
+           "key_alias", "rec_mut", "no_read_harvest")
 REC_MUTS = ("take_nonfree", "take_swap", "k5_over", "pe_not_first", "drop_refusal", "drop_v_merge", "drop_d_merge",
             "drop_ready", "drop_rowsel", "drop_vread", "ignore_overflow", "reverse_stamps", "evict_po_unpinned",
             "gen_plus_two")
@@ -90,7 +92,10 @@ class OwnResidency(ResidencySparse):
         self._ver = 0
         self._view = None
         self._view_ver = -1
-        self.rec_mut_done = None                          # (tick, kind) of an applied record mutation
+        self._hc = None                                   # the table's host columns of version _hc_ver (projections)
+        self._hc_ver = -1
+        self._sviews: Dict[Tuple[int, int, int], Stream] = {}   # (l, b, h) -> its lazy projection (stream())
+        self.rec_mut_done = None                         # (tick, kind) of an applied record mutation
         self.b2_applied = 0                               # ticks applied by the B2 consumer
         self.__dict__["_own_ready"] = True
 
@@ -114,59 +119,137 @@ class OwnResidency(ResidencySparse):
         """The table as vendored LayerPool objects (cached per table version; read-only by contract)."""
         if self._view is not None and self._view_ver == self._ver:
             return self._view
-        T, G = self.own, self.own.geo
-        cols = {n: T.c[n].to("cpu") for n in ("code", "block", "gen", "uid", "cls", "stamp", "rd_first", "rd_last",
-                                             "seq")}
-        pins = T.pin_w.to("cpu")
-        sh = torch.arange(32, dtype=torch.int64)
+        hc = self._host_cols()
         pools = []
         for l in range(self.L):
             pool = LayerPool(l, self.B, self.H, self.C, self.X, self.R_ver)
             for (b, h), st in pool.streams.items():
-                st.owner = self._owner_py[b]
-                code = cols["code"][l, b, h].tolist()
-                blk = cols["block"][l, b, h].tolist()
-                gen = cols["gen"][l, b, h].tolist()
-                uid = cols["uid"][l, b, h].tolist()
-                cls = cols["cls"][l, b, h].tolist()
-                stamp = cols["stamp"][l, b, h].tolist()
-                rf = cols["rd_first"][l, b, h].tolist()
-                rl = cols["rd_last"][l, b, h].tolist()
-                seq = cols["seq"][l, b, h].tolist()
-                lru = []
-                for i, s in enumerate(st.slots):
-                    c = code[i]
-                    s.state = STATE_OF[c]
-                    s.block = blk[i]
-                    s.gen = gen[i]
-                    s.owner = self._uid_obj.get(uid[i]) if uid[i] >= 0 else None
-                    s.cls = CLS_OF[cls[i]]
-                    s.first_reader = self._evobj.get(rf[i]) if rf[i] >= 0 else None
-                    s.last_reader = self._evobj.get(rl[i]) if rl[i] >= 0 else None
-                    s.seq = seq[i] if c == C_INFLIGHT else None
-                    if c == C_LRU:
-                        lru.append((stamp[i], blk[i], i))
-                    elif c == C_PO:
-                        st.po[blk[i]] = i
-                    elif c == C_VRES:
-                        st.vres[blk[i]] = i
-                    elif c == C_INFLIGHT and st.owner is not None and s.owner == st.owner:
-                        st.pending[blk[i]] = i
-                for (_, bk, i) in sorted(lru):
-                    st.lru[bk] = i
-                for plane in range(2 * self.KEYS):
-                    words = pins[plane, l, b, h]
-                    if not bool(words.any()):
-                        continue
-                    key = self._key_of.get((b, plane % self.KEYS))
-                    kind = VERIFY if plane < self.KEYS else DRAFT
-                    bits = (torch.bitwise_and(torch.bitwise_right_shift(words.unsqueeze(-1), sh), 1) != 0).reshape(-1)
-                    for bk in bits[:self.nblk].nonzero().view(-1).tolist():
-                        st.prot.setdefault(bk, set()).add(key)
-                        st.pin_kind.setdefault(bk, {}).setdefault(key, set()).add(kind)
+                self._fill_stream(st, l, b, h, hc)
             pools.append(pool)
         self._view, self._view_ver = pools, self._ver
         return pools
+
+    def _host_cols(self) -> Dict[str, Any]:
+        """The table's columns on the host, ONE copy per table version (the projections read them); the pin planes
+        that hold a bit, per stream."""
+        if self._hc is not None and self._hc_ver == self._ver:
+            return self._hc
+        T = self.own
+        hc: Dict[str, Any] = {n: T.c[n].to("cpu") for n in ("code", "block", "gen", "uid", "cls", "stamp", "rd_first",
+                                                             "rd_last", "seq")}
+        pins = T.pin_w.to("cpu")
+        planes: Dict[Tuple[int, int, int], List[int]] = {}
+        for (p, l, b, h) in pins.any(-1).nonzero().tolist():         # plane-major: each stream's planes ascending
+            planes.setdefault((l, b, h), []).append(p)
+        hc["pins"], hc["planes"] = pins, planes
+        self._hc, self._hc_ver = hc, self._ver
+        self._sviews = {}
+        return hc
+
+    def _fill_stream(self, st: Stream, l: int, b: int, h: int, hc: Dict[str, Any]) -> None:
+        """One vendored Stream (fresh: no slot taken) set to the table's stream (l, b, h)."""
+        st.owner = self._owner_py[b]
+        code = hc["code"][l, b, h].tolist()
+        blk = hc["block"][l, b, h].tolist()
+        gen = hc["gen"][l, b, h].tolist()
+        uid = hc["uid"][l, b, h].tolist()
+        cls = hc["cls"][l, b, h].tolist()
+        stamp = hc["stamp"][l, b, h].tolist()
+        rf = hc["rd_first"][l, b, h].tolist()
+        rl = hc["rd_last"][l, b, h].tolist()
+        seq = hc["seq"][l, b, h].tolist()
+        lru = []
+        for i, s in enumerate(st.slots):
+            c = code[i]
+            s.state = STATE_OF[c]
+            s.block = blk[i]
+            s.gen = gen[i]
+            s.owner = self._uid_obj.get(uid[i]) if uid[i] >= 0 else None
+            s.cls = CLS_OF[cls[i]]
+            s.first_reader = self._evobj.get(rf[i]) if rf[i] >= 0 else None
+            s.last_reader = self._evobj.get(rl[i]) if rl[i] >= 0 else None
+            s.seq = seq[i] if c == C_INFLIGHT else None
+            if c == C_LRU:
+                lru.append((stamp[i], blk[i], i))
+            elif c == C_PO:
+                st.po[blk[i]] = i
+            elif c == C_VRES:
+                st.vres[blk[i]] = i
+            elif c == C_INFLIGHT and st.owner is not None and s.owner == st.owner:
+                st.pending[blk[i]] = i
+        for (_, bk, i) in sorted(lru):
+            st.lru[bk] = i
+        for plane in hc["planes"].get((l, b, h), ()):
+            words = hc["pins"][plane, l, b, h]
+            key = self._key_of.get((b, plane % self.KEYS))
+            kind = VERIFY if plane < self.KEYS else DRAFT
+            bits = (torch.bitwise_and(torch.bitwise_right_shift(words.unsqueeze(-1), _SH32), 1) != 0).reshape(-1)
+            for bk in bits[:self.nblk].nonzero().view(-1).tolist():
+                st.prot.setdefault(bk, set()).add(key)
+                st.pin_kind.setdefault(bk, {}).setdefault(key, set()).add(kind)
+
+    def stream(self, l: int, b: int, h: int):
+        """One stream's read-only projection. Lazy (SG5 b2): from the whole projection when it is current, else ONE
+        stream built from the host columns of this table version (cached until the table changes). Metrics.report
+        reads one stream per lifetime record; the whole projection at SG5's p5b2 point (L 32, B 64, H 8, C + X 160)
+        is 2.6 M Slot objects."""
+        if not self.__dict__.get("_own_ready"):
+            return super().stream(l, b, h)
+        if self._view is not None and self._view_ver == self._ver:
+            return self._view[l].stream(b, h)
+        hc = self._host_cols()
+        st = self._sviews.get((l, b, h))
+        if st is None:
+            st = Stream(l, h, b, self.C + self.X, self.C)
+            self._fill_stream(st, l, b, h, hc)
+            self._sviews[(l, b, h)] = st
+        return st
+
+    def memory(self) -> Dict[str, int]:
+        """Residency.memory (r2_residency.py:799-812) on the table: ONE host read of the state counts. Metrics samples
+        it at every poll and end_tick; the vendored version would build the whole projection each time."""
+        if not self.__dict__.get("_own_ready"):
+            return super().memory()
+        code = self.own.c["code"]
+        n = torch.stack([(code == x).sum() for x in (C_INFLIGHT, C_LRU, C_PO, C_VRES, C_RELEASING)]).tolist()
+        inflight, lru, po, vres, rel = (int(x) for x in n)
+        as_lru = bool(self.mut.vres_counted_as_lru)
+        c = dict(inflight=inflight, lru=lru + (vres if as_lru else 0), po=po, vres=0 if as_lru else vres,
+                 releasing=0 if self.mut.mem_no_releasing else rel)
+        c["slots_used"] = sum(c.values())
+        c["slots_physical"] = self.L * self.B * self.H * (self.n_hist + N_TAIL + self.n_trash)
+        c["retained"] = c["po"] + c["vres"]
+        return c
+
+    def _flush_reads(self) -> None:
+        """The 4.8 read counts (Metrics.lifetimes rd / rv) of the lifetimes whose slot was NOT taken again: the table
+        holds them (rd_n / rv_n; a take resets them, and _host_side moves the old ones into their lifetime first).
+        One host copy of three columns. no_read_harvest (NEGATIVE CONTROL): none."""
+        if self.b2_mut.get("no_read_harvest") or not self.metrics.lifetimes:
+            return
+        G = self.own.geo
+        keys = list(self.metrics.lifetimes)
+        kt = torch.tensor(keys, dtype=torch.int64)
+        f = ((kt[:, 0] * G.B + kt[:, 1]) * G.H + kt[:, 2]) * G.NPOS + kt[:, 3]
+        gen, rd, rv = (self.own.flat(n).to("cpu")[f] for n in ("gen", "rd_n", "rv_n"))
+        cur = (gen.to(torch.int64) == kt[:, 4]).tolist()
+        rd, rv = rd.tolist(), rv.tolist()
+        for i, k in enumerate(keys):
+            if cur[i]:
+                rec = self.metrics.lifetimes[k]
+                rec["rd"], rec["rv"] = int(rd[i]), int(rv[i])
+
+    def report(self) -> Dict:
+        """S-C's report (Residency's 4.3 / 4.6 / 4.8 and "k5") on the table (the lifetimes' read counts flushed from
+        the table first), plus "b2": the mode, the ticks applied, the key slots, the reader ids, the table's size and
+        the mirror's form (a device copy of the table per tick: no host delta, so mirror_slots_uploaded stays 0)."""
+        self._flush_reads()
+        out = super().report()
+        out["b2"] = dict(checked=self.checked, applied_ticks=self.b2_applied, keys=self.KEYS, reader_ids=self.win.next,
+                         reader_live=self.win.next - self.win.lo,
+                         table_bytes=sum(t.numel() * t.element_size() for t in self.own.tensors().values()),
+                         mirror="the table's columns copied on the device at each tick's first resolve (no host delta)")
+        return out
 
     def _in_flight(self, l: int, b: int, h: int, t: int):
         """The CURRENT owner's transfer in flight for (l, b, h, block t) (res.py:509-517), the owner from the table."""
@@ -224,6 +307,7 @@ class OwnResidency(ResidencySparse):
         k = free[0]
         self._kslot[key] = k
         self._key_of[(b, k)] = key
+        self._changed()                                               # the projection names the keys of the slots
         return k
 
     def _key_live(self, b: int, k: int, key) -> bool:
@@ -469,11 +553,11 @@ class OwnResidency(ResidencySparse):
         parts = [self._flags[n].to(torch.int64).reshape(1) for n in names]
         for st in steps:
             rec = st["rec"]
-            if st["vdec"] is not None:
-                parts += [rec["vcnt"].reshape(1), st["vdec"].counters.reshape(-1)[:1]]
+            if st["vdec"] is not None:                                # (the looks too: no read per layer, SG5 b2)
+                parts += [rec["vcnt"].reshape(1), st["vdec"].counters.reshape(-1)[:1], rec["vlook"].reshape(-1)]
             if st["ddec"] is not None:
                 parts += [rec["dcnt"].reshape(1), st["ddec"].counters.reshape(-1)[:3]]
-        flat = self._d2h(torch.cat(parts)).tolist()                   # ONE read (the flags and the counts)
+        flat = self._d2h(torch.cat(parts)).tolist()                   # ONE read (the flags, the counts, the looks)
         self.flag_values = dict(zip(names, flat[:len(names)]))
         raised = sorted(n for n, v in self.flag_values.items() if v)
         if raised:
@@ -488,6 +572,9 @@ class OwnResidency(ResidencySparse):
             if st["vdec"] is not None:
                 p["nv"], p["over"] = int(flat[at]), int(flat[at + 1])
                 at += 2
+                Rv = int(st["vdec"].Rv)
+                p["vlook"] = [flat[at + 4 * jj:at + 4 * jj + 4] for jj in range(Rv)]   # (Rv, 4): rec["vlook"]
+                at += 4 * Rv
                 if p["nv"] > cap_v:
                     capped.append((st["l"], "verify", p["nv"], cap_v))
                 if p["over"] > 0:
@@ -564,7 +651,7 @@ class OwnResidency(ResidencySparse):
             sel[l] = rec["sel"]
             if st["vdec"] is not None:
                 vread[l] = rec["vread"]
-                vlook[l] = rec["vlook"].tolist()
+                vlook[l] = p["vlook"]                                 # read with the counts (apply_tick)
         row_b = torch.tensor([r.b for r in trows], dtype=torch.int64, device=d)
         row_plane = torch.tensor([self._kslot[r.key] + (0 if r.kind == "v" else self.KEYS) for r in trows],
                                  dtype=torch.int64, device=d)
@@ -605,8 +692,23 @@ class OwnResidency(ResidencySparse):
         else:
             tc = O.take_checks(T, ev, so)                             # T4 and the holes stay refusals unchecked
             note(dict(t4=tc["t4"]) if not self.b2_mut.get("no_t4") else {})
+        # the K5 REPORT (S-C's _extra_need, report()["k5"]; SG5 b2): per stream its verify takes (GRANT / EVICT)
+        # beyond its FREE base slots C - usage at the tick's start, summed per layer; read with the predicates
+        need_l = None
+        if P["V"] is not None:
+            V0 = P["V"]
+            tv = O.has(V0["flags"], O.GRANT) | O.has(V0["flags"], O.EVICT)
+            s_tv = V0["s"][tv]
+            nf = torch.zeros(G.S, dtype=torch.int64, device=d).index_add_(0, s_tv, torch.ones_like(s_tv))
+            use0 = (T.c["code"] != C_FREE).view(G.S, G.NPOS).sum(1)
+            need_l = (nf - (self.C - use0).clamp(min=0)).clamp(min=0).view(L, B * H).sum(1)
         names = list(pre)
-        vals = torch.stack([pre[n] for n in names]).tolist() if names else []
+        parts_pre = [torch.stack([pre[n] for n in names]).to(torch.int64)] if names else []
+        if need_l is not None:
+            parts_pre.append(need_l.to(torch.int64))
+        vals = torch.cat(parts_pre).tolist() if parts_pre else []
+        need = vals[len(names):]
+        vals = vals[:len(names)]
         viol = {n: int(v) for n, v in zip(names, vals) if v}
         if viol:
             self._raise_pre(viol, P, ev, rows)
@@ -624,7 +726,13 @@ class OwnResidency(ResidencySparse):
             vrd = T.flat("rd_last")[fpe].tolist()
             for i, q in enumerate(pe.tolist()):
                 victims.append((int(ev["l"][q]), int(ev["b"][q]), int(ev["h"][q]), vblk[i], vcode[i], vrd[i]))
+        # the take slots' generation and read counts before the writes (the 4.8 lifetime they end; SG5 b2), in the
+        # order of write_takes' takes
+        tkq = (ev["kind"] != 2).nonzero().squeeze(1)
+        f_old = ev["s"][tkq] * G.NPOS + ev["take_slot"][tkq]
+        old = torch.stack([T.flat(n)[f_old].to(torch.int64) for n in ("gen", "rd_n", "rv_n")])
         # ---------------------------------------------------------------- the writes
+        self._changed()                                               # (a raise below leaves no stale projection)
         gen_before = T.c["gen"].clone() if checked else None
         undo = O.Undo() if checked else None
         if undo is not None:
@@ -654,6 +762,10 @@ class OwnResidency(ResidencySparse):
                 raise OwnershipViolation("B2 post-write predicates %s fail: the tick is void (rolled back)" % sorted(bad))
         elif int(rc["bad"]):
             raise OwnershipViolation("B2: a draft row read a block that is no longer resident at the recency update")
+        if need_l is not None:                                        # the K5 REPORT of the committed tick
+            for p in info:
+                if p["st"]["vdec"] is not None:
+                    self._note_extra_need(p["st"]["l"], int(need[p["st"]["l"]]))
         # ---------------------------------------------------------------- the readers (the layers' events)
         e_l = torch.tensor([self._rid(self._layer_ev.get(l)) for l in range(L)], dtype=torch.int64, device=d)
         if self.b2_mut.get("rec_mut") == "drop_vread":
@@ -661,7 +773,7 @@ class OwnResidency(ResidencySparse):
         O.read_done(T, vread, P["D"], rows, e_l)
         self._changed()
         # ---------------------------------------------------------------- the host side
-        self._host_side(steps, info, P, ev, takes, victims, rc, rows, vlook, fv, fd)
+        self._host_side(steps, info, P, ev, takes, victims, rc, rows, vlook, fv, fd, old)
 
     def _raise_pre(self, viol: Dict[str, int], P, ev, rows) -> None:
         """A pre-write predicate failed: the tick is void before any change. The message names the predicates (and the
@@ -681,10 +793,11 @@ class OwnResidency(ResidencySparse):
         msg = "; ".join("%s x%d: %s" % (n, v, what.get(n, n)) for n, v in sorted(viol.items()))
         raise OwnershipViolation("B2 pre-write predicates fail (the tick is void, nothing applied): " + msg)
 
-    def _host_side(self, steps, info, P, ev, takes, victims, rc, rows, vlook, fv, fd) -> None:
+    def _host_side(self, steps, info, P, ev, takes, victims, rc, rows, vlook, fv, fd, old) -> None:
         """After the commit: the transfers of the takes (vendored Transfer objects, on the transport), Policy E's
         victims (verifier_evictions; the superseded prefetches), the demand merges, the refusals, the looks (4.3 / 4.6),
-        the journal, the release queue, the layer plans (masked, draft pairs, refusals)."""
+        the journal, the release queue, the layer plans (masked, draft pairs, refusals). old (3, takes): each take
+        slot's generation and read counts before the tick: the 4.8 lifetime that the take ends gets them (SG5 b2)."""
         G = self.own.geo
         V, D = P["V"], P["D"]
         vrows, drows = steps[0]["vrows"], steps[0]["drows"]
@@ -715,12 +828,19 @@ class OwnResidency(ResidencySparse):
         lt, bt, ht = takes["l"].tolist(), takes["b"].tolist(), takes["h"].tolist()
         blk, slot, gen = takes["blk"].tolist(), takes["slot"].tolist(), takes["gen"].tolist()
         rdo = takes["rd_old"].tolist()
+        og, ordn, orvn = old.tolist()
+        harvest = not self.b2_mut.get("no_read_harvest")
+        lifetimes = self.metrics.lifetimes
         by_layer: Dict[int, List[Transfer]] = {}
         new_trs = []
         for i, q in enumerate(tk):
             j = jrow[q]
             isv = part[q] == 0
             r = vrows[j] if isv else drows[j]
+            if harvest:                                               # the ended lifetime's reads (4.8, SG5 b2)
+                rec = lifetimes.get((lt[i], bt[i], ht[i], slot[i], og[i]))
+                if rec is not None:
+                    rec["rd"], rec["rv"] = ordn[i], orvn[i]
             self.seq += 1
             prev = self._evobj.get(rdo[i]) if rdo[i] >= 0 else None
             if self.b2_mut.get("drop_rd_last"):
@@ -754,8 +874,8 @@ class OwnResidency(ResidencySparse):
                 if tr is not None and not self.mut.drop_demand_merge:
                     tr.demand.add(DRAFT)
             nref = int(O.has(D["flags"], O.REFUSED).sum())
-            for _ in range(nref):
-                self.metrics.count("draft_refused")
+            if nref:
+                self.metrics.count("draft_refused", nref)
         # the journal of the recency (touch, acquire, evict_to_c)
         self._count("touch", int(rc["touch"]))
         self._count("acquire", int(rc["acquire"]))

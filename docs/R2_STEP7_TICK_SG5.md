@@ -142,3 +142,44 @@ The lead's decision is to measure S-C at X 64. The step's merge base is C's 7c13
 - `results.sweep` is [] and `results.sweep_backend` is null.
 - `meta.args.X` is 64.
 - `meta.build_gb` should rise against p3's 17.73 GB, because the store holds C + X + 4 = 164 slots per stream instead of 132. The expected value is about 22 GB (REPORT).
+
+## 7. [b2] The p5b2 cell: B2 as the service, and its registration (agent B, 2026-10-21, before the run)
+
+Branch `feature/nosi-r2-m2-sg5-b2` (worktree `/mnt/beegfs/ojerbi/nosi-r2-m2-sg5-b2`): the verify agent's p4d head 3ae7d3b, B's own2b 3fbf8a7 (B2, and through it C's sparse head 771045d), the verify agent's 825665b (S-C's counters).
+
+**What the cell runs.** `p5b2` = p4sc64's arguments with `--backends b2`: both GEMM modes, C 96 / X 64 / R_ver 16, no sweep, 48 steps, gilfree at 8 threads, the superset wait, NOSI_POOL_BLOCKS 100. T19 pins the arguments.
+
+**The b2 backend (`make_engine`, marked `[b2]`).**
+- The service is `OwnResidency` (`nosi/nosi/r2_own2.py`). Its ownership table lives on the store's device. It runs `pin_records=False`.
+- It keeps S-C's device path: `device_verify` / `device_draft` on the device mirror, the superset wait and the urgent gather of `CudaDeviceOps` behind `_LazyOps` (as sc), and C's sparse record with rowsel.
+- The timed path is UNCHECKED. `--b2-checked` turns on every B2 predicate. The cell does not pass it.
+- The gates are sc's: completed, bookkeeping, gilfree team. The record adds `info.b2_checked` and `report()["b2"]`. `report()["k5"]` now holds the demand peak of the passing ticks too: B2 computes it in the apply and reads it with its predicates (no extra device read).
+- Three fixes on the GPU path (`r2_own2.py`): `memory()` counts the table (one read; the vendored version built 2.6 M slot objects at every poll and end_tick), `stream()` builds one stream at a time (for `Metrics.report`), and the per-layer looks ride in the one read of the counts. The 4.8 lifetimes get their read counts from the table (at a take, and at the report).
+
+**The model (the lead's, from p4sc64's record `sg5_p4_2190876_p4sc64`, EXACT; ms per round tick).**
+
+| term | S-C (p4sc64) | b2 (expected) | why |
+|---|---|---|---|
+| poll + end_tick (host backend 5645 - res 936) | 4709 | 80-250 | B2's apply: device ops 11-16 ms at C + X 128 (b2tg2), about 13-20 at 160; the host side per take (Transfer objects, metrics, the arrivals loop: 7.7 k takes per tick, 468010 / 61) 60-200; about 25 host reads |
+| res (the service's resolve, host-bound) | 936 | 100-1000 | + the sparse record per layer (10-30); - S-C's host mirror delta, which B2 replaces with a device copy (0 if the lead's model holds; 550-850 by the engine agent's registration, unmeasured) |
+| rest (residual - poll - end_tick: finish_tick, decisions, write-backs) | 778 | 778 | the same engine and round |
+| twin | 122 | 122 | the same |
+| gemm + att + sel + store | 61 | 61 | the same |
+| **T_tick** | **6606** | **2100 point** | 1897 (the lead's split) + 150 (B2) + 20 (record); 1400 if the mirror delta is 700 |
+
+**Registered for p5b2 (the scoring rules follow the table):**
+
+| ID | registered | key paths | rule |
+|---|---|---|---|
+| B-A | the b2 gilfree preflight PASSES | gate `SG5_preflight_gilfree_b2` (MUST) | PASS = CONFIRMED. A refusal or an exception = REFUTED; the full message in `stderr.txt` is tabulated (named risks: a CUDA-only fault in B2's glue, which never ran on a GPU; a key-slot refusal, I13, KEYS 7; an out-of-memory). |
+| B-T | the b2 EXACT round tick 1.2-2.6 s (point 2.1 s) | `T_tick_ms` of `SG5_exact_b2` | In the band = CONFIRMED. 2.6-3.3 s or 0.9-1.2 s = NEAR (I give the term that moved). Above 3.3 s or below 0.9 s = FALSIFIED: above, B2 keeps more than a third of S-C's 4.7 s; below, the remaining terms are not what the model says. |
+| B-F | the b2 FAST round tick within 10 % of b2 EXACT's | `T_tick_ms` of `SG5_fast_b2` | REPORT (S-C: 6452 vs 6606). |
+| B-S | the residual 0.85-1.2 s (S-C 5.49 s) | `round.residual_ms.mean` | In the band = CONFIRMED: the end_tick term is gone and B2's own term is 0.1-0.4 s. Above 1.5 s = FALSIFIED. |
+| B-R | twin, gemm, att, sel, store within 15 % of S-C's; res 0.1-1.0 s | `round.device_ms.*.mean` | REPORT. res below 0.6 s means S-C's host mirror delta was a large part of S-C's res (the engine agent's claim). |
+| B-D | the b2 draft-only tick 0.5-1.5 s (S-C 4.72 s) | `draft_only.device_ms.tick.mean` | REPORT (S-C's draft-only end_tick is 3.76 s; its rest is about 0). |
+| B-Q | ratio r x T_shipped / T_tick about 0.02 (S-C 0.006) | `ratio` | REPORT. B2 alone does not reach the design target: res + rest stay above 0.9 s of host work. |
+| B-K | REPORT: `report()["k5"]` (the demand peak at X 64, its tick and layer), `report()["b2"]`, `draft_only.sc` / `residency.sc` (`mirror_slots_uploaded` is 0 for b2: a device copy), `meta.peak_gb` (p4sc64 67.41 GB; B2 adds its table, about 0.25 GB, and its temporaries) | as named | REPORT. |
+
+**Expected record shape (integrity, before any score):** command.txt holds `cell=p5b2 modes=exact,fast backends=b2 C=96 X=64 R_ver=16 eq_pool=100` and `sweep=none`; stdout holds 10 gate lines (shipped_baseline, R_shipped_equal_memory, `SG5_preflight_gilfree_b2`, `R_SG5_preflight_gather_b2`, and for `SG5_exact_b2` and `SG5_fast_b2` each `_completed`, `_bookkeeping`, `_gilfree_team`); every point has `b2_checked` false.
+
+**CPU tests (source only, not run).** `tests_cpu/test_r2_tick_b2.py`: TB1 b2 (checked and unchecked) = sc at every tick of the teacher-forced round, at two capacities (rows, tokens, logits, page tables, B's snapshot of the service state, counters, readers, memory; the committed tokens, the journal and the report at the end); TB2 the free-running round; TB3 a planted record defect (drop_rowsel) differs at its tick, and no_read_harvest changes only k48; TB4 the k5 demand on C's F26 / F25 schedules; TB5 the harness's b2 parts. `test_r2_tick.py`: T15 runs b2 too; T19 has the cell p5b2.
