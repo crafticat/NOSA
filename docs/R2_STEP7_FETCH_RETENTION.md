@@ -1134,6 +1134,42 @@ TEST F26 (dense and sparse):
 - F25's refused p4a case reports 48 at layer 0, tick 1.
 - Negative control: a service that notes the demand against the next layer reports another layer.
 
+## 12r. REPORT: the exact wait's spin rounds and the wait's phases (fg6's layer-0 excess; R2_FG6_PAPER_METRICS.md)
+
+THE QUESTION. In fg6 the exact wait cost 331.8 of its 1,002.1 ms in layer 0 (4.0 ms per verify tick); every other
+layer cost 0.26 ms per tick. The record cannot tell whether layer 0 spun on the board (a late publication), or
+whether the main stream idled while the host enqueued the wait (the submission waits, the wait list, the launch).
+
+THE INSTRUMENTS (`r2_residency_sc.py`):
+- SPIN ROUNDS per layer, on the device:
+  - `board_wait_kernel` adds each call's rounds (summed over its blocks of up to 1,024 entries) into
+    `CudaDeviceOps.spins[l]`, an int64 cell. The program is a single program, so it uses a plain read and write.
+  - It is a fixed buffer, so a captured tick counts too.
+  - `spin_counts()` reads it after a run, never in a tick. The CPU stand-in (`ExactWaitSim`) counts one round per
+    entry and spin, in `spins_by_layer` / `spin_counts()`.
+- THE PHASES of every wait call (opt-in: `CudaDeviceOps.profile = []`; eager ticks only; a capture records nothing):
+  - a host clock and a timing event on the main stream at four bounds;
+  - pre (exact: `_submitted`), list (exact: `wait_list`) and wait (exact: the spin program; superset: the event
+    waits);
+  - `wait_profile()` (one synchronize, after the run) returns `wait_profile_summary`: per layer and in total, the
+    calls, each phase's host and device ms, and the spin rounds.
+- How to read it:
+  - a device phase much longer than its host phase: the main stream waited on the device (spinning, or event waits);
+  - a host phase as long as its device phase: the stream waited for the host to enqueue.
+
+THE FG DRIVER (`r2_fetch_fg.py`, on the FG branch, not on this branch) needs three lines at its next merge:
+1. `dops.profile = []` after `make_sc` builds the devops.
+2. `info["wait_profile"] = dops.wait_profile()` after the arm.
+3. Print the per-layer rows of layers 0-2.
+Its own `TimedOps` span stays as the outer total.
+
+TEST F27:
+- The stand-in counts [3, 2] spin rounds (3 in-flight entries at layer 0, 2 at layer 1, each landed by one round),
+  err clear.
+- Negative control: a transport that never publishes: [12, 8] (max_spin 4 per entry), err set.
+- The profile summary sums known calls (two exact calls at layer 0, one superset call at layer 1) to the expected
+  per-layer host and device phases.
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,

@@ -80,6 +80,7 @@ host-to-device copies (the mirror delta, the row inputs) and one device-to-host 
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 from typing import Dict, List, Sequence, Set, Tuple
 
@@ -627,6 +628,40 @@ def wait_list(dec: VerifyDecision, l: int, board: GenBoard) -> Tuple[torch.Tenso
             torch.where(infl, dec.t["infl_gen"], dec.t["ev_gen"]))
 
 
+WAIT_PHASES = ("pre", "list", "wait")
+
+
+def wait_profile_summary(entries, L: int, spins=None) -> Dict:
+    """REPORT (CudaDeviceOps.wait_profile; pure, so the CPU tests check it): entries [(l, m0, m1, m2, m3)] with each m =
+    (host seconds, an event whose elapsed_time(other) is in ms). The phases of one wait call:
+      pre   m0 -> m1   exact: the submission host-waits (_submitted)
+      list  m1 -> m2   exact: wait_list's device ops
+      wait  m2 -> m3   exact: the spin program; superset: the event waits (m0 = m1 = m2)
+    Per layer and in total: the calls, each phase's host ms and device ms (0 for a phase whose bounds are one mark),
+    and the spin rounds. A device phase much longer than its host phase is time the main stream spent waiting on the
+    device; a host phase as long as its device phase means the stream waited for the host to enqueue."""
+    keys = ["host_%s_ms" % p for p in WAIT_PHASES] + ["device_%s_ms" % p for p in WAIT_PHASES]
+    per = []
+    for l in range(L):
+        d = dict(layer=l, calls=0, spins=None if spins is None else spins[l])
+        d.update({k: 0.0 for k in keys})
+        per.append(d)
+    for (l, m0, m1, m2, m3) in entries:
+        p = per[l]
+        p["calls"] += 1
+        for name, a, b in zip(WAIT_PHASES, (m0, m1, m2), (m1, m2, m3)):
+            p["host_%s_ms" % name] += 1e3 * (b[0] - a[0])
+            if a[1] is not b[1]:
+                p["device_%s_ms" % name] += a[1].elapsed_time(b[1])
+    for p in per:
+        for k in keys:
+            p[k] = round(p[k], 4)
+    total = {k: round(sum(p[k] for p in per), 3) for k in keys}
+    total["calls"] = sum(p["calls"] for p in per)
+    total["spins"] = None if spins is None else sum(spins)
+    return dict(per_layer=per, total=total)
+
+
 class PublishingTransport:
     """The CPU stand-in of the publication, around a K3X transport that cannot publish itself (the tests'
     AdversarialTransport): the K3X interface passes through unchanged (the same deliveries, the same pending list),
@@ -698,6 +733,7 @@ class ExactWaitSim(CpuDeviceSim):
         self.max_spin, self.stale_ok = int(max_spin), bool(stale_ok)
         self.err = torch.zeros((), dtype=torch.bool, device=svc.device)
         self.spins = 0
+        self.spins_by_layer = [0] * svc.L                 # REPORT: spin rounds per layer (CudaDeviceOps.spins' stand-in)
 
     def wait(self, l: int, dec: VerifyDecision) -> None:
         board = self.svc.board
@@ -715,7 +751,13 @@ class ExactWaitSim(CpuDeviceSim):
             if got < want or (not self.stale_ok and got != g):
                 self.err |= True
             self.spins += k
+            self.spins_by_layer[l] += k
             self.waited += 1
+
+    def spin_counts(self) -> List[int]:
+        """REPORT: the spin rounds per layer over the run. Here one round per entry and spin; the GPU kernel counts one
+        round per spin of a block of up to 1024 entries (CudaDeviceOps.spin_counts)."""
+        return list(self.spins_by_layer)
 
 
 # The exact wait's Triton kernel (note 12f). ONE program (one SM: the scatter stream's kernels keep the others) walks
@@ -727,7 +769,8 @@ class ExactWaitSim(CpuDeviceSim):
 # defined" from a factory's local import; test F23 guards every kernel we own).
 if triton is not None:
     @triton.jit
-    def board_wait_kernel(board_ptr, idx_ptr, gen_ptr, n, err_ptr, max_spin, BLOCK: tl.constexpr):
+    def board_wait_kernel(board_ptr, idx_ptr, gen_ptr, n, err_ptr, max_spin, spins_ptr, BLOCK: tl.constexpr):
+        total = 0                                         # REPORT: the spin rounds of this call (all its blocks)
         for start in range(0, n, BLOCK):
             offs = start + tl.arange(0, BLOCK)
             inb = offs < n
@@ -741,6 +784,9 @@ if triton is not None:
                 got = tl.load(board_ptr + safe, mask=live, other=0, volatile=True)
                 k += 1
             tl.atomic_max(err_ptr, tl.max((live & (got != want)).to(tl.int32), axis=0))
+            total += k
+        # one program: the layer's counter (an int64 cell) is read and written by this call only (stream order)
+        tl.store(spins_ptr, tl.load(spins_ptr) + total)
 else:                                                     # pragma: no cover - environment dependent
     board_wait_kernel = None
 
@@ -775,6 +821,28 @@ class CudaDeviceOps:
         self.err = torch.zeros((), dtype=torch.int32, device=svc.device)
         self.events_waited = 0
         self.submission_waits = 0
+        # REPORT: the exact wait's spin rounds per layer, on the device (the program adds each call's rounds; a fixed
+        # buffer, so a captured tick counts too); read by spin_counts() after a run, never in a tick
+        self.spins = torch.zeros((svc.L,), dtype=torch.int64, device=svc.device)
+        # REPORT (opt-in: a list; eager ticks only, a capture records nothing): per wait call (layer, m0, m1, m2, m3),
+        # each m = (host clock, timing event on the main stream) at the phase bounds; wait_profile() sums them
+        self.profile = None
+
+    def _mark(self):
+        """REPORT: a host clock and a timing event recorded on the main stream now (the wait's phase bounds)."""
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        return time.perf_counter(), e
+
+    def spin_counts(self) -> List[int]:
+        """REPORT: the exact wait's spin rounds per layer over the run (one device read; call it after the run). The
+        program counts one round per spin of a block of up to 1024 wait-list entries."""
+        return [int(x) for x in self.spins.tolist()]
+
+    def wait_profile(self) -> Dict:
+        """REPORT: wait_profile_summary of the recorded calls and the spin rounds (one synchronize; after the run)."""
+        torch.cuda.synchronize()
+        return wait_profile_summary(self.profile or [], self.svc.L, self.spin_counts())
 
     def _submitted(self, l: int) -> None:
         """LIVENESS (the eager tick): every transfer in flight at layer l is SUBMITTED before the main stream may wait
@@ -792,11 +860,23 @@ class CudaDeviceOps:
                 self.submission_waits += 1
 
     def wait(self, l: int, dec: VerifyDecision) -> None:
+        prof = self.profile is not None and not torch.cuda.is_current_stream_capturing()   # REPORT (opt-in)
+        m0 = self._mark() if prof else None
         if self.wait_mode == "exact":
             self._submitted(l)
+            m1 = self._mark() if prof else None
             idx, gen = wait_list(dec, l, self.svc.board)
-            _wait_kernel()[(1,)](self.svc.board.t, idx, gen, idx.shape[0], self.err, self.max_spin, BLOCK=1024)
+            m2 = self._mark() if prof else None
+            _wait_kernel()[(1,)](self.svc.board.t, idx, gen, idx.shape[0], self.err, self.max_spin,
+                                 self.spins[l:l + 1], BLOCK=1024)
+            if prof:
+                self.profile.append((l, m0, m1, m2, self._mark()))
             return
+        self._superset_wait(l)
+        if prof:
+            self.profile.append((l, m0, m0, m0, self._mark()))     # superset: one phase, the event waits
+
+    def _superset_wait(self, l: int) -> None:
         main = torch.cuda.current_stream()
         seen = set()
         for tr in list(self.svc.inflight.values()):

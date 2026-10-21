@@ -1031,7 +1031,8 @@ def test_F12d_sc_per_layer_path_has_no_host_transfer():
     import inspect
     d2h = FORBIDDEN + ("_d2h(",)
     for fn in (SC.ResidencySC.resolve, SC.DeviceMirror.layer, SC.device_verify, SB.device_draft, SB.rank_in_group,
-               SC.CudaDeviceOps.wait, SC.CudaDeviceOps.gather, SC.wait_list, SC._selected_mask):
+               SC.CudaDeviceOps.wait, SC.CudaDeviceOps._superset_wait, SC.CudaDeviceOps.gather, SC.wait_list,
+               SC._selected_mask):
         src = inspect.getsource(fn)
         assert [tok for tok in d2h + H2D if tok in src] == [], fn.__qualname__
     assert [tok for tok in d2h if tok in inspect.getsource(SB.ResidencySB.resolve)] != []
@@ -2483,6 +2484,7 @@ def _cuda_ops_on_cpu(svc, w, log):
     ops.wait_mode, ops.max_spin = "superset", 1
     ops.err = torch.zeros((), dtype=torch.int32)
     ops.events_waited = ops.submission_waits = 0
+    ops.spins, ops.profile = torch.zeros((svc.L,), dtype=torch.int64), None     # the REPORT fields (F27), off
 
     def copy(dst, src, ids, what):
         for h, per_b in enumerate(ids.tolist()):
@@ -2830,3 +2832,66 @@ def test_F26_the_k5_report_holds_the_peak_shared_extra_demand_of_a_passing_run(k
     if kind == "sc":
         kn = _f26(WrongLayerK5).svc.report()["k5"]
         assert (kn["at_layer"], kn["by_layer"]) != (0, [7, 6]), kn
+
+
+# =====================================================================================================================
+# F27 REPORT: the exact wait's spin rounds per layer and the wait's phases (fg6's layer-0 excess, R2_FG6_PAPER_METRICS)
+# =====================================================================================================================
+def _f27(publish=True, max_spin=4):
+    """The drafts of u0 take blocks 5, 6, 7 at both layers (in flight: force_only); one verify row then reads 3 of them
+    at layer 0 and 2 at layer 1 with the exact wait (the CPU stand-in: one spin round per entry and spin, each round
+    lands the awaited transfer). publish False: the transport never publishes (the spins run out)."""
+    w = world(C=8, X=4, R_ver=1, cls=SC.ResidencySC, publish=publish, svc_kw=dict(nblk=NB, wait_mode="exact"))
+    svc = w.svc
+    svc.dev.max_spin = max_spin
+    svc.begin_request(0, "u0")
+    svc.poll()
+    rows = [Row(0, "d", ("u0", 1, 1), 300, 10)]
+    for l in range(L):
+        p = svc.resolve(l, rows, S([[5, 6, 7], []]))
+        svc.read_done(l, p, Ev(done=True))
+    svc.end_tick()
+    svc.poll()
+    rows = [Row(0, "v", ("u0", 1, 1), 301, 10)]
+    for l, blocks in ((0, [5, 6, 7]), (1, [5, 6])):
+        p = svc.resolve(l, rows, S([blocks, []]))
+        svc.read_done(l, p, Ev(done=True))
+    svc.end_tick()
+    return w
+
+
+class _FakeEv:
+    """A timing event of the profile summary's CPU test: elapsed_time in ms between two device times."""
+
+    def __init__(self, t_ms):
+        self.t = t_ms
+
+    def elapsed_time(self, other):
+        return other.t - self.t
+
+
+def test_F27_the_exact_wait_counts_its_spin_rounds_and_the_wait_profile_splits_its_phases():
+    """F27 (REPORT, the lead's task after fg6): the exact wait counts its spin rounds PER LAYER (CudaDeviceOps.spins,
+    on the device, added by the program per call; the stand-in's spin_counts). Known count: 3 in-flight entries at
+    layer 0 and 2 at layer 1, each landed by one round: [3, 2], err clear. Negative control: a transport that never
+    publishes makes every entry spin max_spin rounds: [3 * 4, 2 * 4], err set. The profile summary
+    (wait_profile_summary, the per-layer host / device split of the wait's phases pre / list / wait) sums known calls:
+    two exact calls at layer 0, one superset call at layer 1 (its pre and list phases are one mark: device 0)."""
+    w = _f27()
+    assert w.svc.dev.spin_counts() == [3, 2] and not bool(w.svc.dev.err), w.svc.dev.spin_counts()
+    w2 = _f27(publish=False)
+    assert w2.svc.dev.spin_counts() == [3 * 4, 2 * 4] and bool(w2.svc.dev.err), w2.svc.dev.spin_counts()
+
+    def m(host_s, dev_ms):
+        return host_s, _FakeEv(dev_ms)
+    s0 = m(0.0, 0.0)
+    entries = [(0, m(0.0, 0.0), m(0.0010, 1.0), m(0.0012, 1.1), m(0.0013, 5.1)),     # layer 0: pre 1 / list .1 / spin 4
+               (0, m(1.0, 100.0), m(1.0005, 100.5), m(1.0006, 100.6), m(1.0007, 100.8)),
+               (1, s0, s0, s0, m(0.0002, 0.3))]                                       # layer 1: superset, wait only
+    s = SC.wait_profile_summary(entries, 2, [9, 0])
+    p0, p1 = s["per_layer"]
+    assert (p0["calls"], p0["spins"], p1["calls"], p1["spins"]) == (2, 9, 1, 0), s
+    assert (p0["device_pre_ms"], p0["device_list_ms"], p0["device_wait_ms"]) == (1.5, 0.2, 4.2), p0
+    assert (p0["host_pre_ms"], p0["host_list_ms"], p0["host_wait_ms"]) == (1.5, 0.3, 0.2), p0
+    assert (p1["device_pre_ms"], p1["device_list_ms"], p1["device_wait_ms"], p1["host_wait_ms"]) == (0.0, 0.0, 0.3, 0.2)
+    assert s["total"]["calls"] == 3 and s["total"]["spins"] == 9 and s["total"]["device_wait_ms"] == 4.5, s["total"]
