@@ -2048,7 +2048,7 @@ def test_R5e_the_sparse_per_layer_path_has_no_host_transfer():
     import inspect
     d2h = FORBIDDEN + ("_d2h(",)
     for fn in (SP.sparse_layer_record, SP._compact, SP._pack_bits, SP._first_in_group, SP.draft_bias_fill,
-               SP.ResidencySparse._layer_record, SC.ResidencySC.resolve):
+               SP.ResidencySparse._layer_record, SP.ResidencySparse._record_inputs, SC.ResidencySC.resolve):
         src = inspect.getsource(fn)
         assert [tok for tok in d2h + H2D if tok in src] == [], fn.__qualname__
     assert [tok for tok in d2h if tok in inspect.getsource(SP.ResidencySparse.apply_tick)] != []
@@ -2656,3 +2656,177 @@ def test_F25_k5_grants_the_free_base_slots_and_every_shared_extra_to_the_verifie
     for mut in ({"verify_reserve": 16}, {"verify_no_local": True}):
         _, en = _k5_case(cls, EDGE_MISSES, dict(kw, sc_mut=mut))
         assert en is not None and "found no slot" in str(en), mut
+
+
+# =====================================================================================================================
+# R7 the sparse record for a device consumer (B2's requests, rev 2 note section 6): rowsel and pin_records=False
+# =====================================================================================================================
+class RecProbe(SP.ResidencySparse):
+    """ResidencySparse that keeps a copy of every layer's record, and of the same layer's record with pins off
+    (pin_records=False, built from the same inputs; the pin table is not touched by it)."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.recs = []
+
+    def _layer_record(self, l, step, tk):
+        args, kw = self._record_inputs(l, step, tk)
+        off = SP.sparse_layer_record(*args, **dict(kw, pins=False))
+        super()._layer_record(l, step, tk)
+        self.recs.append(dict(t=self.tick_no, l=l, on={k: v.clone() for k, v in step["rec"].items()},
+                              off={k: v.clone() for k, v in off.items()}))
+
+
+def _r7_run(sparse_mut=None, ticks=6, hb=15):
+    """F6's first ticks (draft rows every tick, verify rows at ticks 2 and 5, interleaved by request) on a RecProbe
+    world. Returns the world and every (tick, layer)'s rows and selection."""
+    w = world(C=8, X=48, R_ver=8, seed=1, mode="delay", max_delay=4, cls=RecProbe,
+              svc_kw=dict(nblk=NB, sparse_mut=sparse_mut))
+    svc = w.svc
+    for b, u in enumerate(("u0", "u1")):
+        svc.begin_request(b, u)
+    tail, sels = svc.tail0, {}
+    for (t, m, ends, layers) in _sched(101, ticks, True, hb):
+        svc.poll()
+        for l, spec in enumerate(layers):
+            rows = [Row(b, kind, key, 1000 + t, hb, [(hb, tail)]) for (b, kind, key, _) in spec]
+            sel = S(*[s for (_, _, _, s) in spec])
+            sels[(t, l)] = (rows, sel)
+            p = svc.resolve(l, rows, sel)
+            svc.read_done(l, p, Ev(done=True))
+        svc.end_tick()
+        if ends:
+            for u in ("u0", "u1"):
+                svc.decided((u, 1, m))
+    return w, sels
+
+
+def _rowsel_mismatch(recs, sels):
+    """The first tick whose rowsel differs from the tick rows' selections (valid historical blocks), or None."""
+    for r in recs:
+        rows, sel = sels[(r["t"], r["l"])]
+        bits = SP.unpack_bits(r["on"]["rowsel"].cpu(), NB)
+        if tuple(bits.shape) != (len(rows), H, NB):
+            return r["t"]
+        for i, row in enumerate(rows):
+            for h in range(H):
+                want = {z for z in sel[h, i].tolist() if 0 <= z < row.hist_bound and z < NB}
+                if set(torch.nonzero(bits[i, h]).view(-1).tolist()) != want:
+                    return r["t"]
+    return None
+
+
+def test_R7a_rowsel_is_every_tick_rows_selection_on_the_device():
+    """R7a (B2's request): every layer's record carries rowsel (R, H, ceil(nblk / 32)) int64 words in _pack_bits'
+    format, indexed by TICK row: bit z of row i, head h is set exactly when z is a valid historical block of row i's
+    selection at head h (0 <= z < hist_bound, z < nblk). Checked on every layer of F6's first 6 ticks (precondition:
+    verify rows interleaved with draft rows, ticks 2 and 5). The host consumer does not read it (apply_tick's source
+    does not name it). Negative control: rowsel indexed by the decision's entry row (sparse_mut rowsel_by_entry)
+    differs at tick 2, the first tick with verify rows."""
+    w, sels = _r7_run()
+    recs = w.svc.recs
+    assert len(recs) == 6 * L
+    assert any(row.kind == "v" for (rows, _) in sels.values() for row in rows)
+    assert all(r["on"]["rowsel"].dtype == torch.int64 and r["on"]["rowsel"].shape[-1] == (NB + 31) // 32
+               for r in recs)
+    assert _rowsel_mismatch(recs, sels) is None
+    import inspect
+    assert "rowsel" not in inspect.getsource(SP.ResidencySparse.apply_tick)
+    w2, sels2 = _r7_run(sparse_mut={"rowsel_by_entry": True})
+    assert _rowsel_mismatch(w2.svc.recs, sels2) == 2
+
+
+def test_R7b_pin_records_off_drops_the_pin_only_records_and_refuses_the_b1_consumer():
+    """R7b (B2's request): with pins off (pin_records=False) every layer's verify and draft record of F6's first 6
+    ticks is the default record WITHOUT its PIN-only entries and with no PIN flag (every other field equal, in entry
+    order); the looks, the read bitmap, the layer selection and rowsel are equal. The PIN-only records the default
+    consumer applied (pin_only_records, verify + draft) are exactly the entries dropped, and there are some
+    (precondition). A ResidencySparse with pin_records=False refuses to run its own consumer (ValueError at end_tick:
+    nothing applied, the pin table untouched). Negative control: the default record with only its PIN flag cleared
+    is NOT the pins-off record (the drop is seen)."""
+    w, _ = _r7_run()
+    keep = dict(vrec=SP.INFL | SP.DUP | SP.GRANT | SP.EVICT | SP.HOLE,
+                drec=SP.READY | SP.INFL | SP.GRANT | SP.REFUSED | SP.HOLE)
+    dropped, control_differs = 0, False
+    for r in w.svc.recs:
+        for f in ("vlook", "vread", "sel", "rowsel"):
+            if f in r["on"]:
+                assert torch.equal(r["on"][f], r["off"][f]), (r["t"], r["l"], f)
+        for rec, cnt in (("vrec", "vcnt"), ("drec", "dcnt")):
+            if rec not in r["on"]:
+                continue
+            on = r["on"][rec][:, :int(r["on"][cnt])].t().tolist()
+            off = r["off"][rec][:, :int(r["off"][cnt])].t().tolist()
+            want = [x[:2] + [x[2] & ~SP.PIN] + x[3:] for x in on if x[2] & keep[rec]]
+            assert off == want, (r["t"], r["l"], rec)
+            dropped += len(on) - len(off)
+            control_differs |= [x[:2] + [x[2] & ~SP.PIN] + x[3:] for x in on] != off
+    assert dropped > 0 and sum(w.svc.pin_only_records) == dropped, (dropped, w.svc.pin_only_records)
+    assert control_differs
+    w3 = world(C=8, X=48, R_ver=8, seed=1, cls=SP.ResidencySparse, svc_kw=dict(nblk=NB, pin_records=False))
+    svc = w3.svc
+    svc.begin_request(0, "u0")
+    svc.poll()
+    for l in range(L):
+        p = svc.resolve(l, [Row(0, "d", ("u0", 1, 1), 300, 10)], S([[5], []]))
+        svc.read_done(l, p, Ev(done=True))
+    with pytest.raises(ValueError, match="pin_records=False"):
+        svc.end_tick()
+    assert not svc.inflight and not svc.stream(0, 0, 0).prot and int(torch.count_nonzero(svc.pins)) == 0
+
+
+# =====================================================================================================================
+# F26 REPORT: the peak shared-extra demand of a run (report()["k5"]), passing ticks included (the X 64 runs)
+# =====================================================================================================================
+class WrongLayerK5(SC.ResidencySC):
+    """DEFECT (negative control): the shared-extra demand of a layer is noted against the next layer."""
+
+    def _note_extra_need(self, l, need):
+        super()._note_extra_need((l + 1) % self.L, need)
+
+
+# per tick: (the batch slot of its one verify row, per layer (head 0 blocks, head 1 blocks)); every block is a first
+# miss and every stream starts the tick empty (C 4): the layer's need = the sum over its streams of max(0, misses - 4)
+F26_TICKS = [(0, [([0, 1, 2, 3, 4, 5], []), (list(range(10)), [0, 1])]),     # tick 0: layer 0 needs 2, layer 1 needs 6
+             (1, [(list(range(11)), []), (list(range(5)), [])])]              # tick 1: layer 0 needs 7 (THE PEAK), 1
+
+
+def _f26(cls):
+    w = world(C=4, X=10, R_ver=2, cls=cls, svc_kw=dict(nblk=NB))
+    svc = w.svc
+    for b, u in enumerate(("u0", "u1")):
+        svc.begin_request(b, u)
+    for (b, per_layer) in F26_TICKS:
+        svc.poll()                                         # the previous tick's urgent slots are FREE again here
+        assert all(s.usage() == 0 for pool in svc.pools for s in pool.streams.values())
+        rows = [Row(b, "v", ("u%d" % b, 1, 1), 300, 20)]
+        for l in range(L):
+            p = svc.resolve(l, rows, S(list(per_layer[l])))
+            svc.read_done(l, p, Ev(done=True))
+        svc.end_tick()
+    return w
+
+
+@pytest.mark.parametrize("kind", ["sc", "sparse"])
+def test_F26_the_k5_report_holds_the_peak_shared_extra_demand_of_a_passing_run(kind):
+    """F26 (REPORT, the lead's GO for the X 64 runs): report()["k5"] of S-C (dense and sparse) holds, per (tick,
+    layer), the verify first misses that needed a SHARED extra (beyond each stream's free base slots C - usage at the
+    layer's start, summed over the layer's streams), as its peak with the tick and the layer, and each layer's
+    maximum; it is computed from the decision the host already applies (no device read). A PASSING 2-tick schedule
+    with a known demand (layer 0 / 1: 2 / 6 at tick 0, 7 / 1 at tick 1): peak 7 at tick 1, layer 0; by layer [7, 6];
+    every first miss was an urgent take (k43 new 34) and nothing was refused. A REFUSED tick updates it too: F25's
+    p4a case reports its 48 at layer 0, tick 1. Negative control: a service that notes the demand against the next
+    layer reports another layer."""
+    cls = dict(sc=SC.ResidencySC, sparse=SP.ResidencySparse)[kind]
+    w = _f26(cls)
+    k5 = w.svc.report()["k5"]
+    assert (k5["extra_need_peak"], k5["at_tick"], k5["at_layer"], k5["by_layer"]) == (7, 1, 0, [7, 6]), k5
+    assert (k5["C"], k5["X"]) == (4, 10) and w.svc.metrics.k43["new"] == 6 + 10 + 2 + 11 + 5
+    assert w.svc.d2h_reads == len(F26_TICKS)                     # no device read beyond the one per tick
+    w2, e = _k5_case(cls, P4A_MISSES, dict(nblk=NB_K5))
+    assert e is not None
+    k2 = w2.svc.report()["k5"]
+    assert (k2["extra_need_peak"], k2["at_tick"], k2["at_layer"]) == (48, 1, 0), k2
+    if kind == "sc":
+        kn = _f26(WrongLayerK5).svc.report()["k5"]
+        assert (kn["at_layer"], kn["by_layer"]) != (0, [7, 6]), kn

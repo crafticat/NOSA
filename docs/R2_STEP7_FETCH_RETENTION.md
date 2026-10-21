@@ -1077,6 +1077,62 @@ WHAT IT MEANS FOR MEASURING S-C:
 - X is per stream in the store (C + X slots per (layer, request, head)). At D 128, bf16 K and V, one slot per stream
   over L 32 x B 64 x H 2 is about 128 MiB, so X 64 costs about 4 GiB more than X 32.
 - The alternative is fewer protected blocks per stream, for example a smaller LAMBDA (fewer draft positions ahead).
+- DECIDED by the lead (2026-10-21): S-C is measured (SG5 and TC-R) at X 64, with C 96 and R_ver 16.
+
+## 12p. The sparse record for a device consumer: rowsel and pin_records=False (B2's requests, rev 2 note 6)
+
+ROWSEL:
+- Each layer's record gets `step["rec"]["rowsel"]`, (R, H, ceil(nblk / 32)) int64 words in `_pack_bits`' format
+  (32 bits per word; bit i of word w = block 32 w + i).
+- It is indexed by TICK row: verify and draft rows in the tick's Row order. The decision's entry rows map to tick
+  rows by the tick's verify / draft index lists (S-C's `_tick_rows`; the captured tick's `live_rows`).
+- A bit is set for every valid historical block of the row's selection at that head (0 <= block < hist_bound,
+  < nblk). Tails are excluded and duplicates collapse.
+- It stays ON THE DEVICE. B1's host consumer does not read it, and it is not part of the one device-to-host read.
+
+PIN_RECORDS=FALSE (`ResidencySparse(..., pin_records=False)`):
+- The record carries no protection pins: no PIN flag and no pin table update.
+- A verify entry that would be a record only for its new pin (a ready block) is no record. Draft records do not
+  change, because every valid draft entry is a record for another reason too.
+- B1's own consumer protects only from pins, so `ResidencySparse.apply_tick` refuses to run (ValueError). Only a
+  consumer that keeps the protection itself (B2, from rowsel) may use it.
+- `pin_only_records` (verify, draft) counts the PIN-only records that the default consumer applies. This is the
+  saving.
+
+TESTS:
+- R7a: rowsel equals every tick row's valid selection, on every layer of F6's first 6 ticks; apply_tick does not
+  name it. Negative control: rowsel indexed by the entry row differs at tick 2.
+- R7b: the pins-off record equals the default record minus its PIN-only entries, with no PIN flag; the looks, read
+  bitmap, selection and rowsel are equal. The dropped entries equal `pin_only_records` (> 0). A pins-off service
+  refuses its own consumer, applies nothing and leaves the pin table untouched. Negative control: clearing only the
+  PIN flag is not enough.
+
+## 12q. REPORT: the peak shared-extra demand of a run (`report()["k5"]`, for the X 64 runs)
+
+THE DEFINITION. Per (tick, layer), the layer's verify first misses that needed a SHARED extra:
+- per stream, its first misses beyond its FREE base slots at the layer's start, max(0, first misses - (C - usage));
+- summed over the layer's streams.
+- They were served by a granted extra, by Policy E, or by nothing (a refusal). K5's own rule decides it.
+
+WHERE IT IS COMPUTED:
+- The dense and the sparse verify appliers. Each stream's usage is taken at its first appearance in the layer,
+  before any take of the layer; then its takes (K5 grants and Policy E evictions) are counted.
+- A refused tick notes the same quantity from `_k5_report`.
+- So it costs no device read and appears for passing and refused runs alike.
+
+`report()["k5"]` holds:
+- `extra_need_peak` and its `at_tick` / `at_layer` (the first occurrence);
+- `by_layer` (each layer's maximum);
+- C, X, R_ver and the definition.
+
+It answers "is X enough for the whole run": X >= `extra_need_peak` means K5 alone never needed Policy E. A passing
+run with a larger peak relied on Policy E.
+
+TEST F26 (dense and sparse):
+- A passing 2-tick schedule with a known demand: 2 / 6, then 7 / 1. The peak is 7 at tick 1, layer 0; by layer
+  [7, 6]; one device read per tick.
+- F25's refused p4a case reports 48 at layer 0, tick 1.
+- Negative control: a service that notes the demand against the next layer reports another layer.
 
 ## 13. Open questions
 

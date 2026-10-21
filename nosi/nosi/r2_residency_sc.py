@@ -868,6 +868,10 @@ class ResidencySC(ResidencySB):
         self._hist_unwaited: List = []                    # host write-backs the main stream did not wait on yet
         self._flags: Dict[str, torch.Tensor] = {}         # watched device flags (watch_flag)
         self.flag_values: Dict[str, int] = {}             # their values at the last end_tick read
+        # REPORT (report()["k5"]): per (tick, layer) the verify first misses that needed a shared extra (_extra_need),
+        # its peak with the tick and layer, and each layer's maximum; refused ticks included
+        self.k5_peak: Tuple = (0, None, None)
+        self.k5_by_layer: List[int] = [0] * self.L
 
     def watch_flag(self, name: str, flag: torch.Tensor) -> None:
         """Watch a device flag (a 0-dim bool or integer tensor on the service's device; e.g. the twin's sticky
@@ -1190,7 +1194,32 @@ class ResidencySC(ResidencySB):
         head = ("layer %d: %d streams had verify first misses, %d of the misses needed a shared extra; the layer's %d "
                 "free extras (X %d, borrowed %d at the tick start) went to the first %d of them in K3X order; %d found "
                 "no slot%s" % (l, len(order), need, pool.free_extras(), self.X, pool.borrowed(), extras, n_over, note))
+        self._note_extra_need(l, need)
         return "; ".join([head] + lines)
+
+    def _extra_need(self, use0: Dict, n_first: Dict) -> int:
+        """The layer's verify first misses that needed a SHARED extra: per stream, its first misses beyond its FREE
+        base slots at the layer's start (C - usage), summed (K5's rule; granted, Policy E and no slot alike)."""
+        return sum(max(0, n - max(0, self.C - use0[bh])) for bh, n in n_first.items())
+
+    def _note_extra_need(self, l: int, need: int) -> None:
+        """REPORT: the shared-extra demand of layer l at this tick (self.tick_no): the layer's maximum, and the run's
+        peak with its tick and layer (the first occurrence of the peak)."""
+        if need > self.k5_by_layer[l]:
+            self.k5_by_layer[l] = need
+        if need > self.k5_peak[0]:
+            self.k5_peak = (need, self.tick_no, l)
+
+    def report(self) -> Dict:
+        """Residency's report, plus "k5": the peak shared-extra demand of the run (passing and refused ticks)."""
+        out = super().report()
+        need, tick, layer = self.k5_peak
+        out["k5"] = dict(extra_need_peak=need, at_tick=tick, at_layer=layer, by_layer=list(self.k5_by_layer), C=self.C,
+                         X=self.X, R_ver=self.R_ver,
+                         definition="per (tick, layer): the verify first misses beyond each stream's FREE base slots "
+                                    "(C - usage at the layer's start), summed over the layer's streams: the shared "
+                                    "extras that the layer's verify needed (granted, Policy E and no slot)")
+        return out
 
     def _host_candidates(self, l: int, vrow_objs, dec, c, drow_objs, dcols, ddec):
         """Policy E's candidates on the host (v1's _verifier_candidates), from the host state at the start of the
@@ -1229,6 +1258,7 @@ class ResidencySC(ResidencySB):
         now = self.clock()
         looks, entries = [], {}
         cands = self._host_candidates(l, vrow_objs, dec, c, drow_objs, dcols, ddec) if any(c["evict"]) else {}
+        use0, n_first = {}, {}                                # per stream: usage at the layer's start, first misses
         for j, r in enumerate(vrow_objs):
             for h in range(H):
                 st = pool.stream(r.b, h)
@@ -1264,6 +1294,10 @@ class ResidencySC(ResidencySB):
                     else:
                         raise OwnershipViolation("S-C: block %d of verify row %d (layer %d b %d h %d) has no slot and the "
                                                  "device did not flag an overflow" % (t, vidx[j], l, r.b, h))
+                if takes:                                             # the K5 REPORT (_extra_need): the usage at
+                    if (r.b, h) not in use0:                          # the layer's start (no take of this layer in
+                        use0[(r.b, h)] = st.usage()                   # the stream yet), the first misses
+                    n_first[(r.b, h)] = n_first.get((r.b, h), 0) + len(takes)
                 for (t, at, ev_blk, ev_kind) in takes:
                     if ev_blk is not None:                            # Policy E: the host's next candidate, evicted
                         q = cands.get((r.b, h))
@@ -1282,6 +1316,7 @@ class ResidencySC(ResidencySB):
                     ent.append((t, at))
                 looks.append(dict(row=vidx[j], h=h, key=r.key, ready=ready, in_flight=infl, new=new, t=now))
                 entries[(j, h)] = sorted(ent)
+        self._note_extra_need(l, self._extra_need(use0, n_first))
         for lk in looks:
             self.metrics.look(l, lk)
         ev = self._layer_ev.get(l)

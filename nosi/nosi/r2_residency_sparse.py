@@ -24,6 +24,12 @@ THE CUT. Per layer, on the device (_layer_record, device ops only), after device
     (flag FIRST).
   - The LAYER SELECTION BITMAP (B, H, nblk) packed: every block a row of the layer selects; the host decodes it only
     for a stream with a Policy E eviction (its candidate check).
+  - ROWSEL (R, H, ceil(nblk / 32)) packed, per TICK row (B2's request): every valid historical block of that row's
+    selection at each head. It stays ON THE DEVICE in step["rec"]["rowsel"] for a device consumer (B2); the host
+    consumer below does not read it, and it is not in the one device-to-host read.
+  - pin_records=False (B2 as the consumer): no pin is recorded (no PIN flag, no pin table update), so an entry that
+    would be a record only for its new pin is no record. This class's consumer protects only from pins, so it refuses
+    to run on such a record. pin_only_records counts the PIN-only records the default consumer applies (the saving).
   - The BIAS ROWS of the granted draft takes: written on the device here (one batched write per layer), so the host
     take does not copy them (Q-C4).
   Each record list is COMPACTED with a prefix sum (stable: the entry order (row, head, ascending block) is K3X's)
@@ -49,7 +55,8 @@ instead of once per entry (4.8 reads them as > 0 only).
 
 NEGATIVE CONTROLS (sparse_mut, tests only): drop=<kind> (the first state-changing record of that kind is dropped:
 v_pin, v_merge, v_take, v_read, d_pin, d_ready, d_merge, d_take, d_refused), swap_takes (two draft takes of one
-stream exchange their slots), no_cap_check (a record over its capacity is truncated, not refused).
+stream exchange their slots), no_cap_check (a record over its capacity is truncated, not refused), rowsel_by_entry
+(rowsel indexed by the entry row of the verify / draft decision instead of the tick row).
 """
 from __future__ import annotations
 
@@ -112,14 +119,22 @@ def unpack_bits(words: torch.Tensor, n: int) -> torch.Tensor:
 
 
 def sparse_layer_record(pins_l, epoch_l, code_l, vdec, kid_v, ddec, kid_d, bbd, hhd, NBLK: int, NPOS: int,
-                        cap_v: int, cap_d: int) -> Dict[str, torch.Tensor]:
+                        cap_v: int, cap_d: int, ixv=None, ixd=None, R: int = 0, pins: bool = True,
+                        rowsel_by_entry: bool = False) -> Dict[str, torch.Tensor]:
     """One layer's sparse record on the device (module docstring). pins_l (B, H, NBLK + 1, 2) the layer's pin table
     (updated in place), epoch_l (B,), code_l (B, H, NPOS) the mirror's state codes; vdec / ddec the layer's decisions
-    (or None), kid_v / kid_d their rows' key ids, bbd / hhd the draft entries' batch slot / head. Device ops only."""
+    (or None), kid_v / kid_d their rows' key ids, bbd / hhd the draft entries' batch slot / head. Device ops only.
+    R > 0: also ROWSEL (R, H, ceil(NBLK / 32)) int64 words in _pack_bits' format: bit z of row i, head h = block z is
+    a valid historical selection of TICK row i at head h (0 <= z < hist_bound, z < NBLK); ixv / ixd (Rv,) / (Rd,) map
+    the verify / draft entry rows to tick rows. It stays on the device (the host consumer does not read it).
+    pins False (B2 as the consumer, pin_records=False): no pin is recorded and the pin table is not touched; an entry
+    that would be a record only for its new pin is no record. rowsel_by_entry: NEGATIVE CONTROL (tests only), rowsel
+    indexed by the entry row instead of the tick row."""
     out: Dict[str, torch.Tensor] = {}
     dev = pins_l.device
     B, H = pins_l.shape[0], pins_l.shape[1]
     selm = torch.zeros((B, H, NBLK + 1), dtype=torch.bool, device=dev)
+    rsel = torch.zeros((R, H, NBLK + 1), dtype=torch.bool, device=dev) if R > 0 else None
     if vdec is not None:
         t = vdec.t
         Rv, k = vdec.Rv, vdec.k
@@ -134,9 +149,14 @@ def sparse_layer_record(pins_l, epoch_l, code_l, vdec, kid_v, ddec, kid_d, bbd, 
         pinning = valid & prot
         blk_p = torch.where(pinning, blk, torch.full_like(blk, NBLK))         # the dummy row takes the others
         one = torch.ones_like(blk)
-        pk = kid * TWO32 + epoch_l[bb]
-        newpin = pinning & (pins_l[bb, hh, blk_p, one] != pk)
-        pins_l.index_put_((bb, hh, blk_p, one), pk)
+        if pins:
+            pk = kid * TWO32 + epoch_l[bb]
+            newpin = pinning & (pins_l[bb, hh, blk_p, one] != pk)
+            pins_l.index_put_((bb, hh, blk_p, one), pk)
+        else:
+            newpin = torch.zeros_like(pinning)
+        if rsel is not None:                                                  # the tick row of each entry
+            rsel[j if rowsel_by_entry else ixv[j], hh, torch.where(valid, blk, torch.full_like(blk, NBLK))] = True
         fkey = torch.where(valid, (kid * H + hh) * (NBLK + 1) + blk, torch.full_like(blk, BIGKEY))
         first = _first_in_group(fkey) & valid
         hole = valid & ~(ready | infl | dup | gr | ev)
@@ -169,9 +189,14 @@ def sparse_layer_record(pins_l, epoch_l, code_l, vdec, kid_v, ddec, kid_d, bbd, 
         pinning = valid & prot
         blk_p = torch.where(pinning, blk, torch.full_like(blk, NBLK))
         zero = torch.zeros_like(blk)
-        pk = kid * TWO32 + epoch_l[bbd]
-        newpin = pinning & (pins_l[bbd, hhd, blk_p, zero] != pk)
-        pins_l.index_put_((bbd, hhd, blk_p, zero), pk)
+        if pins:
+            pk = kid * TWO32 + epoch_l[bbd]
+            newpin = pinning & (pins_l[bbd, hhd, blk_p, zero] != pk)
+            pins_l.index_put_((bbd, hhd, blk_p, zero), pk)
+        else:
+            newpin = torch.zeros_like(pinning)
+        if rsel is not None:
+            rsel[j if rowsel_by_entry else ixd[j], hhd, torch.where(valid, blk, torch.full_like(blk, NBLK))] = True
         hole = valid & ~(ready | infl | gr | refused)
         mask = valid & (newpin | ready | infl | gr | refused | hole)
         flags = (newpin * PIN + ready * READY + infl * INFL + gr * GRANT + refused * REFUSED
@@ -179,6 +204,8 @@ def sparse_layer_record(pins_l, epoch_l, code_l, vdec, kid_v, ddec, kid_d, bbd, 
         out["drec"], out["dcnt"] = _compact(mask, [o, blk, flags, t["slot"], t["take_slot"]], cap_d)
         selm[bbd, hhd, torch.where(valid, blk, torch.full_like(blk, NBLK))] = True
     out["sel"] = _pack_bits(selm[..., :NBLK])
+    if rsel is not None:
+        out["rowsel"] = _pack_bits(rsel[..., :NBLK])
     return out
 
 
@@ -205,14 +232,20 @@ class ResidencySparse(ResidencySC):
     """S-C with the sparse decision record (module docstring). Extra arguments: record_cap (cap_v, cap_d) the record
     buffers per layer (None: every entry, no overflow), sparse_mut (negative controls, tests only)."""
 
-    def __init__(self, *args, record_cap: Optional[Tuple[int, int]] = None, sparse_mut=None, **kw):
+    def __init__(self, *args, record_cap: Optional[Tuple[int, int]] = None, sparse_mut=None, pin_records: bool = True,
+                 **kw):
         super().__init__(*args, **kw)
         self.record_cap = record_cap
+        # pin_records False (B2 as the consumer): the record carries no protection pins. This class's own consumer
+        # (apply_tick) protects only from them, so it refuses such a record; a consumer that keeps the protection
+        # itself (B2's table, from rowsel) replaces apply_tick
+        self.pin_records = bool(pin_records)
         self.sparse_mut = dict(sparse_mut or {})
         self.pins = torch.zeros((self.L, self.B, self.H, self.nblk + 1, 2), dtype=torch.int64, device=self.device)
         self._kids: Dict[Any, int] = {}
         self._epoch = [[0] * self.B for _ in range(self.L)]
         self.records_applied = 0                          # records the host applied (reports, the microbench)
+        self.pin_only_records = [0, 0]                    # (verify, draft) records applied only for a new pin
         self.last_counts = [0, 0]
         self.sparse_dropped_at: Optional[Tuple[int, str]] = None   # a negative control's (tick, kind)
         self._mut_done: Set[str] = set()
@@ -248,7 +281,8 @@ class ResidencySparse(ResidencySC):
             return max(nv, 1), max(nd, 1)
         return int(self.record_cap[0]), int(self.record_cap[1])
 
-    def _layer_record(self, l: int, step: Dict, tk: Dict) -> None:
+    def _record_inputs(self, l: int, step: Dict, tk: Dict):
+        """sparse_layer_record's arguments for layer l (device tensors and host ints): (args, keywords)."""
         R = len(tk["vrows"]) + len(tk["drows"])
         kid_all = tk["extra"][:R]
         epoch_l = tk["extra"][R:].view(self.L, self.B)[l]
@@ -261,9 +295,17 @@ class ResidencySparse(ResidencySC):
             bbd = tk["d"][0].view(Rd, 1, 1).expand(Rd, self.H, k).reshape(-1)
             hhd = torch.arange(self.H, device=self.device).view(1, self.H, 1).expand(Rd, self.H, k).reshape(-1)
         cap_v, cap_d = self._caps(step)
-        step["rec"] = sparse_layer_record(self.pins[l], epoch_l, self.dmirror.code[l], step["vdec"], kid_v, ddec,
-                                          kid_d, bbd, hhd, self.nblk, self.n_hist, cap_v, cap_d)
-        step["caps"] = (cap_v, cap_d)
+        args = (self.pins[l], epoch_l, self.dmirror.code[l], step["vdec"], kid_v, ddec, kid_d, bbd, hhd, self.nblk,
+                self.n_hist, cap_v, cap_d)
+        kw = dict(ixv=tk["v"][4] if tk["v"] is not None else None, ixd=tk["d"][4] if tk["d"] is not None else None,
+                  R=R, pins=self.pin_records, rowsel_by_entry=self.sparse_mut.get("rowsel_by_entry", False))
+        return args, kw
+
+    def _layer_record(self, l: int, step: Dict, tk: Dict) -> None:
+        args, kw = self._record_inputs(l, step, tk)
+        step["rec"] = sparse_layer_record(*args, **kw)
+        step["caps"] = (args[11], args[12])
+        ddec, bbd, hhd = args[5], args[7], args[8]
         if ddec is not None and self.store_b is not None and self.cis is not None:
             draft_bias_fill(self.store_b[l], self.cis[l], ddec, bbd, hhd, self.bs)
 
@@ -271,6 +313,10 @@ class ResidencySparse(ResidencySC):
     def apply_tick(self, steps: List[Dict]) -> None:
         """THE HOST CONSUMER (the S-C signature; module docstring): ONE device-to-host read, the void-tick refusals,
         then the records in v1's order."""
+        if not self.pin_records:
+            raise ValueError("pin_records=False: the sparse record carries no protection pins, and this consumer (B1) "
+                             "protects only from them; a consumer that keeps the protection itself (B2) must replace "
+                             "apply_tick")
         names = list(self._flags)
         parts = [self._flags[n].to(torch.int64).reshape(1) for n in names]
         W = (self.n_hist + 31) // 32
@@ -464,6 +510,7 @@ class ResidencySparse(ResidencySC):
         self.records_applied += len(recs)
         cands = self._candidates_from_bits(l, vrow_objs, p["sel"]) if any(r[2] & EVICT for r in recs) else {}
         firsts: Dict[Tuple, List[Tuple[int, int, str]]] = {}         # key -> [(h, block, class)]
+        use0, n_first = {}, {}                                        # the K5 REPORT (S-C's _extra_need)
         i, n = 0, len(recs)
         while i < n:
             g = recs[i][0] // k                                       # (row, head) group: o // k = j * H + h
@@ -474,6 +521,8 @@ class ResidencySparse(ResidencySC):
             while i < n and recs[i][0] // k == g:
                 o, t, fl, slot, islot, igen, rslot, tslot, evb = recs[i]
                 i += 1
+                if not fl & (INFL | DUP | GRANT | EVICT | HOLE):
+                    self.pin_only_records[0] += 1                     # a record only for its new pin
                 if fl & HOLE:
                     raise OwnershipViolation("S-C: block %d of verify row %d (layer %d b %d h %d) has no slot and the "
                                              "device did not flag an overflow" % (t, vidx[j], l, r.b, h))
@@ -493,6 +542,10 @@ class ResidencySparse(ResidencySC):
                 elif fl & (GRANT | EVICT):
                     takes.append((t, tslot, evb if fl & EVICT else None, "inflight" if fl & EVICT_INFL else "lru",
                                   fl & FIRST))
+            if takes:                                                 # the usage at the layer's start (no take of
+                if (r.b, h) not in use0:                              # this layer in the stream yet)
+                    use0[(r.b, h)] = st.usage()
+                n_first[(r.b, h)] = n_first.get((r.b, h), 0) + len(takes)
             for (t, at, ev_blk, ev_kind, first) in takes:
                 if ev_blk is not None:                                # Policy E: the host's next candidate, evicted
                     q = cands.get((r.b, h))
@@ -510,6 +563,7 @@ class ResidencySparse(ResidencySC):
                 self._landed.add(tr.seq)
                 if first:
                     firsts.setdefault(r.key, []).append((h, t, "new"))
+        self._note_extra_need(l, self._extra_need(use0, n_first))
         # the looks (4.3 / 4.6): the ready first looks counted on the device, the others from the records
         keys = []
         for jj, r in enumerate(vrow_objs):
@@ -580,6 +634,8 @@ class ResidencySparse(ResidencySC):
         recs = p["drec"]
         self.records_applied += len(recs)
         for (o, t, fl, slot, tslot) in recs:
+            if not fl & (READY | INFL | GRANT | REFUSED | HOLE):
+                self.pin_only_records[1] += 1                         # a record only for its new pin
             j, h = o // (H * k), (o // k) % H
             r = drow_objs[j]
             st = pool.stream(r.b, h)
