@@ -858,6 +858,33 @@ EXPECTED HOST TIME PER TICK AT B 64 (B1), as estimates; the REPORT microbench me
 - draft ticks: ready records and touches (about 0.26 M at about 0.3-0.5 us), about 80-130 ms, plus pins at a
   cohort's first draft tick.
 - So B1 should cut p3's 7 s to about 0.2-0.4 s per tick. B2 (array-backed) should bring it to tens of ms.
+- REFUTED by the REPORT microbench (sparse 7392ac6, CPU, B 64, H 2, 2 layers): apply_tick per tick, dense verify
+  252.3 ms / draft 112.8 ms; sparse verify 266.8 ms / draft 109.7 ms. Times 16 for 32 layers: dense 4037 / 1804 ms,
+  sparse 4269 / 1755 ms. 114,904 sparse records applied.
+  - So on the vendored objects, B1 gives NO host speedup. The cost is the per-record vendored apply (take, protect,
+    move_to_end, the journal, the reads), not the reading of the dense record.
+  - My estimate assumed sub-microsecond records; the vendored dict-of-set and OrderedDict objects cost several
+    microseconds each. B1 stays as the dense == sparse reference and as the record producer; B2 is the speed path.
+
+WHAT B2 CAN KEEP FROM B1's DEVICE PART, AS IS:
+- `_compact` (the stable prefix-sum compaction into fixed buffers, with a count) and `_pack_bits` / `unpack_bits`.
+  They are independent of the ownership representation.
+- `draft_bias_fill` (the bias rows of the granted draft takes in one write per layer). It needs only the decision
+  and the store.
+- `_first_in_group` (the stable first-occurrence mask), and the look counts (vlook) if B2 keeps K3X's 4.3 / 4.6
+  metrics.
+- The record itself (note 12l's format), as the lockstep interface between B1 and B2.
+- NOT the pin table. It exists only to tell the vendored host which (block, key, kind) pins are new. A device-
+  authoritative B2 table keeps protection itself (per-row selection bitmaps, B's design).
+
+AFTER THE CPU RUN of 7392ac6 (3 failed, 163 passed, 2 skipped;
+`/mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/sparse_7392ac6.txt`), both preconditions were mine:
+- R5a f21b / f21b_exact: "touches > 0" cannot hold there. The split schedule never lands a prefetch, so no draft row
+  reads a READY block. The touch precondition now applies to f6 / f12b / f20b only.
+- R5b d_merge: the negative control's choice ran BEFORE the tick's applies. A draft merge into this layer's urgent
+  verify take (demand {verify}) has no host transfer yet at that point, so it was skipped as "no transfer". It now
+  counts as state-changing (the take creates the transfer at apply). A v_merge without a transfer (a dup of the
+  layer's own urgent take) is still skipped: its demand holds verify already.
 
 TESTS (`test_r2_residency.py`, R5):
 - R5a: sparse == dense on F6 (probe and exact), F12b, F20b and F21b (probe and exact). Every tick it compares the

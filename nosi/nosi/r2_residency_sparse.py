@@ -417,10 +417,13 @@ class ResidencySparse(ResidencySC):
                     continue
                 r[2] &= ~PIN
                 return True
-            if kind.endswith("_merge"):
+            if kind.endswith("_merge"):                         # (this runs BEFORE the tick's applies)
                 tr = self._in_flight(l, row.b, h, t)
-                if tr is None or pkind in tr.demand:
-                    continue
+                if tr is not None and pkind in tr.demand:
+                    continue                                    # the demand is there already: no state change
+                if tr is None and kind == "v_merge":
+                    continue                                    # a dup of this layer's urgent take: verify already
+                # d_merge with no transfer yet: the urgent take of this layer creates it at apply, demand {verify}
             if kind == "d_ready" and (t in s.lru and next(reversed(s.lru)) == t):
                 continue                                        # a touch of the MRU entry changes nothing
             del recs[i]

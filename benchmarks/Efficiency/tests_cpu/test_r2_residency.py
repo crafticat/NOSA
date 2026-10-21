@@ -1984,13 +1984,17 @@ def _r5_case(name):
 def test_R5a_the_sparse_record_equals_the_dense_one(case):
     """R5a: the sparse S-C (B1) and the dense S-C on one schedule: equal pages, verify content, device mirrors (both
     equal the full scan), ownership state, counters (4.3, 4.6, refusals, masked, transfers) and readers after every
-    tick; ONE device read per tick (both). Preconditions: records were applied and touches happened; per schedule,
-    f6 urgent misses, f12b draft refusals, f20b Policy E LRU evictions, f21b in-flight supersedes."""
+    tick; ONE device read per tick (both). Preconditions: records were applied; per schedule, f6 urgent misses and
+    draft touches, f12b draft refusals, f20b Policy E LRU evictions and draft touches, f21b in-flight supersedes.
+    (f21b's split schedule never lands a prefetch, so it has no READY draft read and no touch by construction; the
+    touch path is f6's and f20b's.)"""
     args = _r5_case(case)
     bad, ws, wx, ticks = _lockstep_sparse(**args)
     assert bad == [], bad[:3]
     assert ticks == len(args["sched"]) and wx.svc.d2h_reads == ticks == ws.svc.d2h_reads
-    assert wx.svc.records_applied > 0 and wx.svc.journal_counts.get("touch", 0) > 0
+    assert wx.svc.records_applied > 0
+    if not case.startswith("f21b"):
+        assert wx.svc.journal_counts.get("touch", 0) > 0, wx.svc.journal_counts
     pre = {"f6": wx.svc.metrics.k43["new"] > 0, "f6_exact": wx.svc.metrics.k43["new"] > 0,
            "f12b": wx.svc.metrics.refused > 0,
            "f20b": wx.svc.metrics.counts.get("verifier_evictions", 0) > 0,
