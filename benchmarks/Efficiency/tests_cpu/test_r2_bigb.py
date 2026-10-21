@@ -264,11 +264,16 @@ def _preflight_run(G, preflight, stash=None):
 def test_BG5b_the_preflight_builds_the_next_engine_after_the_last_one_is_gone():
     G = TT._sg5_gate()
     assert _preflight_run(G, G.preflight) == [False]
-    # NEGATIVE CONTROL 1: feaa7d6's release line (rnd not released) keeps the first engine alive
+    # NEGATIVE CONTROL 1: feaa7d6's two lines (rnd neither reset at the loop's start nor released) keep the first
+    # engine alive. Both lines must be restored: either one alone frees it (job 2191296: the reset alone did)
     src = inspect.getsource(G.preflight)
-    fixed = "del eng, svc, tp, rnd"
-    assert src.count(fixed) == 1
-    old = src.replace(fixed, "del eng, svc, tp")
+    fixed = ("del eng, svc, tp, rnd", "eng = svc = tp = rnd = None")
+    assert all(src.count(f) == 1 for f in fixed)
+    old = src.replace(fixed[0], "del eng, svc, tp").replace(fixed[1], "eng = svc = tp = None")
+    for one in (src.replace(fixed[0], "del eng, svc, tp"), src.replace(fixed[1], "eng = svc = tp = None")):
+        n1 = dict(G.__dict__)
+        exec(compile(one, "preflight_half", "exec"), n1)
+        assert _preflight_run(G, n1["preflight"]) == [False]        # each line alone suffices
     ns = dict(G.__dict__)
     exec(compile(old, "preflight_feaa7d6", "exec"), ns)
     assert _preflight_run(G, ns["preflight"]) == [True]

@@ -426,7 +426,9 @@ def test_S1_the_twin_variant_of_the_tick_and_of_sg5(p3):
     with pytest.raises(SystemExit):
         SG5.parse_args(base + ["--twin", "triton"])
     src = (EFF / "r2_tick_sg5.py").read_text()
-    assert "TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin, **ekw)" in src   # [integ2] bigb's ekw
+    for call in ("TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin, **ekw)",      # [bigb] **ekw
+                 "TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin, xpool=xspec, **ekw)"):
+        assert call in src, call                                  # the twin option reaches the engine in both layouts
     assert 'meta["twin"] = a.twin' in src
     tick_src = (NOSI / "r2_tick.py").read_text()
     assert tick_src.count("[twin-variant]") >= 10 and "ctr = twin.advance_unchecked(keys, cis_b, n_dev)" in tick_src
