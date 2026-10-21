@@ -20,6 +20,8 @@ F3  the body kernel (interpreter): FusedBody.decode_fixed against DeviceWritebac
     the gathers and the write-back (tests/test_r2_decode_body.py); a refused step (a position out of range) sets ERR_POS
     and changes no persistent table in both (the diff's scratch maps are rewritten by both). NEGATIVE CONTROLS: the tail rows written for an inactive request, the tail id not set,
     and an inactive request's load mask kept are each caught.
+F4  the tick profile's pure parts (benchmarks/Efficiency/r2_tick_profile.py): window, cuts, labels (with a refused
+    sequence as the negative control), tables, means, verdicts TK2-TK4.
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider benchmarks/Efficiency/tests_cpu/test_r2_fused.py
 """
@@ -345,6 +347,60 @@ def _child(script, tag):
 
 def test_F2_the_twin_kernel_under_the_interpreter():
     _child(TWIN_CHILD, "F2")
+
+
+def _o(name, ts, dur=1.0, rng=None, rid=None, corr=None, cls=None):
+    return dict(name=name, cat="kernel", cls=cls or "SMALL", dur_us=float(dur), range=rng, ts=float(ts), rid=rid,
+                corr=corr)
+
+
+def test_F4_tick_profile_pure_parts():
+    """F4: the pure parts of the tick profile M-T (benchmarks/Efficiency/r2_tick_profile.py): the window choice, the
+    tick cuts (eager region ranges, graph launches), the labels (TF's own; a graph tick's from its reference: equal
+    names, or equal without the twin with the fused kernels as t.twin; NEGATIVE CONTROL: another sequence is refused),
+    the per-tick tables and their means, and the verdicts TK2-TK4 (CONFIRMED on a table that meets them, REFUTED when
+    the fused tick saves nothing)."""
+    sys.path.insert(0, str(ROOT / "benchmarks/Efficiency"))
+    import r2_tick_profile as TPR
+    assert TPR.cap_label((8, 1), 8) == "G_d" and TPR.cap_label((32, 3), 8) == "G_v"
+    labels = ["G_d"] * 45 + ["G_v", "G_d", "G_v", "G_d", "G_d", "G_d", "G_v"]
+    assert TPR.pick_window(labels, 40, 6) == (42, 48)
+    assert TPR.pick_window(["G_d"] * 60, 40, 6) is None
+    ops = [_o("p", 1), _o("a", 2), _o("b", 5), _o("c", 6), _o("d", 9), _o("e", 10)]
+    segs = TPR.cut(list(reversed(ops)), [9, 2, 6])
+    assert [[o["name"] for o in s] for s in segs] == [["a", "b"], ["c"], ["d", "e"]]
+    eager = [_o("x", 3, rng="t.tick", rid="r1"), _o("y", 2, rng="t.tick", rid="r1"), _o("z", 8, rng="t.tick", rid="r2"),
+             _o("w", 1, rng="t.twin", rid="q"), _o("v", 0)]
+    assert TPR.tf_starts(eager) == [2.0, 8.0]
+    assert TPR.eager_ranges(eager) == ["-", "-", "-", "t.twin", "out"]
+    graph = [_o("a", 5, corr=7), _o("b", 4, corr=7), _o("c", 9, corr=8), _o("u", 1, corr=3)]
+    assert TPR.graph_starts(graph, {7, 8}) == [4.0, 9.0]
+    ref_names, ref_ranges = ["a", "b", "tw1", "tw2", "c"], ["-", "t.gemm", "t.twin", "t.twin", "out"]
+    same = [_o(n, i) for i, n in enumerate(ref_names)]
+    assert TPR.transfer(same, ref_names, ref_ranges) == (ref_ranges, "equal")
+    fused = [_o("a", 0), _o("b", 1), _o("_twin_kernel", 2, cls="TWINF"), _o("c", 3)]
+    assert TPR.transfer(fused, ref_names, ref_ranges) == (["-", "t.gemm", "t.twin", "out"], "equal without the twin")
+    lab, how = TPR.transfer([_o("a", 0), _o("x", 1), _o("c", 2)], ref_names, ref_ranges)
+    assert lab is None and how.startswith("differs")
+    t1 = TPR.tick_table(same, ref_ranges)
+    assert t1["total"] == [5, 5.0] and t1["ranges"]["t.twin"] == [2, 2.0] and t1["cross"]["t.gemm"] == {"SMALL": [1, 1.0]}
+    t2 = TPR.tick_table(fused, ["-", "t.gemm", "t.twin", "out"])
+    m = TPR.mean_tables([t1, t2])
+    assert m["ticks"] == 2 and m["total"] == dict(ops=4.5, ms=round(9.0 / 1e3 / 2, 4))
+    assert m["ranges"]["t.twin"] == dict(ops=1.5, ms=round(3.0 / 1e3 / 2, 4))
+    assert m["classes"]["TWINF"] == dict(ops=0.5, ms=round(1.0 / 1e3 / 2, 4))
+
+    def tab(total_ms, twin_ops, twin_ms):
+        return dict(ticks=3, total=dict(ops=0, ms=total_ms), ranges={"t.twin": dict(ops=twin_ops, ms=twin_ms)},
+                    classes={}, cross={})
+    prof = dict(TG=dict(G_v=tab(136.0, 18500, 30.0), G_d=tab(100.0, 6200, 10.0)),
+                TGF=dict(G_v=tab(106.4, 32, 0.4), G_d=tab(90.2, 32, 0.2)))
+    v = {n: x for n, x, _ in TPR.verdicts(prof)}
+    assert v == {"%s %s" % (k, c): "CONFIRMED" for k in ("TK2", "TK3", "TK4") for c in ("G_v", "G_d")}, v
+    prof["TGF"]["G_v"]["total"]["ms"] = 136.0
+    v = {n: x for n, x, _ in TPR.verdicts(prof)}
+    assert v["TK4 G_v"] == "REFUTED" and v["TK4 G_d"] == "CONFIRMED"
+    assert {x for _, x, _ in TPR.verdicts(dict(TG=prof["TG"]))} == {"UNDETERMINED"}
 
 
 def test_F3_the_body_kernel_under_the_interpreter():

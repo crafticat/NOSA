@@ -56,6 +56,8 @@ SH_RANGES = dict(update_no_compress_k_decode="sh.k", update_compress_k_decode="s
 # counted the attention (flash_fwd_splitkv_kernel, _combine_kernel) and stage 1 (flash_fwd_splitkv_stage1_kernel) as
 # GEMM, so Q4's ATTN was 0 in both arms. ATTN no longer takes a bare "splitkv": cuBLAS's splitKreduce stays GEMM.
 CLASS_RULES = (
+    ("TWINF", r"_twin_kernel"),                              # r2_twin_fused (the fused twin step)
+    ("BODYF", r"_body_kernel"),                              # r2_body_fused (the lean body)
     ("STAGE1", r"splitkv_stage1|stage1_kernel|infllm"),
     ("ATTN", r"flash_fwd|flash_attn"),
     ("GEMM", r"gemm|gemv|xmma|cutlass|cublas"),

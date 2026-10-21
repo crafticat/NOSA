@@ -128,6 +128,8 @@ process):
   - It runs 150 ragged steps with write-backs, then a refused step.
   - It uses the torch stand-ins of `tests/test_r2_decode_body.py`.
   - The three planted faults must be caught.
+- F4: the pure parts of the tick profile M-T (section 7), with a refused sequence as the
+  negative control.
 
 **GPU** (`benchmarks/Efficiency/r2_fused_cell.py`, `r2_fused_step.sh`):
 - GT: the fused twin is bitwise equal on the GPU, bfloat16, at the R2 sizes. MUST GT-EQ,
@@ -156,8 +158,49 @@ process):
 | F GPU ops | 1150 - 1260 per step (G 4841, SH 1269) |
 | F median period - SH median period | <= +0.5 ms |
 
-## 6. Not done here
+## 6. The tick takes the fused twin as it is
 
-The tick (the tick-capture worktree is pinned) can take `attach(twin)`:
-- It would make `advance_unchecked` one launch per layer, instead of T_cap x 72 ops.
-- `cb.cnt` and the strided key / cis cells are accepted as they are.
+The tick-capture worktree is pinned. Its code is in this worktree through the merge.
+- `attach(twin)` on the tick's twins makes `advance_unchecked` ONE launch per layer.
+- `cb.cnt` and the strided key / cis cells of `_layer_fixed` are accepted as they are.
+- The lean body is for `DecodeBody`. The tick has its own store and page path; the M-T profile
+  shows its cost (`t.pages`, `-`).
+
+## 7. M-T: the device profile of the captured tick (TC run tc1, holder 2190876)
+
+**The TC timing.** At B 8 the captured tick takes 143.68 ms per tick, of which the host part is
+7.68 ms. The tick is device-bound.
+
+**Why the twin is large in the tick.** The tick's twins use `fixed_order_mean` (the BI mode).
+Each summary is 65 small kernels: a cast of the first row, 31 casts and 31 adds, a divide and a
+cast. A twin step is about 190 kernels, against 72 for `step_fixed` with torch's `.mean`. Per
+layer, `advance_unchecked` runs T steps plus the counter stacks:
+- G_v (T 3): about 578 kernels per layer, 18,500 per tick;
+- G_d (T 1): about 194 kernels per layer, 6,200 per tick.
+
+At B 8 (16 banks) each kernel is 1.2-2.4 us.
+
+**The cell** (`benchmarks/Efficiency/r2_tick_profile.py`, `r2_tick_profile_step.sh`):
+- TE: the reference and the plan.
+- TF: eager, with ranges t.twin / t.stage1 / t.pool / t.select / t.pages / t.attn / t.gemm.
+  '-' is the rest of the region (the store writes, the row cells, rmsnorm, nosa_linear, rope,
+  silu, the residuals, the embedding, lm_head, the token log). 'out' is the work between regions
+  (the upload, the decision read, the events).
+- TG: captured; the ranges come from TF by tick and by name.
+- TGF: captured, with the fused twin.
+  - MUST TGF-EQ: it equals TE bitwise at every tick and at the end.
+  - Its profile takes TG's labels with the twin removed.
+
+All arms use the same window of 6 ticks, with at least 2 of each capacity. The output is ops and
+device ms per tick, per capacity, per range, per class and per range x class, plus the period.
+
+**Registered predictions (M-T, B 8, device per tick, the mean over the window's ticks of a
+capacity):**
+
+| prediction | G_v | G_d |
+|---|---|---|
+| TK2: TG t.twin ops | 16,000 - 21,000 | 5,500 - 7,200 |
+| TK2: TG t.twin ms | 22 - 45 | 7 - 16 |
+| TK3: TGF t.twin | 32 - 40 ops, <= 1.0 ms | 32 - 40 ops, <= 0.5 ms |
+| TK4: TG - TGF device ms | 21 - 44.5 | 6.5 - 15.5 |
+| TK1 (MUST TGF-EQ) | bitwise | bitwise |
