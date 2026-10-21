@@ -13,7 +13,7 @@ tick, against an attention kernel of order 0.1 ms at B 32.
 
 | step of `build_union` | depends on | ops (approx.) | now |
 |---|---|---|---|
-| groups: sort of seq_idx, newg, cummax, m, gid, grow scatter | seq_idx, rows_max | 12 | `build_groups`, ONCE PER TICK (the selector caches it per seq_idx OBJECT and its `_version`; the tick passes one seq_idx object to all 32 layers: `ctx.rb32` on the ResidentStore, `tk["seq_idx"]` on S-C / B2) |
+| groups: sort of seq_idx, newg, cummax, m, gid, grow scatter | seq_idx, rows_max | 12 | `build_groups`, ONCE PER TICK (the selector caches it per TICK TOKEN: the tick passes `group_token=ctx`, its per-tick context object, to every layer; plus the seq_idx object and rows_max; no token = rebuilt every call. Fix 2: the first version keyed on the seq_idx version counter, which inference tensors do not have, CPU job 2191241) |
 | entries (key << 32 / slot), gather by grow, sort, first, cumsum, ut / rowpos / uidx scatters | the layer's page_table, page_key, num_pages | about 25 | ONE kernel `_union_kernel` |
 | windows: pad, view, amin / amax, where, stack | uidx | about 8 | in the same kernel |
 | int32 casts / contiguous | - | 6 | the kernel writes int32 into `torch.empty` buffers (no launch) |
@@ -30,8 +30,9 @@ One program per (group g, KV head h), grid (R, Hkv) as the shared kernel. The N 
   stored to a scratch buffer; barrier;
 * pass B: uid(e) = the number of FIRST entries with a smaller v. Since every value has exactly one FIRST occurrence,
   uid is the number of DISTINCT values below v: the ascending, deduplicated order of build_union's sort. It writes
-  uidx, ut[uid] (FIRST entries), rowpos[j, uid] = i and the split windows (min / max uid per split k = i // PPS),
-  ucnt = the FIRST count; whole mode: win = (0, ucnt).
+  uidx, ut[uid] (FIRST entries), rowpos[j, uid] = i, ucnt = the FIRST count; whole mode: win = (0, ucnt);
+* pass C (split mode, after a barrier; section 7): per split k the stored uidx of positions [k PPS, (k + 1) PPS) of
+  all rows, min / max + 1 by unrolled compare-selects (empty: (0, 0)), as build_union.
 
 The outputs are integers, so "the same output" is exact equality, field by field. Cost per program: about
 2 x (N / TE)^2 tiles of TE x TE int64 compares (N = 4 x 68 = 272: 25 tile pairs per pass), no sort.
@@ -89,3 +90,28 @@ build_union_fused) and 504-593 (the second triton block); SharedKV gains `union`
 `build()` calls `_build`. The shared kernel's address arithmetic moved by + 130 lines against sharedkv2: q 332,
 workspace 370 / 373, bases 425-428, tile rows and loads 445-448 (the X-pool follow-up of docs/R2_SHAREDKV_PLAN.md
 section 7).
+
+## 7. Fixes after the CPU suite on a360d86 (job 2191241: 421 passed, 7 skipped, 3 failed)
+
+1. U4[split], U4[whole]: "Inference tensors do not track version counter". The production tick runs under
+   torch.inference_mode, and the group cache read `seq_idx._version`. Fix: the cache key is an explicit TICK TOKEN.
+   `TickEngine._layer` passes `group_token=ctx` (one SimpleNamespace per tick, built in run_rows, the same object for
+   all layers); `SharedKV` / `SharedKVProbe.bi_paged_decode(..., group_token=None)`; the cache holds (token,
+   seq_idx object, rows_max, grow) and keeps references to both objects; no token = rebuilt on every call. U3 and U4
+   now run under torch.inference_mode (U3 asserts `seq_idx.is_inference()`).
+2. U5: the kernel's `win` differed from build_union in all 24 SPLIT cases (whole mode and every other field
+   matched, so uid / uidx were right). The split windows were the only quantity computed by a different construct
+   than build_union: a masked [TE, SP] min / max over (entry, split) accumulated across the pass-B tile loop
+   (a360d86 `_union_kernel`, the `if not WHOLE:` block after the rowpos store, and the final `else:` store with
+   `hi1 = hi + 1`). The exact faulty step is NOT proven from the source alone: each line reads correct, and the
+   only primitives there that the passing fields did not use are the int tl.min / tl.max reductions (uid and ucnt
+   use tl.sum and matched). The interpreter's RuntimeWarning "invalid value encountered in subtract"
+   (interpreter.py:417, a binary op) may come from those reductions or from the attention kernels' -inf
+   arithmetic in the same child; not decided. Fix: pass C (after a third barrier; `_union_kernel` lines 586-598)
+   reads the STORED uidx back per split k over exactly build_union's (row, position) set with NO reduction
+   primitive: unrolled scalar loads (static NR x PPS) and compare-selects (tl.where), empty -> (0, 0). The hand
+   case pins the values, so a remaining fault will show as concrete numbers.
+3. New test `test_U7_hand_case_pins_win`: one request, 2 rows, P 4, PPS 2, hand-derived grow / ucnt / ut / uidx /
+   rowpos and windows split [[0, 3], [3, 5]], whole [[0, 5]], empty group (0, 0): build_union and the twin; U5's
+   interpreter child runs the KERNEL on it (tile sizes 2 and 16) and prints the windows on a mismatch.
+   `test_U6_fused_path_source` now expects 3 barriers and no version-counter use in SharedKV.

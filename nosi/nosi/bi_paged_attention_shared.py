@@ -57,7 +57,8 @@ separate change to piece 3's kernel; porting it here is a follow-up after both a
 INTERFACE:
     SharedKV(base, mode="split", rows_max=ROWS_MAX)    base = the loaded piece 3 module (pinned blob)
       .bi_paged_decode(q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len, softmax_scale=None,
-                       out=None, workspace=None, pages_per_split=PPS, page_key=None, rows_max=None)
+                       out=None, workspace=None, pages_per_split=PPS, page_key=None, rows_max=None,
+                       group_token=None)      [sharedkv3] group_token: the tick's per-tick object (the group cache key)
         page_key (R, Hkv, P) int32: the block id of each listed page (the tick's selection, compacted like the table).
         Without page_key, or with rows_max == 1 (no request has two rows: nothing to share), it calls piece 3 itself
         (the reference / serial paths call without keys); .stats counts each kind of call, so a gate can assert the
@@ -281,9 +282,6 @@ def build_union_fused(seq_idx, page_table, num_pages, page_key, rows_max: int, p
     N = NR * P
     U = N
     S = 1 if whole else -(-P // int(pps))
-    SP = 2                                             # tl.arange needs a power of two; 2 avoids a 1-wide range
-    while SP < S:
-        SP *= 2
     dev = page_table.device
     e32 = dict(dtype=torch.int32, device=dev)
     ut = torch.empty((R, Hkv, U), **e32)
@@ -299,7 +297,7 @@ def build_union_fused(seq_idx, page_table, num_pages, page_key, rows_max: int, p
             ut.stride(0), ut.stride(1), ucnt.stride(0), rowpos.stride(0), rowpos.stride(1), rowpos.stride(2),
             win.stride(0), win.stride(1), win.stride(2), uidx.stride(0), uidx.stride(1), uidx.stride(2),
             first.stride(0), first.stride(1),
-            NR=NR, P=P, N=N, PPS=int(pps), S=S, SP=SP, TE=int(te), WHOLE=whole is True, DEDUP=bool(dedup))
+            NR=NR, P=P, N=N, PPS=int(pps), S=S, TE=int(te), WHOLE=whole is True, DEDUP=bool(dedup))
     return dict(grow=grow, ut=ut, ucnt=ucnt, rowpos=rowpos, win=win, uidx=uidx, rows_max=NR, whole=whole is True,
                 pps=int(pps))
 
@@ -523,13 +521,14 @@ if triton is not None:      # [sharedkv3] the fused union build (a second triton
                       s_ptr, s_pth, s_npr, s_gr, s_utr, s_uth, s_ucr, s_rpr, s_rph, s_rpj, s_wr, s_wh, s_ws,
                       s_uxr, s_uxh, s_uxj, s_fr, s_fh,
                       NR: tl.constexpr, P: tl.constexpr, N: tl.constexpr, PPS: tl.constexpr, S: tl.constexpr,
-                      SP: tl.constexpr, TE: tl.constexpr, WHOLE: tl.constexpr, DEDUP: tl.constexpr):
+                      TE: tl.constexpr, WHOLE: tl.constexpr, DEDUP: tl.constexpr):
         """[sharedkv3] ONE program per (group g, KV head h): build_union's per-layer outputs for (g, h) (the twin is
         build_union_fused_reference). Pass 0 fills ut / rowpos with -1; pass A marks the FIRST entries (listed, and no
         earlier row of the group lists the same value) into the scratch FIRST; pass B gives each listed entry its uid
-        (the count of FIRST entries with a smaller value), writes uidx, ut[uid] (FIRST entries), rowpos[j, uid] and the
-        split windows (min / max uid per split k of the rows' list positions). Barriers order the passes (global
-        writes of the CTA are visible after the barrier). DEDUP False is the NEGATIVE CONTROL."""
+        (the count of FIRST entries with a smaller value), writes uidx, ut[uid] (FIRST entries) and rowpos[j, uid];
+        pass C (split mode) reads uidx back and writes the split windows (min / max uid over the rows' list positions
+        of split k, by unrolled compare-selects). Barriers order the passes (global writes of the CTA are visible after the barrier). DEDUP False
+        is the NEGATIVE CONTROL."""
         g = tl.program_id(0)
         h = tl.program_id(1)
         ar = tl.arange(0, TE)
@@ -555,10 +554,7 @@ if triton is not None:      # [sharedkv3] the fused union build (a second triton
             tl.store(FIRST + g * s_fr + h * s_fh + f, first.to(tl.int32), mask=f < N)
         tl.debug_barrier()
         cnt = tl.zeros([TE], dtype=tl.int32)
-        kk = tl.arange(0, SP)
-        lo = tl.full([SP], 2147483647, tl.int32)
-        hi = tl.full([SP], -1, tl.int32)
-        for e0 in range(0, N, TE):                                   # pass B: uid, uidx, ut, rowpos, windows
+        for e0 in range(0, N, TE):                                   # pass B: uid, uidx, ut, rowpos (windows: pass C)
             e = e0 + ar
             ve, oke, je, ie = _union_entries(PT, NP, KEY, GROW, g, h, e, s_ptr, s_pth, s_npr, s_gr, N, P)
             uid = tl.zeros([TE], dtype=tl.int32)
@@ -574,21 +570,32 @@ if triton is not None:      # [sharedkv3] the fused union build (a second triton
             tl.store(UIDX + g * s_uxr + h * s_uxh + je * s_uxj + ie, tl.where(oke, uid, -1), mask=me)
             tl.store(UT + g * s_utr + h * s_uth + uid, (ve & 0xFFFFFFFF).to(tl.int32), mask=me & (fe != 0))
             tl.store(ROWPOS + g * s_rpr + h * s_rph + je * s_rpj + uid, ie.to(tl.int32), mask=me & oke)
-            if not WHOLE:
-                sel = oke[:, None] & ((ie // PPS)[:, None] == kk[None, :])
-                lo = tl.minimum(lo, tl.min(tl.where(sel, uid[:, None], 2147483647), 0))
-                hi = tl.maximum(hi, tl.max(tl.where(sel, uid[:, None], -1), 0))
         total = tl.sum(cnt, 0)
         tl.store(UCNT + g * s_ucr + h, total)
         if WHOLE:
             tl.store(WIN + g * s_wr + h * s_wh, 0)
             tl.store(WIN + g * s_wr + h * s_wh + 1, total)
         else:
-            hi1 = hi + 1
-            lo = tl.where(hi1 > 0, lo, 0)
-            mk = kk < S
-            tl.store(WIN + g * s_wr + h * s_wh + kk * s_ws, lo, mask=mk)
-            tl.store(WIN + g * s_wr + h * s_wh + kk * s_ws + 1, hi1, mask=mk)
+            # [sharedkv3 fix, CPU job 2191241] pass C: the split windows from the STORED uidx, as build_union does
+            # (pad, view (NR, S, PPS), amin / amax). The first version accumulated lo / hi per split inside pass B
+            # (an [TE, SP] masked min / max carried across the tile loop); it gave other windows than build_union
+            # in all 24 split cases under the interpreter while uidx itself matched (tl.sum reductions, used for uid
+            # and ucnt, were right; the windows were the only tl.min / tl.max reductions). Pass C reads uidx back
+            # per split over exactly build_union's (row, position) set, with NO reduction primitive: unrolled scalar
+            # loads and compare-selects (min / max by tl.where only).
+            tl.debug_barrier()
+            for k in range(0, S):
+                lo_k = g * 0 + 2147483647                                # int32 scalars (program_id arithmetic)
+                hi_k = g * 0
+                for j in tl.static_range(NR):
+                    for i in tl.static_range(PPS):
+                        pos = k * PPS + i
+                        x = tl.load(UIDX + g * s_uxr + h * s_uxh + j * s_uxj + pos, mask=pos < P, other=-1)
+                        lo_k = tl.where((x >= 0) & (x < lo_k), x, lo_k)
+                        hi_k = tl.where(x + 1 > hi_k, x + 1, hi_k)
+                lo_k = tl.where(hi_k > 0, lo_k, 0)
+                tl.store(WIN + g * s_wr + h * s_wh + k * s_ws, lo_k)
+                tl.store(WIN + g * s_wr + h * s_wh + k * s_ws + 1, hi_k)
 else:                                                  # pragma: no cover
     _union_kernel = None
 
@@ -800,14 +807,15 @@ class SharedKV:
         """impl 'kernel': the Triton kernels (GPU, or the interpreter); 'reference': the torch twins (the CPU tick
         tests): piece 3's bi_paged_decode_reference and bi_paged_decode_shared_reference.
         [sharedkv3] union 'torch' (default: build_union, about 50 ops per call) or 'fused': the groups once per tick
-        (build_groups, cached per seq_idx object and version) and the union in ONE kernel per call
+        (build_groups, cached per tick token + seq_idx object + rows_max) and the union in ONE kernel per call
         (build_union_fused; with impl 'reference' its torch twin build_union_fused_reference)."""
         if mode not in MODES or impl not in self.IMPLS or union not in self.UNIONS:
             raise ValueError("mode %r not in %s / impl %r not in %s / union %r not in %s"
                              % (mode, MODES, impl, self.IMPLS, union, self.UNIONS))
         self.base, self.mode, self.rows_max, self.impl = base, mode, int(rows_max), impl
         self.union = union
-        self._gcache = None                               # (seq_idx object, its _version, rows_max, grow)
+        self._gcache = None                               # (tick token, seq_idx object, rows_max, grow)
+        self._token = None                                # the current call's group_token (set per call)
         self.group_builds = 0                             # build_groups calls (tests: once per tick, not per layer)
         self.build_page_table = base.build_page_table
         self.PAGE, self.PAGES_PER_SPLIT = base.PAGE, base.PAGES_PER_SPLIT
@@ -822,15 +830,18 @@ class SharedKV:
                                          pages_per_split=pps)
 
     def _groups(self, seq_idx, nr):
-        """[sharedkv3] build_groups once per tick: the cache holds the seq_idx OBJECT (so its storage cannot be reused
-        by another tensor while cached) and its in-place version counter; another object, an in-place change or
-        another rows_max rebuilds."""
+        """[sharedkv3] build_groups once per tick. The cache key is the caller's TICK TOKEN (group_token: the tick
+        passes its per-tick context object, the same object to every layer of the tick and a new one each tick),
+        plus the seq_idx object and rows_max; the cache holds references to both objects, so neither identity can be
+        reused by another object while cached. No token (None): rebuilt on every call (correct, not cached).
+        (The first version keyed on the seq_idx version counter; inference tensors have none: CPU job 2191241.)"""
+        tok = self._token
         c = self._gcache
-        if c is not None and c[0] is seq_idx and c[1] == seq_idx._version and c[2] == nr:
+        if tok is not None and c is not None and c[0] is tok and c[1] is seq_idx and c[2] == nr:
             return c[3]
         grow = build_groups(seq_idx, nr)
         self.group_builds += 1
-        self._gcache = (seq_idx, seq_idx._version, nr, grow)
+        self._gcache = (tok, seq_idx, nr, grow) if tok is not None else None
         return grow
 
     def _build(self, args, page_key, nr, pps):
@@ -857,7 +868,8 @@ class SharedKV:
 
     def bi_paged_decode(self, q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len,
                         softmax_scale=None, out=None, workspace=None, pages_per_split=None, page_key=None,
-                        rows_max=None):
+                        rows_max=None, group_token=None):
+        self._token = group_token                         # [sharedkv3] the tick's per-tick token (or None)
         pps = self.base.PAGES_PER_SPLIT if pages_per_split is None else pages_per_split
         nr = self.rows_max if rows_max is None else min(int(rows_max), self.rows_max)
         args = (q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len)
@@ -911,12 +923,14 @@ class SharedKVProbe(SharedKV):
 
     def bi_paged_decode(self, q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len,
                         softmax_scale=None, out=None, workspace=None, pages_per_split=None, page_key=None,
-                        rows_max=None):
+                        rows_max=None, group_token=None):
         nr = self.rows_max if rows_max is None else min(int(rows_max), self.rows_max)
         if page_key is None or nr <= 1:
             return super().bi_paged_decode(q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len,
                                            softmax_scale=softmax_scale, out=out, workspace=workspace,
-                                           pages_per_split=pages_per_split, page_key=page_key, rows_max=rows_max)
+                                           pages_per_split=pages_per_split, page_key=page_key, rows_max=rows_max,
+                                           group_token=group_token)
+        self._token = group_token                         # [sharedkv3] the tick's per-tick token (or None)
         self.stats["shared"] += 1
         pps = self.base.PAGES_PER_SPLIT if pages_per_split is None else pages_per_split
         args = (q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len)

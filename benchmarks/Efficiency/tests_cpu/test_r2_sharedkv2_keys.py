@@ -67,7 +67,7 @@ def ops_with(attn):
 def key_only(p3):
     """An attention object that asks for keys (needs_page_key) and runs piece 3's twin, ignoring them: the keys flow
     through the production tick, the outputs stay piece 3's (a wrong key cannot raise inside the attention)."""
-    def call(*args, page_key=None, rows_max=None):
+    def call(*args, page_key=None, rows_max=None, group_token=None):       # [sharedkv3] the tick's per-tick token
         assert page_key is not None and page_key.dtype == torch.int32
         return p3.bi_paged_decode_reference(*args)
     return SimpleNamespace(needs_page_key=True, bi_paged_decode=call, build_page_table=p3.build_page_table)

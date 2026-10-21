@@ -712,7 +712,8 @@ class TickEngine:
         akw = {}
         if getattr(self.ops.attn, "needs_page_key", False):                # [sharedkv] the selector (default: piece 3)
             with self._span("res"):
-                akw = dict(page_key=self.backend.page_keys(l, ctx, sel, layer, plan=plan), rows_max=ctx.rows_max)
+                akw = dict(page_key=self.backend.page_keys(l, ctx, sel, layer, plan=plan), rows_max=ctx.rows_max,
+                           group_token=ctx)                  # [sharedkv3] one ctx object per tick: the group cache key
         with self._span("att"):
             attn = self.ops.attn.bi_paged_decode(q, self.store_k[l], self.store_v[l], self.store_bias[l], seq_idx,
                                                  table, npg, last, **akw)
