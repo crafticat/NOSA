@@ -162,3 +162,18 @@ Where I expect it to break:
 4. Extend the lockstep with the end_request, cancel_epoch, two-draft-rows, void-tick, T4 and F15 scripts (section 2),
    and with the missing planted kinds (section 3).
 5. Split the cost benchmark by component; sort only the streams that need it.
+
+## 6. Corrections (C, 2026-10-21, after writing the shared fixtures; note 12m of R2_STEP7_FETCH_RETENTION.md)
+
+1. I8 (section 1) is WRONG about the end state. One eviction after all draft rows gives the SAME LRU, PO and released
+   sets as K3X O1's per-row evictions: phase A protects every selected block (K2), so an earlier row's eviction moves
+   a later row's block to PO (never releases it), and the later row acquires it back. Only the transitions differ
+   (fixture o1_two_rows: acquire 2 + evict_po 2 per row; acquire 1 + touch 1 + evict_po 1 in one batch). So a batch
+   I8 is state- and mirror-equivalent; it differs only in the per-kind journal counts. Item 2 of section 5 ("I8 per
+   row-index round") is needed only if B2 reports the journal counts. The example of section 2 (C 2, X 0) cannot
+   reach the case either (X 0 refuses the third block); the fixture uses X 2, R_ver 0.
+2. Kind 6 (section 3) does not free one poll late in the vendored model: the transport waits on the forwarded reader
+   before it lands, so the reader is done at the drop. The defect shows only in the reader projection (fixture
+   nonmono, plant drop_keeps_reader).
+3. Kinds 4 and 6 apply to the vendored path after all: kind 4 in B1's form (the pin table's key ids; fixture
+   key_alias), kind 6 through the readers.

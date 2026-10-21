@@ -2203,3 +2203,250 @@ def test_F23_every_triton_kernel_resolves_its_names_in_its_module():
             tl_local.store(x_ptr + offs, offs)
         return planted
     assert _kernel_name_problems(factory()) == ["tl_local"]
+
+
+# =====================================================================================================================
+# R6 the SHARED LOCKSTEP FIXTURES (r2_lockstep_fixtures.py, note 12m): v1 == S-C dense == S-C sparse on the scripts
+# that the lockstep schedules never reach, and planted defects (the review's 8 missing kinds included) caught at
+# their predicted operations
+# =====================================================================================================================
+def _load_fixtures():
+    name = "r2_lockstep_fixtures"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, str(Path(__file__).resolve().parent / (name + ".py")))
+        m = importlib.util.module_from_spec(spec)
+        sys.modules[name] = m
+        spec.loader.exec_module(m)
+    return sys.modules[name]
+
+
+FXM = _load_fixtures()
+
+
+class BatchRecency(RES.Residency):
+    """DEFECT (review kind 8): the layer's draft recency touches / acquires the READY blocks of EVERY draft row first
+    and evicts once per stream after all rows, instead of K3X O1's evict_to_c after each (row, stream)."""
+
+    def _draft_recency(self, l, rows, got_all):
+        pool = self.pools[l]
+        streams = []
+        for i, r in enumerate(rows):
+            if r.kind != "d":
+                continue
+            for h in range(self.H):
+                st = pool.stream(r.b, h)
+                for (t, idx, gen) in sorted(got_all.get((i, h), [])):
+                    if t in st.lru:
+                        st.touch(t)
+                    elif t in st.po or t in st.vres:
+                        st.acquire(t, self.mut, evict=False)
+                if st not in streams:
+                    streams.append(st)
+        for st in streams:
+            st.evict_to_c(self.mut)
+
+
+class NoT4Refusal(RES.Residency):
+    """DEFECT (review kind 2): a take of a block past the prefill without a registered host write-back is accepted."""
+
+    def _hist_ev_for(self, b, block):
+        return self.hist_ev.get((b, block))
+
+
+class CancelledAccepted(RES.Residency):
+    """DEFECT (review kind 3, with no_late_protection_guard): the cancelled-key check of _check_rows is skipped."""
+
+    def _check_rows(self, l, rows, sel):
+        cancelled, self.cancelled = self.cancelled, set()
+        try:
+            super()._check_rows(l, rows, sel)
+        finally:
+            self.cancelled = cancelled
+
+
+class PollOrderSwapped(RES.Residency):
+    """DEFECT (review kind 5): poll runs the queued reference drops BEFORE the arrivals."""
+
+    def poll(self):
+        keep = []
+        for (key, l) in self.queue:
+            if RES.ev_done(self.key_reader.get((key, l))):
+                self._drop(key, l)
+            else:
+                keep.append((key, l))
+        self.queue = keep
+        self.poll_arrivals()
+        for pool in self.pools:
+            pool.poll_releases(self.mut)
+        self.metrics.sample_memory()
+
+
+class DropKeepsReader(RES.Residency):
+    """DEFECT (review kind 6): a dropped arrival (drop_unowned, drop_vres_unprotected) keeps the slot's last reader."""
+
+    def _admit(self, tr):
+        s = self.stream(tr.layer, tr.b, tr.h).slots[tr.slot]
+        keep = s.last_reader
+        res = super()._admit(tr)
+        if s.state == OWN.RELEASING:
+            s.last_reader = keep
+        return res
+
+
+class LostForward(RES.Residency):
+    """DEFECT (review kind 7): a take drops the slot's last reader (the T3 forward to the transfer is lost)."""
+
+    def _take(self, l, b, h, block, key, kind, at=None, evicted=False, bias=True):
+        tr = super()._take(l, b, h, block, key, kind, at=at, evicted=evicted, bias=bias)
+        if tr is not None:
+            tr.reader_ev = None
+            self.stream(l, b, h).slots[tr.slot].last_reader = None
+        return tr
+
+
+class TrashWriter(RES.Residency):
+    """DEFECT (F15's control): the bias fill of a take also writes the trash slot."""
+
+    def _fill_bias(self, l, b, h, slot, block):
+        super()._fill_bias(l, b, h, slot, block)
+        if self.trash_slot is not None and self.store_b is not None:
+            s0 = self.trash_slot * self.bs
+            self.store_b[l][b, s0:s0 + self.bs, h] = 0.0
+
+
+class IgnoresFlags(SC.ResidencySC):
+    """DEFECT (F16's control): the watched device flags are never read."""
+
+    def watch_flag(self, name, flag):
+        return None
+
+
+class VoidKeepsPins(SP.ResidencySparse):
+    """DEFECT (B1): a void tick keeps the device pin table's entries (no epoch bump)."""
+
+    def _void_pins(self):
+        return None
+
+
+class KeyAliasSparse(SP.ResidencySparse):
+    """DEFECT (review kind 4, B1's form): one key id per REQUEST in the device pin table, so two live keys alias."""
+
+    def _tick_extra(self, rows):
+        kids = [self._kids.setdefault(r.key[0], len(self._kids) + 1) for r in rows]
+        return kids + [e for per_l in self._epoch for e in per_l]
+
+
+_FX_BASE = dict(v1=(RES.Residency, dict(poll_in_resolve=False, defer_issue=True, defer_admit=True)),
+                sc=(SC.ResidencySC, dict(nblk=NB)), sparse=(SP.ResidencySparse, dict(nblk=NB)))
+_FX_PLANT_KW = dict(
+    dup_take_device=lambda: dict(svc_kw=dict(sb_mut={"no_dedup": True})),
+    dup_take_host=lambda: dict(cls=NoDedup),
+    owner_not_mirrored=lambda: dict(svc_kw=dict(mirror_drop={"owner"})),
+    owner_blind=lambda: dict(cls=OwnerBlindInFlight),
+    no_uid_check=lambda: dict(mut=MU.Mutations(no_uid_check=True)),
+    free_on_cancel=lambda: dict(mut=MU.Mutations(free_on_cancel=True)),
+    cancel_refusal_off=lambda: dict(cls=CancelledAccepted, mut=MU.Mutations(no_late_protection_guard=True)),
+    late_guard_off=lambda: dict(mut=MU.Mutations(no_late_protection_guard=True)),
+    batch_recency=lambda: dict(cls=BatchRecency),
+    no_overflow_flag=lambda: dict(svc_kw=dict(sc_mut={"no_overflow_flag": True})),
+    flag_ignored=lambda: dict(cls=IgnoresFlags),
+    void_keeps_pins=lambda: dict(cls=VoidKeepsPins),
+    no_t4_refusal=lambda: dict(cls=NoT4Refusal),
+    trash_written=lambda: dict(cls=TrashWriter),
+    no_reader_wait=lambda: dict(mut=MU.Mutations(no_reader_wait=True)),
+    lost_forward=lambda: dict(cls=LostForward),
+    drop_keeps_reader=lambda: dict(cls=DropKeepsReader),
+    poll_order_swapped=lambda: dict(cls=PollOrderSwapped),
+    key_alias=lambda: dict(cls=KeyAliasSparse),
+)
+
+
+def _fx_world(fx, name, cls=None, mut=None, svc_kw=None):
+    """World `name` ("v1": v1 under the S-C schedule; "sc": S-C dense; "sparse": S-C sparse, B1) of fixture fx:
+    force_only (a transfer lands only when a wait or a "land" forces it), the fixture's capacities and trash slot."""
+    base_cls, base_kw = _FX_BASE[name]
+    w = world(C=fx.C, X=fx.X, R_ver=fx.R_ver, seed=0, mode="force_only", mut=mut, cls=cls or base_cls,
+              svc_kw=dict(base_kw, **(svc_kw or {})), trash=fx.trash)
+    if fx.trash:
+        _fill_trash(w)
+    return w
+
+
+def _journal_kinds(svc):
+    """The stream transitions per kind (a release by its reason): S-C's journal_counts, or v1's Stream.log counted
+    the same way (the sparse record counts its draft touches without a log record)."""
+    jc = getattr(svc, "journal_counts", None)
+    if jc is None:
+        jc = collections.Counter()
+        for pool in svc.pools:
+            for st in pool.streams.values():
+                for e in st.log:
+                    jc[e[0] if e[0] != "release" else "release:%s" % (e[4],)] += 1
+    return sorted((k, v) for k, v in jc.items() if v)
+
+
+def _fx_snapshot(w, tags):
+    """The vendored snapshot of the fixtures, after every operation: the ownership state (_state), the counters, every
+    slot's first / last reader by name, the transfers in flight with their forwarded reader and write-back flag (T3,
+    T4), the transitions per kind, the RELEASING slots with a pending last reader, S-C's device mirror against the
+    full scan (after its delta; v1: none), and the trash sentinel."""
+    svc = w.svc
+    mirror = []
+    if hasattr(svc, "dmirror"):
+        svc.sync_mirror()
+        mirror = [(l, d) for l in range(L) for d in _mirror_diff(svc, l)]
+
+    def tag(ev):
+        return "-" if ev is None else tags.get(id(ev), "?")
+    return dict(
+        state=_state(w), counters=_counters(svc), readers=_reader_tags(svc, tags),
+        forward=sorted((tr.layer, tr.b, tr.h, tr.block, tr.slot, tr.gen, tag(tr.reader_ev), tr.hist_ev is not None)
+                       for tr in svc.inflight.values()),
+        journal=_journal_kinds(svc), gates=sum(len(pool.releasing_gates()) for pool in svc.pools),
+        mirror=mirror, trash=_trash_intact(w) if svc.trash_slot is not None else None)
+
+
+@pytest.mark.parametrize("name", sorted(FXM.FIXTURES))
+def test_R6a_the_worlds_agree_on_each_shared_fixture(name):
+    """R6a: on each shared fixture (r2_lockstep_fixtures.py) v1 under the S-C schedule, S-C dense and S-C sparse (B1)
+    raise the same exceptions, return the same values (a tick: its page tables) and have equal snapshots after EVERY
+    operation (state, counters, readers, forwarded readers and write-backs, transitions per kind, pending gates, the
+    device mirror against the full scan, the trash sentinel). Every operation runs (a terminal raise is the last
+    one). The fixture's precondition holds: its transition happened (counted)."""
+    fx = FXM.FIXTURES[name]
+    worlds = {n: _fx_world(fx, n) for n in fx.worlds}
+    res = FXM.run(fx, worlds, _fx_snapshot, Row)
+    assert res.diffs == [], res.diffs[:1]
+    assert len(res.raised) == len(fx.ops), (name, len(res.raised), len(fx.ops))
+    assert fx.pre(res, worlds[fx.worlds[0]]), (name, fx.doc)
+
+
+_R6_PLANTS = [pytest.param(name, p, id="%s-%s" % (name, p.name)) for name in sorted(FXM.FIXTURES)
+              for p in FXM.FIXTURES[name].plants]
+
+
+@pytest.mark.parametrize("name, plant", _R6_PLANTS)
+def test_R6b_a_planted_defect_is_caught_at_its_operation(name, plant):
+    """R6b (planted defects): one world of the fixture carries the plant's defect. The lockstep reports its FIRST
+    difference at the predicted operation, by the predicted field ("raise": the worlds raise differently; "value": a
+    tick's page tables differ; else the first differing snapshot field). R6a is the precondition (without the defect
+    the worlds agree)."""
+    fx = FXM.FIXTURES[name]
+    worlds = {n: _fx_world(fx, n, **(_FX_PLANT_KW[plant.name]() if n == plant.world else {})) for n in fx.worlds}
+    res = FXM.run(fx, worlds, _fx_snapshot, Row)
+    assert res.diffs, (name, plant.name, "not caught", plant.defect)
+    i, what, detail = res.diffs[0]
+    assert (i, what if what != "snapshot" else detail["field"]) == (plant.at, plant.field), (name, plant.name,
+                                                                                            res.diffs[0])
+
+
+def test_R6c_the_fixtures_plant_every_review_kind():
+    """R6c: the plants cover the review's 8 missing kinds (docs/R2_OWN2_B2_REVIEW_C.md section 3); every plant has a
+    defective world here and names a world of its fixture; every fixture's first world is a vendored one (its
+    precondition reads it)."""
+    plants = [(fx, p) for fx in FXM.FIXTURES.values() for p in fx.plants]
+    missing = set(FXM.REVIEW_KINDS) - {p.kind for _, p in plants}
+    assert not missing, sorted(missing)
+    assert sorted(_FX_PLANT_KW) == sorted(p.name for _, p in plants)
+    assert all(p.world in fx.worlds for fx, p in plants)
+    assert all(fx.worlds[0] in _FX_BASE for fx in FXM.FIXTURES.values())

@@ -899,6 +899,86 @@ TESTS (`test_r2_residency.py`, R5):
 - R5e: the lint: the per-layer device path has no host read or copy; the consumer has the one read.
 - REPORT R5 microbench: apply_tick dense vs sparse at the B 64 geometry (2 layers, extrapolated to 32).
 
+## 12m. Shared lockstep fixtures: the transitions the schedules never reach (branch feature/nosi-r2-m2-sparse)
+
+WHY. The lockstep schedules (F6, F12b, F20b, F21b, F22) only call `decided()` and complete readers two ticks late,
+in order. So they never reach end_request, cancel, two draft rows of one stream, void ticks, T4, the trash slot or
+non-monotone readers (the B2 review, `docs/R2_OWN2_B2_REVIEW_C.md` section 2).
+
+WHAT. `benchmarks/Efficiency/tests_cpu/r2_lockstep_fixtures.py`, a module that needs only torch:
+- A FIXTURE is a short script of operations (begin, end, tick, poll, land, done, decided, cancel, cancel_epoch,
+  history, watch, flag, raise), with its capacities, its worlds, a counted precondition and its plants.
+- `run(fixture, worlds, snapshot, Row)` applies each operation to every world in lockstep. After each operation it
+  compares the raised exception (by class name), the returned value (a tick returns its page tables) and the
+  snapshot. The first difference ends the run and names its operation and its field ("raise", "value", or the first
+  differing snapshot field).
+- A PLANT is a defect in ONE world, with the operation and the field where the lockstep must see it first.
+- B2's lockstep imports the same module: it puts a vendored world first (the preconditions read it) and its own
+  world after it. The world may give its own `land()`.
+
+THE FIXTURES (all on v1 under the S-C schedule, S-C dense and S-C sparse, force_only transports; void_flag on S-C
+dense and sparse only, v1 has no device flags):
+
+| fixture | review item | transition reached (precondition, counted) | plants (operation, field) |
+|---|---|---|---|
+| end_request | (a) F13 / F14b + a land | the dedup merge (no take); release:end; u1's verifier takes its own slot (new, no in-flight look); drop_unowned at the final land | dup_take_device (4, raise), dup_take_host (4, state), owner_not_mirrored (5, mirror), owner_blind (7, value), no_uid_check (8, raise) |
+| cancel | (b) F3 / F11 | a cancelled key refused (op 4); arrivals after the cancel; the late-protection guard (op 7); cancel_epoch returns [K2] | free_on_cancel (2, state), cancel_refusal_off (4, raise), late_guard_off (7, raise) |
+| o1_two_rows | (c) I8's O1 rounds, C 2 | two draft rows of one stream: block 2 goes PO (row 1's evict_to_c) and is acquired back (row 2) | batch_recency (3, journal) |
+| void_overflow | (d) F12f | CapacityRefusal (terminal) | no_overflow_flag (1, raise) |
+| void_flag | (d) F16 | a set flag voids that tick (state and counters unchanged); the next tick applies | flag_ignored (4, raise), void_keeps_pins (6, state) |
+| t4 | (d) T4 | the take of block 5 carries its write-back; block 6 is refused (terminal) | no_t4_refusal (3, raise) |
+| trash | (d) F15 | takes, arrivals, an urgent gather: the trash sentinel stays; a tail naming the trash slot is refused (terminal) | trash_written (1, trash) |
+| nonmono | (d) F12e | a pending earlier reader while a later one is done; the urgent take avoids its slot; the T3 forward of e1; drop_unowned resets the reader | no_reader_wait (6, value), lost_forward (9, readers), drop_keeps_reader (12, readers) |
+| vres_drop | the poll order | admit_vres then release:unprotect in one poll (no drop_vres_unprotected) | poll_order_swapped (2, readers) |
+| key_alias | key ids | two live keys pin one block (prot = {K1, K2}) | key_alias (2, state) |
+
+THE REVIEW'S 8 MISSING KINDS, on the vendored path (R6c checks the coverage):
+1. A take of a block that is in flight: dup_take_device (the device; the host's take check refuses it),
+   dup_take_host (the host; a second transfer).
+2. T4: no_t4_refusal.
+3. A cancelled key / a row after its release was queued: late_guard_off; cancel_refusal_off. The vendored code
+   refuses a cancelled key TWICE: `cancel()` also queues the key's release at every layer, so the late-protection
+   guard refuses it when the cancelled check is off. Only both off accept it.
+4. Key aliasing: B1's form (`key_alias`): one key id per request in B1's pin table. B1 never reuses an id, so the
+   plant aliases two LIVE keys. B2's key-slot reuse is the same class: a new key that inherits a stale pin bit.
+5. The poll order swapped: poll_order_swapped.
+6. A drop that keeps the reader: drop_keeps_reader. CORRECTION of the review (section 3, kind 6): in the vendored
+   model the dropped slot does NOT free one poll late. The transfer carried the slot's previous reader (T3), and the
+   transport waits on it before it lands, so that reader is done at the drop. The defect shows only in the reader
+   projection (the slot's last reader is kept instead of reset).
+7. The T3 forward lost: lost_forward.
+8. One batch eviction for two draft rows: batch_recency.
+
+CORRECTION OF THE REVIEW, I8 (section 1, row I8). The review said that one eviction after all draft rows "gives a
+different LRU". That is WRONG for the end state. Proof sketch:
+- Phase A protects every block that a draft row selects (K2), so no block that a later row reads is released by an
+  earlier row's eviction: it goes PO and the later row acquires it back.
+- Let order1 be the recency order after row 1's moves and order2 after row 2's moves. A block x that row 2 does not
+  read and that is in the last C of order2 has at most as many blocks after it in order1 as in order2. So it is in
+  the last C of order1: row 1's eviction did not remove it.
+- So per-row and batch evictions keep the same LRU (the last C of order2, in that order), and the same PO / released
+  sets (a protected victim goes PO, an unprotected one is released, in both).
+- Only the TRANSITIONS differ: o1_two_rows has acquire 2 + evict_po 2 per row; the batch has acquire 1 + touch 1 +
+  evict_po 1. The stamps (same order) and the mirror marks (the same slots) are equal too.
+- So the state, the mirror and the readers cannot see the batch defect. The journal (S-C's journal_counts) can, and
+  the planted batch_recency is caught there. For B2: a batch eviction is state-equivalent; if B2 reports the journal
+  counts, it must count the per-row transitions.
+- The review's own example (C 2, X 0: draft [0, 1, 2]) cannot reach the case: with X 0 the third block is refused.
+  The fixture uses X 2, R_ver 0.
+
+TESTS (`test_r2_residency.py`, R6):
+- R6a: per fixture, the worlds agree after every operation; every operation runs; the precondition holds.
+- R6b: per plant, the first difference is at the predicted operation and field.
+- R6c: the plants cover the 8 review kinds; every plant has its defective world; every fixture's first world is a
+  vendored one.
+- The snapshot (`_fx_snapshot`): `_state`, `_counters`, the readers by name, the transfers in flight with their
+  forwarded reader and write-back flag, the transitions per kind (`_journal_kinds`: S-C's journal_counts, or v1's
+  Stream.log counted the same way), the RELEASING slots with a pending reader, S-C's mirror against the full scan,
+  and the trash sentinel.
+
+NOT RUN (static work only, no interpreter). The predicted operations and fields come from reading the code; the CPU
+run decides.
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,
