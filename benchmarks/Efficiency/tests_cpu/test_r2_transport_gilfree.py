@@ -425,7 +425,9 @@ def test_GT6b_the_feeder_publishes_into_an_inference_board(pk):
     host truth and publishes every transfer's (slot, generation). Negative control: the feeder without the board's mode
     (thread_inference forced off after attach_board, as 7ab1ca2 had it) packs and lands the rows, then the publication
     raises the run's error, re-raised at force(); the Python feeder's traceback names the frames _feeder, _release and
-    _publish (the C++ worker's error is its message)."""
+    _publish (the C++ worker's error is its message). The modes checked are the feeder thread's own: the Python
+    feeder records them per release; the C++ worker reports its thread-local state (NativePipe.modes_seen, read in
+    the worker at its start and before each job); None before the first release."""
     import traceback
     for neg in (False, True):
         host_k, host_v, gk, gv, _, _ = _world()
@@ -445,6 +447,7 @@ def test_GT6b_the_feeder_publishes_into_an_inference_board(pk):
         for i, tr in enumerate(trs):
             tr.gen = i + 2
             want[1, tr.b, tr.h, tr.slot] = tr.gen
+        assert gf.feeder_seen is None                           # no release ran yet (cpp: the worker not started)
         gf.issue(1, trs)
         if neg:
             with pytest.raises(RuntimeError, match="Inplace update to inference tensor outside InferenceMode") as ei:

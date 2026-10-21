@@ -199,7 +199,7 @@ class GilfreeTransport:
         self.thread_grad = False if self.thread_inference else bool(torch.is_grad_enabled())
         self.thread_device = dev if self.cuda else None
         self.thread_modes = bool(thread_modes)                 # NEGATIVE CONTROL (tests only) when False
-        self.feeder_seen: Optional[Dict[str, bool]] = None     # the modes the feeder ran with (tests, reports)
+        self._feeder_seen: Optional[Dict[str, bool]] = None    # the modes the feeder ran with (feeder_seen)
         self._cores = list(cores) if cores else None           # the feeder's (or the C++ worker's) CPU affinity
         if self.background and worker == "python":
             self._q: "queue.Queue" = queue.Queue()
@@ -277,8 +277,20 @@ class GilfreeTransport:
         self._stats["threads_max"] = None if w[8] < 0 else w[8]
         self._stats["published"] = w[9]
         self._stats["releases"] = w[10]
-        if w[12] >= 0:
-            self.feeder_seen = dict(inference=bool(w[12]), grad=bool(w[13]))
+
+    @property
+    def feeder_seen(self) -> Optional[Dict[str, bool]]:
+        """The modes the feeder thread ran its last release with (tests, reports): the Python feeder records them per
+        release (_feed_one); worker="cpp": the C++ worker thread's OWN state, read in that thread at its start and
+        before each job (NativePipe.modes_seen). None before the first release (cpp: before the worker started)."""
+        if self.worker == "cpp":
+            inf, grad = (int(x) for x in self.npipe.modes_seen())
+            return None if inf < 0 else dict(inference=bool(inf), grad=bool(grad))
+        return self._feeder_seen
+
+    @feeder_seen.setter
+    def feeder_seen(self, value: Optional[Dict[str, bool]]) -> None:
+        self._feeder_seen = value
 
     def threads_ok(self) -> bool:
         """Agent E's rule (gilfree_pack.threads_ok): every chunk so far ran on exactly the requested team."""

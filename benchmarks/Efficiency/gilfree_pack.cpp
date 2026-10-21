@@ -432,6 +432,13 @@ class NativePipe {
     return out;
   }
 
+  // The worker thread's OWN modes (c10::InferenceMode::is_enabled, c10::GradMode::is_enabled, read in that thread):
+  // at its start, then before each job it runs (the modes the job ran with). [inference, grad]; -1 before the start.
+  std::vector<int64_t> modes_seen() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return {worker_inference_, worker_grad_};
+  }
+
   void set_threads(int64_t n) { nt_ = check_threads(n); }
   int64_t threads() const { return nt_; }
   int64_t chunks_issued() const { return k_; }
@@ -606,6 +613,13 @@ class NativePipe {
         j = pending_.front();
         pending_.pop_front();
       }
+      {
+        const int64_t inf_now = c10::InferenceMode::is_enabled() ? 1 : 0;   // this thread's modes, for this job
+        const int64_t grad_now = c10::GradMode::is_enabled() ? 1 : 0;
+        std::lock_guard<std::mutex> lk(mu_);
+        worker_inference_ = inf_now;
+        worker_grad_ = grad_now;
+      }
       run_job(*j);
       {
         std::lock_guard<std::mutex> lk(mu_);
@@ -694,6 +708,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mod) {
       .def("stream_wait_job", &NativePipe::stream_wait_job, py::call_guard<py::gil_scoped_release>())
       .def("take_error", &NativePipe::take_error)
       .def("worker_stats", &NativePipe::worker_stats)
+      .def("modes_seen", &NativePipe::modes_seen, "the worker thread's own [inference, grad] modes (-1: not started)")
       .def_property_readonly("submitted", &NativePipe::submitted)
       .def_property_readonly("completed", &NativePipe::completed)
       .def_property_readonly("threads", &NativePipe::threads)
