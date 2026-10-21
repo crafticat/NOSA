@@ -214,38 +214,38 @@ if PART == "lockstep":
         return dict(raised=raised, compared=fr.compared, layers=fr.layers, n_diffs=len(fr.diffs),
                     diffs=[list(d) for d in fr.diffs[:8]], stats=rep["stats"], err=rep["err"], L=L)
 
-    def hand_two_drafts(ticks=6):
-        w = TRM.world(C=2, X=4, R_ver=2, cls=OWN2.OwnResidency, svc_kw=dict(nblk=TRM.NB, resolve="check"))
+    def hand_two_drafts(mode):
+        """ONE tick with two draft rows of batch slot 0 whose selections overlap (the draft first-miss dedup across
+        rows). Production never builds it (r2_tick.py RoundState.finish_tick refuses "two draft rows"), and B2's
+        consumer refuses its draft merges into a take of the same tick (d_merge): so the claim is decision equality
+        at both layers, and the SAME refusal at end_tick in torch and in check mode."""
+        w = TRM.world(C=2, X=4, R_ver=2, cls=OWN2.OwnResidency, svc_kw=dict(nblk=TRM.NB, resolve=mode))
         svc = w.svc
         svc.begin_request(0, "u0")
         svc.begin_request(1, "u1")
         hb, tail = 15, svc.tail0
+        rows = [Row(0, "d", ("u0", 1, 1), 1000, hb, [(hb, tail)]), Row(0, "d", ("u0", 1, 2), 1000, hb, [(hb, tail)]),
+                Row(1, "d", ("u1", 1, 1), 1000, hb, [(hb, tail)])]
+        sel = S_([[2, 3, 4, hb], [2, 3, 4, hb]], [[3, 4, 5, hb], [3, 4, 5, hb]], [[4, 6, hb], [4, 6, hb]])
+        svc.poll()
+        for l in range(L):
+            plan = svc.resolve(l, rows, sel)
+            svc.read_done(l, plan, Ev(True))
         raised = None
         try:
-            for t in range(ticks):
-                svc.poll()
-                x = t % 5
-                rows = [Row(0, "d", ("u0", 1, 1), 1000 + t, hb, [(hb, tail)]),     # two cohort keys of b 0 (B2
-                        Row(0, "d", ("u0", 1, 2), 1000 + t, hb, [(hb, tail)]),     # holds KEYS 7 live keys per
-                        Row(1, "d", ("u1", 1, 1), 1000 + t, hb, [(hb, tail)])]     # request: reuse them)
-                # the two draft rows of b 0 overlap in blocks x + 1, x + 2 (the second row's dups of the first's misses)
-                sel = S_([[x, x + 1, x + 2, hb], [x, x + 1, x + 2, hb]],
-                         [[x + 1, x + 2, x + 3, hb], [x + 1, x + 2, x + 3, hb]],
-                         [[x + 2, x + 4, hb], [x + 2, x + 4, hb]])
-                for l in range(L):
-                    plan = svc.resolve(l, rows, sel)
-                    svc.read_done(l, plan, Ev(True))
-                svc.end_tick()
-                TRM.land_all(w)
+            svc.end_tick()
         except Exception as e:                                        # noqa: BLE001
-            raised = "%s: %s" % (type(e).__name__, str(e)[:200])
+            raised = "%s: %s" % (type(e).__name__, str(e)[:160])
         fr = svc.fusedres
+        if fr is None:
+            return dict(raised=raised)
         rep = fr.report()
-        return dict(raised=raised, ticks=ticks, L=L, compared=fr.compared, layers=fr.layers, n_diffs=len(fr.diffs),
+        return dict(raised=raised, L=L, compared=fr.compared, layers=fr.layers, n_diffs=len(fr.diffs),
                     diffs=[list(d) for d in fr.diffs[:8]], stats=rep["stats"], err=rep["err"],
                     max_rows_per_b=rep["max_rows_per_b"])
 
-    OUT["hand"] = dict(overflow=hand_overflow(), two_drafts=hand_two_drafts())
+    OUT["hand"] = dict(overflow=hand_overflow(), two_drafts=hand_two_drafts("check"),
+                       two_drafts_torch=hand_two_drafts("torch"))
 
     # FR7: C's shared fixtures on the B2 world in check mode
     FXM = TRM.FXM
@@ -483,7 +483,8 @@ def _host_reads(seg):
 
 def test_FR4_the_per_layer_path_has_no_host_read_and_a_planted_one_is_found():
     seg = _method_source(NOSI / "r2_fusedres.py", "FusedResolver", "_layer")
-    assert "_launch(_fr_d1" in seg and "_launch(_fr_d2" in seg            # precondition: the right function
+    for k in ("_fr_v1", "_fr_scan.v", "_fr_v2", "_fr_d1", "_fr_scan.d", "_fr_d2"):   # precondition: the right
+        assert 'self._go(where, "%s"' % k in seg, k                              # function (launches via _go)
     assert _host_reads(seg) == [], _host_reads(seg)
     planted = seg.replace("        self.layers += 1", "        self.layers += 1\n        n = int(npg.sum())")
     assert planted != seg and "int(" in _host_reads(planted)            # NEGATIVE CONTROL
@@ -545,13 +546,19 @@ def test_FR6a_overflow_dup_behind_overflow_and_an_in_row_duplicate(lockstep):
 
 
 def test_FR6b_two_draft_rows_of_one_batch_slot(lockstep):
-    r = lockstep["hand"]["two_drafts"]
-    assert r["raised"] is None, r["raised"]
+    """Decision equality on a layer with two draft rows of one batch slot (the D-dup branch), then the same B2
+    refusal as the torch path. PROOF that production never builds such a tick: RoundState.finish_tick refuses it
+    (pinned below); B2's apply refuses its same-tick draft merges in both modes (d_merge)."""
+    r, t = lockstep["hand"]["two_drafts"], lockstep["hand"]["two_drafts_torch"]
     assert r["max_rows_per_b"][1] == 2 and r["stats"]["d_dup"] > 0, ("precondition", r["max_rows_per_b"],
                                                                       r["stats"])
-    assert r["compared"] == r["layers"] == r["ticks"] * r["L"], r
-    assert r["n_diffs"] == 0, r["diffs"]
+    assert r["compared"] == r["layers"] == r["L"], r
+    assert r["n_diffs"] == 0, r["diffs"]                               # fused == torch at both layers
     assert r["err"] == 0, r["err"]
+    assert r["raised"] is not None and r["raised"] == t["raised"], (r["raised"], t["raised"])   # same refusal
+    assert "d_merge" in r["raised"], r["raised"]
+    src = (NOSI / "r2_tick.py").read_text()
+    assert 'raise RuntimeError("tick: request %d has two draft rows" % row.b)' in src   # the production refusal
 
 
 # =====================================================================================================================

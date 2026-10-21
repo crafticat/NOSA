@@ -211,7 +211,8 @@ if triton is not None:
     def _put1(ptr, val, m):
         """One value at ptr where the scalar m holds (a 2-lane vector store: the interpreter ignores a scalar mask)."""
         ln = tl.arange(0, 2)
-        tl.store(ptr + ln * 0, tl.zeros([2], val.dtype) + val, mask=(ln == 0) & m)
+        ty = ptr.dtype.element_ty                           # fusedres2c: the destination's own type, cast explicitly
+        tl.store(ptr + ln * 0, (tl.zeros([2], tl.int64) + val.to(tl.int64)).to(ty), mask=(ln == 0) & m)
 
     @triton.jit
     def _slots(code_ptr, blk_ptr, gen_ptr, cur_ptr, prot_ptr, stamp_ptr, base, NPOS, NBLK, NP: tl.constexpr):
@@ -253,25 +254,29 @@ if triton is not None:
     # =================================================================================================================
     @triton.jit(do_not_specialize=["RH", "S", "C", "X", "RES"])
     def _fr_scan(ne_ptr, rec_ptr, usg_ptr, bne_ptr, brec_ptr, misc_ptr, RH, S, C, X, RES, BLOCK: tl.constexpr):
+        # fusedres2c: every buffer here is int64 and every stored value is cast to int64 explicitly. With int32
+        # buffers (7727e34) the interpreter wrote past d.bne / d.brec at every layer (FR10, job 2191259): a scan / sum
+        # of int32 values is held as 8-byte numpy data under its declared int32 type, so an int32 store wrote 8 bytes
+        # per element and the last lane spilled 4 bytes past the end (values stayed right, little-endian).
         offs = tl.arange(0, BLOCK)
-        cn = tl.sum(tl.zeros([2], tl.int32), axis=0)
+        cn = tl.sum(tl.zeros([2], tl.int64), axis=0)
         cr = cn
         for c0 in range(0, RH, BLOCK):
             m = c0 + offs < RH
-            n = tl.load(ne_ptr + c0 + offs, mask=m, other=0)
-            r = tl.load(rec_ptr + c0 + offs, mask=m, other=0)
-            tl.store(bne_ptr + c0 + offs, cn + tl.cumsum(n, axis=0) - n, mask=m)
-            tl.store(brec_ptr + c0 + offs, cr + tl.cumsum(r, axis=0) - r, mask=m)
-            cn = cn + tl.sum(n, axis=0)
-            cr = cr + tl.sum(r, axis=0)
+            n = tl.load(ne_ptr + c0 + offs, mask=m, other=0).to(tl.int64)
+            r = tl.load(rec_ptr + c0 + offs, mask=m, other=0).to(tl.int64)
+            tl.store(bne_ptr + c0 + offs, (cn + tl.cumsum(n, axis=0) - n).to(tl.int64), mask=m)
+            tl.store(brec_ptr + c0 + offs, (cr + tl.cumsum(r, axis=0) - r).to(tl.int64), mask=m)
+            cn = cn + tl.sum(n, axis=0).to(tl.int64)
+            cr = cr + tl.sum(r, axis=0).to(tl.int64)
         bor = cn * 0
         for c0 in range(0, S, BLOCK):
             m = c0 + offs < S
-            u = tl.load(usg_ptr + c0 + offs, mask=m, other=0)
-            bor = bor + tl.sum(tl.where(m, tl.maximum(u - C, 0), 0), axis=0)
-        budget = tl.maximum(X - bor - RES, 0)
+            u = tl.load(usg_ptr + c0 + offs, mask=m, other=0).to(tl.int64)
+            bor = bor + tl.sum(tl.where(m, tl.maximum(u - C, 0), 0), axis=0).to(tl.int64)
+        budget = tl.maximum(X - bor - RES, 0).to(tl.int64)
         q4 = tl.arange(0, 4)
-        tl.store(misc_ptr + q4, tl.where(q4 == 0, budget, tl.where(q4 == 1, cr, cn)), mask=q4 < 3)
+        tl.store(misc_ptr + q4, tl.where(q4 == 0, budget, tl.where(q4 == 1, cr, cn)).to(tl.int64), mask=q4 < 3)
 
     # =================================================================================================================
     # V1:the verify rows' classification (counts for the global K5 prefix and the record compaction)
@@ -320,7 +325,7 @@ if triton is not None:
             e1 = tl.where(act & (tl.max(nres, axis=0) > 1), 1, 0)
             e2 = tl.where(act & (tl.max(nfly, axis=0) > 1), 2, 0)
             errb = errb | e1 | e2
-        tl.atomic_or(err_ptr, errb)
+        tl.atomic_or(err_ptr, errb.to(tl.int64))                                  # err is int64 (fusedres2c)
 
     # =================================================================================================================
     # V2: the verify decisions
@@ -562,15 +567,15 @@ if triton is not None:
         tl.store(ids_ptr + (h * B + b) * NPOS + jj, newblk.to(tl.int64), mask=mj)
         pw = tl.arange(0, NP // 32)
         tl.store(vread_ptr + pid * WP + pw, _pack(rbits, NP), mask=pw < WP)
-        tl.store(post_ptr + (0 * S + pid) * NP + jj, newblk)
-        tl.store(post_ptr + (1 * S + pid) * NP + jj, evold)
-        tl.store(post_ptr + (2 * S + pid) * NP + jj, evinfl)
-        tl.store(post_ptr + (3 * S + pid) * NP + jj, free2.to(tl.int32))
+        tl.store(post_ptr + (0 * S + pid) * NP + jj, newblk.to(tl.int64))           # post is int64 (fusedres2c)
+        tl.store(post_ptr + (1 * S + pid) * NP + jj, evold.to(tl.int64))
+        tl.store(post_ptr + (2 * S + pid) * NP + jj, evinfl.to(tl.int64))
+        tl.store(post_ptr + (3 * S + pid) * NP + jj, free2.to(tl.int64))
         _put1(usg2_ptr + pid, usage2, pid >= 0)
         _put1(vrcnt_ptr, totrec.to(tl.int64), pid == 0)
         if LAST:
             tl.store(selw_ptr + pid * WB + zw, _pack(selu, ZP), mask=zw < WB)
-        tl.atomic_or(err_ptr, errb)
+        tl.atomic_or(err_ptr, errb.to(tl.int64))                                  # err is int64 (fusedres2c)
 
     # =================================================================================================================
     # D1: the draft rows' classification on the state after the verify rows
@@ -625,7 +630,7 @@ if triton is not None:
             e1 = tl.where(act & (tl.max(nres, axis=0) > 1), 1, 0)
             e2 = tl.where(act & (tl.max(nfly, axis=0) > 1), 2, 0)
             errb = errb | e1 | e2
-        tl.atomic_or(err_ptr, errb)
+        tl.atomic_or(err_ptr, errb.to(tl.int64))                                  # err is int64 (fusedres2c)
 
     # =================================================================================================================
     # D2: the draft decisions, the draft record, the bias rows, the selection bitmaps
@@ -792,7 +797,7 @@ if triton is not None:
                 selu = selu | (_selbits(s, v0, ZP) & act)
         tl.store(selw_ptr + pid * WB + zw, _pack(selu, ZP), mask=zw < WB)
         _put1(dcnt_out_ptr, totrec.to(tl.int64), pid == 0)
-        tl.atomic_or(err_ptr, errb)
+        tl.atomic_or(err_ptr, errb.to(tl.int64))                                  # err is int64 (fusedres2c)
 
 
 def _launch(kernel, grid, *args, **kw):
@@ -844,8 +849,8 @@ class FusedResolver:
         self.guard_hits = []                               # (tick, layer, kernel, buffer) whose guard changed
         self.guard_checks = 0                              # guard checks run (the detector's precondition)
         self._g_persist, self._g_tick, self._g_layer = [], [], []
-        self.err = self._buf((), torch.int32, "err", self._g_persist).zero_()   # this tick's (zeroed per tick)
-        self.err_any = self._buf((), torch.int32, "err_any", self._g_persist).zero_()   # m1: every tick's bits
+        self.err = self._buf((), torch.int64, "err", self._g_persist).zero_()   # this tick's (zeroed per tick)
+        self.err_any = self._buf((), torch.int64, "err_any", self._g_persist).zero_()   # m1: every tick's bits
         self.stats = self._buf((NSTAT_LANES,), torch.int64, "stats", self._g_persist).zero_()   # all 16 lanes
         svc.watch_flag("fused_res_err", self.err)
         self.launches = 0                                  # Triton launches (all layers, all ticks)
@@ -965,8 +970,8 @@ class FusedResolver:
             raise ValueError("resolve='fused': not a contiguous int64 tensor on %s: %s" % (dev, bad))
         self._g_tick = []                                   # this tick's guarded scratch (guard mode)
 
-        def b32(shape, name):
-            return self._buf(shape, torch.int32, name, self._g_tick)
+        def b32(shape, name):                                # int64 since fusedres2c (the name is kept)
+            return self._buf(shape, torch.int64, name, self._g_tick)
 
         def scan_bufs(n, p):
             return dict(ne=b32((n,), p + "ne"), rec=b32((n,), p + "rec"), bne=b32((n,), p + "bne"),

@@ -101,7 +101,7 @@ the xpool refusal in `FusedResolver.__init__`. That costs xpool's own launches o
 | `test_FR4_every_triton_function_resolves_its_names_in_its_module` | L36 lint incl. `_fr_scan` |
 | `test_FR5_a_free_running_round_on_b2_check_equals_torch` | one tick-level round, check == torch |
 | `test_FR6a_overflow_dup_behind_overflow_and_an_in_row_duplicate` | M5 hand case: v_over, v_dup_over, sel_dup > 0 asserted first; equal at both layers; then CapacityRefusal |
-| `test_FR6b_two_draft_rows_of_one_batch_slot` | M5 hand case: 2 draft rows of one b, d_dup > 0 first; equal every layer |
+| `test_FR6b_two_draft_rows_of_one_batch_slot` | M5 hand case, ONE tick: 2 draft rows of one b, d_dup > 0 first; equal at both layers; then the SAME B2 refusal (d_merge) in torch and check mode; proof that production never builds the case: r2_tick.py RoundState.finish_tick (228-230) refuses "two draft rows" (source pin) |
 | `test_FR7_the_shared_fixtures_in_check_mode` | every C fixture: B2 (fused) == reference; fused == torch; void_overflow reaches v_over |
 | `test_FR8_the_kernel_time_parser_and_its_negative_control` | M3 parser on synthetic Kineto traces; a launch moved out of t.res is not counted; orphans counted; no t.tick refused |
 | `test_FR9_the_sg5_flags_for_the_plant_and_the_profile` | the two SG5 flags and their wiring |
@@ -249,3 +249,20 @@ overhead), hence FR-g3 is its own arm.
   - a masked bias lane clamps its slot to 0, so its address stays inside the table.
 - The detector: OwnResidency(fused_guard=True) fills the spare elements with a sentinel and checks every guard after
   every launch (`_check_guards`); FR10 runs four schedules under it, plus a negative control.
+
+### fusedres2c: the guard hits of 7727e34 (job 2191259)
+
+- FR10 found a real out-of-bounds write: `_fr_scan.d` wrote past `d.bne` and `d.brec` at every (tick, layer) of
+  f20b (101 hits). The sites, in 7727e34's r2_fusedres.py: the scan's int32 stores of a cumsum (255-256) and its
+  int32 misc store (266).
+- Masks and sizes were right (one chunk: RH = 4 lanes on 4 elements, no masked lane) and the values were right. The
+  cause (INFERENCE, consistent with every observation): the interpreter keeps a scan / sum of int32 values as
+  8-byte numpy data under the declared int32 type. An int32 store then writes 8 bytes per element; the last lane
+  spills 4 bytes past the end, and little-endian overlap keeps the values right. On the GPU the values are real
+  int32, so this exact spill is interpreter-only. The fix does not rely on that argument.
+- Fix: every scratch buffer is int64 (ne, rec, bne, brec, misc, usg, usg2, usgd, post, err, err_any); every stored
+  value is cast to int64 explicitly (a real cast from a declared int32); `_put1` casts to its destination's element
+  type. The only int32 kernel outputs left are the plan's page table and page counts, stored from int64 values by a
+  real cast. The padding stays as defence; FR10's gate is 0 hits.
+- FR6b: ONE tick, decision equality, then the same B2 refusal in both modes, plus the production proof (above).
+- FR4: the lint names the `_go` call form of all six launches.
