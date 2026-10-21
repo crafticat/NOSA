@@ -339,7 +339,10 @@ class TickEngine:
     store_k / store_v (B, (NB + 4) * 64, Hkv, D) and store_bias (B, (NB + 4) * 64, Hkv) per layer. S_list: the prompt
     lengths. M_alloc: the pooled width of the run (the BI serial decode's). nl, stage1, pool: the nosa_llama ops, the
     stage-1 call and the pooling (defaults: the CUDA ones; the CPU tests pass torch stand-ins). check: host checks of
-    the selection's last two blocks (T - 1, T) every layer (tests and gates; one read per layer).
+    the selection's last two blocks (T - 1, T) every layer (tests and gates; one read per layer). log_slots: the size of
+    the DEVICE TOKEN LOG, one slot per row of the whole run, never reused (default LOG = 1 << 16, the size before this
+    argument existed); the caller sizes it for its round (rows = drafts + verify rows + the rejected ones); a tick that
+    would pass it is refused ("token log full") before it writes, as before.
     twin ([twin-variant]): "torch" (the default, unchanged) or "fused": every twin's step_unchecked / advance_unchecked
     is bound on the instance to r2_twin_fused (ONE Triton kernel per layer, bitwise with ops.mean = fixed_order_mean);
     the call sites are unchanged.
@@ -353,11 +356,14 @@ class TickEngine:
                  nl=None, stage1=None, pool=None, select=SC.select_blocks, draft_drop: float = 0.0, drop_seed: int = 0,
                  check: bool = False, twin: str = "torch",                                      # [twin-variant]
                  rebuild: str = "per_call",                                                     # [batched-rebuild]
-                 xpool=None):                                                                   # [xpool]
+                 xpool=None, log_slots: Optional[int] = None):                                  # [xpool]
         if rebuild not in REBUILD_MODES:                                                        # [batched-rebuild]
             raise TickError("rebuild must be one of %s (got %r)" % (REBUILD_MODES, rebuild))    # [batched-rebuild]
         self.rebuild = rebuild                                                                  # [batched-rebuild]
         self.model, self.ops = model, ops
+        self.LOG = type(self).LOG if log_slots is None else int(log_slots)    # instance size; the check below reads it
+        if self.LOG < 1:
+            raise TickError("log_slots must be >= 1 (got %r)" % (log_slots,))
         self.nl = nl if nl is not None else default_nl()
         if stage1 is None or pool is None:
             s1, pl = default_kernels()
@@ -600,7 +606,8 @@ class TickEngine:
                 getattr(c, name).copy_(getattr(t, name))
             twins.append(c)
         args = dict(nl=self.nl, stage1=self.stage1, pool=self.pool, select=self.select, draft_drop=self.draft_drop,
-                    drop_seed=self.drop_seed, check=self.check, twin=self.twin_variant)                 # [twin-variant]
+                    drop_seed=self.drop_seed, check=self.check, twin=self.twin_variant,                 # [twin-variant]
+                    log_slots=self.LOG)
         args.setdefault("rebuild", self.rebuild)                                                # [batched-rebuild]
         if self.xpool is not None:                                                              # [xpool] its own map
             args["xpool"] = self.xpool.clone()                                                  # [xpool]
