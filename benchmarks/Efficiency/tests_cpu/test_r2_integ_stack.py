@@ -35,7 +35,9 @@ ST2  THE 2^k-LITE MATRIX: full minus each one component (six arms) also equals t
      removed component is really OFF (its precondition does not hold) while the others stay ON.
 ST3  NEGATIVE CONTROL of the matrix comparison: the full stack with the fused resolve's plant 2 (a draft grant takes
      the (q + 1)-th FREE slot): precondition stats d_grant > 0 (the plant changed an output, L34); the comparison
-     reports a difference (the logical page tables name the planted slots).
+     reports a difference (the logical page tables name the planted slots). [integ4] The plant arm runs B2 UNCHECKED
+     (with B2 checked, its first_free predicate refuses the planted tick before it is recorded: job 2191313); a second,
+     checked plant arm must be refused by first_free (or the fused err flag).
 ST4  THE FUSED RESOLVE IN CHECK MODE ON THE FULL STACK (pool + page keys + shared): at every layer the fused outputs
      equal the torch path's (decision fields, pages, the record, and the bias rows written through
      draft_bias_fill_flat on the lanes); compared == layers; err 0.
@@ -327,11 +329,16 @@ if PART == "matrix":
     OUT["none"] = dict(diff=None, pre=pre0, err=base["err"], mirror=base["mirror"], stats=base["stats"],
                        ticks=len(base["ticks"]))
     arms = [("full", set(COMPONENTS), 0)] + [("full-no-" + c, set(COMPONENTS) - {c}, 0) for c in COMPONENTS]
-    arms.append(("plant2", set(COMPONENTS), 2))
+    arms.append(("plant2", set(COMPONENTS), 2))                      # [integ4] B2 UNCHECKED: the comparison detects
+    arms.append(("plant2_checked", set(COMPONENTS), 2))              # [integ4] B2 checked: its first_free predicate
     for name, on, plant in arms:
-        rec, pre = run(on, toks, plant=plant)
+        CTX["checked"] = name != "plant2"                             # (job 2191313: checked B2 refused the planted
+        try:                                                          # tick before on_tick, so the comparison was
+            rec, pre = run(on, toks, plant=plant)                     # not the detector)
+        finally:
+            CTX["checked"] = True
         OUT[name] = dict(diff=first_diff(base, rec), pre=pre, err=rec["err"], mirror=rec["mirror"], stats=rec["stats"],
-                         ticks=len(rec["ticks"]))
+                         ticks=len(rec["ticks"]), checked=name != "plant2")
 elif PART == "check":
     rec, pre = run(set(COMPONENTS), toks, resolve_mode="check")
     base, _ = run(set(), toks)
@@ -448,15 +455,23 @@ def test_ST2_full_minus_each_component_equals_the_default(matrix, comp):
 
 
 def test_ST3_the_matrix_comparison_sees_a_planted_fault(matrix):
+    """[integ4] Job 2191313: with B2 CHECKED, B2's pre-write predicate first_free (r2_own2.py: "a take is not the
+    stream's first FREE slot") refuses the planted tick inside end_tick, before on_tick records it, so the comparison
+    was never the detector. The plant arm now runs B2 UNCHECKED (the GPU cells' setting): the matrix comparison must
+    see the plant, first in the logical page tables of a recorded tick. The checked arm documents the second detector
+    (first_free), which is the right predicate for this fault."""
     arm = matrix["plant2"]
     fu = arm["pre"]["fused"]
+    assert arm["checked"] is False
     assert fu is not None and fu["d_grant"] > 0, ("precondition (L34): plant 2 changed no draft take", fu)
     assert arm["diff"] is not None, "the planted off-by-one take slot was NOT detected by the matrix comparison"
-    if arm["err"] is None:                                            # the plan's own pages name the planted slots
-        assert arm["diff"][1] == "pages", ("the first difference is not in the logical page tables", arm["diff"])
-    else:                                                             # or the plant voided a tick by its own flag
-        assert "fused_res_err" in arm["err"], ("an error that is not the plant's own flag", arm["err"])
-    print("ST3 control: plant 2 effective (d_grant %d), first difference %s" % (fu["d_grant"], arm["diff"]))
+    assert arm["diff"][0] != "end" and arm["diff"][1] == "pages", (
+        "the first difference is not in a recorded tick's logical page tables", arm["diff"], arm["err"])
+    chk = matrix["plant2_checked"]
+    assert chk["checked"] is True and chk["pre"]["fused"]["d_grant"] > 0, chk["pre"]["fused"]
+    assert chk["err"] is not None and ("first_free" in chk["err"] or "fused_res_err" in chk["err"]), chk["err"]
+    print("ST3 control: plant 2 effective (d_grant %d); unchecked B2: first difference %s; checked B2: %s"
+          % (fu["d_grant"], arm["diff"], chk["err"][:120]))
 
 
 # =====================================================================================================================
