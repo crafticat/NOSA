@@ -41,9 +41,10 @@ the releases in ONE feeder thread pinned to `cores` (os.sched_setaffinity) befor
 THE FEEDER THREAD'S MODES (SG5 p2 on holder 2190876, 2026-10-21: "Inplace update to inference tensor outside
 InferenceMode is not allowed", raised by the packer's index_copy_ into the store in the feeder). torch's inference mode,
 grad mode and current CUDA device are THREAD-LOCAL; a new thread starts with the defaults (inference mode off).
-- The feeder enters, around its whole loop, the inference mode that the release's in-place writes need: on when the
-  constructing thread was in inference mode or any store, host or ring tensor is an inference tensor. It enters the
-  constructing thread's grad mode (off under inference mode) and, on the GPU, the store's device.
+- The feeder enters, around each release, the inference mode that the release's in-place writes need: on when the
+  constructing thread was in inference mode, or any store, host or ring tensor is an inference tensor, or the attached
+  generation board is one (attach_board; the publication writes the board in place). It enters the constructing
+  thread's grad mode (off under inference mode) and, once at its start on the GPU, the store's device.
 - Every CUDA operation of a release names its stream (the extension's copy and scatter streams; the publication under
   torch.cuda.stream(scatter); scatter.wait_event), so the thread's current stream is never used.
 - The OpenMP team's threads copy raw bytes only (pack_range: no tensor operation, no dispatcher state).
@@ -155,32 +156,36 @@ class GilfreeTransport:
     def _feeder(self) -> None:
         if self._cores:
             os.sched_setaffinity(0, self._cores)               # the OpenMP team inherits this thread's affinity
-        if not self.thread_modes:                              # NEGATIVE CONTROL: the new thread's defaults
-            self._feed()
-            return
-        if self.thread_device is not None:
+        if self.thread_modes and self.thread_device is not None:
             torch.cuda.set_device(self.thread_device)
-        with torch.inference_mode(self.thread_inference), torch.set_grad_enabled(self.thread_grad):
-            self._feed()
-
-    def _feed(self) -> None:
-        self.feeder_seen = dict(inference=bool(torch.is_inference_mode_enabled()), grad=bool(torch.is_grad_enabled()))
         while True:
             item = self._q.get()
             if item is None:
                 return
             layer, transfers, flag = item
             try:
-                self._release(layer, transfers)
+                if not self.thread_modes:                      # NEGATIVE CONTROL: the new thread's defaults
+                    self._feed_one(layer, transfers)
+                else:                                          # read per release: attach_board may have changed it
+                    with torch.inference_mode(self.thread_inference), torch.set_grad_enabled(self.thread_grad):
+                        self._feed_one(layer, transfers)
             except BaseException as e:                         # reported at the next issue / force
                 self._error = e
             finally:
                 flag.set()
 
+    def _feed_one(self, layer: int, transfers: List[Transfer]) -> None:
+        self.feeder_seen = dict(inference=bool(torch.is_inference_mode_enabled()), grad=bool(torch.is_grad_enabled()))
+        self._release(layer, transfers)
+
     def attach_board(self, board) -> None:
         """The exact device wait (residency note 12f): after each release, (slot, generation) of its transfers is
         published into the board (board.t, board.flat) on the stream that landed the rows, AFTER them: the scatter
-        stream on the GPU (a pinned copy and an index_put_ enqueued there), at once on the CPU."""
+        stream on the GPU (a pinned copy and an index_put_ enqueued there), at once on the CPU. The publication is an
+        in-place write in the feeder thread: an inference-mode board turns the feeder's inference mode on (read at its
+        next release; the queue orders this write before that read)."""
+        if getattr(board.t, "is_inference", lambda: False)():
+            self.thread_inference, self.thread_grad = True, False
         self.board = board
 
     def _publish(self, transfers: List[Transfer]) -> None:
