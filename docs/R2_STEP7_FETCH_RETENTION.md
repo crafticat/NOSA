@@ -858,6 +858,33 @@ EXPECTED HOST TIME PER TICK AT B 64 (B1), as estimates; the REPORT microbench me
 - draft ticks: ready records and touches (about 0.26 M at about 0.3-0.5 us), about 80-130 ms, plus pins at a
   cohort's first draft tick.
 - So B1 should cut p3's 7 s to about 0.2-0.4 s per tick. B2 (array-backed) should bring it to tens of ms.
+- REFUTED by the REPORT microbench (sparse 7392ac6, CPU, B 64, H 2, 2 layers): apply_tick per tick, dense verify
+  252.3 ms / draft 112.8 ms; sparse verify 266.8 ms / draft 109.7 ms. Times 16 for 32 layers: dense 4037 / 1804 ms,
+  sparse 4269 / 1755 ms. 114,904 sparse records applied.
+  - So on the vendored objects, B1 gives NO host speedup. The cost is the per-record vendored apply (take, protect,
+    move_to_end, the journal, the reads), not the reading of the dense record.
+  - My estimate assumed sub-microsecond records; the vendored dict-of-set and OrderedDict objects cost several
+    microseconds each. B1 stays as the dense == sparse reference and as the record producer; B2 is the speed path.
+
+WHAT B2 CAN KEEP FROM B1's DEVICE PART, AS IS:
+- `_compact` (the stable prefix-sum compaction into fixed buffers, with a count) and `_pack_bits` / `unpack_bits`.
+  They are independent of the ownership representation.
+- `draft_bias_fill` (the bias rows of the granted draft takes in one write per layer). It needs only the decision
+  and the store.
+- `_first_in_group` (the stable first-occurrence mask), and the look counts (vlook) if B2 keeps K3X's 4.3 / 4.6
+  metrics.
+- The record itself (note 12l's format), as the lockstep interface between B1 and B2.
+- NOT the pin table. It exists only to tell the vendored host which (block, key, kind) pins are new. A device-
+  authoritative B2 table keeps protection itself (per-row selection bitmaps, B's design).
+
+AFTER THE CPU RUN of 7392ac6 (3 failed, 163 passed, 2 skipped;
+`/mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/sparse_7392ac6.txt`), both preconditions were mine:
+- R5a f21b / f21b_exact: "touches > 0" cannot hold there. The split schedule never lands a prefetch, so no draft row
+  reads a READY block. The touch precondition now applies to f6 / f12b / f20b only.
+- R5b d_merge: the negative control's choice ran BEFORE the tick's applies. A draft merge into this layer's urgent
+  verify take (demand {verify}) has no host transfer yet at that point, so it was skipped as "no transfer". It now
+  counts as state-changing (the take creates the transfer at apply). A v_merge without a transfer (a dup of the
+  layer's own urgent take) is still skipped: its demand holds verify already.
 
 TESTS (`test_r2_residency.py`, R5):
 - R5a: sparse == dense on F6 (probe and exact), F12b, F20b and F21b (probe and exact). Every tick it compares the
@@ -871,6 +898,241 @@ TESTS (`test_r2_residency.py`, R5):
 - R5d: two draft take records of one stream swapped are refused by v1's take check.
 - R5e: the lint: the per-layer device path has no host read or copy; the consumer has the one read.
 - REPORT R5 microbench: apply_tick dense vs sparse at the B 64 geometry (2 layers, extrapolated to 32).
+
+## 12m. Shared lockstep fixtures: the transitions the schedules never reach (branch feature/nosi-r2-m2-sparse)
+
+WHY. The lockstep schedules (F6, F12b, F20b, F21b, F22) only call `decided()` and complete readers two ticks late,
+in order. So they never reach end_request, cancel, two draft rows of one stream, void ticks, T4, the trash slot or
+non-monotone readers (the B2 review, `docs/R2_OWN2_B2_REVIEW_C.md` section 2).
+
+WHAT. `benchmarks/Efficiency/tests_cpu/r2_lockstep_fixtures.py`, a module that needs only torch:
+- A FIXTURE is a short script of operations (begin, end, tick, poll, land, done, decided, cancel, cancel_epoch,
+  history, watch, flag, raise), with its capacities, its worlds, a counted precondition and its plants.
+- `run(fixture, worlds, snapshot, Row)` applies each operation to every world in lockstep. After each operation it
+  compares the raised exception (by class name), the returned value (a tick returns its page tables) and the
+  snapshot. The first difference ends the run and names its operation and its field ("raise", "value", or the first
+  differing snapshot field).
+- A PLANT is a defect in ONE world, with the operation and the field where the lockstep must see it first.
+- B2's lockstep imports the same module: it puts a vendored world first (the preconditions read it) and its own
+  world after it. The world may give its own `land()`.
+
+THE FIXTURES (all on v1 under the S-C schedule, S-C dense and S-C sparse, force_only transports; void_flag on S-C
+dense and sparse only, v1 has no device flags):
+
+| fixture | review item | transition reached (precondition, counted) | plants (operation, field) |
+|---|---|---|---|
+| end_request | (a) F13 / F14b + a land | the dedup merge (no take); release:end; u1's verifier takes its own slot (new, no in-flight look); drop_unowned at the final land | dup_take_device (4, raise), dup_take_host (4, state), owner_not_mirrored (5, mirror), owner_blind (7, value), no_uid_check (8, raise) |
+| cancel | (b) F3 / F11 | a cancelled key refused (op 4); arrivals after the cancel; the late-protection guard (op 7); cancel_epoch returns [K2] | free_on_cancel (2, state), cancel_refusal_off (4, raise), late_guard_off (7, raise) |
+| o1_two_rows | (c) I8's O1 rounds, C 2 | two draft rows of one stream: block 2 goes PO (row 1's evict_to_c) and is acquired back (row 2) | batch_recency (3, journal) |
+| void_overflow | (d) F12f | CapacityRefusal (terminal) | no_overflow_flag (1, raise) |
+| void_flag | (d) F16 | a set flag voids that tick (state and counters unchanged); the next tick applies | flag_ignored (4, raise), void_keeps_pins (6, state) |
+| t4 | (d) T4 | the take of block 5 carries its write-back; block 6 is refused (terminal) | no_t4_refusal (3, raise) |
+| trash | (d) F15 | takes, arrivals, an urgent gather: the trash sentinel stays; a tail naming the trash slot is refused (terminal) | trash_written (1, trash) |
+| nonmono | (d) F12e | a pending earlier reader while a later one is done; the urgent take avoids its slot; the T3 forward of e1; drop_unowned resets the reader | no_reader_wait (6, value), lost_forward (9, readers), drop_keeps_reader (12, readers) |
+| vres_drop | the poll order | admit_vres then release:unprotect in one poll (no drop_vres_unprotected) | poll_order_swapped (2, readers) |
+| key_alias | key ids | two live keys pin one block (prot = {K1, K2}) | key_alias (2, state) |
+
+THE REVIEW'S 8 MISSING KINDS, on the vendored path (R6c checks the coverage):
+1. A take of a block that is in flight: dup_take_device (the device; the host's take check refuses it),
+   dup_take_host (the host; a second transfer).
+2. T4: no_t4_refusal.
+3. A cancelled key / a row after its release was queued: late_guard_off; cancel_refusal_off. The vendored code
+   refuses a cancelled key TWICE: `cancel()` also queues the key's release at every layer, so the late-protection
+   guard refuses it when the cancelled check is off. Only both off accept it.
+4. Key aliasing: B1's form (`key_alias`): one key id per request in B1's pin table. B1 never reuses an id, so the
+   plant aliases two LIVE keys. B2's key-slot reuse is the same class: a new key that inherits a stale pin bit.
+5. The poll order swapped: poll_order_swapped.
+6. A drop that keeps the reader: drop_keeps_reader. CORRECTION of the review (section 3, kind 6): in the vendored
+   model the dropped slot does NOT free one poll late. The transfer carried the slot's previous reader (T3), and the
+   transport waits on it before it lands, so that reader is done at the drop. The defect shows only in the reader
+   projection (the slot's last reader is kept instead of reset).
+7. The T3 forward lost: lost_forward.
+8. One batch eviction for two draft rows: batch_recency.
+
+CORRECTION OF THE REVIEW, I8 (section 1, row I8). The review said that one eviction after all draft rows "gives a
+different LRU". That is WRONG for the end state. Proof sketch:
+- Phase A protects every block that a draft row selects (K2), so no block that a later row reads is released by an
+  earlier row's eviction: it goes PO and the later row acquires it back.
+- Let order1 be the recency order after row 1's moves and order2 after row 2's moves. A block x that row 2 does not
+  read and that is in the last C of order2 has at most as many blocks after it in order1 as in order2. So it is in
+  the last C of order1: row 1's eviction did not remove it.
+- So per-row and batch evictions keep the same LRU (the last C of order2, in that order), and the same PO / released
+  sets (a protected victim goes PO, an unprotected one is released, in both).
+- Only the TRANSITIONS differ: o1_two_rows has acquire 2 + evict_po 2 per row; the batch has acquire 1 + touch 1 +
+  evict_po 1. The stamps (same order) and the mirror marks (the same slots) are equal too.
+- So the state, the mirror and the readers cannot see the batch defect. The journal (S-C's journal_counts) can, and
+  the planted batch_recency is caught there. For B2: a batch eviction is state-equivalent; if B2 reports the journal
+  counts, it must count the per-row transitions.
+- The review's own example (C 2, X 0: draft [0, 1, 2]) cannot reach the case: with X 0 the third block is refused.
+  The fixture uses X 2, R_ver 0.
+
+TESTS (`test_r2_residency.py`, R6):
+- R6a: per fixture, the worlds agree after every operation; every operation runs; the precondition holds.
+- R6b: per plant, the first difference is at the predicted operation and field.
+- R6c: the plants cover the 8 review kinds; every plant has its defective world; every fixture's first world is a
+  vendored one.
+- The snapshot (`_fx_snapshot`): `_state`, `_counters`, the readers by name, the transfers in flight with their
+  forwarded reader and write-back flag, the transitions per kind (`_journal_kinds`: S-C's journal_counts, or v1's
+  Stream.log counted the same way), the RELEASING slots with a pending reader, S-C's mirror against the full scan,
+  and the trash sentinel.
+
+NOT RUN (static work only, no interpreter). The predicted operations and fields come from reading the code; the CPU
+run decides.
+
+## 12n. T4 on the GPU path: the write-back wait list gets its producer (the TC-R review, note 5.1)
+
+THE GAP. S-C's `_hist_unwaited` ("host write-backs the main stream did not wait on yet") had consumers but no
+producer:
+- Consumers: `CudaDeviceOps.gather` (a main-stream `wait_event` per entry before its copies), and the captured
+  tick's host part (the same waits before the replay, outside the graph).
+- Producer: none. `history_written` registered the event only for the takes (`hist_ev`, which the transports wait).
+- So the GPU urgent gather (zero-copy reads of the pinned host rows) was ordered after a write-back ONLY when both
+  ran on one stream. That is true today (`commit_block` uses the current stream), but nothing guarded it.
+
+THE FIX (`r2_residency_sc.py`):
+- `ResidencySC.history_written` calls v1's and appends the event to `_hist_unwaited`.
+- The CPU stand-in's gather (`CpuDeviceSim.gather`) host-waits every pending entry first and empties the list. This
+  is the stand-in of the main stream's wait, and it keeps the list bounded on the CPU.
+- On the GPU the list is now non-empty after every write-back. The captured tick's host part must keep emptying it
+  before the replay: a capture cannot wait on an event recorded outside it. It does (r2_residency_capture.py
+  host_part).
+
+TEST F24:
+- Positive: on the GPU path (CudaDeviceOps with CPU copies and a logging stand-in of the main stream), a write-back
+  on another stream (a pending event) is waited ONCE, before the first copy of the urgent gather. The list is empty
+  after it, and the take still carries the event.
+- The CPU stand-in host-waits a pending write-back at its gather.
+- Negative control: without the producer, the gather copies block 5 with no wait.
+
+## 12o. SG5 p4a's K5 refusal: the policy is right, the report misled (2026-10-21)
+
+THE RECORD (`/mnt/beegfs/ojerbi/r2-runs/sg5/sg5_p4_2190876_p4a.step/stderr.txt:7083`; gilfree, B 64, C 96, X 32,
+R_ver 16):
+- Layer 16 had 16 first misses with no slot. No other layer overflowed.
+- Refused streams: (b 45 h 1), (b 47 h 0), (b 51 h 1), with usage 86 / 86 / 89 of C 96.
+- In each: LRU 77, all protected; in flight 9 / 9 / 12, all protected; PO, VRES and RELEASING 0.
+- The layer had all 32 extras free at the tick start.
+
+THE K5 RULE:
+- Stream.usage = every non-FREE slot (INFLIGHT + LRU + PO + VRES + RELEASING), ownership.py:135-136.
+- LayerPool.borrowed = sum over the layer's streams of max(0, usage - C), :409-410. free_extras = X - borrowed,
+  :412-413.
+- can_take, :419-427:
+  - usage < C: yes (a base slot);
+  - else, for the verifier: free_extras > 0 (the R_ver reserve included);
+  - for a draft: free_extras > R_ver.
+- device_verify (r2_residency_sc.py, K5 block) implements the same rule in K3X order (row, head, block): a stream's
+  first C - usage first misses take its FREE base slots, and every later one needs a shared extra. Extras go to the
+  first X - borrowed such misses of the LAYER. Policy E serves the rest if it can.
+
+THE ANSWERS:
+1. Usage counts every non-FREE slot (86 = 77 LRU + 9 in flight). The free base slots ARE granted: 10 / 10 / 7 first
+   misses per stream.
+2. The verifier DOES take from the R_ver reserve: R_ver limits only drafts.
+3. The 32 extras are ONE pool per LAYER, shared by its B x H = 128 streams (0.25 per stream on average). The report
+   says "free 32" because it shows the host state at the tick START: a void tick applies nothing.
+   - The decision gave all 32 to earlier first misses of layer 16 in K3X order. A first miss is refused by K5 only
+     after the budget is spent, so all 32 were granted.
+   - At least 16 more first misses needed one, with no Policy E candidate left. The refused streams have high batch
+     slots, late in K3X order.
+   - So layer 16's verify demand beyond the base slots was at least 48 first misses (32 granted + 16 with no slot,
+     plus any Policy E evictions), and the allowance was 32. The "16" is the LAYER's total, not per stream.
+
+WHY THE DEMAND IS THIS LARGE:
+- NOSA-8B selects topk 64 blocks per row and head (nosa_llama.py:672-681); about 62 are historical.
+- Every draft row protects its whole selection. With LAMBDA 7 and K 3, a stream holds the union of about 7-10 draft
+  positions' selections, here 77-89 blocks. Q3's measured union over 4 positions was about 71.
+- A verify cohort's own selection then misses about 10-30 blocks per stream, while 10 base slots and 0.25 extras per
+  stream are free.
+
+S-B AND v1 PASSED THE SAME PREFLIGHT (no traceback after the S-C one). That is NOT evidence of an S-C defect:
+- With free timing their trajectories differ from S-C's. v1 polls arrivals inside resolve. S-C's draft rows see the
+  verifier's urgent blocks of the same layer as in flight, not ready.
+- The draft READY sets, so the draft tokens, the selections and the protected unions, all differ.
+- On the SAME state v1 refuses at the same point (F25).
+
+THE FIX (code):
+- The refusal now reports the DECISION. `_k5_report`, shared by the dense and the sparse consumer, gives:
+  - per layer: the streams with first misses, how many needed an extra, the free extras at the tick start, how many
+    were granted, and how many found no slot;
+  - per refused stream: first misses = base slots + shared extras + Policy E + no slot;
+  - then v1's capacity report.
+- `device_verify` gets two test-only negative controls: `verify_no_local` and `verify_reserve`.
+
+TEST F25 (dense and sparse):
+- p4a's state: usage 86 of C 96 in all 4 streams, LRU 77 and 9 in flight (all protected), the 32 extras free.
+- First misses 38 / 20 / 15 / 15: S-C refuses with exactly this decision:
+  - the base slots 10 each;
+  - the shared extras 28, then 4;
+  - no slot 6 + 5 + 5 = 16 over 3 streams;
+  - nothing applied.
+- v1 refuses the same state at block 100, the 15th first miss of stream (0, 1).
+- At exactly the allowance (38 / 14 / 10 / 10), S-C and v1 pass with equal states and all 32 extras borrowed.
+- Negative controls: a device K5 that keeps the reserve from the verifier, or grants no base slot, refuses the
+  allowance case.
+
+WHAT IT MEANS FOR MEASURING S-C:
+- At C 96 / X 32 the first verify ticks at B 64 exceed the allowance in at least one layer.
+- That tick needed X >= 48 at layer 16. The run's maximum is unknown; the new report gives it.
+- X is per stream in the store (C + X slots per (layer, request, head)). At D 128, bf16 K and V, one slot per stream
+  over L 32 x B 64 x H 2 is about 128 MiB, so X 64 costs about 4 GiB more than X 32.
+- The alternative is fewer protected blocks per stream, for example a smaller LAMBDA (fewer draft positions ahead).
+- DECIDED by the lead (2026-10-21): S-C is measured (SG5 and TC-R) at X 64, with C 96 and R_ver 16.
+
+## 12p. The sparse record for a device consumer: rowsel and pin_records=False (B2's requests, rev 2 note 6)
+
+ROWSEL:
+- Each layer's record gets `step["rec"]["rowsel"]`, (R, H, ceil(nblk / 32)) int64 words in `_pack_bits`' format
+  (32 bits per word; bit i of word w = block 32 w + i).
+- It is indexed by TICK row: verify and draft rows in the tick's Row order. The decision's entry rows map to tick
+  rows by the tick's verify / draft index lists (S-C's `_tick_rows`; the captured tick's `live_rows`).
+- A bit is set for every valid historical block of the row's selection at that head (0 <= block < hist_bound,
+  < nblk). Tails are excluded and duplicates collapse.
+- It stays ON THE DEVICE. B1's host consumer does not read it, and it is not part of the one device-to-host read.
+
+PIN_RECORDS=FALSE (`ResidencySparse(..., pin_records=False)`):
+- The record carries no protection pins: no PIN flag and no pin table update.
+- A verify entry that would be a record only for its new pin (a ready block) is no record. Draft records do not
+  change, because every valid draft entry is a record for another reason too.
+- B1's own consumer protects only from pins, so `ResidencySparse.apply_tick` refuses to run (ValueError). Only a
+  consumer that keeps the protection itself (B2, from rowsel) may use it.
+- `pin_only_records` (verify, draft) counts the PIN-only records that the default consumer applies. This is the
+  saving.
+
+TESTS:
+- R7a: rowsel equals every tick row's valid selection, on every layer of F6's first 6 ticks; apply_tick does not
+  name it. Negative control: rowsel indexed by the entry row differs at tick 2.
+- R7b: the pins-off record equals the default record minus its PIN-only entries, with no PIN flag; the looks, read
+  bitmap, selection and rowsel are equal. The dropped entries equal `pin_only_records` (> 0). A pins-off service
+  refuses its own consumer, applies nothing and leaves the pin table untouched. Negative control: clearing only the
+  PIN flag is not enough.
+
+## 12q. REPORT: the peak shared-extra demand of a run (`report()["k5"]`, for the X 64 runs)
+
+THE DEFINITION. Per (tick, layer), the layer's verify first misses that needed a SHARED extra:
+- per stream, its first misses beyond its FREE base slots at the layer's start, max(0, first misses - (C - usage));
+- summed over the layer's streams.
+- They were served by a granted extra, by Policy E, or by nothing (a refusal). K5's own rule decides it.
+
+WHERE IT IS COMPUTED:
+- The dense and the sparse verify appliers. Each stream's usage is taken at its first appearance in the layer,
+  before any take of the layer; then its takes (K5 grants and Policy E evictions) are counted.
+- A refused tick notes the same quantity from `_k5_report`.
+- So it costs no device read and appears for passing and refused runs alike.
+
+`report()["k5"]` holds:
+- `extra_need_peak` and its `at_tick` / `at_layer` (the first occurrence);
+- `by_layer` (each layer's maximum);
+- C, X, R_ver and the definition.
+
+It answers "is X enough for the whole run": X >= `extra_need_peak` means K5 alone never needed Policy E. A passing
+run with a larger peak relied on Policy E.
+
+TEST F26 (dense and sparse):
+- A passing 2-tick schedule with a known demand: 2 / 6, then 7 / 1. The peak is 7 at tick 1, layer 0; by layer
+  [7, 6]; one device read per tick.
+- F25's refused p4a case reports 48 at layer 0, tick 1.
+- Negative control: a service that notes the demand against the next layer reports another layer.
 
 ## 13. Open questions
 

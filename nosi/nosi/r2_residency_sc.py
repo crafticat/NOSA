@@ -37,7 +37,9 @@ with tensor ops, in K3X order (verify row, head, ascending block; dispatcher.py:
              slot 0 (in bounds); end_tick raises CapacityRefusal before any change of the host state. The tick's
              outputs are invalid and the run stops: every LRU entry and in-flight draft prefetch is protected or read
              by the layer and C + X or R_ver is too small (a configuration result, as v1's own CapacityRefusal); the
-             message carries the capacity report of the first refused streams (_overflow_report).
+             message carries the DECISION per layer and per refused stream (_k5_report: its first misses = free base
+             slots + shared extras + Policy E + no slot; the layer's extras at the tick start and how many first
+             misses needed one), then the capacity report (the host state at the tick's start) of those streams.
   protect    every valid selected block (K2), applied at end_tick.
 Then the device (a) WAITS for the in-flight blocks the verify rows read, (b) GATHERS the urgent blocks (K, V, bias)
 into their slots on the main stream before the layer's attention, (c) updates the mirror (the urgent blocks in flight,
@@ -53,7 +55,9 @@ THE DEVICE OPERATIONS (dev):
   CpuDeviceSim   the CPU stand-in (tests). The CPU is the device here, so the stand-in reads its own decision
                  tensors; it never changes the host's ownership state. wait: the needed transfers land (the
                  transport's force), exactly v1's waits. gather: the copies; it refuses a gather into a slot whose
-                 last reader is pending (T3) and waits for the block's host write-back first (T4), as v1's gather.
+                 last reader is pending (T3) and waits for the block's host write-back first (T4), as v1's gather;
+                 before it, it host-waits every write-back registered since its last gather (history_written ->
+                 _hist_unwaited: the stand-in of the GPU main stream's wait).
   CudaDeviceOps  the GPU. SOURCE ONLY, NOT RUN YET (GPU gate FG1). wait: the main stream waits (cudaStreamWaitEvent)
                  on the completion event of EVERY transfer in flight at the layer: a SUPERSET of the needed transfers,
                  because the host does not read the selection; a CPU pack that is not submitted yet is host-waited for
@@ -331,7 +335,9 @@ def device_verify(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, mut=N
     no_verify_dedup (a later occurrence of a miss takes a second slot: two transfers of one block), no_overflow_flag
     (an overflow is not reported), evict_protected / evict_selected / evict_newest (Policy E ignores the protection,
     ignores the layer's selections, takes the most recent candidate first), no_inflight_wait (the layer's wait omits
-    a superseded prefetch: the urgent gather may write before that write landed)."""
+    a superseded prefetch: the urgent gather may write before that write landed), verify_no_local (K5 grants no FREE
+    base slot under C: every first miss needs a shared extra), verify_reserve=R (K5 keeps R shared extras from the
+    verifier, the draft rule: budget X - borrowed - R)."""
     mut = mut or {}
     H, Rv, k = sel.shape
     dev = sel.device
@@ -372,9 +378,11 @@ def device_verify(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, mut=N
     rank_s = rank_in_group(sid, fmiss)
     usage = m.usage.reshape(S)
     free_local = (C - usage).clamp(min=0)
+    if mut.get("verify_no_local"):                                                 # NEGATIVE CONTROL: no base slot
+        free_local = torch.zeros_like(free_local)
     needs_extra = fmiss & (rank_s >= free_local[sid])
     borrowed = (usage - C).clamp(min=0).sum()
-    budget = (X - borrowed).clamp(min=0)
+    budget = (X - borrowed - mut.get("verify_reserve", 0)).clamp(min=0)            # NEGATIVE CONTROL: a reserve
     ne = needs_extra.to(torch.int64)
     g = ne.cumsum(0) - ne
     granted = fmiss & (~needs_extra | (g < budget))
@@ -533,8 +541,13 @@ class CpuDeviceSim:
         host K / V rows and its cis rows (bias), after the block's host write-back (T4); a slot whose last reader is
         pending is refused (T3). A slot that Policy E EVICTED was last read in an earlier tick, before this gather in
         the main stream's order: its pending reader is host-waited here (the stand-in of that order; counted as
-        verifier_force_waits, as v1 counts it)."""
+        verifier_force_waits, as v1 counts it). First, the stand-in of the main stream's wait on every host
+        write-back registered since the last gather (CudaDeviceOps.gather, T4): each pending one is host-waited."""
         svc = self.svc
+        for ev in svc._hist_unwaited:
+            if not ev_done(ev):
+                svc.host_wait(ev)
+        svc._hist_unwaited = []
         g = svc.gather                                    # the host rows and the store (TorchGather's tensors)
         bs = svc.bs
         bb, hh = dec.bh
@@ -855,6 +868,10 @@ class ResidencySC(ResidencySB):
         self._hist_unwaited: List = []                    # host write-backs the main stream did not wait on yet
         self._flags: Dict[str, torch.Tensor] = {}         # watched device flags (watch_flag)
         self.flag_values: Dict[str, int] = {}             # their values at the last end_tick read
+        # REPORT (report()["k5"]): per (tick, layer) the verify first misses that needed a shared extra (_extra_need),
+        # its peak with the tick and layer, and each layer's maximum; refused ticks included
+        self.k5_peak: Tuple = (0, None, None)
+        self.k5_by_layer: List[int] = [0] * self.L
 
     def watch_flag(self, name: str, flag: torch.Tensor) -> None:
         """Watch a device flag (a 0-dim bool or integer tensor on the service's device; e.g. the twin's sticky
@@ -905,6 +922,14 @@ class ResidencySC(ResidencySB):
     def begin_request(self, b: int, uid, hist_blocks=None) -> None:
         super().begin_request(b, uid, hist_blocks)
         self._mark_batch_slot(b)
+
+    def history_written(self, uid, block: int, ev) -> None:
+        """Residency.history_written, and the event joins the write-backs that the main stream has not waited on yet
+        (_hist_unwaited, T4). The GPU gather waits on every one of them before its copies (CudaDeviceOps.gather; a
+        captured tick waits them before the replay, outside the graph); the CPU stand-in host-waits them. Without
+        this producer the GPU urgent gather was ordered after a write-back only when both ran on one stream."""
+        super().history_written(uid, block, ev)
+        self._hist_unwaited.append(ev)
 
     def end_request(self, uid) -> None:
         b = self.uid_b[uid]
@@ -1100,11 +1125,7 @@ class ResidencySC(ResidencySB):
                 parsed.append((st, v, d))
             over = [(st["l"], v[1]) for (st, v, _) in parsed if v is not None and v[1] > 0]
             if over:
-                raise CapacityRefusal("S-C: the verifier's urgent misses found no slot: K5 grants none and Policy E has "
-                                      "no candidate, every LRU entry and in-flight draft prefetch being protected or "
-                                      "read by the layer (layer, blocks without a slot: %s; C %d, X %d, R_ver %d): the "
-                                      "tick's outputs are invalid; refused streams: %s"
-                                      % (over, self.C, self.X, self.R_ver, self._overflow_report(parsed)))
+                raise self._refusal(over, self._overflow_report(parsed))
             for (st, v, d) in parsed:
                 if v is not None:
                     self._apply_verify(st["l"], st["vrows"], st["vidx"], st["vdec"], v[0],
@@ -1113,24 +1134,92 @@ class ResidencySC(ResidencySB):
                 if d is not None:
                     self._apply(st["l"], st["drows"], st["ddec"], d[0], d[1], d[2], d[3])
 
+    def _refusal(self, over, report: str) -> CapacityRefusal:
+        """The CapacityRefusal of a tick whose verify first misses overflowed (the dense and the sparse consumer)."""
+        return CapacityRefusal(
+            "S-C: the verifier's urgent misses found no slot (layer, first misses with no slot: %s; C %d, X %d, R_ver "
+            "%d). K5 granted each stream's FREE base slots (C - usage) and then the layer's shared extras (X - "
+            "borrowed; the verifier may use the R_ver reserve too) in K3X order, and Policy E had no candidate left "
+            "(every other LRU entry and in-flight draft prefetch is protected or read by the layer): this tick's demand "
+            "exceeds that allowance, a configuration result. The tick's outputs are invalid. %s"
+            % (over, self.C, self.X, self.R_ver, report))
+
     def _overflow_report(self, parsed, per_layer: int = 3) -> str:
-        """For a refused tick: the capacity report (v1's _capacity_report, host state = the tick's start: nothing is
-        applied) of the first streams per layer whose first miss got no slot."""
+        """For a refused tick (dense record): per layer with an overflow, _k5_report of the layer's verify first
+        misses (an entry valid, not ready, not in flight, not a later occurrence of a miss), in K3X order."""
         out = []
         for (st, v, _) in parsed:
             if v is None or v[1] <= 0:
                 continue
-            dec, c, seen = st["vdec"], v[0], []
+            dec, c, firsts = st["vdec"], v[0], []
             for o in range(dec.Rv * dec.H * dec.k):
-                if (c["valid"][o] and not (c["ready"][o] or c["infl"][o] or c["dup"][o] or c["granted"][o]
-                                           or c["evict"][o])):
-                    bh = (st["vrows"][o // (dec.H * dec.k)].b, (o // dec.k) % dec.H)
-                    if bh not in seen:
-                        seen.append(bh)
-                        out.append(self._capacity_report(st["l"], bh[0], bh[1]))
-                    if len(seen) >= per_layer:
-                        break
-        return "; ".join(out)
+                if not c["valid"][o] or c["ready"][o] or c["infl"][o] or c["dup"][o]:
+                    continue
+                bh = (st["vrows"][o // (dec.H * dec.k)].b, (o // dec.k) % dec.H)
+                firsts.append((bh, "grant" if c["granted"][o] else ("evict" if c["evict"][o] else "none")))
+            out.append(self._k5_report(st["l"], firsts, v[1], per_layer))
+        return " | ".join(out)
+
+    def _k5_report(self, l: int, firsts, n_over: int, per_layer: int = 3, note: str = "") -> str:
+        """The overflow report of layer l of a refused tick. The host state is the tick's START (nothing is applied),
+        so it shows the slots the decision would have taken as still FREE; this report shows the decision instead.
+        firsts: the layer's verify FIRST misses in K3X order (row, head, block) as ((b, h), outcome), outcome "grant"
+        (K5), "evict" (Policy E) or "none" (no slot). K5 for the verifier (device_verify = v1's LayerPool.can_take,
+        ownership.py:419-427; usage = every non-FREE slot, :135-136; borrowed, :409-413): a stream's first C - usage
+        first misses take its FREE base slots; each later one needs one of the layer's SHARED extras (X - borrowed at
+        the tick start, the R_ver reserve included for the verifier), granted in K3X order while any is free; then
+        Policy E. Per stream: first misses = base + shared extras + Policy E + no slot; then v1's _capacity_report of
+        the first per_layer streams with a first miss with no slot."""
+        pool = self.pools[l]
+        per, order = {}, []
+        for bh, what in firsts:
+            if bh not in per:
+                per[bh] = dict(n=0, grant=0, evict=0, none=0)
+                order.append(bh)
+            per[bh]["n"] += 1
+            per[bh][what] += 1
+        need = extras = 0
+        lines = []
+        for bh in order:
+            p = per[bh]
+            use = pool.stream(bh[0], bh[1]).usage()
+            base = min(max(0, self.C - use), p["n"])
+            need += p["n"] - base
+            extras += p["grant"] - base
+            if p["none"] and len(lines) < per_layer:
+                lines.append("(l %d b %d h %d: first misses %d = %d in its free base slots (C %d - usage %d) + %d shared "
+                             "extras + %d by Policy E + %d with no slot) %s"
+                             % (l, bh[0], bh[1], p["n"], base, self.C, use, p["grant"] - base, p["evict"], p["none"],
+                                self._capacity_report(l, bh[0], bh[1])))
+        head = ("layer %d: %d streams had verify first misses, %d of the misses needed a shared extra; the layer's %d "
+                "free extras (X %d, borrowed %d at the tick start) went to the first %d of them in K3X order; %d found "
+                "no slot%s" % (l, len(order), need, pool.free_extras(), self.X, pool.borrowed(), extras, n_over, note))
+        self._note_extra_need(l, need)
+        return "; ".join([head] + lines)
+
+    def _extra_need(self, use0: Dict, n_first: Dict) -> int:
+        """The layer's verify first misses that needed a SHARED extra: per stream, its first misses beyond its FREE
+        base slots at the layer's start (C - usage), summed (K5's rule; granted, Policy E and no slot alike)."""
+        return sum(max(0, n - max(0, self.C - use0[bh])) for bh, n in n_first.items())
+
+    def _note_extra_need(self, l: int, need: int) -> None:
+        """REPORT: the shared-extra demand of layer l at this tick (self.tick_no): the layer's maximum, and the run's
+        peak with its tick and layer (the first occurrence of the peak)."""
+        if need > self.k5_by_layer[l]:
+            self.k5_by_layer[l] = need
+        if need > self.k5_peak[0]:
+            self.k5_peak = (need, self.tick_no, l)
+
+    def report(self) -> Dict:
+        """Residency's report, plus "k5": the peak shared-extra demand of the run (passing and refused ticks)."""
+        out = super().report()
+        need, tick, layer = self.k5_peak
+        out["k5"] = dict(extra_need_peak=need, at_tick=tick, at_layer=layer, by_layer=list(self.k5_by_layer), C=self.C,
+                         X=self.X, R_ver=self.R_ver,
+                         definition="per (tick, layer): the verify first misses beyond each stream's FREE base slots "
+                                    "(C - usage at the layer's start), summed over the layer's streams: the shared "
+                                    "extras that the layer's verify needed (granted, Policy E and no slot)")
+        return out
 
     def _host_candidates(self, l: int, vrow_objs, dec, c, drow_objs, dcols, ddec):
         """Policy E's candidates on the host (v1's _verifier_candidates), from the host state at the start of the
@@ -1169,6 +1258,7 @@ class ResidencySC(ResidencySB):
         now = self.clock()
         looks, entries = [], {}
         cands = self._host_candidates(l, vrow_objs, dec, c, drow_objs, dcols, ddec) if any(c["evict"]) else {}
+        use0, n_first = {}, {}                                # per stream: usage at the layer's start, first misses
         for j, r in enumerate(vrow_objs):
             for h in range(H):
                 st = pool.stream(r.b, h)
@@ -1204,6 +1294,10 @@ class ResidencySC(ResidencySB):
                     else:
                         raise OwnershipViolation("S-C: block %d of verify row %d (layer %d b %d h %d) has no slot and the "
                                                  "device did not flag an overflow" % (t, vidx[j], l, r.b, h))
+                if takes:                                             # the K5 REPORT (_extra_need): the usage at
+                    if (r.b, h) not in use0:                          # the layer's start (no take of this layer in
+                        use0[(r.b, h)] = st.usage()                   # the stream yet), the first misses
+                    n_first[(r.b, h)] = n_first.get((r.b, h), 0) + len(takes)
                 for (t, at, ev_blk, ev_kind) in takes:
                     if ev_blk is not None:                            # Policy E: the host's next candidate, evicted
                         q = cands.get((r.b, h))
@@ -1222,6 +1316,7 @@ class ResidencySC(ResidencySB):
                     ent.append((t, at))
                 looks.append(dict(row=vidx[j], h=h, key=r.key, ready=ready, in_flight=infl, new=new, t=now))
                 entries[(j, h)] = sorted(ent)
+        self._note_extra_need(l, self._extra_need(use0, n_first))
         for lk in looks:
             self.metrics.look(l, lk)
         ev = self._layer_ev.get(l)
