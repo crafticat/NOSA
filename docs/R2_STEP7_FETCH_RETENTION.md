@@ -1107,6 +1107,33 @@ TESTS:
   refuses its own consumer, applies nothing and leaves the pin table untouched. Negative control: clearing only the
   PIN flag is not enough.
 
+## 12q. REPORT: the peak shared-extra demand of a run (`report()["k5"]`, for the X 64 runs)
+
+THE DEFINITION. Per (tick, layer), the layer's verify first misses that needed a SHARED extra:
+- per stream, its first misses beyond its FREE base slots at the layer's start, max(0, first misses - (C - usage));
+- summed over the layer's streams.
+- They were served by a granted extra, by Policy E, or by nothing (a refusal). K5's own rule decides it.
+
+WHERE IT IS COMPUTED:
+- The dense and the sparse verify appliers. Each stream's usage is taken at its first appearance in the layer,
+  before any take of the layer; then its takes (K5 grants and Policy E evictions) are counted.
+- A refused tick notes the same quantity from `_k5_report`.
+- So it costs no device read and appears for passing and refused runs alike.
+
+`report()["k5"]` holds:
+- `extra_need_peak` and its `at_tick` / `at_layer` (the first occurrence);
+- `by_layer` (each layer's maximum);
+- C, X, R_ver and the definition.
+
+It answers "is X enough for the whole run": X >= `extra_need_peak` means K5 alone never needed Policy E. A passing
+run with a larger peak relied on Policy E.
+
+TEST F26 (dense and sparse):
+- A passing 2-tick schedule with a known demand: 2 / 6, then 7 / 1. The peak is 7 at tick 1, layer 0; by layer
+  [7, 6]; one device read per tick.
+- F25's refused p4a case reports 48 at layer 0, tick 1.
+- Negative control: a service that notes the demand against the next layer reports another layer.
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,

@@ -510,6 +510,7 @@ class ResidencySparse(ResidencySC):
         self.records_applied += len(recs)
         cands = self._candidates_from_bits(l, vrow_objs, p["sel"]) if any(r[2] & EVICT for r in recs) else {}
         firsts: Dict[Tuple, List[Tuple[int, int, str]]] = {}         # key -> [(h, block, class)]
+        use0, n_first = {}, {}                                        # the K5 REPORT (S-C's _extra_need)
         i, n = 0, len(recs)
         while i < n:
             g = recs[i][0] // k                                       # (row, head) group: o // k = j * H + h
@@ -541,6 +542,10 @@ class ResidencySparse(ResidencySC):
                 elif fl & (GRANT | EVICT):
                     takes.append((t, tslot, evb if fl & EVICT else None, "inflight" if fl & EVICT_INFL else "lru",
                                   fl & FIRST))
+            if takes:                                                 # the usage at the layer's start (no take of
+                if (r.b, h) not in use0:                              # this layer in the stream yet)
+                    use0[(r.b, h)] = st.usage()
+                n_first[(r.b, h)] = n_first.get((r.b, h), 0) + len(takes)
             for (t, at, ev_blk, ev_kind, first) in takes:
                 if ev_blk is not None:                                # Policy E: the host's next candidate, evicted
                     q = cands.get((r.b, h))
@@ -558,6 +563,7 @@ class ResidencySparse(ResidencySC):
                 self._landed.add(tr.seq)
                 if first:
                     firsts.setdefault(r.key, []).append((h, t, "new"))
+        self._note_extra_need(l, self._extra_need(use0, n_first))
         # the looks (4.3 / 4.6): the ready first looks counted on the device, the others from the records
         keys = []
         for jj, r in enumerate(vrow_objs):

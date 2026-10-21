@@ -2773,3 +2773,60 @@ def test_R7b_pin_records_off_drops_the_pin_only_records_and_refuses_the_b1_consu
     with pytest.raises(ValueError, match="pin_records=False"):
         svc.end_tick()
     assert not svc.inflight and not svc.stream(0, 0, 0).prot and int(torch.count_nonzero(svc.pins)) == 0
+
+
+# =====================================================================================================================
+# F26 REPORT: the peak shared-extra demand of a run (report()["k5"]), passing ticks included (the X 64 runs)
+# =====================================================================================================================
+class WrongLayerK5(SC.ResidencySC):
+    """DEFECT (negative control): the shared-extra demand of a layer is noted against the next layer."""
+
+    def _note_extra_need(self, l, need):
+        super()._note_extra_need((l + 1) % self.L, need)
+
+
+# per tick: (the batch slot of its one verify row, per layer (head 0 blocks, head 1 blocks)); every block is a first
+# miss and every stream starts the tick empty (C 4): the layer's need = the sum over its streams of max(0, misses - 4)
+F26_TICKS = [(0, [([0, 1, 2, 3, 4, 5], []), (list(range(10)), [0, 1])]),     # tick 0: layer 0 needs 2, layer 1 needs 6
+             (1, [(list(range(11)), []), (list(range(5)), [])])]              # tick 1: layer 0 needs 7 (THE PEAK), 1
+
+
+def _f26(cls):
+    w = world(C=4, X=10, R_ver=2, cls=cls, svc_kw=dict(nblk=NB))
+    svc = w.svc
+    for b, u in enumerate(("u0", "u1")):
+        svc.begin_request(b, u)
+    for (b, per_layer) in F26_TICKS:
+        svc.poll()                                         # the previous tick's urgent slots are FREE again here
+        assert all(s.usage() == 0 for pool in svc.pools for s in pool.streams.values())
+        rows = [Row(b, "v", ("u%d" % b, 1, 1), 300, 20)]
+        for l in range(L):
+            p = svc.resolve(l, rows, S(list(per_layer[l])))
+            svc.read_done(l, p, Ev(done=True))
+        svc.end_tick()
+    return w
+
+
+@pytest.mark.parametrize("kind", ["sc", "sparse"])
+def test_F26_the_k5_report_holds_the_peak_shared_extra_demand_of_a_passing_run(kind):
+    """F26 (REPORT, the lead's GO for the X 64 runs): report()["k5"] of S-C (dense and sparse) holds, per (tick,
+    layer), the verify first misses that needed a SHARED extra (beyond each stream's free base slots C - usage at the
+    layer's start, summed over the layer's streams), as its peak with the tick and the layer, and each layer's
+    maximum; it is computed from the decision the host already applies (no device read). A PASSING 2-tick schedule
+    with a known demand (layer 0 / 1: 2 / 6 at tick 0, 7 / 1 at tick 1): peak 7 at tick 1, layer 0; by layer [7, 6];
+    every first miss was an urgent take (k43 new 34) and nothing was refused. A REFUSED tick updates it too: F25's
+    p4a case reports its 48 at layer 0, tick 1. Negative control: a service that notes the demand against the next
+    layer reports another layer."""
+    cls = dict(sc=SC.ResidencySC, sparse=SP.ResidencySparse)[kind]
+    w = _f26(cls)
+    k5 = w.svc.report()["k5"]
+    assert (k5["extra_need_peak"], k5["at_tick"], k5["at_layer"], k5["by_layer"]) == (7, 1, 0, [7, 6]), k5
+    assert (k5["C"], k5["X"]) == (4, 10) and w.svc.metrics.k43["new"] == 6 + 10 + 2 + 11 + 5
+    assert w.svc.d2h_reads == len(F26_TICKS)                     # no device read beyond the one per tick
+    w2, e = _k5_case(cls, P4A_MISSES, dict(nblk=NB_K5))
+    assert e is not None
+    k2 = w2.svc.report()["k5"]
+    assert (k2["extra_need_peak"], k2["at_tick"], k2["at_layer"]) == (48, 1, 0), k2
+    if kind == "sc":
+        kn = _f26(WrongLayerK5).svc.report()["k5"]
+        assert (kn["at_layer"], kn["by_layer"]) != (0, [7, 6]), kn
