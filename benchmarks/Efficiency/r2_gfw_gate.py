@@ -28,6 +28,22 @@ REPORT
 REGISTERED (frozen 2026-10-21 before gfw1; the step script's header holds the same numbers): per size,
   ratio = median(worker total) / median(v2 total, both v2 blocks):
   PREDICTION |ratio - 1| <= 0.15; FALSIFIER ratio >= 1.30 (the worker slower by 30 % or more); otherwise GREY.
+THE CELLS (--cell): gfw1 = GFW_ready, GFW1, GFW1n, GFW_T (above). gfw2 = GFW_ready, GFW2, GFW2n, R_GFW2_host: the
+descriptor issue (Q-B3, issue_desc) on the GPU, tests_cpu GT8's lockstep at the B 64 geometry:
+  GFW2   MUST: --takes takes (B2's ~6.5 k draft takes of one tick) over --l2-layers layers of the production geometry
+         (B 64, KV heads 2, D 128, bf16, host rows 16311 per request: 254 complete blocks; store C + X + 4 = 132 slots;
+         board C + X = 128), the destinations distinct per layer, issued (after one warm-up take) on two fresh stores:
+         as per-layer Transfer objects (issue, unchanged) and as ONE (6, n) descriptor (issue_desc), each with its T3 /
+         T4 events PENDING at issue (recorded after a --l2-sleep-cycles GPU sleep; the descriptor path through
+         mark_reader / mark_hist). PASS: the two stores (K and V, every layer) and the two boards are BITWISE equal; the
+         board holds every take; 256 sampled takes are the host truth; groups and publications are counted alike;
+         landed_upto() reaches the descriptor job; both on the requested team.
+  GFW2n  MUST, the negative control: the descriptor path with the planted slot shift (set_plant_slot_shift(1)) on a
+         fresh store does NOT land the object path's store.
+  R_GFW2_host  REPORT: the main thread's issue time of the tick: issue_desc (one call) against the L issue() calls of
+         the object path (the Transfer objects are built beforehand, not timed).
+REGISTERED2 (frozen 2026-10-21 before gfw2; the step script's header holds the same numbers): PREDICTION the issue_desc
+  call takes <= 1.0 ms at --takes 6496; FALSIFIER >= 5.0 ms; otherwise GREY.
 OUTPUT: --out/summary.json. The last stdout line is R2_GFW_DONE failed=<n>; exit = n (2 = refused).
 """
 from __future__ import annotations
@@ -42,6 +58,8 @@ import traceback
 import types
 
 REGISTERED = dict(pred_band=0.15, falsifier_ratio=1.30)
+REGISTERED2 = dict(desc_issue_pred_ms=1.0, desc_issue_fals_ms=5.0)
+CELLS = ("gfw1", "gfw2")
 V2_RECORD = {64: dict(svc_p50_ms=4.59, native_total_ms=4.20), 192: dict(svc_p50_ms=12.36, native_total_ms=11.43,
                                                                        svc_p50_ms_t4=15.86)}
 B_T, H_T, D_T, R_T, LAYERS_T, NSRC_T, NBLK_T, M_T, CAP_T = 64, 8, 128, 64, 32, 4, 64, 16, 256
@@ -70,7 +88,22 @@ def parse_args(argv):
     ap.add_argument("--sizes", default="64,192", help="MiB of K + V per release")
     ap.add_argument("--launches", type=int, default=1500, help="launches behind the spin (> the ~1024-entry queue)")
     ap.add_argument("--spin-cycles", type=int, default=200_000_000, help="the GPU sleep before the T4 event")
+    ap.add_argument("--cell", default="gfw1", choices=CELLS, help="gfw1: GFW1 / GFW1n / GFW_T; gfw2: GFW2 / GFW2n")
+    ap.add_argument("--takes", type=int, default=6496, help="gfw2: the takes of the tick (B2: ~6.49 k)")
+    ap.add_argument("--l2-layers", type=int, default=4)
+    ap.add_argument("--l2-batch", type=int, default=64)
+    ap.add_argument("--l2-heads", type=int, default=2)
+    ap.add_argument("--l2-s-host", type=int, default=16311, help="host rows per request (build_ragged's n_host)")
+    ap.add_argument("--l2-c", type=int, default=96)
+    ap.add_argument("--l2-x", type=int, default=32)
+    ap.add_argument("--l2-sleep-cycles", type=int, default=50_000_000, help="the GPU sleep before the T3 / T4 events")
     a = ap.parse_args(argv)
+    npos = a.l2_c + a.l2_x
+    if (a.l2_layers < 1 or a.takes < a.l2_layers or a.takes % a.l2_layers
+            or a.takes // a.l2_layers > a.l2_batch * a.l2_heads * (npos - 1) or a.l2_s_host < 64 * 2
+            or a.l2_sleep_cycles < 1_000_000):
+        ap.error("gfw2: takes a multiple of l2-layers, at most l2-batch x l2-heads x (C + X - 1) per layer; "
+                 "l2-s-host >= 128; l2-sleep-cycles >= 1e6")
     a.sizes = [int(s) for s in a.sizes.split(",") if s]
     if not a.sizes or any(s <= 0 or s % 16 or s > 256 for s in a.sizes):
         ap.error("--sizes: MiB multiples of 16 up to 256 (32 KiB groups spread evenly over B 64 x H 8 streams, <= 16 "
@@ -301,6 +334,143 @@ def timing(ext2, ext3, sizes, threads, releases, warmup):
     return out
 
 
+# ------------------------------------------------------------------------------------------------ GFW2 (cell gfw2)
+def verdict2(ms):
+    """REGISTERED2: HELD if the issue_desc call took <= desc_issue_pred_ms; FALSIFIED at >= desc_issue_fals_ms."""
+    if ms is None:
+        return "MISSING"
+    if ms <= REGISTERED2["desc_issue_pred_ms"]:
+        return "HELD"
+    return "FALSIFIED" if ms >= REGISTERED2["desc_issue_fals_ms"] else "GREY"
+
+
+def l2_takes(a, seed=17):
+    """gfw2's takes (CPU): the (6, n) int64 rows l, b, h, block, slot, gen: per layer takes / layers DISTINCT
+    destinations (b, h, slot < C + X - 1: room for the planted shift), blocks below the complete host blocks,
+    generations 2 .. n + 1."""
+    import torch
+    g = torch.Generator().manual_seed(seed)
+    L, B, H = a.l2_layers, a.l2_batch, a.l2_heads
+    ns = a.l2_c + a.l2_x - 1
+    per = a.takes // L
+    nblk = a.l2_s_host // 64
+    cols = []
+    for l in range(L):
+        dst = torch.randperm(B * H * ns, generator=g)[:per]
+        cols.append(torch.stack([torch.full((per,), l, dtype=torch.int64), dst // (H * ns), (dst // ns) % H,
+                                 torch.randint(0, nblk, (per,), generator=g), dst % ns,
+                                 torch.zeros(per, dtype=torch.int64)]))
+    desc = torch.cat(cols, 1).contiguous()
+    desc[5] = torch.arange(2, desc.shape[1] + 2)
+    return desc
+
+
+def gfw2(GF, SCG, ext3, a):
+    """GFW2 / GFW2n (module docstring): the object path (A), the descriptor path (B), the planted shift (C)."""
+    import torch
+    dev = torch.device("cuda")
+    L, B, H, D, R = a.l2_layers, a.l2_batch, a.l2_heads, 128, 64
+    npos = a.l2_c + a.l2_x
+    slots = npos + 4
+    dt = torch.bfloat16
+    g = torch.Generator().manual_seed(23)
+    host_k = [torch.empty(B, a.l2_s_host, H, D, dtype=dt).uniform_(-1, 1, generator=g) for _ in range(L)]
+    host_v = [torch.empty(B, a.l2_s_host, H, D, dtype=dt).uniform_(-1, 1, generator=g) for _ in range(L)]
+    desc = l2_takes(a)
+    n = int(desc.shape[1])
+    rows = desc.t().tolist()
+    marks = list(range(L))                                     # tick 0: mark = 0 * L + layer
+
+    def stores():
+        return ([torch.zeros(B, slots * R, H, D, dtype=dt, device=dev) for _ in range(L)],
+                [torch.zeros(B, slots * R, H, D, dtype=dt, device=dev) for _ in range(L)])
+
+    def transport(sk, sv):
+        gf = GF.GilfreeTransport(ext3, host_k, host_v, sk, sv, R, D, threads=a.threads,
+                                 host_wait=lambda ev: ev.synchronize(), cap_groups=256, worker="cpp")
+        bd = SCG.GenBoard(L, B, H, npos, dev)
+        gf.attach_board(bd)
+        return gf, bd
+
+    def pending_events():
+        torch.cuda._sleep(int(a.l2_sleep_cycles))           # the main stream: the events complete after the sleep
+        evr = []
+        for _ in range(L):
+            e = torch.cuda.Event()
+            e.record()
+            evr.append(e)
+        eh = torch.cuda.Event()
+        eh.record()
+        return evr, eh
+
+    def objects(sel, evr=None, eh=None):
+        per = {}
+        for i in sel:
+            l, b, h, blk, s, gen = rows[i]
+            per.setdefault(l, []).append(GF.Transfer(i, "u%d" % b, l, b, h, blk, s, gen, "draft", ("u%d" % b, 1, 1),
+                                                     hist_ev=eh, reader_ev=None if evr is None else evr[l]))
+        return per
+    out = dict(n=n, layers=L)
+    # A: the object path (issue, unchanged)
+    sa = stores()
+    ga, ba = transport(*sa)
+    for l, trs in objects([0]).items():
+        ga.issue(l, trs)                                       # the warm-up take (starts the worker)
+    ga.flush()
+    evr, eh = pending_events()
+    batch = objects(range(n), evr, eh)
+    out["a_pending_at_issue"] = not eh.query()
+    t0 = time.perf_counter()
+    for l in sorted(batch):
+        ga.issue(l, batch[l])
+    out["object_issue_ms"] = 1e3 * (time.perf_counter() - t0)
+    ga.flush()
+    torch.cuda.synchronize()
+    out.update(a_stats=dict(ga.stats), a_threads_ok=bool(ga.threads_ok()), a_error=ga.npipe.take_error())
+    ga.close()
+    # B: the descriptor path (issue_desc)
+    sb = stores()
+    gb, bb = transport(*sb)
+    gb.issue_desc(desc[:, :1].contiguous())                    # the same warm-up take (the worker, the stores)
+    gb.flush()
+    evr, eh = pending_events()
+    for l in range(L):
+        gb.mark_reader(marks[l], evr[l])
+    gb.mark_hist(0, eh)
+    out["b_pending_at_issue"] = not eh.query()
+    t0 = time.perf_counter()
+    seq = gb.issue_desc(desc, marks, 0)
+    out["desc_issue_ms"] = 1e3 * (time.perf_counter() - t0)
+    gb.flush()
+    torch.cuda.synchronize()
+    out.update(desc_seq=int(seq), landed_upto=int(gb.landed_upto()), b_stats=dict(gb.stats),
+               b_threads_ok=bool(gb.threads_ok()), b_error=gb.npipe.take_error())
+    gb.close()
+    out["stores_equal"] = all(torch.equal(sa[0][l], sb[0][l]) and torch.equal(sa[1][l], sb[1][l]) for l in range(L))
+    out["boards_equal"] = bool(torch.equal(ba.t, bb.t))
+    out["board_entries"] = int((bb.t != 0).sum().item())
+    sample = torch.randperm(n, generator=torch.Generator().manual_seed(29))[:256].tolist()
+    out["truth_sampled"] = len(sample)
+    out["truth_ok"] = all(
+        torch.equal(sb[0][l][b, s * R:(s + 1) * R, h].cpu(), host_k[l][b, blk * R:(blk + 1) * R, h])
+        and torch.equal(sb[1][l][b, s * R:(s + 1) * R, h].cpu(), host_v[l][b, blk * R:(blk + 1) * R, h])
+        for (l, b, h, blk, s, _) in (rows[i] for i in sample))
+    # C: the planted slot shift (NEGATIVE CONTROL), on B's stores zeroed
+    for t in sb[0] + sb[1]:
+        t.zero_()
+    torch.cuda.synchronize()
+    gc, _ = transport(*sb)
+    gc.npipe.set_plant_slot_shift(1)
+    gc.issue_desc(desc[:, :1].contiguous())
+    gc.issue_desc(desc)
+    gc.flush()
+    torch.cuda.synchronize()
+    out["c_error"] = gc.npipe.take_error()
+    gc.close()
+    out["planted_equal"] = all(torch.equal(sa[0][l], sb[0][l]) and torch.equal(sa[1][l], sb[1][l]) for l in range(L))
+    return out
+
+
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     a = parse_args(argv)
@@ -311,7 +481,7 @@ def main(argv=None) -> int:
         os.makedirs(a.out)
         gates, res = [], {}
         meta = dict(args=vars(a), commit=os.environ.get("GFW_COMMIT", "unknown"), registered=REGISTERED,
-                    v2_record=V2_RECORD)
+                    registered2=REGISTERED2, v2_record=V2_RECORD, cell=a.cell)
 
         def save():
             json.dump(dict(meta=meta, gates=gates, results=res), open(os.path.join(a.out, "summary.json"), "w"),
@@ -337,7 +507,41 @@ def main(argv=None) -> int:
             ready, detail = False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:400])
         gates.append(gate("GFW_ready", ready, True, detail))
         save()
-        if ready:
+        if ready and a.cell == "gfw2":
+            log("GFW2")
+            try:
+                r = gfw2(GF, SCG, ext3, a)
+                res["GFW2"] = r
+                sa, sb, n = r["a_stats"], r["b_stats"], r["n"]
+                ok2 = (r["stores_equal"] and r["boards_equal"] and r["board_entries"] == n and r["truth_ok"]
+                       and sa["groups"] == sb["groups"] == n + 1 and sa["published"] == sb["published"] == n + 1
+                       and r["landed_upto"] == r["desc_seq"] == 2 and r["a_threads_ok"] and r["b_threads_ok"]
+                       and not r["a_error"] and not r["b_error"])
+                gates.append(gate("GFW2", ok2, True, (
+                    "%d takes over %d layers: stores equal %s, boards equal %s, board entries %d, truth %s (%d "
+                    "sampled), groups %s / %s, published %s / %s, releases %s / %s, landed_upto %d of job %d, teams "
+                    "%s / %s, T3/T4 pending at issue %s / %s, errors %r / %r" % (
+                        n, r["layers"], r["stores_equal"], r["boards_equal"], r["board_entries"], r["truth_ok"],
+                        r["truth_sampled"], sa["groups"], sb["groups"], sa["published"], sb["published"],
+                        sa["releases"], sb["releases"], r["landed_upto"], r["desc_seq"], r["a_threads_ok"],
+                        r["b_threads_ok"], r["a_pending_at_issue"], r["b_pending_at_issue"], r["a_error"],
+                        r["b_error"]))))
+                gates.append(gate("GFW2n", not r["planted_equal"], True,
+                                  "the planted slot shift lands %s store (error %r)" % (
+                                      "the SAME" if r["planted_equal"] else "another", r["c_error"])))
+                v = verdict2(r["desc_issue_ms"])
+                gates.append(gate("R_GFW2_host", v == "HELD", False,
+                                  "%s: issue_desc %.3f ms (prediction <= %.1f, falsifier >= %.1f) vs the object path's "
+                                  "%d issue() calls %.2f ms, for %d takes" % (
+                                      v, r["desc_issue_ms"], REGISTERED2["desc_issue_pred_ms"],
+                                      REGISTERED2["desc_issue_fals_ms"], r["layers"], r["object_issue_ms"], n)))
+            except Exception as e:
+                traceback.print_exc()
+                res["GFW2"] = dict(error="%s: %s" % (type(e).__name__, str(e)[:400]))
+                for name in ("GFW2", "GFW2n"):
+                    gates.append(gate(name, False, True, "EXCEPTION " + res["GFW2"]["error"]))
+            save()
+        if ready and a.cell == "gfw1":
             for name, planted, max_spin in (("GFW1", False, 1 << 24), ("GFW1n", True, 1 << 16)):
                 log(name)
                 try:

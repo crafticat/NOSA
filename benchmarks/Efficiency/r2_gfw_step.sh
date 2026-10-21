@@ -11,14 +11,24 @@
 # PREDICTION |ratio - 1| <= 0.15 at 64 and at 192 MiB
 # FALSIFIER ratio >= 1.30 (the worker slower by 30 % or more) at either size; otherwise GREY
 # REGISTERED GFW END
+# CELLS (the optional 5th argument; default gfw1): gfw1 = the cell above. gfw2 = GFW_ready, GFW2 (MUST: the descriptor
+# issue on the GPU, tests_cpu GT8's lockstep at the B 64 geometry: 6496 takes over 4 layers, KV heads 2, host rows
+# 16311, store 132 slots, board 128, T3 / T4 pending at issue; the object path (issue) and ONE descriptor (issue_desc)
+# land BITWISE the same stores and boards, the host truth on 256 sampled takes), GFW2n (MUST: the planted slot shift
+# does not land the same store) and R_GFW2_host (REPORT: the main thread's issue time of the tick).
+# REGISTERED GFW2 BEGIN
+# frozen 2026-10-21 before gfw2; the issue_desc call of 6496 takes, main-thread wall time
+# PREDICTION <= 1.0 ms
+# FALSIFIER >= 5.0 ms; otherwise GREY
+# REGISTERED GFW2 END
 # The pattern of benchmarks/Efficiency/r2_fetch_fg_step.sh (feature/nosi-r2-m2-fg): the GPU uuid from
 # HOLDERS/<holder job id>.gpu_uuid; packer v2 (gilfree_pack.py / .cpp of f2b981a) pinned by commit, path and blob;
 # packer v3 = the blobs of benchmarks/Efficiency/gilfree_pack.{py,cpp} at --nosi; both copied into the step record and
 # loaded by path (built into the step's JIT directory). No model, no workload.
 # SOURCE ONLY until reviewed: it never submits, renews, cancels or replaces an allocation, never retries.
 #
-#   bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id>
-#   DRYRUN=1 bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id>
+#   bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id> [gfw1|gfw2]
+#   DRYRUN=1 bash benchmarks/Efficiency/r2_gfw_step.sh --nosi <sha> <holder job> <run id> [gfw1|gfw2]
 #        (login node: the pin checks and the printed step command; no squeue, claim, srun or write)
 #   In DRYRUN only, GFW_HOLDERS=<dir> replaces HOLDERS (the CPU test uses it); a real run refuses GFW_HOLDERS.
 #
@@ -29,7 +39,7 @@
 # 124 / 137 the host timeout; 1 a STOP before the launch (a missing or malformed uuid file included); 5 an exit-0 step
 # whose record is incomplete or whose sacct row is not COMPLETED 0:0.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-gilfree-worker                                           # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw2                                                     # ROOT
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -47,9 +57,15 @@ STEP_MIN=12
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 GFW step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_gfw_step.sh --nosi <sha> <holder> <run id>" >&2; exit 2; }
-[ $# = 4 ] && [ "$1" = --nosi ] || usage
-NSHA=$2 JOB=$3 RUN=$4
+usage() { echo "usage: r2_gfw_step.sh --nosi <sha> <holder> <run id> [gfw1|gfw2]" >&2; exit 2; }
+{ [ $# = 4 ] || [ $# = 5 ]; } && [ "$1" = --nosi ] || usage
+NSHA=$2 JOB=$3 RUN=$4 CELL=${5:-gfw1}
+case $CELL in
+    gfw1) CELL_ARGS=(--releases 20 --warmup 3 --sizes "$SIZES" --launches 1500 --spin-cycles 200000000) ;;
+    gfw2) CELL_ARGS=(--takes 6496 --l2-layers 4 --l2-batch 64 --l2-heads 2 --l2-s-host 16311 --l2-c 96 --l2-x 32
+                     --l2-sleep-cycles 50000000) ;;
+    *) usage ;;
+esac
 DRY=${DRYRUN:-0}
 [[ $NSHA =~ ^[0-9a-f]{40}$ ]] || stop "--nosi '$NSHA' is not a full commit id"
 case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
@@ -109,9 +125,9 @@ ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) sr
       /bin/sh -c "$CHILD" gfw-child "$GPU_UUID" "$APPTAINER" --bind /mnt/beegfs/ojerbi:/mnt/beegfs/ojerbi "${ENVS[@]}"
       "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_gfw_gate.py" --out "$OUT" --nosi-pkg "$NOSI/nosi/nosi"
       --v3 "$V3_DIR" --v3-build "$JIT/gfw_v3_build" --v2 "$V2_DIR" --v2-build "$JIT/gfw_v2_build"
-      --threads "$THREADS" --releases 20 --warmup 3 --sizes "$SIZES" --launches 1500 --spin-cycles 200000000)
+      --threads "$THREADS" --cell "$CELL" "${CELL_ARGS[@]}")
 if [ "$DRY" = 1 ]; then
-    echo "R2 GFW step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob gpu_uuid $GPU_UUID ($UFILE)"
+    echo "R2 GFW step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob gpu_uuid $GPU_UUID ($UFILE); cell $CELL"
     echo "R2 GFW step: packer v3 $NSHA:$GF_PY blob $V3_PY_BLOB, $GF_CPP blob $V3_CPP_BLOB -> $V3_DIR; packer v2 $GF_SHA:$GF_PY blob $GF_PY_BLOB, $GF_CPP blob $GF_CPP_BLOB -> $V2_DIR"
     printf '%q ' "${ARGV[@]}"
     echo
@@ -150,8 +166,8 @@ printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/comman
 printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s utc_start=%s\n' "$NSHA" \
     "$blob" "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
     stop "cannot write $REC (gfw_active stays)"
-printf 'packer_v3=%s py=%s cpp=%s packer_v2=%s py=%s cpp=%s threads=%s sizes=%s\n' "$NSHA" "$V3_PY_BLOB" "$V3_CPP_BLOB" \
-    "$GF_SHA" "$GF_PY_BLOB" "$GF_CPP_BLOB" "$THREADS" "$SIZES" >> "$REC/command.txt" ||
+printf 'packer_v3=%s py=%s cpp=%s packer_v2=%s py=%s cpp=%s threads=%s sizes=%s cell=%s\n' "$NSHA" "$V3_PY_BLOB" \
+    "$V3_CPP_BLOB" "$GF_SHA" "$GF_PY_BLOB" "$GF_CPP_BLOB" "$THREADS" "$SIZES" "$CELL" >> "$REC/command.txt" ||
     stop "cannot write $REC (gfw_active stays)"
 "${ARGV[@]}" < /dev/null > "$REC/stdout.txt" 2> "$REC/stderr.txt"
 rc=$?

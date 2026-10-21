@@ -28,10 +28,59 @@ def _gate():
     return G
 
 
-def _registered(text, prefix="# "):
+def _registered(text, prefix="# ", tag="GFW"):
     lines = text.splitlines()
-    i, j = lines.index(prefix + "REGISTERED GFW BEGIN"), lines.index(prefix + "REGISTERED GFW END")
+    i, j = lines.index(prefix + "REGISTERED %s BEGIN" % tag), lines.index(prefix + "REGISTERED %s END" % tag)
     return "\n".join(ln[len(prefix):] for ln in lines[i + 1:j])
+
+
+def _takes_ok(desc, a):
+    """gfw2's takes: (6, n), per layer distinct destinations (b, h, slot), every field in range, distinct gens."""
+    rows = desc.t().tolist()
+    ns, nblk = a.l2_c + a.l2_x - 1, a.l2_s_host // 64
+    dst = [(l, b, h, s) for (l, b, h, _, s, _) in rows]
+    return (len(set(dst)) == len(dst) and len({r[5] for r in rows}) == len(rows)
+            and all(0 <= l < a.l2_layers and 0 <= b < a.l2_batch and 0 <= h < a.l2_heads and 0 <= k < nblk
+                    and 0 <= s < ns for (l, b, h, k, s, _) in rows))
+
+
+def test_GFWC3_the_gfw2_cell_args_takes_and_its_registered_verdict():
+    """GFWC3 (cell gfw2): its defaults (6496 takes over 4 layers of the B 64 geometry: KV heads 2, host rows 16311,
+    C 96 + X 32) and refusals; the takes are (6, 6496) with 1624 per layer, distinct destinations per layer, slots
+    below C + X - 1 (room for the planted shift), blocks below the 254 complete host blocks, distinct generations, and
+    seeded (negative control: a planted duplicate destination is seen); the verdict's bands (HELD <= 1.0 ms,
+    FALSIFIED >= 5.0 ms), the same numbers as the step script's REGISTERED GFW2 block; GFW2 / GFW2n MUST and
+    R_GFW2_host REPORT; cell gfw1 keeps its own gates."""
+    G = _gate()
+    base = ["--out", "o", "--nosi-pkg", "n", "--v3", "a", "--v3-build", "/b", "--v2", "c", "--v2-build", "/d"]
+    assert G.parse_args(base).cell == "gfw1"
+    a = G.parse_args(base + ["--cell", "gfw2"])
+    assert (a.takes, a.l2_layers, a.l2_batch, a.l2_heads, a.l2_s_host, a.l2_c, a.l2_x, a.l2_sleep_cycles) == (
+        6496, 4, 64, 2, 16311, 96, 32, 50_000_000)
+    for bad in (["--cell", "gfw3"], ["--takes", "6497"], ["--takes", "200000"], ["--l2-s-host", "100"],
+                ["--l2-sleep-cycles", "10"]):
+        with pytest.raises(SystemExit):
+            G.parse_args(base + ["--cell", "gfw2"] + bad)
+    d = G.l2_takes(a)
+    assert tuple(d.shape) == (6, 6496) and d.dtype == G.l2_takes(a).dtype and d.is_contiguous()
+    assert all(int((d[0] == l).sum()) == 1624 for l in range(4)) and _takes_ok(d, a)
+    assert int(d[4].max()) < 127 and int(d[3].max()) < 254 and int(d[5].min()) == 2
+    assert G.l2_takes(a).tolist() == d.tolist()                                       # seeded
+    bad = d.clone()
+    bad[1:3, 1] = bad[1:3, 0]
+    bad[4, 1] = bad[4, 0]                                                             # NEGATIVE CONTROL: take 1 = take 0's
+    assert not _takes_ok(bad, a)
+    assert [G.verdict2(x) for x in (0.2, 1.0, 1.5, 4.99, 5.0, None)] == ["HELD", "HELD", "GREY", "GREY", "FALSIFIED",
+                                                                         "MISSING"]
+    block = _registered((EFF / "r2_gfw_step.sh").read_text(), tag="GFW2")
+    R = G.REGISTERED2
+    assert "PREDICTION <= %.1f ms" % R["desc_issue_pred_ms"] in block and \
+        "FALSIFIER >= %.1f ms" % R["desc_issue_fals_ms"] in block and "6496 takes" in block, block
+    src = (EFF / "r2_gfw_gate.py").read_text()
+    for need in ('gates.append(gate("GFW2", ok2, True', 'gates.append(gate("GFW2n", not r["planted_equal"], True',
+                 'gates.append(gate("R_GFW2_host", v == "HELD", False', 'if ready and a.cell == "gfw1":',
+                 'if ready and a.cell == "gfw2":', "set_plant_slot_shift(1)", 'r["stores_equal"] and r["boards_equal"]'):
+        assert need in src, need
 
 
 def test_GFWC1_args_plans_gates_and_the_registered_verdict():
@@ -77,23 +126,24 @@ def test_GFWC1_args_plans_gates_and_the_registered_verdict():
 def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
     """GFWC2: r2_gfw_step.sh: the uuid file rules (missing, "GPU-" prefix, two lines: STOP before any other check;
     GFW_HOLDERS outside DRYRUN refused); the pins (packer v2's two blobs of f2b981a; packer v3 = the blobs of this
-    commit, refused when the .cpp is v2's or not VERSION 3); on a clean checkout at HEAD the DRYRUN prints the uuid,
-    both packers' blobs and the gate's arguments. Static: the claim gfw_active, STEP_MIN 12, --export=NONE, no awk /
-    python3 / perl outside comments."""
+    commit, refused when the .cpp is v2's or not VERSION 3); an unknown cell is refused (usage); on a clean checkout at
+    HEAD the DRYRUN prints the uuid, both packers' blobs and the gate's arguments of the default cell gfw1 (unchanged)
+    and of the cell gfw2. Static: the claim gfw_active, STEP_MIN 12, --export=NONE, no awk / python3 / perl outside
+    comments."""
     script = EFF / "r2_gfw_step.sh"
     text = script.read_text()
     lines = text.splitlines()
     assert lines[0] == "#!/bin/bash" and lines[-1] == 'main "$@"; exit $?' and "main() {" in text
     assert 'mkdir "$OUTROOT/gfw_active"' in text and "STEP_MIN=12" in text and "--export=NONE" in text
     assert text.index("UFILE=$HOLDERS/$JOB.gpu_uuid") < text.index('mkdir "$OUTROOT/gfw_active"')
-    assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-gilfree-worker " in text
+    assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw2 " in text
     for word in ("awk", "perl", "python3", " bc ", "node "):
         for ln in lines:
             if not ln.lstrip().startswith("#"):
                 assert word not in ln, (word, ln)
     env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_"))}
 
-    def run(job, content=None, dry=True, sha="0" * 40):
+    def run(job, content=None, dry=True, sha="0" * 40, cell=None):
         if content is not None:
             (tmp_path / ("%s.gpu_uuid" % job)).write_text(content)
         e = dict(env, GFW_HOLDERS=str(tmp_path))
@@ -101,8 +151,8 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
             e["DRYRUN"] = "1"
         else:
             e.pop("DRYRUN", None)
-        return subprocess.run(["bash", str(script), "--nosi", sha, str(job), "t1"], env=e, capture_output=True,
-                              text=True, timeout=120)
+        return subprocess.run(["bash", str(script), "--nosi", sha, str(job), "t1"] + ([cell] if cell else []), env=e,
+                              capture_output=True, text=True, timeout=120)
     uid = "f31fc723-9dfe-407a-9947-28173556232a"
     r = run(511)
     assert r.returncode == 1 and "no GPU uuid file" in r.stderr
@@ -114,6 +164,8 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
     assert r.returncode == 1 and "for DRYRUN" in r.stderr
     r = run(515, uid + "\n")
     assert r.returncode == 1 and "HEAD is not" in r.stderr and "uuid" not in r.stderr.lower()
+    r = run(515, uid + "\n", cell="gfw3")
+    assert r.returncode == 2 and "usage" in r.stderr                    # an unknown cell is refused first
     head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
     dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"], capture_output=True,
                            text=True)
@@ -135,7 +187,14 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
             % (V2["sha"], V2["py"], V2["cpp"])) in r.stdout
     rec = "/mnt/beegfs/ojerbi/r2-runs/gfw/gfw_t1_516.step"
     for arg in ("--threads 8", "--releases 20", "--warmup 3", "--launches 1500", "--spin-cycles 200000000",
-                "--export=NONE", "--gres=gpu:a100:1", "--nosi-pkg /mnt/beegfs/ojerbi/nosi-r2-gilfree-worker/nosi/nosi",
-                "--v3 %s/packer_v3" % rec, "--v2 %s/packer_v2" % rec, "r2_gfw_gate.py"):
+                "--export=NONE", "--gres=gpu:a100:1", "--nosi-pkg /mnt/beegfs/ojerbi/nosi-r2-gfw2/nosi/nosi",
+                "--v3 %s/packer_v3" % rec, "--v2 %s/packer_v2" % rec, "r2_gfw_gate.py", "--cell gfw1", "; cell gfw1"):
         assert arg in r.stdout, arg
     assert "--sizes 64,192" in r.stdout or "--sizes 64\\,192" in r.stdout
+    assert "--takes" not in r.stdout                                     # gfw1 is the default cell, unchanged
+    r2 = run(516, sha=head.stdout.strip(), cell="gfw2")
+    assert r2.returncode == 0, r2.stderr[-300:]
+    for arg in ("--cell gfw2", "--takes 6496", "--l2-layers 4", "--l2-batch 64", "--l2-heads 2", "--l2-s-host 16311",
+                "--l2-c 96", "--l2-x 32", "--l2-sleep-cycles 50000000", "--threads 8", "--export=NONE", "; cell gfw2"):
+        assert arg in r2.stdout, arg
+    assert "--releases" not in r2.stdout and "--launches" not in r2.stdout
