@@ -50,6 +50,16 @@ grad mode and current CUDA device are THREAD-LOCAL; a new thread starts with the
 - The OpenMP team's threads copy raw bytes only (pack_range: no tensor operation, no dispatcher state).
 - thread_modes=False (NEGATIVE CONTROL, tests only): the feeder keeps the thread's defaults.
 - The synchronous mode (background False) runs in the caller's thread with the caller's modes.
+THE C++ WORKER (worker="cpp"; Q-C2, 2026-10-21; the Python feeder stays the DEFAULT, worker="python"). It needs packer
+v3 (feature/nosi-r2-gilfree-worker benchmarks/Efficiency/gilfree_pack.{py,cpp}: NativePipe.submit). issue() does the
+glue on the CALLING thread (the checks, the index lists, the board pairs, the T4 / T3 events' raw cudaEvent_t handles;
+in CPU mode it host-waits T4 / T3 itself) and queues ONE job; a std::thread inside NativePipe runs it with no Python and
+no GIL: T4 by cudaEventSynchronize, T3 by cudaStreamWaitEvent on the scatter stream, the v2 release, the board
+publication (one index_put_ per chunk on the scatter stream after its rows), the job's completion event. The worker
+enters the modes above (inference, grad, device) ONCE, when it starts (at the first issue; attach_board must come
+before). Every transfer of a job gets tr.ev = _JobEv at issue: query / synchronize, and torch's Stream.wait_event
+protocol (wait(stream): the host waits the submission, then the stream waits on the device). submits_without_gil = True
+tells S-C (CudaDeviceOps._submitted, C's named change) that its exact wait needs no host wait for the submission.
 """
 from __future__ import annotations
 
@@ -74,17 +84,56 @@ class _Done:
         return True
 
 
+class _JobEv:
+    """The completion of one C++ worker job (worker="cpp"; every transfer of the job holds it from issue on).
+    query(): the job ran without error and (CUDA) its completion event, recorded by the worker on the scatter stream, is
+    done. synchronize(): waits for both (the GIL released). wait(stream): torch's Stream.wait_event protocol
+    (stream.wait_event(ev) calls ev.wait(stream)): the host waits for the job's SUBMISSION (the GIL released), then the
+    stream waits for the job's event on the device. S-C's exact wait uses none of these: it spins on the board."""
+    __slots__ = ("tp", "seq", "_landed")
+
+    def __init__(self, tp, seq: int):
+        self.tp, self.seq, self._landed = tp, int(seq), False
+
+    def query(self) -> bool:
+        if not self._landed:                                   # poll_arrivals asks per transfer and per poll
+            self._landed = bool(self.tp.npipe.job_done(self.seq))
+        return self._landed
+
+    def synchronize(self) -> None:
+        self.tp.npipe.wait_job(self.seq)
+
+    def wait(self, stream=None) -> None:
+        if not self.tp.cuda:
+            self.tp.npipe.wait_job(self.seq)
+            return
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        self.tp.npipe.stream_wait_job(self.seq, [int(stream.stream_id), int(stream.device_index),
+                                                 int(stream.device_type)])
+
+
+WORKERS = ("python", "cpp")
+
+
 class GilfreeTransport:
     name = "gilfree"
 
     def __init__(self, ext, host_k: Sequence[torch.Tensor], host_v: Sequence[torch.Tensor], slots_k, slots_v, bs: int,
                  D: int, threads: int, host_wait: Callable[[Any], None], cap_groups: int = 256, ring: int = 2,
                  cores: Optional[Sequence[int]] = None, background: bool = False, skip_hist_wait: bool = False,
-                 thread_modes: bool = True):
+                 thread_modes: bool = True, worker: str = "python"):
         if not 1 <= int(threads) <= 256:
             raise ValueError("threads must be in 1 .. 256 (got %r)" % (threads,))
         if int(threads) > 1 and int(getattr(ext, "OPENMP", 0)) != 1:
             raise RuntimeError("gilfree: a team of %d threads asked from an extension built without OpenMP" % threads)
+        if worker not in WORKERS:
+            raise ValueError("worker must be one of %s (got %r)" % (WORKERS, worker))
+        if worker == "cpp" and not callable(getattr(ext.NativePipe, "submit", None)):
+            raise RuntimeError("gilfree: worker='cpp' needs packer v3 (NativePipe.submit; "
+                               "feature/nosi-r2-gilfree-worker gilfree_pack.cpp)")
+        self.worker = worker
+        self.submits_without_gil = worker == "cpp"     # S-C's exact wait: no host wait for the submission (Q-C2)
         self.ext = ext
         self.host_k, self.host_v, self.slots_k, self.slots_v = list(host_k), list(host_v), slots_k, slots_v
         self.bs, self.D, self.threads = int(bs), int(D), int(threads)
@@ -93,7 +142,8 @@ class GilfreeTransport:
         dev = slots_k[0].device
         self.cuda = dev.type == "cuda"
         elem = self.host_k[0].element_size()
-        nb = cap_groups * self.bs * 8 + 2 * cap_groups * self.bs * self.D * elem   # [destination rows | K | V]
+        extra = int(getattr(ext, "SLOT_EXTRA_PER_GROUP", 0))       # packer v3: the board pairs (v2: 0)
+        nb = cap_groups * self.bs * 8 + cap_groups * extra + 2 * cap_groups * self.bs * self.D * elem   # [rows | K | V]
         stage = torch.zeros((ring, nb), dtype=torch.uint8, pin_memory=self.cuda)
         land = torch.zeros((ring, nb), dtype=torch.uint8, device=dev)
         if self.cuda:
@@ -133,10 +183,14 @@ class GilfreeTransport:
         self.npipe = ext.NativePipe(stage, land, int(cap_groups), self.bs, cs, ss)
         self.npipe.set_sources(src_k, src_v)
         self.npipe.set_threads(self.threads)
-        self.stats: Dict[str, int] = {k: 0 for k in STATS[:7]}
-        self.stats.update(releases=0, threads_min=None, threads_max=None, published=0)   # published: (slot, gen) pairs
+        self._stats: Dict[str, int] = {k: 0 for k in STATS[:7]}
+        self._stats.update(releases=0, threads_min=None, threads_max=None, published=0)   # published: (slot, gen) pairs
         self.staging_bytes = 2 * ring * nb
-        self.background = bool(background)
+        self.background = bool(background) or worker == "cpp"   # the C++ worker is always asynchronous
+        self._worker_modes: Optional[tuple] = None             # (inference, grad) the C++ worker started with
+        self._keep: Dict[int, list] = {}                       # job seq -> the Python events its raw handles name
+        self._last_seq = 0
+        self._last_flag: Optional[threading.Event] = None
         self.board = None                                      # the generation board (attach_board), or None
         self._error: Optional[BaseException] = None
         # the feeder thread's modes (module docstring): thread-local in torch, so recorded here and entered there
@@ -146,9 +200,9 @@ class GilfreeTransport:
         self.thread_device = dev if self.cuda else None
         self.thread_modes = bool(thread_modes)                 # NEGATIVE CONTROL (tests only) when False
         self.feeder_seen: Optional[Dict[str, bool]] = None     # the modes the feeder ran with (tests, reports)
-        if self.background:
+        self._cores = list(cores) if cores else None           # the feeder's (or the C++ worker's) CPU affinity
+        if self.background and worker == "python":
             self._q: "queue.Queue" = queue.Queue()
-            self._cores = list(cores) if cores else None
             self._thread = threading.Thread(target=self._feeder, name="gilfree-feeder", daemon=True)
             self._thread.start()
 
@@ -183,10 +237,16 @@ class GilfreeTransport:
         published into the board (board.t, board.flat) on the stream that landed the rows, AFTER them: the scatter
         stream on the GPU (a pinned copy and an index_put_ enqueued there), at once on the CPU. The publication is an
         in-place write in the feeder thread: an inference-mode board turns the feeder's inference mode on (read at its
-        next release; the queue orders this write before that read)."""
+        next release; the queue orders this write before that read). worker="cpp": the worker publishes (in C++, the
+        same order) and enters its modes once, at its start: attach_board after that start must not change them."""
         if getattr(board.t, "is_inference", lambda: False)():
+            if self._worker_modes is not None and self.thread_modes and not self._worker_modes[0]:
+                raise RuntimeError("gilfree: attach_board of an inference-mode board after the C++ worker started "
+                                   "outside inference mode (its modes are entered once): attach the board first")
             self.thread_inference, self.thread_grad = True, False
         self.board = board
+        if self.worker == "cpp":
+            self.npipe.set_board(board.t)
 
     def _publish(self, transfers: List[Transfer]) -> None:
         if self.board is None or not transfers:
@@ -201,16 +261,109 @@ class GilfreeTransport:
             self.board.t.view(-1).index_put_((host[0],), host[1])
         self.stats["published"] += len(transfers)
 
+    @property
+    def stats(self) -> Dict[str, Any]:
+        """The release stats (STATS sums, releases, threads_min / threads_max, published); worker="cpp": read from the
+        worker's totals (the jobs that ran without error) at each access."""
+        if self.worker == "cpp":
+            self._sync_worker()
+        return self._stats
+
+    def _sync_worker(self) -> None:
+        w = [int(x) for x in self.npipe.worker_stats()]
+        for k, v in zip(STATS[:7], w[:7]):
+            self._stats[k] = v
+        self._stats["threads_min"] = None if w[7] < 0 else w[7]
+        self._stats["threads_max"] = None if w[8] < 0 else w[8]
+        self._stats["published"] = w[9]
+        self._stats["releases"] = w[10]
+        if w[12] >= 0:
+            self.feeder_seen = dict(inference=bool(w[12]), grad=bool(w[13]))
+
     def threads_ok(self) -> bool:
         """Agent E's rule (gilfree_pack.threads_ok): every chunk so far ran on exactly the requested team."""
-        return self.stats["threads_min"] == self.threads and self.stats["threads_max"] == self.threads
+        st = self.stats
+        return st["threads_min"] == self.threads and st["threads_max"] == self.threads
 
     def close(self) -> None:
-        if self.background:
+        if self.worker == "cpp":
+            if self._worker_modes is not None:
+                self.npipe.stop_worker()                       # drains the queued jobs, then joins
+            self._sync_worker()
+            self._keep.clear()
+        elif self.background:
             self._q.put(None)
             self._thread.join()
 
+    def flush(self) -> None:
+        """Waits until every issued release ran (the tests' sync point; a no-op in the synchronous mode)."""
+        if self.worker == "cpp":
+            if self._last_seq:
+                self.npipe.wait_job(self._last_seq)
+        elif self.background and self._last_flag is not None:
+            self._last_flag.wait()
+
+    # ------------------------------------------------------------------------------------------------ the C++ worker
+    def _start_worker(self) -> None:
+        if self._worker_modes is not None:
+            return
+        inf, grad = (self.thread_inference, self.thread_grad) if self.thread_modes else (False, True)  # NEGATIVE CONTROL
+        dev = -1
+        if self.cuda:
+            dev = self.thread_device.index if self.thread_device.index is not None else torch.cuda.current_device()
+        self.npipe.start_worker(bool(inf), bool(grad), int(dev), [int(c) for c in (self._cores or [])])
+        self._worker_modes = (bool(inf), bool(grad))
+
+    def _reap(self) -> None:
+        if self._keep:
+            done = int(self.npipe.submitted)
+            for seq in [s for s in self._keep if s <= done]:
+                del self._keep[seq]
+
+    def _submit(self, layer: int, transfers: List[Transfer]) -> None:
+        """worker="cpp": the glue on this thread, ONE job for the C++ worker (module docstring, THE C++ WORKER)."""
+        hist, readers, keep = [], [], []
+        for tr in transfers:
+            for ev, out, skip in ((tr.hist_ev, hist, self.skip_hist_wait), (tr.reader_ev, readers, False)):
+                if ev is None or skip or ev_done(ev):
+                    continue
+                handle = int(getattr(ev, "cuda_event", 0) or 0) if self.cuda else 0
+                if handle:
+                    out.append(handle)                         # T4: cudaEventSynchronize; T3: cudaStreamWaitEvent
+                    keep.append(ev)                            # alive until the worker used its handle
+                else:
+                    self.host_wait(ev)                         # CPU mode (synchronous copies): waited here
+        self._check(layer, transfers)
+        bf, bg = [], []
+        if self.board is not None:
+            bf = [self.board.flat(tr.layer, tr.b, tr.h, tr.slot) for tr in transfers]
+            bg = [int(tr.gen) for tr in transfers]
+        self._start_worker()
+        seq = self.npipe.submit([0] * len(transfers), [tr.h for tr in transfers],
+                                [layer * self.B + tr.b for tr in transfers],
+                                [tr.b * self.n_slots + tr.slot for tr in transfers], [tr.block for tr in transfers],
+                                self.slots_k[layer], self.slots_v[layer], bf, bg, hist, readers)
+        ev = _JobEv(self, seq)
+        for tr in transfers:
+            tr.ev = ev
+            tr.payload = None
+        if keep:
+            self._keep[seq] = keep
+        self._last_seq = int(seq)
+
     # ------------------------------------------------------------------------------------------------ one release
+    def _check(self, layer: int, transfers: List[Transfer]) -> None:
+        """One destination per transfer, every transfer inside the geometry (both workers)."""
+        dst = set()
+        for tr in transfers:
+            if (tr.b, tr.h, tr.slot) in dst:
+                raise ValueError("two transfers into one destination (b %d h %d slot %d)" % (tr.b, tr.h, tr.slot))
+            dst.add((tr.b, tr.h, tr.slot))
+            if not (0 <= tr.block < self.nblk and 0 <= tr.slot < self.n_slots and 0 <= tr.b < self.B):
+                raise ValueError("gilfree: transfer seq %d (b %d, block %d, slot %d) outside the geometry (B %d, %d "
+                                 "complete host blocks, %d slots)" % (tr.seq, tr.b, tr.block, tr.slot, self.B,
+                                                                     self.nblk, self.n_slots))
+
     def _release(self, layer: int, transfers: List[Transfer]) -> None:
         if not self.skip_hist_wait:
             for tr in transfers:                               # T4: the host rows exist before the pack reads them
@@ -222,15 +375,7 @@ class GilfreeTransport:
                     self.scatter.wait_event(tr.reader_ev)
                 else:
                     self.host_wait(tr.reader_ev)
-        dst = set()
-        for tr in transfers:
-            if (tr.b, tr.h, tr.slot) in dst:
-                raise ValueError("two transfers into one destination (b %d h %d slot %d)" % (tr.b, tr.h, tr.slot))
-            dst.add((tr.b, tr.h, tr.slot))
-            if not (0 <= tr.block < self.nblk and 0 <= tr.slot < self.n_slots and 0 <= tr.b < self.B):
-                raise ValueError("gilfree: transfer seq %d (b %d, block %d, slot %d) outside the geometry (B %d, %d "
-                                 "complete host blocks, %d slots)" % (tr.seq, tr.b, tr.block, tr.slot, self.B,
-                                                                     self.nblk, self.n_slots))
+        self._check(layer, transfers)
         i64 = lambda xs: torch.tensor(xs, dtype=torch.int64)   # noqa: E731
         st = self.npipe.release(i64([0] * len(transfers)), i64([tr.h for tr in transfers]),
                                 i64([layer * self.B + tr.b for tr in transfers]),
@@ -258,6 +403,11 @@ class GilfreeTransport:
 
     # ------------------------------------------------------------------------------------------------ K3X interface
     def _raise_pending_error(self) -> None:
+        if self.worker == "cpp":
+            msg = self.npipe.take_error()
+            if msg:
+                raise RuntimeError(msg)
+            return
         if self._error is not None:
             e, self._error = self._error, None
             raise e
@@ -266,21 +416,33 @@ class GilfreeTransport:
         if not transfers:
             return
         self._raise_pending_error()
-        if self.background:
+        if self.worker == "cpp":
+            self._reap()
+            self._submit(layer, transfers)
+        elif self.background:
             flag = threading.Event()
             for tr in transfers:
                 tr.payload = flag                              # force() waits for the feeder to reach this release
+            self._last_flag = flag
             self._q.put((layer, list(transfers), flag))
         else:
             self._release(layer, transfers)
 
     def poll(self) -> None:
         self._raise_pending_error()
+        if self.worker == "cpp":
+            self._reap()
 
     def done(self, tr: Transfer) -> bool:
         return tr.ev is not None and ev_done(tr.ev)
 
     def force(self, tr: Transfer) -> None:
+        if self.worker == "cpp":
+            if tr.ev is None:
+                raise RuntimeError("gilfree: transfer seq %d was never released" % tr.seq)
+            tr.ev.synchronize()                                # the submission, then (CUDA) the landing; GIL released
+            self._raise_pending_error()
+            return
         if self.background and isinstance(tr.payload, threading.Event):
             tr.payload.wait()
         self._raise_pending_error()
