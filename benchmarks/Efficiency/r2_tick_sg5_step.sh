@@ -46,7 +46,7 @@
 #            Its ROOT is NOSI_X1 (nosi-r2-xpool); every other cell keeps NOSI (review m8)
 #   stack1a  [integ] THE FULL STACK (docs/R2_INTEG_PLAN.md) at p5b2's point, EXACT, B 64: --stack full --stack-compare
 #            --X-pool 64 --arrival-lag 2 --sel-check (arms none, full, none2; MUST _ST_replica / _ST_committed /
-#            _ST_bitwise), no --pool-baseline. ROOT NOSI_INTEG (nosi-r2-integ3 since integ3), as every stack1* cell.
+#            _ST_bitwise), no --pool-baseline. ROOT NOSI_INTEG (nosi-r2-integ4 since integ4), as every stack1* cell.
 #            [integ3] + --require-xregion; per arm MUST _ST_acted_<c> / _ST_off_<c> and _ST_xregion (review M2)
 #   stack1p  [integ3] stack1a at the pressure point C 80 (X 64, R_ver 16, X_pool 64): more shared X demand; a
 #            DIAGNOSTIC (a CapacityRefusal there is a configuration result); it never stops the stack1 chain
@@ -176,7 +176,7 @@
 set -u
 NOSI=/mnt/beegfs/ojerbi/nosi-r2-sg5-p6                                                   # ROOT (p6; [b2] p5b2: nosi-r2-m2-sg5-b2; p4sc64: -p4d; p4a: -p4c; p3: nosi-r2-m2-sg5)
 NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                                 # ROOT of cell x1 only ([xpool], review m8)
-NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-integ3                                             # ROOT of the stack1 cells only ([integ], integ3)
+NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-integ4                                             # ROOT of the stack1 cells only ([integ], integ4)
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
