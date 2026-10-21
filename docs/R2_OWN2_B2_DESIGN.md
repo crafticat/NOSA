@@ -1,244 +1,333 @@
-# B2: an array-backed ownership state beside the vendored one (design; no code before the lead's GO)
+# B2: an array-backed ownership state beside the vendored one (design rev 2)
 
-Branch `feature/nosi-r2-m2-own2` from C's `c2fccb2` (feature/nosi-r2-m2-sparse). Status: DESIGN ONLY.
+Branch `feature/nosi-r2-m2-own2`. Status: DESIGN rev 2. The lead gave the GO with the build order B2-T (the component
+microbench) first, then `apply_tick` with check-then-write, then the CPU lockstep.
 
-Why (the engine agent's split, `nosi-r2-sg5-capture` `1d1b956`, `docs/R2_SG5_CAPTURE_PLAN.md` sections 0 and 3.3):
-after the captured tick (A) and C's sparse decision record (B1), a round tick at B 64 still costs 0.5-0.9 s. The bound
-is the host's ~6.5 k draft takes per tick plus the per-slot bookkeeping of the vendored K3X ownership objects
-(`nosi/nosi/kstep/ownership.py`, vendored byte-identical at `91e6e47`: `r2_residency.py:4`, test F9
-`test_r2_residency.py:545`): one Python `Slot` / `Stream` object per slot, dicts and an `OrderedDict` per stream, one
-method call per entry. The plan's Q-C4 (`R2_SG5_CAPTURE_PLAN.md:280-284`) asks for bulk takes: the tick then
-approaches its device time (draft-only 45-60 ms, round 90-140 ms) plus the host part. B2 is that host part. Its target
-is a host cost small against 90 ms. B2 keeps the SAME rules (K1-K5, T3, Policy E, O1) on arrays; the vendored objects
-stay the reference.
+- Rev 1: `1676028` (sha256 cc8ad9e0...4237, job 2191001).
+- Rev 2 answers C's adversarial review (`nosi-r2-m2-sparse` `32e88c2`, `docs/R2_OWN2_B2_REVIEW_C.md`) point by point
+  (section 0). It also folds in:
+  - C's answers in note 12l (Q-B1 record format, Q-B2 recency, Q-B4 key bound);
+  - E's `issue_desc` (Q-B3, `feature/nosi-r2-gilfree-worker` `6397247`).
 
-Geometry used below (p3's point, `R2_SG5_CAPTURE_PLAN.md:177`, `:187`): L 32, B 64, H 2, C 96, X 32, R_ver 16, 16K
-context. NPOS = C + X = 128 slots per stream (`n_hist`, `r2_residency.py:160`); NBLK = n_host // 64, about 256
-(`r2_tick_sg5.py:302`). That is 524,288 slots.
+Code cited at own2 `2eb02c2`, which holds C's `7392ac6` code:
+- `res.py` = `nosi/nosi/r2_residency.py`;
+- `own.py` = `nosi/nosi/kstep/ownership.py`, vendored byte-identical at `91e6e47` (`res.py:4`, test F9);
+- `sc.py` = `nosi/nosi/r2_residency_sc.py`;
+- `sparse.py` = `nosi/nosi/r2_residency_sparse.py`;
+- `core.py` = `nosi/nosi/r2_spec_core.py`;
+- `test.py` = `benchmarks/Efficiency/tests_cpu/test_r2_residency.py`.
 
-## 1. Prior art (the gate)
+**Why B2.** C's B1 microbench shows no host speedup with the sparse record on the vendored objects. At B 64, 32 layers,
+`apply_tick` takes, per tick (verify / draft):
+- dense: 4037 / 1804 ms;
+- sparse: 4269 / 1755 ms.
 
-In our trees (array-based, reusable):
+The cost is the per-record apply into the Python `Slot` / `Stream` objects. B2 keeps the same rules (K1-K5, T3, T4,
+Policy E, O1) on arrays. The vendored objects stay the reference of the lockstep.
 
-| what | where | fits B2? |
+**Geometry** (p3, `R2_SG5_CAPTURE_PLAN.md:177`, `:187`): L 32, B 64, H 2, C 96, X 32, R_ver 16, 16K context.
+- NPOS = C + X = 128 slots per stream (`res.py:160`); NBLK = n_host // 64, about 256 (`r2_tick_sg5.py:302`).
+- That is 524,288 slots, and the verify read bitmap is 0.52 M bits = 64 KB. The capture plan's "2.2 M bits"
+  (`:169`) fits H 8.
+
+**The rows of a tick** (`core.py:136-155`):
+- One draft row per request and tick. `finish_tick` refuses two (`core.py:157-164`).
+- A cohort contributes one verify row per position `c.a .. c.b`, all with the same b and key (`core.py:146-150`).
+- So at p3's mean (51 verify rows), the verify rows come from about 13 requests, each with up to K + 1 rows.
+
+## 0. Rev 2: the answers to C's review
+
+### 0.1 The five points that must be fixed
+
+**(1) The reader model. ACCEPTED, and solved without a monotone assumption.**
+
+B2 does not store readers as ticks. It stores READER EVENT IDS:
+- Every `read_done` call (`res.py:743-761`) gets the next id e: one per layer per tick in v1, one per tick in the
+  captured path.
+- A host registry maps a live id to its event object and to E's mark (tick x L + layer).
+- `rd_first`, `rd_last`, `key_rd` and `hist_id` hold ids; -1 = None, which counts as complete (`ev_done(None)`,
+  `kstep/backend.py:27-34`).
+- **Completion.** `lo` = the oldest incomplete id, and every id below `lo` is complete. `done_win` (bool) holds the
+  ids in [lo, next_id). At each poll, the host refreshes `done_win` with `ev_done` on each live event object. That is
+  about 32-100 queries per tick.
+- Then `done(e) = (e < lo) | done_win[e - lo]`: one gather per full-table check.
+- Completion in ANY order is exact: F12e's pending earlier reader, and `Be.host_wait` completing one `Ev`
+  (`test.py:56-71`). So B2 does not refuse a non-monotone harness.
+- **Host wait.** `wait_reader(e)` calls the service's `host_wait(ev)` on that one object, then re-queries only that
+  event. The force paths use it:
+  - Policy E's pending last reader (`res.py:410-415`);
+  - the urgent gather's gates (`res.py:616-622`);
+  - the arrival rule's force (`res.py:276-281`) goes to the transport, as today.
+
+**(2) I8 with two draft rows of one stream in one layer. ACCEPTED: per-row rounds.**
+- `_draft_recency` (`res.py:686-706`) handles each draft row IN ORDER: its READY blocks in ascending block id
+  (touch / acquire), then `evict_to_c` for that row's streams (`res.py:705`, `own.py:297-303`).
+- B2 runs the recency in ROUNDS. Round r is the r-th draft row of each request in row order (`rank_in_group` over b,
+  `sb.py:75`).
+  - Inside a round, each READY record is a touch if its slot is LRU, an acquisition if PO / VRES, and an
+    `OwnershipViolation` otherwise (`res.py:696-704`).
+  - Each round ends with `evict_to_c` on the round's streams.
+- The number of rounds = the largest number of draft rows of one b (a host scalar).
+- R2's planner gives 1 round (`core.py:157-164`). C's two-row script tests round 2.
+
+**(3) I1 without the dedup. ACCEPTED.**
+- I1 counts the resident slots (LRU, PO, VRES) and the current owner's INFLIGHT slots (`uid == owner`) together:
+  at most 1 per (stream, block).
+- A previous owner's INFLIGHT slot may coexist (`res.py:509-517`; `own.py:266-267`, `:343-345`).
+- Before any write, a take's block must be neither (`res.py:453`).
+
+**(4) The resets, and the mid-tick FREE. ACCEPTED, stated as the transition table of section 3.1:**
+- take: `gen += 1`, `rd_first := -1`, and `rd_last` is KEPT (`own.py:259-261`). It is the transfer's reader gate,
+  the T3 forward (`res.py:478`), and so E's reader mark.
+- admission (`own.py:322-361`):
+  - `seq := none` (`:336`);
+  - drop_unowned: RELEASING, `rd_last := -1`, and `rd_first` is kept (`:337-342`);
+  - every other branch: `rd_first := -1` (`:346`);
+  - LRU, plus ONE `_evict_over_c` (`:347-351`);
+  - VRES if protected (`:352-356`);
+  - else drop_vres_unprotected: RELEASING, `rd_last := -1` (`:357-360`).
+- Policy E frees a slot in the MIDDLE of a tick:
+  - `_evict_now` (`res.py:399-418`): LRU -> RELEASING -> a host wait if the last reader is pending (counted as
+    `verifier_force_waits`) -> FREE;
+  - `_evict_inflight` (`res.py:363-388`): the superseded write is forced, the transfer is forgotten -> FREE.
+
+  I5 allows a FREE transition exactly there and in `poll`.
+- I5 gets the `first_free` rank: the q-th FREE-slot take of a stream in the tick takes the stream's q-th FREE slot
+  of the tick start (`res.py:456-465`, `own.py:429-433`). The proof is in I4 below.
+- `release` (`own.py:271-278`) and `end_owner`'s releases keep both readers.
+
+**(5) The rules with no counterpart. ACCEPTED: invariants I10-I15 and the lifecycle contract of section 3.2:**
+- **I10, T4.** `hist_from` (B,) and `hist_id` (B, NBLK). A take of block >= `hist_from[b]` with no registered
+  write-back is refused before any change (`res.py:197-201`, `:449`). The transfer's write-back gate = `hist_id`,
+  which gives E's `hist_mark`.
+- **I11, cancelled keys.** `kcancel` (B, KEYS):
+  - a row of a cancelled key is refused (`res.py:534-535`);
+  - `cancel` sets `kcancel` and queues (key, l) for every l (`res.py:768-785`);
+  - `cancel_epoch` (`res.py:786-798`) reads `keys_seen` (`res.py:540-541`). That stays a host dict per (uid, epoch):
+    one entry per row, not per entry.
+- **I12, the late-protection guard.** A row of key slot k at layer l is refused while `rel_q[l, b, k]` is set
+  (`res.py:538-539`).
+- **I13, key-slot reuse.** A key slot is free only when:
+  - no pin bit of it is set at any (l, h, block) of b;
+  - `rel_q[:, b, k]` is all false;
+  - its `key_rd` ids are complete.
+
+  A new key takes the lowest free slot. With none free, the new key's first row raises `CapacityRefusal` (C's Q-B4
+  answer: refused, never aliased). Post-tick invariant: no pin bit of a free key slot is set.
+- **I14, the request lifecycle** (section 3.2):
+  - `begin_request` refuses an owned slot (`res.py:203-218`);
+  - `end_request` / `end_owner` (`res.py:220-234`, `own.py:363-384`) as listed there.
+- **I15, the slot range.** A record that names a slot >= NPOS is refused: the tail rings (`res.py:161`) and the trash
+  slot (`res.py:165`) are outside every pool.
+- **The poll order is a contract:** arrivals, then the queued drops, then `poll_releases` (`res.py:283-297`). The
+  lockstep has a planted swap.
+- **Class.** A take is "v" for VERIFY, "ad" for DRAFT (`res.py:480`). `acquire` changes the state only
+  (`own.py:305-321`). B2 never re-tags.
+- **The metrics `_counters` compares** (`test.py:607-611`): masked, draft_pairs, refused, the named counts, k43
+  (ready / in_flight / new / layer_calls), k46 and `transferred`. B2 PRODUCES them as arrays:
+  - `xfer` (B, L, H, NBLK) counts the transfers per (request, l, h, block). It resets at `begin_request`, and
+    refetch = count > 1 at the issue (`res.py:863-868`). The reports map `xfer` back to uid keys.
+  - k43 / k46 come from `vlook` (the device's ready first looks) plus the in_flight / new records. The open-call
+    dedup is per (key, l, h, block) (`res.py:882-927`).
+  - The lifetimes' rd / rv counts (4.8) are two int32 slot columns that reset at a take. They are not compared.
+- **I7 and the current owner.** An in-flight victim must be the current owner's transfer (`uid == owner`,
+  `res.py:509-517`, `:353-362`). The "not selected" check uses the device's `sel` bitmap, so it is COMMON-MODE with
+  the device. Only the lockstep (v1 uses its host selections) catches a wrong bitmap.
+
+### 0.2 The other review findings
+
+- **Section 2 (transitions that no schedule reaches): ACCEPTED.** The lockstep adds the scripts that C names and now
+  writes as shared CPU schedules:
+  - end_request / drop_unowned (F13, F14b plus a final land);
+  - drop_vres_unprotected (a scripted demand-{verify} admission without protection, or a cancel between a verify take
+    and its arrival);
+  - cancel / cancel_epoch / T4 (F3, F11);
+  - two draft rows of one stream (C 2, X 0, two ticks);
+  - void ticks (F12f, F16);
+  - non-monotone readers (F12e: B2 must MATCH, section 0.1 (1));
+  - the trash slot (F15).
+
+  Each schedule asserts its own precondition: the transition count > 0.
+- **Section 3 (planted defects): ACCEPTED.**
+  - "Overflow ignored" is caught by the LOCKSTEP: the vendored tick refuses, B2 applies.
+  - "Selected" is common-mode.
+  - The 8 missing kinds are in section 4.
+- **Section 4 (cost): ACCEPTED as a measurement task.**
+  - Sorts run only on the streams that need them: the Policy E streams and the streams over C. A few victims per
+    stream take a top-k.
+  - B2-T times every component (section 5). The falsifier stands: more than 25 ms per round tick on one amd core
+    means the device version is designed before the host one.
+- **The K5 proof that C asked for.** Inside a tick, usage changes only at a take into a FREE slot (+1):
+  - a Policy E reuse keeps usage (FREE then taken at once: `res.py:420-437`);
+  - an `evict_to_c` release keeps it (LRU -> RELEASING; RELEASING counts, `own.py:135-136`);
+  - an acquisition keeps it (PO / VRES -> LRU);
+  - no other FREE transition happens before `poll` (`poll_in_resolve=False` for S-B / S-C, `sb.py:188`).
+
+  So usage_at = usage0 + the stream's earlier FREE-slot takes, and borrowed_at = borrowed0 + the layer's earlier
+  borrowing takes. The FREE set of a stream only shrinks during the tick, so its q-th FREE-slot take gets its q-th
+  FREE slot.
+
+## 1. Prior art (the gate; unchanged from rev 1)
+
+| what | where | use in B2 |
 |---|---|---|
-| S-C's `DeviceMirror`: the ownership state of every layer as per-slot tensors (L, B, H, C + X): state code, block, generation, current-owner flag, protected flag, recency stamp; `layer()` derives slot_of (scatter), the LRU rank (sort of stamps), Policy E's in-flight order (sort of take stamps, `HALF_STAMP` offset) with device ops only | `nosi/nosi/r2_residency_sc.py:90-227` (C, `c2fccb2`) | YES: B2's core layout. B2 makes this table AUTHORITATIVE and adds the columns the mirror does not hold (owner identity, class, readers, pins, in-flight records). The same codes (`C_FREE` .. `C_RELEASING`) and stamp rules (`STAMP_KINDS`). |
-| S-B's `rank_in_group`: the rank of an entry within its group (the q-th grant of a stream takes the q-th FREE slot) | `nosi/nosi/r2_residency_sb.py:75-89` | YES: the bulk takes (Q-C4). |
-| my `spec_loop.Store`: per (layer, head, request, slot) `ids / state / gen / stamp / used`; `PrefetchQueue` (arrival = a generation watermark); `_assign` (a slot / victim choice by one sort key per stream); `plan_draft` / `plan_round` as `torch.where` updates | `nosi-r2-perreq` (`e58011c`) `nosi/nosi/spec_loop.py:111-284` (Store, `mark_arrived` :171, PrefetchQueue :208, `_assign` :243), `plan_draft` :309-381, `plan_round` :496-593 | IDIOMS ONLY. It has no owners, pins, PO / VRES, reader gates, K5 extras or Policy E. Its watermark arrival and its sort-key victim choice are what B2 uses for arrivals and evictions. |
-| K3X M2 `Arena.pgen_t`, `RingPool.rgen_t`: int64 generation mirrors | `nosi/nosi/kstep/ownership.py:503-641`, `:642-828` | generation mirrors only. |
+| S-C's `DeviceMirror`: per-slot tensors (L, B, H, C + X) of code, block, gen, cur, prot, stamp; `layer()` derives slot_of, the LRU rank and Policy E's in-flight order with device ops | `sc.py:161-227` | the core layout, made authoritative; the same codes (`C_FREE` .. `C_RELEASING`, `sc.py:92`) and stamp rules (`STAMP_KINDS`, `sc.py:99-101`) |
+| S-B's `rank_in_group` | `sb.py:75-89` | bulk takes, the K5 prefix, the rounds |
+| C's B1 device parts (sparse `c6ef37d`): `_compact`, `_pack_bits` / `unpack_bits`, `draft_bias_fill`, `_first_in_group`, `vlook`, the 12l record | `sparse.py:75-112` (at own2; c6ef37d may shift them), `:185-202` | used as they are. NOT the pin table: B2 holds protection itself. |
+| my `spec_loop.Store` (`nosi-r2-perreq` `e58011c`, `spec_loop.py:111-284`, `:309-381`, `:496-593`) | | idioms only (watermark arrival, sort-key choice) |
+| HiSparse `@87db743` `hisparse.cuh:640-672`: a device LRU per request | (`own.py:19-20`) | the only array-based residency outside; no pins, reader gates or extras |
+| vLLM `BlockPool`, SGLang radix / HiCache (host Python), TensorRT-LLM KV manager (host C++) | | not tensor-native; nothing reusable as code |
 
-Outside (checked by name and code where we have a snapshot):
-- HiSparse (SGLang, `@87db743`, `hisparse.cuh:640-672`, the upstream of K1's recency rule cited in `ownership.py:19-20`):
-  a device-side LRU per request (hits to MRU) in CUDA. It is the only array-based residency we know of, and it has no
-  pins, reader gates, shared extras or verifier reserve.
-- vLLM's block manager (`BlockPool`, a doubly linked free queue) and SGLang's radix cache / HiCache are host Python
-  objects; TensorRT-LLM's KV cache manager is host C++. None is tensor-native, and none has reader-gated reuse or
-  per-cohort pins.
-- So nothing outside is reusable as code. B2 = S-C's mirror layout made authoritative, plus the missing columns, with
-  the vendored objects kept as the lockstep reference.
+## 2. The state (arrays)
 
-## 2. The state (arrays; one `OwnTable` per run)
+Shapes: per slot (L, B, H, NPOS); per block (L, B, H, NBLK); per request (B,).
 
-NPOS = C + X slots per stream, NBLK = the run's block horizon, KEYS = the live cohort keys per request. KEYS is a
-constructor argument from (K, LAMBDA): ceil(LAMBDA / K) + 1 undecided cohorts plus 1 decided key that waits for its
-reader, so 5 at K 3, LAMBDA 7 (`r2_tick_sg5.py:77-78`). The lead said "at most about 4" (Q-B4). Shapes per layer,
-stream (b, h), slot or block:
-
-| array | shape, dtype | vendored source |
+| array | dtype | vendored source |
 |---|---|---|
-| `code` | (L, B, H, NPOS) int8: FREE, INFLIGHT, LRU, PO, VRES, RELEASING | `Slot.state` |
-| `block`, `gen` | (L, B, H, NPOS) int32 | `Slot.block`, `Slot.gen` |
-| `cls` | (L, B, H, NPOS) int8: none, "ad", "v" | `Slot.cls` (rev6) |
-| `stamp` | (L, B, H, NPOS) int64: LRU recency (touch / admit / acquire), take order for in-flight slots | the LRU's `OrderedDict` order; S-C's `stamp` |
-| `rd_first`, `rd_last` | (L, B, H, NPOS) int32: the TICK of the slot's first / last reader event (-1 none) | `Slot.first_reader`, `Slot.last_reader` |
-| `seq`, `issue_tick` | (L, B, H, NPOS) int64 / int32: the transfer in flight into the slot | `Slot.seq`, `Transfer.seq`, `Transfer.issue_tick` |
-| `demand` | (L, B, H, NPOS) int8 bits: draft, verify | `Transfer.demand` |
-| `issuer`, `req_key` | (L, B, H, NPOS) int8: draft / verify; the requester's key slot | `Transfer.kind`, `Transfer.requester` |
-| `landed`, `cur` | (L, B, H, NPOS) bool: landed in place (urgent, defer_admit); the transfer is the CURRENT owner's | `Residency._landed`; S-C's `cur` |
-| `pin` | (L, B, H, NBLK) uint16: bit k = key slot k (k < KEYS <= 8) protects the block for verify, bit 8 + k for draft | `Stream.prot`, `Stream.pin_kind` (L9) |
-| `owner` | (B,) int32 request id; `key_of` (B, KEYS) the (epoch, m) of each live key slot | `Stream.owner`; the cohort keys |
-| `key_rd` | (L, B, KEYS) int32: the tick of the key's latest reader at layer l | `Residency.key_reader` |
-| `rel_q` | (L, B, KEYS) bool: (key, l) queued for release behind its reader | `Residency.queue` / `queued` |
+| `code` | int8: FREE, INFLIGHT, LRU, PO, VRES, RELEASING (`sc.py:92`) | `Slot.state` and the stream maps (one code = one map) |
+| `block`, `gen` | int32 | `Slot.block`, `Slot.gen` |
+| `uid` | int32: the slot's owner request (-1 none) | `Slot.owner` (`cur` = `uid == owner[b]`) |
+| `cls` | int8: none, "ad", "v" | `Slot.cls` |
+| `stamp` | int64: the LRU recency of LRU slots; the take order of INFLIGHT slots | the `OrderedDict` order; S-C's `stamp` |
+| `rd_first`, `rd_last` | int64 reader event ids (-1 none) | `Slot.first_reader`, `Slot.last_reader` |
+| `seq`, `issue_tick` | int64 / int32: the slot's transfer (E's job seq) | `Slot.seq`, `Transfer.seq`, `Transfer.issue_tick` |
+| `demand`, `issuer`, `req_key`, `landed` | int8 bits / int8 / int8 key slot / bool | `Transfer.demand`, `.kind`, `.requester`, `Residency._landed` |
+| `hist_gate` | int64 write-back id of the slot's transfer | `Transfer.hist_ev` |
+| `rd_n`, `rv_n` | int32 (4.8 lifetimes; reset at a take) | `Metrics.lifetimes` |
+| `pin` | int16 per block: bit k = key slot k for verify, bit 8 + k for draft (KEYS <= 7) | `Stream.prot`, `Stream.pin_kind` |
+| `owner` | (B,) int32 | `Stream.owner` (one per batch slot) |
+| `key_of`, `kcancel` | (B, KEYS) the (epoch, m) of a live key slot; cancelled | the cohort keys; `Residency.cancelled` |
+| `key_rd`, `rel_q` | (L, B, KEYS) reader id; queued for release | `Residency.key_reader`, `queue` / `queued` |
+| `hist_from`, `hist_id` | (B,), (B, NBLK) int64 | `hist_from`, `hist_ev` |
+| `xfer` | (B, L, H, NBLK) int32 | `Metrics.transferred` |
+| event registry (host) | id -> (event, E's mark); `lo`, `done_win` | the event objects |
 
-Derived, never stored: `resident` = code in {LRU, PO, VRES}; `usage` = (code != FREE).sum(-1); the layer's borrowed
-extras = sum over streams of max(0, usage - C); `slot_of[block]` by one scatter (as `DeviceMirror.layer`). Readers are
-TICK numbers: the capture records ONE reader event per tick for every layer (C's Q-T3 (c)), and the host polls it once
-per tick, so "the reader event completed" is `rd_last <= done_tick` against one watermark. The slot columns are 43 B
-per slot: 524,288 x 43 B = 22.5 MB. `pin` is 32 x 64 x 2 x 256 x 2 B = 2.1 MB.
+Derived: `resident` = code in {LRU, PO, VRES}; `usage` = (code != FREE).sum(-1); `slot_of` (one scatter per tick of the
+resident and current-owner INFLIGHT slots); the layer's borrowed extras.
 
-## 3. The invariants, each as an array predicate (cheap, every tick) or a lockstep check
+## 3. The rules
 
-The apply is TWO-PHASE: it computes the new columns into scratch, evaluates the predicates on (old, new, record), and
-only then commits. A failed predicate or the record's overflow flag refuses the whole tick before any write (as S-C's
-void tick does).
+### 3.1 Transitions (B2 implements exactly these; each cites the vendored line)
 
-| # | rule (source) | array predicate | cost |
-|---|---|---|---|
-| I1 | K3: one slot per resident block per stream | `scatter_add` of resident slots into (L, B, H, NBLK) counts: max <= 1 | one pass |
-| I2 | K1: the LRU holds at most C (at the tick's end, after `evict_to_c`) | `(code == LRU).sum(-1) <= C` | one pass |
-| I3 | K2: a PO / VRES slot is protected | `pin[.., block[slot]] != 0` where code in {PO, VRES} | one gather |
-| I4 | K5 (`LayerPool.can_take`, `ownership.py:419-427`): a take with the stream's usage < C needs no extra; else a verify take needs a free extra, a draft take more than R_ver | the take records in their order key, per layer: borrow = (the stream's usage before the take >= C), by `rank_in_group` per stream; `borrowed_at_take = borrowed_before + exclusive cumsum(borrow)`; for a borrowing verify take `X - borrowed_at_take > 0`, for a borrowing draft take `X - borrowed_at_take > R_ver`. A Policy E grant reuses its victim's slot at once (`_evict_now`, `r2_residency.py:399-418`; `_free_slot_for_verifier` :420-437): usage is unchanged, so it does not borrow | O(record) |
-| I5 | paper 3.4 / K4 / T3: no reuse before owners and readers finish | a take's slot is FREE before the tick; a slot becomes FREE only in `poll` where code == RELEASING and `rd_last <= done_tick`; a Policy E LRU eviction carries `rd_last <= done_tick` or a recorded wait; an in-flight eviction carries "landed or forced" | O(record) + one pass |
-| I6 | T3: an arrival names its slot | code == INFLIGHT, gen and block match, `cur` set (else it is dropped: RELEASING) | O(arrivals) |
-| I7 | Policy E (notes 12h, 12j): candidates and order | an LRU-kind victim is LRU, unpinned at the layer's start, not in the layer's selection bitmap, and the least-stamped such entry still unused; an in-flight victim is INFLIGHT, issuer draft, unpinned, not selected, not landed, the oldest take stamp; no in-flight victim while an LRU candidate of the stream is unused | O(record) + a segment sort of the touched streams |
-| I8 | O1 / K1 recency: draft stamps in (row, head, ascending block) order; `evict_to_c` after the row's batch | the record's draft stamps strictly increase in its order key; the victims are the `n_lru - C` least-stamped LRU entries of the stream after the stamps; pinned -> PO, else RELEASING | a segment top-k over the touched streams |
-| I9 | the generation | `gen` changes only at a take, by +1 | one compare |
+| transition | where in B2 | vendored |
+|---|---|---|
+| FREE -> INFLIGHT (take, verify "v" / draft "ad"): `gen += 1`, `rd_first := -1`, `rd_last` kept, `uid := owner`, `stamp := take clock`, `hist_gate`, `xfer += 1` | apply | `res.py:438-489`, `own.py:238-269`, `res.py:863-868` |
+| LRU -> FREE (Policy E, LRU kind; wait if `rd_last` pending) then FREE -> INFLIGHT | apply | `res.py:399-418`, `:420-437` |
+| INFLIGHT -> FREE (Policy E, in-flight kind; the write forced) then taken | apply | `res.py:363-388` |
+| demand merge (verify / draft bit OR) | apply | `res.py:605-611`, `:672-674` |
+| PO / VRES -> LRU (acquisition), LRU touch | apply, recency round | `own.py:202-206`, `:305-321` |
+| LRU -> PO (pinned) / RELEASING (`evict_to_c` per round; `_evict_over_c` per admission) | apply, poll | `own.py:280-303` |
+| INFLIGHT -> LRU / VRES / RELEASING (admission branches, section 0.1 (4)) | poll | `own.py:322-361`, `res.py:236-282` |
+| PO / VRES -> RELEASING (the last pin of a key dropped) | poll (queued drops), `end_request` | `own.py:213-237`, `res.py:298-305` |
+| RELEASING -> FREE when `done(rd_last)` | poll | `own.py:435-452` |
+| LRU / PO / VRES -> RELEASING ("end") | `end_request` | `own.py:363-384` |
+| readers: `rd_first` if -1, `rd_last := e` for every slot read; `key_rd[l, b, k] := e` for the rows' keys; the verify keys' (key, l) queued | `read_done(e)` | `res.py:743-761` |
 
-Not cheap as predicates, therefore in the CPU lockstep only (section 4): the whole LRU ORDER (I2 and I8 check counts
-and victims; the lockstep checks every rank), the pins of the blocks that are not resident, the release queue against
-the reader ticks, and the metrics (k43 / k46 / k48, refusals, verifier evictions).
+### 3.2 Request and key lifecycle
+
+- `begin_request(b, uid, hist_blocks)` refuses an owned b. It sets `owner`, `hist_from` and `xfer[b] := 0`
+  (`res.py:203-218`).
+- `end_request(uid)` (`res.py:220-234`, `own.py:363-384`):
+  - b's LRU / PO / VRES slots -> RELEASING ("end");
+  - `pin[:, b] := 0`;
+  - `owner[b] := -1`, so the in-flight slots of the old uid are dropped at their arrival (T3);
+  - `hist_id[b] := -1` and `hist_from` cleared;
+  - every queued (key, l) of the uid -> `kcancel`, and `rel_q[:, b] := false`.
+- `decided(key)` queues (key, l) at every l (`res.py:763-766`). `cancel(key)` also sets `kcancel`
+  (`res.py:768-785`). `cancel_epoch(uid, epoch)` cancels the seen keys (`res.py:786-798`).
+- Key slots per I13.
+
+### 3.3 The invariants (predicates in the check-then-write apply)
+
+PRE-WRITE (record against the state; a failure voids the tick before any change):
+- I4 K5 (with the proof in 0.2);
+- I5 (a take into a FREE slot, the first_free rank, no reuse under a pending reader except Policy E's wait);
+- I6 (an admission names an INFLIGHT slot: gen, block, uid);
+- I7 (Policy E candidates and order; the current owner; `sel` common-mode);
+- I10 (T4), I11 (cancelled), I12 (late protection), I13 (key slots), I15 (slot range);
+- the record checks of note 12l: a READY draft record names the resident slot; a merge names the current owner's
+  in-flight slot and generation; a refusal is one K5 refuses; a HOLE raises.
+
+POST-WRITE (a failure rolls the undo log back, so the tick is void): I1 (resident + current-owner INFLIGHT, at most 1
+per block), I2 (LRU <= C, also after poll), I3 (PO / VRES pinned), I9 (gen changes only at a take, by +1), and the
+global K5 sum <= X per layer.
+
+LOCKSTEP ONLY: the full LRU order, the pins of the blocks that are not resident, the release queue, the metrics, and a
+wrong `sel` bitmap.
 
 ## 4. The equality contract (CPU lockstep with planted defects)
 
-- **The lockstep.** The existing worlds and schedules of `benchmarks/Efficiency/tests_cpu/test_r2_residency.py`:
-  - F6 (`_f6`, seeded delays, reordering, bursts, late readers);
-  - F12b (capacity pressure: refusals, the verifier reserve);
-  - F20b (Policy E, LRU kind);
-  - F21b (asynchronous transport: Policy E, in-flight kind);
-  - F22 (arrival lag D = 2: forced and held arrivals).
+- **The worlds.**
+  - F6, F12b, F20b, F21b, F22 (`test.py`);
+  - the scripts of 0.2: F13 / F14b + land, drop_vres_unprotected, F3, F11, two draft rows, F12f, F16, F12e, F15.
 
-  The vendored service (v1 and S-C) runs as today. A B2 `OwnTable` is fed the same tick's record: C's sparse record
-  from S-C's device decisions, or, for v1, a record synthesized from v1's plan and the stream journals that S-C
-  already reports (`_Journal`, `_ProtDict`).
-- **The comparison.** After every `end_tick` and after every `poll`, `project(svc)` maps the vendored state onto B2's
-  arrays, and they must be equal in every column:
-  - an LRU's `OrderedDict` order becomes ranks, compared with the rank of B2's stamps;
-  - `Slot.first_reader` / `last_reader` become the tick of the test's event;
-  - the protection map (block -> keys -> kinds) becomes `pin` bits through the request's key slots;
-  - `inflight` / `pending` become the slot columns;
-  - `key_reader` and `queue` become `key_rd` / `rel_q`;
-  - the counters must be equal too.
-- **Planted defects** (one per record kind). Each must fail the lockstep at the first tick it changes, and each marked
-  P must also be refused by the in-apply predicate:
+  For each tick, B2 is fed C's sparse record from S-C's device decisions (`ResidencySparse._layer_record`). The
+  vendored side runs as today (v1 and S-C).
+- **The comparison.** After every `end_tick` and every `poll`, `project(svc)` maps the vendored state onto B2's arrays,
+  and they must be equal in every column:
+  - LRU order as stamp ranks; pins through the key slots; readers as event ids; `pending` / `inflight` as slot
+    columns;
+  - the metrics of `_counters`.
+- **Planted defects.** Each one must differ at the first tick it changes. A "P" also fails an in-apply predicate.
+  - Rev 1's 14 (rev 1 section 4), with C's corrections: "overflow ignored" -> lockstep; "selected" -> lockstep.
+  - The 8 that C adds (review section 3):
+    1. a take of a block resident or in flight for the owner (P, I1 / dedup);
+    2. a take without a registered write-back (P, I10);
+    3. a row of a cancelled key, or after its (key, l) release was queued (P, I11 / I12);
+    4. a key slot reused while its pins remain (P, I13);
+    5. the poll order swapped (lockstep);
+    6. a drop_unowned / drop_vres_unprotected that keeps `rd_last` (lockstep: it frees one poll late);
+    7. a take that drops `rd_last` (lockstep, and E's reader mark);
+    8. two draft rows of one stream with one batch eviction (lockstep on the two-row script).
+  - Plus: an in-flight Policy E victim of a previous owner (P, I7).
 
-| record kind | planted defect | caught by |
-|---|---|---|
-| draft take | into a non-FREE slot (P, I5); at a slot other than K3X `first_free` | I5; lockstep |
-| verifier grant | a grant past the extras (P, I4); a draft borrowing into the reserve (P, I4) | I4 |
-| Policy E, LRU kind | a pinned victim (P, I7); a victim the layer selects (P, I7); not the least recent | I7 |
-| Policy E, in-flight kind | a protected or landed victim (P, I7); not the oldest; an in-flight victim while an LRU candidate is unused (P, I7) | I7 |
-| refusal | dropped (the take happens) | I4 (when over), else lockstep (counter, state) |
-| demand merge | dropped: the arrival goes VRES instead of LRU | lockstep |
-| PO / VRES acquisition | dropped; the wrong source | lockstep; I2 / I3 |
-| overflow | ignored: the tick applies | the void-tick rule (no column changes) |
-| new pin | dropped: a PO entry unprotected (P, I3) or an entry evicted that v1 keeps PO | I3; lockstep |
-| draft stamps | permuted inside a row's batch (P, I8) | I8; lockstep (ranks) |
-| evict_to_c victims | not the least recent (P, I8); a pinned victim released (P) | I8 |
-| read bitmap | a slot missing: its `rd_last` too old, so it frees one tick early | lockstep (I5 cannot see a missing reader) |
-| poll | frees a RELEASING slot whose reader is pending (P, I5) | I5 |
-| arrival | stale generation, or admitted for an old owner (P, I6) | I6 |
+## 5. B2-T: the component microbench (built first; host CPU tensors at p3's geometry)
 
-## 5. The cost per tick at B 64
+- `benchmarks/Efficiency/r2_own2_b2t.py` times each component separately per round tick. The ops are in
+  `nosi/nosi/r2_own2_ops.py` (vectorized, no per-entry Python), which `apply_tick` will use.
+- Inputs: synthetic, at p3's sizes and with C's record shapes:
+  - per tick 1,054 urgent (467 Policy E), 64 verify merges, 6,493 draft takes, 1,269 refusals;
+  - about 0.2 M READY draft records;
+  - `vread` / `sel` / `rowsel` as 32-bit words;
+  - 51 verify rows from 13 cohorts, 55 draft rows.
+- Each component is a REPORT:
+  - poll: the reader window, the arrivals, `_evict_over_c` on the streams over C only, the key drops, the frees;
+  - apply:
+    - the parse and decode;
+    - the row checks;
+    - the pins (rowsel OR, grouped by (b, key));
+    - K5 and first_free;
+    - slot_of and the dedup;
+    - the READY / merge checks;
+    - Policy E on its streams only (sort or top-k);
+    - the writes with the undo log;
+    - the recency rounds with `evict_to_c` on the streams over C only;
+    - the post-write predicates;
+    - the readers;
+    - the metrics arrays;
+    - E's `issue_desc` arguments.
+- Each component's result is checked against a brute-force reference on small random inputs (CPU tests). The
+  recency is checked against the vendored `Stream`, including the two-row case. Negative controls are included.
+- REGISTERED FALSIFIER: total > 25 ms per round tick (median, one thread) refutes the host estimate. The device
+  version is then designed before the host one, and the component table names what moves first.
 
-Inputs: 0.21 M verify and 0.23 M draft entries per round tick, about 9.3 k sparse records (1.05 k urgent, 0.06 k
-merges, 0.47 k Policy E, 1.27 k refusals, 6.49 k draft takes; `R2_SG5_CAPTURE_PLAN.md:264-271`), the read bitmap of
-L x B x H x NPOS = 32 x 64 x 2 x 128 = 0.52 M bits = 64 KB, NBLK about 256.
+## 6. The interface
 
-- **A number to correct in the plan:** `R2_SG5_CAPTURE_PLAN.md:169` says the bitmap is 2.2 M bits = 270 KB. That
-  matches H 8 (32 x 64 x 8 x 128 = 2.1 M). At H 2 (the plan's own correction, `1d1b956`) it is 0.52 M bits = 64 KB.
+- **The host consumer.** `OwnResidency.apply_tick(steps)` has C's signature (note 12l: `steps[i] = dict(l, vrows,
+  vidx, vdec, drows, ddec, rec, caps)`). B2 consumes `vrec`, `drec`, `vlook`, `vread`, `sel` after the one read.
+- **Requests to C** (through the lead):
+  - (a) add `rowsel` (R, H, ceil(nblk / 32)) per layer. B2's protection is the rowsel OR, grouped by (b, key, kind);
+  - (b) make the PIN-only records optional (a flag) when B2 consumes the record. They are about 0.26 M per verify tick
+    (note 12l estimate), and B2 does not use them.
 
-**The pin volume.** The plan says "the protects are not counted in the record" (`:267`), so I counted them from the
-code. v1 calls `st.protect(t, r.key, kind)` for EVERY selected entry: `r2_residency.py:597` (VERIFY) and `:668`
-(DRAFT). That is 0.21 M + 0.23 M protections per round tick. Most of them repeat a (block, key, kind) that is already
-pinned. The NEW pairs come mostly from the first row of a new key: 55 draft rows / K 3 x 32 x 2 x 64 = 75 k per tick.
-Either count is larger than all the other records together.
-
-- **PROPOSAL to C** (through the lead): the record does NOT carry pins one by one. It carries, per row and per
-  (layer, head), the row's SELECTION BITMAP over NBLK, the row's key slot and its kind. B2 then ORs that bitmap into
-  the key's bit of `pin`. That is 106 rows x 32 x 2 x 256 bits = 217 KB per tick, and one vector op. It is the same
-  information as the selection that the device already holds.
-
-| work per tick | host torch on CPU tensors | device (the same code on CUDA) |
-|---|---|---|
-| dispatch: about 60-120 ops | 0.5-1.5 ms (5-15 us each) | 0.5-1.2 ms of launches; capturable |
-| full-table passes (poll, the reader bitmap into `rd_first` / `rd_last`, I1-I3, I9): about 8 passes over 22.5 MB (0.52 M slots each) | 5-12 ms | < 1 ms |
-| the records (9.3 k) and the pin bitmaps (217 KB, OR into 2.1 MB): scatter / index_put by kind | 1-2 ms | < 0.2 ms |
-| K5 prefix sums, Policy E and `evict_to_c` segment sorts over the touched streams (55 x 32 x 2 = 3.5 k draft and 51 x 32 x 2 = 3.3 k verify streams, x NPOS 128) | 3-8 ms | < 0.5 ms |
-| the device mirror (S-C's `DeviceMirror`) | a delta of the dirty slots (about 20 k x 7 int64 = 1.1 MB pinned H2D): < 1 ms | none: the table IS the mirror |
-| the record's read to the host | already in B1's one read | only the take list (6.5 k x 8 int64 = 0.4 MB) and the flags |
-| **B2 total** | **about 10-25 ms** | **about 2-4 ms** |
-
-These are estimates, not measurements (the per-op rates are typical torch CPU rates for 0.5 M-element int tensors). A
-CPU micro-benchmark of `apply_tick` on a synthetic record of p3's counts measures them before any GPU run (section 7).
-
-**Outside B2: the transfer issue.** `GilfreeTransport.issue` (`r2_transport_gilfree.py:265`) takes a list of Python
-`Transfer` objects. The plan estimates the draft issue at 0.15-0.2 s per tick (`R2_SG5_CAPTURE_PLAN.md:270-271`). B2
-alone does not remove it. B2 hands the takes out as TENSORS (l, b, h, block, slot, gen, seq, kind, key, the previous
-reader's tick), CONTIGUOUS (lessons L28: a non-contiguous view into the raw-pointer Triton gathers read shifted
-entries). A descriptor-tensor issue path into E's packer would remove the per-object cost. That is E's and C's
-interface (Q-B3).
-
-**Placement: build device-agnostic, place it on the host first.**
-- Every B2 function is torch ops with no per-entry Python loop and no host read inside the apply (the predicates
-  reduce to one flag tensor read once).
-- PHASE 1 runs it on CPU tensors: the CPU lockstep is the same code, and C's host consumer already holds the record
-  after B1's one read. The expected cost is 10-25 ms of B2, plus the issue path until Q-B3 is solved.
-- PHASE 2 moves the table to the device after (A) and B1 are measured. The record then never leaves the device except
-  for the take list. B2 shrinks to about 2-4 ms and becomes capturable. What Phase 2 needs: the arrivals as a device
-  watermark (the generation board already exists: `GenBoard`, `r2_residency_sc.py:574`, written by the transport
-  that publishes, `:611`) and the reader watermark as one scalar per tick.
-
-## 6. The interface (one function for C's host consumer; the rest are lifecycle calls)
-
-```python
-class OwnTable:                                   # nosi/nosi/r2_own2.py (after the GO)
-    def __init__(self, L, B, H, C, X, R_ver, nblk, K, LAMBDA, device="cpu", check=True): ...   # KEYS from (K, LAMBDA)
-    # THE per-tick call: C's ResidencySparse.apply_tick, after its one device-to-host read
-    def apply_tick(self, rec: "SparseRecord", tick: int) -> "TickResult": ...
-    # lifecycle (small, per request or per tick)
-    def poll(self, done_tick: int, arrivals: "Arrivals") -> "PollResult": ...   # admissions, releases -> FREE
-    def decided(self, b: int, key_slot: int) -> None: ...                       # queue (key, l) behind its readers
-    def cancel(self, b: int, key_slot: int) -> None: ...
-    def begin_request(self, b: int, uid: int) -> None: ...
-    def end_request(self, b: int) -> None: ...
-    def snapshot(self) -> Dict[str, torch.Tensor]: ...                         # the lockstep's view
-```
-
-- **`apply_tick`** applies one tick in v1's semantics, per layer: the verify part (pins, merges, urgent grants with
-  Policy E), the draft part (pins, merges, takes / refusals), the draft recency (stamps, then `evict_to_c`), then the
-  read bitmap as readers of `tick`.
-  - It returns the takes as tensors for the issue, the metric deltas, and (Phase 1) the dirty slots for the device
-    mirror.
-  - A void tick raises before any write: `CapacityRefusal` (overflow; `kstep/errors.py:36`) or `OwnershipViolation`
-    (a predicate, with its first offending record; `kstep/errors.py:13`). The vendored exceptions are reused.
-- **`poll`** at the tick start:
-  - admits the arrivals (demand with draft -> LRU at MRU, then the over-C eviction; verify only -> VRES if pinned,
-    else RELEASING; an old owner -> RELEASING);
-  - drops the due (key, l) pins (`rel_q` and `key_rd <= done_tick`), releasing the unpinned PO / VRES;
-  - frees the RELEASING slots with `rd_last <= done_tick`.
-
-**THE RECORD FORMAT is C's (B1). What B2 needs from it, to agree through the lead** (Q-B1):
-- one struct-of-arrays int64 tensor, (F, n);
-- per record: kind, l, b, h, block, slot, the generation before, an ORDER key (the layer's resolve order: verify
-  part, then draft part, then recency; inside each, (row, head, ascending block)), the row's key slot, the demand
-  kind, and an aux field (the victim's take stamp or seq);
-- kinds: draft take, verifier grant (K5), Policy E LRU, Policy E in-flight, refusal, merge, PO acquisition, VRES
-  acquisition, draft stamp (touch), `evict_to_c` victim, overflow;
-- side planes: the read bitmap (L, B, H, NPOS) and, per row, the selection bitmap (pins, section 5);
-- **Q-B2 (to C):** B2 can recompute the stamps and the `evict_to_c` victims itself from the read set (they are
-  determined by the order key). Should the record carry them, so that I8 checks the device's choice, or should B2
-  derive them, so that the record shrinks? I prefer that the record carries the victims (a check of the device) and
-  B2 derives the stamps.
-
-## 7. Plan after the GO
-
-1. `nosi/nosi/r2_own2.py` (`OwnTable`) and `project(svc)`; CPU tests B2-L1 .. L5 (the lockstep on F6, F12b, F20b,
-   F21b, F22, for v1 and S-C), then B2-P (one planted defect per record kind, section 4), then B2-C (no per-entry
-   Python loop and no host read in `apply_tick`: a source check, and a host-read check as F10d does for S-B,
-   `test_r2_residency.py:757`).
-2. B2-T: a CPU micro-benchmark of `apply_tick` on a synthetic record with p3's counts per tick (section 5). It is a
-   REPORT that tests section 5's estimate before any GPU run. Registered falsifier: B2's host time > 25 ms per round
-   tick on one amd core refutes the estimate, and Phase 2 then comes first.
-3. Behind a flag in C's `ResidencySparse` (`own="vendored" | "b2"`); the vendored path stays the default and the
-   reference.
-4. Measured on the GPU only after (A) and B1: B2's host time per tick (REPORT), then Phase 2 (device) if it is still
-   on the critical path.
-
-Questions (to the lead, for C and E):
-- **Q-B1:** the record format (section 6).
-- **Q-B2:** recompute or carry the stamps and victims.
-- **Q-B3:** a tensor-descriptor issue path from the take list into E's packer.
-- **Q-B4:** the key slots. Is "at most 4 live cohort keys per request" a hard bound in the planner? My count at K 3,
-  LAMBDA 7 (`r2_tick_sg5.py:77-78`) is ceil(7 / 3) + 1 = 4 undecided cohorts, plus 1 decided key while its pins wait
-  for the reader (`rel_q`): 5. The lead sweep raises LAMBDA, so KEYS comes from (K, LAMBDA). A key beyond KEYS is an
-  `OwnershipViolation` (never a silent drop). `pin` is uint16, so KEYS <= 8.
+  B2 derives each draft INFL record's in-flight slot from its own `slot_of`, so the record needs no new field.
+- **E's issue path** (Q-B3, as E built it):
+  - `seq = tp.issue_desc(desc, reader_marks, hist_mark)`;
+  - `desc` = B2's draft take list (6, n) CONTIGUOUS int64 (l, b, h, block, slot, gen). Lesson L28: a non-contiguous
+    view into a raw-pointer gather reads shifted entries;
+  - `reader_marks` (L,) = the newest E mark of the destination slots' kept `rd_last` per layer;
+  - `hist_mark` = the newest write-back mark over the job's (b, block), or -1;
+  - B2 stores `seq` per slot. A poll admits the slots with `seq <= tp.landed_upto()` and `issue_tick + D <= tick` in
+    one vector op. A slot due by the arrival rule but not landed is forced through the transport first.
+- **Lifecycle calls:** `poll(tick)`, `read_done(l, plan, ev)` (registers the id), `decided`, `cancel`,
+  `cancel_epoch`, `begin_request`, `end_request`, `snapshot()` / `project()`.
