@@ -633,6 +633,85 @@ of R". But every gilfree arm failed: "Inplace update to inference tensor outside
   (as in 7ab1ca2): the rows land, then the publication raises the run's error; its traceback names _feeder,
   _release and _publish.
 
+## 12j. SG5 p3 preflight (holder 2190876): Policy E under an ASYNCHRONOUS transport (2026-10-21)
+
+THE RUN (`/mnt/beegfs/ojerbi/r2-runs/sg5/sg5_p3_2190876`, gates SG5_preflight_*; B 64, C 96 / X 32 / R_ver 16,
+4 committed tokens per request, the same tokens in every arm):
+- S-C on gilfree: CapacityRefusal at layers 16 / 22 / 23 (19, 4, 5 blocks without a slot).
+- S-C on gather, S-B and v1 on both transports: passed (9 ticks, 5 decision ticks).
+- The record has no per-stream state, so the cause below is the mechanism that explains all six results; the next
+  refusal carries the evidence (the capacity report, below).
+
+THE MECHANISM (file:line at this commit):
+- A draft prefetch holds its slot while it is in flight: INFLIGHT counts in K5's usage (`ownership.py:135`), and an
+  in-flight transfer is never freed before it lands (paper 3.4; note 5, the `free_on_cancel` control).
+- Policy E (12h) took only LRU entries (`r2_residency.py` `_verifier_candidates`).
+- When a cohort is decided, its references are dropped at the next poll (`r2_residency.py` `poll` / `_drop`).
+  - With a (near) SYNCHRONOUS transport (SG5's gather, `r2_tick_sg5.py:185`: one Triton gather per issue on a GPU
+    side stream, issued at end_tick, so it has usually completed by the next poll), the prefetch has landed by that
+    poll: it is an LRU entry (admit with draft demand), now unprotected: a Policy E candidate.
+  - With an ASYNCHRONOUS transport (gilfree: the feeder packs the 32 layers' releases one by one on the CPU and lags
+    behind at B 64), the same prefetch is still in flight: it holds its slot and it is NO candidate. When every LRU
+    entry is protected or read by the layer, the verifier refuses although the stream holds slots that no live
+    cohort needs.
+- S-B passed on gilfree at the same point: its candidates spare only the verify rows' blocks (12h), so it had more of
+  them. v1 passed: its schedule polls at every resolve and issues at once, so its prefetches land earlier.
+- CPU reproduction: F21 with policy_e_inflight=False (12h's rule). The asynchronous round (a force_only transport)
+  refuses in v1 and S-C, with the report "LRU 0, unprotected 0; in flight 2, unprotected draft prefetches 2"; the
+  synchronous round (land_all, the gather stand-in) passes.
+
+THE POLICY (Policy E, second candidate kind):
+- When K5 grants the verifier's urgent miss no slot, the candidates are, in this order:
+  1. the stream's unprotected LRU entries that no row of the layer selects, least recent first (12h);
+  2. the stream's in-flight DRAFT prefetches of the current owner that no live cohort protects (their requesters were
+     decided or cancelled) and that no row of the layer selects, oldest issue first.
+- A chosen in-flight prefetch is SUPERSEDED. Its write completes BEFORE the slot is reused; then the service forgets
+  it (it is never admitted), the slot goes FREE and the urgent block takes it.
+  - GPU, S-C: the layer's wait covers it. The superset wait already waits for every transfer in flight at the layer;
+    the exact wait adds the prefetch's (slot, generation) to its board list (`wait_list`). The liveness rule (12g)
+    already host-waits the SUBMISSION of every pack in flight at the layer.
+  - v1 / S-B (host): the transport's force. CPU stand-ins: the force in CpuDeviceSim.wait, the board spin in
+    ExactWaitSim.
+- Paper rule: 3.4, "Storage becomes reusable only after the relevant owners and readers have finished". The
+  prefetch has no live requester and no reader; its only owner is the transfer, and the reuse waits for it. It is
+  Policy E's own rule applied to what a synchronous transport would have made an unprotected LRU entry by the next
+  poll.
+- COST:
+  - the superseded prefetch's bytes are wasted (k48 counts it as never_arrived); a synchronous transport would have
+    landed it and Policy E would have evicted it, so no reuse is lost against the synchronous case;
+  - the urgent gather waits for that transfer on the device (no new host wait: the submission wait exists);
+  - v1 / S-B host-wait it (force).
+- No MUST is weakened. Every verify read still reads its full selection; every slot write follows the previous
+  writer and reader; protected or selected blocks are never candidates.
+- No candidate of either kind: CapacityRefusal, as before (a configuration result).
+
+THE EVIDENCE FOR THE NEXT REFUSAL: v1's and S-C's CapacityRefusal messages now carry a capacity report per refused
+stream (S-C: the first 3 per layer, from the host state at the tick's start; nothing is applied):
+- usage of C; LRU and unprotected LRU entries; in flight and unprotected draft prefetches; PO; VRES; RELEASING;
+- the layer's free extras of X, and R_ver.
+
+S-C device (`device_verify`):
+- The mirror carries the protection flag of in-flight slots too (`sync_mirror`; `_prot_changed` marks the slot in
+  flight).
+- A take stamps the slot (STAMP_KINDS): the issue order.
+- LayerMirror gains fly, fly_stamp, infl_unprot, infl_rank and slot_gen. F14's full-scan reference compares
+  infl_unprot and infl_rank (the in-flight order by issue sequence).
+- The candidate key is the LRU stamp, or HALF_STAMP + the take stamp. The decision gains evict_infl and ev_gen.
+- The layer mirror for the draft rows forgets the superseded block's flight.
+- The host checks every in-flight eviction against v1's list (`_host_candidates`), then `_evict_inflight`.
+
+TESTS:
+- F21 (scenarios plain and protected_oldest):
+  - the reproduction above;
+  - with the fix: v1, S-C probe and S-C exact supersede the right prefetch; the urgent block holds the host truth;
+    the superseded transfer never lands later; the kept prefetch stays in flight;
+  - v1 and S-C reach the same state.
+- F21c negative controls:
+  - a device that supersedes a protected prefetch is refused by the host's check;
+  - a wait that omits the superseded write (no_inflight_wait) is refused by the device's T3 check; with that check
+    off, the slot's content is wrong.
+- F21b: the lockstep with a force_only transport (probe and exact). Precondition: v1 supersedes prefetches.
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,
