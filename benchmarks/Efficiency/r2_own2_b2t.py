@@ -1,7 +1,15 @@
 """R2 step 7, (B2) B2-T: the COMPONENT MICROBENCH of the array-backed ownership state (docs/R2_OWN2_B2_DESIGN.md rev 2,
-section 5). REPORT only. CPU host tensors; no model, no GPU; the records have the shapes of C's note 12l.
+section 5). REPORT only. No model; the records have the shapes of C's note 12l; the same ops on CPU or CUDA tensors.
 
-    python benchmarks/Efficiency/r2_own2_b2t.py --out <json> [--threads 1] [--iters 20] [--warmup 3] [--smoke]
+    python benchmarks/Efficiency/r2_own2_b2t.py --out <json> [--device cpu|cuda] [--threads 1] [--iters 20]
+        [--warmup 3] [--pipelined-iters N] [--profile] [--cpu-reference] [--smoke]
+
+--device cuda (refused, exit 2, when CUDA is absent): the world and the records are built on the host, then moved to the
+device; every component stop SYNCHRONIZES the device (its own wall time) and a CUDA event pair records the stream's
+span; a PIPELINED pass then times whole ticks with no component synchronization (only the ops' own host reads: the
+real cost); --profile adds one tick under torch.profiler with a record_function range per component (device busy time,
+kernel launches, synchronizations); --cpu-reference repeats the timing on the host of the same node. The REGISTERED
+DEVICE PREDICTIONS (REGISTERED_DEVICE, rev 2 section 5.1, frozen before the first GPU run) are scored in the JSON.
 
 THE WORLD (synthetic, seeded) at p3's geometry (L 32, B 64, H 2, C 96, X 32, R_ver 16, NBLK 256, k 64) and p3's
 counts per round tick (R2_SG5_CAPTURE_PLAN.md:264-271: 1,054 urgent of which 467 Policy E, 64 verify merges, 6,493
@@ -24,11 +32,15 @@ EACH ITERATION restores the world (untimed) and times every component in apply_t
   apply: parse, row checks, slot_of, pin words, K5 events, K5 / first_free, take checks, READY, merges, Policy E,
   gen snapshot, verify pins, draft pins, takes, merges, recency rounds (+ evict_to_c), post checks, readers, metrics,
   E's issue_desc arguments.
-JSON: per component median / p10 / p90 / mean ms; the poll / apply / total sums; the generated counts; the predicate
-violations (a coherence diagnostic of the synthetic world: 0 expected); the REGISTERED FALSIFIER (rev 2 section 5): the
-median total > 25 ms with one thread REFUTES the host estimate. Last stdout line:
-  R2_OWN2_B2T_DONE failed=<n> verdict=<SUPPORTED|REFUTED> total_ms=<x>
-exit = n (a generated count that differs from the requested one, or a predicate that fired, each counts 1).
+The predicates are read in TWO host reads per apply (rev 2 section 3.3): the pre-write flags (a set flag voids the tick
+before any write) and the post-write flags (a set flag rolls the undo log back).
+JSON: per component median / p10 / p90 / mean ms (and CUDA event ms); the poll / apply / synced and pipelined totals;
+the generated counts; the predicate violations (a coherence diagnostic of the synthetic world: 0 expected); the
+REGISTERED FALSIFIERS: on the host (rev 2 section 5) the median total > 25 ms with one thread refutes the host estimate
+(job 2191023: 164.364 ms, REFUTED); on the device REGISTERED_DEVICE (D1 the pipelined median, D2 the synced total, D3
+the profiled device busy time). Last stdout line:
+  R2_OWN2_B2T_DONE failed=<n> verdict=<...> total_ms=<x> device=<cpu|cuda>
+exit = n (a generated count that differs from the requested one, or a predicate that fired, each counts 1); 2 refused.
 """
 from __future__ import annotations
 
@@ -49,6 +61,33 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 NOSI = os.path.join(ROOT, "nosi", "nosi")
 PKG = "b2tnosi"
 FALSIFIER_MS = 25.0
+# Frozen before the first GPU run (rev 2 section 5.1). The model: the device ops are LAUNCH-BOUND: about 800 kernel
+# launches (500-1200) and about 60 host synchronizations (35-120) per round tick (poll + apply), at 6-15 us per launch
+# and 15-40 us per synchronization; the GPU's own work (about 30 full-table passes of 0.5 M slots plus the record ops)
+# is 1.5-4 ms of kernel time.
+# The UNCHECKED mode (C's request: the verification-only components gated as K3X's checked mode) drops about 330
+# launches and 10 synchronizations: about 470 launches and 48 synchronizations.
+REGISTERED_DEVICE = dict(
+    D1_pipelined_ms=dict(point=9.0, band=(5.0, 18.0), falsified_above=18.0),    # THE registered falsifier (checked)
+    D1u_pipelined_unchecked_ms=dict(point=5.5, band=(3.0, 11.0), falsified_above=11.0),
+    D2_synced_ms=dict(point=10.0, band=(5.0, 20.0), falsified_above=20.0),
+    D3_busy_ms=dict(point=3.0, band=(1.5, 6.0), falsified_above=6.0),
+    D4_launches=dict(point=800, band=(500, 1200)),
+    D5_syncs=dict(point=60, band=(35, 120)),
+)
+# components with a Python loop (rounds, live events, layer registrations) or a host read (nonzero, a boolean mask,
+# unique, int(max), bool(any), the two flag reads): expected HOST-BOUND on the device (D6: every one with wall >= 0.2 ms
+# has profiled device time <= 0.5 x its wall)
+HOST_BOUND = ("poll.refresh", "poll.force_seq", "poll.arrivals", "poll.checks", "poll.key_drops", "poll.releases",
+              "apply.parse", "apply.k5_events", "apply.merge_check", "apply.policy_e", "apply.pre_flags",
+              "apply.pins", "apply.takes", "apply.merges", "apply.recency", "apply.post_checks", "apply.post_flags",
+              "apply.readers", "apply.metrics", "apply.issue_desc")
+TENSOR_ONLY = ("apply.row_checks", "apply.slot_of", "apply.pin_words", "apply.k5_first_free", "apply.take_checks",
+               "apply.ready_check", "apply.gen_snapshot")
+# verification only: skipped in the UNCHECKED mode (the next state does not depend on them)
+CHECK_ONLY = ("poll.checks", "apply.row_checks", "apply.pin_words", "apply.k5_first_free", "apply.take_checks",
+              "apply.ready_check", "apply.policy_e", "apply.pre_flags", "apply.gen_snapshot", "apply.post_checks",
+              "apply.post_flags")
 
 
 def _load(mod: str):
@@ -92,6 +131,13 @@ def parse_args(argv=None):
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--smoke", action="store_true", help="a small world (CPU tests): L 2, B 8, C 24, X 8, k 8")
+    ap.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    ap.add_argument("--mode", choices=("checked", "unchecked", "both"), default="both",
+                    help="checked: every predicate (two flag reads per apply); unchecked: the verification-only "
+                         "components skipped (CHECK_ONLY), the device's decisions trusted")
+    ap.add_argument("--pipelined-iters", type=int, default=-1, help="whole ticks without component syncs (-1: --iters)")
+    ap.add_argument("--profile", action="store_true", help="one tick under torch.profiler (record_function ranges)")
+    ap.add_argument("--cpu-reference", action="store_true", help="with --device cuda: also time on this node's host")
     for n, v in (("L", 32), ("B", 64), ("H", 2), ("C", 96), ("X", 32), ("R-ver", 16), ("nblk", 256), ("keys", 4),
                  ("k", 64), ("verify-rows", 51), ("cohort-rows", 4), ("draft-rows", 55), ("lru-gap", 13),
                  ("urgent", 1054), ("policy-e", 467), ("v-merge", 64), ("d-take", 6493), ("refused", 1269),
@@ -228,12 +274,17 @@ def build_world(a) -> Dict:
     T.hist_from.zero_()                                                    # T4 active: every block needs a write-back
     T.hist_id.fill_((t - 3) * L)
     T.clock = 1 << 20
-    return dict(G=G, T=T, rows=rows, inV=inV, inD=inD, bor=bor, b_of=b_of, l_of=l_of, vreq=vreq, dreq=dreq)
+    # the tick rows in C's rowsel order (verify rows, then draft rows): batch slot and pin plane per row
+    row_b = torch.cat([rows.vb, rows.db])
+    row_plane = torch.cat([rows.vk, rows.dk + KEYS])
+    n_vkeys = len(set(zip(rows.vb.tolist(), rows.vk.tolist())))
+    return dict(G=G, T=T, rows=rows, inV=inV, inD=inD, bor=bor, b_of=b_of, l_of=l_of, vreq=vreq, dreq=dreq,
+                row_b=row_b, row_plane=row_plane, n_vkeys=n_vkeys)
 
 
-def fresh_window(a, G) -> "OPS.ReaderWindow":
+def fresh_window(a, G, dev="cpu") -> "OPS.ReaderWindow":
     """Reader events of ticks 0 .. t - 1 (one per layer, id = tick x L + l): t - 1 pending, the rest complete."""
-    w = OPS.ReaderWindow(cap=1 << 14)
+    w = OPS.ReaderWindow(cap=1 << 14, device=dev)
     for tt in range(a.tick):
         for l in range(G.L):
             w.register(Ev(done=tt <= a.tick - 2), tt * G.L + l)
@@ -241,31 +292,82 @@ def fresh_window(a, G) -> "OPS.ReaderWindow":
     return w
 
 
-def run_poll(T, win, a, tm=None) -> Dict:
-    def span(name, t0):
-        if tm is not None:
-            tm.setdefault(name, []).append(time.perf_counter_ns() - t0)
+class Spans:
+    """Component timers. keep {name: [ns]} (None: untimed, the pipelined pass); on CUDA every stop synchronizes the
+    device (the component's own wall time) and a CUDA event pair records the stream's span into evkeep at flush();
+    profile: every component is also a torch.profiler.record_function range."""
+
+    def __init__(self, dev, keep=None, evkeep=None, profile=False):
+        self.cuda = torch.device(dev).type == "cuda"
+        self.keep, self.evkeep, self.profile = keep, evkeep, profile
+        self.pending: List = []
+
+    def start(self, name: str):
+        rf = None
+        if self.profile:
+            rf = torch.profiler.record_function(name)
+            rf.__enter__()
+        e0 = None
+        if self.cuda and self.keep is not None:
+            e0 = torch.cuda.Event(enable_timing=True)
+            e0.record()
+        return (name, time.perf_counter_ns(), e0, rf)
+
+    def stop(self, tok) -> None:
+        name, t0, e0, rf = tok
+        if self.keep is not None:
+            if self.cuda:
+                e1 = torch.cuda.Event(enable_timing=True)
+                e1.record()
+                torch.cuda.synchronize()
+                self.pending.append((name, e0, e1))
+            self.keep.setdefault(name, []).append(time.perf_counter_ns() - t0)
+        if rf is not None:
+            rf.__exit__(None, None, None)
+
+    def flush(self) -> None:
+        for name, e0, e1 in self.pending:
+            if self.evkeep is not None:
+                self.evkeep.setdefault(name, []).append(int(e0.elapsed_time(e1) * 1e6))
+        self.pending = []
+
+
+def _host(x):
+    """Tensors -> Python numbers / lists (for the JSON; after the timing)."""
+    if torch.is_tensor(x):
+        return x.item() if x.dim() == 0 else x.tolist()
+    if isinstance(x, dict):
+        return {k: _host(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_host(v) for v in x]
+    return x
+
+
+def run_poll(T, win, a, sp=None, checked: bool = True) -> Dict:
+    sp = sp or Spans(T.dev)
     out = {}
-    t0 = time.perf_counter_ns()
+    k = sp.start("poll.refresh")
     win.refresh(ev_done)
-    span("poll.refresh", t0)
-    t0 = time.perf_counter_ns()
-    fs = OPS.force_seq(T, a.tick, a.tick - 2, a.lag)
-    span("poll.force_seq", t0)
-    out["force_seq"] = fs
-    t0 = time.perf_counter_ns()
+    sp.stop(k)
+    k = sp.start("poll.force_seq")
+    out["force_seq"] = OPS.force_seq(T, a.tick, a.tick - 2, a.lag)
+    sp.stop(k)
+    k = sp.start("poll.arrivals")
     out.update(OPS.poll_arrivals(T, a.tick, a.tick - 2, a.lag))
-    span("poll.arrivals", t0)
-    t0 = time.perf_counter_ns()
-    pc = OPS.post_checks(T, None, 0)
-    span("poll.checks", t0)
-    out["poll_I1"], out["poll_I2"] = pc["I1"], pc["I2"]
-    t0 = time.perf_counter_ns()
+    sp.stop(k)
+    out["poll_I1"] = out["poll_I2"] = False
+    if checked:
+        k = sp.start("poll.checks")
+        pc = OPS.post_checks(T, None, 0, which=("I1", "I2"))
+        i1, i2 = torch.stack([pc["I1"], pc["I2"]]).tolist()           # one host read
+        sp.stop(k)
+        out["poll_I1"], out["poll_I2"] = bool(i1), bool(i2)
+    k = sp.start("poll.key_drops")
     out.update(OPS.drop_due_keys(T, win))
-    span("poll.key_drops", t0)
-    t0 = time.perf_counter_ns()
+    sp.stop(k)
+    k = sp.start("poll.releases")
     out["freed"] = OPS.poll_releases(T, win)
-    span("poll.releases", t0)
+    sp.stop(k)
     return out
 
 
@@ -449,108 +551,125 @@ def gen_records(W: Dict, T1, a) -> Dict:
                v_infl_records=int((torch.bitwise_and(flags, OPS.INFL) != 0).sum()),
                v_dup_records=int((torch.bitwise_and(flags, OPS.DUP) != 0).sum()),
                v_records=int(vrec_m.sum()), d_records=int(dflags.numel()), d_ready=int((dflags == OPS.READY).sum()))
-    return dict(layers=layers, vread=vread, vlook=vlook, sel=sel_w.view(L, B, H, G.WB),
-                rowsel_v=SP._pack_bits(rsel_v[..., :NBLK]), rowsel_d=SP._pack_bits(rsel_d[..., :NBLK]),
+    rowsel_v, rowsel_d = SP._pack_bits(rsel_v[..., :NBLK]), SP._pack_bits(rsel_d[..., :NBLK])
+    return dict(layers=layers, vread=vread, vlook=vlook, sel=sel_w.view(L, B, H, G.WB), rowsel_v=rowsel_v,
+                rowsel_d=rowsel_d, rowsel=torch.cat([rowsel_v, rowsel_d], 1).contiguous(),   # C's tick-row rowsel
                 want=want, got=got)
 
 
 # ===================================================================================================================
 # one apply, component by component (the order OwnResidency.apply_tick will use)
-def run_apply(T, win, W, R, a, tm=None, mut=None) -> Dict:
+def run_apply(T, win, W, R, a, sp=None, mut=None, checked: bool = True) -> Dict:
+    """One apply in OwnResidency.apply_tick's order. checked: every predicate, read in TWO host reads (pre-write: a set
+    flag voids the tick before any write; post-write: a set flag rolls the undo log back). Unchecked: the CHECK_ONLY
+    components are skipped and the writes go without the undo log (the device's decisions are trusted)."""
     G, rows = W["G"], W["rows"]
-
-    def span(name, t0):
-        if tm is not None:
-            tm.setdefault(name, []).append(time.perf_counter_ns() - t0)
-
-    viol: Dict[str, int] = {}
+    sp = sp or Spans(T.dev)
+    pre: Dict[str, torch.Tensor] = {}
 
     def note(d):
         for n, v in d.items():
-            c = int(v.sum()) if torch.is_tensor(v) else int(bool(v))
-            viol[n] = viol.get(n, 0) + c
+            pre[n] = v.sum() if v.dim() else v.to(torch.int64)
 
-    t0 = time.perf_counter_ns()
+    k = sp.start("apply.parse")
     P = OPS.parse(T, R["layers"], rows)
-    span("apply.parse", t0)
-    t0 = time.perf_counter_ns()
-    note(OPS.row_checks(T, rows))
-    hole = 0
-    for part in ("V", "D"):
-        if P[part] is not None:
-            hole += int(OPS.has(P[part]["flags"], OPS.HOLE).sum())
-    viol["hole"] = hole
-    span("apply.row_checks", t0)
-    t0 = time.perf_counter_ns()
+    sp.stop(k)
+    if checked:
+        k = sp.start("apply.row_checks")
+        note(OPS.row_checks(T, rows))
+        for part in ("V", "D"):
+            if P[part] is not None:
+                pre["hole_" + part] = OPS.has(P[part]["flags"], OPS.HOLE).sum()
+        sp.stop(k)
+    k = sp.start("apply.slot_of")
     so = OPS.slot_of(T)
-    span("apply.slot_of", t0)
-    t0 = time.perf_counter_ns()
-    anyw = OPS.any_pin_words(T)
-    span("apply.pin_words", t0)
-    t0 = time.perf_counter_ns()
+    sp.stop(k)
+    if checked:
+        k = sp.start("apply.pin_words")
+        anyw = OPS.any_pin_words(T)
+        sp.stop(k)
+    k = sp.start("apply.k5_events")
     ev = OPS.k5_events(P, T)
-    span("apply.k5_events", t0)
-    t0 = time.perf_counter_ns()
-    note(OPS.k5_check(T, ev, mut))
-    span("apply.k5_first_free", t0)
-    t0 = time.perf_counter_ns()
-    note(OPS.take_checks(T, ev, so))
-    span("apply.take_checks", t0)
-    t0 = time.perf_counter_ns()
-    note(OPS.ready_check(T, P["D"]))
-    span("apply.ready_check", t0)
-    t0 = time.perf_counter_ns()
-    mc, fv, fd = OPS.merge_check(T, P, so, ev)
+    sp.stop(k)
+    if checked:
+        k = sp.start("apply.k5_first_free")
+        note(OPS.k5_check(T, ev, mut))
+        sp.stop(k)
+        k = sp.start("apply.take_checks")
+        note(OPS.take_checks(T, ev, so))
+        sp.stop(k)
+        k = sp.start("apply.ready_check")
+        note(OPS.ready_check(T, P["D"]))
+        sp.stop(k)
+    k = sp.start("apply.merge_check")
+    mc, fv, fd = OPS.merge_check(T, P, so, ev, check=checked)
     note(mc)
-    span("apply.merge_check", t0)
-    t0 = time.perf_counter_ns()
-    note(OPS.policy_e_check(T, ev, P, R["sel"], anyw, True, mut))
-    span("apply.policy_e", t0)
-    t0 = time.perf_counter_ns()
-    gen_before = T.c["gen"].clone()
-    undo = OPS.Undo()
-    clock0 = T.clock
-    undo.call(lambda: setattr(T, "clock", clock0))                     # a void tick also restores the stamp clock
-    span("apply.gen_snapshot", t0)
-    t0 = time.perf_counter_ns()
-    nv = OPS.pins_or(T, R["rowsel_v"], rows.vb, rows.vk, undo, mut)
-    span("apply.pins_verify", t0)
-    t0 = time.perf_counter_ns()
-    nd = OPS.pins_or(T, R["rowsel_d"], rows.db, rows.dk + G.KEYS, undo, mut)
-    span("apply.pins_draft", t0)
-    t0 = time.perf_counter_ns()
+    sp.stop(k)
+    viol: Dict[str, int] = {}
+    undo = None
+    gen_before = None
+    if checked:
+        k = sp.start("apply.policy_e")
+        note(OPS.policy_e_check(T, ev, P, R["sel"], anyw, True, mut))
+        sp.stop(k)
+        k = sp.start("apply.pre_flags")
+        names = list(pre)
+        vals = torch.stack([pre[n] for n in names]).tolist()                # ONE host read before any write
+        sp.stop(k)
+        viol = {n: int(v) for n, v in zip(names, vals)}
+        if any(viol.values()):
+            return dict(void=True, stage="pre", viol=viol)
+        k = sp.start("apply.gen_snapshot")
+        gen_before = T.c["gen"].clone()
+        undo = OPS.Undo()
+        clock0 = T.clock
+        undo.call(lambda: setattr(T, "clock", clock0))                 # a void tick also restores the stamp clock
+        sp.stop(k)
+    k = sp.start("apply.pins")
+    npin = OPS.pins_or(T, R["rowsel"], W["row_b"], W["row_plane"], undo, mut)   # C's tick-row rowsel, one call
+    sp.stop(k)
+    k = sp.start("apply.takes")
     takes = OPS.write_takes(T, ev, a.tick, a.tick, win, undo, mut)
-    span("apply.takes", t0)
-    t0 = time.perf_counter_ns()
+    sp.stop(k)
+    k = sp.start("apply.merges")
     OPS.write_merges(T, fv, fd, undo)
-    span("apply.merges", t0)
-    t0 = time.perf_counter_ns()
+    sp.stop(k)
+    k = sp.start("apply.recency")
     rc = OPS.recency(T, P["D"], rows, undo, mut)
-    span("apply.recency", t0)
-    viol["recency_bad"] = rc["bad"]
-    t0 = time.perf_counter_ns()
-    pc = OPS.post_checks(T, gen_before, int(takes["f"].numel()))
-    span("apply.post_checks", t0)
-    note(pc)
-    void = any(v for v in pc.values())
-    if void:
-        t0 = time.perf_counter_ns()
-        undo.rollback()
-        span("apply.rollback", t0)
-        return dict(void=True, viol=viol, takes=int(takes["f"].numel()), pin_rounds=(nv, nd), recency=rc)
-    t0 = time.perf_counter_ns()
-    e_l = torch.tensor([win.register(Ev(done=False), a.tick * G.L + l) for l in range(G.L)], dtype=torch.int64)
+    sp.stop(k)
+    if checked:
+        k = sp.start("apply.post_checks")
+        post = dict(OPS.post_checks(T, gen_before, int(takes["f"].numel())))
+        post["recency_bad"] = rc["bad"]
+        sp.stop(k)
+        k = sp.start("apply.post_flags")
+        pn = list(post)
+        pv = torch.stack([post[n].to(torch.int64) for n in pn]).tolist()    # ONE host read after the writes
+        sp.stop(k)
+        viol.update({n: int(v) for n, v in zip(pn, pv)})
+        if any(pv):
+            k = sp.start("apply.rollback")
+            undo.rollback()
+            sp.stop(k)
+            return dict(void=True, stage="post", viol=viol, takes=int(takes["f"].numel()), pin_rounds=npin,
+                        recency=rc)
+    k = sp.start("apply.readers")
+    e_l = torch.tensor([win.register(Ev(done=False), a.tick * G.L + l) for l in range(G.L)], dtype=torch.int64,
+                       device=T.dev)
     rd = OPS.read_done(T, R["vread"], P["D"], rows, e_l)
-    span("apply.readers", t0)
-    t0 = time.perf_counter_ns()
-    met = OPS.metrics(P, R["vlook"], takes, rows, G)
-    span("apply.metrics", t0)
-    t0 = time.perf_counter_ns()
+    sp.stop(k)
+    k = sp.start("apply.metrics")
+    met = OPS.metrics(P, R["vlook"], takes, rows, G, W["n_vkeys"])
+    mt = [n for n, v in met.items() if torch.is_tensor(v)]
+    mv = torch.stack([met[n].to(torch.int64) for n in mt]).tolist() if mt else []   # ONE host read
+    met = dict(met, **dict(zip(mt, mv)))
+    sp.stop(k)
+    k = sp.start("apply.issue_desc")
     desc, rmarks, hmark = OPS.issue_desc_args(T, takes, win)
-    span("apply.issue_desc", t0)
+    sp.stop(k)
     return dict(void=False, viol=viol, takes=int(takes["f"].numel()), force_waits=takes["force_waits"],
-                superseded=takes["superseded"], pin_rounds=(nv, nd), recency=rc, readers=rd, metrics=met,
-                desc_shape=list(desc.shape), desc_contiguous=bool(desc.is_contiguous()), reader_marks=rmarks.tolist(),
+                superseded=takes["superseded"], pin_rounds=npin, recency=rc, readers=rd, metrics=met,
+                desc_shape=list(desc.shape), desc_contiguous=bool(desc.is_contiguous()), reader_marks=rmarks,
                 hist_mark=hmark)
 
 
@@ -561,60 +680,207 @@ def stats_ms(v: List[int]) -> Dict[str, float]:
     return dict(p10=round(q[0], 4), median=round(q[1], 4), p90=round(q[2], 4), mean=round(float(t.mean()), 4), n=len(v))
 
 
-def main(argv=None) -> int:
-    a = parse_args(argv)
-    torch.set_num_threads(max(1, a.threads))
-    W = build_world(a)
-    G, T0 = W["G"], W["T"]
-    # the records, against the polled state
-    T1 = T0.clone()
-    poll0 = run_poll(T1, fresh_window(a, G), a)
-    R = gen_records(W, T1, a)
+def rows_to(rows, dev):
+    return OPS.Rows(vb=rows.vb.to(dev), vk=rows.vk.to(dev), db=rows.db.to(dev), dk=rows.dk.to(dev), k=rows.k)
+
+
+def move_world(W: Dict, R: Dict, dev) -> tuple:
+    Wd = dict(W, rows=rows_to(W["rows"], dev), row_b=W["row_b"].to(dev), row_plane=W["row_plane"].to(dev))
+    Rd = dict(R, layers=[{n: (v.to(dev) if torch.is_tensor(v) else v) for n, v in x.items()} for x in R["layers"]])
+    for n in ("vread", "vlook", "sel", "rowsel"):
+        Rd[n] = R[n].to(dev)
+    return Wd, Rd
+
+
+def _sync(dev) -> None:
+    if dev.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def time_on(dev, a, W: Dict, R: Dict, T0, checked: bool) -> Dict:
+    """The component timing (each component synchronized) and the PIPELINED timing (whole ticks) on one device."""
+    dev = torch.device(dev)
+    Wd, Rd = move_world(W, R, dev)
+    Td0 = T0.to(dev)
+    T = Td0.clone()
     tm: Dict[str, List[int]] = {}
-    T = T0.clone()
-    res = None
-    pol = None
+    evt: Dict[str, List[int]] = {}
+    res = pol = None
     for it in range(a.warmup + a.iters):
-        T.copy_from(T0)
-        win = fresh_window(a, G)
-        keep = tm if it >= a.warmup else None
-        pol = run_poll(T, win, a, keep)
-        res = run_apply(T, win, W, R, a, keep)
+        T.copy_from(Td0)
+        win = fresh_window(a, W["G"], dev)
+        _sync(dev)
+        sp = Spans(dev, tm if it >= a.warmup else None, evt)
+        pol = run_poll(T, win, a, sp, checked)
+        res = run_apply(T, win, Wd, Rd, a, sp, None, checked)
+        sp.flush()
+    final = T.clone()
+    pipe, pipe_ev = [], []
+    for it in range(a.iters if a.pipelined_iters < 0 else a.pipelined_iters):
+        T.copy_from(Td0)
+        win = fresh_window(a, W["G"], dev)
+        _sync(dev)
+        e0 = e1 = None
+        if dev.type == "cuda":
+            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0.record()
+        t0 = time.perf_counter_ns()
+        run_poll(T, win, a, None, checked)
+        run_apply(T, win, Wd, Rd, a, None, None, checked)
+        if e1 is not None:
+            e1.record()
+        _sync(dev)
+        pipe.append(time.perf_counter_ns() - t0)
+        if e0 is not None:
+            pipe_ev.append(int(e0.elapsed_time(e1) * 1e6))
     comp = {n: stats_ms(v) for n, v in tm.items()}
     poll_ms = sum(c["median"] for n, c in comp.items() if n.startswith("poll."))
     apply_ms = sum(c["median"] for n, c in comp.items() if n.startswith("apply."))
-    total = round(poll_ms + apply_ms, 4)
+    return dict(device=str(dev), checked=checked, poll=_host(pol), apply=_host(res),
+                components_ms=dict(sorted(comp.items(), key=lambda kv: -kv[1]["median"])),
+                components_event_ms={n: stats_ms(v) for n, v in evt.items()} if evt else None,
+                poll_ms=round(poll_ms, 4), apply_ms=round(apply_ms, 4), synced_total_ms=round(poll_ms + apply_ms, 4),
+                pipelined_ms=stats_ms(pipe) if pipe else None, pipelined_event_ms=stats_ms(pipe_ev) if pipe_ev else None,
+                final=final.to("cpu"))
+
+
+def profile_on(dev, a, W: Dict, R: Dict, T0, checked: bool) -> Dict:
+    """One tick under torch.profiler, every component a record_function range: the device busy time (the kernels'
+    self time), the kernel launches, the host synchronizations and per component its host and device time."""
+    try:
+        from torch.profiler import ProfilerActivity, profile
+        dev = torch.device(dev)
+        Wd, Rd = move_world(W, R, dev)
+        Td0 = T0.to(dev)
+        T = Td0.clone()
+        win = fresh_window(a, W["G"], dev)
+        run_poll(T, win, a, None, checked)                          # warm
+        run_apply(T, win, Wd, Rd, a, None, None, checked)
+        T.copy_from(Td0)
+        win = fresh_window(a, W["G"], dev)
+        _sync(dev)
+        acts = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if dev.type == "cuda" else [])
+        with profile(activities=acts) as prof:
+            sp = Spans(dev, None, None, profile=True)
+            run_poll(T, win, a, sp, checked)
+            run_apply(T, win, Wd, Rd, a, sp, None, checked)
+            _sync(dev)
+        busy = 0.0
+        launches = syncs = memcpy = 0
+        comps = {}
+        for e in prof.key_averages():
+            selfd = float(getattr(e, "self_device_time_total", None) or getattr(e, "self_cuda_time_total", 0.0) or 0.0)
+            totd = float(getattr(e, "device_time_total", None) or getattr(e, "cuda_time_total", 0.0) or 0.0)
+            busy += selfd
+            if e.key in ("cudaLaunchKernel", "cudaLaunchKernelExC", "cuLaunchKernel", "cuLaunchKernelEx"):
+                launches += e.count
+            if e.key in ("cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaEventSynchronize"):
+                syncs += e.count
+            if e.key in ("cudaMemcpyAsync", "cudaMemcpy"):
+                memcpy += e.count
+            if e.key.startswith(("poll.", "apply.")):
+                comps[e.key] = dict(cpu_ms=round(e.cpu_time_total / 1e3, 4), device_ms=round(totd / 1e3, 4))
+        return dict(device_busy_ms=round(busy / 1e3, 4), launches=launches, syncs=syncs, memcpy=memcpy,
+                    components=comps)
+    except Exception as ex:                                       # a REPORT: the run does not depend on it
+        return dict(error=repr(ex))
+
+
+def verdict_band(x, reg) -> str:
+    if x is None:
+        return "MISSING"
+    lo, hi = reg["band"]
+    if x > reg.get("falsified_above", float("inf")):
+        return "FALSIFIED"
+    return "HELD" if lo <= x <= hi else "GREY"
+
+
+def main(argv=None) -> int:
+    a = parse_args(argv)
+    dev = torch.device(a.device)
+    if dev.type == "cuda" and not torch.cuda.is_available():
+        print("R2_OWN2_B2T: --device cuda needs a CUDA device (torch.cuda.is_available() is False): refused",
+              file=sys.stderr, flush=True)
+        return 2
+    torch.set_num_threads(max(1, a.threads))
+    W = build_world(a)
+    G, T0 = W["G"], W["T"]
+    T1 = T0.clone()                                                # the records, against the polled state
+    poll0 = run_poll(T1, fresh_window(a, G), a)
+    R = gen_records(W, T1, a)
+    modes = {"both": (True, False), "checked": (True,), "unchecked": (False,)}[a.mode]
+    runs = {("checked" if c else "unchecked"): time_on(dev, a, W, R, T0, c) for c in modes}
+    cpu_ref = None
+    if a.cpu_reference and dev.type == "cuda":
+        cpu_ref = {("checked" if c else "unchecked"): time_on(torch.device("cpu"), a, W, R, T0, c) for c in modes}
+    prof = {("checked" if c else "unchecked"): profile_on(dev, a, W, R, T0, c) for c in modes} if a.profile else None
     failed = []
     for n, w in R["want"].items():
         if R["got"][n] != w:
             failed.append("count %s: got %d want %d" % (n, R["got"][n], w))
-    for n, v in res["viol"].items():
-        if v:
-            failed.append("predicate %s fired %d" % (n, v))
-    if res["void"]:
-        failed.append("the tick was void")
-    for n in ("poll_I1", "poll_I2"):
-        if pol[n]:
-            failed.append("poll predicate %s fired" % n)
-    verdict = "REFUTED" if total > FALSIFIER_MS else "SUPPORTED"
-    out = dict(geometry=G._asdict(), npos=G.NPOS, slots=G.S * G.NPOS, threads=torch.get_num_threads(),
-               torch=torch.__version__, host=platform.node(), args=vars(a), counts_requested=R["want"],
-               counts_generated=R["got"], poll_first=poll0, poll=pol,
-               apply={k: v for k, v in res.items() if k != "viol"}, violations=res["viol"],
-               components_ms=dict(sorted(comp.items(), key=lambda kv: -kv[1]["median"])),
-               poll_ms=round(poll_ms, 4), apply_ms=round(apply_ms, 4), total_ms=total,
-               falsifier=dict(threshold_ms=FALSIFIER_MS, registered="median total > 25 ms with one thread refutes the "
-                              "host estimate (rev 2 section 5)", verdict=verdict,
-                              applies=torch.get_num_threads() == 1 and not a.smoke),
-               failed=failed)
+    for m, r in runs.items():
+        for n, v in r["apply"]["viol"].items():
+            if v:
+                failed.append("%s: predicate %s fired %d" % (m, n, v))
+        if r["apply"]["void"]:
+            failed.append("%s: the tick was void" % m)
+        for n in ("poll_I1", "poll_I2"):
+            if r["poll"][n]:
+                failed.append("%s: poll predicate %s fired" % (m, n))
+    finals = [r.pop("final") for r in runs.values()]
+    if cpu_ref:
+        finals += [r.pop("final") for r in cpu_ref.values()]
+    same = all(not finals[0].diff(f) for f in finals[1:])
+    if not same:
+        failed.append("the final tables differ between the modes / devices")
+    head = runs.get("checked") or runs["unchecked"]
+    total = head["synced_total_ms"]
+    verdicts = {}
+    if dev.type == "cpu":
+        verdicts["host_25ms"] = dict(verdict="REFUTED" if total > FALSIFIER_MS else "SUPPORTED",
+                                     applies=torch.get_num_threads() == 1 and not a.smoke and "checked" in runs)
+    else:
+        RD = REGISTERED_DEVICE
+        pc = runs.get("checked")
+        pu = runs.get("unchecked")
+        verdicts["D1_pipelined_ms"] = verdict_band(pc["pipelined_ms"]["median"] if pc else None, RD["D1_pipelined_ms"])
+        verdicts["D1u_pipelined_unchecked_ms"] = verdict_band(pu["pipelined_ms"]["median"] if pu else None,
+                                                              RD["D1u_pipelined_unchecked_ms"])
+        verdicts["D2_synced_ms"] = verdict_band(pc["synced_total_ms"] if pc else None, RD["D2_synced_ms"])
+        pk = (prof or {}).get("checked") or {}
+        verdicts["D3_busy_ms"] = verdict_band(pk.get("device_busy_ms"), RD["D3_busy_ms"])
+        verdicts["D4_launches"] = verdict_band(pk.get("launches"), RD["D4_launches"])
+        verdicts["D5_syncs"] = verdict_band(pk.get("syncs"), RD["D5_syncs"])
+        d6 = None
+        if pk.get("components") and pc:
+            d6 = all(pk["components"].get(n, {}).get("device_ms", 0.0) <= 0.5 * c["median"]
+                     for n, c in pc["components_ms"].items() if c["median"] >= 0.2)
+        verdicts["D6_host_bound"] = "MISSING" if d6 is None else ("HELD" if d6 else "FALSIFIED")
+    gpu = None
+    if dev.type == "cuda":
+        p = torch.cuda.get_device_properties(0)
+        gpu = dict(name=p.name, uuid=str(getattr(p, "uuid", "")), cuda=torch.version.cuda)
+    out = dict(geometry=G._asdict(), npos=G.NPOS, slots=G.S * G.NPOS, device=str(dev), gpu=gpu,
+               threads=torch.get_num_threads(), torch=torch.__version__, host=platform.node(), args=vars(a),
+               counts_requested=R["want"], counts_generated=R["got"], poll_first=_host(poll0), modes=runs,
+               cpu_reference=cpu_ref, profile=prof, modes_state_equal=same, total_ms=total,
+               registered_device=REGISTERED_DEVICE, host_bound=HOST_BOUND, check_only=CHECK_ONLY,
+               verdicts=verdicts, failed=failed)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
     with open(a.out, "w") as fh:
         json.dump(out, fh, indent=1, default=str)
-    for n, c in out["components_ms"].items():
-        print("%-24s median %8.3f ms  p90 %8.3f ms" % (n, c["median"], c["p90"]))
+    for m, r in runs.items():
+        for n, c in r["components_ms"].items():
+            print("%-9s %-22s median %8.3f ms  p90 %8.3f ms" % (m, n, c["median"], c["p90"]))
+        pm = r["pipelined_ms"]["median"] if r["pipelined_ms"] else float("nan")
+        print("%-9s synced total %.3f ms; pipelined median %.3f ms" % (m, r["synced_total_ms"], pm))
+    for n, v in verdicts.items():
+        print("VERDICT %s %s" % (n, v))
     for f in failed:
         print("FAILED: " + f)
-    print("R2_OWN2_B2T_DONE failed=%d verdict=%s total_ms=%.3f" % (len(failed), verdict, total), flush=True)
+    vtxt = verdicts.get("D1_pipelined_ms") or verdicts.get("host_25ms", {}).get("verdict", "-")
+    print("R2_OWN2_B2T_DONE failed=%d verdict=%s total_ms=%.3f device=%s" % (len(failed), vtxt, total, dev.type),
+          flush=True)
     return len(failed)
 
 

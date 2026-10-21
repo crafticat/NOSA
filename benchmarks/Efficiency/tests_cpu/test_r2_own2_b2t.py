@@ -18,8 +18,12 @@ docs/R2_OWN2_B2_DESIGN.md rev 2. Every timed component is checked against the VE
   B2T-F  the releases == LayerPool.poll_releases with readers completing out of order (own.py:435-452).
   B2T-I  the post-write predicates fire on their planted state (I1, I2, I3, I9), not on a clean one.
   B2T-U  a void tick (gen_plus_two) restores the table exactly (the undo log); a clean tick commits.
-  B2T-H  the harness (--smoke): exit 0, the generated counts equal the requested ones, no predicate fires, the desc is
-         contiguous, every component is timed.
+  B2T-H  the harness (--smoke, both modes): exit 0, the generated counts equal the requested ones, no predicate fires,
+         the checked and unchecked final tables are equal, the desc is contiguous, every component is timed, the
+         unchecked mode skips CHECK_ONLY.
+  B2T-M  unchecked == checked on the smoke world; a predicate-only defect voids checked, passes unchecked.
+  B2T-G1 --device cuda without CUDA exits 2 before any work. G2 (GPU only, skipped on CPU): CUDA == host tables.
+  B2T-G3 the b2tg step script: static rules, the REGISTERED block == REGISTERED_DEVICE, the uuid rules, the DRYRUN.
   B2T-L  every Python loop of r2_own2_ops.py is per column / part / plane / round / live event (an allowlist).
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA benchmarks/Efficiency/tests_cpu/test_r2_own2_b2t.py
@@ -574,19 +578,132 @@ def test_B2T_U_void_tick_restores_the_table_and_a_clean_tick_commits(tmp_path):
     assert "code" in T.diff(T1) and res["takes"] == a.urgent + a.d_take
 
 
-def test_B2T_H_harness_smoke(tmp_path):
+def test_B2T_H_harness_smoke_both_modes(tmp_path):
+    """B2T-H: --smoke, both modes: exit 0, counts as requested, no predicate fires, the checked and unchecked final tables
+    are EQUAL (the unchecked mode changes no state), every component timed; the unchecked mode skips CHECK_ONLY."""
     out = tmp_path / "b2t.json"
-    rc = BT.main(["--smoke", "--out", str(out), "--iters", "2", "--warmup", "1"])
+    rc = BT.main(["--smoke", "--out", str(out), "--iters", "2", "--warmup", "1", "--pipelined-iters", "2"])
     d = json.loads(out.read_text())
     assert rc == 0 and d["failed"] == [], d["failed"]
-    assert d["counts_generated"]["d_take"] == d["counts_requested"]["d_take"]
-    assert not any(d["violations"].values())
-    assert d["apply"]["desc_contiguous"] and d["apply"]["desc_shape"][0] == 6
-    for name in ("poll.arrivals", "poll.releases", "apply.parse", "apply.k5_first_free", "apply.policy_e",
-                 "apply.pins_verify", "apply.takes", "apply.recency", "apply.post_checks", "apply.readers",
-                 "apply.issue_desc"):
-        assert d["components_ms"][name]["n"] == 2, name
-    assert d["total_ms"] > 0 and d["falsifier"]["applies"] is False
+    assert d["counts_generated"]["d_take"] == d["counts_requested"]["d_take"] and d["modes_state_equal"] is True
+    ck, uk = d["modes"]["checked"], d["modes"]["unchecked"]
+    assert not any(ck["apply"]["viol"].values()) and ck["apply"]["void"] is False and uk["apply"]["void"] is False
+    assert ck["apply"]["desc_contiguous"] and ck["apply"]["desc_shape"][0] == 6
+    assert ck["apply"]["desc_shape"] == uk["apply"]["desc_shape"] and ck["apply"]["metrics"] == uk["apply"]["metrics"]
+    for name in ("poll.arrivals", "poll.checks", "poll.releases", "apply.parse", "apply.k5_first_free",
+                 "apply.policy_e", "apply.pre_flags", "apply.pins", "apply.takes", "apply.recency", "apply.post_checks",
+                 "apply.post_flags", "apply.readers", "apply.metrics", "apply.issue_desc"):
+        assert ck["components_ms"][name]["n"] == 2, name
+    assert set(BT.CHECK_ONLY) <= set(ck["components_ms"]) and not set(BT.CHECK_ONLY) & set(uk["components_ms"])
+    assert ck["pipelined_ms"]["n"] == 2 and ck["synced_total_ms"] > 0 and d["total_ms"] == ck["synced_total_ms"]
+    assert d["verdicts"]["host_25ms"]["applies"] is False and d["device"] == "cpu"
+
+
+def test_B2T_G1_cuda_is_refused_without_cuda(tmp_path, monkeypatch):
+    """B2T-G1: --device cuda without CUDA exits 2 before any work (no output file)."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    out = tmp_path / "g.json"
+    assert BT.main(["--smoke", "--device", "cuda", "--out", str(out)]) == 2
+    assert not out.exists()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the CUDA path runs only where CUDA exists (the GPU step)")
+def test_B2T_G2_cuda_equals_cpu_on_the_smoke_world(tmp_path):
+    """B2T-G2 (GPU only): the same tick on CUDA tensors ends in the same table as on the host, in both modes."""
+    a, W, T1, _ = _smoke_world(tmp_path)
+    R = BT.gen_records(W, T1, a)
+    for checked in (True, False):
+        r_c = BT.time_on("cpu", a, W, R, W["T"], checked)
+        r_g = BT.time_on("cuda", a, W, R, W["T"], checked)
+        assert r_c["final"].diff(r_g["final"]) == [] and r_c["apply"]["metrics"] == r_g["apply"]["metrics"]
+
+
+def test_B2T_M_unchecked_skips_only_verification(tmp_path):
+    """B2T-M: on the smoke world the unchecked apply ends in the checked apply's table, and a planted defect that only a
+    predicate sees (gen_plus_two) voids the checked tick but is NOT caught unchecked (the mode trusts the decisions)."""
+    a, W, T1, win = _smoke_world(tmp_path)
+    R = BT.gen_records(W, T1, a)
+    Tc, Tu = T1.clone(), T1.clone()
+    rc = BT.run_apply(Tc, win, W, R, a, None, None, True)
+    _, _, _, win2 = _smoke_world(tmp_path)
+    ru = BT.run_apply(Tu, win2, W, R, a, None, None, False)
+    assert not rc["void"] and not ru["void"] and Tc.diff(Tu) == []
+    Tc, Tu = T1.clone(), T1.clone()
+    _, _, _, win3 = _smoke_world(tmp_path)
+    assert BT.run_apply(Tc, win3, W, R, a, None, {"gen_plus_two": True}, True)["void"]
+    _, _, _, win4 = _smoke_world(tmp_path)
+    assert not BT.run_apply(Tu, win4, W, R, a, None, {"gen_plus_two": True}, False)["void"]
+
+
+def _registered_block(text):
+    lines = text.splitlines()
+    i, j = lines.index("# REGISTERED B2TG BEGIN"), lines.index("# REGISTERED B2TG END")
+    return "\n".join(lines[i + 1:j])
+
+
+def test_B2T_G3_step_script_uuid_file_pins_dryrun_and_registration(tmp_path):
+    """B2T-G3: r2_own2_b2tg_step.sh. Static: the claim b2tg_active, STEP_MIN 10, --export=NONE, the uuid file read
+    before the claim, the root, no awk / perl / python3 outside comments; its REGISTERED block equals the bench's
+    REGISTERED_DEVICE. The uuid file rules (missing, "GPU-" prefix, two lines) and B2TG_HOLDERS outside DRYRUN stop
+    with exit 1; a wrong --nosi stops at the HEAD check; on a clean checkout at HEAD the DRYRUN prints the pins and
+    the step command (the uuid, --export=NONE, --device cuda, both modes, the profile, the host reference)."""
+    import os
+    import subprocess
+    script = EFF / "r2_own2_b2tg_step.sh"
+    text = script.read_text()
+    lines = text.splitlines()
+    assert lines[0] == "#!/bin/bash" and lines[-1] == 'main "$@"; exit $?' and "main() {" in text
+    assert 'mkdir "$OUTROOT/b2tg_active"' in text and "STEP_MIN=10" in text and "--export=NONE" in text
+    assert text.index("UFILE=$HOLDERS/$JOB.gpu_uuid") < text.index('mkdir "$OUTROOT/b2tg_active"')
+    assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-m2-own2 " in text
+    for word in ("awk", "perl", "python3", " bc ", "node "):
+        for ln in lines:
+            if not ln.lstrip().startswith("#"):
+                assert word not in ln, (word, ln)
+    blk = _registered_block(text)
+    RD = BT.REGISTERED_DEVICE
+    for key, label in (("D1_pipelined_ms", "D1 checked pipelined median per round tick"),
+                       ("D1u_pipelined_unchecked_ms", "D1u unchecked pipelined median per round tick"),
+                       ("D2_synced_ms", "D2 checked synced component sum"), ("D3_busy_ms", "D3 profiled device busy time")):
+        r = RD[key]
+        want = "# %s: PREDICTION %.1f ms, band %.1f-%.1f ms; FALSIFIER > %.1f ms" % (
+            label, r["point"], r["band"][0], r["band"][1], r["falsified_above"])
+        assert want in blk, (want, blk)
+    assert "# D4 kernel launches per tick: band %d-%d (point %d)" % (RD["D4_launches"]["band"] + (RD["D4_launches"]["point"],)) in blk
+    assert "D5 host synchronizations: band %d-%d (point %d)" % (RD["D5_syncs"]["band"] + (RD["D5_syncs"]["point"],)) in blk
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_"))}
+
+    def run(job, content=None, dry=True, sha="0" * 40):
+        if content is not None:
+            (tmp_path / ("%s.gpu_uuid" % job)).write_text(content)
+        e = dict(env, B2TG_HOLDERS=str(tmp_path))
+        if dry:
+            e["DRYRUN"] = "1"
+        else:
+            e.pop("DRYRUN", None)
+        return subprocess.run(["bash", str(script), "--nosi", sha, str(job), "t1"], env=e, capture_output=True,
+                              text=True, timeout=120)
+    uid = "f31fc723-9dfe-407a-9947-28173556232a"
+    r = run(611)
+    assert r.returncode == 1 and "no GPU uuid file" in r.stderr
+    r = run(612, "GPU-%s\n" % uid)
+    assert r.returncode == 1 and "does not hold a uuid" in r.stderr
+    r = run(613, "%s\n%s\n" % (uid, uid))
+    assert r.returncode == 1 and "more than one line" in r.stderr
+    r = run(614, uid + "\n", dry=False)
+    assert r.returncode == 1 and "for DRYRUN" in r.stderr
+    r = run(615, uid + "\n")
+    assert r.returncode == 1 and "HEAD is not" in r.stderr
+    head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
+    dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"],
+                           capture_output=True, text=True)
+    if head.returncode != 0 or dirty.stdout.strip():
+        pytest.skip("not a clean git checkout: the full DRYRUN needs one")
+    r = run(616, uid + "\n", sha=head.stdout.strip())
+    assert r.returncode == 0, r.stderr
+    for need in ("DRYRUN", uid, "--export=NONE", "--device cuda", "--mode both", "--profile", "--cpu-reference",
+                 "--gres=gpu:a100:1", "--time=10", "r2_own2_b2t.py"):
+        assert need in r.stdout, need
 
 
 # ---------------------------------------------------------------------------------------------------- L

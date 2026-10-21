@@ -338,6 +338,64 @@ wrong `sel` bitmap.
 - REGISTERED FALSIFIER: total > 25 ms per round tick (median, one thread) refutes the host estimate. The device
   version is then designed before the host one, and the component table names what moves first.
 
+### 5.1 B2-T on the device (B2TG; registered before the first GPU run, 2026-10-21)
+
+**The host result.** Job 2191023, one thread: the median is 164.364 ms per round tick, so the host falsifier
+(> 25 ms) FIRED. With 4 threads it is 72.778 ms. By the registered rule, the device version comes first.
+- The ops are torch tensor ops only. So the SAME bench runs on CUDA tensors (`--device cuda`).
+- The step script is `benchmarks/Efficiency/r2_own2_b2tg_step.sh`. It holds the same registration block as the
+  bench's `REGISTERED_DEVICE`, and a CPU test checks that the two are equal.
+
+**Two modes** (C's request, as K3X's checked mode):
+- CHECKED: every predicate, read in TWO host reads per apply. The pre-write flags void the tick; the post-write flags
+  roll the undo log back.
+- UNCHECKED: the verification-only components (`CHECK_ONLY`) are skipped, and the writes go without the undo log. The
+  device's decisions are trusted.
+- Both modes must end in the SAME table (a coherence failure otherwise).
+
+**The model behind the predictions:**
+- The device ops are LAUNCH-BOUND: about 800 kernel launches and about 60 host synchronizations per round tick, at
+  6-15 us per launch and 15-40 us per synchronization.
+- The GPU's own work (about 30 full-table passes of 0.5 M slots plus the record ops) is 1.5-4 ms of kernel time.
+- The unchecked mode drops about 330 launches and 10 synchronizations.
+
+| id | quantity | prediction | band | falsifier |
+|---|---|---|---|---|
+| D1 | checked, pipelined median per round tick (whole ticks, no component synchronization) | 9.0 ms | 5.0-18.0 ms | > 18.0 ms |
+| D1u | unchecked, pipelined median | 5.5 ms | 3.0-11.0 ms | > 11.0 ms |
+| D2 | checked, the sum of the synchronized component medians | 10.0 ms | 5.0-20.0 ms | > 20.0 ms |
+| D3 | profiled device busy time (the kernels' self time) | 3.0 ms | 1.5-6.0 ms | > 6.0 ms |
+| D4 | kernel launches per tick | 800 | 500-1200 | REPORT |
+| D5 | host synchronizations per tick | 60 | 35-120 | REPORT |
+| D6 | every component with wall >= 0.2 ms has profiled device time <= 0.5 x wall (host-bound) | holds | - | one that fails |
+
+**Expected HOST-BOUND components (`HOST_BOUND`):**
+- the ones with a Python loop:
+  - `poll.refresh` (the live events);
+  - `apply.pins` (at most K + 1 rounds);
+  - `apply.recency` (the rounds);
+  - `apply.readers` (L event registrations);
+- the ones with a host read:
+  - nonzero / a boolean mask: `poll.arrivals`, `poll.key_drops`, `poll.releases`, `apply.k5_events`, `apply.takes`,
+    `apply.merge_check`, `apply.post_checks`;
+  - unique: `apply.policy_e`, `apply.merges`;
+  - int(max) / bool(any): `poll.force_seq`, `apply.issue_desc`;
+  - the designed reads: `apply.pre_flags`, `apply.post_flags`, `apply.metrics`.
+- Tensor passes only: `apply.slot_of`, `apply.pin_words`, `apply.k5_first_free`, `apply.take_checks`,
+  `apply.ready_check`, `apply.gen_snapshot`.
+
+**What the result decides:**
+- **D1 holds:** B2 on the device costs about 7-10 % of a 90-140 ms round tick. The next lever is removing the
+  synchronizations (fixed-width top-k, masked writes) and the capture, not more ops.
+- **D1 fires:** the per-op host cost on that node is above the model. Then CUDA-graph capture or fused kernels come
+  before anything else.
+
+**C's record formats (confirmed for the lead):**
+- `rowsel` uses int64 words of 32 bits (`_pack_bits`), the same words as B2's pin planes.
+- It is indexed by TICK row. B2 maps each tick row to (b, plane) (plane = key slot for verify, KEYS + key slot for
+  draft) and ORs ALL rows in ONE `pins_or` call. B2-T already uses that layout.
+- `pin_records=False` is right for B2.
+
 ## 6. The interface
 
 - **The host consumer.** `OwnResidency.apply_tick(steps)` has C's signature (note 12l: `steps[i] = dict(l, vrows,

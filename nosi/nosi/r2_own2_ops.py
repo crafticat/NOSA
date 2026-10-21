@@ -6,8 +6,14 @@ words (pin_w (2 KEYS, L, B, H, ceil(NBLK / 32)) int64: plane k = key slot k for 
 of word w = block 32 w + i, the layout of sparse.py _pack_bits); per request owner, key readers, the release queue,
 cancelled key slots, the T4 write-back ids; xfer (the 4.8 transfer counts).
 
+DEVICE-AGNOSTIC: a Table lives on one device (CPU or CUDA); every op creates its tensors on the table's device. The
+report counts are returned as 0-dim tensors (no host read); the host reads that remain are the ones a shape or an early
+exit needs (nonzero / a boolean mask / unique / int(max) / bool(any)): on CUDA each is a synchronization (B2-T reports
+them by component).
+
 THE READERS are EVENT IDS (rev 2 section 0.1 (1)): ReaderWindow maps an id to its event object and E's mark; done(e) is
-exact for completion in any order. -1 = no reader (complete), as ev_done(None).
+exact for completion in any order. -1 = no reader (complete), as ev_done(None). Its host mirror is uploaded once per
+change.
 
 EVERY OPERATION is torch ops over whole columns or over the records, with no Python loop per entry. The loops that
 remain are per ROUND (the recency rounds, the pin rounds: at most K + 1) or per live event (the window refresh).
@@ -26,7 +32,7 @@ from .kstep.errors import CapacityRefusal
 from .r2_residency_sb import rank_in_group
 from .r2_residency_sc import C_FREE, C_INFLIGHT, C_LRU, C_PO, C_RELEASING, C_VRES
 from .r2_residency_sparse import (DUP, EVICT, EVICT_INFL, FIRST, GRANT, HOLE, INFL, PIN, READY,  # noqa: F401
-                                   REFUSED, _first_in_group, unpack_bits)
+                                   REFUSED, _first_in_group)
 
 DEM_D, DEM_V = 1, 2          # demand bits: "draft", "verify" (Transfer.demand)
 ISS_D, ISS_V = 1, 2          # issuer (Transfer.kind)
@@ -74,22 +80,24 @@ ARRAYS = ("pin_w", "owner", "key_rd", "rel_q", "kcancel", "hist_from", "hist_id"
 
 
 class Table:
-    """B2's state (module docstring). Host CPU tensors (the ops are device-agnostic torch)."""
+    """B2's state (module docstring), on one device."""
 
-    def __init__(self, geo: Geo):
+    def __init__(self, geo: Geo, device="cpu"):
         if geo.KEYS < 1 or geo.KEYS > 7:
             raise ValueError("KEYS must be 1..7, got %d" % geo.KEYS)
         self.geo = geo
+        self.dev = torch.device(device)
+        d = self.dev
         sh = (geo.L, geo.B, geo.H, geo.NPOS)
-        self.c: Dict[str, torch.Tensor] = {n: torch.full(sh, v, dtype=d) for (n, d, v) in SLOT_COLS}
-        self.pin_w = torch.zeros((2 * geo.KEYS, geo.L, geo.B, geo.H, geo.WB), dtype=torch.int64)
-        self.owner = torch.full((geo.B,), -1, dtype=torch.int32)
-        self.key_rd = torch.full((geo.L, geo.B, geo.KEYS), -1, dtype=torch.int64)
-        self.rel_q = torch.zeros((geo.L, geo.B, geo.KEYS), dtype=torch.bool)
-        self.kcancel = torch.zeros((geo.B, geo.KEYS), dtype=torch.bool)
-        self.hist_from = torch.full((geo.B,), 1 << 40, dtype=torch.int64)     # no T4 check until begin_request
-        self.hist_id = torch.full((geo.B, geo.NBLK), -1, dtype=torch.int64)
-        self.xfer = torch.zeros((geo.B, geo.L, geo.H, geo.NBLK), dtype=torch.int32)
+        self.c: Dict[str, torch.Tensor] = {n: torch.full(sh, v, dtype=t, device=d) for (n, t, v) in SLOT_COLS}
+        self.pin_w = torch.zeros((2 * geo.KEYS, geo.L, geo.B, geo.H, geo.WB), dtype=torch.int64, device=d)
+        self.owner = torch.full((geo.B,), -1, dtype=torch.int32, device=d)
+        self.key_rd = torch.full((geo.L, geo.B, geo.KEYS), -1, dtype=torch.int64, device=d)
+        self.rel_q = torch.zeros((geo.L, geo.B, geo.KEYS), dtype=torch.bool, device=d)
+        self.kcancel = torch.zeros((geo.B, geo.KEYS), dtype=torch.bool, device=d)
+        self.hist_from = torch.full((geo.B,), 1 << 40, dtype=torch.int64, device=d)   # no T4 check until begin_request
+        self.hist_id = torch.full((geo.B, geo.NBLK), -1, dtype=torch.int64, device=d)
+        self.xfer = torch.zeros((geo.B, geo.L, geo.H, geo.NBLK), dtype=torch.int32, device=d)
         self.clock = 1
 
     def tensors(self) -> Dict[str, torch.Tensor]:
@@ -105,13 +113,18 @@ class Table:
         self.clock = other.clock
 
     def clone(self) -> "Table":
-        t = Table(self.geo)
+        t = Table(self.geo, self.dev)
+        t.copy_from(self)
+        return t
+
+    def to(self, device) -> "Table":
+        t = Table(self.geo, device)
         t.copy_from(self)
         return t
 
     def diff(self, other: "Table") -> List[str]:
         mine, theirs = self.tensors(), other.tensors()
-        out = [n for n in mine if not torch.equal(mine[n], theirs[n])]
+        out = [n for n in mine if not torch.equal(mine[n], theirs[n].to(mine[n].device))]
         if self.clock != other.clock:
             out.append("clock")
         return out
@@ -129,7 +142,7 @@ class Undo:
     def put(self, t: torch.Tensor, idx: torch.Tensor, val) -> None:
         """t[idx] = val on a flat (contiguous) view t; idx must not repeat with different values."""
         self.log.append((t, idx, t[idx].clone()))
-        t[idx] = val.to(t.dtype) if torch.is_tensor(val) else torch.tensor(val, dtype=t.dtype)
+        t[idx] = val.to(t.dtype) if torch.is_tensor(val) else val
 
     def call(self, restore: Callable[[], None]) -> None:
         self.log.append((None, None, restore))
@@ -147,43 +160,66 @@ def _put(undo: Optional[Undo], t: torch.Tensor, idx: torch.Tensor, val) -> None:
     if undo is not None:
         undo.put(t, idx, val)
     else:
-        t[idx] = val.to(t.dtype) if torch.is_tensor(val) else torch.tensor(val, dtype=t.dtype)
+        t[idx] = val.to(t.dtype) if torch.is_tensor(val) else val
+
+
+def unpack_words(words: torch.Tensor, n: int) -> torch.Tensor:
+    """(..., W) int64 32-bit words -> (..., n) bool on the words' device (sparse.py unpack_bits is host-only)."""
+    sh = torch.arange(WBITS, dtype=torch.int64, device=words.device)
+    bits = torch.bitwise_and(torch.bitwise_right_shift(words.unsqueeze(-1), sh), 1) != 0
+    return bits.reshape(*words.shape[:-1], -1)[..., :n]
 
 
 # ---------------------------------------------------------------------------------------------------- readers
 class ReaderWindow:
     """Reader event ids (rev 2 section 0.1 (1)). register() gives every read_done call (res.py:743-761) the next id;
     refresh() asks each LIVE event object (ev_done, kstep/backend.py:27-34), so completion in any order is exact; ids
-    below lo are complete. mark: E's mark of the id (tick x L + layer), for issue_desc's reader_marks."""
+    below lo are complete. mark: E's mark of the id (tick x L + layer), for issue_desc's reader_marks. The host mirror
+    (win_c, mark_c) is the truth; the device copy is uploaded once per change (_sync)."""
 
-    def __init__(self, cap: int = 1 << 14):
+    def __init__(self, cap: int = 1 << 14, device="cpu"):
         self.cap = int(cap)
         self.lo = 0
         self.next = 0
-        self.win = torch.zeros(self.cap, dtype=torch.bool)
-        self.mark = torch.full((self.cap,), -1, dtype=torch.int64)
+        self.dev = torch.device(device)
+        self.win_c = torch.zeros(self.cap, dtype=torch.bool)
+        self.mark_c = torch.full((self.cap,), -1, dtype=torch.int64)
         self.events: Dict[int, object] = {}
+        if self.dev.type == "cpu":
+            self.win, self.mark = self.win_c, self.mark_c
+        else:
+            self.win, self.mark = self.win_c.to(self.dev), self.mark_c.to(self.dev)
+        self._dirty = False
+
+    def _sync(self) -> None:
+        if self._dirty and self.dev.type != "cpu":
+            self.win.copy_(self.win_c)
+            self.mark.copy_(self.mark_c)
+        self._dirty = False
 
     def register(self, ev, mark: int) -> int:
         e = self.next
         if e - self.lo >= self.cap:
             raise CapacityRefusal("B2 reader window: %d live reader events >= cap %d" % (e - self.lo, self.cap))
         i = e % self.cap
-        self.win[i] = False
-        self.mark[i] = int(mark)
+        self.win_c[i] = False
+        self.mark_c[i] = int(mark)
         self.events[e] = ev
         self.next += 1
+        self._dirty = True
         return e
 
     def refresh(self, ev_done: Callable[[object], bool]) -> int:
         """Ask every live event; returns the number of live events after the refresh."""
         for e in range(self.lo, self.next):
             i = e % self.cap
-            if not bool(self.win[i]) and ev_done(self.events.get(e)):
-                self.win[i] = True
-        while self.lo < self.next and bool(self.win[self.lo % self.cap]):
+            if not bool(self.win_c[i]) and ev_done(self.events.get(e)):
+                self.win_c[i] = True
+                self._dirty = True
+        while self.lo < self.next and bool(self.win_c[self.lo % self.cap]):
             self.events.pop(self.lo, None)
             self.lo += 1
+        self._sync()
         return self.next - self.lo
 
     def wait(self, e: int, host_wait: Callable[[object], None], ev_done: Callable[[object], bool]) -> None:
@@ -193,9 +229,12 @@ class ReaderWindow:
         ev = self.events.get(e)
         host_wait(ev)
         if ev_done(ev):
-            self.win[e % self.cap] = True
+            self.win_c[e % self.cap] = True
+            self._dirty = True
+        self._sync()
 
     def done_of(self, ids: torch.Tensor) -> torch.Tensor:
+        self._sync()
         i = ids.remainder(self.cap)
         return (ids < self.lo) | ((ids < self.next) & self.win[i])
 
@@ -233,31 +272,35 @@ def owner_of_slots(T: Table) -> torch.Tensor:
 
 def slot_of(T: Table, with_counts: bool = False):
     """(S, NBLK) int32: the slot of each block that is RESIDENT (LRU / PO / VRES) or IN FLIGHT FOR THE CURRENT OWNER
-    (rev 2 I1: res.py:453, own.py:266-267), else -1. with_counts: also (S, NBLK) int16 counts (I1: at most 1)."""
+    (rev 2 I1: res.py:453, own.py:266-267), else -1. with_counts: also (S, NBLK) int32 counts (I1: at most 1)."""
     g = T.geo
+    d = T.dev
     code = T.c["code"]
     res = (code == C_LRU) | (code == C_PO) | (code == C_VRES)
     m = res | ((code == C_INFLIGHT) & owner_of_slots(T))
     blk = T.c["block"].view(g.S, g.NPOS).to(torch.int64).clamp(min=0)
-    base = torch.arange(g.S, dtype=torch.int64).view(g.S, 1) * g.NBLK
+    base = torch.arange(g.S, dtype=torch.int64, device=d).view(g.S, 1) * g.NBLK
     dummy = g.S * g.NBLK
     flat = torch.where(m.view(g.S, g.NPOS), base + blk, torch.full_like(blk, dummy)).view(-1)
-    so = torch.full((dummy + 1,), -1, dtype=torch.int32)
-    so[flat] = torch.arange(g.NPOS, dtype=torch.int32).repeat(g.S)
+    so = torch.full((dummy + 1,), -1, dtype=torch.int32, device=d)
+    so[flat] = torch.arange(g.NPOS, dtype=torch.int32, device=d).repeat(g.S)
     if not with_counts:
         return so[:dummy].view(g.S, g.NBLK)
-    cnt = torch.zeros((dummy + 1,), dtype=torch.int16).index_add_(0, flat, torch.ones_like(flat, dtype=torch.int16))
+    cnt = torch.zeros((dummy + 1,), dtype=torch.int32, device=d).index_add_(
+        0, flat, torch.ones_like(flat, dtype=torch.int32))
     return so[:dummy].view(g.S, g.NBLK), cnt[:dummy].view(g.S, g.NBLK)
 
 
 # ---------------------------------------------------------------------------------------------------- poll
 def evict_over_c(T: Table, streams: torch.Tensor, anyw: torch.Tensor, undo: Optional[Undo] = None,
-                 mut: Optional[Dict] = None) -> Dict[str, int]:
+                 mut: Optional[Dict] = None) -> Dict[str, torch.Tensor]:
     """K1 (own.py:280-303): while a stream's LRU holds more than C, the least recent entry leaves: a pinned one becomes
     PO (it keeps its slot, K3), an unpinned one is released (readers kept). Only the given streams; only those over C
-    are sorted (a top-k of their few victims). mut: "evict_po_unpinned" (NEGATIVE CONTROL) makes every victim PO."""
+    are sorted (a top-k of their few victims). mut: "evict_po_unpinned" (NEGATIVE CONTROL) makes every victim PO.
+    Host reads: bool(any) (the early exit) and int(max) (the top-k width)."""
     g = T.geo
-    out = dict(evict_po=0, evict_rel=0)
+    zero = torch.zeros((), dtype=torch.int64, device=T.dev)
+    out = dict(evict_po=zero, evict_rel=zero)
     if streams.numel() == 0:
         return out
     code2 = T.c["code"].view(g.S, g.NPOS)
@@ -272,7 +315,7 @@ def evict_over_c(T: Table, streams: torch.Tensor, anyw: torch.Tensor, undo: Opti
     key = torch.where(code2[so] == C_LRU, st, torch.full_like(st, BIG))
     m = int(ex.max())
     _, slots = torch.topk(key, m, dim=1, largest=False)
-    take = torch.arange(m).view(1, m) < ex.view(-1, 1)
+    take = torch.arange(m, device=T.dev).view(1, m) < ex.view(-1, 1)
     vs = slots[take]
     vss = so.view(-1, 1).expand(-1, m)[take]
     fv = vss * g.NPOS + vs
@@ -281,8 +324,8 @@ def evict_over_c(T: Table, streams: torch.Tensor, anyw: torch.Tensor, undo: Opti
     if mut and mut.get("evict_po_unpinned"):
         pinned = torch.ones_like(pinned)
     _put(undo, T.flat("code"), fv, torch.where(pinned, torch.full_like(blk, C_PO), torch.full_like(blk, C_RELEASING)))
-    out["evict_po"] = int(pinned.sum())
-    out["evict_rel"] = int((~pinned).sum())
+    out["evict_po"] = pinned.sum()
+    out["evict_rel"] = (~pinned).sum()
     return out
 
 
@@ -299,7 +342,7 @@ def force_seq(T: Table, tick: int, landed_upto: int, lag: Optional[int]) -> int:
 
 
 def poll_arrivals(T: Table, tick: int, landed_upto: int, lag: Optional[int], undo: Optional[Undo] = None,
-                  mut: Optional[Dict] = None) -> Dict[str, int]:
+                  mut: Optional[Dict] = None) -> Dict:
     """K3X _poll's arrival half (res.py:245-264) with E's job watermark: a slot landed IN PLACE by the main stream (an
     urgent gather, `landed`) is admitted at once (res.py:258-259 skips the arrival rule for it); a transport transfer
     (seq <= landed_upto) is admitted under the arrival rule (lag: at issue_tick + lag exactly, res.py:265-282; landed
@@ -311,15 +354,17 @@ def poll_arrivals(T: Table, tick: int, landed_upto: int, lag: Optional[int], und
       (drop_vres_unprotected). seq := -1.
     mut: "keep_rd_last_on_drop" (NEGATIVE CONTROL: the two resets are skipped)."""
     g = T.geo
+    d = T.dev
     code = T.flat("code")
     infl = code == C_INFLIGHT
     seq = T.flat("seq")
     landed = T.flat("landed")
     tport = infl & ~landed & (seq <= landed_upto)                     # landed by the transport
-    out = dict(admitted=0, admit_lru=0, admit_vres=0, drop_unowned=0, drop_vres_unprotected=0, held=0)
+    zero = torch.zeros((), dtype=torch.int64, device=d)
+    out = dict(admitted=0, admit_lru=zero, admit_vres=zero, drop_unowned=zero, drop_vres_unprotected=zero, held=zero)
     if lag is not None:
         due = infl & ~landed & (T.flat("issue_tick").to(torch.int64) + lag <= tick)
-        out["held"] = int((tport & ~due).sum())
+        out["held"] = (tport & ~due).sum()
         if bool((due & ~tport).any()):
             raise CapacityRefusal("B2 poll: a transfer due at tick %d has not landed (force_seq first)" % tick)
         tport = tport & due
@@ -347,22 +392,23 @@ def poll_arrivals(T: Table, tick: int, landed_upto: int, lag: Optional[int], und
     fl = f[to_lru]
     if fl.numel():
         order = torch.argsort(old_stamp[to_lru], stable=True)          # per stream the issue order (take stamps)
-        _put(undo, T.flat("stamp"), fl[order], torch.arange(fl.numel(), dtype=torch.int64) + T.clock)
+        _put(undo, T.flat("stamp"), fl[order], torch.arange(fl.numel(), dtype=torch.int64, device=d) + T.clock)
         T.clock += int(fl.numel())
         out.update(evict_over_c(T, torch.unique(s[to_lru]), any_pin_words(T), undo))
     out["admitted"] = int(f.numel())
-    out["admit_lru"] = int(to_lru.sum())
-    out["admit_vres"] = int(to_vres.sum())
-    out["drop_unowned"] = int(dropped.sum())
-    out["drop_vres_unprotected"] = int((to_rel & ~dropped).sum())
+    out["admit_lru"] = to_lru.sum()
+    out["admit_vres"] = to_vres.sum()
+    out["drop_unowned"] = dropped.sum()
+    out["drop_vres_unprotected"] = (to_rel & ~dropped).sum()
     return out
 
 
-def drop_due_keys(T: Table, win: ReaderWindow, undo: Optional[Undo] = None) -> Dict[str, int]:
+def drop_due_keys(T: Table, win: ReaderWindow, undo: Optional[Undo] = None) -> Dict:
     """The queued reference releases whose (key, l) reader completed (res.py:283-297 middle part, _drop :298-305,
     Stream.unprotect own.py:213-237): both kind planes of the key slot are cleared at (l, b); PO / VRES slots of those
     streams with no pin bit left -> RELEASING (readers kept)."""
     g = T.geo
+    d = T.dev
     due = T.rel_q & win.done_of(T.key_rd)
     out = dict(keys_dropped=0, unprotect_rel=0)
     if not bool(due.any()):
@@ -376,15 +422,15 @@ def drop_due_keys(T: Table, win: ReaderWindow, undo: Optional[Undo] = None) -> D
         pw[planes, l_i, b_i] = 0
     _put(undo, T.rel_q.view(-1), (l_i * g.B + b_i) * g.KEYS + k_i, False)
     lb = torch.unique(l_i * g.B + b_i)
-    streams = (lb.view(-1, 1) * g.H + torch.arange(g.H).view(1, -1)).view(-1)
+    streams = (lb.view(-1, 1) * g.H + torch.arange(g.H, device=d).view(1, -1)).view(-1)
     rows = T.c["code"].view(g.S, g.NPOS)[streams]
     pv = (rows == C_PO) | (rows == C_VRES)
     blk = T.c["block"].view(g.S, g.NPOS)[streams].to(torch.int64).clamp(min=0)
     pinned = bit_test(any_pin_words(T), streams.view(-1, 1).expand_as(blk), blk)
     rel = pv & ~pinned
-    f = (streams.view(-1, 1) * g.NPOS + torch.arange(g.NPOS).view(1, -1))[rel]
+    f = (streams.view(-1, 1) * g.NPOS + torch.arange(g.NPOS, device=d).view(1, -1))[rel]
     _put(undo, T.flat("code"), f, C_RELEASING)
-    out["keys_dropped"] = int(due.sum())
+    out["keys_dropped"] = int(l_i.numel())
     out["unprotect_rel"] = int(f.numel())
     return out
 
@@ -405,7 +451,7 @@ def poll_releases(T: Table, win: ReaderWindow, undo: Optional[Undo] = None) -> i
 # ---------------------------------------------------------------------------------------------------- apply: parse
 class Rows(NamedTuple):
     """The tick's rows (the same for every layer): batch slot and key slot of each verify / draft row; k entries per
-    (row, head)."""
+    (row, head). The tensors live on the table's device."""
     vb: torch.Tensor
     vk: torch.Tensor
     db: torch.Tensor
@@ -417,6 +463,7 @@ def parse(T: Table, layers: List[Dict], rows: Rows) -> Dict[str, Dict[str, torch
     """C's per-layer records (note 12l: vrec (9, n) = VREC fields, drec (5, n) = DREC fields) -> two flat record sets
     with the layer, the row j = o // (H k), the head (o // k) % H, the batch slot, the key slot and the stream s."""
     g = T.geo
+    d = T.dev
     out = {}
     for part, name, nf, rb, rk in (("V", "vrec", 9, rows.vb, rows.vk), ("D", "drec", 5, rows.db, rows.dk)):
         recs = [x[name] for x in layers if x.get(name) is not None]
@@ -425,18 +472,18 @@ def parse(T: Table, layers: List[Dict], rows: Rows) -> Dict[str, Dict[str, torch
             out[part] = None
             continue
         R = torch.cat(recs, 1)
-        n = torch.tensor([r.shape[1] for r in recs], dtype=torch.int64)
-        l = torch.repeat_interleave(torch.tensor(ls, dtype=torch.int64), n)
+        n = torch.tensor([r.shape[1] for r in recs], dtype=torch.int64, device=d)
+        l = torch.repeat_interleave(torch.tensor(ls, dtype=torch.int64, device=d), n, output_size=int(R.shape[1]))
         o = R[0]
         j = torch.div(o, g.H * rows.k, rounding_mode="floor")
         h = torch.div(o, rows.k, rounding_mode="floor").remainder(g.H)
         b = rb[j]
-        d = dict(l=l, j=j, h=h, b=b, key=rk[j], s=(l * g.B + b) * g.H + h, o=o, blk=R[1], flags=R[2], slot=R[3])
+        dd = dict(l=l, j=j, h=h, b=b, key=rk[j], s=(l * g.B + b) * g.H + h, o=o, blk=R[1], flags=R[2], slot=R[3])
         if part == "V":
-            d.update(infl_slot=R[4], infl_gen=R[5], rslot=R[6], take_slot=R[7], evict_blk=R[8])
+            dd.update(infl_slot=R[4], infl_gen=R[5], rslot=R[6], take_slot=R[7], evict_blk=R[8])
         else:
-            d.update(take_slot=R[4])
-        out[part] = d
+            dd.update(take_slot=R[4])
+        out[part] = dd
     return out
 
 
@@ -476,7 +523,7 @@ def k5_events(P: Dict, T: Table) -> Dict[str, torch.Tensor]:
         cols["kind"].append(kind[idx])
         cols["part"].append(torch.full_like(idx, part))
         cols["src"].append(idx)
-    ev = {n: torch.cat(v) if v else torch.zeros(0, dtype=torch.int64) for n, v in cols.items()}
+    ev = {n: torch.cat(v) if v else torch.zeros(0, dtype=torch.int64, device=T.dev) for n, v in cols.items()}
     if ev["o"].numel():
         order = torch.argsort((ev["l"] * 2 + ev["part"]) * (1 << 40) + ev["o"], stable=True)
         ev = {n: v[order] for n, v in ev.items()}
@@ -523,7 +570,8 @@ def take_checks(T: Table, ev: Dict[str, torch.Tensor], so: torch.Tensor) -> Dict
     tk = ev["kind"] != 2
     blk = ev["blk"].clamp(min=0)
     owned = (so.view(-1)[ev["s"] * T.geo.NBLK + blk] >= 0) & tk
-    key = torch.where(tk, ev["s"] * T.geo.NBLK + blk, torch.full_like(blk, BIG) + torch.arange(blk.numel()))
+    key = torch.where(tk, ev["s"] * T.geo.NBLK + blk,
+                      torch.full_like(blk, BIG) + torch.arange(blk.numel(), device=T.dev))
     twice = ~_first_in_group(key) & tk if key.numel() else tk
     t4 = (ev["blk"] >= T.hist_from[ev["b"]]) & (T.hist_id[ev["b"], blk] < 0)
     return dict(dedup=owned, take_twice=twice, t4=t4)
@@ -543,12 +591,15 @@ def ready_check(T: Table, D: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]
     return dict(ready=r & ~ok)
 
 
-def merge_check(T: Table, P: Dict, so: torch.Tensor, ev: Dict[str, torch.Tensor]) -> Tuple[Dict, torch.Tensor, torch.Tensor]:
+def merge_check(T: Table, P: Dict, so: torch.Tensor, ev: Dict[str, torch.Tensor],
+                check: bool = True) -> Tuple[Dict, torch.Tensor, torch.Tensor]:
     """The in-flight merges (res.py:605-611, :672-674): a verify INFL record names the current owner's INFLIGHT slot
     and generation; a DUP record names the slot an earlier record of this tick took for the same (stream, block); a
     draft INFL record's slot is the current owner's in-flight slot (B2's slot_of, or a verify take of this tick).
-    Returns (failing masks, the verify merge slots (flat), the draft merge slots (flat))."""
+    Returns (failing masks, the verify merge slots (flat), the draft merge slots (flat)). check False (the UNCHECKED
+    mode): the merge targets only (the write needs them), no masks."""
     g = T.geo
+    d = T.dev
     out = {}
     V, D = P["V"], P["D"]
     tk = ev["kind"] != 2
@@ -563,29 +614,31 @@ def merge_check(T: Table, P: Dict, so: torch.Tensor, ev: Dict[str, torch.Tensor]
         i = torch.searchsorted(srt, key).clamp(max=srt.numel() - 1)
         return torch.where(srt[i] == key, tslot[i], torch.full_like(key, -1))
 
-    fv = torch.zeros(0, dtype=torch.int64)
+    fv = torch.zeros(0, dtype=torch.int64, device=d)
     if V is not None:
         mi = has(V["flags"], INFL)
         sl = V["infl_slot"].clamp(min=0, max=g.NPOS - 1)
         f = V["s"] * g.NPOS + sl
-        ok = (V["infl_slot"] >= 0) & (T.flat("code")[f] == C_INFLIGHT) \
-            & (T.flat("block")[f].to(torch.int64) == V["blk"]) & (T.flat("gen")[f].to(torch.int64) == V["infl_gen"]) \
-            & (T.flat("uid")[f] == T.owner[V["b"]])
         md = has(V["flags"], DUP)
-        want = this_tick(V["s"] * g.NBLK + V["blk"].clamp(min=0))
-        okd = (want >= 0) & (want == V["rslot"])
-        out["v_merge"] = mi & ~ok
-        out["v_dup"] = md & ~okd
+        if check:
+            ok = (V["infl_slot"] >= 0) & (T.flat("code")[f] == C_INFLIGHT) \
+                & (T.flat("block")[f].to(torch.int64) == V["blk"]) \
+                & (T.flat("gen")[f].to(torch.int64) == V["infl_gen"]) & (T.flat("uid")[f] == T.owner[V["b"]])
+            want = this_tick(V["s"] * g.NBLK + V["blk"].clamp(min=0))
+            okd = (want >= 0) & (want == V["rslot"])
+            out["v_merge"] = mi & ~ok
+            out["v_dup"] = md & ~okd
         fv = torch.cat([f[mi], (V["s"] * g.NPOS + V["rslot"].clamp(min=0))[md]])
-    fd = torch.zeros(0, dtype=torch.int64)
+    fd = torch.zeros(0, dtype=torch.int64, device=d)
     if D is not None:
         mi = has(D["flags"], INFL)
         key = D["s"] * g.NBLK + D["blk"].clamp(min=0)
         sl = so.view(-1)[key].to(torch.int64)
         sl2 = torch.where(sl >= 0, sl, this_tick(key))
         f = D["s"] * g.NPOS + sl2.clamp(min=0)
-        ok = (sl2 >= 0) & ((sl >= 0) & (T.flat("code")[f] == C_INFLIGHT) | (sl < 0))
-        out["d_merge"] = mi & ~ok
+        if check:
+            ok = (sl2 >= 0) & ((sl >= 0) & (T.flat("code")[f] == C_INFLIGHT) | (sl < 0))
+            out["d_merge"] = mi & ~ok
         fd = f[mi]
     return out, fv, fd
 
@@ -629,15 +682,15 @@ def policy_e_check(T: Table, ev: Dict[str, torch.Tensor], P: Dict, sel_w: torch.
     rr = r.clamp(max=g.NPOS - 1)
     exp = cand[row, rr]
     val = vals[row, rr]
-    E_ = {n: ev[n][pe] for n in ("take_slot", "blk")}
-    infl_flag = torch.zeros_like(s, dtype=torch.bool)
     V = P["V"]
     if V is not None:
         infl_flag = has(V["flags"][ev["src"][pe]], EVICT_INFL)
         evb = V["evict_blk"][ev["src"][pe]]
     else:
+        infl_flag = torch.zeros_like(s, dtype=torch.bool)
         evb = torch.full_like(s, -1)
-    ok = (r < g.NPOS) & (val < BIG) & (exp == E_["take_slot"]) & (blk[row, exp] == evb) & (infl_flag == (val >= HALF))
+    ok = (r < g.NPOS) & (val < BIG) & (exp == ev["take_slot"][pe]) & (blk[row, exp] == evb) \
+        & (infl_flag == (val >= HALF))
     bad = torch.zeros_like(pe)
     bad[pe] = ~ok
     out["policy_e"] = bad
@@ -678,6 +731,7 @@ def write_takes(T: Table, ev: Dict[str, torch.Tensor], tick: int, job_seq: int, 
     :363-388): a pending last reader is counted as a host wait. Returns the issue list (E's desc rows) and flags.
     mut: "gen_plus_two" / "drop_rd_last" (NEGATIVE CONTROLS)."""
     g = T.geo
+    d = T.dev
     tk = ev["kind"] != 2
     idx = tk.nonzero().squeeze(1)
     E_ = {n: v[idx] for n, v in ev.items()}
@@ -687,21 +741,21 @@ def write_takes(T: Table, ev: Dict[str, torch.Tensor], tick: int, job_seq: int, 
     pe = E_["kind"] == 1
     rd_old = T.flat("rd_last")[f].clone()
     c_old = T.flat("code")[f]
-    force_waits = int((pe & (c_old == C_LRU) & ~win.done_of(rd_old)).sum())    # _evict_now's host wait
-    superseded = int((pe & (c_old == C_INFLIGHT)).sum())                       # _evict_inflight: the device waits
+    force_waits = (pe & (c_old == C_LRU) & ~win.done_of(rd_old)).sum()     # _evict_now's host wait
+    superseded = (pe & (c_old == C_INFLIGHT)).sum()                         # _evict_inflight: the device waits
     gen_new = T.flat("gen")[f].to(torch.int64) + (2 if (mut and mut.get("gen_plus_two")) else 1)
     _put(undo, T.flat("code"), f, C_INFLIGHT)
     _put(undo, T.flat("block"), f, E_["blk"])
     _put(undo, T.flat("gen"), f, gen_new)
     _put(undo, T.flat("uid"), f, T.owner[E_["b"]])
     _put(undo, T.flat("cls"), f, torch.where(isv, torch.full_like(f, CLS_V), torch.full_like(f, CLS_AD)))
-    _put(undo, T.flat("stamp"), f, torch.arange(n, dtype=torch.int64) + T.clock)
+    _put(undo, T.flat("stamp"), f, torch.arange(n, dtype=torch.int64, device=d) + T.clock)
     T.clock += n
     _put(undo, T.flat("rd_first"), f, -1)
     if mut and mut.get("drop_rd_last"):
         _put(undo, T.flat("rd_last"), f, -1)
-    _put(undo, T.flat("seq"), f, torch.full_like(f, job_seq))
-    _put(undo, T.flat("issue_tick"), f, torch.full_like(f, tick))
+    _put(undo, T.flat("seq"), f, job_seq)
+    _put(undo, T.flat("issue_tick"), f, tick)
     _put(undo, T.flat("demand"), f, torch.where(isv, torch.full_like(f, DEM_V), torch.full_like(f, DEM_D)))
     _put(undo, T.flat("issuer"), f, torch.where(isv, torch.full_like(f, ISS_V), torch.full_like(f, ISS_D)))
     _put(undo, T.flat("req_key"), f, E_["key"])
@@ -726,17 +780,20 @@ def write_merges(T: Table, fv: torch.Tensor, fd: torch.Tensor, undo: Optional[Un
 
 
 def recency(T: Table, D: Dict[str, torch.Tensor], rows: Rows, undo: Optional[Undo] = None,
-            mut: Optional[Dict] = None) -> Dict[str, int]:
+            mut: Optional[Dict] = None) -> Dict:
     """K1 / O1 (_draft_recency res.py:686-706): per draft row IN ORDER, its READY records in ascending block order (the
     record order): an LRU slot is touched (to MRU), a PO / VRES slot is acquired (-> LRU at MRU, own.py:305-321), any
     other state is a violation; then evict_to_c for that row's streams (own.py:297-303). Rows of different requests are
     independent, so ROUND r = the r-th draft row of each request (rev 2 point (2)); R2's planner gives one round
-    (core.py:157-164). Must run AFTER the tick's pins (evict_to_c tests the protection then).
+    (core.py:157-164). Must run AFTER the tick's pins (evict_to_c tests the protection then). The counts (touch,
+    acquire, evict_po, evict_rel) equal the vendored journal's (B2 reports them; rev 2 0.1 (2)).
     mut: "reverse_stamps" (NEGATIVE CONTROL); "one_batch" (all rows' touches, then one eviction: a REPORT variant. With
     the pins fixed during the recency and every read block pinned by phase A (res.py:668), it reaches the SAME end
     state: the final LRU is the C largest final stamps either way, and the rounds' extra victims are re-acquired.)"""
     g = T.geo
-    out = dict(rounds=0, touch=0, acquire=0, bad=0, evict_po=0, evict_rel=0)
+    d = T.dev
+    zero = torch.zeros((), dtype=torch.int64, device=d)
+    out = dict(rounds=0, touch=zero, acquire=zero, bad=zero, evict_po=zero, evict_rel=zero)
     if D is None or rows.db.numel() == 0:
         return out
     occ = rank_in_group(rows.db, torch.ones_like(rows.db, dtype=torch.bool))
@@ -750,57 +807,67 @@ def recency(T: Table, D: Dict[str, torch.Tensor], rows: Rows, undo: Optional[Und
         f = (D["s"][m] * g.NPOS + D["slot"][m].clamp(min=0))
         c0 = T.flat("code")[f]
         acq = (c0 == C_PO) | (c0 == C_VRES)
-        out["bad"] += int((~acq & (c0 != C_LRU)).sum())
+        out["bad"] = out["bad"] + (~acq & (c0 != C_LRU)).sum()
         _put(undo, T.flat("code"), f[acq], C_LRU)
-        sv = torch.arange(f.numel(), dtype=torch.int64) + T.clock
+        sv = torch.arange(f.numel(), dtype=torch.int64, device=d) + T.clock
         if mut and mut.get("reverse_stamps"):
             sv = sv.flip(0)                                         # NEGATIVE CONTROL: O1's ascending order lost
         _put(undo, T.flat("stamp"), f, sv)
         T.clock += int(f.numel())
-        out["touch"] += int((c0 == C_LRU).sum())
-        out["acquire"] += int(acq.sum())
+        out["touch"] = out["touch"] + (c0 == C_LRU).sum()
+        out["acquire"] = out["acquire"] + acq.sum()
         sel_rows = rows.db if one else rows.db[occ == r0]
-        streams = ((torch.arange(g.L).view(-1, 1, 1) * g.B + sel_rows.view(1, -1, 1)) * g.H
-                   + torch.arange(g.H).view(1, 1, -1)).reshape(-1)
+        streams = ((torch.arange(g.L, device=d).view(-1, 1, 1) * g.B + sel_rows.view(1, -1, 1)) * g.H
+                   + torch.arange(g.H, device=d).view(1, 1, -1)).reshape(-1)
         if one:
             streams = torch.unique(streams)
         e = evict_over_c(T, streams, any_pin_words(T), undo, mut)
-        out["evict_po"] += e["evict_po"]
-        out["evict_rel"] += e["evict_rel"]
+        out["evict_po"] = out["evict_po"] + e["evict_po"]
+        out["evict_rel"] = out["evict_rel"] + e["evict_rel"]
         out["rounds"] += 1
     return out
 
 
 # ---------------------------------------------------------------------------------------------------- post checks
-def post_checks(T: Table, gen_before: Optional[torch.Tensor], n_takes: int) -> Dict[str, bool]:
+POST_CHECKS = ("I1", "I2", "I3", "I9", "K5sum")
+
+
+def post_checks(T: Table, gen_before: Optional[torch.Tensor], n_takes: int,
+                which=POST_CHECKS) -> Dict[str, torch.Tensor]:
     """POST-WRITE predicates (rev 2 section 3.3): I1 (resident + current-owner INFLIGHT at most 1 per block), I2 (LRU <=
-    C), I3 (PO / VRES pinned), I9 (gen changes only at the takes, by +1), the K5 sum (borrowed <= X per layer). True =
-    the predicate FAILS."""
+    C), I3 (PO / VRES pinned), I9 (gen changes only at the takes, by +1; needs gen_before), the K5 sum (borrowed <= X per
+    layer). Each is a 0-dim bool tensor, True = the predicate FAILS (the caller reads them together: one host read).
+    which: the subset to compute (the poll checks I1 and I2 only)."""
     g = T.geo
-    _, cnt = slot_of(T, with_counts=True)
     code2 = T.c["code"].view(g.S, g.NPOS)
-    out = dict(I1=bool((cnt > 1).any()), I2=bool(((code2 == C_LRU).sum(1) > g.C).any()))
-    pv = ((code2 == C_PO) | (code2 == C_VRES)).view(-1).nonzero().squeeze(1)
-    s = torch.div(pv, g.NPOS, rounding_mode="floor")
-    out["I3"] = bool((~bit_test(any_pin_words(T), s, T.flat("block")[pv].to(torch.int64).clamp(min=0))).any()) \
-        if pv.numel() else False
-    if gen_before is not None:
-        d = T.flat("gen").to(torch.int64) - gen_before.view(-1).to(torch.int64)
-        out["I9"] = bool(((d != 0) & (d != 1)).any()) or int((d != 0).sum()) != n_takes
-    usage = g.NPOS - (code2 == C_FREE).sum(1)
-    out["K5sum"] = bool(((usage - g.C).clamp(min=0).view(g.L, -1).sum(1) > g.X).any())
+    out = {}
+    if "I1" in which:
+        _, cnt = slot_of(T, with_counts=True)
+        out["I1"] = (cnt > 1).any()
+    if "I2" in which:
+        out["I2"] = ((code2 == C_LRU).sum(1) > g.C).any()
+    if "I3" in which:
+        pv = ((code2 == C_PO) | (code2 == C_VRES)).view(-1).nonzero().squeeze(1)
+        s = torch.div(pv, g.NPOS, rounding_mode="floor")
+        out["I3"] = (~bit_test(any_pin_words(T), s, T.flat("block")[pv].to(torch.int64).clamp(min=0))).any()
+    if "I9" in which and gen_before is not None:
+        dg = T.flat("gen").to(torch.int64) - gen_before.view(-1).to(torch.int64)
+        out["I9"] = ((dg != 0) & (dg != 1)).any() | ((dg != 0).sum() != n_takes)
+    if "K5sum" in which:
+        usage = g.NPOS - (code2 == C_FREE).sum(1)
+        out["K5sum"] = ((usage - g.C).clamp(min=0).view(g.L, -1).sum(1) > g.X).any()
     return out
 
 
 # ---------------------------------------------------------------------------------------------------- readers, metrics
 def read_done(T: Table, vread: torch.Tensor, D: Optional[Dict[str, torch.Tensor]], rows: Rows,
-              e_l: torch.Tensor) -> Dict[str, int]:
+              e_l: torch.Tensor) -> Dict:
     """The layers' reader events (res.py:743-761): every slot a row read gets rd_first (if none) and rd_last := the
     layer's event id e_l[l]; the verify reads come from vread (L, B, H, WP) words, the draft reads from the READY
     records; the rows' keys get key_rd; the verify keys' (key, l) are queued (rel_q) behind the reader. The 4.8
     lifetime counts rv_n / rd_n count the reads (once per layer for the verify reads, as B1)."""
     g = T.geo
-    vb = unpack_bits(vread, g.NPOS).reshape(g.L, g.B, g.H, g.NPOS)
+    vb = unpack_words(vread, g.NPOS).reshape(g.L, g.B, g.H, g.NPOS)
     e = e_l.view(g.L, 1, 1, 1)
     rf, rl = T.c["rd_first"], T.c["rd_last"]
     rf.copy_(torch.where(vb & (rf < 0), e, rf))
@@ -821,48 +888,51 @@ def read_done(T: Table, vread: torch.Tensor, D: Optional[Dict[str, torch.Tensor]
             T.key_rd[:, b, k] = e_l.view(-1, 1)
     if rows.vb.numel():
         T.rel_q[:, rows.vb, rows.vk] = True
-    return dict(verify_reads=int(vb.sum()), draft_reads=nd)
+    return dict(verify_reads=vb.sum(), draft_reads=nd)
 
 
-def metrics(P: Dict, vlook: Optional[torch.Tensor], takes: Dict[str, torch.Tensor], rows: Rows, geo: Geo) -> Dict:
+def metrics(P: Dict, vlook: Optional[torch.Tensor], takes: Dict[str, torch.Tensor], rows: Rows, geo: Geo,
+            n_vkeys: int) -> Dict:
     """The compared metrics as array reductions (test.py:607-611): k43 ready / in_flight / new / layer_calls, k46 (the
-    device's ready classes + fetched_first / refetch), masked, draft_pairs, refused, verifier_evictions."""
+    device's ready classes + fetched_first / refetch), masked, draft_pairs, refused, verifier_evictions. 0-dim tensors
+    (one host read by the caller). n_vkeys: the tick's distinct verify keys (host-known, from the rows)."""
     V, D = P["V"], P["D"]
     out = {}
     if vlook is not None:
         s = vlook.reshape(-1, 4).sum(0)
-        out.update(k43_ready=int(s[0]), k46_lru=int(s[1]), k46_po=int(s[2]), k46_vres=int(s[3]))
+        out.update(k43_ready=s[0], k46_lru=s[1], k46_po=s[2], k46_vres=s[3])
     if V is not None:
         first = has(V["flags"], FIRST)
-        out["k43_in_flight"] = int((first & has(V["flags"], INFL)).sum())
-        out["k43_new"] = int((first & (has(V["flags"], GRANT) | has(V["flags"], EVICT))).sum())
-        out["verifier_evictions"] = int(has(V["flags"], EVICT).sum())
-        out["verifier_inflight_evictions"] = int(has(V["flags"], EVICT_INFL).sum())
-        keys = torch.unique(rows.vb * 16 + rows.vk)
-        out["k43_layer_calls"] = int(keys.numel()) * geo.L
+        out["k43_in_flight"] = (first & has(V["flags"], INFL)).sum()
+        out["k43_new"] = (first & (has(V["flags"], GRANT) | has(V["flags"], EVICT))).sum()
+        out["verifier_evictions"] = has(V["flags"], EVICT).sum()
+        out["verifier_inflight_evictions"] = has(V["flags"], EVICT_INFL).sum()
+        out["k43_layer_calls"] = n_vkeys * geo.L
     if takes["f"].numel():
-        out["k46_fetched_refetch"] = int((takes["isv"] & takes["refetch"]).sum())
-        out["k46_fetched_first"] = int((takes["isv"] & ~takes["refetch"]).sum())
+        out["k46_fetched_refetch"] = (takes["isv"] & takes["refetch"]).sum()
+        out["k46_fetched_first"] = (takes["isv"] & ~takes["refetch"]).sum()
     if D is not None:
         nr = ~has(D["flags"], READY)
         pair = (D["l"] * rows.db.numel() + D["j"]) * geo.H + D["h"]
         npairs = geo.L * rows.db.numel() * geo.H
-        out["masked"] = int((torch.bincount(pair[nr], minlength=npairs) > 0).sum()) if bool(nr.any()) else 0
+        out["masked"] = (torch.bincount(pair[nr], minlength=npairs) > 0).sum()
         out["draft_pairs"] = npairs
-        out["refused"] = int(has(D["flags"], REFUSED).sum())
+        out["refused"] = has(D["flags"], REFUSED).sum()
     return out
 
 
 def issue_desc_args(T: Table, takes: Dict[str, torch.Tensor], win: ReaderWindow) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """E's tp.issue_desc(desc, reader_marks, hist_mark) for the DRAFT takes (Q-B3): desc (6, n) CONTIGUOUS int64 (l, b,
     h, block, slot, gen) (lessons L28); reader_marks (L,) the newest mark of the destination slots' kept last readers
-    per layer (-1: none pending); hist_mark the newest write-back mark of the job's (b, block) (-1: none)."""
-    d = ~takes["isv"]
-    l, b = takes["l"][d], takes["b"][d]
-    desc = torch.stack([l, b, takes["h"][d], takes["blk"][d], takes["slot"][d], takes["gen"][d]]).contiguous()
-    marks = win.mark_of(takes["rd_old"][d])
-    rm = torch.full((T.geo.L,), -1, dtype=torch.int64)
+    per layer (-1: none pending); hist_mark the newest write-back mark of the job's (b, block) (-1: none; E's call takes
+    an int: one host read)."""
+    dm = ~takes["isv"]
+    l, b = takes["l"][dm], takes["b"][dm]
+    desc = torch.stack([l, b, takes["h"][dm], takes["blk"][dm], takes["slot"][dm], takes["gen"][dm]]).contiguous()
+    marks = win.mark_of(takes["rd_old"][dm])
+    rm = torch.full((T.geo.L,), -1, dtype=torch.int64, device=T.dev)
     if l.numel():
         rm.scatter_reduce_(0, l, marks, reduce="amax", include_self=True)
-    hm = win.mark_of(T.hist_id[b, takes["blk"][d].clamp(min=0)]) if l.numel() else torch.zeros(0, dtype=torch.int64)
-    return desc, rm, int(hm.max()) if hm.numel() else -1
+        hm = win.mark_of(T.hist_id[b, takes["blk"][dm].clamp(min=0)])
+        return desc, rm, int(hm.max())
+    return desc, rm, -1
