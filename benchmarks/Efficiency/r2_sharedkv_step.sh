@@ -19,6 +19,10 @@
 #   probe-fused | probe-plant-fused     --attn probe / probe-plant --union fused, SG1, drop 0.0
 #   shared-fused                        --attn shared --union fused, SG0-SG3, drop 0.5
 #   order after the torch arms: probe-plant-fused, probe-fused, shared-fused.
+# [sharedkv4] NOSI is the r2-sharedkv4 worktree. Claim (review MINOR-7): the OUT / REC / JIT existence check runs
+# BEFORE the claim; the claim holds an owner file (arm, run, holder, step name, nosi, out, time); on a client timeout
+# (124 / 137) the wrapper waits up to 10 min for the holder's steps to leave squeue, never freezes an output whose
+# writer may run, and KEEPS the claim. Use a NEW run id per chain (the fused arms: not s1a).
 # SOURCE ONLY, NOT RUN, NOT REVIEWED: it never submits, renews, cancels or replaces an allocation, never retries.
 #
 #   bash benchmarks/Efficiency/r2_sharedkv_step.sh --nosi <sha> <holder job> <run id> <arm>
@@ -31,7 +35,7 @@
 # both frozen. EXIT: as r2_tick_step.sh (the gate's failed MUST count; 2 refusal; 3 / 4 GPU identity; 124 / 137
 # timeout; 1 STOP before the launch; 5 an exit-0 step with an incomplete record or a non-COMPLETED 0:0 sacct row).
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-sharedkv3                                                # ROOT (this branch)
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-sharedkv4                                                # ROOT (this branch)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -162,8 +166,12 @@ nosteps() {
 }
 busy=$(nosteps) || stop "a step is running in $JOB (or squeue -s failed): '$busy'"
 mkdir -p "$OUTROOT" || stop "cannot create $OUTROOT"
-mkdir "$OUTROOT/skv_active" 2>/dev/null || stop "$OUTROOT/skv_active exists (another step, or an uncertain one)"
-[ ! -e "$OUT" ] && [ ! -e "$REC" ] && [ ! -e "$JIT" ] || stop "$OUT, $REC or $JIT exists: a new run id (skv_active stays)"
+[ ! -e "$OUT" ] && [ ! -e "$REC" ] && [ ! -e "$JIT" ] ||                # [sharedkv4 MINOR-7b] BEFORE the claim
+    stop "$OUT, $REC or $JIT exists: a new run id (no claim taken)"
+mkdir "$OUTROOT/skv_active" 2>/dev/null || stop "$OUTROOT/skv_active exists (another step, or an uncertain one; its owner file says which)"
+printf 'arm=%s run=%s holder=%s step_name=%s nosi=%s out=%s utc_claim=%s\n' "$ARM" "$RUN" "$JOB" "$NAME" "$NSHA" \
+    "$OUT" "$(date -u +%FT%TZ)" > "$OUTROOT/skv_active/owner" ||            # [sharedkv4 MINOR-7a] the claim's owner
+    stop "cannot write $OUTROOT/skv_active/owner (skv_active stays)"
 mkdir "$REC" && mkdir -p "$JIT/tmp" || stop "cannot create $REC / $JIT (skv_active stays)"
 busy=$(nosteps) || stop "a step is running in $JOB under the claim: '$busy' (skv_active stays)"
 git -C "$NOSI" show "$BIATTN_BLOB" > "$ATTN_MOD" && [ "$(git hash-object -- "$ATTN_MOD")" = "$BIATTN_BLOB" ] ||
@@ -195,12 +203,24 @@ if [ "$(wc -l < "$REC/sacct.txt")" = 1 ]; then
 fi
 echo "accounting=$acct" >> "$REC/exit.txt" || ok=0
 [ "$rc" != 0 ] || [ "$acct" = consistent ] || ok=0
+writer=ended
+case $rc in
+    124|137)                                                  # [sharedkv4 MINOR-7c, C10] a timeout: the client
+        ok=0                                                  # ended, the step may still write. Wait (bounded) until
+        writer=running                                        # no step of the holder is listed; the claim STAYS
+        for _ in $(seq 1 60); do                              # either way (a timeout proves nothing about the writer)
+            if nosteps > /dev/null; then writer=gone_from_squeue; break; fi
+            sleep 10
+        done
+        echo "timeout: writer=$writer after the wait; skv_active stays (L40 cleanup after sacct)" >> "$REC/exit.txt" ;;
+esac
 for t in "$OUT" "$REC"; do
     [ -d "$t" ] || continue
+    [ "$t" = "$OUT" ] && [ "$writer" = running ] && continue       # never touch an output that may still be written
     find "$t" -type f -exec chmod 0444 {} + && find "$t" -type d -exec chmod 0555 {} + || ok=0
 done
 if [ "$ok" = 1 ]; then
-    rmdir "$OUTROOT/skv_active" || ok=0
+    rm -f "$OUTROOT/skv_active/owner" && rmdir "$OUTROOT/skv_active" || ok=0
 fi
 echo "R2 sharedkv step: exit $rc; record $REC; output $OUT; record complete and frozen: $ok"
 [ "$rc" = 0 ] && [ "$ok" = 0 ] && exit 5

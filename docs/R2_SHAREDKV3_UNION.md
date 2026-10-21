@@ -54,10 +54,10 @@ torch twin `build_union_fused_reference` (the same algorithm in torch; the CPU t
 |---|---|
 | `test_U1_twin_equals_build_union[...]` | 6 cases x {split, whole} x rows_max {4, 2}: build_groups = build_union's grow; the twin = build_union in every field, with and without the cached groups |
 | `test_U2_dedup_plant_is_caught_after_its_precondition[...]` | dedup off: caught (ucnt differs) where the case shares a value between rows (precondition from build_union's own output); a NO-OP on the disjoint case, reported, not counted |
-| `test_U3_selector_builds_the_groups_once_per_tick_object` | one build for one seq_idx object; rebuild for another object with the same values, an in-place change, another rows_max; bits = piece 3's twin = the torch-union selector |
+| `test_U3_selector_builds_the_groups_once_per_tick_token` | (9a501d8; under inference_mode) one build per (tick token, seq_idx object, rows_max); rebuild for another token, another seq_idx object with the same values, another rows_max, and on every call without a token. An IN-PLACE change of seq_idx under one token is NOT detected (no producer does it; the version-counter guard of a360d86 is gone); bits = piece 3's twin = the torch-union selector |
 | `test_U4_fused_union_in_the_tick[split]`, `[whole]` | SG1 on the CPU tiny model with the fused union driving the tick = serial; group builds <= ticks and < shared calls; the fused probe 0 diffs |
 | `test_U5_kernel_under_the_triton_interpreter` | the KERNEL = build_union in every field (all cases, both modes, rows_max 4 / 2, TE 16 and 64); the DEDUP plant caught after its precondition; SharedKV(union fused) kernel bits = piece 3's kernel, one group build |
-| `test_U6_fused_path_source` | one launch, torch.empty only, no build_union in the fused path, two barriers |
+| `test_U6_fused_path_source` | one launch, torch.empty only, no build_union in the fused path, three barriers (9a501d8) |
 
 Changed: `test_bi_paged_attention_shared.py::test_step_script_shape_and_its_sg1_schedule_is_not_blind` (`--attn
 "$ATTN" --union "$UNION"`), `::test_step_dryrun_refusals_and_pins` (the fused arms, NOSI sharedkv3),
@@ -73,7 +73,9 @@ bitwise end to end (the probe), so a race would show as differing rows or a fail
 Device kernel time (the S3 cell, ncu `gpu__time_duration`, cache-control none, the primary): (union build + shared
 + combine) / (piece 3 split + combine) over the marked calls with 4 rows, `--union fused`:
 
-* split: central 0.90, band [0.60, 1.25]; whole: central 1.75, band [0.85, 3.70].
+* split: central 0.90, band [0.60, 1.25]; whole: central 1.75, band [0.85, 3.70]. [sharedkv4, review MINOR-4:
+  SUPERSEDED: split band [0.60, 1.10] (its top IS F5'); the whole fused band is withdrawn (no whole fused arm:
+  not tested). The build band is per marked call whose build range holds ONLY the union kernel (MINOR-5).]
 * the build alone (`bd` range, per marked call; the group ops only on a tick's first keyed layer): central 15 us,
   band [5, 60].
 * (sharedkv2, `--union torch`, unchanged: split 1.30 [0.80, 2.20], whole 2.10 [1.00, 4.00].)

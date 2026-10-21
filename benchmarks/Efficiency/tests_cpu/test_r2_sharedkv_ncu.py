@@ -198,7 +198,7 @@ def test_N5_step_dryrun_refusals_and_pins(tmp_path):
     assert r.returncode == 1 and "for DRYRUN" in r.stderr
     r = run(315, uid + "\n")
     assert r.returncode == 1 and "HEAD is not" in r.stderr
-    nosi = "/mnt/beegfs/ojerbi/nosi-r2-sharedkv3"
+    nosi = "/mnt/beegfs/ojerbi/nosi-r2-sharedkv4"
     head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
     dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"], capture_output=True,
                            text=True)

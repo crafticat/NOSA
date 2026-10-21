@@ -537,12 +537,25 @@ def test_gate_selector_default_is_piece3_and_choices():
         G.sharedkv_gates(a, fake, gates, {})
         g4 = {g["name"]: g for g in gates}["SKV_rows_max4_calls"]
         assert g4["must"] and g4["passed"] is ok, (counts, g4)
-    # [review MINOR-5] the shared arms refuse --no-check; per_row / probe keep it
-    for choice in ("shared", "shared-whole"):
+    # [review MINOR-5; sharedkv4 MINOR-3] every selector arm refuses --no-check (the fused build needs strictly
+    # ascending keys per row); per_row keeps it
+    for choice in ("shared", "shared-whole", "probe", "probe-whole", "probe-plant"):
         with pytest.raises(SystemExit):
             G.parse_args(base_args + ["--attn", choice, "--no-check"])
-    assert G.parse_args(base_args + ["--attn", "probe", "--no-check"]).no_check
     assert G.parse_args(base_args + ["--no-check"]).no_check
+    # [sharedkv4 MINOR-5 / MAJOR-1] the build kind and the fused-union equality are MUST gates
+    a = G.parse_args(base_args + ["--attn", "probe", "--union", "fused"])
+    for ub, diff, checked, ok_kind, ok_eq in (({"torch": 0, "fused": 3}, {"win": 0}, 3, True, True),
+                                              ({"torch": 2, "fused": 3}, {"win": 0}, 3, False, True),
+                                              ({"torch": 0, "fused": 3}, {"win": 2}, 3, True, False),
+                                              ({"torch": 0, "fused": 3}, {"win": 0}, 0, True, False)):
+        fake.union_builds, fake.union_diff, fake.union_checked = dict(ub), dict(diff), checked
+        gates = []
+        G.sharedkv_gates(a, fake, gates, {})
+        got = {g["name"]: g for g in gates}
+        assert got["SKV_union_build_kind"]["must"] and got["SKV_union_build_kind"]["passed"] is ok_kind, (ub, got)
+        assert got["SKV_fused_union_equals_torch"]["must"]
+        assert got["SKV_fused_union_equals_torch"]["passed"] is ok_eq, (diff, checked)
 
 
 def test_step_script_shape_and_its_sg1_schedule_is_not_blind():
@@ -807,7 +820,7 @@ def test_step_dryrun_refusals_and_pins(tmp_path):
     assert r.returncode == 1 and "for DRYRUN" in r.stderr and "TICK_PIN" in r.stderr
     r = run(416, uid + "\n")
     assert r.returncode == 1 and "HEAD is not" in r.stderr
-    nosi = "/mnt/beegfs/ojerbi/nosi-r2-sharedkv3"
+    nosi = "/mnt/beegfs/ojerbi/nosi-r2-sharedkv4"
     head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
     dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"], capture_output=True,
                            text=True)

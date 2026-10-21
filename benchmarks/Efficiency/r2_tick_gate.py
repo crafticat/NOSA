@@ -77,9 +77,9 @@ ROOT = Path(HERE).resolve().parents[1]                                          
 # ratio is the S3 cell's device kernel time): over the keyed calls of rows_max 4, the order-pooled median of (union
 # build + shared kernel + combine) / (piece 3's split + combine), CUDA events behind a pre-queued GPU.
 SKV_PRED = {"split": dict(time_with_build=(1.30, 0.80, 2.20),        # (central, lo, hi), --union torch
-                          time_with_fused_build=(0.90, 0.60, 1.25)),  # [sharedkv3] --union fused (registered)
+                          time_with_fused_build=(0.90, 0.60, 1.10)),  # [sharedkv4 MINOR-4] hi = F5' (1.10)
             "whole": dict(time_with_build=(2.10, 1.00, 4.00),
-                          time_with_fused_build=(1.75, 0.85, 3.70))}
+                          time_with_fused_build=None)}                # [sharedkv4 MINOR-4] no whole fused arm: none
 
 
 def select_attn(a, attn):
@@ -106,11 +106,24 @@ def sharedkv_gates(a, obj, gates, res):
     n4 = obj.by_rows_max.get(4, 0)                                         # [review MINOR-3] F3, machine-checked
     gates.append(GB.gate("SKV_rows_max4_calls", n4 > 0, True, "keyed calls per rows_max %s (F3: none with 4 rows of "
                          "one request = the cell did not test the 4-row groups)" % (dict(obj.by_rows_max),)))
+    want_u = getattr(a, "union", "torch")                                  # [sharedkv4 MINOR-5] the build that ran
+    ub = dict(getattr(obj, "union_builds", {}))
+    other = "torch" if want_u == "fused" else "fused"
+    gates.append(GB.gate("SKV_union_build_kind", ub.get(want_u, 0) > 0 and ub.get(other, 0) == 0, True,
+                         "--union %s; union builds %s (a fallback to the other build would be silent otherwise)"
+                         % (want_u, ub)))
     if not a.attn.startswith("probe"):
-        res["SKV"] = dict(attn=a.attn, stats=st, by_rows_max=dict(obj.by_rows_max))
+        res["SKV"] = dict(attn=a.attn, stats=st, by_rows_max=dict(obj.by_rows_max), union_builds=ub)
         return
     rep = obj.report()
     res["SKV"] = rep
+    if want_u == "fused":                                                  # [sharedkv4, review MAJOR-1]
+        diff = rep.get("union_diff", {})
+        gates.append(GB.gate("SKV_fused_union_equals_torch", rep.get("union_checked", 0) > 0
+                             and all(v == 0 for v in diff.values()), True,
+                             "%d keyed calls: the fused union vs build_union on the same inputs, differing elements "
+                             "per field %s (a too-wide window is invisible to the bitwise gate)"
+                             % (rep.get("union_checked", 0), diff)))
     try:                                                                   # [review MAJOR-1] F4's own tables
         import torch
         path = os.path.join(a.out, "skv_tables.pt")
@@ -133,7 +146,8 @@ def sharedkv_gates(a, obj, gates, res):
                              "%d calls checked (whole: tiles = union pages; split: union <= tiles <= sum); bad %s"
                              % (rep["tile_identity_checked"], rep["tile_identity_bad"][:4])))
     pred = SKV_PRED[rep["mode"]]
-    c, lo, hi = pred["time_with_fused_build" if getattr(a, "union", "torch") == "fused" else "time_with_build"]
+    bandv = pred["time_with_fused_build" if getattr(a, "union", "torch") == "fused" else "time_with_build"]
+    c, lo, hi = bandv if bandv is not None else (None, float("-inf"), float("inf"))   # None: no arm, not registered
     pooled = {}
     for (nr, first, pr), (_, _, sh) in zip(rep["per_row_ms"], rep["shared_ms"]):
         pooled.setdefault(nr, []).append(sh / pr if pr > 0 else float("nan"))
@@ -216,9 +230,10 @@ def parse_args(argv):
         ap.error("steps >= 2, 1 <= sg0-steps <= steps, draft-drop in [0, 1)")
     if not 2 <= a.sg4_steps <= a.steps or a.phase < 2:
         ap.error("2 <= sg4-steps <= steps, phase >= 2")
-    if a.attn.startswith("shared") and a.no_check:                       # [review MINOR-5]
-        ap.error("--attn %s needs the per-layer selection check (it guarantees the keys' last two entries T - 1, T; "
-                 "without it the shared arm can break the law silently): drop --no-check" % a.attn)
+    if a.attn != "per_row" and a.no_check:                               # [review MINOR-5; sharedkv4 MINOR-3]
+        ap.error("--attn %s needs the per-layer selection check (it guarantees the keys' last two entries T - 1, T "
+                 "and strictly ascending keys per row, which the fused union build assumes; without it the shared "
+                 "side can break the law silently): drop --no-check" % a.attn)
     return a
 
 

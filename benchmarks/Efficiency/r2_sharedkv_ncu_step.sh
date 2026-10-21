@@ -11,7 +11,8 @@
 #                           kernel per call; docs/R2_SHAREDKV3_UNION.md)
 # Order (the plan): b32-split, b64-split, b32-whole, b64-whole; stop at the first MUST failure. [sharedkv3] then
 # b32-split-fused, b64-split-fused.
-# [sharedkv3] NOSI is the r2-sharedkv3 worktree.
+# [sharedkv3] NOSI is the r2-sharedkv3 worktree. [sharedkv4] now r2-sharedkv4; the claim as r2_sharedkv_step.sh
+# (existence check first, an owner file, a bounded wait and a kept claim on a client timeout).
 # SOURCE ONLY, NOT RUN, NOT REVIEWED: it never submits, renews, cancels or replaces an allocation, never retries.
 #
 #   bash benchmarks/Efficiency/r2_sharedkv_ncu_step.sh --nosi <sha> <holder job> <run id> <arm>
@@ -24,7 +25,7 @@
 # count; 2 refusal; 3 / 4 GPU identity; 124 / 137 timeout; 1 STOP before the launch; 5 an exit-0 step with an
 # incomplete record or a non-COMPLETED 0:0 sacct row.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-sharedkv3                                                # ROOT (this branch)
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-sharedkv4                                                # ROOT (this branch)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -153,8 +154,12 @@ nosteps() {
 }
 busy=$(nosteps) || stop "a step is running in $JOB (or squeue -s failed): '$busy'"
 mkdir -p "$OUTROOT" || stop "cannot create $OUTROOT"
-mkdir "$OUTROOT/skv2_active" 2>/dev/null || stop "$OUTROOT/skv2_active exists (another step, or an uncertain one)"
-[ ! -e "$OUT" ] && [ ! -e "$REC" ] && [ ! -e "$JIT" ] || stop "$OUT, $REC or $JIT exists: a new run id (skv2_active stays)"
+[ ! -e "$OUT" ] && [ ! -e "$REC" ] && [ ! -e "$JIT" ] ||                # [sharedkv4 MINOR-7b] BEFORE the claim
+    stop "$OUT, $REC or $JIT exists: a new run id (no claim taken)"
+mkdir "$OUTROOT/skv2_active" 2>/dev/null || stop "$OUTROOT/skv2_active exists (another step, or an uncertain one; its owner file says which)"
+printf 'arm=%s run=%s holder=%s step_name=%s nosi=%s out=%s utc_claim=%s\n' "$ARM" "$RUN" "$JOB" "$NAME" "$NSHA" \
+    "$OUT" "$(date -u +%FT%TZ)" > "$OUTROOT/skv2_active/owner" ||           # [sharedkv4 MINOR-7a] the claim's owner
+    stop "cannot write $OUTROOT/skv2_active/owner (skv2_active stays)"
 mkdir "$REC" && mkdir -p "$JIT/tmp" || stop "cannot create $REC / $JIT (skv2_active stays)"
 busy=$(nosteps) || stop "a step is running in $JOB under the claim: '$busy' (skv2_active stays)"
 git -C "$NOSI" show "$BIATTN_BLOB" > "$ATTN_MOD" && [ "$(git hash-object -- "$ATTN_MOD")" = "$BIATTN_BLOB" ] ||
@@ -187,12 +192,24 @@ if [ "$(wc -l < "$REC/sacct.txt")" = 1 ]; then
 fi
 echo "accounting=$acct" >> "$REC/exit.txt" || ok=0
 [ "$rc" != 0 ] || [ "$acct" = consistent ] || ok=0
+writer=ended
+case $rc in
+    124|137)                                                  # [sharedkv4 MINOR-7c, C10] a timeout: the client
+        ok=0                                                  # ended, the step may still write. Wait (bounded) until
+        writer=running                                        # no step of the holder is listed; the claim STAYS
+        for _ in $(seq 1 60); do
+            if nosteps > /dev/null; then writer=gone_from_squeue; break; fi
+            sleep 10
+        done
+        echo "timeout: writer=$writer after the wait; skv2_active stays (L40 cleanup after sacct)" >> "$REC/exit.txt" ;;
+esac
 for t in "$OUT" "$REC"; do
     [ -d "$t" ] || continue
+    [ "$t" = "$OUT" ] && [ "$writer" = running ] && continue       # never touch an output that may still be written
     find "$t" -type f -exec chmod 0444 {} + && find "$t" -type d -exec chmod 0555 {} + || ok=0
 done
 if [ "$ok" = 1 ]; then
-    rmdir "$OUTROOT/skv2_active" || ok=0
+    rm -f "$OUTROOT/skv2_active/owner" && rmdir "$OUTROOT/skv2_active" || ok=0
 fi
 echo "R2 sharedkv S3 step: exit $rc; record $REC; output $OUT; record complete and frozen: $ok"
 [ "$rc" = 0 ] && [ "$ok" = 0 ] && exit 5

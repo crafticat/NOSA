@@ -90,6 +90,7 @@ except ImportError:                                    # pragma: no cover - envi
     triton = tl = None
 
 ROWS_MAX = 4                 # 1 draft row + K = 3 verify rows per request (the R2 cohort)
+UNION_FIELDS = ("grow", "ut", "ucnt", "rowpos", "win", "uidx")   # [sharedkv4] the tensor fields of a union dict
 MODES = ("split", "whole")
 _BIG = torch.iinfo(torch.int64).max
 
@@ -177,8 +178,9 @@ def plant_drop_page(union: dict, g: int = 0, h: int = 0, u: Optional[int] = None
 
 # ---------------------------------------------------------------------------------------------------------------------
 # [sharedkv3] the union build in TWO parts (docs/R2_SHAREDKV3_UNION.md): the GROUPS once per tick (they depend on
-# seq_idx only: build_groups, cached by the selector per seq_idx object), and the per-layer UNION in ONE Triton kernel
-# (_union_kernel via build_union_fused) instead of about 50 torch ops. Same output as build_union, bit for bit (int
+# seq_idx only: build_groups, cached by the selector per TICK TOKEN + seq_idx object + rows_max; [sharedkv4] an
+# in-place change of seq_idx under one token is NOT detected: no producer does it), and the per-layer UNION in ONE
+# Triton kernel (_union_kernel via build_union_fused) instead of about 50 torch ops. Same output as build_union (int
 # tensors): the union index of an entry is the number of DISTINCT (key, slot) values below it, counted over the
 # first occurrences (an entry whose value no earlier row of the group lists); ascending order and dedup follow.
 # ---------------------------------------------------------------------------------------------------------------------
@@ -523,79 +525,89 @@ if triton is not None:      # [sharedkv3] the fused union build (a second triton
                       NR: tl.constexpr, P: tl.constexpr, N: tl.constexpr, PPS: tl.constexpr, S: tl.constexpr,
                       TE: tl.constexpr, WHOLE: tl.constexpr, DEDUP: tl.constexpr):
         """[sharedkv3] ONE program per (group g, KV head h): build_union's per-layer outputs for (g, h) (the twin is
-        build_union_fused_reference). Pass 0 fills ut / rowpos with -1; pass A marks the FIRST entries (listed, and no
-        earlier row of the group lists the same value) into the scratch FIRST; pass B gives each listed entry its uid
-        (the count of FIRST entries with a smaller value), writes uidx, ut[uid] (FIRST entries) and rowpos[j, uid];
-        pass C (split mode) reads uidx back and writes the split windows (min / max uid over the rows' list positions
-        of split k, by unrolled compare-selects). Barriers order the passes (global writes of the CTA are visible after the barrier). DEDUP False
-        is the NEGATIVE CONTROL."""
+        build_union_fused_reference). Pass 0 fills ut / rowpos / uidx with -1 and ucnt / win with 0 (the outputs of
+        an EMPTY group, final there); [sharedkv4, review MINOR-2] a program whose group has no row (GROW[g, 0] < 0,
+        the grid rows past the last group) stops after pass 0. Otherwise pass A marks the FIRST entries (listed, and
+        no earlier row of the group lists the same value) into the scratch FIRST; pass B gives each listed entry its
+        uid (the count of FIRST entries with a smaller value), writes uidx, ut[uid] (FIRST entries), rowpos[j, uid]
+        and ucnt; pass C (split mode) reads uidx back and writes the split windows (min / max uid over the rows' list
+        positions of split k, by unrolled compare-selects). Barriers order the passes (global writes of the CTA are
+        visible after the barrier); the branch on GROW[g, 0] is uniform over the CTA, so every thread reaches the
+        same barriers. PRECONDITION (review MINOR-3): a row lists each (key, slot) at most once (keys strictly
+        ascending per row, the tick's selection check); build_union dedups a repeat inside one row, this kernel does
+        not. DEDUP False is the NEGATIVE CONTROL."""
         g = tl.program_id(0)
         h = tl.program_id(1)
         ar = tl.arange(0, TE)
         neg = tl.full([TE], -1, tl.int32)
-        for u0 in range(0, N, TE):                                   # pass 0: -1 everywhere the scatters may skip
+        for u0 in range(0, N, TE):                                   # pass 0: the empty group's outputs
             uu = u0 + ar
             mu = uu < N
             tl.store(UT + g * s_utr + h * s_uth + uu, neg, mask=mu)
+            tl.store(UIDX + g * s_uxr + h * s_uxh + (uu // P) * s_uxj + (uu % P), neg, mask=mu)
             for j in tl.static_range(NR):
                 tl.store(ROWPOS + g * s_rpr + h * s_rph + j * s_rpj + uu, neg, mask=mu)
-        tl.debug_barrier()
-        for f0 in range(0, N, TE):                                   # pass A: the first occurrences
-            f = f0 + ar
-            vf, okf, jf, i_f = _union_entries(PT, NP, KEY, GROW, g, h, f, s_ptr, s_pth, s_npr, s_gr, N, P)
-            dup = tl.zeros([TE], dtype=tl.int32)
-            if DEDUP:
-                for e0 in range(0, N, TE):
-                    e = e0 + ar
-                    ve, oke, je, ie = _union_entries(PT, NP, KEY, GROW, g, h, e, s_ptr, s_pth, s_npr, s_gr, N, P)
-                    hit = (ve[:, None] == vf[None, :]) & oke[:, None] & (je[:, None] < jf[None, :])
-                    dup = dup + tl.sum(hit.to(tl.int32), 0)
-            first = okf & (dup == 0)
-            tl.store(FIRST + g * s_fr + h * s_fh + f, first.to(tl.int32), mask=f < N)
-        tl.debug_barrier()
-        cnt = tl.zeros([TE], dtype=tl.int32)
-        for e0 in range(0, N, TE):                                   # pass B: uid, uidx, ut, rowpos (windows: pass C)
-            e = e0 + ar
-            ve, oke, je, ie = _union_entries(PT, NP, KEY, GROW, g, h, e, s_ptr, s_pth, s_npr, s_gr, N, P)
-            uid = tl.zeros([TE], dtype=tl.int32)
-            for f0 in range(0, N, TE):
+        tl.store(UCNT + g * s_ucr + h, g * 0)
+        for k in range(0, S):
+            tl.store(WIN + g * s_wr + h * s_wh + k * s_ws, g * 0)
+            tl.store(WIN + g * s_wr + h * s_wh + k * s_ws + 1, g * 0)
+        r0 = tl.load(GROW + g * s_gr)
+        if r0 >= 0:                                                  # a live group (uniform over the CTA)
+            tl.debug_barrier()
+            for f0 in range(0, N, TE):                               # pass A: the first occurrences
                 f = f0 + ar
                 vf, okf, jf, i_f = _union_entries(PT, NP, KEY, GROW, g, h, f, s_ptr, s_pth, s_npr, s_gr, N, P)
-                fst = tl.load(FIRST + g * s_fr + h * s_fh + f, mask=f < N, other=0)
-                lt = (vf[None, :] < ve[:, None]) & (fst[None, :] != 0)
-                uid = uid + tl.sum(lt.to(tl.int32), 1)
-            fe = tl.load(FIRST + g * s_fr + h * s_fh + e, mask=e < N, other=0)
-            cnt = cnt + fe
-            me = e < N
-            tl.store(UIDX + g * s_uxr + h * s_uxh + je * s_uxj + ie, tl.where(oke, uid, -1), mask=me)
-            tl.store(UT + g * s_utr + h * s_uth + uid, (ve & 0xFFFFFFFF).to(tl.int32), mask=me & (fe != 0))
-            tl.store(ROWPOS + g * s_rpr + h * s_rph + je * s_rpj + uid, ie.to(tl.int32), mask=me & oke)
-        total = tl.sum(cnt, 0)
-        tl.store(UCNT + g * s_ucr + h, total)
-        if WHOLE:
-            tl.store(WIN + g * s_wr + h * s_wh, 0)
-            tl.store(WIN + g * s_wr + h * s_wh + 1, total)
-        else:
-            # [sharedkv3 fix, CPU job 2191241] pass C: the split windows from the STORED uidx, as build_union does
-            # (pad, view (NR, S, PPS), amin / amax). The first version accumulated lo / hi per split inside pass B
-            # (an [TE, SP] masked min / max carried across the tile loop); it gave other windows than build_union
-            # in all 24 split cases under the interpreter while uidx itself matched (tl.sum reductions, used for uid
-            # and ucnt, were right; the windows were the only tl.min / tl.max reductions). Pass C reads uidx back
-            # per split over exactly build_union's (row, position) set, with NO reduction primitive: unrolled scalar
-            # loads and compare-selects (min / max by tl.where only).
+                dup = tl.zeros([TE], dtype=tl.int32)
+                if DEDUP:
+                    for e0 in range(0, N, TE):
+                        e = e0 + ar
+                        ve, oke, je, ie = _union_entries(PT, NP, KEY, GROW, g, h, e, s_ptr, s_pth, s_npr, s_gr, N,
+                                                         P)
+                        hit = (ve[:, None] == vf[None, :]) & oke[:, None] & (je[:, None] < jf[None, :])
+                        dup = dup + tl.sum(hit.to(tl.int32), 0)
+                first = okf & (dup == 0)
+                tl.store(FIRST + g * s_fr + h * s_fh + f, first.to(tl.int32), mask=f < N)
             tl.debug_barrier()
-            for k in range(0, S):
-                lo_k = g * 0 + 2147483647                                # int32 scalars (program_id arithmetic)
-                hi_k = g * 0
-                for j in tl.static_range(NR):
-                    for i in tl.static_range(PPS):
-                        pos = k * PPS + i
-                        x = tl.load(UIDX + g * s_uxr + h * s_uxh + j * s_uxj + pos, mask=pos < P, other=-1)
-                        lo_k = tl.where((x >= 0) & (x < lo_k), x, lo_k)
-                        hi_k = tl.where(x + 1 > hi_k, x + 1, hi_k)
-                lo_k = tl.where(hi_k > 0, lo_k, 0)
-                tl.store(WIN + g * s_wr + h * s_wh + k * s_ws, lo_k)
-                tl.store(WIN + g * s_wr + h * s_wh + k * s_ws + 1, hi_k)
+            cnt = tl.zeros([TE], dtype=tl.int32)
+            for e0 in range(0, N, TE):                               # pass B: uid, uidx, ut, rowpos, ucnt
+                e = e0 + ar
+                ve, oke, je, ie = _union_entries(PT, NP, KEY, GROW, g, h, e, s_ptr, s_pth, s_npr, s_gr, N, P)
+                uid = tl.zeros([TE], dtype=tl.int32)
+                for f0 in range(0, N, TE):
+                    f = f0 + ar
+                    vf, okf, jf, i_f = _union_entries(PT, NP, KEY, GROW, g, h, f, s_ptr, s_pth, s_npr, s_gr, N, P)
+                    fst = tl.load(FIRST + g * s_fr + h * s_fh + f, mask=f < N, other=0)
+                    lt = (vf[None, :] < ve[:, None]) & (fst[None, :] != 0)
+                    uid = uid + tl.sum(lt.to(tl.int32), 1)
+                fe = tl.load(FIRST + g * s_fr + h * s_fh + e, mask=e < N, other=0)
+                cnt = cnt + fe
+                me = e < N
+                tl.store(UIDX + g * s_uxr + h * s_uxh + je * s_uxj + ie, tl.where(oke, uid, -1), mask=me)
+                tl.store(UT + g * s_utr + h * s_uth + uid, (ve & 0xFFFFFFFF).to(tl.int32), mask=me & (fe != 0))
+                tl.store(ROWPOS + g * s_rpr + h * s_rph + je * s_rpj + uid, ie.to(tl.int32), mask=me & oke)
+            total = tl.sum(cnt, 0)
+            tl.store(UCNT + g * s_ucr + h, total)
+            if WHOLE:
+                tl.store(WIN + g * s_wr + h * s_wh, 0)
+                tl.store(WIN + g * s_wr + h * s_wh + 1, total)
+            else:
+                # [sharedkv3 fix, CPU job 2191241] pass C: the split windows from the STORED uidx, as build_union
+                # does (pad, view (NR, S, PPS), amin / amax), with NO reduction primitive: unrolled scalar loads and
+                # compare-selects. a360d86 accumulated an [TE, SP] masked tl.min / tl.max across the pass-B tile
+                # loop and gave other windows under the interpreter (the repro: test_r2_sharedkv4.py, V1-V4).
+                tl.debug_barrier()
+                for k in range(0, S):
+                    lo_k = g * 0 + 2147483647                            # int32 scalars (program_id arithmetic)
+                    hi_k = g * 0
+                    for j in tl.static_range(NR):
+                        for i in tl.static_range(PPS):
+                            pos = k * PPS + i
+                            x = tl.load(UIDX + g * s_uxr + h * s_uxh + j * s_uxj + pos, mask=pos < P, other=-1)
+                            lo_k = tl.where((x >= 0) & (x < lo_k), x, lo_k)
+                            hi_k = tl.where(x + 1 > hi_k, x + 1, hi_k)
+                    lo_k = tl.where(hi_k > 0, lo_k, 0)
+                    tl.store(WIN + g * s_wr + h * s_wh + k * s_ws, lo_k)
+                    tl.store(WIN + g * s_wr + h * s_wh + k * s_ws + 1, hi_k)
 else:                                                  # pragma: no cover
     _union_kernel = None
 
@@ -646,6 +658,11 @@ def bi_paged_decode_shared(base, q, k_cache, v_cache, bias_cache, seq_idx, page_
         union = build_union(seq_idx, page_table, num_pages, page_key, NR, pps, whole)
     elif union["rows_max"] != NR or union["whole"] != whole or union["pps"] != pps:
         raise ValueError("union built for another rows_max / mode / split size")
+    for f in ("grow", "ut", "rowpos", "win"):          # [sharedkv4, review MINOR-9, L28] the kernel's unit strides
+        t = union[f]
+        if t.dtype != torch.int32 or not t.is_contiguous() or t.device != q.device:
+            raise ValueError("union[%r] must be a contiguous int32 tensor on q's device (the kernel reads it with "
+                             "unit last strides)" % f)
     S = base.splits_for(page_table.shape[2], pps)
     if workspace is None:
         wacc = torch.empty((R, Hkv, S, bh, D), dtype=torch.float32, device=q.device)
@@ -817,6 +834,7 @@ class SharedKV:
         self._gcache = None                               # (tick token, seq_idx object, rows_max, grow)
         self._token = None                                # the current call's group_token (set per call)
         self.group_builds = 0                             # build_groups calls (tests: once per tick, not per layer)
+        self.union_builds = dict(torch=0, fused=0)        # [sharedkv4, review MINOR-5] union builds per kind
         self.build_page_table = base.build_page_table
         self.PAGE, self.PAGES_PER_SPLIT = base.PAGE, base.PAGES_PER_SPLIT
         self.__file__ = "%s + sharedkv(%s, %s)" % (getattr(base, "__file__", "piece3"), mode, impl)
@@ -849,6 +867,7 @@ class SharedKV:
         kernel, or its torch twin with impl 'reference')."""
         seq_idx, page_table, num_pages = args[4], args[5], args[6]
         whole = self.mode == "whole"
+        self.union_builds[self.union] += 1                # [sharedkv4, review MINOR-5] which build ran (the gate)
         if self.union == "torch":
             return build_union(seq_idx, page_table, num_pages, page_key, nr, pps, whole)
         grow = self._groups(seq_idx, nr)
@@ -857,7 +876,7 @@ class SharedKV:
         return build_union_fused(seq_idx, page_table, num_pages, page_key, nr, pps, whole, groups=grow)
 
     def _shared(self, args, page_key, nr, softmax_scale, pps, out=None, workspace=None, union=None):
-        if union is None and self.union != "torch":       # [sharedkv3] the launcher's own build is build_union
+        if union is None:                                 # [sharedkv4] always the selector's build (counted)
             union = self._build(args, page_key, nr, pps)
         if self.impl == "reference":
             return bi_paged_decode_shared_reference(self.base, *args, page_key, rows_max=nr, mode=self.mode,
@@ -909,6 +928,8 @@ class SharedKVProbe(SharedKV):
         self.diff_zero = 0                                # differing elements whose floats are equal (+-0.0 only)
         self.diff_value = 0                               # differing elements with another value
         self.samples = []                                 # per keyed call: (call, (flag, flat index, bits ref, bits sh))
+        self.union_diff = {f: 0 for f in UNION_FIELDS}    # [sharedkv4, MAJOR-1] differing elements fused vs torch
+        self.union_checked = 0                            # keyed calls compared
         self.ncu_window = None if ncu_window is None else (int(ncu_window[0]), int(ncu_window[1]))
         self.full_calls = 0                               # keyed calls with rows_max == self.rows_max
         self.marked = []                                  # (j, rows, first, sum pages (device), union pages (device))
@@ -954,6 +975,7 @@ class SharedKVProbe(SharedKV):
 
         def build():                                      # [sharedkv3] the selected build (torch / fused)
             un = self._build(args, page_key, nr, pps)
+            box["raw"] = un                               # [sharedkv4] the unplanted union (MAJOR-1's comparison)
             return plant_drop_page(un) if self.plant else un
 
         def per_row():
@@ -981,6 +1003,8 @@ class SharedKVProbe(SharedKV):
         if prof:
             torch.cuda.cudart().cudaProfilerStop()
         un = box["un"]
+        if self.union == "fused":                         # [sharedkv4, review MAJOR-1] untimed, outside the window:
+            self._check_union(box["raw"], seq_idx, page_table, num_pages, page_key, nr, pps)   # fused = build_union
         if mark is not None:
             self.marked.append((mark, int(q.shape[0]), first, num_pages.to(torch.int64).sum(),
                                 un["ucnt"].to(torch.int64).sum()))
@@ -1011,7 +1035,8 @@ class SharedKVProbe(SharedKV):
         if len(self.tables) < self.record_tables and nr == self.rows_max:      # [review MAJOR-1] F4's own tables
             self.tables.append(dict(call=call, rows_max=nr, mode=self.mode, seq_idx=seq_idx.clone(),
                                     page_table=page_table.clone(), num_pages=num_pages.clone(),
-                                    last_len=last_len.clone(), page_key=page_key.clone(), tiles=tiles_call))
+                                    last_len=last_len.clone(), page_key=page_key.clone(), tiles=tiles_call,
+                                    union={f: box["raw"][f].clone() for f in UNION_FIELDS}))   # [sharedkv4]
         ref, sh = (a, b) if first == "per_row" else (b, a)
         iv = torch.int16 if ref.element_size() == 2 else torch.int32
         rv, sv = ref.view(iv), sh.view(iv)
@@ -1031,6 +1056,21 @@ class SharedKVProbe(SharedKV):
             out.copy_(ref)
             return out
         return ref
+
+    def _check_union(self, raw, seq_idx, page_table, num_pages, page_key, nr, pps) -> None:
+        """[sharedkv4, review MAJOR-1] the fused union of this call against build_union on the same inputs, on the
+        device (no host read): per field the count of differing elements (a shape or dtype difference counts every
+        element of the larger tensor); report() reads the counts once. A wrong window (too wide: identity steps,
+        invisible to the bitwise gate) is caught here."""
+        ref = build_union(seq_idx, page_table, num_pages, page_key, nr, pps, self.mode == "whole")
+        for f in UNION_FIELDS:
+            a, b = raw[f], ref[f]
+            if a.shape == b.shape and a.dtype == b.dtype:
+                d = (a != b).to(torch.int64).sum()
+            else:
+                d = max(a.numel(), b.numel()) + 1
+            self.union_diff[f] = self.union_diff[f] + d
+        self.union_checked += 1
 
     def _ncu_mark(self, nr: int):
         """[sharedkv2] the index j of this keyed call if it lies in ncu_window (counted over the calls with
@@ -1101,14 +1141,20 @@ class SharedKVProbe(SharedKV):
                     expected_tile_ratio=expected_tile_ratio(mix_all, self.mode),
                     union_ratio_by_size=[(mix_all[2][k] / mix_all[1][k]) if mix_all[1][k] else None
                                          for k in range(ROWS_MAX + 1)],
-                    per_call=per_call, mode=self.mode)
+                    per_call=per_call, mode=self.mode, union=self.union,
+                    union_builds=dict(self.union_builds), group_builds=self.group_builds,
+                    union_checked=self.union_checked,                                # [sharedkv4] MAJOR-1 / MINOR-5
+                    union_diff={f: int(v) for f, v in self.union_diff.items()})
 
     def report_tables(self) -> list:
         """The recorded inputs (MAJOR-1), moved to the host (one read; the gate saves them with torch.save)."""
-        out = []
-        for t in self.tables:
-            out.append({k: (v.cpu() if torch.is_tensor(v) else v) for k, v in t.items()})
-        return out
+        def host(v):
+            if torch.is_tensor(v):
+                return v.cpu()
+            if isinstance(v, dict):                       # [sharedkv4] the recorded fused union
+                return {k: host(x) for k, x in v.items()}
+            return v
+        return [{k: host(v) for k, v in t.items()} for t in self.tables]
 
 
 # [review MAJOR-1] REGISTERED per group size s (docs/R2_SHAREDKV_PLAN.md P2, revised): the expected tile / sum ratio

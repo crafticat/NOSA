@@ -72,8 +72,11 @@ S3_PRED = {
     "time_with_build": dict(split=(1.30, 0.80, 2.20), whole=(2.10, 1.00, 4.00)),
     # [sharedkv3] --union fused (docs/R2_SHAREDKV3_UNION.md): the build is one kernel per call (+ the groups once per
     # tick); and the build alone per marked call, in microseconds of device time
-    "time_with_fused_build": dict(split=(0.90, 0.60, 1.25), whole=(1.75, 0.85, 3.70)),
-    "build_us_fused": dict(split=(15.0, 5.0, 60.0), whole=(15.0, 5.0, 60.0)),
+    # [sharedkv4 MINOR-4] the split band's top IS F5' (1.10); no whole fused arm exists: no whole fused band
+    "time_with_fused_build": dict(split=(0.90, 0.60, 1.10), whole=None),
+    # [sharedkv4 MINOR-5] per marked call whose build range holds ONLY the union kernel (the groups cached: not the
+    # tick's first keyed layer)
+    "build_us_fused": dict(split=(15.0, 5.0, 60.0), whole=None),
     "time_kernel": dict(split=(0.80, 0.55, 1.10), whole=(1.60, 0.80, 3.50)),
 }
 
@@ -225,6 +228,8 @@ def ncu_rows(text, fields):
 
 
 def band(name, mode, value):
+    if S3_PRED[name].get(mode) is None:                                 # [sharedkv4] no arm: not registered
+        return "%s %s (no band registered for %s: no arm)" % (name, value, mode)
     c, lo, hi = S3_PRED[name][mode]
     if value is None:
         return "%s n/a (band [%s, %s], central %s)" % (name, lo, hi, c)
@@ -308,6 +313,19 @@ def summarize_variant(cc, rows, cell, mode, fields):
              if d["pr"]["time_ns_all"] else None)
     q["time_kernel"] = q["time_ratio_all"]
     q["build_us_per_call"] = d["bd"]["time_ns_all"] / 1000.0 / len(marked) if marked else None   # [sharedkv3]
+    # [sharedkv4 MINOR-5] the build range per marked call: its _union_kernel count and its other kernels (the group
+    # ops on a tick's first keyed layer, or a torch build); the fused build band uses the calls with ONLY the kernel
+    per_call = {}
+    for (k, j), rs in by.items():
+        if k == "bd" and j in marked:
+            nk = sum(1 for x in rs if "_union_kernel" in x["name"])
+            t = sum(x.get("gpu__time_duration.sum") or 0.0 for x in rs)
+            per_call[j] = (nk, len(rs) - nk, t)
+    d["bd"]["union_kernels_per_call"] = sorted({v[0] for v in per_call.values()})
+    only = [v[2] for v in per_call.values() if v[0] == 1 and v[1] == 0]
+    d["bd"]["calls_only_union_kernel"] = len(only)
+    q["build_us_union_only"] = sum(only) / 1000.0 / len(only) if only else None
+    q["bd_calls"] = {str(j): dict(union_kernels=v[0], other=v[1], ns=v[2]) for j, v in sorted(per_call.items())}
     hk = OPTIONAL[0] if OPTIONAL[0] in fields else None
     q["hit_pr"] = d["pr"][hk] if hk else d["pr"]["hit_derived_pct"]
     q["hit_sh"] = d["sh"][hk] if hk else d["sh"]["hit_derived_pct"]
@@ -328,6 +346,12 @@ def mode_summarize(a, og=None):
         gates.append(gate("O_cell_bitwise", p["diff_rows"] == 0 and p["rows_compared"] > 0
                           and p["stats"].get("shared", 0) > 0, True,
                           "diff_rows %d over %d rows, stats %s" % (p["diff_rows"], p["rows_compared"], p["stats"])))
+        if getattr(a, "union", "torch") == "fused":                    # [sharedkv4, review MAJOR-1]
+            ud = p.get("union_diff", {})
+            gates.append(gate("O_cell_fused_union_equals_torch", p.get("union_checked", 0) > 0
+                              and all(v == 0 for v in ud.values()), True,
+                              "%d keyed calls compared with build_union; differing elements per field %s"
+                              % (p.get("union_checked", 0), ud)))
         gates.append(gate("O_cell_marked", len(cell["ncu"]["marked"]) == a.window[1], True,
                           "%d marked of %d requested (calls with 4 rows seen: %d)"
                           % (len(cell["ncu"]["marked"]), a.window[1], cell["ncu"]["full_calls"])))
@@ -367,13 +391,19 @@ def mode_summarize(a, og=None):
                        % (x_pr, x_sh, BREAK_EVEN))
                 gates.append(gate("R_S3_decision", True, False, dec + "; f (the paid part of the logical excess) "
                                   "%s" % (None if q["f"] is None else round(q["f"], 4))))
+        if win["passed"] and getattr(a, "union", "torch") == "fused":  # [sharedkv4 MINOR-5] the build that ran
+            nks = d["bd"]["union_kernels_per_call"]
+            gates.append(gate("O_build_kernel_%s" % cc, nks == [1], primary,
+                              "fused arm: _union_kernel launches per marked call %s (must be exactly 1 in every "
+                              "call; 0 = a silent fallback to the torch build); calls with only the kernel %d"
+                              % (nks, d["bd"]["calls_only_union_kernel"])))
         if win["passed"]:                                               # [review MAJOR-2 / MAJOR-3] device time
             gates.append(gate("R_S3_device_time_%s" % cc, True, False,
                               "%s device kernel time (ncu gpu__time_duration, serialized, %s L2): %s; %s; main "
                               "kernels only %s; build %d kernels %.0f ns"
                               % ("PRIMARY" if cc == "none" else "REPORT", "cold" if cc == "all" else "tick",
                                  (band("time_with_fused_build", mode, q["time_with_build"]) + "; " +
-                                  band("build_us_fused", mode, q["build_us_per_call"])
+                                  band("build_us_fused", mode, q["build_us_union_only"])
                                   if getattr(a, "union", "torch") == "fused" else
                                   band("time_with_build", mode, q["time_with_build"])),
                                  band("time_kernel", mode, q["time_kernel"]), q["time_ratio_main"],
