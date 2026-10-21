@@ -1764,3 +1764,66 @@ def test_F21b_sc_equals_v1_with_an_asynchronous_transport(exact):
     assert bad == [], bad[:3]
     n = wv.svc.metrics.counts.get("verifier_inflight_evictions", 0)
     assert n > 0 and ws.svc.metrics.counts.get("verifier_inflight_evictions", 0) == n, wv.svc.metrics.counts
+
+
+# =====================================================================================================================
+# F23 every Triton kernel we own resolves its names in its MODULE globals (fg5 on holder 2190876)
+# =====================================================================================================================
+def _kernel_name_problems(jf):
+    """The names a @triton.jit kernel needs but Triton's GPU compiler cannot see: its free (closure) variables, and
+    every global it loads (LOAD_GLOBAL, nested code included) that is neither in its module globals (fn.__globals__)
+    nor a builtin."""
+    import builtins
+    import dis
+    fn = getattr(jf, "fn", jf)
+    out = list(fn.__code__.co_freevars)
+
+    def walk(code):
+        for ins in dis.get_instructions(code):
+            if ins.opname == "LOAD_GLOBAL" and ins.argval not in fn.__globals__ and not hasattr(builtins, ins.argval):
+                out.append(ins.argval)
+        for c in code.co_consts:
+            if hasattr(c, "co_code"):
+                walk(c)
+    walk(fn.__code__)
+    return out
+
+
+def test_F23_every_triton_kernel_resolves_its_names_in_its_module():
+    """F23 (fg5 on holder 2190876: the exact wait's kernel failed to compile on the GPU, "NameError: tl is not
+    defined". It was built inside a factory whose local `import triton.language as tl` is invisible to Triton's
+    compiler, which resolves a kernel's names in fn.__globals__; no CPU test compiled it). For every @triton.jit
+    kernel in the Triton modules of the R2 line (nosi/nosi/r2_*.py, max_pooling_per_request.py, and the
+    flash_cache_engine h2d kernels CudaDeviceOps launches), its code has no free variable and every global it
+    loads resolves in its module or in builtins. Precondition: S-C's board_wait_kernel is among them. Negative
+    control: a planted kernel built in a factory with a local-only import fails the check."""
+    triton = pytest.importorskip("triton")
+    from triton.runtime.jit import JITFunction
+    paths = sorted(p for p in NOSI.glob("r2_*.py") if "triton.jit" in p.read_text())
+    paths += [NOSI / "max_pooling_per_request.py", NOSI / "flash_cache_engine/flash_h2d_mask.py",
+              NOSI / "flash_cache_engine/flash_h2d_mask_bias.py"]
+    kernels = []
+    for p in paths:
+        name = PKG + "." + ".".join(p.relative_to(NOSI).with_suffix("").parts)
+        if name not in sys.modules:
+            spec = importlib.util.spec_from_file_location(name, str(p))
+            m = importlib.util.module_from_spec(spec)
+            sys.modules[name] = m
+            spec.loader.exec_module(m)
+        for v in vars(sys.modules[name]).values():
+            if isinstance(v, JITFunction):
+                kernels.append((name, v))
+    assert any(v is getattr(SC, "board_wait_kernel", None) for _, v in kernels), [n for n, _ in kernels]
+    bad = [(n, getattr(getattr(v, "fn", v), "__name__", "?"), _kernel_name_problems(v)) for n, v in kernels
+           if _kernel_name_problems(v)]
+    assert bad == [], bad
+
+    def factory():
+        import triton.language as tl_local
+
+        @triton.jit
+        def planted(x_ptr, BLOCK: tl_local.constexpr):
+            offs = tl_local.arange(0, BLOCK)
+            tl_local.store(x_ptr + offs, offs)
+        return planted
+    assert _kernel_name_problems(factory()) == ["tl_local"]

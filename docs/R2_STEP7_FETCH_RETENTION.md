@@ -460,6 +460,15 @@ layer's verify rows read in flight, on the device, with no host step:
   block; negative controls: a wait that accepts the previous generation reads the old block (content check); a
   transport that never publishes runs the spin out and the watched `err` refuses the tick); GT4 (gilfree publishes
   exactly its transfers' (slot, generation) after the release; negative: no board attached, no publication).
+- FIRST GPU COMPILE (fg5 on holder 2190876, 2026-10-21): the kernel failed with "NameError: tl is not defined".
+  - Cause: it was built inside the factory `_wait_kernel`, whose local imports of triton / triton.language were
+    invisible to Triton's GPU compiler. That compiler resolves a kernel's names in its module globals
+    (fn.__globals__); in the nested kernel, `tl` was a closure variable. No CPU test compiled the kernel.
+  - Fix: `board_wait_kernel` is now defined at MODULE level, with guarded module imports of triton and
+    triton.language (as max_pooling_per_request.py does). `_wait_kernel()` returns it, or refuses without triton.
+  - Test F23: for every @triton.jit kernel of the R2 line (r2_*.py, max_pooling_per_request.py, the h2d kernels),
+    the kernel has no free variable, and every global it loads resolves in its module or in builtins.
+    Precondition: board_wait_kernel is found. Negative control: a planted kernel with a local-only import fails.
 
 ## 12g. The GPU gates FG1 - FG3 on the real tick (`benchmarks/Efficiency/r2_fetch_fg.py`, 2026-10-21)
 

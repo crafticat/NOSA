@@ -81,6 +81,12 @@ from typing import Dict, List, Sequence, Set, Tuple
 
 import torch
 
+try:                                                      # triton is needed only to launch the exact wait's kernel on
+    import triton                                         # the GPU: a CPU test without triton imports this module
+    import triton.language as tl
+except ImportError:                                       # pragma: no cover - environment dependent
+    triton = tl = None
+
 from .kstep.backend import ev_done
 from .kstep.errors import CapacityRefusal, OwnershipViolation
 from .kstep.ownership import FREE, INFLIGHT, LRU, PO, RELEASING, VRES
@@ -699,37 +705,38 @@ class ExactWaitSim(CpuDeviceSim):
             self.waited += 1
 
 
-_WAIT_KERNEL = None
+# The exact wait's Triton kernel (note 12f). ONE program (one SM: the scatter stream's kernels keep the others) walks
+# the wait list in blocks; per block it spins with VOLATILE loads of the board until every listed entry reached its
+# generation, at most max_spin rounds; then any entry short or past raises err (int32, atomic max). The board write
+# that ends a spin is enqueued after the scatter on the scatter stream, so the slot's rows are complete when the main
+# stream's next kernel reads them. It is defined at MODULE level: Triton's GPU compiler resolves a kernel's names in
+# its module globals (fn.__globals__), never in an enclosing function (fg5 on holder 2190876: "NameError: tl is not
+# defined" from a factory's local import; test F23 guards every kernel we own).
+if triton is not None:
+    @triton.jit
+    def board_wait_kernel(board_ptr, idx_ptr, gen_ptr, n, err_ptr, max_spin, BLOCK: tl.constexpr):
+        for start in range(0, n, BLOCK):
+            offs = start + tl.arange(0, BLOCK)
+            inb = offs < n
+            idx = tl.load(idx_ptr + offs, mask=inb, other=-1)
+            want = tl.load(gen_ptr + offs, mask=inb, other=0)
+            live = idx >= 0
+            safe = tl.where(live, idx, 0)
+            got = tl.load(board_ptr + safe, mask=live, other=0, volatile=True)
+            k = 0
+            while (tl.max((live & (got < want)).to(tl.int32), axis=0) > 0) & (k < max_spin):
+                got = tl.load(board_ptr + safe, mask=live, other=0, volatile=True)
+                k += 1
+            tl.atomic_max(err_ptr, tl.max((live & (got != want)).to(tl.int32), axis=0))
+else:                                                     # pragma: no cover - environment dependent
+    board_wait_kernel = None
 
 
 def _wait_kernel():
-    """The exact wait's Triton kernel, built on first use. SOURCE ONLY, NOT RUN YET (GPU gate FG1). ONE program (one
-    SM: the scatter stream's kernels keep the others) walks the wait list in blocks; per block it spins with VOLATILE
-    loads of the board until every listed entry reached its generation, at most max_spin rounds; then any entry short
-    or past raises err (int32, atomic max). The board write that ends a spin is enqueued after the scatter on the
-    scatter stream, so the slot's rows are complete when the main stream's next kernel reads them."""
-    global _WAIT_KERNEL
-    if _WAIT_KERNEL is None:
-        import triton
-        import triton.language as tl
-
-        @triton.jit
-        def kernel(board_ptr, idx_ptr, gen_ptr, n, err_ptr, max_spin, BLOCK: tl.constexpr):
-            for start in range(0, n, BLOCK):
-                offs = start + tl.arange(0, BLOCK)
-                inb = offs < n
-                idx = tl.load(idx_ptr + offs, mask=inb, other=-1)
-                want = tl.load(gen_ptr + offs, mask=inb, other=0)
-                live = idx >= 0
-                safe = tl.where(live, idx, 0)
-                got = tl.load(board_ptr + safe, mask=live, other=0, volatile=True)
-                k = 0
-                while (tl.max((live & (got < want)).to(tl.int32), axis=0) > 0) & (k < max_spin):
-                    got = tl.load(board_ptr + safe, mask=live, other=0, volatile=True)
-                    k += 1
-                tl.atomic_max(err_ptr, tl.max((live & (got != want)).to(tl.int32), axis=0))
-        _WAIT_KERNEL = kernel
-    return _WAIT_KERNEL
+    """The exact wait's Triton kernel (board_wait_kernel); triton is needed only here, on the GPU."""
+    if board_wait_kernel is None:
+        raise RuntimeError("the exact device wait needs triton (the CPU stand-in is ExactWaitSim)")
+    return board_wait_kernel
 
 
 class CudaDeviceOps:
