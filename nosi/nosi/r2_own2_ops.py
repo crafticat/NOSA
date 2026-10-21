@@ -322,6 +322,7 @@ def evict_over_c(T: Table, streams: torch.Tensor, anyw: torch.Tensor, undo: Opti
     blk = T.flat("block")[fv].to(torch.int64)
     pinned = bit_test(anyw, vss, blk)
     if mut and mut.get("evict_po_unpinned"):
+        out["forced_po"] = (~pinned).sum()                      # the victims the control makes PO wrongly
         pinned = torch.ones_like(pinned)
     _put(undo, T.flat("code"), fv, torch.where(pinned, torch.full_like(blk, C_PO), torch.full_like(blk, C_RELEASING)))
     out["evict_po"] = pinned.sum()
@@ -407,20 +408,30 @@ def drop_due_keys(T: Table, win: ReaderWindow, undo: Optional[Undo] = None) -> D
     """The queued reference releases whose (key, l) reader completed (res.py:283-297 middle part, _drop :298-305,
     Stream.unprotect own.py:213-237): both kind planes of the key slot are cleared at (l, b); PO / VRES slots of those
     streams with no pin bit left -> RELEASING (readers kept)."""
-    g = T.geo
-    d = T.dev
     due = T.rel_q & win.done_of(T.key_rd)
     out = dict(keys_dropped=0, unprotect_rel=0)
     if not bool(due.any()):
         return out
     l_i, b_i, k_i = due.nonzero(as_tuple=True)
+    _put(undo, T.rel_q.view(-1), (l_i * T.geo.B + b_i) * T.geo.KEYS + k_i, False)
+    return drop_keys(T, l_i, b_i, k_i, undo)
+
+
+def drop_keys(T: Table, l_i: torch.Tensor, b_i: torch.Tensor, k_i: torch.Tensor, undo: Optional[Undo] = None) -> Dict:
+    """Drop the references of key slots k_i at (l_i, b_i) (Stream.unprotect own.py:213-237, _drop res.py:298-305): both
+    kind planes cleared; the PO / VRES slots of those streams with no pin bit left -> RELEASING (readers kept).
+    Distinct (l, b, k) triples. Returns the counts (unprotect_rel: the releases, journal "release:unprotect")."""
+    g = T.geo
+    d = T.dev
+    out = dict(keys_dropped=int(l_i.numel()), unprotect_rel=0)
+    if l_i.numel() == 0:
+        return out
     pw = T.pin_w
     for planes in (k_i, k_i + g.KEYS):
         old = pw[planes, l_i, b_i].clone()
         if undo is not None:
             undo.call(lambda p=planes, li=l_i, bi=b_i, o=old: pw.__setitem__((p, li, bi), o))
         pw[planes, l_i, b_i] = 0
-    _put(undo, T.rel_q.view(-1), (l_i * g.B + b_i) * g.KEYS + k_i, False)
     lb = torch.unique(l_i * g.B + b_i)
     streams = (lb.view(-1, 1) * g.H + torch.arange(g.H, device=d).view(1, -1)).view(-1)
     rows = T.c["code"].view(g.S, g.NPOS)[streams]
@@ -430,9 +441,28 @@ def drop_due_keys(T: Table, win: ReaderWindow, undo: Optional[Undo] = None) -> D
     rel = pv & ~pinned
     f = (streams.view(-1, 1) * g.NPOS + torch.arange(g.NPOS, device=d).view(1, -1))[rel]
     _put(undo, T.flat("code"), f, C_RELEASING)
-    out["keys_dropped"] = int(l_i.numel())
     out["unprotect_rel"] = int(f.numel())
     return out
+
+
+def end_owner(T: Table, b: int, undo: Optional[Undo] = None) -> int:
+    """Request end (Stream.end_owner own.py:363-384 at every layer and head of batch slot b): its LRU / PO / VRES slots
+    -> RELEASING (readers kept; journal "release:end"), every pin of b cleared, the owner -1 (its transfers in flight
+    stay in flight and are dropped at their arrival, T3). Returns the releases."""
+    g = T.geo
+    code = T.c["code"][:, b]                                           # (L, H, NPOS)
+    m = (code == C_LRU) | (code == C_PO) | (code == C_VRES)
+    lo = torch.arange(g.L, device=T.dev).view(-1, 1, 1)
+    ho = torch.arange(g.H, device=T.dev).view(1, -1, 1)
+    so = torch.arange(g.NPOS, device=T.dev).view(1, 1, -1)
+    f = ((((lo * g.B + b) * g.H + ho) * g.NPOS) + so).expand(g.L, g.H, g.NPOS)[m]
+    _put(undo, T.flat("code"), f, C_RELEASING)
+    if undo is not None:
+        old = T.pin_w[:, :, b].clone()
+        undo.call(lambda o=old: T.pin_w[:, :, b].copy_(o))
+    T.pin_w[:, :, b] = 0
+    T.owner[b] = -1
+    return int(f.numel())
 
 
 def poll_releases(T: Table, win: ReaderWindow, undo: Optional[Undo] = None) -> int:
@@ -824,6 +854,10 @@ def recency(T: Table, D: Dict[str, torch.Tensor], rows: Rows, undo: Optional[Und
         e = evict_over_c(T, streams, any_pin_words(T), undo, mut)
         out["evict_po"] = out["evict_po"] + e["evict_po"]
         out["evict_rel"] = out["evict_rel"] + e["evict_rel"]
+        if "forced_po" in e:
+            out["forced_po"] = out.get("forced_po", 0) + e["forced_po"]
+        if mut and mut.get("reverse_stamps") and bool(m.any()):   # (tests only: the control's precondition)
+            out["max_stream_reads"] = max(out.get("max_stream_reads", 0), int(torch.bincount(D["s"][m]).max()))
         out["rounds"] += 1
     return out
 
