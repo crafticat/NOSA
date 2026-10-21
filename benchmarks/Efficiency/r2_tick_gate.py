@@ -61,6 +61,7 @@ import os
 import sys
 import time
 import traceback
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -68,6 +69,66 @@ import r2_g0_gate as G0  # noqa: E402  (load_workload)
 import r2_g0bi_gate as GB  # noqa: E402  (decode_loop, load_by_path, free, gate)
 
 PARTS = ("SG0", "SG1", "SG2", "SG3", "SG4")
+ATTN_VARIANTS = ("per_row", "shared", "shared-whole", "probe", "probe-whole", "probe-plant")   # [sharedkv]
+ROOT = Path(HERE).resolve().parents[1]                                                          # [sharedkv]
+# [sharedkv] REGISTERED bands (docs/R2_SHAREDKV_PLAN.md section 4), over ALL keyed calls (tiles) and over the keyed
+# calls of rows_max 4 (time: shared kernel + combine over piece 3's split + combine, the union build excluded)
+SKV_PRED = {"split": dict(tiles=(0.30, 0.60), time=(0.55, 1.10)),
+            "whole": dict(tiles=(0.24, 0.36), time=(0.80, 3.50))}
+
+
+def select_attn(a, attn):
+    """[sharedkv] the tick's attention object for --attn (docs/R2_SHAREDKV_PLAN.md). per_row: piece 3 itself, the
+    default (SG5 / p6 comparability). Every other choice wraps the SAME loaded piece 3 module; calls without page_key
+    (the BI serial REF) still run piece 3 (the wrapper's stats count them)."""
+    if a.attn == "per_row":
+        return attn
+    sk = GB.load_by_path(a.sharedkv, "sharedkv_bi_paged_attention")
+    mode = "whole" if a.attn.endswith("whole") else "split"
+    if a.attn.startswith("probe"):
+        return sk.SharedKVProbe(attn, mode=mode, plant=(a.attn == "probe-plant"))
+    return sk.SharedKV(attn, mode=mode)
+
+
+def sharedkv_gates(a, obj, gates, res):
+    """[sharedkv] after the parts: the selector RAN (MUST, else every bitwise gate above is blind to it), and for the
+    probes the in-tick bitwise A/B (MUST 0 differing rows; probe-plant MUST > 0 = DETECTED, 0 = a NO-OP plant, L34)
+    and the per-call times (REPORT; the registered band lives in the plan, the summary keeps the raw times)."""
+    if a.attn == "per_row":
+        return
+    st = dict(obj.stats)
+    gates.append(GB.gate("SKV_shared_kernel_ran", st.get("shared", 0) > 0, True, "stats %s" % st))
+    if not a.attn.startswith("probe"):
+        res["SKV"] = dict(attn=a.attn, stats=st)
+        return
+    rep = obj.report()
+    res["SKV"] = rep
+    if a.attn == "probe-plant":
+        gates.append(GB.gate("SKV_plant_detected", rep["diff_rows"] > 0, True,
+                             "%d of %d compared rows differ (0 = the plant was a NO-OP on these inputs: BLIND)"
+                             % (rep["diff_rows"], rep["rows_compared"])))
+        return
+    gates.append(GB.gate("SKV_bitwise_shared_equals_per_row", rep["diff_rows"] == 0 and rep["rows_compared"] > 0, True,
+                         "%d of %d compared rows differ (int views: a sign-of-zero difference counts)"
+                         % (rep["diff_rows"], rep["rows_compared"])))
+    by = {}
+    for (nr, first, pr), (_, _, sh), (_, _, bd) in zip(rep["per_row_ms"], rep["shared_ms"], rep["build_ms"]):
+        by.setdefault((nr, first), []).append((sh / pr if pr > 0 else float("nan"), (sh + bd) / pr if pr > 0 else float("nan")))
+    txt = []
+    pred = SKV_PRED[rep["mode"]]
+    for key in sorted(by):
+        k_only = sorted(x for x, _ in by[key])
+        with_b = sorted(y for _, y in by[key])
+        med, medb = k_only[len(k_only) // 2], with_b[len(with_b) // 2]
+        band = pred["time"] if key[0] == 4 else None
+        txt.append("rows_max %d first %s: n %d median shared/per_row %.3f (with the union build %.3f)%s"
+                   % (key[0], key[1], len(k_only), med, medb,
+                      "" if band is None else " band %s %s" % (band, "IN" if band[0] <= med <= band[1] else "OUT")))
+    gates.append(GB.gate("R_SKV_time_ratio", True, False, "; ".join(txt) or "no timed call"))
+    tr = rep["tile_ratio"]
+    gates.append(GB.gate("R_SKV_tile_ratio", True, False, "tiles shared / per-row %s, 64-row tile rows %s; band %s %s"
+                         % (tr, rep["row_ratio"], pred["tiles"],
+                            "n/a" if tr is None else ("IN" if pred["tiles"][0] <= tr <= pred["tiles"][1] else "OUT"))))
 
 
 def log(msg):
@@ -95,6 +156,13 @@ def parse_args(argv):
     ap.add_argument("--m-fix", type=int, default=0, help="G-b's row count; 0 = 4B")
     ap.add_argument("--no-check", action="store_true", help="skip the per-layer selection check (a host read)")
     ap.add_argument("--parts", default="SG0,SG1,SG2,SG3,SG4")
+    ap.add_argument("--attn", default="per_row", choices=ATTN_VARIANTS,                         # [sharedkv]
+                    help="the tick's attention: per_row = piece 3 (default, unchanged); shared[-whole] = the "
+                         "shared-read kernel IN the tick (SG1-SG3 then gate it bitwise against the BI serial REF); "
+                         "probe[-whole] = both kernels on every keyed call, piece 3's output returned, bitwise and "
+                         "time A/B; probe-plant = probe with one union page dropped (the negative control)")
+    ap.add_argument("--sharedkv", default=str(ROOT / "nosi/nosi/bi_paged_attention_shared.py"),   # [sharedkv]
+                    help="the shared-read module (loaded by path; it imports nothing from nosi)")
     a = ap.parse_args(argv)
     a.deltas = [int(x) for x in a.deltas.split(",") if x != ""]
     a.parts = [p for p in a.parts.split(",") if p]
@@ -423,7 +491,8 @@ def main(argv=None) -> int:
         docs, sha = G0.load_workload(a.workload, a.batch, a.S)
         os.makedirs(a.out)
         attn = GB.load_by_path(a.biattn, "piece3_bi_paged_attention")
-        ops = BIOps(attn, a.m_fix, gemm=a.gemm)
+        attn_tick = select_attn(a, attn)                                   # [sharedkv] per_row: attn itself
+        ops = BIOps(attn_tick, a.m_fix, gemm=a.gemm)
         t0 = time.time()
         model = Llama(model_name=a.model, device="cuda", offload=True)
         log("model loaded in %.0f s, allocated %.1f GB" % (time.time() - t0, torch.cuda.memory_allocated() / 1e9))
@@ -487,6 +556,12 @@ def main(argv=None) -> int:
                     gates.append(GB.gate("PART_%s" % label, False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:400])))
                 GB.free()
                 save()
+        try:                                                               # [sharedkv]
+            sharedkv_gates(a, attn_tick, gates, res)
+        except Exception as e:
+            traceback.print_exc()
+            gates.append(GB.gate("PART_SKV", False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:400])))
+        meta["attn"] = a.attn
         meta["peak_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 2)
         save()
         for g in gates:

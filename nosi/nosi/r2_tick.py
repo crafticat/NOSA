@@ -20,6 +20,10 @@ row reading only its own state:
      blocks in ASCENDING BLOCK ID: blocks <= T - 2 from the historical slots, T - 1 from its historical slot once it is
      written back (else from the row's bank's ring), T = p // 64 from the ring, cut at last_len = p % 64 + 1 (the
      row's own extent; the slot-63 naming rule of r2_bi_decode.page_table).
+     [sharedkv] SELECTOR: when ops.attn has needs_page_key (bi_paged_attention_shared.SharedKV; default: piece 3
+     itself, no change), the call also gets page_key (the block ids, backend.page_keys) and rows_max (the most rows
+     of one request in this tick), and a request's rows read each page once (docs/R2_SHAREDKV_PLAN.md). The
+     ResidentStore gives keys; the ResidencyBackend refuses (not built).
   7. wo, gate_up, silu_and_mul, down through ops.linear.
 Final rmsnorm, lm_head through ops.linear, .float(); the argmax of every row goes to the DEVICE TOKEN LOG.
 
@@ -613,8 +617,14 @@ class TickEngine:
             cu_q = self.cu_q_cache[R] = torch.arange(R + 1, dtype=torch.int32, device=self.dev)
         ids = torch.where(lit >= 0, lit, self.tok_log[slot]).view(R, 1)
         any_draft = any(r.kind == "d" for r in rows)
+        rows_max = None
+        if getattr(ops.attn, "needs_page_key", False):                       # [sharedkv] host: rows per request
+            per_req: Dict[int, int] = {}                                     # (the default path skips this)
+            for r in rows:
+                per_req[r.b] = per_req.get(r.b, 0) + 1
+            rows_max = max(per_req.values())
         ctx = SimpleNamespace(pos=pos, rb=rb, rb32=rb32, prev_slot=prev_slot, tail_slot=tail_slot, is_draft=is_draft,
-                              any_draft=any_draft, last=last, rows=svc_rows)
+                              any_draft=any_draft, last=last, rows=svc_rows, rows_max=rows_max)
         pos0 = list(self.bank_pos)
         hidden = F.embedding(ids, model.embed_tokens)
         ctrs = []
@@ -698,9 +708,13 @@ class TickEngine:
             table, npg, last, seq_idx, plan = self.backend.pages(l, ctx, sel, layer)
         if self.timer is not None:
             self.timer.host("backend", time.perf_counter() - t_res)
+        akw = {}
+        if getattr(self.ops.attn, "needs_page_key", False):                # [sharedkv] the selector (default: piece 3)
+            with self._span("res"):
+                akw = dict(page_key=self.backend.page_keys(l, ctx, sel, layer), rows_max=ctx.rows_max)
         with self._span("att"):
             attn = self.ops.attn.bi_paged_decode(q, self.store_k[l], self.store_v[l], self.store_bias[l], seq_idx,
-                                                 table, npg, last)
+                                                 table, npg, last, **akw)
         t_res = time.perf_counter()
         with self._span("res"):
             self.backend.after_attention(l, plan)
@@ -725,6 +739,16 @@ class TickEngine:
         table[:, :, K - 2] = prev_slot.view(R, 1)
         if not (any_draft and self.draft_drop > 0):
             return table, torch.full((R, H), K, dtype=torch.int32, device=self.dev)
+        keep, dest = self._draft_keep(l, sel, pos, rb, is_draft, layer)
+        out = torch.full((R, H, K + 1), -1, dtype=torch.int32, device=self.dev)
+        out.scatter_(2, dest, table)
+        return out[:, :, :K].contiguous(), keep.sum(-1).to(torch.int32).contiguous()
+
+    def _draft_keep(self, l, sel, pos, rb, is_draft, layer):
+        """The draft drop stand-in (module docstring): (keep (R, H, K) bool, dest (R, H, K) int64: the compacted
+        position of each kept entry, K for a dropped one). Shared by page_table and page_keys (sharedkv), so the keys
+        are compacted exactly like the table. Moved out of page_table unchanged (the same ops in the same order)."""
+        H, R, K = sel.shape
         blk = sel.permute(1, 0, 2)                                                       # (R, H, K) int64
         T = (pos // BLOCK).view(R, 1, 1)
         hh = torch.arange(H, device=self.dev).view(1, H, 1)
@@ -733,9 +757,20 @@ class TickEngine:
         drop = is_draft.view(R, 1, 1) & middle & ((x % 1000) < int(round(self.draft_drop * 1000)))
         keep = ~drop
         dest = torch.where(keep, keep.to(torch.int64).cumsum(-1) - 1, torch.full_like(blk, K))
+        return keep, dest
+
+    def page_keys(self, l, sel, pos, rb, is_draft, any_draft, layer):
+        """[sharedkv] (R, H, topk) int32: the BLOCK ID of every entry of page_table's lists (the selection itself, before
+        the renaming of T - 1, T to slots), compacted exactly like the table. The shared-read attention orders a
+        request's union pages by (block id, slot); a ring slot alone does not give the block order."""
+        H, R, K = sel.shape
+        blk = sel.permute(1, 0, 2).to(torch.int32).contiguous()
+        if not (any_draft and self.draft_drop > 0):
+            return blk
+        _, dest = self._draft_keep(l, sel, pos, rb, is_draft, layer)
         out = torch.full((R, H, K + 1), -1, dtype=torch.int32, device=self.dev)
-        out.scatter_(2, dest, table)
-        return out[:, :, :K].contiguous(), keep.sum(-1).to(torch.int32).contiguous()
+        out.scatter_(2, dest, blk)
+        return out[:, :, :K].contiguous()
 
     # ------------------------------------------------------------------ decisions
     def overflow_flag(self) -> torch.Tensor:
@@ -946,6 +981,10 @@ class ResidentStore:
                                          ctx.any_draft, layer)
         return table, npg, ctx.last, ctx.rb32, None
 
+    def page_keys(self, l, ctx, sel, layer):
+        """[sharedkv] the block id of every page_table entry (TickEngine.page_keys)."""
+        return self.eng.page_keys(l, sel, ctx.pos, ctx.rb, ctx.is_draft, ctx.any_draft, layer)
+
     def after_attention(self, l, plan) -> None:
         pass
 
@@ -1029,6 +1068,11 @@ class ResidencyBackend:
         dev = self.eng.dev
         return (plan.page_table.to(dev).contiguous(), plan.num_pages.to(dev).contiguous(),
                 plan.last_len.to(dev).contiguous(), plan.seq_idx.to(dev).contiguous(), plan)
+
+    def page_keys(self, l, ctx, sel, layer):
+        """[sharedkv] NOT BUILT: the Residency's plan compacts a draft row by readiness on its own, so the keys would
+        need the plan's own block-id tensor (a follow-up with C). Refused, never guessed."""
+        raise TickError("sharedkv: the Residency backend gives no page keys yet (use the ResidentStore, or per_row)")
 
     def after_attention(self, l, plan) -> None:
         self.svc.read_done(l, plan, self.new_event())
