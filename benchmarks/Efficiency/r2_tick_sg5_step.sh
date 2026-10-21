@@ -59,7 +59,21 @@
 #            steps, --repeat-docs (B > 94 documents), --log-slots -1 (the round's size), --skip-shipped (no shipped
 #            child: its pinned rows would need 145-273 GiB of host memory), no --pool-baseline, no sweep, --mem 200G.
 #            Its ROOT is NOSI_BIGB (nosi-r2-bigb); run B 128 before B_max at each C.
-#   STEP_MIN 120 in every cell.
+#   STEP_MIN 120 in every cell above.
+#   [fusedres2] the FR-g cells of docs/R2_FUSEDRES_PLAN.md section 7 (p5b2's point: --modes exact,fast --backends b2
+#   --C 96 --X 64 --R-ver 16, no sweep, gilfree 8 threads, unchecked), with NOSI = FRNOSI (the fusedres2 worktree)
+#   for THESE cells only (every other cell keeps NOSI):
+#     frg0   --b2-resolve check, --draft-ticks 4, 48 steps, no pool baseline        GPU equality gate     STEP_MIN 120
+#     frg0x  frg0 at the pressure point --C 24 --X 8 --R-ver 4                      coverage arm          STEP_MIN 120
+#     frg0p  --b2-resolve check --b2-fused-plant 2, --draft-ticks 4, 8 steps        GPU negative control  STEP_MIN 60
+#     frg1   p5b2's arguments + --b2-resolve torch                                  control (always runs) STEP_MIN 60
+#     frg2   p5b2's arguments + --b2-resolve fused                                  event-span timing     STEP_MIN 60
+#     frg3   --b2-resolve fused --b2-res-profile, 12 draft ticks, 8 steps, no pool  kernel time of res    STEP_MIN 60
+#     frg3t  --b2-resolve torch --b2-res-profile, 12 draft ticks, 8 steps, no pool  control (always runs) STEP_MIN 90
+#     frg    the seven above in that order, each its own step (this script per cell, its own claim and record);
+#            after the first cell that exits non-zero, the remaining non-control cells are SKIPPED (frg1 and frg3t
+#            always run); exit = the number of cells that ran and failed (or were refused); one line per cell
+#   (p5b2 took 17.6 min; the check arms add the torch reference and a host compare per layer, about x 2-3.)
 #
 # REGISTERED for stack1 ([integ], 2026-10-21T11:51:27Z, SOURCE ONLY, not run; docs/R2_INTEG_PLAN.md section 5 has
 # every band, its derivation and the falsifiers F-ST1..5). Order stack1a, stack1t, stack1b; stop at the first nonzero
@@ -141,6 +155,7 @@ NOSI=/mnt/beegfs/ojerbi/nosi-r2-sg5-p6                                          
 NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                                 # ROOT of cell x1 only ([xpool], review m8)
 NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-integ2                                             # ROOT of the stack1 cells only ([integ], integ2)
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
+FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -166,7 +181,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1a|stack1t|stack1b] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1a|stack1t|stack1b|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -177,10 +192,31 @@ for w in "$@"; do
         gilfree|gather) [ -z "$TRANSPORT" ] || usage; TRANSPORT=$w ;;
         p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1a|stack1t|stack1b)
             [ -z "$CELL" ] || usage; CELL=$w ;;
+        frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg) [ -z "$CELL" ] || usage; CELL=$w ;;          # [fusedres2]
         *) usage ;;
     esac
 done
 TRANSPORT=${TRANSPORT:-gilfree}
+if [ "$CELL" = frg ]; then                                  # [fusedres2] the combined cell: one step per FR-g cell
+    nfail=0 stopped=
+    for sub in frg0 frg0x frg0p frg1 frg2 frg3 frg3t; do
+        case $sub in frg1|frg3t) ctl=1 ;; *) ctl=0 ;; esac
+        if [ -n "$stopped" ] && [ "$ctl" = 0 ]; then
+            echo "R2 SG5 frg: cell $sub SKIPPED (after the failure of $stopped)"
+            continue
+        fi
+        bash "$0" --nosi "$NSHA" "$JOB" "$RUN" "$sub" "$TRANSPORT"
+        src=$?
+        echo "R2 SG5 frg: cell $sub exit $src"
+        if [ "$src" != 0 ]; then
+            nfail=$((nfail + 1))
+            [ "$ctl" = 1 ] || [ -n "$stopped" ] || stopped=$sub
+        fi
+    done
+    echo "R2 SG5 frg: done; cells failed or refused $nfail; first MUST failure ${stopped:-none}"
+    [ "$nfail" -le 125 ] || nfail=125
+    exit "$nfail"
+fi
 MODES=exact,fast
 BACKENDS=sc,sb,v1
 SWEEP_RUN=$SWEEP
@@ -190,9 +226,11 @@ XPOOL=                                                      # [xpool] x1 only
 STACKARG=()                                                 # [integ] the stack1 cells only (BATCH / MEMG / POOLB below)
 PC=96 PX=32 PRV=16                                          # the primary point (C, X, R_ver)
 BATCH=64 STEPS=48 MEMG=120G                                 # [bigb] every other cell: as before
-POOLB=(--pool-baseline)                                     # [bigb] every other cell: as before
-BIGB=                                                       # [bigb] the bigb cells only
-BIGBARG=()
+POOLB=(--pool-baseline)                                     # [bigb] every other cell: as before ([fusedres2]'s POOLARG
+BIGB=                                                       # is the same array: merged into POOLB in integ2)
+BIGBARG=()                                                  # [bigb] the bigb cells only
+DTICKS=12                                                   # [fusedres2] --draft-ticks (p3's in every cell but frg*);
+FRARG=()                                                    # the frg* cells' extra flags in FRARG
 case $CELL in
     "") ;;                                                  # the default: p3's arguments
     p4a) SWEEP_RUN= ; SUFFIX=_p4a ;;                        # the six points; --sweep left out (its default "": none)
@@ -212,7 +250,18 @@ case $CELL in
     bigb*) MODES=exact ; BACKENDS=b2 ; PX=64 ; PRV=16 ; SWEEP_RUN= ; SUFFIX=_${CELL//-/_} ; NOSI=$NOSI_BIGB   # [bigb]
         BIGB=$CELL ; PC=${CELL:4:2} ; BATCH=${CELL#bigb??-} ; STEPS=24 ; MEMG=200G ; POOLB=()
         BIGBARG=(--layout pool --X-pool 64 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped) ;;
+    frg*) BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_$CELL ; NOSI=$FRNOSI   # [fusedres2] p5b2's point, the FR root
+        case $CELL in
+            frg0) DTICKS=4 ; POOLB=() ; FRARG=(--b2-resolve check) ; STEP_MIN=120 ;;
+            frg0x) PC=24 ; PX=8 ; PRV=4 ; DTICKS=4 ; POOLB=() ; FRARG=(--b2-resolve check) ; STEP_MIN=120 ;;
+            frg0p) DTICKS=4 ; STEPS=8 ; POOLB=() ; FRARG=(--b2-resolve check --b2-fused-plant 2) ; STEP_MIN=60 ;;
+            frg1) FRARG=(--b2-resolve torch) ; STEP_MIN=60 ;;
+            frg2) FRARG=(--b2-resolve fused) ; STEP_MIN=60 ;;
+            frg3) STEPS=8 ; POOLB=() ; FRARG=(--b2-resolve fused --b2-res-profile) ; STEP_MIN=60 ;;
+            frg3t) STEPS=8 ; POOLB=() ; FRARG=(--b2-resolve torch --b2-res-profile) ; STEP_MIN=90 ;;
+        esac ;;
 esac
+MIN_LEFT=$((STEP_MIN * 60 + 600))                           # [fusedres2] after the cell's STEP_MIN
 VARIANTARG=()                                               # [batched-rebuild] no --variants in every other cell
 [ -z "$VARIANTS" ] || VARIANTARG=(--variants "$VARIANTS")
 XPOOLARG=()                                                 # [xpool] no layout argument in every other cell
@@ -262,6 +311,11 @@ if [ -n "$BIGB" ]; then                                     # [bigb] the pool la
         git -C "$NOSI" rev-parse -q --verify "$NSHA:$f" > /dev/null || stop "$f is not tracked at $NSHA (cell $BIGB)"
     done
 fi
+case $CELL in frg*)                                         # [fusedres2] the fused resolve and its profile parser
+    for f in nosi/nosi/r2_fusedres.py benchmarks/Efficiency/r2_fusedres_prof.py; do
+        git -C "$NOSI" rev-parse -q --verify "$NSHA:$f" > /dev/null || stop "$f is not tracked at $NSHA"
+    done ;;
+esac
 [ "$(git -C "$NOSI" rev-parse -q --verify "$BIATTN_SHA:$BIATTN_PATH")" = "$BIATTN_BLOB" ] ||
     stop "piece 3: $BIATTN_PATH at $BIATTN_SHA is not the blob $BIATTN_BLOB"
 [ "$(git -C "$NOSI" rev-parse -q --verify "$GF_SHA:$GF_PY")" = "$GF_PY_BLOB" ] ||
@@ -302,8 +356,8 @@ ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) sr
       "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_tick_sg5.py" --out "$OUT" --model "$MODEL"
       --workload "$WL" --biattn "$ATTN_MOD" --gilfree "$GF_DIR" --gilfree-build "$JIT/gilfree_build"
       --threads "$THREADS" --transport "$TRANSPORT" --batch "$BATCH" --S 16128 --steps "$STEPS" --K 3 --LAMBDA 7 --modes "$MODES"
-      --backends "$BACKENDS" --C "$PC" --X "$PX" --R-ver "$PRV" "${SWEEPARG[@]}" --sweep-steps 24 --draft-ticks 12 --shipped-steps 24
-      "${POOLB[@]}" --preflight-steps 4 "${VARIANTARG[@]}" "${XPOOLARG[@]}" "${BIGBARG[@]}" "${STACKARG[@]}")
+      --backends "$BACKENDS" --C "$PC" --X "$PX" --R-ver "$PRV" "${SWEEPARG[@]}" --sweep-steps 24 --draft-ticks "$DTICKS" --shipped-steps 24
+      "${POOLB[@]}" --preflight-steps 4 "${VARIANTARG[@]}" "${XPOOLARG[@]}" "${BIGBARG[@]}" "${STACKARG[@]}" "${FRARG[@]}")
 if [ "$DRY" = 1 ]; then
     echo "R2 SG5 step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob workload $WL_SHA gpu_uuid $GPU_UUID ($UFILE)"
     echo "R2 SG5 step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; packer $GF_SHA:$GF_PY blob $GF_PY_BLOB, $GF_CPP blob $GF_CPP_BLOB -> $GF_DIR; transport $TRANSPORT; cell ${CELL:-default}"
@@ -311,6 +365,7 @@ if [ "$DRY" = 1 ]; then
     [ -z "$XPOOL" ] || echo "R2 SG5 step: [xpool] root $NOSI, layout both (stream, pool, stream2), X_pool $XPOOL, arrival lag 2; k5 rule NOSI_POOL_BLOCKS = C + 4 - 64 + X_pool / 64 = $((PC + 4 - 64 + XPOOL / 64))"
     [ "${#STACKARG[@]}" -eq 0 ] || echo "R2 SG5 step: [integ] root $NOSI, batch $BATCH, step memory $MEMG, stack arguments ${STACKARG[*]}"
     [ -z "$BIGB" ] || echo "R2 SG5 step: [bigb] root $NOSI, cell $BIGB: layout pool, C $PC, B $BATCH, X_pool 64, arrival lag 2, $STEPS steps, token log sized (-1), no shipped child, mem $MEMG"
+    echo "R2 SG5 step: nosi root $NOSI; STEP_MIN $STEP_MIN; MIN_LEFT $MIN_LEFT s"                   # [fusedres2]
     printf '%q ' "${ARGV[@]}"
     echo
     exit 0
@@ -350,6 +405,8 @@ printf 'biattn=%s:%s blob=%s packer=%s py=%s cpp=%s threads=%s transport=%s swee
     "${SWEEP_RUN:-none}" "$SPLITS" "${CELL:-default}" "$MODES" "$BACKENDS" "$PC" "$PX" "$PRV" "$EQ_POOL" "${VARIANTS:-none}" \
     "${XPOOL:-none}" "$BATCH" "$STEPS" "$MEMG" "${STACKARG[*]:-none}" >> "$REC/command.txt" ||
     stop "cannot write $REC (sg5_active stays)"
+printf 'nosi_root=%s step_min=%s steps=%s draft_ticks=%s frarg=%s\n' "$NOSI" "$STEP_MIN" "$STEPS" "$DTICKS" \
+    "${FRARG[*]:-none}" >> "$REC/command.txt" || stop "cannot write $REC (sg5_active stays)"          # [fusedres2]
 "${ARGV[@]}" < /dev/null > "$REC/stdout.txt" 2> "$REC/stderr.txt"
 rc=$?
 ok=1

@@ -215,33 +215,43 @@ if PART == "lockstep":
                     diffs=[list(d) for d in fr.diffs[:8]], stats=rep["stats"], err=rep["err"], L=L)
 
     def hand_two_drafts(mode):
-        """ONE tick with two draft rows of batch slot 0 whose selections overlap (the draft first-miss dedup across
-        rows). Production never builds it (r2_tick.py RoundState.finish_tick refuses "two draft rows"), and B2's
+        """Ticks with two draft rows of batch slot 0 whose selections overlap (the draft first-miss dedup across
+        rows), up to B2's first refusal. Production never builds it (r2_tick.py RoundState.finish_tick refuses "two draft rows"), and B2's
         consumer refuses its draft merges into a take of the same tick (d_merge): so the claim is decision equality
         at both layers, and the SAME refusal at end_tick in torch and in check mode."""
+        # job 2191261: tick 0 alone does not refuse (its dups are merged into same-tick takes without a d_merge
+        # violation); 2191259's six-tick world (landing after each tick) did refuse with d_merge. So the same six
+        # ticks run in both modes and stop at the FIRST raise: the claim is the same tick and the same text.
         w = TRM.world(C=2, X=4, R_ver=2, cls=OWN2.OwnResidency, svc_kw=dict(nblk=TRM.NB, resolve=mode))
         svc = w.svc
         svc.begin_request(0, "u0")
         svc.begin_request(1, "u1")
         hb, tail = 15, svc.tail0
-        rows = [Row(0, "d", ("u0", 1, 1), 1000, hb, [(hb, tail)]), Row(0, "d", ("u0", 1, 2), 1000, hb, [(hb, tail)]),
-                Row(1, "d", ("u1", 1, 1), 1000, hb, [(hb, tail)])]
-        sel = S_([[2, 3, 4, hb], [2, 3, 4, hb]], [[3, 4, 5, hb], [3, 4, 5, hb]], [[4, 6, hb], [4, 6, hb]])
-        svc.poll()
-        for l in range(L):
-            plan = svc.resolve(l, rows, sel)
-            svc.read_done(l, plan, Ev(True))
-        raised = None
-        try:
-            svc.end_tick()
-        except Exception as e:                                        # noqa: BLE001
-            raised = "%s: %s" % (type(e).__name__, str(e)[:160])
+        raised = raised_tick = None
+        for t in range(6):
+            x = t % 5
+            rows = [Row(0, "d", ("u0", 1, 1), 1000 + t, hb, [(hb, tail)]),
+                    Row(0, "d", ("u0", 1, 2), 1000 + t, hb, [(hb, tail)]),
+                    Row(1, "d", ("u1", 1, 1), 1000 + t, hb, [(hb, tail)])]
+            sel = S_([[x, x + 1, x + 2, hb], [x, x + 1, x + 2, hb]],
+                     [[x + 1, x + 2, x + 3, hb], [x + 1, x + 2, x + 3, hb]],
+                     [[x + 2, x + 4, hb], [x + 2, x + 4, hb]])
+            try:
+                svc.poll()
+                for l in range(L):
+                    plan = svc.resolve(l, rows, sel)
+                    svc.read_done(l, plan, Ev(True))
+                svc.end_tick()
+                TRM.land_all(w)
+            except Exception as e:                                    # noqa: BLE001
+                raised, raised_tick = "%s: %s" % (type(e).__name__, str(e)[:160]), t
+                break
         fr = svc.fusedres
         if fr is None:
-            return dict(raised=raised)
+            return dict(raised=raised, raised_tick=raised_tick)
         rep = fr.report()
-        return dict(raised=raised, L=L, compared=fr.compared, layers=fr.layers, n_diffs=len(fr.diffs),
-                    diffs=[list(d) for d in fr.diffs[:8]], stats=rep["stats"], err=rep["err"],
+        return dict(raised=raised, raised_tick=raised_tick, L=L, compared=fr.compared, layers=fr.layers,
+                    n_diffs=len(fr.diffs), diffs=[list(d) for d in fr.diffs[:8]], stats=rep["stats"], err=rep["err"],
                     max_rows_per_b=rep["max_rows_per_b"])
 
     OUT["hand"] = dict(overflow=hand_overflow(), two_drafts=hand_two_drafts("check"),
@@ -552,11 +562,12 @@ def test_FR6b_two_draft_rows_of_one_batch_slot(lockstep):
     r, t = lockstep["hand"]["two_drafts"], lockstep["hand"]["two_drafts_torch"]
     assert r["max_rows_per_b"][1] == 2 and r["stats"]["d_dup"] > 0, ("precondition", r["max_rows_per_b"],
                                                                       r["stats"])
-    assert r["compared"] == r["layers"] == r["L"], r
-    assert r["n_diffs"] == 0, r["diffs"]                               # fused == torch at both layers
-    assert r["err"] == 0, r["err"]
-    assert r["raised"] is not None and r["raised"] == t["raised"], (r["raised"], t["raised"])   # same refusal
+    assert r["raised"] is not None, "the six-tick world must reach B2's refusal (2191259 saw d_merge)"
+    assert (r["raised_tick"], r["raised"]) == (t["raised_tick"], t["raised"]), (r, t)   # same tick, same text
     assert "d_merge" in r["raised"], r["raised"]
+    assert r["compared"] == r["layers"] == (r["raised_tick"] + 1) * r["L"], r   # every resolved layer compared
+    assert r["n_diffs"] == 0, r["diffs"]                               # fused == torch at every layer
+    assert r["err"] == 0, r["err"]
     src = (NOSI / "r2_tick.py").read_text()
     assert 'raise RuntimeError("tick: request %d has two draft rows" % row.b)' in src   # the production refusal
 
@@ -658,3 +669,88 @@ def test_FR9_the_sg5_flags_for_the_plant_and_the_profile():
     assert "profile_draft_only(a, eng, first, label)" in fns["one_point"]
     assert 'record_function("t." + cat)' in fns["profile_draft_only"]
     assert "FP.parse_res_trace(" in fns["profile_draft_only"]
+
+
+# =====================================================================================================================
+# FR11 the FR-g step cells of r2_tick_sg5_step.sh (T19's DRYRUN pattern)
+# =====================================================================================================================
+FRNOSI = Path("/mnt/beegfs/ojerbi/nosi-r2-fusedres2")
+P6_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-sg5-p6"
+FR_CELLS = dict(              # resolve, plant, profile, (C, X, R_ver), steps, draft ticks, pool baseline, STEP_MIN
+    frg0=("check", 0, False, (96, 64, 16), 48, 4, False, 120),
+    frg0x=("check", 0, False, (24, 8, 4), 48, 4, False, 120),
+    frg0p=("check", 2, False, (96, 64, 16), 8, 4, False, 60),
+    frg1=("torch", 0, False, (96, 64, 16), 48, 12, True, 60),
+    frg2=("fused", 0, False, (96, 64, 16), 48, 12, True, 60),
+    frg3=("fused", 0, True, (96, 64, 16), 8, 12, False, 60),
+    frg3t=("torch", 0, True, (96, 64, 16), 8, 12, False, 90))
+FR_ORDER = ("frg0", "frg0x", "frg0p", "frg1", "frg2", "frg3", "frg3t")
+
+
+def test_FR11_the_frg_step_cells(tmp_path):
+    """The cells frg0 .. frg3t and frg of r2_tick_sg5_step.sh: static pins (FRNOSI is the root of the frg* cells only;
+    the NOSI line is p6's), refusals (unknown / two cells: usage, exit 2; a sha that is not the root's HEAD: STOP,
+    exit 1; p5b2 with the fusedres2 HEAD stops at p6's root: the root is not repointed), and on a checkout whose step
+    script is the fusedres2 HEAD's blob, each cell's DRYRUN through the harness's own parse_args (its flags, point,
+    steps, draft ticks, pool baseline, STEP_MIN, names, PYTHONPATH) and the combined cell's order. frg1 / frg2 are
+    p5b2's arguments token for token plus the resolve flag."""
+    script = ROOT / "benchmarks/Efficiency/r2_tick_sg5_step.sh"
+    text = script.read_text()
+    lines = text.splitlines()
+    assert "NOSI=%s " % P6_ROOT in text and "FRNOSI=%s " % FRNOSI in text
+    assert text.count("NOSI=$FRNOSI") == 1 and text.index("frg*) BACKENDS=b2") < text.index("NOSI=$FRNOSI")
+    assert lines[-1] == 'main "$@"; exit $?'
+    for word in ("awk", "perl", "python3", " bc ", "node "):
+        for ln in lines:
+            if not ln.lstrip().startswith("#"):
+                assert word not in ln, (word, ln)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_"))}
+    uid = "f31fc723-9dfe-407a-9947-28173556232a"
+    (tmp_path / "416.gpu_uuid").write_text(uid + "\n")
+    e = dict(env, SG5_HOLDERS=str(tmp_path), DRYRUN="1")
+
+    def dry(sha, *words):
+        return subprocess.run(["bash", str(script), "--nosi", sha, "416", "t1", *words], env=e, capture_output=True,
+                              text=True, timeout=600)
+    for bad in (("frg9",), ("frg0", "frg1"), ("FRG0",), ("frg", "p5b2"), ("frg0x", "frg0x"), ("frg3", "x")):
+        r = dry("0" * 40, *bad)
+        assert r.returncode == 2 and "usage" in r.stderr, bad
+    r = dry("0" * 40, "frg0")
+    assert r.returncode == 1 and "%s HEAD is not" % FRNOSI in r.stderr, r.stderr[-300:]
+    if not (FRNOSI / ".git").exists():
+        pytest.skip("no %s worktree here" % FRNOSI)
+    fr_head = subprocess.run(["git", "-C", str(FRNOSI), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    r = dry(fr_head, "p5b2")                                            # the other cells keep p6's root
+    assert r.returncode == 1 and "%s HEAD is not" % P6_ROOT in r.stderr, r.stderr[-300:]
+    blob = subprocess.run(["git", "-C", str(FRNOSI), "rev-parse", "%s:benchmarks/Efficiency/r2_tick_sg5_step.sh" % fr_head],
+                          capture_output=True, text=True).stdout.strip()
+    mine = subprocess.run(["git", "hash-object", "--", str(script)], capture_output=True, text=True).stdout.strip()
+    dirty = subprocess.run(["git", "-C", str(FRNOSI), "status", "--porcelain", "--untracked-files=no"],
+                           capture_output=True, text=True).stdout.strip()
+    if blob != mine or dirty:
+        pytest.skip("this step script is not the fusedres2 HEAD's blob, or that worktree has tracked changes")
+    TTP = TT                                                            # p3's argument string (T19)
+    p5b2 = (TTP.P3_SG5_ARGS.format(n="t1_416_{c}").replace(TTP.P3_SG5_SWEEP, "")
+            .replace(TTP.P3_SG5_POINTS, "--modes exact,fast --backends b2").replace(" --X 32 ", " --X 64 "))
+    G = TT._sg5_gate()
+    for cell, (resolve, plant, prof, (C, X, R_ver), steps, dticks, pool, step_min) in FR_CELLS.items():
+        r = dry(fr_head, cell)
+        assert r.returncode == 0, (cell, r.stderr[-400:])
+        got = r.stdout.strip().splitlines()[-1].split("r2_tick_sg5.py ", 1)[1].strip().replace("\\,", ",")
+        pa = G.parse_args(got.split())
+        assert pa.backends == ["b2"] and pa.modes == ["exact", "fast"] and pa.sweep_pts == [], cell
+        assert (pa.C, pa.X, pa.R_ver, pa.steps, pa.draft_ticks, pa.pool_baseline) == (C, X, R_ver, steps, dticks, pool)
+        assert (pa.b2_resolve, pa.b2_fused_plant, pa.b2_res_profile, pa.b2_checked) == (resolve, plant, prof, False)
+        assert "nosi root %s; STEP_MIN %d; MIN_LEFT %d s" % (FRNOSI, step_min, step_min * 60 + 600) in r.stdout
+        assert "--time=%d " % step_min in r.stdout and "--job-name=sg5-t1-416-%s " % cell in r.stdout
+        assert "PYTHONPATH=%s/nosi" % FRNOSI in r.stdout and "%s/benchmarks/Efficiency/r2_tick_sg5.py" % FRNOSI in r.stdout
+        assert "TRITON_CACHE_DIR=/mnt/beegfs/ojerbi/nosa-env/jit/sg5_t1_416_%s/triton" % cell in r.stdout
+        if cell in ("frg1", "frg2"):                                    # p5b2's arguments + the resolve flag only
+            assert got == p5b2.format(c=cell) + " --b2-resolve " + resolve, (cell, got)
+    r = dry(fr_head, "frg")
+    assert r.returncode == 0, r.stderr[-400:]
+    order = [ln.split()[4] for ln in r.stdout.splitlines() if ln.startswith("R2 SG5 frg: cell ")]
+    assert order == list(FR_ORDER), order
+    assert "R2 SG5 frg: done; cells failed or refused 0; first MUST failure none" in r.stdout
+    src = (ROOT / "benchmarks/Efficiency/r2_tick_sg5_step.sh").read_text()
+    assert 'case $sub in frg1|frg3t) ctl=1 ;; *) ctl=0 ;; esac' in src            # the controls always run
