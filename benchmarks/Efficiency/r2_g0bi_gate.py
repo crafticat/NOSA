@@ -71,9 +71,10 @@ def parse_args(argv):
     ap.add_argument("--model", default=os.environ.get("NOSI_MODEL_PATH", ""))
     ap.add_argument("--workload", required=True)
     ap.add_argument("--biattn", required=True, help="piece 3's bi_paged_attention.py (a pinned copy)")
-    ap.add_argument("--gemm", default="exact", choices=("exact", "fast", "bigemm"),
+    ap.add_argument("--gemm", default="exact", choices=("exact", "fast", "bigemm", "bi_c_strict", "bi_c_bucket"),
                     help="the GEMM mode: exact = G-b PaddedLinear(m_fix); fast = natural cuBLAS (the weaker claim: "
-                         "I1 / I2 become REPORT); bigemm = G-a by path")
+                         "I1 / I2 become REPORT); bigemm = G-a by path; bi_c_strict = G-c strict (a NEW target "
+                         "reference: REF is built with G-c too); bi_c_bucket = G-c research arm (I1 / I2 REPORT)")
     ap.add_argument("--bigemm", default=None, help="G-a: the bigemm module (a pinned copy), with --gemm bigemm")
     ap.add_argument("--bigemm-fn", default=None)
     ap.add_argument("--batch", type=int, default=8)
@@ -329,6 +330,9 @@ def part_c(a, model, ops, docs, res, gates, diffs, save):
         ok, why = eq_verdict(run["eq"])
         if ops.mode == "fast" and name != "E2_C_determinism":           # the weaker claim: GEMM rows depend on M
             gates.append(gate("R_" + name, True, False, "FAST (natural cuBLAS, the weaker claim): " + why))
+        elif ops.mode == "bi_c_bucket" and name != "E2_C_determinism":  # [bigemmc] research arm: never a claim
+            gates.append(gate("R_" + name, ok, False, "G-c BUCKET RESEARCH ARM (relaxed law NOT approved; REPORT, "
+                                                      "not a contract claim): " + why))
         else:
             gates.append(gate(name, ok, True, why))
     summ, d = summarize_quality([("C", rec)], "C")
