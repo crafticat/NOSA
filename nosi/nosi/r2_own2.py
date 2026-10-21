@@ -66,9 +66,14 @@ class OwnResidency(ResidencySparse):
     """The residency service with B2's table as the ownership authority (module docstring). Extra arguments: keys (live
     cohort key slots per request, KEYS <= 7), checked, b2_mut (negative controls, tests only)."""
 
-    def __init__(self, *args, keys: int = 7, checked: bool = True, b2_mut=None, **kw):
+    def __init__(self, *args, keys: int = 7, checked: bool = True, b2_mut=None, resolve: str = "torch",
+                 fused_plant: int = 0, fused_guard: bool = False, **kw):
         kw["pin_records"] = False
         self.__dict__["_own_ready"] = False
+        if resolve not in ("torch", "fused", "check"):                # [fusedres] r2_fusedres.RESOLVE_MODES
+            raise ValueError("resolve %r: one of torch, fused, check" % (resolve,))
+        if fused_plant and resolve == "torch":
+            raise ValueError("fused_plant needs resolve 'fused' or 'check'")
         super().__init__(*args, **kw)
         self.checked = bool(checked)
         self.b2_mut = dict(b2_mut or {})
@@ -97,7 +102,21 @@ class OwnResidency(ResidencySparse):
         self._sviews: Dict[Tuple[int, int, int], Stream] = {}   # (l, b, h) -> its lazy projection (stream())
         self.rec_mut_done = None                         # (tick, kind) of an applied record mutation
         self.b2_applied = 0                               # ticks applied by the B2 consumer
+        # [fusedres] the per-layer resolve: "torch" (S-C's device path, inherited), "fused" (r2_fusedres: 2 Triton
+        # launches per draft-only layer, 4 with verify rows), "check" (fused, and the torch path compared at every layer)
+        self.resolve_mode = resolve
+        self.fusedres = None
+        if resolve != "torch":
+            from . import r2_fusedres
+            self.fusedres = r2_fusedres.FusedResolver(self, check=resolve == "check", plant=int(fused_plant),
+                                                      guard=bool(fused_guard))   # [fusedres2b] tests: OOB guards
         self.__dict__["_own_ready"] = True
+
+    def resolve(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> Plan:
+        """[fusedres] S-C's resolve (resolve_mode "torch") or the fused one (r2_fusedres.FusedResolver.resolve)."""
+        if self.fusedres is None:
+            return super().resolve(l, rows, sel)
+        return self.fusedres.resolve(l, rows, sel)
 
     # ================================================================================================================
     # the projection: read-only vendored views of the table
@@ -249,6 +268,9 @@ class OwnResidency(ResidencySparse):
                          reader_live=self.win.next - self.win.lo,
                          table_bytes=sum(t.numel() * t.element_size() for t in self.own.tensors().values()),
                          mirror="the table's columns copied on the device at each tick's first resolve (no host delta)")
+        out["b2"]["resolve"] = self.resolve_mode                      # [fusedres]
+        if self.fusedres is not None:
+            out["b2"]["fused"] = self.fusedres.report()
         return out
 
     def _in_flight(self, l: int, b: int, h: int, t: int):
