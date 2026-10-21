@@ -122,7 +122,8 @@ ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) sr
       "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_tick_sg5.py" --out "$OUT" --model "$MODEL"
       --workload "$WL" --biattn "$ATTN_MOD" --gilfree "$GF_DIR" --gilfree-build "$JIT/gilfree_build"
       --threads "$THREADS" --transport "$TRANSPORT" --batch 64 --S 16128 --steps 48 --K 3 --LAMBDA 7 --modes exact,fast --backends sc,sb,v1
-      --C 96 --X 32 --R-ver 16 --sweep "$SWEEP" --sweep-steps 24 --draft-ticks 12 --shipped-steps 24 --pool-baseline)
+      --C 96 --X 32 --R-ver 16 --sweep "$SWEEP" --sweep-steps 24 --draft-ticks 12 --shipped-steps 24 --pool-baseline
+      --preflight-steps 4)
 if [ "$DRY" = 1 ]; then
     echo "R2 SG5 step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob workload $WL_SHA gpu_uuid $GPU_UUID ($UFILE)"
     echo "R2 SG5 step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; packer $GF_SHA:$GF_PY blob $GF_PY_BLOB, $GF_CPP blob $GF_CPP_BLOB -> $GF_DIR; transport $TRANSPORT"

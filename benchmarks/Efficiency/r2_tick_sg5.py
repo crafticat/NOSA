@@ -17,6 +17,8 @@ documents when B > 94, labelled):
            are drafted), per-op CUDA events.
     TRANSPORT  --transport gilfree (D5, the default: C's adapter over agent E's packer v2) or gather (GatherTransport
            below: NOSI's Triton gather on a side stream), so one transport's failure does not hide the other terms.
+    PREFLIGHT  before the long arms, a short round (--preflight-steps tokens) per backend on the run's transport
+           (MUST; a failing backend is left out of the long arms) and on gather too when the run's is gilfree (REPORT).
     ROUND  the free-running greedy round (r2_tick.run_round) to --steps committed tokens per request, per-op CUDA
            events (TickTimer): T_tick per tick, r = committed tokens / request-ticks, r x T_shipped / T_tick, the
            budget dGEMM / dATT / dSEL / dTWIN / dSTORE / dRES (tick minus T_d, per category), the host ms per
@@ -86,6 +88,8 @@ def parse_args(argv):
     ap.add_argument("--shipped-steps", type=int, default=24)
     ap.add_argument("--pool-baseline", action="store_true", help="also the shipped decode at the primary point's memory")
     ap.add_argument("--bare", action="store_true", help="also each round with the tick events only")
+    ap.add_argument("--preflight-steps", type=int, default=4,
+                    help="PREFLIGHT: a short round per backend and transport before the long arms (0: none)")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -265,7 +269,7 @@ def cuda_event():
     return e
 
 
-def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=None):
+def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=None, transport=None):
     """A fresh engine on the Residency layout with its service and gilfree transport (module docstring)."""
     import torch
     from nosi.r2_residency import Residency, TorchGather
@@ -280,7 +284,9 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
     n_host = int(host_k[0].shape[1])
     cis = [t.total_cis[:B] for t in eng.twins]
     hw = lambda ev: ev.synchronize()                                 # noqa: E731
-    if a.transport == "gilfree":
+    if (transport or a.transport) == "gilfree":
+        if ext is None:
+            raise RuntimeError("the gilfree transport needs the packer extension (not built in this run)")
         tp = GilfreeTransport(ext, host_k, host_v, eng.store_k, eng.store_v, 64, eng.D, threads=a.threads, host_wait=hw,
                               background=True)
     else:
@@ -424,6 +430,51 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
     return info
 
 
+def preflight(a, model, cache, st, first, ops, ext, gates, res):
+    """PREFLIGHT (lead, 2026-10-22: an integration fault must cost minutes, not the whole step): before the long arms,
+    a SHORT free-running round (--preflight-steps committed tokens per request: draft rows, the first verify ticks,
+    their decisions) per backend on the run's transport (MUST; a backend that fails is not run in the long arms), and
+    on the gather transport too when the run's is gilfree (REPORT: does the fault follow the transport?). Returns the
+    backends that passed on the run's transport (all of them with --preflight-steps 0)."""
+    import torch
+    from nosi.r2_tick import run_round
+    if a.preflight_steps <= 0:
+        return list(a.backends)
+    tps = [a.transport] + (["gather"] if a.transport == "gilfree" else [])
+    ok, out = [], []
+    for tpname in tps:
+        for kind in a.backends:
+            label = "SG5_preflight_%s_%s" % (tpname, kind)
+            log(label)
+            must = tpname == a.transport
+            t0 = time.time()
+            eng = svc = tp = None
+            try:
+                eng, svc, tp = make_engine(a, model, cache, st, ops, kind, a.C, a.X, a.R_ver, ext, timer_cats=("tick",),
+                                           transport=tpname)
+                rnd = run_round(eng, first, [a.preflight_steps] * eng.B, K=a.K, LAMBDA=a.LAMBDA)
+                torch.cuda.synchronize()
+                mirror = eng.mirror_failures()
+                good = not mirror and rnd.syncs > 0
+                detail = "%d ticks, %d decision ticks, twin counters %s, %.0f s" % (
+                    rnd.ticks, rnd.syncs, "OK" if not mirror else "DIFFER", time.time() - t0)
+            except Exception as e:
+                traceback.print_exc()
+                good, detail = False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:400])
+            finally:
+                if tp is not None:
+                    tp.close()
+                del eng, svc, tp
+                GB.free()
+            gates.append(GB.gate(label if must else "R_" + label, good or not must, must,
+                                 detail if good else "FAILED: " + detail))
+            out.append(dict(transport=tpname, backend=kind, passed=good, detail=detail))
+            if must and good:
+                ok.append(kind)
+    res["preflight"] = out
+    return ok
+
+
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     a = parse_args(argv)
@@ -489,10 +540,15 @@ def main(argv=None) -> int:
             GB.free()
             first = [int(x) for x in first_t.view(-1).tolist()]
             meta["build_gb"] = round(torch.cuda.memory_allocated() / 1e9, 2)
+            backends = preflight(a, model, cache, st, first, BIOps(attn, a.m_fix, gemm=a.modes[0]), ext, gates, res)
+            save()
+            if not backends:
+                log("PREFLIGHT: no backend ran a short round on the %s transport: the long arms are skipped"
+                    % a.transport)
             res["points"] = []
             for mode in a.modes:
                 ops = BIOps(attn, a.m_fix, gemm=mode)
-                for kind in a.backends:
+                for kind in backends:
                     label = "SG5_%s_%s" % (mode, kind)
                     log("%s at C %d X %d R_ver %d" % (label, a.C, a.X, a.R_ver))
                     try:
@@ -505,7 +561,7 @@ def main(argv=None) -> int:
                     GB.free()
                     save()
             res["sweep"] = []
-            if a.sweep_pts:
+            if a.sweep_pts and a.backends[0] in backends:
                 ops = BIOps(attn, a.m_fix, gemm=a.modes[0])
                 for (C, X, R_ver) in a.sweep_pts:
                     label = "SG5sweep_%s_C%d_X%d" % (a.backends[0], C, X)
