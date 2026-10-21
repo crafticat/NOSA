@@ -962,8 +962,9 @@ class ResidencySC(ResidencySB):
         tails_flat: List[int] = []
         for r in rows:
             tails_flat += [s for (_, s) in r.tail] + [-1] * (N_TAIL - len(r.tail))
+        extra = self._tick_extra(rows)                                # the sparse record's per-tick inputs (or [])
         flat = ([r.b for r in rows] + [r.hist_bound for r in rows] + [len(r.tail) for r in rows] + tails_flat
-                + [r.pos % self.bs + 1 for r in rows] + vrows + drows)
+                + [r.pos % self.bs + 1 for r in rows] + vrows + drows + extra)
         d = self._h2d(torch.tensor(flat, dtype=torch.int64))
         self.row_uploads += 1
         rb, hb, nt = d[:R], d[R:2 * R], d[2 * R:3 * R]
@@ -976,7 +977,17 @@ class ResidencySC(ResidencySB):
         def part(ix):
             return rb[ix], hb[ix], tails[ix], nt[ix], ix
         return dict(sig=self._row_sig(rows), vrows=vrows, drows=drows, v=part(vix) if vrows else None,
-                    d=part(dix) if drows else None, last_len=last_len.to(torch.int32), seq_idx=rb.to(torch.int32))
+                    d=part(dix) if drows else None, last_len=last_len.to(torch.int32), seq_idx=rb.to(torch.int32),
+                    extra=d[len(flat) - len(extra):])
+
+    def _tick_extra(self, rows: Sequence[Row]) -> List[int]:
+        """Hook (the sparse record, r2_residency_sparse.py): more per-tick integers for the ONE row copy."""
+        return []
+
+    def _layer_record(self, l: int, step: Dict, tk: Dict) -> None:
+        """Hook (the sparse record): the layer's device-side record, device ops only. S-C: none (the dense record is
+        the decision tensors themselves)."""
+        return None
 
     # ------------------------------------------------------------------------------------------------ one layer
     def resolve(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> Plan:
@@ -1022,6 +1033,7 @@ class ResidencySC(ResidencySB):
             page[ix] = ddec.page
             npg[ix] = ddec.num_pages
             step["ddec"] = ddec
+        self._layer_record(l, step, tk)                               # device ops only (the sparse record's hook)
         self._tick.append(step)
         plan.page_table = page.to(torch.int32)
         plan.num_pages = npg.to(torch.int32)
@@ -1032,6 +1044,20 @@ class ResidencySC(ResidencySB):
     def end_tick(self) -> None:
         steps, self._tick = self._tick, []
         self._rows = None
+        try:
+            self.apply_tick(steps)
+        finally:
+            self._layer_ev = {}
+        Residency.end_tick(self)                                      # the draft transfers, layer by layer
+        self.metrics.sample_memory()
+
+    def apply_tick(self, steps: List[Dict]) -> None:
+        """THE HOST CONSUMER of one tick's device decisions (note 12l; the capture seam calls exactly this after the
+        replay). steps: the tick's layers in resolve order, each dict(l, vrows, vidx, vdec, drows, ddec[, rec]) with
+        the decision tensors (fixed buffers in a captured tick). It makes the ONE device-to-host read of the tick
+        (the watched flags and the decisions), refuses a void tick (a set flag, an overflow) before any change of the
+        host state, and applies the decisions in v1's order. This class: the DENSE record (every entry of every
+        layer); ResidencySparse (r2_residency_sparse.py) replaces it with the sparse record, same signature."""
         names = list(self._flags)
         parts = [self._flags[n].to(torch.int64).reshape(1) for n in names]   # the watched flags first
         for st in steps:
@@ -1044,7 +1070,6 @@ class ResidencySC(ResidencySB):
             self.flag_values = dict(zip(names, flat[:len(names)]))
             raised = sorted(n for n, v in self.flag_values.items() if v)
             if raised:
-                self._layer_ev = {}
                 raise CapacityRefusal("S-C: the watched device flag(s) %s are set at this tick: the tick is void (none "
                                       "of its decisions is applied)" % raised)
             at = len(names)
@@ -1068,7 +1093,6 @@ class ResidencySC(ResidencySB):
                 parsed.append((st, v, d))
             over = [(st["l"], v[1]) for (st, v, _) in parsed if v is not None and v[1] > 0]
             if over:
-                self._layer_ev = {}
                 raise CapacityRefusal("S-C: the verifier's urgent misses found no slot: K5 grants none and Policy E has "
                                       "no candidate, every LRU entry and in-flight draft prefetch being protected or "
                                       "read by the layer (layer, blocks without a slot: %s; C %d, X %d, R_ver %d): the "
@@ -1081,9 +1105,6 @@ class ResidencySC(ResidencySB):
                                        st["ddec"] if d is not None else None)
                 if d is not None:
                     self._apply(st["l"], st["drows"], st["ddec"], d[0], d[1], d[2], d[3])
-        self._layer_ev = {}
-        Residency.end_tick(self)                                      # the draft transfers, layer by layer
-        self.metrics.sample_memory()
 
     def _overflow_report(self, parsed, per_layer: int = 3) -> str:
         """For a refused tick: the capacity report (v1's _capacity_report, host state = the tick's start: nothing is

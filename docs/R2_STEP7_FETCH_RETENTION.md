@@ -771,6 +771,98 @@ Q-C2, the submission wait (E's C++ feeder worker, feature/nosi-r2-gilfree-worker
 - CPU test F19b: an unsubmitted pack does not block `_submitted` with the attribute. Negative control: without the
   attribute (or with it False) the host wait remains.
 
+## 12l. (B1) the sparse decision record on the vendored ownership objects (`nosi/nosi/r2_residency_sparse.py`)
+
+THE BOUND. S-C's end_tick reads every decision field of every (row, head, selected block) entry and applies every
+entry in Python. At B 64, H 2, k 64 that is about 0.8 M verify and 0.26 M draft entries per tick. SG5 p3: S-B's
+draft-only ticks spent 7.06 s of backend host time per tick, against 27 ms of GEMM.
+
+THE HOST CONSUMER (the capture seam's one call; a stable signature):
+- `ResidencySC.apply_tick(steps)`. steps: the tick's layers in resolve order, each
+  `dict(l, vrows, vidx, vdec, drows, ddec[, rec, caps])` with the decision tensors (fixed buffers in a captured tick).
+- `end_tick` = `apply_tick(steps)`, then the deferred draft issue (`Residency.end_tick`) and the memory sample.
+- S-C's `apply_tick` is the DENSE record. `ResidencySparse.apply_tick` replaces it with the sparse one. B2's
+  array-backed layer implements the same function on the same records.
+- Hooks for the record (device ops only): `_layer_record(l, step, tk)` (called by resolve) and `_tick_extra(rows)`
+  (more integers for the one row copy per tick).
+
+THE RECORD (per layer, int64, device; fixed shapes; built by `sparse_layer_record`):
+- `vrec` (9, cap_v), its fields VREC = (o, blk, flags, slot, infl_slot, infl_gen, rslot, take_slot, evict_blk), and
+  `vcnt` (1,).
+  - The entries: a new pin, an in-flight merge (infl / dup), an urgent take (a grant or a Policy E eviction of
+    either kind), a hole.
+  - o = the entry index (row j = o // (H k), head h = (o // k) % H).
+- `vlook` (Rv, 4): per verify row, the ready FIRST looks of its (key, layer) call, and their 4.6 classes
+  (LRU, PO, VRES).
+- `vread` (B, H, ceil((C + X) / 32)): the slots a verify row reads, as packed bits.
+- `drec` (5, cap_d), its fields DREC = (o, blk, flags, slot, take_slot), and `dcnt` (1,).
+  - The entries: every ready entry, a new pin, a merge, a take, a refusal, a hole.
+- `sel` (B, H, ceil(nblk / 32)): the blocks that any row of the layer selects, as packed bits (for Policy E's host
+  check).
+- The flag bits: PIN 1, READY 2, INFL 4, DUP 8, GRANT 16, EVICT 32, EVICT_INFL 64, FIRST 128, HOLE 256, REFUSED 512.
+- Compaction is a prefix sum (stable). The entry order (row, head, ascending block) is K3X's, so v1's apply order
+  survives.
+- The capacity: `record_cap` (cap_v, cap_d). None = every entry (no overflow). A count over the capacity voids the
+  tick (CapacityRefusal, before any change).
+
+WHAT THE HOST DOES PER RECORD (in v1's order; with an INVARIANT CHECK per record):
+- PIN: `st.protect`.
+  - New pins only: the device's PIN TABLE (L, B, H, nblk + 1, 2 kinds) holds (key id << 32 | epoch).
+  - The host bumps the epoch of (layer, batch slot) when it drops references there (`_drop`, `end_request`) and on
+    a void tick.
+  - So a redundant pin record can happen (an idempotent protect), but a missing one cannot.
+- READY (draft): the check "the host's resident slot is this one", the read, then the recency.
+  - The touches use OrderedDict.move_to_end, with S-C's journal effects (count, stamp, dirty mark) in bulk.
+  - Acquisitions and K1's evict_to_c run the vendored code.
+- INFL / DUP: the owner's transfer in flight (slot and generation checked); the demand merge.
+- GRANT / EVICT: v1's `_take` with its checks (K5, first_free, the evicted slot FREE). A Policy E eviction must be
+  the host's next candidate (selections from `sel`).
+- REFUSED: K5 must refuse it; the count must equal the device's.
+- HOLE: raises.
+- Ready VERIFY entries are not records. Their reads come from `vread`, their looks from `vlook`, and they get no
+  host check (R5a's lockstep proves sparse == dense == v1 on the CPU).
+
+DIFFERENCES FROM THE DENSE RECORD, by design:
+- Stream.log does not receive the draft touch events (their effects are applied directly).
+- The lifetimes' verify read counts (4.8 rv) count a slot once per layer. 4.8 uses them only as > 0.
+
+DEVIATION FROM THE GO MESSAGE: the draft recency is not "bulk stamps plus device victims".
+- With the vendored OrderedDict LRU, the host must reorder every touched entry anyway.
+- So the record carries the touched entries in O1 order, and the host replays v1's recency at C speed. K1's victims
+  come out of the vendored evict_to_c and are exact by construction.
+- Bulk stamps with device victims belong to B2 (an array-backed LRU).
+
+Q-C4, BULK TAKES:
+- The device already chose take_slot. The part that bulks is on the device: the bias rows of the granted draft
+  takes, one batched write per layer (`draft_bias_fill`), so the host take no longer copies them (`_take(bias=False)`).
+- The host part stays per record: vendored `st.take` (the generation, the journal), the Transfer, the in-flight
+  maps, metrics.issued. That is about 2-4 us per take; at p3's about 9.3 k records per tick, about 20-40 ms.
+- A fully bulk registration (one vectorized call per layer) needs the array-backed slots of B2.
+- The record format above is what B2 consumes: GRANT records in order give (row, head, block, take_slot) per take.
+
+EXPECTED HOST TIME PER TICK AT B 64 (B1), as estimates; the REPORT microbench measures the CPU part:
+- verify ticks:
+  - one read and tolist of the records: about 10-30 ms;
+  - new pins (each cohort pins its selection once, about 0.26 M per verify tick at about 0.4 us): about 100 ms;
+  - the read bitmap (about 0.26 M slots at about 0.15 us): about 40 ms;
+  - takes and merges: about 30 ms;
+- draft ticks: ready records and touches (about 0.26 M at about 0.3-0.5 us), about 80-130 ms, plus pins at a
+  cohort's first draft tick.
+- So B1 should cut p3's 7 s to about 0.2-0.4 s per tick. B2 (array-backed) should bring it to tens of ms.
+
+TESTS (`test_r2_residency.py`, R5):
+- R5a: sparse == dense on F6 (probe and exact), F12b, F20b and F21b (probe and exact). Every tick it compares the
+  pages, the verify content, both mirrors against the full scan, the ownership state, the counters and each slot's
+  first / last reader. One device read per tick.
+- R5b: one planted dropped record per kind (v_pin, v_merge, v_take, v_read, d_pin, d_ready, d_merge, d_take,
+  d_refused). Each is caught at its own tick; the precondition is that a state-changing record of that kind
+  occurred.
+- R5c: a record over its capacity voids exactly the tick that the uncapped run predicts. Negative control: a
+  truncated record (no_cap_check) differs at that tick.
+- R5d: two draft take records of one stream swapped are refused by v1's take check.
+- R5e: the lint: the per-layer device path has no host read or copy; the consumer has the one read.
+- REPORT R5 microbench: apply_tick dense vs sparse at the B 64 geometry (2 layers, extrapolated to 32).
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,

@@ -436,7 +436,7 @@ class Residency:
         return None
 
     def _take(self, l: int, b: int, h: int, block: int, key: Tuple, kind: str, at: Optional[int] = None,
-              evicted: bool = False) -> Optional[Transfer]:
+              evicted: bool = False, bias: bool = True) -> Optional[Transfer]:
         """K3X _issue (dispatcher.py:3098-3179): take a FREE slot (K5 decides a draft may borrow), forward the slot's
         previous last reader to the transfer (T3), fill the bias rows. A refused draft fetch returns None.
         at: the slot a DEVICE decision chose (S-B: a draft take; S-C: a verifier urgent take); the host checks it is
@@ -482,8 +482,8 @@ class Residency:
         tr.issue_tick = self.tick_no                                  # the tick that issues it (arrival_lag)
         self.inflight[tr.seq] = tr
         self.pending[(l, b, h, int(block))] = tr
-        if not (at is not None and kind == VERIFY):
-            self._fill_bias(l, b, h, idx, int(block))
+        if bias and not (at is not None and kind == VERIFY):          # bias False: the device filled them (sparse,
+            self._fill_bias(l, b, h, idx, int(block))                 # one batched write per layer, note 12l)
         self.metrics.issued(tr)
         return tr
 
@@ -884,37 +884,46 @@ class Metrics:
         layer_call: when several verify rows of one cohort select a block (the flattened round), the FIRST look
         classifies it and later looks do not count it again (a block that an earlier row of the cohort fetched is
         "new", never "in_flight": the cohort fetched it)."""
-        call = self.open_calls.setdefault((lk["key"], l), dict(t=lk["t"], ready=0, in_flight=0, new=0, wait_ns=0,
-                                                               seen=set()))
+        call = self.open_call(lk["key"], l, lk["t"])
         st = self.svc.stream(l, self.svc.uid_b[lk["key"][0]], lk["h"])
         for cls in ("ready", "in_flight", "new"):
             for t in lk[cls]:
                 if (lk["h"], t) in call["seen"]:
                     continue
                 call["seen"].add((lk["h"], t))
-                call[cls] += 1
-                idx = st.resident(t)
-                if cls == "ready":
-                    state = st.slots[idx].state if idx is not None else None
-                    self.k46[{LRU: "lru", PO: "po", VRES: "vres"}.get(state, "not_resident")] += 1
-                    continue
-                own = cls == "new"
-                if idx is None:
-                    tr = self.svc._in_flight(l, st.b, st.h, t)
-                    if own and tr is not None:
-                        idx = tr.slot                         # its own transfer, landed in place (S-C schedule), admitted
-                    else:                                     # at the next poll
-                        # another requester's transfer waited on the device: not admitted on the host yet
-                        self.k46["inflight_waited" if not own else "not_resident"] += 1
-                        continue
-                rec = self.lifetimes.get((l, st.b, st.h, idx, st.slots[idx].gen))
-                if own:
-                    self.k46["fetched_refetch" if rec is not None and rec["refetch"] else "fetched_first"] += 1
-                else:
-                    state = st.slots[idx].state
-                    self.k46[{LRU: "lru", PO: "po", VRES: "vres"}.get(state, "not_resident")] += 1
-                if rec is not None and rec["seq"] in self.arrival_ns:
-                    call["wait_ns"] += max(0, self.arrival_ns[rec["seq"]] - lk["t"])
+                self.look_one(call, l, st, cls, t, lk["t"])
+
+    def open_call(self, key: Tuple, l: int, t: int) -> Dict:
+        """The (key, l) layer_call of K3X 4.3 (opened by its first look)."""
+        return self.open_calls.setdefault((key, l), dict(t=t, ready=0, in_flight=0, new=0, wait_ns=0, seen=set()))
+
+    def look_one(self, call: Dict, l: int, st, cls: str, t: int, t_look: int) -> None:
+        """The FIRST look of block t (class ready / in_flight / new) in a layer_call: 4.3 and 4.6 (look's body; the
+        sparse record (r2_residency_sparse.py) calls it for its in_flight / new records and counts its ready looks on
+        the device)."""
+        call[cls] += 1
+        idx = st.resident(t)
+        if cls == "ready":
+            state = st.slots[idx].state if idx is not None else None
+            self.k46[{LRU: "lru", PO: "po", VRES: "vres"}.get(state, "not_resident")] += 1
+            return
+        own = cls == "new"
+        if idx is None:
+            tr = self.svc._in_flight(l, st.b, st.h, t)
+            if own and tr is not None:
+                idx = tr.slot                                 # its own transfer, landed in place (S-C schedule), admitted
+            else:                                             # at the next poll
+                # another requester's transfer waited on the device: not admitted on the host yet
+                self.k46["inflight_waited" if not own else "not_resident"] += 1
+                return
+        rec = self.lifetimes.get((l, st.b, st.h, idx, st.slots[idx].gen))
+        if own:
+            self.k46["fetched_refetch" if rec is not None and rec["refetch"] else "fetched_first"] += 1
+        else:
+            state = st.slots[idx].state
+            self.k46[{LRU: "lru", PO: "po", VRES: "vres"}.get(state, "not_resident")] += 1
+        if rec is not None and rec["seq"] in self.arrival_ns:
+            call["wait_ns"] += max(0, self.arrival_ns[rec["seq"]] - t_look)
 
     def executed(self, l: int, lk: Dict) -> None:
         call = self.open_calls.pop((lk["key"], l), None)
