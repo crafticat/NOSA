@@ -106,6 +106,11 @@ def parse_args(argv):
     ap.add_argument("--b2-resolve", default="torch", choices=("torch", "fused", "check"),        # [fusedres]
                     help="b2: the per-layer resolve: S-C's torch ops (default), r2_fusedres (fused), or fused with "
                          "the torch path compared at every layer (check: an equality gate, not a timing)")
+    ap.add_argument("--b2-fused-plant", type=int, default=0, choices=(0, 1, 2),                 # [fusedres2] M2
+                    help=argparse.SUPPRESS)                     # NEGATIVE CONTROL (FR-g0p): r2_fusedres.PLANTS
+    ap.add_argument("--b2-res-profile", action="store_true",                                    # [fusedres2] M3
+                    help="b2: torch.profiler over the draft-only phase; the device time per draft tick of the kernels "
+                         "launched inside the 't.res' spans (r2_fusedres_prof.py); its spans are NOT timings")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -347,7 +352,8 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
         lazy = _LazyOps()                                            # [b2] wait) behind _LazyOps, as sc
         svc = OwnResidency(*args, device=eng.store_k[0].device, nblk=n_host // 64, devops=lazy,             # [b2]
                            checked=bool(getattr(a, "b2_checked", False)),                                     # [b2]
-                           resolve=getattr(a, "b2_resolve", "torch"), **kw)                                   # [fusedres]
+                           resolve=getattr(a, "b2_resolve", "torch"),                                         # [fusedres]
+                           fused_plant=int(getattr(a, "b2_fused_plant", 0)), **kw)                            # [fusedres2]
         lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)       # [b2]
     else:
         lazy = _LazyOps()
@@ -363,6 +369,39 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
             return base_span(cat) if cat in timer_cats else contextlib.nullcontext()
         eng.timer.span = span
     return eng, svc, tp
+
+
+def profile_draft_only(a, eng, first, label):
+    """[fusedres2] M3 of review-fusedres-0e28cf6: the draft-only phase under torch.profiler (CPU + CUDA), every
+    TickTimer span also a record_function range "t.<cat>"; the trace is written to --out and parsed by
+    r2_fusedres_prof.parse_res_trace: per draft tick the device ms and the device events launched inside "t.res"
+    (tick 0 skipped in the stats: compiles). The event spans of a profiled phase are NOT timings."""
+    import torch
+    from torch.profiler import ProfilerActivity, profile, record_function
+    import r2_fusedres_prof as FP
+    base_span = eng.timer.span
+    import contextlib
+
+    @contextlib.contextmanager
+    def span(cat):
+        with record_function("t." + cat):
+            with base_span(cat):
+                yield
+    eng.timer.span = span
+    try:
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            run_draft_only(eng, first, a.draft_ticks, a.K)
+            torch.cuda.synchronize()
+    finally:
+        eng.timer.span = base_span
+    path = os.path.join(a.out, "%s_draft_only_trace.json" % label)
+    prof.export_chrome_trace(path)
+    out = {}
+    for cat in ("res", "tick"):
+        p = FP.parse_res_trace(json.load(open(path)), cat=cat)
+        out[cat] = FP.summarize(p, skip=1)
+    out["trace"] = path
+    return out
 
 
 def run_draft_only(eng, first, n, K):
@@ -445,7 +484,10 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
     # T_d: the draft-only tick
     eng, svc, tp = make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext)
     try:
-        run_draft_only(eng, first, a.draft_ticks, a.K)
+        if kind == "b2" and getattr(a, "b2_res_profile", False):    # [fusedres2] M3: the kernel time of res
+            info["draft_only_res_profile"] = profile_draft_only(a, eng, first, label)
+        else:
+            run_draft_only(eng, first, a.draft_ticks, a.K)
         info["draft_only"] = summarize(eng.timer.report())
         info["draft_only"]["d2h_reads"] = getattr(svc, "d2h_reads", None)
         info["draft_only"]["sc"] = sc_counters(svc)                    # REPORT (RES_SC.md 6)

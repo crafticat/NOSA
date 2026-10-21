@@ -15,8 +15,9 @@ FR2  NEGATIVE CONTROLS with an L34 precondition: plant 1 (Policy E takes the new
      output (stats pe_flip_effective / d_grant). A run where the plant is effective must differ from the torch path
      at EXACTLY the first layer where it became effective; a run where it never is effective must show no
      difference (reported as a no-op, never as a catch); each plant must be effective on at least one schedule.
-FR3  LAUNCHES PER LAYER (f12b, its draft-only ticks and its verify ticks): fused: 2 Triton launches per draft-only
-     layer, 4 per layer with verify rows; on a draft-only layer after the tick's first, NO torch op other than an
+FR3  LAUNCHES PER LAYER (f12b, its draft-only ticks and its verify ticks): fused: 3 Triton launches per draft-only
+     layer (D1, SCAN, D2), 6 per layer with verify and draft rows; on a draft-only layer after the tick's first, NO
+     torch op other than an
      allocation or a view (TorchDispatchMode, paused inside the launches). The torch path's compute ops per such
      layer are counted for comparison (precondition: the counter sees them).
 FR4  STATIC: the per-layer path (FusedResolver._layer) has no host read (S-C's F12d list) and no host-to-device copy
@@ -25,6 +26,20 @@ FR4  STATIC: the per-layer path (FusedResolver._layer) has no host read (S-C's F
 FR5  ONE TICK ROUND (the interpreter): the free-running greedy round (r2_tick.run_round, K 3, LAMBDA 7) on b2 with
      resolve="check" == resolve="torch" (rows, argmax per tick, committed tokens, decision stats); no difference at
      any compared layer; err 0.
+FR6  HAND CASES for the branches the schedules do not reach (review M5), each with its precondition asserted BEFORE
+     the equality claim: (a) one verify tick at C 1 / X 1 whose first misses overflow (K5 refuses, no Policy E
+     candidate), whose second verify row repeats an overflowed block (a dup behind an overflowed first miss) and
+     selects one block twice in the row: v_over, v_dup_over, sel_dup > 0; the tick is void (CapacityRefusal) after
+     the comparison; (b) draft-only ticks with TWO draft rows of one batch slot whose selections overlap: max rows
+     per b == 2 and d_dup > 0 (the draft first-miss dedup across rows). Fused == torch at every layer, err 0.
+FR7  C's SHARED FIXTURES (r2_lockstep_fixtures.py) on the B2 world with resolve="check": the B2 world equals the
+     vendored reference on every fixture (B2I-1's rule) and fused == torch at every resolved layer; precondition: the
+     void_overflow fixture reaches v_over > 0.
+FR8  THE KERNEL-TIME PARSER (r2_fusedres_prof.py, review M3) on synthetic Kineto traces through its production entry:
+     the device time of the kernels launched inside "t.res" per tick; a launch moved out of the range is not counted
+     (negative control); an orphan device event is counted; a trace without "t.tick" ranges is refused.
+FR9  THE SG5 FLAGS: --b2-fused-plant (hidden, 0 / 1 / 2, FR-g0p) and --b2-res-profile parse; make_engine passes the
+     plant; one_point routes the draft-only phase through profile_draft_only.
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA benchmarks/Efficiency/tests_cpu/test_r2_fusedres.py
 """
@@ -107,7 +122,9 @@ if PART == "lockstep":
         return dict(sched=name, mode=mode, plant=plant, n_bad=len(bad), bad=[repr(x)[:300] for x in bad[:3]],
                     ticks=len(kw["sched"]), L=TRM.L, compared=fr.compared, layers=fr.layers, launches=fr.launches,
                     n_diffs=len(fr.diffs), diffs=[list(d) for d in fr.diffs[:8]], stats=rep["stats"], err=rep["err"],
-                    bias_fallbacks=rep["bias_fallbacks"],
+                    bias_casts=rep["bias_casts"], sel_conversions=rep["sel_conversions"],
+                    max_rows_per_b=rep["max_rows_per_b"], gate=rep["gate"], first_diff_at=rep["first_diff_at"],
+                    first_effective=rep["first_effective"],
                     trace=[[t, l, st, e] for (t, l, st, e) in fr.trace],
                     v1=dict(evictions=c.get("verifier_evictions", 0),
                             inflight_evictions=c.get("verifier_inflight_evictions", 0), refused=m.refused,
@@ -168,6 +185,86 @@ if PART == "lockstep":
             setattr(cls, attr, orig)
         OUT["count"][mode] = dict(n_bad=len(bad), bad=[repr(x)[:300] for x in bad[:3]], recs=recs)
     FR._launch = orig_launch
+
+    # FR6: hand cases (review M5)
+    Row, S_, Ev, L = TRM.Row, TRM.S, TRM.Ev, TRM.L
+
+    def hand_overflow():
+        w = TRM.world(C=1, X=1, R_ver=1, cls=OWN2.OwnResidency, svc_kw=dict(nblk=TRM.NB, resolve="check"))
+        svc = w.svc
+        svc.begin_request(0, "u0")
+        svc.begin_request(1, "u1")
+        hb, tail = 15, svc.tail0
+        key = ("u0", 1, 1)
+        rows = [Row(0, "v", key, 1000, hb, [(hb, tail)]), Row(0, "v", key, 1000, hb, [(hb, tail)])]
+        # row 0: blocks 3 (a local take, C 1), 4 (the layer's one shared extra at head 0), 5 (refused, no candidate:
+        # an OVERFLOW); row 1: block 5 twice (an in-row duplicate) behind its overflowed first miss, and block 6
+        sel = S_([[3, 4, 5, hb], [3, 4, 5, hb]], [[5, 5, 6, hb], [5, 5, 6, hb]])
+        raised = None
+        try:
+            svc.poll()
+            for l in range(L):
+                plan = svc.resolve(l, rows, sel)
+                svc.read_done(l, plan, Ev(True))
+            svc.end_tick()
+        except Exception as e:                                        # noqa: BLE001 - reported by class name
+            raised = type(e).__name__
+        fr = svc.fusedres
+        rep = fr.report()
+        return dict(raised=raised, compared=fr.compared, layers=fr.layers, n_diffs=len(fr.diffs),
+                    diffs=[list(d) for d in fr.diffs[:8]], stats=rep["stats"], err=rep["err"], L=L)
+
+    def hand_two_drafts(ticks=6):
+        w = TRM.world(C=2, X=4, R_ver=2, cls=OWN2.OwnResidency, svc_kw=dict(nblk=TRM.NB, resolve="check"))
+        svc = w.svc
+        svc.begin_request(0, "u0")
+        svc.begin_request(1, "u1")
+        hb, tail = 15, svc.tail0
+        raised = None
+        try:
+            for t in range(ticks):
+                svc.poll()
+                x = t % 5
+                rows = [Row(0, "d", ("u0", 1, 1), 1000 + t, hb, [(hb, tail)]),     # two cohort keys of b 0 (B2
+                        Row(0, "d", ("u0", 1, 2), 1000 + t, hb, [(hb, tail)]),     # holds KEYS 7 live keys per
+                        Row(1, "d", ("u1", 1, 1), 1000 + t, hb, [(hb, tail)])]     # request: reuse them)
+                # the two draft rows of b 0 overlap in blocks x + 1, x + 2 (the second row's dups of the first's misses)
+                sel = S_([[x, x + 1, x + 2, hb], [x, x + 1, x + 2, hb]],
+                         [[x + 1, x + 2, x + 3, hb], [x + 1, x + 2, x + 3, hb]],
+                         [[x + 2, x + 4, hb], [x + 2, x + 4, hb]])
+                for l in range(L):
+                    plan = svc.resolve(l, rows, sel)
+                    svc.read_done(l, plan, Ev(True))
+                svc.end_tick()
+                TRM.land_all(w)
+        except Exception as e:                                        # noqa: BLE001
+            raised = "%s: %s" % (type(e).__name__, str(e)[:200])
+        fr = svc.fusedres
+        rep = fr.report()
+        return dict(raised=raised, ticks=ticks, L=L, compared=fr.compared, layers=fr.layers, n_diffs=len(fr.diffs),
+                    diffs=[list(d) for d in fr.diffs[:8]], stats=rep["stats"], err=rep["err"],
+                    max_rows_per_b=rep["max_rows_per_b"])
+
+    OUT["hand"] = dict(overflow=hand_overflow(), two_drafts=hand_two_drafts())
+
+    # FR7: C's shared fixtures on the B2 world in check mode
+    FXM = TRM.FXM
+    fx_out = {}
+    for name in sorted(FXM.FIXTURES):
+        fx = FXM.FIXTURES[name]
+        ref = fx.worlds[0]
+        worlds = {ref: TRM._fx_world(fx, ref)}
+        worlds["b2"] = OWN._fx_b2(fx, svc_kw=dict(resolve="check"))
+        try:
+            res = FXM.run(fx, worlds, TRM._fx_snapshot, Row)
+            rdiffs, rerr = [repr(d)[:300] for d in res.diffs[:2]], None
+        except Exception as e:                                        # noqa: BLE001
+            rdiffs, rerr = [], "%s: %s" % (type(e).__name__, str(e)[:200])
+        fr = worlds["b2"].svc.fusedres
+        rep = fr.report()
+        fx_out[name] = dict(res_diffs=rdiffs, run_error=rerr, compared=fr.compared, layers=fr.layers,
+                            n_diffs=len(fr.diffs), diffs=[list(d) for d in fr.diffs[:5]], stats=rep["stats"])
+    OUT["fixtures"] = fx_out
 
 elif PART == "tick":
     P3PATH = sys.argv[3]
@@ -258,9 +355,17 @@ def test_FR1_fused_equals_torch_at_every_layer_and_b2_equals_v1(lockstep, sched)
     assert r["n_diffs"] == 0, r["diffs"]                               # fused == torch, every output
     assert r["compared"] == r["layers"] == r["ticks"] * r["L"], (r["compared"], r["layers"], r["ticks"], r["L"])
     assert r["err"] == 0, r["err"]
-    assert r["bias_fallbacks"] == 0, r["bias_fallbacks"]               # the bias rows took the kernel's copy
+    assert r["bias_casts"] == 0 and r["sel_conversions"] == 0, (r["bias_casts"], r["sel_conversions"])
     assert r["b2_applied"] == r["ticks"]
     assert PRE[sched](r), (sched, r["v1"], r["stats"])                 # the schedule reached its transitions
+
+
+def test_FR1_the_lockstep_schedules_reach_the_verify_dedup(lockstep):
+    """Review M5: the verify first-miss dedup across rows (v_dup) ran on at least one lockstep schedule (two verify
+    rows of one cohort per request every third tick). The overflow branches are FR6's (a lockstep run voids)."""
+    dups = {s: lockstep["equal"][s]["stats"]["v_dup"] for s in SCHED}
+    assert any(v > 0 for v in dups.values()), dups
+    assert all(lockstep["equal"][s]["stats"]["v_over"] == 0 for s in SCHED)   # a lockstep tick never overflows
 
 
 # =====================================================================================================================
@@ -285,6 +390,9 @@ def test_FR2_each_plant_is_caught_at_its_first_effective_layer(lockstep, plant):
         effective.append(key)
         assert r["n_diffs"] > 0, (key, "effective at %s but not caught" % (first_eff,))
         assert tuple(r["diffs"][0][:2]) == first_eff, (key, r["diffs"][0], first_eff)
+        # the report's own scoring fields (FR-g0p reads exactly these on the GPU, M2)
+        assert r["first_diff_at"] == list(first_eff) == r["first_effective"][stat], (key, r["first_diff_at"],
+                                                                                    r["first_effective"])
         print("FR2 plant %d on %s: effective first at tick %d layer %d, caught there (%s)"
               % (plant, r["sched"], first_eff[0], first_eff[1], r["diffs"][0][2]))
     assert effective, ("precondition (L34): plant %d was effective on no schedule" % plant,
@@ -311,7 +419,7 @@ VIEW_OR_ALLOC = {"empty", "empty_strided", "select", "slice", "view", "alias", "
                  "_unsafe_view"}
 
 
-def test_FR3_two_launches_per_draft_only_layer_four_with_verify_rows_and_no_torch_compute(lockstep):
+def test_FR3_three_launches_per_draft_only_layer_six_with_verify_rows_and_no_torch_compute(lockstep):
     c = lockstep["count"]
     assert c["fused"]["n_bad"] == 0 and c["torch"]["n_bad"] == 0, (c["fused"]["bad"], c["torch"]["bad"])
     fz, tz = c["fused"]["recs"], c["torch"]["recs"]
@@ -319,9 +427,9 @@ def test_FR3_two_launches_per_draft_only_layer_four_with_verify_rows_and_no_torc
     d_only = [r for r in fz if not r["mixed"]]
     mixed = [r for r in fz if r["mixed"]]
     assert d_only and mixed, "precondition: f12b has draft-only and verify layers"
-    assert all(r["launches"] == 2 for r in d_only), [(r["tick"], r["l"], r["launches"]) for r in d_only]
-    assert all(r["launches"] == 4 for r in mixed), [(r["tick"], r["l"], r["launches"]) for r in mixed]  # f12b: every
-    # layer with verify rows also has draft rows (_sched_pressure); a verify-only layer would launch 2
+    assert all(r["launches"] == 3 for r in d_only), [(r["tick"], r["l"], r["launches"]) for r in d_only]
+    assert all(r["launches"] == 6 for r in mixed), [(r["tick"], r["l"], r["launches"]) for r in mixed]  # f12b: every
+    # layer with verify rows also has draft rows (_sched_pressure); a verify-only layer would launch 3
     later = [r for r in d_only if not r["first"]]
     assert later, "precondition: a draft-only layer after the tick's first"
     compute = sorted({op for r in later for op in r["ops"] if op not in VIEW_OR_ALLOC})
@@ -331,7 +439,7 @@ def test_FR3_two_launches_per_draft_only_layer_four_with_verify_rows_and_no_torc
     assert t_compute and min(t_compute) >= 20, t_compute               # precondition: the counter sees compute ops
     print("FR3 per draft-only layer (not the tick's first): fused %d Triton launches, %d torch compute ops; torch "
           "path %.1f compute ops (min %d, max %d) over %d layers; per verify layer fused %d launches"
-          % (2, 0, sum(t_compute) / len(t_compute), min(t_compute), max(t_compute), len(t_compute), 4))
+          % (3, 0, sum(t_compute) / len(t_compute), min(t_compute), max(t_compute), len(t_compute), 6))
 
 
 # =====================================================================================================================
@@ -365,7 +473,7 @@ def test_FR4_every_triton_function_resolves_its_names_in_its_module():
     from triton.runtime.jit import JITFunction
     FR = TRM._load("r2_fusedres")
     fns = {n: v for n, v in vars(FR).items() if isinstance(v, JITFunction)}
-    need = {"_fr_v1", "_fr_v2", "_fr_d1", "_fr_d2", "_row", "_sorted_unique", "_lookup", "_seen", "_pack", "_put1",
+    need = {"_fr_v1", "_fr_v2", "_fr_d1", "_fr_d2", "_fr_scan", "_row", "_sorted_unique", "_lookup", "_seen", "_pack", "_put1",
             "_slots", "_d_state", "_at_slot", "_selbits"}
     assert need <= set(fns), sorted(need - set(fns))
     bad = {n: TRM._kernel_name_problems(v) for n, v in fns.items() if TRM._kernel_name_problems(v)}
@@ -400,3 +508,109 @@ def test_FR5_a_free_running_round_on_b2_check_equals_torch(p3):
     assert r["torch_stats"]["ticks"] > 20 and r["torch_stats"]["publications"] > 0, r["torch_stats"]
     print("FR5 OK: %d ticks, %d fused layers compared, launches per layer %.2f, stats %s"
           % (r["check_stats"]["ticks"], f["compared"], f["launches_per_layer"], f["stats"]))
+
+
+# =====================================================================================================================
+# FR6 hand cases (review M5): preconditions first, then the equality claim
+# =====================================================================================================================
+def test_FR6a_overflow_dup_behind_overflow_and_an_in_row_duplicate(lockstep):
+    r = lockstep["hand"]["overflow"]
+    s = r["stats"]
+    assert s["v_over"] > 0 and s["v_dup_over"] > 0 and s["sel_dup"] > 0, ("precondition", s)
+    assert r["compared"] == r["layers"] == r["L"], r                    # every layer compared before the void
+    assert r["n_diffs"] == 0, r["diffs"]
+    assert r["raised"] == "CapacityRefusal", r["raised"]               # the overflow voids the tick (S-C's rule)
+
+
+def test_FR6b_two_draft_rows_of_one_batch_slot(lockstep):
+    r = lockstep["hand"]["two_drafts"]
+    assert r["raised"] is None, r["raised"]
+    assert r["max_rows_per_b"][1] == 2 and r["stats"]["d_dup"] > 0, ("precondition", r["max_rows_per_b"],
+                                                                      r["stats"])
+    assert r["compared"] == r["layers"] == r["ticks"] * r["L"], r
+    assert r["n_diffs"] == 0, r["diffs"]
+    assert r["err"] == 0, r["err"]
+
+
+# =====================================================================================================================
+# FR7 C's shared fixtures in check mode
+# =====================================================================================================================
+def test_FR7_the_shared_fixtures_in_check_mode(lockstep):
+    fx = lockstep["fixtures"]
+    assert fx, "no fixture ran"
+    bad = {n: (v["run_error"], v["res_diffs"][:1]) for n, v in fx.items() if v["run_error"] or v["res_diffs"]}
+    assert bad == {}, bad                                               # the B2 world (fused) == the reference
+    fdiff = {n: v["diffs"][:2] for n, v in fx.items() if v["n_diffs"]}
+    assert fdiff == {}, fdiff                                           # fused == torch at every resolved layer
+    assert all(v["compared"] == v["layers"] for v in fx.values()), {n: (v["compared"], v["layers"])
+                                                                    for n, v in fx.items()}
+    assert "void_overflow" in fx and fx["void_overflow"]["stats"]["v_over"] > 0, fx.get("void_overflow")
+    assert sum(v["compared"] for v in fx.values()) > 0
+
+
+# =====================================================================================================================
+# FR8 the kernel-time parser (r2_fusedres_prof.py)
+# =====================================================================================================================
+FP = _load_by_path("r2_fusedres_prof_fr", ROOT / "benchmarks/Efficiency/r2_fusedres_prof.py")
+
+
+def _ann(name, ts, dur, tid=1):
+    return dict(ph="X", cat="user_annotation", name=name, ts=ts, dur=dur, pid=7, tid=tid)
+
+
+def _launch_ev(ts, corr, tid=1):
+    return dict(ph="X", cat="cuda_driver", name="cuLaunchKernel", ts=ts, dur=1, pid=7, tid=tid,
+                args=dict(correlation=corr))
+
+
+def _kern(name, corr, dur):
+    return dict(ph="X", cat="kernel", name=name, ts=10000 + corr, dur=dur, pid=0, tid=7, args=dict(correlation=corr))
+
+
+def _trace(move_out=False):
+    ev = [_ann("t.tick", 0, 100), _ann("t.res", 10, 20), _ann("t.res", 50, 10),
+          _ann("t.tick", 200, 100), _ann("t.res", 210, 20)]
+    ev += [_launch_ev(15 if not move_out else 40, 1), _launch_ev(55, 2), _launch_ev(80, 3), _launch_ev(215, 4)]
+    ev += [_kern("_fr_d1", 1, 30), _kern("_fr_d2", 2, 50), _kern("gemm", 3, 400), _kern("_fr_d1", 4, 70),
+           _kern("orphan", 99, 5)]
+    return dict(traceEvents=ev)
+
+
+def test_FR8_the_kernel_time_parser_and_its_negative_control():
+    p = FP.parse_res_trace(_trace())
+    assert p["ticks"] == 2 and p["n"] == [2, 1], p
+    assert [round(x, 6) for x in p["ms"]] == [0.08, 0.07], p          # 30 + 50 us; 70 us (gemm is outside t.res)
+    d1 = p["by_name"]["_fr_d1"]
+    assert d1["n"] == 2 and round(d1["ms"], 6) == 0.1 and "gemm" not in p["by_name"], p["by_name"]
+    assert p["orphans"] == 1, p                                         # never silently dropped
+    t = FP.parse_res_trace(_trace(), cat="tick")
+    assert [round(x, 6) for x in t["ms"]] == [0.48, 0.07], t           # the whole tick includes gemm
+    q = FP.parse_res_trace(_trace(move_out=True))                       # NEGATIVE CONTROL: the launch leaves t.res
+    assert q["n"] == [1, 1] and round(q["ms"][0], 6) == 0.05, q
+    s = FP.summarize(p, skip=1)
+    assert s["ms_stats"]["n"] == 1 and round(s["ms_stats"]["median"], 6) == 0.07, s
+    with pytest.raises(ValueError, match="t.tick"):
+        FP.parse_res_trace(dict(traceEvents=[e for e in _trace()["traceEvents"] if e["name"] != "t.tick"]))
+
+
+# =====================================================================================================================
+# FR9 the SG5 flags
+# =====================================================================================================================
+def test_FR9_the_sg5_flags_for_the_plant_and_the_profile():
+    G = TT._sg5_gate()
+    base = ["--out", "o", "--workload", "w", "--biattn", "b", "--gilfree", "g", "--gilfree-build", "/x",
+            "--backends", "b2"]
+    a = G.parse_args(base)
+    assert a.b2_resolve == "torch" and a.b2_fused_plant == 0 and a.b2_res_profile is False
+    b = G.parse_args(base + ["--b2-resolve", "check", "--b2-fused-plant", "2", "--b2-res-profile"])
+    assert b.b2_resolve == "check" and b.b2_fused_plant == 2 and b.b2_res_profile is True
+    with pytest.raises(SystemExit):
+        G.parse_args(base + ["--b2-fused-plant", "3"])
+    src = (ROOT / "benchmarks/Efficiency/r2_tick_sg5.py").read_text()
+    tree = ast.parse(src)
+    fns = {n.name: ast.get_source_segment(src, n) for n in tree.body if isinstance(n, ast.FunctionDef)}
+    assert 'fused_plant=int(getattr(a, "b2_fused_plant", 0))' in fns["make_engine"]
+    assert 'resolve=getattr(a, "b2_resolve", "torch")' in fns["make_engine"]
+    assert "profile_draft_only(a, eng, first, label)" in fns["one_point"]
+    assert 'record_function("t." + cat)' in fns["profile_draft_only"]
+    assert "FP.parse_res_trace(" in fns["profile_draft_only"]

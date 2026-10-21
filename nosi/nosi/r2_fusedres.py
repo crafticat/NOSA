@@ -4,9 +4,9 @@ WHAT IT REPLACES. OwnResidency (r2_own2.py) inherits S-C's per-layer device path
 sorts and scatters), device_verify / device_draft (stable sorts, rank_in_group with cummax, index, index_put_) and
 C's sparse record (sparse_layer_record, _compact, _pack_bits, draft_bias_fill). On the GPU that is about 305 small
 kernels per layer, 9,774 per draft tick at B 64 and 37.62 ms of kernel time (analysis/bound_4_2/other_res_r1,
-"res:resolve G_d"). This module makes the SAME decisions with two Triton launches per row kind present in the layer:
-FOUR with verify and draft rows (V1, V2, D1, D2), TWO with only draft rows (D1, D2) or only verify rows (V1, V2). No host read, no host-to-device copy in
-the per-layer path. OwnResidency(resolve="fused") uses it; resolve="check" uses it and also runs the torch path on the
+"res:resolve G_d"). This module makes the SAME decisions with THREE Triton launches per row kind present in the
+layer (fusedres2): SIX with verify and draft rows (V1, SCAN, V2, D1, SCAN, D2), THREE with only draft rows (D1, SCAN,
+D2) or only verify rows. No host read, no host-to-device copy in the per-layer path. OwnResidency(resolve="fused") uses it; resolve="check" uses it and also runs the torch path on the
 same inputs and compares every output (tests, the GPU equality gate); resolve="torch" (the default) is unchanged.
 
 THE LAYOUT. One Triton program per stream s = b * H + h (grid S = B * H). A program reads its stream's NPOS = C + X
@@ -18,9 +18,11 @@ tables of DeviceMirror.layer (B, H, nblk) are never built.
 
 THE ONE GLOBAL COUPLING is K5's shared extras: "the first (X - borrowed - reserve) extra-needing first misses of the
 layer, in K3X entry order (row, head, ascending block)", and borrowed sums every stream's usage. Phase 1 (V1 / D1)
-writes each (row, head)'s count of extra-needing first misses and each stream's usage; phase 2 (V2 / D2) reads the
-whole count vector (R * H integers) and the usage vector (S integers) and computes its entries' global exclusive
-prefix itself: base(row, head) + the in-row prefix. The sparse record's compaction uses the same scheme (the record
+writes each (row, head)'s count of extra-needing first misses and each stream's usage; SCAN (one program) writes the
+exclusive prefix per (row, head), the layer's budget and the record total; phase 2 (V2 / D2) loads ONE base per
+(row, head) and adds the in-row prefix (fusedres2, review M4: 0e28cf6 had every program read the whole count vectors,
+an O(B^2) term at B 287). Phase 2 re-checks its own counts against phase 1's (err bit 16, review m5). The sparse
+record's compaction uses the same scheme (the record
 count per (row, head) comes from phase 1: a draft record is every valid entry, a verify record every valid entry that
 is not READY, since pin_records is False for B2). Program 0 of phase 1 zeroes the counters that phase 2 adds into.
 
@@ -49,16 +51,20 @@ ownership state; the err flag below is raised when the first two fail):
   A1  a block has at most one resident slot and at most one current-owner slot in flight per stream (K3). S-C's
       scatter picks one of several on the GPU (unspecified); this module picks the highest slot.
   A2  Policy E's candidate stamps are in [0, 2^47) and distinct within a stream (each stamp is a fresh clock value).
-      torch.sort breaks ties in an unspecified way; this module breaks them by slot index.
+      torch.sort breaks ties in an unspecified way; this module breaks them by slot index. Ties are NOT flagged (only
+      the range is, bit 8); both picks are legal; a tie shows as a check-mode difference.
   A3  a K5 grant always finds a FREE slot (grants <= NPOS - usage, by K5's arithmetic). S-C would index the next
-      stream's slot 0 if it did not; this module writes nothing for such a take and raises the err flag.
+      stream's slot 0 (and the tail bias rows) if it did not; this module writes nothing for such a take, may set
+      read bit NPOS / lane NPOS in its scratch, and raises the err flag: the outputs differ only on a voided tick.
 
-THE BIAS ROWS are copied bit for bit in D2 when store_b[l] and cis[l] are contiguous (B, rows, H) tables of one 2- or
-4-byte dtype; otherwise S-B's torch draft_bias_fill runs after D2 (counted in bias_fallbacks: torch ops, not the
-design's launch count).
+THE BIAS ROWS: D2 copies them bit for bit when store_b[l] and cis[l] have one 2- or 4-byte dtype (BIAS 1), else casts
+cis to store_b's dtype in the kernel (BIAS 2, counted in bias_casts; at p5b2 both are the tick dtype: r2_tick.py
+from_r2 makes the twins and store_bias with src.ring.dtype). Non-contiguous or non-(B, rows, H) tables are refused.
 
 THE ERR FLAG (self.err, int32, watched by the service: a set flag voids the tick with CapacityRefusal at end_tick):
-bit 1 A1 resident, bit 2 A1 in flight, bit 4 A3, bit 8 A2 (stamp range).
+bit 1 A1 resident, bit 2 A1 in flight, bit 4 A3, bit 8 A2 (stamp range), bit 16 the phase-1 / phase-2 self-check.
+self.err is zeroed at each tick's first layer (after the previous end_tick read it); self.err_any keeps every tick's
+bits (report()["err"]).
 
 NEGATIVE CONTROLS (plant, tests only): 1 = Policy E takes the NEWEST candidate first (the order flipped); 2 = a draft
 grant takes the (q + 1)-th FREE slot (an off-by-one slot). STATS counts, per run, where each plant CHANGES an output
@@ -96,9 +102,14 @@ assert DREC == ("o", "blk", "flags", "slot", "take_slot")
 
 RESOLVE_MODES = ("torch", "fused", "check")
 PLANTS = {0: "none", 1: "Policy E takes the newest candidate first", 2: "a draft grant takes the (q + 1)-th FREE slot"}
-STATS = ("v_evict", "pe_flip_effective", "v_grant", "d_grant", "d_refused", "v_over", "v_dup", "v_evict_infl")
+STATS = ("v_evict", "pe_flip_effective", "v_grant", "d_grant", "d_refused", "v_over", "v_dup", "v_evict_infl",
+         "v_dup_over", "d_dup", "sel_dup")      # v_dup_over: a dup behind an overflowed first miss; sel_dup: a row
+#                                                 selecting one block twice (entries beyond the first), both kinds
+GATE_STATS = ("v_evict", "pe_flip_effective", "v_grant", "d_grant", "d_refused")   # FR-g0's coverage (M1)
 ERR_BITS = {1: "A1: a block has two resident slots in a stream", 2: "A1: a block has two owner slots in flight",
-            4: "A3: a K5 grant found no FREE slot", 8: "A2: a Policy E candidate stamp outside [0, 2^47)"}
+            4: "A3: a K5 grant found no FREE slot", 8: "A2: a Policy E candidate stamp outside [0, 2^47)",
+            16: "self-check: phase 2's classification count differs from phase 1's (the global prefix is wrong)"}
+SCAN_BLOCK = 1024
 MAX_NPOS = 512                                         # Policy E's sort key holds the slot index in 9 bits
 
 
@@ -128,8 +139,9 @@ if triton is not None:
         kid = tl.load(kid_ptr + tr)
         kk = tl.arange(0, KP)
         mk = kk < K
-        s = tl.load(sel_ptr + (h * R + tr) * K + kk, mask=mk, other=-1).to(tl.int32)
-        v0 = mk & (s >= 0) & (s < hbr) & (s < NBLK)
+        s64 = tl.load(sel_ptr + (h * R + tr) * K + kk, mask=mk, other=-1)
+        v0 = mk & (s64 >= 0) & (s64 < hbr) & (s64 < NBLK)                       # validated in int64 (m8)
+        s = tl.where(v0, s64, -1).to(tl.int32)                                  # only valid entries are compared
         return act, j, tr, kid, s, v0
 
     @triton.jit
@@ -228,14 +240,40 @@ if triton is not None:
         return slot, infl, nres, nfly
 
     # =================================================================================================================
-    # V1: the verify rows' classification (counts for the global K5 prefix and the record compaction)
+    # SCAN (one program, M4 of review-fusedres-0e28cf6): the exclusive prefixes of the per-(row, head) counts of a
+    # phase, the layer's K5 budget and the record total. Phase 2 then loads ONE base per (row, head): no O(B^2) reads.
     # =================================================================================================================
-    @triton.jit
+    @triton.jit(do_not_specialize=["RH", "S", "C", "X", "RES"])
+    def _fr_scan(ne_ptr, rec_ptr, usg_ptr, bne_ptr, brec_ptr, misc_ptr, RH, S, C, X, RES, BLOCK: tl.constexpr):
+        offs = tl.arange(0, BLOCK)
+        cn = tl.sum(tl.zeros([2], tl.int32), axis=0)
+        cr = cn
+        for c0 in range(0, RH, BLOCK):
+            m = c0 + offs < RH
+            n = tl.load(ne_ptr + c0 + offs, mask=m, other=0)
+            r = tl.load(rec_ptr + c0 + offs, mask=m, other=0)
+            tl.store(bne_ptr + c0 + offs, cn + tl.cumsum(n, axis=0) - n, mask=m)
+            tl.store(brec_ptr + c0 + offs, cr + tl.cumsum(r, axis=0) - r, mask=m)
+            cn = cn + tl.sum(n, axis=0)
+            cr = cr + tl.sum(r, axis=0)
+        bor = cn * 0
+        for c0 in range(0, S, BLOCK):
+            m = c0 + offs < S
+            u = tl.load(usg_ptr + c0 + offs, mask=m, other=0)
+            bor = bor + tl.sum(tl.where(m, tl.maximum(u - C, 0), 0), axis=0)
+        budget = tl.maximum(X - bor - RES, 0)
+        q4 = tl.arange(0, 4)
+        tl.store(misc_ptr + q4, tl.where(q4 == 0, budget, tl.where(q4 == 1, cr, cn)), mask=q4 < 3)
+
+    # =================================================================================================================
+    # V1:the verify rows' classification (counts for the global K5 prefix and the record compaction)
+    # =================================================================================================================
+    @triton.jit(do_not_specialize=["H", "R", "K", "NBLK", "NPOS", "C", "Rv", "MAXRV", "NLOOK"])   # m4: no re-compile
     def _fr_v1(code_ptr, blk_ptr, gen_ptr, cur_ptr, prot_ptr, stamp_ptr, sel_ptr, kid_ptr,
                vix_ptr, vhb_ptr, vstart_ptr, vcnt_ptr, vorder_ptr,
                ne_ptr, rec_ptr, usg_ptr, err_ptr, cntv_ptr, look_ptr,
                H, R, K, NBLK, NPOS, C, Rv, MAXRV, NLOOK,
-               KP: tl.constexpr, NP: tl.constexpr, LP: tl.constexpr):
+               KP: tl.constexpr, NP: tl.constexpr):
         pid = tl.program_id(0)
         b = pid // H
         h = pid % H
@@ -244,8 +282,9 @@ if triton is not None:
             code_ptr, blk_ptr, gen_ptr, cur_ptr, prot_ptr, stamp_ptr, base, NPOS, NBLK, NP)
         free_local = tl.maximum(C - usage, 0)
         _put1(usg_ptr + pid, usage, pid >= 0)
-        lk = tl.arange(0, LP)                                                     # program 0 zeroes V2's sums
-        tl.store(look_ptr + lk, tl.zeros([LP], tl.int64), mask=(lk < NLOOK) & (pid == 0))
+        lk = tl.arange(0, 256)                                                    # program 0 zeroes V2's sums
+        for c0 in range(0, NLOOK, 256):
+            tl.store(look_ptr + c0 + lk, tl.zeros([256], tl.int64), mask=(c0 + lk < NLOOK) & (pid == 0))
         _put1(cntv_ptr, tl.sum(tl.zeros([2], tl.int64), axis=0), pid == 0)
         start = tl.load(vstart_ptr + b)
         cnt = tl.load(vcnt_ptr + b)
@@ -278,16 +317,18 @@ if triton is not None:
     # =================================================================================================================
     # V2: the verify decisions
     # =================================================================================================================
-    @triton.jit
+    @triton.jit(do_not_specialize=["H", "B", "R", "K", "NBLK", "NPOS", "C", "X", "Rv", "Rd", "MAXRV", "MAXRD", "NV",
+                                   "CAPV", "S", "WB", "WP", "T", "P"])
     def _fr_v2(code_ptr, blk_ptr, gen_ptr, cur_ptr, prot_ptr, stamp_ptr, sel_ptr, kid_ptr,
                vix_ptr, vhb_ptr, vtl_ptr, vnt_ptr, vstart_ptr, vcnt_ptr, vorder_ptr,
                dix_ptr, dhb_ptr, dstart_ptr, dcnt_ptr, dorder_ptr,
-               ne_ptr, rec_ptr, usg_ptr,
+               ne_ptr, rec_ptr, bne_ptr, brec_ptr, misc_ptr,
                tv_ptr, vpage_ptr, vnpg_ptr, ppage_ptr, pnpg_ptr, ids_ptr, vrec_ptr, vrcnt_ptr, cntv_ptr, look_ptr,
                vread_ptr, post_ptr, usg2_ptr, selw_ptr, rowsel_ptr, err_ptr, stats_ptr,
-               H, B, R, K, NBLK, NPOS, C, X, Rv, Rd, MAXRV, MAXRD, NV, CAPV, RH, S, WB, WP, T, P,
-               KP: tl.constexpr, NP: tl.constexpr, PP: tl.constexpr, TP: tl.constexpr, RHP: tl.constexpr,
-               SP: tl.constexpr, ZP: tl.constexpr, PE_INFL: tl.constexpr, LAST: tl.constexpr, PLANT: tl.constexpr):
+               H, B, R, K, NBLK, NPOS, C, X, Rv, Rd, MAXRV, MAXRD, NV, CAPV, S, WB, WP, T, P,
+               KP: tl.constexpr, NP: tl.constexpr, PP: tl.constexpr, TP: tl.constexpr,
+               ZP: tl.constexpr, PE_INFL: tl.constexpr, LAST: tl.constexpr, PLANT: tl.constexpr,
+               NSTAT: tl.constexpr):
         pid = tl.program_id(0)
         b = pid // H
         h = pid % H
@@ -299,14 +340,9 @@ if triton is not None:
         fi = free.to(tl.int32)
         fr = tl.cumsum(fi, axis=0) - fi                                          # rank among the FREE slots
         free_local = tl.maximum(C - usage, 0)
-        # K5's shared extras for the verifier: X - borrowed (the reserve R_ver included)
-        ss = tl.arange(0, SP)
-        usgv = tl.load(usg_ptr + ss, mask=ss < S, other=0)
-        budget = tl.maximum(X - tl.sum(tl.maximum(usgv - C, 0), axis=0), 0)
-        rr = tl.arange(0, RHP)
-        nev = tl.load(ne_ptr + rr, mask=rr < RH, other=0)
-        recv = tl.load(rec_ptr + rr, mask=rr < RH, other=0)
-        totrec = tl.sum(recv, axis=0)
+        # K5's shared extras for the verifier (X - borrowed, the reserve R_ver included) and the record total: SCAN's
+        budget = tl.load(misc_ptr)
+        totrec = tl.load(misc_ptr + 1)
         vstart = tl.load(vstart_ptr + b)
         vcnt = tl.load(vcnt_ptr + b)
         dstart = tl.load(dstart_ptr + b)
@@ -355,7 +391,7 @@ if triton is not None:
         tt = tl.arange(0, TP)
         rrn = tl.arange(0, NP)
         q4 = tl.arange(0, 4)
-        st8 = tl.arange(0, 8)
+        st16 = tl.arange(0, 16)
         zw = tl.arange(0, ZP // 32)
         for i in range(0, MAXRV):
             act, j, tr, kid, s, v0 = _row(vorder_ptr, vix_ptr, vhb_ptr, kid_ptr, sel_ptr, vstart, vcnt, i, Rv, h, R,
@@ -377,7 +413,7 @@ if triton is not None:
             ne = fmiss & (rank >= free_local)
             nei = ne.to(tl.int32)
             idx = j * H + h
-            g = tl.sum(tl.where(rr < idx, nev, 0), axis=0) + tl.cumsum(nei, axis=0) - nei
+            g = tl.load(bne_ptr + idx) + tl.cumsum(nei, axis=0) - nei
             granted = fmiss & ((ne == 0) | (g < budget))
             refused = fmiss & (granted == 0)
             gi = granted.to(tl.int32)
@@ -445,7 +481,7 @@ if triton is not None:
             # the verify record (pin_records False): every valid entry that is not READY, compacted in entry order
             rm = valid & (ready == 0)
             rmi = rm.to(tl.int32)
-            rpos = tl.sum(tl.where(rr < idx, recv, 0), axis=0) + tl.cumsum(rmi, axis=0) - rmi
+            rpos = tl.load(brec_ptr + idx) + tl.cumsum(rmi, axis=0) - rmi
             wm = rm & act & (rpos < CAPV)
             flags = (ready.to(tl.int64) * 2 + infl.to(tl.int64) * 4 + dup.to(tl.int64) * 8 + granted.to(tl.int64) * 16
                      + evicted.to(tl.int64) * 32 + ev_infl.to(tl.int64) * 64 + first.to(tl.int64) * 128
@@ -494,16 +530,22 @@ if triton is not None:
             # REPORT / L34 preconditions: per kind, the entries of this row
             n_ev = tl.sum(evicted.to(tl.int64), axis=0)
             n_fl = tl.sum((evicted & (ncand - 1 - rev != rev)).to(tl.int64), axis=0)   # plant 1 changes these
-            sv = tl.where(st8 == 0, n_ev, tl.where(st8 == 1, n_fl, tl.where(
-                st8 == 2, tl.sum(gi.to(tl.int64), axis=0), tl.where(
-                    st8 == 5, tl.sum(over.to(tl.int64), axis=0), tl.where(
-                        st8 == 6, tl.sum(dup.to(tl.int64), axis=0), tl.where(
-                            st8 == 7, tl.sum(ev_infl.to(tl.int64), axis=0), 0))))))
-            tl.atomic_add(stats_ptr + st8, sv, mask=(st8 < 8) & act)
+            n_dov = tl.sum((dup & (grp < 0)).to(tl.int64), axis=0)                   # a dup behind an overflow
+            n_sdup = (tl.sum(v0.to(tl.int32), axis=0) - tl.sum(valid.to(tl.int32), axis=0)).to(tl.int64)
+            sv = tl.where(st16 == 0, n_ev, tl.where(st16 == 1, n_fl, tl.where(
+                st16 == 2, tl.sum(gi.to(tl.int64), axis=0), tl.where(
+                    st16 == 5, tl.sum(over.to(tl.int64), axis=0), tl.where(
+                        st16 == 6, tl.sum(dup.to(tl.int64), axis=0), tl.where(
+                            st16 == 7, tl.sum(ev_infl.to(tl.int64), axis=0), tl.where(
+                                st16 == 8, n_dov, tl.where(st16 == 10, n_sdup, 0))))))))
+            tl.atomic_add(stats_ptr + st16, sv, mask=(st16 < NSTAT) & act)
             e1 = tl.where(act & (tl.max(nres, axis=0) > 1), 1, 0)
             e2 = tl.where(act & (tl.max(nfly, axis=0) > 1), 2, 0)
             e4 = tl.where(act & (tl.max((granted & (fs < 0)).to(tl.int32), axis=0) > 0), 4, 0)
-            errb = errb | e1 | e2 | e4
+            # m5: this copy of the classification must agree with V1's counts (else the global prefix is wrong)
+            e16 = tl.where(act & ((tl.sum(nei, axis=0) != tl.load(ne_ptr + idx))
+                                  | (tl.sum(rmi, axis=0) != tl.load(rec_ptr + idx))), 16, 0)
+            errb = errb | e1 | e2 | e4 | e16
             # this row's selection bitmap (rowsel), and the stream's union (sel) when no draft row follows
             rb_ = _selbits(s, v0, ZP)
             tl.store(rowsel_ptr + (tr * H + h) * WB + zw, _pack(rb_, ZP), mask=(zw < WB) & act)
@@ -525,7 +567,7 @@ if triton is not None:
     # =================================================================================================================
     # D1: the draft rows' classification on the state after the verify rows
     # =================================================================================================================
-    @triton.jit
+    @triton.jit(do_not_specialize=["H", "R", "K", "NBLK", "NPOS", "C", "Rd", "MAXRD", "S", "NPAIRS"])
     def _fr_d1(code_ptr, blk_ptr, gen_ptr, cur_ptr, prot_ptr, stamp_ptr, sel_ptr, kid_ptr,
                dix_ptr, dhb_ptr, dstart_ptr, dcnt_ptr, dorder_ptr,
                post_ptr, usg2_ptr, ne_ptr, rec_ptr, usgd_ptr, err_ptr, cntd_ptr,
@@ -580,18 +622,19 @@ if triton is not None:
     # =================================================================================================================
     # D2: the draft decisions, the draft record, the bias rows, the selection bitmaps
     # =================================================================================================================
-    @triton.jit
+    @triton.jit(do_not_specialize=["H", "B", "R", "K", "NBLK", "NPOS", "C", "Rv", "Rd", "MAXRV", "MAXRD", "ND",
+                                   "CAPD", "S", "WB", "T", "P", "BS", "ROWS_S", "ROWS_C"])
     def _fr_d2(code_ptr, blk_ptr, gen_ptr, cur_ptr, prot_ptr, stamp_ptr, sel_ptr, kid_ptr,
                vix_ptr, vhb_ptr, vstart_ptr, vcnt_ptr, vorder_ptr,
                dix_ptr, dhb_ptr, dtl_ptr, dnt_ptr, dstart_ptr, dcnt_ptr, dorder_ptr,
-               post_ptr, ne_ptr, rec_ptr, usgd_ptr,
+               post_ptr, ne_ptr, rec_ptr, bne_ptr, brec_ptr, misc_ptr, usgd_ptr,
                td_ptr, dpage_ptr, dnpg_ptr, ppage_ptr, pnpg_ptr, drec_ptr, dcnt_out_ptr, cntd_ptr,
                selw_ptr, rowsel_ptr, err_ptr, stats_ptr, sb_ptr, cis_ptr,
-               H, B, R, K, NBLK, NPOS, C, X, RVER, Rv, Rd, MAXRV, MAXRD, ND, CAPD, RH, S, WB, T, P,
+               H, B, R, K, NBLK, NPOS, C, Rv, Rd, MAXRV, MAXRD, ND, CAPD, S, WB, T, P,
                BS, ROWS_S, ROWS_C,
-               KP: tl.constexpr, NP: tl.constexpr, PP: tl.constexpr, TP: tl.constexpr, RHP: tl.constexpr,
-               SP: tl.constexpr, ZP: tl.constexpr, BSP: tl.constexpr, HAS_V: tl.constexpr, BIAS: tl.constexpr,
-               PLANT: tl.constexpr):
+               KP: tl.constexpr, NP: tl.constexpr, PP: tl.constexpr, TP: tl.constexpr,
+               ZP: tl.constexpr, BSP: tl.constexpr, HAS_V: tl.constexpr, BIAS: tl.constexpr,
+               PLANT: tl.constexpr, NSTAT: tl.constexpr):
         pid = tl.program_id(0)
         b = pid // H
         h = pid % H
@@ -612,13 +655,8 @@ if triton is not None:
         fi = free.to(tl.int32)
         fr = tl.cumsum(fi, axis=0) - fi
         free_local = tl.maximum(C - usage, 0)
-        ss = tl.arange(0, SP)
-        usgv = tl.load(usgd_ptr + ss, mask=ss < S, other=0)
-        budget = tl.maximum(X - tl.sum(tl.maximum(usgv - C, 0), axis=0) - RVER, 0)
-        rr = tl.arange(0, RHP)
-        nev = tl.load(ne_ptr + rr, mask=rr < RH, other=0)
-        recv = tl.load(rec_ptr + rr, mask=rr < RH, other=0)
-        totrec = tl.sum(recv, axis=0)
+        budget = tl.load(misc_ptr)                                               # SCAN: X - borrowed - R_ver
+        totrec = tl.load(misc_ptr + 1)
         start = tl.load(dstart_ptr + b)
         cnt = tl.load(dcnt_ptr + b)
         carry_f = tl.sum(tl.zeros([2], tl.int32), axis=0)
@@ -628,7 +666,7 @@ if triton is not None:
         mk = kk < K
         cc = tl.arange(0, PP)
         tt = tl.arange(0, TP)
-        st8 = tl.arange(0, 8)
+        st16 = tl.arange(0, 16)
         zw = tl.arange(0, ZP // 32)
         bb = tl.arange(0, BSP)
         selu = _selbits(tl.full([KP], -1, tl.int32), tl.full([KP], -1, tl.int32) >= 0, ZP)
@@ -649,7 +687,7 @@ if triton is not None:
             ne = fmiss & (rank >= free_local)
             nei = ne.to(tl.int32)
             idx = j * H + h
-            g = tl.sum(tl.where(rr < idx, nev, 0), axis=0) + tl.cumsum(nei, axis=0) - nei
+            g = tl.load(bne_ptr + idx) + tl.cumsum(nei, axis=0) - nei
             granted = fmiss & ((ne == 0) | (g < budget))
             refused = fmiss & (granted == 0)
             gi = granted.to(tl.int32)
@@ -691,7 +729,7 @@ if triton is not None:
             _put1(pnpg_ptr + tr * H + h, npg.to(tl.int32), act)
             # the draft record: every valid entry, compacted in entry order
             vi = valid.to(tl.int32)
-            rpos = tl.sum(tl.where(rr < idx, recv, 0), axis=0) + tl.cumsum(vi, axis=0) - vi
+            rpos = tl.load(brec_ptr + idx) + tl.cumsum(vi, axis=0) - vi
             wm = valid & act & (rpos < CAPD)
             hole = valid & ((ready | infl | granted | refused) == 0)
             flags = (ready.to(tl.int64) * 2 + infl.to(tl.int64) * 4 + granted.to(tl.int64) * 16
@@ -710,19 +748,27 @@ if triton is not None:
             q4 = tl.arange(0, 4)
             cv = tl.where(q4 == 0, (nready < nvalid).to(tl.int64), tl.where(q4 == 1, nref, 0))
             tl.atomic_add(cntd_ptr + q4, cv, mask=(q4 < 2) & act)
-            sv = tl.where(st8 == 3, tl.sum(gi.to(tl.int64), axis=0), tl.where(st8 == 4, nref, 0))
-            tl.atomic_add(stats_ptr + st8, sv, mask=((st8 == 3) | (st8 == 4)) & act)
-            # the bias rows of the granted takes (S-B's draft_bias_fill), bit-exact copies
-            if BIAS:
+            n_sdup = (tl.sum(v0.to(tl.int32), axis=0) - nvalid).to(tl.int64)
+            sv = tl.where(st16 == 3, tl.sum(gi.to(tl.int64), axis=0), tl.where(st16 == 4, nref, tl.where(
+                st16 == 9, tl.sum(dup.to(tl.int64), axis=0), tl.where(st16 == 10, n_sdup, 0))))
+            tl.atomic_add(stats_ptr + st16, sv, mask=(st16 < NSTAT) & act)
+            # the bias rows of the granted takes (S-B's draft_bias_fill): BIAS 1 bit copies (one dtype), 2 a cast
+            # (cis to store_b's dtype: torch's .to on the GPU rounds to nearest even, as Triton's cast does)
+            if BIAS != 0:
                 gm = (granted & act & (take >= 0) & (take < NPOS))[:, None] & (bb[None, :] < BS)
                 b64 = b.to(tl.int64)
                 src = cis_ptr + ((b64 * ROWS_C + blk[:, None].to(tl.int64) * BS + bb[None, :]) * H + h)
                 dst = sb_ptr + ((b64 * ROWS_S + take[:, None].to(tl.int64) * BS + bb[None, :]) * H + h)
-                tl.store(dst, tl.load(src, mask=gm, other=0), mask=gm)
+                x = tl.load(src, mask=gm, other=0)
+                if BIAS == 2:
+                    x = x.to(sb_ptr.dtype.element_ty)
+                tl.store(dst, x, mask=gm)
             e1 = tl.where(act & (tl.max(nres, axis=0) > 1), 1, 0)
             e2 = tl.where(act & (tl.max(nfly, axis=0) > 1), 2, 0)
             e4 = tl.where(act & (tl.max((granted & (fs < 0)).to(tl.int32), axis=0) > 0), 4, 0)
-            errb = errb | e1 | e2 | e4
+            e16 = tl.where(act & ((tl.sum(nei, axis=0) != tl.load(ne_ptr + idx))
+                                  | (nvalid != tl.load(rec_ptr + idx))), 16, 0)            # m5: D1 == D2
+            errb = errb | e1 | e2 | e4 | e16
             rb_ = _selbits(s, v0, ZP)
             tl.store(rowsel_ptr + (tr * H + h) * WB + zw, _pack(rb_, ZP), mask=(zw < WB) & act)
             selu = selu | (rb_ & act)
@@ -785,12 +831,15 @@ class FusedResolver:
         self.num_warps = int(num_warps)
         self.pe_inflight = bool(svc.policy_e_inflight)
         dev = svc.device
-        self.err = torch.zeros((), dtype=torch.int32, device=dev)
+        self.err = torch.zeros((), dtype=torch.int32, device=dev)          # this tick's (zeroed at each tick's start)
+        self.err_any = torch.zeros((), dtype=torch.int32, device=dev)      # m1: every tick's, OR-ed (sticky REPORT)
         self.stats = torch.zeros((len(STATS),), dtype=torch.int64, device=dev)
         svc.watch_flag("fused_res_err", self.err)
         self.launches = 0                                  # Triton launches (all layers, all ticks)
         self.layers = 0                                    # fused layers resolved
-        self.bias_fallbacks = 0                            # layers whose bias rows took S-B's torch fill (dtypes)
+        self.bias_casts = 0                                # layers whose bias rows needed a dtype cast (BIAS 2)
+        self.sel_conversions = 0                           # m3: layers whose selection was copied (dtype / layout)
+        self.max_rows_per_b = [0, 0]                       # (verify, draft) rows of one batch slot, the run's max
         self.compared = 0                                  # check: layers compared with the torch path
         self.diffs = []                                    # check: (tick, layer, output) that differ
         self.trace = []                                    # check: (tick, layer, stats after the layer)
@@ -846,9 +895,11 @@ class FusedResolver:
                 acc += c
             order = sorted(range(len(bs)), key=lambda j: (bs[j], j))
             return start, cnt, order, (max(cnt) if bs else 0)
-        self.err.zero_()                                    # per tick: the previous end_tick has read it (one op)
+        self.err_any.bitwise_or_(self.err)                  # m1: keep every tick's bits (the REPORT's err)
+        self.err.zero_()                                    # per tick: the previous end_tick has read it
         vs, vc, vo, mv = group(tk["vrows"])
         ds, dc, do, md = group(tk["drows"])
+        self.max_rows_per_b = [max(self.max_rows_per_b[0], mv), max(self.max_rows_per_b[1], md)]
         flat = vs + vc + (vo or [0]) + ds + dc + (do or [0])
         d = svc._h2d(torch.tensor(flat, dtype=torch.int64))
         parts, at = [], 0
@@ -860,11 +911,24 @@ class FusedResolver:
         one_t = torch.full((1, N_TAIL), -1, dtype=torch.int64, device=dev)
         v = tk["v"] if tk["v"] is not None else (one, one, one_t, one, one)
         dd = tk["d"] if tk["d"] is not None else (one, one, one_t, one, one)
+        kid = tk["extra"][:len(rows)]
+        # m2 (L28): every tensor the kernels address by flat offsets is a contiguous int64 tensor, or refuse
+        dm = svc.dmirror
+        named = [("dmirror." + n, getattr(dm, n)) for n in ("code", "block", "gen", "cur", "prot", "stamp")]
+        named += [("kid", kid)] + [("%s[%d]" % (kind, i), t) for kind, tup in (("v", v), ("d", dd))
+                                   for i, t in enumerate(tup)]
+        named += [("rows." + n, t) for n, t in zip(("vstart", "vcnt", "vorder", "dstart", "dcnt", "dorder"), parts)]
+        bad = [n for n, t in named if t.dtype != torch.int64 or not t.is_contiguous() or t.device.type != dev.type]
+        if bad:
+            raise ValueError("resolve='fused': not a contiguous int64 tensor on %s: %s" % (dev, bad))
         i32 = dict(dtype=torch.int32, device=dev)
+
+        def scan_bufs(n):
+            return dict(ne=torch.empty(n, **i32), rec=torch.empty(n, **i32), bne=torch.empty(n, **i32),
+                        brec=torch.empty(n, **i32), misc=torch.empty(4, **i32))
         return dict(vstart=parts[0], vcnt=parts[1], vorder=parts[2], dstart=parts[3], dcnt=parts[4],
-                    dorder=parts[5], maxrv=mv, maxrd=md, Rv=Rv, Rd=Rd, v=v, d=dd, kid=tk["extra"][:len(rows)],
-                    ne_v=torch.empty(max(Rv * H, 1), **i32), rec_v=torch.empty(max(Rv * H, 1), **i32),
-                    ne_d=torch.empty(max(Rd * H, 1), **i32), rec_d=torch.empty(max(Rd * H, 1), **i32),
+                    dorder=parts[5], maxrv=mv, maxrd=md, Rv=Rv, Rd=Rd, v=v, d=dd, kid=kid,
+                    sv=scan_bufs(max(Rv * H, 1)), sd=scan_bufs(max(Rd * H, 1)),
                     usg=torch.empty(S, **i32), usg2=torch.empty(S, **i32), usgd=torch.empty(S, **i32),
                     post=torch.empty((4, S, NP), **i32), NP=NP, bh={})
 
@@ -880,18 +944,6 @@ class FusedResolver:
             out = fz["bh"][k] = (bb, hh)
         return out
 
-    def _bhd(self, fz, k):
-        """(b, h) of every draft entry (the bias fill's fallback only)."""
-        key = ("d", k)
-        out = fz["bh"].get(key)
-        if out is None:
-            svc = self.svc
-            H, Rd = svc.H, fz["Rd"]
-            bb = fz["d"][0].view(Rd, 1, 1).expand(Rd, H, k).reshape(-1)
-            hh = torch.arange(H, device=svc.device).view(1, H, 1).expand(Rd, H, k).reshape(-1)
-            out = fz["bh"][key] = (bb, hh)
-        return out
-
     # ----------------------------------------------------------------------------------------------- one layer
     def _layer(self, l, rows, sel, tk, fz):
         """Layer l: allocations (no kernel), the launches, the decision objects. No host read, no host-to-device copy
@@ -904,14 +956,14 @@ class FusedResolver:
         k = sel.shape[2]
         P = k + N_TAIL
         if sel.dtype != torch.int64 or not sel.is_contiguous():       # L28: the kernels compute flat addresses
-            sel = sel.to(torch.int64).contiguous()
+            sel = sel.to(torch.int64).contiguous()                    # m3: a torch copy, counted (FR-g2 gates 0)
+            self.sel_conversions += 1
         Rv, Rd = fz["Rv"], fz["Rd"]
         NP = fz["NP"]
         KP = max(_pow2(k), 2)
         PP = max(_pow2(P), 2)
         TP = max(_pow2(N_TAIL), 2)
         ZP = max(_pow2(NBLK), 64)
-        SP = max(_pow2(S), 2)
         WB, WP = (NBLK + 31) // 32, (NPOS + 31) // 32
         dm = svc.dmirror
         tabs = (dm.code[l], dm.block[l], dm.gen[l], dm.cur[l], dm.prot[l], dm.stamp[l])
@@ -930,8 +982,8 @@ class FusedResolver:
         nw = self.num_warps
         ref = torch_reference(svc, l, tk, sel) if self.check else None     # check mode: before any launch
         where = (svc.tick_no, l)
+        sv, sd = fz["sv"], fz["sd"]
         if Rv:
-            RHP = max(_pow2(Rv * H), 2)
             tv = torch.empty((len(FIELDS_V), nv), **i64)
             vpage = torch.empty((Rv, H, P), **i64)
             vnpg = torch.empty((Rv, H), **i64)
@@ -942,19 +994,21 @@ class FusedResolver:
             vlook = torch.empty((Rv, 4), **i64)
             vread = torch.empty((B, H, WP), **i64)
             _launch(_fr_v1, (S,), *tabs, sel, kid, vix, vhb, fz["vstart"], fz["vcnt"], fz["vorder"],
-                    fz["ne_v"], fz["rec_v"], fz["usg"], self.err, cntv, vlook,
+                    sv["ne"], sv["rec"], fz["usg"], self.err, cntv, vlook,
                     H, R, k, NBLK, NPOS, svc.C, Rv, fz["maxrv"], Rv * 4,
-                    KP=KP, NP=NP, LP=max(_pow2(Rv * 4), 2), num_warps=nw)
+                    KP=KP, NP=NP, num_warps=nw)
+            _launch(_fr_scan, (1,), sv["ne"], sv["rec"], fz["usg"], sv["bne"], sv["brec"], sv["misc"],
+                    Rv * H, S, svc.C, svc.X, 0, BLOCK=SCAN_BLOCK, num_warps=4)
             _launch(_fr_v2, (S,), *tabs, sel, kid, vix, vhb, vtl, vnt, fz["vstart"], fz["vcnt"], fz["vorder"],
                     dix, dhb, fz["dstart"], fz["dcnt"], fz["dorder"],
-                    fz["ne_v"], fz["rec_v"], fz["usg"],
+                    sv["ne"], sv["rec"], sv["bne"], sv["brec"], sv["misc"],
                     tv, vpage, vnpg, page, npg, ids, vrec, vcnt, cntv, vlook, vread, fz["post"], fz["usg2"], selw,
                     rowsel, self.err, self.stats,
                     H, B, R, k, NBLK, NPOS, svc.C, svc.X, Rv, max(Rd, 1), fz["maxrv"], fz["maxrd"], nv, caps[0],
-                    Rv * H, S, WB, WP, N_TAIL, P,
-                    KP=KP, NP=NP, PP=PP, TP=TP, RHP=RHP, SP=SP, ZP=ZP, PE_INFL=self.pe_inflight,
-                    LAST=Rd == 0, PLANT=self.plant, num_warps=nw)
-            self.launches += 2
+                    S, WB, WP, N_TAIL, P,
+                    KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, PE_INFL=self.pe_inflight,
+                    LAST=Rd == 0, PLANT=self.plant, NSTAT=len(STATS), num_warps=nw)
+            self.launches += 3
             vdec = VerifyDecision(Rv, H, k, {f: tv[i] for i, f in enumerate(FIELDS_V)}, vpage, vnpg, ids,
                                   self._bh(fz, k), cntv)
             rec.update(vrec=vrec, vcnt=vcnt, vlook=vlook, vread=vread)
@@ -966,45 +1020,46 @@ class FusedResolver:
                 self._wait_gather_traced(l, vdec, where)
         sb_before = None
         if Rd:
-            RHP = max(_pow2(Rd * H), 2)
             td = torch.empty((len(FIELDS), nd), **i64)
             dpage = torch.empty((Rd, H, P), **i64)
             dnpg = torch.empty((Rd, H), **i64)
             drec = torch.empty((len(DREC), caps[1]), **i64)
             dcnt = torch.empty((1,), **i64)
             cntd = torch.empty((3,), **i64)
-            bias = svc.store_b is not None and svc.cis is not None
+            bias = 0
             sb = cis = sel
             rows_s = rows_c = 0
-            fallback = False
-            if bias:
+            if svc.store_b is not None and svc.cis is not None:
                 sb_t, cis_t = svc.store_b[l], svc.cis[l]
+                if (not sb_t.is_contiguous() or not cis_t.is_contiguous() or sb_t.dim() != 3 or cis_t.dim() != 3
+                        or not sb_t.dtype.is_floating_point or not cis_t.dtype.is_floating_point):
+                    raise ValueError("resolve='fused': the bias rows need contiguous (B, rows, H) float store_b and "
+                                     "cis tables (got %s %s / %s %s)" % (sb_t.dtype, tuple(sb_t.shape), cis_t.dtype,
+                                                                         tuple(cis_t.shape)))
                 if self.check:
                     sb_before = sb_t.clone()
-                if (sb_t.dtype != cis_t.dtype or sb_t.element_size() not in (2, 4) or not sb_t.is_contiguous()
-                        or not cis_t.is_contiguous() or sb_t.dim() != 3 or cis_t.dim() != 3):
-                    fallback = True                                   # S-B's torch fill after D2 (counted)
+                if sb_t.dtype == cis_t.dtype and sb_t.element_size() in (2, 4):
+                    bias, sb, cis = 1, _bits(sb_t), _bits(cis_t)      # bit copies
                 else:
-                    sb, cis = _bits(sb_t), _bits(cis_t)
-                    rows_s, rows_c = sb_t.shape[1], cis_t.shape[1]
+                    bias, sb, cis = 2, sb_t, cis_t                    # m9: the cast in the kernel (counted)
+                    self.bias_casts += 1
+                rows_s, rows_c = sb_t.shape[1], cis_t.shape[1]
             _launch(_fr_d1, (S,), *tabs, sel, kid, dix, dhb, fz["dstart"], fz["dcnt"], fz["dorder"],
-                    fz["post"], fz["usg2"], fz["ne_d"], fz["rec_d"], fz["usgd"], self.err, cntd,
+                    fz["post"], fz["usg2"], sd["ne"], sd["rec"], fz["usgd"], self.err, cntd,
                     H, R, k, NBLK, NPOS, svc.C, Rd, fz["maxrd"], S, Rd * H,
                     KP=KP, NP=NP, HAS_V=Rv > 0, num_warps=nw)
+            _launch(_fr_scan, (1,), sd["ne"], sd["rec"], fz["usgd"], sd["bne"], sd["brec"], sd["misc"],
+                    Rd * H, S, svc.C, svc.X, svc.R_ver, BLOCK=SCAN_BLOCK, num_warps=4)
             _launch(_fr_d2, (S,), *tabs, sel, kid, vix, vhb, fz["vstart"], fz["vcnt"], fz["vorder"],
                     dix, dhb, dtl, dnt, fz["dstart"], fz["dcnt"], fz["dorder"],
-                    fz["post"], fz["ne_d"], fz["rec_d"], fz["usgd"],
+                    fz["post"], sd["ne"], sd["rec"], sd["bne"], sd["brec"], sd["misc"], fz["usgd"],
                     td, dpage, dnpg, page, npg, drec, dcnt, cntd, selw, rowsel, self.err, self.stats, sb, cis,
-                    H, B, R, k, NBLK, NPOS, svc.C, svc.X, svc.R_ver, max(Rv, 1), Rd, fz["maxrv"], fz["maxrd"], nd,
-                    caps[1], Rd * H, S, WB, N_TAIL, P, svc.bs, rows_s, rows_c,
-                    KP=KP, NP=NP, PP=PP, TP=TP, RHP=RHP, SP=SP, ZP=ZP, BSP=max(_pow2(svc.bs), 2), HAS_V=Rv > 0,
-                    BIAS=bias and not fallback, PLANT=self.plant, num_warps=nw)
-            self.launches += 2
+                    H, B, R, k, NBLK, NPOS, svc.C, max(Rv, 1), Rd, fz["maxrv"], fz["maxrd"], nd,
+                    caps[1], S, WB, N_TAIL, P, svc.bs, rows_s, rows_c,
+                    KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, BSP=max(_pow2(svc.bs), 2), HAS_V=Rv > 0,
+                    BIAS=bias, PLANT=self.plant, NSTAT=len(STATS), num_warps=nw)
+            self.launches += 3
             ddec = DraftDecision(Rd, H, k, {f: td[i] for i, f in enumerate(FIELDS)}, dpage, dnpg, cntd)
-            if fallback:                                              # torch ops: reported, not the timed design
-                self.bias_fallbacks += 1
-                bbd, hhd = self._bhd(fz, k)
-                draft_bias_fill(svc.store_b[l], svc.cis[l], ddec, bbd, hhd, svc.bs)
             rec.update(drec=drec, dcnt=dcnt)
         rec.update(sel=selw, rowsel=rowsel)
         self.layers += 1
@@ -1081,12 +1136,40 @@ class FusedResolver:
         self._trace(where)
 
     def report(self):
-        """REPORT (one device read; after a run): the mode, the counts, the stats and the err flag."""
+        """REPORT (device reads; after a run): the mode, the counts, the stats, the err bits of every tick (err_any:
+        m1), the coverage gate of FR-g0 (M1: a GATE_STATS counter at 0 is "NOT GATED", never a pass), and in check
+        mode the first difference and, per stat, the first (tick, layer) where it became > 0 (FR-g0p, M2)."""
+        stats = dict(zip(STATS, self.stats.to("cpu").tolist()))
+        err_any = int(self.err_any) | int(self.err)
+        first_eff = {}
+        for (t, l, st, _) in self.trace:
+            for name, v in zip(STATS, st):
+                if v > 0 and name not in first_eff:
+                    first_eff[name] = [t, l]
         return dict(mode="check" if self.check else "fused", plant=self.plant, launches=self.launches,
                     layers=self.layers, launches_per_layer=self.launches / max(1, self.layers),
-                    bias_fallbacks=self.bias_fallbacks, compared=self.compared, diffs=len(self.diffs),
+                    bias_casts=self.bias_casts, sel_conversions=self.sel_conversions,
+                    max_rows_per_b=list(self.max_rows_per_b), compared=self.compared, diffs=len(self.diffs),
                     first_diffs=[list(d) for d in self.diffs[:5]],
-                    stats=dict(zip(STATS, self.stats.to("cpu").tolist())), err=int(self.err))
+                    first_diff_at=list(self.diffs[0][:2]) if self.diffs else None, first_effective=first_eff,
+                    stats=stats, gate={s: ("gated" if stats[s] > 0 else "NOT GATED") for s in GATE_STATS},
+                    err=err_any, err_bits=[m for b, m in sorted(ERR_BITS.items()) if err_any & b],
+                    compiled=compiled_variants())
+
+
+def compiled_variants():
+    """REPORT (m4): the compiled variants per kernel of this module (Triton's JIT cache per device; None where the
+    installed Triton keeps no such cache, e.g. the interpreter). A variant compiled inside a timed span inflates it."""
+    out = {}
+    if triton is None:
+        return out
+    for name in ("_fr_v1", "_fr_v2", "_fr_d1", "_fr_d2", "_fr_scan"):
+        try:
+            cache = globals()[name].cache
+            out[name] = sum(len(v) for v in cache.values())
+        except Exception:                                  # noqa: BLE001 - a REPORT; the cache layout is version-bound
+            out[name] = None
+    return out
 
 
 def torch_reference(svc, l, tk, sel):
