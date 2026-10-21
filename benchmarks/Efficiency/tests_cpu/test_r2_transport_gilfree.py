@@ -651,21 +651,54 @@ def test_GT10_the_job_watermark_grows_and_a_failed_job_never_lands(v3):
     gf.close()
 
 
+@pytest.mark.parametrize("worker", ["cpp", "python", "sync"])
+def test_GT11_wait_submitted_waits_for_the_submission(v3, worker):
+    """GT11 (the eager tick's liveness rule, gfw1b): GilfreeTransport.wait_submitted(tr) returns once the transfer's
+    release is SUBMITTED: the C++ worker's submitted counter reached its job (packer v3's wait_submission, the GIL
+    released), the Python feeder's flag is set, the synchronous mode at once; the rows are the host truth afterwards.
+    Negative controls: a transfer that was never released, and a job seq that was never submitted, are refused."""
+    host_k, host_v, gk, gv, _, _ = _world()
+    kw = dict(worker="cpp") if worker == "cpp" else dict(background=(worker == "python"))
+    gf = GF.GilfreeTransport(v3.ext, host_k, host_v, gk, gv, BS, D, threads=2, host_wait=lambda ev: None, cap_groups=4,
+                             **kw)
+    groups = [(0, 0, 3, 1), (1, 1, 4, 2), (1, 0, NB - 1, NPOS - 1)]
+    trs = _transfers(0, groups, 0)
+    gf.issue(0, trs)
+    gf.wait_submitted(trs[0])
+    if worker == "cpp":
+        assert int(gf.npipe.submitted) >= trs[0].ev.seq
+        with pytest.raises(RuntimeError, match="never submitted"):
+            gf.npipe.wait_submission(99)                          # NEGATIVE CONTROL
+    elif worker == "python":
+        assert trs[0].payload.is_set()
+    gf.flush()
+    for tr in trs:
+        gf.force(tr)
+    gf.close()
+    assert _truth_ok(gk, gv, host_k, host_v, [(0, groups)])
+    if worker == "cpp":
+        with pytest.raises(RuntimeError, match="never released"):
+            gf.wait_submitted(_transfers(0, [(0, 0, 1, 1)], 50)[0])   # NEGATIVE CONTROL: no ev
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU-only: the later GPU gate runs it")
 def test_GTG1_gpu_exact_wait_without_the_submission_wait(v3):
     """GTG1 (GPU-ONLY; the later GPU gate): S-C's exact wait WITHOUT its submission wait (CudaDeviceOps._submitted,
     r2_residency_sc.py:675-683) on the C++ worker. The release's T4 event completes only after a 200M-cycle GPU sleep on
     a side stream, so the worker's job is still waiting when the main stream starts to spin on the generation board
-    (r2_residency_sc._wait_kernel, compiled before); then 1500 launches go behind the spin (more than the ~1024-entry
-    launch queue: the main thread blocks in a launch while the spin runs). The worker packs, lands and publishes without
-    the GIL: the spin ends with err 0 after it waited (> 10 ms), every launch ran, the rows are the host truth, and
-    torch's Stream.wait_event accepts the job's event (_JobEv.wait: S-C's superset path). Negative control: the worker's
-    publication planted off (set_skip_publish): the spin ends by its bound with err 1, the launches still run."""
+    (r2_residency_sc._wait_kernel, compiled before). THE CAPTURED-TICK PROTOCOL: 64 launches go behind the spin (a
+    captured tick's few). The worker packs, lands and publishes without the GIL: the spin ends with err 0 after it
+    waited (> 10 ms), every launch ran, the rows are the host truth, and torch's Stream.wait_event accepts the job's event
+    (_JobEv.wait: S-C's superset path). THE EAGER-TICK PROTOCOL: the host waits the job's submission
+    (wait_submitted, the GIL released) and only then spins, with 1500 launches behind (more than the ~1024-entry queue):
+    err 0. (gfw1b: 1500 launches behind a spin with NO submission wait ran the spin to its bound: the worker's H2D /
+    scatter, enqueued after the spin, were held behind it.) Negative control: the worker's publication planted off
+    (set_skip_publish): the spin ends by its bound with err 1, the launches still run."""
     dev = torch.device("cuda")
     Bp, Hp, Dp, nblk, npos = 2, 2, 64, 16, 12
     g = torch.Generator().manual_seed(5)
 
-    def run(planted, max_spin):
+    def run(planted, max_spin, launches, wait_submission=False):
         host_k = [torch.randn(Bp, nblk * BS, Hp, Dp, generator=g) for _ in range(L)]
         host_v = [torch.randn(Bp, nblk * BS, Hp, Dp, generator=g) for _ in range(L)]
         sk = [torch.zeros(Bp, npos * BS, Hp, Dp, device=dev) for _ in range(L)]
@@ -677,26 +710,30 @@ def test_GTG1_gpu_exact_wait_without_the_submission_wait(v3):
         if planted:
             gf.npipe.set_skip_publish(True)                    # NEGATIVE CONTROL
         groups = [(b, h, (3 * b + h) % nblk, 2 * h + b) for b in range(Bp) for h in range(Hp)]
+        gens = [i + 5 for i in range(len(groups))]
+        idx = torch.tensor([board.flat(1, b, h, s) for (b, h, _, s) in groups], dtype=torch.int64, device=dev)
+        gen = torch.tensor(gens, dtype=torch.int64, device=dev)
+        err = torch.zeros((), dtype=torch.int32, device=dev)
+        x = torch.zeros((), device=dev)
+        kern = SCG._wait_kernel()
+        kern[(1,)](board.t, torch.full_like(idx, -1), gen, idx.shape[0], err, max_spin, BLOCK=1024)   # compile
+        torch.cuda.synchronize()                               # before the sleep: the T4 event must be pending
         side = torch.cuda.Stream()
         with torch.cuda.stream(side):
             torch.cuda._sleep(200_000_000)
             hist = torch.cuda.Event()
             hist.record(side)
         trs = _transfers(1, groups, 0, hist=hist)
-        for i, tr in enumerate(trs):
-            tr.gen = i + 5
-        idx = torch.tensor([board.flat(1, tr.b, tr.h, tr.slot) for tr in trs], dtype=torch.int64, device=dev)
-        gen = torch.tensor([tr.gen for tr in trs], dtype=torch.int64, device=dev)
-        err = torch.zeros((), dtype=torch.int32, device=dev)
-        x = torch.zeros((), device=dev)
-        kern = SCG._wait_kernel()
-        kern[(1,)](board.t, torch.full_like(idx, -1), gen, idx.shape[0], err, max_spin, BLOCK=1024)   # compile
+        for tr, gn in zip(trs, gens):
+            tr.gen = gn
         e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         gf.issue(1, trs)                                       # queued: the host does not wait for the submission
+        if wait_submission:
+            gf.wait_submitted(trs[0])                          # the eager tick's rule, the GIL released
         e0.record()
         kern[(1,)](board.t, idx, gen, idx.shape[0], err, max_spin, BLOCK=1024)
         e1.record()
-        for _ in range(1500):
+        for _ in range(launches):
             x.add_(1.0)
         torch.cuda.current_stream().wait_event(trs[0].ev)      # _JobEv.wait (the superset protocol)
         torch.cuda.synchronize()
@@ -705,7 +742,9 @@ def test_GTG1_gpu_exact_wait_without_the_submission_wait(v3):
                  and torch.equal(sv[1][b, s * BS:(s + 1) * BS, h].cpu(), host_v[1][b, k * BS:(k + 1) * BS, h])
                  for (b, h, k, s) in groups)
         return int(err.item()), float(x.item()), e0.elapsed_time(e1), ok
-    err, x, spin_ms, ok = run(False, 1 << 24)
-    assert err == 0 and x == 1500.0 and ok and spin_ms > 10.0, (err, x, spin_ms, ok)
-    err2, x2, _, ok2 = run(True, 1 << 16)
-    assert err2 == 1 and x2 == 1500.0 and ok2, (err2, x2, ok2)
+    err, x, spin_ms, ok = run(False, 1 << 24, 64)                         # captured: few launches, no wait
+    assert err == 0 and x == 64.0 and ok and spin_ms > 10.0, (err, x, spin_ms, ok)
+    err1, x1, _, ok1 = run(False, 1 << 24, 1500, wait_submission=True)    # eager: the submission wait first
+    assert err1 == 0 and x1 == 1500.0 and ok1, (err1, x1, ok1)
+    err2, x2, _, ok2 = run(True, 1 << 16, 64)
+    assert err2 == 1 and x2 == 64.0 and ok2, (err2, x2, ok2)

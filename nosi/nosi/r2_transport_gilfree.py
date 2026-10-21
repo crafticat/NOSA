@@ -111,6 +111,10 @@ class _JobEv:
     def synchronize(self) -> None:
         self.tp.npipe.wait_job(self.seq)
 
+    def wait_submitted(self) -> None:
+        """The host waits (the GIL released) until the job's GPU work is ENQUEUED, not until it landed."""
+        self.tp.npipe.wait_submission(self.seq)
+
     def wait(self, stream=None) -> None:
         if not self.tp.cuda:
             self.tp.npipe.wait_job(self.seq)
@@ -320,6 +324,21 @@ class GilfreeTransport:
         elif self.background:
             self._q.put(None)
             self._thread.join()
+
+    def wait_submitted(self, tr: Transfer) -> None:
+        """THE EAGER TICK'S LIVENESS RULE (gfw1b on holder 2190876): a main stream may spin on the board (S-C's exact
+        wait) only behind GPU work that is already ENQUEUED. A transfer whose job is submitted after the spin can be
+        blocked behind it: the main thread's launches behind the spin fill the launch queue (or the streams share a
+        hardware queue), the worker's later H2D / scatter cannot run, and the spin ends only at its bound. So, before
+        such a spin, the host waits here until the transfer's job is SUBMITTED: the C++ worker's counter (the GIL
+        released: no GIL deadlock), the Python feeder's flag; nothing in the synchronous mode. It does not wait for
+        the landing (the device spin does that)."""
+        if self.worker == "cpp":
+            if tr.ev is None:
+                raise RuntimeError("gilfree: transfer seq %d was never released" % tr.seq)
+            tr.ev.wait_submitted()
+        elif self.background and isinstance(tr.payload, threading.Event):
+            tr.payload.wait()
 
     def flush(self) -> None:
         """Waits until every issued release ran (the tests' sync point; a no-op in the synchronous mode)."""

@@ -91,14 +91,17 @@ def test_GFWC1_args_plans_gates_and_the_registered_verdict():
     distinct destinations per (b, h) stream, layers and blocks in range (negative control: a planted duplicate
     destination is seen; a size that does not spread evenly is refused); the registered verdict's bands (HELD within
     +-15 %, FALSIFIED at >= 1.30, GREY between), the same numbers as the step script's REGISTERED block; GFW_ready /
-    GFW1 / GFW1n are MUST and the timing lines REPORT; the gate imports no nosi package (it loads by path)."""
+    GFW1 (captured: 64 launches behind the spin, no submission wait) / GFW1e (eager: 1500 launches, the host's
+    submission wait first, >= 50 ms) / GFW1n are MUST, R_GFW1x (the eager hazard: 1500 launches, no wait, a 2^20
+    bound; expected err 1) and the timing lines REPORT; the gate imports no nosi package (it loads by path)."""
     G = _gate()
     base = ["--out", "o", "--nosi-pkg", "n", "--v3", "a", "--v3-build", "/b", "--v2", "c", "--v2-build", "/d"]
     a = G.parse_args(base)
     assert (a.threads, a.releases, a.warmup, a.sizes, a.launches, a.spin_cycles) == (8, 20, 3, [64, 192], 1500,
                                                                                      200_000_000)
+    assert (a.launches_few, a.hazard_spin) == (64, 1 << 20)
     for bad in (["--sizes", "65"], ["--sizes", "272"], ["--launches", "1000"], ["--releases", "2"], ["--threads", "0"],
-                ["--spin-cycles", "10"]):
+                ["--spin-cycles", "10"], ["--launches-few", "300"], ["--hazard-spin", "10"]):
         with pytest.raises(SystemExit):
             G.parse_args(base + bad)
     for mib, groups, per in ((64, 2048, 4), (192, 6144, 12)):
@@ -118,8 +121,12 @@ def test_GFWC1_args_plans_gates_and_the_registered_verdict():
     assert "|ratio - 1| <= %.2f" % R["pred_band"] in block and "ratio >= %.2f" % R["falsifier_ratio"] in block, block
     assert "at 64 and at 192 MiB" in block and a.sizes == [64, 192]
     src = (EFF / "r2_gfw_gate.py").read_text()
-    for need in ('gate("GFW_ready", ready, True', "gate(name, ok, True, detail)", 'gate("R_GFW_T%d" % mib',
-                 '("GFW1", False, 1 << 24), ("GFW1n", True, 1 << 16)', "set_skip_publish(True)",
+    for need in ('gate("GFW_ready", ready, True', "gates.append(gate(name, ok, must, detail))", 'gate("R_GFW_T%d" % mib',
+                 '("GFW1", True, False, 1 << 24, a.launches_few, False)',
+                 '("GFW1e", True, False, 1 << 24, a.launches, True)',
+                 '("GFW1n", True, True, 1 << 16, a.launches_few, False)',
+                 '("R_GFW1x", False, False, a.hazard_spin, a.launches, False)', "gf.wait_submitted(trs[0])",
+                 '(r["submission_wait_ms"] or 0.0) >= 50.0', "set_skip_publish(True)",
                  'r["t4_pending_at_issue"]', 'r["spin_ms"] > 10.0'):
         assert need in src, need
     assert "from nosi" not in src and "import nosi" not in src
@@ -138,7 +145,7 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
     assert lines[0] == "#!/bin/bash" and lines[-1] == 'main "$@"; exit $?' and "main() {" in text
     assert 'mkdir "$OUTROOT/gfw_active"' in text and "STEP_MIN=12" in text and "--export=NONE" in text
     assert text.index("UFILE=$HOLDERS/$JOB.gpu_uuid") < text.index('mkdir "$OUTROOT/gfw_active"')
-    assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw1b " in text
+    assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw1c " in text
     for word in ("awk", "perl", "python3", " bc ", "node "):
         for ln in lines:
             if not ln.lstrip().startswith("#"):
@@ -189,7 +196,8 @@ def test_GFWC2_step_script_uuid_file_pins_and_dryrun(tmp_path):
             % (V2["sha"], V2["py"], V2["cpp"])) in r.stdout
     rec = "/mnt/beegfs/ojerbi/r2-runs/gfw/gfw_t1_516.step"
     for arg in ("--threads 8", "--releases 20", "--warmup 3", "--launches 1500", "--spin-cycles 200000000",
-                "--export=NONE", "--gres=gpu:a100:1", "--nosi-pkg /mnt/beegfs/ojerbi/nosi-r2-gfw1b/nosi/nosi",
+                "--launches-few 64", "--hazard-spin 1048576",
+                "--export=NONE", "--gres=gpu:a100:1", "--nosi-pkg /mnt/beegfs/ojerbi/nosi-r2-gfw1c/nosi/nosi",
                 "--v3 %s/packer_v3" % rec, "--v2 %s/packer_v2" % rec, "r2_gfw_gate.py", "--cell gfw1", "; cell gfw1"):
         assert arg in r.stdout, arg
     assert "--sizes 64,192" in r.stdout or "--sizes 64\\,192" in r.stdout

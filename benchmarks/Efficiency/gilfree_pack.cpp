@@ -465,6 +465,10 @@ class NativePipe {
     return !cuda_ || j->done_ev.query();
   }
 
+  // Blocks (bound with the GIL released) until job seq was SUBMITTED (its GPU work enqueued), not until it landed:
+  // the eager tick's liveness rule (gfw1b): a main stream may spin on the board only behind work already enqueued.
+  void wait_submission(int64_t seq) { (void)wait_submitted(seq); }
+
   // Blocks (bound with the GIL released) until job seq was submitted, then (CUDA) until it landed.
   void wait_job(int64_t seq) {
     std::shared_ptr<Job> j = wait_submitted(seq);
@@ -879,6 +883,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mod) {
            "Q-B3: the job watermark (every job up to it ran and landed)")
       .def("set_plant_slot_shift", &NativePipe::set_plant_slot_shift, "NEGATIVE CONTROL (tests only)")
       .def("job_done", &NativePipe::job_done, py::call_guard<py::gil_scoped_release>())
+      .def("wait_submission", &NativePipe::wait_submission, py::call_guard<py::gil_scoped_release>(),
+           "wait until job seq is submitted (its GPU work enqueued), the GIL released")
       .def("wait_job", &NativePipe::wait_job, py::call_guard<py::gil_scoped_release>())
       .def("stream_wait_job", &NativePipe::stream_wait_job, py::call_guard<py::gil_scoped_release>())
       .def("take_error", &NativePipe::take_error)

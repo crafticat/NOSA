@@ -6,16 +6,32 @@ modules by path from --nosi-pkg (a bare package: nosi/__init__.py is not importe
 
 MUST
   GFW_ready  packer v3 (VERSION 3, the OpenMP build, NativePipe.submit) and the pinned v2 (the OpenMP build) built.
-  GFW1       S-C's exact wait WITHOUT its submission wait (CudaDeviceOps._submitted, r2_residency_sc.py:675-683) on the
-             C++ worker (tests_cpu/test_r2_transport_gilfree.py GTG1, as a gate): a 4-transfer release whose T4 event
-             completes only after a --spin-cycles GPU sleep on a side stream is issued (queued: the host does not wait),
-             the main stream spins on the generation board (r2_residency_sc._wait_kernel, compiled before), then
-             --launches launches go behind the spin (more than the ~1024-entry launch queue). PASS: the T4 event was
-             still pending at issue, err 0, the spin waited > 10 ms (a real spin), every launch ran, the rows are the
-             host truth, torch's Stream.wait_event accepts the job's event (_JobEv.wait, S-C's superset path), the
-             worker ran on the requested team.
-  GFW1n      the negative control: the same with the worker's publication planted off (set_skip_publish): the spin
-             ends by its bound (max_spin 2^16) with err 1; every launch still ran; the rows are the host truth.
+  GFW1       THE CAPTURED-TICK PROTOCOL: S-C's exact wait WITHOUT its submission wait (CudaDeviceOps._submitted,
+             r2_residency_sc.py:675-683) on the C++ worker, with FEW launches behind the spin, as a captured tick has
+             (one replay plus the host's few launches): a 4-transfer release whose T4 event completes only after a
+             --spin-cycles GPU sleep on a side stream is issued (queued: the host does not wait), the main stream spins
+             on the generation board (r2_residency_sc._wait_kernel, compiled before), then --launches-few launches go
+             behind the spin. PASS: the T4 event was still pending at issue, err 0, the spin waited > 10 ms (a real
+             spin), every launch ran, the rows are the host truth, torch's Stream.wait_event accepts the job's event
+             (_JobEv.wait, S-C's superset path), the worker ran on the requested team.
+  GFW1e      THE EAGER-TICK PROTOCOL: the same release, then the host waits (the GIL released) until the job is
+             SUBMITTED (GilfreeTransport.wait_submitted: the worker's GPU work enqueued), then the spin and --launches
+             launches behind it (more than the ~1024-entry launch queue, as an eager tick has). PASS: the T4 event was
+             pending at issue, the host's submission wait lasted >= 50 ms (it waited for the T4-gated submission), err
+             0, every launch ran, the rows are the host truth, the superset wait accepted, the team the requested one.
+  GFW1n      the negative control: GFW1's shape with the worker's publication planted off (set_skip_publish): the
+             spin ends by its bound (max_spin 2^16) with err 1; every launch still ran; the rows are the host truth.
+  WHY TWO PROTOCOLS (gfw1b on holder 2190876, 3462ba3: GFW1 with 1500 launches behind the spin and no submission wait
+             FAILED: err 1, the spin ran to its bound, 8620.6 ms; the main thread's enqueue took 8656.8 ms; the board
+             and the rows were right afterwards). The worker waited for ONE event, the T4 event on the side stream,
+             recorded BEFORE the spin (no main-stream event); its H2D (copy stream) and scatter (scatter stream) were
+             enqueued AFTER the spin from the worker thread and ran only when the spin gave up: the launches behind the
+             spin filled the launch queue (or the streams share a hardware queue), a serialization below the worker.
+             So in the eager tick the host must wait for the submission before the spin (now without the GIL), and the
+             no-wait protocol holds only with few launches behind the spin (the captured tick). R_GFW1x keeps the
+             hazard on record.
+  R_GFW1x    REPORT, the eager hazard: GFW1's release with --launches behind the spin and NO submission wait, the spin
+             bounded at --hazard-spin rounds: expected err 1 (the hazard of gfw1b reproduced); PASS = as expected.
 REPORT
   GFW_T<MiB> per release of <MiB> of K + V (bf16, D 128, R 64: 32 KiB per group; B 64 x H 8 streams, the groups over
              32 layers' sources, the destinations distinct, cap 256 groups per chunk), on --threads OpenMP threads, the
@@ -87,6 +103,8 @@ def parse_args(argv):
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--sizes", default="64,192", help="MiB of K + V per release")
     ap.add_argument("--launches", type=int, default=1500, help="launches behind the spin (> the ~1024-entry queue)")
+    ap.add_argument("--launches-few", type=int, default=64, help="GFW1: the captured tick's few launches behind the spin")
+    ap.add_argument("--hazard-spin", type=int, default=1 << 20, help="R_GFW1x: the spin's bound (rounds)")
     ap.add_argument("--spin-cycles", type=int, default=200_000_000, help="the GPU sleep before the T4 event")
     ap.add_argument("--cell", default="gfw1", choices=CELLS, help="gfw1: GFW1 / GFW1n / GFW_T; gfw2: GFW2 / GFW2n")
     ap.add_argument("--takes", type=int, default=6496, help="gfw2: the takes of the tick (B2: ~6.49 k)")
@@ -108,6 +126,8 @@ def parse_args(argv):
     if not a.sizes or any(s <= 0 or s % 16 or s > 256 for s in a.sizes):
         ap.error("--sizes: MiB multiples of 16 up to 256 (32 KiB groups spread evenly over B 64 x H 8 streams, <= 16 "
                  "destinations each)")
+    if not 0 <= a.launches_few <= 256 or a.hazard_spin < 1 << 10:
+        ap.error("launches-few 0 .. 256 (well below the ~1024-entry queue), hazard-spin >= 1024")
     if not 1 <= a.threads <= 64 or a.releases < 3 or a.warmup < 0 or a.launches < 1100 or a.spin_cycles < 1_000_000:
         ap.error("threads 1 .. 64, releases >= 3, warmup >= 0, launches >= 1100, spin-cycles >= 1e6")
     return a
@@ -182,8 +202,9 @@ def plan_ok(vecs, B=B_T, H=H_T, M=M_T, nblk=NBLK_T):
 
 
 # ------------------------------------------------------------------------------------------------ GFW1 / GFW1n
-def gfw1(GF, SCG, ext3, planted, max_spin, spin_cycles, launches, threads):
-    """GTG1 as a gate (module docstring). Returns its observations."""
+def gfw1(GF, SCG, ext3, planted, max_spin, spin_cycles, launches, threads, wait_submission=False):
+    """GTG1 as a gate (module docstring: GFW1 / GFW1e / GFW1n / R_GFW1x). wait_submission: the host waits until the
+    job is submitted before the spin (GFW1e). Returns its observations."""
     import torch
     dev = torch.device("cuda")
     L, Bp, Hp, Dp, nblk, npos, BS = 2, 2, 2, 64, 16, 12, 64
@@ -219,6 +240,11 @@ def gfw1(GF, SCG, ext3, planted, max_spin, spin_cycles, launches, threads):
     t0 = time.perf_counter()
     gf.issue(1, trs)                                           # queued: the host does not wait for the submission
     issue_ms = 1e3 * (time.perf_counter() - t0)
+    submission_wait_ms = None
+    if wait_submission:                                        # GFW1e: the eager tick's rule, before the spin
+        t1 = time.perf_counter()
+        gf.wait_submitted(trs[0])
+        submission_wait_ms = 1e3 * (time.perf_counter() - t1)
     e0.record()
     kern[(1,)](board.t, idx, gen, idx.shape[0], err, max_spin, BLOCK=1024)
     e1.record()
@@ -238,7 +264,9 @@ def gfw1(GF, SCG, ext3, planted, max_spin, spin_cycles, launches, threads):
     return dict(planted=bool(planted), max_spin=int(max_spin), err=int(err.item()), launches_done=float(x.item()),
                 spin_ms=float(e0.elapsed_time(e1)), rows_ok=bool(rows_ok), superset_wait=superset,
                 threads_ok=bool(gf.threads_ok()), stats=dict(gf.stats), t4_pending_at_issue=bool(pending_at_issue),
-                issue_ms=round(issue_ms, 3), enqueue_ms=round(enqueue_ms, 3),
+                issue_ms=round(issue_ms, 3), enqueue_ms=round(enqueue_ms, 3), launches=int(launches),
+                wait_submission=bool(wait_submission),
+                submission_wait_ms=None if submission_wait_ms is None else round(submission_wait_ms, 3),
                 board=[int(v) for v in board.t.view(-1)[idx].tolist()], want=[int(v) for v in gen.tolist()])
 
 
@@ -542,27 +570,43 @@ def main(argv=None) -> int:
                     gates.append(gate(name, False, True, "EXCEPTION " + res["GFW2"]["error"]))
             save()
         if ready and a.cell == "gfw1":
-            for name, planted, max_spin in (("GFW1", False, 1 << 24), ("GFW1n", True, 1 << 16)):
+            # (name, MUST, planted, max_spin, launches behind the spin, the host's submission wait first)
+            arms1 = (("GFW1", True, False, 1 << 24, a.launches_few, False),
+                     ("GFW1e", True, False, 1 << 24, a.launches, True),
+                     ("GFW1n", True, True, 1 << 16, a.launches_few, False),
+                     ("R_GFW1x", False, False, a.hazard_spin, a.launches, False))
+            for name, must, planted, max_spin, launches, waits in arms1:
                 log(name)
                 try:
-                    r = gfw1(GF, SCG, ext3, planted, max_spin, a.spin_cycles, a.launches, a.threads)
+                    r = gfw1(GF, SCG, ext3, planted, max_spin, a.spin_cycles, launches, a.threads,
+                             wait_submission=waits)
                     res[name] = r
-                    if planted:
-                        ok = r["err"] == 1 and r["launches_done"] == float(a.launches) and r["rows_ok"]
+                    done = r["launches_done"] == float(launches)
+                    if name == "GFW1n":
+                        ok = r["err"] == 1 and done and r["rows_ok"]
+                    elif name == "R_GFW1x":
+                        ok = r["err"] == 1 and done and r["rows_ok"]      # the hazard reproduced, as expected
+                    elif name == "GFW1e":
+                        ok = (r["err"] == 0 and done and r["rows_ok"] and r["superset_wait"] == "ok"
+                              and r["threads_ok"] and r["t4_pending_at_issue"]
+                              and (r["submission_wait_ms"] or 0.0) >= 50.0)
                     else:
-                        ok = (r["err"] == 0 and r["launches_done"] == float(a.launches) and r["spin_ms"] > 10.0
-                              and r["rows_ok"] and r["superset_wait"] == "ok" and r["threads_ok"]
-                              and r["t4_pending_at_issue"])
-                    detail = ("err %d, launches %d/%d, spin %.1f ms, rows %s, superset wait %s, team ok %s, T4 pending "
-                              "at issue %s, issue %.2f ms, enqueue %.1f ms, board %s want %s" % (
-                                  r["err"], int(r["launches_done"]), a.launches, r["spin_ms"], r["rows_ok"],
-                                  r["superset_wait"], r["threads_ok"], r["t4_pending_at_issue"], r["issue_ms"],
-                                  r["enqueue_ms"], r["board"], r["want"]))
+                        ok = (r["err"] == 0 and done and r["spin_ms"] > 10.0 and r["rows_ok"]
+                              and r["superset_wait"] == "ok" and r["threads_ok"] and r["t4_pending_at_issue"])
+                    detail = ("err %d, launches %d/%d, spin %.1f ms (bound %d), rows %s, superset wait %s, team ok %s, "
+                              "T4 pending at issue %s, submission wait %s ms, issue %.2f ms, enqueue %.1f ms, board %s "
+                              "want %s" % (
+                                  r["err"], int(r["launches_done"]), launches, r["spin_ms"], max_spin, r["rows_ok"],
+                                  r["superset_wait"], r["threads_ok"], r["t4_pending_at_issue"],
+                                  r["submission_wait_ms"], r["issue_ms"], r["enqueue_ms"], r["board"], r["want"]))
+                    if name == "R_GFW1x":
+                        detail = ("the eager hazard (no submission wait, %d launches behind the spin): %s; %s" % (
+                            launches, "reproduced as expected" if ok else "NOT reproduced", detail))
                 except Exception as e:
                     traceback.print_exc()
                     res[name] = dict(error="%s: %s" % (type(e).__name__, str(e)[:400]))
                     ok, detail = False, "EXCEPTION " + res[name]["error"]
-                gates.append(gate(name, ok, True, detail))
+                gates.append(gate(name, ok, must, detail))
                 save()
             log("GFW_T")
             try:

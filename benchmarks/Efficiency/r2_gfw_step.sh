@@ -1,9 +1,15 @@
 #!/bin/bash
 # R2 MILESTONE 2, STEP 7, PIECE 5, GFW: ONE short bounded GPU step in an EXISTING holder that runs benchmarks/Efficiency/
 # r2_gfw_gate.py: the gilfree C++ WORKER (packer v3 of this commit, Q-C2) on the A100 before the captured tick depends on
-# it. MUST: GFW_ready (v3 and the pinned v2 built), GFW1 (S-C's exact wait WITHOUT its submission wait: a T4 event behind
-# a GPU sleep, 1500 launches behind the spin; err 0, a real spin > 10 ms, every launch ran, rows the host truth) and
-# GFW1n (the worker's publication planted off: the spin ends by its bound with err 1). REPORT: GFW_T64 / GFW_T192, the
+# it. MUST: GFW_ready (v3 and the pinned v2 built), GFW1 (the CAPTURED-tick protocol: S-C's exact wait WITHOUT its
+# submission wait, a T4 event behind a GPU sleep, 64 launches behind the spin; err 0, a real spin > 10 ms, every launch
+# ran, rows the host truth), GFW1e (the EAGER-tick protocol: the host waits the job's SUBMISSION, the GIL released, then
+# the spin with 1500 launches behind it; err 0) and GFW1n (the worker's publication planted off: the spin ends by its
+# bound with err 1). REPORT R_GFW1x: the eager hazard of gfw1b (1500 launches, no submission wait), expected err 1.
+# gfw1b (3462ba3) failed GFW1 as first written (1500 launches, no submission wait: the spin ran to its bound): the
+# worker's only wait was the T4 event on a side stream, recorded before the spin; its H2D / scatter, enqueued after the
+# spin, were held behind it below the worker (the launch queue filled behind the spin, or a shared hardware queue).
+# REPORT: GFW_T64 / GFW_T192, the
 # worker's per-release service time beside packer v2's in the same step (A-B-A) and v2's record (b64_s512_gilfree2,
 # 8 threads: 4.59 ms at 64 MiB, 12.36 ms at 192 MiB; 15.86 ms with 4 threads).
 # REGISTERED GFW BEGIN
@@ -39,7 +45,7 @@
 # 124 / 137 the host timeout; 1 a STOP before the launch (a missing or malformed uuid file included); 5 an exit-0 step
 # whose record is incomplete or whose sacct row is not COMPLETED 0:0.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw1b                                                    # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-gfw1c                                                    # ROOT
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -61,7 +67,8 @@ usage() { echo "usage: r2_gfw_step.sh --nosi <sha> <holder> <run id> [gfw1|gfw2]
 { [ $# = 4 ] || [ $# = 5 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4 CELL=${5:-gfw1}
 case $CELL in
-    gfw1) CELL_ARGS=(--releases 20 --warmup 3 --sizes "$SIZES" --launches 1500 --spin-cycles 200000000) ;;
+    gfw1) CELL_ARGS=(--releases 20 --warmup 3 --sizes "$SIZES" --launches 1500 --launches-few 64
+                     --hazard-spin 1048576 --spin-cycles 200000000) ;;
     gfw2) CELL_ARGS=(--takes 6496 --l2-layers 4 --l2-batch 64 --l2-heads 2 --l2-s-host 16311 --l2-c 96 --l2-x 32
                      --l2-sleep-cycles 50000000) ;;
     *) usage ;;
