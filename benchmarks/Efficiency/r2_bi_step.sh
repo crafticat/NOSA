@@ -51,10 +51,12 @@ BIGEMM_SHA=                                                                     
 BIGEMM_PATH=                                                                             # PIN (unset)
 BIGEMM_BLOB=                                                                             # PIN (unset)
 BIGEMM_FN=                                                                               # PIN (unset)
-# [bigemmc] the frozen G-c table of a bigc-tune run (its table.json under OUTROOT and the BIGC_TABLE_SHA line of its
-# stdout): EMPTY until bigc-tune ran; the python cell refuses a file whose canonical digest is not the pin
-BIGC_TABLE=                                                                              # PIN (unset)
-BIGC_TABLE_SHA=                                                                          # PIN (unset)
+# [bigemmc] the frozen G-c table: bigc-tune run bi_bgca_2191262 (holder 2191262, exit 0, COMPLETED 0:0; its
+# OUTROOT/bi_bgca_2191262_bigc-tune/table.json, byte-identical in-tree copy below, = bi_linear_c.TABLE); the digest is
+# its stdout's BIGC_TABLE_SHA line. The python cell refuses a file whose canonical digest is not the pin. bigc-tune
+# STOPs while these are set (a new tuning run needs them unset).
+BIGC_TABLE=/mnt/beegfs/ojerbi/nosi-r2-bigemmc/benchmarks/Efficiency/bigc_tables/bgca_2191262_table.json   # PIN
+BIGC_TABLE_SHA=cd8684baba2165e380728cfc619d1ecdfca5723f0982c470199162f55022b814          # PIN
 SELF=benchmarks/Efficiency/r2_bi_step.sh
 STEP_MIN=30
 main() {
@@ -82,7 +84,11 @@ if [ -n "${BI_HOLDERS:-}" ]; then
 fi
 if [ -n "${BIGC_TEST_TABLE:-}${BIGC_TEST_TABLE_SHA:-}" ]; then          # the CPU test BC-S only
     [ "$DRY" = 1 ] || stop "BIGC_TEST_TABLE is for DRYRUN (the CPU test) only"
-    BIGC_TABLE=${BIGC_TEST_TABLE:-} BIGC_TABLE_SHA=${BIGC_TEST_TABLE_SHA:-}
+    if [ "${BIGC_TEST_TABLE:-}" = - ]; then                             # "-": the pins unset
+        BIGC_TABLE= BIGC_TABLE_SHA=
+    else
+        BIGC_TABLE=${BIGC_TEST_TABLE:-} BIGC_TABLE_SHA=${BIGC_TEST_TABLE_SHA:-}
+    fi
 fi
 UFILE=$HOLDERS/$JOB.gpu_uuid
 [ -f "$UFILE" ] || stop "no GPU uuid file $UFILE (the lead writes it for each holder)"

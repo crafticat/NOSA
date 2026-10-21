@@ -18,6 +18,8 @@ skipped when triton is not installed.
   BC-C1  contract and table: contract_for / strict_launch_for take no M; CONTRACT = BLOCK_K 64, split 1, ascending;
          every entry's tile dims >= 16; check_table refuses a changed contract, a split, a tile of 8, a short bucket list.
   BC-C2  bucket map: launch_for total for M 1 .. 4 x 287; 16/17, 64/65, 256/257, 512/513 change bucket; strict never.
+  BC-P   the pinned table: source TABLE == the in-tree copy == bigc-tune 2191262's table.json (bytes), one digest =
+         TABLE_SHA256 = the step's BIGC_TABLE_SHA; a changed entry changes the digest and is refused.
   BC-C3  semantics (interpreter): both variants vs float64, the five NOSA-8B shapes / 64, a 3-D input.
   BC-C4  M invariance (interpreter): integer inputs, M in {1, 7, 16, 17, 64, 65, 256, 257, 287} (every bucket), strict ==
          bucket; random fp32 strict for EVERY M 1 .. 80 (one config: valid on the interpreter), its precondition first
@@ -370,10 +372,11 @@ def test_BC_C1_contract_and_table():
         assert bl.contract_for(N, K) is bl.CONTRACT
     with pytest.raises(ValueError):
         bl.contract_for(0, 5)
-    t = bl.check_table(bl.TABLE)
-    assert t["tuned"] is False and t["contract"] == list(bl.CONTRACT)
-    entries = [e for lst in list(t["shapes"].values()) + [t["default"]] for e in lst] + list(t["strict"].values())
-    assert entries and all(min(e[0], e[1]) >= 16 for e in entries)
+    for t in (bl.check_table(bl.TABLE), bl.check_table(bl.UNTUNED_PRIOR)):
+        assert t["contract"] == list(bl.CONTRACT)
+        entries = [e for lst in list(t["shapes"].values()) + [t["default"]] for e in lst] + list(t["strict"].values())
+        assert entries and all(min(e[0], e[1]) >= 16 for e in entries)
+    assert bl.TABLE["tuned"] is True and bl.UNTUNED_PRIOR["tuned"] is False
     assert bl.NOSA8B_SHAPES == {"wqkv": (4608, 4096), "wo": (4096, 4096), "gate_up": (32768, 4096),
                                 "down": (4096, 16384), "lm_head": (73448, 4096)}
     bad = []
@@ -408,6 +411,37 @@ def test_BC_C2_bucket_map():
         assert all(bl.strict_launch_for(N, K) == s for _ in range(3))
     assert bl.launch_for(4608, 4096, 287) == bl.Launch(*bl.TABLE["shapes"]["4608x4096"][3])
     assert bl.launch_for(7, 9, 1) == bl.Launch(*bl.TABLE["default"][0])
+
+
+RUN_TABLE = Path("/mnt/beegfs/ojerbi/r2-runs/bi/bi_bgca_2191262_bigc-tune/table.json")
+
+
+def test_BC_P_pinned_table():
+    """BC-P: the frozen table of bigc-tune 2191262 is the source TABLE, its in-tree copy and the step's pins, with one
+    digest (computed here, on the compute node). Negative control: one changed entry changes the digest and
+    load_table refuses it."""
+    f = ROOT / bl.TABLE_FILE
+    assert json.loads(f.read_text()) == bl.TABLE
+    assert bl.table_digest(bl.TABLE) == bl.TABLE_SHA256 == "cd8684baba2165e380728cfc619d1ecdfca5723f0982c470199162f55022b814"
+    assert bl.load_table(str(f), bl.TABLE_SHA256) == bl.TABLE
+    if RUN_TABLE.is_file():                                   # the run's own output (frozen 0444)
+        assert RUN_TABLE.read_bytes() == f.read_bytes()
+    assert bl.TABLE["tuned"] is True and bl.TABLE["bucket_invariant"] is True
+    assert bl.strict_launch_for(4608, 4096) == bl.Launch(64, 128, 4, 3, 8)
+    assert bl.strict_launch_for(32768, 4096) == bl.Launch(64, 256, 8, 3, 8)
+    assert bl.strict_launch_for(73448, 4096) == bl.Launch(64, 256, 4, 3, 8)
+    text = STEP.read_text()
+    assert "\nBIGC_TABLE=%s/%s " % (STEP_ROOT, bl.TABLE_FILE) in text
+    assert "\nBIGC_TABLE_SHA=%s " % bl.TABLE_SHA256 in text
+    assert '\n    "tuned": True,\n' in MOD.read_text()            # the step's grep for a frozen source table
+    moved = json.loads(json.dumps(bl.TABLE))
+    moved["strict"]["4096x4096"] = [64, 64, 4, 3, 8]
+    assert bl.table_digest(moved) != bl.TABLE_SHA256
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "t.json"
+        p.write_text(json.dumps(moved, sort_keys=True, separators=(",", ":")))
+        with pytest.raises(ValueError):
+            bl.load_table(str(p), bl.TABLE_SHA256)
 
 
 # =====================================================================================================================
@@ -637,11 +671,12 @@ def test_BC_T_tune_helpers(tmp_path):
     times = {L1: {287: 1.0, 861: 5.0}, L2: {287: 2.0, 861: 1.0}, L3: {287: 0.1}}
     assert T.pick(times, T.STRICT_WEIGHTS) == (L2, 7.0)                  # 3 x 2 + 1 < 3 x 1 + 5; L3 lacks 861
     assert T.pick({}, T.STRICT_WEIGHTS) == (None, None)
-    sp = {k: L2 for k in bl.TABLE["strict"]}
-    bp = {k: [L1] * 5 for k in bl.TABLE["shapes"]}
-    t = T.build_table(bl, bl.TABLE, sp, bp, True, "test")
+    sp = {k: L2 for k in bl.UNTUNED_PRIOR["strict"]}
+    bp = {k: [L1] * 5 for k in bl.UNTUNED_PRIOR["shapes"]}
+    before = json.dumps(bl.UNTUNED_PRIOR, sort_keys=True)
+    t = T.build_table(bl, bl.UNTUNED_PRIOR, sp, bp, True, "test")
     assert t["tuned"] is True and t["bucket_invariant"] is True and t["strict"]["4096x4096"] == list(L2)
-    assert bl.TABLE["tuned"] is False, "build_table must not change the source table"
+    assert json.dumps(bl.UNTUNED_PRIOR, sort_keys=True) == before, "build_table must not change its prior"
     p = tmp_path / "table.json"
     p.write_text(json.dumps(t, sort_keys=True, separators=(",", ":")))
     dg = bl.table_digest(t)
@@ -716,12 +751,26 @@ def test_BC_S_step_cells(tmp_path):
     if sha is None:
         pytest.skip("not a clean checkout of %s: the full DRYRUN needs one" % STEP_ROOT)
     tbl = dict(e, BIGC_TEST_TABLE=STAND_IN_TABLE, BIGC_TEST_TABLE_SHA="a" * 64)
+    unset = dict(e, BIGC_TEST_TABLE="-")                     # DRYRUN: the committed pins unset
+    pin_args = "%s/%s --%s %s" % (STEP_ROOT, bl.TABLE_FILE, "%s", bl.TABLE_SHA256)
+    # the committed pins (the frozen table of bigc-tune 2191262)
     r = run("bigc-gate", sha=sha)
-    assert r.returncode == 1 and "needs the frozen table" in r.stderr, r.stderr[-300:]
+    assert r.returncode == 0 and "G-c table %s/%s sha %s" % (STEP_ROOT, bl.TABLE_FILE, bl.TABLE_SHA256) in r.stdout, \
+        r.stderr[-300:]
+    assert ("bigc_gate.py --out /mnt/beegfs/ojerbi/r2-runs/bi/bi_t1_118_bigc-gate --variants strict\\,bucket --seed 1234 "
+            "--table " + pin_args % "table-sha") in r.stdout, r.stdout[-800:]
     r = run("bigc-time", sha=sha)
-    assert r.returncode == 1 and "needs the frozen table" in r.stderr
+    assert r.returncode == 0 and ("--bigemm-c both --bigc-table " + pin_args % "bigc-table-sha") in r.stdout, \
+        r.stdout[-800:]
+    r = run("bigc-tune", sha=sha)                            # pins set: a new tuning run is refused
+    assert r.returncode == 1 and "bigc-tune makes the table" in r.stderr
     r = run("bigc-tune", sha=sha, env=tbl)
     assert r.returncode == 1 and "bigc-tune makes the table" in r.stderr
+    # pins unset: the source TABLE is frozen ("tuned": True), so gate / time run on it without --table; the STOP for an
+    # untuned source cannot be reached at this commit (its text is pinned instead)
+    r = run("bigc-gate", sha=sha, env=unset)
+    assert r.returncode == 0 and "G-c table source" in r.stdout and "--table" not in r.stdout, r.stderr[-300:]
+    assert "needs the frozen table: run bigc-tune" in STEP.read_text()
     r = run("bigc-gate", sha=sha, env=dict(e, BIGC_TEST_TABLE=STAND_IN_TABLE))
     assert r.returncode == 1 and "partly set" in r.stderr
     r = run("bigc-gate", sha=sha, env=dict(e, BIGC_TEST_TABLE=STAND_IN_TABLE, BIGC_TEST_TABLE_SHA="xyz"))
@@ -734,9 +783,8 @@ def test_BC_S_step_cells(tmp_path):
     assert not os.path.exists(missing)
     r = run("bigc-gate", sha=sha, env=dict(e, BIGC_TEST_TABLE=missing, BIGC_TEST_TABLE_SHA="a" * 64))
     assert r.returncode == 1 and "no table file %s" % missing in r.stderr, r.stderr[-300:]
-    r = run("bigc-tune", sha=sha)
-    if r.returncode != 0:
-        pytest.skip("DRYRUN stopped on a pin outside the cell stage: %s" % r.stderr.strip()[-200:])
+    r = run("bigc-tune", sha=sha, env=unset)
+    assert r.returncode == 0, r.stderr[-300:]
     assert "cell bigc-tune STEP_MIN 60 claim bigc_active" in r.stdout and "--time=60" in r.stdout
     assert "Efficiency/bigc_tune.py --out /mnt/beegfs/ojerbi/r2-runs/bi/bi_t1_118_bigc-tune --warm 3 --reps 10" in r.stdout
     assert "--biattn" not in r.stdout and "--job-name=bi-t1-118-bigc-tune" in r.stdout

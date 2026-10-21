@@ -104,16 +104,18 @@ def shape_key(N: int, K: int) -> str:
     return "%dx%d" % (int(N), int(K))
 
 
-# THE SOURCE TABLE: the UNTUNED PRIOR (design note 3 (a): small BLOCK_N at small M for parallelism without split-K;
-# vLLM / TML's 128 x 128 x 64, 8 warps, 3 stages at large M; BLOCK_M 64 above 512 rows for the wave count on 108 SMs).
 # Entry = [BLOCK_M, BLOCK_N, num_warps, num_stages, GROUP_M]. "strict" / "strict_default": THE CANDIDATE's one launch
 # per weight shape. "buckets" / "shapes" / "default": the RESEARCH ARM only ("buckets" are the inclusive upper row
 # counts of the first len(buckets) buckets; the last bucket is open). bigc_tune.py replaces "strict" and "shapes" for
 # the five NOSA-8B shapes, adds "bucket_invariant" and sets "tuned": true; the digest of the frozen table is recorded
-# with every run. To freeze it into the source, paste table.json's content here (the digest must not change).
+# with every run.
+#
+# UNTUNED_PRIOR: the table before tuning (design note 3 (a): small BLOCK_N at small M for parallelism without split-K;
+# vLLM / TML's 128 x 128 x 64, 8 warps, 3 stages at large M; BLOCK_M 64 above 512 rows for the wave count on 108 SMs).
+# Kept as the record of what bigc-tune 2191262 started from (its strict launch was the cross-launch reference).
 _NARROW = [[16, 32, 4, 4, 8], [32, 64, 4, 4, 8], [64, 64, 4, 4, 8], [128, 128, 8, 3, 8], [64, 128, 4, 4, 8]]
 _WIDE = [[16, 64, 4, 4, 8], [32, 128, 4, 4, 8], [64, 128, 4, 4, 8], [128, 128, 8, 3, 8], [128, 128, 8, 3, 8]]
-TABLE = {
+UNTUNED_PRIOR = {
     "version": 1,
     "tuned": False,
     "source": "untuned prior (bi-gemm-design.md 3 (a)); replace with bigc_tune.py's frozen table",
@@ -125,6 +127,34 @@ TABLE = {
     "default": _NARROW,
     "strict": {shape_key(*s): [64, 128, 4, 4, 8] for s in NOSA8B_SHAPES.values()},
     "strict_default": [64, 128, 4, 4, 8],
+}
+# THE FROZEN TABLE (bigc-tune run bi_bgca_2191262, holder 2191262, exit 0, COMPLETED 0:0, at 57356d7; A100 80GB PCIe,
+# torch 2.6.0+cu124, triton 3.2.0; cross-launch mismatches 0). The same content as the run's
+# /mnt/beegfs/ojerbi/r2-runs/bi/bi_bgca_2191262_bigc-tune/table.json and its in-tree copy TABLE_FILE; canonical digest
+# TABLE_SHA256 (test BC-P checks all three on a compute node). Strict = THE CANDIDATE; shapes / default = the research
+# arm only. Do not edit by hand: a new table needs a new bigc-tune run.
+TABLE_SHA256 = "cd8684baba2165e380728cfc619d1ecdfca5723f0982c470199162f55022b814"
+TABLE_FILE = "benchmarks/Efficiency/bigc_tables/bgca_2191262_table.json"
+TABLE = {
+    "bucket_invariant": True,
+    "buckets": [16, 64, 256, 512],
+    "contract": [64, 1, "ascending", "sm80 MMAv2 mma.sync m16n8k16 bf16 x bf16 -> fp32 (every tile dim >= 16)",
+                 "one fp32 -> output-dtype rounding, no bias"],
+    "default": [[16, 32, 4, 4, 8], [32, 64, 4, 4, 8], [64, 64, 4, 4, 8], [128, 128, 8, 3, 8], [64, 128, 4, 4, 8]],
+    "shapes": {
+        "32768x4096": [[16, 64, 4, 3, 8], [64, 64, 8, 4, 8], [128, 128, 8, 3, 8], [64, 256, 8, 3, 8], [128, 128, 4, 3, 8]],
+        "4096x16384": [[16, 64, 4, 4, 8], [64, 64, 4, 4, 8], [128, 128, 8, 3, 8], [128, 128, 8, 3, 8], [128, 128, 8, 3, 8]],
+        "4096x4096": [[16, 64, 4, 4, 8], [64, 64, 4, 4, 8], [64, 64, 4, 4, 8], [64, 128, 4, 3, 8], [64, 128, 4, 4, 8]],
+        "4608x4096": [[16, 64, 4, 4, 8], [64, 64, 4, 4, 8], [64, 128, 4, 3, 8], [64, 128, 4, 4, 8], [64, 128, 4, 3, 8]],
+        "73448x4096": [[16, 128, 4, 4, 8], [64, 64, 8, 4, 8], [128, 128, 4, 3, 8], [64, 256, 4, 3, 8], [128, 128, 4, 3, 8]],
+    },
+    "source": "bigc_tune 57356d7e590c5c8f807be55eb0ebfc4fc6c2e3c4 on NVIDIA A100 80GB PCIe (torch 2.6.0+cu124, triton "
+              "3.2.0); cross-launch mismatches 0",
+    "strict": {"32768x4096": [64, 256, 8, 3, 8], "4096x16384": [64, 128, 4, 3, 8], "4096x4096": [64, 128, 4, 3, 8],
+               "4608x4096": [64, 128, 4, 3, 8], "73448x4096": [64, 256, 4, 3, 8]},
+    "strict_default": [64, 128, 4, 4, 8],
+    "tuned": True,
+    "version": 1,
 }
 _ACTIVE = {"table": TABLE}
 
