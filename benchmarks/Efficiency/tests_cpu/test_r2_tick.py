@@ -1083,7 +1083,8 @@ def test_T19_sg5_step_script_uuid_file_and_pins(tmp_path):
     """T19: r2_tick_sg5_step.sh: the uuid file rules (missing, "GPU-" prefix, two lines: STOP before any other check;
     SG5_HOLDERS outside DRYRUN refused); the pins (piece 3 v2, the packer's two blobs of f2b981a); on a clean checkout
     at HEAD the DRYRUN prints the uuid, the pins and the arguments of the primary point and the sweep, and the cells
-    (_t19_cells: default = p3's arguments, p4a, p4b-<b>, p4sc64, [b2] p5b2); in the step's own ROOT a DRYRUN stop FAILS.
+    (_t19_cells: default = p3's arguments, p4a, p4b-<b>, p4sc64, [b2] p5b2, p6 = p5b2's EXACT with the four --variants;
+    no other cell has --variants); in the step's own ROOT a DRYRUN stop FAILS.
     Static: the claim sg5_active, STEP_MIN, --export=NONE, no awk / python3 / perl outside comments."""
     script = EFF / "r2_tick_sg5_step.sh"
     text = script.read_text()
@@ -1206,6 +1207,13 @@ def _t19_cells(script, env, sha):
     want["p5b2"] = want["p4sc64"].replace("t1_416_p4sc64", "t1_416_p5b2").replace("--backends sc ",      # [b2]
                                                                                    "--backends b2 ")
     shape["p5b2"] = (["b2"], ["exact", "fast"], 0, 64)                                             # [b2]
+    P6_VARIANTS = "torch/per_call,fused/per_call,torch/batched,fused/batched"                    # [batched-rebuild]
+    want["p6"] = (want["p5b2"].replace("t1_416_p5b2", "t1_416_p6").replace("--modes exact,fast ", "--modes exact ")
+                  + " --variants " + P6_VARIANTS)                                                # [batched-rebuild]
+    shape["p6"] = (["b2"], ["exact"], 0, 64)                                                     # [batched-rebuild]
+    for cell, exp in want.items():                         # [batched-rebuild] --variants in p6 only: every other
+        assert ("--variants" in exp) == (cell == "p6"), cell     # cell's arguments stay p3's / p4's / p5b2's tokens
+    assert "--variants" not in p3
     assert "--b2-checked" not in want["p5b2"] and want["p5b2"] != want["p4sc64"]                  # [b2] unchecked
     for cell, exp in want.items():
         assert exp != p3 and (P3_SG5_SWEEP in exp) == (shape[cell][2] == 9)
@@ -1223,8 +1231,13 @@ def _t19_cells(script, env, sha):
             assert (pa.C, pa.X, pa.R_ver, pa.batch, pa.S, pa.transport, pa.threads) == (96, X, 16, 64, 16128,
                                                                                          "gilfree", 8)
             pool = pa.C + pa.X + 4 - 64                                # the harness's rule (asserted above)
-            assert pool == (100 if cell in ("p4sc64", "p5b2") else 68)                       # [b2] p5b2
-            if cell == "p5b2":                                                                  # [b2]
+            assert pool == (100 if cell in ("p4sc64", "p5b2", "p6") else 68)                 # [b2] p5b2, p6
+            if cell == "p6":                                                                    # [batched-rebuild]
+                assert pa.variant_list == [tuple(v.split("/")) for v in P6_VARIANTS.split(",")]
+                assert pa.rebuild == "per_call" and pa.twin == "torch"         # the first arm: p5b2's replica
+            else:                                                                               # [batched-rebuild]
+                assert pa.variants == "" and pa.variant_list == [("torch", "per_call")]
+            if cell in ("p5b2", "p6"):                                                          # [b2]
                 assert pa.b2_checked is False                                               # the timed path
             assert "NOSI_POOL_BLOCKS = C + X + 4 - 64 = %d" % pool in r.stdout, cell
             assert "C 96 X %d R_ver 16" % X in r.stdout
@@ -1232,7 +1245,8 @@ def _t19_cells(script, env, sha):
     assert r.returncode == 0 and args(r.stdout) == want["p4a"].replace("--transport gilfree", "--transport gather")
     for bad in (("p4b",), ("p4c",), ("p4b-s9",), ("p4a", "p4a"), ("p4a", "p4b-sb"), ("gather", "gilfree"),
                 ("p4a", "gather", "x"), ("P4A",), ("p4sc32",), ("p4sc64", "p4a"),
-                ("p5sc",), ("p5b2c",), ("p5b2", "p4sc64")):                                    # [b2]
+                ("p5sc",), ("p5b2c",), ("p5b2", "p4sc64"),                                     # [b2]
+                ("p6", "p5b2"), ("p6x",), ("P6",)):                                            # [batched-rebuild]
         r = dry(*bad)
         assert r.returncode == 2 and "usage" in r.stderr, bad
 

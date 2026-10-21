@@ -93,6 +93,7 @@ from .r2_positional_twin import BLOCK, PositionalTwin
 
 RING_EXACT, RING_DRAFT = 0, 2              # ring page offsets past the NB historical slots
 TWIN_VARIANTS = ("torch", "fused")         # [twin-variant] TickEngine(twin=...): the twins' unchecked step
+REBUILD_MODES = ("per_call", "batched")    # [batched-rebuild] TickEngine(rebuild=...): the publications' rebuild
 FIELDS = ("pos", "b", "bank", "u", "ring_row", "prev_slot", "tail_slot", "draft", "lit", "slot")
 
 
@@ -123,6 +124,67 @@ def rebuild_from_own_rows(twin: PositionalTwin, b: int, B: int, p: int, dpos: in
     dc = twin.total_cis[B + b, idx].clone()
     SC.rebuild_draft_bank(twin, b, B, dk, dc)
     return dk, dc
+
+
+def rebuild_banks_unchecked(twin: PositionalTwin, items: Sequence[tuple], B: int, dev_items=None,   # [batched-rebuild]
+                            swap: bool = False):                                                  # [batched-rebuild]
+    """[batched-rebuild] (A2, 7f06273) rebuild_from_own_rows for EVERY publication of a tick at once, on one layer's
+    twin, without a host read: items = [(b, p, dpos)], one per bank. The twin's banks are independent, so: FIRST every
+    draft bank's own unverified rows [p, dpos) (ONE gather of the ring and ONE of total_cis over all items), THEN
+    sync_draft_bank of every item (one index copy per table: r2_spec_core.sync_draft_bank batched), then ONE
+    advance_unchecked over T = max(dpos - p) steps with n[B + b] = dpos - p (a bank is inactive past its own rows, as
+    every other bank is in the per-call path). Bitwise rebuild_from_own_rows per bank (test P6a). dev_items: (3, P)
+    int64 on the twin's device (b, p, n; the caller makes it once per tick for every layer). swap: NEGATIVE CONTROL
+    (tests only), the first two items' rows exchanged. Returns {b: (keys (n, H, D), cis (n, H))}."""
+    if not items:
+        return {}
+    dev = twin.pos.device
+    bs = [int(b) for (b, _, _) in items]
+    if len(set(bs)) != len(bs):
+        raise TickError("rebuild_banks_unchecked: one publication per bank (got %s)" % bs)
+    ns = [int(d) - int(p) for (_, p, d) in items]
+    for b, n in zip(bs, ns):
+        if not 0 <= n <= BLOCK:
+            raise TickError("draft bank %d: %d unverified rows (the ring holds 64)" % (B + b, n))
+    T, P = max(ns), len(items)
+    if dev_items is None:
+        dev_items = torch.tensor([bs, [int(p) for (_, p, _) in items], ns], dtype=torch.int64).to(dev)
+    hb, hp, hn = dev_items[0], dev_items[1], dev_items[2]
+    drafts = hb + B
+    out = {}
+    if T:
+        j = torch.arange(T, dtype=torch.int64, device=dev).view(1, T)
+        pos = hp.view(P, 1) + j                                         # (P, T): the absolute positions
+        valid = j < hn.view(P, 1)
+        rk = twin.ring[drafts.view(P, 1), pos % BLOCK]                  # (P, T, H, D): the draft rows, BEFORE the sync
+        rc = twin.total_cis[drafts.view(P, 1), pos.clamp(max=twin.total_cis.shape[1] - 1)]   # (P, T, H)
+        rk = torch.where(valid.view(P, T, 1, 1), rk, torch.zeros_like(rk))
+        rc = torch.where(valid.view(P, T, 1), rc, torch.zeros_like(rc))
+        for i, (b, n) in enumerate(zip(bs, ns)):
+            out[b] = (rk[i, :n], rc[i, :n])
+    else:
+        for b in bs:
+            out[b] = (twin.ring[B + b, :0].clone(), twin.total_cis[B + b, :0].clone())
+    twin.comp_k.index_copy_(0, drafts, twin.comp_k.index_select(0, hb))      # sync_draft_bank, every item at once
+    twin.ring.index_copy_(0, drafts, twin.ring.index_select(0, hb))
+    twin.total_cis.index_copy_(0, drafts, twin.total_cis.index_select(0, hb))
+    twin.ccis.index_copy_(1, drafts, twin.ccis.index_select(1, hb))
+    for t in (twin.pos, twin.n_comp, twin.n_ccis, twin.prefilled):
+        t.index_copy_(0, drafts, t.index_select(0, hb))
+    twin.epoch.index_add_(0, drafts, torch.ones_like(drafts, dtype=twin.epoch.dtype))
+    if T:
+        keys = torch.zeros((twin.B, T, twin.H, twin.D), dtype=twin.ring.dtype, device=dev)
+        cis = torch.zeros((twin.B, T, twin.H), dtype=twin.total_cis.dtype, device=dev)
+        cnt = torch.zeros(twin.B, dtype=torch.int64, device=dev)
+        order = drafts
+        if swap and P >= 2:                                             # NEGATIVE CONTROL: two banks' rows exchanged
+            order = drafts.clone()
+            order[0], order[1] = drafts[1], drafts[0]
+        keys.index_copy_(0, order, rk.to(keys.dtype))
+        cis.index_copy_(0, order, rc.to(cis.dtype))
+        cnt.index_copy_(0, drafts, hn)
+        twin.advance_unchecked(keys, cis, cnt)
+    return out
 
 
 def default_nl():
@@ -275,13 +337,20 @@ class TickEngine:
     the selection's last two blocks (T - 1, T) every layer (tests and gates; one read per layer).
     twin ([twin-variant]): "torch" (the default, unchanged) or "fused": every twin's step_unchecked / advance_unchecked
     is bound on the instance to r2_twin_fused (ONE Triton kernel per layer, bitwise with ops.mean = fixed_order_mean);
-    the call sites are unchanged."""
+    the call sites are unchanged.
+    rebuild ([batched-rebuild]): "per_call" (the default, unchanged: one CHECKED rebuild_from_own_rows per publication
+    and layer) or "batched": apply_events rebuilds every publication of the tick with ONE rebuild_banks_unchecked and
+    ONE copy_rows_many per layer (no host read; with twin "fused" the advance is one fused kernel); bitwise the same."""
 
     LOG = 1 << 16
 
     def __init__(self, model, ops, twins: List[PositionalTwin], store_k, store_v, store_bias, S_list, M_alloc: int,
                  nl=None, stage1=None, pool=None, select=SC.select_blocks, draft_drop: float = 0.0, drop_seed: int = 0,
-                 check: bool = False, twin: str = "torch"):                                     # [twin-variant]
+                 check: bool = False, twin: str = "torch",                                      # [twin-variant]
+                 rebuild: str = "per_call"):                                                    # [batched-rebuild]
+        if rebuild not in REBUILD_MODES:                                                        # [batched-rebuild]
+            raise TickError("rebuild must be one of %s (got %r)" % (REBUILD_MODES, rebuild))    # [batched-rebuild]
+        self.rebuild = rebuild                                                                  # [batched-rebuild]
         self.model, self.ops = model, ops
         self.nl = nl if nl is not None else default_nl()
         if stage1 is None or pool is None:
@@ -444,6 +513,7 @@ class TickEngine:
             twins.append(c)
         args = dict(nl=self.nl, stage1=self.stage1, pool=self.pool, select=self.select, draft_drop=self.draft_drop,
                     drop_seed=self.drop_seed, check=self.check, twin=self.twin_variant)                 # [twin-variant]
+        args.setdefault("rebuild", self.rebuild)                                                # [batched-rebuild]
         args.update(kw)
         return type(self)(self.model, ops if ops is not None else self.ops, twins, [x.clone() for x in self.store_k],
                           [x.clone() for x in self.store_v], [x.clone() for x in self.store_bias], self.S_list,
@@ -746,6 +816,9 @@ class TickEngine:
                 self.copy_ring(l, b, exact_to_draft=True)
             self.bank_pos[B + b] = self.bank_pos[b]
             self.synced[b] = self.bank_pos[b]
+        if self.rebuild == "batched":                                            # [batched-rebuild]
+            self._publish_batched(pub)                                           # [batched-rebuild]
+            return                                                               # [batched-rebuild]
         for b, p in pub.items():
             dpos = self.bank_pos[B + b]
             if dpos < p:
@@ -754,6 +827,49 @@ class TickEngine:
                 rebuild_from_own_rows(self.twins[l], b, B, p, dpos)
                 self.copy_rows(l, b, range(self.synced[b], p))
             self.synced[b] = p
+
+    def _publish_batched(self, pub, swap: bool = False) -> None:                 # [batched-rebuild]
+        """[batched-rebuild] step 4 of apply_events for every publication at once (rebuild="batched"): the host checks
+        of every item first, the items' device tensor and copy_rows' index lists ONCE per tick, then per layer ONE
+        rebuild_banks_unchecked and ONE copy_rows_many; no host read. swap: NEGATIVE CONTROL (tests only)."""
+        B = self.B
+        items = []
+        for b, p in pub.items():
+            dpos = self.bank_pos[B + b]
+            if dpos < p:
+                raise TickError("request %d: the draft bank (%d) is behind the publication (%d)" % (b, dpos, p))
+            items.append((b, p, dpos))
+        if not items:
+            return
+        dev_items = self._to_device(torch.tensor([[b for (b, _, _) in items], [p for (_, p, _) in items],
+                                                  [d - p for (_, p, d) in items]], dtype=torch.int64))
+        cp = self.rows_to_copy([(b, range(self.synced[b], p)) for (b, p, _) in items])
+        with self._span("rebuild"):        # D's profile names it t.rebuild; SG5's REST adds it back (p6's scoring)
+            for l in range(self.L):
+                rebuild_banks_unchecked(self.twins[l], items, B, dev_items=dev_items, swap=swap)
+                if cp is not None:
+                    self.copy_rows_many(l, cp)
+        for (b, p, _) in items:
+            self.synced[b] = p
+
+    def rows_to_copy(self, per_bank):                                            # [batched-rebuild]
+        """[batched-rebuild] copy_rows' index lists for every (bank b, positions) of a tick in ONE device tensor
+        (3, Q): the bank, the source (exact ring) row, the destination (draft ring) row; None when there is no row."""
+        bb, src, dst = [], [], []
+        for b, positions in per_bank:
+            for p in positions:
+                bb.append(int(b))
+                src.append(self.ring_slot(False, p) * BLOCK + p % BLOCK)
+                dst.append(self.ring_slot(True, p) * BLOCK + p % BLOCK)
+        if not bb:
+            return None
+        return self._to_device(torch.tensor([bb, src, dst], dtype=torch.int64))
+
+    def copy_rows_many(self, l: int, cp) -> None:                                # [batched-rebuild]
+        """[batched-rebuild] copy_rows for every (bank, position) of cp at once: the draft ring rows take the exact
+        ring rows (distinct destinations; the sources are the exact ring, never a destination)."""
+        for st in (self.store_k[l], self.store_v[l], self.store_bias[l]):
+            st[cp[0], cp[2]] = st[cp[0], cp[1]]
 
     def writeback(self, b: int) -> None:
         """Every block whose 64 positions are committed goes from its exact ring page to the backend's history (the

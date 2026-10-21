@@ -117,6 +117,18 @@ ops per layer and rolled-back bank).
   bookkeeping gate failing (twins vs mirrors, a void tick); fused / per_call's REST falling below 0.70 s (PF3b
   refuted: the checked rebuild would reach the fused path).
 
+## 4b. Build notes (after the GO)
+
+- The batched rebuild runs inside `self._span("rebuild")` (the lead's request for D's next profile: D's ProfileTimer
+  names it `t.rebuild` instead of OTHER:decision). SG5's TickTimer then times it as the device category `rebuild`, which
+  `summarize` takes out of the residual. So p6 scores the REST of a batched arm as `residual - end_tick + rebuild`:
+  the same work as the per-call arms' REST, as the frozen bands assume. The per-call path's spans are unchanged.
+- D's breakdown (registry "OTHER / res BREAKDOWN"): the decision phase is 273.99 ms of device time in 131,405 kernels
+  per verify tick at 16K B 64, mostly index / index_put_ / nonzero chains of the checked per-call rebuild (the nonzero
+  chains are host syncs). The batched path has no boolean-mask indexing and no host read (lint P6e).
+- THE NEXT DEVICE TERM after p6 (not touched by it): res:resolve, S-C's device decision (radix sorts, index, cummax,
+  where, copies), 86.6 ms per verify tick at B 64 in D's profile.
+
 ## 5. What I need
 
 - GO for option B and the 2 x 2 cell (or only fused / batched + the control).

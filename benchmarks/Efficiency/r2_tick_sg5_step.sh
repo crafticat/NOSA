@@ -35,6 +35,9 @@
 #            S-C's device path, UNCHECKED: the harness's default without --b2-checked) at p4sc64's point: --modes
 #            exact,fast --backends b2 --C 96 --X 64 --R-ver 16, no sweep, 48 steps, gilfree 8 threads, the superset
 #            wait; NOSI_POOL_BLOCKS = 100
+#   p6       [batched-rebuild] p5b2's point, EXACT only, the 2 x 2 of docs/R2_SG5_P6_PLAN.md: --modes exact --backends b2
+#            --C 96 --X 64 --R-ver 16 --variants torch/per_call,fused/per_call,torch/batched,fused/batched (twin and
+#            TickEngine(rebuild=...) per arm; torch/per_call is p5b2's replica); NOSI_POOL_BLOCKS = 100
 #   STEP_MIN 120 in every cell.
 #
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
@@ -58,6 +61,18 @@
 #   B-Q  REPORT: ratio about 0.02 (S-C 0.006)
 #   B-K  REPORT: report()["k5"] (the demand peak), report()["b2"], draft_only.sc / residency.sc, meta.peak_gb
 #
+# REGISTERED for p6 ([batched-rebuild], 2026-10-21 06:12:33Z, registry "SG5 p6 PREDICTIONS"; docs/R2_SG5_P6_PLAN.md
+# section 4; the reference is p5b2's record sg5_p5_2190876_p5b2, exact: T_tick 1347, twin 119, REST 775, end_tick 143,
+# res 252, device 58 ms; REST = residual - (host backend - res)), per round tick:
+#   torch/per_call  twin 105-135 ms, REST 0.70-0.85 s, T_tick 1.20-1.50 s (the control)
+#   fused/per_call  twin 2-6 ms, REST 0.70-0.85 s (PF3b), T_tick 1.08-1.39 s
+#   torch/batched   twin 105-135 ms, REST 0.12-0.30 s, T_tick 0.62-0.95 s
+#   fused/batched   twin 2-6 ms, REST 0.03-0.11 s, T_tick 0.45-0.62 s
+#   the batched arms time their rebuild in the TickTimer category "rebuild" (for D's profile): their REST is scored
+#   as residual - end_tick + rebuild (the same work as the per-call arms' REST);
+#   res, end_tick, device within 15 % of p5b2's in every arm; r, publications, rollbacks within the run-to-run spread;
+#   FALSIFIERS: a band missed; a bookkeeping gate failing; fused/per_call's REST below 0.70 s (PF3b refuted)
+#
 # OUTPUT: OUTROOT/sg5_<run>_<holder>[_<cell>]/summary.json (+ the children's shipped_*.json), and the step record
 # OUTROOT/sg5_<run>_<holder>[_<cell>].step/ (command with the uuid, its file, the pins and the cell, the copies, stdout
 # with one GATE / REPORT line per gate, stderr, exit + accounting, sacct row), both frozen. The job name is
@@ -66,7 +81,7 @@
 # 124 / 137 the host timeout; 1 a STOP before the launch (a missing or malformed uuid file included); 5 an exit-0 step
 # whose record is incomplete or whose sacct row is not COMPLETED 0:0.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-m2-sg5-b2                                                # ROOT ([b2] p5b2; p4sc64: -p4d; p4a: -p4c; p3: nosi-r2-m2-sg5)
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-sg5-p6                                                   # ROOT (p6; [b2] p5b2: nosi-r2-m2-sg5-b2; p4sc64: -p4d; p4a: -p4c; p3: nosi-r2-m2-sg5)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -92,7 +107,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -101,7 +116,7 @@ TRANSPORT= CELL=
 for w in "$@"; do
     case $w in
         gilfree|gather) [ -z "$TRANSPORT" ] || usage; TRANSPORT=$w ;;
-        p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2) [ -z "$CELL" ] || usage; CELL=$w ;;
+        p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6) [ -z "$CELL" ] || usage; CELL=$w ;;
         *) usage ;;
     esac
 done
@@ -110,6 +125,7 @@ MODES=exact,fast
 BACKENDS=sc,sb,v1
 SWEEP_RUN=$SWEEP
 SUFFIX=
+VARIANTS=
 PC=96 PX=32 PRV=16                                          # the primary point (C, X, R_ver)
 case $CELL in
     "") ;;                                                  # the default: p3's arguments
@@ -117,7 +133,11 @@ case $CELL in
     p4b-*) MODES=exact ; BACKENDS=${CELL#p4b-} ; SUFFIX=_$CELL ;;   # one backend, EXACT, then the 9-point sweep
     p4sc64) BACKENDS=sc ; PX=64 ; SWEEP_RUN= ; SUFFIX=_p4sc64 ;;   # S-C only at X 64, both modes, no sweep
     p5b2) BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_p5b2 ;;       # [b2] B2 only at p4sc64's point, unchecked
+    p6) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_p6         # p5b2's point, EXACT, the 2 x 2
+        VARIANTS=torch/per_call,fused/per_call,torch/batched,fused/batched ;;
 esac
+VARIANTARG=()                                               # [batched-rebuild] no --variants in every other cell
+[ -z "$VARIANTS" ] || VARIANTARG=(--variants "$VARIANTS")
 EQ_POOL=$((PC + PX + 4 - 64))                               # r2_tick_sg5.py's equal-memory NOSI_POOL_BLOCKS
 SWEEPARG=()
 [ -z "$SWEEP_RUN" ] || SWEEPARG=(--sweep "$SWEEP_RUN")
@@ -146,7 +166,7 @@ for f in benchmarks/Efficiency/r2_tick_sg5.py benchmarks/Efficiency/r2_g0bi_gate
          nosi/nosi/r2_decode_path.py nosi/nosi/r2_decode_body.py nosi/nosi/r2_positional_twin.py \
          nosi/nosi/r2_spec_core.py nosi/nosi/stage1_seqused.py nosi/nosi/max_pooling_per_request.py \
          nosi/nosi/r2_residency.py nosi/nosi/r2_residency_sb.py nosi/nosi/r2_residency_sc.py \
-         nosi/nosi/r2_residency_sparse.py nosi/nosi/r2_own2.py nosi/nosi/r2_own2_ops.py \
+         nosi/nosi/r2_residency_sparse.py nosi/nosi/r2_own2.py nosi/nosi/r2_own2_ops.py nosi/nosi/r2_twin_fused.py \
          nosi/nosi/r2_transport_gilfree.py nosi/nosi/kstep/ownership.py nosi/nosi/kstep/transfer.py; do
     git -C "$NOSI" rev-parse -q --verify "$NSHA:$f" > /dev/null || stop "$f is not tracked at $NSHA"
 done
@@ -191,7 +211,7 @@ ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) sr
       --workload "$WL" --biattn "$ATTN_MOD" --gilfree "$GF_DIR" --gilfree-build "$JIT/gilfree_build"
       --threads "$THREADS" --transport "$TRANSPORT" --batch 64 --S 16128 --steps 48 --K 3 --LAMBDA 7 --modes "$MODES"
       --backends "$BACKENDS" --C "$PC" --X "$PX" --R-ver "$PRV" "${SWEEPARG[@]}" --sweep-steps 24 --draft-ticks 12 --shipped-steps 24
-      --pool-baseline --preflight-steps 4)
+      --pool-baseline --preflight-steps 4 "${VARIANTARG[@]}")
 if [ "$DRY" = 1 ]; then
     echo "R2 SG5 step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob workload $WL_SHA gpu_uuid $GPU_UUID ($UFILE)"
     echo "R2 SG5 step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; packer $GF_SHA:$GF_PY blob $GF_PY_BLOB, $GF_CPP blob $GF_CPP_BLOB -> $GF_DIR; transport $TRANSPORT; cell ${CELL:-default}"
@@ -230,9 +250,9 @@ printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/comman
 printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s workload=%s utc_start=%s\n' "$NSHA" \
     "$blob" "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "$WL_SHA" "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
     stop "cannot write $REC (sg5_active stays)"
-printf 'biattn=%s:%s blob=%s packer=%s py=%s cpp=%s threads=%s transport=%s sweep=%s splits=%s cell=%s modes=%s backends=%s C=%s X=%s R_ver=%s eq_pool=%s\n' \
+printf 'biattn=%s:%s blob=%s packer=%s py=%s cpp=%s threads=%s transport=%s sweep=%s splits=%s cell=%s modes=%s backends=%s C=%s X=%s R_ver=%s eq_pool=%s variants=%s\n' \
     "$BIATTN_SHA" "$BIATTN_PATH" "$BIATTN_BLOB" "$GF_SHA" "$GF_PY_BLOB" "$GF_CPP_BLOB" "$THREADS" "$TRANSPORT" \
-    "${SWEEP_RUN:-none}" "$SPLITS" "${CELL:-default}" "$MODES" "$BACKENDS" "$PC" "$PX" "$PRV" "$EQ_POOL" \
+    "${SWEEP_RUN:-none}" "$SPLITS" "${CELL:-default}" "$MODES" "$BACKENDS" "$PC" "$PX" "$PRV" "$EQ_POOL" "${VARIANTS:-none}" \
     >> "$REC/command.txt" ||
     stop "cannot write $REC (sg5_active stays)"
 "${ARGV[@]}" < /dev/null > "$REC/stdout.txt" 2> "$REC/stderr.txt"

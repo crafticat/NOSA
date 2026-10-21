@@ -97,6 +97,10 @@ def parse_args(argv):
                     help="PREFLIGHT: a short round per backend and transport before the long arms (0: none)")
     ap.add_argument("--twin", default="torch", choices=("torch", "fused"),                       # [twin-variant]
                     help="the twins' unchecked step: torch ops (default) or r2_twin_fused (one kernel per layer)")
+    ap.add_argument("--variants", default="",                                                    # [batched-rebuild]
+                    help="twin/rebuild,... (twin torch|fused, rebuild per_call|batched): one arm per variant at every "
+                         "(mode, backend), labelled SG5_<mode>_<backend>_<twin>_<rebuild>; empty (the default): "
+                         "the one variant --twin/per_call with p3's labels")
     ap.add_argument("--b2-checked", action="store_true",                                         # [b2]
                     help="b2: every B2 predicate (checked mode); default: unchecked (the timed path)")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
@@ -116,7 +120,34 @@ def parse_args(argv):
         ap.error("m_fix >= (1 + K) B, C >= 1, 0 <= R_ver <= X")
     if a.S < 64 * 64 or a.steps < 4 or a.draft_ticks < 2 or a.shipped_steps < 2:
         ap.error("S >= 4096, steps >= 4, draft-ticks >= 2, shipped-steps >= 2")
+    a.variant_list = parse_variants(a.variants, a.twin)                                          # [batched-rebuild]
+    if a.variant_list is None:                                                                   # [batched-rebuild]
+        ap.error("--variants: twin/rebuild,... with twin in torch|fused and rebuild in per_call|batched, distinct")
+    a.rebuild = a.variant_list[0][1]                                                             # [batched-rebuild]
     return a
+
+
+def parse_variants(text, twin):                                                                 # [batched-rebuild]
+    """[batched-rebuild] --variants -> [(twin, rebuild)]; "" -> [(twin, "per_call")] (p3's arm, its labels unchanged);
+    None for a malformed list (an unknown twin or rebuild, a duplicate, an empty item)."""
+    if not text:
+        return [(twin, "per_call")]
+    out = []
+    for item in text.split(","):
+        parts = item.split("/")
+        if len(parts) != 2 or parts[0] not in ("torch", "fused") or parts[1] not in ("per_call", "batched"):
+            return None
+        if tuple(parts) in out:
+            return None
+        out.append(tuple(parts))
+    return out
+
+
+def variant_label(a, mode, kind, variant):                                                       # [batched-rebuild]
+    """[batched-rebuild] the point's label: p3's SG5_<mode>_<backend> without --variants, else with _<twin>_<rebuild>."""
+    if not a.variants:
+        return "SG5_%s_%s" % (mode, kind)
+    return "SG5_%s_%s_%s_%s" % (mode, kind, variant[0], variant[1])
 
 
 def stats(xs):
@@ -287,6 +318,7 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
     from nosi.r2_tick import ResidencyBackend, TickEngine, TickTimer
     from nosi.r2_transport_gilfree import GilfreeTransport
     eng = TickEngine.from_r2(model, cache, st, ops, hist_slots=C + X, twin=a.twin)               # [twin-variant]
+    eng.rebuild = getattr(a, "rebuild", "per_call")         # [batched-rebuild] the arm's rebuild (parse_variants checks)
     B, L, H = eng.B, eng.L, eng.H
     host_k = [lay.cache_engine._k_cpu for lay in cache.layers]
     host_v = [lay.cache_engine._v_cpu for lay in cache.layers]
@@ -616,6 +648,9 @@ def main(argv=None) -> int:
             meta["gilfree_openmp"] = int(getattr(ext, "OPENMP", 0))
         meta["transport"] = a.transport
         meta["twin"] = a.twin                                                                  # [twin-variant]
+        if a.variants:                                                                         # [batched-rebuild]
+            meta["variants"] = ["%s/%s" % v for v in a.variant_list]                            # [batched-rebuild]
+        a.twin, a.rebuild = a.variant_list[0]           # [batched-rebuild] the preflight / sweep arms: the first one
         t0 = time.time()
         model = Llama(model_name=a.model, device="cuda", offload=True)
         log("model loaded in %.0f s" % (time.time() - t0))
@@ -638,17 +673,22 @@ def main(argv=None) -> int:
             for mode in a.modes:
                 ops = BIOps(attn, a.m_fix, gemm=mode)
                 for kind in backends:
-                    label = "SG5_%s_%s" % (mode, kind)
-                    log("%s at C %d X %d R_ver %d" % (label, a.C, a.X, a.R_ver))
-                    try:
-                        res["points"].append(one_point(a, model, cache, st, first, ops, kind, a.C, a.X, a.R_ver, ext,
-                                                       a.steps, T_shipped, gates, label, bare=a.bare))
-                    except Exception as e:
-                        traceback.print_exc()
-                        gates.append(GB.gate(label + "_completed", False, True, "EXCEPTION %s: %s"
-                                             % (type(e).__name__, str(e)[:400])))
-                    GB.free()
-                    save()
+                    for variant in a.variant_list:                                             # [batched-rebuild]
+                        a.twin, a.rebuild = variant                                            # [batched-rebuild]
+                        label = variant_label(a, mode, kind, variant)                          # [batched-rebuild]
+                        log("%s at C %d X %d R_ver %d" % (label, a.C, a.X, a.R_ver))
+                        try:
+                            pt = one_point(a, model, cache, st, first, ops, kind, a.C, a.X, a.R_ver, ext, a.steps,
+                                           T_shipped, gates, label, bare=a.bare)
+                            pt["twin"], pt["rebuild"] = variant                                # [batched-rebuild]
+                            res["points"].append(pt)
+                        except Exception as e:
+                            traceback.print_exc()
+                            gates.append(GB.gate(label + "_completed", False, True, "EXCEPTION %s: %s"
+                                                 % (type(e).__name__, str(e)[:400])))
+                        GB.free()
+                        save()
+            a.twin, a.rebuild = a.variant_list[0]                                              # [batched-rebuild]
             run_sweep(a, lambda: BIOps(attn, a.m_fix, gemm=a.modes[0]), backends, gates, res, save,
                       lambda ops, kind, C, X, R_ver, label: one_point(a, model, cache, st, first, ops, kind, C, X, R_ver,
                                                                       ext, a.sweep_steps, T_shipped, gates, label))
