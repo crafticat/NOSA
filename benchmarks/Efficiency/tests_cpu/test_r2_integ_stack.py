@@ -849,6 +849,43 @@ def test_ST11_time_cells_have_no_diagnostics_and_cite_their_validation(tmp_path)
     assert "_check_cache_layout(cache, name)" in seg and "int(t" not in seg
 
 
+def test_ST12_the_pool_only_base_for_b128():
+    """[integ6] BIGB_128_DIAG.md: at B 128 X must be sized (896), and no per-stream store fits at X 896, so
+    stack1a128's base arms are only-layout (the pool layout, every other component OFF): stack_values, the parse rules,
+    and one_point_stacks' arms (a stand-in point records each arm's configuration)."""
+    G = TT._sg5_gate()
+    v = G.stack_values("only-layout")
+    assert (v["layout"], v["twin"], v["stack_rebuild"], v["b2_resolve"], v["attn"], v["gilfree_warm_up"]) == (
+        "pool", "torch", "per_call", "torch", "per_row", "off")
+    assert G.stack_values("only-twin")["twin"] == "fused" and G.stack_values("only-twin")["layout"] == "stream"
+    with pytest.raises(ValueError):
+        G.stack_values("only-bogus")
+    base = BASE + ["--backends", "b2", "--C", "96", "--X", "896", "--R-ver", "848", "--X-pool", "896", "--batch",
+                   "128", "--repeat-docs", "--stack", "full", "--stack-compare", "--arrival-lag", "2", "--sel-check"]
+    a = G.parse_args(base + ["--stack-base", "only-layout"])
+    assert a.stack_base == "only-layout" and a.X_pool == a.X == 896
+    point_args = BASE + ["--backends", "b2", "--C", "96", "--X", "896", "--R-ver", "848", "--batch", "128",
+                         "--repeat-docs"]
+    with pytest.raises(SystemExit):                                     # the base needs a pool-layout stack
+        G.parse_args(point_args + ["--stack", "full-no-layout", "--stack-compare", "--arrival-lag", "2",
+                                   "--sel-check", "--stack-base", "only-layout"])
+    with pytest.raises(SystemExit):                                     # --stack-base needs --stack-compare
+        G.parse_args(BASE + ["--backends", "b2", "--stack", "full", "--sel-check", "--stack-base", "only-layout"])
+    seen = []
+
+    def point(aa, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_shipped, gates, label, bare=False,
+              layout=None, fp=None):
+        seen.append((label.rsplit("_", 1)[1], aa.stack_applied, layout, aa.twin, aa.attn))
+        for t in range(2):
+            fp.append(([(0, "v", t)], torch.tensor([t], dtype=torch.int64)))
+        return dict(backend=kind, T_tick_ms=100.0, committed_tokens=[[1]])
+    gates = []
+    G.one_point_stacks(a, None, None, None, None, lambda aa: None, "b2", 96, 896, 848, None, 48, None, gates, "L",
+                       point_fn=point)
+    assert seen == [("none", "only-layout", "pool", "torch", "per_row"), ("stack", "full", "pool", "fused", "shared"),
+                    ("none2", "only-layout", "pool", "torch", "per_row")], seen
+
+
 def test_ST7_one_point_stacks_gates_with_a_stand_in():
     G = TT._sg5_gate()
 
@@ -908,7 +945,7 @@ def test_ST8_the_step_cells_stack1(tmp_path):
                 assert word not in ln, (word, ln)
     lines = text.splitlines()
     root = next(ln for ln in lines if ln.startswith("NOSI_INTEG=")).split()[0][len("NOSI_INTEG="):]
-    assert root == "/mnt/beegfs/ojerbi/nosi-r2-integ5"                      # [integ5] the stack cells' ROOT
+    assert root == "/mnt/beegfs/ojerbi/nosi-r2-integ6"                      # [integ6] the stack cells' ROOT
     # [integ3] M3: the combined cell's order and its stop rules (static; a DRYRUN of it would recurse)
     blk = text[text.index('if [ "$CELL" = stack1 ]; then'):text.index("MODES=exact,fast")]
     order = [blk.index(s) for s in ("sub stack1a\n", 'sub "stack1n-$c"', "sub stack1a128", "sub stack1p",
@@ -938,8 +975,10 @@ def test_ST8_the_step_cells_stack1(tmp_path):
     timing = "--stack-role time --arrival-lag 2 --bare --free-arm --validated-by "
     want = {"stack1a": (["--stack full " + cmp_args, "--batch 64", "--C 96 ", "--mem=120G"],
                         ["--pool-baseline", "--shared-unchecked", "--stack-bands", "--stack-role time"]),
-            "stack1a128": (["--stack full " + cmp_args + " --repeat-docs --log-slots -1", "--batch 128", "--C 96 ",
-                            "--mem=200G"], ["--pool-baseline", "--shared-unchecked", "--stack-bands"]),
+            "stack1a128": (["--stack full --stack-compare --stack-base only-layout --X-pool 896 --arrival-lag 2 "
+                            "--sel-check --require-xregion --stack-role validate --repeat-docs --log-slots -1",
+                            "--batch 128", "--C 96 ", "--mem=200G"],
+                           ["--pool-baseline", "--shared-unchecked", "--stack-bands"]),          # [integ6] X sized
             "stack1p": (["--stack full " + cmp_args, "--batch 64", "--C 80 ", "--mem=120G"],
                         ["--pool-baseline", "--shared-unchecked", "--stack-bands"]),
             "stack1n-layout": (["--stack full-no-layout --stack-compare --arrival-lag 2 --sel-check --stack-role "
@@ -948,8 +987,8 @@ def test_ST8_the_step_cells_stack1(tmp_path):
             "stack1t": (["--stack full --X-pool 64 --shared-unchecked " + timing + sa + " --stack-bands 33:36:200:500",
                          "--batch 64", "--C 96 ", "--pool-baseline", "--mem=120G"],
                         ["--stack-compare", "--sel-check", "--require-xregion", "--stack-role validate"]),
-            "stack1b": (["--stack full --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1 "
-                         + timing + sa + "," + sa128, "--batch 216", "--mem=240G"],
+            "stack1b": (["--stack full --X-pool 1344 --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1 "
+                         + timing + sa + "," + sa128, "--batch 192", "--mem=240G"],                 # [integ6] B 192
                         ["--pool-baseline", "--stack-compare", "--skip-shipped", "--sel-check"])}   # [integ5]
     for c in ("twin", "rebuild", "resolve", "attn", "warmup"):                                  # [integ3] M1
         want["stack1n-" + c] = (["--stack full-no-%s %s" % (c, cmp_args), "--batch 64", "--C 96 "],
@@ -962,13 +1001,14 @@ def test_ST8_the_step_cells_stack1(tmp_path):
             pytest.skip("DRYRUN stopped outside the stack cells' ROOT: %s" % r.stderr.strip()[-200:])
         line = r.stdout.strip().splitlines()[-1]
         got = line.split("r2_tick_sg5.py ", 1)[1].strip().replace("\\,", ",")
-        for w in has + ["--modes exact --backends b2", "--X 64 --R-ver 16", "--steps 48",
-                        "PYTHONPATH=/mnt/beegfs/ojerbi/nosi-r2-integ5/nosi"]:
+        xr = {"stack1a128": "--X 896 --R-ver 848", "stack1b": "--X 1344 --R-ver 1296"}.get(cell, "--X 64 --R-ver 16")
+        for w in has + ["--modes exact --backends b2", xr, "--steps 48",
+                        "PYTHONPATH=/mnt/beegfs/ojerbi/nosi-r2-integ6/nosi"]:
             assert w in got or w in line, (cell, w)
         for w in hasnt + ["--sweep ", "--variants", "--b2-checked", "--layout both"]:
             assert w not in got, (cell, w)
         assert "--job-name=sg5-t1-418-%s " % cell.replace("_", "-") in r.stdout and "cell %s" % cell in r.stdout
-        assert "[integ] root /mnt/beegfs/ojerbi/nosi-r2-integ5," in r.stdout
+        assert "[integ] root /mnt/beegfs/ojerbi/nosi-r2-integ6," in r.stdout
         pa = G.parse_args(got.split())
         assert pa.backends == ["b2"], cell
         if cell == "stack1n-layout":
@@ -976,15 +1016,17 @@ def test_ST8_the_step_cells_stack1(tmp_path):
         elif cell.startswith("stack1n-"):
             assert pa.stack == "full-no-" + cell[len("stack1n-"):] and pa.layout == "pool" and pa.require_xregion
         else:
-            assert pa.stack == "full" and pa.X_pool == 64 and pa.layout == "pool"
+            assert pa.stack == "full" and pa.X_pool == pa.X and pa.layout == "pool"
         if cell == "stack1b":                                             # [integ2] bigb's token log, sized
-            assert pa.batch == 216 and pa.log_slots == -1 and pa.log_slots_n is not None
+            assert pa.batch == 192 and pa.log_slots == -1 and pa.log_slots_n is not None     # [integ6] B 192
+            assert (pa.X, pa.X_pool, pa.R_ver) == (1344, 1344, 1296)
             assert pa.validated_by == sa + "," + sa128 and pa.stack_role == "time"   # [integ5]
         if cell == "stack1t":                                             # [integ3] M3; [integ5] lag-2 bare headline
             assert pa.stack_bands_v == [33.0, 36.0, 200.0, 500.0]
             assert (pa.stack_role, pa.arrival_lag, pa.bare, pa.free_arm, pa.validated_by) == ("time", 2, True, True, sa)
         if cell == "stack1a128":
             assert pa.batch == 128 and pa.stack_role == "validate" and pa.stack_compare
+            assert (pa.X, pa.X_pool, pa.R_ver, pa.stack_base) == (896, 896, 848, "only-layout")      # [integ6]
     for bad in (("stack1a", "stack1b"), ("stack1", "stack1a"), ("stack1c",), ("stack1n-bogus",), ("stack1a256",)):
         rb = subprocess.run(["bash", str(script), "--nosi", head.stdout.strip(), "418", "t1", *bad], env=env,
                             capture_output=True, text=True, timeout=120)

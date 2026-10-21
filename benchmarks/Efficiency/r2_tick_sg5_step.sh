@@ -46,13 +46,14 @@
 #            Its ROOT is NOSI_X1 (nosi-r2-xpool); every other cell keeps NOSI (review m8)
 #   stack1a  [integ] THE FULL STACK (docs/R2_INTEG_PLAN.md) at p5b2's point, EXACT, B 64: --stack full --stack-compare
 #            --X-pool 64 --arrival-lag 2 --sel-check (arms none, full, none2; MUST _ST_replica / _ST_committed /
-#            _ST_bitwise), no --pool-baseline. ROOT NOSI_INTEG (nosi-r2-integ5 since integ5), as every stack1* cell.
+#            _ST_bitwise), no --pool-baseline. ROOT NOSI_INTEG (nosi-r2-integ6 since integ6), as every stack1* cell.
 #            [integ3] + --require-xregion; per arm MUST _ST_acted_<c> / _ST_off_<c> and _ST_xregion (review M2)
 #            [integ5] + --stack-role validate (the diagnostic witnesses ON)
 #   stack1a128 [integ5] stack1a at B 128 (--repeat-docs, --log-slots -1, --mem 200G): required before stack1b. Its
 #            none arms are per-stream (bigb model at B 128, C 96: pool 51.78 GB, per-stream about 69 GB, one engine
 #            at a time); a B 216 comparison does not fit (per-stream about 104 GB), so stack1b is validated at B 64
-#            and B 128, NOT at 216
+#            and B 128, NOT at 216. [integ6] SUPERSEDED: X = X_pool 896, R_ver 848 and the base arms only-layout
+#            (pool layout; no per-stream store fits at X 896); stack1b is B 192 (see the integ6 block below)
 #   [integ5] THE TIME CELLS (stack1t, stack1b), the lead's decisions of 2026-10-21: the HEADLINE arm runs the
 #            validated schedule (--arrival-lag 2) with --bare (tick events only), the instrumented round of the same
 #            arm gives the category split; --stack-role time turns the diagnostic witnesses OFF (MUST
@@ -78,6 +79,8 @@
 #            B 264 of integ e869342 is 89 GB in that model: it would not fit): --stack full --X-pool 64
 #            --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1, --mem=240G (about 116 GB pinned host
 #            rows + 17 GiB base; the holder has 480G). The same B as bigb96-216 (the stack OFF there). R2_INTEG_PLAN 5.4
+#            [integ6] SUPERSEDED: X 64 refuses at B >= 128 (BIGB_128_DIAG.md); stack1b is B 192, X = X_pool 1344,
+#            R_ver 1296 (pinned host rows 102.9 GB + base: --mem=240G)
 #   bigb81-128 | bigb81-244 | bigb96-128 | bigb96-216
 #            [bigb] LARGE B on the SHARED POOL layout (docs/R2_BIGB_PLAN.md section 4; bigb_core.cell_plan): C 81 or
 #            96, B 128 (the stepping stone) or B_max (the largest B whose MODEL peak <= 76 GB: 244 at C 81, 216 at
@@ -123,6 +126,17 @@
 # 33:36:200:500. The free-arrival arm and the instrumented category split are REPORT. stack1a128 MUST the same gates
 # as stack1a at B 128. stack1b: headline lag 2 --bare, bands as integ2 (peak 74-78 GB, T_tick 0.6-1.2 s, REPORT),
 # labelled "validated at B 64 and B 128, not at 216".
+# REVISED in integ6 (2026-10-21T14:33:33Z, before any stack1 run; analysis/bigb/BIGB_128_DIAG.md: bigb96-128 at
+# X 64 refused in the preflight, K5's X per layer is shared by B x H streams): stack1a128 runs C 96, X = X_pool 896,
+# R_ver 848 (the diagnosis's P2), base arms --stack-base only-layout (the pool layout, every other component OFF):
+# the per-stream store at X 896 is (96 + 896 + 4) x 2,105,344 B x 128 = 268 GB, so no per-stream reference exists at
+# B 128; the pool's equality to the per-stream layout is validated at B 64 (stack1a, x1). MUST: the three ST gates,
+# SKV_ran, acted / off, xregion, bookkeeping; peak 53.5-56 GB (bigb model 54.45 + the measured +0.105 offset).
+# stack1b moves to B 192, C 96, X = X_pool 1344, R_ver 1296 (X = 7 per request, the diagnosis's sizing; draft share
+# 48): bigb model peak(B, X 64) 51.78 + 0.27398 (B - 128) = 69.31 GB, + (1344 - 64) x (2,105,408 + 8,576 B) B =
+# 4.80 GB: 74.11 GB <= 76 (B 196: 75.5; B 200: 76.6 > 76; B 216 with X 1512: 81.6). Headline lag 2 --bare: peak
+# 73-76 GB, T_tick 0.5-1.2 s (B 64's terms x 3), tok_per_s 140-335, REPORT; labelled "validated at B 64 (per-stream
+# reference) and B 128 (pool-only reference), not at 192". Gated on stack1a and stack1a128 (--validated-by).
 #
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
@@ -196,7 +210,7 @@
 set -u
 NOSI=/mnt/beegfs/ojerbi/nosi-r2-sg5-p6                                                   # ROOT (p6; [b2] p5b2: nosi-r2-m2-sg5-b2; p4sc64: -p4d; p4a: -p4c; p3: nosi-r2-m2-sg5)
 NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                                 # ROOT of cell x1 only ([xpool], review m8)
-NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-integ5                                             # ROOT of the stack1 cells only ([integ], integ5)
+NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-integ6                                             # ROOT of the stack1 cells only ([integ], integ6)
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
@@ -332,10 +346,10 @@ case $CELL in
     stack1a) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1a ; NOSI=$NOSI_INTEG ; POOLB=()
              STACKARG=(--stack full --stack-compare --X-pool 64 --arrival-lag 2 --sel-check --require-xregion
                        --stack-role validate) ;;
-    stack1a128) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1a128 ; NOSI=$NOSI_INTEG ; POOLB=()
-             BATCH=128 ; MEMG=200G                                                                  # [integ5] B 128
-             STACKARG=(--stack full --stack-compare --X-pool 64 --arrival-lag 2 --sel-check --require-xregion
-                       --stack-role validate --repeat-docs --log-slots -1) ;;
+    stack1a128) MODES=exact ; BACKENDS=b2 ; PX=896 ; PRV=848 ; SWEEP_RUN= ; SUFFIX=_stack1a128 ; NOSI=$NOSI_INTEG
+             POOLB=() ; BATCH=128 ; MEMG=200G                        # [integ6] X sized (BIGB_128_DIAG P2: X 64 refused)
+             STACKARG=(--stack full --stack-compare --stack-base only-layout --X-pool 896 --arrival-lag 2 --sel-check
+                       --require-xregion --stack-role validate --repeat-docs --log-slots -1) ;;
     stack1p) MODES=exact ; BACKENDS=b2 ; PC=80 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1p ; NOSI=$NOSI_INTEG ; POOLB=()
              STACKARG=(--stack full --stack-compare --X-pool 64 --arrival-lag 2 --sel-check --require-xregion
                        --stack-role validate) ;;
@@ -349,9 +363,9 @@ case $CELL in
              STACKARG=(--stack full --X-pool 64 --shared-unchecked --stack-role time --arrival-lag 2 --bare   # headline
                        --free-arm --validated-by "$OUTROOT/sg5_${RUN}_${JOB}_stack1a/summary.json"   # = stack1a's
                        --stack-bands 33:36:200:500) ;;                                              # validated path
-    stack1b) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1b ; NOSI=$NOSI_INTEG ; POOLB=()
-             BATCH=216 ; MEMG=240G                                                                  # [integ2] B 216
-             STACKARG=(--stack full --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1
+    stack1b) MODES=exact ; BACKENDS=b2 ; PX=1344 ; PRV=1296 ; SWEEP_RUN= ; SUFFIX=_stack1b ; NOSI=$NOSI_INTEG
+             POOLB=() ; BATCH=192 ; MEMG=240G                         # [integ6] B 192, X sized 7 per request
+             STACKARG=(--stack full --X-pool 1344 --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1
                        --stack-role time --arrival-lag 2 --bare --free-arm                          # [integ5]
                        --validated-by "$OUTROOT/sg5_${RUN}_${JOB}_stack1a/summary.json,$OUTROOT/sg5_${RUN}_${JOB}_stack1a128/summary.json") ;;
     bigb*) MODES=exact ; BACKENDS=b2 ; PX=64 ; PRV=16 ; SWEEP_RUN= ; SUFFIX=_${CELL//-/_} ; NOSI=$NOSI_BIGB   # [bigb]

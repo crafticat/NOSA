@@ -239,6 +239,33 @@ dd15c93); NOSI_INTEG points here.
 - The L28 stride check moved into a helper (`_check_cache_layout`) outside the linted launcher (job 2191357:
   test_shared_source_keeps_piece3_constants_and_no_host_read forbids "int(t" in the launcher); the lint is unchanged.
 
+### 5.4e integ6 (2026-10-21T14:33:33Z, before any stack1 run): X sized for B >= 128
+
+Basis: analysis/bigb/BIGB_128_DIAG.md (bigb96-128 at X 64 refused in the preflight: K5's X is PER LAYER and shared
+by B x H streams; the verify working set needs about 7 extras per request at C 96). Branch r2-integ6
+(/mnt/beegfs/ojerbi/nosi-r2-integ6, from integ5 4b1d9db); NOSI_INTEG points here.
+- stack1a128: C 96, X = X_pool 896, R_ver 848 (the diagnosis's P2; draft share 48). Memory (bigb model): the stack
+  arm 51.78 GB at X 64 + 832 x 3,203,136 B = 2.665 GB: 54.45 GB (the diagnosis's 54.55 with the measured +0.105
+  offset). The per-stream none arm at X 896 needs (96 + 896 + 4) x 2,105,344 B x 128 = 268 GB of store: it cannot be
+  built. So the base arms are `--stack-base only-layout` (new: the pool layout ON, every other component OFF, same
+  X / R_ver / B: the same decisions as the stack arm, so the bitwise comparison stays exact). The pool layout's own
+  equality to the per-stream layout is validated at B 64 (stack1a, x1), not at B 128. Same-memory note: the base arms
+  hold the same store as the stack arm (an equal-memory pair by construction).
+- stack1b: the largest B at C 96 with X sized at the measured demand (7 per request, a multiple of 64) whose bigb
+  MODEL peak fits 76 GB. peak(B, X) = 51.78 + 0.27398 (B - 128) + (X - 64) x (2,105,408 + 8,576 B) B / 1e9:
+  B 192, X 1344: 69.31 + 4.80 = 74.11 GB (fits); B 196 (X 1408): 75.50; B 200 (X 1408): 76.64 (no); B 216
+  (X 1512): 81.6 (no). Chosen: B 192, X = X_pool 1344, R_ver 1296 (round, 1.9 GB margin). bigb2's plan
+  (/mnt/beegfs/ojerbi/nosi-r2-bigb2/docs/R2_BIGB_PLAN.md) did not exist at this writing: the number must be
+  reconciled with it when it lands. Host: pinned rows 192 x 16352 x 512 B x 2 x 32 = 102.9 GB + base; --mem=240G.
+- stack1b is gated on stack1a and stack1a128 (--validated-by) and labelled "validated at B 64 (per-stream reference)
+  and B 128 (pool-only reference), not at 192".
+- REGISTERED (re-registered with this timestamp): stack1a128 MUST the three ST gates, SKV_ran, acted / off, xregion,
+  bookkeeping; peak 53.5-56 GB. stack1b headline (lag 2, bare): peak 73-76 GB, T_tick 0.5-1.2 s (B 64's terms x 3:
+  twin 6-18 ms, res 25-120 ms, end_tick 0.36-0.49 s, REST 0.05-0.25 s, device 120-180 ms), tok_per_s 140-335; r
+  REPORT (the draft share 48 over 384 streams: more draft refusals than at B 64).
+- Rule record: in integ5's round the agent ran one shell command with `cat >> /dev/null </dev/null` (a redirect, no
+  file written); recorded by the lead.
+
 ### 5.5 Falsifiers (each stops the claim it names)
 
 - F-ST1 any stack1a MUST fails (with the replica passed): a component changes numbers on the GPU when combined; the

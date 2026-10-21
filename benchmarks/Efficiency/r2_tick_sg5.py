@@ -93,6 +93,7 @@ STACK_OFF = dict(twin=dict(twin="torch"), rebuild=dict(rebuild="per_call"), reso
                  layout=dict(layout="stream"), attn=dict(attn="per_row", union="torch"),
                  warmup=dict(gilfree_warm_up="off"))
 STACK_CHOICES = ("", "none", "full") + tuple("full-no-" + c for c in STACK_COMPONENTS)
+STACK_BASES = ("none",) + tuple("only-" + c for c in STACK_COMPONENTS)   # [integ6] --stack-compare's base arms
 # the flags a stack sets: each must be at its parse default when --stack is given (never silently overridden)
 STACK_FLAG_DEFAULTS = dict(twin="torch", variants="", b2_resolve="torch", layout="stream", attn="per_row",
                            union="torch", gilfree_warm_up="on")
@@ -179,6 +180,10 @@ def parse_args(argv):
                     help="a preset of the gap-closing builds (docs/R2_INTEG_PLAN.md): full = twin fused, rebuild "
                          "batched, b2 resolve fused, layout pool (X_pool from --X-pool), attn shared split + union "
                          "fused, gilfree warm-up; full-no-<c> = full minus one component; none = every one OFF")
+    ap.add_argument("--stack-base", default="none", choices=STACK_BASES,                        # [integ6]
+                    help="--stack-compare's base arms (none and none2): none = every component OFF (the default); "
+                         "only-<c> = only component c ON (only-layout: the pool layout as the reference where the "
+                         "per-stream store cannot be built, e.g. X 896 at B 128)")
     ap.add_argument("--stack-compare", action="store_true",                                      # [integ]
                     help="three arms per point: none (every component OFF), the --stack arm, none again (the "
                          "replica); MUST gates <label>_ST_replica / _ST_committed / _ST_bitwise (needs "
@@ -269,6 +274,10 @@ def parse_args(argv):
         ap.error("--require-xregion needs a --stack with the pool layout")
     if a.stack_role and not a.stack:                                                             # [integ5]
         ap.error("--stack-role needs --stack")
+    if a.stack_base != "none" and not a.stack_compare:                                          # [integ6]
+        ap.error("--stack-base needs --stack-compare")
+    if a.stack_base == "only-layout" and a.layout != "pool":
+        ap.error("--stack-base only-layout compares pool-layout arms: the --stack must keep the pool layout")
     if a.stack_role == "validate" and not a.stack_compare:
         ap.error("--stack-role validate needs --stack-compare")
     if a.stack_role == "time":
@@ -334,6 +343,8 @@ def stack_values(name):                                                         
         on = set(STACK_COMPONENTS)
     elif name.startswith("full-no-") and name[len("full-no-"):] in STACK_COMPONENTS:
         on = set(STACK_COMPONENTS) - {name[len("full-no-"):]}
+    elif name.startswith("only-") and name[len("only-"):] in STACK_COMPONENTS:      # [integ6] one component ON
+        on = {name[len("only-"):]}
     else:
         raise ValueError("stack %r (one of %s)" % (name, STACK_CHOICES[1:]))
     out = {}
@@ -1206,7 +1217,8 @@ def one_point_stacks(a, model, cache, st, first, ops_for, kind, C, X, R_ver, ext
     import torch
     point_fn = point_fn or one_point
     out, recs = {}, {}
-    for arm, name in (("none", "none"), ("stack", a.stack), ("none2", "none")):
+    base = getattr(a, "stack_base", "none") or "none"                   # [integ6] the base arms' stack
+    for arm, name in (("none", base), ("stack", a.stack), ("none2", base)):
         aa = stack_args(a, name)
         fp = []
         info = point_fn(aa, model, cache, st, first, ops_for(aa), kind, C, X, R_ver, ext, steps, T_shipped, gates,
@@ -1423,6 +1435,7 @@ def main(argv=None) -> int:
                     sel_check=a.sel_check, shared_unchecked=a.shared_unchecked, gilfree_warm_up=a.gilfree_warm_up,
                     b2_resolve=a.b2_resolve, shipped_batch=a.shipped_batch or a.batch,
                     sharedkv=a.sharedkv if a.attn != "per_row" else None)
+        meta.update(stack_base=a.stack_base if a.stack_compare else None)                        # [integ6]
         meta.update(stack_role=a.stack_role or None, validated_by=validated, free_arm=a.free_arm,   # [integ5]
                     witness=witness_on(a), validated_note=(None if a.stack_role != "time" else
                     "bitwise equality proven at the validated cells' B and lag only (see validated_by)"))
