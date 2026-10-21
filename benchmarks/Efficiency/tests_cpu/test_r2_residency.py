@@ -1519,6 +1519,38 @@ def test_F19_the_exact_wait_host_waits_the_submission_first():
     assert not runner.is_alive() and ops2.submission_waits == 1
 
 
+def test_F19b_a_transport_that_submits_without_the_gil_needs_no_submission_wait():
+    """F19b (Q-C2, E's C++ feeder worker: GilfreeTransport(..., worker="cpp") sets submits_without_gil): with such a
+    transport _submitted(l) returns at once, even for a layer-0 pack that is never submitted (the main thread cannot
+    block that worker; the exact spin with its bounded err is the guard), and waits for nothing. Negative control: the
+    same never-submitted pack with a transport without the attribute (or with it False) keeps _submitted(0) blocked."""
+    def ops_with(trs, tp):
+        ops = object.__new__(SC.CudaDeviceOps)                 # the host part only: no CUDA object is built
+        ops.svc = types.SimpleNamespace(inflight={tr.seq: tr for tr in trs}, tp=tp)
+        ops.submission_waits = 0
+        return ops
+
+    def stuck_tr():
+        t = TR.Transfer(1, "u0", 0, 0, 0, 1, 1, 1, "draft", ("u0", 1, 1))
+        t.payload, t.ev = threading.Event(), None              # queued, never submitted
+        return t
+    ops = ops_with([stuck_tr()], types.SimpleNamespace(submits_without_gil=True))
+    runner = threading.Thread(target=ops._submitted, args=(0,), daemon=True)
+    runner.start()
+    runner.join(timeout=5)
+    assert not runner.is_alive() and ops.submission_waits == 0
+    for tp in (types.SimpleNamespace(), types.SimpleNamespace(submits_without_gil=False)):
+        t = stuck_tr()
+        ops2 = ops_with([t], tp)
+        runner = threading.Thread(target=ops2._submitted, args=(0,), daemon=True)
+        runner.start()
+        runner.join(timeout=0.5)
+        assert runner.is_alive()                               # the host wait remains: blocked on the pack
+        t.payload.set()
+        runner.join(timeout=5)
+        assert not runner.is_alive() and ops2.submission_waits == 1
+
+
 # =====================================================================================================================
 # F20 Policy E: the verifier evicts an LRU entry it does not protect (FG2's CapacityRefusal, holder 2190876; note 12h)
 # =====================================================================================================================

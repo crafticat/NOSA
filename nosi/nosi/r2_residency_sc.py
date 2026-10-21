@@ -760,7 +760,12 @@ class CudaDeviceOps:
         """LIVENESS (the eager tick): every transfer in flight at layer l is SUBMITTED before the main stream may wait
         for it. A gilfree pack still queued in the feeder is host-waited for its submission (a threading.Event: the GIL
         is released). Otherwise the main stream could spin on a pack whose feeder needs the GIL while the host thread
-        holds it, blocked in a kernel launch behind the spinning stream. The completion is waited on the device."""
+        holds it, blocked in a kernel launch behind the spinning stream. The completion is waited on the device.
+        A transport that submits without the GIL (submits_without_gil: E's C++ feeder worker, GilfreeTransport(...,
+        worker="cpp"), Q-C2) cannot be blocked by this thread: no host wait at all (the board's bounded spin with err
+        stays the guard)."""
+        if getattr(getattr(self.svc, "tp", None), "submits_without_gil", False):
+            return                  # Q-C2: the C++ worker submits with no GIL; the exact spin cannot block it
         for tr in list(self.svc.inflight.values()):
             if tr.layer == l and tr.ev is None and isinstance(tr.payload, threading.Event):
                 tr.payload.wait()

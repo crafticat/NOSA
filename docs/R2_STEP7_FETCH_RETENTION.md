@@ -761,6 +761,16 @@ TEST F22 (v1 and S-C):
 - Negative control: free timing with the same seeds differs.
 - Also: arrival_lag 0 is refused.
 
+Q-C2, the submission wait (E's C++ feeder worker, feature/nosi-r2-gilfree-worker cdce147):
+- `GilfreeTransport(..., worker="cpp")` sets `submits_without_gil = True`. With such a transport,
+  `CudaDeviceOps._submitted` returns at once. The worker never needs the GIL, so the main thread cannot block it,
+  and the exact spin with its bounded `err` stays the guard.
+- Superset mode keeps its host wait (tr.ev exists only after the release).
+- E's mode-order rule: attach_board must come before the worker's first issue. ResidencySC attaches it in its
+  constructor; a late inference-mode board is refused by E's worker.
+- CPU test F19b: an unsubmitted pack does not block `_submitted` with the attribute. Negative control: without the
+  attribute (or with it False) the host wait remains.
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,
