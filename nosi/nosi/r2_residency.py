@@ -21,7 +21,9 @@ ONE LAYER (resolve, v1 = host-side per layer, decision D2): the tick passes the 
     requester: the demand is merged and the read WAITS for it), NEW (an URGENT miss: a slot is taken, verifier reserve
     included, and the block is gathered on the main stream before the layer's reads); dispatcher.py:2568-2589, :2492.
     When K5 grants the verifier no slot, POLICY E (note 12h) evicts the stream's least recent LRU entry that is
-    unprotected and selected by no row of the layer, and reuses its slot; with no such entry: CapacityRefusal.
+    unprotected and selected by no row of the layer, and reuses its slot; else (note 12j) it supersedes the oldest
+    unprotected in-flight DRAFT prefetch that no row of the layer selects (its write lands first); with neither:
+    CapacityRefusal (with the stream's capacity report).
   draft rows: protect the whole selection, hits included (kind draft); read only the READY blocks (touch / acquire,
     one eviction pass after the row: dispatcher.py:2899-2932); in-flight -> demand merged; a miss -> a background
     DRAFT transfer, deduplicated (one per stream and block), or REFUSED by K5 (counted; the draft continues masked,
@@ -122,10 +124,13 @@ class Residency:
     def __init__(self, L: int, B: int, H: int, C: int, X: int, R_ver: int, transport, urgent_gather: Callable,
                  store_b=None, cis=None, block: int = BLOCK, block_bytes: int = 0, host_wait: Callable = None,
                  mut: Mutations = None, clock: Callable[[], int] = time.perf_counter_ns, poll_in_resolve: bool = True,
-                 defer_issue: bool = False, defer_admit: bool = False, trash_slots: int = 0):
+                 defer_issue: bool = False, defer_admit: bool = False, trash_slots: int = 0,
+                 policy_e_inflight: bool = True):
         if trash_slots not in (0, 1):
             raise ValueError("trash_slots must be 0 or 1 (got %r)" % (trash_slots,))
         self.poll_in_resolve, self.defer_issue = bool(poll_in_resolve), bool(defer_issue)
+        # Policy E's in-flight candidates (note 12j); False is a NEGATIVE CONTROL (12h's rule: LRU entries only)
+        self.policy_e_inflight = bool(policy_e_inflight)
         # defer_admit (the S-C schedule): the verifier's waited and urgent blocks are read in place on the device and
         # admitted at the next poll, never in the middle of a tick
         self.defer_admit = bool(defer_admit)
@@ -274,10 +279,12 @@ class Residency:
         self.store_b[l][b, s0:s0 + self.bs, h].copy_(self.cis[l][b, r0:r0 + self.bs, h], non_blocking=True)
 
     def _verifier_candidates(self, l: int, rows: Sequence[Row], hist) -> Dict[Tuple[int, int], Any]:
-        """POLICY E, the verifier's eviction (note 12h): per stream (b, h) of a verify row of layer l, the LRU entries
-        the verifier may evict when K5 grants it no slot: UNPROTECTED at the start of the layer and selected by NO row
-        of the layer (so no read of this layer uses them), least recent first. Computed once per layer, before any
-        verify protection or take (those touch only selected blocks, so the list stays valid)."""
+        """POLICY E, the verifier's eviction (notes 12h, 12j): per stream (b, h) of a verify row of layer l, what the
+        verifier may evict when K5 grants it no slot, in this order: (1) the LRU entries UNPROTECTED at the start of the
+        layer and selected by NO row of the layer (so no read of this layer uses them), least recent first; (2) the
+        unprotected in-flight DRAFT prefetches that no row of the layer selects, oldest issue first
+        (_inflight_candidates). Items: (kind "lru" | "inflight", block, slot, transfer or None). Computed once per
+        layer, before any verify protection or take (those touch only selected blocks, so the list stays valid)."""
         pool = self.pools[l]
         sel: Dict[Tuple[int, int], Set[int]] = {}
         for i, r in enumerate(rows):
@@ -291,9 +298,64 @@ class Residency:
                 if (r.b, h) in out:
                     continue
                 st = pool.stream(r.b, h)
-                out[(r.b, h)] = deque((blk, idx) for blk, idx in st.lru.items()
-                                      if not st.prot.get(blk) and blk not in sel[(r.b, h)])
+                out[(r.b, h)] = deque([("lru", blk, idx, None) for blk, idx in st.lru.items()
+                                       if not st.prot.get(blk) and blk not in sel[(r.b, h)]]
+                                      + self._inflight_candidates(l, st, sel[(r.b, h)]))
         return out
+
+    def _inflight_candidates(self, l: int, st, sel) -> List[Tuple]:
+        """POLICY E's second kind (note 12j): the stream's in-flight DRAFT prefetches of the current owner that no live
+        cohort protects (their requesters were decided or cancelled) and that no row of the layer selects, in issue
+        order. With a synchronous transport such a prefetch has landed by the next poll and is an unprotected LRU entry
+        (kind 1); with an asynchronous one it still holds its slot. policy_e_inflight=False (NEGATIVE CONTROL, the
+        rule of 12h) leaves them out."""
+        return self._unprotected_prefetches(l, st, sel) if self.policy_e_inflight else []
+
+    def _unprotected_prefetches(self, l: int, st, sel) -> List[Tuple]:
+        out = []
+        for blk, idx in st.pending.items():
+            tr = self._in_flight(l, st.b, st.h, blk)
+            if (tr is None or tr.slot != idx or tr.kind != DRAFT or tr.seq in self._landed or st.prot.get(blk)
+                    or blk in sel or st.slots[idx].state != INFLIGHT):
+                continue
+            out.append(("inflight", blk, idx, tr))
+        return sorted(out, key=lambda c: c[3].seq)
+
+    def _evict_inflight(self, st, l: int, blk: int, idx: int, tr) -> None:
+        """Policy E, an in-flight candidate (note 12j): the draft prefetch of block blk into slot idx is SUPERSEDED.
+        Paper 3.4: storage becomes reusable only after its owners and readers finished; this prefetch's only owner is
+        the transfer itself. So its write completes BEFORE the slot is reused: here (v1, the host) the transport's
+        force if it has not landed; S-C's device waited for it before its urgent gather (the host then finds it
+        landed). The service forgets the transfer (it is never admitted); the slot goes FREE at once."""
+        s = st.slots[idx]
+        if (tr is None or self._in_flight(l, st.b, st.h, blk) is not tr or tr.slot != idx or s.state != INFLIGHT
+                or s.block != blk or st.prot.get(blk) or tr.kind != DRAFT or tr.seq in self._landed):
+            raise OwnershipViolation("verifier eviction: block %d at slot %d of (l %d b %d h %d) is not an unprotected "
+                                     "in-flight draft prefetch" % (blk, idx, l, st.b, st.h))
+        if not self.tp.done(tr):
+            self.tp.force(tr)                                     # the prefetch's write lands first (T3 for writers)
+        self.inflight.pop(tr.seq, None)
+        if self.pending.get((l, st.b, st.h, blk)) is tr:
+            del self.pending[(l, st.b, st.h, blk)]
+        if st.pending.get(blk) == idx:
+            del st.pending[blk]
+        tr.superseded = True
+        st.release(idx, "verifier_evict_inflight")
+        self.metrics.count("verifier_evictions")
+        self.metrics.count("verifier_inflight_evictions")
+        s.state = FREE
+        s.block, s.owner, s.cls = -1, None, None
+        st.log.append(("free", -1, s.idx, s.gen, None))
+
+    def _capacity_report(self, l: int, b: int, h: int) -> str:
+        """The capacity state of one stream, for a CapacityRefusal (the evidence the next refusal carries)."""
+        pool = self.pools[l]
+        st = pool.stream(b, h)
+        return ("(l %d b %d h %d: usage %d of C %d; LRU %d, unprotected %d; in flight %d, unprotected draft prefetches "
+                "%d; PO %d; VRES %d; RELEASING %d; layer extras free %d of X %d, R_ver %d)"
+                % (l, b, h, st.usage(), self.C, len(st.lru), sum(1 for blk in st.lru if not st.prot.get(blk)),
+                   st.count(INFLIGHT), len(self._unprotected_prefetches(l, st, ())), len(st.po), len(st.vres),
+                   st.count(RELEASING), pool.free_extras(), self.X, self.R_ver))
 
     def _evict_now(self, st, blk: int, idx: int) -> None:
         """Policy E: evict the LRU entry (blk, slot idx) for the verifier and make its slot FREE at once. Its last
@@ -326,8 +388,11 @@ class Residency:
                 return idx
         cands = self._vcands.get((st.b, st.h))
         if cands:
-            blk, idx = cands.popleft()
-            self._evict_now(st, blk, idx)
+            kind, blk, idx, tr = cands.popleft()
+            if kind == "lru":
+                self._evict_now(st, blk, idx)
+            else:
+                self._evict_inflight(st, st.l, blk, idx, tr)
             return idx
         return None
 
@@ -368,9 +433,9 @@ class Residency:
             idx = self._free_slot_for_verifier(pool, st)
             if idx is None:
                 raise CapacityRefusal("layer %d stream (b %d h %d): no slot for the verifier's urgent block %d (C %d, "
-                                      "X %d, R_ver %d): K5 grants none and every LRU entry is protected or read by "
-                                      "this layer (Policy E has no candidate)" % (l, b, h, block, self.C, self.X,
-                                                                                    self.R_ver))
+                                      "X %d, R_ver %d): K5 grants none and Policy E has no candidate (every LRU entry "
+                                      "and in-flight draft prefetch is protected or read by this layer) %s"
+                                      % (l, b, h, block, self.C, self.X, self.R_ver, self._capacity_report(l, b, h)))
         prev_reader = st.slots[idx].last_reader
         self.seq += 1
         gen = st.take(idx, st.owner, int(block), self.seq, cls="v" if kind == VERIFY else "ad")

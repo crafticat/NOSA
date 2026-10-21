@@ -28,12 +28,16 @@ with tensor ops, in K3X order (verify row, head, ascending block; dispatcher.py:
              verify row of the cohort, same stream) reads the same slot: one transfer per stream and block.
   POLICY E   a first miss that K5 cannot grant takes the stream's next EVICTION CANDIDATE (note 12h): an LRU slot
              whose block is unprotected and selected by no row of the layer, least recent first (the mirror's
-             protection flags and recency stamps), as v1 does; the host applies the eviction at end_tick and checks it
-             is v1's choice.
+             protection flags and recency stamps), as v1 does; then (note 12j) the slot of the current owner's
+             draft prefetch IN FLIGHT whose block is unprotected and selected by no row, oldest issue first (the
+             take stamps): that prefetch is superseded, the layer's wait covers its write (superset: every
+             transfer in flight at the layer; exact: wait_list) before the urgent gather; the host applies the
+             eviction at end_tick and checks it is v1's choice.
   OVERFLOW   a first miss without a slot from K5 or Policy E. The device sets the OVERFLOW FLAG and points the page at
              slot 0 (in bounds); end_tick raises CapacityRefusal before any change of the host state. The tick's
-             outputs are invalid and the run stops: every LRU entry is protected or read by the layer and C + X or
-             R_ver is too small (a configuration result, as v1's own CapacityRefusal).
+             outputs are invalid and the run stops: every LRU entry and in-flight draft prefetch is protected or read
+             by the layer and C + X or R_ver is too small (a configuration result, as v1's own CapacityRefusal); the
+             message carries the capacity report of the first refused streams (_overflow_report).
   protect    every valid selected block (K2), applied at end_tick.
 Then the device (a) WAITS for the in-flight blocks the verify rows read, (b) GATHERS the urgent blocks (K, V, bias)
 into their slots on the main stream before the layer's attention, (c) updates the mirror (the urgent blocks in flight,
@@ -84,14 +88,17 @@ from .r2_residency import BLOCK, N_TAIL, VERIFY, Plan, Residency, Row
 from .r2_residency_sb import FIELDS, DraftMirror, ResidencySB, device_draft, rank_in_group
 
 FIELDS_V = ("blk", "valid", "ready", "slot", "infl", "infl_slot", "infl_gen", "dup", "granted", "take_slot", "rslot",
-            "protect", "evict", "evict_blk")
+            "protect", "evict", "evict_blk", "evict_infl", "ev_gen")
 C_FREE, C_INFLIGHT, C_LRU, C_PO, C_VRES, C_RELEASING = range(6)
 CODE = {FREE: C_FREE, INFLIGHT: C_INFLIGHT, LRU: C_LRU, PO: C_PO, VRES: C_VRES, RELEASING: C_RELEASING}
-MIRROR_FIELDS = ("slot_of", "inflight", "infl_slot", "infl_gen", "free", "usage", "releasing", "lru_rank", "prot")
+MIRROR_FIELDS = ("slot_of", "inflight", "infl_slot", "infl_gen", "free", "usage", "releasing", "lru_rank", "prot",
+                 "infl_unprot", "infl_rank")
 JOURNAL_KINDS = ("take", "release", "evict_po", "acquire", "admit", "admit_vres", "drop_unowned",
                  "drop_vres_unprotected", "free", "touch")     # touch / admit / acquire: the LRU recency (Policy E)
 RECENCY_KINDS = ("touch", "admit", "acquire")             # the events that put a block at the LRU's most recent end
+STAMP_KINDS = RECENCY_KINDS + ("take",)                   # + take: the issue order of the in-flight prefetches (12j)
 BIG_STAMP = 1 << 62
+HALF_STAMP = 1 << 61                                      # Policy E's in-flight candidates sort after every LRU one
 
 
 class _ProtDict(dict):
@@ -203,12 +210,20 @@ class DeviceMirror:
         rank = torch.empty_like(order)
         rank.scatter_(1, order, torch.arange(NPOS, device=dev).view(1, NPOS).expand(B * H, NPOS).contiguous())
         resident = (code == C_LRU) | (code == C_PO) | (code == C_VRES)
+        # Policy E's in-flight candidates (12j): the current owner's transfers in flight by issue order (take stamp)
+        fly_stamp = torch.where(fly, self.stamp[l], torch.full_like(code, BIG_STAMP))
+        forder = torch.sort(fly_stamp.view(B * H, NPOS), dim=-1).indices
+        frank = torch.empty_like(forder)
+        frank.scatter_(1, forder, torch.arange(NPOS, device=dev).view(1, NPOS).expand(B * H, NPOS).contiguous())
         return LayerMirror(slot_of=slot_of[:dummy].view(shp), inflight=(infl_slot[:dummy] >= 0).view(shp),
                            infl_slot=infl_slot[:dummy].view(shp), infl_gen=infl_gen[:dummy].view(shp),
                            free=code == C_FREE, usage=(code != C_FREE).to(torch.int64).sum(-1),
                            releasing=code == C_RELEASING,
                            lru_rank=torch.where(lru, rank.view(B, H, NPOS), torch.full_like(code, -1)),
-                           prot=resident & (self.prot[l] != 0), lru_stamp=lru_stamp, slot_block=blk.clone())
+                           prot=resident & (self.prot[l] != 0), lru_stamp=lru_stamp, slot_block=blk.clone(),
+                           infl_unprot=fly & (self.prot[l] == 0),
+                           infl_rank=torch.where(fly, frank.view(B, H, NPOS), torch.full_like(code, -1)),
+                           fly=fly, fly_stamp=fly_stamp, slot_gen=gen.clone())
 
 
 class VerifyMirror(DraftMirror):
@@ -222,6 +237,8 @@ class VerifyMirror(DraftMirror):
         self.releasing = torch.zeros((B, H, npos), dtype=torch.bool, device=device)
         self.lru_rank = torch.full((B, H, npos), -1, dtype=torch.int64, device=device)
         self.prot = torch.zeros((B, H, npos), dtype=torch.bool, device=device)
+        self.infl_unprot = torch.zeros((B, H, npos), dtype=torch.bool, device=device)
+        self.infl_rank = torch.full((B, H, npos), -1, dtype=torch.int64, device=device)
 
     def refresh(self, svc: Residency, l: int) -> None:
         super().refresh(svc, l)
@@ -232,10 +249,19 @@ class VerifyMirror(DraftMirror):
         releasing = torch.zeros((B, H, npos), dtype=torch.bool)
         lru_rank = torch.full((B, H, npos), -1, dtype=torch.int64)
         prot = torch.zeros((B, H, npos), dtype=torch.bool)
+        infl_unprot = torch.zeros((B, H, npos), dtype=torch.bool)
+        infl_rank = torch.full((B, H, npos), -1, dtype=torch.int64)
+        flying: Dict[Tuple[int, int], List] = {}
         for (ll, b, h, blk), tr in svc.pending.items():
             if ll == l and 0 <= blk < nblk and svc._in_flight(l, b, h, blk) is tr:
                 infl_slot[b, h, blk] = tr.slot
                 infl_gen[b, h, blk] = tr.gen
+                flying.setdefault((b, h), []).append(tr)
+        for (b, h), trs in flying.items():                              # the issue order (Policy E, 12j)
+            st = svc.pools[l].stream(b, h)
+            for r, tr in enumerate(sorted(trs, key=lambda x: x.seq)):
+                infl_rank[b, h, tr.slot] = r
+                infl_unprot[b, h, tr.slot] = not st.prot.get(tr.block)
         for (b, h), st in svc.pools[l].streams.items():
             for i, s in enumerate(st.slots):
                 if s.state == RELEASING:
@@ -250,6 +276,8 @@ class VerifyMirror(DraftMirror):
         self.releasing.copy_(releasing, non_blocking=True)
         self.lru_rank.copy_(lru_rank, non_blocking=True)
         self.prot.copy_(prot, non_blocking=True)
+        self.infl_unprot.copy_(infl_unprot, non_blocking=True)
+        self.infl_rank.copy_(infl_rank, non_blocking=True)
 
 
 class VerifyDecision:
@@ -263,6 +291,7 @@ class VerifyDecision:
         self.load_ids = load_ids                     # (H, B, n_hist): the urgent block of each slot, -1 elsewhere
         self.bh = bh                                 # (b, h) of each entry (the device operations read them)
         self.counters = counters                     # (1,) int64: the overflowed first misses
+        self.skip_infl_wait = False                  # NEGATIVE CONTROL (no_inflight_wait): no wait for a superseded write
 
 
 def _selected_mask(S: int, H: int, NBLK: int, parts, dev) -> torch.Tensor:
@@ -279,19 +308,24 @@ def _selected_mask(S: int, H: int, NBLK: int, parts, dev) -> torch.Tensor:
     return acc[:S * NBLK] > 0
 
 
-def device_verify(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, mut=None, others=None) -> VerifyDecision:
+def device_verify(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, mut=None, others=None,
+                  inflight: bool = True) -> VerifyDecision:
     """One layer's verify rows on the device (module docstring), then the mirror update for the layer's draft rows.
     rb, hb (Rv,) int64: batch slot and history boundary of each verify row; tails (Rv, T) int64 tail slots (-1
     padded), nt (Rv,) int64 their count; sel (H, Rv, k) int64 the selections; others: the layer's other rows
     [(rb, hb, sel)] (the draft rows: Policy E never evicts a block that a row of the layer selects).
-    POLICY E (note 12h): a first miss that K5 refuses takes the stream's next eviction candidate: an LRU slot whose
-    block is unprotected and selected by no row of the layer, least recent first (the mirror's recency stamps); only
-    a miss without a candidate is an overflow.
+    POLICY E (notes 12h, 12j): a first miss that K5 refuses takes the stream's next eviction candidate: first an LRU
+    slot whose block is unprotected and selected by no row of the layer, least recent first (the mirror's recency
+    stamps); then (inflight True) a slot of the current owner's transfer in flight whose block is unprotected and
+    selected by no row of the layer, oldest issue first (the take stamps): that prefetch is SUPERSEDED, and the
+    layer's wait covers its write before the urgent gather (evict_infl, ev_gen: wait_list); only a miss without a
+    candidate is an overflow.
     mut (NEGATIVE CONTROLS, tests only): gather_into_releasing (a RELEASING slot counts as FREE: the urgent gather
     writes a slot whose last reader may be pending), no_verify_protect (the verify read protects nothing),
     no_verify_dedup (a later occurrence of a miss takes a second slot: two transfers of one block), no_overflow_flag
     (an overflow is not reported), evict_protected / evict_selected / evict_newest (Policy E ignores the protection,
-    ignores the layer's selections, takes the most recent candidate first)."""
+    ignores the layer's selections, takes the most recent candidate first), no_inflight_wait (the layer's wait omits
+    a superseded prefetch: the urgent gather may write before that write landed)."""
     mut = mut or {}
     H, Rv, k = sel.shape
     dev = sel.device
@@ -350,20 +384,29 @@ def device_verify(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, mut=N
     sid_slot = torch.arange(S, device=dev).view(S, 1).expand(S, NPOS)
     in_sel = (sblk >= 0) & (sblk < NBLK) & selm[sid_slot * NBLK + sblk.clamp(min=0, max=NBLK - 1)]
     cand = m.lru_stamp.reshape(S, NPOS) < BIG_STAMP                                 # LRU slots
+    fly = m.fly.reshape(S, NPOS)                                                    # the owner's slots in flight
+    cand_f = fly if mut.get("evict_protected") else m.infl_unprot.reshape(S, NPOS)
+    if not inflight:                                                                # 12h's rule (a negative control)
+        cand_f = torch.zeros_like(cand_f)
     if not mut.get("evict_protected"):
         cand = cand & ~m.prot.reshape(S, NPOS)
     if not mut.get("evict_selected"):
         cand = cand & ~in_sel
-    ckey = m.lru_stamp.reshape(S, NPOS)
+        cand_f = cand_f & ~in_sel
+    # one key per slot: the LRU candidates by recency, then the in-flight ones by issue order (HALF_STAMP + take stamp)
+    fkey = HALF_STAMP + m.fly_stamp.reshape(S, NPOS).clamp(max=HALF_STAMP)
+    ckey = torch.where(cand, m.lru_stamp.reshape(S, NPOS), fkey)
     if mut.get("evict_newest"):
         ckey = -ckey
-    ckey = torch.where(cand, ckey, torch.full_like(ckey, BIG_STAMP))
+    ckey = torch.where(cand | cand_f, ckey, torch.full_like(ckey, BIG_STAMP))
     cand_sorted = torch.sort(ckey, dim=-1).indices                                  # candidates first, oldest first
-    n_cand = cand.to(torch.int64).sum(-1)                                           # (S,)
+    n_cand = (cand | cand_f).to(torch.int64).sum(-1)                                # (S,)
     r_ev = rank_in_group(sid, refused_k5)
     evicted = refused_k5 & (r_ev < n_cand[sid])
     ev_slot = cand_sorted[sid, r_ev.clamp(max=NPOS - 1)]
     ev_blk = torch.where(evicted, sblk[sid, ev_slot], torch.full_like(ev_slot, -1))
+    ev_infl = evicted & fly[sid, ev_slot]                                           # a superseded prefetch (12j)
+    ev_gen = torch.where(ev_infl, m.slot_gen.reshape(S, NPOS)[sid, ev_slot], torch.zeros_like(ev_slot))
     over = refused_k5 & ~evicted
     taken = granted | evicted
     take_slot = torch.where(granted, free_sorted[sid, q.clamp(max=NPOS - 1)],
@@ -413,13 +456,22 @@ def device_verify(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, mut=N
     d_gone = torch.zeros(S * NBLK, dtype=torch.int64, device=dev).index_add_(0, sid * NBLK + ev_blk.clamp(min=0),
                                                                               evicted.to(torch.int64))
     m.slot_of.masked_fill_(d_gone.view(B, H, NBLK) > 0, -1)
+    # a superseded prefetch's block is no longer in flight for the layer's draft rows (12j)
+    d_gone_f = torch.zeros(S * NBLK, dtype=torch.int64, device=dev).index_add_(0, sid * NBLK + ev_blk.clamp(min=0),
+                                                                                ev_infl.to(torch.int64))
+    gone_f = d_gone_f.view(B, H, NBLK) > 0
+    m.inflight &= ~gone_f
+    m.infl_slot.masked_fill_(gone_f, -1)
     n_over = over.to(torch.int64).sum()
     counters = torch.stack([torch.zeros_like(n_over) if mut.get("no_overflow_flag") else n_over])
     t = dict(blk=blk_f, valid=valid_f, ready=ready.reshape(N), slot=slot.reshape(N), infl=infl.reshape(N),
              infl_slot=islot.reshape(N), infl_gen=igen.reshape(N), dup=dup, granted=granted, take_slot=take_slot,
-             rslot=rslot, protect=protect.reshape(N), evict=evicted, evict_blk=ev_blk)
-    return VerifyDecision(Rv, H, k, {f: v.to(torch.int64) for f, v in t.items()}, page, num_pages, load_ids,
-                          (bb_f, hh_f), counters)
+             rslot=rslot, protect=protect.reshape(N), evict=evicted, evict_blk=ev_blk, evict_infl=ev_infl,
+             ev_gen=ev_gen)
+    dec = VerifyDecision(Rv, H, k, {f: v.to(torch.int64) for f, v in t.items()}, page, num_pages, load_ids,
+                         (bb_f, hh_f), counters)
+    dec.skip_infl_wait = "no_inflight_wait" in mut
+    return dec
 
 
 # ====================================================================================================================
@@ -455,6 +507,20 @@ class CpuDeviceSim:
             if not svc.tp.done(tr):
                 svc.tp.force(tr)
             self.waited += 1
+        if dec.skip_infl_wait:                                    # NEGATIVE CONTROL (no_inflight_wait)
+            return
+        sup = zip(bb.tolist(), hh.tolist(), dec.t["evict_infl"].tolist(), dec.t["evict_blk"].tolist(),
+                  dec.t["take_slot"].tolist(), dec.t["ev_gen"].tolist())
+        for (b, h, e, ob, slot, gen) in sup:                      # Policy E (12j): the superseded prefetch lands first
+            if not e:
+                continue
+            tr = svc._in_flight(l, b, h, ob)
+            if tr is None or tr.slot != slot or tr.gen != gen:
+                raise OwnershipViolation("S-C device: Policy E supersedes block %d at slot %d gen %d (layer %d b %d h "
+                                         "%d), which is not the owner's transfer in flight" % (ob, slot, gen, l, b, h))
+            if not svc.tp.done(tr):
+                svc.tp.force(tr)
+            self.waited += 1
 
     def gather(self, l: int, dec: VerifyDecision) -> None:
         """The urgent gather on the main stream: every (h, b, slot) with a block id in the load ids gets the block's
@@ -466,8 +532,13 @@ class CpuDeviceSim:
         g = svc.gather                                    # the host rows and the store (TorchGather's tensors)
         bs = svc.bs
         bb, hh = dec.bh
-        evicted = {(b, h, s) for (b, h, s, e) in zip(bb.tolist(), hh.tolist(), dec.t["take_slot"].tolist(),
-                                                    dec.t["evict"].tolist()) if e}
+        evicted, superseded = set(), {}
+        for (b, h, s, e, f, ob) in zip(bb.tolist(), hh.tolist(), dec.t["take_slot"].tolist(), dec.t["evict"].tolist(),
+                                       dec.t["evict_infl"].tolist(), dec.t["evict_blk"].tolist()):
+            if e and f:
+                superseded[(b, h, s)] = ob                        # an in-flight prefetch's slot (12j)
+            elif e:
+                evicted.add((b, h, s))                            # an LRU entry's slot (12h)
         for h, per_b in enumerate(dec.load_ids.tolist()):
             for b, per_m in enumerate(per_b):
                 for m, t in enumerate(per_m):
@@ -477,6 +548,12 @@ class CpuDeviceSim:
                     if (b, h, m) in evicted and not ev_done(s.last_reader):
                         svc.host_wait(s.last_reader)
                         svc.metrics.count("verifier_force_waits")
+                    if (b, h, m) in superseded:
+                        tr = svc._in_flight(l, b, h, superseded[(b, h, m)])
+                        if self.check_t3 and tr is not None and not svc.tp.done(tr):
+                            raise OwnershipViolation("S-C device: the urgent gather of block %d writes slot %d (layer %d "
+                                                     "b %d h %d) before the prefetch it supersedes landed (T3 for "
+                                                     "writers)" % (t, m, l, b, h))
                     if self.check_t3 and not ev_done(s.last_reader):
                         raise OwnershipViolation("S-C device: the urgent gather of block %d writes slot %d (layer %d b %d "
                                                  "h %d) while the slot's last reader is pending (T3)" % (t, m, l, b, h))
@@ -517,11 +594,18 @@ class GenBoard:
 
 def wait_list(dec: VerifyDecision, l: int, board: GenBoard) -> Tuple[torch.Tensor, torch.Tensor]:
     """The exact wait's list, on the device, from one layer's verify decision: per entry the board index of its
-    in-flight slot (-1 for an entry that waits for nothing) and the generation it waits for. Fixed length (the
-    decision's N): capturable."""
+    in-flight slot (-1 for an entry that waits for nothing) and the generation it waits for. An entry waits for the
+    transfer in flight that its verify row reads, or (Policy E, 12j) for the prefetch its urgent block supersedes:
+    that write lands before the urgent gather overwrites the slot. Fixed length (the decision's N): capturable."""
     bb, hh = dec.bh
-    f = ((l * board.B + bb) * board.H + hh) * board.npos + dec.t["infl_slot"].clamp(min=0)
-    return torch.where(dec.t["infl"] != 0, f, torch.full_like(f, -1)), dec.t["infl_gen"]
+    infl = dec.t["infl"] != 0
+    ev = dec.t["evict_infl"] != 0
+    if dec.skip_infl_wait:                                            # NEGATIVE CONTROL (no_inflight_wait)
+        ev = torch.zeros_like(ev)
+    slot_w = torch.where(infl, dec.t["infl_slot"], dec.t["take_slot"]).clamp(min=0)
+    f = ((l * board.B + bb) * board.H + hh) * board.npos + slot_w
+    return (torch.where(infl | ev, f, torch.full_like(f, -1)),
+            torch.where(infl, dec.t["infl_gen"], dec.t["ev_gen"]))
 
 
 class PublishingTransport:
@@ -734,6 +818,7 @@ class ResidencySC(ResidencySB):
         self.mirrors = None                               # S-B's per-layer host-refreshed mirrors are not used
         self.dmirror = DeviceMirror(self.L, self.B, self.H, self.nblk, self.n_hist, self.device)
         self.mirror_drop = set(mirror_drop or ())
+        self._ending = False                                         # inside end_request (_prot_changed)
         self.journal_counts: Dict[str, int] = {}                     # the stream transitions per kind (reports)
         self._dirty: Set[Tuple[int, int, int, int]] = set()          # (l, b, h, slot) changed since the last sync
         self._stamp: Dict[Tuple[int, int, int, int], int] = {}       # (l, b, h, slot) -> its LRU recency (Policy E)
@@ -777,18 +862,23 @@ class ResidencySC(ResidencySB):
         per kind in journal_counts (a release by its reason: release:evict, release:unprotect, release:end, ...)."""
         kind = item[0] if item[0] != "release" else "release:%s" % (item[4],)
         self.journal_counts[kind] = self.journal_counts.get(kind, 0) + 1
-        if item[0] in RECENCY_KINDS:                       # the block is now the LRU's most recent entry
-            self._clock += 1
+        if item[0] in STAMP_KINDS:                         # the LRU recency (touch / admit / acquire), the issue order
+            self._clock += 1                               # of a slot in flight (take): Policy E's orders
             self._stamp[key + (item[2],)] = self._clock
         if item[0] in self.mirror_drop:
             return
         self._dirty.add(key + (item[2],))
 
     def _prot_changed(self, key: Tuple[int, int, int], block: int) -> None:
-        """A block's protection may have changed (_ProtDict): its resident slot, if any, goes with the next delta."""
+        """A block's protection may have changed (_ProtDict): its resident slot, or its slot in flight (Policy E's
+        in-flight candidates, 12j), goes with the next delta. Not the slot in flight while its request ENDS
+        (end_request): that transfer stops being the owner's, and the owner change marks it (F14b's control)."""
         if "prot" in self.mirror_drop:
             return
-        idx = self.pools[key[0]].stream(key[1], key[2]).resident(block)
+        st = self.pools[key[0]].stream(key[1], key[2])
+        idx = st.resident(block)
+        if idx is None and not self._ending:
+            idx = st.pending.get(block)
         if idx is not None:
             self._dirty.add(key + (idx,))
 
@@ -806,7 +896,11 @@ class ResidencySC(ResidencySB):
 
     def end_request(self, uid) -> None:
         b = self.uid_b[uid]
-        super().end_request(uid)
+        self._ending = True                    # its transfers in flight stop being the owner's: no protection marks
+        try:
+            super().end_request(uid)
+        finally:
+            self._ending = False
         self._mark_batch_slot(b)
 
     def _h2d(self, host: torch.Tensor) -> torch.Tensor:
@@ -831,7 +925,7 @@ class ResidencySC(ResidencySB):
             if s.state == INFLIGHT:
                 tr = self._in_flight(l, b, h, s.block)
                 cur = 1 if tr is not None and tr.slot == i else 0
-            prot = 1 if s.state in (LRU, PO, VRES) and st.prot.get(s.block) else 0
+            prot = 1 if s.state in (LRU, PO, VRES, INFLIGHT) and st.prot.get(s.block) else 0
             recs.append((((l * B + b) * H + h) * NPOS + i, CODE[s.state], s.block, s.gen, cur, prot,
                          self._stamp.get((l, b, h, i), 0)))
         self._dirty = set()
@@ -909,7 +1003,8 @@ class ResidencySC(ResidencySB):
             if tk["d"] is not None:                                   # Policy E spares the draft rows' blocks too
                 rbd, hbd, _, _, ixd = tk["d"]
                 others.append((rbd, hbd, sel[:, ixd]))
-            vdec = device_verify(m, rb, hb, tl, nt, sel[:, ix], self.C, self.X, self.sc_mut, others=others)
+            vdec = device_verify(m, rb, hb, tl, nt, sel[:, ix], self.C, self.X, self.sc_mut, others=others,
+                                 inflight=self.policy_e_inflight)
             if not self.sc_mut.get("no_wait"):                        # NEGATIVE CONTROL: read before the event
                 self.dev.wait(l, vdec)
             self.dev.gather(l, vdec)
@@ -970,9 +1065,10 @@ class ResidencySC(ResidencySB):
             if over:
                 self._layer_ev = {}
                 raise CapacityRefusal("S-C: the verifier's urgent misses found no slot: K5 grants none and Policy E has "
-                                      "no candidate, every LRU entry being protected or read by the layer (layer, "
-                                      "blocks without a slot: %s; C %d, X %d, R_ver %d): the tick's outputs are invalid"
-                                      % (over, self.C, self.X, self.R_ver))
+                                      "no candidate, every LRU entry and in-flight draft prefetch being protected or "
+                                      "read by the layer (layer, blocks without a slot: %s; C %d, X %d, R_ver %d): the "
+                                      "tick's outputs are invalid; refused streams: %s"
+                                      % (over, self.C, self.X, self.R_ver, self._overflow_report(parsed)))
             for (st, v, d) in parsed:
                 if v is not None:
                     self._apply_verify(st["l"], st["vrows"], st["vidx"], st["vdec"], v[0],
@@ -983,6 +1079,25 @@ class ResidencySC(ResidencySB):
         self._layer_ev = {}
         Residency.end_tick(self)                                      # the draft transfers, layer by layer
         self.metrics.sample_memory()
+
+    def _overflow_report(self, parsed, per_layer: int = 3) -> str:
+        """For a refused tick: the capacity report (v1's _capacity_report, host state = the tick's start: nothing is
+        applied) of the first streams per layer whose first miss got no slot."""
+        out = []
+        for (st, v, _) in parsed:
+            if v is None or v[1] <= 0:
+                continue
+            dec, c, seen = st["vdec"], v[0], []
+            for o in range(dec.Rv * dec.H * dec.k):
+                if (c["valid"][o] and not (c["ready"][o] or c["infl"][o] or c["dup"][o] or c["granted"][o]
+                                           or c["evict"][o])):
+                    bh = (st["vrows"][o // (dec.H * dec.k)].b, (o // dec.k) % dec.H)
+                    if bh not in seen:
+                        seen.append(bh)
+                        out.append(self._capacity_report(st["l"], bh[0], bh[1]))
+                    if len(seen) >= per_layer:
+                        break
+        return "; ".join(out)
 
     def _host_candidates(self, l: int, vrow_objs, dec, c, drow_objs, dcols, ddec):
         """Policy E's candidates on the host (v1's _verifier_candidates), from the host state at the start of the
@@ -1006,8 +1121,10 @@ class ResidencySC(ResidencySB):
                 if (r.b, h) in out:
                     continue
                 st = pool.stream(r.b, h)
-                out[(r.b, h)] = deque((blk, idx) for blk, idx in st.lru.items()
-                                      if not st.prot.get(blk) and blk not in sel.get((r.b, h), ()))
+                sset = sel.get((r.b, h), set())
+                out[(r.b, h)] = deque([("lru", blk, idx, None) for blk, idx in st.lru.items()
+                                       if not st.prot.get(blk) and blk not in sset]
+                                      + self._inflight_candidates(l, st, sset))
         return out
 
     def _apply_verify(self, l: int, vrow_objs: List[Row], vidx: List[int], dec: VerifyDecision, c, drow_objs=None,
@@ -1049,19 +1166,23 @@ class ResidencySC(ResidencySB):
                         ent.append((t, tr.slot))
                     elif c["granted"][o] or c["evict"][o]:
                         new.append(t)
-                        takes.append((t, c["take_slot"][o], c["evict_blk"][o] if c["evict"][o] else None))
+                        takes.append((t, c["take_slot"][o], c["evict_blk"][o] if c["evict"][o] else None,
+                                      "inflight" if c["evict_infl"][o] else "lru"))
                     else:
                         raise OwnershipViolation("S-C: block %d of verify row %d (layer %d b %d h %d) has no slot and the "
                                                  "device did not flag an overflow" % (t, vidx[j], l, r.b, h))
-                for (t, at, ev_blk) in takes:
+                for (t, at, ev_blk, ev_kind) in takes:
                     if ev_blk is not None:                            # Policy E: the host's next candidate, evicted
                         q = cands.get((r.b, h))
                         nxt = q.popleft() if q else None
-                        if nxt != (ev_blk, at):
-                            raise OwnershipViolation("S-C Policy E: the device evicted block %d at slot %d (layer %d b %d "
-                                                     "h %d); the host's next candidate is %s" % (ev_blk, at, l, r.b, h,
-                                                                                                nxt))
-                        self._evict_now(st, ev_blk, at)
+                        if nxt is None or nxt[:3] != (ev_kind, ev_blk, at):
+                            raise OwnershipViolation("S-C Policy E: the device evicted the %s block %d at slot %d (layer "
+                                                     "%d b %d h %d); the host's next candidate is %s"
+                                                     % (ev_kind, ev_blk, at, l, r.b, h, None if nxt is None else nxt[:3]))
+                        if ev_kind == "lru":
+                            self._evict_now(st, ev_blk, at)
+                        else:                                         # the device waited for its write (12j)
+                            self._evict_inflight(st, l, ev_blk, at, nxt[3])
                     tr = self._take(l, r.b, h, t, r.key, VERIFY, at=at, evicted=ev_blk is not None)
                     tr.delivered = True                               # the device's urgent gather landed it
                     self._landed.add(tr.seq)
