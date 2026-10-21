@@ -365,7 +365,8 @@ def test_XP3b_the_flags_on_direct_inputs():
     assert int(xp.err) & XPM.ERR_FULL and int(xp.occ[0, 0].sum()) == n
     ok = XPM.XPool(1, 2, 2, 5, mode="pool", C=3, X_pool=2)
     ok.bind(0, bb[:8], hh[:8], sl[:8], torch.ones(8, dtype=torch.bool))
-    assert int(ok.err) == 0 and sorted(ok.pos_of[0, :, 0, :].reshape(-1).tolist()) == [-1, -1] + list(range(8))
+    assert int(ok.err) == 0 and sorted(ok.pos_of[0, :, 0, :5].reshape(-1).tolist()) == [-1, -1] + list(range(8))
+    assert ok.pos_of[0, :, 0, 5:].tolist() == [[8, 9, 10, 11], [12, 13, 14, 15]]   # the tail rings: A + 4 b + j
     free = torch.zeros(1, 2, 2, 5, dtype=torch.bool)
     free[0, 0, 0, 1] = True                                          # slot 1 of (b 0, h 0) is FREE: its lane returns
     lane = int(ok.pos_of[0, 0, 0, 1])

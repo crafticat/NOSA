@@ -988,7 +988,9 @@ class ResidencySC(ResidencySB):
         self.k5_peak: Tuple = (0, None, None)
         self.k5_by_layer: List[int] = [0] * self.L
         if self.xpool is not None:                        # [xpool] the binder's / translator's error flag rides in the
-            self.watch_flag("xpool_err", self.xpool.err)  # tick's ONE decision read (a set flag refuses the tick)
+            # tick's ONE decision read (a set flag refuses the tick). S-C's own watch_flag, called by name: a subclass
+            # override may read state its __init__ sets only after this one returns (B2's b2_mut, r2_own2.py:416-417)
+            ResidencySC.watch_flag(self, "xpool_err", self.xpool.err)
 
     def watch_flag(self, name: str, flag: torch.Tensor) -> None:
         """Watch a device flag (a 0-dim bool or integer tensor on the service's device; e.g. the twin's sticky
