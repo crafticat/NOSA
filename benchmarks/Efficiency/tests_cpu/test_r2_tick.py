@@ -1076,8 +1076,9 @@ def test_T18_sg5_harness_on_the_cpu(p3):
 def test_T19_sg5_step_script_uuid_file_and_pins(tmp_path):
     """T19: r2_tick_sg5_step.sh: the uuid file rules (missing, "GPU-" prefix, two lines: STOP before any other check;
     SG5_HOLDERS outside DRYRUN refused); the pins (piece 3 v2, the packer's two blobs of f2b981a); on a clean checkout
-    at HEAD the DRYRUN prints the uuid, the pins and the arguments of the primary point and the sweep. Static: the
-    claim sg5_active, STEP_MIN, --export=NONE, no awk / python3 / perl outside comments."""
+    at HEAD the DRYRUN prints the uuid, the pins and the arguments of the primary point and the sweep, and the cells
+    (_t19_cells: default = p3's arguments, p4a, p4b-<b>); in the step's own ROOT a DRYRUN stop FAILS (no skip).
+    Static: the claim sg5_active, STEP_MIN, --export=NONE, no awk / python3 / perl outside comments."""
     script = EFF / "r2_tick_sg5_step.sh"
     text = script.read_text()
     lines = text.splitlines()
@@ -1114,10 +1115,16 @@ def test_T19_sg5_step_script_uuid_file_and_pins(tmp_path):
     head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
     dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"], capture_output=True,
                            text=True)
-    if head.returncode != 0 or dirty.stdout.strip():
-        pytest.skip("not a clean git checkout: the full DRYRUN needs one")
+    untracked = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=all", "--", "nosi"],
+                               capture_output=True, text=True)                 # the step's own precondition (e.g. .pyc)
+    if head.returncode != 0 or dirty.stdout.strip() or untracked.stdout.strip():
+        pytest.skip("not a clean git checkout (tracked changes or untracked files in nosi/): the full DRYRUN needs one")
+    nosi_root = next(ln for ln in lines if ln.startswith("NOSI=")).split()[0][len("NOSI="):]
+    at_root = Path(nosi_root).resolve() == ROOT.resolve()             # this checkout IS the step's ROOT
     r = run(416, uid + "\n", sha=head.stdout.strip())
     if r.returncode != 0:
+        # in the step's own ROOT a stop here is a FAILURE (a broken pin), never a skip
+        assert not at_root, "DRYRUN stopped in the step's ROOT %s: %s" % (nosi_root, r.stderr.strip()[-300:])
         pytest.skip("DRYRUN stopped on a pin outside the uuid stage: %s" % r.stderr.strip()[-200:])
     assert "gpu_uuid %s (%s/416.gpu_uuid)" % (uid, tmp_path) in r.stdout
     assert "piece 3 %s:%s blob %s" % (PIECE3_V2["sha"], PIECE3_V2["path"], PIECE3_V2["blob"]) in r.stdout
@@ -1136,6 +1143,67 @@ def test_T19_sg5_step_script_uuid_file_and_pins(tmp_path):
     r = subprocess.run(["bash", str(script), "--nosi", head.stdout.strip(), "416", "t1", "s9"], env=e,
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 2 and "usage" in r.stderr
+    _t19_cells(script, e, head.stdout.strip())
+
+
+# p3's frozen r2_tick_sg5.py arguments: /mnt/beegfs/ojerbi/r2-runs/sg5/sg5_p3_2190876.step/command.txt, the words after
+# r2_tick_sg5.py, with "p3_2190876" -> {n} and printf %q's "\," -> ","
+P3_SG5_ARGS = ("--out /mnt/beegfs/ojerbi/r2-runs/sg5/sg5_{n} --model /mnt/beegfs/ojerbi/models/NOSA-8B "
+               "--workload /mnt/beegfs/ojerbi/kstep-cpu-runs/workload/pg19-test-c16k "
+               "--biattn /mnt/beegfs/ojerbi/r2-runs/sg5/sg5_{n}.step/piece3_bi_paged_attention.py "
+               "--gilfree /mnt/beegfs/ojerbi/r2-runs/sg5/sg5_{n}.step/gilfree "
+               "--gilfree-build /mnt/beegfs/ojerbi/nosa-env/jit/sg5_{n}/gilfree_build --threads 8 --transport gilfree "
+               "--batch 64 --S 16128 --steps 48 --K 3 --LAMBDA 7 --modes exact,fast --backends sc,sb,v1 --C 96 --X 32 "
+               "--R-ver 16 --sweep 64:16,64:32,64:64,80:16,80:32,80:64,96:16,96:32,96:64 --sweep-steps 24 "
+               "--draft-ticks 12 --shipped-steps 24 --pool-baseline --preflight-steps 4")
+P3_SG5_SWEEP = " --sweep 64:16,64:32,64:64,80:16,80:32,80:64,96:16,96:32,96:64"
+P3_SG5_POINTS = "--modes exact,fast --backends sc,sb,v1"
+
+
+def _t19_cells(script, env, sha):
+    """T19, the CELLS (the lead's two-step p4 plan): the DEFAULT prints p3's arguments token for token; p4a = p3's
+    arguments without the sweep (the harness's --sweep default "" gives no sweep point); p4b-<b> = --modes exact
+    --backends <b> with the 9-point sweep; the cell and the transport in either order; the cell's names
+    (out, record, JIT, job name). Negative controls: every cell's arguments differ from p3's (the comparison
+    discriminates); a bare p4b, an unknown cell or backend, two cells, two transports, or 7 words: usage, exit 2."""
+    def dry(*words):
+        return subprocess.run(["bash", str(script), "--nosi", sha, "416", "t1", *words], env=env, capture_output=True,
+                              text=True, timeout=120)
+
+    def args(out):
+        line = out.strip().splitlines()[-1]
+        return line.split("r2_tick_sg5.py ", 1)[1].strip().replace("\\,", ",")
+    p3 = P3_SG5_ARGS.format(n="t1_416")
+    r = dry()
+    assert r.returncode == 0 and args(r.stdout) == p3, args(r.stdout)
+    assert "--job-name=sg5-t1-416 " in r.stdout and "cell default" in r.stdout
+    assert "TRITON_CACHE_DIR=/mnt/beegfs/ojerbi/nosa-env/jit/sg5_t1_416/triton" in r.stdout
+    G = _sg5_gate()
+    base = ["--out", "o", "--workload", "w", "--biattn", "b", "--gilfree", "g", "--gilfree-build", "/x"]
+    assert G.parse_args(base).sweep == "" and G.parse_args(base).sweep_pts == []     # p4a: no --sweep = no sweep
+    want = {"p4a": P3_SG5_ARGS.format(n="t1_416_p4a").replace(P3_SG5_SWEEP, "")}
+    for b in ("sc", "sb", "v1"):
+        want["p4b-" + b] = P3_SG5_ARGS.format(n="t1_416_p4b-" + b).replace(P3_SG5_POINTS,
+                                                                           "--modes exact --backends " + b)
+    for cell, exp in want.items():
+        assert exp != p3 and (P3_SG5_SWEEP in exp) == (cell != "p4a")
+        for words in ((cell,), (cell, "gilfree"), ("gilfree", cell)):
+            r = dry(*words)
+            assert r.returncode == 0, (words, r.stderr.strip()[-300:])
+            got = args(r.stdout)
+            assert got == exp and got != p3, (words, got)
+            assert "--job-name=sg5-t1-416-%s " % cell in r.stdout and "cell %s" % cell in r.stdout
+            assert "TRITON_CACHE_DIR=/mnt/beegfs/ojerbi/nosa-env/jit/sg5_t1_416_%s/triton" % cell in r.stdout
+            pa = G.parse_args(got.split())                             # the harness's own reading of the cell
+            assert pa.backends == (["sc", "sb", "v1"] if cell == "p4a" else [cell[4:]])
+            assert pa.modes == (["exact", "fast"] if cell == "p4a" else ["exact"])
+            assert len(pa.sweep_pts) == (0 if cell == "p4a" else 9) and pa.steps == 48 and pa.sweep_steps == 24
+    r = dry("gather", "p4a")
+    assert r.returncode == 0 and args(r.stdout) == want["p4a"].replace("--transport gilfree", "--transport gather")
+    for bad in (("p4b",), ("p4c",), ("p4b-s9",), ("p4a", "p4a"), ("p4a", "p4b-sb"), ("gather", "gilfree"),
+                ("p4a", "gather", "x"), ("P4A",)):
+        r = dry(*bad)
+        assert r.returncode == 2 and "usage" in r.stderr, bad
 
 
 def test_T20_the_sweep_runs_on_the_first_backend_that_passed_its_preflight():
