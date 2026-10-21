@@ -46,11 +46,19 @@
 #            Its ROOT is NOSI_X1 (nosi-r2-xpool); every other cell keeps NOSI (review m8)
 #   stack1a  [integ] THE FULL STACK (docs/R2_INTEG_PLAN.md) at p5b2's point, EXACT, B 64: --stack full --stack-compare
 #            --X-pool 64 --arrival-lag 2 --sel-check (arms none, full, none2; MUST _ST_replica / _ST_committed /
-#            _ST_bitwise), no --pool-baseline. ROOT NOSI_INTEG (nosi-r2-integ), as the two cells below
+#            _ST_bitwise), no --pool-baseline. ROOT NOSI_INTEG (nosi-r2-integ2 since integ2), as the two cells below
 #   stack1t  [integ] the full stack's TIMING at p5b2's point, B 64, free timing: --stack full --X-pool 64
 #            --shared-unchecked (the selection precondition is checked in stack1a), --pool-baseline (100)
 #   stack1b  [integ] the full stack's TIMING at B 264 (the largest B of the xpool model, X_pool 64): --stack full
-#            --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64, --mem=240G (141 GB pinned host rows)
+#            --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1, --mem=240G (141 GB
+#            pinned host rows; the holder has 480G); [integ2] the bigb one-engine fix makes it fit (R2_INTEG_PLAN 5.4)
+#   bigb81-128 | bigb81-244 | bigb96-128 | bigb96-216
+#            [bigb] LARGE B on the SHARED POOL layout (docs/R2_BIGB_PLAN.md section 4; bigb_core.cell_plan): C 81 or
+#            96, B 128 (the stepping stone) or B_max (the largest B whose MODEL peak <= 76 GB: 244 at C 81, 216 at
+#            C 96), EXACT, b2, gilfree 8 threads, X 64 / R_ver 16, --layout pool --X-pool 64 --arrival-lag 2, 24
+#            steps, --repeat-docs (B > 94 documents), --log-slots -1 (the round's size), --skip-shipped (no shipped
+#            child: its pinned rows would need 145-273 GiB of host memory), no --pool-baseline, no sweep, --mem 200G.
+#            Its ROOT is NOSI_BIGB (nosi-r2-bigb); run B 128 before B_max at each C.
 #   STEP_MIN 120 in every cell.
 #
 # REGISTERED for stack1 ([integ], 2026-10-21T11:51:27Z, SOURCE ONLY, not run; docs/R2_INTEG_PLAN.md section 5 has
@@ -104,6 +112,23 @@
 #   X-E  REPORT: both equal-memory shipped baselines (P 100 and P 37), xpool.report()'s peak lanes, arrival forced /
 #        held per arm
 #
+# REGISTERED for the bigb cells ([bigb], SOURCE ONLY, not run; docs/R2_BIGB_PLAN.md sections 3-5 have the derivation;
+# MODEL = bigb_core.MemModel / tick_bands, fitted on p5b2 B 64; GB = 1e9 B of torch.cuda.max_memory_allocated):
+#   BB-A  the b2 gilfree preflight on the pool layout PASSES at every point (MUST); a CapacityRefusal there is a
+#         configuration result (the K5 X 64 is shared by B requests), reported with its K5 decision report
+#   BB-M  meta.peak_gb (MODEL, one engine; band +- 1.0 GB, FALSIFIED outside +- 2.0 GB):
+#           bigb81-128 47.72   bigb81-244 75.82   bigb96-128 51.78   bigb96-216 75.89
+#         meta.build_peak_gb (MODEL, +- 1.5 GB): 38.71 at B 128, 52.33 at B 216, 56.66 at B 244
+#   BB-1  meta.preflight_peak_gb <= meta.peak_gb + 0.5 GB (no second engine; FALSIFIED otherwise)
+#   BB-T  T_tick (round, EXACT, mean per tick) low / center / high, REPORT (MODEL from p5b2's categories):
+#           B 128: 1.97 / 2.36 / 2.62 s   B 216: 2.82 / 3.75 / 4.37 s   B 244: 3.09 / 4.19 / 4.93 s
+#   BB-D  the draft-only tick's device time td_dev = gemm + att + sel + store (the reconciliation's td proxy):
+#           B 128: 77 / 92 / 107 ms       B 216: 99 / 135 / 171 ms      B 244: 106 / 148 / 191 ms
+#         its wall per tick: B 128 0.91 / 1.09 / 1.22 s, B 216 1.28 / 1.71 / 2.03 s, B 244 1.40 / 1.91 / 2.28 s
+#         (EXACT pads every GEMM to m_fix = 4B rows: the draft tick's gemm is about 41 / 63 / 70 ms there)
+#   BB-E  REPORT: report()["k5"] (the demand peak vs X 64), refusals, Policy E evictions, xpool.report()'s peak lanes,
+#         r, decisions; the per-point peak_gb_cum
+#
 # OUTPUT: OUTROOT/sg5_<run>_<holder>[_<cell>]/summary.json (+ the children's shipped_*.json), and the step record
 # OUTROOT/sg5_<run>_<holder>[_<cell>].step/ (command with the uuid, its file, the pins and the cell, the copies, stdout
 # with one GATE / REPORT line per gate, stderr, exit + accounting, sacct row), both frozen. The job name is
@@ -114,7 +139,8 @@
 set -u
 NOSI=/mnt/beegfs/ojerbi/nosi-r2-sg5-p6                                                   # ROOT (p6; [b2] p5b2: nosi-r2-m2-sg5-b2; p4sc64: -p4d; p4a: -p4c; p3: nosi-r2-m2-sg5)
 NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                                 # ROOT of cell x1 only ([xpool], review m8)
-NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-integ                                              # ROOT of the stack1 cells only ([integ])
+NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-integ2                                             # ROOT of the stack1 cells only ([integ], integ2)
+NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -140,7 +166,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|stack1a|stack1t|stack1b] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1a|stack1t|stack1b] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -149,7 +175,8 @@ TRANSPORT= CELL=
 for w in "$@"; do
     case $w in
         gilfree|gather) [ -z "$TRANSPORT" ] || usage; TRANSPORT=$w ;;
-        p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|stack1a|stack1t|stack1b) [ -z "$CELL" ] || usage; CELL=$w ;;
+        p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1a|stack1t|stack1b)
+            [ -z "$CELL" ] || usage; CELL=$w ;;
         *) usage ;;
     esac
 done
@@ -160,11 +187,12 @@ SWEEP_RUN=$SWEEP
 SUFFIX=
 VARIANTS=
 XPOOL=                                                      # [xpool] x1 only
-STACKARG=()                                                 # [integ] the stack1 cells only
-BATCH=64                                                    # [integ] stack1b: 264
-STEPMEM=120G                                                # [integ] stack1b: 240G (the pinned host rows, B 264)
-POOLBASE=(--pool-baseline)                                  # [integ] stack1a / stack1b: none
+STACKARG=()                                                 # [integ] the stack1 cells only (BATCH / MEMG / POOLB below)
 PC=96 PX=32 PRV=16                                          # the primary point (C, X, R_ver)
+BATCH=64 STEPS=48 MEMG=120G                                 # [bigb] every other cell: as before
+POOLB=(--pool-baseline)                                     # [bigb] every other cell: as before
+BIGB=                                                       # [bigb] the bigb cells only
+BIGBARG=()
 case $CELL in
     "") ;;                                                  # the default: p3's arguments
     p4a) SWEEP_RUN= ; SUFFIX=_p4a ;;                        # the six points; --sweep left out (its default "": none)
@@ -174,13 +202,16 @@ case $CELL in
     p6) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_p6         # p5b2's point, EXACT, the 2 x 2
         VARIANTS=torch/per_call,fused/per_call,torch/batched,fused/batched ;;
     x1) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_x1 ; XPOOL=64 ; NOSI=$NOSI_X1 ;;   # [xpool] p5b2's point
-    stack1a) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1a ; NOSI=$NOSI_INTEG ; POOLBASE=()
+    stack1a) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1a ; NOSI=$NOSI_INTEG ; POOLB=()
              STACKARG=(--stack full --stack-compare --X-pool 64 --arrival-lag 2 --sel-check) ;;   # [integ] equality
     stack1t) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1t ; NOSI=$NOSI_INTEG
              STACKARG=(--stack full --X-pool 64 --shared-unchecked) ;;                              # [integ] timing, B 64
-    stack1b) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1b ; NOSI=$NOSI_INTEG ; POOLBASE=()
-             BATCH=264 ; STEPMEM=240G
-             STACKARG=(--stack full --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64) ;;   # [integ] B 264
+    stack1b) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_stack1b ; NOSI=$NOSI_INTEG ; POOLB=()
+             BATCH=264 ; MEMG=240G
+             STACKARG=(--stack full --X-pool 64 --shared-unchecked --repeat-docs --shipped-batch 64 --log-slots -1) ;;
+    bigb*) MODES=exact ; BACKENDS=b2 ; PX=64 ; PRV=16 ; SWEEP_RUN= ; SUFFIX=_${CELL//-/_} ; NOSI=$NOSI_BIGB   # [bigb]
+        BIGB=$CELL ; PC=${CELL:4:2} ; BATCH=${CELL#bigb??-} ; STEPS=24 ; MEMG=200G ; POOLB=()
+        BIGBARG=(--layout pool --X-pool 64 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped) ;;
 esac
 VARIANTARG=()                                               # [batched-rebuild] no --variants in every other cell
 [ -z "$VARIANTS" ] || VARIANTARG=(--variants "$VARIANTS")
@@ -221,8 +252,14 @@ done
 [ -z "$XPOOL" ] || git -C "$NOSI" rev-parse -q --verify "$NSHA:nosi/nosi/r2_xpool.py" > /dev/null ||
     stop "nosi/nosi/r2_xpool.py is not tracked at $NSHA (cell x1)"
 if [ "${#STACKARG[@]}" -gt 0 ]; then                        # [integ] the stack's modules, tracked at the pinned commit
-    for f in nosi/nosi/r2_xpool.py nosi/nosi/r2_fusedres.py nosi/nosi/bi_paged_attention_shared.py; do
+    for f in nosi/nosi/r2_xpool.py nosi/nosi/r2_fusedres.py nosi/nosi/bi_paged_attention_shared.py \
+             benchmarks/Efficiency/bigb_core.py; do
         git -C "$NOSI" rev-parse -q --verify "$NSHA:$f" > /dev/null || stop "$f is not tracked at $NSHA (cell $CELL)"
+    done
+fi
+if [ -n "$BIGB" ]; then                                     # [bigb] the pool layout and the token-log size
+    for f in nosi/nosi/r2_xpool.py benchmarks/Efficiency/bigb_core.py; do
+        git -C "$NOSI" rev-parse -q --verify "$NSHA:$f" > /dev/null || stop "$f is not tracked at $NSHA (cell $BIGB)"
     done
 fi
 [ "$(git -C "$NOSI" rev-parse -q --verify "$BIATTN_SHA:$BIATTN_PATH")" = "$BIATTN_BLOB" ] ||
@@ -260,19 +297,20 @@ A=$1
 shift
 exec "$A" exec --nv --cleanenv --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" "$@"'
 ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) srun --jobid="$JOB" --job-name="$NAME"
-      --ntasks=1 --cpus-per-task=16 --mem="$STEPMEM" --gres=gpu:a100:1 --time="$STEP_MIN" --export=NONE
+      --ntasks=1 --cpus-per-task=16 --mem="$MEMG" --gres=gpu:a100:1 --time="$STEP_MIN" --export=NONE
       /bin/sh -c "$CHILD" sg5-child "$GPU_UUID" "$APPTAINER" --bind /mnt/beegfs/ojerbi:/mnt/beegfs/ojerbi "${ENVS[@]}"
       "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_tick_sg5.py" --out "$OUT" --model "$MODEL"
       --workload "$WL" --biattn "$ATTN_MOD" --gilfree "$GF_DIR" --gilfree-build "$JIT/gilfree_build"
-      --threads "$THREADS" --transport "$TRANSPORT" --batch "$BATCH" --S 16128 --steps 48 --K 3 --LAMBDA 7 --modes "$MODES"
+      --threads "$THREADS" --transport "$TRANSPORT" --batch "$BATCH" --S 16128 --steps "$STEPS" --K 3 --LAMBDA 7 --modes "$MODES"
       --backends "$BACKENDS" --C "$PC" --X "$PX" --R-ver "$PRV" "${SWEEPARG[@]}" --sweep-steps 24 --draft-ticks 12 --shipped-steps 24
-      "${POOLBASE[@]}" --preflight-steps 4 "${VARIANTARG[@]}" "${XPOOLARG[@]}" "${STACKARG[@]}")
+      "${POOLB[@]}" --preflight-steps 4 "${VARIANTARG[@]}" "${XPOOLARG[@]}" "${BIGBARG[@]}" "${STACKARG[@]}")
 if [ "$DRY" = 1 ]; then
     echo "R2 SG5 step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob workload $WL_SHA gpu_uuid $GPU_UUID ($UFILE)"
     echo "R2 SG5 step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; packer $GF_SHA:$GF_PY blob $GF_PY_BLOB, $GF_CPP blob $GF_CPP_BLOB -> $GF_DIR; transport $TRANSPORT; cell ${CELL:-default}"
     echo "R2 SG5 step: primary point C $PC X $PX R_ver $PRV; equal-memory shipped baseline NOSI_POOL_BLOCKS = C + X + 4 - 64 = $EQ_POOL"
     [ -z "$XPOOL" ] || echo "R2 SG5 step: [xpool] root $NOSI, layout both (stream, pool, stream2), X_pool $XPOOL, arrival lag 2; k5 rule NOSI_POOL_BLOCKS = C + 4 - 64 + X_pool / 64 = $((PC + 4 - 64 + XPOOL / 64))"
-    [ "${#STACKARG[@]}" -eq 0 ] || echo "R2 SG5 step: [integ] root $NOSI, batch $BATCH, step memory $STEPMEM, stack arguments ${STACKARG[*]}"
+    [ "${#STACKARG[@]}" -eq 0 ] || echo "R2 SG5 step: [integ] root $NOSI, batch $BATCH, step memory $MEMG, stack arguments ${STACKARG[*]}"
+    [ -z "$BIGB" ] || echo "R2 SG5 step: [bigb] root $NOSI, cell $BIGB: layout pool, C $PC, B $BATCH, X_pool 64, arrival lag 2, $STEPS steps, token log sized (-1), no shipped child, mem $MEMG"
     printf '%q ' "${ARGV[@]}"
     echo
     exit 0
@@ -307,10 +345,10 @@ printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/comman
 printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s workload=%s utc_start=%s\n' "$NSHA" \
     "$blob" "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "$WL_SHA" "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
     stop "cannot write $REC (sg5_active stays)"
-printf 'biattn=%s:%s blob=%s packer=%s py=%s cpp=%s threads=%s transport=%s sweep=%s splits=%s cell=%s modes=%s backends=%s C=%s X=%s R_ver=%s eq_pool=%s variants=%s xpool=%s batch=%s stepmem=%s stack=%s\n' \
+printf 'biattn=%s:%s blob=%s packer=%s py=%s cpp=%s threads=%s transport=%s sweep=%s splits=%s cell=%s modes=%s backends=%s C=%s X=%s R_ver=%s eq_pool=%s variants=%s xpool=%s batch=%s steps=%s mem=%s stack=%s\n' \
     "$BIATTN_SHA" "$BIATTN_PATH" "$BIATTN_BLOB" "$GF_SHA" "$GF_PY_BLOB" "$GF_CPP_BLOB" "$THREADS" "$TRANSPORT" \
     "${SWEEP_RUN:-none}" "$SPLITS" "${CELL:-default}" "$MODES" "$BACKENDS" "$PC" "$PX" "$PRV" "$EQ_POOL" "${VARIANTS:-none}" \
-    "${XPOOL:-none}" "$BATCH" "$STEPMEM" "${STACKARG[*]:-none}" >> "$REC/command.txt" ||
+    "${XPOOL:-none}" "$BATCH" "$STEPS" "$MEMG" "${STACKARG[*]:-none}" >> "$REC/command.txt" ||
     stop "cannot write $REC (sg5_active stays)"
 "${ARGV[@]}" < /dev/null > "$REC/stdout.txt" 2> "$REC/stderr.txt"
 rc=$?
