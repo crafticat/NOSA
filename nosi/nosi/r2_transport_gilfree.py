@@ -247,9 +247,9 @@ class GilfreeTransport:
             if d in dst:
                 raise ValueError("two transfers into one destination %s (b %d h %d slot %d)" % (d, tr.b, tr.h, tr.slot))
             dst.add(d)
-            if flat and (tr.phys is None or not 0 <= tr.phys < self.n_slots):
-                raise ValueError("gilfree (xpool): transfer seq %d (b %d h %d slot %d) has lane %r outside [0, %d)"
-                                 % (tr.seq, tr.b, tr.h, tr.slot, tr.phys, self.n_slots))
+            if flat and (tr.phys is None or not 0 <= tr.phys < self.xpool.A):   # the history arena (review m2)
+                raise ValueError("gilfree (xpool): transfer seq %d (b %d h %d slot %d) has lane %r outside the history "
+                                 "arena [0, %d)" % (tr.seq, tr.b, tr.h, tr.slot, tr.phys, self.xpool.A))
             if not (0 <= tr.block < self.nblk and (flat or 0 <= tr.slot < self.n_slots) and 0 <= tr.b < self.B):
                 raise ValueError("gilfree: transfer seq %d (b %d, block %d, slot %d) outside the geometry (B %d, %d "
                                  "complete host blocks, %d slots)" % (tr.seq, tr.b, tr.block, tr.slot, self.B,

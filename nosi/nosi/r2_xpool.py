@@ -32,9 +32,19 @@ THE ERROR FLAG err (0-dim int64 on the device; ResidencySC watches it: the tick'
   2 (ERR_ALIAS)   after a bind the layer's binding is not injective (two bound slots on one lane of a head) or the free
                   list disagrees with the bindings (audit, device ops, every bind);
   4 (ERR_UNBOUND) a page table or a gather names an unbound slot.
-NEGATIVE CONTROL (mut, tests only): "alias" hands, at the first bind where it can, the lane of the bind's first new
-slot of a head to a new slot of ANOTHER request too (host reads; once per object); plant_log records both slots (the
-precondition of the control).
+NEGATIVE CONTROLS (mut, tests only; host reads):
+  "alias"              at the first bind where it can, the lane of the bind's first new slot of a head goes to a new
+                       slot of ANOTHER request too (once per object); plant_log records both slots.
+  "release_inflight"   release_free also unbinds INFLIGHT slots (a transfer may still land in the lane);
+  "release_releasing"  release_free also unbinds RELEASING slots (the lane's last reader may still run);
+                       early_log records every early unbind and, at a later bind, the request the lane went to.
+
+THE LANE-LEVEL ORDER (review M4 of 44d5e95; docs/R2_XPOOL_PLAN.md 2.2). A transfer waits the LOGICAL slot's last
+reader (Transfer.reader_ev), not the lane's previous occupant's (the M2 arena contract, kstep/transfer.py:26). The lane
+is safe because it is released only at FREE (the RELEASING -> FREE reader gate) AND because S-C's decision read is
+BLOCKING (ResidencySB._d2h: t.to("cpu") after every layer's attention): every reader of the tick has finished on the
+device before the next tick's release. ResidencySC refuses the pool when its class says the read is not blocking
+(DECISION_READ_BLOCKING); the CPU test XP10 pins both.
 """
 from __future__ import annotations
 
@@ -51,9 +61,11 @@ except ImportError:                                    # pragma: no cover - envi
 BLOCK = 64
 N_TAIL = 4
 MODES = ("pool", "resident")
-XPOOL_MUTS = ("alias",)
+XPOOL_MUTS = ("alias", "release_inflight", "release_releasing")
 ERR_FULL, ERR_ALIAS, ERR_UNBOUND = 1, 2, 4
 POOL_RULES = ("stream", "k5")
+# r2_residency_sc's state codes (C_FREE .. C_RELEASING = range(6)); the CPU test XP10 pins them equal
+CODE_FREE, CODE_INFLIGHT, CODE_RELEASING = 0, 1, 5
 
 
 class XPoolError(RuntimeError):
@@ -135,6 +147,7 @@ class XPool:
         self.peak = torch.zeros((L_, H_), dtype=torch.int64, device=self.device)   # REPORT: most lanes bound at once
         self.binds = 0                                                               # bind calls (host count)
         self.plant_log: List[Dict] = []
+        self.early_log: List[Dict] = []                                              # the early-release controls
 
     # ------------------------------------------------------------------------------------------------ geometry
     def tail_pos(self, b: int, j: int) -> int:
@@ -176,6 +189,7 @@ class XPool:
             setattr(c, name, getattr(self, name).clone())
         c.mut = dict(self.mut)
         c.plant_log = list(self.plant_log)
+        c.early_log = [dict(e) for e in self.early_log]
         return c
 
     # ------------------------------------------------------------------------------------------------ binding
@@ -207,6 +221,8 @@ class XPool:
         newpos = torch.gather(free_sorted, 1, rank.clamp(max=A - 1))
         if self.mut.get("alias") and not self.plant_log:
             newpos = self._plant_alias(l, assign, newpos)                           # NEGATIVE CONTROL (host reads)
+        if self.early_log:
+            self._note_rebinds(l, assign, newpos)                                   # NEGATIVE CONTROL (host reads)
         cur_h = cur.permute(1, 0, 2).reshape(H, B * NS)
         self.pos_of[l, :, :, :NS] = torch.where(assign, newpos, cur_h).view(H, B, NS).permute(1, 0, 2)
         mark = torch.zeros((H, A + 1), dtype=torch.bool, device=dev)
@@ -235,6 +251,18 @@ class XPool:
             return out
         return newpos
 
+    def _note_rebinds(self, l: int, assign: torch.Tensor, newpos: torch.Tensor) -> None:
+        """NEGATIVE CONTROLS (early release): every early-unbound lane of layer l that this bind gives to a slot records
+        the request it went to (the controls' precondition: a lane changed hands after an early unbind)."""
+        NS = self.n_hist
+        for h in range(self.H):
+            js = assign[h].nonzero().view(-1).tolist()
+            lanes = newpos[h].tolist()
+            for j in js:
+                for e in self.early_log:
+                    if e["l"] == l and e["h"] == h and e["lane"] == lanes[j] and e.get("to") is None:
+                        e["to"] = (j // NS, j % NS)
+
     def audit(self, l: int) -> None:
         """Device ops: per head of layer l, every lane holds at most one bound slot, and the free list (occ) is exactly
         the set of bound lanes; else err |= ERR_ALIAS."""
@@ -249,15 +277,19 @@ class XPool:
         bad = torch.any(c > 1) | torch.any((c > 0) != self.occ[l])
         self.err.bitwise_or_(bad.to(torch.int64) * ERR_ALIAS)
 
-    def release_free(self, free: torch.Tensor) -> None:
-        """Unbind every bound slot that is FREE (free (L, B, H, n_hist) bool on the device: the device mirror's
-        code == FREE after sync_mirror; a FREE slot's last reader completed, K4 / T3). Device ops only."""
+    def release_free(self, code: torch.Tensor) -> None:
+        """Unbind every bound slot that is FREE (code (L, B, H, n_hist): the device mirror's state codes after
+        sync_mirror; a FREE slot's last reader completed, K4 / T3). Device ops only (the early-release NEGATIVE
+        CONTROLS read the host in _early)."""
         if self.mode != "pool":
             return
         L, H, NS, A = self.L, self.H, self.n_hist, self.A
         dev = self.device
         p = self.pos_of[..., :NS]
-        rel = free.to(torch.bool) & (p >= 0)                                        # (the mirror: the same device)
+        free = code == CODE_FREE                                                    # (the mirror: the same device)
+        if self.mut.get("release_inflight") or self.mut.get("release_releasing"):
+            free = self._early(code, p, free)
+        rel = free & (p >= 0)
         li = torch.arange(L, device=dev).view(L, 1, 1, 1)
         hi = torch.arange(H, device=dev).view(1, 1, H, 1)
         idx = (li * H + hi) * (A + 1) + torch.where(rel, p, torch.full_like(p, A))
@@ -265,6 +297,15 @@ class XPool:
         clr.index_put_((idx.reshape(-1),), rel.reshape(-1))     # the dummy lane A takes only False values
         self.occ &= ~clr.view(L, H, A + 1)[..., :A]
         self.pos_of[..., :NS] = torch.where(rel, torch.full_like(p, -1), p)
+
+    def _early(self, code: torch.Tensor, p: torch.Tensor, free: torch.Tensor) -> torch.Tensor:
+        """NEGATIVE CONTROLS (tests only): the FREE mask plus the INFLIGHT (release_inflight) or RELEASING
+        (release_releasing) slots; each bound one is recorded in early_log (layer, request, head, slot, lane, code)."""
+        bad = CODE_INFLIGHT if self.mut.get("release_inflight") else CODE_RELEASING
+        early = (code == bad) & (p >= 0)
+        for (l, b, h, s) in early.nonzero().tolist():
+            self.early_log.append(dict(l=l, b=b, h=h, s=s, lane=int(p[l, b, h, s]), code=bad, to=None))
+        return free | early
 
     # ------------------------------------------------------------------------------------------------ translation
     def translate(self, l: int, table: torch.Tensor, seq_idx: torch.Tensor) -> torch.Tensor:
@@ -373,9 +414,28 @@ def _check_entries(dst_k, dst_v, dst_b, src_k, src_v, src_c, ent) -> None:
         raise XPoolError("h2d_entries: dst_b (rows, H) and src_c (B, S, H)")
 
 
+def entry_extents(dst_k, dst_b, src_k, src_c):
+    """The extents an entry must lie in: (source requests, heads, source K / V rows, source cis rows or -1 without
+    bias, destination rows)."""
+    return (int(src_k.shape[0]), int(dst_k.shape[1]), int(src_k.shape[1]),
+            int(src_c.shape[1]) if (dst_b is not None and src_c is not None) else -1, int(dst_k.shape[0]))
+
+
+def entry_in_bounds(b, h, blk, pos, ok, bs, nb, nh, s_kv, s_c, rows) -> bool:
+    """THE rule the kernel and the twin share (review M2 of 44d5e95): an entry is copied iff it is valid and every row
+    it names exists: 0 <= b < nb, 0 <= h < nh, 0 <= blk with (blk + 1) bs <= s_kv (and <= s_c with a bias), and
+    0 <= pos with (pos + 1) bs <= rows. Otherwise nothing of it is written."""
+    if not ok or not (0 <= b < nb and 0 <= h < nh and blk >= 0 and pos >= 0):
+        return False
+    if (blk + 1) * bs > s_kv or (s_c >= 0 and (blk + 1) * bs > s_c):
+        return False
+    return (pos + 1) * bs <= rows
+
+
 def h2d_entries_twin(dst_k, dst_v, dst_b, src_k, src_v, src_c, ent, bs: int = BLOCK) -> int:
     """The CPU TWIN of _h2d_entries_kernel: the SAME flat element offsets from the base pointers (lesson L28): source
     b * s0 + (blk * bs + r) * s1 + h * s2 + d, destination (pos * bs + r) * t0 + h * t1 + d; bias the same without d.
+    An entry outside the extents (entry_in_bounds: the kernel's own rule) is skipped whole, as the kernel skips it.
     Returns the entries copied. Host loops: tests only."""
     _check_entries(dst_k, dst_v, dst_b, src_k, src_v, src_c, ent)
     D = dst_k.shape[2]
@@ -383,8 +443,9 @@ def h2d_entries_twin(dst_k, dst_v, dst_b, src_k, src_v, src_c, ent, bs: int = BL
     d = torch.arange(D, dtype=torch.int64).view(1, D)
     n = 0
     pairs = [(dst_k, src_k), (dst_v, src_v)]
+    ext = entry_extents(dst_k, dst_b, src_k, src_c)
     for (b, h, blk, pos, ok) in ent.to("cpu").t().tolist():
-        if not ok:
+        if not entry_in_bounds(b, h, blk, pos, ok, bs, *ext):
             continue
         for dst, src in pairs:
             so = b * src.stride(0) + (blk * bs + r) * src.stride(1) + h * src.stride(2) + d
@@ -407,14 +468,19 @@ if triton is not None:
     def _h2d_entries_kernel(DK, DV, DB, SK, SV, SC, ENT, n_ent,
                             s_kb, s_ks, s_kh, s_vb, s_vs, s_vh, s_cb, s_cs, s_ch,
                             t_k0, t_k1, t_v0, t_v1, t_b0, t_b1,
+                            nb, nh, s_kv, s_c, rows,
                             HAS_BIAS: tl.constexpr, BS: tl.constexpr, D: tl.constexpr):
         e = tl.program_id(0).to(tl.int64)
         ok = tl.load(ENT + 4 * n_ent + e)
-        if ok != 0:
-            b = tl.load(ENT + e)
-            h = tl.load(ENT + n_ent + e)
-            blk = tl.load(ENT + 2 * n_ent + e)
-            pos = tl.load(ENT + 3 * n_ent + e)
+        b = tl.load(ENT + e)
+        h = tl.load(ENT + n_ent + e)
+        blk = tl.load(ENT + 2 * n_ent + e)
+        pos = tl.load(ENT + 3 * n_ent + e)
+        go = (ok != 0) & (b >= 0) & (b < nb) & (h >= 0) & (h < nh) & (blk >= 0) & (pos >= 0)   # entry_in_bounds
+        go = go & ((blk + 1) * BS <= s_kv) & ((pos + 1) * BS <= rows)
+        if HAS_BIAS:
+            go = go & ((blk + 1) * BS <= s_c)
+        if go:
             r = tl.arange(0, BS).to(tl.int64)
             d = tl.arange(0, D).to(tl.int64)
             src = blk * BS + r
@@ -430,14 +496,17 @@ else:                                                  # pragma: no cover
     _h2d_entries_kernel = None
 
 
-def h2d_entries(dst_k, dst_v, dst_b, src_k, src_v, src_c, ent, bs: int = BLOCK) -> None:
-    """Copy each valid entry (b, h, block, position) of ent (5, N): the host rows block * bs .. + bs of (b, h) (K, V;
-    with dst_b also the cis rows of src_c) into lane h of position `position` of the flat store, on the CURRENT stream.
-    CUDA: ONE launch of _h2d_entries_kernel, grid (N,) (an invalid entry returns at once); the sources may be pinned
-    host rows (zero-copy reads, as NOSI's flash_h2d_from_mask). CPU: h2d_entries_twin. SOURCE ONLY on the GPU (not
-    run: the registered cell X1, docs/R2_XPOOL_PLAN.md, is its first run)."""
+def h2d_entries(dst_k, dst_v, dst_b, src_k, src_v, src_c, ent, bs: int = BLOCK, kernel: Optional[bool] = None) -> None:
+    """Copy each valid entry (b, h, block, position) of ent (5, N) that lies in the extents (entry_in_bounds): the
+    host rows block * bs .. + bs of (b, h) (K, V; with dst_b also the cis rows of src_c) into lane h of position
+    `position` of the flat store, on the CURRENT stream. CUDA (kernel None): ONE launch of _h2d_entries_kernel, grid
+    (N,) (an entry out of bounds returns at once); the sources may be pinned host rows (zero-copy reads, as NOSI's
+    flash_h2d_from_mask). CPU: h2d_entries_twin. kernel True: the kernel on any device (the CPU test XP11 runs it under
+    TRITON_INTERPRET=1). Not run on the GPU yet: cell x1 (docs/R2_XPOOL_PLAN.md) is its first GPU run."""
     _check_entries(dst_k, dst_v, dst_b, src_k, src_v, src_c, ent)
-    if dst_k.device.type != "cuda":
+    if kernel is None:
+        kernel = dst_k.device.type == "cuda"
+    if not kernel:
         h2d_entries_twin(dst_k, dst_v, dst_b, src_k, src_v, src_c, ent, bs)
         return
     if _h2d_entries_kernel is None:
@@ -446,11 +515,15 @@ def h2d_entries(dst_k, dst_v, dst_b, src_k, src_v, src_c, ent, bs: int = BLOCK) 
     if N == 0:
         return
     D = int(dst_k.shape[2])
+    if D < 1 or D & (D - 1) or int(bs) & (int(bs) - 1):
+        raise XPoolError("h2d_entries: D %d and the block %d must be powers of two (tl.arange)" % (D, bs))
     has_b = dst_b is not None
     db, sc = (dst_b, src_c) if has_b else (dst_k, src_k)
+    nb, nh, s_kv, s_c, rows = entry_extents(dst_k, dst_b, src_k, src_c)
     _h2d_entries_kernel[(N,)](
         dst_k, dst_v, db, src_k, src_v, sc, ent, N,
         src_k.stride(0), src_k.stride(1), src_k.stride(2), src_v.stride(0), src_v.stride(1), src_v.stride(2),
         sc.stride(0), sc.stride(1), sc.stride(2),
         dst_k.stride(0), dst_k.stride(1), dst_v.stride(0), dst_v.stride(1), db.stride(0), db.stride(1),
+        nb, nh, s_kv, s_c, rows,
         HAS_BIAS=has_b, BS=int(bs), D=D)

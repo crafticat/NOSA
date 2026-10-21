@@ -562,7 +562,7 @@ class OwnResidency(ResidencySparse):
         flat = self._d2h(torch.cat(parts)).tolist()                   # ONE read (the flags, the counts, the looks)
         self.flag_values = dict(zip(names, flat[:len(names)]))
         raised = sorted(n for n, v in self.flag_values.items() if v)
-        if raised:
+        if raised and raised != ["xpool_err"]:                        # ([xpool]: xpool_err alone waits, see below)
             raise CapacityRefusal("S-C: the watched device flag(s) %s are set at this tick: the tick is void (none "
                                   "of its decisions is applied)" % raised)
         at = len(names)
@@ -597,6 +597,9 @@ class OwnResidency(ResidencySparse):
             raise CapacityRefusal("S-C sparse record: a layer's record holds more entries than its capacity (layer, "
                                   "kind, entries, capacity: %s): the tick is void (none of its decisions is applied)"
                                   % capped)
+        if raised:                                                    # [xpool] after the overflow (review m7)
+            raise CapacityRefusal("S-C: the watched device flag(s) %s are set at this tick: the tick is void (none "
+                                  "of its decisions is applied)" % raised)
         self._apply_b2(steps, info)
         self.b2_applied += 1
 

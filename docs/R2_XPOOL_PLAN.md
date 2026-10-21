@@ -38,8 +38,19 @@ The residency service does not change its decisions. Its slots stay LOGICAL `(b,
   `device_draft`, and before the urgent gather and the draft bias fill. Per head, the new slots in `(b, s)` order get
   the lowest free lanes. Device ops only; no host read.
 - UNBIND: at the first resolve of the next tick, after `sync_mirror`, every FREE slot gives its lane back
-  (`release_free(dmirror.code == FREE)`). A FREE slot's last reader is complete (K4, T3), so a new owner can write
-  the lane.
+  (`release_free(dmirror.code)`).
+- THE LANE-LEVEL ORDER (review M4). A transfer waits the LOGICAL slot's last reader (`Transfer.reader_ev`,
+  `r2_residency.py` `_take`), not the lane's previous occupant's (the M2 arena contract, `kstep/transfer.py:26`, says
+  "the previous PHYSICAL occupant"). Two facts make the lane safe for a new owner, which in the pool can be ANOTHER
+  request:
+  1. a lane is released only at FREE, and RELEASING -> FREE waits the slot's last reader (`ownership.py:435-450`);
+  2. two drop paths set `last_reader = None` without a reader gate (`ownership.py:338-339`, `:357-358`). There the
+     lane is safe only because S-C's decision read is BLOCKING (`ResidencySB._d2h`: `t.to("cpu")`, after every
+     layer's attention), so every reader of a tick has finished before the next tick's release.
+  The pool therefore DEPENDS on the blocking read. `ResidencySB.DECISION_READ_BLOCKING = True` states it, and
+  `ResidencySC.resolve` refuses the pool when a class sets it False. XP10 pins `_d2h` (no `non_blocking`) and checks the
+  refusal. A captured or asynchronous tick must either keep a blocking read or add a per-lane last-reader event (the
+  M2 arena's rule) before it uses the pool. XP13 checks the order on the CPU with readers that complete two ticks late.
 - POLICY E reuses a slot of the same stream. Its binding stays, so no lane changes hands there.
 - CAPACITY: K5 counts a slot from its take until it is FREE (RELEASING included, `ownership.py:135-136`). Per layer,
   at most `B * H * C + X` slots are in use, so per head at most `B * C + X`. With `X_pool >= X` the arena never runs
@@ -69,8 +80,8 @@ refuses the tick when it is set.
 | `r2_residency_sparse.py` | the draft bias fill on lanes |
 | `r2_own2.py` | `memory()["slots_physical"]` counts lanes |
 | `r2_transport_gilfree.py` | `xpool=`: the group's `m' = Transfer.phys`; the flat destination |
-| `r2_tick_sg5.py` | `--layout stream/pool/both`, `--X-pool`, `--pool-rule stream/k5/both`, `--kv-heads`; `GatherTransport(xpool=)`; `one_point_both` |
-| `r2_tick_sg5_step.sh` | cell `x1`; ROOT `nosi-r2-xpool`; `r2_xpool.py` in the tracked-file list |
+| `r2_tick_sg5.py` | `--layout stream/pool/both`, `--X-pool`, `--pool-rule stream/k5/both`, `--arrival-lag`; `GatherTransport(xpool=)`; `one_point_both` (stream, pool, stream2) |
+| `r2_tick_sg5_step.sh` | cell `x1` with its own root `NOSI_X1` (every other cell keeps `NOSI`, review m8); `r2_xpool.py` checked for x1 |
 
 The default stays the per-stream layout. Every new branch is behind `xpool is not None` or `--layout != stream`.
 Backends v1 and sb refuse the pool (their takes do not go through the device binder).
@@ -117,7 +128,9 @@ Per request (bytes from `store_bytes_formula`, CPU test XP2 checks each value):
 Why this layout costs more than the audit's pool: a position has H lanes, and K5's X bounds the SUM over heads. So to
 keep K5's meaning exact, each head needs X lanes, and the pool holds H x X lanes, not X. The extra is
 (H - 1) x X_pool x 16,448 B per request: 6.69-6.94 MB at X_pool 407-422. A head-agnostic pool needs a packer whose
-destination row does not add h (E's `gilfree_pack.cpp:152`), so it is out of scope here (call it S6b).
+destination row does not add h (E's `gilfree_pack.cpp:152`), so it is out of scope here (call it S6b). S6b also
+touches `_h2d_entries_kernel` and `draft_bias_fill_flat` (both add h). Piece 3's kernel needs no edit for it: pass
+stride(2) = 0 views and per-(row, head) positions (review m8).
 
 At B 64, cell x1: store 13,608,943,616 B = 13.61 GB vs 22,097,690,624 B = 22.10 GB. Difference 8,488,747,008 B =
 8.49 GB.
@@ -147,26 +160,51 @@ X_pool 64 rows are valid only for runs that keep K5's X at 64.
 
 `r2_xpool.equal_memory_pool` (harness: `--pool-rule`, default `stream`, so p3-p6 stay comparable):
 - `stream` (today): P = C + X + 4 - 64. At C 96, X 64: 100.
-- `k5`: P = C + 4 - 64 + floor(pool_lanes / (B x H)), with pool_lanes = H x X_pool in this layout. At C 96, X_pool 64,
-  B 64, H 2: 36 + 1 = 37. With the audit's head-agnostic 64 slots: 36; with 422 slots: 39 (the audit's 36 + 3.30,
-  rounded down).
+- `k5`: P = C + 4 - 64 + floor(pool_lanes / (B x H)), with pool_lanes = H x X_pool in this layout, so H cancels:
+  P = C + 4 - 64 + floor(X_pool / B) (the harness's `pool_rule_value`; the `--kv-heads` argument of 44d5e95 is gone,
+  review m5). At C 96, X_pool 64, B 64: 36 + 1 = 37. With the audit's head-agnostic 64 slots: 36; with 422 slots: 39
+  (the audit's 36 + 3.30). This rule rounds DOWN; the audit's Q4 item 4 wrote ceil. The two agree at x1 (64 / 64 = 1)
+  and differ by 1 whenever X_pool / B is not whole.
 
 ## 6. The registered GPU cell x1 (SOURCE ONLY, not run; registered before any run)
 
-Command: `bash benchmarks/Efficiency/r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> x1`.
+Command: `bash benchmarks/Efficiency/r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> x1` (run from the
+`nosi-r2-xpool` checkout; x1's root is `NOSI_X1`, every other cell keeps the script's `NOSI`).
 Arguments: p5b2's point, EXACT only: `--modes exact --backends b2 --C 96 --X 64 --R-ver 16`, no sweep, 48 steps,
-gilfree 8 threads, the superset wait, unchecked b2, `--layout both --X-pool 64 --pool-rule both`. Per point the
-per-stream arm runs first, then the pool arm, each from a fresh engine and with its own draft-only tick. The preflight
-runs the pool layout.
+gilfree 8 threads, the superset wait, unchecked b2, `--layout both --X-pool 64 --pool-rule both --arrival-lag 2`.
+
+Revision after the review of 44d5e95 (B1, m6). Under free timing two runs of the same documents differ in their draft
+reads (note 12k, `docs/R2_STEP7_FETCH_RETENTION.md:739-747`), so a row-by-row comparison could fail for timing alone.
+Now:
+- every engine of the run (preflight, draft-only, rounds, both layouts) uses the fixed arrival lag D = 2 (12k's choice
+  for gilfree); each arm reports `arrival` (lag, forced, held);
+- per point three arms run in the order stream, pool, stream2. stream2 is the REPLICA: the same layout again, from a
+  fresh engine. It must pass the same comparison first (X-R); without that the bitwise gate is VOID;
+- the time and peak reports compare the pool with the MEAN of the two stream arms, so the arm order is not a confound.
 
 | id | quantity | prediction | falsifier |
 |---|---|---|---|
 | X-A | the b2 gilfree preflight on the POOL layout | PASS (MUST) | a refusal or an exception |
-| X-B | `SG5_exact_b2_XP_bitwise` (MUST): committed tokens, every tick's rows and every row's logit fingerprint equal | PASS | any difference |
+| X-R | `SG5_exact_b2_XP_replica` (MUST): stream2 = stream, every tick's rows and fingerprints and the committed tokens | PASS | any difference (then X-B is VOID: the comparison cannot pass under this timing) |
+| X-C | `SG5_exact_b2_XP_committed` (MUST): the committed tokens, stream vs pool | PASS | any difference |
+| X-B | `SG5_exact_b2_XP_bitwise` (MUST): every tick's rows and every row's logit fingerprint, stream vs pool | PASS | any difference with X-R passed |
 | X-S | `store_gb` per arm | 22.098 (stream), 13.609 (pool) | another value (it is tensor bytes) |
-| X-M | the round's peak GB, stream minus pool | 7.9-8.9 GB (MODEL 8.49) | below 7.5 or above 9.5 |
-| X-T | T_tick pool / stream | 0.97-1.05 | outside 0.85-1.15 (the registered 15 %) |
-| X-E | REPORT: the shipped baselines at P 100 and P 37; `xpool.report()` peak lanes per (layer, head) | - | - |
+| X-M | the round's peak GB, mean(stream) minus pool | 7.9-8.9 GB (MODEL 8.49) | below 7.5 or above 9.5 |
+| X-T | T_tick pool / mean(stream, stream2) | 0.97-1.05 | outside 0.85-1.15 (the registered 15 %) |
+| X-E | REPORT: the shipped baselines at P 100 and P 37; `xpool.report()` peak lanes per (layer, head); arrival forced / held; stream2 / stream T_tick | - | - |
+
+Scoring of X-T between the prediction and the falsifier (review m6c): a ratio in 1.05-1.15 or 0.85-0.97 is "outside
+the prediction, not falsified". It is a REPORT that asks for the per-category profile (`res`, `att`) before any claim.
+
+Peak values (review m6b): the fingerprint allocates about R x V x 8 B of int64 per tick (about 0.26 GB at R 256, V
+128,256) plus a float copy, outside the tick spans but inside `peak_gb_round`. So x1's absolute peaks are NOT
+comparable with p5b2's or p6's; only the drop X-M is scored.
+
+Time budget (review m6d; MODEL from p5b2's record `sg5_p5_2190876_p5b2.step`: the step ran 05:44:42Z-06:02:19Z,
+17.6 min; its two shipped children took 10.5 min, model load and build 3 min, the two preflights 27 s, one EXACT point
+1.75 min). x1: three shipped children (P 0, 100, 37) about 16 min; build 3.5 min; preflights 0.5 min; three EXACT arms
+5.3 min, doubled for the arrival lag's forced waits and the fingerprints: 10.5 min. Total about 30 min, under a quarter
+of STEP_MIN 120.
 
 Derivation of X-T: the pool adds per layer one page-table gather, two binds (two sorts of H x 6,208 lanes and ops over
 B x H x (C + X) = 20,480 slots, then the audit) and per tick one unbind over 655,360 slots and one device read
@@ -179,7 +217,10 @@ construction. The model, the build state and the twins are the same in both arms
 draft bias fill's buffer is (rows + 1) x H x 2 B per call, 2.7 MB (stream) vs 1.7 MB (pool).
 
 What a result decides:
-- X-B fails: the pool changes numbers. The cell's other values are void; the first difference names tick and row.
+- X-R fails: the run is not reproducible even with the fixed lag; X-B says nothing. Find the remaining timing source
+  first (X-C still holds or fails on its own).
+- X-B fails with X-R passed: the pool changes numbers. The cell's other values are void; the first difference names
+  tick and row.
 - X-B and X-M hold: the shared pool removes the row 1b term (8.49 GB at B 64) with no numerical change.
 - X-T fails high: a binder or translator op is slower than modelled. The profile categories `res` and `att` locate it.
 
@@ -199,6 +240,10 @@ What a result decides:
 | `test_XP7_the_harness_compares_the_two_arms` | `one_point_both`'s gates with a stand-in; the fingerprint sees one bit |
 | `test_XP8_the_step_cell_x1` | the step cell (DRYRUN on a clean checkout) |
 | `test_XP9_the_pool_per_layer_path_has_no_host_transfer` | F12d's tokens on bind / audit / release_free / translate / gather_entries / draft_bias_fill_flat; negative control: assign_phys reads |
+| `test_XP10_the_pool_needs_a_blocking_decision_read` | (M4) `_d2h` blocks; `DECISION_READ_BLOCKING`; the state codes; a non-blocking class is refused |
+| `test_XP11_the_entry_kernel_under_the_triton_interpreter` | (M2) the kernel = its twin under TRITON_INTERPRET=1 (fp32 / fp16 bias, no bias); the same out-of-bounds entries skipped; negative control (b / h swapped) |
+| `test_XP12_gather_entries_lands_a_real_decision_as_the_device_stand_in[f20b]`, `[f21b]` | (M1) real S-C decisions with Policy E: gather_entries + twin = CpuDeviceSim.gather; negative control: the mask without evict |
+| `test_XP13_the_pool_service_equals_the_per_stream_service_and_early_unbinds_are_caught` | (M3, M4) S-C pool = S-C per stream on F20b with a lane-level reader check; plants release_releasing (hazards) and release_inflight (the comparison differs), each with its precondition |
 
 Regression files to run with them: `test_r2_tick.py` (T9, T18, T19), `test_r2_tick_b2.py`, `test_r2_tick_p6.py`,
 `test_r2_residency.py` (F12d scans `ResidencySC.resolve` and `CudaDeviceOps.gather`; F23 now also lints
@@ -206,8 +251,13 @@ Regression files to run with them: `test_r2_tick.py` (T9, T18, T19), `test_r2_ti
 
 ## 8. Open points and risks
 
-- The kernel `_h2d_entries_kernel` never compiled. Only its CPU twin ran in a test design; cell x1 is its first run
-  (X-A, X-B).
+- The kernel `_h2d_entries_kernel` has not run on a GPU. XP11 runs it under the Triton interpreter; cell x1 is its
+  first GPU run (X-A, X-B).
+- The pool depends on S-C's blocking decision read (2.2, the lane-level order).
+- An xpool_err set in a tick that also overflows is reported AFTER the overflow refusal (S-C and B2 apply_tick), so
+  an overflowed page that names slot 0 is not blamed on the pool (review m7).
+- `Residency(xpool=)` refuses a transport whose `.xpool` is not the pool (review m2); TorchGather is built but only v1
+  calls it, and v1 refuses the pool.
 - The pool layout adds ONE device-to-host read per tick that issues draft transfers (`assign_phys`). S-C's "one read
   per tick" becomes two in the pool layout only.
 - The fingerprint is not a proof of bitwise equality: one differing element always changes it; several could cancel.

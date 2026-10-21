@@ -198,6 +198,11 @@ class ResidencySB(Residency):
         self._layer_ev: Dict[int, object] = {}
         self.d2h_reads = 0
 
+    # [xpool] the reads below are BLOCKING (t.to("cpu"), no non_blocking): S-C's tick-end decision read then waits for
+    # every reader of the tick. The shared X pool reuses lanes across requests on that ground (r2_xpool.py, the
+    # lane-level order); a class whose decision read does not block must set this False (the pool then refuses).
+    DECISION_READ_BLOCKING = True
+
     def _d2h(self, t: torch.Tensor) -> torch.Tensor:
         """Every device-to-host read of S-B goes through here (counted: test F10)."""
         self.d2h_reads += 1

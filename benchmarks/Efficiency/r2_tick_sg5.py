@@ -37,11 +37,12 @@ MUST gates: every run completes (no exception; a CapacityRefusal is reported wit
 the twins' counters equal the host mirrors after each round, the gilfree team ran on the requested threads.
 [xpool] THE SHARED X POOL LAYOUT (step S6, opt-in; nosi/nosi/r2_xpool.py, docs/R2_XPOOL_PLAN.md): --layout stream (the
 default: every arm as before) | pool (the store of B (C + 4) + X_pool positions per layer; --X-pool, default X; sc and
-b2 only) | both (each point runs the per-stream arm, then the pool arm, labelled <label>_stream / <label>_pool; the
-preflight runs the pool layout; MUST gate <label>_XP_bitwise: the committed tokens and every tick's rows and per-row
-logit fingerprints equal; REPORTS <label>_XP_peak (the round's peak GB, per arm, after a reset of the peak counter)
-and <label>_XP_tick (T_tick pool / stream)). --pool-rule stream (default: NOSI_POOL_BLOCKS = C + X + 4 - 64) | k5
-(r2_xpool.equal_memory_pool: C + 4 - 64 + floor(H X_pool / (B H)), H = --kv-heads) | both.
+b2 only) | both (each point runs three arms, stream, pool, stream2, labelled <label>_<arm>; needs --arrival-lag >= 1
+and no sweep; the preflight runs the pool layout; one_point_both: MUST gates <label>_XP_replica (stream2 = stream),
+<label>_XP_committed, <label>_XP_bitwise (rows and per-row logit fingerprints; VOID without the replica); REPORTS
+<label>_XP_peak and <label>_XP_tick against the mean of the two stream arms). --arrival-lag D (default 0 = free
+timing): the residency's fixed arrival lag (note 12k) for every engine of the run. --pool-rule stream (default:
+NOSI_POOL_BLOCKS = C + X + 4 - 64) | k5 (r2_xpool.equal_memory_pool: C + 4 - 64 + floor(X_pool / B)) | both.
 OUTPUT: --out/summary.json (after every run). The last stdout line is R2_TICK_SG5_DONE failed=<n>; exit = n (2 =
 refused). ENVIRONMENT: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0, NOSI_POOL_BLOCKS = 0 (the parent; a child sets its own).
 """
@@ -119,7 +120,9 @@ def parse_args(argv):
                     help="the pool's positions per layer (H lanes each); -1: X (K5's own bound)")
     ap.add_argument("--pool-rule", default="stream", choices=("stream", "k5", "both"),          # [xpool]
                     help="the equal-memory shipped baseline's NOSI_POOL_BLOCKS rule (with --pool-baseline)")
-    ap.add_argument("--kv-heads", type=int, default=2, help="H for --pool-rule k5 (NOSA-8B: 2)")  # [xpool]
+    ap.add_argument("--arrival-lag", type=int, default=0,                                        # [xpool] review B1
+                    help="the residency's fixed arrival lag D (note 12k; 0: free timing, the default); --layout both "
+                         "needs D >= 1, so the arms are comparable tick by tick")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -146,8 +149,11 @@ def parse_args(argv):
                  % (a.layout, XPOOL_BACKENDS))
     if a.X_pool != -1 and (a.layout == "stream" or a.X_pool < a.X):                              # [xpool]
         ap.error("--X-pool needs --layout pool / both and X_pool >= X (K5's bound per head)")
-    if a.kv_heads < 1:
-        ap.error("--kv-heads >= 1")
+    if a.arrival_lag < 0 or (a.layout == "both" and a.arrival_lag < 1):                         # [xpool] review B1
+        ap.error("--arrival-lag >= 0; --layout both needs --arrival-lag >= 1 (free timing makes two runs differ, "
+                 "note 12k)")
+    if a.layout == "both" and a.sweep_pts:                                                       # [xpool] review m4
+        ap.error("--layout both runs no sweep (the sweep's points would run the pool arm only)")
     return a
 
 
@@ -158,11 +164,12 @@ def pool_positions(a, X):                                                       
 
 def pool_rule_value(a, rule):                                                                   # [xpool]
     """[xpool] NOSI_POOL_BLOCKS of the equal-memory shipped baseline at the primary point under `rule` (before max(0,
-    .)): "stream" C + X + 4 - 64; "k5" C + 4 - 64 + floor(H X_pool / (B H)) = r2_xpool.equal_memory_pool's k5 rule
-    with pool_lanes = H X_pool (the CPU test XP4 pins the two together; the parent does not import nosi here)."""
+    .)): "stream" C + X + 4 - 64; "k5" C + 4 - 64 + floor(X_pool / B) = r2_xpool.equal_memory_pool's k5 rule with
+    pool_lanes = H X_pool (H cancels: a position has H lanes, one per head; review m5). Rounded DOWN (the audit's Q4.4
+    wrote ceil; at x1 both give 37). The CPU test XP4 pins the two together; the parent does not import nosi here."""
     if rule == "stream":
         return a.C + a.X + 4 - 64
-    return a.C + 4 - 64 + (a.kv_heads * pool_positions(a, a.X)) // (a.batch * a.kv_heads)
+    return a.C + 4 - 64 + pool_positions(a, a.X) // a.batch
 
 
 def parse_variants(text, twin):                                                                 # [batched-rebuild]
@@ -422,6 +429,8 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
     kw = dict(store_b=eng.store_bias, cis=cis, block_bytes=64 * 2 * eng.D * 2, host_wait=hw)
     if xp is not None:                                                                           # [xpool]
         kw["xpool"] = xp
+    if getattr(a, "arrival_lag", 0) > 0:                                                         # [xpool] review B1
+        kw["arrival_lag"] = a.arrival_lag
     if kind == "v1":
         svc = Residency(*args, **kw)
     elif kind == "sb":
@@ -581,6 +590,9 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
                                          + eng.store_bias) / 1e9, 3)
             if eng.xpool is not None:
                 info["xpool"] = eng.xpool.report()
+            info["arrival"] = dict(lag=getattr(svc, "arrival_lag", None),                       # review B1: REPORT
+                                   forced=getattr(svc, "arrival_forced", None),
+                                   held=getattr(svc, "arrival_held", None))
         if fp is not None:                                                                       # [xpool]
             info["committed_tokens"] = [list(r.out) for r in rnd.reqs]
         rs = summarize(eng.timer.report())
@@ -634,10 +646,10 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
 XP_TICK_BAND = 0.15                                                                             # [xpool] registered
 
 
-def compare_layouts(recs):                                                                     # [xpool]
-    """[xpool] recs[layout] = (per-tick rows, per-tick fingerprint lists, committed tokens). Returns (equal, compared
-    rows, the first difference or None)."""
-    s, p = recs["stream"], recs["pool"]
+def compare_layouts(recs, a_key="stream", b_key="pool"):                                       # [xpool]
+    """[xpool] recs[arm] = (per-tick rows, per-tick fingerprint lists, committed tokens). Returns (equal, compared
+    rows, the first difference or None) of arms a_key and b_key."""
+    s, p = recs[a_key], recs[b_key]
     if s[2] != p[2]:
         return False, 0, "committed tokens differ"
     if len(s[0]) != len(p[0]):
@@ -655,42 +667,68 @@ def compare_layouts(recs):                                                      
 
 def one_point_both(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_shipped, gates, label,
                    bare=False, point_fn=None):
-    """[xpool] --layout both: the per-stream arm, then the pool arm (one_point with layout and fingerprints), then
-    the MUST gate <label>_XP_bitwise and the REPORTS <label>_XP_peak / <label>_XP_tick (docs/R2_XPOOL_PLAN.md
-    section 6). point_fn: the CPU test's stand-in of one_point."""
+    """[xpool] --layout both (docs/R2_XPOOL_PLAN.md section 6; review B1, m6a): three arms in the order stream, pool,
+    stream2 (one_point with a layout and fingerprints; every arm with the run's fixed --arrival-lag). Gates:
+      <label>_XP_replica    MUST: stream2 equals stream under the SAME comparison (the gate can pass at all: L34)
+      <label>_XP_committed  MUST: the pool arm's committed tokens equal the stream arm's (whatever the replica says)
+      <label>_XP_bitwise    MUST: rows and every row's fingerprint equal, stream vs pool; VOID (not passed) when the
+                            replica failed
+      R_<label>_XP_peak / R_<label>_XP_tick  REPORTS: the pool vs the MEAN of the two stream arms (no order
+                            confound); the stream arms' own spread is printed with it.
+    point_fn: the CPU test's stand-in of one_point."""
     import torch
     point_fn = point_fn or one_point
     out, recs = {}, {}
-    for lay in ("stream", "pool"):
+    for arm, lay in (("stream", "stream"), ("pool", "pool"), ("stream2", "stream")):
         fp = []
         info = point_fn(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_shipped, gates,
-                        "%s_%s" % (label, lay), bare=bare, layout=lay, fp=fp)
+                        "%s_%s" % (label, arm), bare=bare, layout=lay, fp=fp)
         vals = torch.cat([v for (_, v) in fp]).tolist() if fp else []             # ONE read per arm, after it
         per_tick, at = [], 0
         for (rows, v) in fp:
             per_tick.append(vals[at:at + len(rows)])
             at += len(rows)
-        recs[lay] = ([r for (r, _) in fp], per_tick, info.pop("committed_tokens", None))
-        out[lay] = info
+        recs[arm] = ([r for (r, _) in fp], per_tick, info.pop("committed_tokens", None))
+        out[arm] = info
+    rep_ok, rep_n, rep_diff = compare_layouts(recs, "stream", "stream2")
+    rep_ok = rep_ok and rep_n > 0
+    gates.append(GB.gate(label + "_XP_replica", rep_ok, True, "stream vs stream2 (the same layout twice): %s, %d rows "
+                         "compared" % ("EQUAL" if rep_ok else "DIFFER (%s)" % (rep_diff or "no row compared"), rep_n)))
+    com_ok = recs["stream"][2] is not None and recs["stream"][2] == recs["pool"][2]
+    gates.append(GB.gate(label + "_XP_committed", com_ok, True, "committed tokens stream vs pool: %s"
+                         % ("equal" if com_ok else "DIFFER")))
     same, n, diff = compare_layouts(recs)
-    gates.append(GB.gate(label + "_XP_bitwise", same and n > 0, True,
-                         "%s: %d rows of %d ticks compared, committed tokens %s" % (
-                             "EQUAL" if same and n > 0 else "DIFFER (%s)" % (diff or "no row compared"), n,
-                             len(recs["stream"][0]), "equal" if recs["stream"][2] == recs["pool"][2] else "differ")))
-    ps, pp = out["stream"].get("peak_gb_round"), out["pool"].get("peak_gb_round")
+    ok = rep_ok and same and n > 0
+    if not rep_ok:
+        detail = "VOID: the replica differs, so this comparison cannot pass under the run's timing (pool vs stream: %s)" \
+                 % ("equal" if same and n > 0 else diff)
+    else:
+        detail = "%s: %d rows of %d ticks compared" % ("EQUAL" if ok else "DIFFER (%s)" % (diff or "no row compared"), n,
+                                                      len(recs["stream"][0]))
+    gates.append(GB.gate(label + "_XP_bitwise", ok, True, detail))
+
+    def mean2(key):
+        x, y = out["stream"].get(key), out["stream2"].get(key)
+        return None if x is None or y is None else (x + y) / 2.0
+    ps, pp = mean2("peak_gb_round"), out["pool"].get("peak_gb_round")
     ss, sp = out["stream"].get("store_gb"), out["pool"].get("store_gb")
     drop = None if ps is None or pp is None else round(ps - pp, 3)
-    gates.append(GB.gate("R_" + label + "_XP_peak", True, False, "round peak GB stream %s pool %s (drop %s); store GB "
-                         "stream %s pool %s (drop %s)" % (ps, pp, drop, ss, sp,
-                                                          None if ss is None or sp is None else round(ss - sp, 3))))
-    ts, tq = out["stream"].get("T_tick_ms"), out["pool"].get("T_tick_ms")
+    gates.append(GB.gate("R_" + label + "_XP_peak", True, False, "round peak GB stream (mean of 2) %s pool %s (drop %s); "
+                         "store GB stream %s pool %s (drop %s)" % (ps, pp, drop, ss, sp,
+                                                                   None if ss is None or sp is None else round(ss - sp, 3))))
+    ts, tq = mean2("T_tick_ms"), out["pool"].get("T_tick_ms")
+    t1, t2 = out["stream"].get("T_tick_ms"), out["stream2"].get("T_tick_ms")
     ratio = None if not ts or tq is None else tq / ts
-    gates.append(GB.gate("R_" + label + "_XP_tick", True, False, "T_tick stream %s ms pool %s ms: ratio %s (registered "
-                         "band 1 +- %.2f: %s)" % (ts, tq, None if ratio is None else round(ratio, 4), XP_TICK_BAND,
-                                                  "inside" if ratio is not None and abs(ratio - 1) <= XP_TICK_BAND
-                                                  else "OUTSIDE")))
-    return dict(backend=kind, layouts=out, xp=dict(bitwise=same, rows_compared=n, first_difference=diff,
-                                                    peak_drop_gb=drop, tick_ratio=ratio))
+    spread = None if not t1 or t2 is None else t2 / t1
+    gates.append(GB.gate("R_" + label + "_XP_tick", True, False, "T_tick stream %s / %s ms (stream2 / stream %s) pool %s "
+                         "ms: ratio pool / mean(stream) %s (registered: prediction 0.97-1.05, falsified outside 1 +- "
+                         "%.2f: %s)" % (t1, t2, None if spread is None else round(spread, 4), tq,
+                                        None if ratio is None else round(ratio, 4), XP_TICK_BAND,
+                                        "inside" if ratio is not None and abs(ratio - 1) <= XP_TICK_BAND
+                                        else "OUTSIDE")))
+    return dict(backend=kind, layouts=out, xp=dict(replica=rep_ok, replica_difference=rep_diff, committed=com_ok,
+                                                    bitwise=ok, rows_compared=n, first_difference=diff,
+                                                    peak_drop_gb=drop, tick_ratio=ratio, stream_spread=spread))
 
 
 def preflight(a, model, cache, st, first, ops, ext, gates, res, engine_fn=None, round_fn=None):

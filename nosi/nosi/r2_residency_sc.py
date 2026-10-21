@@ -1151,8 +1151,11 @@ class ResidencySC(ResidencySB):
         if not self._tick:                                            # the tick's first layer: the per-tick copies
             self.sync_mirror()
             self._rows = self._tick_rows(rows)
-            if self.xpool is not None:                                # [xpool] every FREE slot gives its lane back
-                self.xpool.release_free(self.dmirror.code == C_FREE)
+            if self.xpool is not None:                                # [xpool] every FREE slot gives its lane back;
+                if not self.DECISION_READ_BLOCKING:                   # safe only behind a BLOCKING decision read
+                    raise OwnershipViolation("xpool: lanes are reused across requests only behind a blocking decision "
+                                             "read (r2_xpool.py, the lane-level order); this class's is not")
+                self.xpool.release_free(self.dmirror.code)
         elif self._dirty:
             raise OwnershipViolation("S-C: the host state changed in the middle of a tick (the device mirror is stale)")
         elif self._row_sig(rows) != self._rows["sig"]:
@@ -1230,7 +1233,7 @@ class ResidencySC(ResidencySB):
             flat = self._d2h(torch.cat(parts)).tolist()               # ONE read per tick (flags and decisions)
             self.flag_values = dict(zip(names, flat[:len(names)]))
             raised = sorted(n for n, v in self.flag_values.items() if v)
-            if raised:
+            if raised and raised != ["xpool_err"]:                    # ([xpool]: xpool_err alone waits, see below)
                 raise CapacityRefusal("S-C: the watched device flag(s) %s are set at this tick: the tick is void (none "
                                       "of its decisions is applied)" % raised)
             at = len(names)
@@ -1255,6 +1258,9 @@ class ResidencySC(ResidencySB):
             over = [(st["l"], v[1]) for (st, v, _) in parsed if v is not None and v[1] > 0]
             if over:
                 raise self._refusal(over, self._overflow_report(parsed))
+            if raised:                                                # [xpool] after the overflow: an overflowed page
+                raise CapacityRefusal("S-C: the watched device flag(s) %s are set at this tick: the tick is void (none "
+                                      "of its decisions is applied)" % raised)   # names slot 0 (review m7)
             for (st, v, d) in parsed:
                 if v is not None:
                     self._apply_verify(st["l"], st["vrows"], st["vidx"], st["vdec"], v[0],

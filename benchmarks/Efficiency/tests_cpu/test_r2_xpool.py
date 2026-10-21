@@ -36,6 +36,13 @@ adversarial transport, S-C's CPU device stand-in); the pool rounds land each tra
   XP9  (lint, F12d's tokens) the pool's per-layer device path (XPool.bind, audit, release_free, translate,
        gather_entries, draft_bias_fill_flat) holds no host read and no host-to-device copy. Negative control: the
        scan finds the read of assign_phys (the one read per tick, at end_tick).
+  Review of 44d5e95 (paper-notes/review-xpool-44d5e95.md):
+  XP10 (M4) the blocking decision read the lane reuse rests on: pins and a refused non-blocking class.
+  XP11 (M2) _h2d_entries_kernel under TRITON_INTERPRET=1 equals its twin; both skip out-of-bounds entries.
+  XP12 (M1) gather_entries + the twin land S-C's REAL decisions (F20b / F21b, Policy E) as CpuDeviceSim.gather does.
+  XP13 (M3, M4) S-C on the flat layout equals S-C per stream on F20b, with a lane-level reader check; early-unbind
+       plants (RELEASING, INFLIGHT) are caught.
+  The step cell x1 now runs stream, pool, stream2 with --arrival-lag 2 (B1); XP7 covers the replica gate.
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA benchmarks/Efficiency/tests_cpu/test_r2_xpool.py
 """
@@ -127,6 +134,7 @@ def make_pool_engine(ops, kind="b2", C=12, X=24, R_ver=4, X_pool=None, S_list=TT
                         stage1=TT._stage1, pool=TT._pool, check=True, xpool=xp, **kw)
     be = TT.Be()
     tp = FlatAdversarial(be, host_k, host_v, sk, sv, BS, seed, mode=mode, max_delay=3)
+    tp.xpool = xp                                                     # the transport writes this pool's lanes (m2)
     gather = RES.TorchGather(host_k, host_v, sk, sv)
     cis = [t.total_cis[:B] for t in eng.twins]
     args = (TT.NL_LAYERS, B, TT.HKV, C, X, R_ver, tp, gather)
@@ -219,19 +227,21 @@ def test_XP1_pool_layout_equals_the_per_stream_layout_bitwise(p3, ref, cfg, kind
     stream = _run(TT.make_res_engine(ops, kind=kind, **CFG[cfg]), toks)
     pool = _run(make_pool_engine(ops, kind=kind, **CFG[cfg]), toks)
     assert stream.err is None and len(stream.ticks) > 10, ("precondition: the per-stream round ran", stream.err)
+    js = dict(stream.svc.journal_counts)
+    xp = pool.eng.xpool
+    assert xp.binds > 0 and pool.ticks, ("precondition: the pool round bound lanes and recorded ticks", pool.err)
+    if cfg == "pressure":                                             # the preconditions of "eviction pressure",
+        ev = js.get("release:evict", 0) + js.get("release:verifier_evict", 0) + js.get("release:verifier_evict_inflight", 0)
+        assert ev > 0, ("precondition: no eviction in the pressure round", js)          # checked BEFORE the claim
+        assert _handoffs(pool.maps, xp.n_hist) > 0, "precondition: no lane changed hands between requests"
     d = _first_diff(stream, pool)
     assert d is None, ("the pool layout differs from the per-stream layout", d, pool.err)
     assert [r.out for r in pool.rnd.reqs] == [r.out for r in stream.rnd.reqs]
     assert [r.out for r in pool.rnd.reqs] == [[int(toks[s, b]) for s in range(TT.STEPS)] for b in range(pool.eng.B)]
-    js, jp = dict(stream.svc.journal_counts), dict(pool.svc.journal_counts)
+    jp = dict(pool.svc.journal_counts)
     assert js == jp, (js, jp)
-    xp = pool.eng.xpool
-    assert int(xp.err) == 0 and xp.binds > 0 and not pool.svc.uid_b
+    assert int(xp.err) == 0 and not pool.svc.uid_b
     assert pool.eng.stats["writebacks"] >= 3 and pool.eng.stats["rollbacks"] > 0
-    if cfg == "pressure":                                             # the preconditions of "eviction pressure"
-        ev = js.get("release:evict", 0) + js.get("release:verifier_evict", 0) + js.get("release:verifier_evict_inflight", 0)
-        assert ev > 0, ("precondition: no eviction in the pressure round", js)
-        assert _handoffs(pool.maps, xp.n_hist) > 0, "precondition: no lane changed hands between requests"
 
 
 def test_XP1n_the_comparison_sees_a_wrong_page(p3, ref):
@@ -367,10 +377,13 @@ def test_XP3b_the_flags_on_direct_inputs():
     ok.bind(0, bb[:8], hh[:8], sl[:8], torch.ones(8, dtype=torch.bool))
     assert int(ok.err) == 0 and sorted(ok.pos_of[0, :, 0, :5].reshape(-1).tolist()) == [-1, -1] + list(range(8))
     assert ok.pos_of[0, :, 0, 5:].tolist() == [[8, 9, 10, 11], [12, 13, 14, 15]]   # the tail rings: A + 4 b + j
-    free = torch.zeros(1, 2, 2, 5, dtype=torch.bool)
-    free[0, 0, 0, 1] = True                                          # slot 1 of (b 0, h 0) is FREE: its lane returns
+    code = torch.full((1, 2, 2, 5), 2, dtype=torch.int64)            # every slot LRU (code 2) ...
+    code[0, 0, 0, 1] = XPM.CODE_FREE                                 # ... but slot 1 of (b 0, h 0): FREE, its lane returns
+    code[0, 0, 0, 2] = XPM.CODE_RELEASING                            # RELEASING and INFLIGHT keep their lanes
+    code[0, 0, 0, 3] = XPM.CODE_INFLIGHT
     lane = int(ok.pos_of[0, 0, 0, 1])
-    ok.release_free(free)
+    ok.release_free(code)
+    assert int(ok.pos_of[0, 0, 0, 2]) >= 0 and int(ok.pos_of[0, 0, 0, 3]) >= 0
     assert int(ok.pos_of[0, 0, 0, 1]) == -1 and not bool(ok.occ[0, 0, lane])
     ok.bind(0, torch.tensor([1]), torch.tensor([0]), torch.tensor([3]), torch.ones(1, dtype=torch.bool))
     assert int(ok.pos_of[0, 1, 0, 3]) == lane and int(ok.err) == 0   # the lowest free lane, to ANOTHER request
@@ -395,17 +408,22 @@ def test_XP4_the_equal_memory_baseline_rules():
     G = TT._sg5_gate()
     base = ["--out", "o", "--workload", "w", "--biattn", "b", "--gilfree", "g", "--gilfree-build", "/x"]
     a = G.parse_args(base)
-    assert (a.layout, a.X_pool, a.pool_rule, a.kv_heads) == ("stream", -1, "stream", 2)   # the defaults: unchanged
+    assert (a.layout, a.X_pool, a.pool_rule, a.arrival_lag) == ("stream", -1, "stream", 0)   # the defaults: unchanged
     x1 = G.parse_args(base + ["--modes", "exact", "--backends", "b2", "--X", "64", "--layout", "both", "--X-pool", "64",
-                              "--pool-rule", "both"])
+                              "--pool-rule", "both", "--arrival-lag", "2"])
+    assert x1.arrival_lag == 2
     assert G.pool_rule_value(x1, "stream") == 100 and G.pool_rule_value(x1, "k5") == 37
     assert G.pool_rule_value(x1, "k5") == E(96, 64, "k5", pool_lanes=2 * 64, B=64, H=2)
     for Xp in (64, 100, 422):
         y = G.parse_args(base + ["--backends", "b2", "--X", "64", "--layout", "pool", "--X-pool", str(Xp)])
         assert G.pool_rule_value(y, "k5") == E(96, 64, "k5", pool_lanes=2 * Xp, B=64, H=2)
     assert G.pool_positions(G.parse_args(base + ["--backends", "sc", "--layout", "pool"]), 32) == 32
-    for bad in (["--layout", "pool"], ["--layout", "both", "--backends", "b2,v1"], ["--X-pool", "64"],
-                ["--backends", "b2", "--X", "64", "--layout", "pool", "--X-pool", "32"], ["--pool-rule", "x"]):
+    for bad in (["--layout", "pool"], ["--layout", "both", "--backends", "b2,v1", "--arrival-lag", "2"],
+                ["--X-pool", "64"], ["--backends", "b2", "--X", "64", "--layout", "pool", "--X-pool", "32"],
+                ["--pool-rule", "x"],
+                ["--backends", "b2", "--layout", "both"],                                     # B1: free timing refused
+                ["--backends", "b2", "--layout", "both", "--arrival-lag", "2", "--sweep", "96:64"],   # m4
+                ["--arrival-lag", "-1"]):
         with pytest.raises(SystemExit):
             G.parse_args(base + bad)
     src = (EFF / "r2_tick_sg5.py").read_text()
@@ -422,11 +440,13 @@ def test_XP5_the_entry_gather_twin_models_the_kernel_addresses():
     host_v = torch.randn(B, S, H, D, generator=g)
     cis = torch.randn(B, S + 5, H, generator=g)[:, :S]                      # a strided view, as total_cis[:B]
     dk, dv, db = (torch.zeros(M * BS, H, D), torch.zeros(M * BS, H, D), torch.zeros(M * BS, H))
-    ent = torch.tensor([[0, 1, 2, 3, 1], [2, 0, 5, 6, 1], [1, 1, 0, 0, 0], [1, 0, 4, 2, 1]]).t().contiguous()
-    n = XPM.h2d_entries(dk, dv, db, host_k, host_v, cis, ent)
+    ent = torch.tensor([[0, 1, 2, 3, 1], [2, 0, 5, 6, 1], [1, 1, 0, 0, 0], [1, 0, 4, 2, 1],
+                        [1, 1, 6, 4, 1], [0, 0, 1, 7, 1], [3, 0, 1, 4, 1], [0, 2, 1, 4, 1], [0, 0, -1, 4, 1]]
+                       ).t().contiguous()                             # the last five: OUT OF BOUNDS (block 6 of 6,
+    n = XPM.h2d_entries(dk, dv, db, host_k, host_v, cis, ent)         # position 7 of 7, b 3, h 2, block -1): skipped
     assert n is None                                                  # the CPU path: the twin
     ek, ev, eb = torch.zeros_like(dk), torch.zeros_like(dv), torch.zeros_like(db)
-    for (b, h, blk, pos, ok) in ent.t().tolist():
+    for (b, h, blk, pos, ok) in ent.t().tolist()[:4]:
         if ok:
             ek[pos * BS:(pos + 1) * BS, h] = host_k[b, blk * BS:(blk + 1) * BS, h]
             ev[pos * BS:(pos + 1) * BS, h] = host_v[b, blk * BS:(blk + 1) * BS, h]
@@ -457,26 +477,36 @@ def test_XP6_gilfree_lands_each_transfer_in_its_lane(pinned):
     host_k, host_v, gk, gv, _, _ = GFT._world()
     L, B, H, D = GFT.L, GFT.B, GFT.H, GFT.D
     C, X = 4, GFT.NPOS - 4
-    xp = XG.XPool(L, B, H, C + X, mode="pool", C=C, X_pool=20)          # M = 2 (4 + 4) + 20 = 36 > the 27 transfers
-    assert xp.M == 36
+    xp = XG.XPool(L, B, H, C + X, mode="pool", C=C, X_pool=21)          # A = 2 x 4 + 21 = 29 > the 27 transfers
+    assert (xp.A, xp.M) == (29, 37)
     fk = [xp.new_store(D)[0] for _ in range(L)]
     fv = [torch.zeros_like(t) for t in fk]
-    gf = GF.GilfreeTransport(pinned.ext, host_k, host_v, fk, fv, BS, D, threads=2, host_wait=lambda ev: None,
-                             cap_groups=4, xpool=xp)
+    gf_bg = GF.GilfreeTransport(pinned.ext, host_k, host_v, fk, fv, BS, D, threads=2, host_wait=lambda ev: None,
+                                cap_groups=4, xpool=xp, background=True)    # production's feeder thread (review m3)
     ps = GF.GilfreeTransport(pinned.ext, host_k, host_v, gk, gv, BS, D, threads=2, host_wait=lambda ev: None,
                              cap_groups=4)
     plans = GFT._plans()
     lanes = {}
     seq = 0
-    for layer, groups in plans:
-        a = GFT._transfers(layer, groups, seq)
-        bt = GFT._transfers(layer, groups, seq)
-        for i, tr in enumerate(a):                                    # a lane per (layer, h): distinct, permuted
-            tr.phys = (7 * (seq + i) + 3) % xp.M
-            lanes[(layer, tr.b, tr.h, tr.slot)] = tr.phys
-        seq += len(groups)
-        gf.issue(layer, a)
-        ps.issue(layer, bt)
+    issued = []
+    try:
+        for layer, groups in plans:
+            a = GFT._transfers(layer, groups, seq)
+            bt = GFT._transfers(layer, groups, seq)
+            for i, tr in enumerate(a):                                # a lane per (layer, h): distinct, permuted
+                tr.phys = (7 * (seq + i) + 3) % xp.A
+                lanes[(layer, tr.b, tr.h, tr.slot)] = tr.phys
+            seq += len(groups)
+            gf_bg.issue(layer, a)
+            ps.issue(layer, bt)
+            issued += a
+        for tr in issued:
+            gf_bg.force(tr)
+        assert all(gf_bg.done(tr) for tr in issued) and gf_bg.feeder_seen is not None
+    finally:
+        gf_bg.close()
+    gf = GF.GilfreeTransport(pinned.ext, host_k, host_v, fk, fv, BS, D, threads=2, host_wait=lambda ev: None,
+                             cap_groups=4, xpool=xp)                  # synchronous: the refusals raise at issue
     assert len(set((l_, h_, p_) for (l_, _, h_, _), p_ in lanes.items())) == len(lanes), "precondition: lanes distinct"
     for (layer, b, h, s), p in lanes.items():
         assert torch.equal(fk[layer][p * BS:(p + 1) * BS, h], gk[layer][b, s * BS:(s + 1) * BS, h])
@@ -489,6 +519,10 @@ def test_XP6_gilfree_lands_each_transfer_in_its_lane(pinned):
     two[0].phys = two[1].phys = 5
     with pytest.raises(ValueError, match="one destination"):
         gf.issue(0, two)
+    tail = GFT._transfers(0, [(0, 0, 1, 0)], 650)                    # a lane in the tail rings [A, M) (review m2)
+    tail[0].phys = xp.A
+    with pytest.raises(ValueError, match="history arena"):
+        gf.issue(0, tail)
     wrong = GFT._transfers(1, [(1, 1, 3, 2)], 700)                   # NEGATIVE CONTROL: a wrong lane lands elsewhere
     wrong[0].phys = 2
     gf.issue(1, wrong)
@@ -508,32 +542,47 @@ def test_XP7_the_harness_compares_the_two_arms():
     f2 = G.logit_fingerprint(lg2)
     assert f.shape == (3,) and f[0] == f2[0] and f[2] == f2[2] and f[1] != f2[1]
 
-    def stand_in(perturb=None):
+    def stand_in(perturb=None, tokens=None):
+        """perturb: the arm (label suffix stream / pool / stream2) whose tick 2 row 1 fingerprint is off by one;
+        tokens: the arm whose committed tokens differ."""
+        calls = []
+
         def point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_shipped, gates, label, bare=False,
                   layout=None, fp=None):
+            arm = label.rsplit("_", 1)[1]
+            calls.append((arm, layout))
             for t in range(4):
                 v = torch.arange(3, dtype=torch.int64) * (t + 1)
-                if perturb == layout and t == 2:
+                if perturb == arm and t == 2:
                     v = v + torch.tensor([0, 1, 0])
                 fp.append(([(0, "v", 10 + t), (1, "d", 20 + t), (2, "v", 30 + t)], v))
-            return dict(backend=kind, T_tick_ms=100.0 if layout == "stream" else 104.0, peak_gb_round=30.0 if
-                        layout == "stream" else 21.5, store_gb=22.1 if layout == "stream" else 13.6,
-                        committed_tokens=[[1, 2, 3]])
+            return dict(backend=kind, T_tick_ms={"stream": 100.0, "pool": 104.0, "stream2": 102.0}[arm],
+                        peak_gb_round=30.0 if layout == "stream" else 21.5, store_gb=22.1 if layout == "stream" else 13.6,
+                        committed_tokens=[[1, 2, 4]] if tokens == arm else [[1, 2, 3]])
+        point.calls = calls
         return point
-    a = SimpleNamespace()
-    gates = []
-    r = G.one_point_both(a, None, None, None, None, None, "b2", 96, 64, 16, None, 48, None, gates, "SG5_exact_b2",
-                         point_fn=stand_in())
-    g = {x["name"]: x for x in gates}
-    assert g["SG5_exact_b2_XP_bitwise"]["passed"] and g["SG5_exact_b2_XP_bitwise"]["must"]
-    assert r["xp"]["rows_compared"] == 12 and r["xp"]["peak_drop_gb"] == 8.5 and abs(r["xp"]["tick_ratio"] - 1.04) < 1e-9
+
+    def run(**kw):
+        gates = []
+        pf = stand_in(**kw)
+        r = G.one_point_both(SimpleNamespace(), None, None, None, None, None, "b2", 96, 64, 16, None, 48, None, gates,
+                             "SG5_exact_b2", point_fn=pf)
+        return r, {x["name"]: x for x in gates}, pf.calls
+    r, g, calls = run()
+    assert calls == [("stream", "stream"), ("pool", "pool"), ("stream2", "stream")]     # stream, pool, stream2 (m6a)
+    for name in ("SG5_exact_b2_XP_replica", "SG5_exact_b2_XP_committed", "SG5_exact_b2_XP_bitwise"):
+        assert g[name]["passed"] and g[name]["must"], name
+    assert r["xp"]["rows_compared"] == 12 and r["xp"]["peak_drop_gb"] == 8.5
+    assert abs(r["xp"]["tick_ratio"] - 104.0 / 101.0) < 1e-9 and abs(r["xp"]["stream_spread"] - 1.02) < 1e-9
     assert "inside" in g["R_SG5_exact_b2_XP_tick"]["detail"] and "drop 8.5" in g["R_SG5_exact_b2_XP_peak"]["detail"]
-    gates = []
-    r = G.one_point_both(a, None, None, None, None, None, "b2", 96, 64, 16, None, 48, None, gates, "SG5_exact_b2",
-                         point_fn=stand_in(perturb="pool"))
-    g = {x["name"]: x for x in gates}
-    assert not g["SG5_exact_b2_XP_bitwise"]["passed"]
+    r, g, _ = run(perturb="pool")                                     # the pool differs: bitwise FAILS, named
+    assert g["SG5_exact_b2_XP_replica"]["passed"] and not g["SG5_exact_b2_XP_bitwise"]["passed"]
     assert "tick 2 row 1" in g["SG5_exact_b2_XP_bitwise"]["detail"], g["SG5_exact_b2_XP_bitwise"]["detail"]
+    r, g, _ = run(perturb="stream2")                                  # the replica differs: bitwise is VOID
+    assert not g["SG5_exact_b2_XP_replica"]["passed"] and not g["SG5_exact_b2_XP_bitwise"]["passed"]
+    assert g["SG5_exact_b2_XP_bitwise"]["detail"].startswith("VOID") and g["SG5_exact_b2_XP_committed"]["passed"]
+    r, g, _ = run(tokens="pool")                                      # committed tokens differ: that MUST fails too
+    assert not g["SG5_exact_b2_XP_committed"]["passed"] and not g["SG5_exact_b2_XP_bitwise"]["passed"]
     assert G.compare_layouts({"stream": ([], [], [[1]]), "pool": ([], [], [[2]])})[2] == "committed tokens differ"
 
 
@@ -547,8 +596,12 @@ def test_XP8_the_step_cell_x1(tmp_path):
         for ln in text.splitlines():
             if not ln.lstrip().startswith("#"):
                 assert word not in ln, (word, ln)
-    assert "x1) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_x1 ; XPOOL=64 ;;" in text
-    assert "nosi/nosi/r2_xpool.py; do" in text
+    assert "x1) MODES=exact ; BACKENDS=b2 ; PX=64 ; SWEEP_RUN= ; SUFFIX=_x1 ; XPOOL=64 ; NOSI=$NOSI_X1 ;;" in text
+    assert '[ -z "$XPOOL" ] || git -C "$NOSI" rev-parse -q --verify "$NSHA:nosi/nosi/r2_xpool.py"' in text
+    lines = text.splitlines()
+    shared = next(ln for ln in lines if ln.startswith("NOSI=")).split()[0][len("NOSI="):]
+    x1_root = next(ln for ln in lines if ln.startswith("NOSI_X1=")).split()[0][len("NOSI_X1="):]
+    assert shared == "/mnt/beegfs/ojerbi/nosi-r2-sg5-p6" and x1_root == "/mnt/beegfs/ojerbi/nosi-r2-xpool"   # m8
     head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
     dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"], capture_output=True,
                            text=True)
@@ -562,21 +615,23 @@ def test_XP8_the_step_cell_x1(tmp_path):
     env.update(SG5_HOLDERS=str(tmp_path), DRYRUN="1")
     r = subprocess.run(["bash", str(script), "--nosi", head.stdout.strip(), "417", "t1", "x1"], env=env,
                        capture_output=True, text=True, timeout=120)
-    nosi_root = next(ln for ln in text.splitlines() if ln.startswith("NOSI=")).split()[0][len("NOSI="):]
     if r.returncode != 0:
-        assert Path(nosi_root).resolve() != ROOT.resolve(), r.stderr.strip()[-300:]
-        pytest.skip("DRYRUN stopped outside the step's ROOT: %s" % r.stderr.strip()[-200:])
+        assert Path(x1_root).resolve() != ROOT.resolve(), r.stderr.strip()[-300:]     # in x1's ROOT a stop FAILS
+        pytest.skip("DRYRUN stopped outside x1's ROOT: %s" % r.stderr.strip()[-200:])
     line = r.stdout.strip().splitlines()[-1]
     got = line.split("r2_tick_sg5.py ", 1)[1].strip().replace("\\,", ",")
     for w in ("--modes exact --backends b2", "--C 96 --X 64 --R-ver 16", "--pool-baseline", "--steps 48",
-              "--layout both --X-pool 64 --pool-rule both"):
-        assert w in got, w
+              "--layout both --X-pool 64 --pool-rule both --arrival-lag 2",
+              "PYTHONPATH=/mnt/beegfs/ojerbi/nosi-r2-xpool/nosi"):
+        assert w in got or w in line, w
     assert "--sweep " not in got and "--variants" not in got and "--b2-checked" not in got
-    assert "k5 rule NOSI_POOL_BLOCKS = C + 4 - 64 + (2 X_pool) / (64 x 2) = 37" in r.stdout
+    assert "k5 rule NOSI_POOL_BLOCKS = C + 4 - 64 + X_pool / 64 = 37" in r.stdout
+    assert "root /mnt/beegfs/ojerbi/nosi-r2-xpool" in r.stdout
     assert "--job-name=sg5-t1-417-x1 " in r.stdout and "cell x1" in r.stdout
     G = TT._sg5_gate()
     pa = G.parse_args(got.split())
-    assert (pa.layout, pa.X_pool, pa.pool_rule, pa.backends, pa.modes) == ("both", 64, "both", ["b2"], ["exact"])
+    assert (pa.layout, pa.X_pool, pa.pool_rule, pa.backends, pa.modes, pa.arrival_lag) == ("both", 64, "both", ["b2"],
+                                                                                            ["exact"], 2)
     assert G.pool_rule_value(pa, "k5") == 37 and G.pool_rule_value(pa, "stream") == 100
     for bad in (("x1", "p6"), ("x2",), ("X1",)):
         rb = subprocess.run(["bash", str(script), "--nosi", head.stdout.strip(), "417", "t1", *bad], env=env,
@@ -596,3 +651,313 @@ def test_XP9_the_pool_per_layer_path_has_no_host_transfer():
         src = inspect.getsource(fn)
         assert [t for t in toks if t in src] == [], fn.__qualname__
     assert [t for t in toks if t in inspect.getsource(XPM.XPool.assign_phys)] != []   # NEGATIVE CONTROL: the read
+
+
+# =====================================================================================================================
+# the SERVICE-level pool world (test_r2_residency's world and schedules on the flat layout; review M1, M3, M4)
+# =====================================================================================================================
+TRM = _shared("test_r2_residency_shared_xp", "test_r2_residency.py")   # the r2res package: S-C, schedules, _state
+XPR = TRM._load("r2_xpool")                                            # the XPool S-C of that package uses
+F20B = dict(seed=5, C=24, X=2, R_ver=2, hb=36, mode="delay",            # Policy E LRU evictions (F20b)
+            sched=lambda: TRM._sched_pressure(105, 18, hb=36, window=3, nver=3))
+F21B = dict(seed=7, C=16, X=2, R_ver=2, hb=30, mode="force_only",       # Policy E in-flight supersedes (F21b)
+            sched=lambda: TRM._sched_split(109, 30, hb=30, d_hi=20, window=2, nver=1))
+
+
+class FlatAdversarialR(TRM.TR.AdversarialTransport):
+    """FlatAdversarial for the r2res package (its own Transfer class)."""
+    xpool = None
+
+    def _land(self, tr):
+        if tr.phys is None:
+            raise AssertionError("xpool: transfer seq %d landed without a lane" % tr.seq)
+        p0 = tr.phys * self.bs
+        self.slots_k[tr.layer][p0:p0 + self.bs, tr.h].copy_(tr.payload[0])
+        self.slots_v[tr.layer][p0:p0 + self.bs, tr.h].copy_(tr.payload[1])
+        tr.delivered = True
+        tr.payload = None
+        self.delivered += 1
+
+
+def _pool_svc_world(C, X, R_ver, seed, mode="delay", max_delay=4, xp_mut=None, cls=None):
+    """test_r2_residency.world's data (the same generator order: host K, host V, cis) on the FLAT layout: S-C (or cls)
+    with an XPool (X_pool = X), FlatAdversarialR (seeded alike), the CPU device stand-in."""
+    L, B, H, D, BS_, NB = TRM.L, TRM.B, TRM.H, TRM.D, TRM.BS, TRM.NB
+    g = torch.Generator().manual_seed(seed)
+    host_k = [torch.randn(B, NB * BS_, H, D, generator=g) for _ in range(L)]
+    host_v = [torch.randn(B, NB * BS_, H, D, generator=g) for _ in range(L)]
+    cis = [torch.randn(B, NB * BS_, H, generator=g) for _ in range(L)]
+    xp = XPR.XPool(L, B, H, C + X, mode="pool", C=C, X_pool=X, mut=xp_mut)
+    st = [xp.new_store(D) for _ in range(L)]
+    sk, sv, sb = [s[0] for s in st], [s[1] for s in st], [s[2] for s in st]
+    be = TRM.Be()
+    tp = FlatAdversarialR(be, host_k, host_v, sk, sv, BS_, seed, mode=mode, max_delay=max_delay)
+    tp.xpool = xp
+    gather = TRM.RES.TorchGather(host_k, host_v, sk, sv)
+    svc = (cls or TRM.SC.ResidencySC)(L, B, H, C, X, R_ver, tp, gather, store_b=sb, cis=cis, block_bytes=BS_ * 2 * D * 4,
+                                      host_wait=be.host_wait, nblk=NB, xpool=xp)
+    return SimpleNamespace(svc=svc, tp=tp, be=be, host_k=host_k, host_v=host_v, cis=cis, store_k=sk, store_v=sv,
+                           store_b=sb, xp=xp)
+
+
+def _lane_holds(w, l, b, h, s, blk):
+    """Slot s of (b, h) at layer l is bound and its lane holds the host truth of block blk (K, V and bias)."""
+    p = int(w.xp.pos_of[l, b, h, s])
+    if p < 0:
+        return False
+    p0, r0, bs = p * TRM.BS, blk * TRM.BS, TRM.BS
+    return (torch.equal(w.store_k[l][p0:p0 + bs, h], w.host_k[l][b, r0:r0 + bs, h])
+            and torch.equal(w.store_v[l][p0:p0 + bs, h], w.host_v[l][b, r0:r0 + bs, h])
+            and torch.equal(w.store_b[l][p0:p0 + bs, h], w.cis[l][b, r0:r0 + bs, h]))
+
+
+def _pool_content_ok(w, l, rows, sel, plan):
+    """test_r2_residency._content_ok on the flat layout: every verify row's listed pages hold the truth of its
+    selection; every DRAFT row's historical pages hold the truth of the block their (resident) slot names."""
+    NS = w.svc.n_hist
+    for i, r in enumerate(rows):
+        for h in range(TRM.H):
+            if r.kind == "v":
+                want = sorted({z for z in sel[h, i].tolist() if 0 <= z < r.hist_bound})
+                got = plan.page_table[i, h, :len(want)].tolist()
+                if int(plan.num_pages[i, h]) < len(want) or not all(_lane_holds(w, l, r.b, h, s, z)
+                                                                     for z, s in zip(want, got)):
+                    return False
+            else:
+                for s in plan.page_table[i, h, :int(plan.num_pages[i, h])].tolist():
+                    if 0 <= s < NS and not _lane_holds(w, l, r.b, h, s, w.svc.stream(l, r.b, h).slots[s].block):
+                        return False
+    return True
+
+
+def _svc_run(w, case, pool, lane_check=False):
+    """One schedule on one world (test_r2_residency._lockstep_sc's tick, one world): per tick the logical pages, the
+    content at the read point, the state and the counters; readers complete two ticks late. lane_check (pool): every
+    lane bound by a bind while the LAST READER of its previous occupant is pending counts as a hazard (the lane-level
+    order); rebinds counts the binds of a lane that was read before (the check's precondition)."""
+    svc = w.svc
+    sched = case["sched"]()
+    hb = case["hb"]
+    log, readers = [], []
+    cnt = dict(hazards=0, rebinds=0)
+    if pool and lane_check:
+        xp, NS = w.xp, svc.n_hist
+        lane_reader = {}
+        bind0, rd0 = xp.bind, svc.read_done
+
+        def bind(l, bb, hh, slot, mask):
+            before = xp.pos_of[l, :, :, :NS].clone()
+            bind0(l, bb, hh, slot, mask)
+            new = (before < 0) & (xp.pos_of[l, :, :, :NS] >= 0)
+            for (b, h, s) in new.nonzero().tolist():
+                key = (l, h, int(xp.pos_of[l, b, h, s]))
+                if key in lane_reader:
+                    cnt["rebinds"] += 1
+                    if not lane_reader[key].done:
+                        cnt["hazards"] += 1
+
+        def read_done(l, plan, ev):
+            sq = plan.seq_idx.tolist()
+            for i in range(plan.page_table.shape[0]):
+                for h in range(TRM.H):
+                    for s in plan.page_table[i, h, :int(plan.num_pages[i, h])].tolist():
+                        if 0 <= s < NS and int(xp.pos_of[l, sq[i], h, s]) >= 0:
+                            lane_reader[(l, h, int(xp.pos_of[l, sq[i], h, s]))] = ev
+            return rd0(l, plan, ev)
+        xp.bind, svc.read_done = bind, read_done
+    for b, u in enumerate(("u0", "u1")):
+        svc.begin_request(b, u)
+    tail = svc.tail0
+    err = None
+    try:
+        for (t, m, ends, layers) in sched:
+            svc.poll()
+            rec = dict(t=t, pages=[], content=[])
+            for l, spec in enumerate(layers):
+                rows = [TRM.Row(b, kind, key, 1000 + t, hb, [(hb, tail)]) for (b, kind, key, _) in spec]
+                sel = TRM.S(*[s for (_, _, _, s) in spec])
+                p = svc.resolve(l, rows, sel)
+                rec["pages"].append([[p.page_table[i, h, :int(p.num_pages[i, h])].tolist() for h in range(TRM.H)]
+                                     for i in range(len(rows))])
+                rec["content"].append((_pool_content_ok if pool else TRM._content_ok)(w, l, rows, sel, p))
+                ev = TRM.Ev()
+                readers.append((t, ev))
+                svc.read_done(l, p, ev)
+            svc.end_tick()
+            for (tt, e) in readers:
+                if tt <= t - 2:
+                    e.done = True
+            if ends:
+                for u in ("u0", "u1"):
+                    svc.decided((u, 1, m))
+            rec["state"], rec["counters"] = TRM._state(w), TRM._counters(svc)
+            log.append(rec)
+    except Exception as e:                                            # noqa: BLE001 - recorded, compared by the test
+        err = e
+    return SimpleNamespace(log=log, err=err, cnt=cnt, w=w)
+
+
+def _svc_pair(case, xp_mut=None, lane_check=False):
+    common = dict(C=case["C"], X=case["X"], R_ver=case["R_ver"], seed=case["seed"], mode=case["mode"], max_delay=4)
+    ws = TRM.world(**common, cls=TRM.SC.ResidencySC, svc_kw=dict(nblk=TRM.NB))
+    wp = _pool_svc_world(**common, xp_mut=xp_mut)
+    return _svc_run(ws, case, False), _svc_run(wp, case, True, lane_check=lane_check)
+
+
+def _svc_diff(a, b):
+    """The first (tick, field) where the two service runs differ, or a content failure of either; None: equal."""
+    for t, (x, y) in enumerate(zip(a.log, b.log)):
+        for f in ("pages", "state", "counters"):
+            if x[f] != y[f]:
+                return (t, f)
+        if not all(x["content"]) or not all(y["content"]):
+            return (t, "content")
+    if len(a.log) != len(b.log) or (a.err is None) != (b.err is None):
+        return (min(len(a.log), len(b.log)), "raise: %r / %r" % (a.err, b.err))
+    return None
+
+
+@pytest.mark.parametrize("case", ["f20b", "f21b"])
+def test_XP12_gather_entries_lands_a_real_decision_as_the_device_stand_in(case):
+    """XP12 (review M1): on S-C's real verify decisions (the F20b / F21b schedules on the flat layout, Policy E
+    present), XPool.gather_entries + h2d_entries_twin land each decision into a copy of the store EXACTLY as
+    CpuDeviceSim.gather lands it into the store (K, V, bias; every layer call). Preconditions: decisions with Policy E
+    evictions occurred. NEGATIVE CONTROL: the entry mask without `evict` (granted only); precondition: it changes the
+    entry set at some call; claim: that copy then differs from the store."""
+    c = dict(F20B if case == "f20b" else F21B)
+    w = _pool_svc_world(c["C"], c["X"], c["R_ver"], c["seed"], mode=c["mode"])
+    xp, dev = w.xp, w.svc.dev
+    orig = dev.gather
+    rec = dict(calls=0, evict=0, mism=0, plant_changed=0, plant_caught=0)
+
+    def gather(l, dec):
+        bb, hh = dec.bh
+        t = dec.t
+        ent = xp.gather_entries(l, bb, hh, t["blk"], t["take_slot"], (t["granted"] | t["evict"]) != 0)
+        bad = xp.gather_entries(l, bb, hh, t["blk"], t["take_slot"], t["granted"] != 0)
+        good = [x.clone() for x in (w.store_k[l], w.store_v[l], w.store_b[l])]
+        plant = [x.clone() for x in good]
+        XPR.h2d_entries_twin(*good, w.host_k[l], w.host_v[l], w.cis[l], ent)
+        XPR.h2d_entries_twin(*plant, w.host_k[l], w.host_v[l], w.cis[l], bad)
+        orig(l, dec)
+        real = (w.store_k[l], w.store_v[l], w.store_b[l])
+        rec["calls"] += 1
+        rec["evict"] += int((t["evict"] != 0).sum())
+        rec["mism"] += int(not all(torch.equal(x, y) for x, y in zip(good, real)))
+        if not torch.equal(ent[4], bad[4]):
+            rec["plant_changed"] += 1
+            rec["plant_caught"] += int(not all(torch.equal(x, y) for x, y in zip(plant, real)))
+    dev.gather = gather
+    run = _svc_run(w, c, True)
+    assert run.err is None, run.err
+    assert rec["calls"] > 0 and rec["evict"] > 0, ("precondition: Policy E evictions in the decisions", rec)
+    assert rec["mism"] == 0, rec
+    assert rec["plant_changed"] > 0, ("precondition: the plant changed the entry set (L34)", rec)
+    assert rec["plant_caught"] == rec["plant_changed"], rec
+
+
+def test_XP13_the_pool_service_equals_the_per_stream_service_and_early_unbinds_are_caught():
+    """XP13 (review M3, M4): S-C on the flat layout equals S-C per stream on the F20b schedule (pages, state,
+    counters every tick; the content at every read point true in both), and NO lane is bound while its previous
+    occupant's last reader is pending (readers complete two ticks late). Precondition of that check: lanes were bound
+    again after a read (rebinds > 0). NEGATIVE CONTROLS (XPool mut):
+      release_releasing  unbinds RELEASING slots too. Precondition (L34): an early-unbound lane was bound again. Claim:
+                         the lane check counts hazards.
+      release_inflight   unbinds INFLIGHT slots too (a transfer still lands in the lane). Precondition: an
+                         early-unbound lane was bound again. Claim: the comparison differs (or the run raises)."""
+    s, p = _svc_pair(F20B, lane_check=True)
+    assert s.err is None and len(s.log) == 18, ("precondition: the per-stream run completed", s.err)
+    assert p.cnt["rebinds"] > 0, ("precondition: lanes were rebound after a read", p.cnt)
+    assert _svc_diff(s, p) is None, (_svc_diff(s, p), p.err)
+    assert p.cnt["hazards"] == 0 and int(p.w.xp.err) == 0, p.cnt
+    _, rr = _svc_pair(F20B, xp_mut={"release_releasing": True}, lane_check=True)
+    el = rr.w.xp.early_log
+    assert el and any(e["to"] is not None for e in el), ("precondition: no early-unbound lane was bound again", el[:3])
+    assert rr.cnt["hazards"] > 0, rr.cnt
+    s2, ri = _svc_pair(F20B, xp_mut={"release_inflight": True})
+    el = ri.w.xp.early_log
+    assert el and any(e["to"] is not None for e in el), ("precondition: no early-unbound lane was bound again", el[:3])
+    assert _svc_diff(s2, ri) is not None
+
+
+def test_XP10_the_pool_needs_a_blocking_decision_read():
+    """XP10 (review M4): the lane-level order rests on S-C's BLOCKING decision read. Pins: ResidencySB._d2h reads with
+    t.to("cpu") and no non_blocking; DECISION_READ_BLOCKING is True; r2_xpool's state codes are S-C's. NEGATIVE
+    CONTROL: a service class that declares its read non-blocking is refused at its first pool resolve."""
+    import inspect
+    src = inspect.getsource(TRM.SB.ResidencySB._d2h)
+    assert 'return t.to("cpu")' in src and "non_blocking" not in src
+    assert TRM.SB.ResidencySB.DECISION_READ_BLOCKING is True and TRM.SC.ResidencySC.DECISION_READ_BLOCKING is True
+    assert (XPR.CODE_FREE, XPR.CODE_INFLIGHT, XPR.CODE_RELEASING) == (TRM.SC.C_FREE, TRM.SC.C_INFLIGHT,
+                                                                      TRM.SC.C_RELEASING)
+
+    class AsyncRead(TRM.SC.ResidencySC):
+        DECISION_READ_BLOCKING = False
+    w = _pool_svc_world(4, 4, 2, 0, cls=AsyncRead)
+    w.svc.begin_request(0, "u0")
+    w.svc.poll()
+    with pytest.raises(TRM.ER.OwnershipViolation, match="blocking"):
+        w.svc.resolve(0, [TRM.Row(0, "d", ("u0", 1, 1), 300, 10)], TRM.S([[0, 1], []]))
+    ok = _pool_svc_world(4, 4, 2, 0)                                  # the same world with S-C: no refusal
+    ok.svc.begin_request(0, "u0")
+    ok.svc.poll()
+    ok.svc.resolve(0, [TRM.Row(0, "d", ("u0", 1, 1), 300, 10)], TRM.S([[0, 1], []]))
+
+
+INTERP_CHILD = r'''
+import importlib.util, sys, torch
+spec = importlib.util.spec_from_file_location("r2_xpool_interp", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+assert m._h2d_entries_kernel is not None
+g = torch.Generator().manual_seed(11)
+B, S, H, D, M, BS = 3, 6 * 64, 2, 16, 7, 64
+host_k = torch.randn(B, S, H, D, generator=g)
+host_v = torch.randn(B, S, H, D, generator=g)
+cis = torch.randn(B, S + 5, H, generator=g)[:, :S]
+ent = torch.tensor([[0, 1, 2, 3, 1], [2, 0, 5, 6, 1], [1, 1, 0, 0, 0], [1, 0, 4, 2, 1],
+                    [1, 1, 6, 4, 1], [0, 0, 1, 7, 1], [3, 0, 1, 4, 1], [0, 2, 1, 4, 1], [0, 0, -1, 4, 1]]
+                   ).t().contiguous()
+fails = []
+for bdt in (torch.float32, torch.float16):
+    a = [torch.zeros(M * BS, H, D), torch.zeros(M * BS, H, D), torch.zeros(M * BS, H, dtype=bdt)]
+    t = [x.clone() for x in a]
+    m.h2d_entries(*a, host_k, host_v, cis, ent, kernel=True)
+    m.h2d_entries_twin(*t, host_k, host_v, cis, ent)
+    if not all(torch.equal(x, y) for x, y in zip(a, t)):
+        fails.append(("kernel != twin", bdt))
+    if torch.equal(a[2], torch.zeros_like(a[2])) or not torch.equal(a[0][4 * 64:5 * 64, 1], torch.zeros(64, D)):
+        fails.append(("precondition: something landed, the out-of-bounds entry did not", bdt))
+a = [torch.zeros(M * BS, H, D), torch.zeros(M * BS, H, D)]
+t = [x.clone() for x in a]
+m.h2d_entries(a[0], a[1], None, host_k, host_v, None, ent, kernel=True)
+m.h2d_entries_twin(t[0], t[1], None, host_k, host_v, None, ent)
+if not all(torch.equal(x, y) for x, y in zip(a, t)):
+    fails.append(("kernel != twin without bias",))
+# NEGATIVE CONTROL: b and h exchanged in the table (a wrong row offset); precondition: the valid set changes bytes
+swapped = ent[[1, 0, 2, 3, 4]].contiguous()
+p = [torch.zeros(M * BS, H, D), torch.zeros(M * BS, H, D), torch.zeros(M * BS, H)]
+q = [x.clone() for x in p]
+m.h2d_entries(*p, host_k, host_v, cis, swapped, kernel=True)
+m.h2d_entries_twin(*q, host_k, host_v, cis, ent)
+if all(torch.equal(x, y) for x, y in zip(p, q)):
+    fails.append(("negative control not caught: the swapped table lands the same bytes",))
+if fails:
+    print("FAILS", fails)
+    sys.exit(1)
+print("XPOOL-INTERP OK")
+'''
+
+
+def test_XP11_the_entry_kernel_under_the_triton_interpreter():
+    """XP11 (review M2): _h2d_entries_kernel itself under TRITON_INTERPRET=1 (a fresh process, CPU tensors, piece 3's
+    pattern) equals h2d_entries_twin bitwise, with an fp32 and an fp16 bias (the explicit cast) and without a bias; the
+    kernel and the twin skip the SAME out-of-bounds entries (entry_in_bounds). NEGATIVE CONTROL: a table with b and h
+    exchanged lands other bytes."""
+    if importlib.util.find_spec("triton") is None:
+        pytest.skip("triton is not installed")
+    env = dict(os.environ, TRITON_INTERPRET="1", PYTHONDONTWRITEBYTECODE="1")
+    r = subprocess.run([sys.executable, "-c", INTERP_CHILD, str(TT.NOSI / "r2_xpool.py")], env=env, cwd=str(ROOT),
+                       capture_output=True, text=True, timeout=1500)
+    assert r.returncode == 0 and r.stdout.strip().splitlines()[-1:] == ["XPOOL-INTERP OK"], (
+        "child exit %d\n--- stdout ---\n%s\n--- stderr ---\n%s" % (r.returncode, r.stdout[-4000:], r.stderr[-4000:]))

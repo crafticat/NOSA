@@ -71,6 +71,7 @@ from .kstep.executor import DRAFT, VERIFY
 from .kstep.mutations import Mutations
 from .kstep.ownership import FREE, INFLIGHT, LRU, PO, RELEASING, VRES, LayerPool
 from .kstep.transfer import Transfer
+from .r2_xpool import ERR_UNBOUND as XP_ERR_UNBOUND
 
 BLOCK = 64
 N_TAIL = 4                       # tail-ring slots per (request, head): exact pages 0, 1 and draft pages 0, 1
@@ -147,6 +148,9 @@ class Residency:
                                  "%s" % type(self).__name__)
             if trash_slots:
                 raise ValueError("xpool: no trash slot in the shared-pool layout")
+            if getattr(transport, "xpool", None) is not xpool:       # review m2: a transport that indexes [b, slot, h]
+                raise ValueError("xpool: the transport %s does not write this pool's lanes (its .xpool is not this "
+                                 "XPool)" % type(transport).__name__)
             if (xpool.L, xpool.B, xpool.H, xpool.n_hist, xpool.mode, xpool.C) != (int(L), int(B), int(H),
                                                                                    int(C) + int(X), "pool", int(C)):
                 raise ValueError("xpool (L %d, B %d, H %d, n_hist %d, mode %s, C %s) is not this service's (L %d, B %d, "
@@ -332,11 +336,16 @@ class Residency:
     def _fill_bias(self, l: int, b: int, h: int, slot: int, block: int) -> None:
         if self.store_b is None or self.cis is None:
             return
-        if self.xpool is not None:                                     # [xpool] the slot's lane, device ops only
-            p = self.xpool.pos_of[l, b, h, slot]
-            rows = p * self.bs + torch.arange(self.bs, device=p.device)
-            self.store_b[l].index_put_((rows, torch.full_like(rows, h)),
-                                       self.cis[l][b, block * self.bs:(block + 1) * self.bs, h].to(self.store_b[l].dtype))
+        if self.xpool is not None:                                     # [xpool] the slot's lane, device ops only; an
+            xp = self.xpool                                            # unbound slot rewrites lane h of position 0
+            p = xp.pos_of[l, b, h, slot]                               # with its own values (no change) and sets
+            ok = p >= 0                                                # ERR_UNBOUND (review m1)
+            xp.err.bitwise_or_((~ok).to(torch.int64) * XP_ERR_UNBOUND)
+            r = torch.arange(self.bs, device=p.device)
+            rows = torch.where(ok, p * self.bs + r, r)
+            hs = torch.full_like(rows, h)
+            new = self.cis[l][b, block * self.bs:(block + 1) * self.bs, h].to(self.store_b[l].dtype)
+            self.store_b[l].index_put_((rows, hs), torch.where(ok, new, self.store_b[l][rows, hs]))
             return
         s0, r0 = slot * self.bs, block * self.bs
         self.store_b[l][b, s0:s0 + self.bs, h].copy_(self.cis[l][b, r0:r0 + self.bs, h], non_blocking=True)
