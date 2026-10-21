@@ -35,6 +35,13 @@ After the layer's attention the tick calls read_done(l, plan, event): the event 
 read and of every (key, l); a verify key's (key, l) references are QUEUED and dropped when that event completed (K4 as
 amended by repair 1 R1; dispatcher.py:1553-1588, :1671-1694, :2821).
 
+ARRIVALS (poll_arrivals, note 12k): with arrival_lag None (the default) a transport transfer is admitted at the first
+poll that observes its completion. With arrival_lag D it is admitted exactly at the poll of tick issue_tick + D (the
+tick index advances at end_tick): forced there if it has not landed (counted: arrival_forced, arrival_forced_ns), held
+back until then if it has (arrival_held). The ownership state then depends on the schedule only, not on when the
+transport lands, so two runs are comparable bitwise (Q-C3). An urgent block (landed in place) keeps its rule: admitted
+at the next poll.
+
 BIAS: the cis rows are on the GPU (the twin's total_cis), so they are not transferred: at TAKE the service copies the
 block's cis rows into the slot's bias rows on the current (main) stream, which orders the write after every earlier
 read of that slot on the same stream.
@@ -125,9 +132,20 @@ class Residency:
                  store_b=None, cis=None, block: int = BLOCK, block_bytes: int = 0, host_wait: Callable = None,
                  mut: Mutations = None, clock: Callable[[], int] = time.perf_counter_ns, poll_in_resolve: bool = True,
                  defer_issue: bool = False, defer_admit: bool = False, trash_slots: int = 0,
-                 policy_e_inflight: bool = True):
+                 policy_e_inflight: bool = True, arrival_lag: Optional[int] = None):
         if trash_slots not in (0, 1):
             raise ValueError("trash_slots must be 0 or 1 (got %r)" % (trash_slots,))
+        if arrival_lag is not None and (isinstance(arrival_lag, bool) or not isinstance(arrival_lag, int)
+                                        or arrival_lag < 1):
+            raise ValueError("arrival_lag must be None or an int >= 1 (got %r)" % (arrival_lag,))
+        # THE ARRIVAL RULE (note 12k): None = free timing (a transfer is admitted at the first poll that sees it done);
+        # D = fixed lag: a transfer issued in tick t is admitted exactly at the poll of tick t + D, forced there if it
+        # has not landed, never earlier even if it has; the forced waits are counted (arrival_forced, _ns)
+        self.arrival_lag = arrival_lag
+        self.tick_no = 0                                     # end_tick calls so far: the current tick's index
+        self.arrival_forced = 0                              # transfers forced at their admission tick
+        self.arrival_forced_ns = 0                           # the host time of those forces
+        self.arrival_held = 0                                # (poll, transfer) pairs done but not yet due
         self.poll_in_resolve, self.defer_issue = bool(poll_in_resolve), bool(defer_issue)
         # Policy E's in-flight candidates (note 12j); False is a NEGATIVE CONTROL (12h's rule: LRU entries only)
         self.policy_e_inflight = bool(policy_e_inflight)
@@ -235,11 +253,32 @@ class Residency:
         order = sorted(self.inflight.values(), key=lambda tr: (tr.layer, tr.b, tr.h, tr.seq))
         for tr0 in order:
             tr = self.inflight.get(tr0.seq)
-            if tr is not None and (tr.seq in self._landed or self.tp.done(tr)):
-                self._landed.discard(tr.seq)
-                self._admit(tr)
-                n += 1
+            if tr is None:
+                continue
+            if tr.seq not in self._landed and not self._arrived(tr):
+                continue
+            self._landed.discard(tr.seq)
+            self._admit(tr)
+            n += 1
         return n
+
+    def _arrived(self, tr: Transfer) -> bool:
+        """THE ARRIVAL RULE of one transport transfer (note 12k). Free timing (arrival_lag None): its own completion is
+        observed. Fixed lag D: the poll belongs to tick issue_tick + D or later; a transfer not landed by then is FORCED
+        here (counted, timed), one landed earlier waits for that tick (counted as held). The state then depends on the
+        schedule only, never on when the transport lands."""
+        if self.arrival_lag is None:
+            return self.tp.done(tr)
+        if self.tick_no < getattr(tr, "issue_tick", 0) + self.arrival_lag:
+            if self.tp.done(tr):
+                self.arrival_held += 1
+            return False
+        if not self.tp.done(tr):
+            t0 = time.perf_counter_ns()
+            self.tp.force(tr)
+            self.arrival_forced += 1
+            self.arrival_forced_ns += time.perf_counter_ns() - t0
+        return True
 
     def poll(self) -> None:
         """The start of a tick: arrivals, then the queued reference releases whose (key, l) reader event completed
@@ -440,6 +479,7 @@ class Residency:
         self.seq += 1
         gen = st.take(idx, st.owner, int(block), self.seq, cls="v" if kind == VERIFY else "ad")
         tr = Transfer(self.seq, st.owner, l, b, h, int(block), idx, gen, kind, key, hist_ev=hev, reader_ev=prev_reader)
+        tr.issue_tick = self.tick_no                                  # the tick that issues it (arrival_lag)
         self.inflight[tr.seq] = tr
         self.pending[(l, b, h, int(block))] = tr
         if not (at is not None and kind == VERIFY):
@@ -532,10 +572,12 @@ class Residency:
         return plan
 
     def end_tick(self) -> None:
-        """The end of a tick: the deferred draft transfers are issued, layer by layer, in their order."""
+        """The end of a tick: the deferred draft transfers are issued, layer by layer, in their order; the tick index
+        advances (arrival_lag counts ticks by it)."""
         for (l, trs) in self._deferred:
             self.tp.issue(l, trs)
         self._deferred = []
+        self.tick_no += 1
 
     def _verify_part(self, l: int, rows: Sequence[Row], hist, plan: Plan) -> Dict[Tuple[int, int], List]:
         """The verify rows of the layer (host, v1): protect, look, merge / wait / urgent (K5, else Policy E); returns
@@ -923,5 +965,7 @@ class Metrics:
             masked=self.masked, draft_pairs=self.draft_pairs,
             masked_fraction=(self.masked / self.draft_pairs if self.draft_pairs else None),
             draft_refused=self.refused, arrivals_after_cancel=self.arrivals_after_cancel, counts=dict(self.counts),
-            memory=self.svc.memory(), definitions=DEFINITIONS)
+            memory=self.svc.memory(), definitions=DEFINITIONS,
+            arrival=dict(lag=self.svc.arrival_lag, forced=self.svc.arrival_forced,
+                         forced_ns=self.svc.arrival_forced_ns, held=self.svc.arrival_held))
         return out

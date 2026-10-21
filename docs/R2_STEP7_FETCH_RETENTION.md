@@ -727,6 +727,40 @@ AFTER THE FIRST CPU RUN (2051f9b: 5 failed, 138 passed, 2 skipped;
   puts the drafts in blocks 0 .. 19 and the verify reads in 20 .. 29 (C 16, 30 ticks). No prefetch lands, so only
   in-flight candidates can serve the verifier.
 
+## 12k. The arrival rule: a fixed lag for comparable runs (Q-C3, branch feature/nosi-r2-m2-sparse, 2026-10-21)
+
+THE PROBLEM:
+- Draft rows read only READY blocks (paper 3.1). READY depends on which transfers the tick's poll admitted, and
+  with free timing that depends on when the transport landed them.
+- So two runs of the same documents differ: in the draft reads, the LRU order and the evictions. The exact wait keeps
+  every verify read correct, but not the drafts' choices.
+- "Landed at the first tick boundary after its event completes" still depends on timing, so it does not fix this.
+
+THE RULE: `Residency(arrival_lag=D)` (None = free timing, the default and unchanged; D >= 1):
+- A transport transfer issued in tick t (`tr.issue_tick`, taken from `tick_no`, which end_tick advances) is admitted
+  exactly at the poll of tick t + D.
+- At that poll the service FORCES a transfer that has not landed (`tp.force`). It counts the force in
+  `arrival_forced` and times it in `arrival_forced_ns`.
+- A transfer that landed earlier is held back until t + D; each held poll is counted in `arrival_held`.
+- The report gives `report()["arrival"]` = {lag, forced, forced_ns, held}.
+- Unchanged: an urgent block (landed in place) is admitted at the next poll; v1's own schedule still admits a waited
+  block at once (a force at a fixed point).
+- Then admissions, READY sets, draft reads, the LRU order, the evictions and Policy E's in-flight status are functions
+  of the schedule alone.
+- Reader events stay alike between runs:
+  - a transport lands a transfer only after its slot's reader completed;
+  - a force host-waits that reader.
+- Cost: a host wait whenever the transport is late by more than D ticks. It is reported, not hidden. Suggested
+  values: D = 2 for gilfree; D = 1 makes the gather transport deterministic too.
+
+TEST F22 (v1 and S-C):
+- The setup: two worlds on F6's schedule, with transports seeded differently ("delay", max_delay 4, bursts).
+- Precondition 1: their pending lists differ at some tick.
+- Precondition 2: both branches of the rule ran (a force at the admission tick, a landed transfer held back).
+- Claim: at D = 2 the ownership states are equal after every tick.
+- Negative control: free timing with the same seeds differs.
+- Also: arrival_lag 0 is refused.
+
 ## 13. Open questions
 
 - Q0 The per-layer sync of v1 drains the GPU 32 times per tick. If dHOST is too large, S-B (device-side draft rows,

@@ -1764,3 +1764,69 @@ def test_F21b_sc_equals_v1_with_an_asynchronous_transport(exact):
     assert bad == [], bad[:3]
     n = wv.svc.metrics.counts.get("verifier_inflight_evictions", 0)
     assert n > 0 and ws.svc.metrics.counts.get("verifier_inflight_evictions", 0) == n, wv.svc.metrics.counts
+
+
+# =====================================================================================================================
+# F22 the ARRIVAL RULE (Q-C3, note 12k): a fixed lag makes two runs with different transport timing comparable
+# =====================================================================================================================
+def _lag_pair(cls, D, seeds=(11, 12), steps=24, hb=15):
+    """Two services of one kind driven by F6's schedule, their transports seeded differently ("delay", max_delay 4,
+    bursts: they land at different polls). v1 runs its own schedule (polls at every resolve, issues at once, admits
+    a waited block at once); S-C its own. Readers complete two ticks late, cohorts are decided at their ends. Returns
+    (the first tick whose ownership states differ (_state without the transport's list) or None, the first tick whose
+    transports' pending lists differ or None, the two worlds)."""
+    worlds = []
+    for sd in seeds:
+        kw = dict(arrival_lag=D) if cls is None else dict(nblk=NB, arrival_lag=D)
+        worlds.append(world(C=8, X=48, R_ver=8, seed=sd, mode="delay", max_delay=4, cls=cls, svc_kw=kw))
+    uids = ("u0", "u1")
+    for w in worlds:
+        for b, u in enumerate(uids):
+            w.svc.begin_request(b, u)
+    tail = worlds[0].svc.tail0
+    readers, first_state, first_tp = [], None, None
+    for (t, m, ends, layers) in _sched(101, steps, True, hb):
+        for w in worlds:
+            w.svc.poll()
+        for l, spec in enumerate(layers):
+            rows = [Row(b, kind, key, 1000 + t, hb, [(hb, tail)]) for (b, kind, key, _) in spec]
+            sel = S(*[s for (_, _, _, s) in spec])
+            evs = [Ev() for _ in worlds]
+            for w, ev in zip(worlds, evs):
+                w.svc.read_done(l, w.svc.resolve(l, rows, sel), ev)
+            readers.append((t, evs))
+        for w in worlds:
+            w.svc.end_tick()
+        for (tt, evs) in readers:
+            if tt <= t - 2:
+                for ev in evs:
+                    ev.done = True
+        if ends:
+            for w in worlds:
+                for u in uids:
+                    w.svc.decided((u, 1, m))
+        if first_state is None and _state(worlds[0])[:-1] != _state(worlds[1])[:-1]:
+            first_state = t
+        if first_tp is None and [tr.seq for tr in worlds[0].tp.pending] != [tr.seq for tr in worlds[1].tp.pending]:
+            first_tp = t
+    return first_state, first_tp, worlds
+
+
+@pytest.mark.parametrize("kind", ["v1", "sc"])
+def test_F22_a_fixed_arrival_lag_makes_two_runs_comparable(kind):
+    """F22 (Q-C3): arrival_lag D = 2. Precondition: the two transports land differently (their pending lists differ at
+    some tick), and both branches of the rule ran (a transfer forced at its admission tick, a landed one held back).
+    Claim: the two services' ownership states are equal after every tick (v1 and S-C). Negative control: free timing
+    (arrival_lag None) with the same seeds gives different states. The forced waits are reported."""
+    cls = None if kind == "v1" else SC.ResidencySC
+    fs, ft, ws = _lag_pair(cls, 2)
+    assert ft is not None, "precondition: the two transports landed alike"
+    assert sum(w.svc.arrival_forced for w in ws) > 0 and sum(w.svc.arrival_held for w in ws) > 0, \
+        [(w.svc.arrival_forced, w.svc.arrival_held) for w in ws]
+    assert fs is None, fs
+    rep = ws[0].svc.report()["arrival"]
+    assert rep["lag"] == 2 and rep["forced"] == ws[0].svc.arrival_forced and rep["forced_ns"] >= 0
+    fs0, ft0, _ = _lag_pair(cls, None)
+    assert ft0 is not None and fs0 is not None, (ft0, fs0)
+    with pytest.raises(ValueError, match="arrival_lag"):
+        world(cls=cls, svc_kw=dict(arrival_lag=0) if cls is None else dict(nblk=NB, arrival_lag=0))
