@@ -266,6 +266,10 @@ def parse_args(argv):
     ap.add_argument("--host-profile", action="store_true",                                     # [hostfix] item 0
                     help="host sub-timers per tick (HOST_PROF_CATS), the feeder thread's Python time per release and "
                          "gc.callbacks (collection start / duration per tick) in the timed rounds; host clocks only")
+    ap.add_argument("--gc-freeze", action="store_true",                                       # [hostfix] item 1
+                    help="every timed phase (draft-only, round, bare round): gc.collect(), gc.freeze(), gc.disable() "
+                         "before it; gc.unfreeze(), gc.enable(), one gc.collect() after it (round_guard); the counts in "
+                         "each point's gc_freeze record")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -1129,9 +1133,23 @@ class GcLog:
 @contextlib.contextmanager
 def round_guard(a, eng, rec, tag):
     """[hostfix] The host guards of ONE timed phase (the draft-only phase, the round, the bare round) of one engine:
-    --host-profile installs a GcLog on the engine's timer for the phase (yielded; None without the flag). Without
-    any [hostfix] flag it does nothing (every phase as before). rec: the point's info (the guards' records)."""
+    --host-profile installs a GcLog on the engine's timer for the phase (yielded; None without the flag).
+    --gc-freeze (item 1): before the phase gc.collect(), gc.freeze() (every object alive now goes to the permanent
+    generation: no later collection walks it), gc.disable(); after it (an exception too) gc.unfreeze(), gc.enable()
+    (only when it was enabled before), then ONE gc.collect() outside the phase: the garbage the phase left in cycles.
+    rec["gc_freeze"][tag]: the generation counts and the collections per generation (gc.get_stats) before and after,
+    the frozen count, the objects collected before and after, the CUDA bytes that the after-collect freed (a CUDA
+    tensor held in a cycle stays allocated while the collector is off: the MUST EF_mem_cap sees the phase's peak).
+    Without any [hostfix] flag it does nothing (every phase as before). rec: the point's info (the guards' records)."""
     gcl = GcLog(eng.timer) if getattr(a, "host_profile", False) and eng.timer is not None else None
+    frz = None
+    if getattr(a, "gc_freeze", False):
+        frz = dict(enabled_before=gc.isenabled(), count_before=list(gc.get_count()))
+        frz["collected_before"] = gc.collect()
+        gc.freeze()
+        frz["frozen"] = gc.get_freeze_count()
+        gc.disable()
+        frz["stats_before"] = [dict(s) for s in gc.get_stats()]
     if gcl is not None:
         gc.callbacks.append(gcl)
     try:
@@ -1142,6 +1160,20 @@ def round_guard(a, eng, rec, tag):
                 gc.callbacks.remove(gcl)
             except ValueError:
                 pass
+        if frz is not None:
+            frz["count_after"] = list(gc.get_count())
+            frz["stats_after"] = [dict(s) for s in gc.get_stats()]
+            frz["collections_in_phase"] = [s1["collections"] - s0["collections"]
+                                           for s0, s1 in zip(frz["stats_before"], frz["stats_after"])]
+            gc.unfreeze()
+            if frz["enabled_before"]:
+                gc.enable()
+            tm = sys.modules.get("torch")
+            cuda = tm is not None and tm.cuda.is_available()
+            m0 = tm.cuda.memory_allocated() if cuda else None
+            frz["collected_after"] = gc.collect()
+            frz["cuda_freed_gb_by_collect"] = round((m0 - tm.cuda.memory_allocated()) / 1e9, 4) if cuda else None
+            rec.setdefault("gc_freeze", {})[tag] = frz
 
 
 def feeder_report(prof):
@@ -1728,6 +1760,9 @@ def main(argv=None) -> int:
             meta.update(host_profile=True, host_prof_cats=HOST_PROF_CATS,
                         host_profile_note="host clocks only (perf_counter); per point: draft_only_host_profile, "
                                           "host_profile (instrumented round), bare_host_profile (the headline)")
+        if a.gc_freeze:                                                                        # [hostfix] item 1
+            meta.update(gc_freeze=True, gc_freeze_note="each timed phase: collect, freeze, disable before; unfreeze, "
+                                                       "enable, collect after (per point: gc_freeze[phase])")
         if a.eval_role:                                                                        # [evalsplit]
             meta.update(eval_role=a.eval_role, accuracy_record=acc_rec, mem_cap_gb=a.mem_cap_gb,
                         eval_bands=a.eval_bands_v,

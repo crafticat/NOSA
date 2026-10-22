@@ -8,11 +8,15 @@ adversarial transport, S-C's CPU device stand-in) with B2 (OwnResidency) as the 
        exists; with it every HOST_PROF_CATS category is recorded except the GPU wait's (h_superset_wait: CudaDeviceOps
        only). NEGATIVE CONTROL: the comparison sees a planted one-logit change. GcLog records a collection inside its
        block only; the gilfree feeder's Python time per release (GilfreeTransport.prof) and its default (no record).
+  HF1  --gc-freeze (item 1): round_guard collects, freezes and disables before the phase and restores after it (an
+       exception too; a collector OFF before stays OFF); no automatic collection in the phase (PRECONDITION: the
+       same churn collects with the collector ON); the B2 round under the guard equals the round without it.
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA benchmarks/Efficiency/tests_cpu/test_r2_hostfix.py
 """
 from __future__ import annotations
 
+import contextlib
 import gc
 import importlib.util
 import inspect
@@ -49,9 +53,9 @@ def _sg5():
     return _shared("r2_tick_sg5_hostfix_cpu", str(EFF / "r2_tick_sg5.py"))
 
 
-def _run_hf(p3, toks, cfg="default", forced=True, svc_kw=None, setup=None):
-    """One B2 round on the CPU stand-in with a per-tick record (test_r2_tick_b2._run's, plus a CPU TickTimer and a
-    setup(eng, svc) hook before the round: the flag under test)."""
+def _run_hf(p3, toks, cfg="default", forced=True, svc_kw=None, setup=None, around=None):
+    """One B2 round on the CPU stand-in with a per-tick record (test_r2_tick_b2._run's, plus a CPU TickTimer, a
+    setup(eng, svc) hook before the round and around(eng): a context manager around run_round: the flag under test)."""
     eng = TT.make_res_engine(TT.make_ops(p3), kind="b2", svc_kw=svc_kw, **TB.CFG[cfg])
     world = eng.res_world
     svc = world.svc
@@ -92,8 +96,9 @@ def _run_hf(p3, toks, cfg="default", forced=True, svc_kw=None, setup=None):
     reject_at, _ = TK.forced_schedule(3) if forced else (None, [])
     rnd, err = None, None
     try:
-        rnd = TK.run_round(eng, [int(toks[0, b]) for b in range(eng.B)], [TT.STEPS] * eng.B, K=3, LAMBDA=7,
-                           teacher=teacher if forced else None, reject_at=reject_at, on_tick=on_tick)
+        with (around(eng) if around is not None else contextlib.nullcontext()):
+            rnd = TK.run_round(eng, [int(toks[0, b]) for b in range(eng.B)], [TT.STEPS] * eng.B, K=3, LAMBDA=7,
+                               teacher=teacher if forced else None, reject_at=reject_at, on_tick=on_tick)
     except Exception as e:                                            # noqa: BLE001 - a difference at its tick
         err = "%s: %s" % (type(e).__name__, str(e)[:300])
     return SimpleNamespace(eng=eng, svc=svc, ticks=ticks, rnd=rnd, err=err, evs=evs, world=world)
@@ -239,6 +244,84 @@ def test_HF0d_the_harness_wiring():
     # round_guard without any [hostfix] flag: nothing installed, nothing changed
     a = G.parse_args(base)
     n0 = len(gc.callbacks)
-    with G.round_guard(a, SimpleNamespace(timer=SimpleNamespace(tick=0)), {}, "round") as g:
-        assert g is None and len(gc.callbacks) == n0 and gc.isenabled()
-    assert len(gc.callbacks) == n0
+    rec = {}
+    with G.round_guard(a, SimpleNamespace(timer=SimpleNamespace(tick=0)), rec, "round") as g:
+        assert g is None and len(gc.callbacks) == n0 and gc.isenabled() and gc.get_freeze_count() == 0
+    assert len(gc.callbacks) == n0 and rec == {}
+
+
+# =====================================================================================================================
+# HF1 --gc-freeze
+# =====================================================================================================================
+def _churn(n=30000):
+    """Container allocations kept alive until the end (the collector counts allocations minus deallocations of
+    tracked objects): enough to pass the generation-0 threshold many times."""
+    keep = [{"i": i} for i in range(n)]
+    del keep
+
+
+def _collections():
+    return [s["collections"] for s in gc.get_stats()]
+
+
+def test_HF1a_gc_freeze_guard_disables_collection_in_the_phase_and_restores_it():
+    G = _sg5()
+    base = ["--out", "o", "--workload", "w", "--biattn", "b", "--gilfree", "g", "--gilfree-build", "/x"]
+    assert G.parse_args(base).gc_freeze is False
+    a = G.parse_args(base + ["--gc-freeze"])
+    eng = SimpleNamespace(timer=SimpleNamespace(tick=0))
+    assert gc.isenabled()
+    # precondition (L34: the control must be able to fire): the same churn with the collector ON collects
+    c0 = _collections()
+    _churn()
+    assert _collections()[0] > c0[0], "precondition: the churn triggers generation-0 collections"
+    rec = {}
+    with G.round_guard(a, eng, rec, "round"):
+        assert not gc.isenabled() and gc.get_freeze_count() > 0
+        c1 = _collections()
+        _churn()
+        assert _collections() == c1                                   # no automatic collection in the phase
+    assert gc.isenabled() and gc.get_freeze_count() == 0
+    r = rec["gc_freeze"]["round"]
+    assert r["enabled_before"] is True and r["frozen"] > 0
+    assert r["collections_in_phase"] and not any(r["collections_in_phase"]), r["collections_in_phase"]
+    assert r["collected_after"] >= 0 and "cuda_freed_gb_by_collect" in r
+    assert len(r["count_before"]) == len(gc.get_count())
+    with pytest.raises(RuntimeError):                                 # an exception in the phase restores it too
+        with G.round_guard(a, eng, rec, "bare"):
+            raise RuntimeError("x")
+    assert gc.isenabled() and gc.get_freeze_count() == 0 and "bare" in rec["gc_freeze"]
+    gc.disable()                                                      # a collector OFF before stays OFF after
+    try:
+        with G.round_guard(a, eng, rec, "draft_only"):
+            pass
+        assert not gc.isenabled() and rec["gc_freeze"]["draft_only"]["enabled_before"] is False
+    finally:
+        gc.enable()
+
+
+def test_HF1b_the_round_under_gc_freeze_changes_no_value(p3, ref):
+    toks, _ = ref
+    G = _sg5()
+    base = ["--out", "o", "--workload", "w", "--biattn", "b", "--gilfree", "g", "--gilfree-build", "/x"]
+    a = G.parse_args(base + ["--gc-freeze", "--host-profile"])
+    rec = {}
+    b0 = _run_hf(p3, toks, svc_kw=dict(checked=False))
+    b1 = _run_hf(p3, toks, svc_kw=dict(checked=False), setup=_host_profile_on,
+                 around=lambda eng: G.round_guard(a, eng, rec, "round"))
+    assert _diff(b0, b1) is None
+    _same_end(b0, b1)
+    r = rec["gc_freeze"]["round"]
+    assert r["collections_in_phase"] and not any(r["collections_in_phase"]), r["collections_in_phase"]
+    assert gc.isenabled() and gc.get_freeze_count() == 0
+    assert G.host_profile_record(b1.eng.timer.report())["missing"] == ["h_superset_wait"]
+
+
+def test_HF1c_the_harness_wiring():
+    G = _sg5()
+    src = inspect.getsource(G.round_guard)
+    for need in ("gc.collect()", "gc.freeze()", "gc.disable()", "gc.unfreeze()", "gc.enable()",
+                 'rec.setdefault("gc_freeze", {})[tag] = frz'):
+        assert need in src, need
+    assert src.index("gc.freeze()") < src.index("yield gcl") < src.index("gc.unfreeze()")
+    assert src.index("gc.callbacks.remove(gcl)") < src.index('frz["collected_after"] = gc.collect()')
