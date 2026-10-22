@@ -204,7 +204,7 @@
 #   FALSIFIER      steady (mean) > 140 or < 15 tok/s; MODEL check: steady (median) >= the same-GPU baseline would mean
 #                  the implementation reached the model's Q (SCORING_bigc.md section 5: 3,703.5 MODEL); predicted NOT
 #
-# REGISTERED for evalfast2t / evalfast2 / evalfast2c ([hostfix], STAMP <date -u, written by the lead when queuing>,
+# REGISTERED for evalfast2t / evalfast2 / evalfast2c ([hostfix], STAMP 2026-10-22T21:23:24Z,
 # SOURCE ONLY, not run). Derivation: analysis/evalfast/DIAG_tick_host.md sections 1.3, 1.4, 4 and 4.1 (INFERRED ranks,
 # not measured one by one) on the MEASURED evalfast record (sg5_ev1_2192143_evalfast, nova05: fused/batched TWIN with
 # the TORCH resolver; bare tick median 771.62 / mean 946.75 ms, 215.68 / 175.79 / 137.26 tok/s steady median / steady

@@ -764,7 +764,7 @@ def test_HF6a_the_cells_and_the_registration_static():
     reg = text[text.index("# REGISTERED for evalfast2t / evalfast2 / evalfast2c"):]
     reg = reg[:reg.index("\n#\n")]
     for tag in ("HF-T-MED", "HF-T-MEAN", "HF-T-EFF", "HF-T-GC", "HF-T-HOST", "HF-T-FALS", "HF-F-MED", "HF-F-MEAN",
-                "HF-F-EFF", "HF-F-FALS", "HF-C", "HF-MEM", "STAMP <date -u"):
+                "HF-F-EFF", "HF-F-FALS", "HF-C", "HF-MEM", "STAMP 2026-10-22T21:23:24Z"):
         assert tag in reg, tag
     # the registered bands are the cells' --eval-bands (SMED_LO:SMED_HI:SMEAN_LO:SMEAN_HI:EFF_LO:EFF_HI)
     assert "point 250, band [220, 300]" in reg and "point 230, band [195, 290]" in reg and "point 175, band [140, 220]" in reg
