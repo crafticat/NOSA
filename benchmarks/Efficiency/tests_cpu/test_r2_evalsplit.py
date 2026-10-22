@@ -483,7 +483,8 @@ def test_EV13_the_step_scripts(tmp_path):
     assert root == "/mnt/beegfs/ojerbi/nosi-r2-sg5par"                  # [sg5par] the per-holder claim's ROOT
     ea = (EFF / "r2_evalacc_step.sh").read_text()
     assert next(ln for ln in ea.splitlines() if ln.startswith("NOSI=")).split()[0] == "NOSI=/mnt/beegfs/ojerbi/nosi-r2-sg5par"
-    assert next(ln for ln in sg.splitlines() if ln.startswith("NOSI_INTEG=")).split()[0].endswith("nosi-r2-integ6")
+    # [hostfix] stack2 4ddb795 (cherry-picked) moved the stack1 cells' ROOT from integ6 to stack2
+    assert next(ln for ln in sg.splitlines() if ln.startswith("NOSI_INTEG=")).split()[0].endswith("nosi-r2-stack2")
     head = _clean_head()
     if head is None:
         pytest.skip("not a clean git checkout: the DRYRUN needs one")
