@@ -759,7 +759,7 @@ def test_HF6a_the_cells_and_the_registration_static():
     lines = text.splitlines()
     root = next(ln for ln in lines if ln.startswith("NOSI_EVAL=")).split()[0][len("NOSI_EVAL="):]
     assert root == HF_ROOT
-    assert "evalfast|evalfast2|evalfast2t|evalfast2c] [gilfree|gather]" in text                  # the usage line
+    assert "evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192] [gilfree|gather]" in text
     assert "        evalfast2|evalfast2t|evalfast2c) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     reg = text[text.index("# REGISTERED for evalfast2t / evalfast2 / evalfast2c"):]
     reg = reg[:reg.index("\n#\n")]
@@ -860,6 +860,56 @@ def test_HF6c_a_wrong_cell_word_is_refused(tmp_path):
         r = subprocess.run(["bash", str(STEP), "--nosi", "0" * 40, "418", "t1", *bad], env=env, capture_output=True,
                            text=True, timeout=60)
         assert r.returncode == 2 and "usage" in r.stderr, (bad, r.stderr[-200:])
+
+
+# HF7 [b192] the B 192 resolver pair evalfast2c192 / evalfast2f192 / evalfast2t192 (the fused path does not fit B 216)
+B192_CELLS = dict(
+    evalfast2f192=dict(res="fused", flags=True, has=["--eval-bands 75:140:60:135:50:120", "--bare", "--steps 48",
+                                                     "--eval-role fast-time", "--mem-cap-gb 84",
+                                                     "--host-profile --gc-freeze --lean-time"]),
+    evalfast2t192=dict(res="torch", flags=True, has=["--eval-bands 220:300:180:290:140:230", "--bare", "--steps 48",
+                                                     "--eval-role fast-time", "--mem-cap-gb 84",
+                                                     "--host-profile --gc-freeze --lean-time"]),
+    evalfast2c192=dict(res="check", flags=False, has=["--steps 8", "--draft-ticks 4"]))
+
+
+def test_HF7a_the_b192_cells_and_the_registration_static():
+    text = STEP.read_text()
+    assert "        evalfast2f192|evalfast2t192|evalfast2c192) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
+    reg = text[text.index("# REGISTERED for evalfast2c192 / evalfast2f192 / evalfast2t192"):]
+    reg = reg[:reg.index("\n#\n")]
+    for tag in ("STAMP 2026-10-22T22:59:44Z", "B1-C", "B1-T-MED", "B1-T-MEAN", "B1-T-EFF", "B1-F-MED", "B1-F-FALS",
+                "B1-MEM", "point 255, band [220, 300]", "point 100, band [75, 140]", "[180, 290]", "[140, 230]",
+                "[60, 135]", "[50, 120]", "NOT a headline"):
+        assert tag in reg, tag
+    blk = text[text.index("    evalfast2f192|evalfast2t192) MODES=fast"):text.index("    evalfast2c192) MODES=fast")]
+    assert "RES=fused ; BANDS=75:140:60:135:50:120" in blk and "RES=torch ; BANDS=220:300:180:290:140:230" in blk
+    assert "BATCH=192" in blk and "PX=1344 ; PRV=1296" in blk and "--X-pool 1344" in blk
+
+
+@pytest.mark.parametrize("cell", sorted(B192_CELLS))
+def test_HF7b_the_b192_cells_dryrun(tmp_path, cell):
+    if _clean_head() is None:
+        pytest.skip("not a clean git checkout (tracked changes or untracked files in nosi/): the DRYRUN needs one")
+    r = _dry(tmp_path, cell)
+    if r.returncode != 0:
+        assert Path(HF_ROOT).resolve() != REPO.resolve(), r.stderr[-400:]
+        pytest.skip("DRYRUN stopped outside the hostfix ROOT: %s" % r.stderr.strip()[-200:])
+    line = r.stdout.strip().splitlines()[-1]
+    got = line.split("r2_tick_sg5.py ", 1)[1].strip().replace("\\,", ",")
+    for w in ["--modes fast --backends b2", "--batch 192", "--C 96 --X 1344 --R-ver 1296", "--mem=240G",
+              "--layout pool --X-pool 1344 --arrival-lag 2", "--repeat-docs --log-slots -1 --skip-shipped",
+              "--variants fused/batched", "--job-name=sg5-t1-418-%s " % cell] + B192_CELLS[cell]["has"]:
+        assert w in got or w in line, (cell, w)
+    assert "--wait-index" not in got and "--b2-fewer-reads" not in got and "torch/per_call" not in got
+    pa = _sg5().parse_args(got.split())
+    assert pa.batch == 192 and pa.X_pool == 1344 and pa.b2_resolve == B192_CELLS[cell]["res"]
+    assert bool(pa.host_profile and pa.gc_freeze and pa.lean_time) == B192_CELLS[cell]["flags"]
+    if cell == "evalfast2c192":
+        assert pa.eval_role == "" and pa.steps == 8 and not pa.bare and "--accuracy-record" not in got
+    else:
+        assert pa.eval_role == "fast-time" and pa.bare
+        assert "--accuracy-record /mnt/beegfs/ojerbi/r2-runs/evalacc/eacc_t1_418_evalacc/summary.json" in got
 
 
 def test_HF1c_the_harness_wiring():

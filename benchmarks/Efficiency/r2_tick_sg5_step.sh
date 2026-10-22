@@ -240,6 +240,23 @@
 #              <= 84 (MUST), no point (the fused resolver's own temporaries). FALSIFIER: EF_mem_cap fails
 #   evalfast2 / evalfast2t eval bands (R_EF_bands, REPORT): the HF-*-MED / -MEAN / -EFF bands above
 #
+# REGISTERED for evalfast2c192 / evalfast2f192 / evalfast2t192 ([b192], STAMP 2026-10-22T22:59:44Z, before any run).
+# WHY: at B 216 the fused path does not fit the A100. evalfast2c hf1/hf2: Triton CUDA OOM at the first _fr_v2 launch
+# (driver local memory); evalfast2 hf1/hf2: torch OOM in the preflight after that launch (75.66 GiB torch + 3.3 GiB
+# non-torch of 79.25 GiB; DIAG_fused_check_oom.md). stack1b launched the same _fr_v2 binary at B 192 (peak 75.45 GB).
+# So the RESOLVER comparison moves to B 192 (C 96 + X 1344, X = 7 per request, R_ver 1296, NP 2048), as a matched pair.
+# The B 216 headline stays evalfast2t's (torch). The B 192 cells are NOT a headline: mb1 (the baseline) is at B 216.
+#   B1-C     evalfast2c192 MUST _draft_only_fused_equal / _round_fused_equal / _fused_err PASS. FALSIFIER: a
+#            difference: then evalfast2f192 is VOID
+#   B1-T-MED evalfast2t192 steady tok/s (median tick): point 255, band [220, 300] (evalfast2t's tick 640 ms scaled to
+#            B 192: host + other about 220 ms, torch res about 350 ms -> about 570 ms; 166 x 192/216 = 148 tok per tick)
+#   B1-T-MEAN [180, 290]; B1-T-EFF [140, 230]
+#   B1-F-MED evalfast2f192 steady tok/s (median tick): point 100, band [75, 140] (tick about 220 + stack1b's fused res
+#            median 1215 = about 1435 ms; 148 / 1.435 = 103). B1-F-MEAN [60, 135]; B1-F-EFF [50, 120]
+#   B1-F-FALS FALSIFIER of "fused is slower than torch at NP 2048": evalfast2f192 median ABOVE evalfast2t192's
+#   B1-MEM   both <= 84 GB (MUST EF_mem_cap). REPORT: fused warm_mem_gb (d2b6627 oomfix: free GB before / after the
+#            first warm launch; the difference is the _fr_v2 local-memory pool)
+#
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
 #        _k5_report) names the per-layer demand (first misses needing a shared extra, free extras at the tick start,
@@ -342,7 +359,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -358,6 +375,7 @@ for w in "$@"; do
             [ -z "$CELL" ] || usage; CELL=$w ;;                                                  # [integ3]
         evalfast) [ -z "$CELL" ] || usage; CELL=$w ;;                                            # [evalsplit]
         evalfast2|evalfast2t|evalfast2c) [ -z "$CELL" ] || usage; CELL=$w ;;                     # [hostfix]
+        evalfast2f192|evalfast2t192|evalfast2c192) [ -z "$CELL" ] || usage; CELL=$w ;;            # [b192]
         *) usage ;;
     esac
 done
@@ -506,6 +524,19 @@ case $CELL in
     evalfast2c) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_evalfast2c       # [hostfix]
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
         EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
+                 --b2-resolve check) ;;
+    evalfast2f192|evalfast2t192) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1344 ; PRV=1296 ; SWEEP_RUN= ; SUFFIX=_$CELL  # [b192]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=192 ; MEMG=240G ; VARIANTS=fused/batched
+        if [ "$CELL" = evalfast2f192 ]; then RES=fused ; BANDS=75:140:60:135:50:120
+        else RES=torch ; BANDS=220:300:180:290:140:230
+        fi
+        EVALARG=(--layout pool --X-pool 1344 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
+                 --eval-role fast-time --mem-cap-gb 84
+                 --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
+                 --eval-bands "$BANDS" --b2-resolve "$RES" --host-profile --gc-freeze --lean-time) ;;
+    evalfast2c192) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1344 ; PRV=1296 ; SWEEP_RUN= ; SUFFIX=_evalfast2c192    # [b192]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=192 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
+        EVALARG=(--layout pool --X-pool 1344 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
                  --b2-resolve check) ;;
 esac
 MIN_LEFT=$((STEP_MIN * 60 + 600))                           # [fusedres2] after the cell's STEP_MIN
