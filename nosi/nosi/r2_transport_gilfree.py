@@ -93,6 +93,7 @@ import contextlib
 import os
 import queue
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
@@ -149,6 +150,11 @@ WORKERS = ("python", "cpp")
 
 class GilfreeTransport:
     name = "gilfree"
+    # [hostfix] --host-profile (OPT-IN; None: no clock is read): a list that gets one record per release of the
+    # Python worker (_release, the feeder thread when background): (layer, transfers, python ns, native ns, the clock
+    # at its end). python ns = the release's wall time minus the native pack call (npipe.release, which runs the C++
+    # team): the feeder's Python part (the waits, _check, the lists, _publish, the event), which holds the GIL.
+    prof = None
 
     def __init__(self, ext, host_k: Sequence[torch.Tensor], host_v: Sequence[torch.Tensor], slots_k, slots_v, bs: int,
                  D: int, threads: int, host_wait: Callable[[Any], None], cap_groups: int = 256, ring: int = 2,
@@ -569,6 +575,9 @@ class GilfreeTransport:
                                                                      self.nblk, self.n_slots))
 
     def _release(self, layer: int, transfers: List[Transfer]) -> None:
+        prof = self.prof                                       # [hostfix] --host-profile (None: off)
+        if prof is not None:
+            t_start = time.perf_counter_ns()
         if not self.skip_hist_wait:
             for tr in transfers:                               # T4: the host rows exist before the pack reads them
                 if tr.hist_ev is not None and not ev_done(tr.hist_ev):
@@ -582,11 +591,16 @@ class GilfreeTransport:
         self._check(layer, transfers)
         flat = self.xpool is not None                          # [xpool] the destination is the transfer's lane
         i64 = lambda xs: torch.tensor(xs, dtype=torch.int64)   # noqa: E731
-        st = self.npipe.release(i64([0] * len(transfers)), i64([tr.h for tr in transfers]),
-                                i64([layer * self.B + tr.b for tr in transfers]),
-                                i64([tr.phys if flat else tr.b * self.n_slots + tr.slot for tr in transfers]),
-                                i64([tr.block for tr in transfers]), self.slots_k[layer].view(-1, self.D),
-                                self.slots_v[layer].view(-1, self.D))
+        cols = (i64([0] * len(transfers)), i64([tr.h for tr in transfers]),
+                i64([layer * self.B + tr.b for tr in transfers]),
+                i64([tr.phys if flat else tr.b * self.n_slots + tr.slot for tr in transfers]),
+                i64([tr.block for tr in transfers]), self.slots_k[layer].view(-1, self.D),
+                self.slots_v[layer].view(-1, self.D))
+        if prof is not None:
+            t_nat = time.perf_counter_ns()
+        st = self.npipe.release(*cols)
+        if prof is not None:
+            t_nat = time.perf_counter_ns() - t_nat
         st = [int(x) for x in st]
         if st[1] > 0 and not (st[7] == st[8] == self.threads):
             raise RuntimeError("gilfree: packing teams of %d .. %d threads != requested %d" % (st[7], st[8], self.threads))
@@ -605,6 +619,9 @@ class GilfreeTransport:
             ev = _Done()
         for tr in transfers:
             tr.ev = ev
+        if prof is not None:                                   # [hostfix] (list.append: atomic under the GIL)
+            t_end = time.perf_counter_ns()
+            prof.append((int(layer), len(transfers), t_end - t_start - t_nat, t_nat, t_end))
 
     # ------------------------------------------------------------------------------------------------ K3X interface
     def _raise_pending_error(self) -> None:

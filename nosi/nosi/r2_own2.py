@@ -35,6 +35,7 @@ NEGATIVE CONTROLS (b2_mut, tests only; the B2 forms of C's fixture plants and of
 """
 from __future__ import annotations
 
+import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -445,20 +446,37 @@ class OwnResidency(ResidencySparse):
         if n:
             self.journal_counts[kind] = self.journal_counts.get(kind, 0) + int(n)
 
+    # [hostfix] --host-profile (S-C's host_prof, a callable (category, ns); None: no clock is read, no record)
+    def _hp0(self) -> int:
+        return time.perf_counter_ns() if self.host_prof is not None else 0
+
+    def _hp(self, cat: str, t0: int) -> int:
+        """Records the host ns since t0 under cat (when profiling); returns the clock now (the next part's t0)."""
+        if self.host_prof is None:
+            return 0
+        t = time.perf_counter_ns()
+        self.host_prof(cat, t - t0)
+        return t
+
     # ================================================================================================================
     # poll
     # ================================================================================================================
     def poll(self) -> None:
         """res.py:283-297 on the table, in v1's order: the arrivals, then the queued drops, then the releases (the poll
         order is a contract: poll_order_swapped is its NEGATIVE CONTROL). Checked: I1 / I2 after the arrivals."""
+        t = self._hp0()                                               # [hostfix] --host-profile (0: off)
         if self.b2_mut.get("poll_order_swapped"):
             self._poll_drops()
             self._poll_arrivals()
         else:
             self._poll_arrivals()
+            t = self._hp("h_poll_arrivals", t)
             self._poll_drops()
+            t = self._hp("h_poll_drops", t)
         self._poll_releases()
+        t = self._hp("h_poll_releases", t)
         self.metrics.sample_memory()
+        self._hp("h_poll_memory", t)
 
     def _poll_arrivals(self) -> int:
         """res.py:245-264: every transfer whose own completion is observed (or landed in place: an urgent gather) is
@@ -574,6 +592,7 @@ class OwnResidency(ResidencySparse):
         journal, the release queue)."""
         if not steps:
             return
+        t_hp = self._hp0()                                            # [hostfix] --host-profile (0: off)
         names = list(self._flags)
         parts = [self._flags[n].to(torch.int64).reshape(1) for n in names]
         for st in steps:
@@ -623,6 +642,7 @@ class OwnResidency(ResidencySparse):
         if raised:                                                    # [xpool] after the overflow (review m7)
             raise CapacityRefusal("S-C: the watched device flag(s) %s are set at this tick: the tick is void (none "
                                   "of its decisions is applied)" % raised)
+        self._hp("h_apply_read", t_hp)                                # the ONE read and its parse
         self._apply_b2(steps, info)
         self.b2_applied += 1
 
@@ -640,6 +660,7 @@ class OwnResidency(ResidencySparse):
         return out
 
     def _apply_b2(self, steps: List[Dict], info: List[Dict]) -> None:
+        t_hp = self._hp0()                                            # [hostfix] --host-profile (0: off)
         T, G = self.own, self.own.geo
         d = self.device
         L, B, H = self.L, self.B, self.H
@@ -800,6 +821,7 @@ class OwnResidency(ResidencySparse):
             pass                                                      # (the bit was cleared in _rec_mutate)
         O.read_done(T, vread, P["D"], rows, e_l)
         self._changed()
+        self._hp("h_b2_ops", t_hp)                                    # [hostfix] parse .. read_done (ops and syncs)
         # ---------------------------------------------------------------- the host side
         self._host_side(steps, info, P, ev, takes, victims, rc, rows, vlook, fv, fd, old)
 
@@ -829,6 +851,7 @@ class OwnResidency(ResidencySparse):
         G = self.own.geo
         V, D = P["V"], P["D"]
         vrows, drows = steps[0]["vrows"], steps[0]["drows"]
+        t_hp = self._hp0()                                            # [hostfix] --host-profile (0: off)
         # Policy E's victims (res.py:399-418, :363-388)
         for (l, b, h, oblk, ocode, ord_) in victims:
             self.metrics.count("verifier_evictions")
@@ -849,6 +872,7 @@ class OwnResidency(ResidencySparse):
                     self.metrics.count("verifier_force_waits")
                 self._count("release:verifier_evict", 1)
             self._count("free", 1)
+        t_hp = self._hp("h_hs_victims", t_hp)
         # the takes, in K3X order (the vendored _take's Transfer, res.py:476-489)
         tk = (ev["kind"] != 2).nonzero().squeeze(1).tolist()
         part = ev["part"].tolist()
@@ -888,6 +912,7 @@ class OwnResidency(ResidencySparse):
         self._count("take", len(tk))
         for l in sorted(by_layer):
             self._deferred.append((l, by_layer[l]))
+        t_hp = self._hp("h_hs_takes", t_hp)                           # the take columns' reads and the per-take loop
         # the demand merges on the transfers (res.py:605-611, :672-674)
         if V is not None:
             m = O.has(V["flags"], O.INFL) | O.has(V["flags"], O.DUP)
@@ -909,6 +934,7 @@ class OwnResidency(ResidencySparse):
         self._count("acquire", int(rc["acquire"]))
         self._count("evict_po", int(rc["evict_po"]))
         self._count("release:evict", int(rc["evict_rel"]))
+        t_hp = self._hp("h_hs_merges", t_hp)                          # demand merges, refusals, recency journal
         # the looks (4.3 / 4.6), as C's sparse consumer (r2_residency_sparse.py _apply_verify_sparse)
         now = self.clock()
         trs_of = {q: tr for (q, tr) in new_trs}
@@ -971,12 +997,14 @@ class OwnResidency(ResidencySparse):
             if not self.mut.release_only_at_decision:
                 for key in keys:
                     self._queue(key, l)
+        t_hp = self._hp("h_hs_looks", t_hp)                           # the 4.3 / 4.6 looks and the release queue
         for p in info:
             if p["st"]["ddec"] is not None:
                 masked, refused, pairs = p["dc"]
                 self.metrics.layer_plan(Plan(page_table=None, num_pages=None, last_len=None, seq_idx=None, blocks=[],
                                              masked=int(masked), draft_pairs=int(pairs), refused=int(refused)))
         self._changed()
+        self._hp("h_hs_plans", t_hp)
 
     # ---------------------------------------------------------------------------------------------- record mutations
     def _rec_mutate(self, layers: List[Dict], rowsel: torch.Tensor, vread: torch.Tensor, rows, row_b: torch.Tensor,

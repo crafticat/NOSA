@@ -356,6 +356,10 @@ class TickEngine:
     ONE copy_rows_many per layer (no host read; with twin "fused" the advance is one fused kernel); bitwise the same."""
 
     LOG = 1 << 16
+    # [hostfix] --host-profile (OPT-IN, default False: no extra record): the timer also gets host sub-timers, in
+    # seconds per tick, under the categories of HOST_PROF_CATS (the engine's part; the service records its own parts
+    # through its host_prof callable). Host clocks only: no device read, no event, no change of any computed value.
+    host_prof = False
 
     def __init__(self, model, ops, twins: List[PositionalTwin], store_k, store_v, store_bias, S_list, M_alloc: int,
                  nl=None, stage1=None, pool=None, select=SC.select_blocks, draft_drop: float = 0.0, drop_seed: int = 0,
@@ -696,11 +700,16 @@ class TickEngine:
         self.backend.begin_tick()
         t_rows = time.perf_counter()
         tab, count, T = self.row_table(rows, tokens)
+        t_prep = time.perf_counter()                                        # [hostfix] (a host clock only)
         svc_rows = self.backend.prepare(rows)
         R = len(rows)
         if self.timer is not None:
             self.timer.host("backend", t_rows - t_start)
             self.timer.host("rows", time.perf_counter() - t_rows)
+            if self.host_prof:                                              # [hostfix] --host-profile
+                self.timer.host("h_begin_tick", t_rows - t_start)
+                self.timer.host("h_row_table", t_prep - t_rows)
+                self.timer.host("h_prepare", time.perf_counter() - t_prep)
         buf = self._to_device(torch.cat([tab.reshape(-1), torch.tensor(count, dtype=torch.int64)]))
         d = buf[:len(FIELDS) * R].view(len(FIELDS), R)
         n_dev = buf[len(FIELDS) * R:]                                       # (2B,) per-bank counts, on the device
@@ -727,6 +736,7 @@ class TickEngine:
         ctx = SimpleNamespace(pos=pos, rb=rb, rb32=rb32, prev_slot=prev_slot, tail_slot=tail_slot, is_draft=is_draft,
                               any_draft=any_draft, last=last, rows=svc_rows, rows_max=rows_max)
         pos0 = list(self.bank_pos)
+        t_lay = time.perf_counter()                                         # [hostfix] (a host clock only)
         hidden = F.embedding(ids, model.embed_tokens)
         ctrs = []
         for l, layer in enumerate(model.layers):
@@ -738,6 +748,9 @@ class TickEngine:
         self.backend.end_tick()
         if self.timer is not None:
             self.timer.host("backend", time.perf_counter() - t_be)
+            if self.host_prof:                                              # [hostfix] --host-profile
+                self.timer.host("h_layers", t_be - t_lay)                   # the 32 layers' host time (launches,
+                self.timer.host("h_end_tick", time.perf_counter() - t_be)   # pages, after_attention)
         arg = logits.argmax(-1)
         lo = self.n_tok
         if lo + R > self.LOG:
@@ -814,6 +827,8 @@ class TickEngine:
             table, npg, last, seq_idx, plan = self.backend.pages(l, ctx, sel, layer)
         if self.timer is not None:
             self.timer.host("backend", time.perf_counter() - t_res)
+            if self.host_prof:                                              # [hostfix] --host-profile
+                self.timer.host("h_pages", time.perf_counter() - t_res)
         akw = {}
         if getattr(self.ops.attn, "needs_page_key", False):                # [sharedkv] the selector (default: piece 3)
             with self._span("res"):
@@ -831,6 +846,8 @@ class TickEngine:
             self.backend.after_attention(l, plan)
         if self.timer is not None:
             self.timer.host("backend", time.perf_counter() - t_res)
+            if self.host_prof:                                              # [hostfix] --host-profile
+                self.timer.host("h_after_attention", time.perf_counter() - t_res)
         attn = attn.view(R, 1, -1)
         hidden = residual + lin(attn, layer.wo)
         residual = hidden
@@ -1345,9 +1362,12 @@ def run_round(engine: TickEngine, first_tokens: Sequence[int], max_new: Sequence
     if ready is not None:
         rnd.ready = lambda b, c: bool(ready(rnd, b, c))
     empty = 0
+    prof = engine.timer is not None and bool(getattr(engine, "host_prof", False))   # [hostfix] --host-profile
+    clk = time.perf_counter
     while not all(r.done for r in rnd.reqs):
         if rnd.ticks >= max_ticks:
             raise TickError("no progress after %d ticks" % max_ticks)
+        t_plan = clk()
         rows = rnd.plan_tick()
         if not rows:
             empty += 1
@@ -1359,16 +1379,29 @@ def run_round(engine: TickEngine, first_tokens: Sequence[int], max_new: Sequence
         tokens = [row.token for row in rows]
         if engine.timer is not None:
             engine.timer.next_tick()
+            if prof:                                             # [hostfix] the plan of THIS tick (before its span)
+                engine.timer.host("h_plan", clk() - t_plan)
         with engine._span("tick"):
             out = engine.run_rows(rows, tokens)
         if on_tick is not None:                                  # the gates' checks: outside the tick's spans
+            t0 = clk()
             on_tick(rows, tokens, out)
+            if prof:
+                engine.timer.host("h_on_tick", clk() - t0)
         with engine._span("tick"):
+            t0 = clk()
             rnd.finish_tick(rows, out.slots, out.hi)
+            t1 = clk()
             engine.apply_events()
+            if prof:
+                engine.timer.host("h_finish_tick", t1 - t0)      # the decision read and the host decisions
+                engine.timer.host("h_apply_events", clk() - t1)
+        t0 = clk()
         for b, r in enumerate(rnd.reqs):
             if r.done:
                 engine.end_request(b)
+        if prof:
+            engine.timer.host("h_end_request", clk() - t0)       # outside the tick's span (wall clock only)
     engine.check_overflow()
     return rnd
 

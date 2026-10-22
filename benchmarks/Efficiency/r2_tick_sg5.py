@@ -68,12 +68,14 @@ refused). ENVIRONMENT: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0, NOSI_POOL_BLOCKS 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import json
 import math
 import os
 import subprocess
 import sys
+import threading
 import time
 import traceback
 
@@ -106,6 +108,33 @@ STACK_BASES = ("none",) + tuple("only-" + c for c in STACK_COMPONENTS)   # [inte
 # the flags a stack sets: each must be at its parse default when --stack is given (never silently overridden)
 STACK_FLAG_DEFAULTS = dict(twin="torch", variants="", b2_resolve="torch", layout="stream", attn="per_row",
                            union="torch", gilfree_warm_up="on")
+# [hostfix] --host-profile: the host sub-timers per tick (TickTimer.host, ms per tick in the record; host clocks only,
+# no device read). DIAG_tick_host.md section 1.2 names each item; "h_" + the part. The engine's (r2_tick.py), the
+# service's (r2_residency_sc.py / r2_own2.py, through svc.host_prof) and the wait's (CudaDeviceOps.wait).
+HOST_PROF_CATS = dict(
+    h_plan="run_round: plan_tick (item 0; before the tick's span)",
+    h_begin_tick="run_rows: backend.begin_tick = the service's poll (item 1)",
+    h_poll_arrivals="B2 poll: _poll_arrivals (item 1a)", h_poll_drops="B2 poll: _poll_drops (1b)",
+    h_poll_releases="B2 poll: _poll_releases (1c)", h_poll_memory="B2 poll: metrics.sample_memory (1d)",
+    h_row_table="run_rows: row_table (item 2)", h_prepare="run_rows: backend.prepare (item 3)",
+    h_layers="run_rows: the 32 layers' host time, embedding to lm_head (items 4-6: launches, pages, waits)",
+    h_pages="per layer, summed: backend.pages = resolve + translate (5b, 5c, 5d)",
+    h_superset_wait="per verify layer, summed: CudaDeviceOps._superset_wait (5c)",
+    h_after_attention="per layer, summed: backend.after_attention = read_done (5e)",
+    h_end_tick="run_rows: backend.end_tick (item 7)",
+    h_et_apply="end_tick: apply_tick = the decision read + the B2 consumer (7a-7f)",
+    h_apply_read="B2 apply_tick: the ONE decision read and its parse (7a)",
+    h_b2_ops="B2 _apply_b2: parse .. read_done, device ops and their syncs (7b)",
+    h_hs_victims="B2 _host_side: Policy E victims (7c)", h_hs_takes="B2 _host_side: the takes loop (7d)",
+    h_hs_merges="B2 _host_side: demand merges, refusals, recency journal (7e)",
+    h_hs_looks="B2 _host_side: the 4.3 / 4.6 looks and the release queue (7f)",
+    h_hs_plans="B2 _host_side: the layer plans (masked, pairs, refusals)",
+    h_et_issue="end_tick: Residency.end_tick = assign_phys + the draft issues (7g, 7h)",
+    h_et_memory="end_tick: metrics.sample_memory (7i)",
+    h_finish_tick="run_round: finish_tick = read_tokens + the host decisions (item 9)",
+    h_apply_events="run_round: apply_events (item 10)",
+    h_on_tick="run_round: on_tick (the gates' callback; outside the tick's span)",
+    h_end_request="run_round: end_request loop (item 11; outside the tick's span)")
 
 
 def log(msg):
@@ -234,6 +263,9 @@ def parse_args(argv):
                     help="the declared device memory cap (GB = 1e9 B, max allocated): MUST EF_mem_cap")
     ap.add_argument("--eval-bands", default="",                                                # [evalsplit]
                     help="SMED_LO:SMED_HI:SMEAN_LO:SMEAN_HI:EFF_LO:EFF_HI tok/s: REPORT R_EF_bands on the headline")
+    ap.add_argument("--host-profile", action="store_true",                                     # [hostfix] item 0
+                    help="host sub-timers per tick (HOST_PROF_CATS), the feeder thread's Python time per release and "
+                         "gc.callbacks (collection start / duration per tick) in the timed rounds; host clocks only")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -738,6 +770,11 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
             lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)
         eng.attach_backend(ResidencyBackend(eng, svc, host_k, host_v, cuda_event, a.K))
         eng.timer = TickTimer(cuda=True)
+        if getattr(a, "host_profile", False):                            # [hostfix] item 0: host clocks only
+            eng.host_prof = True
+            svc.host_prof = lambda cat, ns, t=eng.timer: t.host(cat, ns * 1e-9)
+            if getattr(tp, "worker", None) == "python":                  # the gilfree Python feeder's releases
+                tp.prof = []
         if timer_cats is not None:                                       # BARE: the tick events only
             base_span = eng.timer.span
             import contextlib
@@ -1040,6 +1077,105 @@ def summarize(rep, skip=1):
     return out
 
 
+class GcLog:
+    """[hostfix] --host-profile: a gc.callbacks hook over a timed round. Each collection is one event (the timer's tick
+    at its start, the generation, the start clock ns, the pause ns, the objects collected, the thread that ran it: the
+    main thread or the gilfree feeder; a collection holds the GIL, so it pauses both). Collections are serialized by
+    the interpreter, so one start clock is enough. Installed by `with`, removed at the exit (an exception too)."""
+
+    def __init__(self, timer):
+        self.timer = timer
+        self.events = []
+        self._t0 = None
+
+    def __call__(self, phase, info):
+        if phase == "start":
+            self._t0 = time.perf_counter_ns()
+        elif self._t0 is not None:
+            t1 = time.perf_counter_ns()
+            self.events.append((int(self.timer.tick), int(info.get("generation", -1)), self._t0, t1 - self._t0,
+                                int(info.get("collected", 0)), threading.current_thread().name))
+            self._t0 = None
+
+    def __enter__(self):
+        gc.callbacks.append(self)
+        return self
+
+    def __exit__(self, et, ev, tb):
+        try:
+            gc.callbacks.remove(self)
+        except ValueError:
+            pass
+        return False
+
+    def report(self, n_ticks):
+        """Per tick the pause ms (sum; a collection before the first tick counts at tick 0), per generation the count
+        and ms, the ten longest pauses (tick, generation, ms, collected, thread)."""
+        per = [0.0] * max(1, int(n_ticks))
+        by_gen = {}
+        for (t, g, _, dur, col, _th) in self.events:
+            per[min(max(t, 0), len(per) - 1)] += dur / 1e6
+            x = by_gen.setdefault(str(g), dict(n=0, ms=0.0, collected=0))
+            x["n"] += 1
+            x["ms"] += dur / 1e6
+            x["collected"] += col
+        top = sorted(self.events, key=lambda e: -e[3])[:10]
+        return dict(per_tick_ms=[round(x, 3) for x in per], by_generation=by_gen, n=len(self.events),
+                    total_ms=round(sum(e[3] for e in self.events) / 1e6, 3),
+                    longest=[dict(tick=e[0], gen=e[1], ms=round(e[3] / 1e6, 3), collected=e[4], thread=e[5])
+                             for e in top])
+
+
+@contextlib.contextmanager
+def round_guard(a, eng, rec, tag):
+    """[hostfix] The host guards of ONE timed phase (the draft-only phase, the round, the bare round) of one engine:
+    --host-profile installs a GcLog on the engine's timer for the phase (yielded; None without the flag). Without
+    any [hostfix] flag it does nothing (every phase as before). rec: the point's info (the guards' records)."""
+    gcl = GcLog(eng.timer) if getattr(a, "host_profile", False) and eng.timer is not None else None
+    if gcl is not None:
+        gc.callbacks.append(gcl)
+    try:
+        yield gcl
+    finally:
+        if gcl is not None:
+            try:
+                gc.callbacks.remove(gcl)
+            except ValueError:
+                pass
+
+
+def feeder_report(prof):
+    """[hostfix] --host-profile: the gilfree feeder's releases (GilfreeTransport.prof records: layer, transfers, Python
+    ns, native ns, end clock): totals and the per-transfer Python time (the GIL-held part)."""
+    if prof is None:
+        return None
+    recs = list(prof)
+    py = [r[2] for r in recs]
+    nat = [r[3] for r in recs]
+    n_tr = sum(r[1] for r in recs)
+    return dict(releases=len(recs), transfers=n_tr, python_ms=round(sum(py) / 1e6, 3),
+                native_ms=round(sum(nat) / 1e6, 3), python_us_per_transfer=(sum(py) / 1e3 / n_tr) if n_tr else None,
+                python_ms_per_release=stats([x / 1e6 for x in py]))
+
+
+def host_profile_record(rep, gclog=None, tp=None, skip=1):
+    """[hostfix] --host-profile: a round's host record from TickTimer.report() (one per round): every host category
+    per tick (ms; the "h_" sub-timers of HOST_PROF_CATS and backend / rows / read), the tick span per tick, the
+    stats per category (the first `skip` ticks left out, as summarize), the GC pauses (GcLog) and the feeder's
+    Python time (feeder_report)."""
+    cats = sorted(c for c in rep["host_ms"] if c.startswith("h_") or c in ("backend", "rows", "read"))
+    per_tick = {c: [round(x, 3) for x in rep["host_ms"][c]] for c in cats}
+    out = dict(ticks=rep["ticks"], skip=skip, per_tick_ms=per_tick,
+               tick_ms=[round(x, 3) for x in rep["device_ms"].get("tick", [])],
+               stats={c: stats(v[skip:]) for c, v in per_tick.items()},
+               missing=sorted(c for c in HOST_PROF_CATS if c not in per_tick))
+    if gclog is not None:
+        out["gc"] = gclog.report(rep["ticks"])
+    if tp is not None:
+        out["feeder"] = feeder_report(getattr(tp, "prof", None))
+    return out
+
+
 def budget(rnd_sum, d_sum):
     """dX = the round's mean per tick minus the draft-only tick's, per device category (docs/R2_STEP7_TICK_SG5.md 3)."""
     out = {}
@@ -1111,11 +1247,15 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
             info["X_pool"] = pool_positions(a, X)
     # T_d: the draft-only tick
     eng, svc, tp = make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, layout=layout)
+    hprof = bool(getattr(a, "host_profile", False))                  # [hostfix] item 0
     try:
         if kind == "b2" and getattr(a, "b2_res_profile", False):    # [fusedres2] M3: the kernel time of res
             info["draft_only_res_profile"] = profile_draft_only(a, eng, first, label)
         else:
-            run_draft_only(eng, first, a.draft_ticks, a.K)
+            with round_guard(a, eng, info, "draft_only") as gcl:       # [hostfix] (nothing without its flags)
+                run_draft_only(eng, first, a.draft_ticks, a.K)
+            if hprof:
+                info["draft_only_host_profile"] = host_profile_record(eng.timer.report(), gcl, tp)
         info["draft_only"] = summarize(eng.timer.report())
         info["draft_only"]["d2h_reads"] = getattr(svc, "d2h_reads", None)
         info["draft_only"]["sc"] = sc_counters(svc)                    # REPORT (RES_SC.md 6)
@@ -1138,10 +1278,13 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
         if fp is not None:                                                                       # [xpool] no read here
             fp.append(([(r.b, r.kind, r.pos) for r in rows], logit_fingerprint(out.logits)))
     try:
-        t0 = time.time()
-        rnd = run_round(eng, first, [steps] * eng.B, K=a.K, LAMBDA=a.LAMBDA, on_tick=on_tick)
-        torch.cuda.synchronize()
-        info["wall_s"] = round(time.time() - t0, 1)
+        with round_guard(a, eng, info, "round") as gcl:                # [hostfix] (nothing without its flags)
+            t0 = time.time()
+            rnd = run_round(eng, first, [steps] * eng.B, K=a.K, LAMBDA=a.LAMBDA, on_tick=on_tick)
+            torch.cuda.synchronize()
+            info["wall_s"] = round(time.time() - t0, 1)
+        if hprof:                                                      # [hostfix] after the round's clock
+            info["host_profile"] = host_profile_record(eng.timer.report(), gcl, tp)
         if layout is not None:                                                                   # [xpool]
             info["peak_gb_round"] = round(torch.cuda.max_memory_allocated() / 1e9, 3)
             info["store_gb"] = round(sum(t.numel() * t.element_size() for t in eng.store_k + eng.store_v
@@ -1221,15 +1364,18 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
         eng, svc, tp = make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=("tick",),
                                    layout=layout)
         try:
-            tb = time.time()
-            rb = run_round(eng, first, [steps] * eng.B, K=a.K, LAMBDA=a.LAMBDA)
-            if getattr(a, "eval_role", ""):                          # [evalsplit] the headline's own counts
-                torch.cuda.synchronize()
-                info["bare_round"] = dict(ticks=rb.ticks, committed=sum(len(r.out) - 1 for r in rb.reqs),
-                                          wall_s=round(time.time() - tb, 3))
+            with round_guard(a, eng, info, "bare") as gcl:             # [hostfix] (nothing without its flags)
+                tb = time.time()
+                rb = run_round(eng, first, [steps] * eng.B, K=a.K, LAMBDA=a.LAMBDA)
+                if getattr(a, "eval_role", ""):                      # [evalsplit] the headline's own counts
+                    torch.cuda.synchronize()
+                    info["bare_round"] = dict(ticks=rb.ticks, committed=sum(len(r.out) - 1 for r in rb.reqs),
+                                              wall_s=round(time.time() - tb, 3))
             del rb                                                   # (it holds the engine)
             bs = summarize(eng.timer.report())
             info["bare_T_tick"] = bs["device_ms"].get("tick")
+            if hprof:                                                # [hostfix] the headline round's host record
+                info["bare_host_profile"] = host_profile_record(eng.timer.report(), gcl, tp)
         finally:
             tp.close()
             del eng, svc, tp
@@ -1578,6 +1724,10 @@ def main(argv=None) -> int:
                     b2_resolve=a.b2_resolve, shipped_batch=a.shipped_batch or a.batch,
                     sharedkv=a.sharedkv if a.attn != "per_row" else None)
         meta.update(stack_base=a.stack_base if a.stack_compare else None)                        # [integ6]
+        if a.host_profile:                                                                     # [hostfix] item 0
+            meta.update(host_profile=True, host_prof_cats=HOST_PROF_CATS,
+                        host_profile_note="host clocks only (perf_counter); per point: draft_only_host_profile, "
+                                          "host_profile (instrumented round), bare_host_profile (the headline)")
         if a.eval_role:                                                                        # [evalsplit]
             meta.update(eval_role=a.eval_role, accuracy_record=acc_rec, mem_cap_gb=a.mem_cap_gb,
                         eval_bands=a.eval_bands_v,

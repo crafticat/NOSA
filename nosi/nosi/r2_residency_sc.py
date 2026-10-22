@@ -897,7 +897,11 @@ class CudaDeviceOps:
             if prof:
                 self.profile.append((l, m0, m1, m2, self._mark()))
             return
+        hp = getattr(self.svc, "host_prof", None)                   # [hostfix] --host-profile: a host clock only
+        t0 = time.perf_counter_ns() if hp is not None else 0
         self._superset_wait(l)
+        if hp is not None:
+            hp("h_superset_wait", time.perf_counter_ns() - t0)
         if prof:
             self.profile.append((l, m0, m0, m0, self._mark()))     # superset: one phase, the event waits
 
@@ -981,6 +985,10 @@ class ResidencySC(ResidencySB):
     key_plant_live = 0                                    # [sharedkv2] device count: plants inside num_pages
 
     XPOOL_OK = True                                       # [xpool] resolve binds the lanes (r2_xpool.XPool)
+    # [hostfix] OPT-IN host instrumentation (default None, every line as before): host_prof is a callable (category,
+    # ns) that gets the host sub-timers of end_tick, the device wait and B2's consumer (r2_tick_sg5.py --host-profile
+    # binds it to the engine's TickTimer); host clocks only, no device read, no change of any decision
+    host_prof = None
 
     def __init__(self, *args, sc_mut=None, devops=None, mirror_drop=None, wait_mode: str = "probe", **kw):
         kw["defer_admit"] = True
@@ -1272,14 +1280,22 @@ class ResidencySC(ResidencySB):
         return key.contiguous()
 
     def end_tick(self) -> None:
+        hp = self.host_prof                                           # [hostfix] None: no clock is read
+        t0 = time.perf_counter_ns() if hp is not None else 0
         steps, self._tick = self._tick, []
         self._rows = None
         try:
             self.apply_tick(steps)
         finally:
             self._layer_ev = {}
+        t1 = time.perf_counter_ns() if hp is not None else 0
         Residency.end_tick(self)                                      # the draft transfers, layer by layer
+        t2 = time.perf_counter_ns() if hp is not None else 0
         self.metrics.sample_memory()
+        if hp is not None:
+            hp("h_et_apply", t1 - t0)                                 # the decision read and the host consumer
+            hp("h_et_issue", t2 - t1)                                 # assign_phys and the draft issues
+            hp("h_et_memory", time.perf_counter_ns() - t2)
 
     def apply_tick(self, steps: List[Dict]) -> None:
         """THE HOST CONSUMER of one tick's device decisions (note 12l; the capture seam calls exactly this after the
