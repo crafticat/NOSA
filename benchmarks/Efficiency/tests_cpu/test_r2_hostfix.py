@@ -16,6 +16,10 @@ adversarial transport, S-C's CPU device stand-in) with B2 (OwnResidency) as the 
        three rounds (forced, pressure, free); the dropped REPORT work ran in the default and not in lean
        (PRECONDITION); NEGATIVE CONTROL: a lean mode that skips the release queue differs at the first verify tick;
        the linear key dedup equals the old quadratic one; the harness's flag, refusals, witness and meta.
+  HF3  --wait-index (item 3): InflightByLayer's index equals the layer filter after every mutation of random
+       sequences (NEGATIVE CONTROL: a stale pop); _superset_wait waits the same events in the same order on random
+       fixtures, plain vs indexed (NEGATIVE CONTROL: a transfer that bypasses the index); the B2 round with the
+       index equals the default and the index is exact at every resolve (NEGATIVE CONTROL: the stale pop in a round).
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA benchmarks/Efficiency/tests_cpu/test_r2_hostfix.py
 """
@@ -389,6 +393,193 @@ def test_HF2d_the_harness_wiring():
     me = inspect.getsource(G.make_engine)
     assert 'lean=bool(getattr(a, "lean_time", False))' in me and "eng.xpool.witness = witness_on(a)" in me
     assert len(G.LEAN_DROPPED) == 6 and 'lean_dropped=list(LEAN_DROPPED)' in inspect.getsource(G.main)
+
+
+RSC = TT._load("r2_residency_sc")                                      # r2tick's S-C (InflightByLayer, CudaDeviceOps)
+
+
+def _tr(seq, layer, ev=None):
+    return SimpleNamespace(seq=seq, layer=layer, ev=ev, payload=None)
+
+
+def _random_ops(seed, n=400, L=4, cls=None):
+    """A random mutation sequence applied to a plain dict and to an InflightByLayer (or cls): set (new keys, a key
+    again with the same or another layer), del, pop (present / missing with a default), popitem, setdefault, update,
+    and a rare clear. Yields (plain, indexed, op) after every operation."""
+    g = torch.Generator().manual_seed(seed)
+    plain, ix = {}, (cls or RSC.InflightByLayer)()
+    nxt = [0]
+    evs = [object() for _ in range(7)]                               # shared events (one per release)
+
+    def new(layer):
+        nxt[0] += 1
+        return _tr(nxt[0], layer, evs[int(torch.randint(0, len(evs), (1,), generator=g))])
+    for _ in range(n):
+        r = int(torch.randint(0, 100, (1,), generator=g))
+        keys = list(plain)
+        k = keys[int(torch.randint(0, len(keys), (1,), generator=g))] if keys else None
+        lay = int(torch.randint(0, L, (1,), generator=g))
+        if r < 40 or k is None:
+            t = new(lay)
+            plain[t.seq] = t
+            ix[t.seq] = t
+            op = "set"
+        elif r < 48:
+            t = _tr(k, plain[k].layer if r < 45 else lay, plain[k].ev)
+            plain[k] = t
+            ix[k] = t
+            op = "reset"
+        elif r < 60:
+            del plain[k]
+            del ix[k]
+            op = "del"
+        elif r < 75:
+            assert plain.pop(k) is ix.pop(k)
+            assert plain.pop(-5, None) is ix.pop(-5, None) is None
+            op = "pop"
+        elif r < 80:
+            a, b = plain.popitem(), ix.popitem()
+            assert a[0] == b[0] and a[1] is b[1]
+            op = "popitem"
+        elif r < 88:
+            t = new(lay)
+            assert plain.setdefault(t.seq, t) is ix.setdefault(t.seq, t)
+            op = "setdefault"
+        elif r < 98:
+            ts = [new(int(torch.randint(0, L, (1,), generator=g))) for _ in range(3)]
+            plain.update({t.seq: t for t in ts})
+            ix.update({t.seq: t for t in ts})
+            op = "update"
+        else:
+            plain.clear()
+            ix.clear()
+            op = "clear"
+        yield plain, ix, op
+
+
+def test_HF3a_the_layer_index_equals_the_layer_filter_after_every_mutation():
+    L = 4
+    for seed in range(6):
+        ops = set()
+        for plain, ix, op in _random_ops(seed, L=L):
+            ops.add(op)
+            assert dict(ix) == plain and list(ix) == list(plain)
+            for l in range(L):
+                got, want = ix.by_layer(l), [t for t in plain.values() if t.layer == l]
+                assert len(got) == len(want) and all(x is y for x, y in zip(got, want)), (seed, op, l)
+            assert ix.index_ok()
+        assert {"set", "reset", "del", "pop", "popitem", "setdefault", "update"} <= ops, ops
+    assert isinstance(RSC.InflightByLayer().copy(), RSC.InflightByLayer)
+
+
+class StalePopIndex(RSC.InflightByLayer):
+    """DEFECT (negative control): pop does not update the layer index (a popped transfer stays waited)."""
+
+    def pop(self, k, *default):
+        return dict.pop(self, k, *default)
+
+
+def test_HF3a2_negative_control_a_stale_index_is_seen():
+    bad = 0
+    for plain, ix, op in _random_ops(1, cls=StalePopIndex):
+        if not ix.index_ok():
+            bad += 1
+            assert op == "pop" or bad > 1                             # first seen right after a pop
+    assert bad > 0
+
+
+class _Main:
+    def __init__(self, log):
+        self.log = log
+
+    def wait_event(self, ev):
+        self.log.append(id(ev))
+
+
+def _waits(inflight, landed, monkeypatch, L=4):
+    """CudaDeviceOps._superset_wait over every layer on a CPU stand-in: the main stream's wait log (event ids, in
+    order) and events_waited."""
+    log = []
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a, **k: _Main(log))
+    ops = object.__new__(RSC.CudaDeviceOps)
+    ops.svc = SimpleNamespace(inflight=inflight, _landed=landed, host_prof=None)
+    ops.events_waited = ops.submission_waits = 0
+    per = []
+    for l in range(L):
+        n0 = len(log)
+        ops._superset_wait(l)
+        per.append(log[n0:])
+    return per, ops.events_waited
+
+
+def test_HF3b_the_superset_wait_waits_the_same_events_in_the_same_order(monkeypatch):
+    checked = 0
+    for seed in range(8):
+        g = torch.Generator().manual_seed(100 + seed)
+        for i, (plain, ix, op) in enumerate(_random_ops(seed, n=200)):
+            if i % 37:
+                continue
+            landed = {k for k in plain if int(torch.randint(0, 4, (1,), generator=g)) == 0}
+            a = _waits(plain, landed, monkeypatch)
+            b = _waits(ix, landed, monkeypatch)
+            assert a == b, (seed, i)
+            checked += a[1] > 0
+    assert checked > 10, "precondition: the fixtures wait on events"
+    # NEGATIVE CONTROL: a transfer that bypasses the index (dict.__setitem__) is not waited by the indexed scan
+    plain, ix = {}, RSC.InflightByLayer()
+    for t in (_tr(1, 0, object()), _tr(2, 1, object())):
+        plain[t.seq] = t
+        ix[t.seq] = t
+    hidden = _tr(3, 1, object())
+    plain[3] = hidden
+    dict.__setitem__(ix, 3, hidden)
+    a, b = _waits(plain, set(), monkeypatch), _waits(ix, set(), monkeypatch)
+    assert a[0][0] == b[0][0] and a[0][1] != b[0][1] and id(hidden.ev) in a[0][1] and id(hidden.ev) not in b[0][1]
+
+
+def test_HF3c_the_b2_round_with_the_index_equals_the_default_and_keeps_it_exact(p3, ref):
+    toks, _ = ref
+    base = _run_hf(p3, toks, cfg="pressure", svc_kw=dict(checked=False))
+    seen = []
+
+    def check_each_resolve(eng, svc):
+        assert isinstance(svc.inflight, RSC.InflightByLayer)
+        r0 = svc.resolve
+
+        def resolve(l, rows, sel):
+            seen.append((len(svc.inflight), svc.inflight.index_ok()))
+            return r0(l, rows, sel)
+        svc.resolve = resolve
+    ixr = _run_hf(p3, toks, cfg="pressure", svc_kw=dict(checked=False, wait_index=True), setup=check_each_resolve)
+    assert _diff(base, ixr) is None
+    _same_end(base, ixr)
+    assert seen and all(ok for _, ok in seen) and max(n for n, _ in seen) > 0, "precondition: transfers in flight"
+    assert not isinstance(base.svc.inflight, RSC.InflightByLayer)                   # the default: a plain dict
+    # NEGATIVE CONTROL: the stale-pop index in the same round is seen by the same per-resolve check
+    seen_bad = []
+
+    def stale(eng, svc):
+        svc.inflight = StalePopIndex(svc.inflight)
+        r0 = svc.resolve
+
+        def resolve(l, rows, sel):
+            seen_bad.append(svc.inflight.index_ok())
+            return r0(l, rows, sel)
+        svc.resolve = resolve
+    _run_hf(p3, toks, cfg="pressure", svc_kw=dict(checked=False), setup=stale)
+    assert not all(seen_bad), "the stale index is not seen (no arrival popped a transfer?)"
+
+
+def test_HF3d_the_harness_wiring():
+    G = _sg5()
+    base = ["--out", "o", "--workload", "w", "--biattn", "b", "--gilfree", "g", "--gilfree-build", "/x"]
+    assert G.parse_args(base).wait_index is False
+    assert G.parse_args(base + ["--backends", "b2", "--X", "64", "--wait-index"]).wait_index is True
+    with pytest.raises(SystemExit):
+        G.parse_args(base + ["--wait-index"])                         # sc, sb, v1: refused
+    assert 'wait_index=bool(getattr(a, "wait_index", False))' in inspect.getsource(G.make_engine)
+    src = inspect.getsource(RSC.CudaDeviceOps._superset_wait)
+    assert 'getattr(self.svc.inflight, "by_layer", None)' in src and "tr.layer != l" in src
 
 
 def test_HF1c_the_harness_wiring():

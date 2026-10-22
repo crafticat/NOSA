@@ -807,6 +807,88 @@ def _wait_kernel():
     return board_wait_kernel
 
 
+_MISSING = object()
+
+
+class InflightByLayer(dict):
+    """[hostfix] --wait-index (item 3 of analysis/evalfast/DIAG_tick_host.md section 4; OPT-IN, B2's
+    OwnResidency(wait_index=True)): the service's in-flight map (seq -> Transfer) with a per-layer index of the SAME
+    transfers, kept in step by every dict mutation (set, del, pop, popitem, setdefault, update, clear). by_layer(l)
+    lists layer l's transfers in the dict's insertion order: exactly the transfers, in the order, that the old scan
+    of _superset_wait keeps after its layer filter. A transfer's layer is set once (Transfer's constructor); a key
+    set again with a transfer of another layer re-indexes that layer from the dict's order (rare; exact)."""
+
+    def __init__(self, items=()):
+        super().__init__()
+        self._by: Dict[int, Dict[int, object]] = {}
+        for k, v in dict(items).items():
+            self[k] = v
+
+    def _drop(self, k, v) -> None:
+        sub = self._by.get(v.layer)
+        if sub is not None:
+            sub.pop(k, None)
+            if not sub:
+                del self._by[v.layer]
+
+    def __setitem__(self, k, v) -> None:
+        old = dict.get(self, k, _MISSING)
+        dict.__setitem__(self, k, v)
+        if old is not _MISSING and old.layer != v.layer:
+            self._drop(k, old)
+            self._by[v.layer] = {s: t for s, t in dict.items(self) if t.layer == v.layer}
+        else:
+            self._by.setdefault(v.layer, {})[k] = v
+
+    def __delitem__(self, k) -> None:
+        v = dict.__getitem__(self, k)
+        dict.__delitem__(self, k)
+        self._drop(k, v)
+
+    def pop(self, k, *default):
+        if dict.__contains__(self, k):
+            v = dict.pop(self, k)
+            self._drop(k, v)
+            return v
+        if default:
+            return default[0]
+        raise KeyError(k)
+
+    def popitem(self):
+        k, v = dict.popitem(self)
+        self._drop(k, v)
+        return k, v
+
+    def setdefault(self, k, default=None):
+        if not dict.__contains__(self, k):
+            self[k] = default
+        return dict.__getitem__(self, k)
+
+    def update(self, *args, **kw) -> None:
+        for k, v in dict(*args, **kw).items():
+            self[k] = v
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+    def clear(self) -> None:
+        dict.clear(self)
+        self._by.clear()
+
+    def copy(self):
+        return InflightByLayer(dict.items(self))
+
+    def by_layer(self, l: int) -> List:
+        """Layer l's transfers in the dict's insertion order (a new list: the caller may change the dict after)."""
+        return list(self._by.get(l, {}).values())
+
+    def index_ok(self) -> bool:
+        """Tests: the index equals the layer filter of the dict, in order, for every layer."""
+        layers = {t.layer for t in dict.values(self)} | set(self._by)
+        return all([t for t in dict.values(self) if t.layer == l] == self.by_layer(l) for l in layers)
+
+
 class CudaDeviceOps:
     """S-C's device operations on the GPU (module docstring). SOURCE ONLY, NOT RUN YET (GPU gate FG1).
     wait_mode "superset": the main stream waits on the completion event of every transfer in flight at the layer.
@@ -908,7 +990,8 @@ class CudaDeviceOps:
     def _superset_wait(self, l: int) -> None:
         main = torch.cuda.current_stream()
         seen = set()
-        for tr in list(self.svc.inflight.values()):
+        idx = getattr(self.svc.inflight, "by_layer", None)              # [hostfix] --wait-index (InflightByLayer):
+        for tr in (list(self.svc.inflight.values()) if idx is None else idx(l)):   # the same transfers, in order
             if tr.layer != l or tr.seq in self.svc._landed:
                 continue
             if tr.ev is None and isinstance(tr.payload, threading.Event):   # a CPU pack not submitted yet (gilfree)

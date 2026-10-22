@@ -48,7 +48,7 @@ from .kstep.executor import DRAFT, VERIFY
 from .kstep.ownership import FREE, INFLIGHT, LRU, PO, RELEASING, VRES, LayerPool, Stream
 from .kstep.transfer import Transfer
 from .r2_residency import N_TAIL, Plan, Row
-from .r2_residency_sc import C_FREE, C_INFLIGHT, C_LRU, C_PO, C_RELEASING, C_VRES
+from .r2_residency_sc import C_FREE, C_INFLIGHT, C_LRU, C_PO, C_RELEASING, C_VRES, InflightByLayer
 from .r2_residency_sparse import DREC, VREC, ResidencySparse
 
 STATE_OF = {C_FREE: FREE, C_INFLIGHT: INFLIGHT, C_LRU: LRU, C_PO: PO, C_VRES: VRES, C_RELEASING: RELEASING}
@@ -68,7 +68,8 @@ class OwnResidency(ResidencySparse):
     cohort key slots per request, KEYS <= 7), checked, b2_mut (negative controls, tests only)."""
 
     def __init__(self, *args, keys: int = 7, checked: bool = True, b2_mut=None, resolve: str = "torch",
-                 fused_plant: int = 0, fused_guard: bool = False, fused_warm: str = "auto", lean: bool = False, **kw):
+                 fused_plant: int = 0, fused_guard: bool = False, fused_warm: str = "auto", lean: bool = False,
+                 wait_index: bool = False, **kw):
         kw["pin_records"] = False
         self.__dict__["_own_ready"] = False
         # [hostfix] --lean-time (OPT-IN, default False: every line as before): the REPORT-only host work is skipped
@@ -80,6 +81,8 @@ class OwnResidency(ResidencySparse):
         if fused_plant and resolve == "torch":
             raise ValueError("fused_plant needs resolve 'fused' or 'check'")
         super().__init__(*args, **kw)
+        if wait_index:                                                # [hostfix] --wait-index (OPT-IN): the same map
+            self.inflight = InflightByLayer(self.inflight)            # with a per-layer index (_superset_wait)
         self.checked = bool(checked)
         self.b2_mut = dict(b2_mut or {})
         for k in self.b2_mut:
