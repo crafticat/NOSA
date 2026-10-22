@@ -480,7 +480,9 @@ def test_EV13_the_step_scripts(tmp_path):
                     assert word not in ln, (name, word, ln)
     sg = (EFF / "r2_tick_sg5_step.sh").read_text()
     root = next(ln for ln in sg.splitlines() if ln.startswith("NOSI_EVAL=")).split()[0][len("NOSI_EVAL="):]
-    assert root == "/mnt/beegfs/ojerbi/nosi-r2-evalsplit"
+    assert root == "/mnt/beegfs/ojerbi/nosi-r2-sg5par"                  # [sg5par] the per-holder claim's ROOT
+    ea = (EFF / "r2_evalacc_step.sh").read_text()
+    assert next(ln for ln in ea.splitlines() if ln.startswith("NOSI=")).split()[0] == "NOSI=/mnt/beegfs/ojerbi/nosi-r2-sg5par"
     assert next(ln for ln in sg.splitlines() if ln.startswith("NOSI_INTEG=")).split()[0].endswith("nosi-r2-integ6")
     head = _clean_head()
     if head is None:
@@ -495,13 +497,14 @@ def test_EV13_the_step_scripts(tmp_path):
         r = subprocess.run(["bash", str(EFF / "r2_evalacc_step.sh"), "--nosi", head, "418", "t1", cell], env=env,
                            capture_output=True, text=True, timeout=180)
         if r.returncode != 0:
-            assert Path("/mnt/beegfs/ojerbi/nosi-r2-evalsplit").resolve() != ROOT.resolve(), r.stderr[-300:]
-            pytest.skip("DRYRUN stopped outside the evalsplit ROOT: %s" % r.stderr.strip()[-200:])
+            assert Path("/mnt/beegfs/ojerbi/nosi-r2-sg5par").resolve() != ROOT.resolve(), r.stderr[-300:]
+            pytest.skip("DRYRUN stopped outside the sg5par ROOT: %s" % r.stderr.strip()[-200:])
         line = r.stdout.strip().splitlines()[-1]
         got = line.split("r2_evalacc.py ", 1)[1].replace("\\,", ",")
         for w in has + ["--exact-gemm bi_c_strict", "--parts TF,SPEC,NEG", "--S 16128",
                         "--gold-workload /mnt/beegfs/ojerbi/kstep-cpu-runs/workload/pg19-test-ctx65280"]:
             assert w in got or w in line, (cell, w)
+        assert "claim /mnt/beegfs/ojerbi/r2-runs/evalacc/eacc_active_418 (one per holder)" in r.stdout
         sfx = cell.replace("-", "")
         assert "--job-name=eacc-t1-418-%s " % sfx in line and "/r2-runs/evalacc/eacc_t1_418_%s " % sfx in line
         pa = EA.parse_args(got.split())
@@ -519,10 +522,65 @@ def test_EV13_the_step_scripts(tmp_path):
               "--variants fused/batched,torch/per_call", "--layout pool --X-pool 1512 --arrival-lag 2 --bare",
               "--skip-shipped --eval-role fast-time --mem-cap-gb 84",
               "--accuracy-record /mnt/beegfs/ojerbi/r2-runs/evalacc/eacc_t1_418_evalacc/summary.json",
-              "--eval-bands 55:125:30:70:27:65", "--mem=240G", "PYTHONPATH=/mnt/beegfs/ojerbi/nosi-r2-evalsplit/nosi"):
+              "--eval-bands 55:125:30:70:27:65", "--mem=240G", "PYTHONPATH=/mnt/beegfs/ojerbi/nosi-r2-sg5par/nosi"):
         assert w in got or w in line, w
+    assert "claim /mnt/beegfs/ojerbi/r2-runs/sg5/sg5_active_418 (one per holder)" in r.stdout
     for w in ("--pool-baseline", "--stack", "--sweep "):
         assert w not in got, w
     pa = _sg5().parse_args(got.split())
     assert pa.eval_role == "fast-time" and pa.batch == 216 and pa.X_pool == 1512 and pa.log_slots == -1
     assert pa.variant_list == [("fused", "batched"), ("torch", "per_call")]
+
+
+# =====================================================================================================================
+# EV14 [sg5par]: one claim per holder (the claim's mkdir through the DRYRUN-only probe; a global claim as the control)
+# =====================================================================================================================
+@pytest.mark.parametrize("name,var,prefix,cell", [("r2_tick_sg5_step.sh", "SG5", "sg5_active", "evalfast"),
+                                                  ("r2_evalacc_step.sh", "EACC", "eacc_active", "evalacc")])
+def test_EV14_one_claim_per_holder(tmp_path, name, var, prefix, cell):
+    """EV14: two holders get two distinct claims (both taken at the same time); a second step in the same holder is
+    refused; the real mkdir and rmdir use the same CLAIM (OUTROOT/<prefix>_<holder>). NEGATIVE CONTROL: the same
+    script with the claim name of the old global claim (<prefix>, no holder) refuses the second holder, so this test
+    sees a shared claim. The probe runs before every git pin, so no clean checkout is necessary."""
+    text = (EFF / name).read_text()
+    assert ("CLAIMNAME=%s_$JOB " % prefix) in text and "CLAIM=$OUTROOT/$CLAIMNAME\n" in text
+    assert 'mkdir "$CLAIM" 2>/dev/null ||' in text and 'rmdir "$CLAIM" || ok=0' in text
+    assert ('mkdir "$%s_CLAIM_PROBE/$CLAIMNAME"' % var) in text
+    assert ('[ "$DRY" = 1 ] || stop "%s_CLAIM_PROBE is for DRYRUN (the CPU test) only"' % var) in text
+    assert ('"$OUTROOT/%s"' % prefix) not in text                     # no global claim left
+    assert text.index("CLAIM=$OUTROOT/$CLAIMNAME") < text.index('[ "$(git -C "$NOSI" rev-parse HEAD)"')
+    assert text.index("UFILE=$HOLDERS/$JOB.gpu_uuid") < text.index("CLAIMNAME=")
+    holders = tmp_path / "holders"
+    holders.mkdir()
+    for job, uid in ((418, "33cfb929-315c-8d27-5622-1169affb7e04"), (419, "f31fc723-9dfe-407a-9947-28173556232a")):
+        (holders / ("%d.gpu_uuid" % job)).write_text(uid + "\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_"))}
+
+    def take(script, probe, job):
+        e = dict(env, DRYRUN="1", **{var + "_HOLDERS": str(holders), var + "_CLAIM_PROBE": str(probe)})
+        return subprocess.run(["bash", str(script), "--nosi", "0" * 40, str(job), "t1", cell], env=e,
+                              capture_output=True, text=True, timeout=60)
+
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    r = take(EFF / name, probe, 418)
+    assert r.returncode == 0 and ("took %s_418" % prefix) in r.stdout, r.stderr[-300:]
+    r = take(EFF / name, probe, 418)                                   # the same holder: refused
+    assert r.returncode == 1 and ("%s_418 is held" % prefix) in r.stderr, r.stderr[-300:]
+    r = take(EFF / name, probe, 419)                                   # the other holder, while 418 holds its claim
+    assert r.returncode == 0 and ("took %s_419" % prefix) in r.stdout, r.stderr[-300:]
+    assert sorted(p.name for p in probe.iterdir()) == ["%s_418" % prefix, "%s_419" % prefix]
+    r = take(EFF / name, probe, 419)
+    assert r.returncode == 1 and ("%s_419 is held" % prefix) in r.stderr
+    # NEGATIVE CONTROL: the old global claim (one name for every holder) refuses the second holder
+    old = ("CLAIMNAME=%s_$JOB " % prefix)
+    assert text.count(old) == 1
+    glob_script = tmp_path / ("global_" + name)
+    glob_script.write_text(text.replace(old, "CLAIMNAME=%s " % prefix))
+    gprobe = tmp_path / "gprobe"
+    gprobe.mkdir()
+    r = take(glob_script, gprobe, 418)
+    assert r.returncode == 0 and ("took %s\n" % prefix) in r.stdout, r.stderr[-300:]
+    r = take(glob_script, gprobe, 419)
+    assert r.returncode == 1 and ("%s is held" % prefix) in r.stderr, r.stderr[-300:]
+    assert sorted(p.name for p in gprobe.iterdir()) == [prefix]

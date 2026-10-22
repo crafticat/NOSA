@@ -1085,13 +1085,19 @@ def test_T19_sg5_step_script_uuid_file_and_pins(tmp_path):
     at HEAD the DRYRUN prints the uuid, the pins and the arguments of the primary point and the sweep, and the cells
     (_t19_cells: default = p3's arguments, p4a, p4b-<b>, p4sc64, [b2] p5b2, p6 = p5b2's EXACT with the four --variants;
     no other cell has --variants); in the step's own ROOT a DRYRUN stop FAILS.
-    Static: the claim sg5_active, STEP_MIN, --export=NONE, no awk / python3 / perl outside comments."""
+    Static: the claim sg5_active_<holder> ([sg5par]), STEP_MIN, --export=NONE, no awk / python3 / perl outside
+    comments."""
     script = EFF / "r2_tick_sg5_step.sh"
     text = script.read_text()
     lines = text.splitlines()
     assert lines[0] == "#!/bin/bash" and lines[-1] == 'main "$@"; exit $?' and "main() {" in text
-    assert 'mkdir "$OUTROOT/sg5_active"' in text and "STEP_MIN=120" in text and "--export=NONE" in text
-    assert text.index("UFILE=$HOLDERS/$JOB.gpu_uuid") < text.index('mkdir "$OUTROOT/sg5_active"')
+    # [sg5par] the claim is per holder: CLAIM=$OUTROOT/sg5_active_<holder job>; the real mkdir / rmdir use CLAIM
+    # (test_r2_evalsplit.py EV14 takes the claim through SG5_CLAIM_PROBE, with a negative control)
+    assert "CLAIMNAME=sg5_active_$JOB " in text and "CLAIM=$OUTROOT/$CLAIMNAME\n" in text
+    assert 'mkdir "$CLAIM" 2>/dev/null ||' in text and 'rmdir "$CLAIM" || ok=0' in text
+    assert 'mkdir "$OUTROOT/sg5_active"' not in text and 'rmdir "$OUTROOT/sg5_active"' not in text
+    assert "STEP_MIN=120" in text and "--export=NONE" in text
+    assert text.index("UFILE=$HOLDERS/$JOB.gpu_uuid") < text.index('mkdir "$CLAIM"')
     for word in ("awk", "perl", "python3", " bc ", "node "):
         for ln in lines:
             if not ln.lstrip().startswith("#"):

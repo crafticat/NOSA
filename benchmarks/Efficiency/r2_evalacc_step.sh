@@ -12,6 +12,15 @@
 #   DRYRUN=1 bash benchmarks/Efficiency/r2_evalacc_step.sh --nosi <sha> <holder job> <run id> <evalacc|evalacc-mini>
 #        (login node: the pin checks and the printed step command; no squeue, claim, srun or write)
 #   In DRYRUN only, EACC_HOLDERS=<dir> replaces HOLDERS (the CPU test uses it); a real run refuses EACC_HOLDERS.
+#   In DRYRUN only, EACC_CLAIM_PROBE=<dir>: after the uuid file checks, mkdir <dir>/<the claim's name> (the real
+#        claim's mkdir, under <dir> and not OUTROOT), then exit 0 when it took the claim, 1 when the claim is held; no
+#        other check or write (the CPU test uses it); a real run refuses EACC_CLAIM_PROBE.
+#
+# CLAIM ([sg5par], 2026-10-22): ONE CLAIM PER HOLDER, OUTROOT/eacc_active_<holder job id> (was OUTROOT/eacc_active).
+#   Two steps in the same holder refuse each other; steps in different holders run at the same time. Every path that a
+#   step writes holds the run id AND the holder job (OUT, REC, JIT with its caches and TMPDIR, the job name, the sacct
+#   row); the step reads only the pinned workloads, the model and the image (read-only). Eval cell (a) reads the
+#   summary.json of the SAME holder only.
 #
 # CELLS:
 #   evalacc-mini  the inspected miniature (preflight rule, 2026-09-20): B 8, alt 4, 32 gold tokens, 16 SPEC tokens,
@@ -32,7 +41,7 @@
 # 124 / 137 the host timeout; 1 a STOP before the launch; 5 an exit-0 step whose record is incomplete or whose sacct
 # row is not COMPLETED 0:0.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-evalsplit                                                # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-sg5par                                                   # ROOT ([sg5par]: the per-holder claim)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -75,6 +84,17 @@ GPU_UUID=$(head -n 1 "$UFILE")
 [[ $GPU_UUID =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] ||
     stop "$UFILE does not hold a uuid (no GPU- prefix): '$GPU_UUID'"
 for v in $(compgen -e); do case $v in SLURM_*|SRUN_*|SALLOC_*|SBATCH_*) stop "the environment exports $v" ;; esac; done
+CLAIMNAME=eacc_active_$JOB                                  # [sg5par] one claim per holder (header: CLAIM)
+CLAIM=$OUTROOT/$CLAIMNAME
+if [ -n "${EACC_CLAIM_PROBE:-}" ]; then                     # [sg5par] the CPU test of the claim's name and its mkdir
+    [ "$DRY" = 1 ] || stop "EACC_CLAIM_PROBE is for DRYRUN (the CPU test) only"
+    if mkdir "$EACC_CLAIM_PROBE/$CLAIMNAME" 2>/dev/null; then
+        echo "R2 evalacc step: CLAIM_PROBE took $CLAIMNAME"
+        exit 0
+    fi
+    echo "R2 evalacc step: CLAIM_PROBE $CLAIMNAME is held" >&2
+    exit 1
+fi
 [ "$(git -C "$NOSI" rev-parse HEAD)" = "$NSHA" ] || stop "$NOSI HEAD is not $NSHA"
 [ -z "$(git -C "$NOSI" status --porcelain --untracked-files=no)" ] || stop "$NOSI has tracked changes"
 [ -z "$(git -C "$NOSI" status --porcelain --untracked-files=all -- nosi)" ] || stop "$NOSI has untracked files in nosi/"
@@ -127,6 +147,7 @@ ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) sr
 if [ "$DRY" = 1 ]; then
     echo "R2 evalacc step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob workload $WL_SHA gold $GOLD_SHA gpu_uuid $GPU_UUID ($UFILE)"
     echo "R2 evalacc step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; cell $CELL: batch $BATCH alt $ALT n_gold $NGOLD spec $SPEC; exact bi_c_strict; STEP_MIN $STEP_MIN; MIN_LEFT $MIN_LEFT s"
+    echo "R2 evalacc step: claim $CLAIM (one per holder)"                                             # [sg5par]
     printf '%q ' "${ARGV[@]}"
     echo
     exit 0
@@ -147,19 +168,19 @@ nosteps() {
 }
 busy=$(nosteps) || stop "a step is running in $JOB (or squeue -s failed): '$busy'"
 mkdir -p "$OUTROOT" || stop "cannot create $OUTROOT"
-mkdir "$OUTROOT/eacc_active" 2>/dev/null || stop "$OUTROOT/eacc_active exists (another step, or an uncertain one)"
-[ ! -e "$OUT" ] && [ ! -e "$REC" ] && [ ! -e "$JIT" ] || stop "$OUT, $REC or $JIT exists: a new run id (eacc_active stays)"
-mkdir "$REC" && mkdir -p "$JIT/tmp" || stop "cannot create $REC / $JIT (eacc_active stays)"
-busy=$(nosteps) || stop "a step is running in $JOB under the claim: '$busy' (eacc_active stays)"
+mkdir "$CLAIM" 2>/dev/null || stop "$CLAIM exists (another step in holder $JOB, or an uncertain one)"
+[ ! -e "$OUT" ] && [ ! -e "$REC" ] && [ ! -e "$JIT" ] || stop "$OUT, $REC or $JIT exists: a new run id ($CLAIMNAME stays)"
+mkdir "$REC" && mkdir -p "$JIT/tmp" || stop "cannot create $REC / $JIT ($CLAIMNAME stays)"
+busy=$(nosteps) || stop "a step is running in $JOB under the claim: '$busy' ($CLAIMNAME stays)"
 git -C "$NOSI" show "$BIATTN_BLOB" > "$ATTN_MOD" && [ "$(git hash-object -- "$ATTN_MOD")" = "$BIATTN_BLOB" ] ||
-    stop "cannot copy piece 3's blob $BIATTN_BLOB to $ATTN_MOD (eacc_active stays)"
-printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/command.txt (eacc_active stays)"
+    stop "cannot copy piece 3's blob $BIATTN_BLOB to $ATTN_MOD ($CLAIMNAME stays)"
+printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/command.txt ($CLAIMNAME stays)"
 printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s workload=%s gold=%s utc_start=%s\n' \
     "$NSHA" "$blob" "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "$WL_SHA" "$GOLD_SHA" "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
-    stop "cannot write $REC (eacc_active stays)"
-printf 'biattn=%s:%s blob=%s copy=%s cell=%s batch=%s alt=%s n_gold=%s spec=%s splits=%s\n' "$BIATTN_SHA" "$BIATTN_PATH" \
-    "$BIATTN_BLOB" "$ATTN_MOD" "$CELL" "$BATCH" "$ALT" "$NGOLD" "$SPEC" "$SPLITS" >> "$REC/command.txt" ||
-    stop "cannot write $REC (eacc_active stays)"
+    stop "cannot write $REC ($CLAIMNAME stays)"
+printf 'biattn=%s:%s blob=%s copy=%s cell=%s batch=%s alt=%s n_gold=%s spec=%s splits=%s claim=%s\n' "$BIATTN_SHA" \
+    "$BIATTN_PATH" "$BIATTN_BLOB" "$ATTN_MOD" "$CELL" "$BATCH" "$ALT" "$NGOLD" "$SPEC" "$SPLITS" "$CLAIM" >> "$REC/command.txt" ||
+    stop "cannot write $REC ($CLAIMNAME stays)"
 "${ARGV[@]}" < /dev/null > "$REC/stdout.txt" 2> "$REC/stderr.txt"
 rc=$?
 ok=1
@@ -183,7 +204,7 @@ for t in "$OUT" "$REC"; do
     find "$t" -type f -exec chmod 0444 {} + && find "$t" -type d -exec chmod 0555 {} + || ok=0
 done
 if [ "$ok" = 1 ]; then
-    rmdir "$OUTROOT/eacc_active" || ok=0
+    rmdir "$CLAIM" || ok=0
 fi
 echo "R2 evalacc step: exit $rc; record $REC; output $OUT; record complete and frozen: $ok"
 [ "$rc" = 0 ] && [ "$ok" = 0 ] && exit 5

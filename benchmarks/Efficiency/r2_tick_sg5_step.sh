@@ -18,6 +18,18 @@
 #        (the cell and the transport in either order, at most one of each; any other word: usage, exit 2)
 #        (login node: the pin checks and the printed step command; no squeue, claim, srun or write)
 #   In DRYRUN only, SG5_HOLDERS=<dir> replaces HOLDERS (the CPU test uses it); a real run refuses SG5_HOLDERS.
+#   In DRYRUN only, SG5_CLAIM_PROBE=<dir>: after the uuid file checks, mkdir <dir>/<the claim's name> (the real claim's
+#        mkdir, under <dir> and not OUTROOT), then exit 0 when it took the claim, 1 when the claim is held; no other check
+#        or write (the CPU test uses it); a real run refuses SG5_CLAIM_PROBE.
+#
+# CLAIM ([sg5par], 2026-10-22): ONE CLAIM PER HOLDER, OUTROOT/sg5_active_<holder job id>. Two steps in the same holder
+#   refuse each other; steps in different holders (different GPUs) run at the same time. Every path that a step writes
+#   holds the run id AND the holder job (OUT, REC, JIT and its TRITON / TORCH_EXTENSIONS / FLASHINFER / TVM_FFI caches
+#   and TMPDIR, the job name, the sacct row); every record that a cell reads (--validated-by, --accuracy-record, the
+#   stack_bands.txt of stack1) is the SAME holder's. No cell reads another holder's record, so no cross-holder claim
+#   is necessary. The global claim OUTROOT/sg5_active of the older ROOTs (p6, x1, integ6, bigb, fusedres2) is not read:
+#   a step of an older ROOT and a step of this script in the SAME holder are kept apart by the holder's dispatcher (one
+#   job at a time) and by nosteps() before and after the claim.
 #
 # CELLS (the lead's two-step p4 plan, 2026-10-21; every other argument, gate and threshold as in the default):
 #   (none)   the default: p3's arguments, token for token (--modes exact,fast --backends sc,sb,v1 and the 9-point
@@ -233,7 +245,7 @@ NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                        
 NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-integ6                                             # ROOT of the stack1 cells only ([integ], integ6)
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
-NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-evalsplit                                           # ROOT of the evalfast cell only [evalsplit]
+NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-sg5par                                              # ROOT of the evalfast cell only [evalsplit] ([sg5par]: the per-holder claim)
 EVALACC_OUT=/mnt/beegfs/ojerbi/r2-runs/evalacc                                           # ROOT (r2_evalacc_step.sh's OUTROOT)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
@@ -435,6 +447,17 @@ GPU_UUID=$(head -n 1 "$UFILE")
 [[ $GPU_UUID =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] ||
     stop "$UFILE does not hold a uuid (no GPU- prefix): '$GPU_UUID'"
 for v in $(compgen -e); do case $v in SLURM_*|SRUN_*|SALLOC_*|SBATCH_*) stop "the environment exports $v" ;; esac; done
+CLAIMNAME=sg5_active_$JOB                                   # [sg5par] one claim per holder (header: CLAIM)
+CLAIM=$OUTROOT/$CLAIMNAME
+if [ -n "${SG5_CLAIM_PROBE:-}" ]; then                      # [sg5par] the CPU test of the claim's name and its mkdir
+    [ "$DRY" = 1 ] || stop "SG5_CLAIM_PROBE is for DRYRUN (the CPU test) only"
+    if mkdir "$SG5_CLAIM_PROBE/$CLAIMNAME" 2>/dev/null; then
+        echo "R2 SG5 step: CLAIM_PROBE took $CLAIMNAME"
+        exit 0
+    fi
+    echo "R2 SG5 step: CLAIM_PROBE $CLAIMNAME is held" >&2
+    exit 1
+fi
 [ "$(git -C "$NOSI" rev-parse HEAD)" = "$NSHA" ] || stop "$NOSI HEAD is not $NSHA"
 [ -z "$(git -C "$NOSI" status --porcelain --untracked-files=no)" ] || stop "$NOSI has tracked changes"
 [ -z "$(git -C "$NOSI" status --porcelain --untracked-files=all -- nosi)" ] || stop "$NOSI has untracked files in nosi/"
@@ -525,6 +548,7 @@ if [ "$DRY" = 1 ]; then
     [ -z "$BIGB" ] || echo "R2 SG5 step: [bigb] root $NOSI, cell $BIGB: layout pool, C $PC, B $BATCH, X_pool 64, arrival lag 2, $STEPS steps, token log sized (-1), no shipped child, mem $MEMG"
     [ "${#EVALARG[@]}" -eq 0 ] || echo "R2 SG5 step: [evalsplit] root $NOSI, batch $BATCH, step memory $MEMG, variants $VARIANTS, eval arguments ${EVALARG[*]}"
     echo "R2 SG5 step: nosi root $NOSI; STEP_MIN $STEP_MIN; MIN_LEFT $MIN_LEFT s"                   # [fusedres2]
+    echo "R2 SG5 step: claim $CLAIM (one per holder)"                                               # [sg5par]
     printf '%q ' "${ARGV[@]}"
     echo
     exit 0
@@ -545,28 +569,28 @@ nosteps() {
 }
 busy=$(nosteps) || stop "a step is running in $JOB (or squeue -s failed): '$busy'"
 mkdir -p "$OUTROOT" || stop "cannot create $OUTROOT"
-mkdir "$OUTROOT/sg5_active" 2>/dev/null || stop "$OUTROOT/sg5_active exists (another step, or an uncertain one)"
-[ ! -e "$OUT" ] && [ ! -e "$REC" ] && [ ! -e "$JIT" ] || stop "$OUT, $REC or $JIT exists: a new run id (sg5_active stays)"
-mkdir "$REC" && mkdir "$GF_DIR" && mkdir -p "$JIT/tmp" || stop "cannot create $REC / $JIT (sg5_active stays)"
-busy=$(nosteps) || stop "a step is running in $JOB under the claim: '$busy' (sg5_active stays)"
+mkdir "$CLAIM" 2>/dev/null || stop "$CLAIM exists (another step in holder $JOB, or an uncertain one)"
+[ ! -e "$OUT" ] && [ ! -e "$REC" ] && [ ! -e "$JIT" ] || stop "$OUT, $REC or $JIT exists: a new run id ($CLAIMNAME stays)"
+mkdir "$REC" && mkdir "$GF_DIR" && mkdir -p "$JIT/tmp" || stop "cannot create $REC / $JIT ($CLAIMNAME stays)"
+busy=$(nosteps) || stop "a step is running in $JOB under the claim: '$busy' ($CLAIMNAME stays)"
 git -C "$NOSI" show "$BIATTN_BLOB" > "$ATTN_MOD" && [ "$(git hash-object -- "$ATTN_MOD")" = "$BIATTN_BLOB" ] ||
-    stop "cannot copy piece 3's blob $BIATTN_BLOB to $ATTN_MOD (sg5_active stays)"
+    stop "cannot copy piece 3's blob $BIATTN_BLOB to $ATTN_MOD ($CLAIMNAME stays)"
 git -C "$NOSI" show "$GF_PY_BLOB" > "$GF_DIR/gilfree_pack.py" && [ "$(git hash-object -- "$GF_DIR/gilfree_pack.py")" = "$GF_PY_BLOB" ] ||
-    stop "cannot copy the packer's blob $GF_PY_BLOB (sg5_active stays)"
+    stop "cannot copy the packer's blob $GF_PY_BLOB ($CLAIMNAME stays)"
 git -C "$NOSI" show "$GF_CPP_BLOB" > "$GF_DIR/gilfree_pack.cpp" && [ "$(git hash-object -- "$GF_DIR/gilfree_pack.cpp")" = "$GF_CPP_BLOB" ] ||
-    stop "cannot copy the packer's blob $GF_CPP_BLOB (sg5_active stays)"
-printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/command.txt (sg5_active stays)"
+    stop "cannot copy the packer's blob $GF_CPP_BLOB ($CLAIMNAME stays)"
+printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/command.txt ($CLAIMNAME stays)"
 printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s workload=%s utc_start=%s\n' "$NSHA" \
     "$blob" "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "$WL_SHA" "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
-    stop "cannot write $REC (sg5_active stays)"
+    stop "cannot write $REC ($CLAIMNAME stays)"
 printf 'biattn=%s:%s blob=%s packer=%s py=%s cpp=%s threads=%s transport=%s sweep=%s splits=%s cell=%s modes=%s backends=%s C=%s X=%s R_ver=%s eq_pool=%s variants=%s xpool=%s batch=%s steps=%s mem=%s stack=%s\n' \
     "$BIATTN_SHA" "$BIATTN_PATH" "$BIATTN_BLOB" "$GF_SHA" "$GF_PY_BLOB" "$GF_CPP_BLOB" "$THREADS" "$TRANSPORT" \
     "${SWEEP_RUN:-none}" "$SPLITS" "${CELL:-default}" "$MODES" "$BACKENDS" "$PC" "$PX" "$PRV" "$EQ_POOL" "${VARIANTS:-none}" \
     "${XPOOL:-none}" "$BATCH" "$STEPS" "$MEMG" "${STACKARG[*]:-none}" >> "$REC/command.txt" ||
-    stop "cannot write $REC (sg5_active stays)"
-printf 'nosi_root=%s step_min=%s steps=%s draft_ticks=%s frarg=%s evalarg=%s\n' "$NOSI" "$STEP_MIN" "$STEPS" \
-    "$DTICKS" "${FRARG[*]:-none}" "${EVALARG[*]:-none}" >> "$REC/command.txt" ||
-    stop "cannot write $REC (sg5_active stays)"                                                     # [fusedres2]
+    stop "cannot write $REC ($CLAIMNAME stays)"
+printf 'nosi_root=%s step_min=%s steps=%s draft_ticks=%s frarg=%s evalarg=%s claim=%s\n' "$NOSI" "$STEP_MIN" "$STEPS" \
+    "$DTICKS" "${FRARG[*]:-none}" "${EVALARG[*]:-none}" "$CLAIM" >> "$REC/command.txt" ||
+    stop "cannot write $REC ($CLAIMNAME stays)"                                                     # [fusedres2]
 "${ARGV[@]}" < /dev/null > "$REC/stdout.txt" 2> "$REC/stderr.txt"
 rc=$?
 ok=1
@@ -590,7 +614,7 @@ for t in "$OUT" "$REC"; do
     find "$t" -type f -exec chmod 0444 {} + && find "$t" -type d -exec chmod 0555 {} + || ok=0
 done
 if [ "$ok" = 1 ]; then
-    rmdir "$OUTROOT/sg5_active" || ok=0
+    rmdir "$CLAIM" || ok=0
 fi
 echo "R2 SG5 step: exit $rc; record $REC; output $OUT; record complete and frozen: $ok"
 [ "$rc" = 0 ] && [ "$ok" = 0 ] && exit 5
