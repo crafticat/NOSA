@@ -1060,7 +1060,9 @@ def test_T18_sg5_harness_on_the_cpu(p3):
         assert need in gsrc, need
     assert a.preflight_steps == 4                                       # the PREFLIGHT runs before the long arms
     assert src_all.index("backends = preflight(") < src_all.index("for kind in backends:")
-    assert "threading" not in src_all                                   # the harness starts no thread of its own
+    for bad in ("Thread(", "ThreadPool", "start_new_thread", "concurrent.futures"):   # the harness starts no thread
+        assert bad not in src_all, bad                                  # of its own ([hostfix] it may NAME the current
+                                                                        # thread in its gc callback)
     src = (EFF / "r2_tick_sg5.py").read_text()
     fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "run_draft_only")
     assert "from nosi." not in ast.get_source_segment(src, fn)        # the engine's own module (job 2190926)
