@@ -410,7 +410,7 @@ def test_EV10_fast_time_parse_rules():
 def test_EV11_fast_time_metrics_and_gates(tmp_path):
     G = _sg5()
     a = G.parse_args(SG5_BASE + EF_OK + ["--batch", "4", "--steps", "9", "--eval-bands", "55:125:30:70:27:65"])
-    pt = dict(label="SG5_fast_b2_fused_batched", gemm="FAST: natural cuBLAS F.linear", rebuild="batched",
+    pt = dict(label="SG5_fast_b2_fused_batched", gemm="fast", rebuild="batched",       # one_point: gemm=ops.mode
               bare_round=dict(ticks=10, committed=32, wall_s=0.8), bare_T_tick=dict(mean=50.0, median=40.0),
               round=dict(device_ms=dict(tick=dict(mean=60.0, median=50.0))), committed=32, ticks=10, wall_s=1.0)
     e = G.eval_metrics(pt)
@@ -430,7 +430,7 @@ def test_EV11_fast_time_metrics_and_gates(tmp_path):
     assert "HEADLINE (bare): steady 80.00" in g["R_EF_SG5_fast_b2_fused_batched"]["detail"]
     gates = []                                                          # the planted failures
     G.eval_gates(a, dict(peak_gb=84.2, accuracy_record=None),
-                 dict(points=[dict(pt, gemm="EXACT: G-b", bare_round=dict(ticks=10, committed=31, wall_s=0.8))]),
+                 dict(points=[dict(pt, gemm="exact", bare_round=dict(ticks=10, committed=31, wall_s=0.8))]),
                  gates)
     g = {x["name"]: x for x in gates}
     assert not any(g[n]["passed"] for n in ("EF_headline_fast", "EF_bare_SG5_fast_b2_fused_batched", "EF_mem_cap",

@@ -825,7 +825,7 @@ def eval_gates(a, meta, res, gates):                                            
     """[evalsplit] The gates of --eval-role fast-time (module docstring)."""
     pts = res.get("points") or []
     head = pts[0] if pts else {}
-    gates.append(GB.gate("EF_headline_fast", str(head.get("gemm", "")).startswith("FAST"), True,
+    gates.append(GB.gate("EF_headline_fast", head.get("gemm") == "fast", True,               # one_point: ops.mode
                          "the headline point's GEMM: %s" % head.get("gemm")))
     want = a.batch * (a.steps - 1)
     for p in pts:
