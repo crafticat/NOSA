@@ -735,20 +735,26 @@ def policy_e_check(T: Table, ev: Dict[str, torch.Tensor], P: Dict, sel_w: torch.
 
 # ---------------------------------------------------------------------------------------------------- apply: writes
 def pins_or(T: Table, rowsel: torch.Tensor, rows_b: torch.Tensor, planes: torch.Tensor,
-            undo: Optional[Undo] = None, mut: Optional[Dict] = None) -> int:
+            undo: Optional[Undo] = None, mut: Optional[Dict] = None, rounds: Optional[List[torch.Tensor]] = None) -> int:
     """K2 (every selected block is protected by the row's key, res.py:597 VERIFY, :668 DRAFT): rowsel (L, R, H, WB)
     words OR'ed into plane planes[r] at batch slot rows_b[r]. Rows that share (plane, b) (a cohort's verify rows,
     core.py:146-150) go in ROUNDS, so each round writes distinct (plane, b). Returns the rounds.
-    mut: "sum_not_or" (NEGATIVE CONTROL: words added, not OR'ed)."""
+    mut: "sum_not_or" (NEGATIVE CONTROL: words added, not OR'ed).
+    rounds ([hostfix] --b2-fewer-reads; None: computed here as before): the rounds' row indices made on the host
+    (OwnResidency._fr_rows: round r = the ascending rows whose (plane, b) occurred r times before), equal to
+    (rnd == r).nonzero() of rank_in_group below; no host read here then."""
     g = T.geo
     if rows_b.numel() == 0:
         return 0
-    grp = planes * g.B + rows_b
-    rnd = rank_in_group(grp, torch.ones_like(grp, dtype=torch.bool))
     pw = T.pin_w
-    n = int(rnd.max()) + 1
+    if rounds is None:
+        grp = planes * g.B + rows_b
+        rnd = rank_in_group(grp, torch.ones_like(grp, dtype=torch.bool))
+        n = int(rnd.max()) + 1
+    else:
+        n = len(rounds)
     for r in range(n):
-        idx = (rnd == r).nonzero().squeeze(1)
+        idx = (rnd == r).nonzero().squeeze(1) if rounds is None else rounds[r]
         p, b = planes[idx], rows_b[idx]
         old = pw[p, :, b].clone()                                    # (n_r, L, H, WB)
         new = rowsel[:, idx].permute(1, 0, 2, 3)
@@ -816,7 +822,7 @@ def write_merges(T: Table, fv: torch.Tensor, fd: torch.Tensor, undo: Optional[Un
 
 
 def recency(T: Table, D: Dict[str, torch.Tensor], rows: Rows, undo: Optional[Undo] = None,
-            mut: Optional[Dict] = None) -> Dict:
+            mut: Optional[Dict] = None, n_rounds: Optional[int] = None) -> Dict:
     """K1 / O1 (_draft_recency res.py:686-706): per draft row IN ORDER, its READY records in ascending block order (the
     record order): an LRU slot is touched (to MRU), a PO / VRES slot is acquired (-> LRU at MRU, own.py:305-321), any
     other state is a violation; then evict_to_c for that row's streams (own.py:297-303). Rows of different requests are
@@ -825,7 +831,10 @@ def recency(T: Table, D: Dict[str, torch.Tensor], rows: Rows, undo: Optional[Und
     acquire, evict_po, evict_rel) equal the vendored journal's (B2 reports them; rev 2 0.1 (2)).
     mut: "reverse_stamps" (NEGATIVE CONTROL); "one_batch" (all rows' touches, then one eviction: a REPORT variant. With
     the pins fixed during the recency and every read block pinned by phase A (res.py:668), it reaches the SAME end
-    state: the final LRU is the C largest final stamps either way, and the rounds' extra victims are re-acquired.)"""
+    state: the final LRU is the C largest final stamps either way, and the rounds' extra victims are re-acquired.)
+    n_rounds ([hostfix] --b2-fewer-reads; None: int(occ.max()) + 1 as before): the round count made on the host (the
+    most draft rows of one batch slot: the same value); with 1 every occ is 0, so round 0's rows are all rows.db (the
+    mask selection's value and order) and no mask read is made for them."""
     g = T.geo
     d = T.dev
     zero = torch.zeros((), dtype=torch.int64, device=d)
@@ -835,7 +844,7 @@ def recency(T: Table, D: Dict[str, torch.Tensor], rows: Rows, undo: Optional[Und
     occ = rank_in_group(rows.db, torch.ones_like(rows.db, dtype=torch.bool))
     r_of = occ[D["j"]]
     ready = has(D["flags"], READY)
-    n = int(occ.max()) + 1
+    n = int(occ.max()) + 1 if n_rounds is None else int(n_rounds)
     one = bool(mut and mut.get("one_batch"))
     plan = [(None, None)] if one else [(r, r) for r in range(n)]
     for (r0, _) in plan:
@@ -852,7 +861,7 @@ def recency(T: Table, D: Dict[str, torch.Tensor], rows: Rows, undo: Optional[Und
         T.clock += int(f.numel())
         out["touch"] = out["touch"] + (c0 == C_LRU).sum()
         out["acquire"] = out["acquire"] + acq.sum()
-        sel_rows = rows.db if one else rows.db[occ == r0]
+        sel_rows = rows.db if one or n_rounds == 1 else rows.db[occ == r0]
         streams = ((torch.arange(g.L, device=d).view(-1, 1, 1) * g.B + sel_rows.view(1, -1, 1)) * g.H
                    + torch.arange(g.H, device=d).view(1, 1, -1)).reshape(-1)
         if one:

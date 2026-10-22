@@ -20,6 +20,11 @@ adversarial transport, S-C's CPU device stand-in) with B2 (OwnResidency) as the 
        sequences (NEGATIVE CONTROL: a stale pop); _superset_wait waits the same events in the same order on random
        fixtures, plain vs indexed (NEGATIVE CONTROL: a transfer that bypasses the index); the B2 round with the
        index equals the default and the index is exact at every resolve (NEGATIVE CONTROL: the stale pop in a round).
+  HF5  --b2-fewer-reads (item 5): the B2 round with fewer reads equals the default at every tick and in the report
+       (forced, pressure, free; unchecked and checked; PRECONDITION: a tick pins in two or more rounds), and with
+       --lean-time equals lean; the consumer's host reads per tick are never more and fewer in total (counted on the
+       CPU stand-in); the host pin rounds and recency round count equal rank_in_group's on random rows; NEGATIVE
+       CONTROL: merged pin rounds differ from the default.
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA benchmarks/Efficiency/tests_cpu/test_r2_hostfix.py
 """
@@ -580,6 +585,156 @@ def test_HF3d_the_harness_wiring():
     assert 'wait_index=bool(getattr(a, "wait_index", False))' in inspect.getsource(G.make_engine)
     src = inspect.getsource(RSC.CudaDeviceOps._superset_wait)
     assert 'getattr(self.svc.inflight, "by_layer", None)' in src and "tr.layer != l" in src
+
+
+SB = TT._load("r2_residency_sb")                                       # rank_in_group (r2tick)
+
+
+class _Reads:
+    """Counts the host reads of tensors in a block (tolist, int, bool, item, nonzero): the CPU stand-in of the
+    synchronizations the same calls make on CUDA."""
+
+    NAMES = ("tolist", "__int__", "__bool__", "item", "nonzero")
+
+    def __init__(self, monkeypatch):
+        self.n = 0
+        for name in self.NAMES:
+            orig = getattr(torch.Tensor, name)
+
+            def wrap(*a, _o=orig, **k):
+                self.n += 1
+                return _o(*a, **k)
+            monkeypatch.setattr(torch.Tensor, name, wrap)
+
+
+def _counting_end_tick(svc, counter):
+    """Counts the reads of svc.end_tick only (the B2 consumer)."""
+    e0 = svc.end_tick
+    box = dict(reads=[])
+
+    def end_tick():
+        before = counter.n
+        counter.n = 0
+        try:
+            return e0()
+        finally:
+            box["reads"].append(counter.n)
+            counter.n = before
+    svc.end_tick = end_tick
+    return box
+
+
+@pytest.mark.parametrize("cfg,forced,checked", [("default", True, False), ("pressure", True, False),
+                                                ("default", False, False), ("pressure", True, True)],
+                         ids=["forced", "pressure", "free", "pressure-checked"])
+def test_HF5a_fewer_reads_changes_no_value(p3, ref, cfg, forced, checked, monkeypatch):
+    toks, _ = ref
+    pins = []
+    pins_or0 = OWN2.O.pins_or
+
+    def pins_or(*a, **k):
+        if k.get("rounds") is not None:
+            pins.append(len(k["rounds"]))
+        return pins_or0(*a, **k)
+    monkeypatch.setattr(OWN2.O, "pins_or", pins_or)
+    base = _run_hf(p3, toks, cfg=cfg, forced=forced, svc_kw=dict(checked=checked))
+    few = _run_hf(p3, toks, cfg=cfg, forced=forced, svc_kw=dict(checked=checked, fewer_reads=True))
+    assert base.svc.fewer_reads is False and few.svc.fewer_reads is True
+    assert _diff(base, few) is None
+    _same_end(base, few)
+    assert pins and max(pins) >= 2, "precondition: a tick pins in two or more rounds (a cohort's verify rows)"
+    c = base.svc.metrics.counts
+    if cfg == "pressure":
+        assert base.svc.journal_counts.get("take", 0) > 0 and base.svc.journal_counts.get("touch", 0) > 0
+    print("REPORT verifier_evictions %s, draft_refused %s, pin rounds max %d" % (c.get("verifier_evictions"),
+                                                                                 c.get("draft_refused"), max(pins)))
+
+
+def test_HF5b_fewer_reads_with_lean_equals_lean(p3, ref):
+    toks, _ = ref
+    lean = _run_hf(p3, toks, cfg="pressure", svc_kw=dict(checked=False, lean=True))
+    both = _run_hf(p3, toks, cfg="pressure", svc_kw=dict(checked=False, lean=True, fewer_reads=True))
+    assert _diff(lean, both) is None
+    _same_end(lean, both)
+
+
+def test_HF5c_the_consumer_reads_less(p3, ref, monkeypatch):
+    """The B2 consumer's host reads per tick (tolist / int / bool / item / nonzero, counted in end_tick): fewer with
+    the flag on every tick with verify rows; never more."""
+    toks, _ = ref
+    counter = _Reads(monkeypatch)
+    boxes = {}
+    for name, kw in (("base", dict(checked=False)), ("few", dict(checked=False, fewer_reads=True))):
+        boxes[name] = []
+        _run_hf(p3, toks, cfg="pressure", svc_kw=kw,
+                setup=lambda eng, svc, n=name: boxes.__setitem__(n, _counting_end_tick(svc, counter)))
+    rb, rf = boxes["base"]["reads"], boxes["few"]["reads"]
+    assert len(rb) == len(rf) > 10
+    assert all(f <= b for b, f in zip(rb, rf)), list(zip(rb, rf))
+    assert sum(rf) < sum(rb), (sum(rb), sum(rf))
+    print("REPORT B2 consumer host reads per tick: default %s, fewer %s (sum %d -> %d)"
+          % (rb[:6], rf[:6], sum(rb), sum(rf)))
+
+
+def test_HF5d_host_rounds_equal_the_device_rank_on_random_rows():
+    g = torch.Generator().manual_seed(9)
+    for _ in range(60):
+        R = int(torch.randint(1, 40, (1,), generator=g))
+        bs = torch.randint(0, 4, (R,), generator=g).tolist()
+        ks = torch.randint(0, 3, (R,), generator=g).tolist()
+        kinds = ["v" if x else "d" for x in torch.randint(0, 2, (R,), generator=g).tolist()]
+        trows = [SimpleNamespace(b=b, key=("u%d" % b, 1, k), kind=kd) for b, k, kd in zip(bs, ks, kinds)]
+        vrows = [r for r in trows if r.kind == "v"]
+        drows = [r for r in trows if r.kind == "d"]
+        stub = SimpleNamespace(_kslot={r.key: r.key[2] for r in trows}, KEYS=7, B=4, _h2d=lambda t: t)
+        (vb, vk, db, dk, row_b, row_plane), rounds, n_rec = OWN2.OwnResidency._fr_rows(stub, vrows, drows, trows)
+        grp = row_plane * 4 + row_b
+        rnd = SB.rank_in_group(grp, torch.ones_like(grp, dtype=torch.bool))
+        want = [(rnd == r).nonzero().squeeze(1).tolist() for r in range(int(rnd.max()) + 1)]
+        assert [x.tolist() for x in rounds] == want
+        assert vb.tolist() == [r.b for r in vrows] and dk.tolist() == [r.key[2] for r in drows]
+        assert row_plane.tolist() == [r.key[2] + (0 if r.kind == "v" else 7) for r in trows]
+        if drows:
+            occ = SB.rank_in_group(db, torch.ones_like(db, dtype=torch.bool))
+            assert n_rec == int(occ.max()) + 1
+        else:
+            assert n_rec == 0
+
+
+def test_HF5e_negative_control_one_pin_round_differs(p3, ref):
+    """L34: a fewer-reads path whose pin rounds are merged into ONE round (duplicate (plane, b) in one indexed write:
+    the later row's words replace the earlier's) differs from the default, so HF5a's comparison sees a wrong round."""
+    toks, _ = ref
+    base = _run_hf(p3, toks, cfg="pressure", svc_kw=dict(checked=False))
+    merged = []
+
+    def one_round(eng, svc):
+        f0 = svc._fr_rows
+
+        def fr_rows(vrows, drows, trows):
+            rows6, rounds, n_rec = f0(vrows, drows, trows)
+            if len(rounds) >= 2:
+                merged.append(len(rounds))
+                rounds = [torch.cat(rounds)]
+            return rows6, rounds, n_rec
+        svc._fr_rows = fr_rows
+    bad = _run_hf(p3, toks, cfg="pressure", svc_kw=dict(checked=False, fewer_reads=True), setup=one_round)
+    assert merged, "precondition: a tick with two or more pin rounds"
+    assert _diff(base, bad) is not None or [r.out for r in base.rnd.reqs] != [r.out for r in bad.rnd.reqs] \
+        or TB._rep(base.svc) != TB._rep(bad.svc)
+
+
+def test_HF5f_the_harness_wiring():
+    G = _sg5()
+    base = ["--out", "o", "--workload", "w", "--biattn", "b", "--gilfree", "g", "--gilfree-build", "/x"]
+    assert G.parse_args(base).b2_fewer_reads is False
+    assert G.parse_args(base + ["--backends", "b2", "--X", "64", "--b2-fewer-reads"]).b2_fewer_reads is True
+    with pytest.raises(SystemExit):
+        G.parse_args(base + ["--b2-fewer-reads"])
+    assert 'fewer_reads=bool(getattr(a, "b2_fewer_reads", False))' in inspect.getsource(G.make_engine)
+    assert inspect.signature(OWN2.OwnResidency.__init__).parameters["fewer_reads"].default is False
+    assert inspect.signature(OWN2.O.pins_or).parameters["rounds"].default is None
+    assert inspect.signature(OWN2.O.recency).parameters["n_rounds"].default is None
 
 
 def test_HF1c_the_harness_wiring():
