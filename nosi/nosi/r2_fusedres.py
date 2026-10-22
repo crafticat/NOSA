@@ -110,7 +110,7 @@ GATE_STATS = ("v_evict", "pe_flip_effective", "v_grant", "d_grant", "d_refused")
 ERR_BITS = {1: "A1: a block has two resident slots in a stream", 2: "A1: a block has two owner slots in flight",
             4: "A3: a K5 grant found no FREE slot", 8: "A2: a Policy E candidate stamp outside [0, 2^47)",
             16: "self-check: phase 2's classification count differs from phase 1's (the global prefix is wrong)"}
-SCAN_BLOCK = 1024                      # the most lanes of a SCAN chunk (pow2(R H) when smaller)
+SCAN_BLOCK = 1024                      # the lanes of every SCAN chunk ([stack2] always: no per-tick variant)
 NSTAT_LANES = 16                       # the stats atomics' lanes; the stats buffer holds all of them (fusedres2b)
 # fusedres2b (job 2191246: glibc "corrupted size vs. prev_size" in the interpreter child): every buffer a kernel
 # writes is allocated with LANE_PAD spare elements after its logical end, so a masked lane past the end (SCAN's chunk,
@@ -119,7 +119,13 @@ NSTAT_LANES = 16                       # the stats atomics' lanes; the stats buf
 # that names the kernel and the buffer).
 LANE_PAD = 2048
 GUARD_SENTINEL = -95443717
-MAX_NPOS = 512                                         # Policy E's sort key holds the slot index in 9 bits
+# [stack2] Policy E's sort key is class << (47 + SB) | stamp << SB | slot, SB = slot_bits(NP) (V2's constexpr). SB is 9
+# for NP <= 512: the key and the mask are the 23b8a38 ones, bit for bit. SB grows with NP above 512 (10 at NP 1024, 11
+# at 2048, 12 at 4096). The largest legal key is 2 << (47 + SB) (class 2, stamp 0), < 2^63 for SB <= 14; MAX_NPOS 4096
+# keeps SB <= 12 (key < 2^61). A candidate stamp outside [0, 2^47) sets err bit 8 (the tick is voided); its key can
+# overflow int64, at every SB, as before. stack1a128 (job 386, C 96 + X 896 = 992) failed on the old 9-bit limit.
+MAX_NPOS = 4096
+STAMP_BITS = 47                                        # A2: a candidate stamp is in [0, 2^47)
 
 
 def _pow2(n: int) -> int:
@@ -127,6 +133,58 @@ def _pow2(n: int) -> int:
     while p < n:
         p *= 2
     return p
+
+
+# [stack2] NO DATA-DEPENDENT COMPILE (job 386 stack1a: 17 variants of these kernels were first compiled INSIDE the
+# stack arm's timed round, Triton cache mtimes 20:22:59 .. 20:24:35 local; one _fr_v2 compile is about 31 s, the
+# 42.4 s tick). Triton keys a compiled variant on every constexpr, on every int argument (== 1, % 16) and on every
+# pointer's 16-byte alignment, unless the argument is in do_not_specialize. 23b8a38 listed the ints only, so these
+# per-tick facts made new variants: the row-list slices' alignment (dix / dstart / dcnt / dorder follow len(vrows);
+# kid follows len(rows)), LZ = pow2(Rv * 4) and SCAN's BLOCK = pow2(max(Rv H, S)). Now: the row-list pointers and the
+# selection are not specialized (they are gathered, never vector-loaded), LZ and BLOCK are constants (masked lanes:
+# the same values), and the variants left (V2's LAST, D1 / D2's HAS_V) are compiled by warm_up before the first
+# decision. DNS_OLD keeps 23b8a38's lists (the tests' negative control). No output changes.
+_INTS = dict(
+    _fr_scan=["RH", "S", "C", "X", "RES"],
+    _fr_v1=["H", "R", "K", "NBLK", "NPOS", "C", "Rv", "MAXRV", "NLOOK"],
+    _fr_v2=["H", "B", "R", "K", "NBLK", "NPOS", "C", "X", "Rv", "Rd", "MAXRV", "MAXRD", "NV", "CAPV", "S", "WB", "WP",
+            "T", "P"],
+    _fr_d1=["H", "R", "K", "NBLK", "NPOS", "C", "Rd", "MAXRD", "S", "NPAIRS"],
+    _fr_d2=["H", "B", "R", "K", "NBLK", "NPOS", "C", "Rv", "Rd", "MAXRV", "MAXRD", "ND", "CAPD", "S", "WB", "T", "P",
+            "BS", "ROWS_S", "ROWS_C"])
+_ROWS_V = ["vix_ptr", "vhb_ptr", "vtl_ptr", "vnt_ptr", "vstart_ptr", "vcnt_ptr", "vorder_ptr"]
+_ROWS_D = ["dix_ptr", "dhb_ptr", "dtl_ptr", "dnt_ptr", "dstart_ptr", "dcnt_ptr", "dorder_ptr"]
+_SEL = ["sel_ptr", "kid_ptr"]
+DNS_OLD = {k: list(v) for k, v in _INTS.items()}
+DNS = dict(_fr_scan=_INTS["_fr_scan"],
+           _fr_v1=_INTS["_fr_v1"] + _SEL + [p for p in _ROWS_V if p not in ("vtl_ptr", "vnt_ptr")],
+           _fr_v2=_INTS["_fr_v2"] + _SEL + _ROWS_V + [p for p in _ROWS_D if p not in ("dtl_ptr", "dnt_ptr")],
+           _fr_d1=_INTS["_fr_d1"] + _SEL + [p for p in _ROWS_D if p not in ("dtl_ptr", "dnt_ptr")],
+           _fr_d2=_INTS["_fr_d2"] + _SEL + [p for p in _ROWS_V if p not in ("vtl_ptr", "vnt_ptr")] + _ROWS_D
+           + ["sb_ptr", "cis_ptr"])
+LOOK_LANES = 256                                       # V1's zeroing chunk (23b8a38: min(256, pow2(Rv * 4)))
+WARM_MODES = ("auto", "on", "off")                     # auto: on for a CUDA service (the interpreter compiles nothing)
+_warm_depth = [0]                                      # > 0 while warm_up launches (tests tell its launches apart)
+
+
+def _jit_dns(name: str):
+    """[stack2] triton.jit with DNS[name] as do_not_specialize (and as do_not_specialize_on_alignment where the
+    installed Triton has that argument: Triton 3.2 splits the pointer alignment off; older versions key the alignment
+    of a pointer under do_not_specialize)."""
+    kw = dict(do_not_specialize=DNS[name])
+    try:
+        import inspect
+        if "do_not_specialize_on_alignment" in inspect.signature(triton.jit).parameters:
+            kw["do_not_specialize_on_alignment"] = DNS[name]
+    except (TypeError, ValueError):                    # pragma: no cover - a signature that inspect cannot read
+        pass
+    return triton.jit(**kw)
+
+
+def slot_bits(np_: int) -> int:
+    """The slot field's width in Policy E's key for NP lanes (a power of 2): 9 up to NP 512 (23b8a38's layout), else
+    log2(NP). Tests force 9 at NP > 512 to rebuild the old layout (the negative control)."""
+    return max(9, (int(np_) - 1).bit_length())
 
 
 if triton is not None:
@@ -253,7 +311,7 @@ if triton is not None:
     # SCAN (one program, M4 of review-fusedres-0e28cf6): the exclusive prefixes of the per-(row, head) counts of a
     # phase, the layer's K5 budget and the record total. Phase 2 then loads ONE base per (row, head): no O(B^2) reads.
     # =================================================================================================================
-    @triton.jit(do_not_specialize=["RH", "S", "C", "X", "RES"])
+    @_jit_dns("_fr_scan")
     def _fr_scan(ne_ptr, rec_ptr, usg_ptr, bne_ptr, brec_ptr, misc_ptr, RH, S, C, X, RES, BLOCK: tl.constexpr):
         # fusedres2c: every buffer here is int64 and every stored value is cast to int64 explicitly. With int32
         # buffers (7727e34) the interpreter wrote past d.bne / d.brec at every layer (FR10, job 2191259): a scan / sum
@@ -282,7 +340,7 @@ if triton is not None:
     # =================================================================================================================
     # V1:the verify rows' classification (counts for the global K5 prefix and the record compaction)
     # =================================================================================================================
-    @triton.jit(do_not_specialize=["H", "R", "K", "NBLK", "NPOS", "C", "Rv", "MAXRV", "NLOOK"])   # m4: no re-compile
+    @_jit_dns("_fr_v1")   # m4: no re-compile; [stack2] rows and sel too
     def _fr_v1(code_ptr, blk_ptr, gen_ptr, cur_ptr, prot_ptr, stamp_ptr, sel_ptr, kid_ptr,
                vix_ptr, vhb_ptr, vstart_ptr, vcnt_ptr, vorder_ptr,
                ne_ptr, rec_ptr, usg_ptr, err_ptr, cntv_ptr, look_ptr,
@@ -331,8 +389,7 @@ if triton is not None:
     # =================================================================================================================
     # V2: the verify decisions
     # =================================================================================================================
-    @triton.jit(do_not_specialize=["H", "B", "R", "K", "NBLK", "NPOS", "C", "X", "Rv", "Rd", "MAXRV", "MAXRD", "NV",
-                                   "CAPV", "S", "WB", "WP", "T", "P"])
+    @_jit_dns("_fr_v2")                         # [stack2] ints, rows, sel
     def _fr_v2(code_ptr, blk_ptr, gen_ptr, cur_ptr, prot_ptr, stamp_ptr, sel_ptr, kid_ptr,
                vix_ptr, vhb_ptr, vtl_ptr, vnt_ptr, vstart_ptr, vcnt_ptr, vorder_ptr,
                dix_ptr, dhb_ptr, dstart_ptr, dcnt_ptr, dorder_ptr,
@@ -342,7 +399,7 @@ if triton is not None:
                H, B, R, K, NBLK, NPOS, C, X, Rv, Rd, MAXRV, MAXRD, NV, CAPV, S, WB, WP, T, P,
                KP: tl.constexpr, NP: tl.constexpr, PP: tl.constexpr, TP: tl.constexpr,
                ZP: tl.constexpr, PE_INFL: tl.constexpr, LAST: tl.constexpr, PLANT: tl.constexpr,
-               NSTAT: tl.constexpr):
+               NSTAT: tl.constexpr, SMUL: tl.constexpr, CMUL: tl.constexpr, SMASK: tl.constexpr):
         pid = tl.program_id(0)
         b = pid // H
         h = pid % H
@@ -381,10 +438,11 @@ if triton is not None:
         else:
             candf = cand & (cand == 0)
         anyc = cand | candf
-        # one key per slot: class (LRU candidate 0, in-flight candidate 1, none 2) << 56 | stamp << 9 | slot
+        # one key per slot: class (LRU candidate 0, in-flight candidate 1, none 2) << (47 + SB) | stamp << SB | slot
+        # [stack2] SMUL = 2^SB, CMUL = 2^(47 + SB), SMASK = 2^SB - 1 (host: slot_bits(NP)); SB 9 = 23b8a38's literals
         cls = tl.where(cand, 0, tl.where(candf, 1, 2)).to(tl.int64)
         kst = tl.where(cand, stamp, tl.where(candf, tl.minimum(stamp, 2305843009213693952), 0))
-        comp = cls * 72057594037927936 + kst * 512 + jj.to(tl.int64)
+        comp = cls * CMUL + kst * SMUL + jj.to(tl.int64)
         srtc = tl.sort(comp)
         ncand = tl.sum(anyc.to(tl.int32), axis=0)
         errb = tl.where(tl.max((anyc & ((stamp < 0) | (stamp >= 140737488355328))).to(tl.int32), axis=0) > 0, 8, 0)
@@ -442,7 +500,7 @@ if triton is not None:
                 ruse = tl.where(evicted, ncand - 1 - rev, rev)
             else:
                 ruse = rev
-            evs = (tl.sum(tl.where(rrn[None, :] == ruse[:, None], srtc[None, :], 0), axis=1) & 511).to(tl.int32)
+            evs = (tl.sum(tl.where(rrn[None, :] == ruse[:, None], srtc[None, :], 0), axis=1) & SMASK).to(tl.int32)
             evblk_raw = _at_slot(evs, jj, sblk, -1073741824)
             evfly = _at_slot(evs, jj, fly.to(tl.int32), 0)
             evgen_raw = _at_slot(evs, jj, gen, 0)
@@ -581,7 +639,7 @@ if triton is not None:
     # =================================================================================================================
     # D1: the draft rows' classification on the state after the verify rows
     # =================================================================================================================
-    @triton.jit(do_not_specialize=["H", "R", "K", "NBLK", "NPOS", "C", "Rd", "MAXRD", "S", "NPAIRS"])
+    @_jit_dns("_fr_d1")                         # [stack2] ints, rows, sel
     def _fr_d1(code_ptr, blk_ptr, gen_ptr, cur_ptr, prot_ptr, stamp_ptr, sel_ptr, kid_ptr,
                dix_ptr, dhb_ptr, dstart_ptr, dcnt_ptr, dorder_ptr,
                post_ptr, usg2_ptr, ne_ptr, rec_ptr, usgd_ptr, err_ptr, cntd_ptr,
@@ -636,8 +694,7 @@ if triton is not None:
     # =================================================================================================================
     # D2: the draft decisions, the draft record, the bias rows, the selection bitmaps
     # =================================================================================================================
-    @triton.jit(do_not_specialize=["H", "B", "R", "K", "NBLK", "NPOS", "C", "Rv", "Rd", "MAXRV", "MAXRD", "ND",
-                                   "CAPD", "S", "WB", "T", "P", "BS", "ROWS_S", "ROWS_C"])
+    @_jit_dns("_fr_d2")                         # [stack2] ints, rows, sel, bias
     def _fr_d2(code_ptr, blk_ptr, gen_ptr, cur_ptr, prot_ptr, stamp_ptr, sel_ptr, kid_ptr,
                vix_ptr, vhb_ptr, vstart_ptr, vcnt_ptr, vorder_ptr,
                dix_ptr, dhb_ptr, dtl_ptr, dnt_ptr, dstart_ptr, dcnt_ptr, dorder_ptr,
@@ -820,9 +877,18 @@ class FusedResolver:
     every layer and record every differing output in self.diffs (tests, the GPU equality gate; it reads the device).
     plant: a NEGATIVE CONTROL (PLANTS), tests only."""
 
-    def __init__(self, svc, check: bool = False, plant: int = 0, num_warps: int = 8, guard: bool = False):
+    def __init__(self, svc, check: bool = False, plant: int = 0, num_warps: int = 8, guard: bool = False,
+                 warm: str = "auto"):
         if triton is None:
             raise RuntimeError("resolve='fused' needs triton (not installed)")
+        if warm not in WARM_MODES:
+            raise ValueError("fused warm %r (one of %s)" % (warm, WARM_MODES))
+        # [stack2] warm: compile every variant of a selection width before its first decision (warm_up). auto = on
+        # for a CUDA service; the interpreter (CPU) compiles nothing, so auto is off there and the launch counts of
+        # the CPU tests stay as they were (FR13 runs warm 'on' in the interpreter)
+        self.warm = warm == "on" or (warm == "auto" and torch.device(svc.device).type == "cuda")
+        self._warmed = set()                               # the variant keys warm_up launched
+        self.warm_launches = 0                             # warm_up's launches (not in self.launches)
         # [integ] the shared X pool (docs/R2_FUSEDRES_PLAN.md section 5, implemented): the kernels decide on LOGICAL
         # slots (I1-I5); the lanes are bound after V2 and after D2 (XPool.bind, torch ops), the draft bias rows go
         # through r2_xpool.draft_bias_fill_flat (D2 runs with BIAS 0), and the FREE slots' lanes are released after the
@@ -849,6 +915,9 @@ class FusedResolver:
             raise ValueError("resolve='fused' does not call _layer_record: %s overrides it" % type(svc).__name__)
         if svc.n_hist > MAX_NPOS:
             raise ValueError("resolve='fused': C + X = %d > %d" % (svc.n_hist, MAX_NPOS))
+        if max(_pow2(svc.n_hist), 64) - svc.n_hist > LANE_PAD:      # [stack2] a masked NP lane stays in the pad
+            raise ValueError("resolve='fused': NP - (C + X) = %d > LANE_PAD %d"
+                             % (max(_pow2(svc.n_hist), 64) - svc.n_hist, LANE_PAD))
         self.svc = svc
         self.check = bool(check)
         self.plant = int(plant)
@@ -1044,6 +1113,9 @@ class FusedResolver:
             self.sel_conversions += 1
         Rv, Rd = fz["Rv"], fz["Rd"]
         NP = fz["NP"]
+        SB = slot_bits(NP)                                  # [stack2] Policy E's slot field (module-level: tests patch it)
+        if 2 + STAMP_BITS + SB > 63:
+            raise ValueError("resolve='fused': Policy E's key needs %d bits at NP %d" % (2 + STAMP_BITS + SB, NP))
         KP = max(_pow2(k), 2)
         PP = max(_pow2(P), 2)
         TP = max(_pow2(N_TAIL), 2)
@@ -1067,6 +1139,8 @@ class FusedResolver:
         nv, nd = Rv * H * k, Rd * H * k
         caps = (max(nv, 1), max(nd, 1))
         nw = self.num_warps
+        if self.warm:                                                 # [stack2] every variant of this width, once
+            self.warm_up(l, sel, NP, k)                               # (scratch outputs; no state is read back)
         ref = torch_reference(svc, l, tk, sel) if self.check else None     # check mode: before any launch
         where = (svc.tick_no, l)
         sv, sd = fz["sv"], fz["sd"]
@@ -1083,9 +1157,9 @@ class FusedResolver:
             self._go(where, "_fr_v1", _fr_v1, (S,), *tabs, sel, kid, vix, vhb, fz["vstart"], fz["vcnt"],
                      fz["vorder"], sv["ne"], sv["rec"], fz["usg"], self.err, cntv, vlook,
                      H, R, k, NBLK, NPOS, svc.C, Rv, fz["maxrv"], Rv * 4,
-                     KP=KP, NP=NP, LZ=min(256, max(_pow2(Rv * 4), 2)), num_warps=nw)
+                     KP=KP, NP=NP, LZ=LOOK_LANES, num_warps=nw)          # [stack2] a constant
             self._go(where, "_fr_scan.v", _fr_scan, (1,), sv["ne"], sv["rec"], fz["usg"], sv["bne"], sv["brec"],
-                     sv["misc"], Rv * H, S, svc.C, svc.X, 0, BLOCK=min(SCAN_BLOCK, max(_pow2(max(Rv * H, S)), 2)),
+                     sv["misc"], Rv * H, S, svc.C, svc.X, 0, BLOCK=SCAN_BLOCK,              # [stack2] a constant
                      num_warps=4)
             self._go(where, "_fr_v2", _fr_v2, (S,), *tabs, sel, kid, vix, vhb, vtl, vnt, fz["vstart"], fz["vcnt"], fz["vorder"],
                     dix, dhb, fz["dstart"], fz["dcnt"], fz["dorder"],
@@ -1095,7 +1169,8 @@ class FusedResolver:
                     H, B, R, k, NBLK, NPOS, svc.C, svc.X, Rv, max(Rd, 1), fz["maxrv"], fz["maxrd"], nv, caps[0],
                     S, WB, WP, N_TAIL, P,
                     KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, PE_INFL=self.pe_inflight,
-                    LAST=Rd == 0, PLANT=self.plant, NSTAT=len(STATS), num_warps=nw)
+                    LAST=Rd == 0, PLANT=self.plant, NSTAT=len(STATS), SMUL=1 << SB,
+                    CMUL=1 << (STAMP_BITS + SB), SMASK=(1 << SB) - 1, num_warps=nw)
             self.launches += 3
             vdec = VerifyDecision(Rv, H, k, {f: tv[i] for i, f in enumerate(FIELDS_V)}, vpage, vnpg, ids,
                                   self._bh(fz, k), cntv)
@@ -1117,35 +1192,18 @@ class FusedResolver:
             drec = b64((len(DREC), caps[1]), "drec")
             dcnt = b64((1,), "dcnt")
             cntd4 = b64((4,), "d.counters")                   # the 4 lanes of the counter atomics; counters = [:3]
-            bias = 0
-            sb = cis = sel
-            rows_s = rows_c = 0
-            flat_bias = self.xp is not None and svc.store_b is not None and svc.cis is not None   # [integ][xpool]
-            if flat_bias:                                             # recipe (3): D2 with BIAS 0; the bias rows go
-                if self.check:                                        # through draft_bias_fill_flat after the bind
-                    sb_before = svc.store_b[l].clone()
-            elif svc.store_b is not None and svc.cis is not None:
-                sb_t, cis_t = svc.store_b[l], svc.cis[l]
-                if (not sb_t.is_contiguous() or not cis_t.is_contiguous() or sb_t.dim() != 3 or cis_t.dim() != 3
-                        or not sb_t.dtype.is_floating_point or not cis_t.dtype.is_floating_point):
-                    raise ValueError("resolve='fused': the bias rows need contiguous (B, rows, H) float store_b and "
-                                     "cis tables (got %s %s / %s %s)" % (sb_t.dtype, tuple(sb_t.shape), cis_t.dtype,
-                                                                         tuple(cis_t.shape)))
-                if self.check:
-                    sb_before = sb_t.clone()
-                if sb_t.dtype == cis_t.dtype and sb_t.element_size() in (2, 4):
-                    bias, sb, cis = 1, _bits(sb_t), _bits(cis_t)      # bit copies
-                else:
-                    bias, sb, cis = 2, sb_t, cis_t                    # m9: the cast in the kernel (counted)
-                    self.bias_casts += 1
-                rows_s, rows_c = sb_t.shape[1], cis_t.shape[1]
+            bias, sb, cis, rows_s, rows_c, flat_bias = self._bias_args(l, sel)   # [stack2] shared with warm_up
+            if self.check and (flat_bias or bias):                    # flat_bias: recipe (3), D2 with BIAS 0; the bias
+                sb_before = svc.store_b[l].clone()                    # rows go through draft_bias_fill_flat
+            if bias == 2:
+                self.bias_casts += 1                                  # m9: the cast in the kernel (counted)
             self._go(where, "_fr_d1", _fr_d1, (S,), *tabs, sel, kid, dix, dhb, fz["dstart"], fz["dcnt"],
                      fz["dorder"], fz["post"], fz["usg2"], sd["ne"], sd["rec"], fz["usgd"], self.err, cntd4,
                      H, R, k, NBLK, NPOS, svc.C, Rd, fz["maxrd"], S, Rd * H,
                      KP=KP, NP=NP, HAS_V=Rv > 0, num_warps=nw)
             self._go(where, "_fr_scan.d", _fr_scan, (1,), sd["ne"], sd["rec"], fz["usgd"], sd["bne"], sd["brec"],
                      sd["misc"], Rd * H, S, svc.C, svc.X, svc.R_ver,
-                     BLOCK=min(SCAN_BLOCK, max(_pow2(max(Rd * H, S)), 2)), num_warps=4)
+                     BLOCK=SCAN_BLOCK, num_warps=4)                                    # [stack2] a constant
             self._go(where, "_fr_d2", _fr_d2, (S,), *tabs, sel, kid, vix, vhb, fz["vstart"], fz["vcnt"],
                      fz["vorder"], dix, dhb, dtl, dnt, fz["dstart"], fz["dcnt"], fz["dorder"],
                      fz["post"], sd["ne"], sd["rec"], sd["bne"], sd["brec"], sd["misc"], fz["usgd"],
@@ -1169,6 +1227,97 @@ class FusedResolver:
         if ref is not None:
             self._compare(where, l, step, page, npg, sb_before, ref)
         return step, page, npg
+
+    def _bias_args(self, l, sel):
+        """D2's bias arguments for layer l (BIAS, sb, cis, rows_s, rows_c, flat_bias); no side effect. flat_bias: the
+        xpool's flat fill does the bias rows (D2 BIAS 0, as without tables). BIAS 1: one 2- or 4-byte dtype (bit
+        copies); BIAS 2: a cast in the kernel. Non-contiguous or non-(B, rows, H) tables are refused."""
+        svc = self.svc
+        flat_bias = self.xp is not None and svc.store_b is not None and svc.cis is not None   # [integ][xpool]
+        if flat_bias or svc.store_b is None or svc.cis is None:
+            return 0, sel, sel, 0, 0, flat_bias
+        sb_t, cis_t = svc.store_b[l], svc.cis[l]
+        if (not sb_t.is_contiguous() or not cis_t.is_contiguous() or sb_t.dim() != 3 or cis_t.dim() != 3
+                or not sb_t.dtype.is_floating_point or not cis_t.dtype.is_floating_point):
+            raise ValueError("resolve='fused': the bias rows need contiguous (B, rows, H) float store_b and "
+                             "cis tables (got %s %s / %s %s)" % (sb_t.dtype, tuple(sb_t.shape), cis_t.dtype,
+                                                                 tuple(cis_t.shape)))
+        if sb_t.dtype == cis_t.dtype and sb_t.element_size() in (2, 4):
+            return 1, _bits(sb_t), _bits(cis_t), sb_t.shape[1], cis_t.shape[1], False   # bit copies
+        return 2, sb_t, cis_t, sb_t.shape[1], cis_t.shape[1], False                     # m9: the cast in the kernel
+
+    # ----------------------------------------------------------------------------------------------- warm-up
+    def warm_up(self, l, sel, NP, k):
+        """[stack2] Compiles every variant that a layer of selection width k can launch, before its first decision:
+        V1, SCAN, V2 with LAST True and False, D1 and D2 with HAS_V True and False (BIAS, PLANT, NP, KP, PP, ZP and the
+        slot field are fixed per run and width). The launches have NO active row (MAXRV = MAXRD = 0) and write only
+        scratch tensors made here (err and stats included); they read layer l's mirror tables and sel. The compile
+        key of each launch equals a real launch's: the same constexprs and num_warps, the same dtypes, every int in
+        do_not_specialize, and every pointer either in do_not_specialize or a fresh (16-byte aligned) allocation, as
+        the real outputs are. Once per key (self._warmed); warm_launches counts them (not self.launches)."""
+        svc = self.svc
+        B, H, dev = svc.B, svc.H, svc.device
+        S = B * H
+        NPOS, NBLK = svc.n_hist, svc.nblk
+        SB = slot_bits(NP)
+        P = k + N_TAIL
+        KP, PP, TP, ZP = max(_pow2(k), 2), max(_pow2(P), 2), max(_pow2(N_TAIL), 2), max(_pow2(NBLK), 64)
+        WB, WP = (NBLK + 31) // 32, (NPOS + 31) // 32
+        bias, sb, cis, rows_s, rows_c, _ = self._bias_args(l, sel)
+        key = (k, NP, bias, sb.dtype, cis.dtype)
+        if key in self._warmed:
+            return
+        dm = svc.dmirror
+        tabs = (dm.code[l], dm.block[l], dm.gen[l], dm.cur[l], dm.prot[l], dm.stamp[l])
+        R = int(sel.shape[1])
+        nw = self.num_warps
+
+        def z(*shape, dtype=torch.int64):                             # LANE_PAD spare elements, as _buf (fusedres2b)
+            n = 1
+            for s in shape:
+                n *= s
+            return torch.zeros((n + LANE_PAD,), dtype=dtype, device=dev)[:n].view(shape)
+        rowv = (z(1), z(1), z(1, N_TAIL), z(1), z(1))                 # (rb, hb, tails, nt, ix): never read (no row)
+        cnts = (z(B), z(B), z(1))                                     # (start, count, order) per batch slot: 0 rows
+        kid = z(max(R, 1))
+        err, stats = z(), z(NSTAT_LANES)
+        ne, rec, bne, brec, misc = z(1), z(1), z(1), z(1), z(4)
+        usg, usg2, usgd, post = z(S), z(S), z(S), z(4, S, NP)
+        tv, vpage, vnpg = z(len(FIELDS_V), 1), z(1, H, P), z(1, H)
+        page, npg = z(max(R, 1), H, P, dtype=torch.int32), z(max(R, 1), H, dtype=torch.int32)
+        ids, vrec, vcnt, cntv, vlook, vread = z(H, B, NPOS), z(len(VREC), 1), z(1), z(1), z(1, 4), z(B, H, WP)
+        selw, rowsel = z(B, H, WB), z(max(R, 1), H, WB)
+        td, dpage, dnpg, drec, dcnt, cntd4 = z(len(FIELDS), 1), z(1, H, P), z(1, H), z(len(DREC), 1), z(1), z(4)
+        _warm_depth[0] += 1
+        try:
+            _launch(_fr_v1, (S,), *tabs, sel, kid, rowv[4], rowv[1], *cnts, ne, rec, usg, err, cntv, vlook,
+                    H, R, k, NBLK, NPOS, svc.C, 1, 0, 0, KP=KP, NP=NP, LZ=LOOK_LANES, num_warps=nw)
+            _launch(_fr_scan, (1,), ne, rec, usg, bne, brec, misc, 0, S, svc.C, svc.X, 0, BLOCK=SCAN_BLOCK,
+                    num_warps=4)
+            self.warm_launches += 2
+            for last in (True, False):
+                _launch(_fr_v2, (S,), *tabs, sel, kid, rowv[4], rowv[1], rowv[2], rowv[3], *cnts,
+                        rowv[4], rowv[1], *cnts, ne, rec, bne, brec, misc,
+                        tv, vpage, vnpg, page, npg, ids, vrec, vcnt, cntv, vlook, vread, post, usg2, selw,
+                        rowsel, err, stats,
+                        H, B, R, k, NBLK, NPOS, svc.C, svc.X, 1, 1, 0, 0, 1, 1, S, WB, WP, N_TAIL, P,
+                        KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, PE_INFL=self.pe_inflight, LAST=last, PLANT=self.plant,
+                        NSTAT=len(STATS), SMUL=1 << SB, CMUL=1 << (STAMP_BITS + SB), SMASK=(1 << SB) - 1,
+                        num_warps=nw)
+                self.warm_launches += 1
+            for has_v in (True, False):
+                _launch(_fr_d1, (S,), *tabs, sel, kid, rowv[4], rowv[1], *cnts, post, usg2, ne, rec, usgd, err,
+                        cntd4, H, R, k, NBLK, NPOS, svc.C, 1, 0, S, 0, KP=KP, NP=NP, HAS_V=has_v, num_warps=nw)
+                _launch(_fr_d2, (S,), *tabs, sel, kid, rowv[4], rowv[1], *cnts, rowv[4], rowv[1], rowv[2], rowv[3],
+                        *cnts, post, ne, rec, bne, brec, misc, usgd,
+                        td, dpage, dnpg, page, npg, drec, dcnt, cntd4, selw, rowsel, err, stats, sb, cis,
+                        H, B, R, k, NBLK, NPOS, svc.C, 1, 1, 0, 0, 1, 1, S, WB, N_TAIL, P, svc.bs, rows_s, rows_c,
+                        KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, BSP=max(_pow2(svc.bs), 2), HAS_V=has_v, BIAS=bias,
+                        PLANT=self.plant, NSTAT=len(STATS), num_warps=nw)
+                self.warm_launches += 2
+        finally:
+            _warm_depth[0] -= 1
+        self._warmed.add(key)
 
     # ----------------------------------------------------------------------------------------------- check mode
     @staticmethod
@@ -1267,7 +1416,8 @@ class FusedResolver:
                     first_diff_at=list(self.diffs[0][:2]) if self.diffs else None, first_effective=first_eff,
                     stats=stats, gate={s: ("gated" if stats[s] > 0 else "NOT GATED") for s in GATE_STATS},
                     err=err_any, err_bits=[m for b, m in sorted(ERR_BITS.items()) if err_any & b],
-                    guard=self.guard, guard_checks=self.guard_checks, guard_hits=[list(x) for x in self.guard_hits],
+                    guard=self.guard, guard_checks=self.guard_checks, warm=self.warm, warmed=len(self._warmed),
+                    warm_launches=self.warm_launches, guard_hits=[list(x) for x in self.guard_hits],
                     compiled=compiled_variants())
 
 

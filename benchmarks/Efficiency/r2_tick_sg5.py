@@ -604,6 +604,27 @@ class _LazyOps:
         return self.impl.gather(l, dec)
 
 
+class _CloseOnError:
+    """[stack2] make_engine's guard: an exception inside the block closes the transport, then propagates. The gilfree
+    transport's feeder (background=True) is a thread whose target is a bound method of the transport, so the running
+    thread holds the transport and its store (eng.store_k / store_v): no `del` and no gc.collect() frees them until
+    close() ends the thread. A close() that raises is printed; the first exception propagates."""
+
+    def __init__(self, tp):
+        self.tp = tp
+
+    def __enter__(self):
+        return self.tp
+
+    def __exit__(self, et, ev, tb):
+        if et is not None:
+            try:
+                self.tp.close()
+            except Exception:                                    # noqa: BLE001 - the original exception wins
+                traceback.print_exc()
+        return False
+
+
 def cuda_event():
     import torch
     e = torch.cuda.Event()
@@ -688,39 +709,43 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
                               warm_up=getattr(a, "gilfree_warm_up", "on") == "on")              # [integ] gfw1f
     else:
         tp = GatherTransport(host_k, host_v, eng.store_k, eng.store_v, C + X, xpool=xp)          # [xpool] xp or None
-    gather = TorchGather(host_k, host_v, eng.store_k, eng.store_v)
-    args = (L, B, H, C, X, R_ver, tp, gather)
-    kw = dict(store_b=eng.store_bias, cis=cis, block_bytes=64 * 2 * eng.D * 2, host_wait=hw)
-    if xp is not None:                                                                           # [xpool]
-        kw["xpool"] = xp
-    if getattr(a, "arrival_lag", 0) > 0:                                                         # [xpool] review B1
-        kw["arrival_lag"] = a.arrival_lag
-    if kind == "v1":
-        svc = Residency(*args, **kw)
-    elif kind == "sb":
-        svc = ResidencySB(*args, device="cuda", nblk=n_host // 64, **kw)
-    elif kind == "b2":                                               # [b2] B2's table on the store's device; S-C's
-        from nosi.r2_own2 import OwnResidency                        # [b2] device path: CudaDeviceOps (the superset
-        lazy = _LazyOps()                                            # [b2] wait) behind _LazyOps, as sc
-        svc = OwnResidency(*args, device=eng.store_k[0].device, nblk=n_host // 64, devops=lazy,             # [b2]
-                           checked=bool(getattr(a, "b2_checked", False)),                                     # [b2]
-                           resolve=getattr(a, "b2_resolve", "torch"),                                         # [fusedres]
-                           fused_plant=int(getattr(a, "b2_fused_plant", 0)), **kw)                            # [fusedres2]
-        lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)       # [b2]
-    else:
-        lazy = _LazyOps()
-        svc = ResidencySC(*args, device="cuda", nblk=n_host // 64, devops=lazy, **kw)
-        lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)
-    eng.attach_backend(ResidencyBackend(eng, svc, host_k, host_v, cuda_event, a.K))
-    eng.timer = TickTimer(cuda=True)
-    if timer_cats is not None:                                       # BARE: the tick events only
-        base_span = eng.timer.span
-        import contextlib
+    # [stack2] a failure after the transport exists closes it: the gilfree feeder thread holds the store (job 386
+    # stack1a128: OwnResidency refused C + X 992 here, the thread kept the first engine, the gather arm built a second:
+    # preflight peak 82.97 GB). The exception still propagates.
+    with _CloseOnError(tp):
+        gather = TorchGather(host_k, host_v, eng.store_k, eng.store_v)
+        args = (L, B, H, C, X, R_ver, tp, gather)
+        kw = dict(store_b=eng.store_bias, cis=cis, block_bytes=64 * 2 * eng.D * 2, host_wait=hw)
+        if xp is not None:                                                                           # [xpool]
+            kw["xpool"] = xp
+        if getattr(a, "arrival_lag", 0) > 0:                                                         # [xpool] review B1
+            kw["arrival_lag"] = a.arrival_lag
+        if kind == "v1":
+            svc = Residency(*args, **kw)
+        elif kind == "sb":
+            svc = ResidencySB(*args, device="cuda", nblk=n_host // 64, **kw)
+        elif kind == "b2":                                               # [b2] B2's table on the store's device; S-C's
+            from nosi.r2_own2 import OwnResidency                        # [b2] device path: CudaDeviceOps (the superset
+            lazy = _LazyOps()                                            # [b2] wait) behind _LazyOps, as sc
+            svc = OwnResidency(*args, device=eng.store_k[0].device, nblk=n_host // 64, devops=lazy,             # [b2]
+                               checked=bool(getattr(a, "b2_checked", False)),                                     # [b2]
+                               resolve=getattr(a, "b2_resolve", "torch"),                                         # [fusedres]
+                               fused_plant=int(getattr(a, "b2_fused_plant", 0)), **kw)                            # [fusedres2]
+            lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)       # [b2]
+        else:
+            lazy = _LazyOps()
+            svc = ResidencySC(*args, device="cuda", nblk=n_host // 64, devops=lazy, **kw)
+            lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)
+        eng.attach_backend(ResidencyBackend(eng, svc, host_k, host_v, cuda_event, a.K))
+        eng.timer = TickTimer(cuda=True)
+        if timer_cats is not None:                                       # BARE: the tick events only
+            base_span = eng.timer.span
+            import contextlib
 
-        def span(cat):
-            return base_span(cat) if cat in timer_cats else contextlib.nullcontext()
-        eng.timer.span = span
-    return eng, svc, tp
+            def span(cat):
+                return base_span(cat) if cat in timer_cats else contextlib.nullcontext()
+            eng.timer.span = span
+        return eng, svc, tp
 
 
 def fused_gates(a, label, phase, rep):

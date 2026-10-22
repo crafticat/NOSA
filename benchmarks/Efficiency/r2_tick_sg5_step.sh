@@ -58,7 +58,7 @@
 #            Its ROOT is NOSI_X1 (nosi-r2-xpool); every other cell keeps NOSI (review m8)
 #   stack1a  [integ] THE FULL STACK (docs/R2_INTEG_PLAN.md) at p5b2's point, EXACT, B 64: --stack full --stack-compare
 #            --X-pool 64 --arrival-lag 2 --sel-check (arms none, full, none2; MUST _ST_replica / _ST_committed /
-#            _ST_bitwise), no --pool-baseline. ROOT NOSI_INTEG (nosi-r2-integ6 since integ6), as every stack1* cell.
+#            _ST_bitwise), no --pool-baseline. ROOT NOSI_INTEG (nosi-r2-stack2 since stack2), as every stack1* cell.
 #            [integ3] + --require-xregion; per arm MUST _ST_acted_<c> / _ST_off_<c> and _ST_xregion (review M2)
 #            [integ5] + --stack-role validate (the diagnostic witnesses ON)
 #   stack1a128 [integ5] stack1a at B 128 (--repeat-docs, --log-slots -1, --mem 200G): required before stack1b. Its
@@ -158,6 +158,26 @@
 # 4.80 GB: 74.11 GB <= 76 (B 196: 75.5; B 200: 76.6 > 76; B 216 with X 1512: 81.6). Headline lag 2 --bare: peak
 # 73-76 GB, T_tick 0.5-1.2 s (B 64's terms x 3), tok_per_s 140-335, REPORT; labelled "validated at B 64 (per-stream
 # reference) and B 128 (pool-only reference), not at 192". Gated on stack1a and stack1a128 (--validated-by).
+# REVISED in stack2 (2026-10-22T14:37:32Z, before any stack2 run; analysis/stack1/SCORING_stack1.md; ROOT
+# NOSI_INTEG = nosi-r2-stack2). Code changes: (1) the fused resolver's Policy E key holds the slot in max(9, log2 NP)
+# bits (MAX_NPOS 4096; 23b8a38's key bit for bit at NP <= 512); (2) make_engine closes the transport when the build
+# fails after it (the gilfree feeder thread held the first engine: stack1a128's 82.97 GB preflight); (3) no Triton
+# compile inside a timed tick: the fused kernels' row-list / selection pointers are not specialized, LZ and SCAN's
+# BLOCK are constants, and warm_up (fused resolve) / SharedKV.warm_up (rows_max 2 .. 4) compile every variant at the
+# engine's first resolve (an untimed first tick). The kernels changed, so stack1a reruns too (bitwise equality is per
+# build). The chain and every 23b8a38 MUST gate are unchanged. PREDICTIONS (run id stk2):
+#   stack1a     MUST: the 36 gates PASS as at 23b8a38. REPORT, registered: (a) the fused report's "compiled" counts
+#               after the stack round EQUAL those after its draft-only phase (no new variant inside the round;
+#               stack1a had 15 -> 32); (b) res max per tick < 2 s (was 39.06 s) and the stack arm's T_tick max < 3 s
+#               (was 42.41 s); (c) R_ST_tick 0.30-0.55 (the compile-free stack median 433.6 ms x the none arms'
+#               mean / median 1.17-1.30, over mean(none) about 1274 ms; the shared attention's median 71.9 ms vs 12.6 ms
+#               is NOT a compile and is not changed here): the 0.15-0.40 band of 5.4c stays the REPORT band, and a
+#               miss above it is EXPECTED (the falsifier reading of R_ST_tick is unchanged: none).
+#   stack1a128  MUST: SG5_preflight_gilfree_b2 PASS (C + X 992 <= 4096) and every stack1a gate at B 128 (5.4e).
+#               meta.preflight_peak_gb <= meta.peak_gb + 0.5 (one engine at a time; was 82.97 with no round); peak
+#               53.5-56 GB (5.4e, unchanged). REPORT: res per tick at NP 1024 (no band: first fused run above NP 512).
+#   stack1p, stack1t, stack1b: as registered in integ5 / integ6 (stack1b: peak 73-76 GB; bigb2 measured +1.33 GB
+#               over the model at X 1344, so about 75.4 GB, REPORT).
 #
 # REGISTERED for evalfast ([evalsplit], 2026-10-22T14:21:48Z, SOURCE ONLY, not run; derivation in
 # paper-notes/fast-eval-cells.md section 1.3; INFERENCE from bigb96x1344-198 (EXACT, 2.976 s mean / 1.669 s median
@@ -242,7 +262,7 @@
 set -u
 NOSI=/mnt/beegfs/ojerbi/nosi-r2-sg5-p6                                                   # ROOT (p6; [b2] p5b2: nosi-r2-m2-sg5-b2; p4sc64: -p4d; p4a: -p4c; p3: nosi-r2-m2-sg5)
 NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                                 # ROOT of cell x1 only ([xpool], review m8)
-NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-integ6                                             # ROOT of the stack1 cells only ([integ], integ6)
+NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-stack2                                             # ROOT of the stack1 cells only ([integ]; [stack2])
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
 NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-sg5par                                              # ROOT of the evalfast cell only [evalsplit] ([sg5par]: the per-holder claim)

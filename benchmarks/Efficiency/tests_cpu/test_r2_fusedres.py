@@ -40,6 +40,15 @@ FR8  THE KERNEL-TIME PARSER (r2_fusedres_prof.py, review M3) on synthetic Kineto
      (negative control); an orphan device event is counted; a trace without "t.tick" ranges is refused.
 FR9  THE SG5 FLAGS: --b2-fused-plant (hidden, 0 / 1 / 2, FR-g0p) and --b2-res-profile parse; make_engine passes the
      plant; one_point routes the draft-only phase through profile_draft_only.
+FR12 [stack2] C + X ABOVE 512 (job 386 stack1a128: "C + X = 992 > 512"): (a) slot_bits gives 23b8a38's key (2^56,
+     512, 511) up to NP 512 and an int64-safe key up to MAX_NPOS; (b) resolvers at C + X 992 and 1440 equal the torch
+     path at every layer, with Policy E victims in slots > 511 (precondition); (c) NEGATIVE CONTROL: the 9-bit field
+     (slot_bits forced to 9) differs at the first verify layer and nowhere before it.
+FR13 [stack2] NO COMPILE INSIDE A DECISION (job 386 stack1a: 17 variants compiled in the timed round): with fused_warm
+     'on', every launch's compile key (constexprs, num_warps, dtype / alignment / int class of the arguments not in
+     do_not_specialize) was launched by warm_up first; decisions, stats and launch counts equal the warm 'off' run.
+     NEGATIVE CONTROL: under 23b8a38's rule (ints-only do_not_specialize, LZ and SCAN BLOCK per tick) some real key
+     is new.
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA benchmarks/Efficiency/tests_cpu/test_r2_fusedres.py
 """
@@ -326,6 +335,145 @@ elif PART == "tick":
                        same_out=rt["out"] == rc["out"], same_stats=rt["stats"] == rc["stats"], fused=rc["fused"],
                        diffs=rc["diffs"], mirror=[rt["mirror"], rc["mirror"]],
                        first_rec_diff=next((i for i, (a, b) in enumerate(zip(rt["rec"], rc["rec"])) if a != b), None))
+
+elif PART == "wide":
+    # FR12 [stack2]: C + X above 512 (stack1a128 992 = C 96 + X 896, stack1b 1440 = C 96 + X 1344). Phase A: draft rows
+    # fill C slots per stream (slots 0 .. C - 1, LRU at C exactly: no K1 eviction). Phase B: draft rows read blocks
+    # 0 .. 511 again (touch: they go to the LRU's recent end). The cohort is decided. Phase C: one verify tick with 3
+    # new blocks per head at usage C: K5 grants X of them (the 2 FREE slots), the rest are refused, and Policy E evicts
+    # the least recent LRU candidates, which are in slots 512 .. C - 1. Fused == torch at every layer (check mode).
+    # Argument "old": slot_bits forced to 9 (23b8a38's key layout and mask) = the NEGATIVE CONTROL.
+    OWN = load("test_r2_own2_frwide", os.path.join(HERE, "test_r2_own2.py"))
+    TRM, OWN2 = OWN.TRM, OWN.OWN2
+    FR = TRM._load("r2_fusedres")
+    assert FR.triton is not None, "FR12 child: triton did not import"
+    Row, S_, Ev, L = TRM.Row, TRM.S, TRM.Ev, TRM.L
+    WIN = 127                                                   # + the tail entry: k 128 (KP 128)
+    TOUCH = 512                                                 # blocks 0 .. 511: slots 0 .. 511 after phase A
+
+    def wide(C, X, old=False):
+        hb = C + 16                                             # history bound: the new blocks C, C + 1, C + 2 < hb
+        TRM.NB = hb + 8                                         # world() sizes the host rows by the module's NB
+        if old:
+            FR.slot_bits = lambda np_: 9                        # NEGATIVE CONTROL: the 9-bit slot field at NP > 512
+        w = TRM.world(C=C, X=X, R_ver=2, cls=OWN2.OwnResidency,       # warm_up on (FR13 at the wide NP too)
+                      svc_kw=dict(nblk=TRM.NB, resolve="check", fused_warm="off" if old else "on"))
+        svc = w.svc
+        fr = svc.fusedres
+        uids = ("u0", "u1")
+        for b, u in enumerate(uids):
+            svc.begin_request(b, u)
+        tail = svc.tail0
+        ticks = []                                              # (phase, the draft / verify block list)
+        for x in range(0, C, WIN):
+            ticks.append(("A", list(range(x, min(x + WIN, C)))))
+        for x in range(0, TOUCH, WIN):
+            ticks.append(("B", list(range(x, min(x + WIN, TOUCH)))))
+        ticks.append(("C", [C, C + 1, C + 2]))
+        raised = raised_tick = None
+        ev_slots, take_slots, phase_c_tick = [], [], None
+        for t, (ph, blocks) in enumerate(ticks):
+            if ph == "C":
+                phase_c_tick = t
+                for u in uids:                                  # the draft cohort is decided before the verify tick
+                    svc.decided((u, 1, 1))
+            kind, key_m = ("v", 2) if ph == "C" else ("d", 1)
+            rows = [Row(b, kind, (u, 1, key_m), 1000 + t, hb, [(hb, tail)]) for b, u in enumerate(uids)]
+            sel = S_(*[[blocks + [hb], blocks + [hb]] for _ in uids])
+            try:
+                svc.poll()
+                for l in range(L):
+                    plan = svc.resolve(l, rows, sel)
+                    if ph == "C":                               # the fused decision (== torch's when no diff)
+                        vd = svc._tick[-1]["vdec"]
+                        ev = vd.t["evict"] != 0
+                        ev_slots += vd.t["take_slot"][ev].tolist()
+                        take_slots += vd.t["take_slot"][(vd.t["granted"] != 0)].tolist()
+                    svc.read_done(l, plan, Ev(True))
+                svc.end_tick()
+                TRM.land_all(w)
+            except Exception as e:                              # noqa: BLE001 - reported
+                raised, raised_tick = "%s: %s" % (type(e).__name__, str(e)[:200]), t
+                break
+        rep = fr.report()
+        return dict(C=C, X=X, old=old, n_hist=svc.n_hist, NP=max(FR._pow2(svc.n_hist), 64),
+                    sb=FR.slot_bits(max(FR._pow2(svc.n_hist), 64)), ticks=len(ticks), phase_c_tick=phase_c_tick,
+                    raised=raised, raised_tick=raised_tick, L=L, compared=fr.compared, layers=fr.layers,
+                    n_diffs=len(fr.diffs), diffs=[list(d) for d in fr.diffs[:8]], stats=rep["stats"],
+                    err=rep["err"], ev_slots=ev_slots, take_slots=take_slots, b2_applied=svc.b2_applied,
+                    warm_launches=rep["warm_launches"], warmed=rep["warmed"])
+    which = sys.argv[3]
+    if which == "old":
+        OUT["wide"] = wide(990, 2, old=True)
+    else:
+        n = int(which)
+        OUT["wide"] = wide(n - 2, 2)
+elif PART == "warm":
+    # FR13 [stack2]: every launch's compile key (Triton's: constexprs + num_warps, and for each argument NOT in
+    # do_not_specialize: a pointer's dtype and 16-byte alignment, an int's == 1 and % 16) is one that warm_up
+    # launched before it. The old rule (23b8a38: DNS_OLD, LZ = pow2(Rv * 4), BLOCK = pow2(max(R H, S))) is the
+    # NEGATIVE CONTROL: some real key is new under it.
+    import inspect
+    OWN = load("test_r2_own2_frwarm", os.path.join(HERE, "test_r2_own2.py"))
+    TRM, OWN2 = OWN.TRM, OWN.OWN2
+    FR = TRM._load("r2_fusedres")
+    assert FR.triton is not None, "FR13 child: triton did not import"
+
+    def p2(n):
+        return FR._pow2(int(n))
+
+    def ckey(kernel, args, kw, dns, old):
+        fn = getattr(kernel, "fn", kernel)
+        name = fn.__name__
+        params = list(inspect.signature(fn).parameters)
+        skip = set(dns[name])
+        spec = []
+        for p, v in zip(params, args):
+            if p in skip:
+                continue
+            if isinstance(v, torch.Tensor):
+                spec.append((p, str(v.dtype), v.data_ptr() % 16 == 0))
+            elif isinstance(v, bool):
+                spec.append((p, v))
+            elif isinstance(v, int):
+                spec.append((p, v == 1, v % 16 == 0))
+            else:
+                spec.append((p, repr(v)))
+        cx = dict(kw)
+        if old and name == "_fr_v1":
+            cx["LZ"] = min(256, max(p2(args[params.index("NLOOK")]), 2))
+        if old and name == "_fr_scan":
+            cx["BLOCK"] = min(FR.SCAN_BLOCK, max(p2(max(args[params.index("RH")], args[params.index("S")])), 2))
+        return [name, sorted((k, repr(v)) for k, v in cx.items()), spec]
+
+    LOG = []
+    orig_launch = FR._launch
+
+    def keyed(kernel, grid, *a, **k):
+        LOG.append((FR._warm_depth[0] > 0, json.dumps(ckey(kernel, a, k, FR.DNS, False)),
+                    json.dumps(ckey(kernel, a, k, FR.DNS_OLD, True))))
+        return orig_launch(kernel, grid, *a, **k)
+    FR._launch = keyed
+
+    def run(name, warm):
+        del LOG[:]
+        kw = OWN.SCHEDULES[name]()
+        bad, wv, wb = OWN._lockstep_b2(svc_kw=dict(resolve="check", fused_warm=warm), **kw)
+        fr = wb.svc.fusedres
+        rep = fr.report()
+        warm_new = {k for (w, k, _) in LOG if w}
+        warm_old = {o for (w, _, o) in LOG if w}
+        real = [(k, o) for (w, k, o) in LOG if not w]
+        miss_new = sorted({k for (k, _) in real if k not in warm_new})
+        miss_old = sorted({o for (_, o) in real if o not in warm_old})
+        return dict(n_bad=len(bad), bad=[repr(x)[:300] for x in bad[:3]], n_diffs=len(fr.diffs),
+                    diffs=[list(d) for d in fr.diffs[:5]], err=rep["err"], compared=fr.compared, layers=fr.layers,
+                    warm=rep["warm"], warmed=rep["warmed"], warm_launches=rep["warm_launches"],
+                    launches=rep["launches"], real=len(real), n_warm_keys=len(warm_new),
+                    miss_new=[json.loads(m)[0] for m in miss_new], miss_old=[json.loads(m)[0] for m in miss_old],
+                    trace=[[t, l, st, e] for (t, l, st, e) in fr.trace], b2_applied=wb.svc.b2_applied)
+    OUT["warm"] = {"%s-%s" % (n, wm): run(n, wm) for n in ("f12b", "f20b") for wm in ("on", "off")}
+    FR._launch = orig_launch
 print("FR_JSON " + json.dumps(OUT))
 '''
 
@@ -754,3 +902,100 @@ def test_FR11_the_frg_step_cells(tmp_path):
     assert "R2 SG5 frg: done; cells failed or refused 0; first MUST failure none" in r.stdout
     src = (ROOT / "benchmarks/Efficiency/r2_tick_sg5_step.sh").read_text()
     assert 'case $sub in frg1|frg3t) ctl=1 ;; *) ctl=0 ;; esac' in src            # the controls always run
+
+
+# =====================================================================================================================
+# FR12 [stack2] C + X above 512: Policy E's slot field (r2_fusedres.slot_bits), job 386 stack1a128's refusal
+# =====================================================================================================================
+def test_FR12a_the_slot_field_keeps_23b8a38s_key_up_to_512_and_never_overflows():
+    """SB 9 for NP <= 512: the multipliers and the mask are 23b8a38's literals (2^56, 512, 511), so the compiled V2 is
+    the same arithmetic there. Above 512 the field grows with NP and the largest legal key (class 2) stays below
+    2^63 up to MAX_NPOS. A resolver above MAX_NPOS is refused."""
+    if not _has_triton():
+        pytest.skip("triton is not installed")
+    FR = TRM._load("r2_fusedres")
+    for np_ in (64, 128, 256, 512):
+        sb = FR.slot_bits(np_)
+        assert (1 << sb, 1 << (FR.STAMP_BITS + sb), (1 << sb) - 1) == (512, 72057594037927936, 511), np_
+    assert [FR.slot_bits(n) for n in (1024, 2048, 4096)] == [10, 11, 12]
+    assert FR.MAX_NPOS >= 2048 + 96                                    # bigb's probe X 2048 at C 96 fits too
+    for n_hist in (992, 1440, 2048, FR.MAX_NPOS):
+        np_ = max(FR._pow2(n_hist), 64)
+        sb = FR.slot_bits(np_)
+        assert np_ - 1 < (1 << sb), n_hist                             # every slot index fits the field
+        top = 2 * (1 << (FR.STAMP_BITS + sb))                          # class 2, stamp 0, slot 0
+        legal = 1 * (1 << (FR.STAMP_BITS + sb)) + ((1 << FR.STAMP_BITS) - 1) * (1 << sb) + np_ - 1
+        assert legal < top < (1 << 63), n_hist                         # classes ordered, no int64 overflow
+        assert np_ - n_hist <= FR.LANE_PAD, n_hist                     # a masked NP lane stays in the pad
+    with pytest.raises(ValueError, match="C \\+ X = 4098 > 4096"):
+        TRM.world(C=4096, X=2, cls=OWN2.OwnResidency, svc_kw=dict(nblk=TRM.NB, resolve="fused"))
+
+
+@pytest.mark.parametrize("n_hist", [992, 1440])
+def test_FR12b_fused_equals_torch_with_policy_e_victims_above_slot_511(n_hist):
+    """A resolver at C + X = 992 (stack1a128) and 1440 (stack1b): every layer of every tick equals the torch path
+    (check mode), err 0, no raise. Preconditions (L34): Policy E evicted, and every victim's slot is > 511 (the slots
+    that the 9-bit field could not hold)."""
+    if not _has_triton():
+        pytest.skip("triton is not installed")
+    r = _child("wide", str(n_hist))["wide"]
+    assert r["n_hist"] == n_hist and r["NP"] == max(1024, 1 << (n_hist - 1).bit_length()) and r["sb"] > 9, r
+    assert r["raised"] is None, (r["raised"], r["raised_tick"])
+    assert r["compared"] == r["layers"] == r["ticks"] * r["L"], (r["compared"], r["layers"], r["ticks"])
+    assert r["stats"]["v_evict"] > 0 and r["ev_slots"], ("precondition: Policy E evicted", r["stats"])
+    assert min(r["ev_slots"]) > 511, ("precondition: victims above slot 511", r["ev_slots"])
+    assert r["n_diffs"] == 0, r["diffs"]
+    assert r["err"] == 0, r["err"]
+    assert r["b2_applied"] == r["ticks"], r["b2_applied"]
+    assert r["warmed"] >= 1 and r["warm_launches"] >= 8, (r["warmed"], r["warm_launches"])   # FR13 at this NP
+    print("FR12b C + X %d (NP %d, SB %d): %d layers equal; victims %s; grants %s"
+          % (n_hist, r["NP"], r["sb"], r["compared"], sorted(r["ev_slots"]), sorted(r["take_slots"])))
+
+
+def test_FR12c_the_old_9_bit_slot_field_is_caught_at_the_first_eviction():
+    """NEGATIVE CONTROL: slot_bits forced to 9 at C + X = 992 rebuilds 23b8a38's key and mask (slot & 511). Before the
+    verify tick no V2 runs (draft rows only), so the plant is not effective there and must not differ; at the verify
+    tick (victims above 511, FR12b's precondition) the check must differ at layer 0."""
+    if not _has_triton():
+        pytest.skip("triton is not installed")
+    r = _child("wide", "old")["wide"]
+    assert r["sb"] == 9 and r["NP"] == 1024, r
+    assert r["n_diffs"] > 0, ("the 9-bit slot field was not caught", r["stats"], r["ev_slots"])
+    assert r["diffs"][0][:2] == [r["phase_c_tick"], 0], (r["diffs"][0], r["phase_c_tick"])
+    assert any(d[2].startswith("v.t.") for d in r["diffs"]), r["diffs"]
+
+
+# =====================================================================================================================
+# FR13 [stack2] no compile inside a timed tick: every launch's compile key was warmed first (job 386 stack1a)
+# =====================================================================================================================
+@pytest.fixture(scope="module")
+def warmrun():
+    if not _has_triton():
+        pytest.skip("triton is not installed")
+    return _child("warm")["warm"]
+
+
+@pytest.mark.parametrize("sched", ["f12b", "f20b"])
+def test_FR13a_warm_up_covers_every_compile_key_and_changes_no_output(warmrun, sched):
+    """With fused_warm 'on', warm_up launches every variant of a selection width before the width's first decision:
+    every real launch's compile key (constexprs, num_warps, and the dtype / alignment / int class of each argument not
+    in do_not_specialize) is a key that warm_up launched. The run is unchanged: check mode equal at every layer, err 0,
+    the B2 world equal to v1, and the same per-layer stats trace as the run with warm 'off'."""
+    on, off = warmrun["%s-on" % sched], warmrun["%s-off" % sched]
+    for r in (on, off):
+        assert r["n_bad"] == 0 and r["n_diffs"] == 0 and r["err"] == 0, (r["bad"], r["diffs"], r["err"])
+        assert r["compared"] == r["layers"] > 0
+    assert on["warm"] is True and off["warm"] is False and off["warm_launches"] == 0
+    assert on["warmed"] >= 1 and on["warm_launches"] >= 8 and on["n_warm_keys"] >= 7, on   # V1 SCAN V2x2 D1x2 D2x2
+    assert on["real"] > 0 and on["miss_new"] == [], ("compiled inside a decision", on["miss_new"])
+    assert on["trace"] == off["trace"] and on["b2_applied"] == off["b2_applied"], "warm_up changed a decision"
+    assert on["launches"] == off["launches"]                          # warm_up's launches are not counted there
+
+
+def test_FR13b_the_old_variant_rule_compiles_inside_decisions(warmrun):
+    """NEGATIVE CONTROL: under 23b8a38's rule (ints only in do_not_specialize, so pointer alignment counts;
+    LZ = pow2(Rv * 4); SCAN BLOCK = pow2(max(R H, S))) the same launches have keys that warm_up never launched: the
+    detector sees the per-tick variants that compiled inside the stack1a round."""
+    miss = {s: warmrun["%s-on" % s]["miss_old"] for s in ("f12b", "f20b")}
+    assert any(miss.values()), miss
+    print("FR13b old rule: kernels with a key first seen inside a decision: %s" % miss)

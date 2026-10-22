@@ -253,7 +253,8 @@ def test_TB5_the_harness_b2_backend(p3):
     tree = ast.parse(src)
     me = ast.get_source_segment(src, next(n for n in tree.body if isinstance(n, ast.FunctionDef)
                                           and n.name == "make_engine"))
-    b2 = me[me.index('elif kind == "b2":'):me.index("    else:\n        lazy = _LazyOps()")]
+    b2 = me[me.index('elif kind == "b2":'):me.index("        else:\n            lazy = _LazyOps()")]   # [stack2] in the
+    #                                                                     _CloseOnError block (one indent deeper)
     for need in ("from nosi.r2_own2 import OwnResidency", "lazy = _LazyOps()", "device=eng.store_k[0].device",
                  "devops=lazy", 'checked=bool(getattr(a, "b2_checked", False))',
                  "lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)"):

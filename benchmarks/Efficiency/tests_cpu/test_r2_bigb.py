@@ -410,3 +410,174 @@ def test_BG9_harness_flags_and_the_step_cells(tmp_path):
         rb = subprocess.run(["bash", str(script), "--nosi", head.stdout.strip(), "417", "t1", *bad], env=env,
                             capture_output=True, text=True, timeout=120)
         assert rb.returncode == 2 and "usage" in rb.stderr, bad
+
+
+# =====================================================================================================================
+# BG10 [stack2] a failed engine build releases its engine (job 386 stack1a128: preflight peak 82.97 GB)
+# =====================================================================================================================
+class _FeederTp:
+    """GilfreeTransport's shape for this test: background=True starts a feeder thread whose target is a bound method
+    (the thread holds the transport, the transport holds the store); close() puts None and joins (BG10 pins the real
+    class's lines)."""
+    made = []                                                       # weak references: the test never keeps one alive
+
+    def __init__(self, ext, host_k, host_v, slots_k, slots_v, bs, D, threads=1, host_wait=None, background=False,
+                 xpool=None, warm_up=True, close_raises=False):
+        import queue
+        import threading
+        self.slots_k, self.slots_v, self.close_raises = slots_k, slots_v, close_raises
+        self._q = queue.Queue()
+        self._thread = threading.Thread(target=self._feeder, name="bg10-feeder", daemon=True)
+        self._thread.start()
+        _FeederTp.made.append(weakref.ref(self))
+
+    def _feeder(self):
+        while True:
+            if self._q.get() is None:
+                return
+
+    def close(self):
+        self._q.put(None)
+        self._thread.join()
+        if self.close_raises:
+            raise RuntimeError("bg10: close failed")
+
+
+def _bg10_world(G, monkeypatch, close_raises=False):
+    """Stand-in nosi modules for make_engine (the REAL function runs): from_r2 makes a store whose weak reference is
+    kept; OwnResidency raises job 386's error after the transport exists. Returns (a, cache, stores)."""
+    import types
+    stores = []
+
+    class Eng:
+        def __init__(self):
+            self.check, self.xpool, self.rebuild = False, None, "per_call"
+            self.B, self.L, self.H, self.D = 2, 1, 2, 4
+            self.store_k = [torch.zeros(2, 128, 2, 4)]
+            self.store_v = [torch.zeros(2, 128, 2, 4)]
+            self.store_bias = [torch.zeros(2, 128, 2)]
+            self.twins = [SimpleNamespace(total_cis=torch.zeros(2, 128, 2))]
+            stores.append(weakref.ref(self.store_k[0]))
+
+    class TickEngine:
+        @staticmethod
+        def from_r2(model, cache, st, ops, hist_slots, twin, **kw):
+            gc.collect()
+            stores_alive.append([r() is not None for r in stores])
+            return Eng()
+
+    class Refuse:
+        def __init__(self, *args, **kw):
+            raise ValueError("resolve='fused': C + X = 992 > 512")
+
+    class Stub:
+        def __init__(self, *args, **kw):
+            pass
+
+    class GatherTp:
+        def __init__(self, host_k, host_v, store_k, store_v, n_slots, bs=64, xpool=None):
+            self.store_k = store_k
+
+        def close(self):
+            pass
+    stores_alive = []
+
+    def mod(name, **attrs):
+        m = types.ModuleType(name)
+        m.__dict__.update(attrs)
+        monkeypatch.setitem(sys.modules, name, m)
+    pkg = types.ModuleType("nosi")
+    pkg.__path__ = []
+    monkeypatch.setitem(sys.modules, "nosi", pkg)
+    mod("nosi.r2_residency", Residency=Stub, TorchGather=Stub)
+    mod("nosi.r2_residency_sb", ResidencySB=Stub)
+    mod("nosi.r2_residency_sc", CudaDeviceOps=Stub, ResidencySC=Stub)
+    mod("nosi.r2_tick", ResidencyBackend=Stub, TickEngine=TickEngine, TickTimer=Stub,
+        run_round=lambda *a_, **k: None)                            # preflight imports it (never called here)
+    tp_cls = (lambda *a_, **k: _FeederTp(*a_, close_raises=True, **k)) if close_raises else _FeederTp
+    mod("nosi.r2_transport_gilfree", GilfreeTransport=tp_cls)
+    mod("nosi.r2_own2", OwnResidency=Refuse)
+    monkeypatch.setattr(G, "GatherTransport", GatherTp)
+    base = ["--out", "o", "--workload", "w", "--biattn", "b", "--gilfree", "g", "--gilfree-build", "/x"]
+    a = G.parse_args(base + ["--backends", "b2", "--b2-resolve", "fused", "--C", "96", "--X", "896"])
+    lay = SimpleNamespace(cache_engine=SimpleNamespace(_k_cpu=torch.zeros(2, 256, 2, 4),
+                                                       _v_cpu=torch.zeros(2, 256, 2, 4)))
+    return a, SimpleNamespace(layers=[lay]), stores, stores_alive
+
+
+def _bg10_build(G, a, cache):
+    """One make_engine call on the gilfree transport; returns the exception's text (no traceback is kept)."""
+    try:
+        G.make_engine(a, None, cache, None, None, "b2", 96, 896, 848, object(), transport="gilfree")
+    except Exception as e:                                         # noqa: BLE001 - the text only
+        return "%s: %s" % (type(e).__name__, e)
+    return None
+
+
+def _bg10_cleanup():
+    for r in _FeederTp.made:
+        tp = r()
+        if tp is not None and tp._thread.is_alive():
+            tp.close_raises = False
+            tp.close()
+    _FeederTp.made.clear()
+
+
+def test_BG10_a_failed_engine_build_closes_its_transport_and_frees_its_store(monkeypatch):
+    """job 386 stack1a128: OwnResidency raised after make_engine had built the store and started the gilfree feeder;
+    the feeder thread held the transport and the store, so the gather arm's engine was the second one alive (82.97 GB).
+    Now make_engine closes the transport on any exception after it exists (_CloseOnError): the store is collectable
+    and the same exception propagates. Through the real preflight (gilfree, then gather): the first store is gone when
+    the second engine is built. NEGATIVE CONTROL: _CloseOnError replaced by a guard that does not close keeps the
+    store alive (the detector sees the leak), in make_engine and in the preflight. A close() that raises does not
+    hide the build's exception. The real GilfreeTransport has the modelled shape (static)."""
+    G = TT._sg5_gate()
+    try:
+        a, cache, stores, alive = _bg10_world(G, monkeypatch)
+        msg = _bg10_build(G, a, cache)
+        assert msg == "ValueError: resolve='fused': C + X = 992 > 512", msg
+        gc.collect()
+        assert len(stores) == 1 and stores[0]() is None, "the failed engine's store is still alive"
+        assert all(r() is None for r in _FeederTp.made), "the transport (and its feeder thread) is still alive"
+        # the preflight: gilfree (MUST) then gather (REPORT), each build fails; the second build sees the first store
+        stores.clear()
+        alive.clear()
+        gates, res = [], {}
+        passed = G.preflight(a, None, cache, None, [0, 0], None, object(), gates, res)
+        assert passed == [] and len(stores) == 2 and alive == [[], [False]], (passed, alive)
+        assert [g["passed"] for g in gates] == [False, True] and "992 > 512" in gates[0]["detail"], gates
+
+        guard = G._CloseOnError
+
+        class NoClose(guard):                                      # NEGATIVE CONTROL: 23b8a38's behaviour
+            def __exit__(self, et, ev, tb):
+                return False
+        monkeypatch.setattr(G, "_CloseOnError", NoClose)
+        stores.clear()
+        alive.clear()
+        msg = _bg10_build(G, a, cache)
+        gc.collect()
+        assert msg is not None and stores[0]() is not None, "detector: the unclosed feeder must keep the store"
+        _bg10_cleanup()
+        gc.collect()
+        assert stores[0]() is None                                 # closing the feeder frees it (the mechanism)
+        stores.clear()
+        alive.clear()
+        G.preflight(a, None, cache, None, [0, 0], None, object(), [], {})
+        assert alive == [[], [True]], alive                        # 82.97 GB's shape: two engines alive
+        _bg10_cleanup()
+        monkeypatch.setattr(G, "_CloseOnError", guard)
+        # a close() that raises: the build's own exception still propagates
+        a2, cache2, stores2, _ = _bg10_world(G, monkeypatch, close_raises=True)
+        msg = _bg10_build(G, a2, cache2)
+        assert msg == "ValueError: resolve='fused': C + X = 992 > 512", msg
+    finally:
+        _bg10_cleanup()
+    src = (ROOT / "nosi/nosi/r2_transport_gilfree.py").read_text()
+    assert 'threading.Thread(target=self._feeder, name="gilfree-feeder", daemon=True)' in src
+    close = src[src.index("    def close(self) -> None:"):]
+    close = close[:close.index("\n    def ", 10)]                   # GilfreeTransport.close only
+    assert "self._q.put(None)" in close and "self._thread.join()" in close
+    me = inspect.getsource(G.make_engine)
+    assert me.index("tp = GilfreeTransport(") < me.index("with _CloseOnError(tp):") < me.index("OwnResidency(")
+    assert me.index("with _CloseOnError(tp):") < me.index("return eng, svc, tp")

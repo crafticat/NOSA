@@ -862,6 +862,14 @@ class SharedKV:
         self.by_rows_max = {}                             # [review MINOR-3] shared calls per rows_max (host ints)
         self.count_saved = False                          # [integ3] opt-in: pages_saved, a device counter (no read)
         self.pages_saved = None                           # sum over shared calls of (row pages - union pages)
+        # [stack2] warm: at the first call with a page_key (the tick's first layer, draft-only rows included), every
+        # rows_max variant 2 .. rows_max of the union kernel and the shared kernel is launched once on the call's first
+        # row (scratch outputs; stats untouched), so no variant is compiled inside a later (timed) tick. job 386
+        # stack1a: the variants of rows_max 2 and 3 were compiled inside the stack round (att max 3.1 s). auto = on
+        # for the kernel on a CUDA tensor
+        self.warm = "auto"
+        self.warm_calls = 0                               # warm-up launches of the shared side (one per rows_max)
+        self._warm_done = set()                           # (pps, page width, dtype, rows_max) warmed
 
     def _base(self, args, softmax_scale, pps, out=None, workspace=None):
         if self.impl == "reference":
@@ -897,6 +905,35 @@ class SharedKV:
             return build_union_fused_reference(seq_idx, page_table, num_pages, page_key, nr, pps, whole, groups=grow)
         return build_union_fused(seq_idx, page_table, num_pages, page_key, nr, pps, whole, groups=grow)
 
+    def _warm_on(self, q) -> bool:
+        if self.warm == "auto":
+            return self.impl == "kernel" and q.is_cuda
+        return self.warm == "on" and self.impl == "kernel"
+
+    def warm_up(self, args, page_key, softmax_scale, pps) -> None:
+        """[stack2] Launches the selected union build and the shared kernel (+ piece 3's combine) once for every
+        rows_max 2 .. self.rows_max on the call's FIRST row: the same tensors (views of row 0), dtypes, strides and
+        constexprs as a real call of that rows_max, so the same compiled variants. Outputs are fresh tensors that are
+        dropped; .stats, .by_rows_max, .union_builds, the group cache and pages_saved are not touched."""
+        q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len = args
+        if q.shape[0] == 0:
+            return
+        one = (q[:1], k_cache, v_cache, bias_cache, seq_idx[:1], page_table[:1], num_pages[:1], last_len[:1])
+        whole = self.mode == "whole"
+        for nr in range(2, self.rows_max + 1):
+            key = (int(pps), int(page_table.shape[2]), q.dtype, nr)
+            if key in self._warm_done:
+                continue
+            if self.union == "torch":
+                un = build_union(one[4], one[5], one[6], page_key[:1], nr, pps, whole)
+            else:
+                un = build_union_fused(one[4], one[5], one[6], page_key[:1], nr, pps, whole,
+                                       groups=build_groups(one[4], nr))
+            bi_paged_decode_shared(self.base, *one, page_key[:1], rows_max=nr, mode=self.mode,
+                                   softmax_scale=softmax_scale, pages_per_split=pps, union=un)
+            self._warm_done.add(key)
+            self.warm_calls += 1
+
     def _shared(self, args, page_key, nr, softmax_scale, pps, out=None, workspace=None, union=None):
         if union is None:                                 # [sharedkv4] always the selector's build (counted)
             union = self._build(args, page_key, nr, pps)
@@ -917,6 +954,8 @@ class SharedKV:
         pps = self.base.PAGES_PER_SPLIT if pages_per_split is None else pages_per_split
         nr = self.rows_max if rows_max is None else min(int(rows_max), self.rows_max)
         args = (q, k_cache, v_cache, bias_cache, seq_idx, page_table, num_pages, last_len)
+        if page_key is not None and self._warm_on(q):     # [stack2] before the first decision that could need one
+            self.warm_up(args, page_key, softmax_scale, pps)
         if page_key is None or nr <= 1:
             self.stats["base_no_key" if page_key is None else "base_single_row"] += 1
             return self._base(args, softmax_scale, pps, out=out, workspace=workspace)

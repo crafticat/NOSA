@@ -945,7 +945,7 @@ def test_ST8_the_step_cells_stack1(tmp_path):
                 assert word not in ln, (word, ln)
     lines = text.splitlines()
     root = next(ln for ln in lines if ln.startswith("NOSI_INTEG=")).split()[0][len("NOSI_INTEG="):]
-    assert root == "/mnt/beegfs/ojerbi/nosi-r2-integ6"                      # [integ6] the stack cells' ROOT
+    assert root == "/mnt/beegfs/ojerbi/nosi-r2-stack2"                      # [stack2] the stack cells' ROOT
     # [integ3] M3: the combined cell's order and its stop rules (static; a DRYRUN of it would recurse)
     blk = text[text.index('if [ "$CELL" = stack1 ]; then'):text.index("MODES=exact,fast")]
     order = [blk.index(s) for s in ("sub stack1a\n", 'sub "stack1n-$c"', "sub stack1a128", "sub stack1p",
@@ -1003,12 +1003,12 @@ def test_ST8_the_step_cells_stack1(tmp_path):
         got = line.split("r2_tick_sg5.py ", 1)[1].strip().replace("\\,", ",")
         xr = {"stack1a128": "--X 896 --R-ver 848", "stack1b": "--X 1344 --R-ver 1296"}.get(cell, "--X 64 --R-ver 16")
         for w in has + ["--modes exact --backends b2", xr, "--steps 48",
-                        "PYTHONPATH=/mnt/beegfs/ojerbi/nosi-r2-integ6/nosi"]:
+                        "PYTHONPATH=/mnt/beegfs/ojerbi/nosi-r2-stack2/nosi"]:
             assert w in got or w in line, (cell, w)
         for w in hasnt + ["--sweep ", "--variants", "--b2-checked", "--layout both"]:
             assert w not in got, (cell, w)
         assert "--job-name=sg5-t1-418-%s " % cell.replace("_", "-") in r.stdout and "cell %s" % cell in r.stdout
-        assert "[integ] root /mnt/beegfs/ojerbi/nosi-r2-integ6," in r.stdout
+        assert "[integ] root /mnt/beegfs/ojerbi/nosi-r2-stack2," in r.stdout
         pa = G.parse_args(got.split())
         assert pa.backends == ["b2"], cell
         if cell == "stack1n-layout":

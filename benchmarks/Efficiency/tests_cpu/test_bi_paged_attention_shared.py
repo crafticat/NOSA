@@ -359,6 +359,23 @@ if not (t.bits_equal(o1, ref) and t.bits_equal(o2, ref) and t.bits_equal(o3, ref
     fails.append(("selector-bits",))
 if sel.stats != dict(shared=1, base_no_key=1, base_single_row=1):
     fails.append(("selector-stats", sel.stats))
+if sel.warm_calls != 0:                                   # [stack2] auto: off on CPU tensors
+    fails.append(("warm-auto-on-cpu", sel.warm_calls))
+# [stack2] warm_up: the first keyed call (rows_max 1: piece 3) launches every rows_max 2 .. rows_max once; outputs and
+# every counter equal a selector without it; a later call does not warm again
+for un_kind in ("fused", "torch"):
+    sw = sk.SharedKV(bi, union=un_kind)
+    sw.warm = "on"
+    w1 = sw.bi_paged_decode(*t.args_of(c), page_key=c["key"], rows_max=1)
+    nw1 = sw.warm_calls
+    w2 = sw.bi_paged_decode(*t.args_of(c), page_key=c["key"], rows_max=4)
+    if not (t.bits_equal(w1, ref) and t.bits_equal(w2, ref)):
+        fails.append(("warm-bits", un_kind))
+    if nw1 != sw.rows_max - 1 or sw.warm_calls != nw1:
+        fails.append(("warm-calls", un_kind, nw1, sw.warm_calls))
+    if sw.stats != dict(shared=1, base_no_key=0, base_single_row=1) or sw.by_rows_max != {4: 1} \
+            or sw.union_builds != {"torch": int(un_kind == "torch"), "fused": int(un_kind == "fused")}:
+        fails.append(("warm-counters", un_kind, sw.stats, sw.by_rows_max, sw.union_builds))
 # NEGATIVE CONTROL on the KERNEL: one union page dropped; precondition: it is listed by some row; caught = the
 # listing rows differ, the others do not
 for mode in ("split", "whole"):
