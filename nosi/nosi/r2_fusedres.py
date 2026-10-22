@@ -74,6 +74,8 @@ changes every draft grant's take slot ("d_grant").
 Imports torch (and triton when it is installed). No `from __future__ import annotations`: the kernels' constexpr
 annotations must be objects.
 """
+import sys
+
 import torch
 
 try:                                                   # triton is needed only to launch the kernels; the reference
@@ -165,6 +167,10 @@ DNS = dict(_fr_scan=_INTS["_fr_scan"],
 LOOK_LANES = 256                                       # V1's zeroing chunk (23b8a38: min(256, pow2(Rv * 4)))
 WARM_MODES = ("auto", "on", "off")                     # auto: on for a CUDA service (the interpreter compiles nothing)
 _warm_depth = [0]                                      # > 0 while warm_up launches (tests tell its launches apart)
+# [oomfix] the first launch of _fr_v2 (NP 2048) grows the driver's local-memory pool (register spills, for every thread
+# the device can hold). The driver cannot take the blocks that torch's caching allocator holds, and torch does not free
+# them on a DRIVER failure (analysis/evalfast/DIAG_fused_check_oom.md). One empty_cache per process, before that launch.
+_LMEM_PREP = [False]
 
 
 def _jit_dns(name: str):
@@ -889,6 +895,7 @@ class FusedResolver:
         self.warm = warm == "on" or (warm == "auto" and torch.device(svc.device).type == "cuda")
         self._warmed = set()                               # the variant keys warm_up launched
         self.warm_launches = 0                             # warm_up's launches (not in self.launches)
+        self.warm_mem_gb = None                            # [oomfix] free GB before / after the process's first warm_up
         # [integ] the shared X pool (docs/R2_FUSEDRES_PLAN.md section 5, implemented): the kernels decide on LOGICAL
         # slots (I1-I5); the lanes are bound after V2 and after D2 (XPool.bind, torch ops), the draft bias rows go
         # through r2_xpool.draft_bias_fill_flat (D2 runs with BIAS 0), and the FREE slots' lanes are released after the
@@ -1267,6 +1274,12 @@ class FusedResolver:
         key = (k, NP, bias, sb.dtype, cis.dtype)
         if key in self._warmed:
             return
+        mem0 = None
+        if not _LMEM_PREP[0] and torch.device(dev).type == "cuda":   # [oomfix] once per process (the preflight:
+            torch.cuda.synchronize()                                 # untimed); later engines skip it
+            torch.cuda.empty_cache()
+            mem0 = torch.cuda.mem_get_info()[0]
+            _LMEM_PREP[0] = True
         dm = svc.dmirror
         tabs = (dm.code[l], dm.block[l], dm.gen[l], dm.cur[l], dm.prot[l], dm.stamp[l])
         R = int(sel.shape[1])
@@ -1317,6 +1330,10 @@ class FusedResolver:
                 self.warm_launches += 2
         finally:
             _warm_depth[0] -= 1
+        if mem0 is not None:                                         # [oomfix] free before - free after = the warm
+            torch.cuda.synchronize()                                 # launches' local memory + modules
+            self.warm_mem_gb = [round(mem0 / 1e9, 3), round(torch.cuda.mem_get_info()[0] / 1e9, 3)]
+            print("[oomfix] fused warm_up free GB before/after", self.warm_mem_gb, file=sys.stderr, flush=True)
         self._warmed.add(key)
 
     # ----------------------------------------------------------------------------------------------- check mode
@@ -1418,7 +1435,7 @@ class FusedResolver:
                     err=err_any, err_bits=[m for b, m in sorted(ERR_BITS.items()) if err_any & b],
                     guard=self.guard, guard_checks=self.guard_checks, warm=self.warm, warmed=len(self._warmed),
                     warm_launches=self.warm_launches, guard_hits=[list(x) for x in self.guard_hits],
-                    compiled=compiled_variants())
+                    warm_mem_gb=self.warm_mem_gb, compiled=compiled_variants())
 
 
 def compiled_variants():
