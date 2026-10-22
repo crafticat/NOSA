@@ -69,6 +69,11 @@ import r2_g0_gate as G0  # noqa: E402  (load_workload)
 import r2_g0bi_gate as GB  # noqa: E402  (decode_loop, load_by_path, free, gate)
 
 PARTS = ("SG0", "SG1", "SG2", "SG3", "SG4")
+# [bigemmc] --gemm choices and the modes whose SG0-SG3 equality gates are MUST (r2_bi_decode.EXACT_GEMM_MODES; test
+# BC-W3 keeps them equal). bi_c_strict = G-c strict against a NEW target reference (REF built with G-c too);
+# bi_c_bucket = the research arm: REPORT only.
+GEMMS = ("exact", "fast", "bi_c_strict", "bi_c_bucket")
+EXACT_GEMMS = ("exact", "bi_c_strict")
 ATTN_VARIANTS = ("per_row", "shared", "shared-whole", "probe", "probe-whole", "probe-plant")   # [sharedkv]
 ROOT = Path(HERE).resolve().parents[1]                                                          # [sharedkv]
 # [sharedkv] REGISTERED bands (docs/R2_SHAREDKV_PLAN.md section 5, revised after the review of f79d0df). Tiles: no
@@ -188,7 +193,7 @@ def parse_args(argv):
     ap.add_argument("--model", default=os.environ.get("NOSI_MODEL_PATH", ""))
     ap.add_argument("--workload", required=True)
     ap.add_argument("--biattn", required=True, help="piece 3's bi_paged_attention.py (a pinned copy; v2 7c826c1)")
-    ap.add_argument("--gemm", default="exact", choices=("exact", "fast"))
+    ap.add_argument("--gemm", default="exact", choices=GEMMS)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--S", type=int, default=16128)
     ap.add_argument("--deltas", default="0,1,17,63,64,65,777,4097")
@@ -271,7 +276,7 @@ def part_sg0(a, base, ref, gates, res):
     eq = torch.stack(eqs).cpu()                                            # (steps, B)
     nx = torch.stack(nxts).cpu()
     bad = (~eq).nonzero().tolist()
-    gates.append(GB.gate("SG0_engine_serial_equals_BI_serial", not bad, a.gemm == "exact",
+    gates.append(GB.gate("SG0_engine_serial_equals_BI_serial", not bad, a.gemm in EXACT_GEMMS,
                          "%d of %d (step, request) rows differ%s" % (len(bad), eq.numel(),
                                                                      "; first (step, request) %s" % bad[:4] if bad else "")))
     gates.append(GB.gate("SG0_control_next_position_differs", not bool(nx.any()), True,
@@ -449,7 +454,7 @@ def part_tick(a, base, ref, gates, res, forced, name=None, ready=None, eng_kw=No
         res[name] = dict(negative=negative, compared=len(cmp_idx), differ=len(bad), ticks=rnd.ticks, ties=ties)
         del eng
         return
-    must = a.gemm == "exact"
+    must = a.gemm in EXACT_GEMMS
     gates.append(GB.gate("%s_verify_rows_equal_BI_serial" % name, not bad and not wrong_in and cmp_idx, must,
                          "%d of %d compared verify rows differ (first (request, position) %s); %d rows with a non-REF "
                          "input in the teacher-forced run; %d not compared (past REF), %d off REF's path"

@@ -10,7 +10,8 @@ batch size, the row order or the neighbours. ONE DECODE STEP, per layer, the R2 
 with each op replaced or checked:
   1. rmsnorm (flashinfer, one program per row: microgate B1); wqkv through ops.linear, the GEMM mode being a run
      parameter: EXACT = G-b, r2_spec_core.PaddedLinear (cuBLAS at ONE row count m_fix; the decision of note 3.3);
-     FAST = natural cuBLAS (the weaker claim); bigemm = G-a by path (comparison only); nosa_linear (one Triton
+     FAST = natural cuBLAS (the weaker claim); bigemm = G-a by path (comparison only); bi_c_strict = G-c strict (opt-in,
+     a NEW target reference); bi_c_bucket = G-c research arm (opt-in, REPORT only); nosa_linear (one Triton
      program per row: B1); rope (flashinfer, per row: B1).
   2. twin.step with ops.mean = fixed_order_mean for the two summaries (31 elementwise adds in window order, then / 32):
      torch's .mean may choose its reduction strategy from the tensor shape, that is from B.
@@ -57,17 +58,27 @@ def fixed_order_mean(x: torch.Tensor, dim: int) -> torch.Tensor:
     return (acc / len(xs)).to(x.dtype)
 
 
-GEMM_MODES = ("exact", "fast", "bigemm")
+GEMM_MODES = ("exact", "fast", "bigemm", "bi_c_strict", "bi_c_bucket")
+# the modes whose GEMM rows are CLAIMED not to depend on M (their gates are MUST). bi_c_strict joins only as a NEW
+# target reference (r2-bigemmc; see bi_linear_c.REFERENCE_NOTE); bi_c_bucket is a research arm and never joins.
+EXACT_GEMM_MODES = ("exact", "bi_c_strict")
 
 
 class BIOps:
     """The BI ops of one run. attn: a module with bi_paged_decode and build_page_table (piece 3); m_fix: G-b's row
     count (>= every batch of the run). gemm, a RUN PARAMETER (lead, 2026-10-20):
       "exact"   G-b, r2_spec_core.PaddedLinear(m_fix) for wqkv, wo, gate_up, down and lm_head (the exact claim);
+                THE DEFAULT, unchanged;
       "fast"    natural cuBLAS (F.linear): the WEAKER claim, every non-GEMM op batch-invariant, the GEMM rows depend
                 on the row count (the gate reports the difference and classifies it by margin);
       "bigemm"  G-a, linear = the bigemm module's bi_linear (loaded by path; measured slower than G-b at the tick's
-                row mix, note 3.3; kept for comparison)."""
+                row mix, note 3.3; kept for comparison);
+      "bi_c_strict"  G-c STRICT (r2-bigemmc, bi_linear_c.bi_c_linear_strict: one Triton launch per weight shape for
+                every M). Opt-in. Its bits are NOT G-b's: a run in this mode uses G-c for its own BI serial reference
+                too, so it is a run against a NEW target reference (bi_linear_c.REFERENCE_NOTE), never a re-run of the
+                G-b results;
+      "bi_c_bucket"  RESEARCH ARM (bi_linear_c.bi_c_linear_bucket: launch chosen by M bucket; the relaxed law is NOT
+                approved). Opt-in; its gates are REPORT, never a contract claim."""
 
     def __init__(self, attn, m_fix: int, gemm: str = "exact", linear=None, linear_name: str = None,
                  mean=fixed_order_mean):
@@ -82,16 +93,28 @@ class BIOps:
         self.padded = PaddedLinear(m_fix)
         self.m_fix = self.padded.m_fix
         self.mode = gemm
-        self.linear = dict(exact=self.padded, fast=F.linear, bigemm=linear)[gemm]
+        self.gemm_c = None
+        if gemm in ("bi_c_strict", "bi_c_bucket"):
+            from . import bi_linear_c as BLC
+            variant = gemm[len("bi_c_"):]
+            self.gemm_c = BLC.describe(variant)
+            linear = dict(strict=BLC.bi_c_linear_strict, bucket=BLC.bi_c_linear_bucket)[variant]
+        self.linear = dict(exact=self.padded, fast=F.linear, bigemm=linear, bi_c_strict=linear,
+                           bi_c_bucket=linear)[gemm]
         self.gemm = dict(exact="EXACT: G-b PaddedLinear(m_fix=%d)" % self.m_fix, fast="FAST: natural cuBLAS F.linear",
-                         bigemm="G-a %s" % (linear_name or linear))[gemm]
+                         bigemm="G-a %s" % (linear_name or linear),
+                         bi_c_strict="G-c STRICT (NEW target reference)",
+                         bi_c_bucket="G-c BUCKET RESEARCH ARM (not a contract claim)")[gemm]
         self.mean = mean
 
     def describe(self) -> dict:
-        return dict(gemm=self.gemm, mode=self.mode, m_fix=self.m_fix, attn=getattr(self.attn, "__file__", repr(self.attn)),
-                    mean="fixed_order_mean" if self.mean is fixed_order_mean else repr(self.mean),
-                    selection="r2_spec_core.select_blocks (stable, ties to the lower block id)",
-                    f4="not reproduced: the tail page is cut at the row's own extent")
+        d = dict(gemm=self.gemm, mode=self.mode, m_fix=self.m_fix, attn=getattr(self.attn, "__file__", repr(self.attn)),
+                 mean="fixed_order_mean" if self.mean is fixed_order_mean else repr(self.mean),
+                 selection="r2_spec_core.select_blocks (stable, ties to the lower block id)",
+                 f4="not reproduced: the tail page is cut at the row's own extent")
+        if self.gemm_c is not None:
+            d.update(gemm_c=self.gemm_c)
+        return d
 
 
 def attach_bi(st, ops: BIOps):

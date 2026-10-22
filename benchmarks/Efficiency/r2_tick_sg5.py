@@ -74,7 +74,7 @@ import r2_g0_gate as G0  # noqa: E402  (load_workload)
 import r2_g0bi_gate as GB  # noqa: E402  (load_by_path, free, gate)
 
 BACKENDS = ("sc", "sb", "v1", "b2")                                                     # [b2] b2: OwnResidency
-MODES = ("exact", "fast")
+MODES = ("exact", "fast", "bi_c_strict", "bi_c_bucket")      # [bigemmc] G-c strict / research arm: opt-in only
 TRANSPORTS = ("gilfree", "gather")
 LAYOUTS = ("stream", "pool", "both")                                                    # [xpool]
 XPOOL_BACKENDS = ("sc", "b2")                                                           # [xpool] S-C's device path
