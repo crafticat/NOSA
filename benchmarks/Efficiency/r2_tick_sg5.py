@@ -62,6 +62,11 @@ STEADY tok/s = committed / (ticks x the median (and mean) tick), SEPARATELY (hum
 (the headline) and from the instrumented round (REPORT); prefill and engine build excluded. MUST EF_headline_fast,
 EF_bare_<label> (the bare round committed B (steps - 1) tokens), EF_mem_cap (meta.peak_gb <= --mem-cap-gb),
 EF_accuracy_record; REPORT R_EF_<label> and R_EF_bands (--eval-bands against the headline).
+[hostfix] THE HOST FIXES (analysis/evalfast/DIAG_tick_host.md section 4; each OPT-IN, each default the old path):
+--host-profile (item 0: host sub-timers per tick, HOST_PROF_CATS; the gilfree feeder's Python time; gc.callbacks;
+per point draft_only_host_profile / host_profile / bare_host_profile), --gc-freeze (item 1: round_guard), --lean-time
+(item 2, b2: LEAN_DROPPED), --wait-index (item 3, b2: r2_residency_sc.InflightByLayer), --b2-fewer-reads (item 5,
+b2: OwnResidency(fewer_reads=True)). No flag changes a decision, a page table or a logit (tests_cpu/test_r2_hostfix.py).
 OUTPUT: --out/summary.json (after every run). The last stdout line is R2_TICK_SG5_DONE failed=<n>; exit = n (2 =
 refused). ENVIRONMENT: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0, NOSI_POOL_BLOCKS = 0 (the parent; a child sets its own).
 """
