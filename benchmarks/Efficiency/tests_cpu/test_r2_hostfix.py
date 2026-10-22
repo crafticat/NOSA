@@ -398,9 +398,12 @@ def test_HF2d_the_harness_wiring():
     assert G.parse_args(base).lean_time is False and G.witness_on(G.parse_args(base)) is True
     for bad in (["--lean-time"], ["--backends", "sc", "--lean-time"],
                 ["--backends", "b2", "--X", "64", "--lean-time", "--stack", "full", "--stack-compare",
-                 "--arrival-lag", "2"]):
+                 "--arrival-lag", "2", "--sel-check", "--X-pool", "64"]):   # (only the lean rule refuses it)
         with pytest.raises(SystemExit):
             G.parse_args(base + bad)
+    ok = G.parse_args(base + ["--backends", "b2", "--X", "64", "--stack", "full", "--stack-compare", "--arrival-lag",
+                              "2", "--sel-check", "--X-pool", "64"])      # the same cell without --lean-time parses
+    assert ok.stack_compare and not ok.lean_time
     me = inspect.getsource(G.make_engine)
     assert 'lean=bool(getattr(a, "lean_time", False))' in me and "eng.xpool.witness = witness_on(a)" in me
     assert len(G.LEAN_DROPPED) == 6 and 'lean_dropped=list(LEAN_DROPPED)' in inspect.getsource(G.main)
@@ -865,5 +868,6 @@ def test_HF1c_the_harness_wiring():
     for need in ("gc.collect()", "gc.freeze()", "gc.disable()", "gc.unfreeze()", "gc.enable()",
                  'rec.setdefault("gc_freeze", {})[tag] = frz'):
         assert need in src, need
-    assert src.index("gc.freeze()") < src.index("yield gcl") < src.index("gc.unfreeze()")
+    y = src.index("yield gcl")                                        # (the docstring names the calls too)
+    assert src.rindex("gc.freeze()") < y < src.index("gc.unfreeze()", y)
     assert src.index("gc.callbacks.remove(gcl)") < src.index('frz["collected_after"] = gc.collect()')

@@ -547,6 +547,8 @@ class OwnResidency(ResidencySparse):
             self._landed.discard(tr.seq)
             if not self.lean:                                         # [hostfix] --lean-time: 4.8 / 4.3 REPORT only
                 self.metrics.arrived(tr, None, tr.requester in self.cancelled)
+            elif tr.requester in self.cancelled:                      # (the cheap count of Metrics.arrived is kept)
+                self.metrics.arrivals_after_cancel += 1
         self._changed()
         if self.checked:
             pc = O.post_checks(T, None, 0, which=("I1", "I2", "I3"))
@@ -830,7 +832,8 @@ class OwnResidency(ResidencySparse):
             # predicates' ONE read. Nothing is written between here and the old reads below (the victims' and the 4.8
             # counts: the writes start after them), so the values are the ones those reads give; a refusal event's
             # take slot is read too and never used
-            f_all = ev["s"] * G.NPOS + ev["take_slot"]
+            f_all = ev["s"] * G.NPOS + ev["take_slot"].clamp(0, G.NPOS - 1)   # (a refusal's sentinel stays in
+            #                                                         its stream; a take's slot is in range already)
             ext = [ev[n] for n in ("kind", "l", "b", "h", "part", "j", "src")]
             ext += [T.flat(n)[f_all] for n in ("code", "block", "rd_last")]
             if not self.lean:
