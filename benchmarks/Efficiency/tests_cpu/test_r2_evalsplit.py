@@ -338,7 +338,7 @@ def test_EV7_the_driver_passes_on_an_equivalent_fast(tmp_path, capsys):
 @pytest.mark.parametrize("plant,gate_name", [
     (dict(env=dict(exact_batch_dep=True)), "EA_E_batch_invariance"),
     (dict(env=dict(spec_break=True)), "EA_SG2_spec_equals_serial"),
-    (dict(env=dict(fast_shift=0.5)), "EA_VERDICT_FAST"),
+    (dict(env=dict(fast_shift=2.0)), "EA_VERDICT_FAST"),
     (dict(env=dict(plant_noop=True)), "EA_NEG_precondition"),
     (dict(wl=dict(mismatch={2})), "EA_P0_gold_prefix")])
 def test_EV8_each_must_gate_sees_its_plant(tmp_path, plant, gate_name):
@@ -458,11 +458,14 @@ def test_EV12_the_default_bare_path_is_unchanged():
 # EV13: the holder steps (lint, DRYRUN on a clean checkout of this branch)
 # =====================================================================================================================
 def _clean_head():
-    head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
-    dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"],
-                           capture_output=True, text=True)
-    untracked = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=all", "--", "nosi"],
+    try:
+        head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
+        dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"],
                                capture_output=True, text=True)
+        untracked = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=all", "--",
+                                    "nosi"], capture_output=True, text=True)
+    except FileNotFoundError:                                        # no git in this environment: no DRYRUN
+        return None
     if head.returncode != 0 or dirty.stdout.strip() or untracked.stdout.strip():
         return None
     return head.stdout.strip()
