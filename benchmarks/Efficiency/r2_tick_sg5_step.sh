@@ -88,6 +88,15 @@
 #            steps, --repeat-docs (B > 94 documents), --log-slots -1 (the round's size), --skip-shipped (no shipped
 #            child: its pinned rows would need 145-273 GiB of host memory), no --pool-baseline, no sweep, --mem 200G.
 #            Its ROOT is NOSI_BIGB (nosi-r2-bigb); run B 128 before B_max at each C.
+#   evalfast [evalsplit] EVAL CELL (a), the FAST TIMING HEADLINE (human decision part 3, 2026-10-22;
+#            paper-notes/fast-eval-cells.md): the R2 engine end to end at the steady-baseline workload (pg19-test-c16k,
+#            S 16128, B 216 = mb1's batch, --repeat-docs, the 84 GB device cap) with natural cuBLAS in draft and verify
+#            rows: --modes fast --backends b2 --C 96 --X 1512 --R-ver 1464 (X sized 7 per request, integ6's rule) --layout
+#            pool --X-pool 1512 --arrival-lag 2 --bare --variants fused/batched,torch/per_call (the headline first; the
+#            second is bigb2's measured path) --log-slots -1 --skip-shipped (the baseline is mb1 on the same GPU, a
+#            separate cell of nosi-r2-mbase) --eval-role fast-time --mem-cap-gb 84 --accuracy-record = eval cell (b)'s
+#            summary.json of the same run id and holder (r2_evalacc_step.sh cell evalacc; a refusal, exit 2, without
+#            it) --eval-bands 55:125:30:70:27:65. 48 steps, --mem 240G. ROOT NOSI_EVAL (nosi-r2-evalsplit)
 #   STEP_MIN 120 in every cell above.
 #   [fusedres2] the FR-g cells of docs/R2_FUSEDRES_PLAN.md section 7 (p5b2's point: --modes exact,fast --backends b2
 #   --C 96 --X 64 --R-ver 16, no sweep, gilfree 8 threads, unchecked), with NOSI = FRNOSI (the fusedres2 worktree)
@@ -137,6 +146,17 @@
 # 4.80 GB: 74.11 GB <= 76 (B 196: 75.5; B 200: 76.6 > 76; B 216 with X 1512: 81.6). Headline lag 2 --bare: peak
 # 73-76 GB, T_tick 0.5-1.2 s (B 64's terms x 3), tok_per_s 140-335, REPORT; labelled "validated at B 64 (per-stream
 # reference) and B 128 (pool-only reference), not at 192". Gated on stack1a and stack1a128 (--validated-by).
+#
+# REGISTERED for evalfast ([evalsplit], 2026-10-22T14:21:48Z, SOURCE ONLY, not run; derivation in
+# paper-notes/fast-eval-cells.md section 1.3; INFERENCE from bigb96x1344-198 (EXACT, 2.976 s mean / 1.669 s median
+# tick, 4,554 committed in 35 ticks, wall 114.1 s), the B slope 0.0127 s per request and p5b2's FAST - EXACT -4.4 %):
+#   EF-STEADY-MED  steady tok/s (median tick) 83, band [55, 125]
+#   EF-STEADY-MEAN steady tok/s (mean tick) 46, band [30, 70]
+#   EF-EFF         effective tok/s 42, band [27, 65]
+#   EF-MEM         meta.peak_gb 81.6 (integ6 model) + 1.33 (bigb2's measured offset) = 82.9 <= 84 (MUST EF_mem_cap)
+#   EF-RATIO       steady (mean) / mb1 on the same GPU (mean step) about 0.014, band [0.008, 0.025] (scored by hand)
+#   FALSIFIER      steady (mean) > 140 or < 15 tok/s; MODEL check: steady (median) >= the same-GPU baseline would mean
+#                  the implementation reached the model's Q (SCORING_bigc.md section 5: 3,703.5 MODEL); predicted NOT
 #
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
@@ -213,6 +233,8 @@ NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                        
 NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-integ6                                             # ROOT of the stack1 cells only ([integ], integ6)
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
+NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-evalsplit                                           # ROOT of the evalfast cell only [evalsplit]
+EVALACC_OUT=/mnt/beegfs/ojerbi/r2-runs/evalacc                                           # ROOT (r2_evalacc_step.sh's OUTROOT)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -238,7 +260,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -252,6 +274,7 @@ for w in "$@"; do
         frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg) [ -z "$CELL" ] || usage; CELL=$w ;;          # [fusedres2]
         stack1|stack1a128|stack1p|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup)
             [ -z "$CELL" ] || usage; CELL=$w ;;                                                  # [integ3]
+        evalfast) [ -z "$CELL" ] || usage; CELL=$w ;;                                            # [evalsplit]
         *) usage ;;
     esac
 done
@@ -334,6 +357,7 @@ BIGB=                                                       # is the same array:
 BIGBARG=()                                                  # [bigb] the bigb cells only
 DTICKS=12                                                   # [fusedres2] --draft-ticks (p3's in every cell but frg*);
 FRARG=()                                                    # the frg* cells' extra flags in FRARG
+EVALARG=()                                                  # [evalsplit] the evalfast cell only
 case $CELL in
     "") ;;                                                  # the default: p3's arguments
     p4a) SWEEP_RUN= ; SUFFIX=_p4a ;;                        # the six points; --sweep left out (its default "": none)
@@ -381,6 +405,12 @@ case $CELL in
             frg3) STEPS=8 ; POOLB=() ; FRARG=(--b2-resolve fused --b2-res-profile) ; STEP_MIN=60 ;;
             frg3t) STEPS=8 ; POOLB=() ; FRARG=(--b2-resolve torch --b2-res-profile) ; STEP_MIN=90 ;;
         esac ;;
+    evalfast) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_evalfast   # [evalsplit]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched,torch/per_call
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
+                 --eval-role fast-time --mem-cap-gb 84
+                 --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
+                 --eval-bands 55:125:30:70:27:65) ;;
 esac
 MIN_LEFT=$((STEP_MIN * 60 + 600))                           # [fusedres2] after the cell's STEP_MIN
 VARIANTARG=()                                               # [batched-rebuild] no --variants in every other cell
@@ -432,6 +462,12 @@ if [ -n "$BIGB" ]; then                                     # [bigb] the pool la
         git -C "$NOSI" rev-parse -q --verify "$NSHA:$f" > /dev/null || stop "$f is not tracked at $NSHA (cell $BIGB)"
     done
 fi
+if [ "${#EVALARG[@]}" -gt 0 ]; then                         # [evalsplit] the eval modules, tracked at the pinned commit
+    for f in benchmarks/Efficiency/r2_evalacc.py nosi/nosi/r2_xpool.py benchmarks/Efficiency/bigb_core.py \
+             nosi/nosi/r2_twin_fused.py; do
+        git -C "$NOSI" rev-parse -q --verify "$NSHA:$f" > /dev/null || stop "$f is not tracked at $NSHA (cell $CELL)"
+    done
+fi
 case $CELL in frg*)                                         # [fusedres2] the fused resolve and its profile parser
     for f in nosi/nosi/r2_fusedres.py benchmarks/Efficiency/r2_fusedres_prof.py; do
         git -C "$NOSI" rev-parse -q --verify "$NSHA:$f" > /dev/null || stop "$f is not tracked at $NSHA"
@@ -478,7 +514,8 @@ ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) sr
       --workload "$WL" --biattn "$ATTN_MOD" --gilfree "$GF_DIR" --gilfree-build "$JIT/gilfree_build"
       --threads "$THREADS" --transport "$TRANSPORT" --batch "$BATCH" --S 16128 --steps "$STEPS" --K 3 --LAMBDA 7 --modes "$MODES"
       --backends "$BACKENDS" --C "$PC" --X "$PX" --R-ver "$PRV" "${SWEEPARG[@]}" --sweep-steps 24 --draft-ticks "$DTICKS" --shipped-steps 24
-      "${POOLB[@]}" --preflight-steps 4 "${VARIANTARG[@]}" "${XPOOLARG[@]}" "${BIGBARG[@]}" "${STACKARG[@]}" "${FRARG[@]}")
+      "${POOLB[@]}" --preflight-steps 4 "${VARIANTARG[@]}" "${XPOOLARG[@]}" "${BIGBARG[@]}" "${STACKARG[@]}" "${FRARG[@]}"
+      "${EVALARG[@]}")
 if [ "$DRY" = 1 ]; then
     echo "R2 SG5 step: DRYRUN (nothing claimed, written or launched); pins OK: nosi $NSHA blob $blob workload $WL_SHA gpu_uuid $GPU_UUID ($UFILE)"
     echo "R2 SG5 step: piece 3 $BIATTN_SHA:$BIATTN_PATH blob $BIATTN_BLOB -> $ATTN_MOD; packer $GF_SHA:$GF_PY blob $GF_PY_BLOB, $GF_CPP blob $GF_CPP_BLOB -> $GF_DIR; transport $TRANSPORT; cell ${CELL:-default}"
@@ -486,6 +523,7 @@ if [ "$DRY" = 1 ]; then
     [ -z "$XPOOL" ] || echo "R2 SG5 step: [xpool] root $NOSI, layout both (stream, pool, stream2), X_pool $XPOOL, arrival lag 2; k5 rule NOSI_POOL_BLOCKS = C + 4 - 64 + X_pool / 64 = $((PC + 4 - 64 + XPOOL / 64))"
     [ "${#STACKARG[@]}" -eq 0 ] || echo "R2 SG5 step: [integ] root $NOSI, batch $BATCH, step memory $MEMG, stack arguments ${STACKARG[*]}"
     [ -z "$BIGB" ] || echo "R2 SG5 step: [bigb] root $NOSI, cell $BIGB: layout pool, C $PC, B $BATCH, X_pool 64, arrival lag 2, $STEPS steps, token log sized (-1), no shipped child, mem $MEMG"
+    [ "${#EVALARG[@]}" -eq 0 ] || echo "R2 SG5 step: [evalsplit] root $NOSI, batch $BATCH, step memory $MEMG, variants $VARIANTS, eval arguments ${EVALARG[*]}"
     echo "R2 SG5 step: nosi root $NOSI; STEP_MIN $STEP_MIN; MIN_LEFT $MIN_LEFT s"                   # [fusedres2]
     printf '%q ' "${ARGV[@]}"
     echo
@@ -526,8 +564,9 @@ printf 'biattn=%s:%s blob=%s packer=%s py=%s cpp=%s threads=%s transport=%s swee
     "${SWEEP_RUN:-none}" "$SPLITS" "${CELL:-default}" "$MODES" "$BACKENDS" "$PC" "$PX" "$PRV" "$EQ_POOL" "${VARIANTS:-none}" \
     "${XPOOL:-none}" "$BATCH" "$STEPS" "$MEMG" "${STACKARG[*]:-none}" >> "$REC/command.txt" ||
     stop "cannot write $REC (sg5_active stays)"
-printf 'nosi_root=%s step_min=%s steps=%s draft_ticks=%s frarg=%s\n' "$NOSI" "$STEP_MIN" "$STEPS" "$DTICKS" \
-    "${FRARG[*]:-none}" >> "$REC/command.txt" || stop "cannot write $REC (sg5_active stays)"          # [fusedres2]
+printf 'nosi_root=%s step_min=%s steps=%s draft_ticks=%s frarg=%s evalarg=%s\n' "$NOSI" "$STEP_MIN" "$STEPS" \
+    "$DTICKS" "${FRARG[*]:-none}" "${EVALARG[*]:-none}" >> "$REC/command.txt" ||
+    stop "cannot write $REC (sg5_active stays)"                                                     # [fusedres2]
 "${ARGV[@]}" < /dev/null > "$REC/stdout.txt" 2> "$REC/stderr.txt"
 rc=$?
 ok=1

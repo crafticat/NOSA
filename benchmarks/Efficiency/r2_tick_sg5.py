@@ -53,6 +53,15 @@ log_slots_for the round) | N; --skip-shipped (opt-in: no shipped child, a REPORT
 and one_point now release the round (a TickRound holds its engine) with the engine, so no two engines coexist (before:
 the preflight's first engine lived while the second was built: p5b2's 67.49 GB peak was two engines). REPORTS:
 meta.build_peak_gb, meta.preflight_peak_gb, each point's peak_gb_cum, meta.log_slots.
+[evalsplit] EVAL CELL (a), THE FAST TIMING HEADLINE (human decision part 3, 2026-10-22; opt-in --eval-role fast-time):
+the R2 engine end to end with natural cuBLAS (FAST) in draft and verify rows, timed only when the accuracy record of
+eval cell (b) (r2_evalacc.py: FAST vs EXACT EQUIVALENT, every MUST gate passed) exists: --accuracy-record (a refusal,
+exit 2, otherwise). Needs --modes fast[,...] (the first point is the headline), --backends b2, --layout pool, --bare,
+--mem-cap-gb > 0; no --stack, no sweep. Per point "eval": EFFECTIVE tok/s = committed / the round's wall clock and
+STEADY tok/s = committed / (ticks x the median (and mean) tick), SEPARATELY (human, 2026-10-21), from the bare round
+(the headline) and from the instrumented round (REPORT); prefill and engine build excluded. MUST EF_headline_fast,
+EF_bare_<label> (the bare round committed B (steps - 1) tokens), EF_mem_cap (meta.peak_gb <= --mem-cap-gb),
+EF_accuracy_record; REPORT R_EF_<label> and R_EF_bands (--eval-bands against the headline).
 OUTPUT: --out/summary.json (after every run). The last stdout line is R2_TICK_SG5_DONE failed=<n>; exit = n (2 =
 refused). ENVIRONMENT: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0, NOSI_POOL_BLOCKS = 0 (the parent; a child sets its own).
 """
@@ -217,6 +226,14 @@ def parse_args(argv):
     ap.add_argument("--skip-shipped", action="store_true",                                       # [bigb]
                     help="no shipped child (T_shipped None, ratio None; a REPORT gate says so); not with "
                          "--pool-baseline")
+    ap.add_argument("--eval-role", default="", choices=("", "fast-time"),                     # [evalsplit]
+                    help="fast-time: eval cell (a), the FAST timing headline (module docstring); default: none")
+    ap.add_argument("--accuracy-record", default="",                                           # [evalsplit]
+                    help="eval cell (b)'s summary.json (r2_evalacc.py): FAST vs EXACT EQUIVALENT, every MUST passed")
+    ap.add_argument("--mem-cap-gb", type=float, default=0.0,                                   # [evalsplit]
+                    help="the declared device memory cap (GB = 1e9 B, max allocated): MUST EF_mem_cap")
+    ap.add_argument("--eval-bands", default="",                                                # [evalsplit]
+                    help="SMED_LO:SMED_HI:SMEAN_LO:SMEAN_HI:EFF_LO:EFF_HI tok/s: REPORT R_EF_bands on the headline")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -303,6 +320,22 @@ def parse_args(argv):
         ap.error("--log-slots: 0 (the engine's default), -1 (log_slots_for) or a positive size")
     if a.skip_shipped and a.pool_baseline:                                                       # [bigb]
         ap.error("--skip-shipped runs no shipped child, so no --pool-baseline either")
+    a.eval_bands_v = None                                                                        # [evalsplit]
+    if a.eval_role == "fast-time":
+        if a.modes[0] != "fast" or a.backends != ["b2"] or a.layout != "pool" or not a.bare or a.mem_cap_gb <= 0 \
+                or not a.accuracy_record or a.stack or a.stack_compare or a.sweep_pts:
+            ap.error("--eval-role fast-time: --modes fast[,...] (the headline first), --backends b2, --layout pool, "
+                     "--bare, --mem-cap-gb > 0 and --accuracy-record; no --stack, --stack-compare or --sweep")
+        if a.eval_bands:
+            try:
+                v = [float(x) for x in a.eval_bands.split(":")]
+            except ValueError:
+                v = []
+            if len(v) != 6 or not all(v[i] < v[i + 1] for i in (0, 2, 4)):
+                ap.error("--eval-bands SMED_LO:SMED_HI:SMEAN_LO:SMEAN_HI:EFF_LO:EFF_HI (each LO < HI)")
+            a.eval_bands_v = v
+    elif a.accuracy_record or a.mem_cap_gb or a.eval_bands:
+        ap.error("--accuracy-record, --mem-cap-gb and --eval-bands need --eval-role fast-time")
     a.log_slots_n = resolve_log_slots(a)                                                         # [bigb]
     return a
 
@@ -758,6 +791,77 @@ def check_validated(paths):                                                     
     return out
 
 
+def check_accuracy_record(path):                                                               # [evalsplit]
+    """[evalsplit] Eval cell (a)'s evidence: r2_evalacc.check_record (FAST vs EXACT EQUIVALENT, every MUST passed).
+    SystemExit ("REFUSED ...") otherwise; the harness exits 2 before any build."""
+    import r2_evalacc
+    return r2_evalacc.check_record(path)
+
+
+def _rates(committed, ticks, tick_stats, wall_s, source):                                       # [evalsplit]
+    if not ticks or not tick_stats or not committed:
+        return None
+    med, mean = tick_stats.get("median"), tick_stats.get("mean")
+    return dict(source=source, committed=committed, ticks=ticks, wall_s=wall_s, tick_ms_median=med, tick_ms_mean=mean,
+                steady_tok_s_median=(committed / (ticks * med / 1e3)) if med else None,
+                steady_tok_s_mean=(committed / (ticks * mean / 1e3)) if mean else None,
+                effective_tok_s=(committed / wall_s) if wall_s else None)
+
+
+def eval_metrics(p):                                                                           # [evalsplit]
+    """[evalsplit] A point's throughput, EFFECTIVE and STEADY SEPARATELY (human, 2026-10-21): steady = committed /
+    (ticks x the median or mean tick: no out-of-tick time), effective = committed / the round's wall clock (every
+    tick, first-use compiles and the host time between ticks; prefill and the engine build excluded). headline = the
+    bare round (tick events only), instrumented = the per-op-event round (REPORT)."""
+    br = p.get("bare_round") or {}
+    rs = (p.get("round") or {}).get("device_ms", {}).get("tick")
+    return dict(headline=_rates(br.get("committed"), br.get("ticks"), p.get("bare_T_tick"), br.get("wall_s"),
+                                "bare round (tick events only)"),
+                instrumented=_rates(p.get("committed"), p.get("ticks"), rs, p.get("wall_s"),
+                                    "instrumented round (per-op events)"))
+
+
+def eval_gates(a, meta, res, gates):                                                           # [evalsplit]
+    """[evalsplit] The gates of --eval-role fast-time (module docstring)."""
+    pts = res.get("points") or []
+    head = pts[0] if pts else {}
+    gates.append(GB.gate("EF_headline_fast", str(head.get("gemm", "")).startswith("FAST"), True,
+                         "the headline point's GEMM: %s" % head.get("gemm")))
+    want = a.batch * (a.steps - 1)
+    for p in pts:
+        lab = p.get("label") or "%s_%s" % (p.get("gemm", "?")[:4], p.get("rebuild"))
+        p["eval"] = eval_metrics(p)
+        br = p.get("bare_round") or {}
+        gates.append(GB.gate("EF_bare_%s" % lab, br.get("committed") == want, True,
+                             "the bare round committed %s tokens (B (steps - 1) = %d) in %s ticks"
+                             % (br.get("committed"), want, br.get("ticks"))))
+        h, ins = p["eval"]["headline"], p["eval"]["instrumented"]
+
+        def fmt(x):
+            return "none" if not x else ("steady %.2f tok/s (median tick) / %.2f (mean tick); effective %.2f tok/s"
+                                         % (x["steady_tok_s_median"] or 0, x["steady_tok_s_mean"] or 0,
+                                            x["effective_tok_s"] or 0))
+        gates.append(GB.gate("R_EF_%s" % lab, True, False, "HEADLINE (bare): %s | instrumented: %s"
+                             % (fmt(h), fmt(ins))))
+    peak = meta.get("peak_gb")
+    gates.append(GB.gate("EF_mem_cap", peak is not None and peak <= a.mem_cap_gb, True,
+                         "peak allocated %s GB vs the declared cap %g GB" % (peak, a.mem_cap_gb)))
+    gates.append(GB.gate("EF_accuracy_record", bool(meta.get("accuracy_record")), True,
+                         "FAST timed under the accuracy record %s" % (meta.get("accuracy_record") or {}).get("path")))
+    if a.eval_bands_v is not None:
+        h = (head.get("eval") or {}).get("headline")
+        v = a.eval_bands_v
+        if not h:
+            text = "no headline rates"
+        else:
+            parts = [("steady_median", h["steady_tok_s_median"], v[0], v[1]),
+                     ("steady_mean", h["steady_tok_s_mean"], v[2], v[3]),
+                     ("effective", h["effective_tok_s"], v[4], v[5])]
+            text = "; ".join("%s %.2f in [%g, %g]: %s" % (n, x or 0, lo, hi, "IN" if x is not None and lo <= x <= hi
+                                                            else "OUT") for n, x, lo, hi in parts)
+        gates.append(GB.gate("R_EF_bands", True, False, text))
+
+
 def headline_tick_ms(p):                                                                        # [integ5]
     """[integ5] A point's headline T_tick: the --bare round's tick mean (no per-category events) when present, else
     the instrumented round's."""
@@ -1092,7 +1196,13 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
         eng, svc, tp = make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=("tick",),
                                    layout=layout)
         try:
-            run_round(eng, first, [steps] * eng.B, K=a.K, LAMBDA=a.LAMBDA)
+            tb = time.time()
+            rb = run_round(eng, first, [steps] * eng.B, K=a.K, LAMBDA=a.LAMBDA)
+            if getattr(a, "eval_role", ""):                          # [evalsplit] the headline's own counts
+                torch.cuda.synchronize()
+                info["bare_round"] = dict(ticks=rb.ticks, committed=sum(len(r.out) - 1 for r in rb.reqs),
+                                          wall_s=round(time.time() - tb, 3))
+            del rb                                                   # (it holds the engine)
             bs = summarize(eng.timer.report())
             info["bare_T_tick"] = bs["device_ms"].get("tick")
         finally:
@@ -1374,6 +1484,13 @@ def main(argv=None) -> int:
         except SystemExit as e:
             print(str(e), file=sys.stderr)
             return 2
+    acc_rec = None
+    if a.eval_role == "fast-time":                                   # [evalsplit] the accuracy evidence, before any work
+        try:
+            acc_rec = check_accuracy_record(a.accuracy_record)
+        except SystemExit as e:
+            print(str(e), file=sys.stderr)
+            return 2
     try:
         os.makedirs(a.out)
         gates, res = [], {}
@@ -1436,6 +1553,11 @@ def main(argv=None) -> int:
                     b2_resolve=a.b2_resolve, shipped_batch=a.shipped_batch or a.batch,
                     sharedkv=a.sharedkv if a.attn != "per_row" else None)
         meta.update(stack_base=a.stack_base if a.stack_compare else None)                        # [integ6]
+        if a.eval_role:                                                                        # [evalsplit]
+            meta.update(eval_role=a.eval_role, accuracy_record=acc_rec, mem_cap_gb=a.mem_cap_gb,
+                        eval_bands=a.eval_bands_v,
+                        eval_note="FAST (natural cuBLAS) in draft and verify rows; accuracy equivalence from the "
+                                  "record, at its scope (batch / GPU); bitwise claims are EXACT's (G-c strict) cells")
         meta.update(stack_role=a.stack_role or None, validated_by=validated, free_arm=a.free_arm,   # [integ5]
                     witness=witness_on(a), validated_note=(None if a.stack_role != "time" else
                     "bitwise equality proven at the validated cells' B and lag only (see validated_by)"))
@@ -1481,6 +1603,8 @@ def main(argv=None) -> int:
                                 pt = point(a, model, cache, st, first, ops, kind, a.C, a.X, a.R_ver, ext, a.steps,
                                            T_shipped, gates, label, bare=a.bare)
                             pt["twin"], pt["rebuild"] = variant                                # [batched-rebuild]
+                            if a.eval_role:                                                    # [evalsplit]
+                                pt["label"] = label
                             res["points"].append(pt)
                             if a.free_arm:                         # [integ5] REPORT: free arrival, after the headline
                                 import copy
@@ -1509,6 +1633,8 @@ def main(argv=None) -> int:
         meta["peak_gb"] = round(max(_PEAK[0], torch.cuda.max_memory_allocated()) / 1e9, 2)     # [xpool] resets
         if a.stack_bands_v is not None:                                                        # [integ3] M3
             write_stack_bands(a, meta, res, gates)
+        if a.eval_role == "fast-time":                                                         # [evalsplit]
+            eval_gates(a, meta, res, gates)
         save()
         for g in gates:
             print("%s %s %s: %s" % ("GATE" if g["must"] else "REPORT", g["name"], "PASS" if g["passed"] else "FAIL",
