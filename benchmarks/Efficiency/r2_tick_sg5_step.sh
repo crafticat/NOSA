@@ -109,6 +109,20 @@
 #            separate cell of nosi-r2-mbase) --eval-role fast-time --mem-cap-gb 84 --accuracy-record = eval cell (b)'s
 #            summary.json of the same run id and holder (r2_evalacc_step.sh cell evalacc; a refusal, exit 2, without
 #            it) --eval-bands 55:125:30:70:27:65. 48 steps, --mem 240G. ROOT NOSI_EVAL (nosi-r2-evalsplit)
+#            [hostfix] ROOT NOSI_EVAL is nosi-r2-hostfix now (its defaults keep evalfast's path; the stack2 fixes are in)
+#   evalfast2  [hostfix] evalfast with the HOST FIXES (analysis/evalfast/DIAG_tick_host.md section 4, fixes 0-2) and
+#            the FUSED resolver: evalfast's point, pool layout, cap, accuracy record and steps, but --variants
+#            fused/batched only, --b2-resolve fused, --host-profile --gc-freeze --lean-time, its own --eval-bands
+#   evalfast2t [hostfix] evalfast2 with --b2-resolve torch (evalfast's resolver): the host fixes alone, so the resolver
+#            change and the host fixes are scored apart (evalfast -> evalfast2t: host fixes; evalfast2t -> evalfast2:
+#            the resolver)
+#   evalfast2c [hostfix] the PRECONDITION of evalfast2: the fused resolver EQUALS the torch one at this scale (C + X 1608,
+#            NP 2048, B 216): --b2-resolve check (fused, and the torch path compared field by field at every layer:
+#            MUST <label>_draft_only_fused_equal / _round_fused_equal), --modes fast (the timing cells' decision
+#            inputs), the same point and layout, --variants fused/batched, 8 steps, --draft-ticks 4, no --bare, no
+#            eval role; run it BEFORE evalfast2
+#            The three: ROOT NOSI_EVAL, --mem 240G, STEP_MIN 120. Not in them (the lead's flag list): --wait-index and
+#            --b2-fewer-reads (items 3 and 5, opt-in, CPU-tested; one word each to add)
 #   STEP_MIN 120 in every cell above.
 #   [fusedres2] the FR-g cells of docs/R2_FUSEDRES_PLAN.md section 7 (p5b2's point: --modes exact,fast --backends b2
 #   --C 96 --X 64 --R-ver 16, no sweep, gilfree 8 threads, unchecked), with NOSI = FRNOSI (the fusedres2 worktree)
@@ -190,6 +204,42 @@
 #   FALSIFIER      steady (mean) > 140 or < 15 tok/s; MODEL check: steady (median) >= the same-GPU baseline would mean
 #                  the implementation reached the model's Q (SCORING_bigc.md section 5: 3,703.5 MODEL); predicted NOT
 #
+# REGISTERED for evalfast2t / evalfast2 / evalfast2c ([hostfix], STAMP <date -u, written by the lead when queuing>,
+# SOURCE ONLY, not run). Derivation: analysis/evalfast/DIAG_tick_host.md sections 1.3, 1.4, 4 and 4.1 (INFERRED ranks,
+# not measured one by one) on the MEASURED evalfast record (sg5_ev1_2192143_evalfast, nova05: fused/batched TWIN with
+# the TORCH resolver; bare tick median 771.62 / mean 946.75 ms, 215.68 / 175.79 / 137.26 tok/s steady median / steady
+# mean / effective; 10,152 committed in 61 ticks = 166.43 per tick; res span 395.8 ms median, residual 379.8 ms
+# median; mean - median 175.1 ms) and the stack1b fused res median 1213.1 ms at NP 2048, B 192 (SCORING_stack2.md,
+# nova07; cross-GPU, cross-arm: INFERRED grade). tok/s = 166.43 / tick s. Bands are wide on purpose: every saving below
+# is INFERRED.
+#   HF-T-MED   evalfast2t steady tok/s (median tick): point 250, band [220, 300]. Tick median 771.6 - (lean: looks 40-80
+#              on a verify tick, metrics dicts 20-50, memory samples / witness / draft_refused 5-15) - (GC young-
+#              generation passes 5-20) = 610-700 ms, point 665 ms
+#   HF-T-MEAN  evalfast2t steady tok/s (mean tick): point 230, band [195, 290] (the mean also loses the GC spikes:
+#              100-175 ms on the mean if the 2-6 s ticks are collections)
+#   HF-T-EFF   evalfast2t effective tok/s: point 175, band [140, 220] (61 x the mean tick + 14-16 s outside the ticks)
+#   HF-T-GC    evalfast2t bare tick mean / median <= 1.12 (evalfast 1.227) with gc_freeze.bare.collections_in_phase
+#              all 0. FALSIFIER: >= 1.20 with no collection in the phase means the spikes are NOT cyclic GC
+#   HF-T-HOST  REPORT (bare_host_profile, median per tick): h_hs_looks < 2 ms (lean); h_hs_takes 60-200, h_poll_arrivals
+#              50-150, h_superset_wait 20-100, h_et_issue 15-40, h_b2_ops 20-60 ms; the feeder's Python time 30-90 ms
+#              per tick. Reading rule: if h_hs_takes + h_poll_arrivals + the feeder < 100 ms median, fix 4 (array-backed
+#              transfers) is NOT the next lever
+#   HF-T-FALS  FALSIFIER of the host fixes: evalfast2t steady (median) < 216 (no gain over evalfast's 215.68) or > 340
+#   HF-F-MED   evalfast2 steady tok/s (median tick): point 105, band [75, 150]. Tick median = evalfast2t's 665 - the
+#              torch res span 396 + the fused res 1200-1400 (stack1b's 1213 at NP 2048 with 384 programs; 432 here,
+#              both 4 waves of 108 SMs) = 1470-1670 ms
+#   HF-F-MEAN  evalfast2 steady tok/s (mean tick): point 95, band [65, 145]
+#   HF-F-EFF   evalfast2 effective tok/s: point 85, band [55, 130]
+#   HF-F-FALS  FALSIFIER of the "fused is about 3x slower per unit of work at NP 2048" reading (DIAG 2.2): evalfast2
+#              steady (median) ABOVE evalfast2t's (the fused resolver faster than torch at this scale)
+#   HF-C       evalfast2c MUST: <label>_draft_only_fused_equal and <label>_round_fused_equal PASS (0 differences, every
+#              layer compared), _fused_err PASS. FALSIFIER: a difference: fused is NOT equal to torch at C + X 1608, and
+#              evalfast2's fused timing has no equality precondition (score it VOID, keep evalfast2t)
+#   HF-MEM     evalfast2t meta.peak_gb 83.2 +- 0.5 <= 84 (MUST EF_mem_cap; evalfast 83.19: the flags change no device
+#              allocation); gc_freeze.*.cuda_freed_gb_by_collect <= 0.1 (no CUDA tensor kept in a cycle). evalfast2:
+#              <= 84 (MUST), no point (the fused resolver's own temporaries). FALSIFIER: EF_mem_cap fails
+#   evalfast2 / evalfast2t eval bands (R_EF_bands, REPORT): the HF-*-MED / -MEAN / -EFF bands above
+#
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
 #        _k5_report) names the per-layer demand (first misses needing a shared extra, free extras at the tick start,
@@ -265,7 +315,7 @@ NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                        
 NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-stack2                                             # ROOT of the stack1 cells only ([integ]; [stack2])
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
-NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-sg5par                                              # ROOT of the evalfast cell only [evalsplit] ([sg5par]: the per-holder claim)
+NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-hostfix                                             # ROOT of the evalfast* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes)
 EVALACC_OUT=/mnt/beegfs/ojerbi/r2-runs/evalacc                                           # ROOT (r2_evalacc_step.sh's OUTROOT)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
@@ -292,7 +342,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -307,6 +357,7 @@ for w in "$@"; do
         stack1|stack1a128|stack1p|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup)
             [ -z "$CELL" ] || usage; CELL=$w ;;                                                  # [integ3]
         evalfast) [ -z "$CELL" ] || usage; CELL=$w ;;                                            # [evalsplit]
+        evalfast2|evalfast2t|evalfast2c) [ -z "$CELL" ] || usage; CELL=$w ;;                     # [hostfix]
         *) usage ;;
     esac
 done
@@ -443,6 +494,19 @@ case $CELL in
                  --eval-role fast-time --mem-cap-gb 84
                  --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
                  --eval-bands 55:125:30:70:27:65) ;;
+    evalfast2|evalfast2t) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_$CELL   # [hostfix]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched
+        if [ "$CELL" = evalfast2 ]; then RES=fused ; BANDS=75:150:65:145:55:130
+        else RES=torch ; BANDS=220:300:195:290:140:220
+        fi
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
+                 --eval-role fast-time --mem-cap-gb 84
+                 --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
+                 --eval-bands "$BANDS" --b2-resolve "$RES" --host-profile --gc-freeze --lean-time) ;;
+    evalfast2c) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_evalfast2c       # [hostfix]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
+                 --b2-resolve check) ;;
 esac
 MIN_LEFT=$((STEP_MIN * 60 + 600))                           # [fusedres2] after the cell's STEP_MIN
 VARIANTARG=()                                               # [batched-rebuild] no --variants in every other cell
@@ -507,7 +571,7 @@ if [ -n "$BIGB" ]; then                                     # [bigb] the pool la
 fi
 if [ "${#EVALARG[@]}" -gt 0 ]; then                         # [evalsplit] the eval modules, tracked at the pinned commit
     for f in benchmarks/Efficiency/r2_evalacc.py nosi/nosi/r2_xpool.py benchmarks/Efficiency/bigb_core.py \
-             nosi/nosi/r2_twin_fused.py; do
+             nosi/nosi/r2_twin_fused.py nosi/nosi/r2_fusedres.py; do                  # [hostfix] + the fused resolve
         git -C "$NOSI" rev-parse -q --verify "$NSHA:$f" > /dev/null || stop "$f is not tracked at $NSHA (cell $CELL)"
     done
 fi

@@ -25,6 +25,10 @@ adversarial transport, S-C's CPU device stand-in) with B2 (OwnResidency) as the 
        --lean-time equals lean; the consumer's host reads per tick are never more and fewer in total (counted on the
        CPU stand-in); the host pin rounds and recency round count equal rank_in_group's on random rows; NEGATIVE
        CONTROL: merged pin rounds differ from the default.
+  HF6  the step cells evalfast2 / evalfast2t / evalfast2c of r2_tick_sg5_step.sh: ROOT NOSI_EVAL = nosi-r2-hostfix,
+       the REGISTERED block (every tag, the bands = the cells' --eval-bands), and on a clean checkout of this ROOT the
+       DRYRUN of each cell (and of evalfast, unchanged) parsed by the harness into the registered flags; a wrong cell
+       word is refused (usage, exit 2).
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA benchmarks/Efficiency/tests_cpu/test_r2_hostfix.py
 """
@@ -34,6 +38,8 @@ import contextlib
 import gc
 import importlib.util
 import inspect
+import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -735,6 +741,122 @@ def test_HF5f_the_harness_wiring():
     assert inspect.signature(OWN2.OwnResidency.__init__).parameters["fewer_reads"].default is False
     assert inspect.signature(OWN2.O.pins_or).parameters["rounds"].default is None
     assert inspect.signature(OWN2.O.recency).parameters["n_rounds"].default is None
+
+
+# =====================================================================================================================
+# HF6 the step cells evalfast2 / evalfast2t / evalfast2c (static, then a DRYRUN on a clean checkout of this ROOT)
+# =====================================================================================================================
+REPO = HERE.parents[2]
+STEP = EFF / "r2_tick_sg5_step.sh"
+HF_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-hostfix"
+
+
+def test_HF6a_the_cells_and_the_registration_static():
+    text = STEP.read_text()
+    lines = text.splitlines()
+    root = next(ln for ln in lines if ln.startswith("NOSI_EVAL=")).split()[0][len("NOSI_EVAL="):]
+    assert root == HF_ROOT
+    assert "evalfast|evalfast2|evalfast2t|evalfast2c] [gilfree|gather]" in text                  # the usage line
+    assert "        evalfast2|evalfast2t|evalfast2c) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
+    reg = text[text.index("# REGISTERED for evalfast2t / evalfast2 / evalfast2c"):]
+    reg = reg[:reg.index("\n#\n")]
+    for tag in ("HF-T-MED", "HF-T-MEAN", "HF-T-EFF", "HF-T-GC", "HF-T-HOST", "HF-T-FALS", "HF-F-MED", "HF-F-MEAN",
+                "HF-F-EFF", "HF-F-FALS", "HF-C", "HF-MEM", "STAMP <date -u"):
+        assert tag in reg, tag
+    # the registered bands are the cells' --eval-bands (SMED_LO:SMED_HI:SMEAN_LO:SMEAN_HI:EFF_LO:EFF_HI)
+    assert "point 250, band [220, 300]" in reg and "point 230, band [195, 290]" in reg and "point 175, band [140, 220]" in reg
+    assert "point 105, band [75, 150]" in reg and "point 95, band [65, 145]" in reg and "point 85, band [55, 130]" in reg
+    blk = text[text.index("    evalfast2|evalfast2t) MODES=fast"):text.index("    evalfast2c) MODES=fast")]
+    assert "RES=fused ; BANDS=75:150:65:145:55:130" in blk and "RES=torch ; BANDS=220:300:195:290:140:220" in blk
+    for word in ("awk", "perl", "python3", " bc ", "node "):
+        for ln in lines:
+            if not ln.lstrip().startswith("#"):
+                assert word not in ln, (word, ln)
+
+
+def _clean_head():
+    try:
+        head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True)
+        dirty = subprocess.run(["git", "-C", str(REPO), "status", "--porcelain", "--untracked-files=no"],
+                               capture_output=True, text=True)
+        untracked = subprocess.run(["git", "-C", str(REPO), "status", "--porcelain", "--untracked-files=all", "--",
+                                    "nosi"], capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    if head.returncode != 0 or dirty.stdout.strip() or untracked.stdout.strip():
+        return None
+    return head.stdout.strip()
+
+
+def _dry(tmp_path, cell):
+    uid = "33cfb929-315c-8d27-5622-1169affb7e04"
+    (tmp_path / "418.gpu_uuid").write_text(uid + "\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_"))}
+    env.update(SG5_HOLDERS=str(tmp_path), DRYRUN="1")
+    return subprocess.run(["bash", str(STEP), "--nosi", _clean_head(), "418", "t1", cell], env=env,
+                          capture_output=True, text=True, timeout=180)
+
+
+HF_CELLS = dict(
+    evalfast2=dict(has=["--b2-resolve fused", "--eval-bands 75:150:65:145:55:130", "--bare", "--eval-role fast-time",
+                        "--host-profile --gc-freeze --lean-time", "--steps 48", "--draft-ticks 12",
+                        "--accuracy-record /mnt/beegfs/ojerbi/r2-runs/evalacc/eacc_t1_418_evalacc/summary.json",
+                        "--mem-cap-gb 84"],
+                   hasnt=["torch/per_call", "--wait-index", "--b2-fewer-reads"]),
+    evalfast2t=dict(has=["--b2-resolve torch", "--eval-bands 220:300:195:290:140:220", "--bare",
+                         "--eval-role fast-time", "--host-profile --gc-freeze --lean-time", "--steps 48",
+                         "--accuracy-record /mnt/beegfs/ojerbi/r2-runs/evalacc/eacc_t1_418_evalacc/summary.json"],
+                    hasnt=["torch/per_call", "--wait-index", "--b2-fewer-reads"]),
+    evalfast2c=dict(has=["--b2-resolve check", "--steps 8", "--draft-ticks 4"],
+                    hasnt=["--bare", "--eval-role", "--accuracy-record", "--host-profile", "--gc-freeze", "--lean-time",
+                           "torch/per_call", "--eval-bands"]),
+    evalfast=dict(has=["--variants fused/batched,torch/per_call", "--eval-bands 55:125:30:70:27:65", "--bare"],
+                  hasnt=["--b2-resolve", "--host-profile", "--gc-freeze", "--lean-time"]))
+
+
+@pytest.mark.parametrize("cell", sorted(HF_CELLS))
+def test_HF6b_the_cells_dryrun(tmp_path, cell):
+    """On a clean checkout: the DRYRUN prints each cell's arguments, which the harness parses into the registered
+    flags. In this ROOT's own checkout a DRYRUN stop FAILS (never a skip); elsewhere it skips."""
+    if _clean_head() is None:
+        pytest.skip("not a clean git checkout (tracked changes or untracked files in nosi/): the DRYRUN needs one")
+    r = _dry(tmp_path, cell)
+    if r.returncode != 0:
+        assert Path(HF_ROOT).resolve() != REPO.resolve(), r.stderr[-400:]
+        pytest.skip("DRYRUN stopped outside the hostfix ROOT: %s" % r.stderr.strip()[-200:])
+    line = r.stdout.strip().splitlines()[-1]
+    got = line.split("r2_tick_sg5.py ", 1)[1].strip().replace("\\,", ",")
+    common = ["--modes fast --backends b2", "--batch 216", "--C 96 --X 1512 --R-ver 1464", "--mem=240G",
+              "--layout pool --X-pool 1512 --arrival-lag 2", "--repeat-docs --log-slots -1 --skip-shipped",
+              "PYTHONPATH=%s/nosi" % HF_ROOT, "--job-name=sg5-t1-418-%s " % cell, "/r2-runs/sg5/sg5_t1_418_%s " % cell]
+    if cell != "evalfast":
+        common.append("--variants fused/batched")
+    for w in common + HF_CELLS[cell]["has"]:
+        assert w in got or w in line, (cell, w)
+    for w in HF_CELLS[cell]["hasnt"]:
+        assert w not in got, (cell, w)
+    assert "claim /mnt/beegfs/ojerbi/r2-runs/sg5/sg5_active_418 (one per holder)" in r.stdout
+    pa = _sg5().parse_args(got.split())
+    assert pa.batch == 216 and pa.X_pool == 1512 and pa.backends == ["b2"] and pa.layout == "pool"
+    want = dict(evalfast2=("fused", True), evalfast2t=("torch", True), evalfast2c=("check", False),
+                evalfast=("torch", False))[cell]
+    assert (pa.b2_resolve, pa.host_profile and pa.gc_freeze and pa.lean_time) == want, cell
+    assert not pa.wait_index and not pa.b2_fewer_reads
+    if cell in ("evalfast2", "evalfast2t"):
+        assert pa.eval_role == "fast-time" and pa.variant_list == [("fused", "batched")] and pa.bare
+    if cell == "evalfast2c":
+        assert pa.eval_role == "" and pa.steps == 8 and pa.draft_ticks == 4 and not pa.bare
+
+
+def test_HF6c_a_wrong_cell_word_is_refused(tmp_path):
+    uid = "33cfb929-315c-8d27-5622-1169affb7e04"
+    (tmp_path / "418.gpu_uuid").write_text(uid + "\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_"))}
+    env.update(SG5_HOLDERS=str(tmp_path), DRYRUN="1")
+    for bad in (("evalfast3",), ("evalfast2", "evalfast2t"), ("evalfast2x",)):
+        r = subprocess.run(["bash", str(STEP), "--nosi", "0" * 40, "418", "t1", *bad], env=env, capture_output=True,
+                           text=True, timeout=60)
+        assert r.returncode == 2 and "usage" in r.stderr, (bad, r.stderr[-200:])
 
 
 def test_HF1c_the_harness_wiring():

@@ -480,7 +480,7 @@ def test_EV13_the_step_scripts(tmp_path):
                     assert word not in ln, (name, word, ln)
     sg = (EFF / "r2_tick_sg5_step.sh").read_text()
     root = next(ln for ln in sg.splitlines() if ln.startswith("NOSI_EVAL=")).split()[0][len("NOSI_EVAL="):]
-    assert root == "/mnt/beegfs/ojerbi/nosi-r2-sg5par"                  # [sg5par] the per-holder claim's ROOT
+    assert root == "/mnt/beegfs/ojerbi/nosi-r2-hostfix"                 # [hostfix] (was [sg5par]'s nosi-r2-sg5par)
     ea = (EFF / "r2_evalacc_step.sh").read_text()
     assert next(ln for ln in ea.splitlines() if ln.startswith("NOSI=")).split()[0] == "NOSI=/mnt/beegfs/ojerbi/nosi-r2-sg5par"
     # [hostfix] stack2 4ddb795 (cherry-picked) moved the stack1 cells' ROOT from integ6 to stack2
@@ -523,10 +523,11 @@ def test_EV13_the_step_scripts(tmp_path):
               "--variants fused/batched,torch/per_call", "--layout pool --X-pool 1512 --arrival-lag 2 --bare",
               "--skip-shipped --eval-role fast-time --mem-cap-gb 84",
               "--accuracy-record /mnt/beegfs/ojerbi/r2-runs/evalacc/eacc_t1_418_evalacc/summary.json",
-              "--eval-bands 55:125:30:70:27:65", "--mem=240G", "PYTHONPATH=/mnt/beegfs/ojerbi/nosi-r2-sg5par/nosi"):
+              "--eval-bands 55:125:30:70:27:65", "--mem=240G", "PYTHONPATH=/mnt/beegfs/ojerbi/nosi-r2-hostfix/nosi"):
         assert w in got or w in line, w
     assert "claim /mnt/beegfs/ojerbi/r2-runs/sg5/sg5_active_418 (one per holder)" in r.stdout
-    for w in ("--pool-baseline", "--stack", "--sweep "):
+    for w in ("--pool-baseline", "--stack", "--sweep ", "--host-profile", "--gc-freeze", "--lean-time", "--b2-resolve",
+              "--wait-index", "--b2-fewer-reads"):                     # [hostfix] evalfast keeps its arguments
         assert w not in got, w
     pa = _sg5().parse_args(got.split())
     assert pa.eval_role == "fast-time" and pa.batch == 216 and pa.X_pool == 1512 and pa.log_slots == -1
