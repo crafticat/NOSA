@@ -135,6 +135,17 @@ HOST_PROF_CATS = dict(
     h_apply_events="run_round: apply_events (item 10)",
     h_on_tick="run_round: on_tick (the gates' callback; outside the tick's span)",
     h_end_request="run_round: end_request loop (item 11; outside the tick's span)")
+# [hostfix] --lean-time (item 2): what a time cell drops. REPORT-only work: no decision, page table, transfer, release
+# or MUST-gate input depends on it (test_r2_hostfix.py HF2). B2 only. KEPT: the decisions and their refusals, the
+# release queue (_queue), the transfers and their demand sets, the journal, masked / draft pairs / refusals of the
+# plans, the bookkeeping (twin counters vs mirrors), the transport's stats, the X pool's invariant checks.
+LEAN_DROPPED = (
+    "Metrics.issued / Metrics.arrived: the 4.8 lifetimes, transferred and arrival_ns dicts (one record per take)",
+    "the 4.8 read-count harvest of the take slots (their old generation / read counts: one stack and one read)",
+    "the 4.3 / 4.6 looks: open_call, k43, k46, the firsts lists and their reads (the release queue is KEPT, same calls)",
+    "metrics.sample_memory at poll and at end_tick (two table reductions and two reads per tick; peak_retained)",
+    "the draft_refused REPORT count (one read per tick)",
+    "the X-pool witness (lane handoffs, peak lanes: XPool.witness False), as in a --stack-role time cell")
 
 
 def log(msg):
@@ -270,6 +281,9 @@ def parse_args(argv):
                     help="every timed phase (draft-only, round, bare round): gc.collect(), gc.freeze(), gc.disable() "
                          "before it; gc.unfreeze(), gc.enable(), one gc.collect() after it (round_guard); the counts in "
                          "each point's gc_freeze record")
+    ap.add_argument("--lean-time", action="store_true",                                       # [hostfix] item 2
+                    help="b2 only: skip the REPORT-only host work in every engine (LEAN_DROPPED: the 4.3 / 4.6 / 4.8 "
+                         "metrics, the memory samples, the X-pool witness); the decisions and every MUST input stay")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -372,6 +386,9 @@ def parse_args(argv):
             a.eval_bands_v = v
     elif a.accuracy_record or a.mem_cap_gb or a.eval_bands:
         ap.error("--accuracy-record, --mem-cap-gb and --eval-bands need --eval-role fast-time")
+    if a.lean_time and (a.backends != ["b2"] or a.stack_compare or a.stack_role == "validate"):   # [hostfix] item 2
+        ap.error("--lean-time: --backends b2 only (OwnResidency(lean=True)), and not in a validation cell "
+                 "(--stack-compare / --stack-role validate need the witnesses)")
     a.log_slots_n = resolve_log_slots(a)                                                         # [bigb]
     return a
 
@@ -681,8 +698,9 @@ def select_attn(a, attn):                                                       
 
 
 def witness_on(a):                                                                              # [integ5]
-    """[integ5] The diagnostic witnesses (XPool handoffs / peak, SharedKV.pages_saved) run except in a time cell."""
-    return getattr(a, "stack_role", "") != "time"
+    """[integ5] The diagnostic witnesses (XPool handoffs / peak, SharedKV.pages_saved) run except in a time cell.
+    [hostfix] --lean-time turns them OFF too (LEAN_DROPPED)."""
+    return getattr(a, "stack_role", "") != "time" and not getattr(a, "lean_time", False)
 
 
 def skv_report(obj):                                                                            # [integ]
@@ -766,7 +784,8 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
             svc = OwnResidency(*args, device=eng.store_k[0].device, nblk=n_host // 64, devops=lazy,             # [b2]
                                checked=bool(getattr(a, "b2_checked", False)),                                     # [b2]
                                resolve=getattr(a, "b2_resolve", "torch"),                                         # [fusedres]
-                               fused_plant=int(getattr(a, "b2_fused_plant", 0)), **kw)                            # [fusedres2]
+                               fused_plant=int(getattr(a, "b2_fused_plant", 0)),                                  # [fusedres2]
+                               lean=bool(getattr(a, "lean_time", False)), **kw)                                   # [hostfix]
             lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)       # [b2]
         else:
             lazy = _LazyOps()
@@ -1760,6 +1779,10 @@ def main(argv=None) -> int:
             meta.update(host_profile=True, host_prof_cats=HOST_PROF_CATS,
                         host_profile_note="host clocks only (perf_counter); per point: draft_only_host_profile, "
                                           "host_profile (instrumented round), bare_host_profile (the headline)")
+        if a.lean_time:                                                                        # [hostfix] item 2
+            meta.update(lean_time=True, lean_dropped=list(LEAN_DROPPED),
+                        lean_note="REPORT-only: residency k43 / k46 / k48, peak_retained and draft_refused are NOT "
+                                  "measured in this record (zeros); every MUST gate's input is kept")
         if a.gc_freeze:                                                                        # [hostfix] item 1
             meta.update(gc_freeze=True, gc_freeze_note="each timed phase: collect, freeze, disable before; unfreeze, "
                                                        "enable, collect after (per point: gc_freeze[phase])")

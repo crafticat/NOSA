@@ -68,9 +68,13 @@ class OwnResidency(ResidencySparse):
     cohort key slots per request, KEYS <= 7), checked, b2_mut (negative controls, tests only)."""
 
     def __init__(self, *args, keys: int = 7, checked: bool = True, b2_mut=None, resolve: str = "torch",
-                 fused_plant: int = 0, fused_guard: bool = False, fused_warm: str = "auto", **kw):
+                 fused_plant: int = 0, fused_guard: bool = False, fused_warm: str = "auto", lean: bool = False, **kw):
         kw["pin_records"] = False
         self.__dict__["_own_ready"] = False
+        # [hostfix] --lean-time (OPT-IN, default False: every line as before): the REPORT-only host work is skipped
+        # in a time cell (LEAN below); every decision, the release queue, the transfers and every counter a MUST gate
+        # reads stay. Set before the base constructor (S-C's end_tick reads it).
+        self.lean = bool(lean)
         if resolve not in ("torch", "fused", "check"):                # [fusedres] r2_fusedres.RESOLVE_MODES
             raise ValueError("resolve %r: one of torch, fused, check" % (resolve,))
         if fused_plant and resolve == "torch":
@@ -475,7 +479,8 @@ class OwnResidency(ResidencySparse):
             t = self._hp("h_poll_drops", t)
         self._poll_releases()
         t = self._hp("h_poll_releases", t)
-        self.metrics.sample_memory()
+        if not self.lean:                                             # [hostfix] --lean-time: a REPORT sample only
+            self.metrics.sample_memory()
         self._hp("h_poll_memory", t)
 
     def _poll_arrivals(self) -> int:
@@ -533,7 +538,8 @@ class OwnResidency(ResidencySparse):
             if self.pending.get((tr.layer, tr.b, tr.h, tr.block)) is tr:
                 del self.pending[(tr.layer, tr.b, tr.h, tr.block)]
             self._landed.discard(tr.seq)
-            self.metrics.arrived(tr, None, tr.requester in self.cancelled)
+            if not self.lean:                                         # [hostfix] --lean-time: 4.8 / 4.3 REPORT only
+                self.metrics.arrived(tr, None, tr.requester in self.cancelled)
         self._changed()
         if self.checked:
             pc = O.post_checks(T, None, 0, which=("I1", "I2", "I3"))
@@ -777,9 +783,11 @@ class OwnResidency(ResidencySparse):
                 victims.append((int(ev["l"][q]), int(ev["b"][q]), int(ev["h"][q]), vblk[i], vcode[i], vrd[i]))
         # the take slots' generation and read counts before the writes (the 4.8 lifetime they end; SG5 b2), in the
         # order of write_takes' takes
-        tkq = (ev["kind"] != 2).nonzero().squeeze(1)
-        f_old = ev["s"][tkq] * G.NPOS + ev["take_slot"][tkq]
-        old = torch.stack([T.flat(n)[f_old].to(torch.int64) for n in ("gen", "rd_n", "rv_n")])
+        old = None                                                    # [hostfix] --lean-time: no 4.8 harvest
+        if not self.lean:
+            tkq = (ev["kind"] != 2).nonzero().squeeze(1)
+            f_old = ev["s"][tkq] * G.NPOS + ev["take_slot"][tkq]
+            old = torch.stack([T.flat(n)[f_old].to(torch.int64) for n in ("gen", "rd_n", "rv_n")])
         # ---------------------------------------------------------------- the writes
         self._changed()                                               # (a raise below leaves no stale projection)
         gen_before = T.c["gen"].clone() if checked else None
@@ -880,8 +888,8 @@ class OwnResidency(ResidencySparse):
         lt, bt, ht = takes["l"].tolist(), takes["b"].tolist(), takes["h"].tolist()
         blk, slot, gen = takes["blk"].tolist(), takes["slot"].tolist(), takes["gen"].tolist()
         rdo = takes["rd_old"].tolist()
-        og, ordn, orvn = old.tolist()
-        harvest = not self.b2_mut.get("no_read_harvest")
+        og, ordn, orvn = old.tolist() if old is not None else (None, None, None)     # [hostfix] lean: no harvest
+        harvest = not self.b2_mut.get("no_read_harvest") and old is not None
         lifetimes = self.metrics.lifetimes
         by_layer: Dict[int, List[Transfer]] = {}
         new_trs = []
@@ -902,7 +910,8 @@ class OwnResidency(ResidencySparse):
             tr.issue_tick = self.tick_no
             self.inflight[tr.seq] = tr
             self.pending[(lt[i], bt[i], ht[i], blk[i])] = tr
-            self.metrics.issued(tr)
+            if not self.lean:                                         # [hostfix] --lean-time: 4.8 REPORT only
+                self.metrics.issued(tr)
             if isv:
                 tr.delivered = True                                   # the device's urgent gather landed it
                 self._landed.add(tr.seq)
@@ -926,16 +935,45 @@ class OwnResidency(ResidencySparse):
                 tr = self._in_flight(l, b, h, t)
                 if tr is not None and not self.mut.drop_demand_merge:
                     tr.demand.add(DRAFT)
-            nref = int(O.has(D["flags"], O.REFUSED).sum())
-            if nref:
-                self.metrics.count("draft_refused", nref)
+            if not self.lean:                                         # [hostfix] --lean-time: a REPORT count (a read)
+                nref = int(O.has(D["flags"], O.REFUSED).sum())
+                if nref:
+                    self.metrics.count("draft_refused", nref)
         # the journal of the recency (touch, acquire, evict_to_c)
         self._count("touch", int(rc["touch"]))
         self._count("acquire", int(rc["acquire"]))
         self._count("evict_po", int(rc["evict_po"]))
         self._count("release:evict", int(rc["evict_rel"]))
         t_hp = self._hp("h_hs_merges", t_hp)                          # demand merges, refusals, recency journal
-        # the looks (4.3 / 4.6), as C's sparse consumer (r2_residency_sparse.py _apply_verify_sparse)
+        if self.lean:                                                 # [hostfix] --lean-time: no 4.3 / 4.6 looks;
+            self._lean_queue(steps, vrows)                            # the release queue exactly as below
+        else:
+            self._looks(steps, V, ev, part, new_trs, vrows, vlook)
+        t_hp = self._hp("h_hs_looks", t_hp)                           # the 4.3 / 4.6 looks and the release queue
+        for p in info:
+            if p["st"]["ddec"] is not None:
+                masked, refused, pairs = p["dc"]
+                self.metrics.layer_plan(Plan(page_table=None, num_pages=None, last_len=None, seq_idx=None, blocks=[],
+                                             masked=int(masked), draft_pairs=int(pairs), refused=int(refused)))
+        self._changed()
+        self._hp("h_hs_plans", t_hp)
+
+    def _lean_queue(self, steps, vrows) -> None:
+        """[hostfix] --lean-time: the release queue of _looks without the looks. The keys are the verify rows' keys in
+        first-occurrence order (dict.fromkeys: the same list as _looks' dedup, linear instead of quadratic), queued at
+        every layer with verify rows, in the layer order of steps: the same _queue calls in the same order."""
+        if self.mut.release_only_at_decision:
+            return
+        keys = list(dict.fromkeys(r.key for r in vrows))
+        for st in steps:
+            if st["vdec"] is not None:
+                for key in keys:
+                    self._queue(key, st["l"])
+
+    def _looks(self, steps, V, ev, part, new_trs, vrows, vlook) -> None:
+        """The looks (4.3 / 4.6), as C's sparse consumer (r2_residency_sparse.py _apply_verify_sparse), and the
+        release queue of the verify keys at every layer with verify rows ([hostfix]: moved here unchanged from
+        _host_side, so --lean-time can skip the looks and keep the queue: _lean_queue)."""
         now = self.clock()
         trs_of = {q: tr for (q, tr) in new_trs}
         firsts: Dict[Tuple[int, Any], List[Tuple[int, int, str, Any]]] = {}
@@ -997,14 +1035,6 @@ class OwnResidency(ResidencySparse):
             if not self.mut.release_only_at_decision:
                 for key in keys:
                     self._queue(key, l)
-        t_hp = self._hp("h_hs_looks", t_hp)                           # the 4.3 / 4.6 looks and the release queue
-        for p in info:
-            if p["st"]["ddec"] is not None:
-                masked, refused, pairs = p["dc"]
-                self.metrics.layer_plan(Plan(page_table=None, num_pages=None, last_len=None, seq_idx=None, blocks=[],
-                                             masked=int(masked), draft_pairs=int(pairs), refused=int(refused)))
-        self._changed()
-        self._hp("h_hs_plans", t_hp)
 
     # ---------------------------------------------------------------------------------------------- record mutations
     def _rec_mutate(self, layers: List[Dict], rowsel: torch.Tensor, vread: torch.Tensor, rows, row_b: torch.Tensor,

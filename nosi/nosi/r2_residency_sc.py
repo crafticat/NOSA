@@ -989,6 +989,8 @@ class ResidencySC(ResidencySB):
     # ns) that gets the host sub-timers of end_tick, the device wait and B2's consumer (r2_tick_sg5.py --host-profile
     # binds it to the engine's TickTimer); host clocks only, no device read, no change of any decision
     host_prof = None
+    # [hostfix] --lean-time (B2's OwnResidency(lean=True); default False): end_tick skips the REPORT-only memory sample
+    lean = False
 
     def __init__(self, *args, sc_mut=None, devops=None, mirror_drop=None, wait_mode: str = "probe", **kw):
         kw["defer_admit"] = True
@@ -1291,7 +1293,8 @@ class ResidencySC(ResidencySB):
         t1 = time.perf_counter_ns() if hp is not None else 0
         Residency.end_tick(self)                                      # the draft transfers, layer by layer
         t2 = time.perf_counter_ns() if hp is not None else 0
-        self.metrics.sample_memory()
+        if not self.lean:                                             # [hostfix] --lean-time: a REPORT sample only
+            self.metrics.sample_memory()
         if hp is not None:
             hp("h_et_apply", t1 - t0)                                 # the decision read and the host consumer
             hp("h_et_issue", t2 - t1)                                 # assign_phys and the draft issues

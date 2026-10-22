@@ -11,6 +11,11 @@ adversarial transport, S-C's CPU device stand-in) with B2 (OwnResidency) as the 
   HF1  --gc-freeze (item 1): round_guard collects, freezes and disables before the phase and restores after it (an
        exception too; a collector OFF before stays OFF); no automatic collection in the phase (PRECONDITION: the
        same churn collects with the collector ON); the B2 round under the guard equals the round without it.
+  HF2  --lean-time (item 2): the lean B2 round equals the default at every tick in every decision input and output
+       (rows, tokens, logits, pages, state, readers, memory, the kept counters, the release queue and its set) in
+       three rounds (forced, pressure, free); the dropped REPORT work ran in the default and not in lean
+       (PRECONDITION); NEGATIVE CONTROL: a lean mode that skips the release queue differs at the first verify tick;
+       the linear key dedup equals the old quadratic one; the harness's flag, refusals, witness and meta.
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA benchmarks/Efficiency/tests_cpu/test_r2_hostfix.py
 """
@@ -84,7 +89,8 @@ def _run_hf(p3, toks, cfg="default", forced=True, svc_kw=None, setup=None, aroun
                           tokens=[t.slot if isinstance(t, TK.Ref) else int(t) for t in tokens],
                           logits=out.logits.clone(), pages=list(pages), state=TRM._state(world),
                           counters=TRM._counters(svc), readers=TRM._reader_tags(svc, tags), memory=svc.memory(),
-                          kept=_kept_counters(svc)))
+                          kept=_kept_counters(svc), queue=[(repr(k), l) for (k, l) in svc.queue],
+                          queued=sorted(repr(x) for x in svc.queued)))
         pages.clear()
     eng.timer = TK.TickTimer(cuda=False)
     if setup is not None:
@@ -315,6 +321,74 @@ def test_HF1b_the_round_under_gc_freeze_changes_no_value(p3, ref):
     assert r["collections_in_phase"] and not any(r["collections_in_phase"]), r["collections_in_phase"]
     assert gc.isenabled() and gc.get_freeze_count() == 0
     assert G.host_profile_record(b1.eng.timer.report())["missing"] == ["h_superset_wait"]
+
+
+LEAN_FIELDS = ("rows", "tokens", "logits", "pages", "state", "readers", "memory", "kept", "queue", "queued")
+
+
+@pytest.mark.parametrize("cfg,forced", [("default", True), ("pressure", True), ("default", False)],
+                         ids=["forced", "pressure", "free"])
+def test_HF2a_lean_time_changes_no_decision_and_drops_only_reports(p3, ref, cfg, forced):
+    toks, _ = ref
+    base = _run_hf(p3, toks, cfg=cfg, forced=forced, svc_kw=dict(checked=False))
+    lean = _run_hf(p3, toks, cfg=cfg, forced=forced, svc_kw=dict(checked=False, lean=True))
+    assert base.svc.lean is False and lean.svc.lean is True                     # the default (no lean argument)
+    assert inspect.signature(OWN2.OwnResidency.__init__).parameters["lean"].default is False
+    assert _diff(base, lean, LEAN_FIELDS) is None
+    _same_end(base, lean, report=False)
+    assert [t["queue"] for t in base.ticks if t["queue"]], "precondition: the release queue is used"
+    mb, ml = base.svc.metrics, lean.svc.metrics
+    # PRECONDITION: the default ran the dropped work; lean did not
+    assert mb.lifetimes and mb.transferred and mb.arrival_ns and mb.k43["layer_calls"] > 0
+    assert not ml.lifetimes and not ml.transferred and not ml.arrival_ns and not ml.open_calls
+    assert ml.k43["layer_calls"] == 0 and ml.peak_retained_slots == 0 and "draft_refused" not in ml.counts
+    rb, rl = TB._rep(base.svc), TB._rep(lean.svc)
+    for k in ("masked", "draft_pairs", "memory", "after_cancel", "arrival", "k5"):
+        assert rb[k] == rl[k], (k, rb[k], rl[k])
+    assert {k: v for k, v in rb["counts"].items() if k != "draft_refused"} == rl["counts"]
+
+
+def test_HF2b_negative_control_a_lean_mode_without_the_release_queue_differs(p3, ref):
+    """L34: a defective lean (its release queue skipped) differs from the default at the first tick with verify rows
+    (the queue field, before that tick's decisions), so HF2a's comparison can see a dropped queue."""
+    toks, _ = ref
+    base = _run_hf(p3, toks, svc_kw=dict(checked=False))
+
+    def no_queue(eng, svc):
+        svc._lean_queue = lambda steps, vrows: None
+    bad = _run_hf(p3, toks, svc_kw=dict(checked=False, lean=True), setup=no_queue)
+    d = _diff(base, bad, LEAN_FIELDS)
+    first_v = next(t for t, x in enumerate(base.ticks) if any(r[1] == "v" for r in x["rows"]))
+    assert d is not None and d[0] == first_v and d[1] in ("queue", "queued"), (d, first_v)
+
+
+def test_HF2c_the_lean_key_order_equals_the_default_dedup():
+    g = torch.Generator().manual_seed(3)
+    for _ in range(50):
+        n = int(torch.randint(1, 30, (1,), generator=g))
+        pairs = torch.randint(0, 5, (n, 2), generator=g).tolist()
+        rows = [SimpleNamespace(key=("u%d" % x, 1, y)) for x, y in pairs]
+        old = []
+        for r in rows:
+            if r.key not in old:
+                old.append(r.key)
+        assert list(dict.fromkeys(r.key for r in rows)) == old
+
+
+def test_HF2d_the_harness_wiring():
+    G = _sg5()
+    base = ["--out", "o", "--workload", "w", "--biattn", "b", "--gilfree", "g", "--gilfree-build", "/x"]
+    a = G.parse_args(base + ["--backends", "b2", "--X", "64", "--lean-time"])
+    assert a.lean_time is True and G.witness_on(a) is False
+    assert G.parse_args(base).lean_time is False and G.witness_on(G.parse_args(base)) is True
+    for bad in (["--lean-time"], ["--backends", "sc", "--lean-time"],
+                ["--backends", "b2", "--X", "64", "--lean-time", "--stack", "full", "--stack-compare",
+                 "--arrival-lag", "2"]):
+        with pytest.raises(SystemExit):
+            G.parse_args(base + bad)
+    me = inspect.getsource(G.make_engine)
+    assert 'lean=bool(getattr(a, "lean_time", False))' in me and "eng.xpool.witness = witness_on(a)" in me
+    assert len(G.LEAN_DROPPED) == 6 and 'lean_dropped=list(LEAN_DROPPED)' in inspect.getsource(G.main)
 
 
 def test_HF1c_the_harness_wiring():
