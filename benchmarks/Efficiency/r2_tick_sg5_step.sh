@@ -128,6 +128,14 @@
 #   evalfast2rd / evalfast2rdp [resdev] evalfast2rl + --res-dev (the lean resolve's device hot spots with equal integer
 #            ops, nosi/r2_resdev.py, tests_cpu/test_r2_resdev.py; FAST) / + --b2-res-profile too (the device time of
 #            the --res-dev draft-only tick; STEP_MIN 150); REGISTERED block below
+#   evalacc216m / evalacc216 [acc216] THE ACCURACY / EXACTNESS PROOF AT B 216 ON THE TIMED PATH
+#            (analysis/evalfast/STATUS_accuracy_B216.md section 5): evalfast2rd's command with --modes fast,bi_c_strict
+#            (FAST first, then EXACT = G-c strict, on the same prefill and harness), WITHOUT --eval-role fast-time,
+#            --accuracy-record, --mem-cap-gb 84, --eval-bands and --bare (a proof cell, not a timing cell), PLUS
+#            --store-committed-tokens --serial-rows 8 --gold-workload GOLD (r2_tick_sg5.py acc_gates). evalacc216 also
+#            reads --link-record = the evalfast2rd summary.json of the same run id and holder (REPORT only).
+#            evalacc216m: --steps 8, no link: the inspected miniature (memory and gate wiring); run it FIRST.
+#            ROOT NOSI_EVAL. REGISTERED block below
 #   STEP_MIN 120 in every cell above.
 #   [fusedres2] the FR-g cells of docs/R2_FUSEDRES_PLAN.md section 7 (p5b2's point: --modes exact,fast --backends b2
 #   --C 96 --X 64 --R-ver 16, no sweep, gilfree 8 threads, unchecked), with NOSI = FRNOSI (the fusedres2 worktree)
@@ -340,6 +348,52 @@
 #            So about 83.1-83.3 GB: it holds, with a margin of about 0.7 GB. If RD-MEM fails, drop the bias fill's own
 #            dummies first (the largest term).
 #
+# REGISTERED for evalacc216m / evalacc216 ([acc216], STAMP 2026-10-23T18:04:12Z, before any run; the lead writes the stamp from
+# `date -u` in the command that freezes this block, L33). WHY: analysis/evalfast/STATUS_accuracy_B216.md: at B 216 no
+# gate proves the exact target distribution (ETD), batch invariance (BI) or accuracy equivalence (AE) on the timed
+# path; the evalacc record is batch 48 on another engine path. ROOT NOSI_EVAL = nosi-r2-acc216. Gates:
+# r2_tick_sg5.py acc_gates (MUST unless the name starts with R_).
+#   ACC-BI    ACC_exact_batch_invariance PASS: 0 differing pairs of 122 (rows b % 94 and b, b = 94 .. 215; 48 tokens per
+#             row in evalacc216, 8 in evalacc216m); the prompt rows are equal in every pair. Basis: G-c strict passed
+#             bigc G2 at M 1 .. 1148 (r2_evalacc.py EA-E) and the verify ticks use at most (1 + K) B = 864 rows; the
+#             pool / b2 path is bitwise equal to the per-stream path under EXACT (x1 XP_bitwise, stack1a ST_bitwise).
+#             FALSIFIER: 1 or more differing pairs: under EXACT the timed path at B 216 is NOT batch-invariant (the row
+#             position or the co-batch changes the tokens); every bitwise claim at B 216 is VOID until it is localised
+#   ACC-ETD   ACC_exact_vs_serial PASS: rows 0 .. 7 of the EXACT round equal the BI serial bi_c_strict decode of the
+#             same 8 prompts, 8 of 8 rows, every token. FALSIFIER: a difference: the EXACT round on the timed path does
+#             not commit the target model's greedy tokens
+#   ACC-AE    ACC_AE_fast_vs_exact EQUIVALENT (evalacc216): |d acceptance| <= 0.01 (allowance about 0.0104 = 3 x the
+#             binomial SE 0.0028 at 10,152 decisions per point and acceptance about 0.959, + floor 0.002; FAST noise 0);
+#             gold match over the first copies of the 55 gold documents x 48 tokens = 2,640 tokens per point: |d gold|
+#             inside the allowance (about 0.018 at gold match about 0.04; cap 0.02). FALSIFIER: AFFECTS: FAST changes
+#             accuracy at B 216, so the FAST timing headline loses its accuracy basis (human decision part 3)
+#   ACC-LINK  R_ACC_fast_link (REPORT, evalacc216): the FAST point's accepted 9732, rejected 420, committed 10152,
+#             ticks 61 EQUAL the same holder's evalfast2rd record (the gate reads the numbers from that record).
+#             FALSIFIER: DIFFER: this cell did not run the timed path (or the FAST counts are not reproducible), so
+#             ACC-AE does not transfer to the timed runs (score the link VOID; ACC-BI and ACC-ETD keep their meaning)
+#   ACC-AGREE R_ACC_fast_vs_exact_tokens (REPORT): fewer than 216 of 216 rows fully equal (batch 48 reference: 26 of
+#             48, median first divergence 25). Not a falsifier: FAST is not batch-invariant
+#   ACC-FDUP  R_ACC_fast_dup_rows (REPORT): no prediction
+#   ACC-MEM   meta.peak_gb 83.1-83.5 GB (R_ACC_peak, REPORT: a proof cell has no --mem-cap-gb). Model: the points run
+#             one engine at a time (one_point frees each engine before the next one); FAST is 83.25 GB in evalfast2rd
+#             (its bare round was a third engine of the same size, so dropping --bare changes no peak); the EXACT
+#             point holds the same store, twins, residency and X pool, and G-c strict allocates only its output (no
+#             m_fix padding, no cuBLAS workspace): FAST +- 0.2 GB. The serial reference runs before the build's GPU
+#             windows are freed: build peak 52.62 GB (evalfast2rd) + an 8-row copy under 2 GB, so it is not the peak.
+#             PHYSICAL LIMIT: the A100 gives 79.25 GiB = 85.10 GB (DIAG_fused_check_oom.md); 83.5 GB allocated =
+#             77.8 GiB leaves about 1.4 GiB for the CUDA context, the cuBLAS / Triton modules and the allocator's
+#             slack, as FAST at 83.25 GB had on both GPUs. FALSIFIER: an OOM, or peak > 84 GB in evalacc216m (its
+#             preflight peak is already the long run's: evalfast2rd preflight_peak_gb 82.76 at 4 steps): do NOT run
+#             evalacc216; the fallback is B 188 (two copies of the 94 documents, 94 pairs; X 1316 = 7 per request,
+#             R_ver 1268; about 28 x 0.29 = 8 GB less by the bigb slope), a new cell that needs its own review
+#   ACC-MINI  evalacc216m: ACC-BI (122 pairs, 8 tokens) and ACC-ETD (8 rows, 8 tokens) PASS; peak inside ACC-MEM.
+#             Its ACC-AE is EXPECTED EQUIVALENT, but at 1,512 decisions and 440 gold tokens the allowance is the cap
+#             (0.02): an AFFECTS there is a REPORT for the scorer, NOT a falsifier (the full cell decides)
+#   SCOPE     every --eval-role fast-time cell now writes R_EF_accuracy_scope (REPORT): with the batch 48 record and
+#             B 216 it reads "SCOPE MISMATCH (REPORT, not MUST)"; no current cell stops on it
+#   TIME      evalacc216 about 25-40 min (evalfast2rd 21.5 min without its bare round, plus the EXACT point at 1.5-4 x
+#             the FAST round and the 8-row serial decode); STEP_MIN 120 in both cells
+#
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
 #        _k5_report) names the per-layer demand (first misses needing a shared extra, free extras at the tick start,
@@ -415,8 +469,10 @@ NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                        
 NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-stack2                                             # ROOT of the stack1 cells only ([integ]; [stack2])
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
-NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-graph                                               # ROOT of the evalfast* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree; [frfix] own worktree; [resfix] own worktree; [resdev] own worktree)
+NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-acc216                                             # ROOT of the evalfast* and evalacc216* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree; [frfix] own worktree; [resfix] own worktree; [resdev] own worktree; [acc216] own worktree)
 EVALACC_OUT=/mnt/beegfs/ojerbi/r2-runs/evalacc                                           # ROOT (r2_evalacc_step.sh's OUTROOT)
+GOLD=/mnt/beegfs/ojerbi/kstep-cpu-runs/workload/pg19-test-ctx65280                        # ROOT [acc216] (r2_evalacc_step.sh's)
+GOLD_SHA=f2fb36f441ec12b7a79239d5e86263c6454b7713436f53f81086ef2bedcc34b3                 # PIN (ctx65280_tokens.bin) [acc216]
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -442,7 +498,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl|evalfast2rd|evalfast2rdp] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl|evalfast2rd|evalfast2rdp|evalacc216m|evalacc216] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -464,6 +520,7 @@ for w in "$@"; do
         evalfast2fx|evalfast2wx) [ -z "$CELL" ] || usage; CELL=$w ;;                                # [frfix]
         evalfast2rp|evalfast2rl) [ -z "$CELL" ] || usage; CELL=$w ;;                                # [resfix]
         evalfast2rd|evalfast2rdp) [ -z "$CELL" ] || usage; CELL=$w ;;                               # [resdev]
+        evalacc216m|evalacc216) [ -z "$CELL" ] || usage; CELL=$w ;;                                 # [acc216]
         *) usage ;;
     esac
 done
@@ -547,6 +604,8 @@ BIGBARG=()                                                  # [bigb] the bigb ce
 DTICKS=12                                                   # [fusedres2] --draft-ticks (p3's in every cell but frg*);
 FRARG=()                                                    # the frg* cells' extra flags in FRARG
 EVALARG=()                                                  # [evalsplit] the evalfast cell only
+ACC=                                                        # [acc216] the evalacc216* cells only (the gold pin)
+LINKARG=()                                                  # [acc216] evalacc216 only
 case $CELL in
     "") ;;                                                  # the default: p3's arguments
     p4a) SWEEP_RUN= ; SUFFIX=_p4a ;;                        # the six points; --sweep left out (its default "": none)
@@ -671,6 +730,14 @@ case $CELL in
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=192 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
         EVALARG=(--layout pool --X-pool 1344 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
                  --b2-resolve check) ;;
+    evalacc216m|evalacc216) MODES=fast,bi_c_strict ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_$CELL  # [acc216]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; ACC=1
+        if [ "$CELL" = evalacc216m ]; then STEPS=8                       # the miniature: memory and gate wiring, no link
+        else LINKARG=(--link-record "$OUTROOT/sg5_${RUN}_${JOB}_evalfast2rd/summary.json")    # the same holder's
+        fi
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
+                 --b2-resolve torch --host-profile --gc-freeze --lean-time --wait-index --b2-fewer-reads --res-lean
+                 --res-dev --store-committed-tokens --serial-rows 8 --gold-workload "$GOLD" "${LINKARG[@]}") ;;
 esac
 MIN_LEFT=$((STEP_MIN * 60 + 600))                           # [fusedres2] after the cell's STEP_MIN
 VARIANTARG=()                                               # [batched-rebuild] no --variants in every other cell
@@ -754,6 +821,10 @@ esac
 [ "$(stat -c %s "$MODEL/model.safetensors" 2>/dev/null)" = "$MODEL_SIZE" ] || stop "model size is not $MODEL_SIZE"
 wl=$(sha256sum "$WL/c16k_tokens.bin" 2>/dev/null) || stop "no $WL/c16k_tokens.bin"
 [ "${wl%% *}" = "$WL_SHA" ] || stop "c16k_tokens.bin sha256 is not $WL_SHA"
+if [ -n "$ACC" ]; then                                      # [acc216] the gold continuation, pinned as in r2_evalacc_step.sh
+    gl=$(sha256sum "$GOLD/ctx65280_tokens.bin" 2>/dev/null) || stop "no $GOLD/ctx65280_tokens.bin"
+    [ "${gl%% *}" = "$GOLD_SHA" ] || stop "ctx65280_tokens.bin sha256 is not $GOLD_SHA"
+fi
 OUT=$OUTROOT/sg5_${RUN}_$JOB$SUFFIX
 REC=$OUT.step
 JIT=$JITBASE/sg5_${RUN}_$JOB$SUFFIX
@@ -795,6 +866,7 @@ if [ "$DRY" = 1 ]; then
     [ "${#STACKARG[@]}" -eq 0 ] || echo "R2 SG5 step: [integ] root $NOSI, batch $BATCH, step memory $MEMG, stack arguments ${STACKARG[*]}"
     [ -z "$BIGB" ] || echo "R2 SG5 step: [bigb] root $NOSI, cell $BIGB: layout pool, C $PC, B $BATCH, X_pool 64, arrival lag 2, $STEPS steps, token log sized (-1), no shipped child, mem $MEMG"
     [ "${#EVALARG[@]}" -eq 0 ] || echo "R2 SG5 step: [evalsplit] root $NOSI, batch $BATCH, step memory $MEMG, variants $VARIANTS, eval arguments ${EVALARG[*]}"
+    [ -z "$ACC" ] || echo "R2 SG5 step: [acc216] modes $MODES; gold $GOLD (sha256 $GOLD_SHA); link ${LINKARG[*]:-none}"
     echo "R2 SG5 step: nosi root $NOSI; STEP_MIN $STEP_MIN; MIN_LEFT $MIN_LEFT s"                   # [fusedres2]
     echo "R2 SG5 step: claim $CLAIM (one per holder)"                                               # [sg5par]
     printf '%q ' "${ARGV[@]}"

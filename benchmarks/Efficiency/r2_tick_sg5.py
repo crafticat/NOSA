@@ -72,6 +72,23 @@ resolve without its hidden syncs, with the per-row Python and the tick's constan
 (OwnResidency(res_lean=True)); the same decisions, page tables and records (tests_cpu/test_r2_resfix.py).
 [resdev] --res-dev (with --res-lean; analysis/evalfast/SCORING_resfix.md 2.3): the lean resolve's device hot spots
 with equal integer ops (OwnResidency(res_dev=True), nosi/r2_resdev.py; tests_cpu/test_r2_resdev.py).
+[acc216] THE ACCURACY / EXACTNESS PROOF ON THE TIMED PATH (analysis/evalfast/STATUS_accuracy_B216.md section 5; opt-in
+--store-committed-tokens; no new kernel, no new mode). Every point stores its committed tokens (the statement of the
+[xpool] fp path, one_point). With --modes fast,bi_c_strict the two points run on the same prefill and harness, and
+acc_gates adds:
+  ACC_exact_batch_invariance  MUST: with --repeat-docs, row b and row b + n (n = the workload's documents) hold the
+                              same prompt; the EXACT (bi_c_strict) committed tokens of every such pair are equal (B 216,
+                              n 94: 122 pairs, each copy against the first copy). REPORT when no row repeats a document
+  ACC_exact_vs_serial         MUST: the EXACT rows 0 .. --serial-rows - 1 equal the BI serial greedy decode of the same
+                              prompts with bi_c_strict (r2_evalacc.RealEnv.subset / frc, EA_SG2_spec_equals_serial's
+                              reference; run on a copy of the build BEFORE its GPU windows are freed)
+  ACC_AE_fast_vs_exact        MUST: r2_evalacc's band rule (spec_verdict_inputs, verdict) on the acceptance, and on the
+                              gold match with --gold-workload (the first copy of each document with a gold continuation)
+  R_ACC_fast_link             REPORT: the FAST point's accepted / rejected / committed / ticks against --link-record (a
+                              timed run's summary.json): the proof ran the timed path
+  R_ACC_fast_vs_exact_tokens, R_ACC_fast_dup_rows, R_ACC_peak  REPORTS
+[acc216] R_EF_accuracy_scope (REPORT, --eval-role fast-time): the accuracy record's batch and commit next to the cell's;
+a scope mismatch (a batch 48 record for a batch 216 cell) is REPORTED, not refused.
 OUTPUT: --out/summary.json (after every run). The last stdout line is R2_TICK_SG5_DONE failed=<n>; exit = n (2 =
 refused). ENVIRONMENT: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0, NOSI_POOL_BLOCKS = 0 (the parent; a child sets its own).
 """
@@ -309,6 +326,18 @@ def parse_args(argv):
                          "(OwnResidency(res_dev=True), nosi/r2_resdev.py: one flat scan, no 1-D cummax, compactions "
                          "for the free lists, int32 sort keys, own dummy targets); the same decisions, page tables and "
                          "records (tests_cpu/test_r2_resdev.py)")
+    ap.add_argument("--store-committed-tokens", action="store_true",                          # [acc216]
+                    help="store every point's committed tokens (info['committed_tokens']) and run the ACC gates "
+                         "(module docstring); default: off (no token stored, no ACC gate)")
+    ap.add_argument("--serial-rows", type=int, default=8,                                     # [acc216]
+                    help="with --store-committed-tokens and bi_c_strict in --modes: the BI serial bi_c_strict decode of "
+                         "rows 0 .. N - 1 (ACC_exact_vs_serial); 0: none")
+    ap.add_argument("--gold-workload", default="",                                            # [acc216]
+                    help="with --store-committed-tokens: pg19-test-ctx65280 (r2_evalacc.load_gold): the gold match "
+                         "criterion of ACC_AE_fast_vs_exact; empty: acceptance only")
+    ap.add_argument("--link-record", default="",                                              # [acc216]
+                    help="with --store-committed-tokens: a timed run's summary.json; REPORT R_ACC_fast_link compares "
+                         "the FAST point's counts with its first FAST point")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -422,6 +451,14 @@ def parse_args(argv):
         ap.error("--res-lean: --backends b2 with --b2-resolve torch only (OwnResidency(res_lean=True))")
     if a.res_dev and not a.res_lean:                                                             # [resdev]
         ap.error("--res-dev: needs --res-lean (OwnResidency(res_lean=True, res_dev=True))")
+    if a.store_committed_tokens:                                                                 # [acc216]
+        if a.layout == "both" or a.stack_compare:
+            ap.error("--store-committed-tokens: not with --layout both or --stack-compare (their arms compare and "
+                     "drop the tokens themselves)")
+        if not 0 <= a.serial_rows <= a.batch:
+            ap.error("--serial-rows: 0 <= N <= --batch")
+    elif a.serial_rows != 8 or a.gold_workload or a.link_record:
+        ap.error("--serial-rows, --gold-workload and --link-record need --store-committed-tokens")
     a.log_slots_n = resolve_log_slots(a)                                                         # [bigb]
     return a
 
@@ -915,9 +952,28 @@ def check_validated(paths):                                                     
 
 def check_accuracy_record(path):                                                               # [evalsplit]
     """[evalsplit] Eval cell (a)'s evidence: r2_evalacc.check_record (FAST vs EXACT EQUIVALENT, every MUST passed).
-    SystemExit ("REFUSED ...") otherwise; the harness exits 2 before any build."""
+    SystemExit ("REFUSED ...") otherwise; the harness exits 2 before any build.
+    [acc216] The returned dict also holds the record's own batch and alt batch (meta.args), so R_EF_accuracy_scope can
+    put them next to the cell's batch. The refusal rules are unchanged (r2_evalacc.check_record)."""
     import r2_evalacc
-    return r2_evalacc.check_record(path)
+    rec = r2_evalacc.check_record(path)
+    args = (json.load(open(path)).get("meta") or {}).get("args") or {}          # check_record read it as JSON
+    return dict(rec, batch=args.get("batch"), alt_batch=args.get("alt_batch"))
+
+
+def accuracy_scope(rec, batch, commit):                                                        # [acc216]
+    """[acc216] REPORT R_EF_accuracy_scope: (match, text) of the accuracy record's batch and commit against the cell's
+    batch and commit. A mismatch is a REPORT (the current cells keep running), never a refusal or a MUST failure."""
+    rec = rec or {}
+    rb, rc = rec.get("batch"), rec.get("nosi_commit")
+    same_b = isinstance(rb, int) and rb == int(batch)
+    same_c = bool(rc) and rc == commit
+    text = ("accuracy record batch %s (alt %s), commit %s; this cell batch %d, commit %s; batch %s, commit %s"
+            % (rb, rec.get("alt_batch"), rc, int(batch), commit, "EQUAL" if same_b else "DIFFERS",
+               "EQUAL" if same_c else "DIFFERS"))
+    if not (same_b and same_c):
+        text += ": SCOPE MISMATCH (REPORT, not MUST): the record does not test this cell's batch / commit"
+    return same_b and same_c, text
 
 
 def _rates(committed, ticks, tick_stats, wall_s, source):                                       # [evalsplit]
@@ -970,6 +1026,8 @@ def eval_gates(a, meta, res, gates):                                            
                          "peak allocated %s GB vs the declared cap %g GB" % (peak, a.mem_cap_gb)))
     gates.append(GB.gate("EF_accuracy_record", bool(meta.get("accuracy_record")), True,
                          "FAST timed under the accuracy record %s" % (meta.get("accuracy_record") or {}).get("path")))
+    _, scope_text = accuracy_scope(meta.get("accuracy_record"), a.batch, meta.get("nosi_commit"))   # [acc216]
+    gates.append(GB.gate("R_EF_accuracy_scope", True, False, scope_text))
     if a.eval_bands_v is not None:
         h = (head.get("eval") or {}).get("headline")
         v = a.eval_bands_v
@@ -982,6 +1040,190 @@ def eval_gates(a, meta, res, gates):                                            
             text = "; ".join("%s %.2f in [%g, %g]: %s" % (n, x or 0, lo, hi, "IN" if x is not None and lo <= x <= hi
                                                             else "OUT") for n, x, lo, hi in parts)
         gates.append(GB.gate("R_EF_bands", True, False, text))
+
+
+# ------------------------------------------------------------------ [acc216] the accuracy / exactness proof
+ACC_EXACT = "bi_c_strict"                                   # [acc216] EXACT = G-c strict (the human's EXACT)
+ACC_CAP_GB = 84.0                                           # [acc216] the timing cells' declared cap (REPORT only here)
+
+
+def doc_count(a):                                                                               # [acc216]
+    """[acc216] The workload's documents: c16k_manifest.json shape[0], the n that load_docs tiles."""
+    return int(json.load(open(os.path.join(a.workload, "c16k_manifest.json")))["shape"][0])
+
+
+def dup_pairs(B, n):                                                                            # [acc216]
+    """[acc216] load_docs's tiling puts document b % n in row b. The pairs (b % n, b) for b in n .. B - 1 pair each
+    later copy with the FIRST copy (B 216, n 94: 94 + 28 = 122 pairs). Equality is transitive, so equal pairs here mean
+    equal tokens in every pair of copies (the 150 pairs of the 3-copy and 2-copy groups)."""
+    return [(b % n, b) for b in range(n, B)] if 0 < n < B else []
+
+
+def prompts_differ(docs, pairs):                                                                # [acc216]
+    """[acc216] The precondition of ACC_exact_batch_invariance: the pairs whose prompt rows are NOT equal
+    (torch.equal). Empty when every pair shares a prompt."""
+    import torch
+    return [(i, j) for (i, j) in pairs if not torch.equal(docs[i], docs[j])]
+
+
+def gold_rows(a, docs, n):                                                                      # [acc216]
+    """[acc216] --gold-workload: r2_evalacc.load_gold (the c16k prompt rows, the next --steps tokens of ctx65280; its
+    SHA256SUMS check and prefix check), over EVERY matched document. Each gold row goes to the FIRST prompt row
+    b < min(B, n) with the same tokens (torch.equal): only first copies are scored (copies are not independent
+    samples). Returns dict(rows {b: gold tokens}, matched, doc_index, prefix_mismatch, unmapped, sha_gold)."""
+    import torch
+    import r2_evalacc as EA
+    m = EA.load_gold(a.workload, a.gold_workload, a.S, a.steps, 1)["matched"]
+    d = EA.load_gold(a.workload, a.gold_workload, a.S, a.steps, m)
+    rows, unmapped = {}, []
+    lim = min(a.batch, n)
+    for j, k in enumerate(d["doc_index"]):
+        b = next((b for b in range(lim) if torch.equal(docs[b], d["prompts"][j])), None)
+        if b is None:
+            unmapped.append(k)
+        else:
+            rows[b] = [int(x) for x in d["gold"][j].tolist()]
+    return dict(rows=rows, matched=d["matched"], doc_index=d["doc_index"], prefix_mismatch=d["prefix_mismatch"],
+                unmapped=unmapped, sha_gold=d["sha_gold"])
+
+
+def load_link(path):                                                                            # [acc216]
+    """[acc216] --link-record: the first FAST point of a timed run's summary.json -> dict(path, counts (accepted,
+    rejected, committed, ticks)); dict(path, error) when it cannot be read (R_ACC_fast_link is a REPORT)."""
+    try:
+        pts = (json.load(open(path)).get("results") or {}).get("points") or []
+        p = next(p for p in pts if p.get("gemm") == "fast")
+        rs = p.get("round_stats") or {}
+        return dict(path=path, label=p.get("label"), counts=dict(accepted=rs.get("accepted"),
+                                                                 rejected=rs.get("rejected"),
+                                                                 committed=p.get("committed"), ticks=p.get("ticks")))
+    except Exception as e:                                       # noqa: BLE001 - a REPORT names the cause
+        return dict(path=path, error="%s: %s" % (type(e).__name__, str(e)[:200]))
+
+
+def serial_reference(a, model, cache, st, first, ops, env=None):                              # [acc216]
+    """[acc216] ACC_exact_vs_serial's reference: the BI serial greedy decode of rows 0 .. --serial-rows - 1 with ops
+    (bi_c_strict), --steps tokens per row (the first token included, as a round's committed list), on a COPY of the
+    build. It is r2_evalacc's own path: RealEnv.subset (r2_bi_decode.subset_state) and RealEnv.frc (attach_bi, then
+    r2_g0bi_gate.decode_loop), the reference of EA_SG2_spec_equals_serial (r2_evalacc.py RealEnv.subset / frc).
+    subset_state copies the build's GPU windows, so main runs it BEFORE it frees them. env: the CPU test's stand-in
+    (default: RealEnv on this process's model, torch and r2_g0bi_gate)."""
+    if env is None:
+        import torch
+        import r2_evalacc as EA
+        env = EA.RealEnv()                                           # no setup(): the model is loaded already
+        env.torch, env.GB, env.model = torch, GB, model
+    rows = list(range(a.serial_rows))
+    t0 = time.time()
+    c, s = env.subset(cache, st, rows)
+    try:
+        toks = env.frc(c, s, ops, [first[i] for i in rows], a.steps)
+    finally:
+        del c, s
+        env.free()
+    return dict(rows=rows, tokens=[[int(x) for x in t] for t in toks], steps=a.steps, gemm=getattr(ops, "mode", None),
+                wall_s=round(time.time() - t0, 1),
+                source="r2_evalacc.RealEnv.subset / frc (the serial reference of EA_SG2_spec_equals_serial)")
+
+
+def _acc_point(res, gemm):                                                                      # [acc216]
+    return next((p for p in res.get("points") or [] if p.get("gemm") == gemm), None)
+
+
+def acc_gates(a, meta, res, gates, pairs, bad_pairs=(), gold=None, link=None):                 # [acc216]
+    """[acc216] The gates of --store-committed-tokens (module docstring). It reads only res["points"] (gemm,
+    committed_tokens, round_stats, committed, ticks), res["serial_reference"] and meta["peak_gb"], so the CPU test
+    plants one change at one site (one row's token list, one serial row, one count) and sees only that gate fail.
+    A gate runs only when its inputs exist: the EXACT gates need the bi_c_strict point, the AE gate both points.
+    The AE rule is r2_evalacc's (spec_metrics, spec_verdict_inputs, verdict, inside_noise; BANDS accept / gold).
+    FAST's noise is 0: this cell runs no FAST replica (FAST SPEC noise is |SF_rep - SF| in r2_evalacc); the timed runs
+    gave the same FAST counts in every run (R_ACC_fast_link REPORTS the link)."""
+    import r2_evalacc as EA
+    fast, exact = _acc_point(res, "fast"), _acc_point(res, ACC_EXACT)
+    ft = None if fast is None else fast.get("committed_tokens")
+    et = None if exact is None else exact.get("committed_tokens")
+    rec = res.setdefault("acc", {})
+    # 1. BATCH INVARIANCE: the EXACT tokens of rows that hold the same document
+    if et is not None:
+        if pairs:
+            diff = [(i, j) for (i, j) in pairs if et[i] != et[j]]
+            rec["exact_dup_rows"] = dict(pairs=len(pairs), differ=len(diff), first=diff[:5])
+            gates.append(GB.gate("ACC_exact_batch_invariance", not diff and not bad_pairs, True,
+                                 "EXACT (%s) rows that hold the same document: %d of %d pairs differ (first %s); the "
+                                 "prompt rows are equal in every pair: %s"
+                                 % (ACC_EXACT, len(diff), len(pairs), diff[:3],
+                                    "yes" if not bad_pairs else "NO, %s" % list(bad_pairs)[:3])))
+        else:
+            gates.append(GB.gate("R_ACC_exact_batch_invariance", True, False, "no row repeats a document (needs "
+                                 "--repeat-docs and B > the documents): batch invariance NOT tested"))
+    if ft is not None and pairs:
+        diff = [(i, j) for (i, j) in pairs if ft[i] != ft[j]]
+        rec["fast_dup_rows"] = dict(pairs=len(pairs), differ=len(diff), first=diff[:5])
+        gates.append(GB.gate("R_ACC_fast_dup_rows", True, False, "FAST rows that hold the same document: %d of %d pairs "
+                             "differ (FAST is not batch-invariant: REPORT)" % (len(diff), len(pairs))))
+    # 2. EXACT TARGET DISTRIBUTION: the EXACT round's rows 0 .. k - 1 = the BI serial decode (EA_SG2's logic)
+    ser = res.get("serial_reference")
+    if et is not None and ser is not None:
+        rows = list(ser["rows"])
+        agr = EA.seq_agreement([et[b] for b in rows], ser["tokens"])
+        ok = len(rows) > 0 and agr["full"] == len(rows) and ser.get("gemm") == ACC_EXACT
+        rec["exact_vs_serial"] = agr
+        gates.append(GB.gate("ACC_exact_vs_serial", ok, True,
+                             "EXACT round vs the BI serial %s decode: %d of %d rows' %d committed tokens equal; first "
+                             "divergence per row %s" % (ser.get("gemm"), agr["full"], len(rows), ser.get("steps"),
+                                                        agr["first_divergence"])))
+    # 3. ACCURACY EQUIVALENCE: r2_evalacc's band rule, FAST vs EXACT
+    if ft is not None and et is not None and fast.get("round_stats") and exact.get("round_stats"):
+        grows = sorted((gold or {}).get("rows", {}))
+
+        def metrics(p, toks):
+            return EA.spec_metrics([toks[b] for b in grows], p["round_stats"], [gold["rows"][b] for b in grows])
+        mf, me = metrics(fast, ft), metrics(exact, et)
+        crit = ["accept"] + (["gold"] if grows else [])
+        if not grows:                                    # no gold criterion: spec_verdict_inputs needs a number
+            mf["gold_match"] = me["gold_match"] = 0.0
+        diffs, noises, ses = EA.spec_verdict_inputs(me, mf, mf)      # SF_rep = SF: FAST noise 0 (docstring)
+        v = EA.verdict(diffs, noises, ses, crit)
+        pre = gold is None or (bool(grows) and not gold.get("prefix_mismatch") and not gold.get("unmapped"))
+        rec["ae"] = dict(fast=mf, exact=me, verdict=v, gold_rows=grows, rule="r2_evalacc.inside_noise / verdict")
+        gates.append(GB.gate("ACC_AE_fast_vs_exact", v["verdict"] == "EQUIVALENT" and pre, True,
+                             "FAST vs EXACT (%s), r2_evalacc's band rule, FAST noise 0: %s; %s; acceptance FAST %s "
+                             "EXACT %s (%s / %s decisions); gold match FAST %s EXACT %s over %d rows (first copies), "
+                             "%d tokens; gold precondition %s"
+                             % (ACC_EXACT, v["verdict"], "; ".join(
+                                 "%s d %+.5f allow %.5f cap %g %s" % (c, x["d"], x["allow"], x["cap"],
+                                                                     "ok" if x["ok"] else "OUT")
+                                 for c, x in v["criteria"].items()),
+                                mf["acceptance"], me["acceptance"], mf["decisions"], me["decisions"],
+                                mf["gold_match"] if grows else None, me["gold_match"] if grows else None, len(grows),
+                                mf["gold_n"], "ok" if pre else "FAILED (prefix mismatch %s, unmapped %s)"
+                                % ((gold or {}).get("prefix_mismatch"), (gold or {}).get("unmapped")))))
+    if ft is not None and et is not None:
+        agr = EA.seq_agreement(ft, et)
+        rec["fast_vs_exact_tokens"] = dict(full=agr["full"], requests=agr["requests"],
+                                           median_first_divergence=agr["median_first_divergence"])
+        gates.append(GB.gate("R_ACC_fast_vs_exact_tokens", True, False, "FAST vs EXACT committed tokens: %d of %d rows "
+                             "fully equal, median first divergence %s (not a gate: FAST is not batch-invariant)"
+                             % (agr["full"], agr["requests"], agr["median_first_divergence"])))
+    # 4. THE LINK TO THE TIMED RUNS (REPORT)
+    if fast is not None:
+        rs = fast.get("round_stats") or {}
+        mine = dict(accepted=rs.get("accepted"), rejected=rs.get("rejected"), committed=fast.get("committed"),
+                    ticks=fast.get("ticks"))
+        if link is None:
+            text = "FAST counts %s; no --link-record" % mine
+        elif link.get("error"):
+            text = "FAST counts %s; link record %s unreadable: %s" % (mine, link.get("path"), link["error"])
+        else:
+            same = link["counts"] == mine
+            text = "FAST counts %s vs the timed record %s (%s) %s: %s" % (
+                mine, link["path"], link.get("label"), link["counts"],
+                "EQUAL (this proof ran the timed path)" if same else "DIFFER (the proof did NOT reproduce the timed run)")
+        rec["fast_link"] = text
+        gates.append(GB.gate("R_ACC_fast_link", True, False, text))
+    peak = meta.get("peak_gb")
+    gates.append(GB.gate("R_ACC_peak", True, False, "peak allocated %s GB over every point (the timing cells' cap %g GB: "
+                         "%s)" % (peak, ACC_CAP_GB, "inside" if peak is not None and peak <= ACC_CAP_GB else "OUTSIDE")))
 
 
 def headline_tick_ms(p):                                                                        # [integ5]
@@ -1382,7 +1624,7 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
                                    held=getattr(svc, "arrival_held", None))
         if eng.xpool is not None:                       # [xpool]; [integ3] every pool arm (the M2 witnesses)
             info["xpool"] = eng.xpool.report()
-        if fp is not None:                                                                       # [xpool]
+        if fp is not None or getattr(a, "store_committed_tokens", False):                        # [xpool] [acc216]
             info["committed_tokens"] = [list(r.out) for r in rnd.reqs]
         rs = summarize(eng.timer.report())
         info["round"] = rs
@@ -1798,6 +2040,19 @@ def main(argv=None) -> int:
             raise SystemExit("REFUSED: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0 and NOSI_POOL_BLOCKS 0 are needed")
         docs, sha, rep = load_docs(a)
         meta.update(workload_sha256=sha, repeated_docs=rep, torch=torch.__version__, gpu=torch.cuda.get_device_name(0))
+        acc = None
+        if a.store_committed_tokens:                                   # [acc216] the inputs of acc_gates, before the
+            n_docs = doc_count(a) if rep else a.batch                  # model (a bad gold workload refuses here)
+            pairs = dup_pairs(a.batch, n_docs) if rep else []
+            acc = dict(pairs=pairs, bad_pairs=prompts_differ(docs, pairs),
+                       gold=gold_rows(a, docs, n_docs) if a.gold_workload else None,
+                       link=load_link(a.link_record) if a.link_record else None)
+            meta["acc216"] = dict(n_docs=n_docs, dup_pairs=len(pairs), bad_prompt_pairs=acc["bad_pairs"][:5],
+                                  serial_rows=a.serial_rows if ACC_EXACT in a.modes else 0,
+                                  gold_rows=None if acc["gold"] is None else sorted(acc["gold"]["rows"]),
+                                  gold_matched=None if acc["gold"] is None else acc["gold"]["matched"],
+                                  gold_sha256=None if acc["gold"] is None else acc["gold"]["sha_gold"],
+                                  link_record=a.link_record or None)
         attn = GB.load_by_path(a.biattn, "piece3_bi_paged_attention")
         ext = None
         if a.transport == "gilfree":
@@ -1849,6 +2104,13 @@ def main(argv=None) -> int:
             prompts = [docs[b, :a.S] for b in range(a.batch)]
             horizon = max(a.steps, a.sweep_steps) + a.LAMBDA + 64
             cache, st, first_t = build_ragged(model, prompts, horizon, f4_fix=True)
+            if acc is not None and ACC_EXACT in a.modes and a.serial_rows > 0:    # [acc216] needs the GPU windows
+                log("ACC: the BI serial %s decode of rows 0 .. %d (a copy of the build)" % (ACC_EXACT, a.serial_rows - 1))
+                res["serial_reference"] = serial_reference(
+                    a, model, cache, st, [int(x) for x in first_t.view(-1).tolist()],
+                    BIOps(select_attn(a, attn), a.m_fix, gemm=ACC_EXACT))
+                meta["serial_peak_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 3)    # REPORT
+                save()
             for lay in cache.layers:                                   # the tick's own store replaces the windows
                 e = lay.cache_engine
                 e._k_gpu = e._v_gpu = e._kv_bias_gpu = None
@@ -1913,6 +2175,8 @@ def main(argv=None) -> int:
             write_stack_bands(a, meta, res, gates)
         if a.eval_role == "fast-time":                                                         # [evalsplit]
             eval_gates(a, meta, res, gates)
+        if acc is not None:                                                                    # [acc216]
+            acc_gates(a, meta, res, gates, acc["pairs"], acc["bad_pairs"], acc["gold"], acc["link"])
         save()
         for g in gates:
             print("%s %s %s: %s" % ("GATE" if g["must"] else "REPORT", g["name"], "PASS" if g["passed"] else "FAIL",
