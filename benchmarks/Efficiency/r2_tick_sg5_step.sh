@@ -266,6 +266,19 @@
 #   HW-RES   REPORT: the instrumented res share falls (evalfast2t 43.0 %); the gain is in res, not host residual
 #   HW-MEM   peak_gb <= 84 (MUST EF_mem_cap); the flags change no device allocation
 #
+# REGISTERED for evalfast2wi / evalfast2fr ([hostw2], STAMP 2026-10-23T02:01:01Z, before any run). WHY: evalfast2w
+# (both flags) ran 210.87 (nova05 hw1) / 211.75 (nova07 hw2) tok/s vs evalfast2t 260.01 / 261.90: HW-FALS fired on both
+# nodes. DIAG_evalfast2w.md: +150 ms on the median tick, all in end_tick (h_hs_takes +64, h_hs_merges +70); rank 1 cause
+# --b2-fewer-reads under --lean-time (one .tolist() of the FULL records, r2_own2.py:979-997, where lean read only the
+# masked entries); --wait-index cut h_superset_wait about 85 -> 6 ms on ticks 6-31 (the mean), not the median.
+#   WI-MED   evalfast2wi (evalfast2t + --wait-index): steady median point 264, band [254, 273]; WI-MEAN [200, 230];
+#            WI-EFF [175, 200]. REPORT: h_hs_merges 2-8 ms, h_superset_wait about 6 ms on ticks 6-31.
+#            FALSIFIER: h_hs_merges median > 15 ms or h_hs_takes median > 40 ms (the index costs end_tick time)
+#   FR-MED   evalfast2fr (evalfast2t + --b2-fewer-reads): steady median point 209, band [195, 225]; FR-MEAN [165, 195];
+#            FR-EFF [148, 172]. REPORT: h_hs_merges 65-82 ms. FALSIFIER: h_hs_merges median < 20 ms or the bare median
+#            tick < 700 ms (then fewer-reads is not the cause)
+#   W2-MEM   both peak_gb <= 84 (MUST EF_mem_cap)
+#
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
 #        _k5_report) names the per-layer demand (first misses needing a shared extra, free extras at the tick start,
@@ -341,7 +354,7 @@ NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                        
 NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-stack2                                             # ROOT of the stack1 cells only ([integ]; [stack2])
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
-NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-hostfix                                             # ROOT of the evalfast* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes)
+NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-hostw2                                              # ROOT of the evalfast* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree)
 EVALACC_OUT=/mnt/beegfs/ojerbi/r2-runs/evalacc                                           # ROOT (r2_evalacc_step.sh's OUTROOT)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
@@ -368,7 +381,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -386,6 +399,7 @@ for w in "$@"; do
         evalfast2|evalfast2t|evalfast2c) [ -z "$CELL" ] || usage; CELL=$w ;;                     # [hostfix]
         evalfast2f192|evalfast2t192|evalfast2c192) [ -z "$CELL" ] || usage; CELL=$w ;;            # [b192]
         evalfast2w) [ -z "$CELL" ] || usage; CELL=$w ;;                                             # [hostw]
+        evalfast2wi|evalfast2fr) [ -z "$CELL" ] || usage; CELL=$w ;;                                # [hostw2]
         *) usage ;;
     esac
 done
@@ -551,6 +565,15 @@ case $CELL in
                  --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
                  --eval-bands 270:330:215:270:185:235 --b2-resolve torch --host-profile --gc-freeze --lean-time
                  --wait-index --b2-fewer-reads) ;;
+    evalfast2wi|evalfast2fr) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_$CELL  # [hostw2]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched
+        if [ "$CELL" = evalfast2wi ]; then ONEFLAG=--wait-index ; BANDS=254:273:200:230:175:200
+        else ONEFLAG=--b2-fewer-reads ; BANDS=195:225:165:195:148:172
+        fi
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
+                 --eval-role fast-time --mem-cap-gb 84
+                 --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
+                 --eval-bands "$BANDS" --b2-resolve torch --host-profile --gc-freeze --lean-time "$ONEFLAG") ;;
     evalfast2c192) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1344 ; PRV=1296 ; SWEEP_RUN= ; SUFFIX=_evalfast2c192    # [b192]
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=192 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
         EVALARG=(--layout pool --X-pool 1344 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
