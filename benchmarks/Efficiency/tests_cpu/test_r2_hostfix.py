@@ -751,7 +751,7 @@ def test_HF5f_the_harness_wiring():
 # =====================================================================================================================
 REPO = HERE.parents[2]
 STEP = EFF / "r2_tick_sg5_step.sh"
-HF_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-hostw2"                    # [hostw2] (was nosi-r2-hostfix)
+HF_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-frfix"                     # [frfix] (was nosi-r2-hostw2)
 
 
 def test_HF6a_the_cells_and_the_registration_static():
@@ -759,7 +759,7 @@ def test_HF6a_the_cells_and_the_registration_static():
     lines = text.splitlines()
     root = next(ln for ln in lines if ln.startswith("NOSI_EVAL=")).split()[0][len("NOSI_EVAL="):]
     assert root == HF_ROOT
-    assert "|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr] [gilfree|gather]" in text
+    assert "|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx] [gilfree|gather]" in text
     assert "        evalfast2|evalfast2t|evalfast2c) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     reg = text[text.index("# REGISTERED for evalfast2t / evalfast2 / evalfast2c"):]
     reg = reg[:reg.index("\n#\n")]
@@ -972,6 +972,46 @@ def test_HF9b_the_split_cells_dryrun(tmp_path, cell):
     line = r.stdout.strip().splitlines()[-1]
     got = line.split("r2_tick_sg5.py ", 1)[1].strip().replace("\\,", ",")
     bands, wi, fr = W2_CELLS[cell]
+    for w in ("--batch 216", "--C 96 --X 1512 --R-ver 1464", "--layout pool --X-pool 1512 --arrival-lag 2", "--bare",
+              "--eval-role fast-time", "--mem-cap-gb 84", "--eval-bands " + bands, "--steps 48",
+              "PYTHONPATH=%s/nosi" % HF_ROOT):
+        assert w in got or w in line, (cell, w)
+    pa = _sg5().parse_args(got.split())
+    assert pa.b2_resolve == "torch" and pa.host_profile and pa.gc_freeze and pa.lean_time
+    assert (bool(pa.wait_index), bool(pa.b2_fewer_reads)) == (wi, fr), cell
+
+
+# HF10 [frfix] the device-selected --b2-fewer-reads: evalfast2fx (--b2-fewer-reads) / evalfast2wx (both flags)
+FX_CELLS = dict(evalfast2fx=("250:275:200:225:178:198", False, True),
+                evalfast2wx=("255:282:205:235:180:205", True, True))
+
+
+def test_HF10a_the_fix_cells_static():
+    text = STEP.read_text()
+    assert "        evalfast2fx|evalfast2wx) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
+    reg = text[text.index("# REGISTERED for evalfast2fx / evalfast2wx"):]
+    reg = reg[:reg.index("\n#\n")]
+    for tag in ("STAMP 2026-10-23T03:52:16Z", "FX-MED", "point 262, band [250, 275]", "FX-MEAN [200, 225]", "FX-EFF [178, 198]",
+                "FX-FALS", "h_hs_merges > 15 ms", "by > 20 ms", "WX-MED", "point 268, band [255, 282]",
+                "WX-MEAN [205, 235]", "WX-EFF [180, 205]", "263.8 / 267.7", "WX-FALS", "minus 5 tok/s", "< 255",
+                "FX-MEM", "peak_gb <= 84"):
+        assert tag in reg, tag
+    blk = text[text.index("    evalfast2fx|evalfast2wx) MODES=fast"):text.index("    evalfast2c192) MODES=fast")]
+    for cell, (bands, _, _) in FX_CELLS.items():
+        assert "BANDS=%s" % bands in blk, cell
+
+
+@pytest.mark.parametrize("cell", sorted(FX_CELLS))
+def test_HF10b_the_fix_cells_dryrun(tmp_path, cell):
+    if _clean_head() is None:
+        pytest.skip("not a clean git checkout (tracked changes or untracked files in nosi/): the DRYRUN needs one")
+    r = _dry(tmp_path, cell)
+    if r.returncode != 0:
+        assert Path(HF_ROOT).resolve() != REPO.resolve(), r.stderr[-400:]
+        pytest.skip("DRYRUN stopped outside the frfix ROOT: %s" % r.stderr.strip()[-200:])
+    line = r.stdout.strip().splitlines()[-1]
+    got = line.split("r2_tick_sg5.py ", 1)[1].strip().replace("\\,", ",")
+    bands, wi, fr = FX_CELLS[cell]
     for w in ("--batch 216", "--C 96 --X 1512 --R-ver 1464", "--layout pool --X-pool 1512 --arrival-lag 2", "--bare",
               "--eval-role fast-time", "--mem-cap-gb 84", "--eval-bands " + bands, "--steps 48",
               "PYTHONPATH=%s/nosi" % HF_ROOT):

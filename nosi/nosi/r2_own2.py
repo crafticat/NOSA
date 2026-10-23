@@ -724,6 +724,36 @@ class OwnResidency(ResidencySparse):
             at += n
         return out
 
+    @staticmethod
+    def _fr_merge_sel(V, D):
+        """[frfix] --b2-fewer-reads: the demand merges' record columns (l, b, h, blk) selected ON THE DEVICE: the verify
+        records with INFL or DUP, then the draft records with INFL, each part in record order (the entries that
+        V["l"][m] and D["l"][m] give). ONE nonzero over both parts' masks (one synchronization: the selection's size),
+        then one index_select. Returns (sel (4, n) int64, nv (1,) int64: the verify part's count), both for the caller's
+        ONE read; _fr_merge_split makes the host lists of that read. The full record never crosses."""
+        cols, masks = [], []
+        nv = None
+        for X, m_of in ((V, lambda f: O.has(f, O.INFL) | O.has(f, O.DUP)), (D, lambda f: O.has(f, O.INFL))):
+            if X is None:
+                continue
+            m = m_of(X["flags"])
+            if nv is None:                                            # the first part present: V's count, or 0
+                nv = m.sum().reshape(1) if X is V else torch.zeros(1, dtype=torch.int64, device=m.device)
+            cols.append(torch.stack([X[n].to(torch.int64) for n in ("l", "b", "h", "blk")]))
+            masks.append(m)
+        if not cols:
+            return None, None
+        idx = torch.cat(masks).nonzero().squeeze(1)                   # ascending: V's entries, then D's
+        return torch.cat(cols, 1).index_select(1, idx), nv.to(torch.int64)
+
+    @staticmethod
+    def _fr_merge_split(flat, nv):
+        """[frfix] the host lists of _fr_merge_sel's read: flat = sel.reshape(-1).tolist() (l, b, h, blk rows of n
+        entries each), nv the verify count. Returns (verify merges, draft merges), lists of (l, b, h, blk)."""
+        n = len(flat) // 4
+        m = list(zip(flat[:n], flat[n:2 * n], flat[2 * n:3 * n], flat[3 * n:]))
+        return m[:nv], m[nv:]
+
     def _apply_b2(self, steps: List[Dict], info: List[Dict]) -> None:
         t_hp = self._hp0()                                            # [hostfix] --host-profile (0: off)
         T, G = self.own, self.own.geo
@@ -975,22 +1005,29 @@ class OwnResidency(ResidencySparse):
             self._count("free", 1)
         t_hp = self._hp("h_hs_victims", t_hp)
         # the takes, in K3X order (the vendored _take's Transfer, res.py:476-489)
-        vcols = dcols = rcl = None
+        vcols = rcl = fm = nref_fr = None
         if evh is not None:                                           # [hostfix] --b2-fewer-reads: ONE read of the
-            vn, dn = ("l", "b", "h", "blk", "flags", "j"), ("l", "b", "h", "blk", "flags")   # takes, the merges' and
-            cols = [takes[n] for n in ("l", "b", "h", "blk", "slot", "gen", "rd_old")]     # the looks' record
-            cols += [V[n] for n in vn] if V is not None else []                             # columns and the
-            cols += [D[n] for n in dn] if D is not None else []                             # recency counts (none
+            vn = ("l", "b", "h", "blk", "flags", "j")                 # takes, the merges selected on the device
+            cols = [takes[n] for n in ("l", "b", "h", "blk", "slot", "gen", "rd_old")]     # ([frfix]), the looks'
+            looks = V is not None and not self.lean                                         # record columns (not
+            cols += [V[n] for n in vn] if looks else []                                     # lean: the looks read
+            msel, mnv = self._fr_merge_sel(V, D)                                            # all of V anyway), the
+            cols += [msel, mnv] if msel is not None else []                                 # refusal count and the
+            if D is not None and not self.lean:                                             # recency counts (none
+                cols.append(O.has(D["flags"], O.REFUSED).sum())                             # changes after its op:
             cols.append(torch.stack([torch.as_tensor(rc[n]).to(device=self.device, dtype=torch.int64).reshape(())
-                                     for n in ("touch", "acquire", "evict_po", "evict_rel")]))   # changes after
-            got = self._fr_read(cols)                                                       # its op: same values)
+                                     for n in ("touch", "acquire", "evict_po", "evict_rel")]))   # same values)
+            got = self._fr_read(cols)
             lt, bt, ht, blk, slot, gen, rdo = got[:7]
             at = 7
-            if V is not None:
+            if looks:
                 vcols = dict(zip(vn, got[at:at + len(vn)]), src=evh["src"])
                 at += len(vn)
-            if D is not None:
-                dcols = dict(zip(dn, got[at:at + len(dn)]))
+            if msel is not None:
+                fm = self._fr_merge_split(got[at], got[at + 1][0])
+                at += 2
+            if D is not None and not self.lean:
+                nref_fr = got[at][0]
             rcl = got[-1]
             tk = [q for q, kd in enumerate(evh["kind"]) if kd != 2]   # = (kind != 2).nonzero(), ascending
             part, jrow = evh["part"], evh["j"]
@@ -1038,10 +1075,8 @@ class OwnResidency(ResidencySparse):
         t_hp = self._hp("h_hs_takes", t_hp)                           # the take columns' reads and the per-take loop
         # the demand merges on the transfers (res.py:605-611, :672-674)
         if V is not None:
-            if vcols is not None:                                     # [hostfix] the host filter of the ONE read:
-                vm = O.INFL | O.DUP                                   # has(INFL) | has(DUP), in record order
-                merges = [(l, b, h, t) for (l, b, h, t, fl) in zip(vcols["l"], vcols["b"], vcols["h"], vcols["blk"],
-                                                                   vcols["flags"]) if fl & vm]
+            if fm is not None:                                        # [frfix] selected on the device, in record
+                merges = fm[0]                                        # order (_fr_merge_sel), from the ONE read
             else:
                 m = O.has(V["flags"], O.INFL) | O.has(V["flags"], O.DUP)
                 merges = zip(V["l"][m].tolist(), V["b"][m].tolist(), V["h"][m].tolist(), V["blk"][m].tolist())
@@ -1050,9 +1085,8 @@ class OwnResidency(ResidencySparse):
                 if tr is not None and not self.mut.drop_demand_merge:
                     tr.demand.add(VERIFY)
         if D is not None:
-            if dcols is not None:                                     # [hostfix] the host filter of the ONE read
-                merges = [(l, b, h, t) for (l, b, h, t, fl) in zip(dcols["l"], dcols["b"], dcols["h"], dcols["blk"],
-                                                                   dcols["flags"]) if fl & O.INFL]
+            if fm is not None:                                        # [frfix] selected on the device
+                merges = fm[1]
             else:
                 m = O.has(D["flags"], O.INFL)
                 merges = zip(D["l"][m].tolist(), D["b"][m].tolist(), D["h"][m].tolist(), D["blk"][m].tolist())
@@ -1061,8 +1095,8 @@ class OwnResidency(ResidencySparse):
                 if tr is not None and not self.mut.drop_demand_merge:
                     tr.demand.add(DRAFT)
             if not self.lean:                                         # [hostfix] --lean-time: a REPORT count (a read)
-                if dcols is not None:                                 # [hostfix] fewer reads: from the ONE read
-                    nref = sum(1 for fl in dcols["flags"] if fl & O.REFUSED)
+                if nref_fr is not None:                               # [frfix] counted on the device, ONE read
+                    nref = nref_fr
                 else:
                     nref = int(O.has(D["flags"], O.REFUSED).sum())
                 if nref:

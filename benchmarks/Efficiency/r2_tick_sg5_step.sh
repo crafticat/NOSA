@@ -279,6 +279,19 @@
 #            tick < 700 ms (then fewer-reads is not the cause)
 #   W2-MEM   both peak_gb <= 84 (MUST EF_mem_cap)
 #
+# REGISTERED for evalfast2fx / evalfast2wx ([frfix], STAMP 2026-10-23T03:52:16Z, before any run). WHY: the fix in r2_own2.py makes
+# --b2-fewer-reads select on the device: it removes the .tolist() of the FULL records and the Python filter. evalfast2fr
+# ran 216.8 tok/s vs the control 259.7-260.1 (hw3/hw4), at 150 ms/tick extra, all in h_hs_takes / h_hs_merges.
+#   FX-MED   evalfast2fx (evalfast2t + --b2-fewer-reads, the device-selected fix): steady median point 262, band [250, 275];
+#            FX-MEAN [200, 225]; FX-EFF [178, 198].
+#   FX-FALS  FALSIFIED if the evalfast2fx median < 250, or the median tick's h_hs_merges > 15 ms, or its h_hs_takes
+#            exceeds the control's by > 20 ms
+#   WX-MED   evalfast2wx (evalfast2t + --wait-index --b2-fewer-reads): steady median point 268, band [255, 282];
+#            WX-MEAN [205, 235]; WX-EFF [180, 205]. --wait-index alone gave 263.8 / 267.7.
+#   WX-FALS  FALSIFIED if the evalfast2wx median < the evalfast2wi median of the same job minus 5 tok/s (if both run in
+#            one job), else if it is < 255
+#   FX-MEM   both peak_gb <= 84 (MUST EF_mem_cap; same as W2-MEM)
+#
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
 #        _k5_report) names the per-layer demand (first misses needing a shared extra, free extras at the tick start,
@@ -354,7 +367,7 @@ NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                        
 NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-stack2                                             # ROOT of the stack1 cells only ([integ]; [stack2])
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
-NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-hostw2                                              # ROOT of the evalfast* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree)
+NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-frfix                                               # ROOT of the evalfast* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree; [frfix] own worktree)
 EVALACC_OUT=/mnt/beegfs/ojerbi/r2-runs/evalacc                                           # ROOT (r2_evalacc_step.sh's OUTROOT)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
@@ -381,7 +394,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -400,6 +413,7 @@ for w in "$@"; do
         evalfast2f192|evalfast2t192|evalfast2c192) [ -z "$CELL" ] || usage; CELL=$w ;;            # [b192]
         evalfast2w) [ -z "$CELL" ] || usage; CELL=$w ;;                                             # [hostw]
         evalfast2wi|evalfast2fr) [ -z "$CELL" ] || usage; CELL=$w ;;                                # [hostw2]
+        evalfast2fx|evalfast2wx) [ -z "$CELL" ] || usage; CELL=$w ;;                                # [frfix]
         *) usage ;;
     esac
 done
@@ -574,6 +588,15 @@ case $CELL in
                  --eval-role fast-time --mem-cap-gb 84
                  --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
                  --eval-bands "$BANDS" --b2-resolve torch --host-profile --gc-freeze --lean-time "$ONEFLAG") ;;
+    evalfast2fx|evalfast2wx) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_$CELL  # [frfix]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched
+        if [ "$CELL" = evalfast2fx ]; then FXFLAGS=(--b2-fewer-reads) ; BANDS=250:275:200:225:178:198
+        else FXFLAGS=(--wait-index --b2-fewer-reads) ; BANDS=255:282:205:235:180:205
+        fi
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
+                 --eval-role fast-time --mem-cap-gb 84
+                 --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
+                 --eval-bands "$BANDS" --b2-resolve torch --host-profile --gc-freeze --lean-time "${FXFLAGS[@]}") ;;
     evalfast2c192) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1344 ; PRV=1296 ; SWEEP_RUN= ; SUFFIX=_evalfast2c192    # [b192]
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=192 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
         EVALARG=(--layout pool --X-pool 1344 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
