@@ -751,7 +751,7 @@ def test_HF5f_the_harness_wiring():
 # =====================================================================================================================
 REPO = HERE.parents[2]
 STEP = EFF / "r2_tick_sg5_step.sh"
-HF_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-frfix"                     # [frfix] (was nosi-r2-hostw2)
+HF_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-resfix"                    # [resfix] (was [frfix]'s nosi-r2-frfix)
 
 
 def test_HF6a_the_cells_and_the_registration_static():
@@ -759,7 +759,7 @@ def test_HF6a_the_cells_and_the_registration_static():
     lines = text.splitlines()
     root = next(ln for ln in lines if ln.startswith("NOSI_EVAL=")).split()[0][len("NOSI_EVAL="):]
     assert root == HF_ROOT
-    assert "|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx] [gilfree|gather]" in text
+    assert "|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl] [gilfree|gather]" in text
     assert "        evalfast2|evalfast2t|evalfast2c) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     reg = text[text.index("# REGISTERED for evalfast2t / evalfast2 / evalfast2c"):]
     reg = reg[:reg.index("\n#\n")]
@@ -1019,6 +1019,48 @@ def test_HF10b_the_fix_cells_dryrun(tmp_path, cell):
     pa = _sg5().parse_args(got.split())
     assert pa.b2_resolve == "torch" and pa.host_profile and pa.gc_freeze and pa.lean_time
     assert (bool(pa.wait_index), bool(pa.b2_fewer_reads)) == (wi, fr), cell
+
+
+# HF11 [resfix] evalfast2wx + one flag: evalfast2rp (--b2-res-profile) / evalfast2rl (--res-lean)
+RX_CELLS = dict(evalfast2rp=("200:340:150:300:120:260", True, False),
+                evalfast2rl=("280:330:225:265:195:225", False, True))
+
+
+def test_HF11a_the_resfix_cells_static():
+    text = STEP.read_text()
+    assert "        evalfast2rp|evalfast2rl) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
+    assert "|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl] [gilfree|gather]" in text
+    reg = text[text.index("# REGISTERED for evalfast2rp / evalfast2rl"):]
+    reg = reg[:reg.index("\n#\n")]
+    for tag in ("STAMP 2026-10-23T10:08:04Z", "RP ", "13,900", "60-120 ms", "REPORT only", "RL-MED", "point 300, band [280, 330]", "308",
+                "RL-MEAN  [225, 265]", "RL-EFF [195, 225]", "RL-FALS", "median < 275", ">= 40 ms", "RL-MEM",
+                "peak_gb <= 84", "nosi-r2-resfix"):
+        assert tag in reg, tag
+    blk = text[text.index("    evalfast2rp|evalfast2rl) MODES=fast"):text.index("    evalfast2c192) MODES=fast")]
+    for cell, (bands, _, _) in RX_CELLS.items():
+        assert "BANDS=%s" % bands in blk, cell
+    assert "STEP_MIN=150" in blk and "--wait-index" in blk and "--b2-fewer-reads" in blk
+
+
+@pytest.mark.parametrize("cell", sorted(RX_CELLS))
+def test_HF11b_the_resfix_cells_dryrun(tmp_path, cell):
+    if _clean_head() is None:
+        pytest.skip("not a clean git checkout (tracked changes or untracked files in nosi/): the DRYRUN needs one")
+    r = _dry(tmp_path, cell)
+    if r.returncode != 0:
+        assert Path(HF_ROOT).resolve() != REPO.resolve(), r.stderr[-400:]
+        pytest.skip("DRYRUN stopped outside the resfix ROOT: %s" % r.stderr.strip()[-200:])
+    line = r.stdout.strip().splitlines()[-1]
+    got = line.split("r2_tick_sg5.py ", 1)[1].strip().replace("\\,", ",")
+    bands, prof, lean = RX_CELLS[cell]
+    for w in ("--batch 216", "--C 96 --X 1512 --R-ver 1464", "--layout pool --X-pool 1512 --arrival-lag 2", "--bare",
+              "--eval-role fast-time", "--mem-cap-gb 84", "--eval-bands " + bands, "--steps 48",
+              "PYTHONPATH=%s/nosi" % HF_ROOT, "--time=%d" % (150 if prof else 120)):
+        assert w in got or w in line, (cell, w)
+    pa = _sg5().parse_args(got.split())
+    assert pa.b2_resolve == "torch" and pa.host_profile and pa.gc_freeze and pa.lean_time
+    assert pa.wait_index and pa.b2_fewer_reads, cell                  # evalfast2wx's flags
+    assert (bool(pa.b2_res_profile), bool(pa.res_lean)) == (prof, lean), cell
 
 
 def test_HF1c_the_harness_wiring():

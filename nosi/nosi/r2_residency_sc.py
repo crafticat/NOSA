@@ -79,6 +79,8 @@ host-to-device copies (the mirror delta, the row inputs) and one device-to-host 
 """
 from __future__ import annotations
 
+import itertools
+import operator
 import threading
 import time
 from collections import deque
@@ -98,6 +100,7 @@ from .kstep.ownership import FREE, INFLIGHT, LRU, PO, RELEASING, VRES
 from . import r2_xpool as XP
 from .r2_residency import BLOCK, N_TAIL, VERIFY, Plan, Residency, Row
 from .r2_residency_sb import FIELDS, DraftMirror, ResidencySB, device_draft, rank_in_group
+from .r2_residency_sb import LeanConsts, device_draft_lean, rank_prep, rank_with   # [resfix] --res-lean
 
 FIELDS_V = ("blk", "valid", "ready", "slot", "infl", "infl_slot", "infl_gen", "dup", "granted", "take_slot", "rslot",
             "protect", "evict", "evict_blk", "evict_infl", "ev_gen")
@@ -111,6 +114,9 @@ RECENCY_KINDS = ("touch", "admit", "acquire")             # the events that put 
 STAMP_KINDS = RECENCY_KINDS + ("take",)                   # + take: the issue order of the in-flight prefetches (12j)
 BIG_STAMP = 1 << 62
 HALF_STAMP = 1 << 61                                      # Policy E's in-flight candidates sort after every LRU one
+_ROW5 = operator.attrgetter("b", "kind", "key", "pos", "hist_bound")   # [resfix] a row's sig without its tail
+_TAIL = operator.attrgetter("tail")                                    # [resfix]
+_KEY = operator.attrgetter("key")                                      # [resfix]
 
 
 class _ProtDict(dict):
@@ -236,6 +242,61 @@ class DeviceMirror:
                            infl_unprot=fly & (self.prot[l] == 0),
                            infl_rank=torch.where(fly, frank.view(B, H, NPOS), torch.full_like(code, -1)),
                            fly=fly, fly_stamp=fly_stamp, slot_gen=gen.clone())
+
+    def layer_lean(self, l: int, cst: LeanConsts) -> LayerMirror:
+        """[resfix] layer(l) for --res-lean, the same values: the aranges, the slot index map, the scatter source of
+        the ranks and the constant fills come from the tick's cache (cst); the resident test is computed once (layer
+        computes code == C_LRU / C_PO / C_VRES twice); usage is the count of ~free. slot_block and slot_gen are VIEWS
+        of the table, not clones: nothing writes self.block / self.gen between this call and the last read of the
+        layer's mirror (only sync_mirror and apply write them, at a tick's first resolve), and no decision op writes
+        slot_block or slot_gen (device_verify reads them; device_draft and the record do not read them). Every field a
+        decision op WRITES (slot_of, inflight, infl_slot, free, usage) is a fresh tensor, as in layer()."""
+        code, blk, gen, cur = self.code[l], self.block[l], self.gen[l], self.cur[l]   # (B, H, NPOS)
+        B, H, NPOS = code.shape
+        NBLK = self.nblk
+        dev = code.device
+        fl = cst.full_like
+        okb = (blk >= 0) & (blk < NBLK)
+        base = cst.memo(("dm_base", B, H, NBLK),
+                        lambda: (cst.ar(B).view(B, 1, 1) * H + cst.ar(H).view(1, H, 1)) * NBLK)
+        dummy = B * H * NBLK                                                       # one extra element takes the rest
+        flat = base + blk.clamp(min=0, max=NBLK - 1)
+        idx = cst.memo(("dm_idx", B, H, NPOS), lambda: cst.ar(NPOS).view(1, 1, NPOS).expand(B, H, NPOS).reshape(-1))
+        lru = code == C_LRU
+        resident = lru | (code == C_PO) | (code == C_VRES)
+        res = okb & resident
+        fly = okb & (code == C_INFLIGHT) & (cur != 0)
+        at_res = torch.where(res, flat, fl(flat, dummy)).reshape(-1)
+        at_fly = torch.where(fly, flat, fl(flat, dummy)).reshape(-1)
+        slot_of = torch.full((dummy + 1,), -1, dtype=torch.int64, device=dev)
+        slot_of[at_res] = idx                                                      # one resident slot per block (K3)
+        infl_slot = torch.full((dummy + 1,), -1, dtype=torch.int64, device=dev)
+        infl_slot[at_fly] = idx                                                    # one owner transfer per block
+        infl_gen = torch.zeros((dummy + 1,), dtype=torch.int64, device=dev)
+        infl_gen[at_fly] = gen.reshape(-1)
+        shp = (B, H, NBLK)
+        big = fl(code, BIG_STAMP)
+        lru_stamp = torch.where(lru, self.stamp[l], big)
+        order = torch.sort(lru_stamp.view(B * H, NPOS), dim=-1).indices
+        src = cst.memo(("dm_src", B * H, NPOS), lambda: cst.ar(NPOS).view(1, NPOS).expand(B * H, NPOS).contiguous())
+        rank = torch.empty_like(order)
+        rank.scatter_(1, order, src)
+        fly_stamp = torch.where(fly, self.stamp[l], big)
+        forder = torch.sort(fly_stamp.view(B * H, NPOS), dim=-1).indices
+        frank = torch.empty_like(forder)
+        frank.scatter_(1, forder, src)
+        neg = fl(code, -1)
+        free = code == C_FREE
+        isl = infl_slot[:dummy]
+        return LayerMirror(slot_of=slot_of[:dummy].view(shp), inflight=(isl >= 0).view(shp),
+                           infl_slot=isl.view(shp), infl_gen=infl_gen[:dummy].view(shp),
+                           free=free, usage=(~free).to(torch.int64).sum(-1),
+                           releasing=code == C_RELEASING,
+                           lru_rank=torch.where(lru, rank.view(B, H, NPOS), neg),
+                           prot=resident & (self.prot[l] != 0), lru_stamp=lru_stamp, slot_block=blk,
+                           infl_unprot=fly & (self.prot[l] == 0),
+                           infl_rank=torch.where(fly, frank.view(B, H, NPOS), neg),
+                           fly=fly, fly_stamp=fly_stamp, slot_gen=gen)
 
 
 class VerifyMirror(DraftMirror):
@@ -488,6 +549,144 @@ def device_verify(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, mut=N
                          (bb_f, hh_f), counters)
     dec.skip_infl_wait = "no_inflight_wait" in mut
     return dec
+
+
+def _selected_mask_lean(S: int, H: int, NBLK: int, parts, cst: LeanConsts) -> torch.Tensor:
+    """[resfix] _selected_mask for --res-lean, the same values. parts: [(s (R, H, k) the permuted selection, ok its
+    validity (_selected_mask's ok = device_verify's / device_draft's valid0: the same formula), sidn3 (R, H, 1) =
+    (rb * H + h) * NBLK, a tick constant)]."""
+    acc = torch.zeros(S * NBLK + 1, dtype=torch.int64, device=cst.device)
+    for (s_, ok, sidn3) in parts:
+        f = torch.where(ok, sidn3 + s_.clamp(min=0), cst.full_like(s_, S * NBLK))
+        acc.index_add_(0, f.reshape(-1), ok.reshape(-1).to(torch.int64))
+    return acc[:S * NBLK] > 0
+
+
+def device_verify_lean(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, cst: LeanConsts, rc: Dict, others=(),
+                       inflight: bool = True) -> VerifyDecision:
+    """[resfix] device_verify without mut (no negative control), the same values. rc: the tick's verify-row constants
+    (ResidencySC._lean_rows_c: bb, hh views, bb_f, hh_f, sid, sidN = sid * NBLK, sidP = sid * NPOS, sidn3, tval,
+    rk = rank_prep(sid): one stable sort of the stream ids per tick for the three rank_in_group calls); others
+    [(s, ok, sidn3)] of the layer's other rows (_selected_mask_lean). Computed once where device_verify computes twice:
+    cand | cand_f, sid * NBLK + ev_blk. The bool fields stay bool (no int64 cast)."""
+    H, Rv, k = sel.shape
+    dev = sel.device
+    B, _, NBLK = m.slot_of.shape
+    NPOS = m.free.shape[-1]
+    S = B * H
+    BIG = NBLK + 1
+    fl = cst.full_like
+    s = sel.permute(1, 0, 2)                                                       # (Rv, H, k)
+    valid0 = (s >= 0) & (s < hb.view(Rv, 1, 1)) & (s < NBLK)
+    srt = torch.sort(torch.where(valid0, s, fl(s, BIG)), dim=-1).values
+    prev = torch.cat([fl(srt[..., :1], -1), srt[..., :-1]], dim=-1)
+    valid = (srt < BIG) & (srt != prev)                                             # unique, ascending
+    blk = torch.where(valid, srt, fl(srt, 0))
+    bb, hh = rc["bb"], rc["hh"]
+    slot = m.slot_of[bb, hh, blk]
+    ready = valid & (slot >= 0)
+    infl = valid & ~ready & m.inflight[bb, hh, blk]
+    islot = m.infl_slot[bb, hh, blk]
+    igen = m.infl_gen[bb, hh, blk]
+    miss = valid & ~ready & ~infl
+    N = Rv * H * k
+    sid, bb_f, hh_f = rc["sid"], rc["bb_f"], rc["hh_f"]
+    blk_f = blk.reshape(N)
+    miss_f = miss.reshape(N)
+    mkey = torch.where(miss_f, rc["sidN"] + blk_f, fl(blk_f, S * NBLK))
+    ks, perm = torch.sort(mkey, stable=True)
+    first_sorted = torch.cat([fl(ks[:1], True, dtype=torch.bool), ks[1:] != ks[:-1]])
+    first = torch.empty_like(first_sorted)
+    first[perm] = first_sorted
+    fmiss = miss_f & first
+    dup = miss_f & ~first
+    rank_s = rank_with(rc["rk"], fmiss)
+    usage = m.usage.reshape(S)
+    free_local = (C - usage).clamp(min=0)
+    needs_extra = fmiss & (rank_s >= free_local[sid])
+    borrowed = (usage - C).clamp(min=0).sum()
+    budget = (X - borrowed).clamp(min=0)                                            # (device_verify: - 0, no mut)
+    ne = needs_extra.to(torch.int64)
+    g = ne.cumsum(0) - ne
+    granted = fmiss & (~needs_extra | (g < budget))
+    refused_k5 = fmiss & ~granted
+    q = rank_with(rc["rk"], granted)
+    ar = cst.ar(NPOS).view(1, NPOS).expand(S, NPOS)
+    free_sorted = torch.sort(torch.where(m.free.reshape(S, NPOS), ar, fl(ar, NPOS)), dim=-1).values
+    selm = _selected_mask_lean(S, H, NBLK, [(s, valid0, rc["sidn3"])] + list(others), cst)
+    sblk = m.slot_block.reshape(S, NPOS)
+    sidn_slot = cst.memo(("sidn_slot", S, NBLK), lambda: cst.ar(S).view(S, 1) * NBLK)   # (S, 1): broadcasts
+    in_sel = (sblk >= 0) & (sblk < NBLK) & selm[sidn_slot + sblk.clamp(min=0, max=NBLK - 1)]
+    cand = m.lru_stamp.reshape(S, NPOS) < BIG_STAMP                                 # LRU slots
+    fly = m.fly.reshape(S, NPOS)                                                    # the owner's slots in flight
+    cand_f = m.infl_unprot.reshape(S, NPOS)
+    if not inflight:                                                                # 12h's rule (a negative control)
+        cand_f = torch.zeros_like(cand_f)
+    cand = cand & ~m.prot.reshape(S, NPOS)
+    cand = cand & ~in_sel
+    cand_f = cand_f & ~in_sel
+    fkey = HALF_STAMP + m.fly_stamp.reshape(S, NPOS).clamp(max=HALF_STAMP)
+    ckey = torch.where(cand, m.lru_stamp.reshape(S, NPOS), fkey)
+    any_c = cand | cand_f
+    ckey = torch.where(any_c, ckey, fl(ckey, BIG_STAMP))
+    cand_sorted = torch.sort(ckey, dim=-1).indices                                  # candidates first, oldest first
+    n_cand = any_c.to(torch.int64).sum(-1)                                          # (S,)
+    r_ev = rank_with(rc["rk"], refused_k5)
+    evicted = refused_k5 & (r_ev < n_cand[sid])
+    ev_slot = cand_sorted[sid, r_ev.clamp(max=NPOS - 1)]
+    ev_blk = torch.where(evicted, sblk[sid, ev_slot], fl(ev_slot, -1))
+    ev_infl = evicted & fly[sid, ev_slot]                                           # a superseded prefetch (12j)
+    ev_gen = torch.where(ev_infl, m.slot_gen.reshape(S, NPOS)[sid, ev_slot], fl(ev_slot, 0))
+    over = refused_k5 & ~evicted
+    taken = granted | evicted
+    neg = fl(q, -1)
+    take_slot = torch.where(granted, free_sorted[sid, q.clamp(max=NPOS - 1)], torch.where(evicted, ev_slot, neg))
+    pos = cst.ar(N)
+    gstart = torch.cummax(torch.where(first_sorted, pos, fl(pos, 0)), 0).values
+    grp_slot = torch.empty_like(take_slot)
+    grp_slot[perm] = take_slot[perm][gstart]
+    rslot = torch.where(ready.reshape(N), slot.reshape(N),
+                        torch.where(infl.reshape(N), islot.reshape(N),
+                                    torch.where(fmiss, take_slot, torch.where(dup, grp_slot, neg))))
+    valid_f = valid.reshape(N)
+    hole = valid_f & (rslot < 0)                                                    # an overflowed block
+    rslot_page = torch.where(hole, fl(rslot, 0), rslot)                             # in bounds; the flag voids the tick
+    vkey = torch.where(valid, srt, fl(srt, BIG))
+    vperm = torch.sort(vkey, dim=-1).indices
+    pslot = torch.gather(rslot_page.view(Rv, H, k), -1, vperm)
+    nvalid = valid.to(torch.int64).sum(-1)                                          # (Rv, H)
+    T = tails.shape[1]
+    P = k + T
+    page = torch.full((Rv, H, P), -1, dtype=torch.int64, device=dev)
+    posk = cst.ar(k).view(1, 1, k)
+    page[..., :k] = torch.where(posk < nvalid.unsqueeze(-1), pslot, fl(pslot, -1))
+    post = cst.ar(T).view(1, 1, T)
+    page.scatter_(-1, nvalid.unsqueeze(-1) + post, rc["tval"])
+    num_pages = nvalid + nt.view(Rv, 1)
+    col = torch.where(taken, take_slot, fl(take_slot, NPOS))
+    ids = torch.full((H, B, NPOS + 1), -1, dtype=torch.int64, device=dev)
+    ids.index_put_((hh_f, bb_f, col), torch.where(taken, blk_f, fl(blk_f, -1)))
+    load_ids = ids[..., :NPOS].contiguous()
+    tk = granted.to(torch.int64)
+    d_infl = torch.zeros(S * NBLK, dtype=torch.int64, device=dev).index_add_(0, rc["sidN"] + blk_f,
+                                                                              taken.to(torch.int64))
+    m.inflight |= d_infl.view(B, H, NBLK) > 0
+    d_free = torch.zeros(S * NPOS, dtype=torch.int64, device=dev).index_add_(0, rc["sidP"] + take_slot.clamp(min=0),
+                                                                              tk)
+    m.free &= ~(d_free.view(B, H, NPOS) > 0)
+    m.usage += torch.zeros(S, dtype=torch.int64, device=dev).index_add_(0, sid, tk).view(B, H)
+    at_ev = rc["sidN"] + ev_blk.clamp(min=0)
+    d_gone = torch.zeros(S * NBLK, dtype=torch.int64, device=dev).index_add_(0, at_ev, evicted.to(torch.int64))
+    m.slot_of.masked_fill_(d_gone.view(B, H, NBLK) > 0, -1)
+    d_gone_f = torch.zeros(S * NBLK, dtype=torch.int64, device=dev).index_add_(0, at_ev, ev_infl.to(torch.int64))
+    gone_f = d_gone_f.view(B, H, NBLK) > 0
+    m.inflight &= ~gone_f
+    m.infl_slot.masked_fill_(gone_f, -1)
+    counters = over.to(torch.int64).sum().reshape(1)                                # (device_verify: a stack of one)
+    t = dict(blk=blk_f, valid=valid_f, ready=ready.reshape(N), slot=slot.reshape(N), infl=infl.reshape(N),
+             infl_slot=islot.reshape(N), infl_gen=igen.reshape(N), dup=dup, granted=granted, take_slot=take_slot,
+             rslot=rslot, protect=valid_f, evict=evicted, evict_blk=ev_blk, evict_infl=ev_infl, ev_gen=ev_gen)
+    return VerifyDecision(Rv, H, k, t, page, num_pages, load_ids, (bb_f, hh_f), counters)
 
 
 # ====================================================================================================================
@@ -1074,6 +1273,8 @@ class ResidencySC(ResidencySB):
     host_prof = None
     # [hostfix] --lean-time (B2's OwnResidency(lean=True); default False): end_tick skips the REPORT-only memory sample
     lean = False
+    # [resfix] --res-lean (B2's OwnResidency(res_lean=True) -> enable_res_lean; default False: resolve runs as before)
+    res_lean = False
 
     def __init__(self, *args, sc_mut=None, devops=None, mirror_drop=None, wait_mode: str = "probe", **kw):
         kw["defer_admit"] = True
@@ -1268,6 +1469,8 @@ class ResidencySC(ResidencySB):
 
     # ------------------------------------------------------------------------------------------------ one layer
     def resolve(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> Plan:
+        if self.res_lean:                                             # [resfix] --res-lean (default False)
+            return self._resolve_lean(l, rows, sel)
         H, R = self.H, len(rows)
         if any(st["l"] == l for st in self._tick):
             raise ValueError("S-C: layer %d resolved twice in one tick (its decisions are applied at end_tick)" % l)
@@ -1334,6 +1537,202 @@ class ResidencySC(ResidencySB):
         if self.want_keys:                                            # [sharedkv2] device ops only
             plan.page_key = self._page_keys(R, P, step, tk, plan.num_pages)
         return plan
+
+    # ------------------------------------------------------------------------------------------------ [resfix] lean
+    def enable_res_lean(self) -> None:
+        """[resfix] --res-lean (OPT-IN; analysis/evalfast/DIAG_torch_res.md section 4, fixes 4-7): resolve runs
+        _resolve_lean. Refused with a negative control set (sc_mut, sb_mut, sparse_mut, the X pool's mut): the lean
+        copies do not carry them (the reference path keeps them)."""
+        muts = [n for n, v in (("sc_mut", self.sc_mut), ("sb_mut", self.sb_mut),
+                               ("sparse_mut", getattr(self, "sparse_mut", None)),
+                               ("xpool mut", getattr(self.xpool, "mut", None))) if v]
+        if muts:
+            raise ValueError("--res-lean runs no negative control (%s set): use the reference resolve" % ", ".join(muts))
+        if self.xpool is not None and (self.xpool.B, self.xpool.H, self.xpool.n_hist) != (self.B, self.H, self.n_hist):
+            raise ValueError("--res-lean: the X pool's (B, H, n_hist) %s differ from the service's %s"
+                             % ((self.xpool.B, self.xpool.H, self.xpool.n_hist), (self.B, self.H, self.n_hist)))
+        self.res_lean = True
+        self._lean_c = LeanConsts(self.device)
+        self._lean_t = None
+
+    def _resolve_lean(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> Plan:
+        """[resfix] resolve() for --res-lean: the same checks (the same exceptions, in the same order), the same device
+        decisions, page tables, records, lane bindings and plan values (CPU tests RL1-RL4), with less host work:
+          (1) no hidden sync: a constant True is scattered with index_put_ of a 0-dim DEVICE tensor (LeanConsts.true);
+              `x[i] = True` copies a pageable Python True to the device and synchronizes, at 8 sites per mixed layer
+              (XPool.bind x 2, the sparse record x 5, the bias fill; DIAG_torch_res.md 1.2);
+          (2) the per-row Python runs once per tick: _check_rows in full at the tick's first layer; a later layer
+              compares its rows with the first layer's (_lean_same_rows) and runs the per-layer guards with C-level set
+              and map operations over the tick's distinct keys (_lean_rows_ok); any difference or a guard that fires
+              runs the reference _check_rows / _row_sig compare (the same exception). The plan's lists come from C-level
+              maps (_lean_plan);
+          (3) the tick's constants are built once per tick (LeanConsts, _lean_rows_c: aranges, the rows' (b, h)
+              expansions and stream ids, the stable sort of the stream ids for rank_in_group, the tail page values, the
+              page buffers, the constant fills); the selection of the draft rows is gathered once (Policy E's mask and
+              device_draft); the bool decision fields keep their dtype (no int64 cast).
+        The page buffers are reused across the tick's layers: every element is written at every layer (the verify and
+        the draft rows cover every row, each decision's page is (rows, H, k + N_TAIL)), and the plan holds an int32
+        COPY (.to(torch.int32))."""
+        H, R = self.H, len(rows)
+        if any(st["l"] == l for st in self._tick):
+            raise ValueError("S-C: layer %d resolved twice in one tick (its decisions are applied at end_tick)" % l)
+        if sel.device.type != self.device.type:
+            raise ValueError("S-C: the selection must be on the service's device %s (got %s)" % (self.device, sel.device))
+        first = not self._tick
+        same = (not first) and self._lean_same_rows(rows)
+        if not same or not self._lean_rows_ok(l, rows, sel):
+            self._check_rows(l, rows, sel)                            # the reference checks (first layer: always)
+        if self.want_keys and first:                                  # [sharedkv2] host rows only, once per tick
+            self._check_tail_keys(rows)
+        cst = self._lean_c
+        if first:                                                     # the tick's first layer: the per-tick copies
+            self.sync_mirror()
+            self._rows = self._tick_rows(rows)
+            cst.new_tick()
+            self._lean_snap(rows)
+            if self.xpool is not None:                                # [xpool] every FREE slot gives its lane back;
+                if not self.DECISION_READ_BLOCKING:                   # safe only behind a BLOCKING decision read
+                    raise OwnershipViolation("xpool: lanes are reused across requests only behind a blocking decision "
+                                             "read (r2_xpool.py, the lane-level order); this class's is not")
+                self.xpool.release_free(self.dmirror.code)
+        elif self._dirty:
+            raise OwnershipViolation("S-C: the host state changed in the middle of a tick (the device mirror is stale)")
+        elif not same and self._row_sig(rows) != self._rows["sig"]:
+            raise ValueError("S-C: every layer of a tick resolves the same rows (layer %d differs)" % l)
+        tk = self._rows
+        k = sel.shape[2]
+        P = k + N_TAIL
+        rcs = self._lean_parts(tk, k)
+        plan = self._lean_plan(rows)
+        dv = self.device
+        page = cst.memo(("page", R, H, P), lambda: torch.empty((R, H, P), dtype=torch.int64, device=dv))
+        npg = cst.memo(("npg", R, H), lambda: torch.empty((R, H), dtype=torch.int64, device=dv))
+        m = self.dmirror.layer_lean(l, cst)
+        step = dict(l=l, vrows=list(map(rows.__getitem__, tk["vrows"])), vidx=tk["vrows"], vdec=None,
+                    drows=list(map(rows.__getitem__, tk["drows"])), ddec=None)
+        sv_d = v0_d = sel_d = None
+        if tk["d"] is not None:                                       # the draft rows' selection, once per layer
+            rbd, hbd, _, _, ixd = tk["d"]
+            sel_d = sel[:, ixd]
+            sv_d = sel_d.permute(1, 0, 2)
+            v0_d = (sv_d >= 0) & (sv_d < hbd.view(-1, 1, 1)) & (sv_d < self.nblk)
+        if tk["v"] is not None:                                       # the verify rows: on the device, no host read
+            rb, hb, tl, nt, ix = tk["v"]
+            others = [] if tk["d"] is None else [(sv_d, v0_d, rcs["d"]["sidn3"])]   # Policy E spares the draft rows'
+            vdec = device_verify_lean(m, rb, hb, tl, nt, sel[:, ix], self.C, self.X, cst, rcs["v"], others=others,
+                                      inflight=self.policy_e_inflight)              # blocks too
+            if self.xpool is not None:                                # [xpool] the takes' lanes, before the gather
+                self.xpool.bind_lean(l, vdec.bh[0], vdec.bh[1], vdec.t["take_slot"],
+                                     vdec.t["granted"] | vdec.t["evict"], cst, base=rcs["v"]["xbase"])
+            self.dev.wait(l, vdec)
+            self.dev.gather(l, vdec)
+            page[ix] = vdec.page
+            npg[ix] = vdec.num_pages
+            step["vdec"] = vdec
+        if tk["d"] is not None:                                       # the draft rows: S-B, on the mirror after verify
+            rb, hb, tl, nt, ix = tk["d"]
+            rcd = rcs["d"]
+            ddec = device_draft_lean(m, rb, hb, tl, nt, sel_d, self.C, self.X, self.R_ver, cst, rcd, s=sv_d,
+                                     valid0=v0_d)
+            if self.xpool is not None:                                # [xpool] the draft takes' lanes, before the
+                self.xpool.bind_lean(l, rcd["bb_f"], rcd["hh_f"], ddec.t["take_slot"], ddec.t["granted"], cst,
+                                     base=rcd["xbase"])               # bias fill (_layer_record) and the issue
+            page[ix] = ddec.page
+            npg[ix] = ddec.num_pages
+            step["ddec"] = ddec
+        self._layer_record_lean(l, step, tk, rcs)                     # device ops only (the sparse record's hook)
+        self._tick.append(step)
+        plan.page_table = page.to(torch.int32)
+        plan.num_pages = npg.to(torch.int32)
+        plan.last_len = tk["last_len"]
+        plan.seq_idx = tk["seq_idx"]
+        if self.want_keys:                                            # [sharedkv2] device ops only
+            plan.page_key = self._page_keys(R, P, step, tk, plan.num_pages)
+        return plan
+
+    def _lean_snap(self, rows: Sequence[Row]) -> None:
+        """[resfix] The tick's rows as the later layers compare them (_lean_same_rows: each row's (b, kind, key, pos,
+        hist_bound) and a copy of its tail), and the tick's distinct keys and (uid, batch slot) pairs (_lean_rows_ok).
+        Taken at the tick's first resolve, right after _tick_rows took the rows' sig (nothing changes the rows between)."""
+        ub = list(dict.fromkeys((r.key[0], r.b) for r in rows))
+        self._lean_t = dict(row5=list(map(_ROW5, rows)),
+                            tails=[list(t) if isinstance(t, list) else tuple(t) for t in map(_TAIL, rows)],
+                            keys=list(dict.fromkeys(map(_KEY, rows))), uids=[u for (u, _) in ub],
+                            ubs=[b for (_, b) in ub], rc={})
+
+    def _lean_same_rows(self, rows: Sequence[Row]) -> bool:
+        """[resfix] True iff rows equal the tick's first rows field by field (C-level maps and list compares, no Python
+        loop per row). Then _row_sig(rows) equals the tick's sig (the same five fields and tuple(tail) == tuple(the
+        copy)), and _check_rows' row-only check (the kind) gives the first layer's result. False is never wrong: the
+        caller runs the reference checks and the reference sig compare (a tail of another sequence type, for one,
+        compares False here and equal there)."""
+        lt = self._lean_t
+        return (lt is not None and len(rows) == len(lt["row5"]) and list(map(_ROW5, rows)) == lt["row5"]
+                and list(map(_TAIL, rows)) == lt["tails"])
+
+    def _lean_rows_ok(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> bool:
+        """[resfix] _check_rows' per-layer guards for rows equal to the tick's first rows: the selection's shape; no row
+        key cancelled (set.isdisjoint); every (uid, batch slot) pair still in uid_b; no (key, l) release queued (the
+        late-protection guard). Over the tick's DISTINCT keys and pairs, with C-level maps. True iff _check_rows(l,
+        rows, sel) raises nothing; its keys_seen update is a no-op after the first layer (the sets only grow: nothing
+        removes an entry of keys_seen). False: the caller runs _check_rows, which raises the reference exception."""
+        lt = self._lean_t
+        if sel.dim() != 3 or tuple(sel.shape[:2]) != (self.H, len(rows)):
+            return False
+        if not self.cancelled.isdisjoint(lt["keys"]):
+            return False
+        if any(map(operator.ne, map(self.uid_b.get, lt["uids"]), lt["ubs"])):
+            return False
+        if not self.mut.no_late_protection_guard and any(map(self.queued.__contains__,
+                                                             zip(lt["keys"], itertools.repeat(l)))):
+            return False
+        return True
+
+    def _lean_plan(self, rows: Sequence[Row]) -> Plan:
+        """[resfix] _new_plan's value with C-level work: plan.blocks R x H empty lists (S-C fills none, and no reader
+        writes them: the R row lists are ONE list object, its H entries ONE empty list; equal by ==), plan.keys the
+        rows' keys. A class that overrides _new_plan gets its own."""
+        if type(self)._new_plan is not Residency._new_plan:
+            return self._new_plan(rows)
+        plan = Plan(page_table=None, num_pages=None, last_len=None, seq_idx=None, blocks=[[[]] * self.H] * len(rows))
+        plan.keys = list(map(_KEY, rows))
+        return plan
+
+    def _lean_parts(self, tk: Dict, k: int) -> Dict:
+        """[resfix] The tick's row constants of selection width k (_lean_rows_c per part), built once per tick and k."""
+        rcs = self._lean_t["rc"].get(k)
+        if rcs is None:
+            rcs = {p: (self._lean_rows_c(tk[p], k) if tk[p] is not None else None) for p in ("v", "d")}
+            self._lean_t["rc"][k] = rcs
+        return rcs
+
+    def _lean_rows_c(self, part, k: int) -> Dict:
+        """[resfix] One row part's tick constants (tk["v"] or tk["d"]) at selection width k, each the expression that
+        device_verify / device_draft / _selected_mask / XPool.bind / _record_inputs evaluate per layer on the same
+        per-tick inputs (rb, tails, nt): bb, hh (n, H, k) views; bb_f, hh_f, sid (N,); sidN = sid * NBLK, sidP =
+        sid * NPOS; sidn3 = (rb * H + h) * NBLK (n, H, 1); tval (the tail page values); rk = rank_prep(sid); xbase =
+        sid * n_hist (bind's (bb * H + hh) * NS)."""
+        cst, H = self._lean_c, self.H
+        rb, hb, tl, nt, ix = part
+        n = rb.shape[0]
+        N = n * H * k
+        bb = rb.view(n, 1, 1).expand(n, H, k)
+        hh = cst.ar(H).view(1, H, 1).expand(n, H, k)
+        sid = (bb * H + hh).reshape(N)
+        T = tl.shape[1]
+        post = cst.ar(T).view(1, 1, T)
+        rc = dict(k=k, bb=bb, hh=hh, sid=sid, bb_f=bb.reshape(N), hh_f=hh.reshape(N), sidN=sid * self.nblk,
+                  sidP=sid * self.n_hist, sidn3=(rb.view(n, 1, 1) * H + cst.ar(H).view(1, H, 1)) * self.nblk,
+                  tval=torch.where(post < nt.view(n, 1, 1), tl.view(n, 1, T).expand(n, H, T),
+                                   torch.full((n, H, T), -1, dtype=torch.int64, device=self.device)),
+                  rk=rank_prep(sid, cst))
+        if self.xpool is not None:
+            rc["xbase"] = sid * self.xpool.n_hist
+        return rc
+
+    def _layer_record_lean(self, l: int, step: Dict, tk: Dict, rcs: Dict) -> None:
+        """[resfix] Hook: the layer's record for --res-lean (ResidencySparse: the lean sparse record). S-C: _layer_record."""
+        return self._layer_record(l, step, tk)
 
     # ------------------------------------------------------------------------------------------------ [sharedkv2] keys
     def _check_tail_keys(self, rows: Sequence[Row]) -> None:

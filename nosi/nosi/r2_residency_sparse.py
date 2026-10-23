@@ -71,6 +71,7 @@ from .kstep.executor import DRAFT, VERIFY
 from . import r2_xpool as XP
 from .r2_residency import Plan, Row
 from .r2_residency_sc import C_LRU, C_PO, C_VRES, ResidencySC
+from .r2_residency_sb import _nz                                     # [resfix] --res-lean
 
 # the record fields, in their buffer order
 VREC = ("o", "blk", "flags", "slot", "infl_slot", "infl_gen", "rslot", "take_slot", "evict_blk")
@@ -229,6 +230,126 @@ def draft_bias_fill(store_b_l, cis_l, ddec, bbd, hhd, bs: int) -> None:
     store_b_l[...] = torch.where(hit[:, :rows], buf[:, :rows], store_b_l)
 
 
+# ====================================================================================================================
+# [resfix] --res-lean: the record's lean copies (the functions above stay the reference, unchanged)
+# ====================================================================================================================
+def _first_in_group_lean(key: torch.Tensor, cst) -> torch.Tensor:
+    """[resfix] _first_in_group with the constant True from cst."""
+    ks, perm = torch.sort(key, stable=True)
+    first_sorted = torch.cat([cst.full_like(ks[:1], True, dtype=torch.bool), ks[1:] != ks[:-1]])
+    out = torch.empty_like(first_sorted)
+    out[perm] = first_sorted
+    return out
+
+
+def _compact_lean(mask: torch.Tensor, fields: List[torch.Tensor], cap: int, cst) -> Tuple[torch.Tensor, torch.Tensor]:
+    """[resfix] _compact with the dummy-column fill from cst (the output buffer stays fresh)."""
+    m64 = mask.to(torch.int64)
+    pos = torch.cumsum(m64, 0) - 1
+    cnt = m64.sum().reshape(1)
+    dest = torch.where(mask & (pos < cap), pos, cst.full_like(pos, cap))
+    src = torch.stack(fields)                                            # (F, N)
+    out = torch.full((len(fields), cap + 1), -1, dtype=torch.int64, device=mask.device)
+    out.scatter_(1, dest.view(1, -1).expand(len(fields), -1), src)      # the unmasked go to the dummy column cap
+    return out[:, :cap], cnt
+
+
+def _pack_bits_lean(bits: torch.Tensor, cst) -> torch.Tensor:
+    """[resfix] _pack_bits with its bit weights from cst (cst.w32 = 1 << arange(32))."""
+    n = bits.shape[-1]
+    W = (n + 31) // 32
+    b = F_nn.pad(bits.to(torch.int64), (0, W * 32 - n)).view(*bits.shape[:-1], W, 32)
+    return (b * cst.w32).sum(-1)
+
+
+def sparse_layer_record_lean(code_l, vdec, ddec, B: int, H: int, NBLK: int, NPOS: int, cap_v: int, cap_d: int,
+                             R: int, cst, rcv=None, rcd=None) -> Dict[str, torch.Tensor]:
+    """[resfix] sparse_layer_record for --res-lean with pins=False (B2: pin_records=False; ResidencySparse refuses the
+    lean record with pins) and rowsel by the tick row, the same values:
+      - no hidden sync: the four `x[...] = True` scatters (rsel, rbits, selm x 2; DIAG_torch_res.md: sites :160, :177,
+        :179, :200, :206) write cst.true, a 0-dim device tensor, with index_put_;
+      - the tick constants of each part (rcv / rcd, ResidencySparse._lean_rec_c): o = arange(N), j = o // (H k), the
+        tick rows rowt = ix[j], fbase = (kid[j] * H + h) * (NBLK + 1) (fkey's left part), and the draft entries' (b, h);
+      - where(valid, blk, NBLK) is computed once per part (the record computes it for rsel and for selm);
+      - a bool decision field is used as it is (_nz: x != 0 equals x).
+    pins=False: no pin is recorded, newpin is all False (as in the reference), the pin table is not touched."""
+    out: Dict[str, torch.Tensor] = {}
+    dev = code_l.device
+    fl = cst.full_like
+    selm = torch.zeros((B, H, NBLK + 1), dtype=torch.bool, device=dev)
+    rsel = torch.zeros((R, H, NBLK + 1), dtype=torch.bool, device=dev) if R > 0 else None
+    if vdec is not None:
+        t = vdec.t
+        Rv = vdec.Rv
+        o, j = rcv["o"], rcv["j"]
+        bb, hh = vdec.bh
+        valid, ready, infl, dup = _nz(t["valid"]), _nz(t["ready"]), _nz(t["infl"]), _nz(t["dup"])
+        gr, ev, evf = _nz(t["granted"]), _nz(t["evict"]), _nz(t["evict_infl"])
+        blk = t["blk"]
+        newpin = fl(valid, False)                                             # pins False: no pin is recorded
+        vblk = torch.where(valid, blk, fl(blk, NBLK))
+        if rsel is not None:                                                  # the tick row of each entry
+            rsel.index_put_((rcv["rowt"], hh, vblk), cst.true)
+        fkey = torch.where(valid, rcv["fbase"] + blk, fl(blk, BIGKEY))
+        first = _first_in_group_lean(fkey, cst) & valid
+        hole = valid & ~(ready | infl | dup | gr | ev)
+        mask = valid & (newpin | infl | dup | gr | ev | hole)
+        flags = (newpin * PIN + ready * READY + infl * INFL + dup * DUP + gr * GRANT + ev * EVICT + evf * EVICT_INFL
+                 + first * FIRST + hole * HOLE).to(torch.int64)
+        out["vrec"], out["vcnt"] = _compact_lean(mask, [o, blk, flags, t["slot"], t["infl_slot"], t["infl_gen"],
+                                                        t["rslot"], t["take_slot"], t["evict_blk"]], cap_v, cst)
+        c = code_l[bb, hh, t["slot"].clamp(min=0)]
+        rf = ready & first
+        vals = torch.stack([rf, rf & (c == C_LRU), rf & (c == C_PO), rf & (c == C_VRES)], -1).to(torch.int64)
+        out["vlook"] = torch.zeros((Rv, 4), dtype=torch.int64, device=dev).index_add_(0, j, vals)
+        rs = torch.where(ready, t["slot"], torch.where(infl, t["infl_slot"], torch.where(
+            dup, t["rslot"], torch.where(gr | ev, t["take_slot"], fl(blk, -1)))))
+        rd = valid & (rs >= 0)
+        rbits = torch.zeros((B, H, NPOS + 1), dtype=torch.bool, device=dev)
+        rbits.index_put_((bb, hh, torch.where(rd, rs, fl(rs, NPOS))), cst.true)
+        out["vread"] = _pack_bits_lean(rbits[..., :NPOS], cst)
+        selm.index_put_((bb, hh, vblk), cst.true)
+    if ddec is not None:
+        t = ddec.t
+        o = rcd["o"]
+        bbd, hhd = rcd["bb_f"], rcd["hh_f"]
+        valid, ready, infl = _nz(t["valid"]), _nz(t["ready"]), _nz(t["infl"])
+        gr, refused = _nz(t["granted"]), _nz(t["refused"])
+        blk = t["blk"]
+        newpin = fl(valid, False)
+        vblk = torch.where(valid, blk, fl(blk, NBLK))
+        if rsel is not None:
+            rsel.index_put_((rcd["rowt"], hhd, vblk), cst.true)
+        hole = valid & ~(ready | infl | gr | refused)
+        mask = valid & (newpin | ready | infl | gr | refused | hole)
+        flags = (newpin * PIN + ready * READY + infl * INFL + gr * GRANT + refused * REFUSED
+                 + hole * HOLE).to(torch.int64)
+        out["drec"], out["dcnt"] = _compact_lean(mask, [o, blk, flags, t["slot"], t["take_slot"]], cap_d, cst)
+        selm.index_put_((bbd, hhd, vblk), cst.true)
+    out["sel"] = _pack_bits_lean(selm[..., :NBLK], cst)
+    if rsel is not None:
+        out["rowsel"] = _pack_bits_lean(rsel[..., :NBLK], cst)
+    return out
+
+
+def draft_bias_fill_lean(store_b_l, cis_l, ddec, bbd, hhd, bs: int, cst) -> None:
+    """[resfix] draft_bias_fill (the per-stream store) for --res-lean, the same writes: the hit mask's True is
+    cst.true (index_put_: no host copy, no sync; the reference's `hit[...] = True` is DIAG site :228)."""
+    t = ddec.t
+    g = _nz(t["granted"])
+    N = g.shape[0]
+    rows = store_b_l.shape[1]
+    r = cst.ar(bs).view(1, bs)
+    dst = torch.where(g.view(N, 1), t["take_slot"].clamp(min=0).view(N, 1) * bs + r, cst.full_like(r, rows))
+    src = t["blk"].clamp(min=0).view(N, 1) * bs + r
+    b2, h2 = bbd.view(N, 1).expand(N, bs), hhd.view(N, 1).expand(N, bs)
+    buf = torch.zeros((store_b_l.shape[0], rows + 1, store_b_l.shape[2]), dtype=store_b_l.dtype, device=g.device)
+    hit = torch.zeros((store_b_l.shape[0], rows + 1, store_b_l.shape[2]), dtype=torch.bool, device=g.device)
+    buf[b2, dst, h2] = cis_l[b2, src, h2].to(store_b_l.dtype)
+    hit.index_put_((b2, dst, h2), cst.true)
+    store_b_l[...] = torch.where(hit[:, :rows], buf[:, :rows], store_b_l)
+
+
 class ResidencySparse(ResidencySC):
     """S-C with the sparse decision record (module docstring). Extra arguments: record_cap (cap_v, cap_d) the record
     buffers per layer (None: every entry, no overflow), sparse_mut (negative controls, tests only)."""
@@ -312,6 +433,42 @@ class ResidencySparse(ResidencySC):
                 XP.draft_bias_fill_flat(self.xpool, l, self.store_b[l], self.cis[l], ddec, bbd, hhd, self.bs)
             else:
                 draft_bias_fill(self.store_b[l], self.cis[l], ddec, bbd, hhd, self.bs)
+
+    def _layer_record_lean(self, l: int, step: Dict, tk: Dict, rcs: Dict) -> None:
+        """[resfix] --res-lean: _layer_record with sparse_layer_record_lean and the lean bias fills, the same record and
+        writes. The reference _layer_record runs instead for a class that overrides _layer_record (TrashWriterB2, a
+        control) and with pin_records (the lean record has no pin path)."""
+        if type(self)._layer_record is not ResidencySparse._layer_record or self.pin_records:
+            return self._layer_record(l, step, tk)
+        cst = self._lean_c
+        vdec, ddec = step["vdec"], step["ddec"]
+        R = len(tk["vrows"]) + len(tk["drows"])
+        cap_v, cap_d = self._caps(step)
+        rcv = self._lean_rec_c(tk, "v", R, rcs["v"]) if vdec is not None else None
+        rcd = self._lean_rec_c(tk, "d", R, rcs["d"]) if ddec is not None else None
+        step["rec"] = sparse_layer_record_lean(self.dmirror.code[l], vdec, ddec, self.B, self.H, self.nblk, self.n_hist,
+                                               cap_v, cap_d, R, cst, rcv=rcv, rcd=rcd)
+        step["caps"] = (cap_v, cap_d)
+        if ddec is not None and self.store_b is not None and self.cis is not None:
+            if self.xpool is not None:                                # [xpool] the takes' lanes (bound in resolve)
+                XP.draft_bias_fill_flat_lean(self.xpool, l, self.store_b[l], self.cis[l], ddec, rcd["bb_f"],
+                                             rcd["hh_f"], self.bs, cst)
+            else:
+                draft_bias_fill_lean(self.store_b[l], self.cis[l], ddec, rcd["bb_f"], rcd["hh_f"], self.bs, cst)
+
+    def _lean_rec_c(self, tk: Dict, part: str, R: int, rc: Dict) -> Dict:
+        """[resfix] The record's tick constants of one row part, added to its _lean_rows_c dict once per tick and width:
+        o = arange(N), j = o // (H k) (the entry's row in the part), rowt = ix[j] (its tick row: rowsel), fbase =
+        (kid[j] * H + h) * (NBLK + 1) (the left part of the record's FIRST key; kid = the key ids of the tick rows, the
+        first R integers of the tick's extra copy, as _record_inputs reads them)."""
+        if "rowt" not in rc:
+            cst, H, k = self._lean_c, self.H, rc["k"]
+            ix = tk[part][4]
+            o = cst.ar(rc["sid"].shape[0])
+            j = torch.div(o, H * k, rounding_mode="floor")
+            kid = tk["extra"][:R][ix]
+            rc.update(o=o, j=j, rowt=ix[j], fbase=(kid[j] * H + rc["hh_f"]) * (self.nblk + 1))
+        return rc
 
     # ------------------------------------------------------------------------------------------------ the consumer
     def apply_tick(self, steps: List[Dict]) -> None:

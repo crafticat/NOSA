@@ -67,6 +67,9 @@ EF_accuracy_record; REPORT R_EF_<label> and R_EF_bands (--eval-bands against the
 per point draft_only_host_profile / host_profile / bare_host_profile), --gc-freeze (item 1: round_guard), --lean-time
 (item 2, b2: LEAN_DROPPED), --wait-index (item 3, b2: r2_residency_sc.InflightByLayer), --b2-fewer-reads (item 5,
 b2: OwnResidency(fewer_reads=True)). No flag changes a decision, a page table or a logit (tests_cpu/test_r2_hostfix.py).
+[resfix] --res-lean (b2, --b2-resolve torch; analysis/evalfast/DIAG_torch_res.md section 4, fixes 4-7): the torch
+resolve without its hidden syncs, with the per-row Python and the tick's constants once per tick
+(OwnResidency(res_lean=True)); the same decisions, page tables and records (tests_cpu/test_r2_resfix.py).
 OUTPUT: --out/summary.json (after every run). The last stdout line is R2_TICK_SG5_DONE failed=<n>; exit = n (2 =
 refused). ENVIRONMENT: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0, NOSI_POOL_BLOCKS = 0 (the parent; a child sets its own).
 """
@@ -295,6 +298,10 @@ def parse_args(argv):
     ap.add_argument("--b2-fewer-reads", action="store_true",                                  # [hostfix] item 5
                     help="b2 only: the consumer's host-known values in one pinned non-blocking copy and its device "
                          "values in one read per place (OwnResidency(fewer_reads=True)); the same values")
+    ap.add_argument("--res-lean", action="store_true",                                        # [resfix]
+                    help="b2 with --b2-resolve torch only: the torch resolve with less host work per layer "
+                         "(OwnResidency(res_lean=True): no hidden sync, the per-row Python and the tick's constants "
+                         "once per tick); the same decisions, page tables and records (tests_cpu/test_r2_resfix.py)")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -404,6 +411,8 @@ def parse_args(argv):
         ap.error("--wait-index: --backends b2 only (OwnResidency(wait_index=True))")
     if a.b2_fewer_reads and a.backends != ["b2"]:                                                # [hostfix] item 5
         ap.error("--b2-fewer-reads: --backends b2 only (OwnResidency(fewer_reads=True))")
+    if a.res_lean and (a.backends != ["b2"] or a.b2_resolve != "torch"):                         # [resfix]
+        ap.error("--res-lean: --backends b2 with --b2-resolve torch only (OwnResidency(res_lean=True))")
     a.log_slots_n = resolve_log_slots(a)                                                         # [bigb]
     return a
 
@@ -802,7 +811,8 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
                                fused_plant=int(getattr(a, "b2_fused_plant", 0)),                                  # [fusedres2]
                                lean=bool(getattr(a, "lean_time", False)),                                         # [hostfix]
                                wait_index=bool(getattr(a, "wait_index", False)),                                  # [hostfix]
-                               fewer_reads=bool(getattr(a, "b2_fewer_reads", False)), **kw)                       # [hostfix]
+                               fewer_reads=bool(getattr(a, "b2_fewer_reads", False)),                             # [hostfix]
+                               res_lean=bool(getattr(a, "res_lean", False)), **kw)                                # [resfix]
             lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)       # [b2]
         else:
             lazy = _LazyOps()
@@ -1804,6 +1814,8 @@ def main(argv=None) -> int:
             meta.update(wait_index=True)
         if a.b2_fewer_reads:                                                                   # [hostfix] item 5
             meta.update(b2_fewer_reads=True)
+        if a.res_lean:                                                                         # [resfix]
+            meta.update(res_lean=True)
         if a.gc_freeze:                                                                        # [hostfix] item 1
             meta.update(gc_freeze=True, gc_freeze_note="each timed phase: collect, freeze, disable before; unfreeze, "
                                                        "enable, collect after (per point: gc_freeze[phase])")

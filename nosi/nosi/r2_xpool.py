@@ -249,6 +249,70 @@ class XPool:
             self.peak[l] = torch.maximum(self.peak[l], occ.to(torch.int64).sum(-1))
         self.audit(l)                                 # production safety check (xpool_err; no sync): always on
 
+    def bind_lean(self, l: int, bb: torch.Tensor, hh: torch.Tensor, slot: torch.Tensor, mask: torch.Tensor, cst,
+                  base: Optional[torch.Tensor] = None) -> None:
+        """[resfix] bind() for --res-lean (ResidencySC._resolve_lean), the same ops on the same values, minus one
+        hidden sync: bind's `want[...] = True` copies a Python True from pageable host memory to the device (one
+        cudaStreamSynchronize per call); here the value is cst.true, a 0-dim tensor on this device (index_put_ copies
+        nothing). The aranges and the constant fills come from cst (r2_residency_sb.LeanConsts); base = (bb * H + hh)
+        * n_hist (a tick constant of the caller; None: computed here); a bool mask is used as it is (mask != 0 equals
+        it). No negative-control mut (ResidencySC.enable_res_lean refuses one)."""
+        if self.mode != "pool":
+            return
+        self.binds += 1
+        B, H, NS, A = self.B, self.H, self.n_hist, self.A
+        dev = self.device
+        fl = cst.full_like
+        bb, hh, slot = (x.reshape(-1).to(torch.int64) for x in (bb, hh, slot))   # on the device already
+        m = mask.reshape(-1)
+        ok = (m if m.dtype == torch.bool else m != 0) & (slot >= 0) & (slot < NS)
+        if base is None:
+            base = (bb * H + hh) * NS
+        f = base + slot.clamp(min=0, max=NS - 1)
+        want = torch.zeros(B * H * NS + 1, dtype=torch.bool, device=dev)
+        want.index_put_((torch.where(ok, f, fl(f, B * H * NS)),), cst.true)
+        want = want[:B * H * NS].view(B, H, NS)
+        cur = self.pos_of[l, :, :, :NS]                                             # (B, H, NS) view
+        needh = (want & (cur < 0)).permute(1, 0, 2).reshape(H, B * NS)              # per head, (b, s) order
+        ni = needh.to(torch.int64)
+        rank = ni.cumsum(-1) - ni
+        occ = self.occ[l]                                                           # (H, A) view
+        ar = cst.ar(A).view(1, A).expand(H, A)
+        free_sorted = torch.sort(torch.where(occ, fl(ar, A), ar), dim=-1).values
+        nfree = (~occ).to(torch.int64).sum(-1, keepdim=True)
+        over = needh & (rank >= nfree)
+        assign = needh & ~over
+        newpos = torch.gather(free_sorted, 1, rank.clamp(max=A - 1))
+        cur_h = cur.permute(1, 0, 2).reshape(H, B * NS)
+        self.pos_of[l, :, :, :NS] = torch.where(assign, newpos, cur_h).view(H, B, NS).permute(1, 0, 2)
+        mark = torch.zeros((H, A + 1), dtype=torch.bool, device=dev)
+        tgt = torch.where(assign, newpos, fl(newpos, A))
+        mark.scatter_(1, tgt, fl(assign, True))
+        occ |= mark[:, :A]
+        if self.witness:                                                            # [integ3] / [integ5] as in bind
+            breq = cst.memo(("xp_breq", H, B, NS), lambda: (cst.ar(B * NS) // NS).view(1, B * NS).expand(H, B * NS))
+            prev = torch.gather(self.owner[l], 1, tgt)
+            self.handoffs += (assign & (prev >= 0) & (prev != breq)).to(torch.int64).sum()
+            self.owner[l].scatter_(1, tgt, torch.where(assign, breq, fl(breq, -1)))
+            self.owner[l, :, A] = -1
+        self.err.bitwise_or_(torch.any(over).to(torch.int64) * ERR_FULL)      # production: the full-arena refusal
+        if self.witness:
+            self.peak[l] = torch.maximum(self.peak[l], occ.to(torch.int64).sum(-1))
+        self.audit_lean(l, cst)                         # production safety check (xpool_err; no sync): always on
+
+    def audit_lean(self, l: int, cst) -> None:
+        """[resfix] audit() for --res-lean: the same ops, the constant fill from cst."""
+        if self.mode != "pool":
+            return
+        H, NS, A = self.H, self.n_hist, self.A
+        p = self.pos_of[l, :, :, :NS].permute(1, 0, 2).reshape(H, -1)
+        bound = p >= 0
+        cnt = torch.zeros((H, A + 1), dtype=torch.int64, device=self.device)
+        cnt.scatter_add_(1, torch.where(bound, p, cst.full_like(p, A)), bound.to(torch.int64))
+        c = cnt[:, :A]
+        bad = torch.any(c > 1) | torch.any((c > 0) != self.occ[l])
+        self.err.bitwise_or_(bad.to(torch.int64) * ERR_ALIAS)
+
     def _plant_alias(self, l: int, assign: torch.Tensor, newpos: torch.Tensor) -> torch.Tensor:
         """NEGATIVE CONTROL: per head, the first new slot keeps its lane and the first new slot of ANOTHER request gets
         the same lane (its own lane stays free). Recorded in plant_log; no plant where no head has two requests."""
@@ -414,6 +478,31 @@ def draft_bias_fill_flat(xp: XPool, l: int, store_b_flat, cis_l, ddec, bbd, hhd,
     hit = torch.zeros((rows + 1, H), dtype=torch.bool, device=dev)
     buf[dst, h2] = cis_l[b2, src, h2].to(store_b_flat.dtype)
     hit[dst, h2] = True
+    store_b_flat[...] = torch.where(hit[:rows], buf[:rows], store_b_flat)
+
+
+def draft_bias_fill_flat_lean(xp: XPool, l: int, store_b_flat, cis_l, ddec, bbd, hhd, bs: int, cst) -> None:
+    """[resfix] draft_bias_fill_flat for --res-lean, the same writes: the hit mask's constant True is cst.true, a 0-dim
+    tensor on the store's device (`hit[dst, h2] = True` copies a Python True from pageable host memory and synchronizes
+    the stream); the arange and the dummy-row fill come from cst; a bool granted is used as it is."""
+    t = ddec.t
+    g = t["granted"] if t["granted"].dtype == torch.bool else t["granted"] != 0
+    N = g.shape[0]
+    rows = store_b_flat.shape[0]
+    H = store_b_flat.shape[1]
+    dev = store_b_flat.device
+    slot = t["take_slot"].clamp(min=0, max=xp.n_hist - 1)
+    pos = xp.pos_of[l][bbd, hhd, slot]
+    xp.err.bitwise_or_(torch.any(g & (pos < 0)).to(torch.int64) * ERR_UNBOUND)
+    ok = g & (pos >= 0)
+    r = cst.ar(bs).view(1, bs)
+    dst = torch.where(ok.view(N, 1), pos.clamp(min=0).view(N, 1) * bs + r, cst.full_like(r, rows))
+    src = t["blk"].clamp(min=0).view(N, 1) * bs + r
+    b2, h2 = bbd.view(N, 1).expand(N, bs), hhd.view(N, 1).expand(N, bs)
+    buf = torch.zeros((rows + 1, H), dtype=store_b_flat.dtype, device=dev)
+    hit = torch.zeros((rows + 1, H), dtype=torch.bool, device=dev)
+    buf[dst, h2] = cis_l[b2, src, h2].to(store_b_flat.dtype)
+    hit.index_put_((dst, h2), cst.true)
     store_b_flat[...] = torch.where(hit[:rows], buf[:rows], store_b_flat)
 
 

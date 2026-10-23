@@ -180,6 +180,156 @@ def device_draft(m: DraftMirror, rb, hb, tails, nt, sel, C: int, X: int, R_ver: 
     return DraftDecision(Rd, H, k, {f: v.to(torch.int64) for f, v in t.items()}, page, num_pages, counters)
 
 
+# ====================================================================================================================
+# [resfix] --res-lean (OPT-IN; analysis/evalfast/DIAG_torch_res.md section 4, fixes 4-7): the torch resolve with less
+# host work per layer. The functions above stay the REFERENCE, unchanged; the *_lean copies below run the same ops on
+# the same values (CPU tests RL1-RL4 compare them field by field), without the negative-control muts (ResidencySC
+# refuses --res-lean with one).
+# ====================================================================================================================
+class LeanConsts:
+    """[resfix] The resolve's constant operands on one device, so a layer launches no kernel to rebuild them.
+      ar(n)          torch.arange(n): a slice of ONE arange, grown on demand (the same values, contiguous, stride 1).
+      true           a 0-dim device True: the value of a constant scatter (x.index_put_(i, true)). `x[i] = True` with a
+                     Python True copies one pageable byte to the device and synchronizes the stream (aten::copy_ ->
+                     cudaStreamSynchronize; DIAG_torch_res.md 1.2); index_put_ with a value on x's device copies nothing.
+      w32            _pack_bits' bit weights (1 << i, i < 32).
+      full_like(x, v[, dtype])  torch.full_like(x, v, dtype=dtype), cached for the TICK by (shape, stride, dtype, v):
+                     the tensor torch.full_like would give (same values, same strides). SHARED: only an operand that no
+                     op writes may come from it (every output buffer stays a fresh tensor).
+      memo(key, fn)  a tick constant (fn() once per tick).
+    new_tick() drops the tick's cache (its shapes follow the tick's rows), at the tick's first resolve."""
+
+    def __init__(self, device):
+        self.device = torch.device(device)
+        self._ar = torch.arange(1024, device=self.device)
+        self.true = torch.ones((), dtype=torch.bool, device=self.device)
+        self.w32 = torch.bitwise_left_shift(torch.ones(32, dtype=torch.int64, device=self.device),
+                                            torch.arange(32, dtype=torch.int64, device=self.device))
+        self.tick: Dict = {}
+
+    def new_tick(self) -> None:
+        self.tick = {}
+
+    def ar(self, n: int) -> torch.Tensor:
+        n = int(n)
+        if n > self._ar.shape[0]:
+            self._ar = torch.arange(max(n, 2 * self._ar.shape[0]), device=self.device)
+        return self._ar[:n]
+
+    def full_like(self, like: torch.Tensor, value, dtype=None) -> torch.Tensor:
+        key = ("full", tuple(like.shape), tuple(like.stride()), like.dtype if dtype is None else dtype, value)
+        t = self.tick.get(key)
+        if t is None:
+            t = torch.full_like(like, value, dtype=dtype)
+            self.tick[key] = t
+        return t
+
+    def memo(self, key, fn):
+        t = self.tick.get(key)
+        if t is None:
+            t = fn()
+            self.tick[key] = t
+        return t
+
+
+def _nz(x: torch.Tensor) -> torch.Tensor:
+    """[resfix] x != 0 as a bool tensor; a bool x is returned as it is (x != 0 equals x: no kernel)."""
+    return x if x.dtype == torch.bool else x != 0
+
+
+def rank_prep(key: torch.Tensor, cst: LeanConsts):
+    """[resfix] The key-only half of rank_in_group (its stable sort and group starts), so rank_with(rank_prep(key),
+    mask) == rank_in_group(key, mask) (the same ops in the same order). The rows' stream ids are a TICK constant: one
+    sort per tick instead of five per layer."""
+    n = key.shape[0]
+    ks, perm = torch.sort(key, stable=True)
+    pos = cst.ar(n)
+    start = torch.cat([cst.full_like(ks[:1], True, dtype=torch.bool), ks[1:] != ks[:-1]])
+    gstart = torch.cummax(torch.where(start, pos, cst.full_like(pos, 0)), 0).values
+    return perm, gstart
+
+
+def rank_with(prep, mask: torch.Tensor) -> torch.Tensor:
+    """[resfix] rank_in_group's mask half on a rank_prep result."""
+    perm, gstart = prep
+    mk = mask.to(torch.int64)[perm]
+    c = mk.cumsum(0) - mk
+    out = torch.empty_like(c)
+    out[perm] = c - c[gstart]
+    return out
+
+
+def device_draft_lean(m: DraftMirror, rb, hb, tails, nt, sel, C: int, X: int, R_ver: int, cst: LeanConsts, rc: Dict,
+                      s=None, valid0=None) -> DraftDecision:
+    """[resfix] device_draft without mut, the same values. rc: the tick's draft-row constants (ResidencySC._lean_rows_c:
+    bb, hh views, sid, sidN = sid * NBLK, tval, rk = rank_prep(sid)); s, valid0: the permuted selection and its
+    validity if the caller has them (ResidencySC._resolve_lean computes them once for Policy E's mask too). The bool
+    fields stay bool (no int64 cast; every consumer reads them as != 0 or as truth values)."""
+    H, Rd, k = sel.shape
+    dev = sel.device
+    B, _, NBLK = m.slot_of.shape
+    NPOS = m.free.shape[-1]
+    S = B * H
+    BIG = NBLK + 1
+    fl = cst.full_like
+    if s is None:
+        s = sel.permute(1, 0, 2)                                                   # (Rd, H, k)
+    if valid0 is None:
+        valid0 = (s >= 0) & (s < hb.view(Rd, 1, 1)) & (s < NBLK)
+    srt = torch.sort(torch.where(valid0, s, fl(s, BIG)), dim=-1).values
+    prev = torch.cat([fl(srt[..., :1], -1), srt[..., :-1]], dim=-1)
+    valid = (srt < BIG) & (srt != prev)                                             # unique, ascending
+    blk = torch.where(valid, srt, fl(srt, 0))
+    bb, hh = rc["bb"], rc["hh"]
+    slot = m.slot_of[bb, hh, blk]
+    ready = valid & (slot >= 0)
+    infl0 = valid & ~ready & m.inflight[bb, hh, blk]
+    miss = valid & ~ready & ~infl0
+    N = Rd * H * k
+    sid = rc["sid"]
+    blk_f = blk.reshape(N)
+    miss_f = miss.reshape(N)
+    mkey = torch.where(miss_f, rc["sidN"] + blk_f, fl(blk_f, S * NBLK))
+    ks, perm = torch.sort(mkey, stable=True)
+    first_sorted = torch.cat([fl(ks[:1], True, dtype=torch.bool), ks[1:] != ks[:-1]])
+    first = torch.empty_like(first_sorted)
+    first[perm] = first_sorted
+    fmiss = miss_f & first
+    dup = miss_f & ~first
+    rank_s = rank_with(rc["rk"], fmiss)
+    usage = m.usage.reshape(S)
+    free_local = (C - usage).clamp(min=0)
+    needs_extra = fmiss & (rank_s >= free_local[sid])
+    borrowed = (usage - C).clamp(min=0).sum()
+    budget = (X - borrowed - R_ver).clamp(min=0)
+    ne = needs_extra.to(torch.int64)
+    g = ne.cumsum(0) - ne
+    granted = fmiss & (~needs_extra | (g < budget))
+    refused = fmiss & ~granted
+    q = rank_with(rc["rk"], granted)
+    ar = cst.ar(NPOS).view(1, NPOS).expand(S, NPOS)
+    free_sorted = torch.sort(torch.where(m.free.reshape(S, NPOS), ar, fl(ar, NPOS)), dim=-1).values
+    take_slot = torch.where(granted, free_sorted[sid, q.clamp(max=NPOS - 1)], fl(q, -1))
+    rkey = torch.where(ready, srt, fl(srt, BIG))
+    rperm = torch.sort(rkey, dim=-1).indices
+    rslot = torch.gather(slot, -1, rperm)
+    nready = ready.to(torch.int64).sum(-1)                                          # (Rd, H)
+    T = tails.shape[1]
+    P = k + T
+    page = torch.full((Rd, H, P), -1, dtype=torch.int64, device=dev)
+    posk = cst.ar(k).view(1, 1, k)
+    page[..., :k] = torch.where(posk < nready.unsqueeze(-1), rslot, fl(rslot, -1))
+    post = cst.ar(T).view(1, 1, T)
+    page.scatter_(-1, nready.unsqueeze(-1) + post, rc["tval"])
+    num_pages = nready + nt.view(Rd, 1)
+    masked = (nready < valid.to(torch.int64).sum(-1)).to(torch.int64).sum()
+    counters = torch.stack([masked, refused.to(torch.int64).sum(), fl(masked, Rd * H)])
+    t = dict(blk=blk_f, valid=valid.reshape(N), ready=ready.reshape(N), slot=slot.reshape(N),
+             infl=infl0.reshape(N) | dup, granted=granted, refused=refused, take_slot=take_slot,
+             protect=valid.reshape(N))
+    return DraftDecision(Rd, H, k, t, page, num_pages, counters)
+
+
 class ResidencySB(Residency):
     """Residency with the draft rows decided on the device (module docstring). Extra arguments: device (the mirrors'
     and the decisions' device), nblk (block ids per request the store can name), sb_mut (negative controls)."""

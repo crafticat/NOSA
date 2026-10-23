@@ -69,7 +69,7 @@ class OwnResidency(ResidencySparse):
 
     def __init__(self, *args, keys: int = 7, checked: bool = True, b2_mut=None, resolve: str = "torch",
                  fused_plant: int = 0, fused_guard: bool = False, fused_warm: str = "auto", lean: bool = False,
-                 wait_index: bool = False, fewer_reads: bool = False, **kw):
+                 wait_index: bool = False, fewer_reads: bool = False, res_lean: bool = False, **kw):
         kw["pin_records"] = False
         self.__dict__["_own_ready"] = False
         # [hostfix] --lean-time (OPT-IN, default False: every line as before): the REPORT-only host work is skipped
@@ -84,6 +84,8 @@ class OwnResidency(ResidencySparse):
             raise ValueError("resolve %r: one of torch, fused, check" % (resolve,))
         if fused_plant and resolve == "torch":
             raise ValueError("fused_plant needs resolve 'fused' or 'check'")
+        if res_lean and resolve != "torch":                           # [resfix] the torch resolve's lean form only
+            raise ValueError("res_lean needs resolve 'torch' (it is the torch resolve's lean form), not %r" % resolve)
         super().__init__(*args, **kw)
         if wait_index:                                                # [hostfix] --wait-index (OPT-IN): the same map
             self.inflight = InflightByLayer(self.inflight)            # with a per-layer index (_superset_wait)
@@ -123,6 +125,11 @@ class OwnResidency(ResidencySparse):
             self.fusedres = r2_fusedres.FusedResolver(self, check=resolve == "check", plant=int(fused_plant),
                                                       guard=bool(fused_guard),   # [fusedres2b] tests: OOB guards
                                                       warm=fused_warm)          # [stack2] warm_up (auto: CUDA)
+        # [resfix] --res-lean (OPT-IN, default False: resolve as before): S-C's torch resolve with less host work per
+        # layer (ResidencySC._resolve_lean: no hidden sync, the per-row Python once per tick, the tick's constants once);
+        # the same decisions, page tables and records (tests_cpu/test_r2_resfix.py)
+        if res_lean:
+            self.enable_res_lean()
         self.__dict__["_own_ready"] = True
 
     def resolve(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> Plan:
