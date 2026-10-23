@@ -72,6 +72,9 @@ resolve without its hidden syncs, with the per-row Python and the tick's constan
 (OwnResidency(res_lean=True)); the same decisions, page tables and records (tests_cpu/test_r2_resfix.py).
 [resdev] --res-dev (with --res-lean; analysis/evalfast/SCORING_resfix.md 2.3): the lean resolve's device hot spots
 with equal integer ops (OwnResidency(res_dev=True), nosi/r2_resdev.py; tests_cpu/test_r2_resdev.py).
+[endbatch] --end-batch (b2; analysis/evalfast/DIAG_effective_gap.md section 4, fix 3): run_round ends the requests that
+finish in a tick with ONE call (OwnResidency(end_batch=True).end_requests: one O.end_owners, one host read, a per-request
+index of the queued keys); the same final state as one end_request per request (tests_cpu/test_r2_endbatch.py).
 OUTPUT: --out/summary.json (after every run). The last stdout line is R2_TICK_SG5_DONE failed=<n>; exit = n (2 =
 refused). ENVIRONMENT: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0, NOSI_POOL_BLOCKS = 0 (the parent; a child sets its own).
 """
@@ -309,6 +312,10 @@ def parse_args(argv):
                          "(OwnResidency(res_dev=True), nosi/r2_resdev.py: one flat scan, no 1-D cummax, compactions "
                          "for the free lists, int32 sort keys, own dummy targets); the same decisions, page tables and "
                          "records (tests_cpu/test_r2_resdev.py)")
+    ap.add_argument("--end-batch", action="store_true",                                       # [endbatch]
+                    help="b2 only: the requests that finish in a tick end with ONE call (OwnResidency(end_batch=True)."
+                         "end_requests: one end_owners, one host read, a per-request index of the queued keys); the "
+                         "same final state as one end_request per request (tests_cpu/test_r2_endbatch.py)")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -422,6 +429,8 @@ def parse_args(argv):
         ap.error("--res-lean: --backends b2 with --b2-resolve torch only (OwnResidency(res_lean=True))")
     if a.res_dev and not a.res_lean:                                                             # [resdev]
         ap.error("--res-dev: needs --res-lean (OwnResidency(res_lean=True, res_dev=True))")
+    if a.end_batch and a.backends != ["b2"]:                                                     # [endbatch]
+        ap.error("--end-batch: --backends b2 only (OwnResidency(end_batch=True))")
     a.log_slots_n = resolve_log_slots(a)                                                         # [bigb]
     return a
 
@@ -822,8 +831,10 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
                                wait_index=bool(getattr(a, "wait_index", False)),                                  # [hostfix]
                                fewer_reads=bool(getattr(a, "b2_fewer_reads", False)),                             # [hostfix]
                                res_lean=bool(getattr(a, "res_lean", False)),                                      # [resfix]
-                               res_dev=bool(getattr(a, "res_dev", False)), **kw)                                  # [resdev]
+                               res_dev=bool(getattr(a, "res_dev", False)),                                        # [resdev]
+                               end_batch=bool(getattr(a, "end_batch", False)), **kw)                              # [endbatch]
             lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)       # [b2]
+            eng.end_batch = bool(getattr(a, "end_batch", False))         # [endbatch] run_round: one end call per tick
         else:
             lazy = _LazyOps()
             svc = ResidencySC(*args, device="cuda", nblk=n_host // 64, devops=lazy, **kw)
@@ -1828,6 +1839,8 @@ def main(argv=None) -> int:
             meta.update(res_lean=True)
         if a.res_dev:                                                                          # [resdev]
             meta.update(res_dev=True)
+        if a.end_batch:                                                                        # [endbatch]
+            meta.update(end_batch=True)
         if a.gc_freeze:                                                                        # [hostfix] item 1
             meta.update(gc_freeze=True, gc_freeze_note="each timed phase: collect, freeze, disable before; unfreeze, "
                                                        "enable, collect after (per point: gc_freeze[phase])")

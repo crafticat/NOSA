@@ -70,7 +70,7 @@ class OwnResidency(ResidencySparse):
     def __init__(self, *args, keys: int = 7, checked: bool = True, b2_mut=None, resolve: str = "torch",
                  fused_plant: int = 0, fused_guard: bool = False, fused_warm: str = "auto", lean: bool = False,
                  wait_index: bool = False, fewer_reads: bool = False, res_lean: bool = False, res_dev: bool = False,
-                 **kw):
+                 end_batch: bool = False, **kw):
         kw["pin_records"] = False
         self.__dict__["_own_ready"] = False
         # [hostfix] --lean-time (OPT-IN, default False: every line as before): the REPORT-only host work is skipped
@@ -137,6 +137,16 @@ class OwnResidency(ResidencySparse):
         # (the same decisions, page tables and records; tests_cpu/test_r2_resdev.py)
         if res_dev:
             self.enable_res_dev()
+        # [endbatch] --end-batch (OPT-IN, default False: one end_request per ended request, as before): end_requests
+        # ends ALL the requests that finish in a tick with ONE call (one O.end_owners, one host read) and finds each
+        # request's queued keys through _qidx (uid -> its queued cohort keys, in first-queue order), not by a scan of
+        # the whole queued set per request. _qidx starts from the queued set (empty here) and _queue keeps it.
+        self.end_batch = bool(end_batch)
+        self._qidx: Optional[Dict[Any, Dict[Tuple, None]]] = None
+        if self.end_batch:
+            self._qidx = {}
+            for (key, _l) in self.queued:
+                self._qidx.setdefault(key[0], {})[key] = None
         self.__dict__["_own_ready"] = True
 
     def resolve(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> Plan:
@@ -441,6 +451,69 @@ class OwnResidency(ResidencySparse):
                 del self._key_of[(bb, kk)]
                 self._kslot.pop(key, None)
         self._changed()
+
+    def _queue(self, key: Tuple, l: int) -> None:
+        """res.py:331-335 (unchanged); [endbatch] with --end-batch, the key is also put in its request's _qidx entry.
+        Every write to self.queued goes through here (res.py:334 is its only add; nothing removes from it), so _qidx
+        holds, per uid u, exactly the keys k with (k, l) in self.queued and k[0] == u."""
+        super()._queue(key, l)
+        qidx = self.__dict__.get("_qidx")
+        if qidx is not None:
+            qidx.setdefault(key[0], {})[key] = None
+
+    def end_requests(self, uids: Sequence) -> None:
+        """[endbatch] --end-batch: end_request for every uid in uids with ONE O.end_owners call (one host read for the
+        whole set) and one pass over each host map. r2_tick.run_round calls it once per tick with the requests that
+        ended in that tick (ResidencyBackend.end_requests).
+        THE FINAL STATE equals the state after end_request(u) for each u in uids, in ANY order:
+          - the table: O.end_owners writes only the entries of the ended batch slots, each from its own old value (its
+            docstring); hist_id[b] and hist_from[b] get constants. No entry depends on another request's end.
+          - uid_b, hist_from, hist_ev, _key_of, _kslot: each request's end deletes only its own entries (keyed by its
+            uid or its batch slot); a Python dict keeps the insertion order of the entries that stay, so the remaining
+            entries and their order are the same for every order of the deletions.
+          - _owner_py[b] = None per b; queue: the same filter (the entries of the other requests, in their order).
+          - cancelled: a set; it gets the same keys (the union over the uids of their queued keys, from _qidx or one
+            scan of queued). Nothing iterates it; only membership is read.
+          - journal_counts["release:end"]: the same sum, inserted at the same position (no other kind is counted
+            during the ends); _ver: one _changed() per request, as before.
+        A uid not in uid_b raises KeyError BEFORE any change (end_request raises it after the earlier ends); a repeated
+        uid raises ValueError."""
+        uids = list(uids)
+        if not uids:
+            return
+        if len(set(uids)) != len(uids):
+            raise ValueError("end_requests: a uid occurs twice in %s" % (uids,))
+        for u in uids:
+            if u not in self.uid_b:
+                raise KeyError(u)
+        bs = [self.uid_b.pop(u) for u in uids]
+        bset = set(bs)
+        bt = self._h2d(torch.tensor(bs, dtype=torch.int64))         # (CUDA: pinned, non-blocking: no host sync)
+        n = O.end_owners(self.own, bt)                                # the ONE host read
+        self._count("release:end", n)
+        for b in bs:
+            self._owner_py[b] = None
+            self.hist_from.pop(b, None)
+        for k in [k for k in self.hist_ev if k[0] in bset]:
+            del self.hist_ev[k]
+        self.own.hist_id.index_fill_(0, bt, -1)
+        self.own.hist_from.index_fill_(0, bt, 1 << 40)
+        if self._qidx is not None:
+            for u in uids:
+                self.cancelled.update(self._qidx.get(u, ()))
+        else:                                                         # (end_batch False: one scan for all uids)
+            us = set(uids)
+            for (key, l) in self.queued:
+                if key[0] in us:
+                    self.cancelled.add(key)
+        us = set(uids)
+        self.queue = [(k, l) for (k, l) in self.queue if k[0] not in us]
+        for (bb, kk), key in list(self._key_of.items()):
+            if bb in bset:
+                del self._key_of[(bb, kk)]
+                self._kslot.pop(key, None)
+        for _ in uids:
+            self._changed()
 
     def cancel(self, key: Tuple) -> None:
         """res.py:768-785: the key refused from now on, its references queued at every layer; its transfers in flight

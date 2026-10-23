@@ -468,6 +468,31 @@ def end_owner(T: Table, b: int, undo: Optional[Undo] = None) -> int:
     return int(f.numel())
 
 
+def end_owners(T: Table, bt: torch.Tensor, undo: Optional[Undo] = None) -> int:
+    """[endbatch] end_owner for SEVERAL batch slots in ONE call (--end-batch; OwnResidency.end_requests). bt: int64 on
+    the table's device, DISTINCT batch slots (the caller checks this on the host). The writes are end_owner's for each
+    b: the LRU / PO / VRES slots of b -> RELEASING, every pin of b cleared, the owner of b -1. Existing torch ops only:
+    index_select / where / index_copy_ / index_fill_ (no scalar scatter through an advanced index, no boolean mask
+    index). ONE host read: the release count (the sum of end_owner's counts).
+    WHY THE ORDER OF bt DOES NOT MATTER: the writes for b go to code[:, b], pin_w[:, :, b] and owner[b] only, and the
+    new code of a slot of b is a function of the old code of that slot only. No b reads or writes an entry of another
+    b. So the result is the same for every order of bt and equals end_owner(T, b) called once per b in any order.
+    undo: the old codes and pins of bt are restored by rollback (the owner is not, as in end_owner)."""
+    if bt.numel() == 0:
+        return 0
+    code = T.c["code"]
+    sub = code.index_select(1, bt)                                     # (L, n, H, NPOS), a copy: the old codes of bt
+    m = (sub == C_LRU) | (sub == C_PO) | (sub == C_VRES)
+    if undo is not None:
+        pw_old = T.pin_w.index_select(2, bt)
+        undo.call(lambda i=bt, o=sub: code.index_copy_(1, i, o))
+        undo.call(lambda i=bt, o=pw_old: T.pin_w.index_copy_(2, i, o))
+    code.index_copy_(1, bt, torch.where(m, torch.full_like(sub, C_RELEASING), sub))
+    T.pin_w.index_fill_(2, bt, 0)
+    T.owner.index_fill_(0, bt, -1)
+    return int(m.sum())                                                # the ONE host read (the releases)
+
+
 def poll_releases(T: Table, win: ReaderWindow, undo: Optional[Undo] = None) -> int:
     """K4 (own.py:435-452): RELEASING -> FREE once the slot's last reader completed; block, owner, class cleared;
     gen and readers kept."""

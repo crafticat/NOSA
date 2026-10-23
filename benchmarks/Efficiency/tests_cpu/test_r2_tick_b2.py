@@ -234,7 +234,8 @@ def test_TB4_the_k5_report_holds_the_demand_peak_on_b2():
 GPU_PATH = ("apply_tick", "_apply_b2", "_host_side", "poll", "_poll_arrivals", "_poll_drops", "_poll_releases",
             "sync_mirror", "begin_request", "history_written", "end_request", "cancel", "memory", "_key_slot",
             "_in_flight", "_tick_rows_of", "watch_flag",
-            "_looks", "_lean_queue")                     # [hostfix] _host_side's looks moved out; the lean queue
+            "_looks", "_lean_queue",                     # [hostfix] _host_side's looks moved out; the lean queue
+            "end_requests", "_queue")                    # [endbatch] the batched ends and the queued-key index
 
 
 def _methods(path, cls):
