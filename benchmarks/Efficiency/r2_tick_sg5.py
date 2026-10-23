@@ -72,6 +72,10 @@ resolve without its hidden syncs, with the per-row Python and the tick's constan
 (OwnResidency(res_lean=True)); the same decisions, page tables and records (tests_cpu/test_r2_resfix.py).
 [resdev] --res-dev (with --res-lean; analysis/evalfast/SCORING_resfix.md 2.3): the lean resolve's device hot spots
 with equal integer ops (OwnResidency(res_dev=True), nosi/r2_resdev.py; tests_cpu/test_r2_resdev.py).
+[inflight-array] --inflight-array (b2, --arrival-lag >= 1; analysis/evalfast/DIAG_effective_gap.md section 4, fix 2):
+the poll admits the due draft issues as whole parts (OwnResidency(inflight_array=True): no sort of the transfers in
+flight, one done / force per issue, one vectorized check, the host maps in bulk); the same admitted sets, so the same
+decisions, page tables and logits (tests_cpu/test_r2_admitfill.py).
 OUTPUT: --out/summary.json (after every run). The last stdout line is R2_TICK_SG5_DONE failed=<n>; exit = n (2 =
 refused). ENVIRONMENT: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0, NOSI_POOL_BLOCKS = 0 (the parent; a child sets its own).
 """
@@ -309,6 +313,11 @@ def parse_args(argv):
                          "(OwnResidency(res_dev=True), nosi/r2_resdev.py: one flat scan, no 1-D cummax, compactions "
                          "for the free lists, int32 sort keys, own dummy targets); the same decisions, page tables and "
                          "records (tests_cpu/test_r2_resdev.py)")
+    ap.add_argument("--inflight-array", action="store_true",                                  # [inflight-array]
+                    help="b2 with --arrival-lag >= 1 only: the poll admits the due draft issues as whole parts "
+                         "(OwnResidency(inflight_array=True): no sort of the transfers in flight, one done / force per "
+                         "issue, one vectorized check); the same admitted sets, decisions, page tables and logits "
+                         "(tests_cpu/test_r2_admitfill.py)")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -422,6 +431,9 @@ def parse_args(argv):
         ap.error("--res-lean: --backends b2 with --b2-resolve torch only (OwnResidency(res_lean=True))")
     if a.res_dev and not a.res_lean:                                                             # [resdev]
         ap.error("--res-dev: needs --res-lean (OwnResidency(res_lean=True, res_dev=True))")
+    if a.inflight_array and (a.backends != ["b2"] or a.arrival_lag < 1):                          # [inflight-array]
+        ap.error("--inflight-array: --backends b2 with --arrival-lag >= 1 only (OwnResidency(inflight_array=True) "
+                 "needs the fixed arrival rule)")
     a.log_slots_n = resolve_log_slots(a)                                                         # [bigb]
     return a
 
@@ -590,6 +602,7 @@ class GatherTransport:
     service fills them from the GPU cis table at take."""
 
     name = "gather"
+    one_event_per_issue = True                      # [inflight-array] one completion event per issue (set in order)
 
     def __init__(self, host_k, host_v, store_k, store_v, n_slots: int, bs: int = 64, xpool=None):
         import torch
@@ -822,7 +835,8 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
                                wait_index=bool(getattr(a, "wait_index", False)),                                  # [hostfix]
                                fewer_reads=bool(getattr(a, "b2_fewer_reads", False)),                             # [hostfix]
                                res_lean=bool(getattr(a, "res_lean", False)),                                      # [resfix]
-                               res_dev=bool(getattr(a, "res_dev", False)), **kw)                                  # [resdev]
+                               res_dev=bool(getattr(a, "res_dev", False)),                                        # [resdev]
+                               inflight_array=bool(getattr(a, "inflight_array", False)), **kw)                    # [inflight-array]
             lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)       # [b2]
         else:
             lazy = _LazyOps()
@@ -1828,6 +1842,8 @@ def main(argv=None) -> int:
             meta.update(res_lean=True)
         if a.res_dev:                                                                          # [resdev]
             meta.update(res_dev=True)
+        if a.inflight_array:                                                                   # [inflight-array]
+            meta.update(inflight_array=True)
         if a.gc_freeze:                                                                        # [hostfix] item 1
             meta.update(gc_freeze=True, gc_freeze_note="each timed phase: collect, freeze, disable before; unfreeze, "
                                                        "enable, collect after (per point: gc_freeze[phase])")
@@ -1888,6 +1904,7 @@ def main(argv=None) -> int:
                                 import copy
                                 af = copy.copy(a)
                                 af.arrival_lag = 0
+                                af.inflight_array = False          # [inflight-array] free timing: the old poll
                                 log("%s_free: the same stack at free arrival (REPORT timing)" % label)
                                 pf = one_point(af, model, cache, st, first,
                                                BIOps(select_attn(af, attn), a.m_fix, gemm=mode), kind, a.C, a.X,

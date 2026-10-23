@@ -150,6 +150,10 @@ WORKERS = ("python", "cpp")
 
 class GilfreeTransport:
     name = "gilfree"
+    # [inflight-array] every transfer of ONE issue() completes on ONE event (the Python worker's release event, the C++
+    # worker's job event), and the worker sets tr.ev in the list's order: so the last transfer's done() is the issue's
+    # (OwnResidency(inflight_array=True) asks one done per issue)
+    one_event_per_issue = True
     # [hostfix] --host-profile (OPT-IN; None: no clock is read): a list that gets one record per release of the
     # Python worker (_release, the feeder thread when background): (layer, transfers, python ns, native ns, the clock
     # at its end). python ns = the release's wall time minus the native pack call (npipe.release, which runs the C++

@@ -1003,6 +1003,11 @@ class PublishingTransport:
     def pending(self):
         return self.inner.pending
 
+    @property
+    def one_event_per_issue(self) -> bool:
+        """[inflight-array] the inner transport's (the publication adds no event)."""
+        return bool(getattr(self.inner, "one_event_per_issue", False))
+
     def attach_board(self, board: GenBoard) -> None:
         self.board = board
 
@@ -1169,6 +1174,18 @@ class InflightByLayer(dict):
         k, v = dict.popitem(self)
         self._drop(k, v)
         return k, v
+
+    def pop_layer_many(self, l: int, ks) -> None:
+        """[inflight-array] Pops the keys ks from the map and from layer l's index, in C-level map calls (no Python
+        statement per key): the effect of pop(k) for each k. Every key must be in the map and name a transfer of layer
+        l (the caller's issue part holds one layer); index_ok() checks the index in the tests."""
+        n = len(ks)
+        deque(map(dict.pop, itertools.repeat(self, n), ks), maxlen=0)
+        sub = self._by.get(l)
+        if sub is not None:
+            deque(map(sub.pop, ks, itertools.repeat(None, n)), maxlen=0)
+            if not sub:
+                del self._by[l]
 
     def setdefault(self, k, default=None):
         if not dict.__contains__(self, k):
