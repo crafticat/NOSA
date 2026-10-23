@@ -101,6 +101,8 @@ from . import r2_xpool as XP
 from .r2_residency import BLOCK, N_TAIL, VERIFY, Plan, Residency, Row
 from .r2_residency_sb import FIELDS, DraftMirror, ResidencySB, device_draft, rank_in_group
 from .r2_residency_sb import LeanConsts, device_draft_lean, rank_prep, rank_with   # [resfix] --res-lean
+from .r2_residency_sb import dev_flat                                              # [resdev] --res-dev
+from . import r2_resdev as RD                                                      # [resdev]
 
 FIELDS_V = ("blk", "valid", "ready", "slot", "infl", "infl_slot", "infl_gen", "dup", "granted", "take_slot", "rslot",
             "protect", "evict", "evict_blk", "evict_infl", "ev_gen")
@@ -174,6 +176,39 @@ class LayerMirror:
     def __init__(self, **fields):
         for k, v in fields.items():
             setattr(self, k, v)
+
+
+class _LazyRanks(LayerMirror):
+    """[resdev] A LayerMirror whose lru_rank and infl_rank are computed at their first read (_mirror_ranks: layer_lean's
+    own ops on the same inputs, which no decision op writes). device_verify(_lean), device_draft(_lean) and the record
+    read neither, so --res-dev skips two (B H, NPOS) sorts and two scatters per layer; a reader (a test) gets the same
+    values."""
+
+    def __init__(self, rank_fn, **fields):
+        super().__init__(**fields)
+        self.__dict__["_rank_fn"] = rank_fn
+
+    def __getattr__(self, name):
+        if name in ("lru_rank", "infl_rank"):
+            lr, ir = self.__dict__["_rank_fn"]()
+            self.__dict__.update(lru_rank=lr, infl_rank=ir)
+            return self.__dict__[name]
+        raise AttributeError(name)
+
+
+def _mirror_ranks(lru, fly, lru_stamp, fly_stamp, code, cst):
+    """[resdev] layer_lean's lru_rank and infl_rank, its ops in its order."""
+    B, H, NPOS = code.shape
+    fl = cst.full_like
+    order = torch.sort(lru_stamp.view(B * H, NPOS), dim=-1).indices
+    src = cst.memo(("dm_src", B * H, NPOS), lambda: cst.ar(NPOS).view(1, NPOS).expand(B * H, NPOS).contiguous())
+    rank = torch.empty_like(order)
+    rank.scatter_(1, order, src)
+    forder = torch.sort(fly_stamp.view(B * H, NPOS), dim=-1).indices
+    frank = torch.empty_like(forder)
+    frank.scatter_(1, forder, src)
+    neg = fl(code, -1)
+    return torch.where(lru, rank.view(B, H, NPOS), neg), torch.where(fly, frank.view(B, H, NPOS), neg)
 
 
 class DeviceMirror:
@@ -266,17 +301,35 @@ class DeviceMirror:
         resident = lru | (code == C_PO) | (code == C_VRES)
         res = okb & resident
         fly = okb & (code == C_INFLIGHT) & (cur != 0)
-        at_res = torch.where(res, flat, fl(flat, dummy)).reshape(-1)
-        at_fly = torch.where(fly, flat, fl(flat, dummy)).reshape(-1)
-        slot_of = torch.full((dummy + 1,), -1, dtype=torch.int64, device=dev)
+        if cst.dev:                                                                # [resdev] each slot that is not
+            spr = cst.memo(("dm_spread", B, H, NPOS, NBLK),                        # resident / in flight writes its
+                           lambda: (cst.ar(B * H * NPOS) + dummy).view(B, H, NPOS))   # OWN dummy (no shared target)
+            at_res = torch.where(res, flat, spr).reshape(-1)
+            at_fly = torch.where(fly, flat, spr).reshape(-1)
+            ext = B * H * NPOS
+        else:
+            at_res = torch.where(res, flat, fl(flat, dummy)).reshape(-1)
+            at_fly = torch.where(fly, flat, fl(flat, dummy)).reshape(-1)
+            ext = 1
+        slot_of = torch.full((dummy + ext,), -1, dtype=torch.int64, device=dev)
         slot_of[at_res] = idx                                                      # one resident slot per block (K3)
-        infl_slot = torch.full((dummy + 1,), -1, dtype=torch.int64, device=dev)
+        infl_slot = torch.full((dummy + ext,), -1, dtype=torch.int64, device=dev)
         infl_slot[at_fly] = idx                                                    # one owner transfer per block
-        infl_gen = torch.zeros((dummy + 1,), dtype=torch.int64, device=dev)
+        infl_gen = torch.zeros((dummy + ext,), dtype=torch.int64, device=dev)
         infl_gen[at_fly] = gen.reshape(-1)
         shp = (B, H, NBLK)
         big = fl(code, BIG_STAMP)
         lru_stamp = torch.where(lru, self.stamp[l], big)
+        if cst.dev:                                                                # [resdev] lru_rank / infl_rank:
+            fly_stamp = torch.where(fly, self.stamp[l], big)                       # no decision op reads them (they
+            free = code == C_FREE                                                  # are computed when read: _LazyRanks)
+            isl = infl_slot[:dummy]
+            return _LazyRanks(lambda: _mirror_ranks(lru, fly, lru_stamp, fly_stamp, code, cst),
+                              slot_of=slot_of[:dummy].view(shp), inflight=(isl >= 0).view(shp),
+                              infl_slot=isl.view(shp), infl_gen=infl_gen[:dummy].view(shp),
+                              free=free, usage=(~free).sum(-1), releasing=code == C_RELEASING,
+                              prot=resident & (self.prot[l] != 0), lru_stamp=lru_stamp, slot_block=blk,
+                              infl_unprot=fly & (self.prot[l] == 0), fly=fly, fly_stamp=fly_stamp, slot_gen=gen)
         order = torch.sort(lru_stamp.view(B * H, NPOS), dim=-1).indices
         src = cst.memo(("dm_src", B * H, NPOS), lambda: cst.ar(NPOS).view(1, NPOS).expand(B * H, NPOS).contiguous())
         rank = torch.empty_like(order)
@@ -555,6 +608,13 @@ def _selected_mask_lean(S: int, H: int, NBLK: int, parts, cst: LeanConsts) -> to
     """[resfix] _selected_mask for --res-lean, the same values. parts: [(s (R, H, k) the permuted selection, ok its
     validity (_selected_mask's ok = device_verify's / device_draft's valid0: the same formula), sidn3 (R, H, 1) =
     (rb * H + h) * NBLK, a tick constant)]."""
+    if cst.dev:                                                    # [resdev] a set bit per selected block: index_put_ of
+        n = max([p[0].numel() for p in parts] + [1])               # True, each invalid entry at its own dummy (no
+        hit = torch.zeros(S * NBLK + n, dtype=torch.bool, device=cst.device)   # atomic add to one shared element);
+        for (s_, ok, sidn3) in parts:                              # the lean count > 0 iff an ok entry hit the block
+            f = RD.spread(sidn3 + s_.clamp(min=0), ok, S * NBLK, cst.ar(s_.numel()).view(s_.shape))
+            hit.index_put_((f.reshape(-1),), cst.true)
+        return hit[:S * NBLK]
     acc = torch.zeros(S * NBLK + 1, dtype=torch.int64, device=cst.device)
     for (s_, ok, sidn3) in parts:
         f = torch.where(ok, sidn3 + s_.clamp(min=0), cst.full_like(s_, S * NBLK))
@@ -594,7 +654,11 @@ def device_verify_lean(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, 
     blk_f = blk.reshape(N)
     miss_f = miss.reshape(N)
     mkey = torch.where(miss_f, rc["sidN"] + blk_f, fl(blk_f, S * NBLK))
-    ks, perm = torch.sort(mkey, stable=True)
+    dv = cst.dev                                                                    # [resdev] --res-dev
+    if dv:                                                                          # 0 <= mkey <= S * NBLK: int32 keys
+        ks, perm = RD.sort_key32(mkey, S * NBLK)
+    else:
+        ks, perm = torch.sort(mkey, stable=True)
     first_sorted = torch.cat([fl(ks[:1], True, dtype=torch.bool), ks[1:] != ks[:-1]])
     first = torch.empty_like(first_sorted)
     first[perm] = first_sorted
@@ -611,8 +675,11 @@ def device_verify_lean(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, 
     granted = fmiss & (~needs_extra | (g < budget))
     refused_k5 = fmiss & ~granted
     q = rank_with(rc["rk"], granted)
-    ar = cst.ar(NPOS).view(1, NPOS).expand(S, NPOS)
-    free_sorted = torch.sort(torch.where(m.free.reshape(S, NPOS), ar, fl(ar, NPOS)), dim=-1).values
+    if dv:                                                                          # [resdev] a compaction, no sort
+        free_sorted = RD.sorted_free(m.free.reshape(S, NPOS), flat=dev_flat(cst, S, NPOS))
+    else:
+        ar = cst.ar(NPOS).view(1, NPOS).expand(S, NPOS)
+        free_sorted = torch.sort(torch.where(m.free.reshape(S, NPOS), ar, fl(ar, NPOS)), dim=-1).values
     selm = _selected_mask_lean(S, H, NBLK, [(s, valid0, rc["sidn3"])] + list(others), cst)
     sblk = m.slot_block.reshape(S, NPOS)
     sidn_slot = cst.memo(("sidn_slot", S, NBLK), lambda: cst.ar(S).view(S, 1) * NBLK)   # (S, 1): broadcasts
@@ -630,7 +697,7 @@ def device_verify_lean(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, 
     any_c = cand | cand_f
     ckey = torch.where(any_c, ckey, fl(ckey, BIG_STAMP))
     cand_sorted = torch.sort(ckey, dim=-1).indices                                  # candidates first, oldest first
-    n_cand = any_c.to(torch.int64).sum(-1)                                          # (S,)
+    n_cand = any_c.sum(-1) if dv else any_c.to(torch.int64).sum(-1)                 # (S,) [resdev] bool sum: int64
     r_ev = rank_with(rc["rk"], refused_k5)
     evicted = refused_k5 & (r_ev < n_cand[sid])
     ev_slot = cand_sorted[sid, r_ev.clamp(max=NPOS - 1)]
@@ -642,7 +709,10 @@ def device_verify_lean(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, 
     neg = fl(q, -1)
     take_slot = torch.where(granted, free_sorted[sid, q.clamp(max=NPOS - 1)], torch.where(evicted, ev_slot, neg))
     pos = cst.ar(N)
-    gstart = torch.cummax(torch.where(first_sorted, pos, fl(pos, 0)), 0).values
+    if dv:                                                                          # [resdev] no single-block cummax
+        gstart = RD.group_start(first_sorted, pos)
+    else:
+        gstart = torch.cummax(torch.where(first_sorted, pos, fl(pos, 0)), 0).values
     grp_slot = torch.empty_like(take_slot)
     grp_slot[perm] = take_slot[perm][gstart]
     rslot = torch.where(ready.reshape(N), slot.reshape(N),
@@ -654,7 +724,7 @@ def device_verify_lean(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, 
     vkey = torch.where(valid, srt, fl(srt, BIG))
     vperm = torch.sort(vkey, dim=-1).indices
     pslot = torch.gather(rslot_page.view(Rv, H, k), -1, vperm)
-    nvalid = valid.to(torch.int64).sum(-1)                                          # (Rv, H)
+    nvalid = valid.sum(-1) if dv else valid.to(torch.int64).sum(-1)                # (Rv, H)
     T = tails.shape[1]
     P = k + T
     page = torch.full((Rv, H, P), -1, dtype=torch.int64, device=dev)
@@ -663,6 +733,13 @@ def device_verify_lean(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, 
     post = cst.ar(T).view(1, 1, T)
     page.scatter_(-1, nvalid.unsqueeze(-1) + post, rc["tval"])
     num_pages = nvalid + nt.view(Rv, 1)
+    if dv:                                                                          # [resdev] the mirror updates
+        return _verify_tail_dev(m, rc, cst, Rv, H, k, B, NBLK, NPOS, N, taken, granted, evicted, ev_infl, ev_blk,
+                                take_slot, blk_f, over, page, num_pages,
+                                dict(blk=blk_f, valid=valid_f, ready=ready.reshape(N), slot=slot.reshape(N),
+                                     infl=infl.reshape(N), infl_slot=islot.reshape(N), infl_gen=igen.reshape(N),
+                                     dup=dup, granted=granted, take_slot=take_slot, rslot=rslot, protect=valid_f,
+                                     evict=evicted, evict_blk=ev_blk, evict_infl=ev_infl, ev_gen=ev_gen))
     col = torch.where(taken, take_slot, fl(take_slot, NPOS))
     ids = torch.full((H, B, NPOS + 1), -1, dtype=torch.int64, device=dev)
     ids.index_put_((hh_f, bb_f, col), torch.where(taken, blk_f, fl(blk_f, -1)))
@@ -686,6 +763,41 @@ def device_verify_lean(m: VerifyMirror, rb, hb, tails, nt, sel, C: int, X: int, 
     t = dict(blk=blk_f, valid=valid_f, ready=ready.reshape(N), slot=slot.reshape(N), infl=infl.reshape(N),
              infl_slot=islot.reshape(N), infl_gen=igen.reshape(N), dup=dup, granted=granted, take_slot=take_slot,
              rslot=rslot, protect=valid_f, evict=evicted, evict_blk=ev_blk, evict_infl=ev_infl, ev_gen=ev_gen)
+    return VerifyDecision(Rv, H, k, t, page, num_pages, load_ids, (bb_f, hh_f), counters)
+
+
+def _verify_tail_dev(m, rc, cst, Rv, H, k, B, NBLK, NPOS, N, taken, granted, evicted, ev_infl, ev_blk, take_slot, blk_f,
+                     over, page, num_pages, t) -> VerifyDecision:
+    """[resdev] device_verify_lean's last part (load_ids, the mirror updates, the counter) with the same values:
+      - load_ids: the taken entries write their block at (h, b, take slot) as in the lean index_put_; every other entry
+        writes -1 to its OWN dummy element (the lean op sends them to the dummy column NPOS of their stream);
+      - d_infl / d_free / d_gone / d_gone_f: the lean op adds the mask (0 or 1) at an index and tests the sum > 0; here
+        each masked entry writes True at the same index and every other entry writes True to its own dummy element
+        (no atomic add to one shared element). sum > 0 iff some masked entry hit the index: the same bool;
+      - the bool sums are int64 already (no cast)."""
+    dev = cst.device
+    S = B * H
+    bb_f, hh_f, sid = rc["bb_f"], rc["hh_f"], rc["sid"]
+    on = cst.ar(N)
+    W = NPOS + 1
+    ids = torch.full((H * B * W + N,), -1, dtype=torch.int64, device=dev)
+    fi = RD.spread((hh_f * B + bb_f) * W + take_slot, taken, H * B * W, on)
+    ids.index_put_((fi,), torch.where(taken, blk_f, cst.full_like(blk_f, -1)))
+    load_ids = ids[:H * B * W].view(H, B, W)[..., :NPOS].contiguous()
+
+    def hits(size, idx, mask):
+        h_ = torch.zeros(size + N, dtype=torch.bool, device=dev)
+        h_.index_put_((RD.spread(idx, mask, size, on),), cst.true)
+        return h_[:size]
+    m.inflight |= hits(S * NBLK, rc["sidN"] + blk_f, taken).view(B, H, NBLK)
+    m.free &= ~hits(S * NPOS, rc["sidP"] + take_slot.clamp(min=0), granted).view(B, H, NPOS)
+    m.usage += torch.zeros(S, dtype=torch.int64, device=dev).index_add_(0, sid, granted.to(torch.int64)).view(B, H)
+    at_ev = rc["sidN"] + ev_blk.clamp(min=0)
+    m.slot_of.masked_fill_(hits(S * NBLK, at_ev, evicted).view(B, H, NBLK), -1)
+    gone_f = hits(S * NBLK, at_ev, ev_infl).view(B, H, NBLK)
+    m.inflight &= ~gone_f
+    m.infl_slot.masked_fill_(gone_f, -1)
+    counters = over.sum().reshape(1)
     return VerifyDecision(Rv, H, k, t, page, num_pages, load_ids, (bb_f, hh_f), counters)
 
 
@@ -1275,6 +1387,8 @@ class ResidencySC(ResidencySB):
     lean = False
     # [resfix] --res-lean (B2's OwnResidency(res_lean=True) -> enable_res_lean; default False: resolve runs as before)
     res_lean = False
+    # [resdev] --res-dev (B2's OwnResidency(res_dev=True) -> enable_res_dev; default False: the lean ops as before)
+    res_dev = False
 
     def __init__(self, *args, sc_mut=None, devops=None, mirror_drop=None, wait_mode: str = "probe", **kw):
         kw["defer_admit"] = True
@@ -1554,6 +1668,15 @@ class ResidencySC(ResidencySB):
         self.res_lean = True
         self._lean_c = LeanConsts(self.device)
         self._lean_t = None
+
+    def enable_res_dev(self) -> None:
+        """[resdev] --res-dev (OPT-IN, after enable_res_lean; analysis/evalfast/SCORING_resfix.md 2.3 / 3.4): the lean
+        functions run r2_resdev's equal ops at their device hot spots (the service's LeanConsts.dev = True). The lean
+        path (dev False) stays the reference; CPU tests tests_cpu/test_r2_resdev.py RD1-RD5 (RD6 on a GPU)."""
+        if not self.res_lean:
+            raise ValueError("--res-dev needs --res-lean (it changes the lean resolve's device ops only)")
+        self.res_dev = True
+        self._lean_c.dev = True
 
     def _resolve_lean(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> Plan:
         """[resfix] resolve() for --res-lean: the same checks (the same exceptions, in the same order), the same device

@@ -52,6 +52,15 @@ from typing import Dict, List, Optional, Sequence
 
 import torch
 
+try:                                                   # [resdev] --res-dev's equal device ops (bind_lean, audit_lean)
+    from . import r2_resdev as RD
+except ImportError:                                    # loaded as a file (XP11's interpreter child): the sibling by path
+    import importlib.util as _ilu
+    import pathlib as _pl
+    _sp = _ilu.spec_from_file_location("r2_resdev", _pl.Path(__file__).with_name("r2_resdev.py"))
+    RD = _ilu.module_from_spec(_sp)
+    _sp.loader.exec_module(RD)
+
 try:                                                   # triton is needed only to launch h2d_entries' kernel on the GPU
     import triton
     import triton.language as tl
@@ -269,25 +278,39 @@ class XPool:
         if base is None:
             base = (bb * H + hh) * NS
         f = base + slot.clamp(min=0, max=NS - 1)
-        want = torch.zeros(B * H * NS + 1, dtype=torch.bool, device=dev)
-        want.index_put_((torch.where(ok, f, fl(f, B * H * NS)),), cst.true)
+        dv = getattr(cst, "dev", False)                             # [resdev] --res-dev: r2_resdev's equal ops
+        if dv:                                                      # each entry that wants no slot: its own dummy
+            want = torch.zeros(B * H * NS + f.shape[0], dtype=torch.bool, device=dev)
+            want.index_put_((RD.spread(f, ok, B * H * NS, cst.ar(f.shape[0])),), cst.true)
+        else:
+            want = torch.zeros(B * H * NS + 1, dtype=torch.bool, device=dev)
+            want.index_put_((torch.where(ok, f, fl(f, B * H * NS)),), cst.true)
         want = want[:B * H * NS].view(B, H, NS)
         cur = self.pos_of[l, :, :, :NS]                                             # (B, H, NS) view
         needh = (want & (cur < 0)).permute(1, 0, 2).reshape(H, B * NS)              # per head, (b, s) order
         ni = needh.to(torch.int64)
-        rank = ni.cumsum(-1) - ni
         occ = self.occ[l]                                                           # (H, A) view
-        ar = cst.ar(A).view(1, A).expand(H, A)
-        free_sorted = torch.sort(torch.where(occ, fl(ar, A), ar), dim=-1).values
-        nfree = (~occ).to(torch.int64).sum(-1, keepdim=True)
+        if dv:                                  # [resdev] ONE flat scan (not one block per head); a compaction of the
+            rank = RD.excl_scan_rows(ni)        # free lanes (not a sort of 2 x A keys); bool sums are int64
+            free_sorted = RD.sorted_free(~occ, flat=cst.memo(("rd_flat", H, A), lambda: cst.ar(H * A).view(H, A)))
+            nfree = (~occ).sum(-1, keepdim=True)
+        else:
+            rank = ni.cumsum(-1) - ni
+            ar = cst.ar(A).view(1, A).expand(H, A)
+            free_sorted = torch.sort(torch.where(occ, fl(ar, A), ar), dim=-1).values
+            nfree = (~occ).to(torch.int64).sum(-1, keepdim=True)
         over = needh & (rank >= nfree)
         assign = needh & ~over
         newpos = torch.gather(free_sorted, 1, rank.clamp(max=A - 1))
         cur_h = cur.permute(1, 0, 2).reshape(H, B * NS)
         self.pos_of[l, :, :, :NS] = torch.where(assign, newpos, cur_h).view(H, B, NS).permute(1, 0, 2)
-        mark = torch.zeros((H, A + 1), dtype=torch.bool, device=dev)
         tgt = torch.where(assign, newpos, fl(newpos, A))
-        mark.scatter_(1, tgt, fl(assign, True))
+        if dv:                                  # [resdev] an unassigned entry marks its own dummy lane A + j, not A
+            mark = torch.zeros((H, A + B * NS), dtype=torch.bool, device=dev)
+            mark.scatter_(1, RD.spread(newpos, assign, A, cst.ar(B * NS).view(1, B * NS)), fl(assign, True))
+        else:
+            mark = torch.zeros((H, A + 1), dtype=torch.bool, device=dev)
+            mark.scatter_(1, tgt, fl(assign, True))
         occ |= mark[:, :A]
         if self.witness:                                                            # [integ3] / [integ5] as in bind
             breq = cst.memo(("xp_breq", H, B, NS), lambda: (cst.ar(B * NS) // NS).view(1, B * NS).expand(H, B * NS))
@@ -307,8 +330,13 @@ class XPool:
         H, NS, A = self.H, self.n_hist, self.A
         p = self.pos_of[l, :, :, :NS].permute(1, 0, 2).reshape(H, -1)
         bound = p >= 0
-        cnt = torch.zeros((H, A + 1), dtype=torch.int64, device=self.device)
-        cnt.scatter_add_(1, torch.where(bound, p, cst.full_like(p, A)), bound.to(torch.int64))
+        if getattr(cst, "dev", False):          # [resdev] an unbound slot adds 0 to its OWN dummy lane A + j (the lean
+            n = p.shape[1]                      # op adds to lane A from every unbound slot: atomics on one element)
+            cnt = torch.zeros((H, A + n), dtype=torch.int64, device=self.device)
+            cnt.scatter_add_(1, RD.spread(p, bound, A, cst.ar(n).view(1, n)), bound.to(torch.int64))
+        else:
+            cnt = torch.zeros((H, A + 1), dtype=torch.int64, device=self.device)
+            cnt.scatter_add_(1, torch.where(bound, p, cst.full_like(p, A)), bound.to(torch.int64))
         c = cnt[:, :A]
         bad = torch.any(c > 1) | torch.any((c > 0) != self.occ[l])
         self.err.bitwise_or_(bad.to(torch.int64) * ERR_ALIAS)
@@ -496,11 +524,16 @@ def draft_bias_fill_flat_lean(xp: XPool, l: int, store_b_flat, cis_l, ddec, bbd,
     xp.err.bitwise_or_(torch.any(g & (pos < 0)).to(torch.int64) * ERR_UNBOUND)
     ok = g & (pos >= 0)
     r = cst.ar(bs).view(1, bs)
-    dst = torch.where(ok.view(N, 1), pos.clamp(min=0).view(N, 1) * bs + r, cst.full_like(r, rows))
+    if getattr(cst, "dev", False):              # [resdev] a row of an entry without a take goes to its OWN dummy row
+        ext = N * bs                            # rows + n * bs + r (the lean op sends all N * bs of them to row `rows`)
+        dst = RD.spread(pos.clamp(min=0).view(N, 1) * bs + r, ok.view(N, 1), rows, cst.ar(ext).view(N, bs))
+    else:
+        ext = 1
+        dst = torch.where(ok.view(N, 1), pos.clamp(min=0).view(N, 1) * bs + r, cst.full_like(r, rows))
     src = t["blk"].clamp(min=0).view(N, 1) * bs + r
     b2, h2 = bbd.view(N, 1).expand(N, bs), hhd.view(N, 1).expand(N, bs)
-    buf = torch.zeros((rows + 1, H), dtype=store_b_flat.dtype, device=dev)
-    hit = torch.zeros((rows + 1, H), dtype=torch.bool, device=dev)
+    buf = torch.zeros((rows + ext, H), dtype=store_b_flat.dtype, device=dev)
+    hit = torch.zeros((rows + ext, H), dtype=torch.bool, device=dev)
     buf[dst, h2] = cis_l[b2, src, h2].to(store_b_flat.dtype)
     hit.index_put_((dst, h2), cst.true)
     store_b_flat[...] = torch.where(hit[:rows], buf[:rows], store_b_flat)

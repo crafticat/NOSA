@@ -125,6 +125,9 @@
 #            --b2-fewer-reads (items 3 and 5, opt-in, CPU-tested; one word each to add)
 #   evalfast2rp / evalfast2rl [resfix] evalfast2wx + --b2-res-profile (the device floor of res; STEP_MIN 150) / +
 #            --res-lean (the lean torch resolve, tests_cpu/test_r2_resfix.py); REGISTERED block below
+#   evalfast2rd / evalfast2rdp [resdev] evalfast2rl + --res-dev (the lean resolve's device hot spots with equal integer
+#            ops, nosi/r2_resdev.py, tests_cpu/test_r2_resdev.py; FAST) / + --b2-res-profile too (the device time of
+#            the --res-dev draft-only tick; STEP_MIN 150); REGISTERED block below
 #   STEP_MIN 120 in every cell above.
 #   [fusedres2] the FR-g cells of docs/R2_FUSEDRES_PLAN.md section 7 (p5b2's point: --modes exact,fast --backends b2
 #   --C 96 --X 64 --R-ver 16, no sweep, gilfree 8 threads, unchecked), with NOSI = FRNOSI (the fusedres2 worktree)
@@ -311,6 +314,32 @@
 #            evalfast2wx's same-job value by >= 40 ms (if both run in one job; else than wx1's 384.4 ms)
 #   RL-MEM   evalfast2rl and evalfast2rp peak_gb <= 84 (MUST EF_mem_cap; the lean cache holds about 50 MB per tick)
 #
+# REGISTERED for evalfast2rd / evalfast2rdp ([resdev], STAMP 2026-10-23T13:17:36Z, before any run). WHY:
+# analysis/evalfast/SCORING_resfix.md 2.2-2.3 / 3.4: after --res-lean the draft-only res span (143-144 ms) is about
+# 92 % device work (132 ms kernel time per draft-only tick, 17,000 events; profiled on the OLD path). The device hot spots:
+# the 2-row cumsum in XPool.bind (25.9 ms), a long scatter (11.6 ms), the sorts (about 16 ms), the 1-D cummax (7.4 ms),
+# fills and copies (about 22 ms). --res-dev (needs --res-lean) runs r2_resdev's equal integer ops there: one flat scan,
+# group starts without cummax, compactions for the free lists (no sort), int32 radix keys for the stable sorts, own
+# dummy targets for every masked scatter / index_put_ / index_add_, the two mirror rank sorts only when read (no decision
+# op reads them), bool sums without casts. ROOT NOSI_EVAL = nosi-r2-graph. Both cells are evalfast2rl plus --res-dev.
+#   RD-MED   evalfast2rd: steady tok/s (median tick) point 360, band [335, 420] (rl 325-328; DIAG / SCORING 3.3:
+#            about 45 ms less per median tick)
+#   RD-MEAN  [260, 300]; RD-EFF [222, 255] (DERIVED by the implementer, not given by the lead: evalfast2rl's mean 256 /
+#            effective 219 with about 45 ms less per mean tick of about 650 ms)
+#   RD-FALS  FALSIFIED if the evalfast2rd median < 330, or the evalfast2rdp profiled draft-only res kernel time
+#            (draft_only_res_profile.res, ms per tick) is not lower than 132 ms by >= 25 ms (i.e. not <= 107 ms)
+#   RDP      evalfast2rdp (evalfast2rd + --b2-res-profile): REPORT only, bands wide (200:340:150:300:120:260, the round
+#            is not profiled; the profiler slows every later launch, SCORING_resfix.md 2.4). Predict per draft-only tick:
+#            kernel time 80-107 ms, the scan_innermost cumsum and the 1-D cummax gone from t.res (0 calls), onesweep
+#            radix passes about half of rl's, radixSortKVInPlace about 1 per layer (the free-list sort and the two rank
+#            sorts are gone). STEP_MIN 150.
+#   RD-MEM   evalfast2rd and evalfast2rdp peak_gb <= 84 (MUST EF_mem_cap). Estimate: rl peak 83.04 GB plus under 0.1 GB
+#            (per layer, transient: the own-dummy buffers of the mirror maps 3 x 5.6 MB, the free-list compaction about
+#            25 MB, the bias fill's dummy rows Rd x H x k x 64 rows (buffer, hit mask, index: about 70 MB at k 64,
+#            140 MB at k 128); tick constants up to about 60 MB (the grown arange); minus the two rank sorts' buffers).
+#            So about 83.1-83.3 GB: it holds, with a margin of about 0.7 GB. If RD-MEM fails, drop the bias fill's own
+#            dummies first (the largest term).
+#
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
 #        _k5_report) names the per-layer demand (first misses needing a shared extra, free extras at the tick start,
@@ -386,7 +415,7 @@ NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                        
 NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-stack2                                             # ROOT of the stack1 cells only ([integ]; [stack2])
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
-NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-resfix                                              # ROOT of the evalfast* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree; [frfix] own worktree; [resfix] own worktree)
+NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-graph                                               # ROOT of the evalfast* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree; [frfix] own worktree; [resfix] own worktree; [resdev] own worktree)
 EVALACC_OUT=/mnt/beegfs/ojerbi/r2-runs/evalacc                                           # ROOT (r2_evalacc_step.sh's OUTROOT)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
@@ -413,7 +442,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl|evalfast2rd|evalfast2rdp] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -434,6 +463,7 @@ for w in "$@"; do
         evalfast2wi|evalfast2fr) [ -z "$CELL" ] || usage; CELL=$w ;;                                # [hostw2]
         evalfast2fx|evalfast2wx) [ -z "$CELL" ] || usage; CELL=$w ;;                                # [frfix]
         evalfast2rp|evalfast2rl) [ -z "$CELL" ] || usage; CELL=$w ;;                                # [resfix]
+        evalfast2rd|evalfast2rdp) [ -z "$CELL" ] || usage; CELL=$w ;;                               # [resdev]
         *) usage ;;
     esac
 done
@@ -627,6 +657,16 @@ case $CELL in
                  --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
                  --eval-bands "$BANDS" --b2-resolve torch --host-profile --gc-freeze --lean-time --wait-index
                  --b2-fewer-reads "$RXFLAG") ;;
+    evalfast2rd|evalfast2rdp) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_$CELL  # [resdev]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched
+        if [ "$CELL" = evalfast2rdp ]; then RDFLAGS=(--res-lean --res-dev --b2-res-profile) ; BANDS=200:340:150:300:120:260 ; STEP_MIN=150
+        else RDFLAGS=(--res-lean --res-dev) ; BANDS=335:420:260:300:222:255
+        fi
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
+                 --eval-role fast-time --mem-cap-gb 84
+                 --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
+                 --eval-bands "$BANDS" --b2-resolve torch --host-profile --gc-freeze --lean-time --wait-index
+                 --b2-fewer-reads "${RDFLAGS[@]}") ;;
     evalfast2c192) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1344 ; PRV=1296 ; SWEEP_RUN= ; SUFFIX=_evalfast2c192    # [b192]
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=192 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
         EVALARG=(--layout pool --X-pool 1344 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped

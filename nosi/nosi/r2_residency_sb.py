@@ -34,6 +34,7 @@ import torch
 from .kstep.errors import OwnershipViolation
 from .kstep.ownership import FREE
 from .r2_residency import DRAFT, N_TAIL, Plan, Residency, Row
+from . import r2_resdev as RD                                       # [resdev] --res-dev's equal device ops
 
 FIELDS = ("blk", "valid", "ready", "slot", "infl", "granted", "refused", "take_slot", "protect")
 
@@ -197,7 +198,11 @@ class LeanConsts:
                      the tensor torch.full_like would give (same values, same strides). SHARED: only an operand that no
                      op writes may come from it (every output buffer stays a fresh tensor).
       memo(key, fn)  a tick constant (fn() once per tick).
+      dev            [resdev] False (the default): every lean function runs its lean ops. True (--res-dev,
+                     ResidencySC.enable_res_dev): the lean functions run r2_resdev's equal ops at their device hot spots.
     new_tick() drops the tick's cache (its shapes follow the tick's rows), at the tick's first resolve."""
+
+    dev = False                                                    # [resdev] --res-dev sets it on the service's copy
 
     def __init__(self, device):
         self.device = torch.device(device)
@@ -245,6 +250,8 @@ def rank_prep(key: torch.Tensor, cst: LeanConsts):
     ks, perm = torch.sort(key, stable=True)
     pos = cst.ar(n)
     start = torch.cat([cst.full_like(ks[:1], True, dtype=torch.bool), ks[1:] != ks[:-1]])
+    if cst.dev:                                                    # [resdev] no single-block 1-D cummax
+        return perm, RD.group_start(start, pos)
     gstart = torch.cummax(torch.where(start, pos, cst.full_like(pos, 0)), 0).values
     return perm, gstart
 
@@ -290,7 +297,10 @@ def device_draft_lean(m: DraftMirror, rb, hb, tails, nt, sel, C: int, X: int, R_
     blk_f = blk.reshape(N)
     miss_f = miss.reshape(N)
     mkey = torch.where(miss_f, rc["sidN"] + blk_f, fl(blk_f, S * NBLK))
-    ks, perm = torch.sort(mkey, stable=True)
+    if cst.dev:                                                    # [resdev] 0 <= mkey <= S * NBLK: int32 radix keys
+        ks, perm = RD.sort_key32(mkey, S * NBLK)
+    else:
+        ks, perm = torch.sort(mkey, stable=True)
     first_sorted = torch.cat([fl(ks[:1], True, dtype=torch.bool), ks[1:] != ks[:-1]])
     first = torch.empty_like(first_sorted)
     first[perm] = first_sorted
@@ -307,13 +317,16 @@ def device_draft_lean(m: DraftMirror, rb, hb, tails, nt, sel, C: int, X: int, R_
     granted = fmiss & (~needs_extra | (g < budget))
     refused = fmiss & ~granted
     q = rank_with(rc["rk"], granted)
-    ar = cst.ar(NPOS).view(1, NPOS).expand(S, NPOS)
-    free_sorted = torch.sort(torch.where(m.free.reshape(S, NPOS), ar, fl(ar, NPOS)), dim=-1).values
+    if cst.dev:                                                    # [resdev] a compaction, no segmented sort
+        free_sorted = RD.sorted_free(m.free.reshape(S, NPOS), flat=dev_flat(cst, S, NPOS))
+    else:
+        ar = cst.ar(NPOS).view(1, NPOS).expand(S, NPOS)
+        free_sorted = torch.sort(torch.where(m.free.reshape(S, NPOS), ar, fl(ar, NPOS)), dim=-1).values
     take_slot = torch.where(granted, free_sorted[sid, q.clamp(max=NPOS - 1)], fl(q, -1))
     rkey = torch.where(ready, srt, fl(srt, BIG))
     rperm = torch.sort(rkey, dim=-1).indices
     rslot = torch.gather(slot, -1, rperm)
-    nready = ready.to(torch.int64).sum(-1)                                          # (Rd, H)
+    nready = ready.sum(-1) if cst.dev else ready.to(torch.int64).sum(-1)           # (Rd, H) [resdev] bool sum: int64
     T = tails.shape[1]
     P = k + T
     page = torch.full((Rd, H, P), -1, dtype=torch.int64, device=dev)
@@ -322,12 +335,21 @@ def device_draft_lean(m: DraftMirror, rb, hb, tails, nt, sel, C: int, X: int, R_
     post = cst.ar(T).view(1, 1, T)
     page.scatter_(-1, nready.unsqueeze(-1) + post, rc["tval"])
     num_pages = nready + nt.view(Rd, 1)
-    masked = (nready < valid.to(torch.int64).sum(-1)).to(torch.int64).sum()
-    counters = torch.stack([masked, refused.to(torch.int64).sum(), fl(masked, Rd * H)])
+    if cst.dev:                                                    # [resdev] a bool sum is int64 already: no casts
+        masked = (nready < valid.sum(-1)).sum()
+        counters = torch.stack([masked, refused.sum(), fl(masked, Rd * H)])
+    else:
+        masked = (nready < valid.to(torch.int64).sum(-1)).to(torch.int64).sum()
+        counters = torch.stack([masked, refused.to(torch.int64).sum(), fl(masked, Rd * H)])
     t = dict(blk=blk_f, valid=valid.reshape(N), ready=ready.reshape(N), slot=slot.reshape(N),
              infl=infl0.reshape(N) | dup, granted=granted, refused=refused, take_slot=take_slot,
              protect=valid.reshape(N))
     return DraftDecision(Rd, H, k, t, page, num_pages, counters)
+
+
+def dev_flat(cst: LeanConsts, S: int, NP: int) -> torch.Tensor:
+    """[resdev] arange(S * NP).view(S, NP) (int64), a tick constant of cst (r2_resdev.sorted_free's flat)."""
+    return cst.memo(("rd_flat", S, NP), lambda: cst.ar(S * NP).view(S, NP))
 
 
 class ResidencySB(Residency):

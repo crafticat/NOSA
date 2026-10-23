@@ -69,7 +69,8 @@ class OwnResidency(ResidencySparse):
 
     def __init__(self, *args, keys: int = 7, checked: bool = True, b2_mut=None, resolve: str = "torch",
                  fused_plant: int = 0, fused_guard: bool = False, fused_warm: str = "auto", lean: bool = False,
-                 wait_index: bool = False, fewer_reads: bool = False, res_lean: bool = False, **kw):
+                 wait_index: bool = False, fewer_reads: bool = False, res_lean: bool = False, res_dev: bool = False,
+                 **kw):
         kw["pin_records"] = False
         self.__dict__["_own_ready"] = False
         # [hostfix] --lean-time (OPT-IN, default False: every line as before): the REPORT-only host work is skipped
@@ -86,6 +87,8 @@ class OwnResidency(ResidencySparse):
             raise ValueError("fused_plant needs resolve 'fused' or 'check'")
         if res_lean and resolve != "torch":                           # [resfix] the torch resolve's lean form only
             raise ValueError("res_lean needs resolve 'torch' (it is the torch resolve's lean form), not %r" % resolve)
+        if res_dev and not res_lean:                                  # [resdev] the lean resolve's device ops only
+            raise ValueError("res_dev needs res_lean (it changes the lean resolve's device ops)")
         super().__init__(*args, **kw)
         if wait_index:                                                # [hostfix] --wait-index (OPT-IN): the same map
             self.inflight = InflightByLayer(self.inflight)            # with a per-layer index (_superset_wait)
@@ -130,6 +133,10 @@ class OwnResidency(ResidencySparse):
         # the same decisions, page tables and records (tests_cpu/test_r2_resfix.py)
         if res_lean:
             self.enable_res_lean()
+        # [resdev] --res-dev (OPT-IN, default False): the lean resolve's device hot spots with r2_resdev's equal ops
+        # (the same decisions, page tables and records; tests_cpu/test_r2_resdev.py)
+        if res_dev:
+            self.enable_res_dev()
         self.__dict__["_own_ready"] = True
 
     def resolve(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> Plan:

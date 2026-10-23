@@ -72,6 +72,7 @@ from . import r2_xpool as XP
 from .r2_residency import Plan, Row
 from .r2_residency_sc import C_LRU, C_PO, C_VRES, ResidencySC
 from .r2_residency_sb import _nz                                     # [resfix] --res-lean
+from . import r2_resdev as RD                                        # [resdev] --res-dev
 
 # the record fields, in their buffer order
 VREC = ("o", "blk", "flags", "slot", "infl_slot", "infl_gen", "rslot", "take_slot", "evict_blk")
@@ -247,8 +248,14 @@ def _compact_lean(mask: torch.Tensor, fields: List[torch.Tensor], cap: int, cst)
     m64 = mask.to(torch.int64)
     pos = torch.cumsum(m64, 0) - 1
     cnt = m64.sum().reshape(1)
-    dest = torch.where(mask & (pos < cap), pos, cst.full_like(pos, cap))
     src = torch.stack(fields)                                            # (F, N)
+    if cst.dev:                                 # [resdev] an entry that is not recorded goes to its OWN dummy column
+        n = pos.shape[0]                        # cap + i (the lean op sends them all to column cap: one element)
+        dest = RD.spread(pos, mask & (pos < cap), cap, cst.ar(n))
+        out = torch.full((len(fields), cap + n), -1, dtype=torch.int64, device=mask.device)
+        out.scatter_(1, dest.view(1, -1).expand(len(fields), -1), src)
+        return out[:, :cap], cnt
+    dest = torch.where(mask & (pos < cap), pos, cst.full_like(pos, cap))
     out = torch.full((len(fields), cap + 1), -1, dtype=torch.int64, device=mask.device)
     out.scatter_(1, dest.view(1, -1).expand(len(fields), -1), src)      # the unmasked go to the dummy column cap
     return out[:, :cap], cnt
@@ -290,8 +297,17 @@ def sparse_layer_record_lean(code_l, vdec, ddec, B: int, H: int, NBLK: int, NPOS
         vblk = torch.where(valid, blk, fl(blk, NBLK))
         if rsel is not None:                                                  # the tick row of each entry
             rsel.index_put_((rcv["rowt"], hh, vblk), cst.true)
-        fkey = torch.where(valid, rcv["fbase"] + blk, fl(blk, BIGKEY))
-        first = _first_in_group_lean(fkey, cst) & valid
+        top = rcv.get("fk_bound", -1) + 1 if cst.dev else -1          # [resdev] a valid key <= fk_bound (host bound)
+        if 0 < top < RD.INT32_MAX:                                    # the invalid ones at top, not BIGKEY: the same
+            fkey = torch.where(valid, rcv["fbase"] + blk, fl(blk, top))   # order, so the same stable permutation, with
+            ks, perm = RD.sort_key32(fkey, top)                       # int32 radix keys
+            fs = torch.cat([fl(ks[:1], True, dtype=torch.bool), ks[1:] != ks[:-1]])
+            first = torch.empty_like(fs)
+            first[perm] = fs
+            first = first & valid
+        else:
+            fkey = torch.where(valid, rcv["fbase"] + blk, fl(blk, BIGKEY))
+            first = _first_in_group_lean(fkey, cst) & valid
         hole = valid & ~(ready | infl | dup | gr | ev)
         mask = valid & (newpin | infl | dup | gr | ev | hole)
         flags = (newpin * PIN + ready * READY + infl * INFL + dup * DUP + gr * GRANT + ev * EVICT + evf * EVICT_INFL
@@ -468,6 +484,10 @@ class ResidencySparse(ResidencySC):
             j = torch.div(o, H * k, rounding_mode="floor")
             kid = tk["extra"][:R][ix]
             rc.update(o=o, j=j, rowt=ix[j], fbase=(kid[j] * H + rc["hh_f"]) * (self.nblk + 1))
+            # [resdev] a host bound of every valid FIRST key: kid <= len(self._kids) (_tick_extra numbers the keys 1, 2,
+            # ...), h < H, blk < NBLK; the record sorts int32 keys when it is below 2**31 - 1 (--res-dev only)
+            kids = getattr(self, "_kids", None)                       # (None: no bound, the int64 sort)
+            rc["fk_bound"] = -1 if kids is None else (len(kids) * H + H - 1) * (self.nblk + 1) + self.nblk
         return rc
 
     # ------------------------------------------------------------------------------------------------ the consumer
