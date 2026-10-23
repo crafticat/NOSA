@@ -69,7 +69,7 @@ class OwnResidency(ResidencySparse):
 
     def __init__(self, *args, keys: int = 7, checked: bool = True, b2_mut=None, resolve: str = "torch",
                  fused_plant: int = 0, fused_guard: bool = False, fused_warm: str = "auto", lean: bool = False,
-                 wait_index: bool = False, fewer_reads: bool = False, **kw):
+                 wait_index: bool = False, fewer_reads: bool = False, fused_kernel: str = None, **kw):
         kw["pin_records"] = False
         self.__dict__["_own_ready"] = False
         # [hostfix] --lean-time (OPT-IN, default False: every line as before): the REPORT-only host work is skipped
@@ -84,6 +84,8 @@ class OwnResidency(ResidencySparse):
             raise ValueError("resolve %r: one of torch, fused, check" % (resolve,))
         if fused_plant and resolve == "torch":
             raise ValueError("fused_plant needs resolve 'fused' or 'check'")
+        if fused_kernel is not None and resolve == "torch":           # [fr3] the kernel variant of the fused resolve
+            raise ValueError("fused_kernel needs resolve 'fused' or 'check'")
         super().__init__(*args, **kw)
         if wait_index:                                                # [hostfix] --wait-index (OPT-IN): the same map
             self.inflight = InflightByLayer(self.inflight)            # with a per-layer index (_superset_wait)
@@ -122,7 +124,8 @@ class OwnResidency(ResidencySparse):
             from . import r2_fusedres
             self.fusedres = r2_fusedres.FusedResolver(self, check=resolve == "check", plant=int(fused_plant),
                                                       guard=bool(fused_guard),   # [fusedres2b] tests: OOB guards
-                                                      warm=fused_warm)          # [stack2] warm_up (auto: CUDA)
+                                                      warm=fused_warm,          # [stack2] warm_up (auto: CUDA)
+                                                      kernel=fused_kernel)      # [fr3] None: DEFAULT_KERNEL (v2)
         self.__dict__["_own_ready"] = True
 
     def resolve(self, l: int, rows: Sequence[Row], sel: torch.Tensor) -> Plan:

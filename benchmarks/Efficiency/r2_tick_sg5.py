@@ -67,6 +67,10 @@ EF_accuracy_record; REPORT R_EF_<label> and R_EF_bands (--eval-bands against the
 per point draft_only_host_profile / host_profile / bare_host_profile), --gc-freeze (item 1: round_guard), --lean-time
 (item 2, b2: LEAN_DROPPED), --wait-index (item 3, b2: r2_residency_sc.InflightByLayer), --b2-fewer-reads (item 5,
 b2: OwnResidency(fewer_reads=True)). No flag changes a decision, a page table or a logit (tests_cpu/test_r2_hostfix.py).
+[fr3] --fused-kernel v2|v3 (default v2; refused with --b2-resolve torch): FusedResolver(kernel=...), in
+meta.fused_kernel; G2's launches per draft-only layer follow the kernel (FR_DRAFT_LAUNCHES). meta.fused_warm_mem_gb:
+FusedResolver's [oomfix] warm_mem_gb (free GB before / after the process's first warm_up; that resolver is the
+preflight's, so the points' fused reports hold None), kept by note_fused_warm before each b2 engine is released.
 OUTPUT: --out/summary.json (after every run). The last stdout line is R2_TICK_SG5_DONE failed=<n>; exit = n (2 =
 refused). ENVIRONMENT: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0, NOSI_POOL_BLOCKS = 0 (the parent; a child sets its own).
 """
@@ -95,6 +99,7 @@ TRANSPORTS = ("gilfree", "gather")
 LAYOUTS = ("stream", "pool", "both")                                                    # [xpool]
 XPOOL_BACKENDS = ("sc", "b2")                                                           # [xpool] S-C's device path
 _PEAK = [0]                                                                             # [xpool] the max before resets
+_FUSED_WARM = [None]                                    # [fr3] the process's FusedResolver.warm_mem_gb (note_fused_warm)
 # [integ] the shared-KV selector in the SG5 tick (docs/R2_SHAREDKV_PLAN.md; r2_tick_gate.select_attn's choices that
 # drive the tick: the probes stay in r2_tick_gate.py)
 ATTN_CHOICES = ("per_row", "shared", "shared-whole")
@@ -199,6 +204,10 @@ def parse_args(argv):
     ap.add_argument("--b2-resolve", default="torch", choices=("torch", "fused", "check"),        # [fusedres]
                     help="b2: the per-layer resolve: S-C's torch ops (default), r2_fusedres (fused), or fused with "
                          "the torch path compared at every layer (check: an equality gate, not a timing)")
+    ap.add_argument("--fused-kernel", default=None, choices=("v2", "v3"),                       # [fr3]
+                    help="b2 with --b2-resolve fused / check (or a --stack with it): r2_fusedres's kernel variant "
+                         "(FusedResolver(kernel=...)); default v2. v3: 4 launches per draft-only layer, 7 per mixed "
+                         "layer, bounded tiles (r2_fusedres module docstring, V3)")
     ap.add_argument("--b2-fused-plant", type=int, default=0, choices=(0, 1, 2),                 # [fusedres2] M2
                     help=argparse.SUPPRESS)                     # NEGATIVE CONTROL (FR-g0p): r2_fusedres.PLANTS
     ap.add_argument("--b2-res-profile", action="store_true",                                    # [fusedres2] M3
@@ -334,6 +343,9 @@ def parse_args(argv):
                      "MINOR-3), or an explicit --shared-unchecked for a timing arm" % a.attn)
     if a.b2_resolve != "torch" and any(b != "b2" for b in a.backends):                          # [integ]
         ap.error("--b2-resolve %s (or a --stack with it) runs on --backends b2 only" % a.b2_resolve)
+    if a.fused_kernel is not None and a.b2_resolve == "torch":                                   # [fr3]
+        ap.error("--fused-kernel %s needs --b2-resolve fused / check (or a --stack with it)" % a.fused_kernel)
+    a.fused_kernel = a.fused_kernel or "v2"                                                      # [fr3] the default
     if a.stack_compare and (a.layout == "both" or a.arrival_lag < 1 or a.sweep_pts or a.bare):  # [integ]
         ap.error("--stack-compare: no --layout both, no sweep, no --bare, and --arrival-lag >= 1 (free timing makes "
                  "two runs differ, note 12k)")
@@ -800,6 +812,8 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
                                checked=bool(getattr(a, "b2_checked", False)),                                     # [b2]
                                resolve=getattr(a, "b2_resolve", "torch"),                                         # [fusedres]
                                fused_plant=int(getattr(a, "b2_fused_plant", 0)),                                  # [fusedres2]
+                               fused_kernel=(None if getattr(a, "b2_resolve", "torch") == "torch"                 # [fr3]
+                                             else getattr(a, "fused_kernel", "v2")),                              # [fr3]
                                lean=bool(getattr(a, "lean_time", False)),                                         # [hostfix]
                                wait_index=bool(getattr(a, "wait_index", False)),                                  # [hostfix]
                                fewer_reads=bool(getattr(a, "b2_fewer_reads", False)), **kw)                       # [hostfix]
@@ -825,6 +839,20 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
         return eng, svc, tp
 
 
+FR_DRAFT_LAUNCHES = dict(v2=3.0, v3=4.0)     # [fr3] G2: Triton launches per draft-only layer (mixed: v2 6, v3 7)
+
+
+def note_fused_warm(svc):
+    """[fr3] Keep the first non-None FusedResolver.warm_mem_gb of the process (report()'s field; [oomfix] measures it
+    once per process, in the first fused engine: the preflight's, which is released before the points). A service
+    without a fused resolver, or one whose value is None, changes nothing. Returns the kept value."""
+    fr = getattr(svc, "fusedres", None)
+    w = getattr(fr, "warm_mem_gb", None) if fr is not None else None
+    if _FUSED_WARM[0] is None and w is not None:
+        _FUSED_WARM[0] = list(w)
+    return _FUSED_WARM[0]
+
+
 def fused_gates(a, label, phase, rep):
     """[fusedres2] the FR-g gates of docs/R2_FUSEDRES_PLAN.md section 7 as harness gates (a failed MUST counts in the
     exit, so r2_tick_sg5_step.sh's combined cell frg can stop on it). phase: "draft_only" or "round".
@@ -834,7 +862,8 @@ def fused_gates(a, label, phase, rep):
       G0p  check, plant 2: d_grant > 0, differences > 0, first_diff_at == first_effective["d_grant"] (MUST in the
            draft-only phase, REPORT in the round)
       G2   fused, not profiled, draft-only phase: launches_per_layer == 3.0, sel_conversions == 0, bias_casts == 0
-           (MUST)"""
+           (MUST). [fr3] kernel-aware: FR_DRAFT_LAUNCHES[rep["kernel"]] (v2 3.0, v3 4.0: PREP + D1, SCAN, D2); a report
+           without "kernel" is v2's; v3 also needs rep["kernel"] == --fused-kernel"""
     mode, plant = getattr(a, "b2_resolve", "torch"), int(getattr(a, "b2_fused_plant", 0))
     tag = "%s_%s" % (label, phase)
     out = [GB.gate(tag + "_fused_err", rep["err"] == 0, True, "err_any %s %s" % (rep["err"], rep["err_bits"]))]
@@ -850,12 +879,17 @@ def fused_gates(a, label, phase, rep):
                            "d_grant %d diffs %d first_diff_at %s first_effective %s"
                            % (rep["stats"]["d_grant"], rep["diffs"], rep["first_diff_at"], fe)))
     if mode == "fused" and phase == "draft_only" and not getattr(a, "b2_res_profile", False):
-        ok = rep["launches_per_layer"] == 3.0 and rep["sel_conversions"] == 0 and rep["bias_casts"] == 0
+        kern, want = rep.get("kernel", "v2"), getattr(a, "fused_kernel", "v2")                   # [fr3]
+        fr3 = kern != "v2" or want != "v2"                                                       # [fr3] v2: as before
+        ok = rep["launches_per_layer"] == FR_DRAFT_LAUNCHES.get(kern) and rep["sel_conversions"] == 0 \
+            and rep["bias_casts"] == 0 and (not fr3 or kern == want)
         stack = bool(getattr(a, "stack", ""))                # [integ3] review-integ2 M1: REPORT in the stack cells
         out.append(GB.gate(("R_" if stack else "") + tag + "_fused_dispatch", ok, not stack,      # until FR-g
-                           "launches/layer %s sel_conversions %d bias_casts %d compiled %s%s"     # measures it
+                           "launches/layer %s sel_conversions %d bias_casts %d compiled %s%s%s"   # measures it
                            % (rep["launches_per_layer"], rep["sel_conversions"], rep["bias_casts"], rep["compiled"],
-                              " (REPORT in a stack cell until FR-g2 measured it)" if stack else "")))
+                              " (REPORT in a stack cell until FR-g2 measured it)" if stack else "",
+                              "" if not fr3 else " kernel %s (launches/layer want %s, --fused-kernel %s)"   # [fr3]
+                              % (kern, FR_DRAFT_LAUNCHES.get(kern), want))))
     return out
 
 
@@ -1329,6 +1363,7 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
         info["draft_only"]["sc"] = sc_counters(svc)                    # REPORT (RES_SC.md 6)
         if getattr(svc, "fusedres", None) is not None:                 # [fusedres] REPORT: launches, stats, err,
             info["draft_only"]["fused"] = svc.fusedres.report()        # check-mode differences
+            note_fused_warm(svc)                                       # [fr3] (with --preflight-steps 0: here)
             gates.extend(fused_gates(a, label, "draft_only", info["draft_only"]["fused"]))   # [fusedres2] FR-g
     finally:
         tp.close()
@@ -1652,6 +1687,7 @@ def preflight(a, model, cache, st, first, ops, ext, gates, res, engine_fn=None, 
                 traceback.print_exc()
                 good, detail = False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:400])
             finally:
+                note_fused_warm(svc)        # [fr3] the [oomfix] measure lives in this (the first fused) resolver
                 if tp is not None:
                     tp.close()
                 del eng, svc, tp, rnd       # [bigb] before: rnd kept this engine alive while the next one was built
@@ -1790,6 +1826,7 @@ def main(argv=None) -> int:
         meta.update(stack=a.stack or None, stack_compare=a.stack_compare, attn=a.attn, union=a.union,   # [integ]
                     sel_check=a.sel_check, shared_unchecked=a.shared_unchecked, gilfree_warm_up=a.gilfree_warm_up,
                     b2_resolve=a.b2_resolve, shipped_batch=a.shipped_batch or a.batch,
+                    fused_kernel=a.fused_kernel if a.b2_resolve != "torch" else None,             # [fr3]
                     sharedkv=a.sharedkv if a.attn != "per_row" else None)
         meta.update(stack_base=a.stack_base if a.stack_compare else None)                        # [integ6]
         if a.host_profile:                                                                     # [hostfix] item 0
@@ -1835,6 +1872,7 @@ def main(argv=None) -> int:
             backends = preflight(a, model, cache, st, first, BIOps(select_attn(a, attn), a.m_fix, gemm=a.modes[0]),
                                  ext, gates, res)                                              # [integ] --attn
             meta["preflight_peak_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 3)         # [bigb] REPORT
+            meta["fused_warm_mem_gb"] = _FUSED_WARM[0]                                         # [fr3] REPORT
             save()
             if not backends:
                 log("PREFLIGHT: no backend ran a short round on the %s transport: the long arms are skipped"
@@ -1885,6 +1923,7 @@ def main(argv=None) -> int:
                       lambda ops, kind, C, X, R_ver, label: one_point(a, model, cache, st, first, ops, kind, C, X, R_ver,
                                                                       ext, a.sweep_steps, T_shipped, gates, label))
         meta["peak_gb"] = round(max(_PEAK[0], torch.cuda.max_memory_allocated()) / 1e9, 2)     # [xpool] resets
+        meta["fused_warm_mem_gb"] = _FUSED_WARM[0]                                             # [fr3] REPORT
         if a.stack_bands_v is not None:                                                        # [integ3] M3
             write_stack_bands(a, meta, res, gates)
         if a.eval_role == "fast-time":                                                         # [evalsplit]

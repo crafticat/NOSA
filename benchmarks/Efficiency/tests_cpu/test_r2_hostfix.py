@@ -751,7 +751,7 @@ def test_HF5f_the_harness_wiring():
 # =====================================================================================================================
 REPO = HERE.parents[2]
 STEP = EFF / "r2_tick_sg5_step.sh"
-HF_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-frfix"                     # [frfix] (was nosi-r2-hostw2)
+HF_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-fr3"                       # [fr3] (was [frfix]'s nosi-r2-frfix)
 
 
 def test_HF6a_the_cells_and_the_registration_static():
@@ -759,7 +759,8 @@ def test_HF6a_the_cells_and_the_registration_static():
     lines = text.splitlines()
     root = next(ln for ln in lines if ln.startswith("NOSI_EVAL=")).split()[0][len("NOSI_EVAL="):]
     assert root == HF_ROOT
-    assert "|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx] [gilfree|gather]" in text
+    assert ("|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx"
+            "|evalfast2c3|evalfast2f3|evalfast2f3_192] [gilfree|gather]") in text                  # [fr3] the v3 cells
     assert "        evalfast2|evalfast2t|evalfast2c) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     reg = text[text.index("# REGISTERED for evalfast2t / evalfast2 / evalfast2c"):]
     reg = reg[:reg.index("\n#\n")]
@@ -1019,6 +1020,118 @@ def test_HF10b_the_fix_cells_dryrun(tmp_path, cell):
     pa = _sg5().parse_args(got.split())
     assert pa.b2_resolve == "torch" and pa.host_profile and pa.gc_freeze and pa.lean_time
     assert (bool(pa.wait_index), bool(pa.b2_fewer_reads)) == (wi, fr), cell
+
+
+# HF12 [fr3] the fused v3 kernel: evalfast2c3 (CHECK at B 216) / evalfast2f3 (FAST at B 216) / evalfast2f3_192 (B 192)
+F3_CELLS = dict(evalfast2c3=dict(batch=216, X=1512, rver=1464, res="check", bands=None),
+                evalfast2f3=dict(batch=216, X=1512, rver=1464, res="fused", bands="330:650:250:560:210:480"),
+                evalfast2f3_192=dict(batch=192, X=1344, rver=1296, res="fused", bands="300:620:230:530:200:450"))
+
+
+def test_HF12a_the_v3_cells_static():
+    text = STEP.read_text()
+    assert "        evalfast2c3|evalfast2f3|evalfast2f3_192) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
+    reg = text[text.index("# REGISTERED for evalfast2c3 / evalfast2f3 / evalfast2f3_192"):]
+    reg = reg[:reg.index("\n#\n")]
+    for tag in ("STAMP 2026-10-23T11:29:23Z", "C3", "fused v3 == torch at every", "launches 4 per draft-only layer", "7 per mixed layer",
+                "< 0.5 GB", "v2: 3.0 GB", "[oomfix] stderr line", "VOID", "F3-MED", "point 450, band [330, 650]",
+                "550-600", "F3-MEAN [250, 560]", "F3-EFF [210, 480]", "F3-192", "point 420, band [300, 620]",
+                "F3-192-MEAN [230, 530]", "F3-192-EFF [200, 450]", "103 tok/s", "217 tok/s", "F3-FALS",
+                "median < 280", "> 100 ms", "F3-MEM", "peak_gb <= 84"):
+        assert tag in reg, tag
+    i3 = text.index("    evalfast2c3) MODES=fast")
+    blk = text[i3:text.index("\nesac", i3)]
+    assert "--b2-resolve check --fused-kernel v3" in blk and "STEPS=8 ; DTICKS=4" in blk
+    assert "--b2-resolve fused --fused-kernel v3" in blk and "--wait-index --b2-fewer-reads" in blk
+    for cell, w in F3_CELLS.items():
+        if w["bands"]:
+            assert "BANDS=%s" % w["bands"] in blk, cell
+
+
+@pytest.mark.parametrize("cell", sorted(F3_CELLS))
+def test_HF12b_the_v3_cells_dryrun(tmp_path, cell):
+    if _clean_head() is None:
+        pytest.skip("not a clean git checkout (tracked changes or untracked files in nosi/): the DRYRUN needs one")
+    r = _dry(tmp_path, cell)
+    if r.returncode != 0:
+        assert Path(HF_ROOT).resolve() != REPO.resolve(), r.stderr[-400:]
+        pytest.skip("DRYRUN stopped outside the fr3 ROOT: %s" % r.stderr.strip()[-200:])
+    line = r.stdout.strip().splitlines()[-1]
+    got = line.split("r2_tick_sg5.py ", 1)[1].strip().replace("\\,", ",")
+    w = F3_CELLS[cell]
+    for s in ("--modes fast --backends b2", "--batch %d" % w["batch"], "--C 96 --X %d --R-ver %d" % (w["X"], w["rver"]),
+              "--layout pool --X-pool %d --arrival-lag 2" % w["X"], "--repeat-docs --log-slots -1 --skip-shipped",
+              "--variants fused/batched", "--mem=240G", "--b2-resolve %s" % w["res"], "--fused-kernel v3",
+              "PYTHONPATH=%s/nosi" % HF_ROOT, "--job-name=sg5-t1-418-%s " % cell):
+        assert s in got or s in line, (cell, s)
+    assert "torch/per_call" not in got
+    pa = _sg5().parse_args(got.split())
+    assert (pa.batch, pa.X_pool, pa.b2_resolve, pa.fused_kernel) == (w["batch"], w["X"], w["res"], "v3"), cell
+    if cell == "evalfast2c3":
+        assert pa.eval_role == "" and pa.steps == 8 and pa.draft_ticks == 4 and not pa.bare
+        for s in ("--accuracy-record", "--eval-bands", "--host-profile", "--wait-index", "--b2-fewer-reads"):
+            assert s not in got, (cell, s)
+    else:
+        assert pa.eval_role == "fast-time" and pa.bare and pa.steps == 48 and pa.mem_cap_gb == 84
+        assert "--eval-bands " + w["bands"] in got
+        assert pa.host_profile and pa.gc_freeze and pa.lean_time and pa.wait_index and pa.b2_fewer_reads
+        assert "--accuracy-record /mnt/beegfs/ojerbi/r2-runs/evalacc/eacc_t1_418_evalacc/summary.json" in got
+
+
+def test_HF12c_the_v3_harness_wiring():
+    """--fused-kernel: default v2, refused with the torch resolver (an explicit v2 too), passed to OwnResidency only
+    with a fused resolver; G2 follows the report's kernel (v2 unchanged); note_fused_warm keeps the process's first
+    warm_mem_gb for meta.fused_warm_mem_gb."""
+    G = _sg5()
+    base = ["--out", "o", "--workload", "w", "--biattn", "b", "--gilfree", "g", "--gilfree-build", "/x",
+            "--backends", "b2", "--X", "64"]
+    assert G.parse_args(base).fused_kernel == "v2"
+    assert G.parse_args(base + ["--b2-resolve", "fused"]).fused_kernel == "v2"
+    assert G.parse_args(base + ["--b2-resolve", "check", "--fused-kernel", "v3"]).fused_kernel == "v3"
+    for bad in (["--fused-kernel", "v3"], ["--fused-kernel", "v2"], ["--b2-resolve", "fused", "--fused-kernel", "v4"]):
+        with pytest.raises(SystemExit):
+            G.parse_args(base + bad)
+    # G2 (fused_dispatch): v2 as before (a report without "kernel" is v2's), v3 needs 4.0 and --fused-kernel v3
+    rep = dict(err=0, err_bits=[], launches_per_layer=3.0, sel_conversions=0, bias_casts=0, compiled={})
+
+    def g2(fk, **kw):
+        a = SimpleNamespace(b2_resolve="fused", b2_fused_plant=0, b2_res_profile=False, stack="", fused_kernel=fk)
+        gd = [x for x in G.fused_gates(a, "L", "draft_only", dict(rep, **kw)) if x["name"].endswith("_fused_dispatch")]
+        assert len(gd) == 1 and gd[0]["must"]
+        return gd[0]
+    v2 = g2("v2")
+    assert v2["passed"] and v2["detail"] == "launches/layer 3.0 sel_conversions 0 bias_casts 0 compiled {}"
+    assert g2("v2", kernel="v2")["passed"] and not g2("v2", launches_per_layer=4.0)["passed"]
+    assert g2("v3", kernel="v3", launches_per_layer=4.0)["passed"]
+    assert not g2("v3", kernel="v3")["passed"]                                 # 3.0 is v2's count
+    assert not g2("v2", kernel="v3", launches_per_layer=4.0)["passed"]         # the report's kernel is not the flag's
+    assert not g2("v3", launches_per_layer=3.0)["passed"]                      # --fused-kernel v3, a v2 report
+    d3 = g2("v3", kernel="v3", launches_per_layer=4.0)["detail"]
+    assert d3.endswith("compiled {} kernel v3 (launches/layer want 4.0, --fused-kernel v3)"), d3
+    assert G.FR_DRAFT_LAUNCHES == dict(v2=3.0, v3=4.0)
+    # note_fused_warm: the first non-None value of the process
+    old = G._FUSED_WARM[0]
+    try:
+        G._FUSED_WARM[0] = None
+        assert G.note_fused_warm(None) is None and G.note_fused_warm(SimpleNamespace(fusedres=None)) is None
+        assert G.note_fused_warm(SimpleNamespace(fusedres=SimpleNamespace(warm_mem_gb=None))) is None   # a later engine
+        def svc(w):
+            return SimpleNamespace(fusedres=SimpleNamespace(warm_mem_gb=w))
+        assert G.note_fused_warm(svc([10.544, 10.3])) == [10.544, 10.3] == G._FUSED_WARM[0]
+        assert G.note_fused_warm(svc([9.0, 8.0])) == [10.544, 10.3]                # the first one stays
+    finally:
+        G._FUSED_WARM[0] = old
+    assert "note_fused_warm(svc)" in inspect.getsource(G.preflight)
+    assert "note_fused_warm(svc)" in inspect.getsource(G.one_point)
+    msrc = inspect.getsource(G.main)
+    assert msrc.count('meta["fused_warm_mem_gb"] = _FUSED_WARM[0]') == 2
+    assert 'fused_kernel=a.fused_kernel if a.b2_resolve != "torch" else None' in msrc
+    assert 'fused_kernel=(None if getattr(a, "b2_resolve", "torch") == "torch"' in inspect.getsource(G.make_engine)
+    # OwnResidency: fused_kernel None = r2_fusedres.DEFAULT_KERNEL; refused with resolve torch (before any build)
+    assert inspect.signature(OWN2.OwnResidency.__init__).parameters["fused_kernel"].default is None
+    assert "kernel=fused_kernel" in inspect.getsource(OWN2.OwnResidency.__init__)
+    with pytest.raises(ValueError, match="fused_kernel needs resolve"):
+        OWN2.OwnResidency(resolve="torch", fused_kernel="v3")
 
 
 def test_HF1c_the_harness_wiring():
