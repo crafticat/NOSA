@@ -257,6 +257,15 @@
 #   B1-MEM   both <= 84 GB (MUST EF_mem_cap). REPORT: fused warm_mem_gb (d2b6627 oomfix: free GB before / after the
 #            first warm launch; the difference is the _fr_v2 local-memory pool)
 #
+# REGISTERED for evalfast2w ([hostw], STAMP 2026-10-23T01:03:07Z, before any run): evalfast2t + --wait-index (DIAG
+# section 4 fix 3: 40-100 ms per tick, out of res) + --b2-fewer-reads (fix 5: 5-20 ms). Base: evalfast2t hf2 (nova05)
+# median tick 640.09 ms / 260.01 tok/s, mean 785.58 / 211.85, effective 187.89; 166.4 committed tokens per tick.
+#   HW-MED   steady tok/s (median tick): point 295, band [270, 330] (tick 640 - 45..120 = 520-595 ms)
+#   HW-MEAN  [215, 270]; HW-EFF [185, 235]
+#   HW-FALS  FALSIFIER: steady (median) below 262 (no gain over evalfast2t's 260.01 beyond 1 % noise)
+#   HW-RES   REPORT: the instrumented res share falls (evalfast2t 43.0 %); the gain is in res, not host residual
+#   HW-MEM   peak_gb <= 84 (MUST EF_mem_cap); the flags change no device allocation
+#
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
 #        _k5_report) names the per-layer demand (first misses needing a shared extra, free extras at the tick start,
@@ -359,7 +368,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -376,6 +385,7 @@ for w in "$@"; do
         evalfast) [ -z "$CELL" ] || usage; CELL=$w ;;                                            # [evalsplit]
         evalfast2|evalfast2t|evalfast2c) [ -z "$CELL" ] || usage; CELL=$w ;;                     # [hostfix]
         evalfast2f192|evalfast2t192|evalfast2c192) [ -z "$CELL" ] || usage; CELL=$w ;;            # [b192]
+        evalfast2w) [ -z "$CELL" ] || usage; CELL=$w ;;                                             # [hostw]
         *) usage ;;
     esac
 done
@@ -534,6 +544,13 @@ case $CELL in
                  --eval-role fast-time --mem-cap-gb 84
                  --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
                  --eval-bands "$BANDS" --b2-resolve "$RES" --host-profile --gc-freeze --lean-time) ;;
+    evalfast2w) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_evalfast2w        # [hostw]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
+                 --eval-role fast-time --mem-cap-gb 84
+                 --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
+                 --eval-bands 270:330:215:270:185:235 --b2-resolve torch --host-profile --gc-freeze --lean-time
+                 --wait-index --b2-fewer-reads) ;;
     evalfast2c192) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1344 ; PRV=1296 ; SWEEP_RUN= ; SUFFIX=_evalfast2c192    # [b192]
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=192 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
         EVALARG=(--layout pool --X-pool 1344 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
