@@ -1062,7 +1062,7 @@ def test_HF12b_the_v3_cells_dryrun(tmp_path, cell):
     for s in ("--modes fast --backends b2", "--batch %d" % w["batch"], "--C 96 --X %d --R-ver %d" % (w["X"], w["rver"]),
               "--layout pool --X-pool %d --arrival-lag 2" % w["X"], "--repeat-docs --log-slots -1 --skip-shipped",
               "--variants fused/batched", "--mem=240G", "--b2-resolve %s" % w["res"], "--fused-kernel v3",
-              "PYTHONPATH=%s/nosi" % HF_ROOT, "--job-name=sg5-t1-418-%s " % cell):
+              "PYTHONPATH=%s/nosi" % HF_ROOT, "--job-name=sg5-t1-418-%s " % cell.replace("_", "-")):   # the step's job names use '-'
         assert s in got or s in line, (cell, s)
     assert "torch/per_call" not in got
     pa = _sg5().parse_args(got.split())
