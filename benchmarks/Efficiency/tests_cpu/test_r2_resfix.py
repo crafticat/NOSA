@@ -574,8 +574,8 @@ def test_RL4a_a_plant_between_layers_gives_the_same_outcome(p3, ref, name):
 
 def test_RL4b_the_flag_refusals_and_its_wiring(p3):
     ops = TT.make_ops(p3)
-    with pytest.raises(ValueError):                                   # the torch resolve only
-        TT.make_res_engine(ops, kind="b2", svc_kw=dict(res_lean=True, resolve="fused"), **CFG["default"])
+    # [flean] res_lean with resolve "fused" / "check" is accepted now (FusedResolver's lean hook): tests_cpu/test_r2_flean.py
+    assert "res_lean needs resolve" not in inspect.getsource(OWN2.OwnResidency.__init__)
     for kw in (dict(sc_mut={"no_wait": True}), dict(sb_mut={"no_dedup": True}), dict(sparse_mut={"swap_takes": True})):
         with pytest.raises(ValueError):                               # no negative control in the lean copies
             TT.make_res_engine(ops, kind="b2", svc_kw=dict(res_lean=True, **kw), **CFG["default"])
@@ -588,9 +588,10 @@ def test_RL4b_the_flag_refusals_and_its_wiring(p3):
     base = ["--out", "o", "--workload", "w", "--biattn", "b", "--gilfree", "g", "--gilfree-build", "/x"]
     assert G.parse_args(base).res_lean is False
     assert G.parse_args(base + ["--backends", "b2", "--X", "64", "--res-lean"]).res_lean is True
-    for bad in (["--res-lean"], ["--backends", "b2", "--X", "64", "--b2-resolve", "fused", "--res-lean"]):
+    for bad in (["--res-lean"],):                                     # [flean] fused + --res-lean: accepted now
         with pytest.raises(SystemExit):
             G.parse_args(base + bad)
+    assert G.parse_args(base + ["--backends", "b2", "--X", "64", "--b2-resolve", "fused", "--res-lean"]).res_lean
     assert 'res_lean=bool(getattr(a, "res_lean", False))' in inspect.getsource(G.make_engine)
 
 

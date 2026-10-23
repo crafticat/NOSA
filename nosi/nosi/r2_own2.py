@@ -70,7 +70,7 @@ class OwnResidency(ResidencySparse):
     def __init__(self, *args, keys: int = 7, checked: bool = True, b2_mut=None, resolve: str = "torch",
                  fused_plant: int = 0, fused_guard: bool = False, fused_warm: str = "auto", lean: bool = False,
                  wait_index: bool = False, fewer_reads: bool = False, res_lean: bool = False, res_dev: bool = False,
-                 **kw):
+                 fused_kernel: str = None, **kw):
         kw["pin_records"] = False
         self.__dict__["_own_ready"] = False
         # [hostfix] --lean-time (OPT-IN, default False: every line as before): the REPORT-only host work is skipped
@@ -85,10 +85,13 @@ class OwnResidency(ResidencySparse):
             raise ValueError("resolve %r: one of torch, fused, check" % (resolve,))
         if fused_plant and resolve == "torch":
             raise ValueError("fused_plant needs resolve 'fused' or 'check'")
-        if res_lean and resolve != "torch":                           # [resfix] the torch resolve's lean form only
-            raise ValueError("res_lean needs resolve 'torch' (it is the torch resolve's lean form), not %r" % resolve)
+        # [flean] res_lean is accepted with every resolve: "torch" runs ResidencySC._resolve_lean; "fused" / "check" run
+        # FusedResolver with the lean host checks, bind_lean and the lean bias fill (r2_fusedres.FusedResolver._lean_*;
+        # the fused kernels do not change; check mode keeps the REFERENCE bind on its shadow pool)
         if res_dev and not res_lean:                                  # [resdev] the lean resolve's device ops only
             raise ValueError("res_dev needs res_lean (it changes the lean resolve's device ops)")
+        if fused_kernel is not None and resolve == "torch":           # [fr3] the kernel variant of the fused resolve
+            raise ValueError("fused_kernel needs resolve 'fused' or 'check'")
         super().__init__(*args, **kw)
         if wait_index:                                                # [hostfix] --wait-index (OPT-IN): the same map
             self.inflight = InflightByLayer(self.inflight)            # with a per-layer index (_superset_wait)
@@ -127,7 +130,8 @@ class OwnResidency(ResidencySparse):
             from . import r2_fusedres
             self.fusedres = r2_fusedres.FusedResolver(self, check=resolve == "check", plant=int(fused_plant),
                                                       guard=bool(fused_guard),   # [fusedres2b] tests: OOB guards
-                                                      warm=fused_warm)          # [stack2] warm_up (auto: CUDA)
+                                                      warm=fused_warm,          # [stack2] warm_up (auto: CUDA)
+                                                      kernel=fused_kernel)      # [fr3] None: DEFAULT_KERNEL (v2)
         # [resfix] --res-lean (OPT-IN, default False: resolve as before): S-C's torch resolve with less host work per
         # layer (ResidencySC._resolve_lean: no hidden sync, the per-row Python once per tick, the tick's constants once);
         # the same decisions, page tables and records (tests_cpu/test_r2_resfix.py)

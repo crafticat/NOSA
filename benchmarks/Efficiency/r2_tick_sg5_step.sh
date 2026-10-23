@@ -128,6 +128,11 @@
 #   evalfast2rd / evalfast2rdp [resdev] evalfast2rl + --res-dev (the lean resolve's device hot spots with equal integer
 #            ops, nosi/r2_resdev.py, tests_cpu/test_r2_resdev.py; FAST) / + --b2-res-profile too (the device time of
 #            the --res-dev draft-only tick; STEP_MIN 150); REGISTERED block below
+#   evalfast2c3 / evalfast2f3 / evalfast2f3_192 [fr3] the fused v3 kernel (--fused-kernel v3): CHECK at B 216 / FAST
+#            at B 216 / FAST at B 192; REGISTERED block below
+#   evalfast2f3p / evalfast2c3l / evalfast2f3l [flean] evalfast2f3 + --b2-res-profile (STEP_MIN 150) / evalfast2c3 +
+#            --res-lean --res-dev (the CHECK gate) / evalfast2f3 + --res-lean --res-dev (the fused path with the lean
+#            host checks, binds and bias fill; tests_cpu/test_r2_flean.py); REGISTERED block below
 #   STEP_MIN 120 in every cell above.
 #   [fusedres2] the FR-g cells of docs/R2_FUSEDRES_PLAN.md section 7 (p5b2's point: --modes exact,fast --backends b2
 #   --C 96 --X 64 --R-ver 16, no sweep, gilfree 8 threads, unchecked), with NOSI = FRNOSI (the fusedres2 worktree)
@@ -340,6 +345,68 @@
 #            So about 83.1-83.3 GB: it holds, with a margin of about 0.7 GB. If RD-MEM fails, drop the bias fill's own
 #            dummies first (the largest term).
 #
+# REGISTERED for evalfast2c3 / evalfast2f3 / evalfast2f3_192 ([fr3], STAMP 2026-10-23T11:29:23Z, before any run). WHY: the fused v2
+# kernels spill (_fr_v2 at NP 2048: about 3.0 GB of driver local memory, SCORING_b192.md section 6), so fused v2 does
+# not fit at B 216 and runs 103 tok/s at B 192 vs torch 217 (DIAG_torch_res.md fix 1). The v3 kernels (r2_fusedres.py
+# docstring, V3; --fused-kernel v3) make the same decisions with bounded tiles: no NP-wide vector, no (KP x NP) tile, no
+# tl.sort. The CTA barriers of v3 cannot be tested on the CPU: evalfast2c3 is v3's GPU correctness gate.
+#   evalfast2c3      evalfast2c (CHECK, B 216, 8 steps, --draft-ticks 4, no --bare, no eval role) + --fused-kernel v3
+#   evalfast2f3      evalfast2wx (FAST timing, B 216, --wait-index --b2-fewer-reads) with --b2-resolve fused
+#                    --fused-kernel v3
+#   evalfast2f3_192  evalfast2f3 at B 192 (C 96 + X 1344, R_ver 1296: evalfast2f192's point), the direct comparison with
+#                    fused v2 (evalfast2f192, 103 tok/s) and torch (evalfast2t192, 217 tok/s) at B 192
+#   C3       evalfast2c3 MUST _draft_only_fused_equal / _round_fused_equal / _fused_err PASS: fused v3 == torch at every
+#            compared layer (0 differences, every layer compared). REPORT: launches 4 per draft-only layer (the
+#            draft-only phase's fused.launches_per_layer 4.0) and 7 per mixed layer; warm-up local memory < 0.5 GB
+#            (meta.fused_warm_mem_gb before - after, and the [oomfix] stderr line; v2: 3.0 GB). FALSIFIER: a
+#            difference: then evalfast2f3 and evalfast2f3_192 are VOID
+#   F3-MED   evalfast2f3 steady tok/s (median tick) at B 216: point 450, band [330, 650] (diagnosis estimate 550-600;
+#            wide because untested). F3-MEAN [250, 560]; F3-EFF [210, 480] (REPORT: the WX mean / median and effective /
+#            median ratios, 0.81 and 0.71, on the median band, widened)
+#   F3-192   evalfast2f3_192 steady tok/s (median tick) at B 192: point 420, band [300, 620]. F3-192-MEAN [230, 530];
+#            F3-192-EFF [200, 450] (the same ratios)
+#   F3-FALS  FALSIFIED if the evalfast2f3 median < 280 at B 216 (then v3 does not beat torch), or the res span at the
+#            median tick > 100 ms
+#   F3-MEM   both timing cells peak_gb <= 84 (MUST EF_mem_cap)
+#
+# REGISTERED for evalfast2f3p / evalfast2c3l / evalfast2f3l ([flean], STAMP 2026-10-23T17:13:30Z, before any run). WHY:
+# analysis/evalfast/SCORING_fr3.md sections 2-4. F3 fell 24-25 % below its point. The res span at the median tick is
+# 239.9 / 256.3 ms. Fused v3 keeps three costs: the bind / audit kernels (2-row cumsum, scatter_add_ on one dummy lane),
+# the per-row Python at every layer, and 3 hidden syncs per mixed layer. --res-lean and --res-dev remove them on the
+# torch path. This tree (ROOT NOSI_EVAL = nosi-r2-flean: graph 8ccf262 + fr3 e7de351) lets the fused path use them:
+# FusedResolver calls _lean_same_rows / _lean_rows_ok / _lean_plan, XPool.bind_lean and draft_bias_fill_flat_lean
+# (LeanConsts.dev selects r2_resdev's ops). The kernels do not change. The check mode's shadow pool keeps the REFERENCE
+# bind (tests_cpu/test_r2_flean.py).
+#   evalfast2f3p     evalfast2f3 + --b2-res-profile (no new code): the device time of the fused v3 draft-only tick.
+#                    REPORT only, bands wide (200:340:150:300:120:260; the profiler slows every later launch). STEP_MIN
+#                    150. Per draft-only tick (draft_only_res_profile.res, ticks 1-11):
+#   F3P-H2D  "Memcpy HtoD (Pageable -> Device)" in res: n = 768 over 12 draft-only ticks (64 per tick, 2 per layer:
+#            r2_xpool.py bind and the bias fill). FALSIFIER: any other count
+#   F3P-SCAN tensor_kernel_scan_innermost_dim<long, plus> (the 2-row cumsum): n 384; 25.9 ms per tick, band [22, 30]
+#   F3P-SADD _scatter_gather_elementwise_kernel<true, long> ReduceAdd (scatter_add_): n 384; 11.6 ms per tick, band
+#            [9.5, 14]
+#   F3P-TRI  the 4 Triton kernels _fr3_prep, _fr3_d1, _fr_scan, _fr3_d2: n 1536; together 80 ms per tick, band
+#            [45, 110] (GUESS level)
+#   F3P-RES  all res device time: point 125 ms per tick, band [95, 150]. Below 95: the span is host-bound
+#   evalfast2c3l     evalfast2c3 (CHECK, B 216, 8 steps, --draft-ticks 4, no --bare, no eval role) + --res-lean
+#                    --res-dev
+#   C3L      MUST _draft_only_fused_equal / _round_fused_equal / _fused_err PASS: 0 diffs, every layer compared (the
+#            lane compare is against the shadow pool's REFERENCE bind). FALSIFIER: a difference: evalfast2f3l is VOID
+#   evalfast2f3l     evalfast2f3 + --res-lean --res-dev, B 216 (--eval-bands 335:375:258:292:220:248)
+#   REVISED by the lead before any run (SCORING_fr3.md 3.3 gave 415 [365, 460]; that estimate counted 40-72 ms from
+#   --res-dev). New evidence (SCORING_resdev.md): --res-dev cut the draft-only res KERNEL time 132 -> 61.9 ms, but the
+#   res WALL span did not move (140-147 ms) and evalfast2rd = evalfast2rl within noise (4 same-job pairs: rd 324.8 /
+#   333.4 / 321.5 / 327.6 vs rl 324.5 / 327.7 / 326.0 / 324.8). The span is launch-bound (about 11,300 launches per
+#   draft-only tick), so --res-dev counts 0 here; only --res-lean's host terms on the fused path count (per-row Python
+#   29-35 ms and 1-3 hidden syncs per mixed tick, partly overlapped): 10-30 ms of the 492.5 ms median tick.
+#   F3L-MED  steady tok/s (median tick): point 350, band [335, 375] (f3: 335.64 / 340.21)
+#   F3L-MEAN steady tok/s (mean tick): point 272, band [258, 292] (f3 mean / median 0.776)
+#   F3L-EFF  effective tok/s: point 230, band [220, 248] (f3 effective / median 0.658)
+#   F3L-FALS FALSIFIED if the evalfast2f3l median < 340 (no gain over f3's two runs), or the bare stats median h_pages
+#            >= 237 ms (f3: 240.534 / 237.760; predicted 210-230)
+#   F3L-MEM  peak_gb <= 84 GB (MUST EF_mem_cap; f3 peak 83.16, the dev dummies add per-layer transients of about
+#            0.1-0.3 GB). If it fails, drop the bias fill's own dummies first
+#
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
 #        _k5_report) names the per-layer demand (first misses needing a shared extra, free extras at the tick start,
@@ -415,7 +482,7 @@ NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                        
 NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-stack2                                             # ROOT of the stack1 cells only ([integ]; [stack2])
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
-NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-graph                                               # ROOT of the evalfast* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree; [frfix] own worktree; [resfix] own worktree; [resdev] own worktree)
+NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-flean                                               # ROOT of the evalfast* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree; [frfix] own worktree; [resfix] own worktree; [resdev] own worktree; [fr3] own worktree; [flean] own worktree)
 EVALACC_OUT=/mnt/beegfs/ojerbi/r2-runs/evalacc                                           # ROOT (r2_evalacc_step.sh's OUTROOT)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
@@ -442,7 +509,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl|evalfast2rd|evalfast2rdp] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl|evalfast2rd|evalfast2rdp|evalfast2c3|evalfast2f3|evalfast2f3_192|evalfast2f3p|evalfast2c3l|evalfast2f3l] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -464,6 +531,8 @@ for w in "$@"; do
         evalfast2fx|evalfast2wx) [ -z "$CELL" ] || usage; CELL=$w ;;                                # [frfix]
         evalfast2rp|evalfast2rl) [ -z "$CELL" ] || usage; CELL=$w ;;                                # [resfix]
         evalfast2rd|evalfast2rdp) [ -z "$CELL" ] || usage; CELL=$w ;;                               # [resdev]
+        evalfast2c3|evalfast2f3|evalfast2f3_192) [ -z "$CELL" ] || usage; CELL=$w ;;                # [fr3]
+        evalfast2f3p|evalfast2c3l|evalfast2f3l) [ -z "$CELL" ] || usage; CELL=$w ;;                 # [flean]
         *) usage ;;
     esac
 done
@@ -671,6 +740,34 @@ case $CELL in
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=192 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
         EVALARG=(--layout pool --X-pool 1344 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
                  --b2-resolve check) ;;
+    evalfast2c3) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_evalfast2c3      # [fr3]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
+                 --b2-resolve check --fused-kernel v3) ;;
+    evalfast2f3|evalfast2f3_192) MODES=fast ; BACKENDS=b2 ; PC=96 ; SWEEP_RUN= ; SUFFIX=_$CELL                 # [fr3]
+        NOSI=$NOSI_EVAL ; POOLB=() ; MEMG=240G ; VARIANTS=fused/batched
+        if [ "$CELL" = evalfast2f3 ]; then BATCH=216 ; PX=1512 ; PRV=1464 ; BANDS=330:650:250:560:210:480
+        else BATCH=192 ; PX=1344 ; PRV=1296 ; BANDS=300:620:230:530:200:450
+        fi
+        EVALARG=(--layout pool --X-pool "$PX" --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
+                 --eval-role fast-time --mem-cap-gb 84
+                 --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
+                 --eval-bands "$BANDS" --b2-resolve fused --fused-kernel v3 --host-profile --gc-freeze --lean-time
+                 --wait-index --b2-fewer-reads) ;;
+    evalfast2f3p|evalfast2f3l) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_$CELL  # [flean]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched
+        if [ "$CELL" = evalfast2f3p ]; then FLFLAGS=(--b2-res-profile) ; BANDS=200:340:150:300:120:260 ; STEP_MIN=150
+        else FLFLAGS=(--res-lean --res-dev) ; BANDS=335:375:258:292:220:248
+        fi
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
+                 --eval-role fast-time --mem-cap-gb 84
+                 --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
+                 --eval-bands "$BANDS" --b2-resolve fused --fused-kernel v3 --host-profile --gc-freeze --lean-time
+                 --wait-index --b2-fewer-reads "${FLFLAGS[@]}") ;;
+    evalfast2c3l) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_evalfast2c3l    # [flean]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
+                 --b2-resolve check --fused-kernel v3 --res-lean --res-dev) ;;
 esac
 MIN_LEFT=$((STEP_MIN * 60 + 600))                           # [fusedres2] after the cell's STEP_MIN
 VARIANTARG=()                                               # [batched-rebuild] no --variants in every other cell

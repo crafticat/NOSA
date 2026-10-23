@@ -71,6 +71,29 @@ grant takes the (q + 1)-th FREE slot (an off-by-one slot). STATS counts, per run
 (L34): plant 1 changes ev_slot only for an eviction whose flipped rank differs (stats "pe_flip_effective"); plant 2
 changes every draft grant's take slot ("d_grant").
 
+V3 ([fr3], FusedResolver(kernel="v3"); the default "v2" is unchanged). The v2 kernels hold NP-wide slot vectors and
+(KP x NP) compare tiles per program, and _fr_v2 sorts NP keys with tl.sort. At NP 2048 and 8 warps that spills (about
+3.0 GB of driver local memory, analysis/evalfast/SCORING_b192.md section 6). V3 makes the SAME decisions with bounded
+tiles. No v3 kernel has an NP-wide vector, a (KP x NP) tile or tl.sort (test FR3-S checks the source):
+  PREP  (new, one launch per layer, grid S) per stream: the BLOCK TABLES (ZP entries each: the highest resident slot
+        and its count, the highest current-owner slot in flight and its count; built from (ZC x TC) compare tiles, so a
+        table entry equals v2's _lookup for every block), the FREE LIST (the FREE slots in slot order: the q-th FREE
+        slot is one load), the usage, and with verify rows Policy E's key per slot (v2's insel / class / stamp / slot
+        key, per (CH x KP) chunk) and the candidate count; it initializes V2's per-slot scratch (post) and the tables
+        that V2 fills (took / gone / gone in flight).
+  V1 / D1 / D2  as v2, with table loads instead of compare tiles (D1 also builds the FREE list after the verify rows).
+  V2    as v2, with table and FREE-list loads. Policy E, EXACT: a row's victims are the consecutive ranks carry_r ..
+        carry_r + nev - 1, so V2 takes them in key order by one bounded pass over the stream's keys each ("the next key
+        above the last one taken": keys are distinct, the slot is in the low bits). The cost is O(evictions x NP), not
+        a sort. The per-row state (v2's newblk / evold / evinfl / free2 vectors) becomes scatters to distinct slots and
+        blocks, with a CTA barrier (tl.debug_barrier) before a later row or the end pass reads them.
+  Launches per layer: 4 draft-only or verify-only (PREP + 3), 7 with both (PREP, V1, SCAN, V2, D1, SCAN, D2).
+  Determinism: no decision uses an atomic (the scatters write distinct addresses or one equal value), so v3 has no
+  FAST / EXACT split. Equality with v2 (and so with the torch path) holds on every tick whose err flag is 0; on a voided
+  tick (A3, err bit 4: a grant without a FREE slot) the scratch lane NPOS may differ from v2's (both are voided).
+  Plant 3 (v3 only): a verify dup ignores the slot an earlier row took (the took table read); effective where
+  v_dup - v_dup_over grows.
+
 Imports torch (and triton when it is installed). No `from __future__ import annotations`: the kernels' constexpr
 annotations must be objects.
 """
@@ -164,13 +187,43 @@ DNS = dict(_fr_scan=_INTS["_fr_scan"],
            _fr_d1=_INTS["_fr_d1"] + _SEL + [p for p in _ROWS_D if p not in ("dtl_ptr", "dnt_ptr")],
            _fr_d2=_INTS["_fr_d2"] + _SEL + [p for p in _ROWS_V if p not in ("vtl_ptr", "vnt_ptr")] + _ROWS_D
            + ["sb_ptr", "cis_ptr"])
-LOOK_LANES = 256                                       # V1's zeroing chunk (23b8a38: min(256, pow2(Rv * 4)))
+# [fr3] the v3 kernels: every int, the row lists and the selection are not specialized ([stack2]'s rule)
+_INTS3 = dict(
+    _fr3_prep=["H", "R", "K", "NBLK", "NPOS", "Rv", "Rd", "MAXRV", "MAXRD", "S"],
+    _fr3_v1=["H", "R", "K", "NBLK", "C", "Rv", "MAXRV", "NLOOK"],
+    _fr3_v2=["H", "B", "R", "K", "NBLK", "NPOS", "C", "Rv", "MAXRV", "NV", "CAPV", "S", "WB", "WP", "T", "P"],
+    _fr3_d1=["H", "R", "K", "NBLK", "NPOS", "C", "Rd", "MAXRD", "S", "NPAIRS"],
+    _fr3_d2=["H", "B", "R", "K", "NBLK", "NPOS", "C", "Rv", "Rd", "MAXRV", "MAXRD", "ND", "CAPD", "S", "WB", "T", "P",
+             "BS", "ROWS_S", "ROWS_C"])
+_RV5 = [p for p in _ROWS_V if p not in ("vtl_ptr", "vnt_ptr")]
+_RD5 = [p for p in _ROWS_D if p not in ("dtl_ptr", "dnt_ptr")]
+DNS_OLD.update({k: list(v) for k, v in _INTS3.items()})
+DNS.update(_fr3_prep=_INTS3["_fr3_prep"] + _SEL + _RV5 + _RD5,
+           _fr3_v1=_INTS3["_fr3_v1"] + _SEL + _RV5,
+           _fr3_v2=_INTS3["_fr3_v2"] + _SEL + _ROWS_V,
+           _fr3_d1=_INTS3["_fr3_d1"] + _SEL + _RD5,
+           _fr3_d2=_INTS3["_fr3_d2"] + _SEL + _RV5 + _ROWS_D + ["sb_ptr", "cis_ptr"])
+LOOK_LANES = 256                                      # V1's zeroing chunk (23b8a38: min(256, pow2(Rv * 4)))
 WARM_MODES = ("auto", "on", "off")                     # auto: on for a CUDA service (the interpreter compiles nothing)
 _warm_depth = [0]                                      # > 0 while warm_up launches (tests tell its launches apart)
 # [oomfix] the first launch of _fr_v2 (NP 2048) grows the driver's local-memory pool (register spills, for every thread
 # the device can hold). The driver cannot take the blocks that torch's caching allocator holds, and torch does not free
 # them on a DRIVER failure (analysis/evalfast/DIAG_fused_check_oom.md). One empty_cache per process, before that launch.
 _LMEM_PREP = [False]
+# [fr3] the kernel variants (module docstring, V3). FusedResolver(kernel=None) reads DEFAULT_KERNEL at construction:
+# the CPU tests switch it per child process (test_r2_fusedres_v3.py); production passes kernel explicitly.
+KERNELS = ("v2", "v3")
+DEFAULT_KERNEL = "v2"
+PLANTS3 = {3: "v3: a verify dup ignores the slot an earlier row took for its block (the took table read)"}
+FR3_ZC = 64                                            # v3: the block chunk (rowsel / sel words), a multiple of 32, >= 64
+FR3_TC = 64                                            # v3: the slot chunk of the tables' build: (ZC x TC) tiles
+FR3_TILE = 4096                                        # v3: the largest (CH x KP) tile
+
+
+def fr3_chunk(KP: int, NP: int) -> int:
+    """[fr3] v3's slot chunk CH: a power of 2, >= 64 (two 32-bit words, no size-1 tile dimension), <= NP, and
+    CH x KP <= FR3_TILE where KP <= 64."""
+    return min(int(NP), max(64, FR3_TILE // int(KP)))
 
 
 def _jit_dns(name: str):
@@ -863,6 +916,681 @@ if triton is not None:
         _put1(dcnt_out_ptr, totrec.to(tl.int64), pid == 0)
         tl.atomic_or(err_ptr, errb.to(tl.int64))                                  # err is int64 (fusedres2c)
 
+    # =================================================================================================================
+    # [fr3] V3: the same decisions with bounded register tiles (module docstring, V3). The largest tiles per program:
+    # (KP x KP) (_sorted_unique, _seen, as v2), (PP x KP) and (PP x TP) (the page table, as v2), (ZC x KP) (rowsel /
+    # sel), (CH x KP) (PREP's insel), (ZC x TC) (PREP's tables). No NP-wide vector, no (KP x NP) tile, no tl.sort.
+    # The per-stream block table tab (S, 7, ZP) int64: 0 the highest resident slot (-1), 1 their count, 2 the highest
+    # current-owner slot in flight (-1), 3 their count, 4 the slot a verify row took for the block (-1), 5 a verify row
+    # evicted the block (0 / 1), 6 it evicted it while in flight (0 / 1). post (4, S, NP) int64 (v3's use): 0 newblk
+    # per slot (-1), 1 the verify read bit per slot, 2 Policy E's key per slot, 3 FREE after the verify rows.
+    # flist (S, 2, NP): the FREE slots in slot order (0 before the verify rows: PREP; 1 after them: D1). pm (S, 4):
+    # 0 Policy E's candidate count, 1 / 2 the FREE counts of flist 0 / 1.
+    # =================================================================================================================
+    @triton.jit
+    def _tab3(tb, blk, f: tl.constexpr, ZP: tl.constexpr):
+        """[fr3] Field f of the stream's block table at the blocks blk (all in [0, NBLK) <= ZP: an invalid entry's blk
+        is 0), as int32."""
+        return tl.load(tb + f * ZP + blk).to(tl.int32)
+
+    @triton.jit
+    def _d_state3(tb, blk, ZP: tl.constexpr, HAS_V: tl.constexpr):
+        """[fr3] _d_state by table loads: the original resident / in-flight slot and counts (PREP), then (HAS_V) the
+        verify rows' changes per block (V2): an evicted block's slot is gone, a block a verify row took is in flight,
+        a superseded prefetch's block is not in flight."""
+        slot = _tab3(tb, blk, 0, ZP)
+        nres = _tab3(tb, blk, 1, ZP)
+        islot = _tab3(tb, blk, 2, ZP)
+        nfly = _tab3(tb, blk, 3, ZP)
+        infl = islot >= 0
+        if HAS_V:
+            took = _tab3(tb, blk, 4, ZP) >= 0
+            gone = _tab3(tb, blk, 5, ZP) != 0
+            gonef = _tab3(tb, blk, 6, ZP) != 0
+            slot = tl.where(gone, -1, slot)
+            infl = (infl | took) & (gonef == 0)
+        return slot, infl, nres, nfly
+
+    @triton.jit
+    def _selbits_at(s, v0, z0, ZC: tl.constexpr):
+        """[fr3] _selbits on the blocks z0 .. z0 + ZC - 1 only (a (ZC x KP) tile)."""
+        z = z0 + tl.arange(0, ZC)
+        return tl.max((v0[None, :] & (s[None, :] == z[:, None])).to(tl.int32), axis=1) > 0
+
+    # PREP: the block tables, the FREE list, the usage, Policy E's keys, V2's scratch
+    @_jit_dns("_fr3_prep")
+    def _fr3_prep(code_ptr, blk_ptr, cur_ptr, prot_ptr, stamp_ptr, sel_ptr, kid_ptr,
+                  vix_ptr, vhb_ptr, vstart_ptr, vcnt_ptr, vorder_ptr,
+                  dix_ptr, dhb_ptr, dstart_ptr, dcnt_ptr, dorder_ptr,
+                  tab_ptr, flist_ptr, pm_ptr, post_ptr, usg_ptr, err_ptr,
+                  H, R, K, NBLK, NPOS, Rv, Rd, MAXRV, MAXRD, S,
+                  KP: tl.constexpr, NP: tl.constexpr, ZP: tl.constexpr, CH: tl.constexpr, ZC: tl.constexpr,
+                  TC: tl.constexpr, HAS_V: tl.constexpr, PE_INFL: tl.constexpr, SMUL: tl.constexpr,
+                  CMUL: tl.constexpr):
+        pid = tl.program_id(0)
+        b = pid // H
+        h = pid % H
+        pid64 = pid.to(tl.int64)
+        base = pid64 * NPOS
+        tb = tab_ptr + pid64 * (7 * ZP)
+        # (1) the block tables. Per block: the highest slot of the resident slots (LRU / PO / VRES) and of the current
+        # owner's slots in flight (v2's _lookup: the highest of several, A1), and how many there are (err bits 1 / 2)
+        zl = tl.arange(0, ZC)
+        tj = tl.arange(0, TC)
+        for z0 in range(0, ZP, ZC):
+            zz = z0 + zl
+            rmax = tl.full([ZC], -1, tl.int32)
+            rn = tl.zeros([ZC], tl.int32)
+            fmax = tl.full([ZC], -1, tl.int32)
+            fn = tl.zeros([ZC], tl.int32)
+            for c0 in range(0, NP, TC):
+                jc = c0 + tj
+                mj = jc < NPOS
+                code = tl.load(code_ptr + base + jc, mask=mj, other=-1).to(tl.int32)
+                sblk = tl.load(blk_ptr + base + jc, mask=mj, other=-1).to(tl.int32)
+                cur = tl.load(cur_ptr + base + jc, mask=mj, other=0)
+                okb = (sblk >= 0) & (sblk < NBLK)
+                res = okb & ((code == 2) | (code == 3) | (code == 4))
+                fly = okb & (code == 1) & (cur != 0)
+                hit = sblk[None, :] == zz[:, None]
+                mr = res[None, :] & hit
+                mf = fly[None, :] & hit
+                rmax = tl.maximum(rmax, tl.max(tl.where(mr, jc[None, :], -1), axis=1))
+                rn = rn + tl.sum(mr.to(tl.int32), axis=1)
+                fmax = tl.maximum(fmax, tl.max(tl.where(mf, jc[None, :], -1), axis=1))
+                fn = fn + tl.sum(mf.to(tl.int32), axis=1)
+            tl.store(tb + 0 * ZP + zz, rmax.to(tl.int64))
+            tl.store(tb + 1 * ZP + zz, rn.to(tl.int64))
+            tl.store(tb + 2 * ZP + zz, fmax.to(tl.int64))
+            tl.store(tb + 3 * ZP + zz, fn.to(tl.int64))
+            tl.store(tb + 4 * ZP + zz, tl.full([ZC], -1, tl.int64))           # V2 fills 4-6 (the verify rows)
+            tl.store(tb + 5 * ZP + zz, tl.zeros([ZC], tl.int64))
+            tl.store(tb + 6 * ZP + zz, tl.zeros([ZC], tl.int64))
+        # (2) the usage and the FREE slots in slot order (v2's fr rank: the q-th FREE slot is flist[q]); V2's scratch
+        cl = tl.arange(0, CH)
+        fl = flist_ptr + pid64 * (2 * NP)
+        nfree = tl.sum(tl.zeros([2], tl.int32), axis=0)
+        usage = nfree
+        for c0 in range(0, NP, CH):
+            jc = c0 + cl
+            mj = jc < NPOS
+            code = tl.load(code_ptr + base + jc, mask=mj, other=-1).to(tl.int32)
+            free = mj & (code == 0)
+            fi = free.to(tl.int32)
+            tl.store(fl + nfree + tl.cumsum(fi, axis=0) - fi, jc.to(tl.int64), mask=free)
+            nfree = nfree + tl.sum(fi, axis=0)
+            usage = usage + tl.sum((mj & (code != 0)).to(tl.int32), axis=0)
+            if HAS_V:
+                tl.store(post_ptr + (0 * S + pid64) * NP + jc, tl.full([CH], -1, tl.int64))       # newblk
+                tl.store(post_ptr + (1 * S + pid64) * NP + jc, tl.zeros([CH], tl.int64))          # read bits
+                tl.store(post_ptr + (3 * S + pid64) * NP + jc, free.to(tl.int64))                 # FREE after V
+        _put1(usg_ptr + pid, usage, pid >= 0)
+        _put1(pm_ptr + pid64 * 4 + 1, nfree, pid >= 0)
+        # (3) Policy E's key per slot (v2's V2: insel over the verify AND draft rows of b, cand, candf, the key)
+        if HAS_V:
+            vstart = tl.load(vstart_ptr + b)
+            vcnt = tl.load(vcnt_ptr + b)
+            dstart = tl.load(dstart_ptr + b)
+            dcnt = tl.load(dcnt_ptr + b)
+            ncand = tl.sum(tl.zeros([2], tl.int32), axis=0)
+            errb = ncand
+            for c0 in range(0, NP, CH):
+                jc = c0 + cl
+                mj = jc < NPOS
+                code = tl.load(code_ptr + base + jc, mask=mj, other=-1).to(tl.int32)
+                sblk = tl.load(blk_ptr + base + jc, mask=mj, other=-1).to(tl.int32)
+                cur = tl.load(cur_ptr + base + jc, mask=mj, other=0)
+                prot = tl.load(prot_ptr + base + jc, mask=mj, other=0)
+                stamp = tl.load(stamp_ptr + base + jc, mask=mj, other=0)
+                okb = (sblk >= 0) & (sblk < NBLK)
+                resid = (code == 2) | (code == 3) | (code == 4)
+                fly = okb & (code == 1) & (cur != 0)
+                insel = mj & (code < -1)
+                for i in range(0, MAXRV):
+                    act, j, tr, kid, s, v0 = _row(vorder_ptr, vix_ptr, vhb_ptr, kid_ptr, sel_ptr, vstart, vcnt, i, Rv,
+                                                  h, R, K, NBLK, KP)
+                    hit = tl.max((v0[None, :] & (s[None, :] == sblk[:, None])).to(tl.int32), axis=1) > 0
+                    insel = insel | (hit & act)
+                for i in range(0, MAXRD):
+                    act, j, tr, kid, s, v0 = _row(dorder_ptr, dix_ptr, dhb_ptr, kid_ptr, sel_ptr, dstart, dcnt, i, Rd,
+                                                  h, R, K, NBLK, KP)
+                    hit = tl.max((v0[None, :] & (s[None, :] == sblk[:, None])).to(tl.int32), axis=1) > 0
+                    insel = insel | (hit & act)
+                insel = insel & okb
+                prot_r = resid & (prot != 0)
+                cand = (code == 2) & (prot_r == 0) & (insel == 0)
+                if PE_INFL:
+                    candf = fly & (prot == 0) & (insel == 0)
+                else:
+                    candf = cand & (cand == 0)
+                anyc = cand | candf
+                cls = tl.where(cand, 0, tl.where(candf, 1, 2)).to(tl.int64)
+                kst = tl.where(cand, stamp, tl.where(candf, tl.minimum(stamp, 2305843009213693952), 0))
+                tl.store(post_ptr + (2 * S + pid64) * NP + jc, cls * CMUL + kst * SMUL + jc.to(tl.int64))
+                ncand = ncand + tl.sum(anyc.to(tl.int32), axis=0)
+                bad = tl.max((anyc & ((stamp < 0) | (stamp >= 140737488355328))).to(tl.int32), axis=0)
+                errb = errb | tl.where(bad > 0, 8, 0)
+            _put1(pm_ptr + pid64 * 4, ncand, pid >= 0)
+            tl.atomic_or(err_ptr, errb.to(tl.int64))
+
+    # V1 (v3): v2's V1 with table loads
+    @_jit_dns("_fr3_v1")
+    def _fr3_v1(sel_ptr, kid_ptr, vix_ptr, vhb_ptr, vstart_ptr, vcnt_ptr, vorder_ptr,
+                tab_ptr, ne_ptr, rec_ptr, usg_ptr, err_ptr, cntv_ptr, look_ptr,
+                H, R, K, NBLK, C, Rv, MAXRV, NLOOK,
+                KP: tl.constexpr, ZP: tl.constexpr, LZ: tl.constexpr):
+        pid = tl.program_id(0)
+        b = pid // H
+        h = pid % H
+        tb = tab_ptr + pid.to(tl.int64) * (7 * ZP)
+        usage = tl.load(usg_ptr + pid).to(tl.int32)                              # PREP's (v2: V1's own _slots)
+        free_local = tl.maximum(C - usage, 0)
+        lk = tl.arange(0, LZ)                                                     # program 0 zeroes V2's sums
+        for c0 in range(0, NLOOK, LZ):
+            tl.store(look_ptr + c0 + lk, tl.zeros([LZ], tl.int64), mask=(c0 + lk < NLOOK) & (pid == 0))
+        _put1(cntv_ptr, tl.sum(tl.zeros([2], tl.int64), axis=0), pid == 0)
+        start = tl.load(vstart_ptr + b)
+        cnt = tl.load(vcnt_ptr + b)
+        carry = tl.sum(tl.zeros([2], tl.int32), axis=0)
+        errb = tl.sum(tl.zeros([2], tl.int32), axis=0)
+        for i in range(0, MAXRV):
+            act, j, tr, kid, s, v0 = _row(vorder_ptr, vix_ptr, vhb_ptr, kid_ptr, sel_ptr, start, cnt, i, Rv, h, R, K,
+                                          NBLK, KP)
+            valid, blk = _sorted_unique(s, v0, K, NBLK, KP)
+            slot = _tab3(tb, blk, 0, ZP)
+            nres = _tab3(tb, blk, 1, ZP)
+            islot = _tab3(tb, blk, 2, ZP)
+            nfly = _tab3(tb, blk, 3, ZP)
+            ready = valid & (slot >= 0)
+            infl = valid & (ready == 0) & (islot >= 0)
+            miss = valid & (ready == 0) & (infl == 0)
+            seen, seen_k = _seen(vorder_ptr, vix_ptr, vhb_ptr, kid_ptr, sel_ptr, start, cnt, i, Rv, h, R, K, NBLK,
+                                 kid, blk, valid, KP)
+            fmiss = miss & (seen == 0)
+            fm = fmiss.to(tl.int32)
+            rank = carry + tl.cumsum(fm, axis=0) - fm
+            ne = fmiss & (rank >= free_local)
+            idx = j * H + h
+            _put1(ne_ptr + idx, tl.sum(ne.to(tl.int32), axis=0), act)
+            _put1(rec_ptr + idx, tl.sum((valid & (ready == 0)).to(tl.int32), axis=0), act)
+            carry = carry + tl.where(act, tl.sum(fm, axis=0), 0)
+            e1 = tl.where(act & (tl.max(nres, axis=0) > 1), 1, 0)
+            e2 = tl.where(act & (tl.max(nfly, axis=0) > 1), 2, 0)
+            errb = errb | e1 | e2
+        tl.atomic_or(err_ptr, errb.to(tl.int64))
+
+    # V2 (v3): v2's V2 with table / FREE-list loads, Policy E by bounded passes, the state by scatters
+    @_jit_dns("_fr3_v2")
+    def _fr3_v2(code_ptr, blk_ptr, gen_ptr, cur_ptr, sel_ptr, kid_ptr,
+                vix_ptr, vhb_ptr, vtl_ptr, vnt_ptr, vstart_ptr, vcnt_ptr, vorder_ptr,
+                tab_ptr, flist_ptr, pm_ptr, ne_ptr, rec_ptr, bne_ptr, brec_ptr, misc_ptr, usg_ptr,
+                tv_ptr, vpage_ptr, vnpg_ptr, ppage_ptr, pnpg_ptr, ids_ptr, vrec_ptr, vrcnt_ptr, cntv_ptr, look_ptr,
+                vread_ptr, post_ptr, usg2_ptr, selw_ptr, rowsel_ptr, err_ptr, stats_ptr,
+                H, B, R, K, NBLK, NPOS, C, Rv, MAXRV, NV, CAPV, S, WB, WP, T, P,
+                KP: tl.constexpr, NP: tl.constexpr, PP: tl.constexpr, TP: tl.constexpr, ZP: tl.constexpr,
+                CH: tl.constexpr, ZC: tl.constexpr, LAST: tl.constexpr, PLANT: tl.constexpr,
+                NSTAT: tl.constexpr, CMUL: tl.constexpr, SMASK: tl.constexpr):
+        pid = tl.program_id(0)
+        b = pid // H
+        h = pid % H
+        pid64 = pid.to(tl.int64)
+        base = pid64 * NPOS
+        tb = tab_ptr + pid64 * (7 * ZP)
+        fl = flist_ptr + pid64 * (2 * NP)                                         # PREP: FREE slots in slot order
+        pnb = post_ptr + (0 * S + pid64) * NP                                     # newblk per slot (PREP: -1)
+        prd = post_ptr + (1 * S + pid64) * NP                                     # read bits per slot (PREP: 0)
+        pk = post_ptr + (2 * S + pid64) * NP                                      # Policy E's keys (PREP)
+        pfr = post_ptr + (3 * S + pid64) * NP                                     # FREE after V (PREP: FREE)
+        usage = tl.load(usg_ptr + pid).to(tl.int32)
+        free_local = tl.maximum(C - usage, 0)
+        ncand = tl.load(pm_ptr + pid64 * 4).to(tl.int32)
+        nfree = tl.load(pm_ptr + pid64 * 4 + 1).to(tl.int32)
+        budget = tl.load(misc_ptr)
+        totrec = tl.load(misc_ptr + 1)
+        vstart = tl.load(vstart_ptr + b)
+        vcnt = tl.load(vcnt_ptr + b)
+        usage2 = usage
+        errb = tl.sum(tl.zeros([2], tl.int32), axis=0)
+        carry_f = errb
+        carry_g = errb
+        carry_r = errb
+        # Policy E: the last key taken. EXACT: the next victim is the smallest key above it (keys are distinct: the
+        # slot is in the low bits), so the e-th one taken is v2's srtc[e]. PLANT 1 takes the largest candidate key
+        # below it (srtc[ncand - 1 - e]; a candidate key is < 2 CMUL when its stamp is in range, A2)
+        if PLANT == 1:
+            lastk = tl.sum(tl.zeros([2], tl.int64), axis=0) + 2 * CMUL
+        else:
+            lastk = tl.sum(tl.zeros([2], tl.int64), axis=0) - 1
+        kk = tl.arange(0, KP)
+        mk = kk < K
+        cc = tl.arange(0, PP)
+        tt = tl.arange(0, TP)
+        q4 = tl.arange(0, 4)
+        st16 = tl.arange(0, 16)
+        cl = tl.arange(0, CH)
+        zl = tl.arange(0, ZC // 32)
+        for i in range(0, MAXRV):
+            act, j, tr, kid, s, v0 = _row(vorder_ptr, vix_ptr, vhb_ptr, kid_ptr, sel_ptr, vstart, vcnt, i, Rv, h, R,
+                                          K, NBLK, KP)
+            valid, blk = _sorted_unique(s, v0, K, NBLK, KP)
+            slot = _tab3(tb, blk, 0, ZP)
+            nres = _tab3(tb, blk, 1, ZP)
+            islot = _tab3(tb, blk, 2, ZP)
+            nfly = _tab3(tb, blk, 3, ZP)
+            igen = tl.where(islot >= 0, tl.maximum(tl.load(gen_ptr + base + tl.maximum(islot, 0)), 0), 0)
+            ready = valid & (slot >= 0)
+            infl = valid & (ready == 0) & (islot >= 0)
+            miss = valid & (ready == 0) & (infl == 0)
+            seen, seen_k = _seen(vorder_ptr, vix_ptr, vhb_ptr, kid_ptr, sel_ptr, vstart, vcnt, i, Rv, h, R, K, NBLK,
+                                 kid, blk, valid, KP)
+            fmiss = miss & (seen == 0)
+            dup = miss & seen
+            first = valid & (seen_k == 0)
+            fm = fmiss.to(tl.int32)
+            rank = carry_f + tl.cumsum(fm, axis=0) - fm
+            ne = fmiss & (rank >= free_local)
+            nei = ne.to(tl.int32)
+            idx = j * H + h
+            g = tl.load(bne_ptr + idx) + tl.cumsum(nei, axis=0) - nei
+            granted = fmiss & ((ne == 0) | (g < budget))
+            refused = fmiss & (granted == 0)
+            gi = granted.to(tl.int32)
+            q = carry_g + tl.cumsum(gi, axis=0) - gi
+            qc = tl.minimum(q, NPOS - 1)
+            fs = tl.where(qc < nfree, tl.load(fl + tl.minimum(tl.maximum(qc, 0), NP - 1)).to(tl.int32), -1)
+            fsl = tl.where(fs >= 0, fs, NPOS)
+            ri = refused.to(tl.int32)
+            rev = carry_r + tl.cumsum(ri, axis=0) - ri
+            evicted = refused & (rev < ncand)
+            # this row's victims: the ranks carry_r .. carry_r + nev - 1 (refused entries rank consecutively), one
+            # bounded pass over the stream's keys each
+            nev = tl.sum(evicted.to(tl.int32), axis=0)
+            evs = tl.zeros([KP], tl.int32)
+            for e in range(0, nev):
+                if PLANT == 1:
+                    best = tl.sum(tl.zeros([2], tl.int64), axis=0) - 1
+                    for c0 in range(0, NP, CH):
+                        kv = tl.load(pk + c0 + cl)
+                        best = tl.maximum(best, tl.max(tl.where((kv < lastk) & (kv < 2 * CMUL), kv, -1), axis=0))
+                else:
+                    best = tl.sum(tl.zeros([2], tl.int64), axis=0) + 9223372036854775807
+                    for c0 in range(0, NP, CH):
+                        kv = tl.load(pk + c0 + cl)
+                        best = tl.minimum(best, tl.min(tl.where(kv > lastk, kv, 9223372036854775807), axis=0))
+                lastk = best
+                evs = tl.where(evicted & (rev == carry_r + e), (best & SMASK).to(tl.int32), evs)
+            # the victim slot's block, in-flight state and gen (v2's _at_slot on evs): loads at evs (< NPOS)
+            evblk_raw = tl.load(blk_ptr + base + evs, mask=evicted, other=-1073741824).to(tl.int32)
+            evcode = tl.load(code_ptr + base + evs, mask=evicted, other=-1).to(tl.int32)
+            evcur = tl.load(cur_ptr + base + evs, mask=evicted, other=0)
+            evfly = ((evblk_raw >= 0) & (evblk_raw < NBLK) & (evcode == 1) & (evcur != 0)).to(tl.int32)
+            evgen_raw = tl.maximum(tl.load(gen_ptr + base + evs, mask=evicted, other=0), 0)
+            ev_blk = tl.where(evicted, evblk_raw, -1)
+            ev_infl = evicted & (evfly > 0)
+            ev_gen = tl.where(ev_infl, evgen_raw, 0)
+            over = refused & (evicted == 0)
+            take = tl.where(granted, fsl, tl.where(evicted, evs, -1))
+            taken = granted | evicted
+            grp = tl.load(tb + 4 * ZP + blk, mask=dup, other=-1).to(tl.int32)    # an EARLIER row's take (barrier)
+            if PLANT == 3:
+                grp_use = tl.where(dup, -1, grp)
+            else:
+                grp_use = grp
+            rslot = tl.where(ready, slot, tl.where(infl, islot, tl.where(fmiss, take, tl.where(dup, grp_use, -1))))
+            hole = valid & (rslot < 0)
+            rpage = tl.where(hole, 0, rslot)
+            # the decision's fields (K3X entry order: o = (j H + h) k + p)
+            o = idx * K + kk
+            me = mk & act
+            tl.store(tv_ptr + 0 * NV + o, blk.to(tl.int64), mask=me)
+            tl.store(tv_ptr + 1 * NV + o, valid.to(tl.int64), mask=me)
+            tl.store(tv_ptr + 2 * NV + o, ready.to(tl.int64), mask=me)
+            tl.store(tv_ptr + 3 * NV + o, slot.to(tl.int64), mask=me)
+            tl.store(tv_ptr + 4 * NV + o, infl.to(tl.int64), mask=me)
+            tl.store(tv_ptr + 5 * NV + o, islot.to(tl.int64), mask=me)
+            tl.store(tv_ptr + 6 * NV + o, igen.to(tl.int64), mask=me)
+            tl.store(tv_ptr + 7 * NV + o, dup.to(tl.int64), mask=me)
+            tl.store(tv_ptr + 8 * NV + o, granted.to(tl.int64), mask=me)
+            tl.store(tv_ptr + 9 * NV + o, take.to(tl.int64), mask=me)
+            tl.store(tv_ptr + 10 * NV + o, rslot.to(tl.int64), mask=me)
+            tl.store(tv_ptr + 11 * NV + o, valid.to(tl.int64), mask=me)
+            tl.store(tv_ptr + 12 * NV + o, evicted.to(tl.int64), mask=me)
+            tl.store(tv_ptr + 13 * NV + o, ev_blk.to(tl.int64), mask=me)
+            tl.store(tv_ptr + 14 * NV + o, ev_infl.to(tl.int64), mask=me)
+            tl.store(tv_ptr + 15 * NV + o, ev_gen.to(tl.int64), mask=me)
+            # the page table: every valid block in ascending block id (its read slot), then the row's tail slots
+            vi = valid.to(tl.int32)
+            vp = tl.cumsum(vi, axis=0) - vi
+            nvalid = tl.sum(vi, axis=0)
+            hist = tl.max(tl.where(valid[None, :] & (vp[None, :] == cc[:, None]), rpage[None, :], -1), axis=1)
+            tv = tl.load(vtl_ptr + j * T + tt, mask=tt < T, other=-1)
+            ntr = tl.load(vnt_ptr + j)
+            tcol = cc - nvalid
+            tailv = tl.max(tl.where((tcol[:, None] == tt[None, :]) & (tt[None, :] < ntr), tv[None, :], -1), axis=1)
+            page = tl.where(cc < nvalid, hist.to(tl.int64), tl.where((tcol >= 0) & (tcol < ntr), tailv, -1))
+            mp = (cc < P) & act
+            tl.store(vpage_ptr + idx * P + cc, page, mask=mp)
+            tl.store(ppage_ptr + (tr * H + h) * P + cc, page.to(tl.int32), mask=mp)
+            npg = nvalid + ntr
+            _put1(vnpg_ptr + idx, npg.to(tl.int64), act)
+            _put1(pnpg_ptr + tr * H + h, npg.to(tl.int32), act)
+            # the verify record (pin_records False): every valid entry that is not READY, compacted in entry order
+            rm = valid & (ready == 0)
+            rmi = rm.to(tl.int32)
+            rpos = tl.load(brec_ptr + idx) + tl.cumsum(rmi, axis=0) - rmi
+            wm = rm & act & (rpos < CAPV)
+            flags = (ready.to(tl.int64) * 2 + infl.to(tl.int64) * 4 + dup.to(tl.int64) * 8 + granted.to(tl.int64) * 16
+                     + evicted.to(tl.int64) * 32 + ev_infl.to(tl.int64) * 64 + first.to(tl.int64) * 128
+                     + over.to(tl.int64) * 256)
+            tl.store(vrec_ptr + 0 * CAPV + rpos, o.to(tl.int64), mask=wm)
+            tl.store(vrec_ptr + 1 * CAPV + rpos, blk.to(tl.int64), mask=wm)
+            tl.store(vrec_ptr + 2 * CAPV + rpos, flags, mask=wm)
+            tl.store(vrec_ptr + 3 * CAPV + rpos, slot.to(tl.int64), mask=wm)
+            tl.store(vrec_ptr + 4 * CAPV + rpos, islot.to(tl.int64), mask=wm)
+            tl.store(vrec_ptr + 5 * CAPV + rpos, igen.to(tl.int64), mask=wm)
+            tl.store(vrec_ptr + 6 * CAPV + rpos, rslot.to(tl.int64), mask=wm)
+            tl.store(vrec_ptr + 7 * CAPV + rpos, take.to(tl.int64), mask=wm)
+            tl.store(vrec_ptr + 8 * CAPV + rpos, ev_blk.to(tl.int64), mask=wm)
+            pm_ = me & (o >= totrec) & (o < CAPV)                                 # the -1 padding (no record there)
+            neg = tl.full([KP], -1, tl.int64)
+            for f in tl.static_range(9):
+                tl.store(vrec_ptr + f * CAPV + o, neg, mask=pm_)
+            # the looks: READY first looks of (key, head, block), by the slot's state class
+            rf = ready & first
+            cat = tl.load(code_ptr + base + tl.maximum(slot, 0)).to(tl.int32)
+            c0_ = tl.sum(rf.to(tl.int64), axis=0)
+            c1 = tl.sum((rf & (cat == 2)).to(tl.int64), axis=0)
+            c2 = tl.sum((rf & (cat == 3)).to(tl.int64), axis=0)
+            c3 = tl.sum((rf & (cat == 4)).to(tl.int64), axis=0)
+            lv = tl.where(q4 == 0, c0_, tl.where(q4 == 1, c1, tl.where(q4 == 2, c2, c3)))
+            tl.atomic_add(look_ptr + j * 4 + q4, lv, mask=(q4 < 4) & act)
+            # the verify read bits (v2's rbits): one equal value per slot, any order
+            rs = tl.where(ready, slot, tl.where(infl, islot, tl.where(dup, rslot, tl.where(taken, take, -1))))
+            rd = valid & (rs >= 0) & (rs < NP) & act
+            tl.store(prd + tl.minimum(tl.maximum(rs, 0), NP - 1), tl.full([KP], 1, tl.int64), mask=rd)
+            # the stream's state after this row (v2's newblk / evold / evinfl / free2): the takes are distinct slots
+            # and distinct blocks (a block's first miss is taken once per stream), the victims distinct slots
+            tka = tl.minimum(tl.maximum(take, 0), NP - 1)
+            tk = taken & act & (take >= 0) & (take < NP)
+            tl.store(pnb + tka, blk.to(tl.int64), mask=tk)
+            tl.store(tb + 4 * ZP + blk, take.to(tl.int64), mask=tk)
+            evo = tl.maximum(evblk_raw, 0)
+            evok = evicted & act & (evo < NBLK)
+            evoa = tl.minimum(evo, ZP - 1)
+            tl.store(tb + 5 * ZP + evoa, tl.full([KP], 1, tl.int64), mask=evok)
+            tl.store(tb + 6 * ZP + evoa, tl.full([KP], 1, tl.int64), mask=evok & ev_infl)
+            tl.store(pfr + tka, tl.zeros([KP], tl.int64), mask=granted & act & (take >= 0) & (take < NP))
+            usage2 = usage2 + tl.where(act, tl.sum(gi, axis=0), 0)
+            carry_f = carry_f + tl.where(act, tl.sum(fm, axis=0), 0)
+            carry_g = carry_g + tl.where(act, tl.sum(gi, axis=0), 0)
+            carry_r = carry_r + tl.where(act, tl.sum(ri, axis=0), 0)
+            tl.atomic_add(cntv_ptr, tl.where(act, tl.sum(over.to(tl.int64), axis=0), 0))
+            # REPORT / L34 preconditions: per kind, the entries of this row (n_dov from the TRUE grp: plant 3 is
+            # effective at dup & grp >= 0, i.e. where v_dup - v_dup_over grows)
+            n_ev = tl.sum(evicted.to(tl.int64), axis=0)
+            n_fl = tl.sum((evicted & (ncand - 1 - rev != rev)).to(tl.int64), axis=0)
+            n_dov = tl.sum((dup & (grp < 0)).to(tl.int64), axis=0)
+            n_sdup = (tl.sum(v0.to(tl.int32), axis=0) - tl.sum(valid.to(tl.int32), axis=0)).to(tl.int64)
+            sv = tl.where(st16 == 0, n_ev, tl.where(st16 == 1, n_fl, tl.where(
+                st16 == 2, tl.sum(gi.to(tl.int64), axis=0), tl.where(
+                    st16 == 5, tl.sum(over.to(tl.int64), axis=0), tl.where(
+                        st16 == 6, tl.sum(dup.to(tl.int64), axis=0), tl.where(
+                            st16 == 7, tl.sum(ev_infl.to(tl.int64), axis=0), tl.where(
+                                st16 == 8, n_dov, tl.where(st16 == 10, n_sdup, 0))))))))
+            tl.atomic_add(stats_ptr + st16, sv, mask=(st16 < NSTAT) & act)
+            e1 = tl.where(act & (tl.max(nres, axis=0) > 1), 1, 0)
+            e2 = tl.where(act & (tl.max(nfly, axis=0) > 1), 2, 0)
+            e4 = tl.where(act & (tl.max((granted & (fs < 0)).to(tl.int32), axis=0) > 0), 4, 0)
+            e16 = tl.where(act & ((tl.sum(nei, axis=0) != tl.load(ne_ptr + idx))
+                                  | (tl.sum(rmi, axis=0) != tl.load(rec_ptr + idx))), 16, 0)
+            errb = errb | e1 | e2 | e4 | e16
+            # this row's selection bitmap (rowsel), per block chunk
+            for z0 in range(0, ZP, ZC):
+                zw = z0 // 32 + zl
+                tl.store(rowsel_ptr + (tr * H + h) * WB + zw, _pack(_selbits_at(s, v0, z0, ZC), ZC),
+                         mask=(zw < WB) & act)
+            tl.debug_barrier()                    # the took table and the per-slot scratch: later rows read them
+        tl.debug_barrier()
+        # the end pass: the load ids (newblk per slot) and the verify read bitmap, per slot chunk
+        for c0 in range(0, NP, CH):
+            jc = c0 + cl
+            tl.store(ids_ptr + (h * B + b) * NPOS + jc, tl.load(pnb + jc), mask=jc < NPOS)
+            pw = c0 // 32 + tl.arange(0, CH // 32)
+            tl.store(vread_ptr + pid * WP + pw, _pack(tl.load(prd + jc) != 0, CH), mask=pw < WP)
+        _put1(usg2_ptr + pid, usage2, pid >= 0)
+        _put1(vrcnt_ptr, totrec.to(tl.int64), pid == 0)
+        if LAST:                                  # the stream's union (sel) when no draft row follows, per chunk
+            for z0 in range(0, ZP, ZC):
+                selu = tl.zeros([ZC], tl.int32) != 0
+                for i in range(0, MAXRV):
+                    act, j, tr, kid, s, v0 = _row(vorder_ptr, vix_ptr, vhb_ptr, kid_ptr, sel_ptr, vstart, vcnt, i, Rv,
+                                                  h, R, K, NBLK, KP)
+                    selu = selu | (_selbits_at(s, v0, z0, ZC) & act)
+                zw = z0 // 32 + zl
+                tl.store(selw_ptr + pid * WB + zw, _pack(selu, ZC), mask=zw < WB)
+        tl.atomic_or(err_ptr, errb.to(tl.int64))
+
+    # D1 (v3): v2's D1 with table loads; it also writes D2's FREE list (the FREE slots after the verify rows)
+    @_jit_dns("_fr3_d1")
+    def _fr3_d1(code_ptr, sel_ptr, kid_ptr, dix_ptr, dhb_ptr, dstart_ptr, dcnt_ptr, dorder_ptr,
+                tab_ptr, flist_ptr, pm_ptr, post_ptr, usg_ptr, usg2_ptr, ne_ptr, rec_ptr, usgd_ptr, err_ptr, cntd_ptr,
+                H, R, K, NBLK, NPOS, C, Rd, MAXRD, S, NPAIRS,
+                KP: tl.constexpr, NP: tl.constexpr, ZP: tl.constexpr, CH: tl.constexpr, HAS_V: tl.constexpr):
+        pid = tl.program_id(0)
+        b = pid // H
+        h = pid % H
+        pid64 = pid.to(tl.int64)
+        base = pid64 * NPOS
+        tb = tab_ptr + pid64 * (7 * ZP)
+        if HAS_V:
+            usage = tl.load(usg2_ptr + pid).to(tl.int32)                          # V2's (after the verify rows)
+        else:
+            usage = tl.load(usg_ptr + pid).to(tl.int32)                           # PREP's
+        free_local = tl.maximum(C - usage, 0)
+        _put1(usgd_ptr + pid, usage, pid >= 0)
+        q4 = tl.arange(0, 4)                                                       # program 0: (masked, refused, pairs)
+        tl.store(cntd_ptr + q4, tl.where(q4 == 2, NPAIRS, 0).to(tl.int64), mask=(q4 < 3) & (pid == 0))
+        cl = tl.arange(0, CH)
+        fl = flist_ptr + pid64 * (2 * NP) + NP
+        nfree = tl.sum(tl.zeros([2], tl.int32), axis=0)
+        for c0 in range(0, NP, CH):
+            jc = c0 + cl
+            mj = jc < NPOS
+            if HAS_V:
+                free = (tl.load(post_ptr + (3 * S + pid64) * NP + jc) != 0) & mj
+            else:
+                free = mj & (tl.load(code_ptr + base + jc, mask=mj, other=-1).to(tl.int32) == 0)
+            fi = free.to(tl.int32)
+            tl.store(fl + nfree + tl.cumsum(fi, axis=0) - fi, jc.to(tl.int64), mask=free)
+            nfree = nfree + tl.sum(fi, axis=0)
+        _put1(pm_ptr + pid64 * 4 + 2, nfree, pid >= 0)
+        start = tl.load(dstart_ptr + b)
+        cnt = tl.load(dcnt_ptr + b)
+        carry = tl.sum(tl.zeros([2], tl.int32), axis=0)
+        errb = tl.sum(tl.zeros([2], tl.int32), axis=0)
+        for i in range(0, MAXRD):
+            act, j, tr, kid, s, v0 = _row(dorder_ptr, dix_ptr, dhb_ptr, kid_ptr, sel_ptr, start, cnt, i, Rd, h, R, K,
+                                          NBLK, KP)
+            valid, blk = _sorted_unique(s, v0, K, NBLK, KP)
+            slot, inflight, nres, nfly = _d_state3(tb, blk, ZP, HAS_V)
+            ready = valid & (slot >= 0)
+            infl0 = valid & (ready == 0) & inflight
+            miss = valid & (ready == 0) & (infl0 == 0)
+            seen, seen_k = _seen(dorder_ptr, dix_ptr, dhb_ptr, kid_ptr, sel_ptr, start, cnt, i, Rd, h, R, K, NBLK,
+                                 kid, blk, valid, KP)
+            fmiss = miss & (seen == 0)
+            fm = fmiss.to(tl.int32)
+            rank = carry + tl.cumsum(fm, axis=0) - fm
+            ne = fmiss & (rank >= free_local)
+            idx = j * H + h
+            _put1(ne_ptr + idx, tl.sum(ne.to(tl.int32), axis=0), act)
+            _put1(rec_ptr + idx, tl.sum(valid.to(tl.int32), axis=0), act)
+            carry = carry + tl.where(act, tl.sum(fm, axis=0), 0)
+            e1 = tl.where(act & (tl.max(nres, axis=0) > 1), 1, 0)
+            e2 = tl.where(act & (tl.max(nfly, axis=0) > 1), 2, 0)
+            errb = errb | e1 | e2
+        tl.atomic_or(err_ptr, errb.to(tl.int64))
+
+    # D2 (v3): v2's D2 with table / FREE-list loads, rowsel and sel per block chunk
+    @_jit_dns("_fr3_d2")
+    def _fr3_d2(sel_ptr, kid_ptr, vix_ptr, vhb_ptr, vstart_ptr, vcnt_ptr, vorder_ptr,
+                dix_ptr, dhb_ptr, dtl_ptr, dnt_ptr, dstart_ptr, dcnt_ptr, dorder_ptr,
+                tab_ptr, flist_ptr, pm_ptr, ne_ptr, rec_ptr, bne_ptr, brec_ptr, misc_ptr, usgd_ptr,
+                td_ptr, dpage_ptr, dnpg_ptr, ppage_ptr, pnpg_ptr, drec_ptr, dcnt_out_ptr, cntd_ptr,
+                selw_ptr, rowsel_ptr, err_ptr, stats_ptr, sb_ptr, cis_ptr,
+                H, B, R, K, NBLK, NPOS, C, Rv, Rd, MAXRV, MAXRD, ND, CAPD, S, WB, T, P,
+                BS, ROWS_S, ROWS_C,
+                KP: tl.constexpr, NP: tl.constexpr, PP: tl.constexpr, TP: tl.constexpr, ZP: tl.constexpr,
+                ZC: tl.constexpr, BSP: tl.constexpr, HAS_V: tl.constexpr, BIAS: tl.constexpr,
+                PLANT: tl.constexpr, NSTAT: tl.constexpr):
+        pid = tl.program_id(0)
+        b = pid // H
+        h = pid % H
+        pid64 = pid.to(tl.int64)
+        tb = tab_ptr + pid64 * (7 * ZP)
+        fl = flist_ptr + pid64 * (2 * NP) + NP                                    # D1: FREE slots after V
+        nfree = tl.load(pm_ptr + pid64 * 4 + 2).to(tl.int32)
+        usage = tl.load(usgd_ptr + pid)
+        free_local = tl.maximum(C - usage, 0)
+        budget = tl.load(misc_ptr)                                               # SCAN: X - borrowed - R_ver
+        totrec = tl.load(misc_ptr + 1)
+        start = tl.load(dstart_ptr + b)
+        cnt = tl.load(dcnt_ptr + b)
+        carry_f = tl.sum(tl.zeros([2], tl.int32), axis=0)
+        carry_g = carry_f
+        errb = carry_f
+        kk = tl.arange(0, KP)
+        mk = kk < K
+        cc = tl.arange(0, PP)
+        tt = tl.arange(0, TP)
+        st16 = tl.arange(0, 16)
+        zl = tl.arange(0, ZC // 32)
+        bb = tl.arange(0, BSP)
+        for i in range(0, MAXRD):
+            act, j, tr, kid, s, v0 = _row(dorder_ptr, dix_ptr, dhb_ptr, kid_ptr, sel_ptr, start, cnt, i, Rd, h, R, K,
+                                          NBLK, KP)
+            valid, blk = _sorted_unique(s, v0, K, NBLK, KP)
+            slot, inflight, nres, nfly = _d_state3(tb, blk, ZP, HAS_V)
+            ready = valid & (slot >= 0)
+            infl0 = valid & (ready == 0) & inflight
+            miss = valid & (ready == 0) & (infl0 == 0)
+            seen, seen_k = _seen(dorder_ptr, dix_ptr, dhb_ptr, kid_ptr, sel_ptr, start, cnt, i, Rd, h, R, K, NBLK,
+                                 kid, blk, valid, KP)
+            fmiss = miss & (seen == 0)
+            dup = miss & seen
+            fm = fmiss.to(tl.int32)
+            rank = carry_f + tl.cumsum(fm, axis=0) - fm
+            ne = fmiss & (rank >= free_local)
+            nei = ne.to(tl.int32)
+            idx = j * H + h
+            g = tl.load(bne_ptr + idx) + tl.cumsum(nei, axis=0) - nei
+            granted = fmiss & ((ne == 0) | (g < budget))
+            refused = fmiss & (granted == 0)
+            gi = granted.to(tl.int32)
+            q = carry_g + tl.cumsum(gi, axis=0) - gi
+            if PLANT == 2:
+                qc = tl.minimum(q + 1, NPOS - 1)
+            else:
+                qc = tl.minimum(q, NPOS - 1)
+            fs = tl.where(qc < nfree, tl.load(fl + tl.minimum(tl.maximum(qc, 0), NP - 1)).to(tl.int32), -1)
+            take = tl.where(granted, tl.where(fs >= 0, fs, NPOS), -1)
+            infl = infl0 | dup
+            o = idx * K + kk
+            me = mk & act
+            tl.store(td_ptr + 0 * ND + o, blk.to(tl.int64), mask=me)
+            tl.store(td_ptr + 1 * ND + o, valid.to(tl.int64), mask=me)
+            tl.store(td_ptr + 2 * ND + o, ready.to(tl.int64), mask=me)
+            tl.store(td_ptr + 3 * ND + o, slot.to(tl.int64), mask=me)
+            tl.store(td_ptr + 4 * ND + o, infl.to(tl.int64), mask=me)
+            tl.store(td_ptr + 5 * ND + o, granted.to(tl.int64), mask=me)
+            tl.store(td_ptr + 6 * ND + o, refused.to(tl.int64), mask=me)
+            tl.store(td_ptr + 7 * ND + o, take.to(tl.int64), mask=me)
+            tl.store(td_ptr + 8 * ND + o, valid.to(tl.int64), mask=me)
+            # the page table: the READY blocks in ascending block id (their slots), then the row's tail slots
+            ri_ = ready.to(tl.int32)
+            rp = tl.cumsum(ri_, axis=0) - ri_
+            nready = tl.sum(ri_, axis=0)
+            nvalid = tl.sum(valid.to(tl.int32), axis=0)
+            hist = tl.max(tl.where(ready[None, :] & (rp[None, :] == cc[:, None]), slot[None, :], -1), axis=1)
+            tv = tl.load(dtl_ptr + j * T + tt, mask=tt < T, other=-1)
+            ntr = tl.load(dnt_ptr + j)
+            tcol = cc - nready
+            tailv = tl.max(tl.where((tcol[:, None] == tt[None, :]) & (tt[None, :] < ntr), tv[None, :], -1), axis=1)
+            page = tl.where(cc < nready, hist.to(tl.int64), tl.where((tcol >= 0) & (tcol < ntr), tailv, -1))
+            mp = (cc < P) & act
+            tl.store(dpage_ptr + idx * P + cc, page, mask=mp)
+            tl.store(ppage_ptr + (tr * H + h) * P + cc, page.to(tl.int32), mask=mp)
+            npg = nready + ntr
+            _put1(dnpg_ptr + idx, npg.to(tl.int64), act)
+            _put1(pnpg_ptr + tr * H + h, npg.to(tl.int32), act)
+            # the draft record: every valid entry, compacted in entry order
+            vi = valid.to(tl.int32)
+            rpos = tl.load(brec_ptr + idx) + tl.cumsum(vi, axis=0) - vi
+            wm = valid & act & (rpos < CAPD)
+            hole = valid & ((ready | infl | granted | refused) == 0)
+            flags = (ready.to(tl.int64) * 2 + infl.to(tl.int64) * 4 + granted.to(tl.int64) * 16
+                     + refused.to(tl.int64) * 512 + hole.to(tl.int64) * 256)
+            tl.store(drec_ptr + 0 * CAPD + rpos, o.to(tl.int64), mask=wm)
+            tl.store(drec_ptr + 1 * CAPD + rpos, blk.to(tl.int64), mask=wm)
+            tl.store(drec_ptr + 2 * CAPD + rpos, flags, mask=wm)
+            tl.store(drec_ptr + 3 * CAPD + rpos, slot.to(tl.int64), mask=wm)
+            tl.store(drec_ptr + 4 * CAPD + rpos, take.to(tl.int64), mask=wm)
+            pm_ = me & (o >= totrec) & (o < CAPD)
+            neg = tl.full([KP], -1, tl.int64)
+            for f in tl.static_range(5):
+                tl.store(drec_ptr + f * CAPD + o, neg, mask=pm_)
+            # the counters (masked pairs, refusals) and the REPORT / L34 preconditions
+            nref = tl.sum(refused.to(tl.int64), axis=0)
+            q4 = tl.arange(0, 4)
+            cv = tl.where(q4 == 0, (nready < nvalid).to(tl.int64), tl.where(q4 == 1, nref, 0))
+            tl.atomic_add(cntd_ptr + q4, cv, mask=(q4 < 2) & act)
+            n_sdup = (tl.sum(v0.to(tl.int32), axis=0) - nvalid).to(tl.int64)
+            sv = tl.where(st16 == 3, tl.sum(gi.to(tl.int64), axis=0), tl.where(st16 == 4, nref, tl.where(
+                st16 == 9, tl.sum(dup.to(tl.int64), axis=0), tl.where(st16 == 10, n_sdup, 0))))
+            tl.atomic_add(stats_ptr + st16, sv, mask=(st16 < NSTAT) & act)
+            # the bias rows of the granted takes (as v2's D2)
+            if BIAS != 0:
+                gm = (granted & act & (take >= 0) & (take < NPOS))[:, None] & (bb[None, :] < BS)
+                b64 = b.to(tl.int64)
+                src = cis_ptr + ((b64 * ROWS_C + blk[:, None].to(tl.int64) * BS + bb[None, :]) * H + h)
+                dst = sb_ptr + ((b64 * ROWS_S + tl.maximum(take, 0)[:, None].to(tl.int64) * BS + bb[None, :]) * H
+                                + h)
+                x = tl.load(src, mask=gm, other=0)
+                if BIAS == 2:
+                    x = x.to(sb_ptr.dtype.element_ty)
+                tl.store(dst, x, mask=gm)
+            e1 = tl.where(act & (tl.max(nres, axis=0) > 1), 1, 0)
+            e2 = tl.where(act & (tl.max(nfly, axis=0) > 1), 2, 0)
+            e4 = tl.where(act & (tl.max((granted & (fs < 0)).to(tl.int32), axis=0) > 0), 4, 0)
+            e16 = tl.where(act & ((tl.sum(nei, axis=0) != tl.load(ne_ptr + idx))
+                                  | (nvalid != tl.load(rec_ptr + idx))), 16, 0)            # m5: D1 == D2
+            errb = errb | e1 | e2 | e4 | e16
+            for z0 in range(0, ZP, ZC):
+                zw = z0 // 32 + zl
+                tl.store(rowsel_ptr + (tr * H + h) * WB + zw, _pack(_selbits_at(s, v0, z0, ZC), ZC),
+                         mask=(zw < WB) & act)
+            carry_f = carry_f + tl.where(act, tl.sum(fm, axis=0), 0)
+            carry_g = carry_g + tl.where(act, tl.sum(gi, axis=0), 0)
+        # the stream's selection union (sel): the draft rows and, with verify rows, theirs too; per block chunk
+        if HAS_V:
+            vstart = tl.load(vstart_ptr + b)
+            vcnt = tl.load(vcnt_ptr + b)
+        for z0 in range(0, ZP, ZC):
+            selu = tl.zeros([ZC], tl.int32) != 0
+            for i in range(0, MAXRD):
+                act, j, tr, kid, s, v0 = _row(dorder_ptr, dix_ptr, dhb_ptr, kid_ptr, sel_ptr, start, cnt, i, Rd, h,
+                                              R, K, NBLK, KP)
+                selu = selu | (_selbits_at(s, v0, z0, ZC) & act)
+            if HAS_V:
+                for i in range(0, MAXRV):
+                    act, j, tr, kid, s, v0 = _row(vorder_ptr, vix_ptr, vhb_ptr, kid_ptr, sel_ptr, vstart, vcnt, i,
+                                                  Rv, h, R, K, NBLK, KP)
+                    selu = selu | (_selbits_at(s, v0, z0, ZC) & act)
+            zw = z0 // 32 + zl
+            tl.store(selw_ptr + pid * WB + zw, _pack(selu, ZC), mask=zw < WB)
+        _put1(dcnt_out_ptr, totrec.to(tl.int64), pid == 0)
+        tl.atomic_or(err_ptr, errb.to(tl.int64))
+
 
 def _launch(kernel, grid, *args, **kw):
     """Every launch of this module goes through here (tests count them)."""
@@ -884,11 +1612,15 @@ class FusedResolver:
     plant: a NEGATIVE CONTROL (PLANTS), tests only."""
 
     def __init__(self, svc, check: bool = False, plant: int = 0, num_warps: int = 8, guard: bool = False,
-                 warm: str = "auto"):
+                 warm: str = "auto", kernel: str = None):
         if triton is None:
             raise RuntimeError("resolve='fused' needs triton (not installed)")
         if warm not in WARM_MODES:
             raise ValueError("fused warm %r (one of %s)" % (warm, WARM_MODES))
+        kernel = DEFAULT_KERNEL if kernel is None else kernel          # [fr3] the module's default, read now
+        if kernel not in KERNELS:
+            raise ValueError("fused kernel %r (one of %s)" % (kernel, KERNELS))
+        self.kernel = kernel
         # [stack2] warm: compile every variant of a selection width before its first decision (warm_up). auto = on
         # for a CUDA service; the interpreter (CPU) compiles nothing, so auto is off there and the launch counts of
         # the CPU tests stay as they were (FR13 runs warm 'on' in the interpreter)
@@ -908,8 +1640,9 @@ class FusedResolver:
         # (verify takes, then draft takes, per layer; the same release per tick); _compare compares the lane maps and
         # fills the reference bias rows on the SHADOW lanes, so a fused-only bind fault shows as a difference
         self.xp_ref = self.xp.clone() if (self.xp is not None and check) else None
-        if plant not in PLANTS:
-            raise ValueError("fused plant %r (one of %s)" % (plant, sorted(PLANTS)))
+        plants = {**PLANTS, **PLANTS3} if kernel == "v3" else PLANTS   # [fr3] plant 3 exists in v3 only
+        if plant not in plants:
+            raise ValueError("fused plant %r (one of %s)" % (plant, sorted(plants)))
         if getattr(svc, "record_cap", None) is not None:
             raise ValueError("resolve='fused' writes every record (record_cap must be None)")
         if getattr(svc, "pin_records", True):
@@ -987,12 +1720,22 @@ class FusedResolver:
             raise ValueError("S-C: layer %d resolved twice in one tick (its decisions are applied at end_tick)" % l)
         if sel.device.type != svc.device.type:
             raise ValueError("S-C: the selection must be on the service's device %s (got %s)" % (svc.device, sel.device))
-        svc._check_rows(l, rows, sel)
+        lean = self._lean_on()                                        # [flean] --res-lean: the lean host checks
+        same = False
+        if lean:                                                      # ResidencySC._resolve_lean's order: a later
+            same = bool(svc._tick) and svc._lean_same_rows(rows)      # layer with the tick's rows runs the per-layer
+            if not same or not svc._lean_rows_ok(l, rows, sel):       # guards; else (and at the first layer) the
+                svc._check_rows(l, rows, sel)                         # reference checks (the same exception)
+        else:
+            svc._check_rows(l, rows, sel)
         if svc.want_keys and not svc._tick:                           # [integ] S-C's [sharedkv2] hook, kept (host
             svc._check_tail_keys(rows)                                # rows only, once per tick)
         if not svc._tick:                                             # the tick's first layer: the per-tick copies
             svc.sync_mirror()
             svc._rows = svc._tick_rows(rows)
+            if lean:                                                  # [flean] the tick's lean constants and the rows'
+                svc._lean_c.new_tick()                                # snapshot (_lean_same_rows / _lean_rows_ok)
+                svc._lean_snap(rows)
             if self.xp is not None:                                   # [integ][xpool] S-C's unbind, same place and
                 if not svc.DECISION_READ_BLOCKING:                    # the same blocking-read precondition
                     raise OwnershipViolation("xpool: lanes are reused across requests only behind a blocking decision "
@@ -1002,10 +1745,10 @@ class FusedResolver:
                     self.xp_ref.release_free(svc.dmirror.code)
         elif svc._dirty:
             raise OwnershipViolation("S-C: the host state changed in the middle of a tick (the device mirror is stale)")
-        elif svc._row_sig(rows) != svc._rows["sig"]:
+        elif not same and svc._row_sig(rows) != svc._rows["sig"]:     # [flean] same: the sig is equal (_lean_same_rows)
             raise ValueError("S-C: every layer of a tick resolves the same rows (layer %d differs)" % l)
         tk = svc._rows
-        plan = svc._new_plan(rows)
+        plan = svc._lean_plan(rows) if lean else svc._new_plan(rows)  # [flean] _new_plan's value, C-level work
         fz = tk.get("fz")
         if fz is None:
             fz = tk["fz"] = self._tick_setup(rows, tk)
@@ -1073,11 +1816,15 @@ class FusedResolver:
         def scan_bufs(n, p):
             return dict(ne=b32((n,), p + "ne"), rec=b32((n,), p + "rec"), bne=b32((n,), p + "bne"),
                         brec=b32((n,), p + "brec"), misc=b32((4,), p + "misc"))
-        return dict(vstart=parts[0], vcnt=parts[1], vorder=parts[2], dstart=parts[3], dcnt=parts[4],
-                    dorder=parts[5], maxrv=mv, maxrd=md, Rv=Rv, Rd=Rd, v=v, d=dd, kid=kid,
-                    sv=scan_bufs(max(Rv * H, 1), "v."), sd=scan_bufs(max(Rd * H, 1), "d."),
-                    usg=b32((S,), "usg"), usg2=b32((S,), "usg2"), usgd=b32((S,), "usgd"),
-                    post=b32((4, S, NP), "post"), NP=NP, bh={})
+        out = dict(vstart=parts[0], vcnt=parts[1], vorder=parts[2], dstart=parts[3], dcnt=parts[4],
+                   dorder=parts[5], maxrv=mv, maxrd=md, Rv=Rv, Rd=Rd, v=v, d=dd, kid=kid,
+                   sv=scan_bufs(max(Rv * H, 1), "v."), sd=scan_bufs(max(Rd * H, 1), "d."),
+                   usg=b32((S,), "usg"), usg2=b32((S,), "usg2"), usgd=b32((S,), "usgd"),
+                   post=b32((4, S, NP), "post"), NP=NP, bh={})
+        if self.kernel == "v3":                             # [fr3] the per-stream block tables, FREE lists, counts
+            ZP = max(_pow2(svc.nblk), 64)
+            out.update(tab=b32((S, 7, ZP), "fr3.tab"), flist=b32((S, 2, NP), "fr3.flist"), pm=b32((S, 4), "fr3.pm"))
+        return out
 
     def _bh(self, fz, k):
         """(b, h) of every verify entry (K3X order; VerifyDecision.bh, read by S-C's device wait), per selection width
@@ -1102,6 +1849,26 @@ class FusedResolver:
             bb = fz["d"][0].view(Rd, 1, 1).expand(Rd, H, k).reshape(-1)
             hh = torch.arange(H, device=svc.device).view(1, H, 1).expand(Rd, H, k).reshape(-1)
             out = fz["bh"][key] = (bb, hh)
+        return out
+
+    # ----------------------------------------------------------------------------------------------- [flean]
+    def _lean_on(self):
+        """[flean] True iff the service runs --res-lean (OwnResidency(res_lean=True) -> enable_res_lean, after this
+        resolver is built: so it is read at each call). Then resolve uses the lean host checks (_lean_same_rows,
+        _lean_rows_ok, _lean_plan, once-per-tick LeanConsts), and _layer binds with XPool.bind_lean and fills the bias
+        rows with draft_bias_fill_flat_lean (with --res-dev, LeanConsts.dev selects r2_resdev's ops inside them). The
+        kernels, the decisions and the check mode's reference (torch_reference, the shadow pool's XPool.bind and
+        draft_bias_fill_flat) do not change. False (the default): every call as before."""
+        return bool(getattr(self.svc, "res_lean", False))
+
+    def _xbase(self, fz, kind, k):
+        """[flean] bind_lean's base (bb * H + hh) * n_hist of the verify ("v") or draft ("d") entries (K3X order), per
+        selection width k (device ops, once per tick and width; the value bind_lean computes itself without it)."""
+        key = ("xb", kind, k)
+        out = fz["bh"].get(key)
+        if out is None:
+            bb, hh = self._bh(fz, k) if kind == "v" else self._bhd(fz, k)
+            out = fz["bh"][key] = (bb * self.svc.H + hh) * self.xp.n_hist
         return out
 
     # ----------------------------------------------------------------------------------------------- one layer
@@ -1151,6 +1918,16 @@ class FusedResolver:
         ref = torch_reference(svc, l, tk, sel) if self.check else None     # check mode: before any launch
         where = (svc.tick_no, l)
         sv, sd = fz["sv"], fz["sd"]
+        v3 = self.kernel == "v3"                                      # [fr3] module docstring, V3
+        CH = fr3_chunk(KP, NP)
+        if v3:                                                        # PREP: tables, FREE list, keys, V2's scratch
+            self._go(where, "_fr3_prep", _fr3_prep, (S,), dm.code[l], dm.block[l], dm.cur[l], dm.prot[l],
+                     dm.stamp[l], sel, kid, vix, vhb, fz["vstart"], fz["vcnt"], fz["vorder"], dix, dhb, fz["dstart"],
+                     fz["dcnt"], fz["dorder"], fz["tab"], fz["flist"], fz["pm"], fz["post"], fz["usg"], self.err,
+                     H, R, k, NBLK, NPOS, max(Rv, 1), max(Rd, 1), fz["maxrv"], fz["maxrd"], S,
+                     KP=KP, NP=NP, ZP=ZP, CH=CH, ZC=FR3_ZC, TC=FR3_TC, HAS_V=Rv > 0, PE_INFL=self.pe_inflight,
+                     SMUL=1 << SB, CMUL=1 << (STAMP_BITS + SB), num_warps=nw)
+            self.launches += 1
         if Rv:
             tv = b64((len(FIELDS_V), nv), "v.t")
             vpage = b64((Rv, H, P), "v.page")
@@ -1161,28 +1938,47 @@ class FusedResolver:
             cntv = b64((1,), "v.counters")
             vlook = b64((Rv, 4), "vlook")
             vread = b64((B, H, WP), "vread")
-            self._go(where, "_fr_v1", _fr_v1, (S,), *tabs, sel, kid, vix, vhb, fz["vstart"], fz["vcnt"],
-                     fz["vorder"], sv["ne"], sv["rec"], fz["usg"], self.err, cntv, vlook,
-                     H, R, k, NBLK, NPOS, svc.C, Rv, fz["maxrv"], Rv * 4,
-                     KP=KP, NP=NP, LZ=LOOK_LANES, num_warps=nw)          # [stack2] a constant
+            if v3:
+                self._go(where, "_fr3_v1", _fr3_v1, (S,), sel, kid, vix, vhb, fz["vstart"], fz["vcnt"], fz["vorder"],
+                         fz["tab"], sv["ne"], sv["rec"], fz["usg"], self.err, cntv, vlook,
+                         H, R, k, NBLK, svc.C, Rv, fz["maxrv"], Rv * 4, KP=KP, ZP=ZP, LZ=LOOK_LANES, num_warps=nw)
+            else:
+                self._go(where, "_fr_v1", _fr_v1, (S,), *tabs, sel, kid, vix, vhb, fz["vstart"], fz["vcnt"],
+                         fz["vorder"], sv["ne"], sv["rec"], fz["usg"], self.err, cntv, vlook,
+                         H, R, k, NBLK, NPOS, svc.C, Rv, fz["maxrv"], Rv * 4,
+                         KP=KP, NP=NP, LZ=LOOK_LANES, num_warps=nw)          # [stack2] a constant
             self._go(where, "_fr_scan.v", _fr_scan, (1,), sv["ne"], sv["rec"], fz["usg"], sv["bne"], sv["brec"],
                      sv["misc"], Rv * H, S, svc.C, svc.X, 0, BLOCK=SCAN_BLOCK,              # [stack2] a constant
                      num_warps=4)
-            self._go(where, "_fr_v2", _fr_v2, (S,), *tabs, sel, kid, vix, vhb, vtl, vnt, fz["vstart"], fz["vcnt"], fz["vorder"],
-                    dix, dhb, fz["dstart"], fz["dcnt"], fz["dorder"],
-                    sv["ne"], sv["rec"], sv["bne"], sv["brec"], sv["misc"],
-                    tv, vpage, vnpg, page, npg, ids, vrec, vcnt, cntv, vlook, vread, fz["post"], fz["usg2"], selw,
-                    rowsel, self.err, self.stats,
-                    H, B, R, k, NBLK, NPOS, svc.C, svc.X, Rv, max(Rd, 1), fz["maxrv"], fz["maxrd"], nv, caps[0],
-                    S, WB, WP, N_TAIL, P,
-                    KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, PE_INFL=self.pe_inflight,
-                    LAST=Rd == 0, PLANT=self.plant, NSTAT=len(STATS), SMUL=1 << SB,
-                    CMUL=1 << (STAMP_BITS + SB), SMASK=(1 << SB) - 1, num_warps=nw)
+            if v3:
+                self._go(where, "_fr3_v2", _fr3_v2, (S,), dm.code[l], dm.block[l], dm.gen[l], dm.cur[l], sel, kid,
+                         vix, vhb, vtl, vnt, fz["vstart"], fz["vcnt"], fz["vorder"],
+                         fz["tab"], fz["flist"], fz["pm"], sv["ne"], sv["rec"], sv["bne"], sv["brec"], sv["misc"],
+                         fz["usg"], tv, vpage, vnpg, page, npg, ids, vrec, vcnt, cntv, vlook, vread, fz["post"],
+                         fz["usg2"], selw, rowsel, self.err, self.stats,
+                         H, B, R, k, NBLK, NPOS, svc.C, Rv, fz["maxrv"], nv, caps[0], S, WB, WP, N_TAIL, P,
+                         KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, CH=CH, ZC=FR3_ZC, LAST=Rd == 0, PLANT=self.plant,
+                         NSTAT=len(STATS), CMUL=1 << (STAMP_BITS + SB), SMASK=(1 << SB) - 1, num_warps=nw)
+            else:
+                self._go(where, "_fr_v2", _fr_v2, (S,), *tabs, sel, kid, vix, vhb, vtl, vnt, fz["vstart"], fz["vcnt"],
+                         fz["vorder"], dix, dhb, fz["dstart"], fz["dcnt"], fz["dorder"],
+                         sv["ne"], sv["rec"], sv["bne"], sv["brec"], sv["misc"],
+                         tv, vpage, vnpg, page, npg, ids, vrec, vcnt, cntv, vlook, vread, fz["post"], fz["usg2"], selw,
+                         rowsel, self.err, self.stats,
+                         H, B, R, k, NBLK, NPOS, svc.C, svc.X, Rv, max(Rd, 1), fz["maxrv"], fz["maxrd"], nv, caps[0],
+                         S, WB, WP, N_TAIL, P,
+                         KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, PE_INFL=self.pe_inflight,
+                         LAST=Rd == 0, PLANT=self.plant, NSTAT=len(STATS), SMUL=1 << SB,
+                         CMUL=1 << (STAMP_BITS + SB), SMASK=(1 << SB) - 1, num_warps=nw)
             self.launches += 3
             vdec = VerifyDecision(Rv, H, k, {f: tv[i] for i, f in enumerate(FIELDS_V)}, vpage, vnpg, ids,
                                   self._bh(fz, k), cntv)
             rec.update(vrec=vrec, vcnt=vcnt, vlook=vlook, vread=vread)
-            if self.xp is not None:                                   # [integ][xpool] recipe (2): the takes' lanes,
+            if self.xp is not None and self._lean_on():               # [flean] the same binds, bind_lean (no hidden
+                self.xp.bind_lean(l, vdec.bh[0], vdec.bh[1], vdec.t["take_slot"],   # sync; --res-dev: r2_resdev's
+                                  vdec.t["granted"] | vdec.t["evict"], svc._lean_c,   # ops, cst.dev)
+                                  base=self._xbase(fz, "v", k))
+            elif self.xp is not None:                                 # [integ][xpool] recipe (2): the takes' lanes,
                 self.xp.bind(l, vdec.bh[0], vdec.bh[1], vdec.t["take_slot"],   # before the wait and the gather
                              (vdec.t["granted"] | vdec.t["evict"]) != 0)
             if ref is None:
@@ -1204,25 +2000,49 @@ class FusedResolver:
                 sb_before = svc.store_b[l].clone()                    # rows go through draft_bias_fill_flat
             if bias == 2:
                 self.bias_casts += 1                                  # m9: the cast in the kernel (counted)
-            self._go(where, "_fr_d1", _fr_d1, (S,), *tabs, sel, kid, dix, dhb, fz["dstart"], fz["dcnt"],
-                     fz["dorder"], fz["post"], fz["usg2"], sd["ne"], sd["rec"], fz["usgd"], self.err, cntd4,
-                     H, R, k, NBLK, NPOS, svc.C, Rd, fz["maxrd"], S, Rd * H,
-                     KP=KP, NP=NP, HAS_V=Rv > 0, num_warps=nw)
+            if v3:
+                self._go(where, "_fr3_d1", _fr3_d1, (S,), dm.code[l], sel, kid, dix, dhb, fz["dstart"], fz["dcnt"],
+                         fz["dorder"], fz["tab"], fz["flist"], fz["pm"], fz["post"], fz["usg"], fz["usg2"], sd["ne"],
+                         sd["rec"], fz["usgd"], self.err, cntd4, H, R, k, NBLK, NPOS, svc.C, Rd, fz["maxrd"], S,
+                         Rd * H, KP=KP, NP=NP, ZP=ZP, CH=CH, HAS_V=Rv > 0, num_warps=nw)
+            else:
+                self._go(where, "_fr_d1", _fr_d1, (S,), *tabs, sel, kid, dix, dhb, fz["dstart"], fz["dcnt"],
+                         fz["dorder"], fz["post"], fz["usg2"], sd["ne"], sd["rec"], fz["usgd"], self.err, cntd4,
+                         H, R, k, NBLK, NPOS, svc.C, Rd, fz["maxrd"], S, Rd * H,
+                         KP=KP, NP=NP, HAS_V=Rv > 0, num_warps=nw)
             self._go(where, "_fr_scan.d", _fr_scan, (1,), sd["ne"], sd["rec"], fz["usgd"], sd["bne"], sd["brec"],
                      sd["misc"], Rd * H, S, svc.C, svc.X, svc.R_ver,
                      BLOCK=SCAN_BLOCK, num_warps=4)                                    # [stack2] a constant
-            self._go(where, "_fr_d2", _fr_d2, (S,), *tabs, sel, kid, vix, vhb, fz["vstart"], fz["vcnt"],
-                     fz["vorder"], dix, dhb, dtl, dnt, fz["dstart"], fz["dcnt"], fz["dorder"],
-                     fz["post"], sd["ne"], sd["rec"], sd["bne"], sd["brec"], sd["misc"], fz["usgd"],
-                     td, dpage, dnpg, page, npg, drec, dcnt, cntd4, selw, rowsel, self.err, self.stats, sb, cis,
-                     H, B, R, k, NBLK, NPOS, svc.C, max(Rv, 1), Rd, fz["maxrv"], fz["maxrd"], nd,
-                     caps[1], S, WB, N_TAIL, P, svc.bs, rows_s, rows_c,
-                     KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, BSP=max(_pow2(svc.bs), 2), HAS_V=Rv > 0,
-                     BIAS=bias, PLANT=self.plant, NSTAT=len(STATS), num_warps=nw)
+            if v3:
+                self._go(where, "_fr3_d2", _fr3_d2, (S,), sel, kid, vix, vhb, fz["vstart"], fz["vcnt"], fz["vorder"],
+                         dix, dhb, dtl, dnt, fz["dstart"], fz["dcnt"], fz["dorder"],
+                         fz["tab"], fz["flist"], fz["pm"], sd["ne"], sd["rec"], sd["bne"], sd["brec"], sd["misc"],
+                         fz["usgd"], td, dpage, dnpg, page, npg, drec, dcnt, cntd4, selw, rowsel, self.err,
+                         self.stats, sb, cis,
+                         H, B, R, k, NBLK, NPOS, svc.C, max(Rv, 1), Rd, fz["maxrv"], fz["maxrd"], nd,
+                         caps[1], S, WB, N_TAIL, P, svc.bs, rows_s, rows_c,
+                         KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, ZC=FR3_ZC, BSP=max(_pow2(svc.bs), 2), HAS_V=Rv > 0,
+                         BIAS=bias, PLANT=self.plant, NSTAT=len(STATS), num_warps=nw)
+            else:
+                self._go(where, "_fr_d2", _fr_d2, (S,), *tabs, sel, kid, vix, vhb, fz["vstart"], fz["vcnt"],
+                         fz["vorder"], dix, dhb, dtl, dnt, fz["dstart"], fz["dcnt"], fz["dorder"],
+                         fz["post"], sd["ne"], sd["rec"], sd["bne"], sd["brec"], sd["misc"], fz["usgd"],
+                         td, dpage, dnpg, page, npg, drec, dcnt, cntd4, selw, rowsel, self.err, self.stats, sb, cis,
+                         H, B, R, k, NBLK, NPOS, svc.C, max(Rv, 1), Rd, fz["maxrv"], fz["maxrd"], nd,
+                         caps[1], S, WB, N_TAIL, P, svc.bs, rows_s, rows_c,
+                         KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, BSP=max(_pow2(svc.bs), 2), HAS_V=Rv > 0,
+                         BIAS=bias, PLANT=self.plant, NSTAT=len(STATS), num_warps=nw)
             self.launches += 3
             ddec = DraftDecision(Rd, H, k, {f: td[i] for i, f in enumerate(FIELDS)}, dpage, dnpg, cntd4[:3])
             rec.update(drec=drec, dcnt=dcnt)
-            if self.xp is not None:                                   # [integ][xpool] recipe (3): the draft takes'
+            if self.xp is not None and self._lean_on():               # [flean] the same binds and bias rows, lean
+                bbd, hhd = self._bhd(fz, k)
+                self.xp.bind_lean(l, bbd, hhd, ddec.t["take_slot"], ddec.t["granted"], svc._lean_c,
+                                  base=self._xbase(fz, "d", k))
+                if flat_bias:
+                    XP.draft_bias_fill_flat_lean(self.xp, l, svc.store_b[l], svc.cis[l], ddec, bbd, hhd, svc.bs,
+                                                 svc._lean_c)
+            elif self.xp is not None:                                 # [integ][xpool] recipe (3): the draft takes'
                 bbd, hhd = self._bhd(fz, k)                           # lanes, then their bias rows on the lanes
                 self.xp.bind(l, bbd, hhd, ddec.t["take_slot"], ddec.t["granted"] != 0)
                 if flat_bias:
@@ -1303,31 +2123,67 @@ class FusedResolver:
         td, dpage, dnpg, drec, dcnt, cntd4 = z(len(FIELDS), 1), z(1, H, P), z(1, H), z(len(DREC), 1), z(1), z(4)
         _warm_depth[0] += 1
         try:
-            _launch(_fr_v1, (S,), *tabs, sel, kid, rowv[4], rowv[1], *cnts, ne, rec, usg, err, cntv, vlook,
-                    H, R, k, NBLK, NPOS, svc.C, 1, 0, 0, KP=KP, NP=NP, LZ=LOOK_LANES, num_warps=nw)
-            _launch(_fr_scan, (1,), ne, rec, usg, bne, brec, misc, 0, S, svc.C, svc.X, 0, BLOCK=SCAN_BLOCK,
-                    num_warps=4)
-            self.warm_launches += 2
-            for last in (True, False):
-                _launch(_fr_v2, (S,), *tabs, sel, kid, rowv[4], rowv[1], rowv[2], rowv[3], *cnts,
-                        rowv[4], rowv[1], *cnts, ne, rec, bne, brec, misc,
-                        tv, vpage, vnpg, page, npg, ids, vrec, vcnt, cntv, vlook, vread, post, usg2, selw,
-                        rowsel, err, stats,
-                        H, B, R, k, NBLK, NPOS, svc.C, svc.X, 1, 1, 0, 0, 1, 1, S, WB, WP, N_TAIL, P,
-                        KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, PE_INFL=self.pe_inflight, LAST=last, PLANT=self.plant,
-                        NSTAT=len(STATS), SMUL=1 << SB, CMUL=1 << (STAMP_BITS + SB), SMASK=(1 << SB) - 1,
-                        num_warps=nw)
-                self.warm_launches += 1
-            for has_v in (True, False):
-                _launch(_fr_d1, (S,), *tabs, sel, kid, rowv[4], rowv[1], *cnts, post, usg2, ne, rec, usgd, err,
-                        cntd4, H, R, k, NBLK, NPOS, svc.C, 1, 0, S, 0, KP=KP, NP=NP, HAS_V=has_v, num_warps=nw)
-                _launch(_fr_d2, (S,), *tabs, sel, kid, rowv[4], rowv[1], *cnts, rowv[4], rowv[1], rowv[2], rowv[3],
-                        *cnts, post, ne, rec, bne, brec, misc, usgd,
-                        td, dpage, dnpg, page, npg, drec, dcnt, cntd4, selw, rowsel, err, stats, sb, cis,
-                        H, B, R, k, NBLK, NPOS, svc.C, 1, 1, 0, 0, 1, 1, S, WB, N_TAIL, P, svc.bs, rows_s, rows_c,
-                        KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, BSP=max(_pow2(svc.bs), 2), HAS_V=has_v, BIAS=bias,
-                        PLANT=self.plant, NSTAT=len(STATS), num_warps=nw)
+            if self.kernel == "v3":                                   # [fr3] the v3 variants: PREP (HAS_V both), V1,
+                CH = fr3_chunk(KP, NP)                                # SCAN, V2 (LAST both), D1 / D2 (HAS_V both)
+                tab, flist, pm = z(S, 7, ZP), z(S, 2, NP), z(S, 4)
+                for has_v in (True, False):
+                    _launch(_fr3_prep, (S,), dm.code[l], dm.block[l], dm.cur[l], dm.prot[l], dm.stamp[l], sel, kid,
+                            rowv[4], rowv[1], *cnts, rowv[4], rowv[1], *cnts, tab, flist, pm, post, usg, err,
+                            H, R, k, NBLK, NPOS, 1, 1, 0, 0, S,
+                            KP=KP, NP=NP, ZP=ZP, CH=CH, ZC=FR3_ZC, TC=FR3_TC, HAS_V=has_v, PE_INFL=self.pe_inflight,
+                            SMUL=1 << SB, CMUL=1 << (STAMP_BITS + SB), num_warps=nw)
+                    self.warm_launches += 1
+                _launch(_fr3_v1, (S,), sel, kid, rowv[4], rowv[1], *cnts, tab, ne, rec, usg, err, cntv, vlook,
+                        H, R, k, NBLK, svc.C, 1, 0, 0, KP=KP, ZP=ZP, LZ=LOOK_LANES, num_warps=nw)
+                _launch(_fr_scan, (1,), ne, rec, usg, bne, brec, misc, 0, S, svc.C, svc.X, 0, BLOCK=SCAN_BLOCK,
+                        num_warps=4)
                 self.warm_launches += 2
+                for last in (True, False):
+                    _launch(_fr3_v2, (S,), dm.code[l], dm.block[l], dm.gen[l], dm.cur[l], sel, kid,
+                            rowv[4], rowv[1], rowv[2], rowv[3], *cnts, tab, flist, pm, ne, rec, bne, brec, misc, usg,
+                            tv, vpage, vnpg, page, npg, ids, vrec, vcnt, cntv, vlook, vread, post, usg2, selw,
+                            rowsel, err, stats,
+                            H, B, R, k, NBLK, NPOS, svc.C, 1, 0, 1, 1, S, WB, WP, N_TAIL, P,
+                            KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, CH=CH, ZC=FR3_ZC, LAST=last, PLANT=self.plant,
+                            NSTAT=len(STATS), CMUL=1 << (STAMP_BITS + SB), SMASK=(1 << SB) - 1, num_warps=nw)
+                    self.warm_launches += 1
+                for has_v in (True, False):
+                    _launch(_fr3_d1, (S,), dm.code[l], sel, kid, rowv[4], rowv[1], *cnts, tab, flist, pm, post, usg,
+                            usg2, ne, rec, usgd, err, cntd4, H, R, k, NBLK, NPOS, svc.C, 1, 0, S, 0,
+                            KP=KP, NP=NP, ZP=ZP, CH=CH, HAS_V=has_v, num_warps=nw)
+                    _launch(_fr3_d2, (S,), sel, kid, rowv[4], rowv[1], *cnts, rowv[4], rowv[1], rowv[2], rowv[3],
+                            *cnts, tab, flist, pm, ne, rec, bne, brec, misc, usgd,
+                            td, dpage, dnpg, page, npg, drec, dcnt, cntd4, selw, rowsel, err, stats, sb, cis,
+                            H, B, R, k, NBLK, NPOS, svc.C, 1, 1, 0, 0, 1, 1, S, WB, N_TAIL, P, svc.bs, rows_s,
+                            rows_c, KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, ZC=FR3_ZC, BSP=max(_pow2(svc.bs), 2),
+                            HAS_V=has_v, BIAS=bias, PLANT=self.plant, NSTAT=len(STATS), num_warps=nw)
+                    self.warm_launches += 2
+            else:
+                _launch(_fr_v1, (S,), *tabs, sel, kid, rowv[4], rowv[1], *cnts, ne, rec, usg, err, cntv, vlook,
+                        H, R, k, NBLK, NPOS, svc.C, 1, 0, 0, KP=KP, NP=NP, LZ=LOOK_LANES, num_warps=nw)
+                _launch(_fr_scan, (1,), ne, rec, usg, bne, brec, misc, 0, S, svc.C, svc.X, 0, BLOCK=SCAN_BLOCK,
+                        num_warps=4)
+                self.warm_launches += 2
+                for last in (True, False):
+                    _launch(_fr_v2, (S,), *tabs, sel, kid, rowv[4], rowv[1], rowv[2], rowv[3], *cnts,
+                            rowv[4], rowv[1], *cnts, ne, rec, bne, brec, misc,
+                            tv, vpage, vnpg, page, npg, ids, vrec, vcnt, cntv, vlook, vread, post, usg2, selw,
+                            rowsel, err, stats,
+                            H, B, R, k, NBLK, NPOS, svc.C, svc.X, 1, 1, 0, 0, 1, 1, S, WB, WP, N_TAIL, P,
+                            KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, PE_INFL=self.pe_inflight, LAST=last, PLANT=self.plant,
+                            NSTAT=len(STATS), SMUL=1 << SB, CMUL=1 << (STAMP_BITS + SB), SMASK=(1 << SB) - 1,
+                            num_warps=nw)
+                    self.warm_launches += 1
+                for has_v in (True, False):
+                    _launch(_fr_d1, (S,), *tabs, sel, kid, rowv[4], rowv[1], *cnts, post, usg2, ne, rec, usgd, err,
+                            cntd4, H, R, k, NBLK, NPOS, svc.C, 1, 0, S, 0, KP=KP, NP=NP, HAS_V=has_v, num_warps=nw)
+                    _launch(_fr_d2, (S,), *tabs, sel, kid, rowv[4], rowv[1], *cnts, rowv[4], rowv[1], rowv[2],
+                            rowv[3], *cnts, post, ne, rec, bne, brec, misc, usgd,
+                            td, dpage, dnpg, page, npg, drec, dcnt, cntd4, selw, rowsel, err, stats, sb, cis,
+                            H, B, R, k, NBLK, NPOS, svc.C, 1, 1, 0, 0, 1, 1, S, WB, N_TAIL, P, svc.bs, rows_s, rows_c,
+                            KP=KP, NP=NP, PP=PP, TP=TP, ZP=ZP, BSP=max(_pow2(svc.bs), 2), HAS_V=has_v, BIAS=bias,
+                            PLANT=self.plant, NSTAT=len(STATS), num_warps=nw)
+                    self.warm_launches += 2
         finally:
             _warm_depth[0] -= 1
         if mem0 is not None:                                         # [oomfix] free before - free after = the warm
@@ -1425,7 +2281,8 @@ class FusedResolver:
             for name, v in zip(STATS, st):
                 if v > 0 and name not in first_eff:
                     first_eff[name] = [t, l]
-        return dict(mode="check" if self.check else "fused", plant=self.plant, launches=self.launches,
+        return dict(mode="check" if self.check else "fused", kernel=self.kernel, plant=self.plant,   # [fr3] kernel
+                    launches=self.launches,
                     layers=self.layers, launches_per_layer=self.launches / max(1, self.layers),
                     bias_casts=self.bias_casts, sel_conversions=self.sel_conversions,
                     max_rows_per_b=list(self.max_rows_per_b), compared=self.compared, diffs=len(self.diffs),
@@ -1444,7 +2301,8 @@ def compiled_variants():
     out = {}
     if triton is None:
         return out
-    for name in ("_fr_v1", "_fr_v2", "_fr_d1", "_fr_d2", "_fr_scan"):
+    for name in ("_fr_v1", "_fr_v2", "_fr_d1", "_fr_d2", "_fr_scan",
+                 "_fr3_prep", "_fr3_v1", "_fr3_v2", "_fr3_d1", "_fr3_d2"):                  # [fr3]
         try:
             cache = globals()[name].cache
             out[name] = sum(len(v) for v in cache.values())
