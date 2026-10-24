@@ -427,7 +427,7 @@ def test_AC9a_the_cells_static():
     assert "|evalfast2ia|evalacc216m|evalacc216|" in text              # [f3lia] the merged cells around it
     assert "        evalacc216m|evalacc216) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     blk = text[text.index("    evalacc216m|evalacc216) MODES="):]
-    blk = blk[:blk.index("\nesac\n")]
+    blk = blk[:blk.index(" ;;\n", blk.index("EVALARG=(")) + 3]           # [f3all] this cell only (cells follow)
     for w in ("MODES=fast,bi_c_strict", "BACKENDS=b2", "PC=96 ; PX=1512 ; PRV=1464", "BATCH=216", "MEMG=240G",
               "VARIANTS=fused/batched", "NOSI=$NOSI_EVAL", 'if [ "$CELL" = evalacc216m ]; then STEPS=8',
               'LINKARG=(--link-record "$OUTROOT/sg5_${RUN}_${JOB}_evalfast2rd/summary.json")',

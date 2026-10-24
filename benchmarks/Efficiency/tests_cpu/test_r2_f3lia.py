@@ -344,7 +344,8 @@ def test_F3E_the_flags_parse_together_and_reach_OwnResidency():
 def test_F3F_the_static_gate_lists_hold_both_sides():
     G = HF._sg5()
     op = inspect.getsource(G.one_point)
-    assert sorted(set(re.findall(r"gates\.extend\((\w+)\(", op))) == ["fused_gates", "stack_acted_gates"]
+    assert sorted(set(re.findall(r"gates\.extend\((\w+)\(", op))) == ["apply_batched_gates", "fused_gates",
+                                                                       "stack_acted_gates"]   # [f3all] applyev's AB_acted
     assert "note_fused_warm(svc)" in op and "note_fused_warm(svc)" in inspect.getsource(G.preflight)   # [fr3]
     main = inspect.getsource(G.main)
     for s in ("eval_gates(a, meta, res, gates)", "acc_gates(a, meta, res, gates, acc[", "af.inflight_array = False",

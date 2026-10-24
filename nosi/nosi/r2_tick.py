@@ -56,6 +56,11 @@ ROLLBACK and PUBLICATION (TickEngine.apply_events, after the decision):
                   rebuild_from_own_rows): FIRST the draft bank's keys / cis of its still-unverified positions are read
                   from its own twin rows, THEN the bank is rebuilt (sync, then advance by them), and the draft ring
                   rows of the newly published positions take the exact rows.
+  [applyev]       apply_batched=True (OPT-IN, needs rebuild="batched"; default False: every line above runs as before):
+                  the draft-bank step of EVERY rollback and EVERY publication of the tick in ONE rebuild_banks_unchecked
+                  and ONE copy_rows_many per layer (TickEngine._apply_batched: the _publish_batched pattern; a rollback
+                  is an item with no row to replay, its ring copy = the 128 rows of its two ring pages), and the
+                  rollback's keep vector on the device once per tick (not once per layer). Bitwise the same state.
 HOST SYNCS. TickEngine.run_rows and apply_events contain no host read of their own (one pinned H2D copy of the row
 table and the per-bank counts per tick); read_tokens is the one decision read. The twins advance through
 PositionalTwin.advance_unchecked (C's 4fe5fc9, bitwise advance()'s): no host read; the capacity is checked ONCE per
@@ -137,7 +142,7 @@ def rebuild_from_own_rows(twin: PositionalTwin, b: int, B: int, p: int, dpos: in
 
 
 def rebuild_banks_unchecked(twin: PositionalTwin, items: Sequence[tuple], B: int, dev_items=None,   # [batched-rebuild]
-                            swap: bool = False):                                                  # [batched-rebuild]
+                            swap: bool = False, rows_out: bool = True):                           # [applyev] rows_out
     """[batched-rebuild] (A2, 7f06273) rebuild_from_own_rows for EVERY publication of a tick at once, on one layer's
     twin, without a host read: items = [(b, p, dpos)], one per bank. The twin's banks are independent, so: FIRST every
     draft bank's own unverified rows [p, dpos) (ONE gather of the ring and ONE of total_cis over all items), THEN
@@ -145,7 +150,9 @@ def rebuild_banks_unchecked(twin: PositionalTwin, items: Sequence[tuple], B: int
     advance_unchecked over T = max(dpos - p) steps with n[B + b] = dpos - p (a bank is inactive past its own rows, as
     every other bank is in the per-call path). Bitwise rebuild_from_own_rows per bank (test P6a). dev_items: (3, P)
     int64 on the twin's device (b, p, n; the caller makes it once per tick for every layer). swap: NEGATIVE CONTROL
-    (tests only), the first two items' rows exchanged. Returns {b: (keys (n, H, D), cis (n, H))}."""
+    (tests only), the first two items' rows exchanged. Returns {b: (keys (n, H, D), cis (n, H))}.
+    [applyev] rows_out False (TickEngine._apply_batched, which reads no captured row): returns {} and makes no copy or
+    view of the captured rows; every write to the twin is the same."""
     if not items:
         return {}
     dev = twin.pos.device
@@ -171,8 +178,9 @@ def rebuild_banks_unchecked(twin: PositionalTwin, items: Sequence[tuple], B: int
         rk = torch.where(valid.view(P, T, 1, 1), rk, torch.zeros_like(rk))
         rc = torch.where(valid.view(P, T, 1), rc, torch.zeros_like(rc))
         for i, (b, n) in enumerate(zip(bs, ns)):
-            out[b] = (rk[i, :n], rc[i, :n])
-    else:
+            if rows_out:                                                # [applyev]
+                out[b] = (rk[i, :n], rc[i, :n])
+    elif rows_out:                                                      # [applyev] (was: else)
         for b in bs:
             out[b] = (twin.ring[B + b, :0].clone(), twin.total_cis[B + b, :0].clone())
     twin.comp_k.index_copy_(0, drafts, twin.comp_k.index_select(0, hb))      # sync_draft_bank, every item at once
@@ -353,7 +361,9 @@ class TickEngine:
     the call sites are unchanged.
     rebuild ([batched-rebuild]): "per_call" (the default, unchanged: one CHECKED rebuild_from_own_rows per publication
     and layer) or "batched": apply_events rebuilds every publication of the tick with ONE rebuild_banks_unchecked and
-    ONE copy_rows_many per layer (no host read; with twin "fused" the advance is one fused kernel); bitwise the same."""
+    ONE copy_rows_many per layer (no host read; with twin "fused" the advance is one fused kernel); bitwise the same.
+    apply_batched ([applyev], default False: unchanged; needs rebuild "batched"): apply_events also batches its
+    ROLLBACKS (_apply_batched; module docstring, ROLLBACK and PUBLICATION); bitwise the same."""
 
     LOG = 1 << 16
     # [hostfix] --host-profile (OPT-IN, default False: no extra record): the timer also gets host sub-timers, in
@@ -365,12 +375,19 @@ class TickEngine:
                  nl=None, stage1=None, pool=None, select=SC.select_blocks, draft_drop: float = 0.0, drop_seed: int = 0,
                  check: bool = False, twin: str = "torch",                                      # [twin-variant]
                  rebuild: str = "per_call",                                                     # [batched-rebuild]
-                 xpool=None, log_slots: Optional[int] = None):                                  # [xpool]
+                 xpool=None, log_slots: Optional[int] = None,                                   # [xpool]
+                 apply_batched: bool = False):                                                  # [applyev]
         if rebuild not in REBUILD_MODES:                                                        # [batched-rebuild]
             raise TickError("rebuild must be one of %s (got %r)" % (REBUILD_MODES, rebuild))    # [batched-rebuild]
+        if apply_batched and rebuild != "batched":                                              # [applyev]
+            raise TickError("apply_batched needs rebuild 'batched' (got %r)" % (rebuild,))      # [applyev]
         self.rebuild = rebuild                                                                  # [batched-rebuild]
+        self.apply_batched = bool(apply_batched)                                                # [applyev]
         self.batched_calls = 0                  # [integ3] GPU witness (review M2): _publish_batched calls with an item
         self.batched_max = 0                    # [integ3] and the most publications one call rebuilt
+        self.apply_calls = 0                    # [applyev] witness: _apply_batched calls with >= 1 rollback item,
+        self.apply_rb_max = 0                   # [applyev] the most rollbacks one call carried,
+        self.apply_rb_items = 0                 # [applyev] and all rollback items (host counters only)
         self.model, self.ops = model, ops
         self.LOG = type(self).LOG if log_slots is None else int(log_slots)    # instance size; the check below reads it
         if self.LOG < 1:
@@ -621,6 +638,7 @@ class TickEngine:
                     drop_seed=self.drop_seed, check=self.check, twin=self.twin_variant,                 # [twin-variant]
                     log_slots=self.LOG)
         args.setdefault("rebuild", self.rebuild)                                                # [batched-rebuild]
+        args.setdefault("apply_batched", self.apply_batched)                                    # [applyev]
         if self.xpool is not None:                                                              # [xpool] its own map
             args["xpool"] = self.xpool.clone()                                                  # [xpool]
         args.update(kw)
@@ -961,6 +979,8 @@ class TickEngine:
                 rb_epoch[b] = ep
         self.events = []
         B = self.B
+        if self.apply_batched and self.rebuild != "batched":                     # [applyev] (eng.rebuild is set
+            raise TickError("apply_batched needs rebuild 'batched' (got %r)" % (self.rebuild,))   # after construction)
         if rb:                                                                   # 1. the exact banks: ONE commit
             keep = {}
             for b, p in rb.items():
@@ -969,8 +989,13 @@ class TickEngine:
                     raise TickError("rollback of request %d to %d: outside this tick's rows (%d + %d) or below the "
                                     "committed %d" % (b, p, self.last_pos0[b], self.last_count[b], self.committed[b]))
                 keep[b] = idx
-            for l in range(self.L):
-                SC.rollback_bank(self.twins[l], self.last_ctr[l], keep)
+            if self.apply_batched:                                               # [applyev] the keep vector ONCE
+                full = self._keep_vector(keep)
+                for l in range(self.L):
+                    self.twins[l].commit(self.last_ctr[l], full)
+            else:
+                for l in range(self.L):
+                    SC.rollback_bank(self.twins[l], self.last_ctr[l], keep)
             for b, p in rb.items():
                 self.bank_pos[b] = p
                 self.committed[b] = p
@@ -984,6 +1009,9 @@ class TickEngine:
         for b in set(rb) | set(pub):                                             # 2. write-back
             self.writeback(b)
         self.backend.decisions(pub, rb_epoch)                                   # the residency's references
+        if self.apply_batched:                                                   # [applyev] steps 3 and 4 at once
+            self._apply_batched(rb, pub)                                         # [applyev]
+            return                                                               # [applyev]
         for b in rb:                                                             # 3. the draft banks
             for l in range(self.L):
                 SC.sync_draft_bank(self.twins[l], b, B)
@@ -1025,6 +1053,76 @@ class TickEngine:
                 rebuild_banks_unchecked(self.twins[l], items, B, dev_items=dev_items, swap=swap)
                 if cp is not None:
                     self.copy_rows_many(l, cp)
+        for (b, p, _) in items:
+            self.synced[b] = p
+
+    def _keep_vector(self, keep):                                                # [applyev]
+        """[applyev] r2_spec_core.rollback_bank's per-layer keep vector, made ONCE per tick on the device: (2B,)
+        int64, ctr.shape[0] - 1 for every bank, keep[bank] for a rolled-back bank. One T per tick, so every layer's
+        ctr has the same shape (checked on the host metadata)."""
+        rows = {int(c.shape[0]) for c in self.last_ctr}
+        if len(rows) != 1:
+            raise TickError("apply_batched: the layers' counter stacks differ in length (%s)" % sorted(rows))
+        vals = [next(iter(rows)) - 1] * (2 * self.B)
+        for bank, k in keep.items():
+            vals[bank] = k
+        return self._to_device(torch.tensor(vals, dtype=torch.int64))
+
+    def _apply_batched(self, rb, pub) -> None:                                   # [applyev]
+        """[applyev] steps 3 and 4 of apply_events for EVERY rollback and EVERY publication of the tick at once
+        (apply_batched=True): the _publish_batched pattern. Host checks first; ONE items tensor and ONE copy index
+        list per tick; per layer ONE rebuild_banks_unchecked and ONE copy_rows_many; no host read. A rollback of
+        request b is the item (b, q, q), q = its exact bank's position (nothing to replay), and its ring copy is the
+        128 rows of its two ring pages (positions 0 .. 127: ring_slot parity 0 and 1, every row p % 64).
+        EXACTNESS (bitwise the unbatched steps 3 and 4; tests_cpu/test_r2_applyev.py AE1-AE3):
+        (a) SAME VALUES. Unbatched, a rollback runs sync_draft_bank (draft bank B + b := exact bank b: comp_k, ring,
+            total_cis, ccis, pos, n_comp, n_ccis, prefilled; epoch + 1) and copy_ring (the draft ring pages := the
+            exact ring pages). Here the item (b, q, q) gets the same element copies through index_copy_ and the same
+            int64 + 1 through index_add_; if a publication of the same call has rows to replay (T > 0), the advance
+            sees n = 0 for the rollback's bank, and step_unchecked writes an inactive bank's own value back
+            (torch.where(active, new, old)), so the synced bytes stay. copy_rows_many over positions 0 .. 127 copies
+            each row of the two pages from the exact ring to the draft ring: copy_ring's copy, element by element (no
+            arithmetic). The publications' items and rows are _publish_batched's own.
+        (b) SAME ORDER OF WRITES TO EACH ADDRESS. The items name distinct requests (apply_events drops the publication
+            of a rolled-back request). An item writes only draft bank B + b of each twin and request b's draft ring
+            rows; it reads only exact bank b and request b's exact ring rows, which steps 3 and 4 never write. So no
+            address gets writes from two items, and at each address the sequence is the unbatched one: the sync, then
+            (a publication) the replay steps, or (a rollback) the sync only, plus at most a same-value write-back.
+            index_copy_ / index_put_ with distinct destination indices are deterministic.
+        (c) The keep vector (_keep_vector) is rollback_bank's vector, value for value; twin.commit reads its values
+            only. Host mirrors: bank_pos[B + b] and synced[b] as in steps 3 and 4.
+        A refusal (a draft bank behind its publication) is raised here BEFORE any device op of steps 3 and 4 (the
+        unbatched path raises after step 3's syncs); a refusal ends the run either way."""
+        B = self.B
+        items = []
+        for b, p in pub.items():
+            dpos = self.bank_pos[B + b]
+            if dpos < p:
+                raise TickError("request %d: the draft bank (%d) is behind the publication (%d)" % (b, dpos, p))
+            items.append((b, p, dpos))
+        rb_items = [(b, self.bank_pos[b], self.bank_pos[b]) for b in rb]
+        if not items and not rb_items:
+            return
+        if items:                                                                # [integ3] the publications' witness,
+            self.batched_calls += 1                                              # as _publish_batched counts it
+            self.batched_max = max(self.batched_max, len(items))
+        if rb_items:
+            self.apply_calls += 1
+            self.apply_rb_max = max(self.apply_rb_max, len(rb_items))
+            self.apply_rb_items += len(rb_items)
+        both = items + rb_items
+        dev_items = self._to_device(torch.tensor([[b for (b, _, _) in both], [p for (_, p, _) in both],
+                                                  [d - p for (_, p, d) in both]], dtype=torch.int64))
+        cp = self.rows_to_copy([(b, range(self.synced[b], p)) for (b, p, _) in items]
+                               + [(b, range(2 * BLOCK)) for (b, _, _) in rb_items])
+        with self._span("rebuild"):        # the rollbacks' syncs join the publications' rebuild span
+            for l in range(self.L):
+                rebuild_banks_unchecked(self.twins[l], both, B, dev_items=dev_items, rows_out=False)
+                if cp is not None:
+                    self.copy_rows_many(l, cp)
+        for b in rb:
+            self.bank_pos[B + b] = self.bank_pos[b]
+            self.synced[b] = self.bank_pos[b]
         for (b, p, _) in items:
             self.synced[b] = p
 

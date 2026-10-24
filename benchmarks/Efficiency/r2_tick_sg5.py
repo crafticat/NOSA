@@ -108,6 +108,13 @@ a scope mismatch (a batch 48 record for a batch 216 cell) is REPORTED, not refus
 [endbatch] --end-batch (b2; analysis/evalfast/DIAG_effective_gap.md section 4, fix 3): run_round ends the requests that
 finish in a tick with ONE call (OwnResidency(end_batch=True).end_requests: one O.end_owners, one host read, a per-request
 index of the queued keys); the same final state as one end_request per request (tests_cpu/test_r2_endbatch.py).
+[applyev] --apply-batched (OPT-IN; every variant's rebuild must be "batched"): TickEngine(apply_batched=True): the
+rollbacks of apply_events join the publications' batched rebuild (one rebuild_banks_unchecked and one copy_rows_many per
+layer for every rollback and publication of a tick; the keep vector once per tick); bitwise the same state. MUST
+<label>_AB_acted (apply_batched_gates) in every point's round (tests_cpu/test_r2_applyev.py).
+[f3all] --end-batch and --apply-batched with the f3lia path (cells evalfast2all / evalfast2c3all / evalacc216all): the
+three parts are independent (the ends are run_round's, after the tick span; the batched apply is TickEngine.apply_events;
+the fused resolve and the array poll are the service's); no new code joins them (tests_cpu/test_r2_f3all.py).
 OUTPUT: --out/summary.json (after every run). The last stdout line is R2_TICK_SG5_DONE failed=<n>; exit = n (2 =
 refused). ENVIRONMENT: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0, NOSI_POOL_BLOCKS = 0 (the parent; a child sets its own).
 """
@@ -373,6 +380,10 @@ def parse_args(argv):
                     help="b2 only: the requests that finish in a tick end with ONE call (OwnResidency(end_batch=True)."
                          "end_requests: one end_owners, one host read, a per-request index of the queued keys); the "
                          "same final state as one end_request per request (tests_cpu/test_r2_endbatch.py)")
+    ap.add_argument("--apply-batched", action="store_true",                                   # [applyev]
+                    help="every variant's rebuild batched only: apply_events batches its rollbacks with the "
+                         "publications (TickEngine(apply_batched=True): one rebuild_banks_unchecked and one "
+                         "copy_rows_many per layer per tick); the same state (tests_cpu/test_r2_applyev.py)")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -502,6 +513,11 @@ def parse_args(argv):
         ap.error("--serial-rows, --gold-workload and --link-record need --store-committed-tokens")
     if a.end_batch and a.backends != ["b2"]:                                                     # [endbatch]
         ap.error("--end-batch: --backends b2 only (OwnResidency(end_batch=True))")
+    if a.apply_batched and a.stack_compare:                                                      # [applyev] its base
+        ap.error("--apply-batched: no --stack-compare (its base arms run rebuild per_call)")       # arms
+    if a.apply_batched and any(rb != "batched" for _, rb in a.variant_list):                     # [applyev]
+        ap.error("--apply-batched: every variant's rebuild must be batched (TickEngine(apply_batched=True) needs "
+                 "rebuild 'batched'; got %s)" % ["%s/%s" % v for v in a.variant_list])
     a.log_slots_n = resolve_log_slots(a)                                                         # [bigb]
     return a
 
@@ -862,6 +878,7 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
     if eng.xpool is not None:                               # [integ5] the diagnostics OFF in a time cell
         eng.xpool.witness = witness_on(a)
     eng.rebuild = getattr(a, "rebuild", "per_call")         # [batched-rebuild] the arm's rebuild (parse_variants checks)
+    eng.apply_batched = bool(getattr(a, "apply_batched", False))   # [applyev] after the rebuild (apply_events checks)
     B, L, H = eng.B, eng.L, eng.H
     xp = eng.xpool                                                                               # [xpool] or None
     host_k = [lay.cache_engine._k_cpu for lay in cache.layers]
@@ -932,6 +949,18 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
 
 
 FR_DRAFT_LAUNCHES = dict(v2=3.0, v3=4.0)     # [fr3] G2: Triton launches per draft-only layer (mixed: v2 6, v3 7)
+
+
+def apply_batched_gates(a, label, w):                                                          # [applyev]
+    """[applyev] --apply-batched only (else no gate): MUST <label>_AB_acted: the round's engine ran the batched apply
+    with rollbacks (its own witness: apply_calls > 0, and one call carried >= 2 rollbacks). w: the engine's host
+    counters (apply_calls, apply_rb_max, apply_rb_items, apply_batched)."""
+    if not getattr(a, "apply_batched", False):
+        return []
+    ok = bool(w.get("apply_batched")) and w.get("apply_calls", 0) > 0 and w.get("apply_rb_max", 0) >= 2
+    return [GB.gate("%s_AB_acted" % label, ok, True, "apply_batched %s, calls with rollbacks %s, most rollbacks in "
+                    "one call %s, rollback items %s" % (w.get("apply_batched"), w.get("apply_calls"),
+                                                        w.get("apply_rb_max"), w.get("apply_rb_items")))]
 
 
 def note_fused_warm(svc):
@@ -1745,6 +1774,11 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
                    witness=witness_on(a))                     # [integ5] the arm's role (the actual state: below)
         info["stack_witness"] = {k: v for k, v in wit.items() if k not in ("fused", "xpool", "skv")}
         gates.extend(stack_acted_gates(a, label, wit, eng.B, C))
+        abw = dict(apply_batched=getattr(eng, "apply_batched", False), apply_calls=getattr(eng, "apply_calls", 0),
+                   apply_rb_max=getattr(eng, "apply_rb_max", 0), apply_rb_items=getattr(eng, "apply_rb_items", 0))
+        if getattr(a, "apply_batched", False):                                                   # [applyev] REPORT
+            info["apply_batched"] = abw
+        gates.extend(apply_batched_gates(a, label, abw))                                         # [applyev]
         mirror = eng.mirror_failures()
         gates.append(GB.gate("%s_completed" % label, True, True, "ticks %d, T_tick %s ms, r %.3f, ratio %s"
                              % (rnd.ticks, None if T_tick is None else round(T_tick, 2), r,
@@ -2159,6 +2193,8 @@ def main(argv=None) -> int:
             meta.update(inflight_array=True)
         if a.end_batch:                                                                        # [endbatch]
             meta.update(end_batch=True)
+        if a.apply_batched:                                                                    # [applyev]
+            meta.update(apply_batched=True)
         if a.gc_freeze:                                                                        # [hostfix] item 1
             meta.update(gc_freeze=True, gc_freeze_note="each timed phase: collect, freeze, disable before; unfreeze, "
                                                        "enable, collect after (per point: gc_freeze[phase])")

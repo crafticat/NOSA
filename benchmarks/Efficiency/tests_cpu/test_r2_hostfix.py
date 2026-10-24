@@ -766,7 +766,9 @@ def test_HF6a_the_cells_and_the_registration_static():
             "|evalfast2ia"                                                                         # [admitfill]
             "|evalacc216m|evalacc216"                                                              # [acc216]
             "|evalfast2f3lia|evalfast2c3lia|evalacc216f3lia"                                       # [f3lia]
-            "|evalfast2eb] [gilfree|gather]") in text                                              # [endbatch]
+            "|evalfast2eb"                                                                         # [endbatch]
+            "|evalfast2ab|evalfast2c3ab"                                                           # [applyev]
+            "|evalfast2all|evalfast2c3all|evalacc216all] [gilfree|gather]") in text                # [f3all]
     assert "        evalfast2|evalfast2t|evalfast2c) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     reg = text[text.index("# REGISTERED for evalfast2t / evalfast2 / evalfast2c"):]
     reg = reg[:reg.index("\n#\n")]
