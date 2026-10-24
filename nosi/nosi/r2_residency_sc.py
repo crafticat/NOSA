@@ -1277,6 +1277,12 @@ class CudaDeviceOps:
         Any other transport: a pack still queued in a Python feeder is host-waited for its submission (a
         threading.Event: the GIL is released), as before. Each wait counts in submission_waits."""
         tp = getattr(self.svc, "tp", None)
+        jobs = self._nm_jobs(l)                                       # [f3ld] B2's table path: its jobs, no Transfer
+        if jobs is not None:
+            for job in jobs:                                          # (it needs E's C++ worker: issue="desc")
+                tp.wait_submitted(job)
+                self.submission_waits += 1
+            return
         if getattr(tp, "submits_without_gil", False) and callable(getattr(tp, "wait_submitted", None)):
             seen = set()
             for tr in list(self.svc.inflight.values()):
@@ -1315,8 +1321,20 @@ class CudaDeviceOps:
         if prof:
             self.profile.append((l, m0, m0, m0, self._mark()))     # superset: one phase, the event waits
 
+    def _nm_jobs(self, l: int):
+        """[f3ld] B2's table path (OwnResidency(no_transfer_mirror=True).nm_jobs_at): the jobs with a take of layer l
+        in flight, in issue order; None for every other service (the transfers below, unchanged)."""
+        f = getattr(self.svc, "nm_jobs_at", None)
+        return f(l) if f is not None else None
+
     def _superset_wait(self, l: int) -> None:
         main = torch.cuda.current_stream()
+        jobs = self._nm_jobs(l)                                       # [f3ld] one wait per job (its completion object)
+        if jobs is not None:
+            for job in jobs:
+                main.wait_event(job.ev)
+                self.events_waited += 1
+            return
         seen = set()
         idx = getattr(self.svc.inflight, "by_layer", None)              # [hostfix] --wait-index (InflightByLayer):
         for tr in (list(self.svc.inflight.values()) if idx is None else idx(l)):   # the same transfers, in order

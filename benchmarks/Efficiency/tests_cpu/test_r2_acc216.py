@@ -29,7 +29,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 EFF = ROOT / "benchmarks/Efficiency"
 STEP = EFF / "r2_tick_sg5_step.sh"
-ACC_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3lia"                         # [f3lia] (was nosi-r2-acc216)
+ACC_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3ld"                          # [f3ld] (was nosi-r2-f3lia / -acc216)
 # [f3lia] the commit the acc216 delta applies to in this tree: r2-f3lia's merge of flean + admitfill (3463341), the
 # parent of the acc216 merge (was 8ccf262, acc216's own base: flean and admitfill changed make_engine / preflight /
 # one_point after it, so the line compare is made against the tree that acc216 was merged into)

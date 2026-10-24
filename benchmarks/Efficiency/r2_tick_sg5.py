@@ -90,6 +90,9 @@ array poll is in OwnResidency._poll_arrivals, the fused resolve in FusedResolver
 issue; default object; desc = ONE E issue_desc job per tick, needs --worker cpp and --transport gilfree; [f3ld] and
 --layout stream: E's issue_desc refuses xpool lanes), ported by hunks from 47db0c0; issue_clock / issue_report: the
 issue calls' host time, calls and takes per tick (REPORT info["issue"]). tests_cpu/test_r2_b2_desc.py.
+[f3ld] --no-transfer-mirror (b2, --b2-issue desc, --arrival-lag >= 1, --lean-time; not with --inflight-array): no
+Transfer object per take (OwnResidency(no_transfer_mirror=True); analysis/evalfast/PLAN_admission_fill.md rank 1b);
+the same decisions, page tables, table, store and logits (tests_cpu/test_r2_f3ld.py).
 [acc216] THE ACCURACY / EXACTNESS PROOF ON THE TIMED PATH (analysis/evalfast/STATUS_accuracy_B216.md section 5; opt-in
 --store-committed-tokens; no new kernel, no new mode). Every point stores its committed tokens (the statement of the
 [xpool] fp path, one_point). With --modes fast,bi_c_strict the two points run on the same prefill and harness, and
@@ -364,6 +367,10 @@ def parse_args(argv):
     ap.add_argument("--b2-issue", default="object", choices=("object", "desc"),                  # [b2-desc]
                     help="b2's draft issue: object (tp.issue per layer, the default; p5b2 / p6) or desc (ONE "
                          "tp.issue_desc job per tick; needs --worker cpp and packer v3 with DESC)")
+    ap.add_argument("--no-transfer-mirror", action="store_true",                                 # [f3ld]
+                    help="b2 with --b2-issue desc, --arrival-lag >= 1 and --lean-time only: no Transfer object per take "
+                         "(OwnResidency(no_transfer_mirror=True)): the poll, the Policy E victims, the waits and the "
+                         "merges on the table and the jobs; the same decisions (tests_cpu/test_r2_f3ld.py)")
     ap.add_argument("--store-committed-tokens", action="store_true",                          # [acc216]
                     help="store every point's committed tokens (info['committed_tokens']) and run the ACC gates "
                          "(module docstring); default: off (no token stored, no ACC gate)")
@@ -500,6 +507,10 @@ def parse_args(argv):
     if a.b2_issue == "desc" and (a.backends != ["b2"] or a.layout != "stream"):                  # [f3ld]
         ap.error("--b2-issue desc: --backends b2 and --layout stream only (E's issue_desc names logical slots and "
                  "refuses xpool lanes: GilfreeTransport.issue_desc; OwnResidency(issue='desc') refuses an X pool)")
+    if a.no_transfer_mirror and (a.b2_issue != "desc" or a.arrival_lag < 1 or not a.lean_time   # [f3ld]
+                                 or a.inflight_array):
+        ap.error("--no-transfer-mirror: needs --b2-issue desc (with --worker cpp), --arrival-lag >= 1 and --lean-time; "
+                 "not with --inflight-array (both are poll paths; OwnResidency(no_transfer_mirror=True))")
     if a.store_committed_tokens:                                                                 # [acc216]
         if a.layout == "both" or a.stack_compare:
             ap.error("--store-committed-tokens: not with --layout both or --stack-compare (their arms compare and "
@@ -954,7 +965,8 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
                                res_lean=bool(getattr(a, "res_lean", False)),                                      # [resfix]
                                res_dev=bool(getattr(a, "res_dev", False)),                                        # [resdev]
                                inflight_array=bool(getattr(a, "inflight_array", False)),                          # [inflight-array]
-                               issue=getattr(a, "b2_issue", "object"), **kw)                                      # [b2-desc]
+                               issue=getattr(a, "b2_issue", "object"),                                            # [b2-desc]
+                               no_transfer_mirror=bool(getattr(a, "no_transfer_mirror", False)), **kw)            # [f3ld]
             lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)       # [b2]
         else:
             lazy = _LazyOps()
@@ -2207,6 +2219,7 @@ def main(argv=None) -> int:
         if a.inflight_array:                                                                   # [inflight-array]
             meta.update(inflight_array=True)
         meta.update(worker=a.worker, b2_issue=a.b2_issue)                                      # [b2-desc]
+        meta.update(no_transfer_mirror=a.no_transfer_mirror)                                   # [f3ld]
         if a.gc_freeze:                                                                        # [hostfix] item 1
             meta.update(gc_freeze=True, gc_freeze_note="each timed phase: collect, freeze, disable before; unfreeze, "
                                                        "enable, collect after (per point: gc_freeze[phase])")
@@ -2276,6 +2289,7 @@ def main(argv=None) -> int:
                                 af = copy.copy(a)
                                 af.arrival_lag = 0
                                 af.inflight_array = False          # [inflight-array] free timing: the old poll
+                                af.no_transfer_mirror = False      # [f3ld] free timing: the mirror path
                                 log("%s_free: the same stack at free arrival (REPORT timing)" % label)
                                 pf = one_point(af, model, cache, st, first,
                                                BIOps(select_attn(af, attn), a.m_fix, gemm=mode), kind, a.C, a.X,

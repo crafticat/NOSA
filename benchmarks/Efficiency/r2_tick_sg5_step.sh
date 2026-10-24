@@ -151,6 +151,15 @@
 #   evalacc216f3lia [f3lia] evalacc216 on the combined path: --b2-resolve fused --fused-kernel v3 --res-lean --res-dev
 #            --inflight-array in place of --b2-resolve torch; --link-record = the evalfast2f3lia summary.json of the
 #            same run id and holder (REPORT only); REGISTERED block below (the F3LIA block)
+#   evalfast2f3d / evalfast2c3d [f3ld] evalfast2f3lia / evalfast2c3lia + --worker cpp --b2-issue desc (b2-desc 47db0c0
+#            ported: ONE E issue_desc job per tick; packer v3 of --nosi, GF3 below)
+#   evalfast2f3t / evalfast2c3t [f3ld] evalfast2f3d / evalfast2c3d + --no-transfer-mirror, WITHOUT --inflight-array (the
+#            table poll replaces the array poll); evalfast2c3t adds --lean-time (the flag needs it)
+#            The four: ROOT NOSI_EVAL (nosi-r2-f3ld), the same-job control evalfast2f3lia
+#            (tests_cpu/test_r2_b2_desc.py, tests_cpu/test_r2_f3ld.py); REGISTERED block below (the F3LD block).
+#            BLOCKED (F3LD_BLOCKED): every eval cell is --layout pool and E's issue_desc refuses xpool lanes; the step
+#            stops outside DRYRUN until the lead clears F3LD_BLOCKED (r2_tick_sg5.py refuses --b2-issue desc with
+#            --layout pool too)
 #   STEP_MIN 120 in every cell above.
 #   [fusedres2] the FR-g cells of docs/R2_FUSEDRES_PLAN.md section 7 (p5b2's point: --modes exact,fast --backends b2
 #   --C 96 --X 64 --R-ver 16, no sweep, gilfree 8 threads, unchecked), with NOSI = FRNOSI (the fusedres2 worktree)
@@ -486,6 +495,35 @@
 #   ACC3LIA-LINK R_ACC_fast_link (REPORT) against evalfast2f3lia. PREDICTION: TBD by lead
 #   ACC3LIA-MEM  R_ACC_peak (REPORT). PREDICTION: TBD by lead
 #
+# REGISTERED for evalfast2f3d / evalfast2c3d / evalfast2f3t / evalfast2c3t ([f3ld], NOT STAMPED: the lead fills every
+# PREDICTION and adds the stamp line before any run). WHAT: this tree (ROOT NOSI_EVAL = nosi-r2-f3ld: f3lia 89c9169 +
+# b2-desc 47db0c0 ported by hunks + --no-transfer-mirror; analysis/evalfast/PLAN_admission_fill.md section 4 ranks 1a
+# and 1b, section 5.2). Same-job control: evalfast2f3lia (the f3lia path in this tree, flags off).
+#   evalfast2f3d  evalfast2f3lia + --worker cpp --b2-issue desc (FAST timing, B 216, --eval-bands "$F3LD_BANDS": TBD)
+#   evalfast2c3d  evalfast2c3lia + --worker cpp --b2-issue desc (CHECK, B 216, 8 steps, --draft-ticks 4)
+#   evalfast2f3t  evalfast2f3d + --no-transfer-mirror - --inflight-array (FAST timing, --eval-bands "$F3LT_BANDS": TBD)
+#   evalfast2c3t  evalfast2c3d + --no-transfer-mirror --lean-time - --inflight-array (CHECK)
+#   F3LD-BLOCK  the cells need the descriptor path on the shared pool; at this tree E's issue_desc refuses xpool lanes
+#               (r2_transport_gilfree.py issue_desc; gilfree_pack.cpp submit_desc writes b * slots + slot), so the
+#               harness refuses --b2-issue desc with --layout pool (exit 2) and the step stops while F3LD_BLOCKED is set.
+#               PREDICTION: TBD by lead
+#   C3D / C3T   MUST _draft_only_fused_equal / _round_fused_equal / _fused_err PASS: 0 diffs, every layer compared.
+#               FALSIFIER: a difference: the matching timing cell is VOID. PREDICTION: TBD by lead
+#   F3D-MED     steady tok/s (median tick). PREDICTION: TBD by lead
+#   F3D-MEAN    steady tok/s (mean tick). PREDICTION: TBD by lead
+#   F3D-EFF     effective tok/s. PREDICTION: TBD by lead
+#   F3D-ISSUE   tick 0 h_et_issue (bare_host_profile.per_tick_ms) and info.issue per tick. PREDICTION: TBD by lead
+#   F3D-SAME    the bare round's ticks and committed equal evalfast2f3lia's of the same job. PREDICTION: TBD by lead
+#   F3D-FALS    PREDICTION: TBD by lead
+#   F3T-MED     steady tok/s (median tick). PREDICTION: TBD by lead
+#   F3T-MEAN    steady tok/s (mean tick). PREDICTION: TBD by lead
+#   F3T-EFF     effective tok/s. PREDICTION: TBD by lead
+#   F3T-T04     ticks 0-4: h_hs_takes, h_hs_merges, h_poll_arrivals, h_et_issue; arrival forced / forced_ns at tick 2.
+#               PREDICTION: TBD by lead
+#   F3T-SAME    the bare round's ticks and committed equal evalfast2f3lia's of the same job. PREDICTION: TBD by lead
+#   F3T-FALS    PREDICTION: TBD by lead
+#   F3LD-MEM    peak_gb <= 84 (MUST EF_mem_cap) in both timing cells. PREDICTION: TBD by lead
+#
 # REGISTERED for evalacc216m / evalacc216 ([acc216], STAMP 2026-10-23T18:04:12Z, before any run; the lead writes the stamp from
 # `date -u` in the command that freezes this block, L33). WHY: analysis/evalfast/STATUS_accuracy_B216.md: at B 216 no
 # gate proves the exact target distribution (ETD), batch invariance (BI) or accuracy equivalence (AE) on the timed
@@ -607,7 +645,7 @@ NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                        
 NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-stack2                                             # ROOT of the stack1 cells only ([integ]; [stack2])
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
-NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-f3lia                                               # ROOT of the evalfast* and evalacc216* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree; [frfix] own worktree; [resfix] own worktree; [resdev] own worktree; [fr3] own worktree; [flean] own worktree; [admitfill] own worktree; [acc216] own worktree; [f3lia] own worktree: flean + admitfill + acc216)
+NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-f3ld                                                # ROOT of the evalfast* and evalacc216* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree; [frfix] own worktree; [resfix] own worktree; [resdev] own worktree; [fr3] own worktree; [flean] own worktree; [admitfill] own worktree; [acc216] own worktree; [f3lia] own worktree: flean + admitfill + acc216; [f3ld] own worktree: f3lia + b2-desc + no transfer mirror)
 EVALACC_OUT=/mnt/beegfs/ojerbi/r2-runs/evalacc                                           # ROOT (r2_evalacc_step.sh's OUTROOT)
 GOLD=/mnt/beegfs/ojerbi/kstep-cpu-runs/workload/pg19-test-ctx65280                        # ROOT [acc216] (r2_evalacc_step.sh's)
 GOLD_SHA=f2fb36f441ec12b7a79239d5e86263c6454b7713436f53f81086ef2bedcc34b3                 # PIN (ctx65280_tokens.bin) [acc216]
@@ -636,7 +674,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl|evalfast2rd|evalfast2rdp|evalfast2c3|evalfast2f3|evalfast2f3_192|evalfast2f3p|evalfast2c3l|evalfast2f3l|evalfast2ia|evalacc216m|evalacc216|evalfast2f3lia|evalfast2c3lia|evalacc216f3lia] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl|evalfast2rd|evalfast2rdp|evalfast2c3|evalfast2f3|evalfast2f3_192|evalfast2f3p|evalfast2c3l|evalfast2f3l|evalfast2ia|evalacc216m|evalacc216|evalfast2f3lia|evalfast2c3lia|evalacc216f3lia|evalfast2f3d|evalfast2c3d|evalfast2f3t|evalfast2c3t] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -664,6 +702,7 @@ for w in "$@"; do
         evalacc216m|evalacc216) [ -z "$CELL" ] || usage; CELL=$w ;;                                 # [acc216]
         evalfast2f3lia|evalfast2c3lia) [ -z "$CELL" ] || usage; CELL=$w ;;                          # [f3lia]
         evalacc216f3lia) [ -z "$CELL" ] || usage; CELL=$w ;;                                        # [f3lia] [acc216]
+        evalfast2f3d|evalfast2c3d|evalfast2f3t|evalfast2c3t) [ -z "$CELL" ] || usage; CELL=$w ;;    # [f3ld]
         *) usage ;;
     esac
 done
@@ -749,6 +788,8 @@ FRARG=()                                                    # the frg* cells' ex
 EVALARG=()                                                  # [evalsplit] the evalfast cell only
 ACC=                                                        # [acc216] the evalacc216* cells only (the gold pin)
 LINKARG=()                                                  # [acc216] evalacc216 only
+GF3=                                                        # [f3ld] the f3ld cells only: packer v3 of --nosi (DESC)
+F3LD_BLOCKED=xpool                                          # [f3ld] REGISTERED F3LD-BLOCK; the lead clears it
 case $CELL in
     "") ;;                                                  # the default: p3's arguments
     p4a) SWEEP_RUN= ; SUFFIX=_p4a ;;                        # the six points; --sweep left out (its default "": none)
@@ -937,7 +978,31 @@ case $CELL in
                  --b2-resolve fused --fused-kernel v3 --host-profile --gc-freeze --lean-time --wait-index --b2-fewer-reads
                  --res-lean --res-dev --inflight-array --store-committed-tokens --serial-rows 8 --gold-workload "$GOLD"
                  "${LINKARG[@]}") ;;
+    evalfast2f3d|evalfast2f3t) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_$CELL  # [f3ld]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; GF3=1
+        F3LD_BANDS=TBD                                      # PREDICTION: TBD by lead (REGISTERED F3D-MED/MEAN/EFF)
+        F3LT_BANDS=TBD                                      # PREDICTION: TBD by lead (REGISTERED F3T-MED/MEAN/EFF)
+        if [ "$CELL" = evalfast2f3d ]; then F3BANDS=$F3LD_BANDS ; F3FLAGS=(--inflight-array --worker cpp --b2-issue desc)
+        else F3BANDS=$F3LT_BANDS ; F3FLAGS=(--worker cpp --b2-issue desc --no-transfer-mirror)
+        fi
+        [ "${DRYRUN:-0}" = 1 ] || [ "$F3BANDS" != TBD ] ||
+            stop "cell $CELL: --eval-bands TBD (the lead fills and stamps the REGISTERED F3LD block first)"
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
+                 --eval-role fast-time --mem-cap-gb 84
+                 --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
+                 --eval-bands "$F3BANDS" --b2-resolve fused --fused-kernel v3 --host-profile --gc-freeze --lean-time
+                 --wait-index --b2-fewer-reads --res-lean --res-dev "${F3FLAGS[@]}") ;;
+    evalfast2c3d|evalfast2c3t) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_$CELL  # [f3ld]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4 ; GF3=1
+        if [ "$CELL" = evalfast2c3d ]; then C3FLAGS=(--inflight-array --worker cpp --b2-issue desc)
+        else C3FLAGS=(--lean-time --worker cpp --b2-issue desc --no-transfer-mirror)
+        fi
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
+                 --b2-resolve check --fused-kernel v3 --res-lean --res-dev "${C3FLAGS[@]}") ;;
 esac
+if [ -n "$GF3" ] && [ "${DRYRUN:-0}" != 1 ] && [ -n "$F3LD_BLOCKED" ]; then                       # [f3ld]
+    stop "cell $CELL: BLOCKED ($F3LD_BLOCKED): E's issue_desc refuses xpool lanes and every eval cell is --layout pool (REGISTERED F3LD-BLOCK)"
+fi
 MIN_LEFT=$((STEP_MIN * 60 + 600))                           # [fusedres2] after the cell's STEP_MIN
 VARIANTARG=()                                               # [batched-rebuild] no --variants in every other cell
 [ -z "$VARIANTS" ] || VARIANTARG=(--variants "$VARIANTS")
@@ -1016,6 +1081,15 @@ esac
     stop "packer: $GF_PY at $GF_SHA is not the blob $GF_PY_BLOB"
 [ "$(git -C "$NOSI" rev-parse -q --verify "$GF_SHA:$GF_CPP")" = "$GF_CPP_BLOB" ] ||
     stop "packer: $GF_CPP at $GF_SHA is not the blob $GF_CPP_BLOB"
+PK_PY_BLOB=$GF_PY_BLOB PK_CPP_BLOB=$GF_CPP_BLOB PK_SRC="$GF_SHA (packer v2)"   # [f3ld] the packer this step copies
+if [ -n "$GF3" ]; then                                      # [f3ld] packer v3 of --nosi (r2_gfw_step.sh's rule) + DESC
+    PK_PY_BLOB=$(git -C "$NOSI" rev-parse -q --verify "$NSHA:$GF_PY") || stop "packer v3: $GF_PY is not tracked at $NSHA"
+    PK_CPP_BLOB=$(git -C "$NOSI" rev-parse -q --verify "$NSHA:$GF_CPP") || stop "packer v3: $GF_CPP is not tracked at $NSHA"
+    [ "$PK_CPP_BLOB" != "$GF_CPP_BLOB" ] || stop "packer v3: $GF_CPP at $NSHA is v2's blob (no C++ worker)"
+    git -C "$NOSI" show "$PK_CPP_BLOB" | grep -q 'mod.attr("VERSION") = 3;' || stop "packer v3: $GF_CPP at $NSHA is not VERSION 3"
+    git -C "$NOSI" show "$PK_CPP_BLOB" | grep -q 'mod.attr("DESC") = 1;' || stop "packer v3: $GF_CPP at $NSHA has no DESC"
+    PK_SRC="$NSHA (packer v3 of --nosi, DESC)"
+fi
 [ -f "$SIF" ] || stop "no image $SIF"
 [ "$(stat -c %s "$MODEL/model.safetensors" 2>/dev/null)" = "$MODEL_SIZE" ] || stop "model size is not $MODEL_SIZE"
 wl=$(sha256sum "$WL/c16k_tokens.bin" 2>/dev/null) || stop "no $WL/c16k_tokens.bin"
@@ -1066,6 +1140,7 @@ if [ "$DRY" = 1 ]; then
     [ -z "$BIGB" ] || echo "R2 SG5 step: [bigb] root $NOSI, cell $BIGB: layout pool, C $PC, B $BATCH, X_pool 64, arrival lag 2, $STEPS steps, token log sized (-1), no shipped child, mem $MEMG"
     [ "${#EVALARG[@]}" -eq 0 ] || echo "R2 SG5 step: [evalsplit] root $NOSI, batch $BATCH, step memory $MEMG, variants $VARIANTS, eval arguments ${EVALARG[*]}"
     [ -z "$ACC" ] || echo "R2 SG5 step: [acc216] modes $MODES; gold $GOLD (sha256 $GOLD_SHA); link ${LINKARG[*]:-none}"
+    [ -z "$GF3" ] || echo "R2 SG5 step: [f3ld] packer copied: $PK_SRC: $GF_PY blob $PK_PY_BLOB, $GF_CPP blob $PK_CPP_BLOB -> $GF_DIR; blocked: ${F3LD_BLOCKED:-no}"
     echo "R2 SG5 step: nosi root $NOSI; STEP_MIN $STEP_MIN; MIN_LEFT $MIN_LEFT s"                   # [fusedres2]
     echo "R2 SG5 step: claim $CLAIM (one per holder)"                                               # [sg5par]
     printf '%q ' "${ARGV[@]}"
@@ -1094,10 +1169,12 @@ mkdir "$REC" && mkdir "$GF_DIR" && mkdir -p "$JIT/tmp" || stop "cannot create $R
 busy=$(nosteps) || stop "a step is running in $JOB under the claim: '$busy' ($CLAIMNAME stays)"
 git -C "$NOSI" show "$BIATTN_BLOB" > "$ATTN_MOD" && [ "$(git hash-object -- "$ATTN_MOD")" = "$BIATTN_BLOB" ] ||
     stop "cannot copy piece 3's blob $BIATTN_BLOB to $ATTN_MOD ($CLAIMNAME stays)"
-git -C "$NOSI" show "$GF_PY_BLOB" > "$GF_DIR/gilfree_pack.py" && [ "$(git hash-object -- "$GF_DIR/gilfree_pack.py")" = "$GF_PY_BLOB" ] ||
-    stop "cannot copy the packer's blob $GF_PY_BLOB ($CLAIMNAME stays)"
-git -C "$NOSI" show "$GF_CPP_BLOB" > "$GF_DIR/gilfree_pack.cpp" && [ "$(git hash-object -- "$GF_DIR/gilfree_pack.cpp")" = "$GF_CPP_BLOB" ] ||
-    stop "cannot copy the packer's blob $GF_CPP_BLOB ($CLAIMNAME stays)"
+git -C "$NOSI" show "$PK_PY_BLOB" > "$GF_DIR/gilfree_pack.py" && [ "$(git hash-object -- "$GF_DIR/gilfree_pack.py")" = "$PK_PY_BLOB" ] ||
+    stop "cannot copy the packer's blob $PK_PY_BLOB ($CLAIMNAME stays)"                              # [f3ld] PK_*: v2 or v3
+git -C "$NOSI" show "$PK_CPP_BLOB" > "$GF_DIR/gilfree_pack.cpp" && [ "$(git hash-object -- "$GF_DIR/gilfree_pack.cpp")" = "$PK_CPP_BLOB" ] ||
+    stop "cannot copy the packer's blob $PK_CPP_BLOB ($CLAIMNAME stays)"
+printf 'packer_copied=%s py=%s cpp=%s\n' "$PK_SRC" "$PK_PY_BLOB" "$PK_CPP_BLOB" > "$REC/packer.txt" ||
+    stop "cannot write $REC/packer.txt ($CLAIMNAME stays)"                                           # [f3ld]
 printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/command.txt ($CLAIMNAME stays)"
 printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s workload=%s utc_start=%s\n' "$NSHA" \
     "$blob" "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "$WL_SHA" "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
