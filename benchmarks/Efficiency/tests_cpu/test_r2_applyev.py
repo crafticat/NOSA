@@ -494,13 +494,14 @@ def test_AE6a_the_cells_and_the_registration_static():
     reg = reg[:reg.index("\n#\n")]
     for tag in ("[applyev], SOURCE ONLY, not run", "nosi-r2-applyev", "PROFILE_f3l_mixed.md", "60.5 ms", "416",
                 "_publish_batched", "EXACTNESS (a)-(c)", "AB-C3", "0 diffs", "_AB_acted", "VOID", "AB-ACT",
-                "evalfast2f3l     the same-job control", "PREDICTION: TBD by lead"):
+                "evalfast2f3l     the same-job control", "AB-MED", "AB-MEAN", "AB-EFF", "AB-FALS", "AB-MEM"):
         assert tag in reg, tag
-    assert "STAMP 20" not in reg                                        # the lead stamps it before any run
+    assert "STAMP 2026-10-24T04:59:23Z" in reg and "TBD" not in reg    # the lead stamped it before any run
+    assert "425:475:305:345:248:280" in reg
     i = text.index("    evalfast2ab) MODES=fast")
     blk = text[i:text.index("\nesac", i)]
     assert "ABFLAGS=(--res-lean --res-dev --apply-batched)" in blk and "\"${ABFLAGS[@]}\"" in blk
-    assert "--eval-bands" not in blk.split("evalfast2c3ab)")[0]          # evalfast2ab: no bands until the lead's
+    assert "--eval-bands 425:475:305:345:248:280 " in blk.split("evalfast2c3ab)")[0]   # evalfast2ab: the lead's bands
     assert "--b2-resolve check --fused-kernel v3 --res-lean --res-dev --apply-batched" in blk
     f3l = text[text.index("    evalfast2f3p|evalfast2f3l) MODES=fast"):text.index("    evalfast2c3l) MODES=fast")]
     assert "FLFLAGS=(--res-lean --res-dev) ; BANDS=335:375:258:292:220:248" in f3l and "--apply-batched" not in f3l
@@ -530,12 +531,13 @@ def test_AE6b_the_cells_dryrun(tmp_path, cell, base):
     line, got, toks = _argv(tmp_path / "a", cell)
     _, _, btoks = _argv(tmp_path / "b", base)
     want = (_drop_bands(btoks) if cell == "evalfast2ab" else btoks) + ["--apply-batched"]
+    toks = _drop_bands(toks) if cell == "evalfast2ab" else toks        # the stamped AB bands replace f3l's
     assert toks == want, (cell, [t for t in toks if t not in want], [t for t in want if t not in toks])
     for s in ("PYTHONPATH=%s/nosi" % AB_ROOT, "--job-name=sg5-t1-418-%s " % cell, "--time=120", "--mem=240G"):
         assert s in line, (cell, s)
     pa = HF._sg5().parse_args(got.split())
     assert pa.apply_batched and pa.rebuild == "batched" and pa.res_lean and pa.res_dev and pa.fused_kernel == "v3"
     if cell == "evalfast2ab":
-        assert pa.eval_role == "fast-time" and pa.bare and pa.b2_resolve == "fused" and pa.eval_bands == ""
+        assert pa.eval_role == "fast-time" and pa.bare and pa.b2_resolve == "fused" and pa.eval_bands == "425:475:305:345:248:280"
     else:
         assert pa.eval_role == "" and pa.b2_resolve == "check" and pa.steps == 8 and pa.draft_ticks == 4

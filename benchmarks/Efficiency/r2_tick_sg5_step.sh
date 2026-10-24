@@ -410,24 +410,29 @@
 #   F3L-MEM  peak_gb <= 84 GB (MUST EF_mem_cap; f3 peak 83.16, the dev dummies add per-layer transients of about
 #            0.1-0.3 GB). If it fails, drop the bias fill's own dummies first
 #
-# REGISTERED for evalfast2ab / evalfast2c3ab ([applyev], SOURCE ONLY, not run; no STAMP yet: the lead stamps it with
-# `date -u` before any run). WHY: analysis/evalfast/PROFILE_f3l_mixed.md sections 3.2-3.3 and 4 (step 3): on F3L
+# REGISTERED for evalfast2ab / evalfast2c3ab ([applyev], SOURCE ONLY, not run; STAMP 2026-10-24T04:59:23Z, before any
+# run; CPU suites ab_8ed091c_{a,b,c1,c2,c3} green). WHY: analysis/evalfast/PROFILE_f3l_mixed.md sections 3.2-3.3 and 4 (step 3): on F3L
 # (evalfast2f3l) apply_events is 60.5 ms of the 403.9 ms median tick and the one span that is still launch-bound. Per
 # rolled-back request and per layer it runs sync_draft_bank (10 small device ops) and copy_ring (3 copies): 13 x 32 =
 # 416 launches per rollback. --apply-batched (ROOT NOSI_EVAL = nosi-r2-applyev: flean 665ac69 + this change) puts the
 # rollbacks into the publications' batched rebuild (the _publish_batched pattern: per layer ONE rebuild_banks_unchecked
 # and ONE copy_rows_many for every rollback and publication of the tick) and makes the keep vector once per tick. The
 # state is bitwise the unbatched state (r2_tick.py TickEngine._apply_batched docstring: EXACTNESS (a)-(c)).
-#   evalfast2ab      evalfast2f3l + --apply-batched (FAST timing, B 216, no --eval-bands: the bands come with the
-#                    prediction)
+#   evalfast2ab      evalfast2f3l + --apply-batched (FAST timing, B 216, --eval-bands 425:475:305:345:248:280, the
+#                    AB-MED / AB-MEAN / AB-EFF bands below)
 #   evalfast2c3ab    evalfast2c3l (CHECK, B 216, 8 steps, --draft-ticks 4, no --bare, no eval role) + --apply-batched
 #   evalfast2f3l     the same-job control (unchanged arguments; this ROOT, --apply-batched off)
 #   AB-C3    evalfast2c3ab MUST _draft_only_fused_equal / _round_fused_equal / _fused_err PASS: 0 diffs, every layer
 #            compared; MUST <label>_AB_acted (apply_calls > 0, one call with >= 2 rollbacks). FALSIFIER: a difference:
 #            evalfast2ab is VOID
 #   AB-ACT   evalfast2ab MUST <label>_AB_acted (the round's engine ran the batched apply with rollbacks)
-#   PREDICTION: TBD by lead (AB-MED / AB-MEAN / AB-EFF bands, AB-FALS, AB-MEM; the bare_host_profile h_apply_events
-#            median vs the same-job evalfast2f3l)
+#   AB-MED   steady tok/s (median tick). PREDICTION: 450 [425, 475] (f3l 412.05 / 420.92; about 35 of the 60.5 ms
+#            apply_events span goes, so the 404 ms median tick falls to about 370 ms)
+#   AB-MEAN  steady tok/s (mean tick). PREDICTION: 323 [305, 345] (the same ms saving on a longer mean tick)
+#   AB-EFF   effective tok/s. PREDICTION: 262 [248, 280] (the 16 s first-fill / end gap does not change)
+#   AB-HAPPLY bare_host_profile h_apply_events median. PREDICTION: below 30 ms (same-job evalfast2f3l about 60 ms)
+#   AB-FALS  PREDICTION: fires if the median is below the same job's evalfast2f3l median + 10 tok/s
+#   AB-MEM   peak_gb <= 84 (MUST EF_mem_cap). PREDICTION: 83.1 to 83.3 GB (f3l 83.18)
 #
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
@@ -797,7 +802,7 @@ case $CELL in
         EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
                  --eval-role fast-time --mem-cap-gb 84
                  --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
-                 --b2-resolve fused --fused-kernel v3 --host-profile --gc-freeze --lean-time
+                 --eval-bands 425:475:305:345:248:280 --b2-resolve fused --fused-kernel v3 --host-profile --gc-freeze --lean-time
                  --wait-index --b2-fewer-reads "${ABFLAGS[@]}") ;;
     evalfast2c3ab) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_evalfast2c3ab  # [applyev]
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
