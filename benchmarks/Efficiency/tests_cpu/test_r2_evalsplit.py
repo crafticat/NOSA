@@ -480,7 +480,7 @@ def test_EV13_the_step_scripts(tmp_path):
                     assert word not in ln, (name, word, ln)
     sg = (EFF / "r2_tick_sg5_step.sh").read_text()
     root = next(ln for ln in sg.splitlines() if ln.startswith("NOSI_EVAL=")).split()[0][len("NOSI_EVAL="):]
-    assert root == "/mnt/beegfs/ojerbi/nosi-r2-f3lia"                   # [f3lia] (was [flean]'s nosi-r2-flean, [admitfill]'s nosi-r2-admitfill)
+    assert root == "/mnt/beegfs/ojerbi/nosi-r2-f3lia"                   # [f3lia] (was nosi-r2-flean / -admitfill / -acc216)
     ea = (EFF / "r2_evalacc_step.sh").read_text()
     assert next(ln for ln in ea.splitlines() if ln.startswith("NOSI=")).split()[0] == "NOSI=/mnt/beegfs/ojerbi/nosi-r2-sg5par"
     # [hostfix] stack2 4ddb795 (cherry-picked) moved the stack1 cells' ROOT from integ6 to stack2

@@ -751,7 +751,7 @@ def test_HF5f_the_harness_wiring():
 # =====================================================================================================================
 REPO = HERE.parents[2]
 STEP = EFF / "r2_tick_sg5_step.sh"
-HF_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3lia"                     # [f3lia] (was [flean]'s nosi-r2-flean, [admitfill]'s nosi-r2-admitfill)
+HF_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3lia"                     # [f3lia] (was nosi-r2-flean / -admitfill / -acc216)
 
 
 def test_HF6a_the_cells_and_the_registration_static():
@@ -764,7 +764,8 @@ def test_HF6a_the_cells_and_the_registration_static():
             "|evalfast2c3|evalfast2f3|evalfast2f3_192"                                             # [fr3] the v3 cells
             "|evalfast2f3p|evalfast2c3l|evalfast2f3l"                                              # [flean]
             "|evalfast2ia"                                                                         # [admitfill]
-            "|evalfast2f3lia|evalfast2c3lia] [gilfree|gather]") in text                            # [f3lia]
+            "|evalacc216m|evalacc216"                                                              # [acc216]
+            "|evalfast2f3lia|evalfast2c3lia|evalacc216f3lia] [gilfree|gather]") in text            # [f3lia]
     assert "        evalfast2|evalfast2t|evalfast2c) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     reg = text[text.index("# REGISTERED for evalfast2t / evalfast2 / evalfast2c"):]
     reg = reg[:reg.index("\n#\n")]
