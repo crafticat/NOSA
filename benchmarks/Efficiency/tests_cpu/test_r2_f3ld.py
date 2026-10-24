@@ -12,9 +12,29 @@ untouched; done(), landed_upto() and the forces see the view. Both arms poll onc
 the view is the same in both.
 
   TO0  PRECONDITIONS (L34), over the TO1 draws: the arms issue descriptor jobs; the table arm holds transfers (landed
-       before due) AND forces them (due, not landed); Policy E evicts an in-flight slot; a verify merge and a draft
-       merge write the demand of a slot in flight; a request ends with takes in flight; the mirror arm keeps Transfers
-       in flight and the table arm none.
+       before due) AND forces them (due, not landed); Policy E evicts an in-flight slot (in the SCRIPTED draw only, see
+       THE CADENCE BOUND; the lag <= 2 draws evict none, asserted); a verify merge and a draft merge write the demand
+       of a slot in flight; a request ends with takes in flight; the mirror arm keeps Transfers in flight and the table
+       arm none.
+
+THE CADENCE BOUND (why the random draws never evict a slot in flight). Policy E's in-flight candidate is an UNPINNED,
+not-landed draft prefetch of the stream (r2_own2_ops.py:706-707 policy_e_check cf; r2_residency_sc.py:518-525
+device_verify cand_f). A draft row pins every block it selects with its cohort key (r2_residency_sb.py:160 protect =
+valid; r2_own2.py:1528 pins_or). That key is released only behind the verify read of its cohort (r2_own2.py:1903-1913
+_lean_queue; r2_residency.py:796-798) or by a cancel (r2_residency.py:806-834), and the drop runs at a later poll,
+AFTER the arrivals (r2_own2.py:717-729). A cohort is verified at least one tick after its last draft row
+(r2_spec_core.py:136-154 plan_tick, :178-182 the trigger; r2_tick.py:1175-1177 cohort_of). So a prefetch issued at
+tick t is unpinned at the poll of t + 2 at the earliest, where the arrival rule (lag <= 2) admits it first
+(r2_own2_ops.py:368-374). The one earlier release, a cancel at tick t, starts a new epoch with no cohort for K + 1
+ticks, so the request has no verify row while the prefetch is in flight. Hence: with arrival_lag <= 2 (every random
+draw and the GPU cells' --arrival-lag 2) no in-flight victim exists, by the cadence. The SCRIPTED draw (_script_setup) uses
+arrival_lag 8 and a scripted selection that builds the state by construction: C = 3, X = 0 (K5 refuses the verifier
+when the stream is full, ownership.py:419-427), the drafts prefetch three blocks, a rejection or a verify releases
+their keys, and at the next verify tick of ONE stream (layer 0, request 3, head 0) the verify rows select a block that
+is neither resident nor in flight plus every unpinned LRU block (so no LRU candidate exists) and spare the oldest
+prefetch: Policy E supersedes the second-oldest prefetch, whose job is not forced yet. The draft row of that tick
+selects the same blocks, so it merges onto the verify take of this tick (demand {verify}: the TO2i site,
+r2_own2_ops.py:669-678 merge_check this_tick; r2_own2.py:1153-1162).
   TO1  ROUND LEVEL, randomized streams: per draw (random.Random(seed): the configuration, the data seed, teacher-forced
        or free-running, the event lateness 0 / 2, arrival_lag 1 / 2, checked / unchecked, --b2-fewer-reads,
        --wait-index, --res-lean / --res-dev, the completion view, the mirror arm's poll: the array poll or the old one)
@@ -27,7 +47,8 @@ the view is the same in both.
        TO1f: the fused v3 resolve (--b2-resolve fused --fused-kernel v3 --res-lean --res-dev, TRITON_INTERPRET=1 in a
        fresh process) on the eval flag set: table arm == mirror arm.
   TO2  NEGATIVE CONTROLS at the site under test (b2_mut, the table arm; L34: each records that it acted; L49: the plant
-       is at the table-path line, not on a module global): (i) nm_drop_dem_d: one draft demand bit is not written ->
+       is at the table-path line, not on a module global; (i) and (iv) act in the SCRIPTED draw, by construction: THE
+       CADENCE BOUND above): (i) nm_drop_dem_d: one draft demand bit is not written ->
        the first difference is that tick's TABLE (the demand column) and a later tick's projection (the admission went
        another way); (ii) nm_due_early: one job due a tick early -> the first difference is at that tick; (iii)
        nm_skip_force: a due job that has not landed is not forced -> O.poll_arrivals refuses (CapacityRefusal "force_seq
@@ -177,7 +198,8 @@ def _slow(tp, delay_of):
     return st
 
 
-SLOW = {None: None, "mix": lambda s: 1 + s % 3, "late": lambda s: 3, "early": lambda s: 1}
+SLOW = {None: None, "mix": lambda s: 1 + s % 3, "late": lambda s: 3, "early": lambda s: 1,
+        "never": lambda s: 1 << 30}                                   # [f3ldx] seen landed only once forced (SCRIPT)
 
 
 def _arm_kw(d, table):
@@ -215,7 +237,16 @@ def _round(p3, v3, toks, d, table, plant_kw=None, facts=False, count=None, setup
     """One round of draw d on the mirror arm (table False) or the table arm; plant_kw: more OwnResidency arguments
     (a control); facts: record _mirror_facts per tick; count: a dict that gets the per-tick in-flight map sizes (also
     kept in r.box["inflight"]); setup(eng, svc, ticks): before the round. Every tick record gets "view": the
-    completion view's forced watermark after the tick (None without a view)."""
+    completion view's forced watermark after the tick (None without a view). [f3ldx] d["setup"] (the SCRIPTED draw's
+    selection): called before setup."""
+    ds = d.get("setup")
+    if ds is not None:
+        s0 = setup
+
+        def setup(eng, svc, ticks, _a=ds, _b=s0):
+            _a(eng, svc, ticks)
+            if _b is not None:
+                _b(eng, svc, ticks)
     kw = _arm_kw(d, table)
     kw.update(plant_kw or {})
     box = dict(inflight=[], view_ticks=[])
@@ -261,7 +292,101 @@ FIXED = [dict(name="eval", cfg="pressure", seed=1, forced=True, late=2, lag=2, c
               wait_index=True, res_lean=True, res_dev=True, slow="mix", ia=True),
          dict(name="checked-free", cfg="default", seed=2, forced=False, late=2, lag=2, checked=True, fewer_reads=False,
               wait_index=False, res_lean=False, res_dev=False, slow="late", ia=True)]
-DRAWS = FIXED + _draws()
+
+# ---------------------------------------------------------------------------------------------------------------------
+# [f3ldx] THE SCRIPTED DRAW (module docstring, THE CADENCE BOUND): a selection that reads the table at each resolve
+# ---------------------------------------------------------------------------------------------------------------------
+BD.CFG.setdefault("script", dict(C=3, X=0, R_ver=0))                 # NPOS = C: a full stream gets no K5 slot
+U_SCRIPT = tuple(range(6))           # history blocks of every row: T = pos // 64 >= 7, so hist_bound >= T - 1 >= 6
+SCRIPT_TARGET = (0, 3, 0)            # (layer, request, head): the ONE stream where Policy E acts (TO2iv: one victim)
+
+
+def _stream_view(T, l, b, h):
+    """The table's state of stream (l, b, h) at this resolve (the decisions of the tick apply at end_tick, so every
+    layer of a tick sees the state after the tick's poll): resident blocks, unpinned LRU blocks, the current owner's
+    blocks in flight (take stamp, block) and the unpinned not-landed draft prefetches among them (Policy E's in-flight
+    candidates before the layer's selection, r2_own2_ops.py:706-707), the FREE count, the blocks of U_SCRIPT in no
+    slot."""
+    code = T.c["code"][l, b, h].tolist()
+    blk = T.c["block"][l, b, h].tolist()
+    uid = T.c["uid"][l, b, h].tolist()
+    iss = T.c["issuer"][l, b, h].tolist()
+    landed = T.c["landed"][l, b, h].tolist()
+    stamp = T.c["stamp"][l, b, h].tolist()
+    acc = None
+    for row in T.pin_w[:, l, b, h].tolist():                          # any key plane (any_pin_words)
+        acc = list(row) if acc is None else [x | y for x, y in zip(acc, row)]
+
+    def pinned(x):
+        return (acc[x // 32] >> (x % 32)) & 1 == 1
+    own = int(T.owner[b])
+    sl = list(zip(code, blk, uid, iss, landed, stamp))
+    res = sorted(x for (c, x, _, _, _, _) in sl if c in (RSC.C_LRU, RSC.C_PO, RSC.C_VRES))
+    lru_up = sorted(x for (c, x, _, _, _, _) in sl if c == RSC.C_LRU and not pinned(x))
+    fly = sorted((s, x) for (c, x, u, _, _, s) in sl if c == C_INFLIGHT and u == own)
+    fly_up = sorted((s, x) for (c, x, u, i, ld, s) in sl
+                    if c == C_INFLIGHT and u == own and i == OWN2.O.ISS_D and not ld and not pinned(x))
+    used = {x for (c, x, _, _, _, _) in sl if c != RSC.C_FREE}
+    return dict(res=res, lru_up=lru_up, fly=fly, fly_up=fly_up, nfree=sum(1 for c in code if c == RSC.C_FREE),
+                fresh=[x for x in U_SCRIPT if x not in used])
+
+
+def _script_sel(svc, l, rows, sel, target):
+    """The scripted selection of one layer (the rows' last two entries, blocks T - 1 and T, are kept; the first k - 2
+    entries name the history blocks, padded with repeats: the device keeps unique blocks, r2_residency_sc.py:465-468).
+    Per stream (l, b, h):
+      TARGET and a verify row and the stream full (no FREE slot; X = 0: K5 refuses) and an unpinned prefetch in flight:
+          verify AND draft rows select {a block in no slot} + every unpinned LRU block + (two or more candidates) the
+          oldest prefetch. So K5 refuses the miss, no LRU candidate exists, and Policy E supersedes the second-oldest
+          prefetch (r2_residency_sc.py:516-538), whose job no read forced; the draft row merges onto the verify take.
+      else (preparation, no Policy E): verify rows read the lowest resident block, else the oldest block in flight
+          (the device waits for it: the oldest job is the one forced), else a block in no slot (a FREE slot exists:
+          nothing is resident or in flight); draft rows select the lowest block in no slot (a prefetch while a slot
+          is FREE, else a refusal)."""
+    T = svc.own
+    H, R, k = sel.shape
+    new = sel.clone()
+
+    def pad(s):
+        s = sorted(set(s))
+        return torch.tensor(s + [s[-1]] * (k - 2 - len(s)), dtype=sel.dtype)
+    for b in sorted({r.b for r in rows}):
+        vi = [i for i, r in enumerate(rows) if r.b == b and r.kind == "v"]
+        di = [i for i, r in enumerate(rows) if r.b == b and r.kind == "d"]
+        for i in vi + di:
+            assert rows[i].hist_bound >= len(U_SCRIPT) and k - 2 >= len(U_SCRIPT), ("SCRIPT: U_SCRIPT is not history",
+                                                                                     rows[i], k)
+        for h in range(H):
+            v = _stream_view(T, l, b, h)
+            assert v["fresh"], ("SCRIPT: every block of U_SCRIPT holds a slot", l, b, h, v)
+            if (l, b, h) == target and vi and v["nfree"] == 0 and v["fly_up"]:
+                spare = [v["fly_up"][0][1]] if len(v["fly_up"]) >= 2 else []
+                sv = sd = [v["fresh"][0]] + v["lru_up"] + spare
+            else:
+                sv = v["res"][:1] or [x for (_, x) in v["fly"][:1]] or v["fresh"][:1]
+                sd = v["fresh"][:1]
+            for i in vi:
+                new[h, i, :k - 2] = pad(sv)
+            for i in di:
+                new[h, i, :k - 2] = pad(sd)
+    return new
+
+
+def _script_setup(target=SCRIPT_TARGET):
+    """setup(eng, svc, ticks) of the SCRIPTED draw: svc.resolve (already _run's recorder) gets the scripted
+    selection; the engine's attention reads the plan's pages, so the tokens stay teacher-forced (forced=True)."""
+    def setup(eng, svc, ticks):
+        inner = svc.resolve
+
+        def resolve(l, rows, sel):
+            return inner(l, rows, _script_sel(svc, l, rows, sel, target))
+        svc.resolve = resolve
+    return setup
+
+
+SCRIPT = dict(name="script-evict", cfg="script", seed=1, forced=True, late=0, lag=8, checked=False, fewer_reads=False,
+              wait_index=False, res_lean=False, res_dev=False, slow="never", ia=True, setup=_script_setup())
+DRAWS = FIXED + _draws() + [SCRIPT]
 _PAIRS = {}
 
 
@@ -311,8 +436,14 @@ def test_TO0_preconditions_the_draws_issue_hold_force_evict_merge_and_end_in_fli
     assert sum(t.svc.arrival_held for _, t in pairs) > 0, "precondition: no take landed before it was due"
     assert sum(t.svc.arrival_forced for _, t in pairs) > 0, "precondition: no due take was forced"
     assert sum(t.svc.nm_stats["forced_jobs"] for _, t in pairs) > 0
-    ev_in = sum(t.svc.journal_counts.get("release:verifier_evict_inflight", 0) for _, t in pairs)
-    assert ev_in > 0, "precondition: Policy E never evicted a slot in flight"
+    ev_by = {d["name"]: t.svc.journal_counts.get("release:verifier_evict_inflight", 0)
+             for d, (_, t) in zip(DRAWS, pairs)}
+    low = {d["name"]: ev_by[d["name"]] for d in DRAWS if d["lag"] <= 2}
+    assert low and sum(low.values()) == 0, ("THE CADENCE BOUND (module docstring): with arrival_lag <= 2 no in-flight "
+                                            "Policy E victim exists, yet a draw evicted one", low)
+    ev_in = sum(ev_by.values())
+    assert ev_by[SCRIPT["name"]] > 0, ("precondition: Policy E never evicted a slot in flight in the SCRIPTED draw",
+                                       ev_by, pairs[DRAWS.index(SCRIPT)][1].err)
     assert all(max(m.box["inflight"]) > 0 for m, _ in pairs), "precondition: a mirror arm held no Transfer in flight"
     assert all(max(t.box["inflight"]) == 0 for _, t in pairs), "a table arm held a Transfer in flight"
     # the merges and the ends in flight: one more table-arm round of the eval draw with counters on the shared ops
@@ -419,7 +550,7 @@ def _clean_tbl(p3, v3, toks, d):
 def test_TO2i_a_dropped_draft_demand_bit_is_seen_in_that_ticks_table(p3, ref, v3):
     toks, _ = ref
     tried = []
-    for d in DRAWS:
+    for d in [SCRIPT] + [x for x in DRAWS if x is not SCRIPT]:        # [f3ldx] the SCRIPTED draw acts by construction
         bad = _round(p3, v3, toks, d, True, plant_kw=dict(b2_mut={"nm_drop_dem_d": True}))
         done = bad.svc.nm_mut_done
         tried.append((d["name"], done))
@@ -469,15 +600,16 @@ def test_TO2iii_a_due_job_not_forced_is_refused_by_the_poll(p3, ref, v3):
 def test_TO2iv_a_victim_job_not_forced_is_seen_in_that_ticks_view(p3, ref, v3):
     """On the CPU stand-in the device wait forces a superseded prefetch first (CpuDeviceSim.wait, Policy E 12j) and its
     gather refuses a write before it landed (check_t3): so the host-side force of the victim's job acts only with
-    both off (sc_mut no_inflight_wait and dev.check_t3 False, in the clean and the planted round alike)."""
+    both off (sc_mut no_inflight_wait and dev.check_t3 False, in the clean and the planted round alike).
+    [f3ldx] The draw is the SCRIPTED one (module docstring, THE CADENCE BOUND: the earlier lag-2 candidates "pressure"
+    1-3 / "default" 1 can have no in-flight victim). Its view lands a job only when forced (slow "never"), and Policy E
+    acts on ONE stream, so the victim's job is forced by nothing else in that tick."""
     toks, _ = ref
 
     def no_t3(eng, svc, ticks):
         svc.dev.check_t3 = False
     tried = []
-    for cfg, seed in (("pressure", 1), ("pressure", 2), ("pressure", 3), ("default", 1)):
-        d = dict(FIXED[0], name="victim-%s-%d" % (cfg, seed), cfg=cfg, seed=seed, slow="late", res_lean=False,
-                 res_dev=False, extra=dict(sc_mut={"no_inflight_wait": True}))
+    for d in (dict(SCRIPT, name="victim-script", extra=dict(sc_mut={"no_inflight_wait": True})),):
         bad = _round(p3, v3, toks, d, True, plant_kw=dict(b2_mut={"nm_victim_unforced": True}), setup=no_t3)
         done = bad.svc.nm_mut_done
         tried.append((d["name"], done, bad.err))
