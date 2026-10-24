@@ -458,33 +458,36 @@
 #   IA-MEM   peak_gb <= 84 (MUST EF_mem_cap). Estimate: rl 83.04 GB plus under 0.05 GB (N0 x 3 int64 columns 16 MB, the row
 #            index 5 MB, the cat and the check masks of one poll about 25 MB)
 #
-# REGISTERED for evalfast2f3lia / evalfast2c3lia / evalacc216f3lia ([f3lia], NOT STAMPED: the lead fills every PREDICTION and adds the
-# stamp line before any run). WHAT: this tree (ROOT NOSI_EVAL = nosi-r2-f3lia: flean 665ac69 merged with admitfill
+# REGISTERED for evalfast2f3lia / evalfast2c3lia / evalacc216f3lia ([f3lia], STAMP 2026-10-24T01:50:02Z, before any run; the
+# lead filled every PREDICTION from SCORING_flean.md, SCORING_inflight.md, SCORING_acc216.md, PROFILE_f3l_mixed.md). WHAT: this tree (ROOT NOSI_EVAL = nosi-r2-f3lia: flean 665ac69 merged with admitfill
 # c714fb2) has the fused v3 resolver with --res-lean --res-dev (evalfast2f3l) and the array poll --inflight-array
 # (evalfast2ia). The two parts are independent: the array poll is OwnResidency._poll_arrivals (the take path's issue
 # parts), the fused resolve is FusedResolver.resolve; no new code joins them (tests_cpu/test_r2_f3lia.py). Same-job
 # controls: evalfast2f3l (the fused path without the array poll) and evalfast2ia (the array poll on the torch resolve).
-#   evalfast2f3lia   evalfast2f3l + --inflight-array (FAST timing, B 216, --eval-bands "$F3LIA_BANDS": TBD by lead;
-#                    the harness refuses the placeholder TBD, so the cell cannot run before the lead fills it)
+#   evalfast2f3lia   evalfast2f3l + --inflight-array (FAST timing, B 216, --eval-bands "$F3LIA_BANDS" =
+#                    415:460:305:360:252:300, the F3LIA-MED/MEAN/EFF bands below)
 #   evalfast2c3lia   evalfast2c3l + --inflight-array (CHECK, B 216, 8 steps, --draft-ticks 4, no --bare, no eval role)
 #   C3LIA    MUST _draft_only_fused_equal / _round_fused_equal / _fused_err PASS: 0 diffs, every layer compared, with
 #            the array poll on. FALSIFIER: a difference: evalfast2f3lia is VOID
-#   F3LIA-MED  steady tok/s (median tick). PREDICTION: TBD by lead
-#   F3LIA-MEAN steady tok/s (mean tick). PREDICTION: TBD by lead
-#   F3LIA-EFF  effective tok/s. PREDICTION: TBD by lead
-#   F3LIA-POLL h_poll_arrivals (bare_host_profile.per_tick_ms, tick 2 and the median). PREDICTION: TBD by lead
+#   F3LIA-MED  steady tok/s (median tick). PREDICTION: 435 [415, 460] (f3l 412.05 / 420.92 + ia's +6 % on rl; the
+#              profile's estimate about 435)
+#   F3LIA-MEAN steady tok/s (mean tick). PREDICTION: 330 [305, 360] (f3l mean 301.59 / 308.44; ia raised rl's mean +15 %)
+#   F3LIA-EFF  effective tok/s. PREDICTION: 275 [252, 300] (f3l 249.68 / 254.46; ia raised rl's effective +12 %)
+#   F3LIA-POLL h_poll_arrivals (bare_host_profile.per_tick_ms, tick 2 and the median). PREDICTION: tick 2 > 1000 ms
+#              (REPORT; ia's own run kept 2705 / 2739 ms, IA-FALS (a) fired, so the poll is not the gain's cause)
 #   F3LIA-SAME the bare round's ticks and committed equal evalfast2f3l's of the same job: no decision changed
-#   F3LIA-FALS PREDICTION: TBD by lead
-#   F3LIA-MEM  peak_gb <= 84 (MUST EF_mem_cap). PREDICTION: TBD by lead
+#   F3LIA-FALS PREDICTION: the median is below the same job's evalfast2f3l median (ia adds nothing on the fused path)
+#   F3LIA-MEM  peak_gb <= 84 (MUST EF_mem_cap). PREDICTION: 83.0 to 83.3 GB (f3l 83.18, ia 83.04)
 #   evalacc216f3lia  evalacc216 (the acc216 block below: --modes fast,bi_c_strict, no --bare, no eval role,
 #                    --store-committed-tokens --serial-rows 8 --gold-workload GOLD) on this path: --b2-resolve fused
 #                    --fused-kernel v3 --res-lean --res-dev --inflight-array; --link-record = the evalfast2f3lia
 #                    summary.json of the same run id and holder
-#   ACC3LIA-BI   ACC_exact_batch_invariance (MUST). PREDICTION: TBD by lead
-#   ACC3LIA-ETD  ACC_exact_vs_serial (MUST). PREDICTION: TBD by lead
-#   ACC3LIA-AE   ACC_AE_fast_vs_exact (MUST). PREDICTION: TBD by lead
-#   ACC3LIA-LINK R_ACC_fast_link (REPORT) against evalfast2f3lia. PREDICTION: TBD by lead
-#   ACC3LIA-MEM  R_ACC_peak (REPORT). PREDICTION: TBD by lead
+#   ACC3LIA-BI   ACC_exact_batch_invariance (MUST). PREDICTION: PASS, 0 of 122 pairs differ
+#   ACC3LIA-ETD  ACC_exact_vs_serial (MUST). PREDICTION: PASS, 8 of 8 rows x 48 committed tokens equal
+#   ACC3LIA-AE   ACC_AE_fast_vs_exact (MUST). PREDICTION: EQUIVALENT (acc216 on rd: accept d -0.00010, gold d -0.00076)
+#   ACC3LIA-LINK R_ACC_fast_link (REPORT) against evalfast2f3lia. PREDICTION: EQUAL counts
+#   ACC3LIA-MEM  R_ACC_peak (REPORT). PREDICTION: <= 84 GB (acc216 full 83.25)
+#   No miniature: evalfast2c3lia (8 steps, CHECK) runs first in the same job and gates every later cell.
 #
 # REGISTERED for evalacc216m / evalacc216 ([acc216], STAMP 2026-10-23T18:04:12Z, before any run; the lead writes the stamp from
 # `date -u` in the command that freezes this block, L33). WHY: analysis/evalfast/STATUS_accuracy_B216.md: at B 216 no
@@ -910,7 +913,7 @@ case $CELL in
                  --b2-resolve check --fused-kernel v3 --res-lean --res-dev) ;;
     evalfast2f3lia) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_evalfast2f3lia  # [f3lia]
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched
-        F3LIA_BANDS=TBD                                     # PREDICTION: TBD by lead (REGISTERED F3LIA-MED/MEAN/EFF)
+        F3LIA_BANDS=415:460:305:360:252:300                 # REGISTERED F3LIA-MED/MEAN/EFF (STAMP 2026-10-24T01:50:02Z)
         [ "${DRYRUN:-0}" = 1 ] || [ "$F3LIA_BANDS" != TBD ] ||
             stop "cell $CELL: --eval-bands TBD (the lead fills and stamps the REGISTERED F3LIA block first)"
         EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
