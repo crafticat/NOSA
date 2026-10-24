@@ -32,11 +32,34 @@ NEGATIVE CONTROLS (b2_mut, tests only; the B2 forms of C's fixture plants and of
   no_dedup_check, mirror_ignores_owner, owner_blind, no_uid_check, free_on_cancel, one_batch, ignore_flags, no_t4,
   no_reader_wait, drop_rd_last, keep_rd_last_on_drop, poll_order_swapped, key_alias, trash_writer, and the record
   mutations rec_mut (drop / alter the first record of a kind, after the read and before the checks).
+
+[inflight-array] THE IN-FLIGHT TABLE OF ISSUES (--inflight-array; OPT-IN, default False: every line of the old poll
+runs; analysis/evalfast/DIAG_effective_gap.md section 4, fix 2). The old poll sorts every transfer in flight and asks
+the arrival rule once per transfer (h_poll_arrivals 4.9 s at tick 2 of evalfast2rl: the whole first fill arrives
+there). With the flag, _host_side also keeps the draft takes of a tick as ISSUE PARTS, one per layer: the transfer list
+that end_tick gives to ONE tp.issue call, and the takes' (flat slot, generation, block) columns, selected on the table's
+device from write_takes' columns. The poll then:
+  - admits the urgent takes in flight (the _landed set), as before (no arrival rule);
+  - admits every transfer in flight of every DUE part (issue tick + arrival_lag <= tick), and none of a part not due:
+    the old rule, per part instead of per transfer. A transfer that left the map (a Policy E victim) is skipped.
+  - asks the transport ONE done (and at most ONE force) per part when the transport says that every transfer of one
+    issue completes on one event, set in the transfers' order (one_event_per_issue: gilfree, gather); else it asks per
+    transfer, in the old (layer, b, h, seq) order. The forced and held counts are the old ones (per transfer).
+  - checks I6 in ONE vectorized compare on the device (the old per-transfer check gives the old exception on a
+    failure), and removes the admitted transfers from the host maps in C-level map calls.
+The admitted set is the old set at every poll, so every decision, page table and logit is the same
+(tests_cpu/test_r2_admitfill.py). A COVERAGE CHECK at each poll refuses a transfer in flight that no part and no urgent
+take holds. It needs the fixed arrival rule (arrival_lag): with free timing the due set is per-transfer completion.
+NEGATIVE CONTROLS (b2_mut, tests only; each acts at the site under test, the array poll): ia_skip_one (a due part
+leaves out one transfer), ia_due_early (a part is due one tick early), ia_bad_gen (the check's expected generation of
+the first arrival is one too high).
 """
 from __future__ import annotations
 
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from itertools import chain, compress, repeat
+from operator import attrgetter, is_
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -57,10 +80,26 @@ _SH32 = torch.arange(32, dtype=torch.int64)
 # no_read_harvest (SG5 b2): the 4.8 lifetimes get no read counts from the table (report()["k48"] differs from S-C's)
 B2_MUTS = ("no_dedup_check", "mirror_ignores_owner", "owner_blind", "no_uid_check", "free_on_cancel", "one_batch",
            "ignore_flags", "no_t4", "no_reader_wait", "drop_rd_last", "keep_rd_last_on_drop", "poll_order_swapped",
-           "key_alias", "rec_mut", "no_read_harvest")
+           "key_alias", "rec_mut", "no_read_harvest",
+           "ia_skip_one", "ia_due_early", "ia_bad_gen")              # [inflight-array] the array poll's controls
 REC_MUTS = ("take_nonfree", "take_swap", "k5_over", "pe_not_first", "drop_refusal", "drop_v_merge", "drop_d_merge",
             "drop_ready", "drop_rowsel", "drop_vread", "ignore_overflow", "reverse_stamps", "evict_po_unpinned",
             "gen_plus_two")
+# [inflight-array] the Transfer fields the array poll reads in C-level map calls; _ORDER is the old poll's order
+_SEQ, _B, _H, _BLK, _REQ = (attrgetter(n) for n in ("seq", "b", "h", "block", "requester"))
+_ORDER = attrgetter("layer", "b", "h", "seq")
+
+
+class _IAPart:
+    """[inflight-array] One draft issue of one tick (module docstring): the layer l, the transfer list trs that end_tick
+    gives to ONE tp.issue call (the same list object), their seqs (made at the first poll), and cols: their (flat slot,
+    generation, block) columns, (3, len(trs)) int64 on the table's device, in the order of trs."""
+    __slots__ = ("l", "trs", "lo", "hi", "cols", "seqs")
+
+    def __init__(self, l: int, trs: list, lo: int, hi: int):
+        self.l, self.trs, self.lo, self.hi = int(l), trs, int(lo), int(hi)
+        self.cols = None
+        self.seqs = None
 
 
 class OwnResidency(ResidencySparse):
@@ -70,7 +109,7 @@ class OwnResidency(ResidencySparse):
     def __init__(self, *args, keys: int = 7, checked: bool = True, b2_mut=None, resolve: str = "torch",
                  fused_plant: int = 0, fused_guard: bool = False, fused_warm: str = "auto", lean: bool = False,
                  wait_index: bool = False, fewer_reads: bool = False, res_lean: bool = False, res_dev: bool = False,
-                 fused_kernel: str = None, **kw):
+                 fused_kernel: str = None, inflight_array: bool = False, **kw):   # [fr3] [inflight-array] ([f3lia])
         kw["pin_records"] = False
         self.__dict__["_own_ready"] = False
         # [hostfix] --lean-time (OPT-IN, default False: every line as before): the REPORT-only host work is skipped
@@ -95,6 +134,15 @@ class OwnResidency(ResidencySparse):
         super().__init__(*args, **kw)
         if wait_index:                                                # [hostfix] --wait-index (OPT-IN): the same map
             self.inflight = InflightByLayer(self.inflight)            # with a per-layer index (_superset_wait)
+        # [inflight-array] --inflight-array (OPT-IN, default False: the old poll): the in-flight table of issues
+        # (module docstring). It needs the fixed arrival rule: the due set is then a function of the issue tick only
+        self.inflight_array = bool(inflight_array)
+        if self.inflight_array and self.arrival_lag is None:
+            raise ValueError("inflight_array needs a fixed arrival_lag (an int >= 1): with free timing a transfer "
+                             "arrives at its own completion, so the poll must ask the transport per transfer")
+        self._ia_groups: Dict[int, List[_IAPart]] = {}                # issue tick -> its draft issue parts
+        self.ia_mut_done = None                                       # (tick, kind) of an applied array control
+        self.ia_stats = dict(polls=0, parts_due=0, group_checks=0, transfer_checks=0, admitted=0)
         self.checked = bool(checked)
         self.b2_mut = dict(b2_mut or {})
         for k in self.b2_mut:
@@ -302,6 +350,8 @@ class OwnResidency(ResidencySparse):
                          table_bytes=sum(t.numel() * t.element_size() for t in self.own.tensors().values()),
                          mirror="the table's columns copied on the device at each tick's first resolve (no host delta)")
         out["b2"]["resolve"] = self.resolve_mode                      # [fusedres]
+        if self.inflight_array:                                       # [inflight-array] REPORT (off: no key)
+            out["b2"]["inflight_array"] = dict(self.ia_stats)
         if self.fusedres is not None:
             out["b2"]["fused"] = self.fusedres.report()
         return out
@@ -512,6 +562,8 @@ class OwnResidency(ResidencySparse):
         """res.py:245-264: every transfer whose own completion is observed (or landed in place: an urgent gather) is
         admitted, by the arrival rule (_arrived, note 12k); the admission branches are O.poll_arrivals' (own.py:322-361),
         on the slots of the arrived transfers only."""
+        if self.inflight_array:                                       # [inflight-array] (off: the old lines below)
+            return self._poll_arrivals_array()
         self.tp.poll()
         order = sorted(self.inflight.values(), key=lambda tr: (tr.layer, tr.b, tr.h, tr.seq))
         arrived = []
@@ -575,6 +627,231 @@ class OwnResidency(ResidencySparse):
                 raise OwnershipViolation("B2 poll: after the arrivals %s fails (I1: one slot per resident or in-flight "
                                          "block; I2: the LRU holds at most C; I3: a PO / VRES slot is pinned)" % fails)
         return len(arrived)
+
+    # ---------------------------------------------------------------------------------------------- [inflight-array]
+    def _ia_add(self, takes: Dict, by_layer: Dict[int, List[Transfer]], rows_of: Dict[int, List[int]]) -> None:
+        """[inflight-array] The draft takes of this tick as issue parts, one per layer in end_tick's issue order
+        (sorted layers, as _host_side appends them to _deferred): the layer, the SAME transfer list that end_tick
+        issues, and the takes' (flat slot, generation, block) columns. rows_of[l]: the rows of write_takes' columns
+        (takes) of layer l's transfers, in the list's order. ONE host-to-device copy of the row indices and ONE
+        index_select on the device (no read)."""
+        order: List[int] = []
+        parts = []
+        for l in sorted(by_layer):
+            idx = rows_of[l]
+            if len(idx) != len(by_layer[l]):
+                raise OwnershipViolation("inflight-array: layer %d issues %d transfers but names %d take rows"
+                                         % (l, len(by_layer[l]), len(idx)))
+            parts.append(_IAPart(l, by_layer[l], len(order), len(order) + len(idx)))
+            order.extend(idx)
+        sel = self._h2d(torch.tensor(order, dtype=torch.int64))
+        cols = torch.stack([takes[n].to(torch.int64) for n in ("f", "gen", "blk")]).index_select(1, sel)
+        for p in parts:
+            p.cols = cols[:, p.lo:p.hi]
+        self._ia_groups.setdefault(self.tick_no, []).extend(parts)
+
+    def _ia_force(self, tr) -> None:
+        """[inflight-array] _arrived's force of a due transfer that has not landed (the same counts and clock)."""
+        t0 = time.perf_counter_ns()
+        self.tp.force(tr)
+        self.arrival_forced += 1
+        self.arrival_forced_ns += time.perf_counter_ns() - t0
+
+    def _poll_arrivals_array(self) -> int:
+        """[inflight-array] _poll_arrivals with the issue table (module docstring). The arrival rule is the old one: an
+        urgent take (in _landed) is admitted at the next poll; a draft transfer at the first poll of tick issue_tick +
+        arrival_lag or later, forced there if its issue has not landed; one landed earlier is counted as held at every
+        poll before. The admitted set is the old one. After the transport's poll: (1) the urgent takes in flight; (2)
+        per issue part, its transfers still in flight (one C-level membership map); a due part joins the arrivals, a
+        part not due counts its held transfers; (3) the COVERAGE CHECK; (4) the forces; (5) ONE vectorized I6 check;
+        (6) the table's admission (the lines of _poll_arrivals); (7) the host maps, in bulk."""
+        self.tp.poll()
+        tp, infl, T, G = self.tp, self.inflight, self.own, self.own.geo
+        has = infl.__contains__
+        lag, now = self.arrival_lag, self.tick_no
+        ev1 = bool(getattr(tp, "one_event_per_issue", False))
+        mu = self.b2_mut
+        st = self.ia_stats
+        st["polls"] += 1
+        early = 1 if mu.get("ia_due_early") else 0                    # NEGATIVE CONTROL: due one tick early
+        lan = [infl[s] for s in self._landed if has(s)]               # (1) the urgent takes in flight
+        n_cover = len(lan)
+        due, due_keys = [], []
+        for k in sorted(self._ia_groups):                             # (2) the issue parts, oldest tick first
+            is_due = k + lag - early <= now
+            for p in self._ia_groups[k]:
+                if p.seqs is None:
+                    p.seqs = list(map(_SEQ, p.trs))
+                alive = list(map(has, p.seqs))
+                na = sum(alive)
+                n_cover += na
+                if not na:
+                    continue
+                if not self._landed.isdisjoint(p.seqs):
+                    raise OwnershipViolation("inflight-array: a draft transfer of tick %d (layer %d) is in the urgent "
+                                             "set: it would arrive by two rules" % (k, p.l))
+                if is_due:
+                    if early and k + lag > now and self.ia_mut_done is None:
+                        self.ia_mut_done = (now, "ia_due_early")
+                    due.append([p, alive, na])
+                elif ev1:                                             # one event per issue: the last transfer's
+                    st["group_checks"] += 1                           # done is the issue's (set in list order)
+                    if tp.done(p.trs[-1]):
+                        self.arrival_held += na
+                else:
+                    for tr in compress(p.trs, alive):
+                        st["transfer_checks"] += 1
+                        if tp.done(tr):
+                            self.arrival_held += 1
+            if is_due:
+                due_keys.append(k)
+        if n_cover != len(infl):                                      # (3) every transfer in flight is held here
+            raise OwnershipViolation("inflight-array: %d transfers are in flight, but the issue table and the urgent "
+                                     "set hold %d: a transfer entered or left the in-flight map outside the take path"
+                                     % (len(infl), n_cover))
+        if mu.get("ia_skip_one") and due and self.ia_mut_done is None:   # NEGATIVE CONTROL: one transfer left out
+            p, alive, na = due[0]
+            alive = list(alive)
+            alive[alive.index(True)] = False
+            due[0] = [p, alive, na - 1]
+            self.ia_mut_done = (now, "ia_skip_one")
+        fb = []                                                       # (4) the forces of the due transfers
+        for p, alive, na in due:
+            st["parts_due"] += 1
+            if not na:
+                continue
+            if ev1:
+                st["group_checks"] += 1
+                if not tp.done(p.trs[-1]):
+                    self._ia_force(p.trs[-1])
+            else:
+                fb.extend(compress(p.trs, alive))
+        if fb:
+            fb.sort(key=_ORDER)                                       # the old poll's order (its force order)
+            for tr in fb:
+                st["transfer_checks"] += 1
+                if not tp.done(tr):
+                    self._ia_force(tr)
+        n_arr = len(lan) + sum(x[2] for x in due)
+        if n_arr == 0:
+            for k in due_keys:
+                del self._ia_groups[k]
+            return 0
+        cols = []                                                     # (5) ONE I6 check on the device
+        if lan:
+            fl = [((tr.layer * G.B + tr.b) * G.H + tr.h) * G.NPOS + tr.slot for tr in lan]
+            cols.append(self._h2d(torch.tensor([fl, [tr.gen for tr in lan], [tr.block for tr in lan]],
+                                               dtype=torch.int64)))
+        for p, alive, na in due:
+            if na == len(p.trs):
+                cols.append(p.cols)
+            elif na:
+                keep = list(compress(range(len(alive)), alive))
+                cols.append(p.cols.index_select(1, self._h2d(torch.tensor(keep, dtype=torch.int64))))
+        C3 = torch.cat(cols, 1) if len(cols) > 1 else cols[0]
+        f, gexp, bexp = C3[0], C3[1], C3[2]
+        if mu.get("ia_bad_gen") and self.ia_mut_done is None:         # NEGATIVE CONTROL: a wrong expected generation
+            gexp = gexp.clone()
+            gexp[0] += 1
+            self.ia_mut_done = (now, "ia_bad_gen")
+        bad = ((T.flat("gen")[f].to(torch.int64) != gexp) | (T.flat("code")[f].to(torch.int64) != C_INFLIGHT)
+               | (T.flat("block")[f].to(torch.int64) != bexp))
+        if bool(bad.any()):
+            self._ia_raise(lan, due)
+        # (6) the table's admission: the lines of _poll_arrivals, with n_arr arrivals
+        T.flat("landed")[f] = True                                    # the transport's arrivals (urgent: landed)
+        mut = {}
+        if mu.get("keep_rd_last_on_drop"):
+            mut["keep_rd_last_on_drop"] = True
+        if mu.get("rec_mut") == "evict_po_unpinned":                  # the admissions' K1 eviction (own.py:347-351)
+            mut["evict_po_unpinned"] = True
+        if mu.get("no_uid_check"):                                    # NEGATIVE CONTROL (T3): every arrival owned
+            T.flat("uid")[f] = T.owner[torch.div(torch.div(f, G.NPOS, rounding_mode="floor"), G.H,
+                                                 rounding_mode="floor").remainder(G.B)]
+        res = O.poll_arrivals(T, self.tick_no, -1, None, None, mut or None)
+        if int(res.get("forced_po", 0)) > 0 and self.rec_mut_done is None:
+            self.rec_mut_done = (self.tick_no, "evict_po_unpinned")   # the control had an effect at this poll
+        self._count("admit", int(res["admit_lru"]))
+        self._count("admit_vres", int(res["admit_vres"]))
+        self._count("drop_unowned", int(res["drop_unowned"]))
+        self._count("drop_vres_unprotected", int(res["drop_vres_unprotected"]))
+        self._count("evict_po", int(res["evict_po"]))
+        self._count("release:evict", int(res["evict_rel"]))
+        if int(res["admitted"]) != n_arr:
+            raise OwnershipViolation("B2 poll: %d slots admitted for %d arrived transfers" % (int(res["admitted"]),
+                                                                                            n_arr))
+        self._ia_forget(lan, due)                                     # (7) the host maps
+        for k in due_keys:
+            del self._ia_groups[k]
+        st["admitted"] += n_arr
+        self._changed()
+        if self.checked:
+            pc = O.post_checks(T, None, 0, which=("I1", "I2", "I3"))
+            fails = [n for n, v in zip(("I1", "I2", "I3"), torch.stack([pc["I1"], pc["I2"], pc["I3"]]).tolist()) if v]
+            if fails:
+                raise OwnershipViolation("B2 poll: after the arrivals %s fails (I1: one slot per resident or in-flight "
+                                         "block; I2: the LRU holds at most C; I3: a PO / VRES slot is pinned)" % fails)
+        return n_arr
+
+    def _ia_raise(self, lan, due) -> None:
+        """[inflight-array] The vectorized I6 check failed: the old per-transfer check, in the old order, gives the old
+        exception. If it passes, the issue table's columns disagree with its transfers: that is a defect too."""
+        T, G = self.own, self.own.geo
+        arrived = sorted(chain(lan, *[compress(p.trs, alive) for p, alive, _ in due]), key=_ORDER)
+        f = torch.tensor([((tr.layer * G.B + tr.b) * G.H + tr.h) * G.NPOS + tr.slot for tr in arrived],
+                         dtype=torch.int64, device=self.device)
+        gen = T.flat("gen")[f].tolist()
+        code = T.flat("code")[f].tolist()
+        blk = T.flat("block")[f].tolist()
+        for i, tr in enumerate(arrived):                              # I6 (own.py:328-333): the arrival names its slot
+            if gen[i] != tr.gen:
+                raise StaleGeneration("arrival (uid %s, block %d) names slot %d gen %d but the slot holds gen %d"
+                                      % (tr.uid, tr.block, tr.slot, tr.gen, gen[i]))
+            if code[i] != C_INFLIGHT or blk[i] != tr.block:
+                raise OwnershipViolation("arrival (uid %s, block %d, slot %d gen %d): slot is %s/%d"
+                                         % (tr.uid, tr.block, tr.slot, tr.gen, STATE_OF[code[i]], blk[i]))
+        raise OwnershipViolation("inflight-array: the vectorized arrival check fails where the per-transfer check "
+                                 "passes: the issue table's columns (flat slot, generation, block) do not match its "
+                                 "transfers")
+
+    def _ia_forget(self, lan, due) -> None:
+        """[inflight-array] The admitted transfers leave the host maps (the old loop's effect): the urgent takes per
+        transfer (few); each due part in bulk: the in-flight map (InflightByLayer.pop_layer_many, or dict.pop mapped),
+        the pending map (only the keys that still name the transfer), the metrics (not lean: Metrics.arrived per
+        transfer in the old order; lean: the count of arrivals after a cancel)."""
+        infl, pend = self.inflight, self.pending
+        pop_many = getattr(infl, "pop_layer_many", None)
+        for tr in lan:
+            infl.pop(tr.seq, None)
+            if pend.get((tr.layer, tr.b, tr.h, tr.block)) is tr:
+                del pend[(tr.layer, tr.b, tr.h, tr.block)]
+            self._landed.discard(tr.seq)
+        gone = []
+        for p, alive, na in due:
+            if not na:
+                continue
+            if na == len(p.trs):
+                trs, seqs = p.trs, p.seqs
+            else:
+                trs, seqs = list(compress(p.trs, alive)), list(compress(p.seqs, alive))
+            if pop_many is not None:
+                pop_many(p.l, seqs)
+            else:
+                deque(map(infl.pop, seqs), maxlen=0)
+            keys = list(zip(repeat(p.l), map(_B, trs), map(_H, trs), map(_BLK, trs)))
+            cur = list(map(pend.get, keys))
+            if all(map(is_, cur, trs)):
+                deque(map(pend.__delitem__, keys), maxlen=0)
+            else:
+                for key, c, tr in zip(keys, cur, trs):
+                    if c is tr:
+                        del pend[key]
+            gone.append(trs)
+        if not self.lean:                                             # [hostfix] --lean-time: 4.8 / 4.3 REPORT only
+            for tr in sorted(chain(lan, *gone), key=_ORDER):
+                self.metrics.arrived(tr, None, tr.requester in self.cancelled)
+        elif self.cancelled:                                          # (the cheap count of Metrics.arrived is kept)
+            self.metrics.arrivals_after_cancel += sum(map(self.cancelled.__contains__, map(_REQ, chain(lan, *gone))))
 
     def _poll_drops(self) -> None:
         """res.py:287-293: the queued (key, l) releases whose key reader completed; O.drop_keys on the table."""
@@ -1062,6 +1339,8 @@ class OwnResidency(ResidencySparse):
         lifetimes = self.metrics.lifetimes
         by_layer: Dict[int, List[Transfer]] = {}
         new_trs = []
+        ia = self.inflight_array                                      # [inflight-array] the issue parts' take rows
+        ia_rows: Dict[int, List[int]] = {}
         for i, q in enumerate(tk):
             j = jrow[q]
             isv = part[q] == 0
@@ -1086,10 +1365,14 @@ class OwnResidency(ResidencySparse):
                 self._landed.add(tr.seq)
             else:
                 by_layer.setdefault(lt[i], []).append(tr)
+                if ia:                                                # [inflight-array] row i of write_takes' columns
+                    ia_rows.setdefault(lt[i], []).append(i)
             new_trs.append((q, tr))
         self._count("take", len(tk))
         for l in sorted(by_layer):
             self._deferred.append((l, by_layer[l]))
+        if ia and by_layer:                                           # [inflight-array] the same lists, as issue parts
+            self._ia_add(takes, by_layer, ia_rows)
         t_hp = self._hp("h_hs_takes", t_hp)                           # the take columns' reads and the per-take loop
         # the demand merges on the transfers (res.py:605-611, :672-674)
         if V is not None:

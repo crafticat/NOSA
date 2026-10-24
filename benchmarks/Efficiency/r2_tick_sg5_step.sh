@@ -133,6 +133,13 @@
 #   evalfast2f3p / evalfast2c3l / evalfast2f3l [flean] evalfast2f3 + --b2-res-profile (STEP_MIN 150) / evalfast2c3 +
 #            --res-lean --res-dev (the CHECK gate) / evalfast2f3 + --res-lean --res-dev (the fused path with the lean
 #            host checks, binds and bias fill; tests_cpu/test_r2_flean.py); REGISTERED block below
+#   evalfast2ia [admitfill] evalfast2rl + --inflight-array (the poll admits the due draft issues as whole parts: no sort
+#            of the transfers in flight, one done / force per issue; tests_cpu/test_r2_admitfill.py; FAST). It is fix 2
+#            of analysis/evalfast/DIAG_effective_gap.md section 4 (fix 1, the fill at admission, is not exact here:
+#            the first resident set is the tick-0 selection); REGISTERED block below
+#   evalfast2f3lia / evalfast2c3lia [f3lia] evalfast2f3l + --inflight-array (FAST timing) / evalfast2c3l +
+#            --inflight-array (the CHECK gate, 0 diffs); evalfast2f3l and evalfast2ia are the same-job controls
+#            (tests_cpu/test_r2_f3lia.py); REGISTERED block below
 #   STEP_MIN 120 in every cell above.
 #   [fusedres2] the FR-g cells of docs/R2_FUSEDRES_PLAN.md section 7 (p5b2's point: --modes exact,fast --backends b2
 #   --C 96 --X 64 --R-ver 16, no sweep, gilfree 8 threads, unchecked), with NOSI = FRNOSI (the fusedres2 worktree)
@@ -407,6 +414,58 @@
 #   F3L-MEM  peak_gb <= 84 GB (MUST EF_mem_cap; f3 peak 83.16, the dev dummies add per-layer transients of about
 #            0.1-0.3 GB). If it fails, drop the bias fill's own dummies first
 #
+# REGISTERED for evalfast2ia ([admitfill], STAMP 2026-10-23T18:17:11Z, before any run). WHY: analysis/evalfast/DIAG_effective_gap.md
+# sections 3-4: effective is 15.26 s per round below steady; 12.96 s of it is ticks 0-4, and 6.58 s of that is the poll
+# (h_poll_arrivals g1rl ticks 1-4: 917.7, 4865.3, 442.1, 547.2 ms; median 38.1 ms): a sort of every transfer in flight
+# and the arrival rule per transfer, when the first fill arrives. --inflight-array admits the due draft issues as whole
+# parts (one done / force per issue, one vectorized I6 check, the host maps in bulk); the same admitted sets, so the same
+# decisions. ROOT NOSI_EVAL = nosi-r2-admitfill. The cell is evalfast2rl plus ONE flag. The control is evalfast2rl of the
+# same job (else g1rl: W 46748 ms, median tick 512.9 ms, mean tick 655.9 ms, 61 ticks, 10152 committed).
+# ARITHMETIC (INFERRED; g1rl): cost per take c = sum h_hs_takes / transfers = (2921.3 + 500.4 + 225.6 + 258.1 + 100.9 +
+# 56 x 26.0) ms / 1267097 = 5462.3 / 1267097 = 4.31 us; first fill N0 = 2921.3 / 0.00431 = about 678,000 draft takes
+# (tick 0), tick 1 about 116,000, a steady tick about 6,000 (about 12,000-24,000 in flight). Array poll cost per transfer:
+# membership map 0.06 us, urgent-set check 0.03 us, bulk forget (in-flight pop, pending get / delete, field maps) about
+# 0.4 us; device (column cat, three gathers, O.poll_arrivals) 20-60 ms for N0. So tick 2 = 794,000 x 0.09 us + 678,000 x
+# 0.4 us + 20-60 ms = 71 + 271 + 40 = about 380 ms; tick 1 (N0 not due: seqs, membership, check) about 100 ms; ticks 3, 4
+# about 70 and 100 ms; a steady tick 5-12 ms (point 8). Saved: ticks 1-4 6772.3 - 650 = 6122 ms; ticks 5-60 2658 - 56 x 8
+# = 2210 ms (ticks 51-60 GUESSED at 32 ms each); tick 0 costs about 90 ms more (the part rows, one index copy). Net 8242 ms.
+#   IA-POLL2 tick 2 h_poll_arrivals (bare_host_profile.per_tick_ms) point 380 ms, PASS <= 550 ms
+#   IA-POLL  tick 1 <= 200 ms; ticks 3 and 4 <= 150 ms each; the median h_poll_arrivals point 8 ms, PASS <= 15 ms
+#   IA-MED   steady tok/s (median tick): median tick 512.9 - (38.1 - 8) = 482.8 ms; 10152 / (61 x 0.4828) = 344.7: point
+#            345, band [328, 362]
+#   IA-MEAN  mean tick (ticks 1-60) (39355.1 - 8332) / 60 = 517.1 ms; 10152 / (61 x 0.5171) = 321.9: point 322,
+#            band [305, 338]
+#   IA-EFF   W = 46748 - 8242 = 38506 ms; 10152 / 38.506 = 263.6: point 264, band [245, 282]
+#   IA-SAME  the bare round's ticks and committed equal evalfast2rl's of the same job (61, 10152): no decision changed
+#   IA-T02   NOT expected to pass the lead's "ticks 0-2 each <= 1.5 x median" (fix 1's prediction): tick 0 about 4.1 s
+#            (the takes 2.9 s and the issues 0.6 s stay), tick 1 about 2.35 s (the merges 1.1 s stay), tick 2 about 0.92 s
+#            (5403.9 - 4865.3 + 380); fix 1's "effective >= 290" and "steady median unchanged" are NOT expected either
+#            (point 264; the median tick falls by about 30 ms, the steady poll). No fill moves out of the clock, so there is
+#            no admit_fill_ms: effective has one value
+#   IA-FALS  FALSIFIED if tick 2 h_poll_arrivals > 1000 ms (then the time is not the scan: GIL waits on the feeder, or
+#            the bulk forget), or the median h_poll_arrivals > 20 ms, or IA-SAME fails, or effective < 240
+#   IA-MEM   peak_gb <= 84 (MUST EF_mem_cap). Estimate: rl 83.04 GB plus under 0.05 GB (N0 x 3 int64 columns 16 MB, the row
+#            index 5 MB, the cat and the check masks of one poll about 25 MB)
+#
+# REGISTERED for evalfast2f3lia / evalfast2c3lia ([f3lia], NOT STAMPED: the lead fills every PREDICTION and adds the
+# stamp line before any run). WHAT: this tree (ROOT NOSI_EVAL = nosi-r2-f3lia: flean 665ac69 merged with admitfill
+# c714fb2) has the fused v3 resolver with --res-lean --res-dev (evalfast2f3l) and the array poll --inflight-array
+# (evalfast2ia). The two parts are independent: the array poll is OwnResidency._poll_arrivals (the take path's issue
+# parts), the fused resolve is FusedResolver.resolve; no new code joins them (tests_cpu/test_r2_f3lia.py). Same-job
+# controls: evalfast2f3l (the fused path without the array poll) and evalfast2ia (the array poll on the torch resolve).
+#   evalfast2f3lia   evalfast2f3l + --inflight-array (FAST timing, B 216, --eval-bands "$F3LIA_BANDS": TBD by lead;
+#                    the harness refuses the placeholder TBD, so the cell cannot run before the lead fills it)
+#   evalfast2c3lia   evalfast2c3l + --inflight-array (CHECK, B 216, 8 steps, --draft-ticks 4, no --bare, no eval role)
+#   C3LIA    MUST _draft_only_fused_equal / _round_fused_equal / _fused_err PASS: 0 diffs, every layer compared, with
+#            the array poll on. FALSIFIER: a difference: evalfast2f3lia is VOID
+#   F3LIA-MED  steady tok/s (median tick). PREDICTION: TBD by lead
+#   F3LIA-MEAN steady tok/s (mean tick). PREDICTION: TBD by lead
+#   F3LIA-EFF  effective tok/s. PREDICTION: TBD by lead
+#   F3LIA-POLL h_poll_arrivals (bare_host_profile.per_tick_ms, tick 2 and the median). PREDICTION: TBD by lead
+#   F3LIA-SAME the bare round's ticks and committed equal evalfast2f3l's of the same job: no decision changed (MUST)
+#   F3LIA-FALS PREDICTION: TBD by lead
+#   F3LIA-MEM  peak_gb <= 84 (MUST EF_mem_cap). PREDICTION: TBD by lead
+#
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
 #        _k5_report) names the per-layer demand (first misses needing a shared extra, free extras at the tick start,
@@ -482,7 +541,7 @@ NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                        
 NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-stack2                                             # ROOT of the stack1 cells only ([integ]; [stack2])
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
-NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-flean                                               # ROOT of the evalfast* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree; [frfix] own worktree; [resfix] own worktree; [resdev] own worktree; [fr3] own worktree; [flean] own worktree)
+NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-f3lia                                               # ROOT of the evalfast* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree; [frfix] own worktree; [resfix] own worktree; [resdev] own worktree; [fr3] own worktree; [flean] own worktree; [admitfill] own worktree; [f3lia] own worktree: flean + admitfill)
 EVALACC_OUT=/mnt/beegfs/ojerbi/r2-runs/evalacc                                           # ROOT (r2_evalacc_step.sh's OUTROOT)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
@@ -509,7 +568,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl|evalfast2rd|evalfast2rdp|evalfast2c3|evalfast2f3|evalfast2f3_192|evalfast2f3p|evalfast2c3l|evalfast2f3l] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl|evalfast2rd|evalfast2rdp|evalfast2c3|evalfast2f3|evalfast2f3_192|evalfast2f3p|evalfast2c3l|evalfast2f3l|evalfast2ia|evalfast2f3lia|evalfast2c3lia] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -533,6 +592,8 @@ for w in "$@"; do
         evalfast2rd|evalfast2rdp) [ -z "$CELL" ] || usage; CELL=$w ;;                               # [resdev]
         evalfast2c3|evalfast2f3|evalfast2f3_192) [ -z "$CELL" ] || usage; CELL=$w ;;                # [fr3]
         evalfast2f3p|evalfast2c3l|evalfast2f3l) [ -z "$CELL" ] || usage; CELL=$w ;;                 # [flean]
+        evalfast2ia) [ -z "$CELL" ] || usage; CELL=$w ;;                                            # [admitfill]
+        evalfast2f3lia|evalfast2c3lia) [ -z "$CELL" ] || usage; CELL=$w ;;                          # [f3lia]
         *) usage ;;
     esac
 done
@@ -736,6 +797,13 @@ case $CELL in
                  --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
                  --eval-bands "$BANDS" --b2-resolve torch --host-profile --gc-freeze --lean-time --wait-index
                  --b2-fewer-reads "${RDFLAGS[@]}") ;;
+    evalfast2ia) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_$CELL  # [admitfill]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
+                 --eval-role fast-time --mem-cap-gb 84
+                 --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
+                 --eval-bands 328:362:305:338:245:282 --b2-resolve torch --host-profile --gc-freeze --lean-time --wait-index
+                 --b2-fewer-reads --res-lean --inflight-array) ;;
     evalfast2c192) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1344 ; PRV=1296 ; SWEEP_RUN= ; SUFFIX=_evalfast2c192    # [b192]
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=192 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
         EVALARG=(--layout pool --X-pool 1344 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
@@ -768,6 +836,20 @@ case $CELL in
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
         EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
                  --b2-resolve check --fused-kernel v3 --res-lean --res-dev) ;;
+    evalfast2f3lia) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_evalfast2f3lia  # [f3lia]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched
+        F3LIA_BANDS=TBD                                     # PREDICTION: TBD by lead (REGISTERED F3LIA-MED/MEAN/EFF)
+        [ "${DRYRUN:-0}" = 1 ] || [ "$F3LIA_BANDS" != TBD ] ||
+            stop "cell $CELL: --eval-bands TBD (the lead fills and stamps the REGISTERED F3LIA block first)"
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
+                 --eval-role fast-time --mem-cap-gb 84
+                 --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
+                 --eval-bands "$F3LIA_BANDS" --b2-resolve fused --fused-kernel v3 --host-profile --gc-freeze --lean-time
+                 --wait-index --b2-fewer-reads --res-lean --res-dev --inflight-array) ;;
+    evalfast2c3lia) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_evalfast2c3lia  # [f3lia]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
+                 --b2-resolve check --fused-kernel v3 --res-lean --res-dev --inflight-array) ;;
 esac
 MIN_LEFT=$((STEP_MIN * 60 + 600))                           # [fusedres2] after the cell's STEP_MIN
 VARIANTARG=()                                               # [batched-rebuild] no --variants in every other cell
