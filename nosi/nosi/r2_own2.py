@@ -16,7 +16,12 @@ state and replaces that state:
     drops, the releases, in v1's order); begin_request / end_request; _in_flight (the current owner from the table).
   - THE TRANSFER SIDE stays host objects in this class (one vendored Transfer per take, on the vendored transport), so
     the CPU lockstep runs on the same transports as v1 and S-C; the device path replaces it with E's issue_desc (the
-    take list is O.issue_desc_args' desc).
+    take list is O.issue_desc_args' desc). [b2-desc] issue="desc" (default "object") keeps the Transfer objects and
+    replaces only the transport issue: the tick's draft takes go to tp.issue_desc as ONE job (ported from 47db0c0 by
+    hunks; [f3ld] the job is queued by the host consumer and submitted in end_tick's issue phase, ResidencySC.end_tick's
+    _tick_issue hook, where Residency.end_tick issues on the object path, so --host-profile's h_et_issue times it),
+    every draft Transfer holds the job's completion object, T3 / T4 become E's reader / write-back marks (_rid,
+    history_written); docs/R2_B2_DESC_PLAN.md of 47db0c0.
   - `pools` and `stream()` are a READ-ONLY PROJECTION: real vendored LayerPool / Stream / Slot objects built from the
     table (cached per table version), so the vendored snapshot helpers, the device stand-in (CpuDeviceSim) and the
     reports read B2's state through the vendored interface. Nothing writes them.
@@ -82,6 +87,7 @@ B2_MUTS = ("no_dedup_check", "mirror_ignores_owner", "owner_blind", "no_uid_chec
            "ignore_flags", "no_t4", "no_reader_wait", "drop_rd_last", "keep_rd_last_on_drop", "poll_order_swapped",
            "key_alias", "rec_mut", "no_read_harvest",
            "ia_skip_one", "ia_due_early", "ia_bad_gen")              # [inflight-array] the array poll's controls
+ISSUES = ("object", "desc")                              # [b2-desc] the draft issue path (OwnResidency(issue=...))
 REC_MUTS = ("take_nonfree", "take_swap", "k5_over", "pe_not_first", "drop_refusal", "drop_v_merge", "drop_d_merge",
             "drop_ready", "drop_rowsel", "drop_vread", "ignore_overflow", "reverse_stamps", "evict_po_unpinned",
             "gen_plus_two")
@@ -109,9 +115,17 @@ class OwnResidency(ResidencySparse):
     def __init__(self, *args, keys: int = 7, checked: bool = True, b2_mut=None, resolve: str = "torch",
                  fused_plant: int = 0, fused_guard: bool = False, fused_warm: str = "auto", lean: bool = False,
                  wait_index: bool = False, fewer_reads: bool = False, res_lean: bool = False, res_dev: bool = False,
-                 fused_kernel: str = None, inflight_array: bool = False, **kw):   # [fr3] [inflight-array] ([f3lia])
+                 fused_kernel: str = None, inflight_array: bool = False, issue: str = "object",
+                 **kw):                                       # [fr3] [inflight-array] ([f3lia]) [b2-desc] ([f3ld])
         kw["pin_records"] = False
         self.__dict__["_own_ready"] = False
+        self.issue = "object"                             # [b2-desc] before the parent's constructor (lesson L19)
+        self._hm = None                                   # [b2-desc] (B, nblk) host: each block's write-back mark
+        self._hmark = 0                                   # [b2-desc] the last write-back mark given (marks grow)
+        self._hev: Dict[int, Tuple[Any, int]] = {}         # [b2-desc] id(write-back event) -> (event, its mark)
+        self.desc_jobs = 0                                # [b2-desc] REPORT: descriptor jobs issued
+        self.desc_takes = 0                               # [b2-desc] REPORT: draft takes issued through them
+        self._desc_next = None                            # [f3ld] the tick's queued job (_issue_desc -> _tick_issue)
         # [hostfix] --lean-time (OPT-IN, default False: every line as before): the REPORT-only host work is skipped
         # in a time cell (LEAN below); every decision, the release queue, the transfers and every counter a MUST gate
         # reads stay. Set before the base constructor (S-C's end_tick reads it).
@@ -132,6 +146,26 @@ class OwnResidency(ResidencySparse):
         if fused_kernel is not None and resolve == "torch":           # [fr3] the kernel variant of the fused resolve
             raise ValueError("fused_kernel needs resolve 'fused' or 'check'")
         super().__init__(*args, **kw)
+        # [b2-desc] the draft issue: "object" (the default; p5b2 / p6: Residency.end_tick, tp.issue per layer) or "desc"
+        # (E's tp.issue_desc: the tick's draft takes as ONE (6, n) job; docs/R2_B2_DESC_PLAN.md). Checked HERE, not at
+        # the first issue (lesson L31): desc needs E's C++ worker with packer v3's DESC. [f3ld] and no X pool: E's
+        # issue_desc names logical slots and refuses xpool lanes (r2_transport_gilfree.py issue_desc), so the shared-pool
+        # layout (--layout pool, every eval cell) cannot take the descriptor path
+        if issue not in ISSUES:
+            raise ValueError("issue must be one of %s (got %r)" % (ISSUES, issue))
+        if issue == "desc":
+            tp = self.tp
+            ok = (getattr(tp, "worker", None) == "cpp" and int(getattr(getattr(tp, "ext", None), "DESC", 0)) == 1
+                  and all(callable(getattr(tp, n, None)) for n in ("issue_desc", "mark_reader", "mark_hist", "job_ev")))
+            if not ok:
+                raise ValueError("OwnResidency(issue='desc') needs GilfreeTransport(worker='cpp') over packer v3 with "
+                                 "DESC (issue_desc, mark_reader, mark_hist, job_ev); got %s" % (type(tp).__name__,))
+            if self.xpool is not None:
+                raise ValueError("OwnResidency(issue='desc') with an X pool: E's issue_desc names logical slots and "
+                                 "does not translate xpool lanes (GilfreeTransport.issue_desc refuses xpool)")
+        self.issue = issue
+        if issue == "desc":
+            self._hm = torch.full((self.B, self.nblk), -1, dtype=torch.int64)
         if wait_index:                                                # [hostfix] --wait-index (OPT-IN): the same map
             self.inflight = InflightByLayer(self.inflight)            # with a per-layer index (_superset_wait)
         # [inflight-array] --inflight-array (OPT-IN, default False: the old poll): the in-flight table of issues
@@ -348,7 +382,8 @@ class OwnResidency(ResidencySparse):
         out["b2"] = dict(checked=self.checked, applied_ticks=self.b2_applied, keys=self.KEYS, reader_ids=self.win.next,
                          reader_live=self.win.next - self.win.lo,
                          table_bytes=sum(t.numel() * t.element_size() for t in self.own.tensors().values()),
-                         mirror="the table's columns copied on the device at each tick's first resolve (no host delta)")
+                         mirror="the table's columns copied on the device at each tick's first resolve (no host delta)",
+                         issue=self.issue, desc_jobs=self.desc_jobs, desc_takes=self.desc_takes)   # [b2-desc] REPORT
         out["b2"]["resolve"] = self.resolve_mode                      # [fusedres]
         if self.inflight_array:                                       # [inflight-array] REPORT (off: no key)
             out["b2"]["inflight_array"] = dict(self.ia_stats)
@@ -383,6 +418,11 @@ class OwnResidency(ResidencySparse):
             e = self.win.register(ev, -1)
             self._eid[id(ev)] = e
             self._evobj[e] = ev
+            if self.issue == "desc":
+                # [b2-desc] T3 as E's reader marks: the reader id IS the mark. Ids grow in registration order, and the
+                # only ids are the layers' read events (apply, layer order, tick order), all recorded on the main
+                # stream: they complete in id order, so the job's wait on the newest id of a layer covers the older.
+                self.tp.mark_reader(e, ev)
         return e
 
     def _key_slot(self, key) -> int:
@@ -472,6 +512,23 @@ class OwnResidency(ResidencySparse):
     def history_written(self, uid, block: int, ev) -> None:
         super().history_written(uid, block, ev)                       # hist_ev (T4), the main stream's waits
         self.own.hist_id[self.uid_b[uid], int(block)] = 1
+        if self.issue == "desc":
+            # [b2-desc] T4 as E's write-back marks: one mark per write-back event, in call order (the tick's write-backs
+            # are recorded on the main stream in that order, so they complete in mark order); the block keeps the mark
+            # of its event, as hist_ev keeps the event (None: no wait, as hist_ev None on the object path)
+            if ev is None:
+                self._hm[self.uid_b[uid], int(block)] = -1
+            else:
+                hit = self._hev.get(id(ev))
+                if hit is None or hit[0] is not ev:                   # a new event: the next mark (first-seen order)
+                    self._hmark += 1
+                    self.tp.mark_hist(self._hmark, ev)
+                    hit = (ev, self._hmark)
+                    self._hev[id(ev)] = hit
+                    if len(self._hev) > 256:                          # keep the recent events only (marks only grow)
+                        for k in [k for k, (_, m) in self._hev.items() if m < self._hmark - 128]:
+                            del self._hev[k]
+                self._hm[self.uid_b[uid], int(block)] = hit[1]
         self._changed()
 
     def end_request(self, uid) -> None:
@@ -485,6 +542,8 @@ class OwnResidency(ResidencySparse):
             del self.hist_ev[k]
         self.hist_from.pop(b, None)
         self.own.hist_id[b] = -1
+        if self._hm is not None:                                      # [b2-desc] as hist_ev: b's write-backs dropped
+            self._hm[b] = -1
         self.own.hist_from[b] = 1 << 40
         for (key, l) in list(self.queued):
             if key[0] == uid:
@@ -1369,8 +1428,9 @@ class OwnResidency(ResidencySparse):
                     ia_rows.setdefault(lt[i], []).append(i)
             new_trs.append((q, tr))
         self._count("take", len(tk))
-        for l in sorted(by_layer):
-            self._deferred.append((l, by_layer[l]))
+        if self.issue == "object":                                    # Residency.end_tick issues them, per layer
+            for l in sorted(by_layer):
+                self._deferred.append((l, by_layer[l]))
         if ia and by_layer:                                           # [inflight-array] the same lists, as issue parts
             self._ia_add(takes, by_layer, ia_rows)
         t_hp = self._hp("h_hs_takes", t_hp)                           # the take columns' reads and the per-take loop
@@ -1423,7 +1483,63 @@ class OwnResidency(ResidencySparse):
                 self.metrics.layer_plan(Plan(page_table=None, num_pages=None, last_len=None, seq_idx=None, blocks=[],
                                              masked=int(masked), draft_pairs=int(pairs), refused=int(refused)))
         self._changed()
+        if self.issue == "desc":                                      # LAST: queued for end_tick's issue phase
+            self._queue_desc(takes, by_layer)
         self._hp("h_hs_plans", t_hp)
+
+    # ---------------------------------------------------------------------------------------------- [b2-desc] the issue
+    def _issue_desc(self, takes: Dict[str, torch.Tensor], by_layer: Dict[int, List[Transfer]]) -> None:
+        """[b2-desc] The tick's draft takes as ONE descriptor job (E's tp.issue_desc; docs/R2_B2_DESC_PLAN.md). The
+        Transfer objects of the object path stay (the arrival rule, the maps, the metrics, Policy E's forces read
+        them); only the transport issue changes: no per-layer tp.issue, no per-transfer glue in the transport. The
+        desc is the take list itself (l, b, h, block, slot, gen of every draft take, the same values the Transfers
+        carry), built on the table's device and copied to the host ONCE, contiguous (lesson L28). T3: per layer the
+        newest reader id among the takes' replaced last readers (rd_old; -1 none); T4: the newest write-back mark of
+        the takes' (b, block) (-1 none). Every Transfer of the job gets the job's completion object (tp.job_ev), as
+        the C++ worker's issue() gives it. Checked mode: the desc equals the Transfers' (l, b, h, block, slot, gen)
+        multiset (one host loop; the unchecked timed path skips it). [f3ld] Called by _tick_issue (end_tick's issue
+        phase), not at the end of _host_side as in 47db0c0 (_queue_desc)."""
+        trs = [tr for l in sorted(by_layer) for tr in by_layer[l]]
+        if not trs:
+            return
+        dm = ~takes["isv"]
+        X = torch.stack([takes[n][dm].to(torch.int64) for n in ("l", "b", "h", "blk", "slot", "gen", "rd_old")]).cpu()
+        desc = X[:6].contiguous()
+        if int(desc.shape[1]) != len(trs):
+            raise OwnershipViolation("B2 desc: %d draft takes in the desc, %d draft Transfers" % (desc.shape[1], len(trs)))
+        if self.checked:
+            want = sorted((tr.layer, tr.b, tr.h, tr.block, tr.slot, tr.gen) for tr in trs)
+            if sorted(map(tuple, desc.t().tolist())) != want:
+                raise OwnershipViolation("B2 desc: the descriptor differs from the draft Transfers")
+        rd = X[6]
+        if self.b2_mut.get("drop_rd_last"):                           # as the object path's reader_ev = None
+            rd = torch.full_like(rd, -1)
+        rm = torch.full((self.L,), -1, dtype=torch.int64).scatter_reduce_(0, desc[0], rd, reduce="amax",
+                                                                          include_self=True)
+        hm = int(self._hm[desc[1], desc[3]].max())                    # (no_t4 drops a CHECK, not the T4 wait: as hist_ev)
+        seq = self.tp.issue_desc(desc, rm, hm)
+        ev = self.tp.job_ev(seq)
+        for tr in trs:
+            tr.ev = ev
+            tr.payload = None
+        self.desc_jobs += 1
+        self.desc_takes += len(trs)
+
+    def _queue_desc(self, takes: Dict[str, torch.Tensor], by_layer: Dict[int, List[Transfer]]) -> None:
+        """[f3ld] The end of the host consumer: the tick's draft takes wait for end_tick's issue phase (_tick_issue).
+        A job still queued from an earlier tick is a defect (end_tick submits each tick's job)."""
+        if self._desc_next is not None:
+            raise OwnershipViolation("B2 desc: the queued draft takes of an earlier tick were never issued")
+        self._desc_next = (takes, by_layer)
+
+    def _tick_issue(self) -> None:
+        """[f3ld] end_tick's issue phase: ResidencySC.end_tick calls it before Residency.end_tick, inside the h_et_issue
+        clock, so the descriptor job is issued where the object path issues its per-layer transfers (nothing runs
+        between apply_tick and this point: end_tick's finally only clears _layer_ev; a void tick raises in apply_tick,
+        so it queues nothing). Nothing queued (the object path, a tick without takes): nothing to do."""
+        job, self._desc_next = self._desc_next, None
+        if job is not None:
+            self._issue_desc(*job)
 
     def _lean_queue(self, steps, vrows) -> None:
         """[hostfix] --lean-time: the release queue of _looks without the looks. The keys are the verify rows' keys in

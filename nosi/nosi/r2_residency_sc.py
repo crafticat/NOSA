@@ -1913,6 +1913,9 @@ class ResidencySC(ResidencySB):
         finally:
             self._layer_ev = {}
         t1 = time.perf_counter_ns() if hp is not None else 0
+        issue = getattr(self, "_tick_issue", None)                    # [f3ld] B2's descriptor job (r2_own2.py), in the
+        if issue is not None:                                         # issue phase; S-C / sparse have none
+            issue()
         Residency.end_tick(self)                                      # the draft transfers, layer by layer
         t2 = time.perf_counter_ns() if hp is not None else 0
         if not self.lean:                                             # [hostfix] --lean-time: a REPORT sample only

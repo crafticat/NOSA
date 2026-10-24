@@ -559,6 +559,14 @@ class GilfreeTransport:
             raise RuntimeError("gilfree: landed_upto needs worker='cpp'")
         return int(self.npipe.landed_upto())
 
+    def job_ev(self, seq: int) -> "_JobEv":
+        """[b2-desc] The completion object of descriptor job `seq` (worker="cpp"), the one that issue() gives every
+        transfer of a job: a caller that keeps one Transfer per take (OwnResidency(issue="desc")) sets tr.ev to it, so
+        done / force / wait_submitted / Stream.wait_event work per job as on the object path."""
+        if self.worker != "cpp" or int(seq) < 1:
+            raise RuntimeError("gilfree: job_ev needs worker='cpp' and a job seq >= 1 (got %r)" % (seq,))
+        return _JobEv(self, int(seq))
+
     # ------------------------------------------------------------------------------------------------ one release
     def _check(self, layer: int, transfers: List[Transfer]) -> None:
         """One destination per transfer, every transfer inside the geometry (both workers). [integ] xpool's flat-store
