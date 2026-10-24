@@ -14,8 +14,21 @@ the view is the same in both.
   TO0  PRECONDITIONS (L34), over the TO1 draws: the arms issue descriptor jobs; the table arm holds transfers (landed
        before due) AND forces them (due, not landed); Policy E evicts an in-flight slot (in the SCRIPTED draw only, see
        THE CADENCE BOUND; the lag <= 2 draws evict none, asserted); a verify merge and a draft merge write the demand
-       of a slot in flight; a request ends with takes in flight; the mirror arm keeps Transfers in flight and the table
-       arm none.
+       of a slot in flight; a request ends with a draft prefetch in flight (in the SCRIPTED END draw, see THE END IN
+       FLIGHT); the mirror arm keeps Transfers in flight and the table arm none.
+
+THE END IN FLIGHT (why the eval draw ended no request with a take in flight, and the SCRIPTED END draw). A request ends
+after the tick whose decision makes it done (r2_tick.py:1400-1402 -> :1290-1293 -> r2_own2.py:649-671): its LRU / PO /
+VRES slots are released and its takes in flight STAY in flight, dropped at their arrival (r2_own2_ops.py:451-468;
+poll_arrivals drop_unowned, :352 and :380). It is done only at a verify decision (r2_spec_core.py:223-226), and that
+tick has no draft row of the request (a draft row is planned only while want < max_new, :141-145, and a decision adds at
+most the lead to len(out)). A transport take is admitted at issue_tick + lag, held before (r2_own2_ops.py:368-373). So a
+take is in flight at the end only if it was issued in the last lag - 1 ticks before the end: at lag 2, only by a draft
+row of the tick before the end. The eval draw's last draft rows select resident blocks, so it has none. This is
+reachable, not a bound, so the SCRIPTED END draw (_script_end_sel) builds it: C = 5, X = 0, arrival_lag 8, no verify
+miss, and the draft row at the request's LAST draft position (S_b + STEPS - 2: the final epoch always drafts it, as the
+end needs want >= max_new) prefetches a block in no slot while a FREE slot exists (four FREE slots after block A: an
+epoch rejected after its last draft row uses one). The final cohorts are verified within lag - 1 ticks of that row.
 
 THE CADENCE BOUND (why the random draws never evict a slot in flight). Policy E's in-flight candidate is an UNPINNED,
 not-landed draft prefetch of the stream (r2_own2_ops.py:706-707 policy_e_check cf; r2_residency_sc.py:518-525
@@ -386,7 +399,55 @@ def _script_setup(target=SCRIPT_TARGET):
 
 SCRIPT = dict(name="script-evict", cfg="script", seed=1, forced=True, late=0, lag=8, checked=False, fewer_reads=False,
               wait_index=False, res_lean=False, res_dev=False, slow="never", ia=True, setup=_script_setup())
-DRAWS = FIXED + _draws() + [SCRIPT]
+
+# ---------------------------------------------------------------------------------------------------------------------
+# [f3ldx] THE SCRIPTED END (module docstring, THE END IN FLIGHT): a request ends with a draft prefetch in flight
+# ---------------------------------------------------------------------------------------------------------------------
+BD.CFG.setdefault("script_end", dict(C=5, X=0, R_ver=0))             # NPOS = C = 5 < len(U_SCRIPT): a block is fresh
+
+
+def _script_end_sel(svc, S_list, l, rows, sel):
+    """The scripted selection of the END draw, per stream (l, b, h) (entries as _script_sel):
+      verify rows: the lowest resident block, else the oldest block in flight (the device waits for it), else a
+          block in no slot (never at the end: block A is resident from tick 8 on, lag 8);
+      draft rows: at the request's LAST draft position (pos >= S_b + STEPS - 2, module docstring) and a FREE slot:
+          a block in no slot (a draft prefetch, a GRANT: usage < C); else the lowest resident block, else the oldest
+          block in flight (a merge, no take), else a block in no slot (the first prefetch, block A, at tick 0).
+    So no verify misses (no urgent take, no Policy E) and every request's final epoch prefetches one block at its
+    last draft row while the stream has a FREE slot (1 + 4 takes fit C = 5)."""
+    T = svc.own
+    H, R, k = sel.shape
+    new = sel.clone()
+
+    def pad(s):
+        s = sorted(set(s))
+        return torch.tensor(s + [s[-1]] * (k - 2 - len(s)), dtype=sel.dtype)
+    for i, r in enumerate(rows):
+        assert r.hist_bound >= len(U_SCRIPT) and k - 2 >= len(U_SCRIPT), ("SCRIPT END: U_SCRIPT is not history", r, k)
+        last = r.kind == "d" and r.pos >= S_list[r.b] + TT.STEPS - 2
+        for h in range(H):
+            v = _stream_view(T, l, r.b, h)
+            assert v["fresh"], ("SCRIPT END: every block of U_SCRIPT holds a slot", l, r.b, h, v)
+            if last and v["nfree"] > 0:
+                s = v["fresh"][:1]
+            else:
+                s = v["res"][:1] or [x for (_, x) in v["fly"][:1]] or v["fresh"][:1]
+            new[h, i, :k - 2] = pad(s)
+    return new
+
+
+def _script_end_setup():
+    def setup(eng, svc, ticks):
+        inner, S_list = svc.resolve, [int(x) for x in eng.S_list]
+
+        def resolve(l, rows, sel):
+            return inner(l, rows, _script_end_sel(svc, S_list, l, rows, sel))
+        svc.resolve = resolve
+    return setup
+
+
+SCRIPT_END = dict(SCRIPT, name="script-end", cfg="script_end", setup=_script_end_setup())
+DRAWS = FIXED + _draws() + [SCRIPT, SCRIPT_END]
 _PAIRS = {}
 
 
@@ -474,8 +535,27 @@ def test_TO0_preconditions_the_draws_issue_hold_force_evict_merge_and_end_in_fli
     assert r.err is None, r.err
     assert seen["fv"] > 0, ("precondition: no verify merge wrote a demand bit of a slot in flight", seen)
     assert seen["fd"] > 0, ("precondition: no draft merge wrote a demand bit of a slot in flight", seen)
-    assert seen["ends"] > 0 and seen["end_in_flight"] > 0, ("precondition: no request ended with takes in flight", seen)
-    print("TO0: Policy E in-flight evictions %d; merges %s" % (ev_in, seen))
+    # [f3ldx] the ends in flight: the table arm of the SCRIPTED END draw (module docstring, THE END IN FLIGHT)
+    ends = dict(ends=0, end_in_flight=0, end_transport=0)
+
+    def count_ends(eng, svc, ticks):
+        end0 = svc.end_request
+
+        def end_request(uid):
+            b = svc.uid_b[uid]
+            code = svc.own.c["code"][:, b]
+            infl = code == C_INFLIGHT
+            ends["ends"] += 1
+            ends["end_in_flight"] += int(bool(infl.any()))
+            ends["end_transport"] += int(bool((infl & ~svc.own.c["landed"][:, b]
+                                               & (svc.own.c["issuer"][:, b] == OWN2.O.ISS_D)).any()))
+            return end0(uid)
+        svc.end_request = end_request
+    re_ = _round(p3, v3, toks, SCRIPT_END, True, setup=count_ends)
+    assert re_.err is None, re_.err
+    assert ends["ends"] > 0 and ends["end_in_flight"] > 0 and ends["end_transport"] > 0, (
+        "precondition: no request ended with a draft prefetch in flight (SCRIPTED END draw)", ends, seen)
+    print("TO0: Policy E in-flight evictions %d; merges %s; scripted ends %s" % (ev_in, seen, ends))
 
 
 # =====================================================================================================================
