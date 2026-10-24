@@ -34,6 +34,10 @@ ACC_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3ldx"                         # [f3ldx] 
 # parent of the acc216 merge (was 8ccf262, acc216's own base: flean and admitfill changed make_engine / preflight /
 # one_point after it, so the line compare is made against the tree that acc216 was merged into)
 BASE_SHA = "346334116e779add7d4e77aff02e7ffaab25f62c"
+# [f3ldx] the tree the b2-desc port (dac03d2) and f3ld (a5c8937) apply to: f3lia's tip 89c9169 (acc216 merged). AC2
+# compares in two steps: BASE_SHA -> PORT_SHA is acc216's own delta (the ONE condition line); PORT_SHA -> this tree is the
+# port's delta, which must be REPORT lines and keyword arguments at the callees' defaults (flag off: no state change)
+PORT_SHA = "89c9169bd60b37fcba760e1220d1b00bb26ad3c8"
 sys.path.insert(0, str(EFF))
 
 
@@ -82,13 +86,48 @@ def test_AC1_flag_parsing():
 # =====================================================================================================================
 # AC2 flag off: unchanged
 # =====================================================================================================================
-def _base_source():
+def _base_source(sha=BASE_SHA, path="benchmarks/Efficiency/r2_tick_sg5.py"):
     try:
-        r = subprocess.run(["git", "-C", str(ROOT), "show", "%s:benchmarks/Efficiency/r2_tick_sg5.py" % BASE_SHA],
-                           capture_output=True, text=True)
+        r = subprocess.run(["git", "-C", str(ROOT), "show", "%s:%s" % (sha, path)], capture_output=True, text=True)
     except FileNotFoundError:
         return None
     return r.stdout if r.returncode == 0 else None
+
+
+def _code(ln):
+    """A line without its trailing comment (indentation kept: it is Python's syntax)."""
+    return ln.split("  #", 1)[0].rstrip()
+
+
+def _undo_port(new_f, added, merges):
+    """[f3ldx] new_f's code lines with the port's delta undone: each line of `added` (stripped code) is dropped and
+    each run of `merges` (consecutive stripped code lines) goes back to its one old code line. Each must occur exactly
+    once, so a line that the port did not add makes the compare fail."""
+    new = [_code(x) for x in new_f.splitlines()]
+    for ln in added:
+        assert sum(1 for x in new if x.strip() == ln) == 1, ("the port's added line is not there once", ln)
+        new = [x for x in new if x.strip() != ln]
+    for run, old in merges:
+        at = [i for i in range(len(new) - len(run) + 1) if [x.strip() for x in new[i:i + len(run)]] == list(run)]
+        assert len(at) == 1, ("the port's changed lines are not there once", run)
+        i = at[0]
+        new[i:i + len(run)] = [new[i][:len(new[i]) - len(new[i].lstrip())] + old]
+    return new
+
+
+# [f3ldx] the port's lines in one_point: REPORT only (each writes one key of info and reads nothing it changes)
+PORT_ONE_POINT_ADDED = ('info["b2_issue"] = getattr(a, "b2_issue", "object")',
+                        'info["worker"] = getattr(a, "worker", "python")',
+                        'info["issue"] = issue_report(tp, rnd.ticks)')
+# [f3ldx] the port's lines in make_engine: the REPORT wrapper and three keyword arguments (their flag-off values are the
+# callees' defaults: worker "python", issue "object", no_transfer_mirror False; checked in AC2)
+PORT_MAKE_ENGINE_ADDED = ("issue_clock(tp)",)
+PORT_MAKE_ENGINE_MERGES = (
+    (('warm_up=getattr(a, "gilfree_warm_up", "on") == "on",', 'worker=getattr(a, "worker", "python"))'),
+     'warm_up=getattr(a, "gilfree_warm_up", "on") == "on")'),
+    (('inflight_array=bool(getattr(a, "inflight_array", False)),', 'issue=getattr(a, "b2_issue", "object"),',
+      'no_transfer_mirror=bool(getattr(a, "no_transfer_mirror", False)), **kw)'),
+     'inflight_array=bool(getattr(a, "inflight_array", False)), **kw)'))
 
 
 def _func(src, name):
@@ -111,16 +150,56 @@ def test_AC2_flag_off_is_unchanged():
     assert main.index("acc_gates(a, meta, res, gates, acc[", i) - i < 160   # the gates: the next statement
     # the serial reference reads the build's GPU windows: it runs BEFORE main frees them
     assert main.index("serial_reference(") < main.index("e._k_gpu = e._v_gpu = e._kv_bias_gpu = None")
-    old = _base_source()
-    if old is None:
-        pytest.skip("no git object %s here: the line compare against the base needs it" % BASE_SHA)
-    old_l, new_l = _func(old, "one_point").splitlines(), _func(src, "one_point").splitlines()
-    assert len(old_l) == len(new_l)
-    diff = [(x, y) for x, y in zip(old_l, new_l) if x != y]
-    assert len(diff) == 1, diff                                       # one_point: the ONE condition line, no other
+    old, mid = _base_source(), _base_source(PORT_SHA)
+    if old is None or mid is None:
+        pytest.skip("no git object %s / %s here: the line compare against the base needs it" % (BASE_SHA, PORT_SHA))
+    # step 1, acc216's own delta (BASE_SHA -> PORT_SHA): one_point changes the ONE condition line, no other
+    old_l, mid_l = _func(old, "one_point").splitlines(), _func(mid, "one_point").splitlines()
+    assert len(old_l) == len(mid_l)
+    diff = [(x, y) for x, y in zip(old_l, mid_l) if x != y]
+    assert len(diff) == 1, diff
     assert diff[0][0].strip().startswith("if fp is not None:") and diff[0][1].strip().startswith(new)
     for f in ("make_engine", "run_draft_only", "preflight", "load_docs", "one_point_both", "one_point_stacks"):
-        assert _func(old, f) == _func(src, f), f                        # no other path of the timed round changed
+        assert _func(old, f) == _func(mid, f), f                        # no other path of the timed round changed
+    # step 2, the port's delta (PORT_SHA -> this tree), [f3ldx]: one_point only adds the three REPORT lines and
+    # make_engine only the REPORT wrapper and three keyword arguments; no other line of the timed round changed
+    assert _undo_port(_func(src, "one_point"), PORT_ONE_POINT_ADDED, ()) == [_code(x) for x in mid_l]
+    assert all(ln.startswith("info[") for ln in PORT_ONE_POINT_ADDED)  # each writes one REPORT key, nothing else
+    assert (_undo_port(_func(src, "make_engine"), PORT_MAKE_ENGINE_ADDED, PORT_MAKE_ENGINE_MERGES)
+            == [_code(x) for x in _func(mid, "make_engine").splitlines()])
+    for f in ("run_draft_only", "preflight", "load_docs", "one_point_both", "one_point_stacks"):
+        assert _func(mid, f) == _func(src, f), f
+    # the port's flags are OFF by default, and off they pass the callees' own defaults (the pre-port call)
+    a0 = G.parse_args(SG5_BASE)
+    assert (a0.worker, a0.b2_issue, a0.no_transfer_mirror) == ("python", "object", False)
+    def init_sig(file, cls):                                          # the class's own __init__ signature (text)
+        s = (ROOT / "nosi/nosi" / file).read_text()
+        s = s[s.index("\nclass %s" % cls):]
+        i = s.index("    def __init__(")
+        return s[i:s.index("):", i)]
+    sig = init_sig("r2_transport_gilfree.py", "GilfreeTransport")
+    assert 'worker: str = "python"' in sig, sig
+    sig = init_sig("r2_own2.py", "OwnResidency(")
+    assert 'issue: str = "object"' in sig and "no_transfer_mirror: bool = False" in sig, sig
+    # the REPORT helpers: issue_report only reads; issue_clock returns the call's value, passes its arguments and
+    # its exception unchanged (it adds a perf_counter_ns pair per call: host time, no state)
+    assert "setattr" not in inspect.getsource(G.issue_report)
+    seen = []
+
+    class _Tp:
+        def issue(self, layer, transfers):
+            seen.append((layer, transfers))
+            if layer < 0:
+                raise KeyError("planted")
+            return "r%d" % layer
+    tp = _Tp()
+    st = G.issue_clock(tp)
+    trs = [1, 2, 3]
+    assert tp.issue(4, trs) == "r4" and seen == [(4, trs)] and seen[0][1] is trs
+    with pytest.raises(KeyError, match="planted"):
+        tp.issue(-1, [])
+    assert (st["calls"], st["takes"], st["desc_calls"]) == (2, 3, 0) and tp.issue_clock is st
+    assert G.issue_report(tp, 2)["calls"] == 2 and G.issue_report(SimpleNamespace(), 2) is None
 
 
 # =====================================================================================================================
@@ -427,7 +506,11 @@ def test_AC9a_the_cells_static():
     assert "|evalfast2ia|evalacc216m|evalacc216|" in text              # [f3lia] the merged cells around it
     assert "        evalacc216m|evalacc216) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     blk = text[text.index("    evalacc216m|evalacc216) MODES="):]
-    blk = blk[:blk.index("\nesac\n")]
+    # [f3ldx] this cell only: it ends at its first ";;" (the cells after it, evalacc216f3lia and the f3ld / f3ldx
+    # timing cells, have their own flags, e.g. --eval-role); still inside the cell case
+    assert blk.index(" ;;\n") < blk.index("\nesac\n")
+    blk = blk[:blk.index(" ;;\n") + len(" ;;")]
+    assert blk.endswith('--gold-workload "$GOLD" "${LINKARG[@]}") ;;') and blk.count(";;") == 1, blk
     for w in ("MODES=fast,bi_c_strict", "BACKENDS=b2", "PC=96 ; PX=1512 ; PRV=1464", "BATCH=216", "MEMG=240G",
               "VARIANTS=fused/batched", "NOSI=$NOSI_EVAL", 'if [ "$CELL" = evalacc216m ]; then STEPS=8',
               'LINKARG=(--link-record "$OUTROOT/sg5_${RUN}_${JOB}_evalfast2rd/summary.json")',

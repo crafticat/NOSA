@@ -472,7 +472,9 @@ def test_XD5_refusals_wiring_t21_and_the_cells_static(p3, v3):
     e.res_world.tp.close()
     ns = SimpleNamespace(VERSION=3, DESC=1, OPENMP=1, SLOT_EXTRA_PER_GROUP=v3.SLOT_EXTRA_PER_GROUP,
                          NativePipe=v3.NativePipe)
-    for ext, other, msg in ((ns, False, "DESC >= 2"), (v3, True, "the same XPool")):
+    # a transport on another XPool: the base Residency check (r2_residency.py, review m2) refuses it first, before
+    # OwnResidency's desc check; both refuse at construction (L31)
+    for ext, other, msg in ((ns, False, "DESC >= 2"), (v3, True, "its .xpool is not this XPool")):
         def make(be, host_k, host_v, sk, sv, xp, seed, ext=ext, other=other):
             return GF.GilfreeTransport(ext, host_k, host_v, sk, sv, BS, int(host_k[0].shape[-1]), threads=2,
                                        host_wait=be.host_wait, cap_groups=8, worker="cpp",
