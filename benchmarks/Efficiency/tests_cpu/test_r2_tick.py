@@ -1374,4 +1374,5 @@ def test_T21_sc_counters_are_a_report_only_snapshot(p3):
     # no other first argument); the helpers' gates (fused_gates, stack_acted_gates) come in through gates.extend
     assert op.count("GB.gate(") == len(re.findall(r'GB\.gate\("%s_[A-Za-z0-9_]+" % label', op)), \
         "a GB.gate in one_point that the name check does not read"
-    assert sorted(set(re.findall(r"gates\.extend\((\w+)\(", op))) == ["fused_gates", "stack_acted_gates"]
+    assert sorted(set(re.findall(r"gates\.extend\((\w+)\(", op))) == ["apply_batched_gates", "fused_gates",
+                                                                       "stack_acted_gates"]   # [applyev] AB_acted

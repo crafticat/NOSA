@@ -133,6 +133,9 @@
 #   evalfast2f3p / evalfast2c3l / evalfast2f3l [flean] evalfast2f3 + --b2-res-profile (STEP_MIN 150) / evalfast2c3 +
 #            --res-lean --res-dev (the CHECK gate) / evalfast2f3 + --res-lean --res-dev (the fused path with the lean
 #            host checks, binds and bias fill; tests_cpu/test_r2_flean.py); REGISTERED block below
+#   evalfast2ab / evalfast2c3ab [applyev] evalfast2f3l + --apply-batched (timing; no --eval-bands until the lead
+#            registers them) / evalfast2c3l + --apply-batched (the CHECK gate); evalfast2f3l is the same-job control
+#            (tests_cpu/test_r2_applyev.py); REGISTERED block below
 #   STEP_MIN 120 in every cell above.
 #   [fusedres2] the FR-g cells of docs/R2_FUSEDRES_PLAN.md section 7 (p5b2's point: --modes exact,fast --backends b2
 #   --C 96 --X 64 --R-ver 16, no sweep, gilfree 8 threads, unchecked), with NOSI = FRNOSI (the fusedres2 worktree)
@@ -407,6 +410,25 @@
 #   F3L-MEM  peak_gb <= 84 GB (MUST EF_mem_cap; f3 peak 83.16, the dev dummies add per-layer transients of about
 #            0.1-0.3 GB). If it fails, drop the bias fill's own dummies first
 #
+# REGISTERED for evalfast2ab / evalfast2c3ab ([applyev], SOURCE ONLY, not run; no STAMP yet: the lead stamps it with
+# `date -u` before any run). WHY: analysis/evalfast/PROFILE_f3l_mixed.md sections 3.2-3.3 and 4 (step 3): on F3L
+# (evalfast2f3l) apply_events is 60.5 ms of the 403.9 ms median tick and the one span that is still launch-bound. Per
+# rolled-back request and per layer it runs sync_draft_bank (10 small device ops) and copy_ring (3 copies): 13 x 32 =
+# 416 launches per rollback. --apply-batched (ROOT NOSI_EVAL = nosi-r2-applyev: flean 665ac69 + this change) puts the
+# rollbacks into the publications' batched rebuild (the _publish_batched pattern: per layer ONE rebuild_banks_unchecked
+# and ONE copy_rows_many for every rollback and publication of the tick) and makes the keep vector once per tick. The
+# state is bitwise the unbatched state (r2_tick.py TickEngine._apply_batched docstring: EXACTNESS (a)-(c)).
+#   evalfast2ab      evalfast2f3l + --apply-batched (FAST timing, B 216, no --eval-bands: the bands come with the
+#                    prediction)
+#   evalfast2c3ab    evalfast2c3l (CHECK, B 216, 8 steps, --draft-ticks 4, no --bare, no eval role) + --apply-batched
+#   evalfast2f3l     the same-job control (unchanged arguments; this ROOT, --apply-batched off)
+#   AB-C3    evalfast2c3ab MUST _draft_only_fused_equal / _round_fused_equal / _fused_err PASS: 0 diffs, every layer
+#            compared; MUST <label>_AB_acted (apply_calls > 0, one call with >= 2 rollbacks). FALSIFIER: a difference:
+#            evalfast2ab is VOID
+#   AB-ACT   evalfast2ab MUST <label>_AB_acted (the round's engine ran the batched apply with rollbacks)
+#   PREDICTION: TBD by lead (AB-MED / AB-MEAN / AB-EFF bands, AB-FALS, AB-MEM; the bare_host_profile h_apply_events
+#            median vs the same-job evalfast2f3l)
+#
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
 #   A1'  the S-C gilfree preflight PASSES at X 64; or, if it refuses, the refusal's K5 decision report (C's 7c1387f,
 #        _k5_report) names the per-layer demand (first misses needing a shared extra, free extras at the tick start,
@@ -482,7 +504,7 @@ NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                        
 NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-stack2                                             # ROOT of the stack1 cells only ([integ]; [stack2])
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
-NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-flean                                               # ROOT of the evalfast* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree; [frfix] own worktree; [resfix] own worktree; [resdev] own worktree; [fr3] own worktree; [flean] own worktree)
+NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-applyev                                             # ROOT of the evalfast* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree; [frfix] own worktree; [resfix] own worktree; [resdev] own worktree; [fr3] own worktree; [flean] own worktree; [applyev] own worktree)
 EVALACC_OUT=/mnt/beegfs/ojerbi/r2-runs/evalacc                                           # ROOT (r2_evalacc_step.sh's OUTROOT)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                        # ROOT (lead-owned uuid files)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
@@ -509,7 +531,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl|evalfast2rd|evalfast2rdp|evalfast2c3|evalfast2f3|evalfast2f3_192|evalfast2f3p|evalfast2c3l|evalfast2f3l] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl|evalfast2rd|evalfast2rdp|evalfast2c3|evalfast2f3|evalfast2f3_192|evalfast2f3p|evalfast2c3l|evalfast2f3l|evalfast2ab|evalfast2c3ab] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -533,6 +555,7 @@ for w in "$@"; do
         evalfast2rd|evalfast2rdp) [ -z "$CELL" ] || usage; CELL=$w ;;                               # [resdev]
         evalfast2c3|evalfast2f3|evalfast2f3_192) [ -z "$CELL" ] || usage; CELL=$w ;;                # [fr3]
         evalfast2f3p|evalfast2c3l|evalfast2f3l) [ -z "$CELL" ] || usage; CELL=$w ;;                 # [flean]
+        evalfast2ab|evalfast2c3ab) [ -z "$CELL" ] || usage; CELL=$w ;;                              # [applyev]
         *) usage ;;
     esac
 done
@@ -768,6 +791,18 @@ case $CELL in
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
         EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
                  --b2-resolve check --fused-kernel v3 --res-lean --res-dev) ;;
+    evalfast2ab) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_evalfast2ab        # [applyev]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched
+        ABFLAGS=(--res-lean --res-dev --apply-batched)              # evalfast2f3l's FLFLAGS + --apply-batched (no bands)
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
+                 --eval-role fast-time --mem-cap-gb 84
+                 --accuracy-record "$EVALACC_OUT/eacc_${RUN}_${JOB}_evalacc/summary.json"
+                 --b2-resolve fused --fused-kernel v3 --host-profile --gc-freeze --lean-time
+                 --wait-index --b2-fewer-reads "${ABFLAGS[@]}") ;;
+    evalfast2c3ab) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_evalfast2c3ab  # [applyev]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; STEPS=8 ; DTICKS=4
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
+                 --b2-resolve check --fused-kernel v3 --res-lean --res-dev --apply-batched) ;;
 esac
 MIN_LEFT=$((STEP_MIN * 60 + 600))                           # [fusedres2] after the cell's STEP_MIN
 VARIANTARG=()                                               # [batched-rebuild] no --variants in every other cell
