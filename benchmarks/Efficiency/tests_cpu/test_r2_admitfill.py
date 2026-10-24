@@ -61,7 +61,7 @@ HF, TT, TK, OWN2, RSC, XPT = RF.HF, RF.TT, RF.TK, RF.OWN2, RF.RSC, RF.XPT
 p3, ref = RF.p3, RF.ref                                               # the fixtures, by name
 LAG = 2                                                               # the eval cells' --arrival-lag
 FLAGS = dict(plain={}, eval=dict(lean=True, wait_index=True, fewer_reads=True, res_lean=True))
-IA_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3lia"                         # [f3lia] (was nosi-r2-admitfill)
+IA_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3all"                         # [f3all] (was nosi-r2-f3lia; before: nosi-r2-admitfill)
 IA_BANDS = "328:362:305:338:245:282"
 
 

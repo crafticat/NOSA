@@ -105,6 +105,9 @@ acc_gates adds:
 a scope mismatch (a batch 48 record for a batch 216 cell) is REPORTED, not refused.
 [f3lia] the acc216 proof on the combined path (cell evalacc216f3lia): --store-committed-tokens with --b2-resolve fused
 --fused-kernel v3 --res-lean --res-dev --inflight-array; no harness change (the flags were independent before).
+[endbatch] --end-batch (b2; analysis/evalfast/DIAG_effective_gap.md section 4, fix 3): run_round ends the requests that
+finish in a tick with ONE call (OwnResidency(end_batch=True).end_requests: one O.end_owners, one host read, a per-request
+index of the queued keys); the same final state as one end_request per request (tests_cpu/test_r2_endbatch.py).
 OUTPUT: --out/summary.json (after every run). The last stdout line is R2_TICK_SG5_DONE failed=<n>; exit = n (2 =
 refused). ENVIRONMENT: NOSI_R2_DECODE=1, NOSI_ATTN_SPLITS > 0, NOSI_POOL_BLOCKS = 0 (the parent; a child sets its own).
 """
@@ -366,6 +369,10 @@ def parse_args(argv):
     ap.add_argument("--link-record", default="",                                              # [acc216]
                     help="with --store-committed-tokens: a timed run's summary.json; REPORT R_ACC_fast_link compares "
                          "the FAST point's counts with its first FAST point")
+    ap.add_argument("--end-batch", action="store_true",                                       # [endbatch]
+                    help="b2 only: the requests that finish in a tick end with ONE call (OwnResidency(end_batch=True)."
+                         "end_requests: one end_owners, one host read, a per-request index of the queued keys); the "
+                         "same final state as one end_request per request (tests_cpu/test_r2_endbatch.py)")
     ap.add_argument("--baseline-only", type=int, default=-1, help=argparse.SUPPRESS)   # the child: NOSI_POOL_BLOCKS
     ap.add_argument("--baseline-out", default="", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -493,6 +500,8 @@ def parse_args(argv):
             ap.error("--serial-rows: 0 <= N <= --batch")
     elif a.serial_rows != 8 or a.gold_workload or a.link_record:
         ap.error("--serial-rows, --gold-workload and --link-record need --store-committed-tokens")
+    if a.end_batch and a.backends != ["b2"]:                                                     # [endbatch]
+        ap.error("--end-batch: --backends b2 only (OwnResidency(end_batch=True))")
     a.log_slots_n = resolve_log_slots(a)                                                         # [bigb]
     return a
 
@@ -897,8 +906,10 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
                                fewer_reads=bool(getattr(a, "b2_fewer_reads", False)),                             # [hostfix]
                                res_lean=bool(getattr(a, "res_lean", False)),                                      # [resfix]
                                res_dev=bool(getattr(a, "res_dev", False)),                                        # [resdev]
-                               inflight_array=bool(getattr(a, "inflight_array", False)), **kw)                    # [inflight-array]
+                               inflight_array=bool(getattr(a, "inflight_array", False)),                          # [inflight-array]
+                               end_batch=bool(getattr(a, "end_batch", False)), **kw)                              # [endbatch]
             lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)       # [b2]
+            eng.end_batch = bool(getattr(a, "end_batch", False))         # [endbatch] run_round: one end call per tick
         else:
             lazy = _LazyOps()
             svc = ResidencySC(*args, device="cuda", nblk=n_host // 64, devops=lazy, **kw)
@@ -2146,6 +2157,8 @@ def main(argv=None) -> int:
             meta.update(res_dev=True)
         if a.inflight_array:                                                                   # [inflight-array]
             meta.update(inflight_array=True)
+        if a.end_batch:                                                                        # [endbatch]
+            meta.update(end_batch=True)
         if a.gc_freeze:                                                                        # [hostfix] item 1
             meta.update(gc_freeze=True, gc_freeze_note="each timed phase: collect, freeze, disable before; unfreeze, "
                                                        "enable, collect after (per point: gc_freeze[phase])")

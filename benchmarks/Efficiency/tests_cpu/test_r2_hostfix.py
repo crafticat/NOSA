@@ -751,7 +751,7 @@ def test_HF5f_the_harness_wiring():
 # =====================================================================================================================
 REPO = HERE.parents[2]
 STEP = EFF / "r2_tick_sg5_step.sh"
-HF_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3lia"                     # [f3lia] (was nosi-r2-flean / -admitfill / -acc216)
+HF_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3all"                     # [f3all] (was nosi-r2-f3lia / -endbatch / -applyev)
 
 
 def test_HF6a_the_cells_and_the_registration_static():
@@ -765,7 +765,8 @@ def test_HF6a_the_cells_and_the_registration_static():
             "|evalfast2f3p|evalfast2c3l|evalfast2f3l"                                              # [flean]
             "|evalfast2ia"                                                                         # [admitfill]
             "|evalacc216m|evalacc216"                                                              # [acc216]
-            "|evalfast2f3lia|evalfast2c3lia|evalacc216f3lia] [gilfree|gather]") in text            # [f3lia]
+            "|evalfast2f3lia|evalfast2c3lia|evalacc216f3lia"                                       # [f3lia]
+            "|evalfast2eb] [gilfree|gather]") in text                                              # [endbatch]
     assert "        evalfast2|evalfast2t|evalfast2c) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     reg = text[text.index("# REGISTERED for evalfast2t / evalfast2 / evalfast2c"):]
     reg = reg[:reg.index("\n#\n")]
@@ -1036,6 +1037,7 @@ def test_HF11a_the_resfix_cells_static():
     text = STEP.read_text()
     assert "        evalfast2rp|evalfast2rl) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     assert "|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl|evalfast2rd|evalfast2rdp|" in text   # [flean] fr3's cells follow
+    assert "|evalfast2eb" in text                                                                  # [endbatch] ([f3all])
     reg = text[text.index("# REGISTERED for evalfast2rp / evalfast2rl"):]
     reg = reg[:reg.index("\n#\n")]
     for tag in ("STAMP 2026-10-23T10:08:04Z", "RP ", "13,900", "60-120 ms", "REPORT only", "RL-MED", "point 300, band [280, 330]", "308",
@@ -1079,6 +1081,7 @@ def test_HF13a_the_resdev_cells_static():
     text = STEP.read_text()
     assert "        evalfast2rd|evalfast2rdp) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     assert "|evalfast2rp|evalfast2rl|evalfast2rd|evalfast2rdp|" in text      # [flean] fr3's cells follow
+    assert "|evalfast2eb" in text                                            # [endbatch] ([f3all])
     reg = text[text.index("# REGISTERED for evalfast2rd / evalfast2rdp"):]
     reg = reg[:reg.index("\n#\n")]
     for tag in ("STAMP 2026-10-23T13:17:36Z", "before any run", "RD-MED", "point 360, band [335, 420]", "RD-MEAN  [260, 300]",

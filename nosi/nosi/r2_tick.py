@@ -437,6 +437,7 @@ class TickEngine:
         self.cu_q_cache = {}
         self.backend = ResidentStore(self)
         self.timer = None
+        self.end_batch = False       # [endbatch] True: run_round ends a tick's finished requests with ONE end_requests
         self.void = False
         self.tie_acc = None          # count_ties(): per layer (pairs, ties at the QK_SELECT cut, ties at the top-k cut)
         self.plant = None            # plant_ties(): the gate SG4c's planted ties (tests and gates only)
@@ -935,6 +936,16 @@ class TickEngine:
     def end_request(self, b: int) -> None:
         self.backend.end_request(int(b))
 
+    def end_requests(self, bs) -> None:
+        """[endbatch] --end-batch: the finished requests of one tick in ONE backend call (a backend without
+        end_requests gets one end_request per b, in the order of bs)."""
+        fn = getattr(self.backend, "end_requests", None)
+        if fn is None:
+            for b in bs:
+                self.end_request(b)
+            return
+        fn([int(b) for b in bs])
+
     @torch.inference_mode()
     def apply_events(self) -> None:
         """The decisions of the tick (module docstring, ROLLBACK and PUBLICATION). Device ops and host bookkeeping."""
@@ -1292,6 +1303,23 @@ class ResidencyBackend:
             self.ended.add(b)
             self.svc.end_request(b)
 
+    def end_requests(self, bs) -> None:
+        """[endbatch] the requests of bs not ended yet, in the order of bs (the uid of request b is b): ONE
+        svc.end_requests call when the service has --end-batch on (OwnResidency(end_batch=True)), else one
+        svc.end_request per request, as end_request does."""
+        new = []
+        for b in bs:
+            if b not in self.ended and b not in new:
+                new.append(b)
+        if not new:
+            return
+        self.ended.update(new)
+        if getattr(self.svc, "end_batch", False):
+            self.svc.end_requests(new)
+        else:
+            for b in new:
+                self.svc.end_request(b)
+
 
 class TickTimer:
     """SG5's instrumentation (module docstring): per tick, CUDA event pairs per category (or perf_counter on the CPU),
@@ -1397,9 +1425,12 @@ def run_round(engine: TickEngine, first_tokens: Sequence[int], max_new: Sequence
                 engine.timer.host("h_finish_tick", t1 - t0)      # the decision read and the host decisions
                 engine.timer.host("h_apply_events", clk() - t1)
         t0 = clk()
-        for b, r in enumerate(rnd.reqs):
-            if r.done:
-                engine.end_request(b)
+        if getattr(engine, "end_batch", False):                  # [endbatch] --end-batch: ONE call for the tick's ends
+            engine.end_requests([b for b, r in enumerate(rnd.reqs) if r.done])
+        else:
+            for b, r in enumerate(rnd.reqs):
+                if r.done:
+                    engine.end_request(b)
         if prof:
             engine.timer.host("h_end_request", clk() - t0)       # outside the tick's span (wall clock only)
     engine.check_overflow()

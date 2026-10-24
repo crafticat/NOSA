@@ -612,7 +612,7 @@ FL_CELLS = dict(
 def test_FL7a_the_cells_and_the_registration_static():
     text = HF.STEP.read_text()
     lines = text.splitlines()
-    assert next(ln for ln in lines if ln.startswith("NOSI_EVAL=")).split()[0] == "NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-f3lia"
+    assert next(ln for ln in lines if ln.startswith("NOSI_EVAL=")).split()[0] == "NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-f3all"   # [f3all]
     assert "        evalfast2f3p|evalfast2c3l|evalfast2f3l) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     assert "|evalfast2c3|evalfast2f3|evalfast2f3_192|evalfast2f3p|evalfast2c3l|evalfast2f3l|" in text   # [f3lia] more follow
     reg = text[text.index("# REGISTERED for evalfast2f3p / evalfast2c3l / evalfast2f3l"):]
