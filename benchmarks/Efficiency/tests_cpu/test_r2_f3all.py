@@ -16,12 +16,14 @@ eng.end_batch after the construction, in make_engine's order.
        the batched apply and the batched ends ran in that round too (the evalfast2c3all gate's CPU form).
   FA3  STATE (child): the f3lia path + --end-batch --apply-batched == the f3lia path (the evalfast2f3lia control, rebuild
        batched) on randomized event streams (test_r2_applyev.py's _sched: SG1's forced schedule, rollbacks only,
-       mixed seeds, the free-running greedy round) with all requests ending in one tick or staggered over ticks
-       (test_r2_endbatch.py's STAGGER), on both layouts: every tick and layer (RF._rounds_diff), the full service state
-       at every poll and at the end (test_r2_endbatch.py's _snap), the twin tables, stores and token log at the end,
-       the X pool map per tick, the same end (HF._same_end), the same ended requests per tick. PRECONDITIONS over the
-       set (FA3z): a tick that ends 2 or more requests, a round that ends requests in 2 or more ticks, a batched apply
-       call with 2 or more rollbacks, a rollback in each stream with a reject schedule.
+       mixed seeds, the free-running greedy round) and one scripted stream (lock_sched: a per-request cycle schedule,
+       so with one max_new for all the requests stay in lockstep and all end in ONE tick, by construction) with one
+       max_new for all or staggered over ticks (test_r2_endbatch.py's STAGGER), on both layouts: every tick and layer
+       (RF._rounds_diff), the full service state at every poll and at the end (test_r2_endbatch.py's _snap), the twin
+       tables, stores and token log at the end, the X pool map per tick, the same end (HF._same_end), the same ended
+       requests per tick. PRECONDITIONS over the set (FA3z): a tick that ends 2 or more requests (the lock case), a
+       round that ends requests in 2 or more ticks, a batched apply call with 2 or more rollbacks, a rollback in each
+       stream with a reject schedule.
   FA4  NEGATIVE CONTROLS on this path (child; L34: each plant's own act precondition; L49: each plant only at the site
        under test): (a) test_r2_endbatch.py's skip-one plant of O.end_owners (the last request of each batched end
        keeps its owner): precondition: it acted and left an owner; the compare sees it. (b) test_r2_applyev.py's
@@ -166,6 +168,26 @@ def engine(P3, layout, cfg, seed, mode, allf, checked=False):
     return eng
 
 
+def lock_sched():
+    """The "lock" stream: a scripted reject_at that is a function of the request's OWN decision count and the cohort's
+    size only (r2_tick.forced_schedule's "cycle" kind, without its position kinds cross / steer). The n-th decided
+    cohort of a request (size L) is rejected at offset n % (L + 1); offset L = accepted whole. Why the requests stay in
+    lockstep: run_round passes no ready gate, so Round.plan_tick and TickRound.finish_tick / _decide read only the
+    counts (s, committed_in_epoch, n_triggered, len(out), max_new) and this function's result; each request starts
+    with one token, so with one max_new for all (no STAGGER) every request has the same counts at every tick. Thus
+    every rejection falls in the same tick for all B requests (one apply with B rollbacks) and all B requests end in
+    ONE tick (one end_requests call with B uids): the FA3z preconditions hold by construction, not by a seed."""
+    n_dec = {}
+
+    def reject_at(b, c, E):
+        k = n_dec.get(b, 0)
+        n_dec[b] = k + 1
+        L = c.b - c.a + 1
+        off = k % (L + 1)
+        return None if off == L else c.a + off
+    return reject_at
+
+
 def xround(eng, toks, stream, stagger):
     """RF._round's per-tick and per-layer record, with test_r2_applyev.py's event stream, test_r2_endbatch.py's
     STAGGER (or one max_new for all), the full service state (EB._snap) at every poll and at the end, every end call
@@ -219,7 +241,7 @@ def xround(eng, toks, stream, stagger):
             maps.append(svc.xpool.pos_of.clone())
     eng.timer = TK.TickTimer(cuda=False)
     S_list = eng.S_list
-    reject_at = AE._sched(stream)                       # a FRESH generator per round: both rounds draw alike
+    reject_at = lock_sched() if stream == "lock" else AE._sched(stream)   # FRESH per round: both rounds draw alike
 
     def teacher(b, p):
         return int(toks[p - S_list[b], b])
@@ -288,7 +310,8 @@ def compare(a, b):
 CASES = [("stream", "default", "forced", False, 1, False), ("stream", "pressure", "rb", True, 1, False),
          ("stream", "pressure", "mixed1", True, 2, False), ("stream", "default", "free", True, 1, False),
          ("stream", "pressure", "mixed3", False, 3, True), ("pool", "default", "forced", True, 1, False),
-         ("pool", "pressure", "mixed2", True, 1, False), ("pool", "pressure", "rb", False, 2, True)]
+         ("pool", "pressure", "mixed2", True, 1, False), ("pool", "pressure", "rb", False, 2, True),
+         ("stream", "pressure", "lock", False, 1, False)]
 
 if PART == "cases":
     print("FA_JSON " + json.dumps(dict(cases=CASES)))
@@ -347,7 +370,8 @@ def _child(part, *extra):
 CASES = [("stream", "default", "forced", False, 1, False), ("stream", "pressure", "rb", True, 1, False),
          ("stream", "pressure", "mixed1", True, 2, False), ("stream", "default", "free", True, 1, False),
          ("stream", "pressure", "mixed3", False, 3, True), ("pool", "default", "forced", True, 1, False),
-         ("pool", "pressure", "mixed2", True, 1, False), ("pool", "pressure", "rb", False, 2, True)]
+         ("pool", "pressure", "mixed2", True, 1, False), ("pool", "pressure", "rb", False, 2, True),
+         ("stream", "pressure", "lock", False, 1, False)]
 CASE_IDS = ["-".join(str(x) for x in c) for c in CASES]
 _RUNS = {}
 
@@ -423,6 +447,10 @@ def test_FA3_end_batch_and_apply_batched_equal_the_f3lia_path(p3, i):
     stream = r["case"][2]
     if stream != "free":                                              # a reject schedule: rollbacks on this stream
         assert b["rollbacks"] > 0, ("precondition: the stream's rollbacks", r["case"], b["rollbacks"])
+    if stream == "lock" and not r["case"][3]:                         # lock_sched, one max_new: the lockstep
+        assert len(b["ends"]) == 1 and len(b["ends"][0][1]) >= 2, ("the lock stream ends all requests in ONE tick",
+                                                                    b["ends"])
+        assert b["apply_rb_max"] >= 2, ("the lock stream rolls back every request in one apply", b["apply_rb_max"])
 
 
 def test_FA3z_the_cases_reach_every_end_and_apply_mix(p3):

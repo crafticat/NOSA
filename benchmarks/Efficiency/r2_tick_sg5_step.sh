@@ -612,6 +612,7 @@
 #   ALL-MEAN   steady tok/s (mean tick). PREDICTION: 375 [345, 405] (f3lia 351.43)
 #   ALL-EFF    effective tok/s. PREDICTION: 320 [295, 345] (f3lia 281.21 = about 43 s per round; --end-batch -3.4 s,
 #              --apply-batched about -2 s over 61 ticks)
+#   ALL-BANDS  --eval-bands 440:500:345:405:295:345 (ALL-MED / ALL-MEAN / ALL-EFF)
 #   ALL-HEND   the sum of bare_host_profile.per_tick_ms.h_end_request (ticks 0-60). PREDICTION: below 50 ms (eb 10.5 ms;
 #              f3lia about 3400 ms)
 #   ALL-HAPPLY bare_host_profile h_apply_events median. PREDICTION: below 30 ms (f3l about 60 ms)

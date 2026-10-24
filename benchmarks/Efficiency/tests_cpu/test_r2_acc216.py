@@ -34,6 +34,11 @@ ACC_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3all"                         # [f3all] 
 # parent of the acc216 merge (was 8ccf262, acc216's own base: flean and admitfill changed make_engine / preflight /
 # one_point after it, so the line compare is made against the tree that acc216 was merged into)
 BASE_SHA = "346334116e779add7d4e77aff02e7ffaab25f62c"
+# [f3all] the tree that endbatch (1ae07fe) and applyev (a3199da) were merged into: f3lia's tip 5cdfc75 (acc216 merged).
+# AC2 compares in two steps (as nosi-r2-f3ldx 14043f0 did for the b2-desc port): BASE_SHA -> PORT_SHA is acc216's own
+# delta (the ONE condition line); PORT_SHA -> this tree is the merge's delta, which must be REPORT / gate lines and
+# assignments whose flag-off values equal the callees' defaults (flag off: no state change)
+PORT_SHA = "5cdfc755c236dd14a6c9036b73693a028dddedcc"
 sys.path.insert(0, str(EFF))
 
 
@@ -82,13 +87,52 @@ def test_AC1_flag_parsing():
 # =====================================================================================================================
 # AC2 flag off: unchanged
 # =====================================================================================================================
-def _base_source():
+def _base_source(sha=BASE_SHA, path="benchmarks/Efficiency/r2_tick_sg5.py"):
     try:
-        r = subprocess.run(["git", "-C", str(ROOT), "show", "%s:benchmarks/Efficiency/r2_tick_sg5.py" % BASE_SHA],
-                           capture_output=True, text=True)
+        r = subprocess.run(["git", "-C", str(ROOT), "show", "%s:%s" % (sha, path)], capture_output=True, text=True)
     except FileNotFoundError:
         return None
     return r.stdout if r.returncode == 0 else None
+
+
+def _code(ln):
+    """A line without its trailing comment (indentation kept: it is Python's syntax)."""
+    return ln.split("  #", 1)[0].rstrip()
+
+
+def _undo_port(new_f, added, merges):
+    """[f3all] new_f's code lines with the merge's delta undone: each line of `added` (stripped code) is dropped and
+    each run of `merges` (consecutive stripped code lines) goes back to its one old code line. Each must occur exactly
+    once, so a line that the merge did not add makes the compare fail (nosi-r2-f3ldx 14043f0's helper)."""
+    new = [_code(x) for x in new_f.splitlines()]
+    for ln in added:
+        assert sum(1 for x in new if x.strip() == ln) == 1, ("the merge's added line is not there once", ln)
+        new = [x for x in new if x.strip() != ln]
+    for run, old in merges:
+        at = [i for i in range(len(new) - len(run) + 1) if [x.strip() for x in new[i:i + len(run)]] == list(run)]
+        assert len(at) == 1, ("the merge's changed lines are not there once", run)
+        i = at[0]
+        new[i:i + len(run)] = [new[i][:len(new[i]) - len(new[i].lstrip())] + old]
+    return new
+
+
+# [f3all] applyev's lines in one_point (endbatch adds none there): the engine's host counters read into abw (getattr
+# only), the REPORT key info["apply_batched"] under the flag, and the gate list extended by apply_batched_gates (which
+# returns [] with the flag off; checked in AC2)
+PORT_ONE_POINT_ADDED = (
+    'abw = dict(apply_batched=getattr(eng, "apply_batched", False), apply_calls=getattr(eng, "apply_calls", 0),',
+    'apply_rb_max=getattr(eng, "apply_rb_max", 0), apply_rb_items=getattr(eng, "apply_rb_items", 0))',
+    'if getattr(a, "apply_batched", False):',
+    'info["apply_batched"] = abw',
+    'gates.extend(apply_batched_gates(a, label, abw))')
+# [f3all] the merge's lines in make_engine: two engine assignments and one keyword argument (their flag-off values are
+# the defaults: TickEngine apply_batched False / end_batch False, OwnResidency end_batch False; checked in AC2)
+PORT_MAKE_ENGINE_ADDED = ('eng.apply_batched = bool(getattr(a, "apply_batched", False))',
+                          'eng.end_batch = bool(getattr(a, "end_batch", False))')
+PORT_MAKE_ENGINE_MERGES = (
+    (('inflight_array=bool(getattr(a, "inflight_array", False)),',
+      'end_batch=bool(getattr(a, "end_batch", False)), **kw)'),
+     'inflight_array=bool(getattr(a, "inflight_array", False)), **kw)'),)
 
 
 def _func(src, name):
@@ -111,16 +155,55 @@ def test_AC2_flag_off_is_unchanged():
     assert main.index("acc_gates(a, meta, res, gates, acc[", i) - i < 160   # the gates: the next statement
     # the serial reference reads the build's GPU windows: it runs BEFORE main frees them
     assert main.index("serial_reference(") < main.index("e._k_gpu = e._v_gpu = e._kv_bias_gpu = None")
-    old = _base_source()
-    if old is None:
-        pytest.skip("no git object %s here: the line compare against the base needs it" % BASE_SHA)
-    old_l, new_l = _func(old, "one_point").splitlines(), _func(src, "one_point").splitlines()
-    assert len(old_l) == len(new_l)
-    diff = [(x, y) for x, y in zip(old_l, new_l) if x != y]
-    assert len(diff) == 1, diff                                       # one_point: the ONE condition line, no other
+    old, mid = _base_source(), _base_source(PORT_SHA)
+    if old is None or mid is None:
+        pytest.skip("no git object %s / %s here: the line compare against the base needs it" % (BASE_SHA, PORT_SHA))
+    # step 1, acc216's own delta (BASE_SHA -> PORT_SHA): one_point changes the ONE condition line, no other
+    old_l, mid_l = _func(old, "one_point").splitlines(), _func(mid, "one_point").splitlines()
+    assert len(old_l) == len(mid_l)
+    diff = [(x, y) for x, y in zip(old_l, mid_l) if x != y]
+    assert len(diff) == 1, diff
     assert diff[0][0].strip().startswith("if fp is not None:") and diff[0][1].strip().startswith(new)
     for f in ("make_engine", "run_draft_only", "preflight", "load_docs", "one_point_both", "one_point_stacks"):
-        assert _func(old, f) == _func(src, f), f                        # no other path of the timed round changed
+        assert _func(old, f) == _func(mid, f), f                        # no other path of the timed round changed
+    # step 2, the merge's delta (PORT_SHA -> this tree), [f3all]: one_point only adds applyev's five lines and
+    # make_engine only two assignments and one keyword argument; no other line of the timed round changed
+    assert _undo_port(_func(src, "one_point"), PORT_ONE_POINT_ADDED, ()) == [_code(x) for x in mid_l]
+    assert (_undo_port(_func(src, "make_engine"), PORT_MAKE_ENGINE_ADDED, PORT_MAKE_ENGINE_MERGES)
+            == [_code(x) for x in _func(mid, "make_engine").splitlines()])
+    for f in ("run_draft_only", "preflight", "load_docs", "one_point_both", "one_point_stacks"):
+        assert _func(mid, f) == _func(src, f), f
+    # the REPORT key is written only under the flag: the line right after the flag's condition, one level deeper
+    op_src = _func(src, "one_point")
+    assert ('        if getattr(a, "apply_batched", False):' in op_src
+            and op_src.count('\n            info["apply_batched"] = abw\n') == 1)
+    i = op_src.index('        if getattr(a, "apply_batched", False):')
+    assert op_src.index('\n            info["apply_batched"] = abw\n') == op_src.index("\n", i)
+    # the merge's flags are OFF by default, and off they set the callees' own defaults (the pre-merge state)
+    a0 = G.parse_args(SG5_BASE)
+    assert (a0.end_batch, a0.apply_batched) == (False, False)
+    w_any = dict(apply_batched=True, apply_calls=5, apply_rb_max=4, apply_rb_items=9)
+    assert G.apply_batched_gates(a0, "x", w_any) == [] and G.apply_batched_gates(SimpleNamespace(), "x", w_any) == []
+    assert "setattr" not in inspect.getsource(G.apply_batched_gates)   # it reads w and a only
+
+    def init_sig(file, cls):                                          # the class's own __init__ signature (text)
+        s = (ROOT / "nosi/nosi" / file).read_text()
+        s = s[s.index("\nclass %s" % cls):]
+        i = s.index("    def __init__(")
+        return s[i:s.index("):", i)]
+    sig = init_sig("r2_tick.py", "TickEngine")
+    assert "apply_batched: bool = False" in sig, sig
+    sig = init_sig("r2_own2.py", "OwnResidency(")
+    assert "end_batch: bool = False" in sig, sig
+    tick = (ROOT / "nosi/nosi/r2_tick.py").read_text()
+    te = tick[tick.index("\nclass TickEngine"):]
+    te = te[:te.index("\n    def ", te.index("    def __init__(") + 1)]
+    assert te.count("        self.end_batch = False ") == 1, "TickEngine's end_batch default"
+    rr = tick[tick.index("\ndef run_round("):]
+    rr = rr[:rr.index("\n\n\n")]
+    assert ('        if getattr(engine, "end_batch", False):' in rr
+            and "            for b, r in enumerate(rnd.reqs):\n                if r.done:\n"
+                "                    engine.end_request(b)\n" in rr), "run_round: off = one end_request per request"
 
 
 # =====================================================================================================================
