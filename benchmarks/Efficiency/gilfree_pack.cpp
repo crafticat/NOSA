@@ -25,6 +25,9 @@
 //            torch Stream.wait_event protocol / its error and stats.
 // The v2 entry points (pack_into, release) are unchanged in meaning; release() publishes nothing (the Python feeder
 // publishes). v3 slot layout: P0 = cap * (R + 2) * 8 (SLOT_EXTRA_PER_GROUP = 16 bytes of board pairs per group).
+// DESC 2 [f3ldx]: set_stores also takes the X pool's FLAT stores (M * R, H, D); submit_desc then takes a (7, n)
+// descriptor whose row 6 is each take's lane, and the destination is m' = lane (the object path's rule: the adapter's
+// submit with m' = Transfer.phys on the (1, M * R, H, D) view). The 4-D stores keep DESC 1's logical rule unchanged.
 //
 // WHAT (bit-for-bit the Python packer's work, reordered only across chunk boundaries):
 //   order    the release's groups (b, h, l, m, blk) sorted by (l, b, h, m) = the concatenation of the Python packer's
@@ -253,6 +256,7 @@ struct Job {
   at::cuda::CUDAEvent done_ev;                              // CUDA: recorded on the scatter stream after the release
   bool is_desc = false;                                     // Q-B3: a descriptor job (submit_desc)
   std::vector<int64_t> desc;                                // its (6, n) rows l, b, h, block, slot, gen (a copy)
+  int64_t desc_rows = 6;                                    // [f3ldx] 7 on the flat X-pool store: + the lane row
 };
 
 constexpr int kStats = 10;                    // groups, chunks, layers, pack, wait, submit, total, team lo, team hi, published
@@ -386,10 +390,36 @@ class NativePipe {
   // ------------------------------------------------------------------------------------------------ Q-B3
   // The descriptor path: the layers' stores (the base tensors, alive in Python), registered once. The sources must be
   // the adapter's: one (1, S, H, D) per (layer, request), in the order layer * B + b.
+  // [f3ldx] A 3-D store (M * R, H, D) is the X pool's FLAT store (r2_xpool): the descriptor then has a 7th row, the
+  // LANE of each take, and the destination m' is that lane (the object path's rule: r2_transport_gilfree.py _submit,
+  // m' = Transfer.phys on the store's (1, M * R, H, D) view; release_impl's view(-1, D) is the same rows). B then comes
+  // from the sources (one per (layer, request)), and the lane bound is M. A 4-D store keeps the logical path unchanged.
   void set_stores(std::vector<at::Tensor> sk, std::vector<at::Tensor> sv) {
     TORCH_CHECK(have_src_, "set_sources first");
     TORCH_CHECK(!sk.empty() && sk.size() == sv.size(), "set_stores: K and V lists of one length");
     const at::Tensor& s0 = sk[0];
+    if (s0.dim() == 3) {                                       // [f3ldx] the flat X-pool store: lanes in the descriptor
+      TORCH_CHECK(s0.size(2) == src_.D && s0.size(1) == src_.H && s0.size(0) % R_ == 0 && s0.size(0) > 0,
+                  "set_stores (flat): the stores are (M * R, H, D) with whole R-row positions and the sources' H and D");
+      for (size_t i = 0; i < sk.size(); ++i) {
+        for (const at::Tensor* t : {&sk[i], &sv[i]}) {
+          TORCH_CHECK(t->sizes() == s0.sizes() && t->is_contiguous() && t->scalar_type() == src_.dtype &&
+                          t->device() == land_.device(),
+                      "set_stores: every store is contiguous, of the first one's shape, the sources' dtype, where the "
+                      "landing ring lives");
+        }
+      }
+      const int64_t nsrc = static_cast<int64_t>(src_.k.size()), nl = static_cast<int64_t>(sk.size());
+      TORCH_CHECK(src_.B == 1 && nsrc % nl == 0 && nsrc / nl >= 1,
+                  "set_stores (flat): the sources must be one (1, S, H, D) per (layer, request) (the adapter's)");
+      stores_k_ = std::move(sk);
+      stores_v_ = std::move(sv);
+      flat_ = true;
+      dB_ = nsrc / nl;
+      dH_ = stores_k_[0].size(1);
+      dslots_ = stores_k_[0].size(0) / R_;                     // the lane bound M (order_and_check: m' < S_dst / R)
+      return;
+    }
     TORCH_CHECK(s0.dim() == 4 && s0.size(3) == src_.D && s0.size(2) == src_.H && s0.size(1) % R_ == 0,
                 "set_stores: the stores are (B, rows, H, D) with whole R-row slots and the sources' H and D");
     for (size_t i = 0; i < sk.size(); ++i) {
@@ -404,6 +434,7 @@ class NativePipe {
                 "set_stores: the sources must be one (1, S, H, D) per (layer, request) (the adapter's)");
     stores_k_ = std::move(sk);
     stores_v_ = std::move(sv);
+    flat_ = false;
     dB_ = s0.size(0);
     dH_ = s0.size(2);
     dslots_ = s0.size(1) / R_;
@@ -412,14 +443,23 @@ class NativePipe {
   // ONE job of a whole tick's takes: desc (6, n) int64 CPU rows l, b, h, block, slot, gen (copied here: the tensor
   // stays in Python); readers: per layer the raw cudaEvent_t of the newest last reader of its destinations (0 none);
   // hist: the raw cudaEvent_t of the newest write-back the job's host rows need (0 none). -> its job seq.
+  // [f3ldx] On the flat X-pool store (set_stores with 3-D stores) desc is (7, n): row 6 is each take's LANE.
   int64_t submit_desc(at::Tensor desc, std::vector<int64_t> readers, int64_t hist) {
     TORCH_CHECK(!stores_k_.empty(), "set_stores first");
-    TORCH_CHECK(desc.device().is_cpu() && desc.scalar_type() == at::kLong && desc.dim() == 2 && desc.size(0) == 6 &&
-                    desc.size(1) > 0 && desc.is_contiguous(),
-                "submit_desc: desc is a non-empty contiguous (6, n) int64 CPU tensor (l, b, h, block, slot, gen)");
+    if (flat_) {
+      TORCH_CHECK(desc.device().is_cpu() && desc.scalar_type() == at::kLong && desc.dim() == 2 && desc.size(0) == 7 &&
+                      desc.size(1) > 0 && desc.is_contiguous(),
+                  "submit_desc (flat X-pool store): desc is a non-empty contiguous (7, n) int64 CPU tensor (l, b, h, "
+                  "block, slot, gen, lane)");
+    } else {
+      TORCH_CHECK(desc.device().is_cpu() && desc.scalar_type() == at::kLong && desc.dim() == 2 && desc.size(0) == 6 &&
+                      desc.size(1) > 0 && desc.is_contiguous(),
+                  "submit_desc: desc is a non-empty contiguous (6, n) int64 CPU tensor (l, b, h, block, slot, gen)");
+    }
     TORCH_CHECK(readers.empty() || readers.size() == stores_k_.size(), "submit_desc: one reader handle per layer");
     auto j = std::make_shared<Job>();
     j->is_desc = true;
+    j->desc_rows = desc.size(0);
     const int64_t* p = desc.data_ptr<int64_t>();
     j->desc.assign(p, p + desc.numel());
     j->readers = std::move(readers);
@@ -622,15 +662,22 @@ class NativePipe {
   // destination m' = b * slots + slot of the layer's store), its checks (inside the geometry and the board, one
   // destination per (l, b, h, slot)), then ONE release per layer present, in layer order, each after its layer's T3
   // wait (the newest last reader of its destinations) on the scatter stream; the board pairs from the entries.
+  // [f3ldx] On the flat X-pool store the destination is the descriptor's LANE row (m' = lane, the object path's rule,
+  // r2_transport_gilfree.py _submit / _release: m' = Transfer.phys), the duplicate check is per (l, h, lane) (the
+  // object path's _check: one transfer per (h, lane) of a layer), and the logical slot names only the board entry.
   std::vector<int64_t> release_desc(Job& j) {
     TORCH_CHECK(!stores_k_.empty(), "set_stores first");
-    const int64_t n = static_cast<int64_t>(j.desc.size() / 6);
+    const bool flat = j.desc_rows == 7;
+    TORCH_CHECK(flat == flat_, "gilfree desc: a ", j.desc_rows, "-row descriptor on a ", flat_ ? "flat" : "4-D",
+                " store");
+    const int64_t n = static_cast<int64_t>(j.desc.size() / j.desc_rows);
     const int64_t* Dl = j.desc.data();
     const int64_t* Db = Dl + n;
     const int64_t* Dh = Db + n;
     const int64_t* Dk = Dh + n;
     const int64_t* Ds = Dk + n;
     const int64_t* Dg = Ds + n;
+    const int64_t* Dp = flat ? Dg + n : nullptr;               // [f3ldx] the lane (flat store only)
     const int64_t L = static_cast<int64_t>(stores_k_.size());
     const int64_t nblk = src_.S / R_;
     const bool pub = board_.defined() && !skip_publish_;
@@ -643,11 +690,19 @@ class NativePipe {
       bN = board_.size(3);
     }
     for (int64_t i = 0; i < n; ++i) {
+      if (flat) {                                              // [f3ldx] the lane inside the M positions
+        TORCH_CHECK(Dl[i] >= 0 && Dl[i] < L && Db[i] >= 0 && Db[i] < dB_ && Dh[i] >= 0 && Dh[i] < dH_ && Dk[i] >= 0 &&
+                        Dk[i] < nblk && Ds[i] >= 0 && Dp[i] >= 0 && Dp[i] < dslots_,
+                    "gilfree desc: entry ", i, " (l ", Dl[i], ", b ", Db[i], ", h ", Dh[i], ", block ", Dk[i],
+                    ", slot ", Ds[i], ", lane ", Dp[i], ") outside the geometry (L ", L, ", B ", dB_, ", H ", dH_, ", ",
+                    nblk, " complete host blocks, ", dslots_, " positions)");
+      } else {
       TORCH_CHECK(Dl[i] >= 0 && Dl[i] < L && Db[i] >= 0 && Db[i] < dB_ && Dh[i] >= 0 && Dh[i] < dH_ && Dk[i] >= 0 &&
                       Dk[i] < nblk && Ds[i] >= 0 && Ds[i] < dslots_,
                   "gilfree desc: entry ", i, " (l ", Dl[i], ", b ", Db[i], ", h ", Dh[i], ", block ", Dk[i], ", slot ",
                   Ds[i], ") outside the geometry (L ", L, ", B ", dB_, ", H ", dH_, ", ", nblk,
                   " complete host blocks, ", dslots_, " slots)");
+      }
       if (pub) {
         TORCH_CHECK(Dl[i] < bL && Db[i] < bB && Dh[i] < bH && Ds[i] < bN, "gilfree desc: entry ", i,
                     " outside the board (", bL, ", ", bB, ", ", bH, ", ", bN, ")");
@@ -655,9 +710,17 @@ class NativePipe {
     }
     std::vector<int64_t> o(n);
     std::iota(o.begin(), o.end(), 0);
+    if (flat) {                                                // [f3ldx] one take per (l, h, lane), in layer order
+      auto lkey = [&](int64_t e) { return std::make_tuple(Dl[e], Dh[e], Dp[e]); };
+      std::stable_sort(o.begin(), o.end(), [&](int64_t x, int64_t y) { return lkey(x) < lkey(y); });
+      for (int64_t i = 1; i < n; ++i) {
+        TORCH_CHECK(lkey(o[i]) != lkey(o[i - 1]), "gilfree desc: two transfers into one lane (l ", Dl[o[i]], " h ",
+                    Dh[o[i]], " lane ", Dp[o[i]], ")");
+      }
+    }
     auto key = [&](int64_t e) { return std::make_tuple(Dl[e], Db[e], Dh[e], Ds[e]); };
-    std::stable_sort(o.begin(), o.end(), [&](int64_t x, int64_t y) { return key(x) < key(y); });
-    for (int64_t i = 1; i < n; ++i) {
+    if (!flat) std::stable_sort(o.begin(), o.end(), [&](int64_t x, int64_t y) { return key(x) < key(y); });
+    for (int64_t i = 1; i < n && !flat; ++i) {
       TORCH_CHECK(key(o[i]) != key(o[i - 1]), "gilfree desc: two transfers into one destination (l ", Dl[o[i]],
                   " b ", Db[o[i]], " h ", Dh[o[i]], " slot ", Ds[o[i]], ")");
     }
@@ -681,7 +744,8 @@ class NativePipe {
         const int64_t e = o[i0 + q];
         vh[q] = Dh[e];
         vl[q] = l * dB_ + Db[e];                       // the source of (layer, request)
-        vm[q] = Db[e] * dslots_ + Ds[e] + plant_slot_; // the destination slot in the layer's store
+        vm[q] = flat ? Dp[e] + plant_slot_             // [f3ldx] the lane: the object path's m' = Transfer.phys
+                     : Db[e] * dslots_ + Ds[e] + plant_slot_; // the destination slot in the layer's store
         vk[q] = Dk[e];
         if (pub) {
           vf[q] = ((l * bB + Db[e]) * bH + Dh[e]) * bN + Ds[e];
@@ -828,6 +892,7 @@ class NativePipe {
   // Q-B3: the layers' stores, the store geometry, the job watermark, the planted slot shift (tests only)
   std::vector<at::Tensor> stores_k_, stores_v_;
   int64_t dB_ = 0, dH_ = 0, dslots_ = 0, landed_ = 0, plant_slot_ = 0;
+  bool flat_ = false;                                // [f3ldx] the stores are the X pool's flat (M * R, H, D) stores
   std::atomic<int64_t> submitted_{0}, completed_{0};
   std::vector<int64_t> totals_;
   std::string error_, fatal_;
@@ -875,10 +940,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mod) {
       .def("submit", &NativePipe::submit, py::call_guard<py::gil_scoped_release>(),
            "queue one release for the worker: (b, h, l, m, blk lists, the layer's store K and V (B, rows, H, D), "
            "board indices, board generations, T4 event handles, T3 event handles) -> its job seq")
-      .def("set_stores", &NativePipe::set_stores, "Q-B3: the layers' stores (B, rows, H, D), K and V lists")
+      .def("set_stores", &NativePipe::set_stores, "Q-B3: the layers' stores (B, rows, H, D), K and V lists; [f3ldx] "
+           "or the X pool's flat stores (M * R, H, D): the descriptor then carries the lane row")
       .def("submit_desc", &NativePipe::submit_desc, py::call_guard<py::gil_scoped_release>(),
-           "Q-B3: queue a whole tick's takes as ONE job: desc (6, n) int64 rows l, b, h, block, slot, gen; per-layer "
-           "T3 event handles; one T4 event handle -> its job seq")
+           "Q-B3: queue a whole tick's takes as ONE job: desc (6, n) int64 rows l, b, h, block, slot, gen ([f3ldx] "
+           "(7, n) + the lane on flat stores); per-layer T3 event handles; one T4 event handle -> its job seq")
       .def("landed_upto", &NativePipe::landed_upto, py::call_guard<py::gil_scoped_release>(),
            "Q-B3: the job watermark (every job up to it ran and landed)")
       .def("set_plant_slot_shift", &NativePipe::set_plant_slot_shift, "NEGATIVE CONTROL (tests only)")
@@ -897,7 +963,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mod) {
       .def_property_readonly("cuda", &NativePipe::is_cuda)
       .def_property_readonly("p0", &NativePipe::p0);
   mod.attr("VERSION") = 3;
-  mod.attr("DESC") = 1;                       // Q-B3: set_stores / submit_desc / landed_upto
+  mod.attr("DESC") = 2;                       // Q-B3: set_stores / submit_desc / landed_upto; 2 [f3ldx]: + flat lanes
   mod.attr("SLOT_EXTRA_PER_GROUP") = kPairBytes;
 #ifdef _OPENMP
   mod.attr("OPENMP") = 1;

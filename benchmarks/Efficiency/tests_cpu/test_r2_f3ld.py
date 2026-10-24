@@ -48,9 +48,9 @@ the view is the same in both.
        --no-transfer-mirror parses with --b2-issue desc --worker cpp --arrival-lag >= 1 --lean-time and refuses
        otherwise; make_engine passes it; the T21 static lists (one_point's gate helpers, main's gate calls) hold.
   TO5  THE CELLS (static): evalfast2f3d / evalfast2c3d / evalfast2f3t / evalfast2c3t, NOSI_EVAL = this tree, packer v3
-       of --nosi (GF3), the REGISTERED F3LD block unstamped with every PREDICTION "TBD by lead", the TBD bands refused
-       outside DRYRUN, F3LD_BLOCKED stops the step outside DRYRUN; TO5d: the DRYRUN argv of every new cell, and the
-       harness's refusal of --b2-issue desc on --layout pool (the registered blocker).
+       of --nosi (GF3, [f3ldx] DESC 2), the REGISTERED F3LD block unstamped with every PREDICTION "TBD by lead", the
+       TBD bands refused outside DRYRUN, [f3ldx] no F3LD_BLOCKED; TO5d: the DRYRUN argv of every new cell, and the
+       harness now PARSES it on --layout pool (the blocker is cleared; the TBD bands aside).
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA benchmarks/Efficiency/tests_cpu/test_r2_f3ld.py
 """
@@ -90,7 +90,7 @@ TT, TRM, OWN2, RSC, GF = BD.TT, BD.TRM, BD.OWN2, BD.RSC, BD.GF
 RES = TT.RES
 p3, ref, v3 = BD.p3, BD.ref, BD.v3                                    # the fixtures, by name
 C_INFLIGHT = RSC.C_INFLIGHT
-F3LD_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3ld"
+F3LD_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3ldx"                        # [f3ldx] (was nosi-r2-f3ld)
 CELLS = ("evalfast2f3d", "evalfast2c3d", "evalfast2f3t", "evalfast2c3t")
 FIELDS = BD.FIELDS + ("layers",)
 
@@ -619,10 +619,11 @@ def test_TO4_refusals_and_the_harness_wiring(p3, v3):
     for bad in ([x for x in NM if x != "--lean-time"],
                 NM[:NM.index("--worker")] + ["--no-transfer-mirror"],                     # no --b2-issue desc
                 [x if x != "2" else "0" for x in NM],                                      # --arrival-lag 0
-                NM + ["--inflight-array"],
-                NM + ["--layout", "pool"]):                                                # E's issue_desc: no xpool
+                NM + ["--inflight-array"]):
         with pytest.raises(SystemExit):
             G.parse_args(bad)
+    a = G.parse_args(NM + ["--layout", "pool"])                                            # [f3ldx] the lane row
+    assert a.no_transfer_mirror and a.layout == "pool"
     me = inspect.getsource(G.make_engine)
     assert 'no_transfer_mirror=bool(getattr(a, "no_transfer_mirror", False))' in me
     assert 'issue=getattr(a, "b2_issue", "object")' in me and 'worker=getattr(a, "worker", "python")' in me
@@ -664,8 +665,8 @@ def test_TO5_the_cells_static():
     lines = text.splitlines()
     assert next(ln for ln in lines if ln.startswith("NOSI_EVAL=")).split()[0] == "NOSI_EVAL=" + F3LD_ROOT
     assert F3LD_ROOT == HF.HF_ROOT
-    assert "|evalfast2f3lia|evalfast2c3lia|evalacc216f3lia|evalfast2f3d|evalfast2c3d|evalfast2f3t|evalfast2c3t] " \
-           "[gilfree|gather]" in text
+    assert "|evalfast2f3lia|evalfast2c3lia|evalacc216f3lia|evalfast2f3d|evalfast2c3d|evalfast2f3t|evalfast2c3t" \
+           "|evalfast2f3c|evalfast2c3c] [gilfree|gather]" in text                     # [f3ldx] f3c / c3c appended
     assert "        evalfast2f3d|evalfast2c3d|evalfast2f3t|evalfast2c3t) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     f3 = _cell(text, "    evalfast2f3d|evalfast2f3t) MODES=fast")
     for w in ("BATCH=216", "PX=1512 ; PRV=1464", "VARIANTS=fused/batched", "NOSI=$NOSI_EVAL", "GF3=1",
@@ -685,14 +686,14 @@ def test_TO5_the_cells_static():
         assert w not in c3, w
     # the control evalfast2f3lia keeps its arguments (test_r2_f3lia.py F3G)
     assert "--wait-index --b2-fewer-reads --res-lean --res-dev --inflight-array) ;;" in text
-    # the packer: v3 of --nosi for the GF3 cells (r2_gfw_step.sh's rule), DESC checked; copied from PK_*
-    for w in ("GF3=                ", "F3LD_BLOCKED=xpool", 'PK_PY_BLOB=$(git -C "$NOSI" rev-parse -q --verify "$NSHA:$GF_PY")',
-              "grep -q 'mod.attr(\"DESC\") = 1;'", 'git -C "$NOSI" show "$PK_PY_BLOB" > "$GF_DIR/gilfree_pack.py"',
+    # the packer: v3 of --nosi for the GF3 cells (r2_gfw_step.sh's rule), DESC 2 checked ([f3ldx]); copied from PK_*
+    for w in ("GF3=                ", 'PK_PY_BLOB=$(git -C "$NOSI" rev-parse -q --verify "$NSHA:$GF_PY")',
+              "grep -q 'mod.attr(\"DESC\") = 2;'", 'git -C "$NOSI" show "$PK_PY_BLOB" > "$GF_DIR/gilfree_pack.py"',
               'git -C "$NOSI" show "$PK_CPP_BLOB" > "$GF_DIR/gilfree_pack.cpp"'):
         assert w.strip() in text, w
     assert 'git -C "$NOSI" show "$GF_PY_BLOB" >' not in text
-    i = text.index('if [ -n "$GF3" ] && [ "${DRYRUN:-0}" != 1 ] && [ -n "$F3LD_BLOCKED" ]; then')
-    assert text.index("\nesac\n", text.index("    evalfast2c3d|evalfast2c3t) MODES=fast")) < i
+    assert "F3LD_BLOCKED" not in text.replace("so F3LD_BLOCKED is gone", "")       # [f3ldx] the blocker is gone
+    assert "grep -q 'mod.attr(\"DESC\") = 1;'" not in text
     for word in ("awk", "perl", "python3", " bc ", "node "):
         for ln in lines:
             if not ln.lstrip().startswith("#"):
@@ -718,7 +719,8 @@ def test_TO5_the_registration_is_left_to_the_lead():
 
 @pytest.mark.parametrize("cell", CELLS)
 def test_TO5_the_step_stops_outside_dryrun(tmp_path, cell):
-    """Outside DRYRUN: the timing cells stop on the TBD bands (while unstamped), the CHECK cells on F3LD_BLOCKED."""
+    """Outside DRYRUN: the timing cells stop on the TBD bands (while unstamped); [f3ldx] the CHECK cells are not
+    blocked: with the test's holder directory they stop at the SG5_HOLDERS rule (DRYRUN only), before any launch."""
     text = HF.STEP.read_text()
     env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_", "DRYRUN"))}
     env.update(SG5_HOLDERS=str(tmp_path))
@@ -727,10 +729,11 @@ def test_TO5_the_step_stops_outside_dryrun(tmp_path, cell):
     assert r.returncode == 1, (r.returncode, r.stderr[-300:])
     assert "r2_tick_sg5.py" not in r.stdout
     timing = cell in ("evalfast2f3d", "evalfast2f3t")
+    assert "BLOCKED" not in r.stderr, r.stderr[-300:]
     if timing and re.search(r"^\s+F3L[DT]_BANDS=TBD\s", text, re.M):
         assert "cell %s: --eval-bands TBD" % cell in r.stderr, r.stderr[-300:]
-    elif re.search(r"^F3LD_BLOCKED=xpool", text, re.M):
-        assert "cell %s: BLOCKED (xpool)" % cell in r.stderr, r.stderr[-300:]
+    else:
+        assert "SG5_HOLDERS is for DRYRUN" in r.stderr, r.stderr[-300:]
 
 
 @pytest.mark.parametrize("cell", CELLS)
@@ -753,8 +756,8 @@ def test_TO5d_the_cells_dryrun(tmp_path, cell, capsys):
               "--b2-resolve %s" % ("fused" if timing else "check")):
         assert s in got or s in line, (cell, s)
     assert ("--no-transfer-mirror" in got) == nm and ("--inflight-array" in got) == (not nm), cell
-    assert "[f3ld] packer copied: %s (packer v3 of --nosi, DESC)" % HF._clean_head() in r.stdout
-    assert "blocked: xpool" in r.stdout
+    assert "[f3ld] packer copied: %s (packer v3 of --nosi, DESC 2)" % HF._clean_head() in r.stdout
+    assert "blocked:" not in r.stdout                                 # [f3ldx] F3LD-BLOCK cleared
     argv = got.split()
     if timing:
         bands = "TBD" if "--eval-bands TBD" in got else None
@@ -765,16 +768,15 @@ def test_TO5d_the_cells_dryrun(tmp_path, cell, capsys):
         assert ("--lean-time" in got) == nm
     G = HF._sg5()
     capsys.readouterr()
-    with pytest.raises(SystemExit):                                   # the registered blocker (F3LD-BLOCK)
-        G.parse_args(argv)
-    err = capsys.readouterr().err
-    assert ("issue_desc" in err and "xpool" in err) or "--eval-bands" in err, err[-400:]
-    if not timing:                                                    # the flags themselves parse on the stream layout
+    if timing and "--eval-bands TBD" in got:                          # the placeholder bands: refused by the harness
+        with pytest.raises(SystemExit):
+            G.parse_args(argv)
+        assert "--eval-bands" in capsys.readouterr().err
         alt = list(argv)
-        k = alt.index("--layout")
-        alt[k + 1] = "stream"
-        del alt[alt.index("--X-pool"):alt.index("--X-pool") + 2]
-        pa = G.parse_args(alt)
-        assert pa.b2_issue == "desc" and pa.worker == "cpp" and pa.no_transfer_mirror == nm
-        assert pa.inflight_array == (not nm) and pa.b2_resolve == "check" and pa.fused_kernel == "v3"
-        assert pa.res_lean and pa.res_dev and pa.arrival_lag == 2 and pa.batch == 216
+        alt[alt.index("--eval-bands") + 1] = "1:2:1:2:1:2"
+        argv = alt
+    pa = G.parse_args(argv)                                           # [f3ldx] on --layout pool: no blocker left
+    assert pa.layout == "pool" and pa.X_pool == 1512
+    assert pa.b2_issue == "desc" and pa.worker == "cpp" and pa.no_transfer_mirror == nm
+    assert pa.inflight_array == (not nm) and pa.b2_resolve == ("fused" if timing else "check")
+    assert pa.fused_kernel == "v3" and pa.res_lean and pa.res_dev and pa.arrival_lag == 2 and pa.batch == 216

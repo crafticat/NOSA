@@ -87,9 +87,10 @@ decisions, page tables and logits (tests_cpu/test_r2_admitfill.py).
 array poll is in OwnResidency._poll_arrivals, the fused resolve in FusedResolver.resolve); no new code joins them
 (tests_cpu/test_r2_f3lia.py).
 [b2-desc] --worker python|cpp (the gilfree transport's worker; default python) and --b2-issue object|desc (b2's draft
-issue; default object; desc = ONE E issue_desc job per tick, needs --worker cpp and --transport gilfree; [f3ld] and
---layout stream: E's issue_desc refuses xpool lanes), ported by hunks from 47db0c0; issue_clock / issue_report: the
-issue calls' host time, calls and takes per tick (REPORT info["issue"]). tests_cpu/test_r2_b2_desc.py.
+issue; default object; desc = ONE E issue_desc job per tick, needs --worker cpp and --transport gilfree; [f3ldx] every
+--layout: on the pool the descriptor carries each take's lane, packer DESC 2), ported by hunks from 47db0c0;
+issue_clock / issue_report: the issue calls' host time, calls and takes per tick (REPORT info["issue"]).
+tests_cpu/test_r2_b2_desc.py, tests_cpu/test_r2_f3ldx.py.
 [f3ld] --no-transfer-mirror (b2, --b2-issue desc, --arrival-lag >= 1, --lean-time; not with --inflight-array): no
 Transfer object per take (OwnResidency(no_transfer_mirror=True); analysis/evalfast/PLAN_admission_fill.md rank 1b);
 the same decisions, page tables, table, store and logits (tests_cpu/test_r2_f3ld.py).
@@ -504,9 +505,9 @@ def parse_args(argv):
                  "needs the fixed arrival rule)")
     if a.b2_issue == "desc" and (a.worker != "cpp" or a.transport != "gilfree"):                  # [b2-desc]
         ap.error("--b2-issue desc needs --worker cpp and --transport gilfree (E's issue_desc)")
-    if a.b2_issue == "desc" and (a.backends != ["b2"] or a.layout != "stream"):                  # [f3ld]
-        ap.error("--b2-issue desc: --backends b2 and --layout stream only (E's issue_desc names logical slots and "
-                 "refuses xpool lanes: GilfreeTransport.issue_desc; OwnResidency(issue='desc') refuses an X pool)")
+    if a.b2_issue == "desc" and a.backends != ["b2"]:                                             # [f3ld] [f3ldx]
+        ap.error("--b2-issue desc: --backends b2 only (OwnResidency(issue='desc')); every --layout (the pool: the "
+                 "descriptor's lane row, packer DESC >= 2)")
     if a.no_transfer_mirror and (a.b2_issue != "desc" or a.arrival_lag < 1 or not a.lean_time   # [f3ld]
                                  or a.inflight_array):
         ap.error("--no-transfer-mirror: needs --b2-issue desc (with --worker cpp), --arrival-lag >= 1 and --lean-time; "

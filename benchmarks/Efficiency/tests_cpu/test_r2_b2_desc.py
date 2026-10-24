@@ -30,9 +30,10 @@ waits on every pending event.
        difference from the clean desc round is that tick's STORE (every host-state field equal there: the table cannot
        see it), and the planted slot holds block + 1's rows.
   BD3  refusals and the harness: issue="desc" over K3X's adversarial transport and over the Python feeder is refused
-       at CONSTRUCTION (lesson L31), an unknown issue too; job_ev needs the C++ worker; r2_tick_sg5 --worker /
-       --b2-issue parse (defaults python / object; desc without --worker cpp, or on gather, refused; [f3ld] desc with
-       --layout pool / both refused: E's issue_desc refuses xpool lanes); make_engine passes both; issue_clock counts
+       at CONSTRUCTION (lesson L31), an unknown issue too ([f3ldx] the X pool is not: test_r2_f3ldx.py); job_ev needs
+       the C++ worker; r2_tick_sg5 --worker /
+       --b2-issue parse (defaults python / object; desc without --worker cpp, or on gather, or off b2, refused; [f3ldx]
+       desc with --layout pool / both parses: the descriptor carries the lanes); make_engine passes both; issue_clock counts
        the issue calls, takes and host time of a transport (REPORT); [f3ld] the issue phase hook.
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rA benchmarks/Efficiency/tests_cpu/test_r2_b2_desc.py
@@ -86,7 +87,7 @@ def v3(tmp_path_factory):
     sys.modules[spec.name] = gp
     spec.loader.exec_module(gp)
     ext = gp.load(str(tmp_path_factory.mktemp("gilfree3_b2desc_build")))
-    assert int(ext.VERSION) == 3 and int(ext.DESC) == 1 and int(ext.OPENMP) == 1
+    assert int(ext.VERSION) == 3 and int(ext.DESC) == 2 and int(ext.OPENMP) == 1     # [f3ldx] DESC 2: the lane row
     return ext
 
 
@@ -147,11 +148,31 @@ def _factory(ext, worker, cnt):
     return make
 
 
-def _engine(p3, ext, issue, cfg="default", checked=False, worker="cpp", cnt=None, seed=1, lag=LAG, svc_kw=None):
-    """A b2 engine of make_res_engine on E's transport. svc_kw: more OwnResidency arguments ([f3ld] the eval flags)."""
+def _factory_pool(ext, worker, cnt):
+    """[f3ldx] make_pool_engine's transport hook (test_r2_xpool.py): E's GilfreeTransport on the SAME XPool as the
+    service and the engine (the flat stores), with _factory's counting host_wait."""
+    def make(be, host_k, host_v, sk, sv, xp, seed):
+        def hw(ev):
+            if ev is not None and not EVD(ev):
+                cnt["host_waits"] += 1
+            be.host_wait(ev)
+        return GF.GilfreeTransport(ext, host_k, host_v, sk, sv, BS, int(host_k[0].shape[-1]), threads=2, host_wait=hw,
+                                   cap_groups=8, worker=worker, xpool=xp)
+    return make
+
+
+def _engine(p3, ext, issue, cfg="default", checked=False, worker="cpp", cnt=None, seed=1, lag=LAG, svc_kw=None,
+            pool=False):
+    """A b2 engine of make_res_engine on E's transport. svc_kw: more OwnResidency arguments ([f3ld] the eval flags).
+    [f3ldx] pool=True: test_r2_xpool.make_pool_engine's world (the shared X pool, X_pool = X) on E's transport."""
     cnt = cnt if cnt is not None else dict(host_waits=0)
     kw = dict(checked=checked, issue=issue, arrival_lag=lag)
     kw.update(svc_kw or {})
+    if pool:
+        XPT = _shared("test_r2_xpool_shared_b2", "test_r2_xpool.py")
+        eng = XPT.make_pool_engine(TT.make_ops(p3), kind="b2", seed=seed, svc_kw=kw,
+                                   tp_factory=_factory_pool(ext, worker, cnt), **CFG[cfg])
+        return eng, cnt
     orig = TT.KTR.AdversarialTransport
     TT.KTR.AdversarialTransport = _factory(ext, worker, cnt)
     try:
@@ -172,12 +193,13 @@ def _state(svc):
 
 
 def _run(p3, ext, toks, issue, cfg="default", checked=False, late=LAG, plant=None, seed=1, lag=LAG, svc_kw=None,
-         forced=True, state=None, layer_rec=None, setup=None):
+         forced=True, state=None, layer_rec=None, setup=None, pool=False):
     """One round on b2 with E's C++ worker (teacher-forced by forced_schedule, or free-running); a record per tick
     (after its end_tick and the flush). plant(tp, svc, ticks, world, probes) may wrap the transport (BD2). [f3ld]
     state(svc): the state field (default _state); layer_rec(svc, plan): a per-LAYER record after every resolve (the
-    device decisions, test_r2_f3ld.py); setup(eng, svc, ticks): called before the round."""
-    eng, cnt = _engine(p3, ext, issue, cfg=cfg, checked=checked, seed=seed, lag=lag, svc_kw=svc_kw)
+    device decisions, test_r2_f3ld.py); setup(eng, svc, ticks): called before the round. [f3ldx] pool: the X-pool
+    world (_engine(pool=True))."""
+    eng, cnt = _engine(p3, ext, issue, cfg=cfg, checked=checked, seed=seed, lag=lag, svc_kw=svc_kw, pool=pool)
     world = eng.res_world
     svc, tp = world.svc, world.tp
     assert isinstance(tp, GF.GilfreeTransport) and tp.worker == "cpp" and svc.tp is tp
@@ -396,9 +418,11 @@ def test_BD3_refusals_the_harness_flags_and_the_issue_clock(p3, v3):
     eng, _ = _engine(p3, v3, "desc")                                  # positive: the C++ worker builds it
     assert eng.res_world.svc.issue == "desc" and eng.res_world.svc._hm is not None
     eng.res_world.tp.close()
-    # [f3ld] the X pool is refused at construction (E's issue_desc names logical slots), and the issue phase hook
+    # [f3ldx] the X pool is no longer refused: it needs DESC >= 2 and the transport on the same XPool
+    # (test_r2_f3ldx.py XD1-XD4 run it); and the issue phase hook
     src = inspect.getsource(OWN2.OwnResidency.__init__)
-    assert "does not translate xpool lanes" in src and "if self.xpool is not None:" in src
+    assert "does not translate xpool lanes" not in src and "if self.xpool is not None:" in src
+    assert 'getattr(tp, "xpool", None) is not self.xpool' in src and 'getattr(tp, "desc_lanes", 2)' in src
     et = inspect.getsource(RSC.ResidencySC.end_tick)
     assert et.index('getattr(self, "_tick_issue", None)') < et.index("Residency.end_tick(self)")
     assert et.index("self.apply_tick(steps)") < et.index('getattr(self, "_tick_issue", None)')
@@ -413,11 +437,14 @@ def test_BD3_refusals_the_harness_flags_and_the_issue_clock(p3, v3):
     a = G.parse_args(base + ["--backends", "b2", "--worker", "cpp", "--b2-issue", "desc"])
     assert a.worker == "cpp" and a.b2_issue == "desc"
     for bad in (["--b2-issue", "desc"], ["--worker", "cpp", "--b2-issue", "desc", "--transport", "gather"],
-                ["--worker", "rust"], ["--b2-issue", "bulk"],
-                ["--worker", "cpp", "--b2-issue", "desc", "--layout", "pool"],          # [f3ld] xpool lanes
-                ["--worker", "cpp", "--b2-issue", "desc", "--layout", "both", "--arrival-lag", "2"]):
+                ["--worker", "rust"], ["--b2-issue", "bulk"]):
         with pytest.raises(SystemExit):
             G.parse_args(base + ["--backends", "b2"] + bad)
+    with pytest.raises(SystemExit):                                   # desc is b2's (OwnResidency(issue='desc'))
+        G.parse_args(base + ["--backends", "sc", "--worker", "cpp", "--b2-issue", "desc"])
+    for lay in (["--layout", "pool", "--arrival-lag", "2"], ["--layout", "both", "--arrival-lag", "2"]):   # [f3ldx]
+        a = G.parse_args(base + ["--backends", "b2", "--worker", "cpp", "--b2-issue", "desc"] + lay)
+        assert a.b2_issue == "desc" and a.layout == lay[1]
     src = (EFF / "r2_tick_sg5.py").read_text()
     tree = ast.parse(src)
     me = ast.get_source_segment(src, next(n for n in tree.body if isinstance(n, ast.FunctionDef)

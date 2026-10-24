@@ -208,21 +208,25 @@ class OwnResidency(ResidencySparse):
         super().__init__(*args, **kw)
         # [b2-desc] the draft issue: "object" (the default; p5b2 / p6: Residency.end_tick, tp.issue per layer) or "desc"
         # (E's tp.issue_desc: the tick's draft takes as ONE (6, n) job; docs/R2_B2_DESC_PLAN.md). Checked HERE, not at
-        # the first issue (lesson L31): desc needs E's C++ worker with packer v3's DESC. [f3ld] and no X pool: E's
-        # issue_desc names logical slots and refuses xpool lanes (r2_transport_gilfree.py issue_desc), so the shared-pool
-        # layout (--layout pool, every eval cell) cannot take the descriptor path
+        # the first issue (lesson L31): desc needs E's C++ worker with packer v3's DESC. [f3ldx] With an X pool (--layout
+        # pool, every eval cell) it needs DESC >= 2: the transport adds each take's lane by the object path's rule
+        # (r2_transport_gilfree.py _desc_lanes: XPool.lanes_of, assign_phys's index) and the transport must share the
+        # service's XPool (its lanes are this pool's)
         if issue not in ISSUES:
             raise ValueError("issue must be one of %s (got %r)" % (ISSUES, issue))
         if issue == "desc":
             tp = self.tp
-            ok = (getattr(tp, "worker", None) == "cpp" and int(getattr(getattr(tp, "ext", None), "DESC", 0)) == 1
+            dl = int(getattr(getattr(tp, "ext", None), "DESC", 0) or 0)
+            ok = (getattr(tp, "worker", None) == "cpp" and dl >= 1
                   and all(callable(getattr(tp, n, None)) for n in ("issue_desc", "mark_reader", "mark_hist", "job_ev")))
             if not ok:
                 raise ValueError("OwnResidency(issue='desc') needs GilfreeTransport(worker='cpp') over packer v3 with "
                                  "DESC (issue_desc, mark_reader, mark_hist, job_ev); got %s" % (type(tp).__name__,))
-            if self.xpool is not None:
-                raise ValueError("OwnResidency(issue='desc') with an X pool: E's issue_desc names logical slots and "
-                                 "does not translate xpool lanes (GilfreeTransport.issue_desc refuses xpool)")
+            if self.xpool is not None:                                # [f3ldx] the lane row (DESC 2), the same pool
+                lanes = int(getattr(tp, "desc_lanes", 2))
+                if dl < lanes or getattr(tp, "xpool", None) is not self.xpool:
+                    raise ValueError("OwnResidency(issue='desc') with an X pool needs packer v3 with DESC >= %d (got "
+                                     "%d) and a transport on the same XPool (GilfreeTransport(xpool=...))" % (lanes, dl))
         self.issue = issue
         if issue == "desc":
             self._hm = torch.full((self.B, self.nblk), -1, dtype=torch.int64)

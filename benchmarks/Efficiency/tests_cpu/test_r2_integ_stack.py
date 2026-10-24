@@ -51,7 +51,8 @@ ST5  ZERO-STRIDE VIEWS (the xpool flat address mode) in the shared-KV KERNEL and
 ST6  STATIC: FusedResolver keeps S-C's [sharedkv2] page-key hooks (_check_tail_keys once per tick, _page_keys on the
      plan) and implements docs/R2_FUSEDRES_PLAN.md section 5 (release_free after sync_mirror behind the blocking-read
      rule, bind after V2 and after D2, draft_bias_fill_flat, no xpool refusal); the gilfree transport's flat checks
-     live in _check (both workers), the C++ worker submits m' = Transfer.phys, issue_desc refuses the pool.
+     live in _check (both workers), the C++ worker submits m' = Transfer.phys, issue_desc on the pool adds the lane row
+     ([f3ldx]; test_r2_f3ldx.py).
 ST7  THE SG5 HARNESS: --stack presets (full / full-no-<c> / none), refusals (explicit component flags with --stack,
      a non-b2 backend, --attn shared without --sel-check, --stack-compare without a lag), the labels, --shipped-batch,
      and one_point_stacks' gates with a stand-in point (equal arms PASS; a differing stack arm FAILS with the tick and

@@ -441,14 +441,31 @@ class XPool:
         valid = tk & (pos >= 0) & (blk >= 0)
         return torch.stack([bb, hh, blk.clamp(min=0), pos.clamp(min=0), valid.to(torch.int64)]).contiguous()
 
+    def phys_index(self, l, b, h, slot):
+        """THE ADDRESS RULE of the transports' lanes: the flat index of (layer, b, h, slot) in pos_of (ints or int64
+        tensors). assign_phys (the object path: Transfer.phys) and lanes_of (the descriptor path) both read pos_of at
+        this index, so both name the same lane."""
+        return ((l * self.B + b) * self.H + h) * (self.n_hist + N_TAIL) + slot
+
+    def lanes_of(self, desc: torch.Tensor) -> torch.Tensor:
+        """[f3ldx] The lane of each take of a descriptor (6, n) int64 CPU rows l, b, h, block, slot, gen: pos_of at
+        phys_index(l, b, h, slot), assign_phys's rule, in ONE device-to-host read. -> (n,) int64 CPU. A take without a
+        lane is refused, as assign_phys refuses it."""
+        f = self.phys_index(desc[0], desc[1], desc[2], desc[4])
+        vals = self.pos_of.view(-1)[f.to(self.device)].to("cpu")
+        if bool((vals < 0).any()):
+            i = int((vals < 0).nonzero()[0, 0])
+            raise XPoolError("descriptor take %d (layer %d b %d h %d slot %d) has no bound lane"
+                             % (i, int(desc[0, i]), int(desc[1, i]), int(desc[2, i]), int(desc[4, i])))
+        return vals
+
     def assign_phys(self, transfers: Sequence) -> None:
         """Transfer.phys := the lane of each transfer's (layer, b, h, slot): ONE device-to-host read for the list (the
         tick's deferred draft transfers, at end_tick). A transfer without a lane is refused (the binder's invariant)."""
         trs = list(transfers)
         if not trs:
             return
-        W = self.n_hist + N_TAIL
-        f = torch.tensor([((tr.layer * self.B + tr.b) * self.H + tr.h) * W + tr.slot for tr in trs], dtype=torch.int64)
+        f = torch.tensor([self.phys_index(tr.layer, tr.b, tr.h, tr.slot) for tr in trs], dtype=torch.int64)
         vals = self.pos_of.view(-1)[f.to(self.device)].tolist()
         for tr, p in zip(trs, vals):
             if p < 0:
