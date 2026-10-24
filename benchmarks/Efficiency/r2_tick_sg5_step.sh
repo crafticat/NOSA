@@ -158,7 +158,7 @@
 #            registers them) / evalfast2c3l + --apply-batched (the CHECK gate); evalfast2f3l is the same-job control
 #            (tests_cpu/test_r2_applyev.py); REGISTERED block below
 #   evalfast2all / evalfast2c3all [f3all] evalfast2f3lia + --end-batch --apply-batched (FAST timing; --eval-bands
-#            "$ALL_BANDS", TBD until the lead registers them: the step refuses TBD outside DRYRUN) / evalfast2c3lia +
+#            "$ALL_BANDS" = 440:500:345:405:295:345, registered in the F3ALL block) / evalfast2c3lia +
 #            --end-batch --apply-batched (the CHECK gate, 0 diffs, plus MUST _AB_acted); evalfast2f3lia is the same-job
 #            control (tests_cpu/test_r2_f3all.py); REGISTERED block below (the F3ALL block)
 #   evalacc216all [f3all] evalacc216f3lia + --end-batch --apply-batched; --link-record = the evalfast2all summary.json
@@ -591,8 +591,8 @@
 #   AB-FALS  PREDICTION: fires if the median is below the same job's evalfast2f3l median + 10 tok/s
 #   AB-MEM   peak_gb <= 84 (MUST EF_mem_cap). PREDICTION: 83.1 to 83.3 GB (f3l 83.18)
 #
-# REGISTERED for evalfast2all / evalfast2c3all / evalacc216all ([f3all], NOT STAMPED: the lead fills every PREDICTION and
-# the bands, then stamps this block from `date -u` before any run, L33). WHAT: this tree (ROOT NOSI_EVAL = nosi-r2-f3all:
+# REGISTERED for evalfast2all / evalfast2c3all / evalacc216all ([f3all], STAMP 2026-10-24T05:23:37Z, before any run; the
+# lead used the first f3lia record sg5_l3_2192144_evalfast2f3lia 433.94 / 351.43 / 281.21 and SCORING_endbatch.md). WHAT: this tree (ROOT NOSI_EVAL = nosi-r2-f3all:
 # f3lia 5cdfc75 merged with endbatch 1ae07fe and applyev a3199da) has the f3lia path (fused v3 + --res-lean --res-dev +
 # --inflight-array), the batched ends --end-batch (evalfast2eb) and the batched apply --apply-batched (evalfast2ab). The
 # three parts are independent: the ends are run_round's (after the tick span; OwnResidency.end_requests), the batched
@@ -607,23 +607,26 @@
 #            compared, with the array poll, the batched ends and the batched apply on; MUST <label>_AB_acted (apply_calls
 #            > 0, one call with >= 2 rollbacks). FALSIFIER: a difference: evalfast2all and evalacc216all are VOID
 #   ALL-ACT    evalfast2all MUST <label>_AB_acted (the round's engine ran the batched apply with rollbacks)
-#   ALL-MED    steady tok/s (median tick). PREDICTION: TBD by lead
-#   ALL-MEAN   steady tok/s (mean tick). PREDICTION: TBD by lead
-#   ALL-EFF    effective tok/s. PREDICTION: TBD by lead
-#   ALL-HEND   the sum of bare_host_profile.per_tick_ms.h_end_request (ticks 0-60). PREDICTION: TBD by lead
-#   ALL-HAPPLY bare_host_profile h_apply_events median. PREDICTION: TBD by lead
-#   ALL-SAME   the bare round's ticks and committed equal evalfast2f3lia's of the same job. PREDICTION: TBD by lead
-#   ALL-FALS   the falsifier. PREDICTION: TBD by lead
-#   ALL-MEM    peak_gb <= 84 (MUST EF_mem_cap). PREDICTION: TBD by lead
+#   ALL-MED    steady tok/s (median tick). PREDICTION: 470 [440, 500] (f3lia 433.94; --apply-batched about -35 ms of
+#              the median tick; --end-batch does not touch the median tick)
+#   ALL-MEAN   steady tok/s (mean tick). PREDICTION: 375 [345, 405] (f3lia 351.43)
+#   ALL-EFF    effective tok/s. PREDICTION: 320 [295, 345] (f3lia 281.21 = about 43 s per round; --end-batch -3.4 s,
+#              --apply-batched about -2 s over 61 ticks)
+#   ALL-HEND   the sum of bare_host_profile.per_tick_ms.h_end_request (ticks 0-60). PREDICTION: below 50 ms (eb 10.5 ms;
+#              f3lia about 3400 ms)
+#   ALL-HAPPLY bare_host_profile h_apply_events median. PREDICTION: below 30 ms (f3l about 60 ms)
+#   ALL-SAME   the bare round's ticks and committed equal evalfast2f3lia's of the same job. PREDICTION: equal
+#   ALL-FALS   the falsifier. PREDICTION: fires if effective < the same job's evalfast2f3lia effective + 15 tok/s
+#   ALL-MEM    peak_gb <= 84 (MUST EF_mem_cap). PREDICTION: 83.0 to 83.4 GB
 #   evalacc216all    evalacc216f3lia (--modes fast,bi_c_strict, no --bare, no eval role, --store-committed-tokens
 #                    --serial-rows 8 --gold-workload GOLD, --b2-resolve fused --fused-kernel v3 --res-lean --res-dev
 #                    --inflight-array) + --end-batch --apply-batched; --link-record = the evalfast2all summary.json of the
 #                    same run id and holder
-#   ACCALL-BI   ACC_exact_batch_invariance (MUST). PREDICTION: TBD by lead
-#   ACCALL-ETD  ACC_exact_vs_serial (MUST). PREDICTION: TBD by lead
-#   ACCALL-AE   ACC_AE_fast_vs_exact (MUST). PREDICTION: TBD by lead
-#   ACCALL-LINK R_ACC_fast_link (REPORT) against evalfast2all. PREDICTION: TBD by lead
-#   ACCALL-MEM  R_ACC_peak (REPORT). PREDICTION: TBD by lead
+#   ACCALL-BI   ACC_exact_batch_invariance (MUST). PREDICTION: PASS, 0 of 122 pairs differ
+#   ACCALL-ETD  ACC_exact_vs_serial (MUST). PREDICTION: PASS, 8 of 8 rows x 48 committed tokens equal
+#   ACCALL-AE   ACC_AE_fast_vs_exact (MUST). PREDICTION: EQUIVALENT
+#   ACCALL-LINK R_ACC_fast_link (REPORT) against evalfast2all. PREDICTION: EQUAL counts
+#   ACCALL-MEM  R_ACC_peak (REPORT). PREDICTION: <= 84 GB
 #   No miniature: evalfast2c3all (8 steps, CHECK) runs first in the same job and gates every later cell.
 #
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
@@ -1056,7 +1059,7 @@ case $CELL in
                  --b2-resolve check --fused-kernel v3 --res-lean --res-dev --apply-batched) ;;
     evalfast2all) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_evalfast2all     # [f3all]
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched
-        ALL_BANDS=TBD                                       # REGISTERED ALL-MED/MEAN/EFF (the lead fills and stamps)
+        ALL_BANDS=440:500:345:405:295:345                   # REGISTERED ALL-MED/MEAN/EFF (STAMP 2026-10-24T05:23:37Z)
         [ "${DRYRUN:-0}" = 1 ] || [ "$ALL_BANDS" != TBD ] ||
             stop "cell $CELL: --eval-bands TBD (the lead fills and stamps the REGISTERED F3ALL block first)"
         EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
