@@ -501,46 +501,51 @@
 #   ACC3LIA-MEM  R_ACC_peak (REPORT). PREDICTION: <= 84 GB (acc216 full 83.25)
 #   No miniature: evalfast2c3lia (8 steps, CHECK) runs first in the same job and gates every later cell.
 #
-# REGISTERED for evalfast2f3d / evalfast2c3d / evalfast2f3t / evalfast2c3t ([f3ld], NOT STAMPED: the lead fills every
-# PREDICTION and adds the stamp line before any run). WHAT: this tree (ROOT NOSI_EVAL = nosi-r2-f3ldx: nosi-r2-f3ld
+# REGISTERED for evalfast2f3d / evalfast2c3d / evalfast2f3t / evalfast2c3t ([f3ld], STAMP 2026-10-24T04:16:01Z, before any
+# run and before any f3lia GPU result; the lead's absolute bands assume f3lia near its registered points). WHAT: this tree (ROOT NOSI_EVAL = nosi-r2-f3ldx: nosi-r2-f3ld
 # a5c8937 = f3lia 89c9169 + b2-desc 47db0c0 ported by hunks + --no-transfer-mirror, + [f3ldx] the descriptor's lane row
 # on the X pool; analysis/evalfast/PLAN_admission_fill.md section 4 ranks 1a and 1b, section 5.2). Same-job control:
 # evalfast2f3lia (the f3lia path in this tree, flags off).
-#   evalfast2f3d  evalfast2f3lia + --worker cpp --b2-issue desc (FAST timing, B 216, --eval-bands "$F3LD_BANDS": TBD)
+#   evalfast2f3d  evalfast2f3lia + --worker cpp --b2-issue desc (FAST timing, B 216, --eval-bands "$F3LD_BANDS")
 #   evalfast2c3d  evalfast2c3lia + --worker cpp --b2-issue desc (CHECK, B 216, 8 steps, --draft-ticks 4)
-#   evalfast2f3t  evalfast2f3d + --no-transfer-mirror - --inflight-array (FAST timing, --eval-bands "$F3LT_BANDS": TBD)
+#   evalfast2f3t  evalfast2f3d + --no-transfer-mirror - --inflight-array (FAST timing, --eval-bands "$F3LT_BANDS")
 #   evalfast2c3t  evalfast2c3d + --no-transfer-mirror --lean-time - --inflight-array (CHECK)
-#   evalfast2f3c  [f3ldx] evalfast2f3lia + --worker cpp --b2-issue object (FAST timing, --eval-bands "$F3LC_BANDS": TBD):
+#   evalfast2f3c  [f3ldx] evalfast2f3lia + --worker cpp --b2-issue object (FAST timing, --eval-bands "$F3LC_BANDS"):
 #                 the C++ feeder's share alone (no descriptor, no table path)
 #   evalfast2c3c  [f3ldx] evalfast2c3lia + --worker cpp --b2-issue object (CHECK)
 #   F3LD-BLOCK  CLEARED at this tree: E's issue_desc on the pool sends a (7, n) descriptor, row 6 = each take's lane
 #               by the object path's rule (XPool.lanes_of = pos_of at XPool.phys_index, the index of assign_phys);
 #               gilfree_pack.cpp (DESC 2) writes m' = lane on flat stores (the m' of _submit). CPU proof:
-#               tests_cpu/test_r2_f3ldx.py (desc on pool == object on pool, store-equal every tick). PREDICTION: TBD by lead
+#               tests_cpu/test_r2_f3ldx.py (desc on pool == object on pool, store-equal every tick). PREDICTION: the CPU proof holds on GPU: C3D / C3T pass
 #   C3C         MUST _draft_only_fused_equal / _round_fused_equal / _fused_err PASS: 0 diffs, every layer compared.
-#               FALSIFIER: a difference: evalfast2f3c is VOID. PREDICTION: TBD by lead
-#   F3C-MED     steady tok/s (median tick). PREDICTION: TBD by lead
-#   F3C-MEAN    steady tok/s (mean tick). PREDICTION: TBD by lead
-#   F3C-EFF     effective tok/s. PREDICTION: TBD by lead
-#   F3C-ISSUE   tick 0 h_et_issue (bare_host_profile.per_tick_ms) and info.issue per tick. PREDICTION: TBD by lead
-#   F3C-SAME    the bare round's ticks and committed equal evalfast2f3lia's of the same job. PREDICTION: TBD by lead
+#               FALSIFIER: a difference: evalfast2f3c is VOID. PREDICTION: PASS, 0 diffs
+#   F3C-MED     steady tok/s (median tick). PREDICTION: 437 [415, 465] (f3lia point 435; the C++ feeder is off the
+#               steady tick's critical path)
+#   F3C-MEAN    steady tok/s (mean tick). PREDICTION: 333 [305, 365]
+#   F3C-EFF     effective tok/s. PREDICTION: 279 [252, 305] (PLAN_admission_fill.md: issue is 0.9 s of the 13.3 s)
+#   F3C-ISSUE   tick 0 h_et_issue (bare_host_profile.per_tick_ms) and info.issue per tick. PREDICTION: tick 0 h_et_issue
+#               below the same job's evalfast2f3lia tick 0 (REPORT)
+#   F3C-SAME    the bare round's ticks and committed equal evalfast2f3lia's of the same job. PREDICTION: equal
 #   C3D / C3T   MUST _draft_only_fused_equal / _round_fused_equal / _fused_err PASS: 0 diffs, every layer compared.
-#               FALSIFIER: a difference: the matching timing cell is VOID. PREDICTION: TBD by lead
-#   F3D-MED     steady tok/s (median tick). PREDICTION: TBD by lead
-#   F3D-MEAN    steady tok/s (mean tick). PREDICTION: TBD by lead
-#   F3D-EFF     effective tok/s. PREDICTION: TBD by lead
-#   F3D-ISSUE   tick 0 h_et_issue (bare_host_profile.per_tick_ms) and info.issue per tick. PREDICTION: TBD by lead
-#   F3D-SAME    the bare round's ticks and committed equal evalfast2f3lia's of the same job. PREDICTION: TBD by lead
-#   F3D-FALS    PREDICTION: TBD by lead
-#   F3T-MED     steady tok/s (median tick). PREDICTION: TBD by lead
-#   F3T-MEAN    steady tok/s (mean tick). PREDICTION: TBD by lead
-#   F3T-EFF     effective tok/s. PREDICTION: TBD by lead
+#               FALSIFIER: a difference: the matching timing cell is VOID. PREDICTION: PASS, 0 diffs (both)
+#   F3D-MED     steady tok/s (median tick). PREDICTION: 440 [415, 470]
+#   F3D-MEAN    steady tok/s (mean tick). PREDICTION: 345 [310, 380]
+#   F3D-EFF     effective tok/s. PREDICTION: 315 [275, 360] (one job per issue: the issue and take objects go; the
+#               per-take poll and merges stay)
+#   F3D-ISSUE   tick 0 h_et_issue (bare_host_profile.per_tick_ms) and info.issue per tick. PREDICTION: tick 0 h_et_issue
+#               at most half of the same job's evalfast2f3lia tick 0
+#   F3D-SAME    the bare round's ticks and committed equal evalfast2f3lia's of the same job. PREDICTION: equal
+#   F3D-FALS    PREDICTION: fires if effective < the same job's evalfast2f3lia effective + 10 tok/s
+#   F3T-MED     steady tok/s (median tick). PREDICTION: 445 [415, 480]
+#   F3T-MEAN    steady tok/s (mean tick). PREDICTION: 370 [320, 410]
+#   F3T-EFF     effective tok/s. PREDICTION: 390 [350, 415] (PLAN_admission_fill.md section 4: wall -14 to -16 s)
 #   F3T-T04     ticks 0-4: h_hs_takes, h_hs_merges, h_poll_arrivals, h_et_issue; arrival forced / forced_ns at tick 2.
-#               PREDICTION: TBD by lead
-#   F3T-SAME    the bare round's ticks and committed equal evalfast2f3lia's of the same job. PREDICTION: TBD by lead
-#   F3T-FALS    PREDICTION: TBD by lead
-#   F3C-FALS    PREDICTION: TBD by lead
-#   F3LD-MEM    peak_gb <= 84 (MUST EF_mem_cap) in the three timing cells. PREDICTION: TBD by lead
+#               PREDICTION: the sum of the four spans over ticks 0-4 below 4 s (f3l about 13 s); arrival forced 0
+#   F3T-SAME    the bare round's ticks and committed equal evalfast2f3lia's of the same job. PREDICTION: equal
+#   F3T-FALS    PREDICTION: fires if effective < the same job's evalfast2f3lia effective + 50 tok/s (the plan's
+#               mechanism does not hold)
+#   F3C-FALS    PREDICTION: fires if effective < the same job's evalfast2f3lia effective - 5 tok/s (the C++ feeder costs)
+#   F3LD-MEM    peak_gb <= 84 (MUST EF_mem_cap) in the three timing cells. PREDICTION: 83.0 to 83.4 GB
 #
 # REGISTERED for evalacc216m / evalacc216 ([acc216], STAMP 2026-10-23T18:04:12Z, before any run; the lead writes the stamp from
 # `date -u` in the command that freezes this block, L33). WHY: analysis/evalfast/STATUS_accuracy_B216.md: at B 216 no
@@ -998,8 +1003,8 @@ case $CELL in
                  "${LINKARG[@]}") ;;
     evalfast2f3d|evalfast2f3t) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_$CELL  # [f3ld]
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; GF3=1
-        F3LD_BANDS=TBD                                      # PREDICTION: TBD by lead (REGISTERED F3D-MED/MEAN/EFF)
-        F3LT_BANDS=TBD                                      # PREDICTION: TBD by lead (REGISTERED F3T-MED/MEAN/EFF)
+        F3LD_BANDS=415:470:310:380:275:360                  # REGISTERED F3D-MED/MEAN/EFF (STAMP 2026-10-24T04:16:01Z)
+        F3LT_BANDS=415:480:320:410:350:415                  # REGISTERED F3T-MED/MEAN/EFF (STAMP 2026-10-24T04:16:01Z)
         if [ "$CELL" = evalfast2f3d ]; then F3BANDS=$F3LD_BANDS ; F3FLAGS=(--inflight-array --worker cpp --b2-issue desc)
         else F3BANDS=$F3LT_BANDS ; F3FLAGS=(--worker cpp --b2-issue desc --no-transfer-mirror)
         fi
@@ -1019,7 +1024,7 @@ case $CELL in
                  --b2-resolve check --fused-kernel v3 --res-lean --res-dev "${C3FLAGS[@]}") ;;
     evalfast2f3c) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_$CELL  # [f3ldx]
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; GF3=1
-        F3LC_BANDS=TBD                                      # PREDICTION: TBD by lead (REGISTERED F3C-MED/MEAN/EFF)
+        F3LC_BANDS=415:465:305:365:252:305                  # REGISTERED F3C-MED/MEAN/EFF (STAMP 2026-10-24T04:16:01Z)
         [ "${DRYRUN:-0}" = 1 ] || [ "$F3LC_BANDS" != TBD ] ||
             stop "cell $CELL: --eval-bands TBD (the lead fills and stamps the REGISTERED F3LD block first)"
         EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped

@@ -522,7 +522,7 @@ def test_XD5_refusals_wiring_t21_and_the_cells_static(p3, v3):
     assert "        evalfast2f3c|evalfast2c3c) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     f3c = F3._cell(text, "    evalfast2f3c) MODES=fast")
     for w in ("BATCH=216", "PX=1512 ; PRV=1464", "VARIANTS=fused/batched", "NOSI=$NOSI_EVAL", "GF3=1",
-              "F3LC_BANDS=TBD", '[ "${DRYRUN:-0}" = 1 ] || [ "$F3LC_BANDS" != TBD ]',
+              "F3LC_BANDS=", '[ "${DRYRUN:-0}" = 1 ] || [ "$F3LC_BANDS" != TBD ]',
               "--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped",
               "--eval-role fast-time --mem-cap-gb 84", '--eval-bands "$F3LC_BANDS" --b2-resolve fused --fused-kernel v3',
               "--wait-index --b2-fewer-reads --res-lean --res-dev --inflight-array --worker cpp --b2-issue object"):

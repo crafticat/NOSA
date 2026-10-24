@@ -882,7 +882,7 @@ def test_TO5_the_cells_static():
     assert "        evalfast2f3d|evalfast2c3d|evalfast2f3t|evalfast2c3t) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     f3 = _cell(text, "    evalfast2f3d|evalfast2f3t) MODES=fast")
     for w in ("BATCH=216", "PX=1512 ; PRV=1464", "VARIANTS=fused/batched", "NOSI=$NOSI_EVAL", "GF3=1",
-              "F3LD_BANDS=TBD", "F3LT_BANDS=TBD", "F3FLAGS=(--inflight-array --worker cpp --b2-issue desc)",
+              "F3LD_BANDS=", "F3LT_BANDS=", "F3FLAGS=(--inflight-array --worker cpp --b2-issue desc)",
               "F3FLAGS=(--worker cpp --b2-issue desc --no-transfer-mirror)", '[ "${DRYRUN:-0}" = 1 ]',
               "--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped",
               "--eval-role fast-time --mem-cap-gb 84", '--eval-bands "$F3BANDS" --b2-resolve fused --fused-kernel v3',
