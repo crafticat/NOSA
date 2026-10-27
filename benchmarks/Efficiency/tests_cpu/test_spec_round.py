@@ -15,8 +15,9 @@ TOKENS   test_spec_tokens_equal_shipped_greedy (L3 / L4 EXACT, B 1 / B 8): every
          step's, bitwise; after every round the residency invariants and the host rows hold. Preconditions: rejects and
          full accepts, a block edge, skipped host loads, pool moves, (B 8) ragged positions.
 OVERFLOW test_tiny_journal_equals_shipped (L3 / L4 EXACT, B 8; the GPU cell sp3b): the same claims with a journal of
-         1 slot per layer and step, and the residency right after every reject_all. Preconditions: overflow, and a pool
-         slot that a MOVE_IN emptied and a later step of the group overwrote by a MOVE_OUT, unsaved. Negative control
+         1 slot per layer and step, and the residency right after every reject_all (L4: shipped-token drafts in every
+         round, full accepts only). Preconditions: overflow, and a pool slot that a MOVE_IN emptied and a later step of
+         the group overwrote by a MOVE_OUT with another block, unsaved. Negative control
          undo_move_in_none (the rollback's undo table of 6de1cfd): CAUGHT.
          test_draft_group_tiny_journal_restores_live_slots (no runner): one group of 6 draft steps, 1-slot journal,
          reject_all: the snapshot's maps and live slot bytes, the next plain steps bitwise. The same plant: CAUGHT.
@@ -205,14 +206,22 @@ def test_spec_tokens_equal_shipped_greedy(level, B):
 CAP_TINY = 1
 
 
+ORACLE_ALL = tuple(range(-1, N + 9))    # every round of a run (and the L4 prelude, round -1)
+
+
 @functools.lru_cache(maxsize=None)
 def _ev_tiny(level, B, rb_neg, seed=0):
-    """run_vs_shipped with a journal of CAP_TINY slots, the periodic FILTER, and spec_world.watch_reuse (the sp3b
-    pattern in every group before its undo; the residency right after every reject_all)."""
+    """run_vs_shipped with a journal of CAP_TINY slots and spec_world.watch_reuse (the sp3b pattern in every group
+    before its undo; the residency right after every reject_all). L3: the periodic FILTER (rejects and full accepts).
+    L4: the drafts are the shipped tokens in EVERY round (no filter), so every request accepts every round: in L4 only a
+    full-accept request runs three skip-making draft steps in one group (the draft row, then 2 drafts; after a reject a
+    request has K - 1 valid drafts and never accepts in full again), and the pattern needs three. No round cap (the
+    plant runs as many rounds as the claim run, so their groups are the same until the first harmful reuse)."""
     box = {}
-    ev = SW.run_vs_shipped(B, level=level, mode="exact", gemm="rowgroup", draft_filter=FILTER, rb_neg=rb_neg,
-                           journal=CAP_TINY, on_runner=lambda r: SW.watch_reuse(r, box), seed=seed,
-                           max_rounds=(12 if rb_neg is not None else 0))
+    l3 = level == "L3"
+    ev = SW.run_vs_shipped(B, level=level, mode="exact", gemm="rowgroup", draft_filter=(FILTER if l3 else None),
+                           rb_neg=rb_neg, journal=CAP_TINY, on_runner=lambda r: SW.watch_reuse(r, box), seed=seed,
+                           oracle_rounds=((-1, 0) if l3 else ORACLE_ALL), max_rounds=0)
     ev["reuse"] = box
     return ev
 
@@ -237,7 +246,9 @@ def test_tiny_journal_equals_shipped(level):
     st, f, ru = ev["rd"]["journal"], ev["facts"], ev["reuse"]
     assert sum(st["overflow"]) > 0 and sum(st["overflow_dead"]) > 0, st
     assert ru.get("unsaved", 0) > 0, (seed, ru, f)
-    assert f["rejects"] > 0 and f["skipped"] > 0 and f["min_count"] >= N, f
+    assert f["skipped"] > 0 and f["full"] > 0 and f["min_count"] >= N, f
+    if level == "L3":
+        assert f["rejects"] > 0, f                                     # L4 here: full accepts only (_ev_tiny)
     got = (ev["reuse"].get("resid_reject", [])[:2], ev["resid"][:2], ev["bad_tokens"][:5], ev["bad_logits"][:5],
            ev["host"][:2])
     assert got == ([], [], [], [], []), got

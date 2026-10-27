@@ -330,6 +330,12 @@ first world seed in 0 .. 2 with the pattern, and the plant runs on that seed, so
 the 6de1cfd table (the plant) and the exactness of the fixed table. It also adds the direct test without the runner,
 test_draft_group_tiny_journal_restores_live_slots: one group of 6 draft steps (B 8, journal 1), reject_all, then the
 maps and the LIVE slot bytes against the snapshot and 3 plain steps against a world without the group; the same plant.
+REVIEW (a read-only reviewer agent on 280b9e7 / 30afd33 / 2d9f1a4): no defect in the fix, the token gates or the step
+script; it confirmed the root cause in the code. Three test risks, fixed in the next commit: (a) the plant runs had a
+12-round cap while the seed came from an uncapped run (now no cap); (b) in L4 only a request that never rejected runs
+three skip-making draft steps in one group (the draft row, then 2 drafts), and FILTER forces early rejects (the L4 case
+now uses shipped-token drafts in every round: full accepts only); (c) move_in_reuse counted a MOVE_OUT that parks the
+same block the MOVE_IN took out (harmless with either table; now excluded).
 
 GATES (280b9e7): r2_spec_cell.tok_gates adds the MUST gates <arm>-TOK and <arm>-FP for L3 and L4X. A divergence now
 fails the cell (sp3b reported 0 failed MUST gates).

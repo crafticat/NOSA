@@ -262,8 +262,10 @@ def move_in_reuse(rb, keep) -> dict:
     between them). A MOVE_IN leaves the bytes of q in place (flash_pool_swap.py:29-30); the later MOVE_OUT overwrites
     them. A MOVE_IN needs an empty window slot, so inside a group only a draft's skip (map entry -1) makes one. keep (B,):
     the steps request b keeps (commit's n_acc; reject_all: 0); only the (step, request) pairs that this undo runs count.
-    reuse: such MOVE_OUTs; unsaved: those that the step did not save (past the journal's N, and q held no block by the
-    map, so they count as overflow_dead: no fallback reloads them); move_in: the MOVE_INs that this undo runs."""
+    Only a MOVE_OUT that parks ANOTHER block than the one the MOVE_IN took out of q counts (parking the same block
+    writes the bytes that q held: harmless). reuse: such MOVE_OUTs; unsaved: those that the step did not save (past the
+    journal's N, and q held no block by the map, so they count as overflow_dead: no fallback reloads them); move_in: the
+    MOVE_INs that this undo runs."""
     out = dict(reuse=0, unsaved=0, move_in=0)
     if not rb.pool:
         return out
@@ -272,15 +274,20 @@ def move_in_reuse(rb, keep) -> dict:
     keep = torch.as_tensor(keep).to(torch.int64).cpu().clamp(0, n_run)
     for l in range(rb.L):
         freed = torch.zeros((rb.H, rb.B, P), dtype=torch.bool)
+        held = torch.full((rb.H, rb.B, P), -1, dtype=torch.int64)       # the block a MOVE_IN took out of q
         for u in range(n_run):
             j = rb.J[l][u]
             run = ((keep <= u) & ~und[u]).view(1, rb.B, 1)
             a, t = j["plan_action"].to(torch.int64).cpu(), j["plan_target"].cpu()
             mo, mi = _pool_slots(a, t, RR.MOVE_OUT, P), _pool_slots(a, t, RR.MOVE_IN, P)
-            r = mo & run & freed & (j["_pool_map"].cpu() < 0)
+            pmap = j["_pool_map"].cpu()
+            parked = torch.full((rb.H, rb.B, P + 1), -2, dtype=torch.int64)    # the block a MOVE_OUT parks in q
+            parked.scatter_(2, torch.where(a == RR.MOVE_OUT, t, torch.full_like(t, P)), j["_block_map"].cpu())
+            r = mo & run & freed & (pmap < 0) & (parked[:, :, :P] != held)
             out["reuse"] += int(r.sum())
             out["unsaved"] += int((r & j["unsaved"].cpu()[:, :, M:]).sum())
             out["move_in"] += int((mi & run).sum())
+            held = torch.where(mi & run, pmap, held)
             freed = (freed & ~mo) | (mi & run)
     return out
 
