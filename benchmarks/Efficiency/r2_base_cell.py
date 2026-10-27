@@ -54,6 +54,19 @@ B 219, basef 2190876). --mbase selects the registered mbase predictions (verdict
   MB-F     at C 63 with the R2 arm: R2 (fused) / SH steady inside (0.95, 1.00);
   MB-R2C   REPORT (a MODEL, not a measurement): SH steady x MBASE_FUSED_FACTOR, the fused step this C would have.
 The cell also reports the device memory in use (cudaMemGetInfo) at the end of the SH arm, beside the allocator peak.
+
+--ragged (Task 1.3 of KS/analysis/plan/PLAN_speckv_on_cached_nosa.md; default OFF, and then nothing below runs): after
+SH, the PER-REQUEST engine (nosi/nosi/ragged_engine.py: the shipped kernels and the victim pool, per-request lengths)
+in the same process, each arm with its own shipped prefill, TEACHER-FORCED on SH's tokens:
+  RG   equal lengths: every request active at every step (request b's local step k = the global step t).
+  RGS  lengths spread by up to --ragged-spread - 1 tokens: request b starts at global step d_b = b % spread (inactive
+       before), runs its N local steps, then stops; T = N + max(d_b) global steps. Its local step k reads SH's input
+       inputs[b, k] at position S0 + k, so its predictions compare with SH's per request.
+  Per arm: the steady step = the median period of the steps where every request is active, the capture step
+  excluded; agreement as R2's; the LOGITS FINGERPRINT of every (request, local step), the max value (float32) and
+  the float64 sum of the logits row, compared BITWISE with SH's (SH then also records it: two reductions per step,
+  declared); MUST gates RG-RUN / RG-ERR / RG-CAP (the pooling graph captured once per layer, at step 0); the
+  registered predictions PRED_RAGGED (RG-BIT, RGS-BIT, RG-STEP, RGS-STEP), TBD by the lead (REPORT until filled).
 """
 from __future__ import annotations
 
@@ -91,6 +104,11 @@ MBASE_REF = dict(C=128, B=216, eager_median_ms=68.336639, tok_s=3160.822684, gai
 PRED_MBASE = {(128, 216): (68.0, 64.92, 70.39), (113, 240): (74.5, 68.0, 81.0), (96, 280): (85.6, 78.0, 94.0),
               (79, 328): (106.0, 92.0, 118.0), (63, 344): (180.6, 174.5, 185.3)}
 MBASE_F_BAND = (0.95, 1.00)
+# --ragged (Task 1.3): REGISTERED PREDICTIONS, TBD BY THE LEAD. Fill every None and the stamp (date -u, L33) in a
+# commit BEFORE the run; a None value gives REPORT. *_bitwise: True / False (every fingerprint equal to SH's);
+# *_ratio: (low, high) of the arm's steady step / SH's steady step.
+PRED_RAGGED = dict(stamp=None, RG_bitwise=None, RGS_bitwise=None, RG_ratio=None, RGS_ratio=None)
+RAGGED_ARMS = (("RG", 1), ("RGS", None))               # (arm, spread); None = --ragged-spread
 
 
 def log(msg):
@@ -112,6 +130,17 @@ def parse_args(argv):
     ap.add_argument("--pool", type=int, default=0,
                     help="the victim pool P (C = 63 + P); must equal NOSI_POOL_BLOCKS; P > 0 needs --arms SH")
     ap.add_argument("--mbase", action="store_true", help="the registered mbase predictions (verdicts_mbase)")
+    ap.add_argument("--ragged", action="store_true",
+                    help="after SH: the per-request engine arms RG and RGS (nosi/nosi/ragged_engine.py; needs --arms SH)")
+    ap.add_argument("--ragged-spread", type=int, default=64, help="RGS: request b starts at step b %% spread (2 .. 64)")
+    ap.add_argument("--ragged-twin", default="torch", choices=("torch", "bi", "fused"),
+                    help="the twin step: torch (the shipped summaries, bitwise), bi or fused (the fixed-order mean)")
+    ap.add_argument("--ragged-body", default="fused", choices=("torch", "fused"),
+                    help="the body: torch (DeviceWritebackBody) or fused (FusedBody); the same bits")
+    ap.add_argument("--ragged-gemm", default="natural", choices=("natural", "exact"),
+                    help="natural (F.linear, the shipped call) or exact (PaddedLinear at m_fix = --batch)")
+    ap.add_argument("--ragged-graph", default="on", choices=("on", "off"),
+                    help="pooling + top-k in one CUDA graph per layer (captured once) or eager")
     a = ap.parse_args(argv)
     a.arms = [x for x in a.arms.split(",") if x]
     if a.arms not in (["SH", "R2"], ["SH"]):
@@ -124,6 +153,10 @@ def parse_args(argv):
         ap.error("--pool > 0 needs --arms SH (the R2 decode body has no victim pool)")
     if a.batch < 1 or not 1 <= a.warmup < a.steps or a.steps > 1000:
         ap.error("--batch >= 1, --warmup in 1 .. steps - 1, --steps <= 1000 (the shipped total_cis holds S + 1024)")
+    if a.ragged and a.arms != ["SH"]:
+        ap.error("--ragged needs --arms SH (the ragged arms are teacher-forced on SH's tokens)")
+    if a.ragged and not 2 <= a.ragged_spread <= R_TOK:
+        ap.error("--ragged-spread in 2 .. %d" % R_TOK)
     return a
 
 
@@ -315,6 +348,63 @@ def verdicts_mbase(C: int, B: int, sh, r2):
     return out
 
 
+def ragged_schedule(B: int, steps: int, spread: int):
+    """--ragged: the schedule of one arm. Request b starts at global step d_b = b % spread (spread 1: every request
+    at step 0) and runs `steps` local steps. Returns (T, k, active, col, full): T = steps + max(d_b) global steps;
+    k (T, B) int64 = the local step of request b at global step t (clamped to [0, steps]: the input column);
+    active (T, B) bool; col (T, B) int64 = k where active, else `steps` (a discarded column); full = the global steps
+    where every request is active."""
+    import torch
+    d = torch.tensor([b % spread for b in range(B)], dtype=torch.int64)
+    T = int(steps) + int(d.max())
+    k = torch.arange(T, dtype=torch.int64).view(T, 1) - d.view(1, B)
+    active = (k >= 0) & (k < steps)
+    kc = k.clamp(0, steps)
+    col = torch.where(active, kc, torch.full_like(kc, steps))
+    full = [t for t in range(T) if bool(active[t].all())]
+    return T, kc, active, col, full
+
+
+def fingerprint_compare(ref, got):
+    """BITWISE comparison of two logits fingerprints (max (B, N) float32, sum (B, N) float64): the bits of both values
+    of every (request, step). Returns dict(equal_fraction, n_unequal, first) with first = (request, step) of the
+    earliest unequal step (None: all equal)."""
+    import torch
+    eq = (ref[0].contiguous().view(torch.int32) == got[0].contiguous().view(torch.int32)) & \
+        (ref[1].contiguous().view(torch.int64) == got[1].contiguous().view(torch.int64))
+    eq = eq.cpu()
+    bad = (~eq).nonzero()
+    first = None
+    if bad.numel():
+        t0 = int(bad[:, 1].min())
+        b0 = int(bad[bad[:, 1] == t0][0, 0])
+        first = (b0, t0)
+    return dict(equal_fraction=float(eq.double().mean()), n_unequal=int((~eq).sum()), first=first)
+
+
+def verdicts_ragged(sh, rg):
+    """--ragged: RG-BIT / RGS-BIT (every fingerprint equal to SH's) and RG-STEP / RGS-STEP (the arm's steady step / SH's
+    inside the registered band) against PRED_RAGGED; a registered value None (TBD) gives REPORT."""
+    out = []
+    for arm, _ in RAGGED_ARMS:
+        r = (rg or {}).get(arm)
+        if r is None:
+            out.append(("%s-BIT" % arm, "NOT_RUN", "the arm did not run"))
+            continue
+        fp = r["fingerprint"]
+        want = PRED_RAGGED["%s_bitwise" % arm]
+        got = fp["equal_fraction"] == 1.0
+        v = "REPORT" if want is None else ("CONFIRMED" if got == bool(want) else "REFUTED")
+        out.append(("%s-BIT" % arm, v, "fingerprints equal to SH's: %.6f (%d unequal, first %s); registered %s" % (
+            fp["equal_fraction"], fp["n_unequal"], fp["first"], want)))
+        if sh is not None and sh["rates"]["steady_step_ms"] and r["rates"]["steady_step_ms"]:
+            ratio = r["rates"]["steady_step_ms"] / sh["rates"]["steady_step_ms"]
+            band = PRED_RAGGED["%s_ratio" % arm]
+            v = "REPORT" if band is None else ("CONFIRMED" if band[0] <= ratio <= band[1] else "REFUTED")
+            out.append(("%s-STEP" % arm, v, "%s / SH steady step %.4f (registered band %s)" % (arm, ratio, band)))
+    return out
+
+
 class CudaClock:
     def event(self):
         import torch
@@ -390,7 +480,7 @@ def r2_teacher_forced(RC, model, st, cb, cache, inputs, warmup: int, use_graph: 
 
 
 # ------------------------------------------------------------------ the arms (GPU)
-def run_shipped(model, ids, steps: int, clock):
+def run_shipped(model, ids, steps: int, clock, fp=None):
     import torch
     from nosi.cache_engine import InfLLMv2Cache
     cfg = model.config
@@ -422,6 +512,9 @@ def run_shipped(model, ids, steps: int, clock):
         clock.record(ev[t])
         lg = model.decode_inference(tok, cu, pos, cache)
         tok = lg[:, -1, :].argmax(dim=-1, keepdim=True)
+        if fp is not None:                                 # --ragged only: the logits fingerprint (two reductions)
+            fp[0][:, t].copy_(lg[:, -1, :].amax(dim=-1))
+            fp[1][:, t].copy_(lg[:, -1, :].sum(dim=-1, dtype=torch.float64))
         inputs[:, t + 1:t + 2].copy_(tok)
         pos = pos + 1
     clock.record(ev[steps])
@@ -457,6 +550,79 @@ def run_r2(model, ids, inputs, steps: int, warmup: int, clock, mode: str = "buil
     res.update(prefill_s=round(prefill_s, 1), first_token_agreement=first_agree, widths=st.meta.get("widths"),
                mode=mode, overflow=[int(t.overflow) for t in st.twins] if mode == "fused" else None)
     del res["graph"], cb, st, cache
+    return res
+
+
+MODEL_WARM_BUFFERS = ("pooling_buf_all", "max_pooling_buf", "max_pooling_buf_cis", "topk_buf_val", "topk_buf_indices",
+                      "topk_val_buf_q", "topk_idx_buf_q", "topk_val_buf", "topk_idx_buf", "mask_buf")
+LAYER_WARM_STATE = ("after_pooling_graph", "score_buf", "compressed_cis_buf")
+
+
+def run_ragged(model, ids, inputs, steps: int, spread: int, clock, opt):
+    """--ragged: ONE arm of the per-request engine (module docstring). Its own shipped prefill (the same cache and
+    max_gen_len as SH), then ragged_engine.attach (the bridge; the shipped batch-wide tables released), then T global
+    steps on the schedule ragged_schedule(B, steps, spread), teacher-forced on SH's tokens, all inputs and outputs on
+    the device (no host sync per step). opt: gemm, twin, body, graph."""
+    import torch
+    from nosi.cache_engine import InfLLMv2Cache
+    from nosi import ragged_engine as RE
+    cfg = model.config
+    model.has_buffers = False                            # the shipped warm-up state is not used: release it
+    for name in MODEL_WARM_BUFFERS:
+        if hasattr(model, name):
+            setattr(model, name, None)
+    for layer in model.layers:
+        for name in LAYER_WARM_STATE:
+            if hasattr(layer, name):
+                setattr(layer, name, None)
+    gc.collect()
+    torch.cuda.empty_cache()
+    cache = InfLLMv2Cache(config=cfg, num_hidden_layers=cfg.num_hidden_layers, has_kv_bias=True)
+    for layer in cache.layers:
+        layer.cache_engine.max_gen_len = steps + 64
+    Bn = ids.shape[0]
+    clock.sync()
+    t0 = time.time()
+    logits, _ = model.batch_prefill(ids, cache)
+    clock.sync()
+    prefill_s = time.time() - t0
+    first_agree = int((logits[:, -1, :].argmax(dim=-1) == inputs[:, 0]).sum())
+    del logits
+    lin = RE.exact_linear(Bn) if opt["gemm"] == "exact" else None
+    ops = RE.RaggedOps(RE.default_kernels(), gemm=opt["gemm"], linear=lin, twin=opt["twin"], body=opt["body"],
+                       graph=opt["graph"])
+    rs = RE.attach(model, cache, S0, steps, ops)
+    gc.collect()
+    torch.cuda.empty_cache()                             # the released shipped tables
+    T, kc, act, col, full = ragged_schedule(Bn, steps, spread)
+    act_dev, kc_dev, col_dev = act.to("cuda"), kc.to("cuda"), col.to("cuda")
+    pred = torch.full((Bn, steps + 1), -1, dtype=torch.int64, device="cuda")
+    fmax = torch.zeros((Bn, steps + 1), dtype=torch.float32, device="cuda")
+    fsum = torch.zeros((Bn, steps + 1), dtype=torch.float64, device="cuda")
+    ids_buf = torch.empty((Bn, 1), dtype=torch.int64, device="cuda")
+    pos_buf = torch.empty((Bn, 1), dtype=torch.int32, device="cuda")
+    ev = [clock.event() for _ in range(T + 1)]
+    for t in range(T):
+        clock.record(ev[t])
+        k = kc_dev[t].view(Bn, 1)
+        ids_buf.copy_(inputs.gather(1, k))
+        pos_buf.copy_(k + S0)
+        RE.set_activity(rs, act_dev[t], act[t])
+        lg = RE.decode_step(model, rs, ids_buf, pos_buf)[:, -1, :]
+        c = col_dev[t].view(Bn, 1)
+        pred.scatter_(1, c, lg.argmax(dim=-1, keepdim=True))
+        fmax.scatter_(1, c, lg.amax(dim=-1, keepdim=True))
+        fsum.scatter_(1, c, lg.sum(dim=-1, keepdim=True, dtype=torch.float64))
+    clock.record(ev[T])
+    clock.sync()
+    periods = [clock.elapsed(ev[t], ev[t + 1]) for t in range(T)]
+    body_err, overflow = RE.errors(rs)
+    res = dict(pred=pred[:, :steps], fp=(fmax[:, :steps], fsum[:, :steps]), periods=periods, T=T,
+               steady=[t for t in full if t > 0 and t not in rs.capture_steps], n_full=len(full), captures=rs.captures,
+               capture_steps=list(rs.capture_steps), replays=rs.replays, layers=len(model.layers), body_err=body_err,
+               overflow=overflow, prefill_s=round(prefill_s, 1), first_token_agreement=first_agree,
+               meta=dict(rs.meta, spread=spread))
+    del rs, cache
     return res
 
 
@@ -540,8 +706,12 @@ def main(argv=None) -> int:
         free()
         sh_base = round(torch.cuda.memory_allocated() / 1e9, 3)
         log("arm SH (B %d, %d steps); host %s" % (a.batch, a.steps, mem["after_load"]))
+        fp_sh = None
+        if a.ragged:                                     # SH's logits fingerprint, for the ragged arms' bitwise check
+            fp_sh = (torch.zeros((a.batch, a.steps), dtype=torch.float32, device="cuda"),
+                     torch.zeros((a.batch, a.steps), dtype=torch.float64, device="cuda"))
         try:
-            out = run_shipped(model, ids, a.steps, clock)
+            out = run_shipped(model, ids, a.steps, clock, fp=fp_sh)
             pa, pr = gpu_peak()
             rw = {t for t, _ in out["rewarms"]}
             steady = period_stats(out["periods"], [t for t in range(a.steps) if t not in rw])
@@ -591,10 +761,54 @@ def main(argv=None) -> int:
                     gates.append(("R2-RUN", True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
             mem["after_R2"] = host_mem()
             free()
+        rg = {}
+        if a.ragged:
+            ropt = dict(gemm=a.ragged_gemm, twin=a.ragged_twin, body=a.ragged_body, graph=a.ragged_graph == "on")
+            for arm, spread in RAGGED_ARMS:
+                spread = a.ragged_spread if spread is None else spread
+                if inputs is None:
+                    gates.append(("%s-RUN" % arm, True, False, "NOT_RUN: SH failed (teacher-forced on SH's tokens)"))
+                    continue
+                mem["before_%s_release" % arm] = host_mem()
+                free(host=True)
+                log("arm %s (spread %d, %s)" % (arm, spread, ropt))
+                rg_base = round(torch.cuda.memory_allocated() / 1e9, 3)
+                try:
+                    res = run_ragged(model, ids, inputs, a.steps, spread, clock, ropt)
+                    pa, pr = gpu_peak()
+                    steady = period_stats(res["periods"], res["steady"])
+                    fpc = fingerprint_compare(fp_sh, res["fp"])
+                    rg[arm] = dict(spread=spread, T=res["T"], n_full=res["n_full"], prefill_s=res["prefill_s"],
+                                   steady=steady, rates=rates(a.batch, a.steps, res["periods"], steady),
+                                   all_steps=period_stats(res["periods"], list(range(1, res["T"]))),
+                                   gpu_peak_alloc_GB=pa, gpu_peak_reserved_GB=pr, gpu_base_alloc_GB=rg_base,
+                                   first_token_agreement=res["first_token_agreement"], fingerprint=fpc,
+                                   agreement=agreement(res["pred"], inputs, min(a.batch, N_DOCS)),
+                                   captures=res["captures"], capture_steps=res["capture_steps"],
+                                   replays=res["replays"], body_err=res["body_err"], overflow=res["overflow"],
+                                   meta=res["meta"])
+                    gates.append(("%s-RUN" % arm, True, True, "%d global steps, %d with every request active" % (
+                        res["T"], res["n_full"])))
+                    gates.append(("%s-ERR" % arm, True, res["body_err"] == 0 and not any(res["overflow"]),
+                                  "body refusal bits %s; twin overflow flags %s" % (
+                                      res["body_err"], sorted(set(res["overflow"])))))
+                    want = res["layers"] if ropt["graph"] else 0
+                    cap_ok = res["captures"] == want and all(s == 0 for s in res["capture_steps"])
+                    gates.append(("%s-CAP" % arm, True, cap_ok, "%d graph captures (want %d, all at step 0): steps %s;"
+                                  " %d replays" % (res["captures"], want, sorted(set(res["capture_steps"])),
+                                                   res["replays"])))
+                    del res
+                except Exception as e:
+                    traceback.print_exc()
+                    gates.append(("%s-RUN" % arm, True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+                mem["after_%s" % arm] = host_mem()
+                free()
     preds = (verdicts_fused if a.r2 == "fused" else verdicts)(a.batch, sh, r2, agree, expected)
     C = C_BASE + a.pool
     if a.mbase:
         preds = preds + verdicts_mbase(C, a.batch, sh, r2)
+    if a.ragged:
+        preds = preds + verdicts_ragged(sh, rg)
     meta = dict(batch=a.batch, steps=a.steps, warmup=a.warmup, S0=S0, doc_rows=rows, n_unique_docs=min(a.batch, N_DOCS),
                 workload_sha256=sha, expected_rewarms=expected, attn_splits=NL._ATTN_SPLITS,
                 pool_blocks=CEN.POOL_BLOCKS, capacity_C=C, arms=a.arms, mbase=a.mbase,
@@ -608,6 +822,10 @@ def main(argv=None) -> int:
     out = dict(meta=meta, SH=sh, R2=r2, agreement=agree, GT=gt or None,
                gates=[dict(name=g[0], must=g[1], passed=bool(g[2]), detail=g[3]) for g in gates],
                predictions=[dict(name=p[0], verdict=p[1], detail=p[2]) for p in preds])
+    if a.ragged:                                         # flag off: the summary keeps exactly its former keys
+        meta.update(ragged=dict(spread=a.ragged_spread, twin=a.ragged_twin, body=a.ragged_body, gemm=a.ragged_gemm,
+                                graph=a.ragged_graph, predictions=PRED_RAGGED, sh_fingerprint=True))
+        out["RAGGED"] = rg
     with open(os.path.join(a.out, "summary.json"), "w") as f:
         json.dump(out, f, indent=1, sort_keys=True, default=str)
     for g in gates:
@@ -623,6 +841,13 @@ def main(argv=None) -> int:
     if agree:
         print("REPORT agreement: teacher-forced %.6f, diverged %d of %d (first at %s)" % (
             agree["tf_agreement"], agree["n_diverged"], agree["n_requests"], agree["first_divergence_min"]))
+    for name, arm in sorted(rg.items()) if a.ragged else ():
+        print("REPORT %s B %d spread %d: steady %s ms/step (%d steps), %s tok/s, effective %s tok/s, peak %s GB, prefill "
+              "%s s; agreement %.6f; fingerprints equal %.6f (first unequal %s)" % (
+                  name, a.batch, arm["spread"], arm["rates"]["steady_step_ms"], arm["steady"]["n"],
+                  arm["rates"]["steady_tok_s"], arm["rates"]["effective_tok_s"], arm["gpu_peak_alloc_GB"],
+                  arm["prefill_s"], arm["agreement"]["tf_agreement"], arm["fingerprint"]["equal_fraction"],
+                  arm["fingerprint"]["first"]))
     nfail = sum(1 for g in gates if g[1] and not g[2])
     print("r2_base: %d MUST gate(s) failed" % nfail)
     return min(nfail, 19)
