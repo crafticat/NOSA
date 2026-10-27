@@ -138,17 +138,17 @@ class CacheEngine:
         # binding is the only way P=0 provably executes the upstream body.
         self.pool_blocks = POOL_BLOCKS
         self._pool_stamp_base = 0
-        # retroinfer-eval fork: the availability hook and the victim pool must
-        # never run together. pool_update sits BETWEEN diff and the copy_ and may
-        # PARK the outgoing block Y of a slot in anticipation of a fetch that the
-        # hook would then deny: the slot would still hold Y while the pool also
-        # held Y, the map would name Y twice, and diff_offload's free-slot
-        # counting -- which needs pairwise distinct ids -- would break, producing
-        # a plausible, finite, WRONG output with no error. The pooled decode also
-        # hands attention a NARROWED VIEW, and combining a second mechanism with
-        # the length the split-KV partition is derived from is the defect job
-        # 2173299 measured at p=65. Refuse at construction, the way the pool
-        # already refuses an inconsistent configuration.
+        # retroinfer-eval fork: NOSI_AVAIL and the victim pool must never run
+        # together. pool_update PARKS the outgoing block Y of a slot before a fetch
+        # the hook can deny: the slot still holds Y, the pool holds Y, the map names
+        # Y twice and diff_offload's free-slot count (pairwise distinct ids) breaks:
+        # a finite, WRONG output and no error. The pooled decode never calls on_diff.
+        # r2-draftpool: the ONE availability restriction that may run with the pool
+        # is the draft-resident flag (end of this file; it does not read NOSI_AVAIL).
+        # Its draft writes -1 into _block_map at each slot whose fetch it skips,
+        # after the map commit, so Y is only in the pool and no id is held twice
+        # (tests_cpu/test_draft_pool.py). It gives attention the same narrowed view
+        # (job 2173299). NOSI_AVAIL itself stays refused here, for the reason above.
         if _avail.SPEC not in ("", "0", "off") and POOL_BLOCKS > 0:
             raise RuntimeError(
                 "NOSI_AVAIL=%r together with NOSI_POOL_BLOCKS=%d: the availability "
@@ -851,3 +851,266 @@ class InfLLMv2Cache(DynamicCache):
     
     def get_max_length(self):
         raise NotImplementedError
+
+
+# ===========================================================================
+# r2-draftpool: THE DRAFT STEP ON THE RESIDENT KV. Task 1.1 of
+# kstep-cpu-runs/analysis/plan/PLAN_speckv_on_cached_nosa.md (hook (a) of
+# MAP_cached_nosa.md section 3). Default OFF.
+#
+# WHAT A DRAFT STEP DOES. It is the pooled decode (the method __init__ binds when
+# NOSI_POOL_BLOCKS > 0) without the two host gathers. It does the tail write,
+# diff_offload, pool_update, the pool swap and the map commit with the same
+# statements as the pooled decode. Then it does not wait for the host. After
+# pool_update, the slots with _load_mask >= 0 are the slots that still need a
+# block from the host. The draft step:
+#   1. writes -1 into _block_map at those slots, after the map commit;
+#   2. gives attention a SCRATCH copy of the bias with avail_policy.MASK_BIAS
+#      (-3e4) on the 64 rows of those slots. It never writes the live bias;
+#   3. keeps the miss list for Task 1.2: draft_misses() returns the slots
+#      (H, B, topk) bool and the host block ids (H, B, topk) int64, contiguous.
+#
+# WHY THE MAP EDIT IS NECESSARY. pool_update can park the old block Y of slot s
+# in a pool slot (MOVE_OUT) for a fetch of X that the draft then skips. Slot s
+# still holds the bytes of Y and the pool holds Y. If the map kept Y at s, the
+# map would name Y twice and diff_offload's free-slot count would break. If the
+# map kept X at s, the map would name a block that is not in the slot, and the
+# next step would read the bytes of Y as X. With -1 at s, Y is only in the pool,
+# X is not on the GPU, and the next diff counts s as a free slot
+# (diff_offload_kernel.cu:35-48, :77-98). The bias masks the old bytes of s.
+#
+# DEFAULT OFF. The statements above this block are the statements of ded9d41
+# (tests_cpu/test_draft_pool.py compares the AST), and every line above keeps
+# its number (tests/test_r2_engine_findings.py pins the lines). Nothing below
+# runs until a caller calls InfLLMv2Cache.enable_draft_resident() after the
+# prefill. Then a step is a draft step only after set_draft_resident(True). A
+# shipped step of an enabled engine calls the bound method object that __init__
+# made, so it is the shipped step.
+#
+# REFUSALS (each one raises with the reason):
+#   * no victim pool (P = 0): __init__ binds the upstream method, which has no
+#     draft path;
+#   * a transfer trace or an availability policy in the process: neither one
+#     models a draft step;
+#   * a draft step before the first shipped step after the prefill: slots that
+#     no step loaded hold uninitialised bytes (torch.empty), and the mask does
+#     not stop them (0 x NaN = NaN in the attention sum);
+#   * a draft step that fills the tail block (DraftBlockEdge): the write-back of
+#     that step would copy draft rows into the host cache (the pooled decode,
+#     section D). Task 1.5 owns that write-back. Until then the step must be a
+#     shipped step.
+#
+# ONE STREAM. All layers share one bias scratch and one skip buffer. The
+# attention of layer l reads the scratch before the draft of layer l+1 writes it,
+# because both run on the current stream. A consumer on a second stream needs one
+# scratch for each layer.
+#
+# NOT IN THIS TASK (Task 1.5): the draft token's K, V and bias go into the live
+# tail slot and into the layer tables, as in a shipped step. Nothing rolls them
+# back.
+# ===========================================================================
+class DraftBlockEdge(RuntimeError):
+    """A draft step would fill the tail block, so its write-back would copy draft
+    rows into the host cache. Run that step as a shipped step."""
+
+
+def _draft_refusal(engine):
+    """The exception that refuses a draft step of `engine` now, or None. Host
+    integers only: no device read."""
+    if getattr(engine, "_draft_skip", None) is None:
+        return RuntimeError(
+            "draft-resident: this engine is not draft-capable. Call "
+            "InfLLMv2Cache.enable_draft_resident() after the prefill.")
+    if engine._pool_stamp_base < engine.topk:
+        return RuntimeError(
+            "draft-resident: refused before the first shipped decode step after "
+            "the prefill. Slots that no step loaded hold uninitialised bytes "
+            "(torch.empty in prefill_update), and the bias mask does not stop "
+            "them: a NaN key or value with a weight of 0 still gives NaN.")
+    if engine._tail_block_len_on_gpu + 1 >= engine.block_size:
+        return DraftBlockEdge(
+            "draft-resident: refused. This step writes tail row %d of %d, so the "
+            "tail block fills and its write-back would copy DRAFT rows into the "
+            "host cache. Run this step as a shipped step (set_draft_resident("
+            "False)). Task 1.5 owns the write-back of a draft."
+            % (engine._tail_block_len_on_gpu, engine.block_size))
+    return None
+
+
+def _decode_update_draft_resident(self, key_states, value_states, kv_bias, topk_idx):
+    """ONE DRAFT STEP on the resident KV (see the block comment above).
+
+    Returns what the pooled decode returns, except the bias: the K and V views
+    of the attended window, the SCRATCH bias view (same shape and strides as
+    the live view) and _cache_lens. When no slot needs the host, the scratch
+    holds the same values as the live bias, so the step equals the shipped
+    step (test_all_hit_draft_equals_shipped)."""
+    # 0. The refusals, before this engine writes anything. NOTE: the layer
+    #    tables of this layer (nosa_llama.py, decode_forward steps 5-6) already
+    #    moved when this raises, so the caller must stop. The clean guard is
+    #    InfLLMv2Cache.set_draft_resident(True), before the step starts.
+    _why = _draft_refusal(self)
+    if _why is not None:
+        raise _why
+    # A. - B2. and the map commit: the statements of the pooled decode, in the
+    #    same order, without the trace hooks (enable_draft_resident refuses the
+    #    trace). test_draft_body_is_shipped_prefix compares the AST.
+    B, S, H, D = key_states.shape
+    assert H == self.head_num and D == self.head_dim and S == 1
+
+    self.seq_length += 1
+    self._cache_lens[...] += 1
+
+    _tail_write_pos = self._tail_block_idx_on_gpu * self.block_size + self._tail_block_len_on_gpu
+    self._k_gpu[:, _tail_write_pos:_tail_write_pos+1, :, :].copy_(key_states, non_blocking=True)
+    self._v_gpu[:, _tail_write_pos:_tail_write_pos+1, :, :].copy_(value_states, non_blocking=True)
+
+
+    self._kv_bias_gpu[:, _tail_write_pos:_tail_write_pos+1, :].copy_(kv_bias[:, self.seq_length-1:self.seq_length, :], non_blocking=True)
+
+
+    self._tail_block_len_on_gpu += 1
+    tail_full = self._tail_block_len_on_gpu == self.block_size
+    assert self._tail_block_len_on_gpu <= self.block_size, (
+        "tail ran past its block (%d > %d): _cache_lens would reach the pool"
+        % (self._tail_block_len_on_gpu, self.block_size))
+    diff.diff_offload(self._block_map, topk_idx, self._new_block_map_buf, self._load_mask)
+    _pool.pool_update(self._block_map, self._load_mask,
+                      self._pool_map, self._pool_age,
+                      self._pool_target, self._pool_action,
+                      self._pool_stamp_base, self._tail_block_idx_on_gpu)
+    _flash_pool_swap(self._k_gpu, self._v_gpu, self._kv_bias_gpu,
+                     self._pool_target, self._pool_action,
+                     self.topk, self.block_size)
+    self._pool_stamp_base += self.topk
+    self._block_map.copy_(self._new_block_map_buf, non_blocking=True)
+
+    # C. THE DRAFT. No host gather. The refusal above makes tail_full False, so
+    #    there is no write-back (section D of the pooled decode) either.
+    assert not tail_full, "a draft step filled the tail block"
+    torch.ge(self._load_mask, 0, out=self._draft_skip)
+    self._draft_miss_ids.copy_(self._load_mask)
+    self._block_map.masked_fill_(self._draft_skip, -1)
+    self._draft_bias_skip.copy_(self._draft_skip.permute(1, 2, 0).unsqueeze(2))
+    self._draft_bias_att.copy_(self._kv_bias_gpu_att)
+    self._draft_bias_att.view(B, self.topk, self.block_size, H).masked_fill_(self._draft_bias_skip, _avail.MASK_BIAS)
+    return self._k_gpu_att, self._v_gpu_att, self._draft_bias_att, self._cache_lens
+
+
+def _engine_enable_draft_resident(self, bias_scratch, bias_skip):
+    """Make this engine draft-capable. Call it after prefill_update.
+
+    bias_scratch: a tensor with the shape, strides, dtype and device of
+    _kv_bias_gpu (never _kv_bias_gpu itself). bias_skip: a (B, topk, 1, H) bool
+    tensor. One cache can give the same two tensors to all its layers (one
+    stream; see the block comment). This call allocates the miss list of this
+    layer and keeps the bound method that __init__ made as the shipped step."""
+    if self.pool_blocks <= 0:
+        raise RuntimeError(
+            "draft-resident needs the victim pool (NOSI_POOL_BLOCKS > 0): with "
+            "P = 0, __init__ binds the upstream method, which has no draft path")
+    if self._att_rows is None:
+        raise RuntimeError("draft-resident: call enable_draft_resident after the prefill (prefill_update)")
+    if _tt.TRACE is not None or _avail.POLICY is not None:
+        raise RuntimeError(
+            "draft-resident: refused with the transfer trace or an availability "
+            "policy installed (neither models a draft step; a policy would mask "
+            "the bias a second time)")
+    if getattr(self, "_draft_skip", None) is not None:
+        raise RuntimeError("draft-resident: this engine is already enabled")
+    H, B, M = self._load_mask.shape
+    live = self._kv_bias_gpu
+    if (tuple(bias_scratch.shape) != tuple(live.shape) or bias_scratch.stride() != live.stride()
+            or bias_scratch.dtype != live.dtype or bias_scratch.device != live.device):
+        raise ValueError(
+            "draft-resident: the bias scratch must have the shape, strides, dtype "
+            "and device of _kv_bias_gpu: got %s %s %s %s, need %s %s %s %s"
+            % (tuple(bias_scratch.shape), bias_scratch.stride(), bias_scratch.dtype, bias_scratch.device,
+               tuple(live.shape), live.stride(), live.dtype, live.device))
+    if bias_scratch.untyped_storage().data_ptr() == live.untyped_storage().data_ptr():
+        raise ValueError("draft-resident: the bias scratch is the live bias (never mask it in place)")
+    if (tuple(bias_skip.shape) != (B, M, 1, H) or bias_skip.dtype != torch.bool
+            or bias_skip.device != live.device):
+        raise ValueError("draft-resident: the skip buffer must be (B, topk, 1, H) = %s bool on %s, got %s %s %s"
+                         % ((B, M, 1, H), live.device, tuple(bias_skip.shape), bias_skip.dtype, bias_skip.device))
+    self._draft_shipped_update = self.decode_update
+    self._draft_bias = bias_scratch
+    self._draft_bias_att = bias_scratch[:, :self._att_rows]
+    self._draft_bias_skip = bias_skip
+    self._draft_miss_ids = torch.full((H, B, M), -1, dtype=torch.int64, device=live.device)
+    self._draft_skip = torch.zeros((H, B, M), dtype=torch.bool, device=live.device)
+
+
+def _engine_set_draft_resident(self, on):
+    """Bind the NEXT decode step of this engine: the draft step (on=True) or the
+    shipped step (on=False). on=False on an engine that is not enabled does
+    nothing. A refused on=True binds the shipped step, then raises."""
+    shipped = getattr(self, "_draft_shipped_update", None)
+    if not on:
+        if shipped is not None:
+            self.decode_update = shipped
+        return
+    why = _draft_refusal(self)
+    if why is not None:
+        if shipped is not None:
+            self.decode_update = shipped
+        raise why
+    self.decode_update = self.decode_update_draft_resident
+
+
+def _engine_draft_misses(self):
+    """The miss list of the LAST draft step of this engine, for Task 1.2:
+    (slots, ids). slots: (H, B, topk) bool, _load_mask >= 0 after pool_update.
+    ids: (H, B, topk) int64, contiguous (the gather kernels read ids as a flat
+    array), the host block id of each skipped slot and -1 at every other slot.
+    The next draft step of this engine overwrites both."""
+    return self._draft_skip, self._draft_miss_ids
+
+
+def _cache_enable_draft_resident(self):
+    """Opt in (the flag; default off: nothing else calls this). Call it after the
+    prefill. Allocates one bias scratch and one skip buffer for all layers, and
+    the miss list of each layer. Returns the scratch."""
+    engines = [layer.cache_engine for layer in self.layers]
+    for e in engines:
+        if e.pool_blocks <= 0 or e._att_rows is None:
+            e.enable_draft_resident(None, None)          # raises the reason (no pool, or no prefill yet)
+    e0 = engines[0]
+    H, B, M = e0._load_mask.shape
+    scratch = torch.empty_like(e0._kv_bias_gpu)
+    skip = torch.empty((B, M, 1, H), dtype=torch.bool, device=e0._kv_bias_gpu.device)
+    for e in engines:
+        e.enable_draft_resident(scratch, skip)
+    return scratch
+
+
+def _cache_draft_resident_allowed(self):
+    """True when every layer may run the next step as a draft step."""
+    return all(_draft_refusal(layer.cache_engine) is None for layer in self.layers)
+
+
+def _cache_set_draft_resident(self, on):
+    """Make the NEXT decode step a draft step (on=True) or a shipped step
+    (on=False) in every layer. Call it between steps, never inside one.
+    on=True checks every layer first. If one layer refuses, every layer gets the
+    shipped step, and then the refusal is raised: no layer of the next step can
+    draft by accident, and no state of the step has moved yet."""
+    engines = [layer.cache_engine for layer in self.layers]
+    if on:
+        for e in engines:
+            why = _draft_refusal(e)
+            if why is not None:
+                for e2 in engines:
+                    e2.set_draft_resident(False)
+                raise why
+    for e in engines:
+        e.set_draft_resident(on)
+
+
+CacheEngine.decode_update_draft_resident = _decode_update_draft_resident
+CacheEngine.enable_draft_resident = _engine_enable_draft_resident
+CacheEngine.set_draft_resident = _engine_set_draft_resident
+CacheEngine.draft_misses = _engine_draft_misses
+InfLLMv2Cache.enable_draft_resident = _cache_enable_draft_resident
+InfLLMv2Cache.draft_resident_allowed = _cache_draft_resident_allowed
+InfLLMv2Cache.set_draft_resident = _cache_set_draft_resident

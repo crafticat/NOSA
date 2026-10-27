@@ -82,6 +82,25 @@ kc[g, b] (kc = the sum of the earlier n_acc) and its step u reads SH's input inp
   wrong commit changes the state of the next group, so the kept rows of every later group check it too. MUST gates
   RBR-RUN / -ERR / -CAP, RBS-RUN / -ERR / -CAP; the registered predictions PRED_ROLLBACK (RB-BIT, RB-STEP, RB-COMMIT,
   RB-OVF), TBD by the lead (REPORT until filled).
+
+--draft-resident (r2-draftpool; Task 1.1 of kstep-cpu-runs/analysis/plan/PLAN_speckv_on_cached_nosa.md; needs --pool > 0
+and --arms SH): after SH, the DR arm runs in the same process on a NEW cache of the same engine with the draft flag ON
+(cache_engine.py, the r2-draftpool block: InfLLMv2Cache.enable_draft_resident, set_draft_resident), TEACHER-FORCED on
+SH's tokens. A draft step skips the two host gathers and masks the slots that still need the host. The kind of step t
+(dr_kind, in this order): rewarm (a re-warm step), g0 (t < --dr-gate0, the Gate 0 prefix), edge (the cache refuses a
+draft now: the tail block fills), ship (after the prefix, every (--dr-k + 1)-th step: the shipped step after --dr-k
+drafts), draft. Every kind except draft runs the shipped step. Gates and predictions (verdicts_draft):
+  DR-RUN    MUST: the DR arm ran N steps with at least one draft step.
+  DR-G0     MUST: the steps t < --dr-gate0 (flag on, shipped) give SH's next tokens for every request.
+  DR-FIRST  REPORT: the DR prefill's first tokens equal SH's. If DR-G0 fails and DR-FIRST fails too, the cause is a
+            run-to-run difference of the prefill, not the flag.
+  DR-STEP   the draft step median (ms) inside DLO:DHI of --dr-bands (REPORT without bands).
+  DR-RATIO  draft median / SH steady median inside RLO:RHI of --dr-bands (REPORT without bands).
+  DR-SHIP   REPORT: the ship step median / SH steady median.
+  DR-SKIP   REPORT: skipped slots per (layer, KV head, request) per draft step.
+  DR-AGREE  REPORT: the teacher-forced agreement of the draft steps and of the ship steps with SH's tokens.
+  DR-MEM    REPORT: DR peak allocated - SH peak allocated (GB).
+--draft-resident runs on the SHIPPED cache engine and does not combine with --ragged / --rollback (refused).
 """
 from __future__ import annotations
 
@@ -140,6 +159,8 @@ RAGGED_ARMS = (("RG", 1), ("RGS", None))               # (arm, spread); None = -
 PRED_ROLLBACK = dict(stamp="2026-10-27T18:12:28Z", RB_bitwise=True, RB_step_ratio=(1.0, 1.4), RB_commit_ms=(5.0, 60.0),
                      RB_overflow_zero=True)
 ROLLBACK_ARMS = ("RBR", "RBS")                         # the reference first (its prefill and steps carry no hook)
+# --draft-resident (r2-draftpool): the step kinds of the DR arm (dr_kind); only "draft" runs the draft step
+DR_KINDS = ("rewarm", "g0", "edge", "ship", "draft")
 
 
 def log(msg):
@@ -180,6 +201,11 @@ def parse_args(argv):
     ap.add_argument("--rb-seed", type=int, default=0, help="--rollback: the seed of n_acc (uniform in 0 .. K)")
     ap.add_argument("--rb-journal-blocks", type=int, default=256,
                     help="--rollback: saved slots per layer and step (a lost slot past it comes back from the host)")
+    ap.add_argument("--draft-resident", action="store_true",
+                    help="r2-draftpool: the DR arm after SH (the draft step on the resident KV); needs --pool > 0")
+    ap.add_argument("--dr-k", type=int, default=3, help="--draft-resident: draft steps per shipped step")
+    ap.add_argument("--dr-gate0", type=int, default=4, help="--draft-resident: the shipped prefix (Gate 0) in steps")
+    ap.add_argument("--dr-bands", default="", help="--draft-resident: DLO:DHI:RLO:RHI (DR-STEP ms, DR-RATIO), or TBD")
     a = ap.parse_args(argv)
     a.arms = [x for x in a.arms.split(",") if x]
     if a.arms not in (["SH", "R2"], ["SH"]):
@@ -202,6 +228,25 @@ def parse_args(argv):
                            and a.rb_journal_blocks >= 1):
         ap.error("--rb-k in 1 .. %d, --rb-groups >= 1 with (groups + 1) x K <= --steps, --rb-journal-blocks >= 1"
                  % R_TOK)
+    if a.draft_resident and (a.ragged or a.rollback):
+        ap.error("--draft-resident (the shipped cache engine) does not combine with --ragged / --rollback")
+    a.dr_bands_parsed = None
+    if a.draft_resident:
+        if a.pool <= 0:
+            ap.error("--draft-resident needs --pool > 0 (the draft step is on the pooled decode)")
+        if a.arms != ["SH"]:
+            ap.error("--draft-resident needs --arms SH (the DR arm runs after SH, teacher-forced on SH's tokens)")
+        if a.dr_k < 1:
+            ap.error("--dr-k >= 1")
+        if not 1 <= a.dr_gate0 < a.steps:
+            ap.error("--dr-gate0 in 1 .. steps - 1 (a draft needs one shipped step after the prefill)")
+        try:
+            a.dr_bands_parsed = parse_dr_bands(a.dr_bands)
+        except ValueError as e:
+            ap.error(str(e))
+        a.arms = ["SH", "DR"]
+    elif a.dr_bands:
+        ap.error("--dr-bands needs --draft-resident")
     return a
 
 
@@ -512,6 +557,102 @@ def verdicts_rollback(sh, rb):
         out.append(("RB-OVF", v, "journal slots past N that held a block (restored from the host): %d; past N and "
                     "empty (not restored, no reader): %d; destroyed %d; registered %s" % (
                         ovf, sum(rbs["journal"].get("overflow_dead", [])), sum(rbs["journal"]["destroyed"]), want)))
+    return out
+
+
+# ------------------------------------------------------------------ --draft-resident (r2-draftpool), pure parts
+def parse_dr_bands(s: str):
+    """--dr-bands: '' or 'TBD' -> None (REPORT verdicts); 'DLO:DHI:RLO:RHI' -> four floats with 0 < DLO < DHI and
+    0 < RLO < RHI (DR-STEP in ms, DR-RATIO)."""
+    if s in ("", "TBD"):
+        return None
+    parts = s.split(":")
+    if len(parts) != 4:
+        raise ValueError("--dr-bands %r: need DLO:DHI:RLO:RHI or TBD" % s)
+    try:
+        v = tuple(float(x) for x in parts)
+    except ValueError:
+        raise ValueError("--dr-bands %r: four numbers" % s)
+    if not (0 < v[0] < v[1] and 0 < v[2] < v[3]):
+        raise ValueError("--dr-bands %r: need 0 < DLO < DHI and 0 < RLO < RHI" % s)
+    return v
+
+
+def dr_kind(t: int, rewarm: bool, allowed: bool, k: int, gate0: int) -> str:
+    """The kind of DR step t: 'rewarm', 'g0', 'edge', 'ship' or 'draft' (in this order of priority). Only 'draft'
+    runs the draft step. 'edge': the cache refuses a draft now (allowed is InfLLMv2Cache.draft_resident_allowed(): False
+    when the step fills the tail block). After the prefix t < gate0, every (k + 1)-th step is 'ship'."""
+    if rewarm:
+        return "rewarm"
+    if t < gate0:
+        return "g0"
+    if not allowed:
+        return "edge"
+    return "ship" if (t - gate0) % (k + 1) == k else "draft"
+
+
+def dr_summary(B: int, res, inputs, gate0: int):
+    """The DR arm's numbers from run_draft's result: period stats per kind (a re-warm step is only 'rewarm'), the
+    count per kind, the teacher-forced agreement per kind and over the prefix t < gate0 (DR-G0), and the skipped slots
+    per (layer, KV head, request) per draft step."""
+    kinds = list(res["kinds"])
+    periods = res["periods"]
+    stats = {kd: period_stats(periods, [t for t, x in enumerate(kinds) if x == kd]) for kd in DR_KINDS}
+    n_kind = {kd: kinds.count(kd) for kd in DR_KINDS}
+    ok = res["pred"].detach().cpu() == inputs.detach().cpu()[:, 1:len(kinds) + 1]
+    per = {}
+    for kd in DR_KINDS:
+        cols = [t for t, x in enumerate(kinds) if x == kd]
+        per[kd] = float(ok[:, cols].float().mean()) if cols else None
+    g0 = ok[:, :gate0]
+    bad = (~g0).nonzero()
+    first_bad = [int(bad[0, 0]), int(bad[0, 1])] if bad.numel() else None
+    draft_t = [t for t, x in enumerate(kinds) if x == "draft"]
+    sk = [int(x) for x in res["skipped"]]
+    per_stream = (sum(sk[t] for t in draft_t) / (len(draft_t) * res["streams_per_step"])) if draft_t else None
+    med = stats["draft"]["median_ms"]
+    return dict(kinds=kinds, stats=stats, n_kind=n_kind, rewarms=res["rewarms"], prefill_s=res["prefill_s"],
+                first_token_agreement=res["first_token_agreement"], streams_per_step=res["streams_per_step"],
+                skipped=sk, skip_per_stream=per_stream,
+                agreement=dict(per_kind=per, g0_equal=int(g0.sum()), g0_total=int(g0.numel()),
+                               g0_first_diff_request_step=first_bad),
+                draft_tok_s=(round(1e3 * B / med, 1) if med else None))
+
+
+def verdicts_draft(sh, dr, bands):
+    """--draft-resident: DR-STEP and DR-RATIO (CONFIRMED / REFUTED inside --dr-bands, REPORT without bands), DR-SHIP,
+    DR-SKIP, DR-AGREE, DR-MEM (REPORT)."""
+    if dr is None or not dr["stats"]["draft"]["median_ms"]:
+        return [("DR-STEP", "NOT_RUN", "no draft step was timed")]
+    out = []
+    d = dr["stats"]["draft"]["median_ms"]
+    if bands is None:
+        out.append(("DR-STEP", "REPORT", "draft step median %.3f ms (no band)" % d))
+    else:
+        out.append(("DR-STEP", "CONFIRMED" if bands[0] <= d <= bands[1] else "REFUTED",
+                    "draft step median %.3f ms (band [%s, %s])" % (d, bands[0], bands[1])))
+    s = sh["rates"]["steady_step_ms"] if sh else None
+    if s:
+        r = d / s
+        if bands is None:
+            out.append(("DR-RATIO", "REPORT", "draft median / SH steady %.4f (no band)" % r))
+        else:
+            out.append(("DR-RATIO", "CONFIRMED" if bands[2] <= r <= bands[3] else "REFUTED",
+                        "draft median / SH steady %.4f (band [%s, %s])" % (r, bands[2], bands[3])))
+        sm = dr["stats"]["ship"]["median_ms"]
+        out.append(("DR-SHIP", "REPORT", "ship step median %s ms / SH steady %.3f ms = %s" % (
+            sm, s, ("%.4f" % (sm / s)) if sm else None)))
+    else:
+        out.append(("DR-RATIO", "NOT_RUN", "no SH steady step"))
+    sp = dr["skip_per_stream"]
+    out.append(("DR-SKIP", "REPORT", "skipped slots per (layer, KV head, request) per draft step %s" % (
+        ("%.4f" % sp) if sp is not None else None)))
+    pk = dr["agreement"]["per_kind"]
+    out.append(("DR-AGREE", "REPORT", "teacher-forced agreement: draft %s, ship %s, edge %s" % (
+        pk["draft"], pk["ship"], pk["edge"])))
+    if sh is not None and dr.get("gpu_peak_alloc_GB") is not None:
+        out.append(("DR-MEM", "REPORT", "DR peak %.3f GB - SH peak %.3f GB = %+.3f GB" % (
+            dr["gpu_peak_alloc_GB"], sh["gpu_peak_alloc_GB"], dr["gpu_peak_alloc_GB"] - sh["gpu_peak_alloc_GB"])))
     return out
 
 
@@ -841,6 +982,64 @@ def run_rollback(model, ids, inputs, steps: int, clock, opt, mode: str, sched):
     return res
 
 
+def run_draft(model, ids, inputs, steps: int, clock, k: int, gate0: int):
+    """The DR arm (--draft-resident): a NEW shipped cache, the same prefill as SH, then the draft flag ON
+    (InfLLMv2Cache.enable_draft_resident), TEACHER-FORCED on SH's tokens inputs[:, t]. Re-warms follow SH's rule.
+    Before each step, dr_kind picks the kind and set_draft_resident binds the draft step or the shipped step in every
+    layer. A period is the same span as in run_shipped (CUDA events at the step starts). A draft step also sums its
+    skipped slots over the layers on the device (no host read inside the loop)."""
+    import torch
+    from nosi.cache_engine import InfLLMv2Cache
+    cfg = model.config
+    cache = InfLLMv2Cache(config=cfg, num_hidden_layers=cfg.num_hidden_layers, has_kv_bias=True)
+    for layer in cache.layers:
+        layer.cache_engine.max_gen_len = steps + 64
+    Bn = ids.shape[0]
+    clock.sync()
+    t0 = time.time()
+    logits, pos = model.batch_prefill(ids, cache)
+    clock.sync()
+    prefill_s = time.time() - t0
+    first_agree = int((logits[:, -1, :].argmax(dim=-1) == inputs[:, 0]).sum())
+    del logits
+    pos = pos[:, -1:] + 1
+    cu = torch.arange(0, Bn + 1, dtype=torch.int, device="cuda")
+    cache.enable_draft_resident()                        # THE FLAG (default off: only this arm calls it)
+    engines = [layer.cache_engine for layer in cache.layers]
+    H, Bm, _ = engines[0]._load_mask.shape
+    tok = torch.empty((Bn, 1), dtype=torch.int64, device="cuda")
+    pred = torch.empty((Bn, steps), dtype=torch.int64, device="cuda")
+    skipped = torch.zeros((steps,), dtype=torch.int64, device="cuda")
+    model.has_buffers = False
+    warm, rewarms, kinds = None, [], []
+    ev = [clock.event() for _ in range(steps + 1)]
+    for t in range(steps):
+        l0 = cache.layers[0]
+        need, why = rewarm_need(cache.get_seq_length(0), l0.no_compress_k_len, l0.cached_compressed_max_seqlen, warm)
+        if need:
+            warm = warm_state(cache.get_seq_length(0), l0.no_compress_k_len, l0.cached_compressed_max_seqlen)
+            rewarms.append((t, why))
+            model.has_buffers = False
+        kind = dr_kind(t, need, cache.draft_resident_allowed(), k, gate0)
+        kinds.append(kind)
+        cache.set_draft_resident(kind == "draft")
+        tok.copy_(inputs[:, t:t + 1])
+        clock.record(ev[t])
+        lg = model.decode_inference(tok, cu, pos, cache)
+        pred[:, t].copy_(lg[:, -1, :].argmax(dim=-1))
+        if kind == "draft":
+            skipped[t] = torch.stack([e.draft_misses()[0] for e in engines]).sum()
+        pos = pos + 1
+    clock.record(ev[steps])
+    clock.sync()
+    cache.set_draft_resident(False)
+    periods = [clock.elapsed(ev[t], ev[t + 1]) for t in range(steps)]
+    out = dict(pred=pred, periods=periods, kinds=kinds, rewarms=rewarms, skipped=skipped.cpu().tolist(),
+               streams_per_step=len(engines) * H * Bm, prefill_s=round(prefill_s, 1), first_token_agreement=first_agree)
+    del cache, engines
+    return out
+
+
 def gpu_peak():
     import torch
     return round(torch.cuda.max_memory_allocated() / 1e9, 3), round(torch.cuda.max_memory_reserved() / 1e9, 3)
@@ -899,7 +1098,7 @@ def main(argv=None) -> int:
         print(str(e), file=sys.stderr)
         return 20
     os.makedirs(a.out)
-    gates, sh, r2, agree, gt = [], None, None, None, {}
+    gates, sh, r2, agree, gt, dr = [], None, None, None, {}, None
     if a.gt:                                             # the fused twin's GPU gate, before the model loads
         log("GT (r2_fused_cell.part_gt)")
         try:
@@ -1071,7 +1270,33 @@ def main(argv=None) -> int:
                 rbres["compare"] = rollback_compare(fps["RBR"], fps["RBS"], sched[0])
             rbres["n_acc_sum"] = int(sched[0].sum())
             del fps
-    preds = (verdicts_fused if a.r2 == "fused" else verdicts)(a.batch, sh, r2, agree, expected)
+        if "DR" in a.arms:
+            if inputs is None:
+                gates.append(("DR-RUN", True, False, "NOT_RUN: SH failed (DR is teacher-forced on SH's tokens)"))
+            else:
+                log("arm DR (draft-resident, k %d, gate0 %d)" % (a.dr_k, a.dr_gate0))
+                dr_base = round(torch.cuda.memory_allocated() / 1e9, 3)
+                try:
+                    res = run_draft(model, ids, inputs, a.steps, clock, a.dr_k, a.dr_gate0)
+                    pa, pr = gpu_peak()
+                    dr = dr_summary(a.batch, res, inputs, a.dr_gate0)
+                    dr.update(gpu_peak_alloc_GB=pa, gpu_peak_reserved_GB=pr, gpu_base_alloc_GB=dr_base)
+                    del res
+                    nd = dr["n_kind"]["draft"]
+                    gates.append(("DR-RUN", True, nd > 0, "%d steps, kinds %s" % (a.steps, dr["n_kind"])))
+                    g = dr["agreement"]
+                    gates.append(("DR-G0", True, g["g0_equal"] == g["g0_total"],
+                                  "steps 0 .. %d (flag on, shipped): %d of %d tokens equal SH's (first difference "
+                                  "[request, step] %s)" % (a.dr_gate0 - 1, g["g0_equal"], g["g0_total"],
+                                                           g["g0_first_diff_request_step"])))
+                    gates.append(("DR-FIRST", False, dr["first_token_agreement"] == a.batch,
+                                  "prefill first tokens equal SH's: %d of %d" % (dr["first_token_agreement"], a.batch)))
+                except Exception as e:
+                    traceback.print_exc()
+                    gates.append(("DR-RUN", True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+            mem["after_DR"] = host_mem()
+            free()
+    preds =(verdicts_fused if a.r2 == "fused" else verdicts)(a.batch, sh, r2, agree, expected)
     C = C_BASE + a.pool
     if a.mbase:
         preds = preds + verdicts_mbase(C, a.batch, sh, r2)
@@ -1079,6 +1304,8 @@ def main(argv=None) -> int:
         preds = preds + verdicts_ragged(sh, rg)
     if a.rollback:
         preds = preds + verdicts_rollback(sh, rbres)
+    if a.draft_resident:
+        preds = preds + verdicts_draft(sh, dr, a.dr_bands_parsed)
     meta = dict(batch=a.batch, steps=a.steps, warmup=a.warmup, S0=S0, doc_rows=rows, n_unique_docs=min(a.batch, N_DOCS),
                 workload_sha256=sha, expected_rewarms=expected, attn_splits=NL._ATTN_SPLITS,
                 pool_blocks=CEN.POOL_BLOCKS, capacity_C=C, arms=a.arms, mbase=a.mbase,
@@ -1087,9 +1314,10 @@ def main(argv=None) -> int:
                                         peak_model_GB=round(mbase_peak_model(C, a.batch), 3))
                                    if a.mbase else None),
                 predictions=(PRED_FUSED if a.r2 == "fused" else PRED), r2=a.r2, gt=a.gt,
+                draft_resident=a.draft_resident, dr_k=a.dr_k, dr_gate0=a.dr_gate0, dr_bands=a.dr_bands,
                 nosi_commit=os.environ.get("BASE_COMMIT", "unknown"), torch=torch.__version__,
                 gpu=torch.cuda.get_device_name(0), host_mem=mem)
-    out = dict(meta=meta, SH=sh, R2=r2, agreement=agree, GT=gt or None,
+    out = dict(meta=meta, SH=sh, R2=r2, DR=dr, agreement=agree, GT=gt or None,
                gates=[dict(name=g[0], must=g[1], passed=bool(g[2]), detail=g[3]) for g in gates],
                predictions=[dict(name=p[0], verdict=p[1], detail=p[2]) for p in preds])
     if a.ragged:                                         # flag off: the summary keeps exactly its former keys
@@ -1133,6 +1361,13 @@ def main(argv=None) -> int:
                       arm["agreement"]["agreement"], arm["journal"]))
     if a.rollback and rbres.get("compare"):
         print("REPORT rollback compare: %s" % (rbres["compare"],))
+    if dr:
+        st = dr["stats"]
+        print("REPORT DR B %d: draft median %s ms (n %d, %s tok/s), ship median %s ms (n %d), g0 median %s ms, kinds %s, "
+              "skipped per stream %s, peak %s GB, prefill %s s" % (
+                  a.batch, st["draft"]["median_ms"], st["draft"]["n"], dr["draft_tok_s"], st["ship"]["median_ms"],
+                  st["ship"]["n"], st["g0"]["median_ms"], dr["n_kind"], dr["skip_per_stream"],
+                  dr["gpu_peak_alloc_GB"], dr["prefill_s"]))
     nfail = sum(1 for g in gates if g[1] and not g[2])
     print("r2_base: %d MUST gate(s) failed" % nfail)
     return min(nfail, 19)
