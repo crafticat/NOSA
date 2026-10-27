@@ -112,14 +112,20 @@ MBS_BUDGET_GB = dict(matched=82.04, edge=84.0)      # matched: mb1's measured pe
 # REGISTERED predictions: TBD. The lead writes every value and the stamp (`date -u` in the same command, L33) in a
 # commit before the run. A None value prints UNREGISTERED. Forms: a band (low, high); a dict of bands keyed "C" or
 # "C_B"; mx_fits a dict "C_B" -> True (fits) / False (out of memory).
-PRED_MBS = dict(stamp=None,
-                rn_steady_ratio=None,       # --recap-nogc / plain SH steady median, every A/B pair
-                rn_eff_ratio=None,          # {"C": band}: --recap-nogc / plain effective tok/s
-                rn_rewarm_later_ms=None,    # median of the later re-warm periods (ms) under --recap-nogc
-                rn_rewarm_first_ms=None,    # the first re-warm period (ms) under --recap-nogc (the JIT included)
-                mx_steady_tok_s=None,       # {"C_B": band}: SH steady tok/s of each sub-cell
-                mx_peak_ratio=None,         # band: SH peak allocated / mbase_peak_model(C, B)
-                mx_fits=None)               # {"C_B": bool}: the fit probes
+# Lead registration 2026-10-27T22:02:35Z: the builder's suggestions (docs/NOTES_mbstrong.md section 4) adopted; the
+# edge-B fit probes are registered as True (fits) to make an OOM a refuted prediction, not a silent gap.
+PRED_MBS = dict(stamp="2026-10-27T22:02:35Z",
+                rn_steady_ratio=(0.99, 1.01),     # --recap-nogc / plain SH steady median, every A/B pair
+                rn_eff_ratio={"128": (1.8, 2.3), "73": (1.45, 1.85), "81": (1.5, 1.95), "63": (1.3, 1.6)},
+                rn_rewarm_later_ms=(200, 1000),   # median of the later re-warm periods (ms) under --recap-nogc
+                rn_rewarm_first_ms=(4000, 12000),  # the first re-warm period (ms) under --recap-nogc (the JIT included)
+                mx_steady_tok_s={"128_216": (3330, 3420), "128_222": (3300, 3480), "73_318": (2540, 2630),
+                                 "73_358": (2480, 2700), "73_369": (2480, 2700), "81_290": (2830, 2920),
+                                 "81_326": (2780, 2980), "81_336": (2780, 2980), "63_344": (1870, 1930),
+                                 "63_406": (1840, 1960)},
+                mx_peak_ratio=(0.99, 1.01),       # band: SH peak allocated / mbase_peak_model(C, B)
+                mx_fits={"128_222": True, "73_358": True, "73_369": True, "81_326": True, "81_336": True,
+                         "63_406": True})
 
 
 def log(msg):
