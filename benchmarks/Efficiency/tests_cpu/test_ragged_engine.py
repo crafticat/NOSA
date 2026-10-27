@@ -247,7 +247,9 @@ sys.modules["ragged_world"] = W
 spec.loader.exec_module(W)
 FB = W.pkg_load("r2_body_fused")
 assert FB.triton is not None, "child: triton did not import"
-ev = W.run_bodies([4100, 4157, 4223, 4160], 70)
+# block completions BY CONSTRUCTION inside the 4 all-active steps: 4157 at local step 2, 4223 at 0, 4159 at 0, 4158
+# at 1 (4100 and 4160 complete theirs at local steps 59 / 63 only, which ragged activity may not reach: run a, 2 of 4)
+ev = W.run_bodies([4100, 4157, 4223, 4160, 4159, 4158], 70)
 assert ev["inactive"] > 0 and ev["crossings"] >= 4, ev
 print("RGF OK FusedBody with the pool == the torch body, bitwise (70 steps, ragged activity): %s" % ev)
 '''

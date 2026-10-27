@@ -166,6 +166,21 @@ INPUTS FOR THE LEAD'S BANDS (INFERRED, not measured):
   that step. A refused step is a run failure (RG-ERR), not a recoverable state.
 - The ragged arms release the shipped warm-up graphs and buffers of the model (`run_ragged`). Run them after SH and R2.
 
+## 6b. FIX 1 (CPU run a at 76a24bc: 45 passed, 2 skipped, 1 failed)
+
+- Record: `/mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/rg_76a24bc_a.txt`. Failed:
+  `test_fused_body_with_pool_under_the_interpreter`, child line 14, `AssertionError: {'inactive': 80, 'crossings': 2}`.
+- ROOT CAUSE: a wrong PRECONDITION count in the test, not the engine. Line 13 (`W.run_bodies(...)`) returned, so every
+  behaviour check inside it PASSED: the logits of every step, every engine table and the refusal bits of FusedBody
+  with the pool are bitwise those of the torch body. Line 14 then asked for >= 4 block completions. With the prompts
+  4100 / 4157 / 4223 / 4160, only two completions are certain (4223 at local step 0, 4157 at local step 2); 4100 and
+  4160 need local steps 59 and 63, which 70 global steps at activity 0.7 did not reach. I counted them wrongly when I
+  wrote the test. Not an interpreter limit; not undefined memory (`_new_block_map_buf` / `_load_mask` are not compared
+  and the diff writes every slot before a read).
+- FIX: the threshold stays >= 4. The data change: prompts 4100, 4157, 4223, 4160, 4159, 4158 (B 6). 4157, 4223, 4159
+  and 4158 complete a block at local steps 2, 0, 0, 1, all inside the 4 all-active steps, so the precondition holds by
+  construction. B 6 also runs FusedBody's lane mask (6 of 8 lanes). No behaviour assertion changed.
+
 ## 7. Shell commands outside cat / grep / head / tail / ls / sort / cut / diff / git / wc (this task)
 
 - `sed`: ONCE, read-only, in a pipeline (`git diff ... | sed -n 1,0p`): it printed nothing and changed nothing. This
