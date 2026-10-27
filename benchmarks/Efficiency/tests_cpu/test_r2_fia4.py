@@ -11,7 +11,7 @@ compute node:
 
 FV1 license header and revision; FV2 every changed line carries [fork] (difflib against the pristine upstream copies)
 with two planted negative controls; FV3 one fork, no other kernel; FV4 the torch tables = a set model, the width, the
-sort precondition (and the recorded S1 lists, when present); FV5 the kernel under the interpreter (14 groups, a planted
+sort precondition (and the recorded S1 lists, when present); FV5 the kernel under the interpreter (15 groups, a planted
 mask error among them); FV6 completeness and the PRED4 block; FV7 the decision report; FV8 ncu summary, argv and the
 arguments; FV9 / FV10 the step (static shape, DRYRUN).
 """
@@ -111,8 +111,11 @@ def tables_match(model, table, ext, ulen):
         c = len(want)
         if int(ulen[h, n]) != c:
             return False, "length (%d, %d): %d != %d" % (h, n, int(ulen[h, n]), c)
-        if table[h, n, :c].tolist() != [p for p, _ in want] or ext[h, n, :c].tolist() != [w for _, w in want]:
-            return False, "entries of (%d, %d) differ" % (h, n)
+        got_p, got_w = table[h, n, :c].tolist(), ext[h, n, :c].tolist()
+        for j, (p, w) in enumerate(want):
+            if got_p[j] != p or got_w[j] != w:
+                return False, "entry (%d, %d, %d) differs: page %d / %d, word %#x / %#x (tables / model)" % (
+                    h, n, j, got_p[j], p, got_w[j] & 0xFFFFFFFF, w)
     return True, "%d (head, request) tables equal" % len(model)
 
 
@@ -385,6 +388,26 @@ check("I13_real_geometry_vs_fp64", err(og, bg, [0, 1, 2, 3], GR) <= 2e-4, err(og
 g13 = M.fv_table_gate("1x4", fg, [("full", bg)], 4, cg["S"], True)
 check("I13_real_geometry_tables", g13["passed"], g13["detail"])
 
+# I15 no store outside the tables (fia4 CPU run 02bc4c4: one int32 past a program's ext row was written): the three
+# tables are views at the head of larger buffers whose tail is a canary (-7). The LAST program of the grid (KV head 1,
+# request 1) owns the last row, so a write past its row reaches the canary whatever the grid order (precondition: the
+# tables end where the canary starts). Each row's entry 0 (block 0, all rows: 64 tokens each) is checked too.
+nt = 2 * 2 * M.fv_width(64)
+big_t = torch.full((nt + 64,), -7, dtype=torch.int32)
+big_x = torch.full((nt + 64,), -7, dtype=torch.int32)
+big_l = torch.full((4 + 8,), -7, dtype=torch.int32)
+t15, x15, l15 = big_t[:nt].view(2, 2, -1), big_x[:nt].view(2, 2, -1), big_l[:4].view(2, 2)
+check("I15_precondition_views", t15.data_ptr() == big_t.data_ptr() and t15.is_contiguous() and x15.is_contiguous())
+kv, vv, bv, sr = views(bf, S)
+o15 = torch.empty_like(bf["q"])
+F.unified_attention(bf["q"], kv, vv, o15, fv.bufs["cu"], 4, fv.bufs["seqused"], sr, G4["D"] ** -0.5, True, (-1, -1),
+                    t15, 0, None, None, None, union_ext=x15, union_len=l15, cis_bias=bv, build_union=build_args(bf, S))
+check("I15_canary_table", bool((big_t[nt:] == -7).all()), big_t[nt:nt + 4].tolist())
+check("I15_canary_ext", bool((big_x[nt:] == -7).all()), big_x[nt:nt + 4].tolist())
+check("I15_canary_len", bool((big_l[4:] == -7).all()), big_l[4:].tolist())
+check("I15_entry0_every_row", bool((x15[:, :, 0] == 0x40404040).all()), x15[:, :, 0].tolist())
+check("I15_output", M.bits_equal(o15, o_fv))
+
 # I14 the launcher's refusals (before any launch)
 fv.prepare(bf)
 kv, vv, bv, sr = views(bf, S)
@@ -422,7 +445,8 @@ def test_FV5_the_fork_under_the_triton_interpreter():
     (4 copies) == in its request, bitwise (EXACT); I9 the block-edge batch; I10 requests of 1, 3 and 4 rows; I11 the
     3D split path (2 segments) = the 2D output (1e-5); I12 an unsorted list makes the table gate VOID; I13 the NOSA-8B
     geometry (BLOCK_M 64, D 128); I14 the launcher refuses window, ALiBi, quantized KV, 3 rows per block, 5 query
-    rows, a missing ext table and a table narrower than BLOCK_Q x P_PAD."""
+    rows, a missing ext table and a table narrower than BLOCK_Q x P_PAD; I15 no store outside the tables (canary
+    tails after the three tables; every row's entry 0 is block 0's word 0x40404040)."""
     if importlib.util.find_spec("triton") is None:
         pytest.skip("triton is not installed")
     env = dict(os.environ, TRITON_INTERPRET="1", PYTHONDONTWRITEBYTECODE="1")

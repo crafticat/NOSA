@@ -310,7 +310,12 @@ def fork_build_union(  # [fork]
         word_e += tl.where(hit, ext << (8 * r), 0)  # [fork] row r's byte (disjoint bytes: the sum is the or)
         dup_e += tl.where(hit & (u_e > r), 1, 0)  # [fork]
     first_e = (ok_e & (dup_e == 0)).to(tl.int32)  # [fork]
-    tl.store(ext_ptr + offs_e, tl.cumsum(first_e, axis=0))  # [fork] scratch: C[e] = FIRST entries at or before e
+    # [fork] The count runs in int64 and is cast to int32 before the store. Triton 3.2's interpreter gives the cumsum of
+    # [fork] an int32 vector as int64 numpy data still typed int32 (np.cumsum promotes; interpreter.py:729-735,
+    # [fork] :849-850), and its store copies the data's 8 bytes per element: one int32 past this row was written (the
+    # [fork] next row's entry 0 became 0; fia4 CPU run 02bc4c4). An int64 -> int32 cast is a real cast in both backends.
+    c_first = tl.cumsum(first_e.to(tl.int64), axis=0).to(tl.int32)  # [fork]
+    tl.store(ext_ptr + offs_e, c_first)  # [fork] scratch: C[e] = FIRST entries at or before e
     tl.debug_barrier()  # [fork]
     rank_e = tl.zeros([NE], dtype=tl.int32)  # [fork]
     for r in tl.static_range(BLOCK_Q):  # [fork] pass 2: rank_e = sum over r of C[r P_PAD + pos - 1] - C[r P_PAD - 1]

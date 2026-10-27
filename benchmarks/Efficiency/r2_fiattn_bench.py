@@ -2277,8 +2277,12 @@ def fv_table_gate(tag, arm, batches, rpr, s_slots, must):
         live = torch.arange(t.shape[-1], device=t.device).view(1, 1, -1) < n.unsqueeze(-1).to(torch.int64)
         dl, dt, dx = int((kn != n).sum()), int(((kt != t) & live).sum()), int(((kx != x) & live).sum())
         bad += dl + dt + dx
-        det.append("%s: %d lengths, %d pages, %d extent words differ of %d entries (%s)"
-                   % (name, dl, dt, dx, int(live.sum()), txt))
+        # [fia4 fix] the first differing entries: (KV head, request, union index) kernel / torch (words in hex)
+        first = ["(%d, %d, %d) page %d / %d, word %#x / %#x" % (h, q, j, int(kt[h, q, j]), int(t[h, q, j]),
+                                                                int(kx[h, q, j]) & 0xFFFFFFFF, int(x[h, q, j]) & 0xFFFFFFFF)
+                 for h, q, j in (((kt != t) | (kx != x)) & live).nonzero().tolist()[:4]]
+        det.append("%s: %d lengths, %d pages, %d extent words differ of %d entries (%s)%s"
+                   % (name, dl, dt, dx, int(live.sum()), txt, "; first: " + ", ".join(first) if first else ""))
     return gate("U_FV_table_%s" % tag, pre and bad == 0, must, "%s; %s" % (
         "precondition met (sorted rows)" if pre else "VOID: unsorted rows", "; ".join(det)),
         status=None if pre else "VOID")

@@ -23,7 +23,7 @@ Evidence: SCORING_fia3.md, SURVEY_shared_kv_kernel.md (sections 3.2, 7), analysi
 
 | file | what |
 |---|---|
-| /mnt/beegfs/ojerbi/nosi-r2-fia4/nosi/nosi/fork_vllm_unified_attention.py | the fork (1142 lines; 305 lines added or changed, 281 upstream lines removed, all tagged) |
+| /mnt/beegfs/ojerbi/nosi-r2-fia4/nosi/nosi/fork_vllm_unified_attention.py | the fork (1147 lines; 310 lines added or changed, 281 upstream lines removed, all tagged) |
 | /mnt/beegfs/ojerbi/nosi-r2-fia4/benchmarks/Efficiency/tests_cpu/fixtures_vllm_0_20_2/triton_unified_attention.py.upstream | pristine upstream copy (cp, byte for byte) |
 | /mnt/beegfs/ojerbi/nosi-r2-fia4/benchmarks/Efficiency/tests_cpu/fixtures_vllm_0_20_2/triton_attention_helpers.py.upstream | pristine upstream copy (cp, byte for byte) |
 | /mnt/beegfs/ojerbi/nosi-r2-fia4/benchmarks/Efficiency/r2_fiattn_bench.py | the bench: [fia4] arms FV, FVT, their gates, PRED4, R_DECISION4, ncu occupancy fields |
@@ -177,6 +177,29 @@ Builder expectations (MODEL, NOT registered; for the lead's judgement only):
    max_seqlen_q; FVArm checks the entry on the host in prepare (as FPArm).
 5. The interpreter shares CPU memory with the tensors (interpreter.py:1052-1077), so the in-kernel table stores are seen
    by the loop's loads in the CPU test; on the GPU, the barrier gives the same order inside the program.
+6. FIXED after CPU run 02bc4c4 (cpu-logs/fia4_02bc4c4_a.txt: I2, I9, I10 failed with ONE extent word, entry (KV head
+   1, request 0)). Root cause (derived from the code; the next run prints the entry): Triton 3.2's interpreter computes
+   tl.cumsum of an int32 vector with np.cumsum, which returns int64 (numpy promotes small integers to the platform
+   integer), and to_tensor keeps that array but types it int32 (interpreter.py:729-735, :849-850). The store passes the
+   numpy array to the C++ store (interpreter.py:384-385; INFERENCE: it copies the array's itemsize, 8 bytes, per
+   element, at 4-byte steps; the C++ source is not on disk, the observed signature fits it exactly). So the scratch
+   store of the C counts wrote one int32 past the program's ext row: the high half of C[255], 0, went to entry 0 of
+   the NEXT row (inside the row each next element overwrote the high half, so the counts stayed right). The interpreter runs the
+   grid with x outer and the KV head inner (interpreter.py:1098-1100), so the program (KV head 0, last request) runs
+   after (KV head 1, request 0) and zeroed that row's entry 0 after its loop had used it: block 0's word 0x40404040
+   (I2, I9) or 0x40 (I10, a one-row request) became 0 in the table, while the outputs stayed right (I1, I3, I10 passed).
+   B 1 (I13) passed because there the next row's program runs later and rewrites its entry 0. The GPU path is not hit
+   (an int32 scan gives int32). Fix (one [fork] line + comment): the count runs in int64 and is cast to int32 before
+   the store; an int64 -> int32 cast is a real cast in the interpreter (cast_impl astype, interpreter.py:388-404) and on
+   the GPU, while an int32 -> int32 cast is a no-op that would not help (semantic.py:840-841). New check I15: the
+   tables are views at the head of buffers with a canary tail (the last program of the grid owns the last row, so any
+   write past a row reaches the canary), and every row's entry 0 must be 0x40404040. fv_table_gate and the set-model
+   check now print the first differing (KV head, request, union index) with the kernel and torch values.
+7. The interpreter's "RuntimeWarning: invalid value encountered in divide" (interpreter.py:417, create_fdiv) comes from
+   upstream's 2D epilogue `acc = acc / L[:, None]` for tile rows past a request's rows (I10: requests of 1 and 3 rows;
+   query_mask_0 is false there). Those rows see no token: softmax_step sets m = 0, L = 1 x exp(-inf) + 0 = 0, acc = 0,
+   so 0 / 0 = NaN. The output store masks them (query_mask_0), so the NaN is never written; I10 checks the 8 real rows
+   against fp64. The bench's cells have 4 rows per request, so no such tile row exists there.
 
 ## 9. CPU tests for the lead (a compute node, inside the image; git HEAD printed before and after, lessons L37)
 
@@ -191,7 +214,7 @@ Builder expectations (MODEL, NOT registered; for the lead's judgement only):
   changed line tagged, with two plants; FV3 one fork, two launched kernels (upstream's), the helpers called only from
   the kernel, no kernel in the bench; FV4 the torch tables = a set model, the width, the sort precondition, and the
   recorded S1 lists sorted (it prints the fact; a failure here means the s1 cells cannot use FV's build); FV5 the fork
-  under TRITON_INTERPRET=1 (a fresh process; 14 check groups: fp64 at GQA 4 and at the NOSA-8B geometry, the kernel tables =
+  under TRITON_INTERPRET=1 (a fresh process; 15 check groups (I15: canary tails, section 8 item 6): fp64 at GQA 4 and at the NOSA-8B geometry, the kernel tables =
   the torch tables = the set model, FVT == FV, the planted mask error DETECTED and local, both witnesses, FI1-FI5, a row
   alone bitwise, the block-edge batch, requests of 1 / 3 / 4 rows, the 3D path, the VOID sort precondition, 7 launcher
   refusals); FV6 completeness and the PRED4 block; FV7 the decision report; FV8 the ncu fields, argv and arguments;
