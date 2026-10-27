@@ -52,8 +52,11 @@ ARM_MODE = dict(VRX=("exact", "rowgroup"), VRC=("exact", "natural"), VRF=("fast"
 #   VRX_ratio, VRC_ratio, VRF_ratio   (low, high): the steady joint pass / SH's steady step
 #   sel_ratio    (low, high): VRF's selection of R rows / its one-row selection (ms per pass, probe passes)
 #   union_mean   (low, high): VRF's union of the R rows' selections per (head, request), mean
-PRED_VERIFY = dict(stamp=None, VRX_bitwise=None, VRC_agree=None, VRF_agree=None, VRX_ratio=None, VRC_ratio=None,
-                   VRF_ratio=None, sel_ratio=None, union_mean=None)
+# Lead registration (2026-10-27T17:47:11Z): the builder's model of docs/NOTES_verify1.md section 5 adopted. A VRF ratio
+# near 3.1 means route 1 saves little over K + 1 serial steps; that is the expected result and the reason for route 2.
+PRED_VERIFY = dict(stamp="2026-10-27T17:47:11Z", VRX_bitwise=True, VRC_agree=0.99, VRF_agree=0.99,
+                   VRX_ratio=(3.4, 4.6), VRC_ratio=(3.0, 4.2), VRF_ratio=(2.5, 3.8), sel_ratio=(2.5, 4.2),
+                   union_mean=(66, 76))
 
 
 def log(msg):
