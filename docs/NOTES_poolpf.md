@@ -77,6 +77,18 @@ Decisions that the lead must know:
 Run it in the image (`/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif`): it needs triton, transformers, a C++ compiler and the
 CUDA headers (the packer build), as the f3t transport tests do. Not run by the builder.
 
+FIX 1 (CPU job pf_bccd3b1_a, 3 failures at bccd3b1). Root cause: a TEST HARNESS defect, not an engine defect.
+`prefill_update` allocates the window and the host rows with `torch.empty` and does not write all of them (the window
+slots before their first fill, the tail slot past the tail length, the host rows past S). Two worlds built from one
+seed held different leftover bytes there, and the tests compare whole tensors bitwise. Evidence: `_k_cpu` / `_v_cpu`
+differed at step 0 although no path writes host rows before the first write-back; the failing print of test 2 ended
+in bit-pattern values (3.6141e+03, 3.0794e-41) at the tail slot's unwritten last row; test 1 failed at step 0 on the
+outputs (views of the whole window). The engine never reads those rows. Fix: `r2_poolpf_cell.define_undefined` gives
+them one fixed value (4096.0) after the prefill, in the CPU worlds AND in the GPU gate PF-HIT (the CUDA caching
+allocator reuses blocks too). New preconditions: two worlds of one seed are bitwise equal before step 0 (tests 1, 2,
+5 and PF-HIT). No assertion was weakened; the cpupack plant must now change `_k_gpu` (before, leftover bytes alone
+could satisfy "some state differs").
+
 | test | what it proves |
 |---|---|
 | `test_flag_off_is_shipped` | Gate 0. The shipped files are unchanged against ded9d41. The binding before attach and after detach is the shipped bound method. Attached with no request: 8 steps (one block edge, one write-back) leave every engine tensor and every output bitwise equal to a never-attached twin. The cpupack source differs in the fetch line and the name only. Refusals. |

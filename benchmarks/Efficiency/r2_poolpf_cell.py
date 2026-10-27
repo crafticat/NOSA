@@ -150,6 +150,24 @@ def pick_cores(n, allowed):
     return allowed[-n:] if len(allowed) > n else None
 
 
+UNDEFINED_FILL = 4096.0            # exact in bf16 and fp32, far from the data
+
+
+def define_undefined(e, value=UNDEFINED_FILL):
+    """Give one fixed value to the memory that prefill_update allocates with torch.empty and does not write
+    (cache_engine.py:195-196, :222-224): the window slots before the tail slot, the tail slot past the tail length,
+    and the host rows past S. The shipped kernels never read it (attention stops at _cache_lens; a window slot is
+    read only after its fill; the packer reads complete blocks only). Two engine sets built from one seed otherwise
+    hold DIFFERENT leftover bytes there, and a bitwise comparison of whole tensors then fails for no behaviour (CPU
+    job pf_bccd3b1_a: _k_cpu differed at step 0; the window's tail rows differed). Call it after prefill_update."""
+    tail, n, bs = int(e._tail_block_idx_on_gpu), int(e._tail_block_len_on_gpu), int(e.block_size)
+    for t in (e._k_gpu, e._v_gpu, e._kv_bias_gpu):
+        t[:, :tail * bs].fill_(value)
+        t[:, tail * bs + n:(tail + 1) * bs].fill_(value)
+    for t in (e._k_cpu, e._v_cpu):
+        t[:, int(e.seq_length):].fill_(value)
+
+
 def summarize(B, schedule, periods, rewarms, segs):
     """Per arm: steady statistics over its non-re-warm steps, the ratio to SH, the cores, and the merged pool prefetch
     records of its segments."""
@@ -264,10 +282,15 @@ def part_hit(CEN, PFM, ext, gates, rec, threads, cores):
             v = torch.randn((Bh, Sh, H, D), generator=g).to(torch.bfloat16).to(dev)
             tc = torch.randn((Bh, Sh + 1024, H), generator=g).to(torch.bfloat16).to(dev)
             e.prefill_update(k, v, tc[:, :Sh], 0, Bh)
+            define_undefined(e)                          # the window comparison below is over whole tensors
             layers.append(types.SimpleNamespace(cache_engine=e, total_cis=tc))
         torch.cuda.synchronize()
         return types.SimpleNamespace(layers=layers)
     w1, w0 = world(1), world(1)
+    same0 = all(torch.equal(getattr(x.cache_engine, nm), getattr(y.cache_engine, nm))   # precondition: one world
+                for x, y in zip(w0.layers, w1.layers)
+                for nm in ("_k_gpu", "_v_gpu", "_kv_bias_gpu", "_k_cpu", "_v_cpu", "_block_map", "_pool_map",
+                           "_pool_age"))
     pf1 = PFM.PoolPrefetch(w1, ext, lanes=8, threads=threads, cores=cores)
     pf0 = PFM.PoolPrefetch(w0, ext, lanes=8, threads=threads, cores=cores)
     pf1.attach()
@@ -314,12 +337,13 @@ def part_hit(CEN, PFM, ext, gates, rec, threads, cores):
     ok_ctrl = (len(s_0) == 1 and int(e0._pool_action[h, b, s_0[0]]) == PFM.POOL_MOVE_OUT
                and torch.equal(rows(e0._k_gpu, s_0[0]), rows(e0._k_cpu, X)))
     rec.update(X=X, pinned_slot=q, window_slot_1=s_1, window_slot_0=s_0, counters=c, windows_equal=win,
+               sets_equal_before_step0=same0,
                action_1=(int(e1._pool_action[h, b, s_1[0]]) if s_1 else None),
                action_0=(int(e0._pool_action[h, b, s_0[0]]) if s_0 else None))
-    gates.append(("PF-HIT", True, ok_hit and win, "X %d pinned in slot %s; step 1 action %s target %s; bytes %s; "
-                  "counters %s; windows equal %s" % (X, q, rec["action_1"],
-                                                     int(e1._pool_target[h, b, s_1[0]]) if s_1 else None,
-                                                     "equal" if ok_hit else "see record", c, win)))
+    gates.append(("PF-HIT", True, same0 and ok_hit and win, "sets equal before step 0 %s; X %d pinned in slot %s; "
+                  "step 1 action %s target %s; bytes %s; counters %s; windows equal %s" % (
+                      same0, X, q, rec["action_1"], int(e1._pool_target[h, b, s_1[0]]) if s_1 else None,
+                      "equal" if ok_hit else "see record", c, win)))
     gates.append(("PF-HIT-CTRL", True, ok_ctrl, "without the prefetch: action %s (MOVE_OUT = a miss), gather bytes %s"
                   % (rec["action_0"], "equal" if ok_ctrl else "see record")))
     pf1.close()

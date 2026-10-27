@@ -157,7 +157,11 @@ def _logged(monkeypatch, CE, log):
 
 
 def _world(CE, seed):
-    """L CacheEngines after a real prefill_update (CPU, float32), with their total_cis tables (the bias source)."""
+    """L CacheEngines after a real prefill_update (CPU, float32), with their total_cis tables (the bias source).
+    The memory that prefill_update allocates with torch.empty and does not write gets one fixed value
+    (r2_poolpf_cell.define_undefined, the helper of the GPU gate PF-HIT too): two worlds of one seed are then bitwise
+    equal before step 0 (CPU job pf_bccd3b1_a: without it they held different leftover bytes)."""
+    define_undefined = _cell().define_undefined
     g = torch.Generator().manual_seed(seed)
     layers = []
     for _ in range(L):
@@ -168,6 +172,7 @@ def _world(CE, seed):
         v = torch.randn((B, S, H, D), generator=g)
         tc = torch.randn((B, S + 1024, H), generator=g)
         e.prefill_update(k, v, tc[:, :S], 0, B)
+        define_undefined(e)
         layers.append(types.SimpleNamespace(cache_engine=e, total_cis=tc))
     return types.SimpleNamespace(layers=layers)
 
@@ -239,7 +244,8 @@ def test_flag_off_is_shipped(CE, PF, ext, nopin):
         assert "pool_prefetch" not in (NOSI / f).read_text()
     # (b) + (c): a never-attached world A and an attached world B (gpugather, no request), 8 steps, same inputs
     wa, wb = _world(CE, 1), _world(CE, 1)
-    shipped = [layer.cache_engine.__dict__["decode_update"] for layer in wb.layers]
+    assert _diff(_state(wa), _state(wb)) == []               # precondition: one seed gives one world, bitwise
+    shipped =[layer.cache_engine.__dict__["decode_update"] for layer in wb.layers]
     assert all(getattr(s, "__func__", None) is CE.CacheEngine.decode_update_has_kv_bias_pool for s in shipped)
     with pytest.raises(ValueError):
         PF.PoolPrefetch(wb, ext, fetch="other", ops=TWIN_OPS)
@@ -283,7 +289,8 @@ def test_prefetched_block_is_a_pool_hit(CE, PF, ext, nopin, monkeypatch):
     log = []
     _logged(monkeypatch, CE, log)
     w1, w0 = _world(CE, 2), _world(CE, 2)
-    pf1, pf0 = _pf(PF, w1, ext), _pf(PF, w0, ext)
+    assert _diff(_state(w1), _state(w0)) == []               # precondition: one seed gives one world, bitwise
+    pf1, pf0 =_pf(PF, w1, ext), _pf(PF, w0, ext)
     pf1.attach()
     pf0.attach()
     s0 = _random_sel(w1, random.Random(7))
@@ -444,7 +451,8 @@ def test_cpupack_equals_gpugather_bytes(CE, PF, ext, nopin, monkeypatch):
     log = []
     _logged(monkeypatch, CE, log)
     wg, wc, wp = _world(CE, 5), _world(CE, 5), _world(CE, 5)
-    pg = _pf(PF, wg, ext)
+    assert _diff(_state(wg), _state(wc)) == [] and _diff(_state(wg), _state(wp)) == []   # precondition: one world
+    pg =_pf(PF, wg, ext)
     pc = _pf(PF, wc, ext, fetch="cpupack", lanes=4)
     pp = _pf(PF, wp, ext, fetch="cpupack", lanes=16)
     pp.tp.npipe.set_plant_slot_shift(1)                      # NEGATIVE CONTROL: every take lands one lane up
@@ -484,7 +492,7 @@ def test_cpupack_equals_gpugather_bytes(CE, PF, ext, nopin, monkeypatch):
     assert rep["stats"]["cp_items"] == misses and int(rep["transport"]["groups"]) == misses
     assert multi                                             # precondition: two misses of one (layer, head) differ
     pp.tp.poll()                                             # precondition: the plant job ran without an error
-    assert _diff(_state(wp), ref0) != []                     # the plant changes the window
+    assert any(x.endswith("_k_gpu") for x in _diff(_state(wp), ref0))   # the plant changes the window's K
     for p in (pg, pc, pp):
         p.close()
 
