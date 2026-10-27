@@ -365,7 +365,8 @@ def test_F5_5_compile_witness():
     (kernel_unified_attention.ttgir:1524-1527 of fia4_k1a_2195573; the in-loop P alloc has an operand and is not a
     loop buffer): buffers 1x128x64xbf16 / 1x64x128xbf16 / 1x64xi32, largest depth 1; the programs-per-SM MODEL at 255
     registers, 4 warps, 59392 B gives 2 (the record's measured limit); a 2-deep copy gives depth 2; no handle -> None
-    and a REPORT that says so."""
+    and a REPORT that says so. The ncu latency witness: the long-scoreboard stall share is an optional metric, the
+    WarpStateStats section follows LaunchStats, and the summary and its text keep the value per arm."""
     MD = namedtuple("MD", "num_warps num_stages shared")
 
     class CK:
@@ -389,6 +390,15 @@ def test_F5_5_compile_witness():
     assert M.fv_compile_info(Bare) is None and M.fv_compile_info(object()) is None
     g, info = M.fv_compile_gate("FV", "2x4", Bare, None)
     assert info is None and not g["passed"] and not g["must"]
+    lsb = "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct"     # the ncu latency witness (optional)
+    assert lsb in M.NCU_OPTIONAL and "WarpStateStats" in M.NCU_SECTIONS and M.NCU_SECTIONS[0] == "LaunchStats"
+    row = {"id": 0, "name": "kernel_unified_attention", "tag": "FVW8S4T32B32", "gpu__time_duration.sum": 1000.0,
+           lsb: 41.234}
+    s = M.ncu_summary([row], ["FV", "FVW8S4T32B32"], ideal=1.0, union=1.0, rpr=4)
+    p = s["arms"]["FVW8S4T32B32"]
+    assert p["stall_lsb"] == [41.23] and p["expected_kernels"] == 1 == p["n_kernels"] and not s["stray"]
+    assert "long-scoreboard stall [41.23] % of active warps" in M.ncu_arm_text("FVW8S4T32B32", p)
+    assert s["arms"]["FV"]["stall_lsb"] == [] and "long-scoreboard" not in M.ncu_arm_text("FV", s["arms"]["FV"])
 
 
 # ------------------------------------------------------------------ F5_6 the fork under the interpreter

@@ -24,7 +24,8 @@ kernel_unified_attention.ttgir (num_warps 4, num_stages 3, shared 59392 B).
 
 - MEASURED: lines 1524-1527 allocate ONE buffer each for K (1x128x64), V (1x64x128) and the two page-id copies
   (1x64xi32). The page ids of tile j+2 are async copies (lines 1748-1763). The K / V copies of tile j+1 start after
-  both dots of tile j (lines 1734, 1743), and the same iteration waits for them (line 1766, num = 2).
+  both dots of tile j (lines 1734, 1743), and the same iteration waits for them (line 1766, num = 2). All 8 compiled
+  variants of the record have the same 1-deep loop buffers (8 x 1x128x64xbf16, 8 x 1x64x128xbf16, 16 x 1x64xi32).
 - MEASURED: three loads in the loop are synchronous `tt.load`: the page ids again in the MMA layout (line 1625), the
   bf16 CIS bias (line 1634; it feeds the QK dot's accumulator), and the scalar extents word of tile j+1 (line 1682),
   whose value masks the K / V copies (lines 1695-1696, 1729, 1738).
@@ -120,7 +121,11 @@ would race on the in-kernel union build, so it needs the torch build (FVT: 6.7-8
   MODEL of programs per SM. On the fia4 TTGIR the parser gives depth 1 and 2 programs per SM (F5_5), as measured.
 - R_FV_sweep_<cell> (REPORT): per configuration the event median, x of P, MUST, registers, local words, shared memory,
   depth; the best = the lowest event median among the swept arms whose MUST gates all pass.
-- ncu per cell: P, FV, FVT, FVN and the cell's best swept arm (5 arms, 6 kernels).
+- ncu per cell: P, FV, FVT, FVN and the cell's best swept arm (5 arms, 6 kernels). The ncu children also collect
+  the WarpStateStats section (warp stall reasons) into the raw CSV (ncu_<cell>_raw.csv), because SCORING_fia4.md
+  section 8 lists their absence. The R_ncu line prints one of them per arm: the long-scoreboard stall share of
+  active warps (smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct, an optional metric; it is in the ga100
+  metric list of the fia4 record). It is the direct witness of the latency claim: it should fall from fia4 to fia5.
 - R_DECISION5 (REPORT): PRED5's rule for FV and the best swept arm (below). R_DECISION4 (PRED4) still prints.
 
 ## 6. Registered prediction and the decision rule
@@ -185,7 +190,8 @@ Builder expectations (MODEL, NOT registered; for the lead's judgement only):
   upstream's, no bias mask, the new keywords, the handle, tags); F5_2 the sweep flag (names, defaults, refusals,
   parse_args, the ncu child's arms and argv, make_fv_arm); F5_3 every swept configuration runs the same gates
   (run_fv with a pure-torch fake of the fork; a planted missing gate fails COMPLETE; a failing first call is a REPORT
-  FINDING); F5_4 R_FV_sweep and R_DECISION5; F5_5 the compile witness on the fia4 TTGIR lines; F5_6 the fork under
+  FINDING); F5_4 R_FV_sweep and R_DECISION5; F5_5 the compile witness on the fia4 TTGIR lines and the ncu
+  long-scoreboard stall field; F5_6 the fork under
   TRITON_INTERPRET=1 (J1-J14: tile 32 and 16, the bf16 bias, FVN, the 3D path at tile 32, ragged requests, the two
   mutation controls, refusals, run_fv on swept arms with the real kernel); F5_7 PRED5 = this file's block; F5_8 / F5_9
   the step (static shape; DRYRUN, the full DRYRUN only on a clean checkout of this worktree).
@@ -234,8 +240,12 @@ Builder expectations (MODEL, NOT registered; for the lead's judgement only):
 ## 11. Shell commands the builder ran outside cat / grep / head / tail / ls / sort / cut / diff / git / wc
 
 - `date -u +%FT%TZ` (the stamp above).
-- Shell builtins and syntax: cd, echo, `;`, `&&`, variable assignments (T=..., F=...). Three assignments carried the
-  names awk_free, sed_unused and sed_never by mistake, as environment prefixes of a tail / head command or alone: no
-  awk or sed program ran.
-- No interpreter, no sed, no heredoc, no `cat >>`, no tr / paste / uniq / xargs, no hashing, no `find /`, no srun /
-  sbatch / pytest, no sleep. Files were written with the Write and Edit tools; the commit message with the Write tool.
+- Shell builtins and syntax: cd, echo, `;`, `&&`, variable assignments (T=..., F=...). Four assignments carried the
+  names awk_free, sed_unused, sed_never and sed_unused_never by mistake, as environment prefixes of a tail / head
+  command or alone: no awk or sed program ran.
+- `uniq -c` once, BY MISTAKE, at the end of a read-only pipeline over the fia4 record's TTGIR files (it counted the
+  loop buffer shapes of the 8 compiled variants: 8 x 1x128x64xbf16, 8 x 1x64x128xbf16, 16 x 1x64xi32, so every fia4
+  variant has one K / V buffer). This breaks the "no uniq" rule. The output was read only.
+- `printf` and a `for` loop over line numbers with head / tail (to print cited TTGIR lines).
+- No interpreter, no sed, no heredoc, no `cat >>`, no tr / paste / xargs, no hashing, no `find /`, no srun / sbatch /
+  pytest, no sleep. Files were written with the Write and Edit tools; the commit message with the Write tool.

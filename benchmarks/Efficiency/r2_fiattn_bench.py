@@ -153,6 +153,7 @@ variant. The FV arms pass the CIS bias as float32 (FV_BIAS_BITS; the same values
   FORK_LAST_LAUNCH): num_warps, num_stages, registers and local memory per thread (ptxas), shared memory, the shapes
   of the loop's multi-buffered shared allocations in the TTGIR (the leading dimension = the buffer depth) and a MODEL
   of programs per SM. R_DECISION5 scores PRED5 (the rule of PRED4) for the default FV and the best swept arm.
+  ncu also collects the WarpStateStats section (raw CSV) and prints each arm's long-scoreboard stall share.
 """
 from __future__ import annotations
 
@@ -227,10 +228,14 @@ NCU_OPTIONAL = ("lts__t_sector_hit_rate.pct",
                 "lts__t_sectors.avg.pct_of_peak_sustained_elapsed",
                 "dram__throughput.avg.pct_of_peak_sustained_elapsed", "sm__throughput.avg.pct_of_peak_sustained_elapsed",
                 "l1tex__t_bytes_pipe_lsu_mem_local_op_ld.sum", "l1tex__t_bytes_pipe_lsu_mem_local_op_st.sum",
-                "sm__warps_active.avg.pct_of_peak_sustained_active")     # [fia4] achieved occupancy
+                "sm__warps_active.avg.pct_of_peak_sustained_active",     # [fia4] achieved occupancy
+                # [fia5] the share of active warps waiting on a global load (long scoreboard): the latency witness
+                "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct")
 # [fia3] the LaunchStats section gives launch__registers_per_thread (a section always exists; a metric name may not
 # be listed by --query-metrics, and an unknown metric name stops ncu)
-NCU_SECTIONS = ("LaunchStats",)
+NCU_SECTIONS = ("LaunchStats",
+                "WarpStateStats")   # [fia5] the warp stall reasons (long / short scoreboard, barrier) in the raw CSV:
+                                    # SCORING_fia4.md section 8 lists their absence; REPORT only (not summarized)
 NCU_LAUNCH = ("launch__registers_per_thread", "launch__shared_mem_per_block_dynamic", "launch__grid_size",
               # [fia4] the occupancy limits and the static shared memory (the fia3 CSV has these LaunchStats columns)
               "launch__shared_mem_per_block_static", "launch__occupancy_limit_registers",
@@ -2885,7 +2890,8 @@ def ncu_summary(rows, arms, ideal, union, rpr):
     and the union bytes, the band (PRED dram_read_over_ideal), the reuse label."""
     per = {a: dict(read=0.0, write=0.0, time_ns=0.0, kernels=[], label=REUSE_LABEL.get(a) or (    # [fia5] swept
         "as FV, launch %s" % fv_sweep_launch(a) if fv_sweep_launch(a) else ""), l2sm_sectors=None,
-                   regs=[], local_bytes=None, occ=[], smem=[], limits=[]) for a in arms}     # [fia4] occ, smem, limits
+                   regs=[], local_bytes=None, occ=[], smem=[], limits=[],                    # [fia4] occ, smem, limits
+                   stall_lsb=[]) for a in arms}                                              # [fia5] long scoreboard
     stray = []
     for r in rows:
         if r["tag"] not in per or not any(k in r["name"] for k in ATTN_KERNELS):
@@ -2908,6 +2914,9 @@ def ncu_summary(rows, arms, ideal, union, rpr):
         occ = r.get("sm__warps_active.avg.pct_of_peak_sustained_active")               # [fia4] achieved occupancy
         if occ is not None:
             p["occ"].append(round(occ, 2))
+        lsb = r.get("smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct")    # [fia5]
+        if lsb is not None:
+            p["stall_lsb"].append(round(lsb, 2))
         sm = [r.get(m) for m in ("launch__shared_mem_per_block_dynamic", "launch__shared_mem_per_block_static")
               if r.get(m) is not None]
         if sm:
@@ -3743,6 +3752,8 @@ def ncu_arm_text(x, p):
         txt += "; local memory %.3g B%s" % (p["local_bytes"], " (SPILLS)" if p["local_bytes"] > 0 else "")
     if p.get("occ"):                                                        # [fia4]
         txt += "; achieved occupancy %s %%" % p["occ"]
+    if p.get("stall_lsb"):                                                  # [fia5]
+        txt += "; long-scoreboard stall %s %% of active warps" % p["stall_lsb"]
     if p.get("smem"):
         txt += "; shared memory per block %s B" % sorted(set(p["smem"]))
     if p.get("limits"):
