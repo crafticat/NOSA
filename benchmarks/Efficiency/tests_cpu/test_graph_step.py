@@ -741,9 +741,16 @@ def test_GS4_graph_safe_step_equals_shipped(W, S, pool):
             assert getattr(a, n) == getattr(b, n), n
         for n in ("seq_length", "_tail_block_len_on_gpu", "_pool_stamp_base"):
             assert getattr(a.cache_engine, n) == getattr(b.cache_engine, n), n
+        # FIX 2 (CPU job gs_f6de8be_a): the stamp moves on the pool path only (cache_engine.py:511). The documented
+        # mapping, checked on BOTH engines: stamp0 + 64 x steps with the pool, stamp0 without it.
+        want = res["host0"]["stamp0"] + (GS.TOPK * steps if pool else 0)
+        assert a.cache_engine._pool_stamp_base == b.cache_engine._pool_stamp_base == want
         assert torch.equal(a.compress_k_cache_varlen, b.compress_k_cache_varlen)
         if pool:
             assert torch.equal(a.cache_engine._pool_age, b.cache_engine._pool_age)
+        else:                                                     # no pool: no ages anywhere, nothing to shift
+            assert gs.ages is None and not hasattr(a.cache_engine, "_pool_age")
+            assert not hasattr(b.cache_engine, "_pool_age")
     assert res["c_sh"]._seen_tokens == res["c_tw"]._seen_tokens
     assert end["seq"] == S + steps
 

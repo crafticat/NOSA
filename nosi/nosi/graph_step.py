@@ -87,6 +87,8 @@ def plan_steps(S, n0, m0, tail0, tl0, cis0, steps, stamp0=0):
     """The host values the SHIPPED step would use at each of `steps` decode steps after the state (S, n0, m0, tail0,
     tl0, cis0, stamp0). Pure. Returns (rows, end): rows[t] a dict (t, seq, kc, n_col, m, cis_col, tl_col, cc, tail_pos,
     bias_col, tf, wb_row, stamp, out_len, width, m_frozen, rewarm, key); end the counters after the last step.
+    `stamp` is the shipped LRU stamp of the POOL path (cache_engine.py:507, :511); at P = 0 the shipped stamp never
+    moves, and export() leaves it alone.
     Sources: update_no_compress_k_decode cache_engine.py:681-692, update_compress_k_decode :663-670,
     update_uncompressed_cis :780-781, update_cis :752-762, decode_update_has_kv_bias_pool :450-464 and :523-531, the
     shipped re-warm rule r2_base_cell.warm_state / rewarm_need (sustained_core.py:217-235)."""
@@ -456,7 +458,11 @@ class GraphStep:
                 L.cis_len = end["cis"]
                 L.tail_cis_len = end["tl"]
                 e._tail_block_len_on_gpu = end["tail"]
-                e._pool_stamp_base = end["stamp"]
+                if self.pool:
+                    # FIX 2: the shipped step moves the stamp on the POOL path only (cache_engine.py:511, inside
+                    # decode_update_has_kv_bias_pool, bound at :173 when P > 0). At P = 0 the bound method is
+                    # decode_update_has_kv_bias (:175), which never touches it: it stays at its value (:140).
+                    e._pool_stamp_base = end["stamp"]
                 L.compress_k_cache_varlen = self.ck[l][:, :end["m"]].contiguous()
         if hasattr(self.cache, "_seen_tokens"):
             self.cache._seen_tokens += self.H * done   # InfLLMv2Cache.decode_update_kv adds key_states.shape[-2]

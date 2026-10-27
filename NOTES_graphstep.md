@@ -245,3 +245,28 @@ same world.
 
 Commands of this pass outside cat / grep / head / tail / ls / sort / cut / diff / git / wc: none (shell builtin `cd`
 only). No sed.
+
+## 11. FIX 2 (CPU job gs_f6de8be_a: 18 passed, 2 skipped, 2 failed at f6de8be)
+
+Log: `/mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/gs_f6de8be_a.txt`. GS4 [6128-0] and [6136-0] (pool OFF) failed at the
+host-counter check after `export()`: `assert 0 == 6400` for `_pool_stamp_base`. The left side is the SHIPPED engine
+(`a` = `c_sh`): shipped 0, graph step 6400.
+
+ROOT CAUSE: a defect of `GraphStep.export()` (graph_step.py), not of the comparison. The shipped engine moves the stamp
+on the POOL path only: `self._pool_stamp_base += self.topk` sits in `decode_update_has_kv_bias_pool`
+(cache_engine.py:511), which is bound only when P > 0 (:173). At P = 0 the bound method is `decode_update_has_kv_bias`
+(:175); it never touches the stamp, so the stamp stays at its value from `__init__` (:140), 0. `export()` wrote
+`plan_steps`' end stamp (stamp0 + 64 x steps) at every P. The pool-on cases pass because there both sides move by 64
+per step (shipped :511; graph step: `export()` writes the planned end stamp, while the ages carry the constant-stamp
+frame and `shift_out` maps them back). There is no representation mapping on the stamp itself: `export()` must write
+the shipped value. So the exported host state was wrong at P = 0, and a shipped eager step continuing on that cache
+would have held a stamp that the shipped engine never has.
+
+FIX: `export()` writes the stamp only when the pool is on (the same condition as the shipped binding). The test keeps
+the strict equality of every counter and now also checks the documented mapping on both engines: stamp0 + 64 x steps
+with the pool, stamp0 without it; at P = 0 there are no ages (`gs.ages is None`, no `_pool_age` on either engine:
+cache_engine.py:240 creates it inside the pool branch only). `plan_steps`' docstring says that its `stamp` column is
+the pool path's.
+
+Commands of this pass outside cat / grep / head / tail / ls / sort / cut / diff / git / wc: none (shell builtin `cd`
+only). No sed.
