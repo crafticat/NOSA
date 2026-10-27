@@ -33,7 +33,10 @@ MEASURED per speculative arm (CUDA events; one host sync per round, after the ro
   draft                skipped slots per (layer, KV head, request) per draft call; redirected slots; the rollback
                        journal counters (destroyed, saved, overflow, overflow_dead, redirected); truncations.
 MUST GATES: SH-RUN; per arm <arm>-RUN, <arm>-ERR (no body refusal bit, no twin overflow flag), <arm>-COMMIT (every
-request committed at least one token per round, and the per-round sums add up to the committed total).
+request committed at least one token per round, and the per-round sums add up to the committed total); per EXACT arm
+(L3, L4X) <arm>-TOK (every checked committed token bitwise SH's, at least one checked) and <arm>-FP (every checked
+committed row's logits fingerprint bitwise SH's). sp3b at 6de1cfd had no token gate: its EXACT arms lost SH's tokens
+and the cell reported 0 failed MUST gates (SCORING_sp3b.md).
 REGISTERED PREDICTIONS PRED_SPEC: TBD by the lead (a None value gives REPORT).
 EXIT: the number of failed MUST gates (0-19); 20 refused; 30 an exception outside an arm.
 """
@@ -266,8 +269,28 @@ def verdicts_spec(sh, sp, B: int):
     return out
 
 
-def arm_gates(arm, res):
-    """The MUST gates of one speculative arm's result: [(name, must, passed, detail)]."""
+def tok_gates(arm, rec):
+    """The token MUST gates of an EXACT arm (EXACT_ARMS; SCORING_sp3b.md: sp3b's L3 / L4X lost SH's tokens from column 1
+    and the cell still reported 0 failed MUST gates). <arm>-TOK: at least one token checked and every checked committed
+    token bitwise SH's; <arm>-FP: every checked committed row's logits fingerprint bitwise SH's. rec: summarize()'s
+    record, or None (the check did not run: both FAIL). A FAST arm has none: [(name, must, passed, detail)]."""
+    if arm not in EXACT_ARMS:
+        return []
+    if rec is None:
+        return [("%s-TOK" % arm, True, False, "no token check (no record)"),
+                ("%s-FP" % arm, True, False, "no fingerprint check (no record)")]
+    tc, fc = rec["tokens"], rec["fingerprints"]
+    return [("%s-TOK" % arm, True, tc["n_checked"] > 0 and tc["n_unequal"] == 0,
+             "committed tokens bitwise SH's: %d of %d unequal (first %s; min checked per request %d)" % (
+                 tc["n_unequal"], tc["n_checked"], tc["first"], tc["min_checked"])),
+            ("%s-FP" % arm, True, fc["n_checked"] > 0 and fc["n_unequal"] == 0,
+             "logits fingerprints bitwise SH's: %d of %d unequal (first %s)" % (fc["n_unequal"], fc["n_checked"],
+                                                                               fc["first"]))]
+
+
+def arm_gates(arm, res, rec=None):
+    """The MUST gates of one speculative arm's result: [(name, must, passed, detail)]; an EXACT arm's token gates
+    (tok_gates) from summarize()'s record rec."""
     rd = res["read"]
     g = []
     body_err, overflow = rd["errors"]
@@ -279,7 +302,7 @@ def arm_gates(arm, res):
     g.append(("%s-COMMIT" % arm, True, ok, "%d warm step(s) + %d rounds; committed per request min %d max %d; warm %d "
               "+ per-round sum %d, total %d" % (rd["warm"], rd["rounds"], min(cnt), max(cnt), warm,
                                                 sum(rd["round_committed"]), sum(cnt))))
-    return g
+    return g + tok_gates(arm, rec)
 
 
 def summarize(arm, res, inputs, fp_sh, sh, B: int, steps: int, dims):
@@ -444,7 +467,7 @@ def main(argv=None) -> int:
                 rec.update(gpu_peak_alloc_GB=pa, gpu_peak_reserved_GB=pr, opt=opt)
                 sp[arm] = rec
                 gates.append(("%s-RUN" % arm, True, True, "%d rounds of K %d" % (res["read"]["rounds"], a.spec)))
-                gates.extend(arm_gates(arm, res))
+                gates.extend(arm_gates(arm, res, rec))
                 del res
             except Exception as e:
                 traceback.print_exc()

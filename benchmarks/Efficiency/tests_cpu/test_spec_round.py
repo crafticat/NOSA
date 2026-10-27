@@ -14,6 +14,9 @@ TOKENS   test_spec_tokens_equal_shipped_greedy (L3 / L4 EXACT, B 1 / B 8): every
          SHIPPED greedy decode (Llama.decode_inference, re-warmed), and every committed row's logits are the shipped
          step's, bitwise; after every round the residency invariants and the host rows hold. Preconditions: rejects and
          full accepts, a block edge, skipped host loads, pool moves, (B 8) ragged positions.
+OVERFLOW test_tiny_journal_equals_shipped (L3 / L4 EXACT, B 8; the GPU cell sp3b): the same claims with a journal of
+         1 slot per layer and step, and the residency right after every reject_all. Preconditions: overflow, and a pool
+         slot that a MOVE_IN emptied and a later step of the group overwrote by a MOVE_OUT, unsaved.
 REJECT   test_reject_keeps_accepted_prefix_and_correction (L3 / L4, B 8): a reject commits the accepted drafts and the
          target's correction (m = n + 1). Negative controls commit_draft_at_reject and keep_rejected: CAUGHT.
 FULL     test_full_accept_no_bonus_token (L3 / L4, B 8): a full accept commits exactly K tokens, the drafts. Negative
@@ -190,6 +193,41 @@ def test_spec_tokens_equal_shipped_greedy(level, B):
     rd = ev["rd"]
     assert rd["errors"] == (0, [0] * L), rd["errors"]
     assert sum(rd["journal"]["overflow"]) == 0
+
+
+# ------------------------------------------------------------------ OVERFLOW (GPU cell sp3b at 6de1cfd)
+# sp3b (C 73, B 318): the journal saturated (16.7 - 30.4 M live slots past N = 256 went to the host fallback) and the
+# EXACT arms L3 / L4X lost the shipped tokens from column 1 on; sp3m (C 128, B 8, overflow 0) was bitwise. This world
+# has the same regime with a journal of CAP_TINY slots: almost every lost slot of a step is past N.
+CAP_TINY = 1
+
+
+@functools.lru_cache(maxsize=None)
+def _ev_tiny(level, B, rb_neg):
+    """run_vs_shipped with a journal of CAP_TINY slots, the periodic FILTER, and spec_world.watch_reuse (the sp3b
+    pattern in every group before its undo; the residency right after every reject_all)."""
+    box = {}
+    ev = SW.run_vs_shipped(B, level=level, mode="exact", gemm="rowgroup", draft_filter=FILTER, rb_neg=rb_neg,
+                           journal=CAP_TINY, on_runner=lambda r: SW.watch_reuse(r, box),
+                           max_rounds=(12 if rb_neg is not None else 0))
+    ev["reuse"] = box
+    return ev
+
+
+@pytest.mark.parametrize("level", ["L3", "L4"])
+def test_tiny_journal_equals_shipped(level):
+    """THE sp3b DIVERGENCE ON CPU. EXACT rounds with a saturated journal: the committed tokens and logits rows are the
+    shipped greedy decode's, the residency holds after every reject_all and every round, the host rows hold.
+    Preconditions (L34): the journal overflows (live and dead slots past N), and some group has a pool slot that a
+    MOVE_IN emptied and a later step's MOVE_OUT overwrote, unsaved (spec_world.move_in_reuse)."""
+    ev = _ev_tiny(level, 8, None)
+    st, f, ru = ev["rd"]["journal"], ev["facts"], ev["reuse"]
+    assert sum(st["overflow"]) > 0 and sum(st["overflow_dead"]) > 0, st
+    assert ru.get("unsaved", 0) > 0, (ru, f)
+    assert f["rejects"] > 0 and f["skipped"] > 0 and f["min_count"] >= N, f
+    got = (ev["reuse"].get("resid_reject", [])[:2], ev["resid"][:2], ev["bad_tokens"][:5], ev["bad_logits"][:5],
+           ev["host"][:2])
+    assert got == ([], [], [], [], []), got
 
 
 # ------------------------------------------------------------------ REJECT
@@ -538,10 +576,28 @@ def test_cell_arguments_and_verdicts(monkeypatch):
                  "L4F-AGREE": "CONFIRMED", "L4F-RATIO": "CONFIRMED", "SP-ACCEPT": "CONFIRMED",
                  "L4F-VS-L3": "REFUTED"}, v
     rd = dict(errors=(0, [0, 0]), count=[10, 13], warm=1, rounds=4, round_committed=[5, 6, 5, 5])
-    gates = {n: ok for n, _, ok, _ in SC.arm_gates("L3", dict(read=rd))}
-    assert gates == {"L3-ERR": True, "L3-COMMIT": True}, gates
+    rec = dict(tokens=dict(spr["tokens"], min_checked=10), fingerprints=dict(spr["fingerprints"], first=None))
+
+    def gates_of(arm, r=rec):
+        out = SC.arm_gates(arm, dict(read=rd), r)
+        assert all(must for _, must, _, _ in out), out                # every gate of an arm is a MUST gate
+        return {n: ok for n, _, ok, _ in out}
+    assert gates_of("L3") == {"L3-ERR": True, "L3-COMMIT": True, "L3-TOK": True, "L3-FP": True}
+    assert gates_of("L4X") == {"L4X-ERR": True, "L4X-COMMIT": True, "L4X-TOK": True, "L4X-FP": True}
+    assert gates_of("L4F") == {"L4F-ERR": True, "L4F-COMMIT": True}   # FAST: no token gate (not bitwise by design)
+    # THE TOKEN GATES FAIL THE CELL (sp3b at 6de1cfd: 122,604 unequal tokens and 0 failed MUST gates)
+    one_tok = dict(rec, tokens=dict(rec["tokens"], n_unequal=1, first=(124, 1)))
+    assert gates_of("L3", one_tok) == {"L3-ERR": True, "L3-COMMIT": True, "L3-TOK": False, "L3-FP": True}
+    one_fp = dict(rec, fingerprints=dict(rec["fingerprints"], n_unequal=1, first=(1, 1)))
+    assert gates_of("L4X", one_fp)["L4X-FP"] is False and gates_of("L4X", one_fp)["L4X-TOK"] is True
+    none_checked = dict(tokens=dict(rec["tokens"], n_checked=0), fingerprints=dict(rec["fingerprints"], n_checked=0))
+    assert gates_of("L3", none_checked)["L3-TOK"] is False and gates_of("L3", none_checked)["L3-FP"] is False
+    assert gates_of("L3", None)["L3-TOK"] is False and gates_of("L4X", None)["L4X-FP"] is False
+    assert gates_of("L4F", None) == {"L4F-ERR": True, "L4F-COMMIT": True}
     rd["round_committed"] = [5, 6, 5, 4]
-    assert {n: ok for n, _, ok, _ in SC.arm_gates("L3", dict(read=rd))}["L3-COMMIT"] is False
+    assert gates_of("L3")["L3-COMMIT"] is False
+    src = (EFF / "r2_spec_cell.py").read_text()
+    assert "gates.extend(arm_gates(arm, res, rec))" in src                 # main passes the record to the gates
 
 
 def _step(cell, sha="0" * 40):
@@ -563,7 +619,7 @@ def _clean_head():
 
 
 def test_step_script_sp3():
-    for bad in ("sp3c", "mb1", "rb1"):
+    for bad in ("sp3c", "mb1", "rb1", "rg1f", "rb74"):
         r = _step(bad)
         assert r.returncode == 1 and "cell '%s'" % bad in r.stderr, (bad, r.returncode, r.stderr[-300:])
     sha = _clean_head()
@@ -582,3 +638,21 @@ def test_step_script_sp3():
                      "--spec-arms L3", "L4X", "L4F", "--spec-prefetch off", "--spec-twin fused --spec-body fused",
                      "--mem=%s" % mem, "--time=%d" % smin, "sp_t1_%s_%s" % (HOLDER, cell), "r2_spec_cell.py"):
             assert want in r.stdout, (cell, want)
+    # THE DISCRIMINATING CELLS of the sp3b divergence: r2_base_cell.py at sp3b's C 73 B 318, fused twin, no speculation
+    eng = "--ragged-twin fused --ragged-body fused --ragged-gemm natural --ragged-graph on"
+    for cell, desc, args in (
+            ("rg73", "arms SH+RG+RGS steps 512 twin fused (no speculation)",
+             ("--arms SH --ragged --ragged-spread 64 " + eng,)),
+            ("rb73", "arms SH+RBR+RBS steps 512 K 3 groups 128 journal 256 twin fused (no draft)",
+             ("--arms SH --rollback --rb-k 3 --rb-groups 128 --rb-seed 0 --rb-journal-blocks 256 " + eng,))):
+        r = _step(cell, sha)
+        if r.returncode != 0:
+            pytest.skip("DRYRUN stopped on a pin outside the cell stage: %s" % r.stderr.strip()[-200:])
+        line = ("cell %s: C 73 (pool 10) B 318 %s STEP_MIN 90 mem 340G claim /mnt/beegfs/ojerbi/r2-runs/spec/"
+                "sp_active_%s" % (cell, desc, HOLDER))
+        assert line in r.stdout, (cell, r.stdout[-600:])
+        for want in ("NOSI_POOL_BLOCKS=10", "--pool 10", "--batch 318", "--steps 512", "--warmup 2", "--mem=340G",
+                     "--time=90", "sp_t1_%s_%s" % (HOLDER, cell), "benchmarks/Efficiency/r2_base_cell.py") + args:
+            assert want in r.stdout, (cell, want)
+        for no in ("--spec", "r2_spec_cell.py", "--mbase"):
+            assert no not in r.stdout, (cell, no)
