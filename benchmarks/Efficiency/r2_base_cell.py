@@ -54,6 +54,20 @@ B 219, basef 2190876). --mbase selects the registered mbase predictions (verdict
   MB-F     at C 63 with the R2 arm: R2 (fused) / SH steady inside (0.95, 1.00);
   MB-R2C   REPORT (a MODEL, not a measurement): SH steady x MBASE_FUSED_FACTOR, the fused step this C would have.
 The cell also reports the device memory in use (cudaMemGetInfo) at the end of the SH arm, beside the allocator peak.
+
+r2-mbstrong (docs/NOTES_mbstrong.md; every flag default off; the SH arm only, --arms SH):
+  --recap-nogc  each SH re-warm runs ONE release (synchronize, gc.collect, empty_cache) and then captures its 32
+                pooling + top-k graphs with r2_recap_nogc.GraphNoRelease (torch.cuda.graph without its release on
+                entry). The engine files are not edited. MUST gate RN-GC: 1 gc.collect call and 32 GraphNoRelease
+                contexts per re-warm.
+  --ab-record   the A/B record ab_record.pt: every token, the logits digest of every re-warm step and of the last step.
+                A plain run (no --recap-nogc) reports RN-GC (32 gc.collect calls per re-warm, the shipped contexts).
+  --ab-ref DIR  DIR is the other half of the A/B pair (the same C, B, run and holder; the other mode). MUST gate RN-EQ.
+  --fit-probe   an out-of-memory SH arm is a REPORT: SH-RUN is then not a MUST gate.
+  With --recap-nogc or --ab-record the SH arm runs run_shipped_ab (the lines of run_shipped plus the instrument);
+  without them it runs run_shipped. The batch arithmetic: fit_batch (the prefill-peak model mbase_peak_model and the
+  int32 envelope of cache_engine.py:216-221). The registered predictions PRED_MBS (TBD by the lead) print UNREGISTERED
+  until the lead stamps them.
 """
 from __future__ import annotations
 
@@ -91,6 +105,21 @@ MBASE_REF = dict(C=128, B=216, eager_median_ms=68.336639, tok_s=3160.822684, gai
 PRED_MBASE = {(128, 216): (68.0, 64.92, 70.39), (113, 240): (74.5, 68.0, 81.0), (96, 280): (85.6, 78.0, 94.0),
               (79, 328): (106.0, 92.0, 118.0), (63, 344): (180.6, 174.5, 185.3)}
 MBASE_F_BAND = (0.95, 1.00)
+# r2-mbstrong: the batch arithmetic (fit_batch) and the registered predictions PRED_MBS.
+INT32 = 2 ** 31
+KV_HEADS, HEAD_DIM, BLOCK = 2, 128, 64              # NOSA-8B (config.json); block = topk block (nosa_llama.py:680)
+MBS_BUDGET_GB = dict(matched=82.04, edge=84.0)      # matched: mb1's measured peak (2175791, dr1); edge: the 84 GB budget
+# REGISTERED predictions: TBD. The lead writes every value and the stamp (`date -u` in the same command, L33) in a
+# commit before the run. A None value prints UNREGISTERED. Forms: a band (low, high); a dict of bands keyed "C" or
+# "C_B"; mx_fits a dict "C_B" -> True (fits) / False (out of memory).
+PRED_MBS = dict(stamp=None,
+                rn_steady_ratio=None,       # --recap-nogc / plain SH steady median, every A/B pair
+                rn_eff_ratio=None,          # {"C": band}: --recap-nogc / plain effective tok/s
+                rn_rewarm_later_ms=None,    # median of the later re-warm periods (ms) under --recap-nogc
+                rn_rewarm_first_ms=None,    # the first re-warm period (ms) under --recap-nogc (the JIT included)
+                mx_steady_tok_s=None,       # {"C_B": band}: SH steady tok/s of each sub-cell
+                mx_peak_ratio=None,         # band: SH peak allocated / mbase_peak_model(C, B)
+                mx_fits=None)               # {"C_B": bool}: the fit probes
 
 
 def log(msg):
@@ -112,6 +141,11 @@ def parse_args(argv):
     ap.add_argument("--pool", type=int, default=0,
                     help="the victim pool P (C = 63 + P); must equal NOSI_POOL_BLOCKS; P > 0 needs --arms SH")
     ap.add_argument("--mbase", action="store_true", help="the registered mbase predictions (verdicts_mbase)")
+    ap.add_argument("--recap-nogc", action="store_true",
+                    help="r2-mbstrong: one release per SH re-warm, captures without the per-context release")
+    ap.add_argument("--ab-record", action="store_true", help="r2-mbstrong: write the A/B record ab_record.pt")
+    ap.add_argument("--ab-ref", default=None, help="r2-mbstrong: the other half of the A/B pair (MUST gate RN-EQ)")
+    ap.add_argument("--fit-probe", action="store_true", help="r2-mbstrong: an out-of-memory SH arm is a REPORT")
     a = ap.parse_args(argv)
     a.arms = [x for x in a.arms.split(",") if x]
     if a.arms not in (["SH", "R2"], ["SH"]):
@@ -124,6 +158,10 @@ def parse_args(argv):
         ap.error("--pool > 0 needs --arms SH (the R2 decode body has no victim pool)")
     if a.batch < 1 or not 1 <= a.warmup < a.steps or a.steps > 1000:
         ap.error("--batch >= 1, --warmup in 1 .. steps - 1, --steps <= 1000 (the shipped total_cis holds S + 1024)")
+    if (a.recap_nogc or a.ab_record or a.fit_probe) and a.arms != ["SH"]:
+        ap.error("--recap-nogc, --ab-record and --fit-probe need --arms SH")
+    if a.ab_ref is not None and not a.ab_record:
+        ap.error("--ab-ref needs --ab-record (RN-EQ compares two records)")
     return a
 
 
@@ -315,6 +353,96 @@ def verdicts_mbase(C: int, B: int, sh, r2):
     return out
 
 
+# ------------------------------------------------------------------ r2-mbstrong pure parts (CPU-tested)
+def int32_batch_limit(S: int, steps: int, C: int) -> int:
+    """The largest B that the int32 envelope of the pooled engine accepts (cache_engine.py:216-221, asserted when
+    P > 0): host side B x (S + max_gen_len) x H x D < 2^31, max_gen_len = steps + 64 (run_shipped); GPU side
+    B x (topk + P) x block x H x D < 2^31, topk + P = C + 1 (C = 63 + P). At P = 0 the engine does not assert, and the
+    gathers widen their program ids (flash_h2d_mask.py:23-27); the limit is applied there too (it does not bind below
+    B 502 at S 16128, 512 steps)."""
+    hd = KV_HEADS * HEAD_DIM
+    host = (INT32 - 1) // ((int(S) + int(steps) + 64) * hd)
+    gpu = (INT32 - 1) // ((int(C) + 1) * BLOCK * hd)
+    return min(host, gpu)
+
+
+def fit_batch(C: int, budget_GB: float, S: int = S0, steps: int = 512) -> int:
+    """The largest B whose prefill-peak model mbase_peak_model(C, B) is <= budget_GB, capped by int32_batch_limit.
+    The model is fitted at S 16128 only (2175791), so another S is refused."""
+    if int(S) != S0:
+        raise ValueError("fit_batch: the peak model holds at S %d only (got %d)" % (S0, S))
+    p = MBASE_PEAK
+    slope = p["slope_c63_GB"] + (int(C) - C_BASE) * p["slope_per_block_GB"]
+    B = max(0, int((budget_GB - p["intercept_GB"]) / slope))
+    while B > 0 and mbase_peak_model(C, B) > budget_GB:
+        B -= 1
+    while mbase_peak_model(C, B + 1) <= budget_GB:
+        B += 1
+    return min(B, int32_batch_limit(S, steps, C))
+
+
+def rewarm_stats(periods, rewarms) -> dict:
+    """The re-warm (re-capture) periods: the first (it holds the one-time JIT work), the later ones, the sum."""
+    xs = [float(periods[t]) for t, _ in rewarms]
+    later = xs[1:]
+    return dict(n=len(xs), first_ms=round(xs[0], 1) if xs else None,
+                later_median_ms=round(statistics.median(later), 1) if later else None,
+                later_mean_ms=round(statistics.fmean(later), 1) if later else None, sum_ms=round(sum(xs), 1))
+
+
+def effective_excl_first(B: int, periods, rewarms):
+    """REPORT: effective tok/s without step 0 when step 0 is the first re-warm (its one-time JIT work)."""
+    if not rewarms or rewarms[0][0] != 0 or len(periods) < 2:
+        return None
+    return round(1e3 * B * (len(periods) - 1) / float(sum(periods[1:])), 1)
+
+
+def is_oom(e) -> bool:
+    """An out-of-memory exception: the caching allocator's (torch.cuda.OutOfMemoryError) or a CUDA driver error."""
+    return type(e).__name__ == "OutOfMemoryError" or "out of memory" in str(e).lower()
+
+
+def _pred(name, val, band, what):
+    if val is None:
+        return (name, "NOT_RUN", what + ": no value")
+    if band is None:
+        return (name, "UNREGISTERED", "%s %.4f" % (what, val))
+    lo, hi = band
+    return (name, "CONFIRMED" if lo <= val <= hi else "REFUTED", "%s %.4f (band [%s, %s])" % (what, val, lo, hi))
+
+
+def mbs_verdicts(C: int, B: int, sh, nogc: bool, ref_sh, fit, pred=None):
+    """The PRED_MBS predictions of one sub-cell: RN-* (the A/B pair: ref_sh is the other half's SH summary; the
+    ratios are --recap-nogc / plain), RN-RW-* (--recap-nogc re-warm periods), MX-* (steady tok/s, peak / model, fit)."""
+    pred = PRED_MBS if pred is None else pred
+    key = "%d_%d" % (C, B)
+    out = []
+    pick = lambda d, k: None if d is None else d.get(k)   # noqa: E731
+    if fit is not None:
+        want = pick(pred["mx_fits"], key)
+        v = "UNREGISTERED" if want is None else ("CONFIRMED" if want == (fit == "fits") else "REFUTED")
+        out.append(("MX-FIT", v, "C %d B %d: %s (registered %s)" % (C, B, fit, want)))
+    if sh is None or not sh["rates"]["steady_step_ms"]:
+        return out
+    out.append(_pred("MX-TOK", sh["rates"]["steady_tok_s"], pick(pred["mx_steady_tok_s"], key),
+                     "SH steady tok/s at C %d B %d" % (C, B)))
+    out.append(_pred("MX-PEAK", sh["gpu_peak_alloc_GB"] / mbase_peak_model(C, B), pred["mx_peak_ratio"],
+                     "SH peak allocated / model at C %d B %d" % (C, B)))
+    rs = sh.get("rewarm_stats") or {}
+    if nogc:
+        out.append(_pred("RN-RW-LATER", rs.get("later_median_ms"), pred["rn_rewarm_later_ms"],
+                         "--recap-nogc later re-warm median ms"))
+        out.append(_pred("RN-RW-FIRST", rs.get("first_ms"), pred["rn_rewarm_first_ms"],
+                         "--recap-nogc first re-warm ms"))
+    if ref_sh is not None and ref_sh["rates"]["steady_step_ms"]:
+        x, y = (sh, ref_sh) if nogc else (ref_sh, sh)            # x: --recap-nogc, y: plain
+        out.append(_pred("RN-STEADY", x["rates"]["steady_step_ms"] / y["rates"]["steady_step_ms"],
+                         pred["rn_steady_ratio"], "--recap-nogc / plain SH steady median"))
+        out.append(_pred("RN-EFF", x["rates"]["effective_tok_s"] / y["rates"]["effective_tok_s"],
+                         pick(pred["rn_eff_ratio"], str(C)), "--recap-nogc / plain effective tok/s at C %d" % C))
+    return out
+
+
 class CudaClock:
     def event(self):
         import torch
@@ -433,6 +561,64 @@ def run_shipped(model, ids, steps: int, clock):
                 device_used_end_GB=round((tot - fr) / 1e9, 3))
 
 
+def run_shipped_ab(model, ids, steps: int, clock, ab):
+    """r2-mbstrong (--recap-nogc / --ab-record): run_shipped with the instrument ab (r2_recap_nogc.ABRecorder). The
+    prefill lines are the lines of run_shipped; the decode loop is shipped_loop_ab. Without the flags main calls
+    run_shipped. The CPU test MBS1 checks both by AST against run_shipped."""
+    import torch
+    from nosi.cache_engine import InfLLMv2Cache
+    cfg = model.config
+    cache = InfLLMv2Cache(config=cfg, num_hidden_layers=cfg.num_hidden_layers, has_kv_bias=True)
+    for layer in cache.layers:
+        layer.cache_engine.max_gen_len = steps + 64
+    Bn = ids.shape[0]
+    clock.sync()
+    t0 = time.time()
+    logits, pos = model.batch_prefill(ids, cache)
+    clock.sync()
+    prefill_s = time.time() - t0
+    tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    del logits
+    pos = pos[:, -1:] + 1
+    out = shipped_loop_ab(model, cache, tok, pos, Bn, steps, clock, ab, "cuda")
+    fr, tot = torch.cuda.mem_get_info()                  # REPORT: device memory in use (context + reserved) at the end
+    del cache
+    out.update(prefill_s=round(prefill_s, 1), device_used_end_GB=round((tot - fr) / 1e9, 3))
+    return out
+
+
+def shipped_loop_ab(model, cache, tok, pos, Bn: int, steps: int, clock, ab, device):
+    """The decode loop of run_shipped (the same statements in the same order) with three additions, all through ab:
+    `with ab.step(t, need):` around the decode call, `ab.after(t, need, lg)` after it, `ab.finish(lg)` after the timed
+    loop. device: "cuda" (run_shipped_ab) or "cpu" (the CPU test)."""
+    import torch
+    cu = torch.arange(0, Bn + 1, dtype=torch.int, device=device)
+    inputs = torch.empty((Bn, steps + 1), dtype=torch.int64, device=device)
+    inputs[:, 0:1].copy_(tok)
+    model.has_buffers = False
+    warm, rewarms = None, []
+    ev = [clock.event() for _ in range(steps + 1)]
+    for t in range(steps):
+        l0 = cache.layers[0]
+        need, why = rewarm_need(cache.get_seq_length(0), l0.no_compress_k_len, l0.cached_compressed_max_seqlen, warm)
+        if need:
+            warm = warm_state(cache.get_seq_length(0), l0.no_compress_k_len, l0.cached_compressed_max_seqlen)
+            rewarms.append((t, why))
+            model.has_buffers = False
+        clock.record(ev[t])
+        with ab.step(t, need):
+            lg = model.decode_inference(tok, cu, pos, cache)
+        ab.after(t, need, lg)
+        tok = lg[:, -1, :].argmax(dim=-1, keepdim=True)
+        inputs[:, t + 1:t + 2].copy_(tok)
+        pos = pos + 1
+    clock.record(ev[steps])
+    clock.sync()
+    periods = [clock.elapsed(ev[t], ev[t + 1]) for t in range(steps)]
+    ab.finish(lg)
+    return dict(inputs=inputs, periods=periods, rewarms=rewarms, ab=ab.result())
+
+
 def run_r2(model, ids, inputs, steps: int, warmup: int, clock, mode: str = "built"):
     import torch
     from nosi import r2_capture as RC
@@ -512,6 +698,17 @@ def main(argv=None) -> int:
         print("REFUSED: needs NOSI_ATTN_SPLITS > 0 and NOSI_POOL_BLOCKS == --pool (%d; the knob is %d)" % (
             a.pool, CEN.POOL_BLOCKS), file=sys.stderr)
         return 20
+    ab_on = a.recap_nogc or a.ab_record                   # r2-mbstrong (flag off: both False)
+    mbs_on = ab_on or a.fit_probe
+    contract, ab_ref, ab_rec, cmp, fit = None, None, None, None, None
+    if ab_on:                                            # refuse before the model loads
+        import r2_recap_nogc as RN
+        try:
+            contract = RN.check_contract()
+            ab_ref = RN.load_ref(a.ab_ref) if a.ab_ref is not None else None
+        except Exception as e:
+            print("REFUSED: r2-mbstrong: %s: %s" % (type(e).__name__, e), file=sys.stderr)
+            return 20
     try:
         docs, sha = RG.load_docs(a.workload, N_DOCS, S0)
     except SystemExit as e:
@@ -541,7 +738,11 @@ def main(argv=None) -> int:
         sh_base = round(torch.cuda.memory_allocated() / 1e9, 3)
         log("arm SH (B %d, %d steps); host %s" % (a.batch, a.steps, mem["after_load"]))
         try:
-            out = run_shipped(model, ids, a.steps, clock)
+            if ab_on:
+                ab = RN.ABRecorder(a.recap_nogc, a.ab_record, model.num_layers)
+                out = run_shipped_ab(model, ids, a.steps, clock, ab)
+            else:
+                out = run_shipped(model, ids, a.steps, clock)
             pa, pr = gpu_peak()
             rw = {t for t, _ in out["rewarms"]}
             steady = period_stats(out["periods"], [t for t in range(a.steps) if t not in rw])
@@ -550,12 +751,27 @@ def main(argv=None) -> int:
                       gpu_peak_reserved_GB=pr, gpu_base_alloc_GB=sh_base,
                       device_used_end_GB=out["device_used_end_GB"],
                       rewarm_ms=[round(out["periods"][t], 1) for t, _ in out["rewarms"]])
+            if mbs_on:
+                sh["rewarm_stats"] = rewarm_stats(out["periods"], out["rewarms"])
+                sh["rates"]["effective_tok_s_excl_first"] = effective_excl_first(a.batch, out["periods"],
+                                                                                 out["rewarms"])
+                fit = "fits" if a.fit_probe else None
+            if ab_on:
+                sh["ab"] = out["ab"]
+                if a.ab_record:
+                    ab_rec = dict(tokens=out["inputs"].detach().cpu(), rewarms=[list(x) for x in out["rewarms"]],
+                                  nogc=a.recap_nogc, **ab.record_tensors())
             inputs = out["inputs"]
             del out
             gates.append(("SH-RUN", True, True, "%d steps, %d re-warms" % (a.steps, len(sh["rewarms"]))))
         except Exception as e:
             traceback.print_exc()
-            gates.append(("SH-RUN", True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+            if a.fit_probe and is_oom(e):
+                fit = "oom"
+                gates.append(("SH-RUN", False, False, "OUT OF MEMORY at C %d B %d (--fit-probe: a REPORT, not a MUST): "
+                              "%s: %s" % (C_BASE + a.pool, a.batch, type(e).__name__, str(e)[:300])))
+            else:
+                gates.append(("SH-RUN", True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
             inputs = None
         mem["after_SH"] = host_mem()
         mem["host_cache_released_after_SH"] = free(host=True)
@@ -595,6 +811,30 @@ def main(argv=None) -> int:
     C = C_BASE + a.pool
     if a.mbase:
         preds = preds + verdicts_mbase(C, a.batch, sh, r2)
+    if mbs_on:                                           # r2-mbstrong gates and predictions (flag off: none)
+        rec_meta = dict(batch=a.batch, steps=a.steps, S0=S0, capacity_C=C, pool_blocks=CEN.POOL_BLOCKS,
+                        attn_splits=NL._ATTN_SPLITS, workload_sha256=sha, doc_rows=rows)
+        if ab_on:
+            gates.append(("RN-CONTRACT", True, True, "torch %s: graph.__enter__ %s; GraphNoRelease.__enter__ %s" % (
+                contract["torch"], contract["graph_enter"], contract["no_release_enter"])))
+            if sh is not None:
+                ok, det = RN.rn_gc_gate(sh["ab"], [t for t, _ in sh["rewarms"]])
+                gates.append(("RN-GC", a.recap_nogc, ok, det))
+        if ab_rec is not None:
+            torch.save(dict(ab_rec, meta=rec_meta), os.path.join(a.out, "ab_record.pt"))
+        if ab_ref is not None:
+            if ab_rec is None:
+                gates.append(("RN-EQ", True, False, "NOT_RUN: the SH arm did not finish"))
+            else:
+                cmp = RN.compare_ab(ab_ref["record"], dict(ab_rec, meta=rec_meta))
+                gates.append(("RN-EQ", True, cmp["passed"], "vs %s: meta differs %s; modes (ref, this) %s; tokens differ "
+                              "%s (first [b, t] %s); re-warm steps equal %s; digest keys ok %s; digests differ at %s; "
+                              "last-step digest equal %s" % (
+                                  a.ab_ref, cmp["meta_diff"], cmp["modes"], cmp["token_mismatches"],
+                                  cmp["first_token_mismatch"], cmp["rewarms_equal"], cmp["digest_keys_ok"],
+                                  cmp["digest_mismatch_steps"], cmp["final_equal"])))
+        preds = preds + mbs_verdicts(C, a.batch, sh, a.recap_nogc,
+                                     ab_ref["summary"]["SH"] if ab_ref is not None else None, fit)
     meta = dict(batch=a.batch, steps=a.steps, warmup=a.warmup, S0=S0, doc_rows=rows, n_unique_docs=min(a.batch, N_DOCS),
                 workload_sha256=sha, expected_rewarms=expected, attn_splits=NL._ATTN_SPLITS,
                 pool_blocks=CEN.POOL_BLOCKS, capacity_C=C, arms=a.arms, mbase=a.mbase,
@@ -605,9 +845,17 @@ def main(argv=None) -> int:
                 predictions=(PRED_FUSED if a.r2 == "fused" else PRED), r2=a.r2, gt=a.gt,
                 nosi_commit=os.environ.get("BASE_COMMIT", "unknown"), torch=torch.__version__,
                 gpu=torch.cuda.get_device_name(0), host_mem=mem)
+    if mbs_on:
+        meta.update(recap_nogc=a.recap_nogc, ab_record=a.ab_record, ab_ref=a.ab_ref, fit_probe=a.fit_probe, fit=fit,
+                    graph_contract=contract, mbs_predictions=PRED_MBS,
+                    fit_model=dict(peak_model_GB=round(mbase_peak_model(C, a.batch), 3), budgets_GB=MBS_BUDGET_GB,
+                                   fit_batch={k: fit_batch(C, v, S0, a.steps) for k, v in MBS_BUDGET_GB.items()},
+                                   int32_batch_limit=int32_batch_limit(S0, a.steps, C)))
     out = dict(meta=meta, SH=sh, R2=r2, agreement=agree, GT=gt or None,
                gates=[dict(name=g[0], must=g[1], passed=bool(g[2]), detail=g[3]) for g in gates],
                predictions=[dict(name=p[0], verdict=p[1], detail=p[2]) for p in preds])
+    if mbs_on and cmp is not None:
+        out["AB"] = cmp
     with open(os.path.join(a.out, "summary.json"), "w") as f:
         json.dump(out, f, indent=1, sort_keys=True, default=str)
     for g in gates:
@@ -623,6 +871,16 @@ def main(argv=None) -> int:
     if agree:
         print("REPORT agreement: teacher-forced %.6f, diverged %d of %d (first at %s)" % (
             agree["tf_agreement"], agree["n_diverged"], agree["n_requests"], agree["first_divergence_min"]))
+    if mbs_on:
+        rs = (sh or {}).get("rewarm_stats") or {}
+        print("REPORT RN C %d B %d %s fit %s: steady median %s mean %s ms; effective %s tok/s (without step 0: %s); "
+              "re-warm first %s ms, later median %s ms, sum %s ms (n %s); peak %s GB (model %.3f)" % (
+                  C, a.batch, "recap-nogc" if a.recap_nogc else "plain", fit,
+                  sh["steady"]["median_ms"] if sh else None, sh["steady"]["mean_ms"] if sh else None,
+                  sh["rates"]["effective_tok_s"] if sh else None,
+                  sh["rates"].get("effective_tok_s_excl_first") if sh else None, rs.get("first_ms"),
+                  rs.get("later_median_ms"), rs.get("sum_ms"), rs.get("n"), sh["gpu_peak_alloc_GB"] if sh else None,
+                  mbase_peak_model(C, a.batch)))
     nfail = sum(1 for g in gates if g[1] and not g[2])
     print("r2_base: %d MUST gate(s) failed" % nfail)
     return min(nfail, 19)
