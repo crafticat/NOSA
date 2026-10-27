@@ -26,6 +26,20 @@
 #              The report: <record>/nsys_p0nsys.nsys-rep. NSYS below is the binary of the image (jobs 2175759, 2178106).
 #   p0all      THE SEQUENCE (Task 0.4): mb1 FIRST, then p0c128 p0c63b344 p0c63b216 p0k128b63 (an even holder id) or
 #              p0k128b63 p0c63b216 p0c63b344 p0c128 (an odd holder id). A failed mb1 stops the sequence.
+# p0sweep CELLS (docs/NOTES_p0sweep.md: the speculation ceiling where small B keeps the GEMMs near their weight-read
+# floor and small C or a long context makes the fetch a large share; each = arm H + arm T with the selection probe and
+# the verify probe, as p0c128):
+#   p0c63b64   C  63 (P  0) B  64 S 16128. STEP_MIN 30, --mem 240G.
+#   p0c63b128  C  63 (P  0) B 128 S 16128. STEP_MIN 35, --mem 240G.
+#   p0c128b64  C 128 (P 65) B  64 S 16128. STEP_MIN 30, --mem 240G.
+#   p0k64c63   C  63 (P  0) B 127 S 65280 (the 55-document 64K workload), without --mbase. B 127 is the largest B at
+#              64K: the int32 gather envelope B x (S + 576) x 256 < 2^31 (cache_engine.py:216; the flash_h2d gathers do
+#              not cast their program ids at pool 0 either) allows 127 and refuses 128; memory allows more (C 63 B 127
+#              used 53.9 GB at 64K, ctxsweep cs2 2190876 fit_row.json). STEP_MIN 90, --mem 440G.
+#   p0k64c128  C 128 (P 65) B 127 S 65280, as p0k64c63 (C 113 B 127 used 67.3 GB at 64K; C 128 adds about 4.0 GB).
+#              STEP_MIN 90, --mem 440G.
+#   p0sweep    THE SEQUENCE: mb1 FIRST, then p0c63b64 p0c63b128 p0c128b64 p0k64c63 p0k64c128 (an even holder id) or
+#              p0k64c128 p0k64c63 p0c128b64 p0c63b128 p0c63b64 (an odd holder id). A failed mb1 stops the sequence.
 # THE SAME-JOB BASELINE RULE (Task 0.4): every p0 cell gets --baseline OUTROOT/p0prof_<run>_<holder>_mb1/summary.json and
 # prints "variant / baseline" for the median, the mean and the effective tok/s. A single p0 cell STOPS unless that mb1
 # record is complete (exit=0, accounting=consistent, summary.json present). There is no --skip-shipped: arm H always runs.
@@ -34,13 +48,13 @@
 # stdout, stderr, exit + accounting, sacct row), all frozen (0444 / 0555).
 # EXIT: one cell: the cell's exit (the number of failed MUST gates 0-19; 20 refused; 30 raised); 2 a usage error; 3
 # another GPU; 4 not exactly one GPU; 124 / 137 the host timeout; 1 a STOP before the launch; 5 an exit-0 step whose
-# record is incomplete or whose sacct row is not COMPLETED 0:0. p0all: the first non-zero cell exit (5 if every cell
-# exited 0 and a record is incomplete).
-# Checks before the claim (each STOPS with exit 1): as r2_base_fused_step.sh, plus the BASE_SHA bytes and the 128K
-# workload pin. The claim: OUTROOT/p0prof_active (mkdir, atomic) for the whole sequence; a stop after the claim leaves
-# it (the lead decides).
+# record is incomplete or whose sacct row is not COMPLETED 0:0. p0all / p0sweep: the first non-zero cell exit (5 if
+# every cell exited 0 and a record is incomplete).
+# Checks before the claim (each STOPS with exit 1): as r2_base_fused_step.sh, plus the BASE_SHA bytes and the 64K and
+# 128K workload pins. The claim: OUTROOT/p0prof_active (mkdir, atomic) for the whole sequence; a stop after the claim
+# leaves it (the lead decides).
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-p0prof                                                   # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-p0sweep                                                  # ROOT
 BASE_SHA=ded9d412d81aef76e2c1b6983673e6eaa7010adc                                        # PIN (the mb1 code)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                         # ROOT (lead-owned)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
@@ -50,6 +64,8 @@ MODEL=/mnt/beegfs/ojerbi/models/NOSA-8B                                         
 MODEL_SIZE=16370581512                                                                   # PIN (nosi_pool.sbatch)
 WL=/mnt/beegfs/ojerbi/kstep-cpu-runs/workload/pg19-test-c16k                              # ROOT
 WL_SHA=a25d1e16592c72d40550a3a05a2ac7673df0b57ce7fb1e9293f1451de4c8a0ce                   # PIN (c16k_tokens.bin)
+WLM=/mnt/beegfs/ojerbi/kstep-cpu-runs/workload/pg19-test-ctx65280                         # ROOT
+WLM_SHA=f2fb36f441ec12b7a79239d5e86263c6454b7713436f53f81086ef2bedcc34b3                  # PIN (its SHA256SUMS)
 WLK=/mnt/beegfs/ojerbi/kstep-cpu-runs/workload/pg19-test-ctx130816                        # ROOT
 WLK_SHA=ff5df555025599d59d0c5c586c39ec7ed112cede78175b565387c0dde185a5d2                  # PIN (its SHA256SUMS)
 JITBASE=/mnt/beegfs/ojerbi/nosa-env/jit                                                  # ROOT
@@ -59,7 +75,7 @@ SPLITS=4
 NSYS_WINDOW=8
 main() {
 stop() { echo "R2 p0prof step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_base_profile_step.sh --nosi <sha> <holder> <run id> <mb1|p0c128|p0c63b344|p0c63b216|p0k128b63|p0nsys|p0all>" >&2; exit 2; }
+usage() { echo "usage: r2_base_profile_step.sh --nosi <sha> <holder> <run id> <mb1|p0c128|p0c63b344|p0c63b216|p0k128b63|p0nsys|p0all|p0c63b64|p0c63b128|p0c128b64|p0k64c63|p0k64c128|p0sweep>" >&2; exit 2; }
 [ $# = 5 ] && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4 CELL=$5
 DRY=${DRYRUN:-0}
@@ -67,14 +83,20 @@ DRY=${DRYRUN:-0}
 [[ $JOB =~ ^[1-9][0-9]{0,11}$ ]] || stop "holder job id '$JOB'"
 [[ $RUN =~ ^[a-z0-9]{1,16}$ ]] || stop "run id '$RUN' (1-16 of a-z 0-9)"
 case $CELL in
-    mb1|p0c128|p0c63b344|p0c63b216|p0k128b63|p0nsys) CELLS=("$CELL") ;;
+    mb1|p0c128|p0c63b344|p0c63b216|p0k128b63|p0nsys|p0c63b64|p0c63b128|p0c128b64|p0k64c63|p0k64c128) CELLS=("$CELL") ;;
     p0all)
         if [ $((JOB % 2)) = 0 ]; then
             CELLS=(mb1 p0c128 p0c63b344 p0c63b216 p0k128b63)
         else
             CELLS=(mb1 p0k128b63 p0c63b216 p0c63b344 p0c128)
         fi ;;
-    *) stop "cell '$CELL' (mb1, p0c128, p0c63b344, p0c63b216, p0k128b63, p0nsys or p0all)" ;;
+    p0sweep)
+        if [ $((JOB % 2)) = 0 ]; then
+            CELLS=(mb1 p0c63b64 p0c63b128 p0c128b64 p0k64c63 p0k64c128)
+        else
+            CELLS=(mb1 p0k64c128 p0k64c63 p0c128b64 p0c63b128 p0c63b64)
+        fi ;;
+    *) stop "cell '$CELL' (mb1, p0c128, p0c63b344, p0c63b216, p0k128b63, p0nsys, p0all, p0c63b64, p0c63b128, p0c128b64, p0k64c63, p0k64c128 or p0sweep)" ;;
 esac
 if [ -n "${P0_HOLDERS:-}" ]; then
     [ "$DRY" = 1 ] || stop "P0_HOLDERS is for DRYRUN (the CPU test) only"
@@ -92,6 +114,13 @@ cfg() {   # $1 = a cell: POOL BATCH STEPS STEP_MIN MEM CTX WLX PYF PYX (the pyth
         p0k128b63) POOL=65 BATCH=63 STEPS=512 STEP_MIN=100 MEM=440G CTX=130816 WLX=$WLK
                    PYX=(--context 130816 --pool 65 --stage-timers) ;;
         p0nsys) POOL=65 BATCH=216 STEPS=40 STEP_MIN=30 MEM=240G PYX=(--pool 65 --nsys-window "$NSYS_WINDOW") ;;
+        p0c63b64) POOL=0 BATCH=64 STEPS=512 STEP_MIN=30 MEM=240G PYX=(--pool 0 --mbase --stage-timers) ;;
+        p0c63b128) POOL=0 BATCH=128 STEPS=512 STEP_MIN=35 MEM=240G PYX=(--pool 0 --mbase --stage-timers) ;;
+        p0c128b64) POOL=65 BATCH=64 STEPS=512 STEP_MIN=30 MEM=240G PYX=(--pool 65 --mbase --stage-timers) ;;
+        p0k64c63) POOL=0 BATCH=127 STEPS=512 STEP_MIN=90 MEM=440G CTX=65280 WLX=$WLM
+                  PYX=(--context 65280 --pool 0 --stage-timers) ;;
+        p0k64c128) POOL=65 BATCH=127 STEPS=512 STEP_MIN=90 MEM=440G CTX=65280 WLX=$WLM
+                   PYX=(--context 65280 --pool 65 --stage-timers) ;;
         *) stop "cfg: no cell '$1'" ;;
     esac
 }
@@ -121,6 +150,8 @@ git -C "$NOSI" diff --quiet "$BASE_SHA" "$NSHA" -- nosi benchmarks/Efficiency/r2
 [ "$(stat -c %s "$MODEL/model.safetensors" 2>/dev/null)" = "$MODEL_SIZE" ] || stop "model size is not $MODEL_SIZE"
 wl=$(sha256sum "$WL/c16k_tokens.bin" 2>/dev/null) || stop "no $WL/c16k_tokens.bin"
 [ "${wl%% *}" = "$WL_SHA" ] || stop "c16k_tokens.bin sha256 is not $WL_SHA"
+wlm=$(sha256sum "$WLM/ctx65280_tokens.bin" 2>/dev/null) || stop "no $WLM/ctx65280_tokens.bin"
+[ "${wlm%% *}" = "$WLM_SHA" ] || stop "ctx65280_tokens.bin sha256 is not $WLM_SHA"
 wlk=$(sha256sum "$WLK/ctx130816_tokens.bin" 2>/dev/null) || stop "no $WLK/ctx130816_tokens.bin"
 [ "${wlk%% *}" = "$WLK_SHA" ] || stop "ctx130816_tokens.bin sha256 is not $WLK_SHA"
 UFILE=$HOLDERS/$JOB.gpu_uuid
@@ -174,7 +205,7 @@ build() {   # $1 = a cell: OUT REC JIT NAME ARGV
 }
 if [ "$DRY" = 1 ]; then
     if base_ok; then bstate=complete; else bstate=absent; fi
-    echo "R2 p0prof step: DRYRUN (nothing claimed, written or launched); cell $CELL; pins OK: nosi $NSHA blob $blob base $BASE_SHA workload $WL_SHA 128K workload $WLK_SHA gpu_uuid $GPU_UUID (from $UFILE)"
+    echo "R2 p0prof step: DRYRUN (nothing claimed, written or launched); cell $CELL; pins OK: nosi $NSHA blob $blob base $BASE_SHA workload $WL_SHA 64K workload $WLM_SHA 128K workload $WLK_SHA gpu_uuid $GPU_UUID (from $UFILE)"
     echo "R2 p0prof step: cells ${CELLS[*]}; STEP_MIN total $TOTAL_MIN; baseline record $BASEREC ($bstate)"
     for c in "${CELLS[@]}"; do
         build "$c"

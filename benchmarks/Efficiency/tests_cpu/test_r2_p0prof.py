@@ -64,7 +64,7 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[3]
 EFF = ROOT / "benchmarks/Efficiency"
 NOSI = ROOT / "nosi/nosi"
-STEP_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-p0prof"
+STEP_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-p0sweep"    # the step script's ROOT (p0sweep moved it from nosi-r2-p0prof)
 BASE_SHA = "ded9d412d81aef76e2c1b6983673e6eaa7010adc"
 MB1 = Path("/mnt/beegfs/ojerbi/r2-runs/basef/basef_mba_2190876_mb1")
 WLK = Path("/mnt/beegfs/ojerbi/kstep-cpu-runs/workload/pg19-test-ctx130816")
@@ -145,7 +145,7 @@ def test_PP1_parse_args():
            ["--stage-timers", "--prof-steps", "0"], ["--stage-timers", "--prof-steps", "17"],
            ["--stage-timers", "--sel-start", "60"], ["--stage-timers", "--sel-start", "6"],
            ["--stage-timers", "--sel-rows", "1"], ["--stage-timers", "--sel-steps", "1"],
-           ["--stage-timers", "--sel-start", "508"], ["--mbase", "--context", "130816"], ["--context", "65280"],
+           ["--stage-timers", "--sel-start", "508"], ["--mbase", "--context", "130816"], ["--context", "32768"],
            ["--pool", "66"], ["--ring", "1"], ["--steps", "1001"])
     for b in bad:
         with pytest.raises(SystemExit):

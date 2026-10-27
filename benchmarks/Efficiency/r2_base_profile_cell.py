@@ -1,8 +1,13 @@
 """Task 0.1 "p0prof" (kstep-cpu-runs/analysis/plan/PLAN_speckv_on_cached_nosa.md): the profile of the cached-NOSA
 decode step and the ceiling for speculation, with the verify's extra selection (P0_PILOT_AUTOPSY.md 7.4, 9.2). One
 process, one model, one (C, B, S) per process (cache_engine reads NOSI_POOL_BLOCKS once, at import). Workload: the PG19
-94-document 16128-token file (S 16128, request b = row b % 94) or the 24-document 130816-token file (--context 130816,
-request b = row b % 24). benchmarks/Efficiency/r2_base_profile_step.sh runs it.
+94-document 16128-token file (S 16128, request b = row b % 94), the 55-document 65280-token file (--context 65280,
+request b = row b % 55) or the 24-document 130816-token file (--context 130816, request b = row b % 24).
+benchmarks/Efficiency/r2_base_profile_step.sh runs it.
+p0sweep (the second part, PLAN Task 0.1 continued): the map of the speculation ceiling where it could still win. Small B
+keeps the GEMMs near their weight-read floor; small C or a long context makes the fetch a large share. Arm T also runs
+the verify window (VerifyProbe). The cell reports the GEMM time against the rows and the ceiling with the MEASURED
+verify model (VERIFY_FORMULA, verify_ceiling). The registered block is PRED_SWEEP.
 
 ARMS (in this order, one model):
   H  THE HEADLINE. r2_base_cell.run_shipped (the function of the mb1 record, 3,387.7 tok/s) with r2_base_cell.CudaClock.
@@ -21,6 +26,13 @@ ARMS (in this order, one model):
                  row per request and once for R rows per request (1 draft + R - 1 verify positions) in ONE stage-1
                  call with cu_seqlens_q = 0, R, 2R, ... (the varlen route; the rows repeat the request's query). No new
                  kernel. The first step of the window is a warm-up (Triton specialization, buffers) and is not used.
+       verify    --vfy-start, --vfy-steps, --gemm-mults (default 34, 12, 1,2,3,4): VerifyProbe, the measured inputs
+                 of the verify model. Per layer, with existing ops only, into the probe's own tensors: (1) 'union': a
+                 copy of the shipped selection (topk_idx) into a ring of R steps; when the ring is full, the number of
+                 distinct block ids of each (head, request) over R consecutive steps (sort, compare, sum); (2)
+                 'load_count': the host loads of the layer (load mask >= 0 after the pool lookup); (3) 'gemm_x<m>':
+                 the GEMM stack of the shipped step (the group gemm_mlp) on m x B rows, for each m. The first step
+                 is a warm-up for the GEMM and fetch times; the union counts from the step where the ring is full.
        steady    every other non-re-warm step: the stage timers.
      The host time of each torch.cuda.graph enter and exit (CaptureTimer) and the gc time per step (GcTimer).
   N  THE NSYS ARM. It runs only with --nsys-window W, and it replaces H and T. The same decode for --steps steps;
@@ -46,14 +58,17 @@ the shipped step run on the current stream (cache_engine.py:490-492), so the sta
   attention     flash_attn_nosa_with_kvcache entry (nosa_llama.py:634-641)
   ffn_gemm      its exit: wo GEMM, residual, rmsnorm, gate_up GEMM, SiLU, down GEMM, residual (:645-660)
   inter / final decode_forward exit: the Python loop to the next layer / the final rmsnorm + lm_head (:839-843)
+  [vfy steps]   'union' before tail_write, 'load_count' before fetch_k, 'gemm_prep' and 'gemm_x<m>' after ffn_gemm
 Per step: embed (step start: embedding + loop set-up), sample (decode_inference return: argmax, the token copy, the
 position, the next re-warm check). GROUPS map the labels to the stages of the plan: selection, resolve (diff + pool
 resolve), pool_swap, fetch, attention, gemm_mlp, rest.
 
 MUST: H-RUN, H-UNPATCHED; with T: T-RUN, T-EQ (T's tokens equal H's), T-CHAIN (every steady timed step has the
-expected boundary sequence), T-SEL (every selection step has the probe's sequence and no probe error), T-RESTORED
-(every patch target is the original object after T), T-PROF (the profiler saw GPU ops and launches); with N: N-RUN.
-REPORT: everything else, the REGISTERED predictions (PRED_P0, the lead stamps them) and the ceiling (CEILING_FORMULA).
+expected boundary sequence), T-SEL (every selection step has the probe's sequence and no probe error), T-VFY (every
+verify step has the probe's sequence, no probe error, the expected number of probe calls), T-RESTORED (every patch
+target is the original object after T), T-PROF (the profiler saw GPU ops and launches); with N: N-RUN.
+REPORT: everything else, the REGISTERED predictions (PRED_P0 and PRED_SWEEP, the lead stamps them), the ceiling
+(CEILING_FORMULA) and the ceiling with the measured verify model (VERIFY_FORMULA).
 EXIT: the number of failed MUST gates; 20 refused; 30 an exception outside an arm.
 """
 from __future__ import annotations
@@ -79,8 +94,10 @@ import r2_ragged_gate as RG        # noqa: E402
 NSYS_STEPS = 20
 PROF_START, PROF_STEPS = 8, 3
 SEL_START, SEL_STEPS, SEL_ROWS = 24, 8, 4
-CONTEXTS = (16128, 130816)
+CONTEXTS = (16128, 65280, 130816)
 ACCEPTED = (1, 2, 3, 4)
+VFY_START, VFY_STEPS = 34, 12
+GEMM_MULTS = (1, 2, 3, 4)
 
 # ------------------------------------------------------------------ REGISTERED (Task 0.1; THE LEAD STAMPS)
 # Every "TBD" is a placeholder. The lead writes the values and REGISTERED_UTC (from `date -u` in the same command, L33)
@@ -134,6 +151,91 @@ CEILING_FORMULA = (
     "means that no round with `a` accepted tokens can pay. baseline_ms = arm H steady median (same process); the "
     "selection times are arm T's (CUDA events, the probe window).")
 
+# ------------------------------------------------------------------ REGISTERED p0sweep (THE LEAD STAMPS)
+# Every "TBD" is a placeholder, as in PRED_P0. The lead writes the values and REGISTERED_SWEEP_UTC (from `date -u` in
+# the same command, L33) in ONE commit BEFORE the run. A "TBD" gives the verdict UNREGISTERED. A band is (low, high).
+# Cell keys (cell_key): 63_64 (p0c63b64), 63_128 (p0c63b128), 128_64 (p0c128b64), 63_127_s65280 (p0k64c63),
+# 128_127_s65280 (p0k64c128). The P0-* lines of these cells read PRED_P0: its per-cell bands have no key for them
+# (UNREGISTERED); its global bands (ovh_band, recap_ms, recap_gc_share) were stamped for p0all, so the scorer reads
+# them as REPORT for the sweep cells.
+REGISTERED_SWEEP_UTC = "TBD"
+_SWEEP_KEYS = ("63_64", "63_128", "128_64", "63_127_s65280", "128_127_s65280")
+PRED_SWEEP = {
+    "stage_ms": {
+        "63_64": {"selection": "TBD", "resolve": "TBD", "pool_swap": "TBD", "fetch": "TBD", "attention": "TBD",
+                  "gemm_mlp": "TBD", "rest": "TBD"},
+        "63_128": {"selection": "TBD", "resolve": "TBD", "pool_swap": "TBD", "fetch": "TBD", "attention": "TBD",
+                   "gemm_mlp": "TBD", "rest": "TBD"},
+        "128_64": {"selection": "TBD", "resolve": "TBD", "pool_swap": "TBD", "fetch": "TBD", "attention": "TBD",
+                   "gemm_mlp": "TBD", "rest": "TBD"},
+        "63_127_s65280": {"selection": "TBD", "resolve": "TBD", "pool_swap": "TBD", "fetch": "TBD",
+                          "attention": "TBD", "gemm_mlp": "TBD", "rest": "TBD"},
+        "128_127_s65280": {"selection": "TBD", "resolve": "TBD", "pool_swap": "TBD", "fetch": "TBD",
+                           "attention": "TBD", "gemm_mlp": "TBD", "rest": "TBD"},
+    },
+    #   SW-STAGE-<group>: {group: (low, high)} ms per step, T steady median, per cell
+    "gemm_x1_ms": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
+                   "128_127_s65280": "TBD"},
+    #   SW-GEMM-X1: the probe's GEMM stack on B rows, ms per step (32 layers + the final rmsnorm and lm_head)
+    "gemm_xr_ms": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
+                   "128_127_s65280": "TBD"},
+    #   SW-GEMM-XR: the same on R x B rows (R = --sel-rows, 4), ms per step
+    "gemm_slope": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
+                   "128_127_s65280": "TBD"},
+    #   SW-GEMM-SLOPE: ms per row, the least-squares slope over the probe points (B, 2B, 3B, 4B rows)
+    "sel_extra_ms": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
+                     "128_127_s65280": "TBD"},
+    #   SW-SEL: the extra selection of a round, joint (R rows - 1 row), ms per step
+    "union_extras": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
+                     "128_127_s65280": "TBD"},
+    #   SW-UNION: extras per (head, request) = the mean union of R consecutive selections - topk (vr1: 8.137)
+    "loads_per_stream": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
+                         "128_127_s65280": "TBD"},
+    #   SW-LOADS: host loads per (layer, head, request) per step, in the verify window
+    "union_fetch_ms": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
+                       "128_127_s65280": "TBD"},
+    #   SW-UFETCH: the union-extras fetch (all extras from the host), ms per joint pass
+    "joint_steps": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
+                    "128_127_s65280": "TBD"},
+    #   SW-JOINT: the joint pass (measured fetch) / the H steady median
+    "vs_cached_floor": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
+                        "128_127_s65280": "TBD"},
+    #   SW-CACHED-FLOOR: committed tok/s / 3,387.7 at acceptance 0.995, draft floor, measured fetch
+    "vs_cached_dr1": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
+                      "128_127_s65280": "TBD"},
+    #   SW-CACHED-DR1: the same with dr1's share of the gather for the pool (dr1_for_pool)
+    "vs_own_floor": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
+                     "128_127_s65280": "TBD"},
+    #   SW-OWN-FLOOR: committed tok/s / the cell's own H steady tok/s at acceptance 0.995, draft floor, measured fetch
+}
+# The verify model (not predictions; the basis of each number is in the comment).
+VERIFY_ACCEPT = (0.995, 1.0)       # per-token acceptance; dr1 measured 0.99475 (SCORING_dr1.md 7)
+REF_CACHED_TOK_S = 3387.7          # cached NOSA, mb1 2190876 (C 128 B 216, 16K): the same-memory best baseline
+WEIGHT_FLOOR_MS = 10.6             # gemm_mlp intercept (SCORING_p0all.md 3: the C 63 slope from B 216 to B 344)
+DRAFT_RECOVERY = (("floor", 1.0), ("dr1_69", 0.6926), ("dr1_44", 0.4440))
+#   the share of the gather that one draft step saves. floor: all of it (draft = baseline - gather). dr1 saved 3.368 ms:
+#   69.26 % of p0all's C 128 gather (4.863 ms; SCORING_p0all.md 8.1, applied at C 63 in 8.4) and 44.4 % of the ncu
+#   gather (7.585 ms; SCORING_dr1.md 9). dr1_for_pool: dr1_69 at pool 0 (C 63), dr1_44 with a pool (C 128).
+VERIFY_FORMULA = (
+    "A round = K = R - 1 draft steps + 1 joint pass of R rows per request (1 draft row + K verify rows); it commits "
+    "E(a) = 1 + a + ... + a^(R-1) tokens per request at per-token acceptance a. draft_ms = baseline_ms - recovery x "
+    "gather_ms (gather_ms = baseline_ms x the gather_only fraction; recovery 1 = the floor). joint_ms = baseline_ms + "
+    "(gemm(R x B rows) - gemm(B rows)) + (selection of R rows - selection of 1 row) + union_fetch_ms: the shipped step "
+    "with its GEMM stack and its selection on R rows per request, ONE attention (perfect K / V sharing over the R "
+    "rows), and the fetch of the union extras. union_fetch_ms = extras x streams x ms per load: extras = the mean "
+    "union of R consecutive shipped selections per (head, request) - topk; streams = layers x KV heads x B; ms per "
+    "load = the fetch time / the host loads of the same steps (all extras taken as host loads: exact at pool 0, an "
+    "upper bound with a pool). Variant 'hidden': union_fetch_ms = 0 (a background prefetch hides it). Committed tok/s "
+    "= 1000 x B x E(a) / (K x draft_ms + joint_ms). Break-even joint_ms against a rate X = 1000 x B x E(a) / X - K x "
+    "draft_ms (X = 3,387.7, cached NOSA; or the cell's own 1000 x B / baseline_ms). The GEMM and selection times are "
+    "the medians of arm T's probes (eager); baseline_ms = the arm H steady median.")
+
+
+def dr1_for_pool(pool):
+    """The dr1 share of the gather for a cell (DRAFT_RECOVERY name): dr1_69 at pool 0, dr1_44 with a pool."""
+    return "dr1_69" if int(pool) == 0 else "dr1_44"
+
+
 # ------------------------------------------------------------------ stages (pure parts, CPU-tested)
 LAYER_SEQ_POOL = ("qkv_gemm", "qkv_prep", "stage1", "pool_topk", "tail_write", "diff", "pool_resolve", "pool_swap",
                   "map_commit", "fetch_k", "fetch_v", "writeback", "attention", "ffn_gemm")
@@ -161,12 +263,23 @@ def cell_key(C, B, S=None):
     return "%d_%d" % (int(C), int(B)) + ("" if S == BC.S0 else "_s%d" % S)
 
 
-def expected_sequence(n_layers: int, pool: bool, sel: bool = False):
-    """The boundary labels of one timed step, in stream order (sel: a selection-probe step)."""
+def vfy_labels(mults=GEMM_MULTS):
+    """The verify probe's labels per layer: union (before tail_write), load_count (before fetch_k), gemm_prep and one
+    gemm_x<m> per multiplier (after ffn_gemm, before inter / final)."""
+    return ("union", "load_count", "gemm_prep") + tuple("gemm_x%d" % int(m) for m in mults)
+
+
+def expected_sequence(n_layers: int, pool: bool, sel: bool = False, vfy=None):
+    """The boundary labels of one timed step, in stream order (sel: a selection-probe step; vfy: the GEMM multipliers
+    of a verify-probe step)."""
     body = list(LAYER_SEQ_POOL if pool else LAYER_SEQ_NOPOOL)
     if sel:
         i = body.index("stage1") + 1
         body[i:i] = SEL_LABELS
+    if vfy is not None:
+        body.insert(body.index("tail_write"), "union")
+        body.insert(body.index("fetch_k"), "load_count")
+        body.extend(vfy_labels(vfy)[2:])
     seq = ["embed"]
     for layer in range(int(n_layers)):
         seq.extend(body)
@@ -344,13 +457,30 @@ def _stage1(rec, fn, probe):
     return w
 
 
-def _layer(rec, fn, last):
+def _vfy_on(rec, vfy):
+    return vfy is not None and vfy.active and rec.inner and not rec.capturing
+
+
+def _layer(rec, fn, last, vfy=None):
     def w(self, *a, **k):
         rec.layer(self.layer_idx)
         rec.mark("qkv_gemm")
         r = fn(self, *a, **k)
+        if _vfy_on(rec, vfy):
+            vfy.gemm(self, a, self.layer_idx == last)
         rec.mark("final" if self.layer_idx == last else "inter")
         return r
+    w.__wrapped__ = fn
+    return w
+
+
+def _probe_entry(rec, fn, label, vfy, method):
+    """_entry, and in a verify-probe step the probe's method first (it marks its own label)."""
+    def w(*a, **k):
+        if _vfy_on(rec, vfy):
+            getattr(vfy, method)(a, k)
+        rec.mark(label)
+        return fn(*a, **k)
     w.__wrapped__ = fn
     return w
 
@@ -359,10 +489,13 @@ class Patcher:
     """The stage wrappers of arm T. install(cache) puts them in place; restore() puts back the ORIGINAL objects (by
     identity) and removes the cache's instance attribute. nl / cen = the modules nosi.nosa_llama / nosi.cache_engine
     (the CPU tests pass fakes with the same names). The shipped code reads every one of these names at call time
-    (module globals, a class attribute, an instance attribute), so a wrapper sees every call; T-CHAIN proves it."""
+    (module globals, a class attribute, an instance attribute), so a wrapper sees every call; T-CHAIN proves it.
+    probe: the SelectionProbe (stage-1 wrapper); vfy: the VerifyProbe (decode_forward exit, decode_update_kv entry,
+    flash_h2d_from_mask entry)."""
 
-    def __init__(self, rec, nl, cen, n_layers, probe=None):
+    def __init__(self, rec, nl, cen, n_layers, probe=None, vfy=None):
         self.rec, self.nl, self.cen, self.n_layers, self.probe = rec, nl, cen, int(n_layers), probe
+        self.vfy = vfy
         self.saved = []
         self.cache = None
         self.installs = 0
@@ -378,17 +511,18 @@ class Patcher:
             raise RuntimeError("Patcher.install: the wrappers are already in place")
         rec, nl, cen = self.rec, self.nl, self.cen
         self.cache = cache
-        self._set(nl.LlamaLayer, "decode_forward", _layer(rec, vars(nl.LlamaLayer)["decode_forward"], self.n_layers - 1))
+        self._set(nl.LlamaLayer, "decode_forward",
+                  _layer(rec, vars(nl.LlamaLayer)["decode_forward"], self.n_layers - 1, self.vfy))
         self._set(nl, "nosa_linear", _entry(rec, nl.nosa_linear, "qkv_prep"))
         self._set(nl, "infllmv2_attn_stage1_fast", _stage1(rec, nl.infllmv2_attn_stage1_fast, self.probe))
         self._set(nl, "flash_attn_nosa_with_kvcache",
                   _around(rec, nl.flash_attn_nosa_with_kvcache, "attention", "ffn_gemm"))
-        self._set(cache, "decode_update_kv", _entry(rec, cache.decode_update_kv, "tail_write"))
+        self._set(cache, "decode_update_kv", _probe_entry(rec, cache.decode_update_kv, "tail_write", self.vfy, "union"))
         self._set(cen, "diff", _Proxy(cen.diff, diff_offload=_entry(rec, cen.diff.diff_offload, "diff")))
         if getattr(cen, "_pool", None) is not None:
             self._set(cen, "_pool", _Proxy(cen._pool, pool_update=_entry(rec, cen._pool.pool_update, "pool_resolve")))
             self._set(cen, "_flash_pool_swap", _around(rec, cen._flash_pool_swap, "pool_swap", "map_commit"))
-        self._set(cen, "flash_h2d_from_mask", _entry(rec, cen.flash_h2d_from_mask, "fetch_k"))
+        self._set(cen, "flash_h2d_from_mask", _probe_entry(rec, cen.flash_h2d_from_mask, "fetch_k", self.vfy, "count"))
         self._set(cen, "flash_h2d_from_mask_bias", _around(rec, cen.flash_h2d_from_mask_bias, "fetch_v", "writeback"))
         self.installs += 1
 
@@ -495,6 +629,120 @@ class SelectionProbe:
         except Exception as e:      # the probe is a measurement: an error disables it, T-SEL reports it
             self.disabled = True
             self.errors.append("layer %s: %s: %s" % (rec.layer_idx, type(e).__name__, str(e)[:300]))
+
+
+class VerifyProbe:
+    """The measured inputs of the verify model (VERIFY_FORMULA), with existing ops only. It reads the shipped tensors
+    and writes only its own, so the decode does not change (T-EQ). Active in the verify steps (kind 'vfy'); `step` is
+    the index of the step in the window (TimerHooks sets it). Device sums only: the host reads them after the arm.
+      union       (decode_update_kv entry) copy the shipped selection topk_idx (H x B x topk block ids, a[4]) into a
+                  ring of R per layer. When the ring holds R consecutive steps: sort the R x topk ids of each (head,
+                  request) and count the distinct ids. That is the union of R consecutive selections; the rows of a
+                  joint pass are R consecutive positions.
+      count       (flash_h2d_from_mask entry) the host loads of the layer: load mask (a[2], H x B x topk) >= 0. The
+                  pool lookup has already cleared the pool hits.
+      gemm        (decode_forward exit) the layer input (a[0], B x 1 x hidden) repeated m times per request
+                  (repeat_interleave, label gemm_prep), then for each m (label gemm_x<m>) the GEMM stack of the shipped
+                  step on m x B rows: input rmsnorm + wqkv; wo + residual; rmsnorm + gate_up + SiLU-and-mul + down +
+                  residual (nosa_llama.py:553-556, 647-660); the last layer adds the final rmsnorm + lm_head + float
+                  (:839-843). So the probe's m = 1 repeats the group gemm_mlp (qkv_gemm + ffn_gemm + final) eagerly.
+                  The input of wo is the first wo.in_features columns of the probe's own wqkv output (timing only).
+    A Python error disables the probe (T-VFY fails; the decode goes on)."""
+
+    def __init__(self, rec, n_steps, torch_mod, F, norm, silu_and_mul, final=None, mults=GEMM_MULTS, rows=SEL_ROWS):
+        self.rec, self.n_steps, self.torch = rec, int(n_steps), torch_mod
+        self.F, self.norm, self.silu, self.final = F, norm, silu_and_mul, final
+        self.mults, self.rows = tuple(int(m) for m in mults), int(rows)
+        self.active, self.disabled, self.step = False, False, None
+        self.errors = []
+        self.calls = dict(union=0, count=0, gemm=0)
+        self.ring, self.filled = {}, {}
+        self.acc = None                              # device int64 (3, n_steps): union sum, union max, loads
+        self.union_n = [0] * self.n_steps            # (head, request) samples of the union, per step
+        self.streams = [0] * self.n_steps            # (head, request) streams of the load count, per step
+
+    def _acc(self, like):
+        if self.acc is None:
+            self.acc = self.torch.zeros((3, self.n_steps), dtype=self.torch.int64, device=like.device)
+        return self.acc
+
+    def _fail(self, what, e):
+        self.disabled = True
+        self.errors.append("%s layer %s: %s: %s" % (what, self.rec.layer_idx, type(e).__name__, str(e)[:300]))
+
+    def union(self, a, k):
+        if self.disabled:
+            return
+        T = self.torch
+        try:
+            self.rec.mark("union")
+            sel = a[4] if len(a) > 4 else k["topk_idx"]
+            i, li = int(self.step), self.rec.layer_idx
+            ring = self.ring.get(li)
+            if ring is None:
+                ring = self.ring[li] = [T.empty_like(sel) for _ in range(self.rows)]
+                self.filled[li] = 0
+            ring[self.filled[li] % self.rows].copy_(sel)
+            self.filled[li] += 1
+            if self.filled[li] >= self.rows:
+                s = T.sort(T.cat(ring, dim=-1), dim=-1).values
+                u = (s[..., 1:] != s[..., :-1]).sum(dim=-1) + 1
+                acc = self._acc(u)
+                acc[0, i].add_(u.sum())
+                acc[1, i].copy_(T.maximum(acc[1, i], u.max()))
+                self.union_n[i] += int(u.numel())
+            self.calls["union"] += 1
+        except Exception as e:      # the probe is a measurement: an error disables it, T-VFY reports it
+            self._fail("union", e)
+
+    def count(self, a, k):
+        if self.disabled:
+            return
+        try:
+            self.rec.mark("load_count")
+            mask = a[2] if len(a) > 2 else k["load_ids"]
+            i = int(self.step)
+            self._acc(mask)[2, i].add_((mask >= 0).sum())
+            self.streams[i] += int(mask.shape[0]) * int(mask.shape[1])
+            self.calls["count"] += 1
+        except Exception as e:
+            self._fail("count", e)
+
+    def gemm(self, layer, a, last):
+        if self.disabled:
+            return
+        rec = self.rec
+        try:
+            rec.mark("gemm_prep")
+            x = a[0]
+            xs = [x if m == 1 else x.repeat_interleave(m, dim=0) for m in self.mults]
+            for m, xm in zip(self.mults, xs):
+                rec.mark("gemm_x%d" % m)
+                self._stack(layer, xm, last)
+            self.calls["gemm"] += 1
+        except Exception as e:
+            self._fail("gemm", e)
+
+    def _stack(self, layer, x, last):
+        F, norm = self.F, self.norm
+        h = norm(x, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
+        qkv = F.linear(h, layer.wqkv)
+        h = x + F.linear(qkv[..., :layer.wo.shape[1]], layer.wo)
+        g = F.linear(norm(h, layer.post_attention_layernorm_variance_epsilon, layer.post_attention_layernorm_weight),
+                     layer.gate_up_proj)
+        out = self.torch.empty(g.shape[:-1] + (g.shape[-1] // 2,), dtype=g.dtype, device=g.device)
+        self.silu(g, out)
+        h = h + F.linear(out, layer.down_proj)
+        if last and self.final is not None:
+            w, eps, head = self.final
+            h = F.linear(norm(h, eps, w), head).float()
+        return h
+
+    def take(self):
+        """The device sums as host lists (after the arm's last sync): [union sums, union maxima, loads]."""
+        if self.acc is None:
+            return [[0] * self.n_steps for _ in range(3)]
+        return [[int(x) for x in row] for row in self.acc.tolist()]
 
 
 def snapshot_targets(nl, cen, cuda):
@@ -609,14 +857,15 @@ class GcTimer:
 class TimerHooks:
     """Arm T's hooks in decode_loop. Steps p0 .. p1 - 1 = the profiler window (the wrappers removed, the profiler on);
     steps p0 - 1 .. p1 are not timed per stage (`edge`). Steps s0 .. s1 - 1 = the selection window (kind 'sel', the
-    probe on)."""
+    probe on). Steps v0 .. v1 - 1 = the verify window (kind 'vfy', the VerifyProbe on, its `step` = t - v0)."""
 
     def __init__(self, rec, patcher, cap, gct, window, clock, profiler_factory, cuda, steps, now=time.perf_counter,
-                 gc_mod=gc, sel_window=(0, 0), probe=None):
+                 gc_mod=gc, sel_window=(0, 0), probe=None, vfy_window=(0, 0), vfy=None):
         self.rec, self.patcher, self.cap, self.gct = rec, patcher, cap, gct
         self.p0, self.p1 = window
         self.s0, self.s1 = sel_window
-        self.probe = probe
+        self.v0, self.v1 = vfy_window
+        self.probe, self.vfy = probe, vfy
         self.clock, self.profiler_factory, self.cuda, self.now, self.gc = clock, profiler_factory, cuda, now, gc_mod
         self.prof, self.prof_running = None, False
         self.host_ms = [None] * steps
@@ -643,10 +892,14 @@ class TimerHooks:
             self.prof_running = True
         inner = not need and not edge
         sel = inner and self.s0 <= t < self.s1
+        vf = inner and self.v0 <= t < self.v1
         label = "rewarm" if need else ("window" if win else ("edge" if edge else "embed"))
-        self.rec.step_begin(t, inner, label, "sel" if sel else "main")
+        self.rec.step_begin(t, inner, label, "sel" if sel else ("vfy" if vf else "main"))
         if self.probe is not None:
             self.probe.active = sel
+        if self.vfy is not None:
+            self.vfy.active = vf
+            self.vfy.step = (t - self.v0) if vf else None
         self.cap.take()
         self.gct.take()
         self.h0 = self.now()
@@ -658,6 +911,8 @@ class TimerHooks:
     def after(self, t, need, why):
         if self.probe is not None:
             self.probe.active = False
+        if self.vfy is not None:
+            self.vfy.active = False
         g = self.gct.take()
         self.gc_ms[t] = g[0]
         if need:
@@ -674,6 +929,8 @@ class TimerHooks:
     def stop(self):
         if self.probe is not None:
             self.probe.active = False
+        if self.vfy is not None:
+            self.vfy.active = False
         if self.prof_running:
             try:
                 self.prof.stop()
@@ -891,6 +1148,141 @@ def ceiling(base_ms, B, save_frac, sel=None, accepted=ACCEPTED, ref_tok_s=None):
     return out
 
 
+def ls_line(xs, ys):
+    """The least-squares line y = intercept + slope x: (slope, intercept); (None, None) for fewer than 2 distinct x."""
+    n = len(xs)
+    if n < 2 or len(set(xs)) < 2:
+        return None, None
+    mx, my = sum(xs) / n, sum(ys) / n
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sum((x - mx) ** 2 for x in xs)
+    return slope, my - slope * mx
+
+
+def gemm_rows_summary(steps, keep, mults, B, shipped_ms=None, floor_ms=WEIGHT_FLOOR_MS):
+    """The GEMM probe (kind 'vfy' steps): per multiplier m, the GEMM stack on m x B rows in ms per step (32 layers +
+    the final rmsnorm and lm_head; median, p10, p90), ms per row, the excess over floor_ms (the weight-read floor,
+    about 10.6 ms: SCORING_p0all.md 3); the marginal ms per row between neighbour points; the least-squares line over
+    the points (its intercept estimates the floor); the probe's B rows / the shipped gemm_mlp median (shipped_ms).
+    Only steps with every gemm_x<m> label count (a probe error stops the labels)."""
+    labels = ["gemm_x%d" % int(m) for m in mults]
+    rs = [steps[t] for t in keep if t in steps and steps[t].get("inner") and steps[t].get("kind") == "vfy"
+          and all(x in steps[t].get("stages", {}) for x in labels)]
+    out = dict(n=len(rs), B=int(B), mults=[int(m) for m in mults], floor_ms=floor_ms, shipped_gemm_mlp_ms=shipped_ms)
+    if not rs:
+        return out
+    pts = []
+    for m in mults:
+        st = _stats([r["stages"].get("gemm_x%d" % int(m), 0.0) for r in rs])
+        rows, med = int(m) * int(B), st["median_ms"]
+        pts.append(dict(mult=int(m), rows=rows, median_ms=med, p10_ms=st["p10_ms"], p90_ms=st["p90_ms"],
+                        ms_per_row=round(med / rows, 5), over_floor_ms=round(med - floor_ms, 3)))
+    slope, icpt = ls_line([p["rows"] for p in pts], [p["median_ms"] for p in pts])
+    one = next((p for p in pts if p["mult"] == 1), None)
+    out.update(points=pts, prep=_stats([r["stages"].get("gemm_prep", 0.0) for r in rs]),
+               marginal=[dict(rows=[p["rows"], q["rows"]],
+                              ms_per_row=round((q["median_ms"] - p["median_ms"]) / (q["rows"] - p["rows"]), 5))
+                         for p, q in zip(pts, pts[1:])],
+               slope_ms_per_row=(round(slope, 5) if slope is not None else None),
+               intercept_ms=(round(icpt, 3) if icpt is not None else None),
+               x1_over_shipped=(round(one["median_ms"] / shipped_ms, 4) if one and shipped_ms else None))
+    return out
+
+
+def vfy_summary(steps, ts, acc, union_n, streams, topk, warm=1):
+    """The verify window. ts: its steps in order; acc: [union sums, union maxima, loads] per window index
+    (VerifyProbe.take); union_n / streams: the (head, request) samples per index; topk: the blocks of one selection.
+    Union: mean and max over the indices with a full ring; extras_per_stream = mean - topk. Loads and fetch: the
+    indices from `warm` on (the first is the warm-up): host loads per stream-step and per step, the fetch (fetch_k +
+    fetch_v) ms per step and ms per load in the same steps. union_fetch_ms = extras x streams per step x ms per load
+    (every extra a host load). Only steps with the full count of samples count (a probe error stops the counts)."""
+    sums, maxes, loads = acc
+    ufull, sfull = max(union_n, default=0), max(streams, default=0)
+    ui = [i for i in range(len(ts)) if union_n[i] > 0 and union_n[i] == ufull]
+    un = sum(union_n[i] for i in ui)
+    mean = sum(sums[i] for i in ui) / un if un else None
+    li = [i for i in range(int(warm), len(ts)) if streams[i] > 0 and streams[i] == sfull
+          and "stages" in steps.get(ts[i], {})]
+    ld, sn, n = sum(loads[i] for i in li), sum(streams[i] for i in li), len(li)
+    fetch = sum(steps[ts[i]]["stages"].get("fetch_k", 0.0) + steps[ts[i]]["stages"].get("fetch_v", 0.0) for i in li)
+    per_load = fetch / ld if ld else None
+    extras = mean - int(topk) if mean is not None else None
+    sps = sn / n if n else None
+    uf = extras * sps * per_load if extras is not None and per_load is not None and sps else None
+    return dict(topk=int(topk), union_steps=len(ui), union_samples=un,
+                union_mean=(round(mean, 4) if mean is not None else None),
+                union_max=(max(maxes[i] for i in ui) if ui else None),
+                extras_per_stream=(round(extras, 4) if extras is not None else None),
+                load_steps=n, loads=ld, streams_per_step=(round(sps, 1) if sps else None),
+                loads_per_stream=(round(ld / sn, 5) if sn else None), loads_per_step=(round(ld / n, 1) if n else None),
+                fetch_ms_per_step=(round(fetch / n, 3) if n else None),
+                ms_per_load=(round(per_load, 7) if per_load is not None else None),
+                union_fetch_ms=(round(uf, 3) if uf is not None else None),
+                extras_over_loads=(round(extras * sn / ld, 3) if extras is not None and ld else None))
+
+
+def verify_case(vc, fetch, draft, accept):
+    """One row of verify_ceiling's cases (None if absent)."""
+    return next((c for c in (vc or {}).get("cases", []) if c["fetch"] == fetch and c["draft"] == draft
+                 and c["accept"] == accept), None)
+
+
+def verify_ceiling(base_ms, B, gather_ms, gemm, sel, vfy, rows=SEL_ROWS, attention_ms=None, accept=VERIFY_ACCEPT,
+                   recovery=DRAFT_RECOVERY, ref_tok_s=REF_CACHED_TOK_S, mb1_tok_s=None):
+    """VERIFY_FORMULA. gemm: gemm_rows_summary (needs the points m = 1 and m = R); sel: selection_summary (extra_joint_ms,
+    r_rows); vfy: vfy_summary (union_fetch_ms). joint_ms per fetch variant ('measured': + union_fetch_ms; 'hidden': 0);
+    the lead's form of the measured joint pass (GEMM of R x B rows + selection of R rows + one attention + union fetch
+    + the rest of the shipped step); per (fetch, draft, acceptance) case: draft_ms, round_ms, committed tok/s, / ref
+    (cached NOSA), / own (1000 x B / base_ms), / mb1 (the same job), the break-even joint_ms and the margin."""
+    R = int(rows)
+    K = R - 1
+    pts = {p["mult"]: p["median_ms"] for p in (gemm or {}).get("points", [])}
+    out = dict(formula=VERIFY_FORMULA, baseline_ms=base_ms, batch=int(B), rows=R, K=K, ref_tok_s=ref_tok_s,
+               mb1_tok_s=mb1_tok_s, own_tok_s=(round(1e3 * B / base_ms, 1) if base_ms else None),
+               gather_ms=(round(gather_ms, 3) if gather_ms is not None else None), accept=list(accept),
+               recovery=[list(r) for r in recovery])
+    sx = (sel or {}).get("extra_joint_ms")
+    miss = [name for name, v in (("baseline_ms", base_ms), ("gather_ms", gather_ms), ("gemm x1", pts.get(1)),
+                                 ("gemm x%d" % R, pts.get(R)), ("selection extra", sx)) if v is None]
+    if miss:
+        out["missing"] = miss
+        return out
+    g1, gr = pts[1], pts[R]
+    uf = (vfy or {}).get("union_fetch_ms")
+    sr = _get(sel, "r_rows", "median_ms")
+    joint = {"hidden": base_ms + (gr - g1) + sx}
+    if uf is not None:
+        joint["measured"] = joint["hidden"] + uf
+    out.update(gemm_x1_ms=g1, gemm_xr_ms=gr, gemm_extra_ms=round(gr - g1, 3), sel_r_ms=sr, sel_extra_ms=sx,
+               union_fetch_ms=uf, attention_ms=attention_ms, joint_ms={k: round(v, 3) for k, v in joint.items()},
+               joint_steps={k: round(v / base_ms, 4) for k, v in joint.items()})
+    if "measured" in joint and attention_ms is not None and sr is not None:
+        out["components"] = dict(gemm_r_rows_ms=gr, selection_r_rows_ms=sr, one_attention_ms=attention_ms,
+                                 union_fetch_ms=uf,
+                                 rest_of_step_ms=round(joint["measured"] - gr - sr - attention_ms - uf, 3))
+    cases = []
+    for fetch in ("measured", "hidden"):
+        if fetch not in joint:
+            continue
+        j = joint[fetch]
+        for name, r in recovery:
+            draft = base_ms - r * gather_ms
+            rnd = K * draft + j
+            for a in accept:
+                e = sum(a ** i for i in range(R))
+                tok = 1e3 * B * e / rnd
+                be_own = e * base_ms - K * draft
+                be_ref = 1e3 * B * e / ref_tok_s - K * draft
+                cases.append(dict(fetch=fetch, draft=name, recovery=r, accept=a, tokens_per_request=round(e, 5),
+                                  draft_ms=round(draft, 3), joint_ms=round(j, 3), round_ms=round(rnd, 3),
+                                  tok_s=round(tok, 1), vs_cached=round(tok / ref_tok_s, 4),
+                                  vs_own=round(e * base_ms / rnd, 4),
+                                  vs_mb1=(round(tok / mb1_tok_s, 4) if mb1_tok_s else None),
+                                  breakeven_joint_own_ms=round(be_own, 3), margin_own_ms=round(be_own - j, 3),
+                                  breakeven_joint_cached_ms=round(be_ref, 3), margin_cached_ms=round(be_ref - j, 3)))
+    out["cases"] = cases
+    return out
+
+
 LAUNCH_KINDS = (("kernel", ("cudaLaunchKernel", "cuLaunchKernel", "cudaLaunchCooperativeKernel")),
                 ("graph", ("cudaGraphLaunch", "cuGraphLaunch")),
                 ("memcpy", ("cudaMemcpy", "cuMemcpy")),
@@ -1102,6 +1494,55 @@ def verdicts_p0(C, B, res, pred=None, utc=None, S=None):
     return out
 
 
+def verdicts_sweep(C, B, res, pred=None, utc=None, S=None):
+    """PRED_SWEEP against this cell: [(name, verdict, detail)]. TBD -> UNREGISTERED; no value -> NOT_RUN. The ceiling
+    lines read the verify_ceiling case (fetch 'measured', acceptance VERIFY_ACCEPT[0]) with the draft floor and with
+    dr1's share of the gather for this cell's pool (dr1_for_pool(C - 63))."""
+    pred = PRED_SWEEP if pred is None else pred
+    utc = REGISTERED_SWEEP_UTC if utc is None else utc
+    reg = utc != "TBD"
+    key = cell_key(C, B, S)
+
+    def band(name):
+        v = pred.get(name, "TBD")
+        return v.get(key, "TBD") if isinstance(v, dict) else v
+    out = []
+    sb = band("stage_ms")
+    for g, _ in GROUPS:
+        v = _get(res, "stages", "groups", g, "median_ms")
+        b = sb.get(g, "TBD") if isinstance(sb, dict) else sb
+        out.append(("SW-STAGE-%s" % g, _verdict(v, b, reg), "%s ms per step (T median) %s (band %s)" % (g, v, b)))
+    vc = res.get("verify_ceiling") or {}
+    gr = res.get("gemm_rows") or {}
+    R = int(vc.get("rows", SEL_ROWS))
+    pts = {p["mult"]: p["median_ms"] for p in gr.get("points", [])}
+    a0 = VERIFY_ACCEPT[0]
+    dr1 = dr1_for_pool(int(C) - BC.C_BASE)
+    fl, d1 = verify_case(vc, "measured", "floor", a0), verify_case(vc, "measured", dr1, a0)
+    rows = (("SW-GEMM-X1", "gemm_x1_ms", pts.get(1), "GEMM stack on B rows, ms per step"),
+            ("SW-GEMM-XR", "gemm_xr_ms", pts.get(R), "GEMM stack on %d x B rows, ms per step" % R),
+            ("SW-GEMM-SLOPE", "gemm_slope", gr.get("slope_ms_per_row"), "GEMM least-squares ms per row"),
+            ("SW-SEL", "sel_extra_ms", _get(res, "selection", "extra_joint_ms"),
+             "extra selection of a round, joint, ms per step"),
+            ("SW-UNION", "union_extras", _get(res, "verify_probe", "extras_per_stream"),
+             "union extras per (head, request)"),
+            ("SW-LOADS", "loads_per_stream", _get(res, "verify_probe", "loads_per_stream"),
+             "host loads per (layer, head, request) per step"),
+            ("SW-UFETCH", "union_fetch_ms", _get(res, "verify_probe", "union_fetch_ms"),
+             "union-extras fetch, ms per joint pass"),
+            ("SW-JOINT", "joint_steps", _get(vc, "joint_steps", "measured"), "joint pass (measured fetch) / H median"),
+            ("SW-CACHED-FLOOR", "vs_cached_floor", (fl or {}).get("vs_cached"),
+             "committed tok/s / %s at a %s, draft floor, measured fetch" % (REF_CACHED_TOK_S, a0)),
+            ("SW-CACHED-DR1", "vs_cached_dr1", (d1 or {}).get("vs_cached"),
+             "committed tok/s / %s at a %s, draft %s, measured fetch" % (REF_CACHED_TOK_S, a0, dr1)),
+            ("SW-OWN-FLOOR", "vs_own_floor", (fl or {}).get("vs_own"),
+             "committed tok/s / own H tok/s at a %s, draft floor, measured fetch" % a0))
+    for name, k, v, what in rows:
+        b = band(k)
+        out.append((name, _verdict(v, b, reg), "%s %s (band %s)" % (what, v, b)))
+    return out
+
+
 # ------------------------------------------------------------------ the arms (GPU)
 def parse_args(argv):
     ap = argparse.ArgumentParser()
@@ -1121,6 +1562,10 @@ def parse_args(argv):
     ap.add_argument("--sel-start", type=int, default=SEL_START)
     ap.add_argument("--sel-steps", type=int, default=SEL_STEPS, help="0: no selection probe")
     ap.add_argument("--sel-rows", type=int, default=SEL_ROWS, help="R rows per request (1 draft + R - 1 verify)")
+    ap.add_argument("--vfy-start", type=int, default=VFY_START)
+    ap.add_argument("--vfy-steps", type=int, default=VFY_STEPS, help="0: no verify probe")
+    ap.add_argument("--gemm-mults", default=",".join(str(m) for m in GEMM_MULTS),
+                    help="the GEMM probe's rows per request (comma list, increasing, with 1 and --sel-rows)")
     ap.add_argument("--ring", type=int, default=4)
     ap.add_argument("--baseline", default="", help="the same job's mb1 summary.json (Task 0.4)")
     ap.add_argument("--nsys-window", type=int, default=None,
@@ -1154,6 +1599,22 @@ def parse_args(argv):
                 ap.error("--sel-start / --sel-steps / --sel-rows: 2 .. 64 steps, 2 .. 16 rows, inside 1 .. steps - 1, "
                          "no re-warm (%s), apart from the profiler window %d .. %d and its neighbours" % (
                              sorted(rw), p0, p1 - 1))
+    try:
+        a.gemm_mults = tuple(int(x) for x in str(a.gemm_mults).split(","))
+    except ValueError:
+        ap.error("--gemm-mults: a comma list of integers")
+    if a.stage_timers and a.vfy_steps:
+        m = a.gemm_mults
+        if (any(not 1 <= x <= 8 for x in m) or list(m) != sorted(set(m)) or 1 not in m
+                or a.sel_rows not in m):
+            ap.error("--gemm-mults %s: increasing, each in 1 .. 8, with 1 and --sel-rows %d" % (m, a.sel_rows))
+        v0, v1 = a.vfy_start, a.vfy_start + a.vfy_steps
+        s0, s1 = (a.sel_start, a.sel_start + a.sel_steps) if a.sel_steps else (0, 0)
+        if (not a.sel_rows + 2 <= a.vfy_steps <= 64 or v0 < 1 or v1 > a.steps or rw & set(range(v0, v1))
+                or set(range(v0, v1)) & set(range(p0 - 1, p1 + 1)) or set(range(v0, v1)) & set(range(s0, s1))):
+            ap.error("--vfy-start / --vfy-steps: %d .. 64 steps (--sel-rows + 2), inside 1 .. steps - 1, no re-warm "
+                     "(%s), apart from the profiler window %d .. %d and its neighbours and from the selection window "
+                     "%d .. %d" % (a.sel_rows + 2, sorted(rw), p0, p1 - 1, s0, s1 - 1))
     return a
 
 
@@ -1187,22 +1648,30 @@ def arm_timer(a, model, ids, inputs_h, H, gates, NL, CEN, torch):
     before = snapshot_targets(NL, CEN, torch.cuda)
     clock = EvClock()
     exp = dict(main=expected_sequence(n_layers, pool), sel=expected_sequence(n_layers, pool, sel=True))
+    v0, v1 = (a.vfy_start, a.vfy_start + a.vfy_steps) if a.vfy_steps else (0, 0)
+    if a.vfy_steps:
+        exp["vfy"] = expected_sequence(n_layers, pool, vfy=a.gemm_mults)
     rec = StageRecorder(clock, n_layers, exp, ring=a.ring, cap=max(len(v) for v in exp.values()) + 8)
-    probe = None
+    probe, vfy = None, None
     s0, s1 = (a.sel_start, a.sel_start + a.sel_steps) if a.sel_steps else (0, 0)
     if a.sel_steps:
         probe = SelectionProbe(rec, model.layers, lambda: (model.pooling_buf_all.shape[-1], model.pooling_buf_all.dtype),
                                NL.infllmv2_attn_stage1_fast, NL.nosa_pooling, torch, rows=a.sel_rows,
                                qk_select=NL.QK_SELECT)
-    patcher = Patcher(rec, NL, CEN, n_layers, probe)
+    if a.vfy_steps:
+        vfy = VerifyProbe(rec, v1 - v0, torch, NL.F, NL.layer_norm, NL.silu_and_mul,
+                          final=(model.norm_weight, model.norm_variance_epsilon, model.lm_head), mults=a.gemm_mults,
+                          rows=a.sel_rows)
+    patcher = Patcher(rec, NL, CEN, n_layers, probe, vfy)
     cap = CaptureTimer(rec)
     gct = GcTimer()
     p0, p1 = a.prof_start, a.prof_start + a.prof_steps
     act = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
     hooks = TimerHooks(rec, patcher, cap, gct, (p0, p1), clock, lambda: torch.profiler.profile(activities=act),
-                       torch.cuda, a.steps, sel_window=(s0, s1), probe=probe)
+                       torch.cuda, a.steps, sel_window=(s0, s1), probe=probe, vfy_window=(v0, v1), vfy=vfy)
     log("arm T (B %d, %d steps; stage timers, ring %d, %d boundaries per step; profiler window %d .. %d; selection "
-        "probe %d .. %d, %d rows)" % (a.batch, a.steps, a.ring, len(exp["main"]), p0, p1 - 1, s0, s1 - 1, a.sel_rows))
+        "probe %d .. %d, %d rows; verify probe %d .. %d, GEMM rows per request %s)" % (
+            a.batch, a.steps, a.ring, len(exp["main"]), p0, p1 - 1, s0, s1 - 1, a.sel_rows, v0, v1 - 1, a.gemm_mults))
     try:
         out = decode_loop(model, ids, a.steps, clock, hooks)
     except Exception as e:
@@ -1214,12 +1683,20 @@ def arm_timer(a, model, ids, inputs_h, H, gates, NL, CEN, torch):
     pa, pr = BC.gpu_peak()
     moved = moved_targets(before, snapshot_targets(NL, CEN, torch.cuda))
     rw = {t for t, _ in out["rewarms"]}
-    keep = [t for t in range(a.steps) if t not in rw and not p0 - 1 <= t <= p1 and not s0 <= t < s1]
+    keep = [t for t in range(a.steps) if t not in rw and not p0 - 1 <= t <= p1 and not s0 <= t < s1
+            and not v0 <= t < v1]
     sel_keep = list(range(s0 + 1, s1))                        # the first selection step is the warm-up
+    vfy_keep = list(range(v0 + 1, v1))                        # the first verify step is the warm-up (times)
     periods = [rec.steps[t]["period_ms"] for t in range(a.steps)]
     steady = BC.period_stats(periods, keep)
     st = stage_summary(rec.steps, keep)
     sel = selection_summary(rec.steps, sel_keep, a.sel_rows) if probe is not None else None
+    gemm_rows, vsum = None, None
+    if vfy is not None:
+        gemm_rows = gemm_rows_summary(rec.steps, vfy_keep, a.gemm_mults, a.batch,
+                                      shipped_ms=_get(st, "groups", "gemm_mlp", "median_ms"))
+        vsum = vfy_summary(rec.steps, list(range(v0, v1)), vfy.take(), vfy.union_n, vfy.streams,
+                           model.layers[0].topk_blocks)
     eq = bool(torch.equal(out["inputs"], inputs_h))
     ndiff = 0 if eq else int((out["inputs"] != inputs_h).sum())
     prof, prof_err = None, None
@@ -1246,15 +1723,21 @@ def arm_timer(a, model, ids, inputs_h, H, gates, NL, CEN, torch):
             row["groups"] = {g: round(sum(r["stages"].get(x, 0.0) for x in ls), 3) for g, ls in GROUPS}
             if r["kind"] == "sel":
                 row["sel"] = {x: round(r["stages"].get(x, 0.0), 3) for x in SEL_LABELS}
+            if r["kind"] == "vfy":
+                row["vfy"] = {x: round(r["stages"].get(x, 0.0), 3) for x in vfy_labels(a.gemm_mults)}
         per_step[str(t)] = row
-    cm, cs = rec.chain_of("main"), rec.chain_of("sel")
+    cm, cs, cv = rec.chain_of("main"), rec.chain_of("sel"), rec.chain_of("vfy")
     T = dict(rewarms=out["rewarms"], prefill_s=out["prefill_s"], steady=steady, keep_n=len(keep),
              rates=BC.rates(a.batch, a.steps, periods, steady), gpu_peak_alloc_GB=pa, gpu_peak_reserved_GB=pr,
              device_used_end_GB=out["device_used_end_GB"], stages=st, per_layer_mean_ms=rec.per_layer_mean(),
-             chain=dict(main=cm, sel=cs, n_inner=rec.n_inner, expected_len={k: len(v) for k, v in exp.items()},
+             chain=dict(main=cm, sel=cs, vfy=cv, n_inner=rec.n_inner, expected_len={k: len(v) for k, v in exp.items()},
                         closure_max_ms=round(rec.closure_max_ms, 6)),
              selection=sel, selection_probe=(dict(window=[s0, s1 - 1], used=sel_keep, rows=a.sel_rows,
                                                   calls=probe.calls, errors=probe.errors) if probe else None),
+             gemm_rows=gemm_rows, vfy=vsum,
+             verify_probe=(dict(window=[v0, v1 - 1], used_times=vfy_keep, rows=a.sel_rows, mults=list(a.gemm_mults),
+                                calls=vfy.calls, errors=vfy.errors, union_n=vfy.union_n, streams=vfy.streams)
+                           if vfy else None),
              recapture=recapture_summary(hooks.recap, rec.steps, H.get("rewarm_ms") if H else None),
              profile=prof, profile_error=prof_err, tokens_equal_H=eq, token_diffs=ndiff,
              patch_installs=patcher.installs, per_step=per_step)
@@ -1276,6 +1759,14 @@ def arm_timer(a, model, ids, inputs_h, H, gates, NL, CEN, torch):
                       "(expected %d); errors %s; first mismatches %s" % (
                           cs["ok"], ns, len(exp["sel"]), probe.calls, n_layers * (s1 - s0), probe.errors[:2],
                           cs["examples"][:3])))
+    if vfy is not None:
+        nv, want = rec.n_inner.get("vfy", 0), n_layers * (v1 - v0)
+        ok = (cv["bad"] == 0 and cv["ok"] == nv == v1 - v0 and not vfy.errors
+              and vfy.calls == dict(union=want, count=want, gemm=want) and vsum["union_steps"] > 0)
+        gates.append(("T-VFY", True, ok, "%d of %d verify steps have the expected %d boundaries; probe calls %s "
+                      "(expected %d each); union steps %d; errors %s; first mismatches %s" % (
+                          cv["ok"], nv, len(exp["vfy"]), vfy.calls, want, vsum["union_steps"], vfy.errors[:2],
+                          cv["examples"][:3])))
     gates.append(("T-RESTORED", True, moved == [] and not hooks.instance_left,
                   "patch targets moved after T: %s; cache instance attribute left: %s" % (moved, hooks.instance_left)))
     seen = (prof or {}).get("gpu_ops_per_step", 0)
@@ -1374,7 +1865,13 @@ def main(argv=None) -> int:
         ref = base.get("steady_tok_s") if base and "error" not in base else None
         sel = T["selection"] if T["selection"] and T["selection"].get("n") else None
         res["ceiling"] = ceiling(hm, a.batch, sf, sel=sel, ref_tok_s=ref) if hm and sf else None
-    preds = verdicts_p0(C, a.batch, res, S=S) if a.nsys_window is None else []
+        res["gemm_rows"] = T["gemm_rows"]
+        res["verify_probe"] = T["vfy"]
+        gather = hm * sf["gather_only"] if hm and sf and "gather_only" in sf else None
+        res["verify_ceiling"] = (verify_ceiling(hm, a.batch, gather, T["gemm_rows"], sel, T["vfy"], rows=a.sel_rows,
+                                                attention_ms=_get(T, "stages", "groups", "attention", "median_ms"),
+                                                mb1_tok_s=ref) if T["gemm_rows"] is not None else None)
+    preds = verdicts_p0(C, a.batch, res, S=S) + verdicts_sweep(C, a.batch, res, S=S) if a.nsys_window is None else []
     if a.mbase and H is not None:
         preds = preds + BC.verdicts_mbase(C, a.batch, H, None)
     meta = dict(batch=a.batch, steps=a.steps, S0=S, context=S, doc_rows=rows, n_docs=n_docs,
@@ -1384,6 +1881,10 @@ def main(argv=None) -> int:
                 prof_window=[a.prof_start, a.prof_start + a.prof_steps - 1],
                 sel_window=([a.sel_start, a.sel_start + a.sel_steps - 1] if a.sel_steps else None),
                 sel_rows=a.sel_rows, ring=a.ring, nsys_window=a.nsys_window, mbase=a.mbase,
+                vfy_window=([a.vfy_start, a.vfy_start + a.vfy_steps - 1] if a.vfy_steps else None),
+                gemm_mults=list(a.gemm_mults), registered_sweep_utc=REGISTERED_SWEEP_UTC, predictions_sweep=PRED_SWEEP,
+                verify_formula=VERIFY_FORMULA, verify_accept=VERIFY_ACCEPT, draft_recovery=DRAFT_RECOVERY,
+                ref_cached_tok_s=REF_CACHED_TOK_S, weight_floor_ms=WEIGHT_FLOOR_MS,
                 registered_utc=REGISTERED_UTC, predictions=PRED_P0, ceiling_formula=CEILING_FORMULA, groups=GROUPS,
                 saves=SAVES, nosi_commit=os.environ.get("BASE_COMMIT", "unknown"), torch=torch.__version__,
                 gpu=torch.cuda.get_device_name(0), host_mem=mem)
@@ -1442,6 +1943,39 @@ def main(argv=None) -> int:
                       x.get("verify_budget_ms"), cg.get("K"), x.get("verify_budget_after_sel_joint_ms"),
                       x.get("min_accepted_joint"), x.get("verify_budget_after_sel_serial_ms"),
                       x.get("min_accepted_serial")))
+    gr = res.get("gemm_rows")
+    if gr and gr.get("n"):
+        print("REPORT GEMM rows C %d B %d S %d (median of %d verify steps; ms per step, 32 layers + final): %s; marginal "
+              "ms per row %s; least squares %s ms per row, intercept %s ms (floor about %s); shipped gemm_mlp %s ms "
+              "(probe B rows / shipped %s); prep %s ms" % (
+                  C, a.batch, S, gr["n"], ", ".join("%d rows %.3f (%.5f per row, %+.3f over the floor)" % (
+                      p["rows"], p["median_ms"], p["ms_per_row"], p["over_floor_ms"]) for p in gr["points"]),
+                  [m["ms_per_row"] for m in gr["marginal"]], gr["slope_ms_per_row"], gr["intercept_ms"],
+                  gr["floor_ms"], gr["shipped_gemm_mlp_ms"], gr["x1_over_shipped"], gr["prep"]["median_ms"]))
+    vp = res.get("verify_probe")
+    if vp:
+        print("REPORT union of R %d consecutive selections: mean %s, max %s per (head, request) over %d steps; extras %s "
+              "per stream; host loads %s per stream-step (%s per step, %d steps); fetch %s ms per step, %s ms per load; "
+              "union fetch (every extra a host load) %s ms per joint pass; extras / loads per stream %s" % (
+                  a.sel_rows, vp["union_mean"], vp["union_max"], vp["union_steps"], vp["extras_per_stream"],
+                  vp["loads_per_stream"], vp["loads_per_step"], vp["load_steps"], vp["fetch_ms_per_step"],
+                  vp["ms_per_load"], vp["union_fetch_ms"], vp["extras_over_loads"]))
+    vc = res.get("verify_ceiling")
+    if vc and vc.get("missing"):
+        print("REPORT verify ceiling: not computed, missing %s" % vc["missing"])
+    elif vc:
+        print("REPORT verify joint pass C %d B %d S %d: %s ms (%s shipped steps) = base %.3f + GEMM extra %s (x1 %s, x%d %s)"
+              " + selection extra %s + union fetch %s; components (GEMM R rows + selection R rows + one attention + "
+              "union fetch + rest of the step) %s" % (
+                  C, a.batch, S, vc["joint_ms"], vc["joint_steps"], vc["baseline_ms"], vc["gemm_extra_ms"],
+                  vc["gemm_x1_ms"], vc["rows"], vc["gemm_xr_ms"], vc["sel_extra_ms"], vc["union_fetch_ms"],
+                  vc.get("components")))
+        for c in vc["cases"]:
+            print("REPORT verify case fetch %s draft %s (share %s) a %s: draft %.3f ms, round %.3f ms, %.1f tok/s, / %s "
+                  "%.4f, / own %.4f, / mb1 %s; break-even joint own %.3f (margin %+.3f), cached %.3f (margin %+.3f)" % (
+                      c["fetch"], c["draft"], c["recovery"], c["accept"], c["draft_ms"], c["round_ms"], c["tok_s"],
+                      vc["ref_tok_s"], c["vs_cached"], c["vs_own"], c["vs_mb1"], c["breakeven_joint_own_ms"],
+                      c["margin_own_ms"], c["breakeven_joint_cached_ms"], c["margin_cached_ms"]))
     r = res.get("baseline_ratios")
     if r:
         print("SCORE C %d B %d S %d / mb1 (C %d B %d S %d, same job): median %.4f, mean %.4f, effective %.4f, steady "
