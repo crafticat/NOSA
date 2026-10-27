@@ -288,7 +288,9 @@ def _truncate_run(S_list, neg=None):
     dx, dr = RW.Driver(mx, x, S_list, tok), RW.Driver(mr, r, S_list, tok)
     dx.plain(W0)
     dr.plain(W0)
-    keep1 = torch.tensor([3, 1, 0, 2, 3, 1, 2, 0][:B], dtype=torch.int64)
+    # request 0 truncates all 3 steps (B 1: the plant then has steps to undo twice); B 8: fills at u 0 / 1 / 2 (S8 after
+    # W0) meet kept and truncated steps, and a kept fill of a truncated request (request 3) is written at truncate
+    keep1 = torch.tensor([0, 3, 1, 2, 3, 1, 2, 0][:B], dtype=torch.int64)
     kept = torch.where(keep1 == 3, torch.full_like(keep1, 2), keep1)
     rb.begin()
     lx = [dx.step(u, wrong=(u >= kept)) for u in range(3)]
