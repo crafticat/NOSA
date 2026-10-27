@@ -102,14 +102,15 @@ def define_undefined(cache, value=UNDEFINED_FILL):
 # ---- REGISTERED PREDICTIONS: TBD. The lead fills every value and the stamp (`date -u`, L33) in a commit BEFORE any
 # run; a None value prints UNREGISTERED. Bands are (low, high); NOTES_graphstep.md section 6 has the builder's
 # suggestions (not registered).
+# Lead registration: the builder's suggestions of NOTES section 6 are adopted as they are (basis written there).
 PRED_GS = dict(
-    stamp=None,                 # UTC stamp of the registration
-    steady_ratio=None,          # gs / sh steady wall per step, (low, high)
-    effective_ratio=None,       # gs / sh effective tok/s, (low, high)
-    launches_gs=None,           # gs launch calls per step, (low, high)
-    capture_s=None,             # gs total capture seconds, (low, high)
-    busy_ratio=None,            # gs / sh device busy per step, (low, high)
-    rewarm_hostcall_share=None,  # sh: (gc + empty_cache + synchronize ms) / re-warm period, mean over re-warms 2..9
+    stamp="2026-10-27T16:46:27Z",  # UTC stamp of the registration
+    steady_ratio=(0.95, 1.02),     # gs / sh steady wall per step, (low, high); central 0.99 (device-bound step)
+    effective_ratio=(1.4, 2.6),    # gs / sh effective tok/s, (low, high); central 2.1 (re-warms leave the loop)
+    launches_gs=(3, 15),           # gs launch calls per step, (low, high); central 8
+    capture_s=(2, 30),             # gs total capture seconds, (low, high); central 6
+    busy_ratio=(0.95, 1.02),       # gs / sh device busy per step, (low, high); central 0.99
+    rewarm_hostcall_share=(0.6, 1.0),  # sh: (gc + empty_cache + synchronize ms) / re-warm period; central 0.8
 )
 
 

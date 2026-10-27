@@ -866,12 +866,18 @@ def test_GS7_cell_pure_parts():
     br = GC.rewarm_breakdown([100.0, 6000.0], [(1, "out_len")], {1: dict(gc_ms=3000.0, empty_cache_ms=1500.0,
                                                                          sync_ms=500.0, n_gc=32)})
     assert br[0]["other_ms"] == 1000.0 and br[0]["hostcall_share"] == round(5000 / 6000, 4) and br[0]["n_gc"] == 32
-    v = {p[0]: p[1] for p in GC.gs_verdicts(dict(steady_ratio=0.99, effective_ratio=None), GC.PRED_GS)}
+    unreg = {k: None for k in GC.PRED_GS}                            # the builder's state, before the lead's stamp
+    v = {p[0]: p[1] for p in GC.gs_verdicts(dict(steady_ratio=0.99, effective_ratio=None), unreg)}
     assert v["GS-P1"] == "UNREGISTERED" and v["GS-P2"] == "NOT_RUN"
     v = {p[0]: p[1] for p in GC.gs_verdicts(dict(steady_ratio=0.99, capture_s=50.0),
                                             dict(GC.PRED_GS, steady_ratio=(0.95, 1.0), capture_s=(1, 30)))}
     assert v["GS-P1"] == "CONFIRMED" and v["GS-P4"] == "REFUTED"
-    assert all(v is None for v in GC.PRED_GS.values())              # TBD: the lead registers the values
+    if GC.PRED_GS["stamp"] is None:                                  # TBD: the lead registers the values
+        assert all(v is None for v in GC.PRED_GS.values())
+    else:                                                            # stamped: every value is a (low, high) band
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", GC.PRED_GS["stamp"])
+        assert all(isinstance(v, tuple) and len(v) == 2 and v[0] <= v[1]
+                   for k, v in GC.PRED_GS.items() if k != "stamp")
     import gc as gcmod
     pr = GC.Probe()
     orig = gcmod.collect
