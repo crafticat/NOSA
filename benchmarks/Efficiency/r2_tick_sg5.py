@@ -86,6 +86,14 @@ decisions, page tables and logits (tests_cpu/test_r2_admitfill.py).
 [f3lia] --inflight-array with --b2-resolve fused / check (and --res-lean --res-dev): the two parts are independent (the
 array poll is in OwnResidency._poll_arrivals, the fused resolve in FusedResolver.resolve); no new code joins them
 (tests_cpu/test_r2_f3lia.py).
+[b2-desc] --worker python|cpp (the gilfree transport's worker; default python) and --b2-issue object|desc (b2's draft
+issue; default object; desc = ONE E issue_desc job per tick, needs --worker cpp and --transport gilfree; [f3ldx] every
+--layout: on the pool the descriptor carries each take's lane, packer DESC 2), ported by hunks from 47db0c0;
+issue_clock / issue_report: the issue calls' host time, calls and takes per tick (REPORT info["issue"]).
+tests_cpu/test_r2_b2_desc.py, tests_cpu/test_r2_f3ldx.py.
+[f3ld] --no-transfer-mirror (b2, --b2-issue desc, --arrival-lag >= 1, --lean-time; not with --inflight-array): no
+Transfer object per take (OwnResidency(no_transfer_mirror=True); analysis/evalfast/PLAN_admission_fill.md rank 1b);
+the same decisions, page tables, table, store and logits (tests_cpu/test_r2_f3ld.py).
 [acc216] THE ACCURACY / EXACTNESS PROOF ON THE TIMED PATH (analysis/evalfast/STATUS_accuracy_B216.md section 5; opt-in
 --store-committed-tokens; no new kernel, no new mode). Every point stores its committed tokens (the statement of the
 [xpool] fp path, one_point). With --modes fast,bi_c_strict the two points run on the same prefill and harness, and
@@ -364,6 +372,16 @@ def parse_args(argv):
                          "(OwnResidency(inflight_array=True): no sort of the transfers in flight, one done / force per "
                          "issue, one vectorized check); the same admitted sets, decisions, page tables and logits "
                          "(tests_cpu/test_r2_admitfill.py)")
+    ap.add_argument("--worker", default="python", choices=("python", "cpp"),                     # [b2-desc]
+                    help="the gilfree transport's worker: python (the Python feeder, the default; p5b2 / p6) or cpp "
+                         "(E's C++ worker; needs packer v3 in --gilfree)")
+    ap.add_argument("--b2-issue", default="object", choices=("object", "desc"),                  # [b2-desc]
+                    help="b2's draft issue: object (tp.issue per layer, the default; p5b2 / p6) or desc (ONE "
+                         "tp.issue_desc job per tick; needs --worker cpp and packer v3 with DESC)")
+    ap.add_argument("--no-transfer-mirror", action="store_true",                                 # [f3ld]
+                    help="b2 with --b2-issue desc, --arrival-lag >= 1 and --lean-time only: no Transfer object per take "
+                         "(OwnResidency(no_transfer_mirror=True)): the poll, the Policy E victims, the waits and the "
+                         "merges on the table and the jobs; the same decisions (tests_cpu/test_r2_f3ld.py)")
     ap.add_argument("--store-committed-tokens", action="store_true",                          # [acc216]
                     help="store every point's committed tokens (info['committed_tokens']) and run the ACC gates "
                          "(module docstring); default: off (no token stored, no ACC gate)")
@@ -503,6 +521,15 @@ def parse_args(argv):
     if a.inflight_array and (a.backends != ["b2"] or a.arrival_lag < 1):                          # [inflight-array]
         ap.error("--inflight-array: --backends b2 with --arrival-lag >= 1 only (OwnResidency(inflight_array=True) "
                  "needs the fixed arrival rule)")
+    if a.b2_issue == "desc" and (a.worker != "cpp" or a.transport != "gilfree"):                  # [b2-desc]
+        ap.error("--b2-issue desc needs --worker cpp and --transport gilfree (E's issue_desc)")
+    if a.b2_issue == "desc" and a.backends != ["b2"]:                                             # [f3ld] [f3ldx]
+        ap.error("--b2-issue desc: --backends b2 only (OwnResidency(issue='desc')); every --layout (the pool: the "
+                 "descriptor's lane row, packer DESC >= 2)")
+    if a.no_transfer_mirror and (a.b2_issue != "desc" or a.arrival_lag < 1 or not a.lean_time   # [f3ld]
+                                 or a.inflight_array):
+        ap.error("--no-transfer-mirror: needs --b2-issue desc (with --worker cpp), --arrival-lag >= 1 and --lean-time; "
+                 "not with --inflight-array (both are poll paths; OwnResidency(no_transfer_mirror=True))")
     if a.store_committed_tokens:                                                                 # [acc216]
         if a.layout == "both" or a.stack_compare:
             ap.error("--store-committed-tokens: not with --layout both or --stack-compare (their arms compare and "
@@ -815,6 +842,45 @@ def cuda_event():
     return e
 
 
+def issue_clock(tp):                                                                            # [b2-desc]
+    """[b2-desc] REPORT: the main thread's host time in the transport's issue calls (tp.issue per layer on the object
+    path; tp.issue_desc per tick on the descriptor path), their calls and the takes they carry. It wraps the two
+    methods on this transport object (a perf_counter_ns pair per call: about 1 us per call, ~31 calls per tick on the
+    object path); a transport without a method is not wrapped. Returns the live counters (tp.issue_clock)."""
+    st = dict(calls=0, takes=0, ns=0, desc_calls=0)
+    for name in ("issue", "issue_desc"):
+        f = getattr(tp, name, None)
+        if not callable(f):
+            continue
+
+        def wrapped(*args, _f=f, _name=name, **kw):
+            t0 = time.perf_counter_ns()
+            try:
+                return _f(*args, **kw)
+            finally:
+                st["ns"] += time.perf_counter_ns() - t0
+                st["calls"] += 1
+                if _name == "issue":
+                    st["takes"] += len(args[1] if len(args) > 1 else kw.get("transfers", ()))
+                else:
+                    st["desc_calls"] += 1
+                    st["takes"] += int((args[0] if args else kw["desc"]).shape[1])
+        setattr(tp, name, wrapped)
+    tp.issue_clock = st
+    return st
+
+
+def issue_report(tp, ticks):                                                                     # [b2-desc]
+    """[b2-desc] REPORT: issue_clock's totals and per-tick means (ticks: the round's ticks)."""
+    st = getattr(tp, "issue_clock", None)
+    if st is None:
+        return None
+    n = max(1, int(ticks))
+    return dict(calls=st["calls"], desc_calls=st["desc_calls"], takes=st["takes"], host_ms=round(st["ns"] / 1e6, 3),
+                per_tick=dict(calls=round(st["calls"] / n, 2), takes=round(st["takes"] / n, 1),
+                              host_ms=round(st["ns"] / 1e6 / n, 4)))
+
+
 def select_attn(a, attn):                                                                       # [integ] sharedkv
     """[integ] The tick's attention object for --attn (r2_tick_gate.select_attn's tick choices): per_row = piece 3's
     module itself (default, unchanged); shared / shared-whole = a NEW SharedKV over the same loaded piece 3 module
@@ -891,9 +957,11 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
             raise RuntimeError("the gilfree transport needs the packer extension (not built in this run)")
         tp = GilfreeTransport(ext, host_k, host_v, eng.store_k, eng.store_v, 64, eng.D, threads=a.threads, host_wait=hw,
                               background=True, xpool=xp,                                         # [xpool] xp or None
-                              warm_up=getattr(a, "gilfree_warm_up", "on") == "on")              # [integ] gfw1f
+                              warm_up=getattr(a, "gilfree_warm_up", "on") == "on",              # [integ] gfw1f
+                              worker=getattr(a, "worker", "python"))                            # [b2-desc]
     else:
         tp = GatherTransport(host_k, host_v, eng.store_k, eng.store_v, C + X, xpool=xp)          # [xpool] xp or None
+    issue_clock(tp)                                                  # [b2-desc] REPORT: the issue's host time
     # [stack2] a failure after the transport exists closes it: the gilfree feeder thread holds the store (job 386
     # stack1a128: OwnResidency refused C + X 992 here, the thread kept the first engine, the gather arm built a second:
     # preflight peak 82.97 GB). The exception still propagates.
@@ -924,6 +992,8 @@ def make_engine(a, model, cache, st, ops, kind, C, X, R_ver, ext, timer_cats=Non
                                res_lean=bool(getattr(a, "res_lean", False)),                                      # [resfix]
                                res_dev=bool(getattr(a, "res_dev", False)),                                        # [resdev]
                                inflight_array=bool(getattr(a, "inflight_array", False)),                          # [inflight-array]
+                               issue=getattr(a, "b2_issue", "object"),                                            # [b2-desc]
+                               no_transfer_mirror=bool(getattr(a, "no_transfer_mirror", False)),                  # [f3ld]
                                end_batch=bool(getattr(a, "end_batch", False)), **kw)                              # [endbatch]
             lazy.impl = CudaDeviceOps(svc, host_k, host_v, eng.store_k, eng.store_v, eng.store_bias, cis)       # [b2]
             eng.end_batch = bool(getattr(a, "end_batch", False))         # [endbatch] run_round: one end call per tick
@@ -1669,6 +1739,8 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
     if kind == "b2":                                                 # [b2] the mode (report()["b2"] repeats it)
         info["b2_checked"] = bool(getattr(a, "b2_checked", False))
         info["b2_resolve"] = getattr(a, "b2_resolve", "torch")                    # [fusedres]
+        info["b2_issue"] = getattr(a, "b2_issue", "object")                                     # [b2-desc]
+    info["worker"] = getattr(a, "worker", "python")                                             # [b2-desc]
     if layout is not None or getattr(a, "layout", "stream") != "stream":                         # [xpool]
         info["layout"] = arm_layout(a, layout)
         if info["layout"] == "pool":
@@ -1742,6 +1814,7 @@ def one_point(a, model, cache, st, first, ops, kind, C, X, R_ver, ext, steps, T_
                                    counts=dict(svc.metrics.counts), d2h_reads=getattr(svc, "d2h_reads", None),
                                    sc=sc_counters(svc)),                 # REPORT (RES_SC.md 6)
                     transport=dict(tp.stats), threads_ok=tp.threads_ok())
+        info["issue"] = issue_report(tp, rnd.ticks)                   # [b2-desc] REPORT (docs/R2_B2_DESC_PLAN.md)
         info["transport_warm_calls"] = getattr(tp, "warm_calls", None)                           # [integ] gfw1f
         sb_ = getattr(a, "shipped_batch", 0) or eng.B                                            # [integ]
         if sb_ != eng.B:                                       # the shipped decode ran at another batch: no ratio
@@ -2195,6 +2268,8 @@ def main(argv=None) -> int:
             meta.update(end_batch=True)
         if a.apply_batched:                                                                    # [applyev]
             meta.update(apply_batched=True)
+        meta.update(worker=a.worker, b2_issue=a.b2_issue)                                      # [b2-desc]
+        meta.update(no_transfer_mirror=a.no_transfer_mirror)                                   # [f3ld]
         if a.gc_freeze:                                                                        # [hostfix] item 1
             meta.update(gc_freeze=True, gc_freeze_note="each timed phase: collect, freeze, disable before; unfreeze, "
                                                        "enable, collect after (per point: gc_freeze[phase])")
@@ -2264,6 +2339,7 @@ def main(argv=None) -> int:
                                 af = copy.copy(a)
                                 af.arrival_lag = 0
                                 af.inflight_array = False          # [inflight-array] free timing: the old poll
+                                af.no_transfer_mirror = False      # [f3ld] free timing: the mirror path
                                 log("%s_free: the same stack at free arrival (REPORT timing)" % label)
                                 pf = one_point(af, model, cache, st, first,
                                                BIOps(select_attn(af, attn), a.m_fix, gemm=mode), kind, a.C, a.X,

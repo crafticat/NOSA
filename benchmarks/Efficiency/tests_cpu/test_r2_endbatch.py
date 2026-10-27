@@ -499,7 +499,11 @@ def test_EB4a_the_per_request_sources_are_the_base_text():
     b_own2, b_ops, b_tick = (_base_text(p) for p in ("nosi/nosi/r2_own2.py", "nosi/nosi/r2_own2_ops.py",
                                                      "nosi/nosi/r2_tick.py"))
     old = _block(b_own2, "    def end_request(self, uid) -> None:")
-    assert old in own2 and "O.end_owner(self.own, b)" in old
+    # [f3tall] b2-desc (f3ldx) added exactly these two lines to end_request (b's write-back marks); the rest is the base
+    b2desc_end = ("        if self._hm is not None:                                      # [b2-desc] as hist_ev: b's "
+                  "write-backs dropped\n            self._hm[b] = -1\n")
+    assert own2.count(b2desc_end) == 1
+    assert old in own2.replace(b2desc_end, "") and "O.end_owner(self.own, b)" in old
     old = _block(b_ops, "def end_owner(T: Table, b: int", "\n\n\ndef ")
     assert old in ops
     old = _block(b_tick, "    def end_request(self, b: int) -> None:\n        if b not in self.ended:", "\n\n\n")
@@ -540,7 +544,7 @@ def test_EB4d_the_step_cell_static():
     assert "        evalfast2eb) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     assert "|evalacc216f3lia|evalfast2eb" in text                      # [f3all] (was "|evalfast2rdp|evalfast2eb]")
     root = next(ln for ln in text.splitlines() if ln.startswith("NOSI_EVAL=")).split()[0][len("NOSI_EVAL="):]
-    assert root == "/mnt/beegfs/ojerbi/nosi-r2-f3all"                  # [f3all] (was nosi-r2-endbatch)
+    assert root == "/mnt/beegfs/ojerbi/nosi-r2-f3tall"                 # [f3tall] (was nosi-r2-f3all / -endbatch)
     reg = text[text.index("# REGISTERED for evalfast2eb"):]
     reg = reg[:reg.index("\n#\n")]
     for tag in ("STAMP 2026-10-23T18:05:38Z, before any run", "EB-O", "O <= 350 ms", "EB-EFF", "point 233, band [226, 245]", "EB-MED",

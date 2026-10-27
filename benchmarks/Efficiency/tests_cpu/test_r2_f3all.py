@@ -75,7 +75,7 @@ RF = _shared("test_r2_resfix_shared_rd", "test_r2_resfix.py")         # RL2's ro
 HF, TT, OWN2 = RF.HF, RF.TT, RF.OWN2
 TK = TT.TK
 p3 = RF.p3                                                            # the fixture, by name
-ALL_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3all"                         # NOSI_EVAL
+ALL_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3tall"                        # NOSI_EVAL ([f3tall]; was nosi-r2-f3all)
 STANDIN_BANDS = "1:2:1:2:1:2"                                         # syntax only (no prediction): the parse test
 
 
@@ -604,8 +604,8 @@ def test_FA7_the_cells_static():
     lines = text.splitlines()
     assert next(ln for ln in lines if ln.startswith("NOSI_EVAL=")).split()[0] == "NOSI_EVAL=" + ALL_ROOT
     assert ALL_ROOT == HF.HF_ROOT
-    assert "|evalacc216f3lia|evalfast2eb|evalfast2ab|evalfast2c3ab|evalfast2all|evalfast2c3all|evalacc216all] " \
-           "[gilfree|gather]" in text
+    assert "|evalacc216f3lia|evalfast2eb|evalfast2ab|evalfast2c3ab|evalfast2all|evalfast2c3all|evalacc216all|" in text
+    assert "] [gilfree|gather]" in text          # [f3tall] the f3ld / f3ldx / f3tall cells follow (test_r2_hostfix.py HF6a)
     assert "        evalfast2all|evalfast2c3all) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     assert "        evalacc216all) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     fa = _cell(text, "    evalfast2all) MODES=fast")

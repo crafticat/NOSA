@@ -612,8 +612,8 @@ FL_CELLS = dict(
 def test_FL7a_the_cells_and_the_registration_static():
     text = HF.STEP.read_text()
     lines = text.splitlines()
-    # [f3all] the ROOT moved to nosi-r2-f3all (f3lia + endbatch + applyev); the flean cells are unchanged there
-    assert next(ln for ln in lines if ln.startswith("NOSI_EVAL=")).split()[0] == "NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-f3all"
+    # [f3tall] the ROOT moved to nosi-r2-f3tall (f3all + f3ldx); the flean cells are unchanged there
+    assert next(ln for ln in lines if ln.startswith("NOSI_EVAL=")).split()[0] == "NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-f3tall"
     assert "        evalfast2f3p|evalfast2c3l|evalfast2f3l) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     assert "|evalfast2c3|evalfast2f3|evalfast2f3_192|evalfast2f3p|evalfast2c3l|evalfast2f3l|" in text   # [f3lia] more follow
     reg = text[text.index("# REGISTERED for evalfast2f3p / evalfast2c3l / evalfast2f3l"):]

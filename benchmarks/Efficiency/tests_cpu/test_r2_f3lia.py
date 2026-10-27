@@ -64,7 +64,7 @@ def _shared(name, file):
 RF = _shared("test_r2_resfix_shared_rd", "test_r2_resfix.py")         # RL2's rounds and cases (shared name)
 HF, TT, OWN2 = RF.HF, RF.TT, RF.OWN2
 p3 = RF.p3                                                            # the fixture, by name
-F3_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3all"                         # [f3all] NOSI_EVAL (was nosi-r2-f3lia)
+F3_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3tall"                        # [f3tall] NOSI_EVAL (was nosi-r2-f3all / -f3ldx / -f3lia)
 LAG = 2                                                               # the eval cells' --arrival-lag
 STANDIN_BANDS = "1:2:1:2:1:2"                                         # syntax only (no prediction): the parse test
 
@@ -383,7 +383,7 @@ def test_F3G_the_cells_static():
     assert next(ln for ln in lines if ln.startswith("NOSI_EVAL=")).split()[0] == "NOSI_EVAL=" + F3_ROOT
     assert F3_ROOT == HF.HF_ROOT
     assert "|evalfast2f3l|evalfast2ia|evalacc216m|evalacc216|evalfast2f3lia|evalfast2c3lia|evalacc216f3lia|" in text
-    assert "] [gilfree|gather]" in text                                # [f3all] the endbatch / applyev / f3all cells follow
+    assert "] [gilfree|gather]" in text          # [f3all] [f3ld] [f3ldx] [f3tall] the later cells follow (test_r2_hostfix.py HF6a)
     assert "        evalfast2f3lia|evalfast2c3lia) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     assert "        evalacc216f3lia) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     i = text.index("    evalfast2f3lia) MODES=fast")

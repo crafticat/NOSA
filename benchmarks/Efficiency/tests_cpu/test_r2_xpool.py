@@ -101,10 +101,11 @@ class FlatAdversarial(KTR.AdversarialTransport):
 
 
 def make_pool_engine(ops, kind="b2", C=12, X=24, R_ver=4, X_pool=None, S_list=TT.S_TINY, steps=TT.STEPS, seed=1,
-                     mode="delay", svc_kw=None, xp_mut=None, **kw):
+                     mode="delay", svc_kw=None, xp_mut=None, tp_factory=None, **kw):
     """TT.make_res_engine's world on the SHARED POOL layout: the same twins and host rows (the same seeded prefill),
     one flat store per layer with the four tail pages at their static positions and an empty history arena; the
-    service (b2 / sc) and the engine share one XPool; FlatAdversarial with the same seed."""
+    service (b2 / sc) and the engine share one XPool; FlatAdversarial with the same seed. [f3ldx] tp_factory(be,
+    host_k, host_v, sk, sv, xp, seed): another transport on the same pool (test_r2_f3ldx.py: E's GilfreeTransport)."""
     ref_eng = TT.make_engine(ops, S_list=S_list, steps=steps, seed=seed)
     B, NBr = len(S_list), C + X
     n_host = (ref_eng.NB + 1) * BS
@@ -133,8 +134,11 @@ def make_pool_engine(ops, kind="b2", C=12, X=24, R_ver=4, X_pool=None, S_list=TT
     eng = TK.TickEngine(ref_eng.model, ops, ref_eng.twins, sk, sv, sb, S_list, ref_eng.M_alloc, nl=TT.NL_CPU,
                         stage1=TT._stage1, pool=TT._pool, check=True, xpool=xp, **kw)
     be = TT.Be()
-    tp = FlatAdversarial(be, host_k, host_v, sk, sv, BS, seed, mode=mode, max_delay=3)
-    tp.xpool = xp                                                     # the transport writes this pool's lanes (m2)
+    if tp_factory is None:
+        tp = FlatAdversarial(be, host_k, host_v, sk, sv, BS, seed, mode=mode, max_delay=3)
+        tp.xpool = xp                                                 # the transport writes this pool's lanes (m2)
+    else:
+        tp = tp_factory(be, host_k, host_v, sk, sv, xp, seed)         # [f3ldx]
     gather = RES.TorchGather(host_k, host_v, sk, sv)
     cis = [t.total_cis[:B] for t in eng.twins]
     args = (TT.NL_LAYERS, B, TT.HKV, C, X, R_ver, tp, gather)

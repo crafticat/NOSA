@@ -61,7 +61,7 @@ HF, TT, TK, OWN2, RSC, XPT = RF.HF, RF.TT, RF.TK, RF.OWN2, RF.RSC, RF.XPT
 p3, ref = RF.p3, RF.ref                                               # the fixtures, by name
 LAG = 2                                                               # the eval cells' --arrival-lag
 FLAGS = dict(plain={}, eval=dict(lean=True, wait_index=True, fewer_reads=True, res_lean=True))
-IA_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3all"                         # [f3all] (was nosi-r2-f3lia; before: nosi-r2-admitfill)
+IA_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3tall"                        # [f3tall] (was nosi-r2-f3all / -f3ldx / -f3lia / -admitfill)
 IA_BANDS = "328:362:305:338:245:282"
 
 
@@ -291,14 +291,22 @@ def test_IA3a_flag_off_never_runs_the_array_poll(p3, ref, monkeypatch, lag):
 
     def boom(self):
         raise AssertionError("the array poll ran with the flag off")
+    def boom_nm(self):
+        raise AssertionError("the table poll (--no-transfer-mirror) ran with its flag off")
     monkeypatch.setattr(OWN2.OwnResidency, "_poll_arrivals_array", boom)
+    monkeypatch.setattr(OWN2.OwnResidency, "_poll_arrivals_nm", boom_nm)  # [f3ld] the other opt-in poll path
     r = RF._round(_eng(p3, "stream", "pressure", 1, False, lag=lag), toks, True)
     assert r.err is None and len(r.ticks) > 10, r.err
     assert r.svc.inflight_array is False and r.svc._ia_groups == {} and r.svc.ia_stats["polls"] == 0
+    assert r.svc.no_transfer_mirror is False                          # [f3ld] its default
     src = inspect.getsource(OWN2.OwnResidency._poll_arrivals)
     body = src.split('"""', 2)[2]
-    first = [ln.strip() for ln in body.splitlines() if ln.strip()][:2]
-    assert first[0].startswith("if self.inflight_array:") and first[1] == "return self._poll_arrivals_array()", first
+    first = [ln.split("  #", 1)[0].strip() for ln in body.splitlines() if ln.strip()][:5]
+    # [f3ld] the dispatcher: the table path first, then the array path, each behind its own flag; with both off the
+    # next line is the old poll's first line
+    assert first[:4] == ["if self.no_transfer_mirror:", "return self._poll_arrivals_nm()",
+                         "if self.inflight_array:", "return self._poll_arrivals_array()"], first
+    assert first[4] == "self.tp.poll()", first
     for old in ("order = sorted(self.inflight.values(), key=lambda tr: (tr.layer, tr.b, tr.h, tr.seq))",
                 "if tr.seq not in self._landed and not self._arrived(tr):", "for tr in arrived:"):
         assert old in body, old                                       # the old lines are still the off path

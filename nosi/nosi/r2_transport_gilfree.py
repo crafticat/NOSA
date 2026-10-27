@@ -31,7 +31,9 @@ does not say which side.
   transfer's group is (b' = 0, h, l' = l * B + b, m' = Transfer.phys, blk), so (m' * R + r) * H + h is lane h of its
   position (S_dst = M * 64; the packer's m' < M check is the lane bound). The duplicate check is per (h, lane).
   [integ] Both workers: _check holds the flat checks; worker="cpp" submits the flat store as a (1, M * 64, H, D) view
-  (the same S_dst); issue_desc (logical slots computed in C++) refuses the pool.
+  (the same S_dst). [f3ldx] issue_desc on the pool (packer DESC >= 2): the descriptor gets a 7th row, each take's lane
+  by the object path's rule (XPool.lanes_of = pos_of at XPool.phys_index, the index of assign_phys), the flat stores
+  go to set_stores as they are (3-D), and C++ writes m' = lane (the m' of _submit) on the same (rows, D) view.
 
 THE ORDER RULES of K3X's transfers, kept here:
   T4  hist_ev (the tick's write-back of the block's host rows): the packer reads host rows only after it, so the
@@ -146,6 +148,7 @@ class _JobEv:
 
 
 WORKERS = ("python", "cpp")
+DESC_LANES = 2                                     # [f3ldx] packer v3's DESC level with the lane row (flat stores)
 
 
 class GilfreeTransport:
@@ -154,6 +157,7 @@ class GilfreeTransport:
     # worker's job event), and the worker sets tr.ev in the list's order: so the last transfer's done() is the issue's
     # (OwnResidency(inflight_array=True) asks one done per issue)
     one_event_per_issue = True
+    desc_lanes = DESC_LANES                            # [f3ldx] the DESC level issue_desc needs on the X pool
     # [hostfix] --host-profile (OPT-IN; None: no clock is read): a list that gets one record per release of the
     # Python worker (_release, the feeder thread when background): (layer, transfers, python ns, native ns, the clock
     # at its end). python ns = the release's wall time minus the native pack call (npipe.release, which runs the C++
@@ -521,12 +525,13 @@ class GilfreeTransport:
         rows l, b, h, block, slot, gen (B2's take list); reader_marks: per layer the newest mark (tick * L + layer) of
         its destinations' last readers (-1: none); hist_mark: the newest write-back tick of the job's host rows (-1:
         none). C++ builds the pack plan (the adapter's geometry and checks) and publishes the board; returns the job's
-        seq (0: no take). The host admits the takes of every job seq <= landed_upto()."""
+        seq (0: no take). The host admits the takes of every job seq <= landed_upto(). [f3ldx] With an X pool the
+        caller's desc is unchanged; the transport adds the lane row (_desc_lanes) before submit_desc."""
         if self.worker != "cpp" or not int(getattr(self.ext, "DESC", 0)):
             raise RuntimeError("gilfree: issue_desc needs worker='cpp' and packer v3 with DESC (submit_desc)")
-        if self.xpool is not None:                             # [integ] C++ computes m' = b * slots + slot (logical)
-            raise ValueError("gilfree: issue_desc does not translate xpool lanes (the descriptor names logical slots); "
-                             "use issue() with Transfer.phys")
+        if self.xpool is not None and int(getattr(self.ext, "DESC", 0)) < DESC_LANES:
+            raise RuntimeError("gilfree: issue_desc on the X pool needs packer v3 with DESC >= %d (the lane row of "
+                               "submit_desc on flat stores; got DESC %s)" % (DESC_LANES, getattr(self.ext, "DESC", 0)))
         if (not torch.is_tensor(desc) or desc.dtype != torch.int64 or desc.dim() != 2 or desc.shape[0] != 6
                 or desc.device.type != "cpu"):
             raise ValueError("gilfree: desc must be a (6, n) int64 CPU tensor (l, b, h, block, slot, gen)")
@@ -534,6 +539,8 @@ class GilfreeTransport:
         self._reap()
         if desc.shape[1] == 0:
             return 0
+        if self.xpool is not None:
+            desc = self._desc_lanes(desc)                      # [f3ldx] (7, n): + the lane of each take
         keep: list = []
         readers = []
         if reader_marks is not None:
@@ -552,12 +559,34 @@ class GilfreeTransport:
         self._last_seq = seq
         return seq
 
+    def _desc_lanes(self, desc: torch.Tensor) -> torch.Tensor:
+        """[f3ldx] The descriptor on the X pool: (7, n) = desc + row 6, each take's LANE, by the OBJECT PATH'S RULE:
+        XPool.lanes_of reads pos_of at XPool.phys_index(l, b, h, slot), the index assign_phys reads for Transfer.phys
+        (r2_xpool.py), which _submit sends as m'. The same history-arena bound as _check (0 <= lane < A); C++ checks
+        one take per (l, h, lane) (the object path's per-(h, lane) duplicate check) and lane < M."""
+        lanes = self.xpool.lanes_of(desc)
+        bad = (lanes < 0) | (lanes >= self.xpool.A)
+        if bool(bad.any()):
+            i = int(bad.nonzero()[0, 0])
+            raise ValueError("gilfree (xpool): descriptor take %d (l %d b %d h %d slot %d) has lane %d outside the "
+                             "history arena [0, %d)" % (i, int(desc[0, i]), int(desc[1, i]), int(desc[2, i]),
+                                                        int(desc[4, i]), int(lanes[i]), self.xpool.A))
+        return torch.cat([desc, lanes.view(1, -1)]).contiguous()
+
     def landed_upto(self) -> int:
         """Q-B3: the job watermark (worker="cpp"): every job up to this seq ran without error and its rows landed
         (CUDA: its completion event on the scatter stream is done). It only grows; a failed job never lands."""
         if self.worker != "cpp":
             raise RuntimeError("gilfree: landed_upto needs worker='cpp'")
         return int(self.npipe.landed_upto())
+
+    def job_ev(self, seq: int) -> "_JobEv":
+        """[b2-desc] The completion object of descriptor job `seq` (worker="cpp"), the one that issue() gives every
+        transfer of a job: a caller that keeps one Transfer per take (OwnResidency(issue="desc")) sets tr.ev to it, so
+        done / force / wait_submitted / Stream.wait_event work per job as on the object path."""
+        if self.worker != "cpp" or int(seq) < 1:
+            raise RuntimeError("gilfree: job_ev needs worker='cpp' and a job seq >= 1 (got %r)" % (seq,))
+        return _JobEv(self, int(seq))
 
     # ------------------------------------------------------------------------------------------------ one release
     def _check(self, layer: int, transfers: List[Transfer]) -> None:

@@ -29,16 +29,17 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 EFF = ROOT / "benchmarks/Efficiency"
 STEP = EFF / "r2_tick_sg5_step.sh"
-ACC_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3all"                         # [f3all] (was nosi-r2-f3lia; before: nosi-r2-acc216)
+ACC_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3tall"                        # [f3tall] (was nosi-r2-f3all / -f3ldx / -f3lia / -acc216)
 # [f3lia] the commit the acc216 delta applies to in this tree: r2-f3lia's merge of flean + admitfill (3463341), the
 # parent of the acc216 merge (was 8ccf262, acc216's own base: flean and admitfill changed make_engine / preflight /
 # one_point after it, so the line compare is made against the tree that acc216 was merged into)
 BASE_SHA = "346334116e779add7d4e77aff02e7ffaab25f62c"
-# [f3all] the tree that endbatch (1ae07fe) and applyev (a3199da) were merged into: f3lia's tip 5cdfc75 (acc216 merged).
-# AC2 compares in two steps (as nosi-r2-f3ldx 14043f0 did for the b2-desc port): BASE_SHA -> PORT_SHA is acc216's own
-# delta (the ONE condition line); PORT_SHA -> this tree is the merge's delta, which must be REPORT / gate lines and
-# assignments whose flag-off values equal the callees' defaults (flag off: no state change)
-PORT_SHA = "5cdfc755c236dd14a6c9036b73693a028dddedcc"
+# [f3tall] the merge base of f3all and f3ldx: f3lia's tip 89c9169 (acc216 merged). f3all compared against 5cdfc75 (the
+# stamp commit after 89c9169); its r2_tick_sg5.py is the blob of 89c9169 (5cdfc75 changes the step script only). AC2
+# compares in two steps: BASE_SHA -> PORT_SHA is acc216's own delta (the ONE condition line); PORT_SHA -> this tree is
+# the delta of BOTH sides (f3ldx's port: REPORT lines and keyword arguments at the callees' defaults; f3all's merge:
+# REPORT / gate lines and assignments whose flag-off values equal the callees' defaults; flag off: no state change)
+PORT_SHA = "89c9169bd60b37fcba760e1220d1b00bb26ad3c8"
 sys.path.insert(0, str(EFF))
 
 
@@ -101,38 +102,48 @@ def _code(ln):
 
 
 def _undo_port(new_f, added, merges):
-    """[f3all] new_f's code lines with the merge's delta undone: each line of `added` (stripped code) is dropped and
-    each run of `merges` (consecutive stripped code lines) goes back to its one old code line. Each must occur exactly
-    once, so a line that the merge did not add makes the compare fail (nosi-r2-f3ldx 14043f0's helper)."""
+    """[f3ldx] [f3all] new_f's code lines with the port's / merge's delta undone: each line of `added` (stripped code)
+    is dropped and each run of `merges` (consecutive stripped code lines) goes back to its one old code line. Each must
+    occur exactly once, so a line that the port or the merge did not add makes the compare fail."""
     new = [_code(x) for x in new_f.splitlines()]
     for ln in added:
-        assert sum(1 for x in new if x.strip() == ln) == 1, ("the merge's added line is not there once", ln)
+        assert sum(1 for x in new if x.strip() == ln) == 1, ("the delta's added line is not there once", ln)
         new = [x for x in new if x.strip() != ln]
     for run, old in merges:
         at = [i for i in range(len(new) - len(run) + 1) if [x.strip() for x in new[i:i + len(run)]] == list(run)]
-        assert len(at) == 1, ("the merge's changed lines are not there once", run)
+        assert len(at) == 1, ("the delta's changed lines are not there once", run)
         i = at[0]
         new[i:i + len(run)] = [new[i][:len(new[i]) - len(new[i].lstrip())] + old]
     return new
 
 
+# [f3ldx] the port's lines in one_point: REPORT only (each writes one key of info and reads nothing it changes)
+PORT_ONE_POINT_ADDED_LDX = ('info["b2_issue"] = getattr(a, "b2_issue", "object")',
+                            'info["worker"] = getattr(a, "worker", "python")',
+                            'info["issue"] = issue_report(tp, rnd.ticks)')
 # [f3all] applyev's lines in one_point (endbatch adds none there): the engine's host counters read into abw (getattr
 # only), the REPORT key info["apply_batched"] under the flag, and the gate list extended by apply_batched_gates (which
 # returns [] with the flag off; checked in AC2)
-PORT_ONE_POINT_ADDED = (
+PORT_ONE_POINT_ADDED_ALL = (
     'abw = dict(apply_batched=getattr(eng, "apply_batched", False), apply_calls=getattr(eng, "apply_calls", 0),',
     'apply_rb_max=getattr(eng, "apply_rb_max", 0), apply_rb_items=getattr(eng, "apply_rb_items", 0))',
     'if getattr(a, "apply_batched", False):',
     'info["apply_batched"] = abw',
     'gates.extend(apply_batched_gates(a, label, abw))')
-# [f3all] the merge's lines in make_engine: two engine assignments and one keyword argument (their flag-off values are
-# the defaults: TickEngine apply_batched False / end_batch False, OwnResidency end_batch False; checked in AC2)
-PORT_MAKE_ENGINE_ADDED = ('eng.apply_batched = bool(getattr(a, "apply_batched", False))',
+PORT_ONE_POINT_ADDED = PORT_ONE_POINT_ADDED_LDX + PORT_ONE_POINT_ADDED_ALL           # [f3tall] both sides
+# [f3ldx] the REPORT wrapper and [f3all] two engine assignments in make_engine; [f3ldx] three keyword arguments and
+# [f3all] one (their flag-off values are the callees' defaults: worker "python", issue "object", no_transfer_mirror
+# False, OwnResidency end_batch False, TickEngine apply_batched False / end_batch False; checked in AC2)
+PORT_MAKE_ENGINE_ADDED = ("issue_clock(tp)",
+                          'eng.apply_batched = bool(getattr(a, "apply_batched", False))',
                           'eng.end_batch = bool(getattr(a, "end_batch", False))')
 PORT_MAKE_ENGINE_MERGES = (
-    (('inflight_array=bool(getattr(a, "inflight_array", False)),',
+    (('warm_up=getattr(a, "gilfree_warm_up", "on") == "on",', 'worker=getattr(a, "worker", "python"))'),
+     'warm_up=getattr(a, "gilfree_warm_up", "on") == "on")'),
+    (('inflight_array=bool(getattr(a, "inflight_array", False)),', 'issue=getattr(a, "b2_issue", "object"),',
+      'no_transfer_mirror=bool(getattr(a, "no_transfer_mirror", False)),',
       'end_batch=bool(getattr(a, "end_batch", False)), **kw)'),
-     'inflight_array=bool(getattr(a, "inflight_array", False)), **kw)'),)
+     'inflight_array=bool(getattr(a, "inflight_array", False)), **kw)'))
 
 
 def _func(src, name):
@@ -166,9 +177,11 @@ def test_AC2_flag_off_is_unchanged():
     assert diff[0][0].strip().startswith("if fp is not None:") and diff[0][1].strip().startswith(new)
     for f in ("make_engine", "run_draft_only", "preflight", "load_docs", "one_point_both", "one_point_stacks"):
         assert _func(old, f) == _func(mid, f), f                        # no other path of the timed round changed
-    # step 2, the merge's delta (PORT_SHA -> this tree), [f3all]: one_point only adds applyev's five lines and
-    # make_engine only two assignments and one keyword argument; no other line of the timed round changed
+    # step 2, the delta of both sides (PORT_SHA -> this tree), [f3tall]: one_point only adds f3ldx's three REPORT lines
+    # and applyev's five lines; make_engine only the REPORT wrapper, two assignments and four keyword arguments; no
+    # other line of the timed round changed
     assert _undo_port(_func(src, "one_point"), PORT_ONE_POINT_ADDED, ()) == [_code(x) for x in mid_l]
+    assert all(ln.startswith("info[") for ln in PORT_ONE_POINT_ADDED_LDX)  # each writes one REPORT key, nothing else
     assert (_undo_port(_func(src, "make_engine"), PORT_MAKE_ENGINE_ADDED, PORT_MAKE_ENGINE_MERGES)
             == [_code(x) for x in _func(mid, "make_engine").splitlines()])
     for f in ("run_draft_only", "preflight", "load_docs", "one_point_both", "one_point_stacks"):
@@ -185,6 +198,8 @@ def test_AC2_flag_off_is_unchanged():
     w_any = dict(apply_batched=True, apply_calls=5, apply_rb_max=4, apply_rb_items=9)
     assert G.apply_batched_gates(a0, "x", w_any) == [] and G.apply_batched_gates(SimpleNamespace(), "x", w_any) == []
     assert "setattr" not in inspect.getsource(G.apply_batched_gates)   # it reads w and a only
+    # [f3ldx] the port's flags are OFF by default, and off they pass the callees' own defaults (the pre-port call)
+    assert (a0.worker, a0.b2_issue, a0.no_transfer_mirror) == ("python", "object", False)
 
     def init_sig(file, cls):                                          # the class's own __init__ signature (text)
         s = (ROOT / "nosi/nosi" / file).read_text()
@@ -204,6 +219,29 @@ def test_AC2_flag_off_is_unchanged():
     assert ('        if getattr(engine, "end_batch", False):' in rr
             and "            for b, r in enumerate(rnd.reqs):\n                if r.done:\n"
                 "                    engine.end_request(b)\n" in rr), "run_round: off = one end_request per request"
+    sig = init_sig("r2_transport_gilfree.py", "GilfreeTransport")    # [f3ldx]
+    assert 'worker: str = "python"' in sig, sig
+    sig = init_sig("r2_own2.py", "OwnResidency(")
+    assert 'issue: str = "object"' in sig and "no_transfer_mirror: bool = False" in sig, sig
+    # the REPORT helpers: issue_report only reads; issue_clock returns the call's value, passes its arguments and
+    # its exception unchanged (it adds a perf_counter_ns pair per call: host time, no state)
+    assert "setattr" not in inspect.getsource(G.issue_report)
+    seen = []
+
+    class _Tp:
+        def issue(self, layer, transfers):
+            seen.append((layer, transfers))
+            if layer < 0:
+                raise KeyError("planted")
+            return "r%d" % layer
+    tp = _Tp()
+    st = G.issue_clock(tp)
+    trs = [1, 2, 3]
+    assert tp.issue(4, trs) == "r4" and seen == [(4, trs)] and seen[0][1] is trs
+    with pytest.raises(KeyError, match="planted"):
+        tp.issue(-1, [])
+    assert (st["calls"], st["takes"], st["desc_calls"]) == (2, 3, 0) and tp.issue_clock is st
+    assert G.issue_report(tp, 2)["calls"] == 2 and G.issue_report(SimpleNamespace(), 2) is None
 
 
 # =====================================================================================================================
@@ -510,7 +548,11 @@ def test_AC9a_the_cells_static():
     assert "|evalfast2ia|evalacc216m|evalacc216|" in text              # [f3lia] the merged cells around it
     assert "        evalacc216m|evalacc216) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     blk = text[text.index("    evalacc216m|evalacc216) MODES="):]
-    blk = blk[:blk.index(" ;;\n", blk.index("EVALARG=(")) + 3]           # [f3all] this cell only (cells follow)
+    # [f3ldx] [f3all] this cell only: it ends at its first ";;" (the cells after it, evalacc216f3lia, the f3all, f3ld /
+    # f3ldx and f3tall cells, have their own flags, e.g. --eval-role); still inside the cell case
+    assert blk.index(" ;;\n") < blk.index("\nesac\n")
+    blk = blk[:blk.index(" ;;\n") + len(" ;;")]
+    assert blk.endswith('--gold-workload "$GOLD" "${LINKARG[@]}") ;;') and blk.count(";;") == 1, blk
     for w in ("MODES=fast,bi_c_strict", "BACKENDS=b2", "PC=96 ; PX=1512 ; PRV=1464", "BATCH=216", "MEMG=240G",
               "VARIANTS=fused/batched", "NOSI=$NOSI_EVAL", 'if [ "$CELL" = evalacc216m ]; then STEPS=8',
               'LINKARG=(--link-record "$OUTROOT/sg5_${RUN}_${JOB}_evalfast2rd/summary.json")',

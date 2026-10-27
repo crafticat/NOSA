@@ -480,7 +480,7 @@ def test_AE5_a_dropped_rollback_copy_is_caught(p3, ref):
 # =====================================================================================================================
 # AE6 the cells
 # =====================================================================================================================
-AB_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3all"                          # [f3all] NOSI_EVAL (was nosi-r2-applyev)
+AB_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3tall"                         # [f3tall] NOSI_EVAL (was nosi-r2-f3all / -applyev)
 
 
 def test_AE6a_the_cells_and_the_registration_static():
