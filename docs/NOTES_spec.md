@@ -277,7 +277,9 @@ INPUTS FOR THE BANDS (MODEL / INFERRED, not measured):
   with the Write and Edit tools.
 - The reviewer agent reported one breach of its own: `sed -n 100,130p test_verify_rows.py | head -0` once (read-only,
   output discarded).
-- The sp3b task (section 11): `date -u +%FT%TZ` (the stamp, L33). Nothing else outside the list.
+- The sp3b task (section 11): `date -u` (the stamps, L33) and `date` once (local time). ONE BREACH: `sed -n 1p` once,
+  at the end of a read-only pipeline on `git show 280b9e7` output (it printed one line; nothing was edited). A
+  read-only reviewer agent ran on 280b9e7 / 30afd33.
 
 ## 11. GPU cell sp3b at 6de1cfd: the EXACT arms lost SH's tokens. Root cause, reproduction, fix
 
@@ -318,12 +320,16 @@ spec_world.move_in_reuse finds the pattern of step 4 (a MOVE_OUT into a slot tha
 group emptied, unsaved). EXPECTED at 280b9e7: FAIL, with ("pool", l, h, b, q, y) or ("win", ...) residency errors. NOT
 RUN by me (no pytest on the login node): the lead runs it at 280b9e7 first, then at the fix commit.
 
-FIX (the next commit): UNDO_ACTION[MOVE_IN] = MOVE_OUT. The undo moves the block back from window slot m into pool slot
+FIX (30afd33): UNDO_ACTION[MOVE_IN] = MOVE_OUT. The undo moves the block back from window slot m into pool slot
 q. At that time m holds the block: the map after the step names it, so the undo of the later steps restored it (saved
 rows, host fallback or an inverse move). Every inverse move now reads only NAMED slots, and the unnamed bytes of a slot
 are never an input (rr docstring, THE UNDO READS ONLY NAMED SLOTS). Cost: one block copy per undone MOVE_IN, in the
 same flash_pool_swap launch. No new kernel. Negative control undo_move_in_none (the old table): the test asserts that
-the check CATCHES it, with the same precondition.
+the check CATCHES it, with the same precondition. The next commit makes the precondition robust: the test takes the
+first world seed in 0 .. 2 with the pattern, and the plant runs on that seed, so ONE test run shows the divergence of
+the 6de1cfd table (the plant) and the exactness of the fixed table. It also adds the direct test without the runner,
+test_draft_group_tiny_journal_restores_live_slots: one group of 6 draft steps (B 8, journal 1), reject_all, then the
+maps and the LIVE slot bytes against the snapshot and 3 plain steps against a world without the group; the same plant.
 
 GATES (280b9e7): r2_spec_cell.tok_gates adds the MUST gates <arm>-TOK and <arm>-FP for L3 and L4X. A divergence now
 fails the cell (sp3b reported 0 failed MUST gates).

@@ -18,6 +18,8 @@ OVERFLOW test_tiny_journal_equals_shipped (L3 / L4 EXACT, B 8; the GPU cell sp3b
          1 slot per layer and step, and the residency right after every reject_all. Preconditions: overflow, and a pool
          slot that a MOVE_IN emptied and a later step of the group overwrote by a MOVE_OUT, unsaved. Negative control
          undo_move_in_none (the rollback's undo table of 6de1cfd): CAUGHT.
+         test_draft_group_tiny_journal_restores_live_slots (no runner): one group of 6 draft steps, 1-slot journal,
+         reject_all: the snapshot's maps and live slot bytes, the next plain steps bitwise. The same plant: CAUGHT.
 REJECT   test_reject_keeps_accepted_prefix_and_correction (L3 / L4, B 8): a reject commits the accepted drafts and the
          target's correction (m = n + 1). Negative controls commit_draft_at_reject and keep_rejected: CAUGHT.
 FULL     test_full_accept_no_bonus_token (L3 / L4, B 8): a full accept commits exactly K tokens, the drafts. Negative
@@ -204,15 +206,25 @@ CAP_TINY = 1
 
 
 @functools.lru_cache(maxsize=None)
-def _ev_tiny(level, B, rb_neg):
+def _ev_tiny(level, B, rb_neg, seed=0):
     """run_vs_shipped with a journal of CAP_TINY slots, the periodic FILTER, and spec_world.watch_reuse (the sp3b
     pattern in every group before its undo; the residency right after every reject_all)."""
     box = {}
     ev = SW.run_vs_shipped(B, level=level, mode="exact", gemm="rowgroup", draft_filter=FILTER, rb_neg=rb_neg,
-                           journal=CAP_TINY, on_runner=lambda r: SW.watch_reuse(r, box),
+                           journal=CAP_TINY, on_runner=lambda r: SW.watch_reuse(r, box), seed=seed,
                            max_rounds=(12 if rb_neg is not None else 0))
     ev["reuse"] = box
     return ev
+
+
+def _tiny_seed(level, B=8, seeds=3):
+    """The first world seed (0 .. seeds - 1) whose run has the sp3b pattern (move_in_reuse: unsaved > 0), and its
+    evidence; the last seed's evidence if none has it (the precondition assert then fails with the facts)."""
+    for seed in range(seeds):
+        ev = _ev_tiny(level, B, None, seed)
+        if ev["reuse"].get("unsaved", 0) > 0:
+            break
+    return seed, ev
 
 
 @pytest.mark.parametrize("level", ["L3", "L4"])
@@ -221,19 +233,66 @@ def test_tiny_journal_equals_shipped(level):
     shipped greedy decode's, the residency holds after every reject_all and every round, the host rows hold.
     Preconditions (L34): the journal overflows (live and dead slots past N), and some group has a pool slot that a
     MOVE_IN emptied and a later step's MOVE_OUT overwrote, unsaved (spec_world.move_in_reuse)."""
-    ev = _ev_tiny(level, 8, None)
+    seed, ev = _tiny_seed(level)
     st, f, ru = ev["rd"]["journal"], ev["facts"], ev["reuse"]
     assert sum(st["overflow"]) > 0 and sum(st["overflow_dead"]) > 0, st
-    assert ru.get("unsaved", 0) > 0, (ru, f)
+    assert ru.get("unsaved", 0) > 0, (seed, ru, f)
     assert f["rejects"] > 0 and f["skipped"] > 0 and f["min_count"] >= N, f
     got = (ev["reuse"].get("resid_reject", [])[:2], ev["resid"][:2], ev["bad_tokens"][:5], ev["bad_logits"][:5],
            ev["host"][:2])
     assert got == ([], [], [], [], []), got
     # PLANT undo_move_in_none: the inverse of MOVE_IN is no move (the table of 6de1cfd, the sp3b code)
-    p = _ev_tiny(level, 8, "undo_move_in_none")
-    assert p["reuse"].get("unsaved", 0) > 0, p["reuse"]                # precondition (L34) of the plant run
+    p = _ev_tiny(level, 8, "undo_move_in_none", seed)
+    assert p["reuse"].get("unsaved", 0) > 0, (seed, p["reuse"])        # precondition (L34) of the plant run
     caught = (p["reuse"].get("resid_reject", []), p["resid"], p["bad_tokens"], p["bad_logits"])
     assert caught != ([], [], [], []), "undo_move_in_none was not caught"     # CAUGHT
+
+
+def _draft_group_run(seed, neg=None, steps=6):
+    """THE ROOT CAUSE WITHOUT THE RUNNER. World x: 4 plain steps (the window is loaded), ONE rollback group of `steps`
+    DRAFT steps (DraftResident "all") with a journal of CAP_TINY slots, reject_all. World y: the same 4 plain steps, no
+    group. Returns the facts of the group (spec_world.move_in_reuse, before the undo), the journal counters, the
+    non-slot differences from the snapshot, the LIVE slot differences (rollback_world.live_slot_diff: the window and pool
+    slots that the maps name) and whether the next 3 plain steps of x and y are bitwise equal."""
+    (mx, x), (my, y) = RW.build(SM8, horizon=128, seed=seed), RW.build(SM8, horizon=128, seed=seed)
+    B = len(SM8)
+    rb = RR.Rollback(x, steps, capacity=CAP_TINY, neg=neg)
+    ds = SR.DraftResident(x, rb)
+    tok = RW.tokens(seed, B, n=128)
+    dx, dy = RW.Driver(mx, x, SM8, tok), RW.Driver(my, y, SM8, tok)
+    dx.plain(4)
+    dy.plain(4)
+    snap = RW.state(x)
+    rb.begin()
+    for u in range(steps):
+        ds.begin("all")
+        dx.step(u)
+        ds.end()
+    facts = SW.move_in_reuse(rb, torch.zeros(B, dtype=torch.int64))
+    rb.reject_all()
+    post = RW.state(x)
+    ev = dict(facts=facts, stats=rb.stats(), other=RW.diff(post, snap, skip=RW.SLOTS))
+    ev["live"] = RW.live_slot_diff(post, snap) if ev["other"] == [] else None
+    ev["after"] = [torch.equal(W.bits(dx.plain(1)[0]), W.bits(dy.plain(1)[0])) for _ in range(3)]
+    return ev
+
+
+def test_draft_group_tiny_journal_restores_live_slots():
+    """One group of 6 draft steps with a 1-slot journal, then reject_all: every map, table, counter and the clock are
+    the snapshot's, every LIVE slot (named by a map) holds its snapshot bytes, and the next 3 plain steps equal a world
+    that never ran the group. Precondition (L34): the group has the sp3b pattern (a pool slot that a MOVE_IN emptied and
+    a later draft step overwrote by a MOVE_OUT, unsaved); the first world seed in 0 .. 2 with it. Negative control
+    undo_move_in_none (the undo table of 6de1cfd) on the same seed: CAUGHT by the live slots."""
+    for seed in range(3):
+        ev = _draft_group_run(seed)
+        if ev["facts"]["unsaved"] > 0:
+            break
+    assert ev["facts"]["unsaved"] > 0 and sum(ev["stats"]["overflow_dead"]) > 0, (seed, ev["facts"], ev["stats"])
+    assert ev["other"] == [] and ev["live"] == [] and all(ev["after"]), (seed, ev["other"][:5], ev["live"], ev["after"])
+    p = _draft_group_run(seed, neg="undo_move_in_none")
+    assert p["facts"]["unsaved"] > 0, (seed, p["facts"])               # precondition (L34) of the plant run
+    assert p["other"] == [], p["other"][:5]                              # the maps are right; only bytes are wrong
+    assert p["live"] != [], "undo_move_in_none was not caught"          # CAUGHT
 
 
 # ------------------------------------------------------------------ REJECT
