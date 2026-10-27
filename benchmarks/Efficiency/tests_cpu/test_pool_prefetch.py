@@ -549,10 +549,12 @@ def test_cell_arms_args_and_verdicts():
     assert arms["BG64"]["ratio_median"] == round(67.0 / 61.5, 4) and arms["BG64"]["cores_minus_SH"] == 1.0
     assert arms["BG64"]["delivery"]["n"] == 2 and arms["BG64"]["delivery"]["late"] == 1
     assert arms["BG64"]["backlog"]["growth_per_segment"] == [2] and arms["BG64"]["bytes_per_step"] == 1 << 26
-    v = {n: x for n, x, _ in PC.verdicts_pf(arms)}
-    assert v["PF-BG64"] == "REPORT" and v["PF-CP"] == "NOT_RUN" and v["PF-DLV64"] == "REPORT"
     old = dict(PC.PRED_PF)
     try:
+        for k in PC.PRED_PF:                                             # unregistered bands give REPORT (the
+            PC.PRED_PF[k] = None                                         # builder's state, before the lead's stamp)
+        v = {n: x for n, x, _ in PC.verdicts_pf(arms)}
+        assert v["PF-BG64"] == "REPORT" and v["PF-CP"] == "NOT_RUN" and v["PF-DLV64"] == "REPORT"
         PC.PRED_PF["PF-BG64"] = (1.0, 1.05)
         assert {n: x for n, x, _ in PC.verdicts_pf(arms)}["PF-BG64"] == "REFUTED"
         PC.PRED_PF["PF-BG64"] = (1.05, 1.15)
