@@ -66,7 +66,12 @@ def fake_nosa_linear(qkv, delta_weight, A, q_size, kv_size, kv_heads):
     q = qkv[..., :q_size].contiguous()
     k = qkv[..., q_size:q_size + kv_size].contiguous()
     v = qkv[..., q_size + kv_size:].contiguous()
-    return q, k, v, A * F.softplus(F.linear(v, delta_weight))
+    # softplus ROW BY ROW, as the kernel's one program per (row, head) (nosa_linear.py:84-93, grid :110): a softplus
+    # over the whole batch tensor runs the SIMD path on full chunks and the scalar path on the rest, so a row's bits
+    # would depend on the row count (verify1 fix 6adf18d, ragged_world.fake_nosa_linear; carried here in nosi-r2-spec)
+    lin = F.linear(v, delta_weight)
+    cis = torch.cat([A * F.softplus(r) for r in lin.reshape(-1, lin.shape[-1]).split(1)]).reshape(lin.shape)
+    return q, k, v, cis
 
 
 def fake_rope(pos, q, k, head_dim, cache, is_neox):

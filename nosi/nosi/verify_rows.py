@@ -60,6 +60,15 @@ last tail row's for every row), "shared_row_lengths" (every row uses row 0's n_u
 NO NEW KERNEL. The kernels are the shipped ones and the ones of Task 1.3: stage1_seqused (the installed infllm_v2.C
 op), nosa_pooling_per_request, torch.topk, diff_offload, pool_update, flash_pool_swap, flash_h2d_from_mask(_bias),
 r2_writeback.masked_writeback, flash_attn_nosa_with_kvcache. Everything else is torch.
+
+PHASE 2 (the integration tree nosi-r2-spec, the speculative round runner; every default keeps Task 1.4's behaviour):
+  - VerifyOps(draft_last=True), FAST: row K is a resident-only draft row (the extras store holds the verify rows'
+    union only; nothing is fetched for row K alone). EXACT has no such option: the runner's DraftResident hook makes
+    row K's decode_fixed a draft residency.
+  - VerifyState.hooks (default None): an open rollback group (Task 1.5's Rollback) journals a FAST layer through
+    hooks.fast_begin / hooks.fast_end. The EXACT rows need no hook (the rollback wraps the body's decode_fixed).
+  - The FAST write-back calls rs.body.writeback_kernel (the same kernel as kernels["writeback"]; in an open rollback
+    group, the deferred write-back).
 """
 from __future__ import annotations
 
@@ -94,10 +103,13 @@ class VerifyOps:
       attn    the attention callable (default: nosa_llama's flash_attn_nosa_with_kvcache)
       neg     a negative control (NEG_KINDS), tests only
       record  keep the per-layer evidence in VerifyState.log (tests only)
-      stats   accumulate the union statistics on the device"""
+      stats   accumulate the union statistics on the device
+      draft_last  FAST only (Phase 2, the speculative round runner): row K is a RESIDENT-ONLY DRAFT row. The extras store
+              loads the union of rows 0 .. K - 1 only; row K attends what is present for it (the window and the
+              extras that the verify rows loaded) and nothing is fetched for it alone. Default False (Task 1.4)."""
 
     def __init__(self, K=3, mode="fast", gemm="natural", linear=None, extra=16, attn=None, neg=None, record=False,
-                 stats=True):
+                 stats=True, draft_last=False):
         if not 1 <= int(K) <= K_MAX:
             raise VerifyError("K must be in 1 .. %d (got %r)" % (K_MAX, K))
         if mode not in MODES or gemm not in GEMMS:
@@ -116,11 +128,13 @@ class VerifyOps:
         self.neg = neg
         self.record = bool(record)
         self.stats = bool(stats)
+        self.draft_last = bool(draft_last)
 
     def describe(self) -> dict:
         return dict(K=self.K, R=self.R, mode=self.mode, gemm=self.gemm,
                     linear=getattr(self.linear, "__name__", type(self.linear).__name__),
-                    m_fix=getattr(self.linear, "m_fix", None), extra=self.extra, neg=self.neg)
+                    m_fix=getattr(self.linear, "m_fix", None), extra=self.extra, neg=self.neg,
+                    draft_last=self.draft_last)
 
 
 class VerifyState:
@@ -183,6 +197,7 @@ class VerifyState:
         self.clock = None                   # the cell's CudaClock (event / record)
         self.probe = False                  # True: the one-row selection after the batched one (timing + SEL0)
         self.fa_check = None                # a dict -> the VRF-IDX gate on the next FAST pass, layer 0
+        self.hooks = None                   # Phase 2: the rollback (fast_begin / fast_end around a FAST layer)
         self.passes = 0
         self.meta = dict(ops=ops.describe(), B=B, R=R, E=E, X=X, mask_bias=MASK_BIAS)
 
@@ -332,7 +347,7 @@ def _extras(vs: VerifyState, eng, twin, sel, m, crossing):
     rs = vs.rs
     kern = rs.ops.kernels
     H, B, X, bs, topk = vs.H, vs.B, vs.X, vs.bs, vs.topk
-    s, first = _union(vs, sel)
+    s, first = _union(vs, sel[:, :, :vs.R - 1] if vs.ops.draft_last else sel)   # draft_last: the verify rows' union
     in_win = (s.unsqueeze(-1) == eng._block_map.unsqueeze(-2)).any(-1)        # (H, B, R * topk)
     nxt = (m + 1).view(1, B, 1)
     extra = first & ~in_win & (s != nxt)
@@ -380,6 +395,8 @@ def _fast_rows(vs: VerifyState, l: int, layer, eng, twin, q, k4, v4, sel, pos_be
     Hq = q.shape[1]
     tail0 = (topk - 1) * bs
     p0 = pos_before[0]
+    if vs.hooks is not None:                                                  # Phase 2: the rollback's FAST journal
+        vs.hooks.fast_begin(l, eng, R)
     p_rows = p0.view(B, 1) + vs.offs.view(1, R)                              # (B, R)
     m = p0 // bs                                                              # the tail block at the start
     in_tail = (p_rows // bs) == m.view(B, 1)
@@ -464,12 +481,16 @@ def _fast_rows(vs: VerifyState, l: int, layer, eng, twin, q, k4, v4, sel, pos_be
     p_last = p0 + (R - 1)
     vs.full.copy_((p0 % bs) + (R - 1) >= bs - 1)
     vs.wpos.copy_(m * bs + (bs - 1))
-    kern["writeback"](eng._k_gpu, eng._v_gpu, eng._k_cpu, eng._v_cpu, vs.full, vs.wpos, tail0, bs)
+    # the body's write-back callable: the same kernel as kern["writeback"] (RaggedOps.make_body), or the rollback's
+    # deferred write-back while a group is open (Phase 2)
+    rs.body.writeback_kernel(eng._k_gpu, eng._v_gpu, eng._k_cpu, eng._v_cpu, vs.full, vs.wpos, tail0, bs)
     eng._k_gpu[bi, r63] = torch.where(it4, eng._k_gpu[bi, r63], k4c)
     eng._v_gpu[bi, r63] = torch.where(it4, eng._v_gpu[bi, r63], v4c)
     eng._kv_bias_gpu[bi, r63] = torch.where(it3, eng._kv_bias_gpu[bi, r63], cis_rows)
     eng._block_map[..., topk - 1] = ((p_last + 1) // bs).view(1, B).expand(H, B)
     eng._cache_lens.copy_(rs.body.cache_lens_value(eng, p_last).to(torch.int32))
+    if vs.hooks is not None:
+        vs.hooks.fast_end(l, eng, p0, vs.full, R)
     return attn
 
 

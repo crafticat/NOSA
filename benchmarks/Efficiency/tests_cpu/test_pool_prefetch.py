@@ -249,14 +249,26 @@ def _rows(t, b, blk, h):
 
 # ------------------------------------------------------------------------------------------------ Gate 0
 def test_flag_off_is_shipped(CE, PF, ext, nopin):
-    # (a) the flag lives only in new files: the shipped engine, model and baseline cell are unchanged
-    r = subprocess.run(["git", "-C", str(ROOT), "diff", "--quiet", BASE, "--", "nosi/nosi/cache_engine.py",
+    # (a) the flag lives only in new files: the shipped model, kernels and baseline step script are unchanged. In the
+    # integration tree nosi-r2-spec two of the former files carry OTHER hooks, each with its own Gate 0:
+    # cache_engine.py the appended draft block of Task 1.1 (test_draft_pool.py; here: ded9d41's module statements are a
+    # prefix of this file's), r2_base_cell.py the --ragged / --rollback / --draft-resident arms (test_ragged_engine.py,
+    # test_rollback.py, test_draft_pool.py). Neither names pool_prefetch.
+    r = subprocess.run(["git", "-C", str(ROOT), "diff", "--quiet", BASE, "--",
                         "nosi/nosi/nosa_llama.py", "nosi/nosi/flash_cache_engine", "nosi/nosi/r2_transport_gilfree.py",
-                        "benchmarks/Efficiency/r2_base_cell.py", "benchmarks/Efficiency/r2_base_fused_step.sh"],
+                        "benchmarks/Efficiency/r2_base_fused_step.sh"],
                        capture_output=True, text=True)
     assert r.returncode == 0, "a shipped file differs from %s: %s" % (BASE, r.stdout + r.stderr)
+    import ast
+    base_ce = subprocess.run(["git", "-C", str(ROOT), "show", "%s:nosi/nosi/cache_engine.py" % BASE],
+                             capture_output=True, text=True)
+    assert base_ce.returncode == 0, base_ce.stderr
+    bt, ht = ast.parse(base_ce.stdout), ast.parse((NOSI / "cache_engine.py").read_text())
+    assert len(ht.body) >= len(bt.body) and all(ast.dump(x) == ast.dump(y) for x, y in zip(bt.body, ht.body)), \
+        "cache_engine.py: %s's module statements are not a prefix" % BASE
     for f in ("cache_engine.py", "nosa_llama.py"):
         assert "pool_prefetch" not in (NOSI / f).read_text()
+    assert "pool_prefetch" not in (EFF / "r2_base_cell.py").read_text()
     # (b) + (c): a never-attached world A and an attached world B (gpugather, no request), 8 steps, same inputs
     wa, wb = _world(CE, 1), _world(CE, 1)
     assert _diff(_state(wa), _state(wb), SCRATCH) == []      # precondition: one seed gives one world, bitwise

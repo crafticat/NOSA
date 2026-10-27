@@ -106,6 +106,33 @@ staged block is not copied after the gathers), no_slot_restore, no_host_fallback
 no_tail_restore, no_twin_restore (each removes one part of the undo), no_rollback (commit undoes nothing: the dr1
 flow), skip_release_wait (the next step does not wait the release event), host_sync (commit reads n_acc on the host
 once).
+
+PHASE 2 ADDITIONS (the integration tree nosi-r2-spec; the speculative round runner is the only caller of the new parts).
+Without a call of truncate / fast_begin / fast_end a group behaves as above, bit for bit.
+  SPLIT JOURNAL. The pre-step journal has two parts. The TWIN part (counters, the four twin rows, the tail row) is
+      taken in the twin hook, as before. The ENGINE part (_block_map, _new_block_map_buf, _load_mask, _cache_lens and
+      the four pool tables) is taken in a hook on the body's decode_fixed (rs.body.decode_fixed), just before that
+      step writes the engine, and the hook sets the step index that the pool, gather and write-back hooks use. In the
+      ragged step nothing writes these tables between the twin step and decode_fixed (the stage-1 / pooling / top-k
+      work writes RaggedState buffers only), so the journal holds the same values as before. The split lets a joint
+      pass (verify_rows.py) advance the twin R times first and then run R residencies, each with its own journal.
+  JOINT PASS, FAST MODE (verify_rows FAST has one residency for R rows and no decode_fixed): verify_rows calls
+      fast_begin(l, eng, R) before the residency (the engine journal of the first row) and fast_end(l, eng, p0, full,
+      R) after the pass. fast_end writes the engine journal of rows 1 .. R - 1 as "the state after r rows": the maps
+      and the pool after the residency, the tail id (p0 + r) // 64 and the attention length of position p0 + r - 1;
+      their slot journals are empty (the residency stays: it is a valid cache state for any kept prefix); and the
+      deferred fill of a request that fills in the pass gets its own row, u0 + 63 - p0 % 64.
+  TRUNCATE. truncate(n_keep) inside an open group: request b with n_keep[b] < the steps run loses its steps
+      n_keep[b] .. now (the undo of commit, these requests only), and the group stays open for every request. A kept
+      fill of a truncated request goes to the host rows now; its staged block is dropped either way. The undone steps
+      are marked (_undone): a later commit / truncate never undoes them again. Use: the joint pass of a speculative
+      round keeps the draft row of the requests that accepted every token in the group (it is the first draft step of
+      their next round), and the requests that rejected a token go back to their accepted prefix at once (they draft
+      again from the correction in the same group).
+  Every group's commit / truncate checks that each layer journaled the engine of every step (_ures == _u), so a
+  joint pass without these hooks is refused, not silently wrong.
+  Negative control (tests only): no_truncate_mark (commit undoes the truncated steps a second time: the inverse pool
+  moves run twice).
 """
 from __future__ import annotations
 
@@ -127,12 +154,13 @@ TWIN_CTR = ("pos", "n_comp", "n_ccis")
 COUNTERS = ("destroyed", "saved", "overflow", "overflow_dead", "redirected")
 NEG_KINDS = (None, "no_defer", "no_redirect", "no_slot_restore", "no_host_fallback", "no_pool_restore",
              "no_meta_restore", "no_tail_restore", "no_twin_restore", "no_rollback", "skip_release_wait",
-             "host_sync")
+             "host_sync", "no_truncate_mark")
 # the functions of the group's path: no host sync allowed (tests_cpu/test_rollback.py, test_no_host_sync_in_commit_path)
 COMMIT_PATH = ("commit", "reject_all", "_mirror", "_commit_layer", "_undo_step", "_undo_slots", "_restore_slots",
                "_fallback", "_redirect_ids", "_redirect", "_writeback_deferred", "_where_rows", "_wait_release_all",
                "_linear_hook", "_twin_hook", "_pool_update_hook", "_gather_k_hook", "_gather_v_hook",
-               "_writeback_hook", "_save_slots", "_slot_rows")
+               "_writeback_hook", "_save_slots", "_slot_rows",
+               "_decode_fixed_hook", "_journal_engine", "truncate", "_truncate_layer", "fast_begin", "fast_end")
 
 
 class RollbackError(RuntimeError):
@@ -260,7 +288,12 @@ class Rollback:
         self.T = [self._alloc_defer(l) for l in range(self.L)]
         self.tentative = False
         self.groups = 0
+        self.truncations = 0
         self._u = [0] * self.L
+        self._ures = [0] * self.L                       # SPLIT JOURNAL: the steps whose engine part is journaled
+        self._undone = torch.zeros((self.K, B), dtype=torch.bool, device=dev)    # TRUNCATE: undone (step, request)
+        self._undone_host = torch.zeros((self.K, B), dtype=torch.bool)
+        self.kbig = torch.tensor(self.K, dtype=i64, device=dev)                  # "no staged fill" (T["u"])
         self._cur = [0] * self.L
         self._stamp0 = [0] * self.L
         self._release = [None] * self.L
@@ -319,8 +352,10 @@ class Rollback:
                           pool_update=kern.get("pool_update"), pool_swap=kern.get("pool_swap"),
                           writeback=rs.body.writeback_kernel, linear=rs.ops.linear,
                           twin=[t.step_unchecked for t in twins],
-                          twin_own=["step_unchecked" in t.__dict__ for t in twins])
+                          twin_own=["step_unchecked" in t.__dict__ for t in twins],
+                          decode_fixed=rs.body.decode_fixed, decode_fixed_own="decode_fixed" in rs.body.__dict__)
         rs.ops.linear = self._linear_hook
+        rs.body.decode_fixed = self._decode_fixed_hook
         for l, lay in enumerate(rs.cache.layers):
             e = lay.cache_engine
             self._lay[e._k_gpu.data_ptr()] = l
@@ -340,11 +375,17 @@ class Rollback:
         if self.tentative:
             raise RollbackError("detach inside a group: commit first")
         rs, kern, o = self.rs, self.rs.ops.kernels, self._orig
+        if rs.body.__dict__.get("decode_fixed") != self._decode_fixed_hook:
+            raise RollbackError("detach: another hook wraps the body's decode_fixed (detach that hook first)")
         kern["gather_k"], kern["gather_v_bias"] = o["gather_k"], o["gather_v_bias"]
         if self.pool:
             kern["pool_update"] = o["pool_update"]
         rs.body.writeback_kernel = o["writeback"]
         rs.ops.linear = o["linear"]
+        if o["decode_fixed_own"]:
+            rs.body.decode_fixed = o["decode_fixed"]
+        else:
+            del rs.body.decode_fixed
         for t, f, own in zip(rs.st.twins, o["twin"], o["twin_own"]):
             if own:
                 t.step_unchecked = f
@@ -358,6 +399,9 @@ class Rollback:
             raise RollbackError("begin inside a group: commit first")
         self.tentative = True
         self._u = [0] * self.L
+        self._ures = [0] * self.L
+        self._undone.zero_()
+        self._undone_host.zero_()
         self._act_host = []
         self._pos_host0 = self.rs.st.pos_host.clone()
         for l in range(self.L):
@@ -375,6 +419,9 @@ class Rollback:
             raise RollbackError("the layers ran different numbers of tentative steps: %s" % (self._u,))
         if n_acc.shape != self.bshape or n_acc.device != self.dev:
             raise RollbackError("n_acc must be a (%d,) tensor on %s" % (self.B, self.dev))
+        if self._ures != self._u:
+            raise RollbackError("a step changed the engine without its engine journal (layers: twin %s, engine %s): "
+                                "a joint pass without the rollback's hooks?" % (self._u, self._ures))
         na = None                                                     # every check before any work (no partial commit)
         if n_acc_host is not None:
             na = torch.as_tensor(n_acc_host, dtype=torch.int64).clamp(0, n_run)
@@ -383,8 +430,11 @@ class Rollback:
         nacc = n_acc.to(torch.int64).clamp(0, n_run)
         if self.neg == "host_sync":                                   # NEGATIVE CONTROL (tests only)
             self._neg_host_sync(nacc)
+        und = self._undone[:n_run].clone()                            # TRUNCATE: these steps are undone already
+        if self.neg == "no_truncate_mark":                            # NEGATIVE CONTROL (tests only): undo them twice
+            und.zero_()
         for l in range(self.L):
-            self.stream.run(functools.partial(self._commit_layer, l, nacc, n_run))
+            self.stream.run(functools.partial(self._commit_layer, l, nacc, n_run, und))
             self._release[l] = self.stream.record(self.dev)
         self._need_wait = True
         if na is not None:
@@ -421,14 +471,14 @@ class Rollback:
         CPU copy of n_acc, clamped; CPU tensors only: no device read)."""
         adv = torch.zeros(self.B, dtype=torch.int64)
         for u in range(n_run):
-            adv += ((na > u) & self._act_host[u]).to(torch.int64)
+            adv += ((na > u) & self._act_host[u] & ~self._undone_host[u]).to(torch.int64)
         self.rs.st.pos_host.copy_(self._pos_host0 + adv)
 
     # -------------------------------------------------------------- the undo
-    def _commit_layer(self, l: int, nacc, n_run: int) -> None:
+    def _commit_layer(self, l: int, nacc, n_run: int, und) -> None:
         if self.neg != "no_rollback":                                # NEGATIVE CONTROL (tests only): the dr1 flow
             for u in range(n_run - 1, -1, -1):
-                self._undo_step(l, u, nacc <= u)
+                self._undo_step(l, u, (nacc <= u) & ~und[u])
         self._writeback_deferred(l, nacc)
 
     def _where_rows(self, dst, saved, mask) -> None:
@@ -529,9 +579,13 @@ class Rollback:
         return self._orig["linear"](x, w)
 
     def _twin_hook(self, l: int, keys, cis, active):
-        """The pre-step journal of layer l (the first write of a step is the twin's), then the twin step."""
+        """The TWIN part of the pre-step journal of layer l (the first write of a step is the twin's: the counters, the
+        twin rows, the tail row), then the twin step. The ENGINE part is journaled by _decode_fixed_hook (SPLIT
+        JOURNAL)."""
         if not self.tentative:
             return self._orig["twin"][l](keys, cis, active)
+        if self._need_wait:                                          # a joint pass reaches the engine here first
+            self._wait_release_all()
         u = self._u[l]
         if u >= self.K:
             raise RollbackError("more than K = %d tentative steps in one group (layer %d)" % (self.K, l))
@@ -540,11 +594,6 @@ class Rollback:
         if l == 0:
             self._act_host.append(self.rs.st.active_host.clone())
         eng, tw, j, ab = self.rs.cache.layers[l].cache_engine, self.rs.st.twins[l], self.J[l][u], self.all_b
-        for n in META4:
-            j[n].copy_(getattr(eng, n))
-        if self.pool:
-            for n in POOL4:
-                j[n].copy_(getattr(eng, n))
         c, ix = j["ctr"], j["idx"]
         c[0].copy_(tw.pos)
         c[1].copy_(tw.n_comp)
@@ -563,6 +612,129 @@ class Rollback:
         j["tv"].copy_(eng._v_gpu[ab, row])
         j["tb"].copy_(eng._kv_bias_gpu[ab, row])
         return self._orig["twin"][l](keys, cis, active)
+
+    def _decode_fixed_hook(self, eng, *args, **kwargs):
+        """SPLIT JOURNAL: in a group, the ENGINE part of the pre-step journal of the next step of this layer whose
+        twin step ran (the ragged step: the same step; a joint pass in EXACT mode: its rows in order), and the step
+        index of the pool / gather / write-back hooks; then the body's decode_fixed."""
+        if self.tentative:
+            if self._need_wait:
+                self._wait_release_all()
+            l = self._lay[eng._k_gpu.data_ptr()]
+            u = self._ures[l]
+            uu = self._u[l]
+            if u >= uu:
+                raise RollbackError("layer %d: decode_fixed without its twin step (engine journal %d, twin %d)"
+                                    % (l, u, uu))
+            self._ures[l] = u + 1
+            self._journal_engine(l, u)
+        return self._orig["decode_fixed"](eng, *args, **kwargs)
+
+    def _journal_engine(self, l: int, u: int) -> None:
+        """The ENGINE part of the journal of step u, layer l (the maps, the lengths and the pool tables before the step
+        writes them); the pool / gather / write-back hooks then record into step u."""
+        eng, j = self.rs.cache.layers[l].cache_engine, self.J[l][u]
+        for n in META4:
+            j[n].copy_(getattr(eng, n))
+        if self.pool:
+            for n in POOL4:
+                j[n].copy_(getattr(eng, n))
+        self._cur[l] = u
+
+    # -------------------------------------------------------------- the joint pass, FAST mode (verify_rows.py)
+    def fast_begin(self, l: int, eng, R: int) -> None:
+        """verify_rows FAST, before the residency of layer l (one residency for the R rows whose twin steps ran): the
+        engine journal of the first row. Outside a group: nothing."""
+        if not self.tentative:
+            return
+        if self._need_wait:
+            self._wait_release_all()
+        u0 = self._u[l] - R
+        uu = self._ures[l]
+        if u0 != uu:
+            raise RollbackError("layer %d: fast_begin for rows %d .. %d, the engine journal is at %d" % (
+                l, u0, u0 + R - 1, uu))
+        self._journal_engine(l, u0)
+        self._ures[l] = u0 + 1
+
+    def fast_end(self, l: int, eng, p0, full, R: int) -> None:
+        """verify_rows FAST, after the pass of layer l: the engine journal of rows 1 .. R - 1 = the state after r rows
+        (module docstring, PHASE 2 ADDITIONS), empty slot journals for them, and the row of each request's fill
+        (full (B,) bool: the request filled its tail block in this pass, at row 63 - p0 % 64). p0 (B,) int64: the
+        position of row 0."""
+        if not self.tentative:
+            return
+        u0 = self._u[l] - R
+        bs, tail = self.bs, self.M - 1
+        for r in range(1, R):
+            j = self.J[l][u0 + r]
+            for n in META4:
+                j[n].copy_(getattr(eng, n))
+            if self.pool:
+                for n in POOL4:
+                    j[n].copy_(getattr(eng, n))
+                j["plan_action"].zero_()                             # no pool move of its own: the undo moves nothing
+                j["plan_target"].fill_(-1)
+            j["_block_map"][:, :, tail].copy_(((p0 + r) // bs).view(1, self.B).expand(self.H, self.B))
+            j["_cache_lens"].copy_(self.rs.body.cache_lens_value(eng, p0 + (r - 1)).to(torch.int32))
+            j["ent"].fill_(-1)                                       # no saved slot (the residency stays)
+            j["rows"].copy_(self._slot_rows(j["ent"][:self.N]))      # valid row ids (the dummy) for the masked copy
+            j["unsaved"].zero_()
+        T = self.T[l]
+        T["u"].copy_(torch.where(full, u0 + (bs - 1) - p0 % bs, T["u"]))
+        self._ures[l] = u0 + R
+
+    # -------------------------------------------------------------- TRUNCATE (an open group, some requests)
+    def truncate(self, n_keep: torch.Tensor, n_keep_host=None) -> None:
+        """Inside an open group: request b with n_keep[b] < the steps run loses its steps n_keep[b] .. n_run - 1 now;
+        the group stays open (module docstring, PHASE 2 ADDITIONS). n_keep: a (B,) integer tensor on the engine's
+        device (no host read). n_keep_host: the same values on the CPU, or None (then RaggedState.pos_host is not
+        updated; a later commit's mirror then counts the truncated steps as kept)."""
+        if not self.tentative:
+            raise RollbackError("truncate outside a group: begin first")
+        n_run = self._u[0]
+        same = self._u.count(n_run)
+        if same != self.L:
+            raise RollbackError("the layers ran different numbers of tentative steps: %s" % (self._u,))
+        if n_keep.shape != self.bshape or n_keep.device != self.dev:
+            raise RollbackError("n_keep must be a (%d,) tensor on %s" % (self.B, self.dev))
+        if self._ures != self._u:
+            raise RollbackError("a step changed the engine without its engine journal (layers: twin %s, engine %s)"
+                                % (self._u, self._ures))
+        nh = None
+        if n_keep_host is not None:
+            nh = torch.as_tensor(n_keep_host, dtype=torch.int64).clamp(0, n_run)
+            if nh.device.type != "cpu" or nh.shape != self.bshape:
+                raise RollbackError("n_keep_host must be a (%d,) CPU tensor or list" % self.B)
+        nk = n_keep.to(torch.int64).clamp(min=0, max=n_run)
+        tr = nk < n_run
+        rejs = [(nk <= u) & ~self._undone[u] for u in range(n_run)]
+        for l in range(self.L):
+            self.stream.run(functools.partial(self._truncate_layer, l, rejs, nk, tr, n_run))
+            self._release[l] = self.stream.record(self.dev)
+        self._need_wait = True
+        for u in range(n_run):
+            self._undone[u] |= rejs[u]
+        if nh is not None:
+            for u in range(n_run):
+                self._undone_host[u] |= nh <= u
+            adv = torch.zeros(self.B, dtype=torch.int64)
+            for u in range(n_run):
+                adv += (self._act_host[u] & ~self._undone_host[u]).to(torch.int64)
+            self.rs.st.pos_host.copy_(self._pos_host0 + adv)
+        self.truncations += 1
+
+    def _truncate_layer(self, l: int, rejs, nk, tr, n_run: int) -> None:
+        """The undo of the truncated steps of layer l (reverse order), then the staged fill of each truncated request:
+        to the host rows if its step is kept (fill step < n_keep), dropped either way."""
+        for u in range(n_run - 1, -1, -1):
+            self._undo_step(l, u, rejs[u])
+        eng, T = self.rs.cache.layers[l].cache_engine, self.T[l]
+        keep = tr & (T["u"] < nk)
+        self._orig["writeback"](T["k"], T["v"], eng._k_cpu, eng._v_cpu, keep, T["pos"], 0, self.bs)
+        T["u"].copy_(torch.where(tr, self.kbig, T["u"]))
+        T["pos"].copy_(torch.where(tr, self.minus1, T["pos"]))
+        T["id"].copy_(torch.where(tr, self.minus1, T["id"]))
 
     def _pool_update_hook(self, old_map, load_mask, pool_map, pool_age, pool_target, pool_action, stamp_base,
                           tail_slot):
@@ -584,7 +756,9 @@ class Rollback:
     def _gather_k_hook(self, gpu, cpu, load_ids, block_size):
         if not self.tentative:
             return self._orig["gather_k"](gpu, cpu, load_ids, block_size)
-        l = self._lay[gpu.data_ptr()]
+        l = self._lay.get(gpu.data_ptr(), -1)
+        if l < 0:                                                    # not an engine table (verify_rows FAST's extras
+            return self._orig["gather_k"](gpu, cpu, load_ids, block_size)   # store: scratch, no journal, no redirect)
         if not self.pool:                                            # no pool: the gather is the only loser of slots
             self._save_slots(l, self.J[l][self._cur[l]], load_ids >= 0)
         self._orig["gather_k"](gpu, cpu, load_ids, block_size)
@@ -596,7 +770,9 @@ class Rollback:
         self._orig["gather_v_bias"](gpu_v, cpu_v, bias_buf, kv_bias, load_ids, block_size)
         if not self.tentative:
             return
-        l = self._lay[gpu_v.data_ptr()]
+        l = self._lay.get(gpu_v.data_ptr(), -1)
+        if l < 0:                                                    # the extras store (see _gather_k_hook)
+            return
         T = self.T[l]
         self._redirect(gpu_v, T["v"], T["m2"])
 

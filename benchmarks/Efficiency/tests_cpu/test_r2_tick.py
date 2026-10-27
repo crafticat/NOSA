@@ -295,7 +295,12 @@ def _nosa_linear(qkv, delta_w, A, q_size, kv_size, Hkv):
     q = qkv[..., :q_size].contiguous()
     k = qkv[..., q_size:q_size + kv_size].contiguous()
     v = qkv[..., q_size + kv_size:].contiguous()
-    cis = (A.double() * F.softplus(v.double() @ delta_w.double().t())).to(qkv.dtype)
+    # softplus ROW BY ROW, as the kernel's one program per (row, head) (nosa_linear.py:84-93, grid :110): a softplus
+    # over the whole batch tensor runs the SIMD path on full chunks and the scalar path on the rest, so a row's bits
+    # would depend on the row count (verify1 fix 6adf18d, ragged_world.fake_nosa_linear; carried here in nosi-r2-spec)
+    lin = v.double() @ delta_w.double().t()
+    sp = torch.cat([F.softplus(r) for r in lin.reshape(-1, lin.shape[-1]).split(1)]).reshape(lin.shape)
+    cis = (A.double() * sp).to(qkv.dtype)
     return q, k, v, cis
 
 

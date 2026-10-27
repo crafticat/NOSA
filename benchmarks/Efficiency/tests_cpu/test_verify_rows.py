@@ -4,8 +4,9 @@ r2_verify_step.sh cell vr1). The world: tests_cpu/verify_world.py over tests_cpu
 from its own source; every CUDA op a torch stand-in with the kernel's flat addresses, lesson L28). B 1 and B 8 (the
 largest CPU batch). No CUDA, no Triton launch.
 
-GATE 0   test_flag_off_is_shipped: nosi/nosi (verify_rows.py excepted), dependencies/, r2_base_cell.py and the ragged
-         step script are the Task 1.3 tip's bytes; no flag-off path names verify_rows; a VerifyState attached and never
+GATE 0   test_flag_off_is_shipped: nosi/nosi (verify_rows.py and, in the integration tree nosi-r2-spec, the files of
+         the other hooks excepted: each has its own Gate 0), dependencies/ and the ragged step script are the Task 1.3
+         tip's bytes; no flag-off path names verify_rows; a VerifyState attached and never
          used changes no engine or twin table, and the ragged step stays bitwise the shipped step.
          Negative control "touch" (an attach that writes one tail row): caught by the table check.
 EXACT    test_verify_equals_serial_shipped (B 1, B 8; attach after the shipped prefill; gemm rowgroup): every row of
@@ -87,9 +88,17 @@ def test_flag_off_is_shipped():
                        capture_output=True, text=True)
     if r.returncode != 0:
         pytest.skip("no git or no commit %s in %s" % (RAGGED_TIP, ROOT))
+    # The integration tree nosi-r2-spec merges three more hooks, each excluded here and checked by its own Gate 0:
+    # ragged_rollback.py / state_snapshot.py (Task 1.5, test_rollback.py), cache_engine.py's appended draft block
+    # (Task 1.1, test_draft_pool.py), pool_prefetch.py / r2_transport_gilfree_v3.py (Task 1.2, test_pool_prefetch.py),
+    # spec_round.py (Phase 2, test_spec_round.py). r2_base_cell.py carries the --rollback and --draft-resident arms
+    # (their Gate 0s check that every call sits under its flag); verify_rows is still named by no flag-off file (below).
     r = subprocess.run(["git", "-C", str(ROOT), "diff", "--stat", RAGGED_TIP, "--", "nosi/nosi", "dependencies",
-                        "benchmarks/Efficiency/r2_base_cell.py", "benchmarks/Efficiency/r2_base_ragged_step.sh",
-                        ":(exclude)nosi/nosi/verify_rows.py", ":(exclude,glob)**/__pycache__/**"],
+                        "benchmarks/Efficiency/r2_base_ragged_step.sh",
+                        ":(exclude)nosi/nosi/verify_rows.py", ":(exclude)nosi/nosi/ragged_rollback.py",
+                        ":(exclude)nosi/nosi/state_snapshot.py", ":(exclude)nosi/nosi/cache_engine.py",
+                        ":(exclude)nosi/nosi/pool_prefetch.py", ":(exclude)nosi/nosi/r2_transport_gilfree_v3.py",
+                        ":(exclude)nosi/nosi/spec_round.py", ":(exclude,glob)**/__pycache__/**"],
                        capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout.strip() == "", "flag-off sources differ from %s:\n%s" % (RAGGED_TIP, r.stdout)
     for f in ("nosi/nosi/ragged_engine.py", "nosi/nosi/nosa_llama.py", "nosi/nosi/cache_engine.py",

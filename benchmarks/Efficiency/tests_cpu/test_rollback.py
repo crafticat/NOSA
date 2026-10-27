@@ -116,13 +116,21 @@ def test_flag_off_is_shipped(S_list):
     r = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "-q", "--verify", BASE + "^{commit}"],
                        capture_output=True, text=True)
     if r.returncode == 0:
+        # The integration tree nosi-r2-spec merges three more hooks; each file is excluded here and checked by its own
+        # Gate 0: verify_rows.py (test_verify_rows.py), cache_engine.py's appended draft block (test_draft_pool.py),
+        # pool_prefetch.py / r2_transport_gilfree_v3.py (test_pool_prefetch.py), spec_round.py (test_spec_round.py).
         r = subprocess.run(["git", "-C", str(ROOT), "diff", "--stat", BASE, "--", "nosi/nosi", "dependencies",
                             ":(exclude)nosi/nosi/ragged_rollback.py", ":(exclude)nosi/nosi/state_snapshot.py",
-                            ":(exclude,glob)**/__pycache__/**"], capture_output=True, text=True)
+                            ":(exclude)nosi/nosi/verify_rows.py", ":(exclude)nosi/nosi/cache_engine.py",
+                            ":(exclude)nosi/nosi/pool_prefetch.py", ":(exclude)nosi/nosi/r2_transport_gilfree_v3.py",
+                            ":(exclude)nosi/nosi/spec_round.py", ":(exclude,glob)**/__pycache__/**"],
+                           capture_output=True, text=True)
         assert r.returncode == 0 and r.stdout.strip() == "", "the engine sources differ from %s:\n%s" % (BASE, r.stdout)
     src = {p.name: p.read_text() for p in (ROOT / "nosi/nosi").glob("*.py")}
     assert "ragged_rollback.py" in src and "state_snapshot.py" in src
-    assert [n for n, t in src.items() if "ragged_rollback" in t and n != "ragged_rollback.py"] == []
+    # spec_round.py (Phase 2, opt-in: only r2_spec_cell.py and the tests import it) is the one module that uses it
+    assert [n for n, t in src.items() if "ragged_rollback" in t and n not in ("ragged_rollback.py",
+                                                                               "spec_round.py")] == []
     assert [n for n, t in src.items() if "state_snapshot" in t and n != "state_snapshot.py"] == []
     assert {"_pool_map", "_pool_age", "_pool_target", "_pool_action"} <= set(SS._ENGINE_TENSORS)
     assert "_pool_stamp_base" in SS._ENGINE_SCALARS
