@@ -118,6 +118,24 @@ Python glue, and one more JIT variant (FlashInfer's own customization hook, as t
   Cells [fia3]: B up to 256; the suffix s1 takes the lists of the recorded S1 tick tables (--s1-tables; requests =
   the recorded groups of exactly rows-per-request rows, cycled to B; synthetic q / K / V / bias). Cells with B > 64
   draw K / V / bias on the GPU (a seeded CUDA generator); B <= 64 keeps fia1 / fia2's CPU data bitwise.
+
+[fia4] THE FORK OF vLLM's TRITON UNIFIED ATTENTION (plan Task 0.3 option 2; docs/NOTES_fia4.md). FlashInfer FP0 lost
+(SCORING_fia3.md: 1.68-1.70x piece 3, 77-100 ms plan + build per tick). The rung-4 row is written; the human allowed ONE
+fork: nosi/nosi/fork_vllm_unified_attention.py (vLLM 0.20.2, every changed line tagged [fork]), loaded by path
+(--fv-kernel). No other kernel.
+  FV  one program per (request, KV head): the request's 4 rows x the 16 query heads = one 64-row tile; each union KV
+      tile (one 64-token block) is loaded once and multiplied for all rows (tl.dot); each row sees only its own blocks
+      and its extent by a SCORE mask (8 bits per row and union entry); logit = (q.k + bias) x scale. The program BUILDS
+      its union table on the device (fork_build_union: binary search over the rows' sorted lists): no plan, no host
+      read, no extra launch. No split (vLLM's 2D path).
+  FVT the same kernel reading a table that the torch builder made before the launch (fp_union + fv_tables_from_union):
+      timing only. ncu FV - FVT = the in-kernel build's device cost; FVT's torch build per layer is reported too.
+  Gates [fia4] (MUST unless marked): C0_FV_import; G_block0 (shared with FP0); C_FV (fp64, TOL_C); FI1-FI3 and FI5 for
+  FV (FI5 is MUST with no precondition: FV loads only the tokens some row of the request sees); CW_FV (bias witness);
+  MW_FV (mask witness, through the prebuilt-table path with every row given the pair's reach); U_FV_table (the
+  kernel-built tables == the torch tables, on the full and the altreq batch). REPORTs: X_row_alone_FV (the EXACT probe:
+  expected 0 rows differ), R_GRAPH_FV (one launch captured in a CUDA graph, replay bitwise), R_FVT_equals_FV, R_T,
+  R_FV_build, R_D, the ncu numbers (+ achieved occupancy, shared memory, occupancy limits) and R_DECISION4 (PRED4).
 """
 from __future__ import annotations
 
@@ -154,9 +172,11 @@ CELLS = ((8, 1), (8, 4), (32, 1), (32, 4))  # (B, rows per request); 8x1 first: 
 MAX_B = 256                                 # [fia3] B up to 256 (the 216 x 4 target cell)
 CPU_DATA_MAX_B = 64                         # [fia3] B <= 64: K / V / bias drawn on the CPU (fia1 / fia2 data, bitwise);
                                             # larger cells draw them on the GPU (a seeded CUDA generator)
-ARMS = ("P", "F8", "F0", "FH", "S5", "FP0", "FP8", "FPU", "V1")
+ARMS = ("P", "F8", "F0", "FH", "S5", "FP0", "FP8", "FPU", "V1", "FV", "FVT")
 MUST_ARMS = ("P", "F8", "F0")
 FP_ARMS = ("FP0", "FP8", "FPU")             # [fia3] FlashInfer paged PREFILL over the request union
+FV_ARMS = ("FV", "FVT")                     # [fia4] the fork of vLLM's Triton unified attention (in-kernel / torch table)
+FV_ROWS = 4                                 # [fia4] BLOCK_Q of the fork: the rows of one request in one program
 FI_VERSION = "0.5.3"                        # the version every JIT cache of nosa-env.sif names (nosa-env/jit/*/flashinfer)
 FI_VERSIONS = ("0.5.3", "0.6.8.post1")      # [fia3] accepted: the sif's 0.5.3 and the 0.6.8.post1 read for this change
 TOL_C = 1.0e-3                              # REGISTERED: max |arm - fp64| (absolute), every arm
@@ -173,7 +193,8 @@ NCU_MARGIN_S = 120
 NCU_CAP_S = 600
 ATTN_KERNELS = ("BatchPrefillWithPagedKVCacheKernel", "PersistentVariableLengthMergeStatesKernel",
                 "_bi_split_kernel", "_bi_combine_kernel", "_bi_shared_kernel",
-                "flash_fwd", "kernel_topk_to_uint64")          # [fia3] V1: InfLLM-v2's forward and its mask packer
+                "flash_fwd", "kernel_topk_to_uint64",          # [fia3] V1: InfLLM-v2's forward and its mask packer
+                "kernel_unified_attention")                    # [fia4] FV / FVT: the fork (one launch per call)
 KERNEL_FILTER = "regex:" + "|".join(ATTN_KERNELS)
 NCU_REQUIRED = ("gpu__time_duration.sum", "dram__bytes_read.sum", "dram__bytes_write.sum")
 NCU_OPTIONAL = ("lts__t_sector_hit_rate.pct",
@@ -181,16 +202,21 @@ NCU_OPTIONAL = ("lts__t_sector_hit_rate.pct",
                 "lts__t_sectors_srcunit_tex_op_read.sum", "lts__t_sectors_srcunit_tex.sum",
                 "lts__t_sectors.avg.pct_of_peak_sustained_elapsed",
                 "dram__throughput.avg.pct_of_peak_sustained_elapsed", "sm__throughput.avg.pct_of_peak_sustained_elapsed",
-                "l1tex__t_bytes_pipe_lsu_mem_local_op_ld.sum", "l1tex__t_bytes_pipe_lsu_mem_local_op_st.sum")
+                "l1tex__t_bytes_pipe_lsu_mem_local_op_ld.sum", "l1tex__t_bytes_pipe_lsu_mem_local_op_st.sum",
+                "sm__warps_active.avg.pct_of_peak_sustained_active")     # [fia4] achieved occupancy
 # [fia3] the LaunchStats section gives launch__registers_per_thread (a section always exists; a metric name may not
 # be listed by --query-metrics, and an unknown metric name stops ncu)
 NCU_SECTIONS = ("LaunchStats",)
-NCU_LAUNCH = ("launch__registers_per_thread", "launch__shared_mem_per_block_dynamic", "launch__grid_size")
+NCU_LAUNCH = ("launch__registers_per_thread", "launch__shared_mem_per_block_dynamic", "launch__grid_size",
+              # [fia4] the occupancy limits and the static shared memory (the fia3 CSV has these LaunchStats columns)
+              "launch__shared_mem_per_block_static", "launch__occupancy_limit_registers",
+              "launch__occupancy_limit_shared_mem", "launch__waves_per_multiprocessor")
 L2_SECTOR_BYTES = 32
 TAG_RE = re.compile(r"fia\|([A-Z0-9]+)")
 KERNELS_PER_CALL = dict(P=2, F8=4, F0=2, FH=None, S5=2,   # F8: 2 heads x (prefill + merge); F0: 2 x prefill
-                        FP0=2, FP8=4, FPU=2, V1=None)     # [fia3] FP8: 2 x (prefill + merge); V1: 2 calls x (packer +
+                        FP0=2, FP8=4, FPU=2, V1=None,     # [fia3] FP8: 2 x (prefill + merge); V1: 2 calls x (packer +
                                                           # forward, maybe split + combine): not fixed
+                        FV=1, FVT=1)                      # [fia4] one launch: grid (2B, Hkv), both KV heads
 REUSE_LABEL = dict(
     P="hardware cache only: per-row loads; the rows of a request are adjacent programs of one grid (L2 reuse)",
     F8="hardware cache only: one CTA per (row, chunk); requests in request-major order (L2 reuse)",
@@ -205,6 +231,10 @@ REUSE_LABEL = dict(
     FPU="as FP0 without the mask (timing only)",
     V1="hardware cache only: InfLLM-v2 varlen, kBlockM 16 = one token x 16 heads per CTA; the rows of a request reuse "
        "the union pages through L2",
+    FV="EXPLICIT shared tile: one Triton program per (request, KV head) loads each union block once (64 tokens, only "
+       "the tokens some row sees) for the 4 rows x 16 query heads (BLOCK_M 64, one tl.dot); the program builds its "
+       "union table itself; per-row score mask",
+    FVT="as FV, the union table built by torch before the launch (timing only)",
 )
 VARIANT_NAME = "R2FiCisBias"
 VARIANT_URI = "r2_fiattn_cisbias_bf16_d%d"
@@ -355,6 +385,20 @@ PRED3 = {
                 "vLLM's Triton unified attention) with this measured blocker written down as the skill's rung-4 row. "
                 "If L2->SM bytes fall 3x (P / FP0) but the time does not move (FP0 / P > 0.8): HBM-bound, stop at the "
                 "15 % byte bound.",
+}
+
+# [fia4] REGISTERED block for the LEAD (the stamp is the lead's; docs/NOTES_fia4.md section 6 carries the same json;
+# test FV12 keeps them equal). Bands [central, low, high]. Source: the lead's T0.3b brief (FV / P device central 0.7,
+# band [0.4, 1.1]; the rule).
+PRED4 = {
+    "registered": "REGISTERED <TBD-for-lead-stamp>",
+    "source": "lead's T0.3b brief 2026-10-27 (PLAN_speckv_on_cached_nosa.md Task 0.3 option 2; SCORING_fia3.md)",
+    "fv_over_p_device": {"216x4": [0.7, 0.4, 1.1], "216x4s1": [0.7, 0.4, 1.1]},
+    "thresholds": {"fv_over_p_max": 0.8, "union_build_ms_per_tick_max": 1.0, "layers_per_tick": 32},
+    "decision": "ADOPT FV if, at B 216 x 4, FV device time <= 0.8 x P device time (ncu) AND the union build <= 1 ms "
+                "per tick (32 layers; FV builds in the kernel: 32 x (FV - FVT) device time) AND the FV MUST gates "
+                "pass. Else NOT MET, with the ncu split (registers, spills, achieved occupancy, DRAM and L2->SM "
+                "bytes) written down.",
 }
 
 
@@ -1728,6 +1772,137 @@ class V1Arm:
         return self.launch()
 
 
+# ------------------------------------------------------------------ [fia4] the fork of vLLM's Triton unified attention
+def import_fv(path):
+    """[fia4] The fork (nosi/nosi/fork_vllm_unified_attention.py of THIS tree, loaded by path; it imports torch and
+    triton only). (module, None) or (None, the reason: a FINDING)."""
+    try:
+        mod = load_by_path(path, "fork_vllm_unified_attention")
+        for name in ("unified_attention", "kernel_unified_attention", "fork_build_union"):
+            if not hasattr(mod, name):
+                return None, "%s has no %s" % (path, name)
+        return mod, None
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, str(e)[:300])
+
+
+def fv_width(p_):
+    """[fia4] The union-table width W = FV_ROWS x the next power of two >= P (the kernel's scratch and rank range)."""
+    pp = 1
+    while pp < int(p_):
+        pp *= 2
+    return FV_ROWS * pp
+
+
+def fv_tables_from_union(u, width):
+    """[fia4] The fork's union tables from fp_union's output: the TORCH builder (FVT's input, the oracle of FV's
+    in-kernel build). table (Hkv, B, width) int32 = the union page ids (entry x S + slot) in ascending (block id, slot)
+    order; ext (Hkv, B, width) int32 = per union page the rows' visible tokens, one byte per row (row u at bits 8u ..
+    8u + 7); length (Hkv, B) int32 = the union sizes. Entries past a union are 0. Device ops only (no host read)."""
+    ext = u["ext"]
+    hkv, nb, rpr, uw = ext.shape
+    if rpr > FV_ROWS or int(width) < uw:
+        raise ValueError("rows per request %d (<= %d), width %d (>= %d)" % (rpr, FV_ROWS, width, uw))
+    sh = (torch.arange(rpr, device=ext.device, dtype=torch.int64) * 8).view(1, 1, rpr, 1)
+    word = (ext << sh).sum(2)                                                    # disjoint bytes: the sum is the or
+    table = torch.zeros((hkv, nb, int(width)), dtype=torch.int32, device=ext.device)
+    xt = torch.zeros((hkv, nb, int(width)), dtype=torch.int32, device=ext.device)
+    table[..., :uw] = u["upage"].to(torch.int32)
+    xt[..., :uw] = word.to(torch.int32)
+    return table, xt, u["ucnt"].to(torch.int32).contiguous()
+
+
+def fv_sorted_rows(b):
+    """[fia4] The precondition of the fork's in-kernel build (piece 3's canonical order, build_page_table): every
+    (row, KV head) lists its pages in strictly ascending block id. (ok, detail); one host read (gates only)."""
+    pk = b["page_key"].to("cpu", torch.int64)
+    npg = b["num_pages"].to("cpu", torch.int64)
+    j = torch.arange(1, pk.shape[-1]).view(1, 1, -1)
+    live = j < npg.unsqueeze(-1)
+    bad = int((live & (pk[..., 1:] <= pk[..., :-1])).any(-1).sum())
+    return bad == 0, "%d (row, KV head) lists are not strictly ascending by block id" % bad
+
+
+class FVArm:
+    """[fia4] The fork of vLLM's Triton unified attention (module docstring [fia4]; docs/NOTES_fia4.md). build True
+    (FV): the kernel builds the union table itself (fork_build_union); False (FVT): the torch builder writes it IN PLACE
+    before the launch (build); ones (FVT only): every row sees the pair's whole reach (the MASK WITNESS). Persistent
+    buffers per batch shape: the union tables (Hkv, B, W), the lengths, cu_seqlens_q, a zero seqused_k (the fork reads
+    only its length) and the output. prepare has one host read (the rows of a request share one storage entry, as
+    FPArm); launch has none (R_GRAPH_FV captures it)."""
+    def __init__(self, mod, name, geom, s_slots, rpr, build, ones=False, device="cuda"):
+        if rpr > FV_ROWS or (build and ones):
+            raise ValueError("rows per request %d (<= %d), build %s, ones %s" % (rpr, FV_ROWS, build, ones))
+        self.mod, self.name, self.geom, self.S, self.rpr = mod, name, geom, s_slots, rpr
+        self.build_in_kernel, self.ones = bool(build), bool(ones)
+        self.scale = geom["D"] ** -0.5
+        self.dev = torch.device(device)
+        self.bufs = self.u = self.info = None
+        self._b = self._out = None
+        self.launch_kw = {}                 # num_warps / num_stages overrides: none (Triton's defaults, as upstream)
+
+    @property
+    def workspace_bytes(self):
+        return sum(t.numel() * t.element_size() for t in (self.bufs or {}).values() if torch.is_tensor(t))
+
+    def alloc(self, nb, p_):
+        hkv, d, w = self.geom["Hkv"], self.dev, fv_width(p_)
+        self.bufs = dict(nb=nb, p=p_, w=w, table=torch.zeros((hkv, nb, w), dtype=torch.int32, device=d),
+                         ext=torch.zeros((hkv, nb, w), dtype=torch.int32, device=d),
+                         ulen=torch.zeros((hkv, nb), dtype=torch.int32, device=d),
+                         cu=(torch.arange(nb + 1, dtype=torch.int32, device=d) * self.rpr).contiguous(),
+                         seqused=torch.zeros(nb, dtype=torch.int32, device=d))
+
+    def build(self, b):
+        """The torch build (FVT; FV's oracle), copied IN PLACE into the tables the launch reads. No host read."""
+        u = fp_union(b, self.rpr, self.S, ones=self.ones)
+        t, x, n = fv_tables_from_union(u, self.bufs["w"])
+        self.bufs["table"].copy_(t)
+        self.bufs["ext"].copy_(x)
+        self.bufs["ulen"].copy_(n)
+        self.u = u
+        return u
+
+    def prepare(self, b):
+        check_store(b["k"], b["v"], b["bias"])
+        r_, hkv, p_ = b["page_table"].shape
+        if r_ % self.rpr or b["k"].shape[1] != self.S * PAGE:
+            raise ValueError("%d rows are not requests of %d rows, or the store is not S x %d rows" % (r_, self.rpr, PAGE))
+        nb = r_ // self.rpr
+        seq = b["seq_idx"].to("cpu", torch.int64).view(nb, self.rpr)
+        if not bool((seq == seq[:, :1]).all()):
+            raise ValueError("the rows of a request must be consecutive and share one storage entry")
+        if self.bufs is None or self.bufs["nb"] != nb or self.bufs["p"] != p_:
+            self.alloc(nb, p_)
+        if not self.build_in_kernel:
+            self.build(b)
+        self._out = torch.empty_like(b["q"])
+        self._b = b
+
+    def launch(self):
+        b, bf = self._b, self.bufs
+        n_, sr, hkv, d = b["k"].shape
+        nblk = n_ * self.S
+        bu = None
+        if self.build_in_kernel:
+            bu = dict(page_key=b["page_key"], page_table=b["page_table"], num_pages=b["num_pages"],
+                      last_len=b["last_len"], seq_idx=b["seq_idx"], slots_per_entry=self.S)
+        self.mod.unified_attention(
+            b["q"], b["k"].view(nblk, PAGE, hkv, d), b["v"].view(nblk, PAGE, hkv, d), self._out, bf["cu"], self.rpr,
+            bf["seqused"], sr, self.scale, True, (-1, -1), bf["table"], 0, None, None, None,
+            union_ext=bf["ext"], union_len=bf["ulen"], cis_bias=b["bias"].view(nblk, PAGE, hkv), build_union=bu,
+            rows_per_q_block=FV_ROWS, **self.launch_kw)
+        return self._out
+
+    def tables(self):
+        """Copies of the tables the last launch read (FVT) or wrote (FV): (table, ext, length)."""
+        return self.bufs["table"].clone(), self.bufs["ext"].clone(), self.bufs["ulen"].clone()
+
+    def __call__(self, b):
+        self.prepare(b)
+        return self.launch().clone()
+
+
 # ------------------------------------------------------------------ gates (arm-agnostic; the CPU tests use fakes)
 def bits_equal(a, b):
     """Bitwise equality (a -0.0 / +0.0 or a NaN payload difference counts)."""
@@ -1867,10 +2042,11 @@ def plan_reuse_check(name, tag, arm, b_plan, b_layer):
                 % (len(bad), fresh.shape[0], bad[:10]))
 
 
-def completeness_gates(gates, cells, arms, custom, fp=False, v1=False):
+def completeness_gates(gates, cells, arms, custom, fp=False, v1=False, fv=False):
     """[fix after fia1] MUST per requested cell: every expected gate of that cell is present (whatever its result),
     so a cell or an arm that never reported cannot pass by absence. [fia3] fp (the FP variant built): FP0's gates;
-    v1 (V1 importable): V1_pre and C_V1 (C_V1 is a VOID REPORT when the precondition fails)."""
+    v1 (V1 importable): V1_pre and C_V1 (C_V1 is a VOID REPORT when the precondition fails). [fia4] fv (the fork
+    imported): FV's gates."""
     have = {g["name"] for g in gates}
     out = []
     for c in cells:
@@ -1890,6 +2066,12 @@ def completeness_gates(gates, cells, arms, custom, fp=False, v1=False):
                 want.append("CW_FP0_%s" % tag)
         if v1 and "V1" in arms:
             want += ["V1_pre_%s" % tag, "C_V1_%s" % tag]
+        if fv and "FV" in arms:                                           # [fia4]
+            want += ["G_block0_%s" % tag, "C_FV_%s" % tag, "MW_FV_%s" % tag, "U_FV_table_%s" % tag]
+            want += ["%s_FV_%s" % (p, tag) for p in ("FI1_request_alone", "FI2_order", "FI3_other_requests",
+                                                     "FI5_poison")]
+            if custom:
+                want.append("CW_FV_%s" % tag)
         miss = [w for w in want if w not in have]
         out.append(gate("COMPLETE_%s" % tag, not miss, True, "%d of %d expected gates present; missing %s"
                         % (len(want) - len(miss), len(want), miss[:8])))
@@ -1983,20 +2165,21 @@ def block0_gate(tag, batches, rpr, s_slots, must):
                 % (len(batches), miss, f64, KV_TILE_PAGES * PAGE, f128, cells))
 
 
-def mask_witness(tag, arm_ones, bf, rows, ref, u_rows, tol, must):
+def mask_witness(tag, arm_ones, bf, rows, ref, u_rows, tol, must, gname=None):
     """MW: FP0 with every row given the pair's whole reach (no holes) must FAIL C against the reference, so FP0's C
     pass comes from the mask the variant applies. VOID when no row misses a union page (a mask with no hole: a no-op
-    plant, L34)."""
+    plant, L34). [fia4] gname: the gate's name (default the FP0 name; FV: MW_FV_<tag>)."""
+    gname = gname or "MW_FP0_%s" % tag
     j = torch.arange(u_rows["ext"].shape[-1], device=u_rows["ext"].device).view(1, 1, 1, -1)
     live = j < u_rows["ucnt"].unsqueeze(-1).unsqueeze(-1)
     holes = int((live & (u_rows["ext"] < u_rows["ext"].amax(dim=2, keepdim=True))).sum())
     if holes == 0:
-        return gate("MW_FP0_%s" % tag, False, must, "VOID: no row misses a union token (the mask has no hole)",
+        return gate(gname, False, must, "VOID: no row misses a union token (the mask has no hole)",
                     status="VOID")
     o = arm_ones(bf)[torch.as_tensor(rows, device=bf["q"].device)]
     err = float((o.double() - ref.to(o.device)).abs().max())
     st = "DETECTED" if err > tol else "BLIND"
-    return gate("MW_FP0_%s" % tag, st == "DETECTED", must,
+    return gate(gname, st == "DETECTED", must,
                 "%s: every row given the whole union vs the reference %.3e (tol %.1e); %d (request, head, row, page) "
                 "cells see fewer tokens than the reach" % (st, err, tol, holes), status=st)
 
@@ -2079,6 +2262,119 @@ def decision_report(report, gates, cells):
     return out
 
 
+# ------------------------------------------------------------------ [fia4] gates and the decision of the fork
+def fv_table_gate(tag, arm, batches, rpr, s_slots, must):
+    """U_FV_table (MUST): after an FV call on each batch, the tables the KERNEL wrote == the torch tables
+    (fv_tables_from_union over fp_union) on each union's valid prefix, and the lengths are equal. Precondition: the
+    rows are sorted (fv_sorted_rows; the in-kernel build needs piece 3's canonical order), else VOID (= fail)."""
+    det, bad, pre = [], 0, True
+    for name, b in batches:
+        ok, txt = fv_sorted_rows(b)
+        pre = pre and ok
+        arm(b)
+        kt, kx, kn = arm.tables()
+        t, x, n = fv_tables_from_union(fp_union(b, rpr, s_slots), arm.bufs["w"])
+        live = torch.arange(t.shape[-1], device=t.device).view(1, 1, -1) < n.unsqueeze(-1).to(torch.int64)
+        dl, dt, dx = int((kn != n).sum()), int(((kt != t) & live).sum()), int(((kx != x) & live).sum())
+        bad += dl + dt + dx
+        det.append("%s: %d lengths, %d pages, %d extent words differ of %d entries (%s)"
+                   % (name, dl, dt, dx, int(live.sum()), txt))
+    return gate("U_FV_table_%s" % tag, pre and bad == 0, must, "%s; %s" % (
+        "precondition met (sorted rows)" if pre else "VOID: unsorted rows", "; ".join(det)),
+        status=None if pre else "VOID")
+
+
+def fv_row_alone_gate(tag, arm, bf, rows, rpr, full):
+    """X_row_alone_FV (REPORT; the EXACT probe): each sampled row alone (rpr copies of it: its own list is then the
+    union) vs the same row in its request, bitwise. Expected: no difference (a tile = one block, ascending block
+    order; a block the row does not list is an exact identity step once block 0 was seen, G_block0)."""
+    diff = []
+    for r in rows:
+        o = arm(select(bf, [r] * rpr))
+        if not bits_equal(o[0], full[r]):
+            diff.append(r)
+    return gate("X_row_alone_FV_%s" % tag, not diff, False,
+                "%d of %d sampled rows differ alone (%d copies) vs in their request (EXACT expected by construction); "
+                "differing %s" % (len(diff), len(rows), rpr, diff[:10]))
+
+
+def fv_graph_probe(tag, arm, b):
+    """R_GRAPH_FV (REPORT): one FV launch (the in-kernel union build included) captured in a CUDA graph after a
+    side-stream warm-up (torch.cuda.graphs); the replay into a NaN-filled output == the eager launch, bitwise; replay
+    time. A capture error is a REPORT field."""
+    if not (torch.cuda.is_available() and b["q"].is_cuda):
+        return gate("R_GRAPH_FV_%s" % tag, False, False, "not run: no CUDA tensors")
+    try:
+        arm.prepare(b)
+        eager = arm.launch().clone()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                arm.launch()
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            arm.launch()
+        arm._out.fill_(float("nan"))
+        g.replay()
+        torch.cuda.synchronize()
+        same = bits_equal(arm._out, eager)
+        t = cuda_time(g.replay, 5, 50)
+        del g
+        return gate("R_GRAPH_FV_%s" % tag, same, False, "one FV launch in a CUDA graph: replay bitwise equal to eager "
+                    "%s; replay %.4f ms per layer" % (same, t["median"]))
+    except Exception as e:
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        return gate("R_GRAPH_FV_%s" % tag, False, False, "capture failed: %s: %s" % (type(e).__name__, str(e)[:300]))
+
+
+def decision_report4(report, gates, cells):
+    """R_DECISION4 (REPORT; the lead scores it): PRED4's rule per registered cell. FV / P from the ncu device times;
+    the union build per tick = 32 x (FV - FVT) ncu device time (FV builds in the kernel, FVT reads a torch table), or
+    the event-time difference when ncu has no FVT; the FV MUST gates of the cell; plus the ncu split for the record."""
+    th = PRED4["thresholds"]
+    out = []
+    for c in cells:
+        b, rpr, src = cell_parts(c)
+        tag = cell_tag(b, rpr, src)
+        if tag not in PRED4["fv_over_p_device"]:
+            continue
+        arms = (((report.get("ncu") or {}).get(tag) or {}).get("summary") or {}).get("arms") or {}
+        p, f, ft = arms.get("P"), arms.get("FV"), arms.get("FVT")
+        ratio = f["time_ns"] / p["time_ns"] if p and f and p.get("time_ns") else None
+        rt = ft["time_ns"] / p["time_ns"] if p and ft and p.get("time_ns") else None
+        b_ncu = (th["layers_per_tick"] * max(f["time_ns"] - ft["time_ns"], 0.0) / 1e6
+                 if f and ft and f.get("time_ns") and ft.get("time_ns") else None)
+        t = (((report.get("cells") or {}).get(tag) or {}).get("arms") or {}).get("FV") or {}
+        b_ev = t.get("build_in_kernel_ms_per_tick_events")
+        build = b_ncu if b_ncu is not None else b_ev
+        mine = [g for g in gates if g["must"] and g["name"].endswith("_" + tag)
+                and ("_FV_" in g["name"] or g["name"].startswith("G_block0"))]
+        gates_ok = bool(mine) and all(g["passed"] for g in mine)
+        time_ok = ratio is not None and ratio <= th["fv_over_p_max"]
+        build_ok = build is not None and build <= th["union_build_ms_per_tick_max"]
+        verdict = "ADOPT" if (time_ok and build_ok and gates_ok) else "NOT MET"
+        split = "n/a"
+        if f:
+            split = "registers %s, local memory %s B, achieved occupancy %s %%, shared memory %s B, DRAM / union %s, " \
+                    "L2->SM / union %s" % (sorted(set(f.get("regs") or [])), f.get("local_bytes"), f.get("occ"),
+                                           f.get("smem"), f.get("read_over_union"), f.get("l2sm_over_union"))
+        out.append(gate("R_DECISION4_%s" % tag, True, False,
+                        "%s: FV / P device %s (%s); union build per tick %s ms (ncu %s, events %s; rule <= %.1f); FV "
+                        "MUST gates %s; FVT / P %s; FV ncu: %s"
+                        % (verdict, "%.4f" % ratio if ratio is not None else "n/a",
+                           band_text(ratio, PRED4["fv_over_p_device"][tag]),
+                           "%.4f" % build if build is not None else "n/a",
+                           "%.4f" % b_ncu if b_ncu is not None else "n/a",
+                           "%.4f" % b_ev if b_ev is not None else "n/a", th["union_build_ms_per_tick_max"],
+                           "PASS" if gates_ok else "NOT ALL PASS", "%.4f" % rt if rt is not None else "n/a", split)))
+    return out
+
+
 # ------------------------------------------------------------------ timing (GPU)
 def summarize_ms(xs):
     s = sorted(xs)
@@ -2157,6 +2453,8 @@ def time_arm(name, arm, b, warm, reps, geom):
             rep["layer_with_plan_reuse_ms"] = cuda_time(layer, warm, reps)
     if isinstance(arm, FPArm):
         time_fp_extras(rep, arm, b, warm, reps)
+    if isinstance(arm, FVArm):                                                  # [fia4]
+        time_fv_extras(rep, arm, b, warm, reps)
     if isinstance(arm, V1Arm):
         rep["gather_ms"] = cuda_time(lambda: arm.stage_gather(b), 2, 20)       # union + store copy (one host read)
         rep["prep_ms"] = cuda_time(arm.stage_prep, 2, 20)                     # exp(cis) values
@@ -2233,6 +2531,42 @@ def time_fp_extras(rep, arm, b, warm, reps):
         rep["tick_overhead_graph_ms"] = round(nl * (pl + bg), 5) if bg is not None else None
 
 
+def time_fv_extras(rep, arm, b, warm, reps):
+    """[fia4] FV / FVT host costs: the host time of one launch (Python + Triton's launcher; a CUDA graph removes it),
+    and for FVT the torch build of the tables per layer (events, host wall, one CUDA graph) and per tick (32 layers).
+    FV's in-kernel build is FV - FVT (set by run_cell when both ran)."""
+    rep["launch_host_ms"] = host_time(arm.launch, 50)
+    rep["build"] = "in the kernel (fork_build_union)" if arm.build_in_kernel else "torch (fp_union + tables)"
+    if not arm.build_in_kernel:
+        rep["build_ms_per_layer"] = cuda_time(lambda: arm.build(b), 5, 50)
+        rep["build_host_ms_per_layer"] = host_time(lambda: arm.build(b), 50)
+        gms, gerr = build_graph_ms(arm, b)
+        if gms is not None:
+            rep["build_graph_ms_per_layer"] = gms
+        else:
+            rep["build_graph_error"] = gerr
+        nl = LAYERS_PER_TICK
+        rep["tick_build_eager_ms"] = round(nl * rep["build_ms_per_layer"]["median"], 5)
+        rep["tick_build_graph_ms"] = round(nl * gms["median"], 5) if gms is not None else None
+        rep["union"] = union_stats(arm.u, b)
+    rep["table_width"] = arm.bufs["w"]
+    arm.prepare(b)
+
+
+def fv_time_text(t):
+    """[fia4] the FV arms' part of the R_T line."""
+    txt = "; launch host %.4f ms; build %s" % (t["launch_host_ms"]["median"], t["build"])
+    if "build_ms_per_layer" in t:
+        g = t.get("build_graph_ms_per_layer")
+        txt += (" per layer %.4f ms events, %.4f ms host, graph %s; per tick (%d layers) eager %.4f, graph %s ms; "
+                "union %s" % (t["build_ms_per_layer"]["median"], t["build_host_ms_per_layer"]["median"],
+                              "%.4f" % g["median"] if g else "n/a (%s)" % t.get("build_graph_error"), LAYERS_PER_TICK,
+                              t["tick_build_eager_ms"],
+                              "%.4f" % t["tick_build_graph_ms"] if t.get("tick_build_graph_ms") is not None else "n/a",
+                              t["union"]))
+    return txt + "; table width %d" % t["table_width"]
+
+
 # ------------------------------------------------------------------ ncu (REPORT)
 def _num(x):
     try:
@@ -2273,7 +2607,7 @@ def ncu_summary(rows, arms, ideal, union, rpr):
     """Per arm: DRAM bytes read / written, kernel time, kernel count (vs KERNELS_PER_CALL), ratios to the ideal
     and the union bytes, the band (PRED dram_read_over_ideal), the reuse label."""
     per = {a: dict(read=0.0, write=0.0, time_ns=0.0, kernels=[], label=REUSE_LABEL.get(a, ""), l2sm_sectors=None,
-                   regs=[], local_bytes=None) for a in arms}
+                   regs=[], local_bytes=None, occ=[], smem=[], limits=[]) for a in arms}     # [fia4] occ, smem, limits
     stray = []
     for r in rows:
         if r["tag"] not in per or not any(k in r["name"] for k in ATTN_KERNELS):
@@ -2293,6 +2627,17 @@ def ncu_summary(rows, arms, ideal, union, rpr):
                                   "l1tex__t_bytes_pipe_lsu_mem_local_op_st.sum") if r.get(m) is not None]
         if loc:
             p["local_bytes"] = (p["local_bytes"] or 0.0) + sum(loc)
+        occ = r.get("sm__warps_active.avg.pct_of_peak_sustained_active")               # [fia4] achieved occupancy
+        if occ is not None:
+            p["occ"].append(round(occ, 2))
+        sm = [r.get(m) for m in ("launch__shared_mem_per_block_dynamic", "launch__shared_mem_per_block_static")
+              if r.get(m) is not None]
+        if sm:
+            p["smem"].append(int(sum(sm)))
+        lim = tuple(r.get(m) for m in ("launch__occupancy_limit_registers", "launch__occupancy_limit_shared_mem",
+                                       "launch__waves_per_multiprocessor"))
+        if any(x is not None for x in lim):
+            p["limits"].append(lim)
     for a, p in per.items():
         p["n_kernels"] = len(p["kernels"])
         p["expected_kernels"] = KERNELS_PER_CALL.get(a)
@@ -2332,6 +2677,8 @@ def ncu_argv(a, b, rpr, child_out, rep, metrics, arms, bias_free, src="gen"):
         argv += ["--sharedkv", a.sharedkv]
     if "V1" in arms:
         argv += ["--verify-step", getattr(a, "verify_step", None)]
+    if any(x in arms for x in FV_ARMS):                                      # [fia4]
+        argv += ["--fv-kernel", getattr(a, "fv_kernel", None)]
     if src == "s1":
         argv += ["--s1-tables", getattr(a, "s1_tables", None)]
     if bias_free:
@@ -2371,7 +2718,7 @@ def ncu_metrics(a, out):
 FP_MODES = dict(FP0=("none", "rows"), FP8=("fixed", "rows"), FPU=("none", "off"))
 
 
-def build_arms(fi, a, geom, case, p3, skv, jit, arms, device, jit_fp=None, vmod=None):
+def build_arms(fi, a, geom, case, p3, skv, jit, arms, device, jit_fp=None, vmod=None, fvmod=None):
     out = {}
     rmax = case["R"] + len(SHORT_COUNTS)
     for name in arms:
@@ -2387,6 +2734,9 @@ def build_arms(fi, a, geom, case, p3, skv, jit, arms, device, jit_fp=None, vmod=
         elif name == "V1":                                      # [fia3] only when V1 imports
             if vmod is not None:
                 out[name] = V1Arm(vmod, geom, case["rpr"], case["S"])
+        elif name in FV_ARMS:                                   # [fia4] only when the fork imports
+            if fvmod is not None and case["rpr"] <= FV_ROWS:
+                out[name] = FVArm(fvmod, name, geom, case["S"], case["rpr"], build=(name == "FV"), device=device)
         else:
             split = dict(F8="fixed", F0="none", FH="heuristic")[name]
             out[name] = FIArm(fi, name, split, geom, case["S"], jit, device)
@@ -2401,8 +2751,8 @@ def make_cell_case(geom, b, rpr, src, seed, s1_groups, with_data=True):
     return make_case(geom, b, rpr, seed, with_data=with_data, data_device=dd)
 
 
-def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates, src="gen", jit_fp=None, vmod=None, s1_groups=None):
-    """All gates and reports of one cell; appends to gates, returns the cell's report dict."""
+def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates, src="gen", jit_fp=None, vmod=None, s1_groups=None, fvmod=None):
+    """All gates and reports of one cell; appends to gates, returns the cell's report dict. [fia4] fvmod: the fork."""
     tag = cell_tag(b, rpr, src)
     custom = jit is not None
     t0 = time.time()
@@ -2422,7 +2772,7 @@ def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates, src="gen", jit_fp=None, v
     rep = dict(cell=tag, R=r_, rows_sampled=rows, poison=pstats, ideal_bytes=ideal_bytes(bf, geom),
                union_bytes=union_bytes(bf, geom, case["N"], case["S"]), arms={}, src=src,
                data_device=case.get("data_device"), s1_groups=case.get("s1_groups"), s1_calls=case.get("s1_calls"))
-    arms = build_arms(fi, a, geom, case, p3, skv, jit, a.arms, "cuda", jit_fp=jit_fp, vmod=vmod)
+    arms = build_arms(fi, a, geom, case, p3, skv, jit, a.arms, "cuda", jit_fp=jit_fp, vmod=vmod, fvmod=fvmod)
     outs = {}
     for name in ("P", "F8", "F0", "S5"):
         if name not in arms:
@@ -2467,8 +2817,9 @@ def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates, src="gen", jit_fp=None, v
                 gates.append(gate("R_REUSE_%s_%s" % (name, tag), False, False, "EXCEPTION %s: %s"
                                   % (type(e).__name__, str(e)[:300])))
     run_fp_v1(fi, a, geom, case, arms, outs, bf, rows, ref, ref0, poisoned, rpr, tag, custom, jit_fp, gates, rep)
+    run_fv(geom, case, arms, outs, bf, rows, ref, ref0, poisoned, rpr, tag, custom, fvmod, gates, rep)    # [fia4]
     tp = None
-    for name in ("P", "F8", "F0", "FH", "S5", "FP0", "FP8", "FPU", "V1"):
+    for name in ("P", "F8", "F0", "FH", "S5", "FP0", "FP8", "FPU", "V1", "FV", "FVT"):
         if name not in arms or (name == "V1" and not rep.get("v1_pre")):
             continue
         try:
@@ -2483,7 +2834,9 @@ def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates, src="gen", jit_fp=None, v
                 bands = PRED["ratio_vs_p3"].get(name, {})
                 txt = "%s %.4f ms, x%s of P; %s" % (name, med, "%.3f" % ratio if ratio else "n/a",
                                                     band_text(ratio, bands[tag]) if tag in bands else "no band")
-                if "build_ms_per_layer" in t:
+                if "launch_host_ms" in t:                                     # [fia4] before the FP branch
+                    txt += fv_time_text(t)
+                elif "build_ms_per_layer" in t:
                     txt += fp_time_text(t)
                 elif "gather_ms" in t:
                     txt += "; union store gather %.4f ms, exp(cis) values %.4f ms (per layer), W %d slots" % (
@@ -2512,6 +2865,7 @@ def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates, src="gen", jit_fp=None, v
             traceback.print_exc()
             gates.append(gate("R_T_%s_%s" % (name, tag), False, False, "EXCEPTION %s: %s" % (type(e).__name__,
                                                                                              str(e)[:300])))
+    fv_build_report(rep, tag, gates)                                                            # [fia4]
     if custom and a.strided and "F8" in outs:
         try:
             sa = FIStridedArm(fi, geom, case["S"], jit, "cuda")
@@ -2641,6 +2995,96 @@ def run_fp_v1(fi, a, geom, case, arms, outs, bf, rows, ref, ref0, poisoned, rpr,
             gates.append(gate("C_V1_%s" % tag, False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
 
 
+def _fv_try(gates, name, must, fn):
+    """[fia4] Append fn()'s gate; an exception becomes a failed gate of that name (MUST as given)."""
+    try:
+        gates.append(fn())
+    except Exception as e:
+        traceback.print_exc()
+        gates.append(gate(name, False, must, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+
+
+def run_fv(geom, case, arms, outs, bf, rows, ref, ref0, poisoned, rpr, tag, custom, fvmod, gates, rep):
+    """[fia4] The gates of the fork for one cell (module docstring [fia4]). Appends to gates and outs."""
+    if not any(x in arms for x in FV_ARMS):
+        return
+    baq = batch_of(case, "altreq")
+    rows_t = torch.as_tensor(rows, device=bf["q"].device)
+    if not any(g["name"] == "G_block0_%s" % tag for g in gates):            # shared with FP0 (computed once)
+        _fv_try(gates, "G_block0_%s" % tag, True, lambda: block0_gate(tag, [bf, baq], rpr, case["S"], must=True))
+    u_full = fp_union(bf, rpr, case["S"])
+    rep["union"] = rep.get("union") or union_stats(u_full, bf)
+    if "FV" in arms:
+        arm = arms["FV"]
+        t0 = time.time()
+        try:
+            arm(bf)
+            if bf["q"].is_cuda:
+                torch.cuda.synchronize()
+            gates.append(gate("R_FV_first_call_%s" % tag, True, False, "the first FV call (Triton JIT compile of the "
+                              "fork, or its cache) took %.1f s" % (time.time() - t0)))
+        except Exception as e:
+            traceback.print_exc()
+            gates.append(gate("ARM_FV_%s" % tag, False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+            return
+        nreq = case["R"] // rpr
+        breq = sorted({r // rpr for r in rows})
+        rperm = torch.randperm(nreq, generator=torch.Generator().manual_seed(case["seed"] + 2)).tolist()
+        rperms = [("reversed_requests", list(reversed(range(nreq)))), ("random", rperm)]
+        pre5 = (True, "FV loads only the tokens that some row of the request sees, the tile reach mask")
+        try:
+            g, full = request_suite("FV", tag, arm, bf, baq, rpr, breq, rperms, poisoned, pre5, True)
+            gates.extend(g)
+            outs["FV"] = full
+            gates.append(correctness_gate("FV", tag, full[rows_t], ref, TOL_C, True))
+        except Exception as e:
+            traceback.print_exc()
+            gates.append(gate("ARM_FV_%s" % tag, False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+        if "FV" in outs:
+            if custom:
+                _fv_try(gates, "CW_FV_%s" % tag, True,
+                        lambda: bias_witness(tag, arm, bf, rows, ref, ref0, TOL_C, True, gname="CW_FV_%s" % tag))
+            _fv_try(gates, "U_FV_table_%s" % tag, True,
+                    lambda: fv_table_gate(tag, arm, [("full", bf), ("altreq", baq)], rpr, case["S"], True))
+            _fv_try(gates, "MW_FV_%s" % tag, True, lambda: mask_witness(
+                tag, FVArm(fvmod, "FVones", geom, case["S"], rpr, build=False, ones=True, device=bf["q"].device), bf,
+                rows, ref, u_full, TOL_C, True, gname="MW_FV_%s" % tag))
+            _fv_try(gates, "X_row_alone_FV_%s" % tag, False,
+                    lambda: fv_row_alone_gate(tag, arm, bf, rows, rpr, outs["FV"]))
+            _fv_try(gates, "R_GRAPH_FV_%s" % tag, False, lambda: fv_graph_probe(tag, arm, bf))
+            if "P" in outs:
+                gates.append(bits_vs("FV", tag, outs["FV"], outs["P"]))
+    if "FVT" in arms:
+        try:
+            o = arms["FVT"](bf)
+            outs["FVT"] = o
+            gates.append(correctness_gate("FVT", tag, o[rows_t], ref, TOL_C, False))
+            if "FV" in outs:
+                same = sum(1 for r in range(o.shape[0]) if bits_equal(o[r], outs["FV"][r]))
+                gates.append(gate("R_FVT_equals_FV_%s" % tag, same == o.shape[0], False, "%d of %d rows of FVT (a torch "
+                                  "table) bitwise equal to FV (the kernel's table)" % (same, o.shape[0])))
+        except Exception as e:
+            traceback.print_exc()
+            gates.append(gate("ARM_FVT_%s" % tag, False, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+
+
+def fv_build_report(rep, tag, gates):
+    """[fia4] R_FV_build (REPORT): the in-kernel union build per layer and per tick from CUDA events (FV - FVT kernel
+    medians; ncu's FV - FVT is in R_DECISION4), next to the torch build of FVT (eager and one CUDA graph)."""
+    fv, ft = rep["arms"].get("FV"), rep["arms"].get("FVT")
+    if not (fv and ft):
+        return
+    d = fv["call_ms"]["median"] - ft["call_ms"]["median"]
+    fv["build_in_kernel_ms_per_layer_events"] = round(d, 5)
+    fv["build_in_kernel_ms_per_tick_events"] = round(LAYERS_PER_TICK * max(d, 0.0), 5)
+    gates.append(gate("R_FV_build_%s" % tag, True, False,
+                      "in-kernel union build (FV - FVT, events) %.4f ms per layer -> %.4f ms per tick (%d layers; "
+                      "rule <= %.1f); the torch build of FVT per tick: eager %s ms, graph %s ms"
+                      % (d, fv["build_in_kernel_ms_per_tick_events"], LAYERS_PER_TICK,
+                         PRED4["thresholds"]["union_build_ms_per_tick_max"], ft.get("tick_build_eager_ms"),
+                         ft.get("tick_build_graph_ms"))))
+
+
 # ------------------------------------------------------------------ modes
 def parse_args(argv):
     ap = argparse.ArgumentParser()
@@ -2662,6 +3106,8 @@ def parse_args(argv):
     ap.add_argument("--bias-free", action="store_true", help="ncu-cell only: the default module, bias = 0")
     ap.add_argument("--verify-step", default=None, help="[fia3] EQ verify_step.py (a pinned copy; arm V1)")
     ap.add_argument("--s1-tables", default=None, help="[fia3] the recorded S1 skv_tables.pt (a copy; the s1 cells)")
+    ap.add_argument("--fv-kernel", default=None, help="[fia4] the fork nosi/nosi/fork_vllm_unified_attention.py (FV, "
+                                                      "FVT)")
     a = ap.parse_args(argv)
     a.cells = parse_cells(a.cells)
     a.arms = parse_arms(a.arms)
@@ -2671,6 +3117,8 @@ def parse_args(argv):
         raise ValueError("ncu-cell with S5 needs --sharedkv")
     if "V1" in a.arms and not a.verify_step:
         raise ValueError("arm V1 needs --verify-step")
+    if any(x in a.arms for x in FV_ARMS) and not a.fv_kernel:                      # [fia4]
+        raise ValueError("arms FV / FVT need --fv-kernel")
     if any(cell_parts(c)[2] == "s1" for c in a.cells) and not a.s1_tables:
         raise ValueError("an s1 cell needs --s1-tables")
     return a
@@ -2685,7 +3133,8 @@ def refuse_common(a):
             return "%s %s is not a file" % (what, f)
     if a.sharedkv and not os.path.isfile(a.sharedkv):
         return "--sharedkv %s is not a file" % a.sharedkv
-    for f, what in ((getattr(a, "verify_step", None), "--verify-step"), (getattr(a, "s1_tables", None), "--s1-tables")):
+    for f, what in ((getattr(a, "verify_step", None), "--verify-step"), (getattr(a, "s1_tables", None), "--s1-tables"),
+                    (getattr(a, "fv_kernel", None), "--fv-kernel")):                      # [fia4] --fv-kernel
         if f and not os.path.isfile(f):
             return "%s %s is not a file" % (what, f)
     if not torch.cuda.is_available():
@@ -2748,6 +3197,20 @@ def load_v1(a, gates, report):
     return vmod
 
 
+def load_fv(a, gates, report):
+    """[fia4] gate C0_FV_import (MUST when FV / FVT is asked): the fork loads by path (torch + triton). Returns the
+    module or None (the FV arms do not run; a FINDING)."""
+    if not any(x in a.arms for x in FV_ARMS):
+        return None
+    mod, why = import_fv(a.fv_kernel)
+    gates.append(gate("C0_FV_import", mod is not None, True, "the fork %s: %s" % (
+        a.fv_kernel, "imported (triton %s)" % getattr(sys.modules.get("triton"), "__version__", "?") if mod is not None
+        else "FINDING: " + why)))
+    if mod is None:
+        report["findings"].append("the fork does not import: %s" % why)
+    return mod
+
+
 def load_s1(a, geom, gates):
     """[fia3] the recorded S1 groups per rows-per-request of the s1 cells: {rpr: groups}, or None (a MUST failure)."""
     rprs = sorted({cell_parts(c)[1] for c in a.cells if cell_parts(c)[2] == "s1"})
@@ -2806,6 +3269,7 @@ def mode_main(a):
     del ws0
     jit_fp = build_fp_variant(fi, a, geom, gates, report)                 # [fia3]
     vmod = load_v1(a, gates, report)
+    fvmod = load_fv(a, gates, report)                                      # [fia4]
     s1 = load_s1(a, geom, gates)
     for c in a.cells:
         b, rpr, src = cell_parts(c)
@@ -2820,32 +3284,35 @@ def mode_main(a):
         log("cell %s (%d s left)" % (tag, left))
         try:
             report["cells"][tag] = run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates, src=src, jit_fp=jit_fp,
-                                            vmod=vmod, s1_groups=(s1 or {}).get(rpr))
+                                            vmod=vmod, s1_groups=(s1 or {}).get(rpr), fvmod=fvmod)
         except Exception as e:
             traceback.print_exc()
             gates.append(gate("CELL_%s" % tag, False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
     gates.extend(completeness_gates(gates, a.cells, a.arms, jit is not None, fp=jit_fp is not None,
-                                    v1=vmod is not None))
+                                    v1=vmod is not None, fv=fvmod is not None))
     if a.ncu != "none":
         try:
             run_ncu(a, geom, jit is None, deadline, gates, report, fp_ok=jit_fp is not None, v1_ok=vmod is not None,
-                    s1=s1)
+                    s1=s1, fv_ok=fvmod is not None)
         except Exception as e:
             traceback.print_exc()
             gates.append(gate("R_ncu", False, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
     if jit_fp is not None and "FP0" in a.arms:
         gates.extend(decision_report(report, gates, a.cells))
+    if fvmod is not None and "FV" in a.arms:                                 # [fia4]
+        gates.extend(decision_report4(report, gates, a.cells))
     meta = dict(mode="main", cells=[cell_tag(*c) for c in a.cells], arms=a.arms, seed=a.seed, sample=a.sample,
                 warm=a.warm, reps=a.reps, budget_s=a.budget_s, seconds=round(time.time() - t_start, 1), geom=geom,
                 torch=torch.__version__, flashinfer=fiv, gpu=torch.cuda.get_device_name(0),
                 commit=os.environ.get("FIATTN_COMMIT", "unknown"), biattn=a.biattn, sharedkv=a.sharedkv,
                 verify_step=a.verify_step, s1_tables=a.s1_tables, fi_versions_accepted=list(FI_VERSIONS),
+                fv_kernel=a.fv_kernel, triton=getattr(sys.modules.get("triton"), "__version__", None),   # [fia4]
                 kv_tile_tokens_model=KV_TILE_PAGES * PAGE,
                 bias_free=jit is None, tol_c=TOL_C, env={k: v for k, v in os.environ.items()
                                                          if k.startswith(("FLASHINFER_", "TVM_FFI", "TRITON_",
                                                                           "TORCH_", "MAX_JOBS", "TMPDIR"))})
     write_json(os.path.join(a.out, "summary.json"), dict(meta=meta, gates=gates, report=report, pred=PRED,
-                                                         pred3=PRED3))
+                                                         pred3=PRED3, pred4=PRED4))
     for g in gates:
         print("%s %s %s: %s" % ("GATE" if g["must"] else "REPORT", g["name"], "PASS" if g["passed"] else "FAIL",
                                 g["detail"][:500]))
@@ -2854,7 +3321,7 @@ def mode_main(a):
     return min(nfail, 125)
 
 
-def run_ncu(a, geom, bias_free, deadline, gates, report, fp_ok=False, v1_ok=False, s1=None):
+def run_ncu(a, geom, bias_free, deadline, gates, report, fp_ok=False, v1_ok=False, s1=None, fv_ok=False):
     if not os.access(a.ncu, os.X_OK):
         gates.append(gate("R_ncu", False, False, "no executable ncu at %s" % a.ncu))
         return
@@ -2879,6 +3346,8 @@ def run_ncu(a, geom, bias_free, deadline, gates, report, fp_ok=False, v1_ok=Fals
             arms += [x for x in FP_ARMS if x in a.arms]
         if v1_ok and "V1" in a.arms and report["cells"][tag].get("v1_pre"):
             arms.append("V1")
+        if fv_ok and rpr <= FV_ROWS:                                         # [fia4]
+            arms += [x for x in FV_ARMS if x in a.arms]
         child = os.path.join(a.out, "ncu_%s" % tag)
         rep = os.path.join(a.out, "ncu_%s_rep" % tag)
         t1 = time.time()
@@ -2916,6 +3385,12 @@ def ncu_arm_text(x, p):
         txt += "; registers %s" % sorted(set(p["regs"]))
     if p.get("local_bytes") is not None:
         txt += "; local memory %.3g B%s" % (p["local_bytes"], " (SPILLS)" if p["local_bytes"] > 0 else "")
+    if p.get("occ"):                                                        # [fia4]
+        txt += "; achieved occupancy %s %%" % p["occ"]
+    if p.get("smem"):
+        txt += "; shared memory per block %s B" % sorted(set(p["smem"]))
+    if p.get("limits"):
+        txt += "; occupancy limits (registers, shared memory, waves) %s" % list(dict.fromkeys(p["limits"]))[:3]
     if p.get("band3"):
         txt += "; %s" % p["band3"]
     return txt
@@ -2942,7 +3417,8 @@ def mode_ncu_cell(a):
     bf = batch_of(case, "full")
     jit_fp = jit_args_fp(geom["D"]) if any(x in a.arms for x in FP_ARMS) else None      # [fia3] built by the parent
     vmod = import_v1(a.verify_step)[0] if "V1" in a.arms else None
-    arms = build_arms(fi, a, geom, case, p3, skv, jit, a.arms, "cuda", jit_fp=jit_fp, vmod=vmod)
+    fvmod = import_fv(a.fv_kernel)[0] if any(x in a.arms for x in FV_ARMS) else None   # [fia4] (the Triton cache)
+    arms = build_arms(fi, a, geom, case, p3, skv, jit, a.arms, "cuda", jit_fp=jit_fp, vmod=vmod, fvmod=fvmod)
     if "V1" in arms and not v1_precondition(fp_union(bf, rpr, case["S"]), bf, rpr)[0]:
         del arms["V1"]
     for arm in arms.values():
