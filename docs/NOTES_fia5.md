@@ -1,6 +1,6 @@
 # R2 FIA5: let Triton pipeline K / V inside the vLLM fork (plan Task 0.3b, the fia4 follow-up)
 
-REGISTERED <TBD-for-lead-stamp>
+REGISTERED 2026-10-27T21:11:01Z (lead stamp, before any run)
 
 Builder stamp: 2026-10-27T20:41:30Z (`date -u`). Status: SOURCE ONLY, NOT RUN, NOT REVIEWED.
 Branch r2-fia5, worktree /mnt/beegfs/ojerbi/nosi-r2-fia5, from r2-fia4 344f7d0 (the fia4 fork, stamped and run).
@@ -136,7 +136,7 @@ keeps them equal). The bands are the lead's suggestion in the brief; the rule is
 <!-- PRED5-BEGIN -->
 ```json
 {
- "registered": "REGISTERED <TBD-for-lead-stamp>",
+ "registered": "REGISTERED 2026-10-27T21:11:01Z (lead stamp, before any run)",
  "source": "lead's fia5 brief 2026-10-27 (SCORING_fia4.md sections 5-6: let Triton pipeline K / V inside the fork)",
  "fv_over_p_device": {"216x4": [0.85, 0.6, 1.05], "216x4s1": [0.85, 0.6, 1.05]},
  "best_swept_over_p_device": {"216x4": [0.85, 0.6, 1.05], "216x4s1": [0.85, 0.6, 1.05]},

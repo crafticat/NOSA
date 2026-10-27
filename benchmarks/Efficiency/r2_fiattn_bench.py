@@ -435,7 +435,7 @@ PRED4 = {
 # [fia5] REGISTERED block for the LEAD (the stamp is the lead's; docs/NOTES_fia5.md section 6 carries the same json;
 # test F5_7 keeps them equal). Bands [central, low, high]: the lead's suggestion in the fia5 brief. The rule is PRED4's.
 PRED5 = {
-    "registered": "REGISTERED <TBD-for-lead-stamp>",
+    "registered": "REGISTERED 2026-10-27T21:11:01Z (lead stamp, before any run)",
     "source": "lead's fia5 brief 2026-10-27 (SCORING_fia4.md sections 5-6: let Triton pipeline K / V inside the fork)",
     "fv_over_p_device": {"216x4": [0.85, 0.6, 1.05], "216x4s1": [0.85, 0.6, 1.05]},
     "best_swept_over_p_device": {"216x4": [0.85, 0.6, 1.05], "216x4s1": [0.85, 0.6, 1.05]},
