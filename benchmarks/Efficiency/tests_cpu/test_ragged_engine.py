@@ -298,6 +298,8 @@ def test_ragged_cell_arguments_schedule_fingerprint_verdicts(monkeypatch):
     rg = {"RG": dict(fingerprint=dict(equal_fraction=1.0, n_unequal=0, first=None), rates=dict(steady_step_ms=65.0)),
           "RGS": dict(fingerprint=dict(equal_fraction=0.9, n_unequal=5, first=(3, 7)),
                       rates=dict(steady_step_ms=70.0))}
+    for key in ("RG_bitwise", "RGS_bitwise", "RG_ratio", "RGS_ratio"):          # the builder's state: unregistered
+        monkeypatch.setitem(BC.PRED_RAGGED, key, None)
     v = {n: x for n, x, _ in BC.verdicts_ragged(sh, rg)}
     assert v == {"RG-BIT": "REPORT", "RG-STEP": "REPORT", "RGS-BIT": "REPORT", "RGS-STEP": "REPORT"}, v
     for key, val in (("RG_bitwise", True), ("RGS_bitwise", True), ("RG_ratio", (0.97, 1.03)),

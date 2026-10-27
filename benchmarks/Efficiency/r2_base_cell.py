@@ -107,7 +107,12 @@ MBASE_F_BAND = (0.95, 1.00)
 # --ragged (Task 1.3): REGISTERED PREDICTIONS, TBD BY THE LEAD. Fill every None and the stamp (date -u, L33) in a
 # commit BEFORE the run; a None value gives REPORT. *_bitwise: True / False (every fingerprint equal to SH's);
 # *_ratio: (low, high) of the arm's steady step / SH's steady step.
-PRED_RAGGED = dict(stamp=None, RG_bitwise=None, RGS_bitwise=None, RG_ratio=None, RGS_ratio=None)
+# STAMP by the lead (before any run). RG (equal lengths) and RGS (spread lengths) must give the shipped bits (EXACT
+# claim of Task 1.3). Step ratio vs SH: one band for both cells; central 1.15 for rg1 (torch twin, about 72 small
+# kernels per layer) and 1.05 for rg1f (fused twin; R2 measured 2.31 ms per tick at B 216). The plan's L2 gate
+# (at most -3 %) is the TARGET for rung L2, not this prediction.
+PRED_RAGGED = dict(stamp="2026-10-27T16:40:10Z", RG_bitwise=True, RGS_bitwise=True, RG_ratio=(1.0, 1.35),
+                   RGS_ratio=(1.0, 1.35))
 RAGGED_ARMS = (("RG", 1), ("RGS", None))               # (arm, spread); None = --ragged-spread
 
 
