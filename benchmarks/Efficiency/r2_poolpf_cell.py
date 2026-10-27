@@ -242,6 +242,46 @@ def verdicts_pf(arms):
     return out
 
 
+# ------------------------------------------------------------------ the gate comparisons (CPU-tested)
+def same_bytes(a, b) -> bool:
+    """THE tensor comparison of every gate of this cell (a CPU test checks that no other line calls torch.equal):
+    bitwise equality after BOTH sides are on the host. A gate compares GPU rows with host rows (the window against
+    the pinned _k_cpu), and torch.equal refuses two devices (pf1 run poolpf_q2_2195574: PF-HIT raised "Expected all
+    tensors to be on the same device ... cuda:0 and cpu"). A shape or dtype mismatch is a difference, not an error."""
+    import torch
+    a, b = a.detach().to("cpu"), b.detach().to("cpu")
+    return tuple(a.shape) == tuple(b.shape) and a.dtype == b.dtype and torch.equal(a, b)
+
+
+def sets_equal(pairs, names) -> bool:
+    """Every named tensor of every (engine, engine) pair bitwise equal (same_bytes)."""
+    return all(same_bytes(getattr(x, nm), getattr(y, nm)) for x, y in pairs for nm in names)
+
+
+def hit_checks(PFM, e1, e0, tc1, wins, X, q, s_1, s_0, c, h, b):
+    """The PF-HIT and PF-HIT-CTRL verdicts of part_hit, every tensor comparison through same_bytes. e1 / e0: layer l's
+    engines of the prefetch set and of the control set; tc1: the prefetch set's total_cis of layer l; wins: [(control
+    engine, prefetch engine)] of every layer; X: the prefetched block; q: its pinned pool slots; s_1 / s_0: X's window
+    slots after step 1 in each set; c: the prefetch set's counters; (h, b): the stream. Returns (ok_hit, windows
+    equal, ok_ctrl)."""
+    bs, topk = int(e1.block_size), int(e1.topk)
+
+    def rows(t, blk):
+        return t[b, blk * bs:(blk + 1) * bs, h]
+    ok_hit = (len(q) == 1 and len(s_1) == 1
+              and int(e1._pool_action[h, b, s_1[0]]) in (PFM.POOL_SWAP, PFM.POOL_MOVE_IN)
+              and int(e1._pool_target[h, b, s_1[0]]) == q[0]
+              and same_bytes(rows(e1._k_gpu, s_1[0]), rows(e1._k_cpu, X))
+              and same_bytes(rows(e1._v_gpu, s_1[0]), rows(e1._v_cpu, X))
+              and same_bytes(rows(e1._kv_bias_gpu, s_1[0]), rows(tc1, X))
+              and c["committed"] == 1 and c["pin_hits"] == 1 and bool(c["conserved"]))
+    win = all(same_bytes(getattr(x, nm)[:, :topk * bs], getattr(y, nm)[:, :topk * bs])
+              for x, y in wins for nm in ("_k_gpu", "_v_gpu", "_kv_bias_gpu"))
+    ok_ctrl = (len(s_0) == 1 and int(e0._pool_action[h, b, s_0[0]]) == PFM.POOL_MOVE_OUT
+               and same_bytes(rows(e0._k_gpu, s_0[0]), rows(e0._k_cpu, X)))
+    return ok_hit, win, ok_ctrl
+
+
 # ------------------------------------------------------------------ the GPU parts
 def _sel(cache, rnd, dev):
     import torch
@@ -291,10 +331,9 @@ def part_hit(CEN, PFM, ext, gates, rec, threads, cores):
         torch.cuda.synchronize()
         return types.SimpleNamespace(layers=layers)
     w1, w0 = world(1), world(1)
-    same0 = all(torch.equal(getattr(x.cache_engine, nm), getattr(y.cache_engine, nm))   # precondition: one world
-                for x, y in zip(w0.layers, w1.layers)
-                for nm in ("_k_gpu", "_v_gpu", "_kv_bias_gpu", "_k_cpu", "_v_cpu", "_block_map", "_pool_map",
-                           "_pool_age"))
+    pairs = [(x.cache_engine, y.cache_engine) for x, y in zip(w0.layers, w1.layers)]
+    same0 = sets_equal(pairs, ("_k_gpu", "_v_gpu", "_kv_bias_gpu", "_k_cpu", "_v_cpu", "_block_map", "_pool_map",
+                               "_pool_age"))                # precondition: one seed gives one engine set
     pf1 = PFM.PoolPrefetch(w1, ext, lanes=8, threads=threads, cores=cores)
     pf0 = PFM.PoolPrefetch(w0, ext, lanes=8, threads=threads, cores=cores)
     pf1.attach()
@@ -324,22 +363,11 @@ def part_hit(CEN, PFM, ext, gates, rec, threads, cores):
     _engine_step(w0, s1, g0, dev, H, D)
     torch.cuda.synchronize()
 
-    def rows(t, blk):
-        return t[b, blk * BSZ:(blk + 1) * BSZ, h]
     s_1 = (e1._block_map[h, b] == X).nonzero().view(-1).tolist()
     s_0 = (e0._block_map[h, b] == X).nonzero().view(-1).tolist()
     c = pf1.report()["counters"]
-    ok_hit = (n == 1 and len(q) == 1 and len(s_1) == 1
-              and int(e1._pool_action[h, b, s_1[0]]) in (PFM.POOL_SWAP, PFM.POOL_MOVE_IN)
-              and int(e1._pool_target[h, b, s_1[0]]) == q[0]
-              and torch.equal(rows(e1._k_gpu, s_1[0]), rows(e1._k_cpu, X))
-              and torch.equal(rows(e1._v_gpu, s_1[0]), rows(e1._v_cpu, X))
-              and torch.equal(rows(e1._kv_bias_gpu, s_1[0]), rows(tc, X))
-              and c["committed"] == 1 and c["pin_hits"] == 1 and c["conserved"])
-    win = all(torch.equal(getattr(x.cache_engine, nm)[:, :64 * BSZ], getattr(y.cache_engine, nm)[:, :64 * BSZ])
-              for x, y in zip(w0.layers, w1.layers) for nm in ("_k_gpu", "_v_gpu", "_kv_bias_gpu"))
-    ok_ctrl = (len(s_0) == 1 and int(e0._pool_action[h, b, s_0[0]]) == PFM.POOL_MOVE_OUT
-               and torch.equal(rows(e0._k_gpu, s_0[0]), rows(e0._k_cpu, X)))
+    ok_hit, win, ok_ctrl = hit_checks(PFM, e1, e0, tc, pairs, X, q, s_1, s_0, c, h, b)
+    ok_hit = ok_hit and n == 1
     rec.update(X=X, pinned_slot=q, window_slot_1=s_1, window_slot_0=s_0, counters=c, windows_equal=win,
                sets_equal_before_step0=same0,
                action_1=(int(e1._pool_action[h, b, s_1[0]]) if s_1 else None),
@@ -450,7 +478,7 @@ def part_eq(model, docs, a, ext, cores, clock, gates, rec):
     ref = runs["SH"]["logits"]
     for arm, name in (("BGP%d" % a.gate_bg_mib, "PF-EQ-BGP"), ("CP", "PF-EQ-CP")):
         got = runs[arm]["logits"]
-        bad = [i for i, (x, y) in enumerate(zip(ref, got)) if not torch.equal(x, y)]
+        bad = [i for i, (x, y) in enumerate(zip(ref, got)) if not same_bytes(x, y)]
         ok = len(got) == len(ref) == a.gate_steps and not bad
         gates.append((name, True, ok, "%s logits vs SH, bitwise, %d steps: %d differing steps (first %s)"
                       % (arm, len(got), len(bad), bad[0] if bad else None)))

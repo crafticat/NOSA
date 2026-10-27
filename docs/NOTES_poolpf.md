@@ -97,6 +97,18 @@ before step 0 now skips the list `SCRATCH = ("_load_mask",)` (the reason is writ
 AFTER a step still compares it. We do not fill it with a value: that would hide a diff that does not write every slot
 at step 0. The GPU gate PF-HIT's precondition never compared it.
 
+FIX 3 (GPU run poolpf_q2_2195574_pf1 at 151355d: PF-HIT raised "Expected all tensors to be on the same device ...
+cuda:0 and cpu", so T did not run; PF-EQ-BGP, PF-EQ-CP and PF-PIN-CONS PASSED). Root cause: r2_poolpf_cell.py:335,
+:336 and :342 called torch.equal on a CUDA window slice and a slice of the PINNED HOST rows (_k_cpu / _v_cpu are CPU
+tensors); the CPU tests had every tensor on the CPU. The hit itself had passed its checks up to that line (n, q, action,
+target). Fix: one helper, `same_bytes`, moves both sides to the host and then compares bitwise (a shape or dtype
+mismatch is a difference). Every gate comparison goes through it (PF-HIT's precondition and verdicts, PF-HIT-CTRL,
+PF-EQ-BGP, PF-EQ-CP); PF-PIN-CONS compares integers. The PF-HIT / PF-HIT-CTRL verdicts moved into the pure function
+`hit_checks` (same checks, none removed). Test `test_gate_comparisons_align_devices`: (static) the only `.equal` call
+of the cell is inside `same_bytes`; (dynamic) `hit_checks` passes on CPU twin worlds after a real prefetch and hit,
+with every host row behind `HostOnly`, a stand-in for a second device that torch.equal refuses; a wrong block turns
+ok_hit and ok_ctrl False.
+
 | test | what it proves |
 |---|---|
 | `test_flag_off_is_shipped` | Gate 0. The shipped files are unchanged against ded9d41. The binding before attach and after detach is the shipped bound method. Attached with no request: 8 steps (one block edge, one write-back) leave every engine tensor and every output bitwise equal to a never-attached twin. The cpupack source differs in the fetch line and the name only. Refusals. |

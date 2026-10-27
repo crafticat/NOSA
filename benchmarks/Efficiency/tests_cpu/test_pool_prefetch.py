@@ -38,6 +38,10 @@ WHAT RUNS FOR REAL
                                         (NativePipe.set_plant_slot_shift) changes the window. Preconditions: two
                                         misses in one (layer, head) with different host bytes; the plant job ran
                                         without an error.
+  test_gate_comparisons_align_devices  the cell's gates compare GPU rows with host rows: the only .equal call of
+                                        r2_poolpf_cell.py is inside same_bytes (static), and the PF-HIT verdict code
+                                        (hit_checks) passes with every host row behind a second "device" (HostOnly)
+                                        that torch.equal refuses; a wrong block turns it False.
   test_h2d_twin_matches_triton_interpreter  (needs triton; skipped without it) the REAL flash_h2d_from_mask and
                                         flash_h2d_from_mask_bias under TRITON_INTERPRET=1 in a fresh process, with the
                                         production argument shapes (destination: the pool rows as a narrowed view;
@@ -562,6 +566,93 @@ def test_cell_arms_args_and_verdicts():
     finally:
         PC.PRED_PF.clear()
         PC.PRED_PF.update(old)
+
+
+class HostOnly:
+    """A host tensor that plays a SECOND DEVICE in a gate comparison (pf1 run poolpf_q2_2195574: PF-HIT compared CUDA
+    window rows with the pinned host rows, and torch.equal refused the two devices). Indexing gives a HostOnly; torch.equal
+    refuses it next to a tensor (a TypeError here, a RuntimeError for cuda vs cpu); detach() / .to("cpu") give the
+    plain host tensor. So only a comparison that moves both sides to the host can read it."""
+
+    def __init__(self, t):
+        self.t = t
+
+    def __getitem__(self, k):
+        return HostOnly(self.t[k])
+
+    def detach(self):
+        return self
+
+    def to(self, device):
+        assert str(device) == "cpu", device
+        return self.t
+
+    @property
+    def shape(self):
+        return self.t.shape
+
+    @property
+    def dtype(self):
+        return self.t.dtype
+
+
+def test_gate_comparisons_align_devices(CE, PF, ext, nopin):
+    """r2_poolpf_cell's gates compare tensors of two devices (the GPU window, the pinned host rows). (1) STATIC: the only
+    .equal call of the cell is the one inside same_bytes (every gate goes through it). (2) DYNAMIC: the PF-HIT /
+    PF-HIT-CTRL verdict code (hit_checks, the code part_hit runs) on CPU twin worlds after a real prefetch and pool hit,
+    with every host row behind HostOnly: (True, True, True). Preconditions (L34): torch.equal refuses HostOnly rows next
+    to a tensor; a wrong block X' (other host bytes) turns ok_hit and ok_ctrl False."""
+    import ast
+    PC = _cell()
+    tree = ast.parse((EFF / "r2_poolpf_cell.py").read_text())
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "equal"]
+    owner = [f.name for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.name == "same_bytes"
+             and any(c in calls for c in ast.walk(f))]
+    assert len(calls) == 1 and owner == ["same_bytes"], [ast.dump(c.func) for c in calls]
+    w1, w0 = _world(CE, 2), _world(CE, 2)
+    pf1, pf0 = _pf(PF, w1, ext), _pf(PF, w0, ext)
+    pf1.attach()
+    pf0.attach()
+    s0 = _random_sel(w1, random.Random(7))
+    g1, g0 = torch.Generator().manual_seed(5), torch.Generator().manual_seed(5)
+    _step(w1, s0, g1, pf1)
+    _step(w0, s0, g0, pf0)
+    l, h, b = 0, 0, 1
+    e1, e0 = w1.layers[l].cache_engine, w0.layers[l].cache_engine
+    tail = int(e1.seq_length) // BS
+    resident = set(e1._block_map[h, b].tolist()) | set(e1._pool_map[h, b].tolist())
+    free = [x for x in range(tail) if x not in resident]
+    X, Xbad = free[0], free[1]
+    assert pf1.prefetch(torch.tensor([[l, h, b, X]])) == 1
+    pf1.tp.flush()
+    pf1.begin_step()
+    q = (e1._pool_map[h, b] == X).nonzero().view(-1).tolist()
+    s1 = [t.clone() for t in s0]
+    s1[l][h, b, 0] = X
+    _step(w1, s1, g1)
+    pf0.begin_step()
+    _step(w0, s1, g0)
+    s_1 = (e1._block_map[h, b] == X).nonzero().view(-1).tolist()
+    s_0 = (e0._block_map[h, b] == X).nonzero().view(-1).tolist()
+    c = pf1.report()["counters"]
+
+    def view(e):                                             # the engine with its host rows on the "other device"
+        keep = ("block_size", "topk", "_k_gpu", "_v_gpu", "_kv_bias_gpu", "_pool_action", "_pool_target")
+        return types.SimpleNamespace(_k_cpu=HostOnly(e._k_cpu), _v_cpu=HostOnly(e._v_cpu),
+                                     **{k: getattr(e, k) for k in keep})
+    v1, v0 = view(e1), view(e0)
+    wins = [(view(x.cache_engine), view(y.cache_engine)) for x, y in zip(w0.layers, w1.layers)]
+    with pytest.raises(TypeError):                           # precondition: the plant refuses a direct torch.equal
+        torch.equal(_rows(e1._k_gpu, b, s_1[0], h), _rows(v1._k_cpu, b, X, h))
+    tc1 = w1.layers[l].total_cis
+    assert PC.hit_checks(PF, v1, v0, tc1, wins, X, q, s_1, s_0, c, h, b) == (True, True, True)
+    assert PC.sets_equal([(v1, e1)], ("_k_cpu", "_v_cpu", "_k_gpu"))     # host-only against plain, aligned
+    assert not torch.equal(_rows(e1._k_cpu, b, X, h), _rows(e1._k_cpu, b, Xbad, h))   # precondition: X' differs
+    bad = PC.hit_checks(PF, v1, v0, tc1, wins, Xbad, q, s_1, s_0, c, h, b)
+    assert bad[0] is False and bad[2] is False and bad[1] is True
+    pf1.close()
+    pf0.close()
 
 
 def _env():
