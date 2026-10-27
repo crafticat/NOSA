@@ -163,6 +163,10 @@
 #            below (the F3LD block). [f3ldx] NOT BLOCKED: E's issue_desc writes the pool's lanes (packer v3 DESC 2: the
 #            descriptor's lane row, by the object path's rule), so F3LD_BLOCKED is gone and r2_tick_sg5.py takes
 #            --b2-issue desc with --layout pool
+#   evalacc216f3t [f3tacc] evalacc216f3lia on the f3t path: --b2-resolve fused --fused-kernel v3 --res-lean --res-dev
+#            --worker cpp --b2-issue desc --no-transfer-mirror (the flag set of evalfast2f3t; no --inflight-array);
+#            packer v3 of --nosi (GF3); --link-record = the evalfast2f3t summary.json of the same run id and holder
+#            (REPORT only); ROOT NOSI_EVAL (nosi-r2-f3tacc); tests_cpu/test_r2_f3tacc.py; REGISTERED block below (ACC3T)
 #   STEP_MIN 120 in every cell above.
 #   [fusedres2] the FR-g cells of docs/R2_FUSEDRES_PLAN.md section 7 (p5b2's point: --modes exact,fast --backends b2
 #   --C 96 --X 64 --R-ver 16, no sweep, gilfree 8 threads, unchecked), with NOSI = FRNOSI (the fusedres2 worktree)
@@ -547,6 +551,13 @@
 #   F3C-FALS    PREDICTION: fires if effective < the same job's evalfast2f3lia effective - 5 tok/s (the C++ feeder costs)
 #   F3LD-MEM    peak_gb <= 84 (MUST EF_mem_cap) in the three timing cells. PREDICTION: 83.0 to 83.4 GB
 #
+# REGISTERED for evalacc216f3t ([f3tacc], NOT STAMPED: the lead writes the stamp from `date -u` before any run, L33).
+# WHAT: this tree (ROOT NOSI_EVAL = nosi-r2-f3tacc = nosi-r2-f3ldx 3769b64 + this cell; no source change). The cell is
+# evalacc216f3lia with the evalfast2f3t flag set in place of the f3lia flags: --worker cpp --b2-issue desc
+# --no-transfer-mirror, no --inflight-array; packer v3 of --nosi (GF3); --link-record = the evalfast2f3t summary.json
+# of the same run id and holder. Same-job control: evalacc216f3lia (its own link: evalfast2f3lia).
+#   ACC3T: same gates as ACC3LIA (ACC3T-BI, ACC3T-ETD, ACC3T-AE, ACC3T-LINK against evalfast2f3t, ACC3T-MEM)
+#
 # REGISTERED for evalacc216m / evalacc216 ([acc216], STAMP 2026-10-23T18:04:12Z, before any run; the lead writes the stamp from
 # `date -u` in the command that freezes this block, L33). WHY: analysis/evalfast/STATUS_accuracy_B216.md: at B 216 no
 # gate proves the exact target distribution (ETD), batch invariance (BI) or accuracy equivalence (AE) on the timed
@@ -668,7 +679,7 @@ NOSI_X1=/mnt/beegfs/ojerbi/nosi-r2-xpool                                        
 NOSI_INTEG=/mnt/beegfs/ojerbi/nosi-r2-stack2                                             # ROOT of the stack1 cells only ([integ]; [stack2])
 NOSI_BIGB=/mnt/beegfs/ojerbi/nosi-r2-bigb                                                # ROOT of the bigb cells only ([bigb])
 FRNOSI=/mnt/beegfs/ojerbi/nosi-r2-fusedres2                                              # ROOT of the frg* cells only [fusedres2]
-NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-f3ldx                                               # ROOT of the evalfast* and evalacc216* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree; [frfix] own worktree; [resfix] own worktree; [resdev] own worktree; [fr3] own worktree; [flean] own worktree; [admitfill] own worktree; [acc216] own worktree; [f3lia] own worktree: flean + admitfill + acc216; [f3ld] own worktree: f3lia + b2-desc + no transfer mirror; [f3ldx] own worktree: f3ld + the descriptor's lane row on the X pool)
+NOSI_EVAL=/mnt/beegfs/ojerbi/nosi-r2-f3tacc                                              # ROOT of the evalfast* and evalacc216* cells only [evalsplit] ([sg5par] claim; [hostfix] host fixes; [hostw2] own worktree; [frfix] own worktree; [resfix] own worktree; [resdev] own worktree; [fr3] own worktree; [flean] own worktree; [admitfill] own worktree; [acc216] own worktree; [f3lia] own worktree: flean + admitfill + acc216; [f3ld] own worktree: f3lia + b2-desc + no transfer mirror; [f3ldx] own worktree: f3ld + the descriptor's lane row on the X pool; [f3tacc] own worktree: f3ldx + evalacc216f3t)
 EVALACC_OUT=/mnt/beegfs/ojerbi/r2-runs/evalacc                                           # ROOT (r2_evalacc_step.sh's OUTROOT)
 GOLD=/mnt/beegfs/ojerbi/kstep-cpu-runs/workload/pg19-test-ctx65280                        # ROOT [acc216] (r2_evalacc_step.sh's)
 GOLD_SHA=f2fb36f441ec12b7a79239d5e86263c6454b7713436f53f81086ef2bedcc34b3                 # PIN (ctx65280_tokens.bin) [acc216]
@@ -697,7 +708,7 @@ STEP_MIN=120
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 main() {
 stop() { echo "R2 SG5 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl|evalfast2rd|evalfast2rdp|evalfast2c3|evalfast2f3|evalfast2f3_192|evalfast2f3p|evalfast2c3l|evalfast2f3l|evalfast2ia|evalacc216m|evalacc216|evalfast2f3lia|evalfast2c3lia|evalacc216f3lia|evalfast2f3d|evalfast2c3d|evalfast2f3t|evalfast2c3t|evalfast2f3c|evalfast2c3c] [gilfree|gather]" >&2
+usage() { echo "usage: r2_tick_sg5_step.sh --nosi <sha> <holder> <run id> [p4a|p4b-sc|p4b-sb|p4b-v1|p4sc64|p5b2|p6|x1|bigb81-128|bigb81-244|bigb96-128|bigb96-216|stack1|stack1a|stack1a128|stack1p|stack1t|stack1b|stack1n-twin|stack1n-rebuild|stack1n-resolve|stack1n-layout|stack1n-attn|stack1n-warmup|frg0|frg0x|frg0p|frg1|frg2|frg3|frg3t|frg|evalfast|evalfast2|evalfast2t|evalfast2c|evalfast2f192|evalfast2t192|evalfast2c192|evalfast2w|evalfast2wi|evalfast2fr|evalfast2fx|evalfast2wx|evalfast2rp|evalfast2rl|evalfast2rd|evalfast2rdp|evalfast2c3|evalfast2f3|evalfast2f3_192|evalfast2f3p|evalfast2c3l|evalfast2f3l|evalfast2ia|evalacc216m|evalacc216|evalfast2f3lia|evalfast2c3lia|evalacc216f3lia|evalfast2f3d|evalfast2c3d|evalfast2f3t|evalfast2c3t|evalfast2f3c|evalfast2c3c|evalacc216f3t] [gilfree|gather]" >&2
           exit 2; }
 { [ $# -ge 4 ] && [ $# -le 6 ]; } && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4
@@ -727,6 +738,7 @@ for w in "$@"; do
         evalacc216f3lia) [ -z "$CELL" ] || usage; CELL=$w ;;                                        # [f3lia] [acc216]
         evalfast2f3d|evalfast2c3d|evalfast2f3t|evalfast2c3t) [ -z "$CELL" ] || usage; CELL=$w ;;    # [f3ld]
         evalfast2f3c|evalfast2c3c) [ -z "$CELL" ] || usage; CELL=$w ;;                              # [f3ldx]
+        evalacc216f3t) [ -z "$CELL" ] || usage; CELL=$w ;;                                          # [f3tacc]
         *) usage ;;
     esac
 done
@@ -1037,6 +1049,13 @@ case $CELL in
         EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
                  --b2-resolve check --fused-kernel v3 --res-lean --res-dev --inflight-array --worker cpp
                  --b2-issue object) ;;
+    evalacc216f3t) MODES=fast,bi_c_strict ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_$CELL  # [f3tacc]
+        NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; ACC=1 ; GF3=1    # on f3t's path
+        LINKARG=(--link-record "$OUTROOT/sg5_${RUN}_${JOB}_evalfast2f3t/summary.json")        # the same holder's
+        EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --repeat-docs --log-slots -1 --skip-shipped
+                 --b2-resolve fused --fused-kernel v3 --host-profile --gc-freeze --lean-time --wait-index --b2-fewer-reads
+                 --res-lean --res-dev --worker cpp --b2-issue desc --no-transfer-mirror --store-committed-tokens
+                 --serial-rows 8 --gold-workload "$GOLD" "${LINKARG[@]}") ;;
 esac
 MIN_LEFT=$((STEP_MIN * 60 + 600))                           # [fusedres2] after the cell's STEP_MIN
 VARIANTARG=()                                               # [batched-rebuild] no --variants in every other cell

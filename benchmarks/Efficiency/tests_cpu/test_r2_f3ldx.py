@@ -91,7 +91,7 @@ XPM = TT._load("r2_xpool")
 KTR = TT.KTR
 p3, ref, v3 = BD.p3, BD.ref, BD.v3                                    # the fixtures, by name
 BS = BD.BS
-ROOT6 = "/mnt/beegfs/ojerbi/nosi-r2-f3ldx"
+ROOT6 = "/mnt/beegfs/ojerbi/nosi-r2-f3tacc"                          # [f3tacc] (was nosi-r2-f3ldx)
 CELLS6 = ("evalfast2f3d", "evalfast2c3d", "evalfast2f3t", "evalfast2c3t", "evalfast2f3c", "evalfast2c3c")
 TIMING = ("evalfast2f3d", "evalfast2f3t", "evalfast2f3c")
 

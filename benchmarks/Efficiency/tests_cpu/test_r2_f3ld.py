@@ -124,7 +124,7 @@ TT, TRM, OWN2, RSC, GF = BD.TT, BD.TRM, BD.OWN2, BD.RSC, BD.GF
 RES = TT.RES
 p3, ref, v3 = BD.p3, BD.ref, BD.v3                                    # the fixtures, by name
 C_INFLIGHT = RSC.C_INFLIGHT
-F3LD_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3ldx"                        # [f3ldx] (was nosi-r2-f3ld)
+F3LD_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-f3tacc"                       # [f3tacc] (was nosi-r2-f3ldx / -f3ld)
 CELLS = ("evalfast2f3d", "evalfast2c3d", "evalfast2f3t", "evalfast2c3t")
 FIELDS = BD.FIELDS + ("layers",)
 
@@ -878,7 +878,7 @@ def test_TO5_the_cells_static():
     assert next(ln for ln in lines if ln.startswith("NOSI_EVAL=")).split()[0] == "NOSI_EVAL=" + F3LD_ROOT
     assert F3LD_ROOT == HF.HF_ROOT
     assert "|evalfast2f3lia|evalfast2c3lia|evalacc216f3lia|evalfast2f3d|evalfast2c3d|evalfast2f3t|evalfast2c3t" \
-           "|evalfast2f3c|evalfast2c3c] [gilfree|gather]" in text                     # [f3ldx] f3c / c3c appended
+           "|evalfast2f3c|evalfast2c3c|evalacc216f3t] [gilfree|gather]" in text       # [f3ldx] f3c / c3c, [f3tacc] acc appended
     assert "        evalfast2f3d|evalfast2c3d|evalfast2f3t|evalfast2c3t) [ -z \"$CELL\" ] || usage; CELL=$w ;;" in text
     f3 = _cell(text, "    evalfast2f3d|evalfast2f3t) MODES=fast")
     for w in ("BATCH=216", "PX=1512 ; PRV=1464", "VARIANTS=fused/batched", "NOSI=$NOSI_EVAL", "GF3=1",
