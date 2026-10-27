@@ -235,7 +235,9 @@ Builder expectations (MODEL, NOT registered; for the lead's judgement only):
 4. The float32 bias is a storage change for production (+0.4 % bytes); a decision for the lead.
 5. The V mask deviates from the brief (section 4); FVN measures it with the rest of the extents work.
 6. The best swept arm is chosen on events, then scored on ncu (section 6).
-7. JIT time is the largest part of the step (section 9). If the budget runs short, 32x4 drops first.
+7. JIT time is the largest part of the step (section 9). If the budget runs short, 32x4 is the cell that is skipped
+   (it runs last). A skipped cell is the MUST gate BUDGET_cell_<tag> (as in fia4), so the step then exits non-zero;
+   the rule's cells (216x4, 216x4s1) run first and keep their gates.
 
 ## 11. Shell commands the builder ran outside cat / grep / head / tail / ls / sort / cut / diff / git / wc
 

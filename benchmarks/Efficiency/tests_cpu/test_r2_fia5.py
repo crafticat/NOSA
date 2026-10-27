@@ -311,6 +311,8 @@ def test_F5_4_best_swept_arm_and_decision_report5():
         gates.append(M.gate("C_%s_%s" % (x, tag), x != "FVW4S4T32B32", True, ""))
         gates.append(M.gate("U_%s_table_%s" % (x, tag), True, True, ""))
     gates.append(M.gate("C_FVW8S4T32B32_216x4s1", False, True, ""))                     # another cell: no effect
+    assert M.fv_gates_ok(gates, "FVW8S4T32B32", tag) and not M.fv_gates_ok(gates, "FVW4S4T32B32", tag)
+    assert not M.fv_gates_ok(gates, "FVW8S3T64B32", tag)                    # G_block0 alone is not a passing arm
     best = M.fv_sweep_report(rep, tag, gates, ["FVW4S3T64B32", "FVW8S4T32B32", "FVW4S4T32B32", "FVW8S3T64B32"])
     assert best == "FVW8S4T32B32" == rep["fv_best"]
     g = gates[-1]

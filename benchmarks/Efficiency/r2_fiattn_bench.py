@@ -2573,6 +2573,14 @@ def fv_must_gates(gates, name, tag):
             and (key in g["name"] or g["name"].startswith("G_block0"))]
 
 
+def fv_gates_ok(gates, name, tag):
+    """[fia5] True when the arm has MUST gates of its OWN in the cell (G_block0 alone does not count: an arm that
+    ran no gate is never "passing") and every MUST gate of fv_must_gates passed."""
+    mine = fv_must_gates(gates, name, tag)
+    own = [g for g in mine if "_%s_" % name in g["name"]]
+    return bool(own) and all(g["passed"] for g in mine)
+
+
 def fv_sweep_report(rep, tag, gates, names):
     """[fia5] R_FV_sweep_<tag> (REPORT): per swept arm of the cell the event median, x of P, its MUST gates and its
     compile witness; rep["fv_best"] = the lowest event median among the swept arms whose MUST gates all pass (None
@@ -2583,8 +2591,7 @@ def fv_sweep_report(rep, tag, gates, names):
     rows, cands = [], []
     for x in ["FV", "FVN"] + list(names):
         t = (arms.get(x) or {}).get("call_ms", {}).get("median")
-        mine = fv_must_gates(gates, x, tag) if x != "FVN" else []
-        ok = bool(mine) and all(g["passed"] for g in mine)
+        ok = x != "FVN" and fv_gates_ok(gates, x, tag)
         c = comp.get(x) or {}
         rows.append("%s %s ms (x%s of P; MUST %s; regs %s, local words %s, shared %s, depth %s)" % (
             x, "%.4f" % t if t is not None else "n/a", "%.3f" % (t / p) if (t is not None and p) else "n/a",
@@ -2634,8 +2641,7 @@ def decision_report5(report, gates, cells):
                 parts.append("best swept: none (no swept arm with all MUST gates passing, or no sweep)")
                 continue
             r = ratio(a)
-            mine = fv_must_gates(gates, x, tag)
-            g_ok = bool(mine) and all(g["passed"] for g in mine)
+            g_ok = fv_gates_ok(gates, x, tag)
             if r is not None and r <= th["fv_over_p_max"] and g_ok and build_ok:
                 ok_cfg.append((r, x))
             cw = comp.get(x) or {}
