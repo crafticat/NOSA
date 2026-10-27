@@ -18,13 +18,19 @@
 # [fork] PLAN_speckv_on_cached_nosa.md, Task 0.3, survey option 2. The human's rule: fork the closest kernel, no other.
 # [fork] What changes (docs/NOTES_fia4.md lists every region):
 # [fork]  1. BLOCK_Q = the rows of one request (4: 1 draft + 3 verify) x the query heads of one KV head (16) = a 64-row
-# [fork]     tile. Each KV tile (TILE_SIZE = one 64-token NOSA block) is loaded once and multiplied for all 64 rows.
+# [fork]     tile. Each KV tile (by default TILE_SIZE = one 64-token NOSA block) is loaded once for all 64 rows.
 # [fork]  2. The block table of a program = the UNION of its rows' selected blocks for (request, KV head), in ascending
 # [fork]     block-id order. The program builds it on the device (BUILD_UNION), or it reads a table built before.
 # [fork]  3. Per row and union entry: the number of tokens of that block the row sees (8 bits; 0 = not selected). The
-# [fork]     kernel applies it to the SCORE tile (-inf), never to K / V copies. K / V / bias loads stop at the largest.
+# [fork]     kernel applies it to the SCORE tile (-inf). K and the bias load whole tiles; V reads 0 past the largest
+# [fork]     byte (fia5).
 # [fork]  4. The CIS bias: logit = (q.k + bias) x scale, the shipped decode math (FA2-NOSA decode, piece 3).
 # [fork]  5. The 2D path (no split-KV) is the default. The 3D split path stays behind its flag (the segment buffers).
+# [fork] fia5 (docs/NOTES_fia5.md; record fia4_k1a_2195573: K and V had ONE shared buffer each and the tile loop waited
+# [fork] on synchronous loads): the extents are VECTORS loaded from the table with physical_block_idx's idiom, so the
+# [fork] pipeliner of Triton prefetches them; no extents mask on the K copy; the bias may be float32 (the layout and
+# [fork] dtype of upstream's per-token-head scale caches: 4 B per token, so Triton pipelines its load); the token tile
+# [fork] may be a part of a block (tile_size; upstream's TILE_SIZE choices); use_extents=False is a timing arm only.
 # [fork] Removed (they need token positions; the union tile space has none): sliding window, chunked attention, ALiBi,
 # [fork] the QQ bias, the PrefixLM ranges. The launcher refuses them. No vllm import (the image has no vllm).
 
@@ -237,6 +243,9 @@ def softmax_step(S, M, L):
 # [fork] removed: logger (unused)
 is_batch_invariant = False  # [fork] no vllm envs here; the fork has one schedule (no split unless asked)
 float8_info = torch.finfo(torch.float8_e4m3fn)  # [fork] = current_platform.fp8_dtype() on CUDA (platforms/interface.py)
+# [fork] fia5: the handle of the last launch (Triton's CompiledKernel: n_regs, n_spills, metadata.shared, asm["ttgir"];
+# [fork] None under the interpreter). The bench reads it as the compile witness of each launch configuration.
+FORK_LAST_LAUNCH = {"kernel": None}  # [fork]
 
 
 @triton.jit
@@ -385,7 +394,7 @@ def kernel_unified_attention(
     # For other modes callers may pass any non-null pointer.
     k_scale_cache_ptr,
     v_scale_cache_ptr,
-    cis_bias_ptr,  # [fork] CIS bias [num_blocks, block_size, num_kv_heads] (the per-token-head scale layout)
+    cis_bias_ptr,  # [fork] CIS bias [num_blocks, block_size, num_kv_heads] (the per-token-head scale layout; any float)
     union_ext_ptr,  # [fork] per union entry: the packed extents of the BLOCK_Q rows (block_tables_ptr's layout)
     union_len_ptr,  # [fork] [num_kv_heads, num_seqs] int32: the union entries per (KV head, request)
     row_key_ptr,  # [fork] BUILD_UNION inputs (fork_build_union); any pointer otherwise
@@ -457,6 +466,7 @@ def kernel_unified_attention(
     USE_CIS_BIAS: tl.constexpr,  # [fork]
     P_PAD: tl.constexpr,  # [fork] a power of two >= row_width (BUILD_UNION)
     BUILD_STEPS: tl.constexpr,  # [fork] fork_build_union's binary-search steps
+    USE_EXTENTS: tl.constexpr,  # [fork] False: no extents (every row sees every union token): a TIMING arm only
     # KV cache quantization mode handled inside this kernel via constexpr
     # branches: NONE (0), FP8_PER_TENSOR (1), INT8_PER_TOKEN_HEAD (2),
     # FP8_PER_TOKEN_HEAD (3).
@@ -488,9 +498,9 @@ def kernel_unified_attention(
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
 
-    # [fork] The program's KV = the UNION of its rows' selected blocks for (seq_idx, kv_head_idx): one TILE per union
-    # [fork] entry (TILE_SIZE == BLOCK_SIZE), ascending block id. Its table row: (kv_head_idx, seq_idx). seq_len above is
-    # [fork] not used (no positions here).
+    # [fork] The program's KV = the UNION of its rows' selected blocks for (seq_idx, kv_head_idx), in ascending block
+    # [fork] id: BLOCK_SIZE // TILE_SIZE tiles per union entry (one by default). Its table row: (kv_head_idx, seq_idx).
+    # [fork] seq_len above is not used (no positions here).
     union_row = kv_head_idx * num_seqs + seq_idx  # [fork]
     block_table_offset = union_row.to(tl.int64) * block_table_stride  # [fork] (moved up from below: the union table)
     if BUILD_UNION:  # [fork] the program builds its own table: no host plan, no extra launch
@@ -506,7 +516,7 @@ def kernel_unified_attention(
         num_union = tl.load(union_len_ptr + union_row)  # [fork] a table built before the launch
 
     if IS_3D:
-        tiles_per_segment = cdiv_fn(num_union, NUM_SEGMENTS_PER_SEQ)  # [fork] tiles = union entries
+        tiles_per_segment = cdiv_fn(num_union, NUM_SEGMENTS_PER_SEQ)  # [fork] union ENTRIES per segment (whole blocks)
         if segm_idx * tiles_per_segment >= num_union:  # [fork]
             return
     else:
@@ -547,28 +557,43 @@ def kernel_unified_attention(
 
     # [fork] removed: context_len and the ALiBi / QQ-bias set-up (token positions)
     row_shift = 8 * (offs_m // num_queries_per_kv)  # [fork] the bit offset of each tile row's byte in a union_ext word
+    TILES_PER_BLOCK: tl.constexpr = BLOCK_SIZE // TILE_SIZE  # [fork] tiles per union entry (1: a tile is a block)
 
     if IS_3D:  # [fork] the tile loop runs over the union entries (was compute_tile_loop_bounds, by position)
-        loop_lo = segm_idx * tiles_per_segment  # [fork]
-        loop_hi = tl.minimum((segm_idx + 1) * tiles_per_segment, num_union)  # [fork]
+        loop_lo = segm_idx * tiles_per_segment * TILES_PER_BLOCK  # [fork]
+        loop_hi = tl.minimum((segm_idx + 1) * tiles_per_segment, num_union) * TILES_PER_BLOCK  # [fork]
     else:  # [fork]
         loop_lo = 0  # [fork]
-        loop_hi = num_union  # [fork]
+        loop_hi = num_union * TILES_PER_BLOCK  # [fork]
 
     # iterate through tiles (now limited to the sliding window range)
     for j in range(loop_lo, loop_hi):
         seq_offset = j * TILE_SIZE + offs_t
-        ext_word = tl.load(union_ext_ptr + block_table_offset + j)  # [fork] union entry j: the rows' packed extents
-        row_ext = (ext_word >> row_shift) & 0xFF  # [fork] (BLOCK_M,): the tokens of this block each tile row sees
-        reach = tl.maximum(  # [fork] the largest of the (<= 4) bytes, as scalar arithmetic (no cross-thread reduce)
-            tl.maximum(ext_word & 0xFF, (ext_word >> 8) & 0xFF),  # [fork]
-            tl.maximum((ext_word >> 16) & 0xFF, (ext_word >> 24) & 0xFF),  # [fork]
-        )  # [fork]
-        tile_mask = offs_t < reach  # [fork] load only tokens some row sees (was: seq_offset < max_seq_prefix_len)
+        tok = (j % TILES_PER_BLOCK) * TILE_SIZE + offs_t  # [fork] the token rows in the block (seq_offset % BLOCK)
 
         physical_block_idx = tl.load(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
+
+        # [fork] fia5: the rows' packed extents of union entry seq_offset // BLOCK_SIZE, loaded as VECTORS with the
+        # [fork] idiom of physical_block_idx (a vector index, every lane the same word; no scalar load whose value
+        # [fork] gates the K / V copies), so the pipeliner prefetches them like the page ids (record fia4_k1a_2195573:
+        # [fork] the scalar word was a synchronous load in the loop, and K / V had one buffer each).
+        if USE_EXTENTS:  # [fork]
+            ext_t = tl.load(union_ext_ptr + block_table_offset + seq_offset // BLOCK_SIZE)  # [fork] (TILE_SIZE,)
+            reach = tl.maximum(  # [fork] the largest of the (<= 4) bytes, lane by lane (no cross-thread reduce)
+                tl.maximum(ext_t & 0xFF, (ext_t >> 8) & 0xFF),  # [fork]
+                tl.maximum((ext_t >> 16) & 0xFF, (ext_t >> 24) & 0xFF),  # [fork]
+            )  # [fork]
+            # [fork] V only (and the dead per-token-head scales): a token no row sees reads 0 (FI5: p = 0 times a NaN V
+            # [fork] is NaN). K and the bias load whole tiles: their unseen columns are -inf in S (seq_mask below).
+            tile_mask = tok < reach  # [fork] (was: seq_offset < max_seq_prefix_len)
+            ext_rows = tl.load(  # [fork] (BLOCK_M,): the same word for every tile row, a vector index as above
+                union_ext_ptr + block_table_offset + (j * TILE_SIZE + offs_m % TILE_SIZE) // BLOCK_SIZE  # [fork]
+            )  # [fork]
+            row_ext = (ext_rows >> row_shift) & 0xFF  # [fork] (BLOCK_M,): the tokens of this block each tile row sees
+        else:  # [fork] the FV-nomask timing arm: no extents load, every token loaded and seen
+            tile_mask = offs_t < TILE_SIZE  # [fork] all true
 
         v_offset = (
             physical_block_idx[:, None] * stride_v_cache_0
@@ -585,7 +610,7 @@ def kernel_unified_attention(
         # K : (HEAD_SIZE, TILE_SIZE)
         K_load = tl.load(
             key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
+            mask=dim_mask[:, None],  # [fork] the whole tile (a union entry is a whole allocated block); seq_mask cuts S
             other=0.0,
         )
         K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
@@ -622,11 +647,17 @@ def kernel_unified_attention(
                 + (seq_offset % BLOCK_SIZE) * stride_b_slot  # [fork]
                 + kv_head_idx * stride_b_head  # [fork]
             )  # [fork]
-            cis = tl.load(cis_bias_ptr + cis_idx, mask=tile_mask, other=0.0).to(tl.float32)  # [fork]
+            # [fork] the whole tile, no mask (seq_mask cuts S). A float32 bias is 4 B per token: Triton 3.2 pipelines a
+            # [fork] load of >= 32-bit lanes (cp.async), so it is prefetched like K / V; a 16-bit bias at token stride
+            # [fork] Hkv is not (the record's TTGIR: a synchronous load).
+            cis = tl.load(cis_bias_ptr + cis_idx).to(tl.float32)  # [fork]
         else:  # [fork]
             cis = tl.zeros([TILE_SIZE], dtype=tl.float32)  # [fork]
 
-        seq_mask = offs_t[None, :] < row_ext[:, None]  # [fork] the row's block bit + its extent (was the causal mask)
+        if USE_EXTENTS:  # [fork] the row's block bit + its extent (was the causal mask)
+            seq_mask = tok[None, :] < row_ext[:, None]  # [fork]
+        else:  # [fork]
+            seq_mask = offs_t[None, :] < TILE_SIZE  # [fork] all true (the FV-nomask timing arm)
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
@@ -839,6 +870,7 @@ def _fork_inputs(q, k, block_table, union_ext, union_len, cis_bias, build_union,
     b_strides = (0, 0, 0)  # [fork]
     if cis_bias is not None:  # [fork]
         assert tuple(cis_bias.shape) == (k.shape[0], block_size, num_kv_heads), "[fork] cis_bias: k's pages"  # [fork]
+        assert cis_bias.dtype in (torch.float32, torch.bfloat16, torch.float16), "[fork] cis_bias: a float"  # [fork]
         b_strides = cis_bias.stride()  # [fork]
     out = dict(b_strides=b_strides, key=block_table, slot=block_table, npages=union_len, last=union_len,  # [fork]
                entry=union_len, rk=(0, 0), rn=0, width=1, slots=1, p_pad=16, steps=1)  # [fork]
@@ -914,6 +946,8 @@ def unified_attention(
     rows_per_q_block=4,  # [fork] BLOCK_Q: the rows of one request (1 draft + 3 verify)
     num_warps=None,  # [fork] launch overrides; None = Triton's defaults (as upstream)
     num_stages=None,  # [fork]
+    tile_size=None,  # [fork] the token tile: None = the block (one union entry per tile); upstream picks 16 / 32
+    use_extents=True,  # [fork] False: no extents mask at all, every row sees every union token (a TIMING arm only)
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -981,8 +1015,10 @@ def unified_attention(
     elif sliding_window_val <= 0:
         chunk_lookback = -1
 
-    TILE_SIZE_PREFILL = block_size  # [fork] one tile = one block = one union entry (a tile never spans two blocks)
-    TILE_SIZE_DECODE = block_size  # [fork]
+    TILE_SIZE_PREFILL = block_size if tile_size is None else int(tile_size)  # [fork] a tile never spans two blocks
+    TILE_SIZE_DECODE = TILE_SIZE_PREFILL  # [fork]
+    assert 16 <= TILE_SIZE_PREFILL <= block_size and block_size % TILE_SIZE_PREFILL == 0, "[fork] tile_size"  # [fork]
+    assert TILE_SIZE_PREFILL == triton.next_power_of_2(TILE_SIZE_PREFILL), "[fork] tile_size: a power of 2"  # [fork]
 
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
@@ -1034,7 +1070,7 @@ def unified_attention(
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         tile_size = TILE_SIZE_DECODE
 
-    kernel_unified_attention[grid](
+    FORK_LAST_LAUNCH["kernel"] = kernel_unified_attention[grid](  # [fork] keep the handle (the compile witness)
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
         segm_max_ptr=segm_max_ptr,
@@ -1116,6 +1152,7 @@ def unified_attention(
         USE_CIS_BIAS=cis_bias is not None,  # [fork]
         P_PAD=fk["p_pad"],  # [fork]
         BUILD_STEPS=fk["steps"],  # [fork]
+        USE_EXTENTS=bool(use_extents),  # [fork]
         KV_QUANT_MODE=kv_quant_mode,
         CHUNK_LOOKBACK=chunk_lookback,
         CHUNK_SIZE=chunk_size,

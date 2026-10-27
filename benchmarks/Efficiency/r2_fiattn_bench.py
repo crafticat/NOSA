@@ -136,6 +136,23 @@ fork: nosi/nosi/fork_vllm_unified_attention.py (vLLM 0.20.2, every changed line 
   kernel-built tables == the torch tables, on the full and the altreq batch). REPORTs: X_row_alone_FV (the EXACT probe:
   expected 0 rows differ), R_GRAPH_FV (one launch captured in a CUDA graph, replay bitwise), R_FVT_equals_FV, R_T,
   R_FV_build, R_D, the ncu numbers (+ achieved occupancy, shared memory, occupancy limits) and R_DECISION4 (PRED4).
+
+[fia5] PIPELINE K / V INSIDE THE FORK (docs/NOTES_fia5.md; SCORING_fia4.md sections 5-6). The fork's tile loop loads the
+rows' extents as vectors (prefetched with the page ids), K and the bias as whole tiles, V up to the tile's reach; the
+bias may be float32 (prefetched); the token tile may be a part of a block; one more constexpr gives a no-mask timing
+variant. The FV arms pass the CIS bias as float32 (FV_BIAS_BITS; the same values: bf16 -> fp32 is exact).
+  FVN  the FV launch with use_extents=False: no extents at all (every row sees every union token). TIMING ONLY (not
+       attention; R_FVN_not_attention says so); ncu FV - FVN = the cost of the extents.
+  --fv-sweep w4s2,w8s3t32,w4s3b16,...: one more FV arm per launch configuration, named FVW<warps>S<stages>T<tile>B<bias
+       bits> (tile default 64, bias default 32). Each swept arm runs FV's gates under its own name (C, FI1-FI3, FI5,
+       CW, MW, U_<arm>_table; REPORTs X_row_alone, R_GRAPH, R_D vs P and vs FV, R_<arm>_compile); a swept arm whose
+       first call fails (compile, resources) is a REPORT FINDING and runs no gate. R_FV_sweep_<cell> picks the best
+       swept configuration (lowest event median among those whose MUST gates pass); ncu profiles P, FV, FVT, FVN and
+       that best configuration.
+  R_<arm>_compile (REPORT): the compiled kernel of the arm's first call (Triton's handle, kept by the fork in
+  FORK_LAST_LAUNCH): num_warps, num_stages, registers and local memory per thread (ptxas), shared memory, the shapes
+  of the loop's multi-buffered shared allocations in the TTGIR (the leading dimension = the buffer depth) and a MODEL
+  of programs per SM. R_DECISION5 scores PRED5 (the rule of PRED4) for the default FV and the best swept arm.
 """
 from __future__ import annotations
 
@@ -172,11 +189,18 @@ CELLS = ((8, 1), (8, 4), (32, 1), (32, 4))  # (B, rows per request); 8x1 first: 
 MAX_B = 256                                 # [fia3] B up to 256 (the 216 x 4 target cell)
 CPU_DATA_MAX_B = 64                         # [fia3] B <= 64: K / V / bias drawn on the CPU (fia1 / fia2 data, bitwise);
                                             # larger cells draw them on the GPU (a seeded CUDA generator)
-ARMS = ("P", "F8", "F0", "FH", "S5", "FP0", "FP8", "FPU", "V1", "FV", "FVT")
+ARMS = ("P", "F8", "F0", "FH", "S5", "FP0", "FP8", "FPU", "V1", "FV", "FVT", "FVN")
 MUST_ARMS = ("P", "F8", "F0")
 FP_ARMS = ("FP0", "FP8", "FPU")             # [fia3] FlashInfer paged PREFILL over the request union
-FV_ARMS = ("FV", "FVT")                     # [fia4] the fork of vLLM's Triton unified attention (in-kernel / torch table)
+FV_ARMS = ("FV", "FVT", "FVN")              # [fia4] the fork of vLLM's Triton unified attention (in-kernel / torch
+                                            # table); [fia5] FVN: the FV launch without extents (timing only)
 FV_ROWS = 4                                 # [fia4] BLOCK_Q of the fork: the rows of one request in one program
+FV_BIAS_BITS = 32                           # [fia5] the FV arms pass the CIS bias as float32 (the fork prefetches it)
+FV_SWEEP_NAME = re.compile(r"FVW(\d+)S(\d+)T(\d+)B(16|32)")          # [fia5] a swept FV arm (canonical name)
+FV_SWEEP_ITEM = re.compile(r"w(\d+)s(\d+)(?:t(\d+))?(?:b(16|32))?")  # [fia5] one --fv-sweep item
+FV_SWEEP_WARPS = (2, 4, 8, 16)
+FV_SWEEP_STAGES = (1, 2, 3, 4, 5, 6)
+FV_SWEEP_TILES = (16, 32, 64)
 FI_VERSION = "0.5.3"                        # the version every JIT cache of nosa-env.sif names (nosa-env/jit/*/flashinfer)
 FI_VERSIONS = ("0.5.3", "0.6.8.post1")      # [fia3] accepted: the sif's 0.5.3 and the 0.6.8.post1 read for this change
 TOL_C = 1.0e-3                              # REGISTERED: max |arm - fp64| (absolute), every arm
@@ -216,7 +240,8 @@ TAG_RE = re.compile(r"fia\|([A-Z0-9]+)")
 KERNELS_PER_CALL = dict(P=2, F8=4, F0=2, FH=None, S5=2,   # F8: 2 heads x (prefill + merge); F0: 2 x prefill
                         FP0=2, FP8=4, FPU=2, V1=None,     # [fia3] FP8: 2 x (prefill + merge); V1: 2 calls x (packer +
                                                           # forward, maybe split + combine): not fixed
-                        FV=1, FVT=1)                      # [fia4] one launch: grid (2B, Hkv), both KV heads
+                        FV=1, FVT=1,                      # [fia4] one launch: grid (2B, Hkv), both KV heads
+                        FVN=1)                            # [fia5] (a swept arm: 1 as well, expected_kernels)
 REUSE_LABEL = dict(
     P="hardware cache only: per-row loads; the rows of a request are adjacent programs of one grid (L2 reuse)",
     F8="hardware cache only: one CTA per (row, chunk); requests in request-major order (L2 reuse)",
@@ -235,6 +260,7 @@ REUSE_LABEL = dict(
        "the tokens some row sees) for the 4 rows x 16 query heads (BLOCK_M 64, one tl.dot); the program builds its "
        "union table itself; per-row score mask",
     FVT="as FV, the union table built by torch before the launch (timing only)",
+    FVN="as FV without the extents (every row sees every union token; timing only, not attention)",
 )
 VARIANT_NAME = "R2FiCisBias"
 VARIANT_URI = "r2_fiattn_cisbias_bf16_d%d"
@@ -401,6 +427,22 @@ PRED4 = {
                 "bytes) written down.",
 }
 
+# [fia5] REGISTERED block for the LEAD (the stamp is the lead's; docs/NOTES_fia5.md section 6 carries the same json;
+# test F5_7 keeps them equal). Bands [central, low, high]: the lead's suggestion in the fia5 brief. The rule is PRED4's.
+PRED5 = {
+    "registered": "REGISTERED <TBD-for-lead-stamp>",
+    "source": "lead's fia5 brief 2026-10-27 (SCORING_fia4.md sections 5-6: let Triton pipeline K / V inside the fork)",
+    "fv_over_p_device": {"216x4": [0.85, 0.6, 1.05], "216x4s1": [0.85, 0.6, 1.05]},
+    "best_swept_over_p_device": {"216x4": [0.85, 0.6, 1.05], "216x4s1": [0.85, 0.6, 1.05]},
+    "thresholds": {"fv_over_p_max": 0.8, "union_build_ms_per_tick_max": 1.0, "layers_per_tick": 32},
+    "decision": "ADOPT a launch configuration C of the fork (the default FV, or the cell's best swept configuration: "
+                "the lowest CUDA-event median among the swept arms whose MUST gates pass) if, at B 216 x 4, C's device "
+                "time <= 0.8 x P device time (ncu) AND the union build <= 1 ms per tick (32 layers; 32 x (FV - FVT) "
+                "device time at the default launch) AND C's MUST gates pass. When both qualify, the lower device time. "
+                "Else NOT MET, with the ncu split and the compile witness (registers, spills, shared memory, K / V "
+                "buffer depth) written down.",
+}
+
 
 def log(msg):
     print("[r2_fiattn %s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
@@ -477,10 +519,58 @@ def ncu_key(c):
 
 
 def parse_arms(text):
+    """[fia5] also a swept FV arm's canonical name (the ncu child gets the best one by name)."""
     arms = [a for a in str(text).split(",") if a]
-    if not arms or any(a not in ARMS for a in arms) or len(set(arms)) != len(arms):
-        raise ValueError("arms %r (subset of %s)" % (text, ARMS))
+    if not arms or any(a not in ARMS and fv_sweep_launch(a) is None for a in arms) or len(set(arms)) != len(arms):
+        raise ValueError("arms %r (subset of %s, or FVW<w>S<s>T<t>B<b>)" % (text, ARMS))
     return arms
+
+
+def fv_sweep_name(warps, stages, tile=PAGE, bias_bits=FV_BIAS_BITS):
+    """[fia5] The canonical arm name of one launch configuration of the fork."""
+    return "FVW%dS%dT%dB%d" % (int(warps), int(stages), int(tile), int(bias_bits))
+
+
+def fv_sweep_launch(name):
+    """[fia5] A swept arm's launch configuration from its canonical name, or None (not a swept arm, or out of range):
+    dict(num_warps, num_stages, tile_size, bias_bits)."""
+    m = FV_SWEEP_NAME.fullmatch(str(name))
+    if m is None:
+        return None
+    w, s, t, bb = (int(x) for x in m.groups())
+    if w not in FV_SWEEP_WARPS or s not in FV_SWEEP_STAGES or t not in FV_SWEEP_TILES or PAGE % t:
+        return None
+    if name != fv_sweep_name(w, s, t, bb):                              # no leading zeros: one name per configuration
+        return None
+    return dict(num_warps=w, num_stages=s, tile_size=t, bias_bits=bb)
+
+
+def parse_fv_sweep(text):
+    """[fia5] '--fv-sweep w4s2,w8s3t32,w4s3b16' -> the canonical arm names ['FVW4S2T64B32', 'FVW8S3T32B32',
+    'FVW4S3T64B16']: num_warps w, num_stages s, the token tile t (default PAGE: one block per tile), the CIS bias
+    passed as float b bits (default 32; 16 = the store's bf16). Empty -> []. Refused: an unknown item, a value out of
+    range (FV_SWEEP_WARPS, FV_SWEEP_STAGES, FV_SWEEP_TILES that divide PAGE), a repeated configuration."""
+    out = []
+    for item in [x.strip() for x in str(text or "").split(",") if x.strip()]:
+        m = FV_SWEEP_ITEM.fullmatch(item)
+        if m is None:
+            raise ValueError("--fv-sweep item %r is not w<warps>s<stages>[t<tile>][b<16|32>]" % item)
+        w, s = int(m.group(1)), int(m.group(2))
+        t = int(m.group(3)) if m.group(3) else PAGE
+        bb = int(m.group(4)) if m.group(4) else FV_BIAS_BITS
+        name = fv_sweep_name(w, s, t, bb)
+        if fv_sweep_launch(name) is None:
+            raise ValueError("--fv-sweep item %r: warps in %s, stages in %s, tile in %s" % (
+                item, FV_SWEEP_WARPS, FV_SWEEP_STAGES, FV_SWEEP_TILES))
+        if name in out:
+            raise ValueError("--fv-sweep item %r repeats %s" % (item, name))
+        out.append(name)
+    return out
+
+
+def is_fv_arm(name):
+    """[fia5] An arm of the fork: FV, FVT, FVN or a swept configuration."""
+    return name in FV_ARMS or fv_sweep_launch(name) is not None
 
 
 def cell_tag(b, r, src="gen"):
@@ -1829,8 +1919,11 @@ class FVArm:
     before the launch (build); ones (FVT only): every row sees the pair's whole reach (the MASK WITNESS). Persistent
     buffers per batch shape: the union tables (Hkv, B, W), the lengths, cu_seqlens_q, a zero seqused_k (the fork reads
     only its length) and the output. prepare has one host read (the rows of a request share one storage entry, as
-    FPArm); launch has none (R_GRAPH_FV captures it)."""
-    def __init__(self, mod, name, geom, s_slots, rpr, build, ones=False, device="cuda"):
+    FPArm); launch has none (R_GRAPH_FV captures it).
+    [fia5] launch: None (Triton's defaults, as upstream; the token tile = one block) or dict(num_warps, num_stages,
+    tile_size, bias_bits) (a swept arm); extents False: the FVN timing arm (use_extents=False); bias_bits 32: prepare
+    passes the CIS bias as a float32 copy (the same values), 16: the store's tensor as it is."""
+    def __init__(self, mod, name, geom, s_slots, rpr, build, ones=False, device="cuda", launch=None, extents=True):
         if rpr > FV_ROWS or (build and ones):
             raise ValueError("rows per request %d (<= %d), build %s, ones %s" % (rpr, FV_ROWS, build, ones))
         self.mod, self.name, self.geom, self.S, self.rpr = mod, name, geom, s_slots, rpr
@@ -1838,8 +1931,15 @@ class FVArm:
         self.scale = geom["D"] ** -0.5
         self.dev = torch.device(device)
         self.bufs = self.u = self.info = None
-        self._b = self._out = None
-        self.launch_kw = {}                 # num_warps / num_stages overrides: none (Triton's defaults, as upstream)
+        self._b = self._out = self._bias = None
+        cfg = dict(launch or {})                                            # [fia5]
+        self.bias_bits = int(cfg.pop("bias_bits", FV_BIAS_BITS))
+        if self.bias_bits not in (16, 32) or set(cfg) - {"num_warps", "num_stages", "tile_size"}:
+            raise ValueError("launch %r" % (launch,))
+        self.launch_cfg = dict(cfg, bias_bits=self.bias_bits)
+        self.launch_kw = {k: int(v) for k, v in cfg.items() if v is not None}    # none: Triton's defaults (upstream)
+        if not extents:
+            self.launch_kw["use_extents"] = False
 
     @property
     def workspace_bytes(self):
@@ -1877,6 +1977,8 @@ class FVArm:
         if not self.build_in_kernel:
             self.build(b)
         self._out = torch.empty_like(b["q"])
+        bias = b["bias"].view(b["k"].shape[0] * self.S, PAGE, hkv)               # [fia5] the bias dtype of this arm
+        self._bias = bias.float().contiguous() if self.bias_bits == 32 else bias
         self._b = b
 
     def launch(self):
@@ -1890,7 +1992,7 @@ class FVArm:
         self.mod.unified_attention(
             b["q"], b["k"].view(nblk, PAGE, hkv, d), b["v"].view(nblk, PAGE, hkv, d), self._out, bf["cu"], self.rpr,
             bf["seqused"], sr, self.scale, True, (-1, -1), bf["table"], 0, None, None, None,
-            union_ext=bf["ext"], union_len=bf["ulen"], cis_bias=b["bias"].view(nblk, PAGE, hkv), build_union=bu,
+            union_ext=bf["ext"], union_len=bf["ulen"], cis_bias=self._bias, build_union=bu,     # [fia5] self._bias
             rows_per_q_block=FV_ROWS, **self.launch_kw)
         return self._out
 
@@ -1901,6 +2003,67 @@ class FVArm:
     def __call__(self, b):
         self.prepare(b)
         return self.launch().clone()
+
+
+def make_fv_arm(mod, name, geom, s_slots, rpr, device, ones=False):
+    """[fia5] An arm of the fork by name: FV (the kernel builds its table), FVT (a torch table), FVN (FV without the
+    extents: timing only) or a swept FVW<w>S<s>T<t>B<b> (FV with that launch). ones=True: the MASK-WITNESS twin of the
+    named arm (the same launch, a torch table where every row sees the pair's reach)."""
+    cfg = fv_sweep_launch(name)
+    if cfg is None and name not in FV_ARMS:
+        raise ValueError("not an arm of the fork: %r" % name)
+    if ones:
+        return FVArm(mod, name + "ones", geom, s_slots, rpr, build=False, ones=True, device=device, launch=cfg)
+    return FVArm(mod, name, geom, s_slots, rpr, build=(name != "FVT"), device=device, launch=cfg,
+                 extents=(name != "FVN"))
+
+
+def fv_compile_info(mod, launch_kw=None):
+    """[fia5] The compile witness of the fork's LAST launch (FORK_LAST_LAUNCH: Triton's CompiledKernel; None under the
+    interpreter or a fork without it): num_warps, num_stages, registers per thread and local memory per thread in
+    4-byte words (Triton's n_spills = CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES / 4, driver.c:125-126), shared memory, the
+    loop's multi-buffered shared allocations in the TTGIR (local_alloc with no operand: 'DxAxBxdtype', D = the buffer
+    depth: the pipeliner's K / V / table buffers), the largest depth among
+    the rank-3 ones, and a MODEL of programs per SM (sm80: 65536 registers in units of 256 per warp, 167936 B of
+    shared memory with 1 KiB reserved per program, 64 warps). None when there is no handle."""
+    ck = (getattr(mod, "FORK_LAST_LAUNCH", None) or {}).get("kernel")
+    if ck is None:
+        return None
+    md = getattr(ck, "metadata", None)
+    asm = getattr(ck, "asm", None) or {}
+    try:
+        ttgir = asm["ttgir"] if "ttgir" in asm else ""
+    except Exception:                                                   # an asm dict that cannot give the text
+        ttgir = ""
+    allocs = re.findall(r"local_alloc\s*:\s*\(\)\s*->\s*!tt\.memdesc<((?:\d+x)+)([a-z]+\d*)", str(ttgir))
+    shapes = sorted({"%s%s" % (dims, ty) for dims, ty in allocs})
+    depth = max([int(d.split("x")[0]) for d, _ in allocs if d.count("x") == 3] or [0])
+    nw, ns = getattr(md, "num_warps", None), getattr(md, "num_stages", None)
+    shared = getattr(md, "shared", None)
+    regs, spill = getattr(ck, "n_regs", None), getattr(ck, "n_spills", None)
+    per_sm = None
+    if nw and regs is not None and shared is not None:
+        per_warp = -(-int(regs) * 32 // 256) * 256
+        by_regs = (65536 // max(per_warp, 1)) // int(nw)
+        by_smem = A100_SMEM_PER_SM // (int(shared) + 1024)
+        by_warps = 64 // int(nw)
+        per_sm = dict(registers=by_regs, shared=by_smem, warps=by_warps, model=min(by_regs, by_smem, by_warps))
+    return dict(num_warps=nw, num_stages=ns, regs=regs, local_words_per_thread=spill, shared=shared,
+                buffers=shapes, kv_depth=depth, programs_per_sm=per_sm, launch_kw=dict(launch_kw or {}))
+
+
+def fv_compile_gate(name, tag, mod, arm):
+    """[fia5] R_<arm>_compile (REPORT) after the arm's first call; returns (gate, info or None)."""
+    info = fv_compile_info(mod, getattr(arm, "launch_kw", None))
+    if info is None:
+        return gate("R_%s_compile_%s" % (name, tag), False, False, "no compiled-kernel handle (the interpreter, or a "
+                    "fork without FORK_LAST_LAUNCH); launch %s" % getattr(arm, "launch_kw", None)), None
+    return gate("R_%s_compile_%s" % (name, tag), True, False,
+                "num_warps %s, num_stages %s, registers %s, local memory %s words of 4 B per thread, shared memory "
+                "%s B; loop buffers %s (largest depth %d); programs per SM (MODEL) %s; launch %s"
+                % (info["num_warps"], info["num_stages"], info["regs"], info["local_words_per_thread"],
+                   info["shared"], info["buffers"], info["kv_depth"], info["programs_per_sm"],
+                   info["launch_kw"])), info
 
 
 # ------------------------------------------------------------------ gates (arm-agnostic; the CPU tests use fakes)
@@ -2046,8 +2209,10 @@ def completeness_gates(gates, cells, arms, custom, fp=False, v1=False, fv=False)
     """[fix after fia1] MUST per requested cell: every expected gate of that cell is present (whatever its result),
     so a cell or an arm that never reported cannot pass by absence. [fia3] fp (the FP variant built): FP0's gates;
     v1 (V1 importable): V1_pre and C_V1 (C_V1 is a VOID REPORT when the precondition fails). [fia4] fv (the fork
-    imported): FV's gates."""
+    imported): FV's gates. [fia5] each swept FV arm of arms: its first-call marker R_<arm>_first_call_<tag>, and when
+    that call ran, FV's gates under the arm's name (fv_gate_names)."""
     have = {g["name"] for g in gates}
+    by_name = {g["name"]: g for g in gates}
     out = []
     for c in cells:
         b, rpr, src = cell_parts(c)
@@ -2067,14 +2232,26 @@ def completeness_gates(gates, cells, arms, custom, fp=False, v1=False, fv=False)
         if v1 and "V1" in arms:
             want += ["V1_pre_%s" % tag, "C_V1_%s" % tag]
         if fv and "FV" in arms:                                           # [fia4]
-            want += ["G_block0_%s" % tag, "C_FV_%s" % tag, "MW_FV_%s" % tag, "U_FV_table_%s" % tag]
-            want += ["%s_FV_%s" % (p, tag) for p in ("FI1_request_alone", "FI2_order", "FI3_other_requests",
-                                                     "FI5_poison")]
-            if custom:
-                want.append("CW_FV_%s" % tag)
+            want += fv_gate_names("FV", tag, custom)
+        if fv:                                                            # [fia5] the swept arms
+            for x in [s for s in arms if fv_sweep_launch(s) is not None]:
+                first = by_name.get("R_%s_first_call_%s" % (x, tag))
+                if first is None:
+                    want.append("R_%s_first_call_%s" % (x, tag))
+                elif first["passed"]:
+                    want += [w for w in fv_gate_names(x, tag, custom) if w not in want]
         miss = [w for w in want if w not in have]
         out.append(gate("COMPLETE_%s" % tag, not miss, True, "%d of %d expected gates present; missing %s"
                         % (len(want) - len(miss), len(want), miss[:8])))
+    return out
+
+
+def fv_gate_names(name, tag, custom):
+    """[fia4] FV's expected gates in one cell ([fia5] the same set for a swept arm, under its own name)."""
+    out = ["G_block0_%s" % tag, "C_%s_%s" % (name, tag), "MW_%s_%s" % (name, tag), "U_%s_table_%s" % (name, tag)]
+    out += ["%s_%s_%s" % (p, name, tag) for p in ("FI1_request_alone", "FI2_order", "FI3_other_requests", "FI5_poison")]
+    if custom:
+        out.append("CW_%s_%s" % (name, tag))
     return out
 
 
@@ -2263,10 +2440,12 @@ def decision_report(report, gates, cells):
 
 
 # ------------------------------------------------------------------ [fia4] gates and the decision of the fork
-def fv_table_gate(tag, arm, batches, rpr, s_slots, must):
+def fv_table_gate(tag, arm, batches, rpr, s_slots, must, gname=None):
     """U_FV_table (MUST): after an FV call on each batch, the tables the KERNEL wrote == the torch tables
     (fv_tables_from_union over fp_union) on each union's valid prefix, and the lengths are equal. Precondition: the
-    rows are sorted (fv_sorted_rows; the in-kernel build needs piece 3's canonical order), else VOID (= fail)."""
+    rows are sorted (fv_sorted_rows; the in-kernel build needs piece 3's canonical order), else VOID (= fail).
+    [fia5] gname: the gate's name (default U_FV_table_<tag>; a swept arm: U_<arm>_table_<tag>)."""
+    gname = gname or "U_FV_table_%s" % tag
     det, bad, pre = [], 0, True
     for name, b in batches:
         ok, txt = fv_sorted_rows(b)
@@ -2283,31 +2462,33 @@ def fv_table_gate(tag, arm, batches, rpr, s_slots, must):
                  for h, q, j in (((kt != t) | (kx != x)) & live).nonzero().tolist()[:4]]
         det.append("%s: %d lengths, %d pages, %d extent words differ of %d entries (%s)%s"
                    % (name, dl, dt, dx, int(live.sum()), txt, "; first: " + ", ".join(first) if first else ""))
-    return gate("U_FV_table_%s" % tag, pre and bad == 0, must, "%s; %s" % (
+    return gate(gname, pre and bad == 0, must, "%s; %s" % (
         "precondition met (sorted rows)" if pre else "VOID: unsorted rows", "; ".join(det)),
         status=None if pre else "VOID")
 
 
-def fv_row_alone_gate(tag, arm, bf, rows, rpr, full):
+def fv_row_alone_gate(tag, arm, bf, rows, rpr, full, gname=None):
     """X_row_alone_FV (REPORT; the EXACT probe): each sampled row alone (rpr copies of it: its own list is then the
     union) vs the same row in its request, bitwise. Expected: no difference (a tile = one block, ascending block
-    order; a block the row does not list is an exact identity step once block 0 was seen, G_block0)."""
+    order; a block the row does not list is an exact identity step once block 0 was seen, G_block0). [fia5] also with
+    a tile that is part of a block (a tile the row does not see is an identity step too); gname as fv_table_gate."""
     diff = []
     for r in rows:
         o = arm(select(bf, [r] * rpr))
         if not bits_equal(o[0], full[r]):
             diff.append(r)
-    return gate("X_row_alone_FV_%s" % tag, not diff, False,
+    return gate(gname or "X_row_alone_FV_%s" % tag, not diff, False,
                 "%d of %d sampled rows differ alone (%d copies) vs in their request (EXACT expected by construction); "
                 "differing %s" % (len(diff), len(rows), rpr, diff[:10]))
 
 
-def fv_graph_probe(tag, arm, b):
+def fv_graph_probe(tag, arm, b, gname=None):
     """R_GRAPH_FV (REPORT): one FV launch (the in-kernel union build included) captured in a CUDA graph after a
     side-stream warm-up (torch.cuda.graphs); the replay into a NaN-filled output == the eager launch, bitwise; replay
-    time. A capture error is a REPORT field."""
+    time. A capture error is a REPORT field. [fia5] gname as fv_table_gate."""
+    gname = gname or "R_GRAPH_FV_%s" % tag
     if not (torch.cuda.is_available() and b["q"].is_cuda):
-        return gate("R_GRAPH_FV_%s" % tag, False, False, "not run: no CUDA tensors")
+        return gate(gname, False, False, "not run: no CUDA tensors")
     try:
         arm.prepare(b)
         eager = arm.launch().clone()
@@ -2326,14 +2507,14 @@ def fv_graph_probe(tag, arm, b):
         same = bits_equal(arm._out, eager)
         t = cuda_time(g.replay, 5, 50)
         del g
-        return gate("R_GRAPH_FV_%s" % tag, same, False, "one FV launch in a CUDA graph: replay bitwise equal to eager "
+        return gate(gname, same, False, "one FV launch in a CUDA graph: replay bitwise equal to eager "
                     "%s; replay %.4f ms per layer" % (same, t["median"]))
     except Exception as e:
         try:
             torch.cuda.synchronize()
         except Exception:
             pass
-        return gate("R_GRAPH_FV_%s" % tag, False, False, "capture failed: %s: %s" % (type(e).__name__, str(e)[:300]))
+        return gate(gname, False, False, "capture failed: %s: %s" % (type(e).__name__, str(e)[:300]))
 
 
 def decision_report4(report, gates, cells):
@@ -2376,6 +2557,98 @@ def decision_report4(report, gates, cells):
                            "%.4f" % b_ncu if b_ncu is not None else "n/a",
                            "%.4f" % b_ev if b_ev is not None else "n/a", th["union_build_ms_per_tick_max"],
                            "PASS" if gates_ok else "NOT ALL PASS", "%.4f" % rt if rt is not None else "n/a", split)))
+    return out
+
+
+def fv_must_gates(gates, name, tag):
+    """[fia5] The MUST gates of one fork arm in one cell (its name between underscores, e.g. C_FV_216x4,
+    U_FVW4S3T64B32_table_216x4) and G_block0 of the cell."""
+    key = "_%s_" % name
+    return [g for g in gates if g["must"] and g["name"].endswith("_" + tag)
+            and (key in g["name"] or g["name"].startswith("G_block0"))]
+
+
+def fv_sweep_report(rep, tag, gates, names):
+    """[fia5] R_FV_sweep_<tag> (REPORT): per swept arm of the cell the event median, x of P, its MUST gates and its
+    compile witness; rep["fv_best"] = the lowest event median among the swept arms whose MUST gates all pass (None
+    when none). The ncu child profiles it next to FV."""
+    arms = rep.get("arms") or {}
+    p = (arms.get("P") or {}).get("call_ms", {}).get("median")
+    comp = rep.get("fv_compile") or {}
+    rows, cands = [], []
+    for x in ["FV", "FVN"] + list(names):
+        t = (arms.get(x) or {}).get("call_ms", {}).get("median")
+        mine = fv_must_gates(gates, x, tag) if x != "FVN" else []
+        ok = bool(mine) and all(g["passed"] for g in mine)
+        c = comp.get(x) or {}
+        rows.append("%s %s ms (x%s of P; MUST %s; regs %s, local words %s, shared %s, depth %s)" % (
+            x, "%.4f" % t if t is not None else "n/a", "%.3f" % (t / p) if (t is not None and p) else "n/a",
+            "n/a" if x == "FVN" else ("PASS" if ok else "NOT ALL PASS"), c.get("regs"),
+            c.get("local_words_per_thread"), c.get("shared"), c.get("kv_depth")))
+        if x in names and ok and t is not None:
+            cands.append((t, x))
+    rep["fv_best"] = min(cands)[1] if cands else None
+    gates.append(gate("R_FV_sweep_%s" % tag, rep["fv_best"] is not None, False,
+                      "best swept arm %s (lowest event median among the swept arms with all MUST gates passing; ncu "
+                      "profiles it); %s" % (rep["fv_best"], "; ".join(rows))))
+    return rep["fv_best"]
+
+
+def decision_report5(report, gates, cells):
+    """[fia5] R_DECISION5 (REPORT; the lead scores it): PRED5's rule per registered cell for the default FV and the
+    cell's best swept arm: X / P from the ncu device times; the union build per tick = 32 x (FV - FVT) ncu (the default
+    launch; else the event difference); X's MUST gates; the extents' share of FV's device time ((FV - FVN) / FV);
+    the ncu split and the compile witness of each."""
+    th = PRED5["thresholds"]
+    out = []
+    for c in cells:
+        b, rpr, src = cell_parts(c)
+        tag = cell_tag(b, rpr, src)
+        if tag not in PRED5["fv_over_p_device"]:
+            continue
+        crep = (report.get("cells") or {}).get(tag) or {}
+        arms = (((report.get("ncu") or {}).get(tag) or {}).get("summary") or {}).get("arms") or {}
+        p, f, ft, fn = arms.get("P"), arms.get("FV"), arms.get("FVT"), arms.get("FVN")
+        best = crep.get("fv_best")
+        fb = arms.get(best) if best else None
+        tp = p.get("time_ns") if p else None
+
+        def ratio(a):
+            return a["time_ns"] / tp if (a and tp and a.get("time_ns")) else None
+        b_ncu = (th["layers_per_tick"] * max(f["time_ns"] - ft["time_ns"], 0.0) / 1e6
+                 if f and ft and f.get("time_ns") and ft.get("time_ns") else None)
+        b_ev = ((crep.get("arms") or {}).get("FV") or {}).get("build_in_kernel_ms_per_tick_events")
+        build = b_ncu if b_ncu is not None else b_ev
+        build_ok = build is not None and build <= th["union_build_ms_per_tick_max"]
+        mshare = (f["time_ns"] - fn["time_ns"]) / f["time_ns"] if (f and fn and f.get("time_ns")) else None
+        comp = crep.get("fv_compile") or {}
+        parts, ok_cfg = [], []
+        for x, a, band in (("FV", f, PRED5["fv_over_p_device"][tag]),
+                           (best, fb, PRED5["best_swept_over_p_device"].get(tag))):
+            if x is None:
+                parts.append("best swept: none (no swept arm with all MUST gates passing, or no sweep)")
+                continue
+            r = ratio(a)
+            mine = fv_must_gates(gates, x, tag)
+            g_ok = bool(mine) and all(g["passed"] for g in mine)
+            if r is not None and r <= th["fv_over_p_max"] and g_ok and build_ok:
+                ok_cfg.append((r, x))
+            cw = comp.get(x) or {}
+            parts.append("%s / P device %s (%s); MUST gates %s; ncu registers %s, local memory %s B, achieved "
+                         "occupancy %s %%, shared memory %s B, DRAM / union %s; compile: depth %s, programs per SM "
+                         "(MODEL) %s" % (
+                             x, "%.4f" % r if r is not None else "n/a", band_text(r, band) if band else "no band",
+                             "PASS" if g_ok else "NOT ALL PASS", sorted(set((a or {}).get("regs") or [])),
+                             (a or {}).get("local_bytes"), (a or {}).get("occ"), (a or {}).get("smem"),
+                             (a or {}).get("read_over_union"), cw.get("kv_depth"),
+                             (cw.get("programs_per_sm") or {}).get("model")))
+        verdict = ("ADOPT %s" % min(ok_cfg)[1]) if ok_cfg else "NOT MET"
+        out.append(gate("R_DECISION5_%s" % tag, True, False,
+                        "%s: %s; union build per tick %s ms (ncu %s, events %s; rule <= %.1f); extents' share of FV "
+                        "(FV - FVN) / FV %s"
+                        % (verdict, " | ".join(parts), "%.4f" % build if build is not None else "n/a",
+                           "%.4f" % b_ncu if b_ncu is not None else "n/a", "%.4f" % b_ev if b_ev is not None else "n/a",
+                           th["union_build_ms_per_tick_max"], "%.4f" % mshare if mshare is not None else "n/a")))
     return out
 
 
@@ -2610,7 +2883,8 @@ def ncu_rows(text, fields):
 def ncu_summary(rows, arms, ideal, union, rpr):
     """Per arm: DRAM bytes read / written, kernel time, kernel count (vs KERNELS_PER_CALL), ratios to the ideal
     and the union bytes, the band (PRED dram_read_over_ideal), the reuse label."""
-    per = {a: dict(read=0.0, write=0.0, time_ns=0.0, kernels=[], label=REUSE_LABEL.get(a, ""), l2sm_sectors=None,
+    per = {a: dict(read=0.0, write=0.0, time_ns=0.0, kernels=[], label=REUSE_LABEL.get(a) or (    # [fia5] swept
+        "as FV, launch %s" % fv_sweep_launch(a) if fv_sweep_launch(a) else ""), l2sm_sectors=None,
                    regs=[], local_bytes=None, occ=[], smem=[], limits=[]) for a in arms}     # [fia4] occ, smem, limits
     stray = []
     for r in rows:
@@ -2644,7 +2918,7 @@ def ncu_summary(rows, arms, ideal, union, rpr):
             p["limits"].append(lim)
     for a, p in per.items():
         p["n_kernels"] = len(p["kernels"])
-        p["expected_kernels"] = KERNELS_PER_CALL.get(a)
+        p["expected_kernels"] = KERNELS_PER_CALL.get(a, 1 if fv_sweep_launch(a) is not None else None)   # [fia5]
         p["read_over_ideal"] = p["read"] / ideal if ideal else None
         p["read_over_union"] = p["read"] / union if union else None
         bands = PRED["dram_read_over_ideal"].get("4" if rpr > 1 else "1", {})
@@ -2681,7 +2955,7 @@ def ncu_argv(a, b, rpr, child_out, rep, metrics, arms, bias_free, src="gen"):
         argv += ["--sharedkv", a.sharedkv]
     if "V1" in arms:
         argv += ["--verify-step", getattr(a, "verify_step", None)]
-    if any(x in arms for x in FV_ARMS):                                      # [fia4]
+    if any(is_fv_arm(x) for x in arms):                                      # [fia4] [fia5] a swept arm too
         argv += ["--fv-kernel", getattr(a, "fv_kernel", None)]
     if src == "s1":
         argv += ["--s1-tables", getattr(a, "s1_tables", None)]
@@ -2738,9 +3012,9 @@ def build_arms(fi, a, geom, case, p3, skv, jit, arms, device, jit_fp=None, vmod=
         elif name == "V1":                                      # [fia3] only when V1 imports
             if vmod is not None:
                 out[name] = V1Arm(vmod, geom, case["rpr"], case["S"])
-        elif name in FV_ARMS:                                   # [fia4] only when the fork imports
+        elif is_fv_arm(name):                                   # [fia4] only when the fork imports ([fia5] FVN, swept)
             if fvmod is not None and case["rpr"] <= FV_ROWS:
-                out[name] = FVArm(fvmod, name, geom, case["S"], case["rpr"], build=(name == "FV"), device=device)
+                out[name] = make_fv_arm(fvmod, name, geom, case["S"], case["rpr"], device)
         else:
             split = dict(F8="fixed", F0="none", FH="heuristic")[name]
             out[name] = FIArm(fi, name, split, geom, case["S"], jit, device)
@@ -2823,7 +3097,8 @@ def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates, src="gen", jit_fp=None, v
     run_fp_v1(fi, a, geom, case, arms, outs, bf, rows, ref, ref0, poisoned, rpr, tag, custom, jit_fp, gates, rep)
     run_fv(geom, case, arms, outs, bf, rows, ref, ref0, poisoned, rpr, tag, custom, fvmod, gates, rep)    # [fia4]
     tp = None
-    for name in ("P", "F8", "F0", "FH", "S5", "FP0", "FP8", "FPU", "V1", "FV", "FVT"):
+    sweep = [x for x in a.arms if fv_sweep_launch(x) is not None and x in arms]          # [fia5] (first call ran)
+    for name in ("P", "F8", "F0", "FH", "S5", "FP0", "FP8", "FPU", "V1", "FV", "FVT", "FVN") + tuple(sweep):
         if name not in arms or (name == "V1" and not rep.get("v1_pre")):
             continue
         try:
@@ -2870,6 +3145,8 @@ def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates, src="gen", jit_fp=None, v
             gates.append(gate("R_T_%s_%s" % (name, tag), False, False, "EXCEPTION %s: %s" % (type(e).__name__,
                                                                                              str(e)[:300])))
     fv_build_report(rep, tag, gates)                                                            # [fia4]
+    if sweep or "FVN" in arms:                                                                  # [fia5]
+        fv_sweep_report(rep, tag, gates, sweep)
     if custom and a.strided and "F8" in outs:
         try:
             sa = FIStridedArm(fi, geom, case["S"], jit, "cuda")
@@ -3008,9 +3285,88 @@ def _fv_try(gates, name, must, fn):
         gates.append(gate(name, False, must, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
 
 
+def fv_partial_reach(u):
+    """[fia5] Live union entries (KV head, request, entry) that the rows reach only in part (0 < reach < PAGE). FI5
+    poisons the tokens past such an entry's reach INSIDE a tile that the fork loads, so FI5 tests the V reach mask
+    (lessons L34: a plant must have teeth). One host read."""
+    reach = u["ext"].amax(dim=2)
+    j = torch.arange(reach.shape[-1], device=reach.device).view(1, 1, -1)
+    live = j < u["ucnt"].unsqueeze(-1)
+    return int((live & (reach > 0) & (reach < PAGE)).sum())
+
+
+def fv_suite(name, arm, fvmod, geom, case, bf, baq, rows, ref, ref0, poisoned, rpr, tag, custom, gates, outs, rep,
+             u_full, swept=False):
+    """[fia4] FV's gates for one cell; [fia5] under the arm's own name, for the default FV and for each swept arm (the
+    same gates by construction). The first call (Triton's JIT compile, or its cache) is timed and gives the compile
+    witness R_<name>_compile; its failure is ARM_<name> (MUST) for FV, and a REPORT FINDING for a swept arm (which
+    then runs no gate). Returns True when the gates ran."""
+    rows_t = torch.as_tensor(rows, device=bf["q"].device)
+    t0 = time.time()
+    try:
+        arm(bf)
+        if bf["q"].is_cuda:
+            torch.cuda.synchronize()
+        gates.append(gate("R_%s_first_call_%s" % (name, tag), True, False, "the first %s call (Triton JIT compile of "
+                          "the fork, or its cache) took %.1f s" % (name, time.time() - t0)))
+    except Exception as e:
+        traceback.print_exc()
+        if swept:
+            gates.append(gate("R_%s_first_call_%s" % (name, tag), False, False, "FINDING: the first call failed (%s: "
+                              "%s); this launch configuration runs no gate" % (type(e).__name__, str(e)[:300])))
+        else:
+            gates.append(gate("ARM_%s_%s" % (name, tag), False, True, "EXCEPTION %s: %s" % (type(e).__name__,
+                                                                                        str(e)[:300])))
+        return False
+    g, info = fv_compile_gate(name, tag, fvmod, arm)
+    gates.append(g)
+    rep.setdefault("fv_compile", {})[name] = info
+    nreq = case["R"] // rpr
+    breq = sorted({r // rpr for r in rows})
+    rperm = torch.randperm(nreq, generator=torch.Generator().manual_seed(case["seed"] + 2)).tolist()
+    rperms = [("reversed_requests", list(reversed(range(nreq)))), ("random", rperm)]
+    pre5 = (True, "no precondition: V reads 0 past each tile's reach, the K / bias columns past it are -inf in S; "
+                  "%d union entries are reached in part (the plant lies inside loaded tiles)"
+            % fv_partial_reach(u_full))
+    try:
+        g, full = request_suite(name, tag, arm, bf, baq, rpr, breq, rperms, poisoned, pre5, True)
+        gates.extend(g)
+        outs[name] = full
+        gates.append(correctness_gate(name, tag, full[rows_t], ref, TOL_C, True))
+    except Exception as e:
+        traceback.print_exc()
+        gates.append(gate("ARM_%s_%s" % (name, tag), False, True, "EXCEPTION %s: %s" % (type(e).__name__,
+                                                                                    str(e)[:300])))
+    if name not in outs:
+        return True
+    gn = lambda p, mid="": "%s_%s%s_%s" % (p, name, mid, tag)                  # noqa: E731
+    if custom:
+        _fv_try(gates, gn("CW"), True,
+                lambda: bias_witness(tag, arm, bf, rows, ref, ref0, TOL_C, True, gname=gn("CW")))
+    _fv_try(gates, gn("U", "_table"), True,
+            lambda: fv_table_gate(tag, arm, [("full", bf), ("altreq", baq)], rpr, case["S"], True,
+                                  gname=gn("U", "_table")))
+    _fv_try(gates, gn("MW"), True, lambda: mask_witness(
+        tag, make_fv_arm(fvmod, name, geom, case["S"], rpr, bf["q"].device, ones=True), bf, rows, ref, u_full, TOL_C,
+        True, gname=gn("MW")))
+    _fv_try(gates, gn("X_row_alone"), False,
+            lambda: fv_row_alone_gate(tag, arm, bf, rows, rpr, outs[name], gname=gn("X_row_alone")))
+    _fv_try(gates, gn("R_GRAPH"), False, lambda: fv_graph_probe(tag, arm, bf, gname=gn("R_GRAPH")))
+    if "P" in outs:
+        gates.append(bits_vs(name, tag, outs[name], outs["P"]))
+    if name != "FV" and "FV" in outs:
+        o = outs[name]
+        same = sum(1 for r in range(o.shape[0]) if bits_equal(o[r], outs["FV"][r]))
+        gates.append(gate(gn("R_D_bits_vs_FV"), True, False, "%d of %d rows bitwise equal to the default FV (launch "
+                          "%s; a tile of a part of a block or other warps may round differently)"
+                          % (same, o.shape[0], arm.launch_cfg)))
+    return True
+
+
 def run_fv(geom, case, arms, outs, bf, rows, ref, ref0, poisoned, rpr, tag, custom, fvmod, gates, rep):
-    """[fia4] The gates of the fork for one cell (module docstring [fia4]). Appends to gates and outs."""
-    if not any(x in arms for x in FV_ARMS):
+    """[fia4] The gates of the fork for one cell (module docstring [fia4]). Appends to gates and outs. [fia5] the
+    swept arms (fv_suite each; a swept arm whose first call fails leaves arms) and FVN (timing only)."""
+    if not any(is_fv_arm(x) for x in arms):
         return
     baq = batch_of(case, "altreq")
     rows_t = torch.as_tensor(rows, device=bf["q"].device)
@@ -3018,50 +3374,19 @@ def run_fv(geom, case, arms, outs, bf, rows, ref, ref0, poisoned, rpr, tag, cust
         _fv_try(gates, "G_block0_%s" % tag, True, lambda: block0_gate(tag, [bf, baq], rpr, case["S"], must=True))
     u_full = fp_union(bf, rpr, case["S"])
     rep["union"] = rep.get("union") or union_stats(u_full, bf)
+    common = (fvmod, geom, case, bf, baq, rows, ref, ref0, poisoned, rpr, tag, custom, gates, outs, rep, u_full)
     if "FV" in arms:
-        arm = arms["FV"]
-        t0 = time.time()
-        try:
-            arm(bf)
-            if bf["q"].is_cuda:
-                torch.cuda.synchronize()
-            gates.append(gate("R_FV_first_call_%s" % tag, True, False, "the first FV call (Triton JIT compile of the "
-                              "fork, or its cache) took %.1f s" % (time.time() - t0)))
-        except Exception as e:
-            traceback.print_exc()
-            gates.append(gate("ARM_FV_%s" % tag, False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
-            return
-        nreq = case["R"] // rpr
-        breq = sorted({r // rpr for r in rows})
-        rperm = torch.randperm(nreq, generator=torch.Generator().manual_seed(case["seed"] + 2)).tolist()
-        rperms = [("reversed_requests", list(reversed(range(nreq)))), ("random", rperm)]
-        pre5 = (True, "FV loads only the tokens that some row of the request sees, the tile reach mask")
-        try:
-            g, full = request_suite("FV", tag, arm, bf, baq, rpr, breq, rperms, poisoned, pre5, True)
-            gates.extend(g)
-            outs["FV"] = full
-            gates.append(correctness_gate("FV", tag, full[rows_t], ref, TOL_C, True))
-        except Exception as e:
-            traceback.print_exc()
-            gates.append(gate("ARM_FV_%s" % tag, False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
-        if "FV" in outs:
-            if custom:
-                _fv_try(gates, "CW_FV_%s" % tag, True,
-                        lambda: bias_witness(tag, arm, bf, rows, ref, ref0, TOL_C, True, gname="CW_FV_%s" % tag))
-            _fv_try(gates, "U_FV_table_%s" % tag, True,
-                    lambda: fv_table_gate(tag, arm, [("full", bf), ("altreq", baq)], rpr, case["S"], True))
-            _fv_try(gates, "MW_FV_%s" % tag, True, lambda: mask_witness(
-                tag, FVArm(fvmod, "FVones", geom, case["S"], rpr, build=False, ones=True, device=bf["q"].device), bf,
-                rows, ref, u_full, TOL_C, True, gname="MW_FV_%s" % tag))
-            _fv_try(gates, "X_row_alone_FV_%s" % tag, False,
-                    lambda: fv_row_alone_gate(tag, arm, bf, rows, rpr, outs["FV"]))
-            _fv_try(gates, "R_GRAPH_FV_%s" % tag, False, lambda: fv_graph_probe(tag, arm, bf))
-            if "P" in outs:
-                gates.append(bits_vs("FV", tag, outs["FV"], outs["P"]))
+        fv_suite("FV", arms["FV"], *common)
+    for x in [n for n in list(arms) if fv_sweep_launch(n) is not None]:      # [fia5] the same gates per swept arm
+        if not fv_suite(x, arms[x], *common, swept=True):
+            del arms[x]
     if "FVT" in arms:
         try:
             o = arms["FVT"](bf)
             outs["FVT"] = o
+            g, info = fv_compile_gate("FVT", tag, fvmod, arms["FVT"])                          # [fia5]
+            gates.append(g)
+            rep.setdefault("fv_compile", {})["FVT"] = info
             gates.append(correctness_gate("FVT", tag, o[rows_t], ref, TOL_C, False))
             if "FV" in outs:
                 same = sum(1 for r in range(o.shape[0]) if bits_equal(o[r], outs["FV"][r]))
@@ -3070,6 +3395,22 @@ def run_fv(geom, case, arms, outs, bf, rows, ref, ref0, poisoned, rpr, tag, cust
         except Exception as e:
             traceback.print_exc()
             gates.append(gate("ARM_FVT_%s" % tag, False, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+    if "FVN" in arms:                                                           # [fia5] timing only
+        try:
+            o = arms["FVN"](bf)
+            g, info = fv_compile_gate("FVN", tag, fvmod, arms["FVN"])
+            gates.append(g)
+            rep.setdefault("fv_compile", {})["FVN"] = info
+            d = (o[rows_t].double() - ref.to(o.device)).abs()
+            err = float(d.max()) if bool(torch.isfinite(d).all()) else float("inf")
+            st = "DETECTED" if err > TOL_C else "BLIND"
+            gates.append(gate("R_FVN_not_attention_%s" % tag, st == "DETECTED", False,
+                              "%s: FVN (no extents: every row sees every union token) vs the reference %.3e "
+                              "(tol %.1e); a timing arm only (FV - FVN = the extents' cost)" % (st, err, TOL_C),
+                              status=st))
+        except Exception as e:
+            traceback.print_exc()
+            gates.append(gate("ARM_FVN_%s" % tag, False, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
 
 
 def fv_build_report(rep, tag, gates):
@@ -3112,16 +3453,22 @@ def parse_args(argv):
     ap.add_argument("--s1-tables", default=None, help="[fia3] the recorded S1 skv_tables.pt (a copy; the s1 cells)")
     ap.add_argument("--fv-kernel", default=None, help="[fia4] the fork nosi/nosi/fork_vllm_unified_attention.py (FV, "
                                                       "FVT)")
+    ap.add_argument("--fv-sweep", default="", help="[fia5] FV launch configurations, one more arm each: "
+                                                   "w<warps>s<stages>[t<tile>][b<16|32>],... (needs the arm FV)")
     a = ap.parse_args(argv)
     a.cells = parse_cells(a.cells)
     a.arms = parse_arms(a.arms)
+    a.fv_sweep = parse_fv_sweep(a.fv_sweep)                                       # [fia5]
+    if a.fv_sweep and "FV" not in a.arms:
+        raise ValueError("--fv-sweep needs the arm FV (the swept arms are FV's launch configurations)")
+    a.arms = a.arms + [x for x in a.fv_sweep if x not in a.arms]
     if a.sample < 2 or a.warm < 0 or a.reps < 1 or a.budget_s < 60 or not 1 <= a.ncu_cap <= NCU_CAP_S:
         raise ValueError("--sample >= 2, --warm >= 0, --reps >= 1, --budget-s >= 60, --ncu-cap 1 .. %d" % NCU_CAP_S)
     if "S5" in a.arms and a.mode == "ncu-cell" and not a.sharedkv:
         raise ValueError("ncu-cell with S5 needs --sharedkv")
     if "V1" in a.arms and not a.verify_step:
         raise ValueError("arm V1 needs --verify-step")
-    if any(x in a.arms for x in FV_ARMS) and not a.fv_kernel:                      # [fia4]
+    if any(is_fv_arm(x) for x in a.arms) and not a.fv_kernel:                     # [fia4] [fia5] any fork arm
         raise ValueError("arms FV / FVT need --fv-kernel")
     if any(cell_parts(c)[2] == "s1" for c in a.cells) and not a.s1_tables:
         raise ValueError("an s1 cell needs --s1-tables")
@@ -3204,7 +3551,7 @@ def load_v1(a, gates, report):
 def load_fv(a, gates, report):
     """[fia4] gate C0_FV_import (MUST when FV / FVT is asked): the fork loads by path (torch + triton). Returns the
     module or None (the FV arms do not run; a FINDING)."""
-    if not any(x in a.arms for x in FV_ARMS):
+    if not any(is_fv_arm(x) for x in a.arms):                                     # [fia5] any fork arm
         return None
     mod, why = import_fv(a.fv_kernel)
     gates.append(gate("C0_FV_import", mod is not None, True, "the fork %s: %s" % (
@@ -3305,18 +3652,20 @@ def mode_main(a):
         gates.extend(decision_report(report, gates, a.cells))
     if fvmod is not None and "FV" in a.arms:                                 # [fia4]
         gates.extend(decision_report4(report, gates, a.cells))
+        gates.extend(decision_report5(report, gates, a.cells))                # [fia5]
     meta = dict(mode="main", cells=[cell_tag(*c) for c in a.cells], arms=a.arms, seed=a.seed, sample=a.sample,
                 warm=a.warm, reps=a.reps, budget_s=a.budget_s, seconds=round(time.time() - t_start, 1), geom=geom,
                 torch=torch.__version__, flashinfer=fiv, gpu=torch.cuda.get_device_name(0),
                 commit=os.environ.get("FIATTN_COMMIT", "unknown"), biattn=a.biattn, sharedkv=a.sharedkv,
                 verify_step=a.verify_step, s1_tables=a.s1_tables, fi_versions_accepted=list(FI_VERSIONS),
                 fv_kernel=a.fv_kernel, triton=getattr(sys.modules.get("triton"), "__version__", None),   # [fia4]
+                fv_sweep={x: fv_sweep_launch(x) for x in a.fv_sweep}, fv_bias_bits=FV_BIAS_BITS,        # [fia5]
                 kv_tile_tokens_model=KV_TILE_PAGES * PAGE,
                 bias_free=jit is None, tol_c=TOL_C, env={k: v for k, v in os.environ.items()
                                                          if k.startswith(("FLASHINFER_", "TVM_FFI", "TRITON_",
                                                                           "TORCH_", "MAX_JOBS", "TMPDIR"))})
     write_json(os.path.join(a.out, "summary.json"), dict(meta=meta, gates=gates, report=report, pred=PRED,
-                                                         pred3=PRED3, pred4=PRED4))
+                                                         pred3=PRED3, pred4=PRED4, pred5=PRED5))      # [fia5] pred5
     for g in gates:
         print("%s %s %s: %s" % ("GATE" if g["must"] else "REPORT", g["name"], "PASS" if g["passed"] else "FAIL",
                                 g["detail"][:500]))
@@ -3352,6 +3701,9 @@ def run_ncu(a, geom, bias_free, deadline, gates, report, fp_ok=False, v1_ok=Fals
             arms.append("V1")
         if fv_ok and rpr <= FV_ROWS:                                         # [fia4]
             arms += [x for x in FV_ARMS if x in a.arms]
+            best = report["cells"][tag].get("fv_best")                       # [fia5] the cell's best swept arm
+            if best and best not in arms:
+                arms.append(best)
         child = os.path.join(a.out, "ncu_%s" % tag)
         rep = os.path.join(a.out, "ncu_%s_rep" % tag)
         t1 = time.time()
@@ -3421,7 +3773,7 @@ def mode_ncu_cell(a):
     bf = batch_of(case, "full")
     jit_fp = jit_args_fp(geom["D"]) if any(x in a.arms for x in FP_ARMS) else None      # [fia3] built by the parent
     vmod = import_v1(a.verify_step)[0] if "V1" in a.arms else None
-    fvmod = import_fv(a.fv_kernel)[0] if any(x in a.arms for x in FV_ARMS) else None   # [fia4] (the Triton cache)
+    fvmod = import_fv(a.fv_kernel)[0] if any(is_fv_arm(x) for x in a.arms) else None   # [fia4] (the Triton cache)
     arms = build_arms(fi, a, geom, case, p3, skv, jit, a.arms, "cuda", jit_fp=jit_fp, vmod=vmod, fvmod=fvmod)
     if "V1" in arms and not v1_precondition(fp_union(bf, rpr, case["S"]), bf, rpr)[0]:
         del arms["V1"]
