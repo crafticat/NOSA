@@ -158,7 +158,10 @@ CEILING_FORMULA = (
 # 128_127_s65280 (p0k64c128). The P0-* lines of these cells read PRED_P0: its per-cell bands have no key for them
 # (UNREGISTERED); its global bands (ovh_band, recap_ms, recap_gc_share) were stamped for p0all, so the scorer reads
 # them as REPORT for the sweep cells.
-REGISTERED_SWEEP_UTC = "TBD"
+# Lead registration: only the deciding keys are registered (gemm_slope, joint_steps, vs_cached_floor, vs_own_floor);
+# every other key stays "TBD" (UNREGISTERED) on purpose. Basis: p0all (GEMM 22 ms at B 216, compute-bound slope about
+# 0.08 ms per row above about 250 rows; weight-read floor about 10.6 ms), vr1 (VRC GEMM 69.5 ms at 864 rows).
+REGISTERED_SWEEP_UTC = "2026-10-27T21:10:08Z"
 _SWEEP_KEYS = ("63_64", "63_128", "128_64", "63_127_s65280", "128_127_s65280")
 PRED_SWEEP = {
     "stage_ms": {
@@ -180,8 +183,8 @@ PRED_SWEEP = {
     "gemm_xr_ms": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
                    "128_127_s65280": "TBD"},
     #   SW-GEMM-XR: the same on R x B rows (R = --sel-rows, 4), ms per step
-    "gemm_slope": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
-                   "128_127_s65280": "TBD"},
+    "gemm_slope": {"63_64": (0.02, 0.09), "63_128": (0.04, 0.10), "128_64": (0.02, 0.09),
+                   "63_127_s65280": (0.04, 0.10), "128_127_s65280": (0.04, 0.10)},
     #   SW-GEMM-SLOPE: ms per row, the least-squares slope over the probe points (B, 2B, 3B, 4B rows)
     "sel_extra_ms": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
                      "128_127_s65280": "TBD"},
@@ -195,17 +198,17 @@ PRED_SWEEP = {
     "union_fetch_ms": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
                        "128_127_s65280": "TBD"},
     #   SW-UFETCH: the union-extras fetch (all extras from the host), ms per joint pass
-    "joint_steps": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
-                    "128_127_s65280": "TBD"},
+    "joint_steps": {"63_64": (1.3, 2.5), "63_128": (1.6, 3.2), "128_64": (1.3, 2.8),
+                    "63_127_s65280": (1.6, 3.5), "128_127_s65280": (1.8, 3.8)},
     #   SW-JOINT: the joint pass (measured fetch) / the H steady median
-    "vs_cached_floor": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
-                        "128_127_s65280": "TBD"},
+    "vs_cached_floor": {"63_64": (0.2, 0.95), "63_128": (0.3, 0.98), "128_64": (0.2, 0.9),
+                        "63_127_s65280": (0.05, 0.6), "128_127_s65280": (0.05, 0.6)},
     #   SW-CACHED-FLOOR: committed tok/s / 3,387.7 at acceptance 0.995, draft floor, measured fetch
     "vs_cached_dr1": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
                       "128_127_s65280": "TBD"},
     #   SW-CACHED-DR1: the same with dr1's share of the gather for the pool (dr1_for_pool)
-    "vs_own_floor": {"63_64": "TBD", "63_128": "TBD", "128_64": "TBD", "63_127_s65280": "TBD",
-                     "128_127_s65280": "TBD"},
+    "vs_own_floor": {"63_64": (1.0, 2.2), "63_128": (0.9, 1.6), "128_64": (0.6, 1.05),
+                     "63_127_s65280": (0.8, 1.5), "128_127_s65280": (0.6, 1.1)},
     #   SW-OWN-FLOOR: committed tok/s / the cell's own H steady tok/s at acceptance 0.995, draft floor, measured fetch
 }
 # The verify model (not predictions; the basis of each number is in the comment).

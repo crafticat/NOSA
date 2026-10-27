@@ -596,7 +596,9 @@ def test_PS9_pred_sweep_and_verdicts():
     v = PC.verdicts_sweep(63, 64, _sweep_res(), utc="TBD")
     assert [n for n, _, _ in v] == names and {x for _, x, _ in v} == {"UNREGISTERED"}
     assert {x for _, x, _ in PC.verdicts_sweep(63, 64, {}, utc="TBD")} == {"NOT_RUN"}
-    stamped = dict(PC.PRED_SWEEP, stage_ms={"63_64": {"fetch": (3, 5)}}, gemm_x1_ms={"63_64": (10, 11)},
+    tbd = {n: {k: ({g: "TBD" for g in groups} if n == "stage_ms" else "TBD") for k in keys}   # builder's state, not
+           for n in PC.PRED_SWEEP}                                                            # the lead's live stamp
+    stamped = dict(tbd, stage_ms={"63_64": {"fetch": (3, 5)}}, gemm_x1_ms={"63_64": (10, 11)},
                    union_extras={"63_64": (7, 9)}, joint_steps={"63_64": (1.0, 1.4)},
                    vs_cached_dr1={"63_64": (0.65, 0.75), "128_64": (0.65, 0.75)}, vs_own_floor={"63_64": (1.1, 1.3)})
     v = {n: x for n, x, _ in PC.verdicts_sweep(63, 64, _sweep_res(), pred=stamped, utc="2026-10-28T08:00:00Z")}
