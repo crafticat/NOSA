@@ -422,7 +422,7 @@ class _FeederTp:
     made = []                                                       # weak references: the test never keeps one alive
 
     def __init__(self, ext, host_k, host_v, slots_k, slots_v, bs, D, threads=1, host_wait=None, background=False,
-                 xpool=None, warm_up=True, close_raises=False):
+                 xpool=None, warm_up=True, worker="python", close_raises=False):
         import queue
         import threading
         self.slots_k, self.slots_v, self.close_raises = slots_k, slots_v, close_raises
