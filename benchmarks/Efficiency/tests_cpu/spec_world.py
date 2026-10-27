@@ -155,10 +155,11 @@ def residency_errors(rs) -> list:
     return errs
 
 
-def host_rows_errors(rs, S: int, ref_host, n_ref: int) -> list:
-    """(A) the blocks completed during the decode (inside the reference's n_ref steps) equal the reference's host rows;
-    (B) every host row from max(S, 64 x (q // 64)) on is still NaN, q = the request's twin position (its committed
-    length): no tentative or draft row reached the host rows."""
+def host_rows_errors(rs, S: int, ref_host, n_ref: int, compare_complete: bool = True) -> list:
+    """(A, compare_complete) the blocks completed during the decode (inside the reference's n_ref steps) equal the
+    reference's host rows (EXACT runs only: FAST rows are not the shipped bits); (B) every host row from
+    max(S, 64 x (q // 64)) on is still NaN, q = the request's twin position (its committed length): no tentative or
+    draft row reached the host rows."""
     errs = []
     for l, lay in enumerate(rs.cache.layers):
         e = lay.cache_engine
@@ -168,8 +169,8 @@ def host_rows_errors(rs, S: int, ref_host, n_ref: int) -> list:
             done = q // BS
             a0 = (S // BS) * BS
             z = min(done, (S + n_ref) // BS) * BS
-            if z > a0 and not (bits_equal(e._k_cpu[b, a0:z], rk[b, a0:z]) and bits_equal(e._v_cpu[b, a0:z],
-                                                                                           rv[b, a0:z])):
+            if compare_complete and z > a0 and not (bits_equal(e._k_cpu[b, a0:z], rk[b, a0:z])
+                                                    and bits_equal(e._v_cpu[b, a0:z], rv[b, a0:z])):
                 errs.append(("complete", l, b, a0, z))
             n0 = max(S, done * BS)
             if not (bool(torch.isnan(e._k_cpu[b, n0:]).all()) and bool(torch.isnan(e._v_cpu[b, n0:]).all())):
@@ -204,10 +205,26 @@ def corrupt_before_edge(K: int):
     return f
 
 
+def inject(ref_tok, rounds, kinds=("draft", "draft_row")):
+    """In the rounds given, the drafts ARE the shipped tokens: the draft token for committed column c (runner.next_col,
+    set by the runner for each filter call) becomes ref_tok[b, c + 1] (ref_tok column 0 = the first input). Those
+    drafts are all accepted (EXACT runs), so the rounds that verify them are full accepts by construction."""
+    n = ref_tok.shape[1] - 1
+
+    def f(runner, kind, j, tok):
+        if kind not in kinds or runner.round not in rounds or runner.next_col is None:
+            return tok
+        col = runner.next_col.to("cpu") + 1
+        want = ref_tok[torch.arange(ref_tok.shape[0]), col.clamp(max=n)]
+        return torch.where((col <= n).to(tok.device), want.to(tok.device), tok)
+    return f
+
+
 def all_kinds(*fs):
     def f(runner, kind, j, tok):
         for g in fs:
-            tok = g(runner, kind, j, tok)
+            if g is not None:
+                tok = g(runner, kind, j, tok)
         return tok
     return f
 
@@ -229,16 +246,22 @@ class Recorder:
 # the driver of the claims
 # ---------------------------------------------------------------------------
 def run_vs_shipped(B: int, level="L3", mode="exact", gemm="rowgroup", K=K0, S=S0, N=N0, seed=0, draft_filter=None,
-                   neg=None, rb_neg=None, check_rounds=True, max_rounds=0, body="torch", redirect=True):
+                   neg=None, rb_neg=None, check_rounds=True, max_rounds=0, body="torch", redirect=True,
+                   oracle_rounds=(-1, 0)):
     """THE SHIPPED GREEDY DECODE against the SPECULATIVE RUN on a second cache from the same prefill. After every round
-    (check_rounds): residency_errors and host_rows_errors (collected, not raised). Returns the evidence: per request the
-    first unequal committed token / logits row, the round records, the facts (preconditions) and the runner."""
+    (check_rounds): residency_errors and host_rows_errors (collected, not raised). oracle_rounds: in these rounds the
+    drafts are the shipped tokens (inject; the L4 prelude is round -1), then draft_filter acts: the first rounds are
+    full accepts by construction (precondition of the full-accept path), later rounds use the natural drafts. Returns the
+    evidence: per request the first unequal committed token / logits row, the round records, the facts
+    (preconditions) and the runner."""
     W.STATS.clear()
     hz = horizon_for(N, K)
     model, A, Bc = two_caches(B, S, hz + 64, seed)
     g = torch.Generator().manual_seed(seed + 2)
     tok0 = torch.randint(0, V, (B,), generator=g)
     ref_tok, ref_lg, ref_host = shipped_greedy(model, A, B, S, N, tok0)
+    if oracle_rounds:
+        draft_filter = all_kinds(inject(ref_tok, tuple(oracle_rounds)), draft_filter)
     ev = dict(resid=[], host=[], round_pos=[])
 
     def after_round(runner):
@@ -247,7 +270,7 @@ def run_vs_shipped(B: int, level="L3", mode="exact", gemm="rowgroup", K=K0, S=S0
             r = residency_errors(runner.rs)
             if r:
                 ev["resid"].append((runner.round, r[:5]))
-            h = host_rows_errors(runner.rs, S, ref_host, N)
+            h = host_rows_errors(runner.rs, S, ref_host, N, compare_complete=(mode == "exact"))
             if h:
                 ev["host"].append((runner.round, h[:5]))
     W.TAG[0] = "spec"

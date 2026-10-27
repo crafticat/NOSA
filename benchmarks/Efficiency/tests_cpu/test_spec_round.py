@@ -90,9 +90,14 @@ S_EDGE = 4925                          # S % 64 = 61: after the warm step the fi
 #                                        block edge (position 4927), so a draft (L3) or a joint-pass row (L4) fills it
 
 
-@functools.lru_cache(maxsize=None)
 def _ev(level, B, neg=None, rb_neg=None, filt="periodic", mode="exact", S=SW.S0):
-    """One run_vs_shipped per parameter set (shared by the claims of this module)."""
+    """One run_vs_shipped per parameter set (shared by the claims of this module; the key is normalised, so a keyword
+    and a default give the same run)."""
+    return _ev_cached(level, B, neg, rb_neg, filt, mode, S)
+
+
+@functools.lru_cache(maxsize=None)
+def _ev_cached(level, B, neg, rb_neg, filt, mode, S):
     f = dict(periodic=FILTER, edge=SW.all_kinds(SW.corrupt_before_edge(K), FILTER),
              row=SW.corrupt(1, 0, kinds=("draft_row",)), none=None)[filt]
     gemm = "rowgroup" if mode == "exact" else "natural"
@@ -279,7 +284,9 @@ W0 = 12                                # test_rollback's warm-up: the first grou
 def _truncate_run(S_list, neg=None):
     """World x: begin, 3 steps (the steps that x truncates read WRONG tokens), truncate(keep1), 2 more steps (wrong
     tokens: they are undone), commit(nfin); world r: the reference that runs only the kept steps (kept = 2 for a
-    request with keep1 = 3, else keep1). Returns the evidence."""
+    request with keep1 = 3, else keep1) over 5 masked steps (steps 3 and 4 have no active request: they advance the LRU
+    clock by topk each, as x's 5 tentative steps do; commit keeps the clock). The host position mirror goes through
+    truncate / commit (their host copies). Returns the evidence."""
     (mx, x), (mr, r) = RW.build(S_list), RW.build(S_list)
     assert RW.diff(RW.state(x), RW.state(r)) == [], "precondition: two worlds of one seed differ before step 0"
     rb = RR.Rollback(x, 6, capacity=RW.CAP, neg=neg)
@@ -295,12 +302,13 @@ def _truncate_run(S_list, neg=None):
     rb.begin()
     lx = [dx.step(u, wrong=(u >= kept)) for u in range(3)]
     facts = RW.journal_facts(rb, keep1)                              # the steps that truncate undoes (u >= keep1)
-    rb.truncate(keep1)
+    rb.truncate(keep1, keep1.clone())
     for u in range(3, 5):
         dx.step(u, wrong=torch.ones(B, dtype=torch.bool))
-    rb.commit(torch.where(keep1 == 3, torch.full_like(keep1, 2), torch.full_like(keep1, 3)))
+    nfin = torch.where(keep1 == 3, torch.full_like(keep1, 2), torch.full_like(keep1, 3))
+    rb.commit(nfin, nfin.clone())
     dx.k += kept
-    lr = dr.masked(kept)
+    lr = dr.masked(kept, steps=5)
     ev = dict(bad_logits=RW.kept_logits_equal(lx, lr, kept), diff=RW.diff(RW.state(x), RW.state(r), skip=RW.SCRATCH),
               facts=facts, fills=RW.fills(S_list, dr.k - kept, kept), stats=rb.stats(), truncations=rb.truncations)
     if not ev["diff"]:
@@ -318,13 +326,14 @@ def test_truncate_then_commit_equals_reference(S_list):
     ev = _truncate_run(S_list)
     assert ev["bad_logits"] == [] and ev["diff"] == [], (ev["bad_logits"], ev["diff"][:5])
     assert all(ev["after"]) and ev["diff_after"] == [], ev["diff_after"][:5]
-    assert ev["facts"]["lost"] > 0 and ev["facts"]["swap"] + ev["facts"]["move_out"] + ev["facts"]["move_in"] > 0, \
-        ev["facts"]                                                  # preconditions: truncated steps moved slots
+    # preconditions: truncated steps moved slots by a SWAP or a MOVE_OUT (the inverse of MOVE_IN is no move, so a
+    # second undo of a MOVE_IN changes nothing)
+    assert ev["facts"]["lost"] > 0 and ev["facts"]["swap"] + ev["facts"]["move_out"] > 0, ev["facts"]
     if len(S_list) > 1:
         assert any(kept for _, _, kept in ev["fills"]) and any(not kept for _, _, kept in ev["fills"]), ev["fills"]
     assert sum(ev["stats"]["overflow"]) == 0 and ev["truncations"] == 1
     p = _truncate_run(S_list, neg="no_truncate_mark")                # PLANT: commit undoes the truncated steps again
-    assert p["facts"]["swap"] + p["facts"]["move_out"] + p["facts"]["move_in"] > 0, p["facts"]   # precondition
+    assert p["facts"]["swap"] + p["facts"]["move_out"] > 0, p["facts"]                            # precondition
     assert p["diff"] != [] or p["bad_logits"] != [], "no_truncate_mark was not caught"           # CAUGHT
 
 

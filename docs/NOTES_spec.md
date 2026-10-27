@@ -149,10 +149,10 @@ their own trees as ROOT).
 | `test_prefetch_wiring`, `test_no_host_sync_in_round[L3, L4]` | the L5 hook is called per draft step / round and is off by default; only run() and the redirect flag read host values, the rollback none | the trap must see run()'s sync |
 | `test_cell_arguments_and_verdicts`, `test_step_script_sp3` | arguments, refusals (`--spec 0`, `--spec-prefetch on`), pure parts, TBD verdicts = REPORT, gates; DRYRUN of the cells | one ULP, one token past the count (ignored) |
 
-THE FILTERS (spec_world.corrupt): the token proof holds for ANY draft tokens, so the tests corrupt chosen drafts to
-force rejects at known places; the uncorrupted rounds keep the natural drafts (full accepts possible). If a
-precondition fails (for example no full accept in L4-B1), the data do not exercise the path: tell me and I change the
-data, not the claim.
+THE FILTERS (spec_world.inject / corrupt): the token proof holds for ANY draft tokens. In rounds -1 (the L4 prelude)
+and 0 the drafts ARE the shipped tokens (full accepts by construction); then chosen drafts are corrupted to force
+rejects at known places; the other rounds keep the natural drafts. If a precondition fails, the data do not exercise
+the path: tell me and I change the data, not the claim.
 
 ## 6. The GPU cells (REGISTERED block TBD for the lead)
 
@@ -221,10 +221,27 @@ INPUTS FOR THE BANDS (MODEL / INFERRED, not measured):
 - The cell runs ceil((steps - 1) / K) rounds: slow requests commit fewer than `steps` tokens; the token check covers
   each request's committed prefix (count_min is reported).
 
-## 8. Shell commands outside cat / grep / head / tail / ls / sort / cut / diff / git / wc (this task)
+## 8. Review (a read-only reviewer agent on 2140e1d) and the fixes
+
+| finding | fix |
+|---|---|
+| BUG: test_truncate compared pos_host and the LRU clock of a 5-step world with a 3-step reference (the diff could never be empty; the plant tested nothing) | truncate / commit get their host copies; the reference runs 5 masked steps (the last two with no active request: the clock moves by topk each, as in x); the plant's precondition needs a SWAP or MOVE_OUT (the inverse of MOVE_IN is no move) |
+| LIKELY BUG: the FAST test compared completed host blocks with the shipped run (FAST is not bitwise) | host_rows_errors(compare_complete=False) for FAST: only the "still NaN" part |
+| BUG (latent, --pool 0): without a pool the slot journal is written only by the gather hook; a draft with no gather left the journal of an older step, and its undo wrote old bytes | `_journal_engine` starts the slot journal empty when there is no pool |
+| RISK: the full-accept preconditions depended on natural drafts in the first rounds | run_vs_shipped(oracle_rounds=(-1, 0)): in those rounds the drafts ARE the shipped tokens (spec_world.inject; the runner exposes `next_col`, the committed column of each draft token, to the test filters) |
+| RISK: the runner read twin.pos before the rollback's release wait (an async executor only) | `_sync_release()` before every read of twin.pos |
+| NIT: the joint pass's default GEMM was F.linear, not the ragged step's | the rollback's original linear (the step's own GEMM) |
+| NIT: KVMeter counts the stale host read of a staged block | documented (it is a real PCIe read) |
+| NIT: lru_cache keys of `_ev` | normalised |
+| NIT: truncate without host copy + commit with host copy gives a wrong mirror | refused (RollbackError) |
+
+## 9. Shell commands outside cat / grep / head / tail / ls / sort / cut / diff / git / wc (this task)
 
 - `git worktree add` (as instructed), `git merge --no-commit`, `git add`, `git commit -F` (messages written with the
   Write tool): git.
-- Shell built-ins only otherwise (`cd`, `echo`, `;`, `&&`, `|`). No interpreter, no sed, no awk, no heredoc, no
-  `cat >>`, no tr / paste / uniq / xargs, no hashing, no `find`, no srun / sbatch / pytest. Files written with the
-  Write and Edit tools.
+- `sleep` in the background twice (a timer while the reviewer agent ran).
+- Shell built-ins only otherwise (`cd`, a variable assignment, `;`, `&&`, `|`). No interpreter, no sed, no awk, no
+  heredoc, no `cat >>`, no tr / paste / uniq / xargs, no hashing, no `find`, no srun / sbatch / pytest. Files written
+  with the Write and Edit tools.
+- The reviewer agent reported one breach of its own: `sed -n 100,130p test_verify_rows.py | head -0` once (read-only,
+  output discarded).

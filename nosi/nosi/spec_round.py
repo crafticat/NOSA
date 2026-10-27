@@ -76,7 +76,6 @@ from __future__ import annotations
 import time
 
 import torch
-import torch.nn.functional as F
 
 from . import ragged_engine as RE
 from . import ragged_rollback as RR
@@ -229,8 +228,10 @@ class KVMeter:
     """Wraps the engine's two host gathers (rs.ops.kernels gather_k / gather_v_bias). Attach it BEFORE the rollback,
     so the rollback's own calls of the original gathers are counted too. While `on`: the (head, request, block) loads
     from the HOST rows (a gather whose source is an engine's _k_cpu / _v_cpu; the staging redirect reads GPU staging and
-    is not counted) are summed on the device (`blocks`, the K gathers). While `timing` (and a clock is set): a span of
-    clock events around each host gather, K and V (`spans`)."""
+    is not counted) are summed on the device (`blocks`, the K gathers). This includes the host read of a block that a
+    step of the same group filled (its host rows are stale until the commit; the redirect then overwrites the slot from
+    the staging block): a real PCIe read, so it is counted. While `timing` (and a clock is set): a span of clock events
+    around each host gather, K and V (`spans`)."""
 
     def __init__(self, rs, clock=None):
         self.rs = rs
@@ -355,7 +356,9 @@ class SpecRunner:
         if ops.level == "L4":
             from . import verify_rows as VR
             self.VR = VR
-            base = ops.linear if ops.linear is not None else F.linear
+            # the joint pass's GEMM: the given one, else the ragged step's own (gemm natural: F.linear; exact: the
+            # batch-invariant linear), so a rowgroup joint pass has the bits of the serial step it replaces
+            base = ops.linear if ops.linear is not None else self.rb._orig["linear"]
             vops = VR.VerifyOps(K=K, mode=ops.mode, gemm=ops.gemm, linear=self._wait_linear(base), extra=ops.extra,
                                 attn=ops.attn, draft_last=(ops.mode == "fast"))
             self.vs = VR.attach(model, rs, vops)
@@ -378,6 +381,7 @@ class SpecRunner:
         self.cap = 0
         self.out = self.fmax = self.fsum = self.lg_out = None
         self.round = -1
+        self.next_col = None
         self.prelude_ms = None
         self.prelude_events = None
         self.wall_s = None
@@ -410,9 +414,17 @@ class SpecRunner:
         self.rb.detach()
         self.meter.detach()
 
-    def _filter(self, kind: str, j: int, tok):
+    def _filter(self, kind: str, j: int, tok, next_col=None):
+        """Tests only (ops.draft_filter). next_col (B,): the committed column that this draft token would take if the
+        verify accepts it (filters can read runner.next_col; None outside a filter call)."""
         f = self.ops.draft_filter
-        return tok if f is None else f(self, kind, j, tok)
+        if f is None:
+            return tok
+        self.next_col = next_col
+        try:
+            return f(self, kind, j, tok)
+        finally:
+            self.next_col = None
 
     def _edge_before(self, n: int) -> bool:
         """HOST: some request fills a block in the first n tentative positions of the group (from the position mirror
@@ -422,8 +434,15 @@ class SpecRunner:
         p = self.pos_host.view(-1, 1) + torch.arange(n, dtype=torch.int64).view(1, -1)
         return bool(((p % RE.BLOCK) == RE.BLOCK - 1).any())
 
+    def _sync_release(self) -> None:
+        """The rollback's release wait BEFORE this runner reads twin.pos (a commit / truncate on another executor may
+        still move it back; the default executor is the same stream, so the wait is satisfied already)."""
+        if self.rb._need_wait:
+            self.rb._wait_release_all()
+
     def _step(self, x):
         """One ragged step of every request: x (B,) tokens at each request's twin position. Returns (B, V) logits."""
+        self._sync_release()
         self.ids1.copy_(x.reshape(self.B, 1))
         self.pos1.copy_(self.rs.st.twins[0].pos.view(self.B, 1))
         return RE.decode_step(self.model, self.rs, self.ids1, self.pos1)[:, -1]
@@ -484,7 +503,7 @@ class SpecRunner:
         self.rb.begin()
         x = self.t
         for j in range(K):
-            d = self._filter("draft", j, self._draft_step(x, j))
+            d = self._filter("draft", j, self._draft_step(x, j), next_col=self.count + j)
             self.D[:, j].copy_(d)
             x = self.D[:, j]
         self.rb.reject_all()
@@ -540,6 +559,7 @@ class SpecRunner:
         self._event(ev)
         D = self.D
         ids = torch.cat((self.t.view(B, 1), D.clamp(min=0)), dim=1)     # rows 0 .. K - 1 verify, row K the draft row
+        self._sync_release()
         pos = (self.rs.st.twins[0].pos.view(B, 1) + self.arR.view(1, R)).to(torch.int32)
         self.rb.begin()                                                  # 1. the joint pass
         exact = self.ops.mode == "exact"
@@ -558,7 +578,7 @@ class SpecRunner:
         G = lg[:, :K].argmax(dim=-1)
         FM = lg[:, :K].amax(dim=-1)
         FS = lg[:, :K].sum(dim=-1, dtype=torch.float64)
-        e0 = self._filter("draft_row", 0, lg[:, K].argmax(dim=-1))
+        e0 = self._filter("draft_row", 0, lg[:, K].argmax(dim=-1), next_col=self.count + K)
         n, v, m, full = self._accept(G, D)                               # 2. accept
         Gc = self._plant_commit(G, D, n, m)
         if self.ops.neg == "keep_rejected":
@@ -576,7 +596,7 @@ class SpecRunner:
         x = torch.where(full, e0, t_new)
         shift = full.to(torch.int64).view(B, 1)
         for j in range(K - 1):
-            y = self._filter("draft", j, self._draft_step(x, R + j))
+            y = self._filter("draft", j, self._draft_step(x, R + j), next_col=self.count + j + shift.view(B))
             Dn.scatter_(1, shift + j, y.view(B, 1))
             x = y
         self._event(ev)

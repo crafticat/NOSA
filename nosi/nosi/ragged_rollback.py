@@ -293,6 +293,7 @@ class Rollback:
         self._ures = [0] * self.L                       # SPLIT JOURNAL: the steps whose engine part is journaled
         self._undone = torch.zeros((self.K, B), dtype=torch.bool, device=dev)    # TRUNCATE: undone (step, request)
         self._undone_host = torch.zeros((self.K, B), dtype=torch.bool)
+        self._mirror_ok = True                          # False after a truncate without n_keep_host (host mirror)
         self.kbig = torch.tensor(self.K, dtype=i64, device=dev)                  # "no staged fill" (T["u"])
         self._cur = [0] * self.L
         self._stamp0 = [0] * self.L
@@ -402,6 +403,7 @@ class Rollback:
         self._ures = [0] * self.L
         self._undone.zero_()
         self._undone_host.zero_()
+        self._mirror_ok = True
         self._act_host = []
         self._pos_host0 = self.rs.st.pos_host.clone()
         for l in range(self.L):
@@ -422,6 +424,9 @@ class Rollback:
         if self._ures != self._u:
             raise RollbackError("a step changed the engine without its engine journal (layers: twin %s, engine %s): "
                                 "a joint pass without the rollback's hooks?" % (self._u, self._ures))
+        if n_acc_host is not None and not self._mirror_ok:
+            raise RollbackError("commit with n_acc_host after a truncate without n_keep_host: the host mirror would "
+                                "count the truncated steps as kept")
         na = None                                                     # every check before any work (no partial commit)
         if n_acc_host is not None:
             na = torch.as_tensor(n_acc_host, dtype=torch.int64).clamp(0, n_run)
@@ -639,6 +644,10 @@ class Rollback:
         if self.pool:
             for n in POOL4:
                 j[n].copy_(getattr(eng, n))
+        else:                                    # no pool: only the gather hook writes the slot journal, and a step
+            j["ent"].fill_(-1)                   # may run no gather (a resident-only draft): start it empty, so the
+            j["rows"].copy_(self._slot_rows(j["ent"][:self.N]))   # undo never restores an older step's slot bytes
+            j["unsaved"].zero_()
         self._cur[l] = u
 
     # -------------------------------------------------------------- the joint pass, FAST mode (verify_rows.py)
@@ -689,7 +698,7 @@ class Rollback:
         """Inside an open group: request b with n_keep[b] < the steps run loses its steps n_keep[b] .. n_run - 1 now;
         the group stays open (module docstring, PHASE 2 ADDITIONS). n_keep: a (B,) integer tensor on the engine's
         device (no host read). n_keep_host: the same values on the CPU, or None (then RaggedState.pos_host is not
-        updated; a later commit's mirror then counts the truncated steps as kept)."""
+        updated, and a later commit WITH n_acc_host is refused: its mirror would count the truncated steps as kept)."""
         if not self.tentative:
             raise RollbackError("truncate outside a group: begin first")
         n_run = self._u[0]
@@ -715,6 +724,8 @@ class Rollback:
         self._need_wait = True
         for u in range(n_run):
             self._undone[u] |= rejs[u]
+        if nh is None:
+            self._mirror_ok = False
         if nh is not None:
             for u in range(n_run):
                 self._undone_host[u] |= nh <= u
