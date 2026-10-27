@@ -54,6 +54,13 @@ B 219, basef 2190876). --mbase selects the registered mbase predictions (verdict
   MB-F     at C 63 with the R2 arm: R2 (fused) / SH steady inside (0.95, 1.00);
   MB-R2C   REPORT (a MODEL, not a measurement): SH steady x MBASE_FUSED_FACTOR, the fused step this C would have.
 The cell also reports the device memory in use (cudaMemGetInfo) at the end of the SH arm, beside the allocator peak.
+
+--graph-step (Task 1.6 rung 1, default OFF; NOTES_graphstep.md): the SH arm runs run_graph_step: the same prefill and
+greedy loop, the decode step driven by nosi/nosi/graph_step.py (2 eager steps, then one CUDA graph per length bucket,
+every capture before the timed loop; no re-warm). Its steady statistic is the replays; its effective tok/s includes the
+capture time. MUST gates GS-PTR (no state pointer moves across the replays) and GS-CAP (every planned graph captured
+before the loop). P2 (the shipped re-warms) is replaced by a GS REPORT line. With the flag off, the executed code and
+the summary are the shipped path's.
 """
 from __future__ import annotations
 
@@ -112,6 +119,9 @@ def parse_args(argv):
     ap.add_argument("--pool", type=int, default=0,
                     help="the victim pool P (C = 63 + P); must equal NOSI_POOL_BLOCKS; P > 0 needs --arms SH")
     ap.add_argument("--mbase", action="store_true", help="the registered mbase predictions (verdicts_mbase)")
+    ap.add_argument("--graph-step", action="store_true",
+                    help="Task 1.6 (default off): the SH arm runs run_graph_step (nosi/nosi/graph_step.py, the whole "
+                         "decode step in one CUDA graph per length bucket, every capture before the timed loop)")
     a = ap.parse_args(argv)
     a.arms = [x for x in a.arms.split(",") if x]
     if a.arms not in (["SH", "R2"], ["SH"]):
@@ -433,6 +443,64 @@ def run_shipped(model, ids, steps: int, clock):
                 device_used_end_GB=round((tot - fr) / 1e9, 3))
 
 
+def run_graph_step(model, ids, steps: int, clock, warmup: int = 2):
+    """--graph-step (Task 1.6): run_shipped's prefill and greedy loop; the decode step is nosi.graph_step: `warmup`
+    eager steps, then every bucket's graph is captured BEFORE step `warmup` (timed apart: extra_ms), then replays.
+    The period of step warmup - 1 ends at an event recorded before the captures. excluded = the eager steps and the
+    first replay (the steady statistic is replays only, as the R2 arm's)."""
+    import torch
+    from nosi.cache_engine import InfLLMv2Cache
+    from nosi import graph_step as GSM
+    cfg = model.config
+    cache = InfLLMv2Cache(config=cfg, num_hidden_layers=cfg.num_hidden_layers, has_kv_bias=True)
+    for layer in cache.layers:
+        layer.cache_engine.max_gen_len = steps + 64
+    Bn = ids.shape[0]
+    clock.sync()
+    t0 = time.time()
+    logits, pos = model.batch_prefill(ids, cache)
+    clock.sync()
+    prefill_s = time.time() - t0
+    tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    del logits
+    pos = pos[:, -1:] + 1
+    cu = torch.arange(0, Bn + 1, dtype=torch.int, device="cuda")
+    inputs = torch.empty((Bn, steps + 1), dtype=torch.int64, device="cuda")
+    inputs[:, 0:1].copy_(tok)
+    gs = GSM.GraphStep(model, cache, cu, steps, warmup=warmup, pos_dtype=pos.dtype)
+    ev = [clock.event() for _ in range(steps + 1)]
+    ev_w = clock.event()
+    capture_ms, ptr0 = None, None
+    for t in range(steps):
+        if t == gs.warmup:
+            clock.record(ev_w)
+            clock.sync()
+            capture_ms = gs.capture_all()
+            ptr0 = gs.state_pointers()
+        clock.record(ev[t])
+        lg = gs.step(t, tok, pos)
+        tok = lg[:, -1, :].argmax(dim=-1, keepdim=True)
+        inputs[:, t + 1:t + 2].copy_(tok)
+        pos = pos + 1
+    clock.record(ev[steps])
+    clock.sync()
+    periods = [clock.elapsed(ev[t], ev[t + 1]) for t in range(steps)]
+    if capture_ms is not None:
+        periods[gs.warmup - 1] = clock.elapsed(ev[gs.warmup - 1], ev_w)
+    moved = None
+    if ptr0 is not None:
+        after = gs.state_pointers()
+        moved = sorted(k for k in set(ptr0) | set(after) if ptr0.get(k) != after.get(k))
+    rep = gs.report()
+    rep.update(capture_ms_total=(round(capture_ms, 1) if capture_ms is not None else None), pointers_changed=moved)
+    gs.export()
+    fr, tot = torch.cuda.mem_get_info()
+    del gs, cache
+    return dict(inputs=inputs, periods=periods, rewarms=[], prefill_s=round(prefill_s, 1),
+                device_used_end_GB=round((tot - fr) / 1e9, 3), excluded=list(range(min(warmup + 1, steps))),
+                extra_ms=([capture_ms] if capture_ms is not None else []), graph_step=rep)
+
+
 def run_r2(model, ids, inputs, steps: int, warmup: int, clock, mode: str = "built"):
     import torch
     from nosi import r2_capture as RC
@@ -541,15 +609,27 @@ def main(argv=None) -> int:
         sh_base = round(torch.cuda.memory_allocated() / 1e9, 3)
         log("arm SH (B %d, %d steps); host %s" % (a.batch, a.steps, mem["after_load"]))
         try:
-            out = run_shipped(model, ids, a.steps, clock)
+            if a.graph_step:
+                out = run_graph_step(model, ids, a.steps, clock, a.warmup)
+            else:
+                out = run_shipped(model, ids, a.steps, clock)
             pa, pr = gpu_peak()
-            rw = {t for t, _ in out["rewarms"]}
+            rw = {t for t, _ in out["rewarms"]} | set(out.get("excluded", ()))
             steady = period_stats(out["periods"], [t for t in range(a.steps) if t not in rw])
             sh = dict(rewarms=out["rewarms"], prefill_s=out["prefill_s"], steady=steady,
-                      rates=rates(a.batch, a.steps, out["periods"], steady), gpu_peak_alloc_GB=pa,
-                      gpu_peak_reserved_GB=pr, gpu_base_alloc_GB=sh_base,
+                      rates=rates(a.batch, a.steps, out["periods"] + out.get("extra_ms", []), steady),
+                      gpu_peak_alloc_GB=pa, gpu_peak_reserved_GB=pr, gpu_base_alloc_GB=sh_base,
                       device_used_end_GB=out["device_used_end_GB"],
                       rewarm_ms=[round(out["periods"][t], 1) for t, _ in out["rewarms"]])
+            if a.graph_step:
+                gsr = sh["graph_step"] = out["graph_step"]
+                gates.append(("GS-PTR", True, gsr["pointers_changed"] == [], "%s state pointers moved across the "
+                              "replays: %s" % (len(gsr["pointers_changed"] or []), (gsr["pointers_changed"] or [])[:10])))
+                gates.append(("GS-CAP", True, gsr["n_graphs"] == gsr["planned_graphs"] and
+                              gsr["replays"] == a.steps - a.warmup, "%d of %d planned graphs captured before the timed "
+                              "loop in %s ms; %d replays, %d eager steps" % (
+                                  gsr["n_graphs"], gsr["planned_graphs"], gsr["capture_ms_total"], gsr["replays"],
+                                  gsr["eager_steps"])))
             inputs = out["inputs"]
             del out
             gates.append(("SH-RUN", True, True, "%d steps, %d re-warms" % (a.steps, len(sh["rewarms"]))))
@@ -592,6 +672,9 @@ def main(argv=None) -> int:
             mem["after_R2"] = host_mem()
             free()
     preds = (verdicts_fused if a.r2 == "fused" else verdicts)(a.batch, sh, r2, agree, expected)
+    if a.graph_step:                                     # P2 counts the shipped re-warms; the graph step has none
+        preds = [p for p in preds if p[0] != "P2"] + [("GS", "REPORT", "graph step: %s" % (
+            {k: (sh or {}).get("graph_step", {}).get(k) for k in ("n_graphs", "capture_ms_sum", "replays")},))]
     C = C_BASE + a.pool
     if a.mbase:
         preds = preds + verdicts_mbase(C, a.batch, sh, r2)
@@ -605,6 +688,8 @@ def main(argv=None) -> int:
                 predictions=(PRED_FUSED if a.r2 == "fused" else PRED), r2=a.r2, gt=a.gt,
                 nosi_commit=os.environ.get("BASE_COMMIT", "unknown"), torch=torch.__version__,
                 gpu=torch.cuda.get_device_name(0), host_mem=mem)
+    if a.graph_step:                                     # flag off: the summary keeps its exact key set
+        meta["graph_step"] = True
     out = dict(meta=meta, SH=sh, R2=r2, agreement=agree, GT=gt or None,
                gates=[dict(name=g[0], must=g[1], passed=bool(g[2]), detail=g[3]) for g in gates],
                predictions=[dict(name=p[0], verdict=p[1], detail=p[2]) for p in preds])
