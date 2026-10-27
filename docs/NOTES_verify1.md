@@ -191,6 +191,40 @@ selection 8.5 ms, residency 14.8, attention 19.2, GEMMs 19.9, rest 2.4 = 64.8):
   before. This does not change a CPU claim (every compared path uses the same stand-in), but the stand-in is not the
   kernel's math.
 
+## 6b. FIX 1 (CPU run a at ee3f9ee: 40 passed, 3 skipped, 5 failed)
+
+- Record: `/mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/vr_ee3f9ee_a.txt`. Failed: `test_verify_equals_serial_shipped[B8]`
+  (group 1 row 0), `test_verify_equals_serial_ragged[B8]` (group 0 row 1), `test_every_verify_row_lists_block0`
+  (group 1 row 3), and `test_one_weight_pass` / `test_no_per_position_selection_loop` (B 4: every row's logits
+  bitwise equal, then the tables `_kv_bias_gpu` and `twin.total_cis` of both layers and `twin.ccis` of layer 1).
+- NOT undefined memory (hypothesis a): both drivers assert "the two worlds are bitwise equal before step 0", and that
+  check covers `twin.total_cis`, `twin.ccis` and `_kv_bias_gpu` (all fully defined: zeros, NaN poison or prefill).
+  No run raised it.
+- WHERE (from the tables): only the cis path differs. Keys (`ring`, `comp_k`), counters, K / V, maps and host rows are
+  equal. Layer 0's cis is a function of the token only, so its VALUE can differ only through an op that is not
+  row-invariant. Every failing test compares an E-row computation with a B-row one; every passing test at B 8
+  compares E rows with E rows (FAST against EXACT, union) or B rows with B rows (flag off).
+- ROOT CAUSE: the CPU stand-in of nosa_linear (`ragged_world.fake_nosa_linear`) computed `F.softplus` over the whole
+  contiguous (rows, 1, H) tensor. PyTorch's CPU elementwise loop (ATen `cpu/Loops.h`, `vectorized_loop`) runs the SIMD
+  (Sleef) exp / log1p on full chunks of 2 x the vector width and the scalar libm path on the rest, so an element's
+  bits depend on the tensor size. With AVX-512 (chunk 32 floats): B 1 = 2 against 8 elements, both scalar (pass);
+  B 4 = 8 (scalar) against 32 (SIMD); B 8 = 16 (scalar) against 64 (SIMD) (fail). With AVX2 (chunk 16) B 8 would
+  pass, so the run's host used AVX-512. The KERNEL computes cis in one program per (row, head)
+  (`nosa_linear.py:84-93`, grid `:110`): it has no such dependence. So the stand-in broke lesson L28 (a CPU twin must
+  model the kernel), not the joint pass. A 1-ULP change of one bias column among about 4,000 attended columns is
+  below float32 resolution, which is why the B 4 logits stayed equal while the tables did not. Task 1.3's
+  ragged-vs-solo test at B 8 (16 against 2 elements, both scalar under AVX-512) passed by this margin only.
+- The first differing element: I could not compute it (no interpreter on the login node). By the code it is an
+  element `twin.total_cis[b, p, h]` with p among the group's positions, where Sleef and libm softplus disagree. The
+  drivers now print the first differing index of every table and of the logits (`first_diff`).
+- FIX: `ragged_world.fake_nosa_linear` computes the cis row by row (`A * softplus` of one (1, H) row at a time), as
+  the kernel's per-row program. Rows of B 1 keep their former bits (2 elements were already scalar). No engine code,
+  no behaviour assertion and no tolerance changed. New test `test_cis_stand_in_is_row_invariant` (B-row slices of an
+  E-row call: same bits; negative control: the former batch-wide softplus, skipped when it is a no-op on the host).
+- Other stand-ins on the path, checked: rmsnorm runs per row; silu acts on a non-contiguous slice (its inner loop is
+  one row); rope, pooling, top-k and the residual adds are exact; stage 1, attention and the twin means run per entry
+  or with the same shapes in both worlds.
+
 ## 7. Shell commands outside cat / grep / head / tail / ls / sort / cut / diff / git / wc (this task)
 
 - `sed`: ONCE, read-only, by mistake, in a pipeline (`grep ... flash_api.cpp | sed -n '1,0p'`): it printed nothing and

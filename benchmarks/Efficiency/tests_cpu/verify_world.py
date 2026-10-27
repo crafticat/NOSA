@@ -137,22 +137,30 @@ def looped_select_rows(vs, layer, q, twin):
 TWIN_TABLES = ("pos", "n_comp", "n_ccis", "comp_k", "ring", "total_cis", "ccis")
 
 
+def first_diff(a, b):
+    """The index (a list) of the first element whose bits differ, in row-major order; None when equal."""
+    d = W.bits(a) != W.bits(b)
+    return d.nonzero()[0].tolist() if bool(d.any()) else None
+
+
 def engines_equal(ca, cb, twins=None):
     """Bitwise: every engine table (ragged_world.ENGINE_TABLES) of two caches, layer by layer, and the LRU stamp;
-    twins = (twins_a, twins_b): the twin tables too. Returns the list of differences (empty: equal). The per-step
-    scratch (_new_block_map_buf, _load_mask) is not compared: diff_offload writes every entry before a read."""
+    twins = (twins_a, twins_b): the twin tables too. Returns the list of differences (empty: equal), each (layer,
+    table, the first differing index). The per-step scratch (_new_block_map_buf, _load_mask) is not compared:
+    diff_offload writes every entry before a read."""
     bad = []
     for l in range(W.L):
         ea, eb = ca.layers[l].cache_engine, cb.layers[l].cache_engine
         for name in W.ENGINE_TABLES:
             if not torch.equal(W.bits(getattr(ea, name)), W.bits(getattr(eb, name))):
-                bad.append((l, name))
+                bad.append((l, name, first_diff(getattr(ea, name), getattr(eb, name))))
         if ea._pool_stamp_base != eb._pool_stamp_base:
-            bad.append((l, "_pool_stamp_base"))
+            bad.append((l, "_pool_stamp_base", (ea._pool_stamp_base, eb._pool_stamp_base)))
         if twins is not None:
             for name in TWIN_TABLES:
                 if not torch.equal(W.bits(getattr(twins[0][l], name)), W.bits(getattr(twins[1][l], name))):
-                    bad.append((l, "twin." + name))
+                    bad.append((l, "twin." + name, first_diff(getattr(twins[0][l], name),
+                                                              getattr(twins[1][l], name))))
     return bad
 
 
@@ -166,7 +174,8 @@ def _compare_rows(grp, la_rows, lb, compare, tol, ev, skip=None):
         assert bool(torch.isfinite(la).all()), "group %d row %d: the reference logits are not finite" % (grp, r)
         if compare == "bits":
             assert torch.equal(W.bits(la), W.bits(got)), \
-                "group %d row %d: the joint logits differ from the serial step" % (grp, r)
+                "group %d row %d: the joint logits differ from the serial step (first at [request, column] %s)" % (
+                    grp, r, first_diff(la, got))
             continue
         for b in range(la.shape[0]):
             if skip is not None and (r, b) in skip:

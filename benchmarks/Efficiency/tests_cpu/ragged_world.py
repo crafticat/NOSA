@@ -209,11 +209,18 @@ def fake_rope(pos, q, k, head_dim, cache, is_neox):
 
 
 def fake_nosa_linear(qkv, delta_weight, A, q_size, kv_size, kv_heads):
-    """nosa_linear (Triton, one program per row): the q / k / v split and cis = A * softplus(v @ delta^T), row-wise."""
+    """nosa_linear (Triton, ONE PROGRAM PER (row, head): nosa_linear.py:84-93, grid :110): the q / k / v split and
+    cis = A * softplus(v @ delta^T), ROW BY ROW. A softplus over the whole batch tensor is NOT row-invariant on the
+    CPU: torch's elementwise loop (ATen cpu/Loops.h vectorized_loop) runs the SIMD exp / log1p on full chunks of
+    2 x the vector width and the scalar libm path on the rest, so a row's bits depended on the row count (CPU run
+    vr_ee3f9ee_a: B 4 and B 8 joint passes of 4 B rows against the serial step of B rows; Task 1.4 FIX 1)."""
     q = qkv[..., :q_size].contiguous()
     k = qkv[..., q_size:q_size + kv_size].contiguous()
     v = qkv[..., q_size + kv_size:].contiguous()
-    return q, k, v, A * F.softplus(row_linear(v, delta_weight))
+    lin = row_linear(v, delta_weight)
+    rows = lin.reshape(-1, lin.shape[-1])
+    cis = torch.cat([A * F.softplus(r) for r in rows.split(1)]).reshape(lin.shape)
+    return q, k, v, cis
 
 
 def row_linear(x, w):

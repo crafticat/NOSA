@@ -30,7 +30,10 @@ NO LOOP  test_no_per_position_selection_loop: static (no stage-1 / pooling / top
 FAST     test_fast_rows_match_exact (B 1, B 8): FAST rows within 1e-4 of the EXACT rows with the same argmax; layer
          0's selections bitwise; at most 2 later-layer near-tie moves (counted). Negative controls "no_extras",
          "no_row_mask", "causal_leak": caught (each with its precondition on these data).
-FAKE     test_fake_attention_idx_matches_fake: the extended attention stand-in reads entry e's bias row and request b's
+FAKE     test_cis_stand_in_is_row_invariant (FIX 1): ragged_world.fake_nosa_linear gives a row the same bits in an
+         E-row call and in a B-row call, as the kernel's one program per (row, head). Negative control: the former
+         batch-wide softplus (skipped, not passed, when it is a no-op on the CPU of the run).
+         test_fake_attention_idx_matches_fake: the extended attention stand-in reads entry e's bias row and request b's
          K / V, and equals ragged_world.fake_attention bitwise per entry; the API's bcache shape check.
 CELL     test_refusals, test_verify_cell_arguments_and_verdicts, test_step_script_vr1.
 
@@ -299,6 +302,33 @@ def test_negctl_fast_plants_fail(neg):
 
 
 # ------------------------------------------------------------------ FAKE
+def test_cis_stand_in_is_row_invariant():
+    """FIX 1 (CPU run vr_ee3f9ee_a: 5 failures, all at B >= 4, all an E-row pass against a B-row step). The kernel
+    computes cis in one program per (row, head) (nosa_linear.py:84-93, grid :110), so a row's cis does not depend on
+    the row count. The stand-in must not either: B-row slices of an E-row call give the same bits."""
+    lay = W.make_model(0).layers[0]
+    g = torch.Generator().manual_seed(11)
+    E, B = 256, 4
+    n = E // B
+    qkv = torch.randn(E, 1, lay.wqkv.shape[0], generator=g)
+    args = (lay.delta.weight, lay.A, lay.q_size, lay.kv_size, W.HKV)
+    full = W.fake_nosa_linear(qkv, *args)
+    for r in range(n):
+        part = W.fake_nosa_linear(qkv[r::n].contiguous(), *args)          # the serial step's call: B rows
+        for a, b in zip(full, part):
+            assert V.first_diff(a[r::n], b) is None, (r, V.first_diff(a[r::n], b))
+
+    def old_cis(x):                                              # NEGATIVE CONTROL: the former stand-in, one
+        v = x[..., lay.q_size + lay.kv_size:].contiguous()       # softplus over the whole batch tensor
+        return lay.A * F.softplus(W.row_linear(v, lay.delta.weight))
+    whole = old_cis(qkv)
+    diffs = [V.first_diff(whole[r::n], old_cis(qkv[r::n].contiguous())) for r in range(n)]
+    if all(d is None for d in diffs):
+        pytest.skip("precondition (L34) not met: this CPU's batched softplus gives every row the bits of a small "
+                    "batch on these data, so the former stand-in is a no-op plant here")
+    assert any(d is not None for d in diffs)                     # the same check catches the former stand-in
+
+
 def test_fake_attention_idx_matches_fake():
     g = torch.Generator().manual_seed(3)
     Bc, rows = 3, W.TOPK * W.BS
