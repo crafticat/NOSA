@@ -20,9 +20,26 @@
 # HOLDERS/<holder job>.gpu_uuid. SOURCE ONLY until reviewed: it never submits, renews, cancels or replaces an
 # allocation, never retries.
 #
-#   bash benchmarks/Efficiency/r2_spec_step.sh --nosi <sha> <holder job> <run id> <sp3m|sp3a|sp3b>
+#   bash benchmarks/Efficiency/r2_spec_step.sh --nosi <sha> <holder job> <run id> <sp3m|sp3a|sp3b|rg73|rb73>
 #   DRYRUN=1 bash benchmarks/Efficiency/r2_spec_step.sh --nosi <sha> <holder job> <run id> <cell>
 #        (login node: the pin checks, the uuid file read and the printed step command; no squeue, claim, srun or write)
+#
+# TWO DISCRIMINATING CELLS for the sp3b divergence (SCORING_sp3b.md section 8; docs/NOTES_spec.md section 11). They run
+# benchmarks/Efficiency/r2_base_cell.py (not edited) at sp3b's C 73 (pool 10) and B 318, 512 steps, --warmup 2, with the
+# FUSED twin and the fused body (--ragged-twin fused --ragged-body fused --ragged-gemm natural --ragged-graph on):
+#   rg73  --ragged --ragged-spread 64: arms SH, RG, RGS. The PLAIN per-request step, no speculation, no rollback; every
+#         RG / RGS logits fingerprint against SH's (prediction RG-BIT / RGS-BIT). Bitwise excludes "the plain ragged step
+#         is not SH at pool 10". STEP_MIN 90, --mem 340G.
+#   rb73  --rollback --rb-k 3 --rb-groups 128 --rb-seed 0 --rb-journal-blocks 256: arms SH, RBR, RBS. The ROLLBACK
+#         only (random n_acc in 0 .. 3, no draft step): every kept row of RBS against RBR (prediction RB-BIT), with a
+#         saturated journal (RB-OVF reports the overflow). STEP_MIN 90, --mem 340G.
+#   Their registered predictions are r2_base_cell.PRED_RAGGED / PRED_ROLLBACK (stamped for rg1 / rb1 at C 128 B 216):
+#   the bitwise ones apply here; the step-ratio and commit bands were set for C 128 B 216 (the lead decides).
+#   Builder's expectation (INFERRED from the root cause in NOTES_spec.md section 11, not a registration): rg73 and rb73
+#   are both bitwise. A MOVE_IN needs an empty window slot, and outside a draft only the first step after the prefill
+#   has empty window slots (with an empty pool), so neither cell runs the undo of a MOVE_IN.
+# Basis of STEP_MIN 90: dr73 (SH + DR at B 318) had STEP_MIN 90; sp3b (four prefills at B 318) took 01:13:19, about 18
+# minutes per arm; three arms and 512 + 512 + 575 (rg73) or 512 + 384 + 384 (rb73) steps.
 #
 # CELLS (512 steps unless stated; --spec 3 --spec-arms L3,L4X,L4F,L4P --spec-journal-blocks 256 --spec-twin fused
 # --spec-body fused --spec-graph on --spec-redirect on --spec-prefetch off --spec-pin off --probe-every 16). The FUSED
@@ -51,8 +68,10 @@
 #   L3-RATIO / L4X-RATIO / L4F-RATIO   median steady committed tok/s / SH steady tok/s inside (TBD, TBD)
 #   SP-ACCEPT   L3's accepted / valid drafts inside (TBD, TBD)
 #   L4F-VS-L3   L4F / L3 median steady committed tok/s inside (TBD, TBD) (the plan's L4 gate: faster than L3)
-#   L4P-TOK / L4P-RATIO / L4P-ACCEPT / L4P-VS-L4X   rung L4P: TBD (PRED_SPEC keys L4P_*, own stamp stamp_L4P)
-#   MUST gates (not predictions): SH-RUN, <arm>-RUN, <arm>-ERR, <arm>-COMMIT for L3, L4X, L4F, L4P.
+#   L4P-TOK / L4P-RATIO / L4P-ACCEPT / L4P-VS-L4X   rung L4P (PRED_SPEC keys L4P_*, own stamp stamp_L4P)
+#   MUST gates (not predictions): SH-RUN, <arm>-RUN, <arm>-ERR, <arm>-COMMIT for L3, L4X, L4F, L4P; <arm>-TOK
+#   (committed tokens bitwise SH's) and <arm>-FP (their logits fingerprints bitwise SH's) for the EXACT arms L3, L4X,
+#   L4P. rg73 / rb73: the MUST gates of r2_base_cell.py (SH-RUN, RG / RGS or RBR / RBS -RUN, -ERR, -CAP).
 #
 # OUTPUT: OUTROOT/sp_<run>_<holder>_<cell>/summary.json and the step record OUTROOT/sp_<run>_<holder>_<cell>.step/
 # (command + pins incl. the uuid and its file, stdout, stderr, exit + accounting, sacct row), both frozen. EXIT: the
@@ -76,22 +95,33 @@ SELF=benchmarks/Efficiency/r2_spec_step.sh
 SPLITS=4
 main() {
 stop() { echo "R2 spec step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_spec_step.sh --nosi <sha> <holder> <run id> <sp3m|sp3a|sp3b>" >&2; exit 2; }
+usage() { echo "usage: r2_spec_step.sh --nosi <sha> <holder> <run id> <sp3m|sp3a|sp3b|rg73|rb73>" >&2; exit 2; }
 [ $# = 5 ] && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4 CELL=$5
 DRY=${DRYRUN:-0}
 [[ $NSHA =~ ^[0-9a-f]{40}$ ]] || stop "--nosi '$NSHA' is not a full commit id"
 case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
 [[ $RUN =~ ^[a-z0-9]{1,16}$ ]] || stop "run id '$RUN' (1-16 of a-z 0-9)"
-K=3 ARMS=L3,L4X,L4F,L4P
+K=3 ARMS=L3,L4X,L4F,L4P KIND=spec
 case $CELL in
     sp3m) POOL=65 BATCH=8 STEPS=64 STEP_MIN=30 MEM=100G ;;
     sp3a) POOL=65 BATCH=216 STEPS=512 STEP_MIN=100 MEM=240G ;;
     sp3b) POOL=10 BATCH=318 STEPS=512 STEP_MIN=140 MEM=340G ;;
-    *) stop "cell '$CELL' (sp3m, sp3a or sp3b)" ;;
+    rg73) POOL=10 BATCH=318 STEPS=512 STEP_MIN=90 MEM=340G KIND=ragged ARMS=RG,RGS ;;
+    rb73) POOL=10 BATCH=318 STEPS=512 STEP_MIN=90 MEM=340G KIND=rollback ARMS=RBR,RBS ;;
+    *) stop "cell '$CELL' (sp3m, sp3a, sp3b, rg73 or rb73)" ;;
 esac
-SPK=(--spec "$K" --spec-arms "$ARMS" --spec-journal-blocks 256 --spec-twin fused --spec-body fused --spec-graph on
-     --spec-redirect on --spec-prefetch off --spec-pin off --probe-every 16)
+ENG=(--ragged-twin fused --ragged-body fused --ragged-gemm natural --ragged-graph on)
+case $KIND in
+    spec) PY=r2_spec_cell.py DESC="arms SH+$ARMS steps $STEPS K $K"
+          SPK=(--spec "$K" --spec-arms "$ARMS" --spec-journal-blocks 256 --spec-twin fused --spec-body fused
+               --spec-graph on --spec-redirect on --spec-prefetch off --spec-pin off --probe-every 16) ;;
+    ragged) PY=r2_base_cell.py DESC="arms SH+RG+RGS steps $STEPS twin fused (no speculation)"
+          SPK=(--warmup 2 --r2 fused --arms SH --ragged --ragged-spread 64 "${ENG[@]}") ;;
+    rollback) PY=r2_base_cell.py DESC="arms SH+RBR+RBS steps $STEPS K $K groups 128 journal 256 twin fused (no draft)"
+          SPK=(--warmup 2 --r2 fused --arms SH --rollback --rb-k "$K" --rb-groups 128 --rb-seed 0 --rb-journal-blocks 256
+               "${ENG[@]}") ;;
+esac
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 for v in $(compgen -e); do case $v in SLURM_*|SRUN_*|SALLOC_*|SBATCH_*) stop "the environment exports $v" ;; esac; done
 [ "$(git -C "$NOSI" rev-parse HEAD)" = "$NSHA" ] || stop "$NOSI HEAD is not $NSHA"
@@ -144,11 +174,11 @@ exec "$A" exec --nv --cleanenv --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES
 ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) srun --jobid="$JOB" --job-name="$NAME"
       --ntasks=1 --cpus-per-task=16 --mem="$MEM" --gres=gpu:a100:1 --time="$STEP_MIN" --export=NONE
       /bin/sh -c "$CHILD" sp-child "$GPU_UUID" "$APPTAINER" --bind /mnt/beegfs/ojerbi:/mnt/beegfs/ojerbi "${ENVS[@]}"
-      "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/r2_spec_cell.py" --out "$OUT" --model "$MODEL"
+      "$SIF" /venv/nosa/bin/python "$NOSI/benchmarks/Efficiency/$PY" --out "$OUT" --model "$MODEL"
       --workload "$WL" --batch "$BATCH" --steps "$STEPS" --pool "$POOL" "${SPK[@]}")
 if [ "$DRY" = 1 ]; then
     echo "R2 spec step: DRYRUN (nothing claimed, written or launched); cell $CELL; pins OK: nosi $NSHA blob $blob workload $WL_SHA gpu_uuid $GPU_UUID (from $UFILE)"
-    echo "R2 spec step: cell $CELL: C $((63 + POOL)) (pool $POOL) B $BATCH arms SH+$ARMS steps $STEPS K $K STEP_MIN $STEP_MIN mem $MEM claim $CLAIM"
+    echo "R2 spec step: cell $CELL: C $((63 + POOL)) (pool $POOL) B $BATCH $DESC STEP_MIN $STEP_MIN mem $MEM claim $CLAIM"
     printf '%q ' "${ARGV[@]}"
     echo
     exit 0
@@ -175,8 +205,8 @@ mkdir "$CLAIM" 2>/dev/null || stop "$CLAIM exists (another step of this holder, 
 mkdir "$REC" && mkdir -p "$JIT/tmp" || stop "cannot create $REC / $JIT ($CLAIM stays)"
 busy=$(nosteps) || stop "a step is running in $JOB under the claim: '$busy' ($CLAIM stays)"
 printf '%q ' "${ARGV[@]}" > "$REC/command.txt" || stop "cannot write $REC/command.txt ($CLAIM stays)"
-printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s cell=%s pool=%s batch=%s arms=%s steps=%s k=%s workload=%s utc_start=%s\n' \
-    "$NSHA" "$blob" "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "$CELL" "$POOL" "$BATCH" "$ARMS" "$STEPS" "$K" "$WL_SHA" \
+printf '\nnosi=%s wrapper_blob=%s gpu_uuid=%s gpu_uuid_file=%s holder=%s left=%s run=%s cell=%s kind=%s pool=%s batch=%s arms=%s steps=%s k=%s workload=%s utc_start=%s\n' \
+    "$NSHA" "$blob" "$GPU_UUID" "$UFILE" "$JOB" "$sl" "$RUN" "$CELL" "$KIND" "$POOL" "$BATCH" "$ARMS" "$STEPS" "$K" "$WL_SHA" \
     "$(date -u +%FT%TZ)" >> "$REC/command.txt" ||
     stop "cannot write $REC ($CLAIM stays)"
 "${ARGV[@]}" < /dev/null > "$REC/stdout.txt" 2> "$REC/stderr.txt"

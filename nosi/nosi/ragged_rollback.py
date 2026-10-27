@@ -54,12 +54,26 @@ pool hook runs after pool_update and before flash_pool_swap: it copies the plan 
 slot (pool slots of MOVE_OUT, window slots of MOVE_IN, window slots loaded with no action) into a flat list of at most
 N = capacity slots per layer and step (index_select; the list is built with cumsum + scatter, no host read). The undo
 of step u: (1) flash_pool_swap with the inverse plan, masked to the rejected requests: SWAP -> SWAP, MOVE_OUT ->
-MOVE_IN (the parked block Y goes back into window slot m and overwrites the gathered block), MOVE_IN -> NONE; (2) the
-saved data goes back (index_copy_); (3) a lost slot past N that held a block (its id from the journal's _block_map /
-_pool_map) comes back from the HOST through the shipped gathers: exact, because every non-tail block on the GPU is a
-copy of its host rows and of its total_cis rows. A past-N slot that held no block keeps other bytes: no reader exists
-(attention reads mapped window slots only, a pool slot is read only when _pool_map names it), and the counter
-"overflow" counts these slots. Without a pool, the gather hook saves the loaded window slots before the gather.
+MOVE_IN (the parked block Y goes back into window slot m and overwrites the gathered block), MOVE_IN -> MOVE_OUT (the
+block goes back from window slot m into pool slot q, where it was before the step); (2) the saved data goes back
+(index_copy_); (3) a lost slot past N that held a block (its id from the journal's _block_map / _pool_map) comes back
+from the HOST through the shipped gathers: exact, because every non-tail block on the GPU is a copy of its host rows
+and of its total_cis rows. A past-N slot that held no block keeps other bytes and the counter "overflow_dead" counts
+it: no reader exists (attention reads mapped window slots only, a pool slot is read only when _pool_map names it, and
+the undo reads only NAMED slots, below). Without a pool, the gather hook saves the loaded window slots before the
+gather.
+THE UNDO READS ONLY NAMED SLOTS. The inverse plan of step u reads window slot m of a SWAP / MOVE_IN (it holds the
+wanted block: the map after step u names it) and pool slot q of a SWAP / MOVE_OUT (it holds Y: the pool map names it).
+The undo of the later steps restored exactly the slots that the maps after step u name, so the moves are exact, and
+the unnamed bytes of a slot are never an input. Until 6de1cfd the inverse of MOVE_IN was NO MOVE: it relied on the
+bytes of pool slot q, which the pool map after the step marks EMPTY. An empty slot is the first LRU victim
+(pool_update_kernel.cu:32-34), so a later step of the same group can MOVE_OUT another block into q; past N, q's old
+bytes then counted as overflow_dead (no save, no fallback), and the undo left q (or the window slot that the next undo
+filled from q) NAMED with the bytes of another block. A MOVE_IN needs an empty window slot (Y = -1), and inside a group
+only a draft's skip (the resident-only draft step: map entry -1) makes one: GPU cell sp3b (journal saturated, EXACT
+arms off SH's tokens from column 1), CPU test test_tiny_journal_equals_shipped (the speculative-round tests), negative
+control
+undo_move_in_none (the old table).
 
 CLOCK. _pool_stamp_base is a per-layer step clock (pool_update_kernel.cu:37-43: stamps stamp_base + m, compared inside
 one (head, request) row). commit() does NOT move it back: every stamp that a request keeps is below it, and a reference
@@ -105,7 +119,7 @@ NEGATIVE CONTROLS (tests only; neg): no_defer (the write-back goes to the host d
 staged block is not copied after the gathers), no_slot_restore, no_host_fallback, no_pool_restore, no_meta_restore,
 no_tail_restore, no_twin_restore (each removes one part of the undo), no_rollback (commit undoes nothing: the dr1
 flow), skip_release_wait (the next step does not wait the release event), host_sync (commit reads n_acc on the host
-once).
+once), undo_move_in_none (the inverse of MOVE_IN is no move: the table of 6de1cfd, see SLOTS).
 
 PHASE 2 ADDITIONS (the integration tree nosi-r2-spec; the speculative round runner is the only caller of the new parts).
 Without a call of truncate / fast_begin / fast_end a group behaves as above, bit for bit.
@@ -144,7 +158,8 @@ import torch
 from .r2_positional_twin import RING
 
 NONE_, SWAP, MOVE_IN, MOVE_OUT = 0, 1, 2, 3            # pool_update_kernel.cu:79-82, flash_pool_swap.py:83-86
-UNDO_ACTION = (NONE_, SWAP, NONE_, MOVE_IN)            # the inverse data move of each action (SLOTS)
+UNDO_ACTION = (NONE_, SWAP, MOVE_OUT, MOVE_IN)         # the inverse data move of each action (SLOTS): reads named slots
+UNDO_ACTION_6DE1CFD = (NONE_, SWAP, NONE_, MOVE_IN)    # NEGATIVE CONTROL undo_move_in_none (tests only): the old table
 META3 = ("_block_map", "_new_block_map_buf", "_load_mask")
 META4 = META3 + ("_cache_lens",)
 POOL4 = ("_pool_map", "_pool_age", "_pool_target", "_pool_action")
@@ -155,7 +170,7 @@ TWIN_CTR = ("pos", "n_comp", "n_ccis")
 COUNTERS = ("destroyed", "saved", "overflow", "overflow_dead", "redirected")
 NEG_KINDS = (None, "no_defer", "no_redirect", "no_slot_restore", "no_host_fallback", "no_pool_restore",
              "no_meta_restore", "no_tail_restore", "no_twin_restore", "no_rollback", "skip_release_wait",
-             "host_sync", "no_truncate_mark")
+             "host_sync", "no_truncate_mark", "undo_move_in_none")
 # the functions of the group's path: no host sync allowed (tests_cpu/test_rollback.py, test_no_host_sync_in_commit_path)
 COMMIT_PATH = ("commit", "reject_all", "_mirror", "_commit_layer", "_undo_step", "_undo_slots", "_restore_slots",
                "_fallback", "_redirect_ids", "_redirect", "_writeback_deferred", "_where_rows", "_wait_release_all",
@@ -281,7 +296,8 @@ class Rollback:
         self.minus1 = torch.tensor(-1, dtype=i64, device=dev)
         self.zero8 = torch.tensor(0, dtype=torch.int8, device=dev)
         self.ustep = [torch.tensor(u, dtype=i64, device=dev) for u in range(self.K)]
-        self.undo_lut = torch.tensor(UNDO_ACTION, dtype=torch.int8, device=dev)
+        self.undo_lut = torch.tensor(UNDO_ACTION_6DE1CFD if neg == "undo_move_in_none" else UNDO_ACTION,
+                                     dtype=torch.int8, device=dev)
         self.zeros_b = torch.zeros(B, dtype=i64, device=dev)
         self.zeros_b_host = torch.zeros(B, dtype=i64)
         self.count = {n: torch.zeros(self.L, dtype=i64, device=dev) for n in COUNTERS}

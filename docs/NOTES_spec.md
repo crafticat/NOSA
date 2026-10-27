@@ -197,7 +197,8 @@ INPUTS FOR THE BANDS (MODEL / INFERRED, not measured):
   2 drafts (120 ms) + commit of 6 steps (about 2 commits): about 200 + 30 + 120 + 60 = 410 ms for at most 3 tokens:
   L4F-RATIO about 0.45 (0.3-0.6); L4F-VS-L3 about 1.1 (0.9-1.4).
 - sp3b: dr73 (draft 0.80 of SH, registered) is the only input; the journal overflows more at C 73 (many more loads):
-  the undo then reloads lost blocks from the host (slower, exact).
+  the undo then reloads lost blocks from the host (slower, exact). REFUTED at sp3b (6de1cfd): not exact after a
+  draft, section 11.
 - SP-ACCEPT: dr1 draft agreement 0.99475 (teacher-forced, drifting state); the rounds' acceptance is n / v over fresh
   drafts: about 0.99 (0.97-1.0).
 
@@ -276,3 +277,74 @@ INPUTS FOR THE BANDS (MODEL / INFERRED, not measured):
   with the Write and Edit tools.
 - The reviewer agent reported one breach of its own: `sed -n 100,130p test_verify_rows.py | head -0` once (read-only,
   output discarded).
+- The sp3b task (section 11): `date -u` (the stamps, L33) and `date` once (local time). ONE BREACH: `sed -n 1p` once,
+  at the end of a read-only pipeline on `git show 280b9e7` output (it printed one line; nothing was edited). A
+  read-only reviewer agent ran on 280b9e7 / 30afd33.
+
+## 11. GPU cell sp3b at 6de1cfd: the EXACT arms lost SH's tokens. Root cause, reproduction, fix
+
+THE RECORD (SCORING_sp3b.md, MEASURED). L3: 0.2362 of the committed tokens equal SH's; L4X: 0.3034; 99.7 % of the
+fingerprints differ; the first difference is at column 1, the first row after round 0's draft group and its
+reject_all. sp3m (C 128, B 8): journal overflow 0, bitwise. sp3b (C 73, B 318): the journal saturates (saved = 256
+per layer and step in 27-30 of 32 layers), 16.7-30.4 M live and 6.2-13.5 M dead slots go past N. rb1 (C 128, B 216,
+rollback, NO draft): 32,708 live slots past N, bitwise.
+
+ROOT CAUSE (CODE, by reading at 6de1cfd; "rr" = ragged_rollback.py, "pu" = pool_update_kernel.cu):
+1. A MOVE_IN happens only when window slot m holds no block (Y = -1, pu:224-236). It copies pool slot q into m and
+   marks q EMPTY (map -1, age -P + q). flash_pool_swap does not change the bytes of q.
+2. The inverse of MOVE_IN was NO MOVE (rr:147, UNDO_ACTION[MOVE_IN] = NONE). So the undo needed the bytes of q to stay
+   in q until the undo.
+3. An empty pool slot has the lowest LRU age (pu:32-34), so it is the FIRST victim of the next MOVE_OUT (pu:187-243).
+   A later step of the same group parks a block Y2 in q.
+4. That later step loses the old bytes of q. Past N, its journal calls the slot "held no block", because the map before
+   that step marks q empty (rr:832): the slot counts as overflow_dead. No save, and no host fallback (the owner is the
+   map entry, -1: rr:549-550).
+5. The undo of the later step moves Y2 back to its window slot; q keeps the bytes of Y2. The undo of the MOVE_IN step
+   puts the old pool map back: q is NAMED with block A (its block before the MOVE_IN) but holds the bytes of Y2. If an
+   earlier step parked A in q (a MOVE_OUT), its undo runs next and copies those bytes into a named window slot. After
+   reject_all a named slot holds the K, V and bias of another block. Attention reads it when a step selects that block:
+   the logits change.
+6. Where the empty window slot comes from. Outside a draft, only the first decode step after the prefill has empty
+   window slots, and the pool is empty then (no MOVE_IN). A draft (DraftResident) sets the map entry of every skipped
+   slot to -1 (spec_round.py:213). The next draft step of the same group puts new misses into those slots, and a pool hit
+   there is a MOVE_IN. L3: draft 1 MOVE_IN, draft 2 MOVE_OUT into the freed slot. L4: the draft row, then the two drafts.
+WHY THE RECORD FITS (INFERRED): sp3m has no overflow (the journal saves q, so q comes back exactly); rb1 has overflow
+but no draft (no MOVE_IN after the first step); sp3b has drafts and a saturated journal. The onset is column 1 because
+round 0's draft group is the first group with drafts. The L3 draft-1 reject rate (2.05 %, the highest of the three
+positions) fits too: draft 1 reads the state before the group's undo, verify step 1 the state after it.
+
+REPRODUCTION (CPU; commit 280b9e7, the code of 6de1cfd plus the test). test_tiny_journal_equals_shipped[L3, L4]: B 8, a
+journal of 1 slot per layer and step, EXACT rounds against the shipped greedy decode. It checks the residency right
+after every reject_all and after every round, the tokens, the logits rows and the host rows. Precondition (L34):
+spec_world.move_in_reuse finds the pattern of step 4 (a MOVE_OUT into a slot that a MOVE_IN of an earlier step of the
+group emptied, unsaved). EXPECTED at 280b9e7: FAIL, with ("pool", l, h, b, q, y) or ("win", ...) residency errors. NOT
+RUN by me (no pytest on the login node): the lead runs it at 280b9e7 first, then at the fix commit.
+
+FIX (30afd33): UNDO_ACTION[MOVE_IN] = MOVE_OUT. The undo moves the block back from window slot m into pool slot
+q. At that time m holds the block: the map after the step names it, so the undo of the later steps restored it (saved
+rows, host fallback or an inverse move). Every inverse move now reads only NAMED slots, and the unnamed bytes of a slot
+are never an input (rr docstring, THE UNDO READS ONLY NAMED SLOTS). Cost: one block copy per undone MOVE_IN, in the
+same flash_pool_swap launch. No new kernel. Negative control undo_move_in_none (the old table): the test asserts that
+the check CATCHES it, with the same precondition. The next commit makes the precondition robust: the test takes the
+first world seed in 0 .. 2 with the pattern, and the plant runs on that seed, so ONE test run shows the divergence of
+the 6de1cfd table (the plant) and the exactness of the fixed table. It also adds the direct test without the runner,
+test_draft_group_tiny_journal_restores_live_slots: one group of 6 draft steps (B 8, journal 1), reject_all, then the
+maps and the LIVE slot bytes against the snapshot and 3 plain steps against a world without the group; the same plant.
+REVIEW (a read-only reviewer agent on 280b9e7 / 30afd33 / 2d9f1a4): no defect in the fix, the token gates or the step
+script; it confirmed the root cause in the code. Three test risks, fixed in the next commit: (a) the plant runs had a
+12-round cap while the seed came from an uncapped run (now no cap); (b) in L4 only a request that never rejected runs
+three skip-making draft steps in one group (the draft row, then 2 drafts), and FILTER forces early rejects (the L4 case
+now uses shipped-token drafts in every round: full accepts only); (c) move_in_reuse counted a MOVE_OUT that parks the
+same block the MOVE_IN took out (harmless with either table; now excluded).
+
+GATES (280b9e7): r2_spec_cell.tok_gates adds the MUST gates <arm>-TOK and <arm>-FP for L3 and L4X. A divergence now
+fails the cell (sp3b reported 0 failed MUST gates).
+
+DISCRIMINATING GPU CELLS (r2_spec_step.sh, 280b9e7; r2_base_cell.py, not edited): rg73 (the plain ragged step: SH, RG,
+RGS) and rb73 (the rollback only: SH, RBR, RBS; K 3, random n_acc, journal 256), both at C 73 B 318 with the fused twin.
+Builder's expectation (INFERRED, not a registration): both bitwise, at 6de1cfd and after the fix, because neither runs
+the undo of a MOVE_IN. If rb73 is NOT bitwise, a second defect exists in the overflow path. The proof of the fix on the
+GPU is sp3b (or sp3m at pool 10) again at the fix commit: L3-TOK, L3-FP, L4X-TOK and L4X-FP must PASS.
+
+OTHER CHANGES: the comment of test_truncate_then_commit_equals_reference (its groups have no MOVE_IN); its claims do
+not change. docs/NOTES_rollback.md: the undo row. The sibling tree nosi-r2-specp must merge the fix commit.

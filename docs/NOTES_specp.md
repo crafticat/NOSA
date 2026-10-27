@@ -229,13 +229,34 @@ checks the arm names one by one).
 
 The reviewer reported no shell command outside the allowed list.
 
-## 9. Shell commands outside cat / grep / head / tail / ls / sort / cut / diff / git / wc (this task)
+## 9. Merge of r2-spec fd1a239 (2026-10-27T23:34:21Z, `date -u`; the sp3b token divergence fix)
+
+Base: this branch at `296203e` (the lead's L4P stamp 2026-10-27T20:56:53Z). r2-spec `fd1a239` brings: the rollback undo
+of MOVE_IN is MOVE_OUT (`30afd33`; the old table is the negative control `undo_move_in_none`), the token MUST gates
+`<arm>-TOK` / `<arm>-FP` for the EXACT arms (`tok_gates`, `arm_gates(arm, res, rec)`), the CPU repro
+`test_tiny_journal_equals_shipped` (1-slot journal; `spec_world.move_in_reuse` / `watch_reuse`), the cells rg73 / rb73.
+
+| file | how |
+|---|---|
+| `r2_spec_step.sh` (3 conflicts) | both: the base's rg73 / rb73 (KIND / PY / DESC) and this branch's five arms, STEP_MIN 30 / 100 / 140 and `--spec-pin off` in the spec kind; the MUST gate text names L4P among the EXACT arms |
+| `spec_world.py` (2 conflicts) | `run_vs_shipped(..., journal, on_runner, pin)`: every keyword of both; `spec_runner(..., journal=journal, pin=pin)`, then `on_runner` |
+| `r2_spec_cell.py` (clean) | both stamps kept; `EXACT_ARMS` has L4P, so L4P gets `L4P-TOK` / `L4P-FP` (MUST); the docstring names L4P |
+| `test_spec_round.py` (clean) + additions | `test_tiny_journal_equals_shipped[L4P]` (the periodic FILTER as L3: rejects and full accepts; its host check also includes `host_c`); `test_cell_arguments_and_verdicts` asserts L4P's four MUST gates and their failures |
+| `test_spec_paper.py` | `test_paper_cell_arguments_and_report` passes the record to `arm_gates` (L4P-TOK / L4P-FP must pass on the CPU run) |
+
+L4P needs no code change for the fix: its truncate and commit run the same `_undo_step`. In an L4P group the draft
+residencies (the deferred row, the draft row, pads, the 2 drafts) can empty window slots (skips), so MOVE_INs and the
+sp3b pattern can occur there too; the new test case checks it.
+
+## 10. Shell commands outside cat / grep / head / tail / ls / sort / cut / diff / git / wc (this task)
 
 - `git worktree add` (as instructed), `git merge --no-edit r2-spec` twice (fast-forward of this new branch, as the
   coordinator asked), `git checkout -- nosi/nosi/ragged_rollback.py` (dropped my own uncommitted edit before the second
   merge; HEAD did not move), `git add`, `git commit -F` (message written with the Write tool): git.
 - `date -u +%FT%TZ` about 20 times (a clock read while the read-only reviewer agent ran; its progress was read with
-  `ls -laL`, `grep -c` and `wc -l` on its transcript file only).
+  `ls -laL`, `grep -c` and `wc -l` on its transcript file only), and once for the stamp of section 9.
+- Merge of fd1a239: `git merge --no-commit --no-ff r2-spec`, conflicts resolved with the Edit tool, `git add`,
+  `git commit -F` (message written with the Write tool).
 - Shell built-ins only otherwise (`cd`, `echo`, `;`, `&&`, `|`).
 - TWO BREACHES (sed, read-only, by mistake): `sed -n 1p /dev/null` inside a grep command (it read nothing), and later
   `grep ... spec_round.py | sed -n 1p` (it printed the first grep line). No other sed, no interpreter, no awk, no

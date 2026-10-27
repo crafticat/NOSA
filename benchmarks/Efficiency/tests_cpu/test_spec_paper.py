@@ -492,5 +492,5 @@ def test_paper_cell_arguments_and_report():
     assert pp["verify_rows_hist"] == rd["verify_hist"] and pp["accepted_per_round"] == rd["round_accepted"]
     assert pp["pin"] is None and rec["draft"]["skip_per_stream_per_call"] > 0
     assert rec["acceptance"]["valid"] == rd["valid"] and rec["kv_at_verify"]["in_flight_blocks"] == 0
-    gates = {n: ok for n, _, ok, _ in SC.arm_gates("L4P", res)}
-    assert gates == {"L4P-ERR": True, "L4P-COMMIT": True}, gates
+    gates = {n: ok for n, _, ok, _ in SC.arm_gates("L4P", res, rec)}  # r2-spec fd1a239: EXACT arms have token gates
+    assert gates == {"L4P-ERR": True, "L4P-COMMIT": True, "L4P-TOK": True, "L4P-FP": True}, gates

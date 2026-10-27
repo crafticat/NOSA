@@ -27,6 +27,9 @@ THIS FILE ADDS
                                reached the host rows: the dr1 leak)
   corrupt(...), corrupt_before_edge(...)   deterministic draft corruptions (the token proof holds for ANY drafts; these
                                force rejects at chosen places)
+  move_in_reuse(rb, keep), watch_reuse(runner, box)   the GPU cell sp3b's pattern in a group (a pool slot that a
+                               MOVE_IN emptied, then a MOVE_OUT of a later step of the group overwrote, unsaved), and the
+                               residency right after each reject_all (test_tiny_journal_equals_shipped)
   Recorder                     a stand-in of a rung-L5 prefetcher (on_draft / on_round), for the wiring test
 RUNG L4P (tests_cpu/test_spec_paper.py; level "L4P" of spec_round.py): run_vs_shipped(pin=...) passes the
 requested-KV pin; after every round it records the soft pins that stay (ev["pinned"]: pinned_slots) and, for L4P, the
@@ -256,14 +259,82 @@ class Recorder:
 # ---------------------------------------------------------------------------
 # the driver of the claims
 # ---------------------------------------------------------------------------
+def _pool_slots(a, t, kind: int, P: int):
+    """(H, B, M) pool actions a and targets t -> (H, B, P) bool: the pool slots that an action `kind` names."""
+    x = torch.zeros(tuple(a.shape[:2]) + (P + 1,), dtype=torch.bool)
+    x.scatter_(2, torch.where(a == kind, t, torch.full_like(t, P)), True)
+    return x[:, :, :P]
+
+
+def move_in_reuse(rb, keep) -> dict:
+    """HOST facts of an OPEN group (tests only; call before its commit): the pool slots q that a step u MOVE_OUTs into
+    while q is EMPTY in the pool map before step u (pool_update_kernel.cu:32-34: an empty slot has the lowest LRU age,
+    so it is the first victim) and q was the SOURCE of a MOVE_IN of an earlier step of the group (no MOVE_OUT into q
+    between them). A MOVE_IN leaves the bytes of q in place (flash_pool_swap.py:29-30); the later MOVE_OUT overwrites
+    them. A MOVE_IN needs an empty window slot, so inside a group only a draft's skip (map entry -1) makes one. keep (B,):
+    the steps request b keeps (commit's n_acc; reject_all: 0); only the (step, request) pairs that this undo runs count.
+    Only a MOVE_OUT that parks ANOTHER block than the one the MOVE_IN took out of q counts (parking the same block
+    writes the bytes that q held: harmless). reuse: such MOVE_OUTs; unsaved: those that the step did not save (past the
+    journal's N, and q held no block by the map, so they count as overflow_dead: no fallback reloads them); move_in: the
+    MOVE_INs that this undo runs."""
+    out = dict(reuse=0, unsaved=0, move_in=0)
+    if not rb.pool:
+        return out
+    n_run, M, P = rb._u[0], rb.M, rb.P
+    und = rb._undone[:n_run].cpu()
+    keep = torch.as_tensor(keep).to(torch.int64).cpu().clamp(0, n_run)
+    for l in range(rb.L):
+        freed = torch.zeros((rb.H, rb.B, P), dtype=torch.bool)
+        held = torch.full((rb.H, rb.B, P), -1, dtype=torch.int64)       # the block a MOVE_IN took out of q
+        for u in range(n_run):
+            j = rb.J[l][u]
+            run = ((keep <= u) & ~und[u]).view(1, rb.B, 1)
+            a, t = j["plan_action"].to(torch.int64).cpu(), j["plan_target"].cpu()
+            mo, mi = _pool_slots(a, t, RR.MOVE_OUT, P), _pool_slots(a, t, RR.MOVE_IN, P)
+            pmap = j["_pool_map"].cpu()
+            parked = torch.full((rb.H, rb.B, P + 1), -2, dtype=torch.int64)    # the block a MOVE_OUT parks in q
+            parked.scatter_(2, torch.where(a == RR.MOVE_OUT, t, torch.full_like(t, P)), j["_block_map"].cpu())
+            r = mo & run & freed & (pmap < 0) & (parked[:, :, :P] != held)
+            out["reuse"] += int(r.sum())
+            out["unsaved"] += int((r & j["unsaved"].cpu()[:, :, M:]).sum())
+            out["move_in"] += int((mi & run).sum())
+            held = torch.where(mi & run, pmap, held)
+            freed = (freed & ~mo) | (mi & run)
+    return out
+
+
+def watch_reuse(runner, box: dict) -> None:
+    """Tests only: wraps runner.rb.commit (reject_all calls it too) and runner.rb.reject_all. Before each undo the
+    group's move_in_reuse facts are added to box; after each reject_all, residency_errors of the restored snapshot go
+    to box["resid_reject"] (round, first errors): a wrong slot is seen where the undo makes it, before a later step can
+    move or evict it."""
+    rb = runner.rb
+    commit0, reject0 = rb.commit, rb.reject_all
+
+    def commit(n_acc, n_acc_host=None):
+        for k_, v_ in move_in_reuse(rb, n_acc).items():
+            box[k_] = box.get(k_, 0) + v_
+        return commit0(n_acc, n_acc_host)
+
+    def reject_all():
+        reject0()
+        r = residency_errors(runner.rs)
+        if r:
+            box.setdefault("resid_reject", []).append((runner.round, r[:5]))
+    rb.commit = commit
+    rb.reject_all = reject_all
+
+
 def run_vs_shipped(B: int, level="L3", mode="exact", gemm="rowgroup", K=K0, S=S0, N=N0, seed=0, draft_filter=None,
                    neg=None, rb_neg=None, check_rounds=True, max_rounds=0, body="torch", redirect=True,
-                   oracle_rounds=(-1, 0), pin=False):
+                   oracle_rounds=(-1, 0), journal=RW.CAP, on_runner=None, pin=False):
     """THE SHIPPED GREEDY DECODE against the SPECULATIVE RUN on a second cache from the same prefill. After every round
     (check_rounds): residency_errors and host_rows_errors (collected, not raised). oracle_rounds: in these rounds the
     drafts are the shipped tokens (inject; the L4 prelude is round -1), then draft_filter acts: the first rounds are
-    full accepts by construction (precondition of the full-accept path), later rounds use the natural drafts. Returns the
-    evidence: per request the first unequal committed token / logits row, the round records, the facts
+    full accepts by construction (precondition of the full-accept path), later rounds use the natural drafts. journal:
+    the rollback's saved slots per layer and step (N). on_runner(runner): called once before the run (test hooks).
+    pin: the L4P requested-KV pin (SpecOps(pin=...)).
+    Returns the evidence: per request the first unequal committed token / logits row, the round records, the facts
     (preconditions) and the runner."""
     W.STATS.clear()
     hz = horizon_for(N, K)
@@ -294,7 +365,10 @@ def run_vs_shipped(B: int, level="L3", mode="exact", gemm="rowgroup", K=K0, S=S0
                     ev["host_c"].append((runner.round, h[:5]))
     W.TAG[0] = "spec"
     runner = spec_runner(model, Bc, S, hz, tok0, level=level, K=K, mode=mode, gemm=gemm, draft_filter=draft_filter,
-                         neg=neg, rb_neg=rb_neg, after_round=after_round, body=body, redirect=redirect, pin=pin)
+                         neg=neg, rb_neg=rb_neg, after_round=after_round, body=body, redirect=redirect, journal=journal,
+                         pin=pin)
+    if on_runner is not None:
+        on_runner(runner)
     runner.run(N, max_rounds=max_rounds)
     rd = runner.read()
     cnt = torch.tensor(rd["count"])
