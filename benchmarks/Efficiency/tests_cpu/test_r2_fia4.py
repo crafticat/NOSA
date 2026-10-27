@@ -11,7 +11,7 @@ compute node:
 
 FV1 license header and revision; FV2 every changed line carries [fork] (difflib against the pristine upstream copies)
 with two planted negative controls; FV3 one fork, no other kernel; FV4 the torch tables = a set model, the width, the
-sort precondition (and the recorded S1 lists, when present); FV5 the kernel under the interpreter (13 checks, a planted
+sort precondition (and the recorded S1 lists, when present); FV5 the kernel under the interpreter (14 groups, a planted
 mask error among them); FV6 completeness and the PRED4 block; FV7 the decision report; FV8 ncu summary, argv and the
 arguments; FV9 / FV10 the step (static shape, DRYRUN).
 """

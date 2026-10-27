@@ -191,7 +191,7 @@ Builder expectations (MODEL, NOT registered; for the lead's judgement only):
   changed line tagged, with two plants; FV3 one fork, two launched kernels (upstream's), the helpers called only from
   the kernel, no kernel in the bench; FV4 the torch tables = a set model, the width, the sort precondition, and the
   recorded S1 lists sorted (it prints the fact; a failure here means the s1 cells cannot use FV's build); FV5 the fork
-  under TRITON_INTERPRET=1 (a fresh process; 13 checks: fp64 at GQA 4 and at the NOSA-8B geometry, the kernel tables =
+  under TRITON_INTERPRET=1 (a fresh process; 14 check groups: fp64 at GQA 4 and at the NOSA-8B geometry, the kernel tables =
   the torch tables = the set model, FVT == FV, the planted mask error DETECTED and local, both witnesses, FI1-FI5, a row
   alone bitwise, the block-edge batch, requests of 1 / 3 / 4 rows, the 3D path, the VOID sort precondition, 7 launcher
   refusals); FV6 completeness and the PRED4 block; FV7 the decision report; FV8 the ncu fields, argv and arguments;
