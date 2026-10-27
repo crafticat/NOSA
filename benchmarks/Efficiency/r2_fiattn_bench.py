@@ -81,12 +81,51 @@ late is skipped and fails gate BUDGET; ncu cells get min(--ncu-cap, the time lef
 OUTPUT: --out/summary.json (gates, reports, plans, timings, predictions, environment), one GATE / REPORT line per gate
 on stdout. EXIT: the number of failed MUST gates (<= 125); 2 = refused (--out exists, bad arguments, no CUDA, no
 FLASHINFER_WORKSPACE_BASE, a FlashInfer version other than 0.5.3).
+
+[fia3] SHARED-KV VERIFY ARMS (plan kstep-cpu-runs/analysis/plan/PLAN_speckv_on_cached_nosa.md Task 0.3; survey
+SURVEY_shared_kv_kernel.md option 1; notes docs/NOTES_fia3.md). NO NEW KERNEL: existing FlashInfer and NOSA kernels,
+Python glue, and one more JIT variant (FlashInfer's own customization hook, as the F8 arm's CIS variant).
+  FP0 FlashInfer BatchPrefillWithPagedKVCacheWrapper (fa2), option A (one wrapper per KV head, as F8). One FlashInfer
+      request = (request, KV head); qo_len = rows per request (1 draft + 3 verify); FlashInfer's own GQA packing puts
+      the 16 query heads x 4 rows of that KV head in ONE CTA tile of 64 rows (packed_qo_len, CTA_TILE_Q 64), so each
+      KV tile is staged in shared memory once for all of them. KV pages = the union of the rows' pages (ascending
+      (block id, slot)); a packed custom mask (FlashInfer's layout: bit qo_idx * kv_len + kv_idx of the request's byte
+      segment) gives each row only its own tokens, expanded from the block bits (a row's last page cut at last_len).
+      The variant R2FiCisBiasMask = R2FiCisBias + a LogitsMask that reads that mask (FlashInfer applies a custom mask
+      through the VARIANT: variants.cuh DefaultAttention; a custom variant without LogitsMask ignores the mask).
+      plan(disable_split_kv=True, packed_custom_mask=...) (the packed mask selects the kCustom kernels). One plan per
+      tick: with no split the plan does not depend on the union sizes, so later layers write their CSR and mask IN
+      PLACE into the buffers the plan holds (relayer; REPORT R_REUSE_FP0 checks it bitwise).
+  FP8 the same with fixed_split_size 8 (pages of the union list): FAST mode only (the chunks depend on the union).
+      Hazard (MODEL from the 0.6.8 source): a row whose first KV tile of a chunk is fully masked starts that chunk's
+      online softmax at -inf (exp2(-inf - -inf) = NaN, prefill.cuh update_mdo_states); REPORT R_FP8_chunk_tile0 counts
+      such cells, and FP8's C gate is a REPORT.
+  FPU FP0's call without the mask (plan without packed_custom_mask: kNone kernels): TIMING ONLY, the mask's cost.
+  V1  NOSA's own prefill varlen route: EQ nosi-eqmem nosi/nosi/verify/verify_step.py varlen_attention (pinned blob,
+      loaded by path; the internal op infllm_v2 _wrapped_infllmv2_attn_varlen_forward, two calls V x exp(cis) and
+      exp(cis), then the quotient) over a CONTIGUOUS union store built here (union page j at slot j, the union's last
+      page at slot W - 1, seqused_k = (W - 1) x 64 + the last-page extent, so the causal rule cuts each row at its own
+      extent). The bench bias is pre-scaled (exp(bias x D^-0.5)) because the bench logit is (q.k + bias) x scale.
+      Precondition V1_pre (consecutive extents, one shared tail); a missing import is a FINDING (REPORT).
+  Gates [fia3]: FP_API and C0_FP (MUST when an FP arm is asked); G_block0 (MUST: every row lists block 0, so no row
+  starts on a fully masked KV tile); C (fp64: TOL_C, MUST for FP0, REPORT for FP8; V1: TOL_V1, MUST); FI1-FI3 and FI5 (request
+  alone, request order, other requests changed, poison: MUST for FP0, REPORT for FP8); CW_FP0 (bias witness) and
+  MW_FP0 (mask witness: every row given the whole union must FAIL C); REPORTs: R_X_row_alone (the EXACT-mode probe:
+  A100 KV tiles are 128 tokens = 2 pages, so a row's bits depend on its siblings' pages: FP0 is FAST-only), R_REUSE,
+  R_T (event time, plan host time, union + mask build per layer eager / host / CUDA graph, the tick overhead), D
+  (bits vs P), NCU (DRAM bytes, L2 -> SM sectors, registers, local-memory bytes) and R_DECISION (the registered rule,
+  PRED3).
+  Cells [fia3]: B up to 256; the suffix s1 takes the lists of the recorded S1 tick tables (--s1-tables; requests =
+  the recorded groups of exactly rows-per-request rows, cycled to B; synthetic q / K / V / bias). Cells with B > 64
+  draw K / V / bias on the GPU (a seeded CUDA generator); B <= 64 keeps fia1 / fia2's CPU data bitwise.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import importlib.util
+import inspect
 import io
 import json
 import math
@@ -112,10 +151,18 @@ SHORT_COUNTS = (5, 8, 9)                    # the hazard rows' page counts (5, 8
 SHORT_LAST = 33                             # their extent in the tail page
 FIXED_SPLIT = 8                             # = piece 3's PAGES_PER_SPLIT
 CELLS = ((8, 1), (8, 4), (32, 1), (32, 4))  # (B, rows per request); 8x1 first: the inspected miniature
-ARMS = ("P", "F8", "F0", "FH", "S5")
+MAX_B = 256                                 # [fia3] B up to 256 (the 216 x 4 target cell)
+CPU_DATA_MAX_B = 64                         # [fia3] B <= 64: K / V / bias drawn on the CPU (fia1 / fia2 data, bitwise);
+                                            # larger cells draw them on the GPU (a seeded CUDA generator)
+ARMS = ("P", "F8", "F0", "FH", "S5", "FP0", "FP8", "FPU", "V1")
 MUST_ARMS = ("P", "F8", "F0")
-FI_VERSION = "0.5.3"
+FP_ARMS = ("FP0", "FP8", "FPU")             # [fia3] FlashInfer paged PREFILL over the request union
+FI_VERSION = "0.5.3"                        # the version every JIT cache of nosa-env.sif names (nosa-env/jit/*/flashinfer)
+FI_VERSIONS = ("0.5.3", "0.6.8.post1")      # [fia3] accepted: the sif's 0.5.3 and the 0.6.8.post1 read for this change
 TOL_C = 1.0e-3                              # REGISTERED: max |arm - fp64| (absolute), every arm
+TOL_V1 = 4.0e-3                             # [fia3] V1 only (builder choice, for the lead to accept): NOSA's route
+                                            # rounds two bf16 outputs and divides in bf16 (verify_step.py:200): about
+                                            # 3 x 2^-9 relative, i.e. above 1e-3 where |out| > 0.2
 WITNESS_FACTOR = 10.0                       # CW precondition: the bias moves the reference by >= 10 x TOL_C
 MIN_FLOAT_WS = 1 << 20                      # [fix after fia1] the float workspace starts here and grows to the
                                             # plans' need (fi_float_need; fia1's fixed 256 MiB overflowed option B)
@@ -125,12 +172,25 @@ NCU_ORDER = ((32, 4), (32, 1), (8, 4), (8, 1))
 NCU_MARGIN_S = 120
 NCU_CAP_S = 600
 ATTN_KERNELS = ("BatchPrefillWithPagedKVCacheKernel", "PersistentVariableLengthMergeStatesKernel",
-                "_bi_split_kernel", "_bi_combine_kernel", "_bi_shared_kernel")
+                "_bi_split_kernel", "_bi_combine_kernel", "_bi_shared_kernel",
+                "flash_fwd", "kernel_topk_to_uint64")          # [fia3] V1: InfLLM-v2's forward and its mask packer
 KERNEL_FILTER = "regex:" + "|".join(ATTN_KERNELS)
 NCU_REQUIRED = ("gpu__time_duration.sum", "dram__bytes_read.sum", "dram__bytes_write.sum")
-NCU_OPTIONAL = ("lts__t_sector_hit_rate.pct",)
+NCU_OPTIONAL = ("lts__t_sector_hit_rate.pct",
+                # [fia3] L2 -> SM traffic (sectors of 32 B), L2 / DRAM / SM throughput, local memory (register spills)
+                "lts__t_sectors_srcunit_tex_op_read.sum", "lts__t_sectors_srcunit_tex.sum",
+                "lts__t_sectors.avg.pct_of_peak_sustained_elapsed",
+                "dram__throughput.avg.pct_of_peak_sustained_elapsed", "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+                "l1tex__t_bytes_pipe_lsu_mem_local_op_ld.sum", "l1tex__t_bytes_pipe_lsu_mem_local_op_st.sum")
+# [fia3] the LaunchStats section gives launch__registers_per_thread (a section always exists; a metric name may not
+# be listed by --query-metrics, and an unknown metric name stops ncu)
+NCU_SECTIONS = ("LaunchStats",)
+NCU_LAUNCH = ("launch__registers_per_thread", "launch__shared_mem_per_block_dynamic", "launch__grid_size")
+L2_SECTOR_BYTES = 32
 TAG_RE = re.compile(r"fia\|([A-Z0-9]+)")
-KERNELS_PER_CALL = dict(P=2, F8=4, F0=2, FH=None, S5=2)   # F8: 2 heads x (prefill + merge); F0: 2 x prefill
+KERNELS_PER_CALL = dict(P=2, F8=4, F0=2, FH=None, S5=2,   # F8: 2 heads x (prefill + merge); F0: 2 x prefill
+                        FP0=2, FP8=4, FPU=2, V1=None)     # [fia3] FP8: 2 x (prefill + merge); V1: 2 calls x (packer +
+                                                          # forward, maybe split + combine): not fixed
 REUSE_LABEL = dict(
     P="hardware cache only: per-row loads; the rows of a request are adjacent programs of one grid (L2 reuse)",
     F8="hardware cache only: one CTA per (row, chunk); requests in request-major order (L2 reuse)",
@@ -138,6 +198,13 @@ REUSE_LABEL = dict(
     FH="hardware cache only (negative control)",
     S5="hardware cache only, forced temporal locality: one program per (request, head, split) reloads each tile per "
        "row (tile 'reload'; L1 / L2), no register or shared-memory sharing",
+    FP0="EXPLICIT shared tile: one CTA per (request, KV head) stages each union KV tile in shared memory once for all "
+        "rows x 16 query heads (FlashInfer's GQA packing, CTA_TILE_Q 64); each row selects its own tokens by the "
+        "packed custom mask",
+    FP8="as FP0, the union cut in chunks of 8 pages (one CTA per chunk) + a merge kernel",
+    FPU="as FP0 without the mask (timing only)",
+    V1="hardware cache only: InfLLM-v2 varlen, kBlockM 16 = one token x 16 heads per CTA; the rows of a request reuse "
+       "the union pages through L2",
 )
 VARIANT_NAME = "R2FiCisBias"
 VARIANT_URI = "r2_fiattn_cisbias_bf16_d%d"
@@ -184,6 +251,64 @@ VARIANT_TENSORS = (["cis_bias"], ["nv_bfloat16"])
 VARIANT_SCALARS = (["cis_page_mul", "cis_entry_stride", "cis_head", "cis_sm_scale"],
                    ["int64_t", "int64_t", "int64_t", "double"])
 
+# [fia3] The FP arms' variant: R2FiCisBias (the same LogitsTransform, verbatim) + a LogitsMask that reads OUR packed
+# mask with FlashInfer's own formula (variants.cuh DefaultAttention, 0.6.8 :57-63, :78-87): the custom mask of a
+# custom variant lives in the variant (the generated PagedParams of a custom module have no maybe_custom_mask field:
+# nosa-env/jit/fiattn_fia2_2191262/.../generated/r2_fiattn_cisbias_bf16_d128/batch_prefill_config.inc). Our tensor
+# names do not start with "maybe", so FlashInfer 0.5.3 (run args appended in order) and 0.6.8 (prepare_jit_additional_
+# args: unknown names take the user args in order) pass the same arguments. r2_mask_indptr holds ABSOLUTE byte
+# offsets into r2_mask, per KV head (one row per wrapper).
+VARIANT_NAME_FP = "R2FiCisBiasMask"
+VARIANT_URI_FP = "r2_fia3_cisbias_mask_bf16_d%d"
+VARIANT_DECL_FP = r"""
+template <typename T, typename = void>
+struct r2fm_has_paged_kv : std::false_type {};
+template <typename T>
+struct r2fm_has_paged_kv<T, std::void_t<decltype(std::declval<T>().paged_kv)>> : std::true_type {};
+
+struct R2FiCisBiasMask : AttentionVariantBase {
+  static constexpr bool use_softmax = true;
+  uint32_t window_left, qo_len, kv_len;
+  float sm_scale_log2;
+  uint8_t* r2_mask_ptr;
+
+  template <typename Params>
+  __device__ __host__ R2FiCisBiasMask(const Params& params, uint32_t batch_idx, uint8_t* smem_ptr) {
+    qo_len = params.get_qo_len(batch_idx);
+    kv_len = params.get_kv_len(batch_idx);
+    window_left = kv_len;
+    sm_scale_log2 = math::log2e;
+    r2_mask_ptr = params.r2_mask + params.r2_mask_indptr[batch_idx];
+  }
+
+  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+    float b = 0.f;
+    if constexpr (r2fm_has_paged_kv<Params>::value) {
+      if (kv_idx < kv_len) {
+        uint32_t pg, e;
+        params.paged_kv.page_size.divmod(kv_idx, pg, e);
+        const int64_t page = static_cast<int64_t>(params.paged_kv.indices[params.paged_kv.indptr[batch_idx] + pg]);
+        b = __bfloat162float(params.cis_bias[page * params.cis_page_mul +
+                                             static_cast<int64_t>(e) * params.cis_entry_stride + params.cis_head]);
+      }
+    }
+    return (logits + b) * static_cast<float>(params.cis_sm_scale);
+  })
+
+  REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+    bool mask = true;
+    if (qo_idx >= qo_len || kv_idx >= kv_len) {
+      mask = false;
+    } else {
+      const uint64_t offset = static_cast<uint64_t>(qo_idx) * kv_len + kv_idx;
+      mask = ((r2_mask_ptr[offset / 8] >> (offset % 8)) & 1);
+    }
+    return mask;
+  })
+};
+"""
+VARIANT_TENSORS_FP = (["cis_bias", "r2_mask", "r2_mask_indptr"], ["nv_bfloat16", "uint8_t", "int32_t"])
+
 # REGISTERED before any run (docs/R2_FIATTN_PLAN.md section 6 carries the same table; the lead stamps it).
 # Bands are [central, low, high]. Times in ms (CUDA events, median), per attention call of one layer.
 PRED = {
@@ -208,6 +333,28 @@ PRED = {
     "dram_read_over_ideal": {"1": {"P": [1.0, 0.9, 1.2], "F8": [1.0, 0.9, 1.25], "F0": [1.0, 0.9, 1.25]},
                              "4": {"P": [0.45, 0.28, 0.9], "F8": [0.45, 0.28, 0.9], "F0": [0.45, 0.28, 0.9],
                                    "S5": [0.33, 0.28, 0.7]}},
+}
+
+# [fia3] REGISTERED before the run by the LEAD (the stamp is the lead's; docs/NOTES_fia3.md section 6 carries the
+# same json; test FC15 keeps them equal). Bands [central, low, high]. Sources: the plan (Task 0.3) and the survey
+# (section 7, "Predictions (MODEL, to register)"); the survey gives intervals only for the byte ratios, so their
+# central value is the interval midpoint (a builder choice).
+PRED3 = {
+    "registered": "REGISTERED <TBD-for-lead-stamp>",
+    "source": "PLAN_speckv_on_cached_nosa.md Task 0.3; SURVEY_shared_kv_kernel.md section 7",
+    "fp0_over_p_device": {"216x4": [0.75, 0.45, 1.3], "216x4s1": [0.75, 0.45, 1.3]},
+    "fp0_dram_read_over_union": [1.05, 1.0, 1.1],
+    "fp0_l2sm_read_over_union": [1.15, 1.0, 1.3],
+    "p_l2sm_read_over_sum": [0.975, 0.9, 1.05],
+    "p_device_ms_per_layer_216x4_central": 1.37,
+    "thresholds": {"fp0_over_p_max": 0.8, "tick_overhead_ms_max": 1.0, "layers_per_tick": 32,
+                   "hbm_bound_l2sm_drop": 3.0},
+    "decision": "ADOPT option 1 (FP0) if, at B 216 x 4, FP0 device time <= 0.8 x P device time AND plan + mask "
+                "build <= 1 ms per tick amortized (one plan per tick, 32 layer builds) AND the FP0 MUST gates pass. "
+                "Else read the ncu split: mask-bound -> a compact mask (FPc); plan-bound -> survey option 2 (a fork of "
+                "vLLM's Triton unified attention) with this measured blocker written down as the skill's rung-4 row. "
+                "If L2->SM bytes fall 3x (P / FP0) but the time does not move (FP0 / P > 0.8): HBM-bound, stop at the "
+                "15 % byte bound.",
 }
 
 
@@ -257,19 +404,32 @@ def geometry_from_config(cfg: dict) -> dict:
 
 
 def parse_cells(text):
-    """'8x1,8x4' -> [(8, 1), (8, 4)]; B in 1 .. 64, rows per request in 1 .. 4; no repeats."""
+    """'8x1,8x4,216x4s1' -> [(8, 1), (8, 4), (216, 4, 's1')]; B in 1 .. MAX_B, rows per request in 1 .. 4; no repeats.
+    [fia3] the suffix s1 = the lists of the recorded S1 tick tables (--s1-tables); none = the seeded generator."""
     out = []
     for part in [p for p in str(text).split(",") if p]:
-        m = re.fullmatch(r"(\d+)x(\d+)", part.strip())
+        m = re.fullmatch(r"(\d+)x(\d+)(s1)?", part.strip())
         if m is None:
-            raise ValueError("cell %r is not BxR" % part)
+            raise ValueError("cell %r is not BxR or BxRs1" % part)
         b, r = int(m.group(1)), int(m.group(2))
-        if not (1 <= b <= 64 and 1 <= r <= 4) or (b, r) in out:
-            raise ValueError("cell %r (B 1 .. 64, rows per request 1 .. 4, no repeats)" % part)
-        out.append((b, r))
+        c = (b, r) if m.group(3) is None else (b, r, "s1")
+        if not (1 <= b <= MAX_B and 1 <= r <= 4) or c in out:
+            raise ValueError("cell %r (B 1 .. %d, rows per request 1 .. 4, no repeats)" % (part, MAX_B))
+        out.append(c)
     if not out:
         raise ValueError("no cells")
     return out
+
+
+def cell_parts(c):
+    """[fia3] (B, rows per request, source): source 'gen' (the seeded generator) or 's1' (the recorded tables)."""
+    return int(c[0]), int(c[1]), (c[2] if len(c) > 2 else "gen")
+
+
+def ncu_key(c):
+    """[fia3] the ncu order: generator cells first, then larger B, then more rows (fia2's 32x4, 32x1, 8x4, 8x1)."""
+    b, r, src = cell_parts(c)
+    return (src != "gen", -b, -r)
 
 
 def parse_arms(text):
@@ -279,8 +439,8 @@ def parse_arms(text):
     return arms
 
 
-def cell_tag(b, r):
-    return "%dx%d" % (b, r)
+def cell_tag(b, r, src="gen"):
+    return "%dx%d%s" % (b, r, "s1" if src == "s1" else "")
 
 
 def cell_seed(seed, b, r):
@@ -319,10 +479,13 @@ def _short_list(c):
     return torch.cat([torch.tensor([0]), torch.arange(TAIL_BLOCK - (c - 2), TAIL_BLOCK), torch.tensor([TAIL_BLOCK])])
 
 
-def make_case(geom, b, rpr, seed, with_data=True):
+def make_case(geom, b, rpr, seed, with_data=True, data_device="cpu"):
     """The cell's fixed, seeded case on the CPU (module docstring). The lists are drawn BEFORE the data, so
     with_data=False (the ncu summary) gives the same lists without the tensors. Storage entries 0 .. B - 1 are the
-    requests, entry B holds the hazard rows."""
+    requests, entry B holds the hazard rows.
+    [fia3] "altreq": every ODD REQUEST gets new lists and a new q (the FP arms' FI3: their unit is the request), drawn
+    from a SEPARATE generator after everything else, so the lists and data of fia1 / fia2 stay bitwise the same.
+    data_device "cuda": K / V / bias come from a seeded CUDA generator (the 216-request cells: about 3.6 GB)."""
     hq, hkv, d = geom["Hq"], geom["Hkv"], geom["D"]
     if not (1 <= rpr <= 4 and b >= 1):
         raise ValueError("B %r, rows per request %r" % (b, rpr))
@@ -357,8 +520,17 @@ def make_case(geom, b, rpr, seed, with_data=True):
     full = rows(blocks, seq, last)
     alt = rows(alt_blocks, seq, last)
     short = rows(sblocks, torch.full((len(SHORT_COUNTS),), n_ - 1), torch.full((len(SHORT_COUNTS),), SHORT_LAST))
+    g2 = torch.Generator().manual_seed(cs + ALTREQ_SEED_OFFSET)             # [fia3] the altreq lists and q only
+    areq_blocks = blocks.clone()
+    for n in range(1, b, 2):
+        for h in range(hkv):
+            sc0 = _draw_scattered(g2)
+            for u in range(rpr):
+                areq_blocks[n * rpr + u, h] = _full_list(sc0 if u == 0 else _swap(g2, sc0))
+    altreq = rows(areq_blocks, seq, last)
     case = dict(geom=dict(geom), B=b, rpr=rpr, R=r_, N=n_, S=s_, P=p_, seed=cs, slot_of_block=slot_of_block,
-                full=full, alt=alt, short=short, k=None, v=None, bias=None)
+                full=full, alt=alt, short=short, altreq=altreq, k=None, v=None, bias=None, src="gen",
+                data_device=data_device)
     if with_data:
         q = torch.randn(r_, hq, d, generator=g).to(torch.bfloat16)
         qa = torch.randn(r_, hq, d, generator=g).to(torch.bfloat16)
@@ -366,16 +538,157 @@ def make_case(geom, b, rpr, seed, with_data=True):
         odd = (torch.arange(r_) % 2 == 1).view(-1, 1, 1)
         alt["q"] = torch.where(odd, qa, q).contiguous()
         short["q"] = torch.randn(len(SHORT_COUNTS), hq, d, generator=g).to(torch.bfloat16)
+        _store_data(case, g, cs, n_, s_, hkv, d, data_device)
+        odd_req = ((torch.arange(r_) // rpr) % 2 == 1).view(-1, 1, 1)
+        altreq["q"] = torch.where(odd_req, torch.randn(r_, hq, d, generator=g2).to(torch.bfloat16), q).contiguous()
+    return case
+
+
+ALTREQ_SEED_OFFSET = 1000003                # [fia3] the altreq generator (a seed no cell_seed reaches in practice)
+S1_SEED_OFFSET = 500000                     # [fia3] the s1 cells' data generator
+
+
+def _store_data(case, g, cs, n_, s_, hkv, d, data_device):
+    """K / V / bias of the store. CPU: from g, in fia1 / fia2's order (the same bits). [fia3] another device: from a
+    CUDA generator seeded with the cell seed (one draw per tensor, the same order)."""
+    if str(data_device) == "cpu":
         case["k"] = torch.randn(n_, s_ * PAGE, hkv, d, generator=g).to(torch.bfloat16)
         case["v"] = torch.randn(n_, s_ * PAGE, hkv, d, generator=g).to(torch.bfloat16)
         case["bias"] = ((torch.rand(n_, s_ * PAGE, hkv, generator=g) * 2 - 1) * BIAS_RANGE).to(torch.bfloat16)
+        return
+    gd = torch.Generator(device=data_device).manual_seed(cs)
+    case["k"] = torch.randn(n_, s_ * PAGE, hkv, d, generator=gd, device=data_device).to(torch.bfloat16)
+    case["v"] = torch.randn(n_, s_ * PAGE, hkv, d, generator=gd, device=data_device).to(torch.bfloat16)
+    case["bias"] = ((torch.rand(n_, s_ * PAGE, hkv, generator=gd, device=data_device) * 2 - 1)
+                    * BIAS_RANGE).to(torch.bfloat16)
+
+
+# ------------------------------------------------------------------ [fia3] the recorded S1 tick tables
+S1_FIELDS = ("seq_idx", "page_table", "num_pages", "last_len", "page_key")
+
+
+def load_s1_tables(path):
+    """The recorded inputs of the S1 tick's first keyed calls with rows_max 4 (sharedkv3 SharedKVProbe.report_tables,
+    saved by r2_tick_gate.py:128-134): a list of dicts with seq_idx (R,), page_table / page_key (R, Hkv, P), num_pages
+    (R, Hkv), last_len (R,). Loaded as weights only (dicts, lists, str, int, tensors)."""
+    try:
+        t = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:                                                   # a torch without weights_only
+        t = torch.load(path, map_location="cpu")
+    if not isinstance(t, list) or not t:
+        raise ValueError("%s: not a non-empty list of recorded calls" % path)
+    for i, d in enumerate(t):
+        miss = [f for f in S1_FIELDS if not (isinstance(d, dict) and torch.is_tensor(d.get(f)))]
+        if miss:
+            raise ValueError("%s: call %d lacks %s" % (path, i, miss))
+    return t
+
+
+def s1_groups(tables, rpr, hkv):
+    """The recorded REQUESTS with exactly rpr rows (rows with one seq_idx in one call, as build_groups groups them),
+    pooled over the calls in call order and ascending seq_idx; each request's rows in POSITION order (tail block x 64 +
+    last_len; the tail = the last listed page of KV head 0)."""
+    out = []
+    for c, t in enumerate(tables):
+        pt = t["page_table"].to(torch.int64)
+        pk = t["page_key"].to(torch.int64)
+        npg = t["num_pages"].to(torch.int64)
+        ll = t["last_len"].to(torch.int64)
+        seq = t["seq_idx"].to(torch.int64)
+        r_, h_, p_ = pt.shape
+        if h_ != hkv or tuple(pk.shape) != (r_, h_, p_) or tuple(npg.shape) != (r_, h_) or tuple(ll.shape) != (r_,) \
+                or tuple(seq.shape) != (r_,):
+            raise ValueError("recorded call %d: shapes seq %s table %s key %s num_pages %s last_len %s (Hkv %d)"
+                             % (c, tuple(seq.shape), tuple(pt.shape), tuple(pk.shape), tuple(npg.shape),
+                                tuple(ll.shape), hkv))
+        seql = seq.tolist()
+        for s in sorted(set(seql)):
+            rows_ = [i for i in range(r_) if seql[i] == s]
+            if len(rows_) != rpr:
+                continue
+            sel = torch.tensor(rows_)
+            if bool(((ll[sel] < 1) | (ll[sel] > PAGE)).any()) or bool((npg[sel] < 1).any()):
+                continue                                                 # not a valid extent: not a request here
+            rows_.sort(key=lambda i: int(pk[i, 0, max(int(npg[i, 0]) - 1, 0)]) * PAGE + int(ll[i]))
+            idx = torch.tensor(rows_)
+            out.append(dict(call=c, seq=s, rows=rows_, page_key=pk[idx], page_table=pt[idx], num_pages=npg[idx],
+                            last_len=ll[idx]))
+    return out
+
+
+def make_case_s1(geom, b, rpr, seed, groups, with_data=True, data_device="cpu"):
+    """[fia3] A case with make_case's fields whose LISTS are recorded: request n takes recorded group n mod G (its rows
+    in position order, its (block id, slot) lists and extents) on its own storage entry n; q / K / V / bias are
+    synthetic (seeded). alt: every odd row takes the same row of the next group; altreq: every odd request takes the
+    next group; both get a new q. The hazard rows (5, 8, 9 pages) sit on entry B with a seeded block -> slot map.
+    S = max(256, the largest recorded slot + 1)."""
+    hq, hkv, d = geom["Hq"], geom["Hkv"], geom["D"]
+    if not groups:
+        raise ValueError("no recorded request with %d rows" % rpr)
+    p_ = int(groups[0]["page_table"].shape[-1])
+    for gr in groups:
+        if tuple(gr["page_table"].shape) != (rpr, hkv, p_):
+            raise ValueError("recorded group shape %s != (%d, %d, %d)" % (tuple(gr["page_table"].shape), rpr, hkv, p_))
+    cs = cell_seed(seed, b, rpr) + S1_SEED_OFFSET
+    g = torch.Generator().manual_seed(cs)
+    G = len(groups)
+    r_, n_ = b * rpr, b + 1
+    pick = [n % G for n in range(b)]
+    nxt = [(i + 1) % G for i in pick]
+
+    def stack(sel_rows):
+        """sel_rows: per row r, (group index, row u in the group)."""
+        f = {}
+        for key in ("page_key", "page_table", "num_pages", "last_len"):
+            f[key] = torch.stack([groups[gi][key][u] for gi, u in sel_rows])
+        return f
+    base_rows = [(pick[n], u) for n in range(b) for u in range(rpr)]
+    alt_rows = [(nxt[n], u) if (n * rpr + u) % 2 == 1 else (pick[n], u) for n in range(b) for u in range(rpr)]
+    areq_rows = [(nxt[n], u) if n % 2 == 1 else (pick[n], u) for n in range(b) for u in range(rpr)]
+    lists = [stack(x) for x in (base_rows, alt_rows, areq_rows)]
+    mx = 0
+    for f in lists:
+        valid = torch.arange(p_).view(1, 1, p_) < f["num_pages"].unsqueeze(-1)
+        mx = max(mx, int(torch.where(valid, f["page_table"], torch.full_like(f["page_table"], -1)).max()))
+    s_ = max(S_SLOTS, mx + 1)
+    slot_of_block = torch.stack([torch.randperm(s_, generator=g) for _ in range(n_)])
+    seq = torch.arange(b).repeat_interleave(rpr)
+
+    def rows(f, seq_idx):
+        return dict(seq_idx=seq_idx.to(torch.int32).contiguous(), page_key=f["page_key"].to(torch.int32).contiguous(),
+                    page_table=f["page_table"].to(torch.int32).contiguous(),
+                    num_pages=f["num_pages"].to(torch.int32).contiguous(),
+                    last_len=f["last_len"].to(torch.int32).contiguous())
+    full, alt, altreq = (rows(f, seq) for f in lists)
+    sblocks = torch.full((len(SHORT_COUNTS), hkv, p_), -1, dtype=torch.int64)
+    for i, c in enumerate(SHORT_COUNTS):
+        sblocks[i, :, :c] = _short_list(c)
+    sslots = torch.where(sblocks >= 0, slot_of_block[n_ - 1][sblocks.clamp(min=0)], torch.full_like(sblocks, -1))
+    short = dict(seq_idx=torch.full((len(SHORT_COUNTS),), n_ - 1, dtype=torch.int32),
+                 page_key=sblocks.to(torch.int32).contiguous(), page_table=sslots.to(torch.int32).contiguous(),
+                 num_pages=(sblocks >= 0).sum(-1).to(torch.int32).contiguous(),
+                 last_len=torch.full((len(SHORT_COUNTS),), SHORT_LAST, dtype=torch.int32))
+    case = dict(geom=dict(geom), B=b, rpr=rpr, R=r_, N=n_, S=s_, P=p_, seed=cs, slot_of_block=slot_of_block,
+                full=full, alt=alt, short=short, altreq=altreq, k=None, v=None, bias=None, src="s1",
+                data_device=data_device, s1_groups=G, s1_calls=sorted({gr["call"] for gr in groups}))
+    if with_data:
+        q = torch.randn(r_, hq, d, generator=g).to(torch.bfloat16)
+        qa = torch.randn(r_, hq, d, generator=g).to(torch.bfloat16)
+        full["q"] = q
+        odd = (torch.arange(r_) % 2 == 1).view(-1, 1, 1)
+        alt["q"] = torch.where(odd, qa, q).contiguous()
+        odd_req = ((torch.arange(r_) // rpr) % 2 == 1).view(-1, 1, 1)
+        altreq["q"] = torch.where(odd_req, qa, q).contiguous()
+        short["q"] = torch.randn(len(SHORT_COUNTS), hq, d, generator=g).to(torch.bfloat16)
+        _store_data(case, g, cs, n_, s_, hkv, d, data_device)
     return case
 
 
 def case_to(case, device):
     out = dict(case)
-    for k in ("full", "alt", "short"):
-        out[k] = {f: t.to(device) for f, t in case[k].items()}
+    for k in ("full", "alt", "short", "altreq"):
+        if k in case:
+            out[k] = {f: t.to(device) for f, t in case[k].items()}
     for f in CACHE_FIELDS:
         out[f] = None if case[f] is None else case[f].to(device)
     return out
@@ -601,7 +914,7 @@ def jit_args_for(d):
 
 
 def version_ok(v):
-    return str(v).split("+")[0] == FI_VERSION
+    return str(v).split("+")[0] in FI_VERSIONS
 
 
 def plan_info_of(w):
@@ -641,6 +954,367 @@ def fi_float_need(counts, split, g, d, sms, fixed=FIXED_SPLIT):
     else:
         raise ValueError(split)
     return _a16(g * nb * cta * d * 4) + _a16(g * nb * cta * 4)
+
+
+# ------------------------------------------------------------------ [fia3] FlashInfer PREFILL over the request union
+_BIG = torch.iinfo(torch.int64).max
+FP_SPLIT = 8                                # FP8: fixed_split_size in pages of the union list (= piece 3's split)
+A100_SMEM_PER_SM = 167936                   # cudaDevAttrMaxSharedMemoryPerMultiprocessor on sm80 (164 KiB)
+LAYERS_PER_TICK = 32                        # NOSA-8B layers: the plan-reuse amortization
+
+
+def cta_tile_prefill(qo_len, g):
+    """FA2DetermineCtaTileQ (utils.cuh:384-403, sm80+) at the average packed length qo_len x group."""
+    packed = int(qo_len) * int(g)
+    return 128 if packed > 64 else (64 if packed > 16 else 16)
+
+
+def kv_tile_tokens(cta_tile_q, d, smem_per_sm=A100_SMEM_PER_SM, dtype_bytes=2):
+    """MODEL of the paged prefill kernel's KV tile (0.6.8 prefill.cuh:2556-2601; the 0.5.3 headers live inside the sif
+    and are NOT read): NUM_WARPS_Q 4 when CTA_TILE_Q > 16 (else 1), NUM_WARPS_KV = 4 / NUM_WARPS_Q, NUM_MMA_Q 2 when
+    CTA_TILE_Q > 64 (else 1), 2 CTAs per SM when two fit, NUM_MMA_KV = min(8 / NUM_MMA_Q, the shared-memory bound); the
+    tile = NUM_MMA_KV x NUM_WARPS_KV x 16 tokens. A100, CTA_TILE_Q 64, D 128, bf16: 8 x 1 x 16 = 128 tokens = 2 pages.
+    The dispatch reads only the device's shared memory: no public option pins it (the EXACT-mode note)."""
+    nwq = 4 if cta_tile_q > 16 else 1
+    nwkv = 4 // nwq
+    nmq = 2 if cta_tile_q > 64 else 1
+    kv_row = 2 * d * 16 * nwkv * dtype_bytes
+    per_cta = cta_tile_q * d * dtype_bytes + kv_row
+    ctas = 2 if smem_per_sm >= 2 * per_cta else 1
+    by_smem = (smem_per_sm // ctas - cta_tile_q * d * dtype_bytes) // kv_row
+    return min(8 // nmq, by_smem) * nwkv * 16
+
+
+KV_TILE_PAGES = kv_tile_tokens(64, 128) // PAGE     # 2 on an A100 (MODEL)
+
+
+def fp_float_need(counts, split, g, d, qo_len, fixed=FP_SPLIT):
+    """FlashInfer's float workspace for ONE prefill plan (0.6.8 scheduler.cuh:771-776): tmp_v = G x padded x
+    CTA_TILE_Q x D x 4 B and tmp_s = G x padded x CTA_TILE_Q x 4 B, each 16-aligned, padded = the sum of the chunks
+    (counts = the union pages of each request); 0 without a split."""
+    if split == "none":
+        return 0
+    if split != "fixed":
+        raise ValueError(split)
+    cta = cta_tile_prefill(qo_len, g)
+    nb = sum(max(1, -(-int(c) // fixed)) for c in counts)
+    return _a16(g * nb * cta * d * 4) + _a16(g * nb * cta * 4)
+
+
+def fp_union(b, rpr, s_slots, ones=False):
+    """Per (KV head h, request n) the UNION of the rows' pages (rows n * rpr .. n * rpr + rpr - 1, one storage entry),
+    in ascending (block id, slot) order (each row's canonical list is a subsequence), and per (row, union page) the
+    number of leading tokens the row sees: 64 for a listed page before the row's LAST LISTED page, last_len for that
+    page (piece 3 / reference_fp64 semantics), 0 for a page the row does not list. ones=True: every row gets the pair's
+    reach (the MASK WITNESS). Device ops only (sort, cumsum, scatter, gather): NO host read (CUDA-graph capturable).
+    Returns int64 tensors (U = rpr x P):
+      ucnt  (Hkv, B)          the union size (pages)
+      upage (Hkv, B, U)       page id entry x S + slot of union page j (j < ucnt), 0 past it
+      ukey  (Hkv, B, U)       block id of union page j, -1 past it
+      ext   (Hkv, B, rpr, U)  tokens row u sees in union page j
+      uidx  (Hkv, B, rpr, P)  union index of row u's list position i, -1 past num_pages
+      klast (Hkv, B)          the last union page's extent: kv_len = (ucnt - 1) x 64 + klast"""
+    pk = b["page_key"].to(torch.int64)
+    pt = b["page_table"].to(torch.int64)
+    npg = b["num_pages"].to(torch.int64)
+    ll = b["last_len"].to(torch.int64)
+    r_, hkv, p_ = pt.shape
+    if r_ % rpr:
+        raise ValueError("%d rows are not requests of %d rows" % (r_, rpr))
+    nb = r_ // rpr
+    uw = rpr * p_
+    dev = pt.device
+    pos = torch.arange(p_, device=dev).view(1, 1, p_)
+    valid = pos < npg.unsqueeze(-1)
+    is_last = pos == (npg - 1).unsqueeze(-1)
+    ext_row = torch.where(is_last, ll.view(r_, 1, 1).expand(r_, hkv, p_), torch.full_like(pt, PAGE))
+    ext_row = torch.where(valid, ext_row, torch.zeros_like(ext_row))
+    comb = torch.where(valid, (pk << 32) | pt, torch.full_like(pt, _BIG))
+
+    def grp(t):                                                      # (R, Hkv, P) -> (Hkv, B, rpr x P), (u, i) order
+        return t.reshape(nb, rpr, hkv, p_).permute(2, 0, 1, 3).reshape(hkv, nb, uw)
+    sv, si = torch.sort(grp(comb), dim=-1, stable=True)
+    okv = sv != _BIG
+    first = okv.clone()
+    first[..., 1:] &= sv[..., 1:] != sv[..., :-1]
+    uid = first.to(torch.int64).cumsum(-1) - 1
+    ucnt = first.to(torch.int64).sum(-1)
+    dest = torch.where(first, uid, torch.full_like(uid, uw))
+    entry = b["seq_idx"].to(torch.int64).reshape(nb, rpr)[:, 0].view(1, nb, 1)
+    slot = sv & 0xFFFFFFFF
+    upage = torch.zeros((hkv, nb, uw + 1), dtype=torch.int64, device=dev)
+    upage.scatter_(-1, dest, torch.where(first, entry * s_slots + slot, torch.zeros_like(slot)))
+    ukey = torch.full((hkv, nb, uw + 1), -1, dtype=torch.int64, device=dev)
+    ukey.scatter_(-1, dest, torch.where(first, sv >> 32, torch.full_like(sv, -1)))
+    uidx = torch.full((hkv, nb, uw), -1, dtype=torch.int64, device=dev)
+    uidx.scatter_(-1, si, torch.where(okv, uid, torch.full_like(uid, -1)))
+    row = torch.div(si, p_, rounding_mode="floor")
+    ext_s = grp(ext_row).gather(-1, si)
+    ext = torch.zeros((hkv, nb, rpr * (uw + 1)), dtype=torch.int64, device=dev)
+    ext.scatter_(-1, row * (uw + 1) + torch.where(okv, uid, torch.full_like(uid, uw)),
+                 torch.where(okv, ext_s, torch.zeros_like(ext_s)))
+    ext = ext.view(hkv, nb, rpr, uw + 1)[..., :uw]
+    if ones:
+        ext = ext.amax(dim=2, keepdim=True).expand(hkv, nb, rpr, uw).contiguous()
+    lastj = (ucnt - 1).clamp(min=0).view(hkv, nb, 1, 1).expand(hkv, nb, rpr, 1)
+    klast = ext.gather(-1, lastj).amax(dim=2).view(hkv, nb)
+    return dict(ucnt=ucnt, upage=upage[..., :uw], ukey=ukey[..., :uw], uidx=uidx.view(hkv, nb, rpr, p_), ext=ext,
+                klast=klast)
+
+
+def fp_csr(u):
+    """FlashInfer's CSR for the union, per KV head (one wrapper each): indptr (Hkv, B + 1) int32 = the union sizes'
+    prefix sums; indices (Hkv, B x U + 1) int32 (the first indptr[B] entries are the union page ids, request by
+    request; the last entry is a dump slot); last_page_len (Hkv, B) int32 = klast. Device ops only."""
+    ucnt = u["ucnt"]
+    hkv, nb = ucnt.shape
+    uw = u["upage"].shape[-1]
+    dev = ucnt.device
+    indptr = torch.zeros((hkv, nb + 1), dtype=torch.int64, device=dev)
+    indptr[:, 1:] = torch.cumsum(ucnt, 1)
+    j = torch.arange(uw, device=dev).view(1, 1, uw)
+    pos = indptr[:, :-1].unsqueeze(-1) + j
+    pos = torch.where(j < ucnt.unsqueeze(-1), pos, torch.full_like(pos, nb * uw))
+    ix = torch.zeros((hkv, nb * uw + 1), dtype=torch.int32, device=dev)
+    ix.scatter_(1, pos.reshape(hkv, -1), u["upage"].reshape(hkv, -1).to(torch.int32))
+    return indptr.to(torch.int32), ix, u["klast"].to(torch.int32)
+
+
+def fp_mask_cap(hkv, nb, rpr, uw):
+    """The packed mask's static capacity in bytes (every request at its widest union: no host read)."""
+    return hkv * nb * ((rpr * uw * PAGE + 7) // 8)
+
+
+def fp_pack(u):
+    """The packed custom mask in FlashInfer's OWN layout (variants.cuh DefaultAttention; VARIANT_DECL_FP): request
+    (h, n) owns a byte-aligned segment of ceil(rpr x kv_len / 8) bytes, segments in (h, n) order; row u sees token t
+    iff bit u x kv_len + t of its segment is set (little bit order). The token bits are EXPANDED FROM THE BLOCK BITS:
+    union page j of row u gives a 64-token word whose first ext[u, j] bits are set. Device ops only: each word's 8
+    bytes are shifted by the row's bit phase (u x kv_len mod 8) into 9 bytes and ADDED into an int32 accumulator (the
+    bits are disjoint, so add = or; bytes past a segment's end carry only zero bits and go to a dump byte).
+    Returns (mask uint8 (cap + 1,), the last byte the dump; mask_indptr int32 (Hkv, B + 1): ABSOLUTE byte offsets of
+    the segments, row h for KV head h's wrapper; kv_len int64 (Hkv, B))."""
+    ext = u["ext"]
+    hkv, nb, rpr, uw = ext.shape
+    dev = ext.device
+    kv_len = (u["ucnt"] - 1) * PAGE + u["klast"]
+    seg = torch.div(rpr * kv_len + 7, 8, rounding_mode="floor")
+    base = torch.zeros(hkv * nb + 1, dtype=torch.int64, device=dev)
+    base[1:] = torch.cumsum(seg.reshape(-1), 0)
+    cap = fp_mask_cap(hkv, nb, rpr, uw)
+    k8 = torch.arange(8, device=dev, dtype=torch.int64) * 8
+    nbits = (ext.unsqueeze(-1) - k8).clamp(0, 8)                                   # (Hkv, B, rpr, U, 8)
+    wb = (torch.ones_like(nbits) << nbits) - 1                                     # byte k of the word
+    rowbit = torch.arange(rpr, device=dev, dtype=torch.int64).view(1, 1, rpr) * kv_len.unsqueeze(-1)
+    sh = (rowbit % 8).view(hkv, nb, rpr, 1, 1)
+    z = torch.zeros_like(wb[..., :1])
+    lo = torch.cat([wb, z], -1)                                                    # wb[k], k = 0 .. 8
+    hi = torch.cat([z, wb], -1)                                                    # wb[k - 1]
+    out9 = ((lo << sh) | (hi >> (8 - sh))) & 0xFF
+    start = (base[:-1].view(hkv, nb, 1, 1) + torch.div(rowbit, 8, rounding_mode="floor").unsqueeze(-1)
+             + torch.arange(uw, device=dev).view(1, 1, 1, uw) * 8)
+    idx = start.unsqueeze(-1) + torch.arange(9, device=dev)
+    idx = torch.where(idx < base[1:].view(hkv, nb, 1, 1, 1), idx, torch.full_like(idx, cap))
+    acc = torch.zeros(cap + 1, dtype=torch.int32, device=dev)
+    acc.scatter_add_(0, idx.reshape(-1), out9.reshape(-1).to(torch.int32))
+    mi = base[torch.arange(hkv, device=dev).view(-1, 1) * nb + torch.arange(nb + 1, device=dev).view(1, -1)]
+    return acc.to(torch.uint8), mi.to(torch.int32), kv_len
+
+
+def union_stats(u, b):
+    """REPORT numbers of one batch's union (ONE host read)."""
+    npg = b["num_pages"].to(torch.int64)
+    uc = u["ucnt"].to(torch.float64)
+    return dict(ucnt_mean=round(float(uc.mean()), 3), ucnt_max=int(u["ucnt"].max()),
+                union_over_sum=round(float(uc.sum() / npg.sum().clamp(min=1)), 5),
+                kv_len_mean=round(float(((u["ucnt"] - 1) * PAGE + u["klast"]).to(torch.float64).mean()), 1))
+
+
+def poison_precondition(u):
+    """FI5's precondition for the FP arms: FlashInfer loads EVERY token of a union page before the last one (it masks
+    them by score, not by load), and p = 0 times a NaN V is NaN. So the poison plant is valid only when every middle
+    union page is fully reached by some row. Returns (ok, detail) (one host read)."""
+    reach = u["ext"].amax(dim=2)
+    j = torch.arange(reach.shape[-1], device=reach.device).view(1, 1, -1)
+    mid = j < (u["ucnt"] - 1).unsqueeze(-1)
+    bad = int((mid & (reach < PAGE)).sum())
+    return bad == 0, "%d middle union pages are not fully reached by any row" % bad
+
+
+def chunk_tile_hazard(u, split=FP_SPLIT, tile_pages=KV_TILE_PAGES):
+    """FP8 hazard (MODEL from the 0.6.8 source): a split chunk starts its own online softmax at m = -inf; a row with no
+    visible token in the chunk's FIRST KV tile gets exp2(-inf - -inf) = NaN (prefill.cuh update_mdo_states has no
+    guard) and the merge keeps it. Returns (bad (request, head, row, chunk) cells, rows with any bad cell, chunks)."""
+    ext = u["ext"]
+    hkv, nb, rpr, uw = ext.shape
+    nch = -(-uw // split)
+    e = torch.nn.functional.pad(ext, (0, nch * split - uw)).view(hkv, nb, rpr, nch, split)
+    vis0 = e[..., :tile_pages].sum(-1)
+    live = (torch.arange(nch, device=ext.device) * split).view(1, 1, 1, nch) < u["ucnt"].view(hkv, nb, 1, 1)
+    bad = live & (vis0 == 0)
+    return int(bad.sum()), int(bad.any(-1).any(0).sum()), int(live[:, :, :1, :].sum())
+
+
+def flat_base(view):
+    """The contiguous tensor a view was made from, flat (the flat-address twins read through it)."""
+    t = view
+    while t._base is not None:
+        t = t._base
+    if not t.is_contiguous() or t.storage_offset() != 0:
+        raise ValueError("the base of the view must be contiguous from offset 0")
+    return t.reshape(-1)
+
+
+def fi_prefill_twin(q, k_view, v_view, bias, qo_indptr, kv_indptr, kv_indices, last_page_len, page_size, mask,
+                    mask_indptr, page_mul, entry_stride, head, scale, custom=True):
+    """CPU float64 TWIN of one FlashInfer paged-prefill call with R2FiCisBiasMask (lessons L28: the kernel's flat
+    addresses). Request i: query rows q[qo_indptr[i] + qo_idx] (G heads each); kv_len = (kv_indptr[i + 1] -
+    kv_indptr[i] - 1) x page_size + last_page_len[i]; token t is entry t % page_size of page kv_indices[kv_indptr[i] +
+    t // page_size], read at fi_offset of the view (page.cuh get_elem_offset); its bias at bias_offset(page, entry,
+    page_mul, entry_stride, head); logit = (q.k + bias) x scale; custom: token t is visible to row qo_idx iff bit
+    qo_idx x kv_len + t of the segment at byte mask_indptr[i] is set; else every token below kv_len is visible."""
+    kf, vf = flat_base(k_view).double(), flat_base(v_view).double()
+    bfl = bias.reshape(-1).double()
+    qi, ki = qo_indptr.to("cpu", torch.int64), kv_indptr.to("cpu", torch.int64)
+    ix, ll = kv_indices.to("cpu", torch.int64), last_page_len.to("cpu", torch.int64)
+    mk = mask.to("cpu", torch.int64) if custom else None
+    mi = mask_indptr.to("cpu", torch.int64) if custom else None
+    d = q.shape[-1]
+    feat = torch.arange(d).view(1, -1)
+    out = torch.zeros(tuple(q.shape), dtype=torch.float64)
+    for i in range(qi.numel() - 1):
+        kv_len = (int(ki[i + 1] - ki[i]) - 1) * page_size + int(ll[i])
+        t = torch.arange(kv_len)
+        page = ix[int(ki[i]) + torch.div(t, page_size, rounding_mode="floor")].view(-1, 1)
+        ent = (t % page_size).view(-1, 1)
+        kk = kf[fi_offset(k_view, page, ent, feat)]
+        vv = vf[fi_offset(v_view, page, ent, feat)]
+        bb = bfl[bias_offset(page.view(-1), ent.view(-1), page_mul, entry_stride, head)]
+        for r in range(int(qi[i + 1] - qi[i])):
+            if custom:
+                o = int(mi[i]) * 8 + r * kv_len + t
+                vis = ((mk[torch.div(o, 8, rounding_mode="floor")] >> (o % 8)) & 1).bool()
+            else:
+                vis = torch.ones(kv_len, dtype=torch.bool)
+            qq = q[int(qi[i]) + r].double().cpu()
+            lg = ((qq @ kk.t()) + bb.view(1, -1)) * scale
+            lg = lg.masked_fill(~vis.view(1, -1), float("-inf"))
+            out[int(qi[i]) + r] = torch.softmax(lg, dim=-1) @ vv
+    return out
+
+
+# ------------------------------------------------------------------ [fia3] V1: NOSA's prefill varlen over a union store
+def v1_layout(u):
+    """V1's contiguous store layout: W = the largest union over (KV head, request) (ONE host read) slots per request;
+    union page j < ucnt - 1 at slot j, the union's last page at slot W - 1, so with seqused_k = (W - 1) x 64 + klast
+    the kernel's causal rule (rows < seqused_k - rpr + u + 1, verify_step.py:37-42) cuts query u inside the last page.
+    Returns (W, slot_of (Hkv, B, U) int64: the slot of union page j, -1 past ucnt)."""
+    ucnt = u["ucnt"]
+    uw = u["upage"].shape[-1]
+    w = int(ucnt.max())
+    j = torch.arange(uw, device=ucnt.device).view(1, 1, uw)
+    last = (ucnt - 1).unsqueeze(-1)
+    slot_of = torch.where(j < last, j, torch.where(j == last, torch.full_like(j, w - 1), torch.full_like(j, -1)))
+    return w, slot_of
+
+
+def v1_args(b, u, rpr, geom):
+    """The internal op's tensors (verify_step.VarlenArgs fields) over a CONTIGUOUS union store gathered from the paged
+    store: ku / vu (B, W x 64, Hkv, D), bu (B, W x 64, Hkv); each (KV head, request) has its own slot map (the topk_idx
+    rows are per KV head, as EQ's union store); empty slots hold token row 0 of the store (never named, never loaded);
+    topk_idx (Hkv, B x rpr, P) int32 = the store slots of each row's listed pages (-1 padded), row n x rpr + u;
+    seqused_k (B,) int32 = (W - 1) x 64 + klast of KV head 0 (V1_pre: the same on every head)."""
+    hkv, d = geom["Hkv"], geom["D"]
+    w, slot_of = v1_layout(u)
+    ucnt = u["ucnt"]
+    nb = ucnt.shape[1]
+    uw = slot_of.shape[-1]
+    dev = ucnt.device
+    pas = torch.full((hkv, nb, w + 1), -1, dtype=torch.int64, device=dev)
+    pas.scatter_(-1, torch.where(slot_of >= 0, slot_of, torch.full_like(slot_of, w)),
+                 torch.where(slot_of >= 0, u["upage"], torch.full_like(slot_of, -1)))
+    pas = pas[..., :w]
+    e = torch.arange(PAGE, device=dev)
+    rows = (pas.clamp(min=0).unsqueeze(-1) * PAGE + e).reshape(hkv, nb * w * PAGE)
+    k, v, bias = b["k"], b["v"], b["bias"]
+    kf, vf, bfl = k.reshape(-1, hkv, d), v.reshape(-1, hkv, d), bias.reshape(-1, hkv)
+    ku = torch.empty((nb, w * PAGE, hkv, d), dtype=k.dtype, device=dev)
+    vu = torch.empty((nb, w * PAGE, hkv, d), dtype=v.dtype, device=dev)
+    bu = torch.empty((nb, w * PAGE, hkv), dtype=bias.dtype, device=dev)
+    for h in range(hkv):
+        ku[:, :, h] = kf[rows[h], h].view(nb, w * PAGE, d)
+        vu[:, :, h] = vf[rows[h], h].view(nb, w * PAGE, d)
+        bu[:, :, h] = bfl[rows[h], h].view(nb, w * PAGE)
+    ui = u["uidx"]
+    sl = torch.gather(slot_of.unsqueeze(2).expand(hkv, nb, rpr, uw), -1, ui.clamp(min=0))
+    topk = torch.where(ui >= 0, sl, torch.full_like(sl, -1)).reshape(hkv, nb * rpr, -1).to(torch.int32).contiguous()
+    return dict(ku=ku, vu=vu, bu=bu, W=w, topk_idx=topk,
+                seqused_k=((w - 1) * PAGE + u["klast"][0]).to(torch.int32).contiguous(),
+                cu_seqlens_q=(torch.arange(nb + 1, dtype=torch.int32, device=dev) * rpr).contiguous(),
+                cu_seqlens_k=(torch.arange(nb + 1, dtype=torch.int32, device=dev) * (w * PAGE)).contiguous(),
+                max_seqlen_q=int(rpr), max_seqlen_k=w * PAGE, softmax_scale=float(d) ** -0.5)
+
+
+def v1_prep(a):
+    """NOSA's two value tensors (verify_step.build_varlen_args :167-169, in the store dtype): ucis = exp(cis), v_scaled
+    = v x ucis, v_fake = ucis on every feature. cis = the bench bias x softmax_scale: the bench logit is (q.k + bias) x
+    scale (piece 3 = FA2-NOSA decode, bi_paged_attention.py:28-30); NOSA's prefill / Path 1 adds cis UNSCALED
+    (nosa_llama.py:301, verify_step.py:167; an open item of the notes)."""
+    nb, rows_, hkv, d = a["vu"].shape
+    ucis = torch.exp(a["bu"] * a["softmax_scale"])
+    vs = (a["vu"] * ucis.unsqueeze(-1)).view(nb * rows_, hkv, d)
+    vfk = ucis.unsqueeze(-1).expand(nb, rows_, hkv, d).contiguous().view(nb * rows_, hkv, d)
+    return vs, vfk
+
+
+def v1_precondition(u, b, rpr):
+    """V1's layout is exact iff, per request: (a) every row's last listed page is the union's last page on every KV
+    head; (b) the last page's extent is the same on every KV head; (c) the rows sit at consecutive extents, last_len[n
+    x rpr + u] == klast - rpr + 1 + u (query u is cut at seqused_k - rpr + u + 1). ONE host read. (ok, detail)."""
+    ui = u["uidx"]
+    hkv, nb, rpr_, p_ = ui.shape
+    npg = b["num_pages"].to(torch.int64)
+    lastpos = (npg - 1).clamp(min=0).t().reshape(hkv, nb, rpr_, 1)
+    lu = ui.gather(-1, lastpos).squeeze(-1)
+    a_bad = (lu != (u["ucnt"] - 1).unsqueeze(-1)).any(-1).any(0)
+    b_bad = (u["klast"] != u["klast"][:1]).any(0)
+    ll = b["last_len"].to(torch.int64).reshape(nb, rpr_)
+    want = u["klast"][0].view(nb, 1) - rpr_ + 1 + torch.arange(rpr_, device=ll.device).view(1, rpr_)
+    c_bad = (ll != want).any(-1)
+    na, nbb, nc = int(a_bad.sum()), int(b_bad.sum()), int(c_bad.sum())
+    ok = na == 0 and nbb == 0 and nc == 0
+    return ok, ("%s: of %d requests, %d have a row whose last page is not the union's last page, %d a per-head extent "
+                "difference, %d non-consecutive extents" % ("met" if ok else "NOT met", nb, na, nbb, nc))
+
+
+def v1_twin(q, a, vs, vfk, rpr):
+    """CPU float64 TWIN of V1 (the varlen layout, verify_step.py:20-48): request n, query u, KV head h sees the store
+    rows slot x 64 + e of the slots topk_idx[h, n x rpr + u] names, below seqused_k[n] - rpr + u + 1; weights =
+    softmax(q.k x softmax_scale) over them; out = (w . v_scaled) / (w . v_fake[:, 0])."""
+    hkv = a["topk_idx"].shape[0]
+    nb = a["seqused_k"].numel()
+    w = a["W"]
+    hq, d = q.shape[1], q.shape[2]
+    g = hq // hkv
+    ku = a["ku"].reshape(nb, w * PAGE, hkv, d).double().cpu()
+    vsd = vs.reshape(nb, w * PAGE, hkv, d).double().cpu()
+    vfd = vfk.reshape(nb, w * PAGE, hkv, d).double().cpu()
+    tk = a["topk_idx"].to("cpu", torch.int64)
+    su = a["seqused_k"].to("cpu", torch.int64)
+    out = torch.zeros((nb * rpr, hq, d), dtype=torch.float64)
+    e = torch.arange(PAGE)
+    for n in range(nb):
+        for uq in range(rpr):
+            cut = int(su[n]) - rpr + uq + 1
+            for h in range(hkv):
+                sl = tk[h, n * rpr + uq]
+                sl = sl[sl >= 0]
+                rr = (sl.view(-1, 1) * PAGE + e.view(1, -1)).reshape(-1)
+                rr = rr[rr < cut]
+                qq = q[n * rpr + uq, h * g:(h + 1) * g].double().cpu()
+                wgt = torch.softmax((qq @ ku[n, rr, h].t()) * a["softmax_scale"], dim=-1)
+                out[n * rpr + uq, h * g:(h + 1) * g] = (wgt @ vsd[n, rr, h]) / (wgt @ vfd[n, rr, h, 0]).unsqueeze(-1)
+    return out
 
 
 # ------------------------------------------------------------------ arms (GPU)
@@ -822,6 +1496,238 @@ class FIStridedArm(FIArm):
         return self._oh[0].view(r_, self.geom["Hq"], self.geom["D"])
 
 
+def jit_args_fp(d):
+    """[fia3] jit_args of the FP arms' variant (the same 13-item list as jit_args_for)."""
+    return [VARIANT_URI_FP % d, torch.bfloat16, torch.bfloat16, torch.bfloat16, torch.int32, d, d,
+            list(VARIANT_TENSORS_FP[0]), list(VARIANT_TENSORS_FP[1]), list(VARIANT_SCALARS[0]),
+            list(VARIANT_SCALARS[1]), VARIANT_NAME_FP, VARIANT_DECL_FP]
+
+
+FP_INIT_PARAMS = ("jit_args", "backend")
+FP_PLAN_PARAMS = ("packed_custom_mask", "disable_split_kv", "fixed_split_size", "sm_scale", "q_data_type",
+                  "kv_data_type")
+
+
+def check_fp_api(fi):
+    """[fia3] gate FP_API: the installed BatchPrefillWithPagedKVCacheWrapper takes what the FP arms pass (read from the
+    signatures; 0.6.8.post1 has them all, the 0.5.3 Python inside the sif is not readable from the login node).
+    (ok, detail); a **kwargs signature cannot be checked and says so."""
+    w = getattr(fi, "BatchPrefillWithPagedKVCacheWrapper", None)
+    if w is None:
+        return False, "no BatchPrefillWithPagedKVCacheWrapper in flashinfer"
+    try:
+        pi = inspect.signature(w.__init__).parameters
+        pp = inspect.signature(w.plan).parameters
+    except (TypeError, ValueError) as e:
+        return False, "signatures not readable: %s" % e
+    kw = [n for n, ps in (("__init__", pi), ("plan", pp))
+          if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in ps.values())]
+    miss = [p for p in FP_INIT_PARAMS if p not in pi] + [p for p in FP_PLAN_PARAMS if p not in pp]
+    if miss and not kw:
+        return False, "missing parameters %s" % miss
+    return True, "parameters present%s" % ("" if not kw else " (**kwargs in %s: not checkable)" % kw)
+
+
+class FPArm:
+    """[fia3] Option 1 of the survey: FlashInfer BatchPrefillWithPagedKVCacheWrapper (fa2), one wrapper per KV head
+    (option A views, as F8). One FlashInfer request = (request, KV head): qo_len = rows per request; num_qo_heads = the
+    group (16), num_kv_heads 1, so FlashInfer packs qo_len x 16 = 64 query rows into ONE CTA tile (its own GQA
+    support: packed_qo_len, scheduler.cuh:505-510; CTA_TILE_Q 64, utils.cuh:384-403). KV pages = the request's union;
+    the packed mask, its byte offsets, the CSR and last_page_len live in persistent buffers written IN PLACE (build), so
+    a plan with no split serves later layers (relayer). split "none" (FP0: disable_split_kv) or "fixed" (FP8:
+    fixed_split_size 8); mask "rows" (each row its own tokens), "ones" (each row the pair's reach: the MASK WITNESS),
+    "off" (FPU: plan without a mask, kNone kernels: timing only)."""
+    def __init__(self, fi, name, split, mask, geom, s_slots, rpr, jit_args, device):
+        if split not in ("none", "fixed") or mask not in ("rows", "ones", "off"):
+            raise ValueError("split %r, mask %r" % (split, mask))
+        self.fi, self.name, self.split, self.mask, self.geom, self.S, self.rpr = fi, name, split, mask, geom, s_slots, rpr
+        self.scale = geom["D"] ** -0.5
+        self.dev = torch.device(device)
+        self.fws = torch.zeros(MIN_FLOAT_WS, dtype=torch.uint8, device=device)
+        self.float_need = 0
+        self.wr = [fi.BatchPrefillWithPagedKVCacheWrapper(self.fws, "NHD", backend="fa2", jit_args=jit_args)
+                   for _ in range(geom["Hkv"])]
+        self.bufs = self.u = self.info = None
+        self._b = self._oh = None
+        self.fresh_buffers = False          # TEST PLANT only: build into NEW tensors (the plan keeps the old ones)
+
+    @property
+    def workspace_bytes(self):
+        own = sum(t.numel() * t.element_size() for t in (self.bufs or {}).values() if torch.is_tensor(t))
+        ints = sum(w._int_workspace_buffer.numel() for w in self.wr if hasattr(w, "_int_workspace_buffer"))
+        return self.fws.numel() + ints + own
+
+    @property
+    def pinned_bytes(self):
+        return sum(w._pin_memory_int_workspace_buffer.numel() for w in self.wr
+                   if hasattr(w, "_pin_memory_int_workspace_buffer"))
+
+    def _sync(self):
+        if self.dev.type == "cuda":
+            torch.cuda.synchronize(self.dev)
+
+    def ensure_ws(self, need):
+        self.float_need = int(need)
+        if need > self.fws.numel():
+            size = (int(need) + (1 << 20) - 1) >> 20 << 20
+            self.fws = torch.zeros(size, dtype=torch.uint8, device=self.dev)
+            for w in self.wr:
+                w.reset_workspace_buffer(self.fws, w._int_workspace_buffer)
+
+    def alloc(self, nb, p_):
+        hkv, uw, d = self.geom["Hkv"], self.rpr * p_, self.dev
+        self.bufs = dict(nb=nb, p=p_, qo=torch.arange(nb + 1, dtype=torch.int32, device=d) * self.rpr,
+                         indptr=torch.zeros((hkv, nb + 1), dtype=torch.int32, device=d),
+                         ix=torch.zeros((hkv, nb * uw + 1), dtype=torch.int32, device=d),
+                         last=torch.ones((hkv, nb), dtype=torch.int32, device=d),
+                         mask=torch.zeros(fp_mask_cap(hkv, nb, self.rpr, uw) + 1, dtype=torch.uint8, device=d),
+                         mi=torch.zeros((hkv, nb + 1), dtype=torch.int32, device=d))
+
+    def build(self, b):
+        """Union + CSR + packed mask of batch b, copied IN PLACE into the buffers the plan holds. No host read."""
+        u = fp_union(b, self.rpr, self.S, ones=(self.mask == "ones"))
+        ip, ix, last = fp_csr(u)
+        m, mi, _ = fp_pack(u)
+        bf = self.bufs
+        if self.fresh_buffers:
+            bf.update(indptr=ip, ix=ix, last=last, mask=m, mi=mi)
+        else:
+            bf["indptr"].copy_(ip)
+            bf["ix"].copy_(ix)
+            bf["last"].copy_(last)
+            bf["mask"].copy_(m)
+            bf["mi"].copy_(mi)
+        self.u = u
+        return u
+
+    def host_copies(self):
+        """Host copies of (qo_indptr, indptr, last_page_len) per KV head (for the host-indptr plan timing)."""
+        bf = self.bufs
+        return [(bf["qo"].cpu(), bf["indptr"][h].cpu(), bf["last"][h].cpu()) for h in range(self.geom["Hkv"])]
+
+    def plan(self, host=None):
+        """plan() per KV head on the held buffers (device indptr: plan's own D2H read). host = host_copies(): the
+        wrapper then holds COPIES, so the plan-reuse path needs the device form again (time_fp_extras re-plans)."""
+        g, d, bf = self.geom["G"], self.geom["D"], self.bufs
+        kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16, sm_scale=self.scale)
+        kw.update(dict(disable_split_kv=True) if self.split == "none" else dict(fixed_split_size=FP_SPLIT))
+        if self.mask != "off":
+            kw["packed_custom_mask"] = bf["mask"]                 # selects the kCustom kernels (mask mode CUSTOM)
+        for h in range(self.geom["Hkv"]):
+            qo, ip, last = host[h] if host is not None else (bf["qo"], bf["indptr"][h], bf["last"][h])
+            self.wr[h].plan(qo, ip, bf["ix"][h], last, g, 1, d, PAGE, **kw)
+        try:
+            self.info = [plan_info_of(w) for w in self.wr]
+        except Exception as e:                                    # a fake or another layout: REPORT only
+            self.info = [dict(error="%s: %s" % (type(e).__name__, e))]
+
+    def prepare(self, b):
+        check_store(b["k"], b["v"], b["bias"])
+        r_, hkv, p_ = b["page_table"].shape
+        if r_ % self.rpr:
+            raise ValueError("%d rows are not requests of %d rows" % (r_, self.rpr))
+        nb = r_ // self.rpr
+        seq = b["seq_idx"].to("cpu", torch.int64).view(nb, self.rpr)
+        if not bool((seq == seq[:, :1]).all()):
+            raise ValueError("the rows of a request must be consecutive and share one storage entry")
+        if self.bufs is None or self.bufs["nb"] != nb or self.bufs["p"] != p_:
+            self.alloc(nb, p_)
+        self.build(b)
+        self._sync()                                               # plan rewrites its pinned buffer (plan doc 8.1)
+        if self.split == "fixed":
+            uc = self.u["ucnt"].cpu()
+            self.ensure_ws(max(fp_float_need(uc[h].tolist(), "fixed", self.geom["G"], self.geom["D"], self.rpr)
+                               for h in range(hkv)))
+        self.plan()
+        self._oh = [torch.empty((r_, self.geom["G"], self.geom["D"]), dtype=torch.bfloat16, device=self.dev)
+                    for _ in range(hkv)]
+        self._b = b
+
+    def relayer(self, b):
+        """The next LAYER under the same plan (no split only: the plan then does not read the union sizes): b's union,
+        CSR and mask are written in place. No plan, no host read."""
+        if self.split != "none" or self.bufs is None or self._b is None \
+                or tuple(b["page_table"].shape) != tuple(self._b["page_table"].shape):
+            raise ValueError("relayer needs a prepared no-split arm and a batch of the same shape")
+        self.build(b)
+        self._b = b
+
+    def launch_runs(self):
+        b, bf = self._b, self.bufs
+        g, hkv = self.geom["G"], self.geom["Hkv"]
+        for h in range(hkv):
+            kv = (kv_view_a(b["k"], self.S, h), kv_view_a(b["v"], self.S, h))
+            self.wr[h].run(b["q"][:, h * g:(h + 1) * g], kv, b["bias"], bf["mask"], bf["mi"][h],
+                           *bias_args("a", hkv, h), self.scale, out=self._oh[h])
+        return self._oh
+
+    def launch(self):
+        return torch.cat(self.launch_runs(), dim=1)
+
+    def __call__(self, b):
+        self.prepare(b)
+        return self.launch()
+
+
+def import_v1(path):
+    """[fia3] V1's module (EQ verify_step.py, a pinned copy, loaded by path: torch only at import) and NOSA's internal
+    varlen op (infllm_v2, inside the sif). (module, None) or (None, the reason: a FINDING)."""
+    try:
+        vm = load_by_path(path, "eq_verify_step")
+        if not (hasattr(vm, "varlen_attention") and hasattr(vm, "VarlenArgs")):
+            return None, "%s has no varlen_attention / VarlenArgs" % path
+        iv = importlib.import_module("infllm_v2.infllmv2_sparse_attention")
+        if not hasattr(iv, "_wrapped_infllmv2_attn_varlen_forward"):
+            return None, "infllm_v2.infllmv2_sparse_attention has no _wrapped_infllmv2_attn_varlen_forward"
+        return vm, None
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, str(e)[:300])
+
+
+class V1Arm:
+    """[fia3] NOSA's prefill varlen route (EQ verify_step.varlen_attention) over a CONTIGUOUS union store: stage_gather
+    (union + the store copy, one host read for W), stage_prep (exp(cis) values), launch (the two internal-op calls and
+    the quotient)."""
+    def __init__(self, vmod, geom, rpr, s_slots):
+        self.vmod, self.geom, self.rpr, self.S = vmod, geom, rpr, s_slots
+        self.info = None
+        self.a = self.vs = self.vfk = self.u = self._b = None
+
+    @property
+    def workspace_bytes(self):
+        ts = [] if self.a is None else [self.a["ku"], self.a["vu"], self.a["bu"]]
+        ts += [t for t in (self.vs, self.vfk) if t is not None]
+        return sum(t.numel() * t.element_size() for t in ts)
+
+    def stage_gather(self, b):
+        self.u = fp_union(b, self.rpr, self.S)
+        self.a = v1_args(b, self.u, self.rpr, self.geom)
+        self._b = b
+
+    def stage_prep(self):
+        self.vs, self.vfk = v1_prep(self.a)
+
+    def prepare(self, b):
+        self.stage_gather(b)
+        self.stage_prep()
+
+    def varlen_args(self):
+        a = self.a
+        nb, rows_, hkv, d = a["ku"].shape
+        return self.vmod.VarlenArgs(q=self._b["q"], k=a["ku"].view(nb * rows_, hkv, d), v_scaled=self.vs,
+                                    v_fake=self.vfk, cu_seqlens_q=a["cu_seqlens_q"], cu_seqlens_k=a["cu_seqlens_k"],
+                                    seqused_k=a["seqused_k"], max_seqlen_q=a["max_seqlen_q"],
+                                    max_seqlen_k=a["max_seqlen_k"], topk_idx=a["topk_idx"],
+                                    softmax_scale=a["softmax_scale"], causal=True)
+
+    def launch(self):
+        return self.vmod.varlen_attention(self.varlen_args())
+
+    def __call__(self, b):
+        self.prepare(b)
+        return self.launch()
+
+
 # ------------------------------------------------------------------ gates (arm-agnostic; the CPU tests use fakes)
 def bits_equal(a, b):
     """Bitwise equality (a -0.0 / +0.0 or a NaN payload difference counts)."""
@@ -906,19 +1812,20 @@ def correctness_gate(name, tag, out_rows, ref, tol, must):
                    if name in PRED["err_vs_fp64"] else "no band"))
 
 
-def bias_witness(tag, arm, bf, rows, ref_bias, ref_nobias, tol, must):
+def bias_witness(tag, arm, bf, rows, ref_bias, ref_nobias, tol, must, gname=None):
     """CW: the arm with bias = 0 must FAIL C against the biased reference; VOID when the bias barely moves the
-    reference (a no-op plant, lessons L34)."""
+    reference (a no-op plant, lessons L34). [fia3] gname: the gate's name (default the F8 name)."""
+    gname = gname or "CW_bias_witness_%s" % tag
     move = float((ref_bias - ref_nobias).abs().max())
     if not move >= WITNESS_FACTOR * tol:
-        return gate("CW_bias_witness_%s" % tag, False, must, "VOID: the bias moves the reference by %.3e < %.0f x tol"
+        return gate(gname, False, must, "VOID: the bias moves the reference by %.3e < %.0f x tol"
                     % (move, WITNESS_FACTOR), status="VOID")
     b0 = dict(bf)
     b0["bias"] = torch.zeros_like(bf["bias"])
     o = arm(b0)[torch.as_tensor(rows, device=bf["q"].device)]
     err = float((o.double() - ref_bias.to(o.device)).abs().max())
     st = "DETECTED" if err > tol else "BLIND"
-    return gate("CW_bias_witness_%s" % tag, st == "DETECTED", must,
+    return gate(gname, st == "DETECTED", must,
                 "%s: bias-free arm vs biased reference %.3e (tol %.1e); the bias moves the reference by %.3e"
                 % (st, err, tol, move), status=st)
 
@@ -960,19 +1867,29 @@ def plan_reuse_check(name, tag, arm, b_plan, b_layer):
                 % (len(bad), fresh.shape[0], bad[:10]))
 
 
-def completeness_gates(gates, cells, arms, custom):
+def completeness_gates(gates, cells, arms, custom, fp=False, v1=False):
     """[fix after fia1] MUST per requested cell: every expected gate of that cell is present (whatever its result),
-    so a cell or an arm that never reported cannot pass by absence."""
+    so a cell or an arm that never reported cannot pass by absence. [fia3] fp (the FP variant built): FP0's gates;
+    v1 (V1 importable): V1_pre and C_V1 (C_V1 is a VOID REPORT when the precondition fails)."""
     have = {g["name"] for g in gates}
     out = []
-    for b, rpr in cells:
-        tag = cell_tag(b, rpr)
+    for c in cells:
+        b, rpr, src = cell_parts(c)
+        tag = cell_tag(b, rpr, src)
         want = ["%s_%s_%s" % (p, a, tag) for a in MUST_ARMS if a in arms
                 for p in ("I1_alone", "I2_order", "I3_siblings", "I4_split_switch", "I5_poison", "C")]
         if "FH" in arms:
             want.append("N_heuristic_negative_%s" % tag)
         if custom and "F8" in arms:
             want.append("CW_bias_witness_%s" % tag)
+        if fp and "FP0" in arms:
+            want += ["G_block0_%s" % tag, "C_FP0_%s" % tag, "MW_FP0_%s" % tag]
+            want += ["%s_FP0_%s" % (p, tag) for p in ("FI1_request_alone", "FI2_order", "FI3_other_requests",
+                                                      "FI5_poison")]
+            if custom:
+                want.append("CW_FP0_%s" % tag)
+        if v1 and "V1" in arms:
+            want += ["V1_pre_%s" % tag, "C_V1_%s" % tag]
         miss = [w for w in want if w not in have]
         out.append(gate("COMPLETE_%s" % tag, not miss, True, "%d of %d expected gates present; missing %s"
                         % (len(want) - len(miss), len(want), miss[:8])))
@@ -988,6 +1905,178 @@ def bits_vs(name, tag, out, ref_out):
     return gate("R_D_bits_vs_P_%s_%s" % (name, tag), True, False,
                 "%d of %d rows differ from piece 3 (%.4f of elements); max |d| %.3e; %s"
                 % (rows, out.shape[0], float(neq.float().mean()), diff, PRED["bits_vs_p3"].get(name, "no prediction")))
+
+
+# ------------------------------------------------------------------ [fia3] gates of the request-unit arms
+def request_suite(name, tag, arm, bf, bq, rpr, alone_reqs, perms, poisoned, poison_pre, must):
+    """FI1 - FI3 and FI5 for an arm whose unit is the REQUEST (its rows share one union, so a row alone is NOT a unit:
+    see R_X_row_alone). FI1: each sampled request alone (a batch of one request, its own plan) == the same rows in the
+    batch; FI2: the requests in reversed and in random order (rows keep their order inside a request) == unpermuted;
+    FI3: the even requests of the altreq batch (odd requests: new q, new lists) == the full batch's (precondition: the
+    changed rows are exactly the odd requests' rows); FI5: unread store rows NaN, output finite and bitwise equal, a
+    MUST only with poison_pre (no loaded row is unread), else a VOID REPORT. Returns (gates, the full output)."""
+    gates = []
+    full = arm(bf)
+    r_ = full.shape[0]
+
+    def rows_of(n):
+        return [n * rpr + u for u in range(rpr)]
+    bad = []
+    for n in alone_reqs:
+        o = arm(select(bf, rows_of(n)))
+        bad += [r for j, r in enumerate(rows_of(n)) if not bits_equal(o[j], full[r])]
+    gates.append(gate("FI1_request_alone_%s_%s" % (name, tag), not bad, must,
+                      "%d requests alone vs in the batch of %d rows; differing rows %s" % (len(alone_reqs), r_, bad[:10])))
+    bad, det = [], []
+    for pname, preq in perms:
+        rows_ = [r for n in preq for r in rows_of(n)]
+        o = arm(select(bf, rows_))
+        d = [r for j, r in enumerate(rows_) if not bits_equal(o[j], full[r])]
+        det.append("%s %d" % (pname, len(d)))
+        bad += d
+    gates.append(gate("FI2_order_%s_%s" % (name, tag), not bad, must,
+                      "rows differing per request permutation: %s; first %s" % (", ".join(det), sorted(set(bad))[:10])))
+    oa = arm(bq)
+    changed = changed_rows(bf, bq)
+    creq = sorted({r // rpr for r in changed})
+    pre = bool(changed) and all(n % 2 == 1 for n in creq)
+    keep = [r for r in range(r_) if (r // rpr) % 2 == 0]
+    bad = [r for r in keep if not bits_equal(oa[r], full[r])]
+    gates.append(gate("FI3_other_requests_%s_%s" % (name, tag), pre and not bad, must,
+                      "%s; %d odd requests changed (q and lists), %d rows of even requests compared; differing %s"
+                      % ("precondition met" if pre else "VOID: altreq did not change exactly odd requests",
+                         len(creq), len(keep), bad[:10]), status=None if pre else "VOID"))
+    bp = dict(bf)
+    bp.update(poisoned)
+    op = arm(bp)
+    finite = bool(torch.isfinite(op.float()).all())
+    bad = [r for r in range(r_) if not bits_equal(op[r], full[r])]
+    pre5, txt5 = poison_pre
+    gates.append(gate("FI5_poison_%s_%s" % (name, tag), finite and not bad, must and pre5,
+                      "%s; unread rows NaN in K / V / bias: output finite %s; differing %s"
+                      % ("precondition met (%s)" % txt5 if pre5 else "VOID REPORT: %s" % txt5, finite, bad[:10]),
+                      status=None if pre5 else "VOID"))
+    return gates, full
+
+
+def block0_gate(tag, batches, rpr, s_slots, must):
+    """G_block0 (the precondition of every FlashInfer arm with a custom mask): every listed (row, KV head) lists block 0,
+    so union page 0 of every (request, head) is block 0 and every row sees tokens 0 .. 63 of the FIRST KV tile. The
+    kernel starts the online softmax at m = -inf, d = 1 with no -inf guard (0.6.8 prefill.cuh:415-421, :878-907): a
+    row whose first tile is fully masked gets exp2(-inf - -inf) = NaN. Also reported: (request, head, row) cells with
+    no visible token in union page 0 and in the first 128-token KV tile (A100, MODEL kv_tile_tokens)."""
+    miss = f64 = f128 = cells = 0
+    for b in batches:
+        pk = b["page_key"].to(torch.int64)
+        npg = b["num_pages"].to(torch.int64)
+        valid = torch.arange(pk.shape[-1], device=pk.device).view(1, 1, -1) < npg.unsqueeze(-1)
+        miss += int((~((pk == 0) & valid).any(-1)).sum())
+        ext = fp_union(b, rpr, s_slots)["ext"]
+        f64 += int((ext[..., 0] == 0).sum())
+        e2 = ext[..., 0] + (ext[..., 1] if ext.shape[-1] > 1 else 0)
+        f128 += int((e2 == 0).sum())
+        cells += int(ext[..., 0].numel())
+    ok = miss == 0 and f64 == 0
+    return gate("G_block0_%s" % tag, ok, must,
+                "%d batches: (row, KV head) lists without block 0: %d; (request, head, row) cells with no visible token "
+                "in union page 0: %d, in the first %d-token KV tile: %d (of %d cells)"
+                % (len(batches), miss, f64, KV_TILE_PAGES * PAGE, f128, cells))
+
+
+def mask_witness(tag, arm_ones, bf, rows, ref, u_rows, tol, must):
+    """MW: FP0 with every row given the pair's whole reach (no holes) must FAIL C against the reference, so FP0's C
+    pass comes from the mask the variant applies. VOID when no row misses a union page (a mask with no hole: a no-op
+    plant, L34)."""
+    j = torch.arange(u_rows["ext"].shape[-1], device=u_rows["ext"].device).view(1, 1, 1, -1)
+    live = j < u_rows["ucnt"].unsqueeze(-1).unsqueeze(-1)
+    holes = int((live & (u_rows["ext"] < u_rows["ext"].amax(dim=2, keepdim=True))).sum())
+    if holes == 0:
+        return gate("MW_FP0_%s" % tag, False, must, "VOID: no row misses a union token (the mask has no hole)",
+                    status="VOID")
+    o = arm_ones(bf)[torch.as_tensor(rows, device=bf["q"].device)]
+    err = float((o.double() - ref.to(o.device)).abs().max())
+    st = "DETECTED" if err > tol else "BLIND"
+    return gate("MW_FP0_%s" % tag, st == "DETECTED", must,
+                "%s: every row given the whole union vs the reference %.3e (tol %.1e); %d (request, head, row, page) "
+                "cells see fewer tokens than the reach" % (st, err, tol, holes), status=st)
+
+
+def row_alone_probe(name, tag, arm, bf, rows, rpr, full=None):
+    """R_X_row_alone (REPORT; the EXACT-mode note): each sampled row alone, padded to rpr rows by repeating it (its own
+    list is then the union, CTA_TILE_Q stays 64), vs the same row in its request. Equal bits would need KV tiles that
+    never hold two pages; FlashInfer's A100 tile is 128 tokens = 2 pages (kv_tile_tokens; the dispatch has no public
+    option), so a row's bits depend on its siblings' pages: FP0 is FAST-only."""
+    full = arm(bf) if full is None else full
+    diff = []
+    for r in rows:
+        o = arm(select(bf, [r] * rpr))
+        if not bits_equal(o[0], full[r]):
+            diff.append(r)
+    return gate("R_X_row_alone_%s_%s" % (name, tag), True, False,
+                "%d of %d sampled rows differ alone (padded to %d identical rows) vs in their request; KV tile %d "
+                "tokens (MODEL): %s" % (len(diff), len(rows), rpr, KV_TILE_PAGES * PAGE,
+                                        "FAST-only, as expected" if diff else "no difference seen on these rows"))
+
+
+def fp_reuse_check(name, tag, arm, b_plan, b_layer):
+    """R_REUSE (REPORT): plan on b_plan, write b_layer's union, CSR and mask IN PLACE (relayer), run; bitwise vs a
+    fresh plan on b_layer. Precondition: some request's union size differs between the two (else VOID)."""
+    arm.prepare(b_plan)
+    uc_a = arm.u["ucnt"].clone()
+    arm.relayer(b_layer)
+    reused = arm.launch().clone()
+    nd = int((uc_a != arm.u["ucnt"]).sum())
+    fresh = arm(b_layer)
+    bad = [r for r in range(fresh.shape[0]) if not bits_equal(reused[r], fresh[r])]
+    return gate("R_REUSE_%s_%s" % (name, tag), nd > 0 and not bad, False,
+                "%s; one plan, the next layer's union / CSR / mask written in place: %d of %d rows differ from a fresh "
+                "plan %s" % ("precondition met (%d (head, request) union sizes differ)" % nd if nd else
+                             "VOID: no union size differs", len(bad), fresh.shape[0], bad[:10]),
+                status=None if nd else "VOID")
+
+
+def decision_report(report, gates, cells):
+    """R_DECISION (REPORT; the lead scores it): PRED3's rule per registered cell from the ncu device times (P, FP0, FPU),
+    the L2 -> SM bytes and the measured tick overhead (one plan + 32 layer builds: eager events, and CUDA-graph
+    replays)."""
+    th = PRED3["thresholds"]
+    out = []
+    for c in cells:
+        b, rpr, src = cell_parts(c)
+        tag = cell_tag(b, rpr, src)
+        if tag not in PRED3["fp0_over_p_device"]:
+            continue
+        arms = (((report.get("ncu") or {}).get(tag) or {}).get("summary") or {}).get("arms") or {}
+        p, f, fu = arms.get("P"), arms.get("FP0"), arms.get("FPU")
+        ratio = f["time_ns"] / p["time_ns"] if p and f and p.get("time_ns") else None
+        l2 = (p["l2sm_bytes"] / f["l2sm_bytes"]) if p and f and p.get("l2sm_bytes") and f.get("l2sm_bytes") else None
+        mshare = (f["time_ns"] - fu["time_ns"]) / f["time_ns"] if f and fu and f.get("time_ns") else None
+        t = (((report.get("cells") or {}).get(tag) or {}).get("arms") or {}).get("FP0") or {}
+        ove, ovg = t.get("tick_overhead_eager_ms"), t.get("tick_overhead_graph_ms")
+        mine = [g for g in gates if g["must"] and g["name"].endswith("_" + tag)
+                and ("FP0" in g["name"] or g["name"].startswith("G_block0"))]
+        gates_ok = bool(mine) and all(g["passed"] for g in mine)
+        time_ok = ratio is not None and ratio <= th["fp0_over_p_max"]
+        ok_e = ove is not None and ove <= th["tick_overhead_ms_max"]
+        ok_g = ovg is not None and ovg <= th["tick_overhead_ms_max"]
+        verdict = "ADOPT" if (time_ok and gates_ok and (ok_e or ok_g)) else "NOT MET"
+        flags = []
+        if ratio is not None and not time_ok and l2 is not None and l2 >= th["hbm_bound_l2sm_drop"]:
+            flags.append("HBM-bound (L2->SM fell %.2fx, time did not): stop at the 15 %% bound" % l2)
+        if not (ok_e or ok_g):
+            flags.append("plan / build bound (tick overhead above %.1f ms)" % th["tick_overhead_ms_max"])
+        if mshare is not None:
+            flags.append("mask share of FP0's device time %.3f (FP0 - FPU)" % mshare)
+        out.append(gate("R_DECISION_%s" % tag, True, False,
+                        "%s: FP0 / P device %s (%s); L2->SM P / FP0 %s; tick overhead eager %s ms, graph %s ms "
+                        "(rule <= %.1f); FP0 MUST gates %s; %s"
+                        % (verdict, "%.4f" % ratio if ratio is not None else "n/a",
+                           band_text(ratio, PRED3["fp0_over_p_device"][tag]),
+                           "%.3f" % l2 if l2 is not None else "n/a",
+                           "%.4f" % ove if ove is not None else "n/a", "%.4f" % ovg if ovg is not None else "n/a",
+                           th["tick_overhead_ms_max"], "PASS" if gates_ok else "NOT ALL PASS",
+                           "; ".join(flags) or "no flag")))
+    return out
 
 
 # ------------------------------------------------------------------ timing (GPU)
@@ -1066,9 +2155,82 @@ def time_arm(name, arm, b, warm, reps, geom):
                 arm.relayer(b)
                 return arm.launch()
             rep["layer_with_plan_reuse_ms"] = cuda_time(layer, warm, reps)
+    if isinstance(arm, FPArm):
+        time_fp_extras(rep, arm, b, warm, reps)
+    if isinstance(arm, V1Arm):
+        rep["gather_ms"] = cuda_time(lambda: arm.stage_gather(b), 2, 20)       # union + store copy (one host read)
+        rep["prep_ms"] = cuda_time(arm.stage_prep, 2, 20)                     # exp(cis) values
+        rep["store_W"] = arm.a["W"]
     rep["workspace_bytes"] = arm.workspace_bytes
     rep["peak_alloc_delta_bytes"] = peak_delta(arm.launch)
     return rep
+
+
+def build_graph_ms(arm, b):
+    """The union + CSR + mask build captured in ONE CUDA graph (it has no host read), replay time by CUDA events. The
+    capture follows torch.cuda.graphs (warm-up on a side stream first). Returns (summary, None) or (None, error)."""
+    try:
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                arm.build(b)
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            arm.build(b)
+        res = cuda_time(g.replay, 5, 50)
+        torch.cuda.synchronize()
+        del g
+        return res, None
+    except Exception as e:
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        return None, "%s: %s" % (type(e).__name__, str(e)[:300])
+
+
+def time_fp_extras(rep, arm, b, warm, reps):
+    """[fia3] FP arm host costs: the build per layer (events, host wall, CUDA graph), plan() per tick (device indptr:
+    the tick's form; host indptr), the layer under the tick's plan (no split), the tick overhead (no split: one plan +
+    32 builds; split: 32 x (plan + build)), the union size, the mask bytes, FlashInfer's mask mode."""
+    rep["runs_only_ms"] = cuda_time(arm.launch_runs, warm, reps)
+    rep["build_ms_per_layer"] = cuda_time(lambda: arm.build(b), 5, 50)
+    rep["build_host_ms_per_layer"] = host_time(lambda: arm.build(b), 50)
+    hc = arm.host_copies()
+    rep["plan_host_indptr_ms_per_tick"] = host_time(lambda: arm.plan(host=hc), 50)
+    arm.prepare(b)
+    rep["plan_device_indptr_ms_per_tick"] = host_time(arm.plan, 50)
+    rep["plan_info"] = arm.info
+    rep["mask_mode_custom"] = [getattr(w, "_custom_mask_buf", None) is not None for w in arm.wr]
+    rep["union"] = union_stats(arm.u, b)
+    rep["mask_bytes"] = int(arm.bufs["mi"][:, -1].max()) - int(arm.bufs["mi"][:, 0].min())
+    rep["float_ws_need_bytes"] = arm.float_need
+    rep["float_ws_alloc_bytes"] = arm.fws.numel()
+    rep["pinned_host_bytes"] = arm.pinned_bytes
+    gms, gerr = build_graph_ms(arm, b)
+    if gms is not None:
+        rep["build_graph_ms_per_layer"] = gms
+    else:
+        rep["build_graph_error"] = gerr
+    arm.prepare(b)                                                # the device-indptr plan on fresh buffers again
+    nl = LAYERS_PER_TICK
+    pl = rep["plan_device_indptr_ms_per_tick"]["median"]
+    be, bh = rep["build_ms_per_layer"]["median"], rep["build_host_ms_per_layer"]["median"]
+    bg = gms["median"] if gms is not None else None
+    if arm.split == "none":
+        def layer():
+            arm.relayer(b)
+            return arm.launch()
+        rep["layer_with_plan_reuse_ms"] = cuda_time(layer, warm, reps)
+        rep["tick_overhead_eager_ms"] = round(pl + nl * be, 5)
+        rep["tick_overhead_host_ms"] = round(pl + nl * bh, 5)
+        rep["tick_overhead_graph_ms"] = round(pl + nl * bg, 5) if bg is not None else None
+    else:
+        rep["tick_overhead_eager_ms"] = round(nl * (pl + be), 5)
+        rep["tick_overhead_host_ms"] = round(nl * (pl + bh), 5)
+        rep["tick_overhead_graph_ms"] = round(nl * (pl + bg), 5) if bg is not None else None
 
 
 # ------------------------------------------------------------------ ncu (REPORT)
@@ -1110,7 +2272,8 @@ def ncu_rows(text, fields):
 def ncu_summary(rows, arms, ideal, union, rpr):
     """Per arm: DRAM bytes read / written, kernel time, kernel count (vs KERNELS_PER_CALL), ratios to the ideal
     and the union bytes, the band (PRED dram_read_over_ideal), the reuse label."""
-    per = {a: dict(read=0.0, write=0.0, time_ns=0.0, kernels=[], label=REUSE_LABEL.get(a, "")) for a in arms}
+    per = {a: dict(read=0.0, write=0.0, time_ns=0.0, kernels=[], label=REUSE_LABEL.get(a, ""), l2sm_sectors=None,
+                   regs=[], local_bytes=None) for a in arms}
     stray = []
     for r in rows:
         if r["tag"] not in per or not any(k in r["name"] for k in ATTN_KERNELS):
@@ -1121,6 +2284,15 @@ def ncu_summary(rows, arms, ideal, union, rpr):
         p["write"] += r.get("dram__bytes_write.sum") or 0.0
         p["time_ns"] += r.get("gpu__time_duration.sum") or 0.0
         p["kernels"].append(r["name"][:60])
+        sec = r.get("lts__t_sectors_srcunit_tex_op_read.sum")              # [fia3] L2 -> SM reads
+        if sec is not None:
+            p["l2sm_sectors"] = (p["l2sm_sectors"] or 0.0) + sec
+        if r.get("launch__registers_per_thread") is not None:
+            p["regs"].append(int(r["launch__registers_per_thread"]))
+        loc = [r.get(m) for m in ("l1tex__t_bytes_pipe_lsu_mem_local_op_ld.sum",
+                                  "l1tex__t_bytes_pipe_lsu_mem_local_op_st.sum") if r.get(m) is not None]
+        if loc:
+            p["local_bytes"] = (p["local_bytes"] or 0.0) + sum(loc)
     for a, p in per.items():
         p["n_kernels"] = len(p["kernels"])
         p["expected_kernels"] = KERNELS_PER_CALL.get(a)
@@ -1128,6 +2300,15 @@ def ncu_summary(rows, arms, ideal, union, rpr):
         p["read_over_union"] = p["read"] / union if union else None
         bands = PRED["dram_read_over_ideal"].get("4" if rpr > 1 else "1", {})
         p["band"] = band_text(p["read_over_ideal"], bands[a]) if a in bands else "no band"
+        p["l2sm_bytes"] = p["l2sm_sectors"] * L2_SECTOR_BYTES if p["l2sm_sectors"] is not None else None
+        p["l2sm_over_union"] = p["l2sm_bytes"] / union if (p["l2sm_bytes"] is not None and union) else None
+        p["l2sm_over_ideal"] = p["l2sm_bytes"] / ideal if (p["l2sm_bytes"] is not None and ideal) else None
+        if a == "FP0":                                                      # [fia3] PRED3 bands
+            p["band3"] = "DRAM/union %s; L2->SM/union %s" % (
+                band_text(p["read_over_union"], PRED3["fp0_dram_read_over_union"]),
+                band_text(p["l2sm_over_union"], PRED3["fp0_l2sm_read_over_union"]))
+        elif a == "P":
+            p["band3"] = "L2->SM/sum %s" % band_text(p["l2sm_over_ideal"], PRED3["p_l2sm_read_over_sum"])
     return dict(arms=per, stray=stray[:20], ideal_bytes=ideal, union_bytes=union)
 
 
@@ -1139,14 +2320,20 @@ def ncu_cap(left_s, cap_s):
     return int(min(cap_s, room))
 
 
-def ncu_argv(a, b, rpr, child_out, rep, metrics, arms, bias_free):
+def ncu_argv(a, b, rpr, child_out, rep, metrics, arms, bias_free, src="gen"):
     argv = [a.ncu, "--profile-from-start", "off", "--replay-mode", "kernel", "--cache-control", "all",
-            "--clock-control", "none", "--nvtx", "--kernel-name", KERNEL_FILTER, "--metrics", ",".join(metrics),
-            "--target-processes", "application-only", "-f", "-o", rep,
-            sys.executable, os.path.abspath(__file__), "--mode", "ncu-cell", "--out", child_out, "--config", a.config,
-            "--biattn", a.biattn, "--cells", cell_tag(b, rpr), "--seed", str(a.seed), "--arms", ",".join(arms)]
+            "--clock-control", "none", "--nvtx", "--kernel-name", KERNEL_FILTER, "--metrics", ",".join(metrics)]
+    for s in NCU_SECTIONS:                                                  # [fia3] registers per thread
+        argv += ["--section", s]
+    argv += ["--target-processes", "application-only", "-f", "-o", rep,
+             sys.executable, os.path.abspath(__file__), "--mode", "ncu-cell", "--out", child_out, "--config", a.config,
+             "--biattn", a.biattn, "--cells", cell_tag(b, rpr, src), "--seed", str(a.seed), "--arms", ",".join(arms)]
     if "S5" in arms:
         argv += ["--sharedkv", a.sharedkv]
+    if "V1" in arms:
+        argv += ["--verify-step", getattr(a, "verify_step", None)]
+    if src == "s1":
+        argv += ["--s1-tables", getattr(a, "s1_tables", None)]
     if bias_free:
         argv += ["--bias-free"]
     return argv
@@ -1174,14 +2361,17 @@ def ncu_metrics(a, out):
     rc = run_logged([a.ncu, "--query-metrics", "--chip", "ga100"], path, 120)
     text = open(path, errors="replace").read() if os.path.exists(path) else ""
     names = set(re.findall(r"^\s*([a-z0-9_]+__[a-z0-9_]+)", text, flags=re.M))
-    base = lambda m: m.rsplit(".", 1)[0]                                # noqa: E731
+    base = lambda m: m.split(".", 1)[0]          # noqa: E731  [fia3] ".avg.pct_of_peak..." has two dots
     missing = [m for m in NCU_REQUIRED if base(m) not in names]
     kept = [m for m in NCU_OPTIONAL if base(m) in names]
     return rc, missing, list(NCU_REQUIRED) + kept
 
 
 # ------------------------------------------------------------------ the cell (main mode)
-def build_arms(fi, a, geom, case, p3, skv, jit, arms, device):
+FP_MODES = dict(FP0=("none", "rows"), FP8=("fixed", "rows"), FPU=("none", "off"))
+
+
+def build_arms(fi, a, geom, case, p3, skv, jit, arms, device, jit_fp=None, vmod=None):
     out = {}
     rmax = case["R"] + len(SHORT_COUNTS)
     for name in arms:
@@ -1190,18 +2380,33 @@ def build_arms(fi, a, geom, case, p3, skv, jit, arms, device):
         elif name == "S5":
             if skv is not None and case["rpr"] > 1:
                 out[name] = S5Arm(skv, p3, geom, rmax, case["P"], device)
+        elif name in FP_ARMS:                                   # [fia3] only when the FP variant built
+            if jit_fp is not None:
+                split, mask = FP_MODES[name]
+                out[name] = FPArm(fi, name, split, mask, geom, case["S"], case["rpr"], jit_fp, device)
+        elif name == "V1":                                      # [fia3] only when V1 imports
+            if vmod is not None:
+                out[name] = V1Arm(vmod, geom, case["rpr"], case["S"])
         else:
             split = dict(F8="fixed", F0="none", FH="heuristic")[name]
             out[name] = FIArm(fi, name, split, geom, case["S"], jit, device)
     return out
 
 
-def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates):
+def make_cell_case(geom, b, rpr, src, seed, s1_groups, with_data=True):
+    """[fia3] the cell's case: the generator or the recorded S1 lists; K / V / bias on the GPU for B > 64."""
+    dd = "cuda" if (with_data and b > CPU_DATA_MAX_B) else "cpu"
+    if src == "s1":
+        return make_case_s1(geom, b, rpr, seed, s1_groups, with_data=with_data, data_device=dd)
+    return make_case(geom, b, rpr, seed, with_data=with_data, data_device=dd)
+
+
+def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates, src="gen", jit_fp=None, vmod=None, s1_groups=None):
     """All gates and reports of one cell; appends to gates, returns the cell's report dict."""
-    tag = cell_tag(b, rpr)
+    tag = cell_tag(b, rpr, src)
     custom = jit is not None
     t0 = time.time()
-    case = case_to(make_case(geom, b, rpr, a.seed), "cuda")
+    case = case_to(make_cell_case(geom, b, rpr, src, a.seed, s1_groups), "cuda")
     if not custom:                                                     # the bias-free REPORT (C0 failed)
         case["bias"] = torch.zeros_like(case["bias"])
     bf, ba, bh = batch_of(case, "full"), batch_of(case, "alt"), batch_of(case, "hazard")
@@ -1215,8 +2420,9 @@ def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates):
     ref = reference_fp64(bf, rows, geom)
     ref0 = reference_fp64(bf, rows, geom, zero_bias=True) if custom else None
     rep = dict(cell=tag, R=r_, rows_sampled=rows, poison=pstats, ideal_bytes=ideal_bytes(bf, geom),
-               union_bytes=union_bytes(bf, geom, case["N"], case["S"]), arms={})
-    arms = build_arms(fi, a, geom, case, p3, skv, jit, a.arms, "cuda")
+               union_bytes=union_bytes(bf, geom, case["N"], case["S"]), arms={}, src=src,
+               data_device=case.get("data_device"), s1_groups=case.get("s1_groups"), s1_calls=case.get("s1_calls"))
+    arms = build_arms(fi, a, geom, case, p3, skv, jit, a.arms, "cuda", jit_fp=jit_fp, vmod=vmod)
     outs = {}
     for name in ("P", "F8", "F0", "S5"):
         if name not in arms:
@@ -1260,9 +2466,10 @@ def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates):
                 traceback.print_exc()
                 gates.append(gate("R_REUSE_%s_%s" % (name, tag), False, False, "EXCEPTION %s: %s"
                                   % (type(e).__name__, str(e)[:300])))
+    run_fp_v1(fi, a, geom, case, arms, outs, bf, rows, ref, ref0, poisoned, rpr, tag, custom, jit_fp, gates, rep)
     tp = None
-    for name in ("P", "F8", "F0", "FH", "S5"):
-        if name not in arms:
+    for name in ("P", "F8", "F0", "FH", "S5", "FP0", "FP8", "FPU", "V1"):
+        if name not in arms or (name == "V1" and not rep.get("v1_pre")):
             continue
         try:
             t = time_arm(name, arms[name], bf, a.warm, a.reps, geom)
@@ -1276,7 +2483,12 @@ def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates):
                 bands = PRED["ratio_vs_p3"].get(name, {})
                 txt = "%s %.4f ms, x%s of P; %s" % (name, med, "%.3f" % ratio if ratio else "n/a",
                                                     band_text(ratio, bands[tag]) if tag in bands else "no band")
-                if "plan_host_indptr_ms_per_tick" in t:
+                if "build_ms_per_layer" in t:
+                    txt += fp_time_text(t)
+                elif "gather_ms" in t:
+                    txt += "; union store gather %.4f ms, exp(cis) values %.4f ms (per layer), W %d slots" % (
+                        t["gather_ms"]["median"], t["prep_ms"]["median"], t["store_W"])
+                elif "pack_ms_per_layer" in t:
                     txt += "; plan/tick host %.4f (%s) device %.4f (%s); pack/layer %.4f (%s); runs only %.4f" % (
                         t["plan_host_indptr_ms_per_tick"]["median"],
                         band_text(t["plan_host_indptr_ms_per_tick"]["median"], PRED["plan_ms_per_tick_host_indptr"]),
@@ -1321,6 +2533,114 @@ def run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates):
     return rep
 
 
+def fp_time_text(t):
+    """[fia3] the FP arms' part of the R_T line."""
+    g = t.get("build_graph_ms_per_layer")
+    return ("; runs only %.4f; build (union + CSR + mask) per layer %.4f ms events, %.4f ms host, graph %s; plan per "
+            "tick host-indptr %.4f device-indptr %.4f ms; layer with the tick's plan %s; tick overhead (%d layers) "
+            "eager %.4f host %.4f graph %s ms (rule <= %.1f); union %s; mask %d B; FlashInfer custom-mask mode %s; "
+            "float workspace need %d B, allocated %d B"
+            % (t["runs_only_ms"]["median"], t["build_ms_per_layer"]["median"], t["build_host_ms_per_layer"]["median"],
+               "%.4f" % g["median"] if g else "n/a (%s)" % t.get("build_graph_error"),
+               t["plan_host_indptr_ms_per_tick"]["median"], t["plan_device_indptr_ms_per_tick"]["median"],
+               "%.4f" % t["layer_with_plan_reuse_ms"]["median"] if "layer_with_plan_reuse_ms" in t else "n/a (split)",
+               LAYERS_PER_TICK, t["tick_overhead_eager_ms"], t["tick_overhead_host_ms"],
+               "%.4f" % t["tick_overhead_graph_ms"] if t.get("tick_overhead_graph_ms") is not None else "n/a",
+               PRED3["thresholds"]["tick_overhead_ms_max"], t["union"], t["mask_bytes"], t["mask_mode_custom"],
+               t["float_ws_need_bytes"], t["float_ws_alloc_bytes"]))
+
+
+def run_fp_v1(fi, a, geom, case, arms, outs, bf, rows, ref, ref0, poisoned, rpr, tag, custom, jit_fp, gates, rep):
+    """[fia3] the gates of the FP arms and of V1 for one cell (appends to gates and outs; rep gets union / v1_pre)."""
+    fp_names = [x for x in FP_ARMS if x in arms]
+    if not fp_names and "V1" not in arms:
+        return
+    baq = batch_of(case, "altreq")
+    rows_t = torch.as_tensor(rows, device=bf["q"].device)
+    u_full = None
+    if fp_names:
+        try:
+            gates.append(block0_gate(tag, [bf, baq], rpr, case["S"], must=True))
+            u_full = fp_union(bf, rpr, case["S"])
+            rep["union"] = union_stats(u_full, bf)
+            pois_pre = poison_precondition(u_full)
+        except Exception as e:
+            traceback.print_exc()
+            gates.append(gate("G_block0_%s" % tag, False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+            pois_pre = (False, "not computed")
+        nreq = case["R"] // rpr
+        breq = sorted({r // rpr for r in rows})
+        rperm = torch.randperm(nreq, generator=torch.Generator().manual_seed(case["seed"] + 2)).tolist()
+        rperms = [("reversed_requests", list(reversed(range(nreq)))), ("random", rperm)]
+        for name in ("FP0", "FP8"):
+            if name not in arms:
+                continue
+            must = name == "FP0"
+            try:
+                g, full = request_suite(name, tag, arms[name], bf, baq, rpr, breq, rperms, poisoned, pois_pre, must)
+                gates.extend(g)
+                outs[name] = full
+                gates.append(correctness_gate(name, tag, full[rows_t], ref, TOL_C, must))
+            except Exception as e:
+                traceback.print_exc()
+                gates.append(gate("ARM_%s_%s" % (name, tag), False, must, "EXCEPTION %s: %s"
+                                  % (type(e).__name__, str(e)[:300])))
+        if "FP0" in outs:
+            if custom:
+                try:
+                    gates.append(bias_witness(tag, arms["FP0"], bf, rows, ref, ref0, TOL_C, True,
+                                              gname="CW_FP0_%s" % tag))
+                except Exception as e:
+                    traceback.print_exc()
+                    gates.append(gate("CW_FP0_%s" % tag, False, True, "EXCEPTION %s: %s"
+                                      % (type(e).__name__, str(e)[:300])))
+            try:
+                ones = FPArm(fi, "FP0ones", "none", "ones", geom, case["S"], rpr, jit_fp, "cuda")
+                gates.append(mask_witness(tag, ones, bf, rows, ref, u_full, TOL_C, True))
+                del ones
+            except Exception as e:
+                traceback.print_exc()
+                gates.append(gate("MW_FP0_%s" % tag, False, True, "EXCEPTION %s: %s" % (type(e).__name__,
+                                                                                        str(e)[:300])))
+            for fn in (lambda: row_alone_probe("FP0", tag, arms["FP0"], bf, rows, rpr, full=outs["FP0"]),
+                       lambda: fp_reuse_check("FP0", tag, arms["FP0"], bf, baq)):
+                try:
+                    gates.append(fn())
+                except Exception as e:
+                    traceback.print_exc()
+                    gates.append(gate("R_FP0_probe_%s" % tag, False, False, "EXCEPTION %s: %s"
+                                      % (type(e).__name__, str(e)[:300])))
+        if "FP8" in arms and u_full is not None:
+            cells_h, rows_h, chunks = chunk_tile_hazard(u_full)
+            gates.append(gate("R_FP8_chunk_tile0_%s" % tag, True, False,
+                              "MODEL: %d (request, head, row, chunk) cells of %d (request, head, chunk) chunks have no "
+                              "visible token in the chunk's first %d-token KV tile: %d query rows predicted NaN in FP8 "
+                              "(a split chunk starts at m = -inf with no guard)"
+                              % (cells_h, chunks, KV_TILE_PAGES * PAGE, rows_h)))
+        if "P" in outs:
+            for name in ("FP0", "FP8"):
+                if name in outs:
+                    gates.append(bits_vs(name, tag, outs[name], outs["P"]))
+    if "V1" in arms:
+        try:
+            u1 = u_full if u_full is not None else fp_union(bf, rpr, case["S"])
+            ok, txt = v1_precondition(u1, bf, rpr)
+            rep["v1_pre"] = ok
+            gates.append(gate("V1_pre_%s" % tag, ok, False, txt, status=None if ok else "VOID"))
+            if ok:
+                full = arms["V1"](bf)
+                outs["V1"] = full
+                gates.append(correctness_gate("V1", tag, full[rows_t], ref, TOL_V1, True))
+                if "P" in outs:
+                    gates.append(bits_vs("V1", tag, full, outs["P"]))
+            else:
+                gates.append(gate("C_V1_%s" % tag, False, False, "VOID REPORT: V1's layout does not hold (%s)" % txt,
+                                  status="VOID"))
+        except Exception as e:
+            traceback.print_exc()
+            gates.append(gate("C_V1_%s" % tag, False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+
+
 # ------------------------------------------------------------------ modes
 def parse_args(argv):
     ap = argparse.ArgumentParser()
@@ -1340,6 +2660,8 @@ def parse_args(argv):
     ap.add_argument("--budget-s", type=int, default=2400)
     ap.add_argument("--no-strided", dest="strided", action="store_false")
     ap.add_argument("--bias-free", action="store_true", help="ncu-cell only: the default module, bias = 0")
+    ap.add_argument("--verify-step", default=None, help="[fia3] EQ verify_step.py (a pinned copy; arm V1)")
+    ap.add_argument("--s1-tables", default=None, help="[fia3] the recorded S1 skv_tables.pt (a copy; the s1 cells)")
     a = ap.parse_args(argv)
     a.cells = parse_cells(a.cells)
     a.arms = parse_arms(a.arms)
@@ -1347,6 +2669,10 @@ def parse_args(argv):
         raise ValueError("--sample >= 2, --warm >= 0, --reps >= 1, --budget-s >= 60, --ncu-cap 1 .. %d" % NCU_CAP_S)
     if "S5" in a.arms and a.mode == "ncu-cell" and not a.sharedkv:
         raise ValueError("ncu-cell with S5 needs --sharedkv")
+    if "V1" in a.arms and not a.verify_step:
+        raise ValueError("arm V1 needs --verify-step")
+    if any(cell_parts(c)[2] == "s1" for c in a.cells) and not a.s1_tables:
+        raise ValueError("an s1 cell needs --s1-tables")
     return a
 
 
@@ -1359,6 +2685,9 @@ def refuse_common(a):
             return "%s %s is not a file" % (what, f)
     if a.sharedkv and not os.path.isfile(a.sharedkv):
         return "--sharedkv %s is not a file" % a.sharedkv
+    for f, what in ((getattr(a, "verify_step", None), "--verify-step"), (getattr(a, "s1_tables", None), "--s1-tables")):
+        if f and not os.path.isfile(f):
+            return "%s %s is not a file" % (what, f)
     if not torch.cuda.is_available():
         return "no CUDA device"
     if not os.environ.get("FLASHINFER_WORKSPACE_BASE"):
@@ -1370,8 +2699,70 @@ def import_flashinfer():
     import flashinfer
     v = getattr(flashinfer, "__version__", "unknown")
     if not version_ok(v):
-        raise RuntimeError("FlashInfer %s is not %s" % (v, FI_VERSION))
+        raise RuntimeError("FlashInfer %s is not one of %s" % (v, FI_VERSIONS))
     return flashinfer, v
+
+
+def build_fp_variant(fi, a, geom, gates, report):
+    """[fia3] gates FP_API and C0_FP (MUST when an FP arm is asked): the wrapper's signature, then the JIT build of
+    R2FiCisBiasMask (the first wrapper builds, the second loads). Returns jit_args_fp or None."""
+    if not any(x in a.arms for x in FP_ARMS):
+        return None
+    ok, why = check_fp_api(fi)
+    gates.append(gate("FP_API", ok, True, "BatchPrefillWithPagedKVCacheWrapper: %s" % why))
+    if not ok:
+        return None
+    jfp = jit_args_fp(geom["D"])
+    ws0 = torch.zeros(1 << 20, dtype=torch.uint8, device="cuda")
+    try:
+        t0 = time.time()
+        fi.BatchPrefillWithPagedKVCacheWrapper(ws0, "NHD", backend="fa2", jit_args=jfp)
+        build_s = time.time() - t0
+        t1 = time.time()
+        fi.BatchPrefillWithPagedKVCacheWrapper(ws0, "NHD", backend="fa2", jit_args=jfp)
+        report["jit_fp"] = dict(build_s=round(build_s, 1), load_s=round(time.time() - t1, 2))
+        gates.append(gate("C0_FP_variant_jit_build", True, True, "R2FiCisBiasMask built and loaded in %.1f s; a second "
+                          "wrapper loads in %.2f s" % (build_s, report["jit_fp"]["load_s"])))
+        return jfp
+    except Exception as e:
+        with open(os.path.join(a.out, "jit_fp_build_error.txt"), "w") as f:
+            f.write(traceback.format_exc())
+        report["findings"].append("the FP variant did not build: %s: %s" % (type(e).__name__, str(e)[:500]))
+        gates.append(gate("C0_FP_variant_jit_build", False, True, "FINDING: the FP variant JIT build FAILED (%s: %s; "
+                          "jit_fp_build_error.txt); the FP arms do not run" % (type(e).__name__, str(e)[:200])))
+        return None
+    finally:
+        del ws0
+
+
+def load_v1(a, gates, report):
+    """[fia3] V1's module and op, or None with a REPORT FINDING (V1 is the no-new-code route of Task 1.4: a missing
+    op is a finding, not a failure of this bench)."""
+    if "V1" not in a.arms:
+        return None
+    vmod, why = import_v1(a.verify_step)
+    gates.append(gate("R_V1_import", vmod is not None, False, "verify_step %s + infllm_v2 internal varlen op: %s"
+                      % (a.verify_step, "importable" if vmod is not None else "FINDING: " + why)))
+    if vmod is None:
+        report["findings"].append("V1 is not importable in this environment: %s" % why)
+    return vmod
+
+
+def load_s1(a, geom, gates):
+    """[fia3] the recorded S1 groups per rows-per-request of the s1 cells: {rpr: groups}, or None (a MUST failure)."""
+    rprs = sorted({cell_parts(c)[1] for c in a.cells if cell_parts(c)[2] == "s1"})
+    if not rprs:
+        return {}
+    try:
+        tables = load_s1_tables(a.s1_tables)
+        s1 = {r: s1_groups(tables, r, geom["Hkv"]) for r in rprs}
+        gates.append(gate("R_S1_tables", True, False, "%s: %d recorded calls; requests with exactly r rows: %s"
+                          % (a.s1_tables, len(tables), {r: len(v) for r, v in s1.items()})))
+        return s1
+    except Exception as e:
+        traceback.print_exc()
+        gates.append(gate("S1_tables", False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+        return None
 
 
 def mode_main(a):
@@ -1413,33 +2804,48 @@ def mode_main(a):
                           % (type(e).__name__, str(e)[:200])))
         jit = None
     del ws0
-    for b, rpr in a.cells:
-        tag = cell_tag(b, rpr)
+    jit_fp = build_fp_variant(fi, a, geom, gates, report)                 # [fia3]
+    vmod = load_v1(a, gates, report)
+    s1 = load_s1(a, geom, gates)
+    for c in a.cells:
+        b, rpr, src = cell_parts(c)
+        tag = cell_tag(b, rpr, src)
         left = deadline - time.time()
         if left < CELL_RESERVE_S:
             gates.append(gate("BUDGET_cell_%s" % tag, False, True, "skipped: %d s left < %d s" % (left, CELL_RESERVE_S)))
             continue
+        if src == "s1" and not (s1 or {}).get(rpr):
+            gates.append(gate("CELL_%s" % tag, False, True, "no recorded request with %d rows (S1 tables)" % rpr))
+            continue
         log("cell %s (%d s left)" % (tag, left))
         try:
-            report["cells"][tag] = run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates)
+            report["cells"][tag] = run_cell(fi, a, geom, p3, skv, jit, b, rpr, gates, src=src, jit_fp=jit_fp,
+                                            vmod=vmod, s1_groups=(s1 or {}).get(rpr))
         except Exception as e:
             traceback.print_exc()
             gates.append(gate("CELL_%s" % tag, False, True, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
-    gates.extend(completeness_gates(gates, a.cells, a.arms, jit is not None))
+    gates.extend(completeness_gates(gates, a.cells, a.arms, jit is not None, fp=jit_fp is not None,
+                                    v1=vmod is not None))
     if a.ncu != "none":
         try:
-            run_ncu(a, geom, jit is None, deadline, gates, report)
+            run_ncu(a, geom, jit is None, deadline, gates, report, fp_ok=jit_fp is not None, v1_ok=vmod is not None,
+                    s1=s1)
         except Exception as e:
             traceback.print_exc()
             gates.append(gate("R_ncu", False, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+    if jit_fp is not None and "FP0" in a.arms:
+        gates.extend(decision_report(report, gates, a.cells))
     meta = dict(mode="main", cells=[cell_tag(*c) for c in a.cells], arms=a.arms, seed=a.seed, sample=a.sample,
                 warm=a.warm, reps=a.reps, budget_s=a.budget_s, seconds=round(time.time() - t_start, 1), geom=geom,
                 torch=torch.__version__, flashinfer=fiv, gpu=torch.cuda.get_device_name(0),
                 commit=os.environ.get("FIATTN_COMMIT", "unknown"), biattn=a.biattn, sharedkv=a.sharedkv,
+                verify_step=a.verify_step, s1_tables=a.s1_tables, fi_versions_accepted=list(FI_VERSIONS),
+                kv_tile_tokens_model=KV_TILE_PAGES * PAGE,
                 bias_free=jit is None, tol_c=TOL_C, env={k: v for k, v in os.environ.items()
                                                          if k.startswith(("FLASHINFER_", "TVM_FFI", "TRITON_",
                                                                           "TORCH_", "MAX_JOBS", "TMPDIR"))})
-    write_json(os.path.join(a.out, "summary.json"), dict(meta=meta, gates=gates, report=report, pred=PRED))
+    write_json(os.path.join(a.out, "summary.json"), dict(meta=meta, gates=gates, report=report, pred=PRED,
+                                                         pred3=PRED3))
     for g in gates:
         print("%s %s %s: %s" % ("GATE" if g["must"] else "REPORT", g["name"], "PASS" if g["passed"] else "FAIL",
                                 g["detail"][:500]))
@@ -1448,7 +2854,7 @@ def mode_main(a):
     return min(nfail, 125)
 
 
-def run_ncu(a, geom, bias_free, deadline, gates, report):
+def run_ncu(a, geom, bias_free, deadline, gates, report, fp_ok=False, v1_ok=False, s1=None):
     if not os.access(a.ncu, os.X_OK):
         gates.append(gate("R_ncu", False, False, "no executable ncu at %s" % a.ncu))
         return
@@ -1456,8 +2862,12 @@ def run_ncu(a, geom, bias_free, deadline, gates, report):
     if rc != 0 or missing:
         gates.append(gate("R_ncu_metrics", False, False, "query exit %s; missing %s" % (rc, missing)))
         return
-    for b, rpr in [c for c in NCU_ORDER if c in a.cells]:
-        tag = cell_tag(b, rpr)
+    for c in sorted(a.cells, key=ncu_key):                                 # [fia3] fia2's order for the old cells
+        b, rpr, src = cell_parts(c)
+        tag = cell_tag(b, rpr, src)
+        if tag not in report.get("cells", {}):
+            gates.append(gate("R_ncu_%s" % tag, False, False, "skipped: the cell did not run"))
+            continue
         cap = ncu_cap(deadline - time.time(), a.ncu_cap)
         if cap is None:
             gates.append(gate("R_ncu_%s" % tag, False, False, "skipped: budget"))
@@ -1465,11 +2875,15 @@ def run_ncu(a, geom, bias_free, deadline, gates, report):
         arms = [x for x in ("P", "F8", "F0") if x in a.arms]
         if rpr > 1 and a.sharedkv and "S5" in a.arms:
             arms.append("S5")
+        if fp_ok:
+            arms += [x for x in FP_ARMS if x in a.arms]
+        if v1_ok and "V1" in a.arms and report["cells"][tag].get("v1_pre"):
+            arms.append("V1")
         child = os.path.join(a.out, "ncu_%s" % tag)
         rep = os.path.join(a.out, "ncu_%s_rep" % tag)
         t1 = time.time()
-        rc = run_logged(ncu_argv(a, b, rpr, child, rep, metrics, arms, bias_free), os.path.join(a.out,
-                        "ncu_%s.log" % tag), cap)
+        rc = run_logged(ncu_argv(a, b, rpr, child, rep, metrics, arms, bias_free, src=src),
+                        os.path.join(a.out, "ncu_%s.log" % tag), cap)
         exp = None
         summ = None
         if os.path.exists(rep + ".ncu-rep"):
@@ -1477,19 +2891,34 @@ def run_ncu(a, geom, bias_free, deadline, gates, report):
             exp = run_logged([a.ncu, "--import", rep + ".ncu-rep", "--csv", "--page", "raw", "--print-units", "base"],
                              csv_path, 300)
             if exp == 0:
-                case = make_case(geom, b, rpr, a.seed, with_data=False)
+                case = make_cell_case(geom, b, rpr, src, a.seed, (s1 or {}).get(rpr), with_data=False)
                 bf = case["full"]
-                summ = ncu_summary(ncu_rows(open(csv_path).read(), metrics), arms, ideal_bytes(bf, geom),
-                                   union_bytes(bf, geom, case["N"], case["S"]), rpr)
+                summ = ncu_summary(ncu_rows(open(csv_path).read(), list(metrics) + list(NCU_LAUNCH)), arms,
+                                   ideal_bytes(bf, geom), union_bytes(bf, geom, case["N"], case["S"]), rpr)
         report["ncu"][tag] = dict(child_exit=rc, export_exit=exp, cap_s=cap, seconds=round(time.time() - t1, 1),
                                   summary=summ)
         txt = "child exit %s (cap %d s), export %s" % (rc, cap, exp)
         if summ:
-            txt += "; " + "; ".join("%s read %.3g B = %s of ideal, %s of union, %d kernels (expected %s); %s"
-                                    % (x, p["read"], "%.3f" % p["read_over_ideal"], "%.3f" % p["read_over_union"],
-                                       p["n_kernels"], p["expected_kernels"], p["band"])
-                                    for x, p in summ["arms"].items())
+            txt += "; " + "; ".join(ncu_arm_text(x, p) for x, p in summ["arms"].items())
         gates.append(gate("R_ncu_%s" % tag, rc == 0 and exp == 0, False, txt))
+
+
+def ncu_arm_text(x, p):
+    """One arm's ncu numbers ([fia3] + device time, L2 -> SM bytes, registers, local memory, PRED3 bands)."""
+    f = lambda v: "%.3f" % v if v is not None else "n/a"                    # noqa: E731
+    txt = ("%s %.1f us, read %.3g B = %s of ideal, %s of union, %d kernels (expected %s); %s"
+           % (x, p["time_ns"] / 1e3, p["read"], f(p["read_over_ideal"]), f(p["read_over_union"]), p["n_kernels"],
+              p["expected_kernels"], p["band"]))
+    if p.get("l2sm_bytes") is not None:
+        txt += "; L2->SM %.3g B = %s of union, %s of sum" % (p["l2sm_bytes"], f(p["l2sm_over_union"]),
+                                                             f(p["l2sm_over_ideal"]))
+    if p.get("regs"):
+        txt += "; registers %s" % sorted(set(p["regs"]))
+    if p.get("local_bytes") is not None:
+        txt += "; local memory %.3g B%s" % (p["local_bytes"], " (SPILLS)" if p["local_bytes"] > 0 else "")
+    if p.get("band3"):
+        txt += "; %s" % p["band3"]
+    return txt
 
 
 def mode_ncu_cell(a):
@@ -1504,13 +2933,18 @@ def mode_ncu_cell(a):
     geom = geometry_from_config(json.load(open(a.config)))
     p3 = load_by_path(a.biattn, "piece3_bi_paged_attention")
     skv = load_by_path(a.sharedkv, "sharedkv5_bi_paged_attention_shared") if a.sharedkv else None
-    b, rpr = a.cells[0]
-    case = case_to(make_case(geom, b, rpr, a.seed), "cuda")
+    b, rpr, src = cell_parts(a.cells[0])
+    groups = s1_groups(load_s1_tables(a.s1_tables), rpr, geom["Hkv"]) if src == "s1" else None
+    case = case_to(make_cell_case(geom, b, rpr, src, a.seed, groups), "cuda")
     jit = None if a.bias_free else jit_args_for(geom["D"])
     if a.bias_free:
         case["bias"] = torch.zeros_like(case["bias"])
     bf = batch_of(case, "full")
-    arms = build_arms(fi, a, geom, case, p3, skv, jit, a.arms, "cuda")
+    jit_fp = jit_args_fp(geom["D"]) if any(x in a.arms for x in FP_ARMS) else None      # [fia3] built by the parent
+    vmod = import_v1(a.verify_step)[0] if "V1" in a.arms else None
+    arms = build_arms(fi, a, geom, case, p3, skv, jit, a.arms, "cuda", jit_fp=jit_fp, vmod=vmod)
+    if "V1" in arms and not v1_precondition(fp_union(bf, rpr, case["S"]), bf, rpr)[0]:
+        del arms["V1"]
     for arm in arms.values():
         arm.prepare(bf)
         arm.launch()
@@ -1524,7 +2958,7 @@ def mode_ncu_cell(a):
         torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
     torch.cuda.cudart().cudaProfilerStop()
-    write_json(os.path.join(a.out, "cell.json"), dict(cell=cell_tag(b, rpr), arms=list(arms), flashinfer=fiv,
+    write_json(os.path.join(a.out, "cell.json"), dict(cell=cell_tag(b, rpr, src), arms=list(arms), flashinfer=fiv,
                                                       ideal_bytes=ideal_bytes(bf, geom),
                                                       union_bytes=union_bytes(bf, geom, case["N"], case["S"])))
     return 0
