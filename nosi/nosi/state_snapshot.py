@@ -57,6 +57,15 @@ InfLLMv2CacheLayer:
 InfLLMv2Cache:
   _seen_tokens                   :757          (python int)
 
+CacheEngine, the VICTIM POOL (retroinfer-eval fork, NOSI_POOL_BLOCKS > 0; Task 1.5 of
+KS/analysis/plan/PLAN_speckv_on_cached_nosa.md added them, MAP_cached_nosa.md section 3(e)):
+  _pool_map, _pool_age           pool_update_kernel.cu:230-243 (in place)
+  _pool_target, _pool_action     pool_update_kernel.cu:128-129, :227-241 (the per-step plan, rewritten by
+                                 every step; kept so that a restore is the snapshot bit for bit)
+  _pool_stamp_base               cache_engine.py:511 (python int: the LRU clock, += topk per step)
+  The pool's DATA rows are slots topk .. topk+P-1 of _k_gpu / _v_gpu / _kv_bias_gpu, which the engine
+  tensors above already hold whole. An engine without a pool has none of these names; _grab skips them.
+
 DELIBERATELY EXCLUDED, and this is not an oversight. The per-step transient
 buffers -- pooling_buf_all, max_pooling_buf, topk_*, mask_buf, score_buf,
 compressed_cis_buf -- are recomputed from scratch every step
@@ -72,8 +81,10 @@ import hashlib
 import torch
 
 _ENGINE_TENSORS = ("_k_gpu", "_v_gpu", "_kv_bias_gpu", "_block_map",
-                   "_new_block_map_buf", "_load_mask", "_cache_lens")
-_ENGINE_SCALARS = ("seq_length", "_tail_block_len_on_gpu", "_tail_block_idx_on_gpu")
+                   "_new_block_map_buf", "_load_mask", "_cache_lens",
+                   "_pool_map", "_pool_age", "_pool_target", "_pool_action")
+_ENGINE_SCALARS = ("seq_length", "_tail_block_len_on_gpu", "_tail_block_idx_on_gpu",
+                   "_pool_stamp_base")
 _LAYER_TENSORS = ("compress_k_cache_varlen", "cached_compressed_cu_seqlens",
                   "no_compress_k_cache", "compressed_cis", "tail_cis", "total_cis")
 _LAYER_SCALARS = ("cached_compressed_max_seqlen", "no_compress_k_len",

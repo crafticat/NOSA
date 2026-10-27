@@ -67,6 +67,21 @@ in the same process, each arm with its own shipped prefill, TEACHER-FORCED on SH
   the float64 sum of the logits row, compared BITWISE with SH's (SH then also records it: two reductions per step,
   declared); MUST gates RG-RUN / RG-ERR / RG-CAP (the pooling graph captured once per layer, at step 0); the
   registered predictions PRED_RAGGED (RG-BIT, RGS-BIT, RG-STEP, RGS-STEP), TBD by the lead (REPORT until filled).
+
+--rollback (Task 1.5 of the same plan; default OFF, and then nothing below runs): after SH, two arms of the per-request
+engine with the options --ragged-twin / -body / -gemm / -graph (the --ragged flag itself is not needed), each with its
+own shipped prefill, TEACHER-FORCED on SH's tokens, on ONE schedule: G = --rb-groups groups of K = --rb-k steps, and
+n_acc[g, b] uniform in 0 .. K (seeded by --rb-seed; rollback_schedule). Request b starts group g at local step
+kc[g, b] (kc = the sum of the earlier n_acc) and its step u reads SH's input inputs[b, kc + u] at position S0 + kc + u.
+  RBR  the REFERENCE: plain ragged steps (no rollback code); in step u of group g only the requests with
+       u < n_acc[g, b] are active. It runs ONLY the kept steps.
+  RBS  the ROLLBACK arm (nosi/nosi/ragged_rollback.py, journal capacity --rb-journal-blocks): per group begin(), K
+       tentative steps with every request active, then commit(n_acc[g]) (CUDA events around it: the commit / rollback
+       cost per group).
+  RB-BIT compares the logits fingerprints (max, float64 sum, argmax) of every KEPT row (u < n_acc[g, b]) bitwise. A
+  wrong commit changes the state of the next group, so the kept rows of every later group check it too. MUST gates
+  RBR-RUN / -ERR / -CAP, RBS-RUN / -ERR / -CAP; the registered predictions PRED_ROLLBACK (RB-BIT, RB-STEP, RB-COMMIT,
+  RB-OVF), TBD by the lead (REPORT until filled).
 """
 from __future__ import annotations
 
@@ -114,6 +129,13 @@ MBASE_F_BAND = (0.95, 1.00)
 PRED_RAGGED = dict(stamp="2026-10-27T16:40:10Z", RG_bitwise=True, RGS_bitwise=True, RG_ratio=(1.0, 1.35),
                    RGS_ratio=(1.0, 1.35))
 RAGGED_ARMS = (("RG", 1), ("RGS", None))               # (arm, spread); None = --ragged-spread
+# --rollback (Task 1.5): REGISTERED PREDICTIONS, TBD BY THE LEAD. Fill every None and the stamp (date -u, L33) in a commit
+# BEFORE the run; a None value gives REPORT. RB_bitwise: True / False (every kept row of RBS bitwise RBR's);
+# RB_step_ratio: (low, high) of RBS's median tentative step / RBR's median step; RB_commit_ms: (low, high) of the
+# median commit per group in ms; RB_overflow_zero: True / False (no lost slot that HELD A BLOCK past
+# --rb-journal-blocks; empty slots past it are counted apart: the first decode step has 63 per (head, request)).
+PRED_ROLLBACK = dict(stamp=None, RB_bitwise=None, RB_step_ratio=None, RB_commit_ms=None, RB_overflow_zero=None)
+ROLLBACK_ARMS = ("RBR", "RBS")                         # the reference first (its prefill and steps carry no hook)
 
 
 def log(msg):
@@ -146,6 +168,14 @@ def parse_args(argv):
                     help="natural (F.linear, the shipped call) or exact (PaddedLinear at m_fix = --batch)")
     ap.add_argument("--ragged-graph", default="on", choices=("on", "off"),
                     help="pooling + top-k in one CUDA graph per layer (captured once) or eager")
+    ap.add_argument("--rollback", action="store_true",
+                    help="after SH: the rollback arms RBR (reference) and RBS (nosi/nosi/ragged_rollback.py); "
+                         "needs --arms SH; uses the --ragged-* engine options")
+    ap.add_argument("--rb-k", type=int, default=3, help="--rollback: tentative steps per group (1 .. 64)")
+    ap.add_argument("--rb-groups", type=int, default=128, help="--rollback: groups ((groups + 1) x K <= --steps)")
+    ap.add_argument("--rb-seed", type=int, default=0, help="--rollback: the seed of n_acc (uniform in 0 .. K)")
+    ap.add_argument("--rb-journal-blocks", type=int, default=256,
+                    help="--rollback: saved slots per layer and step (a lost slot past it comes back from the host)")
     a = ap.parse_args(argv)
     a.arms = [x for x in a.arms.split(",") if x]
     if a.arms not in (["SH", "R2"], ["SH"]):
@@ -162,6 +192,12 @@ def parse_args(argv):
         ap.error("--ragged needs --arms SH (the ragged arms are teacher-forced on SH's tokens)")
     if a.ragged and not 2 <= a.ragged_spread <= R_TOK:
         ap.error("--ragged-spread in 2 .. %d" % R_TOK)
+    if a.rollback and a.arms != ["SH"]:
+        ap.error("--rollback needs --arms SH (the rollback arms are teacher-forced on SH's tokens)")
+    if a.rollback and not (1 <= a.rb_k <= R_TOK and a.rb_groups >= 1 and (a.rb_groups + 1) * a.rb_k <= a.steps
+                           and a.rb_journal_blocks >= 1):
+        ap.error("--rb-k in 1 .. %d, --rb-groups >= 1 with (groups + 1) x K <= --steps, --rb-journal-blocks >= 1"
+                 % R_TOK)
     return a
 
 
@@ -410,6 +446,71 @@ def verdicts_ragged(sh, rg):
     return out
 
 
+def rollback_schedule(B: int, groups: int, K: int, seed: int):
+    """--rollback: n_acc (G, B) int64, the tentative steps of group g that request b keeps, uniform in 0 .. K (a CPU
+    generator seeded by `seed`), and kc (G + 1, B) int64, the kept local steps before group g (kc[0] = 0)."""
+    import torch
+    g = torch.Generator().manual_seed(int(seed))
+    n_acc = torch.randint(0, int(K) + 1, (int(groups), int(B)), generator=g, dtype=torch.int64)
+    kc = torch.zeros((int(groups) + 1, int(B)), dtype=torch.int64)
+    kc[1:] = torch.cumsum(n_acc, 0)
+    return n_acc, kc
+
+
+def rollback_compare(ref, got, n_acc):
+    """--rollback: BITWISE comparison of two logits fingerprints (max (G, K, B) float32, sum float64, argmax int64), RBR
+    against RBS, over the KEPT rows only (u < n_acc[g, b]). Returns dict(n_checked, n_unequal, equal_fraction,
+    first = (group, step, request) of the first unequal kept row in (g, u, b) order or None, groups_unequal)."""
+    import torch
+    G, K, B = ref[0].shape
+    keep = torch.arange(K).view(1, K, 1) < n_acc.view(G, 1, B)
+    eq = (ref[0].contiguous().view(torch.int32) == got[0].contiguous().view(torch.int32)) & \
+        (ref[1].contiguous().view(torch.int64) == got[1].contiguous().view(torch.int64)) & (ref[2] == got[2])
+    bad = keep & ~eq.cpu()
+    n, nb = int(keep.sum()), int(bad.sum())
+    first = tuple(int(x) for x in bad.nonzero()[0]) if nb else None
+    return dict(n_checked=n, n_unequal=nb, equal_fraction=(1.0 if n == 0 else (n - nb) / n), first=first,
+                groups_unequal=int(bad.any(2).any(1).sum()))
+
+
+def _band(v, band):
+    return "REPORT" if band is None else ("CONFIRMED" if band[0] <= v <= band[1] else "REFUTED")
+
+
+def verdicts_rollback(sh, rb):
+    """--rollback: RB-BIT (every kept row equal), RB-STEP (RBS / RBR median step), RB-COMMIT (median commit ms per group),
+    RB-OVF (no journal slot past N) against PRED_ROLLBACK; a registered value None (TBD) gives REPORT."""
+    out, rb = [], rb or {}
+    c = rb.get("compare")
+    if c is None:
+        out.append(("RB-BIT", "NOT_RUN", "an arm did not run"))
+    else:
+        want = PRED_ROLLBACK["RB_bitwise"]
+        got = c["n_checked"] > 0 and c["n_unequal"] == 0
+        v = "REPORT" if want is None else ("CONFIRMED" if got == bool(want) else "REFUTED")
+        out.append(("RB-BIT", v, "kept rows of RBS bitwise RBR's: %d of %d unequal (first %s, %d groups); registered %s"
+                    % (c["n_unequal"], c["n_checked"], c["first"], c["groups_unequal"], want)))
+    rbs, rbr = rb.get("RBS"), rb.get("RBR")
+    if rbs and rbr and rbs["steady"]["median_ms"] and rbr["steady"]["median_ms"]:
+        ratio = rbs["steady"]["median_ms"] / rbr["steady"]["median_ms"]
+        band = PRED_ROLLBACK["RB_step_ratio"]
+        out.append(("RB-STEP", _band(ratio, band), "RBS tentative step / RBR step (medians) %.4f; SH steady %s ms; "
+                    "registered band %s" % (ratio, (sh or {}).get("rates", {}).get("steady_step_ms"), band)))
+    if rbs and rbs.get("commit") and rbs["commit"]["median_ms"] is not None:
+        cm = rbs["commit"]
+        band = PRED_ROLLBACK["RB_commit_ms"]
+        out.append(("RB-COMMIT", _band(cm["median_ms"], band), "commit per group: median %.3f ms, mean %.3f, p90 %.3f "
+                    "(%d groups); registered band %s" % (cm["median_ms"], cm["mean_ms"], cm["p90_ms"], cm["n"], band)))
+    if rbs and rbs.get("journal"):
+        ovf = sum(rbs["journal"]["overflow"])
+        want = PRED_ROLLBACK["RB_overflow_zero"]
+        v = "REPORT" if want is None else ("CONFIRMED" if (ovf == 0) == bool(want) else "REFUTED")
+        out.append(("RB-OVF", v, "journal slots past N that held a block (restored from the host): %d; past N and "
+                    "empty (not restored, no reader): %d; destroyed %d; registered %s" % (
+                        ovf, sum(rbs["journal"].get("overflow_dead", [])), sum(rbs["journal"]["destroyed"]), want)))
+    return out
+
+
 class CudaClock:
     def event(self):
         import torch
@@ -631,6 +732,111 @@ def run_ragged(model, ids, inputs, steps: int, spread: int, clock, opt):
     return res
 
 
+def rollback_agreement(arg, inputs, sched):
+    """--rollback: over the kept rows (u < n_acc[g, b]), the fraction whose argmax equals SH's next token
+    inputs[b, kc[g, b] + u + 1] (REPORT)."""
+    import torch
+    n_acc, kc = sched
+    G, K, B = arg.shape
+    u = torch.arange(K).view(1, K, 1)
+    col = (kc[:G].view(G, 1, B) + u + 1).clamp(max=inputs.shape[1] - 1)
+    sh = inputs.detach().cpu()[torch.arange(B).view(1, 1, B).expand(G, K, B), col]
+    keep = u < n_acc.view(G, 1, B)
+    n = int(keep.sum())
+    return dict(n_kept=n, agreement=(float(((arg.detach().cpu() == sh) & keep).sum()) / n if n else None))
+
+
+def run_rollback(model, ids, inputs, steps: int, clock, opt, mode: str, sched):
+    """--rollback: ONE arm (module docstring). mode "ref" (RBR: plain ragged steps, only the kept steps active) or "spec"
+    (RBS: nosi/nosi/ragged_rollback.Rollback, every step active, then commit(n_acc[g])). Its own shipped prefill and
+    attach, as run_ragged. Per (group, step, request): the logits fingerprint (max, float64 sum, argmax). Per step: the
+    device span between CUDA events around decode_step and the fingerprint copies. Per group (spec): the span of
+    commit(). Inputs and outputs on the device; the host reads them once at the end. opt: gemm, twin, body, graph, k,
+    journal."""
+    import torch
+    from nosi.cache_engine import InfLLMv2Cache
+    from nosi import ragged_engine as RE
+    cfg = model.config
+    model.has_buffers = False                            # the shipped warm-up state is not used: release it (run_ragged)
+    for name in MODEL_WARM_BUFFERS:
+        if hasattr(model, name):
+            setattr(model, name, None)
+    for layer in model.layers:
+        for name in LAYER_WARM_STATE:
+            if hasattr(layer, name):
+                setattr(layer, name, None)
+    gc.collect()
+    torch.cuda.empty_cache()
+    cache = InfLLMv2Cache(config=cfg, num_hidden_layers=cfg.num_hidden_layers, has_kv_bias=True)
+    for layer in cache.layers:
+        layer.cache_engine.max_gen_len = steps + 64
+    Bn = ids.shape[0]
+    clock.sync()
+    t0 = time.time()
+    logits, _ = model.batch_prefill(ids, cache)
+    clock.sync()
+    prefill_s = time.time() - t0
+    first_agree = int((logits[:, -1, :].argmax(dim=-1) == inputs[:, 0]).sum())
+    del logits
+    lin = RE.exact_linear(Bn) if opt["gemm"] == "exact" else None
+    ops = RE.RaggedOps(RE.default_kernels(), gemm=opt["gemm"], linear=lin, twin=opt["twin"], body=opt["body"],
+                       graph=opt["graph"])
+    rs = RE.attach(model, cache, S0, steps, ops)
+    gc.collect()
+    torch.cuda.empty_cache()                             # the released shipped tables
+    rb = None
+    if mode == "spec":
+        from nosi import ragged_rollback as RR
+        rb = RR.Rollback(rs, opt["k"], capacity=opt["journal"])
+    n_acc, kc = sched
+    G, K = int(n_acc.shape[0]), int(opt["k"])
+    nacc_dev, kc_dev = n_acc.to("cuda"), kc.to("cuda")
+    fmax = torch.zeros((G, K, Bn), dtype=torch.float32, device="cuda")
+    fsum = torch.zeros((G, K, Bn), dtype=torch.float64, device="cuda")
+    farg = torch.zeros((G, K, Bn), dtype=torch.int64, device="cuda")
+    ids_buf = torch.empty((Bn, 1), dtype=torch.int64, device="cuda")
+    pos_buf = torch.empty((Bn, 1), dtype=torch.int32, device="cuda")
+    ones, ones_h = torch.ones(Bn, dtype=torch.bool, device="cuda"), torch.ones(Bn, dtype=torch.bool)
+    ea = [clock.event() for _ in range(G * K)]
+    eb = [clock.event() for _ in range(G * K)]
+    ca = [clock.event() for _ in range(G if rb is not None else 0)]
+    cb = [clock.event() for _ in range(G if rb is not None else 0)]
+    t = 0
+    for g in range(G):
+        if rb is not None:
+            rb.begin()
+        for u in range(K):
+            k = (kc_dev[g] + u).clamp(max=steps).view(Bn, 1)
+            ids_buf.copy_(inputs.gather(1, k))
+            pos_buf.copy_(k + S0)
+            if rb is None:
+                RE.set_activity(rs, nacc_dev[g] > u, n_acc[g] > u)
+            else:
+                RE.set_activity(rs, ones, ones_h)
+            clock.record(ea[t])
+            lg = RE.decode_step(model, rs, ids_buf, pos_buf)[:, -1, :]
+            fmax[g, u].copy_(lg.amax(dim=-1))
+            fsum[g, u].copy_(lg.sum(dim=-1, dtype=torch.float64))
+            farg[g, u].copy_(lg.argmax(dim=-1))
+            clock.record(eb[t])
+            t += 1
+        if rb is not None:
+            clock.record(ca[g])
+            rb.commit(nacc_dev[g], n_acc[g])
+            clock.record(cb[g])
+    clock.sync()
+    step_ms = [clock.elapsed(ea[i], eb[i]) for i in range(G * K)]
+    commit_ms = [clock.elapsed(ca[i], cb[i]) for i in range(len(ca))]
+    body_err, overflow = RE.errors(rs)
+    res = dict(fp=(fmax, fsum, farg), step_ms=step_ms, commit_ms=commit_ms, captures=rs.captures,
+               capture_steps=list(rs.capture_steps), replays=rs.replays, layers=len(model.layers), body_err=body_err,
+               overflow=overflow, prefill_s=round(prefill_s, 1), first_token_agreement=first_agree,
+               journal=(rb.stats() if rb is not None else None), groups=G, k=K,
+               meta=dict(rs.meta, mode=mode, capacity=(opt["journal"] if rb is not None else None)))
+    del rb, rs, cache
+    return res
+
+
 def gpu_peak():
     import torch
     return round(torch.cuda.max_memory_allocated() / 1e9, 3), round(torch.cuda.max_memory_reserved() / 1e9, 3)
@@ -808,12 +1014,67 @@ def main(argv=None) -> int:
                     gates.append(("%s-RUN" % arm, True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
                 mem["after_%s" % arm] = host_mem()
                 free()
+        rbres = {}
+        if a.rollback:
+            ropt = dict(gemm=a.ragged_gemm, twin=a.ragged_twin, body=a.ragged_body, graph=a.ragged_graph == "on",
+                        k=a.rb_k, journal=a.rb_journal_blocks)
+            sched = rollback_schedule(a.batch, a.rb_groups, a.rb_k, a.rb_seed)
+            fps = {}
+            for arm in ROLLBACK_ARMS:
+                if inputs is None:
+                    gates.append(("%s-RUN" % arm, True, False, "NOT_RUN: SH failed (teacher-forced on SH's tokens)"))
+                    continue
+                mem["before_%s_release" % arm] = host_mem()
+                free(host=True)
+                log("arm %s (K %d, %d groups, seed %d, journal %d, %s)" % (arm, a.rb_k, a.rb_groups, a.rb_seed,
+                                                                         a.rb_journal_blocks, ropt))
+                rb_base = round(torch.cuda.memory_allocated() / 1e9, 3)
+                try:
+                    res = run_rollback(model, ids, inputs, a.steps, clock, ropt, "ref" if arm == "RBR" else "spec",
+                                       sched)
+                    pa, pr = gpu_peak()
+                    nst = len(res["step_ms"])
+                    fps[arm] = res["fp"]
+                    rbres[arm] = dict(steady=period_stats(res["step_ms"], range(1, nst)),
+                                      all_steps=period_stats(res["step_ms"], range(nst)),
+                                      commit=(period_stats(res["commit_ms"], range(len(res["commit_ms"])))
+                                              if res["commit_ms"] else None),
+                                      commit_ms_first=[round(x, 3) for x in res["commit_ms"][:8]],
+                                      prefill_s=res["prefill_s"], gpu_peak_alloc_GB=pa, gpu_peak_reserved_GB=pr,
+                                      gpu_base_alloc_GB=rb_base, first_token_agreement=res["first_token_agreement"],
+                                      agreement=rollback_agreement(res["fp"][2], inputs, sched),
+                                      journal=res["journal"], captures=res["captures"],
+                                      capture_steps=res["capture_steps"], replays=res["replays"],
+                                      body_err=res["body_err"], overflow=res["overflow"], groups=res["groups"],
+                                      k=res["k"], meta=res["meta"])
+                    gates.append(("%s-RUN" % arm, True, True, "%d groups x %d steps%s" % (
+                        res["groups"], res["k"], ", a commit per group" if res["commit_ms"] else "")))
+                    gates.append(("%s-ERR" % arm, True, res["body_err"] == 0 and not any(res["overflow"]),
+                                  "body refusal bits %s; twin overflow flags %s" % (
+                                      res["body_err"], sorted(set(res["overflow"])))))
+                    want = res["layers"] if ropt["graph"] else 0
+                    cap_ok = res["captures"] == want and all(s == 0 for s in res["capture_steps"])
+                    gates.append(("%s-CAP" % arm, True, cap_ok, "%d graph captures (want %d, all at step 0): steps %s;"
+                                  " %d replays" % (res["captures"], want, sorted(set(res["capture_steps"])),
+                                                   res["replays"])))
+                    del res
+                except Exception as e:
+                    traceback.print_exc()
+                    gates.append(("%s-RUN" % arm, True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+                mem["after_%s" % arm] = host_mem()
+                free()
+            if len(fps) == len(ROLLBACK_ARMS):
+                rbres["compare"] = rollback_compare(fps["RBR"], fps["RBS"], sched[0])
+            rbres["n_acc_sum"] = int(sched[0].sum())
+            del fps
     preds = (verdicts_fused if a.r2 == "fused" else verdicts)(a.batch, sh, r2, agree, expected)
     C = C_BASE + a.pool
     if a.mbase:
         preds = preds + verdicts_mbase(C, a.batch, sh, r2)
     if a.ragged:
         preds = preds + verdicts_ragged(sh, rg)
+    if a.rollback:
+        preds = preds + verdicts_rollback(sh, rbres)
     meta = dict(batch=a.batch, steps=a.steps, warmup=a.warmup, S0=S0, doc_rows=rows, n_unique_docs=min(a.batch, N_DOCS),
                 workload_sha256=sha, expected_rewarms=expected, attn_splits=NL._ATTN_SPLITS,
                 pool_blocks=CEN.POOL_BLOCKS, capacity_C=C, arms=a.arms, mbase=a.mbase,
@@ -831,6 +1092,11 @@ def main(argv=None) -> int:
         meta.update(ragged=dict(spread=a.ragged_spread, twin=a.ragged_twin, body=a.ragged_body, gemm=a.ragged_gemm,
                                 graph=a.ragged_graph, predictions=PRED_RAGGED, sh_fingerprint=True))
         out["RAGGED"] = rg
+    if a.rollback:                                       # flag off: the summary keeps exactly its former keys
+        meta.update(rollback=dict(k=a.rb_k, groups=a.rb_groups, seed=a.rb_seed, journal_blocks=a.rb_journal_blocks,
+                                  twin=a.ragged_twin, body=a.ragged_body, gemm=a.ragged_gemm, graph=a.ragged_graph,
+                                  predictions=PRED_ROLLBACK))
+        out["ROLLBACK"] = rbres
     with open(os.path.join(a.out, "summary.json"), "w") as f:
         json.dump(out, f, indent=1, sort_keys=True, default=str)
     for g in gates:
@@ -853,6 +1119,16 @@ def main(argv=None) -> int:
                   arm["rates"]["steady_tok_s"], arm["rates"]["effective_tok_s"], arm["gpu_peak_alloc_GB"],
                   arm["prefill_s"], arm["agreement"]["tf_agreement"], arm["fingerprint"]["equal_fraction"],
                   arm["fingerprint"]["first"]))
+    for name in ROLLBACK_ARMS if a.rollback else ():
+        arm = rbres.get(name)
+        if arm:
+            print("REPORT %s B %d K %d groups %d: step median %s ms (%d steps), commit median %s ms, peak %s GB, prefill "
+                  "%s s; kept-row agreement with SH %s; journal %s" % (
+                      name, a.batch, arm["k"], arm["groups"], arm["steady"]["median_ms"], arm["steady"]["n"],
+                      (arm["commit"] or {}).get("median_ms"), arm["gpu_peak_alloc_GB"], arm["prefill_s"],
+                      arm["agreement"]["agreement"], arm["journal"]))
+    if a.rollback and rbres.get("compare"):
+        print("REPORT rollback compare: %s" % (rbres["compare"],))
     nfail = sum(1 for g in gates if g[1] and not g[2])
     print("r2_base: %d MUST gate(s) failed" % nfail)
     return min(nfail, 19)

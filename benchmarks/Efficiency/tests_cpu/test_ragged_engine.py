@@ -86,8 +86,12 @@ def test_gate0_flag_off_byte_identical():
                        capture_output=True, text=True)
     if r.returncode != 0:
         pytest.skip("no git or no commit %s in %s" % (BASE, ROOT))
+    # Task 1.5 (r2-rollback) adds nosi/nosi/ragged_rollback.py (imported by no engine module) and the pool names in
+    # nosi/nosi/state_snapshot.py (imported by benchmarks/Efficiency/acceptance_pilot.py only); its own Gate 0 is
+    # tests_cpu/test_rollback.py test_flag_off_is_shipped.
     r = subprocess.run(["git", "-C", str(ROOT), "diff", "--stat", BASE, "--", "nosi/nosi", "dependencies",
-                        ":(exclude)nosi/nosi/ragged_engine.py", ":(exclude,glob)**/__pycache__/**"],
+                        ":(exclude)nosi/nosi/ragged_engine.py", ":(exclude)nosi/nosi/ragged_rollback.py",
+                        ":(exclude)nosi/nosi/state_snapshot.py", ":(exclude,glob)**/__pycache__/**"],
                        capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout.strip() == "", "the engine sources differ from %s:\n%s" % (BASE, r.stdout)
     BC = W.bc()
