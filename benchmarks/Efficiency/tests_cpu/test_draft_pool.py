@@ -992,8 +992,13 @@ def _step(cell, sha="0" * 40, dry=True):
 def test_step_script_dr1():
     text = STEP.read_text()
     preds = [ln for ln in text.splitlines() if "PREDICTION:" in ln]
-    assert len(preds) >= 10 and all(ln.rstrip().endswith("PREDICTION: TBD by lead") for ln in preds), preds
-    assert "NOT STAMPED" in text
+    assert len(preds) >= 10, preds
+    if re.search(r"STAMP \d{4}-\d\d-\d\dT[\d:]+Z", text):              # the lead filled and stamped the block
+        assert not any("TBD by lead" in ln for ln in preds), preds
+        assert re.search(r"^DR1_BANDS=[0-9.]+(:[0-9.]+){3}\s", text, re.M), "stamped block without DR1_BANDS"
+    else:                                                               # the builder's state
+        assert all(ln.rstrip().endswith("PREDICTION: TBD by lead") for ln in preds), preds
+        assert "NOT STAMPED" in text
     for bad in ("dr2", "mb1", "dr1x", ""):
         r = _step(bad)
         assert r.returncode == 1 and "cell '%s'" % bad in r.stderr, (bad, r.returncode, r.stderr[-300:])

@@ -24,8 +24,8 @@
 # Checks before the claim (each STOPS with exit 1): as r2_base_fused_step.sh. The claim: OUTROOT/drp_active (mkdir,
 # atomic); a stop after the claim leaves it (the lead decides).
 #
-# REGISTERED for dr1 / dr1m ([draftpool] Task 1.1, NOT STAMPED, SOURCE ONLY, not run; the lead fills every PREDICTION,
-# writes DR1_BANDS = DLO:DHI:RLO:RHI and stamps this block from `date -u` in the command that freezes it, L33). WHAT:
+# REGISTERED for dr1 / dr1m ([draftpool] Task 1.1, STAMP 2026-10-27T16:18:30Z by the lead, from `date -u`, before any
+# run, L33; DR1_BANDS = DLO:DHI:RLO:RHI). WHAT:
 # SH = mb1 (the same-job baseline). DR = a new cache of the same engine, the flag ON after the prefill, teacher-forced
 # on SH's tokens; kinds: rewarm and t < 4 (g0) shipped, edge (the tail block fills) shipped, then 3 draft steps and 1
 # shipped step (ship). A draft step skips the two host gathers and masks the slots that still need the host.
@@ -34,16 +34,22 @@
 # The plan's estimate (Task 1.1): the draft step = shipped - gather - part of the swap, about 52-57 ms. The draft step
 # still runs the swap; it adds 4 small launches per layer (compare, two masked fills, the bias copy of 3.5 MB).
 #   DR-G0     MUST: the DR steps 0 .. 3 (flag on, shipped) give SH's next tokens, 216 x 4 of 216 x 4.
-#             PREDICTION: TBD by lead
-#   DR-RUN    MUST: 512 steps, at least one draft step. PREDICTION: TBD by lead
-#   DR-STEP   the draft step median (ms) inside DLO:DHI. PREDICTION: TBD by lead
-#   DR-RATIO  draft median / SH steady median inside RLO:RHI. PREDICTION: TBD by lead
-#   DR-SHIP   REPORT: the ship step median (after 3 drafts) / SH steady median. PREDICTION: TBD by lead
-#   DR-SKIP   REPORT: skipped slots per (layer, KV head, request) per draft step. PREDICTION: TBD by lead
-#   DR-AGREE  REPORT: teacher-forced agreement of the draft steps with SH's tokens. PREDICTION: TBD by lead
-#   DR-MEM    REPORT: DR peak allocated - SH peak allocated (GB). PREDICTION: TBD by lead
-#   MB-STEP   (--mbase, as mb1) the SH steady step inside (64.92, 70.39). PREDICTION: TBD by lead
-#   dr1m      DR-RUN and DR-G0 PASS; kinds include edge at t 63 and rewarm at t 64. PREDICTION: TBD by lead
+#             PREDICTION: PASS
+#   DR-RUN    MUST: 512 steps, at least one draft step. PREDICTION: PASS
+#   DR-STEP   the draft step median (ms) inside DLO:DHI. PREDICTION: 57 ms (63.8 - gather 7.6 + about 1.3 of the
+#             4 extra launches per layer), band [50, 62]
+#   DR-RATIO  draft median / SH steady median inside RLO:RHI. PREDICTION: 0.89, band [0.78, 0.97]. FALSIFIER: a
+#             ratio above 0.97 means the gather is not the cost we think it is (read the stage timers of Task 0.1).
+#   DR-SHIP   REPORT: the ship step median (after 3 drafts) / SH steady median. PREDICTION: 1.2 (it loads the misses
+#             of 3 drafts), range [1.0, 1.5]
+#   DR-SKIP   REPORT: skipped slots per (layer, KV head, request) per draft step. PREDICTION: 1-4, growing over the
+#             3 drafts of a group
+#   DR-AGREE  REPORT: teacher-forced agreement of the draft steps with SH's tokens. PREDICTION: 0.93-0.98 (R2 ev1
+#             acceptance 0.9586)
+#   DR-MEM    REPORT: DR peak allocated - SH peak allocated (GB). PREDICTION: below 0.1 GB (one 3.5 MB bias scratch)
+#   MB-STEP   REPORT (--mbase, as mb1): the SH steady step. PREDICTION: 63-66 ms (mb1 measured 63.761); the old band
+#             (64.92, 70.39) is kept for reference only
+#   dr1m      DR-RUN and DR-G0 PASS; kinds include edge at t 63 and rewarm at t 64. PREDICTION: PASS
 set -u
 NOSI=/mnt/beegfs/ojerbi/nosi-r2-draftpool                                                # ROOT
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                         # ROOT (lead-owned)
@@ -57,7 +63,7 @@ JITBASE=/mnt/beegfs/ojerbi/nosa-env/jit                                         
 OUTROOT=/mnt/beegfs/ojerbi/r2-runs/draftpool                                             # ROOT
 SELF=benchmarks/Efficiency/r2_draftpool_step.sh
 SPLITS=4
-DR1_BANDS=TBD                     # REGISTERED DR-STEP / DR-RATIO (NOT STAMPED; the lead writes DLO:DHI:RLO:RHI)
+DR1_BANDS=50:62:0.78:0.97         # REGISTERED DR-STEP / DR-RATIO (STAMP 2026-10-27T16:18:30Z)
 main() {
 stop() { echo "R2 draftpool step: STOP: $*" >&2; exit 1; }
 usage() { echo "usage: r2_draftpool_step.sh --nosi <sha> <holder> <run id> <dr1|dr1m>" >&2; exit 2; }
