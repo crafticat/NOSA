@@ -296,7 +296,8 @@ def _truncate_run(S_list, neg=None):
     dx.plain(W0)
     dr.plain(W0)
     # request 0 truncates all 3 steps (B 1: the plant then has steps to undo twice); B 8: fills at u 0 / 1 / 2 (S8 after
-    # W0) meet kept and truncated steps, and a kept fill of a truncated request (request 3) is written at truncate
+    # W0) meet kept and truncated steps, and a fill that truncate keeps for a truncated request (request 3) stays staged
+    # until the commit
     keep1 = torch.tensor([0, 3, 1, 2, 3, 1, 2, 0][:B], dtype=torch.int64)
     kept = torch.where(keep1 == 3, torch.full_like(keep1, 2), keep1)
     rb.begin()
@@ -336,6 +337,9 @@ def _truncate_reject_run(S_list, neg=None):
     dy.plain(W0)
     snap = RW.state(x)
     keep1 = torch.tensor([0, 3, 1, 2, 3, 1, 2, 0][:B], dtype=torch.int64)
+    # host facts: (request, step) of a fill that truncate KEEPS for a TRUNCATED request (keep1 < 3); reject_all then
+    # undoes that step, so its block must not reach the host rows (CPU job sp_20202f8_a, B 8: request 3, block 73)
+    kept_by_truncate = [(b, u) for b, u, kept in RW.fills(S_list, dx.k, keep1) if kept and int(keep1[b]) < 3]
     rb.begin()
     for u in range(3):
         dx.step(u, wrong=(u >= keep1))
@@ -345,7 +349,8 @@ def _truncate_reject_run(S_list, neg=None):
     for u in range(3, 5):
         dx.step(u, wrong=torch.ones(B, dtype=torch.bool))
     rb.reject_all()
-    ev = dict(diff=RW.diff(RW.state(x), snap), facts=facts, changed=RW.diff(pre, snap), stats=rb.stats())
+    ev = dict(diff=RW.diff(RW.state(x), snap), facts=facts, changed=RW.diff(pre, snap), stats=rb.stats(),
+              kept_by_truncate=kept_by_truncate)
     if not ev["diff"]:
         ev["after"] = [torch.equal(W.bits(dx.plain(1)[0]), W.bits(dy.plain(1)[0])) for _ in range(3)]
         ev["diff_after"] = RW.diff(RW.state(x), RW.state(y))
@@ -368,7 +373,9 @@ def test_truncate_then_commit_equals_reference(S_list):
     # (CPU job sp_a6eb5dd_a: the plant no_truncate_mark gave no difference). It acts when a later commit's keep count is
     # at or below a truncated step: truncate, more steps, then reject_all.
     ev = _truncate_reject_run(S_list)
-    assert ev["diff"] == [], ev["diff"][:5]                           # the snapshot, bit for bit (the clock too)
+    if len(S_list) > 1:                                               # precondition (L34) of the host-row part: a fill
+        assert ev["kept_by_truncate"], ev["kept_by_truncate"]        # that truncate keeps and reject_all undoes
+    assert ev["diff"] == [], ev["diff"][:5]                           # the snapshot, bit for bit (host rows included)
     assert all(ev["after"]) and ev["diff_after"] == [], ev["diff_after"][:5]
     assert RW.in_family(ev["changed"], "slots") and RW.in_family(ev["changed"], "twin"), ev["changed"][:5]
     assert sum(ev["stats"]["overflow"]) == 0

@@ -123,9 +123,10 @@ Without a call of truncate / fast_begin / fast_end a group behaves as above, bit
       their slot journals are empty (the residency stays: it is a valid cache state for any kept prefix); and the
       deferred fill of a request that fills in the pass gets its own row, u0 + 63 - p0 % 64.
   TRUNCATE. truncate(n_keep) inside an open group: request b with n_keep[b] < the steps run loses its steps
-      n_keep[b] .. now (the undo of commit, these requests only), and the group stays open for every request. A kept
-      fill of a truncated request goes to the host rows now; its staged block is dropped either way. The undone steps
-      are marked (_undone): a later commit / truncate never undoes them again. Use: the joint pass of a speculative
+      n_keep[b] .. now (the undo of commit, these requests only), and the group stays open for every request. The fill
+      of an undone step is dropped; the fill of a step that truncate keeps STAYS STAGED (no host write inside an open
+      group: a later commit / reject_all may still undo that step), and the group's commit writes it if it keeps the
+      step. The undone steps are marked (_undone): a later commit / truncate never undoes them again. Use: the joint pass of a speculative
       round keeps the draft row of the requests that accepted every token in the group (it is the first draft step of
       their next round), and the requests that rejected a token go back to their accepted prefix at once (they draft
       again from the correction in the same group).
@@ -737,15 +738,18 @@ class Rollback:
 
     def _truncate_layer(self, l: int, rejs, nk, tr, n_run: int) -> None:
         """The undo of the truncated steps of layer l (reverse order), then the staged fill of each truncated request:
-        to the host rows if its step is kept (fill step < n_keep), dropped either way."""
+        a fill of an UNDONE step (fill step >= n_keep) is dropped; a fill of a step that truncate keeps STAYS STAGED.
+        No host write here: the group is still open, and a later commit / reject_all may undo that step too (CPU job
+        sp_20202f8_a: truncate wrote such a fill to the host rows, then reject_all undid its step and the rows stayed:
+        the dr1 class). The group's commit writes it when it keeps the step (_writeback_deferred); until then the
+        staging redirect serves its block."""
         for u in range(n_run - 1, -1, -1):
             self._undo_step(l, u, rejs[u])
-        eng, T = self.rs.cache.layers[l].cache_engine, self.T[l]
-        keep = tr & (T["u"] < nk)
-        self._orig["writeback"](T["k"], T["v"], eng._k_cpu, eng._v_cpu, keep, T["pos"], 0, self.bs)
-        T["u"].copy_(torch.where(tr, self.kbig, T["u"]))
-        T["pos"].copy_(torch.where(tr, self.minus1, T["pos"]))
-        T["id"].copy_(torch.where(tr, self.minus1, T["id"]))
+        T = self.T[l]
+        drop = tr & (T["u"] >= nk)
+        T["u"].copy_(torch.where(drop, self.kbig, T["u"]))
+        T["pos"].copy_(torch.where(drop, self.minus1, T["pos"]))
+        T["id"].copy_(torch.where(drop, self.minus1, T["id"]))
 
     def _pool_update_hook(self, old_map, load_mask, pool_map, pool_age, pool_target, pool_action, stamp_base,
                           tail_slot):

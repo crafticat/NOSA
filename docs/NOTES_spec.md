@@ -92,8 +92,9 @@ ROLLBACK, PHASE 2 ADDITIONS (ragged_rollback.py docstring):
 - FAST JOURNAL: verify_rows FAST calls `fast_begin` before its one residency (the journal of row 0) and `fast_end`
   after the pass (rows 1 .. R - 1 = the state after r rows: the residency stays, the tail id and attention length of
   position p0 + r - 1, empty slot journals; the fill row of each request, u0 + 63 - p0 % 64).
-- TRUNCATE: undo some requests' later steps inside an open group; a kept fill of a truncated request goes to the host
-  rows at once; the undone steps are marked.
+- TRUNCATE: undo some requests' later steps inside an open group; the fill of an undone step is dropped, a fill of a
+  step that truncate keeps stays staged until the group's commit (no host write inside an open group); the undone
+  steps are marked.
 - REFUSAL: commit / truncate refuse a group where a layer journaled fewer engine steps than twin steps (a joint pass
   without the hooks): `RollbackError`, never a silent wrong journal.
 
@@ -143,7 +144,7 @@ their own trees as ROOT).
 | `test_full_accept_no_bonus_token[L3, L4]` | a full accept commits exactly the K drafts | L4 bonus_on_full_accept (every draft row's token wrong): CAUGHT (precondition: a full accept) |
 | `test_no_draft_row_reaches_host[L3/L4 x B1/B8]` | after every round: completed blocks = the shipped host rows; host rows from the committed block on still NaN (S 4925: the first round fills a block in a step it does not keep) | rollback no_defer: CAUGHT (precondition: such a fill) |
 | `test_accept_counts_reported[L3, L4]` | device counters = a host recount of the round records | miscount: CAUGHT (precondition: m != n somewhere) |
-| `test_truncate_then_commit_equals_reference[B1, B8]` | truncate + 2 more steps + commit = the world of the kept steps (state, kept logits, 3 later steps); a kept fill of a truncated request is written at truncate | no_truncate_mark: CAUGHT (precondition: truncated steps moved slots) |
+| `test_truncate_then_commit_equals_reference[B1, B8]` | truncate + 2 more steps + commit = the world of the kept steps (state, kept logits, 3 later steps); truncate + 2 more steps + reject_all = the snapshot (host rows included: a fill that truncate kept but reject_all undid never reaches them) | no_truncate_mark in the reject_all scenario: CAUGHT (precondition: a truncated step swapped / parked a block) |
 | `test_fast_rounds_keep_residency[B1, B8]` | L4 FAST: residency / host-row / twin invariants after every round, no overflow; a FAST joint pass without the hooks is REFUSED (RollbackError) | - |
 | `test_draft_resident_skips_and_masks[B1, B8]` | the draft runs no host gather; miss list = skip mask; map -1; scratch bias MASK_BIAS on the skipped rows, live bias untouched, view restored; reject_all = snapshot; a draft outside a group is refused | precondition: the last layer skipped a load |
 | `test_prefetch_wiring`, `test_no_host_sync_in_round[L3, L4]` | the L5 hook is called per draft step / round and is off by default; only run() and the redirect flag read host values, the rollback none | the trap must see run()'s sync |
@@ -251,6 +252,19 @@ INPUTS FOR THE BANDS (MODEL / INFERRED, not measured):
    commit scenario keeps its claim; a second scenario (truncate, 2 more steps, reject_all) needs the mark (keep count 0
    is below every truncated step): claim = the snapshot back bit for bit and the next 3 steps equal; plant
    no_truncate_mark there, precondition a SWAP / MOVE_OUT in a truncated step of a truncated request.
+
+3. CPU run sp_20202f8_a (57 passed, 1 skipped, 1 failed): test_truncate_then_commit_equals_reference[B8], the new
+   reject_all scenario: the host rows differed from the snapshot (L0 / L1 `_k_cpu`, `_v_cpu`). ROOT CAUSE, a real
+   defect of truncate (the dr1 class): `_truncate_layer` wrote the staged fill of a truncated request to the host rows
+   at once when truncate kept its step (fill step < n_keep), but the group was still open; the later reject_all undid
+   that step and the host write stayed. At B 8, request 3 (S 4723, keep 2) filled block 73 at tentative step 0 (position
+   4735); truncate wrote host rows 4672 .. 4735; rows 4672 .. 4722 are its prompt rows (the same bytes), so the first
+   differing index is `_k_cpu[3, 4723, 0, 0]` (the snapshot: the NaN poison; after: the row of position 4723, written
+   in the tail by the W0 plain steps). B 1 passed: its only fill is in a truncated step (dropped). FIX: truncate drops
+   the fill of an undone step and KEEPS a kept step's fill STAGED; no host write inside an open group; the group's
+   commit writes it if the commit keeps the step (the L4 runner's final commit keeps every truncated request's kept
+   rows, so its result is the same, written at the commit instead of the truncate). The test now also asserts the
+   precondition of this case (B 8: a fill that truncate keeps and reject_all undoes).
 
 ## 10. Shell commands outside cat / grep / head / tail / ls / sort / cut / diff / git / wc (this task)
 
