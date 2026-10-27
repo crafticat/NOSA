@@ -89,7 +89,10 @@ PRED_SPEC = dict(stamp="2026-10-27T20:08:53Z", L3_tok=True, L4X_tok=True, L4F_ag
 # Inputs (docs/NOTES_specp.md section 5, MODEL): a steady L4P round = one EXACT joint pass of K + 2 rows (K verify,
 # the deferred row, the draft row) + K - 1 drafts + truncate + commit, for at most K tokens (K - 1 in round 0, K - 2
 # after a reject).
-PRED_SPEC.update(stamp_L4P=None, L4P_tok=None, L4P_ratio=None, L4P_accept=None, L4P_vs_L4X=None)
+# Lead registration 2026-10-27T20:56:53Z (basis: NOTES_specp.md section 5 model, L4P / SH about 0.34 and L4P / L4X
+# about 0.87; vr1 and p0all MEASURED that no speculative round beats SH at C 128 B 216).
+PRED_SPEC.update(stamp_L4P="2026-10-27T20:56:53Z", L4P_tok=True, L4P_ratio=(0.2, 0.5), L4P_accept=(0.97, 1.0),
+                 L4P_vs_L4X=(0.6, 1.2))
 
 
 def log(msg):
