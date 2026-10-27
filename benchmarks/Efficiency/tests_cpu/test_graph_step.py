@@ -21,14 +21,21 @@ GS4 test_graph_safe_step_equals_shipped: LOCKSTEP, S 6128 and 6136, P 4 and 0, 1
     (nosa_llama.Llama.decode_inference with the harness's re-warm rule; torch.cuda.graph faked by re-running the
     captured with-body) and GraphStep (capture=False) give torch.equal logits at every step and torch.equal state
     (every engine and cache-layer tensor, the compressed keys, the UNSHIFTED pool ages) after every step; after
-    export() every host counter equals the shipped one. Preconditions: the pool hit and parked blocks (P 4).
+    export() every host counter equals the shipped one. Preconditions: the pool hit and parked blocks (P 4); FIX 1
+    (CPU job gs_fd35db3_a): the two worlds of one seed are bitwise equal before step 0 after
+    r2_graphstep_cell.define_undefined (the memory the shipped prefill allocates with torch.empty and does not write
+    gets one value; the per-step scratch is skipped only before step 0), and before that fill they differ only in
+    tensors that hold such memory.
 GS5 test_negative_controls_are_caught: three planted defects, each with its precondition (L34): the LRU stamp frozen
     at capture (no age shift), the raw-key column frozen at capture, a wrong stage-1 length (half the keys). Each must
-    produce a logits or state difference. (A stage-1 length frozen at the bucket start is a NO-OP plant: the newest
-    compressed keys pool into the forced local window, so only the softmax scale moves; not used.)
+    produce a logits or state difference of ITS kind, after the step it can first act at (no_shift: after the first
+    park; frozen_ncol: from step 1; short_seqused: in the selection). (A stage-1 length frozen at the bucket start is a
+    NO-OP plant: the newest compressed keys pool into the forced local window, so only the softmax scale moves; not
+    used.)
 GS6 test_age_frame_roundtrip: shift_in / shift_out invert each other across steps and keep the age order.
 GS7 test_cell_pure_parts: r2_graphstep_cell's argument rules, boundary / steady / special steps, the launch count, the
-    arm comparison on planted differences, the re-warm breakdown, the TBD verdicts and the probe.
+    arm comparison on planted differences (the state before step 0 too), the re-warm breakdown, the TBD verdicts, the
+    probe, and define_undefined writing exactly the unwritten regions.
 GS8 test_step_script_cells: r2_graphstep_step.sh (static): its ROOT, cells and python arguments.
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider benchmarks/Efficiency/tests_cpu/test_graph_step.py
@@ -492,13 +499,52 @@ def diff_state(GS, c_sh, gs, t):
     return bad
 
 
+HOSTC = ("seq_length", "no_compress_k_len", "cached_compressed_max_seqlen", "cis_len", "tail_cis_len")
+ENGC = ("seq_length", "_tail_block_len_on_gpu", "_pool_stamp_base", "_tail_block_idx_on_gpu")
+
+
+def diff_worlds(c_a, c_b, skip=()):
+    """The entries that differ between two caches in the SHIPPED layout (before any GraphStep): every engine and
+    cache-layer state tensor (whole tensors, bitwise), the compressed keys and the host counters; `skip` = engine
+    tensor names left out."""
+    bad = []
+    for l, (a, b) in enumerate(zip(c_a.layers, c_b.layers)):
+        ea, eb = a.cache_engine, b.cache_engine
+        for n in ENG + ((POOLT + ("_pool_age",)) if ea.pool_blocks > 0 else ()):
+            if n not in skip and not torch.equal(getattr(ea, n), getattr(eb, n)):
+                bad.append("eng%d.%s" % (l, n))
+        for n in LAY + ("compress_k_cache_varlen",):
+            if not torch.equal(getattr(a, n), getattr(b, n)):
+                bad.append("layer%d.%s" % (l, n))
+        bad += ["layer%d.%s" % (l, n) for n in HOSTC if getattr(a, n) != getattr(b, n)]
+        bad += ["eng%d.%s" % (l, n) for n in ENGC if getattr(ea, n) != getattr(eb, n)]
+    return bad
+
+
 def lockstep(W, S, steps, pool, plant=None, seed=0):
     """The shipped decode (r2_base_cell.run_shipped's loop) and GraphStep side by side; the first logits / state
-    difference (None if none)."""
-    GS, BC = W.GS, _bc()
+    difference (None if none). PRECONDITION (FIX 1, CPU job gs_fd35db3_a): the two worlds of one seed are bitwise equal
+    before step 0, after r2_graphstep_cell.define_undefined gives one value to the memory the shipped prefill allocates
+    with torch.empty and does not write; the per-step scratch (SCRATCH) is skipped only here. ROOT-CAUSE CHECK: before
+    that fill, the worlds may differ ONLY in tensors that hold such memory (leftover bytes), never elsewhere."""
+    GS, BC, GC = W.GS, _bc(), _cell()
     W.mp.setattr(W.CE, "POOL_BLOCKS", pool)
     m_sh, c_sh, tok, pos = build_world(W, S, steps, seed)
     m_tw, c_tw, tok_t, pos_t = build_world(W, S, steps, seed)
+    raw = diff_worlds(c_sh, c_tw)
+    holders = set(GC.UNDEFINED_ENGINE) | set(GC.UNDEFINED_LAYER) | set(GC.SCRATCH)
+    assert all(n.split(".", 1)[1] in holders for n in raw), "worlds differ outside the undefined memory: %s" % raw
+    with torch.inference_mode():
+        GC.define_undefined(c_sh)
+        GC.define_undefined(c_tw)
+    pre = diff_worlds(c_sh, c_tw, skip=GC.SCRATCH)
+    assert not pre, "PRECONDITION: the two worlds of seed %d differ before step 0: %s" % (seed, pre)
+    assert torch.equal(tok, tok_t) and torch.equal(pos, pos_t)
+    for n in ("embed_tokens", "lm_head", "norm_weight"):
+        assert torch.equal(getattr(m_sh, n), getattr(m_tw, n)), n
+    for la, lb in zip(m_sh.layers, m_tw.layers):
+        for n in ("wqkv", "wo", "gate_up_proj", "down_proj", "A"):
+            assert torch.equal(getattr(la, n), getattr(lb, n)), n
     cu = torch.arange(B + 1, dtype=torch.int32)
     gs = GS.GraphStep(m_tw, c_tw, cu.clone(), steps, warmup=steps, capture=False, pos_dtype=pos.dtype,
                       shift_ages=(plant != "no_shift"))
@@ -515,7 +561,7 @@ def lockstep(W, S, steps, pool, plant=None, seed=0):
             return orig(*a, seqused_k=seqused_k, **k)
         W.mp.setattr(GS.S1, "stage1_seqused", short)
     out = dict(first_logit=None, first_state=None, rewarms=[], gs=gs, c_sh=c_sh, c_tw=c_tw, host0=dict(gs.host0),
-               parks_before_first=None)
+               parks_before_first=None, first_park_step=None, raw_before_fill=raw)
     warm = None
     tok_s = tok
     for t in range(steps):
@@ -527,6 +573,8 @@ def lockstep(W, S, steps, pool, plant=None, seed=0):
             m_sh.has_buffers = False
         lg_s = m_sh.decode_inference(tok_s, cu, pos, c_sh)
         lg_t = gs.step(t, tok_t, pos_t)
+        if out["first_park_step"] is None and W.ext.parks > 0:
+            out["first_park_step"] = t
         if out["first_logit"] is None and not torch.equal(lg_s, lg_t):
             out["first_logit"] = t
         if out["first_state"] is None:
@@ -710,14 +758,21 @@ def test_GS5_negative_controls_are_caught(W, plant):
     if plant == "short_seqused":                                  # precondition: the dropped keys (from m0 // 2 on)
         r0 = rows[0]                                              # pool into blocks OUTSIDE the forced local window
         assert r0["m"] // 2 // 4 + 17 < r0["out_len"] - 17, r0    # (the last 17 blocks; 4 keys per block)
-    res = lockstep(W, S, steps, 4, plant=plant)
+    res = lockstep(W, S, steps, 4, plant=plant)     # its precondition: the worlds are equal before step 0 (FIX 1)
     caught = res["first_logit"] is not None or res["first_state"] is not None
     assert caught, "planted %s was not caught in %d steps" % (plant, steps)
     if plant == "no_shift":                                       # precondition: a block was parked before the catch
         assert res["parks_before_first"] and res["parks_before_first"] > 0
+        assert res["first_state"] is not None, res                 # the pool is invisible to the logits
         assert any("_pool_age" in n or "_pool_map" in n for n in res["first_state"][1]), res["first_state"]
+        # the plant acts only on an age written at an EARLIER step: the first difference follows the first park
+        assert res["first_park_step"] is not None and res["first_state"][0] > res["first_park_step"], res
     if plant == "frozen_ncol":
         assert res["first_state"] and any("no_compress_k_cache" in n for n in res["first_state"][1])
+        assert res["first_state"][0] >= 1, res["first_state"]      # row 0 of sched is unchanged by the plant
+    if plant == "short_seqused":                                  # it acts through the selection only
+        sel = ("_block_map", "_new_block_map_buf", "_load_mask")
+        assert res["first_logit"] is not None or any(n.split(".", 1)[1] in sel for n in res["first_state"][1]), res
 
 
 # ------------------------------------------------------------------ GS6
@@ -766,20 +821,41 @@ def test_GS7_cell_pure_parts():
         g = torch.Generator().manual_seed(seed)
         return dict(prefill_digest=torch.randint(0, 9, (3, 16), generator=g),
                     digests=torch.randint(0, 9, (5, 3, 16), generator=g), tokens=torch.randint(0, 9, (3, 6), generator=g),
-                    rows=torch.randn((2, 2, 7), generator=g), keep_steps=[0, 4], state={"a": 1, "b": 2})
+                    rows=torch.randn((2, 2, 7), generator=g), keep_steps=[0, 4], state={"a": 1, "b": 2},
+                    pre_state={"a": 5, "c": 6})
     x, y = arm(0), arm(0)
     c = GC.compare_arms(x, y)
     assert c["prefill_equal"] and not c["digest_mismatches"] and not c["token_mismatches"]
-    assert not c["rows_unequal_steps"] and not c["state_mismatches"]
+    assert not c["rows_unequal_steps"] and not c["state_mismatches"] and c["pre_state_mismatches"] == []
     y["digests"][3, 1, 7] += 1
     y["tokens"][2, 4] += 1
     y["rows"][1, 0, 0] += 1.0
     y["state"]["b"] = 3
+    y["pre_state"]["c"] = 7
     y["prefill_digest"][0, 0] += 1
     c = GC.compare_arms(x, y)
     assert c["digest_mismatches"] == 1 and c["first_digest_mismatch"] == [3, 1] and c["steps_with_mismatch"] == [3]
     assert c["token_mismatches"] == 1 and c["first_token_mismatch"] == (2, 3)
     assert c["rows_unequal_steps"] == [4] and c["state_mismatches"] == ["b"] and not c["prefill_equal"]
+    assert c["pre_state_mismatches"] == ["c"]
+    del x["pre_state"]
+    assert GC.compare_arms(x, y)["pre_state_mismatches"] is None
+    # FIX 1: define_undefined writes exactly the unwritten regions (a fake engine with the shipped field names)
+    e = types.SimpleNamespace(_tail_block_idx_on_gpu=3, _tail_block_len_on_gpu=5, block_size=8, seq_length=10,
+                              _k_gpu=torch.zeros(2, 40, 2, 3), _v_gpu=torch.zeros(2, 40, 2, 3), _kv_bias_gpu=torch.zeros(2, 40, 2),
+                              _k_cpu=torch.zeros(2, 16, 2, 3), _v_cpu=torch.zeros(2, 16, 2, 3))
+    L = types.SimpleNamespace(cache_engine=e, no_compress_k_cache=torch.zeros(2, 32, 2, 3), no_compress_k_len=20,
+                              tail_cis=torch.zeros(2, 2, 32), tail_cis_len=17, total_cis=torch.zeros(2, 30, 2), cis_len=10)
+    GC.define_undefined(types.SimpleNamespace(layers=[L]), value=9.0)
+    for t in (e._k_gpu, e._v_gpu, e._kv_bias_gpu):
+        assert bool((t[:, :24] == 9).all()) and bool((t[:, 24:29] == 0).all()) and bool((t[:, 29:32] == 9).all())
+        assert bool((t[:, 32:] == 0).all())                        # the pool rows (zeroed by the prefill) untouched
+    for t in (e._k_cpu, e._v_cpu):
+        assert bool((t[:, :10] == 0).all()) and bool((t[:, 10:] == 9).all())
+    assert bool((L.no_compress_k_cache[:, :20] == 0).all()) and bool((L.no_compress_k_cache[:, 20:] == 9).all())
+    assert bool((L.tail_cis[:, :, :17] == 0).all()) and bool((L.tail_cis[:, :, 17:] == 9).all())
+    assert bool((L.total_cis[:, :10] == 0).all()) and bool((L.total_cis[:, 10:] == 9).all())
+    assert GC.SCRATCH == ("_new_block_map_buf", "_load_mask") and GC.UNDEFINED_FILL == 4096.0
     br = GC.rewarm_breakdown([100.0, 6000.0], [(1, "out_len")], {1: dict(gc_ms=3000.0, empty_cache_ms=1500.0,
                                                                          sync_ms=500.0, n_gc=32)})
     assert br[0]["other_ms"] == 1000.0 and br[0]["hostcall_share"] == round(5000 / 6000, 4) and br[0]["n_gc"] == 32

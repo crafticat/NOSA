@@ -22,7 +22,9 @@ BITWISE COMPARISON over ALL steps: per (step, request) the int64 sums of the fp3
 the vocabulary, and the argmax; the full logits rows of the first 4 requests at the block, compression and width
 boundary steps (torch.equal); the prefill digests; the final cache state (bit sums of every state tensor of every
 layer, after graph_step.export) and the host counters.
-MUST gates: SH-RUN, GS-RUN, PREFILL-EQ (both prefills equal: else GS-EQ is meaningless), GS-EQ, GS-STATE, GS-PTR (no
+Before step 0 both arms give one value (define_undefined) to the memory the shipped prefill allocates and does not write.
+MUST gates: SH-RUN, GS-RUN, PREFILL-EQ (both prefills equal: else GS-EQ is meaningless), PRESTATE-EQ (both caches
+bitwise equal before step 0, the per-step scratch skipped), GS-EQ, GS-STATE, GS-PTR (no
 state pointer moves across the replays), GS-CAP (every planned graph captured before the timed loop, every later step
 a replay). REPORT: SH-P2 (the shipped re-warms), PROF (the profiler saw GPU ops in both arms), and the registered
 predictions PRED_GS: TBD by the lead before any run (UNREGISTERED while a value is None).
@@ -62,6 +64,41 @@ LAYER_STATE = ("no_compress_k_cache", "total_cis", "tail_cis", "compressed_cis",
                "cached_compressed_cu_seqlens")
 HOST_COUNTERS = ("seq_length", "no_compress_k_len", "cached_compressed_max_seqlen", "cis_len", "tail_cis_len")
 ENGINE_COUNTERS = ("seq_length", "_tail_block_len_on_gpu", "_pool_stamp_base")
+# FIX 1 (CPU job gs_fd35db3_a; NOTES_graphstep.md section 10). The shipped prefill allocates these with torch.empty and
+# does not write all of them; no kernel reads the unwritten part before a step writes it. define_undefined gives that
+# part ONE value in every compared cache (two caches otherwise hold different leftover bytes there).
+UNDEFINED_FILL = 4096.0            # exact in bf16 and fp32, far from the data (the value of Task 1.2's FIX 1)
+UNDEFINED_ENGINE = ("_k_gpu", "_v_gpu", "_kv_bias_gpu", "_k_cpu", "_v_cpu")
+UNDEFINED_LAYER = ("no_compress_k_cache", "tail_cis", "total_cis")
+# PER-STEP SCRATCH: torch.empty_like (cache_engine.py:229-230). diff_offload writes EVERY slot of both in a well-formed
+# step (the old hits, diff_offload_kernel.cu:46-47; the k-th new block into the k-th free slot, :96-97; #free ==
+# #new) before any reader of that step, and nothing reads them between steps. Only a comparison BEFORE step 0 skips
+# them; every comparison after a step compares them.
+SCRATCH = ("_new_block_map_buf", "_load_mask")
+
+
+def define_undefined(cache, value=UNDEFINED_FILL):
+    """Give `value` to the memory the shipped prefill allocates with torch.empty and does not write. Call it after the
+    prefill, before step 0, under inference mode:
+      _k_gpu / _v_gpu / _kv_bias_gpu (cache_engine.py:222-224): the window slots before the tail slot (each is read only
+          after its fill) and the tail slot past the tail length (written at :315-319; attention stops at _cache_lens);
+          the pool rows are already zero (:256-258);
+      _k_cpu / _v_cpu (:195-196): the host rows past S (written at :330-331; a write-back writes a block before any
+          gather reads it);
+      no_compress_k_cache (:676-677): the columns past no_compress_k_len (the compression reads all 32 only when full);
+      tail_cis (:730-732): the columns past tail_cis_len (the mean reads all 32 only when full);
+      total_cis (:768-769): the columns past S (the bias gather reads complete blocks below the step's position)."""
+    for L in cache.layers:
+        e = L.cache_engine
+        tail, n, bs = int(e._tail_block_idx_on_gpu), int(e._tail_block_len_on_gpu), int(e.block_size)
+        for t in (e._k_gpu, e._v_gpu, e._kv_bias_gpu):
+            t[:, :tail * bs].fill_(value)
+            t[:, tail * bs + n:(tail + 1) * bs].fill_(value)
+        for t in (e._k_cpu, e._v_cpu):
+            t[:, int(e.seq_length):].fill_(value)
+        L.no_compress_k_cache[:, int(L.no_compress_k_len):].fill_(value)
+        L.tail_cis[:, :, int(L.tail_cis_len):].fill_(value)
+        L.total_cis[:, int(L.cis_len):].fill_(value)
 # ---- REGISTERED PREDICTIONS: TBD. The lead fills every value and the stamp (`date -u`, L33) in a commit BEFORE any
 # run; a None value prints UNREGISTERED. Bands are (low, high); NOTES_graphstep.md section 6 has the builder's
 # suggestions (not registered).
@@ -168,6 +205,11 @@ def compare_arms(x, y):
     out["rows_unequal_steps"] = [t for i, t in enumerate(x["keep_steps"]) if not torch.equal(x["rows"][i], y["rows"][i])]
     keys = sorted(set(x["state"]) | set(y["state"]))
     out["state_mismatches"] = [k for k in keys if x["state"].get(k) != y["state"].get(k)]
+    if "pre_state" in x and "pre_state" in y:
+        keys = sorted(set(x["pre_state"]) | set(y["pre_state"]))
+        out["pre_state_mismatches"] = [k for k in keys if x["pre_state"].get(k) != y["pre_state"].get(k)]
+    else:
+        out["pre_state_mismatches"] = None
     out["steps_compared"] = int(x["digests"].shape[0])
     out["requests"] = int(x["digests"].shape[1])
     return out
@@ -247,13 +289,16 @@ def bits_sum(x):
     return x.sum(dtype=torch.int64)
 
 
-def state_digest(cache):
-    """{name: int} bit sums of every state tensor of every layer and the host counters (one sync)."""
+def state_digest(cache, skip=()):
+    """{name: int} bit sums of every state tensor of every layer and the host counters (one sync); `skip` names engine
+    tensors to leave out (SCRATCH before step 0)."""
     import torch
     names, vals, host = [], [], {}
     for l, L in enumerate(cache.layers):
         e = L.cache_engine
         for n in ENGINE_STATE + (POOL_STATE if e.pool_blocks > 0 else ()):
+            if n in skip:
+                continue
             names.append("eng%d.%s" % (l, n))
             vals.append(bits_sum(getattr(e, n)))
         for n in LAYER_STATE:
@@ -301,6 +346,8 @@ def decode_arm(model, ids, a, clock, mode: str, inputs=None, probe=None, out_dir
     logits, pos = model.batch_prefill(ids, cache)
     clock.sync()
     prefill_s = time.time() - t0
+    define_undefined(cache)                               # FIX 1: both arms, before step 0 (not timed)
+    pre_state = state_digest(cache, skip=SCRATCH)         # PRESTATE-EQ: the two arms' caches before step 0
     V = logits.shape[-1]
     C = DIGEST_CHUNKS if V % DIGEST_CHUNKS == 0 else 1
     pre = torch.zeros((Bn, C), dtype=torch.int64, device="cuda")
@@ -388,7 +435,8 @@ def decode_arm(model, ids, a, clock, mode: str, inputs=None, probe=None, out_dir
     state = state_digest(cache)
     fr, tot = torch.cuda.mem_get_info()
     res = dict(mode=mode, prefill_s=round(prefill_s, 1), periods=periods, rewarms=rewarms, prefill_digest=pre.cpu(),
-               tokens=own.cpu(), digests=dig.cpu(), rows=rows.cpu(), keep_steps=keep, state=state, graph_step=gsr,
+               tokens=own.cpu(), digests=dig.cpu(), rows=rows.cpu(), keep_steps=keep, state=state,
+               pre_state=pre_state, graph_step=gsr,
                capture_ms=capture_ms, profile=prof_res, device_used_end_GB=round((tot - fr) / 1e9, 3), inputs=own)
     del cache
     return res
@@ -489,6 +537,10 @@ def main(argv=None) -> int:
         cmp_ = compare_arms(sh, gs)
         gates.append(("PREFILL-EQ", True, cmp_["prefill_equal"], "the two prefills' logits digests are %s" % (
             "equal" if cmp_["prefill_equal"] else "DIFFERENT (GS-EQ is then not about the graph step)")))
+        pm = cmp_["pre_state_mismatches"]
+        gates.append(("PRESTATE-EQ", True, pm == [], "the two caches before step 0 (after define_undefined; scratch %s "
+                      "skipped): %s mismatching entries %s" % (SCRATCH, len(pm) if pm is not None else "?",
+                                                               (pm or [])[:10])))
         ok = not cmp_["digest_mismatches"] and not cmp_["token_mismatches"] and not cmp_["rows_unequal_steps"]
         gates.append(("GS-EQ", True, ok, "%d steps x %d requests: %d digest mismatches (first %s), %d argmax "
                       "mismatches (first (request, step) %s), rows unequal at steps %s" % (

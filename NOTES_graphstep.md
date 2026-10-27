@@ -126,7 +126,8 @@ FA2), so its CUDA-graph trees would split the step per layer.
 gs1 reports per arm: steady wall per step, effective tok/s (gs includes the capture time), device busy per step and
 GPU ops per step (torch.profiler, steps 100-102), host gap (steady wall - device busy), launch calls per step, the tail
 -fill step periods, the compression-step median; gs: capture ms per bucket and in total; sh: the re-warm periods and
-their breakdown. MUST gates: SH-RUN, GS-RUN, PREFILL-EQ, GS-EQ (per (step, request) bit sums of the fp32 logits in 16
+their breakdown. Before step 0 both arms run `define_undefined` (section 10). MUST gates: SH-RUN, GS-RUN, PREFILL-EQ,
+PRESTATE-EQ (both caches bitwise equal before step 0; the per-step scratch skipped), GS-EQ (per (step, request) bit sums of the fp32 logits in 16
 chunks + argmax over all steps; full rows of 4 requests at the boundary steps 0-3, 15-17, 62-65, 127-128, 255-256,
 287-289, 319-320, 511), GS-STATE (bit sums of every state tensor of every layer after `export()`, and the host
 counters), GS-PTR, GS-CAP. Exit = failed MUST gates.
@@ -194,3 +195,53 @@ checkout (skipped otherwise).
 - Shell builtins: `cd`, `echo` (separators in two reads), `for` loops (over worktree names, with `git log`).
 - Nothing else outside the list. (`git worktree add`, `git status`, `git log`, `git diff`, `git add`, `git commit -F`
   are git.)
+
+## 10. FIX 1 (CPU job gs_fd35db3_a: 5 failed, 15 passed, 2 skipped at fd35db3)
+
+Log: `/mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/gs_fd35db3_a.txt`.
+
+ROOT CAUSE: a TEST HARNESS defect, not a graph-step defect. The shipped prefill allocates these with `torch.empty` and
+does not write all of them (CODE): `_k_cpu` / `_v_cpu` rows past S (cache_engine.py:195-196, written :330-331);
+`_k_gpu` / `_v_gpu` / `_kv_bias_gpu` window slots before their first fill and the tail slot past the tail length
+(:222-224, tail written :315-319; pool rows zeroed :256-258); `no_compress_k_cache` columns past
+`no_compress_k_len` (:676-677); `tail_cis` columns past `tail_cis_len` (:730-732); `total_cis` columns past S
+(:768-769). Two worlds built from one seed held different leftover bytes there, and the test compares whole tensors.
+
+EVIDENCE (from the log, before any change):
+1. In all four GS4 runs the logits were equal at every one of the 100 steps (the logits assertion, one line above
+   the failing one, passed). The engine never reads the unwritten memory.
+2. Every name in the four failure lists is one of those eight tensors. No fully defined tensor appears (`_block_map`,
+   the pool tensors, `_cache_lens`, `compressed_cis`, the compressed keys, `cached_compressed_cu_seqlens`), and no
+   per-step scratch appears (`diff_offload` writes all of `_new_block_map_buf` / `_load_mask` at step 0).
+3. `_k_cpu` / `_v_cpu` differ at step 0, but no path writes host rows at step 0 (the first write-back is at step 15
+   for S 6128, step 7 for S 6136). So both worlds held their prefill rows only; they differ in unwritten rows.
+4. The lists change between parametrizations and layers (`eng1._k_gpu` in both S 6128 runs, not in the S 6136 runs;
+   `eng0._v_cpu` missing in 6136-0): allocator leftovers, not a code path.
+5. GS5 no_shift was "caught" at step 0 by the same leftover bytes. At step 0 no block can park (every window slot's
+   outgoing block is -1 after the prefill, `_block_map = full(-1)` :227), so `parks_before_first` was 0: the plant
+   never acted before the false catch. frozen_ncol and short_seqused may have passed for the same false reason.
+
+FIX (one change, the same rule as Task 1.2's FIX 1 / FIX 2):
+- `r2_graphstep_cell.define_undefined(cache)` gives the value 4096.0 to exactly that memory, after the prefill and
+  before step 0. The CPU worlds call it (both), and the GPU cell calls it in both arms (the CUDA caching allocator
+  reuses blocks across the arms, so GS-STATE had the same defect). No kernel reads that memory before a step writes
+  it, so the logits and the timing do not change.
+- New precondition (CPU, every lockstep run, GS4 and GS5): the two worlds are bitwise equal before step 0 (every engine
+  and cache-layer tensor, the compressed keys, the host counters, the model weights, the first token). It skips
+  only the per-step scratch `SCRATCH = ("_new_block_map_buf", "_load_mask")` (reason at its definition:
+  `diff_offload` writes every slot of both before any reader of the step, diff_offload_kernel.cu:46-47, :96-97);
+  every comparison after a step still compares them.
+- Root-cause check (CPU, every lockstep run): BEFORE the fill, the worlds may differ only in the tensors listed above
+  (or the scratch). A difference anywhere else fails.
+- New GPU gate PRESTATE-EQ (MUST): the bit sums of both arms' caches before step 0 are equal (scratch skipped).
+- Stronger plant assertions (none weakened): no_shift needs its first difference AFTER the first park and in the pool
+  state; frozen_ncol from step 1 on; short_seqused in the selection state (or the logits). With the precondition,
+  leftover bytes can no longer satisfy any plant.
+- GS7 checks that `define_undefined` writes exactly the unwritten regions (a fake engine) and the PRESTATE comparison.
+
+Not changed: the seed, the pool size, every behaviour assertion. If no_shift now fails its precondition, the next step
+is a seed or pool size on which a park happens before step 99 (L34); GS4 [6128-4] already asserts parks > 0 in the
+same world.
+
+Commands of this pass outside cat / grep / head / tail / ls / sort / cut / diff / git / wc: none (shell builtin `cd`
+only). No sed.
