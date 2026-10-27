@@ -64,9 +64,18 @@ OUTROOT=/mnt/beegfs/ojerbi/r2-runs/draftpool                                    
 SELF=benchmarks/Efficiency/r2_draftpool_step.sh
 SPLITS=4
 DR1_BANDS=50:62:0.78:0.97         # REGISTERED DR-STEP / DR-RATIO (STAMP 2026-10-27T16:18:30Z)
+# REGISTERED for dr73 / dr81 (STAMP 2026-10-27T17:58:39Z by the lead, from `date -u`, before any run; L33). WHY: dr1
+# (C 128 B 216) measured a draft saving of only 5.3 % (SCORING_dr1.md): the fetch is small there. The paper's lever is
+# a smaller cache with a larger batch (paper Figure 2: B 318 at C 73, B 290 at C 81; fetch / rest about 1.36 at C 63 and
+# 0.35 at C 81). Same flow as dr1 (SH = the shipped engine at the SAME C and B, then DR), no --mbase band.
+#   DR73-STEP / DR73-RATIO  PREDICTION: draft / SH about 0.80, band [0.60, 0.95]; draft step band [70, 170] ms
+#   DR81-STEP / DR81-RATIO  PREDICTION: draft / SH about 0.87, band [0.70, 0.97]; draft step band [60, 140] ms
+#   FALSIFIER (both): a ratio above 0.97 means a smaller cache does not make the draft pay more than at C 128.
+DR73_BANDS=70:170:0.60:0.95
+DR81_BANDS=60:140:0.70:0.97
 main() {
 stop() { echo "R2 draftpool step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_draftpool_step.sh --nosi <sha> <holder> <run id> <dr1|dr1m>" >&2; exit 2; }
+usage() { echo "usage: r2_draftpool_step.sh --nosi <sha> <holder> <run id> <dr1|dr1m|dr73|dr81>" >&2; exit 2; }
 [ $# = 5 ] && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4 CELL=$5
 DRY=${DRYRUN:-0}
@@ -80,7 +89,11 @@ case $CELL in
             stop "cell $CELL: --dr-bands TBD (the lead fills and stamps the REGISTERED dr1 block first)"
         BANDARG=(--dr-bands "$BANDS") ;;
     dr1m) BATCH=8 STEPS=80 STEP_MIN=20 MEM=100G BANDS=none ;;
-    *) stop "cell '$CELL' (dr1 or dr1m)" ;;
+    dr73) POOL=10 BATCH=318 STEPS=512 STEP_MIN=90 MEM=340G BANDS=$DR73_BANDS                  # [lead] paper Fig. 2
+        BANDARG=(--dr-bands "$BANDS") ;;
+    dr81) POOL=18 BATCH=290 STEPS=512 STEP_MIN=90 MEM=340G BANDS=$DR81_BANDS                  # [lead] paper Fig. 2
+        BANDARG=(--dr-bands "$BANDS") ;;
+    *) stop "cell '$CELL' (dr1, dr1m, dr73 or dr81)" ;;
 esac
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 for v in $(compgen -e); do case $v in SLURM_*|SRUN_*|SALLOC_*|SBATCH_*) stop "the environment exports $v" ;; esac; done
