@@ -1,4 +1,4 @@
-"""Phase 2, rungs L3 and L4 (KS/analysis/plan/PLAN_speckv_on_cached_nosa.md, KS = /mnt/beegfs/ojerbi/kstep-cpu-runs): the
+"""Phase 2, rungs L3, L4, L4P (KS/analysis/plan/PLAN_speckv_on_cached_nosa.md, KS = /mnt/beegfs/ojerbi/kstep-cpu-runs): the
 GPU cell of the SPECULATIVE ROUND RUNNER (nosi/nosi/spec_round.py; opt-in flag --spec K). A NEW script: r2_base_cell.py
 is not edited (its functions are imported), so every older cell keeps its bytes. Step script:
 benchmarks/Efficiency/r2_spec_step.sh (cells sp3m, sp3a, sp3b).
@@ -332,7 +332,10 @@ def summarize(arm, res, inputs, fp_sh, sh, B: int, steps: int, dims):
     calls = rd["draft_calls"]                            # draft decode_fixed calls: one per layer of a draft step / row
     skip = (sum(rd["draft_skipped"]) / (calls * dims["H"] * B)) if calls else None
     paper = None
+    verify_rows = K                                      # verify rows per request and round (L3 / L4: K)
     if level == "L4P":
+        vh = rd["verify_hist"]                           # L4P: v in {K - 2, K - 1, K}: the mean
+        verify_rows = (sum(i * c for i, c in enumerate(vh)) / sum(vh)) if sum(vh) else K
         # a joint-pass call is a draft residency for some requests only: count (request, call) pairs there
         streams = (calls - rd["rows_calls"]) * dims["H"] * B + rd["rows_draft"] * dims["H"]
         skip = (sum(rd["draft_skipped"]) / streams) if streams else None
@@ -343,7 +346,8 @@ def summarize(arm, res, inputs, fp_sh, sh, B: int, steps: int, dims):
                      skipped_per_row_index=rd["row_skipped"], pin=rd["pin"])
     return dict(arm=arm, level=level, K=K, rounds=G, rates=rates, vs_sh=vs_sh, acceptance=acc, paper=paper,
                 phases_median=phase_medians(level, rd["phases"], steady),
-                kv_at_verify=kv_at_verify(rd, steady, K, dims["L"], dims["H"], B, dims["topk"], dims["block_bytes"]),
+                kv_at_verify=kv_at_verify(rd, steady, verify_rows, dims["L"], dims["H"], B, dims["topk"],
+                                          dims["block_bytes"]),
                 tokens=token_check(res["out"], rd["count"], inputs, steps),
                 fingerprints=fingerprint_check(res["fp"], rd["count"], fp_sh, steps),
                 draft=dict(skip_per_stream_per_call=skip, calls=calls, steps=rd["draft_steps"],

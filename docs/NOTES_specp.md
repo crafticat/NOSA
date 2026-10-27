@@ -92,7 +92,8 @@ with K = 2 a request that rejects has no verify row in its next joint pass (the 
    mask: in call r of each layer, a request with mask[r, b] gets the draft residency (its host load ids become -1, the
    staged block stays with redirect, its skipped slots are masked in the scratch bias), the other requests get the full
    residency (their load ids go to the gathers unchanged; they read the scratch bias, which has the live values for
-   them). One joint pass per K draft steps for the whole batch.
+   them). One joint pass per K draft steps for the whole batch. Rows 0 .. K - 3 are verify rows of every request
+   (u >= K - 1, so v >= K - 2): `verify_below = K - 2` sends those calls straight to the body (no scratch bias copy).
 7. THE L5 SEAM. `ops.prefetch.on_draft(miss_ids)` after each draft step and after the joint pass (`miss_ids` = the
    draft row's misses per request). `on_round` as before.
 
@@ -145,7 +146,8 @@ keys only):
 INPUTS FOR THE BANDS (MODEL, not measured), sp3a: SH step 63.6 ms (dr1); draft step 60.2 ms (dr1); the vr1 MEASURED
 EXACT rowgroup joint pass of 4 rows (VRX, bitwise, the form of L4X and L4P) = 4.563 SH steps
 (`analysis/plan/SCORING_vr1.md` lines 15-20; VRC 4.144 and VRF 6.300 are the other arms), so about 72.5 ms per row.
-The L4P joint pass has 5 rows: about 363 ms (two rows load nothing from the host, so at most that). Round = 363 +
+The L4P joint pass has 5 rows: about 363 ms (the deferred and draft rows load no host block except a staged block at an
+edge, so at most that). Round = 363 +
 truncate 30 + 2 drafts 120 + commit 45 = about 558 ms for at most 3 tokens; SH 191 ms for 3 tokens: L4P-RATIO about
 0.34 (0.25-0.45). L4X with the same terms: 290 + 30 + 120 + 60 = about 500 ms per round, so L4P / L4X about 0.9 before
 the token difference; L4P commits K - 2 after a reject where L4X commits up to K, so with per-token acceptance about
@@ -208,12 +210,32 @@ If a precondition fails, the data do not exercise the path: tell me and I change
   the cells use K = 3.
 - The shared claim name with r2-spec's copy of the step script blocks parallel runs of both copies on one holder.
 
-## 8. Shell commands outside cat / grep / head / tail / ls / sort / cut / diff / git / wc (this task)
+## 8. Review (a read-only reviewer agent on the diff of 17143af) and the fixes
+
+The reviewer found no bug: the group size and journal (2 K + 1 steps), the positions, the fills (kept verify rows
+written at the commit, deferred / draft / pad fills dropped), `_rows_call` against `_hook`, the record keys, the
+rows-mode equality, every plant (caught, no refusal, no position overflow: the worst, commit_draft_rows, reaches about
+S + 68 < the horizon 92), the cell keys and the DRYRUN expectations (bash `printf %q` escapes the commas; the test
+checks the arm names one by one).
+
+| finding | fix |
+|---|---|
+| RISK: the plant pin_no_release has only "applied > 0" as precondition; if every pin ended in a hit, the plant would not act (L34) | the clean pin-on run must have `unread > 0` (pins that lasted to release()) |
+| RISK: the cell test compares float64 logit sums of a strided slice with the reference's bitwise | kept; section 7 (if it fails, compare fmax only) |
+| NIT: `row_skipped[0] == 0` cannot fail | labelled a sanity check, not a claim |
+| NIT: KV at verify assumed K verify rows per round for L4P | the cell passes the mean of the verify-row histogram |
+| NIT: `_rows_call` copied the scratch bias also for row 0 (no draft request there) | `verify_below = K - 2`: those calls go straight to the body |
+| NIT: "the draft rows load nothing"; the cell's first line said "rungs L3 and L4" | both corrected (a draft row loads a staged block at an edge) |
+
+The reviewer reported no shell command outside the allowed list.
+
+## 9. Shell commands outside cat / grep / head / tail / ls / sort / cut / diff / git / wc (this task)
 
 - `git worktree add` (as instructed), `git merge --no-edit r2-spec` twice (fast-forward of this new branch, as the
   coordinator asked), `git checkout -- nosi/nosi/ragged_rollback.py` (dropped my own uncommitted edit before the second
   merge; HEAD did not move), `git add`, `git commit -F` (message written with the Write tool): git.
-- `date -u +%FT%TZ` about 15 times (a clock read while the read-only reviewer agent ran).
+- `date -u +%FT%TZ` about 20 times (a clock read while the read-only reviewer agent ran; its progress was read with
+  `ls -laL`, `grep -c` and `wc -l` on its transcript file only).
 - Shell built-ins only otherwise (`cd`, `echo`, `;`, `&&`, `|`).
 - TWO BREACHES (sed, read-only, by mistake): `sed -n 1p /dev/null` inside a grep command (it read nothing), and later
   `grep ... spec_round.py | sed -n 1p` (it printed the first grep line). No other sed, no interpreter, no awk, no

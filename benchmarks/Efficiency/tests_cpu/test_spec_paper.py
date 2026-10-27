@@ -168,7 +168,8 @@ def test_paper_sched_defers_newest(B):
     assert errs == [], errs[:5]                                       # THE CLAIM
     assert seen > 0                                                   # precondition: a deferred token verified later
     rs = ev["rd"]["row_skipped"]                                      # skipped slots per joint-pass row (draft pairs)
-    assert rs[0] == 0, rs                                             # row 0 is always a verify row (v >= K - 2 >= 1)
+    assert rs[0] == 0, rs                                             # SANITY (not a claim): row 0 is a verify row
+    #                                                                   for every request (v >= K - 2 >= 1)
     assert sum(rs[K - 2:]) > 0, rs                                    # the deferred / draft rows were resident-only
     assert _clean(ev)
     p = _ev(B, neg="verify_newest")                                   # PLANT: no deferral (verify d_K too)
@@ -311,6 +312,8 @@ def test_paper_pin_flag():
     assert pin["on"] and pin["recorded"] > 0 and pin["applied"] > 0, pin   # precondition: requested blocks in the pool
     assert pin["applies"] == pin["releases"] == on["rd"]["rounds"], pin
     assert on["pinned"] == []                                         # THE CLAIM: no pin stays after its round
+    assert pin["unread"] > 0, pin                                     # precondition of the plant (L34): some pins last
+    #                                                                   to release() (no kept verify row hit them)
     assert _clean(on) and on["resid"] == [] and on["host"] == [], (on["bad_tokens"][:3], on["resid"][:2])
     p = _ev(8, neg="pin_no_release", pin=True)                        # PLANT: the pins are not released
     assert p["rd"]["pin"]["applied"] > 0                              # precondition
@@ -376,6 +379,10 @@ def test_paper_rows_mode_per_request(S_list, masks):
                 drs[2].begin("rows", **bad)
         with pytest.raises(SR.SpecError):
             drs[2].begin("all", rows=dm.view(1, B))                   # rows belong to mode "rows"
+        with pytest.raises(SR.SpecError):
+            drs[2].begin("all", verify_below=1)                       # so does verify_below
+        with pytest.raises(SR.SpecError):
+            drs[2].begin("rows", rows=dm.view(1, B), verify_below=2)  # verify_below <= R
         rbs[2].reject_all()
         assert all(lay.cache_engine._kv_bias_gpu_att.data_ptr() != drs[2].scratch.data_ptr()
                    for lay in x2.cache.layers)                        # end() restored the live views

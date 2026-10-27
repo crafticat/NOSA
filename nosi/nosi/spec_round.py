@@ -205,6 +205,7 @@ class DraftResident:
         self.mode = None
         self.redirect = False
         self.rows = self.rec = None                                      # mode "rows" (L4P): (R, B) bool each
+        self.verify_below = 0                                            # mode "rows": calls with no draft request
         self.row_skipped = torch.zeros((ROWS_MAX,), dtype=torch.int64, device=dev)
         self.rows_draft = torch.zeros((), dtype=torch.int64, device=dev)  # mode "rows": draft (request, call) pairs
         self.rows_calls = 0                                              # mode "rows": decode_fixed calls (host count)
@@ -237,7 +238,9 @@ class DraftResident:
             del body.decode_fixed
         self.rs.draft = None
 
-    def begin(self, mode, redirect: bool = False, rows=None, record=None) -> None:
+    def begin(self, mode, redirect: bool = False, rows=None, record=None, verify_below: int = 0) -> None:
+        """verify_below (mode "rows"): the caller KNOWS that calls 0 .. verify_below - 1 of each layer have no draft
+        request (rows[i] all False there); those calls go straight to the body (no scratch bias copy)."""
         if self.mode is not None:
             raise SpecError("begin inside a draft bracket")
         if mode == "rows":
@@ -246,8 +249,10 @@ class DraftResident:
                 raise SpecError("mode 'rows' takes rows: an (R, %d) bool tensor, 1 <= R <= %d" % (self.B, ROWS_MAX))
             if record is not None and (record.dtype != torch.bool or tuple(record.shape) != tuple(rows.shape)):
                 raise SpecError("record must be a bool tensor of the shape of rows")
-        elif rows is not None or record is not None:
-            raise SpecError("rows / record belong to mode 'rows'")
+            if not (isinstance(verify_below, int) and 0 <= verify_below <= rows.shape[0]):
+                raise SpecError("verify_below must be an int in 0 .. R")
+        elif rows is not None or record is not None or verify_below:
+            raise SpecError("rows / record / verify_below belong to mode 'rows'")
         elif mode != "all" and not (isinstance(mode, int) and mode >= 0):
             raise SpecError("mode must be 'all', 'rows' or a row index >= 0, got %r" % (mode,))
         if not self.rb.tentative:
@@ -256,6 +261,7 @@ class DraftResident:
         self.redirect = bool(redirect)
         if mode == "rows":
             self.rows, self.rec = rows, (rows if record is None else record)
+            self.verify_below = verify_below
         self._calls = [0] * self.L
         self.steps += 1
 
@@ -265,6 +271,7 @@ class DraftResident:
             self.rs.cache.layers[l].cache_engine._kv_bias_gpu_att = view
         self.mode = None
         self.rows = self.rec = None
+        self.verify_below = 0
 
     def _hook(self, eng, key_states, value_states, kv_bias, topk_idx, pos, active, err, diff, gather_k,
               gather_v_bias):
@@ -317,6 +324,9 @@ class DraftResident:
         _hook; the other requests get the full residency (their load ids go to the given gathers unchanged)."""
         if i >= self.rows.shape[0]:
             raise SpecError("layer %d: decode_fixed call %d, but rows has %d rows" % (l, i, self.rows.shape[0]))
+        if i < self.verify_below:                                        # no draft request (the caller's bound): the
+            return self._orig["fn"](eng, key_states, value_states, kv_bias, topk_idx, pos, active, err, diff,
+                                    gather_k, gather_v_bias)             # target residency, live attended view
         dm = self.rows[i].view(1, self.B, 1)                             # (1, B, 1): the draft requests of this call
         staged = self.rb.T[l]["id"].view(1, self.B, 1) if self.redirect else None
         box = {}
@@ -864,7 +874,8 @@ class SpecRunner:
         self.rb.begin()                                                  # 1. the joint pass
         b0 = self.meter.blocks.clone()
         s0 = len(self.meter.spans)
-        self.draft.begin("rows", redirect=self._edge_before(R), rows=drows, record=drow)
+        # rows 0 .. K - 3 are verify rows of every request (u >= K - 1, so v >= K - 2): no scratch bias for them
+        self.draft.begin("rows", redirect=self._edge_before(R), rows=drows, record=drow, verify_below=K - 2)
         self.meter.on, self.meter.timing = True, probe
         try:
             lg = self.VR.joint_pass(self.model, self.vs, ids, pos)
