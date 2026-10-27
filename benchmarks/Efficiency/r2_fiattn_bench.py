@@ -391,7 +391,7 @@ PRED3 = {
 # test FV12 keeps them equal). Bands [central, low, high]. Source: the lead's T0.3b brief (FV / P device central 0.7,
 # band [0.4, 1.1]; the rule).
 PRED4 = {
-    "registered": "REGISTERED <TBD-for-lead-stamp>",
+    "registered": "REGISTERED 2026-10-27T18:58:34Z (lead stamp, before any run)",
     "source": "lead's T0.3b brief 2026-10-27 (PLAN_speckv_on_cached_nosa.md Task 0.3 option 2; SCORING_fia3.md)",
     "fv_over_p_device": {"216x4": [0.7, 0.4, 1.1], "216x4s1": [0.7, 0.4, 1.1]},
     "thresholds": {"fv_over_p_max": 0.8, "union_build_ms_per_tick_max": 1.0, "layers_per_tick": 32},

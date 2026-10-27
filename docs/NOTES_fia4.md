@@ -1,6 +1,6 @@
 # R2 FIA4: a fork of vLLM's Triton unified attention for the shared-KV verify (plan Task 0.3, option 2)
 
-REGISTERED <TBD-for-lead-stamp>
+REGISTERED 2026-10-27T18:58:34Z (lead stamp, before any run)
 
 Builder stamp: 2026-10-27T18:40:16Z (`date -u`). Status: SOURCE ONLY, NOT RUN, NOT REVIEWED.
 Branch r2-fia4, worktree /mnt/beegfs/ojerbi/nosi-r2-fia4, from r2-fia3 273e2d8 (the fia3 bench, stamped and run).
@@ -120,7 +120,7 @@ keeps them equal). The band is the lead's (the brief).
 <!-- PRED4-BEGIN -->
 ```json
 {
- "registered": "REGISTERED <TBD-for-lead-stamp>",
+ "registered": "REGISTERED 2026-10-27T18:58:34Z (lead stamp, before any run)",
  "source": "lead's T0.3b brief 2026-10-27 (PLAN_speckv_on_cached_nosa.md Task 0.3 option 2; SCORING_fia3.md)",
  "fv_over_p_device": {"216x4": [0.7, 0.4, 1.1], "216x4s1": [0.7, 0.4, 1.1]},
  "thresholds": {"fv_over_p_max": 0.8, "union_build_ms_per_tick_max": 1.0, "layers_per_tick": 32},
