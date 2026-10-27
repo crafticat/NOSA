@@ -217,12 +217,27 @@ def _state(w):
     return out
 
 
-def _diff(a, b):
-    """The names that differ between two _state lists ([] = bitwise equal)."""
+# PER-STEP SCRATCH in STATE: undefined before the first step, fully written by every step before any read. Only the
+# precondition "one seed gives one world" (before step 0) skips it; every comparison AFTER a step keeps it.
+#   _load_mask  torch.empty_like (cache_engine.py:230). diff_offload writes EVERY slot of it in a well-formed step: an
+#               old hit gets -1 (diff_offload_kernel.cu:44-48), the k-th new block goes to the k-th free slot (:77-98),
+#               and #free == #new because old_map holds distinct ids (or -1 before the first fill, never selected) and
+#               new_act holds distinct ids. Its readers in the step come after diff (pool_update cache_engine.py:504,
+#               the gathers :518-519, the cpupack fetch); nothing reads it between steps (CPU job pf_f832a3c_a: the
+#               only difference of two worlds of one seed before step 0).
+# (_new_block_map_buf is scratch of the same kind; STATE does not hold it. We do not fill _load_mask with a value:
+# that would hide a diff that does not write every slot at step 0.)
+SCRATCH = ("_load_mask",)
+
+
+def _diff(a, b, skip=()):
+    """The names that differ between two _state lists ([] = bitwise equal); `skip`: names not compared."""
     bad = []
     for l, (x, y) in enumerate(zip(a, b)):
         for k in x:
-            same = torch.equal(x[k], y[k]) if torch.is_tensor(x[k]) else x[k] == y[k]
+            if k in skip:
+                continue
+            same =torch.equal(x[k], y[k]) if torch.is_tensor(x[k]) else x[k] == y[k]
             if not same:
                 bad.append("layer %d %s" % (l, k))
     return bad
@@ -244,8 +259,8 @@ def test_flag_off_is_shipped(CE, PF, ext, nopin):
         assert "pool_prefetch" not in (NOSI / f).read_text()
     # (b) + (c): a never-attached world A and an attached world B (gpugather, no request), 8 steps, same inputs
     wa, wb = _world(CE, 1), _world(CE, 1)
-    assert _diff(_state(wa), _state(wb)) == []               # precondition: one seed gives one world, bitwise
-    shipped =[layer.cache_engine.__dict__["decode_update"] for layer in wb.layers]
+    assert _diff(_state(wa), _state(wb), SCRATCH) == []      # precondition: one seed gives one world, bitwise
+    shipped = [layer.cache_engine.__dict__["decode_update"] for layer in wb.layers]
     assert all(getattr(s, "__func__", None) is CE.CacheEngine.decode_update_has_kv_bias_pool for s in shipped)
     with pytest.raises(ValueError):
         PF.PoolPrefetch(wb, ext, fetch="other", ops=TWIN_OPS)
@@ -289,8 +304,8 @@ def test_prefetched_block_is_a_pool_hit(CE, PF, ext, nopin, monkeypatch):
     log = []
     _logged(monkeypatch, CE, log)
     w1, w0 = _world(CE, 2), _world(CE, 2)
-    assert _diff(_state(w1), _state(w0)) == []               # precondition: one seed gives one world, bitwise
-    pf1, pf0 =_pf(PF, w1, ext), _pf(PF, w0, ext)
+    assert _diff(_state(w1), _state(w0), SCRATCH) == []      # precondition: one seed gives one world, bitwise
+    pf1, pf0 = _pf(PF, w1, ext), _pf(PF, w0, ext)
     pf1.attach()
     pf0.attach()
     s0 = _random_sel(w1, random.Random(7))
@@ -451,8 +466,8 @@ def test_cpupack_equals_gpugather_bytes(CE, PF, ext, nopin, monkeypatch):
     log = []
     _logged(monkeypatch, CE, log)
     wg, wc, wp = _world(CE, 5), _world(CE, 5), _world(CE, 5)
-    assert _diff(_state(wg), _state(wc)) == [] and _diff(_state(wg), _state(wp)) == []   # precondition: one world
-    pg =_pf(PF, wg, ext)
+    assert _diff(_state(wg), _state(wc), SCRATCH) == [] and _diff(_state(wg), _state(wp), SCRATCH) == []   # one world
+    pg = _pf(PF, wg, ext)
     pc = _pf(PF, wc, ext, fetch="cpupack", lanes=4)
     pp = _pf(PF, wp, ext, fetch="cpupack", lanes=16)
     pp.tp.npipe.set_plant_slot_shift(1)                      # NEGATIVE CONTROL: every take lands one lane up

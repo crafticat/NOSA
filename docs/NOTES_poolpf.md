@@ -89,6 +89,14 @@ allocator reuses blocks too). New preconditions: two worlds of one seed are bitw
 5 and PF-HIT). No assertion was weakened; the cpupack plant must now change `_k_gpu` (before, leftover bytes alone
 could satisfy "some state differs").
 
+FIX 2 (CPU job pf_f832a3c_a: the three new preconditions failed on `_load_mask` only). `_load_mask` is PER-STEP
+SCRATCH: `torch.empty_like` (cache_engine.py:230); `diff_offload` writes every slot of it in a well-formed step (old
+hits -1, diff_offload_kernel.cu:44-48; the k-th new block to the k-th free slot, :77-98; #free == #new) before every
+reader of the step (pool_update, the gathers, the cpupack fetch); nothing reads it between steps. The precondition
+before step 0 now skips the list `SCRATCH = ("_load_mask",)` (the reason is written at its definition); every comparison
+AFTER a step still compares it. We do not fill it with a value: that would hide a diff that does not write every slot
+at step 0. The GPU gate PF-HIT's precondition never compared it.
+
 | test | what it proves |
 |---|---|
 | `test_flag_off_is_shipped` | Gate 0. The shipped files are unchanged against ded9d41. The binding before attach and after detach is the shipped bound method. Attached with no request: 8 steps (one block edge, one write-back) leave every engine tensor and every output bitwise equal to a never-attached twin. The cpupack source differs in the fetch line and the name only. Refusals. |
