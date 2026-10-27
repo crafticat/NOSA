@@ -16,7 +16,8 @@ TOKENS   test_spec_tokens_equal_shipped_greedy (L3 / L4 EXACT, B 1 / B 8): every
          full accepts, a block edge, skipped host loads, pool moves, (B 8) ragged positions.
 OVERFLOW test_tiny_journal_equals_shipped (L3 / L4 EXACT, B 8; the GPU cell sp3b): the same claims with a journal of
          1 slot per layer and step, and the residency right after every reject_all. Preconditions: overflow, and a pool
-         slot that a MOVE_IN emptied and a later step of the group overwrote by a MOVE_OUT, unsaved.
+         slot that a MOVE_IN emptied and a later step of the group overwrote by a MOVE_OUT, unsaved. Negative control
+         undo_move_in_none (the rollback's undo table of 6de1cfd): CAUGHT.
 REJECT   test_reject_keeps_accepted_prefix_and_correction (L3 / L4, B 8): a reject commits the accepted drafts and the
          target's correction (m = n + 1). Negative controls commit_draft_at_reject and keep_rejected: CAUGHT.
 FULL     test_full_accept_no_bonus_token (L3 / L4, B 8): a full accept commits exactly K tokens, the drafts. Negative
@@ -228,6 +229,11 @@ def test_tiny_journal_equals_shipped(level):
     got = (ev["reuse"].get("resid_reject", [])[:2], ev["resid"][:2], ev["bad_tokens"][:5], ev["bad_logits"][:5],
            ev["host"][:2])
     assert got == ([], [], [], [], []), got
+    # PLANT undo_move_in_none: the inverse of MOVE_IN is no move (the table of 6de1cfd, the sp3b code)
+    p = _ev_tiny(level, 8, "undo_move_in_none")
+    assert p["reuse"].get("unsaved", 0) > 0, p["reuse"]                # precondition (L34) of the plant run
+    caught = (p["reuse"].get("resid_reject", []), p["resid"], p["bad_tokens"], p["bad_logits"])
+    assert caught != ([], [], [], []), "undo_move_in_none was not caught"     # CAUGHT
 
 
 # ------------------------------------------------------------------ REJECT
@@ -400,8 +406,8 @@ def test_truncate_then_commit_equals_reference(S_list):
     ev = _truncate_run(S_list)
     assert ev["bad_logits"] == [] and ev["diff"] == [], (ev["bad_logits"], ev["diff"][:5])
     assert all(ev["after"]) and ev["diff_after"] == [], ev["diff_after"][:5]
-    # preconditions: truncated steps moved slots by a SWAP or a MOVE_OUT (the inverse of MOVE_IN is no move, so a
-    # second undo of a MOVE_IN changes nothing)
+    # preconditions: truncated steps moved slots by a SWAP or a MOVE_OUT (no window slot is empty in these groups, so
+    # they have no MOVE_IN)
     assert ev["facts"]["lost"] > 0 and ev["facts"]["swap"] + ev["facts"]["move_out"] > 0, ev["facts"]
     if len(S_list) > 1:
         assert any(kept for _, _, kept in ev["fills"]) and any(not kept for _, _, kept in ev["fills"]), ev["fills"]
