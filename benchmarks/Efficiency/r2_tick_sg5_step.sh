@@ -697,33 +697,38 @@
 #   ACCALL-MEM  R_ACC_peak (REPORT). PREDICTION: <= 84 GB
 #   No miniature: evalfast2c3all (8 steps, CHECK) runs first in the same job and gates every later cell.
 #
-# REGISTERED for evalfast2tall / evalfast2c3tall / evalacc216tall ([f3tall], NOT STAMPED: the lead fills every
-# PREDICTION and the bands and writes the stamp from `date -u` before any run, L33). WHAT: this tree (ROOT NOSI_EVAL =
+# REGISTERED for evalfast2tall / evalfast2c3tall / evalacc216tall ([f3tall], STAMP 2026-10-27T14:23:52Z by the lead,
+# from `date -u`, before any run, L33). WHAT: this tree (ROOT NOSI_EVAL =
 # nosi-r2-f3tall: f3all 3a7f51a merged with f3ldx 3769b64) has the f3t path (fused v3 + --res-lean --res-dev +
 # --worker cpp --b2-issue desc --no-transfer-mirror, no --inflight-array) and the f3all flags --end-batch
 # --apply-batched. The merge adds one line of joining code: OwnResidency.end_requests drops each ended request's
 # write-back marks (_hm[b] = -1), as end_request does since b2-desc (tests_cpu/test_r2_f3tall.py). Same-job controls:
 # evalfast2f3t (f3ldx flags only), evalfast2all (f3all flags only), evalfast2f3lia (both off).
-#   evalfast2tall    evalfast2f3t + --end-batch --apply-batched (FAST timing, B 216, --eval-bands "$TALL_BANDS" = TBD;
-#                    the step refuses the placeholder outside DRYRUN)
+#   evalfast2tall    evalfast2f3t + --end-batch --apply-batched (FAST timing, B 216, --eval-bands "$TALL_BANDS" =
+#                    545:630:485:570:450:560; the step refuses a placeholder outside DRYRUN)
 #   evalfast2c3tall  evalfast2c3t + --end-batch --apply-batched (CHECK, B 216, 8 steps, --draft-ticks 4, no --bare, no
 #                    eval role)
 #   C3TALL   evalfast2c3tall MUST _draft_only_fused_equal / _round_fused_equal / _fused_err PASS: 0 diffs, every layer
 #            compared; MUST <label>_AB_acted (apply_calls > 0, one call with >= 2 rollbacks); MUST desc acted, scored
 #            from the record (no harness gate): residency.report.b2 issue "desc", desc_jobs > 0, desc_takes > 0,
 #            transfer_mirror false, no_transfer_mirror.jobs > 0; info.issue desc_calls > 0. FALSIFIER: a difference or
-#            a flag that did not act: evalfast2tall and evalacc216tall are VOID. PREDICTION: TBD by lead
-#   TALL-ACT   evalfast2tall MUST <label>_AB_acted. PREDICTION: TBD by lead
-#   TALL-MED   steady tok/s (median tick). PREDICTION: TBD by lead
-#   TALL-MEAN  steady tok/s (mean tick). PREDICTION: TBD by lead
-#   TALL-EFF   effective tok/s. PREDICTION: TBD by lead
-#   TALL-HEND  the sum of bare_host_profile.per_tick_ms.h_end_request (ticks 0-60). PREDICTION: TBD by lead
-#   TALL-SAME  the bare round's ticks and committed equal evalfast2f3t's of the same job. PREDICTION: TBD by lead
-#   TALL-FALS  the falsifier against the same job's evalfast2f3t and evalfast2all. PREDICTION: TBD by lead
-#   TALL-MEM   peak_gb <= 84 (MUST EF_mem_cap). PREDICTION: TBD by lead
+#            a flag that did not act: evalfast2tall and evalacc216tall are VOID. PREDICTION: PASS, 0 diffs, all acted
+#   STAMP 2026-10-27T14:23:52Z (lead, before any run). Basis: x3/x4 f3t 543.5/539.7 med, 484.8/488.5 mean,
+#   413.9/419.8 eff (bare wall about 24.4 s); w3/w4 f3all parts cut the bare wall by end-batch 3.2-3.5 s + apply-batched
+#   1.5-1.6 s and the median tick by about 25 ms. If both carry over: wall about 19.5 s, eff about 520.
+#   TALL-ACT   evalfast2tall MUST <label>_AB_acted. PREDICTION: PASS
+#   TALL-MED   steady tok/s (median tick). PREDICTION: 580, band [545, 630]
+#   TALL-MEAN  steady tok/s (mean tick). PREDICTION: 520, band [485, 570]
+#   TALL-EFF   effective tok/s. PREDICTION: 500 (below 520: the desc path may already hold part of the end cost),
+#              band [450, 560]
+#   TALL-HEND  the sum of bare_host_profile.per_tick_ms.h_end_request (ticks 0-60). PREDICTION: < 50 ms
+#   TALL-SAME  the bare round's ticks and committed equal evalfast2f3t's of the same job. PREDICTION: equal
+#   TALL-FALS  fires if evalfast2tall eff < same-job evalfast2f3t eff + 25 (the f3all parts do not stack on f3t), or
+#              if its median < same-job evalfast2f3t median. PREDICTION: does not fire
+#   TALL-MEM   peak_gb <= 84 (MUST EF_mem_cap). PREDICTION: 83.0-83.4 GB
 #   evalacc216tall   evalacc216f3lia's proof on the tall flag set; --link-record = the evalfast2tall summary.json of the
 #                    same run id and holder
-#   ACCTALL    the ACC3LIA gates (BI, ETD, AE, LINK against evalfast2tall, MEM). PREDICTION: TBD by lead
+#   ACCTALL    the ACC3LIA gates (BI, ETD, AE, LINK against evalfast2tall, MEM). PREDICTION: PASS / EQUIVALENT
 #   No miniature: evalfast2c3tall (8 steps, CHECK) runs first in the same job and gates every later cell.
 #
 # REGISTERED for p4sc64 (2026-10-21, before the run; the scoring rules are in docs/R2_STEP7_TICK_SG5.md section 6):
@@ -1218,7 +1223,7 @@ case $CELL in
                  --b2-issue object) ;;
     evalfast2tall) MODES=fast ; BACKENDS=b2 ; PC=96 ; PX=1512 ; PRV=1464 ; SWEEP_RUN= ; SUFFIX=_$CELL  # [f3tall]
         NOSI=$NOSI_EVAL ; POOLB=() ; BATCH=216 ; MEMG=240G ; VARIANTS=fused/batched ; GF3=1
-        TALL_BANDS=TBD                                      # REGISTERED TALL-MED/MEAN/EFF (NOT STAMPED: the lead's)
+        TALL_BANDS=545:630:485:570:450:560                  # REGISTERED TALL-MED/MEAN/EFF (STAMP 2026-10-27T14:23:52Z)
         [ "${DRYRUN:-0}" = 1 ] || [ "$TALL_BANDS" != TBD ] ||
             stop "cell $CELL: --eval-bands TBD (the lead fills and stamps the REGISTERED TALL block first)"
         EVALARG=(--layout pool --X-pool 1512 --arrival-lag 2 --bare --repeat-docs --log-slots -1 --skip-shipped
