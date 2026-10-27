@@ -28,6 +28,9 @@ THIS FILE ADDS
   corrupt(...), corrupt_before_edge(...)   deterministic draft corruptions (the token proof holds for ANY drafts; these
                                force rejects at chosen places)
   Recorder                     a stand-in of a rung-L5 prefetcher (on_draft / on_round), for the wiring test
+RUNG L4P (tests_cpu/test_spec_paper.py; level "L4P" of spec_round.py): run_vs_shipped(pin=...) passes the
+requested-KV pin; after every round it records the soft pins that stay (ev["pinned"]: pinned_slots) and, for L4P, the
+host-row check with q = S + the committed count (ev["host_c"]); unkept_fills knows the L4P round.
 """
 from __future__ import annotations
 
@@ -108,14 +111,21 @@ def shipped_greedy(model, cache, B: int, S: int, N: int, tok0):
 
 def spec_runner(model, cache, S: int, horizon: int, tok0, level="L3", K=K0, mode="exact", gemm="rowgroup",
                 draft_filter=None, neg=None, rb_neg=None, record=True, prefetch=None, after_round=None,
-                journal=RW.CAP, body="torch", redirect=True):
+                journal=RW.CAP, body="torch", redirect=True, pin=False):
     ops = RE.RaggedOps(W.KERNELS, twin="torch", body=body, graph=True)
     rs = RE.attach(model, cache, S, horizon, ops)
     RW.define_undefined(rs)
     sops = SR.SpecOps(level=level, K=K, mode=mode, gemm=gemm, extra=16, attn=VW.fake_attention_idx, journal=journal,
                       redirect=redirect, draft_filter=draft_filter, prefetch=prefetch, rb_neg=rb_neg, neg=neg,
-                      record=record, probe_every=0, after_round=after_round)
+                      record=record, probe_every=0, after_round=after_round, pin=pin)
     return SR.SpecRunner(model, rs, sops, BC.HostClock(), t0=tok0)
+
+
+def pinned_slots(rs) -> int:
+    """Pool slots whose age is a soft pin (>= spec_round.PIN_BASE), over every layer (0 without a pool)."""
+    if not rs.pool:
+        return 0
+    return sum(int((lay.cache_engine._pool_age >= SR.PIN_BASE).sum()) for lay in rs.cache.layers)
 
 
 # ---------------------------------------------------------------------------
@@ -155,17 +165,18 @@ def residency_errors(rs) -> list:
     return errs
 
 
-def host_rows_errors(rs, S: int, ref_host, n_ref: int, compare_complete: bool = True) -> list:
+def host_rows_errors(rs, S: int, ref_host, n_ref: int, compare_complete: bool = True, q_list=None) -> list:
     """(A, compare_complete) the blocks completed during the decode (inside the reference's n_ref steps) equal the
     reference's host rows (EXACT runs only: FAST rows are not the shipped bits); (B) every host row from
     max(S, 64 x (q // 64)) on is still NaN, q = the request's twin position (its committed length): no tentative or
-    draft row reached the host rows."""
+    draft row reached the host rows. q_list (B,) ints: q from the caller (L4P: S + the committed count, so a wrong
+    twin position cannot hide a write)."""
     errs = []
     for l, lay in enumerate(rs.cache.layers):
         e = lay.cache_engine
         rk, rv = ref_host[l]
         for b in range(rs.B):
-            q = int(rs.st.twins[l].pos[b])
+            q = int(rs.st.twins[l].pos[b]) if q_list is None else int(q_list[b])
             done = q // BS
             a0 = (S // BS) * BS
             z = min(done, (S + n_ref) // BS) * BS
@@ -247,7 +258,7 @@ class Recorder:
 # ---------------------------------------------------------------------------
 def run_vs_shipped(B: int, level="L3", mode="exact", gemm="rowgroup", K=K0, S=S0, N=N0, seed=0, draft_filter=None,
                    neg=None, rb_neg=None, check_rounds=True, max_rounds=0, body="torch", redirect=True,
-                   oracle_rounds=(-1, 0)):
+                   oracle_rounds=(-1, 0), pin=False):
     """THE SHIPPED GREEDY DECODE against the SPECULATIVE RUN on a second cache from the same prefill. After every round
     (check_rounds): residency_errors and host_rows_errors (collected, not raised). oracle_rounds: in these rounds the
     drafts are the shipped tokens (inject; the L4 prelude is round -1), then draft_filter acts: the first rounds are
@@ -262,10 +273,13 @@ def run_vs_shipped(B: int, level="L3", mode="exact", gemm="rowgroup", K=K0, S=S0
     ref_tok, ref_lg, ref_host = shipped_greedy(model, A, B, S, N, tok0)
     if oracle_rounds:
         draft_filter = all_kinds(inject(ref_tok, tuple(oracle_rounds)), draft_filter)
-    ev = dict(resid=[], host=[], round_pos=[])
+    ev = dict(resid=[], host=[], round_pos=[], pinned=[], host_c=[])
 
     def after_round(runner):
         ev["round_pos"].append(runner.pos_host.clone())
+        npin = pinned_slots(runner.rs)                    # L4P: no soft pin may stay after a round (RequestPin.release)
+        if npin:
+            ev["pinned"].append((runner.round, npin))
         if check_rounds:
             r = residency_errors(runner.rs)
             if r:
@@ -273,9 +287,14 @@ def run_vs_shipped(B: int, level="L3", mode="exact", gemm="rowgroup", K=K0, S=S0
             h = host_rows_errors(runner.rs, S, ref_host, N, compare_complete=(mode == "exact"))
             if h:
                 ev["host"].append((runner.round, h[:5]))
+            if level == "L4P":                            # the committed length: S + the committed tokens
+                qc = [S + c for c in runner.count.tolist()]
+                h = host_rows_errors(runner.rs, S, ref_host, N, compare_complete=(mode == "exact"), q_list=qc)
+                if h:
+                    ev["host_c"].append((runner.round, h[:5]))
     W.TAG[0] = "spec"
     runner = spec_runner(model, Bc, S, hz, tok0, level=level, K=K, mode=mode, gemm=gemm, draft_filter=draft_filter,
-                         neg=neg, rb_neg=rb_neg, after_round=after_round, body=body, redirect=redirect)
+                         neg=neg, rb_neg=rb_neg, after_round=after_round, body=body, redirect=redirect, pin=pin)
     runner.run(N, max_rounds=max_rounds)
     rd = runner.read()
     cnt = torch.tensor(rd["count"])
@@ -316,6 +335,11 @@ def unkept_fills(ev) -> list:
             if level == "L3":
                 offs = list(range(K))                                     # the drafts at p .. p + K - 1 (all undone)
                 offs += [u for u in range(m, K)]                          # the verify steps past m
+            elif level == "L4P":                                          # the paper's schedule (spec_round, L4P)
+                u_ = int(r["u"][b])
+                offs = list(range(m, K + 2))                              # joint-pass rows that the commit undoes
+                start = u_ + 1 if full else m                             # the drafts after the truncate
+                offs += [start + j for j in range(K - 1)]
             else:
                 offs = [u for u in range(m, K + 1)] if not full else []  # the joint pass's undone rows
                 start = p + K + 1 if full else p + m                      # the drafts after the joint pass

@@ -32,7 +32,9 @@ DRAFT    test_draft_resident_skips_and_masks: the draft step skips the host load
          scratch bias, never writes the live bias, restores the attended view; reject_all gives the snapshot back.
 WIRING   test_prefetch_wiring (rung L5 hook, off in the cells); test_no_host_sync_in_round (only run() and the host
          redirect flag read host values; the rollback none).
-CELL     test_cell_arguments_and_verdicts, test_step_script_sp3.
+CELL     test_cell_arguments_and_verdicts, test_step_script_sp3. Tree nosi-r2-specp (rung L4P): the verdicts include
+         the L4P keys; the step script has the fifth arm L4P, STEP_MIN 30 / 100 / 140, --spec-pin off and this tree as
+         ROOT. The L4P claims are in tests_cpu/test_spec_paper.py.
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider benchmarks/Efficiency/tests_cpu/test_spec_round.py
 """
@@ -53,7 +55,7 @@ sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 EFF = ROOT / "benchmarks/Efficiency"
-STEP_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-spec"
+STEP_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-specp"          # r2-specp: the step script's ROOT is this tree (rung L4P)
 HOLDER = "2190876"                     # a lead-owned uuid file that exists (HOLDERS/2190876.gpu_uuid)
 INTEG_BASE = "3a493d29da11193712c4a0cc9a887f8479c90eda"      # the merge of the four hook trees (before Phase 2)
 
@@ -524,19 +526,23 @@ def test_cell_arguments_and_verdicts(monkeypatch):
     spr = dict(tokens=dict(n_checked=10, n_unequal=0, equal_fraction=1.0, first=None),
                fingerprints=dict(n_checked=10, n_unequal=0), rates=dict(median_tok_s=950.0),
                acceptance=dict(rate=0.97))
-    sp = {"L3": dict(spr), "L4X": dict(spr), "L4F": dict(spr, rates=dict(median_tok_s=1100.0))}
-    for k in ("L3_tok", "L4X_tok", "L4F_agree", "L3_ratio", "L4X_ratio", "L4F_ratio", "accept", "L4F_vs_L3"):
+    sp = {"L3": dict(spr), "L4X": dict(spr), "L4F": dict(spr, rates=dict(median_tok_s=1100.0)),
+          "L4P": dict(spr, rates=dict(median_tok_s=900.0), acceptance=dict(rate=0.95))}      # rung L4P (r2-specp)
+    for k in ("L3_tok", "L4X_tok", "L4F_agree", "L3_ratio", "L4X_ratio", "L4F_ratio", "accept", "L4F_vs_L3",
+              "L4P_tok", "L4P_ratio", "L4P_accept", "L4P_vs_L4X"):
         monkeypatch.setitem(SC.PRED_SPEC, k, None)
     v = {n: x for n, x, _ in SC.verdicts_spec(sh, sp, 8)}
     assert set(v.values()) == {"REPORT"}, v
     for k, val in (("L3_tok", True), ("L4X_tok", True), ("L4F_agree", 0.99), ("L3_ratio", (0.9, 1.0)),
                    ("L4X_ratio", (1.0, 1.2)), ("L4F_ratio", (1.0, 1.2)), ("accept", (0.9, 1.0)),
-                   ("L4F_vs_L3", (1.0, 1.1))):
+                   ("L4F_vs_L3", (1.0, 1.1)), ("L4P_tok", True), ("L4P_ratio", (0.8, 0.95)),
+                   ("L4P_accept", (0.97, 1.0)), ("L4P_vs_L4X", (1.0, 1.2))):
         monkeypatch.setitem(SC.PRED_SPEC, k, val)
     v = {n: x for n, x, _ in SC.verdicts_spec(sh, sp, 8)}
     assert v == {"L3-TOK": "CONFIRMED", "L3-RATIO": "CONFIRMED", "L4X-TOK": "CONFIRMED", "L4X-RATIO": "REFUTED",
                  "L4F-AGREE": "CONFIRMED", "L4F-RATIO": "CONFIRMED", "SP-ACCEPT": "CONFIRMED",
-                 "L4F-VS-L3": "REFUTED"}, v
+                 "L4F-VS-L3": "REFUTED", "L4P-TOK": "CONFIRMED", "L4P-RATIO": "CONFIRMED", "L4P-ACCEPT": "REFUTED",
+                 "L4P-VS-L4X": "REFUTED"}, v
     rd = dict(errors=(0, [0, 0]), count=[10, 13], warm=1, rounds=4, round_committed=[5, 6, 5, 5])
     gates = {n: ok for n, _, ok, _ in SC.arm_gates("L3", dict(read=rd))}
     assert gates == {"L3-ERR": True, "L3-COMMIT": True}, gates
@@ -569,16 +575,18 @@ def test_step_script_sp3():
     sha = _clean_head()
     if sha is None:
         pytest.skip("not a clean checkout of %s: the full DRYRUN needs one" % STEP_ROOT)
-    for cell, pool, batch, steps, smin, mem in (("sp3m", 65, 8, 64, 25, "100G"), ("sp3a", 65, 216, 512, 80, "240G"),
-                                                ("sp3b", 10, 318, 512, 115, "340G")):
+    # r2-specp (rung L4P): the fifth arm L4P, STEP_MIN 30 / 100 / 140, --spec-pin off, ROOT nosi-r2-specp
+    for cell, pool, batch, steps, smin, mem in (("sp3m", 65, 8, 64, 30, "100G"), ("sp3a", 65, 216, 512, 100, "240G"),
+                                                ("sp3b", 10, 318, 512, 140, "340G")):
         r = _step(cell, sha)
         if r.returncode != 0:
             pytest.skip("DRYRUN stopped on a pin outside the cell stage: %s" % r.stderr.strip()[-200:])
-        line = ("cell %s: C %d (pool %d) B %d arms SH+L3,L4X,L4F steps %d K 3 STEP_MIN %d mem %s claim "
+        line = ("cell %s: C %d (pool %d) B %d arms SH+L3,L4X,L4F,L4P steps %d K 3 STEP_MIN %d mem %s claim "
                 "/mnt/beegfs/ojerbi/r2-runs/spec/sp_active_%s" % (cell, 63 + pool, pool, batch, steps, smin, mem,
                                                                     HOLDER))
         assert line in r.stdout, (cell, r.stdout[-600:])
         for want in ("NOSI_POOL_BLOCKS=%d" % pool, "--pool %d" % pool, "--batch %d" % batch, "--spec 3",
-                     "--spec-arms L3", "L4X", "L4F", "--spec-prefetch off", "--spec-twin fused --spec-body fused",
-                     "--mem=%s" % mem, "--time=%d" % smin, "sp_t1_%s_%s" % (HOLDER, cell), "r2_spec_cell.py"):
+                     "--spec-arms L3", "L4X", "L4F", "L4P", "--spec-prefetch off", "--spec-pin off",
+                     "--spec-twin fused --spec-body fused", "/mnt/beegfs/ojerbi/nosi-r2-specp/benchmarks/Efficiency/"
+                     "r2_spec_cell.py", "--mem=%s" % mem, "--time=%d" % smin, "sp_t1_%s_%s" % (HOLDER, cell)):
             assert want in r.stdout, (cell, want)

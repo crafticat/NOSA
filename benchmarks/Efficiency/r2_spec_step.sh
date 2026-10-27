@@ -1,16 +1,21 @@
 #!/bin/bash
-# Phase 2, rungs L3 and L4 (KS/analysis/plan/PLAN_speckv_on_cached_nosa.md, KS = /mnt/beegfs/ojerbi/kstep-cpu-runs): ONE
-# bounded GPU step in an EXISTING holder that runs benchmarks/Efficiency/r2_spec_cell.py (the speculative round runner,
-# nosi/nosi/spec_round.py, opt-in --spec K). A COPY of r2_base_rollback_step.sh (962cd1b): the same pins, checks,
+# Phase 2, rungs L3, L4 and L4P (KS/analysis/plan/PLAN_speckv_on_cached_nosa.md, KS = /mnt/beegfs/ojerbi/kstep-cpu-runs):
+# ONE bounded GPU step in an EXISTING holder that runs benchmarks/Efficiency/r2_spec_cell.py (the speculative round
+# runner, nosi/nosi/spec_round.py, opt-in --spec K). A COPY of r2_base_rollback_step.sh (962cd1b): the same pins, checks,
 # record and freeze; the ROOT, the output root, the names, the cells and the claim change. The claim is PER HOLDER
 # (OUTROOT/sp_active_<holder>): two holders can run cells of this script at the same time (a global claim blocked
-# the second holder for r2_draftpool_step.sh). ONE JOB, FOUR ARMS, each with its own shipped prefill:
+# the second holder for r2_draftpool_step.sh). The tree nosi-r2-specp (branch r2-specp) adds the arm L4P; its ROOT is
+# that tree (the tree nosi-r2-spec keeps its own copy of this script). ONE JOB, FIVE ARMS, each with its own shipped
+# prefill:
 #   SH   the shipped decode at the cell's C and B (cell mb1's flow at C 128 B 216): the same-job baseline
 #   L3   per round: K = 3 resident-only drafts (undone), 3 serial verify steps (the shipped ragged step), accept / correct
 #        / commit per request (greedy, no bonus token)
 #   L4X  per round: ONE joint pass (3 verify rows + the draft row; EXACT, gemm rowgroup), truncate, 2 drafts, commit:
 #        the token proof of L4
 #   L4F  the same with the FAST joint pass (gemm natural): the timing of L4
+#   L4P  the PAPER'S schedule (rung L4P): continuous drafting; every 3 draft steps ONE EXACT joint pass (gemm rowgroup)
+#        verifies every tentative draft but the newest (deferred to the next group) and drafts the next token; 2
+#        drafts; commit. The requested-KV pin is OFF (--spec-pin off)
 # The pattern of benchmarks/Efficiency/r2_base_step.sh: the GPU uuid READ from the lead-owned file
 # HOLDERS/<holder job>.gpu_uuid. SOURCE ONLY until reviewed: it never submits, renews, cancels or replaces an
 # allocation, never retries.
@@ -19,22 +24,24 @@
 #   DRYRUN=1 bash benchmarks/Efficiency/r2_spec_step.sh --nosi <sha> <holder job> <run id> <cell>
 #        (login node: the pin checks, the uuid file read and the printed step command; no squeue, claim, srun or write)
 #
-# CELLS (512 steps unless stated; --spec 3 --spec-arms L3,L4X,L4F --spec-journal-blocks 256 --spec-twin fused
-# --spec-body fused --spec-graph on --spec-redirect on --spec-prefetch off --probe-every 16). The FUSED twin in every
-# cell (SCORING_rg1.md: rg1f, the fused twin, +0.6 % / +1.7 % against cached NOSA with the logits bitwise SH's; rg1, the
-# torch twin, +13-14 %, about 8 ms per step of small launches). The torch twin stays in the CPU tests' EXACT proofs.
+# CELLS (512 steps unless stated; --spec 3 --spec-arms L3,L4X,L4F,L4P --spec-journal-blocks 256 --spec-twin fused
+# --spec-body fused --spec-graph on --spec-redirect on --spec-prefetch off --spec-pin off --probe-every 16). The FUSED
+# twin in every cell (SCORING_rg1.md: rg1f, the fused twin, +0.6 % / +1.7 % against cached NOSA with the logits bitwise
+# SH's; rg1, the torch twin, +13-14 %, about 8 ms per step of small launches). The torch twin stays in the CPU tests'
+# EXACT proofs.
 #   sp3m  the MINIATURE: C 128 (pool 65), B 8, 64 steps. Run it first: it checks the wiring (every MUST gate, the token
-#         checks) at a small cost. STEP_MIN 25, --mem 100G.
-#   sp3a  C 128 (pool 65), B 216 (cell mb1). STEP_MIN 80, --mem 240G.
-#   sp3b  C 73 (pool 10), B 318 (the paper's smaller cache with a larger batch; dr73's cell). STEP_MIN 115, --mem 340G.
-# Basis of STEP_MIN: mb1 took 00:14:31 with a prefill of 657.7 s at B 216; four prefills (about 11 min each at B 216,
-# about 16 min at B 318 by B), SH's decode (1.5 / 2 min) and three speculative decodes of ceil(512 / 3) = 171 rounds
-# (about 0.4-0.5 s per round at B 216 by the dr1 / vr1 models: 1.5 min each).
+#         checks) at a small cost. STEP_MIN 30, --mem 100G.
+#   sp3a  C 128 (pool 65), B 216 (cell mb1). STEP_MIN 100, --mem 240G.
+#   sp3b  C 73 (pool 10), B 318 (the paper's smaller cache with a larger batch; dr73's cell). STEP_MIN 140, --mem 340G.
+# Basis of STEP_MIN: mb1 took 00:14:31 with a prefill of 657.7 s at B 216; five prefills (about 11 min each at B 216,
+# about 16 min at B 318 by B), SH's decode (1.5 / 2 min) and four speculative decodes of ceil(512 / 3) = 171 rounds
+# (about 0.4-0.6 s per round at B 216 by the dr1 / vr1 models: 1.5-2 min each; L4P's EXACT joint pass has 5 rows).
 # MEMORY (INFERRED): L3 adds the rollback journal of 3 steps per layer (about 10 MB per layer and step at 256 slots: 1.0
 # GB) and the staging blocks (0.45 GB at B 216); L4 doubles the journal (6 steps: 2.0 GB) and adds the joint pass's
-# E = 4 B rows (logits about 0.4 GB) and, FAST, the extras store (0.25 GB). mb1's allocator peak was 82.04 GB. If an arm
-# stops on memory, the lead lowers --spec-journal-blocks (a lost slot past it comes back from the host: exact, slower;
-# the journal overflow counter reports it).
+# E = 4 B rows (logits about 0.4 GB) and, FAST, the extras store (0.25 GB); L4P has a journal of 7 steps (2.3 GB) and
+# E = 5 B rows (logits about 0.5 GB). Each arm frees its state before the next. mb1's allocator peak was 82.04 GB. If an
+# arm stops on memory, the lead lowers --spec-journal-blocks (a lost slot past it comes back from the host: exact,
+# slower; the journal overflow counter reports it).
 #
 # REGISTERED (TBD BY THE LEAD: fill r2_spec_cell.PRED_SPEC and its stamp from `date -u` in a commit BEFORE the run;
 # until then every SP prediction is REPORT):
@@ -44,7 +51,8 @@
 #   L3-RATIO / L4X-RATIO / L4F-RATIO   median steady committed tok/s / SH steady tok/s inside (TBD, TBD)
 #   SP-ACCEPT   L3's accepted / valid drafts inside (TBD, TBD)
 #   L4F-VS-L3   L4F / L3 median steady committed tok/s inside (TBD, TBD) (the plan's L4 gate: faster than L3)
-#   MUST gates (not predictions): SH-RUN, <arm>-RUN, <arm>-ERR, <arm>-COMMIT for L3, L4X, L4F.
+#   L4P-TOK / L4P-RATIO / L4P-ACCEPT / L4P-VS-L4X   rung L4P: TBD (PRED_SPEC keys L4P_*, own stamp stamp_L4P)
+#   MUST gates (not predictions): SH-RUN, <arm>-RUN, <arm>-ERR, <arm>-COMMIT for L3, L4X, L4F, L4P.
 #
 # OUTPUT: OUTROOT/sp_<run>_<holder>_<cell>/summary.json and the step record OUTROOT/sp_<run>_<holder>_<cell>.step/
 # (command + pins incl. the uuid and its file, stdout, stderr, exit + accounting, sacct row), both frozen. EXIT: the
@@ -54,7 +62,7 @@
 # Checks before the claim (each STOPS with exit 1): as r2_base_step.sh. The claim: OUTROOT/sp_active_<holder> (mkdir,
 # atomic); a stop after the claim leaves it (the lead decides).
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-spec                                                     # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-specp                                                    # ROOT
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                         # ROOT (lead-owned)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -75,15 +83,15 @@ DRY=${DRYRUN:-0}
 [[ $NSHA =~ ^[0-9a-f]{40}$ ]] || stop "--nosi '$NSHA' is not a full commit id"
 case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
 [[ $RUN =~ ^[a-z0-9]{1,16}$ ]] || stop "run id '$RUN' (1-16 of a-z 0-9)"
-K=3 ARMS=L3,L4X,L4F
+K=3 ARMS=L3,L4X,L4F,L4P
 case $CELL in
-    sp3m) POOL=65 BATCH=8 STEPS=64 STEP_MIN=25 MEM=100G ;;
-    sp3a) POOL=65 BATCH=216 STEPS=512 STEP_MIN=80 MEM=240G ;;
-    sp3b) POOL=10 BATCH=318 STEPS=512 STEP_MIN=115 MEM=340G ;;
+    sp3m) POOL=65 BATCH=8 STEPS=64 STEP_MIN=30 MEM=100G ;;
+    sp3a) POOL=65 BATCH=216 STEPS=512 STEP_MIN=100 MEM=240G ;;
+    sp3b) POOL=10 BATCH=318 STEPS=512 STEP_MIN=140 MEM=340G ;;
     *) stop "cell '$CELL' (sp3m, sp3a or sp3b)" ;;
 esac
 SPK=(--spec "$K" --spec-arms "$ARMS" --spec-journal-blocks 256 --spec-twin fused --spec-body fused --spec-graph on
-     --spec-redirect on --spec-prefetch off --probe-every 16)
+     --spec-redirect on --spec-prefetch off --spec-pin off --probe-every 16)
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 for v in $(compgen -e); do case $v in SLURM_*|SRUN_*|SALLOC_*|SBATCH_*) stop "the environment exports $v" ;; esac; done
 [ "$(git -C "$NOSI" rev-parse HEAD)" = "$NSHA" ] || stop "$NOSI HEAD is not $NSHA"

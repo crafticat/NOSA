@@ -1,4 +1,5 @@
-"""Phase 2 of KS/analysis/plan/PLAN_speckv_on_cached_nosa.md (KS = /mnt/beegfs/ojerbi/kstep-cpu-runs), rungs L3 and L4:
+"""Phase 2 of KS/analysis/plan/PLAN_speckv_on_cached_nosa.md (KS = /mnt/beegfs/ojerbi/kstep-cpu-runs), rungs L3, L4 and
+L4P (the paper's schedule; tree nosi-r2-specp, docs/NOTES_specp.md):
 THE SPECULATIVE ROUND RUNNER on the per-request engine (paper sections 3 and 3.4). OPT-IN: only the cell
 benchmarks/Efficiency/r2_spec_cell.py (--spec K) and the CPU tests import this module. No engine module imports it.
 NO NEW KERNEL: the round composes the hooks of Phase 1 and the shipped kernels as they are.
@@ -19,9 +20,11 @@ THE PARTS
                     rows: the rollback defers every fill of a group and drops the fills of undone steps.
   verify_rows       (Task 1.4 route 1) L4's joint pass: K verify rows and the draft row in ONE forward pass. EXACT:
                     the serial residency per row (row K through DraftResident); FAST: one residency, the extras store
-                    of the verify rows' union, the draft row resident-only (VerifyOps(draft_last=True)).
+                    of the verify rows' union, the draft row resident-only (VerifyOps(draft_last=True)). L4P's joint
+                    pass: EXACT, K + 2 rows, DraftResident mode "rows" (the draft rows per request).
   KVMeter           (this module) the KV that the verify fetches from the host: blocks (device count) and, on probe
                     rounds, CUDA-event spans of the host gathers.
+  RequestPin        (this module; L4P, OFF by default) the requested-KV pin of paper 3.3 with Task 1.2's soft pin.
 
 L3, ONE ROUND (serial verify; per request b at committed position p_b with its last committed token t_b, not fed yet)
   1. begin; K DRAFT steps: step j feeds x_j at p_b + j (x_0 = t_b, x_j = d_j) and gives d_{j+1} = argmax;
@@ -48,6 +51,50 @@ L4, ONE ROUND (joint pass; the group holds the joint pass and the K - 1 draft st
      its m_b rows (its later steps undone; the truncated ones are marked and not undone twice).
   K >= 2 (with K = 1 a request that rejects once never drafts again).
 
+L4P, ONE ROUND: THE PAPER'S SCHEDULE (section 3, Figure 3; section 3.4). Drafting is continuous. Request b has its
+committed position q_b, its last committed token t_b (not fed yet) and u_b TENTATIVE drafts e_1 .. e_u (positions
+q_b + 1 .. q_b + u_b). Every K draft steps ONE joint pass verifies every tentative draft BUT THE NEWEST (v_b = u_b - 1
+verify rows) and drafts the next token. The newest draft e_u is DEFERRED to the next verification group (its KV
+request is one draft step old; rung L5 fetches it during the next drafts).
+  0. (first round only) K draft steps in their own group, reject_all: e_1 .. e_K (u = K).
+  1. begin; ONE JOINT PASS of R = K + 2 rows at q_b .. q_b + K + 1; row r feeds x_r (x_0 = t_b, x_r = e_r):
+       rows 0 .. v_b - 1  VERIFY rows: the target's full selection and the serial residency per row; row r gives the
+                          target's token g_{r+1}, which checks e_{r+1}
+       row v_b            the DEFERRED row: resident-only; it feeds e_v and makes the draft K / V of its position again
+                          (the draft row reads them); its token is not used (e_u stays the draft of that position)
+       row u_b = v_b + 1  the DRAFT row: resident-only; it feeds e_u and gives the next draft e_new
+       rows > u_b         PAD rows: resident-only; truncate undoes them at once
+     DraftResident mode "rows" makes rows >= v_b a draft residency PER REQUEST (one call serves verify and draft rows of
+     different requests). K = 3, first round (Figure 3): rows feed t, d1 (verify d1, d2), d2 (the deferred row), d3 (the
+     draft row: d4), one pad row. d3 is deferred: the next group verifies d3, d4, d5 and defers d6.
+  2. ACCEPT (greedy, paper 3.4): n_b = the longest prefix of e_1 .. e_v that the target gives; full_b = (n_b = v_b);
+     m_b = v_b after a full accept (NO bonus token: the deferred token stays tentative), else n_b + 1 (the accepted
+     drafts and the target's correction g_{n+1}).
+  3. truncate: a full accept keeps rows 0 .. u_b (its deferred row and draft row stay tentative); a reject keeps m_b
+     rows (the joint pass's draft row and every row from the rejected position on are undone now). A fill of a kept
+     tentative row stays staged (ragged_rollback: no host write in an open group); the commit drops it.
+  4. K - 1 DRAFT steps: after a full accept from e_new at q_b + u_b + 1; after a reject from the correction at
+     q_b + m_b. The next drafts: full accept [e_u, e_new, y_1 .. y_{K-1}] (u = K + 1); reject [y_1 .. y_{K-1}]
+     (u = K - 1: the deferred token and e_new are discarded with the rejected rows).
+  5. commit(m_b): every request keeps its m_b verify rows (the deferred row, the draft row and the drafts undone).
+  The group holds R + K - 1 = 2 K + 1 tentative steps. A request commits at most v_b tokens per round: K - 1 in the
+  first round, K after a full accept, K - 2 after a reject. K >= 3 (with K = 2 a request that rejects has no verify
+  row in its next joint pass). EXACT only (gemm rowgroup or exact); a FAST L4P needs a per-row verify mask in
+  verify_rows._extras (not built).
+  THE DEFERRED ROW (a difference from Figure 3, which shows one draft row). The verify rows must start from the
+  committed engine state (the serial residency, for the bitwise proof), so the round undoes every tentative step before
+  the next joint pass. The draft row at q + u reads the K / V of position q + u - 1, and only a draft step made them.
+  The deferred row makes them again in the same pass: one more resident-only row per request (GEMM rows and a draft
+  residency; no host fetch).
+
+REQUESTED-KV PIN (paper 3.3; SpecOps(pin=True), L4P only, OFF by default and in the cells). The draft calls record their
+selection (the blocks that the draft requested: hits and misses; in the joint pass the draft row's). Before the joint
+pass (outside a group) every pool slot that holds a requested block gets the SOFT PIN of Task 1.2 (pool_prefetch.py:
+age PIN_BASE + n, so pool_update takes it as an LRU victim last; a pool hit gives the slot a real stamp: the pin ends).
+After the round's commit every slot that is still pinned gets its age back. Nothing is fetched in this rung, so the pin
+keeps the draft's pool HITS on the GPU until the verify has read them; rung L5 pins its fetched blocks with the same
+rule. The tokens do not change: a window slot gets the same bytes from a pool slot or from the host rows.
+
 EXACTNESS (the token proof; plan, HUMAN DECISION part 3). Every committed token is a target argmax of a step (L3) or a
 verify row (L4) whose inputs are the committed prefix, on an engine state that the rollback restored bit for bit. With
 the verify in the shipped bits (L3: ragged step, gemm natural, twin torch; L4: EXACT joint pass, gemm rowgroup) the
@@ -70,6 +117,10 @@ replaces one draft step while a request has accepted every draft so far.
 NEGATIVE CONTROLS (tests only; SpecOps.neg): commit_draft_at_reject (a reject commits the draft token, not the
 correction), keep_rejected (the state keeps every verify step), bonus_on_full_accept (a full accept also counts the draft
 row's token as committed), miscount (the statistics count accepted drafts, not committed tokens).
+L4P only: verify_newest (no deferral: the joint pass verifies the newest draft too), keep_joint_draft (a reject keeps
+the joint pass's deferred and draft rows and drafts on from e_new), commit_draft_rows (the round's commit keeps the
+deferred and draft rows of a full accept: their draft K / V become committed state), commit_deferred (a full accept also
+commits the deferred row's token), pin_no_release (the pins stay after the round).
 """
 from __future__ import annotations
 
@@ -81,11 +132,19 @@ from . import ragged_engine as RE
 from . import ragged_rollback as RR
 
 MASK_BIAS = -3.0e4                     # avail_policy.py:113, verify_rows.MASK_BIAS: finite on purpose
-LEVELS = ("L3", "L4")
+LEVELS = ("L3", "L4", "L4P")
 L4_MODES = ("exact", "fast")
 L4_GEMMS = ("natural", "rowgroup", "exact")
 NEG_KINDS = (None, "commit_draft_at_reject", "keep_rejected", "bonus_on_full_accept", "miscount")
-K_MAX = {"L3": 32, "L4": 31}           # L4: verify_rows.K_MAX; the rollback group holds 2 K <= 64 steps
+NEG_L4P = ("verify_newest", "keep_joint_draft", "commit_draft_rows", "commit_deferred", "pin_no_release")
+NEG_BY_LEVEL = {"L3": NEG_KINDS, "L4": NEG_KINDS,
+                "L4P": (None, "commit_draft_at_reject", "miscount") + NEG_L4P}
+# L4: verify_rows.K_MAX; the rollback group holds 2 K <= 64 steps. L4P: R = K + 2 rows <= verify_rows.K_MAX + 1 and a
+# group of 2 K + 1 <= 64 steps; K >= 3 (module docstring)
+K_MAX = {"L3": 32, "L4": 31, "L4P": 30}
+K_MIN = {"L3": 1, "L4": 2, "L4P": 3}
+ROWS_MAX = 32                          # DraftResident mode "rows": at most verify_rows.K_MAX + 1 rows per pass
+PIN_BASE = 1 << 60                    # pool_prefetch.PIN_BASE (the same value; tests_cpu/test_spec_paper.py reads it)
 
 
 class SpecError(RuntimeError):
@@ -110,9 +169,18 @@ class DraftResident:
     AFTER the rollback, detach it BEFORE). begin(mode, redirect) / end() bracket one step or one joint pass:
       mode "all"  every decode_fixed call of the bracket is a draft residency (a ragged draft step)
       mode r      only the r-th call of each layer (a joint pass in EXACT mode: row r)
+      mode "rows" (L4P) PER REQUEST: the r-th call of each layer is a draft residency for the requests b with
+                  rows[r, b] and the full (target) residency for the others (an EXACT joint pass whose verify rows and
+                  draft rows differ by request). The host gathers get the load ids of the verify requests only (and,
+                  with redirect, the staged block of the draft requests); the scratch bias masks the draft requests'
+                  skipped slots only, so a verify request reads the live bias values (the same bits). rows: (R, B)
+                  bool; record: (R, B) bool, the (row, request) pairs whose misses go to miss_ids and whose selection
+                  goes to the pin (default: rows).
     A draft call is refused outside an open rollback group (its fill would reach the host rows: the dr1 leak).
     Counters (device): skipped slots and redirected slots per layer; miss_ids[l] = the skipped block ids of the last
-    draft call of layer l (H, B, topk; -1 elsewhere): the list that a background prefetch (rung L5) would fetch."""
+    draft call of layer l (H, B, topk; -1 elsewhere): the list that a background prefetch (rung L5) would fetch. Mode
+    "rows" also counts the skipped slots per row index (row_skipped) and the draft (request, call) pairs
+    (rows_draft)."""
 
     def __init__(self, rs, rb):
         if getattr(rs, "draft", None) is not None:
@@ -136,6 +204,11 @@ class DraftResident:
         self.steps = 0                                                   # draft brackets (steps or rows)
         self.mode = None
         self.redirect = False
+        self.rows = self.rec = None                                      # mode "rows" (L4P): (R, B) bool each
+        self.row_skipped = torch.zeros((ROWS_MAX,), dtype=torch.int64, device=dev)
+        self.rows_draft = torch.zeros((), dtype=torch.int64, device=dev)  # mode "rows": draft (request, call) pairs
+        self.rows_calls = 0                                              # mode "rows": decode_fixed calls (host count)
+        self.pin = None                                                  # L4P with SpecOps(pin=True): a RequestPin
         self._calls = [0] * self.L
         self._lay, self._live = {}, {}
         for l, lay in enumerate(rs.cache.layers):
@@ -164,15 +237,25 @@ class DraftResident:
             del body.decode_fixed
         self.rs.draft = None
 
-    def begin(self, mode, redirect: bool = False) -> None:
+    def begin(self, mode, redirect: bool = False, rows=None, record=None) -> None:
         if self.mode is not None:
             raise SpecError("begin inside a draft bracket")
-        if mode != "all" and not (isinstance(mode, int) and mode >= 0):
-            raise SpecError("mode must be 'all' or a row index >= 0, got %r" % (mode,))
+        if mode == "rows":
+            if rows is None or rows.dim() != 2 or rows.dtype != torch.bool or rows.shape[1] != self.B or \
+                    not 1 <= rows.shape[0] <= ROWS_MAX:
+                raise SpecError("mode 'rows' takes rows: an (R, %d) bool tensor, 1 <= R <= %d" % (self.B, ROWS_MAX))
+            if record is not None and (record.dtype != torch.bool or tuple(record.shape) != tuple(rows.shape)):
+                raise SpecError("record must be a bool tensor of the shape of rows")
+        elif rows is not None or record is not None:
+            raise SpecError("rows / record belong to mode 'rows'")
+        elif mode != "all" and not (isinstance(mode, int) and mode >= 0):
+            raise SpecError("mode must be 'all', 'rows' or a row index >= 0, got %r" % (mode,))
         if not self.rb.tentative:
             raise SpecError("a draft outside a rollback group: its rows could reach the host rows (the dr1 leak)")
         self.mode = mode
         self.redirect = bool(redirect)
+        if mode == "rows":
+            self.rows, self.rec = rows, (rows if record is None else record)
         self._calls = [0] * self.L
         self.steps += 1
 
@@ -181,6 +264,7 @@ class DraftResident:
         for l, view in self._live.items():
             self.rs.cache.layers[l].cache_engine._kv_bias_gpu_att = view
         self.mode = None
+        self.rows = self.rec = None
 
     def _hook(self, eng, key_states, value_states, kv_bias, topk_idx, pos, active, err, diff, gather_k,
               gather_v_bias):
@@ -188,6 +272,9 @@ class DraftResident:
         i = self._calls[l]
         self._calls[l] = i + 1
         mode = self.mode
+        if mode == "rows":
+            return self._rows_call(l, i, eng, key_states, value_states, kv_bias, topk_idx, pos, active, err, diff,
+                                   gather_k, gather_v_bias)
         if mode is None or (mode != "all" and i != mode):
             return self._orig["fn"](eng, key_states, value_states, kv_bias, topk_idx, pos, active, err, diff,
                                     gather_k, gather_v_bias)
@@ -213,6 +300,8 @@ class DraftResident:
         eng._block_map.masked_fill_(skip, -1)                           # the next step loads the skipped blocks
         self.miss_ids[l].copy_(torch.where(skip, lm, self.minus1))
         self.skipped[l] += skip.sum()
+        if self.pin is not None:                                         # L4P, pin on: the requested blocks
+            self.pin.record(l, topk_idx)
         rows = skip.permute(1, 2, 0).unsqueeze(2).expand(self.B, self.topk, self.bs, self.H)
         rows = rows.reshape(self.B, self.topk * self.bs, self.H)
         self.scratch_att.copy_(self._live[l] if self.pool else eng._kv_bias_gpu)
@@ -221,6 +310,51 @@ class DraftResident:
             eng._kv_bias_gpu_att = self.scratch_att                      # attention reads the attended views
         self.calls += 1
         return out[0], out[1], self.scratch, out[3]                      # without a pool attention reads these
+
+    def _rows_call(self, l: int, i: int, eng, key_states, value_states, kv_bias, topk_idx, pos, active, err, diff,
+                   gather_k, gather_v_bias):
+        """Mode "rows": call i of layer l. The draft requests of this call (rows[i, b]) get the draft residency of
+        _hook; the other requests get the full residency (their load ids go to the given gathers unchanged)."""
+        if i >= self.rows.shape[0]:
+            raise SpecError("layer %d: decode_fixed call %d, but rows has %d rows" % (l, i, self.rows.shape[0]))
+        dm = self.rows[i].view(1, self.B, 1)                             # (1, B, 1): the draft requests of this call
+        staged = self.rb.T[l]["id"].view(1, self.B, 1) if self.redirect else None
+        box = {}
+
+        def gk(gpu, cpu, ids, bs):                                       # verify requests: every load; draft
+            keep = ~dm                                                   # requests: the staged block only (redirect)
+            if staged is not None:
+                keep = keep | ((ids == staged) & (staged >= 0))
+            box["ids"] = torch.where(keep, ids, self.minus1)
+            gather_k(gpu, cpu, box["ids"], bs)
+
+        def gv(gpu_v, cpu_v, bias_buf, bias, ids, bs):
+            gather_v_bias(gpu_v, cpu_v, bias_buf, bias, box["ids"], bs)
+        out = self._orig["fn"](eng, key_states, value_states, kv_bias, topk_idx, pos, active, err, diff, gk, gv)
+        lm = eng._load_mask                                              # after pool_update: the host misses
+        skip = (lm >= 0) & dm
+        if staged is not None:
+            red = skip & (lm == staged) & (staged >= 0)
+            skip = skip & ~red
+            self.redirected[l] += red.sum()
+        eng._block_map.masked_fill_(skip, -1)                           # the next step loads the skipped blocks
+        rec = self.rec[i].view(1, self.B, 1)
+        self.miss_ids[l].copy_(torch.where(rec, torch.where(skip, lm, self.minus1), self.miss_ids[l]))
+        n = skip.sum()
+        self.skipped[l] += n
+        self.row_skipped[i] += n
+        self.rows_draft += self.rows[i].sum()
+        if self.pin is not None:
+            self.pin.record(l, topk_idx, rec)
+        rows = skip.permute(1, 2, 0).unsqueeze(2).expand(self.B, self.topk, self.bs, self.H)
+        rows = rows.reshape(self.B, self.topk * self.bs, self.H)
+        self.scratch_att.copy_(self._live[l] if self.pool else eng._kv_bias_gpu)
+        self.scratch_att.masked_fill_(rows, MASK_BIAS)
+        if self.pool:
+            eng._kv_bias_gpu_att = self.scratch_att                      # attention reads the attended views
+        self.calls += 1
+        self.rows_calls += 1
+        return out[0], out[1], self.scratch, out[3]
 
 
 # ------------------------------------------------------------------ the KV that the verify fetches
@@ -277,13 +411,84 @@ class KVMeter:
         self._span(self.orig[1], gpu_v, cpu_v, bias_buf, kv_bias, ids, bs)
 
 
+# ------------------------------------------------------------------ the requested-KV pin (paper 3.3)
+class RequestPin:
+    """Keep the requested KV until the verify has read it (module docstring, REQUESTED-KV PIN). L4P only, OFF unless
+    SpecOps(pin=True). The SOFT PIN of Task 1.2 (pool_prefetch.py: _pool_age = PIN_BASE + n; pool_update takes a pinned
+    slot as an LRU victim last; a pool hit rewrites the age to a real stamp, so the pin ends). Without a victim pool it
+    does nothing (no slot to pin). Device ops only, no host read.
+      record(l, sel, mask)  a draft call of layer l selected sel (H, B, topk); mask (1, B, 1): the requests that count
+      apply()               OUTSIDE a group, before the joint pass: pin every pool slot that holds a recorded block; the
+                            record starts empty again
+      release()             OUTSIDE a group, after the round's commit: every slot that is still pinned (no kept verify
+                            row hit it) gets its age from before apply() back
+    Counters (device): recorded selections, pins applied, pins released without a hit (unread)."""
+
+    def __init__(self, rs, neg=None):
+        self.rs, self.neg = rs, neg
+        eng0 = rs.cache.layers[0].cache_engine
+        self.L, self.B, self.H = int(rs.L), int(rs.B), int(eng0.head_num)
+        self.on = bool(rs.pool)
+        dev = eng0._k_gpu.device
+        self.NB = int(rs.st.M_alloc)                                   # block ids of a selection are < M_alloc
+        z = lambda: torch.zeros((), dtype=torch.int64, device=dev)    # noqa: E731
+        self.recorded, self.applied, self.unread = z(), z(), z()
+        self.applies = self.releases = 0
+        self.live = False
+        self.req, self.saved, self.base = [], [], None
+        if self.on:
+            P = int(eng0.pool_blocks)
+            self.req = [torch.zeros((self.H, self.B, self.NB + 1), dtype=torch.bool, device=dev) for _ in range(self.L)]
+            self.saved = [torch.empty_like(lay.cache_engine._pool_age) for lay in rs.cache.layers]
+            ar = torch.arange(self.H * self.B * P, dtype=torch.int64, device=dev)
+            self.base = (PIN_BASE + ar).view(self.H, self.B, P)        # one pin age per slot
+
+    def record(self, l: int, sel, mask=None) -> None:
+        if not self.on:
+            return
+        ok = sel >= 0
+        if mask is not None:
+            ok = ok & mask
+        idx = torch.where(ok, sel.clamp(max=self.NB - 1), torch.full_like(sel, self.NB))   # column NB: the dummy
+        self.req[l].scatter_(2, idx, True)
+        self.recorded += ok.sum()
+
+    def apply(self) -> None:
+        if not self.on:
+            return
+        for l, lay in enumerate(self.rs.cache.layers):
+            e = lay.cache_engine
+            pm = e._pool_map
+            hit = (pm >= 0) & self.req[l].gather(2, pm.clamp(min=0, max=self.NB - 1))
+            self.saved[l].copy_(e._pool_age)
+            e._pool_age.copy_(torch.where(hit, self.base, e._pool_age))
+            self.applied += hit.sum()
+            self.req[l].zero_()
+        self.applies += 1
+        self.live = True
+
+    def release(self) -> None:
+        if not self.on:
+            return
+        self.live = False
+        if self.neg == "pin_no_release":                               # NEGATIVE CONTROL (tests only)
+            return
+        for l, lay in enumerate(self.rs.cache.layers):
+            e = lay.cache_engine
+            pinned = e._pool_age >= PIN_BASE
+            self.unread += pinned.sum()
+            e._pool_age.copy_(torch.where(pinned, self.saved[l], e._pool_age))
+        self.releases += 1
+
+
 # ------------------------------------------------------------------ the run parameters
 class SpecOps:
     """The run parameters of one speculative arm (recorded in SpecRunner.meta).
-      level      "L3" (K drafts, then K serial verify steps) or "L4" (joint pass of K verify rows + the draft row, then
-                 K - 1 drafts)
-      K          drafts per round (L3: 1 .. 32; L4: 2 .. 31)
-      mode       L4: "exact" (the proof form) or "fast" (the timing form)
+      level      "L3" (K drafts, then K serial verify steps), "L4" (joint pass of K verify rows + the draft row, then
+                 K - 1 drafts) or "L4P" (the paper's schedule: a joint pass every K draft steps that verifies every
+                 tentative draft but the newest and drafts the next token; module docstring)
+      K          drafts per round (L3: 1 .. 32; L4: 2 .. 31; L4P: 3 .. 30)
+      mode       L4: "exact" (the proof form) or "fast" (the timing form); L4P: "exact" only
       gemm       L4: the joint pass's GEMM ("rowgroup": the shipped call's shape, bitwise; "natural"; "exact")
       linear     L4: the GEMM callable (required for gemm "exact")
       extra      L4 FAST: X, the extras store slots per request
@@ -299,24 +504,32 @@ class SpecOps:
       neg        a negative control of this module (NEG_KINDS), tests only
       record     keep every committed row's logits (tests only)
       probe_every  a probe round (gather spans, phase events) every N rounds, round 0 excluded; 0: none
-      after_round  tests only: f(runner) after each round's host sync (the state checks between rounds)"""
+      after_round  tests only: f(runner) after each round's host sync (the state checks between rounds)
+      pin        L4P only: True = the REQUESTED-KV PIN (RequestPin, paper 3.3); default False (off in this rung)"""
 
     def __init__(self, level="L3", K=3, mode="exact", gemm="rowgroup", linear=None, extra=16, attn=None, journal=256,
                  redirect=True, draft_filter=None, prefetch=None, rb_neg=None, stream=None, neg=None, record=False,
-                 probe_every=16, after_round=None):
+                 probe_every=16, after_round=None, pin=False):
         if level not in LEVELS:
             raise SpecError("level %r: one of %s" % (level, LEVELS))
-        lo = 2 if level == "L4" else 1
+        lo = K_MIN[level]
         if not lo <= int(K) <= K_MAX[level]:
             raise SpecError("%s: K in %d .. %d (got %r)" % (level, lo, K_MAX[level], K))
         if mode not in L4_MODES or gemm not in L4_GEMMS:
             raise SpecError("mode %r / gemm %r: one of %s / %s" % (mode, gemm, L4_MODES, L4_GEMMS))
-        if gemm == "exact" and linear is None and level == "L4":
+        if gemm == "exact" and linear is None and level in ("L4", "L4P"):
             raise SpecError("gemm 'exact' takes a batch-invariant linear")
-        if neg not in NEG_KINDS:
-            raise SpecError("unknown negative control %r" % (neg,))
+        if level == "L4P" and mode != "exact":
+            raise SpecError("L4P: mode 'exact' only (a FAST L4P needs a per-row verify mask in verify_rows._extras: "
+                            "not built)")
+        if neg not in NEG_BY_LEVEL[level]:
+            raise SpecError("negative control %r: for %s one of %s" % (neg, level, NEG_BY_LEVEL[level]))
         if neg == "bonus_on_full_accept" and level != "L4":
             raise SpecError("bonus_on_full_accept is an L4 control (L3 has no token past the K-th verify step)")
+        if bool(pin) and level != "L4P":
+            raise SpecError("pin: the requested-KV pin is wired for L4P only")
+        if neg == "pin_no_release" and not bool(pin):
+            raise SpecError("pin_no_release needs pin=True")
         if int(journal) < 1 or int(extra) < 2 or int(probe_every) < 0:
             raise SpecError("journal >= 1, extra >= 2, probe_every >= 0")
         self.level, self.K = level, int(K)
@@ -326,20 +539,23 @@ class SpecOps:
         self.rb_neg, self.stream, self.neg, self.record = rb_neg, stream, neg, bool(record)
         self.probe_every = int(probe_every)
         self.after_round = after_round
+        self.pin = bool(pin)
 
     def describe(self) -> dict:
-        return dict(level=self.level, K=self.K, mode=(self.mode if self.level == "L4" else None),
-                    gemm=(self.gemm if self.level == "L4" else None), extra=self.extra, journal=self.journal,
+        joint = self.level in ("L4", "L4P")
+        return dict(level=self.level, K=self.K, mode=(self.mode if joint else None),
+                    gemm=(self.gemm if joint else None), extra=self.extra, journal=self.journal,
                     redirect=self.redirect, prefetch=self.prefetch is not None, rb_neg=self.rb_neg, neg=self.neg,
-                    filtered=self.draft_filter is not None, probe_every=self.probe_every)
+                    filtered=self.draft_filter is not None, probe_every=self.probe_every, pin=self.pin)
 
 
 # ------------------------------------------------------------------ the runner
 class SpecRunner:
     """The speculative rounds of one RaggedState (module docstring). Build it after ragged_engine.attach / build: it
-    attaches, in this order, the KVMeter, the Rollback (K or 2 K steps per group), the DraftResident and (L4) the
-    joint-pass state. detach() undoes them in the reverse order. clock: an object with event() / record(e) /
-    elapsed(a, b) in ms / sync() (r2_base_cell.CudaClock on the GPU, HostClock on the CPU)."""
+    attaches, in this order, the KVMeter, the Rollback (K, 2 K or (L4P) 2 K + 1 steps per group), the DraftResident and
+    (L4, L4P) the joint-pass state; (L4P, pin on) the RequestPin. detach() undoes them in the reverse order. clock: an
+    object with event() / record(e) / elapsed(a, b) in ms / sync() (r2_base_cell.CudaClock on the GPU, HostClock on
+    the CPU)."""
 
     def __init__(self, model, rs, ops: SpecOps, clock, t0=None):
         self.model, self.rs, self.ops, self.clock = model, rs, ops, clock
@@ -347,28 +563,39 @@ class SpecRunner:
         self.B, self.K = B, K
         dev = rs.st.cu_q.device
         self.dev = dev
+        paper = ops.level == "L4P"
         RE.set_activity(rs, torch.ones(B, dtype=torch.bool, device=dev), torch.ones(B, dtype=torch.bool))
         self.meter = KVMeter(rs, clock)
-        self.rb = RR.Rollback(rs, K if ops.level == "L3" else 2 * K, capacity=ops.journal, stream=ops.stream,
-                              neg=ops.rb_neg)
+        n_group = K if ops.level == "L3" else (2 * K if ops.level == "L4" else 2 * K + 1)
+        self.rb = RR.Rollback(rs, n_group, capacity=ops.journal, stream=ops.stream, neg=ops.rb_neg)
         self.draft = DraftResident(rs, self.rb)
         self.vs = None
-        if ops.level == "L4":
+        if ops.level in ("L4", "L4P"):
             from . import verify_rows as VR
             self.VR = VR
             # the joint pass's GEMM: the given one, else the ragged step's own (gemm natural: F.linear; exact: the
             # batch-invariant linear), so a rowgroup joint pass has the bits of the serial step it replaces
             base = ops.linear if ops.linear is not None else self.rb._orig["linear"]
-            vops = VR.VerifyOps(K=K, mode=ops.mode, gemm=ops.gemm, linear=self._wait_linear(base), extra=ops.extra,
-                                attn=ops.attn, draft_last=(ops.mode == "fast"))
+            if paper:                                  # R = K + 2 rows (verify_rows calls it K + 1 "verify" rows)
+                vops = VR.VerifyOps(K=K + 1, mode="exact", gemm=ops.gemm, linear=self._wait_linear(base),
+                                    extra=ops.extra, attn=ops.attn)
+            else:
+                vops = VR.VerifyOps(K=K, mode=ops.mode, gemm=ops.gemm, linear=self._wait_linear(base),
+                                    extra=ops.extra, attn=ops.attn, draft_last=(ops.mode == "fast"))
             self.vs = VR.attach(model, rs, vops)
             self.vs.hooks = self.rb
+        self.pin = RequestPin(rs, neg=ops.neg) if ops.pin else None
+        self.draft.pin = self.pin
         i64 = torch.int64
         self.t = torch.zeros(B, dtype=i64, device=dev) if t0 is None else t0.to(device=dev, dtype=i64).view(B).clone()
-        self.D = torch.full((B, K), -1, dtype=i64, device=dev)          # the drafts of the next verify (-1: none)
+        # the drafts of the next verify (-1: none); L4P: the tentative drafts e_1 .. e_u (at most K + 1)
+        self.D = torch.full((B, K + 1 if paper else K), -1, dtype=i64, device=dev)
+        self.u = torch.full((B,), K, dtype=i64, device=dev)              # L4P: tentative drafts per request
         self.count = torch.zeros(B, dtype=i64, device=dev)              # committed tokens per request
         self.arK = torch.arange(K, dtype=i64, device=dev)
-        self.arR = torch.arange(K + 1, dtype=i64, device=dev)
+        self.arR = torch.arange(K + 2 if paper else K + 1, dtype=i64, device=dev)   # the joint pass's rows
+        self.v_hist = torch.zeros(K + 1, dtype=i64, device=dev)         # L4P: verify rows per (request, round)
+        self.round_accepted = []                                        # L4P: accepted drafts per round (device)
         self.ids1 = torch.zeros((B, 1), dtype=i64, device=dev)
         self.pos1 = torch.zeros((B, 1), dtype=torch.int32, device=dev)
         self.acc_hist = torch.zeros(K + 1, dtype=i64, device=dev)       # n per (request, round)
@@ -466,10 +693,12 @@ class SpecRunner:
 
     def _commit_tokens(self, G, m, FM, FS, LG) -> None:
         """Committed tokens G[b, :m[b]] (and their logits fingerprints) at columns count[b] .. ; count += m. Columns
-        past the capacity go to the dummy column."""
+        past the capacity go to the dummy column. G has at most len(arR) columns (K for L3 / L4; K + 1 for an L4P
+        plant)."""
         B, K = G.shape
-        cols = self.count.view(B, 1) + self.arK[:K].view(1, K)
-        keep = (self.arK[:K].view(1, K) < m.view(B, 1)) & (cols < self.cap)
+        ar = self.arR[:K]                                                # 0 .. K - 1 (the same values as arK[:K])
+        cols = self.count.view(B, 1) + ar.view(1, K)
+        keep = (ar.view(1, K) < m.view(B, 1)) & (cols < self.cap)
         cols = torch.where(keep, cols, torch.full_like(cols, self.cap))
         self.out.scatter_(1, cols, G)
         self.fmax.scatter_(1, cols, FM)
@@ -615,6 +844,90 @@ class SpecRunner:
             self.records.append(dict(D=D.clone(), G=G.clone(), n=n.clone(), v=v.clone(), m=m.clone(),
                                      full=full.clone(), committed=Gc.clone(), e0=e0.clone(), pos=self.pos_host.clone()))
 
+    def _round_l4p(self, probe: bool) -> None:
+        """L4P, one round: the paper's schedule (module docstring, steps 1-5)."""
+        K, B = self.K, self.B
+        R = K + 2
+        neg = self.ops.neg
+        rec = self.ops.record
+        ev = []
+        self._event(ev)
+        D, u = self.D, self.u
+        defer = 0 if neg == "verify_newest" else 1                       # NEGATIVE CONTROL verify_newest: no deferral
+        v = (u - defer).clamp(min=0)                                     # verify rows: every tentative draft but newest
+        ids = torch.cat((self.t.view(B, 1), D.clamp(min=0)), dim=1)     # (B, R): row r feeds x_r (a pad row: any token)
+        self._sync_release()
+        pos = (self.rs.st.twins[0].pos.view(B, 1) + self.arR.view(1, R)).to(torch.int32)
+        rr = self.arR.view(R, 1)
+        drows = rr >= v.view(1, B)                                       # (R, B): the deferred row, the draft row, pads
+        drow = rr == u.view(1, B)                                        # (R, B): the draft row (its misses, its pin)
+        self.rb.begin()                                                  # 1. the joint pass
+        b0 = self.meter.blocks.clone()
+        s0 = len(self.meter.spans)
+        self.draft.begin("rows", redirect=self._edge_before(R), rows=drows, record=drow)
+        self.meter.on, self.meter.timing = True, probe
+        try:
+            lg = self.VR.joint_pass(self.model, self.vs, ids, pos)
+        finally:
+            self.meter.on, self.meter.timing = False, False
+            self.draft.end()
+        if self.ops.prefetch is not None:                                # rung L5 seam: the draft row's misses
+            self.ops.prefetch.on_draft(self.draft.miss_ids)
+        self._event(ev)
+        G = lg.argmax(dim=-1)                                            # (B, R)
+        Gv = G[:, :K]                                                    # row r < v_b gives g_{r+1}: it checks e_{r+1}
+        Dv = torch.where(self.arK.view(1, K) < v.view(B, 1), D[:, :K], torch.full_like(D[:, :K], -1))
+        n = accept_prefix(Gv, Dv)                                        # 2. accept (greedy, paper 3.4)
+        full = n >= v
+        m = torch.where(full, v, n + 1)                                  # no bonus token after a full accept
+        e_new = self._filter("draft_row", 0, G.gather(1, u.view(B, 1)).view(B), next_col=self.count + u)
+        Gc = self._plant_commit(Gv, Dv, n, m)
+        W = K
+        mc = m
+        if neg == "commit_deferred":                                     # NEGATIVE CONTROL: the deferred row's token
+            W, mc, Gc = K + 1, torch.where(full, v + 1, m), G[:, :K + 1]
+        FM, FS = lg[:, :W].amax(dim=-1), lg[:, :W].sum(dim=-1, dtype=torch.float64)
+        cont = torch.ones_like(full) if neg == "keep_joint_draft" else full    # NEGATIVE CONTROL keep_joint_draft
+        self.rb.truncate(torch.where(cont, u + 1, m))                    # 3. truncate (a reject: m rows, now)
+        pos_trunc = None
+        if rec:
+            self._sync_release()
+            pos_trunc = self.rs.st.twins[0].pos.clone()
+        self._event(ev)
+        self._commit_tokens(Gc, mc, FM, FS, lg[:, :W].clone() if self.lg_out is not None else None)
+        t_new = Gc.gather(1, (m - 1).view(B, 1)).view(B)
+        Dn = torch.full((B, K + 1), -1, dtype=torch.int64, device=self.dev)    # 4. K - 1 drafts, the next drafts
+        if defer:
+            e_u = D.gather(1, (u - 1).clamp(min=0).view(B, 1)).view(B)   # the deferred draft (newest of this group)
+            Dn[:, 0].copy_(torch.where(cont, e_u, Dn[:, 0]))
+        Dn[:, defer].copy_(torch.where(cont, e_new, Dn[:, defer]))
+        shift = torch.where(cont, torch.full_like(u, defer + 1), torch.zeros_like(u))
+        x = torch.where(cont, e_new, t_new)
+        x0 = x.clone() if rec else None
+        for j in range(K - 1):
+            y = self._filter("draft", j, self._draft_step(x, R + j), next_col=self.count + shift + j)
+            Dn.scatter_(1, (shift + j).view(B, 1), y.view(B, 1))
+            x = y
+        self._event(ev)
+        keep = torch.where(full, u + 1, m) if neg == "commit_draft_rows" else m    # NEGATIVE CONTROL commit_draft_rows
+        self.rb.commit(keep)                                             # 5. commit: the m verify rows
+        self._event(ev)
+        self.t = t_new
+        self.D = Dn
+        self.u = torch.where(cont, torch.full_like(u, K + defer), torch.full_like(u, K - 1))
+        self._stats(n, v, mc, full)
+        self.v_hist.scatter_add_(0, v, torch.ones_like(v))
+        self.round_accepted.append(n.sum())
+        self.round_blocks.append(self.meter.blocks - b0)
+        self.round_events.append(ev)
+        self.round_probe.append(self.meter.spans[s0:] if probe else None)
+        if rec:
+            self.records.append(dict(D=D.clone(), u=u.clone(), v=v.clone(), Dv=Dv.clone(), G=Gv.clone(),
+                                     Gall=G.clone(), n=n.clone(), m=mc.clone(), full=full.clone(),
+                                     committed=Gc.clone(), e_new=e_new.clone(), pos=self.pos_host.clone(),
+                                     pos_trunc=pos_trunc, x0=x0, Dn=Dn.clone(), un=self.u.clone(),
+                                     drows=drows.clone()))
+
     def _plant_commit(self, G, D, n, m):
         """The committed tokens of the round: G (the target argmaxes). NEGATIVE CONTROL commit_draft_at_reject: at a
         reject (a valid draft d_n != g_n) the draft token is committed in place of the correction."""
@@ -669,7 +982,7 @@ class SpecRunner:
         # must not follow the live twin counter (CPU job sp_a6eb5dd_a: round 0's filters and record read a moving pos)
         self.pos_host = self.rs.st.twins[0].pos.cpu().clone()
         self.rs.st.pos_host.copy_(self.pos_host)
-        if self.ops.level == "L4":
+        if self.ops.level in ("L4", "L4P"):
             ev = []
             self._event(ev)
             self._prelude()
@@ -682,10 +995,18 @@ class SpecRunner:
             probe = pe > 0 and g > 0 and g % pe == 0
             if self.ops.prefetch is not None:
                 self.ops.prefetch.on_round("begin")
+            if self.pin is not None:                                     # L4P, pin on: outside the group
+                self._sync_release()
+                self.pin.apply()
             if self.ops.level == "L3":
                 self._round_l3(probe)
-            else:
+            elif self.ops.level == "L4":
                 self._round_l4(probe)
+            else:
+                self._round_l4p(probe)
+            if self.pin is not None:
+                self._sync_release()
+                self.pin.release()
             if self.ops.prefetch is not None:
                 self.ops.prefetch.on_round("end")
             hc = torch.stack((self.count, self.rs.st.twins[0].pos)).cpu()          # THE host sync of the round
@@ -721,7 +1042,20 @@ class SpecRunner:
                    prelude_ms=(el(self.prelude_events[0], self.prelude_events[1])
                                if getattr(self, "prelude_events", None) else None),
                    verify=(self.VR.read_stats(self.vs) if self.vs is not None else None))
+        if self.ops.level == "L4P":
+            # verify_hist[v]: (request, round) pairs whose joint pass had v verify rows; round_accepted: accepted drafts
+            # per round; row_skipped[r]: slots that row index r skipped as a draft row; rows_draft: draft (request,
+            # call) pairs of the joint passes (rows_calls calls)
+            pin = None
+            if self.pin is not None:
+                pin = dict(on=self.pin.on, applies=self.pin.applies, releases=self.pin.releases,
+                           recorded=int(self.pin.recorded), applied=int(self.pin.applied), unread=int(self.pin.unread))
+            out.update(verify_hist=self.v_hist.cpu().tolist(),
+                       round_accepted=[int(x) for x in torch.stack(self.round_accepted).cpu()] if self.round_accepted
+                       else [], row_skipped=self.draft.row_skipped[:self.K + 2].cpu().tolist(),
+                       rows_calls=self.draft.rows_calls, rows_draft=int(self.draft.rows_draft), pin=pin)
         return out
 
 
-PHASES = {"L3": ("draft", "verify", "commit"), "L4": ("joint", "truncate", "draft", "commit")}
+PHASES = {"L3": ("draft", "verify", "commit"), "L4": ("joint", "truncate", "draft", "commit"),
+          "L4P": ("joint", "truncate", "draft", "commit")}

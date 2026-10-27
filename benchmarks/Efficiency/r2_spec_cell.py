@@ -12,6 +12,10 @@ ONE PROCESS, ONE MODEL, the arms in this order, each with its own shipped prefil
        commit per request.
   L4X  spec_round level L4, EXACT joint pass (gemm rowgroup: the shipped GEMM shape): the token proof of L4.
   L4F  spec_round level L4, FAST joint pass (gemm natural, one residency + extras store): the timing of L4.
+  L4P  spec_round level L4P, THE PAPER'S SCHEDULE (rung L4P; paper section 3, Figure 3): drafting is continuous; every K
+       draft steps ONE EXACT joint pass (gemm rowgroup) verifies every tentative draft but the newest (the newest is
+       deferred to the next group) and drafts the next token; accept / correct per request; K >= 3. --spec-pin on gives
+       it the requested-KV pin (paper 3.3, soft pin of Task 1.2); OFF by default and in the cells.
 Every speculative arm starts from SH's first token (inputs[:, 0]) and runs FREE (greedy): its committed tokens must be
 SH's tokens. It runs --spec-rounds rounds (default ceil(steps / K): no request passes steps + K - 1 tokens).
 
@@ -23,7 +27,10 @@ MEASURED per speculative arm (CUDA events; one host sync per round, after the ro
                        tok/s (B x 1000 / the SH step), in the same job.
   acceptance           accepted drafts / valid drafts; the histogram of n (accepted drafts per request and round); the
                        full-accept fraction; committed tokens per request and round.
-  phases per round     L3: draft, verify, commit; L4: joint, truncate, draft, commit (ms, medians over steady rounds).
+  phases per round     L3: draft, verify, commit; L4 / L4P: joint, truncate, draft, commit (ms, medians over steady
+                       rounds).
+  L4P only             the verify rows per joint pass (histogram over (request, round)), the accepted drafts per round,
+                       the skipped slots per joint-pass row index (the draft rows are resident-only), the pin counters.
   KV at verify         NEW: the (head, request) blocks the verify fetched from the host (count and bytes per round);
                        READY: the verify rows' selected slots minus NEW (FAST: the union fetches, so READY is an upper
                        bound); IN FLIGHT: 0 (no background prefetch in L3 / L4: --spec-prefetch is rung L5); the WAIT:
@@ -53,11 +60,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import r2_base_cell as BC          # noqa: E402
 
-ARMS = ("L3", "L4X", "L4F")
+ARMS = ("L3", "L4X", "L4F", "L4P")
 ARM_OPS = dict(L3=dict(level="L3", mode="exact", gemm="rowgroup"), L4X=dict(level="L4", mode="exact", gemm="rowgroup"),
-               L4F=dict(level="L4", mode="fast", gemm="natural"))
-EXACT_ARMS = ("L3", "L4X")
-PHASES = {"L3": ("draft", "verify", "commit"), "L4": ("joint", "truncate", "draft", "commit")}
+               L4F=dict(level="L4", mode="fast", gemm="natural"), L4P=dict(level="L4P", mode="exact", gemm="rowgroup"))
+EXACT_ARMS = ("L3", "L4X", "L4P")
+PHASES = {"L3": ("draft", "verify", "commit"), "L4": ("joint", "truncate", "draft", "commit"),
+          "L4P": ("joint", "truncate", "draft", "commit")}
 # REGISTERED PREDICTIONS, TBD BY THE LEAD: fill every None and the stamp (`date -u`, L33) in a commit BEFORE the run.
 #   <arm>_tok      True / False: the arm's committed tokens equal SH's, bitwise (L3, L4X)
 #   L4F_agree      the lowest fraction of L4F's committed tokens equal to SH's (FAST is not bitwise)
@@ -72,6 +80,16 @@ PHASES = {"L3": ("draft", "verify", "commit"), "L4": ("joint", "truncate", "draf
 # expectation is that NO arm beats SH (the plan's stop rule at C 128 B 216; sp3b is the small-cache test).
 PRED_SPEC = dict(stamp="2026-10-27T20:08:53Z", L3_tok=True, L4X_tok=True, L4F_agree=0.99, L3_ratio=(0.3, 0.5),
                  L4X_ratio=(0.2, 0.45), L4F_ratio=(0.2, 0.5), accept=(0.97, 1.0), L4F_vs_L3=(0.6, 1.2))
+# RUNG L4P (the paper's schedule), TBD BY THE LEAD: the stamp above covers the keys above only. Fill these and a new
+# stamp (`date -u`, L33) in a commit BEFORE an L4P run.
+#   L4P_tok      True / False: L4P's committed tokens equal SH's, bitwise
+#   L4P_ratio    (low, high): L4P's median steady committed tok/s / SH's steady tok/s
+#   L4P_accept   (low, high): L4P's accepted / verified drafts
+#   L4P_vs_L4X   (low, high): L4P's median steady committed tok/s / L4X's (both EXACT joint passes)
+# Inputs (docs/NOTES_specp.md section 5, MODEL): a steady L4P round = one EXACT joint pass of K + 2 rows (K verify,
+# the deferred row, the draft row) + K - 1 drafts + truncate + commit, for at most K tokens (K - 1 in round 0, K - 2
+# after a reject).
+PRED_SPEC.update(stamp_L4P=None, L4P_tok=None, L4P_ratio=None, L4P_accept=None, L4P_vs_L4X=None)
 
 
 def log(msg):
@@ -102,12 +120,18 @@ def parse_args(argv):
     ap.add_argument("--spec-prefetch", default="off", choices=("off", "on"),
                     help="rung L5 (background prefetch of the draft misses): not wired to a transport here")
     ap.add_argument("--probe-every", type=int, default=16, help="a probe round every N rounds (round 0 excluded)")
+    ap.add_argument("--spec-pin", default="off", choices=("off", "on"),
+                    help="L4P: keep the requested KV pinned until the verify read it (paper 3.3; off in this rung)")
     a = ap.parse_args(argv)
     a.spec_arms = [x for x in a.spec_arms.split(",") if x]
     if not a.spec_arms or any(x not in ARMS for x in a.spec_arms) or len(set(a.spec_arms)) != len(a.spec_arms):
         ap.error("--spec-arms: distinct names from %s" % (ARMS,))
     if a.spec != 0 and not 2 <= a.spec <= 18:
         ap.error("--spec K in 2 .. 18 (L4 needs K >= 2; the horizon steps + 3 K + 8 fits the host rows steps + 64)")
+    if a.spec != 0 and "L4P" in a.spec_arms and a.spec < 3:
+        ap.error("--spec-arms L4P needs --spec K >= 3 (with K = 2 a request that rejects has no verify row next)")
+    if a.spec_pin == "on" and "L4P" not in a.spec_arms:
+        ap.error("--spec-pin on acts on the L4P arm only")
     if a.batch < 1 or a.steps > 1000 or a.steps < 8:
         ap.error("--batch >= 1, --steps in 8 .. 1000 (the shipped total_cis holds S + 1024)")
     if a.spec_rounds < 0 or a.spec_journal_blocks < 1 or a.spec_extra < 2 or a.probe_every < 2:
@@ -214,7 +238,8 @@ def kv_at_verify(rd, steady, rows_per_round: int, L: int, H: int, B: int, topk: 
     return dict(new_blocks_per_round=(round(nb, 1) if nb is not None else None),
                 new_MB_per_round=(round(nb * block_bytes / 1e6, 3) if nb is not None else None),
                 ready_slots_per_round=(round(sel - nb, 1) if nb is not None else None), selected_slots_per_round=sel,
-                in_flight_blocks=0, in_flight_note="no background prefetch in L3 / L4 (--spec-prefetch is rung L5)",
+                in_flight_blocks=0,
+                in_flight_note="no background prefetch in L3 / L4 / L4P (--spec-prefetch is rung L5)",
                 wait_ms_median=(round(statistics.median(waits), 3) if waits else None), wait_rounds=len(waits),
                 block_bytes=block_bytes)
 
@@ -263,6 +288,13 @@ def verdicts_spec(sh, sp, B: int):
         band("L4F-VS-L3", l4f["rates"]["median_tok_s"] / l3["rates"]["median_tok_s"], P["L4F_vs_L3"])
     else:
         out.append(("L4F-VS-L3", "NOT_RUN", "L3 or L4F did not run"))
+    l4p, l4x = (sp or {}).get("L4P"), (sp or {}).get("L4X")
+    if l4p is not None:
+        band("L4P-ACCEPT", l4p["acceptance"]["rate"], P["L4P_accept"])
+    if l4p is not None and l4x is not None and l4p["rates"]["median_tok_s"] and l4x["rates"]["median_tok_s"]:
+        band("L4P-VS-L4X", l4p["rates"]["median_tok_s"] / l4x["rates"]["median_tok_s"], P["L4P_vs_L4X"])
+    else:
+        out.append(("L4P-VS-L4X", "NOT_RUN", "L4P or L4X did not run"))
     return out
 
 
@@ -299,7 +331,17 @@ def summarize(arm, res, inputs, fp_sh, sh, B: int, steps: int, dims):
                committed_per_request_round=(sum(rd["round_committed"]) / (B * G) if G else None))
     calls = rd["draft_calls"]                            # draft decode_fixed calls: one per layer of a draft step / row
     skip = (sum(rd["draft_skipped"]) / (calls * dims["H"] * B)) if calls else None
-    return dict(arm=arm, level=level, K=K, rounds=G, rates=rates, vs_sh=vs_sh, acceptance=acc,
+    paper = None
+    if level == "L4P":
+        # a joint-pass call is a draft residency for some requests only: count (request, call) pairs there
+        streams = (calls - rd["rows_calls"]) * dims["H"] * B + rd["rows_draft"] * dims["H"]
+        skip = (sum(rd["draft_skipped"]) / streams) if streams else None
+        ra = [rd["round_accepted"][g] for g in steady if g < len(rd["round_accepted"])]
+        paper = dict(verify_rows_hist=rd["verify_hist"], accepted_per_round=rd["round_accepted"],
+                     accepted_per_round_steady_mean=(round(statistics.fmean(ra), 3) if ra else None),
+                     accepted_per_request_round=(rd["accepted"] / (B * G) if G else None),
+                     skipped_per_row_index=rd["row_skipped"], pin=rd["pin"])
+    return dict(arm=arm, level=level, K=K, rounds=G, rates=rates, vs_sh=vs_sh, acceptance=acc, paper=paper,
                 phases_median=phase_medians(level, rd["phases"], steady),
                 kv_at_verify=kv_at_verify(rd, steady, K, dims["L"], dims["H"], B, dims["topk"], dims["block_bytes"]),
                 tokens=token_check(res["out"], rd["count"], inputs, steps),
@@ -351,7 +393,8 @@ def run_spec(model, ids, inputs, steps: int, clock, opt):
     torch.cuda.empty_cache()                             # the released shipped tables
     a = ARM_OPS[opt["arm"]]
     sops = SR.SpecOps(level=a["level"], K=K, mode=a["mode"], gemm=a["gemm"], extra=opt["extra"],
-                      journal=opt["journal"], redirect=opt["redirect"], probe_every=opt["probe_every"])
+                      journal=opt["journal"], redirect=opt["redirect"], probe_every=opt["probe_every"],
+                      pin=(a["level"] == "L4P" and bool(opt.get("pin"))))
     runner = SR.SpecRunner(model, rs, sops, clock, t0=inputs[:, 0])
     G = rounds_for(steps, K, opt["rounds"])
     runner.run(steps, rounds=G)
@@ -435,7 +478,8 @@ def main(argv=None) -> int:
             BC.free(host=True)
             opt = dict(arm=arm, K=a.spec, rounds=a.spec_rounds, journal=a.spec_journal_blocks, extra=a.spec_extra,
                        twin=a.spec_twin, body=a.spec_body, graph=a.spec_graph == "on",
-                       redirect=a.spec_redirect == "on", probe_every=a.probe_every)
+                       redirect=a.spec_redirect == "on", probe_every=a.probe_every,
+                       pin=(arm == "L4P" and a.spec_pin == "on"))
             log("arm %s (%s)" % (arm, opt))
             try:
                 res = run_spec(model, ids, inputs, a.steps, clock, opt)
@@ -457,7 +501,8 @@ def main(argv=None) -> int:
                 capacity_C=BC.C_BASE + a.pool, spec_k=a.spec, spec_arms=a.spec_arms, spec_rounds=a.spec_rounds,
                 spec_journal_blocks=a.spec_journal_blocks, spec_extra=a.spec_extra, spec_twin=a.spec_twin,
                 spec_body=a.spec_body, spec_graph=a.spec_graph, spec_redirect=a.spec_redirect,
-                spec_prefetch=a.spec_prefetch, probe_every=a.probe_every, predictions=PRED_SPEC, dims=dims,
+                spec_prefetch=a.spec_prefetch, spec_pin=a.spec_pin, probe_every=a.probe_every, predictions=PRED_SPEC,
+                dims=dims,
                 host_mem=mem, base_commit=os.environ.get("BASE_COMMIT"))
     summary = dict(meta=meta, SH=sh, SPEC=sp,
                    gates=[dict(name=g[0], must=g[1], passed=bool(g[2]), detail=g[3]) for g in gates],
@@ -484,6 +529,12 @@ def main(argv=None) -> int:
                   r["phases_median"], r["kv_at_verify"], r["tokens"]["equal_fraction"], r["tokens"]["first"],
                   r["fingerprints"]["equal_fraction"], r["draft"]["skip_per_stream_per_call"],
                   sum(r["journal"]["overflow"]), r["gpu_peak_alloc_GB"]))
+        if r.get("paper"):
+            pp = r["paper"]
+            print("REPORT %s paper schedule: verify rows per joint pass (histogram v = 0 .. K) %s; accepted per round "
+                  "(steady mean) %s; accepted per request and round %s; skipped slots per joint-pass row %s; pin %s" % (
+                      name, pp["verify_rows_hist"], pp["accepted_per_round_steady_mean"],
+                      pp["accepted_per_request_round"], pp["skipped_per_row_index"], pp["pin"]))
     nfail = sum(1 for g in gates if g[1] and not g[2])
     print("r2_spec: %d MUST gate(s) failed" % nfail)
     return min(nfail, 19)
