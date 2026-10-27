@@ -88,22 +88,37 @@ ACCEPTED = (1, 2, 3, 4)
 # not a new prediction: it is the plan's Global Constraint "flags off = baseline: step time within +-2 % of the same-job
 # baseline" (arm H at the mb1 cell against the same job's mb1), so it carries its band now.
 # Cell keys (cell_key): 128_216 (p0c128), 63_344 (p0c63b344), 63_216 (p0c63b216), 128_63_s130816 (p0k128b63).
-REGISTERED_UTC = "TBD"
+# STAMP 2026-10-27T16:25:29Z (the lead). BASIS: ncu step of job 2175791 at C 128 B 216 (selection 8.9, resolve 1.2,
+# pool swap 5.4, gather 7.6, attention 19.2, GEMM 19.9 ms; MAP_cached_nosa.md 2.1); original NOSA B 344 C 63 1,908.8
+# tok/s (180 ms per step) with fetch about 1.36x the rest (paper Figure 2); P0_PILOT_AUTOPSY.md (128K B 63: selection
+# about 26 ms per position). Stage bands are wide on purpose: event timers on a device-bound step add their own cost.
+# The 63_* cells run without the pool, so their pool_swap band is (0, 1).
+REGISTERED_UTC = "2026-10-27T16:25:29Z"
 _CELL_KEYS = ("128_216", "63_344", "63_216", "128_63_s130816")
 PRED_P0 = {
     "head_band": (0.98, 1.02),     # P0-HEAD: H steady median / same-job mb1 steady median (same C, B, S only)
-    "ovh_band": "TBD",             # P0-OVH: T steady median / H steady median (the cost of the timers)
-    "stage_ms": {k: "TBD" for k in _CELL_KEYS},
+    "ovh_band": (1.0, 1.15),       # P0-OVH: T steady median / H steady median (the cost of the timers)
+    "stage_ms": {
+        "128_216": {"selection": (6, 13), "resolve": (0.7, 2.5), "pool_swap": (3.5, 8), "fetch": (5, 11),
+                    "attention": (15, 24), "gemm_mlp": (16, 25), "rest": (1, 8)},
+        "63_344": {"selection": (9, 20), "resolve": (1, 4), "pool_swap": (0, 1), "fetch": (70, 130),
+                   "attention": (24, 38), "gemm_mlp": (25, 40), "rest": (2, 14)},
+        "63_216": {"selection": (6, 13), "resolve": (0.7, 3), "pool_swap": (0, 1), "fetch": (40, 80),
+                   "attention": (15, 24), "gemm_mlp": (16, 25), "rest": (1, 10)},
+        "128_63_s130816": {"selection": (15, 40), "resolve": (0.5, 3), "pool_swap": (1, 6), "fetch": (2, 12),
+                           "attention": (8, 20), "gemm_mlp": (6, 12), "rest": (1, 10)},
+    },
     #                                P0-STAGE-<group>: {group: (low, high)} ms per step, T steady median, per cell
-    "launches": {k: "TBD" for k in _CELL_KEYS},
+    "launches": {k: (800, 4000) for k in _CELL_KEYS},
     #                                P0-LAUNCH: (low, high) enqueued launches per step (kernel + graph + memcpy + memset)
-    "gap_ms": {k: "TBD" for k in _CELL_KEYS},
+    "gap_ms": {"128_216": (0, 6), "63_344": (0, 6), "63_216": (0, 6), "128_63_s130816": (0, 10)},
     #                                P0-GAP: (low, high) host gap = H steady median - device busy (ms per step)
-    "recap_ms": "TBD",             # P0-RECAP: (low, high) T period of a later re-capture step (not the first), ms
-    "recap_gc_share": "TBD",       # P0-RECAP-GC: (low, high) gc time / period of a later re-capture step
-    "sel_extra_ms": {k: "TBD" for k in _CELL_KEYS},
+    "recap_ms": (4500, 7500),      # P0-RECAP: (low, high) T period of a later re-capture step (not the first), ms
+    "recap_gc_share": (0.5, 1.0),  # P0-RECAP-GC: hypothesis: gc dominates a re-capture
+    "sel_extra_ms": {"128_216": (2, 10), "63_344": (3, 15), "63_216": (2, 10), "128_63_s130816": (5, 40)},
     #                                P0-SEL: (low, high) extra selection of a round, joint (R rows - 1 row), ms per step
-    "ceil_speedup": {k: "TBD" for k in _CELL_KEYS},
+    "ceil_speedup": {"128_216": (1.07, 1.2), "63_344": (1.6, 3.2), "63_216": (1.4, 2.6),
+                     "128_63_s130816": (1.02, 1.2)},
     #                                P0-CEIL: (low, high) max speedup of the draft, gather_only
 }
 CEILING_FORMULA = (
