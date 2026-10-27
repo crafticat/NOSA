@@ -235,7 +235,24 @@ INPUTS FOR THE BANDS (MODEL / INFERRED, not measured):
 | NIT: lru_cache keys of `_ev` | normalised |
 | NIT: truncate without host copy + commit with host copy gives a wrong mirror | refused (RollbackError) |
 
-## 9. Shell commands outside cat / grep / head / tail / ls / sort / cut / diff / git / wc (this task)
+## 9. CPU run sp_a6eb5dd_a (6 failed, 21 passed; regressions sp_a6eb5dd_b / _c green) and the fixes
+
+1. test_no_draft_row_reaches_host[L3-B1, L3-B8, L4-B1, L4-B8]: the L34 precondition (a block filled by a step that its
+   round does not keep) was empty. ROOT CAUSE (a runner bug that shows on a CPU device only): after the warm step,
+   `SpecRunner.run` set `self.pos_host = twins[0].pos.cpu()`; on a CPU device `Tensor.cpu()` returns the SAME tensor, so
+   the host mirror followed the live twin counter for the whole of round 0 (L3) / the L4 prelude. The edge filter
+   (`corrupt_before_edge`, applied after draft 0 ran) then saw position 4927 (offset 0, no forced reject), and the round
+   record stored the round-END position. Later rounds were right (their mirror comes from `torch.stack(...).cpu()`, a new
+   tensor). On the GPU `.cpu()` copies. FIX: `.cpu().clone()` (one line in spec_round.py). With S 4925 the first round
+   starts at 4926: the forced reject keeps m = 1 and the fill at 4927 (offset 1) is not kept, in every parametrization.
+2. test_truncate_then_commit_equals_reference[B1, B8]: the plant no_truncate_mark was not caught. ROOT CAUSE: in that
+   scenario (and in the L4 commit) every truncated request keeps 3 steps, more than its truncated step indices, so commit
+   never selects a truncated step again: the mark is never read there, and the plant cannot act. FIX (test only): the
+   commit scenario keeps its claim; a second scenario (truncate, 2 more steps, reject_all) needs the mark (keep count 0
+   is below every truncated step): claim = the snapshot back bit for bit and the next 3 steps equal; plant
+   no_truncate_mark there, precondition a SWAP / MOVE_OUT in a truncated step of a truncated request.
+
+## 10. Shell commands outside cat / grep / head / tail / ls / sort / cut / diff / git / wc (this task)
 
 - `git worktree add` (as instructed), `git merge --no-commit`, `git add`, `git commit -F` (messages written with the
   Write tool): git.

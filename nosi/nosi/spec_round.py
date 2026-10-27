@@ -665,7 +665,9 @@ class SpecRunner:
         self.clock.sync()
         t_wall = time.perf_counter()
         self._warm(self.warm_steps)
-        self.pos_host = self.rs.st.twins[0].pos.cpu()                    # a host sync (once, before the rounds)
+        # a host sync (once, before the rounds). clone(): on a CPU device .cpu() returns the SAME tensor, and the mirror
+        # must not follow the live twin counter (CPU job sp_a6eb5dd_a: round 0's filters and record read a moving pos)
+        self.pos_host = self.rs.st.twins[0].pos.cpu().clone()
         self.rs.st.pos_host.copy_(self.pos_host)
         if self.ops.level == "L4":
             ev = []

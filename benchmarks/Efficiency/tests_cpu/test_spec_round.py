@@ -321,6 +321,37 @@ def _truncate_run(S_list, neg=None):
     return ev
 
 
+def _truncate_reject_run(S_list, neg=None):
+    """World x: begin, 3 steps (the truncated ones read WRONG tokens), truncate(keep1), 2 more steps, then reject_all:
+    the snapshot before the group must come back bit for bit (the clock too). Here the TRUNCATE MARK matters: the final
+    keep count (0) is below every truncated step, so without the mark reject_all undoes those steps a second time. World
+    y never runs the group (the next steps must equal). Returns the evidence."""
+    (mx, x), (my, y) = RW.build(S_list), RW.build(S_list)
+    assert RW.diff(RW.state(x), RW.state(y)) == [], "precondition: two worlds of one seed differ before step 0"
+    rb = RR.Rollback(x, 6, capacity=RW.CAP, neg=neg)
+    B = len(S_list)
+    tok = RW.tokens(0, B)
+    dx, dy = RW.Driver(mx, x, S_list, tok), RW.Driver(my, y, S_list, tok)
+    dx.plain(W0)
+    dy.plain(W0)
+    snap = RW.state(x)
+    keep1 = torch.tensor([0, 3, 1, 2, 3, 1, 2, 0][:B], dtype=torch.int64)
+    rb.begin()
+    for u in range(3):
+        dx.step(u, wrong=(u >= keep1))
+    facts = RW.journal_facts(rb, keep1)                              # the truncated (request, step) pairs
+    pre = RW.state(x)
+    rb.truncate(keep1, keep1.clone())
+    for u in range(3, 5):
+        dx.step(u, wrong=torch.ones(B, dtype=torch.bool))
+    rb.reject_all()
+    ev = dict(diff=RW.diff(RW.state(x), snap), facts=facts, changed=RW.diff(pre, snap), stats=rb.stats())
+    if not ev["diff"]:
+        ev["after"] = [torch.equal(W.bits(dx.plain(1)[0]), W.bits(dy.plain(1)[0])) for _ in range(3)]
+        ev["diff_after"] = RW.diff(RW.state(x), RW.state(y))
+    return ev
+
+
 @pytest.mark.parametrize("S_list", [S1, S8], ids=["B1", "B8"])
 def test_truncate_then_commit_equals_reference(S_list):
     ev = _truncate_run(S_list)
@@ -332,9 +363,19 @@ def test_truncate_then_commit_equals_reference(S_list):
     if len(S_list) > 1:
         assert any(kept for _, _, kept in ev["fills"]) and any(not kept for _, _, kept in ev["fills"]), ev["fills"]
     assert sum(ev["stats"]["overflow"]) == 0 and ev["truncations"] == 1
-    p = _truncate_run(S_list, neg="no_truncate_mark")                # PLANT: commit undoes the truncated steps again
-    assert p["facts"]["swap"] + p["facts"]["move_out"] > 0, p["facts"]                            # precondition
-    assert p["diff"] != [] or p["bad_logits"] != [], "no_truncate_mark was not caught"           # CAUGHT
+    # THE TRUNCATE MARK. In the commit above (and in spec_round's L4 commit) every truncated request keeps 3 steps,
+    # more than its truncated step indices, so commit never selects a truncated step again: the mark cannot act there
+    # (CPU job sp_a6eb5dd_a: the plant no_truncate_mark gave no difference). It acts when a later commit's keep count is
+    # at or below a truncated step: truncate, more steps, then reject_all.
+    ev = _truncate_reject_run(S_list)
+    assert ev["diff"] == [], ev["diff"][:5]                           # the snapshot, bit for bit (the clock too)
+    assert all(ev["after"]) and ev["diff_after"] == [], ev["diff_after"][:5]
+    assert RW.in_family(ev["changed"], "slots") and RW.in_family(ev["changed"], "twin"), ev["changed"][:5]
+    assert sum(ev["stats"]["overflow"]) == 0
+    p = _truncate_reject_run(S_list, neg="no_truncate_mark")         # PLANT: reject_all undoes truncated steps again
+    assert p["facts"]["swap"] + p["facts"]["move_out"] > 0, p["facts"]    # precondition (L34): a truncated step of a
+    #                                                                       truncated request swapped / parked a block
+    assert p["diff"] != [], "no_truncate_mark was not caught"         # CAUGHT
 
 
 # ------------------------------------------------------------------ FAST
