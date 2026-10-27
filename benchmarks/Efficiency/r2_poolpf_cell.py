@@ -60,17 +60,21 @@ RG = BC.RG
 SCHEDULE = "SH,PF0,BG64,BG192,CP,CP,BG192,BG64,PF0,SH"
 # REGISTERED PREDICTIONS of pf1. TBD: the lead writes each band (low, high) and PRED_STAMP (from `date -u`, L33) BEFORE
 # any run. A band left None gives the verdict REPORT. r2_poolpf_step.sh STOPS while PRED_STAMP is None.
-PRED_STAMP = None
+# STAMP by the lead. BASIS: sustained harness (EVIDENCE_q3_q5_q6.md): native packer 1 thread +0.96 % at 64 MiB,
+# 4-8 threads +1.22 % at 64 MiB and +3.30-3.43 % at 192 MiB and keeps up; copy-engine kappa 0.006-0.05; mb1 gather
+# 7.6 ms per step (0.24 ms per layer). CP puts pack + copy on the critical path, so it is expected to LOSE to the GPU
+# gather for the step's own misses; its purpose is the paper 4.4 A/B, not a speed-up.
+PRED_STAMP = "2026-10-27T16:37:16Z"
 PRED_PF = {
-    "PF-HOOK": None,       # PF0 / SH steady median step (the hooks' cost, no load)
-    "PF-BG64": None,       # BG64 / SH steady median step (interference of 64 MiB per step of CPU packing)
-    "PF-BG192": None,      # BG192 / SH steady median step
-    "PF-CP": None,         # CP / SH steady median step (cpupack on the critical path)
-    "PF-DLV64": None,      # BG64 delivery, median ms (issue to arrival)
-    "PF-DLV192": None,     # BG192 delivery, median ms
-    "PF-KEEP192": None,    # BG192 backlog growth per segment (jobs, last sample - first sample)
-    "PF-CORES192": None,   # BG192 cores minus SH cores (rusage)
-    "PF-CPFETCH": None,    # CP fetch per layer, median device ms
+    "PF-HOOK": (0.99, 1.03),       # PF0 / SH steady median step (the hooks' cost, no load)
+    "PF-BG64": (1.0, 1.04),        # BG64 / SH steady median step (interference of 64 MiB per step of CPU packing)
+    "PF-BG192": (1.01, 1.06),      # BG192 / SH steady median step
+    "PF-CP": (1.0, 1.5),           # CP / SH steady median step (cpupack on the critical path); central 1.15
+    "PF-DLV64": (3.0, 20.0),       # BG64 delivery, median ms (issue to arrival)
+    "PF-DLV192": (9.0, 45.0),      # BG192 delivery, median ms
+    "PF-KEEP192": (-2, 2),         # BG192 backlog growth per segment (jobs, last sample - first sample)
+    "PF-CORES192": (0.5, 8.0),     # BG192 cores minus SH cores (rusage)
+    "PF-CPFETCH": (0.1, 2.0),      # CP fetch per layer, median device ms
 }
 RATIO_KEYS = (("PF-HOOK", "PF0"), ("PF-BG64", "BG64"), ("PF-BG192", "BG192"), ("PF-CP", "CP"))
 
