@@ -246,6 +246,60 @@ same world.
 Commands of this pass outside cat / grep / head / tail / ls / sort / cut / diff / git / wc: none (shell builtin `cd`
 only). No sed.
 
+## 12. FIX 3 (GPU job 2195574, at 73e16d5: gs0 exit 0, gs1 exit 1 with CUDA out of memory)
+
+Records: `/mnt/beegfs/ojerbi/r2-runs/gstep/gstep_h2_2195574_gs1` (+ `.step`), `gstep_h2p_2195574_gs0` (+ `.step`).
+
+WHAT THE RECORD SHOWS (MEASURED):
+- gs0 (B 16, 320 steps) passed every MUST gate: GS-EQ (0 digest and 0 argmax mismatches), GS-STATE, PRESTATE-EQ,
+  GS-PTR, GS-CAP (59 of 59 graphs, 2.13 s). So the graph step is bitwise correct at B 16; the gs1 failure is memory.
+- gs1 arm sh passed: steady 64.376 ms, peak allocated 83.251 GB, peak reserved 83.907 GB, device used at its end
+  84.686 GB. mb1 (job 2190876, the same cell without the instrumentation) peaked at 82.042 GB.
+- gs1 arm gs: the prefill finished (09:17), then `RuntimeError: CUDA error: out of memory` in
+  `g.capture_end()` (graph_step.py capture_all; torch/cuda/graphs.py:84). That is a CUDA DRIVER error inside end
+  capture / `cudaGraphInstantiate`, not the caching allocator's "Tried to allocate". The record does not say which
+  of the 95 graphs failed (no per-capture log): a gap that this fix closes.
+
+ROOT CAUSE (INFERRED from the record and the code):
+1. An instantiated graph lives in DRIVER memory, outside PyTorch's allocator. PyTorch does not give its cached blocks
+   back for it.
+2. After the graph arm's own prefill, PyTorch keeps the prefill's freed transient blocks cached (the prefill peak is
+   about 4 GB above the decode working set). My raw capture path skipped the release that `torch.cuda.graph` does on
+   entry ("free as much memory as we can for the graph": synchronize, gc.collect, empty_cache) and nothing else
+   released it. So the device had about 0.4 GB free (the sh arm ended at 84.69 GB used of about 85.1 GB) when the
+   driver had to instantiate graph after graph. The shared private pool itself got memory: on a failed cudaMalloc
+   PyTorch frees its own cache and retries; the driver does not.
+3. My state digest made it worse: `sum(dtype=int64)` of an int16 view first makes a FULL int64 copy (ATen
+   `make_reduction`: `self.to(in_dtype)`), 3.65 GB for one `_k_gpu` at B 216. That transient is the likely reason
+   why the gs1 sh arm peaked at 83.25 GB against mb1's 82.04 GB, and in the graph arm the freed copy stayed cached
+   too.
+Not the cause: two arms alive at once (`BC.free()` = gc + empty_cache runs before each arm, and the sh cache is
+freed at the end of its arm); separate pools per bucket (all graphs already share one `graph_pool_handle`).
+
+FIX (existing tools only, no kernel):
+- `GraphStep.capture_all`: ONE release (gc.collect + synchronize + empty_cache) before the first capture, outside
+  the timed loop (about 0.2 s once instead of 95 times inside `torch.cuda.graph`).
+- `bits_sum` sums in chunks of 2^24 elements (an int64 temporary of at most 128 MB).
+- `GraphStep.export` frees each layer's padded key table right after its contiguous copy (+0.11 GB, not +3.56 GB),
+  and refuses a second export or a later step.
+- Memory per phase, printed AS IT HAPPENS and kept when an arm raises: arm_start, prefill, pre_state, graphstep_init,
+  before_release, after_release, one record per captured graph (graph index, kind, first step, ms), capture_failed
+  (which graph), loop_end, export, state_digest, arm_failed. Each record: allocated, reserved, the peaks since the
+  previous record, device free / total (`cudaMemGetInfo`, which sees the instantiated graphs).
+- New MUST gate GS-MEM: the graph arm finished, no capture failed, and every phase from the release on left at least
+  `MEM_FLOOR_GB` = 0.25 GB device free. Its detail prints every phase and the per-graph free-memory drop, also when
+  the arm fails. SH-MEM reports the eager arm's phases. `r2_base_cell --graph-step` (mb1g) records the same capture
+  memory in its summary.
+
+Budget (INFERRED, to be checked by GS-MEM): after the release about 85.1 - 0.7 (context) - 79.2 (model + caches) =
+about 5 GB free for the shared pool, the graph executables and the loop's temporaries. gs0 suggests well under 1 GB
+for its 59 graphs. If GS-MEM shows less headroom than the 95 graphs need, the next steps are, in order: fold the cc
+kind into the plain graph with device-side selects (95 -> 71 graphs), the existing R2 Triton write-back for the 8 tail-fill graphs (13,824
+memcpy nodes each -> 32 kernel nodes), two processes in one job.
+
+Commands of this pass outside cat / grep / head / tail / ls / sort / cut / diff / git / wc: none (shell builtin `cd`
+only). No sed.
+
 ## 11. FIX 2 (CPU job gs_f6de8be_a: 18 passed, 2 skipped, 2 failed at f6de8be)
 
 Log: `/mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/gs_f6de8be_a.txt`. GS4 [6128-0] and [6136-0] (pool OFF) failed at the

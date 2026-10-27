@@ -38,6 +38,7 @@ steps. CPU mode (capture=False) runs the same body eagerly: the CPU tests compar
 """
 from __future__ import annotations
 
+import gc
 import time
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -226,6 +227,10 @@ class GraphStep:
         self.done = 0
         self.replays = 0
         self.eager_steps = 0
+        self.exported = False
+        self.mem_log: List[dict] = []      # capture_all's memory per phase (FIX 3), kept when a capture raises
+        self.log = None                    # an optional print function (the GPU cell sets it)
+        self.reset_peaks = False           # True: each record's peaks cover the time since the previous record
 
     # ------------------------------------------------------------------ the captured region
     def _body(self, key: StepKey):
@@ -376,10 +381,32 @@ class GraphStep:
                                 block_size=layer.block_size, local_blocks=layer.window_blocks,
                                 init_blocks=layer.init_blocks)
 
+    def mem_point(self, tag: str, **extra) -> dict:
+        """One memory record (GB): allocated, reserved, the peaks (since the previous record when reset_peaks, else
+        since the caller's last reset), the device free / total memory (cudaMemGetInfo: it sees the driver's own
+        allocations, e.g. the instantiated graphs). Host side; call it only outside a capture."""
+        free, total = torch.cuda.mem_get_info()
+        rec = dict(tag=tag, alloc_GB=round(torch.cuda.memory_allocated() / 1e9, 3),
+                   reserved_GB=round(torch.cuda.memory_reserved() / 1e9, 3),
+                   peak_alloc_GB=round(torch.cuda.max_memory_allocated() / 1e9, 3),
+                   peak_reserved_GB=round(torch.cuda.max_memory_reserved() / 1e9, 3),
+                   free_GB=round(free / 1e9, 3), total_GB=round(total / 1e9, 3), **extra)
+        if self.reset_peaks:
+            torch.cuda.reset_peak_memory_stats()
+        self.mem_log.append(rec)
+        if self.log is not None:
+            self.log("mem %s" % rec)
+        return rec
+
     def capture_all(self):
-        """Capture one graph per key of the steps >= warmup (capture_plan), all before the timed loop. Uses the raw
-        capture API on one side stream and one shared pool: no gc.collect() / empty_cache() per graph (the
-        torch.cuda.graph context runs both on entry; NOTES_graphstep.md section 3). Returns the total ms."""
+        """Capture one graph per key of the steps >= warmup (capture_plan), all before the timed loop, on one side
+        stream into ONE shared private pool (graph_pool_handle). It uses the raw capture API, so no gc.collect() /
+        empty_cache() per graph (the torch.cuda.graph context runs both on entry; NOTES_graphstep.md section 3).
+        FIX 3 (gs1 job 2195574: CUDA out of memory in capture_end, i.e. in cudaGraphInstantiate): the driver
+        allocates each instantiated graph OUTSIDE PyTorch's allocator, and PyTorch kept the prefill's freed blocks
+        cached (device free about 0.4 GB). So the free cached memory goes back to the driver ONCE here, before the
+        first capture (gc.collect + empty_cache, outside the timed loop). mem_log records the memory before and after
+        that release and after every capture. Returns the total ms."""
         if not self.capture:
             raise RuntimeError("graph_step: capture_all() with capture=False")
         if self.done < self.warmup:
@@ -387,32 +414,51 @@ class GraphStep:
         t_all = time.perf_counter()
         self.warm_pooling()
         torch.cuda.synchronize()
+        self.mem_point("before_release")
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        self.mem_point("after_release")
         if self.graph_pool is None:
             self.graph_pool = torch.cuda.graph_pool_handle()
+        plan = capture_plan(self.rows, self.warmup)
+        first = {}
+        for r in self.rows:
+            first.setdefault(r["key"], r["t"])
         with torch.inference_mode():
-            for key in capture_plan(self.rows, self.warmup):
+            for i, key in enumerate(plan):
                 if key in self.graphs:
                     continue
+                kind = "+".join(n for n, on in (("kc", key.kc), ("cc", key.cc), ("tf", key.tf)) if on) or "plain"
+                where = dict(graph=i + 1, of=len(plan), first_step=first[key], kind=kind)
                 t0 = time.perf_counter()
-                g = torch.cuda.CUDAGraph()
-                cur = torch.cuda.current_stream()
-                self.stream.wait_stream(cur)
-                with torch.cuda.stream(self.stream):
-                    g.capture_begin(pool=self.graph_pool)
-                    ok = False
-                    try:
-                        self._body(key)
-                        ok = True
-                    finally:
+                try:
+                    g = torch.cuda.CUDAGraph()
+                    cur = torch.cuda.current_stream()
+                    self.stream.wait_stream(cur)
+                    with torch.cuda.stream(self.stream):
+                        g.capture_begin(pool=self.graph_pool)
+                        ok = False
                         try:
-                            g.capture_end()
-                        except Exception:
-                            if ok:
-                                raise
-                cur.wait_stream(self.stream)
-                torch.cuda.synchronize()
+                            self._body(key)
+                            ok = True
+                        finally:
+                            try:
+                                g.capture_end()
+                            except Exception:
+                                if ok:
+                                    raise
+                    cur.wait_stream(self.stream)
+                    torch.cuda.synchronize()
+                except Exception:
+                    try:                               # the record names the failing graph; never masks the error
+                        self.mem_point("capture_failed", **where)
+                    except Exception:
+                        pass
+                    raise
                 self.graphs[key] = g
                 self.capture_ms[key] = (time.perf_counter() - t0) * 1e3
+                self.mem_point("capture", ms=round(self.capture_ms[key], 1), **where)
         torch.cuda.synchronize()
         return (time.perf_counter() - t_all) * 1e3
 
@@ -423,6 +469,8 @@ class GraphStep:
             raise RuntimeError("graph_step: step %d out of order (next is %d)" % (t, self.done))
         if t >= self.steps:
             raise RuntimeError("graph_step: step %d beyond the planned %d steps" % (t, self.steps))
+        if self.exported:
+            raise RuntimeError("graph_step: step after export(); the graphs read the freed padded key tables")
         key = self.keys[t]
         with torch.inference_mode():
             self.ids.copy_(tok)
@@ -444,7 +492,10 @@ class GraphStep:
     def export(self, done: Optional[int] = None):
         """Write the shipped host state after `done` steps (default: the steps run) into the cache: counters, the
         contiguous compressed keys, the unshifted pool ages and the stamp. Afterwards the shipped eager step can
-        continue on this cache."""
+        continue on this cache; this GraphStep cannot (call it once). FIX 3: each layer's padded key table is freed
+        right after its contiguous copy, so the copy costs one layer's table (about 0.11 GB at B 216), not 32."""
+        if self.exported:
+            raise RuntimeError("graph_step: export() runs once")
         done = self.done if done is None else int(done)
         _, end = plan_steps(steps=done, **self.host0)
         with torch.inference_mode():
@@ -464,6 +515,8 @@ class GraphStep:
                     # decode_update_has_kv_bias (:175), which never touches it: it stays at its value (:140).
                     e._pool_stamp_base = end["stamp"]
                 L.compress_k_cache_varlen = self.ck[l][:, :end["m"]].contiguous()
+                self.ck[l] = None
+        self.exported = True
         if hasattr(self.cache, "_seen_tokens"):
             self.cache._seen_tokens += self.H * done   # InfLLMv2Cache.decode_update_kv adds key_states.shape[-2]
         return end

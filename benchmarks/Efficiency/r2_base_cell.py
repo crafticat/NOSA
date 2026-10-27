@@ -468,6 +468,7 @@ def run_graph_step(model, ids, steps: int, clock, warmup: int = 2):
     inputs = torch.empty((Bn, steps + 1), dtype=torch.int64, device="cuda")
     inputs[:, 0:1].copy_(tok)
     gs = GSM.GraphStep(model, cache, cu, steps, warmup=warmup, pos_dtype=pos.dtype)
+    gs.log = log                                         # capture_all prints its memory per graph (FIX 3)
     ev = [clock.event() for _ in range(steps + 1)]
     ev_w = clock.event()
     capture_ms, ptr0 = None, None
@@ -492,7 +493,8 @@ def run_graph_step(model, ids, steps: int, clock, warmup: int = 2):
         after = gs.state_pointers()
         moved = sorted(k for k in set(ptr0) | set(after) if ptr0.get(k) != after.get(k))
     rep = gs.report()
-    rep.update(capture_ms_total=(round(capture_ms, 1) if capture_ms is not None else None), pointers_changed=moved)
+    rep.update(capture_ms_total=(round(capture_ms, 1) if capture_ms is not None else None), pointers_changed=moved,
+               mem=gs.mem_log)
     gs.export()
     fr, tot = torch.cuda.mem_get_info()
     del gs, cache

@@ -24,7 +24,9 @@ boundary steps (torch.equal); the prefill digests; the final cache state (bit su
 layer, after graph_step.export) and the host counters.
 Before step 0 both arms give one value (define_undefined) to the memory the shipped prefill allocates and does not write.
 MUST gates: SH-RUN, GS-RUN, PREFILL-EQ (both prefills equal: else GS-EQ is meaningless), PRESTATE-EQ (both caches
-bitwise equal before step 0, the per-step scratch skipped), GS-EQ, GS-STATE, GS-PTR (no
+bitwise equal before step 0, the per-step scratch skipped), GS-MEM (FIX 3: the graph arm finished and every phase from
+the release before the captures on left >= MEM_FLOOR_GB device free; the memory of every phase is printed as it
+happens and in the gate, also when the arm fails), GS-EQ, GS-STATE, GS-PTR (no
 state pointer moves across the replays), GS-CAP (every planned graph captured before the timed loop, every later step
 a replay). REPORT: SH-P2 (the shipped re-warms), PROF (the profiler saw GPU ops in both arms), and the registered
 predictions PRED_GS: TBD by the lead before any run (UNREGISTERED while a value is None).
@@ -281,13 +283,23 @@ def digest_into(dst, lg, chunks: int):
     dst.copy_(x.view(x.shape[0], chunks, x.shape[1] // chunks).sum(dim=-1, dtype=torch.int64))
 
 
-def bits_sum(x):
+BITS_CHUNK = 1 << 24               # elements per partial sum: an int64 temporary of at most 128 MB
+
+
+def bits_sum(x, chunk=BITS_CHUNK):
+    """The int64 sum of x's bit patterns (a 0-d device tensor; no sync). FIX 3: in chunks, because sum(dtype=int64)
+    of an int16 / int32 tensor first makes a full int64 copy (ATen make_reduction: self.to(in_dtype)); for one
+    _k_gpu at B 216 that is 3.65 GB, and the gs1 job's sh arm peaked at 83.25 GB against mb1's 82.04 GB."""
     import torch
     if x.dtype in (torch.bfloat16, torch.float16):
         x = x.view(torch.int16)
     elif x.dtype == torch.float32:
         x = x.view(torch.int32)
-    return x.sum(dtype=torch.int64)
+    v = x.reshape(-1)
+    total = torch.zeros((), dtype=torch.int64, device=x.device)
+    for i in range(0, v.numel(), chunk):
+        total += v[i:i + chunk].sum(dtype=torch.int64)
+    return total
 
 
 def state_digest(cache, skip=()):
@@ -332,11 +344,68 @@ def profile_summary(path, nsteps: int):
                 classes=agg["classes"], top_names=agg["names"][:25], trace=os.path.basename(path) + ".gz")
 
 
-def decode_arm(model, ids, a, clock, mode: str, inputs=None, probe=None, out_dir=None):
+MEM_FLOOR_GB = 0.25                # GS-MEM: the least device free memory a graph-arm phase may leave
+
+
+def mem_point(memlog, tag, **extra):
+    """One memory record (GB) appended to memlog and printed at once (it survives a crash): allocated, reserved, the
+    peaks since the last record (the counters are reset after reading), the device free / total (cudaMemGetInfo:
+    it sees the driver's own allocations too, e.g. instantiated graphs). graph_step.GraphStep.mem_point writes the
+    same fields into the same list during capture_all."""
+    import torch
+    free, total = torch.cuda.mem_get_info()
+    rec = dict(tag=tag, alloc_GB=round(torch.cuda.memory_allocated() / 1e9, 3),
+               reserved_GB=round(torch.cuda.memory_reserved() / 1e9, 3),
+               peak_alloc_GB=round(torch.cuda.max_memory_allocated() / 1e9, 3),
+               peak_reserved_GB=round(torch.cuda.max_memory_reserved() / 1e9, 3),
+               free_GB=round(free / 1e9, 3), total_GB=round(total / 1e9, 3), **extra)
+    torch.cuda.reset_peak_memory_stats()
+    memlog.append(rec)
+    log("mem %s" % rec)
+    return rec
+
+
+def mem_table(memlog):
+    """The per-phase line of a memory log: every phase but the per-graph captures, which are summarised (count, the
+    free memory after the first and the last, the least free, the mean drop per graph) and the failing capture."""
+    caps = [p for p in memlog if p["tag"] == "capture"]
+    parts = ["%s alloc %.2f res %.2f peak %.2f free %.2f" % (p["tag"], p["alloc_GB"], p["reserved_GB"],
+                                                          p["peak_alloc_GB"], p["free_GB"])
+             for p in memlog if p["tag"] != "capture"]
+    if caps:
+        drop = (caps[0]["free_GB"] - caps[-1]["free_GB"]) / max(1, len(caps) - 1)
+        parts.append("captures %d: free %.2f -> %.2f (least %.2f, %.4f GB per graph after the first)" % (
+            len(caps), caps[0]["free_GB"], caps[-1]["free_GB"], min(p["free_GB"] for p in caps), drop))
+    bad = [p for p in memlog if p["tag"] == "capture_failed"]
+    if bad:
+        parts.append("FAILED at graph %s of %s (first step %s, kind %s)" % (
+            bad[0].get("graph"), bad[0].get("of"), bad[0].get("first_step"), bad[0].get("kind")))
+    return "; ".join(parts)
+
+
+def mem_gate(memlog, ran: bool, floor=MEM_FLOOR_GB):
+    """GS-MEM: (passed, detail). Passes when the arm ran, no capture failed, and every phase from the release before
+    the captures on (the captures, the timed loop, export, the digest: where the driver must find memory) left >=
+    floor GB free. The phases before the release hold the prefill's cached blocks and are reported only."""
+    if not memlog:
+        return False, "no memory record"
+    tags = [p["tag"] for p in memlog]
+    tail = memlog[tags.index("after_release"):] if "after_release" in tags else memlog
+    least = min(p["free_GB"] for p in tail)
+    failed = any(p["tag"] in ("capture_failed", "arm_failed") for p in memlog)
+    ok = ran and not failed and least >= floor
+    return ok, "least device free from the release on %.3f GB (floor %.2f), arm %s: %s" % (
+        least, floor, "ran" if ran else "DID NOT FINISH", mem_table(memlog))
+
+
+def decode_arm(model, ids, a, clock, mode: str, inputs=None, probe=None, out_dir=None, memlog=None):
     """One arm (module docstring). mode 'eager' = run_shipped's loop; 'graph' = run_graph_step's loop. inputs (B,
-    steps + 1) = the first arm's tokens (teacher forcing) or None (free-running)."""
+    steps + 1) = the first arm's tokens (teacher forcing) or None (free-running). memlog: the list that receives the
+    memory record of every phase (the caller keeps it when the arm raises)."""
     import torch
     from nosi.cache_engine import InfLLMv2Cache
+    memlog = [] if memlog is None else memlog
+    mem_point(memlog, "arm_start")
     steps, Bn = a.steps, ids.shape[0]
     cfg = model.config
     cache = InfLLMv2Cache(config=cfg, num_hidden_layers=cfg.num_hidden_layers, has_kv_bias=True)
@@ -347,8 +416,10 @@ def decode_arm(model, ids, a, clock, mode: str, inputs=None, probe=None, out_dir
     logits, pos = model.batch_prefill(ids, cache)
     clock.sync()
     prefill_s = time.time() - t0
+    mem_point(memlog, "prefill")
     define_undefined(cache)                               # FIX 1: both arms, before step 0 (not timed)
     pre_state = state_digest(cache, skip=SCRATCH)         # PRESTATE-EQ: the two arms' caches before step 0
+    mem_point(memlog, "pre_state")
     V = logits.shape[-1]
     C = DIGEST_CHUNKS if V % DIGEST_CHUNKS == 0 else 1
     pre = torch.zeros((Bn, C), dtype=torch.int64, device="cuda")
@@ -371,6 +442,8 @@ def decode_arm(model, ids, a, clock, mode: str, inputs=None, probe=None, out_dir
     if mode == "graph":
         from nosi import graph_step as GSM
         gs = GSM.GraphStep(model, cache, cu, steps, warmup=a.warmup, pos_dtype=pos.dtype)
+        gs.mem_log, gs.log, gs.reset_peaks = memlog, log, True   # capture_all records into the same list, at once
+        mem_point(memlog, "graphstep_init")
     else:
         model.has_buffers = False
     warm, rewarms = None, []
@@ -413,6 +486,7 @@ def decode_arm(model, ids, a, clock, mode: str, inputs=None, probe=None, out_dir
             prof.stop()
     clock.record(ev[steps])
     clock.sync()
+    mem_point(memlog, "loop_end")
     periods = [clock.elapsed(ev[t], ev[t + 1]) for t in range(steps)]
     if capture_ms is not None:
         periods[gs.warmup - 1] = clock.elapsed(ev[gs.warmup - 1], ev_w)
@@ -433,12 +507,14 @@ def decode_arm(model, ids, a, clock, mode: str, inputs=None, probe=None, out_dir
                    pointers_changed=moved)
         gs.export()
         del gs
+        mem_point(memlog, "export")
     state = state_digest(cache)
-    fr, tot = torch.cuda.mem_get_info()
+    end = mem_point(memlog, "state_digest")
     res = dict(mode=mode, prefill_s=round(prefill_s, 1), periods=periods, rewarms=rewarms, prefill_digest=pre.cpu(),
                tokens=own.cpu(), digests=dig.cpu(), rows=rows.cpu(), keep_steps=keep, state=state,
-               pre_state=pre_state, graph_step=gsr,
-               capture_ms=capture_ms, profile=prof_res, device_used_end_GB=round((tot - fr) / 1e9, 3), inputs=own)
+               pre_state=pre_state, graph_step=gsr, mem=memlog,
+               capture_ms=capture_ms, profile=prof_res,
+               device_used_end_GB=round(end["total_GB"] - end["free_GB"], 3), inputs=own)
     del cache
     return res
 
@@ -505,19 +581,21 @@ def main(argv=None) -> int:
     model = Llama(model_name=a.model, device="cuda", offload=True)
     log("model loaded in %.0f s" % (time.time() - t0))
     expected = BC.expected_rewarms(S0, a.steps)
-    gates, arms, probe, first = [], {}, Probe(), None
+    gates, arms, probe, first, mems = [], {}, Probe(), None, {}
     with torch.inference_mode():
         for name in a.order.split(","):
             mode = "eager" if name == "sh" else "graph"
-            BC.free()
+            BC.free()                                    # gc + empty_cache: the other arm's blocks go back first
             log("arm %s (%s, B %d, %d steps%s)" % (name, mode, a.batch, a.steps,
                                                    ", teacher-forced" if first is not None else ""))
+            mems[name] = []
             try:
                 if mode == "eager":
                     probe.install()
                 res = decode_arm(model, ids, a, clock, mode, inputs=(first["inputs"] if first else None),
-                                 probe=(probe if mode == "eager" else None), out_dir=a.out)
-                res["gpu_peak_alloc_GB"], res["gpu_peak_reserved_GB"] = BC.gpu_peak()
+                                 probe=(probe if mode == "eager" else None), out_dir=a.out, memlog=mems[name])
+                res["gpu_peak_alloc_GB"] = max(p["peak_alloc_GB"] for p in mems[name])
+                res["gpu_peak_reserved_GB"] = max(p["peak_reserved_GB"] for p in mems[name])
                 arms[name] = res
                 gates.append(("%s-RUN" % name.upper(), True, True, "%d steps (%s)" % (a.steps, mode)))
                 if first is None:
@@ -526,9 +604,17 @@ def main(argv=None) -> int:
                 traceback.print_exc()
                 gates.append(("%s-RUN" % name.upper(), True, False, "EXCEPTION %s: %s" % (type(e).__name__,
                                                                                        str(e)[:300])))
+                try:                                     # the memory at the failure (never masks the error)
+                    mem_point(mems[name], "arm_failed", error=type(e).__name__)
+                except Exception:
+                    pass
             finally:
                 probe.remove()
             BC.free(host=True)
+            if mode == "graph":                          # GS-MEM: printed whether the arm finished or not
+                gates.append(("GS-MEM", True) + mem_gate(mems[name], name in arms))
+            else:
+                gates.append(("SH-MEM", False, True, mem_table(mems[name])))
             if name not in arms:
                 break                                    # the second arm needs the first arm's tokens
     summ = {n: arm_summary(n, r, a, probe.rows if n == "sh" else None) for n, r in arms.items()}
@@ -592,13 +678,14 @@ def main(argv=None) -> int:
                 keep_rows=KEEP_ROWS, boundary_steps=boundary_steps(a.steps), predictions=PRED_GS,
                 nosi_commit=os.environ.get("BASE_COMMIT", "unknown"), torch=torch.__version__,
                 gpu=torch.cuda.get_device_name(0), graph_enter_source=graph_enter_source())
-    out = dict(meta=meta, arms=summ, compare=cmp_, ratios=res,
+    out = dict(meta=meta, arms=summ, compare=cmp_, ratios=res, mem=mems,
                gates=[dict(name=g[0], must=g[1], passed=bool(g[2]), detail=g[3]) for g in gates],
                predictions=[dict(name=p[0], verdict=p[1], detail=p[2]) for p in preds])
     with open(os.path.join(a.out, "summary.json"), "w") as f:
         json.dump(out, f, indent=1, sort_keys=True, default=str)
     for g in gates:
-        print("GATE %s %s: %s" % (g[0], "PASS" if g[2] else ("FAIL" if g[1] else "REPORT"), g[3][:400]))
+        lim = 3000 if g[0].endswith("-MEM") else 400
+        print("GATE %s %s: %s" % (g[0], "PASS" if g[2] else ("FAIL" if g[1] else "REPORT"), g[3][:lim]))
     for p in preds:
         print("PREDICTION %s %s: %s" % p)
     for n, s in summ.items():

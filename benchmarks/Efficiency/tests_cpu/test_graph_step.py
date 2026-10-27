@@ -35,7 +35,8 @@ GS5 test_negative_controls_are_caught: three planted defects, each with its prec
 GS6 test_age_frame_roundtrip: shift_in / shift_out invert each other across steps and keep the age order.
 GS7 test_cell_pure_parts: r2_graphstep_cell's argument rules, boundary / steady / special steps, the launch count, the
     arm comparison on planted differences (the state before step 0 too), the re-warm breakdown, the TBD verdicts, the
-    probe, and define_undefined writing exactly the unwritten regions.
+    probe, define_undefined writing exactly the unwritten regions, and (FIX 3) the chunked bit sum and the memory
+    table / GS-MEM gate on synthetic records.
 GS8 test_step_script_cells: r2_graphstep_step.sh (static): its ROOT, cells and python arguments.
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider benchmarks/Efficiency/tests_cpu/test_graph_step.py
@@ -753,6 +754,9 @@ def test_GS4_graph_safe_step_equals_shipped(W, S, pool):
             assert not hasattr(b.cache_engine, "_pool_age")
     assert res["c_sh"]._seen_tokens == res["c_tw"]._seen_tokens
     assert end["seq"] == S + steps
+    assert gs.exported and all(c is None for c in gs.ck)            # FIX 3: the padded tables are freed by export
+    with pytest.raises(RuntimeError):
+        gs.export()                                                 # once only (it adds to _seen_tokens)
 
 
 # ------------------------------------------------------------------ GS5
@@ -863,6 +867,29 @@ def test_GS7_cell_pure_parts():
     assert bool((L.tail_cis[:, :, :17] == 0).all()) and bool((L.tail_cis[:, :, 17:] == 9).all())
     assert bool((L.total_cis[:, :10] == 0).all()) and bool((L.total_cis[:, 10:] == 9).all())
     assert GC.SCRATCH == ("_new_block_map_buf", "_load_mask") and GC.UNDEFINED_FILL == 4096.0
+    # FIX 3: the chunked bit sum equals the one-shot sum (bf16, fp32, int64; a chunk that does not divide the size)
+    g2 = torch.Generator().manual_seed(3)
+    for x in (torch.randn((5, 7, 3), generator=g2).to(torch.bfloat16), torch.randn((4, 9), generator=g2),
+              torch.randint(-50, 50, (11, 3), generator=g2)):
+        ref = (x.view(torch.int16) if x.dtype == torch.bfloat16 else
+               x.view(torch.int32) if x.dtype == torch.float32 else x).to(torch.int64).sum()
+        assert int(GC.bits_sum(x, chunk=8)) == int(ref) == int(GC.bits_sum(x))
+    # FIX 3: the memory table and gate on synthetic records (the phases, the per-graph drop, the failing graph)
+    def rec(tag, free, **k):
+        return dict(tag=tag, alloc_GB=1.0, reserved_GB=2.0, peak_alloc_GB=3.0, peak_reserved_GB=3.5, free_GB=free,
+                    total_GB=85.0, **k)
+    ok_log = [rec("arm_start", 50.0), rec("prefill", 0.3), rec("after_release", 5.0),
+              rec("capture", 4.9, graph=1, of=3), rec("capture", 4.7, graph=2, of=3), rec("capture", 4.5, graph=3, of=3),
+              rec("loop_end", 4.2)]
+    ok, detail = GC.mem_gate(ok_log, True)
+    assert ok and "captures 3: free 4.90 -> 4.50" in detail and "0.2000 GB per graph" in detail, detail
+    assert "prefill alloc 1.00" in detail                           # the phase before the release is reported ...
+    assert not GC.mem_gate(ok_log, False)[0]                        # ... an arm that did not finish fails
+    bad = ok_log[:4] + [rec("capture_failed", 0.1, graph=2, of=3, first_step=17, kind="kc")]
+    ok, detail = GC.mem_gate(bad, False)
+    assert not ok and "FAILED at graph 2 of 3 (first step 17, kind kc)" in detail, detail
+    assert not GC.mem_gate(ok_log[:-1] + [rec("loop_end", 0.1)], True)[0]   # below the floor after the release
+    assert not GC.mem_gate([], True)[0]
     br = GC.rewarm_breakdown([100.0, 6000.0], [(1, "out_len")], {1: dict(gc_ms=3000.0, empty_cache_ms=1500.0,
                                                                          sync_ms=500.0, n_gc=32)})
     assert br[0]["other_ms"] == 1000.0 and br[0]["hostcall_share"] == round(5000 / 6000, 4) and br[0]["n_gc"] == 32
