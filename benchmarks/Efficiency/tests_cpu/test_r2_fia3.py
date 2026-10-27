@@ -630,7 +630,9 @@ def test_FC15_pred3_is_registered_in_the_notes():
     low, high] with low <= central <= high; the FP0 / P band is the plan's (0.75 in [0.45, 1.3]); the thresholds are
     the plan's rule (0.8, 1 ms, 32 layers, 3x)."""
     doc = (ROOT / "docs/NOTES_fia3.md").read_text()
-    assert "REGISTERED <TBD-for-lead-stamp>" in doc
+    stamp = re.search(r"^REGISTERED (<TBD-for-lead-stamp>|\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ \(lead stamp)", doc, re.M)
+    assert stamp, "no REGISTERED line (TBD marker or the lead's stamp) in the notes"
+    assert M.PRED3["registered"].startswith("REGISTERED " + stamp.group(1)[:20])
     m = re.search(r"<!-- PRED3-BEGIN -->\s*```json\s*(.*?)```\s*<!-- PRED3-END -->", doc, flags=re.S)
     assert m, "no PRED3 block in the notes"
     assert json.loads(m.group(1)) == json.loads(json.dumps(M.PRED3))

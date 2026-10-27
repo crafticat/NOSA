@@ -340,7 +340,7 @@ PRED = {
 # (section 7, "Predictions (MODEL, to register)"); the survey gives intervals only for the byte ratios, so their
 # central value is the interval midpoint (a builder choice).
 PRED3 = {
-    "registered": "REGISTERED <TBD-for-lead-stamp>",
+    "registered": "REGISTERED 2026-10-27T16:35:45Z (lead stamp, before any run)",
     "source": "PLAN_speckv_on_cached_nosa.md Task 0.3; SURVEY_shared_kv_kernel.md section 7",
     "fp0_over_p_device": {"216x4": [0.75, 0.45, 1.3], "216x4s1": [0.75, 0.45, 1.3]},
     "fp0_dram_read_over_union": [1.05, 1.0, 1.1],
