@@ -134,7 +134,11 @@ RAGGED_ARMS = (("RG", 1), ("RGS", None))               # (arm, spread); None = -
 # RB_step_ratio: (low, high) of RBS's median tentative step / RBR's median step; RB_commit_ms: (low, high) of the
 # median commit per group in ms; RB_overflow_zero: True / False (no lost slot that HELD A BLOCK past
 # --rb-journal-blocks; empty slots past it are counted apart: the first decode step has 63 per (head, request)).
-PRED_ROLLBACK = dict(stamp=None, RB_bitwise=None, RB_step_ratio=None, RB_commit_ms=None, RB_overflow_zero=None)
+# Lead registration 2026-10-27T18:12:28Z (basis: docs/NOTES_rollback.md section 4): kept rows bitwise; tentative step
+# central 1.15x the reference (about 1,400 extra launches, partly hidden by a device-bound step); commit central 30 ms
+# per group (about 3,800 launches, host-bound); no lost live slot at 256 journal slots (1.6x the mean load).
+PRED_ROLLBACK = dict(stamp="2026-10-27T18:12:28Z", RB_bitwise=True, RB_step_ratio=(1.0, 1.4), RB_commit_ms=(5.0, 60.0),
+                     RB_overflow_zero=True)
 ROLLBACK_ARMS = ("RBR", "RBS")                         # the reference first (its prefill and steps carry no hook)
 
 
