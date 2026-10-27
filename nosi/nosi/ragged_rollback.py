@@ -70,8 +70,9 @@ bytes of pool slot q, which the pool map after the step marks EMPTY. An empty sl
 (pool_update_kernel.cu:32-34), so a later step of the same group can MOVE_OUT another block into q; past N, q's old
 bytes then counted as overflow_dead (no save, no fallback), and the undo left q (or the window slot that the next undo
 filled from q) NAMED with the bytes of another block. A MOVE_IN needs an empty window slot (Y = -1), and inside a group
-only a draft's skip (spec_round.DraftResident: map entry -1) makes one: GPU cell sp3b (journal saturated, EXACT arms
-off SH's tokens from column 1), CPU test test_spec_round.py::test_tiny_journal_equals_shipped, negative control
+only a draft's skip (the resident-only draft step: map entry -1) makes one: GPU cell sp3b (journal saturated, EXACT
+arms off SH's tokens from column 1), CPU test test_tiny_journal_equals_shipped (the speculative-round tests), negative
+control
 undo_move_in_none (the old table).
 
 CLOCK. _pool_stamp_base is a per-layer step clock (pool_update_kernel.cu:37-43: stamps stamp_base + m, compared inside
