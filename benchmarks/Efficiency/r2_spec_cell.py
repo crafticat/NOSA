@@ -66,8 +66,12 @@ PHASES = {"L3": ("draft", "verify", "commit"), "L4": ("joint", "truncate", "draf
 #   L4F_vs_L3      (low, high): L4F's median steady committed tok/s / L3's (the plan's L4 gate: "faster than L3")
 # Inputs for the bands (SCORING_dr1.md): at C 128 B 216 the draft step is 0.947 SH and the ceiling of speculation is
 # about +4 %; at C 73 B 318 dr73 (registered 0.80 [0.60, 0.95]) is pending.
-PRED_SPEC = dict(stamp=None, L3_tok=None, L4X_tok=None, L4F_agree=None, L3_ratio=None, L4X_ratio=None,
-                 L4F_ratio=None, accept=None, L4F_vs_L3=None)
+# Lead registration 2026-10-27T20:08:53Z. Basis: dr1 (draft 0.947 SH), vr1 MEASURED (VRC joint pass 4.144 SH steps,
+# VRF FAST 6.300), the builder's round model (docs/NOTES_spec.md section 6) with vr1's measured joint pass: L4F round
+# about 404 + 30 + 120 + 60 = 614 ms for at most 3 tokens vs SH 191 ms -> about 0.31. Both cells use these bands; the
+# expectation is that NO arm beats SH (the plan's stop rule at C 128 B 216; sp3b is the small-cache test).
+PRED_SPEC = dict(stamp="2026-10-27T20:08:53Z", L3_tok=True, L4X_tok=True, L4F_agree=0.99, L3_ratio=(0.3, 0.5),
+                 L4X_ratio=(0.2, 0.45), L4F_ratio=(0.2, 0.5), accept=(0.97, 1.0), L4F_vs_L3=(0.6, 1.2))
 
 
 def log(msg):
