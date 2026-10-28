@@ -128,12 +128,14 @@ def test_flags_off_is_shipped(S_list):
         r = subprocess.run(["git", "-C", str(ROOT), "diff", "--stat", INTEG_BASE, "--", "nosi/nosi", "dependencies",
                             ":(exclude)nosi/nosi/spec_round.py", ":(exclude)nosi/nosi/ragged_rollback.py",
                             ":(exclude)nosi/nosi/spec_prefetch.py",  # rung L5 (Gate 0: test_spec_prefetch.py)
+                            ":(exclude)nosi/nosi/spec_tentative.py", # WS-A (Gate 0: test_wsa.py)
                             ":(exclude)nosi/nosi/verify_rows.py", ":(exclude,glob)**/__pycache__/**"],
                            capture_output=True, text=True)
         assert r.returncode == 0 and r.stdout.strip() == "", "engine sources differ from %s:\n%s" % (INTEG_BASE,
                                                                                                     r.stdout)
     src = {p.name: p.read_text() for p in (ROOT / "nosi/nosi").glob("*.py")}
     assert "spec_round.py" in src
+    src.pop("spec_tentative.py", None)        # WS-A: spec_tentative imports spec_round (opt-in; Gate 0: test_wsa.py)
     assert [n for n, t in src.items() if "spec_round" in t and n != "spec_round.py"] == []
     for f in ("r2_base_cell.py", "r2_verify_cell.py", "r2_poolpf_cell.py"):
         assert "spec_round" not in (EFF / f).read_text(), f

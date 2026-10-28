@@ -124,6 +124,7 @@ def test_flag_off_is_shipped(S_list):
                             ":(exclude)nosi/nosi/verify_rows.py", ":(exclude)nosi/nosi/cache_engine.py",
                             ":(exclude)nosi/nosi/pool_prefetch.py", ":(exclude)nosi/nosi/r2_transport_gilfree_v3.py",
                             ":(exclude)nosi/nosi/spec_prefetch.py",  # rung L5 (Gate 0: test_spec_prefetch.py)
+                            ":(exclude)nosi/nosi/spec_tentative.py", # WS-A (Gate 0: test_wsa.py)
                             ":(exclude)nosi/nosi/spec_round.py", ":(exclude,glob)**/__pycache__/**"],
                            capture_output=True, text=True)
         assert r.returncode == 0 and r.stdout.strip() == "", "the engine sources differ from %s:\n%s" % (BASE, r.stdout)

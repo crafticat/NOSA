@@ -67,6 +67,10 @@ DECLARED = ("nosi/nosi/spec_round.py", "nosi/nosi/spec_prefetch.py", "benchmarks
             "docs/NOTES_spec5.md")
 GATE0_TESTS = ("benchmarks/Efficiency/tests_cpu/test_ragged_engine.py", "benchmarks/Efficiency/tests_cpu/test_verify_rows.py",
                "benchmarks/Efficiency/tests_cpu/test_rollback.py", "benchmarks/Efficiency/tests_cpu/test_spec_round.py")
+DECLARED = DECLARED + ("nosi/nosi/spec_tentative.py",                        # WS-A (spec_tentative; Gate 0: test_wsa.py)
+                       "benchmarks/Efficiency/r2_wsa_cell.py", "benchmarks/Efficiency/r2_wsa_step.sh",   # spec_tentative
+                       "benchmarks/Efficiency/tests_cpu/wsa_world.py", "docs/NOTES_wsa.md",            # spec_tentative
+                       "benchmarks/Efficiency/tests_cpu/test_wsa.py")                                  # spec_tentative
 
 
 def _load(name):
@@ -190,6 +194,7 @@ def test_flags_off_is_specp(B, tmp_path):
     for f in GATE0_TESTS:                                     # their exclude lists only: one added line each
         d = _git("diff", "-U0", SPECP, "--", f).stdout.splitlines()
         body = [x for x in d if x[:1] in "+-" and not x.startswith(("+++", "---"))]
+        body = [x for x in body if not (x.startswith("+") and "spec_tentative" in x)]   # WS-A (spec_tentative) lines
         assert body and all(x.startswith("+") and "spec_prefetch" in x for x in body), (f, body[:5])
     # (b) spec_round.py = a6c9d10's AST + the guarded seams
     old = _git("show", "%s:nosi/nosi/spec_round.py" % SPECP).stdout
