@@ -64,10 +64,18 @@ STRESS_STORE = 3                   # STRESS: a (head, request) listed more store
 #   ratio_vs_l4xu    L4XF's / L4XU's median steady committed tok/s
 #   ratio_vs_sh      L4XF's median steady committed tok/s / SH's steady tok/s
 # The builder's INFERENCE (docs/NOTES_wsc.md section 7, with the arithmetic) is an input for the lead, not a registration.
-PRED_STAMP_WSC = None
+# The lead's REGISTRATION (2026-10-28T12:59:25Z, `date -u`, before any WS-C cell ran): the builder's bands (NOTES_wsc.md
+# section 7), checked against the lead's WS-B bands (r2_wsb_cell.PRED_WSB, 1a8ce68: L4XU / SH (0.27, 0.41) / (0.31,
+# 0.50)): L4XU / SH x L4XF / L4XU gives about 0.28-0.47 / 0.32-0.56, which contains these ratio_vs_sh bands. MEASURED basis
+# of the saving: SCORING_fia6.md (FV6 complete layer 1.26 ms at 216x4 against the shipped call's 0.61 ms x R; the union
+# store calls, merge and empty spill fills of WS-B removed). RISK registered with it: at C 128 B 216 the arena + store
+# leave about 0.5 GB of the card (NOTES_wsc.md risk 1); an OOM there is a RUN failure, not a band miss.
+PRED_STAMP_WSC = "2026-10-28T12:59:25Z"
 PRED_WSC = dict(stamp=PRED_STAMP_WSC,
-                C128=dict(joint_sh_steps=None, joint_saving_ms=None, ratio_vs_l4xu=None, ratio_vs_sh=None),
-                C73=dict(joint_sh_steps=None, joint_saving_ms=None, ratio_vs_l4xu=None, ratio_vs_sh=None))
+                C128=dict(joint_sh_steps=(2.0, 3.1), joint_saving_ms=(20.0, 70.0), ratio_vs_l4xu=(1.03, 1.14),
+                          ratio_vs_sh=(0.28, 0.40)),
+                C73=dict(joint_sh_steps=(2.4, 3.8), joint_saving_ms=(30.0, 100.0), ratio_vs_l4xu=(1.02, 1.12),
+                         ratio_vs_sh=(0.33, 0.46)))
 PLAN_FALSIFIER_MS = 15.0           # PLAN_L4P_faithful.md WS-C: FALSIFIER saving < 15 ms (REPORT here; the lead scores)
 
 
