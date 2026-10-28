@@ -59,7 +59,8 @@ last tail row's for every row), "shared_row_lengths" (every row uses row 0's n_u
 "union": ONE store fill and no spill, so the listed blocks past X - 1 are not served: the old FAST overflow of vr1,
 5.57 % of the extras; caught by the presence recount and by test_wsb.py's byte check), "union_attention" (mode
 "union": every row sees every window block and every listed store block, the union; the contract forbids it; caught
-by the visible count).
+by the visible count), "short_store_len" (mode "union": a store call's length ends at the START of the highest visible
+slot, the defect a review found in b67cc05; caught by the visible count, which counts the slots the length reads).
 
 NO NEW KERNEL. The kernels are the shipped ones and the ones of Task 1.3: stage1_seqused (the installed infllm_v2.C
 op), nosa_pooling_per_request, torch.topk, diff_offload, pool_update, flash_pool_swap, flash_h2d_from_mask(_bias),
@@ -102,8 +103,8 @@ serial bits (test_wsb.py). Rows 1 .. R - 1 read their blocks in other slots and 
 CHECK-ONLY (VerifyOps(check=True); the check cells; OFF in the timing cells): the per-layer copy of the selections
 (vs.chk_sel), the PRESENCE RECOUNT (every selected block of a FULL row is in the window, a served store slot, the tail
 block or the next block: stat dropped, a MUST counter), the VISIBLE COUNT (union residency must not become union
-attention: a full row SEES exactly its selection size, a resident row its selection size minus its skipped blocks;
-stat vis_bad, a MUST counter) and the per-row counts. ACCOUNTING (ops.stats, device counters; off in the timing
+attention: a full row SEES exactly its selection size, a resident row its selection size minus its skipped blocks; a
+store slot counts only when the call's length reads it; stat vis_bad, a MUST counter) and the per-row counts. ACCOUNTING (ops.stats, device counters; off in the timing
 cells): row roles, the window's ready part and residual host loads, the store's pool / host blocks, the spill, the
 rows that the attention calls stream. HOST COUNTS (always, no device op): vs.calls (GEMM, attention, residency and
 gather calls, store fills). PRODUCTION (always): the store fills, the spill, the merge; the resident rows' miss ids
@@ -122,9 +123,11 @@ from .stage1_seqused import stage1_seqused
 MODES = ("fast", "exact", "union")
 GEMMS = ("natural", "rowgroup", "exact")
 NEG_KINDS = (None, "no_init_force", "no_extras", "no_row_mask", "causal_leak", "shared_row_lengths", "drop_spill",
-             "union_attention")
-UNION_NEG = ("drop_spill", "union_attention")
-UNION_STATS = ("extras", "extras_pool", "extras_host", "extras_max", "spill", "unserved", "fills_used", "dropped",
+             "union_attention", "short_store_len")
+UNION_NEG = ("drop_spill", "union_attention", "short_store_len")
+FAST_NEG = ("no_extras", "no_row_mask", "causal_leak")          # route-1 FAST controls: mode "union" refuses them
+UNION_STATS = ("extras", "extras_pool", "extras_host", "extras_max", "spill", "unserved", "fills_used",
+               "spill_fills_used", "dropped",
                "skipped", "union_sum", "union_max", "vis_bad", "win_sel", "win_host", "rows_full", "rows_res",
                "streamed_rows", "visible_blocks")
 UNION_ROW_STATS = ("dropped", "skipped", "vis_bad", "visible", "selected")
@@ -171,6 +174,9 @@ class VerifyOps:
             raise VerifyError("unknown negative control %r" % (neg,))
         if mode != "union" and (spill is not None or check or neg in UNION_NEG):
             raise VerifyError("spill / check / %s belong to mode 'union'" % (UNION_NEG,))
+        if mode == "union" and neg in FAST_NEG:
+            raise VerifyError("%s is a control of mode 'fast' (mode 'union' ignores it: the plant would test nothing)"
+                              % neg)
         if spill is not None and int(spill) < 1:
             raise VerifyError("spill: at least one store fill")
         self.spill = None if spill is None else int(spill)
@@ -269,7 +275,7 @@ class VerifyState:
             self.served = torch.full((H, B, self.cap), -1, dtype=torch.int64, device=dev)
             self.dev_x = torch.full((H, B, X), -1, dtype=torch.int64, device=dev)    # slot 0 stays -1 (next block)
             self.host_x = torch.full((H, B, X), -1, dtype=torch.int64, device=dev)
-            self.ar_x1 = torch.arange(1, X, dtype=torch.int64, device=dev)
+            self.ar_xend = torch.arange(2, X + 1, dtype=torch.int64, device=dev)   # slot x (1 .. X - 1) ends at x + 1
             self.minus1 = torch.tensor(-1, dtype=torch.int64, device=dev)
             self.zero_i = torch.zeros((), dtype=torch.int64, device=dev)
             full = torch.ones((R, B), dtype=torch.bool, device=dev)
@@ -694,10 +700,12 @@ def _store_fill(vs: VerifyState, eng, twin, src_dev, src_host, lo: int, hi: int)
 
 def _store_call(vs: VerifyState, c: int, lst_c, sel_sorted, q_e, row_in, in_tail):
     """One attention call over the store after fill c: row r reads slot x >= 1 where the listed id is in its selection,
-    and (fill 0 only, a row past the block edge) slot 0's rows at or before its own position. The per-entry length is
-    the highest slot the row reads (0: nothing; the kernel exits early, out 0 and lse +inf). Returns (o (E, Hq, D)
-    float, lse (E, Hq, 1) float, lens (E,) int32, vis (H, B, R, X - 1) bool); an entry with length 0 gives o 0 and
-    lse -inf (weight 0)."""
+    and (fill 0 only, a row past the block edge) slot 0's rows at or before its own position. Slot x holds the rows
+    [x 64, (x + 1) 64), so the per-entry length is the END of the highest slot the row reads (0: nothing; the kernel
+    exits early, out 0 and lse +inf). Returns (o (E, Hq, D) float, lse (E, Hq, 1) float, lens (E,) int32, seen
+    (H, B, R) int64); an entry with length 0 gives o 0 and lse -inf (weight 0). seen (CHECK-ONLY input of the visible
+    count): per (head, request, row) the visible slots that the length READS (slot 0 when its own row is read), so a
+    short length makes the visible count smaller than the selection (gate VIS)."""
     H, B, R, T = sel_sorted.shape
     X, bs, E = vs.X, vs.bs, vs.E
     Hq = q_e.shape[2]
@@ -707,10 +715,12 @@ def _store_call(vs: VerifyState, c: int, lst_c, sel_sorted, q_e, row_in, in_tail
     if vs.ops.neg == "union_attention":                                       # NEGATIVE CONTROL: every listed block
         vis = ids >= 0
     m_x = vis.permute(1, 2, 3, 0).unsqueeze(3).expand(B, R, X - 1, bs, H).reshape(B, R, (X - 1) * bs, H)
-    top = torch.where(vis, vs.ar_x1, vs.zero_i).amax(-1).amax(0)              # (B, R): the highest slot read
+    top = torch.where(vis, vs.ar_xend, vs.zero_i).amax(-1).amax(0)            # (B, R): the end of the highest slot
+    if vs.ops.neg == "short_store_len":                                       # NEGATIVE CONTROL: the start, not the end
+        top = (top - 1).clamp(min=0)
     if c == 0:
         m_n = (vs.ar_bs.view(1, 1, bs) <= row_in.view(B, R, 1)) & (~in_tail).view(B, R, 1)
-        top = torch.where(in_tail, top, top.clamp(min=1))
+        top = torch.where(in_tail, top, top.clamp(min=1))                     # slot 0 ends at 1
     else:
         m_n = torch.zeros((B, R, bs), dtype=torch.bool, device=vis.device)
     m_b = torch.cat([m_n.unsqueeze(-1).expand(B, R, bs, H), m_x], dim=2)    # (B, R, X * bs, H): slot 0 first
@@ -718,6 +728,12 @@ def _store_call(vs: VerifyState, c: int, lst_c, sel_sorted, q_e, row_in, in_tail
     bias = torch.where(m_b, eb.unsqueeze(1), torch.full((), MASK_BIAS, dtype=eb.dtype, device=eb.device))
     bias = bias.reshape(E, X * bs, H)
     lens = (top * bs).to(torch.int32).reshape(E)
+    seen = None
+    if vs.ops.check:                                                          # CHECK-ONLY: visible AND read
+        lr = lens.view(1, B, R, 1).to(torch.int64)
+        seen = (vis & (vs.ar_xend.view(1, 1, 1, X - 1) * bs <= lr)).sum(-1)
+        if c == 0:
+            seen = seen + ((~in_tail) & (lens.view(B, R).to(torch.int64) >= row_in + 1)).view(1, B, R)
     o, lse = vs.ops.attn(q_e, vs.ext_k, vs.ext_v, bias[:B], cache_seqlens=lens, cache_batch_idx=vs.cbi,
                          num_splits=vs.rs.nl._ATTN_SPLITS, return_softmax_lse=True)
     vs.calls["attn"] += 1
@@ -732,7 +748,7 @@ def _store_call(vs: VerifyState, c: int, lst_c, sel_sorted, q_e, row_in, in_tail
     if vs.ops.record:
         vs._rec_fills.append(dict(c=c, lst=lst_c.clone(), ext_k=vs.ext_k.clone(), ext_v=vs.ext_v.clone(),
                                   ext_bias=vs.ext_bias.clone(), lens=lens.clone(), vis=vis.clone()))
-    return o, lse, lens, vis
+    return o, lse, lens, seen
 
 
 def _fa_check_u(vs: VerifyState, tag: str, q_e, kc, vc, bias, lens, o, picks) -> None:
@@ -852,32 +868,37 @@ def _union_rows(vs: VerifyState, l: int, layer, eng, twin, q, k4, v4, sel, pos_b
         new = torch.maximum(mx, l_c)
         a, b_ = torch.exp(mx - new), torch.exp(l_c - new)
         return num * a + o_c * b_, den * a + b_, new
-    # CHECK-ONLY: the blocks each row SEES (mask level): window slots, store slots, slot 0 past the block edge
-    vis_cnt = vis.sum(-1) + (~in_tail).view(1, B, R).to(torch.int64) if ops.check else None
-    o_c, l_c, lens_c, vis_c = _store_call(vs, 0, lst[..., :X - 1], sel_sorted, q_e, row_in, in_tail)
+    # CHECK-ONLY: the blocks each row SEES: window slots by the mask (the window call's length covers every slot below
+    # the tail slot; the tail slot is the tail block, cut causally as SH's), store slots that are visible AND read
+    vis_cnt = vis.sum(-1) if ops.check else None
+    o_c, l_c, lens_c, seen = _store_call(vs, 0, lst[..., :X - 1], sel_sorted, q_e, row_in, in_tail)
     num, den, mx = merge(num, den, mx, o_c, l_c)
     used = (lens_c > 0).any().to(torch.int64) if ops.stats else None
+    spill_used = torch.zeros((), dtype=torch.int64, device=used.device) if ops.stats else None
     streamed = lens_a.to(torch.int64).sum() + lens_c.to(torch.int64).sum() if ops.stats else None
     if vis_cnt is not None:
-        vis_cnt = vis_cnt + vis_c.sum(-1)
+        vis_cnt = vis_cnt + seen
     _mark(vs, l, "spill")
     # the SPILL: fills 1 .. C - 1 of the same store (counted in _union_list; never a drop)
     for c in range(1, vs.C):
         lo, hi = c * (X - 1), (c + 1) * (X - 1)
         _store_fill(vs, eng, twin, src_dev, src_host, lo, hi)
-        o_c, l_c, lens_c, vis_c = _store_call(vs, c, lst[..., lo:hi], sel_sorted, q_e, row_in, in_tail)
+        o_c, l_c, lens_c, seen = _store_call(vs, c, lst[..., lo:hi], sel_sorted, q_e, row_in, in_tail)
         num, den, mx = merge(num, den, mx, o_c, l_c)
         if used is not None:
-            used = used + (lens_c > 0).any().to(torch.int64)
+            u_c = (lens_c > 0).any().to(torch.int64)
+            used = used + u_c
+            spill_used = spill_used + u_c
             streamed = streamed + lens_c.to(torch.int64).sum()
         if vis_cnt is not None:
-            vis_cnt = vis_cnt + vis_c.sum(-1)
+            vis_cnt = vis_cnt + seen
     _mark(vs, l, "merge")
     # 6. the end of the merge (call A is never empty: the tail slot, so mx is finite)
     o = num / den
     attn = o.to(q.dtype).reshape(B, R, -1)
     if used is not None:
         vs.stat["fills_used"] += used
+        vs.stat["spill_fills_used"] += spill_used               # spill fills (c >= 1) that served an entry
         vs.stat["streamed_rows"] += streamed                    # rows the attention calls stream (per entry, per head)
     _mark(vs, l, "check")
     # CHECK-ONLY (ops.check) and the rung-L5 seams (vs.miss_ids, vs.pin): the presence of each selected block

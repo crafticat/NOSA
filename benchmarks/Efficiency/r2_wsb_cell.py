@@ -127,8 +127,8 @@ def parse_args(argv):
     if a.batch < 1 or a.steps > 1000 or a.steps < 8:
         ap.error("--batch >= 1, --steps in 8 .. 1000")
     R = a.spec + 1
-    if a.check_steps < R or a.check_steps > a.steps or a.check_steps % R:
-        ap.error("--check-steps: a multiple of K + 1 = %d, at most --steps" % R)
+    if any(x in CHECK_ARMS for x in a.arms) and (a.check_steps < R or a.check_steps > a.steps or a.check_steps % R):
+        ap.error("--check-steps: a multiple of K + 1 = %d, at most --steps (the check arms)" % R)
     if a.joint_extra < 2 or a.joint_spill < 0 or a.probe_every < 2 or a.spec_rounds < 0 or a.spec_journal_blocks < 1:
         ap.error("--joint-extra >= 2, --joint-spill >= 0, --probe-every >= 2, --spec-rounds >= 0, journal >= 1")
     if not 1 <= a.pool <= BC.POOL_MAX:
@@ -203,8 +203,9 @@ def check_gates(arm, res, require_stress: bool = False, L: int = 32):
     ok = all(k in fa and fa[k]["entries"] and all(fa[k]["equal"]) for k in ("A", "B"))
     g.append(("%s-IDX" % arm, True, ok, "window call %s; first store call %s" % (fa.get("A"), fa.get("B"))))
     if require_stress:
-        g.append(("%s-STRESS" % arm, True, st["spill"] > 0 and st["fills_used"] > 0,
-                  "spill %d blocks; store fills that served an entry %d" % (st["spill"], st["fills_used"])))
+        g.append(("%s-STRESS" % arm, True, st["spill"] > 0 and st["spill_fills_used"] > 0,
+                  "spill %d blocks; spill fills (c >= 1) that served an entry %d" % (st["spill"],
+                                                                                  st["spill_fills_used"])))
     return g
 
 
@@ -455,12 +456,14 @@ def run_check_union(model, ids, inputs, steps: int, clock, opt, shr):
     compared, first_bad = 0, []
     d_top, d_max, agree = [], [], []
     marks, prof = [], None
+    is_probe = lambda g: every > 0 and g > 0 and g % every == 0         # noqa: E731
+    g_prof = next((g for g in range(G // 2, G) if not is_probe(g)), None)   # the first non-probe pass from G // 2
     for g in range(G):
-        probe = every > 0 and g > 0 and g % every == 0
+        probe = is_probe(g)
         vs.marks = [] if probe else None
         ids_g = inputs[:, g * R:(g + 1) * R].contiguous()
         pos_g = (BC.S0 + g * R + offs).to(torch.int32).view(1, R).expand(B, R).contiguous()
-        if opt["profile"] and g == G // 2 and not probe:             # CHECK-ONLY: the kernels one pass dispatches
+        if opt["profile"] and g == g_prof:                           # CHECK-ONLY: the kernels one pass dispatches
             lg, prof = _profile(lambda: VR.joint_pass(model, vs, ids_g, pos_g))
         else:
             lg = VR.joint_pass(model, vs, ids_g, pos_g)

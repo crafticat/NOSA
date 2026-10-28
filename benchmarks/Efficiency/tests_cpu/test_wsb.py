@@ -27,7 +27,9 @@ BYTES    test_every_selected_block_present (B 1, B 8, X 4: the union does not fi
 PLANTS   test_dropped_extras_plant_caught: "drop_spill" (one fill, no spill: the old 5.57 % FAST overflow) is caught by
          the presence recount (dropped > 0 = the byte check's missing count) and by the cell's PRESENT gate.
          test_union_attention_plant_caught: "union_attention" (every row sees the union) is caught by the visible
-         count and by the cell's VIS gate, and the logits leave SH's.
+         count and by the cell's VIS gate, and the logits leave SH's. test_short_store_length_plant_caught:
+         "short_store_len" (the b67cc05 defect: a store call's length one slot short) is caught by the visible count,
+         which counts a store slot only where the length reads it.
 COUNT    test_one_residency_call_per_layer: union = L diff calls per pass; the EXACT pass (negative control) = R L.
 ROLES    test_resident_rows_single_pass: rows 0 .. K - 1 full, row K resident (L4XU's roles): the full rows match SH;
          the resident row's skipped blocks = the byte check's count; the role counters.
@@ -260,6 +262,20 @@ def test_union_attention_plant_caught():
     assert g["UC-VIS"] is False, g
 
 
+def test_short_store_length_plant_caught():
+    """The defect of b67cc05 (review): a store call's length ended at the START of the highest visible slot, so that
+    slot was never read; the mask-level counters (dropped, the old visible count) and VRF-IDX could not see it. The
+    visible count now counts a store slot only where the length reads it."""
+    ev = _ev("B8", neg="short_store_len")
+    st = ev["stats"]
+    assert _ev("B8")["stats"]["extras"] > 0                                  # precondition: rows read store slots
+    assert st["dropped"] == 0, st                                            # the list holds every block ...
+    assert st["vis_bad"] > 0, st                                             # ... but a row does not read one
+    assert ev["max_delta"] > 1e-4 or ev["argmax_bad"] or ev["changed"], ev["max_delta"]
+    g = {n: ok for n, _, ok, _ in _cell().check_gates("UC", _res_of(ev), L=L)}
+    assert g["UC-VIS"] is False and g["UC-PRESENT"] is True, g
+
+
 # ------------------------------------------------------------------ COUNT
 def _built(S_list, steps):
     model = W.make_model(0)
@@ -334,7 +350,9 @@ def test_fake_attention_u():
 # ------------------------------------------------------------------ OPS
 def test_union_ops_and_bound():
     for kw in (dict(mode="fast", spill=2), dict(mode="fast", check=True), dict(mode="exact", neg="drop_spill"),
-               dict(mode="fast", neg="union_attention"), dict(mode="union", spill=0), dict(mode="union", extra=1)):
+               dict(mode="fast", neg="union_attention"), dict(mode="fast", neg="short_store_len"),
+               dict(mode="union", neg="no_extras"), dict(mode="union", neg="no_row_mask"),
+               dict(mode="union", neg="causal_leak"), dict(mode="union", spill=0), dict(mode="union", extra=1)):
         with pytest.raises(VR.VerifyError):
             VR.VerifyOps(**kw)
     with pytest.raises(SR.SpecError):
@@ -429,12 +447,15 @@ def test_cell_arguments():
             a.spec_body, a.probe_every) == (["L4X", "L4XU"], 216, 512, 65, 3, 48, 0, 128, "fused", "fused", 16)
     assert C.parse_args(base + ["--arms", "L4X"]).joint_residency == "serial"
     for bad in ([], ["--joint-residency", "union", "--arms", "L4X"], ["--joint-residency", "union", "--arms", "UC,SHR"],
-                ["--joint-residency", "union", "--arms", "UC"], ["--joint-residency", "union", "--check-steps", "130"],
+                ["--joint-residency", "union", "--arms", "UC"],
+                ["--joint-residency", "union", "--arms", "SHR,UC", "--check-steps", "130"],
+                ["--joint-residency", "union", "--arms", "SHR,UC", "--steps", "64"],
                 ["--joint-residency", "union", "--pool", "66"], ["--joint-residency", "union", "--joint-extra", "1"],
                 ["--joint-residency", "union", "--spec", "2"], ["--joint-residency", "union", "--arms", "L4XU,L4XU"]):
         with pytest.raises(SystemExit):
             C.parse_args(base + bad)
     assert C.parse_args(base + ["--joint-residency", "union", "--arms", "SHR,UC,UCR"]).arms == ["SHR", "UC", "UCR"]
+    assert C.parse_args(base + ["--joint-residency", "union", "--steps", "64"]).check_steps == 128   # timing arms only
 
 
 def test_cell_pure_parts(monkeypatch):
