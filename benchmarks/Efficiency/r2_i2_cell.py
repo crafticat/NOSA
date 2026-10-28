@@ -95,11 +95,24 @@ PHASE_GROUPS_U = dict(residency=("resid",), write=("write",), union=("union",), 
 #   I2_plan          the plan's I2 point (PLAN_L4P_faithful.md: 0.52 at C 128 B 216, 0.63 at C 73 B 318): the verdict
 #                    I2-PLAN-15 is CONFIRMED when I2_ratio is within +-15 % of it (the plan's rung falsifier)
 #   I2_above_I1      True: the rung falsifier "measured ratio below the previous rung's" (I2-ABOVE-I1)
-PRED_STAMP_I2 = None
+# The lead's REGISTRATION (2026-10-28T15:18:51Z, `date -u`, after WS-A's I1 cells and BEFORE any I2 timing cell).
+# MEASURED I1 inputs (r2-runs/spec/wa_k2a_2195574_wa1a.step and wa_k2b_2195574_wa1b.step, stdout REPORT L4PT): L4PT /
+# SH 0.3927 (C 128 B 216) and 0.4833 (C 73 B 318); L4PT phases per round: joint 315.264 / 518.766 ms, draft 150.473 /
+# 194.389, commit 6.158 / 8.526, reset 0.11; SH step 64.394 / 123.967 ms; rollback 0.0974 / 0.0696 SH steps; equal-token
+# fraction 0.403 / 0.389. MODEL for L4PTU (NOTES_i2.md section 5.1): joint about 212 ms (C 128) / 392 ms (C 73) from WS-B's
+# union pass (not yet measured on GPU) plus the GEMM change (natural vs rowgroup, about -27 ms at C 128); band edges joint
+# 180-300 / 330-500 ms; the drafts after a union pass may lose window hits (unknown). Round I1 about 472 / 722 ms, so I2 /
+# I1 about 1.28 / 1.21 central.
+PRED_STAMP_I2 = "2026-10-28T15:18:51Z"
 PRED_KEYS = ("I2_ratio", "I2_vs_I1", "I2_joint_sh", "I2_joint_saving", "I2_rollback_sh", "I1_ratio", "I2_agree", "I2_plan",
              "I2_above_I1")
 PRED_I2 = dict(stamp=PRED_STAMP_I2, **{k: None for k in PRED_KEYS})
-PRED_I2_BY_B = {216: {k: None for k in PRED_KEYS}, 318: {k: None for k in PRED_KEYS}}
+PRED_I2_BY_B = {
+    216: dict(I2_ratio=(0.38, 0.57), I2_vs_I1=(0.98, 1.45), I2_joint_sh=(2.6, 4.7), I2_joint_saving=(0.0, 140.0),
+              I2_rollback_sh=(0.03, 0.30), I1_ratio=(0.37, 0.42), I2_agree=0.25, I2_plan=0.52, I2_above_I1=True),
+    318: dict(I2_ratio=(0.46, 0.68), I2_vs_I1=(0.97, 1.40), I2_joint_sh=(2.5, 4.1), I2_joint_saving=(0.0, 190.0),
+              I2_rollback_sh=(0.03, 0.30), I1_ratio=(0.45, 0.51), I2_agree=0.25, I2_plan=0.63, I2_above_I1=True),
+}
 
 
 def log(msg):
