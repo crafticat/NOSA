@@ -349,10 +349,18 @@ def wsg_gates_f(arm, cap_result, ref, tie=I2C.CHK_TIE_LOGIT):
     return g, rec
 
 
-def mem_record(arm, rec_or_res, pa, budget=BUDGET_GB):
-    """REPORT: an arm's peak allocated GB (BC.gpu_peak, 1e9 bytes) against the 84 GB budget."""
-    return ("%s-MEM" % arm, False, pa is not None and pa <= budget,
-            "peak allocated %s GB against %.1f GB; %s" % (pa, budget, rec_or_res))
+def mem_record(arm, mem, pa, budget=BUDGET_GB):
+    """REPORT: an arm's peak allocated GB against the 84 GB budget: the larger of BC.gpu_peak after the arm (1e9 bytes;
+    the arms reset the peak after their prefill, so this is the decode peak) and the arm's prefill peak (its memory
+    dict, in GiB as r2_i2_cell.run_arm_u: x 1.073741824)."""
+    pre = None
+    if isinstance(mem, dict) and mem.get("prefill_peak_GB") is not None:
+        pre = round(float(mem["prefill_peak_GB"]) * 1024 ** 3 / 1e9, 3)
+    vals = [x for x in (pa, pre) if x is not None]
+    peak = max(vals) if vals else None
+    return ("%s-MEM" % arm, False, peak is not None and peak <= budget,
+            "peak allocated %s GB (after the prefill %s GB, prefill %s GB) against %.1f GB; %s" % (
+                peak, pa, pre, budget, mem))
 
 
 def verdicts(sh, sp, B: int):

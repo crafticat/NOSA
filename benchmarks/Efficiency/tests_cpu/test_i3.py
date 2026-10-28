@@ -164,7 +164,7 @@ def test_i3_gate0_files():
     for n, t in src.items():                                     # the kernel and the arena: injected, not imported
         assert not re.search(r"(import|from)\s+[\w.]*(fork_vllm_unified_attention|r2_kv_arena|r2_i3_arena)\b", t), n
     assert [n for n, t in src.items() if "_fork_rows" in t] == ["verify_rows.py"]
-    assert sorted(n for n, t in src.items() if "spec_tentative_fork" in t) == ["spec_tentative_fork.py"]
+    assert [n for n, t in src.items() if "spec_tentative_fork" in t] == []     # no nosi module names the I3 module
     for name in ("ragged_rollback", "state_snapshot", "spec_prefetch"):
         assert name not in src["spec_tentative_fork.py"], name
     assert "@triton.jit" not in src["spec_tentative_fork.py"] and "triton" not in (EFF / "r2_i3_arena.py").read_text()
@@ -637,6 +637,10 @@ def test_i3_cell_pure_parts():
                       "L4PTF-TAIL", "L4PTF-CHAIN", "L4PTF-IDX", "L4PTF-RA", "L4PTF-FSTRESS"}
     rec = C.fork_record(rd)
     assert rec["store_slots"] == 129 and rec["counters"]["vb_bad"] == 0 and rec["chunks"] == [R], rec
+    n, must, ok, d = C.mem_record("L4PTF", dict(prefill_peak_GB=78.13), 82.57)   # 78.13 GiB = 83.891 GB
+    assert (n, must, ok) == ("L4PTF-MEM", False, True) and "peak allocated 83.891 GB" in d, d
+    assert C.mem_record("TFC", dict(prefill_peak_GB=79.0), 80.0)[2] is False       # 84.826 GB > 84
+    assert C.mem_record("SH", "prefill + decode", 82.043)[2] is True
     sh = dict(rates=dict(steady_step_ms=10.0, steady_tok_s=800.0, effective_tok_s=700.0), steady=dict(mean_ms=10.0))
     v = C.verdicts(sh, {}, 216)
     assert v == [("L4PTF-RUN", "NOT_RUN", "the arm did not run")]

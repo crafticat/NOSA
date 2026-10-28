@@ -210,7 +210,7 @@ def _beq(a, b) -> bool:
 
 def chain_bytes(log, R: int) -> dict:
     """For every fork_t record: every union entry (head h, sequence s, u < len) of the KERNEL's tables is mapped to its
-    location; an entry a row SEES (byte n > 0) must belong to the row's request and name a block of the row's own
+    location; an entry a row with a role (verify or draft) SEES (byte n > 0) must belong to the row's request and name a block of the row's own
     selection, and its tokens 0 .. n - 1 must hold the right bytes:
       a window slot (never the tail slot) or a pool slot, or a listed store slot (1 .. X - 1): the block's HOST rows
       (K, V, bias = total_cis), bit for bit;
@@ -262,6 +262,8 @@ def chain_bytes(log, R: int) -> dict:
                         r = c * 4 + u
                         if n == 0 or r >= R_:
                             continue
+                        if not bool(rec["full"][r, b] | rec["res"][r, b]):
+                            continue                                  # a row without a role (its output is not used)
                         out["checked"] += 1
                         if bb != b:
                             out["cross_request"].append((rec["layer"], h, s, j, u))
