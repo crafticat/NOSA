@@ -534,12 +534,14 @@ class SpecOps:
       pin        L4P only: True = the REQUESTED-KV PIN (RequestPin, paper 3.3); default False (off in this rung)
       joint_stats  WS-B, mode "union" only: the joint pass's device accounting (verify_rows VerifyOps(stats)); the
                  timing cells pass False (docs/NOTES_wsb.md: check-only and accounting work stays out of timing)
+      joint_attn WS-C, mode "union" only: "store" (default, WS-B's attention) or "fork" (ONE fork call per layer;
+                 docs/NOTES_wsc.md); fork: the fork's unified_attention (joint_attn "fork"; rs.kv_arena must be set)
     WS-B (nosi-r2-wsb): mode "union" for L4 (L4XU: rows 0 .. K - 1 verify rows, row K a resident draft row) and for L4P
     (per request: rows < v_b verify rows, the deferred and draft rows resident, pad rows neither; _round_l4p)."""
 
     def __init__(self, level="L3", K=3, mode="exact", gemm="rowgroup", linear=None, extra=16, attn=None, journal=256,
                  redirect=True, draft_filter=None, prefetch=None, rb_neg=None, stream=None, neg=None, record=False,
-                 probe_every=16, after_round=None, pin=False, joint_stats=True):
+                 probe_every=16, after_round=None, pin=False, joint_stats=True, joint_attn="store", fork=None):
         if level not in LEVELS:
             raise SpecError("level %r: one of %s" % (level, LEVELS))
         lo = K_MIN[level]
@@ -564,6 +566,13 @@ class SpecOps:
             raise SpecError("pin_no_release needs pin=True")
         if int(journal) < 1 or int(extra) < 2 or int(probe_every) < 0:
             raise SpecError("journal >= 1, extra >= 2, probe_every >= 0")
+        if joint_attn not in ("store", "fork"):                          # WS-C
+            raise SpecError("joint_attn %r: 'store' or 'fork'" % (joint_attn,))
+        if joint_attn == "fork" and (mode != "union" or level not in ("L4", "L4P") or fork is None):
+            raise SpecError("joint_attn 'fork' (WS-C): mode 'union' at L4 / L4P with the fork's unified_attention")
+        if joint_attn == "store" and fork is not None:
+            raise SpecError("fork belongs to joint_attn 'fork'")
+        self.joint_attn, self.fork = joint_attn, fork
         self.level, self.K = level, int(K)
         self.mode, self.gemm, self.linear, self.extra, self.attn = mode, gemm, linear, int(extra), attn
         self.journal, self.redirect = int(journal), bool(redirect)
@@ -582,6 +591,8 @@ class SpecOps:
                  filtered=self.draft_filter is not None, probe_every=self.probe_every, pin=self.pin)
         if self.mode == "union":                                         # WS-B
             d.update(joint_stats=self.joint_stats)
+        if self.joint_attn == "fork":                                    # WS-C (store: WS-B's record, unchanged)
+            d.update(joint_attn="fork")
         return d
 
 
@@ -612,15 +623,18 @@ class SpecRunner:
             # the joint pass's GEMM: the given one, else the ragged step's own (gemm natural: F.linear; exact: the
             # batch-invariant linear), so a rowgroup joint pass has the bits of the serial step it replaces
             base = ops.linear if ops.linear is not None else self.rb._orig["linear"]
+            fk = {} if ops.joint_attn == "store" else dict(joint_attn="fork", fork=ops.fork)   # WS-C
             if paper and ops.mode == "union":          # WS-B: the rows' roles are set per pass (_round_l4p)
+                if fk:                                 # WS-C: at most K verify (full) rows per pass (v_b <= K)
+                    fk["full_max"] = K
                 vops = VR.VerifyOps(K=K + 1, mode="union", gemm=ops.gemm, linear=self._wait_linear(base),
-                                    extra=ops.extra, attn=ops.attn, stats=ops.joint_stats)
+                                    extra=ops.extra, attn=ops.attn, stats=ops.joint_stats, **fk)
             elif paper:                                # R = K + 2 rows (verify_rows calls it K + 1 "verify" rows)
                 vops = VR.VerifyOps(K=K + 1, mode="exact", gemm=ops.gemm, linear=self._wait_linear(base),
                                     extra=ops.extra, attn=ops.attn)
-            elif ops.mode == "union":                  # WS-B, L4XU: row K is a resident draft row
+            elif ops.mode == "union":                  # WS-B, L4XU: row K is a resident draft row (WS-C L4XF: fork)
                 vops = VR.VerifyOps(K=K, mode="union", gemm=ops.gemm, linear=self._wait_linear(base),
-                                    extra=ops.extra, attn=ops.attn, draft_last=True, stats=ops.joint_stats)
+                                    extra=ops.extra, attn=ops.attn, draft_last=True, stats=ops.joint_stats, **fk)
             else:
                 vops = VR.VerifyOps(K=K, mode=ops.mode, gemm=ops.gemm, linear=self._wait_linear(base),
                                     extra=ops.extra, attn=ops.attn, draft_last=(ops.mode == "fast"))

@@ -66,7 +66,12 @@ HOLDER = "2190876"                     # a lead-owned uuid file that exists (HOL
 DECLARED = ("nosi/nosi/verify_rows.py", "nosi/nosi/spec_round.py", "benchmarks/Efficiency/r2_wsb_cell.py",
             "benchmarks/Efficiency/r2_wsb_step.sh", "benchmarks/Efficiency/tests_cpu/wsb_world.py",
             "benchmarks/Efficiency/tests_cpu/test_wsb.py", "benchmarks/Efficiency/tests_cpu/test_spec_prefetch.py",
-            "docs/NOTES_wsb.md")
+            "docs/NOTES_wsb.md",
+            # WS-C (nosi-r2-wsc, on top of 1a8ce68): its files; tests_cpu/test_wsc.py pins them (test_gate0_files)
+            "benchmarks/Efficiency/fork_vllm_unified_attention.py", "benchmarks/Efficiency/r2_kv_arena.py",
+            "benchmarks/Efficiency/r2_wsc_cell.py", "benchmarks/Efficiency/r2_wsc_step.sh",
+            "benchmarks/Efficiency/tests_cpu/wsc_world.py", "benchmarks/Efficiency/tests_cpu/test_wsc.py",
+            "benchmarks/Efficiency/tests_cpu/test_wsc_interp.py", "docs/NOTES_wsc.md")
 # I2 (nosi-r2-i2: r2-wsareg 83dac96 + r2-wsb 1a8ce68 + the arm L4PTU): the WS-A files, WS-A's added Gate-0 lines in the
 # older tests and the I2 files are declared too (their own Gate 0s: tests_cpu/test_wsa.py, tests_cpu/test_i2.py); in
 # test_spec_prefetch.py the lines of WS-A's own diff (40ac348 -> 83dac96) are allowed besides WS-B's SPEC5_TIP lines
