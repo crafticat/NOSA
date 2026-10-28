@@ -352,8 +352,8 @@ def run_tent(B: int, level="L4P", K=K0, S=S0, N=N0, seed=0, draft_filter=None, n
     cnt = torch.tensor(rd["count"])
     bad_tok, maxd, nrows = [], 0.0, 0
     for b in range(B):
-        c = min(int(cnt[b]), n_ref)
-        got, want = runner.out[b, :c].cpu(), ref_tok[b, 1:c + 1]
+        c = min(int(cnt[b]), n_ref, runner.cap)     # out holds cap columns (the round's writes past cap are masked,
+        got, want = runner.out[b, :c].cpu(), ref_tok[b, 1:c + 1]   # spec_tentative.py:510-511); L3 may commit past N
         if not torch.equal(got, want):
             i = int((got != want).nonzero()[0, 0])
             bad_tok.append((b, i, int(got[i]), int(want[i])))
