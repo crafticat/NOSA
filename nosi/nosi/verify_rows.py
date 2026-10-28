@@ -55,7 +55,11 @@ MASK_BIAS = -3e4, finite, as avail_policy.py:113 (a whole split can be masked; -
 
 NEGATIVE CONTROLS (tests only; VerifyOps.neg): "no_init_force" (the pooling forces no init block), "no_extras" (call B
 sees no extras), "no_row_mask" (call A shows every window slot to every row), "causal_leak" (call A's tail cut is the
-last tail row's for every row), "shared_row_lengths" (every row uses row 0's n_used and M_b).
+last tail row's for every row), "shared_row_lengths" (every row uses row 0's n_used and M_b), "drop_spill" (mode
+"union": ONE store fill and no spill, so the listed blocks past X - 1 are not served: the old FAST overflow of vr1,
+5.57 % of the extras; caught by the presence recount and by test_wsb.py's byte check), "union_attention" (mode
+"union": every row sees every window block and every listed store block, the union; the contract forbids it; caught
+by the visible count).
 
 NO NEW KERNEL. The kernels are the shipped ones and the ones of Task 1.3: stage1_seqused (the installed infllm_v2.C
 op), nosa_pooling_per_request, torch.topk, diff_offload, pool_update, flash_pool_swap, flash_h2d_from_mask(_bias),
@@ -69,6 +73,41 @@ PHASE 2 (the integration tree nosi-r2-spec, the speculative round runner; every 
     hooks.fast_begin / hooks.fast_end. The EXACT rows need no hook (the rollback wraps the body's decode_fixed).
   - The FAST write-back calls rs.body.writeback_kernel (the same kernel as kernels["writeback"]; in an open rollback
     group, the deferred write-back).
+
+WS-B (tree nosi-r2-wsb, KS/analysis/plan/PLAN_L4P_faithful.md, departure D2; docs/NOTES_wsb.md): MODE "union", the
+FAST joint pass with ONE residency per layer for the UNION of the rows' selections. The modes "fast" and "exact" are
+the bytes of 40ac348 (test_wsb.py Gate 0 runs both sources). Per layer, in this order (_union_rows):
+  1. the tentative rows: the tail block's rows into the tail slot, the next block's rows into STORE SLOT 0.
+  2. THE RESIDENCY (one per layer and pass; vs.calls["resid"] counts it): row 0's selection into the window with the
+     shipped diff, victim pool, map commit and the two host gathers (the shipped residency of position p).
+  3. THE UNION LIST (_union_list): per (head, request), in id order, every block that a FULL row selects (a verify row:
+     its whole selection must be present) and every POOL HIT of a RESIDENT row (a draft row reads what is on the GPU and
+     never fetches), minus the window's blocks and the next block. Nothing is dropped: the list holds up to cap =
+     C x (X - 1) ids, and C is sized from the bound (R - 1) x topk (a row's selection has topk ids and row 0's are in
+     the window), so cap covers any union.
+  4. THE STORE (B, X x 64, H, D) holds X - 1 listed blocks per (head, request) at a time (slots 1 .. X - 1; slot 0 is
+     the next block). Fill c (c = 0 .. C - 1) loads the listed ids c (X - 1) .. (c + 1)(X - 1) - 1 with the SHIPPED
+     gathers: a pool hit device to device (flash_h2d_from_mask with the engine's own slot rows as the source, the slot
+     topk + q as the "block id"), a miss from the host rows (the urgent GPU gather). Fill 0 is the extra store; fills
+     1 .. C - 1 are the SPILL: the same store again, counted (stat spill), never a drop.
+  5. ATTENTION: call A on the window (as FAST: the per-entry bias rows, the tail cut by cache_seqlens) and one call per
+     store fill, each a flash_attn_nosa call over the E one-row entries with cache_batch_idx (route 1) and a per-entry
+     bias (VRF-IDX), the per-entry length = the highest slot that the row reads (0: the kernel's early exit, out 0,
+     lse +inf; the merge gives that part the weight 0). The parts merge by their log-sum-exp after each call (a
+     running numerator, denominator and maximum; no stack of the parts).
+  6. the end state of FAST (write-back of a filled block, the next block's rows into the tail slot, tail id, length).
+There is no serial per-row residency. Row 0 of a pass whose window state equals the serial one attends exactly the
+serial row-0 window (its whole selection is in the window, its store parts are empty), so its attention has the
+serial bits (test_wsb.py). Rows 1 .. R - 1 read their blocks in other slots and parts: FAST (float order only).
+CHECK-ONLY (VerifyOps(check=True); the check cells; OFF in the timing cells): the per-layer copy of the selections
+(vs.chk_sel), the PRESENCE RECOUNT (every selected block of a FULL row is in the window, a served store slot, the tail
+block or the next block: stat dropped, a MUST counter), the VISIBLE COUNT (union residency must not become union
+attention: a full row SEES exactly its selection size, a resident row its selection size minus its skipped blocks;
+stat vis_bad, a MUST counter) and the per-row counts. ACCOUNTING (ops.stats, device counters; off in the timing
+cells): row roles, the window's ready part and residual host loads, the store's pool / host blocks, the spill, the
+rows that the attention calls stream. HOST COUNTS (always, no device op): vs.calls (GEMM, attention, residency and
+gather calls, store fills). PRODUCTION (always): the store fills, the spill, the merge; the resident rows' miss ids
+and the pin record only when the caller sets vs.miss_ids / vs.pin (the paper schedule with rung L5).
 """
 from __future__ import annotations
 
@@ -80,9 +119,15 @@ from .max_pooling_per_request import nosa_pooling_per_request
 from .r2_positional_twin import BLOCK
 from .stage1_seqused import stage1_seqused
 
-MODES = ("fast", "exact")
+MODES = ("fast", "exact", "union")
 GEMMS = ("natural", "rowgroup", "exact")
-NEG_KINDS = (None, "no_init_force", "no_extras", "no_row_mask", "causal_leak", "shared_row_lengths")
+NEG_KINDS = (None, "no_init_force", "no_extras", "no_row_mask", "causal_leak", "shared_row_lengths", "drop_spill",
+             "union_attention")
+UNION_NEG = ("drop_spill", "union_attention")
+UNION_STATS = ("extras", "extras_pool", "extras_host", "extras_max", "spill", "unserved", "fills_used", "dropped",
+               "skipped", "union_sum", "union_max", "vis_bad", "win_sel", "win_host", "rows_full", "rows_res",
+               "streamed_rows", "visible_blocks")
+UNION_ROW_STATS = ("dropped", "skipped", "vis_bad", "visible", "selected")
 MASK_BIAS = -3.0e4                     # avail_policy.py:113: finite on purpose
 K_MAX = 31                             # R <= 32 rows: the twin's MAX_ROLLBACK and one block edge per group
 
@@ -106,10 +151,14 @@ class VerifyOps:
       stats   accumulate the union statistics on the device
       draft_last  FAST only (Phase 2, the speculative round runner): row K is a RESIDENT-ONLY DRAFT row. The extras store
               loads the union of rows 0 .. K - 1 only; row K attends what is present for it (the window and the
-              extras that the verify rows loaded) and nothing is fetched for it alone. Default False (Task 1.4)."""
+              extras that the verify rows loaded) and nothing is fetched for it alone. Default False (Task 1.4).
+              Mode "union": row K is a resident row (its pool hits are brought, its misses are skipped).
+      spill   mode "union": the store fills per layer (None: C = ceil((R - 1) topk / (X - 1)), the bound, so nothing can
+              be dropped; an int: tests only)
+      check   mode "union": the CHECK-ONLY operations (module docstring; OFF in the timing cells)"""
 
     def __init__(self, K=3, mode="fast", gemm="natural", linear=None, extra=16, attn=None, neg=None, record=False,
-                 stats=True, draft_last=False):
+                 stats=True, draft_last=False, spill=None, check=False):
         if not 1 <= int(K) <= K_MAX:
             raise VerifyError("K must be in 1 .. %d (got %r)" % (K_MAX, K))
         if mode not in MODES or gemm not in GEMMS:
@@ -120,6 +169,12 @@ class VerifyOps:
             raise VerifyError("extra must be >= 2 (one extras slot and the next-block slot)")
         if neg not in NEG_KINDS:
             raise VerifyError("unknown negative control %r" % (neg,))
+        if mode != "union" and (spill is not None or check or neg in UNION_NEG):
+            raise VerifyError("spill / check / %s belong to mode 'union'" % (UNION_NEG,))
+        if spill is not None and int(spill) < 1:
+            raise VerifyError("spill: at least one store fill")
+        self.spill = None if spill is None else int(spill)
+        self.check = bool(check)
         self.K, self.R = int(K), int(K) + 1
         self.mode, self.gemm = mode, gemm
         self.linear = F.linear if linear is None else linear
@@ -131,10 +186,13 @@ class VerifyOps:
         self.draft_last = bool(draft_last)
 
     def describe(self) -> dict:
-        return dict(K=self.K, R=self.R, mode=self.mode, gemm=self.gemm,
-                    linear=getattr(self.linear, "__name__", type(self.linear).__name__),
-                    m_fix=getattr(self.linear, "m_fix", None), extra=self.extra, neg=self.neg,
-                    draft_last=self.draft_last)
+        d = dict(K=self.K, R=self.R, mode=self.mode, gemm=self.gemm,
+                 linear=getattr(self.linear, "__name__", type(self.linear).__name__),
+                 m_fix=getattr(self.linear, "m_fix", None), extra=self.extra, neg=self.neg,
+                 draft_last=self.draft_last)
+        if self.mode == "union":
+            d.update(spill=self.spill, check=self.check)
+        return d
 
 
 class VerifyState:
@@ -189,17 +247,56 @@ class VerifyState:
             self.hh = torch.arange(H, device=dev).view(H, 1, 1).expand(H, B, X - 1)
             self.bb = torch.arange(B, device=dev).view(1, B, 1).expand(H, B, X - 1)
             self.xx = torch.arange(X - 1, device=dev).view(1, 1, X - 1).expand(H, B, X - 1)
+        # mode "union" (WS-B): the store, the fills, the per-pass row masks (module docstring)
+        self.full_rows = self.res_rows = self.miss_rows = None   # (R, B) bool per pass; None: full_default / ~full
+        self.miss_ids = None                # a list of L (H, B, topk) int64: the miss rows' skipped ids (rung L5 seam)
+        self.pin = None                     # an object with record(l, sel, mask) (the requested-KV pin of the schedule)
+        self.C = self.cap = 0
+        self.chk_sel = None
+        if ops.mode == "union":
+            kdt = eng0._k_gpu.dtype
+            if ops.neg == "drop_spill":                              # NEGATIVE CONTROL: no spill (the old overflow)
+                C = 1
+            elif ops.spill is not None:
+                C = ops.spill
+            else:                                                    # the bound: (R - 1) rows x topk ids
+                C = max(1, -(-((R - 1) * topk) // (X - 1)))
+            self.C, self.cap = C, C * (X - 1)
+            self.ext_k = torch.zeros((B, X * bs, H, D), dtype=kdt, device=dev)
+            self.ext_v = torch.zeros((B, X * bs, H, D), dtype=kdt, device=dev)
+            self.ext_bias = torch.zeros((B, X * bs, H), dtype=eng0._kv_bias_gpu.dtype, device=dev)
+            self.lst_buf = torch.full((H, B, self.cap + 1), -1, dtype=torch.int64, device=dev)
+            self.served = torch.full((H, B, self.cap), -1, dtype=torch.int64, device=dev)
+            self.dev_x = torch.full((H, B, X), -1, dtype=torch.int64, device=dev)    # slot 0 stays -1 (next block)
+            self.host_x = torch.full((H, B, X), -1, dtype=torch.int64, device=dev)
+            self.ar_x1 = torch.arange(1, X, dtype=torch.int64, device=dev)
+            self.minus1 = torch.tensor(-1, dtype=torch.int64, device=dev)
+            self.zero_i = torch.zeros((), dtype=torch.int64, device=dev)
+            full = torch.ones((R, B), dtype=torch.bool, device=dev)
+            if ops.draft_last:
+                full[R - 1] = False
+            self.full_default = full
+            if ops.check:                                            # CHECK-ONLY: the selections of every layer
+                self.chk_sel = torch.full((len(model.layers), H, B, R, topk), -1, dtype=torch.int64, device=dev)
         z = lambda: torch.zeros((), dtype=torch.int64, device=dev)    # noqa: E731
         self.stat = dict(union_sum=z(), union_max=z(), extras=z(), overflow=z(), sel0_order_eq=z(), sel0_set_eq=z())
+        if ops.mode == "union":
+            self.stat.update({k: z() for k in UNION_STATS if k not in self.stat})
+            self.stat_row = {k: torch.zeros(R, dtype=torch.int64, device=dev) for k in UNION_ROW_STATS}
         self.stat_n = dict(union=0, sel0=0)
+        # host invocation counts (every mode; no device op): GEMM calls, attention calls, residency calls, gather calls
+        self.calls = dict(gemm=0, attn=0, resid=0, gather_dev=0, gather_host=0, fills=0)
         self.log = []
         self.marks = None                   # a list -> (layer, label, event) per phase (the cell's probe passes)
         self.clock = None                   # the cell's CudaClock (event / record)
         self.probe = False                  # True: the one-row selection after the batched one (timing + SEL0)
         self.fa_check = None                # a dict -> the VRF-IDX gate on the next FAST pass, layer 0
         self.hooks = None                   # Phase 2: the rollback (fast_begin / fast_end around a FAST layer)
+        self._rec_fills = []                # mode union, record: the store after each fill of the current layer
         self.passes = 0
         self.meta = dict(ops=ops.describe(), B=B, R=R, E=E, X=X, mask_bias=MASK_BIAS)
+        if ops.mode == "union":
+            self.meta.update(fills=self.C, cap=self.cap, bound=(R - 1) * topk)
 
 
 def attach(model, rs, ops: VerifyOps) -> VerifyState:
@@ -223,6 +320,7 @@ def _lin(vs: VerifyState, x, w):
     """The GEMM of every weight. natural / exact: ONE call over the E rows. rowgroup: R calls, each over the B rows of
     one row index, with the shipped call's shape (B, 1, K)."""
     ops = vs.ops
+    vs.calls["gemm"] += 1 if ops.gemm != "rowgroup" else vs.R            # host count (WS-B: invocation counts)
     if ops.gemm != "rowgroup":
         return ops.linear(x, w)
     B, R = vs.B, vs.R
@@ -324,6 +422,7 @@ def _exact_rows(vs: VerifyState, l: int, layer, eng, twin, q, k4, v4, sel, pos_b
     outs = []
     for r in range(R):
         ti_r = sel[:, :, r].contiguous()
+        _mark(vs, l, "resid")                                          # WS-B: row r's residency (probe passes only)
         key_states, value_states, kv_bias, cache_lens = rs.body.decode_fixed(
             eng, k4[:, r].unsqueeze(1).contiguous(), v4[:, r].unsqueeze(1).contiguous(), twin.total_cis, ti_r,
             pos_before[r], rs.st.active, rs.err, diff, kern["gather_k"], kern["gather_v_bias"])
@@ -332,9 +431,13 @@ def _exact_rows(vs: VerifyState, l: int, layer, eng, twin, q, k4, v4, sel, pos_b
         if ops.record:
             vs.log.append(dict(kind="exact", layer=l, row=r, sel=ti_r.clone(), win=eng._block_map.clone(),
                                pos=pos_before[r].clone()))
+        _mark(vs, l, "attn")                                           # WS-B: row r's attention (probe passes only)
         o = ops.attn(q4[:, r].unsqueeze(1).contiguous(), key_states, value_states, kv_bias, cache_seqlens=cache_lens,
                      num_splits=rs.nl._ATTN_SPLITS)
         outs.append(o.reshape(B, -1))
+        vs.calls["resid"] += 1                                       # host counts (WS-B): one residency, two host
+        vs.calls["gather_host"] += 2                                 # gathers and one attention call per row
+        vs.calls["attn"] += 1
     return torch.stack(outs, 1)                                        # (B, R, Hq * D)
 
 
@@ -469,6 +572,9 @@ def _fast_rows(vs: VerifyState, l: int, layer, eng, twin, q, k4, v4, sel, pos_be
     bias_b = bias_b.reshape(E, X * bs, H)
     o_b, lse_b = ops.attn(q_e, vs.ext_k, vs.ext_v, bias_b[:B], cache_seqlens=vs.lens_x, cache_batch_idx=vs.cbi,
                           num_splits=nsplit, return_softmax_lse=True)
+    vs.calls["resid"] += 1                                                    # host counts (WS-B)
+    vs.calls["attn"] += 2
+    vs.calls["gather_host"] += 4
     # 6. the merge of the two partial softmaxes by their log-sum-exp (float32)
     la = lse_a.reshape(E, Hq, 1).float()
     lb = lse_b.reshape(E, Hq, 1).float()
@@ -509,6 +615,319 @@ def _fa_index_check(vs: VerifyState, q_e, katt, vatt, bias_a, lens_a, o_a) -> No
     vs.fa_check.update(entries=picks, equal=eq)
 
 
+# ------------------------------------------------------------------ UNION (WS-B): one residency, the union store
+def _row_masks(vs: VerifyState):
+    """The rows of this pass: full (R, B) bool (a verify row: its whole selection must be present) and res (R, B) bool
+    (a resident row: its pool hits are brought, its misses are skipped). Defaults: vs.full_default and ~full."""
+    full = vs.full_rows if vs.full_rows is not None else vs.full_default
+    res = vs.res_rows if vs.res_rows is not None else ~full
+    return full, res
+
+
+def _union_list(vs: VerifyState, eng, sel, full, res, m):
+    """THE UNION LIST of one layer, after the window residency (module docstring, step 3). sel (H, B, R, T); m (B,)
+    the tail block. Returns lst (H, B, cap): the listed ids in id order (-1 past the end); src_dev (H, B, cap): the
+    engine slot topk + q of a pool hit, else -1; src_host (H, B, cap): the id of a host miss, else -1."""
+    rs = vs.rs
+    H, B, R, T = sel.shape
+    cap, topk = vs.cap, vs.topk
+    cand = torch.where(full.t().reshape(1, B, R, 1), sel, vs.minus1)          # every block of a full row
+    if rs.pool:
+        pm = eng._pool_map                                                     # (H, B, P), after the residency
+        hit = (sel.unsqueeze(-1) == pm.unsqueeze(2).unsqueeze(2)).any(-1) & (sel >= 0)
+        rr = res.t().reshape(1, B, R, 1)
+        cand = torch.cat((cand, torch.where(rr & hit, sel, vs.minus1)), dim=2)  # a resident row's pool hits
+    s = torch.sort(cand.reshape(H, B, -1), dim=-1).values
+    first = torch.ones_like(s, dtype=torch.bool)
+    first[..., 1:] = s[..., 1:] != s[..., :-1]
+    first &= s >= 0
+    in_win = (s.unsqueeze(-1) == eng._block_map.unsqueeze(-2)).any(-1)
+    extra = first & ~in_win & (s != (m + 1).view(1, B, 1))
+    rank = extra.to(torch.int64).cumsum(-1) - 1
+    keep = extra & (rank < cap)
+    buf = vs.lst_buf
+    buf.fill_(-1)
+    buf.scatter_(-1, torch.where(keep, rank, torch.full_like(rank, cap)), torch.where(keep, s, torch.full_like(s, -1)))
+    lst = buf[..., :cap]
+    if rs.pool:
+        pm = eng._pool_map
+        hl = (lst.unsqueeze(-1) == pm.unsqueeze(-2)) & (lst >= 0).unsqueeze(-1)  # (H, B, cap, P)
+        has = hl.any(-1)
+        src_dev = torch.where(has, hl.to(torch.int64).argmax(-1) + topk, vs.minus1)
+        src_host = torch.where(has, vs.minus1, lst)
+    else:
+        has = torch.zeros_like(lst, dtype=torch.bool)
+        src_dev = torch.full_like(lst, -1)
+        src_host = lst
+    if vs.ops.stats:                                                           # accounting (device counters)
+        st, X = vs.stat, vs.X
+        n_extra = extra.to(torch.int64).sum(-1)                                # (H, B)
+        st["extras"] += n_extra.sum()
+        st["extras_max"] = torch.maximum(st["extras_max"], n_extra.max())
+        st["extras_pool"] += has.sum()
+        st["extras_host"] += (src_host >= 0).sum()
+        st["spill"] += (n_extra.clamp(max=cap) - (X - 1)).clamp(min=0).sum()
+        st["unserved"] += (n_extra - cap).clamp(min=0).sum()
+        n_u = first.to(torch.int64).sum(-1)
+        st["union_sum"] += n_u.sum()
+        st["union_max"] = torch.maximum(st["union_max"], n_u.max())
+        vs.stat_n["union"] += H * B
+    return lst, src_dev, src_host
+
+
+def _store_fill(vs: VerifyState, eng, twin, src_dev, src_host, lo: int, hi: int) -> None:
+    """Store fill: slots 1 .. X - 1 <- the listed ids lo .. hi - 1 (slot 0, the next block, is never written here).
+    The SHIPPED gathers: a pool hit from the engine's own slot rows (the slot index as the "block id"), a miss from the
+    host rows (the urgent GPU gather; the bias from twin.total_cis)."""
+    kern, bs = vs.rs.ops.kernels, vs.bs
+    if vs.rs.pool:
+        vs.dev_x[..., 1:].copy_(src_dev[..., lo:hi])
+        kern["gather_k"](vs.ext_k, eng._k_gpu, vs.dev_x, bs)
+        kern["gather_v_bias"](vs.ext_v, eng._v_gpu, vs.ext_bias, eng._kv_bias_gpu, vs.dev_x, bs)
+        vs.calls["gather_dev"] += 2
+    vs.host_x[..., 1:].copy_(src_host[..., lo:hi])
+    kern["gather_k"](vs.ext_k, eng._k_cpu, vs.host_x, bs)
+    kern["gather_v_bias"](vs.ext_v, eng._v_cpu, vs.ext_bias, twin.total_cis, vs.host_x, bs)
+    vs.calls["gather_host"] += 2
+    vs.calls["fills"] += 1
+
+
+def _store_call(vs: VerifyState, c: int, lst_c, sel_sorted, q_e, row_in, in_tail):
+    """One attention call over the store after fill c: row r reads slot x >= 1 where the listed id is in its selection,
+    and (fill 0 only, a row past the block edge) slot 0's rows at or before its own position. The per-entry length is
+    the highest slot the row reads (0: nothing; the kernel exits early, out 0 and lse +inf). Returns (o (E, Hq, D)
+    float, lse (E, Hq, 1) float, lens (E,) int32, vis (H, B, R, X - 1) bool); an entry with length 0 gives o 0 and
+    lse -inf (weight 0)."""
+    H, B, R, T = sel_sorted.shape
+    X, bs, E = vs.X, vs.bs, vs.E
+    Hq = q_e.shape[2]
+    ids = lst_c.unsqueeze(2).expand(H, B, R, X - 1).contiguous()
+    at = torch.searchsorted(sel_sorted, ids).clamp(max=T - 1)
+    vis = (sel_sorted.gather(-1, at) == ids) & (ids >= 0)                    # (H, B, R, X - 1)
+    if vs.ops.neg == "union_attention":                                       # NEGATIVE CONTROL: every listed block
+        vis = ids >= 0
+    m_x = vis.permute(1, 2, 3, 0).unsqueeze(3).expand(B, R, X - 1, bs, H).reshape(B, R, (X - 1) * bs, H)
+    top = torch.where(vis, vs.ar_x1, vs.zero_i).amax(-1).amax(0)              # (B, R): the highest slot read
+    if c == 0:
+        m_n = (vs.ar_bs.view(1, 1, bs) <= row_in.view(B, R, 1)) & (~in_tail).view(B, R, 1)
+        top = torch.where(in_tail, top, top.clamp(min=1))
+    else:
+        m_n = torch.zeros((B, R, bs), dtype=torch.bool, device=vis.device)
+    m_b = torch.cat([m_n.unsqueeze(-1).expand(B, R, bs, H), m_x], dim=2)    # (B, R, X * bs, H): slot 0 first
+    eb = vs.ext_bias
+    bias = torch.where(m_b, eb.unsqueeze(1), torch.full((), MASK_BIAS, dtype=eb.dtype, device=eb.device))
+    bias = bias.reshape(E, X * bs, H)
+    lens = (top * bs).to(torch.int32).reshape(E)
+    o, lse = vs.ops.attn(q_e, vs.ext_k, vs.ext_v, bias[:B], cache_seqlens=lens, cache_batch_idx=vs.cbi,
+                         num_splits=vs.rs.nl._ATTN_SPLITS, return_softmax_lse=True)
+    vs.calls["attn"] += 1
+    if vs.fa_check is not None and c == 0 and "B" not in vs.fa_check:
+        nz = (lens > 0).nonzero().view(-1).tolist()          # one host read per layer until a layer has store entries
+        if nz:
+            _fa_check_u(vs, "B", q_e, vs.ext_k, vs.ext_v, bias, lens, o, sorted({nz[0], nz[len(nz) // 2], nz[-1]}))
+    has = (lens > 0).view(E, 1, 1)
+    o = torch.where(has, o.reshape(E, Hq, -1).float(), torch.zeros((), dtype=torch.float32, device=o.device))
+    lse = torch.where(has, lse.reshape(E, Hq, 1).float(),
+                      torch.full((), float("-inf"), dtype=torch.float32, device=lse.device))
+    if vs.ops.record:
+        vs._rec_fills.append(dict(c=c, lst=lst_c.clone(), ext_k=vs.ext_k.clone(), ext_v=vs.ext_v.clone(),
+                                  ext_bias=vs.ext_bias.clone(), lens=lens.clone(), vis=vis.clone()))
+    return o, lse, lens, vis
+
+
+def _fa_check_u(vs: VerifyState, tag: str, q_e, kc, vc, bias, lens, o, picks) -> None:
+    """VRF-IDX of mode union (tag "A": the window call; "B": the first store call): sampled entries against a PLAIN
+    one-entry call (no cache_batch_idx; the entry's own bias row; the K / V of its request). One host sync, once."""
+    eq = []
+    for e in picks:
+        b = e // vs.R
+        o1 = vs.ops.attn(q_e[e:e + 1], kc[b:b + 1], vc[b:b + 1], bias[e:e + 1],
+                         cache_seqlens=lens[e:e + 1].contiguous(), num_splits=vs.rs.nl._ATTN_SPLITS)
+        eq.append(bool(torch.equal(o1, o[e:e + 1])))
+    vs.fa_check[tag] = dict(entries=list(picks), equal=eq)
+
+
+def _presence(vs: VerifyState, eng, sel, lst, m):
+    """(H, B, R, T) bool: each selected id is in the window, in the union list (the ids that the store fills serve), the
+    tail block m or the next block m + 1 (store slot 0). Sorted search; no host read."""
+    H, B, R, T = sel.shape
+    mm = m.view(1, B, 1).expand(H, B, 1)
+    ps = torch.sort(torch.cat((eng._block_map, lst, mm, mm + 1), dim=2), dim=-1).values.contiguous()
+    v = sel.reshape(H, B, R * T).contiguous()
+    at = torch.searchsorted(ps, v).clamp(max=ps.shape[-1] - 1)
+    return (ps.gather(-1, at) == v).view(H, B, R, T)
+
+
+def _union_rows(vs: VerifyState, l: int, layer, eng, twin, q, k4, v4, sel, pos_before):
+    """Mode "union", one layer (module docstring, WS-B, steps 1-6). The phase marks (probe passes): "union" after the
+    residency, "fetch" (fill 0), "attn" (call A, the fill-0 call and its merge step), "spill" (fills 1 .. C - 1, their
+    calls and merge steps), "merge" (the final division), "check" (CHECK-ONLY and the rung-L5 seams), "end"."""
+    rs, ops = vs.rs, vs.ops
+    kern = rs.ops.kernels
+    B, R, E, X, H, D, bs, topk = vs.B, vs.R, vs.E, vs.X, vs.H, vs.D, vs.bs, vs.topk
+    Hq = q.shape[1]
+    tail0 = (topk - 1) * bs
+    p0 = pos_before[0]
+    if vs.hooks is not None:                                                  # the rollback's FAST journal
+        vs.hooks.fast_begin(l, eng, R)
+    full, res = _row_masks(vs)
+    p_rows = p0.view(B, 1) + vs.offs.view(1, R)                              # (B, R)
+    m = p0 // bs                                                              # the tail block at the start
+    in_tail = (p_rows // bs) == m.view(B, 1)
+    row_in = p_rows % bs
+    bi = vs.bidx
+    kd, vd, bd = eng._k_gpu.dtype, eng._v_gpu.dtype, eng._kv_bias_gpu.dtype
+    k4c, v4c = k4.to(kd), v4.to(vd)
+    cis_rows = twin.total_cis[bi, p_rows].to(bd)                              # (B, R, H): written by the twin
+    # 1. the tentative rows: the tail block's into slot topk - 1, the next block's into store slot 0
+    r63 = tail0 + row_in
+    it4, it3 = in_tail.view(B, R, 1, 1), in_tail.view(B, R, 1)
+    eng._k_gpu[bi, r63] = torch.where(it4, k4c, eng._k_gpu[bi, r63])
+    eng._v_gpu[bi, r63] = torch.where(it4, v4c, eng._v_gpu[bi, r63])
+    eng._kv_bias_gpu[bi, r63] = torch.where(it3, cis_rows, eng._kv_bias_gpu[bi, r63])
+    vs.ext_k[bi, row_in] = torch.where(it4, vs.ext_k[bi, row_in], k4c.to(vs.ext_k.dtype))
+    vs.ext_v[bi, row_in] = torch.where(it4, vs.ext_v[bi, row_in], v4c.to(vs.ext_v.dtype))
+    vs.ext_bias[bi, row_in] = torch.where(it3, vs.ext_bias[bi, row_in], cis_rows.to(vs.ext_bias.dtype))
+    # 2. THE RESIDENCY (one per layer and pass): row 0's selection, the shipped diff, victim pool, map commit, gathers
+    diff = RE._diff_pool(rs, eng) if rs.pool else kern["diff"]
+    diff(eng._block_map, sel[:, :, 0].contiguous(), eng._new_block_map_buf, eng._load_mask)
+    eng._block_map.copy_(eng._new_block_map_buf)
+    kern["gather_k"](eng._k_gpu, eng._k_cpu, eng._load_mask, bs)
+    kern["gather_v_bias"](eng._v_gpu, eng._v_cpu, eng._kv_bias_gpu, twin.total_cis, eng._load_mask, bs)
+    vs.calls["resid"] += 1
+    vs.calls["gather_host"] += 2
+    if ops.stats:                       # accounting: row roles; the window's READY part and its RESIDUAL host loads
+        vs.stat["rows_full"] += full.sum()
+        vs.stat["rows_res"] += res.sum()
+        vs.stat["win_sel"] += (sel[:, :, 0] >= 0).sum()
+        vs.stat["win_host"] += (eng._load_mask >= 0).sum()                   # after pool_update: the host misses
+    _mark(vs, l, "union")
+    # 3. the union list (every full row's blocks and the resident rows' pool hits, minus the window and m + 1)
+    lst, src_dev, src_host = _union_list(vs, eng, sel, full, res, m)
+    sel_sorted = torch.sort(sel, dim=-1).values.contiguous()                 # (H, B, R, T): the rows' sets
+    _mark(vs, l, "fetch")
+    # 4. store fill 0 (the extra store)
+    _store_fill(vs, eng, twin, src_dev, src_host, 0, X - 1)
+    if ops.record:
+        vs._rec_fills = []
+        vs.log.append(dict(kind="union", layer=l, sel=sel.clone(), win=eng._block_map.clone(), lst=lst.clone(),
+                           m=m.clone(), in_tail=in_tail.clone(), p_rows=p_rows.clone(), full=full.clone(),
+                           res=res.clone(), pool_map=(eng._pool_map.clone() if rs.pool else None),
+                           k_gpu=eng._k_gpu.clone(), v_gpu=eng._v_gpu.clone(), bias_gpu=eng._kv_bias_gpu.clone(),
+                           k_cpu=eng._k_cpu.clone(), v_cpu=eng._v_cpu.clone(), total_cis=twin.total_cis.clone(),
+                           fills=vs._rec_fills))
+    _mark(vs, l, "attn")
+    # 5. call A: the window, a bias row set per entry (row r's selection), the causal cut by cache_seqlens (as FAST)
+    win = eng._block_map                                                      # (H, B, topk); slot topk - 1 = m
+    winR = win.unsqueeze(2).expand(H, B, R, topk).contiguous()
+    at = torch.searchsorted(sel_sorted, winR).clamp(max=topk - 1)
+    vis = (sel_sorted.gather(-1, at) == winR) & (winR >= 0)                  # (H, B, R, topk)
+    if ops.neg == "union_attention":                                          # NEGATIVE CONTROL: every window block
+        vis = winR >= 0
+    vis[..., topk - 1] = True
+    if rs.pool:
+        katt, vatt, batt = eng._k_gpu_att, eng._v_gpu_att, eng._kv_bias_gpu_att
+    else:
+        katt, vatt, batt = eng._k_gpu, eng._v_gpu, eng._kv_bias_gpu
+    rows_a = topk * bs
+    m_a = vis.permute(1, 2, 3, 0).unsqueeze(3).expand(B, R, topk, bs, H).reshape(B, R, rows_a, H)
+    bias_a = torch.where(m_a, batt.unsqueeze(1), torch.full((), MASK_BIAS, dtype=batt.dtype, device=batt.device))
+    bias_a = bias_a.reshape(E, rows_a, H)
+    lens_tail = rs.body.cache_lens_value(eng, p_rows)                         # the body's length of position p + r
+    lens_a = torch.where(in_tail, lens_tail, torch.full_like(lens_tail, rows_a)).to(torch.int32).reshape(E)
+    q_e = q.reshape(E, 1, Hq, q.shape[2])
+    nsplit = rs.nl._ATTN_SPLITS
+    o_a, lse_a = ops.attn(q_e, katt, vatt, bias_a[:B], cache_seqlens=lens_a, cache_batch_idx=vs.cbi,
+                          num_splits=nsplit, return_softmax_lse=True)
+    vs.calls["attn"] += 1
+    if vs.fa_check is not None and l == 0 and "A" not in vs.fa_check:
+        _fa_check_u(vs, "A", q_e, katt, vatt, bias_a, lens_a, o_a, sorted({0, E // 3, (2 * E) // 3, E - 1}))
+    # THE MERGE runs after each call (log-sum-exp, float32): num / den / mx; a part of length 0 has the weight 0, so an
+    # entry that reads only the window keeps call A's output exactly (num * 1 + 0, den 1)
+    num = o_a.reshape(E, Hq, -1).float()
+    mx = lse_a.reshape(E, Hq, 1).float()
+    den = torch.ones_like(mx)
+
+    def merge(num, den, mx, o_c, l_c):
+        new = torch.maximum(mx, l_c)
+        a, b_ = torch.exp(mx - new), torch.exp(l_c - new)
+        return num * a + o_c * b_, den * a + b_, new
+    # CHECK-ONLY: the blocks each row SEES (mask level): window slots, store slots, slot 0 past the block edge
+    vis_cnt = vis.sum(-1) + (~in_tail).view(1, B, R).to(torch.int64) if ops.check else None
+    o_c, l_c, lens_c, vis_c = _store_call(vs, 0, lst[..., :X - 1], sel_sorted, q_e, row_in, in_tail)
+    num, den, mx = merge(num, den, mx, o_c, l_c)
+    used = (lens_c > 0).any().to(torch.int64) if ops.stats else None
+    streamed = lens_a.to(torch.int64).sum() + lens_c.to(torch.int64).sum() if ops.stats else None
+    if vis_cnt is not None:
+        vis_cnt = vis_cnt + vis_c.sum(-1)
+    _mark(vs, l, "spill")
+    # the SPILL: fills 1 .. C - 1 of the same store (counted in _union_list; never a drop)
+    for c in range(1, vs.C):
+        lo, hi = c * (X - 1), (c + 1) * (X - 1)
+        _store_fill(vs, eng, twin, src_dev, src_host, lo, hi)
+        o_c, l_c, lens_c, vis_c = _store_call(vs, c, lst[..., lo:hi], sel_sorted, q_e, row_in, in_tail)
+        num, den, mx = merge(num, den, mx, o_c, l_c)
+        if used is not None:
+            used = used + (lens_c > 0).any().to(torch.int64)
+            streamed = streamed + lens_c.to(torch.int64).sum()
+        if vis_cnt is not None:
+            vis_cnt = vis_cnt + vis_c.sum(-1)
+    _mark(vs, l, "merge")
+    # 6. the end of the merge (call A is never empty: the tail slot, so mx is finite)
+    o = num / den
+    attn = o.to(q.dtype).reshape(B, R, -1)
+    if used is not None:
+        vs.stat["fills_used"] += used
+        vs.stat["streamed_rows"] += streamed                    # rows the attention calls stream (per entry, per head)
+    _mark(vs, l, "check")
+    # CHECK-ONLY (ops.check) and the rung-L5 seams (vs.miss_ids, vs.pin): the presence of each selected block
+    if ops.check or vs.miss_ids is not None or vs.pin is not None:
+        found = _presence(vs, eng, sel, lst, m)
+        miss = ~found & (sel >= 0)
+        if ops.check:
+            vs.chk_sel[l].copy_(sel)
+            f4 = full.t().reshape(1, B, R, 1)
+            r4 = res.t().reshape(1, B, R, 1)
+            d = miss & f4
+            s_ = miss & r4
+            vs.stat["dropped"] += d.sum()
+            vs.stat["skipped"] += s_.sum()
+            vs.stat_row["dropped"] += d.sum((0, 1, 3))
+            vs.stat_row["skipped"] += s_.sum((0, 1, 3))
+            # UNION RESIDENCY MUST NOT BECOME UNION ATTENTION: a full row sees exactly its selection size; a resident
+            # row sees its selection size minus its skipped blocks (seen and selected are counted per (head, request))
+            n_sel = (sel >= 0).sum(-1)                                        # (H, B, R)
+            want = n_sel - s_.sum(-1)
+            bad = (f4[..., 0] | r4[..., 0]) & (vis_cnt != want)
+            vs.stat["vis_bad"] += bad.sum()
+            vs.stat["visible_blocks"] += vis_cnt.sum()
+            vs.stat_row["vis_bad"] += bad.sum((0, 1))
+            vs.stat_row["visible"] += vis_cnt.sum((0, 1))
+            vs.stat_row["selected"] += n_sel.sum((0, 1))
+        if vs.miss_rows is not None and vs.miss_ids is not None:              # one miss row per request (the draft row)
+            mr = vs.miss_rows.t().reshape(1, B, R, 1)
+            vs.miss_ids[l].copy_(torch.where(miss & mr, sel, vs.minus1).amax(2))
+        if vs.miss_rows is not None and vs.pin is not None:
+            for r in range(R):
+                vs.pin.record(l, sel[:, :, r], vs.miss_rows[r].view(1, B, 1))
+    if ops.record:
+        vs.log[-1].update(q_e=q_e.clone(), out=o.clone(), lens_a=lens_a.clone(), bias_a=bias_a.clone())
+    _mark(vs, l, "end")
+    # 7. the end state (as FAST): write-back of a filled block, the next block's rows into the tail slot, tail id, length
+    p_last = p0 + (R - 1)
+    vs.full.copy_((p0 % bs) + (R - 1) >= bs - 1)
+    vs.wpos.copy_(m * bs + (bs - 1))
+    rs.body.writeback_kernel(eng._k_gpu, eng._v_gpu, eng._k_cpu, eng._v_cpu, vs.full, vs.wpos, tail0, bs)
+    eng._k_gpu[bi, r63] = torch.where(it4, eng._k_gpu[bi, r63], k4c)
+    eng._v_gpu[bi, r63] = torch.where(it4, eng._v_gpu[bi, r63], v4c)
+    eng._kv_bias_gpu[bi, r63] = torch.where(it3, eng._kv_bias_gpu[bi, r63], cis_rows)
+    eng._block_map[..., topk - 1] = ((p_last + 1) // bs).view(1, B).expand(H, B)
+    eng._cache_lens.copy_(rs.body.cache_lens_value(eng, p_last).to(torch.int32))
+    if vs.hooks is not None:
+        vs.hooks.fast_end(l, eng, p0, vs.full, R)
+    return attn
+
+
 # ------------------------------------------------------------------ the layer and the pass
 def _layer(vs: VerifyState, l: int, layer, hidden, pos_flat, cos_sin_cache):
     rs, ops = vs.rs, vs.ops
@@ -541,6 +960,9 @@ def _layer(vs: VerifyState, l: int, layer, hidden, pos_flat, cos_sin_cache):
         if ops.stats:
             _union(vs, sel)
         attn = _exact_rows(vs, l, layer, eng, twin, q, k4, v4, sel, pos_before)
+    elif ops.mode == "union":
+        _mark(vs, l, "resid")
+        attn = _union_rows(vs, l, layer, eng, twin, q, k4, v4, sel, pos_before)
     else:
         _mark(vs, l, "resid")
         attn = _fast_rows(vs, l, layer, eng, twin, q, k4, v4, sel, pos_before)
@@ -590,6 +1012,10 @@ def read_stats(vs: VerifyState) -> dict:
     d = dict(zip(keys, (int(x) for x in vals)))
     nu = vs.stat_n["union"]
     d.update(union_mean=(d["union_sum"] / nu if nu else None), union_samples=nu, sel0_samples=vs.stat_n["sel0"])
+    if vs.ops.mode == "union":                     # WS-B: per-row counts (CHECK-ONLY), the fills
+        d.update({"row_" + k: [int(x) for x in v.cpu()] for k, v in vs.stat_row.items()})
+        d.update(fills=vs.C, cap=vs.cap, check=vs.ops.check)
+    d.update(calls=dict(vs.calls), passes=vs.passes)            # host invocation counts (every mode)
     return d
 
 
@@ -600,3 +1026,13 @@ def phase_ms(marks, elapsed) -> dict:
     for (_, lab, e0), (_, _, e1) in zip(marks[:-1], marks[1:]):
         out[lab] = out.get(lab, 0.0) + float(elapsed(e0, e1))
     return out
+
+
+def layer_ms(marks, elapsed) -> list:
+    """WS-B: the COMPLETE time of each layer of one probe pass, from its first mark to the first mark of the next layer
+    (the last layer: to the "head" mark). Returns [ms] per layer (the phases of phase_ms nest inside these spans)."""
+    firsts = []
+    for lay, _, e in marks:
+        if not firsts or firsts[-1][0] != lay:
+            firsts.append((lay, e))
+    return [float(elapsed(a[1], b[1])) for a, b in zip(firsts[:-1], firsts[1:])]

@@ -59,6 +59,9 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 EFF = ROOT / "benchmarks/Efficiency"
 SPECP = "a6c9d10500aa3070ad6c0fb781e7c05e1438325b"          # nosi-r2-specp: the tree of rung L4P with the undo fix
+# WS-B (nosi-r2-wsb): parts (a) and (b) of Gate 0 read the rung-L5 tip 40ac348 (the change of rung L5); the WS-B change
+# on top of it is pinned by tests_cpu/test_wsb.py (test_gate0_files, test_gate0_*_unchanged)
+SPEC5_TIP = "40ac348870e89b43ac5278458b660dea8d360508"
 STEP_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-spec5"
 HOLDER = "2190876"                     # a lead-owned uuid file that exists (HOLDERS/2190876.gpu_uuid)
 DECLARED = ("nosi/nosi/spec_round.py", "nosi/nosi/spec_prefetch.py", "benchmarks/Efficiency/r2_spec5_cell.py",
@@ -181,19 +184,19 @@ def _same_records(a, b) -> list:
 
 @pytest.mark.parametrize("B", [1, 8], ids=["B1", "B8"])
 def test_flags_off_is_specp(B, tmp_path):
-    if not _have_specp():
-        pytest.skip("no git or no commit %s in %s" % (SPECP, ROOT))
-    # (a) the tree = a6c9d10 except the declared files of rung L5
-    r = _git("diff", "--name-only", SPECP, "--", ".", *[":(exclude)" + f for f in DECLARED + GATE0_TESTS],
+    if not _have_specp() or _git("rev-parse", "-q", "--verify", SPEC5_TIP + "^{commit}").returncode != 0:
+        pytest.skip("no git or no commit %s / %s in %s" % (SPECP, SPEC5_TIP, ROOT))
+    # (a) the rung-L5 tip = a6c9d10 except the declared files of rung L5
+    r = _git("diff", "--name-only", SPECP, SPEC5_TIP, "--", ".", *[":(exclude)" + f for f in DECLARED + GATE0_TESTS],
              ":(exclude,glob)**/__pycache__/**")
     assert r.returncode == 0 and r.stdout.strip() == "", "files differ from %s:\n%s" % (SPECP, r.stdout)
     for f in GATE0_TESTS:                                     # their exclude lists only: one added line each
-        d = _git("diff", "-U0", SPECP, "--", f).stdout.splitlines()
+        d = _git("diff", "-U0", SPECP, SPEC5_TIP, "--", f).stdout.splitlines()
         body = [x for x in d if x[:1] in "+-" and not x.startswith(("+++", "---"))]
         assert body and all(x.startswith("+") and "spec_prefetch" in x for x in body), (f, body[:5])
-    # (b) spec_round.py = a6c9d10's AST + the guarded seams
+    # (b) spec_round.py of the rung-L5 tip = a6c9d10's AST + the guarded seams
     old = _git("show", "%s:nosi/nosi/spec_round.py" % SPECP).stdout
-    assert _stripped(old) == _stripped((ROOT / "nosi/nosi/spec_round.py").read_text())
+    assert _stripped(old) == _stripped(_git("show", "%s:nosi/nosi/spec_round.py" % SPEC5_TIP).stdout)
     # (c) no engine module but spec_round.py names spec_prefetch; no older cell does
     src = {p.name: p.read_text() for p in (ROOT / "nosi/nosi").glob("*.py")}
     assert [n for n, t in src.items() if "spec_prefetch" in t and n not in ("spec_round.py", "spec_prefetch.py")] == []
