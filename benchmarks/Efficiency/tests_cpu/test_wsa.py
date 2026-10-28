@@ -824,7 +824,18 @@ def test_wsa_cell_arguments_and_report():
     bad = dict(res, read=dict(res["read"], count=[steps + 1] + res["read"]["count"][1:]))
     assert not {x[0]: x for x in C.arm_gates_w("L4PT", bad, t, steps)}["L4PT-COMMIT-N"][2]
     p = C.verdicts(sh, recs, B)
-    assert all(v in ("REPORT", "NOT_RUN") for _, v, _ in p), p                # PRED_WSA is TBD: REPORT only
+    assert all(v in ("REPORT", "NOT_RUN") for _, v, _ in p), p   # the flat PRED_WSA is None and B 8 has no entry
+    assert set(C.PRED_WSA_BY_B) == {216, 318} and all(set(b) < set(C.PRED_WSA) for b in C.PRED_WSA_BY_B.values())
+    old = C.PRED_WSA_BY_B.get(B)
+    try:
+        C.PRED_WSA_BY_B[B] = dict(L4PJ_tok=False)
+        p = {n: v for n, v, _ in C.verdicts(sh, recs, B)}
+        assert p["L4PJ-TOK"] == "REFUTED", p                         # the per-batch entry overrides the flat None
+    finally:
+        if old is None:
+            del C.PRED_WSA_BY_B[B]
+        else:
+            C.PRED_WSA_BY_B[B] = old
 
 
 def _step(cell, sha="0" * 40):

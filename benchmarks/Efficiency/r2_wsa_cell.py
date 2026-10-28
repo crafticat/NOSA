@@ -105,9 +105,25 @@ BUDGET_GB = 84.0
 #   L4PJ_vs_L4P        (low, high): L4PJ's / L4P's median steady committed tok/s (the schedule's change, EXACT)
 # Inputs (MEASURED, SCORING_specp_fix.md section 7): L4P rollback per round (truncate + commit) 317.3 ms = 4.92 SH steps
 # at C 128 B 216, 398.8 ms = 3.22 at C 73 B 318; the fifth (deferred) row +93.5 / +120.5 ms.
-PRED_STAMP_WSA = None
+# The lead's REGISTRATION (2026-10-28T11:28:09Z, `date -u`, before any WS-A cell ran). The two timing cells differ in
+# kind (SH step 64.48 / 124.00 ms; legacy L4P round 896.3 / 1,267.3 ms), so the bands are per batch: PRED_WSA_BY_B[B]
+# overrides PRED_WSA in verdicts(); a batch without an entry (wa1m, B 8) uses PRED_WSA (all None: REPORT).
+# MEASURED inputs (SCORING_specp_fix.md section 7; CHECKPOINTS I0a / I0b): legacy L4P joint 424.2 / 660.4 ms (5 rows;
+# the deferred row +93.5 / +120.5), truncate + commit 317.3 / 398.8 ms, drafts 155.0 / 210.8 ms; yield 2.947 / 2.905
+# committed per request-round; L4P / SH 0.2115 / 0.2864. MODEL (NOTES_wsa.md section 7): L4PT round about 400-460 ms
+# (C 128) and about 650 ms (C 73); band edges 380-560 / 580-850 ms for the unmeasured per-row hook share and the call-B +
+# merge cost. L4PJ runs the new schedule with the journal: round about the legacy one (+-), tokens per round -1..2 %
+# (NOTES section 4, choice 2). L4PT_agree is a floor on the equal-token fraction: FAST differs from SH by float order
+# only (no dropped block), so it should beat L4F's 0.35-0.38 (SCORING_specp_fix.md section 6); floor 0.25.
+PRED_STAMP_WSA = "2026-10-28T11:28:09Z"
 PRED_WSA = dict(stamp=PRED_STAMP_WSA, L4PT_rollback_sh=None, L4PT_ratio=None, L4PT_vs_L4PJ=None,
                 L4PT_joint_saving=None, L4PT_agree=None, L4PJ_tok=None, L4PJ_vs_L4P=None)
+PRED_WSA_BY_B = {
+    216: dict(L4PT_rollback_sh=(0.02, 0.30), L4PT_ratio=(0.32, 0.52), L4PT_vs_L4PJ=(1.50, 2.50),
+              L4PT_joint_saving=(60.0, 180.0), L4PT_agree=0.25, L4PJ_tok=True, L4PJ_vs_L4P=(0.92, 1.08)),
+    318: dict(L4PT_rollback_sh=(0.01, 0.30), L4PT_ratio=(0.40, 0.62), L4PT_vs_L4PJ=(1.40, 2.30),
+              L4PT_joint_saving=(100.0, 280.0), L4PT_agree=0.25, L4PJ_tok=True, L4PJ_vs_L4P=(0.92, 1.08)),
+}
 
 
 def log(msg):
@@ -374,8 +390,10 @@ def arm_gates_w(arm, res, rec, steps: int, require_stress: bool = False):
 
 
 def verdicts(sh, sp, B: int):
-    """PRED_WSA against the arms: [(name, verdict, detail)]; None registered gives REPORT; NOT_RUN without the arm."""
-    P = PRED_WSA
+    """PRED_WSA against the arms: [(name, verdict, detail)]; None registered gives REPORT; NOT_RUN without the arm.
+    PRED_WSA_BY_B[B] overrides PRED_WSA key by key."""
+    P = dict(PRED_WSA)
+    P.update(PRED_WSA_BY_B.get(B) or {})
     out = []
 
     def band(name, v, b):
@@ -605,7 +623,8 @@ def main(argv=None) -> int:
                 spec_rounds=a.spec_rounds, spec_journal_blocks=a.spec_journal_blocks, spec_extra=a.spec_extra,
                 spec_twin=a.spec_twin, spec_body=a.spec_body, spec_graph=a.spec_graph, spec_redirect=a.spec_redirect,
                 probe_every=a.probe_every, check_every=a.check_every, require_stress=a.require_stress,
-                predictions=PRED_WSA, strongest_tok_s=STRONGEST, dims=dims, host_mem=mem,
+                predictions=dict(PRED_WSA, by_batch=PRED_WSA_BY_B), strongest_tok_s=STRONGEST, dims=dims,
+                host_mem=mem,
                 base_commit=os.environ.get("BASE_COMMIT"))
     summary = dict(meta=meta, SH=sh, SPEC=sp,
                    gates=[dict(name=g[0], must=g[1], passed=bool(g[2]), detail=g[3]) for g in gates],
