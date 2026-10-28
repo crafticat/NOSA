@@ -285,8 +285,15 @@ GPU, after the CPU suite is green (a clean checkout at the I2 commit <sha>; hold
 | i2_1fd7c9c_c.txt | 1fd7c9c | test_wsb.py | 26 passed, 1 skipped (WS-B's DRYRUN) |
 | i2_1fd7c9c_d.txt | 1fd7c9c | test_spec_prefetch.py | 23 passed, 1 skipped |
 | i2_1fd7c9c_e.txt | 1fd7c9c | test_spec_round.py, test_spec_paper.py, test_rollback.py, test_verify_rows.py, test_ragged_engine.py | 118 passed, 4 skipped (other trees' DRYRUNs) |
-| i2_55551c3_a.txt | 55551c3 | test_i2.py | see the report |
-| i2_e6a1cf9_a.txt | e6a1cf9 | test_i2.py | see the report |
+| i2_55551c3_a.txt | 55551c3 | test_i2.py | 31 passed |
+| i2_e6a1cf9_a.txt | e6a1cf9 | test_i2.py | 31 passed (the DRYRUN test ran, not skipped; 7cf2a39 changed only these notes and a cell docstring during the run) |
+
+Measured on the stand-ins (i2_e6a1cf9_a.txt, -s): L4PTU max |logit - SH's| 1.6e-6 (B 1), 3.7e-6 (B 8), selections equal
+on 46 / 368 compared rows, union extras 237 / 1,826 (pool 158 / 1,263, host 79 / 563); teacher-forced: 0 of 96 / 768
+selection sets changed, max |dlogit| 3.0e-6 / 4.5e-6; cost: 7 torch calls per reset and 66 per commit in both runs;
+WS-G: WJ, WT, WU pass every part, WUP fails SEL, GREEDY, MISS (miss 792) and is caught. NOTE: gemm natural gave the
+same numbers as rowgroup on the CPU (the stand-in GEMM is row-invariant): the B8nat case does not test the GEMM's
+rounding; only the GPU can.
 
 The logs start with container noise (`"sed": executable file not found in $PATH`): the image's start scripts look for
 tools that the compute PATH does not hold; no test calls them.
