@@ -94,10 +94,24 @@ PHASE_GROUPS_F = dict(residency=("resid",), write=("write",), chain=("chain",), 
 #   I3_above_I2X      True: the rung falsifier "L4PTF below I2X in the same job" (I3-ABOVE-I2X)
 #   I3_peak_gb        the L4PTF arm's peak allocated GB (gpu_peak_alloc_GB)
 # The builder's INFERENCE (docs/NOTES_i3.md section 7, with the arithmetic) is an input for the lead, not a registration.
-PRED_STAMP_I3 = None
+# The lead's REGISTRATION (2026-10-28T23:36:18Z, `date -u`, before any I3 cell ran). MEASURED inputs: I2X (i2ax / i2bx,
+# SCORING_i2x.md): L4PTU-X / SH 0.4310 / 0.5165, joint 273.983 / 466.248 ms, I2X / I1 1.0929 / 1.0680, arm peak 83.461 /
+# 78.260 GB; I1 / SH 0.394 / 0.484; WS-C wc1b (C 73, legacy L4 schedule): fork joint saving 131.7 ms vs X 48 union, of which
+# about 52 ms is the spill (I2X), so about 80 ms is the fork. MODEL (NOTES_i3.md section 7, the builder's): joint 388 ms
+# (376-421) at C 73, 203 ms (185-240) at C 128 (weaker basis). Bands widened slightly from the builder's toward the
+# measured I2X and to cover the CB0 / CB1 copies (2-6 ms, MODEL). Memory: L4PTF arm about 83.9 GB at C 128 (0.1 GB margin,
+# NOTES risk 1): an OOM there is a RUN failure, not a band miss.
+PRED_STAMP_I3 = "2026-10-28T23:36:18Z"
 PRED_KEYS = ("I3_ratio", "I3_vs_I1", "I3_vs_I2X", "I3_joint_sh", "I3_joint_saving", "I3_rollback_sh", "I1_ratio",
              "I2X_ratio", "I3_agree", "I3_above_I2X", "I3_peak_gb")
-PRED_I3_BY_B = {216: {k: None for k in PRED_KEYS}, 318: {k: None for k in PRED_KEYS}}
+PRED_I3_BY_B = {
+    216: dict(I3_ratio=(0.44, 0.54), I3_vs_I1=(1.10, 1.35), I3_vs_I2X=(1.03, 1.22), I3_joint_sh=(2.8, 3.8),
+              I3_joint_saving=(20.0, 90.0), I3_rollback_sh=(0.03, 0.30), I1_ratio=(0.37, 0.42), I2X_ratio=(0.41, 0.45),
+              I3_agree=0.25, I3_above_I2X=True, I3_peak_gb=(83.0, 84.5)),
+    318: dict(I3_ratio=(0.54, 0.61), I3_vs_I1=(1.10, 1.25), I3_vs_I2X=(1.04, 1.16), I3_joint_sh=(2.9, 3.5),
+              I3_joint_saving=(40.0, 95.0), I3_rollback_sh=(0.03, 0.30), I1_ratio=(0.45, 0.51), I2X_ratio=(0.49, 0.55),
+              I3_agree=0.25, I3_above_I2X=True, I3_peak_gb=(76.5, 79.5)),
+}
 
 
 def log(msg):
