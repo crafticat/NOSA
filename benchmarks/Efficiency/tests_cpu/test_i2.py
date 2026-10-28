@@ -80,6 +80,17 @@ I2_NEW = ("nosi/nosi/spec_tentative_union.py", "benchmarks/Efficiency/r2_i2_cell
           "benchmarks/Efficiency/r2_wsg_check.py")
 WSG = "b1ae579"                                              # r2-wsgreg: WS-G with the lead's registration
 WSG_COPY = "benchmarks/Efficiency/r2_wsg_check.py"          # copied from WSG unchanged
+# I3 (nosi-r2-i3 = this tree 63da01d + WS-C2 db21536 + the arm L4PTF): WS-C's files and the I3 files are declared too
+# (their own Gate 0s: tests_cpu/test_wsc.py, tests_cpu/test_i3.py); WS-C edited two of WS-B's files (verify_rows.py,
+# spec_round.py): they are WS-C2's bytes here
+WSC2 = "db21536c4e97f651cbac8cc9b95a376ff5dc76db"
+WSC_EDITED = ("nosi/nosi/verify_rows.py", "nosi/nosi/spec_round.py")
+I3_FILES = ("benchmarks/Efficiency/fork_vllm_unified_attention.py", "benchmarks/Efficiency/r2_kv_arena.py",
+            "benchmarks/Efficiency/r2_wsc_cell.py", "benchmarks/Efficiency/r2_wsc_step.sh", T_ + "wsc_world.py",
+            T_ + "test_wsc.py", T_ + "test_wsc_interp.py", "docs/NOTES_wsc.md",                       # WS-C
+            "nosi/nosi/spec_tentative_fork.py", "benchmarks/Efficiency/r2_i3_arena.py",
+            "benchmarks/Efficiency/r2_i3_cell.py", "benchmarks/Efficiency/r2_i3_step.sh", T_ + "i3_world.py",
+            T_ + "test_i3.py", T_ + "test_i3_interp.py", "docs/NOTES_i3.md")                          # I3
 SEAM_CHANGED = {"#0", "TentState._layer", "TentState._row", "TentRunner.__init__"}
 SEAM_ADDED = {"TentState._rows", "TentState._resid", "TentState._write", "TentRunner._joint_ops", "TentRunner._make_state"}
 
@@ -152,11 +163,13 @@ def test_i2_gate0_files():
     wsb_files = [x for x in _git("diff", "--name-only", SPEC5, WSB).stdout.split("\n") if x]
     r = _git("diff", "--name-only", SPEC5, "--", ".", ":(exclude,glob)**/__pycache__/**")
     changed = {x for x in r.stdout.split("\n") if x}
-    declared = set(wsa_files) | set(wsb_files) | set(I2_EDITED) | set(MERGED) | set(I2_NEW)
+    declared = set(wsa_files) | set(wsb_files) | set(I2_EDITED) | set(MERGED) | set(I2_NEW) | set(I3_FILES)   # I3
     assert changed <= declared, sorted(changed - declared)                 # (a) nothing else moved
     assert set(SAME_AS_WSA) <= set(wsa_files) and set(SAME_AS_WSB) <= set(wsb_files)
     assert _git("diff", "--name-only", WSA, "--", *SAME_AS_WSA).stdout.strip() == ""    # (b) the branches' bytes
-    assert _git("diff", "--name-only", WSB, "--", *SAME_AS_WSB).stdout.strip() == ""
+    assert _git("diff", "--name-only", WSB, "--", *[f for f in SAME_AS_WSB if f not in WSC_EDITED]).stdout.strip() == ""
+    if _have(WSC2):                                                        # I3: WS-C's two edited WS-B files
+        assert _git("diff", "--name-only", WSC2, "--", *WSC_EDITED).stdout.strip() == ""
     assert set(wsa_files) | set(wsb_files) <= set(SAME_AS_WSA) | set(SAME_AS_WSB) | set(I2_EDITED) | set(MERGED) | set(
         I2_NEW), "a branch file is neither kept nor declared as edited"
     f = MERGED[0]                                                          # (c) test_spec_prefetch.py: both sides
@@ -183,7 +196,7 @@ def test_i2_gate0_files():
     for name in ("spec_round", "ragged_rollback", "state_snapshot", "spec_prefetch"):
         assert name not in src["spec_tentative_union.py"], name
     assert sorted(n for n, t in src.items() if "spec_tentative_union" in t and n != "spec_tentative_union.py") == [
-        "spec_tentative.py"]                                           # only the seams' docstring names it
+        "spec_tentative.py", "spec_tentative_fork.py"]                 # the seams' docstring; I3's module imports it
     for c in ("r2_spec_cell.py", "r2_spec5_cell.py", "r2_base_cell.py", "r2_verify_cell.py", "r2_wsa_cell.py",
               "r2_wsb_cell.py"):
         assert "spec_tentative_union" not in (EFF / c).read_text(), c

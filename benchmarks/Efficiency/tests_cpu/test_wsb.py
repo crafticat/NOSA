@@ -87,6 +87,11 @@ DECLARED = DECLARED + ("nosi/nosi/spec_tentative.py", "benchmarks/Efficiency/r2_
                        "benchmarks/Efficiency/r2_i2_step.sh", "benchmarks/Efficiency/tests_cpu/i2_world.py",
                        "benchmarks/Efficiency/tests_cpu/test_i2.py", "docs/NOTES_i2.md",                # I2
                        "benchmarks/Efficiency/r2_i2_check.py", "benchmarks/Efficiency/r2_wsg_check.py")  # I2
+# I3 (nosi-r2-i3: I2 63da01d + WS-C2 db21536 + the arm L4PTF): its files (its own Gate 0: tests_cpu/test_i3.py)
+DECLARED = DECLARED + ("nosi/nosi/spec_tentative_fork.py", "benchmarks/Efficiency/r2_i3_arena.py",
+                       "benchmarks/Efficiency/r2_i3_cell.py", "benchmarks/Efficiency/r2_i3_step.sh",
+                       "benchmarks/Efficiency/tests_cpu/i3_world.py", "benchmarks/Efficiency/tests_cpu/test_i3.py",
+                       "benchmarks/Efficiency/tests_cpu/test_i3_interp.py", "docs/NOTES_i3.md")
 
 
 def _load(name):

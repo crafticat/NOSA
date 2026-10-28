@@ -63,6 +63,25 @@ DECLARED = ("nosi/nosi/verify_rows.py", "nosi/nosi/spec_round.py", "benchmarks/E
             "benchmarks/Efficiency/r2_wsc_step.sh", "benchmarks/Efficiency/tests_cpu/wsc_world.py",
             "benchmarks/Efficiency/tests_cpu/test_wsc.py", "benchmarks/Efficiency/tests_cpu/test_wsc_interp.py",
             "benchmarks/Efficiency/tests_cpu/test_wsb.py", "docs/NOTES_wsc.md")
+# I3 (nosi-r2-i3 = I2 63da01d + this branch db21536 + the arm L4PTF): the files of WS-A and I2 (their own Gate 0s:
+# tests_cpu/test_wsa.py, tests_cpu/test_i2.py; WS-A's added Gate-0 lines in the older tests) and the I3 files (its
+# Gate 0: tests_cpu/test_i3.py) are declared too
+DECLARED = DECLARED + ("nosi/nosi/spec_tentative.py", "benchmarks/Efficiency/r2_wsa_cell.py",
+                       "benchmarks/Efficiency/r2_wsa_step.sh", "benchmarks/Efficiency/tests_cpu/wsa_world.py",
+                       "benchmarks/Efficiency/tests_cpu/test_wsa.py", "docs/NOTES_wsa.md",               # WS-A
+                       "benchmarks/Efficiency/tests_cpu/test_ragged_engine.py",
+                       "benchmarks/Efficiency/tests_cpu/test_verify_rows.py",
+                       "benchmarks/Efficiency/tests_cpu/test_rollback.py",
+                       "benchmarks/Efficiency/tests_cpu/test_spec_round.py",
+                       "benchmarks/Efficiency/tests_cpu/test_spec_prefetch.py",                         # WS-A, I2 lines
+                       "nosi/nosi/spec_tentative_union.py", "benchmarks/Efficiency/r2_i2_cell.py",
+                       "benchmarks/Efficiency/r2_i2_step.sh", "benchmarks/Efficiency/tests_cpu/i2_world.py",
+                       "benchmarks/Efficiency/tests_cpu/test_i2.py", "docs/NOTES_i2.md",
+                       "benchmarks/Efficiency/r2_i2_check.py", "benchmarks/Efficiency/r2_wsg_check.py",  # I2
+                       "nosi/nosi/spec_tentative_fork.py", "benchmarks/Efficiency/r2_i3_arena.py",
+                       "benchmarks/Efficiency/r2_i3_cell.py", "benchmarks/Efficiency/r2_i3_step.sh",
+                       "benchmarks/Efficiency/tests_cpu/i3_world.py", "benchmarks/Efficiency/tests_cpu/test_i3.py",
+                       "benchmarks/Efficiency/tests_cpu/test_i3_interp.py", "docs/NOTES_i3.md")         # I3
 
 
 def _load(name):

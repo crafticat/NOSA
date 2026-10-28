@@ -83,6 +83,16 @@ DECLARED = DECLARED + ("nosi/nosi/verify_rows.py", "nosi/nosi/spec_round.py", "b
                        "benchmarks/Efficiency/r2_i2_step.sh", "benchmarks/Efficiency/tests_cpu/i2_world.py",
                        "benchmarks/Efficiency/tests_cpu/test_i2.py", "docs/NOTES_i2.md",                # I2
                        "benchmarks/Efficiency/r2_i2_check.py", "benchmarks/Efficiency/r2_wsg_check.py")  # I2
+# I3 (nosi-r2-i3: I2 63da01d + WS-C2 db21536 + the arm L4PTF): WS-C's files and the I3 files are declared too (their own
+# Gate 0s: tests_cpu/test_wsc.py, tests_cpu/test_i3.py)
+DECLARED = DECLARED + ("benchmarks/Efficiency/fork_vllm_unified_attention.py", "benchmarks/Efficiency/r2_kv_arena.py",
+                       "benchmarks/Efficiency/r2_wsc_cell.py", "benchmarks/Efficiency/r2_wsc_step.sh",
+                       "benchmarks/Efficiency/tests_cpu/wsc_world.py", "benchmarks/Efficiency/tests_cpu/test_wsc.py",
+                       "benchmarks/Efficiency/tests_cpu/test_wsc_interp.py", "docs/NOTES_wsc.md",       # WS-C
+                       "nosi/nosi/spec_tentative_fork.py", "benchmarks/Efficiency/r2_i3_arena.py",
+                       "benchmarks/Efficiency/r2_i3_cell.py", "benchmarks/Efficiency/r2_i3_step.sh",
+                       "benchmarks/Efficiency/tests_cpu/i3_world.py", "benchmarks/Efficiency/tests_cpu/test_i3.py",
+                       "benchmarks/Efficiency/tests_cpu/test_i3_interp.py", "docs/NOTES_i3.md")         # I3
 
 
 def _load(name):
@@ -181,8 +191,8 @@ def test_wsa_flag_off_is_spec5(B):
             body = [x for x in body if x not in wsb]          # I2: WS-B's own lines of this file (its Gate 0)
             assert body and all(x.startswith("+") and "spec_tentative" in x for x in body), (f, body[:5])
     src = {p.name: p.read_text() for p in (ROOT / "nosi/nosi").glob("*.py")}
-    assert [n for n, t in src.items() if "spec_tentative" in t and n not in ("spec_tentative.py",
-                                                                             "spec_tentative_union.py")] == []   # I2
+    assert [n for n, t in src.items() if "spec_tentative" in t and n not in (
+        "spec_tentative.py", "spec_tentative_union.py", "spec_tentative_fork.py")] == []   # I2, I3
     for name in ("ragged_rollback", "state_snapshot", "spec_prefetch"):   # the older Gate 0 name scans stay true
         assert name not in src["spec_tentative.py"], name
     for f in ("r2_spec_cell.py", "r2_spec5_cell.py", "r2_base_cell.py", "r2_verify_cell.py"):
