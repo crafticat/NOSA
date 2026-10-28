@@ -7,6 +7,11 @@ THE GEOMETRY. The real launcher needs BLOCK_M = rows x query heads per KV head >
 a head dim the tl.dot accepts: the child sets ragged_world's HQ 8 and D 16 (fia5's GEOM4: Hq 8, Hkv 2, D 16) before it
 builds anything (2 query heads per KV head, the default world, gives BLOCK_M 8: J0 shows the refusal).
 
+THE BIAS CONVENTION. The real kernels compute (q.k + bias) x scale (flash_fwd_kernel.h:968-971, :1021; the fork :669);
+the CPU world's SH stand-in computes q.k x scale + bias (ragged_world.py:327-328). The child switches the world's SH to
+the kernel convention first (wsc_world.use_kernel_bias), so the REAL fork is compared with an SH of the same math; J1's
+stand-in uses the kernel convention too (make_fake_fork(16, "kernel")).
+
 J0  the real launcher refuses BLOCK_M 8 (the default CPU world): why test_wsc.py uses the stand-in.
 J1  the real fork and the stand-in (make_fake_fork(16)) on the SAME inputs of union fork passes (TeeFork): the union
     tables (entries below the length) and the lengths equal; the outputs within 1e-4 relative (fia5's interpreter
@@ -56,6 +61,7 @@ W = load("ragged_world", os.path.join(HERE, "ragged_world.py"))
 W.HQ, W.D = 8, 16                                    # fia5's GEOM4: BLOCK_M = 4 x 4 = 16, head dim 16
 W.CFG = types.SimpleNamespace(num_hidden_layers=W.L, num_key_value_heads=W.HKV, head_dim=W.D)
 Z = load("wsc_world", os.path.join(HERE, "wsc_world.py"))
+Z.use_kernel_bias()                                 # SH's stand-in with the REAL kernels' (q.k + bias) x scale
 F = load("fork_real", sys.argv[2])
 real = F.unified_attention
 fails, ran = [], []
@@ -86,7 +92,7 @@ except AssertionError:
     check("J0_block_m_8_refused", True)
 
 # J1 the real fork against the stand-in on the same inputs (two union fork passes)
-tee = Z.TeeFork(Z.make_fake_fork(16), real)
+tee = Z.TeeFork(Z.make_fake_fork(16, "kernel"), real)
 ev1 = Z.run_fork_vs_sh(S4, 2, fork=tee, probe=False)
 check("J1_calls", len(tee.diffs) >= 2 * W.L, len(tee.diffs))
 check("J1_tables_equal", all(tee.tables_equal), tee.tables_equal)

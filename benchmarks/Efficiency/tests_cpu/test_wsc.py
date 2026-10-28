@@ -327,6 +327,10 @@ def test_fake_fork_semantics():
     d = float(((out.double() - ref).abs() / (1 + ref.abs())).max())
     assert d <= 1e-5, d
     assert bool((out[0] != 0).any()) and bool(torch.isfinite(out).all())       # the F4 row still sees its blocks
+    ok, *_ = _launch(Z.make_fake_fork(1, "kernel"), q, k, v, bias, build, cu)  # the real kernels' (q.k + b) x scale
+    refk = Z.fork_ref64(q, k, v, bias, build, cu, q.shape[-1] ** -0.5, bias="kernel")
+    assert float(((ok.double() - refk).abs() / (1 + refk.abs())).max()) <= 1e-5
+    assert float((ok.double() - out.double()).abs().max()) > 1e-3             # the two conventions differ (bias != 0)
     t2, x2, l2 = Z.union_ref(build, cu.tolist(), 2, 128)
     assert torch.equal(ln.to(torch.int64), l2)
     live = torch.arange(128).view(1, 1, -1) < l2.unsqueeze(-1)

@@ -19,13 +19,13 @@
 |---|---|
 | `benchmarks/Efficiency/fork_vllm_unified_attention.py` | the fork, byte copy of fia6's (an existing component). Outside `nosi/nosi` on purpose: four older Gate-0 tests diff `nosi/nosi` against fixed tips (test_verify_rows.py:96, test_rollback.py:122, test_spec_round.py:128, test_ragged_engine.py:96); a new file there would fail them |
 | `benchmarks/Efficiency/r2_kv_arena.py` | the K / V / bias ARENA: one allocation for every layer's engine rows and the union store (section 2a); `PrefillHook` re-homes during the shipped prefill; `rehome` for CPU worlds; `attach` sets `rs.kv_arena` |
-| `nosi/nosi/verify_rows.py` | `VerifyOps(joint_attn="fork", fork=..., full_max=...)` (default "store" = WS-B, unchanged); `_fork_state` :1010, `_fork_call` :1095, `_fork_locate` :1105, `_fork_lists` :1179, `_fork_vb` :1211, `_fork_probe` :1269, `_fork_rows` :1307; the branch in `_layer` :1468; negative controls `fork_union_rows`, `fork_small_store`, `fork_probe_swap` |
+| `nosi/nosi/verify_rows.py` | `VerifyOps(joint_attn="fork", fork=..., full_max=...)` (default "store" = WS-B, unchanged); `_fork_state` :1010, `_fork_call` :1095, `_fork_locate` :1105, `_fork_lists` :1180, `_fork_vb` :1212, `_fork_probe` :1270, `_fork_rows` :1308; the branch in `_layer` :1471; negative controls `fork_union_rows`, `fork_small_store`, `fork_probe_swap` |
 | `nosi/nosi/spec_round.py` | `SpecOps(joint_attn, fork)` passed to the union `VerifyOps` (L4: :635-637; L4P: :627-631 with `full_max=K`) |
 | `benchmarks/Efficiency/r2_wsc_cell.py` | the GPU cell: SH; timing L4X, L4XU (WS-B's functions), L4XF (fork); check SHR, UC / UCR (WS-B), UCF / UCFR (fork); `PRED_WSC` (every value None) and `PRED_STAMP_WSC = None` :67-70 |
 | `benchmarks/Efficiency/r2_wsc_step.sh` | a copy of `r2_wsb_step.sh`: cells wc1m, wc1a, wc1b, wc1ca, wc1cb (:70-74); the fork blob pin (:99); wc1a / wc1b STOP while `PRED_STAMP_WSC = None` (:100-102) |
 | `benchmarks/Efficiency/tests_cpu/wsc_world.py` | the CPU world: `fake_fork` (the fork's torch stand-in), `fork_ref64`, `union_ref`, `TeeFork`, `run_fork_vs_sh`, `fork_bytes`, `run_spec_fork`, `joint_run_union` |
 | `benchmarks/Efficiency/tests_cpu/test_wsc.py` | the in-process CPU tests (section 5) |
-| `benchmarks/Efficiency/tests_cpu/test_wsc_interp.py` | the REAL fork under the Triton interpreter in a child process (section 5; ITS OWN srun) |
+| `benchmarks/Efficiency/tests_cpu/test_wsc_interp.py` | the REAL fork under the Triton interpreter in a child process (section 5; its own srun) |
 | `benchmarks/Efficiency/tests_cpu/test_wsb.py` | Gate 0's DECLARED list gets the WS-C files (nothing else) |
 
 ## 2. The design questions (answered before the code)
@@ -52,9 +52,9 @@
      the attended views of cache_engine.py:298-301), so every shipped kernel sees what it saw before (lesson L28).
      CHOSEN.
 - The fork gets entry 0 and `slots_per_entry = 1`, so `entry * 1 + slot` IS the arena block id (verify_rows
-  `_fork_state` :1084-1086, `_fork_lists` :1183). Pool hits are read IN PLACE through their pool slot (`_fork_locate`
-  :1120-1124, :1145-1147): no device copy (WS-B copied them into its store). Only HOST-only blocks of FULL rows go to
-  the store (one fill, :1358-1362).
+  `_fork_state` :1084-1086, `_fork_lists` :1184). Pool hits are read IN PLACE through their pool slot (`_fork_locate`
+  :1122-1126, :1146-1149): no device copy (WS-B copied them into its store). Only HOST-only blocks of FULL rows go to
+  the store (one fill, :1361-1365).
 - C = 1: the store holds X - 1 >= the bound `(full_max - 1) x topk` listed blocks (the window = row 0's selection, so
   each other full row adds at most topk): `_fork_state` :1029-1035 refuses less (tests only: `fork_small_store`); the
   stat `unserved` stays the MUST witness. L4XF: full_max = K = 3 -> X = 129. UCF / UCFR (every row full): X = 193.
@@ -84,17 +84,17 @@
   store's bias rows for listed blocks and slot 0) and masks per ROW by its 8-bit extents (fork :578-594, :657-660;
   -inf in S :674-676). So there is no (E, rows, H) bias build, no MASK_BIAS, no merge.
 - The extents = SH's per-row cut. A row lists only its own PRESENT selected blocks in ascending id (`_fork_lists`
-  :1201-1204); its LAST listed page is its own block (the local window forces it into every selection), and the fork
+  :1202-1205); its LAST listed page is its own block (the local window forces it into every selection), and the fork
   gives the last listed page the row's `last_len` (fork :370) = the body's attention length past the tail base
-  (`_fork_lists` :1208; r2_decode_body.py:87-93: `base + (q + 1) % 64` with F4 kept). Every other listed block: 64.
+  (`_fork_lists` :1209; r2_decode_body.py:87-93: `base + (q + 1) % 64` with F4 kept). Every other listed block: 64.
   - an IN-TAIL row (its block m): m is in the window's tail slot (`_block_map[..., topk - 1] = m`, set by the end
-    state :1427 and kept by the diff because row 0 selects m); it sees m up to its own position; the F4 row (q % 64 =
+    state :1430 and kept by the diff because row 0 selects m); it sees m up to its own position; the F4 row (q % 64 =
     63) sees 0 tokens of m, as SH's step (r2_decode_body.py:93).
-  - a PAST-EDGE row (its block m + 1): m + 1 lives in store slot 0 (step 1 writes the past-edge rows there, :1334-1336);
+  - a PAST-EDGE row (its block m + 1): m + 1 lives in store slot 0 (step 1 writes the past-edge rows there, :1337-1339);
     it sees m + 1 up to its own position; it sees block m (complete: the in-tail rows of the same pass wrote its last
     rows at step 1) with 64 tokens ONLY if its selection lists m. WS-B's risk 8 (call A always shows the tail slot to
     every row, verify_rows.py :900) does not exist on the fork path.
-- Gates for it: VB (`_fork_vb` :1211-1267: the (block id, tokens) multiset that the KERNEL's table shows each row =
+- Gates for it: VB (`_fork_vb` :1212-1268: the (block id, tokens) multiset that the KERNEL's table shows each row =
   the row's own selection with these token counts; F4 tails with 0 tokens are not shown on either side) and the byte
   check of the CPU tests (`wsc_world.fork_bytes`).
 
@@ -127,16 +127,16 @@
   outside every timed round. The Triton launcher costs 0.1238 ms of host time per call (SCORING_fia6.md line 315):
   32 x 0.1238 = 3.96 ms per pass of host time, hidden while the device queue stays ahead (INFERENCE).
 
-## 3. One layer of the fork path (`_fork_rows` :1307-1431)
+## 3. One layer of the fork path (`_fork_rows` :1308-1434)
 
 1. the tentative rows (WS-B's lines): the tail block's rows into the tail slot, the next block's into store slot 0.
 2. ONE residency (WS-B's lines): row 0's selection, diff + victim pool + map commit + the two host gathers.
-3. "union": `_fork_locate` (:1105-1176): each selected id -> window slot / pool slot (in place) / store slot 0 / store
+3. "union": `_fork_locate` (:1105-1177): each selected id -> window slot / pool slot (in place) / store slot 0 / store
    slot 1 + j of the HOST list (distinct host-only ids of FULL rows, in id order; at most cap). Sorted searches only.
 4. "fetch": ONE store fill of the listed host blocks with the shipped gathers (`calls["fills"]` += 1).
-5. "attn": `_fork_lists` (:1179-1208) and ONE fork call for every row of every request (`calls["attn"]` += 1).
+5. "attn": `_fork_lists` (:1180-1209) and ONE fork call for every row of every request (`calls["attn"]` += 1).
 6. "check" (CHECK-ONLY): PRESENT (dropped / skipped from the locations), VIS and VB from the kernel's tables, G_block0,
-   the stats; layer 0 once with `vs.fa_check`: the "F" and "RA" probes (`_fork_probe` :1269-1304). The rung-L5 seams
+   the stats; layer 0 once with `vs.fa_check`: the "F" and "RA" probes (`_fork_probe` :1270-1305). The rung-L5 seams
    (`miss_ids`, `pin`) as WS-B.
 7. "end": WS-B's end state (write-back, the next block's rows into the tail slot, tail id, length).
 
@@ -185,7 +185,7 @@ Regressions (must stay green):
 | test_gate0_spec_round_store_unchanged[L4XU, L4PU] | the round runner = the 1a8ce68 source, bit for bit | both accept paths ran |
 | test_arena_rehome | one allocation; contiguous views, the old strides; bits kept; block ids; 3 serial steps bitwise = a plain world | wrong B refused; A's engines not bound refused |
 | test_prefill_hook | the shipped prefill re-homed layer by layer = the plain prefill, bitwise; the wrappers removed | - |
-| test_fake_fork_semantics | the stand-in = float64 reference (1e-5); its tables = an independent builder; a row alone bitwise | an unsorted list, a small table, BLOCK_M 8 with the real launcher's check: refused |
+| test_fake_fork_semantics | the stand-in = float64 reference (1e-5) in both bias conventions; its tables = an independent builder; a row alone bitwise | the two conventions differ; an unsorted list, a small table, BLOCK_M 8 with the real launcher's check: refused |
 | test_fork_vs_sh[B1, B8, B4L, B8nat] | SEL = SH; PRESENT; VIS; VB; G_block0; F and RA bitwise; argmax = SH, delta <= 1e-4; 1 residency, 1 fork call, 1 fill per layer | a block edge, F4 rows, past-edge rows; B4L (95-97 blocks): listed host blocks read |
 | test_fork_attention_is_sh_math | every full row = SH's attention in float64 (2e-5) | past-edge and F4 rows |
 | test_fork_bytes[B8, B4L] | every (row, block) of the KERNEL's tables holds its block's host rows | - |
@@ -273,7 +273,8 @@ acceptance of FAST rows (WS-G); the speed of the specialized compile at B 318 (n
    32,768 sets, 94 % single-block swaps, none in layer 0; the fork has another float order than SH, too). The gate
    stays MUST as instructed; WS-B2's near-tie discriminator decides the rule. FAST is not certified by WS-C.
 3. Nothing ran. The real kernel ran only in fia6 (bench tensors) and runs here only under the interpreter
-   (test_wsc_interp.py). The stand-in models the kernel's arithmetic, not its float order on the GPU.
+   (test_wsc_interp.py). The stand-in models the kernel's structure (union, extents, online softmax); in-process it
+   uses the CPU world's bias convention (section 9), and it does not model the GPU's float order.
 4. B 318 is an unmeasured shape for FV6 (fixed config, section 2c); `slots_per_entry = 1` is a new specialization.
 5. The fork launches BLOCK_Q 4 for every request; R 5 (L4P) splits 4 + 1 (the 5th row reads its own blocks again).
    L4P + fork has CPU tests only.
@@ -285,12 +286,31 @@ acceptance of FAST rows (WS-G); the speed of the specialized compile at B 318 (n
 10. The profiler (CHECK-ONLY) may fail under CUPTI (REPORT, as WS-B).
 11. I committed in my new worktree only; I did not push.
 
-## 9. Shell commands outside cat / grep / head / tail / ls / sort / cut / diff / git / wc / date (this task)
+## 9. Review (two read-only reviewer agents on 371812c) and the fixes
+
+| finding | fix |
+|---|---|
+| DEFECT (both reviewers): the CPU world's flash_attn_nosa stand-ins add the CIS bias AFTER the scale, `q.k x scale + bias` (ragged_world.py:327-328, verify_world.py:61-62, wsb_world.py:345); the REAL kernel adds it BEFORE, `(q.k + bias) x scale` (flash_fwd_kernel.h:968-971 adds it to acc_s, :1021 scales), and so does the fork (fork :669). My stand-in had the kernel's math, so every CPU fork-vs-SH test would fail (about 0.065 per logit at D 8). The GPU is not affected (the fork = FA2-NOSA there; fia6 C gates) | the WS-C world only (the older worlds keep their bytes): `make_fake_fork(..., bias="world")` (default, in-process: the world's SH convention) and `bias="kernel"`; `fork_ref64(..., bias=...)`; `fake_attention_kernel` and `use_kernel_bias()` switch the world's SH to the kernel's math in the interpreter child only (a fresh process), where the REAL fork runs. test_fake_fork_semantics checks both conventions and that they differ. FINDING for the lead: the CPU worlds' SH math differs from the GPU kernel's; stand-in-vs-stand-in tests stay consistent, but no CPU result is "SH's GPU math" |
+| RISK: `is_next` was computed after the window / pool lookups; a stale m + 1 id in a map would read a stale slot (no path found that leaves it there) | `_fork_locate` computes `is_next` first and excludes it from the window and pool lookups |
+| RISK: the returned attention is a view of the persistent `vs.fout` | stated in `_fork_rows`' docstring (the caller consumes it before the next layer) |
+| RISK: the probes compile new variants (num_seqs 1) in the first CHECK pass | not timed (check arms only); no change |
+| RISK: `fork_probe_swap` is a no-op at B 1 | the test uses B 8 |
+| RISK: the interpreter child imports the whole synthetic package under TRITON_INTERPRET=1 | the in-process worlds import the same modules today; a failure shows as the child's traceback |
+| RISK: data preconditions in B4L (store reads, unserved at X 2) and the seed-dependent union precondition | asserted as preconditions (L34) |
+
+The reviewers found no defect in: the arena addressing and contiguity, the int32 limits, the row lists (ascending ids, last page, last_len, F4, past-edge and resident rows), `_fork_locate`'s searches and list, `_fork_vb`'s mapping and multisets, the probes' slicing, R 5 chunking, the unchanged default paths, the absence of host reads in a pass, the capture-safety of the call, the cell's imports and gates, the test arithmetic (counts, store GB, verdict bands, the 11 refused argument lists, the DRYRUN line) and the step script's diff against r2_wsb_step.sh.
+
+## 10. Shell commands outside cat / grep / head / tail / ls / sort / cut / diff / git / wc / date (this task)
 
 - BREACH 1 (disclosed): one read-only command contained the shell variable assignment `sed_unused=1` before a grep of
   cache_engine.py (a forbidden tool name used as a variable name; no sed program ran; nothing changed).
 - BREACH 2 (disclosed): one read-only pipeline ended in `uniq -c` (`grep -n "union_list" ... | cut -d: -f1 | sort |
   uniq -c`); uniq is forbidden; it changed nothing.
+- BREACH 3 (disclosed): one read-only command contained the shell variable assignment `sed_x=0` (between two greps of
+  nosi/nosi; no sed program ran; nothing changed).
+- `sleep 1500` once, in a background shell, to wait for the two reviewer agents.
+- The reviewer agents (read-only; their own reports): reviewer 2 piped one grep output into `sed -n '1,0p'` (a
+  breach it disclosed; it printed and changed nothing); both used the shell built-ins `cd`, `for`, `printf`.
 - `od -c` once, on the last 50 bytes of fia6's fork file (`tail -c 50 ... | od -c`), to see its final newline.
 - `grep -P` (a grep option) once, to find non-ASCII lines in fia6's fork file.
 - git: `git worktree add` (as instructed), `git add`, `git commit -F` (the message written with the Write tool), and

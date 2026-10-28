@@ -1113,19 +1113,20 @@ def _fork_locate(vs: VerifyState, eng, sel, full, res, m, l: int) -> dict:
     cap, topk = vs.cap, vs.topk
     v = sel.reshape(H, B, R * T)
     valid = v >= 0
+    # the next block m + 1 FIRST: its rows exist only in store slot 0 (step 1); a stale m + 1 id in a map is not read
+    is_next = (v == (m + 1).view(1, B, 1)) & valid
     ws, wi = torch.sort(eng._block_map, dim=-1)                            # (H, B, topk)
     at_w = torch.searchsorted(ws, v).clamp(max=ws.shape[-1] - 1)
-    in_win = (ws.gather(-1, at_w) == v) & valid
+    in_win = (ws.gather(-1, at_w) == v) & valid & ~is_next
     wslot = wi.gather(-1, at_w)
     if rs.pool:
         ps, pi = torch.sort(eng._pool_map, dim=-1)                         # (H, B, P); an empty slot is -1
         at_p = torch.searchsorted(ps, v).clamp(max=ps.shape[-1] - 1)
-        in_pool = (ps.gather(-1, at_p) == v) & valid & ~in_win
+        in_pool = (ps.gather(-1, at_p) == v) & valid & ~in_win & ~is_next
         pslot = pi.gather(-1, at_p) + topk
     else:
         in_pool = torch.zeros_like(valid)
         pslot = torch.zeros_like(v)
-    is_next = (v == (m + 1).view(1, B, 1)) & valid & ~in_win & ~in_pool
     fullv = full.t().reshape(1, B, R, 1).expand(H, B, R, T).reshape(H, B, R * T)
     host = valid & fullv & ~in_win & ~in_pool & ~is_next
     s = torch.sort(torch.where(host, v, vs.big), dim=-1).values
@@ -1307,7 +1308,9 @@ def _fork_probe(vs: VerifyState, qf) -> None:
 def _fork_rows(vs: VerifyState, l: int, layer, eng, twin, q, k4, v4, sel, pos_before):
     """Mode "union" with joint_attn "fork", one layer (module docstring, WS-C). Steps 1, 2 and 6 are _union_rows'
     (the same lines). The phase marks (probe passes): "union" (the locations and the list), "fetch" (the ONE store
-    fill), "attn" (the row lists and the ONE fork call), "check" (CHECK-ONLY and the rung-L5 seams), "end"."""
+    fill), "attn" (the row lists and the ONE fork call), "check" (CHECK-ONLY and the rung-L5 seams), "end".
+    The returned attention is a VIEW of the persistent vs.fout: the caller (_layer) consumes it before the next
+    layer's fork call writes vs.fout again (one stream); a caller that keeps it across layers must copy it."""
     rs, ops = vs.rs, vs.ops
     kern = rs.ops.kernels
     B, R, E, H, bs, topk = vs.B, vs.R, vs.E, vs.H, vs.bs, vs.topk

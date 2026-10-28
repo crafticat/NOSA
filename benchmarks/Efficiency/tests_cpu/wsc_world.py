@@ -19,6 +19,13 @@ THIS FILE ADDS
                          (:218-241: M -inf and L 1 at the start, m_j 0 when the row has seen nothing yet), acc / L.
                        Float32, ROW BY ROW with fixed shapes, so a row's bits do not depend on its siblings (the
                        kernel's MMA rows are independent too; fia6 RA measured 0 of 16 rows differ).
+                       THE BIAS CONVENTION (bias=...): the REAL kernels add the CIS bias BEFORE the scale, (q.k + bias)
+                       x scale (flash_attn_nosa: flash_fwd_kernel.h:968-971 adds it to acc_s, :1021 scales; the fork
+                       :669). The CPU world's flash_attn_nosa stand-ins add it AFTER the scale, q.k x scale + bias
+                       (ragged_world.py:327-328, verify_world.py:61-62, wsb_world.py:345; a review of WS-C found it).
+                       A stand-in fork compared with the world's SH must use the world's convention ("world", the
+                       default here); the REAL fork is compared with an SH switched to the kernel's convention
+                       (use_kernel_bias, the interpreter child only), and with make_fake_fork(..., bias="kernel").
   FORK_CALLS           one entry (rows, sequences) per launch of fake_fork (the call count of a pass)
   fork_ref64           the attention of the same lists in float64, ORDER-FREE (each row: one softmax over the tokens
                        its own list shows): the reference of fake_fork and of the real kernel
@@ -96,8 +103,20 @@ def _union_of(build, r0, n, h, S):
     return sorted(vals), vals
 
 
-def make_fake_fork(block_m_min: int = 1):
-    """fake_fork (module docstring); block_m_min 16 = the real launcher's BLOCK_M check."""
+BIAS_MODES = ("world", "kernel")
+
+
+def _scores(qh, kt, bt, scale, bias):
+    """The logits of one row and tile: "kernel" (q.k + bias) x scale (the real kernels); "world" q.k x scale + bias
+    (the CPU world's flash_attn_nosa stand-in). qh (g, D), kt (T, D), bt (T,)."""
+    if bias == "kernel":
+        return (qh @ kt.t() + bt.view(1, -1)) * scale
+    return qh @ kt.t() * scale + bt.view(1, -1)
+
+
+def make_fake_fork(block_m_min: int = 1, bias: str = "world"):
+    """fake_fork (module docstring); block_m_min 16 = the real launcher's BLOCK_M check; bias: the convention."""
+    assert bias in BIAS_MODES, bias
 
     def unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k, softmax_scale, causal,
                           window_size, block_table, softcap, q_descale, k_descale, v_descale, seq_threshold_3D=None,
@@ -167,7 +186,7 @@ def make_fake_fork(block_m_min: int = 1):
                         kt = k[phys, :, h].float()
                         vt = torch.where((tok < reach).view(bs, 1), v[phys, :, h].float(), torch.zeros(()))
                         bt = cis_bias[phys, :, h].float()
-                        Sx = (qh @ kt.t() + bt.view(1, bs)) * scale
+                        Sx = _scores(qh, kt, bt, scale, bias)
                         Sx = torch.where((tok < bb[u]).view(1, bs), Sx, torch.full((), NEG_INF))
                         m_j = torch.maximum(M, Sx.max(-1).values)
                         m_j = torch.where(m_j > NEG_INF, m_j, torch.zeros(()))
@@ -185,12 +204,49 @@ def make_fake_fork(block_m_min: int = 1):
     return unified_attention
 
 
-fake_fork = make_fake_fork(1)
+fake_fork = make_fake_fork(1, "world")
 
 
-def fork_ref64(q, k, v, cis_bias, build, cu, scale, rows=None):
+def fake_attention_kernel(q, k_cache, v_cache, bias, cache_seqlens=None, num_splits=0):
+    """ragged_world.fake_attention (the split partition, op for op) with the REAL kernel's bias convention:
+    (q.k + bias) x scale (flash_fwd_kernel.h:968-971, :1021)."""
+    Bq, _, Hq, Dq = q.shape
+    R, Hk = k_cache.shape[1], k_cache.shape[2]
+    _, per = W.split_partition(R, num_splits)
+    out = torch.empty_like(q)
+    for b in range(Bq):
+        n = int(cache_seqlens[b])
+        qq = q[b, 0].view(Hk, Hq // Hk, Dq).float()
+        parts = []
+        lo = 0
+        while lo < n:
+            hi = min(lo + per * W.KBLOCK_N, n)
+            sc = (torch.einsum("hgd,lhd->hgl", qq, k_cache[b, lo:hi].float()) +
+                  bias[b, lo:hi].float().t().unsqueeze(1)) * Dq ** -0.5
+            mx = sc.amax(-1, keepdim=True)
+            e = torch.exp(sc - mx)
+            parts.append((mx, e.sum(-1, keepdim=True), torch.einsum("hgl,lhd->hgd", e, v_cache[b, lo:hi].float())))
+            lo = hi
+        mx = torch.stack([p_[0] for p_ in parts]).amax(0)
+        num = sum(torch.exp(p_[0] - mx) * p_[2] for p_ in parts)
+        den = sum(torch.exp(p_[0] - mx) * p_[1] for p_ in parts)
+        out[b, 0] = (num / den).reshape(Hq, Dq).to(q.dtype)
+    return out
+
+
+def use_kernel_bias():
+    """THE INTERPRETER CHILD ONLY (a fresh process): the world's SH attention takes the real kernel's bias convention
+    (the ragged step reads FAKE_NL at call time, ragged_engine.py:394 and :422; the shipped source's namespace NL_NS;
+    the module name W.fake_attention, which verify_world.fake_attention_idx calls without cache_batch_idx)."""
+    W.FAKE_NL.flash_attn_nosa_with_kvcache = fake_attention_kernel
+    W.NL_NS["flash_attn_nosa_with_kvcache"] = fake_attention_kernel
+    W.fake_attention = fake_attention_kernel
+
+
+def fork_ref64(q, k, v, cis_bias, build, cu, scale, rows=None, bias="world"):
     """float64, order-free: each row's softmax over the tokens of its own list (64 per page, last_len on its last
-    listed page), physical block = entry x S + slot. Returns (rows, Hq, D) float64 for `rows` (default: all)."""
+    listed page), physical block = entry x S + slot; the bias convention as fake_fork's. Returns (rows, Hq, D) float64
+    for `rows` (default: all)."""
     key, slot, npg, last, entry = (build[x] for x in ("page_key", "page_table", "num_pages", "last_len", "seq_idx"))
     S = int(build["slots_per_entry"])
     nb, bs, hkv, d = k.shape
@@ -211,7 +267,7 @@ def fork_ref64(q, k, v, cis_bias, build, cu, scale, rows=None):
             if not ks:
                 continue
             kk, vv, bb = torch.cat(ks).double(), torch.cat(vs_).double(), torch.cat(bs_).double()
-            sc = (q[e, h * g:(h + 1) * g].double() @ kk.t() + bb.view(1, -1)) * scale
+            sc = _scores(q[e, h * g:(h + 1) * g].double(), kk, bb, scale, bias)
             out[i, h * g:(h + 1) * g] = torch.softmax(sc, -1) @ vv
     return out
 
