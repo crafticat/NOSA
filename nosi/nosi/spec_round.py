@@ -93,6 +93,13 @@ OUTSIDE every rollback group (on_verify), so the verify finds them as pool hits 
 on_release ends the pins after the round's commit. The seams below are called only when SpecOps.prefetch is set; with
 prefetch None every round is the code of nosi-r2-specp a6c9d10.
 
+WS-B (tree nosi-r2-wsb, docs/NOTES_wsb.md; SpecOps(mode="union"), L4 and L4P): the joint pass with ONE residency per
+layer for the UNION of the rows' selections (verify_rows mode "union"; FAST: only the float order differs from the
+serial rows). L4: rows 0 .. K - 1 are verify rows, row K is a resident draft row (no DraftResident bracket). L4P: the
+roles are set per request and pass (full = the rows < v_b; resident = the deferred and the draft row; pad rows neither);
+the draft row's misses go to the rung-L5 seam through vs.miss_ids and its selection to the pin through vs.pin. With
+mode "exact" / "fast" every round is the code of nosi-r2-spec5 40ac348.
+
 REQUESTED-KV PIN (paper 3.3; SpecOps(pin=True), L4P only, OFF by default and in the cells). The draft calls record their
 selection (the blocks that the draft requested: hits and misses; in the joint pass the draft row's). Before the joint
 pass (outside a group) every pool slot that holds a requested block gets the SOFT PIN of Task 1.2 (pool_prefetch.py:
@@ -139,7 +146,7 @@ from . import ragged_rollback as RR
 
 MASK_BIAS = -3.0e4                     # avail_policy.py:113, verify_rows.MASK_BIAS: finite on purpose
 LEVELS = ("L3", "L4", "L4P")
-L4_MODES = ("exact", "fast")
+L4_MODES = ("exact", "fast", "union")  # WS-B (nosi-r2-wsb): "union" = verify_rows mode union (docs/NOTES_wsb.md)
 L4_GEMMS = ("natural", "rowgroup", "exact")
 NEG_KINDS = (None, "commit_draft_at_reject", "keep_rejected", "bonus_on_full_accept", "miscount")
 NEG_L4P = ("verify_newest", "keep_joint_draft", "commit_draft_rows", "commit_deferred", "pin_no_release")
@@ -504,7 +511,8 @@ class SpecOps:
                  K - 1 drafts) or "L4P" (the paper's schedule: a joint pass every K draft steps that verifies every
                  tentative draft but the newest and drafts the next token; module docstring)
       K          drafts per round (L3: 1 .. 32; L4: 2 .. 31; L4P: 3 .. 30)
-      mode       L4: "exact" (the proof form) or "fast" (the timing form); L4P: "exact" only
+      mode       L4: "exact" (the proof form), "fast" (the timing form of route 1) or "union" (WS-B); L4P: "exact" or
+                 "union" (WS-B)
       gemm       L4: the joint pass's GEMM ("rowgroup": the shipped call's shape, bitwise; "natural"; "exact")
       linear     L4: the GEMM callable (required for gemm "exact")
       extra      L4 FAST: X, the extras store slots per request
@@ -523,11 +531,15 @@ class SpecOps:
       record     keep every committed row's logits (tests only)
       probe_every  a probe round (gather spans, phase events) every N rounds, round 0 excluded; 0: none
       after_round  tests only: f(runner) after each round's host sync (the state checks between rounds)
-      pin        L4P only: True = the REQUESTED-KV PIN (RequestPin, paper 3.3); default False (off in this rung)"""
+      pin        L4P only: True = the REQUESTED-KV PIN (RequestPin, paper 3.3); default False (off in this rung)
+      joint_stats  WS-B, mode "union" only: the joint pass's device accounting (verify_rows VerifyOps(stats)); the
+                 timing cells pass False (docs/NOTES_wsb.md: check-only and accounting work stays out of timing)
+    WS-B (nosi-r2-wsb): mode "union" for L4 (L4XU: rows 0 .. K - 1 verify rows, row K a resident draft row) and for L4P
+    (per request: rows < v_b verify rows, the deferred and draft rows resident, pad rows neither; _round_l4p)."""
 
     def __init__(self, level="L3", K=3, mode="exact", gemm="rowgroup", linear=None, extra=16, attn=None, journal=256,
                  redirect=True, draft_filter=None, prefetch=None, rb_neg=None, stream=None, neg=None, record=False,
-                 probe_every=16, after_round=None, pin=False):
+                 probe_every=16, after_round=None, pin=False, joint_stats=True):
         if level not in LEVELS:
             raise SpecError("level %r: one of %s" % (level, LEVELS))
         lo = K_MIN[level]
@@ -537,9 +549,11 @@ class SpecOps:
             raise SpecError("mode %r / gemm %r: one of %s / %s" % (mode, gemm, L4_MODES, L4_GEMMS))
         if gemm == "exact" and linear is None and level in ("L4", "L4P"):
             raise SpecError("gemm 'exact' takes a batch-invariant linear")
-        if level == "L4P" and mode != "exact":
-            raise SpecError("L4P: mode 'exact' only (a FAST L4P needs a per-row verify mask in verify_rows._extras: "
-                            "not built)")
+        if mode == "union" and level == "L3":                            # WS-B: the joint pass only
+            raise SpecError("mode 'union' is a joint-pass mode (L4, L4P)")
+        if level == "L4P" and mode not in ("exact", "union"):
+            raise SpecError("L4P: mode 'exact' or 'union' (WS-B) only (a route-1 FAST L4P needs a per-row verify mask "
+                            "in verify_rows._extras: not built)")
         if neg not in NEG_BY_LEVEL[level]:
             raise SpecError("negative control %r: for %s one of %s" % (neg, level, NEG_BY_LEVEL[level]))
         if neg == "bonus_on_full_accept" and level != "L4":
@@ -558,13 +572,17 @@ class SpecOps:
         self.probe_every = int(probe_every)
         self.after_round = after_round
         self.pin = bool(pin)
+        self.joint_stats = bool(joint_stats)
 
     def describe(self) -> dict:
         joint = self.level in ("L4", "L4P")
-        return dict(level=self.level, K=self.K, mode=(self.mode if joint else None),
-                    gemm=(self.gemm if joint else None), extra=self.extra, journal=self.journal,
-                    redirect=self.redirect, prefetch=self.prefetch is not None, rb_neg=self.rb_neg, neg=self.neg,
-                    filtered=self.draft_filter is not None, probe_every=self.probe_every, pin=self.pin)
+        d = dict(level=self.level, K=self.K, mode=(self.mode if joint else None),
+                 gemm=(self.gemm if joint else None), extra=self.extra, journal=self.journal,
+                 redirect=self.redirect, prefetch=self.prefetch is not None, rb_neg=self.rb_neg, neg=self.neg,
+                 filtered=self.draft_filter is not None, probe_every=self.probe_every, pin=self.pin)
+        if self.mode == "union":                                         # WS-B
+            d.update(joint_stats=self.joint_stats)
+        return d
 
 
 # ------------------------------------------------------------------ the runner
@@ -594,9 +612,15 @@ class SpecRunner:
             # the joint pass's GEMM: the given one, else the ragged step's own (gemm natural: F.linear; exact: the
             # batch-invariant linear), so a rowgroup joint pass has the bits of the serial step it replaces
             base = ops.linear if ops.linear is not None else self.rb._orig["linear"]
-            if paper:                                  # R = K + 2 rows (verify_rows calls it K + 1 "verify" rows)
+            if paper and ops.mode == "union":          # WS-B: the rows' roles are set per pass (_round_l4p)
+                vops = VR.VerifyOps(K=K + 1, mode="union", gemm=ops.gemm, linear=self._wait_linear(base),
+                                    extra=ops.extra, attn=ops.attn, stats=ops.joint_stats)
+            elif paper:                                # R = K + 2 rows (verify_rows calls it K + 1 "verify" rows)
                 vops = VR.VerifyOps(K=K + 1, mode="exact", gemm=ops.gemm, linear=self._wait_linear(base),
                                     extra=ops.extra, attn=ops.attn)
+            elif ops.mode == "union":                  # WS-B, L4XU: row K is a resident draft row
+                vops = VR.VerifyOps(K=K, mode="union", gemm=ops.gemm, linear=self._wait_linear(base),
+                                    extra=ops.extra, attn=ops.attn, draft_last=True, stats=ops.joint_stats)
             else:
                 vops = VR.VerifyOps(K=K, mode=ops.mode, gemm=ops.gemm, linear=self._wait_linear(base),
                                     extra=ops.extra, attn=ops.attn, draft_last=(ops.mode == "fast"))
@@ -890,14 +914,24 @@ class SpecRunner:
         self.rb.begin()                                                  # 1. the joint pass
         b0 = self.meter.blocks.clone()
         s0 = len(self.meter.spans)
-        # rows 0 .. K - 3 are verify rows of every request (u >= K - 1, so v >= K - 2): no scratch bias for them
-        self.draft.begin("rows", redirect=self._edge_before(R), rows=drows, record=drow, verify_below=K - 2)
+        union = self.ops.mode == "union"
+        if union:                                                        # WS-B: one union residency per layer; the
+            vs = self.vs                                                 # verify rows full, the deferred and draft rows
+            vs.full_rows = ~drows                                        # resident (pool hits only), pad rows neither
+            vs.res_rows = drows & (rr <= u.view(1, B))
+            vs.miss_rows = drow                                          # the draft row's misses (rung L5) and its pin
+            vs.miss_ids = self.draft.miss_ids if self.ops.prefetch is not None else None
+            vs.pin = self.pin
+        else:
+            # rows 0 .. K - 3 are verify rows of every request (u >= K - 1, so v >= K - 2): no scratch bias for them
+            self.draft.begin("rows", redirect=self._edge_before(R), rows=drows, record=drow, verify_below=K - 2)
         self.meter.on, self.meter.timing = True, probe
         try:
             lg = self.VR.joint_pass(self.model, self.vs, ids, pos)
         finally:
             self.meter.on, self.meter.timing = False, False
-            self.draft.end()
+            if not union:
+                self.draft.end()
         if self.ops.prefetch is not None:                                # rung L5 seam: the draft row's misses
             self.ops.prefetch.on_draft(self.draft.miss_ids)
         self._event(ev)
