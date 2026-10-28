@@ -129,6 +129,7 @@ def test_flags_off_is_shipped(S_list):
                             ":(exclude)nosi/nosi/spec_round.py", ":(exclude)nosi/nosi/ragged_rollback.py",
                             ":(exclude)nosi/nosi/spec_prefetch.py",  # rung L5 (Gate 0: test_spec_prefetch.py)
                             ":(exclude)nosi/nosi/spec_tentative.py", # WS-A (Gate 0: test_wsa.py)
+                            ":(exclude)nosi/nosi/spec_tentative_union.py",   # I2 (Gate 0: test_i2.py)
                             ":(exclude)nosi/nosi/verify_rows.py", ":(exclude,glob)**/__pycache__/**"],
                            capture_output=True, text=True)
         assert r.returncode == 0 and r.stdout.strip() == "", "engine sources differ from %s:\n%s" % (INTEG_BASE,

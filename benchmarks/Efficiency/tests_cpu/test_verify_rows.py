@@ -100,6 +100,7 @@ def test_flag_off_is_shipped():
                         ":(exclude)nosi/nosi/pool_prefetch.py", ":(exclude)nosi/nosi/r2_transport_gilfree_v3.py",
                         ":(exclude)nosi/nosi/spec_prefetch.py",      # rung L5 (Gate 0: test_spec_prefetch.py)
                         ":(exclude)nosi/nosi/spec_tentative.py",     # WS-A (Gate 0: test_wsa.py)
+                        ":(exclude)nosi/nosi/spec_tentative_union.py",   # I2 (Gate 0: test_i2.py)
                         ":(exclude)nosi/nosi/spec_round.py", ":(exclude,glob)**/__pycache__/**"],
                        capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout.strip() == "", "flag-off sources differ from %s:\n%s" % (RAGGED_TIP, r.stdout)

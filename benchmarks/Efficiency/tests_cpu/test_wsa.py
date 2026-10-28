@@ -72,6 +72,17 @@ DECLARED = ("nosi/nosi/spec_tentative.py", "benchmarks/Efficiency/r2_wsa_cell.py
 GATE0_TESTS = ("benchmarks/Efficiency/tests_cpu/test_ragged_engine.py", "benchmarks/Efficiency/tests_cpu/test_verify_rows.py",
                "benchmarks/Efficiency/tests_cpu/test_rollback.py", "benchmarks/Efficiency/tests_cpu/test_spec_round.py",
                "benchmarks/Efficiency/tests_cpu/test_spec_prefetch.py")
+# I2 (nosi-r2-i2: r2-wsareg 83dac96 + r2-wsb 1a8ce68 + the arm L4PTU): the WS-B files and the I2 files are declared too
+# (their own Gate 0s: tests_cpu/test_wsb.py, tests_cpu/test_i2.py); in the Gate 0 tests above, the lines of WS-B's own
+# diff (40ac348 -> 1a8ce68) are allowed besides the added lines that name spec_tentative
+WSB_TIP = "1a8ce68d9d6852fecf45b916c9ef1e6a5a80e098"
+DECLARED = DECLARED + ("nosi/nosi/verify_rows.py", "nosi/nosi/spec_round.py", "benchmarks/Efficiency/r2_wsb_cell.py",
+                       "benchmarks/Efficiency/r2_wsb_step.sh", "benchmarks/Efficiency/tests_cpu/wsb_world.py",
+                       "benchmarks/Efficiency/tests_cpu/test_wsb.py", "docs/NOTES_wsb.md",              # WS-B
+                       "nosi/nosi/spec_tentative_union.py", "benchmarks/Efficiency/r2_i2_cell.py",
+                       "benchmarks/Efficiency/r2_i2_step.sh", "benchmarks/Efficiency/tests_cpu/i2_world.py",
+                       "benchmarks/Efficiency/tests_cpu/test_i2.py", "docs/NOTES_i2.md",                # I2
+                       "benchmarks/Efficiency/r2_i2_check.py", "benchmarks/Efficiency/r2_wsg_check.py")  # I2
 
 
 def _load(name):
@@ -166,9 +177,12 @@ def test_wsa_flag_off_is_spec5(B):
         for f in GATE0_TESTS:                                 # their Gate 0s: only added lines naming spec_tentative
             d = _git("diff", "-U0", SPEC5, "--", f).stdout.splitlines()
             body = [x for x in d if x[:1] in "+-" and not x.startswith(("+++", "---"))]
+            wsb = set(_git("diff", "-U0", SPEC5, WSB_TIP, "--", f).stdout.splitlines()) if _have(WSB_TIP) else set()
+            body = [x for x in body if x not in wsb]          # I2: WS-B's own lines of this file (its Gate 0)
             assert body and all(x.startswith("+") and "spec_tentative" in x for x in body), (f, body[:5])
     src = {p.name: p.read_text() for p in (ROOT / "nosi/nosi").glob("*.py")}
-    assert [n for n, t in src.items() if "spec_tentative" in t and n != "spec_tentative.py"] == []
+    assert [n for n, t in src.items() if "spec_tentative" in t and n not in ("spec_tentative.py",
+                                                                             "spec_tentative_union.py")] == []   # I2
     for name in ("ragged_rollback", "state_snapshot", "spec_prefetch"):   # the older Gate 0 name scans stay true
         assert name not in src["spec_tentative.py"], name
     for f in ("r2_spec_cell.py", "r2_spec5_cell.py", "r2_base_cell.py", "r2_verify_cell.py"):

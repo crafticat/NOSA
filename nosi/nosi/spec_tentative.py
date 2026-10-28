@@ -6,6 +6,11 @@ sp3b). Docs: docs/NOTES_wsa.md. NO NEW KERNEL: the shipped kernels (diff_offload
 flash_h2d_from_mask(_bias), r2_writeback.masked_writeback, flash_attn_nosa_with_kvcache with return_softmax_lse) and
 torch ops.
 
+I2 (tree nosi-r2-i2, docs/NOTES_i2.md): SEAMS for spec_tentative_union.py (arm L4PTU, the joint pass with one residency
+per layer for the union): TentState._rows (the rows of a pass; here row by row), TentState._resid and _write (steps 4
+and 5 of one row, moved out of _row with the same ops in the same order), TentRunner._joint_ops and _make_state. Every
+arm of this module keeps the bits of 83dac96 (tests_cpu/test_i2.py, Gate 0 against the 83dac96 source).
+
 TWO RUNNERS, ONE SCHEDULE (so the proof and the timing compare like with like)
   TentRunner          FAST: the tentative buffers (no journal). Levels L4P (the schedule below) and L3 (reference).
   PaperJournalRunner  EXACT: spec_round's journal (Rollback, DraftResident, the EXACT joint pass), the same schedule.
@@ -354,9 +359,7 @@ class TentState:
         else:
             sel = VR._select_rows(plan.vs, layer, q, twin)
         q4 = q.view(B, R, q.shape[1], q.shape[2])
-        outs = [self._row(l, eng, twin, r, sel[:, :, r], q4[:, r], k4[:, r], v4[:, r], pbs[r], plan)
-                for r in range(R)]
-        attn = torch.stack(outs, 1).reshape(E, 1, -1)
+        attn = self._rows(l, eng, twin, sel, q4, k4, v4, pbs, plan).reshape(E, 1, -1)
         hidden = residual + lin(attn, layer.wo)
         residual = hidden
         h = NL.layer_norm(hidden, layer.post_attention_layernorm_variance_epsilon, layer.post_attention_layernorm_weight)
@@ -364,6 +367,13 @@ class TentState:
         out = torch.empty(h.shape[:-1] + (h.shape[-1] // 2,), dtype=h.dtype, device=h.device)
         NL.silu_and_mul(h, out)
         return residual + lin(out, layer.down_proj)
+
+    def _rows(self, l, eng, twin, sel, q4, k4, v4, pbs, plan):
+        """Steps 4-6 for every row of the pass, ROW BY ROW (one residency per row: L4PT, L3T and every one-row pass).
+        Returns (B, R, Hq * D). I2 SEAM (nosi-r2-i2, docs/NOTES_i2.md): spec_tentative_union.TentStateU overrides it
+        for a joint pass (one residency per layer for the union of the rows' selections, arm L4PTU)."""
+        return torch.stack([self._row(l, eng, twin, r, sel[:, :, r], q4[:, r], k4[:, r], v4[:, r], pbs[r], plan)
+                            for r in range(plan.R)], 1)
 
     def _replay(self, l, twin, act, deferred) -> None:
         """The deferred position's twin step from its buffer entry (the draft step's K and cis row): no GEMM, no
@@ -385,7 +395,6 @@ class TentState:
     def _row(self, l, eng, twin, r, sel, q_r, k_r, v_r, p, plan):
         """Steps 4-6 of the module docstring for row r of every request. Returns (B, Hq * D)."""
         rs, B, bs = self.rs, self.B, self.bs
-        kern = rs.ops.kernels
         act, drf = plan.act[r], plan.draft[r]
         qc = self.qc
         qb = qc // bs
@@ -398,53 +407,10 @@ class TentState:
         inj = (sel > qb3) & ~hasq
         ti = torch.where(inj, qb3.expand_as(sel), sel).contiguous()
         # 4. the residency on the committed window (kept)
-        kern["diff"](eng._block_map, ti, eng._new_block_map_buf, eng._load_mask)
-        am = act.view(1, B, 1)
-        eng._load_mask.masked_fill_(~am, -1)                           # an inactive row loads nothing, moves nothing
-        if self.pool:
-            kern["pool_update"](eng._block_map, eng._load_mask, eng._pool_map, eng._pool_age, eng._pool_target,
-                                eng._pool_action, eng._pool_stamp_base, eng._tail_block_idx_on_gpu)
-            kern["pool_swap"](eng._k_gpu, eng._v_gpu, eng._kv_bias_gpu, eng._pool_target, eng._pool_action, eng.topk,
-                              eng.block_size)
-            eng._pool_stamp_base += eng.topk
-        eng._new_block_map_buf.copy_(torch.where(am, eng._new_block_map_buf, eng._block_map))
-        eng._block_map.copy_(eng._new_block_map_buf)
-        lm = eng._load_mask
-        tent = (lm >= 0) & (lm > qb3)
-        skip = (lm >= 0) & (drf.view(1, B, 1) | tent)
-        ids = torch.where(skip, self.minus1, lm)
-        kern["gather_k"](eng._k_gpu, eng._k_cpu, ids, bs)
-        kern["gather_v_bias"](eng._v_gpu, eng._v_cpu, eng._kv_bias_gpu, twin.total_cis, ids, bs)
-        eng._block_map.masked_fill_(skip, -1)                          # the next row loads a skipped block again
-        self.skipped[l] += (skip & ~tent).sum()
-        if self.checking:                                              # CHECK-ONLY counters
-            self.forced[l] += tent.sum()
-            self.injected[l] += inj.sum()
+        skip = self._resid(l, eng, twin, ti, inj, act, drf, qb3)
         # 5. the row's K, V and cis row into the buffer (never into the committed tail slot)
-        bi = self.all_b
-        i = p % bs
+        self._write(l, twin, r, k_r, v_r, p, plan, past)
         kb, vb, bb = self.k[l], self.v[l], self.bias[l]
-        a3, a2 = act.view(B, 1, 1), act.view(B, 1)
-        kb[bi, i] = torch.where(a3, k_r.to(kb.dtype), kb[bi, i])
-        vb[bi, i] = torch.where(a3, v_r.to(vb.dtype), vb[bi, i])
-        prow = p.clamp(max=int(twin.total_cis.shape[1]) - 1)
-        bb[bi, i] = torch.where(a2, twin.total_cis[bi, prow].to(bb.dtype), bb[bi, i])
-        if l == 0:
-            self.tpos[bi, i] = torch.where(act, p, self.tpos[bi, i])
-            c = self.c
-            c["rows"] += act.sum()
-            c["draft_rows"] += (act & drf).sum()
-            c["verify_rows"] += plan.verify[r].sum()
-            if plan.deferred is not None:                              # the D3 contract: 0 in the tentative mode
-                c["deferred_writes"] += (act & drf & (p == plan.deferred)).sum()
-            c["span_max"].copy_(torch.maximum(c["span_max"], torch.where(act, p + 1 - qc, torch.zeros_like(p)).max()))
-            if self.checking:
-                c["edge_rows"] += (act & past).sum()
-                c["fill_rows"] += (act & (p % bs == bs - 1)).sum()
-            if self.rec is not None:                                   # CHECK-ONLY (tests)
-                self.rec.append(dict(round=self.round, kind=plan.kind, r=r, act=act.clone(), draft=drf.clone(),
-                                     p=p.clone(), rope=plan.pos[:, r].to(torch.int64).clone(), k=k_r.clone(),
-                                     c=bb[bi, i].clone(), verify=plan.verify[r].clone(), qc=qc.clone()))
         # 6. attention: A (the committed window) + B (the buffer), merged by the log-sum-exp
         n_tail = rs.body.cache_lens_value(eng, p) - self.base           # (B,): rows of p's block the shipped step attends
         cq = qc % bs
@@ -480,6 +446,71 @@ class TentState:
         wa, wb = torch.exp(la - mx), torch.exp(lb - mx)
         o = (o_a.reshape(B, Hq, -1).float() * wa + o_b.reshape(B, Hq, -1).float() * wb) / (wa + wb)
         return o.to(q_r.dtype).reshape(B, -1)
+
+    def _resid(self, l, eng, twin, ti, inj, act, drf, qb3):
+        """Step 4 of the module docstring for ONE row (I2: a method so that the union pass runs it once per layer): the
+        residency of the selection ti (H, B, topk) on the COMMITTED window, kept (D1). act / drf (B,) bool: the active
+        and the draft requests; inj (H, B, topk): the injected committed tail ids (a check-only count); qb3 (1, B, 1): the
+        committed tail block. Returns skip (H, B, topk) bool: the window slots whose load the row skipped (a draft row's
+        misses, the tentative block); their map entries are -1."""
+        rs, B, bs = self.rs, self.B, self.bs
+        kern = rs.ops.kernels
+        kern["diff"](eng._block_map, ti, eng._new_block_map_buf, eng._load_mask)
+        am = act.view(1, B, 1)
+        eng._load_mask.masked_fill_(~am, -1)                           # an inactive row loads nothing, moves nothing
+        if self.pool:
+            kern["pool_update"](eng._block_map, eng._load_mask, eng._pool_map, eng._pool_age, eng._pool_target,
+                                eng._pool_action, eng._pool_stamp_base, eng._tail_block_idx_on_gpu)
+            kern["pool_swap"](eng._k_gpu, eng._v_gpu, eng._kv_bias_gpu, eng._pool_target, eng._pool_action, eng.topk,
+                              eng.block_size)
+            eng._pool_stamp_base += eng.topk
+        eng._new_block_map_buf.copy_(torch.where(am, eng._new_block_map_buf, eng._block_map))
+        eng._block_map.copy_(eng._new_block_map_buf)
+        lm = eng._load_mask
+        tent = (lm >= 0) & (lm > qb3)
+        skip = (lm >= 0) & (drf.view(1, B, 1) | tent)
+        ids = torch.where(skip, self.minus1, lm)
+        kern["gather_k"](eng._k_gpu, eng._k_cpu, ids, bs)
+        kern["gather_v_bias"](eng._v_gpu, eng._v_cpu, eng._kv_bias_gpu, twin.total_cis, ids, bs)
+        eng._block_map.masked_fill_(skip, -1)                          # the next row loads a skipped block again
+        self.skipped[l] += (skip & ~tent).sum()
+        if self.checking:                                              # CHECK-ONLY counters
+            self.forced[l] += tent.sum()
+            self.injected[l] += inj.sum()
+        return skip
+
+    def _write(self, l, twin, r, k_r, v_r, p, plan, past) -> None:
+        """Step 5 of the module docstring for row r (I2: a method so that the union pass writes every row before its
+        attention): its K, V and cis row into the BUFFER at row p % 64 (never into the committed tail slot); layer 0:
+        tpos and the counters (rows, the D3 contract's deferred writes, the span; check-only: edge and F4 fill rows, the
+        test record). past (B,) bool: the row is past the committed block's edge."""
+        B, bs = self.B, self.bs
+        act, drf = plan.act[r], plan.draft[r]
+        qc = self.qc
+        bi = self.all_b
+        i = p % bs
+        kb, vb, bb = self.k[l], self.v[l], self.bias[l]
+        a3, a2 = act.view(B, 1, 1), act.view(B, 1)
+        kb[bi, i] = torch.where(a3, k_r.to(kb.dtype), kb[bi, i])
+        vb[bi, i] = torch.where(a3, v_r.to(vb.dtype), vb[bi, i])
+        prow = p.clamp(max=int(twin.total_cis.shape[1]) - 1)
+        bb[bi, i] = torch.where(a2, twin.total_cis[bi, prow].to(bb.dtype), bb[bi, i])
+        if l == 0:
+            self.tpos[bi, i] = torch.where(act, p, self.tpos[bi, i])
+            c = self.c
+            c["rows"] += act.sum()
+            c["draft_rows"] += (act & drf).sum()
+            c["verify_rows"] += plan.verify[r].sum()
+            if plan.deferred is not None:                              # the D3 contract: 0 in the tentative mode
+                c["deferred_writes"] += (act & drf & (p == plan.deferred)).sum()
+            c["span_max"].copy_(torch.maximum(c["span_max"], torch.where(act, p + 1 - qc, torch.zeros_like(p)).max()))
+            if self.checking:
+                c["edge_rows"] += (act & past).sum()
+                c["fill_rows"] += (act & (p % bs == bs - 1)).sum()
+            if self.rec is not None:                                   # CHECK-ONLY (tests)
+                self.rec.append(dict(round=self.round, kind=plan.kind, r=r, act=act.clone(), draft=drf.clone(),
+                                     p=p.clone(), rope=plan.pos[:, r].to(torch.int64).clone(), k=k_r.clone(),
+                                     c=bb[bi, i].clone(), verify=plan.verify[r].clone(), qc=qc.clone()))
 
     # -------------------------------------------------------------- the report
     def report(self) -> dict:
@@ -769,12 +800,11 @@ class TentRunner(PaperSchedule, SR.SpecRunner):
             self.VR = VR
             base = ops.linear if ops.linear is not None else rs.ops.linear
             R = K + 2 if tneg == "recompute_deferred" else K + 1
-            self.vs = VR.attach(model, rs, VR.VerifyOps(K=R - 1, mode="exact", gemm=ops.gemm, linear=base,
-                                                       extra=ops.extra, attn=attn, stats=False))
+            self.vs = VR.attach(model, rs, self._joint_ops(R, ops.gemm, base, ops.extra, attn))
             attn = self.vs.ops.attn
         if attn is None:
             attn = rs.nl.flash_attn_nosa_with_kvcache
-        self.T = TentState(rs, attn, tneg=tneg, poison=poison)
+        self.T = self._make_state(rs, attn, tneg, poison)
         self.hooks, self.check_every = hooks, int(check_every)
         self._check = False
         i64 = torch.int64
@@ -817,6 +847,15 @@ class TentRunner(PaperSchedule, SR.SpecRunner):
                          verify=(self.vs.meta if self.vs is not None else None))
 
     # -------------------------------------------------------------- helpers
+    def _joint_ops(self, R, gemm, base, extra, attn):
+        """The joint pass's VerifyOps (TentState runs its own rows; verify_rows gives the batched selection, the GEMM and
+        the buffers): mode "exact". I2 SEAM (nosi-r2-i2): spec_tentative_union.TentRunnerU returns mode "union"."""
+        return VR.VerifyOps(K=R - 1, mode="exact", gemm=gemm, linear=base, extra=extra, attn=attn, stats=False)
+
+    def _make_state(self, rs, attn, tneg, poison):
+        """The tentative buffers. I2 SEAM (nosi-r2-i2): spec_tentative_union.TentRunnerU returns its TentStateU."""
+        return TentState(rs, attn, tneg=tneg, poison=poison)
+
     def _sync_release(self) -> None:
         """No journal, no release event (spec_round's hook point)."""
         return None

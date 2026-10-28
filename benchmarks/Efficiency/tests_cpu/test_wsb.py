@@ -67,6 +67,21 @@ DECLARED = ("nosi/nosi/verify_rows.py", "nosi/nosi/spec_round.py", "benchmarks/E
             "benchmarks/Efficiency/r2_wsb_step.sh", "benchmarks/Efficiency/tests_cpu/wsb_world.py",
             "benchmarks/Efficiency/tests_cpu/test_wsb.py", "benchmarks/Efficiency/tests_cpu/test_spec_prefetch.py",
             "docs/NOTES_wsb.md")
+# I2 (nosi-r2-i2: r2-wsareg 83dac96 + r2-wsb 1a8ce68 + the arm L4PTU): the WS-A files, WS-A's added Gate-0 lines in the
+# older tests and the I2 files are declared too (their own Gate 0s: tests_cpu/test_wsa.py, tests_cpu/test_i2.py); in
+# test_spec_prefetch.py the lines of WS-A's own diff (40ac348 -> 83dac96) are allowed besides WS-B's SPEC5_TIP lines
+WSA_TIP = "83dac96becf599181913e207dae7174c7f12c147"
+DECLARED = DECLARED + ("nosi/nosi/spec_tentative.py", "benchmarks/Efficiency/r2_wsa_cell.py",
+                       "benchmarks/Efficiency/r2_wsa_step.sh", "benchmarks/Efficiency/tests_cpu/wsa_world.py",
+                       "benchmarks/Efficiency/tests_cpu/test_wsa.py", "docs/NOTES_wsa.md",               # WS-A
+                       "benchmarks/Efficiency/tests_cpu/test_ragged_engine.py",
+                       "benchmarks/Efficiency/tests_cpu/test_verify_rows.py",
+                       "benchmarks/Efficiency/tests_cpu/test_rollback.py",
+                       "benchmarks/Efficiency/tests_cpu/test_spec_round.py",                            # WS-A, I2 lines
+                       "nosi/nosi/spec_tentative_union.py", "benchmarks/Efficiency/r2_i2_cell.py",
+                       "benchmarks/Efficiency/r2_i2_step.sh", "benchmarks/Efficiency/tests_cpu/i2_world.py",
+                       "benchmarks/Efficiency/tests_cpu/test_i2.py", "docs/NOTES_i2.md",                # I2
+                       "benchmarks/Efficiency/r2_i2_check.py", "benchmarks/Efficiency/r2_wsg_check.py")  # I2
 
 
 def _load(name):
@@ -126,6 +141,9 @@ def test_gate0_files():
     assert r.stdout.strip() == "", "untracked files in nosi/: %s" % r.stdout
     # test_spec_prefetch.py: its Gate 0 reads the rung-L5 tip (SPEC5_TIP) in place of the working tree; nothing else
     d = X_.git("diff", "-U0", BASE, "--", "benchmarks/Efficiency/tests_cpu/test_spec_prefetch.py").stdout.splitlines()
+    wsa = set(X_.git("diff", "-U0", BASE, WSA_TIP, "--", "benchmarks/Efficiency/tests_cpu/test_spec_prefetch.py")
+              .stdout.splitlines()) if _have(WSA_TIP) else set()
+    d = [x for x in d if x not in wsa]                        # I2: WS-A's own lines of this file (its Gate 0)
     added = [x[1:] for x in d if x.startswith("+") and not x.startswith("+++")]
     removed = [x for x in d if x.startswith("-") and not x.startswith("---")]
     assert added and all("SPEC5_TIP" in x or x.strip().startswith("#") for x in added), added
@@ -133,7 +151,8 @@ def test_gate0_files():
     src = {p.name: p.read_text() for p in (ROOT / "nosi/nosi").glob("*.py")}
     for n in ("spec_round", "ragged_rollback", "state_snapshot", "spec_prefetch"):   # the older Gate 0 name scans
         assert n not in src["verify_rows.py"], n
-    assert [n for n, t in src.items() if "union_list" in t] == ["verify_rows.py"]     # no other module has the path
+    assert sorted(n for n, t in src.items() if "union_list" in t) == ["spec_tentative_union.py",   # I2: the L4PTU
+                                                                       "verify_rows.py"]          # pass calls it
 
 
 @pytest.mark.parametrize("S_list", [S1, SF8], ids=["B1", "B8"])
