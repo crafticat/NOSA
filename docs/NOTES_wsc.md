@@ -300,6 +300,27 @@ acceptance of FAST rows (WS-G); the speed of the specialized compile at B 318 (n
 
 The reviewers found no defect in: the arena addressing and contiguity, the int32 limits, the row lists (ascending ids, last page, last_len, F4, past-edge and resident rows), `_fork_locate`'s searches and list, `_fork_vb`'s mapping and multisets, the probes' slicing, R 5 chunking, the unchanged default paths, the absence of host reads in a pass, the capture-safety of the call, the cell's imports and gates, the test arithmetic (counts, store GB, verdict bands, the 11 refused argument lists, the DRYRUN line) and the step script's diff against r2_wsb_step.sh.
 
+## 11. wsc2 (tree /mnt/beegfs/ojerbi/nosi-r2-wsc2, branch r2-wsc2, from 22c27ee): the miniature reaches past-edge rows
+
+- MEASURED (record /mnt/beegfs/ojerbi/r2-runs/wsc/wc_c1m_2195573_wc1m.step/stdout.txt): every fork structural gate
+  PASS; UCF-STRESS FAIL "rows past a block edge 0; F4 rows 256"; UCF-SEL FAIL (2,729 of 32,768 sets, expected).
+- CAUSE (a data precondition, L34): every check request starts at S0 = 16128 = 252 x 64 (r2_base_cell.py:120); the
+  UCF passes started at steps 0, 4, ..., 60, so a pass never spans a 64-token block edge (the passes end at 63).
+  `schedule_facts(S0, 64, 4, 0)` = 0 past-edge rows and 1 F4 row per request; 1 x 8 requests x 32 layers = 256, the
+  record's numbers (test_wsc2_miniature_schedule_reaches_past_edge_rows checks this).
+- CHANGE (the schedule, not the claim; every gate unchanged): `--check-phase P` (r2_wsc_cell.py; default 0 = 22c27ee):
+  the fork check arms run SHR's steps 0 .. P - 1 as SERIAL ragged steps first, then passes start at step P
+  (`check_schedule`, used by `run_check_fork`; the SHR record, top-16 and fingerprints are indexed by the pass's own
+  steps). wc1m: 128 steps, --check-steps 128, --check-phase 2 (r2_wsc_step.sh): pass 15 holds steps 62-65, so 2 rows
+  per request are past the edge at 16192 and 1 is an F4 row; 31 passes. The other cells keep phase 0 (their STRESS is
+  not required). FINDING: wc1ca / wc1cb (phase 0, 128 steps) also have no past-edge row in their check passes.
+- The step script's ROOT is now this tree (/mnt/beegfs/ojerbi/nosi-r2-wsc2).
+- CPU tests (test_wsc.py): test_wsc2_miniature_schedule_reaches_past_edge_rows (the record reproduced from the
+  schedule; wc1m's configuration read from the step script gives past-edge and F4 rows; run_check_fork uses the
+  schedule; refusals); test_wsc2_check_passes_after_a_serial_prefix[phase0_control, phase2] (the CPU world with the
+  GPU check's schedule: the past-edge / F4 counters = the schedule's prediction x B x L; phase 2: SEL, PRESENT, VIS, VB,
+  logits and every UCF gate as test_fork_vs_sh).
+
 ## 10. Shell commands outside cat / grep / head / tail / ls / sort / cut / diff / git / wc / date (this task)
 
 - BREACH 1 (disclosed): one read-only command contained the shell variable assignment `sed_unused=1` before a grep of

@@ -16,9 +16,12 @@
 # CELLS (K 3; --spec-journal-blocks 256 --spec-twin fused --spec-body fused --spec-graph on --spec-redirect on
 # --probe-every 16: the configuration of the L4X arm of sp3a / sp3b and of WS-B, the same workload pin and doc rows;
 # the store arms keep WS-B's X 48; the fork arms' store is the bound, --fork-store 0: L4XF X 129, UCF X 193):
-#   wc1m   the MINIATURE: C 73 (pool 10), B 8, 64 steps: SH, L4X, L4XU, L4XF, SHR, UCF; --check-steps 64,
-#          --require-stress 1 (MUST UCF-STRESS: rows past a block edge, F4 rows, pool blocks read in place, store reads,
-#          and a (head, request) that listed more store blocks than one wb1m fill held). Run it first. STEP_MIN 40.
+#   wc1m   the MINIATURE: C 73 (pool 10), B 8, 128 steps: SH, L4X, L4XU, L4XF, SHR, UCF; --check-steps 128,
+#          --check-phase 2, --require-stress 1 (MUST UCF-STRESS: rows past a block edge, F4 rows, pool blocks read in
+#          place, store reads, and a (head, request) that listed more store blocks than one wb1m fill held). Run it
+#          first. STEP_MIN 40. wsc2: S0 = 16128 = 252 x 64, so passes from step 0 of R 4 never span a block edge
+#          (record wc_c1m_2195573_wc1m: rows past a block edge 0); 2 serial steps first, then pass 15 holds steps 62-65
+#          (2 rows past the edge at 16192; schedule_facts in r2_wsc_cell.py; test_wsc.py). The other cells: phase 0.
 #   wc1a   TIMING C 128 (pool 65), B 216, 512 steps: SH, L4X, L4XU, L4XF. STEP_MIN 80, --mem 240G. STOPS while
 #          r2_wsc_cell.PRED_STAMP_WSC is None at <sha>.
 #   wc1b   TIMING C 73 (pool 10), B 318, 512 steps: SH, L4X, L4XU, L4XF. STEP_MIN 110, --mem 340G. STOPS while
@@ -41,7 +44,7 @@
 # this script; 3 another GPU; 4 not exactly one GPU; 124 / 137 the host timeout; 1 a STOP before the launch; 5 an
 # exit-0 step whose record is incomplete or whose sacct row is not COMPLETED 0:0.
 set -u
-NOSI=/mnt/beegfs/ojerbi/nosi-r2-wsc                                                      # ROOT
+NOSI=/mnt/beegfs/ojerbi/nosi-r2-wsc2                                                     # ROOT (wsc2)
 HOLDERS=/mnt/beegfs/ojerbi/kstep-cpu-runs/holders                                         # ROOT (lead-owned)
 SIF=/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif                                             # ROOT
 APPTAINER=/usr/bin/apptainer                                                             # ROOT
@@ -65,18 +68,18 @@ DRY=${DRYRUN:-0}
 [[ $NSHA =~ ^[0-9a-f]{40}$ ]] || stop "--nosi '$NSHA' is not a full commit id"
 case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
 [[ $RUN =~ ^[a-z0-9]{1,16}$ ]] || stop "run id '$RUN' (1-16 of a-z 0-9)"
-K=3 X=48 STRESS=0 NEEDPRED=0
+K=3 X=48 STRESS=0 NEEDPRED=0 PHASE=0
 case $CELL in
-    wc1m)  POOL=10 BATCH=8 STEPS=64 CHECK=64 STRESS=1 ARMS=L4X,L4XU,L4XF,SHR,UCF STEP_MIN=40 MEM=100G ;;
+    wc1m)  POOL=10 BATCH=8 STEPS=128 CHECK=128 PHASE=2 STRESS=1 ARMS=L4X,L4XU,L4XF,SHR,UCF STEP_MIN=40 MEM=100G ;;
     wc1a)  POOL=65 BATCH=216 STEPS=512 CHECK=128 ARMS=L4X,L4XU,L4XF NEEDPRED=1 STEP_MIN=80 MEM=240G ;;
     wc1b)  POOL=10 BATCH=318 STEPS=512 CHECK=128 ARMS=L4X,L4XU,L4XF NEEDPRED=1 STEP_MIN=110 MEM=340G ;;
     wc1ca) POOL=65 BATCH=216 STEPS=128 CHECK=128 ARMS=SHR,UCF STEP_MIN=60 MEM=240G ;;
     wc1cb) POOL=10 BATCH=318 STEPS=128 CHECK=128 ARMS=SHR,UCF STEP_MIN=80 MEM=340G ;;
     *) stop "cell '$CELL' (wc1m, wc1a, wc1b, wc1ca or wc1cb)" ;;
 esac
-DESC="arms SH+$ARMS steps $STEPS K $K X $X fork-store 0 check $CHECK stress $STRESS"
+DESC="arms SH+$ARMS steps $STEPS K $K X $X fork-store 0 check $CHECK phase $PHASE stress $STRESS"
 SPK=(--spec "$K" --arms "$ARMS" --joint-residency union --joint-attn fork --joint-extra "$X" --fork-store 0
-     --check-steps "$CHECK" --spec-journal-blocks 256 --spec-twin fused --spec-body fused --spec-graph on
+     --check-steps "$CHECK" --check-phase "$PHASE" --spec-journal-blocks 256 --spec-twin fused --spec-body fused --spec-graph on
      --spec-redirect on --probe-every 16 --profile on --require-stress "$STRESS")
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 for v in $(compgen -e); do case $v in SLURM_*|SRUN_*|SALLOC_*|SBATCH_*) stop "the environment exports $v" ;; esac; done

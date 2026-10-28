@@ -101,6 +101,9 @@ def parse_args(argv):
     ap.add_argument("--fork-store", type=int, default=0,
                     help="the fork arms' X (0: the bound, 1 + (full rows - 1) x 64; a smaller X is refused)")
     ap.add_argument("--check-steps", type=int, default=128, help="SHR / UC / UCR / UCF / UCFR: teacher-forced positions")
+    ap.add_argument("--check-phase", type=int, default=0,
+                    help="wsc2: UCF / UCFR run steps 0 .. phase - 1 serially, then passes from step phase (0: as "
+                         "22c27ee; the miniature uses 2 so that a pass spans a 64-token block edge)")
     ap.add_argument("--spec-rounds", type=int, default=0, help="rounds per timing arm (0: ceil((steps - 1) / K))")
     ap.add_argument("--spec-journal-blocks", type=int, default=256)
     ap.add_argument("--spec-twin", default="fused", choices=("torch", "bi", "fused"))
@@ -135,6 +138,8 @@ def parse_args(argv):
     R = a.spec + 1
     if any(x in CHECK_ARMS for x in a.arms) and (a.check_steps < R or a.check_steps > a.steps or a.check_steps % R):
         ap.error("--check-steps: a multiple of K + 1 = %d, at most --steps (the check arms)" % R)
+    if not 0 <= a.check_phase < 64 or a.check_phase + R > a.check_steps:
+        ap.error("--check-phase in 0 .. 63 with phase + K + 1 <= --check-steps")
     if a.joint_extra < 2 or a.probe_every < 2 or a.spec_rounds < 0 or a.spec_journal_blocks < 1:
         ap.error("--joint-extra >= 2, --probe-every >= 2, --spec-rounds >= 0, journal >= 1")
     if a.fork_store != 0 and a.fork_store < KA.store_slots(TOPK, R):
@@ -148,6 +153,33 @@ def parse_args(argv):
 # ------------------------------------------------------------------ pure parts (CPU-tested)
 def cap_key(pool: int) -> str:
     return "C%d" % (BC.C_BASE + int(pool))
+
+
+def check_schedule(n: int, R: int, phase: int = 0) -> list:
+    """wsc2: the first step of each teacher-forced pass of the fork check arms (UCF / UCFR): steps 0 .. phase - 1 run
+    as serial ragged steps (the same steps as SHR's), then passes of R rows start at phase, phase + R, ... while the
+    pass ends inside SHR's n steps. phase 0 = the passes of 22c27ee (0, R, 2 R, ...)."""
+    n, R, phase = int(n), int(R), int(phase)
+    if R < 1 or phase < 0 or phase + R > n:
+        raise ValueError("check schedule: R >= 1, 0 <= phase, phase + R <= n (n %d, R %d, phase %d)" % (n, R, phase))
+    return list(range(phase, n - R + 1, R))
+
+
+def schedule_facts(S0: int, n: int, R: int, phase: int = 0, bs: int = 64) -> dict:
+    """wsc2, the precondition of UCF-STRESS from the schedule alone (every check request starts at S0): rows past a
+    block edge (a row whose block is not the block of its pass's row 0) and F4 rows (an in-tail row at p % 64 = 63),
+    per request, over the passes of check_schedule."""
+    bases = check_schedule(n, R, phase)
+    past = f4 = 0
+    for a in bases:
+        p0 = int(S0) + a
+        for r in range(R):
+            p = p0 + r
+            if p // bs != p0 // bs:
+                past += 1
+            elif p % bs == bs - 1:
+                f4 += 1
+    return dict(passes=len(bases), past_edge_rows=past, f4_rows=f4, first=bases[:1], last=bases[-1:])
 
 
 def fork_store_slots(arm: str, K: int, override: int = 0) -> int:
@@ -374,7 +406,12 @@ def run_check_fork(model, ids, inputs, steps: int, clock, opt, shr, fork):
     vs.clock = clock
     vs.fa_check = {}
     n = shr["n"]
-    G = n // R
+    P = int(opt.get("check_phase", 0))
+    bases = check_schedule(n, R, P)                                  # pass g starts at step bases[g] (S0 + bases[g])
+    G = len(bases)
+    for t in range(P):                                               # wsc2: the serial prefix (SHR's own steps 0..P-1)
+        RE.decode_step(model, rs, inputs[:, t:t + 1].contiguous(),
+                       torch.full((B, 1), BC.S0 + t, dtype=torch.int32, device="cuda"))
     every = int(opt["probe_every"])
     offs = torch.arange(R, dtype=torch.int64, device="cuda")
     changed_lr = torch.zeros((L, R), dtype=torch.int64, device="cuda")
@@ -387,8 +424,9 @@ def run_check_fork(model, ids, inputs, steps: int, clock, opt, shr, fork):
     for g in range(G):
         probe = is_probe(g)
         vs.marks = [] if probe else None
-        ids_g = inputs[:, g * R:(g + 1) * R].contiguous()
-        pos_g = (BC.S0 + g * R + offs).to(torch.int32).view(1, R).expand(B, R).contiguous()
+        a0, a1 = bases[g], bases[g] + R                                  # the pass's steps (SHR's indices)
+        ids_g = inputs[:, a0:a1].contiguous()
+        pos_g = (BC.S0 + a0 + offs).to(torch.int32).view(1, R).expand(B, R).contiguous()
         if opt["profile"] and g == g_prof:                           # CHECK-ONLY: the kernels one pass dispatches
             lg, prof = WB._profile(lambda: VR.joint_pass(model, vs, ids_g, pos_g))
         else:
@@ -396,7 +434,7 @@ def run_check_fork(model, ids, inputs, steps: int, clock, opt, shr, fork):
         if probe:
             marks.append(vs.marks)
             vs.marks = None
-        ref = shr["sel"][g * R:(g + 1) * R].to("cuda").to(torch.int64)      # (R, L, H, B, T)
+        ref = shr["sel"][a0:a1].to("cuda").to(torch.int64)                  # (R, L, H, B, T)
         for l in range(L):
             cur = vs.chk_sel[l]                                              # (H, B, R, T)
             rf = ref[:, l].permute(1, 2, 0, 3)
@@ -410,12 +448,12 @@ def run_check_fork(model, ids, inputs, steps: int, clock, opt, shr, fork):
                 for h, b, r in nb.nonzero().tolist()[:5 - len(first_bad)]:
                     first_bad.append((g, l, r, h, b, int(sym[h, b, r])))
         compared += L * vs.H * B * R
-        tv = shr["topv"][g * R:(g + 1) * R].to("cuda")
-        ti = shr["topi"][g * R:(g + 1) * R].to("cuda")
+        tv = shr["topv"][a0:a1].to("cuda")
+        ti = shr["topi"][a0:a1].to("cuda")
         lgr = lg.permute(1, 0, 2)
         d_top.append((lgr.gather(-1, ti) - tv).abs().amax(-1).cpu())
-        d_max.append((lgr.amax(-1) - shr["fmax"][:, g * R:(g + 1) * R].t().to("cuda")).abs().cpu())
-        agree.append((lg.argmax(-1) == inputs[:, g * R + 1:(g + 1) * R + 1]).cpu())
+        d_max.append((lgr.amax(-1) - shr["fmax"][:, a0:a1].t().to("cuda")).abs().cpu())
+        agree.append((lg.argmax(-1) == inputs[:, a0 + 1:a1 + 1]).cpu())
     clock.sync()
     phases = [VR.phase_ms(m, clock.elapsed) for m in marks]
     layers = [VR.layer_ms(m, clock.elapsed) for m in marks]
@@ -520,6 +558,7 @@ def main(argv=None) -> int:
             opt = dict(arm=arm, K=a.spec, rounds=a.spec_rounds, journal=a.spec_journal_blocks, twin=a.spec_twin,
                        body=a.spec_body, graph=a.spec_graph == "on", redirect=a.spec_redirect == "on",
                        probe_every=a.probe_every, extra=a.joint_extra, spill=0, fork_store=a.fork_store,
+                       check_phase=a.check_phase,
                        profile=a.profile == "on")
             log("arm %s (%s)" % (arm, opt))
             try:
@@ -589,7 +628,10 @@ def main(argv=None) -> int:
                 capacity_C=BC.C_BASE + a.pool, spec_k=a.spec, arms=a.arms, joint_residency=a.joint_residency,
                 joint_attn=a.joint_attn, joint_extra=a.joint_extra, fork_store=a.fork_store,
                 fork_store_slots={x: fork_store_slots(x, a.spec, a.fork_store) for x in FORK_ARMS if x in a.arms},
-                check_steps=a.check_steps, spec_rounds=a.spec_rounds, spec_journal_blocks=a.spec_journal_blocks,
+                check_steps=a.check_steps, check_phase=a.check_phase,
+                check_schedule=(schedule_facts(BC.S0, a.check_steps, a.spec + 1, a.check_phase)
+                                if any(x in ("UCF", "UCFR") for x in a.arms) else None),
+                spec_rounds=a.spec_rounds, spec_journal_blocks=a.spec_journal_blocks,
                 spec_twin=a.spec_twin, spec_body=a.spec_body, spec_graph=a.spec_graph, spec_redirect=a.spec_redirect,
                 probe_every=a.probe_every, profile=a.profile, require_stress=a.require_stress, predictions=PRED_WSC,
                 phase_groups=WB.PHASE_GROUPS, dims=dims, host_mem=mem, base_commit=os.environ.get("BASE_COMMIT"),

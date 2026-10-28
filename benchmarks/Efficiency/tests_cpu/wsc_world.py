@@ -346,13 +346,14 @@ def arena_for(cache, B: int, X: int):
 # the check of FAST (fork) itself against SH
 # ---------------------------------------------------------------------------
 def run_fork_vs_sh(S_list, groups, K=3, seed=0, X=None, neg=None, gemm="exact", record=True, draft_last=False,
-                   natural=False, fork=None, probe=True, count_diff=True):
+                   natural=False, fork=None, probe=True, count_diff=True, phase=0):
     """wsb_world.run_union_vs_sh (read it) with the arena (world B re-homed after the build) and joint_attn "fork".
-    Returns its evidence plus: the fork calls per pass (FORK_CALLS), rehome_equal (world B's engine tables after the
-    re-home = world A's, bitwise), the arena."""
+    phase (wsc2, r2_wsc_cell.run_check_fork's --check-phase): steps 0 .. phase - 1 run as SERIAL ragged steps on both
+    worlds (the same tokens), then the joint passes start at step phase. Returns its evidence plus: the fork calls per
+    pass (FORK_CALLS), rehome_equal (world B's engine tables after the re-home = world A's, bitwise), the arena."""
     W.STATS.clear()
     R = K + 1
-    steps = groups * R
+    steps = phase + groups * R
     B = len(S_list)
     model = W.make_model(seed)
     rows = W.prompt_rows(seed + 1, S_list)
@@ -389,11 +390,17 @@ def run_fork_vs_sh(S_list, groups, K=3, seed=0, X=None, neg=None, gemm="exact", 
     S_t = torch.tensor(S_list, dtype=torch.int64)
     offs = torch.arange(R, dtype=torch.int64)
     ev = dict(changed=[], deltas=[], row0_bits=None, groups=groups, R=R, fills=[], diff_per_pass=[], argmax_bad=[],
-              compared=0, fork_per_pass=[], rehome_equal=rehome_equal, arena=arena)
+              compared=0, fork_per_pass=[], rehome_equal=rehome_equal, arena=arena, phase=phase)
+    for t in range(phase):                                           # wsc2: the serial prefix, both worlds
+        p = (S_t + t).view(B, 1).to(torch.int32)
+        rec.step = t
+        W.TAG[0] = "serial"
+        RE.decode_step(model, A, tokens[:, t:t + 1], p)
+        RE.decode_step(model, Bw, tokens[:, t:t + 1], p)
     for grp in range(groups):
         las = []
         for r in range(R):
-            t = grp * R + r
+            t = phase + grp * R + r
             p = S_t + t
             for b in range(B):
                 if int(p[b]) % W.BS == W.BS - 1:
@@ -404,8 +411,9 @@ def run_fork_vs_sh(S_list, groups, K=3, seed=0, X=None, neg=None, gemm="exact", 
             las.append(la[:, -1])
         W.TAG[0] = "joint"
         n0, f0 = len(diff_calls), len(FORK_CALLS)
-        pos = (S_t.view(B, 1) + grp * R + offs.view(1, R)).to(torch.int32)
-        lb = VR.joint_pass(model, vs, tokens[:, grp * R:(grp + 1) * R], pos)
+        a0 = phase + grp * R
+        pos = (S_t.view(B, 1) + a0 + offs.view(1, R)).to(torch.int32)
+        lb = VR.joint_pass(model, vs, tokens[:, a0:a0 + R], pos)
         ev["diff_per_pass"].append(len(diff_calls) - n0)
         ev["fork_per_pass"].append(len(FORK_CALLS) - f0)
         full = vs.full_default if vs.full_rows is None else vs.full_rows
@@ -413,7 +421,7 @@ def run_fork_vs_sh(S_list, groups, K=3, seed=0, X=None, neg=None, gemm="exact", 
             for r in range(R):
                 if not bool(full[r].any()):
                     continue
-                eq, sym = X_._sorted_eq(vs.chk_sel[l][:, :, r], rec.sel[(grp * R + r, l)])
+                eq, sym = X_._sorted_eq(vs.chk_sel[l][:, :, r], rec.sel[(phase + grp * R + r, l)])
                 ev["compared"] += int(full[r].sum()) * eq.shape[0]
                 for h, b in (~eq).nonzero().tolist():
                     if bool(full[r, b]):

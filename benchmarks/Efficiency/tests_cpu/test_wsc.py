@@ -56,7 +56,7 @@ EFF = ROOT / "benchmarks/Efficiency"
 WSB_TIP = "1a8ce68d9d6852fecf45b916c9ef1e6a5a80e098"         # nosi-r2-wsb: the tree WS-C starts from
 FIA6 = "94d5bb0ef62119717975f355b81b7996551adc8f"            # nosi-r2-fia6: the fork as fia6 ran it
 FORK_FIA6_PATH = "nosi/nosi/fork_vllm_unified_attention.py"
-STEP_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-wsc"
+STEP_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-wsc2"                # wsc2: the miniature's new schedule (22c27ee + wsc2)
 HOLDER = "2190876"                     # a lead-owned uuid file that exists (HOLDERS/2190876.gpu_uuid)
 DECLARED = ("nosi/nosi/verify_rows.py", "nosi/nosi/spec_round.py", "benchmarks/Efficiency/fork_vllm_unified_attention.py",
             "benchmarks/Efficiency/r2_kv_arena.py", "benchmarks/Efficiency/r2_wsc_cell.py",
@@ -700,11 +700,12 @@ def test_step_script_wc1():
     r = _step("wc1m", sha)
     if r.returncode != 0:
         pytest.skip("DRYRUN stopped on a pin outside the cell stage: %s" % r.stderr.strip()[-200:])
-    line = ("cell wc1m: C 73 (pool 10) B 8 arms SH+L4X,L4XU,L4XF,SHR,UCF steps 64 K 3 X 48 fork-store 0 check 64 "
-            "stress 1 STEP_MIN 40 mem 100G")
+    line = ("cell wc1m: C 73 (pool 10) B 8 arms SH+L4X,L4XU,L4XF,SHR,UCF steps 128 K 3 X 48 fork-store 0 check 128 "
+            "phase 2 stress 1 STEP_MIN 40 mem 100G")
     assert line in r.stdout, r.stdout[-600:]
-    for want in ("NOSI_POOL_BLOCKS=10", "NOSI_ATTN_SPLITS=4", "--pool 10", "--batch 8", "--steps 64",
-                 "--joint-residency union", "--joint-attn fork", "--fork-store 0", "--check-steps 64",
+    for want in ("NOSI_POOL_BLOCKS=10", "NOSI_ATTN_SPLITS=4", "--pool 10", "--batch 8", "--steps 128",
+                 "--joint-residency union", "--joint-attn fork", "--fork-store 0", "--check-steps 128",
+                 "--check-phase 2",
                  "--require-stress 1", "--mem=100G", "--time=40", "r2_wsc_cell.py", "wc_t1_%s_wc1m" % HOLDER):
         assert want in r.stdout, want
     r = _step("wc1ca", sha)
@@ -716,6 +717,72 @@ def test_step_script_wc1():
             assert r.returncode == 1 and "PRED_STAMP_WSC is None" in r.stderr, (cell, r.stderr[-300:])
         else:
             assert r.returncode == 0 and "cell %s:" % cell in r.stdout, (cell, r.stdout[-300:])
+
+
+# ------------------------------------------------------------------ wsc2: the miniature reaches past-edge rows
+def _cell_config(cell):
+    """(steps, check, phase, stress) of a cell of r2_wsc_step.sh (its case line; PHASE defaults to 0)."""
+    src = (EFF / "r2_wsc_step.sh").read_text()
+    m = re.search(r"^\s+%s\)\s+(.*);;\s*$" % cell, src, flags=re.M)
+    assert m, cell
+    kv = dict(x.split("=", 1) for x in m.group(1).split())
+    return int(kv["STEPS"]), int(kv["CHECK"]), int(kv.get("PHASE", 0)), int(kv.get("STRESS", 0))
+
+
+def test_wsc2_miniature_schedule_reaches_past_edge_rows():
+    """The data precondition of UCF-STRESS (L34): the UCF passes of wc1m must hold rows past a 64-token block edge.
+    MEASURED (record wc_c1m_2195573_wc1m, 22c27ee): rows past a block edge 0, F4 rows 256. CONTROL: 22c27ee's
+    schedule (64 check steps from step 0 at S0 = 252 x 64) gives 0 past-edge rows and 1 F4 row per request, i.e.
+    1 x 8 requests x 32 layers = 256, the record's numbers."""
+    C = _cell()
+    S0, R, L_gpu, B_mini = C.BC.S0, K + 1, 32, 8
+    assert S0 % 64 == 0                                                       # why phase 0 never spans an edge
+    old = C.schedule_facts(S0, 64, R, 0)
+    assert old["past_edge_rows"] == 0 and old["f4_rows"] * B_mini * L_gpu == 256, old    # the record, reproduced
+    steps, check, phase, stress = _cell_config("wc1m")
+    assert stress == 1 and check <= steps and check % R == 0, (steps, check)
+    new = C.schedule_facts(S0, check, R, phase)
+    assert new["past_edge_rows"] > 0 and new["f4_rows"] > 0, new             # THE PRECONDITION, from the schedule
+    assert C.check_schedule(check, R, phase)[-1] + R <= check                # every pass inside SHR's steps
+    a = C.parse_args(["--out", "x", "--workload", "w", "--batch", "8", "--pool", "10", "--steps", str(steps),
+                      "--arms", "L4X,L4XU,L4XF,SHR,UCF", "--joint-residency", "union", "--joint-attn", "fork",
+                      "--check-steps", str(check), "--check-phase", str(phase), "--require-stress", "1"])
+    assert (a.check_steps, a.check_phase) == (check, phase)
+    src = (EFF / "r2_wsc_cell.py").read_text()                                # the GPU arm uses this schedule
+    body = src[src.index("def run_check_fork"):src.index("def main(")]
+    assert "check_schedule(n, R, P)" in body and 'opt.get("check_phase", 0)' in body and "RE.decode_step" in body
+    assert "check_phase=a.check_phase" in src
+    for cell in ("wc1a", "wc1b", "wc1ca", "wc1cb"):                          # the other cells: unchanged (phase 0)
+        assert _cell_config(cell)[2] == 0, cell
+    base = ["--out", "x", "--workload", "w", "--joint-residency", "union", "--joint-attn", "fork", "--arms", "SHR,UCF"]
+    for bad in (["--check-phase", "64"], ["--check-phase", "-1"], ["--check-phase", "126"]):
+        with pytest.raises(SystemExit):
+            C.parse_args(base + bad)
+    assert C.parse_args(base).check_phase == 0
+
+
+@pytest.mark.parametrize("phase", [0, 2], ids=["phase0_control", "phase2"])
+def test_wsc2_check_passes_after_a_serial_prefix(phase):
+    """The CPU world with the GPU check's schedule: requests at multiples of 64 (as S0), 16 passes. phase 2: 2 serial
+    steps on both worlds first (as run_check_fork), then pass 15 spans the block edge: rows past it exist, and every
+    claim of test_fork_vs_sh still holds. phase 0 (the CONTROL): no row past an edge (the wc1m record's failure)."""
+    S_list = [4864, 4928]                                                      # 76 x 64, 77 x 64
+    B = len(S_list)
+    ev = Z.run_fork_vs_sh(S_list, 16, phase=phase)
+    st = ev["stats"]
+    print("phase %d: past-edge %d, F4 %d, store reads %d, pool reads %d" % (phase, st["past_edge"], st["f4_rows"],
+                                                                           st["store_reads"], st["pool_reads"]))
+    facts = _cell().schedule_facts(S_list[0], phase + 16 * R, R, phase)
+    assert st["past_edge"] == facts["past_edge_rows"] * B * L and st["f4_rows"] == facts["f4_rows"] * B * L, (st, facts)
+    if phase == 0:
+        assert st["past_edge"] == 0, st
+        return
+    assert st["past_edge"] > 0 and st["f4_rows"] > 0, st
+    assert ev["changed"] == [], ev["changed"][:8]
+    assert st["dropped"] == 0 and st["unserved"] == 0 and st["vis_bad"] == 0 and st["vb_bad"] == 0, st
+    assert ev["argmax_bad"] == [] and ev["max_delta"] <= 1e-4, (ev["argmax_bad"][:5], ev["max_delta"])
+    assert st["calls"]["attn"] == L * 16 and st["calls"]["resid"] == L * 16, st["calls"]
+    assert all(_gates(ev).values()), _gates(ev)
 
 
 def test_notes():
