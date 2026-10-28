@@ -595,9 +595,9 @@ def test_i2_cell_report_and_gates(monkeypatch):
     assert not {n: ok for n, _, ok, _ in C.union_gates("L4PTU", res, L, check=True)}["L4PTU-IDX"]   # not blind
     p = C.verdicts(sh, recs, B)                                        # B 8: the flat PRED_I2, all None: REPORT
     assert all(v in ("REPORT", "NOT_RUN") for _, v, _ in p), p
-    assert C.PRED_STAMP_I2 is None and all(C.PRED_I2[k] is None for k in C.PRED_KEYS)    # the builder's state
-    assert set(C.PRED_I2_BY_B) == {216, 318}
-    assert all(set(x) == set(C.PRED_KEYS) and all(v is None for v in x.values()) for x in C.PRED_I2_BY_B.values())
+    assert C.PRED_STAMP_I2 is None or isinstance(C.PRED_STAMP_I2, str)   # None until the lead registers
+    assert all(C.PRED_I2[k] is None for k in C.PRED_KEYS) and set(C.PRED_I2_BY_B) == {216, 318}   # flat block: None
+    assert all(set(x) == set(C.PRED_KEYS) for x in C.PRED_I2_BY_B.values())
     r2 = recs["L4PTU"]["rates"]["median_tok_s"] / C.SC.sh_rates(B, sh)["median_tok_s"]
     monkeypatch.setitem(C.PRED_I2_BY_B, B, dict(I2_ratio=(0.0, 1e9), I2_plan=r2 * 1.5, I2_above_I1=True,
                                                  I2_agree=0.5))

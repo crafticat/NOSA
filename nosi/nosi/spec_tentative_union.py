@@ -212,7 +212,7 @@ class TentStateU(ST.TentState):
         row_in, in_all = self._row_inputs(R)
         vis_cnt = vis_a.sum(-1) if chk else None                       # CHECK-ONLY: (H, B, R) blocks seen
         if st:                                                         # ACCOUNTING
-            streamed = cut.to(torch.int64).sum()
+            streamed = (cut.view(B, R).to(torch.int64) * plan.act.t()).sum()   # active rows only
             used = torch.zeros((), dtype=torch.int64, device=self.dev)
             spill_used = torch.zeros((), dtype=torch.int64, device=self.dev)
         for c in range(vs.C):                                          # the store: fill 0, then the spill fills
@@ -257,13 +257,14 @@ class TentStateU(ST.TentState):
             s = vs.stat
             s["rows_full"] += full.sum()
             s["rows_res"] += res.sum()
-            s["win_sel"] += (s0 >= 0).sum()
+            s["win_sel"] += ((s0 >= 0) & plan.act[0].view(1, B, 1)).sum()     # active requests only
             s["win_host"] += ((eng._load_mask >= 0) & ~skip0).sum()   # row 0's host loads (after the pool)
             s["fills_used"] += used
             s["spill_fills_used"] += spill_used
             s["streamed_rows"] += streamed + len_e.to(torch.int64).sum()
         if chk:                                                        # CHECK-ONLY: presence and the visible count
-            vis_cnt = vis_cnt + past.view(1, B, R)                     # the row's own tentative block (the buffer)
+            own_b = (vis_b & own.unsqueeze(-1)).any(2).permute(2, 0, 1)   # (H, B, R): call B shows the own block
+            vis_cnt = vis_cnt + (own_b & past.view(1, B, R))           # a past row's own tentative block (the buffer)
             found = VR._presence(vs, eng, sel, lst, qb)
             miss = ~found & (sel >= 0)
             f4 = full.t().reshape(1, B, R, 1)
