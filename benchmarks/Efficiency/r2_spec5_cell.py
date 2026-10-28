@@ -72,9 +72,12 @@ EXACT_ARMS5 = ARMS5
 # Inputs (MEASURED elsewhere): SCORING_pf1.md (64 / 192 MiB per step: +0.25 / +1.46 %, delivery 11.5 / 20.6 ms,
 # backlog 0), SCORING_sp3b_fix.md (L3 at C 73 B 318: NEW 3,379 MB and the gather WAIT 136.5 ms per round),
 # SCORING_sp3a.md (L4P at C 128 B 216: NEW 421 MB, WAIT 20.0 ms per round).
-PRED_STAMP5 = None
-PRED_SPEC5 = dict(stamp=PRED_STAMP5, L3P_tok=None, L4PP_tok=None, L3P_vs_L3=None, L4PP_vs_L4P=None, L3P_served=None,
-                  L4PP_served=None, L3P_inflight_ms=None, L4PP_inflight_ms=None)
+# Lead registration 2026-10-28T05:37:07Z (one set for sp5a and sp5b). A perfect prefetch hides at most the NEW gather
+# wait (136.5 ms of a 967 ms L3 round at C 73; 20 ms at C 128), against packer and accounting costs: central +5 %.
+PRED_STAMP5 = "2026-10-28T05:37:07Z"
+PRED_SPEC5 = dict(stamp=PRED_STAMP5, L3P_tok=True, L4PP_tok=True, L3P_vs_L3=(0.9, 1.15), L4PP_vs_L4P=(0.9, 1.15),
+                  L3P_served=(0.2, 0.9), L4PP_served=(0.2, 0.9), L3P_inflight_ms=(0.0, 150.0),
+                  L4PP_inflight_ms=(0.0, 150.0))
 SPLIT_KEYS = ("sel", "new", "ready_resident", "read_ready", "read_inflight", "refetch", "read_draft",
               "evict_overflow", "evict_free", "unread", "moved", "committed", "victim_named")
 
