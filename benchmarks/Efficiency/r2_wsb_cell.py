@@ -69,9 +69,17 @@ TOPV = 16                          # SHR keeps its top-16 logits per (request, s
 #   ratio_vs_l4x     (low, high): L4XU's / L4X's median steady committed tok/s
 # Plan (MODEL, PLAN_L4P_faithful.md WS-B): joint pass of 4 rows about 2.85 SH steps at C 128 B 216 (184 ms), about 3.2
 # at C 73 B 318 (398 ms); FALSIFIER > 3.5 / > 4.0 steps.
-PRED_STAMP_WSB = None
-PRED_WSB = dict(stamp=PRED_STAMP_WSB, C128=dict(joint_sh_steps=None, ratio_vs_sh=None, ratio_vs_l4x=None),
-                C73=dict(joint_sh_steps=None, ratio_vs_sh=None, ratio_vs_l4x=None))
+# The lead's REGISTRATION (2026-10-28T10:57:16Z, `date -u`, before any WS-B cell ran). MEASURED inputs
+# (SCORING_specp_fix.md section 7, same configs, same-job SH): L4X joint 330.735 ms = 5.129 SH steps (C 128) and
+# 539.924 ms = 4.354 (C 73); L4X round 749.440 / 1,122.537 ms; L4X DIAG vs SH 0.2115 / 0.8214 = 0.2575 and
+# 0.2864 / 0.8668 = 0.3304. MODEL: the round keeps L4X's draft / truncate / commit and swaps the joint pass; with the
+# joint bands below the round ratio is 1.16-1.32 (C 128) and 1.04-1.26 (C 73). The bands are wider upward because one
+# residency per layer journals fewer window changes (truncate + commit can shrink, unknown) and downward because the
+# drafts after a union pass find fewer window hits (NOTES_wsb.md risk 7, unknown).
+PRED_STAMP_WSB = "2026-10-28T10:57:16Z"
+PRED_WSB = dict(stamp=PRED_STAMP_WSB, C128=dict(joint_sh_steps=(2.3, 3.5), ratio_vs_sh=(0.27, 0.41),
+                                                ratio_vs_l4x=(1.05, 1.60)),
+                C73=dict(joint_sh_steps=(2.4, 4.0), ratio_vs_sh=(0.31, 0.50), ratio_vs_l4x=(0.95, 1.50)))
 # The phase boundaries (verify_rows.py; each label runs from its mark to the next mark of the same pass): docs/NOTES_wsb.md
 # section 4 states them with file:line and the dependencies between them.
 DENSE = ("pre", "post", "head")
