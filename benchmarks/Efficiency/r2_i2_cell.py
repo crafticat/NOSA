@@ -736,7 +736,7 @@ def main(argv=None) -> int:
                     gates.append(("%s-RUN" % arm, True, True, "%d teacher-forced passes of R %d" % (res["passes"],
                                                                                               res["R"])))
                     gates.extend(check_gates_u(arm, res, bool(a.require_stress), L))
-                del res
+                res = None                                   # frees the arm's record; the SHR branch sets no res
             except Exception as e:
                 traceback.print_exc()
                 gates.append(("%s-RUN" % arm, True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
