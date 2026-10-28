@@ -25,6 +25,12 @@ CHECK ARMS (not timed; the coordinator's binding correction: FAST is checked on 
           recount (dropped 0), the VISIBLE COUNT (vis_bad 0), one residency per layer and pass, VRF-IDX of the window, the
           first store and the buffer call; the logits deltas against SHR's top-16 and fingerprints; one PROFILED pass
   TUCR    TUC with gemm rowgroup (SH's GEMM bits: a change there is the union attention's float order alone)
+WS-G CHECK ARMS (cell i2g; the lead, 2026-10-28T13:19Z; r2_wsg_check.py of b1ae579 copied unchanged, with
+r2_i2_check.ContractCapture for the contract-4 runners): the arm with the capture, then REF = SH's computation
+teacher-forced on the arm's own committed tokens; parts MAP, REF, SEL, GREEDY (tie 0), POS, SLOT, MISS / BITS:
+  WJ      L4PJ, the EXACT positive control: WJ-CHK MUST (every part passes)
+  WT, WU  L4PT, L4PTU: every gate REPORT
+  WUP     L4PTU with drop_spill at X = --chk-plant-extra: the planted control; MUST WUP-PLANT-CHK-PRE and -CAUGHT
 MEASURED per timing arm (CUDA events; device counters read once after the arm): r2_wsa_cell.summarize_w's record
 (committed tok/s median / mean / effective against SH and 3,407.2; round phases reset, joint, commit, draft; ROLLBACK per
 round; the D1 / D3 calls; bytes per round; memory and the fitting batch at 84 GB, MODEL; tokens against SH; the contract-4

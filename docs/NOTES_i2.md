@@ -7,7 +7,8 @@
   Merge commit `e3827c0` (+ r2-wsb `1a8ce68`), then the I2 commit (this file). No other worktree was touched: the
   pinned trees nosi-r2-wsa (83dac96), nosi-r2-wsb (1a8ce68), nosi-r2-wsb2 (9688cee), nosi-r2-wse, -wsg, -wsm, -wsc were
   only read.
-- Status: SOURCE ONLY. I ran no test, no interpreter and no job. The lead runs the commands of section 6.
+- Status: CPU tests RUN by me on the amd partition (the human's permission of 2026-10-28T13:19Z), section 6.1; no GPU
+  job. Commits: e3827c0 (merge), 1fd7c9c (I2), 55551c3 (CPU-run fixes), e6a1cf9 (review fixes), then this notes update.
 - Written 2026-10-28T13:10:41Z (`date -u`). Style: ASD-STE100. Labels: CODE = read at file:line; MEASURED = from a
   scoring file; MODEL = hand arithmetic; INFERENCE = my reading. Line numbers come from `grep -n`.
 
@@ -118,6 +119,8 @@ run.
 | `test_l4ptu_buffer_lifetime` | dead buffer entries poisoned change no token, logits within TOL | PLANTS no_causal, no_lower (act on the union call B too): CAUGHT |
 | `test_l4ptu_teacher_forced_vs_sh[B1, B8]` | the check cell on the CPU: 6 teacher-forced passes; every row's selection SET = SH's (every layer, head, request); argmax = SH's; logits within TOL; dropped 0, unserved 0, vis_bad 0, visible = selected; L residency calls per pass (independent count); VRF-IDX A, T (and B with extras) bitwise; the cell's TUC gates pass (B 8) | an F4 fill row and rows past an edge inside the passes; B 8: extras; CONTROL changed=1: TUC-SEL FAILS |
 | `test_l4ptu_store_bytes_and_tentative_plant` | X 4, recorded: every selected block of every row is in the window or a store slot with its host rows and cis rows, or it is block qb / the tentative block (wsb_world.union_bytes) | spill > 0; PLANT list_tentative (the tentative block in the union list, B 1, the 5th pass is the first past the edge): vis_bad > 0 (CAUGHT) |
+| `test_i2_wsg_positive_control_and_arms` | WS-G's check on the stand-ins (filter "end": corrections, finals, target rows in D slots): WJ (L4PJ) passes every part incl. BITS (MUST WJ-CHK PASS); WT and WU pass every part (REPORT gates); the capture changes no token, fingerprint or counter of WU; every wrapper is back after the run | D-slot commits ran; slots, REF self-check and SEL were compared |
+| `test_i2_wsg_planted_control` | WUP (L4PTU, drop_spill, X 4): MISS > 0 and the check FAILS; WUP-PLANT-CHK-PRE and -CAUGHT pass (MUST) | precondition: unserved > 0 (the plant dropped blocks) |
 | `test_l4ptu_refusals_and_no_host_sync` | refusals (level L3, unknown uneg / vneg, spill 0, extra 1, unknown tneg) before the meter attaches; no host read in a round from spec_tentative_union.py or verify_rows.py; spec_tentative.py only in `_run_paper` / `_ps_after` | the trap is not blind (the per-round sync is seen) |
 | `test_i2_cell_arguments`, `test_i2_cell_report_and_gates`, `test_step_script_i2` | the cell's arguments and refusals; summarize / gates on CPU runs of L4PT and L4PTU (the WS-A gates renamed L4PTU-*, RESID, IDX not blind); verdicts REPORT while PRED_I2 is None, the per-batch entry overrides it (RATIO, PLAN-15, AGREE, ABOVE-I1); the step script: wrong cells STOP, DRYRUN prints the cell line and arguments, i2a / i2b STOP while PRED_STAMP_I2 is None | - |
 
@@ -160,6 +163,36 @@ all None, 318: all None} (the per-batch entry overrides the flat block key by ke
 I2_ratio, I2_vs_I1, I2_joint_sh, I2_joint_saving, I2_rollback_sh, I1_ratio, I2_agree (floor), I2_plan (the plan's point;
 verdict I2-PLAN-15 = within +-15 %), I2_above_I1 (the rung falsifier). The step script STOPS i2a / i2b while
 PRED_STAMP_I2 is None.
+
+### 5.0 WS-G's check (cell i2g; scope addition of the lead, 2026-10-28T13:19Z)
+
+`benchmarks/Efficiency/r2_wsg_check.py` is WS-G's module of b1ae579 (nosi-r2-wsgreg), copied UNCHANGED with
+`git checkout b1ae579 -- <path>` in this tree (test_i2 (h) checks its bytes); the other tree was not touched.
+WS-G's FastCapture maps "rows 0 .. m - 1 of a joint pass, m = the count increase" and wraps verify_rows.joint_pass. That
+map is wrong for contract 4 (D-slot target rows also commit) and TentRunner never calls joint_pass. So
+`benchmarks/Efficiency/r2_i2_check.py` adds `ContractCapture(FastCapture)`: the same stores and result keys (so
+r2_wsg_check.run_ref, chk_parts, chk_gates apply unchanged), but rows are mapped BY POSITION (column = p - S; a row of a
+round commits its column if count0 <= column < count1; the last row of a column decides its selection and its logits;
+tentative runners give the verify masks). MISS (tentative arms): every committed id of a verify row's residency is in
+the window (TentState._resid wrapped) plus L4PTU's presence recount ("dropped"). POS (tentative): T.qc = S + count and
+T.ctr_c[0] = T.qc (the twins stand at the frontier between rounds by design). REF and the parts: WS-G's.
+
+Arms (cell i2g, wgcm's shape: C 73, B 100, 64 steps, slot check every 4 rounds; STEP_MIN 90, --mem 200G; MODEL about
+45-55 min: wgcm's SH + 2 x (arm + REF) took 26:47, here SH + 4 x (arm + REF)):
+
+| arm | runner | gates |
+|---|---|---|
+| WJ | L4PJ (PaperJournalRunner, EXACT) | WJ-CHK MUST (the positive control: MAP, REF, SEL, GREEDY, POS, SLOT, BITS) |
+| WT | L4PT (TentRunner) | every gate REPORT |
+| WU | L4PTU (TentRunnerU, union checks on) | every gate REPORT |
+| WUP | L4PTU with VerifyOps neg drop_spill at X 4 (the planted control) | WUP-CHK REPORT; WUP-PLANT-CHK-PRE (MISS > 0) and WUP-PLANT-CHK-CAUGHT MUST |
+
+Plus <arm>-RUN, -ERR, -COMMIT-N (MUST, structural, as wgcm's RUN / ERR / COMMIT). Tie tolerance 0.0 (WS-G's
+registered CHK_TIE_LOGIT). The tentative check arms run with check_every 1 (a TentRunner fingerprints its committed rows
+only on check rounds; MAP reads them).
+
+    DRYRUN=1 bash benchmarks/Efficiency/r2_i2_step.sh --nosi <sha> <h> <r> i2g
+    bash benchmarks/Efficiency/r2_i2_step.sh --nosi <sha> <h> <r> i2g
 
 ### 5.1 Inferred bands (INFERENCE, for the lead to register or change; not registered by me)
 
@@ -243,9 +276,31 @@ GPU, after the CPU suite is green (a clean checkout at the I2 commit <sha>; hold
     bash benchmarks/Efficiency/r2_i2_step.sh --nosi <sha> <h> <r> i2b       # timing C 73 (after PRED_STAMP_I2)
     bash benchmarks/Efficiency/r2_i2_step.sh --nosi <sha> <h> <r> i2a       # timing C 128 (after PRED_STAMP_I2)
 
+### 6.1 CPU runs (MEASURED, amd partition; one srun per line of section 8)
+
+| log (/mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/) | commit | file(s) | summary line |
+|---|---|---|---|
+| i2_1fd7c9c_a.txt | 1fd7c9c | test_i2.py | 3 failed, 28 passed (the name-scan expectation; `--arms` commas escaped by printf %q; WJ MAP / BITS: a stale J-slot logits row at a column that a D-slot step committed) -> fixed in 55551c3 |
+| i2_1fd7c9c_b.txt | 1fd7c9c | test_wsa.py | 24 passed, 1 skipped (WS-A's DRYRUN needs its own tree) |
+| i2_1fd7c9c_c.txt | 1fd7c9c | test_wsb.py | 26 passed, 1 skipped (WS-B's DRYRUN) |
+| i2_1fd7c9c_d.txt | 1fd7c9c | test_spec_prefetch.py | 23 passed, 1 skipped |
+| i2_1fd7c9c_e.txt | 1fd7c9c | test_spec_round.py, test_spec_paper.py, test_rollback.py, test_verify_rows.py, test_ragged_engine.py | 118 passed, 4 skipped (other trees' DRYRUNs) |
+| i2_55551c3_a.txt | 55551c3 | test_i2.py | see the report |
+| i2_e6a1cf9_a.txt | e6a1cf9 | test_i2.py | see the report |
+
+The logs start with container noise (`"sed": executable file not found in $PATH`): the image's start scripts look for
+tools that the compute PATH does not hold; no test calls them.
+
 ## 7. Risks and open points
 
-1. Nothing ran. The CPU tests are my reading of the stand-ins and of the code.
+1. The GPU cells did not run. The CPU stand-ins do not establish GPU dispatch, ordering, timing or memory.
+1b. Review (a read-only reviewer agent on 1fd7c9c's I2 source): one BUG (the name-scan expectation, fixed in 55551c3);
+   RISKS taken: the visible count now reads call B's own-block mask; the registration test now accepts a registration
+   (e6a1cf9). RISKS kept: (i) in L4PTU only row 0 of a joint pass runs TentState._resid, so the joint draft row's skipped
+   misses do not reach T.skipped while draft_rows counts the row: `draft.skip_per_stream_per_call` of L4PTU is lower and
+   does not compare with L4PT's; forced / injected count row 0 and the one-row passes only; (ii) VR.attach's own
+   refusals come after the KVMeter attaches (as in L4PT). NITS kept: TentState._layer has no closing mark, so layer_ms
+   gives L - 1 spans and the last layer's "post" is dropped; the _evu cache key is not normalised (two equal runs).
 2. TUC-SEL (MUST) WILL PROBABLY FAIL ON THE GPU, as WS-B's UC-SEL did in wb1m (2,685 of 32,768 sets changed, mostly
    size-2 swaps, none at layer 0; STATUS_LOG 11:20:48Z): float order moves near ties. TUCR (rowgroup) removes the GEMM
    part. WS-B2's near-tie discriminator (9688cee) is NOT merged here (it changes WS-B's cell only); the lead decides the
@@ -285,6 +340,18 @@ GPU, after the CPU suite is green (a clean checkout at the I2 commit <sha>; hold
 - `cd` (shell built-in) in front of read commands; `echo` (built-in) for separators; `&&`, `;`, `|`.
 - bash process substitution `<( ... )` in one read-only `diff` of git output (no file written).
 - git: `git worktree add` (as instructed), `git merge --no-ff --no-commit`, `git commit -F` (messages written with the
-  Write tool), read-only git commands.
-- No interpreter, no sed, no awk, no heredoc, no `cat >>`, no tr / paste / uniq / xargs, no hashing, no `find`, no srun /
-  sbatch / pytest. Files were written with the Write and Edit tools only.
+  Write tool), `git checkout b1ae579 -- benchmarks/Efficiency/r2_wsg_check.py` (in this worktree: the exact WS-G blob),
+  read-only git commands.
+- `squeue -u ojerbi` (read-only, twice).
+- `timeout 1500 tail -f /dev/null` in the background, once, to wait for the reviewer agent.
+- srun (the human's permission of 13:19Z; the lead's template; `export PATH=...bin-compute:$PATH` first; the output
+  redirected to the log by the shell, as the template does), seven times:
+  `srun -p amd -c 16 --mem=64G -t 240 apptainer exec --bind /mnt/beegfs/ojerbi:/mnt/beegfs/ojerbi --env
+  TMPDIR=/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc,TORCH_EXTENSIONS_DIR=/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/i2_ext_<p>
+  /mnt/beegfs/ojerbi/nosa-env/nosa-env.sif bash -c "cd /mnt/beegfs/ojerbi/nosi-r2-i2 && env PYTHONDONTWRITEBYTECODE=1
+  /venv/nosa/bin/python -m pytest -q [-s] -p no:cacheprovider -rfEs <file(s)>" > .../cpu-logs/i2_<sha7>_<p>.txt 2>&1`
+  with (p, files): (a, test_i2.py) at 1fd7c9c, 55551c3, e6a1cf9 (logs i2_<sha7>_a; the e6a1cf9 run used ext dir f);
+  (b, test_wsa.py), (c, test_wsb.py), (d, test_spec_prefetch.py), (e, test_spec_round.py test_spec_paper.py
+  test_rollback.py test_verify_rows.py test_ragged_engine.py: five CPU stand-in files in one srun) at 1fd7c9c.
+- No interpreter on the login node, no sed, no awk, no heredoc, no `cat >>`, no tr / paste / uniq / xargs, no hashing,
+  no `find`, no sbatch, no GPU job. Files were written with the Write and Edit tools (and the git checkout above).
