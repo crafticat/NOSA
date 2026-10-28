@@ -66,7 +66,12 @@ HOLDER = "2190876"                     # a lead-owned uuid file that exists (HOL
 DECLARED = ("nosi/nosi/verify_rows.py", "nosi/nosi/spec_round.py", "benchmarks/Efficiency/r2_wsb_cell.py",
             "benchmarks/Efficiency/r2_wsb_step.sh", "benchmarks/Efficiency/tests_cpu/wsb_world.py",
             "benchmarks/Efficiency/tests_cpu/test_wsb.py", "benchmarks/Efficiency/tests_cpu/test_spec_prefetch.py",
-            "docs/NOTES_wsb.md")
+            "docs/NOTES_wsb.md",
+            # WS-C (nosi-r2-wsc, on top of 1a8ce68): its files; tests_cpu/test_wsc.py pins them (test_gate0_files)
+            "benchmarks/Efficiency/fork_vllm_unified_attention.py", "benchmarks/Efficiency/r2_kv_arena.py",
+            "benchmarks/Efficiency/r2_wsc_cell.py", "benchmarks/Efficiency/r2_wsc_step.sh",
+            "benchmarks/Efficiency/tests_cpu/wsc_world.py", "benchmarks/Efficiency/tests_cpu/test_wsc.py",
+            "benchmarks/Efficiency/tests_cpu/test_wsc_interp.py", "docs/NOTES_wsc.md")
 
 
 def _load(name):

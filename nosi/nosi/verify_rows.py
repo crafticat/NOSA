@@ -109,6 +109,29 @@ cells): row roles, the window's ready part and residual host loads, the store's 
 rows that the attention calls stream. HOST COUNTS (always, no device op): vs.calls (GEMM, attention, residency and
 gather calls, store fills). PRODUCTION (always): the store fills, the spill, the merge; the resident rows' miss ids
 and the pin record only when the caller sets vs.miss_ids / vs.pin (the paper schedule with rung L5).
+
+WS-C (tree nosi-r2-wsc, KS/analysis/plan/PLAN_L4P_faithful.md, docs/NOTES_wsc.md): mode "union" with
+VerifyOps(joint_attn="fork") (default "store": the WS-B attention above, unchanged). Steps 1, 2 and 6 are WS-B's (the
+tentative rows, the ONE residency per layer, the end state). Steps 3-5 become (_fork_rows):
+  3. WHERE EACH SELECTED BLOCK LIVES (_fork_locate), as a block id of the K / V ARENA (benchmarks/Efficiency/
+     r2_kv_arena.py: ONE allocation holds every layer's window + pool rows AND the store; rs.kv_arena): a window slot
+     (the tail block too), a POOL slot (read IN PLACE: no device copy), store slot 0 (the next block) or store slot
+     1 + j (the j-th HOST-only block that a FULL row selects, in id order). A resident row's host-only blocks are
+     skipped (not present), as in WS-B.
+  4. ONE store fill: the listed host blocks with the shipped gathers. The store holds X - 1 >= (full_max - 1) x topk
+     listed blocks (the bound; VerifyState refuses less), so C = 1: no spill, nothing can be dropped (stat unserved).
+  5. ONE call of the fork (VerifyOps(fork=<the fork module's unified_attention>), FV6 = FORK_LAUNCH: 4 warps, 3
+     stages, a 64-token tile, the bias in the engine's dtype) for every row of every request: the kernel builds each
+     (request, KV head) union of the rows' lists itself and loads each union block ONCE for all rows (up to 4 rows per
+     program; R 5 is split 4 + 1); each row sees only its own list (8-bit extents per row and block; its own block up
+     to the body's length, F4 kept). No window call, no store call, no log-sum-exp merge.
+  CHECK-ONLY (ops.check): PRESENT (dropped, from the locations), VIS and VB from the tables that the KERNEL wrote
+  (each row sees exactly its own selection, as (block id, tokens), mapped back through the window / pool / store
+  maps), G_block0 (every row sees block 0 first: the precondition of the row-alone bits); with vs.fa_check (once,
+  layer 0): "F" (sampled requests alone = their rows in the full launch, bitwise) and "RA" (a row alone = the row in
+  the full launch, bitwise). Negative controls (tests only): "fork_union_rows" (every row lists its request's union),
+  "fork_small_store" (accept a store below the bound), "fork_probe_swap" (the "F" probe reads another request's
+  lists). The fork's Triton kernel is NOT edited (NO NEW KERNEL); this module only builds its inputs.
 """
 from __future__ import annotations
 
@@ -123,8 +146,14 @@ from .stage1_seqused import stage1_seqused
 MODES = ("fast", "exact", "union")
 GEMMS = ("natural", "rowgroup", "exact")
 NEG_KINDS = (None, "no_init_force", "no_extras", "no_row_mask", "causal_leak", "shared_row_lengths", "drop_spill",
-             "union_attention", "short_store_len")
+             "union_attention", "short_store_len", "fork_union_rows", "fork_small_store", "fork_probe_swap")
 UNION_NEG = ("drop_spill", "union_attention", "short_store_len")
+FORK_NEG = ("fork_union_rows", "fork_small_store", "fork_probe_swap")    # WS-C: controls of joint_attn "fork"
+JOINT_ATTN = ("store", "fork")          # mode union's attention: WS-B's (window call + store calls + merge) or the fork
+FORK_ROWS = 4                           # the fork's BLOCK_Q: 4 rows' 8-bit extents in one int32 word (fork :942, :559)
+FORK_LAUNCH = dict(num_warps=4, num_stages=3, tile_size=64)   # FV6 = FVW4S3T64B16 (SCORING_fia6.md); bias: engine dtype
+FORK_BIG = 2 ** 31 - 1                  # a sort key past every block id (int32)
+FORK_STATS = ("pool_reads", "store_reads", "vb_bad", "vb_rows", "block0_bad", "past_edge", "f4_rows", "fork_loaded")
 FAST_NEG = ("no_extras", "no_row_mask", "causal_leak")          # route-1 FAST controls: mode "union" refuses them
 UNION_STATS = ("extras", "extras_pool", "extras_host", "extras_max", "spill", "unserved", "fills_used",
                "spill_fills_used", "dropped",
@@ -158,10 +187,16 @@ class VerifyOps:
               Mode "union": row K is a resident row (its pool hits are brought, its misses are skipped).
       spill   mode "union": the store fills per layer (None: C = ceil((R - 1) topk / (X - 1)), the bound, so nothing can
               be dropped; an int: tests only)
-      check   mode "union": the CHECK-ONLY operations (module docstring; OFF in the timing cells)"""
+      check   mode "union": the CHECK-ONLY operations (module docstring; OFF in the timing cells)
+      joint_attn  mode "union" (WS-C): "store" (default: WS-B's attention) or "fork" (one fork call per layer; the
+              state needs rs.kv_arena; module docstring)
+      fork    joint_attn "fork": the fork's unified_attention (benchmarks/Efficiency/fork_vllm_unified_attention.py on
+              the GPU; a stand-in on the CPU). This module imports no kernel module for it.
+      full_max  joint_attn "fork": the most FULL rows per request in a pass (None: R - 1 with draft_last, else R); the
+              store must hold (full_max - 1) x topk listed blocks (the bound; C = 1)"""
 
     def __init__(self, K=3, mode="fast", gemm="natural", linear=None, extra=16, attn=None, neg=None, record=False,
-                 stats=True, draft_last=False, spill=None, check=False):
+                 stats=True, draft_last=False, spill=None, check=False, joint_attn="store", fork=None, full_max=None):
         if not 1 <= int(K) <= K_MAX:
             raise VerifyError("K must be in 1 .. %d (got %r)" % (K_MAX, K))
         if mode not in MODES or gemm not in GEMMS:
@@ -179,6 +214,23 @@ class VerifyOps:
                               % neg)
         if spill is not None and int(spill) < 1:
             raise VerifyError("spill: at least one store fill")
+        if joint_attn not in JOINT_ATTN:                             # WS-C
+            raise VerifyError("joint_attn %r: one of %s" % (joint_attn, JOINT_ATTN))
+        if joint_attn == "fork":
+            if mode != "union":
+                raise VerifyError("joint_attn 'fork' is an attention of mode 'union'")
+            if fork is None or not callable(fork):
+                raise VerifyError("joint_attn 'fork' takes the fork's unified_attention (fork=...)")
+            if spill is not None:
+                raise VerifyError("joint_attn 'fork' has ONE store fill (C = 1): no spill")
+            if neg in UNION_NEG:
+                raise VerifyError("%s is a control of joint_attn 'store' (the fork path would ignore it)" % neg)
+            if full_max is not None and not 1 <= int(full_max) <= int(K) + 1:
+                raise VerifyError("full_max in 1 .. R = %d" % (int(K) + 1))
+        elif neg in FORK_NEG or fork is not None or full_max is not None:
+            raise VerifyError("fork / full_max / %s belong to joint_attn 'fork'" % (FORK_NEG,))
+        self.joint_attn, self.fork = joint_attn, fork
+        self.full_max = None if full_max is None else int(full_max)
         self.spill = None if spill is None else int(spill)
         self.check = bool(check)
         self.K, self.R = int(K), int(K) + 1
@@ -198,6 +250,9 @@ class VerifyOps:
                  draft_last=self.draft_last)
         if self.mode == "union":
             d.update(spill=self.spill, check=self.check)
+        if self.joint_attn == "fork":                                # WS-C (store: WS-B's record, unchanged)
+            d.update(joint_attn="fork", full_max=self.full_max, fork_launch=dict(FORK_LAUNCH),
+                     fork=getattr(self.fork, "__module__", None))
         return d
 
 
@@ -259,7 +314,7 @@ class VerifyState:
         self.pin = None                     # an object with record(l, sel, mask) (the requested-KV pin of the schedule)
         self.C = self.cap = 0
         self.chk_sel = None
-        if ops.mode == "union":
+        if ops.mode == "union" and ops.joint_attn == "store":          # WS-B's store (WS-C fork: _fork_state below)
             kdt = eng0._k_gpu.dtype
             if ops.neg == "drop_spill":                              # NEGATIVE CONTROL: no spill (the old overflow)
                 C = 1
@@ -303,6 +358,8 @@ class VerifyState:
         self.meta = dict(ops=ops.describe(), B=B, R=R, E=E, X=X, mask_bias=MASK_BIAS)
         if ops.mode == "union":
             self.meta.update(fills=self.C, cap=self.cap, bound=(R - 1) * topk)
+        if ops.mode == "union" and ops.joint_attn == "fork":         # WS-C: the arena, the store, the fork's buffers
+            _fork_state(self, model, rs, ops)
 
 
 def attach(model, rs, ops: VerifyOps) -> VerifyState:
@@ -949,6 +1006,431 @@ def _union_rows(vs: VerifyState, l: int, layer, eng, twin, q, k4, v4, sel, pos_b
     return attn
 
 
+# ------------------------------------------------------------------ UNION + FORK (WS-C): one residency, one fork call
+def _fork_state(vs: VerifyState, model, rs, ops: VerifyOps) -> None:
+    """WS-C: the fork's state of mode union (module docstring): the arena checks; the store = the arena's store views,
+    sized to the bound (C = 1); the list buffers; the fork's sequences (at most FORK_ROWS rows each); its union tables,
+    row lists and output; then ONE warm launch on empty lists (the compile, outside every timed pass)."""
+    B, R, E, H, D, bs, topk = vs.B, vs.R, vs.E, vs.H, vs.D, vs.bs, vs.topk
+    lay0 = model.layers[0]
+    eng0 = rs.cache.layers[0].cache_engine
+    dev = rs.st.cu_q.device
+    arena = getattr(rs, "kv_arena", None)
+    if arena is None:
+        raise VerifyError("joint_attn 'fork' needs the K / V arena on the state (rs.kv_arena; r2_kv_arena.attach)")
+    ns = int(eng0._k_gpu.shape[1]) // bs
+    want = (B, ns, H, D, len(model.layers), bs)
+    have = (arena.B, arena.ns, arena.H, arena.D, arena.L, arena.bs)
+    if have != want:
+        raise VerifyError("the arena is (B, NS, H, D, L, bs) %s, the state %s" % (have, want))
+    for l, lay in enumerate(rs.cache.layers):
+        if not arena.bound(lay.cache_engine, l):
+            raise VerifyError("layer %d: the engine's GPU rows are not the arena's views" % l)
+    full_max = ops.full_max if ops.full_max is not None else (R - 1 if ops.draft_last else R)
+    bound = (full_max - 1) * topk
+    X = int(arena.X)
+    cap = X - 1
+    if cap < bound and ops.neg != "fork_small_store":
+        raise VerifyError("the fork store lists %d blocks per (head, request), below the bound (%d - 1) x %d = %d: a "
+                          "selected block could be dropped (X >= %d)" % (cap, full_max, topk, bound, bound + 1))
+    i64, i32 = torch.int64, torch.int32
+    vs.arena, vs.X, vs.C, vs.cap, vs.bound, vs.ns = arena, X, 1, cap, bound, ns
+    vs.ext_k, vs.ext_v, vs.ext_bias = arena.store_k, arena.store_v, arena.store_bias
+    vs.lst_buf = torch.full((H, B, cap + 1), FORK_BIG, dtype=i64, device=dev)
+    vs.host_x = torch.full((H, B, X), -1, dtype=i64, device=dev)            # slot 0 stays -1 (the next block)
+    vs.minus1 = torch.tensor(-1, dtype=i64, device=dev)
+    vs.big = torch.tensor(FORK_BIG, dtype=i64, device=dev)
+    ar_b = torch.arange(B, dtype=i64, device=dev)
+    vs.slot_b = (ar_b * ns).view(1, B, 1)                                  # + the layer base: engine slot 0 of b
+    vs.store_b = (arena.store_base + ar_b * X).view(1, B, 1)               # store slot 0 of b
+    full = torch.ones((R, B), dtype=torch.bool, device=dev)
+    if ops.draft_last:
+        full[R - 1] = False
+    vs.full_default = full
+    if ops.check:                                                          # CHECK-ONLY: the selections of every layer
+        vs.chk_sel = torch.full((len(model.layers), H, B, R, topk), -1, dtype=i64, device=dev)
+    sizes = [min(FORK_ROWS, R - i) for i in range(0, R, FORK_ROWS)]        # R 4: one sequence per request; R 5: 4 + 1
+    nch = len(sizes)
+    NS = B * nch
+    cu = [0]
+    for _ in range(B):
+        for s in sizes:
+            cu.append(cu[-1] + s)
+    seq_of = [(e // R) * nch + (e % R) // FORK_ROWS for e in range(E)]
+    slot_of = [(e % R) % FORK_ROWS for e in range(E)]
+    vs.fork_sizes, vs.fork_nch, vs.fork_ns = sizes, nch, NS
+    vs.fork_cu = torch.tensor(cu, dtype=i32, device=dev)
+    vs.fork_seq = torch.zeros(NS, dtype=i32, device=dev)                   # seqused_k: the fork reads its length only
+    vs.fork_qmax = max(sizes)
+    vs.seq_req = torch.arange(NS, dtype=i64, device=dev) // nch            # the request of each fork sequence
+    vs.fork_slots = []                                                     # per tile-row slot j: (j, sequences, rows)
+    for j in range(FORK_ROWS):
+        rows_j = [e for e in range(E) if slot_of[e] == j]
+        if rows_j:
+            vs.fork_slots.append((j, torch.tensor([seq_of[e] for e in rows_j], dtype=i64, device=dev),
+                                  torch.tensor(rows_j, dtype=i64, device=dev)))
+    width = R * topk if ops.neg == "fork_union_rows" else topk            # the union plant lists the request's union
+    p_pad = 1
+    while p_pad < width:
+        p_pad *= 2
+    Wt = FORK_ROWS * p_pad                                                 # the kernel's scratch and rank range
+    vs.fork_tab = torch.zeros((H, NS, Wt), dtype=i32, device=dev)
+    vs.fork_ext = torch.zeros((H, NS, Wt), dtype=i32, device=dev)
+    vs.fork_len = torch.zeros((H, NS), dtype=i32, device=dev)
+    vs.pkey = torch.full((E, H, width), FORK_BIG, dtype=i32, device=dev)
+    vs.pslot = torch.zeros((E, H, width), dtype=i32, device=dev)
+    vs.npg = torch.zeros((E, H), dtype=i32, device=dev)
+    vs.plast = torch.zeros(E, dtype=i32, device=dev)
+    vs.pseq = torch.zeros(E, dtype=i32, device=dev)                        # storage entry 0: physical block = slot
+    vs.lists = dict(page_key=vs.pkey, page_table=vs.pslot, num_pages=vs.npg, last_len=vs.plast, seq_idx=vs.pseq,
+                    slots_per_entry=1)
+    vs.fout = torch.zeros((E, int(lay0.num_heads), D), dtype=lay0.wqkv.dtype, device=dev)
+    vs.stat.update({k: torch.zeros((), dtype=i64, device=dev) for k in FORK_STATS})
+    vs.meta.update(fills=1, cap=cap, bound=bound, X=X, full_max=full_max, joint_attn="fork", chunks=sizes,
+                   table_width=Wt, list_width=width, fork_launch=dict(FORK_LAUNCH), arena=arena.describe())
+    q0 = torch.zeros_like(vs.fout)                                         # the warm launch: empty lists (the compile)
+    _fork_call(vs, q0, vs.fout, vs.fork_cu, vs.fork_seq, vs.fork_tab, vs.fork_ext, vs.fork_len, vs.lists, vs.fork_qmax)
+
+
+def _fork_call(vs: VerifyState, qf, out, cu, seq, tab, ext, ln, lists, qmax) -> None:
+    """ONE launch of the fork (FORK_LAUNCH): q (rows, Hq, D) -> out (rows, Hq, D); the kernel builds the union tables
+    tab / ext / ln from the row lists (build_union); K, V and the bias are the arena's (block layout); the scale is the
+    shipped decode's 1 / sqrt(D): logit = (q.k + bias) x scale (fork :669)."""
+    a = vs.arena
+    vs.ops.fork(qf, a.k, a.v, out, cu, qmax, seq, vs.bs, vs.D ** -0.5, True, (-1, -1), tab, 0, None, None, None,
+                union_ext=ext, union_len=ln, cis_bias=a.bias, build_union=lists, rows_per_q_block=FORK_ROWS,
+                **FORK_LAUNCH)
+
+
+def _fork_locate(vs: VerifyState, eng, sel, full, res, m, l: int) -> dict:
+    """WS-C, step 3 (after the residency): where each selected block lives, as an arena block id: a window slot (the
+    tail block too), a pool slot (read IN PLACE), store slot 0 (the next block m + 1) or store slot 1 + j (the j-th
+    entry of the LIST: the distinct ids that a FULL row selects and only the host holds, in id order, at most cap). A
+    resident row's host-only blocks are not present (skipped). Sorted searches; no host read. Returns dict(present,
+    phys (H, B, R, T); phys -1 where not present; lst (H, B, cap) int64, FORK_BIG past its end)."""
+    rs = vs.rs
+    H, B, R, T = sel.shape
+    cap, topk = vs.cap, vs.topk
+    v = sel.reshape(H, B, R * T)
+    valid = v >= 0
+    ws, wi = torch.sort(eng._block_map, dim=-1)                            # (H, B, topk)
+    at_w = torch.searchsorted(ws, v).clamp(max=ws.shape[-1] - 1)
+    in_win = (ws.gather(-1, at_w) == v) & valid
+    wslot = wi.gather(-1, at_w)
+    if rs.pool:
+        ps, pi = torch.sort(eng._pool_map, dim=-1)                         # (H, B, P); an empty slot is -1
+        at_p = torch.searchsorted(ps, v).clamp(max=ps.shape[-1] - 1)
+        in_pool = (ps.gather(-1, at_p) == v) & valid & ~in_win
+        pslot = pi.gather(-1, at_p) + topk
+    else:
+        in_pool = torch.zeros_like(valid)
+        pslot = torch.zeros_like(v)
+    is_next = (v == (m + 1).view(1, B, 1)) & valid & ~in_win & ~in_pool
+    fullv = full.t().reshape(1, B, R, 1).expand(H, B, R, T).reshape(H, B, R * T)
+    host = valid & fullv & ~in_win & ~in_pool & ~is_next
+    s = torch.sort(torch.where(host, v, vs.big), dim=-1).values
+    first = torch.ones_like(s, dtype=torch.bool)
+    first[..., 1:] = s[..., 1:] != s[..., :-1]
+    first &= s < FORK_BIG
+    rank = first.to(torch.int64).cumsum(-1) - 1
+    keep = first & (rank < cap)
+    buf = vs.lst_buf
+    buf.fill_(FORK_BIG)
+    buf.scatter_(-1, torch.where(keep, rank, torch.full_like(rank, cap)), torch.where(keep, s, torch.full_like(s,
+                                                                                                         FORK_BIG)))
+    lst = buf[..., :cap]
+    at_l = torch.searchsorted(lst.contiguous(), v).clamp(max=cap - 1)
+    in_lst = (lst.gather(-1, at_l) == v) & valid & ~in_win & ~in_pool & ~is_next
+    present = in_win | in_pool | is_next | in_lst
+    eb = vs.arena.layer_base(l) + vs.slot_b                                # (1, B, 1)
+    phys = torch.where(in_win, eb + wslot, torch.where(in_pool, eb + pslot,
+                                                       torch.where(is_next, vs.store_b, vs.store_b + 1 + at_l)))
+    phys = torch.where(present, phys, vs.minus1)
+    if vs.ops.stats:                                                       # accounting (device counters)
+        st = vs.stat
+        rolev = (full | res).t().reshape(1, B, R, 1).expand(H, B, R, T).reshape(H, B, R * T)
+        n_host = keep.to(torch.int64).sum(-1)                              # (H, B): listed host blocks
+        n_all = first.to(torch.int64).sum(-1)                              # distinct host-only ids (also past cap)
+        sp = torch.sort(torch.where(in_pool & rolev, v, vs.big), dim=-1).values
+        fp = torch.ones_like(sp, dtype=torch.bool)
+        fp[..., 1:] = sp[..., 1:] != sp[..., :-1]
+        fp &= sp < FORK_BIG
+        n_pool = fp.to(torch.int64).sum(-1)                                # distinct pool blocks read in place
+        st["extras"] += n_all.sum() + n_pool.sum()
+        st["extras_host"] += n_host.sum()
+        st["extras_pool"] += n_pool.sum()
+        st["extras_max"] = torch.maximum(st["extras_max"], n_host.max())   # the most store slots one (head, request) used
+        st["unserved"] += (n_all - cap).clamp(min=0).sum()
+        st["fills_used"] += (n_host.sum() > 0).to(torch.int64)
+        st["pool_reads"] += (in_pool & rolev).sum()                        # (row, block) reads of a pool slot
+        st["store_reads"] += (in_lst & rolev).sum()                        # (row, block) reads of a listed store slot
+        su = torch.sort(torch.where(valid & rolev, v, vs.big), dim=-1).values
+        fu = torch.ones_like(su, dtype=torch.bool)
+        fu[..., 1:] = su[..., 1:] != su[..., :-1]
+        fu &= su < FORK_BIG
+        n_u = fu.to(torch.int64).sum(-1)
+        st["union_sum"] += n_u.sum()
+        st["union_max"] = torch.maximum(st["union_max"], n_u.max())
+        vs.stat_n["union"] += H * B
+    return dict(present=present.view(H, B, R, T), phys=phys.view(H, B, R, T), lst=lst, in_pool=in_pool.view(H, B, R, T),
+                in_lst=in_lst.view(H, B, R, T))
+
+
+def _fork_lists(vs: VerifyState, sel, loc: dict, eng, p_rows) -> None:
+    """WS-C, the fork's row lists (build_union): per (row, KV head) the PRESENT selected blocks in ascending block id
+    (the fork's precondition, fork :296-298) with their arena block ids; per row the tokens it sees in its LAST listed
+    page (its own block: the body's attention length past the tail base; F4 kept: 0 at the block's last position);
+    storage entry 0 with slots_per_entry 1, so the kernel's physical block (entry x 1 + slot) IS the arena block id."""
+    H, B, R, T = sel.shape
+    E = vs.E
+    present, phys = loc["present"], loc["phys"]
+    if vs.ops.neg == "fork_union_rows":                                    # NEGATIVE CONTROL: every row lists the union
+        k1, o1 = torch.sort(torch.where(present, sel, vs.big).reshape(H, B, 1, R * T), dim=-1)
+        p1 = phys.reshape(H, B, 1, R * T).gather(-1, o1)
+        dup = torch.zeros_like(k1, dtype=torch.bool)
+        dup[..., 1:] = k1[..., 1:] == k1[..., :-1]
+        ku, o2 = torch.sort(torch.where(dup, vs.big, k1), dim=-1)
+        pu = p1.gather(-1, o2)
+        # the request's union up to the row's own block (no causal leak: the plant tests union ATTENTION only); the
+        # kept ids are a prefix of the ascending union
+        cur = (p_rows // vs.bs).view(1, B, R, 1)
+        keep = ku.expand(H, B, R, R * T) <= cur
+        keys = torch.where(keep, ku.expand(H, B, R, R * T), vs.big)
+        slots = torch.where(keep, pu.expand(H, B, R, R * T), vs.minus1)
+        npg = keep.sum(-1)
+    else:
+        keys, order = torch.sort(torch.where(present, sel, vs.big), dim=-1)
+        slots = phys.gather(-1, order)
+        npg = present.sum(-1)
+    vs.pkey.copy_(keys.permute(1, 2, 0, 3).reshape(E, H, -1))
+    vs.pslot.copy_(slots.permute(1, 2, 0, 3).reshape(E, H, -1))
+    vs.npg.copy_(npg.permute(1, 2, 0).reshape(E, H))
+    vs.plast.copy_((vs.rs.body.cache_lens_value(eng, p_rows) - (vs.topk - 1) * vs.bs).reshape(E))
+
+
+def _fork_vb(vs: VerifyState, eng, sel, loc: dict, full, res, p_rows, m, l: int):
+    """CHECK-ONLY (WS-C): VB and VIS from the tables that the KERNEL wrote (fia6's VB: union residency must not become
+    union attention). Every union entry (head, sequence, u < len) is mapped back to (request, block id) through THIS
+    layer's maps (window, pool, the next block, the list). Per (head, row) the multiset of (block id, tokens > 0) that
+    the row's byte shows must equal the row's own: a FULL row every selected block, a RESIDENT row its present blocks;
+    64 tokens, its own block (p // 64) the body's length past the tail base (F4: 0 tokens, not shown); no entry of
+    another request. Returns (vis (H, E) blocks seen, bad (H, E) VB failures of rows with a role, want (H, E) blocks
+    the row must see, role (H, E), b0 (H, E): rows whose first seen block is not block 0, G_block0)."""
+    rs = vs.rs
+    H, B, R, T = sel.shape
+    E, X, ns, topk, bs = vs.E, vs.X, vs.ns, vs.topk, vs.bs
+    a = vs.arena
+    tab = vs.fork_tab.to(torch.int64)
+    ext = vs.fork_ext.to(torch.int64)
+    NS, Wt = tab.shape[1], tab.shape[2]
+    live = torch.arange(Wt, dtype=torch.int64, device=tab.device).view(1, 1, Wt) < vs.fork_len.to(torch.int64).unsqueeze(-1)
+    loc_e = tab - a.layer_base(l)
+    on_eng = (loc_e >= 0) & (loc_e < B * ns)
+    loc_s = tab - a.store_base
+    on_st = (loc_s >= 0) & (loc_s < B * X)
+    b_of = torch.where(on_eng, loc_e // ns, torch.where(on_st, loc_s // X, torch.full_like(tab, -1)))
+    maps = torch.cat((eng._block_map, eng._pool_map), dim=2) if rs.pool else eng._block_map   # (H, B, NS)
+    id_eng = maps.reshape(H, B * ns).gather(-1, loc_e.clamp(0, B * ns - 1).reshape(H, NS * Wt)).view(H, NS, Wt)
+    sid = torch.cat(((m + 1).view(1, B, 1).expand(H, B, 1),
+                     torch.where(loc["lst"] < FORK_BIG, loc["lst"], vs.minus1)), dim=2)    # (H, B, X)
+    id_st = sid.reshape(H, B * X).gather(-1, loc_s.clamp(0, B * X - 1).reshape(H, NS * Wt)).view(H, NS, Wt)
+    id_of = torch.where(on_eng, id_eng, torch.where(on_st, id_st, torch.full_like(tab, -2)))
+    kid = torch.full((H, E, Wt), FORK_BIG, dtype=torch.int64, device=tab.device)
+    ktok = torch.zeros((H, E, Wt), dtype=torch.int64, device=tab.device)
+    xreq = torch.zeros((H, E), dtype=torch.bool, device=tab.device)
+    for j, seqs, rows in vs.fork_slots:
+        byte = (ext[:, seqs] >> (8 * j)) & 0xFF                            # (H, n_j, Wt)
+        vis = live[:, seqs] & (byte > 0)
+        kid[:, rows] = torch.where(vis, id_of[:, seqs], vs.big)
+        ktok[:, rows] = torch.where(vis, byte, torch.zeros_like(byte))
+        xreq[:, rows] = (vis & (b_of[:, seqs] != vs.seq_req[seqs].view(1, -1, 1))).any(-1)
+    kid_s, ko = torch.sort(kid, dim=-1)
+    ktok_s = ktok.gather(-1, ko)
+    vis_cnt = (kid < FORK_BIG).sum(-1)
+    cur = (p_rows // bs).view(1, B, R, 1)
+    lastv = (rs.body.cache_lens_value(eng, p_rows) - (topk - 1) * bs).view(1, B, R, 1).to(torch.int64)
+    tok = torch.where(sel == cur, lastv, torch.full_like(sel, bs))
+    f4 = full.t().reshape(1, B, R, 1)
+    r4 = res.t().reshape(1, B, R, 1)
+    want_m = (sel >= 0) & (f4 | (r4 & loc["present"])) & (tok > 0)
+    eid = torch.full((H, E, Wt), FORK_BIG, dtype=torch.int64, device=tab.device)
+    etok = torch.zeros((H, E, Wt), dtype=torch.int64, device=tab.device)
+    eid[..., :T] = torch.where(want_m, sel, vs.big).reshape(H, E, T)
+    etok[..., :T] = torch.where(want_m, tok, torch.zeros_like(tok)).reshape(H, E, T)
+    eid_s, eo = torch.sort(eid, dim=-1)
+    etok_s = etok.gather(-1, eo)
+    role = (full | res).t().reshape(1, E).expand(H, E)
+    bad = (((kid_s != eid_s) | (ktok_s != etok_s)).any(-1) | xreq) & role
+    want = want_m.sum(-1).reshape(H, E)
+    b0 = role & (vis_cnt > 0) & (kid_s[..., 0] != 0)                      # G_block0: block 0 is the row's first entry
+    return vis_cnt, bad, want, role, b0
+
+
+def _fork_probe(vs: VerifyState, qf) -> None:
+    """CHECK-ONLY (WS-C), once (layer 0): "F" = sampled requests launched ALONE (their own rows, lists and a fresh
+    table) give their rows of the full launch bit for bit (the kernel reads each request's own lists: the role of
+    WS-B's VRF-IDX); "RA" = one row of each launched alone (its own list only) gives its row bit for bit (the row's
+    output does not depend on its siblings; fia6's RA). One host sync. NEGATIVE CONTROL fork_probe_swap: "F" reads
+    the lists of the next request (the probe must then report unequal)."""
+    B, R, H = vs.B, vs.R, vs.H
+    nch, Wt = vs.fork_nch, vs.fork_tab.shape[-1]
+    dev = vs.fout.device
+    i32 = torch.int32
+    picks = sorted({0, B // 2, B - 1})
+    eq_f, eq_r, rows = [], [], []
+
+    def sl(lists, a, n):
+        out = {k: (t[a:a + n].contiguous() if torch.is_tensor(t) else t) for k, t in lists.items()}
+        out["seq_idx"] = torch.zeros(n, dtype=i32, device=dev)
+        return out
+
+    def launch(q, lists, cu, n_seq, qmax):
+        o = torch.empty((q.shape[0],) + tuple(vs.fout.shape[1:]), dtype=vs.fout.dtype, device=dev)
+        tab = torch.zeros((H, n_seq, Wt), dtype=i32, device=dev)
+        _fork_call(vs, q, o, cu, torch.zeros(n_seq, dtype=i32, device=dev), tab, torch.zeros_like(tab),
+                   torch.zeros((H, n_seq), dtype=i32, device=dev), lists, qmax)
+        return o
+    for b in picks:
+        e0 = b * R
+        src = ((b + 1) % B if vs.ops.neg == "fork_probe_swap" else b) * R
+        o = launch(qf[e0:e0 + R].contiguous(), sl(vs.lists, src, R), vs.fork_cu[:nch + 1].contiguous(), nch,
+                   vs.fork_qmax)
+        eq_f.append(bool(torch.equal(o, vs.fout[e0:e0 + R])))
+        e = e0 + b % R
+        o1 = launch(qf[e:e + 1].contiguous(), sl(vs.lists, e, 1), torch.tensor([0, 1], dtype=i32, device=dev), 1, 1)
+        eq_r.append(bool(torch.equal(o1, vs.fout[e:e + 1])))
+        rows.append(e)
+    vs.fa_check["F"] = dict(entries=picks, equal=eq_f)
+    vs.fa_check["RA"] = dict(entries=rows, equal=eq_r)
+
+
+def _fork_rows(vs: VerifyState, l: int, layer, eng, twin, q, k4, v4, sel, pos_before):
+    """Mode "union" with joint_attn "fork", one layer (module docstring, WS-C). Steps 1, 2 and 6 are _union_rows'
+    (the same lines). The phase marks (probe passes): "union" (the locations and the list), "fetch" (the ONE store
+    fill), "attn" (the row lists and the ONE fork call), "check" (CHECK-ONLY and the rung-L5 seams), "end"."""
+    rs, ops = vs.rs, vs.ops
+    kern = rs.ops.kernels
+    B, R, E, H, bs, topk = vs.B, vs.R, vs.E, vs.H, vs.bs, vs.topk
+    Hq = q.shape[1]
+    tail0 = (topk - 1) * bs
+    p0 = pos_before[0]
+    if vs.hooks is not None:                                                  # the rollback's FAST journal
+        vs.hooks.fast_begin(l, eng, R)
+    full, res = _row_masks(vs)
+    p_rows = p0.view(B, 1) + vs.offs.view(1, R)                              # (B, R)
+    m = p0 // bs                                                              # the tail block at the start
+    in_tail = (p_rows // bs) == m.view(B, 1)
+    row_in = p_rows % bs
+    bi = vs.bidx
+    kd, vd, bd = eng._k_gpu.dtype, eng._v_gpu.dtype, eng._kv_bias_gpu.dtype
+    k4c, v4c = k4.to(kd), v4.to(vd)
+    cis_rows = twin.total_cis[bi, p_rows].to(bd)                              # (B, R, H): written by the twin
+    # 1. the tentative rows (as _union_rows): the tail block's into the tail slot, the next block's into store slot 0
+    r63 = tail0 + row_in
+    it4, it3 = in_tail.view(B, R, 1, 1), in_tail.view(B, R, 1)
+    eng._k_gpu[bi, r63] = torch.where(it4, k4c, eng._k_gpu[bi, r63])
+    eng._v_gpu[bi, r63] = torch.where(it4, v4c, eng._v_gpu[bi, r63])
+    eng._kv_bias_gpu[bi, r63] = torch.where(it3, cis_rows, eng._kv_bias_gpu[bi, r63])
+    vs.ext_k[bi, row_in] = torch.where(it4, vs.ext_k[bi, row_in], k4c.to(vs.ext_k.dtype))
+    vs.ext_v[bi, row_in] = torch.where(it4, vs.ext_v[bi, row_in], v4c.to(vs.ext_v.dtype))
+    vs.ext_bias[bi, row_in] = torch.where(it3, vs.ext_bias[bi, row_in], cis_rows.to(vs.ext_bias.dtype))
+    # 2. THE RESIDENCY (as _union_rows): row 0's selection, the shipped diff, victim pool, map commit, gathers
+    diff = RE._diff_pool(rs, eng) if rs.pool else kern["diff"]
+    diff(eng._block_map, sel[:, :, 0].contiguous(), eng._new_block_map_buf, eng._load_mask)
+    eng._block_map.copy_(eng._new_block_map_buf)
+    kern["gather_k"](eng._k_gpu, eng._k_cpu, eng._load_mask, bs)
+    kern["gather_v_bias"](eng._v_gpu, eng._v_cpu, eng._kv_bias_gpu, twin.total_cis, eng._load_mask, bs)
+    vs.calls["resid"] += 1
+    vs.calls["gather_host"] += 2
+    if ops.stats:                       # accounting: row roles; the window's READY part and its RESIDUAL host loads
+        vs.stat["rows_full"] += full.sum()
+        vs.stat["rows_res"] += res.sum()
+        vs.stat["win_sel"] += (sel[:, :, 0] >= 0).sum()
+        vs.stat["win_host"] += (eng._load_mask >= 0).sum()                   # after pool_update: the host misses
+        roles = (full | res).t()                                              # (B, R)
+        vs.stat["past_edge"] += ((~in_tail) & roles).sum()                    # rows past the block edge
+        vs.stat["f4_rows"] += (in_tail & (row_in == bs - 1) & roles).sum()   # F4: own block, 0 tokens
+    _mark(vs, l, "union")
+    # 3. where each selected block lives: the window, a pool slot (in place), the next block, the host list
+    loc = _fork_locate(vs, eng, sel, full, res, m, l)
+    _mark(vs, l, "fetch")
+    # 4. ONE store fill: the listed HOST blocks, the shipped gathers (the urgent GPU gather from the host rows)
+    vs.host_x[..., 1:].copy_(torch.where(loc["lst"] < FORK_BIG, loc["lst"], vs.minus1))
+    kern["gather_k"](vs.ext_k, eng._k_cpu, vs.host_x, bs)
+    kern["gather_v_bias"](vs.ext_v, eng._v_cpu, vs.ext_bias, twin.total_cis, vs.host_x, bs)
+    vs.calls["gather_host"] += 2
+    vs.calls["fills"] += 1
+    _mark(vs, l, "attn")
+    # 5. the row lists and ONE fork call for every row of every request (each row masked to its own list)
+    _fork_lists(vs, sel, loc, eng, p_rows)
+    qf = q.reshape(E, Hq, q.shape[-1]).contiguous()
+    _fork_call(vs, qf, vs.fout, vs.fork_cu, vs.fork_seq, vs.fork_tab, vs.fork_ext, vs.fork_len, vs.lists, vs.fork_qmax)
+    vs.calls["attn"] += 1
+    attn = vs.fout.reshape(B, R, -1)
+    if ops.record:
+        vs.log.append(dict(kind="fork", layer=l, sel=sel.clone(), win=eng._block_map.clone(), lst=loc["lst"].clone(),
+                           present=loc["present"].clone(), phys=loc["phys"].clone(), m=m.clone(),
+                           in_tail=in_tail.clone(), p_rows=p_rows.clone(), full=full.clone(), res=res.clone(),
+                           pool_map=(eng._pool_map.clone() if rs.pool else None), k_gpu=eng._k_gpu.clone(),
+                           v_gpu=eng._v_gpu.clone(), bias_gpu=eng._kv_bias_gpu.clone(), k_cpu=eng._k_cpu.clone(),
+                           v_cpu=eng._v_cpu.clone(), total_cis=twin.total_cis.clone(),
+                           fills=[dict(c=0, ext_k=vs.ext_k.clone(), ext_v=vs.ext_v.clone(),
+                                       ext_bias=vs.ext_bias.clone())],
+                           q_e=qf.clone().unsqueeze(1), out=vs.fout.float().clone(), tab=vs.fork_tab.clone(),
+                           ext=vs.fork_ext.clone(), ulen=vs.fork_len.clone(), pkey=vs.pkey.clone(),
+                           pslot=vs.pslot.clone(), npg=vs.npg.clone(), plast=vs.plast.clone(),
+                           base=vs.arena.layer_base(l), store_base=vs.arena.store_base))
+    _mark(vs, l, "check")
+    # CHECK-ONLY (ops.check) and the rung-L5 seams (vs.miss_ids, vs.pin): the presence of each selected block
+    if ops.check or vs.miss_ids is not None or vs.pin is not None:
+        found = loc["present"]
+        miss = ~found & (sel >= 0)
+        if ops.check:
+            vs.chk_sel[l].copy_(sel)
+            f4 = full.t().reshape(1, B, R, 1)
+            r4 = res.t().reshape(1, B, R, 1)
+            d = miss & f4
+            s_ = miss & r4
+            vs.stat["dropped"] += d.sum()
+            vs.stat["skipped"] += s_.sum()
+            vs.stat_row["dropped"] += d.sum((0, 1, 3))
+            vs.stat_row["skipped"] += s_.sum((0, 1, 3))
+            # UNION RESIDENCY MUST NOT BECOME UNION ATTENTION: read from the tables the kernel wrote
+            vis_cnt, bad, want, role, b0 = _fork_vb(vs, eng, sel, loc, full, res, p_rows, m, l)
+            vbad = role & (vis_cnt != want)
+            vs.stat["vis_bad"] += vbad.sum()
+            vs.stat["vb_bad"] += bad.sum()
+            vs.stat["vb_rows"] += role.sum()
+            vs.stat["block0_bad"] += b0.sum()
+            vs.stat["visible_blocks"] += torch.where(role, vis_cnt, torch.zeros_like(vis_cnt)).sum()
+            vs.stat["fork_loaded"] += vs.fork_len.to(torch.int64).sum()      # union entries the kernel loads
+            vs.stat_row["vis_bad"] += vbad.view(H, B, R).sum((0, 1))
+            vs.stat_row["visible"] += torch.where(role, vis_cnt, torch.zeros_like(vis_cnt)).view(H, B, R).sum((0, 1))
+            vs.stat_row["selected"] += (sel >= 0).sum(-1).sum((0, 1))
+        if vs.miss_rows is not None and vs.miss_ids is not None:              # one miss row per request (the draft row)
+            mr = vs.miss_rows.t().reshape(1, B, R, 1)
+            vs.miss_ids[l].copy_(torch.where(miss & mr, sel, vs.minus1).amax(2))
+        if vs.miss_rows is not None and vs.pin is not None:
+            for r in range(R):
+                vs.pin.record(l, sel[:, :, r], vs.miss_rows[r].view(1, B, 1))
+    if vs.fa_check is not None and l == 0 and "F" not in vs.fa_check:
+        _fork_probe(vs, qf)
+    _mark(vs, l, "end")
+    # 6. the end state (as _union_rows): write-back of a filled block, the next block's rows into the tail slot
+    p_last = p0 + (R - 1)
+    vs.full.copy_((p0 % bs) + (R - 1) >= bs - 1)
+    vs.wpos.copy_(m * bs + (bs - 1))
+    rs.body.writeback_kernel(eng._k_gpu, eng._v_gpu, eng._k_cpu, eng._v_cpu, vs.full, vs.wpos, tail0, bs)
+    eng._k_gpu[bi, r63] = torch.where(it4, eng._k_gpu[bi, r63], k4c)
+    eng._v_gpu[bi, r63] = torch.where(it4, eng._v_gpu[bi, r63], v4c)
+    eng._kv_bias_gpu[bi, r63] = torch.where(it3, eng._kv_bias_gpu[bi, r63], cis_rows)
+    eng._block_map[..., topk - 1] = ((p_last + 1) // bs).view(1, B).expand(H, B)
+    eng._cache_lens.copy_(rs.body.cache_lens_value(eng, p_last).to(torch.int32))
+    if vs.hooks is not None:
+        vs.hooks.fast_end(l, eng, p0, vs.full, R)
+    return attn
+
+
 # ------------------------------------------------------------------ the layer and the pass
 def _layer(vs: VerifyState, l: int, layer, hidden, pos_flat, cos_sin_cache):
     rs, ops = vs.rs, vs.ops
@@ -983,7 +1465,8 @@ def _layer(vs: VerifyState, l: int, layer, hidden, pos_flat, cos_sin_cache):
         attn = _exact_rows(vs, l, layer, eng, twin, q, k4, v4, sel, pos_before)
     elif ops.mode == "union":
         _mark(vs, l, "resid")
-        attn = _union_rows(vs, l, layer, eng, twin, q, k4, v4, sel, pos_before)
+        rows = _fork_rows if ops.joint_attn == "fork" else _union_rows   # WS-C: one fork call (default: WS-B's)
+        attn = rows(vs, l, layer, eng, twin, q, k4, v4, sel, pos_before)
     else:
         _mark(vs, l, "resid")
         attn = _fast_rows(vs, l, layer, eng, twin, q, k4, v4, sel, pos_before)
@@ -1036,6 +1519,8 @@ def read_stats(vs: VerifyState) -> dict:
     if vs.ops.mode == "union":                     # WS-B: per-row counts (CHECK-ONLY), the fills
         d.update({"row_" + k: [int(x) for x in v.cpu()] for k, v in vs.stat_row.items()})
         d.update(fills=vs.C, cap=vs.cap, check=vs.ops.check)
+    if vs.ops.joint_attn == "fork":                # WS-C: the store size, the bound, the fork's sequences
+        d.update(joint_attn="fork", store_slots=vs.X, bound=vs.bound, chunks=list(vs.fork_sizes))
     d.update(calls=dict(vs.calls), passes=vs.passes)            # host invocation counts (every mode)
     return d
 
