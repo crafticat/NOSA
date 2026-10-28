@@ -175,11 +175,14 @@ class ContractCapture(CK.FastCapture):
                 cols = col[rows, r]
                 self.sel_store[rows, cols] = sel[:, :, rows, r].permute(2, 0, 1, 3)
                 self.has_sel[rows, cols] = True
-                if p["lg"] is not None:
-                    lgc = p["lg"].cpu()
-                    for i, b in enumerate(self.sample):
-                        if bool(mask[b]):
-                            self.lg_store[(b, int(col[b, r]))] = lgc[i, r].clone()
+                lgc = p["lg"].cpu() if p["lg"] is not None else None
+                for i, b in enumerate(self.sample):
+                    if bool(mask[b]):                     # the LAST row of the column decides: a later row without
+                        key = (b, int(col[b, r]))         # captured logits (a journal D-slot step) drops an earlier
+                        if lgc is None:                   # row's logits (a J-slot resident row of a target request)
+                            self.lg_store.pop(key, None)
+                        else:
+                            self.lg_store[key] = lgc[i, r].clone()
         self.round_rows = []
         S = self.S0
         if self.tentative:                                # the committed position (the twins stand at the frontier)

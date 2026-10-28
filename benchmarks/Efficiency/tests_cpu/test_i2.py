@@ -182,8 +182,8 @@ def test_i2_gate0_files():
     src = {p.name: p.read_text() for p in (ROOT / "nosi/nosi").glob("*.py")}           # (g) the name scans
     for name in ("spec_round", "ragged_rollback", "state_snapshot", "spec_prefetch"):
         assert name not in src["spec_tentative_union.py"], name
-    assert sorted(n for n, t in src.items() if "spec_tentative_union" in t) == ["spec_tentative.py",
-                                                                                "spec_tentative_union.py"]
+    assert sorted(n for n, t in src.items() if "spec_tentative_union" in t and n != "spec_tentative_union.py") == [
+        "spec_tentative.py"]                                           # only the seams' docstring names it
     for c in ("r2_spec_cell.py", "r2_spec5_cell.py", "r2_base_cell.py", "r2_verify_cell.py", "r2_wsa_cell.py",
               "r2_wsb_cell.py"):
         assert "spec_tentative_union" not in (EFF / c).read_text(), c
@@ -653,9 +653,10 @@ def test_step_script_i2():
                                                                                  steps, X, passes, check, stress, slot,
                                                                                  smin, mem, HOLDER))
         assert line in r.stdout, (cell, r.stdout[-600:])
+        assert "--arms %s " % arms.replace(",", "\\,") in r.stdout, (cell, "printf %q escapes the commas")
         for want in ("NOSI_POOL_BLOCKS=%d" % pool, "--pool %d" % pool, "--batch %d" % batch, "--steps %d" % steps,
                      "--chk-slot-every %d" % slot, "--chk-plant-extra 4",
-                     "--arms %s" % arms, "--joint-residency union", "--joint-extra %d" % X, "--tu-gemm natural",
+                     "--joint-residency union", "--joint-extra %d" % X, "--tu-gemm natural",
                      "--check-passes %d" % passes, "--check-every %d" % check, "--require-stress %d" % stress,
                      "--spec-twin fused --spec-body fused", STEP_ROOT + "/benchmarks/Efficiency/r2_i2_cell.py",
                      "--mem=%s" % mem, "--time=%d" % smin, "i2_t1_%s_%s" % (HOLDER, cell)):
