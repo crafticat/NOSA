@@ -80,9 +80,11 @@ case $CELL in
     i2m)  POOL=10 BATCH=8 STEPS=64 ARMS=L4PT,L4PTU,SHR,TUC X=4 PASSES=15 STRESS=1 CHECK=1 STEP_MIN=45 MEM=100G ;;
     i2a)  POOL=65 BATCH=216 STEPS=512 ARMS=L4PT,L4PTU NEEDPRED=1 STEP_MIN=70 MEM=240G ;;
     i2b)  POOL=10 BATCH=318 STEPS=512 ARMS=L4PT,L4PTU NEEDPRED=1 STEP_MIN=95 MEM=340G ;;
+    i2ax) POOL=65 BATCH=216 STEPS=512 ARMS=L4PT,L4PTU X=193 NEEDPRED=2 STEP_MIN=70 MEM=240G ;;
+    i2bx) POOL=10 BATCH=318 STEPS=512 ARMS=L4PT,L4PTU X=193 NEEDPRED=2 STEP_MIN=95 MEM=340G ;;
     i2ca) POOL=65 BATCH=216 STEPS=129 ARMS=SHR,TUC STEP_MIN=70 MEM=240G ;;
     i2cb) POOL=10 BATCH=318 STEPS=129 ARMS=SHR,TUC STEP_MIN=95 MEM=340G ;;
-    *) stop "cell '$CELL' (i2m, i2a, i2b, i2ca, i2cb or i2g)" ;;
+    *) stop "cell '$CELL' (i2m, i2a, i2b, i2ax, i2bx, i2ca, i2cb or i2g)" ;;
 esac
 DESC="arms SH+$ARMS steps $STEPS K $K X $X passes $PASSES check $CHECK stress $STRESS slot $SLOT"
 SPK=(--spec "$K" --arms "$ARMS" --joint-residency union --joint-extra "$X" --tu-gemm natural --check-passes "$PASSES"
@@ -110,6 +112,9 @@ for f in "$CELLPY" benchmarks/Efficiency/r2_wsa_cell.py benchmarks/Efficiency/r2
 done
 if [ "$NEEDPRED" = 1 ] && git -C "$NOSI" show "$NSHA:$CELLPY" | grep -q '^PRED_STAMP_I2 = None$'; then
     stop "r2_i2_cell.PRED_STAMP_I2 is None at $NSHA: register PRED_I2_BY_B and its stamp (date -u) before $CELL"
+fi
+if [ "$NEEDPRED" = 2 ] && ! git -C "$NOSI" show "$NSHA:$CELLPY" | grep -q '^PRED_STAMP_I2X = "20'; then
+    stop "r2_i2_cell.PRED_STAMP_I2X is not registered at $NSHA: register PRED_I2X_BY_B and its stamp (date -u) before $CELL"
 fi
 [ -f "$SIF" ] || stop "no image $SIF"
 [ "$(stat -c %s "$MODEL/model.safetensors" 2>/dev/null)" = "$MODEL_SIZE" ] || stop "model size is not $MODEL_SIZE"

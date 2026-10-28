@@ -113,6 +113,20 @@ PRED_I2_BY_B = {
     318: dict(I2_ratio=(0.46, 0.68), I2_vs_I1=(0.97, 1.40), I2_joint_sh=(2.5, 4.1), I2_joint_saving=(0.0, 190.0),
               I2_rollback_sh=(0.03, 0.30), I1_ratio=(0.45, 0.51), I2_agree=0.25, I2_plan=0.63, I2_above_I1=True),
 }
+# The lead's REGISTRATION of the STORE-SIZE VARIANT (2026-10-28T19:33:15Z, `date -u`, before cells i2ax / i2bx ran): X 193
+# store slots per request, so C = ceil((R - 1) 64 / (X - 1)) = 1 and no spill fill runs. Basis (SCORING_i2.md section 3,
+# MEASURED in i2a / i2b): the 4 empty spill fills per layer cost 65.22 ms (C 128) / 85.80 ms (C 73) per joint pass and
+# served 0 blocks; L4PTU joint 322.829 / 525.985 ms, L4PT joint 314.959 / 520.241 ms; L4PT round 471.7 / 722.5 ms; yield
+# loss of the union pass 3.1 % / 1.5 % per round. MODEL: joint 322.8 - 65.2 = about 258 ms (band 240-300) and 526.0 -
+# 85.8 = about 440 ms (band 420-500); round about 416 / 645 ms; I2X / I1 about 1.10 at both C. Memory: the X 193 store adds
+# about 2.7 GB (B 216) / 4.0 GB (B 318) to L4PT's 80.7 / 74.2 GB arm peak (inside 84).
+PRED_STAMP_I2X = "2026-10-28T19:33:15Z"
+PRED_I2X_BY_B = {
+    216: dict(I2_ratio=(0.38, 0.47), I2_vs_I1=(0.98, 1.18), I2_joint_sh=(3.7, 4.7), I2_joint_saving=(15.0, 75.0),
+              I2_rollback_sh=(0.03, 0.30), I1_ratio=(0.37, 0.42), I2_agree=0.25, I2_plan=0.52, I2_above_I1=True),
+    318: dict(I2_ratio=(0.47, 0.57), I2_vs_I1=(0.98, 1.17), I2_joint_sh=(3.3, 4.1), I2_joint_saving=(20.0, 100.0),
+              I2_rollback_sh=(0.03, 0.30), I1_ratio=(0.45, 0.51), I2_agree=0.25, I2_plan=0.63, I2_above_I1=True),
+}
 
 
 def log(msg):
@@ -303,11 +317,11 @@ def check_gates_u(arm, res, require_stress: bool = False, L: int = 32):
     return g
 
 
-def verdicts(sh, sp, B: int):
+def verdicts(sh, sp, B: int, X: int = 48):
     """PRED_I2 (PRED_I2_BY_B[B] key by key) against the timing arms: [(name, verdict, detail)]; None registered gives
-    REPORT; NOT_RUN without the arm."""
+    REPORT; NOT_RUN without the arm. X != 48 (the store-size variant cells i2ax / i2bx) uses PRED_I2X_BY_B instead."""
     P = dict(PRED_I2)
-    P.update(PRED_I2_BY_B.get(B) or {})
+    P.update((PRED_I2_BY_B if X == 48 else PRED_I2X_BY_B).get(B) or {})
     out = []
 
     def band(name, v, b):
@@ -755,7 +769,7 @@ def main(argv=None) -> int:
                 gates.append(("%s-RUN" % arm, True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
             mem["after_%s" % arm] = BC.host_mem()
             BC.free()
-    preds = verdicts(sh, sp, a.batch)
+    preds = verdicts(sh, sp, a.batch, a.joint_extra)
     meta = dict(batch=a.batch, steps=a.steps, S0=BC.S0, doc_rows=rows, n_unique_docs=min(a.batch, BC.N_DOCS),
                 workload_sha256=sha, attn_splits=NL._ATTN_SPLITS, pool_blocks=CEN.POOL_BLOCKS,
                 capacity_C=BC.C_BASE + a.pool, spec_k=a.spec, arms=a.arms, joint_residency=a.joint_residency,
