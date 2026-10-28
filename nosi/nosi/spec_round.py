@@ -87,6 +87,12 @@ request is one draft step old; rung L5 fetches it during the next drafts).
   The deferred row makes them again in the same pass: one more resident-only row per request (GEMM rows and a draft
   residency; no host fetch).
 
+RUNG L5 (tree nosi-r2-spec5, docs/NOTES_spec5.md; SpecOps(prefetch=spec_prefetch.SpecPrefetch(...)), L3 and L4P).
+The draft misses go to the C++ packer in the background; one commit per epoch puts them into soft-pinned pool slots
+OUTSIDE every rollback group (on_verify), so the verify finds them as pool hits and the undo never needs to know them;
+on_release ends the pins after the round's commit. The seams below are called only when SpecOps.prefetch is set; with
+prefetch None every round is the code of nosi-r2-specp a6c9d10.
+
 REQUESTED-KV PIN (paper 3.3; SpecOps(pin=True), L4P only, OFF by default and in the cells). The draft calls record their
 selection (the blocks that the draft requested: hits and misses; in the joint pass the draft row's). Before the joint
 pass (outside a group) every pool slot that holds a requested block gets the SOFT PIN of Task 1.2 (pool_prefetch.py:
@@ -507,8 +513,10 @@ class SpecOps:
       redirect   True: a draft loads a block that a step of its group filled from the GPU staging (module docstring)
       draft_filter  tests only: f(runner, kind, j, tokens) -> tokens, applied to every draft token as it is made
                  ("draft": draft step j; "draft_row": the joint pass's draft row); the proof holds for any drafts
-      prefetch   rung L5 (not wired to a transport here): an object with on_draft(miss_ids) and on_round(phase), told
-                 the draft misses after each draft step; None in the L3 / L4 cells
+      prefetch   rung L5: an object with on_draft(miss_ids) and on_round(phase), told the draft misses after each
+                 draft step (the wiring tests' Recorder), or spec_prefetch.SpecPrefetch (L3, L4P; it also has bind /
+                 unbind, on_verify: before the verify, outside a group, and on_release: after the round's commit,
+                 outside a group); None: the code of the tree nosi-r2-specp a6c9d10
       rb_neg     a negative control of the rollback (ragged_rollback.NEG_KINDS), tests only
       stream     the rollback's executor (None: ragged_rollback.ImmediateStream)
       neg        a negative control of this module (NEG_KINDS), tests only
@@ -596,6 +604,8 @@ class SpecRunner:
             self.vs.hooks = self.rb
         self.pin = RequestPin(rs, neg=ops.neg) if ops.pin else None
         self.draft.pin = self.pin
+        if ops.prefetch is not None and hasattr(ops.prefetch, "bind"):   # rung L5 (spec_prefetch.SpecPrefetch): its
+            ops.prefetch.bind(self)                                      # hook wraps decode_fixed outside the draft's
         i64 = torch.int64
         self.t = torch.zeros(B, dtype=i64, device=dev) if t0 is None else t0.to(device=dev, dtype=i64).view(B).clone()
         # the drafts of the next verify (-1: none); L4P: the tentative drafts e_1 .. e_u (at most K + 1)
@@ -645,6 +655,8 @@ class SpecRunner:
     def detach(self) -> None:
         if self.rb.tentative:
             raise SpecError("detach inside a round")
+        if self.ops.prefetch is not None and hasattr(self.ops.prefetch, "unbind"):   # rung L5: the outermost hook
+            self.ops.prefetch.unbind()
         if self.vs is not None:
             self.vs.hooks = None
         self.draft.detach()
@@ -753,6 +765,8 @@ class SpecRunner:
         self._event(ev)
         self._prelude()                                                  # 1. K drafts, undone
         self._event(ev)
+        if self.ops.prefetch is not None and hasattr(self.ops.prefetch, "on_verify"):
+            self.ops.prefetch.on_verify()                                # rung L5: the drafts' fetches, outside a group
         D = self.D
         X = torch.cat((self.t.view(B, 1), D[:, :K - 1]), dim=1)
         self.rb.begin()                                                  # 2. K verify steps (the shipped step)
@@ -862,6 +876,8 @@ class SpecRunner:
         rec = self.ops.record
         ev = []
         self._event(ev)
+        if self.ops.prefetch is not None and hasattr(self.ops.prefetch, "on_verify"):
+            self.ops.prefetch.on_verify()                                # rung L5: the drafts' fetches, outside a group
         D, u = self.D, self.u
         defer = 0 if neg == "verify_newest" else 1                       # NEGATIVE CONTROL verify_newest: no deferral
         v = (u - defer).clamp(min=0)                                     # verify rows: every tentative draft but newest
@@ -1015,6 +1031,9 @@ class SpecRunner:
                 self._round_l4(probe)
             else:
                 self._round_l4p(probe)
+            if self.ops.prefetch is not None and hasattr(self.ops.prefetch, "on_release"):
+                self._sync_release()                                     # rung L5: outside the group, before the
+                self.ops.prefetch.on_release()                           # requested-KV pin's release
             if self.pin is not None:
                 self._sync_release()
                 self.pin.release()

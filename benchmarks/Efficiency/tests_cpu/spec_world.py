@@ -114,14 +114,20 @@ def shipped_greedy(model, cache, B: int, S: int, N: int, tok0):
 
 def spec_runner(model, cache, S: int, horizon: int, tok0, level="L3", K=K0, mode="exact", gemm="rowgroup",
                 draft_filter=None, neg=None, rb_neg=None, record=True, prefetch=None, after_round=None,
-                journal=RW.CAP, body="torch", redirect=True, pin=False):
+                journal=RW.CAP, body="torch", redirect=True, pin=False, make_prefetch=None, sr=None):
+    """make_prefetch(rs) (rung L5, tests_cpu/test_spec_prefetch.py): builds the prefetch on the attached state (it
+    replaces `prefetch`); sr: the round-runner module (default spec_round; the Gate 0 of rung L5 passes the a6c9d10
+    source)."""
+    SRm = SR if sr is None else sr
     ops = RE.RaggedOps(W.KERNELS, twin="torch", body=body, graph=True)
     rs = RE.attach(model, cache, S, horizon, ops)
     RW.define_undefined(rs)
-    sops = SR.SpecOps(level=level, K=K, mode=mode, gemm=gemm, extra=16, attn=VW.fake_attention_idx, journal=journal,
-                      redirect=redirect, draft_filter=draft_filter, prefetch=prefetch, rb_neg=rb_neg, neg=neg,
-                      record=record, probe_every=0, after_round=after_round, pin=pin)
-    return SR.SpecRunner(model, rs, sops, BC.HostClock(), t0=tok0)
+    if make_prefetch is not None:
+        prefetch = make_prefetch(rs)
+    sops = SRm.SpecOps(level=level, K=K, mode=mode, gemm=gemm, extra=16, attn=VW.fake_attention_idx, journal=journal,
+                       redirect=redirect, draft_filter=draft_filter, prefetch=prefetch, rb_neg=rb_neg, neg=neg,
+                       record=record, probe_every=0, after_round=after_round, pin=pin)
+    return SRm.SpecRunner(model, rs, sops, BC.HostClock(), t0=tok0)
 
 
 def pinned_slots(rs) -> int:
@@ -327,13 +333,13 @@ def watch_reuse(runner, box: dict) -> None:
 
 def run_vs_shipped(B: int, level="L3", mode="exact", gemm="rowgroup", K=K0, S=S0, N=N0, seed=0, draft_filter=None,
                    neg=None, rb_neg=None, check_rounds=True, max_rounds=0, body="torch", redirect=True,
-                   oracle_rounds=(-1, 0), journal=RW.CAP, on_runner=None, pin=False):
+                   oracle_rounds=(-1, 0), journal=RW.CAP, on_runner=None, pin=False, make_prefetch=None, sr=None):
     """THE SHIPPED GREEDY DECODE against the SPECULATIVE RUN on a second cache from the same prefill. After every round
     (check_rounds): residency_errors and host_rows_errors (collected, not raised). oracle_rounds: in these rounds the
     drafts are the shipped tokens (inject; the L4 prelude is round -1), then draft_filter acts: the first rounds are
     full accepts by construction (precondition of the full-accept path), later rounds use the natural drafts. journal:
     the rollback's saved slots per layer and step (N). on_runner(runner): called once before the run (test hooks).
-    pin: the L4P requested-KV pin (SpecOps(pin=...)).
+    pin: the L4P requested-KV pin (SpecOps(pin=...)). make_prefetch, sr: spec_runner's (rung L5).
     Returns the evidence: per request the first unequal committed token / logits row, the round records, the facts
     (preconditions) and the runner."""
     W.STATS.clear()
@@ -366,7 +372,7 @@ def run_vs_shipped(B: int, level="L3", mode="exact", gemm="rowgroup", K=K0, S=S0
     W.TAG[0] = "spec"
     runner = spec_runner(model, Bc, S, hz, tok0, level=level, K=K, mode=mode, gemm=gemm, draft_filter=draft_filter,
                          neg=neg, rb_neg=rb_neg, after_round=after_round, body=body, redirect=redirect, journal=journal,
-                         pin=pin)
+                         pin=pin, make_prefetch=make_prefetch, sr=sr)
     if on_runner is not None:
         on_runner(runner)
     runner.run(N, max_rounds=max_rounds)
