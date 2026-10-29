@@ -82,14 +82,33 @@ USABLE_GB = A4.USABLE_GB
 #   P_peak_gb            [GB] the arm's peak allocated GB, the prefill included (the MEM gate's value)
 #   I4A_ratio            [x SH] L4PTFD / SH in this job (rung I4A, re-measured)
 # The builder's MODEL (in the hand-over report, with the arithmetic) is an input for the lead, not a registration.
-PRED_STAMP_I4D = None
+PRED_STAMP_I4D = "2026-10-29T09:41:32Z"
 _ARM_KEYS = ("ratio", "vs_I4A", "joint_saving", "wait_saving", "new_saving", "agree", "eq_I4A", "above_I4A", "peak_gb")
 PRED_KEYS = (("I4D_repeat_share", "I4D_listed_pass", "I4D_win_prev_share", "I4D_win_prev_pass", "I4A_ratio",
               "I4D_hit_share", "I4DW_win_hits_pass") + tuple("I4D_" + k for k in _ARM_KEYS)
              + tuple("I4DW_" + k for k in _ARM_KEYS))
+# The lead's registration (before any I4D cell ran): the builder's MODEL bands (hand-over report section 4); P_ratio =
+# the I4A_ratio band x the P_vs_I4A band; I4D_above_I4A at B 216 is None (REPORT): the model's mid is about 1.000, so a
+# flag would be a coin flip.
 PRED_I4D_BY_B = {
-    216: {k: None for k in PRED_KEYS},
-    318: {k: None for k in PRED_KEYS},
+    216: dict(I4D_repeat_share=(0.05, 0.40), I4D_listed_pass=(3000, 12000), I4D_win_prev_share=(0.2, 0.7),
+              I4D_win_prev_pass=(2000, 6400), I4A_ratio=(0.51, 0.55), I4D_hit_share=(0.2, 0.6),
+              I4DW_win_hits_pass=(2000, 7000),
+              I4D_ratio=(0.507, 0.553), I4D_vs_I4A=(0.995, 1.006), I4D_joint_saving=(-2.0, 2.0),
+              I4D_wait_saving=(1.0, 6.0), I4D_new_saving=(0.05, 0.30), I4D_agree=0.25, I4D_eq_I4A=True,
+              I4D_above_I4A=None, I4D_peak_gb=(83.5, 84.25),
+              I4DW_ratio=(0.508, 0.557), I4DW_vs_I4A=(0.997, 1.012), I4DW_joint_saving=(-1.0, 4.0),
+              I4DW_wait_saving=(3.0, 9.0), I4DW_new_saving=(0.15, 0.45), I4DW_agree=0.25, I4DW_eq_I4A=True,
+              I4DW_above_I4A=True, I4DW_peak_gb=(83.5, 84.25)),
+    318: dict(I4D_repeat_share=(0.05, 0.40), I4D_listed_pass=(6000, 30000), I4D_win_prev_share=(0.05, 0.25),
+              I4D_win_prev_pass=(4000, 11000), I4A_ratio=(0.59, 0.62), I4D_hit_share=(0.15, 0.6),
+              I4DW_win_hits_pass=(4000, 14000),
+              I4D_ratio=(0.590, 0.629), I4D_vs_I4A=(1.000, 1.014), I4D_joint_saving=(0.0, 8.0),
+              I4D_wait_saving=(3.0, 18.0), I4D_new_saving=(0.02, 0.12), I4D_agree=0.25, I4D_eq_I4A=True,
+              I4D_above_I4A=True, I4D_peak_gb=(77.3, 78.15),
+              I4DW_ratio=(0.595, 0.637), I4DW_vs_I4A=(1.009, 1.027), I4DW_joint_saving=(5.0, 15.0),
+              I4DW_wait_saving=(9.0, 30.0), I4DW_new_saving=(0.06, 0.20), I4DW_agree=0.25, I4DW_eq_I4A=True,
+              I4DW_above_I4A=True, I4DW_peak_gb=(77.3, 78.15)),
 }
 
 
