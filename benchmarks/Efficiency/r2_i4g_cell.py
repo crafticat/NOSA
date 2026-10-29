@@ -62,14 +62,18 @@ MEM_MUST_GB = 84.0                 # L4PTFDG-MEM: peak allocated with the prefil
 #   I4G_pool_mb        the graph pool's segments (MB, torch.cuda.memory_snapshot) after the run
 #   I4G_capture_s      the summed capture time of the L graphs (s, host clock)
 # The builder's MODEL (docs/NOTES_i4g.md section 5, with the derivation) is an input for the lead, not a registration.
-PRED_STAMP_I4G = None
+PRED_STAMP_I4G = "2026-10-29T12:00:39Z"
 PRED_KEYS = ("I4G_joint_saving", "I4G_joint_ratio", "I4G_vs_D", "I4G_ratio", "I4G_draft_ratio", "I4G_eq",
              "I4G_peak_gb", "I4G_pool_mb", "I4G_capture_s")
+# The lead's registration (before any I4G cell ran): the builder's suggested bands (NOTES_i4g.md section 5). B 318 is a
+# no-regression check (i4cb: joint busy 0.9958, device bound).
 PRED_I4G_BY_B = {
-    216: dict(I4G_joint_saving=None, I4G_joint_ratio=None, I4G_vs_D=None, I4G_ratio=None, I4G_draft_ratio=None,
-              I4G_eq=None, I4G_peak_gb=None, I4G_pool_mb=None, I4G_capture_s=None),
-    318: dict(I4G_joint_saving=None, I4G_joint_ratio=None, I4G_vs_D=None, I4G_ratio=None, I4G_draft_ratio=None,
-              I4G_eq=None, I4G_peak_gb=None, I4G_pool_mb=None, I4G_capture_s=None),
+    216: dict(I4G_joint_saving=(3.0, 10.5), I4G_joint_ratio=(0.95, 0.99), I4G_vs_D=(1.008, 1.030),
+              I4G_ratio=(0.52, 0.54), I4G_draft_ratio=(0.98, 1.02), I4G_eq=True, I4G_peak_gb=(83.85, 83.95),
+              I4G_pool_mb=(2, 100), I4G_capture_s=(0.5, 15)),
+    318: dict(I4G_joint_saving=(-2.0, 3.0), I4G_joint_ratio=(0.99, 1.01), I4G_vs_D=(0.995, 1.010),
+              I4G_ratio=(0.59, 0.61), I4G_draft_ratio=(0.98, 1.02), I4G_eq=True, I4G_peak_gb=(77.60, 77.80),
+              I4G_pool_mb=(3, 150), I4G_capture_s=(0.5, 15)),
 }
 
 
