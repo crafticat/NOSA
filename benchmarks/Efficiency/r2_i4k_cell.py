@@ -83,12 +83,20 @@ KEEP_REF = {
 #   I4K_pool_mb        [MB] X's graph pool segments after the run
 #   I4K_capture_s      [s] X's summed capture time (host clock)
 # The builder's MODEL (the hand-over report, with the derivation) is an input for the lead, not a registration.
-PRED_STAMP_I4K = None
+PRED_STAMP_I4K = "2026-10-29T14:57:28Z"
 PRED_KEYS = ("I4K_joint_saving", "I4K_joint_ratio", "I4K_vs_D", "I4K_vs_G", "I4K_vs_KW", "I4K_ratio", "I4K_wait_saving",
              "I4K_draft_ratio", "I4K_eq", "I4K_above_best", "I4K_peak_gb", "I4K_pool_mb", "I4K_capture_s")
+# The lead's registration (before any I4K cell ran): the builder's MODEL bands (hand-over report section 5).
+# I4K_above_best is None at both batches: the model puts the arm level with L4PTFDG (B 216) and L4PTFKW (B 318).
 PRED_I4K_BY_B = {
-    216: {k: None for k in PRED_KEYS},
-    318: {k: None for k in PRED_KEYS},
+    216: dict(I4K_joint_saving=(2.0, 9.5), I4K_joint_ratio=(0.954, 0.990), I4K_vs_D=(1.006, 1.028),
+              I4K_vs_G=(0.986, 1.005), I4K_vs_KW=None, I4K_ratio=(0.522, 0.540), I4K_wait_saving=(4.0, 9.0),
+              I4K_draft_ratio=(0.98, 1.02), I4K_eq=True, I4K_above_best=None, I4K_peak_gb=(83.85, 83.95),
+              I4K_pool_mb=(5, 150), I4K_capture_s=(0.5, 20)),
+    318: dict(I4K_joint_saving=(17.0, 31.0), I4K_joint_ratio=(0.919, 0.956), I4K_vs_D=(1.030, 1.056),
+              I4K_vs_G=None, I4K_vs_KW=(0.994, 1.015), I4K_ratio=(0.612, 0.638), I4K_wait_saving=(30.0, 48.0),
+              I4K_draft_ratio=(0.98, 1.02), I4K_eq=True, I4K_above_best=None, I4K_peak_gb=(77.60, 77.80),
+              I4K_pool_mb=(5, 200), I4K_capture_s=(0.5, 20)),
 }
 
 
