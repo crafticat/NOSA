@@ -45,6 +45,7 @@ import importlib.util
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import warnings
@@ -761,6 +762,9 @@ def test_i4d_registration_state():
 def _step(cell, sha="0" * 40):
     e = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_"))}
     e["DRYRUN"] = "1"
+    if shutil.which("srun") is None:     # the test runs on a compute node: the compute-side sha256sum wrapper (L55) is
+        e["PATH"] = os.pathsep.join(p for p in e.get("PATH", "").split(os.pathsep)   # an srun, absent in the image
+                                    if not p.rstrip("/").endswith("kstep-cpu-runs/bin-compute"))
     return subprocess.run(["bash", str(EFF / "r2_i4d_step.sh"), "--nosi", sha, HOLDER, "t1", cell], env=e,
                           capture_output=True, text=True, timeout=300)
 
