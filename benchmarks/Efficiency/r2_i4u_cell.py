@@ -81,12 +81,15 @@ USABLE_GB = IA.USABLE_GB
 #                     values computed once, a constant False dropped, two fills replaced by 0-dim constants).
 #   I4U_peak_gb       the hoist adds < 1 MB (the (H, B, R x 64) bool fullv: 0.44 MB at B 216): L4PTFD's i4aa 83.891 /
 #                     i4ab 77.685: (83.85, 83.95) and (77.60, 77.80).
-PRED_STAMP_I4U = None
+PRED_STAMP_I4U = "2026-10-29T18:16:01Z"
 PRED_KEYS = ("I4U_joint_saving", "I4U_joint_ratio", "I4U_vs_D", "I4U_ratio", "I4U_draft_ratio", "I4U_eq",
              "I4U_peak_gb")
+# The lead's registration (before any I4U cell ran): the builder's MODEL bands (hand-over report section 5).
 PRED_I4U_BY_B = {
-    216: {k: None for k in PRED_KEYS},
-    318: {k: None for k in PRED_KEYS},
+    216: dict(I4U_joint_saving=(2.0, 6.0), I4U_joint_ratio=(0.970, 0.990), I4U_vs_D=(1.005, 1.018),
+              I4U_ratio=(0.515, 0.535), I4U_draft_ratio=(0.98, 1.02), I4U_eq=True, I4U_peak_gb=(83.85, 83.95)),
+    318: dict(I4U_joint_saving=(1.5, 5.5), I4U_joint_ratio=(0.985, 0.996), I4U_vs_D=(1.002, 1.010),
+              I4U_ratio=(0.590, 0.610), I4U_draft_ratio=(0.98, 1.02), I4U_eq=True, I4U_peak_gb=(77.60, 77.80)),
 }
 
 
