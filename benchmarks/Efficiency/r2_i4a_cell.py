@@ -59,10 +59,21 @@ USABLE_GB = 84.25                  # the usable device ceiling (lesson L59; SCOR
 #   I4A_peak_gb        the L4PTFD arm's peak allocated GB, the PREFILL INCLUDED (the MEM gate's value; SCORING_i3.md
 #                      6.1 item 1: I3's key read the decode peak only)
 # The builder's INFERENCE (docs/NOTES_i4a.md section 5, with the arithmetic) is an input for the lead, not a registration.
-PRED_STAMP_I4A = None
+# The lead's REGISTRATION (2026-10-29T04:25:58Z, `date -u`, before any I4A cell ran): the builder's bands (NOTES_i4a.md
+# section 5: 1,158 fewer ops per draft step x about 5.5 us = -6.4 ms per step), the I3 re-measure banded around the
+# MEASURED I3 (0.5128 / 0.5925, SCORING_i3.md), and I4A_eq_I3 True (the lean step computes L4PTF's values bit for bit on
+# the CPU; no arithmetic op changed, only copies / masks merged: a GPU difference would be a finding).
+PRED_STAMP_I4A = "2026-10-29T04:25:58Z"
 PRED_KEYS = ("I4A_ratio", "I4A_vs_I3", "I4A_draft_step_sh", "I4A_draft_saving", "I4A_joint_ratio", "I3_ratio",
              "I4A_agree", "I4A_eq_I3", "I4A_above_I3", "I4A_peak_gb")
-PRED_I4A_BY_B = {216: {k: None for k in PRED_KEYS}, 318: {k: None for k in PRED_KEYS}}
+PRED_I4A_BY_B = {
+    216: dict(I4A_ratio=(0.51, 0.55), I4A_vs_I3=(1.01, 1.06), I4A_draft_step_sh=(1.02, 1.13),
+              I4A_draft_saving=(5.0, 18.0), I4A_joint_ratio=(0.98, 1.02), I3_ratio=(0.49, 0.54), I4A_agree=0.25,
+              I4A_eq_I3=True, I4A_above_I3=True, I4A_peak_gb=(83.5, 84.25)),
+    318: dict(I4A_ratio=(0.59, 0.62), I4A_vs_I3=(1.005, 1.04), I4A_draft_step_sh=(0.70, 0.78),
+              I4A_draft_saving=(5.0, 18.0), I4A_joint_ratio=(0.98, 1.02), I3_ratio=(0.57, 0.61), I4A_agree=0.25,
+              I4A_eq_I3=True, I4A_above_I3=True, I4A_peak_gb=(77.3, 78.1)),
+}
 
 
 def log(msg):
