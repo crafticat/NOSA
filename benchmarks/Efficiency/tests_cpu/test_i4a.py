@@ -64,6 +64,12 @@ I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_i4g_graph.py", "benchmarks/Effici
                      "benchmarks/Efficiency/r2_i4g_step.sh", T_ + "i4g_world.py", T_ + "test_i4g.py",
                      "docs/NOTES_i4g.md")                                                        # I4G
 I4A_LATER = ("r2_i4g_cell.py", "r2_i4g_graph.py")                                                # I4G
+# I4H (nosi-r2-i4h: I4G d7997e6 + the arm L4PTFDGD): its files (its own Gate 0: tests_cpu/test_i4h.py); its modules
+# name the I4A modules (I4A_LATER)
+I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_i4h_graph.py", "benchmarks/Efficiency/r2_i4h_cell.py",
+                     "benchmarks/Efficiency/r2_i4h_step.sh", T_ + "i4h_world.py", T_ + "test_i4h.py",
+                     "docs/NOTES_i4h.md")                                                        # I4H
+I4A_LATER = I4A_LATER + ("r2_i4h_cell.py", "r2_i4h_graph.py")                                    # I4H
 
 
 def _load(name, path=None):

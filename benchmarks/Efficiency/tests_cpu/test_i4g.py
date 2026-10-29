@@ -56,6 +56,12 @@ I4G_DECL = (T_ + "test_wsa.py", T_ + "test_wsb.py", T_ + "test_wsc.py", T_ + "te
 I4A_FILES = ("benchmarks/Efficiency/r2_i4a_lean.py", "benchmarks/Efficiency/r2_i4a_cell.py",
              "benchmarks/Efficiency/r2_i4a_step.sh", T_ + "i4a_world.py", "docs/NOTES_i4a.md")
 TIMING_KEYS = {"phases", "round_ms", "wall_s", "prelude_ms", "probe_wait_ms", "graph"}
+# I4H (nosi-r2-i4h: I4G d7997e6 + the arm L4PTFDGD): its files (its own Gate 0: tests_cpu/test_i4h.py); I4G_LATER: the
+# later modules that import or name the I4G modules (the name scan (e) skips them)
+I4G_NEW = I4G_NEW + ("benchmarks/Efficiency/r2_i4h_graph.py", "benchmarks/Efficiency/r2_i4h_cell.py",
+                     "benchmarks/Efficiency/r2_i4h_step.sh", T_ + "i4h_world.py", T_ + "test_i4h.py",
+                     "docs/NOTES_i4h.md")                                                        # I4H
+I4G_LATER = ("r2_i4h_cell.py", "r2_i4h_graph.py")                                                # I4H
 
 
 def _load(name, path=None):
@@ -133,7 +139,7 @@ def test_i4g_gate0_files():
     assert mods == {"torch", "time"}, mods
     assert "@triton.jit" not in src and "import triton" not in src      # NO NEW KERNEL
     for p in list((ROOT / "nosi/nosi").glob("*.py")) + list(EFF.glob("*.py")):     # (e) nobody else names it
-        if p.name.startswith("r2_i4g_"):
+        if p.name.startswith("r2_i4g_") or p.name in I4G_LATER:
             continue
         assert "r2_i4g" not in p.read_text(), p.name
 
