@@ -93,6 +93,10 @@ DECLARED = DECLARED + ("benchmarks/Efficiency/fork_vllm_unified_attention.py", "
                        "benchmarks/Efficiency/r2_i3_cell.py", "benchmarks/Efficiency/r2_i3_step.sh",
                        "benchmarks/Efficiency/tests_cpu/i3_world.py", "benchmarks/Efficiency/tests_cpu/test_i3.py",
                        "benchmarks/Efficiency/tests_cpu/test_i3_interp.py", "docs/NOTES_i3.md")         # I3
+# I4A (nosi-r2-i4a: I3 c4c64b2 + the arm L4PTFD): its files (its own Gate 0: tests_cpu/test_i4a.py)
+DECLARED = DECLARED + ("benchmarks/Efficiency/r2_i4a_lean.py", "benchmarks/Efficiency/r2_i4a_cell.py",
+                       "benchmarks/Efficiency/r2_i4a_step.sh", "benchmarks/Efficiency/tests_cpu/i4a_world.py",
+                       "benchmarks/Efficiency/tests_cpu/test_i4a.py", "docs/NOTES_i4a.md")                # I4A
 
 
 def _load(name):

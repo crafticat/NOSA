@@ -80,6 +80,11 @@ I3_GATE0_EDITED = {T_ + "test_wsa.py": (I2_TIP, {"test_wsa_flag_off_is_spec5"}),
                    T_ + "test_wsb.py": (I2_TIP, set()),
                    T_ + "test_wsc.py": (WSC2, set()),
                    T_ + "test_i2.py": (I2_TIP, {"test_i2_gate0_files"})}
+# I4A (nosi-r2-i4a: this tree c4c64b2 + the arm L4PTFD): its files are declared too (its own Gate 0:
+# tests_cpu/test_i4a.py; it pins this tree's files to c4c64b2's bytes except these and the declaration lines)
+I3_NEW = I3_NEW + ("benchmarks/Efficiency/r2_i4a_lean.py", "benchmarks/Efficiency/r2_i4a_cell.py",
+                   "benchmarks/Efficiency/r2_i4a_step.sh", T_ + "i4a_world.py", T_ + "test_i4a.py",
+                   "docs/NOTES_i4a.md")                                                          # I4A
 
 
 def _load(name, path=None):
