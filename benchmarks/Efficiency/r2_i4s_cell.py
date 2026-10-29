@@ -125,10 +125,20 @@ MEM_MUST_GB = GC.MEM_MUST_GB       # <arm>-MEM: peak allocated with the prefill 
 #   test_i4s_eager_ops), and the shared pool grows by the draft graphs (i4ha: 75.5 MB); the C 128 margin is 0.36 GB
 #   against the usable 84.25 GB (the pool lives in the decode, below the prefill peak). (4) The capture rounds are
 #   excluded (L61); the effective rate keeps them (REPORT).
-PRED_STAMP_I4S = None
+PRED_STAMP_I4S = "2026-10-29T22:50:04Z"
 PRED_KEYS = ("I4S_joint_saving", "I4S_draft_saving", "I4S_joint_ratio", "I4S_draft_ratio", "I4S_vs_ref", "I4S_vs_D",
              "I4S_ratio", "I4S_eq", "I4S_above_best", "I4S_peak_gb", "I4S_pool_mb", "I4S_capture_s")
-PRED_I4S_BY_B = {216: {k: None for k in PRED_KEYS}, 318: {k: None for k in PRED_KEYS}}
+# The lead's registration (before any I4S cell ran): the builder's MODEL bands (cell comment block above).
+PRED_I4S_BY_B = {
+    216: dict(I4S_joint_saving=(1.5, 4.5), I4S_draft_saving=(3.0, 5.7), I4S_joint_ratio=(0.977, 0.993),
+              I4S_draft_ratio=(0.960, 0.979), I4S_vs_ref=(1.013, 1.030), I4S_vs_D=(1.030, 1.054),
+              I4S_ratio=(0.535, 0.552), I4S_eq=True, I4S_above_best=True, I4S_peak_gb=(83.85, 83.95),
+              I4S_pool_mb=(60, 130), I4S_capture_s=(5.5, 10)),
+    318: dict(I4S_joint_saving=(1.5, 4.5), I4S_draft_saving=(1.5, 6.0), I4S_joint_ratio=(0.987, 0.996),
+              I4S_draft_ratio=(0.968, 0.992), I4S_vs_ref=(1.005, 1.020), I4S_vs_D=(1.055, 1.079),
+              I4S_ratio=(0.632, 0.645), I4S_eq=True, I4S_above_best=True, I4S_peak_gb=(77.60, 77.80),
+              I4S_pool_mb=(80, 250), I4S_capture_s=(5.5, 10)),
+}
 
 
 def log(msg):
