@@ -95,6 +95,9 @@ I3_FILES = ("benchmarks/Efficiency/fork_vllm_unified_attention.py", "benchmarks/
 I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_i4a_lean.py", "benchmarks/Efficiency/r2_i4a_cell.py",
                        "benchmarks/Efficiency/r2_i4a_step.sh", T_ + "i4a_world.py", T_ + "test_i4a.py",
                        "docs/NOTES_i4a.md")                                                     # I4A
+# I4D (nosi-r2-i4d: I4A acbe433 + the accounting and the arm L4PTFK): its files (its own Gate 0: tests_cpu/test_i4d.py)
+I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_i4d_keep.py", "benchmarks/Efficiency/r2_i4d_cell.py",
+                       "benchmarks/Efficiency/r2_i4d_step.sh", T_ + "test_i4d.py")              # I4D
 SEAM_CHANGED = {"#0", "TentState._layer", "TentState._row", "TentRunner.__init__"}
 SEAM_ADDED = {"TentState._rows", "TentState._resid", "TentState._write", "TentRunner._joint_ops", "TentRunner._make_state"}
 

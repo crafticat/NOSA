@@ -85,6 +85,10 @@ I3_GATE0_EDITED = {T_ + "test_wsa.py": (I2_TIP, {"test_wsa_flag_off_is_spec5"}),
 I3_NEW = I3_NEW + ("benchmarks/Efficiency/r2_i4a_lean.py", "benchmarks/Efficiency/r2_i4a_cell.py",
                    "benchmarks/Efficiency/r2_i4a_step.sh", T_ + "i4a_world.py", T_ + "test_i4a.py",
                    "docs/NOTES_i4a.md")                                                          # I4A
+# I4D (nosi-r2-i4d: I4A acbe433 + the accounting and the arm L4PTFK): its files are declared too (its own Gate 0:
+# tests_cpu/test_i4d.py)
+I3_NEW = I3_NEW + ("benchmarks/Efficiency/r2_i4d_keep.py", "benchmarks/Efficiency/r2_i4d_cell.py",
+                   "benchmarks/Efficiency/r2_i4d_step.sh", T_ + "test_i4d.py")                   # I4D
 
 
 def _load(name, path=None):
