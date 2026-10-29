@@ -55,6 +55,21 @@ I4U_NEW = ("benchmarks/Efficiency/r2_i4u_hoist.py", "benchmarks/Efficiency/r2_i4
            "benchmarks/Efficiency/r2_i4u_step.sh", T_ + "i4u_world.py", T_ + "test_i4u.py")
 I4U_DECL = (T_ + "test_wsa.py", T_ + "test_wsb.py", T_ + "test_wsc.py", T_ + "test_i2.py", T_ + "test_i3.py",
             T_ + "test_i4a.py")
+# I4S (nosi-r2-i4s: I4K 70059e5 + I4U 832dca5 + I4H fc6c680 + the stacked arms): the later files in this tree (their
+# own Gate 0: tests_cpu/test_i4d.py, test_i4g.py, test_i4k.py, test_i4h.py, test_i4s.py); I4U_LATER: the later modules
+# that import the hoist module (scan (e) skips them)
+I4U_NEW = I4U_NEW + ("benchmarks/Efficiency/r2_i4d_keep.py", "benchmarks/Efficiency/r2_i4d_cell.py",
+                     "benchmarks/Efficiency/r2_i4d_step.sh", T_ + "test_i4d.py",
+                     "benchmarks/Efficiency/r2_i4g_graph.py", "benchmarks/Efficiency/r2_i4g_cell.py",
+                     "benchmarks/Efficiency/r2_i4g_step.sh", T_ + "i4g_world.py", T_ + "test_i4g.py",
+                     "docs/NOTES_i4g.md", "benchmarks/Efficiency/r2_i4k_combo.py",
+                     "benchmarks/Efficiency/r2_i4k_cell.py", "benchmarks/Efficiency/r2_i4k_step.sh",
+                     T_ + "i4k_world.py", T_ + "test_i4k.py", "benchmarks/Efficiency/r2_i4h_graph.py",
+                     "benchmarks/Efficiency/r2_i4h_cell.py", "benchmarks/Efficiency/r2_i4h_step.sh",
+                     T_ + "i4h_world.py", T_ + "test_i4h.py", "docs/NOTES_i4h.md",
+                     "benchmarks/Efficiency/r2_i4s_stack.py", "benchmarks/Efficiency/r2_i4s_cell.py",
+                     "benchmarks/Efficiency/r2_i4s_step.sh", T_ + "i4s_world.py", T_ + "test_i4s.py")    # I4S
+I4U_LATER = ("r2_i4s_stack.py", "r2_i4s_cell.py")                                                # I4S
 
 
 def _load(name, path=None):
@@ -143,7 +158,7 @@ def test_i4u_gate0_files():
     assert "triton" not in src and "load_inline" not in src and "cpp_extension" not in src      # NO NEW KERNEL
     assert not any(f.endswith((".cu", ".cpp", ".cuh")) or "triton" in f for f in changed), sorted(changed)
     for p in list((ROOT / "nosi/nosi").glob("*.py")) + list(EFF.glob("*.py")):     # (e) nobody else names it
-        if p.name.startswith("r2_i4u_"):
+        if p.name.startswith("r2_i4u_") or p.name in I4U_LATER:
             continue
         assert "r2_i4u" not in p.read_text(), p.name
 

@@ -112,6 +112,10 @@ I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_i4u_hoist.py", "benchmarks/Effi
 I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_i4h_graph.py", "benchmarks/Efficiency/r2_i4h_cell.py",
                        "benchmarks/Efficiency/r2_i4h_step.sh", T_ + "i4h_world.py", T_ + "test_i4h.py",
                        "docs/NOTES_i4h.md")                                                     # I4H
+# I4S (nosi-r2-i4s: I4K 70059e5 + I4U 832dca5 + I4H fc6c680 + the stacked arms): its files (its own Gate 0:
+# tests_cpu/test_i4s.py)
+I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_i4s_stack.py", "benchmarks/Efficiency/r2_i4s_cell.py",
+                       "benchmarks/Efficiency/r2_i4s_step.sh", T_ + "i4s_world.py", T_ + "test_i4s.py")   # I4S
 SEAM_CHANGED = {"#0", "TentState._layer", "TentState._row", "TentRunner.__init__"}
 SEAM_ADDED = {"TentState._rows", "TentState._resid", "TentState._write", "TentRunner._joint_ops", "TentRunner._make_state"}
 

@@ -72,6 +72,17 @@ I4K_DECL = (T_ + "test_wsa.py", T_ + "test_wsb.py", T_ + "test_wsc.py", T_ + "te
 I4K_EDITED = {T_ + "test_i4d.py": (I4D_TIP, "test_i4d_gate0_files", '-        if p.name.startswith("r2_i4d_"):'),
               T_ + "test_i4g.py": (I4G_TIP, "test_i4g_gate0_files", '-        if p.name.startswith("r2_i4g_"):')}
 TIMING_KEYS = {"phases", "round_ms", "wall_s", "prelude_ms", "probe_wait_ms", "graph"}
+# I4S (nosi-r2-i4s: I4K 70059e5 + I4U 832dca5 + I4H fc6c680 + the stacked arms): the later files in this tree (their
+# own Gate 0: tests_cpu/test_i4u.py, test_i4h.py, test_i4s.py); I4K_LATER: the later modules that import the combo
+# module (scan (g) skips them)
+I4K_NEW = I4K_NEW + ("benchmarks/Efficiency/r2_i4u_hoist.py", "benchmarks/Efficiency/r2_i4u_cell.py",
+                     "benchmarks/Efficiency/r2_i4u_step.sh", T_ + "i4u_world.py", T_ + "test_i4u.py",
+                     "benchmarks/Efficiency/r2_i4h_graph.py", "benchmarks/Efficiency/r2_i4h_cell.py",
+                     "benchmarks/Efficiency/r2_i4h_step.sh", T_ + "i4h_world.py", T_ + "test_i4h.py",
+                     "docs/NOTES_i4h.md", "benchmarks/Efficiency/r2_i4s_stack.py",
+                     "benchmarks/Efficiency/r2_i4s_cell.py", "benchmarks/Efficiency/r2_i4s_step.sh",
+                     T_ + "i4s_world.py", T_ + "test_i4s.py")                                    # I4S
+I4K_LATER = ("r2_i4s_stack.py", "r2_i4s_cell.py")                                                # I4S
 
 
 class Evidence(UserWarning):
@@ -177,7 +188,7 @@ def test_i4k_gate0_files():
     for name in ("r2_i4k_combo.py", "r2_i4k_cell.py"):                   # NO NEW KERNEL
         assert "triton" not in (EFF / name).read_text(), name
     for p in list((ROOT / "nosi/nosi").glob("*.py")) + list(EFF.glob("*.py")):     # (g) nobody else names it
-        if p.name.startswith("r2_i4k_"):
+        if p.name.startswith("r2_i4k_") or p.name in I4K_LATER:
             continue
         assert "r2_i4k" not in p.read_text(), p.name
 

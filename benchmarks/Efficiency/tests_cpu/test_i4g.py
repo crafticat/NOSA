@@ -70,6 +70,14 @@ I4G_NEW = I4G_NEW + ("benchmarks/Efficiency/r2_i4h_graph.py", "benchmarks/Effici
                      "benchmarks/Efficiency/r2_i4h_step.sh", T_ + "i4h_world.py", T_ + "test_i4h.py",
                      "docs/NOTES_i4h.md")                                                        # I4H
 I4G_LATER = I4G_LATER + ("r2_i4h_cell.py", "r2_i4h_graph.py")                                    # I4H
+# I4S (nosi-r2-i4s: I4K 70059e5 + I4U 832dca5 + I4H fc6c680 + the stacked arms): the later files in this tree (their
+# own Gate 0: tests_cpu/test_i4u.py, tests_cpu/test_i4s.py); the I4U hoist module names r2_i4g_graph in its docstring and
+# the I4S modules import it (scan (e) skips them)
+I4G_NEW = I4G_NEW + ("benchmarks/Efficiency/r2_i4u_hoist.py", "benchmarks/Efficiency/r2_i4u_cell.py",
+                     "benchmarks/Efficiency/r2_i4u_step.sh", T_ + "i4u_world.py", T_ + "test_i4u.py",
+                     "benchmarks/Efficiency/r2_i4s_stack.py", "benchmarks/Efficiency/r2_i4s_cell.py",
+                     "benchmarks/Efficiency/r2_i4s_step.sh", T_ + "i4s_world.py", T_ + "test_i4s.py")    # I4S
+I4G_LATER = I4G_LATER + ("r2_i4u_hoist.py", "r2_i4s_stack.py", "r2_i4s_cell.py")                 # I4S
 
 
 def _load(name, path=None):

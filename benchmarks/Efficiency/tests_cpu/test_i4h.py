@@ -62,6 +62,18 @@ OLDER_FILES = ("benchmarks/Efficiency/r2_i4g_graph.py", "benchmarks/Efficiency/r
                "benchmarks/Efficiency/r2_i4a_lean.py", "benchmarks/Efficiency/r2_i4a_cell.py",
                "benchmarks/Efficiency/r2_i4a_step.sh", T_ + "i4a_world.py", "docs/NOTES_i4a.md")
 TIMING_KEYS = {"phases", "round_ms", "wall_s", "prelude_ms", "probe_wait_ms", "graph", "dgraph"}
+# I4S (nosi-r2-i4s: I4K 70059e5 + I4U 832dca5 + I4H fc6c680 + the stacked arms): the later files in this tree (their
+# own Gate 0: tests_cpu/test_i4d.py, test_i4k.py, test_i4u.py, test_i4s.py); I4H_LATER: the later modules that import
+# the draft-graph module (scan (e) skips them)
+I4H_NEW = I4H_NEW + ("benchmarks/Efficiency/r2_i4d_keep.py", "benchmarks/Efficiency/r2_i4d_cell.py",
+                     "benchmarks/Efficiency/r2_i4d_step.sh", T_ + "test_i4d.py", "benchmarks/Efficiency/r2_i4k_combo.py",
+                     "benchmarks/Efficiency/r2_i4k_cell.py", "benchmarks/Efficiency/r2_i4k_step.sh",
+                     T_ + "i4k_world.py", T_ + "test_i4k.py", "benchmarks/Efficiency/r2_i4u_hoist.py",
+                     "benchmarks/Efficiency/r2_i4u_cell.py", "benchmarks/Efficiency/r2_i4u_step.sh",
+                     T_ + "i4u_world.py", T_ + "test_i4u.py", "benchmarks/Efficiency/r2_i4s_stack.py",
+                     "benchmarks/Efficiency/r2_i4s_cell.py", "benchmarks/Efficiency/r2_i4s_step.sh",
+                     T_ + "i4s_world.py", T_ + "test_i4s.py")                                    # I4S
+I4H_LATER = ("r2_i4s_stack.py", "r2_i4s_cell.py")                                                # I4S
 
 
 def _load(name, path=None):
@@ -139,7 +151,7 @@ def test_i4h_gate0_files():
     assert mods == {"torch", "time"}, mods
     assert "@triton.jit" not in src and "import triton" not in src      # NO NEW KERNEL
     for p in list((ROOT / "nosi/nosi").glob("*.py")) + list(EFF.glob("*.py")):     # (e) nobody else names it
-        if p.name.startswith("r2_i4h_"):
+        if p.name.startswith("r2_i4h_") or p.name in I4H_LATER:
             continue
         assert "r2_i4h" not in p.read_text(), p.name
 

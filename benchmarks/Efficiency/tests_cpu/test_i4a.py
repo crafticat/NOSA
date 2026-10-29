@@ -78,13 +78,20 @@ I4A_LATER = I4A_LATER + ("r2_i4k_combo.py", "r2_i4k_cell.py")                   
 # later modules that import or name the I4A modules (the name scan (e) skips them)
 I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_i4u_hoist.py", "benchmarks/Efficiency/r2_i4u_cell.py",
                      "benchmarks/Efficiency/r2_i4u_step.sh", T_ + "i4u_world.py", T_ + "test_i4u.py")    # I4U
-I4A_LATER = I4A_LATER + ("r2_i4u_cell.py", "r2_i4u_hoist.py")                                    # I4U
+I4A_LATER = ("r2_i4u_cell.py", "r2_i4u_hoist.py")                                                # I4U
 # I4H (nosi-r2-i4h: I4G d7997e6 + the arm L4PTFDGD): its files (its own Gate 0: tests_cpu/test_i4h.py); its modules
 # name the I4A modules (I4A_LATER)
 I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_i4h_graph.py", "benchmarks/Efficiency/r2_i4h_cell.py",
                      "benchmarks/Efficiency/r2_i4h_step.sh", T_ + "i4h_world.py", T_ + "test_i4h.py",
                      "docs/NOTES_i4h.md")                                                        # I4H
 I4A_LATER = I4A_LATER + ("r2_i4h_cell.py", "r2_i4h_graph.py")                                    # I4H
+# I4S (nosi-r2-i4s: I4K 70059e5 + I4U 832dca5 + I4H fc6c680 + the stacked arms): its files (its own Gate 0:
+# tests_cpu/test_i4s.py). Each lever's line above stays its own bytes (the I4U line re-assigns I4A_LATER), so this block
+# rebuilds the whole skip list of the name scan (e): every later module that names the I4A modules, the I4D users too
+I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_i4s_stack.py", "benchmarks/Efficiency/r2_i4s_cell.py",
+                     "benchmarks/Efficiency/r2_i4s_step.sh", T_ + "i4s_world.py", T_ + "test_i4s.py")    # I4S
+I4A_LATER = I4A_LATER + I4A_USERS + ("r2_i4g_cell.py", "r2_i4g_graph.py", "r2_i4k_combo.py", "r2_i4k_cell.py",
+                                     "r2_i4s_stack.py", "r2_i4s_cell.py")                       # I4S
 
 
 def _load(name, path=None):
@@ -163,7 +170,7 @@ def test_i4a_gate0_files():
     assert mods == {"torch"}, mods
     assert "triton" not in (EFF / "r2_i4a_lean.py").read_text()        # NO NEW KERNEL
     for p in list((ROOT / "nosi/nosi").glob("*.py")) + list(EFF.glob("*.py")):     # (e) nobody else names it
-        if p.name.startswith("r2_i4a_") or p.name in I4A_USERS + I4A_LATER:
+        if p.name.startswith("r2_i4a_") or p.name in I4A_LATER:
             continue
         assert "r2_i4a" not in p.read_text(), p.name
 
