@@ -97,6 +97,10 @@ DECLARED = DECLARED + ("benchmarks/Efficiency/fork_vllm_unified_attention.py", "
 DECLARED = DECLARED + ("benchmarks/Efficiency/r2_i4a_lean.py", "benchmarks/Efficiency/r2_i4a_cell.py",
                        "benchmarks/Efficiency/r2_i4a_step.sh", "benchmarks/Efficiency/tests_cpu/i4a_world.py",
                        "benchmarks/Efficiency/tests_cpu/test_i4a.py", "docs/NOTES_i4a.md")                # I4A
+# I4G (nosi-r2-i4g: I4A acbe433 + the arm L4PTFDG): its files (its own Gate 0: tests_cpu/test_i4g.py)
+DECLARED = DECLARED + ("benchmarks/Efficiency/r2_i4g_graph.py", "benchmarks/Efficiency/r2_i4g_cell.py",
+                       "benchmarks/Efficiency/r2_i4g_step.sh", "benchmarks/Efficiency/tests_cpu/i4g_world.py",
+                       "benchmarks/Efficiency/tests_cpu/test_i4g.py", "docs/NOTES_i4g.md")                # I4G
 
 
 def _load(name):
