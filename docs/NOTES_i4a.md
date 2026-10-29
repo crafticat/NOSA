@@ -142,9 +142,14 @@ FINDING (MEASURED, first CPU run): a planted error in the DRAFT step (`mask_befo
 entry; `live_bias`: stale slots visible) changed the run (drafts, acceptance, round records, buffers) but left every
 committed token SH's and the logits within TOL (max |logit - SH's| 8.006e-06, the clean value). Reason (CODE): the
 joint pass verifies every draft and recomputes the verify rows; a wrong draft costs acceptance, not correctness. So
-SH's tokens are blind to draft-step errors. The gate that catches them is **L4PTFD-EQF**: tokens, check-round
-fingerprints AND the acceptance record (`tokens_acct`, `round_accepted`, `round_committed`) equal to L4PTF's in the same
-job. It is MUST in i4am; in the timing cells it is REPORT (run-to-run determinism of two arms is not established).
+SH's tokens are blind to draft-step errors. Second run (log `i4a_88e96de_i4a.txt`): `mask_before_write` left even
+the drafts, the acceptance counts and the fingerprints equal (accepted 146 vs 146); only the buffers and the engine
+state differed (CPU bitwise compare). The gate that catches all three plants is **L4PTFD-EQF**: tokens, check-round
+fingerprints, the acceptance record (`tokens_acct`, `round_accepted`, `round_committed`) AND exact integer bit sums of
+the final state (`r2_i4a_cell.state_checksum`: buffers K / V / bias per layer, tpos, qc, ctr_c, every layer's block
+map, attention lengths, pool map and pool ages; small tensors only) equal to L4PTF's in the same job. Both arms run
+through `r2_i4a_cell.run_arm_x` (r2_i3_cell.run_arm_f's steps with the runner class as a parameter) to take the
+checksum. EQF is MUST in i4am; in the timing cells it is REPORT (run-to-run determinism of two arms is not established).
 
 ## 4. The per-op cost (INFERENCE from MEASURED labels)
 

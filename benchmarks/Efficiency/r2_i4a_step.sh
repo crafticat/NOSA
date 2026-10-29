@@ -7,7 +7,7 @@
 # SAME as the spec / WS-A / I2 / I3 step scripts' (OUTROOT/sp_active_<holder>): a step of any of them blocks the others
 # on one holder (intended). SH FIRST, each arm with its own shipped prefill into the chain arena, on i3a / i3b's inputs:
 #   SH      the shipped decode at the cell's C and B: the same-job baseline
-#   L4PTF   I3 (r2_i3_cell.run_arm_f unchanged): the base rung, re-measured in the same job
+#   L4PTF   I3 (r2_i4a_cell.run_arm_x = r2_i3_cell.run_arm_f's steps + a state checksum): the base rung, re-measured
 #   L4PTFD  I4A: L4PTF with the lean one-row pass (the same arena, store, joint pass and memory)
 # The pattern of benchmarks/Efficiency/r2_base_step.sh: the GPU uuid READ from the lead-owned file
 # HOLDERS/<holder job>.gpu_uuid. SOURCE ONLY until reviewed: it never submits, renews, cancels or replaces an

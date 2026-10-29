@@ -255,7 +255,8 @@ def test_l4ptfd_op_counts():
 def _cpu(ev):
     """The cell's EQF input (r2_i4a_cell.eq_gate) from a CPU run."""
     r = ev["runner"]
-    return dict(out=r.out.cpu(), fp=(r.fmax.cpu(), r.fsum.cpu()), fp_ok=r.fp_ok.cpu(), acct=_cell().acct_record(ev["rd"]))
+    return dict(out=r.out.cpu(), fp=(r.fmax.cpu(), r.fsum.cpu()), fp_ok=r.fp_ok.cpu(), acct=_cell().acct_record(ev["rd"]),
+                state=_cell().state_checksum(r))
 
 
 @pytest.mark.parametrize("dneg", ["mask_before_write", "live_bias", "stale_pass"])
@@ -327,6 +328,10 @@ def test_i4a_cell_pure_parts():
     planted = _cpu(d)
     planted["acct"] = dict(planted["acct"], round_accepted=planted["acct"]["round_accepted"][:-1] + [-1])
     assert C.eq_gate("L4PTFD", planted, _cpu(f), N, False)[2] is False   # CONTROL: the acceptance record changed
+    planted = _cpu(d)
+    planted["state"] = planted["state"][:-1] + [planted["state"][-1] + 1]
+    assert C.eq_gate("L4PTFD", planted, _cpu(f), N, False)[2] is False   # CONTROL: one state checksum changed
+    assert len(_cpu(d)["state"]) == 3 + L * 7                          # tpos, qc, ctr_c; 7 per layer (with the pool)
     assert C.eq_gate("L4PTFD", _cpu(d), None, N, True)[2] is False
     n, m, ok, det = C.mem_record("L4PTFD", dict(prefill_peak_GB=78.13), 82.57)
     assert ok and "83.891 GB" in det and "usable ceiling 84.25 GB" in det, det
@@ -405,11 +410,12 @@ def test_step_script_i4a():
                     cell, 63 + pool, pool, batch, steps, check, stress, eq, smin, mem, HOLDER))
         assert line in r.stdout, (cell, r.stdout[-600:])
         for want in ("NOSI_POOL_BLOCKS=%d" % pool, "--pool %d" % pool, "--batch %d" % batch, "--steps %d" % steps,
-                     "--arms L4PTF,L4PTFD", "--fork-store 0", "--prefill-hook nocopy", "--tu-gemm natural",
+                     "--fork-store 0", "--prefill-hook nocopy", "--tu-gemm natural",
                      "--check-every %d" % check, "--require-stress %d" % stress, "--eq-must %d" % eq,
                      STEP_ROOT + "/benchmarks/Efficiency/r2_i4a_cell.py", "--mem=%s" % mem, "--time=%d" % smin,
                      "i4a_t1_%s_%s" % (HOLDER, cell)):
             assert want in r.stdout, (cell, want)
+        assert re.search(r"--arms L4PTF\\?,L4PTFD ", r.stdout), (cell, r.stdout[-600:])   # printf %q may quote ","
         a = _cell().parse_args(["--out", "x", "--workload", "w", "--batch", str(batch), "--steps", str(steps),
                                 "--pool", str(pool), "--arms", "L4PTF,L4PTFD", "--check-every", str(check),
                                 "--require-stress", str(stress), "--eq-must", str(eq)])

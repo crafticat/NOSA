@@ -1,7 +1,8 @@
 """Rung I4A of KS/analysis/plan/PLAN_L4P_faithful.md (KS = /mnt/beegfs/ojerbi/kstep-cpu-runs), LEVER 1 of
 KS/analysis/plan/LEDGER_model_vs_measured.md revision 5 (the draft phase): the GPU cell of the arm L4PTFD = L4PTF (rung
 I3) with the LEAN ONE-ROW PASS (benchmarks/Efficiency/r2_i4a_lean.py). A NEW script: r2_i3_cell.py is not edited (its
-functions are imported: the L4PTF arm runs r2_i3_cell.run_arm_f unchanged). Step script:
+functions are imported; both arms run run_arm_x = r2_i3_cell.run_arm_f's steps with the runner class as a parameter,
+plus a state checksum after the run). Step script:
 benchmarks/Efficiency/r2_i4a_step.sh (cells i4am, i4aa, i4ab). Docs: docs/NOTES_i4a.md.
 
 ONE PROCESS, ONE MODEL, SH FIRST, then the arms in the order given (L4PTF before L4PTFD: L4PTFD's tokens are compared
@@ -9,7 +10,7 @@ with L4PTF's), each with its own shipped prefill into the chain arena (NoCopyPre
 (the same workload pin, S0, document rows, K 3, 512 steps, fused twin and body, graph, redirect, probe 16, store X 129,
 --tu-gemm natural):
   SH      the shipped decode at the cell's C and B (r2_base_cell.run_shipped): the same-job baseline
-  L4PTF   I3, r2_i3_cell.run_arm_f unchanged
+  L4PTF   I3: spec_tentative_fork.TentRunnerF (nosi unchanged), driven by run_arm_x
   L4PTFD  I4A: L4PTF with the lean one-row pass (r2_i4a_lean.lean_classes(nosi.spec_tentative_fork)); the same arena,
           store, joint pass and memory
 MUST GATES: C0_FORK; SH-RUN; per arm <arm>-RUN, -ERR, -COMMIT-N, -D1, -D3, -SPAN (r2_wsa_cell.arm_gates_w), -RESID,
@@ -139,10 +140,35 @@ def acct_record(rd):
                 round_committed=[int(x) for x in rd.get("round_committed") or []])
 
 
+def _bsum(t) -> int:
+    """The sum of a tensor's BITS as integers (exact, order-free): floats viewed as integers of their size."""
+    import torch
+    if t.is_floating_point():
+        t = t.view({2: torch.int16, 4: torch.int32, 8: torch.int64}[t.element_size()])
+    return int(t.sum(dtype=torch.int64))
+
+
+def state_checksum(runner) -> list:
+    """After a run: integer bit sums of the tentative state (buffers K, V, bias per layer; tpos, qc, ctr_c) and of
+    every layer's engine maps (block map, pool map, pool ages, attention lengths). Small tensors only (no transient
+    near the 84.25 GB ceiling). A draft-step error that changes no draft token still changes these (the CPU plant
+    mask_before_write: docs/NOTES_i4a.md section 3)."""
+    T = runner.T
+    out = [_bsum(T.tpos), _bsum(T.qc), _bsum(T.ctr_c)]
+    for l, lay in enumerate(runner.rs.cache.layers):
+        e = lay.cache_engine
+        out += [_bsum(T.k[l]), _bsum(T.v[l]), _bsum(T.bias[l]), _bsum(e._block_map), _bsum(e._cache_lens)]
+        for name in ("_pool_map", "_pool_age"):
+            t = getattr(e, name, None)
+            if t is not None:
+                out.append(_bsum(t))
+    return out
+
+
 def eq_gate(arm, fd, f, steps: int, must: bool):
     """<arm>-EQF: L4PTFD = L4PTF in the same job, bit for bit: the committed tokens (the first `steps` columns), the
-    check-round fingerprints (the columns both arms marked) and the acceptance record (acct_record). fd / f: dict(out,
-    fp=(fmax, fsum), fp_ok, acct) on the CPU."""
+    check-round fingerprints (the columns both arms marked), the state checksums (state_checksum) and the acceptance
+    record (acct_record). fd / f: dict(out, fp=(fmax, fsum), fp_ok, acct, state) on the CPU."""
     import torch
     if f is None:
         return ("%s-EQF" % arm, must, False, "no L4PTF record in this job")
@@ -152,10 +178,13 @@ def eq_gate(arm, fd, f, steps: int, must: bool):
     fs = torch.equal(fd["fp"][1][:, :steps][both].view(torch.int64), f["fp"][1][:, :steps][both].view(torch.int64))
     n = int(both.sum())
     acc = fd.get("acct") is not None and fd.get("acct") == f.get("acct")
-    ok = tok_bad == 0 and fm and fs and n > 0 and acc
+    cs = fd.get("state") is not None and fd.get("state") == f.get("state")
+    ncs = sum(1 for x, y in zip(fd.get("state") or [], f.get("state") or []) if x != y)
+    ok = tok_bad == 0 and fm and fs and n > 0 and acc and cs
     return ("%s-EQF" % arm, must, ok, "committed tokens unequal to L4PTF's: %d of %d; fingerprints compared %d columns, "
-            "max equal %s, sum equal %s; acceptance record equal %s (accepted %s vs %s)" % (
-                tok_bad, int(fd["out"][:, :steps].numel()), n, fm, fs, acc,
+            "max equal %s, sum equal %s; state checksums equal %s (%d of %d differ); acceptance record equal %s "
+            "(accepted %s vs %s)" % (
+                tok_bad, int(fd["out"][:, :steps].numel()), n, fm, fs, cs, ncs, len(fd.get("state") or []), acc,
                 ((fd.get("acct") or {}).get("tokens_acct") or {}).get("accepted"),
                 ((f.get("acct") or {}).get("tokens_acct") or {}).get("accepted")))
 
@@ -230,16 +259,17 @@ def verdicts(sh, sp, B: int, K: int = 3, eqf=None):
 
 
 # ------------------------------------------------------------------ the lean arm (GPU)
-def run_arm_fd(model, ids, inputs, steps: int, clock, opt, FORK):
-    """L4PTFD: r2_i3_cell.run_arm_f's steps with r2_i4a_lean's TentRunnerFD (the same arena prefill, store, ops,
-    probe marks and memory measures)."""
+def run_arm_x(model, ids, inputs, steps: int, clock, opt, FORK, lean: bool):
+    """r2_i3_cell.run_arm_f's steps, line for line, with the runner class as the only choice (lean False: L4PTF =
+    spec_tentative_fork.TentRunnerF; True: L4PTFD = r2_i4a_lean's TentRunnerFD), plus state_checksum(runner) after
+    the run (EQF). The same arena prefill, store, ops, probe marks and memory measures."""
     import gc
     import torch
     from nosi import ragged_engine as RE
     from nosi import spec_round as SR
     from nosi import spec_tentative_fork as STF
     from nosi import verify_rows as VR
-    _, TentRunnerFD = LN.lean_classes(STF)
+    Runner = LN.lean_classes(STF)[1] if lean else STF.TentRunnerF
     gb = 1024 ** 3
     K = int(opt["K"])
     X = I3C.fork_store_slots("L4PTF", K, opt["fork_store"])
@@ -254,8 +284,8 @@ def run_arm_fd(model, ids, inputs, steps: int, clock, opt, FORK):
                       redirect=opt["redirect"], probe_every=opt["probe_every"])
     check = opt["check_every"] == 1
     ce = opt["check_every"] if opt["check_every"] > 0 else opt["probe_every"]
-    runner = TentRunnerFD(model, rs, sops, clock, fork=FORK.unified_attention, t0=inputs[:, 0], hooks=None,
-                          check_every=ce, union_check=check, union_stats=check, phase_marks=True)
+    runner = Runner(model, rs, sops, clock, fork=FORK.unified_attention, t0=inputs[:, 0], hooks=None,
+                    check_every=ce, union_check=check, union_stats=check, phase_marks=True)
     if check:
         runner.vs.fa_check = {}                                        # CHECK-ONLY: the "F" / "RA" probes
     runner.run(steps)
@@ -271,7 +301,7 @@ def run_arm_fd(model, ids, inputs, steps: int, clock, opt, FORK):
                first_token_agreement=first, meta=dict(rs.meta, spec=runner.meta), undo=None, mem=mem,
                joint_phases=I3C.fork_phase_summary(phases, layers), fa_check=runner.vs.fa_check,
                store=dict(X=X, store_GB=round(arena.store_bytes() / 1e9, 4), cb0_GB=round(arena.chain_bytes() / 1e9, 4)),
-               compile=I3C._compile_report(FORK))
+               compile=I3C._compile_report(FORK), state=state_checksum(runner))
     runner.detach()
     del runner, rs, cache, arena
     return res
@@ -355,10 +385,7 @@ def main(argv=None) -> int:
                        prefill_hook=a.prefill_hook)
             log("arm %s (%s)" % (arm, opt))
             try:
-                if arm == "L4PTF":
-                    res = I3C.run_arm_f(model, ids, inputs, a.steps, clock, opt, FORK)
-                else:
-                    res = run_arm_fd(model, ids, inputs, a.steps, clock, opt, FORK)
+                res = run_arm_x(model, ids, inputs, a.steps, clock, opt, FORK, lean=(arm == "L4PTFD"))
                 pa, pr = BC.gpu_peak()
                 rec = WA.summarize_w("L4PT", res, inputs, fp_sh, sh, a.batch, a.steps, dims)
                 rec.update(arm=arm, gpu_peak_alloc_GB=pa, gpu_peak_reserved_GB=pr, opt=opt,
@@ -379,7 +406,7 @@ def main(argv=None) -> int:
                 gates.extend(I3C.fork_gates(arm, res, L, check_t, bool(a.require_stress)))
                 gates.append(mem_record(arm, res["mem"], pa))
                 cpu = dict(out=res["out"].cpu(), fp=(res["fp"][0].cpu(), res["fp"][1].cpu()), fp_ok=res["fp_ok"].cpu(),
-                           acct=acct_record(res["read"]))
+                           acct=acct_record(res["read"]), state=res["state"])
                 if arm == "L4PTF":
                     keep["L4PTF"] = cpu
                 else:
