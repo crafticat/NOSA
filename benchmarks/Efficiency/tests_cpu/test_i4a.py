@@ -342,8 +342,16 @@ def test_i4a_cell_pure_parts():
     rec = lambda tok, dr, jt: dict(rates=dict(median_tok_s=tok), phases_median=dict(draft=dr, joint=jt),  # noqa
                                    tokens=dict(equal_fraction=0.4, first=(1, 1)), vs_strongest=0.5,
                                    gpu_peak_alloc_GB=82.0, mem_arena=dict(prefill_peak_GB=78.0))
-    v = {x[0]: x for x in C.verdicts(sh, dict(L4PTF=rec(400.0, 20.0, 30.0), L4PTFD=rec(440.0, 16.0, 30.0)), 216,
-                                     eqf=True)}
+    saved = {b: dict(C.PRED_I4A_BY_B[b]) for b in C.PRED_I4A_BY_B}        # the REPORT check runs on an all-None block
+    try:
+        for b in C.PRED_I4A_BY_B:
+            C.PRED_I4A_BY_B[b].update({k: None for k in C.PRED_KEYS})
+        v = {x[0]: x for x in C.verdicts(sh, dict(L4PTF=rec(400.0, 20.0, 30.0), L4PTFD=rec(440.0, 16.0, 30.0)), 216,
+                                         eqf=True)}
+    finally:
+        for b in saved:
+            C.PRED_I4A_BY_B[b].clear()
+            C.PRED_I4A_BY_B[b].update(saved[b])
     assert all(x[1] == "REPORT" for x in v.values()), v                # registration None: every key REPORT
     assert "1.1000" in v["I4A-VS-I3"][2] and "4.0000" in v["I4A-DRAFT-SAVING"][2] and "0.8000" in v[
         "I4A-DRAFT-STEP-SH"][2], v
