@@ -68,12 +68,18 @@ MEM_MUST_GB = 84.0                 # <arm>-MEM: peak allocated with the prefill 
 #   I4H_pool_mb        the shared graph pool's segments (MB, torch.cuda.memory_snapshot) after the L4PTFDGD run
 #   I4H_capture_s      the summed capture time of the draft graphs (s, host clock; begin to end, with the syncs)
 # The builder's MODEL (docs/NOTES_i4h.md section 5, with the derivation) is an input for the lead, not a registration.
-PRED_STAMP_I4H = None
+PRED_STAMP_I4H = "2026-10-29T18:47:25Z"
 PRED_KEYS = ("I4H_draft_saving", "I4H_draft_ratio", "I4H_joint_ratio", "I4H_vs_G", "I4H_vs_D", "I4H_ratio", "I4H_eq",
              "I4H_peak_gb", "I4H_pool_mb", "I4H_capture_s")
+# The lead's registration (before any I4H cell ran): the builder's MODEL bands (hand-over report section 4); steady
+# sets without the capture rounds (L61).
 PRED_I4H_BY_B = {
-    216: {k: None for k in PRED_KEYS},
-    318: {k: None for k in PRED_KEYS},
+    216: dict(I4H_draft_saving=(2.0, 6.5), I4H_draft_ratio=(0.955, 0.986), I4H_joint_ratio=(0.99, 1.01),
+              I4H_vs_G=(1.004, 1.020), I4H_vs_D=(1.023, 1.040), I4H_ratio=(0.536, 0.545), I4H_eq=True,
+              I4H_peak_gb=(83.85, 83.95), I4H_pool_mb=(40, 400), I4H_capture_s=(0.5, 30)),
+    318: dict(I4H_draft_saving=(1.5, 6.0), I4H_draft_ratio=(0.968, 0.992), I4H_joint_ratio=(0.99, 1.01),
+              I4H_vs_G=(1.000, 1.012), I4H_vs_D=(1.013, 1.026), I4H_ratio=(0.605, 0.612), I4H_eq=True,
+              I4H_peak_gb=(77.60, 77.80), I4H_pool_mb=(60, 600), I4H_capture_s=(0.5, 30)),
 }
 
 
