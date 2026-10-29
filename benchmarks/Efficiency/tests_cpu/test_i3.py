@@ -96,6 +96,9 @@ I3_NEW = I3_NEW + ("benchmarks/Efficiency/r2_i4g_graph.py", "benchmarks/Efficien
 # I4K (nosi-r2-i4k: I4D 99c231e + I4G d7997e6 + the arm L4PTFDGKW): its files (its own Gate 0: tests_cpu/test_i4k.py)
 I3_NEW = I3_NEW + ("benchmarks/Efficiency/r2_i4k_combo.py", "benchmarks/Efficiency/r2_i4k_cell.py",
                    "benchmarks/Efficiency/r2_i4k_step.sh", T_ + "i4k_world.py", T_ + "test_i4k.py")       # I4K
+# I4U (nosi-r2-i4u: I4A acbe433 + the arm L4PTFDU): its files (its own Gate 0: tests_cpu/test_i4u.py)
+I3_NEW = I3_NEW + ("benchmarks/Efficiency/r2_i4u_hoist.py", "benchmarks/Efficiency/r2_i4u_cell.py",
+                   "benchmarks/Efficiency/r2_i4u_step.sh", T_ + "i4u_world.py", T_ + "test_i4u.py")       # I4U
 
 
 def _load(name, path=None):

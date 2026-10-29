@@ -107,6 +107,10 @@ DECLARED = DECLARED + ("benchmarks/Efficiency/r2_i4g_graph.py", "benchmarks/Effi
 DECLARED = DECLARED + ("benchmarks/Efficiency/r2_i4k_combo.py", "benchmarks/Efficiency/r2_i4k_cell.py",
                        "benchmarks/Efficiency/r2_i4k_step.sh", "benchmarks/Efficiency/tests_cpu/i4k_world.py",
                        "benchmarks/Efficiency/tests_cpu/test_i4k.py")                                     # I4K
+# I4U (nosi-r2-i4u: I4A acbe433 + the arm L4PTFDU): its files (its own Gate 0: tests_cpu/test_i4u.py)
+DECLARED = DECLARED + ("benchmarks/Efficiency/r2_i4u_hoist.py", "benchmarks/Efficiency/r2_i4u_cell.py",
+                       "benchmarks/Efficiency/r2_i4u_step.sh", "benchmarks/Efficiency/tests_cpu/i4u_world.py",
+                       "benchmarks/Efficiency/tests_cpu/test_i4u.py")                                     # I4U
 
 
 def _load(name):

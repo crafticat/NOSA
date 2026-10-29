@@ -74,6 +74,11 @@ I4A_LATER = ("r2_i4g_cell.py", "r2_i4g_graph.py")                               
 I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_i4k_combo.py", "benchmarks/Efficiency/r2_i4k_cell.py",
                      "benchmarks/Efficiency/r2_i4k_step.sh", T_ + "i4k_world.py", T_ + "test_i4k.py")    # I4K
 I4A_LATER = I4A_LATER + ("r2_i4k_combo.py", "r2_i4k_cell.py")                                    # I4K
+# I4U (nosi-r2-i4u: I4A acbe433 + the arm L4PTFDU): its files (its own Gate 0: tests_cpu/test_i4u.py); I4A_LATER: the
+# later modules that import or name the I4A modules (the name scan (e) skips them)
+I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_i4u_hoist.py", "benchmarks/Efficiency/r2_i4u_cell.py",
+                     "benchmarks/Efficiency/r2_i4u_step.sh", T_ + "i4u_world.py", T_ + "test_i4u.py")    # I4U
+I4A_LATER = I4A_LATER + ("r2_i4u_cell.py", "r2_i4u_hoist.py")                                    # I4U
 
 
 def _load(name, path=None):
