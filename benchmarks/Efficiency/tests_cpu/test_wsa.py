@@ -100,6 +100,10 @@ DECLARED = DECLARED + ("benchmarks/Efficiency/r2_i4a_lean.py", "benchmarks/Effic
 # I4D (nosi-r2-i4d: I4A acbe433 + the accounting and the arm L4PTFK): its files (its own Gate 0: tests_cpu/test_i4d.py)
 DECLARED = DECLARED + ("benchmarks/Efficiency/r2_i4d_keep.py", "benchmarks/Efficiency/r2_i4d_cell.py",
                        "benchmarks/Efficiency/r2_i4d_step.sh", "benchmarks/Efficiency/tests_cpu/test_i4d.py")  # I4D
+# I4G (nosi-r2-i4g: I4A acbe433 + the arm L4PTFDG): its files (its own Gate 0: tests_cpu/test_i4g.py)
+DECLARED = DECLARED + ("benchmarks/Efficiency/r2_i4g_graph.py", "benchmarks/Efficiency/r2_i4g_cell.py",
+                       "benchmarks/Efficiency/r2_i4g_step.sh", "benchmarks/Efficiency/tests_cpu/i4g_world.py",
+                       "benchmarks/Efficiency/tests_cpu/test_i4g.py", "docs/NOTES_i4g.md")                # I4G
 
 
 def _load(name):

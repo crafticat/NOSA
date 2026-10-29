@@ -63,6 +63,12 @@ I4A_DECL = (T_ + "test_wsa.py", T_ + "test_wsb.py", T_ + "test_wsc.py", T_ + "te
 I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_i4d_keep.py", "benchmarks/Efficiency/r2_i4d_cell.py",
                      "benchmarks/Efficiency/r2_i4d_step.sh", T_ + "test_i4d.py")                 # I4D
 I4A_USERS = ("r2_i4d_keep.py", "r2_i4d_cell.py")                                                 # I4D
+# I4G (nosi-r2-i4g: I4A acbe433 + the arm L4PTFDG): its files (its own Gate 0: tests_cpu/test_i4g.py); I4A_LATER: the
+# later modules that import or name the I4A modules (the name scan (e) skips them)
+I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_i4g_graph.py", "benchmarks/Efficiency/r2_i4g_cell.py",
+                     "benchmarks/Efficiency/r2_i4g_step.sh", T_ + "i4g_world.py", T_ + "test_i4g.py",
+                     "docs/NOTES_i4g.md")                                                        # I4G
+I4A_LATER = ("r2_i4g_cell.py", "r2_i4g_graph.py")                                                # I4G
 
 
 def _load(name, path=None):
@@ -141,7 +147,7 @@ def test_i4a_gate0_files():
     assert mods == {"torch"}, mods
     assert "triton" not in (EFF / "r2_i4a_lean.py").read_text()        # NO NEW KERNEL
     for p in list((ROOT / "nosi/nosi").glob("*.py")) + list(EFF.glob("*.py")):     # (e) nobody else names it
-        if p.name.startswith("r2_i4a_") or p.name in I4A_USERS:
+        if p.name.startswith("r2_i4a_") or p.name in I4A_USERS + I4A_LATER:
             continue
         assert "r2_i4a" not in p.read_text(), p.name
 
