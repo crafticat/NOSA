@@ -101,6 +101,10 @@ DECLARED = DECLARED + ("benchmarks/Efficiency/r2_i4k_combo.py", "benchmarks/Effi
 DECLARED = DECLARED + ("benchmarks/Efficiency/r2_i4u_hoist.py", "benchmarks/Efficiency/r2_i4u_cell.py",
                        "benchmarks/Efficiency/r2_i4u_step.sh", "benchmarks/Efficiency/tests_cpu/i4u_world.py",
                        "benchmarks/Efficiency/tests_cpu/test_i4u.py")                                     # I4U
+# I4H (nosi-r2-i4h: I4G d7997e6 + the arm L4PTFDGD): its files (its own Gate 0: tests_cpu/test_i4h.py)
+DECLARED = DECLARED + ("benchmarks/Efficiency/r2_i4h_graph.py", "benchmarks/Efficiency/r2_i4h_cell.py",
+                       "benchmarks/Efficiency/r2_i4h_step.sh", "benchmarks/Efficiency/tests_cpu/i4h_world.py",
+                       "benchmarks/Efficiency/tests_cpu/test_i4h.py", "docs/NOTES_i4h.md")                # I4H
 
 
 def _load(name):
