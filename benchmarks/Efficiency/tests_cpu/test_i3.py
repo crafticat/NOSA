@@ -110,6 +110,9 @@ I3_NEW = I3_NEW + ("benchmarks/Efficiency/r2_i4s_stack.py", "benchmarks/Efficien
 # I4CC (nosi-r2-i4cc: I4S 8f236f8 + the compiled arms): its files (its own Gate 0: tests_cpu/test_i4cc.py)
 I3_NEW = I3_NEW + ("benchmarks/Efficiency/r2_i4cc_compile.py", "benchmarks/Efficiency/r2_i4cc_cell.py",
                    "benchmarks/Efficiency/r2_i4cc_step.sh", T_ + "i4cc_world.py", T_ + "test_i4cc.py")      # I4CC
+# I4DC (nosi-r2-i4dc: I4CC d75a946 + the compiled draft helpers): its files (its own Gate 0: tests_cpu/test_i4dc.py)
+I3_NEW = I3_NEW + ("benchmarks/Efficiency/r2_i4dc_compile.py", "benchmarks/Efficiency/r2_i4dc_cell.py",
+                   "benchmarks/Efficiency/r2_i4dc_step.sh", T_ + "i4dc_world.py", T_ + "test_i4dc.py")      # I4DC
 
 
 def _load(name, path=None):

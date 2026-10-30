@@ -74,6 +74,11 @@ I4U_LATER = ("r2_i4s_stack.py", "r2_i4s_cell.py")                               
 # name the I4S modules only
 I4U_NEW = I4U_NEW + ("benchmarks/Efficiency/r2_i4cc_compile.py", "benchmarks/Efficiency/r2_i4cc_cell.py",
                      "benchmarks/Efficiency/r2_i4cc_step.sh", T_ + "i4cc_world.py", T_ + "test_i4cc.py")  # I4CC
+# I4DC (nosi-r2-i4dc: I4CC d75a946 + the compiled draft helpers): its files (its own Gate 0: tests_cpu/test_i4dc.py);
+# I4U_LATER: its modules may name the I4U modules (scan (f) skips them)
+I4U_NEW = I4U_NEW + ("benchmarks/Efficiency/r2_i4dc_compile.py", "benchmarks/Efficiency/r2_i4dc_cell.py",
+                     "benchmarks/Efficiency/r2_i4dc_step.sh", T_ + "i4dc_world.py", T_ + "test_i4dc.py")  # I4DC
+I4U_LATER = I4U_LATER + ("r2_i4dc_compile.py", "r2_i4dc_cell.py")                              # I4DC
 
 
 def _load(name, path=None):

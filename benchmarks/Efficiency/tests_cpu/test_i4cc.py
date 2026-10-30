@@ -61,6 +61,11 @@ I4CC_EDITED = {T_ + "test_i4s.py": "test_i4s_gate0_files"}
 COMPILE_IMPORTS = {"torch", "time", "r2_i4s_stack"}
 TIMING_KEYS = {"phases", "round_ms", "wall_s", "prelude_ms", "probe_wait_ms", "graph", "dgraph"}
 HAND_KERNEL = ("import triton", "@triton.jit", "triton.jit", "load_inline", "cpp_extension", "tl.load", "tl.store")
+# I4DC (nosi-r2-i4dc: I4CC d75a946 + the compiled draft helpers): its files (its own Gate 0: tests_cpu/test_i4dc.py);
+# I4CC_LATER: its modules import the I4CC modules (scan (e) skips them)
+I4CC_NEW = I4CC_NEW + (E_ + "r2_i4dc_compile.py", E_ + "r2_i4dc_cell.py", E_ + "r2_i4dc_step.sh", T_ + "i4dc_world.py",
+                       T_ + "test_i4dc.py")                                                       # I4DC
+I4CC_LATER = ("r2_i4dc_compile.py", "r2_i4dc_cell.py")                                          # I4DC
 
 
 class Evidence(UserWarning):
@@ -133,7 +138,7 @@ def test_i4cc_gate0_files():
         text = (EFF / name).read_text()
         assert not [w for w in HAND_KERNEL if w in text], (name, [w for w in HAND_KERNEL if w in text])
     for p in list((ROOT / "nosi/nosi").glob("*.py")) + list(EFF.glob("*.py")):     # (e) nobody else names it
-        if p.name.startswith("r2_i4cc_"):
+        if p.name.startswith("r2_i4cc_") or p.name in I4CC_LATER:
             continue
         assert "r2_i4cc" not in p.read_text(), p.name
 

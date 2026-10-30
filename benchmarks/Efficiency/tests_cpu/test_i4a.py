@@ -96,6 +96,11 @@ I4A_LATER = I4A_LATER + I4A_USERS + ("r2_i4g_cell.py", "r2_i4g_graph.py", "r2_i4
 # name the I4S modules only
 I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_i4cc_compile.py", "benchmarks/Efficiency/r2_i4cc_cell.py",
                      "benchmarks/Efficiency/r2_i4cc_step.sh", T_ + "i4cc_world.py", T_ + "test_i4cc.py")  # I4CC
+# I4DC (nosi-r2-i4dc: I4CC d75a946 + the compiled draft helpers): its files (its own Gate 0: tests_cpu/test_i4dc.py);
+# I4A_LATER: its modules cite the I4A module's lines (scan (e) skips them)
+I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_i4dc_compile.py", "benchmarks/Efficiency/r2_i4dc_cell.py",
+                     "benchmarks/Efficiency/r2_i4dc_step.sh", T_ + "i4dc_world.py", T_ + "test_i4dc.py")  # I4DC
+I4A_LATER = I4A_LATER + ("r2_i4dc_compile.py", "r2_i4dc_cell.py")                              # I4DC
 
 
 def _load(name, path=None):
