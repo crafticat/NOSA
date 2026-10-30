@@ -473,22 +473,51 @@ def test_streams_pure():
                 for b in range(B):
                     v = ids[h, b][ids[h, b] >= 0]
                     assert v.numel() == v.unique().numel() and bool((v < 16).all())
-    assert S.BLOCK_BYTES == 32896 and dict(S.CONFIGS)["SER"] == [["Aq", "G", "F", "Ar"]]
-    t = {k: [10.0] * 3 for k, _ in S.CONFIGS}
-    t.update(A=[60.0] * 3, F=[40.0] * 3, M=[20.0] * 3, G=[20.0] * 3, FG=[60.0] * 3)
+    sl = S.slice_lists(lists, 8, 16)                                   # request group [2, 4) of 5
+    assert sl["page_key"].shape == (8, 2, 64) and sl["page_key"].is_contiguous() and sl["slots_per_entry"] == 1
+    assert torch.equal(sl["page_key"], k[8:16]) and bool((S.union_count(sl, 2, 2) == 72).all())
+    cfg = {c[0]: c for c in S.CONFIGS}
+    assert S.BLOCK_BYTES == 32896 and cfg["SER"][2] == [["Aq", "G", "F", "Ar"]] and cfg["SER"][1] == "c"
+    for c, ctl in S.CONTROL_OF.items():                                # every legal schedule has its matched control
+        ops = sorted(p for seq in cfg[c][2] for p in seq)
+        assert cfg[ctl][1] == "c" and len(cfg[ctl][2]) == 1 and sorted(cfg[ctl][2][0]) == ops, (c, ctl)
+    assert cfg["GRPL"][3] is True and cfg["GRP"][3] is False and cfg["GRP"][2] == [S.CHAIN0, S.CHAIN1]
+    for c in ("GRP", "GRPL", "PF"):                                    # no two parts of one layer's chain overlap
+        lists_ = cfg[c][2]
+        assert any(seq == S.CHAIN or seq in (S.CHAIN0, S.CHAIN1) for seq in lists_) and all(
+            set(seq) & set(S.CHAIN) in (set(), set(S.CHAIN)) for seq in lists_), c
+    assert {c[1] for c in S.CONFIGS} == {"a", "b", "c"} and set(S.PARTS) == {p for c in S.CONFIGS for seq in c[2]
+                                                                             for p in seq}
+    names = [c[0] for c in S.CONFIGS]
+    assert [S.rotation(names, r)[0] for r in range(len(names))] == names and S.rotation(names, len(names)) == names
+    t = {k: [10.0] * 3 for k in names}
+    t.update(A=[60.0] * 3, F=[40.0] * 3, M=[20.0] * 3, G=[20.0] * 3, FG=[60.0] * 3, P=[20.0] * 3, SER=[120.0] * 3)
+    t.update(**{"GRP-SER": [130.0] * 3, "GRP": [100.0] * 3, "GRPL": [118.0] * 3, "PF-SER": [140.0] * 3,
+                "PF": [122.0] * 3})
     t["A|F|M"] = [64.0] * 3
     t["A|F"] = [100.0] * 3
     s = S.summarize(t)
-    assert s["decision"] == "REACHABLE" and s["concurrent"]["A|F"]["eff"] == 0.0
+    assert s["capability"] == "REACHABLE" and s["concurrent"]["A|F"]["eff"] == 0.0
     assert s["concurrent"]["A|F|M"]["eff"] == round((120 - 64) / 60.0, 4)
+    at = s["attainable"]
+    assert (at["GRP"]["split_cost_ms"], at["GRP"]["overlap_ms"], at["GRP"]["net_ms"], at["GRP"]["worth"]) == (
+        10.0, 30.0, 20.0, True)
+    assert at["GRPL"]["net_frac"] == round(2 / 120, 4) and at["GRPL"]["worth"] is False
+    assert at["PF"]["hidden_frac"] == 0.9 and at["PF"]["chain_slowdown"] == round(122 / 120 - 1, 4) and at["PF"]["hides"]
+    assert at["WINF"].startswith("NOT MEASURED")
     t["A|F|M"] = [110.0] * 3
-    assert S.summarize(t)["decision"] == "SERIAL"
+    assert S.summarize(t)["capability"] == "SERIAL"
     t["A|F|M"] = [90.0] * 3
-    assert S.summarize(t)["decision"] == "PARTIAL"
+    t["PF"] = [135.0] * 3
+    s = S.summarize(t)
+    assert s["capability"] == "PARTIAL" and s["attainable"]["PF"]["hides"] is False
+    assert S.need_bytes(318) > S.need_bytes(216) > 8e9
     a = S.parse_args(["--out", "x"])
     assert a.shapes == {128: 216, 73: 318} and a.new_blocks == {128: 1.226, 73: 5.0} and a.layers == 32
+    assert (a.reps, a.warmup, a.seed, a.max_shape_s) == (10, 2, 7, 240.0)
     for bad in (["--shapes", "128:216", "--new-blocks", "73:5.0"], ["--reps", "2"], ["--win-share", "2"],
-                ["--union-pages", "64"], ["--shapes", "x"]):
+                ["--union-pages", "64"], ["--shapes", "x"], ["--shapes", "128:7", "--new-blocks", "128:1"],
+                ["--max-shape-s", "0"]):
         with pytest.raises(SystemExit):
             S.parse_args(["--out", "x"] + bad)
     assert S.main(["--out", "x"]) == 20                                # PROTOCOL_STAMP_RECON7 is None: refused
@@ -524,35 +553,99 @@ class _HostDev:
         pass
 
 
-def _cpu_parts(plant=False):
+class _RecDev(_HostDev):
+    """_HostDev that logs every part call with its stream and the lock-step joins (the schedule's order)."""
+
+    def __init__(self):
+        super().__init__()
+        self.cur, self.waits = "main", 0
+
+    def ctx(self, s):
+        dev = self
+
+        class _C:
+            def __enter__(self_):
+                dev.cur = s
+
+            def __exit__(self_, *a):
+                dev.cur = "main"
+        return _C()
+
+    def wait(self, s, e):
+        self.waits += 1
+
+
+def _cpu_parts(plant=False, log=None, dev=None):
     g = torch.Generator().manual_seed(0)
     x, w = torch.randn(8, 16, generator=g), torch.randn(12, 16, generator=g)
-    y1, y2 = torch.empty(8, 12), torch.empty(8, 12)
     src = torch.randn(64, generator=g)
-    fo, go, mo = torch.empty(4), torch.zeros(64), torch.empty(64)
+    parts, outs = {}, {}
     n = dict(F=0)
+    for tag, rows in (("", slice(0, 8)), ("0", slice(0, 4)), ("1", slice(4, 8))):
+        k = rows.stop - rows.start
+        y1, y2, fo, go = torch.empty(k, 12), torch.empty(k, 12), torch.empty(4), torch.zeros(64)
 
-    def F():
-        n["F"] += 1
-        fo.copy_(src[:4] * (2.0 if (plant and n["F"] > 1) else 1.0))
-    parts = dict(Aq=lambda: torch.mm(x, w.t(), out=y1), Ar=lambda: torch.mm(x, w.t(), out=y2), F=F,
-                 G=lambda: go.index_copy_(0, torch.tensor([3, 7]), src[:2]), M=lambda: mo.copy_(src))
-    return parts, dict(Aq=[y1], Ar=[y2], F=[fo], G=[go], M=[mo])
+        def F(fo=fo, tag=tag):
+            n["F"] += 1
+            fo.copy_(src[:4] * (2.0 if (plant and tag == "" and n["F"] > 1) else 1.0))
+        parts.update({"Aq" + tag: (lambda y1=y1, rows=rows: torch.mm(x[rows], w.t(), out=y1)),
+                      "Ar" + tag: (lambda y2=y2, rows=rows: torch.mm(x[rows], w.t(), out=y2)), "F" + tag: F,
+                      "G" + tag: (lambda go=go: go.index_copy_(0, torch.tensor([3, 7]), src[:2]))})
+        outs.update({"Aq" + tag: [y1], "Ar" + tag: [y2], "F" + tag: [fo], "G" + tag: [go]})
+    for p in ("M", "P"):
+        d = torch.empty(64)
+        parts[p] = (lambda d=d: d.copy_(src))
+        outs[p] = [d]
+    if log is not None:
+        for p, f in list(parts.items()):
+            parts[p] = (lambda p=p, f=f: (log.append((dev.cur if dev else None, p)), f())[1])
+    return parts, outs
 
 
 def test_streams_measure_plumbing():
     S = _mod("r2_recon7_streams")
+    names = [c[0] for c in S.CONFIGS]
     parts, outs = _cpu_parts()
-    times, gates = S.measure(_HostDev(), parts, outs, 2, 3, 1)
-    assert set(times) == {k for k, _ in S.CONFIGS} and all(len(v) == 3 for v in times.values())
-    assert [g[0] for g in gates] == ["%s-EXACT" % k for k, _ in S.CONFIGS] and all(g[2] for g in gates), gates
+    times, gates, stop = S.measure(_HostDev(), parts, outs, 2, 3, 1)
+    assert stop is None and set(times) == set(names) and all(len(v) == 3 for v in times.values())
+    assert [g[0] for g in gates] == ["%s-EXACT" % k for k in S.rotation(names, 2)] and all(g[2] for g in gates), gates
     s = S.summarize(times)
-    assert set(s["concurrent"]) == set(S.CONCURRENT) and s["decision"] in ("REACHABLE", "SERIAL", "PARTIAL")
-    parts, outs = _cpu_parts(plant=True)                               # NEGATIVE CONTROL: F's later output differs
-    _, gates = S.measure(_HostDev(), parts, outs, 2, 3, 1)
-    bad = sorted(g[0] for g in gates if not g[2])
-    _ev("RECON7 STREAMS (CPU plumbing): configurations %d; planted F -> EXACT fails in %s" % (len(gates), bad))
-    assert bad == sorted("%s-EXACT" % k for k, spec in S.CONFIGS if any("F" in seq for seq in spec))
+    assert set(s["concurrent"]) == set(S.CONCURRENT) and s["capability"] in ("REACHABLE", "SERIAL", "PARTIAL")
+    assert set(s["attainable"]) == {"GRP", "GRPL", "PF", "WINF"}
+    # the schedules: GRP's two group chains each in the joint pass's order on their own stream; GRPL joins per layer
+    cfg = {c[0]: c for c in S.CONFIGS}
+    for name, joins in (("GRP", 0), ("GRPL", 2 * 2 * (3 - 1))):       # 2 streams x 2 events x (layers - 1)
+        log, dev = [], _RecDev()
+        p2, o2 = _cpu_parts(log=log, dev=dev)
+        side = [dev.stream() for _ in range(3)]
+        S.run_config(dev, p2, cfg[name][2], 3, side, cfg[name][3])
+        for st in {s_ for s_, _ in log}:
+            seq = [p for s_, p in log if s_ is st]
+            assert seq in (S.CHAIN0 * 3, S.CHAIN1 * 3), seq            # every layer's chain in order, per group
+        assert dev.waits - 2 - 2 == joins, (name, dev.waits)           # start waits + end joins + lock-step joins
+    # the order rotation: pass r starts at configuration r mod n
+    order = []
+    p3, o3 = _cpu_parts()
+    real = S.run_config
+    try:
+        S.run_config = lambda dev, parts, spec, layers, side, lock=False: (order.append(spec), real(
+            dev, parts, spec, layers, side, lock))[1]
+        S.measure(_HostDev(), p3, o3, 1, 3, 1)
+    finally:
+        S.run_config = real
+    n0 = len(S.PARTS) + len(names)                                     # the references, the warm-ups
+    firsts = [order[n0 + r * len(names)] for r in range(3)]
+    assert firsts == [cfg[names[r]][2] for r in range(3)]
+    # STOP criteria: an EXACT failure ends the measurement (NEGATIVE CONTROL: F's later outputs differ)
+    parts, outs = _cpu_parts(plant=True)
+    times, gates, stop = S.measure(_HostDev(), parts, outs, 2, 3, 1)
+    bad = [g[0] for g in gates if not g[2]]
+    first_f = next(k for k in S.rotation(names, 2) if "F" in {p for seq in cfg[k][2] for p in seq})
+    _ev("RECON7 X1 (CPU plumbing): %d configurations; planted F -> stop %r, failed %s" % (len(names), stop, bad))
+    assert bad == ["%s-EXACT" % first_f] and stop == "EXACT failed in %s" % first_f
+    tick = iter(range(0, 10 ** 6, 100))                                # a fake clock: 100 s per reading
+    _, _, stop = S.measure(_HostDev(), *_cpu_parts(), 1, 3, 1, max_s=250, clock=lambda: next(tick))
+    assert stop is not None and stop.startswith("wall clock")
 
 
 # ------------------------------------------------------------------ MEM (c)
@@ -689,7 +782,8 @@ CELLS = (("r7pm", 10, "r2_recon7_cell.py", 30, "100G", ["--batch 8", "--steps 72
                                                           "--count-rounds 16\\,20", "--profile-rounds 8\\,12"]),
          ("r7pa", 65, "r2_recon7_cell.py", 110, "240G", ["--batch 216", "--steps 512", "--count-rounds 48\\,64\\,144"]),
          ("r7pb", 10, "r2_recon7_cell.py", 160, "340G", ["--batch 318", "--arms L4PTFD\\,L4PTFDGUDKWC"]),
-         ("r7s", 65, "r2_recon7_streams.py", 20, "64G", ["--shapes 128:216\\,73:318", "--reps 15"]),
+         ("r7s", 65, "r2_recon7_streams.py", 15, "64G", ["--shapes 128:216\\,73:318", "--reps 10", "--warmup 2",
+                                                         "--seed 7", "--max-shape-s 240"]),
          ("r7mem", 18, "r2_recon7_mem.py", 70, "240G", ["--batches 64\\,192", "--probe-rounds 49", "--pool 18"]))
 
 

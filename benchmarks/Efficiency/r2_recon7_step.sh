@@ -26,8 +26,9 @@
 #         L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDP. STEP_MIN 110, --mem 240G.
 #   r7pb  cell (a), C 73 (pool 10), B 318, the same rounds, arms L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDP.
 #         STEP_MIN 160, --mem 340G.
-#   r7s   cell (b), the two-stream harness: shapes C 128 B 216 and C 73 B 318 (pool 65: the knob only; no model).
-#         STEP_MIN 20, --mem 64G.
+#   r7s   cell X1 (b), the concurrency harness: (a) capability, (b) attainable overlap of the legal pairs, matched serial
+#         controls, order-rotated; shapes C 128 B 216 and C 73 B 318 (pool 65: the knob only; no model). STEP_MIN 15
+#         (hard wall), --mem 64G. Protocol: docs/NOTES_recon7.md section "X1 protocol (about 5 min)".
 #   r7mem cell (c), the memory probe: C 81 (pool 18), B 64 then B 192, 512 steps, 49 probe rounds. STEP_MIN 70,
 #         --mem 240G.
 # Basis of STEP_MIN (MEASURED, sacct, the step records' sacct.txt under OUTROOT): i4dca (SH + L4PTFD, L4PTFDGUDC,
@@ -36,7 +37,7 @@
 # 00:11:21 / 00:11:17. MODEL: r7pa = i4dca + one more D-arm part (11.5 min) + the probe's windows (about 1.5 min) =
 # about 60.5 min (margin 1.8); r7pb = i4dcb + 17 + 2 = about 91 min (margin 1.75); r7pm = i4dm2 + one part + the
 # windows = about 10.5 min (margin 2.8); r7s = no model: setup, one Triton compile of the fork and of the gathers, 2 shapes
-# x 11 configurations x (3 + 15) passes = about 5 min (margin 4); r7mem = i4mp73 (B 64) + B 192 (the prefills scale with
+# x 18 configurations x (2 + 10) passes = about 5 min (margin 3; each shape stops itself at 240 s); r7mem = i4mp73 (B 64) + B 192 (the prefills scale with
 # B: 3 x 174 s SH, 3 x 277 s arena) = about 35 min (margin 2). Memory: the I4DC / I4M cells' --mem (sacct MaxRSS 3.1 GB;
 # the pinned host KV is not in MaxRSS: 106 GB at C 81 B 192).
 #
@@ -91,10 +92,10 @@ case $CELL in
                   --require-stress 0 --profile-rounds 96,112 --label-rounds 112 --count-rounds 48,64,144
                   --draft-marks on)
            DESC="arms SH+$ARMS steps 512 probe 16 profile 96,112 label 112 count 48,64,144" ;;
-    r7s)   CELLPY=benchmarks/Efficiency/r2_recon7_streams.py POOL=65 BATCH=0 STEP_MIN=20 MEM=64G
+    r7s)   CELLPY=benchmarks/Efficiency/r2_recon7_streams.py POOL=65 BATCH=0 STEP_MIN=15 MEM=64G
            CARGS=(--shapes 128:216,73:318 --new-blocks 128:1.226,73:5.0 --union-pages 72 --win-share 0.5 --layers 32
-                  --reps 15 --warmup 3)
-           DESC="shapes C 128 B 216, C 73 B 318; NEW blocks per (layer, KV head, request) 1.226 / 5.0; union 72" ;;
+                  --reps 10 --warmup 2 --seed 7 --max-shape-s 240)
+           DESC="X1: shapes C 128 B 216, C 73 B 318; NEW blocks per (layer, KV head, request) 1.226 / 5.0; union 72; seed 7" ;;
     r7mem) CELLPY=benchmarks/Efficiency/r2_recon7_mem.py POOL=18 BATCH=0 STEP_MIN=70 MEM=240G
            CARGS=(--batches 64,192 --steps 512 --pool "$POOL" "${CK[@]}" --probe-every 16 --probe-rounds 49)
            DESC="C 81 B 64 then B 192, 512 steps, 49 probe rounds" ;;

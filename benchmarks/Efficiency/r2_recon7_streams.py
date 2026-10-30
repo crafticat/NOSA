@@ -1,37 +1,43 @@
-"""RECON7 cell (b), R2 discriminator D1 (KS/analysis/plan/RECON7_R2_joint.md section 4; KS =
-/mnt/beegfs/ojerbi/kstep-cpu-runs): THE TWO-STREAM CONCURRENCY MICRO-HARNESS. Question: can the model's max(HBM, dense)
-overlap exist on THIS A100 for THESE kernels at the measured shapes, or is the serial cost a hardware limit? The joint
-pass runs ONE dependent stream (R2: 9,011 GPU ops, 0.000 ms concurrency), so its traces cannot answer it.
-
-NO NEW KERNEL, NO MODEL: existing ops only, on SYNTHETIC inputs of the MEASURED shapes (one layer's work, replayed for
---layers layers = one pass):
-  A  the joint pass's dense GEMMs of one layer at M = 4 B rows (cuBLAS through torch.mm, the op of F.linear):
-     wqkv (4608 x 4096), wo (4096 x 4096), gate_up (32768 x 4096), down (4096 x 16384) (NOSA-8B config.json; the LM head
-     runs once per pass and is not replayed per layer)
-  F  ONE call of the shipped fork (benchmarks/Efficiency/fork_vllm_unified_attention.py, fia6's blob, the arguments of
-     nosi/nosi/verify_rows.py _fork_call with FORK_LAUNCH) over 4 rows per request: each row lists 64 pages, the rows
-     shifted by ROW_SHIFT, so the kernel's union is 72 pages per (KV head, request) (R2: 72.24 measured)
-  G  the shipped zero-copy H2D gathers (nosi/nosi/flash_cache_engine/flash_h2d_mask(_bias).py) of one layer: the
-     window load (K, V + bias, M = 64 slots) and the store fill (K, V + bias, M = 129 slots), --new-blocks NEW host
-     blocks per (layer, KV head, request) (R2 / R3 kv_at_verify: 1.226 at C 128, 5.000 at C 73), --win-share of them
-     window loads, from pinned host memory
-  M  the SAME bytes as G as ONE copy-engine cudaMemcpyAsync per layer (torch copy_ from a pinned staging buffer)
-CONFIGURATIONS (CONFIGS; one CUDA stream per inner list; each list runs its parts layer by layer; streams start on one
-event and join on the main stream): alone A, F, G, M, FG (F + G on one stream: the HBM side with the in-stream H2D);
-SER (Aq, G, F, Ar per layer on ONE stream: the joint pass's order); then concurrent A|F, A|G, A|M, F|M, A|FG, A|F|M.
-REPORTED per shape: the median ms of each configuration over --reps passes (after --warmup), the overlap efficiency
-eff = (sum of the parts alone - concurrent) / (sum - max) (1 = the max() is reached, 0 = serial), the interference
-T(A|M) / max(A, M) - 1 against the model's s = 8.685 %. THE DECISION RULE (docs/NOTES_recon7.md section 3.2, REPORT):
-REACHABLE when T(A|F|M) <= 1.10 x max(A, F, M); SERIAL when T >= 0.90 x the sum; PARTIAL otherwise.
-MUST GATES: RUN per shape; EXACT per configuration (every part's output bits after the configuration = the same part's
-output bits from its reference run, alone: concurrency changes no value); UNION (the fork's union_len = 72 at every (KV
-head, request)); IDS (the NEW blocks per layer = the requested count). EXIT: the number of failed MUST gates (0-19); 20
-refused (PROTOCOL_STAMP_RECON7 is None: r2_recon7_protocol.py); 30 an exception outside a shape.
+"""RECON7 cell X1 (= step cell r7s), R2 discriminator D1 (KS/analysis/plan/RECON7_R2_joint.md section 4; KS =
+/mnt/beegfs/ojerbi/kstep-cpu-runs): THE CONCURRENCY HARNESS. It separates TWO questions (docs/NOTES_recon7.md, section
+"X1 protocol (about 5 min)"):
+  (a) CAPABILITY: can INDEPENDENT dense GEMM work, the fork attention / gather kernels and a copy-engine H2D run at the
+      same time on this A100 at our shapes? (no dependency between the streams: an upper bound)
+  (b) ATTAINABLE: how much overlap do schedules that keep the joint pass's REAL dependencies get? Inside a layer QKV ->
+      (selection) -> fetch -> attention -> MLP are causally dependent; the next layer of the same rows depends on this
+      layer's output. Only LEGAL PAIRS overlap:
+        GRP   request groups: the rows of request group 0 and of group 1 never read each other's values (GEMMs are
+              row-wise, the fork attends per request), so group 0's chain and group 1's chain run on two streams.
+              Variant GRPL: lock-step, both groups join after every layer. COST counted, not hidden: each group's GEMMs
+              read the full weights, so the dense weight traffic is paid twice (the full-batch SER counts it once).
+        PF    a NEXT-round prefetch (the draft rows' misses: their bytes, copy engine) beside the current pass's
+              dependent chain: no read of it in this pass.
+        WINF  window attention beside the selected-block fetch: NOT BUILDABLE with the shipped fork (its 2D launch writes
+              the normalised output only: no log-sum-exp to merge a window part with a fetched part, fork :1060-1063)
+              without a kernel change or a different (not bit-equal) computation: NOT MEASURED (stated in the record).
+NO NEW KERNEL, NO MODEL: existing ops on SYNTHETIC inputs of the MEASURED shapes (one layer's work, replayed --layers
+times = one pass): Aq / Ar the joint pass's dense GEMMs at M = 4 B rows (cuBLAS through torch.mm: wqkv 4608 x 4096; wo
+4096 x 4096, gate_up 32768 x 4096, down 4096 x 16384; NOSA-8B config.json); F ONE call of the shipped fork (fia6's blob,
+verify_rows._fork_call's arguments, FORK_LAUNCH) whose rows list 64 pages shifted (0, 3, 5, 8): union 72 per (KV head,
+request); G the shipped zero-copy gathers (window K, V + bias; store K, V + bias) of --new-blocks NEW host blocks per
+(layer, KV head, request); M / P the same bytes as ONE copy-engine copy from pinned staging (M: mode (a); P: mode (b)'s
+prefetch, its own buffers); Aq0 .. F1 the same parts on request group 0 / 1 (half the requests each, own outputs).
+SELECTION, the residency, the twin step and the norms are NOT replayed (stated: (b) bounds the overlap of the replayed
+parts only).
+MATCHED CONTROLS: every concurrent configuration has a SERIAL configuration of the same ops on one stream with the same
+inputs (CONTROL); all configurations run in the same process, ORDER-ROTATED (lesson L62: the first arm pays more; pass
+r runs the configurations starting at index r mod n), after a warm-up of every configuration.
+MUST GATES: <shape>-RUN; <shape>-<config>-EXACT (every part's output bits after the configuration's last pass = the part's
+reference run alone, so concurrent = serial control = alone); <shape>-UNION (fork union_len = 72 everywhere);
+<shape>-IDS (the NEW blocks per layer as requested); <shape>-BUDGET (the shape finished inside --max-shape-s).
+STOP CRITERIA (the run aborts the rest of a shape): an EXACT failure; the shape's wall clock above --max-shape-s; a UNION
+or IDS failure (before any timing); free device memory below the shape's need (before any allocation).
+EXIT: the number of failed MUST gates (0-19); 20 refused (PROTOCOL_STAMP_RECON7 is None: r2_recon7_protocol.py); 30 an
+exception outside a shape.
 """
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import os
 import statistics
@@ -50,15 +56,35 @@ FORK_ROWS = 4                                                 # = verify_rows.FO
 ROW_SHIFT = (0, 3, 5, 8)                                      # union per (KV head, request) = 64 + 8 = 72
 BLOCK_BYTES = BS * HD * 2 * 2 + BS * 2                        # K + V + bias of one (KV head, block): 32,896 B
 NBH = 16                                                      # host blocks per request (the ids' range)
-PARTS = ("Aq", "Ar", "F", "G", "M")
-CONFIGS = (("A", [["Aq", "Ar"]]), ("F", [["F"]]), ("G", [["G"]]), ("M", [["M"]]), ("FG", [["G", "F"]]),
-           ("SER", [["Aq", "G", "F", "Ar"]]), ("A|F", [["Aq", "Ar"], ["F"]]), ("A|G", [["Aq", "Ar"], ["G"]]),
-           ("A|M", [["Aq", "Ar"], ["M"]]), ("F|M", [["F"], ["M"]]), ("A|FG", [["Aq", "Ar"], ["G", "F"]]),
-           ("A|F|M", [["Aq", "Ar"], ["F"], ["M"]]))
-CONCURRENT = dict(**{"A|F": ("A", "F"), "A|G": ("A", "G"), "A|M": ("A", "M"), "F|M": ("F", "M"),
-                     "A|FG": ("A", "FG"), "A|F|M": ("A", "F", "M")})
+CHAIN = ["Aq", "G", "F", "Ar"]                                # the joint pass's per-layer order (selection not replayed)
+CHAIN0, CHAIN1 = [p + "0" for p in CHAIN], [p + "1" for p in CHAIN]
+PARTS = ("Aq", "Ar", "F", "G", "M", "P") + tuple(CHAIN0) + tuple(CHAIN1)
+# (name, mode, stream lists, lock-step). Mode "a": CAPABILITY (independent work); "b": ATTAINABLE (legal pairs);
+# "c": a CONTROL (the same ops serial on one stream).
+CONFIGS = (
+    ("A", "a", [["Aq", "Ar"]], False), ("F", "a", [["F"]], False), ("G", "a", [["G"]], False),
+    ("M", "a", [["M"]], False), ("FG", "a", [["G", "F"]], False), ("P", "a", [["P"]], False),
+    ("SER", "c", [CHAIN], False),
+    ("A|F", "a", [["Aq", "Ar"], ["F"]], False), ("A|G", "a", [["Aq", "Ar"], ["G"]], False),
+    ("A|M", "a", [["Aq", "Ar"], ["M"]], False), ("F|M", "a", [["F"], ["M"]], False),
+    ("A|FG", "a", [["Aq", "Ar"], ["G", "F"]], False), ("A|F|M", "a", [["Aq", "Ar"], ["F"], ["M"]], False),
+    ("GRP-SER", "c", [CHAIN0 + CHAIN1], False), ("GRP", "b", [CHAIN0, CHAIN1], False),
+    ("GRPL", "b", [CHAIN0, CHAIN1], True),
+    ("PF-SER", "c", [CHAIN + ["P"]], False), ("PF", "b", [CHAIN, ["P"]], False))
+CONCURRENT = {"A|F": ("A", "F"), "A|G": ("A", "G"), "A|M": ("A", "M"), "F|M": ("F", "M"), "A|FG": ("A", "FG"),
+              "A|F|M": ("A", "F", "M")}
+CONTROL_OF = {"GRP": "GRP-SER", "GRPL": "GRP-SER", "PF": "PF-SER"}
+# the legal pairs: lifetimes of the buffers each one shares (docs/NOTES_recon7.md, X1 protocol, section "pairs")
+LEGAL = dict(
+    GRP="group g's x / q / k / v rows, its fork lists and tables, its gather destinations: written and read by group g's "
+        "stream only, from the layer's QKV GEMM to its MLP output; shared read-only: the weights, the arena (disjoint "
+        "pages per request), the pinned host KV (disjoint requests)",
+    PF="the prefetch staging (pinned host) and its device buffer: written during layer l of round t, first read by the "
+       "joint pass of round t + 1; never read or written by this pass's chain (own allocation: no RAW / WAR hazard)",
+    WINF="NOT MEASURED: needs the window part's log-sum-exp (the fork's 2D launch has none) or a non-bit-equal split")
 MODEL_S = 0.0868458712                                        # the model's transport interference (REQ: 8.68458712 %)
-REACH, SERIAL = 1.10, 0.90
+REACH, SERIAL = 1.10, 0.90                                    # mode (a) rule
+WORTH, HIDDEN_OK, SLOW_OK = 0.05, 0.80, 0.05                  # mode (b) rules
 
 
 def log(msg):
@@ -85,18 +111,19 @@ def parse_args(argv):
     ap.add_argument("--union-pages", type=int, default=72, choices=(72,), help="the fork's union per (KV head, request)")
     ap.add_argument("--win-share", type=float, default=0.5, help="the share of the NEW blocks that are window loads")
     ap.add_argument("--layers", type=int, default=32, help="layers replayed per pass")
-    ap.add_argument("--reps", type=int, default=15)
-    ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--reps", type=int, default=10)
+    ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--max-shape-s", type=float, default=240.0, help="STOP: a shape's wall clock above this (s)")
     a = ap.parse_args(argv)
     a.shapes = _pairs(ap, a.shapes, int, "--shapes")
     a.new_blocks = _pairs(ap, a.new_blocks, float, "--new-blocks")
     if not a.shapes or set(a.shapes) != set(a.new_blocks):
         ap.error("--shapes and --new-blocks: the same C values")
-    if not (0.0 <= a.win_share <= 1.0) or a.layers < 1 or a.reps < 3 or a.warmup < 1:
-        ap.error("--win-share in [0, 1], --layers >= 1, --reps >= 3, --warmup >= 1")
-    if any(b < 1 or b > 1024 for b in a.shapes.values()):
-        ap.error("--shapes: B in 1 .. 1024")
+    if not (0.0 <= a.win_share <= 1.0) or a.layers < 1 or a.reps < 3 or a.warmup < 1 or a.max_shape_s <= 0:
+        ap.error("--win-share in [0, 1], --layers >= 1, --reps >= 3, --warmup >= 1, --max-shape-s > 0")
+    if any(b < 2 or b > 1024 or b % 2 for b in a.shapes.values()):
+        ap.error("--shapes: B even, in 2 .. 1024 (two request groups)")
     return a
 
 
@@ -157,6 +184,11 @@ def make_lists(B: int, H: int, U: int = 72):
                 seq_idx=torch.zeros(E, dtype=torch.int32), slots_per_entry=1)
 
 
+def slice_lists(lists, e0: int, e1: int):
+    """The rows [e0, e1) of the row lists (a request group: contiguous int32 copies)."""
+    return {k: (v[e0:e1].contiguous() if hasattr(v, "shape") else v) for k, v in lists.items()}
+
+
 def union_count(lists, B: int, H: int):
     """The union size per (KV head, request) of the rows' lists (torch, as fork_build_union counts FIRST entries)."""
     import torch
@@ -168,9 +200,17 @@ def union_count(lists, B: int, H: int):
     return out
 
 
+def rotation(names, r: int):
+    """Pass r's order: the configurations from index r mod n (lesson L62: no configuration is always first)."""
+    n = len(names)
+    k = r % n
+    return list(names[k:]) + list(names[:k])
+
+
 def summarize(times: dict) -> dict:
-    """times {config: [ms per pass]} -> the medians, the concurrent configurations' max / sum of their parts alone,
-    the overlap efficiency, the ratios, the interference A|M, the decision of the rule."""
+    """times {config: [ms per pass]} -> medians; mode (a): the concurrent sets against their parts alone (max, sum,
+    efficiency eff = (sum - T) / (sum - max)), the interference A|M, the decision; mode (b): each legal schedule against
+    its matched serial control and against the full-batch serial chain SER (shared work counted once), the decisions."""
     med = {k: (round(statistics.median(v), 4) if v else None) for k, v in times.items()}
     out = dict(median_ms=med, spread_ms={k: ([round(min(v), 4), round(max(v), 4)] if v else None)
                                          for k, v in times.items()})
@@ -194,13 +234,33 @@ def summarize(times: dict) -> dict:
     out["model_s"] = MODEL_S
     fm = conc.get("A|F|M")
     if fm is None:
-        out["decision"] = None
+        out["capability"] = None
     elif fm["over_max"] <= REACH:
-        out["decision"] = "REACHABLE"
+        out["capability"] = "REACHABLE"
     elif fm["over_sum"] >= SERIAL:
-        out["decision"] = "SERIAL"
+        out["capability"] = "SERIAL"
     else:
-        out["decision"] = "PARTIAL"
+        out["capability"] = "PARTIAL"
+    att = {}
+    for c in ("GRP", "GRPL"):
+        t, ctl = med.get(c), med.get(CONTROL_OF[c])
+        if None in (t, ctl, ser):
+            att[c] = None
+            continue
+        net = ser - t
+        att[c] = dict(ms=t, control_ms=ctl, ser_ms=ser, split_cost_ms=round(ctl - ser, 4),
+                      overlap_ms=round(ctl - t, 4), net_ms=round(net, 4), net_frac=round(net / ser, 4),
+                      worth=(net / ser) >= WORTH)
+    t, ctl, p = med.get("PF"), med.get("PF-SER"), med.get("P")
+    if None in (t, ctl, ser, p) or not p:
+        att["PF"] = None
+    else:
+        hid = (ser + p - t) / p
+        slow = t / ser - 1.0
+        att["PF"] = dict(ms=t, control_ms=ctl, ser_ms=ser, P_ms=p, hidden_frac=round(hid, 4), chain_slowdown=round(slow, 4),
+                         control_over_sum=round(ctl / (ser + p), 4), hides=(hid >= HIDDEN_OK and slow <= SLOW_OK))
+    att["WINF"] = "NOT MEASURED: " + LEGAL["WINF"]
+    out["attainable"] = att
     return out
 
 
@@ -249,10 +309,11 @@ def bits(t):
     return t
 
 
-def run_config(dev, parts, streams_spec, layers: int, side):
+def run_config(dev, parts, streams_spec, layers: int, side, lockstep: bool = False):
     """ONE pass of a configuration: the main stream records a start event; each inner list runs on its own stream
-    (the first list on the main stream when there is one list) after the start, layer by layer; the main stream waits
-    for every stream's end event and records the end. Returns the elapsed ms (after a sync)."""
+    (one list: the main stream) after the start, layer by layer; lockstep: after every layer every stream waits for
+    every other stream's layer end (a per-layer join); the main stream joins every stream and records the end. Returns
+    the elapsed ms (after a sync)."""
     e0, e1 = dev.event(), dev.event()
     dev.record(e0, dev.main)
     ss = [dev.main] if len(streams_spec) == 1 else side[:len(streams_spec)]
@@ -264,6 +325,15 @@ def run_config(dev, parts, streams_spec, layers: int, side):
             with dev.ctx(s):
                 for p in seq:
                     parts[p]()
+        if lockstep and len(ss) > 1 and l + 1 < layers:
+            evs = []
+            for s in ss:
+                e = dev.event()
+                dev.record(e, s)
+                evs.append(e)
+            for s in ss:
+                for e in evs:
+                    dev.wait(s, e)
     ends = []
     for s in ss:
         if s is not dev.main:
@@ -277,29 +347,61 @@ def run_config(dev, parts, streams_spec, layers: int, side):
     return dev.elapsed(e0, e1)
 
 
-def measure(dev, parts, outputs, layers: int, reps: int, warmup: int, configs=CONFIGS):
-    """Every configuration: warmup + reps passes; the reference outputs from the parts alone (run once each before
-    the configurations); the EXACT gate per configuration. outputs: {part: [tensors it writes]}."""
+def measure(dev, parts, outputs, layers: int, reps: int, warmup: int, configs=CONFIGS, max_s=None, clock=None):
+    """The reference outputs (each part alone, one layer); a warm-up of every configuration; then `reps` ORDER-ROTATED
+    passes (pass r starts at configuration r mod n); after a configuration's last pass its EXACT gate. STOP: an EXACT
+    failure or the wall clock above max_s ends the measurement (the record says so). Returns (times, gates, stop)."""
+    clock = clock or time.perf_counter
+    t0 = clock()
     side = [dev.stream() for _ in range(3)]
+    spec = {c[0]: c for c in configs}
+    used = [p for p in PARTS if p in parts]
     ref = {}
-    for p in PARTS:                                                    # the reference: each part alone, one pass
+    for p in used:
         run_config(dev, parts, [[p]], 1, side)
         for i, t in enumerate(outputs[p]):
             ref["%s.%d" % (p, i)] = t.clone()
-    times, gates = {}, []
-    for name, spec in configs:
+    names = [c[0] for c in configs]
+    for name in names:
         for _ in range(warmup):
-            run_config(dev, parts, spec, layers, side)
-        times[name] = [run_config(dev, parts, spec, layers, side) for _ in range(reps)]
-        used = sorted({p for seq in spec for p in seq})
-        got = {"%s.%d" % (p, i): t for p in used for i, t in enumerate(outputs[p])}
-        gates.append(exact_gate(name, ref, got, bits))
-    return times, gates
+            run_config(dev, parts, spec[name][2], layers, side, spec[name][3])
+    times, gates, stop = {n: [] for n in names}, [], None
+    for r in range(reps):
+        for name in rotation(names, r):
+            _, _, lists, lock = spec[name]
+            times[name].append(run_config(dev, parts, lists, layers, side, lock))
+            if r == reps - 1:
+                ps = sorted({p for seq in lists for p in seq})
+                got = {"%s.%d" % (p, i): t for p in ps for i, t in enumerate(outputs[p])}
+                g = exact_gate(name, ref, got, bits)
+                gates.append(g)
+                if not g[2]:
+                    stop = "EXACT failed in %s" % name
+                    break
+            if max_s is not None and clock() - t0 > max_s:
+                stop = "wall clock %.0f s above %.0f s (pass %d)" % (clock() - t0, max_s, r)
+                break
+        if stop:
+            break
+    return times, gates, stop
+
+
+def need_bytes(B: int, union: int = 72) -> int:
+    """MODEL: the device bytes of one shape (weights, activations, the outputs and the gather destinations four times:
+    full and groups, each with its reference clone; the arena; the copy buffers; 1 GiB slack): the free-memory STOP."""
+    E = R * B
+    w = sum(N * K for _, N, K in GEMMS) * 2
+    act = E * (3 * HIDDEN + INTER) * 2
+    outs = 4 * E * sum(N for _, N, _ in GEMMS) * 2
+    arena = (B * union + 8) * BS * HKV * (2 * HD + 1) * 2
+    dst = 4 * B * (TOPK + X_STORE) * BS * HKV * (2 * HD + 1) * 2
+    return w + act + outs + arena + dst + 2 * E * HQ * HD * 2 + (1 << 30)
 
 
 def build_gpu(B: int, per_stream: float, win_share: float, seed: int, union: int = 72):
-    """The parts of one shape on the GPU (synthetic inputs of the measured shapes; module docstring) and the check
-    values. Returns (parts {name: callable}, outputs {name: [tensors]}, meta)."""
+    """The parts of one shape on the GPU (synthetic inputs of the measured shapes; module docstring): the full-batch
+    parts and the two request groups' parts (own outputs, own tables, slices of the shared read-only inputs). Returns
+    (parts {name: callable}, outputs {name: [tensors]}, meta)."""
     import torch
     import fork_vllm_unified_attention as FK
     from nosi.flash_cache_engine.flash_h2d_mask import flash_h2d_from_mask
@@ -311,60 +413,78 @@ def build_gpu(B: int, per_stream: float, win_share: float, seed: int, union: int
     rnd = lambda *s: (torch.randn(*s, generator=g) * 0.05).to(bf).to(dev)   # noqa: E731
     W = {n: rnd(N, K) for n, N, K in GEMMS}
     x_in, x_att, x_mlp, x_dn = rnd(E, HIDDEN), rnd(E, HIDDEN), rnd(E, HIDDEN), rnd(E, INTER)
-    y = {n: torch.empty((E, N), dtype=bf, device=dev) for n, N, _ in GEMMS}
-
-    def Aq():
-        torch.mm(x_in, W["wqkv"].t(), out=y["wqkv"])
-
-    def Ar():
-        torch.mm(x_att, W["wo"].t(), out=y["wo"])
-        torch.mm(x_mlp, W["gate_up"].t(), out=y["gate_up"])
-        torch.mm(x_dn, W["down"].t(), out=y["down"])
     NB = B * union + 8
     ak, av = rnd(NB, BS, HKV, HD), rnd(NB, BS, HKV, HD)
     ab = rnd(NB, BS, HKV)
     q = rnd(E, HQ, HD)
-    fout = torch.zeros((E, HQ, HD), dtype=bf, device=dev)
     lists = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in make_lists(B, HKV, union).items()}
-    NS = B
-    Wt = FORK_ROWS * TOPK
-    cu = torch.arange(0, E + 1, R, dtype=torch.int32, device=dev)
-    seq = torch.zeros(NS, dtype=torch.int32, device=dev)
-    tab = torch.zeros((HKV, NS, Wt), dtype=torch.int32, device=dev)
-    ext = torch.zeros((HKV, NS, Wt), dtype=torch.int32, device=dev)
-    ln = torch.zeros((HKV, NS), dtype=torch.int32, device=dev)
-
-    def F():
-        FK.unified_attention(q, ak, av, fout, cu, FORK_ROWS, seq, BS, HD ** -0.5, True, (-1, -1), tab, 0, None, None,
-                             None, union_ext=ext, union_len=ln, cis_bias=ab, build_union=lists,
-                             rows_per_q_block=FORK_ROWS, **FORK_LAUNCH)
     nw, ns = counts_per_layer(B, HKV, per_stream, win_share)
     ids_w = make_ids(spread(nw, HKV, B, min(NBH, TOPK), seed + 1), TOPK, NBH, seed + 2).to(dev)
     ids_s = make_ids(spread(ns, HKV, B, min(NBH, X_STORE - 1), seed + 3), X_STORE, NBH, seed + 4, 1).to(dev)
     hk = (torch.randn(B, NBH * BS, HKV, HD, generator=g) * 0.05).to(bf).pin_memory()
     hv = (torch.randn(B, NBH * BS, HKV, HD, generator=g) * 0.05).to(bf).pin_memory()
     cis = rnd(B, NBH * BS, HKV)
-    wk = torch.zeros((B, TOPK * BS, HKV, HD), dtype=bf, device=dev)
-    wv, wb = torch.zeros_like(wk), torch.zeros((B, TOPK * BS, HKV), dtype=bf, device=dev)
-    sk = torch.zeros((B, X_STORE * BS, HKV, HD), dtype=bf, device=dev)
-    sv, sb = torch.zeros_like(sk), torch.zeros((B, X_STORE * BS, HKV), dtype=bf, device=dev)
+    nbytes = max((nw + ns) * BLOCK_BYTES, 1)
+    parts, outputs = {}, {}
 
-    def G():
-        flash_h2d_from_mask(wk, hk, ids_w, BS)
-        flash_h2d_from_mask_bias(wv, hv, wb, cis, ids_w, BS)
-        flash_h2d_from_mask(sk, hk, ids_s, BS)
-        flash_h2d_from_mask_bias(sv, hv, sb, cis, ids_s, BS)
-    nbytes = (nw + ns) * BLOCK_BYTES
-    stage = torch.randint(0, 255, (max(nbytes, 1),), dtype=torch.uint8, generator=g).pin_memory()
-    mdst = torch.zeros((max(nbytes, 1),), dtype=torch.uint8, device=dev)
+    def unit(tag, b0, b1):
+        """The chain parts of the requests [b0, b1) (rows [R b0, R b1)), suffix tag."""
+        e0, e1 = R * b0, R * b1
+        Bg, Eg = b1 - b0, e1 - e0
+        y = {n: torch.empty((Eg, N), dtype=bf, device=dev) for n, N, _ in GEMMS}
+        xi, xa, xm, xd = x_in[e0:e1], x_att[e0:e1], x_mlp[e0:e1], x_dn[e0:e1]
 
-    def M():
-        mdst.copy_(stage, non_blocking=True)
-    parts = dict(Aq=Aq, Ar=Ar, F=F, G=G, M=M)
-    outputs = dict(Aq=[y["wqkv"]], Ar=[y["wo"], y["gate_up"], y["down"]], F=[fout], G=[wk, wv, wb, sk, sv, sb], M=[mdst])
-    meta = dict(B=B, E=E, NB_arena=NB, union=union, new_per_stream=per_stream, new_win=nw, new_store=ns,
-                bytes_per_layer=nbytes, ids_win=int((ids_w >= 0).sum()), ids_store=int((ids_s >= 0).sum()),
-                ln=ln, gemm_flop_per_layer=sum(2 * E * N * K for _, N, K in GEMMS))
+        def Aq():
+            torch.mm(xi, W["wqkv"].t(), out=y["wqkv"])
+
+        def Ar():
+            torch.mm(xa, W["wo"].t(), out=y["wo"])
+            torch.mm(xm, W["gate_up"].t(), out=y["gate_up"])
+            torch.mm(xd, W["down"].t(), out=y["down"])
+        qg = q[e0:e1]
+        fout = torch.zeros((Eg, HQ, HD), dtype=bf, device=dev)
+        lg = slice_lists(lists, e0, e1)
+        cu = torch.arange(0, Eg + 1, R, dtype=torch.int32, device=dev)
+        seq = torch.zeros(Bg, dtype=torch.int32, device=dev)
+        Wt = FORK_ROWS * TOPK
+        tab = torch.zeros((HKV, Bg, Wt), dtype=torch.int32, device=dev)
+        ext = torch.zeros((HKV, Bg, Wt), dtype=torch.int32, device=dev)
+        ln = torch.zeros((HKV, Bg), dtype=torch.int32, device=dev)
+
+        def F():
+            FK.unified_attention(qg, ak, av, fout, cu, FORK_ROWS, seq, BS, HD ** -0.5, True, (-1, -1), tab, 0, None,
+                                 None, None, union_ext=ext, union_len=ln, cis_bias=ab, build_union=lg,
+                                 rows_per_q_block=FORK_ROWS, **FORK_LAUNCH)
+        iw, is_ = ids_w[:, b0:b1].contiguous(), ids_s[:, b0:b1].contiguous()
+        hkg, hvg, cg = hk[b0:b1], hv[b0:b1], cis[b0:b1]
+        wk = torch.zeros((Bg, TOPK * BS, HKV, HD), dtype=bf, device=dev)
+        wv, wb = torch.zeros_like(wk), torch.zeros((Bg, TOPK * BS, HKV), dtype=bf, device=dev)
+        sk = torch.zeros((Bg, X_STORE * BS, HKV, HD), dtype=bf, device=dev)
+        sv, sb = torch.zeros_like(sk), torch.zeros((Bg, X_STORE * BS, HKV), dtype=bf, device=dev)
+
+        def G():
+            flash_h2d_from_mask(wk, hkg, iw, BS)
+            flash_h2d_from_mask_bias(wv, hvg, wb, cg, iw, BS)
+            flash_h2d_from_mask(sk, hkg, is_, BS)
+            flash_h2d_from_mask_bias(sv, hvg, sb, cg, is_, BS)
+        parts.update({"Aq" + tag: Aq, "Ar" + tag: Ar, "F" + tag: F, "G" + tag: G})
+        outputs.update({"Aq" + tag: [y["wqkv"]], "Ar" + tag: [y["wo"], y["gate_up"], y["down"]], "F" + tag: [fout],
+                        "G" + tag: [wk, wv, wb, sk, sv, sb]})
+        return ln, int((iw >= 0).sum()), int((is_ >= 0).sum())
+    ln, cw, cs = unit("", 0, B)
+    ln0, _, _ = unit("0", 0, B // 2)
+    ln1, _, _ = unit("1", B // 2, B)
+
+    def copier():
+        stage = torch.randint(0, 255, (nbytes,), dtype=torch.uint8, generator=g).pin_memory()
+        dst = torch.zeros((nbytes,), dtype=torch.uint8, device=dev)
+        return (lambda: dst.copy_(stage, non_blocking=True)), dst
+    parts["M"], m = copier()
+    parts["P"], p = copier()
+    outputs.update(M=[m], P=[p])
+    meta = dict(B=B, E=E, groups=[[0, B // 2], [B // 2, B]], NB_arena=NB, union=union, new_per_stream=per_stream,
+                new_win=nw, new_store=ns, bytes_per_layer=nbytes, ids_win=cw, ids_store=cs, ln=[ln, ln0, ln1],
+                gemm_flop_per_layer=sum(2 * E * N * K for _, N, K in GEMMS), seed=seed, legal=LEGAL)
     return parts, outputs, meta
 
 
@@ -387,33 +507,60 @@ def main(argv=None) -> int:
     props = torch.cuda.get_device_properties(0)
     for C, B in sorted(a.shapes.items(), key=lambda kv: -kv[0]):
         name = "C%d_B%d" % (C, B)
-        log("shape %s: NEW %s per (layer, KV head, request)" % (name, a.new_blocks[C]))
+        t0 = time.perf_counter()
+        free = torch.cuda.mem_get_info()[0]
+        need = need_bytes(B, a.union_pages)
+        if free < need:
+            gates.append(("%s-RUN" % name, True, False, "STOP: free %.2f GB below the need %.2f GB (MODEL)" % (
+                free / 1e9, need / 1e9)))
+            continue
+        log("shape %s: NEW %s per (layer, KV head, request); need %.2f GB of %.2f GB free" % (
+            name, a.new_blocks[C], need / 1e9, free / 1e9))
         try:
             with torch.inference_mode():
                 parts, outputs, meta = build_gpu(B, a.new_blocks[C], a.win_share, a.seed + C, a.union_pages)
-                times, eg = measure(dev, parts, outputs, a.layers, a.reps, a.warmup)
-                ln = meta.pop("ln")
-                u_ok = bool((ln == a.union_pages).all())
-                gates.append(("%s-UNION" % name, True, u_ok, "union_len min %d max %d (want %d at every (KV head, "
-                              "request))" % (int(ln.min()), int(ln.max()), a.union_pages)))
-            want = counts_per_layer(B, HKV, a.new_blocks[C], a.win_share)
-            gates.append(("%s-IDS" % name, True, (meta["ids_win"], meta["ids_store"]) == want,
-                          "NEW blocks per layer window %d store %d (want %s)" % (meta["ids_win"], meta["ids_store"],
-                                                                                  want)))
+                for p in ("F", "F0", "F1"):                            # build the union tables once
+                    parts[p]()
+                torch.cuda.synchronize()
+                lns = meta.pop("ln")
+                u_ok = all(bool((x == a.union_pages).all()) for x in lns)
+                gates.append(("%s-UNION" % name, True, u_ok, "union_len min %s max %s (want %d at every (KV head, "
+                              "request), full and both groups)" % ([int(x.min()) for x in lns],
+                                                                  [int(x.max()) for x in lns], a.union_pages)))
+                want = counts_per_layer(B, HKV, a.new_blocks[C], a.win_share)
+                i_ok = (meta["ids_win"], meta["ids_store"]) == want
+                gates.append(("%s-IDS" % name, True, i_ok, "NEW blocks per layer window %d store %d (want %s)" % (
+                    meta["ids_win"], meta["ids_store"], want)))
+                if not (u_ok and i_ok):
+                    gates.append(("%s-RUN" % name, True, False, "STOP: UNION or IDS failed before the timing"))
+                    continue
+                times, eg, stop = measure(dev, parts, outputs, a.layers, a.reps, a.warmup,
+                                          max_s=a.max_shape_s - (time.perf_counter() - t0))
+                same = {}
+                for p in ("Aq", "Ar", "F", "G"):                       # REPORT: the groups' bits = the full batch's
+                    same[p] = all(bool((bits(torch.cat((x0, x1), 0)) == bits(x)).all()) for x, x0, x1 in
+                                  zip(outputs[p], outputs[p + "0"], outputs[p + "1"]))
             gates.extend(("%s-%s" % (name, n), m, ok, d) for n, m, ok, d in eg)
+            wall = time.perf_counter() - t0
+            gates.append(("%s-BUDGET" % name, True, stop is None or not stop.startswith("wall"),
+                          "wall %.1f s (limit %.0f s); stop %s" % (wall, a.max_shape_s, stop)))
             s = summarize(times)
-            res[name] = dict(C=C, B=B, meta=meta, times_ms=times, summary=s)
-            gates.append(("%s-RUN" % name, True, True, "%d configurations x %d passes of %d layers" % (
-                len(CONFIGS), a.reps, a.layers)))
+            res[name] = dict(C=C, B=B, meta=meta, times_ms=times, summary=s, stop=stop, wall_s=round(wall, 1),
+                             groups_equal_full=same)
+            gates.append(("%s-RUN" % name, True, stop is None, "%d configurations x %d order-rotated passes of %d "
+                          "layers; stop %s" % (len(CONFIGS), a.reps, a.layers, stop)))
             del parts, outputs
             torch.cuda.empty_cache()
+            if stop is not None:
+                break
         except Exception as e:
             traceback.print_exc()
             gates.append(("%s-RUN" % name, True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+            break
     meta = dict(shapes=a.shapes, new_blocks=a.new_blocks, union_pages=a.union_pages, win_share=a.win_share,
-                layers=a.layers, reps=a.reps, warmup=a.warmup, seed=a.seed, gemms=GEMMS, fork_launch=FORK_LAUNCH,
-                row_shift=ROW_SHIFT, block_bytes=BLOCK_BYTES, nbh=NBH, configs=CONFIGS, rule=dict(reach=REACH,
-                                                                                               serial=SERIAL),
+                layers=a.layers, reps=a.reps, warmup=a.warmup, seed=a.seed, max_shape_s=a.max_shape_s, gemms=GEMMS,
+                fork_launch=FORK_LAUNCH, row_shift=ROW_SHIFT, block_bytes=BLOCK_BYTES, nbh=NBH, configs=CONFIGS,
+                legal=LEGAL, rules=dict(reach=REACH, serial=SERIAL, worth=WORTH, hidden=HIDDEN_OK, slow=SLOW_OK),
                 gpu=props.name, torch=torch.__version__, protocol_stamp=PROT.PROTOCOL_STAMP_RECON7,
                 base_commit=os.environ.get("BASE_COMMIT"))
     with open(os.path.join(a.out, "summary.json"), "w") as f:
@@ -423,12 +570,15 @@ def main(argv=None) -> int:
         print("GATE %-22s %s %s: %s" % (g[0], "MUST" if g[1] else "REPORT", "PASS" if g[2] else "FAIL", g[3]))
     for name, r in res.items():
         s = r["summary"]
-        print("R7 D1 %s: medians ms per pass of %d layers %s" % (name, a.layers, s["median_ms"]))
+        print("X1 %s medians ms per pass of %d layers: %s" % (name, a.layers, s["median_ms"]))
         for c, v in s["concurrent"].items():
-            print("R7 D1 %s %s: %s" % (name, c, v))
-        print("R7 D1 %s serial %s; interference A|M %s (model s %s); DECISION %s (rule: REACHABLE <= %.2f x max, "
-              "SERIAL >= %.2f x sum); bytes per layer %s" % (name, s["serial"], s["interference_AM"], MODEL_S,
-                                                             s["decision"], REACH, SERIAL, r["meta"]["bytes_per_layer"]))
+            print("X1 (a) CAPABILITY %s %s: %s" % (name, c, v))
+        print("X1 (a) CAPABILITY %s: serial %s; interference A|M %s (model s %s); DECISION %s" % (
+            name, s["serial"], s["interference_AM"], MODEL_S, s["capability"]))
+        for c, v in s["attainable"].items():
+            print("X1 (b) ATTAINABLE %s %s: %s" % (name, c, v))
+        print("X1 %s groups' outputs = the full batch's bits (REPORT) %s; wall %s s; stop %s" % (
+            name, r["groups_equal_full"], r["wall_s"], r["stop"]))
     nfail = sum(1 for g in gates if g[1] and not g[2])
     print("r2_recon7_streams: %d MUST gate(s) failed" % nfail)
     return min(nfail, 19)
