@@ -109,10 +109,21 @@ USABLE_GB = S4.USABLE_GB
 #     I4C2_ratio 0.6381 x (1.0055 .. 1.0245) = (0.6416, 0.6537) -> (0.638, 0.657)
 #     I4C2_eq True; I4C2_above_best True (central +1.4 %; the lower edge +0.55 % is inside the 0.6 % spread: weak)
 #     I4C2_peak_gb (77.60, 77.80); I4C2_pool_mb (60, 250); I4C2_capture_s (5.5, 10); I4C2_compile_s (5, 180)
-PRED_STAMP_I4C2 = None
+PRED_STAMP_I4C2 = "2026-10-30T04:10:18Z"
 PRED_KEYS = ("I4C2_joint_saving", "I4C2_joint_ratio", "I4C2_draft_ratio", "I4C2_vs_ref", "I4C2_vs_D", "I4C2_ratio",
              "I4C2_eq", "I4C2_above_best", "I4C2_peak_gb", "I4C2_pool_mb", "I4C2_capture_s", "I4C2_compile_s")
-PRED_I4C2_BY_B = {216: {k: None for k in PRED_KEYS}, 318: {k: None for k in PRED_KEYS}}
+# The lead's registration (before any I4CC cell ran): the builder's MODEL bands. I4C2_above_best at B 318 is None
+# (REPORT): the builder's lower edge lies inside the 0.6 % run spread, so a flag would be a coin flip.
+PRED_I4C2_BY_B = {
+    216: dict(I4C2_joint_saving=(3.0, 12.0), I4C2_joint_ratio=(0.939, 0.985), I4C2_draft_ratio=(0.99, 1.01),
+              I4C2_vs_ref=(1.008, 1.037), I4C2_vs_D=(1.044, 1.080), I4C2_ratio=(0.545, 0.565), I4C2_eq=True,
+              I4C2_above_best=True, I4C2_peak_gb=(83.85, 83.95), I4C2_pool_mb=(40, 130), I4C2_capture_s=(5.5, 10),
+              I4C2_compile_s=(5, 180)),
+    318: dict(I4C2_joint_saving=(3.0, 13.0), I4C2_joint_ratio=(0.963, 0.991), I4C2_draft_ratio=(0.99, 1.01),
+              I4C2_vs_ref=(1.005, 1.025), I4C2_vs_D=(1.066, 1.099), I4C2_ratio=(0.638, 0.657), I4C2_eq=True,
+              I4C2_above_best=None, I4C2_peak_gb=(77.60, 77.80), I4C2_pool_mb=(60, 250), I4C2_capture_s=(5.5, 10),
+              I4C2_compile_s=(5, 180)),
+}
 
 
 def log(msg):
