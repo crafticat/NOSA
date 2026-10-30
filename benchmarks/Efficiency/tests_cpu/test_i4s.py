@@ -72,6 +72,11 @@ LEVER_FILES = dict(
     I4H=(E_ + "r2_i4h_graph.py", E_ + "r2_i4h_cell.py", E_ + "r2_i4h_step.sh", T_ + "i4h_world.py", "docs/NOTES_i4h.md"))
 STACK_IMPORTS = {"torch", "r2_i4a_lean", "r2_i4d_keep", "r2_i4g_graph", "r2_i4h_graph", "r2_i4k_combo", "r2_i4u_hoist"}
 TIMING_KEYS = {"phases", "round_ms", "wall_s", "prelude_ms", "probe_wait_ms", "graph", "dgraph"}
+# I4CC (nosi-r2-i4cc: I4S 8f236f8 + the compiled arms): its files (its own Gate 0: tests_cpu/test_i4cc.py); I4S_LATER:
+# the later modules that name the I4S modules (scan (f) skips them)
+I4S_NEW = I4S_NEW + (E_ + "r2_i4cc_compile.py", E_ + "r2_i4cc_cell.py", E_ + "r2_i4cc_step.sh", T_ + "i4cc_world.py",
+                     T_ + "test_i4cc.py")                                                         # I4CC
+I4S_LATER = ("r2_i4cc_compile.py", "r2_i4cc_cell.py")                                            # I4CC
 
 
 class Evidence(UserWarning):
@@ -166,7 +171,7 @@ def test_i4s_gate0_files():
         text = (EFF / name).read_text()
         assert "triton" not in text and "load_inline" not in text and "cpp_extension" not in text, name
     for p in list((ROOT / "nosi/nosi").glob("*.py")) + list(EFF.glob("*.py")):     # (f) nobody else names it
-        if p.name.startswith("r2_i4s_"):
+        if p.name.startswith("r2_i4s_") or p.name in I4S_LATER:
             continue
         assert "r2_i4s" not in p.read_text(), p.name
 

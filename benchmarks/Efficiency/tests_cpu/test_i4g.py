@@ -78,6 +78,10 @@ I4G_NEW = I4G_NEW + ("benchmarks/Efficiency/r2_i4u_hoist.py", "benchmarks/Effici
                      "benchmarks/Efficiency/r2_i4s_stack.py", "benchmarks/Efficiency/r2_i4s_cell.py",
                      "benchmarks/Efficiency/r2_i4s_step.sh", T_ + "i4s_world.py", T_ + "test_i4s.py")    # I4S
 I4G_LATER = I4G_LATER + ("r2_i4u_hoist.py", "r2_i4s_stack.py", "r2_i4s_cell.py")                 # I4S
+# I4CC (nosi-r2-i4cc: I4S 8f236f8 + the compiled arms): its files (its own Gate 0: tests_cpu/test_i4cc.py); its modules
+# name the I4S modules only
+I4G_NEW = I4G_NEW + ("benchmarks/Efficiency/r2_i4cc_compile.py", "benchmarks/Efficiency/r2_i4cc_cell.py",
+                     "benchmarks/Efficiency/r2_i4cc_step.sh", T_ + "i4cc_world.py", T_ + "test_i4cc.py")  # I4CC
 
 
 def _load(name, path=None):

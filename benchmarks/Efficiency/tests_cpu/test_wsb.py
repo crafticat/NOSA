@@ -120,6 +120,10 @@ DECLARED = DECLARED + ("benchmarks/Efficiency/r2_i4h_graph.py", "benchmarks/Effi
 DECLARED = DECLARED + ("benchmarks/Efficiency/r2_i4s_stack.py", "benchmarks/Efficiency/r2_i4s_cell.py",
                        "benchmarks/Efficiency/r2_i4s_step.sh", "benchmarks/Efficiency/tests_cpu/i4s_world.py",
                        "benchmarks/Efficiency/tests_cpu/test_i4s.py")                                     # I4S
+# I4CC (nosi-r2-i4cc: I4S 8f236f8 + the compiled arms): its files (its own Gate 0: tests_cpu/test_i4cc.py)
+DECLARED = DECLARED + ("benchmarks/Efficiency/r2_i4cc_compile.py", "benchmarks/Efficiency/r2_i4cc_cell.py",
+                       "benchmarks/Efficiency/r2_i4cc_step.sh", "benchmarks/Efficiency/tests_cpu/i4cc_world.py",
+                       "benchmarks/Efficiency/tests_cpu/test_i4cc.py")                                    # I4CC
 
 
 def _load(name):
