@@ -830,3 +830,13 @@ def test_notes_recon7():
                  "r7mem", "falsifier", "decides", "MEASURED", "MODEL", "drain", "PEQ", "D1", "D2", "D3", "D5", "D6",
                  "D7", "GPU only"):
         assert word in doc, word
+    x1 = doc[doc.index("## X1 protocol (about 5 min)"):doc.index("## 3. THE GPU PROTOCOL")]
+    S = _mod("r2_recon7_streams")
+    for word in ("2195630", "nova05", "STEP_MIN 15", "--mem=64G", "--cpus-per-task=16", "crafticat/NOSA", "r2-recon7",
+                 "MATCHED CONTROL", "ORDER-ROTATED", "CANNOT", "STOP CRITERIA", "FALSIFIERS", "DECISION RULES",
+                 "Duplicate-work evidence", "Output bound", FORK_BLOB, "--seed 7", "--max-shape-s 240", "--reps 10",
+                 "--warmup 2", "WINF", "GRP-SER", "PF-SER", "intra-kernel", "lifetimes"):
+        assert word in x1, word
+    for c in ("GRP", "GRPL", "PF"):                                    # every legal schedule and its control
+        assert "| %s |" % c in x1 and S.CONTROL_OF[c] in x1, c
+    assert re.search(r"code commit \| `[0-9a-f]{40}`", x1) and re.search(r"sha256 `[0-9a-f]{64}`", x1)

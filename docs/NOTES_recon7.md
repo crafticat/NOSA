@@ -42,6 +42,132 @@ gate proves it for the probed arms).
 Not built here: R2 D2 (ncu on one fork launch: a tool run, not a cell), R2 D4 (a CPU read of job 2175791), R3 D1b (the
 ladder at C 81 B 287: an arm run after r7mem shows the fit).
 
+## X1 protocol (about 5 min)
+
+The SMALLEST discriminator, asked for before anything else. X1 = step cell `r7s` = `benchmarks/Efficiency/r2_recon7_streams.py`.
+No model, no arm, one GPU step of about 5 min (hard wall 15 min). Only this cell is proposed here; the rest of section 3
+is NOT asked for.
+
+### X1.1 The two questions
+
+(a) HARDWARE CONCURRENCY CAPABILITY: can independent dense GEMM work (A = Aq + Ar), the fork attention (F), the zero-copy
+H2D gather kernels (G) and a copy-engine H2D (M) run at the same time on this A100 at our shapes? Configurations: alone A,
+F, G, M, P, FG; serial SER; concurrent A|F, A|G, A|M, F|M, A|FG, A|F|M (no dependency between the streams).
+
+(b) ATTAINABLE END-TO-END OVERLAP under the joint pass's REAL dependencies. Inside a layer QKV -> (selection) -> fetch
+-> attention -> MLP depend on each other and do NOT overlap; the same rows' next layer depends on this layer's output and
+does NOT overlap either. Only these LEGAL PAIRS overlap, each against a MATCHED CONTROL (the same ops, serial, one
+stream, the same inputs):
+
+| schedule | streams (per layer, in this order) | matched control | buffer lifetimes (what the two sides share) | work counted once? |
+|---|---|---|---|---|
+| GRP | stream 1: Aq0, G0, F0, Ar0 (requests 0 .. B/2 - 1); stream 2: Aq1, G1, F1, Ar1 (requests B/2 .. B - 1) | GRP-SER: Aq0 .. Ar0, Aq1 .. Ar1 on one stream | group g's rows of x / q / k / v, its fork lists and union tables, its gather destinations: written and read by group g's stream only, from its QKV GEMM to its MLP output; shared READ-ONLY: the weights, the KV arena (disjoint pages per request), the pinned host KV (disjoint requests) | NO: each group's GEMMs read all the weights (4 x 474 MB per layer pair instead of 2 x): the split cost = GRP-SER - SER, reported; the NET = SER - GRP counts the shared weight reads once |
+| GRPL | as GRP, both streams join after every layer (lock-step) | GRP-SER | as GRP | as GRP |
+| PF | stream 1: the full chain Aq, G, F, Ar; stream 2: P = a NEXT-round prefetch of the same bytes as G (copy engine) | PF-SER: Aq, G, F, Ar, P on one stream | P's pinned staging and its device buffer: written during layer l of round t, first read by the joint pass of round t + 1; never read or written by this pass's chain (own allocation: no read-after-write or write-after-read hazard) | yes (P is extra transfer, not shared) |
+| WINF | window attention beside the selected-block fetch | - | window pages (resident, read) vs store slots (written): disjoint | NOT MEASURED: the shipped fork's 2D launch writes the normalised output only (no log-sum-exp, fork :1060-1063), so a window part cannot be merged with a fetched part without a kernel change or a not-bit-equal split |
+
+The drafts' fetch beside the joint pass's dense work (the reviewer's third example) IS schedule PF: the draft rows'
+misses are fetched for the NEXT round while this round's chain runs. Selection, the residency, the twin step and the norms
+are NOT replayed: (b) bounds the overlap of the replayed parts only.
+
+### X1.2 What each mode can and cannot show
+
+- (a) CAN show whether the GPU runs these kernels and the copy engine concurrently at our shapes (SM sharing between a
+  compute-bound GEMM and a memory-bound fork / gather; copy-engine bandwidth beside kernels; the interference A|M
+  against the model's s = 8.685 %). It CANNOT show any overlap INSIDE one kernel (e.g. a fork that overlaps its own page
+  loads with its math is invisible to stream concurrency), and it CANNOT say whether the joint pass can use the
+  overlap: its streams have no data dependency (an UPPER BOUND).
+- (b) CAN show the overlap that the named legal schedules get with the real per-layer order, the real request-group
+  independence and the measured byte volumes, and their costs (the groups' doubled weight reads). It CANNOT show the
+  cost of the parts it does not replay (selection, residency, twin, norms, graph launches), the real miss pattern
+  (synthetic ids, uniform per (KV head, request)), skew between groups, WINF, or a schedule not listed.
+- Neither mode measures the model's max(HBM, dense) directly: (a) bounds what the hardware allows; (b) bounds what the
+  listed schedules attain.
+
+### X1.3 Pins
+
+| pin | value |
+|---|---|
+| repository | crafticat/NOSA (git remote `fork` of `/mnt/beegfs/ojerbi/nosi-r2-recon7`), branch `r2-recon7`; NOT pushed by the builder (no push in this role) |
+| code commit | `3432876b13fd995a7a56c6e22d3346fb2271ba66` (parent `8d7dab89d0df8d5298805626275e52ef0530c1a9`) |
+| run commit (`--nosi`) | the APPROVER's stamp commit S on top of the commit that adds this section; precondition: `git -C /mnt/beegfs/ojerbi/nosi-r2-recon7 diff --name-only 3432876b13fd995a7a56c6e22d3346fb2271ba66 S` lists only `benchmarks/Efficiency/r2_recon7_protocol.py` and `docs/NOTES_recon7.md`, and the protocol file's diff is the one stamp line |
+| step script | `benchmarks/Efficiency/r2_recon7_step.sh` sha256 `398d9b03b8109f7ef9192a0fa117f51a57d11cef185a77f78ab37577ff6137df`, git blob `ccacbdcd9d846e269e13d8d0224e6f41f8d5f0fb` (the script refuses to run unless it is that blob at S) |
+| cell | `benchmarks/Efficiency/r2_recon7_streams.py` sha256 `2fe8eacea913061a6ee67d4e8cbc8ed5f6191708663e23352064aa1cda06e6d5`, blob `bda689962157cb1a4c057b9c4c322960c8e74520` |
+| fork kernel | `benchmarks/Efficiency/fork_vllm_unified_attention.py` blob `f0dc0c183a388585e216505a6bbfc696531e8add` (fia6; sha256 `2fdbd75c4e7a6bf07ca543a3fc6a38c921e7e92ddf41f0147a765250ba80d07c`; the step script checks the blob) |
+| gathers | `nosi/nosi/flash_cache_engine/flash_h2d_mask.py` blob `f76b4f61b754adcc7cdc8eaeb22e1e96c0b74b0d`, `flash_h2d_mask_bias.py` blob `1e3630b87b84c658115aa1bd25c69c5afb03aa0e` |
+| image | `/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif` sha256 `14bfb15e1258821e637b5936f2060d7c7c2be20410fdee2a54ee0ffef754734a` |
+| shapes | C 128: B 216, E = 4 B = 864 rows; C 73: B 318, E = 1,272 rows (run in this order); GEMMs wqkv 4608 x 4096, wo 4096 x 4096, gate_up 32768 x 4096, down 4096 x 16384 (bf16); fork: Hq 32, Hkv 2, D 128, 4 rows per request, 64 pages per row, row shifts (0, 3, 5, 8), union 72, last_len 40 + r, FORK_LAUNCH num_warps 4, num_stages 3, tile_size 64; gathers: 1.226 / 5.0 NEW blocks per (layer, KV head, request) (MEASURED kv_at_verify, RECON7_R2_joint.md section 2.1) = 530 / 3,180 per layer (window 265 / 1,590, store 265 / 1,590), 17,434,880 / 104,609,280 B per layer; 16 host blocks per request; groups: requests [0, B/2) and [B/2, B) |
+| seeds | `--seed 7`; shape seed = 7 + C (135 for C 128, 80 for C 73); ids seeds shape seed + 1 .. + 4; inputs: torch CPU generator, N(0, 1) x 0.05 in bf16 |
+| passes | 32 layers per pass; 2 warm-up passes of every configuration, then 10 ORDER-ROTATED passes (pass r starts at configuration r mod 18; lesson L62) |
+
+### X1.4 Command and resources
+
+```
+cd /mnt/beegfs/ojerbi/nosi-r2-recon7
+DRYRUN=1 bash benchmarks/Efficiency/r2_recon7_step.sh --nosi <S> 2195630 x1a r7s     # pins + the command; no launch
+bash benchmarks/Efficiency/r2_recon7_step.sh --nosi <S> 2195630 x1a r7s
+```
+
+The step expands to `srun --jobid=2195630 --job-name=recon7-r7s-x1a-2195630 --ntasks=1 --cpus-per-task=16 --mem=64G
+--gres=gpu:a100:1 --time=15 --export=NONE` (inside `timeout 960`), apptainer with the pinned image, and
+`/venv/nosa/bin/python <tree>/benchmarks/Efficiency/r2_recon7_streams.py --out
+/mnt/beegfs/ojerbi/r2-runs/spec/recon7_x1a_2195630_r7s --shapes 128:216,73:318 --new-blocks 128:1.226,73:5.0
+--union-pages 72 --win-share 0.5 --layers 32 --reps 10 --warmup 2 --seed 7 --max-shape-s 240`.
+
+- GPU: ONE A100, holder SLURM job 2195630 (nova05, GPU uuid f31fc723-9dfe-407a-9947-28173556232a from
+  `/mnt/beegfs/ojerbi/kstep-cpu-runs/holders/2195630.gpu_uuid`). (2195631 on nova07 is the other holder; X1 does not
+  use it.) The step script checks the visible GPU uuid and needs at least STEP_MIN x 60 + 600 = 1,500 s left on the holder.
+- Hard wall time: STEP_MIN 15 (srun --time=15; host timeout 960 s); each shape stops itself at 240 s.
+- Device memory (MODEL, `need_bytes`): 13.9 GB (C 128) and 19.8 GB (C 73), one shape at a time; the cell stops a
+  shape when free memory is below it. Host: 16 cpus, 64G; pinned host buffers below 0.6 GB.
+- Output bound (MODEL, at most 60 MB): `/mnt/beegfs/ojerbi/r2-runs/spec/recon7_x1a_2195630_r7s/summary.json` (2 shapes x
+  18 configurations x 10 passes plus the meta: below 0.2 MB); the step record `.../recon7_x1a_2195630_r7s.step/`
+  (command, stdout, stderr, exit, sacct: below 1 MB); the cold Triton cache of the fork and the two gather kernels in
+  `/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_jit/recon7_x1a_2195630_r7s/` (below 50 MB); the empty JIT directory
+  `/mnt/beegfs/ojerbi/nosa-env/jit/recon7_x1a_2195630_r7s/`. Nothing else is written.
+
+### X1.5 Duplicate-work evidence
+
+No earlier run of this harness exists (checked 2026-10-30T18:47Z, `date -u`): `ls` of every directory under
+`/mnt/beegfs/ojerbi/r2-runs/` (41 directories), filtered for recon7 / stream / concur / x1 / r7s: 16 names (8 runs
+with their `.step` records) matched, all run ids of other cells (`sg5_x1_2190876_x1` launched `r2_tick_sg5.py`;
+`sp_x13b`, `sp_x1m` launched `r2_spec_cell.py`; `sp_x173_*`, `mbs_o2x128_*` launched `r2_base_cell.py`: the
+`Efficiency/*.py` name in their `command.txt`; `sg5_bgb_*` and `sg5_bgbr_*` matched on the batch name "x1344"); `grep -l
+recon7 */*.step/command.txt` under `/mnt/beegfs/ojerbi/r2-runs`: 0 files (no step record of any run names a RECON7
+file). The R2 traces (one
+dependent stream: 0.000 ms concurrency) cannot answer either question.
+
+### X1.6 MUST gates, decision rules, falsifiers, stop criteria (fixed before the run)
+
+MUST GATES (any failure: decide nothing from the run): `<shape>-UNION` (the fork's union_len = 72 at every (KV head,
+request), full batch and both groups); `<shape>-IDS` (the NEW blocks per layer as above); `<shape>-<config>-EXACT` for
+all 18 configurations (every part's output bits after the configuration's last pass = that part's reference run alone:
+concurrent = matched serial control = alone, bit for bit); `<shape>-BUDGET` (the shape finished inside 240 s);
+`<shape>-RUN`.
+MATCHED CONTROLS: SER for (a)'s sums; GRP-SER for GRP and GRPL; PF-SER for PF; the same ops, inputs and process,
+order-rotated (pass r starts at configuration r mod 18).
+DECISION RULES (REPORT values, the rule fixed now):
+- (a) REACHABLE when T(A|F|M) <= 1.10 x max(A, F, M); SERIAL when T(A|F|M) >= 0.90 x (A + F + M); PARTIAL otherwise
+  (eff = (sum - T) / (sum - max) printed for every concurrent set).
+- (b) GRP / GRPL WORTH BUILDING when the NET saving (SER - T) >= 5 % of SER (the shared weight reads counted once);
+  PF HIDES THE TRANSFER when hidden = (SER + P - PF) / P >= 0.80 and the chain slowdown PF / SER - 1 <= 5 %.
+FALSIFIERS: (a) SERIAL at both shapes falsifies "the max() overlap exists on this hardware for these kernels" (the
+model's max(HBM, dense) is then not reachable by concurrency); (a) REACHABLE with (b) GRP and PF both not worth building
+falsifies "the gap is a scheduling question for these pairs" (the overlap exists but the dependencies do not let these
+schedules use it); a control that is not about the sum of its parts (GRP-SER vs Aq0 .. Ar1 alone; PF-SER vs SER + P
+within 5 %) makes that schedule's numbers suspect (reported).
+STOP CRITERIA (the cell aborts the rest of the shape and the run, the record says why): free device memory below the
+need; UNION or IDS failure (before any timing); an EXACT failure; the shape's wall clock above 240 s; an exception. The
+step script aborts before the launch on any pin mismatch, a busy holder, less than 1,500 s left, or the stamp None.
+
+### X1.7 What the result can and cannot decide
+
+- CAN decide: whether hardware concurrency for these kernels exists at our shapes (R2 D1, first half); for GRP / GRPL /
+  PF, whether that schedule is worth building on the replayed parts; whether copy-engine H2D beside the chain costs more
+  than the model's 8.685 %.
+- CANNOT decide: the end-to-end speedup of the joint pass (the unreplayed parts and the real misses are missing); any
+  intra-kernel overlap; WINF; whether the model's other assumptions hold; anything about the drafts' compute.
+
 ## 3. THE GPU PROTOCOL (for review; nothing runs before the human sets PROTOCOL_STAMP_RECON7)
 
 Each subsection states what the run decides, its expected duration (STEP_MIN and its basis), its gates and its
@@ -122,6 +248,10 @@ graphs is not available. -COUNT fails: D2 / D3 have no sample. -MARKS-NEUTRAL fa
 the steady set.
 
 ### 3.2 Cell (b): r7s (`r2_recon7_streams.py`)
+
+SUPERSEDED for the run by section "X1 protocol (about 5 min)" above (the refined cell: capability and attainable
+overlap, matched controls, order rotation, STEP_MIN 15, --reps 10 --warmup 2). The text below is the first version's
+summary, kept for the record.
 
 Parts (one layer; replayed 32 times = one pass; synthetic inputs of the MEASURED shapes, C 128 B 216 and C 73 B 318):
 A = the four dense GEMMs at M = 4 B (cuBLAS: wqkv 4608 x 4096, wo, gate_up 32768 x 4096, down 4096 x 16384); F = ONE
