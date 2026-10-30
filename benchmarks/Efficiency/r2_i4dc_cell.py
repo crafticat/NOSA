@@ -118,10 +118,21 @@ USABLE_GB = CCC.USABLE_GB
 #     I4DC_ratio 0.6534 x (1.006 .. 1.020) = (0.6573, 0.6665) -> (0.655, 0.669)
 #     I4DC_eq True; I4DC_above_best: the lower edge +0.6 % equals the 0.6 % spread (the builder suggests None, REPORT)
 #     I4DC_peak_gb (77.60, 77.80); I4DC_pool_mb (60, 250); I4DC_capture_s (6, 13); I4DC_compile_s (1, 30)
-PRED_STAMP_I4DC = None
+PRED_STAMP_I4DC = "2026-10-30T07:27:31Z"
 PRED_KEYS = ("I4DC_draft_saving", "I4DC_draft_ratio", "I4DC_joint_ratio", "I4DC_vs_ref", "I4DC_vs_D", "I4DC_ratio",
              "I4DC_eq", "I4DC_above_best", "I4DC_peak_gb", "I4DC_pool_mb", "I4DC_capture_s", "I4DC_compile_s")
-PRED_I4DC_BY_B = {216: {k: None for k in PRED_KEYS}, 318: {k: None for k in PRED_KEYS}}
+# The lead's registration (before any I4DC cell ran): the builder's MODEL bands. I4DC_above_best at B 318 is None
+# (REPORT): the band's lower edge equals the run spread.
+PRED_I4DC_BY_B = {
+    216: dict(I4DC_draft_saving=(3.0, 8.0), I4DC_draft_ratio=(0.942, 0.978), I4DC_joint_ratio=(0.99, 1.01),
+              I4DC_vs_ref=(1.008, 1.026), I4DC_vs_D=(1.079, 1.106), I4DC_ratio=(0.564, 0.578), I4DC_eq=True,
+              I4DC_above_best=True, I4DC_peak_gb=(83.85, 83.95), I4DC_pool_mb=(40, 130), I4DC_capture_s=(6, 13),
+              I4DC_compile_s=(1, 30)),
+    318: dict(I4DC_draft_saving=(4.0, 10.0), I4DC_draft_ratio=(0.946, 0.978), I4DC_joint_ratio=(0.99, 1.01),
+              I4DC_vs_ref=(1.006, 1.020), I4DC_vs_D=(1.093, 1.119), I4DC_ratio=(0.655, 0.669), I4DC_eq=True,
+              I4DC_above_best=None, I4DC_peak_gb=(77.60, 77.80), I4DC_pool_mb=(60, 250), I4DC_capture_s=(6, 13),
+              I4DC_compile_s=(1, 30)),
+}
 
 
 def log(msg):
