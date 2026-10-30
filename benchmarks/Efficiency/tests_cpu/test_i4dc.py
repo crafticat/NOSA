@@ -65,6 +65,14 @@ I4DC_EDITED = {T_ + "test_i4cc.py": "test_i4cc_gate0_files"}
 I4CC_FILES = (E_ + "r2_i4cc_compile.py", E_ + "r2_i4cc_cell.py", E_ + "r2_i4cc_step.sh", T_ + "i4cc_world.py")
 COMPILE_IMPORTS = {"torch", "time", "r2_i4cc_compile"}
 HAND_KERNEL = ("import triton", "@triton.jit", "triton.jit", "load_inline", "cpp_extension", "tl.load", "tl.store")
+# RECON7 (nosi-r2-recon7: I4DC 2e9e497 + the measurement cells of the reconciliation): its files and its byte copies
+# (its own Gate 0: tests_cpu/test_recon7.py); I4DC_LATER: its modules import the I4DC cell (scan (e) skips them)
+I4DC_NEW = I4DC_NEW + (E_ + "r2_recon7_protocol.py", E_ + "r2_recon7_probe.py", E_ + "r2_recon7_cell.py",
+                       E_ + "r2_recon7_streams.py", E_ + "r2_recon7_mem.py", E_ + "r2_recon7_step.sh",
+                       E_ + "r2_i4c_cell.py", E_ + "r2_i4m_cell.py", E_ + "r2_wsm_cell.py", T_ + "test_recon7.py",
+                       "docs/NOTES_recon7.md")                                                    # RECON7
+I4DC_LATER = ("r2_recon7_protocol.py", "r2_recon7_probe.py", "r2_recon7_cell.py", "r2_recon7_streams.py",
+              "r2_recon7_mem.py", "r2_i4c_cell.py", "r2_i4m_cell.py", "r2_wsm_cell.py")           # RECON7
 
 
 class Evidence(UserWarning):
@@ -138,7 +146,7 @@ def test_i4dc_gate0_files():
         text = (EFF / name).read_text()
         assert not [w for w in HAND_KERNEL if w in text], (name, [w for w in HAND_KERNEL if w in text])
     for p in list((ROOT / "nosi/nosi").glob("*.py")) + list(EFF.glob("*.py")):     # (e) nobody else names it
-        if p.name.startswith("r2_i4dc_"):
+        if p.name.startswith("r2_i4dc_") or p.name in I4DC_LATER:
             continue
         assert "r2_i4dc" not in p.read_text(), p.name
 

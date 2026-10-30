@@ -122,6 +122,13 @@ I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_i4cc_compile.py", "benchmarks/E
 # I4DC (nosi-r2-i4dc: I4CC d75a946 + the compiled draft helpers): its files (its own Gate 0: tests_cpu/test_i4dc.py)
 I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_i4dc_compile.py", "benchmarks/Efficiency/r2_i4dc_cell.py",
                        "benchmarks/Efficiency/r2_i4dc_step.sh", T_ + "i4dc_world.py", T_ + "test_i4dc.py")  # I4DC
+# RECON7 (nosi-r2-recon7: I4DC 2e9e497 + the measurement cells of the reconciliation): its files and its byte copies
+# (its own Gate 0: tests_cpu/test_recon7.py)
+I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_recon7_protocol.py", "benchmarks/Efficiency/r2_recon7_probe.py",
+                       "benchmarks/Efficiency/r2_recon7_cell.py", "benchmarks/Efficiency/r2_recon7_streams.py",
+                       "benchmarks/Efficiency/r2_recon7_mem.py", "benchmarks/Efficiency/r2_recon7_step.sh",
+                       "benchmarks/Efficiency/r2_i4c_cell.py", "benchmarks/Efficiency/r2_i4m_cell.py",
+                       "benchmarks/Efficiency/r2_wsm_cell.py", T_ + "test_recon7.py", "docs/NOTES_recon7.md")  # RECON7
 SEAM_CHANGED = {"#0", "TentState._layer", "TentState._row", "TentRunner.__init__"}
 SEAM_ADDED = {"TentState._rows", "TentState._resid", "TentState._write", "TentRunner._joint_ops", "TentRunner._make_state"}
 

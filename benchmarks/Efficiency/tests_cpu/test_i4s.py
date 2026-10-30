@@ -82,6 +82,14 @@ I4S_LATER = ("r2_i4cc_compile.py", "r2_i4cc_cell.py")                           
 I4S_NEW = I4S_NEW + (E_ + "r2_i4dc_compile.py", E_ + "r2_i4dc_cell.py", E_ + "r2_i4dc_step.sh", T_ + "i4dc_world.py",
                      T_ + "test_i4dc.py")                                                         # I4DC
 I4S_LATER = I4S_LATER + ("r2_i4dc_compile.py", "r2_i4dc_cell.py")                                # I4DC
+# RECON7 (nosi-r2-recon7: I4DC 2e9e497 + the measurement cells of the reconciliation): its files and its byte copies
+# (its own Gate 0: tests_cpu/test_recon7.py); I4S_LATER: its modules cite the I4S modules (scan (f) skips them)
+I4S_NEW = I4S_NEW + (E_ + "r2_recon7_protocol.py", E_ + "r2_recon7_probe.py", E_ + "r2_recon7_cell.py",
+                     E_ + "r2_recon7_streams.py", E_ + "r2_recon7_mem.py", E_ + "r2_recon7_step.sh",
+                     E_ + "r2_i4c_cell.py", E_ + "r2_i4m_cell.py", E_ + "r2_wsm_cell.py", T_ + "test_recon7.py",
+                     "docs/NOTES_recon7.md")                                                      # RECON7
+I4S_LATER = I4S_LATER + ("r2_recon7_protocol.py", "r2_recon7_probe.py", "r2_recon7_cell.py", "r2_recon7_streams.py",
+                         "r2_recon7_mem.py", "r2_i4c_cell.py", "r2_i4m_cell.py", "r2_wsm_cell.py")   # RECON7
 
 
 class Evidence(UserWarning):

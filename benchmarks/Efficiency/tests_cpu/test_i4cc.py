@@ -66,6 +66,15 @@ HAND_KERNEL = ("import triton", "@triton.jit", "triton.jit", "load_inline", "cpp
 I4CC_NEW = I4CC_NEW + (E_ + "r2_i4dc_compile.py", E_ + "r2_i4dc_cell.py", E_ + "r2_i4dc_step.sh", T_ + "i4dc_world.py",
                        T_ + "test_i4dc.py")                                                       # I4DC
 I4CC_LATER = ("r2_i4dc_compile.py", "r2_i4dc_cell.py")                                          # I4DC
+# RECON7 (nosi-r2-recon7: I4DC 2e9e497 + the measurement cells of the reconciliation): its files and its byte copies
+# (its own Gate 0: tests_cpu/test_recon7.py); I4CC_LATER: its modules name the I4CC modules (scan (e) skips them)
+I4CC_NEW = I4CC_NEW + (E_ + "r2_recon7_protocol.py", E_ + "r2_recon7_probe.py", E_ + "r2_recon7_cell.py",
+                       E_ + "r2_recon7_streams.py", E_ + "r2_recon7_mem.py", E_ + "r2_recon7_step.sh",
+                       E_ + "r2_i4c_cell.py", E_ + "r2_i4m_cell.py", E_ + "r2_wsm_cell.py", T_ + "test_recon7.py",
+                       "docs/NOTES_recon7.md")                                                    # RECON7
+I4CC_LATER = I4CC_LATER + ("r2_recon7_protocol.py", "r2_recon7_probe.py", "r2_recon7_cell.py",
+                           "r2_recon7_streams.py", "r2_recon7_mem.py", "r2_i4c_cell.py", "r2_i4m_cell.py",
+                           "r2_wsm_cell.py")                                                      # RECON7
 
 
 class Evidence(UserWarning):

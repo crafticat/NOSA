@@ -83,6 +83,15 @@ I4H_NEW = I4H_NEW + ("benchmarks/Efficiency/r2_i4cc_compile.py", "benchmarks/Eff
 I4H_NEW = I4H_NEW + ("benchmarks/Efficiency/r2_i4dc_compile.py", "benchmarks/Efficiency/r2_i4dc_cell.py",
                      "benchmarks/Efficiency/r2_i4dc_step.sh", T_ + "i4dc_world.py", T_ + "test_i4dc.py")  # I4DC
 I4H_LATER = I4H_LATER + ("r2_i4dc_compile.py", "r2_i4dc_cell.py")                              # I4DC
+# RECON7 (nosi-r2-recon7: I4DC 2e9e497 + the measurement cells of the reconciliation): its files and its byte copies
+# (its own Gate 0: tests_cpu/test_recon7.py); I4H_LATER: its modules cite the I4H module's lines (scan (e) skips them)
+I4H_NEW = I4H_NEW + ("benchmarks/Efficiency/r2_recon7_protocol.py", "benchmarks/Efficiency/r2_recon7_probe.py",
+                     "benchmarks/Efficiency/r2_recon7_cell.py", "benchmarks/Efficiency/r2_recon7_streams.py",
+                     "benchmarks/Efficiency/r2_recon7_mem.py", "benchmarks/Efficiency/r2_recon7_step.sh",
+                     "benchmarks/Efficiency/r2_i4c_cell.py", "benchmarks/Efficiency/r2_i4m_cell.py",
+                     "benchmarks/Efficiency/r2_wsm_cell.py", T_ + "test_recon7.py", "docs/NOTES_recon7.md")  # RECON7
+I4H_LATER = I4H_LATER + ("r2_recon7_protocol.py", "r2_recon7_probe.py", "r2_recon7_cell.py", "r2_recon7_streams.py",
+                         "r2_recon7_mem.py", "r2_i4c_cell.py", "r2_i4m_cell.py", "r2_wsm_cell.py")       # RECON7
 
 
 def _load(name, path=None):
