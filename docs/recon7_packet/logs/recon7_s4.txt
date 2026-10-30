@@ -1,0 +1,107 @@
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+U - I = 8.969029018 groups; unit 2.097152 MB; extra bytes per request per cohort 18.8094 MB
+
+== 1. model columns with the author's inputs ==
+anc B287: td 68.9864 f 0.29290 extra 6.9446 GEMM(B) 22.6568 GEMM(3B) 58.3740 GEMM(4B) 77.8320 s 0.08685 r 10.72418
+   cohort HBM 213.9039 dense 126.3444 GPU 232.4806; transfer 173.0381 ms (6.4658 MB per request); interval 232.4806 (GPU binds); Q 3703.54; gain vs 3160.822684 +17.170 %
+   joint budget (REQ:40) 88.0680; per-pass reading 238.0232; overlap term td + extra - GEMM(B) 53.2743; serial form 134.3050
+   Q / strongest 3426.2 1.0809, 3410.1 1.0860
+c128 B216: td 54.8137 f 0.35500 extra 5.0333 GEMM(B) 18.3286 GEMM(3B) 45.1166 GEMM(4B) 58.5774 s 0.10577 r 10.13058
+   cohort HBM 169.4744 dense 100.1025 GPU 187.3990; transfer 62.0565 ms (2.9105 MB per request); interval 187.3990 (GPU binds); Q 3457.86; gain vs 3160.822684 +9.398 %
+   joint budget (REQ:40) 70.1555; per-pass reading 191.3777; overlap term td + extra - GEMM(B) 41.5184; serial form 104.9636
+   Q / strongest 3426.2 1.0092, 3410.1 1.0140
+c73 B318: td 75.2948 f 0.27212 extra 7.8025 GEMM(B) 25.2865 GEMM(3B) 64.6792 GEMM(4B) 86.2389 s 0.07859 r 10.98336
+   cohort HBM 233.6869 dense 140.5386 GPU 252.0512; transfer 263.4075 ms (9.0978 MB per request); interval 263.4075 (TRANSFER binds); Q 3621.76; gain vs 3160.822684 +14.583 %
+   joint budget (REQ:40) 97.0356; per-pass reading 259.4594; overlap term td + extra - GEMM(B) 57.8108; serial form 147.7765
+   Q / strongest 3426.2 1.0571, 3410.1 1.0621
+
+== 2. memory with the author's rule (decimal GB; aliased retention: no copied union) ==
+state_MB 0.417792; landing 0.051118 GB
+anc C81 B287: backbone 72.118853 + const + slots 10.876207 + per-request 0.591964 + landing -> total 83.765544 GB; largest B under 84.0: 287.95
+   snapshot at B 5.596252 GB; total without snapshot 78.169291; largest B without snapshot 312.73 (MODEL)
+   each 1 MB per request of copied union adds 0.2870 GB at this B
+c128 C128 B216: backbone 58.077741 + const + slots 29.559030 + per-request 0.090243 + landing -> total 87.905534 GB; largest B under 84.0: 204.11
+   snapshot at B 4.211814 GB; total without snapshot 83.693720; largest B without snapshot 216.99 (MODEL)
+   each 1 MB per request of copied union adds 0.2160 GB at this B
+c73 C73 B318: backbone 78.509947 + const + slots 6.694994 + per-request 1.835374 + landing -> total 87.218835 GB; largest B under 84.0: 304.18
+   snapshot at B 6.200725 GB; total without snapshot 81.018110; largest B without snapshot 331.97 (MODEL)
+   each 1 MB per request of copied union adds 0.3180 GB at this B
+our allocated peaks with prefill: C128 83.891 / 83.900; C73 77.685 / 77.694 (I3 / BEST); fit lines 19.020 + 0.30033 B, 19.020 + 0.18448 B
+
+== 3. measured bytes vs the author's traffic ==
+C128 all arms: ours 2.581 MB per request per round vs model 2.9105: x0.887
+C73 I3: ours 10.527 MB per request per round vs model 9.0978: x1.157
+C73 BEST keep + window: ours 8.065 MB per request per round vs model 9.0978: x0.886
+
+== 4. point 1: resource service per joint pass (MODEL floors; references named) ==
+C128: GEMM stage floor max(compute 43.67, weights 10.33) = 43.67 (measured 64.80); attention floor (logical bytes at the flash rate) 21.51 (measured fork 37.12); PCIe floor 22.12 (measured 21.30)
+   unmodelled stages measured (selection + tentative + small) 60.60
+   A dependent single schedule, floors + measured rest: 147.90 ms; B two-half cross-request split, ideal interleave, weights read twice, no fill: 104.27 ms; measured joint 207.38
+C73: GEMM stage floor max(compute 64.29, weights 10.22) = 64.29 (measured 79.88); attention floor (logical bytes at the flash rate) 31.34 (measured fork 52.16); PCIe floor 132.84 (measured 160.14)
+   unmodelled stages measured (selection + tentative + small) 75.69
+   A dependent single schedule, floors + measured rest: 304.15 ms; B two-half cross-request split, ideal interleave, weights read twice, no fill: 208.53 ms; measured joint 382.04
+
+== 5. point 3: capture amortization (V4; S3) ==
+C128: BEST with capture amortized over k runs: rate(k) = 110376 / (75.975 + 9.594 / k); break-even vs I3 (1394.0) at k = 2.99 runs; amortizing capture + prelude: k = 2.13
+   k 1: 1289.9 tok/s
+   k 2: 1366.5 tok/s
+   k 5: 1417.0 tok/s
+   k 10: 1434.7 tok/s
+C73: BEST with capture amortized over k runs: rate(k) = 162498 / (120.894 + 10.140 / k); break-even vs I3 (1272.8) at k = 1.50 runs; amortizing capture + prelude: k = 1.36
+   k 1: 1240.1 tok/s
+   k 2: 1290.0 tok/s
+   k 5: 1322.0 tok/s
+   k 10: 1333.0 tok/s
+
+== 6. point 4: dispatch shapes and draft accounting ==
+c128: model curve 3 GEMM(B) + GEMM(3B) 100.103 vs our shape 2 GEMM(B) + GEMM(4B) 95.235 (diff -4.868); measured device 2 x 19.785 + 64.800 = 104.370
+c73: model curve 3 GEMM(B) + GEMM(3B) 140.539 vs our shape 2 GEMM(B) + GEMM(4B) 136.812 (diff -3.727); measured device 2 x 25.705 + 79.879 = 131.289
+C128: p 0.02813; fixed-lead n = 3 + 3p = 3.0844 -> Y = 9 / n = 2.9179; empirical n = 3 + 5.1p = 3.1435 -> 2.8631; measured active-request 2.855; dropped drafts per reject 4 - n = 3.129 (model 1 + lag = 3)
+C73: p 0.04027; fixed-lead n = 3 + 3p = 3.1208 -> Y = 9 / n = 2.8839; empirical n = 3 + 5.1p = 3.2054 -> 2.8078; measured active-request 2.798; dropped drafts per reject 4 - n = 3.188 (model 1 + lag = 3)
+
+== 7. revised model at the anchor with interference charged ONCE: Vx = (R - removed) x (1 + s) ==
+anchor terms: td 68.9864; d I3 90.986, best 81.562 (alt 84.399); serial 134.305; body 17.459; dense_ex -6.984; attn 13.908 (fork 19.384); sel 22.550; tent 27.534; book 0.297; small 4.942; c 7.751 / 7.826; drain 11.742
+I3 code, 27.6 GB/s, Y 2.864 (exposed transfer 67.235 ms; joint 281.25)
+   R         470.97 ms: accepted 1745.3 (0.5094 / 0.5118); committed 1764.3 (0.5149 / 0.5174)
+   R + drain 482.71 ms: accepted 1702.8 (0.4970 / 0.4993); committed 1721.4 (0.5024 / 0.5048)
+   V1        438.80 ms: accepted 1873.2 (0.5467 / 0.5493); committed 1893.7 (0.5527 / 0.5553)
+   V2        380.90 ms: accepted 2158.0 (0.6298 / 0.6328); committed 2181.5 (0.6367 / 0.6397)
+   V3        359.83 ms: accepted 2284.3 (0.6667 / 0.6699); committed 2309.2 (0.6740 / 0.6772)
+I3 code, 22.0 GB/s, Y 2.808 (exposed transfer 84.350 ms; joint 298.36)
+   R         488.09 ms: accepted 1651.1 (0.4819 / 0.4842); committed 1669.5 (0.4873 / 0.4896)
+   R + drain 499.83 ms: accepted 1612.3 (0.4706 / 0.4728); committed 1630.3 (0.4758 / 0.4781)
+   V1        438.80 ms: accepted 1836.6 (0.5360 / 0.5386); committed 1857.0 (0.5420 / 0.5446)
+   V2        380.90 ms: accepted 2115.8 (0.6175 / 0.6204); committed 2139.3 (0.6244 / 0.6273)
+   V3        359.83 ms: accepted 2239.7 (0.6537 / 0.6568); committed 2264.6 (0.6610 / 0.6641)
+best code, d 81.56, 27.6 GB/s, Y 2.864 (exposed transfer 67.235 ms; joint 255.40)
+   R         426.35 ms: accepted 1927.9 (0.5627 / 0.5653); committed 1948.9 (0.5688 / 0.5715)
+   R + drain 438.10 ms: accepted 1876.2 (0.5476 / 0.5502); committed 1896.7 (0.5536 / 0.5562)
+   V1        390.31 ms: accepted 2105.9 (0.6147 / 0.6176); committed 2128.9 (0.6214 / 0.6243)
+   V2        332.41 ms: accepted 2472.8 (0.7217 / 0.7251); committed 2499.7 (0.7296 / 0.7330)
+   V3        311.34 ms: accepted 2640.1 (0.7706 / 0.7742); committed 2668.9 (0.7790 / 0.7826)
+best code, d 84.40, 22.0 GB/s, Y 2.808 (exposed transfer 84.350 ms; joint 272.52)
+   R         449.14 ms: accepted 1794.3 (0.5237 / 0.5262); committed 1814.3 (0.5295 / 0.5320)
+   R + drain 460.88 ms: accepted 1748.6 (0.5104 / 0.5128); committed 1768.0 (0.5160 / 0.5185)
+   V1        396.47 ms: accepted 2032.7 (0.5933 / 0.5961); committed 2055.3 (0.5999 / 0.6027)
+   V2        338.57 ms: accepted 2380.3 (0.6947 / 0.6980); committed 2406.8 (0.7025 / 0.7058)
+   V3        317.51 ms: accepted 2538.2 (0.7408 / 0.7443); committed 2566.4 (0.7491 / 0.7526)
+
+== 8. measured-config variants, interference once ==
+I3 C128: V1 382.12 ms Q 1635.1 (/strong 0.4795); V2 336.21 ms Q 1858.4 (/strong 0.5450); V3 318.96 ms Q 1958.9 (/strong 0.5744)
+I3 C73: V1 461.04 ms Q 1937.6 (/strong 0.5655); V2 398.69 ms Q 2240.6 (/strong 0.6540); V3 376.22 ms Q 2374.4 (/strong 0.6930)
+BEST C128: V1 336.85 ms Q 1855.7 (/strong 0.5416); V2 290.94 ms Q 2148.5 (/strong 0.6271); V3 273.69 ms Q 2284.0 (/strong 0.6666)
+BEST C73: V1 441.16 ms Q 2020.5 (/strong 0.5925); V2 378.81 ms Q 2353.0 (/strong 0.6900); V3 356.34 ms Q 2501.4 (/strong 0.7335)
+
+== 9. round vs model cohort with transfer binding at C73 ==
+I3 C128: round 365.423 - model interval 187.3990 = 178.024; draft - 2 max(td, G(B))(1 + s) +30.141; joint - joint budget +137.221; commit + reset +6.114; lending: per-pass - GPU +3.979; transfer binding: GPU - interval +0.000; round - phase sum +0.569; sum 178.024
+I3 C73: round 585.463 - model interval 263.4075 = 322.055; draft - 2 max(td, G(B))(1 + s) +32.126; joint - joint budget +285.005; commit + reset +8.466; lending: per-pass - GPU +7.408; transfer binding: GPU - interval -11.356; round - phase sum +0.406; sum 322.055
+BEST C128: round 324.883 - model interval 187.3990 = 137.484; draft - 2 max(td, G(B))(1 + s) +11.065; joint - joint budget +115.855; commit + reset +6.178; lending: per-pass - GPU +3.979; transfer binding: GPU - interval +0.000; round - phase sum +0.407; sum 137.484
+BEST C73: round 524.659 - model interval 263.4075 = 261.251; draft - 2 max(td, G(B))(1 + s) +14.013; joint - joint budget +241.925; commit + reset +8.546; lending: per-pass - GPU +7.408; transfer binding: GPU - interval -11.356; round - phase sum +0.715; sum 261.251

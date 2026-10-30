@@ -1,0 +1,45 @@
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+=== C81 B287 ===
+  td 68.9864 (interp 256-344); GEMM(B=287) 22.6568 (interp 256-320); GEMM(3B=861) 58.3740 (extrap GEMM(768) x M/768); GEMM(4B=1148) 77.8320 (extrap GEMM(768) x M/768)
+  model joint dense GEMM(B)+GEMM(3B) 81.0308; one call GEMM(4B) 77.8320; difference -3.1988
+  per-pass max: draft 68.9864; joint (model dense) 81.0308; joint (GEMM(4B)) 77.8320
+  round = 2 draft + joint, x(1+s=0.086846): model dense 238.0232; GEMM(4B) 234.5466
+  cohort max over whole cohort: HBM 213.9039; dense(model) 126.3444; dense(2GEMM(B)+GEMM(4B)) 123.1456; GPU 232.4806
+  rows per cohort: draft 861, verify 861, total 1722; weight passes 3; weight bytes read 3 x 15.768289 GB = 47.304867 GB
+  KV groups per request per cohort (model): draft 3 x 63 = 189, verifier extra U-I = 8.969029; total 197.969029
+  KV bytes per request per cohort (x 64 layer-heads x 32896 B): draft 397.9100 MB; verifier extra 18.8829 MB
+    yield 3.0: tokens per request per round; model GPU-bound rate at the cohort interval = 3703.54 tok/s
+    yield 2.8926: tokens per request per round; model GPU-bound rate at the cohort interval = 3570.95 tok/s
+    yield 2.8091: tokens per request per round; model GPU-bound rate at the cohort interval = 3467.87 tok/s
+=== C128 B216 ===
+  td 54.8137 (interp 128-256); GEMM(B=216) 18.3286 (interp 128-256); GEMM(3B=648) 45.1166 (interp 640-672); GEMM(4B=864) 58.5774 (extrap GEMM(768) x M/768)
+  model joint dense GEMM(B)+GEMM(3B) 63.4452; one call GEMM(4B) 58.5774; difference -4.8679
+  per-pass max: draft 54.8137; joint (model dense) 63.4452; joint (GEMM(4B)) 59.8470
+  round = 2 draft + joint, x(1+s=0.105766): model dense 191.3777; GEMM(4B) 187.3990
+  cohort max over whole cohort: HBM 169.4744; dense(model) 100.1025; dense(2GEMM(B)+GEMM(4B)) 95.2347; GPU 187.3990
+  rows per cohort: draft 648, verify 648, total 1296; weight passes 3; weight bytes read 3 x 15.768289 GB = 47.304867 GB
+  KV groups per request per cohort (model): draft 3 x 63 = 189, verifier extra U-I = 8.969029; total 197.969029
+  KV bytes per request per cohort (x 64 layer-heads x 32896 B): draft 397.9100 MB; verifier extra 18.8829 MB
+    yield 3.0: tokens per request per round; model GPU-bound rate at the cohort interval = 3457.86 tok/s
+    yield 2.8926: tokens per request per round; model GPU-bound rate at the cohort interval = 3334.07 tok/s
+    yield 2.8091: tokens per request per round; model GPU-bound rate at the cohort interval = 3237.83 tok/s
+=== C73 B318 ===
+  td 75.2948 (interp 256-344); GEMM(B=318) 25.2865 (interp 256-320); GEMM(3B=954) 64.6792 (extrap GEMM(768) x M/768); GEMM(4B=1272) 86.2389 (extrap GEMM(768) x M/768)
+  model joint dense GEMM(B)+GEMM(3B) 89.9657; one call GEMM(4B) 86.2389; difference -3.7268
+  per-pass max: draft 75.2948; joint (model dense) 89.9657; joint (GEMM(4B)) 86.2389
+  round = 2 draft + joint, x(1+s=0.078585): model dense 259.4594; GEMM(4B) 255.4397
+  cohort max over whole cohort: HBM 233.6869; dense(model) 140.5386; dense(2GEMM(B)+GEMM(4B)) 136.8119; GPU 252.0512
+  rows per cohort: draft 954, verify 954, total 1908; weight passes 3; weight bytes read 3 x 15.768289 GB = 47.304867 GB
+  KV groups per request per cohort (model): draft 3 x 63 = 189, verifier extra U-I = 8.969029; total 197.969029
+  KV bytes per request per cohort (x 64 layer-heads x 32896 B): draft 397.9100 MB; verifier extra 18.8829 MB
+    yield 3.0: tokens per request per round; model GPU-bound rate at the cohort interval = 3784.94 tok/s
+    yield 2.8926: tokens per request per round; model GPU-bound rate at the cohort interval = 3649.44 tok/s
+    yield 2.8091: tokens per request per round; model GPU-bound rate at the cohort interval = 3544.10 tok/s

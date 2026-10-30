@@ -1,0 +1,26 @@
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+== i4c_c4b_2195576_i4cb L4PTFDP probe_joint keys ['labels_median', 'lead_median', 'n', 'plan', 'plan_median', 'probe_joint', 'probe_joint_median', 'rounds', 'span_median', 'tail_median', 'total', 'total_median', 'uncovered_median']
+   total [369.0793, 374.0672, 374.1256, 397.6878, 392.9692, 391.0172, 389.9734, 397.3025, 368.8668, 247.8224, 232.9093]
+   finish rounds: min 170, 10% 174, median 180, max 208; rounds 209
+i4c_c4b_2195576_i4cb L4PTFD no probe_joint <class 'NoneType'>
+== i4c_e4a_2195576_i4ca L4PTFDP probe_joint keys ['labels_median', 'lead_median', 'n', 'plan', 'plan_median', 'probe_joint', 'probe_joint_median', 'rounds', 'span_median', 'tail_median', 'total', 'total_median', 'uncovered_median']
+   total [225.3742, 213.4456, 217.1392, 210.1473, 211.2922, 208.0958, 208.3004, 209.3112, 202.1249, 188.7349]
+   finish rounds: min 170, 10% 172, median 178, max 193; rounds 194
+i4c_e4a_2195576_i4ca L4PTFD no probe_joint <class 'NoneType'>
+== whole run vs steady (I3 arms and best arms)
+  i3_r4a_2195576_i3a L4PTF: committed 110376, wall_s 79.180, prelude_s 0.218, rounds 194, committed / wall 1394.0 (effective 1396.7), mean wall per round (wall - prelude) / G 407.021 ms, round_ms_median 365.423, steady_rounds 181, median tok/s 1709.8, effective / median 0.8169, capture_rounds None, phases_median_incl_capture None
+    accepted in rounds >= 170: 5567 of 109318 (5.09 %); rounds >= 170: 24 of 194
+  i3_r3b_2195575_i3b L4PTF: committed 162498, wall_s 127.667, prelude_s 0.285, rounds 209, committed / wall 1272.8 (effective 1275.3), mean wall per round (wall - prelude) / G 609.481 ms, round_ms_median 585.463, steady_rounds 195, median tok/s 1525.8, effective / median 0.8358, capture_rounds None, phases_median_incl_capture None
+    accepted in rounds >= 170: 11570 of 160248 (7.22 %); rounds >= 170: 39 of 209
+  i4dc_d3a_2195575_i4dca L4PTFDGUDCD: committed 110376, wall_s 85.569, prelude_s 2.457, rounds 194, committed / wall 1289.9 (effective 1292.4), mean wall per round (wall - prelude) / G 428.414 ms, round_ms_median 324.883, steady_rounds 180, median tok/s 1924.1, effective / median 0.6717, capture_rounds [[1, 9594.118]], phases_median_incl_capture {'commit': 6.053, 'draft': 132.271, 'joint': 186.026, 'reset': 0.12}
+    accepted in rounds >= 170: 5567 of 109318 (5.09 %); rounds >= 170: 24 of 194
+  i4dc_d4b_2195576_i4dcb L4PTFDGUDKWCD: committed 162498, wall_s 131.034, prelude_s 2.562, rounds 209, committed / wall 1240.1 (effective 1242.5), mean wall per round (wall - prelude) / G 614.698 ms, round_ms_median 524.659, steady_rounds 194, median tok/s 1699.0, effective / median 0.7313, capture_rounds [[1, 10140.224]], phases_median_incl_capture {'commit': 8.416, 'draft': 176.421, 'joint': 339.028, 'reset': 0.125}
+    accepted in rounds >= 170: 11570 of 160248 (7.22 %); rounds >= 170: 39 of 209

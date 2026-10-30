@@ -1,0 +1,44 @@
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+top keys ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+   CHECK.TFC.R 4
+   CHECK.TFC.facts.passes 32
+   CHECK.TFC.mem.arena.B 318
+   CHECK.TFC.meta.B 318
+   CHECK.TFC.meta.spec.B 318
+   CHECK.TFC.meta.spec.union.arena.B 318
+   CHECK.TFC.meta.spec.verify.B 318
+   CHECK.TFC.meta.spec.verify.E 1272
+   CHECK.TFC.meta.spec.verify.R 4
+   CHECK.TFC.meta.spec.verify.arena.B 318
+   CHECK.TFC.meta.spec.verify.ops.R 4
+   CHECK.TFC.opt.arm TFC
+   CHECK.TFC.opt.passes 32
+   CHECK.TFC.passes 32
+   CHECK.TFC.sel.compared 2605056
+   CHECK.TFC.stats.fork_loaded 47046615
+   CHECK.TFC.stats.passes 32
+   CHECK.TFC.stats.union_max 99
+   CHECK.TFC.stats.union_mean 71.17643075619104
+   CHECK.TFC.stats.union_samples 651264
+   CHECK.TFC.stats.union_sum 46354647
+   CHECK.TFC.stats.vb_rows 2605056
+   CHECK.TFC.stats.visible_blocks 166682880
+   CHECK.TFC.tent_calls.passes 32
+   CHECK.TFC.tent_calls.union_layers 1024
+   meta.batch 318
+   meta.capacity_C 73
+   meta.check_facts.passes 32
+fork_loaded [47046615] union_sum [46354647] samples [651264] visible [166682880] compared [2605056]
+fork_loaded / samples = 72.2389; union_sum / samples = 71.1764; diff per sample = 1.0625
+samples / (318 x 2) = 1024.00 (layer-passes)
+visible / compared = 63.9844
+model: 63 + U - I = 71.9690 ; U = 69.1629 ; I = 60.1939
+measured fork_loaded / model(63+U-I) = 1.0038; union_mean / model = 0.9890; fork_loaded / (64 + U - I) = 0.9900

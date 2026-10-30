@@ -1,0 +1,38 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+.....                                                                    [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_probe_equal[GUDCD]
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:276: Evidence: RECON7 PROBE GUDCD: rounds 30, profiled [8], counted [12]; windows 4; tap {'calls': 4, 'kinds': {'win': 2, 'store': 2, 'other': 0}, 'new_win': 40, 'new_store': 53, 'a_win': 17, 'a_store': 30, 'b_win': 18, 'st_max': 5}; union {'u_max': 75, 'layers': 2}; skips recorded 85; drain [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]; check-only differences ['edge_rows', 'fill_rows', 'forced']
+    _ev("RECON7 PROBE %s: rounds %d, profiled %s, counted %s; windows %d; tap %s; union %s; skips recorded %s; "
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_probe_equal[GUDKCD]
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:276: Evidence: RECON7 PROBE GUDKCD: rounds 30, profiled [8], counted [12]; windows 4; tap {'calls': 4, 'kinds': {'win': 2, 'store': 2, 'other': 0}, 'new_win': 7, 'new_store': 22, 'a_win': 1, 'a_store': 13, 'b_win': 3, 'st_max': 3}; union {'u_max': 75, 'layers': 2}; skips recorded 85; drain [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]; check-only differences ['edge_rows', 'fill_rows', 'forced']
+    _ev("RECON7 PROBE %s: rounds %d, profiled %s, counted %s; windows %d; tap %s; union %s; skips recorded %s; "
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_probe_gates
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:310: Evidence: RECON7 GATES (CPU): {'P-PROF-PATH': (True, 'profiled rounds [8] (done [8]); windows 4; skipped []; bad []'), 'P-MARKS-NEUTRAL': (True, '30 rounds, 7 probe; marked [4, 16, 20, 24, 28]; profiled [8]; counted [12]; recording [11] (in the exclusion [1, 4, 11]: True); steady round'), 'P-MARKS-SHAPE': (True, '5 marked joint passes of 25 marks each (L 2); bad []; 8 marked one-row replay passes of 9 marks; bad rounds []'), 'P-PHASE-SUM': (True, 'probe joint - mark total over 5 marked passes: median 0.2165, max 0.2743 ms (allowed 0 .. max(2.0 ms, 1 % of the probe joint)); out of bound'), 'P-COUNT': (True, 'counted rounds [12]; counted [12]; recorded [11]; bad []'), 'P-PROF': (False, 'profiled rounds [8] (done [8]); joint windows 0 (busy median None ms), busy / plain steady joint None; commit windows 1; draft busy per roun')}
+    _ev("RECON7 GATES (CPU): %s" % {k: (v[2], v[3][:140]) for k, v in gs.items()})
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_probe_plant
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:352: Evidence: RECON7 PLANT probe_computes: differs ['draft_skipped', 'fp_ok', 'round_accepted', 'round_blocks', 'round_committed', 'bb1']; PEQ False
+    _ev("RECON7 PLANT probe_computes: differs %s; PEQ %s" % (bad[:6], g[2]))
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_probe_statistic_fix
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:365: Evidence: RECON7 FIX (R2's C 73 probe joints): old median 374.6, drain-free 391.0, bias -16.4, excluded [176, 192, 208]
+    _ev("RECON7 FIX (R2's C 73 probe joints): old median %s, drain-free %s, bias %s, excluded %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_probe_statistic_fix
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:382: Evidence: RECON7 FIX (CPU run): drain rounds [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]; finished at round start {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0, 10: 0, 11: 0, 12: 0, 13: 0, 14: 0, 15: 0, 16: 0, 17: 0, 18: 2, 19: 2, 20: 4, 21: 4, 22: 4, 23: 6, 24: 6, 25: 6, 26: 6, 27: 7, 28: 7, 29: 7}
+    _ev("RECON7 FIX (CPU run): drain rounds %s; finished at round start %s" % (ev["probe"]["drain"], fin))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+5 passed, 10 deselected, 6 warnings in 559.88s (0:09:19)

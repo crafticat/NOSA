@@ -1,0 +1,19 @@
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+C128/B216: request-rounds 41904; corrections per request-round p_rr = 1058/41904 = 0.025248
+   accepted per request-round 2.608772; committed per request-round 2.634021; steady mean tokens per request-round 2.642954; median-round yield 2.8926
+   correction share of committed 0.009585
+   n old 3.050496; n corrected 3.075745; transfer (C81 bytes) x n/K: 141.3424 ms vs GPU 187.3990
+   model Q with Y = 3 at the model interval 3457.86; with Y = accepted per request-round 3006.93; with Y = median-round yield 3334.07
+C73/B318: request-rounds 66462; corrections per request-round p_rr = 2250/66462 = 0.033854
+   accepted per request-round 2.411122; committed per request-round 2.444976; steady mean tokens per request-round 2.452814; median-round yield 2.8091
+   correction share of committed 0.013846
+   n old 3.067708; n corrected 3.101562; transfer (C81 bytes) x n/K: 193.5420 ms vs GPU 252.0512
+   model Q with Y = 3 at the model interval 3784.94; with Y = accepted per request-round 3041.99; with Y = median-round yield 3544.10

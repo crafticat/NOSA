@@ -1,0 +1,26 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+..........                                                               [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_recon7_copies
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:168: Evidence: RECON7 COPIES: run_arm_r7 = run_arm_d + 5 R7 lines; probe_arm_r7 = probe_arm_x + 2 R7 lines
+    _ev("RECON7 COPIES: run_arm_r7 = run_arm_d + %d R7 lines; probe_arm_r7 = probe_arm_x + %d R7 lines" % (
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_streams_measure_plumbing
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:554: Evidence: RECON7 STREAMS (CPU plumbing): configurations 12; planted F -> EXACT fails in ['A|F-EXACT', 'A|FG-EXACT', 'A|F|M-EXACT', 'F-EXACT', 'FG-EXACT', 'F|M-EXACT', 'SER-EXACT']
+    _ev("RECON7 STREAMS (CPU plumbing): configurations %d; planted F -> EXACT fails in %s" % (len(gates), bad))
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_step_script_recon7
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:730: Evidence: RECON7 DRYRUN: 5 cells printed their step command; protocol approved False
+    _ev("RECON7 DRYRUN: %d cells printed their step command; protocol approved %s" % (len(CELLS), approved))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+10 passed, 5 deselected, 3 warnings in 7.87s

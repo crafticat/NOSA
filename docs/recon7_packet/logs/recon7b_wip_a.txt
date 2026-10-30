@@ -1,0 +1,203 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+.F..F..                                                                  [100%]
+=================================== FAILURES ===================================
+__________________________ test_skip_flags_synthetic ___________________________
+
+    def test_skip_flags_synthetic():
+        RP = _mod("r2_recon7_probe")
+        H, B, T, NB, Ls = 2, 3, 4, 10, 2
+        rec = RP.SkipRecord(Ls, NB)
+        lm = torch.tensor([[[3, -1, 5, 12], [1, 2, -1, -1], [-1, -1, -1, 7]],
+                           [[0, 4, -1, -1], [9, -1, -1, 6], [2, -1, -1, -1]]], dtype=torch.int64)
+        skip = torch.zeros((H, B, T), dtype=torch.bool)
+        skip[0, 0, 0] = skip[0, 0, 3] = skip[1, 1, 3] = True                # ids 3, 12 (out of range), 6
+        rec.reset(5, skip)
+        rec.record(1, lm, skip)
+        assert int(rec.n_skip) == 3 and int(rec.oor) == 1
+        assert bool(rec.blk[1, 0, 0, 3]) and bool(rec.blk[1, 1, 1, 6]) and int(rec.blk[1, :, :, :NB].sum()) == 2
+        assert rec.clr[1].sum() == 3 and bool(rec.clr[1, 0, 0, 0]) and not bool(rec.clr[1, 0, 0, 2])
+        lm2 = torch.full((H, B, T), -1, dtype=torch.int64)
+        lm2[0, 0, 0] = 8                                                   # a later load into the cleared slot (0, 0, 0)
+        rec.record(1, lm2, torch.zeros((H, B, T), dtype=torch.bool))
+        assert not bool(rec.clr[1, 0, 0, 0]) and rec.clr[1].sum() == 2 and int(rec.n_skip) == 3
+    
+        class Lay:
+            def __init__(self):
+                self.cache_engine = type("E", (), {})()
+                self.cache_engine._k_cpu = torch.zeros(4)
+                self.cache_engine._k_gpu = torch.zeros(4)
+    
+        lays = [Lay() for _ in range(Ls)]
+        rs = type("RS", (), {})()
+        rs.ops = type("O", (), {})()
+        calls = []
+        rs.ops.kernels = dict(gather_k=lambda g, c, i, bs: calls.append(1))
+        rs.cache = type("Cc", (), {})()
+        rs.cache.layers = lays
+        vs = type("VS", (), {})()
+        vs.ext_k = torch.zeros(4)
+        runner = type("R", (), {})()
+        runner.rs, runner.vs = rs, vs
+        runner.meter = _Meter([lay.cache_engine._k_cpu.data_ptr() for lay in lays])
+        tap = RP.GatherTap(runner, rec)
+        tap.attach()
+        e = lays[1].cache_engine
+        win = torch.full((H, B, T), -1, dtype=torch.int64)
+        win[0, 0, 0], win[0, 0, 2], win[1, 1, 3], win[1, 2, 1] = 3, 5, 6, 3   # 3 skipped at (0, 0); 6 skipped at (1, 1)
+        win[0, 0, 3] = 8                                                   # a cleared slot, a block no draft skipped
+        rs.ops.kernels["gather_k"](e._k_gpu, e._k_cpu, win, 64)            # window loads of layer 1
+        st = torch.full((H, B, 5), -1, dtype=torch.int64)
+        st[0, 0, 1], st[0, 0, 2], st[1, 2, 1] = 3, 9, 2
+        rs.ops.kernels["gather_k"](vs.ext_k, e._k_cpu, st, 64)             # a store fill of layer 1
+        runner.meter.on = False
+        rs.ops.kernels["gather_k"](e._k_gpu, e._k_cpu, win, 64)            # meter off: not counted
+>       tap.detach()
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py:439: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <r2_recon7_probe.GatherTap object at 0x7f12213fa6b0>
+
+    def detach(self) -> None:
+        if self.kern["gather_k"] is not self._gk:
+>           raise RuntimeError("GatherTap: gather_k is not the tap (another wrapper was installed over it)")
+E           RuntimeError: GatherTap: gather_k is not the tap (another wrapper was installed over it)
+
+benchmarks/Efficiency/r2_recon7_probe.py:442: RuntimeError
+________________________________ test_mem_pure _________________________________
+
+    def test_mem_pure():
+        M = _mod("r2_recon7_mem")
+        a = M.parse_args(["--out", "x", "--workload", "w"])
+        assert (a.batches, a.pool, a.steps, a.probe_rounds, a.margin_gb) == ([64, 192], 18, 512, 49, 0.10)
+        for bad in (["--batches", "64"], ["--batches", "64,64"], ["--spec", "4"], ["--probe-rounds", "20"],
+                    ["--batches", "a"]):
+            with pytest.raises(SystemExit):
+                M.parse_args(["--out", "x", "--workload", "w"] + bad)
+        assert M.main(["--out", "x", "--workload", "w", "--model", "m"]) == 20     # the protocol stamp: refused
+        lines = M.lines_from([(64, 20.0 + 0.21 * 64), (192, 20.0 + 0.21 * 192)], [(64, 18.0 + 0.2 * 64),
+                                                                                  (192, 18.0 + 0.2 * 192)])
+        assert abs(lines["prefill"][0] - 20.0) < 1e-6 and abs(lines["prefill"][1] - 0.21) < 1e-9
+        f = M.fit_record(81, lines, 512, 0.10)
+        want = int((84.0 - 0.10 - 20.0) / 0.21 + 1e-9)
+        assert f["B_fit"] == min(want, f["int32_limit"]) and f["peak_at_anchor_GB"] == round(20.0 + 0.21 * 287, 4)
+        assert f["anchor_fits"] is True and f["B_fit_usable"] == int((83.75 - 20.0) / 0.21) and set(f["margins"]) == {
+            "0.00", "0.10", "0.25"}
+        tap = M.OccTap(2, 5)
+    
+        class Lay:
+            def __init__(self):
+                self.cache_engine = type("E", (), {})()
+                self.cache_engine._k_cpu = torch.zeros(4)
+        runner = type("R", (), {})()
+        runner.rs = type("RS", (), {})()
+        runner.rs.ops = type("O", (), {})()
+        runner.rs.ops.kernels = dict(gather_k=lambda *a: None)
+        runner.rs.cache = type("C", (), {})()
+        runner.rs.cache.layers = [Lay(), Lay()]
+        runner.vs = type("V", (), {})()
+        runner.vs.ext_k = torch.zeros(4)
+        tap.attach(runner)
+        ids = torch.full((2, 3, 5), -1, dtype=torch.int64)
+        ids[0, 0, 1:4] = torch.tensor([3, 4, 5])
+        ids[1, 2, 1] = 7
+        ids[0, 1, 0] = 9                                                   # slot 0 (CB1) never counts
+        lay1 = runner.rs.cache.layers[1].cache_engine
+        runner.rs.ops.kernels["gather_k"](runner.vs.ext_k, lay1._k_cpu, ids, 64)
+        runner.rs.ops.kernels["gather_k"](torch.zeros(4), lay1._k_cpu, ids, 64)    # not a store fill
+>       tap.detach()
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py:597: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <r2_recon7_mem.OccTap object at 0x7f12214f81c0>
+
+    def detach(self) -> None:
+        if self.kern is None:
+            return
+        if self.kern["gather_k"] is not self._gk:
+>           raise RuntimeError("OccTap: gather_k is not the tap")
+E           RuntimeError: OccTap: gather_k is not the tap
+
+benchmarks/Efficiency/r2_recon7_mem.py:138: RuntimeError
+----------------------------- Captured stderr call -----------------------------
+usage: __main__.py [-h] --out OUT [--model MODEL] --workload WORKLOAD
+                   [--batches BATCHES] [--steps STEPS] [--pool POOL]
+                   [--spec SPEC] [--fork-store FORK_STORE]
+                   [--prefill-hook {nocopy,copy}]
+                   [--tu-gemm {natural,rowgroup}]
+                   [--spec-journal-blocks SPEC_JOURNAL_BLOCKS]
+                   [--spec-twin {torch,bi,fused}] [--spec-body {torch,fused}]
+                   [--spec-graph {on,off}] [--spec-redirect {on,off}]
+                   [--probe-every PROBE_EVERY] [--probe-rounds PROBE_ROUNDS]
+                   [--margin-gb MARGIN_GB]
+__main__.py: error: --batches: at least two distinct B >= 1 (a line needs two points)
+usage: __main__.py [-h] --out OUT [--model MODEL] --workload WORKLOAD
+                   [--batches BATCHES] [--steps STEPS] [--pool POOL]
+                   [--spec SPEC] [--fork-store FORK_STORE]
+                   [--prefill-hook {nocopy,copy}]
+                   [--tu-gemm {natural,rowgroup}]
+                   [--spec-journal-blocks SPEC_JOURNAL_BLOCKS]
+                   [--spec-twin {torch,bi,fused}] [--spec-body {torch,fused}]
+                   [--spec-graph {on,off}] [--spec-redirect {on,off}]
+                   [--probe-every PROBE_EVERY] [--probe-rounds PROBE_ROUNDS]
+                   [--margin-gb MARGIN_GB]
+__main__.py: error: --batches: at least two distinct B >= 1 (a line needs two points)
+usage: __main__.py [-h] --out OUT [--model MODEL] --workload WORKLOAD
+                   [--batches BATCHES] [--steps STEPS] [--pool POOL]
+                   [--spec SPEC] [--fork-store FORK_STORE]
+                   [--prefill-hook {nocopy,copy}]
+                   [--tu-gemm {natural,rowgroup}]
+                   [--spec-journal-blocks SPEC_JOURNAL_BLOCKS]
+                   [--spec-twin {torch,bi,fused}] [--spec-body {torch,fused}]
+                   [--spec-graph {on,off}] [--spec-redirect {on,off}]
+                   [--probe-every PROBE_EVERY] [--probe-rounds PROBE_ROUNDS]
+                   [--margin-gb MARGIN_GB]
+__main__.py: error: --spec: K 3 only
+usage: __main__.py [-h] --out OUT [--model MODEL] --workload WORKLOAD
+                   [--batches BATCHES] [--steps STEPS] [--pool POOL]
+                   [--spec SPEC] [--fork-store FORK_STORE]
+                   [--prefill-hook {nocopy,copy}]
+                   [--tu-gemm {natural,rowgroup}]
+                   [--spec-journal-blocks SPEC_JOURNAL_BLOCKS]
+                   [--spec-twin {torch,bi,fused}] [--spec-body {torch,fused}]
+                   [--spec-graph {on,off}] [--spec-redirect {on,off}]
+                   [--probe-every PROBE_EVERY] [--probe-rounds PROBE_ROUNDS]
+                   [--margin-gb MARGIN_GB]
+__main__.py: error: --steps in 8 .. 1000, --probe-every >= 2, --probe-rounds >= 2 x probe_every + 1 (the flat window)
+usage: __main__.py [-h] --out OUT [--model MODEL] --workload WORKLOAD
+                   [--batches BATCHES] [--steps STEPS] [--pool POOL]
+                   [--spec SPEC] [--fork-store FORK_STORE]
+                   [--prefill-hook {nocopy,copy}]
+                   [--tu-gemm {natural,rowgroup}]
+                   [--spec-journal-blocks SPEC_JOURNAL_BLOCKS]
+                   [--spec-twin {torch,bi,fused}] [--spec-body {torch,fused}]
+                   [--spec-graph {on,off}] [--spec-redirect {on,off}]
+                   [--probe-every PROBE_EVERY] [--probe-rounds PROBE_ROUNDS]
+                   [--margin-gb MARGIN_GB]
+__main__.py: error: --batches: integers
+REFUSED: r2_recon7_mem: PROTOCOL_STAMP_RECON7 is None (r2_recon7_protocol.py): the GPU protocol of docs/NOTES_recon7.md is not approved
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_recon7_copies
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:168: Evidence: RECON7 COPIES: run_arm_r7 = run_arm_d + 5 R7 lines; probe_arm_r7 = probe_arm_x + 2 R7 lines
+    _ev("RECON7 COPIES: run_arm_r7 = run_arm_d + %d R7 lines; probe_arm_r7 = probe_arm_x + %d R7 lines" % (
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_streams_measure_plumbing
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:553: Evidence: RECON7 STREAMS (CPU plumbing): configurations 12; planted F -> EXACT fails in ['A|F-EXACT', 'A|FG-EXACT', 'A|F|M-EXACT', 'F-EXACT', 'FG-EXACT', 'F|M-EXACT', 'SER-EXACT']
+    _ev("RECON7 STREAMS (CPU plumbing): configurations %d; planted F -> EXACT fails in %s" % (len(gates), bad))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED benchmarks/Efficiency/tests_cpu/test_recon7.py::test_skip_flags_synthetic
+FAILED benchmarks/Efficiency/tests_cpu/test_recon7.py::test_mem_pure - Runtim...
+2 failed, 5 passed, 8 deselected, 2 warnings in 4.16s
+srun: error: thunder09: task 0: Exited with exit code 1

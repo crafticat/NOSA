@@ -1,0 +1,91 @@
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+== 1. whole-run window (V4:19-25) ==
+I3 C128 r4a (nova07): committed / wall 1394.0 (record effective 1396.7); median 1709.8; effective / median 0.8169
+   mean wall per round (wall - prelude) / G 407.02 ms; without capture 407.02 ms; median round 365.423; excess (no capture) +41.60 ms
+   committed / (wall - capture) 1394.0; committed / (wall - capture - prelude) 1397.8
+   effective / strongest EFFECTIVE nova07 2778.3 (CP:12) = 0.5027
+I3 C73 r3b (nova05): committed / wall 1272.8 (record effective 1275.3); median 1525.8; effective / median 0.8358
+   mean wall per round (wall - prelude) / G 609.48 ms; without capture 609.48 ms; median round 585.463; excess (no capture) +24.02 ms
+   committed / (wall - capture) 1272.8; committed / (wall - capture - prelude) 1275.7
+BEST C128 d3a (nova05): committed / wall 1289.9 (record effective 1292.4); median 1924.1; effective / median 0.6717
+   mean wall per round (wall - prelude) / G 428.41 ms; without capture 378.96 ms; median round 324.883; excess (no capture) +54.08 ms
+   committed / (wall - capture) 1452.8; committed / (wall - capture - prelude) 1501.3
+BEST C73 d4b (nova07): committed / wall 1240.1 (record effective 1242.5); median 1699.0; effective / median 0.7313
+   mean wall per round (wall - prelude) / G 614.70 ms; without capture 566.18 ms; median round 524.659; excess (no capture) +41.52 ms
+   committed / (wall - capture) 1344.1; committed / (wall - capture - prelude) 1373.2
+   effective / strongest EFFECTIVE nova07 2778.3 (CP:12) = 0.4472
+
+== 2. accepted vs committed basis per round (R3:60; V1 via review row 27) ==
+I3 C128: accepted-draft Q (median round, accepted 2.8889 / 2.7799 per request) 1707.6; per 3 accepted 379.48 ms = 2.025 x model 187.40; committed basis per 3 378.99
+I3 C73: accepted-draft Q (median round, accepted 2.8889 / 2.7799 per request) 1509.9; per 3 accepted 631.82 ms = 2.507 x model 252.05; committed basis per 3 625.25
+BEST C128: accepted-draft Q (median round, accepted 2.8889 / 2.7799 per request) 1920.7; per 3 accepted 337.38 ms = 1.800 x model 187.40; committed basis per 3 336.78
+BEST C73: accepted-draft Q (median round, accepted 2.8889 / 2.7799 per request) 1684.9; per 3 accepted 566.20 ms = 2.246 x model 252.05; committed basis per 3 561.53
+
+== 3. re-netting the interference allowance against serialization (review finding 16) ==
+C128: overlap NOT REALISED (td + extra - GEMM(B)) 41.518; serialization (H2D increment - allowance) 13.146; joint-boundary H2D total - allowance 14.592; BEST exposed wait - allowance 13.540
+C73: overlap NOT REALISED (td + extra - GEMM(B)) 57.811; serialization (H2D increment - allowance) 150.942; joint-boundary H2D total - allowance 153.066; BEST exposed wait - allowance 108.570
+ANCHOR: overlap not realised 53.274; allowance s x joint dense 7.0372 (V3:16)
+
+== 4. drain in the steady window (V4B:32-34, :56-58) ==
+C128: probe median all 210.182, drain-free 211.132 (shift +0.950); steady median (drain incl.) 207.094; drain-free probe - steady +4.038
+C73: probe median all 374.565, drain-free 391.019 (shift +16.454); steady median (drain incl.) 383.691; drain-free probe - steady +7.328
+steady-window drain share: C128 24 / 181 = 0.133, C73 39 / 195 = 0.200; probe-set drain share 2 / 10 = 0.200, 3 / 11 = 0.273
+anchor sensitivity: per-round joint upward shift if drain rounds were out (MODEL, interpolated probe shift) 11.742 ms
+
+== 5. anchor revised model after the review (S1:55-62 values; V1 now pays the interference allowance) ==
+I3 code, model bytes, 27.6 GB/s, Y 2.864
+   R 470.97 ms: accepted 1745.3 (0.5094 / 0.5118) committed 1764.3 (0.5149 / 0.5174)
+   R + drain shift 482.71 ms: accepted 1702.8 (0.4970 / 0.4993) committed 1721.4 (0.5024 / 0.5048)
+   V1 410.78 ms: accepted 2001.0 (0.5840 / 0.5868) committed 2022.8 (0.5904 / 0.5932)
+   V2 357.50 ms: accepted 2299.2 (0.6711 / 0.6742) committed 2324.3 (0.6784 / 0.6816)
+   V3 338.12 ms: accepted 2431.0 (0.7095 / 0.7129) committed 2457.5 (0.7173 / 0.7207)
+I3 code, C-interp bytes, 22.0 GB/s, Y 2.808
+   R 525.99 ms: accepted 1532.2 (0.4472 / 0.4493) committed 1549.2 (0.4522 / 0.4543)
+   R + drain shift 537.73 ms: accepted 1498.7 (0.4374 / 0.4395) committed 1515.4 (0.4423 / 0.4444)
+   V1 410.78 ms: accepted 1961.9 (0.5726 / 0.5753) committed 1983.7 (0.5790 / 0.5817)
+   V2 357.50 ms: accepted 2254.3 (0.6579 / 0.6611) committed 2279.3 (0.6653 / 0.6684)
+   V3 338.12 ms: accepted 2383.5 (0.6957 / 0.6989) committed 2410.0 (0.7034 / 0.7067)
+best code, model bytes, 27.6 GB/s, d 81.56, Y 2.864
+   R 426.35 ms: accepted 1927.9 (0.5627 / 0.5654) committed 1948.9 (0.5688 / 0.5715)
+   R + drain shift 438.09 ms: accepted 1876.2 (0.5476 / 0.5502) committed 1896.7 (0.5536 / 0.5562)
+   V1 366.16 ms: accepted 2244.9 (0.6552 / 0.6583) committed 2269.3 (0.6623 / 0.6655)
+   V2 312.88 ms: accepted 2627.1 (0.7668 / 0.7704) committed 2655.8 (0.7751 / 0.7788)
+   V3 293.50 ms: accepted 2800.6 (0.8174 / 0.8213) committed 2831.1 (0.8263 / 0.8302)
+best code, C-interp bytes, 22.0 GB/s, d 84.40, Y 2.808
+   R 459.60 ms: accepted 1753.5 (0.5118 / 0.5142) committed 1773.0 (0.5175 / 0.5199)
+   R + drain shift 471.34 ms: accepted 1709.8 (0.4990 / 0.5014) committed 1728.8 (0.5046 / 0.5070)
+   V1 371.83 ms: accepted 2167.4 (0.6326 / 0.6356) committed 2191.5 (0.6396 / 0.6427)
+   V2 318.56 ms: accepted 2529.8 (0.7384 / 0.7419) committed 2558.0 (0.7466 / 0.7501)
+   V3 299.17 ms: accepted 2693.8 (0.7862 / 0.7899) committed 2723.7 (0.7950 / 0.7987)
+
+== 6. measured-config variants with V1 paying the allowance (S1:24-39 values) ==
+I3 C128: V1 352.277 ms -> Q 1773.6 (/strong 0.5201); V2 0.5896; V3 0.6208 (committed y, unchanged)
+I3 C73: V1 434.521 ms -> Q 2055.8 (/strong 0.6000); V2 0.6921; V3 0.7326 (committed y, unchanged)
+BEST C128: V1 311.343 ms -> Q 2007.8 (/strong 0.5860); V2 0.6762; V3 0.7177 (committed y, unchanged)
+BEST C73: V1 416.089 ms -> Q 2142.2 (/strong 0.6282); V2 0.7296; V3 0.7746 (committed y, unchanged)
+
+== 7. reference baselines (REQ:17; review finding 18) ==
+I3 same-job SH: C128 3334.0; C73 2575.2 (from 1525.8 / 0.5925, rounded ratio)
+model Q anchor 3703.5356 / own SH C128 1.1108; model Q at C128 3457.8631 / own SH C128 1.0372; model Q at C73 3784.9448 / own SH C73 1.4698
+model Q at C128 / strongest n05 1.0092, n07 1.0140; at C73 1.1047, 1.1099
+
+== 8. capacity on one basis (V3:30-54) ==
+C128: ours 216.0-216.4; model allocated basis 213.2-215.7 -> margin ours - model +0.3..+3.2; snapshot removed 227.6-230.0 -> -14.0..-11.2
+C73: ours 318.0-352.0; model allocated basis 340.9-342.4 -> margin ours - model -24.4..+11.1; snapshot removed 379.1-380.0 -> -62.0..-27.1
+C81 slope (linear in C between the fit lines) 0.20133 GB per request; B_fit at 84.0 GB 322.8; at 83.75 GB 321.5
+C81 model: allocated basis 313.6-315.5; snapshot removed 345.6-347.1 (V3:43, :46, :49, :52)
+basis gap at B287 (B256-344 segment): 72.2480 - 66.3914 = 5.8566 = slack 4.6087 + outside 1.1187 + const 0.1292 = 5.8566
+
+== 9. small checks ==
+GEMM measured / GEMM(4B) curve: C128 64.800 / 58.5774 = 1.1062 (+6.223 ms); C73 79.879 / 86.2389 = 0.9263 (-6.360 ms)
+one-step body above td by arm (C128 / C73): I3 L4PTF elapsed 20.87 / 21.98; L4PTFD elapsed 16.82 / 19.48; L4PTFDP draft0 busy 15.29 / 18.20; BEST elapsed 11.33 / 12.92
+r4a vs d3a /SH: 0.5750 / 0.5700 = 1.0088
+final groups commit 459 / 216 = 2.125 tokens (C128)

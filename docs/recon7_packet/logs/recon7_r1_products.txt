@@ -1,0 +1,12 @@
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+C81/B287: 3 td = 206.9592 (HBM - extra = 206.9592); D phase 2 x pass = 149.9552; joint budget with GEMM(4B) = max(75.9311, 77.8320) x (1 + s) = 84.5914 (dense binds)
+C128/B216: 3 td = 164.4411 (HBM - extra = 164.4411); D phase 2 x pass = 121.2222; joint budget with GEMM(4B) = max(59.8470, 58.5774) x (1 + s) = 66.1768 (HBM binds)
+C73/B318: 3 td = 225.8844 (HBM - extra = 225.8844); D phase 2 x pass = 162.4237; joint budget with GEMM(4B) = max(83.0973, 86.2389) x (1 + s) = 93.0160 (dense binds)

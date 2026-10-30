@@ -1,0 +1,79 @@
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+columns ['tag', 'C', 'B', 'cache_control', 'mode', 'nvtx_range', 'kernel_family', 'attribution_method', 'group', 'n_kernels', 'dram_read_GB', 'dram_write_GB', 'pct_of_step_dram_read', 'l2_write_arrival_GB', 'sysmem_read_GB', 'kernel_time_ms']
+cells [('c128_b1', 'ordinary'), ('c128_b216', 'ordinary'), ('c128_b64', 'ordinary'), ('c63_b1', 'ordinary'), ('c63_b1', 'resident'), ('c63_b1_cacheall', 'ordinary'), ('c63_b1_cacheall', 'resident'), ('c63_b344', 'ordinary'), ('c63_b344', 'resident'), ('c63_b64', 'ordinary'), ('c63_b64', 'resident')]
+c128_b216 ordinary nvtx-module: total 57.968 ms, 896 kernels, DRAM read 54.718 GB
+    act_misc              1.252 ms     192 kernels    0.440 GB read
+    gemm                 17.399 ms      96 kernels   14.464 GB read
+    selection             5.276 ms     256 kernels    7.152 GB read
+    offload_metadata      1.242 ms     160 kernels    0.016 GB read
+    pool_moves            5.970 ms      64 kernels    3.084 GB read
+    gather_arrivals       7.585 ms      64 kernels    0.011 GB read
+    attn_stage2          19.245 ms      64 kernels   29.550 GB read
+c128_b216 ordinary kernel-family: total 6.824 ms, 324 kernels, DRAM read 1.829 GB
+    act_misc              0.717 ms     195 kernels    0.090 GB read
+    selection             3.624 ms      96 kernels    0.029 GB read
+    gemm                  2.483 ms      33 kernels    1.711 GB read
+c128_b64 ordinary nvtx-module: total 27.548 ms, 928 kernels, DRAM read 25.805 GB
+    act_misc              0.869 ms     192 kernels    0.130 GB read
+    gemm                 12.075 ms     128 kernels   14.178 GB read
+    selection             2.786 ms     256 kernels    1.895 GB read
+    offload_metadata      1.141 ms     160 kernels    0.005 GB read
+    pool_moves            2.077 ms      64 kernels    0.890 GB read
+    gather_arrivals       2.435 ms      64 kernels    0.003 GB read
+    attn_stage2           6.164 ms      64 kernels    8.704 GB read
+c128_b64 ordinary kernel-family: total 3.380 ms, 324 kernels, DRAM read 1.714 GB
+    act_misc              0.591 ms     195 kernels    0.026 GB read
+    selection             1.521 ms      96 kernels    0.009 GB read
+    gemm                  1.268 ms      33 kernels    1.679 GB read
+c63_b344 ordinary nvtx-module: total 168.085 ms, 832 kernels, DRAM read 74.307 GB
+    act_misc              1.569 ms     192 kernels    0.711 GB read
+    gemm                 23.582 ms      96 kernels   14.963 GB read
+    selection             8.284 ms     256 kernels   11.422 GB read
+    offload_metadata      1.321 ms     160 kernels    0.024 GB read
+    gather_arrivals     102.832 ms      64 kernels    0.058 GB read
+    attn_stage2          30.498 ms      64 kernels   47.129 GB read
+c63_b344 ordinary kernel-family: total 9.182 ms, 324 kernels, DRAM read 1.937 GB
+    act_misc              0.826 ms     195 kernels    0.141 GB read
+    selection             5.591 ms      96 kernels    0.045 GB read
+    gemm                  2.765 ms      33 kernels    1.750 GB read
+c63_b344 resident nvtx-module: total 66.938 ms, 832 kernels, DRAM read 74.254 GB
+    act_misc              1.567 ms     192 kernels    0.710 GB read
+    gemm                 23.566 ms      96 kernels   14.962 GB read
+    selection             8.245 ms     256 kernels   11.422 GB read
+    offload_metadata      1.122 ms     160 kernels    0.024 GB read
+    gather_arrivals       2.254 ms      64 kernels    0.000 GB read
+    attn_stage2          30.183 ms      64 kernels   47.135 GB read
+c63_b344 resident kernel-family: total 9.166 ms, 324 kernels, DRAM read 1.937 GB
+    act_misc              0.824 ms     195 kernels    0.141 GB read
+    selection             5.582 ms      96 kernels    0.045 GB read
+    gemm                  2.760 ms      33 kernels    1.750 GB read
+c63_b64 ordinary nvtx-module: total 41.997 ms, 864 kernels, DRAM read 24.918 GB
+    act_misc              0.875 ms     192 kernels    0.129 GB read
+    gemm                 12.090 ms     128 kernels   14.178 GB read
+    selection             2.772 ms     256 kernels    1.901 GB read
+    offload_metadata      1.144 ms     160 kernels    0.005 GB read
+    gather_arrivals      19.016 ms      64 kernels    0.008 GB read
+    attn_stage2           6.100 ms      64 kernels    8.697 GB read
+c63_b64 ordinary kernel-family: total 3.382 ms, 324 kernels, DRAM read 1.714 GB
+    act_misc              0.590 ms     195 kernels    0.026 GB read
+    selection             1.522 ms      96 kernels    0.009 GB read
+    gemm                  1.270 ms      33 kernels    1.679 GB read
+c63_b64 resident nvtx-module: total 23.022 ms, 864 kernels, DRAM read 24.967 GB
+    act_misc              0.875 ms     192 kernels    0.129 GB read
+    gemm                 12.031 ms     128 kernels   14.178 GB read
+    selection             2.762 ms     256 kernels    1.902 GB read
+    offload_metadata      0.972 ms     160 kernels    0.005 GB read
+    gather_arrivals       0.548 ms      64 kernels    0.000 GB read
+    attn_stage2           5.835 ms      64 kernels    8.752 GB read
+c63_b64 resident kernel-family: total 3.380 ms, 324 kernels, DRAM read 1.714 GB
+    act_misc              0.589 ms     195 kernels    0.026 GB read
+    selection             1.521 ms      96 kernels    0.009 GB read
+    gemm                  1.270 ms      33 kernels    1.679 GB read

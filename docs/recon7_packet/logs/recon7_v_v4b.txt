@@ -1,0 +1,58 @@
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+== i4c_c4b_2195576_i4cb
+   rounds [16, 32, 48, 64, 80, 128, 144, 160, 176, 192, 208]
+   n 11
+   probe_joint [369.5226745605469, 374.508544921875, 374.5648498535156, 398.1404113769531, 393.4167175292969, 391.5422058105469, 390.496337890625, 397.819580078125, 369.3898620605469, 248.30487060546875, 233.39447021484375]
+   probe_joint_median 374.5648
+   total_median 374.1256
+   plan_median 0.4825
+   span_median 365.5414
+   lead_median 2.8559
+   tail_median 5.7482
+   uncovered_median 8.6234
+   round   16 total 369.079; requests already finished 0 of 318
+   round   32 total 374.067; requests already finished 0 of 318
+   round   48 total 374.126; requests already finished 0 of 318
+   round   64 total 397.688; requests already finished 0 of 318
+   round   80 total 392.969; requests already finished 0 of 318
+   round  128 total 391.017; requests already finished 0 of 318
+   round  144 total 389.973; requests already finished 0 of 318
+   round  160 total 397.303; requests already finished 0 of 318
+   round  176 total 368.867; requests already finished 49 of 318
+   round  192 total 247.822; requests already finished 288 of 318
+   round  208 total 232.909; requests already finished 315 of 318
+  median all 374.126; median rounds < 170 390.495 (n 8)
+  probe_joint list median all 374.565; rounds < 170 391.019
+  steady joint median 383.691
+== i4c_e4a_2195576_i4ca
+   rounds [16, 32, 48, 64, 80, 128, 144, 160, 176, 192]
+   n 10
+   probe_joint [227.1426544189453, 213.8665008544922, 217.56723022460938, 210.56101989746094, 211.7038116455078, 208.59613037109375, 208.79087829589844, 209.80335998535156, 202.61795043945312, 189.2069091796875]
+   probe_joint_median 210.1822
+   total_median 209.7293
+   plan_median 0.4812
+   span_median 202.1177
+   lead_median 2.5487
+   tail_median 4.2727
+   uncovered_median 6.8155
+   round   16 total 225.374; requests already finished 0 of 216
+   round   32 total 213.446; requests already finished 0 of 216
+   round   48 total 217.139; requests already finished 0 of 216
+   round   64 total 210.147; requests already finished 0 of 216
+   round   80 total 211.292; requests already finished 0 of 216
+   round  128 total 208.096; requests already finished 0 of 216
+   round  144 total 208.300; requests already finished 0 of 216
+   round  160 total 209.311; requests already finished 0 of 216
+   round  176 total 202.125; requests already finished 79 of 216
+   round  192 total 188.735; requests already finished 210 of 216
+  median all 209.729; median rounds < 170 210.720 (n 8)
+  probe_joint list median all 210.182; rounds < 170 211.132
+  steady joint median 207.094

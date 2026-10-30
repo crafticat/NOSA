@@ -1,0 +1,147 @@
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+=== 1. Resident C63 curve (2175791, eager median, mode resident) ===
+  C63 resident B1: eager median 20.570112 ms (n rows csv)
+  C63 resident B8: eager median 20.682753 ms (n rows csv)
+  C63 resident B32: eager median 22.438911 ms (n rows csv)
+  C63 resident B64: eager median 27.376640 ms (n rows csv)
+  C63 resident B128: eager median 37.512192 ms (n rows csv)
+  C63 resident B256: eager median 62.678017 ms (n rows csv)
+  C63 resident B344: eager median 80.585732 ms (n rows csv)
+=== 2. GEMM step sums (2175525, graph-timed, default variant, env base) ===
+  M128: graph step 14.5920097 ms; eager-median step 15.6568002 ms
+  M256: graph step 20.0271180 ms; eager-median step 21.8174403 ms
+  M320: graph step 25.4561339 ms; eager-median step 29.3884158 ms
+  M384: graph step 27.2645100 ms; eager-median step 30.1175678 ms
+  M512: graph step 34.6211361 ms; eager-median step 38.3542082 ms
+  M640: graph step 42.9303249 ms; eager-median step 45.2959037 ms
+  M672: graph step 51.6753099 ms; eager-median step 55.2919357 ms
+  M768: graph step 52.0687711 ms; eager-median step 51.6849277 ms
+--- candidate extrapolation rules for M > 768 (target GEMM(861) = 58.3739738593) ---
+  last2 (672,768)              GEMM(861) = 52.4499367   GEMM(954) = 52.8311022
+  640-768                      GEMM(861) = 58.7084234   GEMM(954) = 65.3480757
+  640-672                      GEMM(861) = 103.3253772   GEMM(954) = 128.7404897
+  512-768                      GEMM(861) = 58.4071698   GEMM(954) = 64.7455684
+  256-768                      GEMM(861) = 57.8888370   GEMM(954) = 63.7089029
+  128-768                      GEMM(861) = 57.5146130   GEMM(954) = 62.9604549
+  lsq all                      GEMM(861) = 58.5804923   GEMM(954) = 64.3787474
+  lsq M>=256                   GEMM(861) = 59.3513508   GEMM(954) = 65.4166850
+  lsq M>=320                   GEMM(861) = 59.4089870   GEMM(954) = 65.4981364
+  lsq M>=384                   GEMM(861) = 60.3185669   GEMM(954) = 66.8287617
+  lsq M>=512                   GEMM(861) = 60.7993038   GEMM(954) = 67.5561766
+  per-shape last2              GEMM(861) = 52.4499367   GEMM(954) = 52.8311022
+  ratio M861/768 x step768     GEMM(861) = 58.3739739   GEMM(954) = 64.6791766
+=== 3. Transfer rate and interference (2179735, layout cpu8@hm>orig:group/row) ===
+  B64: gbps_alone 8.993466  gbps_conc 8.859767  slowdown_pct 14.626987  mean_step_slowdown 14.62858
+  B336: gbps_alone 11.230247  gbps_conc 11.133855  slowdown_pct 7.378858  mean_step_slowdown 7.457959
+=== 4. Rational structure of U, I, bytes (forecast inputs, not re-derived) ===
+  U*448 = 30985.0000000128  I*3584 = 215734.9999999488  bytes*7 = 45.2607999998
+  U = 30985/448 = 69.16294642857143   I = 215735/3584 = 60.193917410714285   U-I = 8.969029017857142
+  bytes MB / (3 x 64 x 32768 B) = 1.0277157738049827 groups per stream-step
+  63 x 64 x 32896 B = 132636672 (f's per-request KV bytes)
+=== 5. Original anchor C81 / B287 ===
+  GEMM(287) 22.656797603766123 interp 256-320
+  closest extrapolation rule to 58.3739738593: ratio M861/768 x step768 58.37397385934988
+--- model at original anchor: C81 B287 K3 lag2 p0.0 ---
+td (C63 resident interp (256, 344))                          68.9864166023
+f                                                            0.2928997375
+1-f                                                          0.7071002625
+td(1-f)                                                      48.7803132903
+extra = td(1-f)(U-I)/63                                      6.9446356413
+cohort HBM = 3 td + extra                                    213.9038854481
+GEMM(B)                                                      22.6567976038
+GEMM(BK)                                                     58.3739738593
+cohort dense = 3 GEMM(B) + GEMM(BK)                          126.3443666706
+s (interference)                                             0.0868458712
+GPU = max(HBM,dense)(1+s)                                    232.4805547357
+r GB/s                                                       10.7241847353
+transfer = B bytes (n/K)/r                                   173.0381232510
+interval                                                     232.4805547357
+Q accepted-draft tok/s                                       3703.5355536668
+joint HBM proxy td + extra                                   75.9310522436
+joint dense GEMM(B)+GEMM(BK)                                 81.0307714631
+joint budget max(...)(1+s)                                   88.0679594059
+2 draft-only passes HBM (2 td)                               137.9728332045
+2 draft-only passes dense (2 GEMM(B))                        45.3135952075
+per-pass draft-only GPU max(td,GEMM(B))(1+s)                 74.9776020540
+sum of per-pass maxes: 2 draft + joint, x(1+s)               238.0231635139
+draft weight bytes share td*f per pass (ms)                  20.2061033120
+draft KV share td*(1-f) per pass (ms)                        48.7803132903
+  forecast check: Q/3160.822684 - 1 = 0.17169987814060095
+  no-interference Q = 4025.1723253942373  gain 0.27345717485816334
+  sensitivity weights only V=U: extra 53.5522 HBM 260.5115 Q 3040.9434
+  sensitivity weights+half KV V=U-I/2: extra 30.2484 HBM 237.2077 Q 3339.6922
+  sensitivity weights+full KV V=U-I: extra 6.9446 HBM 213.9039 Q 3703.5356
+  sensitivity none (verifier pays its own weight pass + U): extra 73.7583 HBM 280.7176 Q 2822.0557
+  p=0.0: n_old K+p*lag = 3.0, n_new K+p(1+lag) = 3.0, transfer_new 173.0381
+  p=0.109: n_old K+p*lag = 3.218, n_new K+p(1+lag) = 3.327, transfer_new 191.8993
+=== 6. C128 / B216 ===
+  GEMM(216) 18.3286466995875 interp 128-256  GEMM(648) 45.11657117207845 interp 640-672
+--- model at C128/B216 (U, I, bytes carried from C81): C128 B216 K3 lag2 p0.0 ---
+td (C63 resident interp (128, 256))                          54.8136966875
+f                                                            0.3549986772
+1-f                                                          0.6450013228
+td(1-f)                                                      35.3549068698
+extra = td(1-f)(U-I)/63                                      5.0333204070
+cohort HBM = 3 td + extra                                    169.4744104695
+GEMM(B)                                                      18.3286466996
+GEMM(BK)                                                     45.1165711721
+cohort dense = 3 GEMM(B) + GEMM(BK)                          100.1025112708
+s (interference)                                             0.1057656197
+GPU = max(HBM,dense)(1+s)                                    187.3989765171
+r GB/s                                                       10.1305808824
+transfer = B bytes (n/K)/r                                   137.8616870682
+interval                                                     187.3989765171
+Q accepted-draft tok/s                                       3457.8630686439
+joint HBM proxy td + extra                                   59.8470170945
+joint dense GEMM(B)+GEMM(BK)                                 63.4452178717
+joint budget max(...)(1+s)                                   70.1555406572
+2 draft-only passes HBM (2 td)                               109.6273933750
+2 draft-only passes dense (2 GEMM(B))                        36.6572933992
+per-pass draft-only GPU max(td,GEMM(B))(1+s)                 60.6111012860
+sum of per-pass maxes: 2 draft + joint, x(1+s)               191.3777432293
+draft weight bytes share td*f per pass (ms)                  19.4587898177
+draft KV share td*(1-f) per pass (ms)                        35.3549068698
+=== 7. C73 / B318 ===
+  GEMM(318) 25.286477160453796 interp 256-320  GEMM(954) extrapolated by ratio M861/768 x step768 64.67917661070823
+--- model at C73/B318 (U, I, bytes carried from C81): C73 B318 K3 lag2 p0.0 ---
+td (C63 resident interp (256, 344))                          75.2948162045
+f                                                            0.2721163901
+1-f                                                          0.7278836099
+td(1-f)                                                      54.8058626260
+extra = td(1-f)(U-I)/63                                      7.8024662261
+cohort HBM = 3 td + extra                                    233.6869148397
+GEMM(B)                                                      25.2864771605
+GEMM(BK)                                                     64.6791766107
+cohort dense = 3 GEMM(B) + GEMM(BK)                          140.5386080921
+s (interference)                                             0.0785851360
+GPU = max(HBM,dense)(1+s)                                    252.0512328135
+r GB/s                                                       10.9833638824
+transfer = B bytes (n/K)/r                                   187.2043490254
+interval                                                     252.0512328135
+Q accepted-draft tok/s                                       3784.9447882128
+joint HBM proxy td + extra                                   83.0972824306
+joint dense GEMM(B)+GEMM(BK)                                 89.9656537712
+joint budget max(...)(1+s)                                   97.0356169041
+2 draft-only passes HBM (2 td)                               150.5896324091
+2 draft-only passes dense (2 GEMM(B))                        50.5729543209
+per-pass draft-only GPU max(td,GEMM(B))(1+s)                 81.2118695728
+sum of per-pass maxes: 2 draft + joint, x(1+s)               259.4593560496
+draft weight bytes share td*f per pass (ms)                  20.4889535785
+draft KV share td*(1-f) per pass (ms)                        54.8058626260
+=== 8. Human's retrospective conversion (I3 cells) ===
+  C128/B216: SH_ms = 1000*216*0.5128/1709.8 = 64.7823; joint = 3.201*SH = 207.368; joint/budget = 2.9558; gap 137.213 ms
+  C73/B318: SH_ms = 1000*318*0.5925/1525.8 = 123.4860; joint = 3.094*SH = 382.066; joint/budget = 3.9374; gap 285.030 ms
+=== 9. Per round of the implemented schedule vs per model cohort (MODEL terms only) ===
+  anchor C81/B287: model cohort interval 232.4806 ms for 3 accepted drafts/request -> 77.4935 ms per accepted token/request
+  C128/B216: model cohort interval 187.3990 ms for 3 accepted drafts/request -> 62.4663 ms per accepted token/request
+  C73/B318: model cohort interval 252.0512 ms for 3 accepted drafts/request -> 84.0171 ms per accepted token/request
+=== 10. Optional: gm1 eager GEMM inputs (MEASURED later, nova05) for comparison ===
+  gm1 keys: ['gates', 'meta', 'predictions', 'tables']

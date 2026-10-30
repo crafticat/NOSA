@@ -1,0 +1,88 @@
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+== 1. MODEL terms (CITED) and checks (DERIVED)
+B 216: f = 15.7683 / (15.7683 + 216 x 0.132637) = 0.354999; extra = td(1-f)(U-I)/63 = 5.0333 (cited 5.0333); HBM = td + extra = 59.8470; dense 63.4452; budget = max x (1 + s) = 70.1555 (cited 70.1555); interference allowance = dense x s = 6.7103
+   model GEMM curve (old scan, gm1 :40-49): GEMM(216) = 18.3300, GEMM(648) = 45.1175, sum 63.4475 (cited dense 63.4452, diff 0.0023)
+   model KV-read share of td = td(1 - f) = 35.3549; weight share td f = 19.4588; KV share + extra = 40.3882
+   SERIAL FORM (MODEL, this file): td + extra + (dense - GEMM(B)) = 54.8137 + 5.0333 + (63.4452 - 18.3300) = 104.9622; serial - budget = 34.8067 = (HBM - GEMM(B) = 41.5170) - (interference 6.7103)
+B 318: f = 15.7683 / (15.7683 + 318 x 0.132637) = 0.272116; extra = td(1-f)(U-I)/63 = 7.8025 (cited 7.8025); HBM = td + extra = 83.0973; dense 89.9657; budget = max x (1 + s) = 97.0357 (cited 97.0356); interference allowance = dense x s = 7.0700
+   model GEMM curve (old scan, gm1 :40-49): GEMM(318) = 25.2903, GEMM(954) = 64.6779, sum 89.9683 (cited dense 89.9657, diff 0.0026)
+   model KV-read share of td = td(1 - f) = 54.8059; weight share td f = 20.4889; KV share + extra = 62.6084
+   SERIAL FORM (MODEL, this file): td + extra + (dense - GEMM(B)) = 75.2948 + 7.8025 + (89.9657 - 25.2903) = 147.7727; serial - budget = 50.7371 = (HBM - GEMM(B) = 57.8070) - (interference 7.0700)
+== 2. WORK COUNTS (DERIVED)
+i3cb TFC: per (layer, KV head, request): fork pages 47046615 / 651264 = 72.239; union_mean 71.176 (max 99); window host loads 2.628; listed store blocks 4.640; per (layer, KV head, row) visible pages 166682880 / 2605056 = 63.984
+model groups per (layer, KV head, request) per joint: 63 + (U - I) = 71.969; U = 69.163; I = 60.194; I / U = 0.8703
+B 216: rows per joint pass 4B = 864; GEMM calls 129 at M = 864 (draft: 129 at M = 216)
+   GEMM device 64.799 ms (joint) vs 19.785 (draft): x3.275 for x4 rows; FLOP 13.624 T vs 3.406 T; at 312 TF: 43.67 / 10.92 ms; achieved 67.4 % / 55.2 % of peak; weight bytes 15.77 GB / 19.785 ms = 0.797 TB/s (draft)
+   fork: pages read 72.239 x 13824 = 998631 per pass = 32.851 GB; device 37.118 ms -> 0.885 TB/s; draft call A: 64 x 13824 = 884736 pages = 29.104 GB in 19.063 ms -> 1.527 TB/s; fork at call A's rate: 21.517 ms (excess 15.601 ms)
+   model KV groups per joint 71.969 x 13824 = 994900 (measured fork pages / model = 1.0038)
+   H2D: NEW blocks per joint pass 16946.2 = 1.226 per (layer, KV head, request); 557.462 MB = 2.581 MB per request; H2D kernels 21.302 ms (resid 10.206 + fetch 11.096) -> 26.17 GB/s; selected verify slots 2619984.3 = 189.524 per (layer, head, request) = 63.175 per verify row (3 rows); ready share 0.9935
+B 318: rows per joint pass 4B = 1272; GEMM calls 129 at M = 1272 (draft: 129 at M = 318)
+   GEMM device 79.879 ms (joint) vs 25.705 (draft): x3.108 for x4 rows; FLOP 20.057 T vs 5.014 T; at 312 TF: 64.29 / 16.07 ms; achieved 80.5 % / 62.5 % of peak; weight bytes 15.77 GB / 25.705 ms = 0.613 TB/s (draft)
+   fork: pages read 72.239 x 20352 = 1470207 per pass = 48.364 GB; device 52.165 ms -> 0.927 TB/s; draft call A: 64 x 20352 = 1302528 pages = 42.848 GB in 27.764 ms -> 1.543 TB/s; fork at call A's rate: 31.338 ms (excess 20.827 ms)
+   model KV groups per joint 71.969 x 20352 = 1464714 (measured fork pages / model = 1.0038)
+   H2D: NEW blocks per joint pass 101764.2 = 5.000 per (layer, KV head, request); 3347.635 MB = 10.527 MB per request; H2D kernels 160.136 ms (resid 70.258 + fetch 89.878) -> 20.90 GB/s; selected verify slots 3841019.1 = 188.729 per (layer, head, request) = 62.910 per verify row (3 rows); ready share 0.9735
+== 3. GAP DECOMPOSITION (DERIVED)
+-- B 216 (C 128): joint busy 198.9227 (items sum 198.9228); draft busy 70.1072 (items sum 70.1074)
+   A. MAX FORM (the human's budget 70.1555 = dense 63.4452 + interference 6.7103); I3 joint 207.377; gap 137.2215
+      dense GEMM vs model dense                                                                           1.354
+      attention + lists (model: KV share 40.388 hidden under max)                                        40.312
+      selection over 4B rows (model: B rows hidden in td, 3B omitted)                                    27.310
+      residency + fetch: H2D 21.302 + bookkeeping 11.905, minus the interference allowance 6.710         26.497
+      tentative state + union lists (not modelled)                                                       28.908
+      norms / rope / act / embed / cast (hidden in td)                                                    4.386
+      steady non-busy = I3 joint - profiled busy (g112; g96 11.687)                                       8.454
+      sum 137.222 vs gap 137.221: residual -0.0001
+   B. SERIAL FORM chain: budget 70.156 + overlap assumption 34.807 = serial 104.962; measured = one-step device (draft0) 70.107 + joint increment 128.815 + non-busy 8.454 = 207.377
+      one step: measured draft0 busy 70.107 - td 54.814 = 15.294; model increment = extra + dense - GEMM(B) = 5.033 + 45.115 = 50.148; measured increment 128.815; increment excess 78.667
+      dense GEMM (129 calls)                                       joint    64.799 draft   19.785 increment    45.014 model increment   45.115 excess    -0.101
+      attention (fork + lists) / draft call A + B + masks + merge  joint    40.312 draft   23.629 increment    16.683 model increment    5.033 excess    11.649
+      selection (stage 1 + pooling + top-k)                        joint    27.310 draft    9.480 increment    17.830 model increment    0.000 excess    17.830
+      residency + fetch (incl. H2D)                                joint    33.207 draft   12.576 increment    20.631 model increment    0.000 excess    20.631
+      tentative state: union + write + chain + twin                joint    28.908 draft    2.993 increment    25.915 model increment    0.000 excess    25.915
+      norms / rope / act / embed / logits cast                     joint     4.386 draft    1.644 increment     2.743 model increment    0.000 excess     2.743
+      excess sum 78.667; check: serial gap 102.415 = one-step 15.294 + excess 78.667 + non-busy 8.454 -> 102.415
+-- B 318 (C 73): joint busy 383.9143 (items sum 383.9144); draft busy 93.4977 (items sum 93.4976)
+   A. MAX FORM (the human's budget 97.0356 = dense 89.9657 + interference 7.0700); I3 joint 382.041; gap 285.0054
+      dense GEMM vs model dense                                                                         -10.087
+      attention + lists (model: KV share 62.608 hidden under max)                                        56.106
+      selection over 4B rows (model: B rows hidden in td, 3B omitted)                                    38.472
+      residency + fetch: H2D 160.136 + bookkeeping 12.107, minus the interference allowance 7.070       165.173
+      tentative state + union lists (not modelled)                                                       31.118
+      norms / rope / act / embed / cast (hidden in td)                                                    6.096
+      steady non-busy = I3 joint - profiled busy (g112; g96 2.757)                                       -1.873
+      sum 285.005 vs gap 285.005: residual -0.0000
+   B. SERIAL FORM chain: budget 97.036 + overlap assumption 50.737 = serial 147.773; measured = one-step device (draft0) 93.498 + joint increment 290.417 + non-busy -1.873 = 382.041
+      one step: measured draft0 busy 93.498 - td 75.295 = 18.203; model increment = extra + dense - GEMM(B) = 7.803 + 64.675 = 72.478; measured increment 290.417; increment excess 217.939
+      dense GEMM (129 calls)                                       joint    79.879 draft   25.705 increment    54.174 model increment   64.675 excess   -10.501
+      attention (fork + lists) / draft call A + B + masks + merge  joint    56.106 draft   33.654 increment    22.453 model increment    7.803 excess    14.650
+      selection (stage 1 + pooling + top-k)                        joint    38.472 draft   14.038 increment    24.434 model increment    0.000 excess    24.434
+      residency + fetch (incl. H2D)                                joint   172.243 draft   14.141 increment   158.101 model increment    0.000 excess   158.101
+      tentative state: union + write + chain + twin                joint    31.118 draft    3.948 increment    27.171 model increment    0.000 excess    27.171
+      norms / rope / act / embed / logits cast                     joint     6.096 draft    2.012 increment     4.084 model increment    0.000 excess     4.084
+      excess sum 217.939; check: serial gap 234.268 = one-step 18.203 + excess 217.939 + non-busy -1.873 -> 234.269
+== 4. ROUNDS (DERIVED)
+B 216 i4c_e4a (nova07): phases reset 0.115 + joint 207.457 + commit 5.977 + draft 143.987 = 357.536; round median 357.981; residual 0.445
+   joint: busy g112 198.923 / g96 195.690 -> non-busy 8.534 / 11.767; draft phase: busy g112 70.107 + 68.437 = 138.544 / g96 137.730 -> non-busy 5.442 / 6.257; device-busy share of joint + draft (g112) 0.9602
+   I3 nova07: 0.110 + 207.377 + 6.004 + 151.363 = 364.854; round 365.423; residual 0.569; I3 draft - REF draft = 7.376 (lean draft)
+   BEST L4PTFDGUDCD i4dc_d3a (nova05): 0.120 + 186.011 + 6.058 + 132.287 = 324.476; round 324.883; residual 0.407
+B 318 i4c_c4b (nova07): phases reset 0.117 + joint 383.231 + commit 8.344 + draft 189.278 = 580.970; round median 581.517; residual 0.547
+   joint: busy g112 383.914 / g96 379.284 -> non-busy -0.683 / 3.947; draft phase: busy g112 93.498 + 91.531 = 185.029 / g96 184.920 -> non-busy 4.249 / 4.358; device-busy share of joint + draft (g112) 0.9938
+   I3 nova05: 0.115 + 382.041 + 8.351 + 194.550 = 585.057; round 585.463; residual 0.406; I3 draft - REF draft = 5.272 (lean draft)
+   BEST L4PTFDGUDKWCD i4dc_d4b (nova07): 0.125 + 338.961 + 8.421 + 176.437 = 523.944; round 524.659; residual 0.715
+I3 r4a inter-round host time (MODEL): steady sum 181 x 570.878 / 1.5605 = 66215.3 ms; wall 79179.6 - steady - 12 probes x 372 - prelude 217.6 = 8282.7 ms over 194 rounds = 42.7 ms per round (upper bound: includes round 0 and the warm step)
+== 5. BEST ARM vs I3 at the same boundaries (DERIVED; eager probe groups; cross-GPU noted)
+B 216: label deltas: attention -0.606, chain -0.218, check 0.000, dense_next -0.372, fetch -0.376, residency -0.759, union -8.836, write -8.088; sum -19.254; probe total delta -19.235; steady - probe: I3 5.312, best 3.181 (delta -2.131); steady joint delta -21.366 = probe total delta + remainder delta -21.366
+   best gap vs budget 186.011 - 70.1555 = 115.855; I3 gap 137.221; change -21.366; H2D gather spans (wait) I3 20.205 -> best 20.247; NEW blocks 16946.2 -> 16946.2
+B 318: label deltas: attention -1.135, chain -0.280, check -0.001, dense_next 0.070, fetch -0.004, residency -16.803, union -8.998, write -8.167; sum -35.318; probe total delta -33.470; steady - probe: I3 5.789, best -3.821 (delta -9.610); steady joint delta -43.080 = probe total delta + remainder delta -43.080
+   best gap vs budget 338.961 - 97.0356 = 241.925; I3 gap 285.005; change -43.080; H2D gather spans (wait) I3 153.828 -> best 115.643; NEW blocks 101764.2 -> 77960.2
+== 6. L7 at C 73: the probe sample (ana_rev6_s1.txt :89 probe_joint, rounds 16..208)
+median of 11 probes 374.565; without the drain rounds >= 170 (8 probes) 391.019; steady L4PTFD joint 383.231 -> probe overhead -8.666 (recorded -8.666) vs 7.788
+C 128 (c3a :46): median of 10 probes 209.790; without rounds >= 170 210.226; steady 206.157

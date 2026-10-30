@@ -1,0 +1,65 @@
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+back-solved backbone(287) = 72.248091328
+per-request non-backbone at C81 = 0.039952384  landing = 0.05111808
+C                                                       B256    63.000000 B344    63.000000 slope 0.000000 interp287 63.000000 diff_to_target 9.248091
+B                                                       B256   256.000000 B344   344.000000 slope 1.000000 interp287 287.000000 diff_to_target -214.751909
+device_used_GB                                          B256    65.727758 B344    83.870220 slope 0.206164 interp287 72.118853 diff_to_target 0.129239
+device_total_GB                                         B256    85.094826 B344    85.094826 slope 0.000000 interp287 85.094826 diff_to_target -12.846735
+device_used_pct_of_total                                B256    77.240605 B344    98.560893 slope 0.242276 interp287 84.751161 diff_to_target -12.503070
+allocated_GB                                            B256    60.997160 B344    76.309934 slope 0.174009 interp287 66.391433 diff_to_target 5.856659
+reserved_GB                                             B256    64.609059 B344    82.751521 slope 0.206164 interp287 71.000154 diff_to_target 1.247938
+requested_GB                                            B256    60.997073 B344    76.309848 slope 0.174009 interp287 66.391346 diff_to_target 5.856745
+nvidia_smi_used_GB_steady_end                           B256    65.727889 B344    83.870351 slope 0.206164 interp287 72.118984 diff_to_target 0.129108
+weights_unique_GB                                       B256    16.370541 B344    16.370541 slope 0.000000 interp287 16.370541 diff_to_target 55.877550
+weights_unique_pct                                      B256    24.906586 B344    19.518896 slope -0.061224 interp287 23.008650 diff_to_target 49.239442
+resident_hist_kv_window_slots_0_62_GB                   B256    33.954988 B344    45.627015 slope 0.132637 interp287 38.066725 diff_to_target 34.181367
+resident_hist_kv_window_slots_0_62_pct                  B256    51.660043 B344    54.401926 slope 0.031158 interp287 52.625934 diff_to_target 19.622158
+resident_hist_kv_victim_pool_GB                         B256     0.000000 B344     0.000000 slope 0.000000 interp287 0.000000 diff_to_target 72.248091
+resident_hist_kv_victim_pool_pct                        B256     0.000000 B344     0.000000 slope 0.000000 interp287 0.000000 diff_to_target 72.248091
+active_kv_tail_slot_63_GB                               B256     0.538968 B344     0.724238 slope 0.002105 interp287 0.604234 diff_to_target 71.643858
+active_kv_tail_slot_63_pct                              B256     0.820001 B344     0.863523 slope 0.000495 interp287 0.835333 diff_to_target 71.412759
+compressed_kv_tables_GB                                 B256     4.966547 B344     6.673798 slope 0.019401 interp287 5.567965 diff_to_target 66.680126
+compressed_kv_tables_pct                                B256     7.556240 B344     7.957292 slope 0.004557 interp287 7.697520 diff_to_target 64.550572
+selection_metadata_GB                                   B256     0.025264 B344     0.033949 slope 0.000099 interp287 0.028323 diff_to_target 72.219768
+selection_metadata_pct                                  B256     0.038438 B344     0.040478 slope 0.000023 interp287 0.039157 diff_to_target 72.208935
+staging_light_restore_snapshot_GB                       B256     4.991779 B344     6.707703 slope 0.019499 interp287 5.596252 diff_to_target 66.651839
+staging_light_restore_snapshot_pct                      B256     7.594628 B344     7.997717 slope 0.004581 interp287 7.736625 diff_to_target 64.511466
+staging_driver_GB                                       B256     0.000002 B344     0.000003 slope 0.000000 interp287 0.000002 diff_to_target 72.248089
+staging_driver_pct                                      B256     0.000003 B344     0.000003 slope 0.000000 interp287 0.000003 diff_to_target 72.248088
+workspaces_graph_pools_GB                               B256     0.035545 B344     0.047763 slope 0.000139 interp287 0.039849 diff_to_target 72.208242
+workspaces_graph_pools_pct                              B256     0.054078 B344     0.056949 slope 0.000033 interp287 0.055089 diff_to_target 72.193002
+allocator_slack_cached_free_GB                          B256     3.611899 B344     6.441587 slope 0.032156 interp287 4.608721 diff_to_target 67.639370
+allocator_slack_cached_free_pct                         B256     5.495241 B344     7.680422 slope 0.024832 interp287 6.265021 diff_to_target 65.983071
+allocator_slack_rounding_GB                             B256     0.000087 B344     0.000086 slope -0.000000 interp287 0.000087 diff_to_target 72.248005
+allocator_slack_rounding_pct                            B256     0.000132 B344     0.000103 slope -0.000000 interp287 0.000122 diff_to_target 72.247970
+other_overhead_outside_allocator_GB                     B256     1.118700 B344     1.118700 slope 0.000000 interp287 1.118700 diff_to_target 71.129391
+other_overhead_outside_allocator_pct                    B256     1.702020 B344     1.333846 slope -0.004184 interp287 1.572322 diff_to_target 70.675769
+other_overhead_model_constants_inputs_GB                B256     0.100794 B344     0.112194 slope 0.000130 interp287 0.104810 diff_to_target 72.143281
+other_overhead_model_constants_inputs_pct               B256     0.153351 B344     0.133770 slope -0.000223 interp287 0.146453 diff_to_target 72.101638
+unclassified_GB                                         B256     0.012645 B344     0.012645 slope 0.000000 interp287 0.012645 diff_to_target 72.235446
+unclassified_pct                                        B256     0.019238 B344     0.015076 slope -0.000047 interp287 0.017772 diff_to_target 72.230319
+category_sum_minus_device_used_B                        B256     0.000000 B344     0.000000 slope 0.000000 interp287 0.000000 diff_to_target 72.248091
+peak_alloc_GB_prefill                                   B256    58.653281 B344    72.277188 slope 0.154817 interp287 63.452612 diff_to_target 8.795479
+peak_alloc_GB_warmup_step0                              B256    56.107697 B344    69.739720 slope 0.154909 interp287 60.909887 diff_to_target 11.338204
+peak_alloc_GB_warm_steps                                B256    56.142205 B344    69.786089 slope 0.155044 interp287 60.948573 diff_to_target 11.299518
+peak_alloc_GB_decode_ordinary                           B256    61.213667 B344    76.600866 slope 0.174855 interp287 66.634158 diff_to_target 5.613934
+peak_alloc_GB_decode_resident                           B256    61.213667 B344    76.600866 slope 0.174855 interp287 66.634158 diff_to_target 5.613934
+peak_alloc_GB_restore                                   B256    61.200428 B344    76.583076 slope 0.174803 interp287 66.619315 diff_to_target 5.628776
+peak_alloc_GB_capture_ordinary                          B256    61.187284 B344    76.565414 slope 0.174751 interp287 66.604580 diff_to_target 5.643512
+peak_alloc_GB_capture_resident                          B256    61.187284 B344    76.565414 slope 0.174751 interp287 66.604580 diff_to_target 5.643512
+peak_alloc_GB_process_max                               B256    61.213667 B344    76.600866 slope 0.174855 interp287 66.634158 diff_to_target 5.613934
+peak_reserved_GB_process_max                            B256    64.609059 B344    82.751521 slope 0.206164 interp287 71.000154 diff_to_target 1.247938
+max_device_used_GB_at_sync_points                       B256    65.727758 B344    83.870220 slope 0.206164 interp287 72.118853 diff_to_target 0.129239
+offset (guard) = 0.129238759818179
+C81 B287: backbone(device_used interp/extrap + offset) 72.248091  per-request (C-63) part 10.876207  overflow+reserve 0.590127  landing 0.051118  total 83.765544
+C81 B288: backbone(device_used interp/extrap + offset) 72.454256  per-request (C-63) part 10.914103  overflow+reserve 0.592183  landing 0.051118  total 84.011660
+C128 B216: backbone(device_used interp/extrap + offset) 57.610423  per-request (C-63) part 29.559030  overflow+reserve 0.444137  landing 0.051118  total 87.664708
+C73 B318: backbone(device_used interp/extrap + offset) 78.639186  per-request (C-63) part 6.694994  overflow+reserve 0.653869  landing 0.051118  total 86.039167

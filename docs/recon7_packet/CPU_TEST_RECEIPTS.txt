@@ -1,0 +1,13 @@
+log | pytest summary line
+recon7b_8d7dab8_a.txt | 10 passed, 5 deselected, 3 warnings in 7.87s
+recon7b_8d7dab8_b.txt | 5 passed, 10 deselected, 6 warnings in 549.64s (0:09:09)
+recon7b_8d7dab8_g0.txt | 36 passed, 264 deselected in 514.85s (0:08:34)
+recon7b_e83eec9_a.txt | 10 passed, 5 deselected, 3 warnings in 8.00s
+recon7b_e83eec9_b.txt | 5 passed, 10 deselected, 6 warnings in 563.01s (0:09:23)
+recon7b_e83eec9_g0.txt | 36 passed, 264 deselected in 425.58s (0:07:05)
+recon7b_wip_a2.txt | 7 passed, 8 deselected, 2 warnings in 4.22s
+recon7b_wip_a.txt | 2 failed, 5 passed, 8 deselected, 2 warnings in 4.16s
+recon7b_wip_b2.txt | 5 passed, 10 deselected, 6 warnings in 559.88s (0:09:19)
+recon7b_wip_b.txt | 1 failed, 11 deselected in 238.77s (0:03:58)
+recon7b_wip_g0.txt | 38 passed, 277 deselected in 507.52s (0:08:27)
+recon7b_x1wip_a.txt | 7 passed, 8 deselected, 2 warnings in 4.28s

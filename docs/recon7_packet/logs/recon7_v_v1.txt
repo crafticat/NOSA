@@ -1,0 +1,276 @@
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+==================== A. I3 conversions (human REQ:37-41)
+i3_r4a_2195576_i3a B 216 C 128
+  SH steady_tok_s 3334.0 steady_step_ms 64.787; I3 median_tok_s 1709.8 -> own-SH 0.51284 (req 0.5128)
+  SH_ms (req rounded inputs) 64.7823; SH_ms (raw) 64.7870; record steady_step_ms 64.787
+  joint_sh_steps 3.2009; joint (req) 207.368 = 3.201 x 64.7823; joint (raw) 207.377; joint median record 207.377
+  phases {'commit': 6.004, 'draft': 151.363, 'joint': 207.377, 'reset': 0.11} sum 364.854 round_ms_median 365.423 residual +0.569
+  kv NEW blocks 16946.2 MB 557.462 -> MB/request 2.5808; blocks/stream 1.2259; MB check 557.462; wait_med 20.205; rate 27.59 GB/s
+  ready / selected 0.99353; NEW / selected 0.00647
+  y_med = median_tok_s x round / B = 2.8926
+  whole run: effective_tok_s 1396.7, mean_tok_s 1560.5, wall_s 79.17955690808594, prelude_ms 217.5662078857422, rounds 194
+  -- arm key shape (I3 C128 L4PTF)
+   K: '3'
+   acceptance: dict(6)
+   acceptance.accepted: '109318'
+   acceptance.committed_per_request_round: '2.634020618556701'
+   acceptance.full_fraction: '0.8723749522718595'
+   acceptance.hist: list(4) first '[445, 304]'
+   acceptance.rate: '0.9814251214235055'
+   acceptance.valid: '111387'
+   arm: "'L4PTF'"
+   bytes_per_round: dict(6)
+   bytes_per_round.counter_restore: '331776.0'
+   bytes_per_round.published: '18716128.3'
+   bytes_per_round.residency_restore: '0'
+   bytes_per_round.row_bytes: '1028'
+   bytes_per_round.tail_where_physical_MODEL: '2728525824.0'
+   bytes_per_round.writeback: '18679786.9'
+   calls: dict(10)
+   calls.commit_calls: '194'
+   calls.deferred_recompute_rows: '0'
+   calls.j1_passes: '0'
+   calls.joint_passes: '194'
+   calls.joint_rows: '776'
+   calls.remade_rows: '0'
+   calls.replays: '37398'
+   calls.reset_calls: '194'
+   calls.residency_undo_calls: '0'
+   calls.undo_step_calls: '0'
+   compile: dict(5)
+   compile.local_words: '12'
+   compile.num_stages: '3'
+   compile.num_warps: '4'
+   compile.regs: '255'
+   compile.shared: '59392'
+   count_max: '512'
+   count_min: '512'
+   draft: dict(3)
+   draft.rows: '113892'
+   draft.skip_per_stream_per_call: '0.48517345379833526'
+   draft.steps: '389'
+   errors: list(2) first '[0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]'
+   fingerprints: dict(4)
+   fingerprints.equal: '0.031597'
+   fingerprints.max_abs_dmax: '13.375'
+   fingerprints.max_abs_dsum: '254660.34891033173'
+   fingerprints.n: '6836'
+   first_token_agreement: '216'
+   fork: dict(4)
+   fork.bound: '128'
+   fork.chunks: list(1) first '[4]'
+   fork.counters: dict(18)
+   fork.store_slots: '129'
+   gpu_peak_alloc_GB: '82.559'
+   gpu_peak_reserved_GB: '82.752'
+   joint_phases_fork: dict(5)
+   joint_phases_fork.groups_median: dict(9)
+   joint_phases_fork.labels_median: dict(8)
+   joint_phases_fork.layer_ms_median: '6.3171'
+   joint_phases_fork.layers_per_pass: '31'
+   joint_phases_fork.n_probes: '12'
+   joint_sh_steps: '3.2009'
+   kv_at_verify: dict(9)
+   kv_at_verify.block_bytes: '32896'
+   kv_at_verify.in_flight_blocks: '0'
+   kv_at_verify.in_flight_note: "'no background prefetch in L3 / L4 / L4P (--spec-prefetch is rung L5)'"
+   kv_at_verify.new_MB_per_round: '557.462'
+   kv_at_verify.new_blocks_per_round: '16946.2'
+   kv_at_verify.ready_slots_per_round: '2603038.1'
+   kv_at_verify.selected_slots_per_round: '2619984.283298772'
+   kv_at_verify.wait_ms_median: '20.205'
+   kv_at_verify.wait_rounds: '12'
+   level: "'L4P'"
+   mem_arena: dict(6)
+   mem_arena.arena: dict(16)
+   mem_arena.decode_peak_GB: '76.889'
+   mem_arena.decode_peak_reserved_GB: '77.068'
+   mem_arena.hook: "'nocopy'"
+   mem_arena.prefill_peak_GB: '78.13'
+   mem_arena.start_GB: '15.349'
+   memory: dict(9)
+   memory.arena: dict(16)
+   memory.budget_GB: '84.0'
+   memory.decode_peak_GB: '76.889'
+   memory.decode_peak_reserved_GB: '77.068'
+   memory.fit_batch_decode_MODEL: '240'
+   memory.fit_batch_prefill_MODEL: '236'
+   memory.hook: "'nocopy'"
+   memory.prefill_peak_GB: '78.13'
+   memory.start_GB: '15.349'
+   meta: dict(12)
+   meta.B: '216'
+   meta.M_alloc: '261'
+   meta.S: '16128'
+   meta.builder: "'attach'"
+   meta.free_shipped: 'True'
+   meta.horizon: '529'
+   meta.lk_max: '1042'
+   meta.n_max: '16704'
+   meta.ops: dict(8)
+   meta.pool_blocks: '65'
+   meta.score_width: '1152'
+   meta.spec: dict(13)
+   opt: dict(20)
+   opt.K: '3'
+   opt.X: '193'
+   opt.arm: "'L4PTF'"
+   opt.body: "'fused'"
+   opt.check_every: '0'
+   opt.check_phase: '0'
+   opt.extra: '16'
+   opt.fork_store: '0'
+   opt.graph: 'True'
+   opt.journal: '256'
+   opt.passes: '32'
+   opt.plant_X: '4'
+   opt.prefill_hook: "'nocopy'"
+   opt.probe_every: '16'
+   opt.profile: 'True'
+   opt.redirect: 'True'
+   opt.rounds: '0'
+   opt.spill: '0'
+   opt.tu_gemm: "'natural'"
+   opt.twin: "'fused'"
+   paper: dict(4)
+   paper.accepted_per_request_round: '2.6087724322260404'
+   paper.accepted_per_round: list(194) first '[420, 583]'
+   paper.accepted_per_round_steady_mean: '565.398'
+   paper.verify_rows_hist: list(4) first '[0, 52]'
+   phases_median: dict(4)
+   phases_median.commit: '6.004'
+   phases_median.draft: '151.363'
+   phases_median.joint: '207.377'
+   phases_median.reset: '0.11'
+   prefill_s: '559.4'
+   prelude_ms: '217.5662078857422'
+   rates: dict(6)
+   rates.effective_tok_s: '1396.7'
+   rates.mean_tok_s: '1560.5'
+   rates.median_tok_s: '1709.8'
+   rates.round_ms_median: '365.423'
+   rates.steady_rounds: '181'
+   rates.tokens_per_round_mean: '570.878'
+   rollback: "'tentative'"
+   rollback_per_round: dict(6)
+   rollback_per_round.lower_bound: 'False'
+   rollback_per_round.mean_ms: '6.395'
+   rollback_per_round.median_ms: '6.116'
+   rollback_per_round.phases: list(2) first "['reset', 'commit']"
+   rollback_per_round.rounds: '181'
+   rollback_per_round.sh_steps: '0.0944'
+   rounds: '194'
+   schedule: "'contract4'"
+   schedule_record: dict(3)
+   schedule_record.tokens_acct: dict(15)
+   schedule_record.trace_head: list(216) first "[[{'committed': 0, 'deferred': None, 'drafted': 16130, 'fed_d': [16129], 'fed_v': [], 'n': None, 'q': None, 'remade': []"
+   schedule_record.trace_tail: list(216) first "[[{'committed': 3, 'deferred': 16632, 'drafted': 16633, 'fed_d': [16632], 'fed_v': [16628, 16629, 16630], 'n': 3, 'q': 1"
+   store: dict(3)
+   store.X: '129'
+   store.cb0_GB: '0.0142'
+   store.store_GB: '1.8332'
+   tent: dict(17)
+   tent.appended: '110376'
+   tent.calls: dict(15)
+   tent.crossed: '1728'
+   tent.deferred_writes: '0'
+   tent.draft_rows: '113892'
+   tent.dropped: '3516'
+   tent.edge_rows: '411'
+   tent.fill_rows: '165'
+   tent.forced: list(32) first '[408, 408]'
+   tent.injected: list(32) first '[0, 0]'
+   tent.poison: 'False'
+   tent.replays: '37398'
+   tent.rows: '225279'
+   tent.skipped: list(32) first '[50483, 92114]'
+   tent.span_max: '5'
+   tent.tneg: 'None'
+   tent.verify_rows: '111387'
+   tokens: dict(5)
+   tokens.equal_fraction: '0.4034107349537037'
+   tokens.first: list(2) first '[33, 1]'
+   tokens.min_checked: '512'
+   tokens.n_checked: '110592'
+   tokens.n_unequal: '65978'
+   union: dict(10)
+   union.calls_per_joint_pass: dict(6)
+   union.cap: '128'
+   union.counters: dict(18)
+   union.fills: '1'
+   union.joint_passes: '194'
+   union.joint_resid: '6208'
+   union.layers: '32'
+   union.resid_per_joint_pass: '32.0'
+   union.rows: dict(5)
+   union.union_layers: '6208'
+   vs_sh: dict(3)
+   vs_sh.effective_tok_s: '1.1592'
+   vs_sh.mean_tok_s: '0.4925'
+   vs_sh.median_tok_s: '0.5128'
+   vs_strongest: '0.5018'
+   wall_s: '79.17955690808594'
+i3_r3b_2195575_i3b B 318 C 73
+  SH steady_tok_s 2575.1 steady_step_ms 123.489; I3 median_tok_s 1525.8 -> own-SH 0.59252 (req 0.5925)
+  SH_ms (req rounded inputs) 123.4860; SH_ms (raw) 123.4903; record steady_step_ms 123.489
+  joint_sh_steps 3.0937; joint (req) 382.066 = 3.094 x 123.4860; joint (raw) 382.038; joint median record 382.041
+  phases {'commit': 8.351, 'draft': 194.55, 'joint': 382.041, 'reset': 0.115} sum 585.057 round_ms_median 585.463 residual +0.406
+  kv NEW blocks 101764.2 MB 3347.635 -> MB/request 10.5272; blocks/stream 5.0002; MB check 3347.635; wait_med 153.828; rate 21.76 GB/s
+  ready / selected 0.97351; NEW / selected 0.02649
+  y_med = median_tok_s x round / B = 2.8091
+  whole run: effective_tok_s 1275.3, mean_tok_s 1377.1, wall_s 127.66689919121563, prelude_ms 285.3324890136719, rounds 209
+==================== B. R2 round span sums (L4PTFD of the profile jobs)
+  i4c_e4a_2195576_i4ca L4PTFD phases {'commit': 5.977, 'draft': 143.987, 'joint': 207.457, 'reset': 0.115} sum 357.536 round 357.981 residual +0.445 draft/2 71.993 draft_step_ms 71.993
+  i4c_e4a_2195576_i4ca L4PTFDP phases {'commit': 5.961, 'draft': 143.71, 'joint': 207.094, 'reset': 0.128} sum 356.893 round 357.275 residual +0.382 draft/2 71.855 draft_step_ms 71.855
+  profile keys ['busy_over_local_median', 'draft', 'draft_busy_over_steady_median', 'draft_passes', 'gpu_ops_median', 'joint', 'small_ms_median', 'steady_draft_ref']
+  i4c_c4b_2195576_i4cb L4PTFD phases {'commit': 8.344, 'draft': 189.278, 'joint': 383.231, 'reset': 0.117} sum 580.970 round 581.517 residual +0.547 draft/2 94.639 draft_step_ms 94.639
+  i4c_c4b_2195576_i4cb L4PTFDP phases {'commit': 8.342, 'draft': 189.431, 'joint': 383.691, 'reset': 0.131} sum 581.595 round 582.166 residual +0.571 draft/2 94.716 draft_step_ms 94.716
+  profile keys ['busy_over_local_median', 'draft', 'draft_busy_over_steady_median', 'draft_passes', 'gpu_ops_median', 'joint', 'small_ms_median', 'steady_draft_ref']
+  i4c_c3a_2195575_i4ca L4PTFD phases {'commit': 5.98, 'draft': 143.03, 'joint': 206.157, 'reset': 0.119} sum 355.286 round 355.851 residual +0.565 draft/2 71.515 draft_step_ms 71.515
+  i4c_c3a_2195575_i4ca L4PTFDP phases {'commit': 5.935, 'draft': 142.994, 'joint': 206.535, 'reset': 0.126} sum 355.590 round 355.844 residual +0.254 draft/2 71.497 draft_step_ms 71.497
+  profile keys ['busy_over_local_median', 'draft', 'draft_busy_over_steady_median', 'draft_passes', 'gpu_ops_median', 'joint', 'small_ms_median', 'steady_draft_ref']
+==================== C. TFC union counters (72.24 claim)
+  model 63 + U - I = 71.9690; 64 + U - I = 72.9690
+==================== D. Best arms (R3)
+-- i4dc_d3a_2195575_i4dca arms ['L4PTFD', 'L4PTFDGUDC', 'L4PTFDGUDCD']
+  L4PTFD draft_step_ms 71.632 (draft/2 71.632, -td +16.819, /td 1.3068) phases {'commit': 5.979, 'draft': 143.265, 'joint': 206.441, 'reset': 0.114} round 356.213 residual +0.414 median_tok_s 1757.3 NEW MB 557.462 (/B 2.5808) wait 20.206 rate 27.59 peak_prefill 83.891 peak_alloc 82.559
+  L4PTFDGUDC draft_step_ms 69.348 (draft/2 69.348, -td +14.534, /td 1.2652) phases {'commit': 6.053, 'draft': 138.696, 'joint': 185.819, 'reset': 0.118} round 331.368 residual +0.682 median_tok_s 1888.6 NEW MB 557.462 (/B 2.5808) wait 20.216 rate 27.58 peak_prefill 83.891 peak_alloc 82.596
+  L4PTFDGUDCD draft_step_ms 66.144 (draft/2 66.144, -td +11.330, /td 1.2067) phases {'commit': 6.058, 'draft': 132.287, 'joint': 186.011, 'reset': 0.12} round 324.883 residual +0.407 median_tok_s 1924.1 NEW MB 557.462 (/B 2.5808) wait 20.247 rate 27.53 peak_prefill 83.9 peak_alloc 82.604
+  tokens_acct {'accepted': 109318, 'committed': 110376, 'corrected': 1058, 'discarded': 4574, 'fills': 1050, 'final_committed': 459, 'finals': 216, 'group_committed': 109917, 'groups': 37398, 'proposed': 113892, 'remade_rows': 0, 'target_committed': 0, 'targets': 0, 'unverified_discarded': 405, 'verified': 111387}
+  acceptance {'accepted': 109318, 'committed_per_request_round': 2.634020618556701, 'full_fraction': 0.8723749522718595, 'hist': [445, 304, 1581, 35284], 'rate': 0.9814251214235055, 'valid': 111387}
+  p = corrected / (groups + finals) = 1058 / 37614 = 0.02813; corrected / groups only = 0.02829
+  accepted / verified 0.98143; corrected / committed 0.00959; committed - accepted - corrected = 0
+  whole run accepted per request-round = 109318 / (216 x 194) = 2.6088; committed 2.6340
+  accepted_per_round len 194; steady_excluded_rounds [1, 16]; steady_rounds_used 180
+  median accepted/round / B: all rounds 2.8843; excl round 0, probe (i%16==0), excluded 2.8889; mean all 2.6088
+  y_med (median_tok_s x round / B) 2.8940
+  trace_tail: 216 requests; first request first 6 events [{'committed': 3, 'deferred': 16632, 'drafted': 16633, 'fed_d': [16632], 'fed_v': [16628, 16629, 16630], 'n': 3, 'q': 16628, 'remade': [], 'role': 'group', 'round': 168, 'slot': 'J', 'verify': [16629, 16630, 16631]}, {'committed': 0, 'deferred': None, 'drafted': 16634, 'fed_d': [16633], 'fed_v': [], 'n': None, 'q': None, 'remade': [], 'role': 'draft', 'round': 168, 'slot': 'D0', 'verify': []}, {'committed': 0, 'deferred': None, 'drafted': 16635, 'fed_d': [16634], 'fed_v': [], 'n': None, 'q': None, 'remade': [], 'role': 'draft', 'round': 168, 'slot': 'D1', 'verify': []}, {'committed': 3, 'deferred': 16635, 'drafted': 16636, 'fed_d': [16635], 'fed_v': [16631, 16632, 16633], 'n': 3, 'q': 16631, 'remade': [], 'role': 'group', 'round': 169, 'slot': 'J', 'verify': [16632, 16633, 16634]}, {'committed': 0, 'deferred': None, 'drafted': 16637, 'fed_d': [16636], 'fed_v': [], 'n': None, 'q': None, 'remade': [], 'role': 'draft', 'round': 169, 'slot': 'D0', 'verify': []}, {'committed': 0, 'deferred': None, 'drafted': 16638, 'fed_d': [16637], 'fed_v': [], 'n': None, 'q': None, 'remade': [], 'role': 'draft', 'round': 169, 'slot': 'D1', 'verify': []}]
+  roles count {'group': 648, 'draft': 1296, 'final': 216, 'idle': 432}
+  last round per request: min 170 max 193; active request-rounds 38664; done 3240 (0.0773 of B x G)
+  mean active rounds 179.000; ideal 170.667; excess per reject 1.7013
+  memory: peak_with_prefill 83.9, gpu_peak_alloc 82.604; SH gpu_peak_alloc 82.043
+-- i4dc_d4b_2195576_i4dcb arms ['L4PTFD', 'L4PTFDGUDKWC', 'L4PTFDGUDKWCD']
+  L4PTFD draft_step_ms 94.772 (draft/2 94.772, -td +19.477, /td 1.2587) phases {'commit': 8.345, 'draft': 189.543, 'joint': 383.609, 'reset': 0.119} round 581.750 residual +0.134 median_tok_s 1533.2 NEW MB 3347.635 (/B 10.5272) wait 154.756 rate 21.63 peak_prefill 77.685 peak_alloc 76.932
+  L4PTFDGUDKWC draft_step_ms 92.505 (draft/2 92.505, -td +17.210, /td 1.2286) phases {'commit': 8.404, 'draft': 185.01, 'joint': 338.518, 'reset': 0.124} round 532.525 residual +0.469 median_tok_s 1673.8 NEW MB 2564.58 (/B 8.0647) wait 115.7 rate 22.17 peak_prefill 77.685 peak_alloc 76.983
+  L4PTFDGUDKWCD draft_step_ms 88.219 (draft/2 88.219, -td +12.924, /td 1.1716) phases {'commit': 8.421, 'draft': 176.437, 'joint': 338.961, 'reset': 0.125} round 524.659 residual +0.715 median_tok_s 1699.0 NEW MB 2564.58 (/B 8.0647) wait 115.643 rate 22.18 peak_prefill 77.694 peak_alloc 76.991
+  tokens_acct {'accepted': 160248, 'committed': 162498, 'corrected': 2250, 'discarded': 9571, 'fills': 2221, 'final_committed': 638, 'finals': 318, 'group_committed': 161860, 'groups': 55548, 'proposed': 169819, 'remade_rows': 0, 'target_committed': 0, 'targets': 0, 'unverified_discarded': 634, 'verified': 164743}
+  acceptance {'accepted': 160248, 'committed_per_request_round': 2.444976076555024, 'full_fraction': 0.8067166200234721, 'hist': [1001, 670, 3007, 51188], 'rate': 0.9727150774236235, 'valid': 164743}
+  p = corrected / (groups + finals) = 2250 / 55866 = 0.04027; corrected / groups only = 0.04051
+  accepted / verified 0.97272; corrected / committed 0.01385; committed - accepted - corrected = 0
+  whole run accepted per request-round = 160248 / (318 x 209) = 2.4111; committed 2.4450
+  accepted_per_round len 209; steady_excluded_rounds [1, 16]; steady_rounds_used 194
+  median accepted/round / B: all rounds 2.7767; excl round 0, probe (i%16==0), excluded 2.7799; mean all 2.4111
+  y_med (median_tok_s x round / B) 2.8031
+  trace_tail: 318 requests; first request first 6 events [{'committed': 3, 'deferred': 16632, 'drafted': 16633, 'fed_d': [16632], 'fed_v': [16628, 16629, 16630], 'n': 3, 'q': 16628, 'remade': [], 'role': 'group', 'round': 168, 'slot': 'J', 'verify': [16629, 16630, 16631]}, {'committed': 0, 'deferred': None, 'drafted': 16634, 'fed_d': [16633], 'fed_v': [], 'n': None, 'q': None, 'remade': [], 'role': 'draft', 'round': 168, 'slot': 'D0', 'verify': []}, {'committed': 0, 'deferred': None, 'drafted': 16635, 'fed_d': [16634], 'fed_v': [], 'n': None, 'q': None, 'remade': [], 'role': 'draft', 'round': 168, 'slot': 'D1', 'verify': []}, {'committed': 3, 'deferred': 16635, 'drafted': 16636, 'fed_d': [16635], 'fed_v': [16631, 16632, 16633], 'n': 3, 'q': 16631, 'remade': [], 'role': 'group', 'round': 169, 'slot': 'J', 'verify': [16632, 16633, 16634]}, {'committed': 0, 'deferred': None, 'drafted': 16637, 'fed_d': [16636], 'fed_v': [], 'n': None, 'q': None, 'remade': [], 'role': 'draft', 'round': 169, 'slot': 'D0', 'verify': []}, {'committed': 0, 'deferred': None, 'drafted': 16638, 'fed_d': [16637], 'fed_v': [], 'n': None, 'q': None, 'remade': [], 'role': 'draft', 'round': 169, 'slot': 'D1', 'verify': []}]
+  roles count {'group': 950, 'draft': 1900, 'final': 318, 'idle': 644, 'fill': 4}
+  last round per request: min 170 max 208; active request-rounds 58087; done 8375 (0.1260 of B x G)
+  mean active rounds 182.664; ideal 170.667; excess per reject 1.6956
+  memory: peak_with_prefill 77.694, gpu_peak_alloc 76.991; SH gpu_peak_alloc 74.964

@@ -1,0 +1,896 @@
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+======================== i4c_e4a_2195576_i4ca g112 joint
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': '78EE635505DD4B9EAF7DC8D0F7F49DC0', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca/trace_L4PTFDP_g112_joint.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2424522519085.8 dur_ms 234.8834; device window [2424522521243.3, 2424522758682.2] ms 237.4389; start-after-host 2.1575 ms; end-after-host 4.7130 ms
+  ops 9011 busy_ms 198.9227 sum_dur_ms 198.9227 (concurrency 0.0000 ms) idle_ms 38.5162 = host-exposed 27.2717 + device-side 11.2445; gaps >= 1 ms: [(87.25, 1.072, 'union', 'vectorized_elementwise_kernel')]
+  streams {'(0, 7)': (9011, 198.9227)}
+  H2D-class busy 21.3014 ms; other busy 177.6213 ms; H2D overlap with other ops 0.0000 ms
+  classes {'GEMM': (129, 64.7996), 'OTHER': (64, 37.6033), 'SMALL': (7437, 32.7178), 'H2D': (128, 21.3014), 'POOL': (96, 19.6149), 'STAGE1': (32, 9.8163), 'SELECT': (288, 7.274), 'FUSED': (161, 2.9735), 'COPY': (484, 1.1456), 'TWINF': (160, 1.0319), 'DIFF': (32, 0.6445)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    OTHER  kernel_unified_attention                                     (432, 2, 1)      (128, 1, 1)     32   37.1176  1159.93 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 7, 1)      (256, 1, 1)     32   31.4169   981.78 238 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 7, 4)       (256, 1, 1)     32   17.6961   553.00 238 0
+    POOL   nosa_pool_kernel_per_request                                 (2, 864, 261)    (128, 1, 1)     32   12.2842   383.88 22 100
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 864, 2)      (32, 1, 1)      32    9.8163   306.76 122 6
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (18, 7, 1)       (256, 1, 1)     32    6.8402   213.76 238 0
+    POOL   pool_swap_kernel                                             (216, 2, 64)     (256, 1, 1)     32    6.8247   213.27 88 25
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 7, 1)       (256, 1, 1)     32    6.7495   210.92 238 0
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 129)    (128, 1, 1)     32    5.5587   173.71 55 56
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 129)    (128, 1, 1)     32    5.5371   173.03 62 50
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 64)     (128, 1, 1)     32    5.1100   159.69 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 64)     (128, 1, 1)     32    5.0956   159.24 55 56
+    SELECT sbtopk::gatherTopK                                           (1728, 1, 1)     (288, 1, 1)     64    2.9057    45.40 32 98
+    SELECT radixSortKVInPlace                                           (432, 1, 1)      (32, 1, 1)      96    2.5005    26.05 249 6
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (287, 7, 1)      (256, 1, 1)      1    2.0970  2097.02 238 0
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (864, 1, 1)      (1024, 1, 1)    32    1.5889    49.65 31 100
+    SELECT radixSortKVInPlace                                           (1728, 1, 1)     (32, 1, 1)      32    1.3683    42.76 55 25
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             452    1.0930     2.42 None None
+    TWINF  _twin_kernel                                                 (216, 1, 1)      (128, 1, 1)    160    1.0319     6.45 120 13
+    DIFF   diff_kernel                                                  (2, 216, 1)      (64, 1, 1)      32    0.6445    20.14 25 13
+    FUSED  void flashinfer::norm::RMSNormKernel                         (864, 1, 1)      (32, 16, 1)     65    0.5942     9.14 32 100
+    POOL   pool_update_kernel                                           (2, 216, 1)      (64, 1, 1)      32    0.5061    15.81 32 13
+    SELECT searchsorted_cuda_kernel                                     (108, 1, 1)      (1024, 1, 1)    96    0.4996     5.20 24 50
+    OTHER  tensor_kernel_scan_innermost_dim                             (14, 1, 1)       (16, 32, 1)     32    0.4857    15.18 30 3
+    FUSED  nosa_linear_kernel                                           (864, 1, 2)      (128, 1, 1)     32    0.4646    14.52 28 100
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (108, 34, 1)     (16, 8, 1)      32    0.3258    10.18 40 75
+    COPY   Memset (Device)                                              ()               ()              32    0.0526     1.64 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (452, 156155936, 1.093), 'gpu_memset|Memset (Device)': (32, 14336, 0.0526)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (8014, 37.7357), 'cudaMemcpyAsync': (452, 3.9843), 'cuLaunchKernel': (416, 2.3235), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1954), 'cudaLaunchKernelExC': (97, 0.5552), 'cudaDeviceGetAttribute': (96, 0.0858), 'cudaFuncSetAttribute': (65, 0.0981), 'cudaMemsetAsync': (32, 0.3592), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.036), 'cudaEventRecord': (2, 0.0151)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'union': (13.4921, 9.1772, 3136), 'fetch': (7.6166, 7.1165, 288), 'attn': (7.171, 6.4195, 576), 'write': (4.237, 2.2872, 1640), 'twin': (2.4925, 1.3278, 1063), 'resid': (1.0861, 0.0, 992), 'select': (0.8297, 0.2138, 576), 'pre': (0.6355, 0.3982, 224), 'chain': (0.6127, 0.3315, 256), 'post': (0.3397, 0.0, 256), 'head': (0.0033, 0.0, 3)}
+  LABELS: device ms per class; spans (first op start .. last op end, summed over instances); busy in spans
+    attn    ops   576 dev_ms  40.3121 span_ms  47.4416 busy_in_span  40.3121 | COPY 64/0.177, OTHER 32/37.118, SELECT 32/1.368, SMALL 448/1.649
+    chain   ops   256 dev_ms   3.5039 span_ms   3.8331 busy_in_span   3.5039 | SMALL 256/3.504
+    embed   ops     1 dev_ms   0.0414 span_ms   0.0414 busy_in_span   0.0414 | SMALL 1/0.041
+    fetch   ops   288 dev_ms  12.1613 span_ms  17.7398 busy_in_span  12.1613 | H2D 64/11.096, SMALL 224/1.065
+    head    ops     3 dev_ms   2.4337 span_ms   2.4359 busy_in_span   2.4337 | FUSED 1/0.009, GEMM 1/2.097, SMALL 1/0.328
+    post    ops   256 dev_ms  58.4702 span_ms  58.7692 busy_in_span  58.4702 | COPY 32/0.053, FUSED 64/1.880, GEMM 96/55.862, SMALL 64/0.675
+    pre     ops   224 dev_ms   8.2401 span_ms   8.6468 busy_in_span   8.2401 | COPY 32/0.071, FUSED 96/1.084, GEMM 32/6.840, SMALL 64/0.245
+    resid   ops   992 dev_ms  21.0460 span_ms  22.0971 busy_in_span  21.0460 | COPY 64/0.151, DIFF 32/0.644, H2D 64/10.206, POOL 64/7.331, SMALL 768/2.714
+    select  ops   576 dev_ms  27.3100 span_ms  27.9915 busy_in_span  27.3100 | POOL 32/12.284, SELECT 64/2.906, SMALL 448/2.304, STAGE1 32/9.816
+    twin    ops  1063 dev_ms   3.9888 span_ms   6.2391 busy_in_span   3.9888 | COPY 96/0.190, SMALL 807/2.767, TWINF 160/1.032
+    union   ops  3136 dev_ms  12.0867 span_ms  25.5199 busy_in_span  12.0867 | COPY 192/0.496, OTHER 32/0.486, SELECT 192/3.000, SMALL 2720/8.105
+    write   ops  1640 dev_ms   9.3286 span_ms  13.4621 busy_in_span   9.3286 | COPY 4/0.008, SMALL 1636/9.320
+  LAYER 5 sequence (label: start offset ms, span ms, device ms, ops)
+    pre       0.0000   0.2655   0.2590    7
+    twin      0.2665   0.1615   0.1261   33
+    select    0.4291   0.8829   0.8645   18
+    resid     1.3131   0.5585   0.5252   31
+    write     1.8726   0.3373   0.2849   48
+    chain     2.2110   0.1177   0.1103    8
+    union     2.3298   0.7898   0.3793   98
+    fetch     3.1938   0.4598   0.2768    9
+    attn      3.6547   1.4472   1.1741   18
+    post      5.1029   1.8401   1.8305    8
+  first GEMMs (label, grid, block, us): [('pre@0', (18, 7, 1), (256, 1, 1), 220.3), ('post@0', (16, 7, 1), (256, 1, 1), 213.3), ('post@0', (128, 7, 1), (256, 1, 1), 989.8), ('post@0', (16, 7, 4), (256, 1, 1), 556.7), ('pre@1', (18, 7, 1), (256, 1, 1), 217.2), ('post@1', (16, 7, 1), (256, 1, 1), 214.0)]
+======================== i4c_e4a_2195576_i4ca g112 draft0
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': '54A8C13ACD1F4D76ABEA23F351F2C3AC', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca/trace_L4PTFDP_g112_draft0.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2424527866713.4 dur_ms 100.4842; device window [2424527869062.7, 2424527968325.0] ms 99.2623; start-after-host 2.3494 ms; end-after-host 1.1275 ms
+  ops 2867 busy_ms 70.1072 sum_dur_ms 70.1072 (concurrency -0.0000 ms) idle_ms 29.1551 = host-exposed 25.6583 + device-side 3.4969; gaps >= 1 ms: []
+  streams {'(0, 7)': (2867, 70.1072)}
+  H2D-class busy 1.4460 ms; other busy 68.6612 ms; H2D overlap with other ops 0.0000 ms
+  classes {'ATTN': (128, 20.4977), 'GEMM': (129, 19.7854), 'POOL': (96, 11.0743), 'SMALL': (1936, 9.4862), 'STAGE1': (32, 4.5135), 'H2D': (64, 1.446), 'FUSED': (161, 1.0792), 'SELECT': (64, 0.9299), 'DIFF': (32, 0.6392), 'COPY': (193, 0.4455), 'TWINF': (32, 0.2102)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    ATTN   void flash_fwd_splitkv_kernel                                (1, 4, 432)      (128, 1, 1)     64   19.4172   303.39 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 2, 1)      (256, 1, 1)     32   10.3992   324.98 238 0
+    POOL   pool_swap_kernel                                             (216, 2, 64)     (256, 1, 1)     32    7.4285   232.14 88 25
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 2, 3)       (256, 1, 1)     32    4.9996   156.24 238 0
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 216, 2)      (32, 1, 1)      32    4.5135   141.05 122 6
+    POOL   nosa_pool_kernel_per_request                                 (2, 216, 261)    (128, 1, 1)     32    3.1422    98.20 22 100
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (36, 2, 1)       (128, 1, 1)     32    1.9374    60.54 246 0
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (32, 2, 1)       (128, 1, 1)     32    1.7864    55.83 246 0
+    ATTN   void flash_fwd_splitkv_combine_kernel                        (1728, 1, 1)     (128, 1, 1)     64    1.0804    16.88 60 50
+    SELECT sbtopk::gatherTopK                                           (432, 1, 1)      (288, 1, 1)     64    0.9299    14.53 32 56
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 64)     (128, 1, 1)     32    0.7245    22.64 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 64)     (128, 1, 1)     32    0.7216    22.55 55 56
+    GEMM   ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_tn  (574, 1, 1)      (256, 1, 1)      1    0.6629   662.86 238 0
+    DIFF   diff_kernel                                                  (2, 216, 1)      (64, 1, 1)      32    0.6392    19.98 25 13
+    POOL   pool_update_kernel                                           (2, 216, 1)      (64, 1, 1)      32    0.5036    15.74 32 13
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             161    0.4124     2.56 None None
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (216, 1, 1)      (1024, 1, 1)    32    0.3903    12.20 31 100
+    FUSED  void flashinfer::norm::RMSNormKernel                         (216, 1, 1)      (32, 16, 1)     65    0.3257     5.01 32 50
+    TWINF  _twin_kernel                                                 (216, 1, 1)      (128, 1, 1)     32    0.2102     6.57 120 13
+    FUSED  nosa_linear_kernel                                           (216, 1, 2)      (128, 1, 1)     32    0.1876     5.86 28 25
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (27, 34, 1)      (16, 8, 1)      32    0.1757     5.49 40 53
+    COPY   Memset (Device)                                              ()               ()              32    0.0332     1.04 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (161, 46116872, 0.4124), 'gpu_memset|Memset (Device)': (32, 4096, 0.0332)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (2225, 13.1442), 'cudaMemcpyAsync': (161, 1.6715), 'cuLaunchKernel': (160, 0.996), 'cudaFuncSetAttribute': (129, 0.1522), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1582), 'cudaLaunchKernelExC': (97, 0.5789), 'cudaDeviceGetAttribute': (96, 0.0907), 'cudaStreamIsCapturing': (64, 0.0538), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.0369), 'cudaGraphLaunch': (32, 1.3797), 'cudaDriverGetVersion': (32, 0.0055), 'cudaMemsetAsync': (32, 0.4055), 'cudaEventRecord': (2, 0.017)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'resid': (10.8857, 9.7296, 880), 'select': (5.1949, 4.7157, 447), 'amask': (3.8371, 3.582, 141), 'write': (3.4199, 3.2359, 146), 'attnA': (2.4727, 2.3865, 64), 'twin': (1.2897, 1.1061, 160), 'pre': (1.1033, 0.8946, 192), 'merge': (0.4457, 0.0, 416), 'post': (0.3309, 0.0079, 256), 'bmask': (0.1027, 0.0, 96), 'attnB': (0.0684, 0.0, 64), 'head': (0.0041, 0.0, 3)}
+  LABELS: device ms per class; spans (first op start .. last op end, summed over instances); busy in spans
+    amask   ops   141 dev_ms   0.9399 span_ms   3.7993 busy_in_span   0.9399 | SMALL 141/0.940
+    attnA   ops    64 dev_ms  19.0631 span_ms  19.1011 busy_in_span  19.0631 | ATTN 64/19.063
+    attnB   ops    64 dev_ms   1.4346 span_ms   1.4682 busy_in_span   1.4346 | ATTN 64/1.435
+    bmask   ops    96 dev_ms   0.4907 span_ms   0.5593 busy_in_span   0.4907 | SMALL 96/0.491
+    embed   ops     1 dev_ms   0.0135 span_ms   0.0135 busy_in_span   0.0135 | SMALL 1/0.013
+    head    ops     3 dev_ms   0.7509 span_ms   0.7539 busy_in_span   0.7509 | FUSED 1/0.005, GEMM 1/0.663, SMALL 1/0.083
+    merge   ops   416 dev_ms   1.7010 span_ms   2.1126 busy_in_span   1.7010 | SMALL 416/1.701
+    post    ops   256 dev_ms  18.0661 span_ms  18.3625 busy_in_span  18.0661 | COPY 32/0.033, FUSED 64/0.547, GEMM 96/17.185, SMALL 64/0.300
+    pre     ops   192 dev_ms   2.5982 span_ms   3.3405 busy_in_span   2.5982 | COPY 64/0.134, FUSED 96/0.527, GEMM 32/1.937
+    resid   ops   880 dev_ms  12.5763 span_ms  23.4120 busy_in_span  12.5763 | COPY 64/0.149, DIFF 32/0.639, H2D 64/1.446, POOL 64/7.932, SMALL 656/2.410
+    select  ops   448 dev_ms   9.4801 span_ms  13.1210 busy_in_span   9.4801 | COPY 32/0.128, POOL 32/3.142, SELECT 64/0.930, SMALL 288/0.767, STAGE1 32/4.514
+    twin    ops   160 dev_ms   0.5173 span_ms   1.1741 busy_in_span   0.5173 | SMALL 128/0.307, TWINF 32/0.210
+    write   ops   146 dev_ms   2.4757 span_ms   2.9901 busy_in_span   2.4757 | COPY 1/0.002, SMALL 145/2.474
+  LAYER 5 sequence (label: start offset ms, span ms, device ms, ops)
+    pre       0.0000   0.0871   0.0818    6
+    twin      0.0881   0.0204   0.0162    5
+    select    0.1887   0.4050   0.2959   14
+    resid     0.5949   0.7411   0.3199   27
+    write     1.4310   0.0787   0.0753    4
+    amask     1.5380   0.1162   0.0284    4
+    attnA     1.7321   0.5977   0.5966    2
+    bmask     2.3308   0.0173   0.0152    3
+    attnB     2.3497   0.0459   0.0448    2
+    merge     2.3966   0.0662   0.0535   13
+    post      2.4639   0.5718   0.5629    8
+  first GEMMs (label, grid, block, us): [('pre@0', (36, 2, 1), (128, 1, 1), 57.2), ('post@0', (32, 2, 1), (128, 1, 1), 56.0), ('post@0', (128, 2, 1), (256, 1, 1), 324.4), ('post@0', (16, 2, 3), (256, 1, 1), 153.3), ('pre@1', (36, 2, 1), (128, 1, 1), 60.8), ('post@1', (32, 2, 1), (128, 1, 1), 56.1)]
+======================== i4c_e4a_2195576_i4ca g112 draft1
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': '8B0503F46E2F42B893BC75F5ADA52702', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca/trace_L4PTFDP_g112_draft1.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2424529238829.2 dur_ms 96.4291; device window [2424529241174.4, 2424529336435.2] ms 95.2608; start-after-host 2.3452 ms; end-after-host 1.1770 ms
+  ops 2867 busy_ms 68.4373 sum_dur_ms 68.4372 (concurrency -0.0000 ms) idle_ms 26.8236 = host-exposed 23.3161 + device-side 3.5074; gaps >= 1 ms: [(58.927, 1.036, 'merge', 'vectorized_elementwise_kernel')]
+  streams {'(0, 7)': (2867, 68.4372)}
+  H2D-class busy 1.4477 ms; other busy 66.9895 ms; H2D overlap with other ops 0.0000 ms
+  classes {'ATTN': (128, 20.4753), 'GEMM': (129, 19.8039), 'SMALL': (1936, 9.486), 'POOL': (96, 9.4165), 'STAGE1': (32, 4.5086), 'H2D': (64, 1.4477), 'FUSED': (161, 1.0767), 'SELECT': (64, 0.9293), 'DIFF': (32, 0.638), 'COPY': (193, 0.4443), 'TWINF': (32, 0.2109)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    ATTN   void flash_fwd_splitkv_kernel                                (1, 4, 432)      (128, 1, 1)     64   19.3984   303.10 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 2, 1)      (256, 1, 1)     32   10.3949   324.84 238 0
+    POOL   pool_swap_kernel                                             (216, 2, 64)     (256, 1, 1)     32    5.7681   180.25 88 25
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 2, 3)       (256, 1, 1)     32    5.0308   157.21 238 0
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 216, 2)      (32, 1, 1)      32    4.5086   140.89 122 6
+    POOL   nosa_pool_kernel_per_request                                 (2, 216, 261)    (128, 1, 1)     32    3.1440    98.25 22 100
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (36, 2, 1)       (128, 1, 1)     32    1.9306    60.33 246 0
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (32, 2, 1)       (128, 1, 1)     32    1.7871    55.85 246 0
+    ATTN   void flash_fwd_splitkv_combine_kernel                        (1728, 1, 1)     (128, 1, 1)     64    1.0769    16.83 60 50
+    SELECT sbtopk::gatherTopK                                           (432, 1, 1)      (288, 1, 1)     64    0.9293    14.52 32 56
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 64)     (128, 1, 1)     32    0.7253    22.67 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 64)     (128, 1, 1)     32    0.7224    22.58 55 56
+    GEMM   ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_tn  (574, 1, 1)      (256, 1, 1)      1    0.6604   660.42 238 0
+    DIFF   diff_kernel                                                  (2, 216, 1)      (64, 1, 1)      32    0.6380    19.94 25 13
+    POOL   pool_update_kernel                                           (2, 216, 1)      (64, 1, 1)      32    0.5044    15.76 32 13
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             161    0.4113     2.55 None None
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (216, 1, 1)      (1024, 1, 1)    32    0.3896    12.18 31 100
+    FUSED  void flashinfer::norm::RMSNormKernel                         (216, 1, 1)      (32, 16, 1)     65    0.3241     4.99 32 50
+    TWINF  _twin_kernel                                                 (216, 1, 1)      (128, 1, 1)     32    0.2109     6.59 120 13
+    FUSED  nosa_linear_kernel                                           (216, 1, 2)      (128, 1, 1)     32    0.1892     5.91 28 25
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (27, 34, 1)      (16, 8, 1)      32    0.1738     5.43 40 53
+    COPY   Memset (Device)                                              ()               ()              32    0.0330     1.03 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (161, 46116872, 0.4113), 'gpu_memset|Memset (Device)': (32, 4096, 0.033)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (2225, 12.282), 'cudaMemcpyAsync': (161, 1.6468), 'cuLaunchKernel': (160, 0.9299), 'cudaFuncSetAttribute': (129, 0.1517), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1577), 'cudaLaunchKernelExC': (97, 0.5356), 'cudaDeviceGetAttribute': (96, 0.0841), 'cudaStreamIsCapturing': (64, 0.0519), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.0376), 'cudaGraphLaunch': (32, 1.3418), 'cudaDriverGetVersion': (32, 0.0056), 'cudaMemsetAsync': (32, 0.4023), 'cudaEventRecord': (2, 0.0228)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'resid': (11.0687, 9.874, 880), 'amask': (3.3689, 3.1076, 141), 'write': (3.344, 3.1644, 146), 'select': (2.5056, 2.0513, 445), 'attnA': (2.293, 2.2026, 64), 'merge': (1.6169, 1.1655, 416), 'pre': (1.0991, 0.8925, 192), 'twin': (0.8763, 0.7057, 160), 'post': (0.4782, 0.1525, 256), 'bmask': (0.1014, 0.0, 96), 'attnB': (0.0683, 0.0, 64), 'head': (0.0031, 0.0, 3)}
+  LABELS: device ms per class; spans (first op start .. last op end, summed over instances); busy in spans
+    amask   ops   141 dev_ms   0.9413 span_ms   3.5021 busy_in_span   0.9413 | SMALL 141/0.941
+    attnA   ops    64 dev_ms  19.0415 span_ms  19.0800 busy_in_span  19.0415 | ATTN 64/19.041
+    attnB   ops    64 dev_ms   1.4338 span_ms   1.4680 busy_in_span   1.4338 | ATTN 64/1.434
+    bmask   ops    96 dev_ms   0.4941 span_ms   0.5623 busy_in_span   0.4941 | SMALL 96/0.494
+    embed   ops     1 dev_ms   0.0131 span_ms   0.0131 busy_in_span   0.0131 | SMALL 1/0.013
+    head    ops     3 dev_ms   0.7493 span_ms   0.7513 busy_in_span   0.7493 | FUSED 1/0.005, GEMM 1/0.660, SMALL 1/0.084
+    merge   ops   416 dev_ms   1.7005 span_ms   2.2493 busy_in_span   1.7005 | SMALL 416/1.701
+    post    ops   256 dev_ms  18.0915 span_ms  18.4078 busy_in_span  18.0915 | COPY 32/0.033, FUSED 64/0.546, GEMM 96/17.213, SMALL 64/0.299
+    pre     ops   192 dev_ms   2.5893 span_ms   3.3683 busy_in_span   2.5893 | COPY 64/0.133, FUSED 96/0.525, GEMM 32/1.931
+    resid   ops   880 dev_ms  10.9082 span_ms  21.9392 busy_in_span  10.9082 | COPY 64/0.148, DIFF 32/0.638, H2D 64/1.448, POOL 64/6.272, SMALL 656/2.402
+    select  ops   448 dev_ms   9.4739 span_ms  11.6741 busy_in_span   9.4739 | COPY 32/0.128, POOL 32/3.144, SELECT 64/0.929, SMALL 288/0.764, STAGE1 32/4.509
+    twin    ops   160 dev_ms   0.5167 span_ms   0.9220 busy_in_span   0.5167 | SMALL 128/0.306, TWINF 32/0.211
+    write   ops   146 dev_ms   2.4841 span_ms   2.9014 busy_in_span   2.4841 | COPY 1/0.002, SMALL 145/2.482
+  LAYER 5 sequence (label: start offset ms, span ms, device ms, ops)
+    pre       0.0000   0.0860   0.0805    6
+    twin      0.0871   0.0204   0.0162    5
+    select    0.1087   0.3824   0.2958   14
+    resid     0.4922   0.6511   0.2845   27
+    write     1.2285   0.0796   0.0765    4
+    amask     1.3287   0.0984   0.0282    4
+    attnA     1.4906   0.5957   0.5942    2
+    bmask     2.0872   0.0175   0.0154    3
+    attnB     2.1059   0.0455   0.0444    2
+    merge     2.1525   0.0657   0.0532   13
+    post      2.2192   0.5741   0.5651    8
+  first GEMMs (label, grid, block, us): [('pre@0', (36, 2, 1), (128, 1, 1), 56.3), ('post@0', (32, 2, 1), (128, 1, 1), 55.8), ('post@0', (128, 2, 1), (256, 1, 1), 324.5), ('post@0', (16, 2, 3), (256, 1, 1), 154.7), ('pre@1', (36, 2, 1), (128, 1, 1), 60.9), ('post@1', (32, 2, 1), (128, 1, 1), 56.3)]
+STITCH i4c_e4a_2195576_i4ca g112: device windows on one clock? joint [2424522521243.3, 2424522758682.2], draft0 [2424527869062.7, 2424527968325.0], draft1 [2424529241174.4, 2424529336435.2]; joint end -> draft0 start 5110.380 ms; draft0 end -> draft1 start 1272.849 ms
+======================== i4c_e4a_2195576_i4ca g96 joint
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': '09E8009A3A3B42DB9315EEFE790E2EAE', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca/trace_L4PTFDP_g96_joint.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2424510466463.2 dur_ms 236.8412; device window [2424510472808.2, 2424510707884.8] ms 235.0766; start-after-host 6.3449 ms; end-after-host 4.5804 ms
+  ops 9142 busy_ms 195.6904 sum_dur_ms 195.6904 (concurrency -0.0000 ms) idle_ms 39.3862 = host-exposed 28.5686 + device-side 10.8176; gaps >= 1 ms: [(0.04, 1.029, '?', 'void flashinfer::norm::RMSNormKernel'), (1.079, 1.722, '?', 'ampere_bf16_s16816gemm_bf16_256x128_ldg8'), (3.089, 1.669, '?', 'elementwise_kernel'), (14.39, 1.538, '?', 'searchsorted_cuda_kernel'), (50.769, 1.447, '?', 'elementwise_kernel')]
+  streams {'(0, 7)': (9142, 195.6904)}
+  H2D-class busy 18.2480 ms; other busy 177.4425 ms; H2D overlap with other ops 0.0000 ms
+  classes {'GEMM': (129, 64.7678), 'OTHER': (64, 37.1084), 'SMALL': (7536, 33.3781), 'POOL': (96, 19.5224), 'H2D': (128, 18.248), 'STAGE1': (32, 9.423), 'SELECT': (288, 7.2607), 'FUSED': (161, 2.974), 'TWINF': (192, 1.2194), 'COPY': (484, 1.1467), 'DIFF': (32, 0.6418)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    OTHER  kernel_unified_attention                                     (432, 2, 1)      (128, 1, 1)     32   36.6233  1144.48 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 7, 1)      (256, 1, 1)     32   31.4068   981.46 238 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 7, 4)       (256, 1, 1)     32   17.6801   552.50 238 0
+    POOL   nosa_pool_kernel_per_request                                 (2, 864, 261)    (128, 1, 1)     32   12.2623   383.20 22 100
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 864, 2)      (32, 1, 1)      32    9.4230   294.47 122 6
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (18, 7, 1)       (256, 1, 1)     32    6.8330   213.53 238 0
+    POOL   pool_swap_kernel                                             (216, 2, 64)     (256, 1, 1)     32    6.7563   211.13 88 25
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 7, 1)       (256, 1, 1)     32    6.7403   210.63 238 0
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 129)    (128, 1, 1)     32    5.4959   171.75 55 56
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 129)    (128, 1, 1)     32    5.4491   170.28 62 50
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 64)     (128, 1, 1)     32    3.6577   114.30 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 64)     (128, 1, 1)     32    3.6452   113.91 55 56
+    SELECT sbtopk::gatherTopK                                           (1728, 1, 1)     (288, 1, 1)     64    2.8997    45.31 32 98
+    SELECT radixSortKVInPlace                                           (432, 1, 1)      (32, 1, 1)      96    2.4961    26.00 249 6
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (287, 7, 1)      (256, 1, 1)      1    2.1076  2107.61 238 0
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (864, 1, 1)      (1024, 1, 1)    32    1.5909    49.72 31 100
+    SELECT radixSortKVInPlace                                           (1728, 1, 1)     (32, 1, 1)      32    1.3660    42.69 55 25
+    TWINF  _twin_kernel                                                 (216, 1, 1)      (128, 1, 1)    192    1.2194     6.35 120 13
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             452    1.0936     2.42 None None
+    DIFF   diff_kernel                                                  (2, 216, 1)      (64, 1, 1)      32    0.6418    20.06 25 13
+    FUSED  void flashinfer::norm::RMSNormKernel                         (864, 1, 1)      (32, 16, 1)     65    0.5924     9.11 32 100
+    POOL   pool_update_kernel                                           (2, 216, 1)      (64, 1, 1)      32    0.5039    15.75 32 13
+    SELECT searchsorted_cuda_kernel                                     (108, 1, 1)      (1024, 1, 1)    96    0.4990     5.20 24 50
+    OTHER  tensor_kernel_scan_innermost_dim                             (14, 1, 1)       (16, 32, 1)     32    0.4851    15.16 30 3
+    FUSED  nosa_linear_kernel                                           (864, 1, 2)      (128, 1, 1)     32    0.4642    14.51 28 100
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (108, 34, 1)     (16, 8, 1)      32    0.3265    10.20 40 75
+    COPY   Memset (Device)                                              ()               ()              32    0.0531     1.66 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (452, 156155936, 1.0936), 'gpu_memset|Memset (Device)': (32, 14336, 0.0531)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (8113, 38.5855), 'cudaMemcpyAsync': (452, 3.8758), 'cuLaunchKernel': (448, 2.406), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1435), 'cudaLaunchKernelExC': (97, 0.5353), 'cudaDeviceGetAttribute': (96, 0.0859), 'cudaFuncSetAttribute': (65, 0.0959), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.0357), 'cudaMemsetAsync': (32, 0.3674), 'cudaEventRecord': (2, 0.0282)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'?': (39.3862, 28.5686, 9141)}
+======================== i4c_e4a_2195576_i4ca g96 draft0
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': 'BC80D9AD6EEC446BBF43F2B1C01763C2', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca/trace_L4PTFDP_g96_draft0.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2424514687837.8 dur_ms 81.4079; device window [2424514688743.1, 2424514770490.8] ms 81.7477; start-after-host 0.9053 ms; end-after-host 1.2452 ms
+  ops 2867 busy_ms 69.4464 sum_dur_ms 69.4464 (concurrency -0.0000 ms) idle_ms 12.3013 = host-exposed 9.0101 + device-side 3.2912; gaps >= 1 ms: []
+  streams {'(0, 7)': (2867, 69.4464)}
+  H2D-class busy 1.4461 ms; other busy 68.0004 ms; H2D overlap with other ops 0.0000 ms
+  classes {'ATTN': (128, 20.4353), 'GEMM': (129, 19.8359), 'POOL': (96, 10.4737), 'SMALL': (1936, 9.476), 'STAGE1': (32, 4.4848), 'H2D': (64, 1.4461), 'FUSED': (161, 1.0687), 'SELECT': (64, 0.9307), 'DIFF': (32, 0.6374), 'COPY': (193, 0.4464), 'TWINF': (32, 0.2113)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    ATTN   void flash_fwd_splitkv_kernel                                (1, 4, 432)      (128, 1, 1)     64   19.3549   302.42 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 2, 1)      (256, 1, 1)     32   10.4047   325.15 238 0
+    POOL   pool_swap_kernel                                             (216, 2, 64)     (256, 1, 1)     32    6.8252   213.29 88 25
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 2, 3)       (256, 1, 1)     32    5.0464   157.70 238 0
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 216, 2)      (32, 1, 1)      32    4.4848   140.15 122 6
+    POOL   nosa_pool_kernel_per_request                                 (2, 216, 261)    (128, 1, 1)     32    3.1455    98.30 22 100
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (36, 2, 1)       (128, 1, 1)     32    1.9285    60.27 246 0
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (32, 2, 1)       (128, 1, 1)     32    1.7894    55.92 246 0
+    ATTN   void flash_fwd_splitkv_combine_kernel                        (1728, 1, 1)     (128, 1, 1)     64    1.0804    16.88 60 50
+    SELECT sbtopk::gatherTopK                                           (432, 1, 1)      (288, 1, 1)     64    0.9307    14.54 32 56
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 64)     (128, 1, 1)     32    0.7245    22.64 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 64)     (128, 1, 1)     32    0.7216    22.55 55 56
+    GEMM   ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_tn  (574, 1, 1)      (256, 1, 1)      1    0.6669   666.92 238 0
+    DIFF   diff_kernel                                                  (2, 216, 1)      (64, 1, 1)      32    0.6374    19.92 25 13
+    POOL   pool_update_kernel                                           (2, 216, 1)      (64, 1, 1)      32    0.5030    15.72 32 13
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             161    0.4126     2.56 None None
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (216, 1, 1)      (1024, 1, 1)    32    0.3908    12.21 31 100
+    FUSED  void flashinfer::norm::RMSNormKernel                         (216, 1, 1)      (32, 16, 1)     65    0.3235     4.98 32 50
+    TWINF  _twin_kernel                                                 (216, 1, 1)      (128, 1, 1)     32    0.2113     6.60 120 13
+    FUSED  nosa_linear_kernel                                           (216, 1, 2)      (128, 1, 1)     32    0.1877     5.87 28 25
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (27, 34, 1)      (16, 8, 1)      32    0.1668     5.21 40 53
+    COPY   Memset (Device)                                              ()               ()              32    0.0338     1.06 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (161, 46116872, 0.4126), 'gpu_memset|Memset (Device)': (32, 4096, 0.0338)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (2225, 11.1649), 'cudaMemcpyAsync': (161, 1.4798), 'cuLaunchKernel': (160, 0.9069), 'cudaFuncSetAttribute': (129, 0.1321), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1498), 'cudaLaunchKernelExC': (97, 0.508), 'cudaDeviceGetAttribute': (96, 0.0834), 'cudaStreamIsCapturing': (64, 0.0528), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.0474), 'cudaGraphLaunch': (32, 1.3777), 'cudaDriverGetVersion': (32, 0.0052), 'cudaMemsetAsync': (32, 0.388), 'cudaEventRecord': (2, 0.0185)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'?': (12.3013, 9.0101, 2864)}
+======================== i4c_e4a_2195576_i4ca g96 draft1
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': 'F17D4C7E54AA41E2AD59EDF2D7256BC0', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca/trace_L4PTFDP_g96_draft1.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2424515742286.2 dur_ms 80.7732; device window [2424515743034.7, 2424515824283.8] ms 81.2491; start-after-host 0.7485 ms; end-after-host 1.2244 ms
+  ops 2867 busy_ms 68.2837 sum_dur_ms 68.2837 (concurrency -0.0000 ms) idle_ms 12.9654 = host-exposed 9.6296 + device-side 3.3358; gaps >= 1 ms: []
+  streams {'(0, 7)': (2867, 68.2837)}
+  H2D-class busy 1.4535 ms; other busy 66.8302 ms; H2D overlap with other ops 0.0000 ms
+  classes {'ATTN': (128, 20.465), 'GEMM': (129, 19.8575), 'SMALL': (1936, 9.5285), 'POOL': (96, 9.2084), 'STAGE1': (32, 4.4708), 'H2D': (64, 1.4535), 'FUSED': (161, 1.0684), 'SELECT': (64, 0.9334), 'DIFF': (32, 0.6395), 'COPY': (193, 0.447), 'TWINF': (32, 0.2116)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    ATTN   void flash_fwd_splitkv_kernel                                (1, 4, 432)      (128, 1, 1)     64   19.3846   302.88 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 2, 1)      (256, 1, 1)     32   10.4285   325.89 238 0
+    POOL   pool_swap_kernel                                             (216, 2, 64)     (256, 1, 1)     32    5.5472   173.35 88 25
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 2, 3)       (256, 1, 1)     32    5.0458   157.68 238 0
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 216, 2)      (32, 1, 1)      32    4.4708   139.71 122 6
+    POOL   nosa_pool_kernel_per_request                                 (2, 216, 261)    (128, 1, 1)     32    3.1575    98.67 22 100
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (36, 2, 1)       (128, 1, 1)     32    1.9229    60.09 246 0
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (32, 2, 1)       (128, 1, 1)     32    1.7938    56.06 246 0
+    ATTN   void flash_fwd_splitkv_combine_kernel                        (1728, 1, 1)     (128, 1, 1)     64    1.0805    16.88 60 50
+    SELECT sbtopk::gatherTopK                                           (432, 1, 1)      (288, 1, 1)     64    0.9334    14.58 32 56
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 64)     (128, 1, 1)     32    0.7281    22.75 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 64)     (128, 1, 1)     32    0.7254    22.67 55 56
+    GEMM   ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_tn  (574, 1, 1)      (256, 1, 1)      1    0.6664   666.44 238 0
+    DIFF   diff_kernel                                                  (2, 216, 1)      (64, 1, 1)      32    0.6395    19.99 25 13
+    POOL   pool_update_kernel                                           (2, 216, 1)      (64, 1, 1)      32    0.5037    15.74 32 13
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             161    0.4079     2.53 None None
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (216, 1, 1)      (1024, 1, 1)    32    0.3917    12.24 31 100
+    FUSED  void flashinfer::norm::RMSNormKernel                         (216, 1, 1)      (32, 16, 1)     65    0.3259     5.01 32 50
+    TWINF  _twin_kernel                                                 (216, 1, 1)      (128, 1, 1)     32    0.2116     6.61 120 13
+    FUSED  nosa_linear_kernel                                           (216, 1, 2)      (128, 1, 1)     32    0.1892     5.91 28 25
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (27, 34, 1)      (16, 8, 1)      32    0.1617     5.05 40 53
+    COPY   Memset (Device)                                              ()               ()              32    0.0391     1.22 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (161, 46116872, 0.4079), 'gpu_memset|Memset (Device)': (32, 4096, 0.0391)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (2225, 11.1173), 'cudaMemcpyAsync': (161, 1.508), 'cuLaunchKernel': (160, 0.9232), 'cudaFuncSetAttribute': (129, 0.135), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1464), 'cudaLaunchKernelExC': (97, 0.506), 'cudaDeviceGetAttribute': (96, 0.0803), 'cudaStreamIsCapturing': (64, 0.0653), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.0364), 'cudaGraphLaunch': (32, 1.1531), 'cudaDriverGetVersion': (32, 0.0056), 'cudaMemsetAsync': (32, 0.3845), 'cudaEventRecord': (2, 0.0214)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'?': (12.9654, 9.6296, 2864)}
+STITCH i4c_e4a_2195576_i4ca g96: device windows on one clock? joint [2424510472808.2, 2424510707884.8], draft0 [2424514688743.1, 2424514770490.8], draft1 [2424515743034.7, 2424515824283.8]; joint end -> draft0 start 3980.858 ms; draft0 end -> draft1 start 972.544 ms
+======================== i4c_c3a_2195575_i4ca g112 joint
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': 'A0703128DB514595B016DD28137B4BF4', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca/trace_L4PTFDP_g112_joint.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2413839285037.6 dur_ms 237.3969; device window [2413839287194.8, 2413839527139.5] ms 239.9446; start-after-host 2.1573 ms; end-after-host 4.7050 ms
+  ops 9011 busy_ms 197.0599 sum_dur_ms 197.0599 (concurrency 0.0000 ms) idle_ms 42.8848 = host-exposed 30.8801 + device-side 12.0046; gaps >= 1 ms: [(14.728, 1.224, 'union', 'vectorized_elementwise_kernel'), (87.536, 1.084, 'union', 'vectorized_elementwise_kernel')]
+  streams {'(0, 7)': (9011, 197.0599)}
+  H2D-class busy 21.3729 ms; other busy 175.6870 ms; H2D overlap with other ops 0.0000 ms
+  classes {'GEMM': (129, 64.4815), 'OTHER': (64, 37.4004), 'SMALL': (7437, 31.3523), 'H2D': (128, 21.3729), 'POOL': (96, 19.6204), 'STAGE1': (32, 9.8314), 'SELECT': (288, 7.2638), 'FUSED': (161, 2.9436), 'COPY': (484, 1.1338), 'TWINF': (160, 1.0181), 'DIFF': (32, 0.6418)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    OTHER  kernel_unified_attention                                     (432, 2, 1)      (128, 1, 1)     32   36.9140  1153.56 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 7, 1)      (256, 1, 1)     32   31.2074   975.23 238 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 7, 4)       (256, 1, 1)     32   17.6291   550.91 238 0
+    POOL   nosa_pool_kernel_per_request                                 (2, 864, 261)    (128, 1, 1)     32   12.3070   384.59 22 100
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 864, 2)      (32, 1, 1)      32    9.8314   307.23 122 6
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (18, 7, 1)       (256, 1, 1)     32    6.8109   212.84 238 0
+    POOL   pool_swap_kernel                                             (216, 2, 64)     (256, 1, 1)     32    6.8096   212.80 88 25
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 7, 1)       (256, 1, 1)     32    6.7532   211.04 238 0
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 129)    (128, 1, 1)     32    5.6326   176.02 55 56
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 129)    (128, 1, 1)     32    5.5774   174.29 62 50
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 64)     (128, 1, 1)     32    5.0913   159.10 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 64)     (128, 1, 1)     32    5.0716   158.49 55 56
+    SELECT sbtopk::gatherTopK                                           (1728, 1, 1)     (288, 1, 1)     64    2.9022    45.35 32 98
+    SELECT radixSortKVInPlace                                           (432, 1, 1)      (32, 1, 1)      96    2.4996    26.04 249 6
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (287, 7, 1)      (256, 1, 1)      1    2.0808  2080.82 238 0
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (864, 1, 1)      (1024, 1, 1)    32    1.5611    48.79 31 100
+    SELECT radixSortKVInPlace                                           (1728, 1, 1)     (32, 1, 1)      32    1.3673    42.73 55 25
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             452    1.0805     2.39 None None
+    TWINF  _twin_kernel                                                 (216, 1, 1)      (128, 1, 1)    160    1.0181     6.36 120 13
+    DIFF   diff_kernel                                                  (2, 216, 1)      (64, 1, 1)      32    0.6418    20.06 25 13
+    FUSED  void flashinfer::norm::RMSNormKernel                         (864, 1, 1)      (32, 16, 1)     65    0.5898     9.07 32 100
+    POOL   pool_update_kernel                                           (2, 216, 1)      (64, 1, 1)      32    0.5038    15.74 32 13
+    SELECT searchsorted_cuda_kernel                                     (108, 1, 1)      (1024, 1, 1)    96    0.4947     5.15 24 50
+    OTHER  tensor_kernel_scan_innermost_dim                             (14, 1, 1)       (16, 32, 1)     32    0.4864    15.20 30 3
+    FUSED  nosa_linear_kernel                                           (864, 1, 2)      (128, 1, 1)     32    0.4645    14.51 28 100
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (108, 34, 1)     (16, 8, 1)      32    0.3282    10.26 40 75
+    COPY   Memset (Device)                                              ()               ()              32    0.0533     1.67 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (452, 156155936, 1.0805), 'gpu_memset|Memset (Device)': (32, 14336, 0.0533)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (8014, 37.9184), 'cudaMemcpyAsync': (452, 4.1103), 'cuLaunchKernel': (416, 2.3399), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.2173), 'cudaLaunchKernelExC': (97, 0.5712), 'cudaDeviceGetAttribute': (96, 0.0931), 'cudaFuncSetAttribute': (65, 0.098), 'cudaMemsetAsync': (32, 0.372), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.0395), 'cudaEventRecord': (2, 0.0147)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'union': (17.7413, 13.1018, 3136), 'fetch': (8.2071, 7.7019, 288), 'attn': (7.0111, 6.2283, 576), 'write': (3.7482, 1.6453, 1640), 'twin': (2.595, 1.354, 1063), 'resid': (1.1801, 0.0, 992), 'select': (0.8487, 0.195, 576), 'pre': (0.6836, 0.433, 224), 'chain': (0.5171, 0.2208, 256), 'post': (0.3491, 0.0, 256), 'head': (0.0036, 0.0, 3)}
+  LABELS: device ms per class; spans (first op start .. last op end, summed over instances); busy in spans
+    attn    ops   576 dev_ms  40.0825 span_ms  47.0482 busy_in_span  40.0825 | COPY 64/0.177, OTHER 32/36.914, SELECT 32/1.367, SMALL 448/1.624
+    chain   ops   256 dev_ms   3.4729 span_ms   3.8016 busy_in_span   3.4729 | SMALL 256/3.473
+    embed   ops     1 dev_ms   0.0412 span_ms   0.0412 busy_in_span   0.0412 | SMALL 1/0.041
+    fetch   ops   288 dev_ms  12.2528 span_ms  18.0341 busy_in_span  12.2528 | H2D 64/11.210, SMALL 224/1.043
+    head    ops     3 dev_ms   2.4161 span_ms   2.4185 busy_in_span   2.4161 | FUSED 1/0.009, GEMM 1/2.081, SMALL 1/0.326
+    post    ops   256 dev_ms  58.1748 span_ms  58.4815 busy_in_span  58.1748 | COPY 32/0.053, FUSED 64/1.853, GEMM 96/55.590, SMALL 64/0.679
+    pre     ops   224 dev_ms   8.2011 span_ms   8.6450 busy_in_span   8.2011 | COPY 32/0.070, FUSED 96/1.082, GEMM 32/6.811, SMALL 64/0.239
+    resid   ops   992 dev_ms  20.9234 span_ms  22.0668 busy_in_span  20.9234 | COPY 64/0.149, DIFF 32/0.642, H2D 64/10.163, POOL 64/7.313, SMALL 768/2.656
+    select  ops   576 dev_ms  27.3020 span_ms  28.0064 busy_in_span  27.3020 | POOL 32/12.307, SELECT 64/2.902, SMALL 448/2.261, STAGE1 32/9.831
+    twin    ops  1063 dev_ms   3.5710 span_ms   5.9071 busy_in_span   3.5711 | COPY 96/0.189, SMALL 807/2.364, TWINF 160/1.018
+    union   ops  3136 dev_ms  11.9278 span_ms  29.6322 busy_in_span  11.9278 | COPY 192/0.490, OTHER 32/0.486, SELECT 192/2.994, SMALL 2720/7.957
+    write   ops  1640 dev_ms   8.6944 span_ms  12.3528 busy_in_span   8.6944 | COPY 4/0.006, SMALL 1636/8.688
+  LAYER 5 sequence (label: start offset ms, span ms, device ms, ops)
+    pre       0.0000   0.2638   0.2572    7
+    twin      0.2649   0.1491   0.1118   33
+    select    0.4153   0.8757   0.8566   18
+    resid     1.2923   0.5550   0.5192   31
+    write     1.8484   0.3210   0.2651   48
+    chain     2.1707   0.1170   0.1089    8
+    union     2.2890   0.9554   0.3745   98
+    fetch     3.3266   0.4685   0.2847    9
+    attn      3.7962   1.4379   1.1673   18
+    post      5.2356   1.8347   1.8240    8
+  first GEMMs (label, grid, block, us): [('pre@0', (18, 7, 1), (256, 1, 1), 219.3), ('post@0', (16, 7, 1), (256, 1, 1), 212.2), ('post@0', (128, 7, 1), (256, 1, 1), 979.2), ('post@0', (16, 7, 4), (256, 1, 1), 552.4), ('pre@1', (18, 7, 1), (256, 1, 1), 214.5), ('post@1', (16, 7, 1), (256, 1, 1), 212.9)]
+======================== i4c_c3a_2195575_i4ca g112 draft0
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': 'F1F3EDE88B584D9AAB80B1837E20BD94', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca/trace_L4PTFDP_g112_draft0.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2413844635519.0 dur_ms 101.3027; device window [2413844637856.1, 2413844737922.7] ms 100.0666; start-after-host 2.3370 ms; end-after-host 1.1009 ms
+  ops 2867 busy_ms 69.7495 sum_dur_ms 69.7495 (concurrency -0.0000 ms) idle_ms 30.3170 = host-exposed 26.6626 + device-side 3.6545; gaps >= 1 ms: []
+  streams {'(0, 7)': (2867, 69.7495)}
+  H2D-class busy 1.4462 ms; other busy 68.3034 ms; H2D overlap with other ops 0.0000 ms
+  classes {'ATTN': (128, 20.4886), 'GEMM': (129, 19.7144), 'POOL': (96, 11.0746), 'SMALL': (1936, 9.249), 'STAGE1': (32, 4.4951), 'H2D': (64, 1.4462), 'FUSED': (161, 1.0586), 'SELECT': (64, 0.932), 'DIFF': (32, 0.6407), 'COPY': (193, 0.4401), 'TWINF': (32, 0.2102)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    ATTN   void flash_fwd_splitkv_kernel                                (1, 4, 432)      (128, 1, 1)     64   19.4002   303.13 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 2, 1)      (256, 1, 1)     32   10.3917   324.74 238 0
+    POOL   pool_swap_kernel                                             (216, 2, 64)     (256, 1, 1)     32    7.4154   231.73 88 25
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 2, 3)       (256, 1, 1)     32    4.9597   154.99 238 0
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 216, 2)      (32, 1, 1)      32    4.4951   140.47 122 6
+    POOL   nosa_pool_kernel_per_request                                 (2, 216, 261)    (128, 1, 1)     32    3.1557    98.62 22 100
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (36, 2, 1)       (128, 1, 1)     32    1.9113    59.73 246 0
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (32, 2, 1)       (128, 1, 1)     32    1.7942    56.07 246 0
+    ATTN   void flash_fwd_splitkv_combine_kernel                        (1728, 1, 1)     (128, 1, 1)     64    1.0884    17.01 60 50
+    SELECT sbtopk::gatherTopK                                           (432, 1, 1)      (288, 1, 1)     64    0.9320    14.56 32 56
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 64)     (128, 1, 1)     32    0.7237    22.62 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 64)     (128, 1, 1)     32    0.7225    22.58 55 56
+    GEMM   ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_tn  (574, 1, 1)      (256, 1, 1)      1    0.6575   657.54 238 0
+    DIFF   diff_kernel                                                  (2, 216, 1)      (64, 1, 1)      32    0.6407    20.02 25 13
+    POOL   pool_update_kernel                                           (2, 216, 1)      (64, 1, 1)      32    0.5034    15.73 32 13
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             161    0.4069     2.53 None None
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (216, 1, 1)      (1024, 1, 1)    32    0.3811    11.91 31 100
+    FUSED  void flashinfer::norm::RMSNormKernel                         (216, 1, 1)      (32, 16, 1)     65    0.3220     4.95 32 50
+    TWINF  _twin_kernel                                                 (216, 1, 1)      (128, 1, 1)     32    0.2102     6.57 120 13
+    FUSED  nosa_linear_kernel                                           (216, 1, 2)      (128, 1, 1)     32    0.1860     5.81 28 25
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (27, 34, 1)      (16, 8, 1)      32    0.1696     5.30 40 53
+    COPY   Memset (Device)                                              ()               ()              32    0.0332     1.04 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (161, 46116872, 0.4069), 'gpu_memset|Memset (Device)': (32, 4096, 0.0332)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (2225, 13.1023), 'cudaMemcpyAsync': (161, 1.7624), 'cuLaunchKernel': (160, 1.0122), 'cudaFuncSetAttribute': (129, 0.1653), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1685), 'cudaLaunchKernelExC': (97, 0.5723), 'cudaDeviceGetAttribute': (96, 0.0829), 'cudaStreamIsCapturing': (64, 0.0551), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.0425), 'cudaGraphLaunch': (32, 1.3827), 'cudaDriverGetVersion': (32, 0.0045), 'cudaMemsetAsync': (32, 0.4163), 'cudaEventRecord': (2, 0.0178)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'resid': (11.0146, 9.8, 880), 'select': (5.5529, 5.057, 446), 'amask': (3.923, 3.6788, 141), 'write': (3.4924, 3.3101, 146), 'attnA': (2.5586, 2.4708, 64), 'twin': (1.5939, 1.3911, 160), 'pre': (1.1757, 0.9547, 192), 'merge': (0.4778, 0.0, 416), 'post': (0.3412, 0.0, 256), 'bmask': (0.11, 0.0, 96), 'attnB': (0.0727, 0.0, 64), 'head': (0.0043, 0.0, 3)}
+  LABELS: device ms per class; spans (first op start .. last op end, summed over instances); busy in spans
+    amask   ops   141 dev_ms   0.8786 span_ms   3.8173 busy_in_span   0.8786 | SMALL 141/0.879
+    attnA   ops    64 dev_ms  19.0422 span_ms  19.0811 busy_in_span  19.0422 | ATTN 64/19.042
+    attnB   ops    64 dev_ms   1.4464 span_ms   1.4822 busy_in_span   1.4464 | ATTN 64/1.446
+    bmask   ops    96 dev_ms   0.4897 span_ms   0.5642 busy_in_span   0.4897 | SMALL 96/0.490
+    embed   ops     1 dev_ms   0.0133 span_ms   0.0133 busy_in_span   0.0133 | SMALL 1/0.013
+    head    ops     3 dev_ms   0.7466 span_ms   0.7497 busy_in_span   0.7466 | FUSED 1/0.005, GEMM 1/0.658, SMALL 1/0.084
+    merge   ops   416 dev_ms   1.7037 span_ms   2.1466 busy_in_span   1.7037 | SMALL 416/1.704
+    post    ops   256 dev_ms  18.0081 span_ms  18.3123 busy_in_span  18.0081 | COPY 32/0.033, FUSED 64/0.536, GEMM 96/17.146, SMALL 64/0.294
+    pre     ops   192 dev_ms   2.5621 span_ms   3.3529 busy_in_span   2.5621 | COPY 64/0.133, FUSED 96/0.518, GEMM 32/1.911
+    resid   ops   880 dev_ms  12.4952 span_ms  23.4568 busy_in_span  12.4952 | COPY 64/0.148, DIFF 32/0.641, H2D 64/1.446, POOL 64/7.919, SMALL 656/2.342
+    select  ops   448 dev_ms   9.4375 span_ms  13.0667 busy_in_span   9.4375 | COPY 32/0.125, POOL 32/3.156, SELECT 64/0.932, SMALL 288/0.730, STAGE1 32/4.495
+    twin    ops   160 dev_ms   0.4665 span_ms   1.2853 busy_in_span   0.4665 | SMALL 128/0.256, TWINF 32/0.210
+    write   ops   146 dev_ms   2.4597 span_ms   2.9502 busy_in_span   2.4597 | COPY 1/0.002, SMALL 145/2.458
+  LAYER 5 sequence (label: start offset ms, span ms, device ms, ops)
+    pre       0.0000   0.0872   0.0808    6
+    twin      0.0884   0.0213   0.0147    5
+    select    0.2003   0.4120   0.2943   14
+    resid     0.6134   0.7534   0.3146   27
+    write     1.4651   0.0797   0.0763    4
+    amask     1.5765   0.1122   0.0262    4
+    attnA     1.7735   0.5920   0.5908    2
+    bmask     2.3667   0.0173   0.0152    3
+    attnB     2.3850   0.0462   0.0451    2
+    merge     2.4323   0.0671   0.0534   13
+    post      2.5007   0.5721   0.5627    8
+  first GEMMs (label, grid, block, us): [('pre@0', (36, 2, 1), (128, 1, 1), 57.4), ('post@0', (32, 2, 1), (128, 1, 1), 56.2), ('post@0', (128, 2, 1), (256, 1, 1), 324.0), ('post@0', (16, 2, 3), (256, 1, 1), 155.3), ('pre@1', (36, 2, 1), (128, 1, 1), 59.8), ('post@1', (32, 2, 1), (128, 1, 1), 56.4)]
+======================== i4c_c3a_2195575_i4ca g112 draft1
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': 'BF4643ADC9674BAE8F4DA6CF9615280E', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca/trace_L4PTFDP_g112_draft1.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2413846008175.7 dur_ms 99.0175; device window [2413846010574.7, 2413846108334.7] ms 97.7600; start-after-host 2.3990 ms; end-after-host 1.1414 ms
+  ops 2867 busy_ms 68.0698 sum_dur_ms 68.0698 (concurrency -0.0000 ms) idle_ms 29.6901 = host-exposed 26.0257 + device-side 3.6644; gaps >= 1 ms: []
+  streams {'(0, 7)': (2867, 68.0698)}
+  H2D-class busy 1.4481 ms; other busy 66.6217 ms; H2D overlap with other ops 0.0000 ms
+  classes {'ATTN': (128, 20.4757), 'GEMM': (129, 19.7012), 'POOL': (96, 9.4159), 'SMALL': (1936, 9.2562), 'STAGE1': (32, 4.4994), 'H2D': (64, 1.4481), 'FUSED': (161, 1.0582), 'SELECT': (64, 0.9303), 'DIFF': (32, 0.6403), 'COPY': (193, 0.4334), 'TWINF': (32, 0.2112)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    ATTN   void flash_fwd_splitkv_kernel                                (1, 4, 432)      (128, 1, 1)     64   19.3851   302.89 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 2, 1)      (256, 1, 1)     32   10.3772   324.29 238 0
+    POOL   pool_swap_kernel                                             (216, 2, 64)     (256, 1, 1)     32    5.7567   179.90 88 25
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 2, 3)       (256, 1, 1)     32    4.9656   155.17 238 0
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 216, 2)      (32, 1, 1)      32    4.4994   140.61 122 6
+    POOL   nosa_pool_kernel_per_request                                 (2, 216, 261)    (128, 1, 1)     32    3.1551    98.60 22 100
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (36, 2, 1)       (128, 1, 1)     32    1.9070    59.59 246 0
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (32, 2, 1)       (128, 1, 1)     32    1.7936    56.05 246 0
+    ATTN   void flash_fwd_splitkv_combine_kernel                        (1728, 1, 1)     (128, 1, 1)     64    1.0905    17.04 60 50
+    SELECT sbtopk::gatherTopK                                           (432, 1, 1)      (288, 1, 1)     64    0.9303    14.54 32 56
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 64)     (128, 1, 1)     32    0.7252    22.66 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 64)     (128, 1, 1)     32    0.7229    22.59 55 56
+    GEMM   ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_tn  (574, 1, 1)      (256, 1, 1)      1    0.6580   657.96 238 0
+    DIFF   diff_kernel                                                  (2, 216, 1)      (64, 1, 1)      32    0.6403    20.01 25 13
+    POOL   pool_update_kernel                                           (2, 216, 1)      (64, 1, 1)      32    0.5042    15.76 32 13
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             161    0.4003     2.49 None None
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (216, 1, 1)      (1024, 1, 1)    32    0.3808    11.90 31 100
+    FUSED  void flashinfer::norm::RMSNormKernel                         (216, 1, 1)      (32, 16, 1)     65    0.3210     4.94 32 50
+    TWINF  _twin_kernel                                                 (216, 1, 1)      (128, 1, 1)     32    0.2112     6.60 120 13
+    FUSED  nosa_linear_kernel                                           (216, 1, 2)      (128, 1, 1)     32    0.1870     5.84 28 25
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (27, 34, 1)      (16, 8, 1)      32    0.1693     5.29 40 53
+    COPY   Memset (Device)                                              ()               ()              32    0.0331     1.03 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (161, 46116872, 0.4003), 'gpu_memset|Memset (Device)': (32, 4096, 0.0331)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (2225, 12.4587), 'cudaMemcpyAsync': (161, 1.7492), 'cuLaunchKernel': (160, 0.9763), 'cudaFuncSetAttribute': (129, 0.151), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1686), 'cudaLaunchKernelExC': (97, 0.5652), 'cudaDeviceGetAttribute': (96, 0.0836), 'cudaStreamIsCapturing': (64, 0.0559), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.0427), 'cudaGraphLaunch': (32, 1.4143), 'cudaDriverGetVersion': (32, 0.0043), 'cudaMemsetAsync': (32, 0.429), 'cudaEventRecord': (2, 0.0202)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'resid': (11.8966, 10.6459, 880), 'select': (3.8908, 3.4042, 448), 'amask': (3.5967, 3.3526, 141), 'write': (3.5438, 3.3657, 146), 'attnA': (2.3591, 2.2729, 64), 'merge': (1.5267, 1.0416, 416), 'pre': (1.1435, 0.9246, 192), 'twin': (1.0049, 0.8216, 160), 'post': (0.5387, 0.1967, 256), 'bmask': (0.1119, 0.0, 96), 'attnB': (0.0736, 0.0, 64), 'head': (0.0039, 0.0, 3)}
+  LABELS: device ms per class; spans (first op start .. last op end, summed over instances); busy in spans
+    amask   ops   141 dev_ms   0.8768 span_ms   3.5970 busy_in_span   0.8768 | SMALL 141/0.877
+    attnA   ops    64 dev_ms  19.0284 span_ms  19.0662 busy_in_span  19.0284 | ATTN 64/19.028
+    attnB   ops    64 dev_ms   1.4473 span_ms   1.4841 busy_in_span   1.4473 | ATTN 64/1.447
+    bmask   ops    96 dev_ms   0.4918 span_ms   0.5678 busy_in_span   0.4918 | SMALL 96/0.492
+    embed   ops     1 dev_ms   0.0128 span_ms   0.0128 busy_in_span   0.0128 | SMALL 1/0.013
+    head    ops     3 dev_ms   0.7467 span_ms   0.7491 busy_in_span   0.7467 | FUSED 1/0.005, GEMM 1/0.658, SMALL 1/0.084
+    merge   ops   416 dev_ms   1.6995 span_ms   3.1893 busy_in_span   1.6996 | SMALL 416/1.700
+    post    ops   256 dev_ms  17.9983 span_ms  18.3320 busy_in_span  17.9983 | COPY 32/0.033, FUSED 64/0.536, GEMM 96/17.136, SMALL 64/0.293
+    pre     ops   192 dev_ms   2.5521 span_ms   3.3724 busy_in_span   2.5521 | COPY 64/0.128, FUSED 96/0.517, GEMM 32/1.907
+    resid   ops   880 dev_ms  10.8462 span_ms  22.7041 busy_in_span  10.8462 | COPY 64/0.147, DIFF 32/0.640, H2D 64/1.448, POOL 64/6.261, SMALL 656/2.350
+    select  ops   448 dev_ms   9.4371 span_ms  12.6725 busy_in_span   9.4371 | COPY 32/0.124, POOL 32/3.155, SELECT 64/0.930, SMALL 288/0.729, STAGE1 32/4.499
+    twin    ops   160 dev_ms   0.4688 span_ms   0.9135 busy_in_span   0.4688 | SMALL 128/0.258, TWINF 32/0.211
+    write   ops   146 dev_ms   2.4639 span_ms   2.9127 busy_in_span   2.4639 | COPY 1/0.002, SMALL 145/2.462
+  LAYER 5 sequence (label: start offset ms, span ms, device ms, ops)
+    pre       0.0000   0.0851   0.0793    6
+    twin      0.0861   0.0192   0.0149    5
+    select    0.1128   0.4025   0.2951   14
+    resid     0.5165   0.6652   0.2838   27
+    write     1.2812   0.0788   0.0754    4
+    amask     1.3864   0.1044   0.0267    4
+    attnA     1.5606   0.5955   0.5942    2
+    bmask     2.1570   0.0179   0.0156    3
+    attnB     2.1760   0.0468   0.0456    2
+    merge     2.2239   0.0672   0.0531   13
+    post      2.2921   0.5699   0.5604    8
+  first GEMMs (label, grid, block, us): [('pre@0', (36, 2, 1), (128, 1, 1), 56.5), ('post@0', (32, 2, 1), (128, 1, 1), 56.0), ('post@0', (128, 2, 1), (256, 1, 1), 323.8), ('post@0', (16, 2, 3), (256, 1, 1), 154.3), ('pre@1', (36, 2, 1), (128, 1, 1), 58.7), ('post@1', (32, 2, 1), (128, 1, 1), 56.1)]
+STITCH i4c_c3a_2195575_i4ca g112: device windows on one clock? joint [2413839287194.8, 2413839527139.5], draft0 [2413844637856.1, 2413844737922.7], draft1 [2413846010574.7, 2413846108334.7]; joint end -> draft0 start 5110.717 ms; draft0 end -> draft1 start 1272.652 ms
+======================== i4c_c3a_2195575_i4ca g96 joint
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': 'CA49BB60F943462CB95EBEFC14018FF6', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca/trace_L4PTFDP_g96_joint.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2413827263700.7 dur_ms 238.4709; device window [2413827270220.3, 2413827506756.7] ms 236.5364; start-after-host 6.5196 ms; end-after-host 4.5852 ms
+  ops 9142 busy_ms 194.0361 sum_dur_ms 194.0361 (concurrency 0.0000 ms) idle_ms 42.5003 = host-exposed 30.8406 + device-side 11.6597; gaps >= 1 ms: [(0.977, 1.737, '?', 'ampere_bf16_s16816gemm_bf16_256x128_ldg8'), (3.017, 1.696, '?', 'elementwise_kernel'), (14.428, 1.551, '?', 'searchsorted_cuda_kernel'), (51.484, 1.494, '?', 'kernel_unified_attention')]
+  streams {'(0, 7)': (9142, 194.0361)}
+  H2D-class busy 18.2361 ms; other busy 175.8000 ms; H2D overlap with other ops 0.0000 ms
+  classes {'GEMM': (129, 64.5439), 'OTHER': (64, 37.0781), 'SMALL': (7536, 31.9352), 'POOL': (96, 19.5836), 'H2D': (128, 18.2361), 'STAGE1': (32, 9.4797), 'SELECT': (288, 7.2676), 'FUSED': (161, 2.9342), 'TWINF': (192, 1.2013), 'COPY': (484, 1.1348), 'DIFF': (32, 0.6417)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    OTHER  kernel_unified_attention                                     (432, 2, 1)      (128, 1, 1)     32   36.5910  1143.47 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 7, 1)      (256, 1, 1)     32   31.2261   975.82 238 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 7, 4)       (256, 1, 1)     32   17.6559   551.75 238 0
+    POOL   nosa_pool_kernel_per_request                                 (2, 864, 261)    (128, 1, 1)     32   12.3230   385.09 22 100
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 864, 2)      (32, 1, 1)      32    9.4797   296.24 122 6
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (18, 7, 1)       (256, 1, 1)     32    6.8141   212.94 238 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 7, 1)       (256, 1, 1)     32    6.7569   211.15 238 0
+    POOL   pool_swap_kernel                                             (216, 2, 64)     (256, 1, 1)     32    6.7567   211.15 88 25
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 129)    (128, 1, 1)     32    5.5077   172.12 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 129)    (128, 1, 1)     32    5.4518   170.37 55 56
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 64)     (128, 1, 1)     32    3.6464   113.95 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 64)     (128, 1, 1)     32    3.6302   113.44 55 56
+    SELECT sbtopk::gatherTopK                                           (1728, 1, 1)     (288, 1, 1)     64    2.9005    45.32 32 98
+    SELECT radixSortKVInPlace                                           (432, 1, 1)      (32, 1, 1)      96    2.5019    26.06 249 6
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (287, 7, 1)      (256, 1, 1)      1    2.0909  2090.93 238 0
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (864, 1, 1)      (1024, 1, 1)    32    1.5517    48.49 31 100
+    SELECT radixSortKVInPlace                                           (1728, 1, 1)     (32, 1, 1)      32    1.3703    42.82 55 25
+    TWINF  _twin_kernel                                                 (216, 1, 1)      (128, 1, 1)    192    1.2013     6.26 120 13
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             452    1.0821     2.39 None None
+    DIFF   diff_kernel                                                  (2, 216, 1)      (64, 1, 1)      32    0.6417    20.05 25 13
+    FUSED  void flashinfer::norm::RMSNormKernel                         (864, 1, 1)      (32, 16, 1)     65    0.5900     9.08 32 100
+    POOL   pool_update_kernel                                           (2, 216, 1)      (64, 1, 1)      32    0.5038    15.75 32 13
+    SELECT searchsorted_cuda_kernel                                     (108, 1, 1)      (1024, 1, 1)    96    0.4949     5.16 24 50
+    OTHER  tensor_kernel_scan_innermost_dim                             (14, 1, 1)       (16, 32, 1)     32    0.4870    15.22 30 3
+    FUSED  nosa_linear_kernel                                           (864, 1, 2)      (128, 1, 1)     32    0.4643    14.51 28 100
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (108, 34, 1)     (16, 8, 1)      32    0.3282    10.25 40 75
+    COPY   Memset (Device)                                              ()               ()              32    0.0526     1.64 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (452, 156155936, 1.0821), 'gpu_memset|Memset (Device)': (32, 14336, 0.0526)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (8113, 38.5765), 'cudaMemcpyAsync': (452, 3.9462), 'cuLaunchKernel': (448, 2.4794), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1588), 'cudaLaunchKernelExC': (97, 0.5629), 'cudaDeviceGetAttribute': (96, 0.0845), 'cudaFuncSetAttribute': (65, 0.0907), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.0398), 'cudaMemsetAsync': (32, 0.3749), 'cudaEventRecord': (2, 0.0252)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'?': (42.5003, 30.8406, 9141)}
+======================== i4c_c3a_2195575_i4ca g96 draft0
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': 'F09A5F802B8F4AD0BBA231572551B81E', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca/trace_L4PTFDP_g96_draft0.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2413831486031.2 dur_ms 83.0222; device window [2413831486942.3, 2413831570268.4] ms 83.3262; start-after-host 0.9111 ms; end-after-host 1.2151 ms
+  ops 2867 busy_ms 69.0862 sum_dur_ms 69.0862 (concurrency -0.0000 ms) idle_ms 14.2400 = host-exposed 10.7957 + device-side 3.4443; gaps >= 1 ms: []
+  streams {'(0, 7)': (2867, 69.0862)}
+  H2D-class busy 1.4453 ms; other busy 67.6409 ms; H2D overlap with other ops 0.0000 ms
+  classes {'ATTN': (128, 20.4873), 'GEMM': (129, 19.6857), 'POOL': (96, 10.4738), 'SMALL': (1936, 9.2539), 'STAGE1': (32, 4.4704), 'H2D': (64, 1.4453), 'FUSED': (161, 1.0522), 'SELECT': (64, 0.9306), 'DIFF': (32, 0.6379), 'COPY': (193, 0.4387), 'TWINF': (32, 0.2102)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    ATTN   void flash_fwd_splitkv_kernel                                (1, 4, 432)      (128, 1, 1)     64   19.4015   303.15 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 2, 1)      (256, 1, 1)     32   10.3703   324.07 238 0
+    POOL   pool_swap_kernel                                             (216, 2, 64)     (256, 1, 1)     32    6.8215   213.17 88 25
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 2, 3)       (256, 1, 1)     32    4.9571   154.91 238 0
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 216, 2)      (32, 1, 1)      32    4.4704   139.70 122 6
+    POOL   nosa_pool_kernel_per_request                                 (2, 216, 261)    (128, 1, 1)     32    3.1501    98.44 22 100
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (36, 2, 1)       (128, 1, 1)     32    1.9121    59.75 246 0
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (32, 2, 1)       (128, 1, 1)     32    1.7860    55.81 246 0
+    ATTN   void flash_fwd_splitkv_combine_kernel                        (1728, 1, 1)     (128, 1, 1)     64    1.0859    16.97 60 50
+    SELECT sbtopk::gatherTopK                                           (432, 1, 1)      (288, 1, 1)     64    0.9306    14.54 32 56
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 64)     (128, 1, 1)     32    0.7235    22.61 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 64)     (128, 1, 1)     32    0.7218    22.56 55 56
+    GEMM   ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_tn  (574, 1, 1)      (256, 1, 1)      1    0.6602   660.20 238 0
+    DIFF   diff_kernel                                                  (2, 216, 1)      (64, 1, 1)      32    0.6379    19.93 25 13
+    POOL   pool_update_kernel                                           (2, 216, 1)      (64, 1, 1)      32    0.5022    15.69 32 13
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             161    0.4045     2.51 None None
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (216, 1, 1)      (1024, 1, 1)    32    0.3800    11.88 31 100
+    FUSED  void flashinfer::norm::RMSNormKernel                         (216, 1, 1)      (32, 16, 1)     65    0.3212     4.94 32 50
+    TWINF  _twin_kernel                                                 (216, 1, 1)      (128, 1, 1)     32    0.2102     6.57 120 13
+    FUSED  nosa_linear_kernel                                           (216, 1, 2)      (128, 1, 1)     32    0.1857     5.80 28 25
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (27, 34, 1)      (16, 8, 1)      32    0.1652     5.16 40 53
+    COPY   Memset (Device)                                              ()               ()              32    0.0343     1.07 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (161, 46116872, 0.4045), 'gpu_memset|Memset (Device)': (32, 4096, 0.0343)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (2225, 11.2628), 'cudaMemcpyAsync': (161, 1.5382), 'cuLaunchKernel': (160, 0.9595), 'cudaFuncSetAttribute': (129, 0.1334), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1563), 'cudaLaunchKernelExC': (97, 0.5299), 'cudaDeviceGetAttribute': (96, 0.0787), 'cudaStreamIsCapturing': (64, 0.055), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.0433), 'cudaGraphLaunch': (32, 1.4168), 'cudaDriverGetVersion': (32, 0.005), 'cudaMemsetAsync': (32, 0.4161), 'cudaEventRecord': (2, 0.0184)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'?': (14.24, 10.7957, 2866)}
+======================== i4c_c3a_2195575_i4ca g96 draft1
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': 'EBDDC5A1CE814609BEADDCE482AD923E', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca/trace_L4PTFDP_g96_draft1.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2413832536516.2 dur_ms 82.4315; device window [2413832537215.6, 2413832620188.6] ms 82.9730; start-after-host 0.6993 ms; end-after-host 1.2408 ms
+  ops 2867 busy_ms 67.7685 sum_dur_ms 67.7684 (concurrency -0.0000 ms) idle_ms 15.2046 = host-exposed 11.7074 + device-side 3.4971; gaps >= 1 ms: [(65.029, 1.324, '?', 'ampere_bf16_s16816gemm_bf16_256x128_ldg8')]
+  streams {'(0, 7)': (2867, 67.7684)}
+  H2D-class busy 1.4494 ms; other busy 66.3191 ms; H2D overlap with other ops 0.0000 ms
+  classes {'ATTN': (128, 20.4489), 'GEMM': (129, 19.6799), 'SMALL': (1936, 9.2505), 'POOL': (96, 9.1983), 'STAGE1': (32, 4.4742), 'H2D': (64, 1.4494), 'FUSED': (161, 1.0479), 'SELECT': (64, 0.9323), 'DIFF': (32, 0.6383), 'COPY': (193, 0.4388), 'TWINF': (32, 0.2101)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    ATTN   void flash_fwd_splitkv_kernel                                (1, 4, 432)      (128, 1, 1)     64   19.3619   302.53 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 2, 1)      (256, 1, 1)     32   10.3739   324.18 238 0
+    POOL   pool_swap_kernel                                             (216, 2, 64)     (256, 1, 1)     32    5.5368   173.03 88 25
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 2, 3)       (256, 1, 1)     32    4.9501   154.69 238 0
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 216, 2)      (32, 1, 1)      32    4.4742   139.82 122 6
+    POOL   nosa_pool_kernel_per_request                                 (2, 216, 261)    (128, 1, 1)     32    3.1577    98.68 22 100
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (36, 2, 1)       (128, 1, 1)     32    1.9052    59.54 246 0
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (32, 2, 1)       (128, 1, 1)     32    1.7890    55.91 246 0
+    ATTN   void flash_fwd_splitkv_combine_kernel                        (1728, 1, 1)     (128, 1, 1)     64    1.0870    16.98 60 50
+    SELECT sbtopk::gatherTopK                                           (432, 1, 1)      (288, 1, 1)     64    0.9323    14.57 32 56
+    H2D    flash_h2d_from_mask_bias_kernel                              (216, 2, 64)     (128, 1, 1)     32    0.7256    22.68 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (216, 2, 64)     (128, 1, 1)     32    0.7238    22.62 55 56
+    GEMM   ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_tn  (574, 1, 1)      (256, 1, 1)      1    0.6617   661.70 238 0
+    DIFF   diff_kernel                                                  (2, 216, 1)      (64, 1, 1)      32    0.6383    19.95 25 13
+    POOL   pool_update_kernel                                           (2, 216, 1)      (64, 1, 1)      32    0.5037    15.74 32 13
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             161    0.4014     2.49 None None
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (216, 1, 1)      (1024, 1, 1)    32    0.3799    11.87 31 100
+    FUSED  void flashinfer::norm::RMSNormKernel                         (216, 1, 1)      (32, 16, 1)     65    0.3206     4.93 32 50
+    TWINF  _twin_kernel                                                 (216, 1, 1)      (128, 1, 1)     32    0.2101     6.57 120 13
+    FUSED  nosa_linear_kernel                                           (216, 1, 2)      (128, 1, 1)     32    0.1858     5.81 28 25
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (27, 34, 1)      (16, 8, 1)      32    0.1615     5.05 40 53
+    COPY   Memset (Device)                                              ()               ()              32    0.0373     1.17 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (161, 46116872, 0.4014), 'gpu_memset|Memset (Device)': (32, 4096, 0.0373)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (2225, 10.9608), 'cudaMemcpyAsync': (161, 1.525), 'cuLaunchKernel': (160, 0.9387), 'cudaFuncSetAttribute': (129, 0.1347), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1547), 'cudaLaunchKernelExC': (97, 0.5248), 'cudaDeviceGetAttribute': (96, 0.0795), 'cudaStreamIsCapturing': (64, 0.0552), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.0412), 'cudaGraphLaunch': (32, 1.2519), 'cudaDriverGetVersion': (32, 0.0045), 'cudaMemsetAsync': (32, 0.4016), 'cudaEventRecord': (2, 0.0193)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'?': (15.2046, 11.7074, 2865)}
+STITCH i4c_c3a_2195575_i4ca g96: device windows on one clock? joint [2413827270220.3, 2413827506756.7], draft0 [2413831486942.3, 2413831570268.4], draft1 [2413832537215.6, 2413832620188.6]; joint end -> draft0 start 3980.186 ms; draft0 end -> draft1 start 966.947 ms
+======================== i4c_c4b_2195576_i4cb g112 joint
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': '2F3293552653443083FAF7DFFB944A40', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb/trace_L4PTFDP_g112_joint.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2415416500946.1 dur_ms 350.5552; device window [2415416503343.3, 2415416900015.9] ms 396.6727; start-after-host 2.3972 ms; end-after-host 48.5146 ms
+  ops 9011 busy_ms 383.9143 sum_dur_ms 383.9142 (concurrency -0.0000 ms) idle_ms 12.7584 = host-exposed 3.0928 + device-side 9.6656; gaps >= 1 ms: []
+  streams {'(0, 7)': (9011, 383.9142)}
+  H2D-class busy 160.1359 ms; other busy 223.7783 ms; H2D overlap with other ops 0.0000 ms
+  classes {'H2D': (128, 160.1359), 'GEMM': (129, 79.879), 'OTHER': (64, 52.6554), 'SMALL': (7437, 35.9427), 'POOL': (96, 25.0619), 'STAGE1': (32, 13.5402), 'SELECT': (288, 9.2777), 'FUSED': (161, 4.2528), 'TWINF': (160, 1.3138), 'COPY': (484, 1.1439), 'DIFF': (32, 0.7108)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    OTHER  kernel_unified_attention                                     (636, 2, 1)      (128, 1, 1)     32   52.1650  1630.16 255 0
+    H2D    flash_h2d_from_mask_kernel                                   (318, 2, 129)    (128, 1, 1)     32   44.9542  1404.82 55 56
+    H2D    flash_h2d_from_mask_bias_kernel                              (318, 2, 129)    (128, 1, 1)     32   44.9239  1403.87 62 50
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 10, 1)     (256, 1, 1)     32   42.1642  1317.63 238 0
+    H2D    flash_h2d_from_mask_bias_kernel                              (318, 2, 64)     (128, 1, 1)     32   35.1475  1098.36 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (318, 2, 64)     (128, 1, 1)     32   35.1103  1097.20 55 56
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 10, 2)      (256, 1, 1)     32   20.9186   653.71 238 0
+    POOL   nosa_pool_kernel_per_request                                 (2, 1272, 261)   (128, 1, 1)     32   18.1037   565.74 22 100
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 1272, 2)     (32, 1, 1)      32   13.5402   423.13 122 6
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 10, 1)      (256, 1, 1)     32    6.9133   216.04 238 0
+    GEMM   ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_tn  (36, 5, 1)       (256, 1, 1)     32    6.9038   215.74 238 0
+    POOL   pool_swap_kernel                                             (318, 2, 64)     (256, 1, 1)     32    6.7592   211.23 88 25
+    SELECT sbtopk::gatherTopK                                           (2544, 1, 1)     (288, 1, 1)     64    4.1181    64.35 32 98
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (287, 10, 1)     (256, 1, 1)      1    2.9790  2979.04 238 0
+    SELECT radixSortKVInPlace                                           (636, 1, 1)      (32, 1, 1)      64    2.3522    36.75 249 9
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (1272, 1, 1)     (1024, 1, 1)    32    2.2859    71.43 31 100
+    SELECT radixSortKVInPlace                                           (2544, 1, 1)     (32, 1, 1)      32    1.9844    62.01 55 37
+    TWINF  _twin_kernel                                                 (318, 1, 1)      (128, 1, 1)    160    1.3138     8.21 120 18
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             452    1.0909     2.41 None None
+    FUSED  void flashinfer::norm::RMSNormKernel                         (1272, 1, 1)     (32, 16, 1)     65    0.8108    12.47 32 100
+    FUSED  nosa_linear_kernel                                           (1272, 1, 2)     (128, 1, 1)     32    0.7421    23.19 28 100
+    DIFF   diff_kernel                                                  (2, 318, 1)      (64, 1, 1)      32    0.7108    22.21 25 18
+    SELECT searchsorted_cuda_kernel                                     (159, 1, 1)      (1024, 1, 1)    96    0.5796     6.04 24 74
+    OTHER  tensor_kernel_scan_innermost_dim                             (20, 1, 1)       (16, 32, 1)     32    0.4905    15.33 30 5
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (159, 34, 1)     (16, 8, 1)      32    0.4141    12.94 40 75
+    SELECT bitonicSortKVInPlace                                         (636, 1, 1)      (16, 1, 1)      32    0.2435     7.61 40 5
+    POOL   pool_update_kernel                                           (2, 318, 1)      (64, 1, 1)      32    0.1990     6.22 32 18
+    COPY   Memset (Device)                                              ()               ()              32    0.0530     1.66 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (452, 211986464, 1.0909), 'gpu_memset|Memset (Device)': (32, 20480, 0.053)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (8014, 140.3281), 'cudaMemcpyAsync': (452, 4.0363), 'cuLaunchKernel': (416, 16.0014), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (288, 0.1653), 'cudaDeviceGetAttribute': (224, 0.1486), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1766), 'cudaLaunchKernelExC': (97, 0.5593), 'cudaFuncSetAttribute': (65, 0.0973), 'cudaFuncGetAttributes': (32, 0.144), 'cudaMemsetAsync': (32, 0.3834), 'cudaEventRecord': (2, 0.0147)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'union': (4.2659, 0.877, 3136), 'twin': (2.461, 1.3147, 1063), 'write': (1.7224, 0.0, 1640), 'resid': (1.0417, 0.0, 992), 'select': (0.7957, 0.189, 576), 'pre': (0.6181, 0.3857, 224), 'attn': (0.6082, 0.0, 576), 'fetch': (0.5526, 0.2472, 288), 'chain': (0.3508, 0.0791, 256), 'post': (0.3389, 0.0, 256), 'head': (0.0031, 0.0, 3)}
+  LABELS: device ms per class; spans (first op start .. last op end, summed over instances); busy in spans
+    attn    ops   576 dev_ms  56.1065 span_ms  56.6805 busy_in_span  56.1065 | COPY 64/0.178, OTHER 32/52.165, SELECT 32/1.984, SMALL 448/1.779
+    chain   ops   256 dev_ms   4.5397 span_ms   4.8158 busy_in_span   4.5397 | SMALL 256/4.540
+    embed   ops     1 dev_ms   0.0586 span_ms   0.0586 busy_in_span   0.0586 | SMALL 1/0.059
+    fetch   ops   288 dev_ms  91.0844 span_ms  91.5291 busy_in_span  91.0844 | H2D 64/89.878, SMALL 224/1.206
+    head    ops     3 dev_ms   3.4701 span_ms   3.4722 busy_in_span   3.4701 | FUSED 1/0.013, GEMM 1/2.979, SMALL 1/0.478
+    post    ops   256 dev_ms  73.6410 span_ms  73.9400 busy_in_span  73.6410 | COPY 32/0.053, FUSED 64/2.679, GEMM 96/69.996, SMALL 64/0.912
+    pre     ops   224 dev_ms   8.8052 span_ms   9.1930 busy_in_span   8.8052 | COPY 32/0.078, FUSED 96/1.561, GEMM 32/6.904, SMALL 64/0.262
+    resid   ops   992 dev_ms  81.1582 span_ms  82.1656 busy_in_span  81.1582 | COPY 64/0.156, DIFF 32/0.711, H2D 64/70.258, POOL 64/6.958, SMALL 768/3.076
+    select  ops   576 dev_ms  38.4720 span_ms  39.1281 busy_in_span  38.4720 | POOL 32/18.104, SELECT 64/4.118, SMALL 448/2.710, STAGE1 32/13.540
+    twin    ops  1063 dev_ms   4.4696 span_ms   6.6901 busy_in_span   4.4696 | COPY 96/0.190, SMALL 807/2.966, TWINF 160/1.314
+    union   ops  3136 dev_ms  12.5069 span_ms  16.7389 busy_in_span  12.5069 | COPY 192/0.481, OTHER 32/0.490, SELECT 192/3.175, SMALL 2720/8.361
+    write   ops  1640 dev_ms   9.6022 span_ms  11.2926 busy_in_span   9.6022 | COPY 4/0.008, SMALL 1636/9.594
+  LAYER 5 sequence (label: start offset ms, span ms, device ms, ops)
+    pre       0.0000   0.2812   0.2750    7
+    twin      0.2822   0.1738   0.1398   33
+    select    0.4571   1.2163   1.1988   18
+    resid     1.6745   1.0811   1.0489   31
+    write     2.7566   0.3394   0.2900   48
+    chain     3.0971   0.1494   0.1420    8
+    union     3.2475   0.4925   0.3907   98
+    fetch     3.7411   1.1671   1.1586    9
+    attn      4.9092   1.6960   1.6783   18
+    post      6.6067   2.3146   2.3048    8
+  first GEMMs (label, grid, block, us): [('pre@0', (36, 5, 1), (256, 1, 1), 226.6), ('post@0', (16, 10, 1), (256, 1, 1), 221.1), ('post@0', (128, 10, 1), (256, 1, 1), 1331.0), ('post@0', (16, 10, 2), (256, 1, 1), 659.5), ('pre@1', (36, 5, 1), (256, 1, 1), 219.2), ('post@1', (16, 10, 1), (256, 1, 1), 219.2)]
+======================== i4c_c4b_2195576_i4cb g112 draft0
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': 'FCF727EA976C4BD1A9E624470EF01CC6', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb/trace_L4PTFDP_g112_draft0.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2415422115412.2 dur_ms 103.3364; device window [2415422117631.4, 2415422222104.2] ms 104.4728; start-after-host 2.2192 ms; end-after-host 3.3555 ms
+  ops 2867 busy_ms 93.4977 sum_dur_ms 93.4977 (concurrency 0.0000 ms) idle_ms 10.9751 = host-exposed 7.8589 + device-side 3.1162; gaps >= 1 ms: []
+  streams {'(0, 7)': (2867, 93.4977)}
+  H2D-class busy 2.1236 ms; other busy 91.3741 ms; H2D overlap with other ops 0.0000 ms
+  classes {'ATTN': (128, 29.8915), 'GEMM': (129, 25.705), 'POOL': (96, 13.2091), 'SMALL': (1936, 11.446), 'STAGE1': (32, 6.9317), 'H2D': (64, 2.1236), 'FUSED': (161, 1.3191), 'SELECT': (64, 1.2866), 'DIFF': (32, 0.7198), 'COPY': (193, 0.5939), 'TWINF': (32, 0.2715)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    ATTN   void flash_fwd_splitkv_kernel                                (1, 4, 636)      (128, 1, 1)     64   28.2721   441.75 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 3, 1)      (256, 1, 1)     32   13.9514   435.98 238 0
+    POOL   pool_swap_kernel                                             (318, 2, 64)     (256, 1, 1)     32    8.2910   259.09 88 25
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 3, 2)       (256, 1, 1)     32    7.0247   219.52 238 0
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 318, 2)      (32, 1, 1)      32    6.9317   216.61 122 6
+    POOL   nosa_pool_kernel_per_request                                 (2, 318, 261)    (128, 1, 1)     32    4.7138   147.31 22 100
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (36, 3, 1)       (128, 1, 1)     32    1.9535    61.05 246 0
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (32, 3, 1)       (128, 1, 1)     32    1.8793    58.73 246 0
+    ATTN   void flash_fwd_splitkv_combine_kernel                        (2544, 1, 1)     (128, 1, 1)     64    1.6194    25.30 60 50
+    SELECT sbtopk::gatherTopK                                           (636, 1, 1)      (288, 1, 1)     64    1.2866    20.10 32 83
+    H2D    flash_h2d_from_mask_bias_kernel                              (318, 2, 64)     (128, 1, 1)     32    1.0636    33.24 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (318, 2, 64)     (128, 1, 1)     32    1.0600    33.13 55 56
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (287, 3, 1)      (256, 1, 1)      1    0.8961   896.07 238 0
+    DIFF   diff_kernel                                                  (2, 318, 1)      (64, 1, 1)      32    0.7198    22.49 25 18
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             161    0.5457     3.39 None None
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (318, 1, 1)      (1024, 1, 1)    32    0.5262    16.44 31 100
+    FUSED  void flashinfer::norm::RMSNormKernel                         (318, 1, 1)      (32, 16, 1)     65    0.3618     5.57 32 74
+    TWINF  _twin_kernel                                                 (318, 1, 1)      (128, 1, 1)     32    0.2715     8.48 120 18
+    FUSED  nosa_linear_kernel                                           (318, 1, 2)      (128, 1, 1)     32    0.2332     7.29 28 37
+    POOL   pool_update_kernel                                           (2, 318, 1)      (64, 1, 1)      32    0.2043     6.38 32 18
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (40, 34, 1)      (16, 8, 1)      32    0.1980     6.19 40 75
+    COPY   Memset (Device)                                              ()               ()              32    0.0482     1.51 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (161, 67894280, 0.5457), 'gpu_memset|Memset (Device)': (32, 6144, 0.0482)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (2225, 13.6667), 'cudaMemcpyAsync': (161, 1.8301), 'cuLaunchKernel': (160, 1.0918), 'cudaFuncSetAttribute': (129, 0.1589), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1704), 'cudaLaunchKernelExC': (97, 0.5754), 'cudaDeviceGetAttribute': (96, 0.082), 'cudaStreamIsCapturing': (64, 0.0527), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.0361), 'cudaGraphLaunch': (32, 1.53), 'cudaDriverGetVersion': (32, 0.0048), 'cudaMemsetAsync': (32, 0.4068), 'cudaEventRecord': (2, 0.0169)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'resid': (3.0499, 2.0574, 880), 'amask': (1.5474, 1.3539, 141), 'write': (1.3193, 1.1507, 146), 'attnA': (1.2825, 1.2075, 64), 'pre': (1.1858, 0.9814, 192), 'select': (0.9214, 0.558, 447), 'twin': (0.7193, 0.55, 160), 'merge': (0.4467, 0.0, 416), 'post': (0.3255, 0.0, 256), 'bmask': (0.1031, 0.0, 96), 'attnB': (0.0701, 0.0, 64), 'head': (0.004, 0.0, 3)}
+  LABELS: device ms per class; spans (first op start .. last op end, summed over instances); busy in spans
+    amask   ops   141 dev_ms   1.1277 span_ms   2.4353 busy_in_span   1.1277 | SMALL 141/1.128
+    attnA   ops    64 dev_ms  27.7635 span_ms  27.7994 busy_in_span  27.7635 | ATTN 64/27.764
+    attnB   ops    64 dev_ms   2.1280 span_ms   2.1642 busy_in_span   2.1280 | ATTN 64/2.128
+    bmask   ops    96 dev_ms   0.5070 span_ms   0.5761 busy_in_span   0.5070 | SMALL 96/0.507
+    embed   ops     1 dev_ms   0.0174 span_ms   0.0174 busy_in_span   0.0174 | SMALL 1/0.017
+    head    ops     3 dev_ms   1.0284 span_ms   1.0314 busy_in_span   1.0284 | FUSED 1/0.006, GEMM 1/0.896, SMALL 1/0.127
+    merge   ops   416 dev_ms   2.1273 span_ms   2.5397 busy_in_span   2.1273 | SMALL 416/2.127
+    post    ops   256 dev_ms  23.9653 span_ms  24.2576 busy_in_span  23.9653 | COPY 32/0.048, FUSED 64/0.704, GEMM 96/22.855, SMALL 64/0.357
+    pre     ops   192 dev_ms   2.7057 span_ms   3.5267 busy_in_span   2.7057 | COPY 64/0.143, FUSED 96/0.609, GEMM 32/1.954
+    resid   ops   880 dev_ms  14.1411 span_ms  17.1351 busy_in_span  14.1411 | COPY 64/0.157, DIFF 32/0.720, H2D 64/2.124, POOL 64/8.495, SMALL 656/2.645
+    select  ops   448 dev_ms  14.0384 span_ms  14.7214 busy_in_span  14.0383 | COPY 32/0.244, POOL 32/4.714, SELECT 64/1.287, SMALL 288/0.862, STAGE1 32/6.932
+    twin    ops   160 dev_ms   0.6352 span_ms   0.9375 busy_in_span   0.6352 | SMALL 128/0.364, TWINF 32/0.271
+    write   ops   146 dev_ms   3.3126 span_ms   3.7063 busy_in_span   3.3126 | COPY 1/0.002, SMALL 145/3.311
+  LAYER 5 sequence (label: start offset ms, span ms, device ms, ops)
+    pre       0.0000   0.0893   0.0836    6
+    twin      0.0903   0.0236   0.0192    5
+    select    0.1150   0.4409   0.4307   14
+    resid     0.5571   0.5126   0.3837   27
+    write     1.1712   0.1036   0.1005    4
+    amask     1.3063   0.1205   0.0332    4
+    attnA     1.5083   0.8601   0.8590    2
+    bmask     2.3694   0.0177   0.0155    3
+    attnB     2.3881   0.0662   0.0651    2
+    merge     2.4553   0.0771   0.0645   13
+    post      2.5333   0.7459   0.7374    8
+  first GEMMs (label, grid, block, us): [('pre@0', (36, 3, 1), (128, 1, 1), 58.7), ('post@0', (32, 3, 1), (128, 1, 1), 57.3), ('post@0', (128, 3, 1), (256, 1, 1), 431.9), ('post@0', (16, 3, 2), (256, 1, 1), 214.7), ('pre@1', (36, 3, 1), (128, 1, 1), 61.5), ('post@1', (32, 3, 1), (128, 1, 1), 57.6)]
+======================== i4c_c4b_2195576_i4cb g112 draft1
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': '25E48133AB1948E08ABF3BEEFD4BD40A', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb/trace_L4PTFDP_g112_draft1.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2415423510535.3 dur_ms 97.1635; device window [2415423513647.8, 2415423612546.9] ms 98.8991; start-after-host 3.1125 ms; end-after-host 4.8481 ms
+  ops 2867 busy_ms 91.5312 sum_dur_ms 91.5312 (concurrency -0.0000 ms) idle_ms 7.3679 = host-exposed 4.2876 + device-side 3.0803; gaps >= 1 ms: []
+  streams {'(0, 7)': (2867, 91.5312)}
+  H2D-class busy 2.1429 ms; other busy 89.3883 ms; H2D overlap with other ops 0.0000 ms
+  classes {'ATTN': (128, 29.984), 'GEMM': (129, 25.7777), 'SMALL': (1936, 11.5632), 'POOL': (96, 10.9013), 'STAGE1': (32, 6.9336), 'H2D': (64, 2.1429), 'FUSED': (161, 1.3283), 'SELECT': (64, 1.2984), 'DIFF': (32, 0.7261), 'COPY': (193, 0.6029), 'TWINF': (32, 0.2727)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    ATTN   void flash_fwd_splitkv_kernel                                (1, 4, 636)      (128, 1, 1)     64   28.3506   442.98 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 3, 1)      (256, 1, 1)     32   13.9879   437.12 238 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 3, 2)       (256, 1, 1)     32    7.0523   220.38 238 0
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 318, 2)      (32, 1, 1)      32    6.9336   216.67 122 6
+    POOL   pool_swap_kernel                                             (318, 2, 64)     (256, 1, 1)     32    5.9491   185.91 88 25
+    POOL   nosa_pool_kernel_per_request                                 (2, 318, 261)    (128, 1, 1)     32    4.7491   148.41 22 100
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (36, 3, 1)       (128, 1, 1)     32    1.9474    60.86 246 0
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (32, 3, 1)       (128, 1, 1)     32    1.8934    59.17 246 0
+    ATTN   void flash_fwd_splitkv_combine_kernel                        (2544, 1, 1)     (128, 1, 1)     64    1.6334    25.52 60 50
+    SELECT sbtopk::gatherTopK                                           (636, 1, 1)      (288, 1, 1)     64    1.2984    20.29 32 83
+    H2D    flash_h2d_from_mask_bias_kernel                              (318, 2, 64)     (128, 1, 1)     32    1.0731    33.54 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (318, 2, 64)     (128, 1, 1)     32    1.0697    33.43 55 56
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (287, 3, 1)      (256, 1, 1)      1    0.8968   896.78 238 0
+    DIFF   diff_kernel                                                  (2, 318, 1)      (64, 1, 1)      32    0.7261    22.69 25 18
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             161    0.5505     3.42 None None
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (318, 1, 1)      (1024, 1, 1)    32    0.5266    16.46 31 100
+    FUSED  void flashinfer::norm::RMSNormKernel                         (318, 1, 1)      (32, 16, 1)     65    0.3650     5.61 32 74
+    TWINF  _twin_kernel                                                 (318, 1, 1)      (128, 1, 1)     32    0.2727     8.52 120 18
+    FUSED  nosa_linear_kernel                                           (318, 1, 2)      (128, 1, 1)     32    0.2340     7.31 28 37
+    POOL   pool_update_kernel                                           (2, 318, 1)      (64, 1, 1)      32    0.2031     6.35 32 18
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (40, 34, 1)      (16, 8, 1)      32    0.2027     6.34 40 75
+    COPY   Memset (Device)                                              ()               ()              32    0.0524     1.64 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (161, 67894280, 0.5505), 'gpu_memset|Memset (Device)': (32, 6144, 0.0524)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (2225, 12.6539), 'cudaMemcpyAsync': (161, 1.7887), 'cuLaunchKernel': (160, 1.04), 'cudaFuncSetAttribute': (129, 0.1559), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1663), 'cudaLaunchKernelExC': (97, 0.5427), 'cudaDeviceGetAttribute': (96, 0.0843), 'cudaStreamIsCapturing': (64, 0.0528), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.0347), 'cudaGraphLaunch': (32, 1.5684), 'cudaDriverGetVersion': (32, 0.004), 'cudaMemsetAsync': (32, 0.4089), 'cudaEventRecord': (2, 0.0218)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'resid': (2.2152, 1.243, 880), 'pre': (1.3001, 1.0925, 192), 'select': (0.717, 0.3515, 445), 'twin': (0.6658, 0.4977, 160), 'write': (0.6297, 0.4581, 146), 'amask': (0.5396, 0.374, 141), 'merge': (0.45, 0.0, 416), 'attnA': (0.3423, 0.2708, 64), 'post': (0.3315, 0.0, 256), 'bmask': (0.1032, 0.0, 96), 'attnB': (0.0702, 0.0, 64), 'head': (0.0033, 0.0, 3)}
+  LABELS: device ms per class; spans (first op start .. last op end, summed over instances); busy in spans
+    amask   ops   141 dev_ms   1.1235 span_ms   1.5683 busy_in_span   1.1235 | SMALL 141/1.123
+    attnA   ops    64 dev_ms  27.8368 span_ms  27.8732 busy_in_span  27.8368 | ATTN 64/27.837
+    attnB   ops    64 dev_ms   2.1472 span_ms   2.1822 busy_in_span   2.1472 | ATTN 64/2.147
+    bmask   ops    96 dev_ms   0.5124 span_ms   0.5820 busy_in_span   0.5124 | SMALL 96/0.512
+    embed   ops     1 dev_ms   0.0160 span_ms   0.0160 busy_in_span   0.0160 | SMALL 1/0.016
+    head    ops     3 dev_ms   1.0294 span_ms   1.0315 busy_in_span   1.0294 | FUSED 1/0.006, GEMM 1/0.897, SMALL 1/0.127
+    merge   ops   416 dev_ms   2.1525 span_ms   2.5680 busy_in_span   2.1525 | SMALL 416/2.152
+    post    ops   256 dev_ms  24.0538 span_ms  24.3521 busy_in_span  24.0538 | COPY 32/0.052, FUSED 64/0.707, GEMM 96/22.934, SMALL 64/0.361
+    pre     ops   192 dev_ms   2.7084 span_ms   3.6373 busy_in_span   2.7084 | COPY 64/0.145, FUSED 96/0.616, GEMM 32/1.947
+    resid   ops   880 dev_ms  11.8551 span_ms  14.0134 busy_in_span  11.8551 | COPY 64/0.158, DIFF 32/0.726, H2D 64/2.143, POOL 64/6.152, SMALL 656/2.676
+    select  ops   448 dev_ms  14.0969 span_ms  14.6602 busy_in_span  14.0969 | COPY 32/0.246, POOL 32/4.749, SELECT 64/1.298, SMALL 288/0.870, STAGE1 32/6.934
+    twin    ops   160 dev_ms   0.6470 span_ms   0.9280 busy_in_span   0.6470 | SMALL 128/0.374, TWINF 32/0.273
+    write   ops   146 dev_ms   3.3520 span_ms   3.7300 busy_in_span   3.3520 | COPY 1/0.002, SMALL 145/3.350
+  LAYER 5 sequence (label: start offset ms, span ms, device ms, ops)
+    pre       0.0000   0.0892   0.0836    6
+    twin      0.0902   0.0238   0.0198    5
+    select    0.1149   0.4419   0.4318   14
+    resid     0.5582   0.3624   0.3356   27
+    write     0.9217   0.1030   0.1000    4
+    amask     1.0259   0.0353   0.0323    4
+    attnA     1.0623   0.8609   0.8597    2
+    bmask     1.9241   0.0175   0.0154    3
+    attnB     1.9427   0.0655   0.0645    2
+    merge     2.0093   0.0769   0.0645   13
+    post      2.0871   0.7455   0.7364    8
+  first GEMMs (label, grid, block, us): [('pre@0', (36, 3, 1), (128, 1, 1), 58.1), ('post@0', (32, 3, 1), (128, 1, 1), 57.2), ('post@0', (128, 3, 1), (256, 1, 1), 431.4), ('post@0', (16, 3, 2), (256, 1, 1), 214.8), ('pre@1', (36, 3, 1), (128, 1, 1), 60.6), ('post@1', (32, 3, 1), (128, 1, 1), 57.4)]
+STITCH i4c_c4b_2195576_i4cb g112: device windows on one clock? joint [2415416503343.3, 2415416900015.9], draft0 [2415422117631.4, 2415422222104.2], draft1 [2415423513647.8, 2415423612546.9]; joint end -> draft0 start 5217.615 ms; draft0 end -> draft1 start 1291.544 ms
+======================== i4c_c4b_2195576_i4cb g96 joint
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': 'CF7BFC055B4C49A68874CBF54BC52E8E', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb/trace_L4PTFDP_g96_joint.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2415400595826.0 dur_ms 361.1792; device window [2415400602446.3, 2415401004165.5] ms 401.7192; start-after-host 6.6203 ms; end-after-host 47.1603 ms
+  ops 9142 busy_ms 379.2845 sum_dur_ms 379.2845 (concurrency -0.0000 ms) idle_ms 22.4347 = host-exposed 12.6153 + device-side 9.8193; gaps >= 1 ms: [(0.98, 1.755, '?', 'ampere_bf16_s16816gemm_bf16_128x256_ldg8'), (3.047, 1.722, '?', 'elementwise_kernel'), (14.857, 1.53, '?', 'searchsorted_cuda_kernel')]
+  streams {'(0, 7)': (9142, 379.2845)}
+  H2D-class busy 156.1636 ms; other busy 223.1209 ms; H2D overlap with other ops 0.0000 ms
+  classes {'H2D': (128, 156.1636), 'GEMM': (129, 79.7829), 'OTHER': (64, 52.144), 'SMALL': (7536, 36.4725), 'POOL': (96, 24.8429), 'STAGE1': (32, 13.0402), 'SELECT': (288, 9.2213), 'FUSED': (161, 4.2302), 'TWINF': (192, 1.5468), 'COPY': (484, 1.1367), 'DIFF': (32, 0.7035)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    OTHER  kernel_unified_attention                                     (636, 2, 1)      (128, 1, 1)     32   51.6563  1614.26 255 0
+    H2D    flash_h2d_from_mask_bias_kernel                              (318, 2, 129)    (128, 1, 1)     32   43.3771  1355.54 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (318, 2, 129)    (128, 1, 1)     32   43.3746  1355.45 55 56
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 10, 1)     (256, 1, 1)     32   42.1370  1316.78 238 0
+    H2D    flash_h2d_from_mask_bias_kernel                              (318, 2, 64)     (128, 1, 1)     32   34.7211  1085.03 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (318, 2, 64)     (128, 1, 1)     32   34.6909  1084.09 55 56
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 10, 2)      (256, 1, 1)     32   20.9068   653.34 238 0
+    POOL   nosa_pool_kernel_per_request                                 (2, 1272, 261)   (128, 1, 1)     32   17.9786   561.83 22 100
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 1272, 2)     (32, 1, 1)      32   13.0402   407.51 122 6
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 10, 1)      (256, 1, 1)     32    6.8870   215.22 238 0
+    GEMM   ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_tn  (36, 5, 1)       (256, 1, 1)     32    6.8734   214.79 238 0
+    POOL   pool_swap_kernel                                             (318, 2, 64)     (256, 1, 1)     32    6.6671   208.35 88 25
+    SELECT sbtopk::gatherTopK                                           (2544, 1, 1)     (288, 1, 1)     64    4.0867    63.85 32 98
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (287, 10, 1)     (256, 1, 1)      1    2.9786  2978.62 238 0
+    SELECT radixSortKVInPlace                                           (636, 1, 1)      (32, 1, 1)      64    2.3408    36.57 249 9
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (1272, 1, 1)     (1024, 1, 1)    32    2.2885    71.52 31 100
+    SELECT radixSortKVInPlace                                           (2544, 1, 1)     (32, 1, 1)      32    1.9754    61.73 55 37
+    TWINF  _twin_kernel                                                 (318, 1, 1)      (128, 1, 1)    192    1.5468     8.06 120 18
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             452    1.0839     2.40 None None
+    FUSED  void flashinfer::norm::RMSNormKernel                         (1272, 1, 1)     (32, 16, 1)     65    0.8055    12.39 32 100
+    FUSED  nosa_linear_kernel                                           (1272, 1, 2)     (128, 1, 1)     32    0.7220    22.56 28 100
+    DIFF   diff_kernel                                                  (2, 318, 1)      (64, 1, 1)      32    0.7035    21.98 25 18
+    SELECT searchsorted_cuda_kernel                                     (159, 1, 1)      (1024, 1, 1)    96    0.5761     6.00 24 74
+    OTHER  tensor_kernel_scan_innermost_dim                             (20, 1, 1)       (16, 32, 1)     32    0.4877    15.24 30 5
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (159, 34, 1)     (16, 8, 1)      32    0.4142    12.94 40 75
+    SELECT bitonicSortKVInPlace                                         (636, 1, 1)      (16, 1, 1)      32    0.2423     7.57 40 5
+    POOL   pool_update_kernel                                           (2, 318, 1)      (64, 1, 1)      32    0.1972     6.16 32 18
+    COPY   Memset (Device)                                              ()               ()              32    0.0528     1.65 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (452, 211986464, 1.0839), 'gpu_memset|Memset (Device)': (32, 20480, 0.0528)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (8113, 155.1074), 'cudaMemcpyAsync': (452, 4.1405), 'cuLaunchKernel': (448, 2.6885), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (288, 0.1693), 'cudaDeviceGetAttribute': (224, 0.1529), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1684), 'cudaLaunchKernelExC': (97, 0.5603), 'cudaFuncSetAttribute': (65, 0.0926), 'cudaFuncGetAttributes': (32, 0.1487), 'cudaMemsetAsync': (32, 0.3939), 'cudaEventRecord': (2, 0.0292)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'?': (22.4347, 12.6153, 9141)}
+======================== i4c_c4b_2195576_i4cb g96 draft0
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': 'A51A3951759F4C38B687AD2DD6883384', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb/trace_L4PTFDP_g96_draft0.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2415405068204.8 dur_ms 83.9660; device window [2415405069788.8, 2415405169601.7] ms 99.8129; start-after-host 1.5840 ms; end-after-host 17.4310 ms
+  ops 2867 busy_ms 93.8438 sum_dur_ms 93.8438 (concurrency 0.0000 ms) idle_ms 5.9691 = host-exposed 2.9070 + device-side 3.0621; gaps >= 1 ms: []
+  streams {'(0, 7)': (2867, 93.8438)}
+  H2D-class busy 2.1425 ms; other busy 91.7013 ms; H2D overlap with other ops 0.0000 ms
+  classes {'ATTN': (128, 29.8728), 'GEMM': (129, 25.8042), 'POOL': (96, 13.3809), 'SMALL': (1936, 11.5479), 'STAGE1': (32, 6.8715), 'H2D': (64, 2.1425), 'FUSED': (161, 1.3269), 'SELECT': (64, 1.2964), 'DIFF': (32, 0.7252), 'COPY': (193, 0.602), 'TWINF': (32, 0.2736)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    ATTN   void flash_fwd_splitkv_kernel                                (1, 4, 636)      (128, 1, 1)     64   28.2400   441.25 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 3, 1)      (256, 1, 1)     32   14.0007   437.52 238 0
+    POOL   pool_swap_kernel                                             (318, 2, 64)     (256, 1, 1)     32    8.4270   263.34 88 25
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 3, 2)       (256, 1, 1)     32    7.0543   220.45 238 0
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 318, 2)      (32, 1, 1)      32    6.8715   214.73 122 6
+    POOL   nosa_pool_kernel_per_request                                 (2, 318, 261)    (128, 1, 1)     32    4.7472   148.35 22 100
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (36, 3, 1)       (128, 1, 1)     32    1.9554    61.11 246 0
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (32, 3, 1)       (128, 1, 1)     32    1.8942    59.19 246 0
+    ATTN   void flash_fwd_splitkv_combine_kernel                        (2544, 1, 1)     (128, 1, 1)     64    1.6328    25.51 60 50
+    SELECT sbtopk::gatherTopK                                           (636, 1, 1)      (288, 1, 1)     64    1.2964    20.26 32 83
+    H2D    flash_h2d_from_mask_bias_kernel                              (318, 2, 64)     (128, 1, 1)     32    1.0731    33.54 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (318, 2, 64)     (128, 1, 1)     32    1.0694    33.42 55 56
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (287, 3, 1)      (256, 1, 1)      1    0.8995   899.53 238 0
+    DIFF   diff_kernel                                                  (2, 318, 1)      (64, 1, 1)      32    0.7252    22.66 25 18
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             161    0.5494     3.41 None None
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (318, 1, 1)      (1024, 1, 1)    32    0.5279    16.50 31 100
+    FUSED  void flashinfer::norm::RMSNormKernel                         (318, 1, 1)      (32, 16, 1)     65    0.3651     5.62 32 74
+    TWINF  _twin_kernel                                                 (318, 1, 1)      (128, 1, 1)     32    0.2736     8.55 120 18
+    FUSED  nosa_linear_kernel                                           (318, 1, 2)      (128, 1, 1)     32    0.2342     7.32 28 37
+    POOL   pool_update_kernel                                           (2, 318, 1)      (64, 1, 1)      32    0.2067     6.46 32 18
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (40, 34, 1)      (16, 8, 1)      32    0.1996     6.24 40 75
+    COPY   Memset (Device)                                              ()               ()              32    0.0525     1.64 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (161, 67894280, 0.5494), 'gpu_memset|Memset (Device)': (32, 6144, 0.0525)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (2225, 11.389), 'cudaMemcpyAsync': (161, 1.6789), 'cuLaunchKernel': (160, 1.0014), 'cudaFuncSetAttribute': (129, 0.1437), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1733), 'cudaLaunchKernelExC': (97, 0.5082), 'cudaDeviceGetAttribute': (96, 0.0828), 'cudaStreamIsCapturing': (64, 0.0536), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.0368), 'cudaGraphLaunch': (32, 1.5427), 'cudaDriverGetVersion': (32, 0.0049), 'cudaMemsetAsync': (32, 0.4191), 'cudaEventRecord': (2, 0.0171)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'?': (5.9691, 2.907, 2865)}
+======================== i4c_c4b_2195576_i4cb g96 draft1
+  META {'schemaVersion': 1, 'deviceProperties': '<364 chars>', 'cupti_version': 22, 'cuda_runtime_version': 12040, 'cuda_driver_version': 13000, 'trace_id': '6488128F8B9B4E72B5429CB1BBEAE30F', 'traceName': '/mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb/trace_L4PTFDP_g96_draft1.json', 'displayTimeUnit': 'ms', 'baseTimeNanoseconds': 1790857026000000000}
+  host range ts 2415406508068.2 dur_ms 86.1489; device window [2415406509752.8, 2415406606878.8] ms 97.1260; start-after-host 1.6846 ms; end-after-host 12.6617 ms
+  ops 2867 busy_ms 91.0762 sum_dur_ms 91.0762 (concurrency 0.0000 ms) idle_ms 6.0498 = host-exposed 2.9995 + device-side 3.0502; gaps >= 1 ms: []
+  streams {'(0, 7)': (2867, 91.0762)}
+  H2D-class busy 2.1337 ms; other busy 88.9425 ms; H2D overlap with other ops 0.0000 ms
+  classes {'ATTN': (128, 29.9248), 'GEMM': (129, 25.7538), 'SMALL': (1936, 11.5109), 'POOL': (96, 10.6835), 'STAGE1': (32, 6.8538), 'H2D': (64, 2.1337), 'FUSED': (161, 1.3239), 'SELECT': (64, 1.2932), 'DIFF': (32, 0.7238), 'COPY': (193, 0.6037), 'TWINF': (32, 0.2711)}
+  KERNELS (class, name, grid, block): count, ms, us each, regs, est occupancy %
+    ATTN   void flash_fwd_splitkv_kernel                                (1, 4, 636)      (128, 1, 1)     64   28.2956   442.12 255 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (128, 3, 1)      (256, 1, 1)     32   13.9871   437.10 238 0
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (16, 3, 2)       (256, 1, 1)     32    7.0381   219.94 238 0
+    STAGE1 void flash_fwd_splitkv_stage1_kernel                         (1, 318, 2)      (32, 1, 1)      32    6.8538   214.18 122 6
+    POOL   pool_swap_kernel                                             (318, 2, 64)     (256, 1, 1)     32    5.7495   179.67 88 25
+    POOL   nosa_pool_kernel_per_request                                 (2, 318, 261)    (128, 1, 1)     32    4.7317   147.87 22 100
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (36, 3, 1)       (128, 1, 1)     32    1.9460    60.81 246 0
+    GEMM   ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn  (32, 3, 1)       (128, 1, 1)     32    1.8862    58.94 246 0
+    ATTN   void flash_fwd_splitkv_combine_kernel                        (2544, 1, 1)     (128, 1, 1)     64    1.6292    25.46 60 50
+    SELECT sbtopk::gatherTopK                                           (636, 1, 1)      (288, 1, 1)     64    1.2932    20.21 32 83
+    H2D    flash_h2d_from_mask_bias_kernel                              (318, 2, 64)     (128, 1, 1)     32    1.0687    33.40 62 50
+    H2D    flash_h2d_from_mask_kernel                                   (318, 2, 64)     (128, 1, 1)     32    1.0650    33.28 55 56
+    GEMM   ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn  (287, 3, 1)      (256, 1, 1)      1    0.8964   896.43 238 0
+    DIFF   diff_kernel                                                  (2, 318, 1)      (64, 1, 1)      32    0.7238    22.62 25 18
+    COPY   Memcpy DtoD (Device -> Device)                               ()               ()             161    0.5508     3.42 None None
+    FUSED  void flashinfer::activation::act_and_mul_kernel              (318, 1, 1)      (1024, 1, 1)    32    0.5241    16.38 31 100
+    FUSED  void flashinfer::norm::RMSNormKernel                         (318, 1, 1)      (32, 16, 1)     65    0.3638     5.60 32 74
+    TWINF  _twin_kernel                                                 (318, 1, 1)      (128, 1, 1)     32    0.2711     8.47 120 18
+    FUSED  nosa_linear_kernel                                           (318, 1, 2)      (128, 1, 1)     32    0.2333     7.29 28 37
+    FUSED  void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadPara (40, 34, 1)      (16, 8, 1)      32    0.2026     6.33 40 75
+    POOL   pool_update_kernel                                           (2, 318, 1)      (64, 1, 1)      32    0.2023     6.32 32 18
+    COPY   Memset (Device)                                              ()               ()              32    0.0529     1.65 None None
+  COPIES (cat, name): count, bytes, ms {'gpu_memcpy|Memcpy DtoD (Device -> Device)': (161, 67894280, 0.5508), 'gpu_memset|Memset (Device)': (32, 6144, 0.0529)}
+  RUNTIME calls in the host range: {'cudaLaunchKernel': (2225, 11.7512), 'cudaMemcpyAsync': (161, 1.7034), 'cuLaunchKernel': (160, 1.0149), 'cudaFuncSetAttribute': (129, 0.1471), 'cudaOccupancyMaxActiveBlocksPerMultiprocessor': (129, 0.1613), 'cudaLaunchKernelExC': (97, 0.5136), 'cudaDeviceGetAttribute': (96, 0.0828), 'cudaStreamIsCapturing': (64, 0.0541), 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags': (32, 0.0368), 'cudaGraphLaunch': (32, 1.4521), 'cudaDriverGetVersion': (32, 0.0054), 'cudaMemsetAsync': (32, 0.4222), 'cudaEventRecord': (2, 0.0237)}
+  SYNC-like runtime calls: {}
+  idle by the label of the op that ends the gap (gap ms, host-exposed ms, n): {'?': (6.0498, 2.9995, 2864)}
+STITCH i4c_c4b_2195576_i4cb g96: device windows on one clock? joint [2415400602446.3, 2415401004165.5], draft0 [2415405069788.8, 2415405169601.7], draft1 [2415406509752.8, 2415406606878.8]; joint end -> draft0 start 4065.623 ms; draft0 end -> draft1 start 1340.151 ms
