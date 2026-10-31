@@ -67,8 +67,22 @@ Tree /mnt/beegfs/ojerbi/nosi-r2-j1 (branch r2-j1) on RECON7 cd0f0c5. SOURCE ONLY
   with earlier layers; it is exposed only where the queue runs dry (pass start). Bound: joint 0 .. 6.3 ms (BEST's
   non-busy label, R2:300), draft 0 .. 2 x 3 ms; central about 3 ms per round at C 128, 0 .. 3 at C 73. A result inside
   the run spread is the expected outcome, not a defect; J1-RESID and EQF decide correctness.
-- Keep arm (C 73): not built; its residency (r2_i4d_keep.py / r2_i4k_combo.py _resid_k) reads the kept store and kwin
-  lookups that were not checked for capture.
+- Keep arm (C 73), READ-ONLY ANSWER (2026-10-31): capturable with ONE copied method; not built.
+  The keep arm's joint residency is r2_i4d_keep.py:381-425 `_resid_k` (kwin), reached through r2_i4k_combo.py:181-185
+  `_resid_joint` and stubbed by name in the I4S wrapper (r2_i4s_stack.py:426-431, stub "_resid_joint"). Line by line:
+  diff, masked_fill, pool_update (host stamp: StampFrame removes it), pool_swap, the map commit, the lookup of row 0's
+  loads in the persistent map kid (:404-410: a broadcast compare, device only), two host gathers and two store gathers
+  (:411-416, shipped kernels, persistent sources vs.ext_k / ext_v / ext_bias), the check-only _win_bytes (:438-463: fresh
+  scratch tensors and the unmetered gathers, device only; under a capture its scratch comes from the graph pool), the
+  skip counters. ONE host-dependent op: :417 `self._krow(self.kpass)[6].add_(found.sum())` indexes the counter table by
+  the HOST pass index, so a capture would freeze the row (the I4K rung's own "pass_row" control, r2_i4k_combo.py:56-58).
+  The fix is the I4K pattern: add into `self._crow()` (kcur, flushed into the pass's row eagerly after layer L - 1 by
+  _kpost / _kflush, :171-179), field 6; the order constraint (the lookup reads kid before step 5 of the same layer writes
+  it, r2_i4k_combo.py:34-35) holds inside the captured section because the residency precedes _keep_fill there. The
+  keep arm's draft residency is the lean one (r2_i4d_keep.py defines no _resid_lean): F3's draft part applies as is.
+  Expected effect at C 73: about 0 (the C 73 passes are device-bound: joint busy 379.3-383.9 of 383.2 ms elapsed,
+  RECON7_R2_joint.md:203). RECOMMENDATION: build the keep J3 arm only if j1a shows J3-JOINT-SAVING + J3-DRAFT-SAVING
+  above the run spread at C 128.
 
 ## 3. The reuse line (the lead's rule: upstream basis, incompatibility or cost, minimal adaptation, validation)
 
