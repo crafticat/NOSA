@@ -128,6 +128,14 @@ Tree /mnt/beegfs/ojerbi/nosi-r2-j1 (branch r2-j1) on RECON7 cd0f0c5. SOURCE ONLY
 - CPU: tests_cpu/test_j1.py::test_forkbench_pure (work, row pages, rotation, summarize, INVALID marking, default deny,
   argument checks) and test_step_script_j1 (the j1f case and its arguments).
 
+## 2f. The exported factories (sixth commit; no behavior change)
+
+- `j1_wrap(STF, SB, RB, arm)` and `j3_wrap(STF, S1, R1, arm)` (r2_j1_select.py) return the (state, runner) pair of
+  F1 + F2 + F6, and of F3 on a J1 pair, for ANY base classes. They are the bodies of the old ARMS_J1 / ARMS_J3 loops,
+  moved into the local factories `wrap_j1` / `wrap_j3`; the arms of j1_classes are built by them and cached under the
+  same key, so `j1_wrap(STF, *DCL[base], arm) == j1_classes(STF)[arm]`. Reason: the integration rung builds J1 on the
+  BF1 keep classes (KS/analysis/plan/INTEGRATION_NOTES_2026-10-31.md section 3.3). CPU: test_j1.py::test_j1_wrap_export.
+
 ## 3. The reuse line (the lead's rule: upstream basis, incompatibility or cost, minimal adaptation, validation)
 
 - Upstream basis: NOSA's `nosa_pool_kernel` (nosi/nosi/max_pooling_fused.py:7-75) as forked per request in

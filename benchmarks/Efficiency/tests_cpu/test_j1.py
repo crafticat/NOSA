@@ -729,6 +729,27 @@ def test_sh_j1():
     assert C.main(["--sh-j1", "2", "--out", "x", "--workload", "w"]) == 20
 
 
+# ------------------------------------------------------------------ the exported factories (no behavior change)
+def test_j1_wrap_export():
+    J1 = _mod("r2_j1_select")
+    STF = X.STF
+    arms = J1.j1_classes(STF)
+    DCL = X.CD.dc_classes(STF)
+    for arm, base in J1.ARMS_J1.items():                               # the arms ARE the factory's (cached) pairs
+        assert J1.j1_wrap(STF, *DCL[base], arm) == arms[arm]
+    for arm, base in J1.ARMS_J3.items():
+        assert J1.j3_wrap(STF, *arms[base], arm) == arms[arm]
+    mix1 = arms["L4PTFDGUDCDJ1"][0].__mro__[1]
+    mix3 = arms["L4PTFDGUDCDJ3"][0].__mro__[1]
+    SB, RB = DCL["L4PTFDGUDKWCD"]
+    S, R = J1.j1_wrap(STF, SB, RB, "XJ1")                              # a new arm on another base: the same mixin
+    assert S.__mro__[1] is mix1 and S.__mro__[2] is SB and issubclass(R, RB) and R._arm_name(None) == "XJ1"
+    assert J1.j1_wrap(STF, SB, RB, "XJ1") == (S, R)                    # cached
+    S3, R3 = J1.j3_wrap(STF, S, R, "XJ3")
+    assert S3.__mro__[1] is mix3 and S3.__mro__[2] is S and issubclass(R3, R) and R3._arm_name(None) == "XJ3"
+    assert arms["L4PTFDGUDCDJ1"][0].__doc__ == "L4PTFDGUDCD's state with the compiled joint pooling."
+
+
 # ------------------------------------------------------------------ the fork microbench (pure parts)
 def test_forkbench_pure():
     FB = _mod("r2_j1_forkbench")

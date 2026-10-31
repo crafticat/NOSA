@@ -232,6 +232,8 @@ def _capturing() -> bool:
 
 
 _CLASSES = {}
+_WRAPS = {}                 # id(STF) -> dict(j1=wrap, j3=wrap): the class factories of _make / _make_j3 (exported)
+_WRAPPED = {}               # (id(STF), kind, state base, runner base, arm) -> (state class, runner class)
 
 
 def j1_classes(STF) -> dict:
@@ -240,6 +242,27 @@ def j1_classes(STF) -> dict:
     if key not in _CLASSES:
         _CLASSES[key] = (STF, _make(STF))
     return _CLASSES[key][1]
+
+
+def _wrapped(STF, kind: str, SB, RB, arm: str):
+    j1_classes(STF)                                                    # builds the factories once per STF
+    key = (id(STF), kind, SB, RB, arm)
+    if key not in _WRAPPED:
+        _WRAPPED[key] = _WRAPS[id(STF)][kind](SB, RB, arm)
+    return _WRAPPED[key]
+
+
+def j1_wrap(STF, SB, RB, arm: str):
+    """(state class, runner class) of F1 + F2 + F6 on ANY state class SB and runner class RB whose _make_state returns an
+    instance of SB (or of a subclass that keeps SB's attributes): the J1 arms' own construction (ARMS_J1 uses it with the
+    I4DC classes), exported for a later rung (the integration). Cached per (STF, SB, RB, arm)."""
+    return _wrapped(STF, "j1", SB, RB, arm)
+
+
+def j3_wrap(STF, S1, R1, arm: str):
+    """(state class, runner class) of F3 on a J1 pair (S1, R1) from j1_wrap or j1_classes (ARMS_J3 uses it), exported as
+    j1_wrap. Cached per (STF, S1, R1, arm)."""
+    return _wrapped(STF, "j3", S1, R1, arm)
 
 
 def _make(STF):
@@ -581,10 +604,10 @@ def _make(STF):
                         dpeq_layers=int(j["dpeq_layers"].item()), f6=bool(j.get("f6")), f6calls=int(j.get("f6calls", 0)),
                         backend=self._j1_backend, j1neg=self.j1neg)
 
-    out = {}
-    for arm, base in ARMS_J1.items():
-        SB, RB = DCL[base]
-        S = type("TentState_" + arm, (_J1Mix, SB), dict(__doc__="%s's state with the compiled joint pooling." % base))
+    def wrap_j1(SB, RB, arm, base=None):
+        """(S, R) of arm on the state class SB and the runner class RB (the body of the ARMS_J1 loop)."""
+        S = type("TentState_" + arm, (_J1Mix, SB), dict(__doc__="%s's state with the compiled joint pooling." % (
+            base or SB.__name__)))
 
         def _mk(RB=RB, S=S, arm=arm):
             class R_(RB):
@@ -616,7 +639,13 @@ def _make(STF):
                     return out
             R_.__name__ = R_.__qualname__ = "TentRunner_" + arm
             return R_
-        out[arm] = (S, _mk())
+        return S, _mk()
+
+    _WRAPS[id(STF)] = dict(j1=wrap_j1)
+    out = {}
+    for arm, base in ARMS_J1.items():
+        SB, RB = DCL[base]
+        out[arm] = _WRAPPED[(id(STF), "j1", SB, RB, arm)] = wrap_j1(SB, RB, arm, base)
     out.update(_make_j3(STF, out))
     return out
 
@@ -811,10 +840,10 @@ def _make_j3(STF, j1):
         def j3_report(self) -> dict:
             return dict(self.j3, frame=list(getattr(self, "_j3_frame_exports", [])))
 
-    out = {}
-    for arm, base in ARMS_J3.items():
-        S1, R1 = j1[base]
-        S = type("TentState_" + arm, (_J3Mix, S1), dict(__doc__="%s's state with the residency captured (F3)." % base))
+    def wrap_j3(S1, R1, arm, base=None):
+        """(S, R) of arm on the J1 pair (S1, R1) (the body of the ARMS_J3 loop)."""
+        S = type("TentState_" + arm, (_J3Mix, S1), dict(__doc__="%s's state with the residency captured (F3)." % (
+            base or S1.__name__)))
 
         def _mk(R1=R1, S=S, arm=arm):
             class R3(R1):
@@ -851,7 +880,13 @@ def _make_j3(STF, j1):
                     return out
             R3.__name__ = R3.__qualname__ = "TentRunner_" + arm
             return R3
-        out[arm] = (S, _mk())
+        return S, _mk()
+
+    _WRAPS[id(STF)]["j3"] = wrap_j3
+    out = {}
+    for arm, base in ARMS_J3.items():
+        S1, R1 = j1[base]
+        out[arm] = _WRAPPED[(id(STF), "j3", S1, R1, arm)] = wrap_j3(S1, R1, arm, base)
     return out
 
 
