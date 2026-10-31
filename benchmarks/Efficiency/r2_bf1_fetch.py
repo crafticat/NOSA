@@ -87,6 +87,25 @@ commit never takes them); a job that lands after its layer ran is dropped ("pass
 entry until committed (land_busy; torch packer: the next copy into the entry waits the commit's event; gilfree: its
 reader mark). The deferred commits' no-room items count apart (no_room_deferred: the pass's keep may take dead slots
 that the host counted as room). The epoch closes at the pass's end; leftovers are dropped.
+BATCH (bf1b, f2eba43, C 73 B 318, MEASURED: worker busy 249 ms per epoch > the 185 ms window; per ISSUED job 14.3 ms =
+C++ submit 3.74 (2.84 chunks x 1.32 ms) + C++ pack 1.02 + host select and glue 1.41 + side-stream issue and commit
+4.33 (about 90 launches) + snapshot and other waits; only 17.5 of 64 jobs per epoch issued). HYPOTHESIS (not yet
+measured apart): the cost is PER CALL, not per byte (pack 18.9 GB/s native; 1.32 ms per chunk of about 7 CUDA calls from
+the worker while the main thread launches; 4.33 ms per commit of about 90 launches). The report's submit_ms_per_chunk
+decides it: per call it stays about 1.3 ms at 2048-group chunks; per byte (about 5 GB/s) it grows to about 4 ms. The
+lever is fewer calls per epoch: the worker takes every queued job of the epoch up to `batch` (a job that does not fit
+the landing entry goes first into the next batch), and makes ONE pack, ONE release and ONE commit per batch. Custom work:
+_release calls NativePipe.submit (packer v3, the transport's own _submit path) with all layers of the batch in one job,
+not issue_desc (upstream: our r2_transport_gilfree_v3 at the pinned sha; incompatibility: release_desc makes one release,
+>= 1 chunk, per layer; adaptation: every layer's destination is the ONE flat landing, so one release holds every layer,
+source l' = layer x B + b; validation: test_bf1_gilfree EQF, the byte checks, the plant).
+COMPILE (bf1b, L4PTFDGUDKWCDX-COMPILE: ONE late event, loc2 at joint pass 0 = dpass 3, after_captures 64, 1.395 s). The
+arm's first round runs its draft passes (DG captures at dpass 2) BEFORE its first joint pass, and loc2 specializes on
+the store X (its Python int cap = X - 1 and lst_buf (H, B, X)); the C arm compiled X 129 only, so at --bf-store 257 the
+first joint call recompiled after the captures. Fix: TentStateBF.bf_warm_joint, called by the runner's constructor
+(before any capture), runs pre, loc1 and loc2 once on the state's own buffers (a selection of -1; vs.ti and vs.lst_buf
+restored): the compile event is before the captures (after_captures 0), the joint pass hits the cache. Reuse: the
+section's own call (_cc_locate) argument for argument; validation: the COMPILE MUST (<= 1 event per helper, none late).
 CUDA GRAPHS. Nothing here enters a graph: every op is eager, between graph launches. A capture in global mode fails when
 another thread calls the CUDA API, so the runner wraps the graph backend's begin / capture: the capture holds the lock
 that the worker takes around every CUDA call.
@@ -117,12 +136,20 @@ PACKERS = ("torch", "gilfree")          # the host pack: torch.index_select (pin
 LATES = ("drop", "defer")               # a job not issued at the joint pass's start: abandoned | committed at ITS layer
 BNEG = (None, "wrong_bytes", "no_copy")
 # device counters: the side stream's (one tensor) and the compute stream's (another tensor): no tensor has two writers
-SIDE_KEYS = ("items", "committed", "revived", "no_room", "no_room_deferred")
+SIDE_KEYS = ("items", "committed", "revived", "no_room", "no_room_deferred", "passed_items")
 MAIN_KEYS = ("used_store", "unused", "used_win")
 
 
 class BFError(RuntimeError):
     pass
+
+
+class _PlanVS:
+    """The one plan field that _cc_why reads (plan.vs): bf_warm_joint asks the section's own fallback rule."""
+    __slots__ = ("vs",)
+
+    def __init__(self, vs):
+        self.vs = vs
 
 
 class _NoEvent:
@@ -229,13 +256,14 @@ class BgFetch:
 
     def __init__(self, T, mode: str = "ce", n_cap: int = 1024, ring: int = 8, worker: str = "thread",
                  acct: bool = False, bneg=None, close_wait_ms: float = 0.0, packer: str = "torch", threads: int = 8,
-                 gf=None, late: str = "drop", late_wait_ms: float = 100.0, stall_ms: float = 0.0):
+                 gf=None, late: str = "drop", late_wait_ms: float = 100.0, stall_ms: float = 0.0, batch: int = 8):
         if (mode not in MODES or worker not in WORKERS or bneg not in BNEG or packer not in PACKERS
                 or late not in LATES):
             raise BFError("mode %r / worker %r / bneg %r / packer %r / late %r: one of %s / %s / %s / %s / %s" % (
                 mode, worker, bneg, packer, late, MODES, WORKERS, BNEG, PACKERS, LATES))
-        if float(late_wait_ms) < 0 or float(stall_ms) < 0:
-            raise BFError("late_wait_ms >= 0, stall_ms >= 0")
+        if float(late_wait_ms) < 0 or float(stall_ms) < 0 or int(batch) < 1:
+            raise BFError("late_wait_ms >= 0, stall_ms >= 0, batch >= 1")
+        self.batch = int(batch)                          # jobs per worker batch (one pack / transport job / commit)
         self.packer, self.threads, self.gf = packer, int(threads), dict(gf or {})
         self.late_mode, self.late_wait_ms = late, float(late_wait_ms)
         self.stall_ms = float(stall_ms)                  # tests only: the worker sleeps per job (forces late jobs)
@@ -315,8 +343,8 @@ class BgFetch:
         self.snap_busy = [False] * self.nsnap
         self.snap_i = 0
         n = self.n_cap * bs
-        self.land_it = torch.zeros((self.ring, self.n_cap, 5), dtype=i64, device=dev)
-        self.stage_it = self._pinned((self.ring, self.n_cap, 5), i64)
+        self.land_it = torch.zeros((self.ring, self.n_cap, 6), dtype=i64, device=dev)   # h, b, layer, block, rk, lane
+        self.stage_it = self._pinned((self.ring, self.n_cap, 6), i64)
         self.h2d_done = [None] * self.ring               # the event of the entry's last H2D (the staging lifetime)
         self.land_busy = [False] * self.ring             # defer: the entry holds a job that waits for its layer
         self.land_reader = [None] * self.ring            # torch packer: the entry's last reader on the compute stream
@@ -471,10 +499,12 @@ class BgFetch:
         if ep is not None:                               # defer: the epoch ends with its joint pass
             with self.cv:
                 with self.lock:
-                    for l in sorted(ep.deferred):        # landed after their layer ran: wasted, entries freed
-                        for e, n, _ in ep.deferred[l]:
+                    for l in sorted(ep.deferred):        # landed after their layers ran: wasted, entries freed
+                        for e, n, _, k, _ in ep.deferred[l]:
                             self.land_busy[e] = False
-                            self._late(ep, ep.jobs, ep.t_close, "passed", n)
+                            for _ in range(k):
+                                self._late(ep, ep.jobs, ep.t_close, "passed", 0)
+                            self.rep["items_late"] = self.rep.get("items_late", 0) + n
                     ep.deferred.clear()
                     ep.closed = True
                     self.jep = None
@@ -523,21 +553,23 @@ class BgFetch:
         alive and never taken; committing all frees every landing entry, so a queued job never waits for an entry that
         only a later layer would free), layers < l dropped (their layer ran)."""
         for x in sorted(ep.deferred):
-            for e, n, ready in ep.deferred.pop(x):
-                if x < l:
-                    self._late(ep, ep.jobs, ep.t_close, "passed", n)
-                else:
+            for e, n, ready, k, layers in ep.deferred.pop(x):
+                if max(layers) < l:                      # every layer of the batch ran
+                    for _ in range(k):
+                        self._late(ep, ep.jobs, ep.t_close, "passed", 0)
+                    self.rep["items_late"] = self.rep.get("items_late", 0) + n
+                else:                                    # its items of layers < l are dropped inside (passed_items)
                     if self.cuda:
                         torch.cuda.current_stream().wait_event(ready)
                     itd = self.land_it[e][:n]
-                    self._commit(itd, n, x, ep.g, *self._src(e, n, itd), deferred=True)
+                    self._commit(itd, n, ep.g, *self._src(e, n, itd), layers, deferred=True, min_layer=l)
                     done = self._ev()
                     done.record()
                     self._entry_read(e, done)
-                    self.rep["deferred_committed"] = self.rep.get("deferred_committed", 0) + 1
-                    ep.issued += 1
+                    self.rep["deferred_committed"] = self.rep.get("deferred_committed", 0) + k
+                    ep.issued += k
                     ep.items_sent += n
-                    self.rep["issued"] += 1
+                    self.rep["issued"] += k
                     self.rep["items_sent"] += n
                 self.land_busy[e] = False
 
@@ -547,7 +579,7 @@ class BgFetch:
         bs, H, D = self.bs, self.H, self.D
         if self.packer == "torch":
             return self.land_k[e][:n * bs], self.land_v[e][:n * bs]
-        rsrc = ((itd[:, 4].view(n, 1) * bs + self.ar_bs.view(1, bs)) * H + itd[:, 0].view(n, 1)).reshape(-1)
+        rsrc = ((itd[:, 5].view(n, 1) * bs + self.ar_bs.view(1, bs)) * H + itd[:, 0].view(n, 1)).reshape(-1)
         return self.land_k.view(-1, D).index_select(0, rsrc), self.land_v.view(-1, D).index_select(0, rsrc)
 
     def _entry_read(self, e: int, done) -> None:
@@ -589,7 +621,7 @@ class BgFetch:
             self.rep["jobs"] += 1
         job = (ep, int(l), s, ep.jobs - 1, time.perf_counter())
         if self.worker == "inline":                      # the CPU tests: the job at once, on the compute stream
-            self._job(*job)
+            self._batch([job])
         else:
             self._start()
             with self.cv:
@@ -620,22 +652,50 @@ class BgFetch:
             self.thread.start()
 
     def _loop(self):
+        """BATCHES (bf1b: the per-job cost, not the pack, bound the worker: 3,666 of 13,408 jobs issued, 14 ms of worker
+        time per issued job, 2.84 transport chunks per job at 1.32 ms of submission each): one blocking get, then every
+        queued job of the SAME epoch up to `batch` jobs, processed as ONE pack / transport job / commit."""
         with torch.inference_mode():                     # L32: the main thread's inference mode
+            carry, have_carry = None, False
+            left = []                                    # (job, ids): read, not placed (the entry was full): first next
             while True:
-                job = self.q.get()
-                if job is None:
+                if left:
+                    first = left[0][0]
+                else:
+                    first = carry if have_carry else self.q.get()
+                    carry, have_carry = None, False
+                if first is None:
                     return
+                batch = [x[0] for x in left] or [first]
+                idss = [x[1] for x in left] + [None] * (len(batch) - len(left))
+                left = []
+                while len(batch) < self.batch and not have_carry:
+                    try:
+                        nxt = self.q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if nxt is None or nxt[0] is not first[0]:  # the stop, or a newer epoch's job: the next batch
+                        carry, have_carry = nxt, True
+                        break
+                    batch.append(nxt)
+                    idss.append(None)
                 tj = time.perf_counter()
                 try:
-                    self._job(*job)
+                    left = self._batch(batch, idss)
                 except BaseException as e:               # the compute thread raises it at its next hook
                     self.error = "%s: %s\n%s" % (type(e).__name__, e, traceback.format_exc()[-1500:])
-                    self._release_snap(job[2])
+                    for job, ids in zip(batch, idss):
+                        if ids is None:
+                            self._release_snap(job[2])
+                    left = []
                 finally:
+                    done = batch[:len(batch) - len(left)]   # the leftovers stay in flight (pend, inflight)
                     with self.cv:
-                        self.inflight -= 1
-                        job[0].pend[job[1]] -= 1
+                        self.inflight -= len(done)
+                        for job in done:
+                            job[0].pend[job[1]] -= 1
                         self.rep["worker_busy_s"] = self.rep.get("worker_busy_s", 0.0) + time.perf_counter() - tj
+                        self.rep["batches"] = self.rep.get("batches", 0) + 1
                         self.cv.notify_all()
 
     def stop(self) -> None:
@@ -659,19 +719,33 @@ class BgFetch:
         r["late_last_pass"] = r.get("late_last_pass", 0) + int(bool(last))
         self.late_ages.append(age)
 
-    def _job(self, ep, l: int, s: int, j: int = 0, t_enq: float = 0.0) -> None:
-        """Steps 2-3 of the module docstring for one (draft pass, layer) snapshot."""
+    def _batch(self, jobs, idss=None) -> list:
+        """Steps 2-3 of the module docstring for a BATCH of (draft pass, layer) snapshots of ONE epoch (the worker's
+        _loop; inline: one job): per job the items (the store's keys, the epoch's dedup, the ROOM rule, the caps), then
+        ONE pack, ONE transport job (gilfree: ONE release of every layer's items, chunked by cap_groups only) or one
+        H2D pair (torch), ONE commit of every layer's items. idss: the jobs' snapshots already read (None: read here).
+        -> the LEFTOVERS [(job, ids)]: the jobs after the first one that would not fit in the landing entry (n_cap
+        items, n_cap / H lanes per head) are not placed and not counted; the worker runs them first in its next batch
+        (a job is dropped by the cap only when it alone does not fit)."""
         H, B, L, bs, D = self.H, self.B, self.L, self.bs, self.D
+        ep = jobs[0][0]
         if self.stall_ms > 0:                            # tests only: a slow worker (late jobs on purpose)
-            time.sleep(self.stall_ms / 1e3)
-        with self.cap_lock:                              # a CUDA call: not during a capture
-            self.snap_ev[s].synchronize()
-        ids = self.snap_h[s].numpy().copy()
-        self._release_snap(s)
+            time.sleep(self.stall_ms * len(jobs) / 1e3)
+        idss = list(idss) if idss is not None else [None] * len(jobs)
+        ts = time.perf_counter()
+        for i, (_, l, s, j, t_enq) in enumerate(jobs):
+            if idss[i] is not None:
+                continue
+            with self.cap_lock:                          # a CUDA call: not during a capture
+                self.snap_ev[s].synchronize()
+            idss[i] = self.snap_h[s].numpy().copy()
+            self._release_snap(s)
+        self._tadd("snap_s", ts)
         if ep.closed:
             with self.lock:
-                self._late(ep, j, t_enq, "queued")
-            return
+                for _, l, s, j, t_enq in jobs:
+                    self._late(ep, j, t_enq, "queued")
+            return []
         t0 = time.perf_counter()
         if ep.have is None:                              # the epoch's first job: the store's keys and its ROOM
             with self.cap_lock:
@@ -681,43 +755,65 @@ class BgFetch:
                                                    L, self.nblk, self.kblock_h)
             ep.free0 = ep.free.copy()
             ep.have[kl, kh, kb, kk] = True
-        h, b, m = np.nonzero(ids >= 0)
-        blk = ids[h, b, m].astype(np.int64)
-        seen = blk.shape[0]
-        inr = blk < self.nblk
-        h, b, blk = h[inr], b[inr], blk[inr]
-        keep = ~ep.have[l, h, b, blk]
-        h, b, blk = h[keep].astype(np.int64), b[keep].astype(np.int64), blk[keep]
-        n_have = seen - h.shape[0]
-        room = group_rank(h, b, B) < ep.free[h, b]      # ROOM: never pack what the commit cannot place
-        n_room = int(h.shape[0] - room.sum())
-        h, b, blk = h[room], b[room], blk[room]
-        n_cap = max(0, h.shape[0] - self.n_cap)
-        h, b, blk = h[:self.n_cap], b[:self.n_cap], blk[:self.n_cap]
-        if self.packer == "gilfree":                     # a lane per (head, rank in head): n_cap / H lanes per entry
-            lk = group_rank(h, np.zeros_like(h), 1) < self.lanes_e
-            n_cap += int((~lk).sum())
-            h, b, blk = h[lk], b[lk], blk[lk]
-        n = int(h.shape[0])
-        ep.have[l, h, b, blk] = True
-        np.subtract.at(ep.free, (h, b), 1)
-        with self.lock:
-            ep.items_seen += seen
-            ep.items_have += n_have
-            ep.items_room += n_room
-            ep.items_cap += n_cap
-            self.rep["items_seen"] += seen
-            self.rep["items_have"] += n_have
-            self.rep["items_room"] = self.rep.get("items_room", 0) + n_room
-            self.rep["items_cap"] += n_cap
-        if n == 0:
+        parts, nonempty, left = [], [], []
+        hc = np.zeros((H,), dtype=np.int64)              # gilfree: lanes used per head in this batch
+        tot = 0
+        for q, ((_, l, s, j, t_enq), ids) in enumerate(zip(jobs, idss)):
+            h, b, m = np.nonzero(ids >= 0)
+            blk = ids[h, b, m].astype(np.int64)
+            seen = blk.shape[0]
+            inr = blk < self.nblk
+            h, b, blk = h[inr], b[inr], blk[inr]
+            keep = ~ep.have[l, h, b, blk]
+            h, b, blk = h[keep].astype(np.int64), b[keep].astype(np.int64), blk[keep]
+            n_have = seen - h.shape[0]
+            room = group_rank(h, b, B) < ep.free[h, b]  # ROOM: never pack what the commit cannot place
+            n_room = int(h.shape[0] - room.sum())
+            h, b, blk = h[room], b[room], blk[room]
+            fit = np.arange(h.shape[0]) < self.n_cap - tot                  # the batch's landing entry: n_cap items
+            if self.packer == "gilfree":                 # and n_cap / H lanes per head
+                fit &= group_rank(h, np.zeros_like(h), 1) + hc[h] < self.lanes_e
+            if q > 0 and not bool(fit.all()):            # FULL: this job and the later ones go to the next batch
+                left = list(zip(jobs[q:], idss[q:]))
+                jobs = jobs[:q]
+                self.rep["carried"] = self.rep.get("carried", 0) + len(left)
+                break
+            n_cap = int((~fit).sum())
+            h, b, blk = h[fit], b[fit], blk[fit]
+            n = int(h.shape[0])
+            ep.have[l, h, b, blk] = True
+            np.subtract.at(ep.free, (h, b), 1)
+            np.add.at(hc, h, 1)
+            tot += n
             with self.lock:
-                self.rep["empty_jobs"] += 1
-            return
+                ep.items_seen += seen
+                ep.items_have += n_have
+                ep.items_room += n_room
+                ep.items_cap += n_cap
+                self.rep["items_seen"] += seen
+                self.rep["items_have"] += n_have
+                self.rep["items_room"] = self.rep.get("items_room", 0) + n_room
+                self.rep["items_cap"] += n_cap
+                if n == 0:
+                    self.rep["empty_jobs"] += 1
+            if n:
+                parts.append((np.full_like(h, l), h, b, blk))
+                nonempty.append((l, j, t_enq))
+        self._tadd("select_s", t0)
+        if not parts:
+            return left
+        lt, h, b, blk = (np.concatenate([p[i] for p in parts]) for i in range(4))
+        o = np.lexsort((b, h))                          # by (head, request), stable
+        lt, h, b, blk = lt[o], h[o], b[o], blk[o]
+        n = int(h.shape[0])
+        l_min, l_max = int(lt.min()), int(lt.max())
+        self.rep["batch_layers_max"] = max(self.rep.get("batch_layers_max", 0), int(np.unique(lt).shape[0]))
+        self.rep["batch_jobs_max"] = max(self.rep.get("batch_jobs_max", 0), len(nonempty))
         hr = group_rank(h, np.zeros_like(h), 1)          # the rank in its head (items sorted by head)
         rk = group_rank(h, b, B)
         e = self.land_i
         self.land_i = (e + 1) % self.ring
+        tw = time.perf_counter()
         with self.cv:                                    # DEFER: the entry still holds a job that waits for its layer
             while self.land_busy[e] and not ep.closed and self.error is None:
                 self.cv.wait(0.05)
@@ -725,37 +821,47 @@ class BgFetch:
         if self.h2d_done[e] is not None:                 # the staging entry's previous H2D finished
             with self.cap_lock:
                 self.h2d_done[e].synchronize()
+        self._tadd("entry_s", tw)
         pblk = np.minimum(blk + 1, self.nblk - 1) if self.bneg == "wrong_bytes" else blk     # NEGATIVE CONTROL
         it = self.stage_it[e][:n]
-        it.copy_(torch.from_numpy(np.stack((h, b, blk, rk, lane), axis=1)))
+        it.copy_(torch.from_numpy(np.stack((h, b, lt, blk, rk, lane), axis=1)))
         jev = None
+
+        def abandon(stage):                              # under the lock: every non-empty job of the batch is late
+            for l_, j_, t_ in nonempty:
+                self._late(ep, j_, t_, stage, 0)
+            self.rep["items_late"] = self.rep.get("items_late", 0) + n
         if self.packer == "torch":
-            idx = torch.from_numpy(rows_of(h, b, pblk, self.Tcpu, H, bs))
-            eng = self.engs[l]
-            torch.index_select(eng._k_cpu.view(-1, D), 0, idx, out=self.stage_k[e][:n * bs])
-            torch.index_select(eng._v_cpu.view(-1, D), 0, idx, out=self.stage_v[e][:n * bs])
-        else:                                            # GILFREE: ONE descriptor job, packed by the C++ team
-            desc = torch.from_numpy(np.stack((np.full_like(h, l), b, h, pblk, lane, np.zeros_like(h)))).contiguous()
-            readers = [-1] * L
-            readers[l] = self.lmark[e]                   # T3: the landing entry's last commit read it
+            sk3 = self.stage_k[e][:n * bs].view(n, bs, D)
+            sv3 = self.stage_v[e][:n * bs].view(n, bs, D)
+            for x in sorted(set(lt.tolist())):          # per layer: its host rows, into the items' positions
+                pos = np.nonzero(lt == x)[0]
+                idx = torch.from_numpy(rows_of(h[pos], b[pos], pblk[pos], self.Tcpu, H, bs))
+                p_t = torch.from_numpy(pos)
+                eng = self.engs[x]
+                sk3.index_copy_(0, p_t, torch.index_select(eng._k_cpu.view(-1, D), 0, idx).view(-1, bs, D))
+                sv3.index_copy_(0, p_t, torch.index_select(eng._v_cpu.view(-1, D), 0, idx).view(-1, bs, D))
+        else:                                            # GILFREE: ONE release of the batch, packed by the C++ team
             with self.cap_lock:
-                if ep.closed or (ep.closing and l <= ep.consumed_upto):
+                if ep.closed or (ep.closing and l_max <= ep.consumed_upto):
                     with self.lock:
-                        self._late(ep, j, t_enq, "passed" if not ep.closed else "packing", n)
-                    return
-                seq = int(self.tp.issue_desc(desc, reader_marks=readers, hist_mark=-1))   # T4: the snapshot waited
+                        abandon("passed" if not ep.closed else "packing")
+                    return left
+                tc = time.perf_counter()
+                seq = self._release(e, h, b, lt, pblk, lane)
             jev = self.tp.job_ev(seq)
             jev.wait_submitted()                         # the GIL released: the C++ worker packed and enqueued it
+            self._tadd("cxx_s", tc)
         t1 = time.perf_counter()
         with self.cap_lock, self.lock:                   # the issue: atomic against the epoch's close
             self.rep["pack_s"] += t1 - t0
-            if ep.closed or (ep.closing and l <= ep.consumed_upto):    # abandoned (DEFER: its layer already ran)
-                self._late(ep, j, t_enq, "passed" if not ep.closed else "packing", n)
-                return
+            if ep.closed or (ep.closing and l_max <= ep.consumed_upto):    # abandoned (DEFER: its layers already ran)
+                abandon("passed" if not ep.closed else "packing")
+                return left
             ctx = torch.cuda.stream(self.side) if self.cuda else contextlib.nullcontext()
             with ctx:
                 if self.cuda:
-                    self.side.wait_event(self.snap_ev[s])
+                    self.side.wait_event(self.snap_ev[jobs[-1][2]])   # the newest snapshot of the batch
                     if self.land_reader[e] is not None:  # torch packer: a deferred commit read this entry last
                         self.side.wait_event(self.land_reader[e])
                 ea, eb = self._ev(True), self._ev(True)
@@ -768,36 +874,65 @@ class BgFetch:
                 self.land_it[e][:n].copy_(it, non_blocking=self.cuda)
                 eb.record()
                 self.h2d_done[e] = eb
-                if ep.closing:                           # DEFER: landed; the joint pass commits it at layer l
-                    ep.deferred.setdefault(l, []).append((e, n, eb))
+                if ep.closing:                           # DEFER: landed; the joint pass commits it at its layers
+                    ep.deferred.setdefault(l_min, []).append((e, n, eb, len(nonempty), sorted(set(lt.tolist()))))
                     self.land_busy[e] = True
-                    self.rep["deferred"] = self.rep.get("deferred", 0) + 1
+                    self.rep["deferred"] = self.rep.get("deferred", 0) + len(nonempty)
                     self.rep["issue_s"] += time.perf_counter() - t1
                     if self.cuda:
                         self.h2d_ev.append((ea, eb, n * self.item_bytes))
-                    return
+                    return left
                 itd = self.land_it[e][:n]
-                self._commit(itd, n, l, ep.g, *self._src(e, n, itd))
+                self._commit(itd, n, ep.g, *self._src(e, n, itd), sorted(set(lt.tolist())))
                 done = self._ev()
                 done.record()
             self._entry_read(e, done)
             ep.last = done
-            ep.issued += 1
+            ep.issued += len(nonempty)
             ep.items_sent += n
-            self.rep["issued"] += 1
+            self.rep["issued"] += len(nonempty)
             self.rep["items_sent"] += n
             self.rep["issue_s"] += time.perf_counter() - t1
             if self.cuda:
                 self.h2d_ev.append((ea, eb, n * self.item_bytes))
+        return left
 
-    def _commit(self, it, n: int, l: int, g: int, src_k, src_v, deferred: bool = False) -> None:
+    def _tadd(self, key: str, t0: float) -> None:
+        """The worker's stage clocks (report: per epoch): snap_s (snapshot waits), select_s (the items on the host),
+        entry_s (the landing entry's waits), cxx_s (the C++ release until its submission), issue_s (the side-stream
+        launches and the commit), pack_s (select + pack + submit, as before)."""
+        self.rep[key] = self.rep.get(key, 0.0) + time.perf_counter() - t0
+
+    def _release(self, e: int, h, b, lt, pblk, lane) -> int:
+        """THE BATCH'S ONE RELEASE (bf1b: 2.84 chunks per job at 1.32 ms of submission each; issue_desc makes one
+        release per LAYER, at least one chunk each): every item of the batch, all layers, as ONE job of the C++ worker
+        (NativePipe.submit, the transport's own _submit path with xpool) into the ONE flat landing that every layer
+        shares: source l' = layer * B + b (the transport's sources, one per (layer, request)), destination m' = the lane,
+        so the chunks are ceil(n / cap_groups). T3: the landing entry's last commit (its reader mark); no T4 (the host rows
+        exist before the draft pass that named them). -> the job seq."""
+        tp = self.tp
+        tp._raise_pending_error()
+        tp._reap()
+        keep = []
+        rh = tp._mark_handle("reader", self.lmark[e], keep)          # 0: none, or done
+        tp._start_worker()
+        lk, lv = self.land_k.unsqueeze(0), self.land_v.unsqueeze(0)    # (1, M * 64, H, D): the transport's flat view
+        seq = int(tp.npipe.submit([0] * int(h.shape[0]), h.tolist(), (lt * self.B + b).tolist(), lane.tolist(),
+                                  pblk.tolist(), lk, lv, [], [], [], [rh] if rh else []))
+        if keep:
+            tp._keep[seq] = keep
+        tp._last_seq = seq
+        return seq
+
+    def _commit(self, it, n: int, g: int, src_k, src_v, layers, deferred: bool = False, min_layer: int = -1) -> None:
         """Step 3's commit on the CURRENT stream (the side stream; the CPU: in line; DEFER: the compute stream at the
-        joint pass's layer l). it (n, 5) device rows h, b, block, rank in (h, b), lane; src_k / src_v (n x 64, D): the
-        items' rows, item-major. deferred: no room counts apart (the joint pass's keep may have taken dead slots of
-        layers < l since the host counted the room; those bytes were moved and are wasted)."""
+        joint pass's layer min_layer). it (n, 6) device rows h, b, layer, block, rank in (h, b), lane (a batch holds
+        several layers); src_k / src_v (n x 64, D): the items' rows, item-major. deferred: no room counts apart (the
+        joint pass's keep may have taken dead slots since the host counted the room; those bytes were moved and are
+        wasted); items of layers < min_layer are not committed (their layer ran: "passed")."""
         T, H, B, X, bs = self.T, self.H, self.B, self.X, self.bs
-        h, b, blk, rk = it[:, 0], it[:, 1], it[:, 2], it[:, 3]
-        key = blk + int(l) * KM
+        h, b, lt, blk, rk = it[:, 0], it[:, 1], it[:, 2], it[:, 3], it[:, 4]
+        key = blk + lt * KM
         kid1 = T.kid[..., 1:]
         kage1 = T.kage[..., 1:]
         hit = T.kid[h, b, 1:] == key.view(n, 1)                          # (n, X - 1)
@@ -810,26 +945,30 @@ class BgFetch:
             elig = elig & ~T.kblock
         order = torch.sort(torch.where(elig, kage1, torch.full_like(kage1, BIGI)), dim=-1, stable=True).indices
         nel = elig.sum(-1)
-        ok = (~found) & (rk < nel[h, b])
+        passed = lt < int(min_layer)                                    # DEFER: their layer ran
+        found = found & ~passed
+        ok = (~found) & (rk < nel[h, b]) & ~passed
         slot = order[h, b, rk.clamp(max=X - 2)] + 1
         dslot = torch.where(ok, slot, torch.zeros_like(slot))           # not ok: store slot 0 (CB1, rewritten by J)
         rows = (((b * X + dslot).view(n, 1) * bs + self.ar_bs.view(1, bs)) * H + h.view(n, 1)).reshape(-1)
         if self.bneg != "no_copy":                                       # NEGATIVE CONTROL: the rows not copied
             self.sk.index_copy_(0, rows, src_k)
             self.sv.index_copy_(0, rows, src_v)
-            tc = self.twins[l].total_cis
             pos = (blk * bs).view(n, 1) + self.ar_bs.view(1, bs)
-            bias = tc[b.view(n, 1), pos, h.view(n, 1)]
+            bias = None
+            for x in layers:                             # each item's bias rows from ITS layer's twin
+                vals = self.twins[x].total_cis[b.view(n, 1), pos, h.view(n, 1)]
+                bias = vals if bias is None else torch.where((lt == x).view(n, 1), vals, bias)
             self.sb.index_copy_(0, rows, bias.reshape(-1).to(self.sb.dtype))
         wslot = torch.where(ok, slot, torch.where(found, fs0 + 1, torch.zeros_like(slot)))
         T.kid.index_put_((h, b, wslot), key)
-        T.kage.index_put_((h, b, wslot), torch.full_like(key, int(g) * self.L + int(l)))
+        T.kage.index_put_((h, b, wslot), int(g) * self.L + lt)
         self.ptag.index_put_((h, b, wslot), ok | found)
         self.pkey.index_put_((h, b, wslot), key)
-        nr = ((~ok) & (~found)).sum()
+        nr = ((~ok) & (~found) & ~passed).sum()
         z = torch.zeros_like(nr)
         self.cnt_side.add_(torch.stack((torch.full_like(ok.sum(), n), ok.sum(), found.sum(), z if deferred else nr,
-                                        nr if deferred else z)))
+                                        nr if deferred else z, passed.sum())))
 
     # ---------------------------------------------------------- report (after the run, one sync)
     def report(self) -> dict:
@@ -842,14 +981,18 @@ class BgFetch:
             tps = dict(st, threads=self.threads, threads_ok=(st.get("threads_min") == self.threads
                                                              and st.get("threads_max") == self.threads),
                        pack_GBps_native=(round(self.rep["items_sent"] * self.item_bytes / st["pack_ns"], 3)
-                                         if st.get("pack_ns") else None))
+                                         if st.get("pack_ns") else None),
+                       submit_ms_per_chunk=(round(st["submit_ns"] / st["chunks"] / 1e6, 4) if st.get("chunks") else None),
+                       submit_GBps=(round(self.rep["items_sent"] * self.item_bytes / st["submit_ns"], 3)
+                                    if st.get("submit_ns") else None),
+                       groups_per_chunk=(round(st["groups"] / st["chunks"], 1) if st.get("chunks") else None))
             self.tp = None
         if self.cuda:
             torch.cuda.synchronize()
         out = dict(self.rep, mode=self.mode, worker=self.worker, n_cap=self.n_cap, ring=self.ring, acct=self.acct,
                    bneg=self.bneg, X=self.X, error=self.error, device_bytes=self.bytes_device(),
                    item_bytes=self.item_bytes, packer=self.packer, transport=tps, late_mode=self.late_mode,
-                   late_wait_ms=self.late_wait_ms, lanes_per_entry=self.lanes_e)
+                   late_wait_ms=self.late_wait_ms, lanes_per_entry=self.lanes_e, batch=self.batch)
         out.update({k: int(v) for k, v in zip(SIDE_KEYS, self.cnt_side.tolist())})
         out.update({k: int(v) for k, v in zip(MAIN_KEYS, self.cnt_main.tolist())})
         out["pending"] = int(self.ptag[..., 1:].sum())                   # tags of jobs after the last joint pass
@@ -877,6 +1020,13 @@ class BgFetch:
         out["room_free_min"] = min(fn) if fn else None
         dem = [p["items_seen"] - p["items_have"] for p in self.per_epoch]     # demand after the store / epoch dedup
         out["room_demand_per_hb_mean"] = round(sum(dem) / len(dem) / (self.H * self.B), 2) if dem else None
+        ne = max(1, out["epochs"])                       # THE WORKER'S BUDGET per epoch (vs the draft window)
+        out["worker_ms_per_epoch"] = {k: round(out.get(k, 0.0) * 1e3 / ne, 3) for k in (
+            "worker_busy_s", "snap_s", "select_s", "entry_s", "cxx_s", "issue_s", "pack_s")}
+        if tps is not None:
+            out["worker_ms_per_epoch"]["cxx_submit"] = round(tps.get("submit_ns", 0) / 1e6 / ne, 3)
+            out["worker_ms_per_epoch"]["cxx_pack"] = round(tps.get("pack_ns", 0) / 1e6 / ne, 3)
+            out["chunks_per_epoch"] = round(tps.get("chunks", 0) / ne, 2)
         return out
 
 
@@ -924,6 +1074,47 @@ def _make(STF):
             self.bf.after_joint()
             return out
 
+        def bf_warm_joint(self) -> dict:
+            """THE STORE-X WARM (module docstring, COMPILE): ONE call of the joint helpers pre, loc1 and loc2 on THIS
+            state's own buffers (its store X: vs.lst_buf (H, B, X), vs.cap = X - 1, _cap_t, _sb1), exactly as the keep
+            section's _cc_locate calls them (r2_i4cc_compile.py:310-329, fetch False), with a selection of -1 (no
+            block) in vs.ti. Before the arm's first capture: a new store X compiles here (after_captures 0), and the
+            first joint pass hits the cache. vs.ti and vs.lst_buf are restored byte for byte; the call counts too."""
+            vs = self._vs
+            why = self._cc_why(_PlanVS(vs))
+            R = int(vs.R)
+            hp = self._hps.get(R)
+            if why is not None or hp is None:
+                return dict(ran=False, why=why or "no hoist buffers of R %d" % R)
+            H, B, T = self.H, self.B, int(vs.topk)
+            rs = self.rs
+            eng = rs.cache.layers[0].cache_engine
+            n0, calls0 = len(self.cc["events"]), dict(self.cc["calls"])
+            ti0, lb0 = vs.ti.clone(), vs.lst_buf.clone()
+            t0 = time.perf_counter()
+            try:
+                vs.ti.fill_(-1)
+                sel = vs.ti.view(H, B, R, T)
+                ti, inj, sel_c, is_q, is_n = self._cc("pre", 0, sel, hp.qb3, hp.qb4, hp.qb1_4, vs.minus1)
+                v = sel_c.view(H, B, R * T)
+                ws, wi = torch.sort(eng._block_map, dim=-1)
+                ps, pi = torch.sort(eng._pool_map, dim=-1) if rs.pool else (None, None)
+                valid, in_win, wslot, in_pool, pslot, keyh = self._cc("loc1", 0, v, ws, wi, ps, pi, hp.fullv, vs.big,
+                                                                      int(vs.topk))
+                s = torch.sort(keyh, dim=-1).values
+                self._cc("loc2", 0, s, v, valid, in_win, wslot, in_pool, pslot, sel, is_q, is_n, self._eb[0],
+                         self._sb1, self.cb0_id, vs.store_b.view(1, B, 1, 1), vs.lst_buf, vs.host_x, vs.minus1,
+                         vs.big, self._cap_t, int(vs.cap), int(STF.VR.FORK_BIG), False, bool(vs.ops.stats))
+            finally:
+                vs.ti.copy_(ti0)
+                vs.lst_buf.copy_(lb0)
+                self.cc["calls"] = calls0
+            ev = self.cc["events"][n0:]
+            for e in ev:
+                e["warm"] = "store X %d" % int(vs.X)
+            return dict(ran=True, X=int(vs.X), cap=int(vs.cap), compiled=[e["name"] for e in ev],
+                        s=round(time.perf_counter() - t0, 3))
+
     class TentRunnerBF(RKD):
         """The arms L4PTFDGUDKWCDB (bf mode "ce") and L4PTFDGUDKWCDX (bf mode "off"). bf: dict(mode, n_cap, ring,
         worker, acct, bneg) for BgFetch."""
@@ -935,7 +1126,9 @@ def _make(STF):
             self.T.bf = self.bf
             self.bf.wrap_backend(getattr(self.T, "backend", None))
             self.bf.open_epoch()
-            self.meta.update(bf=dict(o, X=self.bf.X, device_bytes=self.bf.bytes_device()))
+            with torch.inference_mode():                               # the run's mode (_run_paper)
+                warm = self.T.bf_warm_joint()                          # COMPILE: before the arm's first capture
+            self.meta.update(bf=dict(o, X=self.bf.X, device_bytes=self.bf.bytes_device(), warm=warm))
 
         def _arm_name(self):
             return "L4PTFDGUDKWCDX" if self._bfo.get("mode", "ce") == "off" else "L4PTFDGUDKWCDB"
