@@ -164,10 +164,19 @@ def test_recon7_copies():
     C, M = _mod("r2_recon7_cell"), _mod("r2_recon7_mem")
     for new, old in ((C.run_arm_r7, C.DCC.run_arm_d), (M.probe_arm_r7, M.I4M.probe_arm_x)):
         nb, ob = _body_lines(new), _body_lines(old)
-        core = [x for x in nb if not x.rstrip().endswith("# R7")]
-        extra = [x for x in nb if x.rstrip().endswith("# R7")]
+        core = [x for x in nb if not re.search(r"# R7\b", x)]
+        extra = [x for x in nb if re.search(r"# R7\b", x)]
+        if new is C.run_arm_r7:                                        # the one core line moved under try (review 3)
+            run = [x for x in extra if x.strip().startswith("runner.run(steps)")]
+            assert len(run) == 1 and run[0].startswith("        runner.run(steps)"), run
+            assert "    runner.run(steps)" in ob
+            ob = [x for x in ob if x != "    runner.run(steps)"]
         assert core == ob, [(i, a, b) for i, (a, b) in enumerate(zip(core, ob)) if a != b][:3] or (len(core), len(ob))
-        assert 2 <= len(extra) <= 5, extra
+        assert 2 <= len(extra) <= 8, extra
+    src = inspect.getsource(C.run_arm_r7)                              # pr.detach() runs in the finally of runner.run
+    tr = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Try)]
+    assert len(tr) == 1 and "runner.run(steps)" in ast.unparse(tr[0].body[0]) and "pr.detach()" in ast.unparse(
+        tr[0].finalbody[0]) and not tr[0].handlers
     _ev("RECON7 COPIES: run_arm_r7 = run_arm_d + %d R7 lines; probe_arm_r7 = probe_arm_x + %d R7 lines" % (
         sum(1 for x in _body_lines(C.run_arm_r7) if x.rstrip().endswith("# R7")),
         sum(1 for x in _body_lines(M.probe_arm_r7) if x.rstrip().endswith("# R7"))))
@@ -354,6 +363,47 @@ def test_probe_plant(tmp_path_factory):
     g = RP.peq_gate_r7("P", _cpu(ev, C), _cpu(base, C), "L4PTFDGUDCD", N_RUN)
     _ev("RECON7 PLANT probe_computes: differs %s; PEQ %s" % (bad[:6], g[2]))
     assert bad != [] and g[2] is False                                 # not a no-op (L34); CAUGHT by PEQ
+
+
+def test_probe_teardown(tmp_path_factory):
+    """review 3 source finding: an exception inside runner.run while the split commit window is open (its module-level
+    SR.accept_prefix wrapper installed, its profiler running) is torn down by ProbeR7.detach (run_arm_r7 calls it in a
+    finally: test_recon7_copies). NEGATIVE CONTROL: before detach the wrapper IS installed (the plant is not a no-op)."""
+    RP = _mod("r2_recon7_probe")
+    seen = {}
+
+    class Boom(RP.ProbeR7):                                            # raise at the pass after a LABELLED window opened
+        def _run_pass(self, model, plan):
+            if self._win is not None and self._win["labelled"] and "raised" not in seen:
+                SRm = next(getattr(sys.modules[c.__module__], "SR") for c in type(self.r).__mro__
+                           if c.__name__ == "TentRunner")
+                seen.update(raised=True, SR=SRm, wrapped=SRm.accept_prefix, run_pass=self.T.run_pass,
+                            prof=torch.autograd._profiler_enabled())
+                raise RuntimeError("planted: an exception inside the split commit window")
+            return super()._run_pass(model, plan)
+    arm = "GUDCD"
+    _plain(C_OF[arm])
+    base = _plain(arm)
+    prof, lab, cnt = _rounds_plan(base["rd"]["rounds"])
+    tmp = str(tmp_path_factory.mktemp("r7_teardown"))
+    box = {}
+
+    def on_runner(run):
+        box["p"] = Boom(run, BC.HostClock(), tmp, ARM_P[arm], prof, lab, cnt, True, X.W.BS * X.W.D * 2 * 2 + X.W.BS * 2)
+        box["orig_run_pass"] = box["p"]._run
+    SRm = None
+    with pytest.raises(RuntimeError, match="planted"):
+        X.run_arm(arm, "timing", B=8, N=N_RUN, on_runner=on_runner)
+    SRm = seen["SR"]
+    p = box["p"]
+    assert seen["raised"] and seen["prof"] is True                     # the window was open, its profiler running
+    leaked = SRm.accept_prefix                                         # NEGATIVE CONTROL: without detach it leaks
+    assert getattr(leaked, "__name__", "") == "w" and p._win is not None, leaked
+    p.detach()
+    assert p._win is None and SRm.accept_prefix is not leaked and getattr(SRm.accept_prefix, "__name__", "") != "w"
+    assert not torch.autograd._profiler_enabled() and p.T.run_pass == box["orig_run_pass"]
+    _ev("RECON7 TEARDOWN: planted exception in the labelled commit window round; before detach accept_prefix=%s, "
+        "profiler on; after detach restored, profiler off" % getattr(leaked, "__name__", leaked))
 
 
 # ------------------------------------------------------------------ THE STATISTIC FIX
@@ -781,8 +831,9 @@ def test_streams_run_shapes():
 
 
 # ------------------------------------------------------------------ MEM (c)
-def test_mem_pure():
+def test_mem_pure(monkeypatch):
     M = _mod("r2_recon7_mem")
+    monkeypatch.setattr(M.PROT, "GRANT_r7mem", None)                   # the refusals below do not depend on the tree
     a = M.parse_args(["--out", "x", "--workload", "w"])
     assert (a.batches, a.pool, a.steps, a.probe_rounds, a.margin_gb) == ([64, 192], 18, 512, 49, 0.10)
     for bad in (["--batches", "64"], ["--batches", "64,64"], ["--spec", "4"], ["--probe-rounds", "20"],
@@ -833,8 +884,10 @@ def test_mem_pure():
 
 
 # ------------------------------------------------------------------ CELL (a), the protocol, the step script, the notes
-def test_recon7_cell_pure():
+def test_recon7_cell_pure(monkeypatch):
     C, RP = _mod("r2_recon7_cell"), _mod("r2_recon7_probe")
+    for c in C.PROT.CELLS:                                             # the refusals below do not depend on the tree
+        monkeypatch.setattr(C.PROT, "GRANT_%s" % c, None)
     base = ["--out", "x", "--workload", "w"]
     a = C.parse_args(base)
     assert (a.arms, a.batch, a.steps, a.pool, a.probe_every, a.profile_rounds, a.label_rounds, a.count_rounds,
@@ -909,7 +962,9 @@ def test_protocol_state(monkeypatch):
     for c in P.CELLS:
         if P.grant(c) is None:
             assert P.refusal(c, P.CELL_MODULE[c], _profile_args(c)).startswith("REFUSED")
-    # an r7s grant runs r7s only
+    # an r7s grant runs r7s only (the tree's own grants set to None first: the test does not depend on them)
+    for c in P.CELLS:
+        monkeypatch.setattr(P, "GRANT_%s" % c, None)
     monkeypatch.setattr(P, "GRANT_r7s", STAMP)
     assert P.refusal("r7s", "r2_recon7_streams", _profile_args("r7s")) is None
     for c in ("r7pm", "r7pa", "r7pb", "r7mem"):
@@ -996,9 +1051,13 @@ def test_step_script_recon7(tmp_path):
     for m in MODULES + ("r2_i4c_cell.py", "r2_i4m_cell.py", "r2_wsm_cell.py", "r2_i4dc_cell.py", "r2_p3_profile.py"):
         assert "benchmarks/Efficiency/%s" % m in src, m
     # THE CELL GRANTS (review 3 finding 1): granted() on planted protocol texts
-    prot = (EFF / "r2_recon7_protocol.py").read_text()
+    tree = (EFF / "r2_recon7_protocol.py").read_text()
+    P = _mod("r2_recon7_protocol")
+    for c in ("r7pm", "r7pa", "r7pb", "r7s", "r7mem"):                 # the tree's own grants, whatever they are
+        assert _granted(c, tree, tmp_path) == (0 if P.stamp_ok(P.grant(c)) else 1), c
+    prot = "\n".join(("%s = None" % x.split(" = ")[0]) if x.startswith("GRANT_") else x for x in tree.splitlines()) + "\n"
     for c in ("r7pm", "r7pa", "r7pb", "r7s", "r7mem"):
-        assert _granted(c, prot, tmp_path) == 1, c                     # this tree: nothing granted
+        assert _granted(c, prot, tmp_path) == 1, c                     # every line None: nothing granted
     g7s = prot.replace("GRANT_r7s = None", 'GRANT_r7s = "%s"' % STAMP)
     assert g7s != prot and _granted("r7s", g7s, tmp_path) == 0
     for c in ("r7pm", "r7pa", "r7pb", "r7mem"):

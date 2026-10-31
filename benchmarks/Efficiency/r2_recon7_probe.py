@@ -588,10 +588,17 @@ class ProbeR7:
         _patch(self._stack, T, "run_pass", self._run_pass)
 
     def detach(self) -> None:
-        if self._win is not None:
-            self._close_commit(None, None, why="detach")
-        _unpatch(self._stack)
-        self.skips.free()
+        """UNCONDITIONAL teardown, also after an exception inside runner.run (review 3 source finding): the open commit
+        window (its patches incl. a module-level SR.accept_prefix wrapper, its record range, its profiler), then the
+        run_pass patch, then the skip record; each step runs even when an earlier one raises."""
+        try:
+            if self._win is not None:
+                self._close_commit(None, None, why="detach")
+        finally:
+            try:
+                _unpatch(self._stack)
+            finally:
+                self.skips.free()
 
     # -------------------------------------------------------------- the dispatch
     def _fin(self):
@@ -904,11 +911,17 @@ class ProbeR7:
         try:
             if w["mk"] is not None:
                 w["mk"].close()
-        finally:
-            _unpatch(w["stack"])
-            w["rf"].__exit__(None, None, None)
-            self.clock.sync()
-            w["prof"].__exit__(None, None, None)
+        finally:                                                       # each step runs even when one raises
+            try:
+                _unpatch(w["stack"])
+            finally:
+                try:
+                    w["rf"].__exit__(None, None, None)
+                finally:
+                    try:
+                        self.clock.sync()
+                    finally:
+                        w["prof"].__exit__(None, None, None)
         name = RANGE_PREFIX + "commit"
         rec = dict(round=w["g"], slot="commit", labelled=w["labelled"], wall_ms=round(float(self.clock.elapsed(
             w["e0"], e1)), 4), trace=None, error=None, closed_by=why, same_round=(g_now == w["g"]),

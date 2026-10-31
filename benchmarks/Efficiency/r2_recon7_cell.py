@@ -184,9 +184,11 @@ def run_arm_r7(model, ids, inputs, steps: int, clock, opt, FORK, arm: str, out_d
     if check:
         runner.vs.fa_check = {}                                        # CHECK-ONLY: the "F" / "RA" probes
     pr = probe_for(runner, clock, out_dir, opt) if arm in PROBED else None   # R7
-    runner.run(steps)
-    if pr is not None:   # R7
-        pr.detach()   # R7
+    try:   # R7 (review 3 source finding: the probe's teardown is unconditional)
+        runner.run(steps)   # R7 (the core line, under try)
+    finally:   # R7
+        if pr is not None:   # R7
+            pr.detach()   # R7
     rd = runner.read()
     rd.pop("trace_all", None)
     clock.sync()
@@ -394,6 +396,7 @@ def main(argv=None) -> int:
             gates.append(("SH-RUN", True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
         mem["after_SH"] = BC.host_mem()
         BC.free()
+        stopped = None
         for arm in a.arms:
             if inputs is None:
                 gates.append(("%s-RUN" % arm, True, False, "NOT_RUN: SH failed (every arm uses SH's tokens)"))
@@ -450,8 +453,13 @@ def main(argv=None) -> int:
             except Exception as e:
                 traceback.print_exc()
                 gates.append(("%s-RUN" % arm, True, False, "EXCEPTION %s: %s" % (type(e).__name__, str(e)[:300])))
+                stopped = arm                                          # STOP THE RUN: no later arm on leaked state
             mem["after_%s" % arm] = BC.host_mem()
             BC.free()
+            if stopped is not None:
+                for later in a.arms[a.arms.index(arm) + 1:]:
+                    gates.append(("%s-RUN" % later, True, False, "NOT_RUN: the run stopped after %s's exception" % arm))
+                break
     probed = [p for p in PROBED if p in sp and (res_of.get(p) or {}).get("probe")]
     recr = sorted({g for p in probed for g in res_of[p]["probe"]["recording_rounds"]})
     xr = sorted(set(HC.excluded_rounds(caps)) | set(recr))            # L61 + the recording rounds, every arm
