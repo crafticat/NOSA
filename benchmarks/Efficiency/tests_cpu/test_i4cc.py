@@ -85,6 +85,11 @@ I4CC_NEW = I4CC_NEW + (E_ + "r2_j1_forkbench.py",)                              
 I4CC_NEW = I4CC_NEW + (E_ + "r2_st1_commit.py", E_ + "r2_st1_cell.py", E_ + "r2_st1_step.sh",
                        T_ + "test_st1.py")                                                        # ST1
 I4CC_LATER = I4CC_LATER + ("r2_st1_commit.py", "r2_st1_cell.py")                                  # ST1
+# INT (nosi-r2-int: J1 + ST1 + BF1 in one arm, r2_int_cell.py): its files (its own Gate 0: tests_cpu/test_int.py);
+# I4CC_LATER: its modules may name the earlier modules (the scan skips them)
+I4CC_NEW = I4CC_NEW + (E_ + "r2_int_arms.py", E_ + "r2_int_cell.py", E_ + "r2_int_step.sh", T_ + "test_int.py",
+                       "docs/NOTES_int.md")                                                       # INT
+I4CC_LATER = I4CC_LATER + ("r2_int_arms.py", "r2_int_cell.py")                                    # INT
 # BF1 (nosi-r2-bf1: RECON7 cd0f0c5 + the draft-issued background fetch): its files (its own Gate 0: tests_cpu/test_bf1.py);
 # I4CC_LATER: its modules may name the earlier modules (the scan skips them)
 I4CC_NEW = I4CC_NEW + (E_ + "r2_bf1_fetch.py", E_ + "r2_bf1_cell.py", E_ + "r2_bf1_step.sh", T_ + "test_bf1.py")  # BF1

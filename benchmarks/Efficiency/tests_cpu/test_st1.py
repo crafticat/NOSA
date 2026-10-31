@@ -59,6 +59,14 @@ ST1_NEW = tuple(E_ + m for m in MODULES) + (E_ + "r2_st1_step.sh", T_ + "test_st
 ST1_DECL = tuple(T_ + "test_%s.py" % n for n in ("wsa", "wsb", "wsc", "i2", "i3", "i4a", "i4g", "i4d", "i4k", "i4u",
                                                     "i4h", "i4s", "i4cc", "i4dc", "recon7"))
 HAND_KERNEL = ("import triton", "@triton.jit", "triton.jit", "load_inline", "cpp_extension", "tl.load", "tl.store")
+# INT (nosi-r2-int: J1 + ST1 + BF1 in one arm, r2_int_cell.py): the J1 and BF1 rungs' files and its own (its own Gate
+# 0: tests_cpu/test_int.py); ST1_LATER: its modules import the ST1 modules (scan (f) skips them)
+ST1_NEW = ST1_NEW + (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", E_ + "r2_j1_forkbench.py",
+                     T_ + "test_j1.py", "docs/NOTES_j1.md",
+                     E_ + "r2_bf1_fetch.py", E_ + "r2_bf1_cell.py", E_ + "r2_bf1_step.sh", T_ + "test_bf1.py",
+                     E_ + "r2_int_arms.py", E_ + "r2_int_cell.py", E_ + "r2_int_step.sh", T_ + "test_int.py",
+                     "docs/NOTES_int.md")                                                         # INT
+ST1_LATER = ("r2_int_arms.py", "r2_int_cell.py")                                                  # INT
 N_RUN = 48                             # committed tokens per request: about 16 rounds + the drain
 
 
@@ -129,7 +137,7 @@ def test_st1_gate0_files():
     mods |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
     assert mods == {"torch", "time"}, mods
     for p in list((ROOT / "nosi/nosi").glob("*.py")) + list(EFF.glob("*.py")):     # (f) nobody else names them
-        if p.name.startswith("r2_st1_"):
+        if p.name.startswith("r2_st1_") or p.name in ST1_LATER:                                     # INT
             continue
         assert "r2_st1" not in p.read_text(), p.name
 

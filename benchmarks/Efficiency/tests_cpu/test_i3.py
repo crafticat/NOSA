@@ -129,6 +129,9 @@ I3_NEW = I3_NEW + ("benchmarks/Efficiency/r2_j1_forkbench.py",)                 
 # own Gate 0: tests_cpu/test_st1.py)
 I3_NEW = I3_NEW + ("benchmarks/Efficiency/r2_st1_commit.py", "benchmarks/Efficiency/r2_st1_cell.py",
                    "benchmarks/Efficiency/r2_st1_step.sh", T_ + "test_st1.py")                              # ST1
+# INT (nosi-r2-int: J1 + ST1 + BF1 in one arm, r2_int_cell.py): its files (its own Gate 0: tests_cpu/test_int.py)
+I3_NEW = I3_NEW + ("benchmarks/Efficiency/r2_int_arms.py", "benchmarks/Efficiency/r2_int_cell.py",
+                   "benchmarks/Efficiency/r2_int_step.sh", T_ + "test_int.py", "docs/NOTES_int.md")          # INT
 # BF1 (nosi-r2-bf1: RECON7 cd0f0c5 + the draft-issued background fetch): its files (its own Gate 0: tests_cpu/test_bf1.py)
 I3_NEW = I3_NEW + ("benchmarks/Efficiency/r2_bf1_fetch.py", "benchmarks/Efficiency/r2_bf1_cell.py",
                    "benchmarks/Efficiency/r2_bf1_step.sh", T_ + "test_bf1.py")                         # BF1

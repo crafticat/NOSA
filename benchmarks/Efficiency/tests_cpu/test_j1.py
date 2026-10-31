@@ -65,6 +65,13 @@ J1_NEW = (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", T_
           E_ + "r2_j1_forkbench.py")
 J1_DECL = tuple(T_ + "test_%s.py" % n for n in ("wsa", "wsb", "wsc", "i2", "i3", "i4a", "i4g", "i4d", "i4k", "i4u", "i4h",
                                                    "i4s", "i4cc", "i4dc", "recon7"))
+# INT (nosi-r2-int: J1 + ST1 + BF1 in one arm, r2_int_cell.py): the ST1 and BF1 rungs' files and its own (its own Gate
+# 0: tests_cpu/test_int.py); J1_LATER: its modules import the J1 modules (scan (e) skips them)
+J1_NEW = J1_NEW + (E_ + "r2_st1_commit.py", E_ + "r2_st1_cell.py", E_ + "r2_st1_step.sh", T_ + "test_st1.py",
+                   E_ + "r2_bf1_fetch.py", E_ + "r2_bf1_cell.py", E_ + "r2_bf1_step.sh", T_ + "test_bf1.py",
+                   E_ + "r2_int_arms.py", E_ + "r2_int_cell.py", E_ + "r2_int_step.sh", T_ + "test_int.py",
+                   "docs/NOTES_int.md")                                                           # INT
+J1_LATER = ("r2_int_arms.py", "r2_int_cell.py")                                                   # INT
 SELECT_IMPORTS = {"torch", "time", "types", "r2_i4dc_compile"}
 HAND_KERNEL = ("import triton", "@triton.jit", "triton.jit", "load_inline", "cpp_extension", "tl.load", "tl.store")
 LATER_NAMES = ("r2_i4a", "r2_i4cc", "r2_i4h", "r2_i4g", "r2_i4s", "r2_i4k", "r2_i4u", "r2_recon7")
@@ -140,7 +147,7 @@ def test_j1_gate0_files():
         assert not [w for w in HAND_KERNEL if w in text], (name, [w for w in HAND_KERNEL if w in text])
         assert not [w for w in LATER_NAMES if w in text], (name, [w for w in LATER_NAMES if w in text])
     for p in list((ROOT / "nosi/nosi").glob("*.py")) + list(EFF.glob("*.py")):     # (e) nobody else names them
-        if p.name.startswith("r2_j1_"):
+        if p.name.startswith("r2_j1_") or p.name in J1_LATER:                                       # INT
             continue
         assert "r2_j1" not in p.read_text(), p.name
 
