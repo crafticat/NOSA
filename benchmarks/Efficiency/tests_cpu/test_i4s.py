@@ -94,6 +94,7 @@ I4S_LATER = I4S_LATER + ("r2_recon7_protocol.py", "r2_recon7_probe.py", "r2_reco
 # (its own Gate 0: tests_cpu/test_j1.py)
 I4S_NEW = I4S_NEW + (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", T_ + "test_j1.py",
                      "docs/NOTES_j1.md")                                                          # J1
+I4S_NEW = I4S_NEW + (E_ + "r2_j1_forkbench.py",)                                                  # J1
 
 
 class Evidence(UserWarning):

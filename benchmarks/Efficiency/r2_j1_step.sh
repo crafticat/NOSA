@@ -24,6 +24,10 @@
 #        --require-stress 1; every gate MUST. Run it first. STEP_MIN 35, --mem 100G.
 #   j1a  timing, C 128 (pool 65), B 216, 512 steps, arms L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDJ1,L4PTFDGUDCDJ3.
 #        STEP_MIN 125, --mem 240G. STOPS while PRED_STAMP_J1 is None.
+#   j1f  the FORK MICROBENCH (benchmarks/Efficiency/r2_j1_forkbench.py; grant GRANT_j1f in THAT file): no model, no
+#        workload; synthetic pages of the measured shapes (B 216, B 318; union 72); variants FORK, FORKT, FORK3D2/4/8,
+#        FORK1R, NS1R1, NS1x4, FLASHU1, NSRU; 32 calls per pass, 10 order-rotated passes. STEP_MIN 25 (the image hash of
+#        23 GB inside it), --mem 64G, OUT_MB 60.
 #   j1b  timing, C 73 (pool 10), B 318, 512 steps, arms L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDJ1. STEP_MIN
 #        170, --mem 340G. STOPS while PRED_STAMP_J1 is None.
 # Every cell also runs SHJ1 right after SH (the shipped run with the compiled pooling: the matched baseline of F2;
@@ -69,20 +73,27 @@ DRY=${DRYRUN:-0}
 [[ $NSHA =~ ^[0-9a-f]{40}$ ]] || stop "--nosi '$NSHA' is not a full commit id"
 case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
 [[ $RUN =~ ^[a-z0-9]{1,16}$ ]] || stop "run id '$RUN' (1-16 of a-z 0-9)"
-K=3 STRESS=0 CHECK=0 NEEDPRED=0
+K=3 STRESS=0 CHECK=0 NEEDPRED=0 NEEDWL=1
 case $CELL in
+    j1f) POOL=65 BATCH=0 STEPS=0 STEP_MIN=25 MEM=64G NEEDWL=0 OUT_MB=60 ARMS=-
+         CELLPY=benchmarks/Efficiency/r2_j1_forkbench.py ;;
     j1m) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 STEP_MIN=35 MEM=100G
          ARMS=L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDJ1,L4PTFDGUDKWCDJ1,L4PTFDGUDCDJ3 ;;
     j1a) POOL=65 BATCH=216 STEPS=512 NEEDPRED=1 STEP_MIN=125 MEM=240G
          ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDJ1,L4PTFDGUDCDJ3 ;;
     j1b) POOL=10 BATCH=318 STEPS=512 NEEDPRED=1 STEP_MIN=170 MEM=340G
          ARMS=L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDJ1 ;;
-    *) stop "cell '$CELL' (j1m, j1a or j1b)" ;;
+    *) stop "cell '$CELL' (j1m, j1a, j1b or j1f)" ;;
 esac
 DESC="arms SH+$ARMS steps $STEPS K $K fork-store 0 check $CHECK stress $STRESS"
 CARGS=(--batch "$BATCH" --steps "$STEPS" --pool "$POOL" --spec "$K" --arms "$ARMS" --fork-store 0 --prefill-hook nocopy
        --tu-gemm natural --spec-journal-blocks 256 --spec-twin fused --spec-body fused --spec-graph on --spec-redirect on
        --probe-every 16 --check-every "$CHECK" --require-stress "$STRESS")
+if [ "$CELL" = j1f ]; then                    # the fork microbench: no model, no workload (synthetic inputs)
+    DESC="fork microbench: shapes C 128 B 216, C 73 B 318; union 72; 3D segments 2,4,8; 32 calls per pass"
+    CARGS=(--cell j1f --shapes 128:216,73:318 --segments 2,4,8 --layers 32 --reps 10 --warmup 2 --seed 7 --sample 8
+           --max-shape-s 300 --max-run-s 900)
+fi
 FILE_KB=$((OUT_MB * 1024))
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 for v in $(compgen -e); do case $v in SLURM_*|SRUN_*|SALLOC_*|SBATCH_*) stop "the environment exports $v" ;; esac; done
@@ -120,9 +131,14 @@ granted "$CELL" <(git -C "$NOSI" show "$NSHA:$CELLPY") && APPROVED=1
 REGISTERED=1
 git -C "$NOSI" show "$NSHA:$CELLPY" | grep -q '^PRED_STAMP_J1 = None$' && REGISTERED=0
 [ -f "$SIF" ] || stop "no image $SIF (its sha256 is checked on the GPU node)"
-[ "$(stat -c %s "$MODEL/model.safetensors" 2>/dev/null)" = "$MODEL_SIZE" ] || stop "model size is not $MODEL_SIZE"
-[ -f "$WL/c16k_tokens.bin" ] || stop "no $WL/c16k_tokens.bin (its sha256 is checked on the GPU node)"
-WLF=$WL/c16k_tokens.bin
+WLF=- WLS=-
+WARGS=()
+if [ "$NEEDWL" = 1 ]; then                    # the model and the workload: only the cells that load them
+    [ "$(stat -c %s "$MODEL/model.safetensors" 2>/dev/null)" = "$MODEL_SIZE" ] || stop "model size is not $MODEL_SIZE"
+    [ -f "$WL/c16k_tokens.bin" ] || stop "no $WL/c16k_tokens.bin (its sha256 is checked on the GPU node)"
+    WLF=$WL/c16k_tokens.bin WLS=$WL_SHA
+    WARGS=(--model "$MODEL" --workload "$WL")
+fi
 UFILE=$HOLDERS/$JOB.gpu_uuid
 [ -f "$UFILE" ] && [ -r "$UFILE" ] || stop "no readable $UFILE (the lead writes it for each holder)"
 GPU_UUID=$(cat -- "$UFILE") || stop "cannot read $UFILE"
@@ -156,18 +172,20 @@ echo "R2 j1 child: host $(hostname) gpu $seen; hashing the image at $(date -u +%
 h=$(/usr/bin/sha256sum -- "$IMG") || { echo "R2 j1 child: cannot hash $IMG" >&2; exit 6; }
 [ "${h%% *}" = "$IMGSHA" ] || { echo "R2 j1 child: image sha256 ${h%% *} is not $IMGSHA" >&2; exit 6; }
 echo "R2 j1 child: image sha256 $IMGSHA OK at $(date -u +%FT%TZ)" >&2
-h=$(/usr/bin/sha256sum -- "$WLF") || { echo "R2 j1 child: cannot hash $WLF" >&2; exit 6; }
-[ "${h%% *}" = "$WLSHA" ] || { echo "R2 j1 child: workload sha256 ${h%% *} is not $WLSHA" >&2; exit 6; }
-echo "R2 j1 child: workload sha256 $WLSHA OK" >&2
+if [ "$WLF" != - ]; then
+    h=$(/usr/bin/sha256sum -- "$WLF") || { echo "R2 j1 child: cannot hash $WLF" >&2; exit 6; }
+    [ "${h%% *}" = "$WLSHA" ] || { echo "R2 j1 child: workload sha256 ${h%% *} is not $WLSHA" >&2; exit 6; }
+    echo "R2 j1 child: workload sha256 $WLSHA OK" >&2
+fi
 ulimit -f "$KB" || { echo "R2 j1 child: ulimit -f $KB failed" >&2; exit 6; }
 A=$1
 shift
 exec "$A" exec --nv --cleanenv --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" "$@"'
 ARGV=(timeout --verbose --signal=TERM --kill-after=15 $((STEP_MIN * 60 + 60)) srun --jobid="$JOB" --job-name="$NAME"
       --ntasks=1 --cpus-per-task=16 --mem="$MEM" --gres=gpu:a100:1 --time="$STEP_MIN" --export=NONE
-      /bin/bash -c "$CHILD" j1-child "$GPU_UUID" "$SIF" "$SIF_SHA" "$WLF" "$WL_SHA" "$FILE_KB" "$APPTAINER"
+      /bin/bash -c "$CHILD" j1-child "$GPU_UUID" "$SIF" "$SIF_SHA" "$WLF" "$WLS" "$FILE_KB" "$APPTAINER"
       --bind /mnt/beegfs/ojerbi:/mnt/beegfs/ojerbi "${ENVS[@]}"
-      "$SIF" /venv/nosa/bin/python "$NOSI/$CELLPY" --out "$OUT" --model "$MODEL" --workload "$WL" "${CARGS[@]}")
+      "$SIF" /venv/nosa/bin/python "$NOSI/$CELLPY" --out "$OUT" "${WARGS[@]}" "${CARGS[@]}")
 if [ "$DRY" = 1 ]; then
     echo "R2 j1 step: DRYRUN (nothing claimed, written or launched); cell $CELL; pins OK: nosi $NSHA blob $blob fork $FORK_BLOB image sha256 $SIF_SHA (checked on the GPU node) workload $WL_SHA gpu_uuid $GPU_UUID (from $UFILE); cell granted $APPROVED; registered $REGISTERED"
     echo "R2 j1 step: cell $CELL: C $((63 + POOL)) (pool $POOL) B $BATCH $DESC STEP_MIN $STEP_MIN mem $MEM out_mb $OUT_MB claim $CLAIM compile caches $CCJIT"

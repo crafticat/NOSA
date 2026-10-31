@@ -79,6 +79,7 @@ I4CC_LATER = I4CC_LATER + ("r2_recon7_protocol.py", "r2_recon7_probe.py", "r2_re
 # (its own Gate 0: tests_cpu/test_j1.py)
 I4CC_NEW = I4CC_NEW + (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", T_ + "test_j1.py",
                        "docs/NOTES_j1.md")                                                        # J1
+I4CC_NEW = I4CC_NEW + (E_ + "r2_j1_forkbench.py",)                                                # J1
 
 
 class Evidence(UserWarning):

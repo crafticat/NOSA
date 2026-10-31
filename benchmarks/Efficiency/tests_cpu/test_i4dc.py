@@ -78,6 +78,7 @@ I4DC_LATER = ("r2_recon7_protocol.py", "r2_recon7_probe.py", "r2_recon7_cell.py"
 I4DC_NEW = I4DC_NEW + (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", T_ + "test_j1.py",
                        "docs/NOTES_j1.md")                                                        # J1
 I4DC_LATER = I4DC_LATER + ("r2_j1_select.py", "r2_j1_cell.py")                                  # J1
+I4DC_NEW = I4DC_NEW + (E_ + "r2_j1_forkbench.py",)                                                # J1
 
 
 class Evidence(UserWarning):

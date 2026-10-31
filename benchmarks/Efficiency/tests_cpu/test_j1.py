@@ -61,7 +61,8 @@ STEP_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-j1"
 HOLDER = "2190876"                     # a lead-owned uuid file that exists (HOLDERS/2190876.gpu_uuid)
 T_ = "benchmarks/Efficiency/tests_cpu/"
 E_ = "benchmarks/Efficiency/"
-J1_NEW = (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", T_ + "test_j1.py", "docs/NOTES_j1.md")
+J1_NEW = (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", T_ + "test_j1.py", "docs/NOTES_j1.md",
+          E_ + "r2_j1_forkbench.py")
 J1_DECL = tuple(T_ + "test_%s.py" % n for n in ("wsa", "wsb", "wsc", "i2", "i3", "i4a", "i4g", "i4d", "i4k", "i4u", "i4h",
                                                    "i4s", "i4cc", "i4dc", "recon7"))
 SELECT_IMPORTS = {"torch", "time", "types", "r2_i4dc_compile"}
@@ -134,7 +135,7 @@ def test_j1_gate0_files():
     mods = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     mods |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
     assert {m for m in mods if not m.startswith("torch.")} == SELECT_IMPORTS, mods
-    for name in ("r2_j1_select.py", "r2_j1_cell.py"):                  # NO HAND-WRITTEN KERNEL; no later rung's name
+    for name in ("r2_j1_select.py", "r2_j1_cell.py", "r2_j1_forkbench.py"):   # NO HAND-WRITTEN KERNEL; no later rung
         text = (EFF / name).read_text()
         assert not [w for w in HAND_KERNEL if w in text], (name, [w for w in HAND_KERNEL if w in text])
         assert not [w for w in LATER_NAMES if w in text], (name, [w for w in LATER_NAMES if w in text])
@@ -728,6 +729,48 @@ def test_sh_j1():
     assert C.main(["--sh-j1", "2", "--out", "x", "--workload", "w"]) == 20
 
 
+# ------------------------------------------------------------------ the fork microbench (pure parts)
+def test_forkbench_pure():
+    FB = _mod("r2_j1_forkbench")
+    SEL = _mod("r2_j1_select")
+    VRm = X.W.pkg_load("verify_rows")
+    assert FB.FORK_LAUNCH == VRm.FORK_LAUNCH and FB.MASK_BIAS == VRm.MASK_BIAS and FB.R == VRm.FORK_ROWS
+    assert FB.UNION == 72 and FB.BLOCK_BYTES == 32896 and FB.GRANT_j1f is None and not FB.granted("j1f")
+    assert FB.main(["--out", "x", "--cell", "j1f"]) == 20                # default deny
+    pages, last = FB.row_pages(3, 2)
+    assert pages[0] == 3 * 72 + 5 and len(pages) == 64 and pages == sorted(pages) and last == 42
+    u = set()
+    for r in range(4):                                                  # the rows' union = 72 pages per request
+        u |= set(FB.row_pages(0, r)[0])
+    assert u == set(range(72))
+    B = 216
+    w = {v: FB.work(v, B) for v in FB.variants((2, 4))}
+    assert w["FORK"] == w["FORKT"] == w["FORK3D2"] == dict(rows=864, pages=2 * 216 * 72)
+    assert w["FLASHU1"]["pages"] == w["FORK"]["pages"] and w["FLASHU1"]["rows"] == 216        # equal bytes
+    assert w["FORK1R"] == w["NS1R1"] == dict(rows=216, pages=2 * 216 * 64)                     # equal rows and bytes
+    assert w["NS1x4"] == dict(rows=864, pages=2 * 864 * 64)                                     # equal rows
+    assert w["NSRU"]["pages"] == 2 * 216 * (64 + 67 + 69 + 72)
+    assert FB.rotation(["a", "b", "c"], 4) == ["b", "c", "a"]
+    times = {v: [32.0 * (1.0 + 0.1 * i)] * 3 for i, v in enumerate(FB.variants((2,)))}
+    times["FORK"] = [32.0 * 1.2] * 3
+    times["FLASHU1"] = [32.0 * 0.6] * 3
+    times["FORK3D2"] = [32.0 * 1.08] * 3
+    valid = {v: True for v in times}
+    valid["NSRU"] = False
+    s = FB.summarize(times, B, 32, valid, (2,))
+    assert s["per"]["FORK"]["ms_call"] == 1.2 and s["ratios"]["FORK/FLASHU1"]["ratio"] == 2.0
+    assert s["per"]["FORK"]["logical_tb_s"] == round(2 * 216 * 72 * 32896 / (1.2 * 1e-3) / 1e12, 4)
+    assert s["ratios"]["NSRU/FORK"]["valid"] is False and "INVALID" in s["ratios"]["NSRU/FORK"]["note"]
+    assert s["fork_minus_flashu1_ms_per_pass"] == round(0.6 * 32, 3)
+    assert s["best_3d"] == dict(variant="FORK3D2", ratio=0.9, saving_ms_per_pass=round(0.12 * 32, 3))
+    assert {"FORK/FLASHU1", "FORK1R/NS1R1", "FORK/NS1x4", "FORKT/FORK", "NSRU/FORK", "FORK3D2/FORK"} == set(s["ratios"])
+    for bad in (["--out", "x", "--segments", "1"], ["--out", "x", "--reps", "2"], ["--out", "x", "--shapes", "a"]):
+        with pytest.raises(SystemExit):
+            FB.parse_args(bad)
+    assert SEL is not None
+    _ev("J1F PURE: work per variant %s; ratios %s" % (w, {k: v["ratio"] for k, v in s["ratios"].items()}))
+
+
 # ------------------------------------------------------------------ CELL
 def test_j1_cell_tables():
     C, D = _cell()
@@ -826,6 +869,13 @@ def test_step_script_j1():
         assert ("%s) POOL=%d BATCH=%d STEPS=%d" % (cell, pool, batch, steps)) in src and ("STEP_MIN=%d MEM=%s" % (
             smin, mem)) in src, cell
         assert arms in src, cell
+    assert "j1f) POOL=65 BATCH=0 STEPS=0 STEP_MIN=25 MEM=64G NEEDWL=0 OUT_MB=60" in src           # the microbench
+    assert "CELLPY=benchmarks/Efficiency/r2_j1_forkbench.py" in src and '"${WARGS[@]}"' in src
+    FB = _mod("r2_j1_forkbench")
+    fa = FB.parse_args(["--out", "x", "--cell", "j1f", "--shapes", "128:216,73:318", "--segments", "2,4,8", "--layers",
+                        "32", "--reps", "10", "--warmup", "2", "--seed", "7", "--sample", "8", "--max-shape-s", "300",
+                        "--max-run-s", "900"])                          # the step script's j1f arguments parse
+    assert fa.shapes == {128: 216, 73: 318} and fa.segments == (2, 4, 8)
     for bad in ("i4dca", "j1", "j1c"):
         r = _step(bad)
         assert r.returncode == 1 and "cell '%s'" % bad in r.stderr, (bad, r.returncode, r.stderr[-300:])
