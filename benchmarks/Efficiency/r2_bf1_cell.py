@@ -130,7 +130,7 @@ def parse_args(argv):
     ap.add_argument("--bf-late", default="defer", choices=BF.LATES,
                     help="defer: a job not issued at the joint pass's start commits at ITS layer of the pass; drop: "
                          "abandoned")
-    ap.add_argument("--bf-late-wait-ms", type=float, default=100.0,
+    ap.add_argument("--bf-late-wait-ms", type=float, default=250.0,
                     help="defer: the host wait budget per joint pass for late jobs (the host runs ahead of the GPU)")
     ap.add_argument("--prefill-hook", default="nocopy", choices=("nocopy", "copy"))
     ap.add_argument("--tu-gemm", default="natural", choices=("natural", "rowgroup"))

@@ -26,7 +26,10 @@
 #        coverage; graph-mode KW vs L4PTFDGUDCD), not a lever: r2_bf1_cell.py's C 128 decision (MODEL 0.987 .. 1.006x).
 # EVERY cell: --bf-packer gilfree --bf-threads 14 --bf-cap-groups 1024 (r2_transport_gilfree_v3's C++ team; built into
 # $JIT/torch_ext at the first BF1 arm, about 1-2 min, outside the steady rounds), --bf-ring 16, --bf-late defer
-# --bf-late-wait-ms 100 (a job not issued when the joint pass starts commits at ITS layer of the pass; the throughput
+# --bf-late-wait-ms 250 (a job not issued when the joint pass starts commits at ITS layer of the pass; the host budget:
+# the worker's D1 backlog at the pass start is about 17 jobs x 5.9 ms = 104 ms at 4.65 GB/s, while the host queues
+# about 14 layers x 10.6 ms = 148 ms of GPU work before it reaches the first pending layer, so the wait is host-only;
+# 100 ms could cut it and drop jobs as "passed"; the throughput
 # derivation: r2_bf1_fetch.py docstring, LATE). Landing 16 x 2048 x 32 KB = 1.07 GB at bf1b (after the prefill).
 # Basis of STEP_MIN (MEASURED, sacct, the step records under OUTROOT): i4dcb (SH + 3 arms, C 73 B 318) 01:11:41 = 17.9 min
 # per part; i4dca (SH + 3 arms, C 128 B 216) 00:47:32 = 11.9 min per part; i4dm2 (SH + 6 arms, B 8) 00:09:18. MODEL:
@@ -81,7 +84,7 @@ esac
 CARGS=(--batch "$BATCH" --steps "$STEPS" --pool "$POOL" --arms "$ARMS" "${CK[@]}" --probe-every "$PE"
        --check-every "$CHECK" --require-stress "$STRESS" --bf-store "$BFX" --bf-ncap "$NCAP" --bf-ring 16
        --bf-worker thread --bf-acct "$ACCT" --bf-close-wait-ms 0 --bf-packer gilfree --bf-threads 14
-       --bf-cap-groups 1024 --bf-late defer --bf-late-wait-ms 100)
+       --bf-cap-groups 1024 --bf-late defer --bf-late-wait-ms 250)
 DESC="arms SH+$ARMS steps $STEPS probe $PE check $CHECK stress $STRESS bf-store $BFX ncap $NCAP acct $ACCT"
 FILE_KB=$((OUT_MB * 1024))
 MIN_LEFT=$((STEP_MIN * 60 + 600))
