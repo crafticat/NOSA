@@ -126,7 +126,9 @@ def configure():
     D.GRAPH_ARMS = D.GRAPH_ARMS + ARMS_J1 + ARMS_J3
     D.STACK_ARMS = D.STACK_ARMS + ARMS_J1 + ARMS_J3
     D.KEEP_ARMS = D.KEEP_ARMS + KEEP_J1
-    D.NAMES = dict(D.NAMES, **{x: D.NAMES[b] for x, b in base_all.items()})
+    # F6: a J1 / J3 arm's section never calls the I4CC loc1 helper (r2_j1_select.loc_fn replaces it): the I4CC
+    # COMPILE gate's "every helper called" list leaves loc1 out for these arms
+    D.NAMES = dict(D.NAMES, **{x: tuple(n for n in D.NAMES[b] if n != "loc1") for x, b in base_all.items()})
 
     def run_arm_j1(model, ids, inputs, steps, clock, opt, FORK, arm):
         """The I4DC run_arm_d with the J1 runner for a J1 arm (runner_class reads the arm from _CUR)."""

@@ -84,6 +84,21 @@ Tree /mnt/beegfs/ojerbi/nosi-r2-j1 (branch r2-j1) on RECON7 cd0f0c5. SOURCE ONLY
   RECON7_R2_joint.md:203). RECOMMENDATION: build the keep J3 arm only if j1a shows J3-JOINT-SAVING + J3-DRAFT-SAVING
   above the run spread at C 128.
 
+## 2d. F6 (fourth commit): the joint section's locate without the map sorts (J1 and J3 arms; runner keyword j1f6)
+
+- MEASURED (r7pa, R/recon7_pa1_2195631_r7pa summary.json, the BEST arm's labelled joint window, round 112): the
+  section's SELECT class 4.30 ms, of which radixSortKVInPlace<..., 4> 2.46 ms (96 kernels = 3 per layer: the window
+  map, the pool map and the host key) and <..., 32> 1.34 ms (32 kernels: the row-list key).
+- CODE: r2_i4cc_compile.py:319-325 sort the window and pool maps only to find a row id's slot with searchsorted
+  (loc1_fn, :108-124). F6 (r2_j1_select.loc_fn) builds per (head, request) an inverse table block id -> slot by ONE
+  scatter of the slot index and reads it with ONE gather; the host-key and row-list sorts stay (the fork needs the
+  ascending lists). Exact: valid ids are unique in a map; wslot / pslot are read only under in_win / in_pool (loc2_fn,
+  :144). `_cc_locate` is copied with 3 lines marked "# J1" (tests_cpu/test_j1.py::test_cc_locate_copy).
+- Expected: about 2/3 of the 2.46 ms short sorts (2 of 3 per layer) = 1.6 ms per joint pass, minus the scatter / gather
+  (about 32 x 10 us = 0.3 ms): about 1.3 ms per round at C 128 (MODEL), C 73 similar per row count (x1.47: about 1.9).
+- Gates: J1-COMPILE (one "f6" compile, not in a capture, F6 calls = the compiled sections), the I4CC COMPILE gate with
+  loc1 left out of the J1 arms' helper list (the cell), EQF.
+
 ## 3. The reuse line (the lead's rule: upstream basis, incompatibility or cost, minimal adaptation, validation)
 
 - Upstream basis: NOSA's `nosa_pool_kernel` (nosi/nosi/max_pooling_fused.py:7-75) as forked per request in
