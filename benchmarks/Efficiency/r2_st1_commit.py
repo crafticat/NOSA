@@ -77,6 +77,31 @@ root's -COMPILE gate wants cc's events before the first capture of any kind; ST3
 after round 0's draft captures, outside any capture, as J1's F6 does): the cell's -KFILL gate checks them.
 NEGATIVE CONTROLS (tests only; tneg3): "no_age" (kage not updated: the map's eviction order changes), "remap_off" (the
 page-id remap reads the slot of the next list rank: a fork row reads another block).
+ST4 (ResidST4; the arms L4PTFDGUDCDMTR = the MT arm + ST4 at C 128, L4PTFDGUDKWCDMTKR = the MTK arm + ST4 at C 73, and
+both INT arms through st4_runner): THE DRAFT RESIDENCY'S INTEGER OPS IN ONE COMPILED HELPER. EVIDENCE (MEASURED, r7pa /
+r7pb summary.json, the draft passes of L4PTFDGUDCDP / L4PTFDGUDKWCDP round 112, labels A / resid / B): SMALL 1,616
+kernels per one-row pass (5.40 / 6.22 ms) = A 465 (1.12 / 1.24 ms) + resid 448 (1.65 / 1.79 ms; + COPY 64, 0.15 /
+0.16 ms) + B 702 (2.54 / 3.06 ms) + head 1. The I4C draft trace (KS/cpu-logs/i4cc_ana_s1.txt:442-638, the eager
+L4PTFDP pass at C 128, per layer) names them: B = the float32 log-sum-exp merge (13 ops, 55 us), the 2 residual adds
+(float), the compiled dwrite / dmask kernels (I4DC; the eager write + masks were 11 ops, 124 us); A = the selection's
+small ops (score copy, fills, mask zero / scatter / masked_fill: J1 F2's region), the twin's pos clone / pos_before
+copy / lengths (6 ops, TentState._layer and ragged_engine._lengths) and the compiled dpre; resid = the eager residency
+r2_i4a_lean.TentStateFD._resid_lean: ~am, masked_fill, where, 2 copies, gt, ge, or, and, where, masked_fill, ~tent,
+and, sum, sum copy, add_ = 14 SMALL + 2 COPY per layer (about 52 / 61 us), between the shipped diff, pool_update,
+pool_swap and the two gathers. It is EAGER in the I4H draft graphs (pool_update's host stamp) and in the C 73 INT arm
+(BF1's on_draft hook); inside the graph in the C 128 INT arm (J1 F3, the stamp frame). Every op is integer / bool /
+copy: the bit-exact part of the draft pass that no earlier rung compiled. THE CHANGE: ResidST4._resid_lean = the same
+code with the ops after pool_swap (the block-map update, tent, skip, ids, the block-map mask of the skipped loads and
+the skipped / check counters) in ONE compiled helper (rpost_fn) before the two shipped gathers; ~am and the load-mask
+fill stay eager (pool_update reads them). The block-map mask moves before the gathers: they read ids only (the same
+final bytes). The counters add into the layer's entry by a one-hot where over (L,) (no atomics, no view of a row).
+PLACEMENT: ResidST4 is inserted DIRECTLY ABOVE the class that defines the original _resid_lean (r2_i4a_lean's
+TentStateFD) by a C3 merge (st4_state: type(name, (S, Bottom), {}) with Bottom = (ResidST4, TentStateFD)), so every
+override above it (BF1's TentStateBF._resid_lean: super() then on_draft; I4H's _dstub; J1 F3's captured call) still
+runs and reaches it. FALLBACK (counted): "nocc" (no compiled state). Compile: the first one-row pass of a run (eager or
+I4H's warm pass); events in the ST4 record only. NEGATIVE CONTROLS (tests only; tneg4): "no_block_mask" (the skipped
+loads stay in the block map: a later row reads a block that was never loaded), "count_off" (the skipped counter is not
+added).
 HOST COUNTS: TentState.calls["commit"] moves once per call in every mode (mode "where": the eager and the captured
 execution run the inherited code; a replay adds the count).
 NEGATIVE CONTROLS (tests only; sneg): "stale" (m is not copied before a replay), "no_phase2" (the next block's rows are
@@ -95,6 +120,8 @@ HELPERS3 = ("kfa", "kfb")
 KM = 1 << 32                       # = r2_i4d_keep.KM (key = layer x KM + block id; tests_cpu/test_st1.py checks)
 ALIVE_BASE = 1 << 50               # = r2_i4d_keep.ALIVE_BASE
 PROTECT = 1 << 62                  # = r2_i4d_keep.PROTECT
+TNEG4 = (None, "no_block_mask", "count_off")
+HELPERS4 = ("rpost",)
 
 
 class CudaGraphsPrivate:
@@ -590,6 +617,124 @@ class KeepFillST3:
 KFB_WRITES = (8, 9, 10, 17)
 
 
+# ===================================================================================================================
+# ST4: the draft residency's integer ops in one compiled helper (module docstring, ST4)
+# ===================================================================================================================
+def rpost_fn(nb, bm, lm, am, qb3, drf3, minus1, skipped, forced, injected, inj, arL, l_t, chk: bool, neg: int):
+    """r2_i4a_lean.TentStateFD._resid_lean after pool_swap (r2_i4a_lean.py:211-223), the gathers aside: the block-map
+    update (nb = eng._new_block_map_buf, bm = eng._block_map, in place), tent, skip, ids, the block map's skipped loads
+    (-1), the counters (in place: the layer's entry of skipped; with chk forced / injected). Returns (skip, ids).
+    neg 1: no block-map mask; neg 2: no skipped count (the controls)."""
+    nbv = torch.where(am, nb, bm)
+    nb.copy_(nbv)
+    tent = lm > qb3                                                    # = (lm >= 0) & (lm > qb3): qb3 >= 0
+    skip = (lm >= 0) & (drf3 | tent)
+    ids = torch.where(skip, minus1, lm)
+    bm.copy_(nbv if neg == 1 else nbv.masked_fill(skip, -1))           # LN: copy_, the gathers, masked_fill_
+    sel = arL == l_t                                                   # (L,): the layer's entry
+    if neg != 2:
+        skipped.add_(torch.where(sel, (skip & ~tent).sum(), 0))
+    if chk:                                                            # CHECK-ONLY counters (LN:221-223)
+        forced.add_(torch.where(sel, tent.sum(), 0))
+        injected.add_(torch.where(sel, inj.sum(), 0))
+    return skip, ids
+
+
+FNS4 = dict(rpost=rpost_fn)
+_COMPILED4 = {}
+RPOST_WRITES = (0, 1, 7, 8, 9)           # rpost_fn's written arguments (the CPU capture stand-in)
+
+
+def compiled4(name: str, backend: str):
+    key = (name, backend)
+    f = _COMPILED4.get(key)
+    if f is None:
+        f = _COMPILED4[key] = torch.compile(FNS4[name], fullgraph=True, dynamic=False, backend=backend)
+    return f
+
+
+class ResidST4:
+    """ST4 (module docstring): the draft residency with the integer ops after pool_swap in rpost_fn. Placed DIRECTLY
+    ABOVE the class that defines the original _resid_lean (st4_state); set up by _st4_setup (st4_attach)."""
+
+    def _st4_setup(self, tneg4) -> None:
+        if tneg4 not in TNEG4:
+            raise ValueError("ST4: control %r (one of %s)" % (tneg4, TNEG4))
+        L, dev = int(self.L), self.dev
+        engs = [lay.cache_engine for lay in self.rs.cache.layers]
+        for e in engs:                                                 # host attribute reads: no aliased inputs
+            p = {t.untyped_storage().data_ptr() for t in (e._block_map, e._new_block_map_buf, e._load_mask)}
+            if len(p) != 3:
+                raise ValueError("ST4: the block map, its buffer and the load mask share a storage")
+        self._st4_ar = torch.arange(L, dtype=torch.int64, device=dev)
+        self._st4_l = [torch.full((), l, dtype=torch.int64, device=dev) for l in range(L)]
+        self._st4 = dict(neg=tneg4, calls=0, entered=0, fallback={}, events=[], compile_s=0.0,
+                         backend=getattr(self, "_cc_backend", None))
+
+    def _st4_why(self):
+        if getattr(self, "_st4", None) is None:
+            return "setup"
+        if getattr(self, "_cc_backend", None) is None:
+            return "nocc"
+        return None
+
+    def _resid_lean(self, l, eng, twin, ti, inj, act, drf, qb3):
+        """r2_i4a_lean.TentStateFD._resid_lean (its host count, the shipped kernels, the host stamp, the gathers) with
+        the ops after pool_swap in rpost_fn (module docstring, ST4)."""
+        why = self._st4_why()
+        st = getattr(self, "_st4", None)
+        if st is not None:
+            st["entered"] += 1
+        if why is not None:
+            if st is not None:
+                st["fallback"][why] = st["fallback"].get(why, 0) + 1
+            return super()._resid_lean(l, eng, twin, ti, inj, act, drf, qb3)
+        self.calls["resid"] += 1
+        rs, B, bs = self.rs, self.B, self.bs
+        kern = rs.ops.kernels
+        kern["diff"](eng._block_map, ti, eng._new_block_map_buf, eng._load_mask)
+        am = act.view(1, B, 1)
+        eng._load_mask.masked_fill_(~am, -1)                           # an inactive row loads nothing, moves nothing
+        if self.pool:
+            kern["pool_update"](eng._block_map, eng._load_mask, eng._pool_map, eng._pool_age, eng._pool_target,
+                                eng._pool_action, eng._pool_stamp_base, eng._tail_block_idx_on_gpu)
+            kern["pool_swap"](eng._k_gpu, eng._v_gpu, eng._kv_bias_gpu, eng._pool_target, eng._pool_action,
+                              eng.topk, eng.block_size)
+            eng._pool_stamp_base += eng.topk
+        neg = {"no_block_mask": 1, "count_off": 2}.get(st["neg"], 0)
+        skip, ids = self._st4_call("rpost", l, eng._new_block_map_buf, eng._block_map, eng._load_mask, am, qb3,
+                                   drf.view(1, B, 1), self.minus1, self.skipped, self.forced, self.injected, inj,
+                                   self._st4_ar, self._st4_l[l], bool(self.checking), neg)
+        kern["gather_k"](eng._k_gpu, eng._k_cpu, ids, bs)
+        kern["gather_v_bias"](eng._v_gpu, eng._v_cpu, eng._kv_bias_gpu, twin.total_cis, ids, bs)
+        st["calls"] += 1
+        return skip
+
+    def _st4_call(self, name, l, *args):
+        """One call of the compiled helper with its compile event (the ST4 record only, as ST3's)."""
+        f = compiled4(name, self._cc_backend)
+        g0 = _graphs_now()
+        t0 = time.perf_counter()
+        wrap = getattr(self, "_cc_wrap", None)                         # tests: the CPU capture stand-in's node maker
+        out = wrap(name, f, args) if wrap is not None else f(*args)
+        dt = time.perf_counter() - t0
+        g1 = _graphs_now()
+        if g1 != g0:
+            cap = bool(getattr(self, "_cc_cap", False)) or bool(getattr(self, "_cd_cap", False))
+            self._st4["events"].append(dict(name=name, graphs=g1 - g0, s=round(dt, 3), layer=int(l),
+                                            joint_pass=int(self.calls["joint_passes"]), capture=cap,
+                                            dpass=int(getattr(self, "lean", {}).get("passes", -1))))
+            self._st4["compile_s"] += dt
+        return out
+
+    def st4_report(self) -> dict:
+        s = dict(self._st4)
+        s["fallback"] = dict(s["fallback"])
+        s["events"] = list(s["events"])
+        s["compile_s"] = round(s["compile_s"], 3)
+        return s
+
+
 _STATES = {}
 _RUNNERS = {}
 
@@ -685,6 +830,67 @@ def st3_runner(R, tneg3=None):
         RunnerST3.__name__ = RunnerST3.__qualname__ = R.__name__ + "ST3"
         _RUNNERS3[key] = RunnerST3
     return _RUNNERS3[key]
+
+
+_STATES4 = {}
+_RUNNERS4 = {}
+
+
+def resid_owner(S):
+    """The DEEPEST class of S's MRO that defines _resid_lean (r2_i4a_lean's TentStateFD)."""
+    owners = [c for c in S.__mro__ if "_resid_lean" in c.__dict__]
+    if not owners:
+        raise ValueError("ST4: %s has no _resid_lean (not a lean one-row state)" % S.__name__)
+    return owners[-1]
+
+
+def st4_state(S):
+    """S with ResidST4 directly above the original _resid_lean (module docstring, PLACEMENT; cached). The new class's
+    MRO: S's classes down to the original's subclasses, then Bottom, ResidST4, the original, the rest."""
+    if S not in _STATES4:
+        if ResidST4 in S.__mro__:
+            raise ValueError("ST4: %s has ResidST4 already" % S.__name__)
+        base = resid_owner(S)
+        bottom = type(base.__name__ + "ST4", (ResidST4, base), {})
+        new = type(S.__name__ + "ST4", (S, bottom), {})
+        mro = new.__mro__
+        i = mro.index(ResidST4)
+        if mro[i + 1] is not base or [c for c in mro[i + 1:] if "_resid_lean" in c.__dict__][:1] != [base]:
+            raise ValueError("ST4: ResidST4 is not directly above %s in %s" % (base.__name__, new.__name__))
+        _STATES4[S] = new
+    return _STATES4[S]
+
+
+def st4_attach(runner, tneg4=None) -> None:
+    """Re-class the runner's state with ResidST4 (st4_state) and set ST4 up (after the base runner's __init__)."""
+    T = runner.T
+    T.__class__ = st4_state(type(T))
+    T._st4_setup(tneg4)
+    runner.meta.update(st4=dict(tneg4=tneg4, helpers=HELPERS4))
+
+
+def st4_runner(R, tneg4=None):
+    """The runner class R (an MT / MTK runner, or an INT runner r2_int_arms.int_runner) whose draft residency runs by
+    ST4 (cached per (R, tneg4)). read() adds the ST4 record ("st4")."""
+    if tneg4 not in TNEG4:
+        raise ValueError("ST4: control %r (one of %s)" % (tneg4, TNEG4))
+    key = (R, tneg4)
+    if key not in _RUNNERS4:
+        class RunnerST4(R):
+            _st4_neg = tneg4
+
+            def __init__(self, *args, **kw):
+                super().__init__(*args, **kw)
+                st4_attach(self, self._st4_neg)
+
+            def read(self) -> dict:
+                out = super().read()
+                out.update(st4=self.T.st4_report())
+                return out
+
+        RunnerST4.__name__ = RunnerST4.__qualname__ = R.__name__ + "ST4"
+        _RUNNERS4[key] = RunnerST4
+    return _RUNNERS4[key]
 
 
 def tail_checksum(T) -> list:
