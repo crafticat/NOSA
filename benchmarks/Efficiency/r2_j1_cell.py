@@ -103,8 +103,11 @@ PRED_J1_BY_B = {
               J1_peak_gb=(83.85, 83.95), J1_compile_s=(0.5, 60.0), J1_sh_saving=(2.0, 3.2), J1_vs_shj1=(0.557, 0.580),
               J3_joint_saving=(0.0, 6.3), J3_draft_saving=(0.0, 6.0), J3_commit_saving=None, J3_reset_saving=None,
               J3_vs_ref=(0.995, 1.030), J3_vs_shj1=None),
-    318: dict(J1_joint_saving=(14.0, 18.5), J1_joint_ratio=(0.945, 0.959), J1_draft_ratio=(0.948, 0.960),
-              J1_draft_saving=(7.0, 9.2), J1_vs_ref=(1.042, 1.056), J1_ratio=(0.680, 0.705), J1_eq=True,
+    # 318: RE-REGISTERED 2026-10-31T15:47:52Z (`date -u`) BEFORE j1b, after j1a ran at 68f8f39: the run tree now
+    # carries F6 (4d71473, inverse-table locate, MODEL 1.3-2.5 ms per joint pass at C73), so the joint bands include
+    # F6: joint saving F1 (14.0, 18.5) + F6 -> (15.0, 21.0); ratios and vs_ref follow; the 216 bands stay as j1a scored.
+    318: dict(J1_joint_saving=(15.0, 21.0), J1_joint_ratio=(0.938, 0.956), J1_draft_ratio=(0.948, 0.960),
+              J1_draft_saving=(7.0, 9.2), J1_vs_ref=(1.044, 1.061), J1_ratio=(0.680, 0.710), J1_eq=True,
               J1_peak_gb=(77.60, 77.80), J1_compile_s=(0.5, 60.0), J1_sh_saving=(3.4, 4.7), J1_vs_shj1=(0.662, 0.678),
               J3_joint_saving=None, J3_draft_saving=None, J3_commit_saving=None, J3_reset_saving=None,
               J3_vs_ref=None, J3_vs_shj1=None)}
