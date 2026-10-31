@@ -220,6 +220,7 @@ class BgFetch:
         self.h2d_ev = []                                 # (start, end, bytes) of every issued job
         self.bar_ev = []                                 # (epoch seq, start, end) of every barrier wait
         self.side = None
+        self.tp = None                                   # the gilfree transport (packer "gilfree", mode "ce" only)
         self._alloc()
 
     # ---------------------------------------------------------- buffers
