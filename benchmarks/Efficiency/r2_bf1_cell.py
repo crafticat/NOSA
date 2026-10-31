@@ -75,7 +75,7 @@ DROP = ("-COUNTS", "-KEEP-EQ", "-KEEP-REF")
 #     of 128 slots per request is 1.82 GB at B 216, and that arm's prefill peak is 83.90 GB of 84.0). DECISION: no BF1
 #     lever at C 128; bf1a is a DIAGNOSTIC only (full-B coverage; the first graph-mode KW vs L4PTFDGUDCD at C 128); adopt
 #     there only if B / L4PTFDGUDCD >= 1.02 in the same process.
-PRED_STAMP_BF1 = "2026-10-31T17:10:34Z"
+PRED_STAMP_BF1 = "2026-10-31T20:31:57Z"
 PRED_KEYS = ("BF1_vs_X", "BF1_vs_R", "BF1_new_ratio", "BF1_wait_saving", "BF1_joint_saving", "BF1_draft_ratio",
              "BF1_barrier_ms", "BF1_eq")
 # THE LEAD'S REGISTRATION (2026-10-31T13:43:47Z, before bf1a / bf1b; the writer's bands; r7pb MEASURED flagA 0.469 at
@@ -86,8 +86,11 @@ PRED_BF1_BY_B = {
     # 318: RE-REGISTERED 2026-10-31T17:10:34Z (`date -u`) for the DEFER + BATCH version (64e307f) before its bf1b run;
     # the barrier version's bf1b (f2eba43) was scored against the bands of 13:43:47Z (all effect bands REFUTED). Basis:
     # bf1b counters (submit 1.32 ms per chunk, 72 % late) and the writer's per-epoch worker model with batches of 8.
-    318: dict(BF1_vs_X=(1.015, 1.08), BF1_vs_R=(1.01, 1.08), BF1_new_ratio=(0.53, 0.75), BF1_wait_saving=(20.0, 45.0),
-              BF1_joint_saving=(10.0, 35.0), BF1_draft_ratio=(1.00, 1.05), BF1_barrier_ms=(0.0, 10.0), BF1_eq=True)}
+    # 318: RE-REGISTERED AGAIN 2026-10-31T20:31:57Z (`date -u`) for the PIPELINED worker (a329dc6 + b451d91) before its
+    # bf1b run; the batched version's bf1b b2 (c10bddf) was scored against the 17:10:34Z bands (B / X 0.9534 REFUTED).
+    # The writer's pipelined-worker model (comment below), calibrated on b2.
+    318: dict(BF1_vs_X=(1.01, 1.06), BF1_vs_R=(1.005, 1.06), BF1_new_ratio=(0.55, 0.66), BF1_wait_saving=(28.0, 44.0),
+              BF1_joint_saving=(15.0, 35.0), BF1_draft_ratio=(1.03, 1.08), BF1_barrier_ms=(0.0, 10.0), BF1_eq=True)}
 # THE WRITER'S MODEL FOR THE PIPELINED WORKER (registration-ready for the lead; NOT registered here). Calibrated on bf1b b2
 # (R/bf1_b2_2195631_bf1b, c10bddf): gain per round = 40 f S - (6.2 + 2.5 S_d) - W_host - 22 S_J [ms; GB], f = 0.62 (NEW
 # 68,985 -> 41,582 blocks = 0.90 GB of S = 1.45 GB), S_J = S (1 - 185 / T_w) the bytes after the draft window, W_host =
