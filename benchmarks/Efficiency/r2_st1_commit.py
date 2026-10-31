@@ -47,6 +47,34 @@ snapshot are gathered from ctr. The banks are independent (one program per bank;
 sequence fixes its bits whatever the order of the banks' steps. Pad rows step nothing in both. NEGATIVE CONTROLS (tests
 only; tneg2): "no_replay_seq" (the replay step left out of the sequence), "no_shift" (the rows after the replay read the
 counters one step early).
+ST3 (KeepFillST3; the keep arms: L4PTFDGUDKWCDMTK = the MT keep arm + ST3, and the INT keep arm through st3_runner).
+EVIDENCE (MEASURED, /mnt/beegfs/ojerbi/r2-runs/spec/recon7_pb1_2195630_r7pb/summary.json, L4PTFDGUDKWCDP round 112,
+labelled joint window, C 73 B 318, label "section"): SMALL 2,785 ops / 16.32 ms per joint pass = 87 per layer, against
+1,473 / 6.94 ms = 46 per layer in the C 128 arm without the keep (r7pa); SELECT 224 vs 192 ops (7 vs 6 per layer: one
+more radix sort). The section's named small kernels: reduce MaxOps<unsigned char> 32 ops 2.34 ms (THE KEEP's map
+lookup, E.view(uint8).max(-1), one per layer, 73 us each), where 108 ops 2.49 ms (96 = the chain images' 3 per layer),
+radixSortKVInPlace 96 ops 3.26 ms (3 per layer: host key, row-list key, the keep's score); the window's CompareEq<long>
+96 ops 2.41 ms, of which 64 / 0.95 ms in "resid" (the kwin lookup), so 32 / 1.46 ms in the section (the keep's E).
+ATTRIBUTION (CODE, per layer): the keep fill (r2_i4k_combo.TentStateFKg._keep_fill + keep_assign_d; KP.KEEP_EXTRA_OPS
+= 30 counted there) issues about 38 SMALL launches + 1 sort: need, E, max, any, td - L, alive, ALIVE_BASE - a1, where,
+masked_fill, valid, ~hit, miss, cumsum, - 1, clamp, gather, where, + 1, where, kid scatter, where, kage scatter, the
+step (2), hx fill, where, hx scatter, stack, sum, add, the remap (5). 87 - 46 = 41 per layer: the keep fill IS the
+difference (about 1,300 of the 2,785; the rest = the C 128 section's chain images 6, buffer writes, the compiled
+helpers' kernels, the sorts' index fills, the counters). It is the largest avoidable part: the E compare and its two
+reductions read 2 x 10.4 M bools per layer (E = (H, B, cap, cap) = 2 x 318 x 128 x 128) and every other op is a
+separate launch. THE CHANGE: the same ops in TWO compiled helpers (kfa_fn: the hits, the protection, the scores, the
+misses and their ranks; Inductor fuses the compare into the two reductions, E is never written; kfb_fn: the slots, the
+map and age scatters, hx, the counters, the remap), the stable sort between them EAGER (the I4CC rule: aten.sort's
+ties), the two shipped gathers after kfb_fn (they read hx). Integer / bool ops only (exact); the layer index and the
+pass step are 0-d device tensors and the FORK_BIG bound is vs.big (one compile per helper for every layer and pass).
+Column 0 of kid (CB1's slot, a write target never read) takes duplicate scatter writes in both versions. A CHECK PASS
+runs the helpers too: keep_assign_d's check counters (overflow from kfa's used / rank / miss; dup and missing from kid
+after kfb) and the byte check (_keep_bytes) run eagerly on the helpers' outputs (the GPU miniature checks every round:
+its keep gates then check ST3's map). FALLBACK (the inherited eager fill, counted per reason): "acct" (kacct), "control"
+(a keep or combo control: kneg, cneg), "kslots" (a blocked slot set), "nocc" (no compiled C / D state). The compile
+events and calls go into the state's compile record (cc: the arm's -COMPILE gate sees them) and the ST3 record.
+NEGATIVE CONTROLS (tests only; tneg3): "no_age" (kage not updated: the map's eviction order changes), "remap_off" (the
+page-id remap reads the slot of the next list rank: a fork row reads another block).
 HOST COUNTS: TentState.calls["commit"] moves once per call in every mode (mode "where": the eager and the captured
 execution run the inherited code; a replay adds the count).
 NEGATIVE CONTROLS (tests only; sneg): "stale" (m is not copied before a replay), "no_phase2" (the next block's rows are
@@ -60,6 +88,11 @@ import torch
 MODES = ("rows", "rowsx", "where")
 SNEG = (None, "stale", "no_phase2", "narrow")
 _INT = {1: torch.int8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+TNEG3 = (None, "no_age", "remap_off")
+HELPERS3 = ("kfa", "kfb")
+KM = 1 << 32                       # = r2_i4d_keep.KM (key = layer x KM + block id; tests_cpu/test_st1.py checks)
+ALIVE_BASE = 1 << 50               # = r2_i4d_keep.ALIVE_BASE
+PROTECT = 1 << 62                  # = r2_i4d_keep.PROTECT
 
 
 class CudaGraphsPrivate:
@@ -400,6 +433,159 @@ class TwinST2:
         return dict(self._st2)
 
 
+# ===================================================================================================================
+# ST3: the keep fill in two compiled helpers (module docstring, ST3). Pure functions: tensors in, tensors out or
+# in-place writes to tensors passed in; no state object, no host read; Python ints / bools are constants of a graph.
+# ===================================================================================================================
+def kfa_fn(lst, kid, kage, kpass_d, l_t, big, L: int):
+    """r2_i4k_combo.keep_assign_d up to the sort (kneg None, block None, no stats, no checks): the key, the hits (at most
+    one per need: the keys are distinct), the slots that hold a needed key (protected), the alive test of the device
+    step, the scores, the valid entries, the misses and their ranks. l_t, kpass_d, big: 0-d int64 tensors."""
+    need = lst + l_t * KM                                              # KP: lst + int(l) x KM
+    k1, a1 = kid[..., 1:], kage[..., 1:]
+    E = need.unsqueeze(-1) == k1.unsqueeze(-2)                         # (H, B, needs, slots)
+    hv, hs = E.to(torch.uint8).max(-1)
+    hit = hv != 0
+    used = E.any(-2)                                                   # (H, B, slots): holds a needed key
+    td = kpass_d * L + l_t                                             # = KP's int(t), on the device
+    alive = a1 > (td - L)
+    score = torch.where(alive, ALIVE_BASE - a1, a1).masked_fill(used, PROTECT)
+    valid = lst < big
+    miss = valid & ~hit
+    rank = miss.cumsum(-1) - 1
+    return score, hit, hs, miss, valid, rank, need, td, used
+
+
+def kfb_fn(order, hit, hs, miss, valid, rank, need, td, kid, kage, hx, lst, minus1, ph, in_lst, sb, sb1, row,
+           kcap: int, age: bool, shift: int):
+    """keep_assign_d after the sort (order = the stable sort's indices, eager) and TentStateFKg._keep_fill without the
+    shipped gathers: the slots, the map and age scatters (in place: kid, kage), hx (in place), the counter row (in place:
+    row[0:2]), the page-id remap. Returns (the remapped phys, the slots). age False / shift 1: the controls no_age /
+    remap_off."""
+    ms = order.gather(-1, rank.clamp(min=0))
+    slot = torch.where(hit, hs, ms) + 1
+    widx = torch.where(miss, slot, 0)
+    kid.scatter_(-1, widx, need)
+    if age:
+        ws = torch.where(valid, slot, 0)
+        kage.scatter_(-1, ws, td.expand(ws.shape))
+    hx.fill_(-1)                                                       # slot 0 (CB1) and every hit: no load
+    hx.scatter_(-1, widx, torch.where(miss, lst, minus1))
+    row[0:2].add_(torch.stack((valid, miss)).sum((1, 2, 3)))
+    at = (ph - sb1 + shift).clamp(0, kcap - 1)                         # the list rank of a listed block
+    sq = slot.gather(-1, at.view(at.shape[0], at.shape[1], -1)).view_as(at)
+    return torch.where(in_lst, sb + sq, ph), slot
+
+
+FNS3 = dict(kfa=kfa_fn, kfb=kfb_fn)
+_COMPILED3 = {}
+
+
+def compiled3(name: str, backend: str):
+    """The compiled ST3 helper (one per (name, backend) per process; fullgraph, static shapes, as the I4CC helpers)."""
+    key = (name, backend)
+    f = _COMPILED3.get(key)
+    if f is None:
+        f = _COMPILED3[key] = torch.compile(FNS3[name], fullgraph=True, dynamic=False, backend=backend)
+    return f
+
+
+def _graphs_now() -> int:
+    """Dynamo's process-wide count of compiled graphs (the compile-event record; read on the host only)."""
+    return int(torch._dynamo.utils.counters["stats"]["unique_graphs"])
+
+
+class KeepFillST3:
+    """ST3 (module docstring): the keep fill of the compiled keep section through kfa_fn / kfb_fn. A mixin before a
+    keep state of the I4DC line (L4PTFDGUDKWCD and the states built on it: ST1 / ST2, J1, BF1, INT). Set up by
+    _st3_setup (st3_attach)."""
+
+    def _st3_setup(self, tneg3) -> None:
+        if tneg3 not in TNEG3:
+            raise ValueError("ST3: control %r (one of %s)" % (tneg3, TNEG3))
+        if getattr(self, "kid", None) is None or not getattr(self, "kkeep", False):
+            raise ValueError("ST3: a keep state only (kid is None)")
+        self._st3_l = [torch.full((), l, dtype=torch.int64, device=self.dev) for l in range(int(self.L))]
+        self._st3 = dict(neg=tneg3, calls=0, checked=0, fallback={}, events=[], compile_s=0.0,
+                         backend=getattr(self, "_cc_backend", None))
+
+    def _st3_why(self):
+        """None: the fill runs through the helpers; else the reason for the inherited eager fill."""
+        if getattr(self, "_cc_backend", None) is None or getattr(self, "cc", None) is None:
+            return "nocc"
+        if self.kacct:
+            return "acct"
+        if self.kneg is not None or getattr(self, "cneg", None) is not None:
+            return "control"
+        if self.kblock is not None:
+            return "kslots"
+        return None
+
+    def _st3_call(self, name, l, *args):
+        """One call of the compiled helper `name` with its compile event (the I4CC record: _CCMix._cc's fields)."""
+        f = compiled3(name, self._cc_backend)
+        g0 = _graphs_now()
+        t0 = time.perf_counter()
+        wrap = getattr(self, "_cc_wrap", None)                         # tests: the CPU capture stand-in's node maker
+        out = wrap(name, f, args) if wrap is not None else f(*args)
+        dt = time.perf_counter() - t0
+        g1 = _graphs_now()
+        cc = self.cc
+        cc["calls"][name] = cc["calls"].get(name, 0) + 1
+        if g1 != g0:
+            ev = dict(name=name, graphs=g1 - g0, s=round(dt, 3), layer=int(l),
+                      joint_pass=int(self.calls["joint_passes"]), capture=bool(getattr(self, "_cc_cap", False)))
+            cc["events"].append(ev)
+            cc["compile_s"] += dt
+            self._st3["events"].append(ev)
+            self._st3["compile_s"] += dt
+        return out
+
+    def _keep_fill(self, l, vs, eng, twin, lst, loc, kern):
+        """TentStateFKg._keep_fill (r2_i4k_combo) through kfa_fn, the eager stable sort and kfb_fn; the same tensors
+        written with the same values (kid's column 0 aside). A check pass adds keep_assign_d's check counters (eager, on
+        the helpers' outputs, at the same points of the map's update) and the byte check (_keep_bytes)."""
+        why = self._st3_why()
+        if why is not None:
+            self._st3["fallback"][why] = self._st3["fallback"].get(why, 0) + 1
+            return super()._keep_fill(l, vs, eng, twin, lst, loc, kern)
+        neg = self._st3["neg"]
+        chk = self.kchk if self.checking else None
+        sb, sb1 = self._ksb1                                           # made in _kpre (eager)
+        score, hit, hs, miss, valid, rank, need, td, used = self._st3_call(
+            "kfa", l, lst, self.kid, self.kage, self.kpass_d, self._st3_l[l], vs.big, int(self.L))
+        if chk is not None:                                            # CHECK-ONLY (keep_assign_d): (iii) no overflow
+            nfree = (~used).sum(-1, keepdim=True)
+            chk["overflow"] += (miss & (rank >= nfree)).sum()
+        order = torch.sort(score, dim=-1, stable=True).indices         # EAGER (KP: the same call)
+        lphys, slot = self._st3_call("kfb", l, order, hit, hs, miss, valid, rank, need, td, self.kid, self.kage,
+                                     vs.host_x, lst, vs.minus1, loc["phys"], loc["in_lst"], sb, sb1, self._crow(),
+                                     int(self.kcap), neg != "no_age", 1 if neg == "remap_off" else 0)
+        if chk is not None:                                            # CHECK-ONLY: (ii) distinct keys, (iv) present
+            s = torch.sort(self.kid[..., 1:], dim=-1).values
+            chk["dup"] += ((s[..., 1:] == s[..., :-1]) & (s[..., 1:] >= 0)).sum()
+            chk["missing"] += (valid & (self.kid.gather(-1, slot) != need)).sum()
+        bs = self.bs
+        kern["gather_k"](vs.ext_k, eng._k_cpu, vs.host_x, bs)
+        kern["gather_v_bias"](vs.ext_v, eng._v_cpu, vs.ext_bias, twin.total_cis, vs.host_x, bs)
+        if chk is not None and self.kcheck:                            # CHECK-ONLY: the store bytes (KP _keep_bytes)
+            self._keep_bytes(vs, eng, twin, lst, valid, slot)
+        self._st3["calls"] += 1
+        self._st3["checked"] += int(chk is not None)
+        return lphys, valid
+
+    def st3_report(self) -> dict:
+        s = dict(self._st3)
+        s["fallback"] = dict(s["fallback"])
+        s["events"] = list(s["events"])
+        s["compile_s"] = round(s["compile_s"], 3)
+        return s
+
+
+# kfb_fn's written arguments (positions; the CPU capture stand-in saves them before the first write)
+KFB_WRITES = (8, 9, 10, 17)
+
+
 _STATES = {}
 _RUNNERS = {}
 
@@ -451,6 +637,50 @@ def st1_runner(R, mode: str = "rows", sneg=None, twin: bool = False, tneg2=None)
         RunnerST1.__name__ = RunnerST1.__qualname__ = R.__name__ + ("ST12" if twin else "ST1")
         _RUNNERS[key] = RunnerST1
     return _RUNNERS[key]
+
+
+_STATES3 = {}
+_RUNNERS3 = {}
+
+
+def st3_state(S):
+    """(KeepFillST3, S) (cached)."""
+    if S not in _STATES3:
+        _STATES3[S] = type(S.__name__ + "ST3", (KeepFillST3, S), {})
+    return _STATES3[S]
+
+
+def st3_attach(runner, tneg3=None) -> None:
+    """Re-class the runner's state to (KeepFillST3, its class) and set ST3 up (st3_runner's __init__ calls it after
+    the base runner's __init__: after ST1's, INT's and BF1's own re-classes)."""
+    T = runner.T
+    T.__class__ = st3_state(type(T))
+    T._st3_setup(tneg3)
+    runner.meta.update(st3=dict(tneg3=tneg3, helpers=HELPERS3))
+
+
+def st3_runner(R, tneg3=None):
+    """The runner class R (a keep arm's: the MT runner of L4PTFDGUDKWCD, or the INT keep runner r2_int_arms.int_runner)
+    whose state fills the keep by ST3 (cached per (R, tneg3)). read() adds the ST3 record ("st3")."""
+    if tneg3 not in TNEG3:
+        raise ValueError("ST3: control %r (one of %s)" % (tneg3, TNEG3))
+    key = (R, tneg3)
+    if key not in _RUNNERS3:
+        class RunnerST3(R):
+            _st3_neg = tneg3
+
+            def __init__(self, *args, **kw):
+                super().__init__(*args, **kw)
+                st3_attach(self, self._st3_neg)
+
+            def read(self) -> dict:
+                out = super().read()
+                out.update(st3=self.T.st3_report())
+                return out
+
+        RunnerST3.__name__ = RunnerST3.__qualname__ = R.__name__ + "ST3"
+        _RUNNERS3[key] = RunnerST3
+    return _RUNNERS3[key]
 
 
 def tail_checksum(T) -> list:

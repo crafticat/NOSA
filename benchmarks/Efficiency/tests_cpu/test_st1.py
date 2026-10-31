@@ -18,6 +18,13 @@ ST2       test_st2_equal (both D arms, timing and check): the MT run (M + the tw
           every bit, and = the D run outside the uncommitted tail rows; every joint layer ran ST2 (no fallback); the
           replay counters equal; PRECONDITION: deferred replays ran. test_st2_controls: "no_replay_seq" and "no_shift"
           CHANGE the run. test_st2_pass_plan: the step sequence of a planted plan (group with replay, final, fill, done).
+ST3       test_st3_constants (KP's constants, kfb's written arguments = the capture stand-in's MUT entry);
+          test_st3_helpers_planted (kfa_fn / kfb_fn, plain and Inductor CPU = the inherited fill on planted maps:
+          hits, misses, evictions; the controls change it); test_st3_equal (timing, check: the MTK run = the MT run every
+          bit incl. the map and the keep record, = the D run outside the uncommitted tail rows; every keep fill through the
+          helpers, check passes with the check counters 0); test_st3_controls ("no_age", "remap_off" CHANGE the run);
+          test_st3_int (ST3 on the INT keep arm L4PTFDGUDKWCDI = the INT run, every bit); test_st3_cell (the MTK arm's
+          rules, gates incl. -KFILL and its plants, the ST3 verdicts and registration state).
 CELL      test_st1_cell_pure (arguments, the gates on CPU evidence pass, their plants fail; the verdicts against the
           registration state), test_st1_registration_state (PRED_STAMP_ST1 / PRED_ST1_BY_B and the GRANT_<cell> lines:
           None or a date -u stamp, as the step script's greps see them), test_step_script_st1 (the repaired pattern: no
@@ -108,6 +115,10 @@ def _mod(name):
     return importlib.import_module(name)
 
 
+# ST3: the written arguments of its helpers for the CPU capture stand-in (i4cc_world.MUT; as test_j1 registers J1's)
+X.XC.MUT.update(kfa=(), kfb=_mod("r2_st1_commit").KFB_WRITES)
+
+
 # ------------------------------------------------------------------ GATE 0
 def test_st1_gate0_files():
     if not _have(BASE_SHA):
@@ -159,7 +170,7 @@ def test_st1_copies():
     core = [x for x in nb if not x.rstrip().endswith("# ST1")]
     extra = [x for x in nb if x.rstrip().endswith("# ST1")]
     assert core == ob, [(i, a, b) for i, (a, b) in enumerate(zip(core, ob)) if a != b][:3] or (len(core), len(ob))
-    assert len(extra) == 2, extra
+    assert len(extra) == 3, extra
     _ev("ST1 COPIES: run_arm_st1 = run_arm_d + %d ST1 lines" % len(extra))
 
 
@@ -187,13 +198,15 @@ class FakeCommitGraphs(XG.FakeGraphs):
 
 
 def m_builder(arm, mode="rows", sneg=None, check=False, stats=False, kcheck=False, phase_marks=False, probe_every=0,
-              twin=False, tneg2=None):
-    """The M arm's runner (twin: the MT arm's; the D arm's runner arguments of i4dc_world.d_builder) with
-    FakeCommitGraphs."""
+              twin=False, tneg2=None, st3=False, tneg3=None):
+    """The M arm's runner (twin: the MT arm's; st3: the MTK arm's; the D arm's runner arguments of
+    i4dc_world.d_builder) with FakeCommitGraphs."""
     STC = _mod("r2_st1_commit")
     W, WB, Z, I3, KA, RE, RW, SR = X.W, X.WB, X.Z, X.I3, X.KA, X.RE, X.RW, X.SR
     fa, fk = WB.fake_attention_u, Z.fake_fork
     Runner = STC.st1_runner(X.DCL[X.DARMS[arm]][1], mode, sneg, twin=twin, tneg2=tneg2)
+    if st3:
+        Runner = STC.st3_runner(Runner, tneg3)
 
     def build(model, cache, S, horizon, tok0, K=X.K0, check_every=0, record=False):
         B = int(cache.layers[0].cache_engine._k_gpu.shape[0])
@@ -216,15 +229,16 @@ def m_builder(arm, mode="rows", sneg=None, check=False, stats=False, kcheck=Fals
     return build
 
 
-def run_m(arm, mode="rows", sneg=None, scen="timing", B=8, N=N_RUN, seed=0, twin=False, tneg2=None):
-    """One run of the M arm (twin: the MT arm) of `arm` (GUDCD, GUDKCD) in i4dc_world's scenario."""
+def run_m(arm, mode="rows", sneg=None, scen="timing", B=8, N=N_RUN, seed=0, twin=False, tneg2=None, st3=False,
+          tneg3=None):
+    """One run of the M arm (twin: the MT arm; st3: the MTK arm) of `arm` (GUDCD, GUDKCD) in i4dc_world's scenario."""
     X.CC.configure()
     s = X.SCEN[scen]
     model, c, S, hz, tok0 = X.world(B, N, seed)
     kc = bool(s["check"]) and arm in X.KEEP
     run = m_builder(arm, mode, sneg, check=s["check"], stats=s["stats"], kcheck=kc, phase_marks=s["phase_marks"],
-                    probe_every=s["probe_every"], twin=twin, tneg2=tneg2)(model, c, S, hz, tok0,
-                                                                         check_every=s["check_every"])
+                    probe_every=s["probe_every"], twin=twin, tneg2=tneg2, st3=st3, tneg3=tneg3)(
+                        model, c, S, hz, tok0, check_every=s["check_every"])
     if s["fa"]:
         run.vs.fa_check = {}
     run.run(N)
@@ -240,12 +254,12 @@ def _plain(arm, scen="timing"):
 _M = {}
 
 
-def _m(arm, mode, sneg=None, scen="timing", twin=False, tneg2=None):
-    key = (arm, mode, sneg, scen, twin, tneg2)
+def _m(arm, mode, sneg=None, scen="timing", twin=False, tneg2=None, st3=False, tneg3=None):
+    key = (arm, mode, sneg, scen, twin, tneg2, st3, tneg3)
     if key not in _M:
         _plain({"GUDCD": "GUDC", "GUDKCD": "GUDKC"}[arm], scen)        # the C arm first: it compiles the joint helpers
         _plain(arm, scen)                                              # the D arm (the reference)
-        _M[key] = run_m(arm, mode, sneg, scen, twin=twin, tneg2=tneg2)
+        _M[key] = run_m(arm, mode, sneg, scen, twin=twin, tneg2=tneg2, st3=st3, tneg3=tneg3)
     return _M[key]
 
 
@@ -407,7 +421,7 @@ def test_st2_pass_plan():
             C.parse_args(base + ["--arms", bad])
     with pytest.raises(SystemExit):
         C.parse_args(base + ["--st1-commit", "fast"])
-    assert C.ARMS[-4:] == ("L4PTFDGUDCDM", "L4PTFDGUDKWCDM", "L4PTFDGUDCDMT", "L4PTFDGUDKWCDMT")
+    assert C.ARMS[-5:] == ("L4PTFDGUDCDM", "L4PTFDGUDKWCDM", "L4PTFDGUDCDMT", "L4PTFDGUDKWCDMT", "L4PTFDGUDKWCDMTK")
     with pytest.raises(SystemExit):                                    # an MT arm needs its M arm
         C.parse_args(base + ["--arms", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDMT"])
     assert set(STC.MODES) == {"rows", "rowsx", "where"}
@@ -479,6 +493,272 @@ def test_st2_pass_plan():
         return "REPORT" if b is None else ("CONFIRMED" if b[0] <= val <= b[1] else "REFUTED")
     assert v["ST1-COMMIT-SAVING"][1] == want("ST1_commit_saving", 1.5) and "1.5000" in v["ST1-COMMIT-SAVING"][2]
     assert v["ST1-VS-REF"][1] == want("ST1_vs_ref", 1.01)
+
+
+# ------------------------------------------------------------------ ST3: the keep fill in two compiled helpers
+def test_st3_constants():
+    STC, KP = _mod("r2_st1_commit"), _mod("r2_i4d_keep")
+    assert (STC.KM, STC.ALIVE_BASE, STC.PROTECT) == (KP.KM, KP.ALIVE_BASE, KP.PROTECT)
+    names = list(inspect.signature(STC.kfb_fn).parameters)
+    assert [names[i] for i in STC.KFB_WRITES] == ["kid", "kage", "hx", "row"] and X.XC.MUT["kfb"] == STC.KFB_WRITES
+    assert X.XC.MUT["kfa"] == () and STC.HELPERS3 == tuple(STC.FNS3) == ("kfa", "kfb")
+    assert set(STC.TNEG3) == {None, "no_age", "remap_off"}
+    with pytest.raises(ValueError):
+        STC.st3_runner(object, "nope")
+
+
+def _plant(seed, H=2, B=3, cap=8, L=4, l=2, kpass=5, nblk=24, R=2, T=5):
+    """A planted keep step (no world): per (head, request) a map with keys of layer l and one of another layer, ages
+    around the step (alive and dead), a sorted list of distinct blocks (held ones: hits; new ones: misses; FORK_BIG
+    after its end) in a strided view of a longer buffer (as vs.lst_buf), and the remap's inputs."""
+    KP = _mod("r2_i4d_keep")
+    g = torch.Generator().manual_seed(seed)
+    big = 2 ** 31 - 1
+    X_ = cap + 1
+    kid, kage = KP.new_map(H, B, X_, torch.device("cpu"))
+    t = kpass * L + l
+    buf = torch.full((H, B, cap + 1), big, dtype=torch.int64)
+    n = torch.zeros((H, B), dtype=torch.int64)
+    for h in range(H):
+        for b in range(B):
+            p = torch.randperm(nblk, generator=g).tolist()
+            nk = int(torch.randint(2, cap, (1,), generator=g))           # 2 .. cap - 1 filled slots
+            for i, s in enumerate((torch.randperm(cap, generator=g)[:nk] + 1).tolist()):
+                kid[h, b, s] = ((l + 1) % L if i == 0 else l) * KP.KM + p[i]
+                kage[h, b, s] = t - int(torch.randint(1, 3 * L, (1,), generator=g))
+            m = int(torch.randint(1, cap + 1, (1,), generator=g))
+            mine = sorted(set(p[1:1 + m // 2] + p[nk:nk + m - m // 2]))
+            buf[h, b, :len(mine)] = torch.tensor(mine, dtype=torch.int64)
+            n[h, b] = len(mine)
+    store_b = torch.arange(B, dtype=torch.int64) * 50 + 1000
+    sb = store_b.view(1, B, 1, 1)
+    sb1 = sb + 1
+    at = torch.randint(0, cap, (H, B, R, T), generator=g)
+    in_lst = (at < n.view(H, B, 1, 1)) & (torch.rand((H, B, R, T), generator=g) < 0.7)
+    ph = torch.where(in_lst, sb1 + at, torch.randint(0, 500, (H, B, R, T), generator=g))
+    return dict(kid=kid, kage=kage, lst=buf[..., :cap], ph=ph, in_lst=in_lst, sb=sb, sb1=sb1,
+                hx=torch.full((H, B, X_), 7, dtype=torch.int64), B=B, cap=cap, L=L, l=l, kpass=kpass, big=big)
+
+
+def _ref_fill(P):
+    """The inherited fill on a plant: r2_i4k_combo.keep_assign_d + TentStateFKg._keep_fill's hx, counters and remap."""
+    CO = _mod("r2_i4k_combo")
+    kid, kage, hx = P["kid"].clone(), P["kage"].clone(), P["hx"].clone()
+    row = torch.zeros(8, dtype=torch.int64)
+    minus1 = torch.tensor(-1, dtype=torch.int64)
+    td = torch.tensor(P["kpass"] * P["L"] + P["l"], dtype=torch.int64)
+    m = CO.keep_assign_d(kid, kage, P["lst"], P["l"], td, P["L"], big=P["big"])
+    hx.fill_(-1)
+    hx.scatter_(-1, m["widx"], torch.where(m["miss"], P["lst"], minus1))
+    row[0:2].add_(torch.stack((m["valid"], m["miss"])).sum((1, 2, 3)))
+    at = (P["ph"] - P["sb1"]).clamp_(0, P["cap"] - 1)
+    sq = m["slot"].gather(-1, at.view(at.shape[0], P["B"], -1)).view_as(at)
+    return dict(kid=kid, kage=kage, hx=hx, row=row, phys=torch.where(P["in_lst"], P["sb"] + sq, P["ph"]),
+                slot=m["slot"], valid=m["valid"], hit=m["hit"], miss=m["miss"])
+
+
+def _st3_fill(P, kfa, kfb, age=True, shift=0):
+    """ST3's fill on a plant: kfa, the eager stable sort, kfb (KeepFillST3._keep_fill without the shipped gathers)."""
+    kid, kage, hx = P["kid"].clone(), P["kage"].clone(), P["hx"].clone()
+    row = torch.zeros(8, dtype=torch.int64)
+    i64 = dict(dtype=torch.int64)
+    score, hit, hs, miss, valid, rank, need, td, used = kfa(P["lst"], kid, kage, torch.tensor(P["kpass"], **i64),
+                                                            torch.tensor(P["l"], **i64), torch.tensor(P["big"], **i64),
+                                                            P["L"])
+    order = torch.sort(score, dim=-1, stable=True).indices
+    phys, slot = kfb(order, hit, hs, miss, valid, rank, need, td, kid, kage, hx, P["lst"], torch.tensor(-1, **i64),
+                     P["ph"], P["in_lst"], P["sb"], P["sb1"], row, P["cap"], age, shift)
+    return dict(kid=kid, kage=kage, hx=hx, row=row, phys=phys, slot=slot, valid=valid, hit=hit, miss=miss)
+
+
+def test_st3_helpers_planted():
+    """kfa_fn / kfb_fn (plain Python and Inductor's CPU backend) = the inherited fill on planted maps, every written
+    tensor (kid's column 0 aside); PRECONDITIONS: hits, misses, evictions of a held key; the controls change it."""
+    STC = _mod("r2_st1_commit")
+    X.CC.configure()
+    variants = (("python", STC.kfa_fn, STC.kfb_fn),
+                ("inductor", STC.compiled3("kfa", "inductor"), STC.compiled3("kfb", "inductor")))
+    hits = misses = evicted = c_age = c_remap = 0
+    seeds = range(6)
+    for seed in seeds:
+        P = _plant(seed)
+        r = _ref_fill(P)
+        hits += int(r["hit"].sum())
+        misses += int(r["miss"].sum())
+        evicted += int((r["miss"] & (P["kid"].gather(-1, r["slot"]) >= 0)).sum())
+        for name, fa, fb in variants:
+            s = _st3_fill(P, fa, fb)
+            for k in ("kage", "hx", "row", "phys", "slot", "valid", "hit", "miss"):
+                assert torch.equal(s[k], r[k]), (seed, name, k)
+            assert torch.equal(s["kid"][..., 1:], r["kid"][..., 1:]), (seed, name)
+        c_age += int(not torch.equal(_st3_fill(P, STC.kfa_fn, STC.kfb_fn, age=False)["kage"], r["kage"]))
+        c_remap += int(not torch.equal(_st3_fill(P, STC.kfa_fn, STC.kfb_fn, shift=1)["phys"], r["phys"]))
+    assert hits > 0 and misses > 0 and evicted > 0, (hits, misses, evicted)       # preconditions (L34)
+    assert c_age == len(seeds) and c_remap > 0, (c_age, c_remap)                    # the controls are not no-ops
+    _ev("ST3 PLANTED: %d plants: hits %d, misses %d, evictions of a held key %d; controls changed no_age %d, "
+        "remap_off %d" % (len(seeds), hits, misses, evicted, c_age, c_remap))
+
+
+def _st3_record_ok(rd):
+    s3, cc = rd["st3"], rd["compile"]
+    n = s3["calls"]
+    assert s3["neg"] is None and not s3["fallback"] and n > 0, s3
+    assert n == cc["sections"] + sum(cc["fallback"].values()), (n, cc["sections"], cc["fallback"])
+    assert cc["calls"]["kfa"] == cc["calls"]["kfb"] == n, cc["calls"]
+    return s3
+
+
+@pytest.mark.parametrize("scen", ["timing", "check"])
+def test_st3_equal(scen):
+    """The MTK run (MT + ST3) = the MT run, every bit (the map: kid / kage columns 1 ..; the keep record), and = the D
+    run outside the uncommitted tail rows; every keep fill ran the helpers (check passes too: the check counters 0)."""
+    mt = _m("GUDKCD", "rows", None, scen, twin=True)
+    ev = _m("GUDKCD", "rows", None, scen, twin=True, st3=True)
+    base = _plain("GUDKCD", scen)
+    rd = ev["rd"]
+    kp = rd["keep"]
+    assert kp["hits_total"] > 0 and kp["fetched_total"] > 0, "precondition: hits and misses (L34)"
+    bad = TS._diff(mt, ev, skip=("st1", "st2", "st3", "compile"))
+    assert bad == [], bad[:10]                                         # THE CLAIM: the MT run, every bit
+    bad_d = TS._diff(base, ev, skip=("st1", "st2", "st3", "compile"), tensors_skip=KV_KEYS)
+    assert bad_d == [], bad_d[:10]
+    s3 = _st3_record_ok(rd)
+    if scen == "check":
+        c = kp["check"]
+        assert s3["checked"] > 0 and c["bytes_checked"] > 0, (s3, c)
+        assert c["overflow"] == c["dup"] == c["missing"] == c["bytes_bad"] == 0, c
+    _ev("ST3 EQUAL %s: joint passes %d, keep listed %d hits %d fetched %d; st3 %s" % (
+        scen, rd["tent"]["calls"]["joint_passes"], kp["listed_total"], kp["hits_total"], kp["fetched_total"],
+        {k: s3[k] for k in ("calls", "checked", "fallback", "events")}))
+
+
+@pytest.mark.parametrize("tneg3", ["no_age", "remap_off"])
+def test_st3_controls(tneg3):
+    """"no_age" changes the map (kage; later the hits), "remap_off" the blocks a fork row reads (the run's outputs)."""
+    mt = _m("GUDKCD", "rows", None, "timing", twin=True)
+    try:
+        ev = _m("GUDKCD", "rows", None, "timing", twin=True, st3=True, tneg3=tneg3)
+    except Exception as e:                                             # a control that breaks the run is caught too
+        _ev("ST3 CONTROL %s: the run raised %s: %s" % (tneg3, type(e).__name__, str(e)[:200]))
+        return
+    bad = TS._diff(mt, ev, skip=("st1", "st2", "st3", "compile"))
+    assert bad != [], "the control %s changed nothing (a no-op plant)" % tneg3
+    if tneg3 == "remap_off":
+        assert [k for k in bad if k not in ("kid", "kage", "keep")], bad   # the reads, not only the map
+    _ev("ST3 CONTROL %s: differences %d (first %s)" % (tneg3, len(bad), bad[:6]))
+
+
+_I3 = {}
+
+
+def _int_st3(scen):
+    """(the INT keep arm's run, the same + ST3) on the CPU world: tests_cpu/test_int.py's builder, then st3_attach (=
+    st3_runner's __init__ after the INT runner's)."""
+    if scen not in _I3:
+        TI = _load("test_int")
+        STC = _mod("r2_st1_commit")
+        ref = TI._int("C73", scen)                                     # its D / C arms first (test_int's order)
+        run = TI._builder("L4PTFDGUDKWCDI", scen)
+        STC.st3_attach(run)
+        if X.SCEN[scen]["fa"]:
+            run.vs.fa_check = {}
+        run.run(N_RUN)
+        rd = run.read()
+        rd["st3"] = run.T.st3_report()
+        _I3[scen] = (ref, dict(runner=run, rd=rd, N=N_RUN, B=8, scen=scen, arm="L4PTFDGUDKWCDI"))
+    return _I3[scen]
+
+
+@pytest.mark.parametrize("scen", ["timing", "check"])
+def test_st3_int(scen):
+    """ST3 on the INT keep arm L4PTFDGUDKWCDI (J1 + ST1 + ST2 + BF1): the classes compose (KeepFillST3 owns _keep_fill,
+    IntLayer _layer, CommitST1 commit, BF1 present) and the run = the INT run, every bit (BF1's record aside: its
+    timers; its counters equal)."""
+    INTA, STC = _mod("r2_int_arms"), _mod("r2_st1_commit")
+    ref, ev = _int_st3(scen)
+    cls = type(ev["runner"].T)
+    names = [k.__name__ for k in cls.__mro__]
+    assert INTA.owner(cls, "_keep_fill") == "KeepFillST3" and INTA.owner(cls, "_layer") == "IntLayer", names
+    assert INTA.owner(cls, "commit") == "CommitST1" and "TentStateBF" in names and "_J1Mix" in names, names
+    RI = INTA.int_runner(X.STF, "L4PTFDGUDKWCDI", "rows")
+    assert issubclass(STC.st3_runner(RI), RI)
+    rd, rr = ev["rd"], ref["rd"]
+    kp = rd["keep"]
+    assert kp["hits_total"] > 0 and kp["fetched_total"] > 0, "precondition: hits and misses (L34)"
+    bad = TS._diff(ref, ev, skip=("compile", "j1", "j3", "st1", "st2", "st3", "int", "bf"))
+    assert bad == [], bad[:10]                                         # THE CLAIM: the INT run, every bit
+    assert all(rd["bf"][k] == rr["bf"][k] for k in ("committed", "used_store", "used_win")), (rd["bf"], rr["bf"])
+    assert rd["bf"]["error"] is None and rd["bf"]["committed"] > 0
+    s3 = _st3_record_ok(rd)
+    if scen == "check":
+        c = kp["check"]
+        assert s3["checked"] > 0 and c["overflow"] == c["dup"] == c["missing"] == c["bytes_bad"] == 0, (s3, c)
+    _ev("ST3 INT %s: keep listed %d hits %d; bf committed %d; st3 %s" % (
+        scen, kp["listed_total"], kp["hits_total"], rd["bf"]["committed"],
+        {k: s3[k] for k in ("calls", "checked", "fallback")}))
+
+
+def test_st3_cell():
+    """The MTK arm in the cell: the arm rules, its gates on CPU evidence (the MT arm's gate set + -KFILL; every MUST
+    passes; -KFILL's plants fail), the ST3 verdicts and registration state (None: REPORT)."""
+    C, STC = _mod("r2_st1_cell"), _mod("r2_st1_commit")
+    base = ["--out", "/nonexistent/x", "--workload", "/nonexistent/w"]
+    keep_arms = "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT"
+    a = C.parse_args(base + ["--arms", keep_arms + ",L4PTFDGUDKWCDMTK"])
+    assert a.arms[-1] == "L4PTFDGUDKWCDMTK"
+    with pytest.raises(SystemExit):                                    # an MTK arm needs its MT arm
+        C.parse_args(base + ["--arms", "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMTK"])
+    assert "L4PTFDGUDKWCDMTK" not in C.ST1 and C.ST13["L4PTFDGUDKWCDMTK"] == "L4PTFDGUDKWCDMT"   # r2_int_cell: ST1
+    assert C.ROOT["L4PTFDGUDKWCDMTK"] == "L4PTFDGUDKWCD" and "L4PTFDGUDKWCDMTK" in C.TWIN
+    name = "L4PTFDGUDKWCDMTK"
+
+    def cpu(e):
+        out = X.cell_inputs(e, C)
+        out["tails"] = STC.tail_checksum(e["runner"].T)
+        return out
+    ev = _m("GUDKCD", "rows", twin=True, st3=True)
+    keepd = {"L4PTFD": cpu(_plain("D")), "L4PTFDGUDKWCD": cpu(_plain("GUDKCD")), "L4PTFDGUDKWC": cpu(_plain("GUDKC")),
+             "L4PTFDGUDKWCDMT": cpu(_m("GUDKCD", "rows", twin=True))}
+    rd = ev["rd"]
+    rec = dict(graph=rd["graph"], dgraph=rd["dgraph"], gpu_peak_alloc_GB=1.0, mem_arena=dict(prefill_peak_GB=1.0))
+    gs = C.arm_gates_st1(name, rd, rec, cpu(ev), keepd, False, 8, 10, N_RUN, L, 1.0)
+    names = [g[0] for g in gs]
+    assert all(n.startswith(name + "-") for n in names), names
+    for want in ("-PEQ", "-DCOUNTS", "-TAIL-EQ", "-CGRAPH", "-TWIN", "-KFILL", "-EQF", "-COMPILE"):
+        assert name + want in names, (want, names)
+    assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
+    s3, cc = rd["st3"], rd["compile"]
+    assert C.kfill_gate(name, s3, cc)[2] and cc["first_capture_pass"] is not None
+    late = dict(name="kfa", graphs=1, s=0.1, layer=0, joint_pass=cc["first_capture_pass"], capture=False)
+    for plant in (dict(fallback=dict(acct=1)), dict(calls=s3["calls"] - 1), dict(neg="no_age"), dict(calls=0),
+                  dict(events=[late]), dict(events=[dict(late, joint_pass=0, capture=True)]),
+                  dict(events=[dict(late, joint_pass=0), dict(late, joint_pass=0)])):
+        assert not C.kfill_gate(name, dict(s3, **plant), cc)[2], plant
+    assert not C.kfill_gate(name, s3, dict(cc, calls=dict(cc["calls"], kfb=s3["calls"] + 1)))[2]
+    assert not C.kfill_gate(name, s3, dict(cc, sections=cc["sections"] + 1))[2]
+    assert not C.kfill_gate(name, None, cc)[2]
+    # the ST3 verdicts (its own registration; REPORT while None)
+    r = lambda tok, joint: dict(rates=dict(median_tok_s=tok, round_ms_median=10.0),     # noqa: E731
+                                phases_median=dict(commit=4.0, joint=joint, draft=4.0), peak_with_prefill_GB=80.0)
+    sp = {"L4PTFDGUDKWCD": r(100.0, 6.0), "L4PTFDGUDKWCDM": r(101.0, 6.0), "L4PTFDGUDKWCDMT": r(102.0, 5.0),
+          "L4PTFDGUDKWCDMTK": r(103.0, 4.0)}
+    v = {p[0]: p for p in C.verdicts(sp, 318)}
+    P3 = C.PRED_ST3_BY_B[318]
+
+    def want(key, val):
+        b = P3.get(key)
+        return "REPORT" if b is None else ("CONFIRMED" if b[0] <= val <= b[1] else "REFUTED")
+    assert v["ST3-JOINT-SAVING"][1] == want("ST3_joint_saving", 1.0) and "1.0000" in v["ST3-JOINT-SAVING"][2]
+    assert v["ST3-VS-MT"][1] == want("ST3_vs_mt", 103.0 / 102.0) and "ST3-ARM" in v
+    assert "ST3-JOINT-SAVING" not in {p[0] for p in C.verdicts({k: sp[k] for k in list(sp)[:3]}, 318)}
+    src = (EFF / "r2_st1_cell.py").read_text()                         # the registration state (None or a stamp)
+    if C.PRED_STAMP_ST3 is None:
+        assert all(x is None for x in P3.values()) and "\nPRED_STAMP_ST3 = None\n" in src
+    else:
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", C.PRED_STAMP_ST3)
+    assert set(C.PRED_ST3_BY_B) == {318} and set(P3) == set(C.PRED_KEYS_ST3)
+    _ev("ST3 CELL: %d gates (%d MUST) pass on CPU evidence; KFILL %s" % (len(gs), sum(1 for g in gs if g[1]),
+                                                                       C.kfill_gate(name, s3, cc)[3][:160]))
 
 
 def test_st1_registration_state():

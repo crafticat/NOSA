@@ -4,6 +4,9 @@ kstep-cpu-runs): the best arms with THE COMMIT CAPTURED AND MOVED BY ROW (benchm
   L4PTFDGUDKWCDM  = L4PTFDGUDKWCD (C 73 B 318: the best arm there) + the same
   L4PTFDGUDCDMT, L4PTFDGUDKWCDMT = the M arm + ST2 (r2_st1_commit.TwinST2: the joint pass's twin section in one
                     advance); its reference arm (PEQ, DCOUNTS, TAIL-EQ) is the M arm; -TWIN checks every joint layer ran it
+  L4PTFDGUDKWCDMTK = L4PTFDGUDKWCDMT + ST3 (r2_st1_commit.KeepFillST3: the keep fill of the joint section in two
+                    compiled helpers); its reference arm is the MT arm; -KFILL checks every keep fill ran the helpers
+                    (or a check pass's fallback) and their compile events came before the first capture
 NO NEW KERNEL. The I4DC cell (benchmarks/Efficiency/r2_i4dc_cell.py) is imported, not edited: its arms, its runner
 choice, its pure parts, its gates. Step script: benchmarks/Efficiency/r2_st1_step.sh (cells st1m, st1a, st1b).
 
@@ -18,8 +21,9 @@ marks, the acceptance record and the state checksums = its D arm's, bit for bit)
 replays = commits - 1, the overflow counter m > J is 0).
 REGISTERED PREDICTIONS PRED_ST1_BY_B: every value None until the lead registers them with PRED_STAMP_ST1 (a None key is
 REPORT); the step script STOPS the timing cells (st1a, st1b) while PRED_STAMP_ST1 is None. The builder's MODEL: the
-comment block above PRED_ST1_BY_B. THE CELL GRANTS GRANT_st1m / GRANT_st1a / GRANT_st1b (default deny, None): the step
-script runs a cell only when its grant line holds a `date -u` stamp at <sha>.
+comment block above PRED_ST1_BY_B. ST3 has its own: PRED_ST3_BY_B / PRED_STAMP_ST3 (None: REPORT), MODEL above them.
+THE CELL GRANTS GRANT_st1m / GRANT_st1a / GRANT_st1b (default deny, None): the step script runs a cell only when its
+grant line holds a `date -u` stamp at <sha>.
 EXIT: the number of failed MUST gates (0-19); 20 refused; 30 an exception outside an arm.
 """
 from __future__ import annotations
@@ -42,11 +46,14 @@ S4, CC, IA, GC, DG, LN, GR, HC, KC, UC, DC, KP, SK = (DCC.S4, DCC.CC, DCC.IA, DC
 I3C, WA, SC, BC = DCC.I3C, DCC.WA, DCC.SC, DCC.BC
 ST1 = dict(L4PTFDGUDCDM="L4PTFDGUDCD", L4PTFDGUDKWCDM="L4PTFDGUDKWCD",       # an M arm -> its D arm (the plain arm)
            L4PTFDGUDCDMT="L4PTFDGUDCDM", L4PTFDGUDKWCDMT="L4PTFDGUDKWCDM")  # an MT arm (+ ST2) -> its M arm
+ST3 = dict(L4PTFDGUDKWCDMTK="L4PTFDGUDKWCDMT")      # an ST3 arm (+ the compiled keep fill) -> its MT arm; NOT in ST1:
+ST13 = dict(ST1, **ST3)                             # r2_int_cell reads ST1 (its own runner choice has no ST3)
 ROOT = dict(L4PTFDGUDCDM="L4PTFDGUDCD", L4PTFDGUDKWCDM="L4PTFDGUDKWCD",      # an ST arm -> the D arm whose runner,
-            L4PTFDGUDCDMT="L4PTFDGUDCD", L4PTFDGUDKWCDMT="L4PTFDGUDKWCD")   # gates and compile it takes
-TWIN = ("L4PTFDGUDCDMT", "L4PTFDGUDKWCDMT")                                # the arms with ST2 (the twin section)
-ARMS = DCC.ARMS + tuple(ST1)
-GRAPH_ARMS = DCC.GRAPH_ARMS + tuple(ST1)
+            L4PTFDGUDCDMT="L4PTFDGUDCD", L4PTFDGUDKWCDMT="L4PTFDGUDKWCD",   # gates and compile it takes
+            L4PTFDGUDKWCDMTK="L4PTFDGUDKWCD")
+TWIN = ("L4PTFDGUDCDMT", "L4PTFDGUDKWCDMT", "L4PTFDGUDKWCDMTK")            # the arms with ST2 (the twin section)
+ARMS = DCC.ARMS + tuple(ST1) + tuple(ST3)
+GRAPH_ARMS = DCC.GRAPH_ARMS + tuple(ST1) + tuple(ST3)
 BASE_D = DCC.BASE_D
 TOPK = DCC.TOPK
 FORK_BLOB = DCC.FORK_BLOB
@@ -103,6 +110,25 @@ PRED_ST1_BY_B = {
 GRANT_st1m = None
 GRANT_st1a = None
 GRANT_st1b = None
+# ST3 (the MTK arm against its MT arm; C 73 only: the keep). NONE UNTIL THE LEAD REGISTERS THEM (PRED_STAMP_ST3,
+# `date -u`); keys (low, high), phases on the steady set without the capture rounds (L61):
+#   ST3_joint_saving  [ms per round] MT joint median - MTK's
+#   ST3_vs_mt         [x] MTK / MT median steady committed tok/s (same job)
+# THE BUILDER'S MODEL (an input for the lead, not a registration). MEASURED (r7pb, C 73 B 318, labelled section of
+# L4PTFDGUDKWCDP round 112, profiled): the keep fill's named kernels per joint pass: the map lookup's max reduction
+# 2.34 ms (32 ops), the E compare 1.46 ms (32), the any reduction (not in the top names: about the max's, MODEL 1.5 ..
+# 2.5 ms), and about 35 more small launches per layer (1,120 ops at 3.0 .. 4.0 us: the section's other small ops
+# average 3.8 us = (16.32 - 2.34 - 1.46 - 2.49 where) ms / 2,613 ops: 3.4 .. 4.5 ms): the keep fill = 8.7 .. 10.8 ms
+# profiled; x 0.85 (the r7pa profiler factor of ST1) = 7.4 .. 9.2 ms.
+# AFTER: kfa (the compare fused into 2 reductions over (H, B, 128) x 128 in registers, the scores, the cumsum: 3 .. 5
+# Inductor kernels) + kfb (gathers, wheres, 3 scatters, the fill, the counters, the remap: 4 .. 7 kernels) = 7 .. 12
+# launches per layer at 3 .. 6 us (E is never written) = 0.7 .. 2.3 ms; the sort stays (1.09 ms, both arms). Saving per
+# joint pass (= per round): 5.1 .. 8.5 ms; BAND (widened for the unseen any reduction and Inductor's kernel count)
+# ST3_joint_saving (3.0, 9.0) ms. ST3_vs_mt = round / (round - saving), round about 515 ms (524.7 - ST1 - ST2):
+# (1.0059, 1.0178) -> (1.005, 1.018). The run-to-run spread at B 318 is 0.6 %: the low end is inside it.
+PRED_STAMP_ST3 = None
+PRED_KEYS_ST3 = ("ST3_joint_saving", "ST3_vs_mt")
+PRED_ST3_BY_B = {318: {k: None for k in PRED_KEYS_ST3}}
 
 
 def log(msg):
@@ -150,7 +176,7 @@ def parse_args(argv):
     for x, c in BASE_D.items():
         if x in a.arms and c not in a.arms:
             ap.error("--arms: %s needs its C arm %s (it compiles the joint helpers)" % (x, c))
-    for x, d in ST1.items():
+    for x, d in ST13.items():
         if x in a.arms and d not in a.arms:
             ap.error("--arms: %s needs its reference arm %s (the PEQ reference)" % (x, d))
     if a.spec != 3:
@@ -158,7 +184,8 @@ def parse_args(argv):
     if a.batch < 1 or a.steps > 1000 or a.steps < 8:
         ap.error("--batch >= 1, --steps in 8 .. 1000")
     if a.check_every == 1 and a.batch > 64 and any(x in a.arms for x in DCC.KEEP_ARMS + ("L4PTFDGUDKWCDM",
-                                                                                            "L4PTFDGUDKWCDMT")):
+                                                                                            "L4PTFDGUDKWCDMT",
+                                                                                            "L4PTFDGUDKWCDMTK")):
         ap.error("--check-every 1 with a keep arm: the keep's byte check needs a scratch store: --batch <= 64")
     if a.probe_every < 2 or a.check_every < 0 or a.spec_journal_blocks < 1:
         ap.error("--probe-every >= 2, --check-every >= 0, journal >= 1")
@@ -184,7 +211,8 @@ def run_arm_st1(model, ids, inputs, steps: int, clock, opt, FORK, arm: str):
     check = opt["check_every"] == 1
     kind, kw = runner_choice(arm, check)
     Runner = runner_class(kind, STF)
-    Runner = STC.st1_runner(Runner, opt["st1_commit"], twin=arm in TWIN) if arm in ST1 else Runner   # ST1
+    Runner = STC.st1_runner(Runner, opt["st1_commit"], twin=arm in TWIN) if arm in ST13 else Runner   # ST1
+    Runner = STC.st3_runner(Runner) if arm in ST3 else Runner          # ST1
     if kind in ("SC", "SKC", "SCD", "SKCD"):
         CC.configure()
     gb = 1024 ** 3
@@ -219,7 +247,7 @@ def run_arm_st1(model, ids, inputs, steps: int, clock, opt, FORK, arm: str):
                joint_phases=I3C.fork_phase_summary(phases, layers), fa_check=runner.vs.fa_check,
                store=dict(X=X, store_GB=round(arena.store_bytes() / 1e9, 4), cb0_GB=round(arena.chain_bytes() / 1e9, 4)),
                compile=I3C._compile_report(FORK), state=IA.state_checksum(runner), runner_kind=kind, runner_kw=kw)
-    res.update(tails=STC.tail_checksum(runner.T), st1=rd.get("st1"))   # ST1
+    res.update(tails=STC.tail_checksum(runner.T), st1=rd.get("st1"), st3=rd.get("st3"))   # ST1
     runner.detach()
     del runner, rs, cache, arena
     return res
@@ -280,12 +308,40 @@ def twin_gate(arm, s2, joint_passes: int, L: int):
             % (joint_passes, s2.get("passes"), s2.get("layers"), joint_passes * L, s2.get("fallback"), s2.get("fused")))
 
 
+def kfill_gate(arm, s3, cc):
+    """<arm>-KFILL (MUST): ST3 filled the keep through its helpers in every section (its Python calls = the compile
+    record's sections + its section fallbacks; check passes included: the check counters run on the helpers' outputs),
+    no fallback, no control, both helpers called as often as the fills, their compile events before the first capture
+    (none inside one), at most one per helper."""
+    if not s3:
+        return ("%s-KFILL" % arm, True, False, "no ST3 record")
+    cc = cc or {}
+    fb = s3.get("fallback") or {}
+    n = s3.get("calls") or 0
+    calls = cc.get("calls") or {}
+    secs = (cc.get("sections") or 0) + sum((cc.get("fallback") or {}).values())
+    fc = cc.get("first_capture_pass")
+    ev = s3.get("events") or []
+    late = [e for e in ev if e.get("capture") or (fc is not None and e.get("joint_pass", -1) >= fc)]
+    per = {}
+    for e in ev:
+        per[e["name"]] = per.get(e["name"], 0) + 1
+    ok = (n > 0 and not fb and s3.get("neg") is None and n == secs
+          and all(calls.get(h) == n for h in STC.HELPERS3) and not late and all(v <= 1 for v in per.values()))
+    return ("%s-KFILL" % arm, True, bool(ok), "fills %s through the helpers (check passes %s), fallback %s; sections %s; "
+            "helper calls %s; compile events %s (late %s); compile %s s; control %s" % (
+                n, s3.get("checked"), fb, secs, {h: calls.get(h) for h in STC.HELPERS3},
+                [(e["name"], e["joint_pass"], e["layer"], e["s"]) for e in ev], len(late), s3.get("compile_s"),
+                s3.get("neg")))
+
+
 def arm_gates_st1(arm, rd, rec, cpu, keep, check: bool, B: int, pool: int, steps: int, L: int, pa):
-    """The I4DC cell's arm gates; an M / MT arm: its D arm's gates under its own name, then -PEQ, -DCOUNTS and
-    -TAIL-EQ against its reference arm (M: the D arm; MT: the M arm), -CGRAPH, and for an MT arm -TWIN."""
-    if arm not in ST1:
+    """The I4DC cell's arm gates; an M / MT / MTK arm: its D arm's gates under its own name, then -PEQ, -DCOUNTS and
+    -TAIL-EQ against its reference arm (M: the D arm; MT: the M arm; MTK: the MT arm), -CGRAPH, for an MT / MTK arm
+    -TWIN, for an MTK arm -KFILL."""
+    if arm not in ST13:
         return DCC.arm_gates(arm, rd, rec, cpu, keep, check, B, pool, steps, L, pa)
-    x, root = ST1[arm], ROOT[arm]
+    x, root = ST13[arm], ROOT[arm]
     out = [(arm + n[len(root):] if n.startswith(root + "-") else n, m, ok, d)
            for n, m, ok, d in DCC.arm_gates(root, rd, rec, cpu, keep, check, B, pool, steps, L, pa)]
     ref = keep.get(x)
@@ -298,6 +354,8 @@ def arm_gates_st1(arm, rd, rec, cpu, keep, check: bool, B: int, pool: int, steps
     if arm in TWIN:
         jp = (((rd.get("tent") or {}).get("calls")) or {}).get("joint_passes")
         out.append(twin_gate(arm, rd.get("st2"), jp, L))
+    if arm in ST3:
+        out.append(kfill_gate(arm, rd.get("st3"), rd.get("compile")))
     return out
 
 
@@ -355,6 +413,16 @@ def verdicts(sp, B: int):
         out.append(("ST2-ARM", "REPORT", "XT = %s, REF = %s (REF ran: %s); joint %s vs %s ms; round %s vs %s ms" % (
             XT, ST1[XT], rm is not None, ph(xt, "joint"), ph(rm, "joint"),
             (xt.get("rates") or {}).get("round_ms_median"), ((rm or {}).get("rates") or {}).get("round_ms_median"))))
+    XK = next((t for t in ST3 if t in sp), None)
+    if XK is not None:                                                 # ST3 against its MT arm (its own registration)
+        P3 = PRED_ST3_BY_B.get(B) or {k: None for k in PRED_KEYS_ST3}
+        xk, rt = sp[XK], sp.get(ST3[XK])
+        band("ST3-JOINT-SAVING", diff(ph(rt, "joint"), ph(xk, "joint")), P3.get("ST3_joint_saving"))
+        band("ST3-VS-MT", ratio(med(xk), med(rt)), P3.get("ST3_vs_mt"))
+        out.append(("ST3-ARM", "REPORT", "XK = %s, REF = %s (REF ran: %s); joint %s vs %s ms; round %s vs %s ms; "
+                    "registered %s" % (XK, ST3[XK], rt is not None, ph(xk, "joint"), ph(rt, "joint"),
+                                       (xk.get("rates") or {}).get("round_ms_median"),
+                                       ((rt or {}).get("rates") or {}).get("round_ms_median"), PRED_STAMP_ST3)))
     return out
 
 
@@ -375,7 +443,7 @@ def main(argv=None) -> int:
         print("REFUSED: needs NOSI_ATTN_SPLITS > 0 and NOSI_POOL_BLOCKS == --pool (%d; the knob is %d)" % (
             a.pool, CEN.POOL_BLOCKS), file=sys.stderr)
         return 20
-    if any(x in a.arms for x in tuple(CCC.BASE) + tuple(BASE_D) + tuple(ST1)) and \
+    if any(x in a.arms for x in tuple(CCC.BASE) + tuple(BASE_D) + tuple(ST13)) and \
             not os.environ.get("TORCHINDUCTOR_CACHE_DIR"):
         print("REFUSED: a C, D or M arm needs TORCHINDUCTOR_CACHE_DIR (the step script sets it; never the home cache)",
               file=sys.stderr)
@@ -450,7 +518,7 @@ def main(argv=None) -> int:
                            joint_phases_fork=res["joint_phases"], store=res["store"], compile=res["compile"],
                            mem_arena=res["mem"], lean=rd.get("lean"), graph=rd.get("graph"), dgraph=rd.get("dgraph"),
                            hoist=rd.get("hoist"), capture_rounds=GC.capture_rounds(rd), runner=res["runner_kind"],
-                           runner_kw=res["runner_kw"], cc=rd.get("compile"), st1=res["st1"])
+                           runner_kw=res["runner_kw"], cc=rd.get("compile"), st1=res["st1"], st3=res.get("st3"))
                 jm = rec["phases_median"].get("joint")
                 shm = sh["rates"]["steady_step_ms"] if sh else None
                 rec["joint_sh_steps"] = round(jm / shm, 4) if (jm and shm) else None
@@ -498,7 +566,8 @@ def main(argv=None) -> int:
                 prefill_hook=a.prefill_hook, tu_gemm=a.tu_gemm, spec_journal_blocks=a.spec_journal_blocks,
                 spec_twin=a.spec_twin, spec_body=a.spec_body, spec_graph=a.spec_graph, spec_redirect=a.spec_redirect,
                 probe_every=a.probe_every, check_every=a.check_every, require_stress=a.require_stress,
-                predictions=dict(stamp=PRED_STAMP_ST1, by_batch=PRED_ST1_BY_B), st1_arms=ST1,
+                predictions=dict(stamp=PRED_STAMP_ST1, by_batch=PRED_ST1_BY_B, st3_stamp=PRED_STAMP_ST3,
+                                 st3_by_batch=PRED_ST3_BY_B), st1_arms=ST1, st3_arms=ST3,
                 compile=dict(torch=torch.__version__, inductor_cache=os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
                              kernel_cache=os.environ.get("TRITON_CACHE_DIR")),
                 mem_must_GB=GC.MEM_MUST_GB, capture_rounds=caps, steady_excluded_rounds=xr, m_arm=m_arm(sp),
