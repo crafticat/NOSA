@@ -311,8 +311,9 @@ def twin_gate(arm, s2, joint_passes: int, L: int):
 def kfill_gate(arm, s3, cc):
     """<arm>-KFILL (MUST): ST3 filled the keep through its helpers in every section (its Python calls = the compile
     record's sections + its section fallbacks; check passes included: the check counters run on the helpers' outputs),
-    no fallback, no control, both helpers called as often as the fills, their compile events before the first capture
-    (none inside one), at most one per helper."""
+    no fallback, no control, both helpers called as often as the fills, their compile events (the ST3 record's; not in
+    cc["events"]: the root's -COMPILE gate counts those against the first capture of any kind) before the first JOINT
+    capture and none inside a capture of either kind, at most one per helper."""
     if not s3:
         return ("%s-KFILL" % arm, True, False, "no ST3 record")
     cc = cc or {}

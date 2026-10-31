@@ -71,8 +71,10 @@ Column 0 of kid (CB1's slot, a write target never read) takes duplicate scatter 
 runs the helpers too: keep_assign_d's check counters (overflow from kfa's used / rank / miss; dup and missing from kid
 after kfb) and the byte check (_keep_bytes) run eagerly on the helpers' outputs (the GPU miniature checks every round:
 its keep gates then check ST3's map). FALLBACK (the inherited eager fill, counted per reason): "acct" (kacct), "control"
-(a keep or combo control: kneg, cneg), "kslots" (a blocked slot set), "nocc" (no compiled C / D state). The compile
-events and calls go into the state's compile record (cc: the arm's -COMPILE gate sees them) and the ST3 record.
+(a keep or combo control: kneg, cneg), "kslots" (a blocked slot set), "nocc" (no compiled C / D state). The helper
+calls are counted in the state's compile record (cc["calls"]); the compile EVENTS go into the ST3 record only (the D
+root's -COMPILE gate wants cc's events before the first capture of any kind; ST3 compiles in the first joint pass,
+after round 0's draft captures, outside any capture, as J1's F6 does): the cell's -KFILL gate checks them.
 NEGATIVE CONTROLS (tests only; tneg3): "no_age" (kage not updated: the map's eviction order changes), "remap_off" (the
 page-id remap reads the slot of the next list rank: a fork row reads another block).
 HOST COUNTS: TentState.calls["commit"] moves once per call in every mode (mode "where": the eager and the captured
@@ -522,7 +524,11 @@ class KeepFillST3:
         return None
 
     def _st3_call(self, name, l, *args):
-        """One call of the compiled helper `name` with its compile event (the I4CC record: _CCMix._cc's fields)."""
+        """One call of the compiled helper `name` with its compile event (_CCMix._cc's fields). The call count goes into
+        cc["calls"]; the EVENT goes into the ST3 record only: the D root's -COMPILE gate (r2_i4dc_compile.compile_gate_cd)
+        wants every event of cc before the arm's first capture of ANY kind, and ST3 compiles in the first joint pass,
+        after round 0's draft captures (as J1's F6 locate; -KFILL checks: before the first JOINT capture, none inside a
+        capture of either kind)."""
         f = compiled3(name, self._cc_backend)
         g0 = _graphs_now()
         t0 = time.perf_counter()
@@ -533,11 +539,9 @@ class KeepFillST3:
         cc = self.cc
         cc["calls"][name] = cc["calls"].get(name, 0) + 1
         if g1 != g0:
-            ev = dict(name=name, graphs=g1 - g0, s=round(dt, 3), layer=int(l),
-                      joint_pass=int(self.calls["joint_passes"]), capture=bool(getattr(self, "_cc_cap", False)))
-            cc["events"].append(ev)
-            cc["compile_s"] += dt
-            self._st3["events"].append(ev)
+            cap = bool(getattr(self, "_cc_cap", False)) or bool(getattr(self, "_cd_cap", False))
+            self._st3["events"].append(dict(name=name, graphs=g1 - g0, s=round(dt, 3), layer=int(l),
+                                            joint_pass=int(self.calls["joint_passes"]), capture=cap))
             self._st3["compile_s"] += dt
         return out
 
