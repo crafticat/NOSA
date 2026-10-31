@@ -108,12 +108,19 @@ PRED_INT_BY_B = {
     # 287: THE ORIGINAL ANCHOR (cell intc: C 81 pool 18, B 287; the C 128 INT composition L4PTFDGUDCDI, no BF1 / keep).
     # None until the lead registers them. MEMORY (MEASURED, r7mem): L4PTFD at C 81 B 287 peaks at 76.80 GB; the INT arm
     # adds about 0.1 GB (MODEL: ST1's private pool + the compiled helpers' buffers).
-    287: {k: None for k in PRED_KEYS_INT}}
+    # REGISTERED 2026-10-31T19:32:23Z (`date -u`) BEFORE intc, MODEL from MEASURED ratios: the INT composition gave
+    # x1.090 over its D arm at C128 B216 (inta), the components x1.052 x 1.013 (J1, J3) x 1.015 (ST1 + ST2) at C128 and
+    # x1.0515 (J1) x 1.013 (ST) at C73 -> x1.075 .. 1.105 at C81; D / SH at C81 between C128 (0.571, inta) and C73 (0.662,
+    # bf1b) -> 0.62 .. 0.66; SH at C81 B287 about 97.9 ms per step (r7mem B64 / B192 line); SHJ1 about 0.96 of SH's step.
+    287: dict(INT_vs_ref=(1.075, 1.105), INT_ratio=(0.67, 0.73), INT_vs_shj1=(0.64, 0.70),
+              INT_vs_strongest=(0.57, 0.63), INT_joint_saving=(16.0, 26.0), INT_draft_saving=(7.0, 12.0),
+              INT_commit_saving=(2.5, 4.5), INT_peak_gb=(76.6, 77.6), INT_eq=True, INT_st3_joint_saving=None,
+              INT_st3_vs_mt=None)}
 # THE CELL GRANTS (default deny; r2_int_step.sh's granted() reads these lines at <sha>): the lead sets a `date -u` stamp.
 GRANT_intm = "2026-10-31T17:03:19Z"
 GRANT_inta = "2026-10-31T17:03:19Z"
 GRANT_intb = "2026-10-31T18:16:02Z"
-GRANT_intc = None
+GRANT_intc = "2026-10-31T19:32:23Z"
 # this cell's options (main strips them before the I4DC main); the BF1 defaults are r2_bf1_cell's
 OPT = dict(st1_commit="rows", ineg=None, bf_store=0, bf_ncap=2048, bf_ring=8, bf_worker="thread", bf_acct=0,
            bf_close_wait_ms=0.0, bf_packer="gilfree", bf_threads=14, bf_cap_groups=2048, bf_late="defer",
