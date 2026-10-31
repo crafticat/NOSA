@@ -95,10 +95,10 @@ not built.
 | pin | value |
 |---|---|
 | repository | crafticat/NOSA (git remote `fork` of `/mnt/beegfs/ojerbi/nosi-r2-recon7`), branch `r2-recon7` |
-| code commit | `CODE_COMMIT_PENDING` (the repaired code; parent `028a5ecf1de346f527f38393c55b1e79ea367569`) |
+| code commit | `2d3e57fa3b52a58dfc86751b5770dddfaf93fc44` (the repaired code; parent `028a5ecf1de346f527f38393c55b1e79ea367569`) |
 | run commit (`--nosi`) | the grant commit S; precondition: `git -C /mnt/beegfs/ojerbi/nosi-r2-recon7 diff --name-only <code commit> S -- nosi ':(glob)benchmarks/Efficiency/*.py' ':(glob)benchmarks/Efficiency/*.sh'` lists only `benchmarks/Efficiency/r2_recon7_protocol.py`, and that file's diff is the one line `GRANT_r7s = "<date -u stamp>"` |
-| step script | `benchmarks/Efficiency/r2_recon7_step.sh` STEP_PINS_PENDING (the script refuses to run unless its bytes are that file at S: cmp against `git show`) |
-| cell | `benchmarks/Efficiency/r2_recon7_streams.py` CELL_PINS_PENDING |
+| step script | `benchmarks/Efficiency/r2_recon7_step.sh` sha256 `158ee291e959949b2b25347673e5a4d9f2aaa31d2304e43ef688dbaee1a4a89e` (computed on amd node thunder09), git blob `71b13f6d6feb792b060959f3f75ca70d8474af1b` (the script refuses to run unless its bytes are that file at S: cmp against `git show`) |
+| cell | `benchmarks/Efficiency/r2_recon7_streams.py` sha256 `11a7c0462f58e0a881f83b35efba318ed2599f32a69988a88a029059405a297b`, blob `2c623283ed378e4a0a00323446ed33d3953faeae`; `r2_recon7_protocol.py` at the code commit sha256 `1ede15d38a724afcf55059e8232538cfc4224e4c9d09e39eb928a11fe0f6f731` (every GRANT None) |
 | fork kernel | `benchmarks/Efficiency/fork_vllm_unified_attention.py` blob `f0dc0c183a388585e216505a6bbfc696531e8add` (fia6; sha256 `2fdbd75c4e7a6bf07ca543a3fc6a38c921e7e92ddf41f0147a765250ba80d07c`; the step script checks the blob) |
 | gathers | `nosi/nosi/flash_cache_engine/flash_h2d_mask.py` blob `f76b4f61b754adcc7cdc8eaeb22e1e96c0b74b0d`, `flash_h2d_mask_bias.py` blob `1e3630b87b84c658115aa1bd25c69c5afb03aa0e` |
 | image | `/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif` (23,079,374,848 B) sha256 `14bfb15e1258821e637b5936f2060d7c7c2be20410fdee2a54ee0ffef754734a` (the record `/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif.sha256`, 2026-09-03); CHECKED inside the step on the GPU node by `/usr/bin/sha256sum` before the image starts (exit 6 on a mismatch) |
