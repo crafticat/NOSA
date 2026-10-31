@@ -96,6 +96,7 @@ I4H_LATER = I4H_LATER + ("r2_recon7_protocol.py", "r2_recon7_probe.py", "r2_reco
 # (its own Gate 0: tests_cpu/test_j1.py)
 I4H_NEW = I4H_NEW + ("benchmarks/Efficiency/r2_j1_select.py", "benchmarks/Efficiency/r2_j1_cell.py",
                      "benchmarks/Efficiency/r2_j1_step.sh", T_ + "test_j1.py", "docs/NOTES_j1.md")          # J1
+I4H_NEW = I4H_NEW + ("benchmarks/Efficiency/r2_j1_forkbench.py",)                                         # J1
 
 
 def _load(name, path=None):

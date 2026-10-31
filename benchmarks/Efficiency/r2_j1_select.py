@@ -100,7 +100,41 @@ def _copy_fn(fn, suffix: str):
 
 
 pool_sh_fn = _copy_fn(pool_fn, "_sh")                  # the matched baseline's copy (ShPool: dynamic shapes)
-FNS = dict(pool=pool_fn)
+
+
+def loc_fn(v, bm, pm, fullv, big, arw, arp, topk: int, nb: int):
+    """F6: the I4CC loc1 helper's outputs (valid, in_win, wslot, in_pool, pslot, keyh) WITHOUT the two sorts of the
+    window / pool maps: an INVERSE TABLE per (head, request), block id -> slot, made by one scatter of the slot index
+    (ids outside [0, nb) and -1 go to a dump column nb), then one gather at the row ids. v (H, B, R x T) int64 (ids <
+    nb: the pooled width, the top-k's range); bm (H, B, T), pm (H, B, P) the maps; arw / arp (T,) / (P,) int64 aranges.
+    Valid ids are unique in a map, so the slot equals the sorted search's slot; where a row id is not in the map, the
+    slot value differs from the sorted search's but no consumer reads it there (loc2 reads wslot under in_win and pslot
+    under in_pool only)."""
+    valid = v >= 0
+    at = v.clamp(0, nb - 1)
+    bmi = bm.long()
+    wi = torch.where((bmi >= 0) & (bmi < nb), bmi, nb)
+    invw = torch.full(bm.shape[:-1] + (nb + 1,), -1, dtype=torch.int64, device=bm.device)
+    invw = invw.scatter(-1, wi, arw.expand_as(wi))
+    wslot = invw.gather(-1, at)
+    in_win = valid & (wslot >= 0)
+    if pm is not None:
+        pmi = pm.long()
+        pi = torch.where((pmi >= 0) & (pmi < nb), pmi, nb)
+        invp = torch.full(pm.shape[:-1] + (nb + 1,), -1, dtype=torch.int64, device=pm.device)
+        invp = invp.scatter(-1, pi, arp.expand_as(pi))
+        ps = invp.gather(-1, at)
+        in_pool = valid & (ps >= 0) & ~in_win
+        pslot = ps + topk
+    else:
+        in_pool = torch.zeros_like(valid)
+        pslot = torch.zeros_like(v)
+    host = valid & fullv & ~in_win & ~in_pool
+    keyh = torch.where(host, v, big)
+    return valid, in_win, wslot, in_pool, pslot, keyh
+
+
+FNS = dict(pool=pool_fn, loc=loc_fn)
 _COMPILED = {}
 
 
@@ -219,7 +253,7 @@ def _make(STF):
         """The compiled joint pooling on an I4DC state (a mixin before the I4DC state class in the MRO; the runner
         re-classes the state that the I4DC runner built)."""
 
-        def _j1_setup(self, backend: str, j1neg, draft: bool = True):
+        def _j1_setup(self, backend: str, j1neg, draft: bool = True, f6: bool = True):
             if backend not in CC.BACKENDS:
                 raise SpecError("compile backend %r (one of %s)" % (backend, CC.BACKENDS))
             if j1neg not in J1NEG:
@@ -232,6 +266,87 @@ def _make(STF):
             self._j1_t = None                                          # the constant index tensors (first call)
             self._j1_ref = None                                        # PEQ scratch (first check)
             self._j1_dt = None                                         # the draft's index tensors and scratch
+            self._j1_f6 = bool(f6)                                     # F6: the inverse-table locate
+            self._j1_lt = None                                         # F6's aranges (first call, eager)
+            self.j1.update(f6=bool(f6), f6calls=0)
+
+        # ---------------------------------------------------------- F6: the joint section's locate without sorts
+        def _j1_loc(self, l, v, eng, fullv, vs):
+            """The I4CC loc1 outputs by loc_fn (compiled; module docstring F6). Called inside the joint section (eager,
+            warm or under the capture: the compiled call is then a kernel node of the CPU stand-in, as I4CC's)."""
+            t = self._j1_lt
+            if t is None:
+                dev = v.device
+                T = int(eng._block_map.shape[-1])
+                P = int(eng._pool_map.shape[-1]) if self.rs.pool else 1
+                t = self._j1_lt = dict(arw=torch.arange(T, dtype=torch.int64, device=dev),
+                                       arp=torch.arange(P, dtype=torch.int64, device=dev), nb=int(vs.pq.shape[-1]))
+            f = compiled("loc", self._j1_backend)
+            args = (v, eng._block_map, eng._pool_map if self.rs.pool else None, fullv, vs.big, t["arw"], t["arp"],
+                    int(vs.topk), t["nb"])
+            from torch._dynamo.utils import counters as C
+            g0 = int(C["stats"]["unique_graphs"])
+            cap = _capturing() or bool(getattr(self, "_cc_cap", False)) or bool(getattr(self, "_cd_cap", False))
+            t0 = time.perf_counter()
+            wrap = getattr(self, "_cc_wrap", None)
+            out = wrap("j1loc", f, args) if wrap is not None else f(*args)
+            dt = time.perf_counter() - t0
+            g1 = int(C["stats"]["unique_graphs"])
+            self.j1["f6calls"] += 1
+            if g1 != g0:
+                self.j1["events"].append(dict(graphs=g1 - g0, s=round(dt, 3), layer=int(l), capture=cap, kind="f6",
+                                              joint_pass=int(self.calls["joint_passes"])))
+                self.j1["compile_s"] += dt
+            return out
+
+        # ---------------------------------------------------------- the I4CC _cc_locate, COPIED (F6: no map sorts)
+        def _cc_locate(self, l, eng, sel, sel_c, is_q, is_n, hp, vs, fetch: bool):
+            """The I4CC _cc_locate with the window / pool sorts and loc1 replaced by _j1_loc (lines marked "# J1")."""
+            if not self._j1_f6:                                                                       # J1
+                return super()._cc_locate(l, eng, sel, sel_c, is_q, is_n, hp, vs, fetch)             # J1
+            rs = self.rs
+            H, B, R, T = sel.shape
+            st = vs.ops.stats
+            v = sel_c.view(H, B, R * T)
+            if vs.ops.check:                                           # CHECK-ONLY: the dropped test, recounted
+                self.hoist_next += ((v == hp.qb1.view(1, B, 1)) & (v >= 0)).sum()
+            valid, in_win, wslot, in_pool, pslot, keyh = self._j1_loc(l, v, eng, hp.fullv, vs)                 # J1
+            s = torch.sort(keyh, dim=-1).values
+            out = self._cc("loc2", l, s, v, valid, in_win, wslot, in_pool, pslot, sel, is_q, is_n, self._eb[l],
+                           self._sb1, self.cb0_id, vs.store_b.view(1, B, 1, 1), vs.lst_buf, vs.host_x, vs.minus1,
+                           vs.big, self._cap_t, int(vs.cap), int(VR.FORK_BIG), bool(fetch), bool(st))
+            lst = vs.lst_buf[..., :vs.cap]
+            if st:                                                     # accounting (_locate_h's, on the outputs)
+                first, keep, in_lst = out[3:]
+                full, res = hp.full, hp.res
+                FORK_BIG = VR.FORK_BIG
+                cap = vs.cap
+                sx = vs.stat
+                rolev = (full | res).t().reshape(1, B, R, 1).expand(H, B, R, T).reshape(H, B, R * T)
+                n_host = keep.to(torch.int64).sum(-1)
+                n_all = first.to(torch.int64).sum(-1)
+                sp = torch.sort(torch.where(in_pool & rolev, v, vs.big), dim=-1).values
+                fp = torch.ones_like(sp, dtype=torch.bool)
+                fp[..., 1:] = sp[..., 1:] != sp[..., :-1]
+                fp &= sp < FORK_BIG
+                n_pool = fp.to(torch.int64).sum(-1)
+                sx["extras"] += n_all.sum() + n_pool.sum()
+                sx["extras_host"] += n_host.sum()
+                sx["extras_pool"] += n_pool.sum()
+                sx["extras_max"] = torch.maximum(sx["extras_max"], n_host.max())
+                sx["unserved"] += (n_all - cap).clamp(min=0).sum()
+                sx["fills_used"] += (n_host.sum() > 0).to(torch.int64)
+                sx["pool_reads"] += (in_pool & rolev).sum()
+                sx["store_reads"] += (in_lst & rolev).sum()
+                su = torch.sort(torch.where(valid & rolev, v, vs.big), dim=-1).values
+                fu = torch.ones_like(su, dtype=torch.bool)
+                fu[..., 1:] = su[..., 1:] != su[..., :-1]
+                fu &= su < FORK_BIG
+                n_u = fu.to(torch.int64).sum(-1)
+                sx["union_sum"] += n_u.sum()
+                sx["union_max"] = torch.maximum(sx["union_max"], n_u.max())
+                vs.stat_n["union"] += H * B
+            return out[:3], lst
 
         def _j1_call(self, l, kind: str, args):
             """One call of the compiled pooling with its compile event (module docstring, COMPILE). Inside a draft
@@ -463,7 +578,8 @@ def _make(STF):
                         peq_vals=int(j["peq_vals"].item()), peq_layers=int(j["peq_layers"]),
                         draft=bool(j["draft"]), dlayers=int(j["dlayers"]), dwarm=int(j["dwarm"]),
                         dpeq_bad=int(j["dpeq_bad"].item()), dpeq_vals=int(j["dpeq_vals"].item()),
-                        dpeq_layers=int(j["dpeq_layers"].item()), backend=self._j1_backend, j1neg=self.j1neg)
+                        dpeq_layers=int(j["dpeq_layers"].item()), f6=bool(j.get("f6")), f6calls=int(j.get("f6calls", 0)),
+                        backend=self._j1_backend, j1neg=self.j1neg)
 
     out = {}
     for arm, base in ARMS_J1.items():
@@ -476,12 +592,13 @@ def _make(STF):
                 compiled draft pooling inside the draft graphs (F2). Keyword arguments: the I4DC runner's, j1neg
                 (J1NEG, tests only), j1draft (default True)."""
 
-                def __init__(self, *args, j1neg=None, j1draft=True, **kw):
+                def __init__(self, *args, j1neg=None, j1draft=True, j1f6=True, **kw):
                     if j1neg not in J1NEG:
                         raise SpecError("unknown J1 control %r (one of %s)" % (j1neg, J1NEG))
-                    self._j1neg, self._j1draft = j1neg, bool(j1draft)
+                    self._j1neg, self._j1draft, self._j1f6 = j1neg, bool(j1draft), bool(j1f6)
                     super().__init__(*args, **kw)
-                    self.meta.setdefault("compile", {}).update(arm=arm, j1neg=j1neg, j1draft=bool(j1draft))
+                    self.meta.setdefault("compile", {}).update(arm=arm, j1neg=j1neg, j1draft=bool(j1draft),
+                                                               j1f6=bool(j1f6))
 
                 def _arm_name(self):
                     return arm
@@ -489,7 +606,7 @@ def _make(STF):
                 def _make_state(self, rs, attn, tneg, poison):
                     T = super()._make_state(rs, attn, tneg, poison)
                     T.__class__ = S                                    # the I4DC state, re-classed (same attributes)
-                    T._j1_setup(getattr(T, "_cc_backend", "inductor"), self._j1neg, self._j1draft)
+                    T._j1_setup(getattr(T, "_cc_backend", "inductor"), self._j1neg, self._j1draft, self._j1f6)
                     return T
 
                 @torch.inference_mode()
@@ -769,15 +886,18 @@ def j1_gates(arm: str, rd, L: int, check_rounds: bool = True) -> list:
     ev = j.get("events") or []
     kinds = [e.get("kind", "joint") for e in ev]
     peq_ok = j.get("peq_layers", 0) > 0 and j.get("peq_bad") == 0 and j.get("peq_vals", 0) > 0
-    comp_ok = (all(kinds.count(k) <= 1 for k in set(kinds)) and set(kinds) <= {"joint", "draft_warm"}
+    sections = ((rd or {}).get("compile") or {}).get("sections")         # the I4CC compiled sections (python calls)
+    f6_ok = (not j.get("f6")) or (j.get("f6calls", 0) == sections and (sections or 0) > 0)
+    comp_ok = (all(kinds.count(k) <= 1 for k in set(kinds)) and set(kinds) <= {"joint", "draft_warm", "f6"}
                and not any(e.get("capture") for e in ev) and not j.get("fallback")
-               and j.get("calls") == jp * int(L) and jp > 0)
+               and j.get("calls") == jp * int(L) and jp > 0 and f6_ok)
     out = [("%s-J1-PEQ" % arm, True, bool(peq_ok),
             "joint pooling bits vs the shipped kernel: %s differing of %s values in %s checked layers" % (
                 j.get("peq_bad"), j.get("peq_vals"), j.get("peq_layers"))),
            ("%s-J1-COMPILE" % arm, True, bool(comp_ok),
-            "calls %s (joint passes %s x L %s); fallback %s; compile events %s; compile %s s; backend %s" % (
-                j.get("calls"), jp, L, j.get("fallback"), ev, j.get("compile_s"), j.get("backend")))]
+            "calls %s (joint passes %s x L %s); F6 %s calls %s (compiled sections %s); fallback %s; compile events %s; "
+            "compile %s s; backend %s" % (j.get("calls"), jp, L, j.get("f6"), j.get("f6calls"), sections,
+                                         j.get("fallback"), ev, j.get("compile_s"), j.get("backend")))]
     if j.get("draft"):
         dg = (rd or {}).get("dgraph") or {}
         want = int(dg.get("capture_passes", 0)) * int(L)

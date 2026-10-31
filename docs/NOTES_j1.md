@@ -84,6 +84,50 @@ Tree /mnt/beegfs/ojerbi/nosi-r2-j1 (branch r2-j1) on RECON7 cd0f0c5. SOURCE ONLY
   RECON7_R2_joint.md:203). RECOMMENDATION: build the keep J3 arm only if j1a shows J3-JOINT-SAVING + J3-DRAFT-SAVING
   above the run spread at C 128.
 
+## 2d. F6 (fourth commit): the joint section's locate without the map sorts (J1 and J3 arms; runner keyword j1f6)
+
+- MEASURED (r7pa, R/recon7_pa1_2195631_r7pa summary.json, the BEST arm's labelled joint window, round 112): the
+  section's SELECT class 4.30 ms, of which radixSortKVInPlace<..., 4> 2.46 ms (96 kernels = 3 per layer: the window
+  map, the pool map and the host key) and <..., 32> 1.34 ms (32 kernels: the row-list key).
+- CODE: r2_i4cc_compile.py:319-325 sort the window and pool maps only to find a row id's slot with searchsorted
+  (loc1_fn, :108-124). F6 (r2_j1_select.loc_fn) builds per (head, request) an inverse table block id -> slot by ONE
+  scatter of the slot index and reads it with ONE gather; the host-key and row-list sorts stay (the fork needs the
+  ascending lists). Exact: valid ids are unique in a map; wslot / pslot are read only under in_win / in_pool (loc2_fn,
+  :144). `_cc_locate` is copied with 3 lines marked "# J1" (tests_cpu/test_j1.py::test_cc_locate_copy).
+- Expected: about 2/3 of the 2.46 ms short sorts (2 of 3 per layer) = 1.6 ms per joint pass, minus the scatter / gather
+  (about 32 x 10 us = 0.3 ms): about 1.3 ms per round at C 128 (MODEL), C 73 similar per row count (x1.47: about 1.9).
+- Gates: J1-COMPILE (one "f6" compile, not in a capture, F6 calls = the compiled sections), the I4CC COMPILE gate with
+  loc1 left out of the J1 arms' helper list (the cell), EQF.
+
+## 2e. j1f (fifth commit): the fork microbench, matched (benchmarks/Efficiency/r2_j1_forkbench.py)
+
+- Why: the ledger's 0.885 vs 1.53 TB/s compares the fork (4 rows, union pages, per-row masks, no split) with the
+  draft's one-row flash call A (1 row, own window, split-KV 4). That pair is UNMATCHED in rows and bytes.
+- What: synthetic pages (seeded, x 0.05 bf16) of the MEASURED shapes (B 216 at C 128, B 318 at C 73). Each request has
+  4 rows of 64 pages, shifted by (0, 3, 5, 8) pages: union 72 per (KV head, request) (MEASURED 72.2 / 72.24). One pass
+  = 32 calls (one per layer). Variants (existing ops only: the fork blob f0dc0c1, flash_attn_nosa, torch):
+  FORK (shipped: FORK_LAUNCH w4 s3 t64, bf16 CIS bias, union built in the kernel); FORKT (union tables built before);
+  FORK3D2 / 4 / 8 (the fork's existing 3D path: seq_threshold_3D = B, n segments, reduce_segments); FORK1R (the fork,
+  1 row per request, BLOCK_Q 1); NS1R1 (flash call, 1 row, own 64 pages, split 4); NS1x4 (flash call, 4 rows, each
+  its own 64-page window); FLASHU1 (flash call, 1 row over the 72 union pages); NSRU (flash call, 4 rows over ONE union
+  window per request through cache_batch_idx and per-entry masking bias rows: verify_rows route 1).
+- Matched ratios: FORK / FLASHU1 (equal logical bytes); FORK1R / NS1R1 (equal rows and bytes); FORK / NS1x4 (equal
+  rows); FORKT / FORK (the in-kernel union build); FORK3Dn / FORK; NSRU / FORK. Per variant: median ms per pass and per
+  call, logical bytes per call (pages x 32,896 B x KV heads x requests or entries) and logical TB/s.
+- Gates (MUST unless noted): <shape>-RUN; <shape>-UNION (FORK union_len = 72, FORK1R = 64 everywhere);
+  <shape>-<v>-NUM (max |out - float64 reference| <= 1e-3 on 8 sampled requests, every row and head; FORK3Dn REPORT);
+  <shape>-FORKT-EQ (FORKT = FORK bit for bit); <shape>-<v>-EXACT (output after the last timed pass = the first output,
+  bit for bit; FORK3Dn REPORT); <shape>-FORK3Dn-PATH (REPORT: the NaN-filled segment maxima were written, so the 3D
+  launch ran); <shape>-BUDGET (300 s); RUN-WALL (900 s). A ratio with a member that fails NUM, EXACT or PATH is
+  INVALID. Order rotation per pass (lesson L62), 2 warm-up passes per variant, 10 timed passes.
+- Decision rules (the lead's): (1) FORK3Dn best ratio <= 0.95 with PATH, NUM and EXACT: the 3D split is a candidate
+  (a launch option, not a kernel edit; it changes the float order, so it needs its own EQF check in the joint arm).
+  (2) FORK1R / NS1R1 > 1.2: the fork kernel has a per-byte gap at equal work (structural; F5 of the brief). (3) FORK /
+  FLASHU1: the cost of the 4-row tile at equal bytes; FORK - FLASHU1 x 32 is the most a rate fix could save per pass.
+  (4) FORK / NS1x4 < 1: the shared read already beats the baseline's 4 calls.
+- CPU: tests_cpu/test_j1.py::test_forkbench_pure (work, row pages, rotation, summarize, INVALID marking, default deny,
+  argument checks) and test_step_script_j1 (the j1f case and its arguments).
+
 ## 3. The reuse line (the lead's rule: upstream basis, incompatibility or cost, minimal adaptation, validation)
 
 - Upstream basis: NOSA's `nosa_pool_kernel` (nosi/nosi/max_pooling_fused.py:7-75) as forked per request in
@@ -126,6 +170,7 @@ Registration: `PRED_J1_BY_B` + `PRED_STAMP_J1` (the builder's MODEL is the comme
 | j1m | C 73 pool 10, B 8, 72 steps, check every round, stress | L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDJ1,L4PTFDGUDKWCDJ1,L4PTFDGUDCDJ3 | 35 / 100G | `bash benchmarks/Efficiency/r2_j1_step.sh --nosi <sha> <holder> <run> j1m` |
 | j1a | C 128 pool 65, B 216, 512 steps | L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDJ1,L4PTFDGUDCDJ3 | 125 / 240G | `... j1a` |
 | j1b | C 73 pool 10, B 318, 512 steps | L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDJ1 | 170 / 340G | `... j1b` |
+| j1f | no model, no workload; shapes B 216 / B 318, union 72, segments 2,4,8, 32 calls x 10 passes | (section 2e variants; grant GRANT_j1f in r2_j1_forkbench.py) | 25 / 64G | `... j1f` |
 
 MUST gates per J1 arm: every gate of its I4DC arm under the J1 name (RUN, ERR, COMMIT-N, D1, D3, SPAN, RESID, ATTN1,
 FILL1, LEAN, MEM, GRAPH, COUNTS, DGRAPH, HOIST, the keep gates, COMPILE, EQF = L4PTFD bitwise), J1-PEQ (0 differing
@@ -153,7 +198,7 @@ Expected (MODEL; per round = per joint pass, the draft unchanged):
 | D = n G(B) + G(BK): shapes and calls | 3 G(B) + G(3B) per cohort, two call sets; shared weights | 2 G(B) + G(4B) per round, ONE call per weight over 4B rows (129 launches per pass); 64.80 / 79.88 ms joint | +1.35 / -10.09 vs the two-call charge | MEASURED: shared weight reads hold; reference above M 768 extrapolated | none (lead owns dense) | - |
 | extra = td (1 - f)(U - I)/63: union U, ready I | U 69.16, I 60.19 (AUTHOR, historical, four requests, teacher-forced) | LOGICAL union 71.18 + 1.06 tail per (layer, KV head, request), C 73 check arm only; I live: MISSING (no live ready-set counter) | x0.99 logical (C 73) | MEASURED logical; C 128 and live I MISSING | X3: VerifyOps(stats) in a C 128 miniature (j1m can carry it later) | - |
 | physical HBM vs logical union bytes | one read per union page | fork DRAM 1.017-1.021 x union (ncu, fia6 microbench on real tables); live pass MISSING | about +2 % | MEASURED (microbench) | X2 ncu on one live fork launch | - |
-| attention tiling / masks / per-request independence | KV time hidden by max(H, D) | fork 37.1 / 52.2 ms; 64-row tile, 2 programs per SM (255 regs, 59 KB smem), 8.1 us per tile, 2 waves x 75.8 tiles; X1: A and F do NOT overlap on two streams (97.8 vs 100.2 ms serial) | +11.6 / +14.7 above the model's extra; 0.885 vs 1.527 TB/s logical | MEASURED (fia5 TTGIR + ncu): occupancy and synchronous per-tile loads; 11 launch configs swept | none without a kernel edit (BLOCKER); 3D split = tail balance only (<= 10 %) | - |
+| attention tiling / masks / per-request independence | KV time hidden by max(H, D) | fork 37.1 / 52.2 ms; 64-row tile, 2 programs per SM (255 regs, 59 KB smem), 8.1 us per tile, 2 waves x 75.8 tiles; X1: A and F do NOT overlap on two streams (97.8 vs 100.2 ms serial) | +11.6 / +14.7 above the model's extra; 0.885 vs 1.527 TB/s logical | MEASURED (fia5 TTGIR + ncu): occupancy and synchronous per-tile loads; 11 launch configs swept | none without a kernel edit (BLOCKER); 3D split = tail balance only (<= 10 %); j1f measures it MATCHED (FORK / FLASHU1, FORK1R / NS1R1, FORK3Dn / FORK) | PENDING j1f |
 | selection (verify rows) | 0 (B draft rows inside td) | stage 1 9.82 / 13.54, POOLING 12.28 / 18.10, top-k 2.91 / 4.12, small 2.30 ms per joint pass | +17.83 / +24.43 (3B rows) | MEASURED: pooling = one program per output element (grid-bound, about 98 % of its time) | F1 (this rung): compiled gather + max, bitwise | PENDING j1a / j1b |
 | gather / materialization | none | cis copy to R rows (H, B, R, Lk) per layer; chain images (AREA 3); H2D gathers (AREA 2) | small (cis copy < 1 ms) | CODE | F1 removes the cis copy | PENDING |
 | launch overhead | td includes its own launches | BEST joint non-busy about 6.3 / about 0 ms (MODEL labels); 2L draft graphs + L eager residencies; passes device-bound (busy 0.94-0.96 of elapsed, L4PTFD profile) | +6.3 / 0 | MODEL (exposed host time only at pass start) | F3 (arm L4PTFDGUDCDJ3): residency inside the joint and draft graphs via the shifted-age frame | PENDING j1a (expected 0-9, central 3 ms per round) |

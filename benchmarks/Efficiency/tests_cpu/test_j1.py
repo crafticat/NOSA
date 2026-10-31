@@ -61,7 +61,8 @@ STEP_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-j1"
 HOLDER = "2190876"                     # a lead-owned uuid file that exists (HOLDERS/2190876.gpu_uuid)
 T_ = "benchmarks/Efficiency/tests_cpu/"
 E_ = "benchmarks/Efficiency/"
-J1_NEW = (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", T_ + "test_j1.py", "docs/NOTES_j1.md")
+J1_NEW = (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", T_ + "test_j1.py", "docs/NOTES_j1.md",
+          E_ + "r2_j1_forkbench.py")
 J1_DECL = tuple(T_ + "test_%s.py" % n for n in ("wsa", "wsb", "wsc", "i2", "i3", "i4a", "i4g", "i4d", "i4k", "i4u", "i4h",
                                                    "i4s", "i4cc", "i4dc", "recon7"))
 SELECT_IMPORTS = {"torch", "time", "types", "r2_i4dc_compile"}
@@ -91,6 +92,7 @@ X = _load("i4dc_world")
 TS = _load("test_i4s")
 CD, CC, L, N0 = X.CD, X.CC, X.L, X.N0
 X.XC.MUT.update(j1pool=(8, 9))         # the written arguments of the J1 pooling call (pq, pc): the capture stand-in
+X.XC.MUT.update(j1loc=())              # F6's locate writes no argument (it returns new tensors)
 
 
 def _git(*args):
@@ -133,7 +135,7 @@ def test_j1_gate0_files():
     mods = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     mods |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
     assert {m for m in mods if not m.startswith("torch.")} == SELECT_IMPORTS, mods
-    for name in ("r2_j1_select.py", "r2_j1_cell.py"):                  # NO HAND-WRITTEN KERNEL; no later rung's name
+    for name in ("r2_j1_select.py", "r2_j1_cell.py", "r2_j1_forkbench.py"):   # NO HAND-WRITTEN KERNEL; no later rung
         text = (EFF / name).read_text()
         assert not [w for w in HAND_KERNEL if w in text], (name, [w for w in HAND_KERNEL if w in text])
         assert not [w for w in LATER_NAMES if w in text], (name, [w for w in LATER_NAMES if w in text])
@@ -377,7 +379,10 @@ def test_j1_equals(case):
     assert j["peq_bad"] == 0 and j["peq_vals"] > 0
     assert j["draft"] and j["dwarm"] == 1 and j["dlayers"] == rd["dgraph"]["capture_passes"] * L > 0   # F2 ran
     assert j["dpeq_layers"] > 0 and j["dpeq_bad"] == 0 and rd["dgraph"]["replay_passes"] >= 10
-    assert not any(e["capture"] for e in j["events"]) and {e["kind"] for e in j["events"]} <= {"joint", "draft_warm"}
+    assert not any(e["capture"] for e in j["events"]) and {e["kind"] for e in j["events"]} <= {"joint", "draft_warm",
+                                                                                              "f6"}
+    assert j["f6"] and j["f6calls"] == rd["compile"]["sections"] > 0                     # F6 ran in every section
+    assert rd["compile"]["calls"].get("loc1", 0) == 0                                     # the I4CC loc1: not called
     bad = TS._diff(b, x, skip=("compile", "j1"))
     assert bad == [], bad[:10]                                         # = its I4DC arm in everything but the records
     skip = ("hoist", "keep", "round_blocks", "compile", "j1") if keep else ("hoist", "compile", "j1")
@@ -431,6 +436,67 @@ def test_j1_plant_wrong_req():
     assert J1.j1_gates("L4PTFDGUDCDJ1", p["rd"], L)[0][2] is False
     with pytest.raises(X.SR.SpecError):
         j1_builder("GUDCDJ1", j1neg="nope")(*X.world(2, 8)[:5])
+
+
+# ------------------------------------------------------------------ F6: the locate without the map sorts
+def _linputs(seed: int, pool: bool):
+    """loc1's inputs at world-like shapes with adversarial maps: H 2, B 5, R 4, T 8 (topk), P 6 (pool), nb 40 block
+    ids; window ids unique per (head, request), pool ids unique and disjoint from the window's, -1 holes; row ids with
+    -1, ids in the window, in the pool, in neither; fullv random."""
+    g = torch.Generator().manual_seed(seed)
+    H, B, R, T, P, nb = 2, 5, 4, 8, 6, 40
+    bm = torch.full((H, B, T), -1, dtype=torch.int64)
+    pm = torch.full((H, B, P), -1, dtype=torch.int64)
+    for h in range(H):
+        for b in range(B):
+            perm = torch.randperm(nb, generator=g)
+            nw, npool = int(torch.randint(3, T + 1, (1,), generator=g)), int(torch.randint(0, P + 1, (1,), generator=g))
+            slots = torch.randperm(T, generator=g)[:nw]
+            bm[h, b, slots] = perm[:nw]
+            ps = torch.randperm(P, generator=g)[:npool]
+            pm[h, b, ps] = perm[nw:nw + npool]
+    v = torch.randint(-1, nb, (H, B, R * T), generator=g)
+    fullv = torch.rand(H, B, R * T, generator=g) > 0.3
+    return dict(v=v, bm=bm, pm=pm if pool else None, fullv=fullv, big=torch.tensor(2 ** 31 - 1),
+                arw=torch.arange(T), arp=torch.arange(P), topk=T, nb=nb)
+
+
+def test_loc_fn_equal():
+    """F6: loc_fn (eager and Inductor) = the I4CC loc1 helper on the sorted maps, for every consumed value (valid,
+    in_win, in_pool, keyh everywhere; wslot under in_win, pslot under in_pool), with and without the pool."""
+    J1 = _mod("r2_j1_select")
+    CC.configure()
+    comp = torch.compile(_fresh(J1.loc_fn), fullgraph=True, dynamic=False, backend="inductor")
+    n = 0
+    with torch.inference_mode():
+        for seed in range(4):
+            for pool in (True, False):
+                I = _linputs(seed, pool)
+                ws, wi = torch.sort(I["bm"], dim=-1)
+                ps, pi = torch.sort(I["pm"], dim=-1) if pool else (None, None)
+                ref = CC.loc1_fn(I["v"], ws, wi, ps, pi, I["fullv"], I["big"], I["topk"])
+                for fn in (J1.loc_fn, comp):
+                    got = fn(I["v"], I["bm"], I["pm"], I["fullv"], I["big"], I["arw"], I["arp"], I["topk"], I["nb"])
+                    for k in (0, 1, 3, 5):                             # valid, in_win, in_pool, keyh
+                        assert torch.equal(got[k], ref[k]), (seed, pool, k)
+                    assert torch.equal(torch.where(ref[1], got[2], 0), torch.where(ref[1], ref[2], 0))
+                    assert torch.equal(torch.where(ref[3], got[4], 0), torch.where(ref[3], ref[4], 0))
+                assert ref[1].any() and (ref[3].any() or not pool) and (I["v"] < 0).any()    # L34: every case met
+                n += 1
+    _ev("J1 F6 LOC: %d variants (seed, pool): loc_fn = I4CC loc1 on the sorted maps for every consumed value" % n)
+
+
+def test_cc_locate_copy():
+    J1 = _mod("r2_j1_select")
+    S = J1.j1_classes(X.STF)["L4PTFDGUDCDJ1"][0]
+    M = next(c for c in S.__mro__ if c.__name__ == "_CCMix")
+    mine, orig = _dedented(S._cc_locate), _dedented(M._cc_locate)
+    core = [x for x in mine if not x.rstrip().endswith("# J1")]
+    extra = [x for x in mine if x.rstrip().endswith("# J1")]
+    i0 = next(i for i, x in enumerate(orig) if "ws, wi = torch.sort(eng._block_map" in x)
+    gone = orig[i0:i0 + 7]                                            # the two sorts and the loc1 call
+    assert "loc1" in gone[-2] and len(extra) == 3 and "_j1_loc(" in extra[-1], (gone, extra)
+    assert core == orig[:i0] + orig[i0 + 7:], [(i, a, b) for i, (a, b) in enumerate(zip(core, orig)) if a != b][:3]
 
 
 # ------------------------------------------------------------------ F3: the residency in the graphs
@@ -663,6 +729,48 @@ def test_sh_j1():
     assert C.main(["--sh-j1", "2", "--out", "x", "--workload", "w"]) == 20
 
 
+# ------------------------------------------------------------------ the fork microbench (pure parts)
+def test_forkbench_pure():
+    FB = _mod("r2_j1_forkbench")
+    SEL = _mod("r2_j1_select")
+    VRm = X.W.pkg_load("verify_rows")
+    assert FB.FORK_LAUNCH == VRm.FORK_LAUNCH and FB.MASK_BIAS == VRm.MASK_BIAS and FB.R == VRm.FORK_ROWS
+    assert FB.UNION == 72 and FB.BLOCK_BYTES == 32896 and FB.GRANT_j1f is None and not FB.granted("j1f")
+    assert FB.main(["--out", "x", "--cell", "j1f"]) == 20                # default deny
+    pages, last = FB.row_pages(3, 2)
+    assert pages[0] == 3 * 72 + 5 and len(pages) == 64 and pages == sorted(pages) and last == 42
+    u = set()
+    for r in range(4):                                                  # the rows' union = 72 pages per request
+        u |= set(FB.row_pages(0, r)[0])
+    assert u == set(range(72))
+    B = 216
+    w = {v: FB.work(v, B) for v in FB.variants((2, 4))}
+    assert w["FORK"] == w["FORKT"] == w["FORK3D2"] == dict(rows=864, pages=2 * 216 * 72)
+    assert w["FLASHU1"]["pages"] == w["FORK"]["pages"] and w["FLASHU1"]["rows"] == 216        # equal bytes
+    assert w["FORK1R"] == w["NS1R1"] == dict(rows=216, pages=2 * 216 * 64)                     # equal rows and bytes
+    assert w["NS1x4"] == dict(rows=864, pages=2 * 864 * 64)                                     # equal rows
+    assert w["NSRU"]["pages"] == 2 * 216 * (64 + 67 + 69 + 72)
+    assert FB.rotation(["a", "b", "c"], 4) == ["b", "c", "a"]
+    times = {v: [32.0 * (1.0 + 0.1 * i)] * 3 for i, v in enumerate(FB.variants((2,)))}
+    times["FORK"] = [32.0 * 1.2] * 3
+    times["FLASHU1"] = [32.0 * 0.6] * 3
+    times["FORK3D2"] = [32.0 * 1.08] * 3
+    valid = {v: True for v in times}
+    valid["NSRU"] = False
+    s = FB.summarize(times, B, 32, valid, (2,))
+    assert s["per"]["FORK"]["ms_call"] == 1.2 and s["ratios"]["FORK/FLASHU1"]["ratio"] == 2.0
+    assert s["per"]["FORK"]["logical_tb_s"] == round(2 * 216 * 72 * 32896 / (1.2 * 1e-3) / 1e12, 4)
+    assert s["ratios"]["NSRU/FORK"]["valid"] is False and "INVALID" in s["ratios"]["NSRU/FORK"]["note"]
+    assert s["fork_minus_flashu1_ms_per_pass"] == round(0.6 * 32, 3)
+    assert s["best_3d"] == dict(variant="FORK3D2", ratio=0.9, saving_ms_per_pass=round(0.12 * 32, 3))
+    assert {"FORK/FLASHU1", "FORK1R/NS1R1", "FORK/NS1x4", "FORKT/FORK", "NSRU/FORK", "FORK3D2/FORK"} == set(s["ratios"])
+    for bad in (["--out", "x", "--segments", "1"], ["--out", "x", "--reps", "2"], ["--out", "x", "--shapes", "a"]):
+        with pytest.raises(SystemExit):
+            FB.parse_args(bad)
+    assert SEL is not None
+    _ev("J1F PURE: work per variant %s; ratios %s" % (w, {k: v["ratio"] for k, v in s["ratios"].items()}))
+
+
 # ------------------------------------------------------------------ CELL
 def test_j1_cell_tables():
     C, D = _cell()
@@ -675,7 +783,8 @@ def test_j1_cell_tables():
     assert "L4PTFDGUDCDJ3" in D.GRAPH_ARMS and "L4PTFDGUDCDJ3" not in D.KEEP_ARMS
     assert D.runner_choice("L4PTFDGUDCDJ3", False) == ("SCD", dict(cc_backend="inductor"))
     assert D.ROOT_ARM["L4PTFDGUDCDJ1"] == "L4PTFDGUD" and D.ROOT_ARM["L4PTFDGUDKWCDJ1"] == "L4PTFDGUDKW"
-    assert D.NAMES["L4PTFDGUDCDJ1"] == I4DC.NAMES["L4PTFDGUDCD"] and "L4PTFDGUDKWCDJ1" in D.KEEP_ARMS
+    assert D.NAMES["L4PTFDGUDCDJ1"] == tuple(n for n in I4DC.NAMES["L4PTFDGUDCD"] if n != "loc1")   # F6
+    assert "L4PTFDGUDKWCDJ1" in D.KEEP_ARMS
     assert C.configure() is D                                          # idempotent
     base = ["--out", "x", "--workload", "w"]
     for arms in ("L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDJ1", "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDJ1",
@@ -760,6 +869,13 @@ def test_step_script_j1():
         assert ("%s) POOL=%d BATCH=%d STEPS=%d" % (cell, pool, batch, steps)) in src and ("STEP_MIN=%d MEM=%s" % (
             smin, mem)) in src, cell
         assert arms in src, cell
+    assert "j1f) POOL=65 BATCH=0 STEPS=0 STEP_MIN=25 MEM=64G NEEDWL=0 OUT_MB=60" in src           # the microbench
+    assert "CELLPY=benchmarks/Efficiency/r2_j1_forkbench.py" in src and '"${WARGS[@]}"' in src
+    FB = _mod("r2_j1_forkbench")
+    fa = FB.parse_args(["--out", "x", "--cell", "j1f", "--shapes", "128:216,73:318", "--segments", "2,4,8", "--layers",
+                        "32", "--reps", "10", "--warmup", "2", "--seed", "7", "--sample", "8", "--max-shape-s", "300",
+                        "--max-run-s", "900"])                          # the step script's j1f arguments parse
+    assert fa.shapes == {128: 216, 73: 318} and fa.segments == (2, 4, 8)
     for bad in ("i4dca", "j1", "j1c"):
         r = _step(bad)
         assert r.returncode == 1 and "cell '%s'" % bad in r.stderr, (bad, r.returncode, r.stderr[-300:])
