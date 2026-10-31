@@ -307,11 +307,12 @@ def test_int_equal(key, scen):
         assert "j3" not in rd                                          # F3 is not in the BF1 arm
     else:
         assert rd["j3"]["joint_captures"] > 0 and rd["j3"]["draft_layers"] > 0, rd["j3"]               # F3
-    gs, rec = _gates(key, scen, ev)
+    evg = TST._int_st3(scen)[1] if keep else ev                        # the cell's C 73 INT arm carries ST3 (test_st1:
+    gs, rec = _gates(key, scen, evg)                                   # test_st3_int: = this INT run, every bit)
     names = {g[0][len(INT_ARMS[key]) + 1:] for g in gs if g[0].startswith(INT_ARMS[key] + "-")}
     want = {"MEM", "GRAPH", "DGRAPH", "HOIST", "COMPILE", "EQF", "J1-PEQ", "J1-COMPILE", "J1-DRAFT", "PEQ", "TAIL-EQ",
             "CGRAPH", "TWIN", "INT-CLASSES", "INT-LAYER", "COUNTS"}
-    want |= {"KEEP", "LISTED", "BF", "INT-LOCK"} | ({"CAP"} if scen == "check" else set()) if keep else \
+    want |= {"KEEP", "LISTED", "BF", "INT-LOCK", "KFILL"} | ({"CAP"} if scen == "check" else set()) if keep else \
         {"DCOUNTS", "J1-RESID"}
     assert names == want, (sorted(names - want), sorted(want - names))
     assert not keep or not ({"KEEP-EQ", "KEEP-REF"} & names)           # BF1 changes them by design (dropped)
@@ -395,13 +396,22 @@ def test_int_cell_tables(monkeypatch):
     assert kw2["bf"] == dict(mode="ce", n_cap=2048, ring=8, worker="thread", acct=False, close_wait_ms=0.0,
                              packer="gilfree", threads=8)
     assert D.runner_choice("L4PTFDGUDKWCDX", False)[1]["bf"]["mode"] == "off"
-    for arm, base in (("L4PTFDGUDCDI", "SCD"), ("L4PTFDGUDKWCDI", "SKCD")):
+    STC = _mod("r2_st1_commit")
+    for arm, base in (("L4PTFDGUDCDI", "SCD"), ("L4PTFDGUDKWCDI", "SKCD"), ("L4PTFDGUDKWCDMTK", "SKCD")):
         C._CUR["arm"] = arm
         try:
             R = D.runner_class(base, X.STF)
         finally:
             C._CUR["arm"] = None
-        assert R.__mro__[1] is INTA.int_runner(X.STF, arm, "rows", None) and R.__name__ == "TentRunner_" + arm
+        if arm == "L4PTFDGUDCDI":                                      # the tails read over the INT runner
+            assert R.__mro__[1] is INTA.int_runner(X.STF, arm, "rows", None) and R.__name__ == "TentRunner_" + arm
+        elif arm == "L4PTFDGUDKWCDI":                                  # + ST3 between them
+            RI = INTA.int_runner(X.STF, arm, "rows", None)
+            assert R.__mro__[1] is STC.st3_runner(RI) and R.__mro__[2] is RI
+        else:                                                          # the MTK control: ST3 over the MT runner
+            assert R.__mro__[1] is STC.st3_runner(STC.st1_runner(X.DCL["L4PTFDGUDKWCD"][1], "rows", twin=True))
+    assert C.hooks("L4PTFDGUDKWCDI")[-1] == "ST3" and "ST3" not in C.hooks("L4PTFDGUDCDI")
+    assert C.ST_ARMS["L4PTFDGUDKWCDMTK"] == "L4PTFDGUDKWCDMT" and "L4PTFDGUDKWCDMTK" in D.KEEP_ARMS
     assert D.runner_class("SCD", X.STF).__mro__[1] is X.DCL["L4PTFDGUDCD"][1]       # every arm: the tails read
     base = ["--out", "x", "--workload", "w"]
     monkeypatch.setenv("TORCH_EXTENSIONS_DIR", "/tmp/x")
@@ -416,6 +426,8 @@ def test_int_cell_tables(monkeypatch):
         D.parse_args(base + ["--arms", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCDI"])          # the INT arm needs its D arm
     own, _ = C.parse_own(base)
     assert "needs L4PTFDGUDKWCDM earlier" in C.check_arms(["L4PTFD", "L4PTFDGUDKWCD", "L4PTFDGUDKWCDMT"], own, D)
+    assert "needs L4PTFDGUDKWCDMT earlier" in C.check_arms(["L4PTFD", "L4PTFDGUDKWCD", "L4PTFDGUDKWCDM",
+                                                            "L4PTFDGUDKWCDMTK"], own, D)
     assert "needs L4PTFDGUDKWCD earlier" in C.check_arms(["L4PTFD", "L4PTFDGUDKWCDB"], own, D)
     assert C.check_arms(["L4PTFD", "L4PTFDGUDKWC", "L4PTFDGUDKWCD", "L4PTFDGUDKWCDI"], own, D) is None
     own2, _ = C.parse_own(base + ["--bf-store", "5"])
@@ -438,6 +450,9 @@ def test_int_cell_tables(monkeypatch):
     assert "16.0000" in v["INT-JOINT-SAVING"][2] and "4.0000" in v["INT-COMMIT-SAVING"][2] and "1.0909" in \
         v["INT-VS-REF"][2], v
     assert C.verdicts(sh2, dict(L4PTFD=sp["L4PTFD"]), 216, D) == [("INT-RUN", "NOT_RUN", "no INT arm ran")]
+    v3 = {y[0]: y for y in C.verdicts(sh2, dict(sp, L4PTFDGUDKWCDMT=mk(400.0, 300.0, 140.0, 3.0),
+                                                L4PTFDGUDKWCDMTK=mk(410.0, 293.0, 140.0, 3.0)), 318, D)}
+    assert "7.0000" in v3["INT-ST3-JOINT-SAVING"][2] and "1.0250" in v3["INT-ST3-VS-MT"][2], v3
     vv = [y[0] for y in D.verdicts(sh2, sp, 216)]
     assert "I4DC-VS-REF" in vv and "INT-VS-REF" in vv and "J1-JOINT-SAVING" not in vv   # J1 verdicts: J1 arms only
 
@@ -467,10 +482,12 @@ def _step(cell, sha="0" * 40):
                           capture_output=True, text=True, timeout=300)
 
 
-CELLS = (("intm", 10, 8, 72, 1, 1, 4, 1, 0, 35, "100G",
-          "L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDI,L4PTFDGUDKWCDI"),
+CELLS = (("intm", 10, 8, 72, 1, 1, 4, 1, 0, 45, "100G",
+          "L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,"
+          "L4PTFDGUDCDI,L4PTFDGUDKWCDI"),
          ("inta", 65, 216, 512, 0, 0, 16, 0, 0, 125, "240G", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI"),
-         ("intb", 10, 318, 512, 0, 0, 16, 0, 257, 170, "340G", "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDI"))
+         ("intb", 10, 318, 512, 0, 0, 16, 0, 257, 270, "340G",
+          "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDKWCDI"))
 
 
 def test_step_script_int(monkeypatch):
@@ -502,7 +519,7 @@ def test_step_script_int(monkeypatch):
         assert a.arms == arms.split(",") and C.check_arms(a.arms, own, D) is None, cell
         assert ("%s) POOL=%d BATCH=%d STEPS=%d" % (cell, pool, batch, steps)) in src, cell
         assert ("STEP_MIN=%d MEM=%s" % (smin, mem)) in src and arms in src, cell
-    assert "intm) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 PE=4 ACCT=1" in src and "BFX=257 STEP_MIN=170" in src
+    assert "intm) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 PE=4 ACCT=1" in src and "BFX=257 STEP_MIN=270" in src
     for bad in ("j1m", "int", "intc"):
         r = _step(bad)
         assert r.returncode == 1 and "cell '%s'" % bad in r.stderr, (bad, r.returncode, r.stderr[-300:])

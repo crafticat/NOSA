@@ -16,6 +16,14 @@ b4bd542, the test fix d376c92) + r2-st1 2bc0bca + r2-bf1 73e9cb4 (BF1 dev 3: at 
 F3 is not in the BF1 arm (INTEGRATION_NOTES 3.4: F3 runs the draft residency inside the capture; BF1's draft hook must
 run eagerly; there is no keep J3 arm).
 
+ST3 (AREA 3, r2-st3-dev 639d4ec, merged fast-forward; KS/analysis/plan/INTEGRATION_NOTES_2026-10-31.md section 9):
+the C 73 INT arm L4PTFDGUDKWCDI now also carries ST3 (the keep fill in two compiled helpers). The cell builds its runner
+as `r2_st1_commit.st3_runner(r2_int_arms.int_runner(...))` (INT_ST3 in r2_int_cell.py; r2_int_arms.int_runner stays
+without ST3: test_st1.test_st3_int wraps it itself) and adds `-KFILL` (r2_st1_cell.kfill_gate). The ST3 control arm
+L4PTFDGUDKWCDMTK (= MT + ST3, its PEQ reference MT, which needs M) runs in intm and intb. Registration keys (None):
+INT_st3_joint_saving (MT joint - MTK joint), INT_st3_vs_mt (MTK / MT); the ST1 cell's ST3-JOINT-SAVING / ST3-VS-MT
+verdicts are emitted too (r2_st1_cell.verdicts).
+
 ## 2. The two collisions (benchmarks/Efficiency/r2_int_arms.py)
 
 1. ST2 x F1: both rungs override TentState._layer with a full copy. `IntLayer._layer` = `TwinST2._layer` with 2 lines
@@ -66,9 +74,12 @@ is None). Every cell: --st1-commit rows, BF1 --bf-ring 8 --bf-worker thread --bf
 
 | cell | config | arms (SH, SHJ1 first) | STEP_MIN / --mem | command |
 |---|---|---|---|---|
-| intm | C 73 pool 10, B 8, 72 steps, probe 4, check every round, stress, --bf-acct 1, --bf-store 0 | L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDI,L4PTFDGUDKWCDI | 35 / 100G | `bash benchmarks/Efficiency/r2_int_step.sh --nosi <sha> <holder> <run> intm` |
+| intm | C 73 pool 10, B 8, 72 steps, probe 4, check every round, stress, --bf-acct 1, --bf-store 0 | L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDCDI,L4PTFDGUDKWCDI | 45 / 100G | `bash benchmarks/Efficiency/r2_int_step.sh --nosi <sha> <holder> <run> intm` |
 | inta | C 128 pool 65, B 216, 512 steps | L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI | 125 / 240G | `... inta` |
-| intb | C 73 pool 10, B 318, 512 steps, --bf-store 257 | L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDI | 170 / 340G | `... intb` |
+| intb | C 73 pool 10, B 318, 512 steps, --bf-store 257 | L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDKWCDI | 270 / 340G | `... intb` |
+
+intb with the ST3 control costs 3 more B 318 arm parts (M, MT, MTK: about 54 min MODEL). Without the control, intb is 4
+arms and STEP_MIN 170 (the earlier form); the lead decides (the control needs M and MT: MTK's PEQ reference chain).
 
 Order: intm first (every gate MUST). Decision (the lead's): adopt an INT arm when every MUST gate passes and INT-VS-REF
 is inside its registered band; INT-ADDITIVITY reports whether the components' savings add (a job with the single-rung
