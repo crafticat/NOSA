@@ -58,7 +58,7 @@ E_ = "benchmarks/Efficiency/"
 J1_NEW = (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", T_ + "test_j1.py", "docs/NOTES_j1.md")
 J1_DECL = tuple(T_ + "test_%s.py" % n for n in ("wsa", "wsb", "wsc", "i2", "i3", "i4a", "i4g", "i4d", "i4k", "i4u", "i4h",
                                                    "i4s", "i4cc", "i4dc", "recon7"))
-SELECT_IMPORTS = {"torch", "time", "r2_i4dc_compile"}
+SELECT_IMPORTS = {"torch", "time", "types", "r2_i4dc_compile"}
 HAND_KERNEL = ("import triton", "@triton.jit", "triton.jit", "load_inline", "cpp_extension", "tl.load", "tl.store")
 LATER_NAMES = ("r2_i4a", "r2_i4cc", "r2_i4h", "r2_i4g", "r2_i4s", "r2_i4k", "r2_i4u", "r2_recon7")
 
@@ -84,6 +84,7 @@ def _load(name, path=None):
 X = _load("i4dc_world")
 TS = _load("test_i4s")
 CD, CC, L, N0 = X.CD, X.CC, X.L, X.N0
+X.XC.MUT.update(j1pool=(8, 9))         # the written arguments of the J1 pooling call (pq, pc): the capture stand-in
 
 
 def _git(*args):
@@ -242,7 +243,8 @@ BASE = dict(GUDCDJ1="GUDCD", GUDKCDJ1="GUDKCD")
 C_OF = dict(GUDCD="GUDC", GUDKCD="GUDKC")
 
 
-def j1_builder(arm, check=False, stats=False, kcheck=False, phase_marks=False, probe_every=0, j1neg=None):
+def j1_builder(arm, check=False, stats=False, kcheck=False, phase_marks=False, probe_every=0, j1neg=None,
+               j1draft=True):
     """i4dc_world.d_builder with the J1 runner (the same arguments; the GPU cell's runner arguments)."""
     J1 = _mod("r2_j1_select")
     Runner = J1.j1_classes(X.STF)[ARMS[arm]][1]
@@ -259,7 +261,7 @@ def j1_builder(arm, check=False, stats=False, kcheck=False, phase_marks=False, p
                           journal=RW.CAP, redirect=True, record=record, probe_every=probe_every)
         kw = dict(fork=Z.fake_fork, t0=tok0, hooks=None, check_every=check_every, union_check=check,
                   union_stats=stats, phase_marks=phase_marks, dneg=None, hneg=None, gneg=None, sneg=None, dgneg=None,
-                  cc_backend="inductor", ccneg=None, cdneg=None, j1neg=j1neg)
+                  cc_backend="inductor", ccneg=None, cdneg=None, j1neg=j1neg, j1draft=j1draft)
         if arm == "GUDKCDJ1":
             kw.update(keep=True, kwin=True, kcheck=kcheck, kneg=None, kslots=None, cneg=None)
         be = X.FakeGraphsDCD()
@@ -269,14 +271,15 @@ def j1_builder(arm, check=False, stats=False, kcheck=False, phase_marks=False, p
     return build
 
 
-def run_j1(arm, scen="timing", B=8, j1neg=None):
+def run_j1(arm, scen="timing", B=8, j1neg=None, j1draft=True):
     CC.configure()
     s = X.SCEN[scen]
     N = N0
     model, c, S, hz, tok0 = X.world(B, N, 0)
     kc = bool(s["check"]) and arm == "GUDKCDJ1"
     run = j1_builder(arm, check=s["check"], stats=s["stats"], kcheck=kc, phase_marks=s["phase_marks"],
-                     probe_every=s["probe_every"], j1neg=j1neg)(model, c, S, hz, tok0, check_every=s["check_every"])
+                     probe_every=s["probe_every"], j1neg=j1neg, j1draft=j1draft)(model, c, S, hz, tok0,
+                                                                                 check_every=s["check_every"])
     if s["fa"]:
         run.vs.fa_check = {}
     run.run(N)
@@ -313,9 +316,13 @@ def test_j1_equals(case):
     rd = x["rd"]
     j = rd["j1"]
     jp = rd["tent"]["calls"]["joint_passes"]
-    _ev("J1 %s %s: rounds %d; joint passes %d; J1 %s" % (case, name, rd["rounds"], jp, j))
+    _ev("J1 %s %s: rounds %d; joint passes %d; draft capture passes %d; J1 %s" % (
+        case, name, rd["rounds"], jp, rd["dgraph"]["capture_passes"], j))
     assert jp > 0 and j["calls"] == jp * L and not j["fallback"] and j["peq_layers"] > 0      # L34 preconditions
-    assert j["peq_bad"] == 0 and j["peq_vals"] > 0 and len(j["events"]) <= 1
+    assert j["peq_bad"] == 0 and j["peq_vals"] > 0
+    assert j["draft"] and j["dwarm"] == 1 and j["dlayers"] == rd["dgraph"]["capture_passes"] * L > 0   # F2 ran
+    assert j["dpeq_layers"] > 0 and j["dpeq_bad"] == 0 and rd["dgraph"]["replay_passes"] >= 10
+    assert not any(e["capture"] for e in j["events"]) and {e["kind"] for e in j["events"]} <= {"joint", "draft_warm"}
     bad = TS._diff(b, x, skip=("compile", "j1"))
     assert bad == [], bad[:10]                                         # = its I4DC arm in everything but the records
     skip = ("hoist", "keep", "round_blocks", "compile", "j1") if keep else ("hoist", "compile", "j1")
@@ -323,6 +330,7 @@ def test_j1_equals(case):
     bad = TS._diff(d, x, skip=skip, tensors_skip=ts)
     assert bad == [], bad[:10]                                         # THE CLAIM: L4PTFD's run, bit for bit
     C, D = _cell()
+    C.SH_J1["emitted"] = True                                          # J1-SHEQ: test_sh_j1 (emitted once per job)
     fd, fb, fx = X.cell_inputs(d, C=D), X.cell_inputs(b, C=D), X.cell_inputs(x, C=D)
     keepd = dict(L4PTFD=fd, **({"L4PTFDGUDKWCD": fb} if keep else {}))
     rec = dict(graph=rd["graph"], dgraph=rd["dgraph"], gpu_peak_alloc_GB=1.0, mem_arena=dict(prefill_peak_GB=1.0))
@@ -330,18 +338,22 @@ def test_j1_equals(case):
     names = [g[0] for g in gs]
     want = ["MEM", "GRAPH", "COUNTS", "DGRAPH", "HOIST"] + (["KEEP"] + (["CAP"] if scen == "check" else []) +
                                                             ["KEEP-EQ", "KEEP-REF"] if keep else []) + [
-        "COMPILE", "EQF", "J1-PEQ", "J1-COMPILE"]
+        "COMPILE", "EQF", "J1-PEQ", "J1-COMPILE", "J1-DRAFT"]
     assert names == ["%s-%s" % (name, w) for w in want], names
     assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
     assert rec["j1"] == j                                              # the summary carries the J1 record
     if keep:
         kq = next(g for g in gs if g[0].endswith("-KEEP-EQ"))
         assert kq[1] is True and "L4PTFDGUDKWCD" in kq[3], kq
+    ev0 = dict(graphs=1, s=1.0, layer=0, capture=False, joint_pass=0, kind="joint")
     for plant in (dict(peq_bad=1), dict(peq_layers=0), dict(fallback=dict(record=1)), dict(calls=j["calls"] - 1),
-                  dict(events=[dict(graphs=1, s=1.0, layer=0, capture=True, joint_pass=0)]),
-                  dict(events=[dict(graphs=1, s=1.0, layer=0, capture=False, joint_pass=0)] * 2)):
+                  dict(events=[dict(ev0, capture=True)]), dict(events=[ev0, ev0]),
+                  dict(events=[dict(ev0, kind="draft")]), dict(dlayers=j["dlayers"] - 1), dict(dwarm=2),
+                  dict(dpeq_bad=1), dict(dpeq_layers=0)):
         g = J1.j1_gates(name, dict(rd, j1=dict(j, **plant)), L)
-        assert not (g[0][2] and g[1][2]), plant
+        assert not all(x[2] for x in g), plant
+    g = J1.j1_gates(name, dict(rd, j1=dict(j, draft=False)), L)        # F1 alone: no draft gate
+    assert [x[0] for x in g] == ["%s-J1-PEQ" % name, "%s-J1-COMPILE" % name] and all(x[2] for x in g)
 
 
 def test_j1_plant_wrong_req():
@@ -354,12 +366,123 @@ def test_j1_plant_wrong_req():
     e = D.S4.eq_gate("L4PTFDGUDCDJ1", X.cell_inputs(p, C=D), fd, N0)
     df = TS._diff(d, p, skip=("hoist", "compile", "j1"))
     j = p["rd"]["j1"]
-    _ev("J1 PLANT wrong_req: differs %s; EQF %s; PEQ bad %s of %s" % (df[:4], e[2], j["peq_bad"], j["peq_vals"]))
+    _ev("J1 PLANT wrong_req: differs %s; EQF %s; PEQ bad %s of %s; draft PEQ bad %s of %s" % (
+        df[:4], e[2], j["peq_bad"], j["peq_vals"], j["dpeq_bad"], j["dpeq_vals"]))
     assert df != [] and e[2] is False and j["peq_bad"] > 0             # not a no-op (L34); CAUGHT by EQF and PEQ
+    assert j["dpeq_bad"] > 0                                           # the draft pooling's plant: CAUGHT by its PEQ
+    q = run_j1("GUDCDJ1", "timing", j1neg="wrong_req", j1draft=False)  # F1 alone: the draft path is the shipped one
+    assert q["rd"]["j1"]["dlayers"] == 0 and q["rd"]["j1"]["dpeq_vals"] == 0 and q["rd"]["j1"]["peq_bad"] > 0
     J1 = _mod("r2_j1_select")
     assert J1.j1_gates("L4PTFDGUDCDJ1", p["rd"], L)[0][2] is False
     with pytest.raises(X.SR.SpecError):
         j1_builder("GUDCDJ1", j1neg="nope")(*X.world(2, 8)[:5])
+
+
+# ------------------------------------------------------------------ F2 on the baseline (SHJ1)
+def test_shpool_equal():
+    """ShPool = the shipped scalar kernel's stand-in (ragged_world.fake_nosa_pooling) bit for bit, over varied max_seqlen
+    (0, small, mid, full), widths M and batches (dynamic shapes), init / local edges, bf16 and float32; its eager PEQ
+    counts every call; a wrong shipped function is CAUGHT by its PEQ."""
+    J1 = _mod("r2_j1_select")
+    fake = X.W.fake_nosa_pooling
+    sp = J1.ShPool(fake)
+    g = torch.Generator().manual_seed(5)
+    n = 0
+    with torch.inference_mode():
+        for dtype in (torch.bfloat16, torch.float32):
+            for B, N, M, mx, init, local in ((3, 128, 20, 70, 1, 16), (3, 128, 20, 5, 0, 2), (5, 256, 40, 150, 1, 16),
+                                             (5, 256, 40, 0, 2, 0), (2, 128, 33, 128, 1, 3)):
+                q = torch.rand(2, B, N, generator=g).to(dtype)
+                c = torch.randn(2, B, N, generator=g).to(dtype)
+                rq, rc = torch.empty(2, B, M, dtype=dtype), torch.empty(2, B, M, dtype=dtype)
+                mq, mc = torch.full((2, B, M), 7.0, dtype=dtype), torch.full((2, B, M), 7.0, dtype=dtype)
+                fake(q, c, mx, rq, rc, block_size=32, stride=16, local_blocks=local, init_blocks=init)
+                sp(q, c, mx, mq, mc, block_size=32, stride=16, local_blocks=local, init_blocks=init)
+                assert torch.equal(CD.bits(mq), CD.bits(rq)) and torch.equal(CD.bits(mc), CD.bits(rc)), (dtype, B, M, mx)
+                n += 1
+    r = sp.report()
+    assert r["calls"] == n == r["peq_calls"] and r["peq_bad"] == 0 and r["captured"] == 0 and r["peq_vals"] > 0
+    assert len(r["events"]) <= 4, r["events"]                         # dynamic shapes: no compile per shape
+    with pytest.raises(ValueError):
+        sp(q, c, 5, mq, mc, padding=2)
+
+    def wrong(q_, c_, mx_, oq, oc, **kw):                              # PLANT: a shipped function that differs
+        fake(q_, c_, max(int(mx_) - 1, 0), oq, oc, **kw)
+    bad = J1.ShPool(wrong)
+    with torch.inference_mode():
+        bad(q, c, 100, mq, mc, block_size=32, stride=16, local_blocks=3, init_blocks=1)
+    assert bad.report()["peq_bad"] > 0
+    _ev("J1 SHPOOL: %d variants bit-equal to the shipped kernel's stand-in; events %s; plant caught %s" % (
+        n, r["events"], bad.report()["peq_bad"]))
+
+
+class _FakeBC:
+    """A base-cell stand-in for run_sh_j1: one eager pooling call through NL per run (the shipped warm-up's call)."""
+
+    def __init__(self, NL, tokens):
+        self.NL, self.tokens, self.seen = NL, tokens, []
+        BCm = _mod("r2_base_cell")
+        self.period_stats, self.rates = BCm.period_stats, BCm.rates
+
+    def run_shipped(self, model, ids, steps, clock, fp=None):
+        q = torch.rand(2, 3, 128)
+        oq, oc = torch.empty(2, 3, 20), torch.empty(2, 3, 20)
+        self.NL.nosa_pooling(q, q.clone(), 70, oq, oc, block_size=32, stride=16, local_blocks=16, init_blocks=1)
+        self.seen.append(type(self.NL.nosa_pooling).__name__)
+        return dict(inputs=self.tokens.clone(), periods=[10.0] * steps, rewarms=[(0, "warm")])
+
+    def free(self, host=False):
+        return False
+
+
+def test_sh_j1():
+    C, D = _cell()
+    J1 = _mod("r2_j1_select")
+    import types
+    ns = types.SimpleNamespace(nosa_pooling=X.W.fake_nosa_pooling)
+    tok = torch.arange(6).view(3, 2)
+    fb = _FakeBC(ns, tok)
+    with torch.inference_mode():
+        rec = C.run_sh_j1(fb, None, tok, 8, None, dict(inputs=tok.clone()), NL=ns)
+    assert ns.nosa_pooling is X.W.fake_nosa_pooling and fb.seen == ["ShPool"]          # swapped for the run, restored
+    assert rec["ran"] and rec["tokens_equal"] and rec["pool"]["peq_calls"] == 1 and rec["pool"]["peq_bad"] == 0
+    assert rec["rates"]["steady_step_ms"] == 10.0
+    with torch.inference_mode():
+        rec2 = C.run_sh_j1(_FakeBC(ns, tok + 1), None, tok, 8, None, dict(inputs=tok.clone()), NL=ns)   # PLANT
+    assert rec2["ran"] and rec2["tokens_equal"] is False
+    saved = dict(C.SH_J1)
+    try:
+        for r, want in ((rec, False), (dict(rec, pool=dict(rec["pool"], captured=4)), True),     # CPU: no capture
+                        (dict(rec2, pool=dict(rec2["pool"], captured=4)), False), (dict(ran=False, error="x"), False)):
+            C.SH_J1.update(result=r)
+            g = C.sh_gate()
+            assert g[0] == "J1-SHEQ" and g[1] is True and g[2] is want, (g, want)
+        C.SH_J1.update(result=None)
+        assert C.sh_gate()[1] is False                                 # not run: REPORT
+        C.SH_J1.update(result=dict(rec, pool=dict(rec["pool"], captured=4)), emitted=False)
+        rd = _run("GUDCDJ1")["rd"]
+        gs = D.arm_gates("L4PTFDGUDCDJ1", rd, dict(graph=rd["graph"], dgraph=rd["dgraph"], gpu_peak_alloc_GB=1.0,
+                                                   mem_arena=dict(prefill_peak_GB=1.0)),
+                         X.cell_inputs(_run("GUDCDJ1"), C=D), dict(L4PTFD=X.cell_inputs(_run("D"), C=D)), False, 8, 10,
+                         N0, L, 1.0)
+        assert gs[-1][0] == "J1-SHEQ" and gs[-1][2] is True and C.SH_J1["emitted"]
+        gs2 = D.arm_gates("L4PTFDGUDCDJ1", rd, dict(graph=rd["graph"], dgraph=rd["dgraph"], gpu_peak_alloc_GB=1.0,
+                                                    mem_arena=dict(prefill_peak_GB=1.0)),
+                          X.cell_inputs(_run("GUDCDJ1"), C=D), dict(L4PTFD=X.cell_inputs(_run("D"), C=D)), False, 8, 10,
+                          N0, L, 1.0)
+        assert "J1-SHEQ" not in [x[0] for x in gs2]                    # once per job
+        sh = dict(rates=dict(steady_step_ms=13.0, steady_tok_s=800.0, effective_tok_s=700.0), steady=dict(mean_ms=10.0))
+        mk = lambda tok_, jt, dr: dict(rates=dict(median_tok_s=tok_), phases_median=dict(draft=dr, joint=jt),  # noqa
+                                       gpu_peak_alloc_GB=82.0, mem_arena=dict(prefill_peak_GB=78.0), j1=dict(compile_s=2.0))
+        sp = dict(L4PTFD=mk(400.0, 200.0, 140.0), L4PTFDGUDCD=mk(440.0, 186.0, 130.0),
+                  L4PTFDGUDCDJ1=mk(455.0, 174.0, 124.0))
+        v = {y[0]: y for y in C.verdicts(sh, sp, 216)}
+        assert "6.0000" in v["J1-DRAFT-SAVING"][2] and "3.0000" in v["J1-SH-SAVING"][2], v      # 13 - 10 ms per step
+        assert "J1-VS-SHJ1" in v and "MODEL" in v["J1-STRONGEST-MATCHED"][2]
+    finally:
+        C.SH_J1.clear()
+        C.SH_J1.update(saved)
+    assert C.main(["--sh-j1", "2", "--out", "x", "--workload", "w"]) == 20
 
 
 # ------------------------------------------------------------------ CELL

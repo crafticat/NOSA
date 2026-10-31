@@ -19,7 +19,16 @@ WHAT CHANGES (one call per joint layer; TentState._layer's joint branch, COPIED 
            the per-request pooling kernel; top-k; mask zero / scatter / masked_fill; top-k
   J1       stage 1 (the same call); pool_fn compiled (reads the compressed cis by REQUEST index: no copy); the same
            top-k / mask / top-k ops (verify_rows' torch binding, so the CPU world's top-k stand-in applies)
-The one-row (draft) passes keep the shipped selection (their captured graphs): fix F2 is a later rung.
+F2 (the second J1 commit; runner keyword j1draft, default True): the ONE-ROW (draft) passes' pooling. The I4H draft
+graphs capture, per layer, A(l) with the selection inline (its _Inline object in place of the layer's shipped pooling
+graph); the J1 state puts _InlineJ1 there instead (in _dbegin_a, after the capture begins; the I4H code restores the
+shipped object after A(l)): the compiled pool_fn (E = B, one entry per request) and ragged_engine._pool_topk's other
+ops on the same tensors, so the draft graphs replay the compiled kernel. The pooling compiles BEFORE the first draft
+capture (one eager warm call on scratch outputs). Check graphs (the check rounds' key) also run the shipped kernel into
+scratch and count differing values on the device (J1-DRAFT). Eager one-row passes (the I4H module's eager reasons,
+its warm pass) keep the shipped selection graph: the same bits by J1-DRAFT's comparison.
+ShPool (F2 on the baseline): the same compiled arithmetic behind the shipped nosa_pooling signature, for the cell's
+matched SHJ1 run.
 
 pool_fn = the kernel's arithmetic (max_pooling_per_request: the per-request kernel; its torch twin pool_reference):
   for entry e, pooled block m < M (M = the buffer width):
@@ -42,6 +51,7 @@ NEGATIVE CONTROL (tests only; j1neg): "wrong_req" (the cis of request (b + 1) % 
 HOST SYNCS: none added (the PEQ counters stay on the device until read()).
 """
 import time
+import types
 
 import torch
 
@@ -75,8 +85,80 @@ def pool_fn(score, ccis, er, br, nidx, mar, n_used, M_b, pq, pc, init_blocks: in
     pc.copy_(torch.where(valid, torch.where(edge, float("inf"), ac), float("-inf")))
 
 
+def _copy_fn(fn, suffix: str):
+    """A copy of fn with its own code object (dynamo keeps its cache on the code object: the copy's compiles do not
+    count against fn's cache)."""
+    co = fn.__code__.replace(co_name=fn.__code__.co_name + suffix)
+    return types.FunctionType(co, fn.__globals__, co.co_name, fn.__defaults__, fn.__closure__)
+
+
+pool_sh_fn = _copy_fn(pool_fn, "_sh")                  # the matched baseline's copy (ShPool: dynamic shapes)
 FNS = dict(pool=pool_fn)
 _COMPILED = {}
+
+
+class ShPool:
+    """F2 on the SAME-JOB BASELINE (the matched comparison): a callable with the signature of the shipped
+    max_pooling_fused.nosa_pooling (scalar max_seqlen; the pooled width M = the buffer width; no per-request validity),
+    computed by pool_fn compiled with dynamic shapes (the shipped step re-warms its pooling graphs when the widths
+    change: one compile serves them). The cell puts it in place of nosa_llama.nosa_pooling for ONE extra shipped run
+    (SHJ1) and restores it. EAGER calls (the warm-up call before each capture of the after-pooling graph) are also
+    compared with the shipped kernel bit for bit (peq; a call inside a capture is not compared)."""
+
+    def __init__(self, shipped, backend: str = "inductor"):
+        if backend not in CC.BACKENDS:
+            raise ValueError("compile backend %r (one of %s)" % (backend, CC.BACKENDS))
+        self.shipped = shipped
+        self.f = torch.compile(pool_sh_fn, fullgraph=True, dynamic=True, backend=backend)
+        self._t = {}
+        self.calls = self.captured = self.peq_calls = 0
+        self.peq_bad = self.peq_vals = 0
+        self.compile_s = 0.0
+        self.events = []
+
+    def __call__(self, q_score, cis_score, max_seqlen, q_score_pooled, cis_score_pooled, block_size=32, stride=16,
+                 padding=1, set_size=5, init_blocks=1, local_blocks=16):
+        if int(padding) != PADDING or int(set_size) != SET_SIZE:
+            raise ValueError("ShPool: padding %d / set_size %d only" % (PADDING, SET_SIZE))
+        H, B = int(q_score.shape[0]), int(q_score.shape[1])
+        M = int(q_score_pooled.shape[-1])
+        dev = q_score.device
+        key = (B, M, str(dev))
+        t = self._t.get(key)
+        if t is None:
+            ar = torch.arange(B, dtype=torch.int64, device=dev).view(B, 1, 1)
+            m = torch.arange(M, dtype=torch.int64, device=dev)
+            nidx = (m.view(M, 1) * (SET_SIZE - 1) - PADDING
+                    + torch.arange(SET_SIZE, dtype=torch.int64, device=dev).view(1, SET_SIZE)).contiguous()
+            t = self._t[key] = dict(ar=ar, nidx=nidx, mar=m.view(1, M), n=torch.zeros((B,), dtype=torch.int32,
+                                                                                       device=dev),
+                                    mb=torch.full((B,), M, dtype=torch.int32, device=dev))
+        cap = _capturing()
+        t["n"].fill_(int(max_seqlen))                                   # the shipped scalar (frozen in a capture)
+        from torch._dynamo.utils import counters as C
+        g0 = int(C["stats"]["unique_graphs"])
+        t0 = time.perf_counter()
+        self.f(q_score, cis_score, t["ar"], t["ar"], t["nidx"], t["mar"], t["n"], t["mb"], q_score_pooled,
+               cis_score_pooled, int(init_blocks), int(local_blocks) + 1)
+        dt = time.perf_counter() - t0
+        g1 = int(C["stats"]["unique_graphs"])
+        self.calls += 1
+        self.captured += int(cap)
+        if g1 != g0:
+            self.events.append(dict(graphs=g1 - g0, s=round(dt, 3), B=B, M=M, capture=cap))
+            self.compile_s += dt
+        if not cap:                                                     # PEQ on the eager calls
+            rq, rc = torch.empty_like(q_score_pooled), torch.empty_like(cis_score_pooled)
+            self.shipped(q_score, cis_score, max_seqlen, rq, rc, block_size=block_size, stride=stride,
+                         padding=padding, set_size=set_size, init_blocks=init_blocks, local_blocks=local_blocks)
+            self.peq_bad += int(((bits(rq) != bits(q_score_pooled)).sum() + (bits(rc) != bits(cis_score_pooled)).sum())
+                                .item())
+            self.peq_vals += rq.numel() + rc.numel()
+            self.peq_calls += 1
+
+    def report(self) -> dict:
+        return dict(calls=self.calls, captured=self.captured, peq_calls=self.peq_calls, peq_bad=self.peq_bad,
+                    peq_vals=self.peq_vals, compile_s=round(self.compile_s, 3), events=list(self.events))
 
 
 def compiled(name: str, backend: str):
@@ -88,6 +170,17 @@ def compiled(name: str, backend: str):
             raise ValueError("compile backend %r (one of %s)" % (backend, CC.BACKENDS))
         f = _COMPILED[key] = torch.compile(FNS[name], fullgraph=True, dynamic=False, backend=backend)
     return f
+
+
+class _InlineJ1:
+    """In place of the I4H module's _Inline during a draft graph A(l)'s capture (F2): replay() runs the J1 state's
+    _j1_dpool (the compiled pooling + ragged_engine._pool_topk's other ops on the same tensors)."""
+
+    def __init__(self, T, l, layer, twin):
+        self.T, self.l, self.layer, self.twin = T, int(l), layer, twin
+
+    def replay(self):
+        self.T._j1_dpool(self.l, self.layer, self.twin)
 
 
 def _capturing() -> bool:
@@ -119,17 +212,103 @@ def _make(STF):
         """The compiled joint pooling on an I4DC state (a mixin before the I4DC state class in the MRO; the runner
         re-classes the state that the I4DC runner built)."""
 
-        def _j1_setup(self, backend: str, j1neg):
+        def _j1_setup(self, backend: str, j1neg, draft: bool = True):
             if backend not in CC.BACKENDS:
                 raise SpecError("compile backend %r (one of %s)" % (backend, CC.BACKENDS))
             if j1neg not in J1NEG:
                 raise SpecError("unknown J1 control %r (one of %s)" % (j1neg, J1NEG))
-            self._j1_backend, self.j1neg = backend, j1neg
+            self._j1_backend, self.j1neg, self._j1_draft = backend, j1neg, bool(draft)
             z = lambda: torch.zeros((), dtype=torch.int64, device=self.dev)    # noqa: E731
             self.j1 = dict(calls=0, fallback={}, events=[], compile_s=0.0, checks=0, peq_bad=z(), peq_vals=z(),
-                           peq_layers=0)
+                           peq_layers=0, draft=bool(draft), dlayers=0, dwarm=0, dpeq_bad=z(), dpeq_vals=z(),
+                           dpeq_layers=z())
             self._j1_t = None                                          # the constant index tensors (first call)
             self._j1_ref = None                                        # PEQ scratch (first check)
+            self._j1_dt = None                                         # the draft's index tensors and scratch
+
+        def _j1_call(self, l, kind: str, args):
+            """One call of the compiled pooling with its compile event (module docstring, COMPILE). Inside a draft
+            capture of the CPU stand-in, the node maker of the capture (_cc_wrap, as the I4DC helpers) runs it."""
+            f = compiled("pool", self._j1_backend)
+            from torch._dynamo.utils import counters as C
+            g0 = int(C["stats"]["unique_graphs"])
+            cap = _capturing() or bool(getattr(self, "_cd_cap", False)) or bool(getattr(self, "_cc_cap", False))
+            wrap = getattr(self, "_cc_wrap", None)
+            t0 = time.perf_counter()
+            if wrap is not None:
+                wrap("j1pool", f, args)
+            else:
+                f(*args)
+            dt = time.perf_counter() - t0
+            g1 = int(C["stats"]["unique_graphs"])
+            if g1 != g0:
+                self.j1["events"].append(dict(graphs=g1 - g0, s=round(dt, 3), layer=int(l), capture=cap, kind=kind,
+                                              joint_pass=int(self.calls["joint_passes"])))
+                self.j1["compile_s"] += dt
+
+        # ---------------------------------------------------------- F2: the one-row (draft) passes' pooling
+        def _j1_dtensors(self):
+            """The draft's constant tensors and the PEQ scratch (made OUTSIDE any capture: the first _dbegin_a)."""
+            t = self._j1_dt
+            if t is None:
+                st = self.rs.st
+                dev, B, M = st.pq.device, self.B, int(st.pq.shape[-1])
+                ar = torch.arange(B, dtype=torch.int64, device=dev)
+                req = (ar + 1) % B if self.j1neg == "wrong_req" else ar  # NEGATIVE CONTROL (tests only)
+                m = torch.arange(M, dtype=torch.int64, device=dev)
+                nidx = (m.view(M, 1) * (SET_SIZE - 1) - PADDING
+                        + torch.arange(SET_SIZE, dtype=torch.int64, device=dev).view(1, SET_SIZE)).contiguous()
+                t = self._j1_dt = dict(er=ar.view(B, 1, 1), br=req.view(B, 1, 1).contiguous(), nidx=nidx,
+                                       mar=m.view(1, M), rq=torch.empty_like(st.pq), rc=torch.empty_like(st.pc),
+                                       wq=torch.empty_like(st.pq), wc=torch.empty_like(st.pc))
+            return t
+
+        def _dbegin_a(self, gs, l, layer):
+            """The draft graph A(l)'s start (the I4H module): before it (outside the capture) the draft pooling's
+            compile on scratch outputs (first layer only); after it, the selection's inline replay object is OURS
+            (the compiled pooling + the shipped top-k ops on the shipped tensors)."""
+            rs = self.rs
+            use = self._j1_draft and rs.ops.graph and self._j1_why_d() is None
+            if use and self.j1["dwarm"] == 0 and rs.score_buf is not None:
+                t = self._j1_dtensors()
+                self._j1_call(l, "draft_warm", (rs.score_buf, rs.st.twins[l].ccis, t["er"], t["br"], t["nidx"],
+                                                t["mar"], rs.n_used, rs.M_b, t["wq"], t["wc"],
+                                                int(layer.init_blocks), int(layer.window_blocks) + 1))
+                self.j1["dwarm"] += 1
+            super()._dbegin_a(gs, l, layer)
+            cur = self._dcur
+            if use and self.j1["dwarm"] > 0 and cur is not None and cur.get("swapped"):
+                rs.graphs[l] = _InlineJ1(self, l, layer, rs.st.twins[l])
+                self.j1["dlayers"] += 1
+
+        def _j1_why_d(self):
+            if self.tneg is not None or self.fneg is not None or getattr(self, "hneg", None) is not None \
+                    or getattr(self, "dneg", None) is not None:
+                return "control"
+            return None
+
+        def _j1_dpool(self, l, layer, twin):
+            """_Inline's replay with the compiled pooling: ragged_engine._pool_topk's ops on its tensors (the shipped
+            pooling replaced; check graphs also run the shipped pooling into scratch and count differing values)."""
+            rs = self.rs
+            st, nl = rs.st, rs.nl
+            t = self._j1_dt
+            if self.checking:
+                RE.nosa_pooling_per_request(rs.score_buf, twin.ccis, rs.n_used, rs.M_b, t["rq"], t["rc"],
+                                            stride=layer.pooling_stride, block_size=layer.block_size,
+                                            local_blocks=layer.window_blocks, init_blocks=layer.init_blocks)
+            self._j1_call(l, "draft", (rs.score_buf, twin.ccis, t["er"], t["br"], t["nidx"], t["mar"], rs.n_used,
+                                       rs.M_b, st.pq, st.pc, int(layer.init_blocks), int(layer.window_blocks) + 1))
+            if self.checking:
+                self.j1["dpeq_bad"] += (bits(st.pq) != bits(t["rq"])).sum() + (bits(st.pc) != bits(t["rc"])).sum()
+                self.j1["dpeq_vals"] += st.pq.numel() + st.pc.numel()
+                self.j1["dpeq_layers"] += 1
+            TR = RE.torch                                              # the module's binding (CPU: the stand-ins)
+            TR.topk(st.pq, nl.QK_SELECT, dim=-1, sorted=False, out=(st.tv_q, st.ti_q))
+            st.mask.zero_()
+            st.mask.scatter_(2, st.ti_q, True)
+            st.pc.masked_fill_(st.mask, float("inf"))
+            TR.topk(st.pc, layer.topk_blocks, dim=-1, sorted=False, out=(st.tv, st.ti))
 
         def _j1_why(self, vs):
             """None: the joint pooling runs compiled; else the reason for the shipped _select_rows."""
@@ -162,23 +341,13 @@ def _make(STF):
             return t
 
         def _j1_pool(self, l, score, twin, vs, layer):
-            """One compiled pooling call with its compile event (module docstring, COMPILE)."""
+            """One compiled joint pooling call (module docstring, COMPILE)."""
             M = int(vs.pq.shape[-1])
             t = self._j1_tensors(vs, M)
-            f = compiled("pool", self._j1_backend)
-            from torch._dynamo.utils import counters as C
-            g0 = int(C["stats"]["unique_graphs"])
-            cap = _capturing()
-            t0 = time.perf_counter()
-            f(score, twin.ccis, t["er"], t["br"], t["nidx"], t["mar"], vs.n_used.view(vs.E), vs.M_b.view(vs.E), vs.pq,
-              vs.pc, int(layer.init_blocks), int(layer.window_blocks) + 1)
-            dt = time.perf_counter() - t0
-            g1 = int(C["stats"]["unique_graphs"])
+            self._j1_call(l, "joint", (score, twin.ccis, t["er"], t["br"], t["nidx"], t["mar"], vs.n_used.view(vs.E),
+                                       vs.M_b.view(vs.E), vs.pq, vs.pc, int(layer.init_blocks),
+                                       int(layer.window_blocks) + 1))
             self.j1["calls"] += 1
-            if g1 != g0:
-                self.j1["events"].append(dict(graphs=g1 - g0, s=round(dt, 3), layer=int(l), capture=cap,
-                                              joint_pass=int(self.calls["joint_passes"])))
-                self.j1["compile_s"] += dt
 
         def _j1_peq(self, score, twin, vs, layer):
             """CHECK-ONLY (J1-PEQ): the shipped copy + pooling on the same inputs into scratch; bit comparison."""
@@ -282,7 +451,9 @@ def _make(STF):
             return dict(calls=int(j["calls"]), fallback=dict(j["fallback"]), events=list(j["events"]),
                         compile_s=round(float(j["compile_s"]), 3), peq_bad=int(j["peq_bad"].item()),
                         peq_vals=int(j["peq_vals"].item()), peq_layers=int(j["peq_layers"]),
-                        backend=self._j1_backend, j1neg=self.j1neg)
+                        draft=bool(j["draft"]), dlayers=int(j["dlayers"]), dwarm=int(j["dwarm"]),
+                        dpeq_bad=int(j["dpeq_bad"].item()), dpeq_vals=int(j["dpeq_vals"].item()),
+                        dpeq_layers=int(j["dpeq_layers"].item()), backend=self._j1_backend, j1neg=self.j1neg)
 
     out = {}
     for arm, base in ARMS_J1.items():
@@ -291,15 +462,16 @@ def _make(STF):
 
         def _mk(RB=RB, S=S, arm=arm):
             class R_(RB):
-                """The J1 arm: the I4DC runner whose state runs the compiled joint pooling. Keyword arguments: the
-                I4DC runner's, j1neg (J1NEG, tests only)."""
+                """The J1 arm: the I4DC runner whose state runs the compiled joint pooling (F1) and, with j1draft, the
+                compiled draft pooling inside the draft graphs (F2). Keyword arguments: the I4DC runner's, j1neg
+                (J1NEG, tests only), j1draft (default True)."""
 
-                def __init__(self, *args, j1neg=None, **kw):
+                def __init__(self, *args, j1neg=None, j1draft=True, **kw):
                     if j1neg not in J1NEG:
                         raise SpecError("unknown J1 control %r (one of %s)" % (j1neg, J1NEG))
-                    self._j1neg = j1neg
+                    self._j1neg, self._j1draft = j1neg, bool(j1draft)
                     super().__init__(*args, **kw)
-                    self.meta.setdefault("compile", {}).update(arm=arm, j1neg=j1neg)
+                    self.meta.setdefault("compile", {}).update(arm=arm, j1neg=j1neg, j1draft=bool(j1draft))
 
                 def _arm_name(self):
                     return arm
@@ -307,7 +479,7 @@ def _make(STF):
                 def _make_state(self, rs, attn, tneg, poison):
                     T = super()._make_state(rs, attn, tneg, poison)
                     T.__class__ = S                                    # the I4DC state, re-classed (same attributes)
-                    T._j1_setup(getattr(T, "_cc_backend", "inductor"), self._j1neg)
+                    T._j1_setup(getattr(T, "_cc_backend", "inductor"), self._j1neg, self._j1draft)
                     return T
 
                 @torch.inference_mode()
@@ -323,19 +495,34 @@ def _make(STF):
 
 def j1_gates(arm: str, rd, L: int, check_rounds: bool = True) -> list:
     """The J1 MUST gates of a J1 arm (module docstring): [(name, must, passed, detail)].
-      J1-PEQ      PEQ ran (layers > 0) and 0 differing values
-      J1-COMPILE  the pooling helper compiled at most once, never inside a capture, no fallback, calls = the joint layers
-                  of the run (joint passes x L)"""
+      J1-PEQ      joint pooling: PEQ ran (layers > 0) and 0 differing values
+      J1-COMPILE  at most one compile event per kind (joint, draft_warm), none inside a capture, no draft compile
+                  outside its warm call, no fallback, calls = the joint layers of the run (joint passes x L)
+      J1-DRAFT    (j1draft) every captured one-row layer runs the compiled pooling (dlayers = draft capture passes
+                  x L, one warm call) and the draft PEQ ran (layers > 0) with 0 differing values"""
     j = (rd or {}).get("j1") or {}
     calls = ((rd or {}).get("tent") or {}).get("calls") or {}            # TentState.report()'s host counts
     jp = int(calls.get("joint_passes", 0))
     ev = j.get("events") or []
+    kinds = [e.get("kind", "joint") for e in ev]
     peq_ok = j.get("peq_layers", 0) > 0 and j.get("peq_bad") == 0 and j.get("peq_vals", 0) > 0
-    comp_ok = (len(ev) <= 1 and not any(e.get("capture") for e in ev) and not j.get("fallback")
+    comp_ok = (all(kinds.count(k) <= 1 for k in set(kinds)) and set(kinds) <= {"joint", "draft_warm"}
+               and not any(e.get("capture") for e in ev) and not j.get("fallback")
                and j.get("calls") == jp * int(L) and jp > 0)
-    return [("%s-J1-PEQ" % arm, True, bool(peq_ok),
-             "pooling bits vs the shipped kernel: %s differing of %s values in %s checked layers" % (
-                 j.get("peq_bad"), j.get("peq_vals"), j.get("peq_layers"))),
-            ("%s-J1-COMPILE" % arm, True, bool(comp_ok),
-             "calls %s (joint passes %s x L %s); fallback %s; compile events %s; compile %s s; backend %s" % (
-                 j.get("calls"), jp, L, j.get("fallback"), ev, j.get("compile_s"), j.get("backend")))]
+    out = [("%s-J1-PEQ" % arm, True, bool(peq_ok),
+            "joint pooling bits vs the shipped kernel: %s differing of %s values in %s checked layers" % (
+                j.get("peq_bad"), j.get("peq_vals"), j.get("peq_layers"))),
+           ("%s-J1-COMPILE" % arm, True, bool(comp_ok),
+            "calls %s (joint passes %s x L %s); fallback %s; compile events %s; compile %s s; backend %s" % (
+                j.get("calls"), jp, L, j.get("fallback"), ev, j.get("compile_s"), j.get("backend")))]
+    if j.get("draft"):
+        dg = (rd or {}).get("dgraph") or {}
+        want = int(dg.get("capture_passes", 0)) * int(L)
+        d_ok = (want > 0 and j.get("dlayers") == want and j.get("dwarm") == 1 and j.get("dpeq_layers", 0) > 0
+                and j.get("dpeq_bad") == 0 and j.get("dpeq_vals", 0) > 0)
+        out.append(("%s-J1-DRAFT" % arm, True, bool(d_ok),
+                    "draft layers with the compiled pooling %s (draft capture passes %s x L %s); warm calls %s; draft "
+                    "pooling bits vs the shipped kernel: %s differing of %s values in %s checked layer replays" % (
+                        j.get("dlayers"), dg.get("capture_passes"), L, j.get("dwarm"), j.get("dpeq_bad"),
+                        j.get("dpeq_vals"), j.get("dpeq_layers"))))
+    return out

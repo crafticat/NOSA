@@ -12,7 +12,15 @@ j1m, j1a, j1b). Docs: docs/NOTES_j1.md.
 
 A J1 arm needs its I4DC arm EARLIER in the job (BASE_D of the copy: the arm's REF; it compiles the draft helpers, so
 the J1 arm compiles the pooling helper only). MUST GATES of a J1 arm: every gate of its I4DC arm under the J1 name (the
-I4S root arm's gates, the D arms' COMPILE, EQF = L4PTFD bit for bit), J1-PEQ, J1-COMPILE (r2_j1_select.j1_gates).
+I4S root arm's gates, the D arms' COMPILE, EQF = L4PTFD bit for bit), J1-PEQ, J1-COMPILE, J1-DRAFT
+(r2_j1_select.j1_gates).
+F2 ON THE BASELINE (the matched comparison): right after SH, ONE more shipped run SHJ1 with the shipped
+nosa_llama.nosa_pooling replaced by r2_j1_select.ShPool (the same compiled arithmetic, dynamic shapes), then
+restored (_BCProxy, run_sh_j1). SH's record and tokens stay SH's; SHJ1's record goes into every J1 arm's record
+(sh_j1) and the MUST gate J1-SHEQ (emitted once, with the first J1 arm): SHJ1's tokens = SH's bit for bit, the eager
+pooling calls' PEQ 0, the pooling inside the captures. Verdicts J1-SH-SAVING, J1-VS-SHJ1 and the MODEL line
+J1-STRONGEST-MATCHED (the strongest whole-step graph's rate with SHJ1's per-step saving). --sh-j1 0 skips SHJ1.
+NOTE: the SH memory record (SH-MEM) is taken after SHJ1 (the same footprint: one shipped run at a time).
 REGISTERED PREDICTIONS PRED_J1_BY_B: every value None until the lead registers them with PRED_STAMP_J1 (a None key is
 REPORT); the step script STOPS the timing cells (j1a, j1b) while PRED_STAMP_J1 is None.
 EXIT: the I4DC cell's (the number of failed MUST gates 0-19; 20 refused; 30 an exception outside an arm).
@@ -38,12 +46,23 @@ KEEP_J1 = ("L4PTFDGUDKWCDJ1",)
 # rounds (L61):
 #   J1_joint_saving  [ms per round] REF joint median - X joint median
 #   J1_joint_ratio   [x] X joint median / REF joint median
-#   J1_draft_ratio   [x] X draft median / REF draft median (the draft is unchanged: about 1)
+#   J1_draft_ratio   [x] X draft median / REF draft median (F2: the draft pooling compiled too)
+#   J1_draft_saving  [ms per round] REF draft median - X draft median (2 one-row passes)
 #   J1_vs_ref        [x] X / REF median steady committed tok/s (same job)
 #   J1_ratio         [x SH] X median steady committed tok/s / SH's
 #   J1_eq            [True] X-EQF passes (= L4PTFD bit for bit)
 #   J1_peak_gb       [GB] X's peak allocated GB, the prefill included
-#   J1_compile_s     [s] the pooling helper's compile seconds (one-time)
+#   J1_compile_s     [s] the pooling helper's compile seconds (one-time; joint + draft shapes)
+#   J1_sh_saving     [ms per step] SH steady step ms - SHJ1 steady step ms (F2 on the matched baseline)
+#   J1_vs_shj1       [x] X median steady committed tok/s / SHJ1's steady tok/s (the matched comparison)
+# F2 (commit 2 of rung J1): the one-row passes' pooling compiled inside the draft graphs; MEASURED basis lines 87
+# (3.14 ms per one-row pass at B 216) and 678 (4.71 ms at B 318). MODEL: 0.2-0.4 ms compiled -> 2.8 / 4.4 ms per pass,
+# 5.6 [4.5, 6.2] / 8.6 [7.0, 9.2] ms per round. J1_draft_ratio C 128 (132.29 - 6.2 .. 4.5) / 132.29 = (0.953, 0.966);
+# C 73 (176.44 - 9.2 .. 7.0) / 176.44 = (0.948, 0.960). J1_vs_ref then C 128 324.88 / (324.88 - 14.0 .. 19.7) =
+# (1.045, 1.065); C 73 524.66 / (524.66 - 21.0 .. 27.7) = (1.042, 1.056). J1_sh_saving: SH's pooling is the scalar
+# kernel with the same grid (H, B, M): 2.8 [2.0, 3.2] ms per step at B 216, 4.4 [3.4, 4.7] at B 318 (MODEL: the
+# per-request kernel's 3.14 / 4.71 ms as the basis). J1_vs_shj1 = J1_ratio x SH step / (SH step - J1_sh_saving).
+# The values in the C 128 / C 73 lines below are F1's; the lead registers F1 + F2 from this block.
 # THE BUILDER'S MODEL (an input for the lead, not a registration). MEASURED basis (KS/cpu-logs/recon7_r2_s2.txt, the I3
 # joint path = the I4DC arms' selection, one profiled pass): nosa_pool_kernel_per_request 12.28 ms per joint pass at
 # C 128 B 216 (line 21: grid (2, 864, 261), 383.88 us per layer) and 18.10 ms at C 73 B 318 (line 615: 565.74 us per
@@ -64,8 +83,8 @@ PRED_STAMP_J1 = None
 GRANT_j1m = None
 GRANT_j1a = None
 GRANT_j1b = None
-PRED_KEYS_J1 = ("J1_joint_saving", "J1_joint_ratio", "J1_draft_ratio", "J1_vs_ref", "J1_ratio", "J1_eq", "J1_peak_gb",
-                "J1_compile_s")
+PRED_KEYS_J1 = ("J1_joint_saving", "J1_joint_ratio", "J1_draft_ratio", "J1_draft_saving", "J1_vs_ref", "J1_ratio",
+                "J1_eq", "J1_peak_gb", "J1_compile_s", "J1_sh_saving", "J1_vs_shj1")
 PRED_J1_BY_B = {216: {k: None for k in PRED_KEYS_J1}, 318: {k: None for k in PRED_KEYS_J1}}
 
 _CUR = dict(arm=None)
@@ -132,7 +151,11 @@ def configure():
         g = gates0(arm, rd, rec, cpu, keep, check, B, pool, steps, L, pa)
         if arm in J1.ARMS_J1:
             rec["j1"] = (rd or {}).get("j1")                           # into the summary (the arm's record)
+            rec["sh_j1"] = SH_J1["result"]
             g = g + J1.j1_gates(arm, rd, L)
+            if not SH_J1["emitted"]:
+                SH_J1["emitted"] = True
+                g = g + [sh_gate()]
         return g
 
     def verdicts_j1(sh, sp, B, eqf=None):
@@ -140,9 +163,78 @@ def configure():
 
     D.run_arm_d, D.runner_choice, D.runner_class = run_arm_j1, runner_choice_j1, runner_class_j1
     D.keep_ref_arm, D.arm_gates, D.verdicts = keep_ref_arm_j1, arm_gates_j1, verdicts_j1
+    D.BC = _BCProxy(D.BC)                                                # SHJ1 after SH (the matched baseline)
     D._J1_CONFIGURED = True
     DCC = D
     return D
+
+
+# ------------------------------------------------------------------ F2 on the baseline: SHJ1 (the matched comparison)
+SH_J1 = dict(enabled=True, result=None, emitted=False)
+
+
+class _BCProxy:
+    """The private copy's BC (the base cell module) with run_shipped wrapped: after SH, ONE more shipped run (SHJ1)
+    with nosa_llama.nosa_pooling replaced by r2_j1_select.ShPool (F2 on the baseline), then restored. SH's own record,
+    inputs and gates are SH's run; SHJ1's record goes to SH_J1 (the J1 arm's record and gate J1-SHEQ)."""
+
+    def __init__(self, bc):
+        self._bc = bc
+
+    def __getattr__(self, name):
+        return getattr(self._bc, name)
+
+    def run_shipped(self, model, ids, steps, clock, fp=None):
+        bc = self._bc
+        out = bc.run_shipped(model, ids, steps, clock, fp=fp)
+        if SH_J1["enabled"] and SH_J1["result"] is None:
+            SH_J1["result"] = run_sh_j1(bc, model, ids, steps, clock, out)
+        return out
+
+
+def run_sh_j1(bc, model, ids, steps, clock, sh_out, NL=None) -> dict:
+    """SHJ1: the shipped run with the compiled pooling (the matched baseline). Returns its record: the steady rates (the
+    same statistic as SH's), the tokens' bit equality with SH's, the pooling PEQ of the eager calls, the compile record,
+    or the exception. NL: the module whose nosa_pooling the shipped layers call (None: nosi.nosa_llama; tests: a
+    stand-in)."""
+    import torch
+    if NL is None:
+        import nosi.nosa_llama as NL
+    bc.free()
+    orig = NL.nosa_pooling
+    sp = J1.ShPool(orig)
+    rec = dict(ran=False)
+    try:
+        NL.nosa_pooling = sp
+        o2 = bc.run_shipped(model, ids, steps, clock, fp=None)
+        rw = {t for t, _ in o2["rewarms"]}
+        steady = bc.period_stats(o2["periods"], [t for t in range(steps) if t not in rw])
+        rec = dict(ran=True, steady=steady, rates=bc.rates(ids.shape[0], steps, o2["periods"], steady),
+                   rewarms=o2["rewarms"], tokens_equal=bool(torch.equal(o2["inputs"], sh_out["inputs"])),
+                   pool=sp.report())
+        del o2
+    except Exception as e:                                             # the gate reports it (the job goes on)
+        traceback.print_exc()
+        rec = dict(ran=False, error="%s: %s" % (type(e).__name__, str(e)[:300]), pool=sp.report())
+    finally:
+        NL.nosa_pooling = orig
+        bc.free()
+    return rec
+
+
+def sh_gate():
+    """J1-SHEQ (MUST, emitted once with the first J1 arm): SHJ1 ran, its tokens = SH's bit for bit, the eager pooling
+    PEQ ran with 0 differing values, and its pooling ran inside the captures."""
+    r = SH_J1["result"]
+    if r is None:
+        return ("J1-SHEQ", False, False, "REPORT: SHJ1 did not run (--sh-j1 0 or SH failed)")
+    p = r.get("pool") or {}
+    ok = (r.get("ran") and r.get("tokens_equal") and p.get("peq_calls", 0) > 0 and p.get("peq_bad") == 0
+          and p.get("captured", 0) > 0)
+    return ("J1-SHEQ", True, bool(ok), "ran %s; tokens equal to SH %s; pooling calls %s (captured %s), eager PEQ %s "
+            "differing of %s in %s calls; compile %s s; error %s" % (
+                r.get("ran"), r.get("tokens_equal"), p.get("calls"), p.get("captured"), p.get("peq_bad"),
+                p.get("peq_vals"), p.get("peq_calls"), p.get("compile_s"), r.get("error")))
 
 
 def j1_arm(sp):
@@ -190,12 +282,37 @@ def verdicts(sh, sp, B: int, D=None):
     band("J1-RATIO", ratio(med(x), shm), P.get("J1_ratio"))
     band("J1-PEAK-GB", D.IA.peak_gb(x), P.get("J1_peak_gb"))
     band("J1-COMPILE-S", ((x.get("j1") or {}).get("compile_s")), P.get("J1_compile_s"))
-    out.append(("J1-ARM", "REPORT", "X = %s, REF = %s (REF ran: %s); J1 record %s" % (
-        X, J1.ARMS_J1[X], r is not None, x.get("j1"))))
+    dr, dx = ph(r, "draft"), ph(x, "draft")
+    band("J1-DRAFT-SAVING", (dr - dx) if (dr is not None and dx is not None) else None, P.get("J1_draft_saving"))
+    s1 = SH_J1["result"] or {}
+    shs = ((sh or {}).get("rates") or {}).get("steady_step_ms")
+    s1s = (s1.get("rates") or {}).get("steady_step_ms")
+    sav = (shs - s1s) if (shs is not None and s1s is not None) else None
+    band("J1-SH-SAVING", sav, P.get("J1_sh_saving"))
+    s1t = (s1.get("rates") or {}).get("steady_tok_s")
+    band("J1-VS-SHJ1", ratio(med(x), s1t), P.get("J1_vs_shj1"))
+    strong = getattr(D, "STRONGEST", None)
+    matched = (1000.0 * B / (1000.0 * B / strong - sav)) if (strong and sav is not None) else None
+    out.append(("J1-STRONGEST-MATCHED", "REPORT", "MODEL: the strongest whole-step graph %s tok/s with the same per-step "
+                "pooling saving as SH -> SHJ1 (%s ms): %s tok/s; X / it %s (X / %s: %s)" % (
+                    strong, None if sav is None else round(sav, 3), None if matched is None else round(matched, 1),
+                    None if (matched is None or med(x) is None) else round(med(x) / matched, 4), strong,
+                    None if (strong is None or med(x) is None) else round(med(x) / strong, 4))))
+    out.append(("J1-ARM", "REPORT", "X = %s, REF = %s (REF ran: %s); J1 record %s; SHJ1 %s" % (
+        X, J1.ARMS_J1[X], r is not None, x.get("j1"), {k: v for k, v in s1.items() if k != "steady"})))
     return out
 
 
 def main(argv=None) -> int:
+    """The I4DC cell's main on the private copy. One extra option of this cell: --sh-j1 {0,1} (default 1: run SHJ1)."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--sh-j1" in argv:
+        i = argv.index("--sh-j1")
+        if i + 1 >= len(argv) or argv[i + 1] not in ("0", "1"):
+            print("REFUSED: --sh-j1 0 or 1", file=sys.stderr)
+            return 20
+        SH_J1["enabled"] = argv[i + 1] == "1"
+        del argv[i:i + 2]
     D = configure()
     return D.main(argv)
 

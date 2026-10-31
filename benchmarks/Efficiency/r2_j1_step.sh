@@ -26,6 +26,8 @@
 #        --mem 240G. STOPS while PRED_STAMP_J1 is None.
 #   j1b  timing, C 73 (pool 10), B 318, 512 steps, arms L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDJ1. STEP_MIN
 #        170, --mem 340G. STOPS while PRED_STAMP_J1 is None.
+# Every cell also runs SHJ1 right after SH (the shipped run with the compiled pooling: the matched baseline of F2;
+# about one more SH run, 1-4 min; inside the margins below).
 # Basis of STEP_MIN (MEASURED, sacct, CITED by r2_recon7_step.sh:42-46): i4dca (SH + 3 arms, C 128 B 216) 00:47:32;
 # i4dcb 01:11:41; i4dm2 (SH + 6 arms, B 8) 00:09:08 / 00:09:18. MODEL: j1a = i4dca + one D-arm part (11.5 min) + one
 # compile (<= 1 min) = about 60 min (margin 1.8); j1b = i4dcb + 17 + 1 = about 90 min (margin 1.9); j1m = i4dm2 + 2

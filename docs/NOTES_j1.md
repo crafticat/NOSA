@@ -30,6 +30,24 @@ Tree /mnt/beegfs/ojerbi/nosi-r2-j1 (branch r2-j1) on RECON7 cd0f0c5. SOURCE ONLY
 - The runner re-classes the I4DC state (`T.__class__`); every I4DC lever, graph and compile helper stays as it is.
 - Untouched: the one-row (draft) selection (fix F2 is the next rung), every kernel, nosi/.
 
+## 2b. F2 (second commit): the draft passes' pooling, and the same fix on the baseline (SHJ1)
+
+- Draft: the I4H draft graphs (benchmarks/Efficiency/r2_i4h_graph.py:304-371) capture A(l) with the layer's
+  selection inline (`_Inline`, :155-165, swapped in at :326-328, restored at :340-342). The J1 state overrides
+  `_dbegin_a`: (1) before the capture, ONE eager warm call compiles pool_fn for the B-entry shape on scratch outputs;
+  (2) after the capture begins, `rs.graphs[l]` = `_InlineJ1` (the compiled pooling + ragged_engine._pool_topk's
+  other ops on the same tensors, ragged_engine.py:333-343). Counts (rs.replays) stay the shipped ones: RE._select
+  counts after `replay()` (:369-370). Check-key graphs also run the shipped kernel into scratch: device counters
+  dpeq_bad / dpeq_vals / dpeq_layers (gate J1-DRAFT).
+- MEASURED basis: 3.14 ms per one-row pass at B 216 (recon7_r2_s2.txt:87), 4.71 ms at B 318 (:678).
+- Baseline: SH's shipped step calls `nosa_llama.nosa_pooling` (the scalar kernel, max_pooling_fused.py:7-107: the
+  same one-program-per-output grid) at nosa_llama.py:447 (eager) and :462 (inside the after-pooling graph). The cell
+  runs ONE extra shipped run (SHJ1) right after SH with that global replaced by `ShPool` (pool_fn compiled with dynamic
+  shapes behind the shipped signature; the eager warm-up calls compared with the shipped kernel), then restores it.
+  Gate J1-SHEQ: SHJ1's tokens = SH's bit for bit. Verdicts J1-SH-SAVING, J1-VS-SHJ1, J1-STRONGEST-MATCHED (MODEL: the
+  whole-step graph's 3,407.2 tok/s with SHJ1's per-step saving; the whole-step graph itself lives in the tree
+  nosi-r2-graphstep, not in this lineage: a measured matched strongest needs its port, not done).
+
 ## 3. The reuse line (the lead's rule: upstream basis, incompatibility or cost, minimal adaptation, validation)
 
 - Upstream basis: NOSA's `nosa_pool_kernel` (nosi/nosi/max_pooling_fused.py:7-75) as forked per request in
@@ -76,7 +94,10 @@ Registration: `PRED_J1_BY_B` + `PRED_STAMP_J1` (the builder's MODEL is the comme
 MUST gates per J1 arm: every gate of its I4DC arm under the J1 name (RUN, ERR, COMMIT-N, D1, D3, SPAN, RESID, ATTN1,
 FILL1, LEAN, MEM, GRAPH, COUNTS, DGRAPH, HOIST, the keep gates, COMPILE, EQF = L4PTFD bitwise), J1-PEQ (0 differing
 values; checked layers > 0), J1-COMPILE (at most one compile event, none in a capture, no fallback, calls = joint passes
-x 32). Since the I4DC arm in the same job also passes EQF, the J1 arm is bitwise its I4DC arm.
+x 32), J1-DRAFT (every captured one-row layer runs the compiled pooling, one warm call, draft PEQ 0 of > 0 values);
+once per job J1-SHEQ (SHJ1's tokens = SH's bitwise; eager pooling PEQ 0; pooling inside the captures). Since the I4DC
+arm in the same job also passes EQF, the J1 arm is bitwise its I4DC arm. Decision rule for F2 (j1a): J1-DRAFT-SAVING
+in [4.5, 6.2] ms and J1-SH-SAVING reported; the verdict against the baseline uses J1-VS-SHJ1 (matched), not J1-RATIO.
 Decision rule (j1a): ADOPT F1 when every MUST gate passes and J1-JOINT-SAVING (REF joint median - J1 joint median) is
 in [9.5, 13.5] ms. Falsifier: J1-JOINT-SAVING < 5 ms (the compiled gather is far from its byte floor), or J1-PEQ > 0.
 Expected (MODEL; per round = per joint pass, the draft unchanged):
@@ -85,7 +106,9 @@ Expected (MODEL; per round = per joint pass, the draft unchanged):
 |---|---|---|
 | joint selection, pooling part (in H's verify rows; the model charges 0) | 12.28 -> 0.5-1.0 ms: -11.6 [9.5, 13.5] | 18.10 -> 0.7-1.5: -17.1 [14.0, 18.5] |
 | round (BEST 324.88 / 524.66 ms MEASURED) | about 313.3 ms; tok/s x1.030-1.043 | about 507.6 ms; x1.027-1.037 |
-| draft passes (n td) | 0 (F2 next: -5.7 / -8.6 per round) | 0 |
+| draft passes (n td), F2 | 2 x (3.14 -> 0.2-0.4) = -5.6 [4.5, 6.2] per round | 2 x (4.71 -> 0.3-0.5) = -8.6 [7.0, 9.2] |
+| round with F1 + F2 | about 307.7 ms; x1.045-1.065 vs REF | about 499 ms; x1.042-1.056 |
+| matched baseline SHJ1 (per SH step) | -2.8 [2.0, 3.2] ms | -4.4 [3.4, 4.7] ms |
 
 ## 6. One row per formula term owned by AREA 1 (LEDGER_rev7 section-1 format)
 
