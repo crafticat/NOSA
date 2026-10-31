@@ -24,7 +24,7 @@ CELL_MODULE = dict(r7pm="r2_recon7_cell", r7pa="r2_recon7_cell", r7pb="r2_recon7
 GRANT_r7pm = None
 GRANT_r7pa = None
 GRANT_r7pb = None
-GRANT_r7s = None
+GRANT_r7s = "2026-10-31T11:38:06Z"
 GRANT_r7mem = None
 
 _ARMS_A = ["L4PTFD", "L4PTFDGUDC", "L4PTFDGUDCD", "L4PTFDGUDCDP"]
