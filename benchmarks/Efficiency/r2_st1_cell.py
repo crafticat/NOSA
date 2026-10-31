@@ -100,9 +100,9 @@ PRED_ST1_BY_B = {
               ST2_vs_m=(1.002, 1.006))}
 # THE CELL GRANTS (default deny; r2_st1_step.sh's granted() reads these lines at <sha>): the lead sets a `date -u` stamp,
 # e.g. GRANT_st1m = "2026-10-31T12:00:00Z", in a commit after the protocol review.
-GRANT_st1m = None
-GRANT_st1a = None
-GRANT_st1b = None
+GRANT_st1m = "2026-10-31T13:36:25Z"
+GRANT_st1a = "2026-10-31T13:36:25Z"
+GRANT_st1b = "2026-10-31T13:36:25Z"
 
 
 def log(msg):
