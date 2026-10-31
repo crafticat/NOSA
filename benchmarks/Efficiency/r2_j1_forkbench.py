@@ -45,7 +45,7 @@ import traceback
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-GRANT_j1f = None
+GRANT_j1f = "2026-10-31T13:22:30Z"
 HQ, HKV, HD, BS, P_ROW, R = 32, 2, 128, 64, 64, 4
 ROW_SHIFT = (0, 3, 5, 8)                                      # the rows' page offsets: union 64 + 8 = 72
 UNION = P_ROW + ROW_SHIFT[-1]
