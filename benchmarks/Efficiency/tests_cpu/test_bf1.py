@@ -194,7 +194,8 @@ def test_pure_rows_rank_alive():
 
 # ------------------------------------------------------------------ the world runs
 def _builder(mode="ce", worker="inline", Xs=None, acct=True, bneg=None, check=False, stats=False, kcheck=False,
-             phase_marks=False, probe_every=0, n_cap=4096, ring=4, packer="torch", gf=None, threads=2):
+             phase_marks=False, probe_every=0, n_cap=4096, ring=4, packer="torch", gf=None, threads=2, late="drop",
+             late_wait_ms=100.0, stall_ms=0.0):
     """i4dc_world.d_builder's L4PTFDGUDKWCD with the BF1 runner and its options (and the store X)."""
     BF = _mod("r2_bf1_fetch")
     W, RE, SR, I3, KA, RW, WB, Z = X.W, X.RE, X.SR, X.I3, X.KA, X.RW, X.WB, X.Z
@@ -213,7 +214,8 @@ def _builder(mode="ce", worker="inline", Xs=None, acct=True, bneg=None, check=Fa
                   phase_marks=phase_marks, dneg=None, hneg=None, gneg=None, sneg=None, dgneg=None,
                   cc_backend="inductor", ccneg=None, cdneg=None, keep=True, kwin=True, kcheck=kcheck, kneg=None,
                   kslots=None, cneg=None, bf=dict(mode=mode, worker=worker, acct=acct, bneg=bneg, n_cap=n_cap,
-                                                  ring=ring, packer=packer, gf=gf, threads=threads))
+                                                  ring=ring, packer=packer, gf=gf, threads=threads, late=late,
+                                                  late_wait_ms=late_wait_ms, stall_ms=stall_ms))
         be = X.FakeGraphsDCD()
         run = Runner(model, rs, sops, BC.HostClock(), graph_backend=be, **kw)
         be.T = run.T
@@ -313,6 +315,31 @@ def test_bf1_thread():
     _ev("BF1 THREAD: jobs %d, issued %d, late %d, empty %d; sent %d, committed %d, used %d" % (
         bf["jobs"], bf["issued"], bf["late"], bf["empty_jobs"], bf["items_sent"], bf["committed"],
         bf["used_store"] + bf["used_win"]))
+
+
+@pytest.mark.parametrize("late", ["drop", "defer"])
+def test_bf1_late(late):
+    """A SLOW worker (stall 200 ms per job, tests only) makes jobs late at the joint pass's start. drop: abandoned
+    (late > 0, the claim holds); defer: committed at THEIR layer of the joint pass on the compute stream (deferred
+    committed > 0 with a large host budget, none passed), the claim and the gates hold, the counters close."""
+    ref = _plain("GUDKCD")
+    ev = _run_bf("timing", worker="thread", late=late, late_wait_ms=60000.0, stall_ms=200.0, ring=2)
+    bad = TS._diff(ref, ev, skip=DIFF_RD, tensors_skip=DIFF_T)
+    assert bad == [], bad[:10]
+    bf = ev["rd"]["bf"]
+    gs = _gates(ev, "timing")
+    assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
+    assert bf["jobs"] == bf["issued"] + bf["late"] + bf["empty_jobs"], bf
+    if late == "drop":
+        assert bf["late"] > 0 and not bf.get("deferred"), bf
+    else:
+        assert bf.get("deferred_committed", 0) > 0 and not bf.get("late_passed"), bf
+        assert bf["deferred_committed"] == bf["deferred"], bf
+    _ev("BF1 LATE %s: jobs %d, issued %d, late %d (queued %s, packing %s, passed %s), deferred %s / committed %s, "
+        "no room deferred %s, host wait %s s, used %d" % (
+            late, bf["jobs"], bf["issued"], bf["late"], bf.get("late_queued"), bf.get("late_packing"),
+            bf.get("late_passed"), bf.get("deferred"), bf.get("deferred_committed"), bf.get("no_room_deferred"),
+            bf.get("late_wait_s"), bf["used_store"] + bf["used_win"]))
 
 
 @pytest.mark.parametrize("bneg", ["wrong_bytes", "no_copy"])
@@ -427,6 +454,7 @@ def test_step_script_bf1(monkeypatch, tmp_path):
     monkeypatch.setenv("TORCH_EXTENSIONS_DIR", str(tmp_path))         # the step script sets it ($JIT/torch_ext)
     text = (EFF / "r2_bf1_step.sh").read_text()
     assert "--bf-packer gilfree" in text and "nosi/nosi/r2_transport_gilfree_v3.py" in text
+    assert "--bf-threads 14" in text and "--bf-late defer" in text and "--bf-cap-groups 1024" in text
     assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-bf1" in text and "CELLPY=benchmarks/Efficiency/r2_bf1_cell.py" in text
     assert "benchmarks/Efficiency/r2_bf1_fetch.py" in text and "^PRED_STAMP_BF1 = None$" in text   # the STOP rule
     cell_src = (EFF / "r2_bf1_cell.py").read_text()                   # STATE-AWARE: the cell's line the rule reads
@@ -442,8 +470,10 @@ def test_step_script_bf1(monkeypatch, tmp_path):
         argv = ["--out", "/x", "--workload", "/w", "--batch", kv["BATCH"], "--steps", kv["STEPS"], "--pool",
                 kv["POOL"], "--arms", kv["ARMS"], "--bf-store", kv["BFX"], "--bf-ncap", kv["NCAP"],
                 "--check-every", kv.get("CHECK", "0"), "--require-stress", kv.get("STRESS", "0"),
-                "--bf-acct", kv.get("ACCT", "0"), "--bf-packer", "gilfree", "--bf-threads", "8"]
+                "--bf-acct", kv.get("ACCT", "0"), "--bf-packer", "gilfree", "--bf-threads", "14", "--bf-ring", "16",
+                "--bf-cap-groups", "1024", "--bf-late", "defer", "--bf-late-wait-ms", "100"]
         a = C.parse_args(argv)
-        assert a.bf_packer == "gilfree"
+        assert a.bf_packer == "gilfree" and C.bf_opt(a, "L4PTFDGUDKWCDB")["late"] == "defer"
+        assert C.bf_opt(a, "L4PTFDGUDKWCDB")["gf"] == dict(cap_groups=1024)
         assert "L4PTFDGUDKWCDB" in a.arms and "L4PTFDGUDKWCDX" in a.arms, (cell, a.arms)
     _ev("BF1 STEP: cells %s parse" % sorted(CELLS))

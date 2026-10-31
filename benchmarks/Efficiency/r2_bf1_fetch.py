@@ -68,6 +68,25 @@ reader is the commit of the entry's last use (mark_reader of the commit's done e
 worker host-waited the snapshot event (after the write-back in stream order), so hist_mark -1. The commit reads the lane
 rows (lane x 64 + r) x H + h and is otherwise the same. Before every graph capture the transport is drained under the cap
 lock (its C++ worker makes CUDA calls: pool_prefetch.begin_step(capture=True)'s rule). The SAME byte checks apply.
+LATE (late="defer", the production default of the cell; "drop" = abandon at the barrier, bf1m m2's behaviour). THE
+THROUGHPUT THE C 73 LEVER NEEDS (MODEL on MEASURED inputs: r7pb NEW 2.93-3.01 GB per joint pass, flagA 0.469; bf1m m2:
+used / sent 0.80, gilfree 8 threads 4.65 GB/s native, every late job of the last draft pass): sent per round about
+0.469 x 2.97 / 0.80 = 1.74 GB. With "drop" every byte must be packed and copied between the first draft snapshot and
+the joint pass's start: the draft phase 176.4 ms + commit / reset 8.5 ms = 185 ms -> 9.4 GB/s sustained pack (2x the
+measured 4.65; the link's 25 GB/s is not the limit: 70 ms). With "defer" the job of layer l is needed only when the
+joint pass reaches layer l (about l / 32 x 339 ms after its start): the binding point is D1's layer 0, cumulative
+about 0.87 GB (all of D0 + one job) by 185 ms = 4.7 GB/s; the last job (1.74 GB by 185 + 329 ms) needs 3.4 GB/s. So
+"defer" lowers the need to about the measured rate; 14 threads and 1024-group chunks (less per-chunk overhead than the
+256 of m2) are the cheap rate lever. DEFER, the mechanism: at the joint pass's start the epoch is CLOSING, not closed:
+a job issued after it lands (H2D on the side stream; gilfree: the side stream waits the transport job) and waits in
+ep.deferred[l]; the joint pass's eager residency of layer l (TentStateBF._resid_joint -> on_joint_layer) first waits on
+the host for the queued jobs of layers <= l (within late_wait_ms per pass: the host runs ahead of the GPU by the queued
+layers' time), then commits EVERY landed job of layers >= l ON THE COMPUTE STREAM (the map is shared by the layers: no other
+stream may write it while the pass runs; slots that the pass's keep used are alive, kage >= (g + 1) L > g L, so the
+commit never takes them); a job that lands after its layer ran is dropped ("passed"). A deferred job holds its landing
+entry until committed (land_busy; torch packer: the next copy into the entry waits the commit's event; gilfree: its
+reader mark). The deferred commits' no-room items count apart (no_room_deferred: the pass's keep may take dead slots
+that the host counted as room). The epoch closes at the pass's end; leftovers are dropped.
 CUDA GRAPHS. Nothing here enters a graph: every op is eager, between graph launches. A capture in global mode fails when
 another thread calls the CUDA API, so the runner wraps the graph backend's begin / capture: the capture holds the lock
 that the worker takes around every CUDA call.
@@ -95,9 +114,10 @@ BIGI = 1 << 62
 MODES = ("ce", "off")
 WORKERS = ("thread", "inline")
 PACKERS = ("torch", "gilfree")          # the host pack: torch.index_select (pinned) | r2_transport_gilfree_v3 (C++ team)
+LATES = ("drop", "defer")               # a job not issued at the joint pass's start: abandoned | committed at ITS layer
 BNEG = (None, "wrong_bytes", "no_copy")
 # device counters: the side stream's (one tensor) and the compute stream's (another tensor): no tensor has two writers
-SIDE_KEYS = ("items", "committed", "revived", "no_room")
+SIDE_KEYS = ("items", "committed", "revived", "no_room", "no_room_deferred")
 MAIN_KEYS = ("used_store", "unused", "used_win")
 
 
@@ -144,6 +164,10 @@ class _Epoch:
         self.free = None                                 # host (H, B): the commit's eligible slots left (ROOM)
         self.free0 = None                                # the same at the epoch's start (the report)
         self.jobs_at_close = None
+        self.closing = False                             # defer: the joint pass runs; jobs commit at THEIR layer
+        self.consumed_upto = -1                          # defer: the joint pass's layers <= this were committed
+        self.deferred = {}                               # defer: layer -> [(entry, n, ready event)] landed, waiting
+        self.pend = {}                                   # layer -> jobs queued and not finished (thread worker)
         self.jobs = self.issued = self.late = 0
         self.items_seen = self.items_have = self.items_cap = self.items_sent = self.items_room = 0
         self.t_close = None                              # host clock at the close (the late jobs' age)
@@ -205,11 +229,16 @@ class BgFetch:
 
     def __init__(self, T, mode: str = "ce", n_cap: int = 1024, ring: int = 8, worker: str = "thread",
                  acct: bool = False, bneg=None, close_wait_ms: float = 0.0, packer: str = "torch", threads: int = 8,
-                 gf=None):
-        if mode not in MODES or worker not in WORKERS or bneg not in BNEG or packer not in PACKERS:
-            raise BFError("mode %r / worker %r / bneg %r / packer %r: one of %s / %s / %s / %s" % (
-                mode, worker, bneg, packer, MODES, WORKERS, BNEG, PACKERS))
+                 gf=None, late: str = "drop", late_wait_ms: float = 100.0, stall_ms: float = 0.0):
+        if (mode not in MODES or worker not in WORKERS or bneg not in BNEG or packer not in PACKERS
+                or late not in LATES):
+            raise BFError("mode %r / worker %r / bneg %r / packer %r / late %r: one of %s / %s / %s / %s / %s" % (
+                mode, worker, bneg, packer, late, MODES, WORKERS, BNEG, PACKERS, LATES))
+        if float(late_wait_ms) < 0 or float(stall_ms) < 0:
+            raise BFError("late_wait_ms >= 0, stall_ms >= 0")
         self.packer, self.threads, self.gf = packer, int(threads), dict(gf or {})
+        self.late_mode, self.late_wait_ms = late, float(late_wait_ms)
+        self.stall_ms = float(stall_ms)                  # tests only: the worker sleeps per job (forces late jobs)
         if getattr(T, "kid", None) is None or not getattr(T, "kwin", False):
             raise BFError("BF1 needs the kept store with window loads (keep=True, kwin=True)")
         if int(n_cap) < 1 or int(ring) < 2 or float(close_wait_ms) < 0:
@@ -248,6 +277,8 @@ class BgFetch:
         self.side = None
         self.tp = None                                   # the gilfree transport (packer "gilfree", mode "ce" only)
         self.late_ages = []                              # ms from enqueue to the close, per late job
+        self.jep = None                                  # defer: the epoch the running joint pass consumes
+        self.jwait_left = 0.0                            # defer: the host wait budget left in this joint pass (s)
         kb = getattr(T, "kblock", None)                  # the keep's test-only slot limit, on the host (ROOM)
         self.kblock_h = kb.cpu().numpy() if kb is not None else None
         self._alloc()
@@ -286,16 +317,20 @@ class BgFetch:
         self.land_it = torch.zeros((self.ring, self.n_cap, 5), dtype=i64, device=dev)
         self.stage_it = self._pinned((self.ring, self.n_cap, 5), i64)
         self.h2d_done = [None] * self.ring               # the event of the entry's last H2D (the staging lifetime)
+        self.land_busy = [False] * self.ring             # defer: the entry holds a job that waits for its layer
+        self.land_reader = [None] * self.ring            # torch packer: the entry's last reader on the compute stream
         self.land_i = 0
         self.tp = None
+        self.lanes_e = max(1, self.n_cap // H)           # gilfree: lanes per entry (a lane holds one block per head)
         if self.packer == "torch":                       # landing (ring, n_cap x 64 rows, D): item-major rows
             self.land_k = torch.empty((self.ring, n, D), dtype=self.kdt, device=dev)
             self.land_v = torch.empty((self.ring, n, D), dtype=self.kdt, device=dev)
             self.stage_k = self._pinned((self.ring, n, D), self.kdt)
             self.stage_v = self._pinned((self.ring, n, D), self.kdt)
         else:                                            # GILFREE (module docstring, PACKER): the flat lanes
-            self.land_k = torch.zeros((self.ring * n, H, D), dtype=self.kdt, device=dev)
-            self.land_v = torch.zeros((self.ring * n, H, D), dtype=self.kdt, device=dev)
+            ln = self.ring * self.lanes_e * bs           # the same bytes as the torch landing (n_cap x 64 x H / H)
+            self.land_k = torch.zeros((ln, H, D), dtype=self.kdt, device=dev)
+            self.land_v = torch.zeros((ln, H, D), dtype=self.kdt, device=dev)
             self.lmark = [-1] * self.ring                # the reader mark (the last commit) of each landing entry
             self.mark_next = 0
             self.tp = self._transport()
@@ -322,7 +357,7 @@ class BgFetch:
         return cls(ext, [e._k_cpu for e in self.engs], [e._v_cpu for e in self.engs], [self.land_k] * L,
                    [self.land_v] * L, self.bs, self.D, self.threads, lambda ev: ev.synchronize(),
                    cap_groups=int(g.get("cap_groups", 256)), ring=2, cores=g.get("cores"), worker="cpp",
-                   xpool=_LaneMap(self.ring * self.n_cap, self.B, self.H))
+                   xpool=_LaneMap(self.ring * self.lanes_e, self.B, self.H))
 
     def bytes_device(self) -> int:
         """The device bytes BF1 allocated (the landing ring, the snapshot ring, the tags)."""
@@ -405,7 +440,11 @@ class BgFetch:
             waited = time.perf_counter() - t0
         with self.lock:
             ep = self.epoch
-            ep.closed = True
+            if self.late_mode == "defer":                # LATE = DEFER: the jobs not issued yet commit at their layer
+                ep.closing, ep.consumed_upto = True, -1
+                self.jep, self.jwait_left = ep, self.late_wait_ms / 1e3
+            else:
+                ep.closed = True
             ep.t_close = time.perf_counter()
             ep.jobs_at_close = ep.jobs
             last = ep.last
@@ -428,6 +467,20 @@ class BgFetch:
         """J end: the used / unused accounting of the epoch's tags, then a new epoch."""
         if self.mode == "off":
             return
+        ep = self.jep
+        if ep is not None:                               # defer: the epoch ends with its joint pass
+            with self.cv:
+                with self.lock:
+                    for l in sorted(ep.deferred):        # landed after their layer ran: wasted, entries freed
+                        for e, n, _ in ep.deferred[l]:
+                            self.land_busy[e] = False
+                            self._late(ep, ep.jobs, ep.t_close, "passed", n)
+                    ep.deferred.clear()
+                    ep.closed = True
+                    self.jep = None
+                    self.rep["late_wait_s"] = self.rep.get("late_wait_s", 0.0) + (self.late_wait_ms / 1e3
+                                                                                  - self.jwait_left)
+                self.cv.notify_all()
         T = self.T
         t1 = int(T.kpass) * self.L
         tg = self.ptag[..., 1:]
@@ -439,6 +492,73 @@ class BgFetch:
         self.ptag.zero_()
         self.ptagw.zero_()
         self.open_epoch()
+
+    def on_joint_layer(self, l: int) -> None:
+        """LATE = DEFER, the joint pass's layer l (compute thread, eager, BEFORE its residency reads the map): commit
+        every landed job of layers >= l on the COMPUTE stream (serial with keep_assign and kwin: the map is shared by the
+        layers, so no other stream may write it while the pass runs); while a job of a layer <= l is still queued, wait
+        for it on the host within the pass's budget (the host runs ahead of the GPU by the queued layers' time). A job
+        that lands after its layer ran is dropped (late "passed")."""
+        ep = self.jep
+        if ep is None or self.mode == "off":
+            return
+        with self.cv:
+            while True:
+                pend = sum(c for x, c in ep.pend.items() if x <= l)     # read BEFORE the consume: a job that
+                with self.lock:                                         # finished before it is consumed now
+                    self._consume(ep, l)
+                self.cv.notify_all()                     # freed entries: a worker waiting for one goes on
+                if pend == 0 or self.jwait_left <= 0 or self.error is not None:
+                    break
+                t0 = time.perf_counter()
+                self.cv.wait(self.jwait_left)
+                self.jwait_left -= time.perf_counter() - t0
+            with self.lock:
+                ep.consumed_upto = l
+            self.cv.notify_all()
+
+    def _consume(self, ep, l: int) -> None:
+        """Under the cv and the lock: EVERY landed deferred job, committed on the compute stream at layer l: layers >= l
+        (a later layer's keys enter early, as the side commits did before the pass; slots of the pass's layers < l are
+        alive and never taken; committing all frees every landing entry, so a queued job never waits for an entry that
+        only a later layer would free), layers < l dropped (their layer ran)."""
+        for x in sorted(ep.deferred):
+            for e, n, ready in ep.deferred.pop(x):
+                if x < l:
+                    self._late(ep, ep.jobs, ep.t_close, "passed", n)
+                else:
+                    if self.cuda:
+                        torch.cuda.current_stream().wait_event(ready)
+                    itd = self.land_it[e][:n]
+                    self._commit(itd, n, x, ep.g, *self._src(e, n, itd), deferred=True)
+                    done = self._ev()
+                    done.record()
+                    self._entry_read(e, done)
+                    self.rep["deferred_committed"] = self.rep.get("deferred_committed", 0) + 1
+                    ep.issued += 1
+                    ep.items_sent += n
+                    self.rep["issued"] += 1
+                    self.rep["items_sent"] += n
+                self.land_busy[e] = False
+
+    def _src(self, e: int, n: int, itd):
+        """The items' K / V rows (n x 64, D) of landing entry e: the torch packer's item-major rows, or (gilfree) the
+        rows (lane x 64 + r) x H + h of each item's lane and head."""
+        bs, H, D = self.bs, self.H, self.D
+        if self.packer == "torch":
+            return self.land_k[e][:n * bs], self.land_v[e][:n * bs]
+        rsrc = ((itd[:, 4].view(n, 1) * bs + self.ar_bs.view(1, bs)) * H + itd[:, 0].view(n, 1)).reshape(-1)
+        return self.land_k.view(-1, D).index_select(0, rsrc), self.land_v.view(-1, D).index_select(0, rsrc)
+
+    def _entry_read(self, e: int, done) -> None:
+        """The landing entry e was read (its commit) up to `done` (under the lock): the next copy into e waits it."""
+        if self.packer == "torch":
+            self.land_reader[e] = done
+        else:
+            mk = self.mark_next
+            self.mark_next += 1
+            self.tp.mark_reader(mk, done)
+            self.lmark[e] = mk
 
     def on_window(self, l: int, eng, skip) -> None:
         """acct=True, after the joint residency of layer l: the row-0 loads that a tagged store slot served (kwin)."""
@@ -474,6 +594,7 @@ class BgFetch:
             self._start()
             with self.cv:
                 self.inflight += 1
+                ep.pend[int(l)] = ep.pend.get(int(l), 0) + 1
             self.q.put(job)
 
     def _snap_slot(self) -> int:
@@ -513,6 +634,7 @@ class BgFetch:
                 finally:
                     with self.cv:
                         self.inflight -= 1
+                        job[0].pend[job[1]] -= 1
                         self.rep["worker_busy_s"] = self.rep.get("worker_busy_s", 0.0) + time.perf_counter() - tj
                         self.cv.notify_all()
 
@@ -540,6 +662,8 @@ class BgFetch:
     def _job(self, ep, l: int, s: int, j: int = 0, t_enq: float = 0.0) -> None:
         """Steps 2-3 of the module docstring for one (draft pass, layer) snapshot."""
         H, B, L, bs, D = self.H, self.B, self.L, self.bs, self.D
+        if self.stall_ms > 0:                            # tests only: a slow worker (late jobs on purpose)
+            time.sleep(self.stall_ms / 1e3)
         with self.cap_lock:                              # a CUDA call: not during a capture
             self.snap_ev[s].synchronize()
         ids = self.snap_h[s].numpy().copy()
@@ -570,6 +694,10 @@ class BgFetch:
         h, b, blk = h[room], b[room], blk[room]
         n_cap = max(0, h.shape[0] - self.n_cap)
         h, b, blk = h[:self.n_cap], b[:self.n_cap], blk[:self.n_cap]
+        if self.packer == "gilfree":                     # a lane per (head, rank in head): n_cap / H lanes per entry
+            lk = group_rank(h, np.zeros_like(h), 1) < self.lanes_e
+            n_cap += int((~lk).sum())
+            h, b, blk = h[lk], b[lk], blk[lk]
         n = int(h.shape[0])
         ep.have[l, h, b, blk] = True
         np.subtract.at(ep.free, (h, b), 1)
@@ -586,11 +714,14 @@ class BgFetch:
             with self.lock:
                 self.rep["empty_jobs"] += 1
             return
-        h, b = h.astype(np.int64), b.astype(np.int64)
+        hr = group_rank(h, np.zeros_like(h), 1)          # the rank in its head (items sorted by head)
         rk = group_rank(h, b, B)
         e = self.land_i
         self.land_i = (e + 1) % self.ring
-        lane = e * self.n_cap + group_rank(h, np.zeros_like(h), 1)    # gilfree: a lane per (head, rank in head)
+        with self.cv:                                    # DEFER: the entry still holds a job that waits for its layer
+            while self.land_busy[e] and not ep.closed and self.error is None:
+                self.cv.wait(0.05)
+        lane = e * self.lanes_e + hr                     # gilfree: lanes of entry e, one per (head, rank in head)
         if self.h2d_done[e] is not None:                 # the staging entry's previous H2D finished
             with self.cap_lock:
                 self.h2d_done[e].synchronize()
@@ -608,9 +739,9 @@ class BgFetch:
             readers = [-1] * L
             readers[l] = self.lmark[e]                   # T3: the landing entry's last commit read it
             with self.cap_lock:
-                if ep.closed:
+                if ep.closed or (ep.closing and l <= ep.consumed_upto):
                     with self.lock:
-                        self._late(ep, j, t_enq, "packing", n)
+                        self._late(ep, j, t_enq, "passed" if not ep.closed else "packing", n)
                     return
                 seq = int(self.tp.issue_desc(desc, reader_marks=readers, hist_mark=-1))   # T4: the snapshot waited
             jev = self.tp.job_ev(seq)
@@ -618,13 +749,15 @@ class BgFetch:
         t1 = time.perf_counter()
         with self.cap_lock, self.lock:                   # the issue: atomic against the epoch's close
             self.rep["pack_s"] += t1 - t0
-            if ep.closed:                                # closed while packing: abandoned
-                self._late(ep, j, t_enq, "packing", n)
+            if ep.closed or (ep.closing and l <= ep.consumed_upto):    # abandoned (DEFER: its layer already ran)
+                self._late(ep, j, t_enq, "passed" if not ep.closed else "packing", n)
                 return
             ctx = torch.cuda.stream(self.side) if self.cuda else contextlib.nullcontext()
             with ctx:
                 if self.cuda:
                     self.side.wait_event(self.snap_ev[s])
+                    if self.land_reader[e] is not None:  # torch packer: a deferred commit read this entry last
+                        self.side.wait_event(self.land_reader[e])
                 ea, eb = self._ev(True), self._ev(True)
                 ea.record()
                 if jev is None:
@@ -635,21 +768,19 @@ class BgFetch:
                 self.land_it[e][:n].copy_(it, non_blocking=self.cuda)
                 eb.record()
                 self.h2d_done[e] = eb
+                if ep.closing:                           # DEFER: landed; the joint pass commits it at layer l
+                    ep.deferred.setdefault(l, []).append((e, n, eb))
+                    self.land_busy[e] = True
+                    self.rep["deferred"] = self.rep.get("deferred", 0) + 1
+                    self.rep["issue_s"] += time.perf_counter() - t1
+                    if self.cuda:
+                        self.h2d_ev.append((ea, eb, n * self.item_bytes))
+                    return
                 itd = self.land_it[e][:n]
-                if jev is None:
-                    src_k, src_v = self.land_k[e][:n * bs], self.land_v[e][:n * bs]
-                else:                                    # the item's lane rows of its head
-                    rsrc = ((itd[:, 4].view(n, 1) * bs + self.ar_bs.view(1, bs)) * H + itd[:, 0].view(n, 1)).reshape(-1)
-                    src_k = self.land_k.view(-1, D).index_select(0, rsrc)
-                    src_v = self.land_v.view(-1, D).index_select(0, rsrc)
-                self._commit(itd, n, l, ep.g, src_k, src_v)
+                self._commit(itd, n, l, ep.g, *self._src(e, n, itd))
                 done = self._ev()
                 done.record()
-            if jev is not None:
-                mk = self.mark_next
-                self.mark_next += 1
-                self.tp.mark_reader(mk, done)
-                self.lmark[e] = mk
+            self._entry_read(e, done)
             ep.last = done
             ep.issued += 1
             ep.items_sent += n
@@ -659,9 +790,11 @@ class BgFetch:
             if self.cuda:
                 self.h2d_ev.append((ea, eb, n * self.item_bytes))
 
-    def _commit(self, it, n: int, l: int, g: int, src_k, src_v) -> None:
-        """Step 3's commit on the CURRENT stream (the side stream; the CPU: in line). it (n, 5) device rows h, b, block,
-        rank in (h, b), lane; src_k / src_v (n x 64, D): the items' rows, item-major."""
+    def _commit(self, it, n: int, l: int, g: int, src_k, src_v, deferred: bool = False) -> None:
+        """Step 3's commit on the CURRENT stream (the side stream; the CPU: in line; DEFER: the compute stream at the
+        joint pass's layer l). it (n, 5) device rows h, b, block, rank in (h, b), lane; src_k / src_v (n x 64, D): the
+        items' rows, item-major. deferred: no room counts apart (the joint pass's keep may have taken dead slots of
+        layers < l since the host counted the room; those bytes were moved and are wasted)."""
         T, H, B, X, bs = self.T, self.H, self.B, self.X, self.bs
         h, b, blk, rk = it[:, 0], it[:, 1], it[:, 2], it[:, 3]
         key = blk + int(l) * KM
@@ -693,7 +826,10 @@ class BgFetch:
         T.kage.index_put_((h, b, wslot), torch.full_like(key, int(g) * self.L + int(l)))
         self.ptag.index_put_((h, b, wslot), ok | found)
         self.pkey.index_put_((h, b, wslot), key)
-        self.cnt_side.add_(torch.stack((torch.full_like(ok.sum(), n), ok.sum(), found.sum(), ((~ok) & (~found)).sum())))
+        nr = ((~ok) & (~found)).sum()
+        z = torch.zeros_like(nr)
+        self.cnt_side.add_(torch.stack((torch.full_like(ok.sum(), n), ok.sum(), found.sum(), z if deferred else nr,
+                                        nr if deferred else z)))
 
     # ---------------------------------------------------------- report (after the run, one sync)
     def report(self) -> dict:
@@ -712,7 +848,8 @@ class BgFetch:
             torch.cuda.synchronize()
         out = dict(self.rep, mode=self.mode, worker=self.worker, n_cap=self.n_cap, ring=self.ring, acct=self.acct,
                    bneg=self.bneg, X=self.X, error=self.error, device_bytes=self.bytes_device(),
-                   item_bytes=self.item_bytes, packer=self.packer, transport=tps)
+                   item_bytes=self.item_bytes, packer=self.packer, transport=tps, late_mode=self.late_mode,
+                   late_wait_ms=self.late_wait_ms, lanes_per_entry=self.lanes_e)
         out.update({k: int(v) for k, v in zip(SIDE_KEYS, self.cnt_side.tolist())})
         out.update({k: int(v) for k, v in zip(MAIN_KEYS, self.cnt_main.tolist())})
         out["pending"] = int(self.ptag[..., 1:].sum())                   # tags of jobs after the last joint pass
@@ -772,6 +909,8 @@ def _make(STF):
             return skip
 
         def _resid_joint(self, l, eng, twin, ti, inj, act, drf, qb3, vs):
+            if self.bf is not None:                                    # DEFER: the late jobs of this layer first
+                self.bf.on_joint_layer(l)
             skip = super()._resid_joint(l, eng, twin, ti, inj, act, drf, qb3, vs)
             if self.bf is not None:
                 self.bf.on_window(l, eng, skip)
