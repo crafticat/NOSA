@@ -18,7 +18,8 @@ marks, the acceptance record and the state checksums = its D arm's, bit for bit)
 replays = commits - 1, the overflow counter m > J is 0).
 REGISTERED PREDICTIONS PRED_ST1_BY_B: every value None until the lead registers them with PRED_STAMP_ST1 (a None key is
 REPORT); the step script STOPS the timing cells (st1a, st1b) while PRED_STAMP_ST1 is None. The builder's MODEL: the
-comment block above PRED_ST1_BY_B.
+comment block above PRED_ST1_BY_B. THE CELL GRANTS GRANT_st1m / GRANT_st1a / GRANT_st1b (default deny, None): the step
+script runs a cell only when its grant line holds a `date -u` stamp at <sha>.
 EXIT: the number of failed MUST gates (0-19); 20 refused; 30 an exception outside an arm.
 """
 from __future__ import annotations
@@ -97,6 +98,11 @@ PRED_ST1_BY_B = {
     318: dict(ST1_commit_saving=(4.0, 7.0), ST1_joint_ratio=(0.99, 1.01), ST1_draft_ratio=(0.99, 1.01),
               ST1_vs_ref=(1.007, 1.014), ST1_peak_delta_gb=(-0.01, 0.05), ST2_joint_saving=(1.0, 3.0),
               ST2_vs_m=(1.002, 1.006))}
+# THE CELL GRANTS (default deny; r2_st1_step.sh's granted() reads these lines at <sha>): the lead sets a `date -u` stamp,
+# e.g. GRANT_st1m = "2026-10-31T12:00:00Z", in a commit after the protocol review.
+GRANT_st1m = None
+GRANT_st1a = None
+GRANT_st1b = None
 
 
 def log(msg):

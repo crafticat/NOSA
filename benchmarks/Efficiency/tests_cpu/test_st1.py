@@ -18,7 +18,11 @@ ST2       test_st2_equal (both D arms, timing and check): the MT run (M + the tw
           every bit, and = the D run outside the uncommitted tail rows; every joint layer ran ST2 (no fallback); the
           replay counters equal; PRECONDITION: deferred replays ran. test_st2_controls: "no_replay_seq" and "no_shift"
           CHANGE the run. test_st2_pass_plan: the step sequence of a planted plan (group with replay, final, fill, done).
-CELL      test_st1_cell_pure (arguments, the gates on CPU evidence pass, their plants fail), test_step_script_st1.
+CELL      test_st1_cell_pure (arguments, the gates on CPU evidence pass, their plants fail; the verdicts against the
+          registration state), test_st1_registration_state (PRED_STAMP_ST1 / PRED_ST1_BY_B and the GRANT_<cell> lines:
+          None or a date -u stamp, as the step script's greps see them), test_step_script_st1 (the repaired pattern: no
+          interpreter or hash on login, cmp against git show, the child's /usr/bin/sha256sum (exit 6), the output limit
+          (exit 7), granted(), the registration stop; DRYRUN on a clean checkout of nosi-r2-st1).
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rfEs benchmarks/Efficiency/tests_cpu/test_st1.py
 """
@@ -29,6 +33,9 @@ import functools
 import importlib
 import importlib.util
 import inspect
+import os
+import re
+import shutil
 import subprocess
 import sys
 import warnings
@@ -43,7 +50,9 @@ ROOT = HERE.parents[2]
 EFF = ROOT / "benchmarks/Efficiency"
 BASE_SHA = "cd0f0c59c1f1cac8a3ef05f6c3abcc0a2079d926"          # nosi-r2-recon7: RECON7 X1 notes (the ST1 base)
 FORK_BLOB = "f0dc0c183a388585e216505a6bbfc696531e8add"
-T_ = "benchmarks/Efficiency/tests_cpu/"
+STEP_ROOT = "/mnt/beegfs/ojerbi/nosi-r2-st1"
+HOLDER = "2190876"                     # a lead-owned uuid file that exists (HOLDERS/2190876.gpu_uuid)
+T_ ="benchmarks/Efficiency/tests_cpu/"
 E_ = "benchmarks/Efficiency/"
 MODULES = ("r2_st1_commit.py", "r2_st1_cell.py")
 ST1_NEW = tuple(E_ + m for m in MODULES) + (E_ + "r2_st1_step.sh", T_ + "test_st1.py")
@@ -391,7 +400,6 @@ def test_st2_pass_plan():
     with pytest.raises(SystemExit):
         C.parse_args(base + ["--st1-commit", "fast"])
     assert C.ARMS[-4:] == ("L4PTFDGUDCDM", "L4PTFDGUDKWCDM", "L4PTFDGUDCDMT", "L4PTFDGUDKWCDMT")
-    assert C.PRED_STAMP_ST1 is None
     with pytest.raises(SystemExit):                                    # an MT arm needs its M arm
         C.parse_args(base + ["--arms", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDMT"])
     assert set(STC.MODES) == {"rows", "rowsx", "where"}
@@ -456,20 +464,88 @@ def test_st2_pass_plan():
           "L4PTFDGUDCDM": dict(rates=dict(median_tok_s=101.0, round_ms_median=9.9),
                                phases_median=dict(commit=4.5, joint=5.0, draft=4.0), peak_with_prefill_GB=80.0)}
     v = {p[0]: p for p in C.verdicts(sp, 216)}
-    assert v["ST1-COMMIT-SAVING"][1] == "REPORT" and "1.5000" in v["ST1-COMMIT-SAVING"][2]
-    assert v["ST1-VS-REF"][1] == "REPORT"
+    P = C.PRED_ST1_BY_B[216]
+
+    def want(key, val):                                                # REPORT while the key is not registered
+        b = P.get(key)
+        return "REPORT" if b is None else ("CONFIRMED" if b[0] <= val <= b[1] else "REFUTED")
+    assert v["ST1-COMMIT-SAVING"][1] == want("ST1_commit_saving", 1.5) and "1.5000" in v["ST1-COMMIT-SAVING"][2]
+    assert v["ST1-VS-REF"][1] == want("ST1_vs_ref", 1.01)
+
+
+def test_st1_registration_state():
+    """The registration and the grants: None (the builder's state) or a `date -u` stamp, as the step script's greps
+    see them in the source."""
+    C = _mod("r2_st1_cell")
+    src = (EFF / "r2_st1_cell.py").read_text()
+    if C.PRED_STAMP_ST1 is None:                                        # the builder's state: every value None
+        assert all(v is None for b in (216, 318) for v in C.PRED_ST1_BY_B[b].values())
+    else:
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", C.PRED_STAMP_ST1)
+    assert set(C.PRED_ST1_BY_B) == {216, 318} and all(set(x) == set(C.PRED_KEYS) for x in C.PRED_ST1_BY_B.values())
+    assert ("\nPRED_STAMP_ST1 = None\n" in src) == (C.PRED_STAMP_ST1 is None)   # the step script's grep sees it
+    for cell in ("st1m", "st1a", "st1b"):                               # the grants: None or a date -u stamp
+        g = getattr(C, "GRANT_%s" % cell)
+        assert g is None or re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", g)
+        assert (("\nGRANT_%s = None\n" % cell) in src) == (g is None)
+
+
+def _step(cell, sha="0" * 40):
+    e = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_"))}
+    e["DRYRUN"] = "1"
+    if shutil.which("srun") is None:
+        e["PATH"] = os.pathsep.join(p for p in e.get("PATH", "").split(os.pathsep)
+                                    if not p.rstrip("/").endswith("kstep-cpu-runs/bin-compute"))
+    return subprocess.run(["bash", str(EFF / "r2_st1_step.sh"), "--nosi", sha, HOLDER, "t1", cell], env=e,
+                          capture_output=True, text=True, timeout=300)
+
+
+CELLS = (("st1m", 10, 8, 72, 1, 1, 35, "100G",
+          "L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDM,L4PTFDGUDKWCDM,L4PTFDGUDCDMT,"
+          "L4PTFDGUDKWCDMT"),
+         ("st1a", 65, 216, 512, 0, 0, 160, "240G", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDM,L4PTFDGUDCDMT"),
+         ("st1b", 10, 318, 512, 0, 0, 240, "340G", "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT"))
 
 
 def test_step_script_st1():
     p = EFF / "r2_st1_step.sh"
-    text = p.read_text()
+    src = p.read_text()
     assert subprocess.run(["bash", "-n", str(p)], capture_output=True).returncode == 0
-    assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-st1 " in text and "CELLPY=benchmarks/Efficiency/r2_st1_cell.py" in text
-    assert "grep -q '^PRED_STAMP_ST1 = None$'" in text and "benchmarks/Efficiency/r2_st1_commit.py" in text
-    for cell, arms in (("st1m", "L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDM,"
-                                "L4PTFDGUDKWCDM,L4PTFDGUDCDMT,L4PTFDGUDKWCDMT"),
-                       ("st1a", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDM,L4PTFDGUDCDMT"),
-                       ("st1b", "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT")):
-        assert cell + ")" in text and "ARMS=" + arms in text, cell
-        C = _mod("r2_st1_cell")
-        assert C.parse_args(["--out", "/x", "--workload", "/w", "--arms", arms]).arms == arms.split(",")
+    assert src.rstrip().endswith('if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; exit $?; fi')
+    for word in ("python", "perl", "awk", "sed", "sha256sum", "hash-object"):   # no interpreter / hash on login
+        lines = [x for x in src.splitlines() if re.search(r"\b%s\b" % re.escape(word), x)
+                 and "/venv/nosa/bin/python" not in x and "/usr/bin/sha256sum" not in x and not x.lstrip().startswith("#")]
+        assert lines == [], (word, lines[:3])
+    assert 'cmp -s -- "$0" <(git -C "$NOSI" show "$NSHA:$SELF")' in src                 # the bytes, not a hash
+    assert src.count("/usr/bin/sha256sum -- ") == 2 and "exit 6" in src                 # the child hashes (GPU node)
+    assert 'ulimit -f "$KB"' in src and 'du -sb -- "$t"' in src and "exit 7" in src     # the output limit
+    assert "NOSI=%s " % STEP_ROOT in src and "FORK_BLOB=%s" % FORK_BLOB in src
+    assert "CCROOT=/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/st1_jit " in src and "CELLPY=%sr2_st1_cell.py" % E_ in src
+    for f in ("r2_st1_commit.py", "r2_i4dc_cell.py", "r2_i4dc_compile.py", "r2_i4h_graph.py", "r2_i4g_graph.py",
+              "r2_writeback.py", "r2_twin_fused.py", "spec_tentative.py", "r2_positional_twin.py"):
+        assert f in src, f
+    assert "OUTROOT/sp_active_$JOB" in src and "granted \"$CELL\" <(git -C \"$NOSI\" show \"$NSHA:$CELLPY\")" in src
+    assert "grep -q '^PRED_STAMP_ST1 = None$' && REGISTERED=0" in src                   # the registration stop
+    C = _mod("r2_st1_cell")
+    for cell, pool, batch, steps, check, stress, smin, mem, arms in CELLS:   # every cell's arguments parse
+        a = C.parse_args(["--out", "x", "--workload", "w", "--batch", str(batch), "--steps", str(steps),
+                          "--pool", str(pool), "--arms", arms, "--check-every", str(check),
+                          "--require-stress", str(stress)])
+        assert a.arms == arms.split(",")
+        assert ("%s) POOL=%d BATCH=%d STEPS=%d" % (cell, pool, batch, steps)) in src and ("STEP_MIN=%d MEM=%s" % (
+            smin, mem)) in src, cell
+        assert "ARMS=" + arms in src, cell
+    for bad in ("i4dca", "st1", "st1c"):
+        r = _step(bad)
+        assert r.returncode == 1 and "cell '%s'" % bad in r.stderr, (bad, r.returncode, r.stderr[-300:])
+    if str(ROOT) != STEP_ROOT or _git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+        pytest.skip("not a clean checkout of %s: the full DRYRUN needs one" % STEP_ROOT)
+    sha = _git("rev-parse", "HEAD").stdout.strip()
+    for cell, pool, batch, steps, check, stress, smin, mem, arms in CELLS:
+        r = _step(cell, sha)
+        if getattr(C, "GRANT_%s" % cell) is None:
+            assert r.returncode == 1 and "is not granted" in r.stderr, (cell, r.returncode, r.stderr[-300:])
+        assert ("cell %s: C %d (pool %d) B %d arms SH+%s steps %d K 3" % (cell, 63 + pool, pool, batch, arms, steps)
+                in r.stdout), (cell, r.stdout[-600:])
+    _ev("ST1 DRYRUN: 3 cells printed their step command; grants %s" % ({c[0]: getattr(C, "GRANT_%s" % c[0]) for c in
+                                                                       CELLS}))
