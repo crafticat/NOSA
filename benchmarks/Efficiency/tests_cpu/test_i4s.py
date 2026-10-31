@@ -99,6 +99,10 @@ I4S_NEW = I4S_NEW + (E_ + "r2_j1_forkbench.py",)                                
 # own Gate 0: tests_cpu/test_st1.py); I4S_LATER: its modules may name the I4S modules (scan (f) skips them)
 I4S_NEW = I4S_NEW + (E_ + "r2_st1_commit.py", E_ + "r2_st1_cell.py", E_ + "r2_st1_step.sh", T_ + "test_st1.py")  # ST1
 I4S_LATER = I4S_LATER + ("r2_st1_commit.py", "r2_st1_cell.py")                                   # ST1
+# BF1 (nosi-r2-bf1: RECON7 cd0f0c5 + the draft-issued background fetch): its files (its own Gate 0: tests_cpu/test_bf1.py);
+# I4S_LATER: its modules may name the earlier modules (the scan skips them)
+I4S_NEW = I4S_NEW + (E_ + "r2_bf1_fetch.py", E_ + "r2_bf1_cell.py", E_ + "r2_bf1_step.sh", T_ + "test_bf1.py")  # BF1
+I4S_LATER = I4S_LATER + ("r2_bf1_fetch.py", "r2_bf1_cell.py")                                     # BF1
 
 
 class Evidence(UserWarning):

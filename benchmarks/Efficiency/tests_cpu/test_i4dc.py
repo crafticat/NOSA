@@ -84,6 +84,10 @@ I4DC_NEW = I4DC_NEW + (E_ + "r2_j1_forkbench.py",)                              
 I4DC_NEW = I4DC_NEW + (E_ + "r2_st1_commit.py", E_ + "r2_st1_cell.py", E_ + "r2_st1_step.sh",
                        T_ + "test_st1.py")                                                        # ST1
 I4DC_LATER = I4DC_LATER + ("r2_st1_commit.py", "r2_st1_cell.py")                                  # ST1
+# BF1 (nosi-r2-bf1: RECON7 cd0f0c5 + the draft-issued background fetch): its files (its own Gate 0: tests_cpu/test_bf1.py);
+# I4DC_LATER: its modules import the I4DC modules (scan (e) skips them)
+I4DC_NEW = I4DC_NEW + (E_ + "r2_bf1_fetch.py", E_ + "r2_bf1_cell.py", E_ + "r2_bf1_step.sh", T_ + "test_bf1.py")  # BF1
+I4DC_LATER = I4DC_LATER + ("r2_bf1_fetch.py", "r2_bf1_cell.py")                                   # BF1
 
 
 class Evidence(UserWarning):

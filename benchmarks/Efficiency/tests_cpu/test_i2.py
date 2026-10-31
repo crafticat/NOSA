@@ -138,6 +138,9 @@ I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_j1_forkbench.py",)             
 # own Gate 0: tests_cpu/test_st1.py)
 I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_st1_commit.py", "benchmarks/Efficiency/r2_st1_cell.py",
                        "benchmarks/Efficiency/r2_st1_step.sh", T_ + "test_st1.py")                          # ST1
+# BF1 (nosi-r2-bf1: RECON7 cd0f0c5 + the draft-issued background fetch): its files (its own Gate 0: tests_cpu/test_bf1.py)
+I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_bf1_fetch.py", "benchmarks/Efficiency/r2_bf1_cell.py",
+                       "benchmarks/Efficiency/r2_bf1_step.sh", T_ + "test_bf1.py")                     # BF1
 SEAM_CHANGED = {"#0", "TentState._layer", "TentState._row", "TentRunner.__init__"}
 SEAM_ADDED = {"TentState._rows", "TentState._resid", "TentState._write", "TentRunner._joint_ops", "TentRunner._make_state"}
 

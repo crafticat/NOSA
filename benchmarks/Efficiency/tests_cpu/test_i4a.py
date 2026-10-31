@@ -120,6 +120,11 @@ I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_j1_forkbench.py",)               
 I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_st1_commit.py", "benchmarks/Efficiency/r2_st1_cell.py",
                      "benchmarks/Efficiency/r2_st1_step.sh", T_ + "test_st1.py")                            # ST1
 I4A_LATER = I4A_LATER + ("r2_st1_commit.py", "r2_st1_cell.py")                                     # ST1
+# BF1 (nosi-r2-bf1: RECON7 cd0f0c5 + the draft-issued background fetch): its files (its own Gate 0: tests_cpu/test_bf1.py);
+# I4A_LATER: its modules may name the earlier modules (the scan skips them)
+I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_bf1_fetch.py", "benchmarks/Efficiency/r2_bf1_cell.py",
+                     "benchmarks/Efficiency/r2_bf1_step.sh", T_ + "test_bf1.py")                     # BF1
+I4A_LATER = I4A_LATER + ("r2_bf1_fetch.py", "r2_bf1_cell.py")                                     # BF1
 
 
 def _load(name, path=None):
