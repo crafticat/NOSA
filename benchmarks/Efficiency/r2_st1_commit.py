@@ -620,11 +620,13 @@ KFB_WRITES = (8, 9, 10, 17)
 # ===================================================================================================================
 # ST4: the draft residency's integer ops in one compiled helper (module docstring, ST4)
 # ===================================================================================================================
-def rpost_fn(nb, bm, lm, am, qb3, drf3, minus1, skipped, forced, injected, inj, arL, l_t, chk: bool, neg: int):
+def rpost_fn(nb, bm, lm, am, qb3, drf3, minus1, skipped, forced, injected, inj, arL, l_t, chk, neg: int):
     """r2_i4a_lean.TentStateFD._resid_lean after pool_swap (r2_i4a_lean.py:211-223), the gathers aside: the block-map
     update (nb = eng._new_block_map_buf, bm = eng._block_map, in place), tent, skip, ids, the block map's skipped loads
-    (-1), the counters (in place: the layer's entry of skipped; with chk forced / injected). Returns (skip, ids).
-    neg 1: no block-map mask; neg 2: no skipped count (the controls)."""
+    (-1), the counters (in place: the layer's entry of skipped; where chk forced / injected). Returns (skip, ids).
+    chk: a 0-d bool tensor in production (ONE graph for check and timing passes: a Python bool would compile a second
+    graph at the first check pass, INT CPU run of 00bfb51, -DRESID), a Python bool in the planted test. Off: the
+    counters get + 0 (the same values). neg 1: no block-map mask; neg 2: no skipped count (the controls)."""
     nbv = torch.where(am, nb, bm)
     nb.copy_(nbv)
     tent = lm > qb3                                                    # = (lm >= 0) & (lm > qb3): qb3 >= 0
@@ -634,9 +636,9 @@ def rpost_fn(nb, bm, lm, am, qb3, drf3, minus1, skipped, forced, injected, inj, 
     sel = arL == l_t                                                   # (L,): the layer's entry
     if neg != 2:
         skipped.add_(torch.where(sel, (skip & ~tent).sum(), 0))
-    if chk:                                                            # CHECK-ONLY counters (LN:221-223)
-        forced.add_(torch.where(sel, tent.sum(), 0))
-        injected.add_(torch.where(sel, inj.sum(), 0))
+    on = sel & chk                                                     # CHECK-ONLY counters (LN:221-223)
+    forced.add_(torch.where(on, tent.sum(), 0))
+    injected.add_(torch.where(on, inj.sum(), 0))
     return skip, ids
 
 
@@ -668,6 +670,7 @@ class ResidST4:
                 raise ValueError("ST4: the block map, its buffer and the load mask share a storage")
         self._st4_ar = torch.arange(L, dtype=torch.int64, device=dev)
         self._st4_l = [torch.full((), l, dtype=torch.int64, device=dev) for l in range(L)]
+        self._st4_chk = [torch.full((), c, dtype=torch.bool, device=dev) for c in (False, True)]   # rpost_fn's chk
         self._st4 = dict(neg=tneg4, calls=0, entered=0, fallback={}, events=[], compile_s=0.0,
                          backend=getattr(self, "_cc_backend", None))
 
@@ -704,7 +707,7 @@ class ResidST4:
         neg = {"no_block_mask": 1, "count_off": 2}.get(st["neg"], 0)
         skip, ids = self._st4_call("rpost", l, eng._new_block_map_buf, eng._block_map, eng._load_mask, am, qb3,
                                    drf.view(1, B, 1), self.minus1, self.skipped, self.forced, self.injected, inj,
-                                   self._st4_ar, self._st4_l[l], bool(self.checking), neg)
+                                   self._st4_ar, self._st4_l[l], self._st4_chk[int(bool(self.checking))], neg)
         kern["gather_k"](eng._k_gpu, eng._k_cpu, ids, bs)
         kern["gather_v_bias"](eng._v_gpu, eng._v_cpu, eng._kv_bias_gpu, twin.total_cis, ids, bs)
         st["calls"] += 1

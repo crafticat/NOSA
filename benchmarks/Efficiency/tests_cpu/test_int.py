@@ -49,6 +49,7 @@ OLD_DECL = tuple(T_ + "test_%s.py" % n for n in ("wsa", "wsb", "wsc", "i2", "i3"
                                                     "i4s", "i4cc", "i4dc", "recon7"))
 RUNG_TESTS = dict(j1="J1_LATER", st1="ST1_LATER", bf1="BF1_LATER")
 ARMS_IMPORTS = {"torch", "r2_bf1_fetch", "r2_j1_select", "r2_st1_commit"}
+NAMED_BY = ("r2_st1_cell.py", "r2_st1_commit.py")   # modules whose comments / docstrings name INT files (no import)
 HAND_KERNEL = ("import triton", "@triton.jit", "triton.jit", "load_inline", "cpp_extension", "tl.load", "tl.store")
 N_RUN = 48                             # committed tokens per request (as test_st1 / test_bf1: blocks fill, drafts accept)
 
@@ -130,7 +131,14 @@ def test_int_gate0_files():
     for p in list((ROOT / "nosi/nosi").glob("*.py")) + list(EFF.glob("*.py")):     # (f) nobody else names them
         if p.name.startswith("r2_int_"):
             continue
-        assert "r2_int" not in p.read_text(), p.name
+        text = p.read_text()
+        if p.name in NAMED_BY:                                         # (f') DECLARED: the ST line's docs name the INT
+            t = ast.parse(text)                                        # files (ST3 / ST4 notes); none imports them
+            imp = {a.name for n in ast.walk(t) if isinstance(n, ast.Import) for a in n.names}
+            imp |= {n.module or "" for n in ast.walk(t) if isinstance(n, ast.ImportFrom)}
+            assert not [m for m in imp if m.startswith("r2_int")], (p.name, imp)
+            continue
+        assert "r2_int" not in text, p.name
 
 
 # ------------------------------------------------------------------ the merged _layer and the classes

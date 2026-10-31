@@ -52,7 +52,7 @@ ST1 = dict(L4PTFDGUDCDM="L4PTFDGUDCD", L4PTFDGUDKWCDM="L4PTFDGUDKWCD",       # a
 ST3 = dict(L4PTFDGUDKWCDMTK="L4PTFDGUDKWCDMT")      # an ST3 arm (+ the compiled keep fill) -> its MT arm; NOT in ST1:
 ST4 = dict(L4PTFDGUDCDMTR="L4PTFDGUDCDMT",          # an ST4 arm (+ the compiled draft residency) -> its reference
            L4PTFDGUDKWCDMTKR="L4PTFDGUDKWCDMTK")    # (C 128: the MT arm; C 73: the MTK arm); NOT in ST1 either
-ST13 = dict(ST1, **ST3, **ST4)                      # r2_int_cell reads ST1 (its own runner choice has neither)
+ST13 = dict(ST1, **ST3, **ST4)                      # the INT cell reads ST1 (its own runner choice has neither)
 KFILL_ARMS = ("L4PTFDGUDKWCDMTK", "L4PTFDGUDKWCDMTKR")                     # the arms with ST3
 ROOT = dict(L4PTFDGUDCDM="L4PTFDGUDCD", L4PTFDGUDKWCDM="L4PTFDGUDKWCD",      # an ST arm -> the D arm whose runner,
             L4PTFDGUDCDMT="L4PTFDGUDCD", L4PTFDGUDKWCDMT="L4PTFDGUDKWCD",   # gates and compile it takes

@@ -846,6 +846,30 @@ def test_st4_helper_planted():
         len(seeds), skips, drafts, c_mask, c_count))
 
 
+def test_st4_one_graph():
+    """The production chk is a 0-d bool tensor: rpost_fn compiles ONE graph for the timing and the check passes (the INT
+    CPU run of 00bfb51: a Python bool compiled a second graph at the first check pass, -DRESID failed), and the tensor
+    form gives the reference values in both (off: the check counters unchanged)."""
+    STC = _mod("r2_st1_commit")
+    X.CC.configure()
+    f = torch.compile(STC.rpost_fn, fullgraph=True, dynamic=False, backend="inductor")
+    graphs = lambda: int(torch._dynamo.utils.counters["stats"]["unique_graphs"])   # noqa: E731
+    g0, g_first = graphs(), None
+    for seed in range(3):
+        P = _plant4(seed)
+        for chk in (False, True):
+            r = _ref_rpost(P, chk)
+            s = _st4_rpost(P, f, torch.tensor(chk))
+            if g_first is None:
+                g_first = graphs()                                     # after the first call (off): compiled once
+            for k in r:
+                assert torch.equal(s[k], r[k]), (seed, chk, k)
+    g1 = graphs()
+    assert g1 == g_first and g_first - g0 <= 1, (g0, g_first, g1)     # no second graph when chk turns on
+    _ev("ST4 ONE GRAPH: chk as a tensor, 6 calls (3 plants x off / on): graphs %d after the first call, %d after all" %
+        (g_first - g0, g1 - g0))
+
+
 def _st4_mro_ok(cls):
     STC = _mod("r2_st1_commit")
     mro = cls.__mro__

@@ -33,6 +33,17 @@ L4PTFDGUDKWCDMTKR (MTK + ST4) run in intm only (gates, correctness; their PEQ ch
 registration key. CPU: test_int.py::test_int_equal evaluates the cell's gates on the INT run + ST3 + ST4
 (`_int_full`: st3_attach / st4_attach in the cell's order) and checks that run = the INT run, every bit.
 
+FIXES after the CPU run of 00bfb51 (cpu-logs int_00bfb51_int.txt):
+- Gate 0 (f): r2_st1_cell.py's comment named the INT cell file: reworded ("the INT cell"); r2_st1_commit.py's ST3 /
+  ST4 docstrings name the INT classes' module: test_int declares both files (NAMED_BY: text allowed, no import of an
+  r2_int module).
+- -DRESID (C 128): rpost compiled twice (draft pass 1 and pass 12: `chk` was a Python bool, so the first check pass
+  compiled a second graph). r2_st1_commit.rpost_fn now takes chk as a 0-d bool tensor (`on = sel & chk`; off adds 0:
+  the same counter values) and ResidST4 passes `_st4_chk[checking]`: one graph. CPU: test_st1.test_st4_one_graph.
+- C 73: Inductor's CPU backend failed to compile kfa_fn (`valid & ~(hv != 0)`: VecMask<float> & VecMask<uint8_t>,
+  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp
+  line 92). OPEN: the ST worker fixes kfa_fn in r2-st4-dev (owner of r2_st1_commit.py); INT merges that commit.
+
 BF1 68028b1 (BF1 dev 4-7, merged on b095d84: the DEFER mechanism, 14 packer threads, 1024-group chunks, the 250 ms
 host budget, the room check, the lead's BF1 registration). The defer hook is in TentStateBF._resid_joint (eager in the
 C 73 INT arm: no F3 there), so it does not touch IntLayer. The INT cell's BF1 options = r2_bf1_cell.bf_opt's keywords
