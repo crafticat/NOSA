@@ -838,7 +838,14 @@ def test_j1_cell_tables():
                                   gpu_peak_alloc_GB=82.0, mem_arena=dict(prefill_peak_GB=78.0), j1=dict(compile_s=2.0))
     sp = dict(L4PTFD=mk(400.0, 200.0, 140.0), L4PTFDGUDCD=mk(440.0, 186.0, 130.0), L4PTFDGUDCDJ1=mk(455.0, 174.0, 130.0))
     v = {y[0]: y for y in C.verdicts(sh2, sp, 216)}
-    assert all(y[1] == "REPORT" for y in v.values()) and "12.0000" in v["J1-JOINT-SAVING"][2], v
+    if C.PRED_STAMP_J1 is None:                                         # unregistered: every verdict REPORT
+        assert all(y[1] == "REPORT" for y in v.values()), v
+    else:                                                               # registered: a band gives CONFIRMED / REFUTED
+        assert all(y[1] in ("REPORT", "CONFIRMED", "REFUTED") for y in v.values()), v
+        b = C.PRED_J1_BY_B[216].get("J1_joint_saving")
+        if b is not None:
+            assert v["J1-JOINT-SAVING"][1] == ("CONFIRMED" if b[0] <= 12.0 <= b[1] else "REFUTED"), v
+    assert "12.0000" in v["J1-JOINT-SAVING"][2], v
     assert C.verdicts(sh2, dict(L4PTFD=sp["L4PTFD"]), 216) == [("J1-RUN", "NOT_RUN", "no J1 arm ran")]
     vv = [y[0] for y in D.verdicts(sh2, sp, 216)]
     assert "I4DC-VS-REF" in vv and "J1-JOINT-SAVING" in vv             # the I4DC verdicts + the J1 verdicts
