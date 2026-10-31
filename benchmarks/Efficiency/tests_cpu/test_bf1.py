@@ -198,7 +198,7 @@ def test_pure_rows_rank_alive():
 # ------------------------------------------------------------------ the world runs
 def _builder(mode="ce", worker="inline", Xs=None, acct=True, bneg=None, check=False, stats=False, kcheck=False,
              phase_marks=False, probe_every=0, n_cap=4096, ring=4, packer="torch", gf=None, threads=2, late="drop",
-             late_wait_ms=100.0, stall_ms=0.0, batch=8):
+             late_wait_ms=100.0, stall_ms=0.0, batch=8, hold=0):
     """i4dc_world.d_builder's L4PTFDGUDKWCD with the BF1 runner and its options (and the store X)."""
     BF = _mod("r2_bf1_fetch")
     W, RE, SR, I3, KA, RW, WB, Z = X.W, X.RE, X.SR, X.I3, X.KA, X.RW, X.WB, X.Z
@@ -218,7 +218,8 @@ def _builder(mode="ce", worker="inline", Xs=None, acct=True, bneg=None, check=Fa
                   cc_backend="inductor", ccneg=None, cdneg=None, keep=True, kwin=True, kcheck=kcheck, kneg=None,
                   kslots=None, cneg=None, bf=dict(mode=mode, worker=worker, acct=acct, bneg=bneg, n_cap=n_cap,
                                                   ring=ring, packer=packer, gf=gf, threads=threads, late=late,
-                                                  late_wait_ms=late_wait_ms, stall_ms=stall_ms, batch=batch))
+                                                  late_wait_ms=late_wait_ms, stall_ms=stall_ms, batch=batch,
+                                                  hold=hold))
         be = X.FakeGraphsDCD()
         run = Runner(model, rs, sops, BC.HostClock(), graph_backend=be, **kw)
         be.T = run.T
@@ -437,45 +438,55 @@ def test_bf1_gilfree_plant(bneg, gfext):
 
 
 def test_bf1_gilfree_batch(gfext):
-    """THE BATCH (bf1b: the worker's cost per CALL bound it): a slow worker (stall 20 ms per job) builds a backlog; the
-    worker takes up to 8 queued jobs of one epoch per batch and makes ONE release of all their layers
-    (NativePipe.submit; cap_groups 1: one chunk per item, so chunks = groups) and ONE commit. The claim, the gates and the counters hold;
-    preconditions (L34): batches of several jobs and several layers ran."""
+    """THE BATCH (bf1b: the worker's cost per CALL bound it): a CERTAIN backlog (hold = the epoch's 2 L jobs: the
+    worker waits for them, or for the joint pass's start; 4981010's stall 20 ms gave none: the CPU world makes 4 jobs
+    per epoch and a CPU draft layer outlasts 20 ms); the worker takes the queued jobs of one epoch as one batch and
+    makes ONE release of all their layers (NativePipe.submit; cap_groups 1: one chunk per item, so chunks = groups) and
+    ONE commit. The claim, the gates and the counters hold; preconditions (L34): batches of several jobs, several
+    non-empty jobs of several layers in one batch."""
     _plain("GUDKC")
     ref = _plain("GUDKCD")
     cls = X.W.pkg_load("r2_transport_gilfree_v3").GilfreeTransport
     ev = _run_bf("timing", worker="thread", packer="gilfree", gf=dict(ext=gfext, cls=cls, cap_groups=1), threads=2,
-                 stall_ms=20.0, late="defer", late_wait_ms=60000.0, batch=8)
+                 late="defer", late_wait_ms=60000.0, batch=8, hold=2 * L)
+    bf = ev["rd"]["bf"]
+    tp = bf["transport"]
+    _ev("BF1 BATCH: jobs %d in %d batches (offered max %s; done per batch -> batches %s; max %s non-empty jobs, %s "
+        "layers); hold %s s; releases %d, chunks %d, groups %d; sent %d, used %d; worker ms per epoch %s" % (
+            bf["jobs"], bf["batches"], bf.get("batch_in_max"), bf.get("batch_sizes"), bf.get("batch_jobs_max"),
+            bf.get("batch_layers_max"),
+            bf.get("hold_s"), tp["releases"], tp["chunks"], tp["groups"], bf["items_sent"],
+            bf["used_store"] + bf["used_win"], bf["worker_ms_per_epoch"]))
     bad = TS._diff(ref, ev, skip=DIFF_RD, tensors_skip=DIFF_T)
     assert bad == [], bad[:10]
-    bf = ev["rd"]["bf"]
     gs = _gates(ev, "timing")
     assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
-    tp = bf["transport"]
     assert bf["error"] is None and bf["jobs"] == bf["issued"] + bf["late"] + bf["empty_jobs"], bf
-    assert bf["batch_jobs_max"] > 1 and bf["batch_layers_max"] > 1 and bf["batches"] < bf["jobs"], bf
+    assert bf["batch_in_max"] > 1 and max(int(k) for k in bf["batch_sizes"]) > 1, (bf["batch_in_max"],
+                                                                                   bf["batch_sizes"])
+    assert bf["batches"] < bf["jobs"], (bf["batches"], bf["jobs"])
+    assert bf["batch_jobs_max"] > 1 and bf["batch_layers_max"] > 1, (bf["batch_jobs_max"], bf["batch_layers_max"])
     assert tp["releases"] <= bf["batches"] and tp["chunks"] == tp["groups"] >= bf["items_sent"] > 0, (tp, bf)
     assert bf["used_store"] + bf["used_win"] > 0, bf
-    _ev("BF1 BATCH: jobs %d in %d batches (max %d jobs, %d layers); releases %d, chunks %d, groups %d; sent %d, used "
-        "%d; worker ms per epoch %s" % (bf["jobs"], bf["batches"], bf["batch_jobs_max"], bf["batch_layers_max"],
-                                        tp["releases"], tp["chunks"], tp["groups"], bf["items_sent"],
-                                        bf["used_store"] + bf["used_win"], bf["worker_ms_per_epoch"]))
 
 
 def test_bf1_carry():
     """A job that does not fit the batch's landing entry (n_cap 1: one item per batch) is CARRIED into the next batch,
-    not dropped: carried > 0, the claim, the gates and the counters hold (torch packer, thread worker, backlog)."""
+    not dropped: carried > 0, the claim, the gates and the counters hold (torch packer, thread worker, a certain
+    backlog: hold = the epoch's 2 L jobs)."""
     ref = _plain("GUDKCD")
-    ev = _run_bf("timing", worker="thread", stall_ms=20.0, late="defer", late_wait_ms=60000.0, n_cap=1, batch=8)
+    ev = _run_bf("timing", worker="thread", late="defer", late_wait_ms=60000.0, n_cap=1, batch=8, hold=2 * L)
+    bf = ev["rd"]["bf"]
+    _ev("BF1 CARRY: jobs %d, batches %d (jobs offered max %s; done per batch -> batches %s), carried %s, capped items "
+        "%d, sent %d" % (bf["jobs"], bf["batches"], bf.get("batch_in_max"), bf.get("batch_sizes"), bf.get("carried"),
+                         bf["items_cap"], bf["items_sent"]))
     bad = TS._diff(ref, ev, skip=DIFF_RD, tensors_skip=DIFF_T)
     assert bad == [], bad[:10]
-    bf = ev["rd"]["bf"]
     gs = _gates(ev, "timing")
     assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
     assert bf["error"] is None and bf["jobs"] == bf["issued"] + bf["late"] + bf["empty_jobs"], bf
-    assert bf.get("carried", 0) > 0 and bf["batch_jobs_max"] == 1, bf
-    _ev("BF1 CARRY: jobs %d, batches %d, carried %d, capped items %d, sent %d" % (
-        bf["jobs"], bf["batches"], bf["carried"], bf["items_cap"], bf["items_sent"]))
+    assert bf["batch_in_max"] > 1, bf["batch_in_max"]                  # the backlog formed (jobs offered to a batch)
+    assert bf.get("carried", 0) > 0 and bf["batch_jobs_max"] == 1, (bf.get("carried"), bf["batch_jobs_max"])
 
 
 @pytest.mark.parametrize("warm", [False, True])

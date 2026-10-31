@@ -256,14 +256,17 @@ class BgFetch:
 
     def __init__(self, T, mode: str = "ce", n_cap: int = 1024, ring: int = 8, worker: str = "thread",
                  acct: bool = False, bneg=None, close_wait_ms: float = 0.0, packer: str = "torch", threads: int = 8,
-                 gf=None, late: str = "drop", late_wait_ms: float = 100.0, stall_ms: float = 0.0, batch: int = 8):
+                 gf=None, late: str = "drop", late_wait_ms: float = 100.0, stall_ms: float = 0.0, batch: int = 8,
+                 hold: int = 0):
         if (mode not in MODES or worker not in WORKERS or bneg not in BNEG or packer not in PACKERS
                 or late not in LATES):
             raise BFError("mode %r / worker %r / bneg %r / packer %r / late %r: one of %s / %s / %s / %s / %s" % (
                 mode, worker, bneg, packer, late, MODES, WORKERS, BNEG, PACKERS, LATES))
-        if float(late_wait_ms) < 0 or float(stall_ms) < 0 or int(batch) < 1:
-            raise BFError("late_wait_ms >= 0, stall_ms >= 0, batch >= 1")
+        if float(late_wait_ms) < 0 or float(stall_ms) < 0 or int(batch) < 1 or int(hold) < 0:
+            raise BFError("late_wait_ms >= 0, stall_ms >= 0, batch >= 1, hold >= 0")
         self.batch = int(batch)                          # jobs per worker batch (one pack / transport job / commit)
+        self.hold = int(hold)                            # tests only: before a batch the worker waits for `hold` queued
+                                                         # jobs (or the epoch's close): a CERTAIN backlog (L34)
         self.packer, self.threads, self.gf = packer, int(threads), dict(gf or {})
         self.late_mode, self.late_wait_ms = late, float(late_wait_ms)
         self.stall_ms = float(stall_ms)                  # tests only: the worker sleeps per job (forces late jobs)
@@ -666,6 +669,8 @@ class BgFetch:
                     carry, have_carry = None, False
                 if first is None:
                     return
+                if self.hold > 1 and not left and not have_carry:
+                    self._hold(first)
                 batch = [x[0] for x in left] or [first]
                 idss = [x[1] for x in left] + [None] * (len(batch) - len(left))
                 left = []
@@ -680,6 +685,7 @@ class BgFetch:
                     batch.append(nxt)
                     idss.append(None)
                 tj = time.perf_counter()
+                self.rep["batch_in_max"] = max(self.rep.get("batch_in_max", 0), len(batch))   # jobs offered (backlog)
                 try:
                     left = self._batch(batch, idss)
                 except BaseException as e:               # the compute thread raises it at its next hook
@@ -696,7 +702,21 @@ class BgFetch:
                             job[0].pend[job[1]] -= 1
                         self.rep["worker_busy_s"] = self.rep.get("worker_busy_s", 0.0) + time.perf_counter() - tj
                         self.rep["batches"] = self.rep.get("batches", 0) + 1
+                        hs = self.rep.setdefault("batch_sizes", {})              # jobs per batch -> batches
+                        hs[str(len(done))] = hs.get(str(len(done)), 0) + 1
                         self.cv.notify_all()
+
+    def _hold(self, first) -> None:
+        """TESTS ONLY (hold > 1): the CPU world makes 4 jobs per epoch (L 2 x 2 draft passes) and a CPU draft layer
+        outlasts a short stall, so the worker took each job as it was queued and no batch of several jobs formed
+        (4981010: batch_jobs_max 1). Before a batch the worker waits until `hold` jobs are queued (with `first`), or the
+        epoch closes (the joint pass started: no more jobs of it), or 10 s; the jobs are then a certain backlog."""
+        t0 = time.perf_counter()
+        ep = first[0]
+        while (self.q.qsize() + 1 < self.hold and not (ep.closing or ep.closed) and self.error is None
+               and time.perf_counter() - t0 < 10.0):
+            time.sleep(0.001)
+        self.rep["hold_s"] = self.rep.get("hold_s", 0.0) + time.perf_counter() - t0
 
     def stop(self) -> None:
         if self.thread is not None:
