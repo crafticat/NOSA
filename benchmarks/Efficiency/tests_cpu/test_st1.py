@@ -25,6 +25,11 @@ ST3       test_st3_constants (KP's constants, kfb's written arguments = the capt
           helpers, check passes with the check counters 0); test_st3_controls ("no_age", "remap_off" CHANGE the run);
           test_st3_int (ST3 on the INT keep arm L4PTFDGUDKWCDI = the INT run, every bit); test_st3_cell (the MTK arm's
           rules, gates incl. -KFILL and its plants, the ST3 verdicts and registration state).
+ST4       test_st4_constants; test_st4_helper_planted (rpost_fn plain and Inductor CPU = the residency's ops, with and
+          without the check counters; the controls change it); test_st4_placement (ResidST4 directly above r2_i4a_lean's
+          _resid_lean in the MT / MTK arms and both INT arms, BF1's override above it); test_st4_equal (MTR = MT, MTKR =
+          MTK every bit, timing and check; -DRESID); test_st4_controls; test_st4_int (both INT arms: C 128 with J1 F3's
+          captured residency, C 73 with BF1 = the INT run every bit); test_st4_cell (rules, gates, plants, verdicts).
 CELL      test_st1_cell_pure (arguments, the gates on CPU evidence pass, their plants fail; the verdicts against the
           registration state), test_st1_registration_state (PRED_STAMP_ST1 / PRED_ST1_BY_B and the GRANT_<cell> lines:
           None or a date -u stamp, as the step script's greps see them), test_step_script_st1 (the repaired pattern: no
@@ -117,6 +122,7 @@ def _mod(name):
 
 # ST3: the written arguments of its helpers for the CPU capture stand-in (i4cc_world.MUT; as test_j1 registers J1's)
 X.XC.MUT.update(kfa=(), kfb=_mod("r2_st1_commit").KFB_WRITES)
+X.XC.MUT.update(rpost=_mod("r2_st1_commit").RPOST_WRITES)              # ST4
 
 
 # ------------------------------------------------------------------ GATE 0
@@ -170,7 +176,7 @@ def test_st1_copies():
     core = [x for x in nb if not x.rstrip().endswith("# ST1")]
     extra = [x for x in nb if x.rstrip().endswith("# ST1")]
     assert core == ob, [(i, a, b) for i, (a, b) in enumerate(zip(core, ob)) if a != b][:3] or (len(core), len(ob))
-    assert len(extra) == 3, extra
+    assert len(extra) == 4, extra
     _ev("ST1 COPIES: run_arm_st1 = run_arm_d + %d ST1 lines" % len(extra))
 
 
@@ -198,8 +204,8 @@ class FakeCommitGraphs(XG.FakeGraphs):
 
 
 def m_builder(arm, mode="rows", sneg=None, check=False, stats=False, kcheck=False, phase_marks=False, probe_every=0,
-              twin=False, tneg2=None, st3=False, tneg3=None):
-    """The M arm's runner (twin: the MT arm's; st3: the MTK arm's; the D arm's runner arguments of
+              twin=False, tneg2=None, st3=False, tneg3=None, st4=False, tneg4=None):
+    """The M arm's runner (twin: the MT arm's; st3: the MTK arm's; st4: + ST4; the D arm's runner arguments of
     i4dc_world.d_builder) with FakeCommitGraphs."""
     STC = _mod("r2_st1_commit")
     W, WB, Z, I3, KA, RE, RW, SR = X.W, X.WB, X.Z, X.I3, X.KA, X.RE, X.RW, X.SR
@@ -207,6 +213,8 @@ def m_builder(arm, mode="rows", sneg=None, check=False, stats=False, kcheck=Fals
     Runner = STC.st1_runner(X.DCL[X.DARMS[arm]][1], mode, sneg, twin=twin, tneg2=tneg2)
     if st3:
         Runner = STC.st3_runner(Runner, tneg3)
+    if st4:
+        Runner = STC.st4_runner(Runner, tneg4)
 
     def build(model, cache, S, horizon, tok0, K=X.K0, check_every=0, record=False):
         B = int(cache.layers[0].cache_engine._k_gpu.shape[0])
@@ -230,14 +238,15 @@ def m_builder(arm, mode="rows", sneg=None, check=False, stats=False, kcheck=Fals
 
 
 def run_m(arm, mode="rows", sneg=None, scen="timing", B=8, N=N_RUN, seed=0, twin=False, tneg2=None, st3=False,
-          tneg3=None):
-    """One run of the M arm (twin: the MT arm; st3: the MTK arm) of `arm` (GUDCD, GUDKCD) in i4dc_world's scenario."""
+          tneg3=None, st4=False, tneg4=None):
+    """One run of the M arm (twin: the MT arm; st3: the MTK arm; st4: + ST4) of `arm` (GUDCD, GUDKCD) in i4dc_world's
+    scenario."""
     X.CC.configure()
     s = X.SCEN[scen]
     model, c, S, hz, tok0 = X.world(B, N, seed)
     kc = bool(s["check"]) and arm in X.KEEP
     run = m_builder(arm, mode, sneg, check=s["check"], stats=s["stats"], kcheck=kc, phase_marks=s["phase_marks"],
-                    probe_every=s["probe_every"], twin=twin, tneg2=tneg2, st3=st3, tneg3=tneg3)(
+                    probe_every=s["probe_every"], twin=twin, tneg2=tneg2, st3=st3, tneg3=tneg3, st4=st4, tneg4=tneg4)(
                         model, c, S, hz, tok0, check_every=s["check_every"])
     if s["fa"]:
         run.vs.fa_check = {}
@@ -254,12 +263,12 @@ def _plain(arm, scen="timing"):
 _M = {}
 
 
-def _m(arm, mode, sneg=None, scen="timing", twin=False, tneg2=None, st3=False, tneg3=None):
-    key = (arm, mode, sneg, scen, twin, tneg2, st3, tneg3)
+def _m(arm, mode, sneg=None, scen="timing", twin=False, tneg2=None, st3=False, tneg3=None, st4=False, tneg4=None):
+    key = (arm, mode, sneg, scen, twin, tneg2, st3, tneg3, st4, tneg4)
     if key not in _M:
         _plain({"GUDCD": "GUDC", "GUDKCD": "GUDKC"}[arm], scen)        # the C arm first: it compiles the joint helpers
         _plain(arm, scen)                                              # the D arm (the reference)
-        _M[key] = run_m(arm, mode, sneg, scen, twin=twin, tneg2=tneg2, st3=st3, tneg3=tneg3)
+        _M[key] = run_m(arm, mode, sneg, scen, twin=twin, tneg2=tneg2, st3=st3, tneg3=tneg3, st4=st4, tneg4=tneg4)
     return _M[key]
 
 
@@ -421,7 +430,8 @@ def test_st2_pass_plan():
             C.parse_args(base + ["--arms", bad])
     with pytest.raises(SystemExit):
         C.parse_args(base + ["--st1-commit", "fast"])
-    assert C.ARMS[-5:] == ("L4PTFDGUDCDM", "L4PTFDGUDKWCDM", "L4PTFDGUDCDMT", "L4PTFDGUDKWCDMT", "L4PTFDGUDKWCDMTK")
+    assert C.ARMS[-7:] == ("L4PTFDGUDCDM", "L4PTFDGUDKWCDM", "L4PTFDGUDCDMT", "L4PTFDGUDKWCDMT", "L4PTFDGUDKWCDMTK",
+                           "L4PTFDGUDCDMTR", "L4PTFDGUDKWCDMTKR")
     with pytest.raises(SystemExit):                                    # an MT arm needs its M arm
         C.parse_args(base + ["--arms", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDMT"])
     assert set(STC.MODES) == {"rows", "rowsx", "where"}
@@ -759,6 +769,275 @@ def test_st3_cell():
     assert set(C.PRED_ST3_BY_B) == {318} and set(P3) == set(C.PRED_KEYS_ST3)
     _ev("ST3 CELL: %d gates (%d MUST) pass on CPU evidence; KFILL %s" % (len(gs), sum(1 for g in gs if g[1]),
                                                                        C.kfill_gate(name, s3, cc)[3][:160]))
+
+
+# ------------------------------------------------------------------ ST4: the draft residency's integer ops compiled
+def test_st4_constants():
+    STC = _mod("r2_st1_commit")
+    names = list(inspect.signature(STC.rpost_fn).parameters)
+    assert [names[i] for i in STC.RPOST_WRITES] == ["nb", "bm", "skipped", "forced", "injected"]
+    assert X.XC.MUT["rpost"] == STC.RPOST_WRITES and STC.HELPERS4 == tuple(STC.FNS4) == ("rpost",)
+    assert set(STC.TNEG4) == {None, "no_block_mask", "count_off"}
+    with pytest.raises(ValueError):
+        STC.st4_runner(object, "nope")
+
+
+def _plant4(seed, H=2, B=3, T=6, L=4, l=2):
+    g = torch.Generator().manual_seed(seed)
+    ri = lambda lo, hi, shape: torch.randint(lo, hi, shape, generator=g, dtype=torch.int64)   # noqa: E731
+    rb = lambda shape: torch.rand(shape, generator=g) < 0.5                                     # noqa: E731
+    return dict(nb=ri(-1, 20, (H, B, T)), bm=ri(-1, 20, (H, B, T)), lm=ri(-1, 20, (H, B, T)), am=rb((1, B, 1)),
+                qb3=ri(0, 10, (1, B, 1)), drf3=rb((1, B, 1)), inj=rb((H, B, T)), skipped=ri(0, 9, (L,)),
+                forced=ri(0, 9, (L,)), injected=ri(0, 9, (L,)), L=L, l=l)
+
+
+def _ref_rpost(P, chk):
+    """r2_i4a_lean.TentStateFD._resid_lean's ops after pool_swap (LN:211-223, the gathers aside), op for op."""
+    nb, bm = P["nb"].clone(), P["bm"].clone()
+    skipped, forced, injected = P["skipped"].clone(), P["forced"].clone(), P["injected"].clone()
+    am, qb3, l = P["am"], P["qb3"], P["l"]
+    nb.copy_(torch.where(am, nb, bm))
+    bm.copy_(nb)
+    lm = P["lm"]
+    tent = lm > qb3
+    skip = (lm >= 0) & (P["drf3"] | tent)
+    ids = torch.where(skip, torch.tensor(-1, dtype=torch.int64), lm)
+    bm.masked_fill_(skip, -1)
+    skipped[l] += (skip & ~tent).sum()
+    if chk:
+        forced[l] += tent.sum()
+        injected[l] += P["inj"].sum()
+    return dict(nb=nb, bm=bm, skipped=skipped, forced=forced, injected=injected, skip=skip, ids=ids)
+
+
+def _st4_rpost(P, f, chk, neg=0):
+    nb, bm = P["nb"].clone(), P["bm"].clone()
+    skipped, forced, injected = P["skipped"].clone(), P["forced"].clone(), P["injected"].clone()
+    i64 = dict(dtype=torch.int64)
+    skip, ids = f(nb, bm, P["lm"], P["am"], P["qb3"], P["drf3"], torch.tensor(-1, **i64), skipped, forced, injected,
+                  P["inj"], torch.arange(P["L"], **i64), torch.tensor(P["l"], **i64), chk, neg)
+    return dict(nb=nb, bm=bm, skipped=skipped, forced=forced, injected=injected, skip=skip, ids=ids)
+
+
+def test_st4_helper_planted():
+    """rpost_fn (plain Python and Inductor's CPU backend) = the residency's ops on planted tensors, every written tensor,
+    with and without the check counters; PRECONDITIONS: skips of both kinds; the controls change it."""
+    STC = _mod("r2_st1_commit")
+    X.CC.configure()
+    variants = (("python", STC.rpost_fn), ("inductor", STC.compiled4("rpost", "inductor")))
+    skips = drafts = c_mask = c_count = 0
+    seeds = range(6)
+    for seed in seeds:
+        P = _plant4(seed)
+        for chk in (False, True):
+            r = _ref_rpost(P, chk)
+            for name, f in variants:
+                s = _st4_rpost(P, f, chk)
+                for k in r:
+                    assert torch.equal(s[k], r[k]), (seed, chk, name, k)
+        skips += int(r["skip"].sum())
+        drafts += int((r["skip"] & ~(P["lm"] > P["qb3"])).sum())
+        c_mask += int(not torch.equal(_st4_rpost(P, STC.rpost_fn, False, 1)["bm"], r["bm"]))
+        r0 = _ref_rpost(P, False)
+        c_count += int(not torch.equal(_st4_rpost(P, STC.rpost_fn, False, 2)["skipped"], r0["skipped"]))
+    assert skips > 0 and drafts > 0 and skips > drafts, (skips, drafts)              # preconditions (L34)
+    assert c_mask > 0 and c_count > 0, (c_mask, c_count)
+    _ev("ST4 PLANTED: %d plants: skips %d (draft skips %d); controls changed no_block_mask %d, count_off %d" % (
+        len(seeds), skips, drafts, c_mask, c_count))
+
+
+def _st4_mro_ok(cls):
+    STC = _mod("r2_st1_commit")
+    mro = cls.__mro__
+    base = _mod("r2_i4a_lean").lean_classes(X.STF)[0]
+    i = mro.index(STC.ResidST4)
+    assert mro[i + 1] is base and STC.resid_owner(cls) is base, [k.__name__ for k in mro]
+    above = [k.__name__ for k in mro[:i] if "_resid_lean" in k.__dict__]       # the overrides that still run first
+    return above
+
+
+def test_st4_placement():
+    """ResidST4 sits DIRECTLY above r2_i4a_lean's TentStateFD (the original _resid_lean) in every arm it joins, below
+    every other override (BF1's in the INT keep arm); a second attach is refused."""
+    STC = _mod("r2_st1_commit")
+    X.CC.configure()
+    out = {}
+    for arm, st3 in (("GUDCD", False), ("GUDKCD", True)):
+        model, c, S, hz, tok0 = X.world(2, 8, 0)
+        run = m_builder(arm, twin=True, st3=st3, st4=True)(model, c, S, hz, tok0)
+        out[arm] = _st4_mro_ok(type(run.T))
+        assert out[arm] == [], out[arm]
+        with pytest.raises(ValueError):
+            STC.st4_state(type(run.T))
+    TI = _load("test_int")
+    INTA = _mod("r2_int_arms")
+    for arm in INTA.ARMS_INT:
+        run = TI._make(arm, "timing")(*X.world(2, 8, 0)[:5])
+        STC.st4_attach(run)
+        cls = type(run.T)
+        out[arm] = _st4_mro_ok(cls)
+        names = [k.__name__ for k in cls.__mro__]
+        if arm in INTA.KEEP_INT:
+            assert out[arm] == ["TentStateBF"] and INTA.owner(cls, "_resid_lean") == "TentStateBF", (out[arm], names)
+        else:
+            assert out[arm] == [] and "_J3Mix" in names, (out[arm], names)
+        assert INTA.owner(cls, "_layer") == "IntLayer" and INTA.owner(cls, "commit") == "CommitST1"
+    _ev("ST4 PLACEMENT: overrides above ResidST4 %s" % out)
+
+
+def _st4_ok(rd, L_, f3=False):
+    s4, dg = rd["st4"], rd["dgraph"]
+    C = _mod("r2_st1_cell")
+    g = C.dresid_gate("X", s4, dg, L_, f3)
+    assert g[2], g
+    return s4
+
+
+ST4_REF = dict(GUDCD=dict(st3=False), GUDKCD=dict(st3=True))
+
+
+@pytest.mark.parametrize("arm,scen", [("GUDCD", "timing"), ("GUDKCD", "timing"), ("GUDCD", "check"),
+                                      ("GUDKCD", "check")])
+def test_st4_equal(arm, scen):
+    """The MTR / MTKR run = its MT / MTK run, every bit (the engine's block maps, the counters, the KV), and = the D
+    run outside the uncommitted tail rows; every draft residency ran the helper (-DRESID)."""
+    st3 = ST4_REF[arm]["st3"]
+    ref = _m(arm, "rows", None, scen, twin=True, st3=st3)
+    ev = _m(arm, "rows", None, scen, twin=True, st3=st3, st4=True)
+    base = _plain(arm, scen)
+    rd = ev["rd"]
+    assert sum(rd["tent"]["skipped"]) > 0 and rd["dgraph"]["replay_passes"] > 0, "precondition: draft skips, replays"
+    bad = TS._diff(ref, ev, skip=("st1", "st2", "st3", "st4", "compile"))
+    assert bad == [], bad[:10]                                         # THE CLAIM: the reference run, every bit
+    bad_d = TS._diff(base, ev, skip=("st1", "st2", "st3", "st4", "compile"), tensors_skip=KV_KEYS)
+    assert bad_d == [], bad_d[:10]
+    s4 = _st4_ok(rd, L)
+    _ev("ST4 EQUAL %s %s: skipped %d (check counters forced %d injected %d); dgraph warm %d capture %d replay %d "
+        "eager %d; st4 %s" % (
+        arm, scen, sum(rd["tent"]["skipped"]), sum(rd["tent"]["forced"]), sum(rd["tent"]["injected"]),
+        rd["dgraph"]["warm"], rd["dgraph"]["capture_passes"],
+        rd["dgraph"]["replay_passes"], rd["dgraph"]["eager"], {k: s4[k] for k in ("calls", "fallback", "events")}))
+
+
+@pytest.mark.parametrize("tneg4", ["no_block_mask", "count_off"])
+def test_st4_controls(tneg4):
+    """"no_block_mask" changes the engine's block maps (and later the loads), "count_off" the skipped counters."""
+    ref = _m("GUDCD", "rows", None, "timing", twin=True)
+    try:
+        ev = _m("GUDCD", "rows", None, "timing", twin=True, st4=True, tneg4=tneg4)
+    except Exception as e:                                             # a control that breaks the run is caught too
+        _ev("ST4 CONTROL %s: the run raised %s: %s" % (tneg4, type(e).__name__, str(e)[:200]))
+        return
+    bad = TS._diff(ref, ev, skip=("st1", "st2", "st4", "compile"))
+    assert bad != [], "the control %s changed nothing (a no-op plant)" % tneg4
+    _ev("ST4 CONTROL %s: differences %d (first %s)" % (tneg4, len(bad), bad[:6]))
+
+
+_I4 = {}
+
+
+def _int_st4(key, scen):
+    """(the INT arm's run, the same + ST4; + ST3 in the keep arm) on the CPU world (test_int's builder + attach)."""
+    if (key, scen) not in _I4:
+        TI = _load("test_int")
+        STC = _mod("r2_st1_commit")
+        arm = TI.INT_ARMS[key]
+        ref = TI._int(key, scen)
+        run = TI._builder(arm, scen)
+        STC.st4_attach(run)
+        if X.SCEN[scen]["fa"]:
+            run.vs.fa_check = {}
+        run.run(N_RUN)
+        rd = run.read()
+        rd["st4"] = run.T.st4_report()
+        _I4[(key, scen)] = (ref, dict(runner=run, rd=rd, N=N_RUN, B=8, scen=scen, arm=arm))
+    return _I4[(key, scen)]
+
+
+@pytest.mark.parametrize("key,scen", [("C128", "timing"), ("C73", "timing"), ("C128", "check"), ("C73", "check")])
+def test_st4_int(key, scen):
+    """ST4 on both INT arms: C 128 (J1 F3: the residency INSIDE the draft graphs, the stamp frame) and C 73 (BF1's
+    on_draft hook after the residency): the run = the INT run, every bit (BF1's record aside: its timers)."""
+    ref, ev = _int_st4(key, scen)
+    rd, rr = ev["rd"], ref["rd"]
+    f3 = key == "C128"
+    assert sum(rd["tent"]["skipped"]) > 0, "precondition: draft skips"
+    if f3:
+        assert rd["j3"]["draft_layers"] > 0, rd["j3"]                  # the residency ran inside the draft captures
+    bad = TS._diff(ref, ev, skip=("compile", "j1", "j3", "st1", "st2", "st4", "int", "bf"))
+    assert bad == [], bad[:10]                                         # THE CLAIM: the INT run, every bit
+    if not f3:
+        assert all(rd["bf"][k] == rr["bf"][k] for k in ("committed", "used_store", "used_win")), (rd["bf"], rr["bf"])
+    s4 = _st4_ok(rd, L, f3)
+    _ev("ST4 INT %s %s: skipped %d; st4 %s" % (key, scen, sum(rd["tent"]["skipped"]),
+                                               {k: s4[k] for k in ("calls", "fallback", "events")}))
+
+
+def test_st4_cell():
+    """The ST4 arms in the cell: the arm rules, the gates on CPU evidence (the reference arm's set + -DRESID; every MUST
+    passes; -DRESID's plants fail), the ST4 verdicts and registration state (None: REPORT)."""
+    C, STC = _mod("r2_st1_cell"), _mod("r2_st1_commit")
+    base = ["--out", "/nonexistent/x", "--workload", "/nonexistent/w"]
+    a = C.parse_args(base + ["--arms", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDM,L4PTFDGUDCDMT,L4PTFDGUDCDMTR"])
+    assert a.arms[-1] == "L4PTFDGUDCDMTR"
+    a = C.parse_args(base + ["--arms", "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,"
+                                       "L4PTFDGUDKWCDMTK,L4PTFDGUDKWCDMTKR"])
+    assert a.arms[-1] == "L4PTFDGUDKWCDMTKR"
+    with pytest.raises(SystemExit):                                    # an ST4 arm needs its reference arm
+        C.parse_args(base + ["--arms", "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,"
+                                       "L4PTFDGUDKWCDMTKR"])
+    assert not set(C.ST4) & set(C.ST1) and C.ST13["L4PTFDGUDCDMTR"] == "L4PTFDGUDCDMT"   # r2_int_cell reads ST1
+    assert "L4PTFDGUDKWCDMTKR" in C.KFILL_ARMS and all(x in C.TWIN for x in C.ST4)
+
+    def cpu(e):
+        out = X.cell_inputs(e, C)
+        out["tails"] = STC.tail_checksum(e["runner"].T)
+        return out
+    for arm, name, st3 in (("GUDCD", "L4PTFDGUDCDMTR", False), ("GUDKCD", "L4PTFDGUDKWCDMTKR", True)):
+        ev = _m(arm, "rows", twin=True, st3=st3, st4=True)
+        ref = _m(arm, "rows", twin=True, st3=st3)
+        keepd = {"L4PTFD": cpu(_plain("D")), C.ROOT[name]: cpu(_plain(arm)), C.ST4[name]: cpu(ref)}
+        if arm == "GUDKCD":
+            keepd["L4PTFDGUDKWC"] = cpu(_plain("GUDKC"))
+        rd = ev["rd"]
+        rec = dict(graph=rd["graph"], dgraph=rd["dgraph"], gpu_peak_alloc_GB=1.0, mem_arena=dict(prefill_peak_GB=1.0))
+        gs = C.arm_gates_st1(name, rd, rec, cpu(ev), keepd, False, 8, 10, N_RUN, L, 1.0)
+        names = [g[0] for g in gs]
+        assert all(n.startswith(name + "-") for n in names), names
+        want = ("-PEQ", "-DCOUNTS", "-TAIL-EQ", "-CGRAPH", "-TWIN", "-DRESID", "-EQF", "-COMPILE") + (
+            ("-KFILL",) if st3 else ())
+        for w in want:
+            assert name + w in names, (w, names)
+        assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
+        s4, dg = rd["st4"], rd["dgraph"]
+        assert C.dresid_gate(name, s4, dg, L, False)[2]
+        for plant in (dict(fallback=dict(nocc=1)), dict(calls=s4["calls"] - 1), dict(entered=s4["calls"] + 1),
+                      dict(neg="count_off"), dict(calls=0, entered=0),
+                      dict(events=[dict(name="rpost", graphs=1, s=0.1, layer=0, dpass=0, capture=True)]),
+                      dict(events=[dict(name="rpost", graphs=1, s=0.1, layer=0, dpass=0, capture=False)] * 2)):
+            assert not C.dresid_gate(name, dict(s4, **plant), dg, L, False)[2], plant
+        assert not C.dresid_gate(name, s4, dg, L, True)[2]             # the F3 formula on a non-F3 run
+        assert not C.dresid_gate(name, None, dg, L, False)[2]
+    r = lambda tok, draft: dict(rates=dict(median_tok_s=tok, round_ms_median=10.0),     # noqa: E731
+                                phases_median=dict(commit=4.0, joint=5.0, draft=draft), peak_with_prefill_GB=80.0)
+    sp = {"L4PTFDGUDCD": r(100.0, 6.0), "L4PTFDGUDCDM": r(101.0, 6.0), "L4PTFDGUDCDMT": r(102.0, 6.0),
+          "L4PTFDGUDCDMTR": r(103.0, 4.0)}
+    v = {p[0]: p for p in C.verdicts(sp, 216)}
+    P4 = C.PRED_ST4_BY_B[216]
+
+    def want4(key, val):
+        b = P4.get(key)
+        return "REPORT" if b is None else ("CONFIRMED" if b[0] <= val <= b[1] else "REFUTED")
+    assert v["ST4-DRAFT-SAVING"][1] == want4("ST4_draft_saving", 2.0) and "2.0000" in v["ST4-DRAFT-SAVING"][2]
+    assert v["ST4-VS-REF"][1] == want4("ST4_vs_ref", 103.0 / 102.0) and "ST4-ARM" in v
+    src = (EFF / "r2_st1_cell.py").read_text()
+    if C.PRED_STAMP_ST4 is None:
+        assert all(x is None for b in C.PRED_ST4_BY_B.values() for x in b.values())
+        assert "\nPRED_STAMP_ST4 = None\n" in src
+    else:
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", C.PRED_STAMP_ST4)
+    assert set(C.PRED_ST4_BY_B) == {216, 318} and all(set(b) == set(C.PRED_KEYS_ST4) for b in C.PRED_ST4_BY_B.values())
+    _ev("ST4 CELL: gates and plants on CPU evidence; verdicts %s" % sorted(k for k in v if k.startswith("ST4")))
 
 
 def test_st1_registration_state():
