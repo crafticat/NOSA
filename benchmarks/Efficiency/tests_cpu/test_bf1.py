@@ -19,8 +19,11 @@ WORLD     test_bf1_equal (timing and check scenarios, inline worker): L4PTFDGUDK
           test_bf1_plants: "wrong_bytes" and "no_copy" break EQF and the byte check (L34: the plant was used).
           test_bf1_gilfree (inline, thread) / test_bf1_gilfree_plant: the packer switch (r2_transport_gilfree_v3, packer
           v3 built here with OpenMP, as test_pool_prefetch.py builds it): the same claim and gates; the plant caught.
-CELL      test_cell_pure (arguments, gates on planted records, verdicts), test_step_script_bf1 (the cells' arguments
-          parse; the pins name the BF1 files).
+          test_bf1_gilfree_batch / test_bf1_carry: the worker's batches (one release of all layers, one commit; a job
+          that does not fit is carried, not dropped). test_bf1_store_x: a store X other than REF's (bf1b): COUNTS
+          declares union.cap / store_slots, the warm compiles loc2 before the first capture; warm off -> COMPILE fails.
+CELL      test_cell_pure (arguments, gates on planted records, verdicts), test_counts_gate_bf (bf1b's COUNTS defect and
+          its fix), test_step_script_bf1 (the cells' arguments parse; the pins name the BF1 files).
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rfEs benchmarks/Efficiency/tests_cpu/test_bf1.py
 """
@@ -203,7 +206,7 @@ def test_pure_rows_rank_alive():
 # ------------------------------------------------------------------ the world runs
 def _builder(mode="ce", worker="inline", Xs=None, acct=True, bneg=None, check=False, stats=False, kcheck=False,
              phase_marks=False, probe_every=0, n_cap=4096, ring=4, packer="torch", gf=None, threads=2, late="drop",
-             late_wait_ms=100.0, stall_ms=0.0):
+             late_wait_ms=100.0, stall_ms=0.0, batch=8, hold=0):
     """i4dc_world.d_builder's L4PTFDGUDKWCD with the BF1 runner and its options (and the store X)."""
     BF = _mod("r2_bf1_fetch")
     W, RE, SR, I3, KA, RW, WB, Z = X.W, X.RE, X.SR, X.I3, X.KA, X.RW, X.WB, X.Z
@@ -223,7 +226,8 @@ def _builder(mode="ce", worker="inline", Xs=None, acct=True, bneg=None, check=Fa
                   cc_backend="inductor", ccneg=None, cdneg=None, keep=True, kwin=True, kcheck=kcheck, kneg=None,
                   kslots=None, cneg=None, bf=dict(mode=mode, worker=worker, acct=acct, bneg=bneg, n_cap=n_cap,
                                                   ring=ring, packer=packer, gf=gf, threads=threads, late=late,
-                                                  late_wait_ms=late_wait_ms, stall_ms=stall_ms))
+                                                  late_wait_ms=late_wait_ms, stall_ms=stall_ms, batch=batch,
+                                                  hold=hold))
         be = X.FakeGraphsDCD()
         run = Runner(model, rs, sops, BC.HostClock(), graph_backend=be, **kw)
         be.T = run.T
@@ -441,7 +445,104 @@ def test_bf1_gilfree_plant(bneg, gfext):
     assert not gs["L4PTFDGUDKWCDB-EQF"][2] and ev["rd"]["keep"]["check"]["bytes_bad"] > 0
 
 
+def test_bf1_gilfree_batch(gfext):
+    """THE BATCH (bf1b: the worker's cost per CALL bound it): a CERTAIN backlog (hold = the epoch's 2 L jobs: the
+    worker waits for them, or for the joint pass's start; 4981010's stall 20 ms gave none: the CPU world makes 4 jobs
+    per epoch and a CPU draft layer outlasts 20 ms); the worker takes the queued jobs of one epoch as one batch and
+    makes ONE release of all their layers (NativePipe.submit; cap_groups 1: one chunk per item, so chunks = groups) and
+    ONE commit. The claim, the gates and the counters hold; preconditions (L34): batches of several jobs, several
+    non-empty jobs of several layers in one batch."""
+    _plain("GUDKC")
+    ref = _plain("GUDKCD")
+    cls = X.W.pkg_load("r2_transport_gilfree_v3").GilfreeTransport
+    ev = _run_bf("timing", worker="thread", packer="gilfree", gf=dict(ext=gfext, cls=cls, cap_groups=1), threads=2,
+                 late="defer", late_wait_ms=60000.0, batch=8, hold=2 * L)
+    bf = ev["rd"]["bf"]
+    tp = bf["transport"]
+    _ev("BF1 BATCH: jobs %d in %d batches (offered max %s; done per batch -> batches %s; max %s non-empty jobs, %s "
+        "layers); hold %s s; releases %d, chunks %d, groups %d; sent %d, used %d; worker ms per epoch %s" % (
+            bf["jobs"], bf["batches"], bf.get("batch_in_max"), bf.get("batch_sizes"), bf.get("batch_jobs_max"),
+            bf.get("batch_layers_max"),
+            bf.get("hold_s"), tp["releases"], tp["chunks"], tp["groups"], bf["items_sent"],
+            bf["used_store"] + bf["used_win"], bf["worker_ms_per_epoch"]))
+    bad = TS._diff(ref, ev, skip=DIFF_RD, tensors_skip=DIFF_T)
+    assert bad == [], bad[:10]
+    gs = _gates(ev, "timing")
+    assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
+    assert bf["error"] is None and bf["jobs"] == bf["issued"] + bf["late"] + bf["empty_jobs"], bf
+    assert bf["batch_in_max"] > 1 and max(int(k) for k in bf["batch_sizes"]) > 1, (bf["batch_in_max"],
+                                                                                   bf["batch_sizes"])
+    assert bf["batches"] < bf["jobs"], (bf["batches"], bf["jobs"])
+    assert bf["batch_jobs_max"] > 1 and bf["batch_layers_max"] > 1, (bf["batch_jobs_max"], bf["batch_layers_max"])
+    assert tp["releases"] <= bf["batches"] and tp["chunks"] == tp["groups"] >= bf["items_sent"] > 0, (tp, bf)
+    assert bf["used_store"] + bf["used_win"] > 0, bf
+
+
+def test_bf1_carry():
+    """A job that does not fit the batch's landing entry (n_cap 1: one item per batch) is CARRIED into the next batch,
+    not dropped: carried > 0, the claim, the gates and the counters hold (torch packer, thread worker, a certain
+    backlog: hold = the epoch's 2 L jobs)."""
+    ref = _plain("GUDKCD")
+    ev = _run_bf("timing", worker="thread", late="defer", late_wait_ms=60000.0, n_cap=1, batch=8, hold=2 * L)
+    bf = ev["rd"]["bf"]
+    _ev("BF1 CARRY: jobs %d, batches %d (jobs offered max %s; done per batch -> batches %s), carried %s, capped items "
+        "%d, sent %d" % (bf["jobs"], bf["batches"], bf.get("batch_in_max"), bf.get("batch_sizes"), bf.get("carried"),
+                         bf["items_cap"], bf["items_sent"]))
+    bad = TS._diff(ref, ev, skip=DIFF_RD, tensors_skip=DIFF_T)
+    assert bad == [], bad[:10]
+    gs = _gates(ev, "timing")
+    assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
+    assert bf["error"] is None and bf["jobs"] == bf["issued"] + bf["late"] + bf["empty_jobs"], bf
+    assert bf["batch_in_max"] > 1, bf["batch_in_max"]                  # the backlog formed (jobs offered to a batch)
+    assert bf.get("carried", 0) > 0 and bf["batch_jobs_max"] == 1, (bf.get("carried"), bf["batch_jobs_max"])
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_bf1_store_x(warm, monkeypatch):
+    """bf1b's two gate defects at a store X other than REF's (--bf-store 257 vs 129). COUNTS: union.cap / store_slots
+    DECLARED and checked against the arm's X. COMPILE: bf_warm_joint compiles loc2 at the new X before the arm's first
+    capture. NEGATIVE CONTROL (warm off, another fresh X): loc2 compiles at the first joint pass, after the draft
+    captures, and COMPILE fails (the plant is effective: L34)."""
+    _plain("GUDKC")
+    _plain("GUDKCD")
+    x0 = X.KA.store_slots(X.TOPK, X.K0)
+    xs = x0 + (64 if warm else 128)                                    # a shape that no earlier run compiled
+    if not warm:
+        monkeypatch.setattr(_mod("r2_bf1_fetch").bf_classes(X.STF)[0], "bf_warm_joint",
+                            lambda self: dict(ran=False, why="plant"))
+    ev = _run_bf("timing", Xs=xs)
+    gs = {g[0]: g for g in _gates(ev, "timing")}
+    cg, kg = gs["L4PTFDGUDKWCDB-COMPILE"], gs["L4PTFDGUDKWCDB-COUNTS"]
+    events = ev["rd"]["compile"]["events"]
+    assert ev["rd"]["bf"]["X"] == xs and kg[2] and "DECLARED" in kg[3], kg
+    late = [e for e in events if e.get("capture") or e.get("after_captures", 1) != 0]
+    if warm:
+        w = ev["runner"].meta["bf"]["warm"]
+        assert w["ran"] and w["X"] == xs and "loc2" in w["compiled"], w
+        assert late == [] and all(g[2] for g in gs.values() if g[1]), [g for g in gs.values() if g[1] and not g[2]]
+    else:
+        assert any(e["name"] == "loc2" for e in late) and not cg[2], events
+    _ev("BF1 STORE X %d (warm %s): events %s; COMPILE %s; COUNTS %s" % (
+        xs, warm, [(e["name"], e.get("after_captures"), e.get("warm")) for e in events], cg[2], kg[2]))
+
+
 # ------------------------------------------------------------------ the cell
+def test_counts_gate_bf():
+    """bf1b's COUNTS defect reproduced (union.cap 256 vs 128, union.store_slots 257 vs 129 fail KC.counts_gate) and
+    fixed: declared when the store differs, checked against the arm's X; every other key still compared."""
+    C = _mod("r2_bf1_cell")
+    ref = dict(union=dict(cap=128, store_slots=129, calls=dict(attn=3)), tent=dict(calls=dict(chain=2)))
+    arm = dict(union=dict(cap=256, store_slots=257, calls=dict(attn=3)), tent=dict(calls=dict(chain=2)))
+    assert not C.KC.counts_gate("B", arm, ref, C.REF, skip=("round_blocks",))[2]       # the defect
+    g = C.counts_gate_bf("B", arm, ref, 257)
+    assert g[2] and "DECLARED" in g[3], g
+    assert not C.counts_gate_bf("B", arm, ref, 129)[2]                 # store_slots must be the arm's X
+    assert not C.counts_gate_bf("B", dict(arm, union=dict(arm["union"], cap=255)), ref, 257)[2]
+    assert not C.counts_gate_bf("B", dict(arm, union=dict(arm["union"], calls=dict(attn=4))), ref, 257)[2]
+    assert not C.counts_gate_bf("B", dict(arm, tent=dict(calls=dict(chain=3))), ref, 257)[2]
+    same = C.counts_gate_bf("B", ref, ref, 129)
+    assert same[2] and "DECLARED" not in same[3], same
+    assert not C.counts_gate_bf("B", arm, None, 257)[2]
 def test_cell_pure(monkeypatch):
     C = _mod("r2_bf1_cell")
     base = ["--out", "/x", "--workload", "/w", "--bf-packer", "torch"]
@@ -494,7 +595,8 @@ def test_step_script_bf1(monkeypatch, tmp_path):
     monkeypatch.setenv("TORCH_EXTENSIONS_DIR", str(tmp_path))         # the step script sets it ($JIT/torch_ext)
     text = (EFF / "r2_bf1_step.sh").read_text()
     assert "--bf-packer gilfree" in text and "nosi/nosi/r2_transport_gilfree_v3.py" in text
-    assert "--bf-threads 14" in text and "--bf-late defer" in text and "--bf-cap-groups 1024" in text
+    assert "--bf-threads 14" in text and "--bf-late defer" in text and "--bf-cap-groups 2048 --bf-batch 8" in text
+    assert '--bf-ring "$RING"' in text
     assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-bf1" in text and "CELLPY=benchmarks/Efficiency/r2_bf1_cell.py" in text
     assert "benchmarks/Efficiency/r2_bf1_fetch.py" in text and "^PRED_STAMP_BF1 = None$" in text   # the STOP rule
     cell_src = (EFF / "r2_bf1_cell.py").read_text()                   # STATE-AWARE: the cell's line the rule reads
@@ -510,10 +612,12 @@ def test_step_script_bf1(monkeypatch, tmp_path):
         argv = ["--out", "/x", "--workload", "/w", "--batch", kv["BATCH"], "--steps", kv["STEPS"], "--pool",
                 kv["POOL"], "--arms", kv["ARMS"], "--bf-store", kv["BFX"], "--bf-ncap", kv["NCAP"],
                 "--check-every", kv.get("CHECK", "0"), "--require-stress", kv.get("STRESS", "0"),
-                "--bf-acct", kv.get("ACCT", "0"), "--bf-packer", "gilfree", "--bf-threads", "14", "--bf-ring", "16",
-                "--bf-cap-groups", "1024", "--bf-late", "defer", "--bf-late-wait-ms", "100"]
+                "--bf-acct", kv.get("ACCT", "0"), "--bf-packer", "gilfree", "--bf-threads", "14", "--bf-ring",
+                kv["RING"], "--bf-cap-groups", "2048", "--bf-batch", "8", "--bf-late", "defer", "--bf-late-wait-ms",
+                "250"]
         a = C.parse_args(argv)
-        assert a.bf_packer == "gilfree" and C.bf_opt(a, "L4PTFDGUDKWCDB")["late"] == "defer"
-        assert C.bf_opt(a, "L4PTFDGUDKWCDB")["gf"] == dict(cap_groups=1024)
+        o = C.bf_opt(a, "L4PTFDGUDKWCDB")
+        assert a.bf_packer == "gilfree" and o["late"] == "defer" and o["batch"] == 8 and o["ring"] == int(kv["RING"])
+        assert o["gf"] == dict(cap_groups=2048)
         assert "L4PTFDGUDKWCDB" in a.arms and "L4PTFDGUDKWCDX" in a.arms, (cell, a.arms)
     _ev("BF1 STEP: cells %s parse" % sorted(CELLS))

@@ -11,9 +11,10 @@ A BF1 arm needs L4PTFDGUDKWCD EARLIER in the job (its LISTED reference; it also 
 run_arm_bf = the I4DC cell's run_arm_d line for line plus the lines marked "# BF1" (tests_cpu/test_bf1.py checks it).
 MUST GATES: the I4DC cell's for every arm; a BF1 arm takes L4PTFDGUDKWCD's gates under its own name (EQF = L4PTFD bit for
 bit: tokens, check-round fingerprints, state checksums, acceptance record) except COUNTS (here without round_blocks, the
-NEW blocks: the quantity that BF1 changes) and KEEP-EQ / KEEP-REF (the keep's fetched and window-hit counts change by
-design), plus -LISTED (the keep's listed blocks per joint pass = L4PTFDGUDKWCD's: J's selections and residency did not
-change) and -BF (B: the mechanism ran, issued, committed, conserved, no worker error; X: off, nothing issued).
+NEW blocks: the quantity that BF1 changes; with --bf-store other than REF's store, union.cap / union.store_slots are
+declared and checked against the arm's X: counts_gate_bf) and KEEP-EQ / KEEP-REF (the keep's fetched and window-hit
+counts change by design), plus -LISTED (the keep's listed blocks per joint pass = L4PTFDGUDKWCD's: J's selections and
+residency did not change) and -BF (B: the mechanism ran, issued, committed, conserved, no worker error; X: off, nothing issued).
 REPORT: NEW blocks per round and the probe-round gather wait (kv_at_verify) against L4PTFDGUDKWCD, the barrier wait, the
 H2D and pack rates, late / capped / kept-alive items, used / wasted bytes.
 REGISTERED PREDICTIONS PRED_BF1_BY_B: every value None until the lead registers them with PRED_STAMP_BF1 (a None key is
@@ -126,7 +127,8 @@ def parse_args(argv):
                          "torch: index_select into pinned staging on the worker thread")
     ap.add_argument("--bf-threads", type=int, default=14, help="the gilfree packing team (16 cpus: the compute thread "
                                                                    "and the BF1 worker keep 2)")
-    ap.add_argument("--bf-cap-groups", type=int, default=1024, help="gilfree: (head, block) groups per packed chunk")
+    ap.add_argument("--bf-cap-groups", type=int, default=2048, help="gilfree: (head, block) groups per packed chunk")
+    ap.add_argument("--bf-batch", type=int, default=8, help="jobs per worker batch (one pack, transport job, commit)")
     ap.add_argument("--bf-late", default="defer", choices=BF.LATES,
                     help="defer: a job not issued at the joint pass's start commits at ITS layer of the pass; drop: "
                          "abandoned")
@@ -166,9 +168,9 @@ def parse_args(argv):
         if x != 0 and x < bound:
             ap.error("%s %d: below the bound 1 + (K - 1) x 64 = %d (0 = the default)" % (name, x, bound))
     if (a.bf_ncap < 1 or a.bf_ring < 2 or a.bf_close_wait_ms < 0 or not 1 <= a.bf_threads <= 64
-            or not 16 <= a.bf_cap_groups <= 4096 or a.bf_late_wait_ms < 0):
+            or not 16 <= a.bf_cap_groups <= 4096 or a.bf_late_wait_ms < 0 or not 1 <= a.bf_batch <= 64):
         ap.error("--bf-ncap >= 1, --bf-ring >= 2, --bf-close-wait-ms >= 0, --bf-threads in 1 .. 64, --bf-cap-groups in "
-                 "16 .. 4096, --bf-late-wait-ms >= 0")
+                 "16 .. 4096, --bf-late-wait-ms >= 0, --bf-batch in 1 .. 64")
     if a.bf_packer == "gilfree" and any(x in a.arms for x in BF_ARMS) and not os.environ.get("TORCH_EXTENSIONS_DIR"):
         ap.error("--bf-packer gilfree: TORCH_EXTENSIONS_DIR must name the run's build directory (never HOME)")
     if not 1 <= a.pool <= BC.POOL_MAX:
@@ -180,7 +182,7 @@ def bf_opt(a, arm: str) -> dict:
     """BgFetch's keyword arguments of a BF1 arm."""
     return dict(mode=BF_ARMS[arm], n_cap=a.bf_ncap, ring=a.bf_ring, worker=a.bf_worker, acct=bool(a.bf_acct),
                 close_wait_ms=a.bf_close_wait_ms, packer=a.bf_packer, threads=a.bf_threads,
-                gf=dict(cap_groups=a.bf_cap_groups), late=a.bf_late, late_wait_ms=a.bf_late_wait_ms)
+                gf=dict(cap_groups=a.bf_cap_groups), late=a.bf_late, late_wait_ms=a.bf_late_wait_ms, batch=a.bf_batch)
 
 
 # ------------------------------------------------------------------ the arms (GPU)
@@ -266,7 +268,7 @@ def bf_gate(arm, bf, mode: str):
                                                                                   bf.get("items")))
     items, sent = bf.get("items"), bf.get("items_sent")
     cons = (bf.get("committed", 0) + bf.get("revived", 0) + bf.get("no_room", 0)
-            + bf.get("no_room_deferred", 0)) == items
+            + bf.get("no_room_deferred", 0) + bf.get("passed_items", 0)) == items   # passed: a batch's layers < l
     tags = (bf.get("used_store", 0) + bf.get("used_win", 0) + bf.get("unused", 0) + bf.get("pending", 0)
             == bf.get("committed", 0) + bf.get("revived", 0))
     room = bf.get("no_room", 0) == 0 and bf.get("revived", 0) == 0    # THE ROOM RULE: the host never sends what the
@@ -283,9 +285,33 @@ def bf_gate(arm, bf, mode: str):
                         bf.get("unused"), bf.get("pending"), tags))
 
 
+STORE_KEYS = ("cap", "store_slots")    # union.<key>: the fork store's size (store_slots = X, cap = X - 1)
+
+
+def counts_gate_bf(arm, c, c_ref, X):
+    """<arm>-COUNTS (MUST) of a BF1 arm: KC.counts_gate against REF without round_blocks. bf1b's gate-spec defect
+    ('union.cap: 256 vs 128', 'union.store_slots: 257 vs 129' at --bf-store 257): when the arm's store differs from
+    REF's, union.cap and union.store_slots are DECLARED (not compared with REF) and checked against the arm's own X
+    instead: store_slots = X (the BgFetch record's X), cap = X - 1, and REF's cap = its store_slots - 1."""
+    if c_ref is None:
+        return KC.counts_gate(arm, c, None, REF, skip=("round_blocks",))
+    u, ur = dict(c.get("union") or {}), dict(c_ref.get("union") or {})
+    if u.get("store_slots") == ur.get("store_slots"):
+        return KC.counts_gate(arm, c, c_ref, REF, skip=("round_blocks",))
+    size_ok = (X is not None and u.get("store_slots") == X and u.get("cap") == X - 1
+               and ur.get("store_slots") is not None and ur.get("cap") == ur["store_slots"] - 1)
+    c2 = dict(c, union={k: v for k, v in u.items() if k not in STORE_KEYS})
+    r2 = dict(c_ref, union={k: v for k, v in ur.items() if k not in STORE_KEYS})
+    n, m, ok, d = KC.counts_gate(arm, c2, r2, REF, skip=("round_blocks",))
+    return (n, m, bool(ok and size_ok), d + "; DECLARED union.cap / union.store_slots (the store X %s, %s's %s): "
+            "store_slots %s = X, cap %s = X - 1, %s's cap %s = its store_slots - 1: %s" % (
+                X, REF, ur.get("store_slots"), u.get("store_slots"), u.get("cap"), REF, ur.get("cap"), size_ok))
+
+
 def arm_gates_bf(arm, rd, rec, cpu, keep, check: bool, B: int, pool: int, steps: int, L: int, pa):
     """The I4DC cell's arm gates; a BF1 arm: REF's gates under its own name without DROP, COUNTS against REF without
-    round_blocks, -LISTED against REF, -BF."""
+    round_blocks (union.cap / store_slots declared when the store differs: counts_gate_bf), -LISTED against REF,
+    -BF."""
     if arm not in BF_ARMS:
         return DCC.arm_gates(arm, rd, rec, cpu, keep, check, B, pool, steps, L, pa)
     out = []
@@ -294,7 +320,7 @@ def arm_gates_bf(arm, rd, rec, cpu, keep, check: bool, B: int, pool: int, steps:
         if not any(n2 == arm + x for x in DROP):
             out.append((n2, m, ok, d))
     ref = keep.get(REF)
-    out.append(KC.counts_gate(arm, cpu["counts"], ref["counts"] if ref else None, REF, skip=("round_blocks",)))
+    out.append(counts_gate_bf(arm, cpu["counts"], ref["counts"] if ref else None, (rd.get("bf") or {}).get("X")))
     out.append(listed_gate(arm, rd.get("keep"), (ref or {}).get("keep"), REF))
     out.append(bf_gate(arm, rd.get("bf"), BF_ARMS[arm]))
     return out
@@ -382,7 +408,11 @@ def bf_lines(name, r) -> list:
             "landed after their layer ran (passed) %s, host wait in the joint passes %s s, no room at the deferred commit "
             "%s items" % (name, bf.get("late_mode"), bf.get("late_wait_ms"), bf.get("deferred"),
                           bf.get("deferred_committed"), bf.get("late_passed"), round(bf.get("late_wait_s") or 0.0, 3),
-                          bf.get("no_room_deferred"))]
+                          bf.get("no_room_deferred")),
+            "BF1 %s WORKER BUDGET (ms per epoch; the draft window is about 185 ms at C 73 B 318): %s; batch %s, batches "
+            "%s, carried %s; chunks per epoch %s, submit %s ms per chunk (about 1.3 = per call, about 4 = per byte)" % (
+                name, bf.get("worker_ms_per_epoch"), bf.get("batch"), bf.get("batches"), bf.get("carried"),
+                bf.get("chunks_per_epoch"), (bf.get("transport") or {}).get("submit_ms_per_chunk"))]
 
 
 # ------------------------------------------------------------------ main
@@ -523,8 +553,7 @@ def main(argv=None) -> int:
     meta = dict(batch=a.batch, steps=a.steps, S0=BC.S0, doc_rows=rows, n_unique_docs=min(a.batch, BC.N_DOCS),
                 workload_sha256=sha, attn_splits=NL._ATTN_SPLITS, pool_blocks=CEN.POOL_BLOCKS,
                 capacity_C=BC.C_BASE + a.pool, spec_k=a.spec, arms=a.arms, fork_store=a.fork_store,
-                bf_store=a.bf_store, bf=dict(ncap=a.bf_ncap, ring=a.bf_ring, worker=a.bf_worker, acct=a.bf_acct,
-                                             close_wait_ms=a.bf_close_wait_ms),
+                bf_store=a.bf_store, bf=dict(bf_opt(a, "L4PTFDGUDKWCDB"), ncap=a.bf_ncap, mode=None),
                 fork_store_slots=I3C.fork_store_slots("L4PTF", a.spec, a.fork_store), prefill_hook=a.prefill_hook,
                 tu_gemm=a.tu_gemm, spec_journal_blocks=a.spec_journal_blocks, spec_twin=a.spec_twin,
                 spec_body=a.spec_body, spec_graph=a.spec_graph, spec_redirect=a.spec_redirect,

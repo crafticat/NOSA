@@ -18,19 +18,22 @@
 #        L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB. Every gate MUST. Run it first. STEP_MIN 25,
 #        --mem 100G.
 #   bf1b timing, C 73 (pool 10), B 318, 512 steps, probe 16, --bf-store 257 (B and X arms: room for about 123 NEW
-#        head-blocks per (head, request) per round), --bf-ncap 2048, arms L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,
+#        head-blocks per (head, request) per round), --bf-ncap 6144 --bf-ring 6 (a batch of 8 jobs x about 588 items;
+#        landing 6 x 6144 x 32 KB = 1.21 GB), arms L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,
 #        L4PTFDGUDKWCDX,L4PTFDGUDKWCDB. STEP_MIN 200, --mem 340G. STOPS while PRED_STAMP_BF1 is None.
-#   bf1a timing, C 128 (pool 65), B 216, 512 steps, probe 16, --bf-store 0 (129), --bf-ncap 1024, arms L4PTFD,
-#        L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB (the best arm L4PTFDGUDCD in the
+#   bf1a timing, C 128 (pool 65), B 216, 512 steps, probe 16, --bf-store 0 (129), --bf-ncap 2048 --bf-ring 8, arms
+#        L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB (the best arm L4PTFDGUDCD in the
 #        same process). STEP_MIN 180, --mem 240G. STOPS while PRED_STAMP_BF1 is None. A DIAGNOSTIC cell (full-B
 #        coverage; graph-mode KW vs L4PTFDGUDCD), not a lever: r2_bf1_cell.py's C 128 decision (MODEL 0.987 .. 1.006x).
-# EVERY cell: --bf-packer gilfree --bf-threads 14 --bf-cap-groups 1024 (r2_transport_gilfree_v3's C++ team; built into
-# $JIT/torch_ext at the first BF1 arm, about 1-2 min, outside the steady rounds), --bf-ring 16, --bf-late defer
+# EVERY cell: --bf-packer gilfree --bf-threads 14 --bf-cap-groups 2048 --bf-batch 8 (r2_transport_gilfree_v3's C++
+# team; ONE release per batch of up to 8 queued jobs: bf1b's worker was bound per CALL, r2_bf1_fetch.py BATCH; built into
+# $JIT/torch_ext at the first BF1 arm, about 1-2 min, outside the steady rounds), --bf-ring per cell, --bf-late defer
 # --bf-late-wait-ms 250 (a job not issued when the joint pass starts commits at ITS layer of the pass; the host budget:
 # the worker's D1 backlog at the pass start is about 17 jobs x 5.9 ms = 104 ms at 4.65 GB/s, while the host queues
 # about 14 layers x 10.6 ms = 148 ms of GPU work before it reaches the first pending layer, so the wait is host-only;
 # 100 ms could cut it and drop jobs as "passed"; the throughput
-# derivation: r2_bf1_fetch.py docstring, LATE). Landing 16 x 2048 x 32 KB = 1.07 GB at bf1b (after the prefill).
+# derivation: r2_bf1_fetch.py docstring, LATE). Landing 6 x 6144 x 32 KB = 1.21 GB at bf1b (after the prefill; bf1b at
+# f2eba43, 8 x 2048: B peak 80.80 GB, X 79.68 GB; MODEL now B about 81.6 GB = + 0.67 landing + 0.12 transport staging).
 # Basis of STEP_MIN (MEASURED, sacct, the step records under OUTROOT): i4dcb (SH + 3 arms, C 73 B 318) 01:11:41 = 17.9 min
 # per part; i4dca (SH + 3 arms, C 128 B 216) 00:47:32 = 11.9 min per part; i4dm2 (SH + 6 arms, B 8) 00:09:18. MODEL:
 # bf1b = 6 parts = 107.5 min (margin 1.86); bf1a = 8 parts = 95 min (margin 1.89); bf1m = 6 parts at B 8 = about 9 min
@@ -74,17 +77,17 @@ CK=(--spec 3 --fork-store 0 --prefill-hook nocopy --tu-gemm natural --spec-journ
 OUT_MB=2048 CHECK=0 STRESS=0 ACCT=0 PE=16
 case $CELL in
     bf1m) POOL=10 BATCH=8 STEPS=72 ARMS=L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB BFX=0 NCAP=2048
-          CHECK=1 STRESS=1 ACCT=1 PE=4 NEEDPRED=0 STEP_MIN=25 MEM=100G ;;
-    bf1a) POOL=65 BATCH=216 STEPS=512 BFX=0 NCAP=1024 NEEDPRED=1 STEP_MIN=180 MEM=240G
+          RING=8 CHECK=1 STRESS=1 ACCT=1 PE=4 NEEDPRED=0 STEP_MIN=25 MEM=100G ;;
+    bf1a) POOL=65 BATCH=216 STEPS=512 BFX=0 NCAP=2048 RING=8 NEEDPRED=1 STEP_MIN=180 MEM=240G
           ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB ;;
-    bf1b) POOL=10 BATCH=318 STEPS=512 BFX=257 NCAP=2048 NEEDPRED=1 STEP_MIN=200 MEM=340G
+    bf1b) POOL=10 BATCH=318 STEPS=512 BFX=257 NCAP=6144 RING=6 NEEDPRED=1 STEP_MIN=200 MEM=340G
           ARMS=L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB ;;
     *) stop "cell '$CELL' (bf1m, bf1a or bf1b)" ;;
 esac
 CARGS=(--batch "$BATCH" --steps "$STEPS" --pool "$POOL" --arms "$ARMS" "${CK[@]}" --probe-every "$PE"
-       --check-every "$CHECK" --require-stress "$STRESS" --bf-store "$BFX" --bf-ncap "$NCAP" --bf-ring 16
+       --check-every "$CHECK" --require-stress "$STRESS" --bf-store "$BFX" --bf-ncap "$NCAP" --bf-ring "$RING"
        --bf-worker thread --bf-acct "$ACCT" --bf-close-wait-ms 0 --bf-packer gilfree --bf-threads 14
-       --bf-cap-groups 1024 --bf-late defer --bf-late-wait-ms 250)
+       --bf-cap-groups 2048 --bf-batch 8 --bf-late defer --bf-late-wait-ms 250)
 DESC="arms SH+$ARMS steps $STEPS probe $PE check $CHECK stress $STRESS bf-store $BFX ncap $NCAP acct $ACCT"
 FILE_KB=$((OUT_MB * 1024))
 MIN_LEFT=$((STEP_MIN * 60 + 600))
