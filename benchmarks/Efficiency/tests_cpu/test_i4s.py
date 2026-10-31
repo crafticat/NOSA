@@ -90,6 +90,10 @@ I4S_NEW = I4S_NEW + (E_ + "r2_recon7_protocol.py", E_ + "r2_recon7_probe.py", E_
                      "docs/NOTES_recon7.md")                                                      # RECON7
 I4S_LATER = I4S_LATER + ("r2_recon7_protocol.py", "r2_recon7_probe.py", "r2_recon7_cell.py", "r2_recon7_streams.py",
                          "r2_recon7_mem.py", "r2_i4c_cell.py", "r2_i4m_cell.py", "r2_wsm_cell.py")   # RECON7
+# ST1 (nosi-r2-st1: RECON7 cd0f0c5 + AREA 3, the captured row commit of the best arms, r2_st1_cell.py): its files (its
+# own Gate 0: tests_cpu/test_st1.py); I4S_LATER: its modules may name the I4S modules (scan (f) skips them)
+I4S_NEW = I4S_NEW + (E_ + "r2_st1_commit.py", E_ + "r2_st1_cell.py", E_ + "r2_st1_step.sh", T_ + "test_st1.py")  # ST1
+I4S_LATER = I4S_LATER + ("r2_st1_commit.py", "r2_st1_cell.py")                                   # ST1
 
 
 class Evidence(UserWarning):

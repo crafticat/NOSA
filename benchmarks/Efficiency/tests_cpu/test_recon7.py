@@ -71,6 +71,10 @@ RECON7_NEW = tuple(E_ + m for m in MODULES) + (E_ + "r2_recon7_step.sh", T_ + "t
 RECON7_DECL = tuple(T_ + "test_%s.py" % n for n in ("wsa", "wsb", "wsc", "i2", "i3", "i4a", "i4g", "i4d", "i4k", "i4u",
                                                        "i4h", "i4s", "i4cc", "i4dc"))
 RECON7_EDITED = {T_ + "test_i4dc.py": "test_i4dc_gate0_files"}
+# ST1 (nosi-r2-st1: RECON7 cd0f0c5 + AREA 3, the captured row commit of the best arms, r2_st1_cell.py): its files (its
+# own Gate 0: tests_cpu/test_st1.py); they do not name the RECON7 modules
+RECON7_NEW = RECON7_NEW + (E_ + "r2_st1_commit.py", E_ + "r2_st1_cell.py", E_ + "r2_st1_step.sh",
+                           T_ + "test_st1.py")                                                    # ST1
 HAND_KERNEL = ("import triton", "@triton.jit", "triton.jit", "load_inline", "cpp_extension", "tl.load", "tl.store")
 PE = 4                                 # the world's timing scenario: probe (and check) rounds every 4 rounds
 N_RUN = 48                             # committed tokens per request: about 16 rounds + the drain

@@ -137,6 +137,10 @@ DECLARED = DECLARED + ("benchmarks/Efficiency/r2_recon7_protocol.py", "benchmark
                        "benchmarks/Efficiency/r2_i4c_cell.py", "benchmarks/Efficiency/r2_i4m_cell.py",
                        "benchmarks/Efficiency/r2_wsm_cell.py", "benchmarks/Efficiency/tests_cpu/test_recon7.py",
                        "docs/NOTES_recon7.md")                                                             # RECON7
+# ST1 (nosi-r2-st1: RECON7 cd0f0c5 + AREA 3, the captured row commit of the best arms, r2_st1_cell.py): its files (its
+# own Gate 0: tests_cpu/test_st1.py)
+DECLARED = DECLARED + ("benchmarks/Efficiency/r2_st1_commit.py", "benchmarks/Efficiency/r2_st1_cell.py",
+                       "benchmarks/Efficiency/r2_st1_step.sh", "benchmarks/Efficiency/tests_cpu/test_st1.py")     # ST1
 
 
 def _load(name):

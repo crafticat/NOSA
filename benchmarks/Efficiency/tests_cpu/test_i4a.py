@@ -110,6 +110,11 @@ I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_recon7_protocol.py", "benchmarks/
                      "benchmarks/Efficiency/r2_wsm_cell.py", T_ + "test_recon7.py", "docs/NOTES_recon7.md")  # RECON7
 I4A_LATER = I4A_LATER + ("r2_recon7_protocol.py", "r2_recon7_probe.py", "r2_recon7_cell.py", "r2_recon7_streams.py",
                          "r2_recon7_mem.py", "r2_i4c_cell.py", "r2_i4m_cell.py", "r2_wsm_cell.py")       # RECON7
+# ST1 (nosi-r2-st1: RECON7 cd0f0c5 + AREA 3, the captured row commit of the best arms, r2_st1_cell.py): its files (its
+# own Gate 0: tests_cpu/test_st1.py); I4A_LATER: its modules may name older modules (scan (e) skips them)
+I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_st1_commit.py", "benchmarks/Efficiency/r2_st1_cell.py",
+                     "benchmarks/Efficiency/r2_st1_step.sh", T_ + "test_st1.py")                            # ST1
+I4A_LATER = I4A_LATER + ("r2_st1_commit.py", "r2_st1_cell.py")                                     # ST1
 
 
 def _load(name, path=None):
