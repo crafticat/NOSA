@@ -370,6 +370,7 @@ def test_bf1_late(late):
     assert bf["jobs"] == bf["issued"] + bf["late"] + bf["empty_jobs"], bf
     if late == "drop":
         assert bf["late"] > 0 and not bf.get("deferred"), bf
+        assert not bf.get("pipelined"), bf.get("pipelined")             # drop mode runs batch by batch (a329dc6)
     else:
         assert bf.get("deferred_committed", 0) > 0 and not bf.get("late_passed"), bf
         assert bf["deferred_committed"] == bf["deferred"], bf

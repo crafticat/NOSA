@@ -107,7 +107,9 @@ max(187, 153) + the exposed wait = about 200 ms per epoch (lead's calibrated mod
 and lifetimes: one batch in flight; batch k uses entry k % ring != entry k - 1 (ring >= 2), and its T3 mark / staging
 wait name batch k - ring, finished before; the jobs of k - 1 leave the flight (pend: the DEFER wait) at its finish; with
 nothing queued the worker finishes k - 1 before it blocks. Counters: pipelined (a batch selected while k - 1 was not
-finished), overlapped (and k - 1's C++ job not yet submitted at k's select: real overlap), cxx_wait_s.
+finished), overlapped (and k - 1's C++ job not yet submitted at k's select: real overlap), cxx_wait_s. DEFER only: with
+late="drop" a batch must issue before the epoch's close, and the pipeline only adds the next batch's prep to that
+latency (a329dc6: test_bf1_late[drop] issued 0 of 120 with the 200 ms test stall), so drop mode runs batch by batch.
 COMPILE (bf1b, L4PTFDGUDKWCDX-COMPILE: ONE late event, loc2 at joint pass 0 = dpass 3, after_captures 64, 1.395 s). The
 arm's first round runs its draft passes (DG captures at dpass 2) BEFORE its first joint pass, and loc2 specializes on
 the store X (its Python int cap = X - 1 and lst_buf (H, B, X)); the C arm compiled X 129 only, so at --bf-store 257 the
@@ -721,6 +723,8 @@ class BgFetch:
                 self.rep["worker_busy_s"] = self.rep.get("worker_busy_s", 0.0) + time.perf_counter() - tj
                 prev = self._done(prev)                  # PIPELINE: prev's issue after this batch's select + submit
                 prev = (batch[:len(batch) - len(left)], p)  # the leftovers stay in flight (pend, inflight)
+                if self.late_mode != "defer":            # DROP: no pipeline (a batch must issue before the close; the
+                    prev = self._done(prev)              # pipeline only delays it by the next batch's prep: a329dc6)
 
     def _done(self, prev):
         """PIPELINE: the previous batch's finish (its submission wait, its issue / commit), then its jobs leave the
