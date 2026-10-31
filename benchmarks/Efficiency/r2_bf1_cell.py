@@ -74,10 +74,16 @@ DROP = ("-COUNTS", "-KEEP-EQ", "-KEEP-REF")
 #     of 128 slots per request is 1.82 GB at B 216, and that arm's prefill peak is 83.90 GB of 84.0). DECISION: no BF1
 #     lever at C 128; bf1a is a DIAGNOSTIC only (full-B coverage; the first graph-mode KW vs L4PTFDGUDCD at C 128); adopt
 #     there only if B / L4PTFDGUDCD >= 1.02 in the same process.
-PRED_STAMP_BF1 = None
+PRED_STAMP_BF1 = "2026-10-31T13:43:47Z"
 PRED_KEYS = ("BF1_vs_X", "BF1_vs_R", "BF1_new_ratio", "BF1_wait_saving", "BF1_joint_saving", "BF1_draft_ratio",
              "BF1_barrier_ms", "BF1_eq")
-PRED_BF1_BY_B = {216: {k: None for k in PRED_KEYS}, 318: {k: None for k in PRED_KEYS}}
+# THE LEAD'S REGISTRATION (2026-10-31T13:43:47Z, before bf1a / bf1b; the writer's bands; r7pb MEASURED flagA 0.469 at
+# C 73 B 318 (R/recon7_pb1_2195630_r7pb) and r7pa 0.509 at C 128 B 216, inside the modelled 0.46-0.50).
+PRED_BF1_BY_B = {
+    216: dict(BF1_vs_X=(1.001, 1.020), BF1_vs_R=(0.995, 1.020), BF1_new_ratio=(0.45, 0.65), BF1_wait_saving=(3.0, 8.0),
+              BF1_joint_saving=(3.0, 8.0), BF1_draft_ratio=(1.00, 1.04), BF1_barrier_ms=(0.0, 10.0), BF1_eq=True),
+    318: dict(BF1_vs_X=(1.06, 1.14), BF1_vs_R=(1.05, 1.14), BF1_new_ratio=(0.45, 0.65), BF1_wait_saving=(35.0, 65.0),
+              BF1_joint_saving=(35.0, 65.0), BF1_draft_ratio=(1.00, 1.04), BF1_barrier_ms=(0.0, 10.0), BF1_eq=True)}
 
 
 def runner_choice(arm: str, check: bool):
@@ -118,7 +124,14 @@ def parse_args(argv):
     ap.add_argument("--bf-packer", default="gilfree", choices=BF.PACKERS,
                     help="gilfree: r2_transport_gilfree_v3 (C++ OpenMP team, GIL released; the production path); "
                          "torch: index_select into pinned staging on the worker thread")
-    ap.add_argument("--bf-threads", type=int, default=8, help="the gilfree packing team")
+    ap.add_argument("--bf-threads", type=int, default=14, help="the gilfree packing team (16 cpus: the compute thread "
+                                                                   "and the BF1 worker keep 2)")
+    ap.add_argument("--bf-cap-groups", type=int, default=1024, help="gilfree: (head, block) groups per packed chunk")
+    ap.add_argument("--bf-late", default="defer", choices=BF.LATES,
+                    help="defer: a job not issued at the joint pass's start commits at ITS layer of the pass; drop: "
+                         "abandoned")
+    ap.add_argument("--bf-late-wait-ms", type=float, default=250.0,
+                    help="defer: the host wait budget per joint pass for late jobs (the host runs ahead of the GPU)")
     ap.add_argument("--prefill-hook", default="nocopy", choices=("nocopy", "copy"))
     ap.add_argument("--tu-gemm", default="natural", choices=("natural", "rowgroup"))
     ap.add_argument("--spec-journal-blocks", type=int, default=256)
@@ -152,8 +165,10 @@ def parse_args(argv):
     for name, x in (("--fork-store", a.fork_store), ("--bf-store", a.bf_store)):
         if x != 0 and x < bound:
             ap.error("%s %d: below the bound 1 + (K - 1) x 64 = %d (0 = the default)" % (name, x, bound))
-    if a.bf_ncap < 1 or a.bf_ring < 2 or a.bf_close_wait_ms < 0 or not 1 <= a.bf_threads <= 64:
-        ap.error("--bf-ncap >= 1, --bf-ring >= 2, --bf-close-wait-ms >= 0, --bf-threads in 1 .. 64")
+    if (a.bf_ncap < 1 or a.bf_ring < 2 or a.bf_close_wait_ms < 0 or not 1 <= a.bf_threads <= 64
+            or not 16 <= a.bf_cap_groups <= 4096 or a.bf_late_wait_ms < 0):
+        ap.error("--bf-ncap >= 1, --bf-ring >= 2, --bf-close-wait-ms >= 0, --bf-threads in 1 .. 64, --bf-cap-groups in "
+                 "16 .. 4096, --bf-late-wait-ms >= 0")
     if a.bf_packer == "gilfree" and any(x in a.arms for x in BF_ARMS) and not os.environ.get("TORCH_EXTENSIONS_DIR"):
         ap.error("--bf-packer gilfree: TORCH_EXTENSIONS_DIR must name the run's build directory (never HOME)")
     if not 1 <= a.pool <= BC.POOL_MAX:
@@ -164,7 +179,8 @@ def parse_args(argv):
 def bf_opt(a, arm: str) -> dict:
     """BgFetch's keyword arguments of a BF1 arm."""
     return dict(mode=BF_ARMS[arm], n_cap=a.bf_ncap, ring=a.bf_ring, worker=a.bf_worker, acct=bool(a.bf_acct),
-                close_wait_ms=a.bf_close_wait_ms, packer=a.bf_packer, threads=a.bf_threads)
+                close_wait_ms=a.bf_close_wait_ms, packer=a.bf_packer, threads=a.bf_threads,
+                gf=dict(cap_groups=a.bf_cap_groups), late=a.bf_late, late_wait_ms=a.bf_late_wait_ms)
 
 
 # ------------------------------------------------------------------ the arms (GPU)
@@ -249,7 +265,8 @@ def bf_gate(arm, bf, mode: str):
         return ("%s-BF" % arm, True, bool(ok), "mode %s; issued %s; items %s" % (bf.get("mode"), bf.get("issued"),
                                                                                   bf.get("items")))
     items, sent = bf.get("items"), bf.get("items_sent")
-    cons = (bf.get("committed", 0) + bf.get("revived", 0) + bf.get("no_room", 0)) == items
+    cons = (bf.get("committed", 0) + bf.get("revived", 0) + bf.get("no_room", 0)
+            + bf.get("no_room_deferred", 0)) == items
     tags = (bf.get("used_store", 0) + bf.get("used_win", 0) + bf.get("unused", 0) + bf.get("pending", 0)
             == bf.get("committed", 0) + bf.get("revived", 0))
     room = bf.get("no_room", 0) == 0 and bf.get("revived", 0) == 0    # THE ROOM RULE: the host never sends what the
@@ -360,7 +377,12 @@ def bf_lines(name, r) -> list:
             "%s; age at the close median %s ms, max %s ms; worker busy %s s" % (
                 name, bf.get("room_free_mean"), bf.get("room_free_min"), bf.get("room_demand_per_hb_mean"),
                 bf.get("items_room"), bf.get("late_queued"), bf.get("late_packing"), bf.get("late_last_pass"),
-                bf.get("late_age_ms_median"), bf.get("late_age_ms_max"), round(bf.get("worker_busy_s") or 0.0, 3))]
+                bf.get("late_age_ms_median"), bf.get("late_age_ms_max"), round(bf.get("worker_busy_s") or 0.0, 3)),
+            "BF1 %s LATE MODE %s (wait budget %s ms per joint pass): deferred jobs %s, committed at their layer %s, "
+            "landed after their layer ran (passed) %s, host wait in the joint passes %s s, no room at the deferred commit "
+            "%s items" % (name, bf.get("late_mode"), bf.get("late_wait_ms"), bf.get("deferred"),
+                          bf.get("deferred_committed"), bf.get("late_passed"), round(bf.get("late_wait_s") or 0.0, 3),
+                          bf.get("no_room_deferred"))]
 
 
 # ------------------------------------------------------------------ main
