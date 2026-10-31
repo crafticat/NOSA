@@ -63,25 +63,30 @@ USABLE_GB = DCC.USABLE_GB
 # THE BUILDER'S MODEL (an input for the lead, not a registration). MEASURED: the commit phase median 6.058 ms (C 128
 # B 216, i4dc_d3a_2195575_i4dca) and 8.416 ms (C 73 B 318, i4dc_d4b_2195576_i4dcb); the r7pm miniature (C 73 B 8): the
 # labelled TentState.commit 1.47 ms of 1.73 ms commit-window busy, eager phase median 3.26-3.43 ms.
-#   MODEL of the eager TentState.commit at B: 4 tail-slot where()s per layer read 2 and write 1 slot (B x 32,768 B each)
-#   at 1.3-1.6 TB/s, + about 5 small kernels per layer at about 3 us: B 216: 32 x (4 x 21.2 MB / 1.45 TB/s + 15 us) =
-#   2.35 ms; B 318: 32 x (4 x 31.3 MB / 1.45 TB/s + 15 us) = 3.24 ms; its floor at B 8 = 1.47 ms MEASURED (launch bound).
-#   MODEL of the replayed graph, mode rows: per layer 3 gathers + 6 index_put_ + the write-back + 2 copies = 12 nodes of
-#   tiny kernels at 1.5-3 us, x 32 = 0.6-1.2 ms, plus about 20 nodes before the layer loop.
-#   Saving per round: B 216 (2.35 - 1.2 .. 2.35 - 0.6) = 1.1 .. 1.8 ms; B 318 2.0 .. 2.6 ms. Host launch time of the
-#   eager commit (about 300 launches) also leaves the phase; if the phase is host bound the saving is larger (up to the
-#   B 8 phase median minus its graph: about 2.5 ms). BAND: B 216 (0.8, 3.0) ms; B 318 (1.5, 3.5) ms.
-#   ST1_vs_ref = round / (round - saving): B 216 324.9 / (324.9 - 0.8 .. 3.0) = (1.0025, 1.0093); B 318 524.7 / (524.7 -
-#   1.5 .. 3.5) = (1.0029, 1.0067). The run-to-run spread of the best arms is 0.3 % (B 216) and 0.6 % (B 318): the tok/s
-#   effect is at or below the spread; the commit phase median is the primary measure.
+#   r7pa (C 128 B 216, recon7_pa1_2195631_r7pa, profiled commit windows rounds 96 / 112, MEASURED): commit window busy
+#   7.11 ms device (wall 10.37); labelled TentState.commit 6.475 ms, fp 0.735, decide 0.203, accept 0.030, tokens 0.056,
+#   dprep 0.072, twins 0.007. So the eager commit is 202 us per layer at B 216 (the earlier bytes MODEL of 2.35 ms was
+#   3x too low: the where()s over the strided tail views run far below the bandwidth figure assumed).
+#   MODEL (re-derived from r7pa): unprofiled commit phase 6.058 ms vs profiled busy 7.11 ms (profiler factor 0.85), so
+#   TentState.commit unprofiled = 6.475 x 0.85 = 5.5 ms at B 216. Its B dependence: a fixed part 1.47 ms (the B 8
+#   window, launch bound) + 5.0 ms x B / 216 (profiled) -> B 318: (1.47 + 7.37) x 0.85 = 7.5 ms, capped by the C 73 phase
+#   (8.416 - fp 1.08 - about 0.4 = 6.9): 6.5 .. 7.5 ms. The replayed graph (mode rows): per layer 3 gathers + 6
+#   index_put_ + the write-back + 2 copies = 12 tiny nodes at 1.5-3.5 us, x 32 + about 20 = 0.6 .. 1.4 ms (B-flat).
+#   Saving per round: B 216 5.5 - (0.6 .. 1.4) = 4.1 .. 4.9 ms; B 318 (6.5 .. 7.5) - (0.7 .. 1.5) = 5.0 .. 6.8 ms.
+#   BAND (widened for the profiler factor and the node cost): ST1_commit_saving B 216 (3.0, 5.5) ms, B 318 (4.0, 7.0)
+#   ms; commit phase after: B 216 0.6 .. 3.1 ms, B 318 1.4 .. 4.4 ms.
+#   ST1_vs_ref = round / (round - saving): B 216 324.9 / (324.9 - 3.0 .. 5.5) = (1.0093, 1.0172) -> (1.008, 1.018);
+#   B 318 524.7 / (524.7 - 4.0 .. 7.0) = (1.0077, 1.0135) -> (1.007, 1.014). The run-to-run spread is 0.3 % (B 216) and
+#   0.6 % (B 318). ST1_joint_ratio and ST1_draft_ratio (0.99, 1.01).
 #   ST1_peak_delta_gb (-0.01, 0.05): the static inputs (< 0.1 MB) and the private pool (MODEL < 20 MB) only.
 PRED_STAMP_ST1 = None
-#   ST2 (the MT arm against its M arm). MEASURED (r7pm, C 73 B 8): the joint pass's twin label 1,194 ops, 3.85 ms
-#   device (mostly < 5 us kernels; the op count does not grow with B). MODEL: ST2 leaves about 13 ops per layer of the
-#   37 (416 of 1,194 per pass); at 2.5-3 us per removed small op: (778 x 2.5 .. 3 us) = 1.9 .. 2.3 ms per joint pass
-#   (= per round) at any B; the replay and row steps run inside one fused kernel (the twin's per-step work is the same).
-#   BAND: ST2_joint_saving (1.0, 3.0) ms at B 216 and B 318; ST2_vs_m = round / (round - 1.0 .. 3.0): B 216 (1.003,
-#   1.010), B 318 (1.002, 1.006). The r7pa / r7pb labelled windows (C 128 / C 73) give the twin label at scale.
+#   ST2 (the MT arm against its M arm). MEASURED: the joint pass's twin label, r7pm (C 73 B 8) 1,194 ops, 3.85 ms
+#   device; r7pa (C 128 B 216, labelled round 112) 1,063 ops, 4.07 ms device (160 _twin_kernel 1.06 ms, 807 small
+#   2.83 ms, 96 copies 0.19 ms), host 46.0 ms; the joint window busy ratio 0.966 (device bound). MODEL: ST2 keeps the
+#   twin kernel work (now 32 launches of T = 5 steps, about 1.06 ms) and about 13 small ops per layer (416, 2-3 us each
+#   at B 216: 0.8 .. 1.2 ms) in place of the 903 small ops and copies (3.02 ms): saving 1.8 .. 2.2 ms per joint pass (=
+#   per round). BAND: ST2_joint_saving (1.0, 2.8) ms at B 216 and (1.0, 3.0) ms at B 318; ST2_vs_m = round / (round -
+#   saving): B 216 (1.003, 1.009), B 318 (1.002, 1.006).
 PRED_KEYS = ("ST1_commit_saving", "ST1_joint_ratio", "ST1_draft_ratio", "ST1_vs_ref", "ST1_peak_delta_gb",
              "ST2_joint_saving", "ST2_vs_m")
 PRED_ST1_BY_B = {216: {k: None for k in PRED_KEYS}, 318: {k: None for k in PRED_KEYS}}
