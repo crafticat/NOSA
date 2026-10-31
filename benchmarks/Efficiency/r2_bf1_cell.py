@@ -65,8 +65,15 @@ DROP = ("-COUNTS", "-KEEP-EQ", "-KEEP-REF")
 # interference 0.8-3.4 %. Coverage c = used / NEW_X in 0.35 .. 0.55 (flagA minus late / no-room / evicted losses).
 #   C 73 B 318 (pool 10): wait saving c x 115.6 = 40 .. 64 ms; draft phase + 0.8-3.4 % of 176 ms = 1.4 .. 6 ms; host GIL
 #     contention unknown; round 524.7 -> 466 .. 491 ms: BF1_vs_X 1.07 .. 1.13 (central 1.10).
-#   C 128 B 216 (pool 65): wait saving c x 20.3 = 7 .. 11 ms; draft + 1 .. 4.5 ms: BF1_vs_X 1.01 .. 1.03; BF1_vs_R about
-#     1.0; against L4PTFDGUDCD (no keep, -5 ms of bookkeeping) about 1.0: a WEAK lever at C 128 (MODEL).
+#   C 128 B 216 (pool 65): THE C 128 DECISION (MODEL on MEASURED inputs): the keep + window arm already cuts the exposed
+#     gather 20.25 -> 13.65 ms (R3 table 2) but costs about 1.4 % (I4D eager: joint +5.5 ms, SI4:212-229); BF1 on it hides
+#     c x 13.65 = 4.8 .. 7.5 ms, minus copy interference in the draft phase 0.8-3.4 % of 132 ms = 1.1 .. 4.5 ms: B / X
+#     1.001 .. 1.020; B / L4PTFDGUDCD = (-4.6 + 0.3 .. 6.4 ms) / 324.9 = 0.987 .. 1.006 (inside the 1 % cross-run spread).
+#     Ceiling (c = 1, no interference, keep at its eager cost): +9 ms = 1.028x. BF1 on the PLAIN arm L4PTFDGUDCD is not
+#     buildable without the keep machinery (its store is a per-layer scratch fill with no map; a separate prefetch region
+#     of 128 slots per request is 1.82 GB at B 216, and that arm's prefill peak is 83.90 GB of 84.0). DECISION: no BF1
+#     lever at C 128; bf1a is a DIAGNOSTIC only (full-B coverage; the first graph-mode KW vs L4PTFDGUDCD at C 128); adopt
+#     there only if B / L4PTFDGUDCD >= 1.02 in the same process.
 PRED_STAMP_BF1 = None
 PRED_KEYS = ("BF1_vs_X", "BF1_vs_R", "BF1_new_ratio", "BF1_wait_saving", "BF1_joint_saving", "BF1_draft_ratio",
              "BF1_barrier_ms", "BF1_eq")
@@ -108,6 +115,10 @@ def parse_args(argv):
     ap.add_argument("--bf-worker", default="thread", choices=BF.WORKERS)
     ap.add_argument("--bf-acct", type=int, default=0, choices=(0, 1), help="1: count the window (kwin) uses too")
     ap.add_argument("--bf-close-wait-ms", type=float, default=0.0, help="host wait for the last jobs at J's barrier")
+    ap.add_argument("--bf-packer", default="gilfree", choices=BF.PACKERS,
+                    help="gilfree: r2_transport_gilfree_v3 (C++ OpenMP team, GIL released; the production path); "
+                         "torch: index_select into pinned staging on the worker thread")
+    ap.add_argument("--bf-threads", type=int, default=8, help="the gilfree packing team")
     ap.add_argument("--prefill-hook", default="nocopy", choices=("nocopy", "copy"))
     ap.add_argument("--tu-gemm", default="natural", choices=("natural", "rowgroup"))
     ap.add_argument("--spec-journal-blocks", type=int, default=256)
@@ -141,8 +152,10 @@ def parse_args(argv):
     for name, x in (("--fork-store", a.fork_store), ("--bf-store", a.bf_store)):
         if x != 0 and x < bound:
             ap.error("%s %d: below the bound 1 + (K - 1) x 64 = %d (0 = the default)" % (name, x, bound))
-    if a.bf_ncap < 1 or a.bf_ring < 2 or a.bf_close_wait_ms < 0:
-        ap.error("--bf-ncap >= 1, --bf-ring >= 2, --bf-close-wait-ms >= 0")
+    if a.bf_ncap < 1 or a.bf_ring < 2 or a.bf_close_wait_ms < 0 or not 1 <= a.bf_threads <= 64:
+        ap.error("--bf-ncap >= 1, --bf-ring >= 2, --bf-close-wait-ms >= 0, --bf-threads in 1 .. 64")
+    if a.bf_packer == "gilfree" and any(x in a.arms for x in BF_ARMS) and not os.environ.get("TORCH_EXTENSIONS_DIR"):
+        ap.error("--bf-packer gilfree: TORCH_EXTENSIONS_DIR must name the run's build directory (never HOME)")
     if not 1 <= a.pool <= BC.POOL_MAX:
         ap.error("--pool in 1 .. %d" % BC.POOL_MAX)
     return a
@@ -151,7 +164,7 @@ def parse_args(argv):
 def bf_opt(a, arm: str) -> dict:
     """BgFetch's keyword arguments of a BF1 arm."""
     return dict(mode=BF_ARMS[arm], n_cap=a.bf_ncap, ring=a.bf_ring, worker=a.bf_worker, acct=bool(a.bf_acct),
-                close_wait_ms=a.bf_close_wait_ms)
+                close_wait_ms=a.bf_close_wait_ms, packer=a.bf_packer, threads=a.bf_threads)
 
 
 # ------------------------------------------------------------------ the arms (GPU)
@@ -241,6 +254,8 @@ def bf_gate(arm, bf, mode: str):
             == bf.get("committed", 0) + bf.get("revived", 0))
     ok = (bf.get("error") is None and bf.get("mode") == mode and (bf.get("issued") or 0) > 0 and items == sent
           and (bf.get("committed") or 0) > 0 and cons and tags)
+    if bf.get("packer") == "gilfree":                                  # the C++ team ran at the requested size
+        ok = ok and bool((bf.get("transport") or {}).get("threads_ok"))
     return ("%s-BF" % arm, True, bool(ok),
             "error %s; jobs %s, issued %s, late %s; items seen %s, kept or sent before %s, capped %s, sent %s = device "
             "%s; committed %s, revived %s, no room %s (sum ok %s); used store %s, window %s, unused %s, pending %s (tags "
@@ -337,7 +352,8 @@ def bf_lines(name, r) -> list:
                 bf.get("h2d_ms_total"), bf.get("h2d_GBps"), bf.get("barrier_waits"), bf.get("barrier_ms_median"),
                 round(bf.get("close_wait_s") or 0.0, 3), bf.get("snap_stall"), bf.get("captures_locked"),
                 round((bf.get("device_bytes") or 0) / 1e6, 1), nr.get("new_blocks_per_round"), nr.get("wait_ms_median"),
-                bf.get("error"))]
+                bf.get("error")),
+            "BF1 %s packer %s: transport %s" % (name, bf.get("packer"), bf.get("transport"))]
 
 
 # ------------------------------------------------------------------ main

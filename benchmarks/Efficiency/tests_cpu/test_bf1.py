@@ -17,6 +17,8 @@ WORLD     test_bf1_equal (timing and check scenarios, inline worker): L4PTFDGUDK
           test_bf1_off: L4PTFDGUDKWCDX = L4PTFDGUDKWCD in EVERY value (the hooks are inert with the fetch off).
           test_bf1_thread: the thread worker (CPU stand-in events) keeps EQF and conserves the counters.
           test_bf1_plants: "wrong_bytes" and "no_copy" break EQF and the byte check (L34: the plant was used).
+          test_bf1_gilfree (inline, thread) / test_bf1_gilfree_plant: the packer switch (r2_transport_gilfree_v3, packer
+          v3 built here with OpenMP, as test_pool_prefetch.py builds it): the same claim and gates; the plant caught.
 CELL      test_cell_pure (arguments, gates on planted records, verdicts), test_step_script_bf1 (the cells' arguments
           parse; the pins name the BF1 files).
 
@@ -120,7 +122,8 @@ def test_bf1_gate0_files():
     tree = ast.parse((EFF / "r2_bf1_fetch.py").read_text())             # the mechanism: torch, numpy, the I4DC module
     mods = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     mods |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module != "__future__"}
-    assert mods <= {"contextlib", "queue", "threading", "time", "traceback", "numpy", "torch", "r2_i4dc_compile"}, mods
+    assert mods <= {"contextlib", "importlib", "queue", "threading", "time", "traceback", "numpy", "torch",
+                    "r2_i4dc_compile"}, mods
     for p in list((ROOT / "nosi/nosi").glob("*.py")) + list(EFF.glob("*.py")):     # (e) nobody else names them
         if p.name.startswith("r2_bf1_"):
             continue
@@ -181,7 +184,7 @@ def test_pure_rows_rank_alive():
 
 # ------------------------------------------------------------------ the world runs
 def _builder(mode="ce", worker="inline", Xs=None, acct=True, bneg=None, check=False, stats=False, kcheck=False,
-             phase_marks=False, probe_every=0, n_cap=4096, ring=4):
+             phase_marks=False, probe_every=0, n_cap=4096, ring=4, packer="torch", gf=None, threads=2):
     """i4dc_world.d_builder's L4PTFDGUDKWCD with the BF1 runner and its options (and the store X)."""
     BF = _mod("r2_bf1_fetch")
     W, RE, SR, I3, KA, RW, WB, Z = X.W, X.RE, X.SR, X.I3, X.KA, X.RW, X.WB, X.Z
@@ -200,7 +203,7 @@ def _builder(mode="ce", worker="inline", Xs=None, acct=True, bneg=None, check=Fa
                   phase_marks=phase_marks, dneg=None, hneg=None, gneg=None, sneg=None, dgneg=None,
                   cc_backend="inductor", ccneg=None, cdneg=None, keep=True, kwin=True, kcheck=kcheck, kneg=None,
                   kslots=None, cneg=None, bf=dict(mode=mode, worker=worker, acct=acct, bneg=bneg, n_cap=n_cap,
-                                                  ring=ring))
+                                                  ring=ring, packer=packer, gf=gf, threads=threads))
         be = X.FakeGraphsDCD()
         run = Runner(model, rs, sops, BC.HostClock(), graph_backend=be, **kw)
         be.T = run.T
@@ -314,10 +317,57 @@ def test_bf1_plants(bneg):
                                                         ev["rd"]["keep"]["check"]["bytes_bad"]))
 
 
+@pytest.fixture(scope="module")
+def gfext(tmp_path_factory):
+    """Packer v3 of THIS tree, built with OpenMP (as tests_cpu/test_pool_prefetch.py's fixture)."""
+    gp = _load("gilfree_pack_v3_bf1", EFF / "gilfree_pack.py")
+    e = gp.load(str(tmp_path_factory.mktemp("gilfree3_bf1")))
+    assert int(e.VERSION) == 3 and int(e.DESC) >= 2 and int(e.OPENMP) == 1
+    return e
+
+
+@pytest.mark.parametrize("worker", ["inline", "thread"])
+def test_bf1_gilfree(worker, gfext):
+    """THE PACKER SWITCH: r2_transport_gilfree_v3 (worker "cpp", descriptor jobs into the flat landing) in place of
+    index_select: the same claim (= L4PTFDGUDKWCD but where the bytes come from), the same gates, used blocks, the NEW
+    blocks fall; the transport's own stats (a team of the requested size)."""
+    _plain("GUDKC")
+    ref = _plain("GUDKCD")
+    cls = X.W.pkg_load("r2_transport_gilfree_v3").GilfreeTransport
+    ev = _run_bf("timing", worker=worker, packer="gilfree", gf=dict(ext=gfext, cls=cls), threads=2)
+    bad = TS._diff(ref, ev, skip=DIFF_RD, tensors_skip=DIFF_T)
+    assert bad == [], bad[:10]
+    bf = ev["rd"]["bf"]
+    gs = _gates(ev, "timing")
+    assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
+    nb, nr = sum(ev["rd"]["round_blocks"]), sum(ref["rd"]["round_blocks"])
+    tp = bf["transport"]
+    assert bf["packer"] == "gilfree" and tp is not None and tp["threads_ok"] and tp["releases"] > 0, tp
+    assert bf["used_store"] + bf["used_win"] > 0 and nb <= nr, (bf, nb, nr)
+    if worker == "inline":
+        assert nb < nr and bf["late"] == 0, (nb, nr, bf["late"])
+    _ev("BF1 GILFREE %s: NEW %d -> %d; sent %d, committed %d, used %d, late %d; transport %s" % (
+        worker, nr, nb, bf["items_sent"], bf["committed"], bf["used_store"] + bf["used_win"], bf["late"],
+        {k: tp.get(k) for k in ("releases", "groups", "chunks", "pack_ns", "threads_min", "threads_max")}))
+
+
+@pytest.mark.parametrize("bneg", ["wrong_bytes"])
+def test_bf1_gilfree_plant(bneg, gfext):
+    """The gilfree path's bytes are checked by the same gates: a packed wrong block is caught (EQF, bytes_bad)."""
+    _plain("GUDKC", "check")
+    _plain("GUDKCD", "check")
+    cls = X.W.pkg_load("r2_transport_gilfree_v3").GilfreeTransport
+    ev = _run_bf("check", worker="inline", packer="gilfree", gf=dict(ext=gfext, cls=cls), threads=2, bneg=bneg)
+    bf = ev["rd"]["bf"]
+    assert bf["used_store"] + bf["used_win"] > 0, bf
+    gs = {g[0]: g for g in _gates(ev, "check")}
+    assert not gs["L4PTFDGUDKWCDB-EQF"][2] and ev["rd"]["keep"]["check"]["bytes_bad"] > 0
+
+
 # ------------------------------------------------------------------ the cell
-def test_cell_pure():
+def test_cell_pure(monkeypatch):
     C = _mod("r2_bf1_cell")
-    base = ["--out", "/x", "--workload", "/w"]
+    base = ["--out", "/x", "--workload", "/w", "--bf-packer", "torch"]
     a = C.parse_args(base)
     assert a.arms == ["L4PTFD", "L4PTFDGUDKWC", "L4PTFDGUDKWCD", "L4PTFDGUDKWCDX", "L4PTFDGUDKWCDB"]
     for bad in (["--arms", "L4PTFD,L4PTFDGUDKWCDB"], ["--arms", "L4PTFD,L4PTFDGUDKWCDB,L4PTFDGUDKWCD"],
@@ -325,6 +375,12 @@ def test_cell_pure():
         with pytest.raises(SystemExit):
             C.parse_args(base + bad)
     assert C.bf_opt(a, "L4PTFDGUDKWCDB")["mode"] == "ce" and C.bf_opt(a, "L4PTFDGUDKWCDX")["mode"] == "off"
+    assert C.bf_opt(a, "L4PTFDGUDKWCDB")["packer"] == "torch"
+    monkeypatch.delenv("TORCH_EXTENSIONS_DIR", raising=False)
+    with pytest.raises(SystemExit):                                    # gilfree without a build directory
+        C.parse_args(["--out", "/x", "--workload", "/w", "--bf-packer", "gilfree"])
+    with pytest.raises(SystemExit):
+        C.parse_args(base + ["--bf-threads", "0"])
     good = dict(mode="ce", error=None, issued=3, items=10, items_sent=10, committed=7, revived=1, no_room=2,
                 used_store=4, used_win=1, unused=2, pending=1)
     assert C.bf_gate("B", good, "ce")[2]
@@ -348,9 +404,11 @@ def test_cell_pure():
 CELLS = {"bf1m": (10, 8, 72), "bf1a": (65, 216, 512), "bf1b": (10, 318, 512)}
 
 
-def test_step_script_bf1():
+def test_step_script_bf1(monkeypatch, tmp_path):
     C = _mod("r2_bf1_cell")
+    monkeypatch.setenv("TORCH_EXTENSIONS_DIR", str(tmp_path))         # the step script sets it ($JIT/torch_ext)
     text = (EFF / "r2_bf1_step.sh").read_text()
+    assert "--bf-packer gilfree" in text and "nosi/nosi/r2_transport_gilfree_v3.py" in text
     assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-bf1" in text and "CELLPY=benchmarks/Efficiency/r2_bf1_cell.py" in text
     assert "benchmarks/Efficiency/r2_bf1_fetch.py" in text and "^PRED_STAMP_BF1 = None$" in text
     for cell, (pool, batch, steps) in CELLS.items():
@@ -361,7 +419,8 @@ def test_step_script_bf1():
         argv = ["--out", "/x", "--workload", "/w", "--batch", kv["BATCH"], "--steps", kv["STEPS"], "--pool",
                 kv["POOL"], "--arms", kv["ARMS"], "--bf-store", kv["BFX"], "--bf-ncap", kv["NCAP"],
                 "--check-every", kv.get("CHECK", "0"), "--require-stress", kv.get("STRESS", "0"),
-                "--bf-acct", kv.get("ACCT", "0")]
+                "--bf-acct", kv.get("ACCT", "0"), "--bf-packer", "gilfree", "--bf-threads", "8"]
         a = C.parse_args(argv)
+        assert a.bf_packer == "gilfree"
         assert "L4PTFDGUDKWCDB" in a.arms and "L4PTFDGUDKWCDX" in a.arms, (cell, a.arms)
     _ev("BF1 STEP: cells %s parse" % sorted(CELLS))

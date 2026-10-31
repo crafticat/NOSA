@@ -22,7 +22,10 @@
 #        L4PTFDGUDKWCDX,L4PTFDGUDKWCDB. STEP_MIN 200, --mem 340G. STOPS while PRED_STAMP_BF1 is None.
 #   bf1a timing, C 128 (pool 65), B 216, 512 steps, probe 16, --bf-store 0 (129), --bf-ncap 1024, arms L4PTFD,
 #        L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB (the best arm L4PTFDGUDCD in the
-#        same process). STEP_MIN 180, --mem 240G. STOPS while PRED_STAMP_BF1 is None.
+#        same process). STEP_MIN 180, --mem 240G. STOPS while PRED_STAMP_BF1 is None. A DIAGNOSTIC cell (full-B
+#        coverage; graph-mode KW vs L4PTFDGUDCD), not a lever: r2_bf1_cell.py's C 128 decision (MODEL 0.987 .. 1.006x).
+# EVERY cell: --bf-packer gilfree --bf-threads 8 (r2_transport_gilfree_v3's C++ team; built into $JIT/torch_ext at the
+# first BF1 arm, about 1-2 min, outside the steady rounds).
 # Basis of STEP_MIN (MEASURED, sacct, the step records under OUTROOT): i4dcb (SH + 3 arms, C 73 B 318) 01:11:41 = 17.9 min
 # per part; i4dca (SH + 3 arms, C 128 B 216) 00:47:32 = 11.9 min per part; i4dm2 (SH + 6 arms, B 8) 00:09:18. MODEL:
 # bf1b = 6 parts = 107.5 min (margin 1.86); bf1a = 8 parts = 95 min (margin 1.89); bf1m = 6 parts at B 8 = about 9 min
@@ -75,7 +78,7 @@ case $CELL in
 esac
 CARGS=(--batch "$BATCH" --steps "$STEPS" --pool "$POOL" --arms "$ARMS" "${CK[@]}" --probe-every "$PE"
        --check-every "$CHECK" --require-stress "$STRESS" --bf-store "$BFX" --bf-ncap "$NCAP" --bf-ring 8
-       --bf-worker thread --bf-acct "$ACCT" --bf-close-wait-ms 0)
+       --bf-worker thread --bf-acct "$ACCT" --bf-close-wait-ms 0 --bf-packer gilfree --bf-threads 8)
 DESC="arms SH+$ARMS steps $STEPS probe $PE check $CHECK stress $STRESS bf-store $BFX ncap $NCAP acct $ACCT"
 FILE_KB=$((OUT_MB * 1024))
 MIN_LEFT=$((STEP_MIN * 60 + 600))
@@ -86,6 +89,8 @@ for v in $(compgen -e); do case $v in SLURM_*|SRUN_*|SALLOC_*|SBATCH_*) stop "th
 blob=$(git -C "$NOSI" rev-parse "$NSHA:$SELF") || stop "$SELF is not tracked at $NSHA"
 cmp -s -- "$0" <(git -C "$NOSI" show "$NSHA:$SELF") || stop "$0 is not the bytes of $SELF at $NSHA (blob $blob)"
 for f in "$CELLPY" "$FORKPY" benchmarks/Efficiency/r2_bf1_fetch.py benchmarks/Efficiency/r2_i4dc_cell.py \
+         benchmarks/Efficiency/gilfree_pack.py benchmarks/Efficiency/gilfree_pack.cpp \
+         nosi/nosi/r2_transport_gilfree_v3.py nosi/nosi/kstep/backend.py nosi/nosi/kstep/transfer.py \
          benchmarks/Efficiency/r2_i4dc_compile.py benchmarks/Efficiency/r2_i4cc_cell.py \
          benchmarks/Efficiency/r2_i4cc_compile.py benchmarks/Efficiency/r2_i4s_cell.py \
          benchmarks/Efficiency/r2_i4s_stack.py benchmarks/Efficiency/r2_i4h_cell.py \

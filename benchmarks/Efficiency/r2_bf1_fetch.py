@@ -53,6 +53,17 @@ it packs again. Snapshot entry: the main thread reuses it only after the worker 
 parity. A stale block cannot be read: the items are complete committed blocks (< qc // 64 at the snapshot; qc never
 decreases; the block's host rows were written back before the snapshot in stream order) and the slot's key is written
 in the same stream step as its bytes.
+PACKER (packer="gilfree", the production switch; "torch" = index_select, the CPU tests' default). Reuse: our
+nosi/nosi/r2_transport_gilfree_v3.GilfreeTransport (packer v3 benchmarks/Efficiency/gilfree_pack.{py,cpp}: an OpenMP
+team packs with the GIL released, the C++ worker thread copies on its copy stream and scatters on its scatter stream;
+MEASURED 21-30 GB/s pack at 8-16 threads, memory note project_retroinfer_eval.md line 158; PF1: a 64 MiB job lands in
+11.2-11.6 ms), exactly as pool_prefetch.py builds it (worker "cpp", issue_desc, the flat lane store). Incompatibility:
+pool_prefetch gives each LAYER its own lanes (L x lanes x 64 KB: 4.3 GB at our n_cap); adaptation: every layer's
+destination is the ONE flat landing ring, a take's lane = ring entry x n_cap + its rank in its head. T3: a lane's previous
+reader is the commit of the entry's last use (mark_reader of the commit's done event; reader_marks per job); T4: the
+worker host-waited the snapshot event (after the write-back in stream order), so hist_mark -1. The commit reads the lane
+rows (lane x 64 + r) x H + h and is otherwise the same. Before every graph capture the transport is drained under the cap
+lock (its C++ worker makes CUDA calls: pool_prefetch.begin_step(capture=True)'s rule). The SAME byte checks apply.
 CUDA GRAPHS. Nothing here enters a graph: every op is eager, between graph launches. A capture in global mode fails when
 another thread calls the CUDA API, so the runner wraps the graph backend's begin / capture: the capture holds the lock
 that the worker takes around every CUDA call.
@@ -79,6 +90,7 @@ KM = 1 << 32
 BIGI = 1 << 62
 MODES = ("ce", "off")
 WORKERS = ("thread", "inline")
+PACKERS = ("torch", "gilfree")          # the host pack: torch.index_select (pinned) | r2_transport_gilfree_v3 (C++ team)
 BNEG = (None, "wrong_bytes", "no_copy")
 # device counters: the side stream's (one tensor) and the compute stream's (another tensor): no tensor has two writers
 SIDE_KEYS = ("items", "committed", "revived", "no_room")
@@ -103,6 +115,18 @@ class _NoEvent:
 
     def elapsed_time(self, other):
         return 0.0
+
+
+class _LaneMap:
+    """The flat-store geometry that GilfreeTransport's xpool option reads (as nosi/nosi/pool_prefetch._Lanes): M = A
+    lanes of 64 rows, B, H; a descriptor's lane is its slot row (row 4)."""
+
+    def __init__(self, M: int, B: int, H: int):
+        self.M = self.A = int(M)
+        self.B, self.H = int(B), int(H)
+
+    def lanes_of(self, desc):
+        return desc[4].clone()
 
 
 class _Epoch:
@@ -154,10 +178,12 @@ class BgFetch:
     """The mechanism of the module docstring for ONE tentative state T (a keep state: T.kid, T.kage, T.arena)."""
 
     def __init__(self, T, mode: str = "ce", n_cap: int = 1024, ring: int = 8, worker: str = "thread",
-                 acct: bool = False, bneg=None, close_wait_ms: float = 0.0):
-        if mode not in MODES or worker not in WORKERS or bneg not in BNEG:
-            raise BFError("mode %r / worker %r / bneg %r: one of %s / %s / %s" % (mode, worker, bneg, MODES, WORKERS,
-                                                                                   BNEG))
+                 acct: bool = False, bneg=None, close_wait_ms: float = 0.0, packer: str = "torch", threads: int = 8,
+                 gf=None):
+        if mode not in MODES or worker not in WORKERS or bneg not in BNEG or packer not in PACKERS:
+            raise BFError("mode %r / worker %r / bneg %r / packer %r: one of %s / %s / %s / %s" % (
+                mode, worker, bneg, packer, MODES, WORKERS, BNEG, PACKERS))
+        self.packer, self.threads, self.gf = packer, int(threads), dict(gf or {})
         if getattr(T, "kid", None) is None or not getattr(T, "kwin", False):
             raise BFError("BF1 needs the kept store with window loads (keep=True, kwin=True)")
         if int(n_cap) < 1 or int(ring) < 2 or float(close_wait_ms) < 0:
@@ -227,17 +253,46 @@ class BgFetch:
         self.snap_busy = [False] * self.nsnap
         self.snap_i = 0
         n = self.n_cap * bs
-        self.land_k = torch.empty((self.ring, n, D), dtype=self.kdt, device=dev)
-        self.land_v = torch.empty((self.ring, n, D), dtype=self.kdt, device=dev)
-        self.land_it = torch.zeros((self.ring, self.n_cap, 4), dtype=i64, device=dev)
-        self.stage_k = self._pinned((self.ring, n, D), self.kdt)
-        self.stage_v = self._pinned((self.ring, n, D), self.kdt)
-        self.stage_it = self._pinned((self.ring, self.n_cap, 4), i64)
+        self.land_it = torch.zeros((self.ring, self.n_cap, 5), dtype=i64, device=dev)
+        self.stage_it = self._pinned((self.ring, self.n_cap, 5), i64)
         self.h2d_done = [None] * self.ring               # the event of the entry's last H2D (the staging lifetime)
         self.land_i = 0
+        self.tp = None
+        if self.packer == "torch":                       # landing (ring, n_cap x 64 rows, D): item-major rows
+            self.land_k = torch.empty((self.ring, n, D), dtype=self.kdt, device=dev)
+            self.land_v = torch.empty((self.ring, n, D), dtype=self.kdt, device=dev)
+            self.stage_k = self._pinned((self.ring, n, D), self.kdt)
+            self.stage_v = self._pinned((self.ring, n, D), self.kdt)
+        else:                                            # GILFREE (module docstring, PACKER): the flat lanes
+            self.land_k = torch.zeros((self.ring * n, H, D), dtype=self.kdt, device=dev)
+            self.land_v = torch.zeros((self.ring * n, H, D), dtype=self.kdt, device=dev)
+            self.lmark = [-1] * self.ring                # the reader mark (the last commit) of each landing entry
+            self.mark_next = 0
+            self.tp = self._transport()
         self.kid_h = [self._pinned((H, B, X), i64) for _ in range(2)]
         self.kage_h = [self._pinned((H, B, X), i64) for _ in range(2)]
         self.map_ev = [self._ev(), self._ev()]
+
+    def _transport(self):
+        """THE GILFREE PACKER: our r2_transport_gilfree_v3.GilfreeTransport (worker "cpp", descriptor issue, the flat
+        lane store of pool_prefetch's use: xpool lanes_of = the descriptor's slot row) with EVERY layer's destination =
+        the ONE flat landing (ring x n_cap x 64 rows, H, D); a take (l, b, h, block, lane) writes rows (lane x 64 + r)
+        x H + h. gf: ext (the gilfree_pack v3 module; default: built from TORCH_EXTENSIONS_DIR), cls (the transport
+        class; default nosi.r2_transport_gilfree_v3), cores, cap_groups."""
+        import importlib
+        g = self.gf
+        ext = g.get("ext")
+        if ext is None:
+            gp = importlib.import_module("gilfree_pack")
+            ext = gp.load(gp.build_dir_from_env())
+        cls = g.get("cls") or importlib.import_module("nosi.r2_transport_gilfree_v3").GilfreeTransport
+        if int(getattr(ext, "DESC", 0)) < 2:
+            raise BFError("packer gilfree: packer v3 with DESC >= 2 (the lane row) is needed")
+        L = self.L
+        return cls(ext, [e._k_cpu for e in self.engs], [e._v_cpu for e in self.engs], [self.land_k] * L,
+                   [self.land_v] * L, self.bs, self.D, self.threads, lambda ev: ev.synchronize(),
+                   cap_groups=int(g.get("cap_groups", 256)), ring=2, cores=g.get("cores"), worker="cpp",
+                   xpool=_LaneMap(self.ring * self.n_cap, self.B, self.H))
 
     def bytes_device(self) -> int:
         """The device bytes BF1 allocated (the landing ring, the snapshot ring, the tags)."""
@@ -250,7 +305,7 @@ class BgFetch:
     def wrap_backend(self, be) -> None:
         """Instance attributes over the graph backend's begin / end / capture: a capture holds the lock that the worker
         takes around its CUDA calls (module docstring, CUDA GRAPHS)."""
-        if self.mode == "off" or self.worker != "thread" or be is None:
+        if self.mode == "off" or (self.worker != "thread" and self.packer != "gilfree") or be is None:
             return
         ob, oe, oc = getattr(be, "begin", None), getattr(be, "end", None), getattr(be, "capture", None)
         bf = self
@@ -260,6 +315,7 @@ class BgFetch:
                 bf.cap_lock.acquire()
                 bf.rep["captures_locked"] += 1
                 try:
+                    bf._drain_transport()
                     return ob()
                 except BaseException:
                     bf.cap_lock.release()
@@ -275,8 +331,15 @@ class BgFetch:
             def capture(fn, T_, vs):
                 with bf.cap_lock:
                     bf.rep["captures_locked"] += 1
+                    bf._drain_transport()
                     return oc(fn, T_, vs)
             be.capture = capture
+
+    def _drain_transport(self) -> None:
+        """Before a capture (the cap lock held, so no new job): the gilfree C++ worker finishes its jobs and idles (its
+        CUDA calls must not run during a global-mode capture; pool_prefetch.begin_step(capture=True)'s rule)."""
+        if self.tp is not None:
+            self.tp.flush()
 
     # ---------------------------------------------------------- epochs (compute thread)
     def open_epoch(self) -> None:
@@ -464,19 +527,36 @@ class BgFetch:
             with self.lock:
                 self.rep["empty_jobs"] += 1
             return
+        h, b = h.astype(np.int64), b.astype(np.int64)
         rk = group_rank(h, b, B)
         e = self.land_i
         self.land_i = (e + 1) % self.ring
+        lane = e * self.n_cap + group_rank(h, np.zeros_like(h), 1)    # gilfree: a lane per (head, rank in head)
         if self.h2d_done[e] is not None:                 # the staging entry's previous H2D finished
             with self.cap_lock:
                 self.h2d_done[e].synchronize()
         pblk = np.minimum(blk + 1, self.nblk - 1) if self.bneg == "wrong_bytes" else blk     # NEGATIVE CONTROL
-        idx = torch.from_numpy(rows_of(h, b, pblk, self.Tcpu, H, bs))
-        eng = self.engs[l]
-        torch.index_select(eng._k_cpu.view(-1, D), 0, idx, out=self.stage_k[e][:n * bs])
-        torch.index_select(eng._v_cpu.view(-1, D), 0, idx, out=self.stage_v[e][:n * bs])
         it = self.stage_it[e][:n]
-        it.copy_(torch.from_numpy(np.stack((h.astype(np.int64), b.astype(np.int64), blk, rk), axis=1)))
+        it.copy_(torch.from_numpy(np.stack((h, b, blk, rk, lane), axis=1)))
+        jev = None
+        if self.packer == "torch":
+            idx = torch.from_numpy(rows_of(h, b, pblk, self.Tcpu, H, bs))
+            eng = self.engs[l]
+            torch.index_select(eng._k_cpu.view(-1, D), 0, idx, out=self.stage_k[e][:n * bs])
+            torch.index_select(eng._v_cpu.view(-1, D), 0, idx, out=self.stage_v[e][:n * bs])
+        else:                                            # GILFREE: ONE descriptor job, packed by the C++ team
+            desc = torch.from_numpy(np.stack((np.full_like(h, l), b, h, pblk, lane, np.zeros_like(h)))).contiguous()
+            readers = [-1] * L
+            readers[l] = self.lmark[e]                   # T3: the landing entry's last commit read it
+            with self.cap_lock:
+                if ep.closed:
+                    with self.lock:
+                        ep.late += 1
+                        self.rep["late"] += 1
+                    return
+                seq = int(self.tp.issue_desc(desc, reader_marks=readers, hist_mark=-1))   # T4: the snapshot waited
+            jev = self.tp.job_ev(seq)
+            jev.wait_submitted()                         # the GIL released: the C++ worker packed and enqueued it
         t1 = time.perf_counter()
         with self.cap_lock, self.lock:                   # the issue: atomic against the epoch's close
             self.rep["pack_s"] += t1 - t0
@@ -491,14 +571,29 @@ class BgFetch:
                     self.side.wait_event(self.snap_ev[s])
                 ea, eb = self._ev(True), self._ev(True)
                 ea.record()
-                self.land_k[e][:n * bs].copy_(self.stage_k[e][:n * bs], non_blocking=self.cuda)
-                self.land_v[e][:n * bs].copy_(self.stage_v[e][:n * bs], non_blocking=self.cuda)
+                if jev is None:
+                    self.land_k[e][:n * bs].copy_(self.stage_k[e][:n * bs], non_blocking=self.cuda)
+                    self.land_v[e][:n * bs].copy_(self.stage_v[e][:n * bs], non_blocking=self.cuda)
+                else:
+                    jev.wait(self.side)                  # the landing (CPU: the host waits the job)
                 self.land_it[e][:n].copy_(it, non_blocking=self.cuda)
                 eb.record()
                 self.h2d_done[e] = eb
-                self._commit(e, n, l, ep.g)
+                itd = self.land_it[e][:n]
+                if jev is None:
+                    src_k, src_v = self.land_k[e][:n * bs], self.land_v[e][:n * bs]
+                else:                                    # the item's lane rows of its head
+                    rsrc = ((itd[:, 4].view(n, 1) * bs + self.ar_bs.view(1, bs)) * H + itd[:, 0].view(n, 1)).reshape(-1)
+                    src_k = self.land_k.view(-1, D).index_select(0, rsrc)
+                    src_v = self.land_v.view(-1, D).index_select(0, rsrc)
+                self._commit(itd, n, l, ep.g, src_k, src_v)
                 done = self._ev()
                 done.record()
+            if jev is not None:
+                mk = self.mark_next
+                self.mark_next += 1
+                self.tp.mark_reader(mk, done)
+                self.lmark[e] = mk
             ep.last = done
             ep.issued += 1
             ep.items_sent += n
@@ -508,10 +603,10 @@ class BgFetch:
             if self.cuda:
                 self.h2d_ev.append((ea, eb, n * self.item_bytes))
 
-    def _commit(self, e: int, n: int, l: int, g: int) -> None:
-        """Step 3's commit on the CURRENT stream (the side stream; the CPU: in line)."""
+    def _commit(self, it, n: int, l: int, g: int, src_k, src_v) -> None:
+        """Step 3's commit on the CURRENT stream (the side stream; the CPU: in line). it (n, 5) device rows h, b, block,
+        rank in (h, b), lane; src_k / src_v (n x 64, D): the items' rows, item-major."""
         T, H, B, X, bs = self.T, self.H, self.B, self.X, self.bs
-        it = self.land_it[e][:n]
         h, b, blk, rk = it[:, 0], it[:, 1], it[:, 2], it[:, 3]
         key = blk + int(l) * KM
         kid1 = T.kid[..., 1:]
@@ -531,8 +626,8 @@ class BgFetch:
         dslot = torch.where(ok, slot, torch.zeros_like(slot))           # not ok: store slot 0 (CB1, rewritten by J)
         rows = (((b * X + dslot).view(n, 1) * bs + self.ar_bs.view(1, bs)) * H + h.view(n, 1)).reshape(-1)
         if self.bneg != "no_copy":                                       # NEGATIVE CONTROL: the rows not copied
-            self.sk.index_copy_(0, rows, self.land_k[e][:n * bs])
-            self.sv.index_copy_(0, rows, self.land_v[e][:n * bs])
+            self.sk.index_copy_(0, rows, src_k)
+            self.sv.index_copy_(0, rows, src_v)
             tc = self.twins[l].total_cis
             pos = (blk * bs).view(n, 1) + self.ar_bs.view(1, bs)
             bias = tc[b.view(n, 1), pos, h.view(n, 1)]
@@ -547,11 +642,21 @@ class BgFetch:
     # ---------------------------------------------------------- report (after the run, one sync)
     def report(self) -> dict:
         self.stop()
+        tps = None
+        if self.tp is not None:                          # drains the C++ worker, then its totals
+            self.tp.flush()
+            st = dict(self.tp.stats)
+            self.tp.close()
+            tps = dict(st, threads=self.threads, threads_ok=(st.get("threads_min") == self.threads
+                                                             and st.get("threads_max") == self.threads),
+                       pack_GBps_native=(round(self.rep["items_sent"] * self.item_bytes / st["pack_ns"], 3)
+                                         if st.get("pack_ns") else None))
+            self.tp = None
         if self.cuda:
             torch.cuda.synchronize()
         out = dict(self.rep, mode=self.mode, worker=self.worker, n_cap=self.n_cap, ring=self.ring, acct=self.acct,
                    bneg=self.bneg, X=self.X, error=self.error, device_bytes=self.bytes_device(),
-                   item_bytes=self.item_bytes)
+                   item_bytes=self.item_bytes, packer=self.packer, transport=tps)
         out.update({k: int(v) for k, v in zip(SIDE_KEYS, self.cnt_side.tolist())})
         out.update({k: int(v) for k, v in zip(MAIN_KEYS, self.cnt_main.tolist())})
         out["pending"] = int(self.ptag[..., 1:].sum())                   # tags of jobs after the last joint pass
@@ -563,8 +668,8 @@ class BgFetch:
         h2d = [(a.elapsed_time(b), nb) for a, b, nb in self.h2d_ev]
         ms = sum(x for x, _ in h2d)
         nb = sum(y for _, y in h2d)
-        out["h2d_ms_total"] = round(ms, 3)
-        out["h2d_GBps"] = round(nb / ms / 1e6, 3) if ms > 0 else None
+        out["h2d_ms_total"] = round(ms, 3)              # gilfree: the side stream's wait for the landing (not the DMA)
+        out["h2d_GBps"] = round(nb / ms / 1e6, 3) if (ms > 0 and self.packer == "torch") else None
         out["pack_GBps"] = round(out["bytes_sent"] / out["pack_s"] / 1e9, 3) if out["pack_s"] > 0 else None
         bw = [(s, a.elapsed_time(b)) for s, a, b in self.bar_ev]
         out["barrier_ms"] = [round(x, 3) for _, x in bw]
