@@ -74,10 +74,16 @@ DROP = ("-COUNTS", "-KEEP-EQ", "-KEEP-REF")
 #     of 128 slots per request is 1.82 GB at B 216, and that arm's prefill peak is 83.90 GB of 84.0). DECISION: no BF1
 #     lever at C 128; bf1a is a DIAGNOSTIC only (full-B coverage; the first graph-mode KW vs L4PTFDGUDCD at C 128); adopt
 #     there only if B / L4PTFDGUDCD >= 1.02 in the same process.
-PRED_STAMP_BF1 = None
+PRED_STAMP_BF1 = "2026-10-31T13:43:47Z"
 PRED_KEYS = ("BF1_vs_X", "BF1_vs_R", "BF1_new_ratio", "BF1_wait_saving", "BF1_joint_saving", "BF1_draft_ratio",
              "BF1_barrier_ms", "BF1_eq")
-PRED_BF1_BY_B = {216: {k: None for k in PRED_KEYS}, 318: {k: None for k in PRED_KEYS}}
+# THE LEAD'S REGISTRATION (2026-10-31T13:43:47Z, before bf1a / bf1b; the writer's bands; r7pb MEASURED flagA 0.469 at
+# C 73 B 318 (R/recon7_pb1_2195630_r7pb) and r7pa 0.509 at C 128 B 216, inside the modelled 0.46-0.50).
+PRED_BF1_BY_B = {
+    216: dict(BF1_vs_X=(1.001, 1.020), BF1_vs_R=(0.995, 1.020), BF1_new_ratio=(0.45, 0.65), BF1_wait_saving=(3.0, 8.0),
+              BF1_joint_saving=(3.0, 8.0), BF1_draft_ratio=(1.00, 1.04), BF1_barrier_ms=(0.0, 10.0), BF1_eq=True),
+    318: dict(BF1_vs_X=(1.06, 1.14), BF1_vs_R=(1.05, 1.14), BF1_new_ratio=(0.45, 0.65), BF1_wait_saving=(35.0, 65.0),
+              BF1_joint_saving=(35.0, 65.0), BF1_draft_ratio=(1.00, 1.04), BF1_barrier_ms=(0.0, 10.0), BF1_eq=True)}
 
 
 def runner_choice(arm: str, check: bool):
