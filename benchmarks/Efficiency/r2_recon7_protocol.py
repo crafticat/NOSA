@@ -21,7 +21,7 @@ CELL_MODULE = dict(r7pm="r2_recon7_cell", r7pa="r2_recon7_cell", r7pb="r2_recon7
                    r7mem="r2_recon7_mem")
 
 # THE GRANTS (one line each; the step script greps `^GRANT_<cell> = "<stamp>"$`).
-GRANT_r7pm = None
+GRANT_r7pm = "2026-10-31T11:41:14Z"
 GRANT_r7pa = None
 GRANT_r7pb = None
 GRANT_r7s = "2026-10-31T11:38:06Z"
