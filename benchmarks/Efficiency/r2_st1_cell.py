@@ -79,7 +79,7 @@ USABLE_GB = DCC.USABLE_GB
 #   B 318 524.7 / (524.7 - 4.0 .. 7.0) = (1.0077, 1.0135) -> (1.007, 1.014). The run-to-run spread is 0.3 % (B 216) and
 #   0.6 % (B 318). ST1_joint_ratio and ST1_draft_ratio (0.99, 1.01).
 #   ST1_peak_delta_gb (-0.01, 0.05): the static inputs (< 0.1 MB) and the private pool (MODEL < 20 MB) only.
-PRED_STAMP_ST1 = None
+PRED_STAMP_ST1 = "2026-10-31T13:02:28Z"
 #   ST2 (the MT arm against its M arm). MEASURED: the joint pass's twin label, r7pm (C 73 B 8) 1,194 ops, 3.85 ms
 #   device; r7pa (C 128 B 216, labelled round 112) 1,063 ops, 4.07 ms device (160 _twin_kernel 1.06 ms, 807 small
 #   2.83 ms, 96 copies 0.19 ms), host 46.0 ms; the joint window busy ratio 0.966 (device bound). MODEL: ST2 keeps the
@@ -89,7 +89,14 @@ PRED_STAMP_ST1 = None
 #   saving): B 216 (1.003, 1.009), B 318 (1.002, 1.006).
 PRED_KEYS = ("ST1_commit_saving", "ST1_joint_ratio", "ST1_draft_ratio", "ST1_vs_ref", "ST1_peak_delta_gb",
              "ST2_joint_saving", "ST2_vs_m")
-PRED_ST1_BY_B = {216: {k: None for k in PRED_KEYS}, 318: {k: None for k in PRED_KEYS}}
+# THE LEAD'S REGISTRATION (2026-10-31T13:02:28Z, before any ST GPU run; the builder's bands re-derived from r7pa).
+PRED_ST1_BY_B = {
+    216: dict(ST1_commit_saving=(3.0, 5.5), ST1_joint_ratio=(0.99, 1.01), ST1_draft_ratio=(0.99, 1.01),
+              ST1_vs_ref=(1.008, 1.018), ST1_peak_delta_gb=(-0.01, 0.05), ST2_joint_saving=(1.0, 2.8),
+              ST2_vs_m=(1.003, 1.009)),
+    318: dict(ST1_commit_saving=(4.0, 7.0), ST1_joint_ratio=(0.99, 1.01), ST1_draft_ratio=(0.99, 1.01),
+              ST1_vs_ref=(1.007, 1.014), ST1_peak_delta_gb=(-0.01, 0.05), ST2_joint_saving=(1.0, 3.0),
+              ST2_vs_m=(1.002, 1.006))}
 
 
 def log(msg):
