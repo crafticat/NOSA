@@ -528,7 +528,7 @@ def run_shapes(a, dev, build, free_bytes, sync, clock=time.perf_counter, ctx=con
                     times, eg, stop, warm = measure(dev, parts, outputs, a.layers, a.reps, a.warmup, max_s=a.max_shape_s,
                                                     clock=clock, t0=t0)
                     same = group_equal(outputs, bits)
-            gates.extend(eg)
+            gates.extend(("%s-%s" % (name, n), m, ok, d) for n, m, ok, d in eg)   # the shape names every gate
             if same:
                 gates.append(("%s-GRP-EQ" % name, False, all(same.values()),
                               "DECISION GATE (GRP / GRPL only): the groups' outputs = the full batch's bits: %s" % same))

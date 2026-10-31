@@ -744,6 +744,8 @@ def test_streams_run_shapes():
     assert must_failed(gates) == [] and list(raw) == ["C8_B4", "C6_B2"], must_failed(gates)
     assert {g[0] for g in gates if not g[1]} == {"C8_B4-GRP-EQ", "C6_B2-GRP-EQ"} and all(g[2] for g in gates)
     assert gates[-1][0] == "RUN-WALL" and all(len(v) == 3 for v in raw["C8_B4"]["times_ms"].values())
+    ex = [g[0] for g in gates if g[0].endswith("-EXACT")]               # every EXACT gate names its shape (x1r3 fix)
+    assert len(ex) == len(set(ex)) == 2 * len(S.CONFIGS) and all(x.startswith(("C8_B4-", "C6_B2-")) for x in ex), ex
     assert all(len(v) == 1 for v in raw["C8_B4"]["warmup_ms"].values()) and raw["C8_B4"]["groups_equal_full"] == dict(
         Aq=True, Ar=True, F=True, G=True)
     gates, raw = run(_cpu_build(S), free=lambda: 0)                    # free memory: the run stops at the first shape
