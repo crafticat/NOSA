@@ -22,10 +22,11 @@
 # on --spec-redirect on; --st1-commit rows; BF1: --bf-ring 8 --bf-worker thread --bf-close-wait-ms 0 --bf-packer gilfree
 # --bf-threads 8; docs/NOTES_int.md holds the protocol):
 #   intm the MINIATURE: C 73 (pool 10), B 8, 72 steps, probe 4, arms L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,
-#        L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK (the ST3 control and its PEQ chain),L4PTFDGUDCDI,
-#        L4PTFDGUDKWCDI (+ ST3), --check-every 1 (J1-PEQ, ST3's map checks and the keep's fresh-fetch byte checks in every
-#        round), --require-stress 1, --bf-acct 1, --bf-store 0, --bf-ncap 2048; every gate MUST. Run it first.
-#        STEP_MIN 45, --mem 100G.
+#        L4PTFDGUDKWCD,L4PTFDGUDCDM,L4PTFDGUDKWCDM,L4PTFDGUDCDMT,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK (the ST3 control),
+#        L4PTFDGUDCDMTR,L4PTFDGUDKWCDMTKR (the ST4 controls: gates and correctness only),L4PTFDGUDCDI (+ ST4),
+#        L4PTFDGUDKWCDI (+ ST3 + ST4), --check-every 1 (J1-PEQ, ST3's map checks and the keep's fresh-fetch byte checks
+#        in every round), --require-stress 1, --bf-acct 1, --bf-store 0, --bf-ncap 2048; every gate MUST. Run it first.
+#        STEP_MIN 55, --mem 100G.
 #   inta timing, C 128 (pool 65), B 216, 512 steps, probe 16, arms L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI. STEP_MIN
 #        125, --mem 240G. STOPS while PRED_STAMP_INT is None.
 #   intb timing, C 73 (pool 10), B 318, 512 steps, probe 16, --bf-store 257 (as bf1b), --bf-ncap 2048, arms L4PTFD,
@@ -35,7 +36,7 @@
 # Basis of STEP_MIN (MEASURED, sacct, CITED by r2_j1_step.sh:35-39): i4dca (SH + 3 arms, C 128 B 216) 00:47:32; i4dcb
 # 01:11:41; i4dm2 (SH + 6 arms, B 8) 00:09:18. MODEL: inta = i4dca + one D-arm part (11.9 min) + SHJ1 (2) + compile
 # (<= 1) = about 62 min (margin 2.0); intb = i4dcb + 4 parts x 17.9 + SHJ1 (4) + the gilfree build (2) = about 149 min
-# (margin 1.8); intm = i4dm2 + 5 parts (about 1.3 min each) + SHJ1 + the build = about 19 min (margin 2.4). Memory: the
+# (margin 1.8); intm = i4dm2 + 9 parts (about 1.3 min each) + SHJ1 + the build = about 24 min (margin 2.3). Memory: the
 # I4DC cells' --mem; BF1's pinned staging 2 x ring x n_cap x 16 KB (0.54 GB).
 #
 # OUTPUT: OUTROOT/int_<run>_<holder>_<cell>/summary.json and the step record OUTROOT/int_<run>_<holder>_<cell>.step/,
@@ -75,8 +76,8 @@ case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
 [[ $RUN =~ ^[a-z0-9]{1,16}$ ]] || stop "run id '$RUN' (1-16 of a-z 0-9)"
 K=3 STRESS=0 CHECK=0 NEEDPRED=0 PE=16 ACCT=0 BFX=0 NCAP=2048
 case $CELL in
-    intm) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 PE=4 ACCT=1 STEP_MIN=45 MEM=100G
-          ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDCDI,L4PTFDGUDKWCDI ;;
+    intm) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 PE=4 ACCT=1 STEP_MIN=55 MEM=100G
+          ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDM,L4PTFDGUDKWCDM,L4PTFDGUDCDMT,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDCDMTR,L4PTFDGUDKWCDMTKR,L4PTFDGUDCDI,L4PTFDGUDKWCDI ;;
     inta) POOL=65 BATCH=216 STEPS=512 NEEDPRED=1 STEP_MIN=125 MEM=240G
           ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI ;;
     intb) POOL=10 BATCH=318 STEPS=512 NEEDPRED=1 BFX=257 STEP_MIN=270 MEM=340G

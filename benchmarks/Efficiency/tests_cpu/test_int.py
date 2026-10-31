@@ -246,6 +246,30 @@ def _int(key, scen="timing", ineg=None, worker="inline"):
     return _I[k]
 
 
+_F = {}
+
+
+def _int_full(key, scen="timing"):
+    """The cell's INT arm on the CPU world: the INT runner + ST3 (the keep arm) + ST4, attached in the cell's order
+    (r2_int_cell.runner_class: st3_runner then st4_runner over int_runner; st*_attach = their __init__ step)."""
+    if (key, scen) not in _F:
+        STC = _mod("r2_st1_commit")
+        _int(key, scen)                                                # its C / D arms first (test_int's order)
+        run = _builder(INT_ARMS[key], scen)
+        if key == "C73":
+            STC.st3_attach(run)
+        STC.st4_attach(run)
+        if X.SCEN[scen]["fa"]:
+            run.vs.fa_check = {}
+        run.run(N_RUN)
+        rd = run.read()
+        if key == "C73":
+            rd["st3"] = run.T.st3_report()
+        rd["st4"] = run.T.st4_report()
+        _F[(key, scen)] = dict(runner=run, rd=rd, N=N_RUN, B=8, scen=scen, arm=INT_ARMS[key])
+    return _F[(key, scen)]
+
+
 def _cell():
     C = _mod("r2_int_cell")
     return C, C.configure()
@@ -307,11 +331,15 @@ def test_int_equal(key, scen):
         assert "j3" not in rd                                          # F3 is not in the BF1 arm
     else:
         assert rd["j3"]["joint_captures"] > 0 and rd["j3"]["draft_layers"] > 0, rd["j3"]               # F3
-    evg = TST._int_st3(scen)[1] if keep else ev                        # the cell's C 73 INT arm carries ST3 (test_st1:
-    gs, rec = _gates(key, scen, evg)                                   # test_st3_int: = this INT run, every bit)
+    evg = _int_full(key, scen)                                         # the cell's INT arm: + ST4 (+ ST3 in the keep arm)
+    bad = TS._diff(ev, evg, skip=SKIP_REC + ("st3", "st4", "bf"))
+    assert bad == [], bad[:10]                                         # = the INT run, every bit (BF1's timers aside)
+    if keep:
+        assert all(evg["rd"]["bf"][k] == rd["bf"][k] for k in ("committed", "used_store", "used_win"))
+    gs, rec = _gates(key, scen, evg)
     names = {g[0][len(INT_ARMS[key]) + 1:] for g in gs if g[0].startswith(INT_ARMS[key] + "-")}
     want = {"MEM", "GRAPH", "DGRAPH", "HOIST", "COMPILE", "EQF", "J1-PEQ", "J1-COMPILE", "J1-DRAFT", "PEQ", "TAIL-EQ",
-            "CGRAPH", "TWIN", "INT-CLASSES", "INT-LAYER", "COUNTS"}
+            "CGRAPH", "TWIN", "INT-CLASSES", "INT-LAYER", "COUNTS", "DRESID"}
     want |= {"KEEP", "LISTED", "BF", "INT-LOCK", "KFILL"} | ({"CAP"} if scen == "check" else set()) if keep else \
         {"DCOUNTS", "J1-RESID"}
     assert names == want, (sorted(names - want), sorted(want - names))
@@ -397,21 +425,25 @@ def test_int_cell_tables(monkeypatch):
                              packer="gilfree", threads=8)
     assert D.runner_choice("L4PTFDGUDKWCDX", False)[1]["bf"]["mode"] == "off"
     STC = _mod("r2_st1_commit")
-    for arm, base in (("L4PTFDGUDCDI", "SCD"), ("L4PTFDGUDKWCDI", "SKCD"), ("L4PTFDGUDKWCDMTK", "SKCD")):
+    MTk = STC.st1_runner(X.DCL["L4PTFDGUDKWCD"][1], "rows", twin=True)
+    MTc = STC.st1_runner(X.DCL["L4PTFDGUDCD"][1], "rows", twin=True)
+    for arm, base in (("L4PTFDGUDCDI", "SCD"), ("L4PTFDGUDKWCDI", "SKCD"), ("L4PTFDGUDKWCDMTK", "SKCD"),
+                      ("L4PTFDGUDCDMTR", "SCD"), ("L4PTFDGUDKWCDMTKR", "SKCD")):
         C._CUR["arm"] = arm
         try:
-            R = D.runner_class(base, X.STF)
+            R = D.runner_class(base, X.STF)                            # R.__mro__[0]: the tails read
         finally:
             C._CUR["arm"] = None
-        if arm == "L4PTFDGUDCDI":                                      # the tails read over the INT runner
-            assert R.__mro__[1] is INTA.int_runner(X.STF, arm, "rows", None) and R.__name__ == "TentRunner_" + arm
-        elif arm == "L4PTFDGUDKWCDI":                                  # + ST3 between them
-            RI = INTA.int_runner(X.STF, arm, "rows", None)
-            assert R.__mro__[1] is STC.st3_runner(RI) and R.__mro__[2] is RI
-        else:                                                          # the MTK control: ST3 over the MT runner
-            assert R.__mro__[1] is STC.st3_runner(STC.st1_runner(X.DCL["L4PTFDGUDKWCD"][1], "rows", twin=True))
-    assert C.hooks("L4PTFDGUDKWCDI")[-1] == "ST3" and "ST3" not in C.hooks("L4PTFDGUDCDI")
-    assert C.ST_ARMS["L4PTFDGUDKWCDMTK"] == "L4PTFDGUDKWCDMT" and "L4PTFDGUDKWCDMTK" in D.KEEP_ARMS
+        RI = INTA.int_runner(X.STF, arm, "rows", None) if arm in C.ARMS_INT else None
+        want = dict(L4PTFDGUDCDI=[STC.st4_runner(RI), RI] if RI else None,
+                    L4PTFDGUDKWCDI=[STC.st4_runner(STC.st3_runner(RI)), STC.st3_runner(RI), RI] if RI else None,
+                    L4PTFDGUDKWCDMTK=[STC.st3_runner(MTk), MTk], L4PTFDGUDCDMTR=[STC.st4_runner(MTc), MTc],
+                    L4PTFDGUDKWCDMTKR=[STC.st4_runner(STC.st3_runner(MTk)), STC.st3_runner(MTk), MTk])[arm]
+        assert list(R.__mro__[1:1 + len(want)]) == want, (arm, R.__mro__[:4])
+    assert C.hooks("L4PTFDGUDKWCDI")[-2:] == ("ST3", "ST4") and C.hooks("L4PTFDGUDCDI")[-1] == "ST4"
+    assert "ST3" not in C.hooks("L4PTFDGUDCDI")
+    assert C.ST_ARMS["L4PTFDGUDKWCDMTK"] == "L4PTFDGUDKWCDMT" and "L4PTFDGUDKWCDMTKR" in D.KEEP_ARMS
+    assert C.ST_ARMS["L4PTFDGUDCDMTR"] == "L4PTFDGUDCDMT" and C.ST_ARMS["L4PTFDGUDKWCDMTKR"] == "L4PTFDGUDKWCDMTK"
     assert D.runner_class("SCD", X.STF).__mro__[1] is X.DCL["L4PTFDGUDCD"][1]       # every arm: the tails read
     base = ["--out", "x", "--workload", "w"]
     monkeypatch.setenv("TORCH_EXTENSIONS_DIR", "/tmp/x")
@@ -482,9 +514,9 @@ def _step(cell, sha="0" * 40):
                           capture_output=True, text=True, timeout=300)
 
 
-CELLS = (("intm", 10, 8, 72, 1, 1, 4, 1, 0, 45, "100G",
-          "L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,"
-          "L4PTFDGUDCDI,L4PTFDGUDKWCDI"),
+CELLS = (("intm", 10, 8, 72, 1, 1, 4, 1, 0, 55, "100G",
+          "L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDM,L4PTFDGUDKWCDM,L4PTFDGUDCDMT,"
+          "L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDCDMTR,L4PTFDGUDKWCDMTKR,L4PTFDGUDCDI,L4PTFDGUDKWCDI"),
          ("inta", 65, 216, 512, 0, 0, 16, 0, 0, 125, "240G", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI"),
          ("intb", 10, 318, 512, 0, 0, 16, 0, 257, 270, "340G",
           "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDKWCDI"))

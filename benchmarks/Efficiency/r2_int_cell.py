@@ -1,15 +1,16 @@
 """Rung INT (KS/analysis/plan/INTEGRATION_NOTES_2026-10-31.md; KS = /mnt/beegfs/ojerbi/kstep-cpu-runs): the GPU cell of
 the INTEGRATED arms (benchmarks/Efficiency/r2_int_arms.py: the classes, the two collision fixes):
-  L4PTFDGUDCDI    L4PTFDGUDCD   + F1 + F2 + F6 + F3 + ST1 + ST2          (C 128 B 216: the best arm there)
-  L4PTFDGUDKWCDI  L4PTFDGUDKWCD + F1 + F2 + F6 + ST1 + ST2 + BF1 + ST3   (C 73 B 318: the best arm there; ST3 = the
-                  keep fill in two compiled helpers, r2_st1_commit.st3_runner over the INT runner; gate -KFILL)
+  L4PTFDGUDCDI    L4PTFDGUDCD   + F1 + F2 + F6 + F3 + ST1 + ST2 + ST4    (C 128 B 216: the best arm there)
+  L4PTFDGUDKWCDI  L4PTFDGUDKWCD + F1 + F2 + F6 + ST1 + ST2 + BF1 + ST3 + ST4   (C 73 B 318: the best arm there)
+  ST3 = the keep fill in two compiled helpers (gate -KFILL), ST4 = the draft residency's integer ops in one compiled
+  helper (gate -DRESID): r2_st1_commit.st3_runner / st4_runner over the INT runner, in that order.
 THE I4DC CELL, REUSED AS A PRIVATE MODULE COPY (the J1 cell's pattern): this file loads benchmarks/Efficiency/
 r2_i4dc_cell.py a second time as "r2_int_dcc" (no edit), extends THAT copy's arm tables and wraps its run_arm_d,
 runner_choice, runner_class, keep_ref_arm, arm_gates, verdicts, BC (SHJ1 after SH: r2_j1_cell's _BCProxy) and HC (the
 ST1 commit graph's capture round joins the L61 exclusion), then runs its main(). The single-rung arms may run in the
 same job as matched controls, with their own cells' gates: the J1 / J3 arms (r2_j1_select + r2_j1_select.j1_gates /
-j3_gates), the ST arms L4PTFDGUDCDM / MT, L4PTFDGUDKWCDM / MT / MTK (r2_st1_cell.arm_gates_st1; MTK = MT + ST3, the
-ST3 control), the BF1 arms
+j3_gates), the ST arms L4PTFDGUDCDM / MT / MTR, L4PTFDGUDKWCDM / MT / MTK / MTKR (r2_st1_cell.arm_gates_st1; MTK = MT
++ ST3, the ST3 control; MTR / MTKR = MT / MTK + ST4, intm only), the BF1 arms
 L4PTFDGUDKWCDX / B (r2_bf1_cell.arm_gates_bf). Every arm's read() carries ST1's tail checksum (the INT arms' TAIL-EQ
 reference). Step script: benchmarks/Efficiency/r2_int_step.sh (cells intm, inta, intb). Docs: docs/NOTES_int.md.
 
@@ -20,7 +21,8 @@ MUST GATES OF AN INT ARM (all components' + EQF = L4PTFD bit for bit):
     I4CC loc1 helper left out (F6), EQF), the C 73 arm without -COUNTS / -KEEP-EQ / -KEEP-REF (BF1 changes them by
     design) and with BF1's -COUNTS (without round_blocks) / -LISTED / -BF against the D arm;
   J1: -J1-PEQ, -J1-COMPILE, -J1-DRAFT; F3 (C 128): -J1-RESID; J1-SHEQ once per job (SHJ1);
-  ST1 / ST2: -PEQ (= the D arm bit for bit), -DCOUNTS (C 128), -TAIL-EQ, -CGRAPH, -TWIN; ST3 (C 73): -KFILL;
+  ST1 / ST2: -PEQ (= the D arm bit for bit), -DCOUNTS (C 128), -TAIL-EQ, -CGRAPH, -TWIN; ST3 (C 73): -KFILL; ST4:
+  -DRESID;
   INT: -INT-CLASSES, -INT-LAYER, -INT-LOCK (C 73) (r2_int_arms.int_gates).
 REGISTERED PREDICTIONS PRED_INT_BY_B: every value None until the lead registers them with PRED_STAMP_INT (a None key is
 REPORT); the step script STOPS the timing cells (inta, intb) while PRED_STAMP_INT is None. THE CELL GRANTS GRANT_intm /
@@ -52,10 +54,11 @@ ARMS_INT = dict(INTA.ARMS_INT)
 ARMS_J = tuple(J1.ARMS_J1) + tuple(J1.ARMS_J3)
 ST_ARMS = dict(STCELL.ST13)                       # an ST arm -> its PEQ reference (M: D; MT: M; MTK: MT)
 INT_ST3 = ("L4PTFDGUDKWCDI",)                     # the INT arm(s) that also carry ST3 (r2_st1_commit.st3_runner)
+INT_ST4 = ("L4PTFDGUDCDI", "L4PTFDGUDKWCDI")      # the INT arms that also carry ST4 (st4_runner, after st3_runner)
 BF_ARMS = dict(BFCELL.BF_ARMS)                    # a BF1 arm -> its fetch mode
 D_OF = dict(J1.ARMS_J1, **J1C.BASE_J3, **ARMS_INT)   # the arms that take the I4DC gates of their D arm (own name)
-KEEP_NEW = ("L4PTFDGUDKWCDJ1", "L4PTFDGUDKWCDM", "L4PTFDGUDKWCDMT", "L4PTFDGUDKWCDMTK", "L4PTFDGUDKWCDX",
-            "L4PTFDGUDKWCDB", "L4PTFDGUDKWCDI")
+KEEP_NEW = ("L4PTFDGUDKWCDJ1", "L4PTFDGUDKWCDM", "L4PTFDGUDKWCDMT", "L4PTFDGUDKWCDMTK", "L4PTFDGUDKWCDMTKR",
+            "L4PTFDGUDKWCDX", "L4PTFDGUDKWCDB", "L4PTFDGUDKWCDI")
 NEW_ARMS = ARMS_J + tuple(ST_ARMS) + tuple(BF_ARMS) + tuple(ARMS_INT)
 # REGISTERED PREDICTIONS, NONE UNTIL THE LEAD REGISTERS THEM: fill PRED_INT_BY_B (per batch) and PRED_STAMP_INT (`date
 # -u`, L33) in a commit BEFORE inta / intb. Keys, each (low, high) unless noted; X = the INT arm of the cell, REF = its D
@@ -180,12 +183,14 @@ def configure():
             R = J1.j1_classes(STF)[arm][1]
         elif arm in ST_ARMS:
             R = STC.st1_runner(rclass0(kind, STF), OPT["st1_commit"], twin=arm in STCELL.TWIN)
-            R = STC.st3_runner(R) if arm in STCELL.ST3 else R           # ST3: the MTK control arm
+            R = STC.st3_runner(R) if arm in STCELL.KFILL_ARMS else R    # ST3: the MTK / MTKR control arms
+            R = STC.st4_runner(R) if arm in STCELL.ST4 else R           # ST4: the MTR / MTKR control arms
         elif arm in BF_ARMS:
             R = BF.bf_classes(STF)[1]
         elif arm in ARMS_INT:
             R = INTA.int_runner(STF, arm, OPT["st1_commit"], OPT["ineg"])
             R = STC.st3_runner(R) if arm in INT_ST3 else R              # ST3 in the C 73 INT arm
+            R = STC.st4_runner(R) if arm in INT_ST4 else R              # ST4 in both INT arms (after ST3)
         else:
             R = rclass0(kind, STF)
         return INTA.with_tails(R)
@@ -203,7 +208,7 @@ def configure():
     def arm_gates_int(arm, rd, rec, cpu, keep, check, B, pool, steps, L, pa):
         rd = rd or {}
         cpu["tails"] = rd.get("tails")                                 # every arm: the TAIL-EQ reference
-        for k in ("j1", "j3", "st1", "st2", "st3", "bf", "int"):
+        for k in ("j1", "j3", "st1", "st2", "st3", "st4", "bf", "int"):
             if rd.get(k) is not None:
                 rec[k] = rd[k]
         if arm in BF_ARMS or arm in INTA.KEEP_INT:
@@ -278,13 +283,15 @@ def int_arm_gates(gates0, arm, rd, rec, cpu, keep, check, B, pool, steps, L, pa)
     g.append(STCELL.twin_gate(arm, rd.get("st2"), calls.get("joint_passes"), L))
     if arm in INT_ST3:                                                 # ST3: every keep fill through its helpers
         g.append(STCELL.kfill_gate(arm, rd.get("st3"), rd.get("compile")))
+    if arm in INT_ST4:                                                 # ST4: every draft residency through its helper
+        g.append(STCELL.dresid_gate(arm, rd.get("st4"), rd.get("dgraph"), L, rd.get("j3") is not None))
     g = g + INTA.int_gates(arm, rd, L)
     return g + sheq_once()
 
 
 def hooks(arm: str) -> tuple:
-    """The hooks of an INT arm in this cell (r2_int_arms.HOOKS + ST3 for INT_ST3)."""
-    return tuple(INTA.HOOKS[arm]) + (("ST3",) if arm in INT_ST3 else ())
+    """The hooks of an INT arm in this cell (r2_int_arms.HOOKS + ST3 for INT_ST3 + ST4 for INT_ST4)."""
+    return tuple(INTA.HOOKS[arm]) + (("ST3",) if arm in INT_ST3 else ()) + (("ST4",) if arm in INT_ST4 else ())
 
 
 def int_arm(sp):
@@ -400,9 +407,9 @@ def report_lines() -> list:
         if name in BF_ARMS or name in INTA.KEEP_INT:
             out.extend(BFCELL.bf_lines(name, r))
         if name in ARMS_INT:
-            out.append("INT %s: hooks %s; record %s; st1 %s; st2 %s; j1 calls %s f6 calls %s; j3 %s; st3 %s" % (
+            out.append("INT %s: hooks %s; record %s; st1 %s; st2 %s; j1 calls %s f6 calls %s; j3 %s; st3 %s; st4 %s" % (
                 name, hooks(name), r.get("int"), r.get("st1"), r.get("st2"), (r.get("j1") or {}).get("calls"),
-                (r.get("j1") or {}).get("f6calls"), r.get("j3"), r.get("st3")))
+                (r.get("j1") or {}).get("f6calls"), r.get("j3"), r.get("st3"), r.get("st4")))
     return out
 
 

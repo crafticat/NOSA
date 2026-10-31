@@ -24,6 +24,15 @@ L4PTFDGUDKWCDMTK (= MT + ST3, its PEQ reference MT, which needs M) runs in intm 
 INT_st3_joint_saving (MT joint - MTK joint), INT_st3_vs_mt (MTK / MT); the ST1 cell's ST3-JOINT-SAVING / ST3-VS-MT
 verdicts are emitted too (r2_st1_cell.verdicts).
 
+ST4 (AREA 3, r2-st4-dev da73561 on d87b071 = the ST3 fix: ST3's compile events in its own record, so the root -COMPILE
+gate no longer sees them; INTEGRATION_NOTES section 10): BOTH INT arms carry ST4 (the draft residency's integer ops
+in one compiled helper): runner = st4_runner(st3_runner(int_runner)) at C 73, st4_runner(int_runner) at C 128 (INT_ST4);
+gate -DRESID (r2_st1_cell.dresid_gate; F3 = the J3 record present). No ST4 timing control in inta / intb (GPU time;
+its effect is inside the INT arm, MODEL about 2 ms per round); the controls L4PTFDGUDCDMTR (MT + ST4) and
+L4PTFDGUDKWCDMTKR (MTK + ST4) run in intm only (gates, correctness; their PEQ chain M, MT is in intm). No new
+registration key. CPU: test_int.py::test_int_equal evaluates the cell's gates on the INT run + ST3 + ST4
+(`_int_full`: st3_attach / st4_attach in the cell's order) and checks that run = the INT run, every bit.
+
 ## 2. The two collisions (benchmarks/Efficiency/r2_int_arms.py)
 
 1. ST2 x F1: both rungs override TentState._layer with a full copy. `IntLayer._layer` = `TwinST2._layer` with 2 lines
@@ -74,7 +83,7 @@ is None). Every cell: --st1-commit rows, BF1 --bf-ring 8 --bf-worker thread --bf
 
 | cell | config | arms (SH, SHJ1 first) | STEP_MIN / --mem | command |
 |---|---|---|---|---|
-| intm | C 73 pool 10, B 8, 72 steps, probe 4, check every round, stress, --bf-acct 1, --bf-store 0 | L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDCDI,L4PTFDGUDKWCDI | 45 / 100G | `bash benchmarks/Efficiency/r2_int_step.sh --nosi <sha> <holder> <run> intm` |
+| intm | C 73 pool 10, B 8, 72 steps, probe 4, check every round, stress, --bf-acct 1, --bf-store 0 | L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDM,L4PTFDGUDKWCDM,L4PTFDGUDCDMT,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDCDMTR,L4PTFDGUDKWCDMTKR,L4PTFDGUDCDI,L4PTFDGUDKWCDI | 55 / 100G | `bash benchmarks/Efficiency/r2_int_step.sh --nosi <sha> <holder> <run> intm` |
 | inta | C 128 pool 65, B 216, 512 steps | L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI | 125 / 240G | `... inta` |
 | intb | C 73 pool 10, B 318, 512 steps, --bf-store 257 | L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDKWCDI | 270 / 340G | `... intb` |
 
