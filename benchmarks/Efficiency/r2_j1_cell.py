@@ -79,12 +79,12 @@ KEEP_J1 = ("L4PTFDGUDKWCDJ1",)
 #     J1_draft_ratio (0.99, 1.01); J1_vs_ref 524.66 / (524.66 - 14.0 .. 18.5) = (1.027, 1.037); J1_ratio 0.660 x that
 #     (REF / SH of i4dcb) = (0.678, 0.684) -> (0.672, 0.690) with the spread; J1_eq True; J1_peak_gb (77.60, 77.80);
 #     J1_compile_s (0.5, 30)
-PRED_STAMP_J1 = None
+PRED_STAMP_J1 = "2026-10-31T12:45:14Z"
 # THE CELL GRANTS (default deny; r2_j1_step.sh's granted() reads these lines at <sha>): the lead sets a `date -u` stamp,
 # e.g. GRANT_j1m = "2026-10-31T12:00:00Z", in a commit after the protocol review.
-GRANT_j1m = None
-GRANT_j1a = None
-GRANT_j1b = None
+GRANT_j1m = "2026-10-31T12:45:14Z"
+GRANT_j1a = "2026-10-31T12:45:14Z"
+GRANT_j1b = "2026-10-31T12:45:14Z"
 PRED_KEYS_J1 = ("J1_joint_saving", "J1_joint_ratio", "J1_draft_ratio", "J1_draft_saving", "J1_vs_ref", "J1_ratio",
                 "J1_eq", "J1_peak_gb", "J1_compile_s", "J1_sh_saving", "J1_vs_shj1",
                 "J3_joint_saving", "J3_draft_saving", "J3_commit_saving", "J3_reset_saving", "J3_vs_ref", "J3_vs_shj1")
@@ -94,7 +94,20 @@ PRED_KEYS_J1 = ("J1_joint_saving", "J1_joint_ratio", "J1_draft_ratio", "J1_draft
 # e4a; joint busy 195.7-198.9 of 207.5), so the saving is the exposed host time only: joint 0 .. 6.3 ms (BEST's non-busy
 # label, MODEL), draft 0 .. 2 x 3 ms, central 3 ms per round (C 128), 0 .. 3 (C 73: device-bound, non-busy about 0).
 # A saving below the run spread (0.3 %) is NOT a refutation of the frame: J1-RESID and EQF decide correctness.
-PRED_J1_BY_B = {216: {k: None for k in PRED_KEYS_J1}, 318: {k: None for k in PRED_KEYS_J1}}
+# THE LEAD'S REGISTRATION (2026-10-31T12:45:14Z, before any J1 GPU run; F1 + F2 from the builder's block above; SH steps
+# 63.0 ms at B 216 (1,000 x 216 / 3,426.2) and 123.5 ms at B 318 (SH about 2,574 tok/s = 1,699.0 / 0.660);
+# J1_vs_shj1 = J1_ratio x (SH step - J1_sh_saving) / SH step; J3 at C 128 only, the frame's central 3 ms of 0 .. 9).
+PRED_J1_BY_B = {
+    216: dict(J1_joint_saving=(9.5, 13.5), J1_joint_ratio=(0.927, 0.949), J1_draft_ratio=(0.953, 0.966),
+              J1_draft_saving=(4.5, 6.2), J1_vs_ref=(1.045, 1.065), J1_ratio=(0.580, 0.605), J1_eq=True,
+              J1_peak_gb=(83.85, 83.95), J1_compile_s=(0.5, 60.0), J1_sh_saving=(2.0, 3.2), J1_vs_shj1=(0.557, 0.580),
+              J3_joint_saving=(0.0, 6.3), J3_draft_saving=(0.0, 6.0), J3_commit_saving=None, J3_reset_saving=None,
+              J3_vs_ref=(0.995, 1.030), J3_vs_shj1=None),
+    318: dict(J1_joint_saving=(14.0, 18.5), J1_joint_ratio=(0.945, 0.959), J1_draft_ratio=(0.948, 0.960),
+              J1_draft_saving=(7.0, 9.2), J1_vs_ref=(1.042, 1.056), J1_ratio=(0.680, 0.705), J1_eq=True,
+              J1_peak_gb=(77.60, 77.80), J1_compile_s=(0.5, 60.0), J1_sh_saving=(3.4, 4.7), J1_vs_shj1=(0.662, 0.678),
+              J3_joint_saving=None, J3_draft_saving=None, J3_commit_saving=None, J3_reset_saving=None,
+              J3_vs_ref=None, J3_vs_shj1=None)}
 
 _CUR = dict(arm=None)
 DCC = None
