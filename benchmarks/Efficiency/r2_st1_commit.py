@@ -267,6 +267,15 @@ class TwinST2:
                 break
         if base is None:
             raise RuntimeError("ST2: no inherited _layer")
+        vr = None                                                      # the shipped verify_rows module: the first
+        for c in mro[mro.index(TwinST2) + 1:]:                         # inherited _layer whose module binds VR (INT:
+            f = c.__dict__.get("_layer")                               # a J1 base's _layer lives in a module without
+            if f is not None and "VR" in getattr(f, "__globals__", {}):   # it; spec_tentative.py:123 binds it)
+                vr = f.__globals__["VR"]
+                break
+        if vr is None:
+            raise RuntimeError("ST2: no inherited _layer whose module binds VR (verify_rows)")
+        self._st2_vr = vr
         f = getattr(self.rs.st.twins[0].step_unchecked, "func", None)
         adv = f.__globals__.get("advance_fused") if (f is not None and getattr(f, "__name__", "") == "step_fused") \
             else None
@@ -356,7 +365,7 @@ class TwinST2:
             if plan.R > 1:
                 self._st2["fallback"] += 1
             return base(self, l, layer, hidden, pos_flat, cos_sin_cache, plan)
-        VR = base.__globals__["VR"]
+        VR = self._st2_vr
         rs = self.rs
         NL, st, lin = rs.nl, rs.st, plan.lin
         B, R = self.B, plan.R

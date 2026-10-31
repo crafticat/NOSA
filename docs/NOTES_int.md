@@ -19,12 +19,15 @@ run eagerly; there is no keep J3 arm).
 ## 2. The two collisions (benchmarks/Efficiency/r2_int_arms.py)
 
 1. ST2 x F1: both rungs override TentState._layer with a full copy. `IntLayer._layer` = `TwinST2._layer` with 2 lines
-   marked "# INT": the shipped `VR = base.__globals__["VR"]` lookup becomes `VR = None` (the J1 state's module has no
-   global VR), and `VR._select_rows(plan.vs, layer, q, twin)` becomes `self._j1_select(plan.vs, layer, q, twin, l)`.
+   marked "# INT": ST2's `VR = self._st2_vr` becomes `VR = None` (the J1 selection needs no VR), and `VR._select_rows(plan.vs, layer, q, twin)` becomes `self._j1_select(plan.vs, layer, q, twin, l)`.
    The runner re-classes the state to (IntLayer, the ST state) after st1_runner's re-class; ST2's fallback (R 1, a
    record) stays the next `_layer` after TwinST2 (the J1 state's). CPU: test_int.py::test_int_layer_copy.
 2. ST1 x BF1: `bf.wrap_backend(T._st1["backend"])` after both setups (the commit capture holds BF1's capture lock and
    drains the gilfree transport first). CPU: test_int.py::test_int_lock (exactly one more locked capture).
+ST2's VR lookup (fix after the CPU run of b0d68a4: test_int_stacked raised KeyError 'VR' at r2_st1_commit.py:359,
+`base.__globals__["VR"]` with a J1 base, whose module binds no VR): `_st2_setup` now finds the shipped verify_rows
+module once, as the first inherited `_layer` whose module binds VR (spec_tentative.py:123), and `_layer` reads
+`self._st2_vr`. The module keeps its torch / time imports (test_st1 Gate 0 (e)); the ST arms' behavior is unchanged.
 Negative controls (tests only, `ineg`): "stacked" (no IntLayer; the run is the same, so EQF cannot see it; J1-COMPILE,
 J1-PEQ, INT-CLASSES, INT-LAYER catch it) and "nolock" (INT-LOCK catches it).
 Also: `r2_j1_select.j1_wrap / j3_wrap` (AREA 1 commit b4bd542, no behavior change) build J1 on any base classes.

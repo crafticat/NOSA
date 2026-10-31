@@ -141,7 +141,7 @@ def test_int_layer_copy():
     assert len(mine) == len(orig), (len(mine), len(orig))
     diff = [(a, b) for a, b in zip(mine, orig) if a != b]
     assert len(diff) == 2 and all("# INT" in a for a, _ in diff), diff
-    assert 'base.__globals__["VR"]' in diff[0][1] and diff[0][0].strip().startswith("VR = None"), diff[0]
+    assert diff[0][1].strip() == "VR = self._st2_vr" and diff[0][0].strip().startswith("VR = None"), diff[0]
     assert "VR._select_rows(plan.vs, layer, q, twin)" in diff[1][1], diff[1]
     assert "self._j1_select(plan.vs, layer, q, twin, l)" in diff[1][0], diff[1]
     assert sum("# INT" in x for x in mine) == 2
@@ -165,6 +165,7 @@ def test_int_classes():
         assert rec["layer_owner"] == "IntLayer" and rec["j3"] == (arm == "L4PTFDGUDCDI") and rec["ineg"] is None
         s = _make(arm, "timing", ineg="stacked")(*X.world(2, 8, 0)[:5])
         assert INTA.owner(type(s.T), "_layer") == "TwinST2"                                # the control: stacked
+        assert run.T._st2_vr is X.STF.VR and s.T._st2_vr is X.STF.VR      # ST2's VR: verify_rows, on a J1 base too
     with pytest.raises(INTA.IntError):
         INTA.int_runner(X.STF, "L4PTFDGUDCDI", ineg="nope")
     with pytest.raises(INTA.IntError):
