@@ -15,7 +15,7 @@ gate proves it for the probed arms).
 
 | file | what |
 |---|---|
-| `benchmarks/Efficiency/r2_recon7_protocol.py` | `PROTOCOL_STAMP_RECON7 = None`: every cell refuses (exit 20) and the step script STOPS every cell while it is None |
+| `benchmarks/Efficiency/r2_recon7_protocol.py` | the CELL GRANTS, default deny: one `GRANT_<cell>` line per cell (e.g. `GRANT_r7s`) and the granted argument PROFILE of each cell; a cell refuses (exit 20) and the step script STOPS it unless its own line holds a `date -u` stamp (replaces the one-for-all stamp of 8d7dab8 .. 028a5ec) |
 | `benchmarks/Efficiency/r2_recon7_probe.py` | cell (a)'s probe `ProbeR7`, the counters (GatherTap, SkipRecord, UnionReader), the drain-free probe statistic, the pure records and gates |
 | `benchmarks/Efficiency/r2_recon7_cell.py` | cell (a): the profiler-window cell of the best arms |
 | `benchmarks/Efficiency/r2_recon7_streams.py` | cell (b): the two-stream concurrency harness (R2 D1) |
@@ -42,93 +42,112 @@ gate proves it for the probed arms).
 Not built here: R2 D2 (ncu on one fork launch: a tool run, not a cell), R2 D4 (a CPU read of job 2175791), R3 D1b (the
 ladder at C 81 B 287: an arm run after r7mem shows the fit).
 
-## X1 protocol (about 5 min)
+## X1 protocol (repaired after review 3, 2026-10-31)
 
-The SMALLEST discriminator, asked for before anything else. X1 = step cell `r7s` = `benchmarks/Efficiency/r2_recon7_streams.py`.
-No model, no arm, one GPU step of about 5 min (hard wall 15 min). Only this cell is proposed here; the rest of section 3
-is NOT asked for.
+The SMALLEST discriminator. X1 = step cell `r7s` = `benchmarks/Efficiency/r2_recon7_streams.py`. No model, no workload,
+no arm; one GPU step (hard wall STEP_MIN 20 min, of it the image hash on the GPU node). Grant: `GRANT_r7s` only (default
+deny: every other cell stays refused by the wrapper and by its Python main).
 
-### X1.1 The two questions
+Review 3 (2026-10-31) findings and their repair in this section and in the code:
+
+| finding | repair (code) | CPU check (tests_cpu/test_recon7.py) |
+|---|---|---|
+| 1 one stamp unlocked all five cells | `r2_recon7_protocol.py`: one `GRANT_<cell>` line per cell, default deny; `refusal(cell, module, args)` checks the cell, its module and its granted PROFILE; the wrapper's `granted()` greps one fixed pattern per cell | test_protocol_state; test_step_script_recon7 (planted protocol texts: an r7s grant refuses r7pm / r7pa / r7pb / r7mem; malformed / missing grants refuse); test_recon7_cell_pure, test_mem_pure |
+| 2 group bit equality was REPORT only; failures continued to the next shape; the deadline covered the timed passes only; BUDGET was not the true wall; decisions printed under failed MUST gates | `<shape>-GRP-EQ` DECISION GATE governs GRP / GRPL (INELIGIBLE otherwise); `run_shapes()` STOPS THE RUN on free memory, UNION, IDS, EXACT, deadline, exception; the deadline from the shape's start (setup, references, warm-up, passes); BUDGET = the wall from the start to the last gate; RUN-WALL; any failed MUST gate SUPPRESSES every decision | test_streams_run_shapes, test_streams_measure_plumbing, test_streams_pure |
+| 3 the buffers do not carry the joint pass's dependencies | mode (b) renamed the ORDERED SYNTHETIC SCHEDULING SCREEN; PF renamed CPY (copy interference: an own buffer, never read); no "attainable", "prefetch hides" or "dependency" claim | test_streams_pure (docstring words present, retracted words absent); test_notes_recon7 |
+| 4 A|F|M was judged against the isolated sum while SER ran A + F + G; a 5 % control discrepancy only printed "suspect"; the weight reads were stated as twice / four times 474 MB per layer | a same-ops serial control X-SER for every concurrent set (26 configurations); SERIAL judged against X-SER; isolated maxima an IDEALIZED reference; a control more than 5 % from its independent sum INVALIDATES the conclusion; every timed and warm-up pass kept with n, quartiles, cv; 474 / 948 MB | test_streams_pure (planted medians: consistent, 6 % INVALID, 4 % valid, SERIAL vs the matched control) |
+| 5 image sha256 declared, not checked; login-side hashing through PATH; model / workload prerequisites for r7s; output limit an estimate | the wrapper hashes nothing (cmp against `git show`); the CHILD hashes the image (and the workload of the cells that read it) with `/usr/bin/sha256sum` on the GPU node before the image starts (exit 6); r7s has no model / workload check; OUT_MB 60 enforced per file (`ulimit -f`) and in total (`du -sb`, exit 7, evidence kept) | test_step_script_recon7 (no hasher outside CHILD; CHILD order; DRYRUN of every cell) |
+
+### X1.1 What the cell measures
 
 (a) HARDWARE CONCURRENCY CAPABILITY: can independent dense GEMM work (A = Aq + Ar), the fork attention (F), the zero-copy
-H2D gather kernels (G) and a copy-engine H2D (M) run at the same time on this A100 at our shapes? Configurations: alone A,
-F, G, M, P, FG; serial SER; concurrent A|F, A|G, A|M, F|M, A|FG, A|F|M (no dependency between the streams).
+H2D gathers (G) and a copy-engine H2D (M) run at the same time on this A100 at our shapes? Alone: A, F, G, M, FG, P.
+Concurrent (independent streams): A|F, A|G, A|M, F|M, A|FG, A|F|M. MATCHED controls: X-SER = the same ops of X serial
+on one stream in the same pass (A|F|M-SER = Aq, Ar, F, M). The isolated maxima are an IDEALIZED reference only.
 
-(b) ATTAINABLE END-TO-END OVERLAP under the joint pass's REAL dependencies. Inside a layer QKV -> (selection) -> fetch
--> attention -> MLP depend on each other and do NOT overlap; the same rows' next layer depends on this layer's output and
-does NOT overlap either. Only these LEGAL PAIRS overlap, each against a MATCHED CONTROL (the same ops, serial, one
-stream, the same inputs):
+(b) ORDERED SYNTHETIC SCHEDULING SCREEN: the joint pass's per-layer CALL ORDER Aq, G, F, Ar on synthetic, INDEPENDENT
+inputs. F does not read G's destinations or Aq's output; Ar does not read F's output. This is an ordered-call screen and
+a copy-interference test. It is NOT an end-to-end dependency validation, NOT a useful-prefetch result, NOT an achieved
+bound of the production joint pass. Producer / consumer and reader / DMA lifetime validation is a separate test that is
+not built.
 
-| schedule | streams (per layer, in this order) | matched control | buffer lifetimes (what the two sides share) | work counted once? |
+| schedule | streams (per layer, in this order) | matched control | scope | work counted once? |
 |---|---|---|---|---|
-| GRP | stream 1: Aq0, G0, F0, Ar0 (requests 0 .. B/2 - 1); stream 2: Aq1, G1, F1, Ar1 (requests B/2 .. B - 1) | GRP-SER: Aq0 .. Ar0, Aq1 .. Ar1 on one stream | group g's rows of x / q / k / v, its fork lists and union tables, its gather destinations: written and read by group g's stream only, from its QKV GEMM to its MLP output; shared READ-ONLY: the weights, the KV arena (disjoint pages per request), the pinned host KV (disjoint requests) | NO: each group's GEMMs read all the weights (4 x 474 MB per layer pair instead of 2 x): the split cost = GRP-SER - SER, reported; the NET = SER - GRP counts the shared weight reads once |
-| GRPL | as GRP, both streams join after every layer (lock-step) | GRP-SER | as GRP | as GRP |
-| PF | stream 1: the full chain Aq, G, F, Ar; stream 2: P = a NEXT-round prefetch of the same bytes as G (copy engine) | PF-SER: Aq, G, F, Ar, P on one stream | P's pinned staging and its device buffer: written during layer l of round t, first read by the joint pass of round t + 1; never read or written by this pass's chain (own allocation: no read-after-write or write-after-read hazard) | yes (P is extra transfer, not shared) |
-| WINF | window attention beside the selected-block fetch | - | window pages (resident, read) vs store slots (written): disjoint | NOT MEASURED: the shipped fork's 2D launch writes the normalised output only (no log-sum-exp, fork :1060-1063), so a window part cannot be merged with a fetched part without a kernel change or a not-bit-equal split |
-
-The drafts' fetch beside the joint pass's dense work (the reviewer's third example) IS schedule PF: the draft rows'
-misses are fetched for the NEXT round while this round's chain runs. Selection, the residency, the twin step and the norms
-are NOT replayed: (b) bounds the overlap of the replayed parts only.
+| GRP | stream 1: Aq0, G0, F0, Ar0 (requests 0 .. B/2 - 1); stream 2: Aq1, G1, F1, Ar1 (requests B/2 .. B - 1) | GRP-SER (consistency: GRP0 + GRP1) | each group's outputs, lists, tables and destinations are its own; shared read-only: weights, arena, pinned host KV. ELIGIBLE for a claim only when GRP-EQ passes (the groups' outputs = the full batch's, bit for bit: the request-neighbour invariant) | NO: the full batch reads the weights once per layer (nominal 474 MB = 473,956,352 B in bf16), the two halves read them twice (948 MB); the split cost = GRP-SER - SER, MEASURED; the net = SER - GRP |
+| GRPL | as GRP, both streams join after every layer | GRP-SER | as GRP | as GRP |
+| CPY | stream 1: Aq, G, F, Ar; stream 2: P = a copy-engine copy of the current pass's NEW-block byte count into its own device buffer, overwritten every layer, never read | CPY-SER (consistency: SER + P) | copy interference beside the ordered calls; not a prefetch (nothing consumes P) | yes (P is extra transfer) |
+| WINF | window attention beside the selected-block fetch | - | - | NOT MEASURED: the shipped fork's 2D launch writes no log-sum-exp (fork :1060-1063) |
 
 ### X1.2 What each mode can and cannot show
 
-- (a) CAN show whether the GPU runs these kernels and the copy engine concurrently at our shapes (SM sharing between a
-  compute-bound GEMM and a memory-bound fork / gather; copy-engine bandwidth beside kernels; the interference A|M
-  against the model's s = 8.685 %). It CANNOT show any overlap INSIDE one kernel (e.g. a fork that overlaps its own page
-  loads with its math is invisible to stream concurrency), and it CANNOT say whether the joint pass can use the
-  overlap: its streams have no data dependency (an UPPER BOUND).
-- (b) CAN show the overlap that the named legal schedules get with the real per-layer order, the real request-group
-  independence and the measured byte volumes, and their costs (the groups' doubled weight reads). It CANNOT show the
-  cost of the parts it does not replay (selection, residency, twin, norms, graph launches), the real miss pattern
-  (synthetic ids, uniform per (KV head, request)), skew between groups, WINF, or a schedule not listed.
-- Neither mode measures the model's max(HBM, dense) directly: (a) bounds what the hardware allows; (b) bounds what the
-  listed schedules attain.
+- (a) CAN show whether the GPU runs these kernels and the copy engine concurrently at our shapes, against the same ops in
+  series, and the copy-engine interference A|M against the model's s = 8.685 %. It CANNOT show overlap INSIDE one
+  kernel, and it CANNOT say whether the joint pass can use the overlap (no data dependency between its streams).
+- (b) CAN show what the listed ordered-call schedules do on synthetic independent inputs of the measured volumes, with
+  their measured costs (the groups' second weight read). It CANNOT validate producer / consumer dependencies, buffer
+  lifetimes against a DMA, a useful prefetch, the unreplayed parts (selection, residency, twin, norms, graph launches),
+  the real miss pattern, group skew, WINF, or any schedule not listed.
+- Neither mode measures the model's max(HBM, dense). A SERIAL result in these schedules does NOT falsify every route to
+  it: intra-kernel overlap, fused kernels, other groupings and other launch configurations stay open.
 
 ### X1.3 Pins
 
 | pin | value |
 |---|---|
-| repository | crafticat/NOSA (git remote `fork` of `/mnt/beegfs/ojerbi/nosi-r2-recon7`), branch `r2-recon7`; NOT pushed by the builder (no push in this role) |
-| code commit | `3432876b13fd995a7a56c6e22d3346fb2271ba66` (parent `8d7dab89d0df8d5298805626275e52ef0530c1a9`) |
-| run commit (`--nosi`) | the APPROVER's stamp commit S on top of the commit that adds this section; precondition: `git -C /mnt/beegfs/ojerbi/nosi-r2-recon7 diff --name-only 3432876b13fd995a7a56c6e22d3346fb2271ba66 S -- nosi ':(glob)benchmarks/Efficiency/*.py' ':(glob)benchmarks/Efficiency/*.sh'` lists only `benchmarks/Efficiency/r2_recon7_protocol.py`, and that file's diff is the one stamp line (the commits after the code commit change only docs/ and tests_cpu/) |
-| step script | `benchmarks/Efficiency/r2_recon7_step.sh` sha256 `398d9b03b8109f7ef9192a0fa117f51a57d11cef185a77f78ab37577ff6137df`, git blob `ccacbdcd9d846e269e13d8d0224e6f41f8d5f0fb` (the script refuses to run unless it is that blob at S) |
-| cell | `benchmarks/Efficiency/r2_recon7_streams.py` sha256 `2fe8eacea913061a6ee67d4e8cbc8ed5f6191708663e23352064aa1cda06e6d5`, blob `bda689962157cb1a4c057b9c4c322960c8e74520` |
+| repository | crafticat/NOSA (git remote `fork` of `/mnt/beegfs/ojerbi/nosi-r2-recon7`), branch `r2-recon7` |
+| code commit | `CODE_COMMIT_PENDING` (the repaired code; parent `028a5ecf1de346f527f38393c55b1e79ea367569`) |
+| run commit (`--nosi`) | the grant commit S; precondition: `git -C /mnt/beegfs/ojerbi/nosi-r2-recon7 diff --name-only <code commit> S -- nosi ':(glob)benchmarks/Efficiency/*.py' ':(glob)benchmarks/Efficiency/*.sh'` lists only `benchmarks/Efficiency/r2_recon7_protocol.py`, and that file's diff is the one line `GRANT_r7s = "<date -u stamp>"` |
+| step script | `benchmarks/Efficiency/r2_recon7_step.sh` STEP_PINS_PENDING (the script refuses to run unless its bytes are that file at S: cmp against `git show`) |
+| cell | `benchmarks/Efficiency/r2_recon7_streams.py` CELL_PINS_PENDING |
 | fork kernel | `benchmarks/Efficiency/fork_vllm_unified_attention.py` blob `f0dc0c183a388585e216505a6bbfc696531e8add` (fia6; sha256 `2fdbd75c4e7a6bf07ca543a3fc6a38c921e7e92ddf41f0147a765250ba80d07c`; the step script checks the blob) |
 | gathers | `nosi/nosi/flash_cache_engine/flash_h2d_mask.py` blob `f76b4f61b754adcc7cdc8eaeb22e1e96c0b74b0d`, `flash_h2d_mask_bias.py` blob `1e3630b87b84c658115aa1bd25c69c5afb03aa0e` |
-| image | `/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif` sha256 `14bfb15e1258821e637b5936f2060d7c7c2be20410fdee2a54ee0ffef754734a` |
-| shapes | C 128: B 216, E = 4 B = 864 rows; C 73: B 318, E = 1,272 rows (run in this order); GEMMs wqkv 4608 x 4096, wo 4096 x 4096, gate_up 32768 x 4096, down 4096 x 16384 (bf16); fork: Hq 32, Hkv 2, D 128, 4 rows per request, 64 pages per row, row shifts (0, 3, 5, 8), union 72, last_len 40 + r, FORK_LAUNCH num_warps 4, num_stages 3, tile_size 64; gathers: 1.226 / 5.0 NEW blocks per (layer, KV head, request) (MEASURED kv_at_verify, RECON7_R2_joint.md section 2.1) = 530 / 3,180 per layer (window 265 / 1,590, store 265 / 1,590), 17,434,880 / 104,609,280 B per layer; 16 host blocks per request; groups: requests [0, B/2) and [B/2, B) |
+| image | `/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif` (23,079,374,848 B) sha256 `14bfb15e1258821e637b5936f2060d7c7c2be20410fdee2a54ee0ffef754734a` (the record `/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif.sha256`, 2026-09-03); CHECKED inside the step on the GPU node by `/usr/bin/sha256sum` before the image starts (exit 6 on a mismatch) |
+| shapes | C 128: B 216, E = 4 B = 864 rows; C 73: B 318, E = 1,272 rows (run in this order); GEMMs wqkv 4608 x 4096, wo 4096 x 4096, gate_up 32768 x 4096, down 4096 x 16384 (bf16; 473,956,352 B of weights per layer); fork: Hq 32, Hkv 2, D 128, 4 rows per request, 64 pages per row, row shifts (0, 3, 5, 8), union 72, last_len 40 + r, FORK_LAUNCH num_warps 4, num_stages 3, tile_size 64; gathers: 1.226 / 5.0 NEW blocks per (layer, KV head, request) (MEASURED kv_at_verify, RECON7_R2_joint.md section 2.1) = 530 / 3,180 per layer (window 265 / 1,590, store 265 / 1,590), 17,434,880 / 104,609,280 B per layer; 16 host blocks per request; groups: requests [0, B/2) and [B/2, B) |
 | seeds | `--seed 7`; shape seed = 7 + C (135 for C 128, 80 for C 73); ids seeds shape seed + 1 .. + 4; inputs: torch CPU generator, N(0, 1) x 0.05 in bf16 |
-| passes | 32 layers per pass; 2 warm-up passes of every configuration, then 10 ORDER-ROTATED passes (pass r starts at configuration r mod 18; lesson L62) |
+| passes | 32 layers per pass; 26 configurations; 2 warm-up passes of each, then 10 ORDER-ROTATED passes (pass r starts at configuration r mod 26; lesson L62); every pass kept |
 
 ### X1.4 Command and resources
 
 ```
 cd /mnt/beegfs/ojerbi/nosi-r2-recon7
-DRYRUN=1 bash benchmarks/Efficiency/r2_recon7_step.sh --nosi <S> 2195630 x1a r7s     # pins + the command; no launch
-bash benchmarks/Efficiency/r2_recon7_step.sh --nosi <S> 2195630 x1a r7s
+DRYRUN=1 bash benchmarks/Efficiency/r2_recon7_step.sh --nosi <S> 2195630 <run id> r7s     # pins + the command
+bash benchmarks/Efficiency/r2_recon7_step.sh --nosi <S> 2195630 <run id> r7s
 ```
 
-The step expands to `srun --jobid=2195630 --job-name=recon7-r7s-x1a-2195630 --ntasks=1 --cpus-per-task=16 --mem=64G
---gres=gpu:a100:1 --time=15 --export=NONE` (inside `timeout 960`), apptainer with the pinned image, and
-`/venv/nosa/bin/python <tree>/benchmarks/Efficiency/r2_recon7_streams.py --out
-/mnt/beegfs/ojerbi/r2-runs/spec/recon7_x1a_2195630_r7s --shapes 128:216,73:318 --new-blocks 128:1.226,73:5.0
---union-pages 72 --win-share 0.5 --layers 32 --reps 10 --warmup 2 --seed 7 --max-shape-s 240`.
+The step expands to `srun --jobid=2195630 --job-name=recon7-r7s-<run id>-2195630 --ntasks=1 --cpus-per-task=16
+--mem=64G --gres=gpu:a100:1 --time=20 --export=NONE` (inside `timeout 1260`), the CHILD on the GPU node (one GPU, the
+uuid, the image sha256, `ulimit -f 61440`), apptainer with the pinned image, and `/venv/nosa/bin/python
+<tree>/benchmarks/Efficiency/r2_recon7_streams.py --out /mnt/beegfs/ojerbi/r2-runs/spec/recon7_<run id>_2195630_r7s
+--cell r7s --shapes 128:216,73:318 --new-blocks 128:1.226,73:5.0 --union-pages 72 --win-share 0.5 --layers 32 --reps 10
+--warmup 2 --seed 7 --max-shape-s 240 --max-run-s 600`.
 
-- GPU: ONE A100, holder SLURM job 2195630 (nova05, GPU uuid f31fc723-9dfe-407a-9947-28173556232a from
-  `/mnt/beegfs/ojerbi/kstep-cpu-runs/holders/2195630.gpu_uuid`). (2195631 on nova07 is the other holder; X1 does not
-  use it.) The step script checks the visible GPU uuid and needs at least STEP_MIN x 60 + 600 = 1,500 s left on the holder.
-- Hard wall time: STEP_MIN 15 (srun --time=15; host timeout 960 s); each shape stops itself at 240 s.
-- Device memory (MODEL, `need_bytes`): 13.9 GB (C 128) and 19.8 GB (C 73), one shape at a time; the cell stops a
-  shape when free memory is below it. Host: 16 cpus, 64G; pinned host buffers below 0.6 GB.
-- Output bound (MODEL, at most 60 MB): `/mnt/beegfs/ojerbi/r2-runs/spec/recon7_x1a_2195630_r7s/summary.json` (2 shapes x
-  18 configurations x 10 passes plus the meta: below 0.2 MB); the step record `.../recon7_x1a_2195630_r7s.step/`
-  (command, stdout, stderr, exit, sacct: below 1 MB); the cold Triton cache of the fork and the two gather kernels in
-  `/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_jit/recon7_x1a_2195630_r7s/` (below 50 MB); the empty JIT directory
-  `/mnt/beegfs/ojerbi/nosa-env/jit/recon7_x1a_2195630_r7s/`. Nothing else is written.
+- GPU: ONE A100 in the EXISTING holder SLURM job 2195630 (nova05, GPU uuid f31fc723-9dfe-407a-9947-28173556232a from
+  `/mnt/beegfs/ojerbi/kstep-cpu-runs/holders/2195630.gpu_uuid`). No new allocation, renewal or replacement.
+- Holder availability is checked FRESHLY by the wrapper at the launch: `squeue -j` (owner, RUNNING, time left >= STEP_MIN
+  x 60 + 600 = 1,800 s), no running step (`squeue -s`, before and after the claim), the atomic claim directory
+  `/mnt/beegfs/ojerbi/r2-runs/spec/sp_active_2195630`, new output / record / cache paths. A read at 2026-10-31T11:08:12Z
+  (`date -u`): 2195630 and 2195631 RUNNING since 2026-10-30T13:58Z, 14:49:38 left each, no step; 2197383 / 2197384
+  PENDING (Dependency). The packet's "idle since 11:04Z" (README of 028a5ec) was stale and wrong for these jobs (they
+  started at 13:58Z); this read replaces it.
+- Hard wall time: STEP_MIN 20 (srun --time=20; host timeout 1,260 s); each shape stops at 240 s from its start, the run
+  at 600 s. MODEL duration: the image hash 1 - 4 min (23 GB from beegfs); per shape about 6 s per rotation of the 26
+  configurations at C 73 (the sum of the expected pass times) x 12 + references and compile: below 150 s.
+- Device memory (MODEL, `need_bytes`): 13.9 GB (C 128) and 19.8 GB (C 73), one shape at a time. Host: 16 cpus, 64G;
+  pinned host buffers below 0.6 GB.
 
-### X1.5 Duplicate-work evidence
+### X1.5 Output limit
 
-No earlier run of this harness exists (checked 2026-10-30T18:47Z, `date -u`): `ls` of every directory under
+OUT_MB 60 for r7s, ENFORCED: per file by `ulimit -f 61440` (KB) on both sides (srun's stdout / stderr written on the
+login side; every file the child writes on the GPU node: summary.json, the Triton cache files); in total by `du -sb` of
+`/mnt/beegfs/ojerbi/r2-runs/spec/recon7_<run id>_2195630_r7s`, its `.step` record, `/mnt/beegfs/ojerbi/nosa-env/jit/recon7_<run id>_2195630_r7s`
+and `/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_jit/recon7_<run id>_2195630_r7s` after the step, written to the
+record's exit.txt; above the limit the step exits 7 and keeps every file. MODEL: summary.json below 1 MB (2 shapes x 26
+configurations x 12 passes), the record below 1 MB, the cold Triton cache below 50 MB.
+
+### X1.6 Duplicate-work evidence
+
+No earlier run of this harness exists (checked 2026-10-30T18:47Z, `date -u`; re-checked by the wrapper at the launch:
+the output, record and cache paths of the run id must not exist): `ls` of every directory under
 `/mnt/beegfs/ojerbi/r2-runs/` (41 directories), filtered for recon7 / stream / concur / x1 / r7s: 16 names (8 runs
 with their `.step` records) matched, all run ids of other cells (`sg5_x1_2190876_x1` launched `r2_tick_sg5.py`;
 `sp_x13b`, `sp_x1m` launched `r2_spec_cell.py`; `sp_x173_*`, `mbs_o2x128_*` launched `r2_base_cell.py`: the
@@ -137,38 +156,45 @@ recon7 */*.step/command.txt` under `/mnt/beegfs/ojerbi/r2-runs`: 0 files (no ste
 file). The R2 traces (one
 dependent stream: 0.000 ms concurrency) cannot answer either question.
 
-### X1.6 MUST gates, decision rules, falsifiers, stop criteria (fixed before the run)
+### X1.7 Gates, decision rules, falsifiers, STOP THE RUN (fixed before the run)
 
-MUST GATES (any failure: decide nothing from the run): `<shape>-UNION` (the fork's union_len = 72 at every (KV head,
-request), full batch and both groups); `<shape>-IDS` (the NEW blocks per layer as above); `<shape>-<config>-EXACT` for
-all 18 configurations (every part's output bits after the configuration's last pass = that part's reference run alone:
-concurrent = matched serial control = alone, bit for bit); `<shape>-BUDGET` (the shape finished inside 240 s);
-`<shape>-RUN`.
-MATCHED CONTROLS: SER for (a)'s sums; GRP-SER for GRP and GRPL; PF-SER for PF; the same ops, inputs and process,
-order-rotated (pass r starts at configuration r mod 18).
-DECISION RULES (REPORT values, the rule fixed now):
-- (a) REACHABLE when T(A|F|M) <= 1.10 x max(A, F, M); SERIAL when T(A|F|M) >= 0.90 x (A + F + M); PARTIAL otherwise
-  (eff = (sum - T) / (sum - max) printed for every concurrent set).
-- (b) GRP / GRPL WORTH BUILDING when the NET saving (SER - T) >= 5 % of SER (the shared weight reads counted once);
-  PF HIDES THE TRANSFER when hidden = (SER + P - PF) / P >= 0.80 and the chain slowdown PF / SER - 1 <= 5 %.
-FALSIFIERS: (a) SERIAL at both shapes falsifies "the max() overlap exists on this hardware for these kernels" (the
-model's max(HBM, dense) is then not reachable by concurrency); (a) REACHABLE with (b) GRP and PF both not worth building
-falsifies "the gap is a scheduling question for these pairs" (the overlap exists but the dependencies do not let these
-schedules use it); a control that is not about the sum of its parts (GRP-SER vs Aq0 .. Ar1 alone; PF-SER vs SER + P
-within 5 %) makes that schedule's numbers suspect (reported).
-STOP CRITERIA (the cell aborts the rest of the shape and the run, the record says why): free device memory below the
-need; UNION or IDS failure (before any timing); an EXACT failure; the shape's wall clock above 240 s; an exception. The
-step script aborts before the launch on any pin mismatch, a busy holder, less than 1,500 s left, or the stamp None.
+MUST GATES (any failure: every decision of the run is printed as SUPPRESSED; the timings stay in the record): `<shape>-UNION` (the
+fork's union_len = 72 at every (KV head, request), full batch and both groups); `<shape>-IDS` (the NEW blocks per layer
+as above); `<shape>-<config>-EXACT` for all 26 configurations (every part's output bits after the configuration's last
+pass = that part's reference run alone); `<shape>-BUDGET` (the TRUE wall from the shape's start, setup included, to its
+last gate <= 240 s); `<shape>-RUN`; `RUN-WALL` (the run's wall <= 600 s).
+DECISION GATE: `<shape>-GRP-EQ` (the groups' outputs, concatenated by request, = the full batch's, bit for bit, for Aq,
+Ar, F, G: the request-neighbour invariant). It governs the GRP / GRPL claim only (INELIGIBLE when it fails).
+MATCHED CONTROLS: X-SER for every concurrent set X (the same ops, one stream); GRP-SER for GRP and GRPL; CPY-SER for CPY.
+CONSISTENCY: each control within 5 % of its independent sum (X-SER: the parts alone; GRP-SER: GRP0 + GRP1; CPY-SER:
+SER + P); otherwise its conclusion is INVALID (not "suspect").
+DECISION RULES (the values are REPORT; the rules fixed now):
+- (a) REACHABLE when T(A|F|M) <= 1.10 x max(A, F, M) (the isolated maxima: an IDEALIZED reference); SERIAL when
+  T(A|F|M) >= 0.90 x T(A|F|M-SER) (the MATCHED control); PARTIAL otherwise; eff_matched = (control - T) / (control - max)
+  printed for every concurrent set. Interference A|M = T(A|M) / max(A, M) - 1 against the model's s = 8.685 %.
+- (b) GRP / GRPL: SCREEN SAVING when eligible (GRP-EQ), GRP-SER consistent, and the net (SER - T) >= 5 % of SER (the
+  weights read once in SER, twice in the groups). CPY: COPY ABSORBED when (SER + P - CPY) / P >= 0.80 and CPY / SER - 1
+  <= 5 % (copy interference only; nothing consumes P).
+FALSIFIERS: (a) SERIAL at both shapes falsifies "independent streams of these kernels at these launch configurations
+overlap on this A100"; it does NOT falsify the model's max(HBM, dense) through intra-kernel overlap, fused kernels, other
+groupings or other launch configurations. (a) REACHABLE with (b) GRP NO SCREEN SAVING or INELIGIBLE: stream overlap
+exists, but this request-group split of the ordered synthetic calls does not use it (nothing about producer / consumer
+dependencies follows). CPY NOT ABSORBED: a copy-engine copy of this byte count is not hidden beside the ordered calls or
+slows them by more than 5 %.
+STOP THE RUN (no later shape; the record says why): free device memory below the need; a UNION or IDS failure (before
+any timing); an EXACT failure; the shape's deadline passed in setup, references, warm-up or timing; an exception. The
+step script stops before the launch on any pin mismatch, a busy or ending holder (less than 1,800 s left), an existing
+claim or path, or a missing grant; the child stops (exit 6) on an image sha256 mismatch on the GPU node.
 
-### X1.7 What the result can and cannot decide
+### X1.8 What the result can and cannot decide
 
-- CAN decide: whether hardware concurrency for these kernels exists at our shapes (R2 D1, first half); for GRP / GRPL /
-  PF, whether that schedule is worth building on the replayed parts; whether copy-engine H2D beside the chain costs more
-  than the model's 8.685 %.
-- CANNOT decide: the end-to-end speedup of the joint pass (the unreplayed parts and the real misses are missing); any
-  intra-kernel overlap; WINF; whether the model's other assumptions hold; anything about the drafts' compute.
+- CAN decide: whether stream-level concurrency of these kernels and the copy engine exists at our shapes, against the
+  same ops in series (R2 D1, first half); the copy-engine interference against the model's 8.685 %; whether the
+  request-group split of the ordered synthetic calls saves time and whether its outputs stay bit-equal.
+- CANNOT decide: the end-to-end speedup of the joint pass, any producer / consumer or DMA-lifetime property, a useful
+  prefetch, any intra-kernel overlap, WINF, the unreplayed parts, anything about the drafts' compute.
 
-## 3. THE GPU PROTOCOL (for review; nothing runs before the human sets PROTOCOL_STAMP_RECON7)
+## 3. THE GPU PROTOCOL of the other cells (r7pm, r7pa, r7pb, r7mem: NOT GRANTED; each needs its own GRANT line)
 
 Each subsection states what the run decides, its expected duration (STEP_MIN and its basis), its gates and its
 falsifier. Order: r7pm first (its MUST gates decide whether r7pa / r7pb run); r7s and r7mem are independent of (a) and of each
@@ -176,7 +202,7 @@ other. One holder, the shared claim `OUTROOT/sp_active_<holder>` (one step at a 
 A100 (10.5 + 60.5 + 91 + 5 + 35 min); the sum of the STEP_MIN limits is 390 min.
 
 Command form: `bash benchmarks/Efficiency/r2_recon7_step.sh --nosi <sha> <holder job> <run id> <cell>` from the tree at
-`<sha>`. DRYRUN=1 prints the pins and the command and then STOPS on the stamp like a real launch.
+`<sha>`. DRYRUN=1 prints the pins and the command and then STOPS on a missing grant like a real launch.
 
 ### 3.1 Cell (a): r7pm, r7pa, r7pb (`r2_recon7_cell.py`)
 
@@ -250,7 +276,7 @@ the steady set.
 ### 3.2 Cell (b): r7s (`r2_recon7_streams.py`)
 
 SUPERSEDED for the run by section "X1 protocol (about 5 min)" above (the refined cell: capability and attainable
-overlap, matched controls, order rotation, STEP_MIN 15, --reps 10 --warmup 2). The text below is the first version's
+screen, matched controls, order rotation, --reps 10 --warmup 2; repaired after review 3). The text below is the first version's
 summary, kept for the record.
 
 Parts (one layer; replayed 32 times = one pass; synthetic inputs of the MEASURED shapes, C 128 B 216 and C 73 B 318):
@@ -326,7 +352,7 @@ nosi, no kernel, nobody else names the modules); the line-for-line copies (`run_
 inherited gate, the windows on the replay path, the labels, the counted pass's counters close: the tap's NEW blocks =
 the meter's); the probe gates and their plants; a probe that computes is CAUGHT by PEQ; the statistic fix; the counters
 on planted tensors; the streams harness (lists, ids, the decision rule, the plumbing with an EXACT plant); the memory
-cell (the tap, the fit, the arguments); the cell's arguments; the protocol stamp; the step script (refusals, DRYRUN, the
+cell (the tap, the fit, the arguments); the cell's arguments; the cell grants; the step script (refusals, DRYRUN, the
 STOP); these notes. The older Gate-0 tests run with `-k gate0`.
 
 ## 7. Risks

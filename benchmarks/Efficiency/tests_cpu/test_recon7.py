@@ -22,9 +22,12 @@ FIX       test_probe_statistic_fix: R2's measured C 73 probe joints (section 3.5
           old median 374.6 is biased by -16.4 ms against the drain-free 391.0; the CPU run's drain rounds = an independent
           derivation from the runner's host counts.
 COUNTERS  test_skip_flags_synthetic: SkipRecord + GatherTap on planted skips and gathers (flagA, flagB, store, range).
-STREAMS   test_streams_pure, test_streams_measure_plumbing (CPU stand-ins; the EXACT plant).
+STREAMS   test_streams_pure (matched controls, consistency, eligibility, suppression), test_streams_measure_plumbing
+          (CPU stand-ins; the EXACT plant; the deadline in every phase), test_streams_run_shapes (every failure STOPS
+          THE RUN; the true BUDGET; GRP-EQ).
 MEM       test_mem_pure (the occupancy tap, the fit, the arguments).
-CELL      test_recon7_cell_pure, test_protocol_state, test_step_script_recon7, test_notes_recon7.
+CELL      test_recon7_cell_pure, test_protocol_state (the cell grants, default deny), test_step_script_recon7 (granted()
+          on planted texts, the hashing boundary, DRYRUN), test_notes_recon7.
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rfEs benchmarks/Efficiency/tests_cpu/test_recon7.py
 """
@@ -478,49 +481,84 @@ def test_streams_pure():
     assert torch.equal(sl["page_key"], k[8:16]) and bool((S.union_count(sl, 2, 2) == 72).all())
     cfg = {c[0]: c for c in S.CONFIGS}
     assert S.BLOCK_BYTES == 32896 and cfg["SER"][2] == [["Aq", "G", "F", "Ar"]] and cfg["SER"][1] == "c"
-    for c, ctl in S.CONTROL_OF.items():                                # every legal schedule has its matched control
+    assert S.WEIGHT_BYTES == 473956352                                 # review 3: 474 MB per layer, 948 MB for 2 halves
+    assert len(S.CONFIGS) == len(cfg) == 26
+    for c, ctl in S.CONTROL_OF.items():                                # EVERY decision has a same-ops serial control
         ops = sorted(p for seq in cfg[c][2] for p in seq)
         assert cfg[ctl][1] == "c" and len(cfg[ctl][2]) == 1 and sorted(cfg[ctl][2][0]) == ops, (c, ctl)
+    assert set(S.CONTROL_OF) == set(S.CONCURRENT) | {"GRP", "GRPL", "CPY"}
+    assert sorted(cfg["A|F|M-SER"][2][0]) == sorted(["Aq", "Ar", "F", "M"]) != sorted(cfg["SER"][2][0])   # review 3 (4)
+    for ctl, xs in S.CONTROL_SUM.items():                              # the independent sums: the same ops again
+        assert sorted(p for x in xs for seq in cfg[x][2] for p in seq) == sorted(cfg[ctl][2][0]), ctl
     assert cfg["GRPL"][3] is True and cfg["GRP"][3] is False and cfg["GRP"][2] == [S.CHAIN0, S.CHAIN1]
-    for c in ("GRP", "GRPL", "PF"):                                    # no two parts of one layer's chain overlap
+    for c in ("GRP", "GRPL", "CPY"):                                   # the ordered calls stay in order per stream
         lists_ = cfg[c][2]
         assert any(seq == S.CHAIN or seq in (S.CHAIN0, S.CHAIN1) for seq in lists_) and all(
             set(seq) & set(S.CHAIN) in (set(), set(S.CHAIN)) for seq in lists_), c
     assert {c[1] for c in S.CONFIGS} == {"a", "b", "c"} and set(S.PARTS) == {p for c in S.CONFIGS for seq in c[2]
                                                                              for p in seq}
+    doc = " ".join(S.__doc__.split())
+    for word in ("NOT a producer / consumer dependency test", "NOT an end-to-end bound", "NOT a useful-prefetch",
+                 "COPY-INTERFERENCE", "NEVER read", "948 MB", "IDEALIZED reference", "INVALIDATES"):
+        assert word in doc, word
+    for word in ("ATTAINABLE", "attainable", "4 x 474", "PF HIDES"):  # the retracted claims and arithmetic
+        assert word not in (EFF / "r2_recon7_streams.py").read_text(), word
     names = [c[0] for c in S.CONFIGS]
     assert [S.rotation(names, r)[0] for r in range(len(names))] == names and S.rotation(names, len(names)) == names
-    t = {k: [10.0] * 3 for k in names}
-    t.update(A=[60.0] * 3, F=[40.0] * 3, M=[20.0] * 3, G=[20.0] * 3, FG=[60.0] * 3, P=[20.0] * 3, SER=[120.0] * 3)
-    t.update(**{"GRP-SER": [130.0] * 3, "GRP": [100.0] * 3, "GRPL": [118.0] * 3, "PF-SER": [140.0] * 3,
-                "PF": [122.0] * 3})
-    t["A|F|M"] = [64.0] * 3
-    t["A|F"] = [100.0] * 3
-    s = S.summarize(t)
-    assert s["capability"] == "REACHABLE" and s["concurrent"]["A|F"]["eff"] == 0.0
-    assert s["concurrent"]["A|F|M"]["eff"] == round((120 - 64) / 60.0, 4)
-    at = s["attainable"]
-    assert (at["GRP"]["split_cost_ms"], at["GRP"]["overlap_ms"], at["GRP"]["net_ms"], at["GRP"]["worth"]) == (
-        10.0, 30.0, 20.0, True)
-    assert at["GRPL"]["net_frac"] == round(2 / 120, 4) and at["GRPL"]["worth"] is False
-    assert at["PF"]["hidden_frac"] == 0.9 and at["PF"]["chain_slowdown"] == round(122 / 120 - 1, 4) and at["PF"]["hides"]
-    assert at["WINF"].startswith("NOT MEASURED")
-    t["A|F|M"] = [110.0] * 3
-    assert S.summarize(t)["capability"] == "SERIAL"
-    t["A|F|M"] = [90.0] * 3
-    t["PF"] = [135.0] * 3
-    s = S.summarize(t)
-    assert s["capability"] == "PARTIAL" and s["attainable"]["PF"]["hides"] is False
+    # the decision rules on planted medians (every control consistent: within 5 % of its independent sum)
+    base = dict(A=60.0, F=40.0, M=20.0, G=20.0, FG=60.0, P=20.0, SER=120.0, GRP0=64.0, GRP1=66.0, GRP=100.0,
+                GRPL=118.0, CPY=122.0)
+    base.update({"GRP-SER": 130.0, "CPY-SER": 140.0, "A|F": 100.0, "A|G": 70.0, "A|M": 62.0, "F|M": 45.0,
+                 "A|FG": 90.0, "A|F|M": 64.0})
+    for c, xs in S.CONCURRENT.items():
+        base["%s-SER" % c] = sum(base[x] for x in xs)
+    t = {k: [v, v + 1.0, v - 1.0] for k, v in base.items()}
+    assert set(t) == set(names)
+    s = S.summarize(t, eligible=dict(GRP=True))
+    assert all(v["consistent"] for v in s["controls"].values()), s["controls"]
+    assert s["capability"] == "REACHABLE" and s["concurrent"]["A|F"]["eff_matched"] == 0.0
+    assert s["concurrent"]["A|F|M"]["eff_matched"] == round((120 - 64) / 60.0, 4)
+    assert s["stats_ms"]["A"]["n"] == 3 and s["stats_ms"]["A"]["min"] == 59.0 and s["stats_ms"]["A"]["max"] == 61.0
+    sc = s["ordered_screen"]
+    assert (sc["GRP"]["split_cost_ms"], sc["GRP"]["overlap_ms"], sc["GRP"]["net_ms"]) == (10.0, 30.0, 20.0)
+    assert sc["GRP"]["decision"].startswith("SCREEN SAVING") and sc["GRPL"]["decision"] == "NO SCREEN SAVING"
+    assert sc["CPY"]["absorbed_frac"] == 0.9 and sc["CPY"]["decision"].startswith("COPY ABSORBED")
+    assert sc["WINF"].startswith("NOT MEASURED")
+    # the request-neighbour invariant governs GRP / GRPL (review 3 finding 2)
+    s2 = S.summarize(t, eligible=dict(GRP=False))
+    assert s2["ordered_screen"]["GRP"]["decision"].startswith("INELIGIBLE") and \
+        s2["ordered_screen"]["GRPL"]["decision"].startswith("INELIGIBLE")
+    assert S.summarize(t)["ordered_screen"]["GRP"]["decision"].startswith("INELIGIBLE")   # default: not eligible
+    # an inconsistent control INVALIDATES its conclusion (review 3 finding 4; NEGATIVE CONTROL: 6 % off)
+    t2 = dict(t, **{"A|F|M-SER": [base["A|F|M-SER"] * 1.06] * 3, "GRP-SER": [130.0 * 1.06] * 3,
+                    "CPY-SER": [140.0 * 1.06] * 3})
+    s3 = S.summarize(t2, eligible=dict(GRP=True))
+    assert s3["capability"].startswith("INVALID") and s3["ordered_screen"]["GRP"]["decision"].startswith("INVALID")
+    assert s3["ordered_screen"]["CPY"]["decision"].startswith("INVALID")
+    t3 = dict(t, **{"A|F|M-SER": [base["A|F|M-SER"] * 1.04] * 3})              # 4 %: still consistent
+    assert S.summarize(t3)["capability"] == "REACHABLE"
+    # SERIAL is judged against the MATCHED control, not the full-batch chain
+    t4 = dict(t, **{"A|F|M": [110.0] * 3})
+    assert S.summarize(t4)["capability"] == "SERIAL"                   # 110 >= 0.9 x 120 (A|F|M-SER)
+    t5 = dict(t, **{"A|F|M": [90.0] * 3, "CPY": [135.0] * 3})
+    s5 = S.summarize(t5, eligible=dict(GRP=True))
+    assert s5["capability"] == "PARTIAL" and s5["ordered_screen"]["CPY"]["decision"] == "COPY NOT ABSORBED"
+    # a failed MUST gate SUPPRESSES every decision (the timings stay)
+    s6 = S.summarize(t, eligible=dict(GRP=True), suppressed=["C128_B216-UNION"])
+    assert s6["capability"].startswith("SUPPRESSED") and s6["interference_AM"] is None
+    assert all(s6["ordered_screen"][c]["decision"].startswith("SUPPRESSED") for c in ("GRP", "GRPL", "CPY"))
+    assert s6["median_ms"] == s["median_ms"]
     assert S.need_bytes(318) > S.need_bytes(216) > 8e9
     a = S.parse_args(["--out", "x"])
     assert a.shapes == {128: 216, 73: 318} and a.new_blocks == {128: 1.226, 73: 5.0} and a.layers == 32
-    assert (a.reps, a.warmup, a.seed, a.max_shape_s) == (10, 2, 7, 240.0)
+    assert (a.reps, a.warmup, a.seed, a.max_shape_s, a.max_run_s, a.cell) == (10, 2, 7, 240.0, 600.0, None)
     for bad in (["--shapes", "128:216", "--new-blocks", "73:5.0"], ["--reps", "2"], ["--win-share", "2"],
                 ["--union-pages", "64"], ["--shapes", "x"], ["--shapes", "128:7", "--new-blocks", "128:1"],
-                ["--max-shape-s", "0"]):
+                ["--max-shape-s", "0"], ["--max-run-s", "0"]):
         with pytest.raises(SystemExit):
             S.parse_args(["--out", "x"] + bad)
-    assert S.main(["--out", "x"]) == 20                                # PROTOCOL_STAMP_RECON7 is None: refused
+    assert S.main(["--out", "x"]) == 20                                # no --cell: refused
+    assert S.main(["--out", "x", "--cell", "r7s"]) == 20               # r7s not granted: refused
 
 
 class _HostDev:
@@ -606,12 +644,13 @@ def test_streams_measure_plumbing():
     S = _mod("r2_recon7_streams")
     names = [c[0] for c in S.CONFIGS]
     parts, outs = _cpu_parts()
-    times, gates, stop = S.measure(_HostDev(), parts, outs, 2, 3, 1)
+    times, gates, stop, warm = S.measure(_HostDev(), parts, outs, 2, 3, 1)
     assert stop is None and set(times) == set(names) and all(len(v) == 3 for v in times.values())
+    assert set(warm) == set(names) and all(len(v) == 1 for v in warm.values())       # the warm-ups are kept
     assert [g[0] for g in gates] == ["%s-EXACT" % k for k in S.rotation(names, 2)] and all(g[2] for g in gates), gates
     s = S.summarize(times)
-    assert set(s["concurrent"]) == set(S.CONCURRENT) and s["capability"] in ("REACHABLE", "SERIAL", "PARTIAL")
-    assert set(s["attainable"]) == {"GRP", "GRPL", "PF", "WINF"}
+    assert set(s["concurrent"]) == set(S.CONCURRENT) and s["capability"] is not None
+    assert set(s["ordered_screen"]) == {"GRP", "GRPL", "CPY", "WINF"}
     # the schedules: GRP's two group chains each in the joint pass's order on their own stream; GRPL joins per layer
     cfg = {c[0]: c for c in S.CONFIGS}
     for name, joins in (("GRP", 0), ("GRPL", 2 * 2 * (3 - 1))):       # 2 streams x 2 events x (layers - 1)
@@ -638,14 +677,105 @@ def test_streams_measure_plumbing():
     assert firsts == [cfg[names[r]][2] for r in range(3)]
     # STOP criteria: an EXACT failure ends the measurement (NEGATIVE CONTROL: F's later outputs differ)
     parts, outs = _cpu_parts(plant=True)
-    times, gates, stop = S.measure(_HostDev(), parts, outs, 2, 3, 1)
+    times, gates, stop, _ = S.measure(_HostDev(), parts, outs, 2, 3, 1)
     bad = [g[0] for g in gates if not g[2]]
     first_f = next(k for k in S.rotation(names, 2) if "F" in {p for seq in cfg[k][2] for p in seq})
     _ev("RECON7 X1 (CPU plumbing): %d configurations; planted F -> stop %r, failed %s" % (len(names), stop, bad))
     assert bad == ["%s-EXACT" % first_f] and stop == "EXACT failed in %s" % first_f
-    tick = iter(range(0, 10 ** 6, 100))                                # a fake clock: 100 s per reading
-    _, _, stop = S.measure(_HostDev(), *_cpu_parts(), 1, 3, 1, max_s=250, clock=lambda: next(tick))
-    assert stop is not None and stop.startswith("wall clock")
+    # the DEADLINE holds in every phase (review 3 finding 2): a fake clock, one reading = `step` s
+    for step, where in ((1000, "references"), (10, "warm-up"), (5, "pass")):    # 14 references, 26 warm-ups, 78
+        tick = iter(range(0, 10 ** 7, step))
+        times, gates, stop, warm = S.measure(_HostDev(), *_cpu_parts(), 1, 3, 1, max_s=250, clock=lambda: next(tick))
+        assert stop is not None and stop.startswith("wall clock") and ("(%s" % where) in stop, (step, stop)
+        if where != "pass":
+            assert gates == [] and all(v == [] for v in times.values()), where       # nothing timed after the stop
+    tick = iter(range(0, 10 ** 7, 10))                                 # the shape's start counts (setup time)
+    _, _, stop, _ = S.measure(_HostDev(), *_cpu_parts(), 1, 3, 1, max_s=250, clock=lambda: next(tick), t0=-10 ** 6)
+    assert stop is not None and "(references)" in stop
+
+
+def _cpu_build(S, clk=None, union_ok=True, ids_ok=True, grp_equal=True, bump=0, fail=False):
+    """A CPU stand-in of build_gpu with request-row outputs (group 0 + group 1 = the full batch, unless planted)."""
+    def build(B, per_stream, win_share, seed, union):
+        if fail:
+            raise RuntimeError("planted build failure")
+        if clk is not None:
+            clk[0] += bump
+        g = torch.Generator().manual_seed(seed)
+        E = S.R * B
+        x, src = torch.randn(E, 6, generator=g), torch.randn(B, 5, generator=g)
+        parts, outs = {}, {}
+        for tag, b0, b1 in (("", 0, B), ("0", 0, B // 2), ("1", B // 2, B)):
+            e0, e1 = S.R * b0, S.R * b1
+            k = 1.0 + (1e-3 if (tag == "1" and not grp_equal) else 0.0)
+            ya, yr, fo, go = (torch.empty(e1 - e0, 6), torch.empty(e1 - e0, 6), torch.empty(e1 - e0, 6),
+                              torch.empty(b1 - b0, 5))
+            parts.update({"Aq" + tag: (lambda ya=ya, e0=e0, e1=e1, k=k: ya.copy_(x[e0:e1] * 2.0 * k)),
+                          "Ar" + tag: (lambda yr=yr, e0=e0, e1=e1: yr.copy_(x[e0:e1] - 1.0)),
+                          "F" + tag: (lambda fo=fo, e0=e0, e1=e1: fo.copy_(x[e0:e1] + 1.0)),
+                          "G" + tag: (lambda go=go, b0=b0, b1=b1: go.copy_(src[b0:b1]))})
+            outs.update({"Aq" + tag: [ya], "Ar" + tag: [yr], "F" + tag: [fo], "G" + tag: [go]})
+        for p in ("M", "P"):
+            d = torch.empty(B, 5)
+            parts[p] = (lambda d=d: d.copy_(src))
+            outs[p] = [d]
+        ln = [torch.full((2, B), union, dtype=torch.int32), torch.full((2, B // 2), union, dtype=torch.int32),
+              torch.full((2, B - B // 2), union, dtype=torch.int32)]
+        if not union_ok:
+            ln[1][0, 0] = union - 1
+        w, s = S.counts_per_layer(B, 2, per_stream, win_share)
+        return parts, outs, dict(ln=ln, ids_win=w + (0 if ids_ok else 1), ids_store=s, B=B)
+    return build
+
+
+def test_streams_run_shapes():
+    """review 3 finding 2: every failure STOPS THE RUN; the deadline covers setup; BUDGET is the true wall; GRP-EQ."""
+    S = _mod("r2_recon7_streams")
+    a = S.parse_args(["--out", "x", "--shapes", "8:4,6:2", "--new-blocks", "8:1.0,6:1.0", "--layers", "1", "--reps", "3",
+                      "--warmup", "1"])
+    big = lambda: 10 ** 13                                              # noqa: E731
+
+    def run(build, free=big, clock=None):
+        return S.run_shapes(a, _HostDev(), build, free, lambda: None, **({"clock": clock} if clock else {}))
+
+    def must_failed(gates):
+        return [g[0] for g in gates if g[1] and not g[2]]
+    gates, raw = run(_cpu_build(S))                                    # all good: both shapes
+    assert must_failed(gates) == [] and list(raw) == ["C8_B4", "C6_B2"], must_failed(gates)
+    assert {g[0] for g in gates if not g[1]} == {"C8_B4-GRP-EQ", "C6_B2-GRP-EQ"} and all(g[2] for g in gates)
+    assert gates[-1][0] == "RUN-WALL" and all(len(v) == 3 for v in raw["C8_B4"]["times_ms"].values())
+    assert all(len(v) == 1 for v in raw["C8_B4"]["warmup_ms"].values()) and raw["C8_B4"]["groups_equal_full"] == dict(
+        Aq=True, Ar=True, F=True, G=True)
+    gates, raw = run(_cpu_build(S), free=lambda: 0)                    # free memory: the run stops at the first shape
+    assert must_failed(gates) == ["C8_B4-RUN"] and list(raw) == ["C8_B4"] and "STOP THE RUN" in gates[0][3]
+    for kw in (dict(union_ok=False), dict(ids_ok=False)):              # UNION / IDS: stop before any timing, no 2nd shape
+        gates, raw = run(_cpu_build(S, **kw))
+        f = must_failed(gates)
+        assert "C8_B4-RUN" in f and not [g for g in gates if g[0].startswith("C6_B2")], (kw, f)
+        assert raw["C8_B4"]["times_ms"] == {} and not [g for g in gates if g[0].endswith("-EXACT")], kw
+    gates, raw = run(_cpu_build(S, grp_equal=False))                   # GRP-EQ fails: a DECISION gate, not a MUST
+    eq = [g for g in gates if g[0] == "C8_B4-GRP-EQ"][0]
+    assert must_failed(gates) == [] and eq[2] is False and "'Aq': False" in eq[3]
+    s = S.summarize(raw["C8_B4"]["times_ms"], eligible=dict(GRP=all(raw["C8_B4"]["groups_equal_full"].values())))
+    assert s["ordered_screen"]["GRP"]["decision"].startswith("INELIGIBLE")
+    clk = [0.0]                                                        # the deadline covers setup (a 1000 s build)
+    gates, raw = run(_cpu_build(S, clk=clk, bump=1000), clock=lambda: clk[0])
+    f = must_failed(gates)
+    assert "C8_B4-BUDGET" in f and "C8_B4-RUN" in f and raw["C8_B4"]["stop"].endswith("(setup)") and "C6_B2" not in raw
+    clk = [0.0]                                                        # a TRUE final wall: time after the last pass
+    real = S.group_equal
+    try:
+        S.group_equal = lambda outputs, bits: (clk.__setitem__(0, clk[0] + 1000), real(outputs, bits))[1]
+        gates, raw = run(_cpu_build(S), clock=lambda: clk[0])
+    finally:
+        S.group_equal = real
+    f = must_failed(gates)
+    assert raw["C8_B4"]["stop"] is None and "C8_B4-BUDGET" in f and "C8_B4-RUN" in f and "C6_B2" not in raw, f
+    assert "RUN-WALL" in f                                             # 1000 s > --max-run-s 600
+    gates, raw = run(_cpu_build(S, fail=True))                         # an exception: the run stops
+    assert must_failed(gates) == ["C8_B4-RUN"] and "EXCEPTION RuntimeError" in gates[0][3] and list(raw) == ["C8_B4"]
+    _ev("RECON7 X1 (CPU run_shapes): free / UNION / IDS / setup deadline / late wall / exception each STOP THE RUN; "
+        "GRP-EQ governs GRP only")
 
 
 # ------------------------------------------------------------------ MEM (c)
@@ -657,7 +787,11 @@ def test_mem_pure():
                 ["--batches", "a"]):
         with pytest.raises(SystemExit):
             M.parse_args(["--out", "x", "--workload", "w"] + bad)
-    assert M.main(["--out", "x", "--workload", "w", "--model", "m"]) == 20     # the protocol stamp: refused
+    assert M.main(["--out", "x", "--workload", "w", "--model", "m"]) == 20     # no --cell: refused
+    assert M.main(["--out", "x", "--workload", "w", "--model", "m", "--cell", "r7mem"]) == 20   # not granted
+    a = M.parse_args(["--out", "x", "--workload", "w", "--cell", "r7mem"])
+    assert M.PROT.refusal("r7mem", "r2_recon7_mem", type("A", (), dict(M.PROT.PROFILES["r7mem"]))()) is not None
+    assert all(getattr(a, k) == v for k, v in M.PROT.PROFILES["r7mem"].items())   # the defaults = the profile
     lines = M.lines_from([(64, 20.0 + 0.21 * 64), (192, 20.0 + 0.21 * 192)], [(64, 18.0 + 0.2 * 64),
                                                                               (192, 18.0 + 0.2 * 192)])
     assert abs(lines["prefill"][0] - 20.0) < 1e-6 and abs(lines["prefill"][1] - 0.21) < 1e-9
@@ -713,7 +847,10 @@ def test_recon7_cell_pure():
         with pytest.raises(SystemExit):
             C.parse_args(base + bad)
     assert C.runner_choice("L4PTFDGUDKWCDP", True) == C.DCC.runner_choice("L4PTFDGUDKWCD", True)
-    assert C.main(base + ["--model", "m"]) == 20                       # PROTOCOL_STAMP_RECON7 is None: refused
+    assert C.main(base + ["--model", "m"]) == 20                       # no --cell: refused
+    for cell in ("r7pm", "r7pa", "r7pb", "r7s"):                       # not granted / not this module's cell
+        assert C.main(base + ["--model", "m", "--cell", cell]) == 20, cell
+    assert all(getattr(a, k) == v for k, v in C.PROT.PROFILES["r7pa"].items())   # the defaults = the r7pa profile
     lab, lay = RP.expected_labels_r7("jointg", 2, keep=True)
     assert lab == ["embed"] + list(RP.JOINT_GK) * 2 + ["head", "end"] and lay[-1] == 2
     assert RP.expected_labels_r7("draftg", 3)[0][:4] == ["static", "A", "resid", "B"]
@@ -749,21 +886,56 @@ def test_recon7_cell_pure():
     assert cr["phase_device_ms"] == 8.0 and cr["decision_device_ms"] == 2.0 and cr["commit_device_ms"] == 2.0
 
 
-def test_protocol_state():
+STAMP = "2026-10-31T12:00:00Z"
+
+
+def _profile_args(cell, **change):
+    P = _mod("r2_recon7_protocol")
+    return type("A", (), dict(P.PROFILES[cell], cell=cell, **change))()
+
+
+def test_protocol_state(monkeypatch):
+    """review 3 finding 1: ONE grant per cell, default deny, the profile bound to the grant."""
     P = _mod("r2_recon7_protocol")
     src = (EFF / "r2_recon7_protocol.py").read_text()
-    assert ("\nPROTOCOL_STAMP_RECON7 = None\n" in src) == (P.PROTOCOL_STAMP_RECON7 is None)   # the step script's grep
-    assert P.PROTOCOL_STAMP_RECON7 is None, "the builder never sets the stamp (the human approves the protocol)"
-    assert P.stamp_ok() is False and P.refusal("x").startswith("REFUSED") and P.stamp_ok("2026-10-30T12:00:00Z")
-    assert not P.stamp_ok("2026-10-30") and not P.stamp_ok(None)
+    assert not hasattr(P, "PROTOCOL_STAMP_RECON7") and "PROTOCOL_STAMP_RECON7 =" not in src   # the one-for-all stamp
+    for c in P.CELLS:                                                  # one line per cell; the file's state is read
+        line = [x for x in src.splitlines() if x.startswith("GRANT_%s = " % c)]
+        assert len(line) == 1, c
+        assert (line[0] == "GRANT_%s = None" % c) == (P.grant(c) is None), c
+    assert set(P.PROFILES) == set(P.CELLS) == set(P.CELL_MODULE)
+    for c in P.CELLS:
+        if P.grant(c) is None:
+            assert P.refusal(c, P.CELL_MODULE[c], _profile_args(c)).startswith("REFUSED")
+    # an r7s grant runs r7s only
+    monkeypatch.setattr(P, "GRANT_r7s", STAMP)
+    assert P.refusal("r7s", "r2_recon7_streams", _profile_args("r7s")) is None
+    for c in ("r7pm", "r7pa", "r7pb", "r7mem"):
+        why = P.refusal(c, P.CELL_MODULE[c], _profile_args(c))
+        assert why is not None and "not granted" in why, (c, why)
+    assert "belongs to" in P.refusal("r7s", "r2_recon7_cell", _profile_args("r7s"))     # the cell / module bind
+    assert "belongs to" in P.refusal("r7pa", "r2_recon7_streams", _profile_args("r7pa"))
+    assert "not one of" in P.refusal(None, "r2_recon7_streams", _profile_args("r7s"))
+    assert "not one of" in P.refusal("r7x", "r2_recon7_streams", _profile_args("r7s"))
+    assert "differs from the granted profile" in P.refusal("r7s", "r2_recon7_streams", _profile_args("r7s", reps=20))
+    assert "no arguments" in P.refusal("r7s", "r2_recon7_streams", None)
+    # a grant of r7pm does not run r7pa's batch through the same module
+    monkeypatch.setattr(P, "GRANT_r7pm", STAMP)
+    assert P.refusal("r7pm", "r2_recon7_cell", _profile_args("r7pm")) is None
+    assert "differs" in P.refusal("r7pm", "r2_recon7_cell", _profile_args("r7pm", batch=216, pool=65))
+    # malformed or missing grants refuse
+    for bad in ("2026-10-31", "2026-10-31T12:00:00", " 2026-10-31T12:00:00Z", "2026-10-31T12:00:00Z ", "", 1, True,
+                ["2026-10-31T12:00:00Z"], "None"):
+        monkeypatch.setattr(P, "GRANT_r7s", bad)
+        assert "not granted" in P.refusal("r7s", "r2_recon7_streams", _profile_args("r7s")), bad
+    monkeypatch.delattr(P, "GRANT_r7s")
+    assert P.grant("r7s") is None and "not granted" in P.refusal("r7s", "r2_recon7_streams", _profile_args("r7s"))
+    assert P.stamp_ok(STAMP) and not P.stamp_ok("2026-10-30") and not P.stamp_ok(None)
 
 
 def _step(cell, sha="0" * 40):
     e = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SRUN_", "SALLOC_", "SBATCH_"))}
-    e["DRYRUN"] = "1"
-    if shutil.which("srun") is None:     # the test runs on a compute node: the compute-side sha256sum wrapper (L55) is
-        e["PATH"] = os.pathsep.join(p for p in e.get("PATH", "").split(os.pathsep)   # an srun, absent in the image
-                                    if not p.rstrip("/").endswith("kstep-cpu-runs/bin-compute"))
+    e["DRYRUN"] = "1"                    # the wrapper hashes nothing (review 3 finding 5): no PATH shim is needed
     return subprocess.run(["bash", str(EFF / "r2_recon7_step.sh"), "--nosi", sha, HOLDER, "t1", cell], env=e,
                           capture_output=True, text=True, timeout=300)
 
@@ -782,61 +954,107 @@ CELLS = (("r7pm", 10, "r2_recon7_cell.py", 30, "100G", ["--batch 8", "--steps 72
                                                           "--count-rounds 16\\,20", "--profile-rounds 8\\,12"]),
          ("r7pa", 65, "r2_recon7_cell.py", 110, "240G", ["--batch 216", "--steps 512", "--count-rounds 48\\,64\\,144"]),
          ("r7pb", 10, "r2_recon7_cell.py", 160, "340G", ["--batch 318", "--arms L4PTFD\\,L4PTFDGUDKWC"]),
-         ("r7s", 65, "r2_recon7_streams.py", 15, "64G", ["--shapes 128:216\\,73:318", "--reps 10", "--warmup 2",
-                                                         "--seed 7", "--max-shape-s 240"]),
+         ("r7s", 65, "r2_recon7_streams.py", 20, "64G", ["--shapes 128:216\\,73:318", "--reps 10", "--warmup 2",
+                                                         "--seed 7", "--max-shape-s 240", "--max-run-s 600"]),
          ("r7mem", 18, "r2_recon7_mem.py", 70, "240G", ["--batches 64\\,192", "--probe-rounds 49", "--pool 18"]))
+HASHERS = ("sha256sum", "hash-object", "md5sum", "sha1sum", "b2sum")
 
 
-def test_step_script_recon7():
+def _granted(cell, text, tmp_path):
+    """The step script's granted() on a planted protocol text (the script sourced, main not run)."""
+    f = tmp_path / ("prot_%s.py" % abs(hash(text)))
+    f.write_text(text)
+    return subprocess.run(["bash", "-c", 'source "$1"; granted "$2" "$3"', "granted-test", str(EFF / "r2_recon7_step.sh"),
+                           cell, str(f)], capture_output=True, text=True, timeout=60).returncode
+
+
+def test_step_script_recon7(tmp_path):
     src = (EFF / "r2_recon7_step.sh").read_text()
-    assert src.rstrip().endswith('main "$@"; exit $?') and "\nmain() {\n" in src
+    assert src.rstrip().endswith('then main "$@"; exit $?; fi') and "\nmain() {\n" in src
     for word in ("python", "perl", "awk", "sed"):                       # no interpreter word outside the cell launch
         lines = [x for x in src.splitlines() if re.search(r"\b%s\b" % word, x) and "/venv/nosa/bin/python" not in x
                  and not x.lstrip().startswith("#")]
         assert lines == [], (word, lines[:3])
+    # THE HASHING BOUNDARY (review 3 finding 5): hashing only inside CHILD (the GPU node), by absolute path
+    lines = src.splitlines()
+    c0 = next(i for i, x in enumerate(lines) if x.startswith("CHILD='"))
+    c1 = next(i for i in range(c0 + 1, len(lines)) if lines[i].endswith("\"$@\"'"))
+    outside = [x for i, x in enumerate(lines) if (i < c0 or i > c1) and not x.lstrip().startswith("#")
+               and any(h in x for h in HASHERS)]
+    assert outside == [], outside[:3]
+    child = "\n".join(lines[c0:c1 + 1])
+    assert child.count("/usr/bin/sha256sum") == 2 and "IMGSHA" in child and "exit 6" in child and "ulimit -f" in child
+    assert child.index("/usr/bin/sha256sum") < child.index('exec "$A"')               # the pins before the image
+    assert "SIF_SHA=%s" % open("/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif.sha256").read().split()[0] in src \
+        if os.path.exists("/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif.sha256") else "SIF_SHA=" in src
+    assert 'cmp -s -- "$0" <(git -C "$NOSI" show "$NSHA:$SELF")' in src and 'ulimit -f "$FILE_KB"' in src
+    assert "du -sb" in src and "exit 7" in src
     assert "FORK_BLOB=%s" % FORK_BLOB in src and "NOSI=%s " % STEP_ROOT in src and "OUTROOT/sp_active_$JOB" in src
     assert "CCROOT=/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_jit " in src
-    assert "grep -q '^PROTOCOL_STAMP_RECON7 = None$'" in src
     for m in MODULES + ("r2_i4c_cell.py", "r2_i4m_cell.py", "r2_wsm_cell.py", "r2_i4dc_cell.py", "r2_p3_profile.py"):
         assert "benchmarks/Efficiency/%s" % m in src, m
+    # THE CELL GRANTS (review 3 finding 1): granted() on planted protocol texts
+    prot = (EFF / "r2_recon7_protocol.py").read_text()
+    for c in ("r7pm", "r7pa", "r7pb", "r7s", "r7mem"):
+        assert _granted(c, prot, tmp_path) == 1, c                     # this tree: nothing granted
+    g7s = prot.replace("GRANT_r7s = None", 'GRANT_r7s = "%s"' % STAMP)
+    assert g7s != prot and _granted("r7s", g7s, tmp_path) == 0
+    for c in ("r7pm", "r7pa", "r7pb", "r7mem"):
+        assert _granted(c, g7s, tmp_path) == 1, c                      # an r7s grant refuses every other cell
+    for bad in ('GRANT_r7s = "2026-10-31"', "GRANT_r7s = '%s'" % STAMP, 'GRANT_r7s = "%s" ' % STAMP,
+                'GRANT_r7s = "%s"  # x' % STAMP, ' GRANT_r7s = "%s"' % STAMP, 'GRANT_r7s="%s"' % STAMP,
+                'GRANT_r7sx = "%s"' % STAMP, 'GRANT_r7s = "%s"0' % STAMP, "GRANT_r7s = %s" % STAMP):
+        assert _granted("r7s", prot.replace("GRANT_r7s = None", bad), tmp_path) == 1, bad
+    assert _granted("r7s", prot.replace("GRANT_r7s = None\n", ""), tmp_path) == 1     # missing line
     for bad in ("r7", "r7px", "i4dca", "r7mm"):
         r = _step(bad)
         assert r.returncode == 1 and "cell '%s'" % bad in r.stderr, (bad, r.returncode, r.stderr[-300:])
     sha = _clean_head()
     if sha is None:
         pytest.skip("not a clean checkout of %s: the full DRYRUN needs one" % STEP_ROOT)
-    approved = "\nPROTOCOL_STAMP_RECON7 = None\n" not in _git("show", "%s:%s" % (sha, E_ + "r2_recon7_protocol.py")).stdout
+    at = _git("show", "%s:%s" % (sha, E_ + "r2_recon7_protocol.py")).stdout
     for cell, pool, py, smin, mem, wants in CELLS:
+        granted = _granted(cell, at, tmp_path) == 0
         r = _step(cell, sha)
-        if r.returncode != 0 and "PROTOCOL_STAMP_RECON7 is None" not in r.stderr:
+        if r.returncode != 0 and "is not granted at" not in r.stderr:
             pytest.skip("DRYRUN stopped on a pin outside the cell stage: %s" % r.stderr.strip()[-200:])
-        if not approved:                                               # every cell STOPS until the human approves
-            assert r.returncode == 1 and "PROTOCOL_STAMP_RECON7 is None" in r.stderr, (cell, r.stderr[-300:])
+        if not granted:                                                # default deny
+            assert r.returncode == 1 and "cell %s is not granted at" % cell in r.stderr, (cell, r.stderr[-300:])
         else:
             assert r.returncode == 0, (cell, r.stderr[-300:])
         out = r.stdout.replace("\\", "")                               # printf %q may quote "," and ":"
         line = "cell %s: C %d (pool %d) " % (cell, 63 + pool, pool)
         assert line in out and "STEP_MIN %d mem %s" % (smin, mem) in out, (cell, out[-600:])
         for want in ["NOSI_POOL_BLOCKS=%d" % pool, STEP_ROOT + "/benchmarks/Efficiency/" + py, "--mem=%s" % mem,
-                     "--time=%d" % smin, "recon7_t1_%s_%s" % (HOLDER, cell)] + [w.replace("\\", "") for w in wants]:
+                     "--time=%d" % smin, "recon7_t1_%s_%s" % (HOLDER, cell), "--cell %s" % cell,
+                     "/usr/bin/sha256sum"] + [w.replace("\\", "") for w in wants]:
             assert want in out, (cell, want, out[-800:])
-        assert ("protocol approved %d" % (1 if approved else 0)) in out
-    _ev("RECON7 DRYRUN: %d cells printed their step command; protocol approved %s" % (len(CELLS), approved))
+        assert ("cell granted %d" % (1 if granted else 0)) in out
+        if cell == "r7s":                                              # no model, no workload prerequisite
+            assert "--model" not in out and "--workload" not in out and "out_mb 60" in out
+        else:
+            assert "--model" in out and "--workload" in out
+    _ev("RECON7 DRYRUN: %d cells printed their step command; granted %s" % (
+        len(CELLS), [c[0] for c in CELLS if _granted(c[0], at, tmp_path) == 0]))
 
 
 def test_notes_recon7():
     doc = (ROOT / "docs/NOTES_recon7.md").read_text()
-    for word in ("test_recon7.py", "PROTOCOL_STAMP_RECON7", "STEP_MIN", "NO NEW KERNEL", "r7pm", "r7pa", "r7pb", "r7s",
-                 "r7mem", "falsifier", "decides", "MEASURED", "MODEL", "drain", "PEQ", "D1", "D2", "D3", "D5", "D6",
-                 "D7", "GPU only"):
+    for word in ("test_recon7.py", "GRANT_r7s", "default deny", "STEP_MIN", "NO NEW KERNEL", "r7pm", "r7pa", "r7pb",
+                 "r7s", "r7mem", "falsifier", "decides", "MEASURED", "MODEL", "drain", "PEQ", "D1", "D2", "D3", "D5",
+                 "D6", "D7", "GPU only"):
         assert word in doc, word
-    x1 = doc[doc.index("## X1 protocol (about 5 min)"):doc.index("## 3. THE GPU PROTOCOL")]
+    assert "PROTOCOL_STAMP_RECON7 = None" not in doc.replace("`PROTOCOL_STAMP_RECON7 = None` (retired", "")
+    x1 = doc[doc.index("## X1 protocol"):doc.index("## 3. THE GPU PROTOCOL")]
     S = _mod("r2_recon7_streams")
-    for word in ("2195630", "nova05", "STEP_MIN 15", "--mem=64G", "--cpus-per-task=16", "crafticat/NOSA", "r2-recon7",
-                 "MATCHED CONTROL", "ORDER-ROTATED", "CANNOT", "STOP CRITERIA", "FALSIFIERS", "DECISION RULES",
-                 "Duplicate-work evidence", "Output bound", FORK_BLOB, "--seed 7", "--max-shape-s 240", "--reps 10",
-                 "--warmup 2", "WINF", "GRP-SER", "PF-SER", "intra-kernel", "lifetimes"):
+    for word in ("2195630", "nova05", "STEP_MIN 20", "--mem=64G", "--cpus-per-task=16", "crafticat/NOSA", "r2-recon7",
+                 "MATCHED", "ORDER-ROTATED", "CANNOT", "STOP THE RUN", "FALSIFIERS", "DECISION RULES",
+                 "Duplicate-work evidence", "Output limit", FORK_BLOB, "--seed 7", "--max-shape-s 240", "--reps 10",
+                 "--warmup 2", "--max-run-s 600", "WINF", "GRP-SER", "CPY-SER", "A|F|M-SER", "intra-kernel",
+                 "GRP-EQ", "SUPPRESSED", "474", "948", "ordered synthetic", "copy interference", "/usr/bin/sha256sum"):
         assert word in x1, word
-    for c in ("GRP", "GRPL", "PF"):                                    # every legal schedule and its control
+    for c in ("GRP", "GRPL", "CPY"):                                   # every screen schedule and its control
         assert "| %s |" % c in x1 and S.CONTROL_OF[c] in x1, c
+    for word in ("4 x 474", "ATTAINABLE", "PF HIDES"):
+        assert word not in x1, word
     assert re.search(r"code commit \| `[0-9a-f]{40}`", x1) and re.search(r"sha256 `[0-9a-f]{64}`", x1)

@@ -23,8 +23,8 @@ of the probed arm (counted round - 1: the draft-skip record runs device ops in t
 THE PROBE STATISTIC (R2 section 3.5): every probe median of the record excludes the DRAIN rounds (a request finished
 before the round began); the all-rounds value and its bias are printed beside it. The drain rounds come from the probed
 arm (the host counts); they hold for every arm whose tokens equal it (the EQF / PEQ gates).
-THE PROTOCOL STAMP: main() refuses (exit 20) while r2_recon7_protocol.PROTOCOL_STAMP_RECON7 is None (the human's GPU
-protocol approval); the step script stops before the launch as well.
+THE CELL GRANT: main() refuses (exit 20) unless r2_recon7_protocol grants --cell (r7pm, r7pa or r7pb) and the arguments
+are that cell's granted profile (default deny); the step script stops before the launch as well.
 EXIT: the number of failed MUST gates (0-19); 20 refused; 30 an exception outside an arm.
 """
 from __future__ import annotations
@@ -79,6 +79,7 @@ def _rounds(ap, s, what):
 def parse_args(argv):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", required=True)
+    ap.add_argument("--cell", default=None, help="r7pm, r7pa or r7pb: the granted cell (r2_recon7_protocol.py)")
     ap.add_argument("--model", default=os.environ.get("NOSI_MODEL_PATH", ""))
     ap.add_argument("--workload", required=True)
     ap.add_argument("--batch", type=int, default=216)
@@ -323,7 +324,7 @@ def decision_lines(name, r, dims) -> list:
 # ------------------------------------------------------------------ main
 def main(argv=None) -> int:
     a = parse_args(sys.argv[1:] if argv is None else argv)
-    why = PROT.refusal("r2_recon7_cell")
+    why = PROT.refusal(a.cell, "r2_recon7_cell", a)
     if why is not None:
         print(why, file=sys.stderr)
         return 20
@@ -476,7 +477,7 @@ def main(argv=None) -> int:
                 spec_body=a.spec_body, spec_graph=a.spec_graph, spec_redirect=a.spec_redirect,
                 probe_every=a.probe_every, check_every=a.check_every, require_stress=a.require_stress,
                 profile_rounds=a.profile_rounds, label_rounds=a.label_rounds, count_rounds=a.count_rounds,
-                draft_marks=a.draft_marks, protocol_stamp=PROT.PROTOCOL_STAMP_RECON7,
+                draft_marks=a.draft_marks, cell=a.cell, grant=PROT.grant(a.cell),
                 labels=dict(joint=RP.JOINT_LAYER, jointg=RP.JOINT_G, jointgk=RP.JOINT_GK, draftg=RP.DRAFT_G,
                             commit=RP.COMMIT_LABELS, commit_phase=RP.COMMIT_PHASE),
                 capture_rounds=caps, recording_rounds=recr, steady_excluded_rounds=xr, drain_rounds=drain,

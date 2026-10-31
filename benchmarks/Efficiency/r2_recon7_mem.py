@@ -19,7 +19,7 @@ per-layer maximum, the histogram, the sum. The probe arm is not timed (I4M's rul
 MUST GATES (per B, prefixed "B<b>-"): SH-RUN, L4PTFD-RUN and I4M's probe-mode arm gates (ERR, D1, D3, SPAN, RESID,
 ATTN1, FILL1, LEAN, COMMIT-P), L4PTFD-MEM, PR-ROUNDS, PR-FILL, PR-FLAT, PR-PRE, OCC (the tap saw one store fill per layer
 and joint pass); FIT (two distinct B with a probe record each). REPORT: the lines, B_fit, the peak at B 287, the
-occupancy. EXIT: the number of failed MUST gates (0-19); 20 refused (PROTOCOL_STAMP_RECON7 is None); 30 an exception
+occupancy. EXIT: the number of failed MUST gates (0-19); 20 refused (cell r7mem not granted: r2_recon7_protocol.py); 30 an exception
 outside an arm.
 """
 from __future__ import annotations
@@ -53,6 +53,7 @@ def log(msg):
 def parse_args(argv):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", required=True)
+    ap.add_argument("--cell", default=None, help="r7mem: the granted cell (r2_recon7_protocol.py)")
     ap.add_argument("--model", default=os.environ.get("NOSI_MODEL_PATH", ""))
     ap.add_argument("--workload", required=True)
     ap.add_argument("--batches", default="64,192", help="the probe points (two or more distinct B)")
@@ -239,7 +240,7 @@ def probe_arm_r7(model, ids, inputs, steps: int, clock, opt, FORK, lean: bool, c
 # ------------------------------------------------------------------ main
 def main(argv=None) -> int:
     a = parse_args(sys.argv[1:] if argv is None else argv)
-    why = PROT.refusal("r2_recon7_mem")
+    why = PROT.refusal(a.cell, "r2_recon7_mem", a)
     if why is not None:
         print(why, file=sys.stderr)
         return 20
@@ -353,7 +354,7 @@ def main(argv=None) -> int:
     meta = dict(batches=a.batches, steps=a.steps, S0=BC.S0, workload_sha256=sha, pool_blocks=CEN.POOL_BLOCKS,
                 capacity_C=C, opt=opt, probe_rounds=a.probe_rounds, margin_GB=a.margin_gb, budget_GB=BUDGET_GB,
                 usable_r3_GB=USABLE_R3_GB, anchor_B=ANCHOR_B, r3_model_bfit=R3_MODEL_BFIT, dims=dims, host_mem=hmem,
-                protocol_stamp=PROT.PROTOCOL_STAMP_RECON7, base_commit=os.environ.get("BASE_COMMIT"),
+                cell=a.cell, grant=PROT.grant(a.cell), base_commit=os.environ.get("BASE_COMMIT"),
                 fork_blob=I4A.FORK_BLOB)
     with open(os.path.join(a.out, "summary.json"), "w") as f:
         json.dump(dict(meta=meta, per_batch={str(k): v for k, v in per_b.items()}, fit=fit,
