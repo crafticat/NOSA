@@ -121,13 +121,19 @@ PRED_INT_BY_B = {
               INT_st3_vs_mt=None)}
 # THE C 73 INT ARM WITHOUT BF1 (L4PTFDGUDKWCDIN, cell intd: C 73 pool 10, B 318, store 129): its own bands (verdicts use
 # this dict when X is that arm). None until the lead registers them (with a new PRED_STAMP_INT).
-PRED_INT_NOBF_BY_B = {318: {k: None for k in PRED_KEYS_INT}}
+# REGISTERED 2026-10-31T22:01:20Z (`date -u`) BEFORE intd, from MEASURED C73 component ratios (same-config jobs): J1
+# x1.0515 (j1b), ST1 + ST2 x1.0138 (intb MT / KWCD), ST3 x1.0109 (intb MTK / MT), ST4 MODEL x1.004 -> product 1.082;
+# D / SH at C73 0.663 (intb); SHJ1 0.964 of SH's step; joint J1 17.8 + ST2 2.2 + ST3 5.4 ms; draft F2 8.0 + ST4 about 2.
+PRED_INT_NOBF_BY_B = {318: dict(INT_vs_ref=(1.065, 1.100), INT_ratio=(0.706, 0.730), INT_vs_shj1=(0.681, 0.704),
+                                INT_vs_strongest=(0.533, 0.551), INT_joint_saving=(21.0, 30.0),
+                                INT_draft_saving=(8.0, 12.0), INT_commit_saving=(3.8, 4.8), INT_peak_gb=(77.6, 78.2),
+                                INT_eq=True, INT_st3_joint_saving=None, INT_st3_vs_mt=None)}
 # THE CELL GRANTS (default deny; r2_int_step.sh's granted() reads these lines at <sha>): the lead sets a `date -u` stamp.
 GRANT_intm = "2026-10-31T17:03:19Z"
 GRANT_inta = "2026-10-31T17:03:19Z"
 GRANT_intb = "2026-10-31T18:16:02Z"
 GRANT_intc = "2026-10-31T19:32:23Z"
-GRANT_intd = None
+GRANT_intd = "2026-10-31T22:01:20Z"
 # this cell's options (main strips them before the I4DC main); the BF1 defaults are r2_bf1_cell's
 OPT = dict(st1_commit="rows", ineg=None, bf_store=0, bf_ncap=2048, bf_ring=8, bf_worker="thread", bf_acct=0,
            bf_close_wait_ms=0.0, bf_packer="gilfree", bf_threads=14, bf_cap_groups=2048, bf_late="defer",
