@@ -102,13 +102,69 @@ def int_state(S):
     return _STATES[S]
 
 
+_WARM = {}
+
+
+def bf_state_int(STF):
+    """BF1's state class with ITS store-X warm (TentStateBF.bf_warm_joint, r2_bf1_fetch.py) on the INT keep arm's
+    section path: the J1 section's locate (F6, r2_j1_select._j1_loc) in place of the I4CC loc1, so loc2 compiles
+    before the arm's first capture with the SAME inputs as the section's (cached per STF). TentRunnerBF.__init__ calls
+    bf_warm_joint after J1's re-class (the state is then (_J1Mix, this class)); with F6 off it is BF1's own warm."""
+    key = id(STF)
+    if key not in _WARM:
+        SBF = BF.bf_classes(STF)[0]
+
+        class TentStateBFInt(SBF):
+            def bf_warm_joint(self) -> dict:
+                """TentStateBF.bf_warm_joint with the J1 locate (the lines marked "# INT"): pre, _j1_loc, loc2 on this
+                state's buffers (a selection of -1); vs.ti, vs.lst_buf, cc's call counts and J1's F6 call count
+                restored."""
+                if not getattr(self, "_j1_f6", False):                                              # INT
+                    return super().bf_warm_joint()                                                  # INT
+                vs = self._vs
+                why = self._cc_why(BF._PlanVS(vs))
+                R = int(vs.R)
+                hp = self._hps.get(R)
+                if why is not None or hp is None:
+                    return dict(ran=False, why=why or "no hoist buffers of R %d" % R, path="j1_loc")
+                H, B, T = self.H, self.B, int(vs.topk)
+                rs = self.rs
+                eng = rs.cache.layers[0].cache_engine
+                n0, calls0 = len(self.cc["events"]), dict(self.cc["calls"])
+                f6c0 = self.j1["f6calls"]                                                           # INT
+                ti0, lb0 = vs.ti.clone(), vs.lst_buf.clone()
+                try:
+                    vs.ti.fill_(-1)
+                    sel = vs.ti.view(H, B, R, T)
+                    ti, inj, sel_c, is_q, is_n = self._cc("pre", 0, sel, hp.qb3, hp.qb4, hp.qb1_4, vs.minus1)
+                    v = sel_c.view(H, B, R * T)
+                    valid, in_win, wslot, in_pool, pslot, keyh = self._j1_loc(0, v, eng, hp.fullv, vs)   # INT
+                    s = torch.sort(keyh, dim=-1).values
+                    self._cc("loc2", 0, s, v, valid, in_win, wslot, in_pool, pslot, sel, is_q, is_n, self._eb[0],
+                             self._sb1, self.cb0_id, vs.store_b.view(1, B, 1, 1), vs.lst_buf, vs.host_x, vs.minus1,
+                             vs.big, self._cap_t, int(vs.cap), int(STF.VR.FORK_BIG), False, bool(vs.ops.stats))
+                finally:
+                    vs.ti.copy_(ti0)
+                    vs.lst_buf.copy_(lb0)
+                    self.cc["calls"] = calls0
+                    self.j1["f6calls"] = f6c0                                                       # INT
+                ev = self.cc["events"][n0:]
+                for e in ev:
+                    e["warm"] = "store X %d (INT: the J1 locate)" % int(vs.X)
+                return dict(ran=True, X=int(vs.X), cap=int(vs.cap), compiled=[e["name"] for e in ev], path="j1_loc")
+
+        TentStateBFInt.__name__ = TentStateBFInt.__qualname__ = SBF.__name__ + "Int"
+        _WARM[key] = TentStateBFInt
+    return _WARM[key]
+
+
 def base_runner(STF, arm: str):
     """The runner class of the INT arm WITHOUT ST1 / ST2 (the J1 or J3 runner on the right base classes)."""
     if arm == "L4PTFDGUDCDI":
         return J1.j1_classes(STF)["L4PTFDGUDCDJ3"][1]                  # F1 + F2 + F6 + F3 on L4PTFDGUDCD
     if arm == "L4PTFDGUDKWCDI":
-        SBF, RBF = BF.bf_classes(STF)                                  # L4PTFDGUDKWCD + BF1
-        return J1.j1_wrap(STF, SBF, RBF, arm)[1]                       # + F1 + F2 + F6
+        RBF = BF.bf_classes(STF)[1]                                    # L4PTFDGUDKWCD + BF1
+        return J1.j1_wrap(STF, bf_state_int(STF), RBF, arm)[1]         # + F1 + F2 + F6 (+ the store-X warm on F6)
     raise IntError("unknown INT arm %r (one of %s)" % (arm, tuple(ARMS_INT)))
 
 

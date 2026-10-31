@@ -19,8 +19,9 @@
 #   DRYRUN=1 bash benchmarks/Efficiency/r2_int_step.sh --nosi <sha> <holder job> <run id> <cell>
 #
 # CELLS (--spec 3 --fork-store 0 --prefill-hook nocopy --tu-gemm natural --spec-twin fused --spec-body fused --spec-graph
-# on --spec-redirect on; --st1-commit rows; BF1 as r2_bf1_step.sh at 68028b1: --bf-ring 16 --bf-worker thread
-# --bf-close-wait-ms 0 --bf-packer gilfree --bf-threads 14 --bf-cap-groups 1024 --bf-late defer --bf-late-wait-ms 250;
+# on --spec-redirect on; --st1-commit rows; BF1 as r2_bf1_step.sh at 64e307f: --bf-ring / --bf-ncap per cell,
+# --bf-worker thread --bf-close-wait-ms 0 --bf-packer gilfree --bf-threads 14 --bf-cap-groups 2048 --bf-batch 8
+# --bf-late defer --bf-late-wait-ms 250;
 # docs/NOTES_int.md holds the protocol):
 #   intm the MINIATURE: C 73 (pool 10), B 8, 72 steps, probe 4, arms L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,
 #        L4PTFDGUDKWCD,L4PTFDGUDCDM,L4PTFDGUDKWCDM,L4PTFDGUDCDMT,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK (the ST3 control),
@@ -38,9 +39,10 @@
 # 01:11:41; i4dm2 (SH + 6 arms, B 8) 00:09:18. MODEL: inta = i4dca + one D-arm part (11.9 min) + SHJ1 (2) + compile
 # (<= 1) = about 62 min (margin 2.0); intb = i4dcb + 4 parts x 17.9 + SHJ1 (4) + the gilfree build (2) = about 149 min
 # (margin 1.8); intm = i4dm2 + 9 parts (about 1.3 min each) + SHJ1 + the build = about 24 min (margin 2.3). Memory: the
-# I4DC cells' --mem; BF1's landing ring at ring 16, n_cap 2048: 1.07 GB (the BF1 writer's figure); device peak of the
-# C 73 INT arm: MODEL about 81.1 GB (BF1's own B arm 81.0 GB, writer's MODEL, + ST1's private pool < 0.05 GB + the
-# compiled helpers' buffers about 0.03 GB), under the usable 83.75 GB (L60) by about 2.6 GB.
+# I4DC cells' --mem; BF1's landing ring per cell as r2_bf1_step.sh at 64e307f (intm / inta: ring 8 x n_cap 2048;
+# intb: ring 6 x n_cap 6144 = 1.21 GB); device peak of the C 73 INT arm at intb: MODEL about 81.7 GB (BF1's own B arm
+# about 81.6 GB, the BF1 writer's MODEL from bf1b's MEASURED 80.80 GB + the landing and the transport staging; + ST1's
+# private pool < 0.05 GB + the compiled helpers' buffers about 0.03 GB), under the usable 83.75 GB (L60) by about 2.0 GB.
 #
 # OUTPUT: OUTROOT/int_<run>_<holder>_<cell>/summary.json and the step record OUTROOT/int_<run>_<holder>_<cell>.step/,
 # both frozen. EXIT: as r2_j1_step.sh (the cell's exit 0-19 / 20 / 30 / 2; 1 STOP; 2 usage; 3 another GPU; 4 not one GPU;
@@ -77,22 +79,22 @@ DRY=${DRYRUN:-0}
 [[ $NSHA =~ ^[0-9a-f]{40}$ ]] || stop "--nosi '$NSHA' is not a full commit id"
 case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
 [[ $RUN =~ ^[a-z0-9]{1,16}$ ]] || stop "run id '$RUN' (1-16 of a-z 0-9)"
-K=3 STRESS=0 CHECK=0 NEEDPRED=0 PE=16 ACCT=0 BFX=0 NCAP=2048
+K=3 STRESS=0 CHECK=0 NEEDPRED=0 PE=16 ACCT=0 BFX=0 NCAP=2048 RING=8
 case $CELL in
     intm) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 PE=4 ACCT=1 STEP_MIN=55 MEM=100G
           ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDM,L4PTFDGUDKWCDM,L4PTFDGUDCDMT,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDCDMTR,L4PTFDGUDKWCDMTKR,L4PTFDGUDCDI,L4PTFDGUDKWCDI ;;
     inta) POOL=65 BATCH=216 STEPS=512 NEEDPRED=1 STEP_MIN=125 MEM=240G
           ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI ;;
-    intb) POOL=10 BATCH=318 STEPS=512 NEEDPRED=1 BFX=257 STEP_MIN=270 MEM=340G
+    intb) POOL=10 BATCH=318 STEPS=512 NEEDPRED=1 BFX=257 NCAP=6144 RING=6 STEP_MIN=270 MEM=340G
           ARMS=L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDKWCDI ;;
     *) stop "cell '$CELL' (intm, inta or intb)" ;;
 esac
-DESC="arms SH+$ARMS steps $STEPS K $K probe $PE check $CHECK stress $STRESS bf-store $BFX ncap $NCAP acct $ACCT"
+DESC="arms SH+$ARMS steps $STEPS K $K probe $PE check $CHECK stress $STRESS bf-store $BFX ncap $NCAP ring $RING acct $ACCT"
 CARGS=(--batch "$BATCH" --steps "$STEPS" --pool "$POOL" --spec "$K" --arms "$ARMS" --fork-store 0 --prefill-hook nocopy
        --tu-gemm natural --spec-journal-blocks 256 --spec-twin fused --spec-body fused --spec-graph on --spec-redirect on
        --probe-every "$PE" --check-every "$CHECK" --require-stress "$STRESS" --st1-commit rows --bf-store "$BFX"
-       --bf-ncap "$NCAP" --bf-ring 16 --bf-worker thread --bf-acct "$ACCT" --bf-close-wait-ms 0 --bf-packer gilfree
-       --bf-threads 14 --bf-cap-groups 1024 --bf-late defer --bf-late-wait-ms 250)
+       --bf-ncap "$NCAP" --bf-ring "$RING" --bf-worker thread --bf-acct "$ACCT" --bf-close-wait-ms 0 --bf-packer gilfree
+       --bf-threads 14 --bf-cap-groups 2048 --bf-batch 8 --bf-late defer --bf-late-wait-ms 250)
 FILE_KB=$((OUT_MB * 1024))
 MIN_LEFT=$((STEP_MIN * 60 + 600))
 for v in $(compgen -e); do case $v in SLURM_*|SRUN_*|SALLOC_*|SBATCH_*) stop "the environment exports $v" ;; esac; done

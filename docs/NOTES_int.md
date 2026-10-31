@@ -33,6 +33,16 @@ L4PTFDGUDKWCDMTKR (MTK + ST4) run in intm only (gates, correctness; their PEQ ch
 registration key. CPU: test_int.py::test_int_equal evaluates the cell's gates on the INT run + ST3 + ST4
 (`_int_full`: st3_attach / st4_attach in the cell's order) and checks that run = the INT run, every bit.
 
+BF1 64e307f (merged on the run commit 5418a3a; the lead's registration and grants kept): batched jobs (--bf-batch 8),
+--bf-cap-groups 2048, ring / n_cap per cell (intm, inta 8 x 2048; intb 6 x 6144 = 1.21 GB landing), the passed
+items, BF1's COUNTS gate for a store size other than REF's (r2_bf1_cell.counts_gate_bf: union.cap / store_slots
+declared and checked against X) and the store-X warm (TentStateBF.bf_warm_joint: loc2 compiles before the first
+capture). INT: the C 73 arm's COUNTS = counts_gate_bf; its warm runs on the J1 section's locate (F6) path
+(r2_int_arms.bf_state_int: pre, _j1_loc, loc2, the same inputs as the section's; J1's F6 call count restored), since
+the INT arm never calls the I4CC loc1. Memory at intb: MODEL about 81.7 GB (BF1's B arm about 81.6 GB from bf1b's
+MEASURED 80.80 GB + 0.67 landing + 0.12 transport staging, + ST1 pool + helpers), about 2.0 GB under 83.75 GB.
+PRED_INT_BY_B untouched (the lead re-registers 318).
+
 FIXES after the CPU run of 00bfb51 (cpu-logs int_00bfb51_int.txt):
 - Gate 0 (f): r2_st1_cell.py's comment named the INT cell file: reworded ("the INT cell"); r2_st1_commit.py's ST3 /
   ST4 docstrings name the INT classes' module: test_int declares both files (NAMED_BY: text allowed, no import of an

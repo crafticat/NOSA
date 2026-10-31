@@ -108,8 +108,8 @@ GRANT_inta = "2026-10-31T17:03:19Z"
 GRANT_intb = None
 # this cell's options (main strips them before the I4DC main); the BF1 defaults are r2_bf1_cell's
 OPT = dict(st1_commit="rows", ineg=None, bf_store=0, bf_ncap=2048, bf_ring=8, bf_worker="thread", bf_acct=0,
-           bf_close_wait_ms=0.0, bf_packer="gilfree", bf_threads=14, bf_cap_groups=1024, bf_late="defer",
-           bf_late_wait_ms=250.0)
+           bf_close_wait_ms=0.0, bf_packer="gilfree", bf_threads=14, bf_cap_groups=2048, bf_late="defer",
+           bf_late_wait_ms=250.0, bf_batch=8)
 _CUR = dict(arm=None)
 RECS = {}                                         # arm -> its summary record (the report lines after the main)
 EQF = {}                                          # arm -> its EQF gate passed
@@ -132,7 +132,7 @@ def bf_opt(arm: str) -> dict:
     return dict(mode=BF_ARMS.get(arm, "ce"), n_cap=OPT["bf_ncap"], ring=OPT["bf_ring"], worker=OPT["bf_worker"],
                 acct=bool(OPT["bf_acct"]), close_wait_ms=OPT["bf_close_wait_ms"], packer=OPT["bf_packer"],
                 threads=OPT["bf_threads"], gf=dict(cap_groups=OPT["bf_cap_groups"]), late=OPT["bf_late"],
-                late_wait_ms=OPT["bf_late_wait_ms"])                  # = r2_bf1_cell.bf_opt (68028b1)
+                late_wait_ms=OPT["bf_late_wait_ms"], batch=OPT["bf_batch"])   # = r2_bf1_cell.bf_opt (64e307f)
 
 
 class _HCProxy:
@@ -284,7 +284,8 @@ def int_arm_gates(gates0, arm, rd, rec, cpu, keep, check, B, pool, steps, L, pa)
     g = gates0(arm, rd, rec, cpu, keep, check, B, pool, steps, L, pa)
     if arm in INTA.KEEP_INT:                                           # BF1: its gate set against the D arm
         g = [x for x in g if not any(x[0] == arm + s for s in BFCELL.DROP)]
-        g.append(KC.counts_gate(arm, cpu["counts"], ref["counts"] if ref else None, d, skip=("round_blocks",)))
+        g.append(BFCELL.counts_gate_bf(arm, cpu["counts"], ref["counts"] if ref else None,   # the store X declared
+                                       (rd.get("bf") or {}).get("X")))                       # when --bf-store differs
         g.append(BFCELL.listed_gate(arm, rd.get("keep"), (ref or {}).get("keep"), d))
         g.append(BFCELL.bf_gate(arm, rd.get("bf"), "ce"))
     else:
@@ -395,7 +396,8 @@ def parse_own(argv):
     ap.add_argument("--bf-close-wait-ms", type=float, default=0.0)
     ap.add_argument("--bf-packer", default="gilfree", choices=BF.PACKERS)
     ap.add_argument("--bf-threads", type=int, default=14)
-    ap.add_argument("--bf-cap-groups", type=int, default=1024)
+    ap.add_argument("--bf-cap-groups", type=int, default=2048)
+    ap.add_argument("--bf-batch", type=int, default=8)
     ap.add_argument("--bf-late", default="defer", choices=BF.LATES)
     ap.add_argument("--bf-late-wait-ms", type=float, default=250.0)
     return ap.parse_known_args(argv)
@@ -414,8 +416,8 @@ def check_arms(arms, own, D) -> str:
         return "--bf-store %d: below the bound %d (0 = --fork-store's)" % (own.bf_store, bound)
     if own.bf_ncap < 1 or own.bf_ring < 2 or own.bf_close_wait_ms < 0 or not 1 <= own.bf_threads <= 64:
         return "--bf-ncap >= 1, --bf-ring >= 2, --bf-close-wait-ms >= 0, --bf-threads in 1 .. 64"
-    if own.bf_cap_groups < 1 or own.bf_late_wait_ms < 0:
-        return "--bf-cap-groups >= 1, --bf-late-wait-ms >= 0"
+    if not 16 <= own.bf_cap_groups <= 4096 or own.bf_late_wait_ms < 0 or not 1 <= own.bf_batch <= 64:
+        return "--bf-cap-groups in 16 .. 4096, --bf-late-wait-ms >= 0, --bf-batch in 1 .. 64 (r2_bf1_cell's rules)"
     bfa = [x for x in arms if x in BF_ARMS or x in INTA.KEEP_INT]
     if own.bf_packer == "gilfree" and bfa and not os.environ.get("TORCH_EXTENSIONS_DIR"):
         return "--bf-packer gilfree: TORCH_EXTENSIONS_DIR must name the run's build directory (never HOME)"
@@ -449,7 +451,7 @@ def main(argv=None) -> int:
     OPT.update(st1_commit=own.st1_commit, bf_store=own.bf_store, bf_ncap=own.bf_ncap, bf_ring=own.bf_ring,
                bf_worker=own.bf_worker, bf_acct=own.bf_acct, bf_close_wait_ms=own.bf_close_wait_ms,
                bf_packer=own.bf_packer, bf_threads=own.bf_threads, bf_cap_groups=own.bf_cap_groups,
-               bf_late=own.bf_late, bf_late_wait_ms=own.bf_late_wait_ms)
+               bf_late=own.bf_late, bf_late_wait_ms=own.bf_late_wait_ms, bf_batch=own.bf_batch)
     rc = D.main(rest)
     for line in report_lines():
         print(line)

@@ -337,6 +337,8 @@ def test_int_equal(key, scen):
         bf = rd["bf"]
         assert bf["committed"] > 0 and bf["used_store"] + bf["used_win"] > 0 and bf["error"] is None, bf   # BF1
         assert "j3" not in rd                                          # F3 is not in the BF1 arm
+        w = ev["runner"].meta["bf"]["warm"]                            # BF1's store-X warm on the J1 locate path
+        assert w["ran"] and w["path"] == "j1_loc" and w["X"] == ev["runner"].bf.X, w
     else:
         assert rd["j3"]["joint_captures"] > 0 and rd["j3"]["draft_layers"] > 0, rd["j3"]               # F3
     evg = _int_full(key, scen)                                         # the cell's INT arm: + ST4 (+ ST3 in the keep arm)
@@ -445,7 +447,8 @@ def test_int_cell_tables(monkeypatch):
     k2, kw2 = D.runner_choice("L4PTFDGUDKWCDI", True)
     assert (k1, kw1) == ("SCD", dict(cc_backend="inductor")) and k2 == "SKCD" and kw2["kcheck"] is True
     assert kw2["bf"] == dict(mode="ce", n_cap=2048, ring=8, worker="thread", acct=False, close_wait_ms=0.0,
-                             packer="gilfree", threads=14, gf=dict(cap_groups=1024), late="defer", late_wait_ms=250.0)
+                             packer="gilfree", threads=14, gf=dict(cap_groups=2048), late="defer", late_wait_ms=250.0,
+                             batch=8)
     BFC = _mod("r2_bf1_cell")                                          # the same keywords as the BF1 cell's
     monkeypatch.setenv("TORCH_EXTENSIONS_DIR", "/tmp/x")
     ab = BFC.parse_args(["--out", "x", "--workload", "w", "--arms", "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDB"])
@@ -567,24 +570,28 @@ def test_step_script_int(monkeypatch):
     C = _mod("r2_int_cell")
     D = C.configure()
     monkeypatch.setenv("TORCH_EXTENSIONS_DIR", "/tmp/x")
+    ring_ncap = dict(intm=(8, 2048), inta=(8, 2048), intb=(6, 6144))   # per cell, as r2_bf1_step.sh's bf1m / bf1b
     for cell, pool, batch, steps, check, stress, pe, acct, bfx, smin, mem, arms in CELLS:   # every cell's arguments
+        ring, ncap = ring_ncap[cell]
         argv = ["--out", "x", "--workload", "w", "--batch", str(batch), "--steps", str(steps), "--pool", str(pool),
                 "--arms", arms, "--check-every", str(check), "--require-stress", str(stress), "--probe-every", str(pe),
-                "--st1-commit", "rows", "--bf-store", str(bfx), "--bf-ncap", "2048", "--bf-ring", "16", "--bf-worker",
-                "thread", "--bf-acct", str(acct), "--bf-close-wait-ms", "0", "--bf-packer", "gilfree",
-                "--bf-threads", "14", "--bf-cap-groups", "1024", "--bf-late", "defer", "--bf-late-wait-ms", "250"]
+                "--st1-commit", "rows", "--bf-store", str(bfx), "--bf-ncap", str(ncap), "--bf-ring", str(ring),
+                "--bf-worker", "thread", "--bf-acct", str(acct), "--bf-close-wait-ms", "0", "--bf-packer", "gilfree",
+                "--bf-threads", "14", "--bf-cap-groups", "2048", "--bf-batch", "8", "--bf-late", "defer",
+                "--bf-late-wait-ms", "250"]
         own, rest = C.parse_own(argv)
         a = D.parse_args(rest)
         assert a.arms == arms.split(",") and C.check_arms(a.arms, own, D) is None, cell
-        assert (own.bf_ring, own.bf_threads, own.bf_cap_groups, own.bf_late, own.bf_late_wait_ms) == (16, 14, 1024,
-                                                                                                   "defer", 250.0)
-    bfs = (EFF / "r2_bf1_step.sh").read_text()                         # the same BF1 arguments as r2_bf1_step.sh
-    for w in ("--bf-ring 16", "--bf-threads 14", "--bf-cap-groups 1024", "--bf-late defer", "--bf-late-wait-ms 250",
-              "--bf-packer gilfree", "--bf-worker thread", "--bf-close-wait-ms 0"):
-        assert w in bfs and w in " ".join(src.split()), w
+        assert (own.bf_ring, own.bf_ncap, own.bf_threads, own.bf_cap_groups, own.bf_batch, own.bf_late,
+                own.bf_late_wait_ms) == (ring, ncap, 14, 2048, 8, "defer", 250.0), cell
         assert ("%s) POOL=%d BATCH=%d STEPS=%d" % (cell, pool, batch, steps)) in src, cell
         assert ("STEP_MIN=%d MEM=%s" % (smin, mem)) in src and arms in src, cell
-    assert "intm) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 PE=4 ACCT=1" in src and "BFX=257 STEP_MIN=270" in src
+    bfs = (EFF / "r2_bf1_step.sh").read_text()                         # the same BF1 arguments as r2_bf1_step.sh
+    for w in ('--bf-ring "$RING"', "--bf-threads 14", "--bf-cap-groups 2048", "--bf-batch 8", "--bf-late defer",
+              "--bf-late-wait-ms 250", "--bf-packer gilfree", "--bf-worker thread", "--bf-close-wait-ms 0",
+              "BFX=257 NCAP=6144 RING=6"):
+        assert w in " ".join(bfs.split()) and w in " ".join(src.split()), w
+    assert "intm) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 PE=4 ACCT=1" in src and "RING=6 STEP_MIN=270" in src
     for bad in ("j1m", "int", "intc"):
         r = _step(bad)
         assert r.returncode == 1 and "cell '%s'" % bad in r.stderr, (bad, r.returncode, r.stderr[-300:])
