@@ -317,6 +317,38 @@ def test_bf1_thread():
         bf["used_store"] + bf["used_win"]))
 
 
+REPORT_KEYS = ("mode", "packer", "late_mode", "late_wait_ms", "lanes_per_entry", "items", "committed", "no_room",
+               "no_room_deferred", "used_store", "unused", "pending", "bytes_sent", "bytes_used", "barrier_ms_median",
+               "late_age_ms_median", "room_free_mean", "transport", "device_bytes", "item_bytes", "error")
+
+
+@pytest.mark.parametrize("mode,packer,late", [("off", "torch", "drop"), ("off", "gilfree", "defer"),
+                                              ("ce", "torch", "drop"), ("ce", "torch", "defer"),
+                                              ("ce", "gilfree", "drop"), ("ce", "gilfree", "defer")])
+def test_bf1_report_every_mode(mode, packer, late, request):
+    """THE ATTRIBUTE CLASS (twice: tp in 9ca5796, lanes_e in 808bf2d): report(), stop() and bytes_device() work on a
+    fresh BgFetch in EVERY mode (off / ce x torch / gilfree x drop / defer), twice in a row, before any run; every key
+    the cell reads is present."""
+    gf = None
+    if packer == "gilfree" and mode != "off":
+        gf = dict(ext=request.getfixturevalue("gfext"), cls=X.W.pkg_load("r2_transport_gilfree_v3").GilfreeTransport)
+    X.CC.configure()
+    model, c, S, hz, tok0 = X.world(8, N_RUN, 0)
+    run = _builder(mode=mode, packer=packer, late=late, worker="thread", gf=gf)(model, c, S, hz, tok0)
+    bf = run.bf
+    assert bf.bytes_device() > 0
+    for i in range(2):
+        rep = bf.report()
+        bf.stop()
+        assert [k for k in REPORT_KEYS if k not in rep] == [], [k for k in REPORT_KEYS if k not in rep]
+        assert (rep["mode"], rep["packer"], rep["late_mode"]) == (mode, packer, late) and rep["error"] is None
+        assert rep["items"] == 0 and rep["items_sent"] == 0, rep
+        live_tp = packer == "gilfree" and mode != "off" and i == 0     # the transport reports once, then is closed
+        assert (rep["transport"] is not None) == live_tp, (i, rep["transport"])
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+                                                                     rep["lanes_per_entry"]))
+
+
 @pytest.mark.parametrize("late", ["drop", "defer"])
 def test_bf1_late(late):
     """A SLOW worker (stall 200 ms per job, tests only) makes jobs late at the joint pass's start. drop: abandoned

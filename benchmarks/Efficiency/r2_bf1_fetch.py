@@ -260,6 +260,7 @@ class BgFetch:
         if not (a.store_k.is_contiguous() and a.store_v.is_contiguous() and a.store_bias.is_contiguous()):
             raise BFError("the arena store views must be contiguous")
         self.n_cap, self.ring = int(n_cap), int(ring)
+        self.lanes_e = max(1, self.n_cap // self.H)     # gilfree: lanes per entry (a lane holds one block per head)
         self.nsnap = 4 * self.L
         self.lock = threading.RLock()                   # the epoch state (both threads; never held across a wait)
         self.cap_lock = threading.RLock()               # the worker's CUDA calls vs a graph capture (CUDA GRAPHS)
@@ -321,7 +322,6 @@ class BgFetch:
         self.land_reader = [None] * self.ring            # torch packer: the entry's last reader on the compute stream
         self.land_i = 0
         self.tp = None
-        self.lanes_e = max(1, self.n_cap // H)           # gilfree: lanes per entry (a lane holds one block per head)
         if self.packer == "torch":                       # landing (ring, n_cap x 64 rows, D): item-major rows
             self.land_k = torch.empty((self.ring, n, D), dtype=self.kdt, device=dev)
             self.land_v = torch.empty((self.ring, n, D), dtype=self.kdt, device=dev)
