@@ -178,7 +178,7 @@ D_OF = dict(C128="GUDCD", C73="GUDKCD")
 C_OF = dict(C128="GUDC", C73="GUDKC")
 
 
-def _make(arm, scen, ineg=None, worker="inline", check=None, kcheck=None):
+def _make(arm, scen, ineg=None, worker="inline", check=None, kcheck=None, late="drop"):
     """i4dc_world.d_builder with the INT runner (the cell's runner arguments): FakeGraphsJ3 for the F3 arm, test_st1's
     FakeCommitGraphs for the commit, BF1 with test_bf1's CPU options for the keep arm."""
     INTA = _mod("r2_int_arms")
@@ -203,7 +203,7 @@ def _make(arm, scen, ineg=None, worker="inline", check=None, kcheck=None):
         if keep:
             kw.update(keep=True, kwin=True, kcheck=bool(check) if kcheck is None else kcheck, kneg=None, kslots=None,
                       cneg=None, bf=dict(mode="ce", worker=worker, acct=True, bneg=None, n_cap=4096, ring=4,
-                                         packer="torch", gf=None, threads=2))
+                                         packer="torch", gf=None, threads=2, late=late))
         be = X.FakeGraphsDCD() if keep else TJ.FakeGraphsJ3()
         run = Runner(model, rs, sops, BC.HostClock(), graph_backend=be, st1_backend=TST.FakeCommitGraphs(), **kw)
         be.T = run.T
@@ -211,16 +211,16 @@ def _make(arm, scen, ineg=None, worker="inline", check=None, kcheck=None):
     return build
 
 
-def _builder(arm, scen, ineg=None, worker="inline"):
+def _builder(arm, scen, ineg=None, worker="inline", late="drop"):
     X.CC.configure()
     s = X.SCEN[scen]
     model, c, S, hz, tok0 = X.world(8, N_RUN, 0)
-    return _make(arm, scen, ineg=ineg, worker=worker)(model, c, S, hz, tok0, check_every=s["check_every"])
+    return _make(arm, scen, ineg=ineg, worker=worker, late=late)(model, c, S, hz, tok0, check_every=s["check_every"])
 
 
-def run_int(arm, scen="timing", ineg=None, worker="inline"):
+def run_int(arm, scen="timing", ineg=None, worker="inline", late="drop"):
     s = X.SCEN[scen]
-    run = _builder(arm, scen, ineg=ineg, worker=worker)
+    run = _builder(arm, scen, ineg=ineg, worker=worker, late=late)
     if s["fa"]:
         run.vs.fa_check = {}
     run.run(N_RUN)
@@ -236,13 +236,13 @@ def _plain(arm, scen="timing"):
 _I = {}
 
 
-def _int(key, scen="timing", ineg=None, worker="inline"):
-    k = (key, scen, ineg, worker)
+def _int(key, scen="timing", ineg=None, worker="inline", late="drop"):
+    k = (key, scen, ineg, worker, late)
     if k not in _I:
         _plain("D", scen)
         _plain(C_OF[key], scen)                                        # the C arm first: the joint helpers
         _plain(D_OF[key], scen)                                        # the D arm: the draft helpers, the reference
-        _I[k] = run_int(INT_ARMS[key], scen, ineg=ineg, worker=worker)
+        _I[k] = run_int(INT_ARMS[key], scen, ineg=ineg, worker=worker, late=late)
     return _I[k]
 
 
@@ -389,6 +389,21 @@ def test_int_lock():
                                                                            rb["bf"]["captures_locked"]))
 
 
+def test_int_defer():
+    """The C 73 INT arm with BF1's production late mode ("defer": a job not issued at the joint pass's start commits at
+    ITS layer, in the joint residency) and the thread worker: = the D arm's run (the BF1 record aside), no worker error,
+    the INT gates pass (INT-LOCK: the commit backend under BF1's lock)."""
+    INTA = _mod("r2_int_arms")
+    ev = _int("C73", "timing", worker="thread", late="defer")
+    rd = ev["rd"]
+    assert rd["bf"]["late_mode"] == "defer" and rd["bf"]["error"] is None and rd["bf"]["committed"] > 0, rd["bf"]
+    assert TS._diff(_plain("GUDKCD"), ev, skip=SKIP_REC + BF_REC, tensors_skip=TST.KV_KEYS + BF_T) == []
+    assert all(g[2] for g in INTA.int_gates("L4PTFDGUDKWCDI", rd, L))
+    _ev("INT DEFER: bf late %s, issued %s, committed %s, used %s" % (rd["bf"].get("late"), rd["bf"].get("issued"),
+                                                                   rd["bf"]["committed"], rd["bf"]["used_store"] +
+                                                                   rd["bf"]["used_win"]))
+
+
 def test_int_gate_plants():
     INTA = _mod("r2_int_arms")
     rd = dict(tent=dict(calls=dict(joint_passes=3)), j1=dict(calls=3 * L), st2=dict(layers=3 * L, fallback=0),
@@ -422,7 +437,11 @@ def test_int_cell_tables(monkeypatch):
     k2, kw2 = D.runner_choice("L4PTFDGUDKWCDI", True)
     assert (k1, kw1) == ("SCD", dict(cc_backend="inductor")) and k2 == "SKCD" and kw2["kcheck"] is True
     assert kw2["bf"] == dict(mode="ce", n_cap=2048, ring=8, worker="thread", acct=False, close_wait_ms=0.0,
-                             packer="gilfree", threads=8)
+                             packer="gilfree", threads=14, gf=dict(cap_groups=1024), late="defer", late_wait_ms=250.0)
+    BFC = _mod("r2_bf1_cell")                                          # the same keywords as the BF1 cell's
+    monkeypatch.setenv("TORCH_EXTENSIONS_DIR", "/tmp/x")
+    ab = BFC.parse_args(["--out", "x", "--workload", "w", "--arms", "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDB"])
+    assert set(BFC.bf_opt(ab, "L4PTFDGUDKWCDB")) == set(kw2["bf"])
     assert D.runner_choice("L4PTFDGUDKWCDX", False)[1]["bf"]["mode"] == "off"
     STC = _mod("r2_st1_commit")
     MTk = STC.st1_runner(X.DCL["L4PTFDGUDKWCD"][1], "rows", twin=True)
@@ -543,12 +562,18 @@ def test_step_script_int(monkeypatch):
     for cell, pool, batch, steps, check, stress, pe, acct, bfx, smin, mem, arms in CELLS:   # every cell's arguments
         argv = ["--out", "x", "--workload", "w", "--batch", str(batch), "--steps", str(steps), "--pool", str(pool),
                 "--arms", arms, "--check-every", str(check), "--require-stress", str(stress), "--probe-every", str(pe),
-                "--st1-commit", "rows", "--bf-store", str(bfx), "--bf-ncap", "2048", "--bf-ring", "8", "--bf-worker",
+                "--st1-commit", "rows", "--bf-store", str(bfx), "--bf-ncap", "2048", "--bf-ring", "16", "--bf-worker",
                 "thread", "--bf-acct", str(acct), "--bf-close-wait-ms", "0", "--bf-packer", "gilfree",
-                "--bf-threads", "8"]
+                "--bf-threads", "14", "--bf-cap-groups", "1024", "--bf-late", "defer", "--bf-late-wait-ms", "250"]
         own, rest = C.parse_own(argv)
         a = D.parse_args(rest)
         assert a.arms == arms.split(",") and C.check_arms(a.arms, own, D) is None, cell
+        assert (own.bf_ring, own.bf_threads, own.bf_cap_groups, own.bf_late, own.bf_late_wait_ms) == (16, 14, 1024,
+                                                                                                   "defer", 250.0)
+    bfs = (EFF / "r2_bf1_step.sh").read_text()                         # the same BF1 arguments as r2_bf1_step.sh
+    for w in ("--bf-ring 16", "--bf-threads 14", "--bf-cap-groups 1024", "--bf-late defer", "--bf-late-wait-ms 250",
+              "--bf-packer gilfree", "--bf-worker thread", "--bf-close-wait-ms 0"):
+        assert w in bfs and w in " ".join(src.split()), w
         assert ("%s) POOL=%d BATCH=%d STEPS=%d" % (cell, pool, batch, steps)) in src, cell
         assert ("STEP_MIN=%d MEM=%s" % (smin, mem)) in src and arms in src, cell
     assert "intm) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 PE=4 ACCT=1" in src and "BFX=257 STEP_MIN=270" in src

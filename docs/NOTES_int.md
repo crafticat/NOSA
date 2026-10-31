@@ -33,6 +33,18 @@ L4PTFDGUDKWCDMTKR (MTK + ST4) run in intm only (gates, correctness; their PEQ ch
 registration key. CPU: test_int.py::test_int_equal evaluates the cell's gates on the INT run + ST3 + ST4
 (`_int_full`: st3_attach / st4_attach in the cell's order) and checks that run = the INT run, every bit.
 
+BF1 68028b1 (BF1 dev 4-7, merged on b095d84: the DEFER mechanism, 14 packer threads, 1024-group chunks, the 250 ms
+host budget, the room check, the lead's BF1 registration). The defer hook is in TentStateBF._resid_joint (eager in the
+C 73 INT arm: no F3 there), so it does not touch IntLayer. The INT cell's BF1 options = r2_bf1_cell.bf_opt's keywords
+(gf cap_groups, late, late_wait_ms); the step script passes r2_bf1_step.sh's: --bf-ring 16 --bf-threads 14
+--bf-cap-groups 1024 --bf-late defer --bf-late-wait-ms 250 (test_int checks both scripts). CPU: test_int_defer (thread
+worker, defer) = the D arm's run, INT gates pass.
+MEMORY, C 73 INT arm at B 318 (MODEL): BF1's own B arm 81.0 GB (the BF1 writer's MODEL: L4PTFDGUDKWCD 77.69 GB MEASURED
+in i4ccb + the store at X 257 + the landing ring 1.07 GB at ring 16) + ST1's private pool (< 0.05 GB; the ST1 band
+ST1_peak_delta_gb (-0.01, 0.05)) + the compiled helpers' buffers (J1 pooling / F6 tables / ST2 / ST3 / ST4: about
+0.03 GB at B 318, MODEL from their shapes) = about 81.1 GB; the usable ceiling 83.75 GB (L60) leaves about 2.6 GB
+(margin rule >= 0.6 GB). The MEM gate of intb measures it.
+
 ## 2. The two collisions (benchmarks/Efficiency/r2_int_arms.py)
 
 1. ST2 x F1: both rungs override TentState._layer with a full copy. `IntLayer._layer` = `TwinST2._layer` with 2 lines
