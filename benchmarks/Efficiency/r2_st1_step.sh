@@ -17,20 +17,20 @@
 # CELLS (--spec 3 --fork-store 0 --prefill-hook nocopy --tu-gemm natural --spec-twin fused --spec-body fused --spec-graph
 # on --spec-redirect on --probe-every 16 --st1-commit rows):
 #   st1m the MINIATURE: C 73 (pool 10), B 8, 72 steps, arms L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,
-#        L4PTFDGUDKWCD,L4PTFDGUDCDM,L4PTFDGUDKWCDM, --check-every 1, --require-stress 1; every gate MUST. Run it first.
-#        STEP_MIN 30, --mem 100G.
-#   st1a timing, C 128 (pool 65), B 216, 512 steps, arms L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDM. STEP_MIN 130,
-#        --mem 240G. STOPS while r2_st1_cell.PRED_STAMP_ST1 is None at <sha>.
-#   st1b timing, C 73 (pool 10), B 318, 512 steps, arms L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM. STEP_MIN 200,
-#        --mem 340G. STOPS while PRED_STAMP_ST1 is None.
+#        L4PTFDGUDKWCD,L4PTFDGUDCDM,L4PTFDGUDKWCDM,L4PTFDGUDCDMT,L4PTFDGUDKWCDMT, --check-every 1, --require-stress 1;
+#        every gate MUST. Run it first. STEP_MIN 35, --mem 100G.
+#   st1a timing, C 128 (pool 65), B 216, 512 steps, arms L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDM,L4PTFDGUDCDMT.
+#        STEP_MIN 160, --mem 240G. STOPS while r2_st1_cell.PRED_STAMP_ST1 is None at <sha>.
+#   st1b timing, C 73 (pool 10), B 318, 512 steps, arms L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT.
+#        STEP_MIN 240, --mem 340G. STOPS while PRED_STAMP_ST1 is None.
 # Basis of STEP_MIN (MEASURED, sacct rows of the step records under OUTROOT): i4dca (SH + 3 arms, C 128 B 216) 00:47:32;
 # i4dcb (SH + 3 arms, C 73 B 318) 01:11:41; i4dm2 (SH + 6 arms, B 8) 00:09:08 and 00:09:18. MODEL: one more arm = one
-# more part: st1a 47:32 x 5 / 4 = 59.4 min (margin 2.2); st1b 71:41 x 5 / 4 = 89.6 min (margin 2.2); st1m 9:18 x 9 / 7 =
-# 12.0 min (margin 2.5). Memory: --mem as the I4DC cells (their sacct MaxRSS 3.1 GB).
+# more part: st1a 47:32 x 6 / 4 = 71.3 min (margin 2.2); st1b 71:41 x 6 / 4 = 107.5 min (margin 2.2); st1m 9:18 x 11 / 7
+# = 14.6 min (margin 2.4). Memory: --mem as the I4DC cells (their sacct MaxRSS 3.1 GB).
 #
 # REGISTERED: r2_st1_cell.PRED_ST1_BY_B and PRED_STAMP_ST1, TBD BY THE LEAD (`date -u`, in a commit BEFORE st1a / st1b).
-# The builder's MODEL: the comment block above PRED_ST1_BY_B. MUST gates: the I4DC cell's for every arm (an M arm: its D
-# arm's) and the M arms' -PEQ, -DCOUNTS, -TAIL-EQ, -CGRAPH.
+# The builder's MODEL: the comment block above PRED_ST1_BY_B. MUST gates: the I4DC cell's for every arm (an M / MT arm:
+# its D arm's) and the M / MT arms' -PEQ, -DCOUNTS, -TAIL-EQ, -CGRAPH (MT: also -TWIN).
 #
 # OUTPUT: OUTROOT/st1_<run>_<holder>_<cell>/summary.json and the step record OUTROOT/st1_<run>_<holder>_<cell>.step/
 # (command + pins incl. the uuid and its file, stdout, stderr, exit + accounting, sacct row), both frozen. EXIT: the
@@ -65,11 +65,12 @@ case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
 [[ $RUN =~ ^[a-z0-9]{1,16}$ ]] || stop "run id '$RUN' (1-16 of a-z 0-9)"
 K=3 STRESS=0 CHECK=0 NEEDPRED=0
 case $CELL in
-    st1m) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 STEP_MIN=30 MEM=100G
-          ARMS=L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDM,L4PTFDGUDKWCDM ;;
-    st1a) POOL=65 BATCH=216 STEPS=512 ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDM NEEDPRED=1 STEP_MIN=130 MEM=240G ;;
-    st1b) POOL=10 BATCH=318 STEPS=512 ARMS=L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM NEEDPRED=1 STEP_MIN=200
-          MEM=340G ;;
+    st1m) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 STEP_MIN=35 MEM=100G
+          ARMS=L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDM,L4PTFDGUDKWCDM,L4PTFDGUDCDMT,L4PTFDGUDKWCDMT ;;
+    st1a) POOL=65 BATCH=216 STEPS=512 ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDM,L4PTFDGUDCDMT NEEDPRED=1 STEP_MIN=160
+          MEM=240G ;;
+    st1b) POOL=10 BATCH=318 STEPS=512 ARMS=L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT NEEDPRED=1
+          STEP_MIN=240 MEM=340G ;;
     *) stop "cell '$CELL' (st1m, st1a or st1b)" ;;
 esac
 DESC="arms SH+$ARMS steps $STEPS K $K fork-store 0 check $CHECK stress $STRESS st1-commit rows"

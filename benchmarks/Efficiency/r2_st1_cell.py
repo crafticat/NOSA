@@ -2,11 +2,13 @@
 kstep-cpu-runs): the best arms with THE COMMIT CAPTURED AND MOVED BY ROW (benchmarks/Efficiency/r2_st1_commit.py):
   L4PTFDGUDCDM    = L4PTFDGUDCD   (C 128 B 216: the best arm there) + r2_st1_commit (mode --st1-commit, default rows)
   L4PTFDGUDKWCDM  = L4PTFDGUDKWCD (C 73 B 318: the best arm there) + the same
+  L4PTFDGUDCDMT, L4PTFDGUDKWCDMT = the M arm + ST2 (r2_st1_commit.TwinST2: the joint pass's twin section in one
+                    advance); its reference arm (PEQ, DCOUNTS, TAIL-EQ) is the M arm; -TWIN checks every joint layer ran it
 NO NEW KERNEL. The I4DC cell (benchmarks/Efficiency/r2_i4dc_cell.py) is imported, not edited: its arms, its runner
 choice, its pure parts, its gates. Step script: benchmarks/Efficiency/r2_st1_step.sh (cells st1m, st1a, st1b).
 
 ONE PROCESS, ONE MODEL, SH FIRST, then the arms in the order of ARMS (L4PTFD first; a D arm after its C arm; an M arm
-after its D arm: the D arm is its PEQ reference and its prediction REF). Every arm runs run_arm_st1 = the I4DC cell's
+after its D arm: the D arm is its PEQ reference and its prediction REF; an MT arm after its M arm). Every arm runs run_arm_st1 = the I4DC cell's
 run_arm_d line for line plus the lines marked "# ST1" (the M runner class; the committed-row tail checksum of every arm;
 the ST1 record); tests_cpu/test_st1.py checks it.
 MUST GATES: the I4DC cell's for every arm (an M arm takes its D arm's gates under its own name: -RUN .. -EQF = L4PTFD bit
@@ -37,7 +39,11 @@ CCC, CD = DCC.CCC, DCC.CD
 S4, CC, IA, GC, DG, LN, GR, HC, KC, UC, DC, KP, SK = (DCC.S4, DCC.CC, DCC.IA, DCC.GC, DCC.DG, DCC.LN, DCC.GR, DCC.HC,
                                                       DCC.KC, DCC.UC, DCC.DC, DCC.KP, DCC.SK)
 I3C, WA, SC, BC = DCC.I3C, DCC.WA, DCC.SC, DCC.BC
-ST1 = dict(L4PTFDGUDCDM="L4PTFDGUDCD", L4PTFDGUDKWCDM="L4PTFDGUDKWCD")    # an M arm -> its D arm (the plain arm)
+ST1 = dict(L4PTFDGUDCDM="L4PTFDGUDCD", L4PTFDGUDKWCDM="L4PTFDGUDKWCD",       # an M arm -> its D arm (the plain arm)
+           L4PTFDGUDCDMT="L4PTFDGUDCDM", L4PTFDGUDKWCDMT="L4PTFDGUDKWCDM")  # an MT arm (+ ST2) -> its M arm
+ROOT = dict(L4PTFDGUDCDM="L4PTFDGUDCD", L4PTFDGUDKWCDM="L4PTFDGUDKWCD",      # an ST arm -> the D arm whose runner,
+            L4PTFDGUDCDMT="L4PTFDGUDCD", L4PTFDGUDKWCDMT="L4PTFDGUDKWCD")   # gates and compile it takes
+TWIN = ("L4PTFDGUDCDMT", "L4PTFDGUDKWCDMT")                                # the arms with ST2 (the twin section)
 ARMS = DCC.ARMS + tuple(ST1)
 GRAPH_ARMS = DCC.GRAPH_ARMS + tuple(ST1)
 BASE_D = DCC.BASE_D
@@ -70,7 +76,14 @@ USABLE_GB = DCC.USABLE_GB
 #   effect is at or below the spread; the commit phase median is the primary measure.
 #   ST1_peak_delta_gb (-0.01, 0.05): the static inputs (< 0.1 MB) and the private pool (MODEL < 20 MB) only.
 PRED_STAMP_ST1 = None
-PRED_KEYS = ("ST1_commit_saving", "ST1_joint_ratio", "ST1_draft_ratio", "ST1_vs_ref", "ST1_peak_delta_gb")
+#   ST2 (the MT arm against its M arm). MEASURED (r7pm, C 73 B 8): the joint pass's twin label 1,194 ops, 3.85 ms
+#   device (mostly < 5 us kernels; the op count does not grow with B). MODEL: ST2 leaves about 13 ops per layer of the
+#   37 (416 of 1,194 per pass); at 2.5-3 us per removed small op: (778 x 2.5 .. 3 us) = 1.9 .. 2.3 ms per joint pass
+#   (= per round) at any B; the replay and row steps run inside one fused kernel (the twin's per-step work is the same).
+#   BAND: ST2_joint_saving (1.0, 3.0) ms at B 216 and B 318; ST2_vs_m = round / (round - 1.0 .. 3.0): B 216 (1.003,
+#   1.010), B 318 (1.002, 1.006). The r7pa / r7pb labelled windows (C 128 / C 73) give the twin label at scale.
+PRED_KEYS = ("ST1_commit_saving", "ST1_joint_ratio", "ST1_draft_ratio", "ST1_vs_ref", "ST1_peak_delta_gb",
+             "ST2_joint_saving", "ST2_vs_m")
 PRED_ST1_BY_B = {216: {k: None for k in PRED_KEYS}, 318: {k: None for k in PRED_KEYS}}
 
 
@@ -79,8 +92,8 @@ def log(msg):
 
 
 def runner_choice(arm: str, check: bool):
-    """The I4DC cell's runner choice of the arm (an M arm: its D arm's)."""
-    return DCC.runner_choice(ST1.get(arm, arm), check)
+    """The I4DC cell's runner choice of the arm (an M or MT arm: its D arm's)."""
+    return DCC.runner_choice(ROOT.get(arm, arm), check)
 
 
 runner_class = DCC.runner_class
@@ -95,7 +108,7 @@ def parse_args(argv):
     ap.add_argument("--steps", type=int, default=512)
     ap.add_argument("--pool", type=int, default=65, help="the victim pool P (C = 63 + P); must equal NOSI_POOL_BLOCKS")
     ap.add_argument("--spec", type=int, default=3, help="K (contract 4; R = 4 = one fork tile)")
-    ap.add_argument("--arms", default="L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDM",
+    ap.add_argument("--arms", default="L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDM,L4PTFDGUDCDMT",
                     help="a subset of %s, in this order (SH runs first; L4PTFD first)" % ",".join(ARMS))
     ap.add_argument("--st1-commit", default="rows", choices=STC.MODES, help="the M arms' commit mode")
     ap.add_argument("--fork-store", type=int, default=0, help="X (0: the bound 1 + (K - 1) x 64)")
@@ -121,12 +134,13 @@ def parse_args(argv):
             ap.error("--arms: %s needs its C arm %s (it compiles the joint helpers)" % (x, c))
     for x, d in ST1.items():
         if x in a.arms and d not in a.arms:
-            ap.error("--arms: %s needs its D arm %s (the PEQ reference)" % (x, d))
+            ap.error("--arms: %s needs its reference arm %s (the PEQ reference)" % (x, d))
     if a.spec != 3:
         ap.error("--spec: K 3 only (R = K + 1 = 4 rows = one fork tile)")
     if a.batch < 1 or a.steps > 1000 or a.steps < 8:
         ap.error("--batch >= 1, --steps in 8 .. 1000")
-    if a.check_every == 1 and a.batch > 64 and any(x in a.arms for x in DCC.KEEP_ARMS + ("L4PTFDGUDKWCDM",)):
+    if a.check_every == 1 and a.batch > 64 and any(x in a.arms for x in DCC.KEEP_ARMS + ("L4PTFDGUDKWCDM",
+                                                                                            "L4PTFDGUDKWCDMT")):
         ap.error("--check-every 1 with a keep arm: the keep's byte check needs a scratch store: --batch <= 64")
     if a.probe_every < 2 or a.check_every < 0 or a.spec_journal_blocks < 1:
         ap.error("--probe-every >= 2, --check-every >= 0, journal >= 1")
@@ -152,7 +166,7 @@ def run_arm_st1(model, ids, inputs, steps: int, clock, opt, FORK, arm: str):
     check = opt["check_every"] == 1
     kind, kw = runner_choice(arm, check)
     Runner = runner_class(kind, STF)
-    Runner = STC.st1_runner(Runner, opt["st1_commit"]) if arm in ST1 else Runner   # ST1
+    Runner = STC.st1_runner(Runner, opt["st1_commit"], twin=arm in TWIN) if arm in ST1 else Runner   # ST1
     if kind in ("SC", "SKC", "SCD", "SKCD"):
         CC.configure()
     gb = 1024 ** 3
@@ -238,14 +252,24 @@ def cgraph_gate(arm, s1, calls_commit):
                 s1.get("pool_bytes"), s1.get("static_bytes")))
 
 
+def twin_gate(arm, s2, joint_passes: int, L: int):
+    """<arm>-TWIN (MUST): ST2 ran the twin section of EVERY joint pass and layer in one advance (no fallback)."""
+    if not s2:
+        return ("%s-TWIN" % arm, True, False, "no ST2 record")
+    ok = (s2.get("passes") == joint_passes and s2.get("layers") == joint_passes * L and s2.get("fallback") == 0
+          and s2.get("neg") is None)
+    return ("%s-TWIN" % arm, True, ok, "joint passes %s (ST2 passes %s), layers %s (expected %s), fallback %s, fused %s"
+            % (joint_passes, s2.get("passes"), s2.get("layers"), joint_passes * L, s2.get("fallback"), s2.get("fused")))
+
+
 def arm_gates_st1(arm, rd, rec, cpu, keep, check: bool, B: int, pool: int, steps: int, L: int, pa):
-    """The I4DC cell's arm gates; an M arm: its D arm's gates under its own name, then -PEQ, -DCOUNTS, -TAIL-EQ and
-    -CGRAPH against / about its D arm."""
+    """The I4DC cell's arm gates; an M / MT arm: its D arm's gates under its own name, then -PEQ, -DCOUNTS and
+    -TAIL-EQ against its reference arm (M: the D arm; MT: the M arm), -CGRAPH, and for an MT arm -TWIN."""
     if arm not in ST1:
         return DCC.arm_gates(arm, rd, rec, cpu, keep, check, B, pool, steps, L, pa)
-    x = ST1[arm]
-    out = [(arm + n[len(x):] if n.startswith(x + "-") else n, m, ok, d)
-           for n, m, ok, d in DCC.arm_gates(x, rd, rec, cpu, keep, check, B, pool, steps, L, pa)]
+    x, root = ST1[arm], ROOT[arm]
+    out = [(arm + n[len(root):] if n.startswith(root + "-") else n, m, ok, d)
+           for n, m, ok, d in DCC.arm_gates(root, rd, rec, cpu, keep, check, B, pool, steps, L, pa)]
     ref = keep.get(x)
     out.append(peq_gate(arm, cpu, ref, x, steps))
     g = KC.counts_gate(arm, cpu["counts"], ref["counts"] if ref else None, x)
@@ -253,6 +277,9 @@ def arm_gates_st1(arm, rd, rec, cpu, keep, check: bool, B: int, pool: int, steps
     out.append(tail_gate(arm, cpu.get("tails"), ref.get("tails") if ref else None, x))
     calls = (((rd.get("tent") or {}).get("calls")) or {}).get("commit")
     out.append(cgraph_gate(arm, rd.get("st1"), calls))
+    if arm in TWIN:
+        jp = (((rd.get("tent") or {}).get("calls")) or {}).get("joint_passes")
+        out.append(twin_gate(arm, rd.get("st2"), jp, L))
     return out
 
 
@@ -302,6 +329,14 @@ def verdicts(sp, B: int):
     out.append(("ST1-ARM", "REPORT", "X = %s, REF = %s (REF ran: %s); round median %s vs %s ms; commit %s vs %s ms" % (
         X, ST1[X], r is not None, (x.get("rates") or {}).get("round_ms_median"),
         ((r or {}).get("rates") or {}).get("round_ms_median"), ph(x, "commit"), ph(r, "commit"))))
+    XT = next((t for t in ("L4PTFDGUDKWCDMT", "L4PTFDGUDCDMT") if t in sp), None)
+    if XT is not None:                                                 # ST2 against its M arm
+        xt, rm = sp[XT], sp.get(ST1[XT])
+        band("ST2-JOINT-SAVING", diff(ph(rm, "joint"), ph(xt, "joint")), P.get("ST2_joint_saving"))
+        band("ST2-VS-M", ratio(med(xt), med(rm)), P.get("ST2_vs_m"))
+        out.append(("ST2-ARM", "REPORT", "XT = %s, REF = %s (REF ran: %s); joint %s vs %s ms; round %s vs %s ms" % (
+            XT, ST1[XT], rm is not None, ph(xt, "joint"), ph(rm, "joint"),
+            (xt.get("rates") or {}).get("round_ms_median"), ((rm or {}).get("rates") or {}).get("round_ms_median"))))
     return out
 
 

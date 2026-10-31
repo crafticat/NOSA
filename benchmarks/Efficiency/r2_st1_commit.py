@@ -34,6 +34,19 @@ THE CHANGE (TentState.commit's contract is kept: the same committed bytes, maps,
      equals the original's (the control of the uncommitted-row claim; 4 more ops per layer).
      MODE "where": the original code (the inherited commit) inside the graph: the LAUNCH-ONLY control (what the graph
      alone removes).
+ST2 (TwinST2; the arms L4PTFDGUDCDMT / L4PTFDGUDKWCDMT = the M arm + ST2). EVIDENCE (MEASURED, r7pm summary.json,
+L4PTFDGUDCDP round 12, labelled joint window, C 73 B 8): the "twin" label of the joint pass is 1,194 GPU ops (192
+_twin_kernel, 906 small, 96 copies), 3.85 ms device and 45.5 ms host per pass, EAGER (outside the joint graphs: the twin
+loop of spec_tentative.TentState._layer:338-352 runs per row: replay, pos.clone, 2 .contiguous, step_unchecked, the
+n_used / M_b copies). THE CHANGE: per joint pass, the step sequence of every request in position order (its active rows
+0 .. a - 1, a prefix; a group request's deferred replay before its draft row v) is gathered once per layer from
+(the rows' K / cis, the buffer's deferred row) and the twin ADVANCES it in ONE call: the shipped fused kernel's
+advance (r2_twin_fused.advance_fused, T = R + 1 steps, FROM_N, the per-step counters ctr) when the twin's step is the
+fused one, else the twin's advance_unchecked (step_unchecked per step); the rows' positions, n_used, M_b and the layer-0
+snapshot are gathered from ctr. The banks are independent (one program per bank; per-bank sums), so a bank's step
+sequence fixes its bits whatever the order of the banks' steps. Pad rows step nothing in both. NEGATIVE CONTROLS (tests
+only; tneg2): "no_replay_seq" (the replay step left out of the sequence), "no_shift" (the rows after the replay read the
+counters one step early).
 HOST COUNTS: TentState.calls["commit"] moves once per call in every mode (mode "where": the eager and the captured
 execution run the inherited code; a replay adds the count).
 NEGATIVE CONTROLS (tests only; sneg): "stale" (m is not copied before a replay), "no_phase2" (the next block's rows are
@@ -233,46 +246,200 @@ class CommitST1:
             st["backend"].release()
 
 
+TNEG2 = (None, "no_replay_seq", "no_shift")
+
+
+class TwinST2:
+    """ST2: THE TWIN SECTION OF A JOINT PASS IN ONE ADVANCE (module docstring, ST2). Overrides TentState._layer for a
+    pass of R > 1 rows (no test record): the same code, with the per-row twin loop (spec_tentative.py:338-352: per row
+    the deferred replay, pos.clone, two .contiguous copies, step_unchecked, the n_used / M_b copies, the layer-0
+    counter snapshot) replaced by ONE advance of every request's step sequence in position order (its active rows,
+    with the deferred replay before the draft row of a group request) and gathers of the per-step counters."""
+
+    def _st2_setup(self, tneg2) -> None:
+        if tneg2 not in TNEG2:
+            raise ValueError("ST2: control %r (one of %s)" % (tneg2, TNEG2))
+        mro = type(self).__mro__
+        base = None
+        for c in mro[mro.index(TwinST2) + 1:]:
+            if "_layer" in c.__dict__:
+                base = c.__dict__["_layer"]
+                break
+        if base is None:
+            raise RuntimeError("ST2: no inherited _layer")
+        f = getattr(self.rs.st.twins[0].step_unchecked, "func", None)
+        adv = f.__globals__.get("advance_fused") if (f is not None and getattr(f, "__name__", "") == "step_fused") \
+            else None
+        self._st2_base = base
+        self._st2 = dict(neg=tneg2, fused=adv is not None, passes=0, layers=0, fallback=0)
+        self._st2_adv = adv
+        self._st2_cur = None
+        self._st2_ctr = None
+        self._st2_bi = self.all_b.view(self.B, 1)
+
+    def _st2_pass(self, plan) -> dict:
+        """Per pass (cached on the plan object): the step sequence of every request (module docstring, ST2)."""
+        cur = self._st2_cur
+        if cur is not None and cur[0] is plan:
+            return cur[1]
+        B, R = self.B, plan.R
+        T = R + 1
+        dev = self.dev
+        act = plan.act                                                 # (R, B) bool: a prefix of rows per request
+        rr = torch.arange(R, dtype=torch.int64, device=dev).view(R, 1)
+        rows = tuple(plan.replay_rows)
+        if plan.replay is not None and rows:
+            keep = torch.zeros((R, 1), dtype=torch.bool, device=dev)
+            keep[list(rows)] = True
+            rmask = plan.replay & keep                                 # the replays of spec_tentative.py:339-340
+        else:
+            rmask = torch.zeros((R, B), dtype=torch.bool, device=dev)
+        rep = rmask.any(0)
+        if self.tneg == "no_replay" or self._st2["neg"] == "no_replay_seq":   # NEGATIVE CONTROLS (tests only)
+            seq_rep = torch.zeros_like(rep)
+        else:
+            seq_rep = rep
+        vb = (rmask.to(torch.int64) * rr).sum(0)                       # (B,): the row the replay precedes
+        jj = torch.arange(T, dtype=torch.int64, device=dev).view(1, T)
+        v1, s1 = vb.view(B, 1), seq_rep.view(B, 1)
+        idx = torch.where(s1 & (jj == v1), torch.full_like(jj, R), torch.where(s1 & (jj > v1), jj - 1, jj))
+        idx = idx.clamp(max=R)                                         # (B, T): 0 .. R - 1 a row's key, R the replay's
+        n = act.to(torch.int64).sum(0) + seq_rep.to(torch.int64)       # (B,): the steps of each request
+        shift = seq_rep.view(1, B) & (rr >= vb.view(1, B))
+        if self._st2["neg"] == "no_shift":                             # NEGATIVE CONTROL (tests only)
+            shift = torch.zeros_like(shift)
+        S = rr + shift.to(torch.int64)                                 # (R, B): the step index of row r
+        out = dict(idx=idx, n=n.contiguous(), S=S, S1=S + 1, i=(plan.deferred % self.bs) if plan.deferred is not None
+                   else torch.zeros((B,), dtype=torch.int64, device=dev), nrep=rmask.sum(), T=T)
+        self._st2_cur = (plan, out)
+        self._st2["passes"] += 1
+        return out
+
+    def _st2_twin(self, l, twin, k4, c3, plan):
+        """The twin section of layer l (module docstring, ST2). Returns pbs (the R rows' positions before their step)."""
+        B, R = self.B, plan.R
+        pp = self._st2_pass(plan)
+        T = pp["T"]
+        if l == 0:                                                     # TentState._replay's host count and counter
+            self.calls["replay_calls"] += len(tuple(plan.replay_rows))
+            if self.tneg != "no_replay" and plan.replay_rows:
+                self.c["replays"] += pp["nrep"]
+        i = pp["i"]
+        dk, dc = twin.ring.dtype, twin.total_cis.dtype
+        kr = self.k[l][self.all_b, i]                                  # spec_tentative.py:386-387 (the deferred row)
+        cr = self.bias[l][self.all_b, i]
+        ek = torch.cat((k4.to(dk), kr.to(dk).unsqueeze(1)), 1)         # (B, R + 1, H, D)
+        ec = torch.cat((c3.to(dc), cr.to(dc).unsqueeze(1)), 1)         # (B, R + 1, H)
+        bi = self._st2_bi
+        sk = ek[bi, pp["idx"]]                                         # (B, T, H, D): each request's steps in order
+        sc = ec[bi, pp["idx"]]
+        if self._st2_adv is not None:                                  # the fused twin: ONE kernel for T steps
+            if self._st2_ctr is None or self._st2_ctr.shape[0] != T + 1:
+                self._st2_ctr = torch.empty((T + 1, 4, B), dtype=torch.int64, device=self.dev)
+            ctr = self._st2_adv(twin, sk, sc, pp["n"], out=self._st2_ctr)
+        else:                                                          # the torch twin: step_unchecked per step
+            ctr = twin.advance_unchecked(sk, sc, pp["n"])
+        pb = ctr[:, 0, :].gather(0, pp["S"])                           # (R, B): the position before row r's step
+        plan.vs.n_used.copy_(ctr[:, 1, :].gather(0, pp["S1"]).t())     # spec_tentative.py:348
+        plan.vs.M_b.copy_((pb // self.bs + 1).t())                     # spec_tentative.py:349
+        if l == 0 and plan.snap:                                       # spec_tentative.py:350-351
+            cs = ctr[:, :3, :].gather(0, pp["S1"].view(R, 1, B).expand(R, 3, B))
+            for r in range(R):
+                plan.ctr[r] = cs[r]
+        self._st2["layers"] += 1
+        return list(pb.unbind(0))
+
+    def _layer(self, l, layer, hidden, pos_flat, cos_sin_cache, plan):
+        """TentState._layer (spec_tentative.py:318-369) with the twin loop of a joint pass in one advance (ST2)."""
+        base = self._st2_base
+        if plan.R == 1 or self.rec is not None:
+            if plan.R > 1:
+                self._st2["fallback"] += 1
+            return base(self, l, layer, hidden, pos_flat, cos_sin_cache, plan)
+        VR = base.__globals__["VR"]
+        rs = self.rs
+        NL, st, lin = rs.nl, rs.st, plan.lin
+        B, R = self.B, plan.R
+        E = B * R
+        Hkv, D = layer.num_key_value_heads, layer.head_dim
+        twin = st.twins[l]
+        eng = rs.cache.layers[l].cache_engine
+        residual = hidden
+        h = NL.layer_norm(hidden, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
+        qkv = lin(h, layer.wqkv)
+        q, k, v, cis = NL.nosa_linear(qkv, layer.delta.weight, layer.A, layer.q_size, layer.kv_size, Hkv)
+        q = q.view(E, -1)
+        k = k.view(E, -1)
+        NL.apply_rope_with_cos_sin_cache_inplace(pos_flat, q, k, D, cos_sin_cache, True)
+        q = q.reshape(E, layer.num_heads, D)
+        k4 = k.reshape(B, R, Hkv, D)
+        v4 = v.reshape(B, R, Hkv, D)
+        c3 = cis.reshape(B, R, Hkv)
+        pbs = self._st2_twin(l, twin, k4, c3, plan)                    # ST2: 2. the twin (and the deferred replay)
+        sel = VR._select_rows(plan.vs, layer, q, twin)                 # 3. the selection
+        q4 = q.view(B, R, q.shape[1], q.shape[2])
+        attn = self._rows(l, eng, twin, sel, q4, k4, v4, pbs, plan).reshape(E, 1, -1)
+        hidden = residual + lin(attn, layer.wo)
+        residual = hidden
+        h = NL.layer_norm(hidden, layer.post_attention_layernorm_variance_epsilon, layer.post_attention_layernorm_weight)
+        h = lin(h, layer.gate_up_proj)
+        out = torch.empty(h.shape[:-1] + (h.shape[-1] // 2,), dtype=h.dtype, device=h.device)
+        NL.silu_and_mul(h, out)
+        return residual + lin(out, layer.down_proj)
+
+    def st2_report(self) -> dict:
+        return dict(self._st2)
+
+
 _STATES = {}
 _RUNNERS = {}
 
 
-def state_class(S):
-    """The state class S with the mixin (cached)."""
-    if S not in _STATES:
-        _STATES[S] = type(S.__name__ + "ST1", (CommitST1, S), {})
-    return _STATES[S]
+def state_class(S, twin: bool = False):
+    """The state class S with the mixin(s) (cached): CommitST1, and with twin also TwinST2."""
+    key = (S, bool(twin))
+    if key not in _STATES:
+        bases = ((TwinST2,) if twin else ()) + (CommitST1, S)
+        _STATES[key] = type(S.__name__ + ("ST12" if twin else "ST1"), bases, {})
+    return _STATES[key]
 
 
-def st1_runner(R, mode: str = "rows", sneg=None):
-    """The runner class R (a best arm's) whose state commits by ST1 in `mode` (cached per (R, mode, sneg)). Its
-    __init__ takes st1_backend (None: CudaGraphsPrivate) besides R's arguments."""
-    if mode not in MODES or sneg not in SNEG:
-        raise ValueError("ST1: mode %r (one of %s), control %r (one of %s)" % (mode, MODES, sneg, SNEG))
-    key = (R, mode, sneg)
+def st1_runner(R, mode: str = "rows", sneg=None, twin: bool = False, tneg2=None):
+    """The runner class R (a best arm's) whose state commits by ST1 in `mode` and, with twin, runs the joint pass's
+    twin section by ST2 (cached per (R, mode, sneg, twin, tneg2)). Its __init__ takes st1_backend (None:
+    CudaGraphsPrivate) besides R's arguments."""
+    if mode not in MODES or sneg not in SNEG or tneg2 not in TNEG2:
+        raise ValueError("ST1: mode %r (one of %s), control %r (one of %s), twin control %r (one of %s)" % (
+            mode, MODES, sneg, SNEG, tneg2, TNEG2))
+    key = (R, mode, sneg, bool(twin), tneg2)
     if key not in _RUNNERS:
         class RunnerST1(R):
-            _st1_mode, _st1_sneg = mode, sneg
+            _st1_mode, _st1_sneg, _st2_on, _st2_neg = mode, sneg, bool(twin), tneg2
 
             def __init__(self, *args, st1_backend=None, **kw):
                 super().__init__(*args, **kw)
                 T = self.T
-                T.__class__ = state_class(type(T))
+                T.__class__ = state_class(type(T), self._st2_on)
                 T._st1_setup(self._st1_mode, self._st1_sneg,
                              st1_backend if st1_backend is not None else CudaGraphsPrivate(), self.vs, int(self.K))
+                if self._st2_on:
+                    T._st2_setup(self._st2_neg)
                 self.meta.update(st1=dict(mode=self._st1_mode, sneg=self._st1_sneg, J=T._st1["J"],
-                                          backend=type(T._st1["backend"]).__name__))
+                                          backend=type(T._st1["backend"]).__name__, twin=self._st2_on,
+                                          tneg2=self._st2_neg))
 
             def read(self) -> dict:
                 out = super().read()
                 out.update(st1=self.T.st1_report())
+                if self._st2_on:
+                    out.update(st2=self.T.st2_report())
                 return out
 
             def detach(self) -> None:
                 self.T._st1_release()
                 super().detach()
 
-        RunnerST1.__name__ = RunnerST1.__qualname__ = R.__name__ + "ST1"
+        RunnerST1.__name__ = RunnerST1.__qualname__ = R.__name__ + ("ST12" if twin else "ST1")
         _RUNNERS[key] = RunnerST1
     return _RUNNERS[key]
 

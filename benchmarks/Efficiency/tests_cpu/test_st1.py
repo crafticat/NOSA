@@ -14,6 +14,10 @@ EQUAL     test_st1_equal (both D arms x the three modes; the check scenario for 
           uncommitted rows); the committed tail rows and the committed host rows equal; 1 warm call, 1 capture, every
           later commit replayed; the overflow counter 0; PRECONDITIONS: a block filled in the run, a commit of m >= 2.
 CONTROLS  test_st1_controls: "stale", "no_phase2" and "narrow" each CHANGE the run (not a no-op: lesson L34).
+ST2       test_st2_equal (both D arms, timing and check): the MT run (M + the twin section in one advance) = the M run,
+          every bit, and = the D run outside the uncommitted tail rows; every joint layer ran ST2 (no fallback); the
+          replay counters equal; PRECONDITION: deferred replays ran. test_st2_controls: "no_replay_seq" and "no_shift"
+          CHANGE the run. test_st2_pass_plan: the step sequence of a planted plan (group with replay, final, fill, done).
 CELL      test_st1_cell_pure (arguments, the gates on CPU evidence pass, their plants fail), test_step_script_st1.
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rfEs benchmarks/Efficiency/tests_cpu/test_st1.py
@@ -165,12 +169,14 @@ class FakeCommitGraphs(XG.FakeGraphs):
         return g, out
 
 
-def m_builder(arm, mode="rows", sneg=None, check=False, stats=False, kcheck=False, phase_marks=False, probe_every=0):
-    """The M arm's runner (the D arm's runner arguments of i4dc_world.d_builder) with FakeCommitGraphs."""
+def m_builder(arm, mode="rows", sneg=None, check=False, stats=False, kcheck=False, phase_marks=False, probe_every=0,
+              twin=False, tneg2=None):
+    """The M arm's runner (twin: the MT arm's; the D arm's runner arguments of i4dc_world.d_builder) with
+    FakeCommitGraphs."""
     STC = _mod("r2_st1_commit")
     W, WB, Z, I3, KA, RE, RW, SR = X.W, X.WB, X.Z, X.I3, X.KA, X.RE, X.RW, X.SR
     fa, fk = WB.fake_attention_u, Z.fake_fork
-    Runner = STC.st1_runner(X.DCL[X.DARMS[arm]][1], mode, sneg)
+    Runner = STC.st1_runner(X.DCL[X.DARMS[arm]][1], mode, sneg, twin=twin, tneg2=tneg2)
 
     def build(model, cache, S, horizon, tok0, K=X.K0, check_every=0, record=False):
         B = int(cache.layers[0].cache_engine._k_gpu.shape[0])
@@ -193,14 +199,15 @@ def m_builder(arm, mode="rows", sneg=None, check=False, stats=False, kcheck=Fals
     return build
 
 
-def run_m(arm, mode="rows", sneg=None, scen="timing", B=8, N=N_RUN, seed=0):
-    """One run of the M arm of `arm` (GUDCD, GUDKCD) in i4dc_world's scenario."""
+def run_m(arm, mode="rows", sneg=None, scen="timing", B=8, N=N_RUN, seed=0, twin=False, tneg2=None):
+    """One run of the M arm (twin: the MT arm) of `arm` (GUDCD, GUDKCD) in i4dc_world's scenario."""
     X.CC.configure()
     s = X.SCEN[scen]
     model, c, S, hz, tok0 = X.world(B, N, seed)
     kc = bool(s["check"]) and arm in X.KEEP
     run = m_builder(arm, mode, sneg, check=s["check"], stats=s["stats"], kcheck=kc, phase_marks=s["phase_marks"],
-                    probe_every=s["probe_every"])(model, c, S, hz, tok0, check_every=s["check_every"])
+                    probe_every=s["probe_every"], twin=twin, tneg2=tneg2)(model, c, S, hz, tok0,
+                                                                         check_every=s["check_every"])
     if s["fa"]:
         run.vs.fa_check = {}
     run.run(N)
@@ -216,12 +223,12 @@ def _plain(arm, scen="timing"):
 _M = {}
 
 
-def _m(arm, mode, sneg=None, scen="timing"):
-    key = (arm, mode, sneg, scen)
+def _m(arm, mode, sneg=None, scen="timing", twin=False, tneg2=None):
+    key = (arm, mode, sneg, scen, twin, tneg2)
     if key not in _M:
         _plain({"GUDCD": "GUDC", "GUDKCD": "GUDKC"}[arm], scen)        # the C arm first: it compiles the joint helpers
         _plain(arm, scen)                                              # the D arm (the reference)
-        _M[key] = run_m(arm, mode, sneg, scen)
+        _M[key] = run_m(arm, mode, sneg, scen, twin=twin, tneg2=tneg2)
     return _M[key]
 
 
@@ -310,8 +317,70 @@ def test_st1_controls(sneg):
                                                                            ev["rd"]["st1"]))
 
 
-# ------------------------------------------------------------------ the cell's pure parts
-def test_st1_cell_pure():
+# ------------------------------------------------------------------ ST2: the twin section in one advance
+@pytest.mark.parametrize("arm,scen", [("GUDCD", "timing"), ("GUDKCD", "timing"), ("GUDCD", "check"),
+                                      ("GUDKCD", "check")])
+def test_st2_equal(arm, scen):
+    m = _m(arm, "rows", None, scen)                                    # the M arm: the reference of the MT arm
+    ev = _m(arm, "rows", None, scen, twin=True)
+    base = _plain(arm, scen)
+    tb = base["rd"]["tent"]
+    assert tb["replays"] > 0 and tb["calls"]["replay_calls"] > 0, "precondition: deferred replays ran"
+    assert tb["calls"]["joint_passes"] > 0
+    bad = TS._diff(m, ev, skip=("st1", "st2", "compile"))
+    assert bad == [], bad[:10]                                         # THE CLAIM: the MT run = the M run, every bit
+    bad_d = TS._diff(base, ev, skip=("st1", "st2", "compile"), tensors_skip=KV_KEYS)
+    assert bad_d == [], bad_d[:10]                                     # and = the D run (KV outside uncommitted rows)
+    assert all(torch.equal(x, y) for x, y in zip(_kv_masked(base["runner"]), _kv_masked(ev["runner"])))
+    s2, rd = ev["rd"]["st2"], ev["rd"]
+    jp = rd["tent"]["calls"]["joint_passes"]
+    assert s2["passes"] == jp and s2["layers"] == jp * L and s2["fallback"] == 0 and s2["neg"] is None, s2
+    assert rd["tent"]["replays"] == tb["replays"] and rd["tent"]["calls"]["replay_calls"] == tb["calls"]["replay_calls"]
+    _ev("ST2 EQUAL %s %s: joint passes %d, replays %d; st2 %s" % (arm, scen, jp, tb["replays"], s2))
+
+
+@pytest.mark.parametrize("tneg2", ["no_replay_seq", "no_shift"])
+def test_st2_controls(tneg2):
+    m = _m("GUDCD", "rows")
+    try:
+        ev = _m("GUDCD", "rows", twin=True, tneg2=tneg2)
+    except Exception as e:                                             # a control that breaks the run is caught too
+        _ev("ST2 CONTROL %s: the run raised %s: %s" % (tneg2, type(e).__name__, str(e)[:200]))
+        return
+    bad = TS._diff(m, ev, skip=("st1", "st2", "compile"))
+    assert bad != [], "the control %s changed nothing (a no-op plant)" % tneg2
+    _ev("ST2 CONTROL %s: differences %d (first %s)" % (tneg2, len(bad), bad[:4]))
+
+
+def test_st2_pass_plan():
+    """The per-pass step sequence on a planted plan: a group request (v 2: rows 0, 1 verify, the replay, row 2 the
+    draft row), a final request (3 rows), a fill request (1 row), a done request (none); R 4."""
+    STC = _mod("r2_st1_commit")
+
+    class _P:
+        pass
+
+    class _T(STC.TwinST2):
+        def __init__(self):
+            self.B, self.dev, self.bs, self.tneg = 4, torch.device("cpu"), 64, None
+            self._st2 = dict(neg=None, passes=0)
+            self._st2_cur = None
+
+    t = _T()
+    p = _P()
+    p.R = 4
+    p.act = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0], [1, 1, 0, 0], [0, 0, 0, 0]], dtype=torch.bool)   # (R, B)
+    p.replay = torch.zeros((4, 4), dtype=torch.bool)
+    p.replay[2, 0] = True
+    p.replay_rows = (2,)
+    p.deferred = torch.tensor([130, 7, 9, 11])
+    pp = t._st2_pass(p)
+    assert pp["n"].tolist() == [4, 3, 1, 0]
+    assert pp["idx"][0].tolist() == [0, 1, 4, 2, 3]                    # rows 0, 1, the replay (slot R), row 2
+    assert pp["idx"][1, :3].tolist() == [0, 1, 2]
+    assert pp["S"][:, 0].tolist() == [0, 1, 3, 4] and pp["S"][:, 1].tolist() == [0, 1, 2, 3]
+    assert pp["i"].tolist() == [2, 7, 9, 11] and int(pp["nrep"]) == 1
+    assert t._st2_pass(p) is pp                                        # cached per plan
     C, STC = _mod("r2_st1_cell"), _mod("r2_st1_commit")
     base = ["--out", "/nonexistent/x", "--workload", "/nonexistent/w"]
     a = C.parse_args(base + ["--arms", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDM"])
@@ -321,7 +390,10 @@ def test_st1_cell_pure():
             C.parse_args(base + ["--arms", bad])
     with pytest.raises(SystemExit):
         C.parse_args(base + ["--st1-commit", "fast"])
-    assert C.ARMS[-2:] == ("L4PTFDGUDCDM", "L4PTFDGUDKWCDM") and C.PRED_STAMP_ST1 is None
+    assert C.ARMS[-4:] == ("L4PTFDGUDCDM", "L4PTFDGUDKWCDM", "L4PTFDGUDCDMT", "L4PTFDGUDKWCDMT")
+    assert C.PRED_STAMP_ST1 is None
+    with pytest.raises(SystemExit):                                    # an MT arm needs its M arm
+        C.parse_args(base + ["--arms", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDMT"])
     assert set(STC.MODES) == {"rows", "rowsx", "where"}
     # the gates on the CPU evidence (the GPU cell's inputs): the D arm's gates under the M name + PEQ, DCOUNTS, TAIL-EQ,
     # CGRAPH; every MUST passes
@@ -359,6 +431,24 @@ def test_st1_cell_pure():
         for plant in (dict(overflow=1), dict(captures=2), dict(replays=s1["replays"] - 1), dict(warm=0)):
             assert not C.cgraph_gate(name, dict(s1, **plant), n)[2], plant
         assert not C.cgraph_gate(name, s1, n + 1)[2]
+        # the MT arm: the D arm's gates under the MT name, PEQ / DCOUNTS / TAIL-EQ against the M arm, CGRAPH, TWIN
+        tname = name + "T"
+        et = _m(arm, "rows", twin=True)
+        keepd[name] = me
+        rdt = et["rd"]
+        rect = dict(graph=rdt["graph"], dgraph=rdt["dgraph"], gpu_peak_alloc_GB=1.0,
+                    mem_arena=dict(prefill_peak_GB=1.0))
+        gt = C.arm_gates_st1(tname, rdt, rect, cpu(et), keepd, False, 8, 10, N_RUN, L, 1.0)
+        namest = [g[0] for g in gt]
+        assert all(n_.startswith(tname + "-") for n_ in namest), namest
+        for want in ("-PEQ", "-DCOUNTS", "-TAIL-EQ", "-CGRAPH", "-TWIN", "-EQF"):
+            assert tname + want in namest, (want, namest)
+        assert all(g[2] for g in gt if g[1]), [g for g in gt if g[1] and not g[2]]
+        jp = rdt["tent"]["calls"]["joint_passes"]
+        assert C.twin_gate(tname, rdt["st2"], jp, L)[2]
+        for plant in (dict(fallback=1), dict(layers=rdt["st2"]["layers"] - 1), dict(passes=jp + 1)):
+            assert not C.twin_gate(tname, dict(rdt["st2"], **plant), jp, L)[2], plant
+        assert not C.twin_gate(tname, None, jp, L)[2]
     # the predictions: REPORT while nothing is registered, NOT_RUN without an M arm
     assert C.verdicts({}, 216) == [("ST1-RUN", "NOT_RUN", "no M arm ran")]
     sp = {"L4PTFDGUDCD": dict(rates=dict(median_tok_s=100.0, round_ms_median=10.0),
@@ -377,9 +467,9 @@ def test_step_script_st1():
     assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-st1 " in text and "CELLPY=benchmarks/Efficiency/r2_st1_cell.py" in text
     assert "grep -q '^PRED_STAMP_ST1 = None$'" in text and "benchmarks/Efficiency/r2_st1_commit.py" in text
     for cell, arms in (("st1m", "L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDM,"
-                                "L4PTFDGUDKWCDM"),
-                       ("st1a", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDM"),
-                       ("st1b", "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM")):
+                                "L4PTFDGUDKWCDM,L4PTFDGUDCDMT,L4PTFDGUDKWCDMT"),
+                       ("st1a", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDM,L4PTFDGUDCDMT"),
+                       ("st1b", "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT")):
         assert cell + ")" in text and "ARMS=" + arms in text, cell
         C = _mod("r2_st1_cell")
         assert C.parse_args(["--out", "/x", "--workload", "/w", "--arms", arms]).arms == arms.split(",")
