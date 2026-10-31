@@ -252,8 +252,9 @@ def bf_gate(arm, bf, mode: str):
     cons = (bf.get("committed", 0) + bf.get("revived", 0) + bf.get("no_room", 0)) == items
     tags = (bf.get("used_store", 0) + bf.get("used_win", 0) + bf.get("unused", 0) + bf.get("pending", 0)
             == bf.get("committed", 0) + bf.get("revived", 0))
-    ok = (bf.get("error") is None and bf.get("mode") == mode and (bf.get("issued") or 0) > 0 and items == sent
-          and (bf.get("committed") or 0) > 0 and cons and tags)
+    room = bf.get("no_room", 0) == 0 and bf.get("revived", 0) == 0    # THE ROOM RULE: the host never sends what the
+    ok = (bf.get("error") is None and bf.get("mode") == mode and (bf.get("issued") or 0) > 0 and items == sent   # commit
+          and (bf.get("committed") or 0) > 0 and cons and tags and room)                                     # cannot place
     if bf.get("packer") == "gilfree":                                  # the C++ team ran at the requested size
         ok = ok and bool((bf.get("transport") or {}).get("threads_ok"))
     return ("%s-BF" % arm, True, bool(ok),
@@ -353,7 +354,13 @@ def bf_lines(name, r) -> list:
                 round(bf.get("close_wait_s") or 0.0, 3), bf.get("snap_stall"), bf.get("captures_locked"),
                 round((bf.get("device_bytes") or 0) / 1e6, 1), nr.get("new_blocks_per_round"), nr.get("wait_ms_median"),
                 bf.get("error")),
-            "BF1 %s packer %s: transport %s" % (name, bf.get("packer"), bf.get("transport"))]
+            "BF1 %s packer %s: transport %s" % (name, bf.get("packer"), bf.get("transport")),
+            "BF1 %s ROOM: eligible slots per (head, request) at the epoch start mean %s min %s; demand per (head, request) "
+            "per epoch %s; items dropped for room BEFORE packing %s. LATE: queued %s, packing %s, of the last draft pass "
+            "%s; age at the close median %s ms, max %s ms; worker busy %s s" % (
+                name, bf.get("room_free_mean"), bf.get("room_free_min"), bf.get("room_demand_per_hb_mean"),
+                bf.get("items_room"), bf.get("late_queued"), bf.get("late_packing"), bf.get("late_last_pass"),
+                bf.get("late_age_ms_median"), bf.get("late_age_ms_max"), round(bf.get("worker_busy_s") or 0.0, 3))]
 
 
 # ------------------------------------------------------------------ main

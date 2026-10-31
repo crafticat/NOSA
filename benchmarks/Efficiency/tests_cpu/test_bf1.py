@@ -180,6 +180,16 @@ def test_pure_rows_rank_alive():
     kid[1, 0, 0], kage[1, 0, 0] = 9, 2 * 4                                  # column 0: never a key
     l_, h_, b_, k_ = BF.kept_alive(kid, kage, 2, 4, 50)
     assert list(zip(l_.tolist(), h_.tolist(), b_.tolist(), k_.tolist())) == [(1, 0, 1, 3)]
+    free, (l2, h2, b2, k2) = BF.store_room(kid, kage, 2, 4, 4, 50)     # THE ROOM RULE: empty or dead slots 1 .. X - 1
+    want = np.zeros((H, B), dtype=np.int64)
+    for hh in range(H):
+        for bb in range(B):
+            want[hh, bb] = sum(1 for x in range(1, 7) if kid[hh, bb, x] < 0 or kage[hh, bb, x] < 2 * 4)
+    assert free.tolist() == want.tolist() and free[0, 1] == 5 and free[1, 4] == 6     # the dead slot counts as free
+    assert sorted(zip(l2.tolist(), h2.tolist(), b2.tolist(), k2.tolist())) == [(0, 1, 4, 7), (1, 0, 1, 3)]
+    blk_ = np.zeros((1, 1, 6), dtype=bool)
+    blk_[..., 3:] = True
+    assert BF.store_room(kid, kage, 2, 4, 4, 50, blk_)[0][0, 0] == 3
 
 
 # ------------------------------------------------------------------ the world runs
@@ -381,10 +391,11 @@ def test_cell_pure(monkeypatch):
         C.parse_args(["--out", "/x", "--workload", "/w", "--bf-packer", "gilfree"])
     with pytest.raises(SystemExit):
         C.parse_args(base + ["--bf-threads", "0"])
-    good = dict(mode="ce", error=None, issued=3, items=10, items_sent=10, committed=7, revived=1, no_room=2,
-                used_store=4, used_win=1, unused=2, pending=1)
+    good = dict(mode="ce", error=None, issued=3, items=10, items_sent=10, committed=10, revived=0, no_room=0,
+                used_store=6, used_win=1, unused=2, pending=1)
     assert C.bf_gate("B", good, "ce")[2]
-    for k, v in (("error", "x"), ("items", 9), ("no_room", 3), ("unused", 3), ("committed", 0), ("issued", 0)):
+    for k, v in (("error", "x"), ("items", 9), ("no_room", 3), ("unused", 3), ("committed", 0), ("issued", 0),
+                 ("revived", 1)):
         assert not C.bf_gate("B", dict(good, **{k: v}), "ce")[2], k
     assert C.bf_gate("X", dict(mode="off", issued=0, items=0), "off")[2]
     assert not C.bf_gate("X", dict(mode="off", issued=1, items=4), "off")[2]

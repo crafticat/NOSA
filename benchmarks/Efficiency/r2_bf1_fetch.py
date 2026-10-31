@@ -29,7 +29,11 @@ THE MECHANISM (per round r, for J(r + 1); g = the host joint-pass index T.kpass 
   2. HOST WORKER (a thread; "inline" on the CPU tests): wait the event; the items (head, request, block); drop the items
      this epoch already sent and the items that the kept store holds ALIVE (a D2H snapshot of kid / kage after J(r):
      kage >= g L; only this mechanism writes the map between two joint passes and it never evicts such a slot, so the
-     drop is exact); cap n_cap; rank per (head, request); pack 64 K and 64 V rows (256 B each) per item with
+     drop is exact; a dead key the store holds is not sent either); THE ROOM RULE (store_room: the device commit's own
+     eligibility, counted on the snapshot and decremented per sent item): an item past its (head, request)'s eligible
+     slots is dropped BEFORE packing (bf1m at X 129 copied 63 % no-room bytes before this rule), so device no_room and
+     revived are 0 by construction (a MUST of the cell's BF gate); cap n_cap; rank per (head, request); pack 64 K and
+     64 V rows (256 B each) per item with
      torch.index_select into a pinned staging entry.
   3. ISSUE (one side stream, under the lock): wait the snapshot event (so it starts after J(r) on the device), the
      non_blocking H2D copies of the rows and the item table into the device landing entry, then THE COMMIT on the same
@@ -136,9 +140,13 @@ class _Epoch:
         self.seq, self.g, self.par, self.ev_map = int(seq), int(g), int(par), ev_map
         self.closed = False
         self.last = None                                 # the last issued commit's event
-        self.have = None                                 # host bitmap (L, H, B, NBLK): sent or kept alive
+        self.have = None                                 # host bitmap (L, H, B, NBLK): sent or held by the store
+        self.free = None                                 # host (H, B): the commit's eligible slots left (ROOM)
+        self.free0 = None                                # the same at the epoch's start (the report)
+        self.jobs_at_close = None
         self.jobs = self.issued = self.late = 0
-        self.items_seen = self.items_have = self.items_cap = self.items_sent = 0
+        self.items_seen = self.items_have = self.items_cap = self.items_sent = self.items_room = 0
+        self.t_close = None                              # host clock at the close (the late jobs' age)
 
 
 def rows_of(h, b, blk, T: int, H: int, bs: int):
@@ -159,6 +167,24 @@ def group_rank(h, b, B: int):
     start[1:] = grp[1:] != grp[:-1]
     first = np.maximum.accumulate(np.where(start, np.arange(n), 0))
     return np.arange(n, dtype=np.int64) - first
+
+
+def store_room(kid_h, kage_h, g: int, L: int, L_valid: int, nblk: int, block=None):
+    """THE ROOM RULE on the host (the device commit's own rule, _commit): (free (H, B): the slots 1 .. X - 1 that are
+    EMPTY or DEAD (kage < g L), minus the test-only blocked slots; and (l, h, b, blk): EVERY key the map holds, alive or
+    dead, so that a block the store holds is never sent again). Only BF1's commits write the map between two joint
+    passes, they take eligible slots only and make them alive, so the device finds exactly free - (items sent before in
+    the epoch) eligible slots: an item past its (head, request)'s room is dropped HERE, before any byte is packed."""
+    k1, a1 = kid_h[..., 1:], kage_h[..., 1:]
+    el = (k1 < 0) | (a1 < int(g) * int(L))
+    if block is not None:
+        el = el & ~block
+    h, b, _ = np.nonzero(k1 >= 0)
+    key = k1[k1 >= 0]
+    l = key >> 32
+    blk = key & (KM - 1)
+    ok = (l >= 0) & (l < L_valid) & (blk < nblk)
+    return el.sum(-1).astype(np.int64), (l[ok], h[ok], b[ok], blk[ok])
 
 
 def kept_alive(kid_h, kage_h, g: int, L: int, nblk: int):
@@ -221,6 +247,9 @@ class BgFetch:
         self.bar_ev = []                                 # (epoch seq, start, end) of every barrier wait
         self.side = None
         self.tp = None                                   # the gilfree transport (packer "gilfree", mode "ce" only)
+        self.late_ages = []                              # ms from enqueue to the close, per late job
+        kb = getattr(T, "kblock", None)                  # the keep's test-only slot limit, on the host (ROOM)
+        self.kblock_h = kb.cpu().numpy() if kb is not None else None
         self._alloc()
 
     # ---------------------------------------------------------- buffers
@@ -377,11 +406,16 @@ class BgFetch:
         with self.lock:
             ep = self.epoch
             ep.closed = True
+            ep.t_close = time.perf_counter()
+            ep.jobs_at_close = ep.jobs
             last = ep.last
             self.rep["close_wait_s"] = self.rep.get("close_wait_s", 0.0) + waited
             self.per_epoch.append(dict(seq=ep.seq, g=ep.g, jobs=ep.jobs, issued=ep.issued, late=ep.late,
                                        inflight_at_close=self.inflight, items_seen=ep.items_seen,
-                                       items_have=ep.items_have, items_cap=ep.items_cap, items_sent=ep.items_sent))
+                                       items_have=ep.items_have, items_room=ep.items_room, items_cap=ep.items_cap,
+                                       items_sent=ep.items_sent,
+                                       free_mean=(round(float(ep.free0.mean()), 2) if ep.free0 is not None else None),
+                                       free_min=(int(ep.free0.min()) if ep.free0 is not None else None)))
         if last is not None and self.cuda:
             a, b = self._ev(True), self._ev(True)
             a.record()
@@ -433,7 +467,7 @@ class BgFetch:
             ep = self.epoch
             ep.jobs += 1
             self.rep["jobs"] += 1
-        job = (ep, int(l), s)
+        job = (ep, int(l), s, ep.jobs - 1, time.perf_counter())
         if self.worker == "inline":                      # the CPU tests: the job at once, on the compute stream
             self._job(*job)
         else:
@@ -470,6 +504,7 @@ class BgFetch:
                 job = self.q.get()
                 if job is None:
                     return
+                tj = time.perf_counter()
                 try:
                     self._job(*job)
                 except BaseException as e:               # the compute thread raises it at its next hook
@@ -478,6 +513,7 @@ class BgFetch:
                 finally:
                     with self.cv:
                         self.inflight -= 1
+                        self.rep["worker_busy_s"] = self.rep.get("worker_busy_s", 0.0) + time.perf_counter() - tj
                         self.cv.notify_all()
 
     def stop(self) -> None:
@@ -486,7 +522,22 @@ class BgFetch:
             self.thread.join()
             self.thread = None
 
-    def _job(self, ep, l: int, s: int) -> None:
+    def _late(self, ep, j: int, t_enq: float, stage: str, n: int = 0) -> None:
+        """A job that the epoch's close abandoned (under the lock). THE CAUSE (lead's request): stage "queued" = the
+        worker had not started it when the joint pass closed the epoch; "packing" = closed while it was packed /
+        submitted. age = close time - its enqueue time (a job of the last draft layers has a small age: the barrier;
+        a large age: the worker's throughput); last_pass: it belongs to the last L jobs of the epoch."""
+        ep.late += 1
+        r = self.rep
+        r["late"] += 1
+        r["late_" + stage] = r.get("late_" + stage, 0) + 1
+        r["items_late"] = r.get("items_late", 0) + n
+        age = (ep.t_close - t_enq) * 1e3 if ep.t_close is not None else None
+        last = ep.jobs_at_close is not None and j >= ep.jobs_at_close - self.L
+        r["late_last_pass"] = r.get("late_last_pass", 0) + int(bool(last))
+        self.late_ages.append(age)
+
+    def _job(self, ep, l: int, s: int, j: int = 0, t_enq: float = 0.0) -> None:
         """Steps 2-3 of the module docstring for one (draft pass, layer) snapshot."""
         H, B, L, bs, D = self.H, self.B, self.L, self.bs, self.D
         with self.cap_lock:                              # a CUDA call: not during a capture
@@ -495,15 +546,16 @@ class BgFetch:
         self._release_snap(s)
         if ep.closed:
             with self.lock:
-                ep.late += 1
-                self.rep["late"] += 1
+                self._late(ep, j, t_enq, "queued")
             return
         t0 = time.perf_counter()
-        if ep.have is None:                              # the epoch's first job: the kept-alive keys
+        if ep.have is None:                              # the epoch's first job: the store's keys and its ROOM
             with self.cap_lock:
                 ep.ev_map.synchronize()
             ep.have = np.zeros((L, H, B, self.nblk), dtype=bool)
-            kl, kh, kb, kk = kept_alive(self.kid_h[ep.par].numpy(), self.kage_h[ep.par].numpy(), ep.g, L, self.nblk)
+            ep.free, (kl, kh, kb, kk) = store_room(self.kid_h[ep.par].numpy(), self.kage_h[ep.par].numpy(), ep.g, L,
+                                                   L, self.nblk, self.kblock_h)
+            ep.free0 = ep.free.copy()
             ep.have[kl, kh, kb, kk] = True
         h, b, m = np.nonzero(ids >= 0)
         blk = ids[h, b, m].astype(np.int64)
@@ -511,18 +563,24 @@ class BgFetch:
         inr = blk < self.nblk
         h, b, blk = h[inr], b[inr], blk[inr]
         keep = ~ep.have[l, h, b, blk]
-        h, b, blk = h[keep], b[keep], blk[keep]
+        h, b, blk = h[keep].astype(np.int64), b[keep].astype(np.int64), blk[keep]
         n_have = seen - h.shape[0]
+        room = group_rank(h, b, B) < ep.free[h, b]      # ROOM: never pack what the commit cannot place
+        n_room = int(h.shape[0] - room.sum())
+        h, b, blk = h[room], b[room], blk[room]
         n_cap = max(0, h.shape[0] - self.n_cap)
         h, b, blk = h[:self.n_cap], b[:self.n_cap], blk[:self.n_cap]
         n = int(h.shape[0])
         ep.have[l, h, b, blk] = True
+        np.subtract.at(ep.free, (h, b), 1)
         with self.lock:
             ep.items_seen += seen
             ep.items_have += n_have
+            ep.items_room += n_room
             ep.items_cap += n_cap
             self.rep["items_seen"] += seen
             self.rep["items_have"] += n_have
+            self.rep["items_room"] = self.rep.get("items_room", 0) + n_room
             self.rep["items_cap"] += n_cap
         if n == 0:
             with self.lock:
@@ -552,8 +610,7 @@ class BgFetch:
             with self.cap_lock:
                 if ep.closed:
                     with self.lock:
-                        ep.late += 1
-                        self.rep["late"] += 1
+                        self._late(ep, j, t_enq, "packing", n)
                     return
                 seq = int(self.tp.issue_desc(desc, reader_marks=readers, hist_mark=-1))   # T4: the snapshot waited
             jev = self.tp.job_ev(seq)
@@ -562,9 +619,7 @@ class BgFetch:
         with self.cap_lock, self.lock:                   # the issue: atomic against the epoch's close
             self.rep["pack_s"] += t1 - t0
             if ep.closed:                                # closed while packing: abandoned
-                ep.late += 1
-                self.rep["late"] += 1
-                self.rep["items_late"] = self.rep.get("items_late", 0) + n
+                self._late(ep, j, t_enq, "packing", n)
                 return
             ctx = torch.cuda.stream(self.side) if self.cuda else contextlib.nullcontext()
             with ctx:
@@ -676,6 +731,15 @@ class BgFetch:
         out["barrier_ms"] = [round(x, 3) for _, x in bw]
         out["barrier_ms_median"] = (sorted(x for _, x in bw)[len(bw) // 2] if bw else None)
         out["per_epoch"] = list(self.per_epoch)
+        ages = sorted(a for a in self.late_ages if a is not None)
+        out["late_age_ms_median"] = round(ages[len(ages) // 2], 3) if ages else None
+        out["late_age_ms_max"] = round(ages[-1], 3) if ages else None
+        fm = [p["free_mean"] for p in self.per_epoch if p.get("free_mean") is not None]
+        fn = [p["free_min"] for p in self.per_epoch if p.get("free_min") is not None]
+        out["room_free_mean"] = round(sum(fm) / len(fm), 2) if fm else None   # eligible slots per (head, request)
+        out["room_free_min"] = min(fn) if fn else None
+        dem = [p["items_seen"] - p["items_have"] for p in self.per_epoch]     # demand after the store / epoch dedup
+        out["room_demand_per_hb_mean"] = round(sum(dem) / len(dem) / (self.H * self.B), 2) if dem else None
         return out
 
 
