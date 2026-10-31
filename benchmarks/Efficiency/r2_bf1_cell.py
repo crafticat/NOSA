@@ -88,6 +88,19 @@ PRED_BF1_BY_B = {
     # bf1b counters (submit 1.32 ms per chunk, 72 % late) and the writer's per-epoch worker model with batches of 8.
     318: dict(BF1_vs_X=(1.015, 1.08), BF1_vs_R=(1.01, 1.08), BF1_new_ratio=(0.53, 0.75), BF1_wait_saving=(20.0, 45.0),
               BF1_joint_saving=(10.0, 35.0), BF1_draft_ratio=(1.00, 1.05), BF1_barrier_ms=(0.0, 10.0), BF1_eq=True)}
+# THE WRITER'S MODEL FOR THE PIPELINED WORKER (registration-ready for the lead; NOT registered here). Calibrated on bf1b b2
+# (R/bf1_b2_2195631_bf1b, c10bddf): gain per round = 40 f S - (6.2 + 2.5 S_d) - W_host - 22 S_J [ms; GB], f = 0.62 (NEW
+# 68,985 -> 41,582 blocks = 0.90 GB of S = 1.45 GB), S_J = S (1 - 185 / T_w) the bytes after the draft window, W_host =
+# 28.5 (T_w - 185) / 190 (0 at T_w <= 185; the measured 28.5 at T_w 375), S_d = S - S_J; the draft's fixed 6.2 ms is
+# the worker's host activity (old bf1b +7.0 ms at 0.34 GB, b2 +9.8 at 1.45 GB). Pipelined T_w = max(Python snap 83 +
+# select 52 + issue 52, C++ pack 93 + submit 60) + exposed wait = 190 .. 230 ms (central 200). Central T_w 200: S_J 0.11
+# GB, W_host 2.3, draft 6.2 + 2.5 x 1.34 + about 1.5 more host overlap = 11 ms: gain 36.0 - 11 - 2.3 - 2.4 = 20.3 ms of
+# X's 523.2 ms round: x1.040. Edge T_w 230, draft 12: gain 11 ms: x1.021; T_w 185, draft 9.8: gain 26 ms: x1.053.
+#   318 (pipelined): BF1_vs_X (1.01, 1.06), BF1_vs_R (1.005, 1.06), BF1_new_ratio (0.55, 0.66) (the selection is
+#   unchanged: b2 0.603), BF1_wait_saving (28, 44) ms (b2 36.0), BF1_joint_saving (15, 35) ms (model -36 + W_host +
+#   22 S_J = -31 .. -23), BF1_draft_ratio (1.03, 1.08), BF1_barrier_ms (0, 10), BF1_eq True. REPORT-only: worker busy
+#   180 .. 260 ms per epoch, deferred share of jobs 0 .. 0.25 (b2 0.59), host wait in the joint passes 0 .. 10 ms per
+#   round (b2 28.5), overlapped > 0.
 
 
 def runner_choice(arm: str, check: bool):
@@ -413,9 +426,11 @@ def bf_lines(name, r) -> list:
                           bf.get("deferred_committed"), bf.get("late_passed"), round(bf.get("late_wait_s") or 0.0, 3),
                           bf.get("no_room_deferred")),
             "BF1 %s WORKER BUDGET (ms per epoch; the draft window is about 185 ms at C 73 B 318): %s; batch %s, batches "
-            "%s, carried %s; chunks per epoch %s, submit %s ms per chunk (about 1.3 = per call, about 4 = per byte)" % (
+            "%s, carried %s; chunks per epoch %s, submit %s ms per chunk (about 1.3 = per call, about 4 = per byte); "
+            "PIPELINE: batches selected while the previous one was unfinished %s, with its C++ job still running %s" % (
                 name, bf.get("worker_ms_per_epoch"), bf.get("batch"), bf.get("batches"), bf.get("carried"),
-                bf.get("chunks_per_epoch"), (bf.get("transport") or {}).get("submit_ms_per_chunk"))]
+                bf.get("chunks_per_epoch"), (bf.get("transport") or {}).get("submit_ms_per_chunk"),
+                bf.get("pipelined"), bf.get("overlapped"))]
 
 
 # ------------------------------------------------------------------ main

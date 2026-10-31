@@ -20,7 +20,8 @@ WORLD     test_bf1_equal (timing and check scenarios, inline worker): L4PTFDGUDK
           test_bf1_gilfree (inline, thread) / test_bf1_gilfree_plant: the packer switch (r2_transport_gilfree_v3, packer
           v3 built here with OpenMP, as test_pool_prefetch.py builds it): the same claim and gates; the plant caught.
           test_bf1_gilfree_batch / test_bf1_carry: the worker's batches (one release of all layers, one commit; a job
-          that does not fit is carried, not dropped). test_bf1_store_x: a store X other than REF's (bf1b): COUNTS
+          that does not fit is carried, not dropped). test_bf1_pipeline: batch k's select runs while batch k - 1's
+          C++ job is pending (overlapped > 0; a stand-in pipe holds each submission 50 ms). test_bf1_store_x: a store X other than REF's (bf1b): COUNTS
           declares union.cap / store_slots, the warm compiles loc2 before the first capture; warm off -> COMPILE fails.
 CELL      test_cell_pure (arguments, gates on planted records, verdicts), test_counts_gate_bf (bf1b's COUNTS defect and
           its fix), test_step_script_bf1 (the cells' arguments parse; the pins name the BF1 files).
@@ -38,6 +39,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import warnings
 from pathlib import Path
 
@@ -467,6 +469,84 @@ def test_bf1_gilfree_batch(gfext):
     assert bf["batches"] < bf["jobs"], (bf["batches"], bf["jobs"])
     assert bf["batch_jobs_max"] > 1 and bf["batch_layers_max"] > 1, (bf["batch_jobs_max"], bf["batch_layers_max"])
     assert tp["releases"] <= bf["batches"] and tp["chunks"] == tp["groups"] >= bf["items_sent"] > 0, (tp, bf)
+    assert bf["used_store"] + bf["used_win"] > 0, bf
+
+
+class _SlowPipe:
+    """A NativePipe stand-in for the PIPELINE test: every call goes to the real pipe (the real job runs, its bytes are
+    the real ones), but a job's SUBMISSION is reported delay_s after its submit (submitted, wait_submission, wait_job,
+    job_done, stream_wait_job), as if the C++ worker packed and copied for that long (C 73 B 318: about 19 ms per
+    batch)."""
+
+    def __init__(self, real, delay_s):
+        self._real, self._delay, self._t = real, float(delay_s), {}
+
+    def submit(self, *args):
+        seq = int(self._real.submit(*args))
+        self._t[seq] = time.perf_counter() + self._delay
+        return seq
+
+    def _hold(self, seq):
+        d = self._t.get(int(seq), 0.0) - time.perf_counter()
+        if d > 0:
+            time.sleep(d)
+
+    @property
+    def submitted(self):
+        real, now = int(self._real.submitted), time.perf_counter()
+        held = [s for s, t in self._t.items() if t > now and s <= real]
+        return min(held) - 1 if held else real
+
+    def wait_submission(self, seq):
+        self._hold(seq)
+        return self._real.wait_submission(seq)
+
+    def wait_job(self, seq):
+        self._hold(seq)
+        return self._real.wait_job(seq)
+
+    def job_done(self, seq):
+        return self._t.get(int(seq), 0.0) <= time.perf_counter() and self._real.job_done(seq)
+
+    def stream_wait_job(self, seq, stream):
+        self._hold(seq)
+        return self._real.stream_wait_job(seq, stream)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _slow_transport(delay_s):
+    base = X.W.pkg_load("r2_transport_gilfree_v3").GilfreeTransport
+
+    class SlowTransport(base):
+        def __init__(self, *args, **kw):
+            super().__init__(*args, **kw)
+            self.npipe = _SlowPipe(self.npipe, delay_s)
+    return SlowTransport
+
+
+def test_bf1_pipeline(gfext):
+    """THE PIPELINE (bf1b b2: the Python and C++ stages ran in series, 375 ms per epoch): every C++ job's submission is
+    held 50 ms (_SlowPipe), batch 1 and a certain backlog (hold = the epoch's 2 L jobs, once per epoch), so batch k's
+    select starts while batch k - 1's job is still pending: OVERLAPPED > 0 (the counter of batches whose select ran
+    while the previous submission was pending). The claim (= L4PTFDGUDKWCD but where the bytes come from), the gates
+    and the counters hold with one batch in flight."""
+    _plain("GUDKC")
+    ref = _plain("GUDKCD")
+    ev = _run_bf("timing", worker="thread", packer="gilfree", gf=dict(ext=gfext, cls=_slow_transport(0.05)),
+                 threads=2, late="defer", late_wait_ms=60000.0, batch=1, hold=2 * L)
+    bf = ev["rd"]["bf"]
+    _ev("BF1 PIPELINE: jobs %d, batches %d, pipelined %s, overlapped %s; issued %d, deferred %s, late %d; worker ms per "
+        "epoch %s" % (bf["jobs"], bf["batches"], bf.get("pipelined"), bf.get("overlapped"), bf["issued"],
+                      bf.get("deferred"), bf["late"], bf["worker_ms_per_epoch"]))
+    bad = TS._diff(ref, ev, skip=DIFF_RD, tensors_skip=DIFF_T)
+    assert bad == [], bad[:10]
+    gs = _gates(ev, "timing")
+    assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
+    assert bf["error"] is None and bf["jobs"] == bf["issued"] + bf["late"] + bf["empty_jobs"], bf
+    assert bf["overlapped"] > 0 and bf["pipelined"] >= bf["overlapped"], (bf["pipelined"], bf["overlapped"])
+    assert bf["worker_ms_per_epoch"]["cxx_wait_s"] < bf["worker_ms_per_epoch"]["cxx_s"], bf["worker_ms_per_epoch"]
     assert bf["used_store"] + bf["used_win"] > 0, bf
 
 
