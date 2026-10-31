@@ -120,6 +120,9 @@ I3_NEW = I3_NEW + ("benchmarks/Efficiency/r2_recon7_protocol.py", "benchmarks/Ef
                    "benchmarks/Efficiency/r2_recon7_mem.py", "benchmarks/Efficiency/r2_recon7_step.sh",
                    "benchmarks/Efficiency/r2_i4c_cell.py", "benchmarks/Efficiency/r2_i4m_cell.py",
                    "benchmarks/Efficiency/r2_wsm_cell.py", T_ + "test_recon7.py", "docs/NOTES_recon7.md")      # RECON7
+# BF1 (nosi-r2-bf1: RECON7 cd0f0c5 + the draft-issued background fetch): its files (its own Gate 0: tests_cpu/test_bf1.py)
+I3_NEW = I3_NEW + ("benchmarks/Efficiency/r2_bf1_fetch.py", "benchmarks/Efficiency/r2_bf1_cell.py",
+                   "benchmarks/Efficiency/r2_bf1_step.sh", T_ + "test_bf1.py")                         # BF1
 
 
 def _load(name, path=None):

@@ -110,6 +110,11 @@ I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_recon7_protocol.py", "benchmarks/
                      "benchmarks/Efficiency/r2_wsm_cell.py", T_ + "test_recon7.py", "docs/NOTES_recon7.md")  # RECON7
 I4A_LATER = I4A_LATER + ("r2_recon7_protocol.py", "r2_recon7_probe.py", "r2_recon7_cell.py", "r2_recon7_streams.py",
                          "r2_recon7_mem.py", "r2_i4c_cell.py", "r2_i4m_cell.py", "r2_wsm_cell.py")       # RECON7
+# BF1 (nosi-r2-bf1: RECON7 cd0f0c5 + the draft-issued background fetch): its files (its own Gate 0: tests_cpu/test_bf1.py);
+# I4A_LATER: its modules may name the earlier modules (the scan skips them)
+I4A_NEW = I4A_NEW + ("benchmarks/Efficiency/r2_bf1_fetch.py", "benchmarks/Efficiency/r2_bf1_cell.py",
+                     "benchmarks/Efficiency/r2_bf1_step.sh", T_ + "test_bf1.py")                     # BF1
+I4A_LATER = I4A_LATER + ("r2_bf1_fetch.py", "r2_bf1_cell.py")                                     # BF1
 
 
 def _load(name, path=None):

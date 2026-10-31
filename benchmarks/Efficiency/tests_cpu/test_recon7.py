@@ -71,6 +71,8 @@ RECON7_NEW = tuple(E_ + m for m in MODULES) + (E_ + "r2_recon7_step.sh", T_ + "t
 RECON7_DECL = tuple(T_ + "test_%s.py" % n for n in ("wsa", "wsb", "wsc", "i2", "i3", "i4a", "i4g", "i4d", "i4k", "i4u",
                                                        "i4h", "i4s", "i4cc", "i4dc"))
 RECON7_EDITED = {T_ + "test_i4dc.py": "test_i4dc_gate0_files"}
+# BF1 (nosi-r2-bf1: RECON7 cd0f0c5 + the draft-issued background fetch): its files (its own Gate 0: tests_cpu/test_bf1.py)
+RECON7_NEW = RECON7_NEW + (E_ + "r2_bf1_fetch.py", E_ + "r2_bf1_cell.py", E_ + "r2_bf1_step.sh", T_ + "test_bf1.py")  # BF1
 HAND_KERNEL = ("import triton", "@triton.jit", "triton.jit", "load_inline", "cpp_extension", "tl.load", "tl.store")
 PE = 4                                 # the world's timing scenario: probe (and check) rounds every 4 rounds
 N_RUN = 48                             # committed tokens per request: about 16 rounds + the drain

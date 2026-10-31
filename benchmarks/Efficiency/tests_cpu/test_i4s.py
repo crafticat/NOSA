@@ -90,6 +90,10 @@ I4S_NEW = I4S_NEW + (E_ + "r2_recon7_protocol.py", E_ + "r2_recon7_probe.py", E_
                      "docs/NOTES_recon7.md")                                                      # RECON7
 I4S_LATER = I4S_LATER + ("r2_recon7_protocol.py", "r2_recon7_probe.py", "r2_recon7_cell.py", "r2_recon7_streams.py",
                          "r2_recon7_mem.py", "r2_i4c_cell.py", "r2_i4m_cell.py", "r2_wsm_cell.py")   # RECON7
+# BF1 (nosi-r2-bf1: RECON7 cd0f0c5 + the draft-issued background fetch): its files (its own Gate 0: tests_cpu/test_bf1.py);
+# I4S_LATER: its modules may name the earlier modules (the scan skips them)
+I4S_NEW = I4S_NEW + (E_ + "r2_bf1_fetch.py", E_ + "r2_bf1_cell.py", E_ + "r2_bf1_step.sh", T_ + "test_bf1.py")  # BF1
+I4S_LATER = I4S_LATER + ("r2_bf1_fetch.py", "r2_bf1_cell.py")                                     # BF1
 
 
 class Evidence(UserWarning):
