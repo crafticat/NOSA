@@ -523,12 +523,13 @@ def test_int_registration_state():
     C = _mod("r2_int_cell")
     src = (EFF / "r2_int_cell.py").read_text()
     if C.PRED_STAMP_INT is None:                                        # the builder's state: every value None
-        assert all(v is None for b in (216, 318) for v in C.PRED_INT_BY_B[b].values())
+        assert all(v is None for b in C.PRED_INT_BY_B for v in C.PRED_INT_BY_B[b].values())
     else:
         assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", C.PRED_STAMP_INT)
-    assert set(C.PRED_INT_BY_B) == {216, 318} and all(set(x) == set(C.PRED_KEYS_INT) for x in C.PRED_INT_BY_B.values())
+    assert set(C.PRED_INT_BY_B) == {216, 287, 318}                     # 287: the original anchor (intc)
+    assert all(set(x) == set(C.PRED_KEYS_INT) for x in C.PRED_INT_BY_B.values())
     assert ("\nPRED_STAMP_INT = None\n" in src) == (C.PRED_STAMP_INT is None)   # the step script's grep sees it
-    for cell in ("intm", "inta", "intb"):                               # the grants: None or a date -u stamp
+    for cell in ("intm", "inta", "intb", "intc"):                       # the grants: None or a date -u stamp
         g = getattr(C, "GRANT_%s" % cell)
         assert g is None or re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", g)
         assert (("\nGRANT_%s = None\n" % cell) in src) == (g is None)
@@ -549,7 +550,8 @@ CELLS = (("intm", 10, 8, 72, 1, 1, 4, 1, 0, 55, "100G",
           "L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDCDMTR,L4PTFDGUDKWCDMTKR,L4PTFDGUDCDI,L4PTFDGUDKWCDI"),
          ("inta", 65, 216, 512, 0, 0, 16, 0, 0, 125, "240G", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI"),
          ("intb", 10, 318, 512, 0, 0, 16, 0, 257, 270, "340G",
-          "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDKWCDI"))
+          "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDKWCDI"),
+         ("intc", 18, 287, 512, 0, 0, 16, 0, 0, 170, "300G", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI"))
 
 
 def test_step_script_int(monkeypatch):
@@ -570,7 +572,10 @@ def test_step_script_int(monkeypatch):
     C = _mod("r2_int_cell")
     D = C.configure()
     monkeypatch.setenv("TORCH_EXTENSIONS_DIR", "/tmp/x")
-    ring_ncap = dict(intm=(8, 2048), inta=(8, 2048), intb=(6, 6144))   # per cell, as r2_bf1_step.sh's bf1m / bf1b
+    ring_ncap = dict(intm=(8, 2048), inta=(8, 2048), intb=(6, 6144), intc=(8, 2048))   # per cell (bf1m / bf1b's)
+    C2 = _mod("r2_int_cell")
+    assert C2.PRED_INT_BY_B[287] is not None and "intc) POOL=18 BATCH=287 STEPS=512 NEEDPRED=1" in src
+    assert not [a for a in CELLS[3][-1].split(",") if a in C2.BF_ARMS or a in C2.INTA.KEEP_INT]   # intc: no BF1, keep
     for cell, pool, batch, steps, check, stress, pe, acct, bfx, smin, mem, arms in CELLS:   # every cell's arguments
         ring, ncap = ring_ncap[cell]
         argv = ["--out", "x", "--workload", "w", "--batch", str(batch), "--steps", str(steps), "--pool", str(pool),
@@ -592,7 +597,7 @@ def test_step_script_int(monkeypatch):
               "BFX=257 NCAP=6144 RING=6"):
         assert w in " ".join(bfs.split()) and w in " ".join(src.split()), w
     assert "intm) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 PE=4 ACCT=1" in src and "RING=6 STEP_MIN=270" in src
-    for bad in ("j1m", "int", "intc"):
+    for bad in ("j1m", "int", "intd"):
         r = _step(bad)
         assert r.returncode == 1 and "cell '%s'" % bad in r.stderr, (bad, r.returncode, r.stderr[-300:])
     if str(ROOT) != STEP_ROOT or _git("status", "--porcelain", "--untracked-files=no").stdout.strip():

@@ -31,6 +31,12 @@
 #        STEP_MIN 55, --mem 100G.
 #   inta timing, C 128 (pool 65), B 216, 512 steps, probe 16, arms L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI. STEP_MIN
 #        125, --mem 240G. STOPS while PRED_STAMP_INT is None.
+#   intc THE ORIGINAL ANCHOR: timing, C 81 (pool 18), B 287, 512 steps, probe 16, arms L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,
+#        L4PTFDGUDCDI (the C 128 INT composition: F1 + F2 + F6 + F3 + ST1 + ST2 + ST4; no BF1, no keep). STEP_MIN 170
+#        (MEASURED inta 70 min at B 216 x 287 / 216 = 93 min, C 81's smaller attention set ignored: an upper side; margin
+#        1.8), --mem 300G. Memory: L4PTFD at C 81 B 287 peaks at 76.80 GB (MEASURED, r7mem); INT adds about 0.1 GB.
+#        STOPS while PRED_STAMP_INT is None; the B 287 keys of PRED_INT_BY_B are None (REPORT) until the lead registers
+#        them (with a new stamp) before intc.
 #   intb timing, C 73 (pool 10), B 318, 512 steps, probe 16, --bf-store 257 (as bf1b), --bf-ncap 2048, arms L4PTFD,
 #        L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDKWCDI (MTK = the ST3
 #        control; its PEQ reference MT needs M). STEP_MIN 270, --mem 340G. STOPS while PRED_STAMP_INT is None.
@@ -72,7 +78,7 @@ granted() {
 }
 main() {
 stop() { echo "R2 int step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_int_step.sh --nosi <sha> <holder> <run id> <intm|inta|intb>" >&2; exit 2; }
+usage() { echo "usage: r2_int_step.sh --nosi <sha> <holder> <run id> <intm|inta|intb|intc>" >&2; exit 2; }
 [ $# = 5 ] && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4 CELL=$5
 DRY=${DRYRUN:-0}
@@ -85,9 +91,11 @@ case $CELL in
           ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDM,L4PTFDGUDKWCDM,L4PTFDGUDCDMT,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDCDMTR,L4PTFDGUDKWCDMTKR,L4PTFDGUDCDI,L4PTFDGUDKWCDI ;;
     inta) POOL=65 BATCH=216 STEPS=512 NEEDPRED=1 STEP_MIN=125 MEM=240G
           ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI ;;
+    intc) POOL=18 BATCH=287 STEPS=512 NEEDPRED=1 STEP_MIN=170 MEM=300G
+          ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI ;;
     intb) POOL=10 BATCH=318 STEPS=512 NEEDPRED=1 BFX=257 NCAP=6144 RING=6 STEP_MIN=270 MEM=340G
           ARMS=L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDKWCDI ;;
-    *) stop "cell '$CELL' (intm, inta or intb)" ;;
+    *) stop "cell '$CELL' (intm, inta, intb or intc)" ;;
 esac
 DESC="arms SH+$ARMS steps $STEPS K $K probe $PE check $CHECK stress $STRESS bf-store $BFX ncap $NCAP ring $RING acct $ACCT"
 CARGS=(--batch "$BATCH" --steps "$STEPS" --pool "$POOL" --spec "$K" --arms "$ARMS" --fork-store 0 --prefill-hook nocopy

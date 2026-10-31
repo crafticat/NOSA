@@ -26,7 +26,7 @@ MUST GATES OF AN INT ARM (all components' + EQF = L4PTFD bit for bit):
   INT: -INT-CLASSES, -INT-LAYER, -INT-LOCK (C 73) (r2_int_arms.int_gates).
 REGISTERED PREDICTIONS PRED_INT_BY_B: every value None until the lead registers them with PRED_STAMP_INT (a None key is
 REPORT); the step script STOPS the timing cells (inta, intb) while PRED_STAMP_INT is None. THE CELL GRANTS GRANT_intm /
-GRANT_inta / GRANT_intb (default deny).
+GRANT_inta / GRANT_intb / GRANT_intc (default deny). intc = the original anchor (C 81 B 287, L4PTFDGUDCDI).
 EXIT: the I4DC cell's (the number of failed MUST gates 0-19; 20 refused; 30 an exception outside an arm); 2 an option
 or arm-order error of this cell.
 """
@@ -104,11 +104,16 @@ PRED_INT_BY_B = {
     318: dict(INT_vs_ref=(1.097, 1.179), INT_ratio=(0.726, 0.781), INT_vs_shj1=(0.700, 0.753),
               INT_vs_strongest=(0.550, 0.591), INT_joint_saving=(31.0, 59.0), INT_draft_saving=(8.5, 12.0),
               INT_commit_saving=(3.8, 4.8), INT_peak_gb=(80.8, 82.0), INT_eq=True, INT_st3_joint_saving=(3.0, 9.0),
-              INT_st3_vs_mt=(1.005, 1.018))}
+              INT_st3_vs_mt=(1.005, 1.018)),
+    # 287: THE ORIGINAL ANCHOR (cell intc: C 81 pool 18, B 287; the C 128 INT composition L4PTFDGUDCDI, no BF1 / keep).
+    # None until the lead registers them. MEMORY (MEASURED, r7mem): L4PTFD at C 81 B 287 peaks at 76.80 GB; the INT arm
+    # adds about 0.1 GB (MODEL: ST1's private pool + the compiled helpers' buffers).
+    287: {k: None for k in PRED_KEYS_INT}}
 # THE CELL GRANTS (default deny; r2_int_step.sh's granted() reads these lines at <sha>): the lead sets a `date -u` stamp.
 GRANT_intm = "2026-10-31T17:03:19Z"
 GRANT_inta = "2026-10-31T17:03:19Z"
 GRANT_intb = "2026-10-31T18:16:02Z"
+GRANT_intc = None
 # this cell's options (main strips them before the I4DC main); the BF1 defaults are r2_bf1_cell's
 OPT = dict(st1_commit="rows", ineg=None, bf_store=0, bf_ncap=2048, bf_ring=8, bf_worker="thread", bf_acct=0,
            bf_close_wait_ms=0.0, bf_packer="gilfree", bf_threads=14, bf_cap_groups=2048, bf_late="defer",
