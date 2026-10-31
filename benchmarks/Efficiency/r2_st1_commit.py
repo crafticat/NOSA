@@ -470,19 +470,26 @@ def kfa_fn(lst, kid, kage, kpass_d, l_t, big, L: int):
     """r2_i4k_combo.keep_assign_d up to the sort (kneg None, block None, no stats, no checks): the key, the hits (at most
     one per need: the keys are distinct), the slots that hold a needed key (protected), the alive test of the device
     step, the scores, the valid entries, the misses and their ranks. l_t, kpass_d, big: 0-d int64 tensors."""
+    # MASKS AS int64 0 / 1 (no mask & mask, no uint8): Inductor's CPU vectorizer emitted `VecMask<float> &
+    # VecMask<unsigned char>` for the mixed-dtype boolean masks of the first version and the C++ build failed
+    # (cpu-logs/int_00bfb51_st1.txt:165-195). Every mask here comes from an integer compare and is combined by integer
+    # arithmetic (int32 for the (needs x slots) product, int64 elsewhere); bools only at the outputs (stores) and as
+    # where conditions. The same values as keep_assign_d's.
     need = lst + l_t * KM                                              # KP: lst + int(l) x KM
     k1, a1 = kid[..., 1:], kage[..., 1:]
-    E = need.unsqueeze(-1) == k1.unsqueeze(-2)                         # (H, B, needs, slots)
-    hv, hs = E.to(torch.uint8).max(-1)
-    hit = hv != 0
-    used = E.any(-2)                                                   # (H, B, slots): holds a needed key
+    Ei = (need.unsqueeze(-1) == k1.unsqueeze(-2)).to(torch.int32)      # (H, B, needs, slots): 0 / 1 (two readers
+    ar1 = torch.arange(1, k1.shape[-1] + 1, dtype=torch.int32, device=k1.device)      # below: Inductor inlines it)
+    s1 = (Ei * ar1).sum(-1, dtype=torch.int64)                         # the hit's slot + 1, 0 without a hit (the keys
+    hit_i = (s1 > 0).to(torch.int64)                                   # are distinct: at most one 1 per need; KP:128)
+    hs = s1 - 1                                                        # = KP's max index where hit (unused elsewhere)
+    used_i = Ei.amax(-2).to(torch.int64)                               # (H, B, slots): holds a needed key
     td = kpass_d * L + l_t                                             # = KP's int(t), on the device
-    alive = a1 > (td - L)
-    score = torch.where(alive, ALIVE_BASE - a1, a1).masked_fill(used, PROTECT)
-    valid = lst < big
-    miss = valid & ~hit
-    rank = miss.cumsum(-1) - 1
-    return score, hit, hs, miss, valid, rank, need, td, used
+    alive_i = (a1 > (td - L)).to(torch.int64)
+    score = torch.where(used_i != 0, PROTECT, torch.where(alive_i != 0, ALIVE_BASE - a1, a1))   # where, masked_fill
+    valid_i = (lst < big).to(torch.int64)
+    miss_i = valid_i * (1 - hit_i)                                     # valid & ~hit
+    rank = miss_i.cumsum(-1) - 1
+    return score, hit_i != 0, hs, miss_i != 0, valid_i != 0, rank, need, td, used_i != 0
 
 
 def kfb_fn(order, hit, hs, miss, valid, rank, need, td, kid, kage, hx, lst, minus1, ph, in_lst, sb, sb1, row,
@@ -500,7 +507,7 @@ def kfb_fn(order, hit, hs, miss, valid, rank, need, td, kid, kage, hx, lst, minu
         kage.scatter_(-1, ws, td.expand(ws.shape))
     hx.fill_(-1)                                                       # slot 0 (CB1) and every hit: no load
     hx.scatter_(-1, widx, torch.where(miss, lst, minus1))
-    row[0:2].add_(torch.stack((valid, miss)).sum((1, 2, 3)))
+    row[0:2].add_(torch.stack((valid.to(torch.int64), miss.to(torch.int64))).sum((1, 2, 3)))
     at = (ph - sb1 + shift).clamp(0, kcap - 1)                         # the list rank of a listed block
     sq = slot.gather(-1, at.view(at.shape[0], at.shape[1], -1)).view_as(at)
     return torch.where(in_lst, sb + sq, ph), slot
@@ -624,21 +631,23 @@ def rpost_fn(nb, bm, lm, am, qb3, drf3, minus1, skipped, forced, injected, inj, 
     """r2_i4a_lean.TentStateFD._resid_lean after pool_swap (r2_i4a_lean.py:211-223), the gathers aside: the block-map
     update (nb = eng._new_block_map_buf, bm = eng._block_map, in place), tent, skip, ids, the block map's skipped loads
     (-1), the counters (in place: the layer's entry of skipped; where chk forced / injected). Returns (skip, ids).
-    chk: a 0-d bool tensor in production (ONE graph for check and timing passes: a Python bool would compile a second
-    graph at the first check pass, INT CPU run of 00bfb51, -DRESID), a Python bool in the planted test. Off: the
-    counters get + 0 (the same values). neg 1: no block-map mask; neg 2: no skipped count (the controls)."""
-    nbv = torch.where(am, nb, bm)
+    chk: a 0-d bool tensor (ONE graph for check and timing passes: a Python bool would compile a second graph at the
+    first check pass, INT CPU run of 00bfb51, -DRESID; the tests pass tensors too). Off: the counters get + 0 (the same
+    values). neg 1: no block-map mask; neg 2: no skipped count (the controls). Masks as int64 0 / 1 combined by int64
+    arithmetic (kfa_fn's rule: no mixed-dtype mask &, which Inductor's CPU vectorizer fails to build)."""
+    nbv = torch.where(am.to(torch.int64) != 0, nb, bm)
     nb.copy_(nbv)
-    tent = lm > qb3                                                    # = (lm >= 0) & (lm > qb3): qb3 >= 0
-    skip = (lm >= 0) & (drf3 | tent)
+    tent_i = (lm > qb3).to(torch.int64)                                # = (lm >= 0) & (lm > qb3): qb3 >= 0
+    skip_i = (lm >= 0).to(torch.int64) * torch.maximum(drf3.to(torch.int64), tent_i)   # (lm >= 0) & (drf | tent)
+    skip = skip_i != 0
     ids = torch.where(skip, minus1, lm)
-    bm.copy_(nbv if neg == 1 else nbv.masked_fill(skip, -1))           # LN: copy_, the gathers, masked_fill_
-    sel = arL == l_t                                                   # (L,): the layer's entry
+    bm.copy_(nbv if neg == 1 else torch.where(skip, -1, nbv))          # LN: copy_, the gathers, masked_fill_(skip, -1)
+    sel_i = (arL == l_t).to(torch.int64)                               # (L,): the layer's entry
     if neg != 2:
-        skipped.add_(torch.where(sel, (skip & ~tent).sum(), 0))
-    on = sel & chk                                                     # CHECK-ONLY counters (LN:221-223)
-    forced.add_(torch.where(on, tent.sum(), 0))
-    injected.add_(torch.where(on, inj.sum(), 0))
+        skipped.add_(sel_i * (skip_i * (1 - tent_i)).sum())            # (skip & ~tent).sum()
+    on_i = sel_i * chk.to(torch.int64)                                 # CHECK-ONLY counters (LN:221-223): + 0 off
+    forced.add_(on_i * tent_i.sum())
+    injected.add_(on_i * inj.to(torch.int64).sum())
     return skip, ids
 
 

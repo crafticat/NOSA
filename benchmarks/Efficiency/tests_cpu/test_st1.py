@@ -814,6 +814,7 @@ def _st4_rpost(P, f, chk, neg=0):
     nb, bm = P["nb"].clone(), P["bm"].clone()
     skipped, forced, injected = P["skipped"].clone(), P["forced"].clone(), P["injected"].clone()
     i64 = dict(dtype=torch.int64)
+    chk = chk if torch.is_tensor(chk) else torch.tensor(bool(chk))     # production form: a 0-d bool tensor
     skip, ids = f(nb, bm, P["lm"], P["am"], P["qb3"], P["drf3"], torch.tensor(-1, **i64), skipped, forced, injected,
                   P["inj"], torch.arange(P["L"], **i64), torch.tensor(P["l"], **i64), chk, neg)
     return dict(nb=nb, bm=bm, skipped=skipped, forced=forced, injected=injected, skip=skip, ids=ids)
