@@ -408,8 +408,15 @@ def test_cell_pure(monkeypatch):
                                     ("L4PTFDGUDKWCDX", 100.0, 340.0, 176.0, 100.0, 115.0),
                                     ("L4PTFDGUDKWCD", 101.0, 339.0, 176.0, 100.0, 116.0))}
     v = {p[0]: p for p in C.verdicts(sp, 318, True)}
-    assert v["BF1-VS-X"][1] == "REPORT" and "1.1000" in v["BF1-VS-X"][2] and v["BF1-NEW-RATIO"][2].startswith("0.5000")
-    assert C.PRED_STAMP_BF1 is None                                    # the lead registers (step script stops before)
+    P = C.PRED_BF1_BY_B[318]
+
+    def want(key, val):                                                # STATE-AWARE: REPORT before the registration
+        bb = P.get(key)
+        return "REPORT" if bb is None else ("CONFIRMED" if bb[0] <= val <= bb[1] else "REFUTED")
+    assert v["BF1-VS-X"][1] == want("BF1_vs_X", 1.1) and "1.1000" in v["BF1-VS-X"][2], v["BF1-VS-X"]
+    assert v["BF1-NEW-RATIO"][1] == want("BF1_new_ratio", 0.5) and v["BF1-NEW-RATIO"][2].startswith("0.5000")
+    st = C.PRED_STAMP_BF1                                              # None, or a `date -u` stamp with bands
+    assert st is None or (re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", st) and P.get("BF1_vs_X") is not None), st
 
 
 CELLS = {"bf1m": (10, 8, 72), "bf1a": (65, 216, 512), "bf1b": (10, 318, 512)}
@@ -421,7 +428,12 @@ def test_step_script_bf1(monkeypatch, tmp_path):
     text = (EFF / "r2_bf1_step.sh").read_text()
     assert "--bf-packer gilfree" in text and "nosi/nosi/r2_transport_gilfree_v3.py" in text
     assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-bf1" in text and "CELLPY=benchmarks/Efficiency/r2_bf1_cell.py" in text
-    assert "benchmarks/Efficiency/r2_bf1_fetch.py" in text and "^PRED_STAMP_BF1 = None$" in text
+    assert "benchmarks/Efficiency/r2_bf1_fetch.py" in text and "^PRED_STAMP_BF1 = None$" in text   # the STOP rule
+    cell_src = (EFF / "r2_bf1_cell.py").read_text()                   # STATE-AWARE: the cell's line the rule reads
+    line = "PRED_STAMP_BF1 = None" if C.PRED_STAMP_BF1 is None else 'PRED_STAMP_BF1 = "%s"' % C.PRED_STAMP_BF1
+    assert re.search("^%s$" % re.escape(line), cell_src, re.M), line
+    nostop = re.search(r"^PRED_STAMP_BF1 = None$", cell_src, re.M) is None
+    assert nostop == (C.PRED_STAMP_BF1 is not None)                   # the timing cells stop exactly while None
     for cell, (pool, batch, steps) in CELLS.items():
         m = re.search(r"^\s+%s\) (.*?) ;;$" % cell, text, re.M | re.S)
         assert m, cell
