@@ -75,7 +75,7 @@ DROP = ("-COUNTS", "-KEEP-EQ", "-KEEP-REF")
 #     of 128 slots per request is 1.82 GB at B 216, and that arm's prefill peak is 83.90 GB of 84.0). DECISION: no BF1
 #     lever at C 128; bf1a is a DIAGNOSTIC only (full-B coverage; the first graph-mode KW vs L4PTFDGUDCD at C 128); adopt
 #     there only if B / L4PTFDGUDCD >= 1.02 in the same process.
-PRED_STAMP_BF1 = "2026-10-31T13:43:47Z"
+PRED_STAMP_BF1 = "2026-10-31T17:10:34Z"
 PRED_KEYS = ("BF1_vs_X", "BF1_vs_R", "BF1_new_ratio", "BF1_wait_saving", "BF1_joint_saving", "BF1_draft_ratio",
              "BF1_barrier_ms", "BF1_eq")
 # THE LEAD'S REGISTRATION (2026-10-31T13:43:47Z, before bf1a / bf1b; the writer's bands; r7pb MEASURED flagA 0.469 at
@@ -83,8 +83,11 @@ PRED_KEYS = ("BF1_vs_X", "BF1_vs_R", "BF1_new_ratio", "BF1_wait_saving", "BF1_jo
 PRED_BF1_BY_B = {
     216: dict(BF1_vs_X=(1.001, 1.020), BF1_vs_R=(0.995, 1.020), BF1_new_ratio=(0.45, 0.65), BF1_wait_saving=(3.0, 8.0),
               BF1_joint_saving=(3.0, 8.0), BF1_draft_ratio=(1.00, 1.04), BF1_barrier_ms=(0.0, 10.0), BF1_eq=True),
-    318: dict(BF1_vs_X=(1.06, 1.14), BF1_vs_R=(1.05, 1.14), BF1_new_ratio=(0.45, 0.65), BF1_wait_saving=(35.0, 65.0),
-              BF1_joint_saving=(35.0, 65.0), BF1_draft_ratio=(1.00, 1.04), BF1_barrier_ms=(0.0, 10.0), BF1_eq=True)}
+    # 318: RE-REGISTERED 2026-10-31T17:10:34Z (`date -u`) for the DEFER + BATCH version (64e307f) before its bf1b run;
+    # the barrier version's bf1b (f2eba43) was scored against the bands of 13:43:47Z (all effect bands REFUTED). Basis:
+    # bf1b counters (submit 1.32 ms per chunk, 72 % late) and the writer's per-epoch worker model with batches of 8.
+    318: dict(BF1_vs_X=(1.015, 1.08), BF1_vs_R=(1.01, 1.08), BF1_new_ratio=(0.53, 0.75), BF1_wait_saving=(20.0, 45.0),
+              BF1_joint_saving=(10.0, 35.0), BF1_draft_ratio=(1.00, 1.05), BF1_barrier_ms=(0.0, 10.0), BF1_eq=True)}
 
 
 def runner_choice(arm: str, check: bool):
