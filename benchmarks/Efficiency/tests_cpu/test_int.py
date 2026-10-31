@@ -181,9 +181,10 @@ def test_int_classes():
 
 
 # ------------------------------------------------------------------ the arms on the CPU world
-INT_ARMS = dict(C128="L4PTFDGUDCDI", C73="L4PTFDGUDKWCDI")
-D_OF = dict(C128="GUDCD", C73="GUDKCD")
-C_OF = dict(C128="GUDC", C73="GUDKC")
+INT_ARMS = dict(C128="L4PTFDGUDCDI", C73="L4PTFDGUDKWCDI", C73N="L4PTFDGUDKWCDIN")   # C73N: the keep arm without BF1
+D_OF = dict(C128="GUDCD", C73="GUDKCD", C73N="GUDKCD")
+C_OF = dict(C128="GUDC", C73="GUDKC", C73N="GUDKC")
+KEEP_KEYS, BF_KEYS = ("C73", "C73N"), ("C73",)
 
 
 def _make(arm, scen, ineg=None, worker="inline", check=None, kcheck=None, late="drop"):
@@ -194,7 +195,7 @@ def _make(arm, scen, ineg=None, worker="inline", check=None, kcheck=None, late="
     check = s["check"] if check is None else check
     W, WB, Z, I3, KA, RE, RW, SR, BC = X.W, X.WB, X.Z, X.I3, X.KA, X.RE, X.RW, X.SR, X.BC
     Runner = INTA.int_runner(X.STF, arm, "rows", ineg)
-    keep = arm in INTA.KEEP_INT
+    keep, bfa = arm in INTA.KEEP_INT, arm in INTA.BF_INT
 
     def build(model, cache, S, horizon, tok0, K=X.K0, check_every=0, record=False):
         B = int(cache.layers[0].cache_engine._k_gpu.shape[0])
@@ -210,8 +211,10 @@ def _make(arm, scen, ineg=None, worker="inline", check=None, kcheck=None, late="
                   dgneg=None, cc_backend="inductor", ccneg=None, cdneg=None, j1neg=None, j1draft=True)
         if keep:
             kw.update(keep=True, kwin=True, kcheck=bool(check) if kcheck is None else kcheck, kneg=None, kslots=None,
-                      cneg=None, bf=dict(mode="ce", worker=worker, acct=True, bneg=None, n_cap=4096, ring=4,
-                                         packer="torch", gf=None, threads=2, late=late))
+                      cneg=None)
+        if bfa:
+            kw.update(bf=dict(mode="ce", worker=worker, acct=True, bneg=None, n_cap=4096, ring=4, packer="torch",
+                              gf=None, threads=2, late=late))
         be = X.FakeGraphsDCD() if keep else TJ.FakeGraphsJ3()
         run = Runner(model, rs, sops, BC.HostClock(), graph_backend=be, st1_backend=TST.FakeCommitGraphs(), **kw)
         be.T = run.T
@@ -264,14 +267,14 @@ def _int_full(key, scen="timing"):
         STC = _mod("r2_st1_commit")
         _int(key, scen)                                                # its C / D arms first (test_int's order)
         run = _builder(INT_ARMS[key], scen)
-        if key == "C73":
+        if key in KEEP_KEYS:
             STC.st3_attach(run)
         STC.st4_attach(run)
         if X.SCEN[scen]["fa"]:
             run.vs.fa_check = {}
         run.run(N_RUN)
         rd = run.read()
-        if key == "C73":
+        if key in KEEP_KEYS:
             rd["st3"] = run.T.st3_report()
         rd["st4"] = run.T.st4_report()
         _F[(key, scen)] = dict(runner=run, rd=rd, N=N_RUN, B=8, scen=scen, arm=INT_ARMS[key])
@@ -296,7 +299,7 @@ def _gates(key, scen, ev):
     J1C.SH_J1["emitted"] = True                                        # J1-SHEQ: test_j1's test_sh_j1
     keepd = {"L4PTFD": _cpu(_plain("D", scen), D)}
     keepd[X.DARMS[D_OF[key]]] = _cpu(_plain(D_OF[key], scen), D)
-    if key == "C73":
+    if key in KEEP_KEYS:
         keepd["L4PTFDGUDKWC"] = _cpu(_plain("GUDKC", scen), D)
     rd = ev["rd"]
     rec = dict(graph=rd["graph"], dgraph=rd["dgraph"], gpu_peak_alloc_GB=1.0, mem_arena=dict(prefill_peak_GB=1.0))
@@ -309,7 +312,8 @@ BF_REC = ("keep", "round_blocks", "bf")
 BF_T = ("kid", "kage", "blocks")
 
 
-@pytest.mark.parametrize("key,scen", [("C128", "timing"), ("C128", "check"), ("C73", "timing"), ("C73", "check")])
+@pytest.mark.parametrize("key,scen", [("C128", "timing"), ("C128", "check"), ("C73", "timing"), ("C73", "check"),
+                                      ("C73N", "timing"), ("C73N", "check")])
 def test_int_equal(key, scen):
     ev = _int(key, scen)
     d, ref = _plain("D", scen), _plain(D_OF[key], scen)
@@ -317,12 +321,13 @@ def test_int_equal(key, scen):
     jp = rd["tent"]["calls"]["joint_passes"]
     tb = ref["rd"]["tent"]
     assert tb["crossed"] > 0 and sum(ref["rd"]["acc_hist"][1:]) > 0 and tb["replays"] > 0, "preconditions (L34)"
-    keep = key == "C73"
-    skip = SKIP_REC + (BF_REC if keep else ())
-    ts = TST.KV_KEYS + (BF_T if keep else ())
+    keep, bfk = key in KEEP_KEYS, key in BF_KEYS
+    skip = SKIP_REC + (BF_REC if bfk else ())
+    ts = TST.KV_KEYS + (BF_T if bfk else ())
     bad = TS._diff(ref, ev, skip=skip, tensors_skip=ts)
     assert bad == [], bad[:10]                                         # THE CLAIM: its D arm's run
-    bad = TS._diff(d, ev, skip=skip + ("hoist",) + (("keep", "round_blocks") if keep else ()), tensors_skip=ts)
+    ts_d = TST.KV_KEYS + (BF_T if keep else ())                        # vs L4PTFD: the keep's own map and record
+    bad = TS._diff(d, ev, skip=skip + ("hoist",) + (("keep", "round_blocks") if keep else ()), tensors_skip=ts_d)
     assert bad == [], bad[:10]                                         # and L4PTFD's
     assert all(torch.equal(a, b) for a, b in zip(TST._kv_masked(ref["runner"]), TST._kv_masked(ev["runner"])))
     STC = _mod("r2_st1_commit")
@@ -333,33 +338,40 @@ def test_int_equal(key, scen):
     assert j["dwarm"] == 1 and j["dlayers"] == rd["dgraph"]["capture_passes"] * L > 0 and j["dpeq_bad"] == 0   # F2
     n = rd["tent"]["calls"]["commit"]
     assert s1["warm"] == 1 and s1["captures"] == 1 and s1["replays"] == n - 1 and s1["overflow"] == 0   # ST1
-    if keep:
+    if bfk:
         bf = rd["bf"]
         assert bf["committed"] > 0 and bf["used_store"] + bf["used_win"] > 0 and bf["error"] is None, bf   # BF1
-        assert "j3" not in rd                                          # F3 is not in the BF1 arm
         w = ev["runner"].meta["bf"]["warm"]                            # BF1's store-X warm on the J1 locate path
         assert w["ran"] and w["path"] == "j1_loc" and w["X"] == ev["runner"].bf.X, w
+    if keep:
+        assert "j3" not in rd                                          # F3 is not in the keep arms
+        assert ("bf" in rd) == bfk and (getattr(ev["runner"], "bf", None) is not None) == bfk
     else:
         assert rd["j3"]["joint_captures"] > 0 and rd["j3"]["draft_layers"] > 0, rd["j3"]               # F3
     evg = _int_full(key, scen)                                         # the cell's INT arm: + ST4 (+ ST3 in the keep arm)
     bad = TS._diff(ev, evg, skip=SKIP_REC + ("st3", "st4", "bf"))
     assert bad == [], bad[:10]                                         # = the INT run, every bit (BF1's timers aside)
-    if keep:
+    if bfk:
         assert all(evg["rd"]["bf"][k] == rd["bf"][k] for k in ("committed", "used_store", "used_win"))
     gs, rec = _gates(key, scen, evg)
     names = {g[0][len(INT_ARMS[key]) + 1:] for g in gs if g[0].startswith(INT_ARMS[key] + "-")}
     want = {"MEM", "GRAPH", "DGRAPH", "HOIST", "COMPILE", "EQF", "J1-PEQ", "J1-COMPILE", "J1-DRAFT", "PEQ", "TAIL-EQ",
             "CGRAPH", "TWIN", "INT-CLASSES", "INT-LAYER", "COUNTS", "DRESID"}
-    want |= {"KEEP", "LISTED", "BF", "INT-LOCK", "KFILL"} | ({"CAP"} if scen == "check" else set()) if keep else \
-        {"DCOUNTS", "J1-RESID"}
+    if bfk:                                                            # BF1's gate set; KEEP-EQ / KEEP-REF dropped
+        want |= {"KEEP", "LISTED", "BF", "INT-LOCK", "KFILL"} | ({"CAP"} if scen == "check" else set())
+    elif keep:                                                         # the keep arm without BF1: the full keep set
+        want |= {"KEEP", "KEEP-EQ", "KEEP-REF", "DCOUNTS", "KFILL"} | ({"CAP"} if scen == "check" else set())
+    else:
+        want |= {"DCOUNTS", "J1-RESID"}
     assert names == want, (sorted(names - want), sorted(want - names))
-    assert not keep or not ({"KEEP-EQ", "KEEP-REF"} & names)           # BF1 changes them by design (dropped)
+    assert not bfk or not ({"KEEP-EQ", "KEEP-REF"} & names)            # BF1 changes them by design (dropped)
     assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
     assert rec["int"]["layer_owner"] == "IntLayer" and rec["st2"]["layers"] == jp * L
     _ev("INT EQUAL %s %s: rounds %d, joint passes %d, commits %d; j1 calls %d f6 %d dlayers %d; st2 %s; st1 %s; %s; "
         "%d MUST gates pass" % (key, scen, rd["rounds"], jp, n, j["calls"], j["f6calls"], j["dlayers"], s2, s1,
                                 ("bf committed %d used %d" % (rd["bf"]["committed"], rd["bf"]["used_store"] +
-                                                              rd["bf"]["used_win"])) if keep else ("j3 %s" % rd["j3"]),
+                                                              rd["bf"]["used_win"])) if bfk else
+                                ("keep, no BF1" if keep else ("j3 %s" % rd["j3"])),
                                 sum(1 for g in gs if g[1])))
 
 
@@ -430,6 +442,11 @@ def test_int_gate_plants():
     r3 = dict(rd, int=dict(rd["int"], arm="L4PTFDGUDCDI", j3=True, bf=False))
     assert [g[0] for g in INTA.int_gates("L4PTFDGUDCDI", r3, L)] == ["L4PTFDGUDCDI-INT-CLASSES", "L4PTFDGUDCDI-INT-LAYER"]
     assert all(g[2] for g in INTA.int_gates("L4PTFDGUDCDI", r3, L))
+    r4 = dict(rd, int=dict(rd["int"], arm="L4PTFDGUDKWCDIN", j3=False, bf=False, lock_applies=False, st1_locked=False))
+    n4 = "L4PTFDGUDKWCDIN"                                             # the keep arm without BF1: no INT-LOCK
+    assert [g[0] for g in INTA.int_gates(n4, r4, L)] == [n4 + "-INT-CLASSES", n4 + "-INT-LAYER"]
+    assert all(g[2] for g in INTA.int_gates(n4, r4, L))
+    assert not INTA.int_gates(n4, dict(r4, int=dict(r4["int"], bf=True)), L)[0][2]       # BF1 classes: wrong here
 
 
 # ------------------------------------------------------------------ CELL
@@ -439,7 +456,20 @@ def test_int_cell_tables(monkeypatch):
     INTA = _mod("r2_int_arms")
     assert D is not I4DC and D.__name__ == C.DCC_NAME and C.configure() is D
     assert "L4PTFDGUDCDI" not in I4DC.ARMS and D.ARMS == I4DC.ARMS + C.NEW_ARMS
-    assert D.ARMS[-2:] == ("L4PTFDGUDCDI", "L4PTFDGUDKWCDI")
+    assert D.ARMS[-3:] == ("L4PTFDGUDCDI", "L4PTFDGUDKWCDI", "L4PTFDGUDKWCDIN")
+    assert D.BASE_D["L4PTFDGUDKWCDIN"] == "L4PTFDGUDKWCD" and "L4PTFDGUDKWCDIN" in D.KEEP_ARMS
+    kn, kwn = D.runner_choice("L4PTFDGUDKWCDIN", False)                # the keep arm without BF1: no bf keyword
+    assert kn == "SKCD" and "bf" not in kwn and kwn["keep"] is True
+    assert C.hooks("L4PTFDGUDKWCDIN") == ("F1", "F2", "F6", "ST1", "ST2", "ST3", "ST4")
+    C._CUR["arm"] = "L4PTFDGUDKWCDIN"
+    try:
+        RN = D.runner_class("SKCD", X.STF)
+    finally:
+        C._CUR["arm"] = None
+    RIN = INTA.int_runner(X.STF, "L4PTFDGUDKWCDIN", "rows", None)
+    STCm = _mod("r2_st1_commit")
+    assert list(RN.__mro__[1:4]) == [STCm.st4_runner(STCm.st3_runner(RIN)), STCm.st3_runner(RIN), RIN]
+    assert not any(k.__name__ == "TentRunnerBF" for k in RN.__mro__)
     assert D.BASE_D["L4PTFDGUDCDI"] == "L4PTFDGUDCD" and D.BASE_D["L4PTFDGUDKWCDI"] == "L4PTFDGUDKWCD"
     assert D.ROOT_ARM["L4PTFDGUDKWCDI"] == "L4PTFDGUDKW" and "L4PTFDGUDKWCDI" in D.KEEP_ARMS
     assert D.NAMES["L4PTFDGUDCDI"] == tuple(n for n in I4DC.NAMES["L4PTFDGUDCD"] if n != "loc1")   # F6
@@ -527,9 +557,12 @@ def test_int_registration_state():
     else:
         assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", C.PRED_STAMP_INT)
     assert set(C.PRED_INT_BY_B) == {216, 287, 318}                     # 287: the original anchor (intc)
+    assert set(C.PRED_INT_NOBF_BY_B) == {318} and set(C.PRED_INT_NOBF_BY_B[318]) == set(C.PRED_KEYS_INT)   # intd
+    if C.PRED_STAMP_INT is None:
+        assert all(v is None for v in C.PRED_INT_NOBF_BY_B[318].values())
     assert all(set(x) == set(C.PRED_KEYS_INT) for x in C.PRED_INT_BY_B.values())
     assert ("\nPRED_STAMP_INT = None\n" in src) == (C.PRED_STAMP_INT is None)   # the step script's grep sees it
-    for cell in ("intm", "inta", "intb", "intc"):                       # the grants: None or a date -u stamp
+    for cell in ("intm", "inta", "intb", "intc", "intd"):               # the grants: None or a date -u stamp
         g = getattr(C, "GRANT_%s" % cell)
         assert g is None or re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", g)
         assert (("\nGRANT_%s = None\n" % cell) in src) == (g is None)
@@ -551,7 +584,8 @@ CELLS = (("intm", 10, 8, 72, 1, 1, 4, 1, 0, 55, "100G",
          ("inta", 65, 216, 512, 0, 0, 16, 0, 0, 125, "240G", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI"),
          ("intb", 10, 318, 512, 0, 0, 16, 0, 257, 270, "340G",
           "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDKWCDI"),
-         ("intc", 18, 287, 512, 0, 0, 16, 0, 0, 170, "300G", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI"))
+         ("intc", 18, 287, 512, 0, 0, 16, 0, 0, 170, "300G", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI"),
+         ("intd", 10, 318, 512, 0, 0, 16, 0, 0, 185, "340G", "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDIN"))
 
 
 def test_step_script_int(monkeypatch):
@@ -572,7 +606,11 @@ def test_step_script_int(monkeypatch):
     C = _mod("r2_int_cell")
     D = C.configure()
     monkeypatch.setenv("TORCH_EXTENSIONS_DIR", "/tmp/x")
-    ring_ncap = dict(intm=(8, 2048), inta=(8, 2048), intb=(6, 6144), intc=(8, 2048))   # per cell (bf1m / bf1b's)
+    ring_ncap = dict(intm=(8, 2048), inta=(8, 2048), intb=(6, 6144), intc=(8, 2048), intd=(8, 2048))   # per cell
+    assert "intd) POOL=10 BATCH=318 STEPS=512 NEEDPRED=1 STEP_MIN=185" in src
+    C3 = _mod("r2_int_cell")                                           # intd: the keep INT arm without BF1, store 129
+    assert not [a for a in CELLS[4][-1].split(",") if a in C3.BF_ARMS or a in C3.INTA.BF_INT]
+    assert "L4PTFDGUDKWCDIN" in CELLS[4][-1] and CELLS[4][8] == 0
     C2 = _mod("r2_int_cell")
     assert C2.PRED_INT_BY_B[287] is not None and "intc) POOL=18 BATCH=287 STEPS=512 NEEDPRED=1" in src
     assert not [a for a in CELLS[3][-1].split(",") if a in C2.BF_ARMS or a in C2.INTA.KEEP_INT]   # intc: no BF1, keep
@@ -597,7 +635,7 @@ def test_step_script_int(monkeypatch):
               "BFX=257 NCAP=6144 RING=6"):
         assert w in " ".join(bfs.split()) and w in " ".join(src.split()), w
     assert "intm) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 PE=4 ACCT=1" in src and "RING=6 STEP_MIN=270" in src
-    for bad in ("j1m", "int", "intd"):
+    for bad in ("j1m", "int", "inte"):
         r = _step(bad)
         assert r.returncode == 1 and "cell '%s'" % bad in r.stderr, (bad, r.returncode, r.stderr[-300:])
     if str(ROOT) != STEP_ROOT or _git("status", "--porcelain", "--untracked-files=no").stdout.strip():

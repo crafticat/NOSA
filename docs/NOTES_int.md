@@ -119,6 +119,7 @@ is None). Every cell: --st1-commit rows, BF1 --bf-ring 8 --bf-worker thread --bf
 | intm | C 73 pool 10, B 8, 72 steps, probe 4, check every round, stress, --bf-acct 1, --bf-store 0 | L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDM,L4PTFDGUDKWCDM,L4PTFDGUDCDMT,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDCDMTR,L4PTFDGUDKWCDMTKR,L4PTFDGUDCDI,L4PTFDGUDKWCDI | 55 / 100G | `bash benchmarks/Efficiency/r2_int_step.sh --nosi <sha> <holder> <run> intm` |
 | inta | C 128 pool 65, B 216, 512 steps | L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI | 125 / 240G | `... inta` |
 | intc (the original anchor) | C 81 pool 18, B 287, 512 steps, probe 16 | L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDI (no BF1, no keep) | 170 / 300G | `... intc` (GRANT_intc None; PRED_INT_BY_B[287] None until registered; memory: L4PTFD 76.80 GB MEASURED r7mem, INT + about 0.1 GB) |
+| intd (C 73 INT without BF1) | C 73 pool 10, B 318, 512 steps, --bf-store 0 (129) | L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDIN (F1 F2 F6 ST1 ST2 ST3 ST4 on the keep arm) | 185 / 340G | `... intd` (GRANT_intd None; bands PRED_INT_NOBF_BY_B[318] None; gates: every INT gate but BF1's and INT-LOCK, the full keep set incl. KEEP-EQ / KEEP-REF, DCOUNTS) |
 | intb | C 73 pool 10, B 318, 512 steps, --bf-store 257 | L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDM,L4PTFDGUDKWCDMT,L4PTFDGUDKWCDMTK,L4PTFDGUDKWCDI | 270 / 340G | `... intb` |
 
 intb with the ST3 control costs 3 more B 318 arm parts (M, MT, MTK: about 54 min MODEL). Without the control, intb is 4

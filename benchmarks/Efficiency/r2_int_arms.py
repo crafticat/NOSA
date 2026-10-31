@@ -29,10 +29,13 @@ import r2_bf1_fetch as BF
 import r2_j1_select as J1
 import r2_st1_commit as STC
 
-ARMS_INT = dict(L4PTFDGUDCDI="L4PTFDGUDCD", L4PTFDGUDKWCDI="L4PTFDGUDKWCD")   # an INT arm -> its I4DC (D) arm
+ARMS_INT = dict(L4PTFDGUDCDI="L4PTFDGUDCD", L4PTFDGUDKWCDI="L4PTFDGUDKWCD",   # an INT arm -> its I4DC (D) arm
+                L4PTFDGUDKWCDIN="L4PTFDGUDKWCD")
 HOOKS = dict(L4PTFDGUDCDI=("F1", "F2", "F6", "F3", "ST1", "ST2"),
-             L4PTFDGUDKWCDI=("F1", "F2", "F6", "ST1", "ST2", "BF1"))
-KEEP_INT = ("L4PTFDGUDKWCDI",)
+             L4PTFDGUDKWCDI=("F1", "F2", "F6", "ST1", "ST2", "BF1"),
+             L4PTFDGUDKWCDIN=("F1", "F2", "F6", "ST1", "ST2"))          # the C 73 INT arm WITHOUT BF1 (cell intd)
+KEEP_INT = ("L4PTFDGUDKWCDI", "L4PTFDGUDKWCDIN")                         # the keep (C 73) INT arms
+BF_INT = ("L4PTFDGUDKWCDI",)                                             # the INT arm(s) with BF1
 INEG = (None, "stacked", "nolock")
 
 
@@ -165,6 +168,9 @@ def base_runner(STF, arm: str):
     if arm == "L4PTFDGUDKWCDI":
         RBF = BF.bf_classes(STF)[1]                                    # L4PTFDGUDKWCD + BF1
         return J1.j1_wrap(STF, bf_state_int(STF), RBF, arm)[1]         # + F1 + F2 + F6 (+ the store-X warm on F6)
+    if arm == "L4PTFDGUDKWCDIN":                                       # L4PTFDGUDKWCD (the I4DC keep classes), no BF1
+        SKD, RKD = J1.CD.dc_classes(STF)["L4PTFDGUDKWCD"]
+        return J1.j1_wrap(STF, SKD, RKD, arm)[1]                       # + F1 + F2 + F6 (as the J1 keep arm)
     raise IntError("unknown INT arm %r (one of %s)" % (arm, tuple(ARMS_INT)))
 
 
@@ -243,9 +249,9 @@ def int_gates(arm: str, rd, L: int) -> list:
     rd = rd or {}
     r = rd.get("int") or {}
     jp = int((((rd.get("tent") or {}).get("calls")) or {}).get("joint_passes", 0))
-    keep = arm in KEEP_INT
+    keep, bf = arm in KEEP_INT, arm in BF_INT
     ok_c = (r.get("layer_owner") == "IntLayer" and r.get("commit_owner") == "CommitST1" and r.get("j3") == (not keep)
-            and r.get("bf") == keep and r.get("ineg") is None and r.get("arm") == arm)
+            and r.get("bf") == bf and r.get("ineg") is None and r.get("arm") == arm)
     j1c = (rd.get("j1") or {}).get("calls")
     s2 = rd.get("st2") or {}
     ok_l = jp > 0 and j1c == jp * int(L) and s2.get("layers") == jp * int(L) and s2.get("fallback") == 0
@@ -253,7 +259,7 @@ def int_gates(arm: str, rd, L: int) -> list:
                r.get("layer_owner"), r.get("commit_owner"), r.get("j3"), r.get("bf"), r.get("ineg"), r.get("arm"))),
            ("%s-INT-LAYER" % arm, True, bool(ok_l), "joint passes %d x L %d; J1 selection calls %s; ST2 layers %s, "
             "fallback %s" % (jp, L, j1c, s2.get("layers"), s2.get("fallback")))]
-    if keep:
+    if bf:
         ok_k = (not r.get("lock_applies")) or bool(r.get("st1_locked"))
         out.append(("%s-INT-LOCK" % arm, True, bool(ok_k), "BF1's capture lock applies %s; the ST1 commit backend "
                     "wrapped %s; captures under the lock %s" % (r.get("lock_applies"), r.get("st1_locked"),

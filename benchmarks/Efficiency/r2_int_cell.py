@@ -2,6 +2,8 @@
 the INTEGRATED arms (benchmarks/Efficiency/r2_int_arms.py: the classes, the two collision fixes):
   L4PTFDGUDCDI    L4PTFDGUDCD   + F1 + F2 + F6 + F3 + ST1 + ST2 + ST4    (C 128 B 216: the best arm there)
   L4PTFDGUDKWCDI  L4PTFDGUDKWCD + F1 + F2 + F6 + ST1 + ST2 + BF1 + ST3 + ST4   (C 73 B 318: the best arm there)
+  L4PTFDGUDKWCDIN L4PTFDGUDKWCD + F1 + F2 + F6 + ST1 + ST2 + ST3 + ST4 (C 73 WITHOUT BF1: cell intd, store 129; the
+                  BF1 gates and -INT-LOCK do not apply; its bands: PRED_INT_NOBF_BY_B)
   ST3 = the keep fill in two compiled helpers (gate -KFILL), ST4 = the draft residency's integer ops in one compiled
   helper (gate -DRESID): r2_st1_commit.st3_runner / st4_runner over the INT runner, in that order.
 THE I4DC CELL, REUSED AS A PRIVATE MODULE COPY (the J1 cell's pattern): this file loads benchmarks/Efficiency/
@@ -23,7 +25,7 @@ MUST GATES OF AN INT ARM (all components' + EQF = L4PTFD bit for bit):
   J1: -J1-PEQ, -J1-COMPILE, -J1-DRAFT; F3 (C 128): -J1-RESID; J1-SHEQ once per job (SHJ1);
   ST1 / ST2: -PEQ (= the D arm bit for bit), -DCOUNTS (C 128), -TAIL-EQ, -CGRAPH, -TWIN; ST3 (C 73): -KFILL; ST4:
   -DRESID;
-  INT: -INT-CLASSES, -INT-LAYER, -INT-LOCK (C 73) (r2_int_arms.int_gates).
+  INT: -INT-CLASSES, -INT-LAYER, -INT-LOCK (the BF1 arm) (r2_int_arms.int_gates).
 REGISTERED PREDICTIONS PRED_INT_BY_B: every value None until the lead registers them with PRED_STAMP_INT (a None key is
 REPORT); the step script STOPS the timing cells (inta, intb) while PRED_STAMP_INT is None. THE CELL GRANTS GRANT_intm /
 GRANT_inta / GRANT_intb / GRANT_intc (default deny). intc = the original anchor (C 81 B 287, L4PTFDGUDCDI).
@@ -53,12 +55,13 @@ DCC_FILE = os.path.join(HERE, "r2_i4dc_cell.py")
 ARMS_INT = dict(INTA.ARMS_INT)
 ARMS_J = tuple(J1.ARMS_J1) + tuple(J1.ARMS_J3)
 ST_ARMS = dict(STCELL.ST13)                       # an ST arm -> its PEQ reference (M: D; MT: M; MTK: MT)
-INT_ST3 = ("L4PTFDGUDKWCDI",)                     # the INT arm(s) that also carry ST3 (r2_st1_commit.st3_runner)
-INT_ST4 = ("L4PTFDGUDCDI", "L4PTFDGUDKWCDI")      # the INT arms that also carry ST4 (st4_runner, after st3_runner)
+INT_ST3 = ("L4PTFDGUDKWCDI", "L4PTFDGUDKWCDIN")   # the INT arms that also carry ST3 (r2_st1_commit.st3_runner)
+INT_ST4 = ("L4PTFDGUDCDI", "L4PTFDGUDKWCDI", "L4PTFDGUDKWCDIN")   # ... ST4 (st4_runner, after st3_runner)
 BF_ARMS = dict(BFCELL.BF_ARMS)                    # a BF1 arm -> its fetch mode
 D_OF = dict(J1.ARMS_J1, **J1C.BASE_J3, **ARMS_INT)   # the arms that take the I4DC gates of their D arm (own name)
 KEEP_NEW = ("L4PTFDGUDKWCDJ1", "L4PTFDGUDKWCDM", "L4PTFDGUDKWCDMT", "L4PTFDGUDKWCDMTK", "L4PTFDGUDKWCDMTKR",
-            "L4PTFDGUDKWCDX", "L4PTFDGUDKWCDB", "L4PTFDGUDKWCDI")
+            "L4PTFDGUDKWCDX", "L4PTFDGUDKWCDB", "L4PTFDGUDKWCDI", "L4PTFDGUDKWCDIN")
+NOBF_INT = ("L4PTFDGUDKWCDIN",)                   # the C 73 INT arm WITHOUT BF1 (cell intd): PRED_INT_NOBF_BY_B
 NEW_ARMS = ARMS_J + tuple(ST_ARMS) + tuple(BF_ARMS) + tuple(ARMS_INT)
 # REGISTERED PREDICTIONS, NONE UNTIL THE LEAD REGISTERS THEM: fill PRED_INT_BY_B (per batch) and PRED_STAMP_INT (`date
 # -u`, L33) in a commit BEFORE inta / intb. Keys, each (low, high) unless noted; X = the INT arm of the cell, REF = its D
@@ -116,11 +119,15 @@ PRED_INT_BY_B = {
               INT_vs_strongest=(0.57, 0.63), INT_joint_saving=(16.0, 26.0), INT_draft_saving=(7.0, 12.0),
               INT_commit_saving=(2.5, 4.5), INT_peak_gb=(76.6, 77.6), INT_eq=True, INT_st3_joint_saving=None,
               INT_st3_vs_mt=None)}
+# THE C 73 INT ARM WITHOUT BF1 (L4PTFDGUDKWCDIN, cell intd: C 73 pool 10, B 318, store 129): its own bands (verdicts use
+# this dict when X is that arm). None until the lead registers them (with a new PRED_STAMP_INT).
+PRED_INT_NOBF_BY_B = {318: {k: None for k in PRED_KEYS_INT}}
 # THE CELL GRANTS (default deny; r2_int_step.sh's granted() reads these lines at <sha>): the lead sets a `date -u` stamp.
 GRANT_intm = "2026-10-31T17:03:19Z"
 GRANT_inta = "2026-10-31T17:03:19Z"
 GRANT_intb = "2026-10-31T18:16:02Z"
 GRANT_intc = "2026-10-31T19:32:23Z"
+GRANT_intd = None
 # this cell's options (main strips them before the I4DC main); the BF1 defaults are r2_bf1_cell's
 OPT = dict(st1_commit="rows", ineg=None, bf_store=0, bf_ncap=2048, bf_ring=8, bf_worker="thread", bf_acct=0,
            bf_close_wait_ms=0.0, bf_packer="gilfree", bf_threads=14, bf_cap_groups=2048, bf_late="defer",
@@ -189,7 +196,7 @@ def configure():
         """The I4DC run_arm_d with the arm's runner (runner_class reads the arm from _CUR); a BF1 arm and the INT keep
         arm take the store X of --bf-store (0: --fork-store's)."""
         _CUR["arm"] = arm
-        o = dict(opt, fork_store=OPT["bf_store"]) if ((arm in BF_ARMS or arm in INTA.KEEP_INT) and OPT["bf_store"]) \
+        o = dict(opt, fork_store=OPT["bf_store"]) if ((arm in BF_ARMS or arm in INTA.BF_INT) and OPT["bf_store"]) \
             else opt
         try:
             return run0(model, ids, inputs, steps, clock, o, FORK, arm)
@@ -205,7 +212,7 @@ def configure():
             kind, kw = rc0(BFCELL.REF, check)
         else:
             return rc0(arm, check)
-        if arm in BF_ARMS or arm in INTA.KEEP_INT:
+        if arm in BF_ARMS or arm in INTA.BF_INT:
             kw = dict(kw, bf=bf_opt(arm))
         return kind, kw
 
@@ -221,8 +228,8 @@ def configure():
             R = BF.bf_classes(STF)[1]
         elif arm in ARMS_INT:
             R = INTA.int_runner(STF, arm, OPT["st1_commit"], OPT["ineg"])
-            R = STC.st3_runner(R) if arm in INT_ST3 else R              # ST3 in the C 73 INT arm
-            R = STC.st4_runner(R) if arm in INT_ST4 else R              # ST4 in both INT arms (after ST3)
+            R = STC.st3_runner(R) if arm in INT_ST3 else R              # ST3 in the C 73 INT arms
+            R = STC.st4_runner(R) if arm in INT_ST4 else R              # ST4 in every INT arm (after ST3)
         else:
             R = rclass0(kind, STF)
         return INTA.with_tails(R)
@@ -230,7 +237,7 @@ def configure():
     def keep_ref_arm_int(arm, have):
         """The J1 / INT keep arms: L4PTFKW, L4PTFDGKW, L4PTFDGUDKW, L4PTFDGUDKWC, L4PTFDGUDKWCD (the first that ran
         earlier)."""
-        if arm not in ("L4PTFDGUDKWCDJ1", "L4PTFDGUDKWCDI"):
+        if arm not in ("L4PTFDGUDKWCDJ1", "L4PTFDGUDKWCDI", "L4PTFDGUDKWCDIN"):
             return kref0(arm, have)
         for r in ("L4PTFKW", "L4PTFDGKW", "L4PTFDGUDKW", "L4PTFDGUDKWC", "L4PTFDGUDKWCD"):
             if r in have and D.ARMS.index(r) < D.ARMS.index(arm):
@@ -243,7 +250,7 @@ def configure():
         for k in ("j1", "j3", "st1", "st2", "st3", "st4", "bf", "int"):
             if rd.get(k) is not None:
                 rec[k] = rd[k]
-        if arm in BF_ARMS or arm in INTA.KEEP_INT:
+        if arm in BF_ARMS or arm in INTA.BF_INT:
             rec["new"] = BFCELL.new_record(rec, rd)
         RECS[arm] = rec
         if arm in ST_ARMS:
@@ -297,13 +304,13 @@ def int_arm_gates(gates0, arm, rd, rec, cpu, keep, check, B, pool, steps, L, pa)
     ref = keep.get(d)
     KC = STCELL.KC
     g = gates0(arm, rd, rec, cpu, keep, check, B, pool, steps, L, pa)
-    if arm in INTA.KEEP_INT:                                           # BF1: its gate set against the D arm
+    if arm in INTA.BF_INT:                                             # BF1: its gate set against the D arm
         g = [x for x in g if not any(x[0] == arm + s for s in BFCELL.DROP)]
         g.append(BFCELL.counts_gate_bf(arm, cpu["counts"], ref["counts"] if ref else None,   # the store X declared
                                        (rd.get("bf") or {}).get("X")))                       # when --bf-store differs
         g.append(BFCELL.listed_gate(arm, rd.get("keep"), (ref or {}).get("keep"), d))
         g.append(BFCELL.bf_gate(arm, rd.get("bf"), "ce"))
-    else:
+    else:                                                              # no BF1 (C 128, and the C 73 arm of intd)
         c = KC.counts_gate(arm, cpu["counts"], ref["counts"] if ref else None, d)
         g.append((arm + "-DCOUNTS",) + tuple(c[1:]))
     g = g + J1.j1_gates(arm, rd, L)
@@ -338,7 +345,9 @@ def int_arm(sp):
 def verdicts(sh, sp, B: int, D=None):
     """PRED_INT_BY_B[B] against X = int_arm(sp) and REF = its D arm: [(name, verdict, detail)]; None gives REPORT."""
     D = D or configure()
-    P = PRED_INT_BY_B.get(B) or {k: None for k in PRED_KEYS_INT}
+    Xn = int_arm(sp)                                                   # the C 73 arm without BF1: its own bands
+    PB = PRED_INT_NOBF_BY_B if Xn in NOBF_INT else PRED_INT_BY_B
+    P = PB.get(B) or {k: None for k in PRED_KEYS_INT}
     out = []
 
     def band(name, v, b):
@@ -433,7 +442,7 @@ def check_arms(arms, own, D) -> str:
         return "--bf-ncap >= 1, --bf-ring >= 2, --bf-close-wait-ms >= 0, --bf-threads in 1 .. 64"
     if not 16 <= own.bf_cap_groups <= 4096 or own.bf_late_wait_ms < 0 or not 1 <= own.bf_batch <= 64:
         return "--bf-cap-groups in 16 .. 4096, --bf-late-wait-ms >= 0, --bf-batch in 1 .. 64 (r2_bf1_cell's rules)"
-    bfa = [x for x in arms if x in BF_ARMS or x in INTA.KEEP_INT]
+    bfa = [x for x in arms if x in BF_ARMS or x in INTA.BF_INT]
     if own.bf_packer == "gilfree" and bfa and not os.environ.get("TORCH_EXTENSIONS_DIR"):
         return "--bf-packer gilfree: TORCH_EXTENSIONS_DIR must name the run's build directory (never HOME)"
     return None
@@ -443,7 +452,7 @@ def report_lines() -> list:
     """The BF1 and INT report lines of the arms that ran (after the I4DC main's lines)."""
     out = []
     for name, r in RECS.items():
-        if name in BF_ARMS or name in INTA.KEEP_INT:
+        if name in BF_ARMS or name in INTA.BF_INT:
             out.extend(BFCELL.bf_lines(name, r))
         if name in ARMS_INT:
             out.append("INT %s: hooks %s; record %s; st1 %s; st2 %s; j1 calls %s f6 calls %s; j3 %s; st3 %s; st4 %s" % (
