@@ -75,6 +75,10 @@ I4CC_NEW = I4CC_NEW + (E_ + "r2_recon7_protocol.py", E_ + "r2_recon7_probe.py", 
 I4CC_LATER = I4CC_LATER + ("r2_recon7_protocol.py", "r2_recon7_probe.py", "r2_recon7_cell.py",
                            "r2_recon7_streams.py", "r2_recon7_mem.py", "r2_i4c_cell.py", "r2_i4m_cell.py",
                            "r2_wsm_cell.py")                                                      # RECON7
+# J1 (nosi-r2-j1: RECON7 cd0f0c5 + the compiled joint pooling of AREA 1): its files
+# (its own Gate 0: tests_cpu/test_j1.py)
+I4CC_NEW = I4CC_NEW + (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", T_ + "test_j1.py",
+                       "docs/NOTES_j1.md")                                                        # J1
 
 
 class Evidence(UserWarning):

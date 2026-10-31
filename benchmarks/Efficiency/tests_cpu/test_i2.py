@@ -129,6 +129,10 @@ I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_recon7_protocol.py", "benchmark
                        "benchmarks/Efficiency/r2_recon7_mem.py", "benchmarks/Efficiency/r2_recon7_step.sh",
                        "benchmarks/Efficiency/r2_i4c_cell.py", "benchmarks/Efficiency/r2_i4m_cell.py",
                        "benchmarks/Efficiency/r2_wsm_cell.py", T_ + "test_recon7.py", "docs/NOTES_recon7.md")  # RECON7
+# J1 (nosi-r2-j1: RECON7 cd0f0c5 + the compiled joint pooling of AREA 1): its files
+# (its own Gate 0: tests_cpu/test_j1.py)
+I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_j1_select.py", "benchmarks/Efficiency/r2_j1_cell.py",
+                       "benchmarks/Efficiency/r2_j1_step.sh", T_ + "test_j1.py", "docs/NOTES_j1.md")        # J1
 SEAM_CHANGED = {"#0", "TentState._layer", "TentState._row", "TentRunner.__init__"}
 SEAM_ADDED = {"TentState._rows", "TentState._resid", "TentState._write", "TentRunner._joint_ops", "TentRunner._make_state"}
 

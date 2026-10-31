@@ -137,6 +137,11 @@ DECLARED = DECLARED + ("benchmarks/Efficiency/r2_recon7_protocol.py", "benchmark
                        "benchmarks/Efficiency/r2_i4c_cell.py", "benchmarks/Efficiency/r2_i4m_cell.py",
                        "benchmarks/Efficiency/r2_wsm_cell.py", "benchmarks/Efficiency/tests_cpu/test_recon7.py",
                        "docs/NOTES_recon7.md")                                                             # RECON7
+# J1 (nosi-r2-j1: RECON7 cd0f0c5 + the compiled joint pooling of AREA 1): its files
+# (its own Gate 0: tests_cpu/test_j1.py)
+DECLARED = DECLARED + ("benchmarks/Efficiency/r2_j1_select.py", "benchmarks/Efficiency/r2_j1_cell.py",
+                       "benchmarks/Efficiency/r2_j1_step.sh", "benchmarks/Efficiency/tests_cpu/test_j1.py",
+                       "docs/NOTES_j1.md")                                                                 # J1
 
 
 def _load(name):

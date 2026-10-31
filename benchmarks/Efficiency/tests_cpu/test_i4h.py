@@ -92,6 +92,10 @@ I4H_NEW = I4H_NEW + ("benchmarks/Efficiency/r2_recon7_protocol.py", "benchmarks/
                      "benchmarks/Efficiency/r2_wsm_cell.py", T_ + "test_recon7.py", "docs/NOTES_recon7.md")  # RECON7
 I4H_LATER = I4H_LATER + ("r2_recon7_protocol.py", "r2_recon7_probe.py", "r2_recon7_cell.py", "r2_recon7_streams.py",
                          "r2_recon7_mem.py", "r2_i4c_cell.py", "r2_i4m_cell.py", "r2_wsm_cell.py")       # RECON7
+# J1 (nosi-r2-j1: RECON7 cd0f0c5 + the compiled joint pooling of AREA 1): its files
+# (its own Gate 0: tests_cpu/test_j1.py)
+I4H_NEW = I4H_NEW + ("benchmarks/Efficiency/r2_j1_select.py", "benchmarks/Efficiency/r2_j1_cell.py",
+                     "benchmarks/Efficiency/r2_j1_step.sh", T_ + "test_j1.py", "docs/NOTES_j1.md")          # J1
 
 
 def _load(name, path=None):
