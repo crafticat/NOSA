@@ -83,7 +83,7 @@ NEW_ARMS = ARMS_J + tuple(ST_ARMS) + tuple(BF_ARMS) + tuple(ARMS_INT)
 #   C 73 B 318 (REF round 524.66 ms): joint F1 14.0 .. 18.5 + F6 about 1.9 + ST2 1.0 .. 3.0; draft F2 7.0 .. 9.2;
 #     commit ST1 4.0 .. 7.0; BF1 (unregistered MODEL) 40 .. 64 minus 1.4 .. 6 -> 60 .. 101 ms: (1.13, 1.24); without
 #     BF1 27 .. 39 ms: (1.054, 1.080).
-PRED_STAMP_INT = "2026-10-31T17:03:19Z"
+PRED_STAMP_INT = "2026-10-31T18:16:02Z"
 PRED_KEYS_INT = ("INT_vs_ref", "INT_ratio", "INT_vs_shj1", "INT_vs_strongest", "INT_joint_saving", "INT_draft_saving",
                  "INT_commit_saving", "INT_peak_gb", "INT_eq", "INT_st3_joint_saving", "INT_st3_vs_mt")
 # THE LEAD'S REGISTRATION (2026-10-31T17:03:19Z `date -u`, before any INT GPU run). Basis (MEASURED, same-job ratios):
@@ -98,14 +98,17 @@ PRED_INT_BY_B = {
               INT_vs_strongest=(0.603, 0.622), INT_joint_saving=(14.0, 20.0), INT_draft_saving=(7.0, 11.0),
               INT_commit_saving=(2.0, 3.3), INT_peak_gb=(83.85, 83.97), INT_eq=True, INT_st3_joint_saving=None,
               INT_st3_vs_mt=None),
-    318: dict(INT_vs_ref=(1.084, 1.180), INT_ratio=(0.718, 0.781), INT_vs_shj1=(0.692, 0.753),
-              INT_vs_strongest=(0.543, 0.592), INT_joint_saving=(25.0, 60.0), INT_draft_saving=(7.0, 13.0),
-              INT_commit_saving=(2.5, 5.5), INT_peak_gb=(80.6, 81.8), INT_eq=True, INT_st3_joint_saving=(3.0, 9.0),
+    # 318: RE-REGISTERED 2026-10-31T18:16:02Z (`date -u`) BEFORE intb, for the batched BF1 (64e307f in ea18c76), from
+    # MEASURED C73 component effects: J1 -25.4 ms per round (j1b), ST1 + ST2 -6.95 ms (st1b); MODEL: ST3 -3 .. 9, ST4
+    # -2 .. 2.7, BF1 batched -8 .. 35 -> INT round 442 .. 475 ms vs D 521.3. The 216 bands stay those of 17:03:19Z.
+    318: dict(INT_vs_ref=(1.097, 1.179), INT_ratio=(0.726, 0.781), INT_vs_shj1=(0.700, 0.753),
+              INT_vs_strongest=(0.550, 0.591), INT_joint_saving=(31.0, 59.0), INT_draft_saving=(8.5, 12.0),
+              INT_commit_saving=(3.8, 4.8), INT_peak_gb=(80.8, 82.0), INT_eq=True, INT_st3_joint_saving=(3.0, 9.0),
               INT_st3_vs_mt=(1.005, 1.018))}
 # THE CELL GRANTS (default deny; r2_int_step.sh's granted() reads these lines at <sha>): the lead sets a `date -u` stamp.
 GRANT_intm = "2026-10-31T17:03:19Z"
 GRANT_inta = "2026-10-31T17:03:19Z"
-GRANT_intb = None
+GRANT_intb = "2026-10-31T18:16:02Z"
 # this cell's options (main strips them before the I4DC main); the BF1 defaults are r2_bf1_cell's
 OPT = dict(st1_commit="rows", ineg=None, bf_store=0, bf_ncap=2048, bf_ring=8, bf_worker="thread", bf_acct=0,
            bf_close_wait_ms=0.0, bf_packer="gilfree", bf_threads=14, bf_cap_groups=2048, bf_late="defer",
