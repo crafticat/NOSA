@@ -111,6 +111,11 @@ I4D_NEW = I4D_NEW + ("benchmarks/Efficiency/r2_j1_select.py", "benchmarks/Effici
                      "benchmarks/Efficiency/r2_j1_step.sh", T_ + "test_j1.py", "docs/NOTES_j1.md")          # J1
 I4D_LATER = I4D_LATER + ("r2_j1_select.py", "r2_j1_cell.py")                                     # J1
 I4D_NEW = I4D_NEW + ("benchmarks/Efficiency/r2_j1_forkbench.py",)                                         # J1
+# ST1 (nosi-r2-st1: RECON7 cd0f0c5 + AREA 3, the captured row commit of the best arms, r2_st1_cell.py): its files (its
+# own Gate 0: tests_cpu/test_st1.py); I4D_LATER: its modules contain "r2_i4d" (scan (f) skips them)
+I4D_NEW = I4D_NEW + ("benchmarks/Efficiency/r2_st1_commit.py", "benchmarks/Efficiency/r2_st1_cell.py",
+                     "benchmarks/Efficiency/r2_st1_step.sh", T_ + "test_st1.py")                            # ST1
+I4D_LATER = I4D_LATER + ("r2_st1_commit.py", "r2_st1_cell.py")                                     # ST1
 
 
 def _load(name, path=None):

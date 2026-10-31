@@ -134,6 +134,10 @@ I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_recon7_protocol.py", "benchmark
 I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_j1_select.py", "benchmarks/Efficiency/r2_j1_cell.py",
                        "benchmarks/Efficiency/r2_j1_step.sh", T_ + "test_j1.py", "docs/NOTES_j1.md")        # J1
 I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_j1_forkbench.py",)                                       # J1
+# ST1 (nosi-r2-st1: RECON7 cd0f0c5 + AREA 3, the captured row commit of the best arms, r2_st1_cell.py): its files (its
+# own Gate 0: tests_cpu/test_st1.py)
+I3_FILES = I3_FILES + ("benchmarks/Efficiency/r2_st1_commit.py", "benchmarks/Efficiency/r2_st1_cell.py",
+                       "benchmarks/Efficiency/r2_st1_step.sh", T_ + "test_st1.py")                          # ST1
 SEAM_CHANGED = {"#0", "TentState._layer", "TentState._row", "TentRunner.__init__"}
 SEAM_ADDED = {"TentState._rows", "TentState._resid", "TentState._write", "TentRunner._joint_ops", "TentRunner._make_state"}
 
