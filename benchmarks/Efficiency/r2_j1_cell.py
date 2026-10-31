@@ -39,6 +39,8 @@ import r2_j1_select as J1         # noqa: E402
 DCC_NAME = "r2_j1_dcc"
 DCC_FILE = os.path.join(HERE, "r2_i4dc_cell.py")
 ARMS_J1 = tuple(J1.ARMS_J1)
+ARMS_J3 = tuple(J1.ARMS_J3)                       # F3: the J1 arm + the residency in the graphs (non-keep arm only)
+BASE_J3 = dict(L4PTFDGUDCDJ3="L4PTFDGUDCD")       # the I4DC arm a J3 arm needs earlier (it compiles the helpers)
 KEEP_J1 = ("L4PTFDGUDKWCDJ1",)
 # REGISTERED PREDICTIONS, NONE UNTIL THE LEAD REGISTERS THEM: fill PRED_J1_BY_B (per batch) and PRED_STAMP_J1 (`date
 # -u`, L33) in a commit BEFORE j1a / j1b (the step script stops while PRED_STAMP_J1 is None). Keys, each (low, high)
@@ -84,7 +86,14 @@ GRANT_j1m = None
 GRANT_j1a = None
 GRANT_j1b = None
 PRED_KEYS_J1 = ("J1_joint_saving", "J1_joint_ratio", "J1_draft_ratio", "J1_draft_saving", "J1_vs_ref", "J1_ratio",
-                "J1_eq", "J1_peak_gb", "J1_compile_s", "J1_sh_saving", "J1_vs_shj1")
+                "J1_eq", "J1_peak_gb", "J1_compile_s", "J1_sh_saving", "J1_vs_shj1",
+                "J3_joint_saving", "J3_draft_saving", "J3_commit_saving", "J3_reset_saving", "J3_vs_ref", "J3_vs_shj1")
+# F3 (commit 3 of rung J1; X3 = L4PTFDGUDCDJ3, REF = the J1 arm of the job): J3_<phase>_saving [ms per round] REF phase
+# median - X3's; J3_vs_ref, J3_vs_shj1 [x]. THE BUILDER'S MODEL: the residency's ~15 eager launches per layer leave
+# the host; the passes are device-bound (draft busy 137.7-138.5 of 144.0 ms elapsed at C 128 for L4PTFD, profile i4c
+# e4a; joint busy 195.7-198.9 of 207.5), so the saving is the exposed host time only: joint 0 .. 6.3 ms (BEST's non-busy
+# label, MODEL), draft 0 .. 2 x 3 ms, central 3 ms per round (C 128), 0 .. 3 (C 73: device-bound, non-busy about 0).
+# A saving below the run spread (0.3 %) is NOT a refutation of the frame: J1-RESID and EQF decide correctness.
 PRED_J1_BY_B = {216: {k: None for k in PRED_KEYS_J1}, 318: {k: None for k in PRED_KEYS_J1}}
 
 _CUR = dict(arm=None)
@@ -110,13 +119,14 @@ def configure():
         DCC = D
         return D
     run0, rclass0, kref0, gates0, verd0 = D.run_arm_d, D.runner_class, D.keep_ref_arm, D.arm_gates, D.verdicts
-    D.BASE_D = dict(D.BASE_D, **J1.ARMS_J1)                              # a J1 arm needs its I4DC arm earlier
-    D.ROOT_ARM = dict(D.ROOT_ARM, **{x: D.ROOT_ARM[b] for x, b in J1.ARMS_J1.items()})
-    D.ARMS = D.ARMS + ARMS_J1
-    D.GRAPH_ARMS = D.GRAPH_ARMS + ARMS_J1
-    D.STACK_ARMS = D.STACK_ARMS + ARMS_J1
+    base_all = dict(J1.ARMS_J1, **BASE_J3)
+    D.BASE_D = dict(D.BASE_D, **base_all)                                # a J1 / J3 arm needs its I4DC arm earlier
+    D.ROOT_ARM = dict(D.ROOT_ARM, **{x: D.ROOT_ARM[b] for x, b in base_all.items()})
+    D.ARMS = D.ARMS + ARMS_J1 + ARMS_J3
+    D.GRAPH_ARMS = D.GRAPH_ARMS + ARMS_J1 + ARMS_J3
+    D.STACK_ARMS = D.STACK_ARMS + ARMS_J1 + ARMS_J3
     D.KEEP_ARMS = D.KEEP_ARMS + KEEP_J1
-    D.NAMES = dict(D.NAMES, **{x: D.NAMES[b] for x, b in J1.ARMS_J1.items()})
+    D.NAMES = dict(D.NAMES, **{x: D.NAMES[b] for x, b in base_all.items()})
 
     def run_arm_j1(model, ids, inputs, steps, clock, opt, FORK, arm):
         """The I4DC run_arm_d with the J1 runner for a J1 arm (runner_class reads the arm from _CUR)."""
@@ -127,14 +137,14 @@ def configure():
             _CUR["arm"] = None
 
     def runner_choice_j1(arm, check):
-        if arm in J1.ARMS_J1:
-            return rc0(J1.ARMS_J1[arm], check)
+        if arm in base_all:
+            return rc0(base_all[arm], check)
         return rc0(arm, check)
     rc0 = D.runner_choice
 
     def runner_class_j1(kind, STF):
         arm = _CUR["arm"]
-        if arm in J1.ARMS_J1:
+        if arm in base_all:
             return J1.j1_classes(STF)[arm][1]
         return rclass0(kind, STF)
 
@@ -149,10 +159,13 @@ def configure():
 
     def arm_gates_j1(arm, rd, rec, cpu, keep, check, B, pool, steps, L, pa):
         g = gates0(arm, rd, rec, cpu, keep, check, B, pool, steps, L, pa)
-        if arm in J1.ARMS_J1:
+        if arm in base_all:
             rec["j1"] = (rd or {}).get("j1")                           # into the summary (the arm's record)
             rec["sh_j1"] = SH_J1["result"]
             g = g + J1.j1_gates(arm, rd, L)
+            if arm in J1.ARMS_J3:
+                rec["j3"] = (rd or {}).get("j3")
+                g = g + J1.j3_gates(arm, rd, L)
             if not SH_J1["emitted"]:
                 SH_J1["emitted"] = True
                 g = g + [sh_gate()]
@@ -300,6 +313,19 @@ def verdicts(sh, sp, B: int, D=None):
                     None if (strong is None or med(x) is None) else round(med(x) / strong, 4))))
     out.append(("J1-ARM", "REPORT", "X = %s, REF = %s (REF ran: %s); J1 record %s; SHJ1 %s" % (
         X, J1.ARMS_J1[X], r is not None, x.get("j1"), {k: v for k, v in s1.items() if k != "steady"})))
+    for a3 in ARMS_J3:                                                 # F3: against the J1 arm (else its I4DC arm)
+        x3 = sp.get(a3)
+        if x3 is None:
+            continue
+        r3n = J1.ARMS_J3[a3] if J1.ARMS_J3[a3] in sp else BASE_J3[a3]
+        r3 = sp.get(r3n)
+        for nm, ph_ in (("JOINT", "joint"), ("DRAFT", "draft"), ("COMMIT", "commit"), ("RESET", "reset")):
+            a_, b_ = ph(r3, ph_), ph(x3, ph_)
+            band("J3-%s-SAVING" % nm, (a_ - b_) if (a_ is not None and b_ is not None) else None,
+                 P.get("J3_%s_saving" % ph_))
+        band("J3-VS-REF", ratio(med(x3), med(r3)), P.get("J3_vs_ref"))
+        band("J3-VS-SHJ1", ratio(med(x3), s1t), P.get("J3_vs_shj1"))
+        out.append(("J3-ARM", "REPORT", "X3 = %s, REF = %s; J3 record %s" % (a3, r3n, x3.get("j3"))))
     return out
 
 

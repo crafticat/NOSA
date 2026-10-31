@@ -20,18 +20,19 @@
 # CELLS (--spec 3 --fork-store 0 --prefill-hook nocopy --tu-gemm natural --spec-twin fused --spec-body fused --spec-graph
 # on --spec-redirect on --probe-every 16; docs/NOTES_j1.md holds the protocol):
 #   j1m  the MINIATURE: C 73 (pool 10), B 8, 72 steps, arms L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,
-#        L4PTFDGUDKWCD,L4PTFDGUDCDJ1,L4PTFDGUDKWCDJ1, --check-every 1 (J1-PEQ in every round), --require-stress 1;
-#        every gate MUST. Run it first. STEP_MIN 30, --mem 100G.
-#   j1a  timing, C 128 (pool 65), B 216, 512 steps, arms L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDJ1. STEP_MIN 110,
-#        --mem 240G. STOPS while PRED_STAMP_J1 is None.
+#        L4PTFDGUDKWCD,L4PTFDGUDCDJ1,L4PTFDGUDKWCDJ1,L4PTFDGUDCDJ3, --check-every 1 (J1-PEQ in every round),
+#        --require-stress 1; every gate MUST. Run it first. STEP_MIN 35, --mem 100G.
+#   j1a  timing, C 128 (pool 65), B 216, 512 steps, arms L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDJ1,L4PTFDGUDCDJ3.
+#        STEP_MIN 125, --mem 240G. STOPS while PRED_STAMP_J1 is None.
 #   j1b  timing, C 73 (pool 10), B 318, 512 steps, arms L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDJ1. STEP_MIN
 #        170, --mem 340G. STOPS while PRED_STAMP_J1 is None.
 # Every cell also runs SHJ1 right after SH (the shipped run with the compiled pooling: the matched baseline of F2;
 # about one more SH run, 1-4 min; inside the margins below).
 # Basis of STEP_MIN (MEASURED, sacct, CITED by r2_recon7_step.sh:42-46): i4dca (SH + 3 arms, C 128 B 216) 00:47:32;
 # i4dcb 01:11:41; i4dm2 (SH + 6 arms, B 8) 00:09:08 / 00:09:18. MODEL: j1a = i4dca + one D-arm part (11.5 min) + one
-# compile (<= 1 min) = about 60 min (margin 1.8); j1b = i4dcb + 17 + 1 = about 90 min (margin 1.9); j1m = i4dm2 + 2
-# parts (2 min) = about 11.5 min (margin 2.6). Memory: the I4DC cells' --mem.
+# compile (<= 1 min) = about 60 min, + the J3 part (11.5) + SHJ1 (2) = about 74 min (margin 1.7); j1b = i4dcb + 17 +
+# 1 + SHJ1 (4) = about 94 min (margin 1.8); j1m = i4dm2 + 3 parts (3 min) = about 12.5 min (margin 2.8). Memory: the
+# I4DC cells' --mem.
 #
 # OUTPUT: OUTROOT/j1_<run>_<holder>_<cell>/summary.json and the step record OUTROOT/j1_<run>_<holder>_<cell>.step/, both
 # frozen. EXIT: as r2_recon7_step.sh (the cell's exit 0-19 / 20 / 30; 1 STOP; 2 usage; 3 another GPU; 4 not one GPU;
@@ -70,9 +71,10 @@ case $JOB in *[!0-9]*|"") stop "holder job id '$JOB'" ;; esac
 [[ $RUN =~ ^[a-z0-9]{1,16}$ ]] || stop "run id '$RUN' (1-16 of a-z 0-9)"
 K=3 STRESS=0 CHECK=0 NEEDPRED=0
 case $CELL in
-    j1m) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 STEP_MIN=30 MEM=100G
-         ARMS=L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDJ1,L4PTFDGUDKWCDJ1 ;;
-    j1a) POOL=65 BATCH=216 STEPS=512 NEEDPRED=1 STEP_MIN=110 MEM=240G ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDJ1 ;;
+    j1m) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 STEP_MIN=35 MEM=100G
+         ARMS=L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDJ1,L4PTFDGUDKWCDJ1,L4PTFDGUDCDJ3 ;;
+    j1a) POOL=65 BATCH=216 STEPS=512 NEEDPRED=1 STEP_MIN=125 MEM=240G
+         ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDJ1,L4PTFDGUDCDJ3 ;;
     j1b) POOL=10 BATCH=318 STEPS=512 NEEDPRED=1 STEP_MIN=170 MEM=340G
          ARMS=L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDJ1 ;;
     *) stop "cell '$CELL' (j1m, j1a or j1b)" ;;

@@ -48,6 +48,28 @@ Tree /mnt/beegfs/ojerbi/nosi-r2-j1 (branch r2-j1) on RECON7 cd0f0c5. SOURCE ONLY
   whole-step graph's 3,407.2 tok/s with SHJ1's per-step saving; the whole-step graph itself lives in the tree
   nosi-r2-graphstep, not in this lineage: a measured matched strongest needs its port, not done).
 
+## 2c. F3 (third commit): the residency inside the captured graphs (arm L4PTFDGUDCDJ3)
+
+- Blocker in the I4G / I4H / I4S rungs: pool_update takes the host int stamp (spec_tentative.py:461-466,
+  r2_i4a_lean.py:206-210, r2_i4u_hoist.py:188-192), so the residency stayed eager (r2_i4g_graph.py:12-15,
+  r2_i4h_graph.py:15-17, r2_i4s_stack.py:28-31) and the rungs called a device stamp "a kernel edit".
+- Reuse: the strongest baseline already removed it without a kernel edit: constant stamp STAMP_K = 64 << 31 and every
+  real age (>= 0) moved down by topk before each call (nosi-r2-graphstep 0159e82 nosi/nosi/graph_step.py:17-19, :59,
+  :146-154, :243-244; gs1 bitwise vs the eager step, SCORING_gs1.md). StampFrame applies it per call and layer as the
+  arm's pool_update (shift_in at the layer's first, eager call; shift_out + the host stamp at export after the run).
+- Capture: the joint section graph now holds the residency (r2_i4s_stack.py:132-176 copied, 6 lines removed, 4 marked
+  "# J3"; expected host counts + calls["resid"] 1); the draft graphs hold A(l) + residency + B(l) as one graph per
+  layer (r2_i4h_graph.py:332-391 overridden: _dstub, _dend_b, _dreplay); the draft key adds meter.on (the drain's
+  target-row passes count host blocks).
+- Expected effect (quantitative explanation, MODEL): the passes are device-bound. L4PTFD profile i4c e4a (C 128): joint
+  busy 195.7-198.9 of 207.5 ms elapsed, draft busy 137.7-138.5 of 144.0 ms (RECON7_R2_joint.md:187-189). Host launch
+  work of the residency: about 15 launches x 32 layers x about 5 us = 2.4 ms per pass, issued while the GPU is busy
+  with earlier layers; it is exposed only where the queue runs dry (pass start). Bound: joint 0 .. 6.3 ms (BEST's
+  non-busy label, R2:300), draft 0 .. 2 x 3 ms; central about 3 ms per round at C 128, 0 .. 3 at C 73. A result inside
+  the run spread is the expected outcome, not a defect; J1-RESID and EQF decide correctness.
+- Keep arm (C 73): not built; its residency (r2_i4d_keep.py / r2_i4k_combo.py _resid_k) reads the kept store and kwin
+  lookups that were not checked for capture.
+
 ## 3. The reuse line (the lead's rule: upstream basis, incompatibility or cost, minimal adaptation, validation)
 
 - Upstream basis: NOSA's `nosa_pool_kernel` (nosi/nosi/max_pooling_fused.py:7-75) as forked per request in
@@ -87,8 +109,8 @@ Registration: `PRED_J1_BY_B` + `PRED_STAMP_J1` (the builder's MODEL is the comme
 
 | cell | config | arms (SH first) | STEP_MIN / --mem | command |
 |---|---|---|---|---|
-| j1m | C 73 pool 10, B 8, 72 steps, check every round, stress | L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDJ1,L4PTFDGUDKWCDJ1 | 30 / 100G | `bash benchmarks/Efficiency/r2_j1_step.sh --nosi <sha> <holder> <run> j1m` |
-| j1a | C 128 pool 65, B 216, 512 steps | L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDJ1 | 110 / 240G | `... j1a` |
+| j1m | C 73 pool 10, B 8, 72 steps, check every round, stress | L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDJ1,L4PTFDGUDKWCDJ1,L4PTFDGUDCDJ3 | 35 / 100G | `bash benchmarks/Efficiency/r2_j1_step.sh --nosi <sha> <holder> <run> j1m` |
+| j1a | C 128 pool 65, B 216, 512 steps | L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDJ1,L4PTFDGUDCDJ3 | 125 / 240G | `... j1a` |
 | j1b | C 73 pool 10, B 318, 512 steps | L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDJ1 | 170 / 340G | `... j1b` |
 
 MUST gates per J1 arm: every gate of its I4DC arm under the J1 name (RUN, ERR, COMMIT-N, D1, D3, SPAN, RESID, ATTN1,
@@ -120,7 +142,9 @@ Expected (MODEL; per round = per joint pass, the draft unchanged):
 | attention tiling / masks / per-request independence | KV time hidden by max(H, D) | fork 37.1 / 52.2 ms; 64-row tile, 2 programs per SM (255 regs, 59 KB smem), 8.1 us per tile, 2 waves x 75.8 tiles; X1: A and F do NOT overlap on two streams (97.8 vs 100.2 ms serial) | +11.6 / +14.7 above the model's extra; 0.885 vs 1.527 TB/s logical | MEASURED (fia5 TTGIR + ncu): occupancy and synchronous per-tile loads; 11 launch configs swept | none without a kernel edit (BLOCKER); 3D split = tail balance only (<= 10 %) | - |
 | selection (verify rows) | 0 (B draft rows inside td) | stage 1 9.82 / 13.54, POOLING 12.28 / 18.10, top-k 2.91 / 4.12, small 2.30 ms per joint pass | +17.83 / +24.43 (3B rows) | MEASURED: pooling = one program per output element (grid-bound, about 98 % of its time) | F1 (this rung): compiled gather + max, bitwise | PENDING j1a / j1b |
 | gather / materialization | none | cis copy to R rows (H, B, R, Lk) per layer; chain images (AREA 3); H2D gathers (AREA 2) | small (cis copy < 1 ms) | CODE | F1 removes the cis copy | PENDING |
-| launch overhead | td includes its own launches | BEST joint non-busy about 6.3 / about 0 ms (MODEL labels); 2L draft graphs + L eager residencies | +6.3 / 0 | MODEL | F3: whole-layer graphs with the shifted-age LRU frame of the strongest baseline | not built |
+| launch overhead | td includes its own launches | BEST joint non-busy about 6.3 / about 0 ms (MODEL labels); 2L draft graphs + L eager residencies; passes device-bound (busy 0.94-0.96 of elapsed, L4PTFD profile) | +6.3 / 0 | MODEL (exposed host time only at pass start) | F3 (arm L4PTFDGUDCDJ3): residency inside the joint and draft graphs via the shifted-age frame | PENDING j1a (expected 0-9, central 3 ms per round) |
+| draft passes' pooling (n td) | inside td | 3.14 / 4.71 ms per one-row pass (one program per output) | +2 x 2.8 / 2 x 4.4 per round | MEASURED kernel | F2 (in the J1 arms) | PENDING j1a / j1b |
+| matched baseline | strongest 3,407.2-3,426.2 tok/s with the shipped pooling | SHJ1: SH with the compiled pooling, same job | per SH step -2.8 / -4.4 (MODEL) | the same kernel in SH | F2 on SH | PENDING (J1-SH-SAVING, J1-VS-SHJ1) |
 
 ## 7. Commands (this rung, login node)
 

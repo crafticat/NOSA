@@ -22,6 +22,12 @@ EQUAL     test_j1_equals (timing B 8, check B 8, both arms): the J1 run = L4PTFD
           J1-COMPILE: one compile event at most, calls = joint passes x L, no fallback; the I4DC cell gates pass on the
           CPU evidence under the J1 name.
 PLANT     test_j1_plant_wrong_req: the cis of the next request: PEQ > 0 and EQF FAILS (not a no-op, L34).
+F2        test_shpool_equal (ShPool = the shipped scalar kernel's stand-in), test_sh_j1 (SHJ1 on a base-cell stand-in,
+          J1-SHEQ, the verdicts); the draft preconditions in test_j1_equals (J1-DRAFT).
+F3        test_stamp_frame_equal (the shifted-age frame = the shipped stamps on a toy LRU kernel; the shift's plant),
+          test_j3_gsection_copy (the I4S _gsection copy), test_j3_equals (L4PTFDGUDCDJ3 = the J1 arm and = L4PTFD bit
+          for bit, ages and maps included; J1-RESID and its plants). The capture stand-in FakeGraphsJ3 records the
+          residency's kernels as kernel nodes.
 CELL      test_j1_cell_tables (the private copy; the I4DC cell module itself unchanged), test_j1_registration_state,
           test_step_script_j1.
 
@@ -238,9 +244,58 @@ def test_pool_fn_equal():
 
 
 # ------------------------------------------------------------------ the arms
-ARMS = dict(GUDCDJ1="L4PTFDGUDCDJ1", GUDKCDJ1="L4PTFDGUDKWCDJ1")
-BASE = dict(GUDCDJ1="GUDCD", GUDKCDJ1="GUDKCD")
+ARMS = dict(GUDCDJ1="L4PTFDGUDCDJ1", GUDKCDJ1="L4PTFDGUDKWCDJ1", GUDCDJ3="L4PTFDGUDCDJ3")
+BASE = dict(GUDCDJ1="GUDCD", GUDKCDJ1="GUDKCD", GUDCDJ3="GUDCD")
 C_OF = dict(GUDCD="GUDC", GUDKCD="GUDKC")
+RESID_KERNELS = ("diff", "pool_update", "pool_swap")
+
+
+class FakeGraphsJ3(X.FakeGraphsDCD):
+    """FakeGraphsDCD for F3: the residency runs INSIDE the joint and the draft captures, so its kernels (diff,
+    pool_update = the stamp frame, pool_swap) and the meter's gathers are kernel nodes of the capture (one recorded
+    call each; their CPU stand-ins may read data-dependent shapes, as a GPU kernel never does). capture() is
+    i4cc_world.FakeGraphsDC.capture with the kernel nodes added (the lines marked F3)."""
+
+    def capture(self, fn, T, vs):
+        rec = X.XG._Recorder()
+        meter = T.meter
+        kern = T.rs.ops.kernels                                                         # F3
+        orig_k = {k: kern[k] for k in RESID_KERNELS if kern.get(k) is not None}         # F3
+        orig_m, orig_f = meter.orig, vs.ops.fork
+        meter.orig = tuple(rec.node(f) for f in orig_m)
+        vs.ops.fork = rec.node(orig_f)
+        kern.update({k: rec.node(f) for k, f in orig_k.items()})                       # F3
+        T._cc_wrap = X.XC._cnode(rec)
+        try:
+            with rec:
+                out = fn()
+        finally:
+            T._cc_wrap = None
+            meter.orig, vs.ops.fork = orig_m, orig_f
+            kern.update(orig_k)                                                         # F3
+            for t, c in reversed(rec.saved):
+                t.copy_(c)
+            self.restored += len(rec.saved)
+        g = X.XG.FakeGraph(rec.ops)
+        self.graphs.append(g)
+        return g, out
+
+    def begin(self):
+        super().begin()
+        rec = self._open[0]
+        T = self.T
+        kern = T.rs.ops.kernels
+        self._j3_k = {k: kern[k] for k in RESID_KERNELS if kern.get(k) is not None}
+        self._j3_m = T.meter.orig
+        kern.update({k: rec.node(f) for k, f in self._j3_k.items()})
+        T.meter.orig = tuple(rec.node(f) for f in self._j3_m)
+
+    def end(self):
+        try:
+            return super().end()
+        finally:
+            self.T.rs.ops.kernels.update(self._j3_k)
+            self.T.meter.orig = self._j3_m
 
 
 def j1_builder(arm, check=False, stats=False, kcheck=False, phase_marks=False, probe_every=0, j1neg=None,
@@ -264,7 +319,7 @@ def j1_builder(arm, check=False, stats=False, kcheck=False, phase_marks=False, p
                   cc_backend="inductor", ccneg=None, cdneg=None, j1neg=j1neg, j1draft=j1draft)
         if arm == "GUDKCDJ1":
             kw.update(keep=True, kwin=True, kcheck=kcheck, kneg=None, kslots=None, cneg=None)
-        be = X.FakeGraphsDCD()
+        be = FakeGraphsJ3() if arm == "GUDCDJ3" else X.FakeGraphsDCD()
         run = Runner(model, rs, sops, BC.HostClock(), graph_backend=be, **kw)
         be.T = run.T
         return run
@@ -376,6 +431,124 @@ def test_j1_plant_wrong_req():
     assert J1.j1_gates("L4PTFDGUDCDJ1", p["rd"], L)[0][2] is False
     with pytest.raises(X.SR.SpecError):
         j1_builder("GUDCDJ1", j1neg="nope")(*X.world(2, 8)[:5])
+
+
+# ------------------------------------------------------------------ F3: the residency in the graphs
+def _toy_pool_update(bm, lm, pm, age, tgt, act, stamp, tail):
+    """A toy LRU kernel with pool_update's contract: per (head, request) the oldest REAL age (an empty, < 0, first) is
+    replaced by stamp + (the first load id, clamped at 0); the chosen slot into tgt. Only comparisons of ages and
+    stamp + m writes (the property the frame relies on)."""
+    key = torch.where(age >= 0, age, age - (1 << 62))
+    slot = key.argmin(-1, keepdim=True)
+    age.scatter_(-1, slot, int(stamp) + lm[..., :1].clamp(min=0).to(age.dtype))
+    tgt.copy_(slot.expand_as(tgt))
+
+
+def test_stamp_frame_equal():
+    """StampFrame = the shipped stamp sequence: the same evictions at every call and, after export, the same ages and
+    host stamps; the first call inside a capture is refused; export re-arms the frame."""
+    import types
+    J1 = _mod("r2_j1_select")
+    g = torch.Generator().manual_seed(11)
+    H, B, P, Lyr, topk = 2, 3, 6, 2, 64
+
+    def engines(seed_age):
+        return [types.SimpleNamespace(_pool_age=seed_age.clone(), _pool_stamp_base=1000) for _ in range(Lyr)]
+    age0 = torch.randint(-3, 900, (H, B, P), generator=g)
+    age0[0, 0, :2] = torch.tensor([-1, -2])                            # empty slots
+    ship, fr_e = engines(age0), engines(age0)
+    frame = J1.StampFrame(_toy_pool_update, fr_e, topk)
+    bad = 0
+    for t in range(40):
+        lm = torch.randint(-1, 50, (H, B, 4), generator=g)
+        for l in range(Lyr):
+            ts, tf = torch.zeros(H, B, 1, dtype=torch.int64), torch.zeros(H, B, 1, dtype=torch.int64)
+            e = ship[l]
+            _toy_pool_update(None, lm, None, e._pool_age, ts, None, e._pool_stamp_base, 7)
+            e._pool_stamp_base += topk
+            f = fr_e[l]
+            frame(None, lm, None, f._pool_age, tf, None, f._pool_stamp_base, 7)
+            f._pool_stamp_base += topk if t == 0 else 0                 # a captured caller moves the host int once
+            bad += int((ts != tf).sum())
+    assert bad == 0                                                     # the same evictions at every call
+    rec = frame.export()
+    for l in range(Lyr):
+        assert torch.equal(ship[l]._pool_age, fr_e[l]._pool_age) and ship[l]._pool_stamp_base == fr_e[l]._pool_stamp_base
+    assert rec["calls"] == [40] * Lyr and rec["first"] == [1000] * Lyr and frame.first == [None] * Lyr
+    frame2 = J1.StampFrame(_toy_pool_update, engines(age0), topk)       # PLANT: no per-call shift -> evictions differ
+    f2 = frame2.engines
+    orig_sub = torch.Tensor.sub_
+    try:
+        torch.Tensor.sub_ = lambda self, *a, **k: self                  # the frame's shift disabled
+        ok = True
+        for t in range(40):
+            lm = torch.randint(-1, 50, (H, B, 4), generator=g)
+            ts, tf = torch.zeros(H, B, 1, dtype=torch.int64), torch.zeros(H, B, 1, dtype=torch.int64)
+            _toy_pool_update(None, lm, None, ship[0]._pool_age, ts, None, ship[0]._pool_stamp_base, 7)
+            ship[0]._pool_stamp_base += topk
+            frame2(None, lm, None, f2[0]._pool_age, tf, None, 0, 7)
+            ok = ok and torch.equal(ts, tf)
+    finally:
+        torch.Tensor.sub_ = orig_sub
+    assert not ok                                                       # the shift is not a no-op (L34)
+    _ev("J1 F3 FRAME: 40 calls x %d layers bit-equal to the shipped stamps; export %s; plant (no shift) caught" % (
+        Lyr, rec))
+
+
+def _dedented(fn):
+    src = textwrap.dedent(inspect.getsource(fn))
+    node = ast.parse(src).body[0]
+    return src.splitlines()[node.body[0].lineno - 1:]
+
+
+def test_j3_gsection_copy():
+    J1 = _mod("r2_j1_select")
+    S3 = J1.j1_classes(X.STF)["L4PTFDGUDCDJ3"][0]
+    G = next(c for c in S3.__mro__ if c.__name__ == "_GraphS")
+    mine, orig = _dedented(S3._gsection), _dedented(G._gsection)
+    core = [x for x in mine if not x.rstrip().endswith("# J3")]
+    gone = [x for x in orig if any(w in x for w in ("self._resid_eager(", "if copy_skip:", 'self._sb["skip"].copy_(skip)',
+                                                    'sk0 = self._sb["skip"]', "setattr(self, stub,",
+                                                    "want = expected_delta_s("))]
+    assert len(gone) == 6, gone
+    assert core == [x for x in orig if x not in gone], [(i, a, b) for i, (a, b) in enumerate(zip(core, orig)) if a != b][:3]
+    extra = [x for x in mine if x.rstrip().endswith("# J3")]
+    assert len(extra) == 4 and "expected_delta_j3(" in extra[2], extra
+
+
+def test_j3_equals():
+    """The J3 arm (F1 + F2 + F3) = the J1 arm and = L4PTFD BIT FOR BIT (every state tensor, the pool ages and maps
+    included, after the frame's export), with the residency inside every joint and draft capture."""
+    C, D = _cell()
+    J1 = _mod("r2_j1_select")
+    d = _run("D")
+    _run("GUDC")
+    _run("GUDCD")
+    j = _run("GUDCDJ1")
+    x = _run("GUDCDJ3")
+    rd = x["rd"]
+    _ev("J1 F3 timing: rounds %d; j3 %s; graph captures %s warm %s replays %s eager %s; dgraph keys %s captures %s "
+        "capture passes %s replay passes %s eager %s" % (
+            rd["rounds"], rd["j3"], rd["graph"]["captures"], rd["graph"]["warm"], rd["graph"]["replays"],
+            rd["graph"]["eager_why"], rd["dgraph"]["keys"], rd["dgraph"]["captures"], rd["dgraph"]["capture_passes"],
+            rd["dgraph"]["replay_passes"], rd["dgraph"]["eager_why"]))
+    assert rd["dgraph"]["replay_passes"] >= 10 and rd["graph"]["replays"] > 0         # L34: replays ran
+    bad = TS._diff(j, x, skip=("compile", "j1", "j3"))
+    assert bad == [], bad[:10]                                         # = the J1 arm (ages after the export too)
+    bad = TS._diff(d, x, skip=("hoist", "compile", "j1", "j3"))
+    assert bad == [], bad[:10]                                         # = L4PTFD
+    g = J1.j3_gates("L4PTFDGUDCDJ3", rd, L)
+    assert g[0][2] is True, g
+    C.SH_J1["emitted"] = True
+    rec = dict(graph=rd["graph"], dgraph=rd["dgraph"], gpu_peak_alloc_GB=1.0, mem_arena=dict(prefill_peak_GB=1.0))
+    gs = D.arm_gates("L4PTFDGUDCDJ3", rd, rec, X.cell_inputs(x, C=D), dict(L4PTFD=X.cell_inputs(d, C=D)), False, 8,
+                     10, N0, L, 1.0)
+    assert [g_[0] for g_ in gs][-4:] == ["L4PTFDGUDCDJ3-%s" % w for w in ("J1-PEQ", "J1-COMPILE", "J1-DRAFT",
+                                                                          "J1-RESID")]
+    assert all(g_[2] for g_ in gs if g_[1]), [g_ for g_ in gs if g_[1] and not g_[2]]
+    for plant in (dict(frame=[]), dict(joint_captures=L - 1), dict(draft_layers=0), dict(delta_fixed=0),
+                  dict(frame=[dict(rd["j3"]["frame"][0], calls=[1, 2] + [1] * (L - 2))])):
+        assert J1.j3_gates("x", dict(rd, j3=dict(rd["j3"], **plant)), L)[0][2] is False, plant
 
 
 # ------------------------------------------------------------------ F2 on the baseline (SHJ1)
@@ -492,7 +665,10 @@ def test_j1_cell_tables():
     assert D is not I4DC and D.__name__ == C.DCC_NAME
     assert os.path.realpath(D.__file__) == os.path.realpath(I4DC.__file__)   # the same file, a second module object
     assert "L4PTFDGUDCDJ1" not in I4DC.ARMS and "L4PTFDGUDCDJ1" not in I4DC.BASE_D       # the import: unchanged
-    assert D.ARMS == I4DC.ARMS + C.ARMS_J1 and D.BASE_D["L4PTFDGUDKWCDJ1"] == "L4PTFDGUDKWCD"
+    assert D.ARMS == I4DC.ARMS + C.ARMS_J1 + C.ARMS_J3 and D.BASE_D["L4PTFDGUDKWCDJ1"] == "L4PTFDGUDKWCD"
+    assert D.BASE_D["L4PTFDGUDCDJ3"] == "L4PTFDGUDCD" and D.ROOT_ARM["L4PTFDGUDCDJ3"] == "L4PTFDGUD"
+    assert "L4PTFDGUDCDJ3" in D.GRAPH_ARMS and "L4PTFDGUDCDJ3" not in D.KEEP_ARMS
+    assert D.runner_choice("L4PTFDGUDCDJ3", False) == ("SCD", dict(cc_backend="inductor"))
     assert D.ROOT_ARM["L4PTFDGUDCDJ1"] == "L4PTFDGUD" and D.ROOT_ARM["L4PTFDGUDKWCDJ1"] == "L4PTFDGUDKW"
     assert D.NAMES["L4PTFDGUDCDJ1"] == I4DC.NAMES["L4PTFDGUDCD"] and "L4PTFDGUDKWCDJ1" in D.KEEP_ARMS
     assert C.configure() is D                                          # idempotent
@@ -551,9 +727,9 @@ def _step(cell, sha="0" * 40):
                           capture_output=True, text=True, timeout=300)
 
 
-CELLS = (("j1m", 10, 8, 72, 1, 1, 30, "100G",
-          "L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDJ1,L4PTFDGUDKWCDJ1"),
-         ("j1a", 65, 216, 512, 0, 0, 110, "240G", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDJ1"),
+CELLS = (("j1m", 10, 8, 72, 1, 1, 35, "100G",
+          "L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDJ1,L4PTFDGUDKWCDJ1,L4PTFDGUDCDJ3"),
+         ("j1a", 65, 216, 512, 0, 0, 125, "240G", "L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDJ1,L4PTFDGUDCDJ3"),
          ("j1b", 10, 318, 512, 0, 0, 170, "340G", "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDJ1"))
 
 
