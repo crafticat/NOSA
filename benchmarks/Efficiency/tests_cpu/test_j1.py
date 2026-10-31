@@ -496,9 +496,14 @@ def test_stamp_frame_equal():
 
 
 def _dedented(fn):
+    """The body lines of a function (method) after its docstring, dedented (test_recon7._body_lines' docstring rule)."""
     src = textwrap.dedent(inspect.getsource(fn))
     node = ast.parse(src).body[0]
-    return src.splitlines()[node.body[0].lineno - 1:]
+    first = node.body[0]
+    doc = isinstance(first, ast.Expr) and isinstance(getattr(first, "value", None), ast.Constant) and isinstance(
+        first.value.value, str)
+    start = first.end_lineno if doc else first.lineno - 1
+    return src.splitlines()[start:]
 
 
 def test_j3_gsection_copy():

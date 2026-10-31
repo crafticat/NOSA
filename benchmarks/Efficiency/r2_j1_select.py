@@ -266,8 +266,7 @@ def _make(STF):
                 nidx = (m.view(M, 1) * (SET_SIZE - 1) - PADDING
                         + torch.arange(SET_SIZE, dtype=torch.int64, device=dev).view(1, SET_SIZE)).contiguous()
                 t = self._j1_dt = dict(er=ar.view(B, 1, 1), br=req.view(B, 1, 1).contiguous(), nidx=nidx,
-                                       mar=m.view(1, M), rq=torch.empty_like(st.pq), rc=torch.empty_like(st.pc),
-                                       wq=torch.empty_like(st.pq), wc=torch.empty_like(st.pc))
+                                       mar=m.view(1, M), rq=torch.empty_like(st.pq), rc=torch.empty_like(st.pc))
             return t
 
         def _dbegin_a(self, gs, l, layer):
@@ -278,8 +277,12 @@ def _make(STF):
             use = self._j1_draft and rs.ops.graph and self._j1_why_d() is None
             if use and self.j1["dwarm"] == 0 and rs.score_buf is not None:
                 t = self._j1_dtensors()
+                # the warm call writes the REAL output buffers (scratch intermediates: the selection of every pass
+                # rewrites them before its top-k reads them): a scratch made here would be an inference tensor, whose
+                # dispatch keys differ from st.pq's, and dynamo would compile again inside the capture (CPU run of
+                # 3e5dd00: a "draft" compile event with capture True)
                 self._j1_call(l, "draft_warm", (rs.score_buf, rs.st.twins[l].ccis, t["er"], t["br"], t["nidx"],
-                                                t["mar"], rs.n_used, rs.M_b, t["wq"], t["wc"],
+                                                t["mar"], rs.n_used, rs.M_b, rs.st.pq, rs.st.pc,
                                                 int(layer.init_blocks), int(layer.window_blocks) + 1))
                 self.j1["dwarm"] += 1
             super()._dbegin_a(gs, l, layer)
