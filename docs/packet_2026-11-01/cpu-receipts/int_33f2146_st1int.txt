@@ -1,0 +1,38 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+......                                                                   [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st3_int[timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int-test/benchmarks/Efficiency/tests_cpu/test_st1.py:706: Evidence: ST3 INT timing: keep listed 846 hits 786; bf committed 461; st3 {'calls': 18, 'checked': 14, 'fallback': {}}
+    _ev("ST3 INT %s: keep listed %d hits %d; bf committed %d; st3 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st3_int[check]
+  /mnt/beegfs/ojerbi/nosi-r2-int-test/benchmarks/Efficiency/tests_cpu/test_st1.py:706: Evidence: ST3 INT check: keep listed 846 hits 786; bf committed 461; st3 {'calls': 19, 'checked': 19, 'fallback': {}}
+    _ev("ST3 INT %s: keep listed %d hits %d; bf committed %d; st3 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_int[C128-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int-test/benchmarks/Efficiency/tests_cpu/test_st1.py:997: Evidence: ST4 INT C128 timing: skipped 1884; st4 {'calls': 10, 'fallback': {}, 'events': [{'name': 'rpost', 'graphs': 1, 's': 0.183, 'layer': 0, 'joint_pass': 0, 'capture': False, 'dpass': 1}]}
+    _ev("ST4 INT %s %s: skipped %d; st4 %s" % (key, scen, sum(rd["tent"]["skipped"]),
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_int[C73-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int-test/benchmarks/Efficiency/tests_cpu/test_st1.py:997: Evidence: ST4 INT C73 timing: skipped 1884; st4 {'calls': 120, 'fallback': {}, 'events': []}
+    _ev("ST4 INT %s %s: skipped %d; st4 %s" % (key, scen, sum(rd["tent"]["skipped"]),
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_int[C128-check]
+  /mnt/beegfs/ojerbi/nosi-r2-int-test/benchmarks/Efficiency/tests_cpu/test_st1.py:997: Evidence: ST4 INT C128 check: skipped 1884; st4 {'calls': 6, 'fallback': {}, 'events': []}
+    _ev("ST4 INT %s %s: skipped %d; st4 %s" % (key, scen, sum(rd["tent"]["skipped"]),
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_int[C73-check]
+  /mnt/beegfs/ojerbi/nosi-r2-int-test/benchmarks/Efficiency/tests_cpu/test_st1.py:997: Evidence: ST4 INT C73 check: skipped 1884; st4 {'calls': 120, 'fallback': {}, 'events': []}
+    _ev("ST4 INT %s %s: skipped %d; st4 %s" % (key, scen, sum(rd["tent"]["skipped"]),
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+6 passed, 40 deselected, 6 warnings in 1181.20s (0:19:41)

@@ -1,0 +1,11 @@
+R2 recon7 child: host nova05 gpu GPU-f31fc723-9dfe-407a-9947-28173556232a; hashing the image at 2026-10-31T11:38:32Z
+R2 recon7 child: image sha256 14bfb15e1258821e637b5936f2060d7c7c2be20410fdee2a54ee0ffef754734a OK at 2026-10-31T11:38:58Z
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 

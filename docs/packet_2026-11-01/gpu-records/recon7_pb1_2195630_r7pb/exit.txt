@@ -1,0 +1,7 @@
+exit=1 utc_end=2026-10-31T13:43:07Z
+accounting=exit 1, sacct FAILED 1:0
+bytes /mnt/beegfs/ojerbi/r2-runs/spec/recon7_pb1_2195630_r7pb 12314774
+bytes /mnt/beegfs/ojerbi/r2-runs/spec/recon7_pb1_2195630_r7pb.step 2494776
+bytes /mnt/beegfs/ojerbi/nosa-env/jit/recon7_pb1_2195630_r7pb 19759130
+bytes /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_jit/recon7_pb1_2195630_r7pb 13363185
+output_bytes=47931865 limit_bytes=2147483648 over=0

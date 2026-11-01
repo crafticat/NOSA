@@ -1,0 +1,1 @@
+2195630.7|st1-st1b-b1-2195630|COMPLETED|0:0|01:43:55|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=340G,node=1|3896128K

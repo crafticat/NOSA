@@ -1,0 +1,1 @@
+2195576.28|i4u-i4ua-y4a-2195576|COMPLETED|0:0|00:36:42|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=240G,node=1|3142972K

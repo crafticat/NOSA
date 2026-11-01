@@ -1,0 +1,1 @@
+2195630.6|bf1-bf1b-b1-2195630|FAILED|3:0|01:44:16|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=340G,node=1|4453676K

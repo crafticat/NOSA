@@ -1,0 +1,1 @@
+2195576.43|i4dc-i4dca-r4a-2195576|COMPLETED|0:0|00:48:01|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=240G,node=1|3032260K

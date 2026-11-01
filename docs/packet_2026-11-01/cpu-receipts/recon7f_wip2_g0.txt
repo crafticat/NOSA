@@ -1,0 +1,327 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+F.....F....F.........F.....FFFFFFFFF                                     [100%]
+=================================== FAILURES ===================================
+_______________________________ test_gate0_files _______________________________
+
+    def test_gate0_files():
+        if not _have(BASE):
+            pytest.skip("no git or no commit %s in %s" % (BASE, ROOT))
+        r = X_.git("diff", "--name-only", BASE, "--", ".", ":(exclude,glob)**/__pycache__/**")
+        assert r.returncode == 0, r.stderr
+        changed = [x for x in r.stdout.split("\n") if x]
+>       assert set(changed) <= set(DECLARED), sorted(set(changed) - set(DECLARED))
+E       AssertionError: ['docs/recon7_packet/CPU_TEST_RECEIPTS.txt', 'docs/recon7_packet/MANIFEST.txt', 'docs/recon7_packet/README.md', 'docs/...KPOINTS.md', 'docs/recon7_packet/analysis/HANDOFF_2026-10-29.md', 'docs/recon7_packet/analysis/HANDOFF_RECON7.md', ...]
+E       assert {'benchmarks/...cell.py', ...} <= {'benchmarks/...cell.py', ...}
+E         
+E         Extra items in the left set:
+E         'docs/recon7_packet/scripts/recon7_r3/s5_backbone.py'
+E         'docs/recon7_packet/scripts/recon7_s/s2_round_split.py'
+E         'docs/recon7_packet/analysis/RECON7_REVIEW.md'
+E         'docs/recon7_packet/scripts/recon7_r3/s2_extract.py'
+E         'docs/recon7_packet/logs/recon7b_wip_b.txt'...
+E         
+E         ...Full output truncated (78 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_wsb.py:193: AssertionError
+_______________________________ test_gate0_files _______________________________
+
+    def test_gate0_files():
+        if not _have(WSB_TIP):
+            pytest.skip("no git or no commit %s in %s" % (WSB_TIP, ROOT))
+        r = X_.git("diff", "--name-only", WSB_TIP, "--", ".", ":(exclude,glob)**/__pycache__/**")
+        assert r.returncode == 0, r.stderr
+        changed = [x for x in r.stdout.split("\n") if x]
+>       assert set(changed) <= set(DECLARED), sorted(set(changed) - set(DECLARED))
+E       AssertionError: ['docs/recon7_packet/CPU_TEST_RECEIPTS.txt', 'docs/recon7_packet/MANIFEST.txt', 'docs/recon7_packet/README.md', 'docs/...KPOINTS.md', 'docs/recon7_packet/analysis/HANDOFF_2026-10-29.md', 'docs/recon7_packet/analysis/HANDOFF_RECON7.md', ...]
+E       assert {'benchmarks/...cell.py', ...} <= {'benchmarks/...cell.py', ...}
+E         
+E         Extra items in the left set:
+E         'docs/recon7_packet/scripts/recon7_r3/s5_backbone.py'
+E         'docs/recon7_packet/scripts/recon7_s/s2_round_split.py'
+E         'docs/recon7_packet/analysis/RECON7_REVIEW.md'
+E         'docs/recon7_packet/scripts/recon7_r3/s2_extract.py'
+E         'docs/recon7_packet/logs/recon7b_wip_b.txt'...
+E         
+E         ...Full output truncated (78 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_wsc.py:210: AssertionError
+_____________________________ test_i2_gate0_files ______________________________
+
+    def test_i2_gate0_files():
+        if not (_have(SPEC5) and _have(WSA) and _have(WSB)):
+            pytest.skip("no git or no commit %s / %s / %s in %s" % (SPEC5, WSA, WSB, ROOT))
+        wsa_files = [x for x in _git("diff", "--name-only", SPEC5, WSA).stdout.split("\n") if x]
+        wsb_files = [x for x in _git("diff", "--name-only", SPEC5, WSB).stdout.split("\n") if x]
+        r = _git("diff", "--name-only", SPEC5, "--", ".", ":(exclude,glob)**/__pycache__/**")
+        changed = {x for x in r.stdout.split("\n") if x}
+        declared = set(wsa_files) | set(wsb_files) | set(I2_EDITED) | set(MERGED) | set(I2_NEW) | set(I3_FILES)   # I3
+>       assert changed <= declared, sorted(changed - declared)                 # (a) nothing else moved
+E       AssertionError: ['docs/recon7_packet/CPU_TEST_RECEIPTS.txt', 'docs/recon7_packet/MANIFEST.txt', 'docs/recon7_packet/README.md', 'docs/...KPOINTS.md', 'docs/recon7_packet/analysis/HANDOFF_2026-10-29.md', 'docs/recon7_packet/analysis/HANDOFF_RECON7.md', ...]
+E       assert {'benchmarks/...cell.py', ...} <= {'benchmarks/...cell.py', ...}
+E         
+E         Extra items in the left set:
+E         'docs/recon7_packet/scripts/recon7_r3/s5_backbone.py'
+E         'docs/recon7_packet/scripts/recon7_s/s2_round_split.py'
+E         'docs/recon7_packet/analysis/RECON7_REVIEW.md'
+E         'docs/recon7_packet/scripts/recon7_r3/s2_extract.py'
+E         'docs/recon7_packet/logs/recon7b_wip_b.txt'...
+E         
+E         ...Full output truncated (78 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_i2.py:205: AssertionError
+_____________________________ test_i3_gate0_files ______________________________
+
+    def test_i3_gate0_files():
+        if not (_have(I2_TIP) and _have(WSC2) and _have(WSB_TIP)):
+            pytest.skip("no git or no commit %s / %s / %s in %s" % (I2_TIP, WSC2, WSB_TIP, ROOT))
+        wsc_files = {x for x in _git("diff", "--name-only", WSB_TIP, WSC2).stdout.split("\n") if x}
+        changed = {x for x in _git("diff", "--name-only", I2_TIP, "--", ".", ":(exclude,glob)**/__pycache__/**").stdout
+                   .split("\n") if x}
+        allowed = wsc_files | set(I3_NEW) | set(I3_GATE0_EDITED)
+>       assert changed <= allowed, sorted(changed - allowed)                    # (a) nothing else moved
+E       AssertionError: ['docs/recon7_packet/CPU_TEST_RECEIPTS.txt', 'docs/recon7_packet/MANIFEST.txt', 'docs/recon7_packet/README.md', 'docs/...KPOINTS.md', 'docs/recon7_packet/analysis/HANDOFF_2026-10-29.md', 'docs/recon7_packet/analysis/HANDOFF_RECON7.md', ...]
+E       assert {'benchmarks/...lean.py', ...} <= {'benchmarks/...lean.py', ...}
+E         
+E         Extra items in the left set:
+E         'docs/recon7_packet/scripts/recon7_r3/s5_backbone.py'
+E         'docs/recon7_packet/scripts/recon7_s/s2_round_split.py'
+E         'docs/recon7_packet/analysis/RECON7_REVIEW.md'
+E         'docs/recon7_packet/scripts/recon7_r3/s2_extract.py'
+E         'docs/recon7_packet/logs/recon7b_wip_b.txt'...
+E         
+E         ...Full output truncated (78 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_i3.py:189: AssertionError
+_____________________________ test_i4a_gate0_files _____________________________
+
+    def test_i4a_gate0_files():
+        if not _have(I3_TIP):
+            pytest.skip("no git or no commit %s in %s" % (I3_TIP, ROOT))
+        changed = {x for x in _git("diff", "--name-only", I3_TIP, "--", ".", ":(exclude,glob)**/__pycache__/**").stdout
+                   .split("\n") if x}
+        changed |= {x for x in _git("ls-files", "--others", "--exclude-standard", "--", ".",
+                                    ":(exclude,glob)**/__pycache__/**").stdout.split("\n") if x}
+>       assert changed <= set(I4A_NEW) | set(I4A_DECL), sorted(changed - set(I4A_NEW) - set(I4A_DECL))   # (a)
+E       AssertionError: ['docs/recon7_packet/CPU_TEST_RECEIPTS.txt', 'docs/recon7_packet/MANIFEST.txt', 'docs/recon7_packet/README.md', 'docs/...KPOINTS.md', 'docs/recon7_packet/analysis/HANDOFF_2026-10-29.md', 'docs/recon7_packet/analysis/HANDOFF_RECON7.md', ...]
+E       assert {'benchmarks/...pile.py', ...} <= {'benchmarks/...pile.py', ...}
+E         
+E         Extra items in the left set:
+E         'docs/recon7_packet/scripts/recon7_r3/s5_backbone.py'
+E         'docs/recon7_packet/scripts/recon7_s/s2_round_split.py'
+E         'docs/recon7_packet/analysis/RECON7_REVIEW.md'
+E         'docs/recon7_packet/scripts/recon7_r3/s2_extract.py'
+E         'docs/recon7_packet/logs/recon7b_wip_b.txt'...
+E         
+E         ...Full output truncated (78 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_i4a.py:169: AssertionError
+_____________________________ test_i4g_gate0_files _____________________________
+
+    def test_i4g_gate0_files():
+        if not _have(I4A_TIP):
+            pytest.skip("no git or no commit %s in %s" % (I4A_TIP, ROOT))
+        changed = {x for x in _git("diff", "--name-only", I4A_TIP, "--", ".", ":(exclude,glob)**/__pycache__/**").stdout
+                   .split("\n") if x}
+        changed |= {x for x in _git("ls-files", "--others", "--exclude-standard", "--", ".",
+                                    ":(exclude,glob)**/__pycache__/**").stdout.split("\n") if x}
+>       assert changed <= set(I4G_NEW) | set(I4G_DECL), sorted(changed - set(I4G_NEW) - set(I4G_DECL))   # (a)
+E       AssertionError: ['docs/recon7_packet/CPU_TEST_RECEIPTS.txt', 'docs/recon7_packet/MANIFEST.txt', 'docs/recon7_packet/README.md', 'docs/...KPOINTS.md', 'docs/recon7_packet/analysis/HANDOFF_2026-10-29.md', 'docs/recon7_packet/analysis/HANDOFF_RECON7.md', ...]
+E       assert {'benchmarks/...keep.py', ...} <= {'benchmarks/...keep.py', ...}
+E         
+E         Extra items in the left set:
+E         'docs/recon7_packet/scripts/recon7_r3/s5_backbone.py'
+E         'docs/recon7_packet/scripts/recon7_s/s2_round_split.py'
+E         'docs/recon7_packet/analysis/RECON7_REVIEW.md'
+E         'docs/recon7_packet/scripts/recon7_r3/s2_extract.py'
+E         'docs/recon7_packet/logs/recon7b_wip_b.txt'...
+E         
+E         ...Full output truncated (78 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_i4g.py:152: AssertionError
+_____________________________ test_i4d_gate0_files _____________________________
+
+    def test_i4d_gate0_files():
+        if not _have(I4A_TIP):
+            pytest.skip("no git or no commit %s in %s" % (I4A_TIP, ROOT))
+        changed = {x for x in _git("diff", "--name-only", I4A_TIP, "--", ".", ":(exclude,glob)**/__pycache__/**").stdout
+                   .split("\n") if x}
+        changed |= {x for x in _git("ls-files", "--others", "--exclude-standard", "--", ".",
+                                    ":(exclude,glob)**/__pycache__/**").stdout.split("\n") if x}
+        allowed = set(I4D_NEW) | set(I4D_DECL) | set(I4D_EDITED)
+>       assert changed <= allowed, sorted(changed - allowed)                                  # (a)
+E       AssertionError: ['docs/recon7_packet/CPU_TEST_RECEIPTS.txt', 'docs/recon7_packet/MANIFEST.txt', 'docs/recon7_packet/README.md', 'docs/...KPOINTS.md', 'docs/recon7_packet/analysis/HANDOFF_2026-10-29.md', 'docs/recon7_packet/analysis/HANDOFF_RECON7.md', ...]
+E       assert {'benchmarks/...keep.py', ...} <= {'benchmarks/...keep.py', ...}
+E         
+E         Extra items in the left set:
+E         'docs/recon7_packet/scripts/recon7_r3/s5_backbone.py'
+E         'docs/recon7_packet/scripts/recon7_s/s2_round_split.py'
+E         'docs/recon7_packet/analysis/RECON7_REVIEW.md'
+E         'docs/recon7_packet/scripts/recon7_r3/s2_extract.py'
+E         'docs/recon7_packet/logs/recon7b_wip_b.txt'...
+E         
+E         ...Full output truncated (78 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_i4d.py:178: AssertionError
+_____________________________ test_i4k_gate0_files _____________________________
+
+    def test_i4k_gate0_files():
+        if not (_have(I4A_TIP) and _have(I4D_TIP) and _have(I4G_TIP)):
+            pytest.skip("no git or no commits %s / %s / %s in %s" % (I4A_TIP, I4D_TIP, I4G_TIP, ROOT))
+        changed = {x for x in _git("diff", "--name-only", I4A_TIP, "--", ".", ":(exclude,glob)**/__pycache__/**").stdout
+                   .split("\n") if x}
+        changed |= {x for x in _git("ls-files", "--others", "--exclude-standard", "--", ".",
+                                    ":(exclude,glob)**/__pycache__/**").stdout.split("\n") if x}
+        allowed = set(I4K_NEW) | set(I4D_FILES) | set(I4G_FILES) | set(I4K_DECL) | set(I4K_EDITED)
+>       assert changed <= allowed, sorted(changed - allowed)                                 # (a)
+E       AssertionError: ['docs/recon7_packet/CPU_TEST_RECEIPTS.txt', 'docs/recon7_packet/MANIFEST.txt', 'docs/recon7_packet/README.md', 'docs/...KPOINTS.md', 'docs/recon7_packet/analysis/HANDOFF_2026-10-29.md', 'docs/recon7_packet/analysis/HANDOFF_RECON7.md', ...]
+E       assert {'benchmarks/...keep.py', ...} <= {'benchmarks/...keep.py', ...}
+E         
+E         Extra items in the left set:
+E         'docs/recon7_packet/scripts/recon7_r3/s5_backbone.py'
+E         'docs/recon7_packet/scripts/recon7_s/s2_round_split.py'
+E         'docs/recon7_packet/analysis/RECON7_REVIEW.md'
+E         'docs/recon7_packet/scripts/recon7_r3/s2_extract.py'
+E         'docs/recon7_packet/logs/recon7b_wip_b.txt'...
+E         
+E         ...Full output truncated (78 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_i4k.py:173: AssertionError
+_____________________________ test_i4u_gate0_files _____________________________
+
+    def test_i4u_gate0_files():
+        if not _have(I4A_TIP):
+            pytest.skip("no git or no commit %s in %s" % (I4A_TIP, ROOT))
+        changed = {x for x in _git("diff", "--name-only", I4A_TIP, "--", ".", ":(exclude,glob)**/__pycache__/**").stdout
+                   .split("\n") if x}
+        changed |= {x for x in _git("ls-files", "--others", "--exclude-standard", "--", ".",
+                                    ":(exclude,glob)**/__pycache__/**").stdout.split("\n") if x}
+>       assert changed <= set(I4U_NEW) | set(I4U_DECL), sorted(changed - set(I4U_NEW) - set(I4U_DECL))   # (a)
+E       AssertionError: ['docs/recon7_packet/CPU_TEST_RECEIPTS.txt', 'docs/recon7_packet/MANIFEST.txt', 'docs/recon7_packet/README.md', 'docs/...KPOINTS.md', 'docs/recon7_packet/analysis/HANDOFF_2026-10-29.md', 'docs/recon7_packet/analysis/HANDOFF_RECON7.md', ...]
+E       assert {'benchmarks/...keep.py', ...} <= {'benchmarks/...keep.py', ...}
+E         
+E         Extra items in the left set:
+E         'docs/recon7_packet/scripts/recon7_r3/s5_backbone.py'
+E         'docs/recon7_packet/scripts/recon7_s/s2_round_split.py'
+E         'docs/recon7_packet/analysis/RECON7_REVIEW.md'
+E         'docs/recon7_packet/scripts/recon7_r3/s2_extract.py'
+E         'docs/recon7_packet/logs/recon7b_wip_b.txt'...
+E         
+E         ...Full output truncated (78 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_i4u.py:147: AssertionError
+_____________________________ test_i4h_gate0_files _____________________________
+
+    def test_i4h_gate0_files():
+        if not _have(I4G_TIP):
+            pytest.skip("no git or no commit %s in %s" % (I4G_TIP, ROOT))
+        changed = {x for x in _git("diff", "--name-only", I4G_TIP, "--", ".", ":(exclude,glob)**/__pycache__/**").stdout
+                   .split("\n") if x}
+        changed |= {x for x in _git("ls-files", "--others", "--exclude-standard", "--", ".",
+                                    ":(exclude,glob)**/__pycache__/**").stdout.split("\n") if x}
+>       assert changed <= set(I4H_NEW) | set(I4H_DECL), sorted(changed - set(I4H_NEW) - set(I4H_DECL))   # (a)
+E       AssertionError: ['docs/recon7_packet/CPU_TEST_RECEIPTS.txt', 'docs/recon7_packet/MANIFEST.txt', 'docs/recon7_packet/README.md', 'docs/...KPOINTS.md', 'docs/recon7_packet/analysis/HANDOFF_2026-10-29.md', 'docs/recon7_packet/analysis/HANDOFF_RECON7.md', ...]
+E       assert {'benchmarks/...keep.py', ...} <= {'benchmarks/...keep.py', ...}
+E         
+E         Extra items in the left set:
+E         'docs/recon7_packet/scripts/recon7_r3/s5_backbone.py'
+E         'docs/recon7_packet/scripts/recon7_s/s2_round_split.py'
+E         'docs/recon7_packet/analysis/RECON7_REVIEW.md'
+E         'docs/recon7_packet/scripts/recon7_r3/s2_extract.py'
+E         'docs/recon7_packet/logs/recon7b_wip_b.txt'...
+E         
+E         ...Full output truncated (78 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_i4h.py:148: AssertionError
+_____________________________ test_i4s_gate0_files _____________________________
+
+    def test_i4s_gate0_files():
+        if not all(_have(s) for s in [MERGE] + list(TIPS.values())):
+            pytest.skip("no git or no commits %s in %s" % ([MERGE] + list(TIPS.values()), ROOT))
+        changed = {x for x in _git("diff", "--name-only", MERGE, "--", ".", ":(exclude,glob)**/__pycache__/**").stdout
+                   .split("\n") if x}
+        changed |= {x for x in _git("ls-files", "--others", "--exclude-standard", "--", ".",
+                                    ":(exclude,glob)**/__pycache__/**").stdout.split("\n") if x}
+>       assert changed <= set(I4S_NEW) | set(I4S_DECL), sorted(changed - set(I4S_NEW) - set(I4S_DECL))   # (a)
+E       AssertionError: ['docs/recon7_packet/CPU_TEST_RECEIPTS.txt', 'docs/recon7_packet/MANIFEST.txt', 'docs/recon7_packet/README.md', 'docs/...KPOINTS.md', 'docs/recon7_packet/analysis/HANDOFF_2026-10-29.md', 'docs/recon7_packet/analysis/HANDOFF_RECON7.md', ...]
+E       assert {'benchmarks/...pile.py', ...} <= {'benchmarks/...pile.py', ...}
+E         
+E         Extra items in the left set:
+E         'docs/recon7_packet/scripts/recon7_r3/s5_backbone.py'
+E         'docs/recon7_packet/scripts/recon7_s/s2_round_split.py'
+E         'docs/recon7_packet/analysis/RECON7_REVIEW.md'
+E         'docs/recon7_packet/scripts/recon7_r3/s2_extract.py'
+E         'docs/recon7_packet/logs/recon7b_wip_b.txt'...
+E         
+E         ...Full output truncated (78 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_i4s.py:159: AssertionError
+____________________________ test_i4cc_gate0_files _____________________________
+
+    def test_i4cc_gate0_files():
+        if not _have(BASE_SHA):
+            pytest.skip("no git or no commit %s in %s" % (BASE_SHA, ROOT))
+        changed = {x for x in _git("diff", "--name-only", BASE_SHA, "--", ".", ":(exclude,glob)**/__pycache__/**").stdout
+                   .split("\n") if x}
+        changed |= {x for x in _git("ls-files", "--others", "--exclude-standard", "--", ".",
+                                    ":(exclude,glob)**/__pycache__/**").stdout.split("\n") if x}
+>       assert changed <= set(I4CC_NEW) | set(I4CC_DECL), sorted(changed - set(I4CC_NEW) - set(I4CC_DECL))   # (a)
+E       AssertionError: ['docs/recon7_packet/CPU_TEST_RECEIPTS.txt', 'docs/recon7_packet/MANIFEST.txt', 'docs/recon7_packet/README.md', 'docs/...KPOINTS.md', 'docs/recon7_packet/analysis/HANDOFF_2026-10-29.md', 'docs/recon7_packet/analysis/HANDOFF_RECON7.md', ...]
+E       assert {'benchmarks/...pile.py', ...} <= {'benchmarks/...pile.py', ...}
+E         
+E         Extra items in the left set:
+E         'docs/recon7_packet/scripts/recon7_r3/s5_backbone.py'
+E         'docs/recon7_packet/scripts/recon7_s/s2_round_split.py'
+E         'docs/recon7_packet/analysis/RECON7_REVIEW.md'
+E         'docs/recon7_packet/scripts/recon7_r3/s2_extract.py'
+E         'docs/recon7_packet/logs/recon7b_wip_b.txt'...
+E         
+E         ...Full output truncated (78 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_i4cc.py:126: AssertionError
+____________________________ test_i4dc_gate0_files _____________________________
+
+    def test_i4dc_gate0_files():
+        if not _have(BASE_SHA):
+            pytest.skip("no git or no commit %s in %s" % (BASE_SHA, ROOT))
+        changed = {x for x in _git("diff", "--name-only", BASE_SHA, "--", ".", ":(exclude,glob)**/__pycache__/**").stdout
+                   .split("\n") if x}
+        changed |= {x for x in _git("ls-files", "--others", "--exclude-standard", "--", ".",
+                                    ":(exclude,glob)**/__pycache__/**").stdout.split("\n") if x}
+>       assert changed <= set(I4DC_NEW) | set(I4DC_DECL), sorted(changed - set(I4DC_NEW) - set(I4DC_DECL))   # (a)
+E       AssertionError: ['docs/recon7_packet/CPU_TEST_RECEIPTS.txt', 'docs/recon7_packet/MANIFEST.txt', 'docs/recon7_packet/README.md', 'docs/...KPOINTS.md', 'docs/recon7_packet/analysis/HANDOFF_2026-10-29.md', 'docs/recon7_packet/analysis/HANDOFF_RECON7.md', ...]
+E       assert {'benchmarks/...cell.py', ...} <= {'benchmarks/...cell.py', ...}
+E         
+E         Extra items in the left set:
+E         'docs/recon7_packet/scripts/recon7_r3/s5_backbone.py'
+E         'docs/recon7_packet/scripts/recon7_s/s2_round_split.py'
+E         'docs/recon7_packet/analysis/RECON7_REVIEW.md'
+E         'docs/recon7_packet/scripts/recon7_r3/s2_extract.py'
+E         'docs/recon7_packet/logs/recon7b_wip_b.txt'...
+E         
+E         ...Full output truncated (78 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_i4dc.py:124: AssertionError
+=========================== short test summary info ============================
+FAILED benchmarks/Efficiency/tests_cpu/test_wsb.py::test_gate0_files - Assert...
+FAILED benchmarks/Efficiency/tests_cpu/test_wsc.py::test_gate0_files - Assert...
+FAILED benchmarks/Efficiency/tests_cpu/test_i2.py::test_i2_gate0_files - Asse...
+FAILED benchmarks/Efficiency/tests_cpu/test_i3.py::test_i3_gate0_files - Asse...
+FAILED benchmarks/Efficiency/tests_cpu/test_i4a.py::test_i4a_gate0_files - As...
+FAILED benchmarks/Efficiency/tests_cpu/test_i4g.py::test_i4g_gate0_files - As...
+FAILED benchmarks/Efficiency/tests_cpu/test_i4d.py::test_i4d_gate0_files - As...
+FAILED benchmarks/Efficiency/tests_cpu/test_i4k.py::test_i4k_gate0_files - As...
+FAILED benchmarks/Efficiency/tests_cpu/test_i4u.py::test_i4u_gate0_files - As...
+FAILED benchmarks/Efficiency/tests_cpu/test_i4h.py::test_i4h_gate0_files - As...
+FAILED benchmarks/Efficiency/tests_cpu/test_i4s.py::test_i4s_gate0_files - As...
+FAILED benchmarks/Efficiency/tests_cpu/test_i4cc.py::test_i4cc_gate0_files - ...
+FAILED benchmarks/Efficiency/tests_cpu/test_i4dc.py::test_i4dc_gate0_files - ...
+13 failed, 23 passed, 264 deselected in 417.66s (0:06:57)

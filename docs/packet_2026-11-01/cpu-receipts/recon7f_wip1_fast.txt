@@ -1,0 +1,140 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+F..F.....sF                                                              [100%]
+=================================== FAILURES ===================================
+___________________________ test_recon7_gate0_files ____________________________
+
+    def test_recon7_gate0_files():
+        if not _have(BASE_SHA):
+            pytest.skip("no git or no commit %s in %s" % (BASE_SHA, ROOT))
+        changed = {x for x in _git("diff", "--name-only", BASE_SHA, "--", ".", ":(exclude,glob)**/__pycache__/**").stdout
+                   .split("\n") if x}
+        changed |= {x for x in _git("ls-files", "--others", "--exclude-standard", "--", ".",
+                                    ":(exclude,glob)**/__pycache__/**").stdout.split("\n") if x}
+>       assert changed <= set(RECON7_NEW) | set(RECON7_DECL), sorted(changed - set(RECON7_NEW) - set(RECON7_DECL))  # (a)
+E       AssertionError: ['docs/recon7_packet/CPU_TEST_RECEIPTS.txt', 'docs/recon7_packet/MANIFEST.txt', 'docs/recon7_packet/README.md', 'docs/...KPOINTS.md', 'docs/recon7_packet/analysis/HANDOFF_2026-10-29.md', 'docs/recon7_packet/analysis/HANDOFF_RECON7.md', ...]
+E       assert {'benchmarks/...ocol.py', ...} <= {'benchmarks/...ocol.py', ...}
+E         
+E         Extra items in the left set:
+E         'docs/recon7_packet/analysis/RECON7_R3_draft_transfer_capacity_schedule.md'
+E         'docs/recon7_packet/scripts/ana_rev7/a2_score.py'
+E         'docs/recon7_packet/scripts/recon7_s/s1_revised_model.py'
+E         'docs/recon7_packet/logs/recon7b_8d7dab8_a.txt'
+E         'docs/recon7_packet/logs/recon7_v_v2.txt'...
+E         
+E         ...Full output truncated (78 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py:124: AssertionError
+______________________________ test_streams_pure _______________________________
+
+    def test_streams_pure():
+        S = _mod("r2_recon7_streams")
+        vr = (ROOT / "nosi/nosi/verify_rows.py").read_text()
+        assert "FORK_LAUNCH = dict(num_warps=4, num_stages=3, tile_size=64)" in vr and "FORK_ROWS = 4 " in vr
+        lists = S.make_lists(5, 2)
+        k = lists["page_key"]
+        assert k.shape == (20, 2, 64) and k.dtype == torch.int32 and bool((k[..., 1:] > k[..., :-1]).all())
+        assert torch.equal(lists["page_table"], k) and bool((S.union_count(lists, 5, 2) == 72).all())
+        assert lists["last_len"].tolist()[:5] == [40, 41, 42, 43, 40]
+        for B, ps, share in ((216, 1.226, 0.5), (318, 5.0, 0.5), (7, 0.3, 0.0)):
+            w, s = S.counts_per_layer(B, 2, ps, share)
+            assert w + s == round(ps * 2 * B)
+            cw = S.spread(w, 2, B, 16, 1)
+            cs = S.spread(s, 2, B, 16, 2)
+            assert int(cw.sum()) == w and int(cs.sum()) == s and int(cw.max() - cw.min()) <= 1
+            iw, is_ = S.make_ids(cw, 64, 16, 3), S.make_ids(cs, 129, 16, 4, 1)
+            assert int((iw >= 0).sum()) == w and int((is_ >= 0).sum()) == s and bool((is_[..., 0] == -1).all())
+            for ids in (iw, is_):
+                for h in range(2):
+                    for b in range(B):
+                        v = ids[h, b][ids[h, b] >= 0]
+                        assert v.numel() == v.unique().numel() and bool((v < 16).all())
+        sl = S.slice_lists(lists, 8, 16)                                   # request group [2, 4) of 5
+        assert sl["page_key"].shape == (8, 2, 64) and sl["page_key"].is_contiguous() and sl["slots_per_entry"] == 1
+        assert torch.equal(sl["page_key"], k[8:16]) and bool((S.union_count(sl, 2, 2) == 72).all())
+        cfg = {c[0]: c for c in S.CONFIGS}
+        assert S.BLOCK_BYTES == 32896 and cfg["SER"][2] == [["Aq", "G", "F", "Ar"]] and cfg["SER"][1] == "c"
+        assert S.WEIGHT_BYTES == 473956352                                 # review 3: 474 MB per layer, 948 MB for 2 halves
+        assert len(S.CONFIGS) == len(cfg) == 26
+        for c, ctl in S.CONTROL_OF.items():                                # EVERY decision has a same-ops serial control
+            ops = sorted(p for seq in cfg[c][2] for p in seq)
+            assert cfg[ctl][1] == "c" and len(cfg[ctl][2]) == 1 and sorted(cfg[ctl][2][0]) == ops, (c, ctl)
+        assert set(S.CONTROL_OF) == set(S.CONCURRENT) | {"GRP", "GRPL", "CPY"}
+        assert sorted(cfg["A|F|M-SER"][2][0]) == sorted(["Aq", "Ar", "F", "M"]) != sorted(cfg["SER"][2][0])   # review 3 (4)
+        for ctl, xs in S.CONTROL_SUM.items():                              # the independent sums: the same ops again
+            assert sorted(p for x in xs for seq in cfg[x][2] for p in seq) == sorted(cfg[ctl][2][0]), ctl
+        assert cfg["GRPL"][3] is True and cfg["GRP"][3] is False and cfg["GRP"][2] == [S.CHAIN0, S.CHAIN1]
+        for c in ("GRP", "GRPL", "CPY"):                                   # the ordered calls stay in order per stream
+            lists_ = cfg[c][2]
+            assert any(seq == S.CHAIN or seq in (S.CHAIN0, S.CHAIN1) for seq in lists_) and all(
+                set(seq) & set(S.CHAIN) in (set(), set(S.CHAIN)) for seq in lists_), c
+        assert {c[1] for c in S.CONFIGS} == {"a", "b", "c"} and set(S.PARTS) == {p for c in S.CONFIGS for seq in c[2]
+                                                                                 for p in seq}
+        doc = S.__doc__
+        for word in ("NOT a producer / consumer dependency test", "NOT an end-to-end bound", "NOT a useful-prefetch",
+                     "COPY-INTERFERENCE", "NEVER read", "948 MB", "IDEALIZED reference", "INVALIDATES"):
+>           assert word in doc, word
+E           AssertionError: NOT a producer / consumer dependency test
+E           assert 'NOT a producer / consumer dependency test' in 'RECON7 cell X1 (= step cell r7s), R2 discriminator D1 (KS/analysis/plan/RECON7_R2_joint.md section 4; KS =\n/mnt/beeg...ailed MUST gates (0-19); 20 refused (cell r7s not granted: r2_recon7_protocol.py); 30 an exception\noutside a shape.\n'
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py:503: AssertionError
+______________________________ test_notes_recon7 _______________________________
+
+    def test_notes_recon7():
+        doc = (ROOT / "docs/NOTES_recon7.md").read_text()
+        for word in ("test_recon7.py", "GRANT_r7s", "default deny", "STEP_MIN", "NO NEW KERNEL", "r7pm", "r7pa", "r7pb",
+                     "r7s", "r7mem", "falsifier", "decides", "MEASURED", "MODEL", "drain", "PEQ", "D1", "D2", "D3", "D5",
+                     "D6", "D7", "GPU only"):
+            assert word in doc, word
+        assert "PROTOCOL_STAMP_RECON7 = None" not in doc.replace("`PROTOCOL_STAMP_RECON7 = None` (retired", "")
+        x1 = doc[doc.index("## X1 protocol"):doc.index("## 3. THE GPU PROTOCOL")]
+        S = _mod("r2_recon7_streams")
+        for word in ("2195630", "nova05", "STEP_MIN 20", "--mem=64G", "--cpus-per-task=16", "crafticat/NOSA", "r2-recon7",
+                     "MATCHED", "ORDER-ROTATED", "CANNOT", "STOP THE RUN", "FALSIFIERS", "DECISION RULES",
+                     "Duplicate-work evidence", "Output limit", FORK_BLOB, "--seed 7", "--max-shape-s 240", "--reps 10",
+                     "--warmup 2", "--max-run-s 600", "WINF", "GRP-SER", "CPY-SER", "A|F|M-SER", "intra-kernel",
+                     "GRP-EQ", "SUPPRESSED", "474", "948", "ordered synthetic", "copy interference", "/usr/bin/sha256sum"):
+            assert word in x1, word
+        for c in ("GRP", "GRPL", "CPY"):                                   # every screen schedule and its control
+            assert "| %s |" % c in x1 and S.CONTROL_OF[c] in x1, c
+        for word in ("4 x 474", "ATTAINABLE", "PF HIDES"):
+>           assert word not in x1, word
+E           AssertionError: 4 x 474
+E           assert '4 x 474' not in "## X1 proto...compute.\n\n"
+E             
+E             '4 x 474' is contained here:
+E               t"; 2 x / 4 x 474 MB | a same-ops serial control X-SER for every concurrent set (26 configurations); SERIAL judged against X-SER; isolated maxima an IDEALIZED reference; a control more than 5 % from its independent sum INVALIDATES the conclusion; every timed and warm-up pass kept with n, quartiles, cv; 474 / 948 MB | test_streams_pure (planted medians: consistent, 6 % INVALID, 4 % valid, SERIAL vs the matched control) |
+E             ?           +++++++
+E               | 5 image sha256 declared, not checked; login-side hashing through PATH; model / workload prerequisites for r7s; output l...
+E             
+E             ...Full output truncated (138 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py:1059: AssertionError
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_recon7_copies
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:171: Evidence: RECON7 COPIES: run_arm_r7 = run_arm_d + 5 R7 lines; probe_arm_r7 = probe_arm_x + 2 R7 lines
+    _ev("RECON7 COPIES: run_arm_r7 = run_arm_d + %d R7 lines; probe_arm_r7 = probe_arm_x + %d R7 lines" % (
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_streams_measure_plumbing
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:683: Evidence: RECON7 X1 (CPU plumbing): 26 configurations; planted F -> stop 'EXACT failed in FG', failed ['FG-EXACT']
+    _ev("RECON7 X1 (CPU plumbing): %d configurations; planted F -> stop %r, failed %s" % (len(names), stop, bad))
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_streams_run_shapes
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:777: Evidence: RECON7 X1 (CPU run_shapes): free / UNION / IDS / setup deadline / late wall / exception each STOP THE RUN; GRP-EQ governs GRP only
+    _ev("RECON7 X1 (CPU run_shapes): free / UNION / IDS / setup deadline / late wall / exception each STOP THE RUN; "
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED benchmarks/Efficiency/tests_cpu/test_recon7.py::test_recon7_gate0_files
+FAILED benchmarks/Efficiency/tests_cpu/test_recon7.py::test_streams_pure - As...
+FAILED benchmarks/Efficiency/tests_cpu/test_recon7.py::test_notes_recon7 - As...
+SKIPPED [1] benchmarks/Efficiency/tests_cpu/test_recon7.py:1014: not a clean checkout of /mnt/beegfs/ojerbi/nosi-r2-recon7: the full DRYRUN needs one
+3 failed, 7 passed, 1 skipped, 5 deselected, 3 warnings in 5.27s

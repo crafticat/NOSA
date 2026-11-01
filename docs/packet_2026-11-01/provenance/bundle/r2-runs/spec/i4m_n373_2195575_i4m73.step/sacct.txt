@@ -1,0 +1,1 @@
+2195575.24|i4m-i4m73-n373-2195575|FAILED|2:0|00:23:53|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=340G,node=1|3135884K

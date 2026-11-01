@@ -1,0 +1,1 @@
+2195630.11|int-intb-b1-2195630|COMPLETED|0:0|02:32:50|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=340G,node=1|5001744K

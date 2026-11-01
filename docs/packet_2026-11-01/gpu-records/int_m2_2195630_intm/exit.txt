@@ -1,0 +1,7 @@
+exit=0 utc_end=2026-10-31T19:23:02Z
+accounting=consistent
+bytes /mnt/beegfs/ojerbi/r2-runs/spec/int_m2_2195630_intm 1329533
+bytes /mnt/beegfs/ojerbi/r2-runs/spec/int_m2_2195630_intm.step 348841
+bytes /mnt/beegfs/ojerbi/nosa-env/jit/int_m2_2195630_intm 21054295
+bytes /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/int_jit/int_m2_2195630_intm 26420161
+output_bytes=49152830 limit_bytes=2147483648 over=0

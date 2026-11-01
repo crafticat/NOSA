@@ -1,0 +1,109 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+.......F.....                                                            [100%]
+=================================== FAILURES ===================================
+_______________________________ test_int_stacked _______________________________
+
+    def test_int_stacked():
+        """The control "stacked" (no merged _layer): the run is the same (silent), the J1 selection never runs in a joint
+        pass; J1-COMPILE, J1-PEQ, INT-CLASSES and INT-LAYER catch it."""
+        INTA = _mod("r2_int_arms")
+        J1 = _mod("r2_j1_select")
+        ref = _plain("GUDCD")
+>       ev = _int("C128", "timing", ineg="stacked")
+
+benchmarks/Efficiency/tests_cpu/test_int.py:332: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+benchmarks/Efficiency/tests_cpu/test_int.py:244: in _int
+    _I[k] = run_int(INT_ARMS[key], scen, ineg=ineg, worker=worker)
+benchmarks/Efficiency/tests_cpu/test_int.py:225: in run_int
+    run.run(N_RUN)
+benchmarks/Efficiency/r2_j1_select.py:871: in run
+    out = super().run(N, rounds=rounds, max_rounds=max_rounds, warm=warm)
+nosi/nosi/spec_tentative.py:1171: in run
+    return self._run_paper(N, max_rounds=max_rounds, warm=warm)
+/venv/nosa/lib/python3.10/site-packages/torch/utils/_contextlib.py:116: in decorate_context
+    return func(*args, **kwargs)
+nosi/nosi/spec_tentative.py:711: in _run_paper
+    n, m, full = self._ps_round(P, probe)
+nosi/nosi/spec_tentative_union.py:342: in _ps_round
+    return super()._ps_round(P, probe)
+nosi/nosi/spec_tentative.py:958: in _ps_round
+    lg = T.run_pass(self.model, plan)
+/venv/nosa/lib/python3.10/site-packages/torch/utils/_contextlib.py:116: in decorate_context
+    return func(*args, **kwargs)
+benchmarks/Efficiency/r2_i4h_graph.py:268: in run_pass
+    return super().run_pass(model, plan)
+benchmarks/Efficiency/r2_i4a_lean.py:95: in run_pass
+    return super().run_pass(model, plan)
+/venv/nosa/lib/python3.10/site-packages/torch/utils/_contextlib.py:116: in decorate_context
+    return func(*args, **kwargs)
+nosi/nosi/spec_tentative.py:311: in run_pass
+    hidden = self._layer(l, layer, hidden, pos_flat, model.cos_sin_cache, plan)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <r2_st1_commit.TentState_L4PTFDGUDCDJ3ST12 object at 0x7f83874dc160>
+l = 0, layer = <LlamaLayer object at 0x7f8387528100>
+hidden = tensor([[[ 0.0099, -0.2556,  0.0476,  ...,  0.0735,  0.0611,  0.3070]],
+
+        [[ 0.1275, -0.2224,  0.0881,  ...,  0..., -0.1178,  ...,  0.1353,  0.3565, -0.0454]],
+
+        [[-0.1446,  0.0449, -0.0896,  ...,  0.1301,  0.3874, -0.1191]]])
+pos_flat = tensor([4911, 4912, 4914, 4915, 4911, 4912, 4914, 4915, 4911, 4912, 4914, 4915,
+        4911, 4912, 4914, 4915, 4911, 4912, 4914, 4915, 4911, 4912, 4914, 4915,
+        4911, 4912, 4914, 4915, 4911, 4912, 4914, 4915], dtype=torch.int32)
+cos_sin_cache = None
+plan = <raggedcpu.spec_tentative._Plan object at 0x7f838719ee30>
+
+    def _layer(self, l, layer, hidden, pos_flat, cos_sin_cache, plan):
+        """TentState._layer (spec_tentative.py:318-369) with the twin loop of a joint pass in one advance (ST2)."""
+        base = self._st2_base
+        if plan.R == 1 or self.rec is not None:
+            if plan.R > 1:
+                self._st2["fallback"] += 1
+            return base(self, l, layer, hidden, pos_flat, cos_sin_cache, plan)
+>       VR = base.__globals__["VR"]
+E       KeyError: 'VR'
+
+benchmarks/Efficiency/r2_st1_commit.py:359: KeyError
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_layer_copy
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_int.py:148: Evidence: INT COPY: IntLayer._layer = TwinST2._layer except 2 marked lines
+    _ev("INT COPY: IntLayer._layer = TwinST2._layer except %d marked lines" % len(diff))
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_equal[C128-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_int.py:319: Evidence: INT EQUAL C128 timing: rounds 30, joint passes 29, commits 30; j1 calls 58 f6 18 dlayers 4; st2 {'neg': None, 'fused': False, 'passes': 29, 'layers': 58, 'fallback': 0}; st1 {'mode': 'rows', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}; j3 {'joint_captures': 2, 'draft_layers': 4, 'delta_fixed': 4, 'frame': [{'first': [0, 0], 'calls': [90, 90], 'stamps_ok': True}]}; 18 MUST gates pass
+    _ev("INT EQUAL %s %s: rounds %d, joint passes %d, commits %d; j1 calls %d f6 %d dlayers %d; st2 %s; st1 %s; %s; "
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_equal[C128-check]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_int.py:319: Evidence: INT EQUAL C128 check: rounds 30, joint passes 29, commits 30; j1 calls 58 f6 19 dlayers 2; st2 {'neg': None, 'fused': False, 'passes': 29, 'layers': 58, 'fallback': 0}; st1 {'mode': 'rows', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}; j3 {'joint_captures': 2, 'draft_layers': 2, 'delta_fixed': 2, 'frame': [{'first': [0, 0], 'calls': [90, 90], 'stamps_ok': True}]}; 18 MUST gates pass
+    _ev("INT EQUAL %s %s: rounds %d, joint passes %d, commits %d; j1 calls %d f6 %d dlayers %d; st2 %s; st1 %s; %s; "
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_equal[C73-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_int.py:319: Evidence: INT EQUAL C73 timing: rounds 30, joint passes 29, commits 30; j1 calls 58 f6 18 dlayers 4; st2 {'neg': None, 'fused': False, 'passes': 29, 'layers': 58, 'fallback': 0}; st1 {'mode': 'rows', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}; bf committed 461 used 299; 20 MUST gates pass
+    _ev("INT EQUAL %s %s: rounds %d, joint passes %d, commits %d; j1 calls %d f6 %d dlayers %d; st2 %s; st1 %s; %s; "
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_equal[C73-check]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_int.py:319: Evidence: INT EQUAL C73 check: rounds 30, joint passes 29, commits 30; j1 calls 58 f6 19 dlayers 2; st2 {'neg': None, 'fused': False, 'passes': 29, 'layers': 58, 'fallback': 0}; st1 {'mode': 'rows', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}; bf committed 461 used 299; 21 MUST gates pass
+    _ev("INT EQUAL %s %s: rounds %d, joint passes %d, commits %d; j1 calls %d f6 %d dlayers %d; st2 %s; st1 %s; %s; "
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_lock
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_int.py:358: Evidence: INT LOCK: captures under BF1's lock 11 (wrapped) vs 10 (nolock)
+    _ev("INT LOCK: captures under BF1's lock %d (wrapped) vs %d (nolock)" % (ra["bf"]["captures_locked"],
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_step_script_int
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_int.py:518: Evidence: INT DRYRUN: 3 cells printed their step command; grants {'intm': None, 'inta': None, 'intb': None}
+    _ev("INT DRYRUN: 3 cells printed their step command; grants %s" % ({c[0]: getattr(C, "GRANT_%s" % c[0]) for c in
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED benchmarks/Efficiency/tests_cpu/test_int.py::test_int_stacked - KeyErr...
+1 failed, 12 passed, 7 warnings in 1089.55s (0:18:09)

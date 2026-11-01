@@ -1,0 +1,1 @@
+2195575.39|i4s-i4sm-s3m-2195575|COMPLETED|0:0|00:07:15|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=100G,node=1|3135132K

@@ -1,0 +1,30 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+...........                                                              [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_recon7_copies
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:180: Evidence: RECON7 COPIES: run_arm_r7 = run_arm_d + 6 R7 lines; probe_arm_r7 = probe_arm_x + 2 R7 lines
+    _ev("RECON7 COPIES: run_arm_r7 = run_arm_d + %d R7 lines; probe_arm_r7 = probe_arm_x + %d R7 lines" % (
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_streams_measure_plumbing
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:733: Evidence: RECON7 X1 (CPU plumbing): 26 configurations; planted F -> stop 'EXACT failed in FG', failed ['FG-EXACT']
+    _ev("RECON7 X1 (CPU plumbing): %d configurations; planted F -> stop %r, failed %s" % (len(names), stop, bad))
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_streams_run_shapes
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:829: Evidence: RECON7 X1 (CPU run_shapes): free / UNION / IDS / setup deadline / late wall / exception each STOP THE RUN; GRP-EQ governs GRP only
+    _ev("RECON7 X1 (CPU run_shapes): free / UNION / IDS / setup deadline / late wall / exception each STOP THE RUN; "
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_step_script_recon7
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:1098: Evidence: RECON7 DRYRUN: 5 cells printed their step command; granted ['r7pm', 'r7s', 'r7mem']
+    _ev("RECON7 DRYRUN: %d cells printed their step command; granted %s" % (
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+11 passed, 6 deselected, 4 warnings in 8.27s

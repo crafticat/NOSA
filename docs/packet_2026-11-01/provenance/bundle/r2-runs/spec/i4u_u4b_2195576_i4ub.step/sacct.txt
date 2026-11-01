@@ -1,0 +1,1 @@
+2195576.25|i4u-i4ub-u4b-2195576|COMPLETED|0:0|00:54:35|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=340G,node=1|3037764K

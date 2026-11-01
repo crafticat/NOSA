@@ -1,0 +1,7 @@
+exit=0 utc_end=2026-10-31T13:44:48Z
+accounting=consistent
+bytes /mnt/beegfs/ojerbi/r2-runs/spec/j1_f1_2195630_j1f 27380
+bytes /mnt/beegfs/ojerbi/r2-runs/spec/j1_f1_2195630_j1f.step 14960
+bytes /mnt/beegfs/ojerbi/nosa-env/jit/j1_f1_2195630_j1f 1
+bytes /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/j1_jit/j1_f1_2195630_j1f 8178395
+output_bytes=8220736 limit_bytes=62914560 over=0

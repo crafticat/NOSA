@@ -1,0 +1,46 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+.............                                                            [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_layer_copy
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_int.py:148: Evidence: INT COPY: IntLayer._layer = TwinST2._layer except 2 marked lines
+    _ev("INT COPY: IntLayer._layer = TwinST2._layer except %d marked lines" % len(diff))
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_equal[C128-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_int.py:320: Evidence: INT EQUAL C128 timing: rounds 30, joint passes 29, commits 30; j1 calls 58 f6 18 dlayers 4; st2 {'neg': None, 'fused': False, 'passes': 29, 'layers': 58, 'fallback': 0}; st1 {'mode': 'rows', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}; j3 {'joint_captures': 2, 'draft_layers': 4, 'delta_fixed': 4, 'frame': [{'first': [0, 0], 'calls': [90, 90], 'stamps_ok': True}]}; 18 MUST gates pass
+    _ev("INT EQUAL %s %s: rounds %d, joint passes %d, commits %d; j1 calls %d f6 %d dlayers %d; st2 %s; st1 %s; %s; "
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_equal[C128-check]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_int.py:320: Evidence: INT EQUAL C128 check: rounds 30, joint passes 29, commits 30; j1 calls 58 f6 19 dlayers 2; st2 {'neg': None, 'fused': False, 'passes': 29, 'layers': 58, 'fallback': 0}; st1 {'mode': 'rows', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}; j3 {'joint_captures': 2, 'draft_layers': 2, 'delta_fixed': 2, 'frame': [{'first': [0, 0], 'calls': [90, 90], 'stamps_ok': True}]}; 18 MUST gates pass
+    _ev("INT EQUAL %s %s: rounds %d, joint passes %d, commits %d; j1 calls %d f6 %d dlayers %d; st2 %s; st1 %s; %s; "
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_equal[C73-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_int.py:320: Evidence: INT EQUAL C73 timing: rounds 30, joint passes 29, commits 30; j1 calls 58 f6 18 dlayers 4; st2 {'neg': None, 'fused': False, 'passes': 29, 'layers': 58, 'fallback': 0}; st1 {'mode': 'rows', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}; bf committed 461 used 299; 20 MUST gates pass
+    _ev("INT EQUAL %s %s: rounds %d, joint passes %d, commits %d; j1 calls %d f6 %d dlayers %d; st2 %s; st1 %s; %s; "
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_equal[C73-check]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_int.py:320: Evidence: INT EQUAL C73 check: rounds 30, joint passes 29, commits 30; j1 calls 58 f6 19 dlayers 2; st2 {'neg': None, 'fused': False, 'passes': 29, 'layers': 58, 'fallback': 0}; st1 {'mode': 'rows', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}; bf committed 461 used 299; 21 MUST gates pass
+    _ev("INT EQUAL %s %s: rounds %d, joint passes %d, commits %d; j1 calls %d f6 %d dlayers %d; st2 %s; st1 %s; %s; "
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_stacked
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_int.py:341: Evidence: INT CONTROL stacked: silent run; caught by ['J1-PEQ', 'J1-COMPILE', 'INT-CLASSES', 'INT-LAYER']
+    _ev("INT CONTROL stacked: silent run; caught by %s" % [n for n, x in g.items() if not x[2]])
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_lock
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_int.py:359: Evidence: INT LOCK: captures under BF1's lock 11 (wrapped) vs 10 (nolock)
+    _ev("INT LOCK: captures under BF1's lock %d (wrapped) vs %d (nolock)" % (ra["bf"]["captures_locked"],
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_step_script_int
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_int.py:519: Evidence: INT DRYRUN: 3 cells printed their step command; grants {'intm': None, 'inta': None, 'intb': None}
+    _ev("INT DRYRUN: 3 cells printed their step command; grants %s" % ({c[0]: getattr(C, "GRANT_%s" % c[0]) for c in
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+13 passed, 8 warnings in 1120.87s (0:18:40)

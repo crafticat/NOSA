@@ -1,0 +1,435 @@
+# MANIFEST of /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_prov/bundle
+# host thunder09  slurm job 2243216  start 2026-10-31T11:38:20Z
+# per-file cap 5000000 B (decimal 5 MB); total copy cap 30000000 B; cp -p keeps the original mtime
+# path map: /mnt/beegfs/ojerbi/X -> bundle/X ; /mnt/central/users/ojerbi/Y -> bundle/_central_users_ojerbi/Y
+# COPIED:          sha256  size  original_path  bundle_path   (sha256 of the original; the copy is re-hashed and compared)
+# NOT TRANSFERRED: original_path size (reason) sha256=<hash of the original, computed on this node>
+# MISSING:         original_path (no such file)
+# DERIVED:         sha256  size  path   (analysis scripts and logs, hashed in place, not copied)
+## run step records (command / exit / sacct / stdout); stderr hashed only
+bdbf8b73f2b4ff3ec5e0465b1492c9404055d23ae6d114f0e112eec0053a4f20  2923  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r4a_2195576_i3a.step/command.txt  bundle/r2-runs/spec/i3_r4a_2195576_i3a.step/command.txt
+8a87e62312ed24363d0a563c3d46ddffbaa1cb8f3c9b5d88811f9be7d32d8ccf  58  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r4a_2195576_i3a.step/exit.txt  bundle/r2-runs/spec/i3_r4a_2195576_i3a.step/exit.txt
+e6c3148011643e4603280d252ffef82795b7c70311611cb3a7fc6c9b03e6c1f5  111  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r4a_2195576_i3a.step/sacct.txt  bundle/r2-runs/spec/i3_r4a_2195576_i3a.step/sacct.txt
+ec05a460f6ea023bdae8d5577bd6ca2317dab7d7e42ec73b0d10654e8271611c  13419  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r4a_2195576_i3a.step/stdout.txt  bundle/r2-runs/spec/i3_r4a_2195576_i3a.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i3_r4a_2195576_i3a.step/stderr.txt 1341618 (stderr: not read by any analysis script) sha256=9f66a4283015002436797e1696512b330c2b4d5d288103205e6128af76c32caa
+b9fb29d1dff8c4a28a5f35588b60ad70f354b110b587cd7b2b0684784f681c52  2923  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r3b_2195575_i3b.step/command.txt  bundle/r2-runs/spec/i3_r3b_2195575_i3b.step/command.txt
+1f21cdb2da5ce3d0b044aff7b9410c2af8d57a8e0a8923501bea422516aea07c  58  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r3b_2195575_i3b.step/exit.txt  bundle/r2-runs/spec/i3_r3b_2195575_i3b.step/exit.txt
+ed8e3fc386502efbc8996cc040ce5a8cdd1ea6ef7c3fd98fba363fad16d56264  111  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r3b_2195575_i3b.step/sacct.txt  bundle/r2-runs/spec/i3_r3b_2195575_i3b.step/sacct.txt
+d60ae2dfd24078658008436c19fda9b1e453eb660ccea1d6204455676b8798f5  13426  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r3b_2195575_i3b.step/stdout.txt  bundle/r2-runs/spec/i3_r3b_2195575_i3b.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i3_r3b_2195575_i3b.step/stderr.txt 1969469 (stderr: not read by any analysis script) sha256=14405c9d73eeab90df5aa895f0a9e4a876877dc79a3a9182184891740da49e87
+b067e199556ad5e153b1f785a73bd7910099e8c9d7730a6df433bb040d414995  3164  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d3a_2195575_i4dca.step/command.txt  bundle/r2-runs/spec/i4dc_d3a_2195575_i4dca.step/command.txt
+0540a30cbad184a9842907ee04e9fde8990e21d2f697fd239ad8920f403a4f61  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d3a_2195575_i4dca.step/exit.txt  bundle/r2-runs/spec/i4dc_d3a_2195575_i4dca.step/exit.txt
+91545b2e628456bc539b57c32244cfb8a90f0bc59da895924f7fb3b7e463a90a  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d3a_2195575_i4dca.step/sacct.txt  bundle/r2-runs/spec/i4dc_d3a_2195575_i4dca.step/sacct.txt
+45a288577d0164df81821d79f49c30065271c0fbe1639d108563bad40e960098  16781  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d3a_2195575_i4dca.step/stdout.txt  bundle/r2-runs/spec/i4dc_d3a_2195575_i4dca.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d3a_2195575_i4dca.step/stderr.txt 1340320 (stderr: not read by any analysis script) sha256=913e393ccca096eaeb8673b2ecf053ffeb8ec46de8ce1fd0f539a90f189f5df0
+760ee3e8176aedc5738df860ea6affd63a090ada59189e5584106612fe2af137  3172  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d4b_2195576_i4dcb.step/command.txt  bundle/r2-runs/spec/i4dc_d4b_2195576_i4dcb.step/command.txt
+3442419c6ef321ab2709da4a0aebf342715a83e4d39b5440abb87fa6525c262e  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d4b_2195576_i4dcb.step/exit.txt  bundle/r2-runs/spec/i4dc_d4b_2195576_i4dcb.step/exit.txt
+e1eee7fe5c8da9a6e4136b3ecc2f5c43bc2dbed242551b4593c96c2cc9a6f196  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d4b_2195576_i4dcb.step/sacct.txt  bundle/r2-runs/spec/i4dc_d4b_2195576_i4dcb.step/sacct.txt
+c4abe78c24eb1e41b359327b97a5fac64d4b723a8f988fd19e503674905ffe0f  18357  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d4b_2195576_i4dcb.step/stdout.txt  bundle/r2-runs/spec/i4dc_d4b_2195576_i4dcb.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d4b_2195576_i4dcb.step/stderr.txt 1970682 (stderr: not read by any analysis script) sha256=a4b1212b5ebc33f840bfbd3d8e66f6f3eb97061bd5d13a2eb6bb37093016c258
+f47342aa7d5371196ef035fdbfa94b6a4e0cd5bb35110cba3c218e464570c3fd  3164  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_r4a_2195576_i4dca.step/command.txt  bundle/r2-runs/spec/i4dc_r4a_2195576_i4dca.step/command.txt
+ab5bc4a9266886880bf97d9996a0d0fbe53010d3c8e6b39a4adfc994ea14587b  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_r4a_2195576_i4dca.step/exit.txt  bundle/r2-runs/spec/i4dc_r4a_2195576_i4dca.step/exit.txt
+02f46d5160c146021b9aa16050a4ec523f15396eaaa139095ebb6788d0938165  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_r4a_2195576_i4dca.step/sacct.txt  bundle/r2-runs/spec/i4dc_r4a_2195576_i4dca.step/sacct.txt
+55b20ac9ecea9e03a7588630f82cae772938c290c8697abaa94a0f3b122c149b  16780  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_r4a_2195576_i4dca.step/stdout.txt  bundle/r2-runs/spec/i4dc_r4a_2195576_i4dca.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_r4a_2195576_i4dca.step/stderr.txt 1341527 (stderr: not read by any analysis script) sha256=0f6d67999d0808b68311137b170faf7900c2582cba8f0551cc17b9fcc12f14da
+a76b3a128a0497219630257f843bc63bd7ec439348631921a87ddbb4769a20c5  2870  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca.step/command.txt  bundle/r2-runs/spec/i4c_e4a_2195576_i4ca.step/command.txt
+3806af7152a44b5e4972a9d77ed37c97b8454c952e535dfebb0fee1f138f0cbd  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca.step/exit.txt  bundle/r2-runs/spec/i4c_e4a_2195576_i4ca.step/exit.txt
+7084c8c7518df39a0b52abb400f92a010886ed690c88fdc1e86dddcd4ac44c9b  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca.step/sacct.txt  bundle/r2-runs/spec/i4c_e4a_2195576_i4ca.step/sacct.txt
+d437e9050cd7a4254b65df644a0c1c8541b5634ab363599f26147a5102244d79  29230  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca.step/stdout.txt  bundle/r2-runs/spec/i4c_e4a_2195576_i4ca.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca.step/stderr.txt 1006984 (stderr: not read by any analysis script) sha256=f3c9952bfad23ae7abcf33daa121a4fb04b69d990ad7b3d812cb4f1f0702ccbe
+c2a88ea6cc2e1d6bf0bba13f02b521e38824206742454887ac23dcdf53f2f55b  2871  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb.step/command.txt  bundle/r2-runs/spec/i4c_c4b_2195576_i4cb.step/command.txt
+d24a10811ea4beb8c66bb3a0bb5aa3f4697196c54e8327cf6879b01b8714ff88  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb.step/exit.txt  bundle/r2-runs/spec/i4c_c4b_2195576_i4cb.step/exit.txt
+d2736322427db201d74ae7daeab3705b07f5e14f61f42353af7bd91d0f1be75e  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb.step/sacct.txt  bundle/r2-runs/spec/i4c_c4b_2195576_i4cb.step/sacct.txt
+ac0bedca99740c6711f617ca9968ec61e6f3a0c26737e44cafa1769bd825df09  29281  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb.step/stdout.txt  bundle/r2-runs/spec/i4c_c4b_2195576_i4cb.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb.step/stderr.txt 1478786 (stderr: not read by any analysis script) sha256=52d85e58efcd5da0cc628d415be9cc839287c7074819435853b67997a6a2159d
+c02a7589dd603b8e99776e65c242d0a85bfecb8f75a497e54a6d113515517052  2916  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r2cb_2195574_i3cb.step/command.txt  bundle/r2-runs/spec/i3_r2cb_2195574_i3cb.step/command.txt
+7062490d14d9971c53f99602f106bc651c96acd1eae94ca518bcff0e70d6668e  72  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r2cb_2195574_i3cb.step/exit.txt  bundle/r2-runs/spec/i3_r2cb_2195574_i3cb.step/exit.txt
+825aef5f3017e3bd6382966e2db6f5f366d5b7fbd3b4869108cdf906da2a6fd2  111  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r2cb_2195574_i3cb.step/sacct.txt  bundle/r2-runs/spec/i3_r2cb_2195574_i3cb.step/sacct.txt
+6f6bd29a6d315e37412f5d8ae8c9e5736360418c7e03463bf1bed268a69d2ffe  37290  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r2cb_2195574_i3cb.step/stdout.txt  bundle/r2-runs/spec/i3_r2cb_2195574_i3cb.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i3_r2cb_2195574_i3cb.step/stderr.txt 1478839 (stderr: not read by any analysis script) sha256=c574b9738d38e99888f6aef03f97c45880b241085afa5112479dc43048713075
+8608d751acb1c05d501508d6fc585bcc5b9c927ba808e4fc8559055a331b58b1  2870  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca.step/command.txt  bundle/r2-runs/spec/i4c_c3a_2195575_i4ca.step/command.txt
+ca3d272608d54b4798d56360b6ca5b63b8e89de10da1d93af81f2498853dfaed  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca.step/exit.txt  bundle/r2-runs/spec/i4c_c3a_2195575_i4ca.step/exit.txt
+fb0da98d03702d0d04edaa5ea8988bb25c34d04b6334a5768fcce8dacd74d262  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca.step/sacct.txt  bundle/r2-runs/spec/i4c_c3a_2195575_i4ca.step/sacct.txt
+ed7052ea8b7670491078ce44b95aa25562f2d0bd6729f11a57f409551a3dd92f  29252  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca.step/stdout.txt  bundle/r2-runs/spec/i4c_c3a_2195575_i4ca.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca.step/stderr.txt 1005777 (stderr: not read by any analysis script) sha256=775e8cbc015645a4f68e32e3ae9b8bc4a6bf02b58080be19a7a2fb22847b57aa
+874e3e5972fc6f7f2471454cd97d1284e5cecbb30e3189fc98bfbb91d79e66fc  2814  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3c_2195575_i4dc.step/command.txt  bundle/r2-runs/spec/i4d_d3c_2195575_i4dc.step/command.txt
+eb6ef12d656e83377c8adfae2bee250faec8055f9b46da25a569569eec725ce2  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3c_2195575_i4dc.step/exit.txt  bundle/r2-runs/spec/i4d_d3c_2195575_i4dc.step/exit.txt
+abd6998d43d1c1de38a4b3d67eb5b5c5a0f01a1fc6f0f815cadb1c77f7172fee  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3c_2195575_i4dc.step/sacct.txt  bundle/r2-runs/spec/i4d_d3c_2195575_i4dc.step/sacct.txt
+01cbd50463ee0af3e08bee4f6a5dae2198ec234e4e4bc358b746c8b577254956  6430  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3c_2195575_i4dc.step/stdout.txt  bundle/r2-runs/spec/i4d_d3c_2195575_i4dc.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3c_2195575_i4dc.step/stderr.txt 671143 (stderr: not read by any analysis script) sha256=7dcf9b5b2e965d382126638364491dc9e5ff06dd61850e438714583050d3b44a
+1a148e68c9980b5d57909ca167d2d271e5c22d9570b4dbf4c5a1c06fc94e468d  2814  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4d_2195576_i4dd.step/command.txt  bundle/r2-runs/spec/i4d_d4d_2195576_i4dd.step/command.txt
+1eb243e54b3d5953c90809973e5687e383462d425f2ae09c0baa9215445355b4  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4d_2195576_i4dd.step/exit.txt  bundle/r2-runs/spec/i4d_d4d_2195576_i4dd.step/exit.txt
+f04fe05f9baea8cc9d16556983e30ddd07bca127e230c1948581ee126884d0a7  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4d_2195576_i4dd.step/sacct.txt  bundle/r2-runs/spec/i4d_d4d_2195576_i4dd.step/sacct.txt
+83a0eab4f2a591680eecca83c415eaa95ab787c55b738a142daf2f436084aeda  6437  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4d_2195576_i4dd.step/stdout.txt  bundle/r2-runs/spec/i4d_d4d_2195576_i4dd.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4d_2195576_i4dd.step/stderr.txt 986884 (stderr: not read by any analysis script) sha256=425e863308b7bbb2c8f9e5265a4d45dce33cdaaeb40b6ca9c53d9f4ac87aa72b
+57d0e630428e9b35670ed0d295cde714ab16350ec359d4233e7493dcc429a4d2  2846  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3a_2195575_i4da.step/command.txt  bundle/r2-runs/spec/i4d_d3a_2195575_i4da.step/command.txt
+c13ed037b6704a3d526decae4aeab04148618f38f2c0e408fa57416039ddd072  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3a_2195575_i4da.step/exit.txt  bundle/r2-runs/spec/i4d_d3a_2195575_i4da.step/exit.txt
+3103187fcd7393f45890d187c8f5198b244bfe1e01c057cdf2220e66efa72c41  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3a_2195575_i4da.step/sacct.txt  bundle/r2-runs/spec/i4d_d3a_2195575_i4da.step/sacct.txt
+3b344765aa4769aee2ce60a8be4263648b7dc868cca09ee6651bf70195cc88b9  17769  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3a_2195575_i4da.step/stdout.txt  bundle/r2-runs/spec/i4d_d3a_2195575_i4da.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3a_2195575_i4da.step/stderr.txt 1340411 (stderr: not read by any analysis script) sha256=75c7ed04990d37869859b0163c29009fdd1a43d7f2738eeb44ed823bff1c82bb
+36d983875205b22d00631b062678d41c7b3857b5b10607c8eff5f3ab68acc77e  2847  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4b_2195576_i4db.step/command.txt  bundle/r2-runs/spec/i4d_d4b_2195576_i4db.step/command.txt
+ea5c69f864618aaa5c17da246fbd1c8e25bcd10761954b8efdfcdad201ee1e96  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4b_2195576_i4db.step/exit.txt  bundle/r2-runs/spec/i4d_d4b_2195576_i4db.step/exit.txt
+649140d50a51029d2ae6050989b5a0321c93df9f3030bb6a24243739c9ab255c  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4b_2195576_i4db.step/sacct.txt  bundle/r2-runs/spec/i4d_d4b_2195576_i4db.step/sacct.txt
+e13a5afb84b7eddb8b54c476201bc515e7df5b76696d072cf781c0bab84b1ff4  17814  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4b_2195576_i4db.step/stdout.txt  bundle/r2-runs/spec/i4d_d4b_2195576_i4db.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4b_2195576_i4db.step/stderr.txt 1970688 (stderr: not read by any analysis script) sha256=ba5cfc511a51ff6d9ca308300e730b63be03f3eed3c052354a0598707e5ac855
+6f3401f0c689409e4c8a48a974f2f2778267316fcfb957aec3e7406b4ae38838  2845  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_f3b_2195575_i4db.step/command.txt  bundle/r2-runs/spec/i4d_f3b_2195575_i4db.step/command.txt
+13ad70b51464396b01bf7f574ca390780aa2efb7a409d665576c49555628ca21  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_f3b_2195575_i4db.step/exit.txt  bundle/r2-runs/spec/i4d_f3b_2195575_i4db.step/exit.txt
+8a43caa9cdc2fd2318fdd4c4eb38b5e5f4242a436b75c9ebb66389de2ef1e951  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_f3b_2195575_i4db.step/sacct.txt  bundle/r2-runs/spec/i4d_f3b_2195575_i4db.step/sacct.txt
+7f0fcadbba30099d2d5246134feeae42aee98f0bac6951973b7075731c0a1375  17821  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_f3b_2195575_i4db.step/stdout.txt  bundle/r2-runs/spec/i4d_f3b_2195575_i4db.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4d_f3b_2195575_i4db.step/stderr.txt 1969469 (stderr: not read by any analysis script) sha256=2ae5168116cf256df18f96c1898c6ad5792e29f04b2cb78fc2b43ab3f7fcc402
+79f2e0e4f0642357112f477a4459f366f1dc0f0af9a4a13717c41b5bb1a70149  2924  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_n3128_2195575_i4m128.step/command.txt  bundle/r2-runs/spec/i4m_n3128_2195575_i4m128.step/command.txt
+c363978e11e516478751c9938fd63e7e598ab788026f6f35e9f298b807508528  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_n3128_2195575_i4m128.step/exit.txt  bundle/r2-runs/spec/i4m_n3128_2195575_i4m128.step/exit.txt
+9b8d4f58e069460b05217cdc803a92d28e94d6b01470df167b3991a6f03c44c3  118  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_n3128_2195575_i4m128.step/sacct.txt  bundle/r2-runs/spec/i4m_n3128_2195575_i4m128.step/sacct.txt
+ba4252f0345bdbfe0bd30df0ed6b4465fc8c178b2e3670f7340a5d230fe190f9  4941  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_n3128_2195575_i4m128.step/stdout.txt  bundle/r2-runs/spec/i4m_n3128_2195575_i4m128.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4m_n3128_2195575_i4m128.step/stderr.txt 671143 (stderr: not read by any analysis script) sha256=4459b7e5b6668393dfa452d5a8a35beba3d92b7c268b5d20caea33d614e8d5f7
+133efe78049b5fdee34561780b52da9d88642e7f79a302e1bc8f57dbcbb95371  2922  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_v4128_2195576_i4m128.step/command.txt  bundle/r2-runs/spec/i4m_v4128_2195576_i4m128.step/command.txt
+90d479a4af7b939159ef5ac6c4955a204637b0f9b6377c8880a85bb7ee7ab3ba  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_v4128_2195576_i4m128.step/exit.txt  bundle/r2-runs/spec/i4m_v4128_2195576_i4m128.step/exit.txt
+efad25c2c03622a1de36fb34f179597958e8cfbaffe6eb9b344cf7f35a8c4223  118  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_v4128_2195576_i4m128.step/sacct.txt  bundle/r2-runs/spec/i4m_v4128_2195576_i4m128.step/sacct.txt
+f404a0fcf7b5d769f9a48f8e30e8117ba786f4152a53fa183349fe513928972a  4942  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_v4128_2195576_i4m128.step/stdout.txt  bundle/r2-runs/spec/i4m_v4128_2195576_i4m128.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4m_v4128_2195576_i4m128.step/stderr.txt 672350 (stderr: not read by any analysis script) sha256=bae02bf72d021fa9ba81b37c6296d9abf3487d2abed6135b04aea894c7ffa58f
+0f8c7e60586afd0593947857d3f215e4857d318e0a5da3bbea522a477b0e182b  2920  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3p73_2195575_i4mp73.step/command.txt  bundle/r2-runs/spec/i4m_m3p73_2195575_i4mp73.step/command.txt
+cec7983d493a64c36999ebb8ce1d5f79d2224ead3ee2a1242b5c4b848d2e9663  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3p73_2195575_i4mp73.step/exit.txt  bundle/r2-runs/spec/i4m_m3p73_2195575_i4mp73.step/exit.txt
+95fddf6a1b0723c03f49a787954444f36a0ccc99288f839c0990b7560fbf99e2  118  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3p73_2195575_i4mp73.step/sacct.txt  bundle/r2-runs/spec/i4m_m3p73_2195575_i4mp73.step/sacct.txt
+84e63df3cfe8a19f896105cce97bddebe6824fc06486c2aac0056be33fdd25ad  5645  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3p73_2195575_i4mp73.step/stdout.txt  bundle/r2-runs/spec/i4m_m3p73_2195575_i4mp73.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3p73_2195575_i4mp73.step/stderr.txt 202373 (stderr: not read by any analysis script) sha256=517e475a7d52efbbfb2ffa432357fdb390675132eec5e7b7d1167567d7ea71f7
+1610bae5dd8c4c59785e91dcc8cdeb3b659c8ea2a2378d70d0fd54d84048e9b3  2936  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3p128_2195575_i4mp128.step/command.txt  bundle/r2-runs/spec/i4m_m3p128_2195575_i4mp128.step/command.txt
+3d249b75b1d6da984da719d1a342ad7c4a3ee1729f09bdde889747ada96db3eb  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3p128_2195575_i4mp128.step/exit.txt  bundle/r2-runs/spec/i4m_m3p128_2195575_i4mp128.step/exit.txt
+073e7a859e5c26b4be02ce6611d6343339d21401aae3a2ea6fedb38dd19688bf  120  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3p128_2195575_i4mp128.step/sacct.txt  bundle/r2-runs/spec/i4m_m3p128_2195575_i4mp128.step/sacct.txt
+fdb43a4bf3027588b9c1798439c307a5b5325fe647df1aec2e4ba52e612bb68a  5587  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3p128_2195575_i4mp128.step/stdout.txt  bundle/r2-runs/spec/i4m_m3p128_2195575_i4mp128.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3p128_2195575_i4mp128.step/stderr.txt 202373 (stderr: not read by any analysis script) sha256=4bb792e7317afe5bc90f860414ff1e5dc7a1c3a5412a9088325ba9dc3c88b79d
+edb7df7d4bae3c345d11bfbcc6b89596e309d67a1aa4a04dbf0272578130ea88  2923  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r3a_2195575_i3a.step/command.txt  bundle/r2-runs/spec/i3_r3a_2195575_i3a.step/command.txt
+605a78e2fee23b6ac3b236653f85aac218ee5d69904fc36680c1e477b1fc3ec9  58  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r3a_2195575_i3a.step/exit.txt  bundle/r2-runs/spec/i3_r3a_2195575_i3a.step/exit.txt
+a03a36b0f24d4beef574010e5d3cfba66492d714a64a1ef90f20951b721fa8b3  111  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r3a_2195575_i3a.step/sacct.txt  bundle/r2-runs/spec/i3_r3a_2195575_i3a.step/sacct.txt
+9c1db7da389bf3cd95a9a946f3b095046ddfd3f9a62177fce461f4b47ba83d3b  13421  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r3a_2195575_i3a.step/stdout.txt  bundle/r2-runs/spec/i3_r3a_2195575_i3a.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i3_r3a_2195575_i3a.step/stderr.txt 1340411 (stderr: not read by any analysis script) sha256=022917b13497cd0eb7a26ba32da6665872ecc2f41d5fbd32a061e92a02b5bf49
+04cf7a5ae1d2d8c6d80fe7f7e11e7b4f76cd717cc79e934ecca4b36b6fcfd609  2923  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r4b_2195576_i3b.step/command.txt  bundle/r2-runs/spec/i3_r4b_2195576_i3b.step/command.txt
+f26bfe53af082cc0d1026c53e86763154bf17f5ba446e49e6b53ae46ebe88016  58  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r4b_2195576_i3b.step/exit.txt  bundle/r2-runs/spec/i3_r4b_2195576_i3b.step/exit.txt
+8c552c1b009cc83708a64d8d753f7abc19c33e52e295e4036c89bf4196bd7cba  111  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r4b_2195576_i3b.step/sacct.txt  bundle/r2-runs/spec/i3_r4b_2195576_i3b.step/sacct.txt
+30e5b497e0d3d1d5b9105e93697252f6923f1153b876c8d666013b032a72b02f  13433  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r4b_2195576_i3b.step/stdout.txt  bundle/r2-runs/spec/i3_r4b_2195576_i3b.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i3_r4b_2195576_i3b.step/stderr.txt 1970688 (stderr: not read by any analysis script) sha256=592dd3090c9e9ee77420af9289fd2b0fdb46639087d3913ba1ee3e8e93889acc
+6f5bf8e411709f730c00a5f5b2d9054c01f03d825dc1872c654f64391129c9be  3177  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c3a_2195575_i4cca.step/command.txt  bundle/r2-runs/spec/i4cc_c3a_2195575_i4cca.step/command.txt
+41d5ba12f83a5a895a1915bb56598c76c49592f21cc6a5d4a58c0054322df5b6  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c3a_2195575_i4cca.step/exit.txt  bundle/r2-runs/spec/i4cc_c3a_2195575_i4cca.step/exit.txt
+aaeb354360b5973d28c75695a0ab8b2b608ab7850986111eb13dea802e4b74ac  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c3a_2195575_i4cca.step/sacct.txt  bundle/r2-runs/spec/i4cc_c3a_2195575_i4cca.step/sacct.txt
+26847db7faa8d707d9a078f0179cfb840764cbb69a5483a4c355a2945ec0cf1d  18907  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c3a_2195575_i4cca.step/stdout.txt  bundle/r2-runs/spec/i4cc_c3a_2195575_i4cca.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c3a_2195575_i4cca.step/stderr.txt 1675045 (stderr: not read by any analysis script) sha256=b72497803d4d51995507c85d278360099d9402ae8c046c809c4e9c2868f22894
+72b72f3fc7f1ebe87cd5506d6655de1aad1667fafd1074c9bf5b4e6c3d5004af  3168  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c4b_2195576_i4ccb.step/command.txt  bundle/r2-runs/spec/i4cc_c4b_2195576_i4ccb.step/command.txt
+fbf2a0050269bf31c9b8a2eef9ce553c376865ddc91bd40235de8afd4c9943d2  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c4b_2195576_i4ccb.step/exit.txt  bundle/r2-runs/spec/i4cc_c4b_2195576_i4ccb.step/exit.txt
+d4aeb6bc3a7a1f5f94af85e422227004f0d0416c11e57f6866284a4c26e0872f  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c4b_2195576_i4ccb.step/sacct.txt  bundle/r2-runs/spec/i4cc_c4b_2195576_i4ccb.step/sacct.txt
+b9b735b1083da94426f1f5bdf96dcc0a7399586644b1a9ebb8a2c493a3584b5d  16712  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c4b_2195576_i4ccb.step/stdout.txt  bundle/r2-runs/spec/i4cc_c4b_2195576_i4ccb.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c4b_2195576_i4ccb.step/stderr.txt 1970684 (stderr: not read by any analysis script) sha256=047000f4b82dc6f7fa494ed4799299a07082cb3f49770544b8c6d0f15c90299b
+f24c0486de190a95463136dc001df60f2aa6e89347d2aa931a30133acfbb1690  2812  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s3a_2195575_i4sa.step/command.txt  bundle/r2-runs/spec/i4s_s3a_2195575_i4sa.step/command.txt
+b31f59732bd9cb0901a8ca39be1e21da442f137b08734e570665a253ba6ff6ad  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s3a_2195575_i4sa.step/exit.txt  bundle/r2-runs/spec/i4s_s3a_2195575_i4sa.step/exit.txt
+051860933ac8fa87e091e94f83323c0e1e0d8052a3a24b5a8b5d357061d93e0a  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s3a_2195575_i4sa.step/sacct.txt  bundle/r2-runs/spec/i4s_s3a_2195575_i4sa.step/sacct.txt
+faa5de4808e93c8ef1b1c9a868f96e5b7965adb3ba774fc7c46050930639eee9  13365  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s3a_2195575_i4sa.step/stdout.txt  bundle/r2-runs/spec/i4s_s3a_2195575_i4sa.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s3a_2195575_i4sa.step/stderr.txt 1340411 (stderr: not read by any analysis script) sha256=a8feb98308ce3fd2d78dc1a75cee806d9dff9a406eb38a203f38b7542d361d85
+9f2e01fc592e201310a5958011502808eac6366064c20c4b3b4a9a3b29ca90ba  2820  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s4b_2195576_i4sb.step/command.txt  bundle/r2-runs/spec/i4s_s4b_2195576_i4sb.step/command.txt
+8637af26444584494c349e2ffdbaa9cf34197c5cc3d103dc67bd362a41d6a6b1  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s4b_2195576_i4sb.step/exit.txt  bundle/r2-runs/spec/i4s_s4b_2195576_i4sb.step/exit.txt
+1e23b0f32bdd1aa0e19f1918b7c47a77b9ac7fd7bb96619feccbe2a3536f1c2f  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s4b_2195576_i4sb.step/sacct.txt  bundle/r2-runs/spec/i4s_s4b_2195576_i4sb.step/sacct.txt
+fb6eee75d7e66dd3eb64a6718dd528c46bdceb095c81bb1b046d7235d4d98edd  15913  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s4b_2195576_i4sb.step/stdout.txt  bundle/r2-runs/spec/i4s_s4b_2195576_i4sb.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s4b_2195576_i4sb.step/stderr.txt 1970686 (stderr: not read by any analysis script) sha256=15df7fe311a2d8164423bfc93c1aa23415f128e1f0b043a77d2c87e5d3b48ce4
+4724e345814d5e36efaf7dd46f594d5ace47f3da7d7861366943eab678905742  2805  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q3a_2195575_i4aa.step/command.txt  bundle/r2-runs/spec/i4a_q3a_2195575_i4aa.step/command.txt
+2a647c1d1ca3f15baa881eeec4dc60231cbf45e8eaf31b9b3d895d23b2148bb7  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q3a_2195575_i4aa.step/exit.txt  bundle/r2-runs/spec/i4a_q3a_2195575_i4aa.step/exit.txt
+dbd9e856304ab1dc01ca06aaf0277508d1aab747f3e92ba095ed5b9b18f2e882  113  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q3a_2195575_i4aa.step/sacct.txt  bundle/r2-runs/spec/i4a_q3a_2195575_i4aa.step/sacct.txt
+8f3d3dd33c3303422f2cf6ad4ebbe7e2d1081fb70be78195482ba128b683679b  10485  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q3a_2195575_i4aa.step/stdout.txt  bundle/r2-runs/spec/i4a_q3a_2195575_i4aa.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q3a_2195575_i4aa.step/stderr.txt 1006984 (stderr: not read by any analysis script) sha256=e7c7d01bc3fa30690bc1b5e8c37f5ee366107bfb5965d7ec5dd69fb96ffc505a
+9d2e01c3cb7127651df5d0304ccfc6c7afe1d72b4ff80b5b53db8673f22a506b  2805  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_k4a_2195576_i4aa.step/command.txt  bundle/r2-runs/spec/i4a_k4a_2195576_i4aa.step/command.txt
+300e02514272f9f797b752917dd5f3b9fbf5e3c94791e95e030947a15949acf0  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_k4a_2195576_i4aa.step/exit.txt  bundle/r2-runs/spec/i4a_k4a_2195576_i4aa.step/exit.txt
+9f7f5d8489f0e5c68de21bcb0b4f7bebff03b51db4fbcb4be591a87167de3f43  113  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_k4a_2195576_i4aa.step/sacct.txt  bundle/r2-runs/spec/i4a_k4a_2195576_i4aa.step/sacct.txt
+97ce6c8a1d65fac3bd9e9a8e8582d0915017d74c610a6274ebb687b8af53069c  10492  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_k4a_2195576_i4aa.step/stdout.txt  bundle/r2-runs/spec/i4a_k4a_2195576_i4aa.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4a_k4a_2195576_i4aa.step/stderr.txt 1006984 (stderr: not read by any analysis script) sha256=a2cbee9605604fcc1606c7f4927b25c5cb8118040353806838bf020307a67e4a
+2369bc7fca102d62a0617edc1542398bbfa065e6e94708de7be4a35e0eb1f4d6  2806  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q4b_2195576_i4ab.step/command.txt  bundle/r2-runs/spec/i4a_q4b_2195576_i4ab.step/command.txt
+03f365a3af83962d6f32fe6ed74647c323ac67a2d27d87639db6230f18bcce78  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q4b_2195576_i4ab.step/exit.txt  bundle/r2-runs/spec/i4a_q4b_2195576_i4ab.step/exit.txt
+b98cb5e8e4d1af43badd6d005e7ea3fc12b47656bf96e51ed1fb364e5e11a398  113  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q4b_2195576_i4ab.step/sacct.txt  bundle/r2-runs/spec/i4a_q4b_2195576_i4ab.step/sacct.txt
+c28675edcbd231f22db94c6812a9b86411608d7ae8a7da88ecb9788f26ce24b6  10492  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q4b_2195576_i4ab.step/stdout.txt  bundle/r2-runs/spec/i4a_q4b_2195576_i4ab.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q4b_2195576_i4ab.step/stderr.txt 1478786 (stderr: not read by any analysis script) sha256=a92e127aa6fb25393919547ae64ed0d247326f41fff5e2434fecfdaf0d5908ff
+37856090ce9554592b86f889cc4cecbb080884b5f4ece727f65efc05b81ca112  2806  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_k3b_2195575_i4ab.step/command.txt  bundle/r2-runs/spec/i4a_k3b_2195575_i4ab.step/command.txt
+40e21186d107be458f4cf8139c9b413ef0681e9161911c311ea64f8fbf6b3694  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_k3b_2195575_i4ab.step/exit.txt  bundle/r2-runs/spec/i4a_k3b_2195575_i4ab.step/exit.txt
+d8520bfb41c5590de60df4f62ed2d6f001045d2562614361634512e0af9b7fe9  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_k3b_2195575_i4ab.step/sacct.txt  bundle/r2-runs/spec/i4a_k3b_2195575_i4ab.step/sacct.txt
+d7538a296303068bc1a126ed6e46f2e39109d5ebadff8233feb07256cb309a89  10489  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_k3b_2195575_i4ab.step/stdout.txt  bundle/r2-runs/spec/i4a_k3b_2195575_i4ab.step/stdout.txt
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4a_k3b_2195575_i4ab.step/stderr.txt 1477571 (stderr: not read by any analysis script) sha256=12577f10de56f2a8f15b69a15801d13aa5d716960d2cd8003961fb8203c356e2
+## run summaries (summary.json) and traces
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i3_r4a_2195576_i3a/summary.json 5003343 (above 5 MB) sha256=d144686ce54c3d6f774b0c532966841507d89731385e296faa19ced54e288b3c
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i3_r3b_2195575_i3b/summary.json 7341335 (above 5 MB) sha256=b483411aabf71a200b3644a83e7279c92dc8214914388f8ce08123193a62e350
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d3a_2195575_i4dca/summary.json 5046590 (above 5 MB) sha256=fa110befb58767bd273d895dc2f3143e49d39ce0b4730252550c7edcadec462e
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d4b_2195576_i4dcb/summary.json 7387411 (above 5 MB) sha256=c37e804fb3b9b970c56c4e1b442f6dcb74f8565fb6b4eb91df47da097be73f40
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_r4a_2195576_i4dca/summary.json 5046587 (above 5 MB) sha256=52fa14c1d76b926269820a8e4ec53a010c3f0ed90ccc18ea62cacc27a07821cc
+65e63e0c698afc16eaa208812947298390518641fbfc43673c0cfce1c9b1a7af  3460201  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca/summary.json  bundle/r2-runs/spec/i4c_e4a_2195576_i4ca/summary.json
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca/trace_L4PTFDP_g112_draft0.json.gz 461058 (trace) sha256=3b4c1491ff87ba9f1aeea90a626f1e7f3d64a0e3a14d7d61d9099ba7a6fbdc64
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca/trace_L4PTFDP_g112_draft1.json.gz 460862 (trace) sha256=27a0c76b22fd7022b005e5c03d51022b3585ccc791548e8afc48005397eaf43f
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca/trace_L4PTFDP_g112_joint.json.gz 1301060 (trace) sha256=b8e85f82e977275e4ff6399e5f77b4efa57a8b6b87b2d7d523ef6534a73e3cd1
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca/trace_L4PTFDP_g96_draft0.json.gz 441327 (trace) sha256=2f1585dfb5dd53e956d8a6085801fb018c5ff6b936dda7389828bedb48307323
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca/trace_L4PTFDP_g96_draft1.json.gz 441262 (trace) sha256=0191779741a57d98638baade03ec86eecdc6de70e726ded3f85f9077b2b2e2a2
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca/trace_L4PTFDP_g96_joint.json.gz 1296779 (trace) sha256=e2eaa4a78ff66516a15e85b8ef0daa97a6fab23b1f7d409e8b4268534843dcf1
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb/summary.json 5018852 (above 5 MB) sha256=108f928952e1af5d938b3f4e04dcfee2f1a3698f63a5ee56b5ec31580a6f92a4
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb/trace_L4PTFDP_g112_draft0.json.gz 465471 (trace) sha256=b0d97ddf22bfd92f7bd2813f30eb5ee046f9d43f259b465157fa8c1054dd5a6b
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb/trace_L4PTFDP_g112_draft1.json.gz 465036 (trace) sha256=c3e6cc54dff717e4b93d03b1ef04df946b380a012e028282ec9472ee9966fc1c
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb/trace_L4PTFDP_g112_joint.json.gz 1335332 (trace) sha256=563349414003ccc9f9d214355eb81bb47886694fb3467d56f07a32691ddd0c55
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb/trace_L4PTFDP_g96_draft0.json.gz 445808 (trace) sha256=babd3cf942ac08cde0968b2402c00988fd7a080992dc2e6bcae4fe4f458a7b43
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb/trace_L4PTFDP_g96_draft1.json.gz 446208 (trace) sha256=668f855ce4ea553ae4abe0bc62c63842340c4b03215da1c0af3789355d61045f
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb/trace_L4PTFDP_g96_joint.json.gz 1335729 (trace) sha256=be0c30dab0fa96a457933e93d12d56506af951e4d1a3ac2d5a0e9460902dcb05
+43bf194d8a1c21e5844bd2c46f2f623cbbd17e1806682252e832f8c849641c10  53725  /mnt/beegfs/ojerbi/r2-runs/spec/i3_r2cb_2195574_i3cb/summary.json  bundle/r2-runs/spec/i3_r2cb_2195574_i3cb/summary.json
+2ba620b5fffc965cb2d48d29078a1e2e745e972e1d3cb878ad6f3a631b18a7bd  3460208  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca/summary.json  bundle/r2-runs/spec/i4c_c3a_2195575_i4ca/summary.json
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca/trace_L4PTFDP_g112_draft0.json.gz 460605 (trace) sha256=3b86ebd3dc9b7412457ceffd22e78347242d4ecf40ac33177891a56fdd857572
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca/trace_L4PTFDP_g112_draft1.json.gz 460712 (trace) sha256=a0c61e48a5695a4bb6def2ad7704bc2821318bc47892a58af286d878b092b43b
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca/trace_L4PTFDP_g112_joint.json.gz 1297241 (trace) sha256=e00b61c106c8f5ab6e9bf10f7ea9806974658578d17b289a12e74c646bf02202
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca/trace_L4PTFDP_g96_draft0.json.gz 440980 (trace) sha256=4cf56c23ca3b5608414067fd8cab89be5f4e9444b82c3614853465575980f171
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca/trace_L4PTFDP_g96_draft1.json.gz 440611 (trace) sha256=7863b131026babc89ec5a101a187fbc52d6e8ee5fb760f8e9f2fdf00f65f35dc
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca/trace_L4PTFDP_g96_joint.json.gz 1297250 (trace) sha256=92b9821b6fbbe01922f8880e847f56ea2f157391766abcbad32409aa37594a70
+d5772cf849c68c9c768f7e832b8de191c7e4ceba2f143505436f87eefa27b84b  1671333  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3c_2195575_i4dc/summary.json  bundle/r2-runs/spec/i4d_d3c_2195575_i4dc/summary.json
+e381db8fb360c1f1c0cdbdfe12a2f1a9885ba76709a2f3dc2595e177edf0f16d  2446759  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4d_2195576_i4dd/summary.json  bundle/r2-runs/spec/i4d_d4d_2195576_i4dd/summary.json
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3a_2195575_i4da/summary.json 5022192 (above 5 MB) sha256=dc42990404270a8a6753331917e6f974ec258a671a12fb93d37de3f81001b1e1
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4b_2195576_i4db/summary.json 7359028 (above 5 MB) sha256=a89e062fc77e4614d8416ff22642f3edaf579a9e51b14a5de44927ab02cc1996
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4d_f3b_2195575_i4db/summary.json 7359032 (above 5 MB) sha256=b9160a57025f808f255b129c84eb4225ebf0cb2f0afadf6a65c3d006c2c56b60
+5813c07b927dfe5fa760574478cc4c79c2458b505192da889f9577e649c8d07b  1582595  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_n3128_2195575_i4m128/summary.json  bundle/r2-runs/spec/i4m_n3128_2195575_i4m128/summary.json
+7ebd1f5f9dc14e810782eed6a6749aba8758fc0cee8d346c159b84f1d2e90c22  1582591  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_v4128_2195576_i4m128/summary.json  bundle/r2-runs/spec/i4m_v4128_2195576_i4m128/summary.json
+bc0d8712843460c541637db0cf87f4a60ecd4906658dcc1b153056e5fad0a3de  486469  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3p73_2195575_i4mp73/summary.json  bundle/r2-runs/spec/i4m_m3p73_2195575_i4mp73/summary.json
+0057f14b77739d03a0aebfbfe39e48d1f6dc68ee2b02b097c2ffd8f3339424c2  486609  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3p128_2195575_i4mp128/summary.json  bundle/r2-runs/spec/i4m_m3p128_2195575_i4mp128/summary.json
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i3_r3a_2195575_i3a/summary.json 5003345 (above 5 MB) sha256=6121f9dc2608f12871e13767abb83418caf0e326df46c8666c14950bb638f8b8
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i3_r4b_2195576_i3b/summary.json 7341344 (above 5 MB) sha256=20dd1d35938db561d8904a9155e8f1fad5a90a68b8b098818a7665cbdd0408d8
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c3a_2195575_i4cca/summary.json 6721709 (above 5 MB) sha256=081b4d18ba2ca0f557b8d3af7397fbd3eacded2f069dc1eb6c979960de6f11a7
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c4b_2195576_i4ccb/summary.json 7384294 (above 5 MB) sha256=89491026abe9892de4c2a853d67abf00c8f4d6b48703314cb3e281412def3b8a
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s3a_2195575_i4sa/summary.json 5037628 (above 5 MB) sha256=c16a7a728653ecdcba20b53d557b77f160c20e34eb983881e7463bb7352e3d94
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s4b_2195576_i4sb/summary.json 7377990 (above 5 MB) sha256=48b42aa5213fd64940efc32b6e83ed303b91a9c6a25477f8edc5066ed76bc584
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q3a_2195575_i4aa/summary.json 3345936 (R3 ladder context only, no covered ledger row; kept out to hold the 30 MB cap) sha256=267d8e32b4d7f68ca751cf778a8452eb613c2bfe5417630f2ce110bd09e117da
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4a_k4a_2195576_i4aa/summary.json 3345945 (R3 ladder context only, no covered ledger row; kept out to hold the 30 MB cap) sha256=09b940789bc36dc13e551a49f2eb1054557d9c36cefd8f7882d66b5fbdd6db64
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q4b_2195576_i4ab/summary.json 4904047 (R3 ladder context only, no covered ledger row; kept out to hold the 30 MB cap) sha256=7b4bcacbb66dd9e922e076b22c1d0004693d58ebd2834d37be3808896be5a7a8
+NOT TRANSFERRED: /mnt/beegfs/ojerbi/r2-runs/spec/i4a_k3b_2195575_i4ab/summary.json 4904045 (R3 ladder context only, no covered ledger row; kept out to hold the 30 MB cap) sha256=9c48995143024a8f7b1e6d29ab2db44c807209a091b3bd55f4cfcffb8e109dde
+## model-side evidence and re-check records
+8f66dd3619ecac412dcb653b15fcecd498452f396e1849542f9ddea34898e509  11218  /mnt/central/users/ojerbi/retroinfer-eval/docs/evidence/hbm_sweep_2175791/scoring/output2_memory.csv  bundle/_central_users_ojerbi/retroinfer-eval/docs/evidence/hbm_sweep_2175791/scoring/output2_memory.csv
+90ba9b23f5855f5df73df0b46e666baa8d8ff4e156b8428fd18e675d71471ce1  15222  /mnt/central/users/ojerbi/retroinfer-eval/docs/evidence/hbm_sweep_2175791/scoring/output3_timing_bw.csv  bundle/_central_users_ojerbi/retroinfer-eval/docs/evidence/hbm_sweep_2175791/scoring/output3_timing_bw.csv
+d837bc39f7393b6da2f738068d90316c5df784c2055bc28895ac7e1897054679  25588  /mnt/central/users/ojerbi/retroinfer-eval/docs/evidence/hbm_sweep_2175791/scoring/output1_hbm_families_long.csv  bundle/_central_users_ojerbi/retroinfer-eval/docs/evidence/hbm_sweep_2175791/scoring/output1_hbm_families_long.csv
+f1bb49006e8e184869a46ecc67e5cdd3a82547002a6c20ae83d9cfc1f32f50f8  104478  /mnt/central/users/ojerbi/retroinfer-eval/docs/evidence/rows_bench_2175525/gemm_mscan.json  bundle/_central_users_ojerbi/retroinfer-eval/docs/evidence/rows_bench_2175525/gemm_mscan.json
+5e6c04c7fe818092c137854302f2275ac9ed0112a2a22a7bceee6d7b23fb9b2d  3466  /mnt/central/users/ojerbi/retroinfer-eval/docs/evidence/cpupack_confirm_2179735/scoring/layout_variants.csv  bundle/_central_users_ojerbi/retroinfer-eval/docs/evidence/cpupack_confirm_2179735/scoring/layout_variants.csv
+5981674a9fe056a68b948be1219592f59c75d768be3c46d2437f4690d251b3cb  29655  /mnt/beegfs/ojerbi/r2-runs/bi/bi_gma_2190876_gm1/summary.json  bundle/r2-runs/bi/bi_gma_2190876_gm1/summary.json
+865982ed35b976c91cd5e15b2ffd320f87bf3c7ebaa55a7afae150ca66c81293  81460  /mnt/beegfs/ojerbi/r2-runs/gstep/gstep_e3r_2195575_gs1r/summary.json  bundle/r2-runs/gstep/gstep_e3r_2195575_gs1r/summary.json
+5984e45d91ce8e3e094f02e6b5ccb52f25ba50ec49460122023c1fa07c4c03ea  81460  /mnt/beegfs/ojerbi/r2-runs/gstep/gstep_e4r_2195576_gs1r/summary.json  bundle/r2-runs/gstep/gstep_e4r_2195576_gs1r/summary.json
+## step records read by ana_rev7/a2_score.py (glob i4*.step: command / exit / sacct only)
+91ea6e253d87a3f94c169ff6b7c6378cf2f4a535dbd257cd2606fa54b383b996  2799  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q3m_2195575_i4am.step/command.txt  bundle/r2-runs/spec/i4a_q3m_2195575_i4am.step/command.txt
+9d13bbd69b9a20cf824280ff6a4bba74e43ee4dab000696862602ecbd58686b4  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q3m_2195575_i4am.step/exit.txt  bundle/r2-runs/spec/i4a_q3m_2195575_i4am.step/exit.txt
+2aaf32e63ac779d376f8123e2321dcd35c681c0cf576978460384f360521b123  113  /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q3m_2195575_i4am.step/sacct.txt  bundle/r2-runs/spec/i4a_q3m_2195575_i4am.step/sacct.txt
+2bcc15b7897ff883cce89e7eaa36a4f69af6d2af7d67e84ba5678c18f9bfbc01  2899  /mnt/beegfs/ojerbi/r2-runs/spec/i4b_w3m_2195575_i4bm.step/command.txt  bundle/r2-runs/spec/i4b_w3m_2195575_i4bm.step/command.txt
+7f1adddace18209d8280880eed34bfe9a0f5dfef7fa7df0a390a60e714469b05  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4b_w3m_2195575_i4bm.step/exit.txt  bundle/r2-runs/spec/i4b_w3m_2195575_i4bm.step/exit.txt
+9f771b6a78eb5ca9e49d88facf7e032627fa35731ac355dd4e8c98523406225f  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4b_w3m_2195575_i4bm.step/sacct.txt  bundle/r2-runs/spec/i4b_w3m_2195575_i4bm.step/sacct.txt
+3e51ba9871464573af2805bca45ed454a5c799af33c5eff6a73f923135c62f02  2893  /mnt/beegfs/ojerbi/r2-runs/spec/i4b_w3sa_2195575_i4bsa.step/command.txt  bundle/r2-runs/spec/i4b_w3sa_2195575_i4bsa.step/command.txt
+54297b67fa5c3b6f1a329cb4732ff7bb1a3342cdecfd75d09dfaea76960f5027  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4b_w3sa_2195575_i4bsa.step/exit.txt  bundle/r2-runs/spec/i4b_w3sa_2195575_i4bsa.step/exit.txt
+6eb4c21ff845fffdeda8145622f8a78526cfe9675fa252164e7eda01074b1feb  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4b_w3sa_2195575_i4bsa.step/sacct.txt  bundle/r2-runs/spec/i4b_w3sa_2195575_i4bsa.step/sacct.txt
+05b829e41160ecd0259c36ea28a3fca151f3312c9efa9f5ca6d741078084cefa  2893  /mnt/beegfs/ojerbi/r2-runs/spec/i4b_w4sb_2195576_i4bsb.step/command.txt  bundle/r2-runs/spec/i4b_w4sb_2195576_i4bsb.step/command.txt
+fd60eb752b51f0e7f2b183c0cd0ab427664ef4c578dcd13942fc2d142eb279d8  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4b_w4sb_2195576_i4bsb.step/exit.txt  bundle/r2-runs/spec/i4b_w4sb_2195576_i4bsb.step/exit.txt
+3c3de91bbf0bc0f773ebd39ecacbaf3e1c2ecbff9b5e0ccd93c7ad6a030ba01e  115  /mnt/beegfs/ojerbi/r2-runs/spec/i4b_w4sb_2195576_i4bsb.step/sacct.txt  bundle/r2-runs/spec/i4b_w4sb_2195576_i4bsb.step/sacct.txt
+81c3906888e4aa095e53190af250d2757048bb33ea854d997404c2af30d6f973  2856  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3m_2195575_i4cm.step/command.txt  bundle/r2-runs/spec/i4c_c3m_2195575_i4cm.step/command.txt
+67d52d617eb3038908fad0e348610494b6ac89f465b4676906d8af129be60e78  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3m_2195575_i4cm.step/exit.txt  bundle/r2-runs/spec/i4c_c3m_2195575_i4cm.step/exit.txt
+7fb36ee0e9f34e4aaffc6af8310233d6a8c52aaf64fafd188c3b2442b631354e  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3m_2195575_i4cm.step/sacct.txt  bundle/r2-runs/spec/i4c_c3m_2195575_i4cm.step/sacct.txt
+0a9748633eb2d2bf931bf850230e9d0ab0d440a313c06cf589c33c500f9ba653  2856  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4m_2195576_i4cm.step/command.txt  bundle/r2-runs/spec/i4c_c4m_2195576_i4cm.step/command.txt
+86b7d89b8551cd4cfc0aae1bad31c6265f0bbc66fee79f165b542c63fb22b830  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4m_2195576_i4cm.step/exit.txt  bundle/r2-runs/spec/i4c_c4m_2195576_i4cm.step/exit.txt
+734f83555df34b9c4f8831952012812f0ddfb9cc99e64125e0130f74a90942f7  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4m_2195576_i4cm.step/sacct.txt  bundle/r2-runs/spec/i4c_c4m_2195576_i4cm.step/sacct.txt
+26888eb686514d306500422df5e8aff7ca1a95cc7b6117f636e1f68163874e4c  3222  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c3m_2195575_i4cm2.step/command.txt  bundle/r2-runs/spec/i4cc_c3m_2195575_i4cm2.step/command.txt
+bebc236f01205f2d02e2afcb91157c0aba6d5119741a349065ea1eba809c982f  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c3m_2195575_i4cm2.step/exit.txt  bundle/r2-runs/spec/i4cc_c3m_2195575_i4cm2.step/exit.txt
+89a17b1e75079f6c6301dff23d12ac25fc3294426a874aa5150089e8f024f126  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c3m_2195575_i4cm2.step/sacct.txt  bundle/r2-runs/spec/i4cc_c3m_2195575_i4cm2.step/sacct.txt
+3e0260af32023c4e67e33c42c29c92d8d067a210aca873420181e5bccd321186  3222  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c4m_2195576_i4cm2.step/command.txt  bundle/r2-runs/spec/i4cc_c4m_2195576_i4cm2.step/command.txt
+98e0574e765fac2fa55ba504bbf8fd411649b7376836d3ddbc87dc843ebf4ba1  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c4m_2195576_i4cm2.step/exit.txt  bundle/r2-runs/spec/i4cc_c4m_2195576_i4cm2.step/exit.txt
+4236563d2164a64db3a73a5bc2d96dafffeaf46dc51ec833e6f8d205a7fce500  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c4m_2195576_i4cm2.step/sacct.txt  bundle/r2-runs/spec/i4cc_c4m_2195576_i4cm2.step/sacct.txt
+6cf58437ad42755710f44f222bde87018ac426adb8ee37501ebc5c52d2ca7808  3168  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_v3b_2195575_i4ccb.step/command.txt  bundle/r2-runs/spec/i4cc_v3b_2195575_i4ccb.step/command.txt
+de368af9e43f2a8b13e0596226f1ef425f1932d8cf47dafa43869043d280c15f  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_v3b_2195575_i4ccb.step/exit.txt  bundle/r2-runs/spec/i4cc_v3b_2195575_i4ccb.step/exit.txt
+715dcc703b782a335b5e3b5bde88d53ee43893ff6e89e150ee7a7998e4b63aed  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_v3b_2195575_i4ccb.step/sacct.txt  bundle/r2-runs/spec/i4cc_v3b_2195575_i4ccb.step/sacct.txt
+24da7d241254a933a8867de35b1ec20e0a060097028b0206045f4d94fa27059e  3177  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_v4a_2195576_i4cca.step/command.txt  bundle/r2-runs/spec/i4cc_v4a_2195576_i4cca.step/command.txt
+cf12c99d91acd793073b3613b590271841834de9c6b88a6b125e9be7f18811c5  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_v4a_2195576_i4cca.step/exit.txt  bundle/r2-runs/spec/i4cc_v4a_2195576_i4cca.step/exit.txt
+6e831030d1d381c8aec12fd1f9d3083314f076d70c66fad4ef29b8867fb6145d  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_v4a_2195576_i4cca.step/sacct.txt  bundle/r2-runs/spec/i4cc_v4a_2195576_i4cca.step/sacct.txt
+c0f1cbe7424f8e6513d73874cf1b599e7c04dedf8cd2741e7d08523e53027452  3177  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_w3a_2195575_i4cca.step/command.txt  bundle/r2-runs/spec/i4cc_w3a_2195575_i4cca.step/command.txt
+2f6fe5f03c3224545a6cfbe15e45aef90a8fe7d69bbd3cb99e06b243a0673935  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_w3a_2195575_i4cca.step/exit.txt  bundle/r2-runs/spec/i4cc_w3a_2195575_i4cca.step/exit.txt
+2b824a37db9f8fd87a51711d83249d26c8f3c2e8779bf8f6e59252259e9802a8  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_w3a_2195575_i4cca.step/sacct.txt  bundle/r2-runs/spec/i4cc_w3a_2195575_i4cca.step/sacct.txt
+69bacca13094183a1d16d0cfbd9a8baa0bca50457016b8d3e2959a211b0cd08b  3168  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_w4b_2195576_i4ccb.step/command.txt  bundle/r2-runs/spec/i4cc_w4b_2195576_i4ccb.step/command.txt
+febfb3f5867344dd417fc4b6a8ae647c8e61c0791f79c8bb08f91d4c39771326  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_w4b_2195576_i4ccb.step/exit.txt  bundle/r2-runs/spec/i4cc_w4b_2195576_i4ccb.step/exit.txt
+05c89377b35813f51010f3ef69f4d7e7e31c1407d820676e2bffb3def1a0fd94  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_w4b_2195576_i4ccb.step/sacct.txt  bundle/r2-runs/spec/i4cc_w4b_2195576_i4ccb.step/sacct.txt
+7310c98ed50cd14e08aff34b4b158c230dad05915690938d1283c65a2f33f9c6  3168  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_y3b_2195575_i4ccb.step/command.txt  bundle/r2-runs/spec/i4cc_y3b_2195575_i4ccb.step/command.txt
+3d479999f01ce4e222ff12084d2b956c4bf585160f1a717fe85d895c30741f71  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_y3b_2195575_i4ccb.step/exit.txt  bundle/r2-runs/spec/i4cc_y3b_2195575_i4ccb.step/exit.txt
+e4059f9163ee9326b0fb88ca8eed38af0132af6648b88b8ed85b11a8d2454d45  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_y3b_2195575_i4ccb.step/sacct.txt  bundle/r2-runs/spec/i4cc_y3b_2195575_i4ccb.step/sacct.txt
+6d3e67612d706c5b20fec4bb635ee5bc047899fa74194eab3b1ba9a6b759231b  3177  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_y4a_2195576_i4cca.step/command.txt  bundle/r2-runs/spec/i4cc_y4a_2195576_i4cca.step/command.txt
+511649a305e5f6cf45bfe052e11f9260c8fd24e7c245813cc147a31ddfbc3863  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_y4a_2195576_i4cca.step/exit.txt  bundle/r2-runs/spec/i4cc_y4a_2195576_i4cca.step/exit.txt
+7fb73a1ca2058077ae00d83226b3d4698b637c3f4559a26c97269eec93bdd362  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_y4a_2195576_i4cca.step/sacct.txt  bundle/r2-runs/spec/i4cc_y4a_2195576_i4cca.step/sacct.txt
+5f4f67791ca2d445e97192f9146b955950be92f638f234dbcefca34424102e48  3230  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d3m_2195575_i4dm2.step/command.txt  bundle/r2-runs/spec/i4dc_d3m_2195575_i4dm2.step/command.txt
+a51a55d2e28c143b8b2c83cad69304bef1676d6f8bde26ddebb96906046226e5  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d3m_2195575_i4dm2.step/exit.txt  bundle/r2-runs/spec/i4dc_d3m_2195575_i4dm2.step/exit.txt
+3275b1c78fd64634c535b3dc3496de0b43854de6a79d7a6a1742e0679f96f08d  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d3m_2195575_i4dm2.step/sacct.txt  bundle/r2-runs/spec/i4dc_d3m_2195575_i4dm2.step/sacct.txt
+a4a29070ee1a0e970dab7a78d22bf880a721d1d602650642af651451ee7d6c6d  3230  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d4m_2195576_i4dm2.step/command.txt  bundle/r2-runs/spec/i4dc_d4m_2195576_i4dm2.step/command.txt
+172333bf5323adb5f6a82dc1ae6dfdb63e5b153fa7c6faec53606c28ed2dfd52  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d4m_2195576_i4dm2.step/exit.txt  bundle/r2-runs/spec/i4dc_d4m_2195576_i4dm2.step/exit.txt
+4af95043b8e6da06f0bfbc1dcf84b70c90a496abda34d468bfa042e0d658db8d  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d4m_2195576_i4dm2.step/sacct.txt  bundle/r2-runs/spec/i4dc_d4m_2195576_i4dm2.step/sacct.txt
+83ffbc7551cbc1d284ab99a4119bc292216adf061c2a921b7e68d2db0095b04f  3172  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_r3b_2195575_i4dcb.step/command.txt  bundle/r2-runs/spec/i4dc_r3b_2195575_i4dcb.step/command.txt
+7cf4becbd5dc8b1e8684126cbad54975a4ba131c431ab7ac9afd27681536add6  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_r3b_2195575_i4dcb.step/exit.txt  bundle/r2-runs/spec/i4dc_r3b_2195575_i4dcb.step/exit.txt
+fba9cd9a2879d442b4ddfcb521a25ac51a015152669919fc42cf171da612816b  116  /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_r3b_2195575_i4dcb.step/sacct.txt  bundle/r2-runs/spec/i4dc_r3b_2195575_i4dcb.step/sacct.txt
+448093ae9c745b5346ce15c4b0d92b8ff5cb8b03572037bccb141b74f5be6923  2840  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3m_2195575_i4dm.step/command.txt  bundle/r2-runs/spec/i4d_d3m_2195575_i4dm.step/command.txt
+99deaf23c0ab06d4ccb2bbafdaa7d937b52c9c99c1ba0f4b54ef73d717253789  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3m_2195575_i4dm.step/exit.txt  bundle/r2-runs/spec/i4d_d3m_2195575_i4dm.step/exit.txt
+96486c3c33677050c1dc44db55f1c076b9650edb7633484fcd9d9abe95025c18  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3m_2195575_i4dm.step/sacct.txt  bundle/r2-runs/spec/i4d_d3m_2195575_i4dm.step/sacct.txt
+a0a8055c1c4dfdcbce0bee3038296ef77446c6c344c695fec54a30a0dab7d805  2840  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4m_2195576_i4dm.step/command.txt  bundle/r2-runs/spec/i4d_d4m_2195576_i4dm.step/command.txt
+1c87c2d7b8ade18aeb9482028b893f0efbe082e061c61a33452d191216ad806b  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4m_2195576_i4dm.step/exit.txt  bundle/r2-runs/spec/i4d_d4m_2195576_i4dm.step/exit.txt
+d647ecbfe61b0d3c669e3f11fb2cac9324c64b97da55d2d603b9346ac122cd3f  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4m_2195576_i4dm.step/sacct.txt  bundle/r2-runs/spec/i4d_d4m_2195576_i4dm.step/sacct.txt
+b90d4c92e8d609bf6b6c27e1e8d240c7b3c15349325ef7a910939fe09459171c  2792  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g3a_2195575_i4ga.step/command.txt  bundle/r2-runs/spec/i4g_g3a_2195575_i4ga.step/command.txt
+7318abf448924034b3da93390a731233e446cca0b8323e096c072d9382565720  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g3a_2195575_i4ga.step/exit.txt  bundle/r2-runs/spec/i4g_g3a_2195575_i4ga.step/exit.txt
+71800af593788ba24bae627b341f7e316bd4e8bceac520ba6ab967912c9a7208  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g3a_2195575_i4ga.step/sacct.txt  bundle/r2-runs/spec/i4g_g3a_2195575_i4ga.step/sacct.txt
+892b7358e0276ce96731f1407a8084952b6adbb519074584bbd9b9df2649a190  2786  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g3m_2195575_i4gm.step/command.txt  bundle/r2-runs/spec/i4g_g3m_2195575_i4gm.step/command.txt
+79bf82d4bf2865c606e595520938f2262adcf45230db90d9cfc2ce807ef802ca  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g3m_2195575_i4gm.step/exit.txt  bundle/r2-runs/spec/i4g_g3m_2195575_i4gm.step/exit.txt
+e49a09bd2ffecd31dafb5440383b1397aaec05e0de3457d3c22f23e35e2eac13  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g3m_2195575_i4gm.step/sacct.txt  bundle/r2-runs/spec/i4g_g3m_2195575_i4gm.step/sacct.txt
+4e5f22ff11bd7adc4f4fd6c0e4ee1a850bcb056584d3d95d917f6160f48d232b  2793  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g4b_2195576_i4gb.step/command.txt  bundle/r2-runs/spec/i4g_g4b_2195576_i4gb.step/command.txt
+18f69302376c5ffb5f63ef5cc3d8e5169b89df61f9b8766789172664303d9172  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g4b_2195576_i4gb.step/exit.txt  bundle/r2-runs/spec/i4g_g4b_2195576_i4gb.step/exit.txt
+a5034d5c4bbf47dc3f76e07c1cb20c185d55727b6923fc291e65874a241b2b5d  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g4b_2195576_i4gb.step/sacct.txt  bundle/r2-runs/spec/i4g_g4b_2195576_i4gb.step/sacct.txt
+60458d1f7a3193948ed7559bee3f257daa3d2b35c4595c50ba6b27f3af04d38e  2786  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g4m_2195576_i4gm.step/command.txt  bundle/r2-runs/spec/i4g_g4m_2195576_i4gm.step/command.txt
+f9a56748e269e3d22e910c6efbd452701500ff673e15d4a4287c9f54bbc986d8  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g4m_2195576_i4gm.step/exit.txt  bundle/r2-runs/spec/i4g_g4m_2195576_i4gm.step/exit.txt
+858f6989d1091fc964d89c81c58c95b4bae73906d1b6e5b1712af33e0cab8bb6  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g4m_2195576_i4gm.step/sacct.txt  bundle/r2-runs/spec/i4g_g4m_2195576_i4gm.step/sacct.txt
+18de7ac5d97877b56f54c3daf117869eea9342ee79e1acbbcb7f18b5be61232b  2791  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_h3b_2195575_i4gb.step/command.txt  bundle/r2-runs/spec/i4g_h3b_2195575_i4gb.step/command.txt
+222e88ac9c874e7edf61fdb04ddab86a5c297b8e5689e8359b9539ea9579669d  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_h3b_2195575_i4gb.step/exit.txt  bundle/r2-runs/spec/i4g_h3b_2195575_i4gb.step/exit.txt
+b27e070fac7056789d8ba38f84284098662e9d8f1b296086af92836cf9e71a6f  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_h3b_2195575_i4gb.step/sacct.txt  bundle/r2-runs/spec/i4g_h3b_2195575_i4gb.step/sacct.txt
+b955eaf6c00289bfdb6e01644122586b55b98812b4c8743bcbcbc2ebc46ed1c7  2790  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_h4a_2195576_i4ga.step/command.txt  bundle/r2-runs/spec/i4g_h4a_2195576_i4ga.step/command.txt
+a7d75b5286a5f6dfbc7b98ba53166d00bb186294931788ddb7d9814026485047  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_h4a_2195576_i4ga.step/exit.txt  bundle/r2-runs/spec/i4g_h4a_2195576_i4ga.step/exit.txt
+c0ec8a29d429b77ad0a93dbc2adb0b92be397379df3fdfb11695eb65195706a4  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_h4a_2195576_i4ga.step/sacct.txt  bundle/r2-runs/spec/i4g_h4a_2195576_i4ga.step/sacct.txt
+162e70445bb5d7c9927e530fc34d60e91351182ceaa688c01a4753e56112322d  2790  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_x3a_2195575_i4ga.step/command.txt  bundle/r2-runs/spec/i4g_x3a_2195575_i4ga.step/command.txt
+dad5f58e373a08902d65a9a1971f05a443e2490932ec57a29ed04466683c6a97  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_x3a_2195575_i4ga.step/exit.txt  bundle/r2-runs/spec/i4g_x3a_2195575_i4ga.step/exit.txt
+775d736802a59badd4647fc0d784681d9138c8d39f6a62105fbcfc9a004f55bb  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_x3a_2195575_i4ga.step/sacct.txt  bundle/r2-runs/spec/i4g_x3a_2195575_i4ga.step/sacct.txt
+a7a6890dc3c3761c879e6900edd64887aa35e0350cb083aca847354169007b63  2791  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_x4b_2195576_i4gb.step/command.txt  bundle/r2-runs/spec/i4g_x4b_2195576_i4gb.step/command.txt
+4dfd6673a83b4db66f17e043df0c1fe5bcf4adeec4721497eed404ba8d058368  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_x4b_2195576_i4gb.step/exit.txt  bundle/r2-runs/spec/i4g_x4b_2195576_i4gb.step/exit.txt
+41d8602f44bd2a6dfa244991d82ee10a3a81d97f9ddb17d388157c92a9d5c5cd  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4g_x4b_2195576_i4gb.step/sacct.txt  bundle/r2-runs/spec/i4g_x4b_2195576_i4gb.step/sacct.txt
+8f9fe816443414ee8eea6c4591bd5457bb2cbc25a4c261ff2507f71757a09eed  2810  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j3a_2195575_i4ha.step/command.txt  bundle/r2-runs/spec/i4h_j3a_2195575_i4ha.step/command.txt
+2c8c6e364846d56149d8fc769e8578159cb6827ed47f140b44d522bf5ac78927  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j3a_2195575_i4ha.step/exit.txt  bundle/r2-runs/spec/i4h_j3a_2195575_i4ha.step/exit.txt
+25407935ea6fbe4f8efb500af509438a32a173dc3b8a765407e9cdff5f3614bd  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j3a_2195575_i4ha.step/sacct.txt  bundle/r2-runs/spec/i4h_j3a_2195575_i4ha.step/sacct.txt
+bde5f3cbea234a8d14725cd5e2a78edab43b8b664a9bf0b5c963ef47f8b349ac  2803  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j3m_2195575_i4hm.step/command.txt  bundle/r2-runs/spec/i4h_j3m_2195575_i4hm.step/command.txt
+c36c09948e16c502ff4e964f0619b62de3deb5daf81ed2b64e3b4a4c59e97382  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j3m_2195575_i4hm.step/exit.txt  bundle/r2-runs/spec/i4h_j3m_2195575_i4hm.step/exit.txt
+936481423e54d20bc64aad1303b8ba2c7edabd0aa7f63c29879673a515e2e335  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j3m_2195575_i4hm.step/sacct.txt  bundle/r2-runs/spec/i4h_j3m_2195575_i4hm.step/sacct.txt
+7a0ffabd4f822fe03caa6d89b55c0cddf2576566cd81008ca135a36c4f320e9a  2810  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j4b_2195576_i4hb.step/command.txt  bundle/r2-runs/spec/i4h_j4b_2195576_i4hb.step/command.txt
+fe3c96d9fefdfe5f7cf74d0fb592509e4459056413f0506ebf424813c8f69c80  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j4b_2195576_i4hb.step/exit.txt  bundle/r2-runs/spec/i4h_j4b_2195576_i4hb.step/exit.txt
+71a417743aa9fb421ee10cd8fdd4ab9f61629d6c74fcb216bc6b20e2c2a3d28a  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j4b_2195576_i4hb.step/sacct.txt  bundle/r2-runs/spec/i4h_j4b_2195576_i4hb.step/sacct.txt
+5bedb5311b7d1282c8ba4f8a626b32b1c2671880840c26bf39589e49b24a03b3  2803  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j4m_2195576_i4hm.step/command.txt  bundle/r2-runs/spec/i4h_j4m_2195576_i4hm.step/command.txt
+8ffde8890ccbfa30365a5be21eab90de8f0fdf1499a1bb7136ada10850e95ed6  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j4m_2195576_i4hm.step/exit.txt  bundle/r2-runs/spec/i4h_j4m_2195576_i4hm.step/exit.txt
+e4682be31f86652f17167d81c0642511cc2f91d4d4ea8c0b1f4f243f177f722a  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j4m_2195576_i4hm.step/sacct.txt  bundle/r2-runs/spec/i4h_j4m_2195576_i4hm.step/sacct.txt
+6452339074e6a5fd48669ef59e72b16fce4fddfd01af5a5bf1401a7820a7f8e8  2810  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_o4a_2195576_i4ha.step/command.txt  bundle/r2-runs/spec/i4h_o4a_2195576_i4ha.step/command.txt
+1c7cf63a580922113298b2ee23fdda95c16adedb746152c19c6be7d68a8d8c94  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_o4a_2195576_i4ha.step/exit.txt  bundle/r2-runs/spec/i4h_o4a_2195576_i4ha.step/exit.txt
+210d70d402ee9348fde5a2b96e80cbf2eaab8c83ef08dd26e17c4906e2f85ab8  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_o4a_2195576_i4ha.step/sacct.txt  bundle/r2-runs/spec/i4h_o4a_2195576_i4ha.step/sacct.txt
+2c73ea3dd48b66f275c2110e03b407217a4457daf70e34b2fc5b43e13b320c0a  2810  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_o4b_2195576_i4hb.step/command.txt  bundle/r2-runs/spec/i4h_o4b_2195576_i4hb.step/command.txt
+754f2afa604574b2f3e1e7d7e3cb50a44062a762882b7e6c15040e91b812a97e  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_o4b_2195576_i4hb.step/exit.txt  bundle/r2-runs/spec/i4h_o4b_2195576_i4hb.step/exit.txt
+7c93b4ca167214577731dd8564be5a40671b3bdea0a338acabec13530c4dc075  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_o4b_2195576_i4hb.step/sacct.txt  bundle/r2-runs/spec/i4h_o4b_2195576_i4hb.step/sacct.txt
+e970d1d096c8985cd8a6dfd712d713a7e97cfc12aae0d490da4116f971246dea  2810  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_z3b_2195575_i4hb.step/command.txt  bundle/r2-runs/spec/i4h_z3b_2195575_i4hb.step/command.txt
+7e8e45f37e47e1f01a1ebfa296a7dd7b674a5e2bf06cc0b3e0b36543cfb7593d  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_z3b_2195575_i4hb.step/exit.txt  bundle/r2-runs/spec/i4h_z3b_2195575_i4hb.step/exit.txt
+7a618288a34fc40345780fc86731df0e2c0ce53015a724ba4af48721ace2d19a  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_z3b_2195575_i4hb.step/sacct.txt  bundle/r2-runs/spec/i4h_z3b_2195575_i4hb.step/sacct.txt
+8cf6c2dbd1670cc342a3913a29a95f56b7f68d73ee4b249fb93ffdac1a264139  2810  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_z4a_2195576_i4ha.step/command.txt  bundle/r2-runs/spec/i4h_z4a_2195576_i4ha.step/command.txt
+f7a16e62dc76eaf22b6f9f620336c1475ca6a76e6b5995d3a0195eff3aa60eef  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_z4a_2195576_i4ha.step/exit.txt  bundle/r2-runs/spec/i4h_z4a_2195576_i4ha.step/exit.txt
+66370605a67d55080c3aa1be1708cfa0a590c0fa27917ab5c5d631e062c150e5  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4h_z4a_2195576_i4ha.step/sacct.txt  bundle/r2-runs/spec/i4h_z4a_2195576_i4ha.step/sacct.txt
+a2f75f486c82568b378a7caad1460d5b76a2a63049d27acbe5573fafd20c3b2a  2833  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k3a_2195575_i4ka.step/command.txt  bundle/r2-runs/spec/i4k_k3a_2195575_i4ka.step/command.txt
+59816aaa0d5bef31d2a19ca0d994d6e43fd6301f1a20a3d9becef828f1e5a1d9  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k3a_2195575_i4ka.step/exit.txt  bundle/r2-runs/spec/i4k_k3a_2195575_i4ka.step/exit.txt
+26253a71bcf4acf90a2d412a0fc4a28e5227b1cbd41d0d523b51439eefabd102  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k3a_2195575_i4ka.step/sacct.txt  bundle/r2-runs/spec/i4k_k3a_2195575_i4ka.step/sacct.txt
+8ba4ec688e9f7b3dfb142a3fe9bde359f2a0fbdb73f6c19d8c3b898953e76460  2827  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k3m_2195575_i4km.step/command.txt  bundle/r2-runs/spec/i4k_k3m_2195575_i4km.step/command.txt
+184bfcea8a91828a924735184a59f229238d02f11bf6d08e6ceffd07c9b76445  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k3m_2195575_i4km.step/exit.txt  bundle/r2-runs/spec/i4k_k3m_2195575_i4km.step/exit.txt
+c0a7cad7a734cee18a6f7481fd0bad366c943cff9f71dc68fb0f4e89c64eb9df  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k3m_2195575_i4km.step/sacct.txt  bundle/r2-runs/spec/i4k_k3m_2195575_i4km.step/sacct.txt
+17b442ee9213fb429d5efdf5c57802afe3bb3db1773f050ce0963810ab16b82c  2834  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k4b_2195576_i4kb.step/command.txt  bundle/r2-runs/spec/i4k_k4b_2195576_i4kb.step/command.txt
+f475168bede9e4733340c67e8291aa1a0b5cde25dcb791d98372f2c41d784a7d  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k4b_2195576_i4kb.step/exit.txt  bundle/r2-runs/spec/i4k_k4b_2195576_i4kb.step/exit.txt
+b1f58e6d4d516960db30d80100a3d8da9f9c4b3f5583953c6cd8e9be541d0087  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k4b_2195576_i4kb.step/sacct.txt  bundle/r2-runs/spec/i4k_k4b_2195576_i4kb.step/sacct.txt
+8f730c91bd9e2a6b801ea9699b790ae7b1a9f8fc214ed7cb9e079168f82c1a8b  2827  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k4m_2195576_i4km.step/command.txt  bundle/r2-runs/spec/i4k_k4m_2195576_i4km.step/command.txt
+eaf35110badeaacf94df8d970d750cf77359410c14fb987b55cdf6e040527e5c  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k4m_2195576_i4km.step/exit.txt  bundle/r2-runs/spec/i4k_k4m_2195576_i4km.step/exit.txt
+4f9bebadf47ca186ee498768d687d6614be982d0df82ee78c41c0e74a9ec30ba  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k4m_2195576_i4km.step/sacct.txt  bundle/r2-runs/spec/i4k_k4m_2195576_i4km.step/sacct.txt
+7faeb8b67225b208c4b62e9f2f83e8c59f99e4201f922f3dd8e6a0e8c2971bfc  2834  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_r3b_2195575_i4kb.step/command.txt  bundle/r2-runs/spec/i4k_r3b_2195575_i4kb.step/command.txt
+8a90e5d3206d9857b8438461f4d50420cd7f6747672cfdee3ae653e714051a05  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_r3b_2195575_i4kb.step/exit.txt  bundle/r2-runs/spec/i4k_r3b_2195575_i4kb.step/exit.txt
+3fa2977c20b7a5dd5f2868f68170bf51c1f798ee9c27d993b63377df62993dff  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_r3b_2195575_i4kb.step/sacct.txt  bundle/r2-runs/spec/i4k_r3b_2195575_i4kb.step/sacct.txt
+43a1ede8f9a72bb6b220aae951bfb228a28779d0627df033f5f202887a126931  2833  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_r4a_2195576_i4ka.step/command.txt  bundle/r2-runs/spec/i4k_r4a_2195576_i4ka.step/command.txt
+ae1f2ea43d34dbc05201fd59b130f1294f9a54d73c1979b801a01fff9df75974  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_r4a_2195576_i4ka.step/exit.txt  bundle/r2-runs/spec/i4k_r4a_2195576_i4ka.step/exit.txt
+12d3649add81d16178fd42b53d470fad3f5692826ab4690ecfc90ec9db29be09  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_r4a_2195576_i4ka.step/sacct.txt  bundle/r2-runs/spec/i4k_r4a_2195576_i4ka.step/sacct.txt
+4b0a525bb888e2bf5de1f7037a21b5a3378db35d74f9e8cef4cbd152120c9c17  2834  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_t3b_2195575_i4kb.step/command.txt  bundle/r2-runs/spec/i4k_t3b_2195575_i4kb.step/command.txt
+c26fc442c180d1016c8a0f74c65a6d3379804cd029c6f5773fd680ba73baef42  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_t3b_2195575_i4kb.step/exit.txt  bundle/r2-runs/spec/i4k_t3b_2195575_i4kb.step/exit.txt
+8f36080833e4d5f1a6b9f3d679d9f014a612081e63831e61da8d66293575fa82  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4k_t3b_2195575_i4kb.step/sacct.txt  bundle/r2-runs/spec/i4k_t3b_2195575_i4kb.step/sacct.txt
+b03c954d275a47c225d3286490990f532e4ef0ada622cb92f6296b5af6a65c3d  2880  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3m_2195575_i4mm.step/command.txt  bundle/r2-runs/spec/i4m_m3m_2195575_i4mm.step/command.txt
+50959464f1a11edd72d191f3629ffbbd61dba186c0600ca7f0a9eb42889c3c5a  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3m_2195575_i4mm.step/exit.txt  bundle/r2-runs/spec/i4m_m3m_2195575_i4mm.step/exit.txt
+031df825d715bb96bc63fd0cedaeaee76a7d3881e41a4b198fe2cff14f25f34f  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3m_2195575_i4mm.step/sacct.txt  bundle/r2-runs/spec/i4m_m3m_2195575_i4mm.step/sacct.txt
+10a228117e94d04652c6bf8029a5013afa19bbef573c49d8dab2623992864880  2908  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_n373_2195575_i4m73.step/command.txt  bundle/r2-runs/spec/i4m_n373_2195575_i4m73.step/command.txt
+18f047f3c576ba8a37f5b393db650eae6587385d35440449fa56368a25cb808b  72  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_n373_2195575_i4m73.step/exit.txt  bundle/r2-runs/spec/i4m_n373_2195575_i4m73.step/exit.txt
+5857b8ab5b76111f9944e6d0abf53973cd428f3c6b40f1c8414dfcb7fa0d7d3c  113  /mnt/beegfs/ojerbi/r2-runs/spec/i4m_n373_2195575_i4m73.step/sacct.txt  bundle/r2-runs/spec/i4m_n373_2195575_i4m73.step/sacct.txt
+cea4a7b164efaf53f4dd7fa7172b883a129bc373f78a31be2cd49555ec441f26  2812  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_p3a_2195575_i4sa.step/command.txt  bundle/r2-runs/spec/i4s_p3a_2195575_i4sa.step/command.txt
+aacd89e14d6278ebbe2c98ee875d97ca4229621e1ad83282b1f1b6fd7c3b6723  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_p3a_2195575_i4sa.step/exit.txt  bundle/r2-runs/spec/i4s_p3a_2195575_i4sa.step/exit.txt
+28b2e03d2f993d9a782c1d053203e6c387e47b0dad60408cf1de92c04d7bd25a  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_p3a_2195575_i4sa.step/sacct.txt  bundle/r2-runs/spec/i4s_p3a_2195575_i4sa.step/sacct.txt
+bd5e019bb701210d0a13dc957dc4a1eec481b9e922b193d686715f786d918f8a  2812  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_q3a_2195575_i4sa.step/command.txt  bundle/r2-runs/spec/i4s_q3a_2195575_i4sa.step/command.txt
+772be1228581e55d9cb067e74d477e849a80aaaa05dec7c727e26478f8e9a957  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_q3a_2195575_i4sa.step/exit.txt  bundle/r2-runs/spec/i4s_q3a_2195575_i4sa.step/exit.txt
+d5da35a2375ca6b0c7e612d91376c76442327340ce4d49e6175f30886f93b0ef  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_q3a_2195575_i4sa.step/sacct.txt  bundle/r2-runs/spec/i4s_q3a_2195575_i4sa.step/sacct.txt
+62ef170142f8ac7c9a25892b8a8e006c40d20781223e966c4e77e4cebb9c3356  2820  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_q4b_2195576_i4sb.step/command.txt  bundle/r2-runs/spec/i4s_q4b_2195576_i4sb.step/command.txt
+dda2ce3c190910fdb46f73c62e7decc52159b316adf38d528aaac990b1348f37  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_q4b_2195576_i4sb.step/exit.txt  bundle/r2-runs/spec/i4s_q4b_2195576_i4sb.step/exit.txt
+a377bf672bb259242fc2921e7d37d7a43f152a385d64206c99fbab6ee4daed9d  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_q4b_2195576_i4sb.step/sacct.txt  bundle/r2-runs/spec/i4s_q4b_2195576_i4sb.step/sacct.txt
+7ea6450ab94ebded1cb847d0fddee8243b8f54732a46d403ebee9d9cc1479f28  2820  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_r3b_2195575_i4sb.step/command.txt  bundle/r2-runs/spec/i4s_r3b_2195575_i4sb.step/command.txt
+01abe2e3b21580b0d11c0b3cd21714a1982d35f2b119946cf2440d663619d670  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_r3b_2195575_i4sb.step/exit.txt  bundle/r2-runs/spec/i4s_r3b_2195575_i4sb.step/exit.txt
+4a7ecc18c4f1c7385d1ef08f11e6e50daeb11ddec52a9de9e57ec3cc946c591a  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_r3b_2195575_i4sb.step/sacct.txt  bundle/r2-runs/spec/i4s_r3b_2195575_i4sb.step/sacct.txt
+d8ba2879af4e9748631779905d33c1b1308f2746401df8738b2e9fd459fb77a5  2812  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_r4a_2195576_i4sa.step/command.txt  bundle/r2-runs/spec/i4s_r4a_2195576_i4sa.step/command.txt
+d83bb7fdca0d2d857fc37688243a2295addc765cc623b005d73fe3b93ea82983  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_r4a_2195576_i4sa.step/exit.txt  bundle/r2-runs/spec/i4s_r4a_2195576_i4sa.step/exit.txt
+94a5a966e9c393ee832641bebb2c41bad42b1d5b17045218a37b4fcca8967ba0  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_r4a_2195576_i4sa.step/sacct.txt  bundle/r2-runs/spec/i4s_r4a_2195576_i4sa.step/sacct.txt
+ac3775f295f26919b7f4c15b1f95d78d1e3912e1d863e2fa29611378ee18fc27  2830  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s3m_2195575_i4sm.step/command.txt  bundle/r2-runs/spec/i4s_s3m_2195575_i4sm.step/command.txt
+0781a23671a2a20f5dc31674cdafab725ae222a757b6dd2bf9129da6d2b79536  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s3m_2195575_i4sm.step/exit.txt  bundle/r2-runs/spec/i4s_s3m_2195575_i4sm.step/exit.txt
+1af8b25a7e9919c215b03cc8b2a04d2b3cd525e1143fbb173befd897a8571089  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s3m_2195575_i4sm.step/sacct.txt  bundle/r2-runs/spec/i4s_s3m_2195575_i4sm.step/sacct.txt
+bab6ee0e863a855f57bf407b339feee7a7538572356c02ecacb0cd158b2a3c78  2830  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s4m_2195576_i4sm.step/command.txt  bundle/r2-runs/spec/i4s_s4m_2195576_i4sm.step/command.txt
+d99110ef2bc9112157bc1720b866bfdc140023269dfe0414bd7b5b75b196b247  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s4m_2195576_i4sm.step/exit.txt  bundle/r2-runs/spec/i4s_s4m_2195576_i4sm.step/exit.txt
+7904f78756f76ed28c6d9e8cf008c66c5b7b17731cf576528d32f94935cc17ca  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s4m_2195576_i4sm.step/sacct.txt  bundle/r2-runs/spec/i4s_s4m_2195576_i4sm.step/sacct.txt
+c71227e4e293e4edf5cf46891573ff0250bbaffd06153db8b4f2ed8cb7ccc1ef  2790  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_o3a_2195575_i4ua.step/command.txt  bundle/r2-runs/spec/i4u_o3a_2195575_i4ua.step/command.txt
+1bc8573f020a12229c2ff8f5e8699863f77df2b7d18b68dc4d6ea26dc6578c8e  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_o3a_2195575_i4ua.step/exit.txt  bundle/r2-runs/spec/i4u_o3a_2195575_i4ua.step/exit.txt
+931a5bab199c62a61b95b9333f1dc98006679ac081262a10571bb9bb9eafc3b2  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_o3a_2195575_i4ua.step/sacct.txt  bundle/r2-runs/spec/i4u_o3a_2195575_i4ua.step/sacct.txt
+212d639b6826d590806ebf4fb66b874ac69a56149474b2c61c2fa5d8a08f71c1  2790  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u3a_2195575_i4ua.step/command.txt  bundle/r2-runs/spec/i4u_u3a_2195575_i4ua.step/command.txt
+6910d79d774e773b0ae7f238d6a87a8e406f17498e9be26d59a7ba3c650bf087  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u3a_2195575_i4ua.step/exit.txt  bundle/r2-runs/spec/i4u_u3a_2195575_i4ua.step/exit.txt
+0b8a5c331491c977b67455eebce732efc78637f22fd828491dafb9e7b0f19372  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u3a_2195575_i4ua.step/sacct.txt  bundle/r2-runs/spec/i4u_u3a_2195575_i4ua.step/sacct.txt
+da3ae224c2c1af6b3cfddab5d969704fb6e754934fb490bd8fcdec47bb17aa3d  2784  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u3m_2195575_i4um.step/command.txt  bundle/r2-runs/spec/i4u_u3m_2195575_i4um.step/command.txt
+b13bb663947b83841af52cb2f09e76ac699160b36e32328765398f6fd694cdd8  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u3m_2195575_i4um.step/exit.txt  bundle/r2-runs/spec/i4u_u3m_2195575_i4um.step/exit.txt
+c1dacc145c30784876c0d479cd58c977c7cf737dce434dc47939a450356a1fb3  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u3m_2195575_i4um.step/sacct.txt  bundle/r2-runs/spec/i4u_u3m_2195575_i4um.step/sacct.txt
+3712260c22d60f404d11914f3a21a6be18d2bab476d6bf7f08fc22bb8f38f788  2791  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u4b_2195576_i4ub.step/command.txt  bundle/r2-runs/spec/i4u_u4b_2195576_i4ub.step/command.txt
+e7d7ff56e8eba6565cbd61796a47761c2414f10ba9f8e5412e6a738f06330b8f  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u4b_2195576_i4ub.step/exit.txt  bundle/r2-runs/spec/i4u_u4b_2195576_i4ub.step/exit.txt
+b96bb759dd2acb2a3ef1aa65c6bbe3e5657b1bf187059ed45942c2dc1505b80d  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u4b_2195576_i4ub.step/sacct.txt  bundle/r2-runs/spec/i4u_u4b_2195576_i4ub.step/sacct.txt
+28db9e56b741be555922b52a52b9bf1626dc1094cfbf2a4c480763e530bf963f  2784  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u4m_2195576_i4um.step/command.txt  bundle/r2-runs/spec/i4u_u4m_2195576_i4um.step/command.txt
+149ad18ec92e154a0f99a7090b71aaec47487464487f840463e6f006ee997366  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u4m_2195576_i4um.step/exit.txt  bundle/r2-runs/spec/i4u_u4m_2195576_i4um.step/exit.txt
+893a16235ac19e0bbf87d6447f0424c7a12a11c9382d330a0ffc66417656c5bf  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u4m_2195576_i4um.step/sacct.txt  bundle/r2-runs/spec/i4u_u4m_2195576_i4um.step/sacct.txt
+5a6cc03adff6bcc9d9ebd3a18ea02bfb3d309631a930c30af404b17b93d000ff  2791  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_y3b_2195575_i4ub.step/command.txt  bundle/r2-runs/spec/i4u_y3b_2195575_i4ub.step/command.txt
+42733ced5ffa3db6d86c101379771d76a329a5948928bbe9616e2e53b6d2c6cf  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_y3b_2195575_i4ub.step/exit.txt  bundle/r2-runs/spec/i4u_y3b_2195575_i4ub.step/exit.txt
+73815c9b8186883edff321ce10111867bef5e0bac66ea5026ce8bbe8b6ba36a0  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_y3b_2195575_i4ub.step/sacct.txt  bundle/r2-runs/spec/i4u_y3b_2195575_i4ub.step/sacct.txt
+a4be29cb683b6cfd87e61137904472ca316f2d93eb4ea21a183cd9eb6267feb6  2790  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_y4a_2195576_i4ua.step/command.txt  bundle/r2-runs/spec/i4u_y4a_2195576_i4ua.step/command.txt
+2be82e463e6fdf97a2e77bf8c5e0d4f871d575563ee7e791412520632c1837cc  58  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_y4a_2195576_i4ua.step/exit.txt  bundle/r2-runs/spec/i4u_y4a_2195576_i4ua.step/exit.txt
+2ab5079c0e98ad7f784a8f0a13a1e31440289a8183f244b694fecd4958f0c8cd  114  /mnt/beegfs/ojerbi/r2-runs/spec/i4u_y4a_2195576_i4ua.step/sacct.txt  bundle/r2-runs/spec/i4u_y4a_2195576_i4ua.step/sacct.txt
+## DERIVED scripts and logs (hashed in place, not copied)
+DERIVED: 7f4bed042a5c20ca292817f7408467fd1057cd57179530094988a59c2e083b96  1399  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/ana_rev7/a1_struct.py
+DERIVED: 2675511962fc4cc033967d3035b78ab47eac0560b1f41f010348bec6a0672ea8  11964  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/ana_rev7/a2_score.py
+DERIVED: 4d54af917a26f334ca28fba4590d513e0bb2829b8279e768f4cebb1d74f751d9  1653  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_r1/recon7_r1_mem.py
+DERIVED: b8334f18a1b1a464a62be2560cd8b3788a5542e443b6c3a10ac74b1d04d8d048  10426  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_r1/recon7_r1_model.py
+DERIVED: f0d75a4aa12c1b51cd3d4c408edd217557c168d05bbc6db05d0f487eb36a4199  916  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_r1/recon7_r1_products.py
+DERIVED: 7f87ab64475d3f9c9621d076962b60044f25c0f820ecf29c2b185655cc0247d7  3757  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_r1/recon7_r1_round.py
+DERIVED: b9e01643d16dfc5fa845636fa72b40a6f9a5c5ef7318ea861f328cd9e0b43b98  2526  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_r1/recon7_r1_units.py
+DERIVED: b0b91fcc0f4d88c4e6c268b1df721cd18f72bd643b19a9a5f1fd0b7577cfb598  1485  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_r1/recon7_r1_yield.py
+DERIVED: 5b51ea39e1e3f5ca906b2ddd625c0d04fa9603c668eefb2154c07fc903410b26  3881  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_r2/s1_records.py
+DERIVED: b94b7220c210879300769770b90b8c46e7edffd9b4a5671a4fa07b5786c26248  12973  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_r2/s2_traces.py
+DERIVED: c678c2798f57c5d6d9f3510a0419420dcbaa0588e99866dfc408cb675ed92fc8  19411  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_r2/s3_derive.py
+DERIVED: c8298ceb327c58e8accf7e26b1dd4ff4ca63c07be6909038a91a909b2d5e27a9  1172  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_r3/s1_skeleton.py
+DERIVED: ca9ce3ef1ebf5c91d92b7136cf871cdf16c4457d62241980fc2cb079cd378cba  6231  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_r3/s2_extract.py
+DERIVED: 96022ab1c5f082cbe83a60c0a6c786c9510de1d018dfd3636c71c7437049b8dd  1649  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_r3/s3_resident_classes.py
+DERIVED: 6e1705516beb3a94fcbcde9c74da38dd90ada7b70059597555b1a5d25d97e388  16522  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_r3/s4_derive.py
+DERIVED: 1a60be18281c793a595e9868e35ba1f69a8145ce1ad445bfef6da7a0fb681c40  1375  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_r3/s5_backbone.py
+DERIVED: 9418064337c023600cc4d04139c0b07a177444f0d0337b787600fb42585aacc5  11143  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_s/s1_revised_model.py
+DERIVED: 85041700d3bca843d33853ea16334f3ed440f8fd3c01f2cbb54bb70b84b80519  2056  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_s/s2_round_split.py
+DERIVED: f522c150a5a64b44442994c1f559763591adf7861c8e3aeb69697d6797364032  8164  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_s/s3_review_response.py
+DERIVED: 0eaec60d4e79058145e4d44d3288d9446c48469156e1db7b482d4e00869b1c04  13124  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_s/s4_review2.py
+DERIVED: 39029e25656239530d86cea09926838bf242b414ad2cc5c7136ddd6dc06753a7  1921  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_v/v1b_tfc.py
+DERIVED: 19989357fce22401be5eb74b1aa16c9bf294e41d2ddd9c64c7bf7ae7ea29af69  8945  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_v/v1_records.py
+DERIVED: 7e4040aa54b8d0a6345d86e346ebcba69522d102f1f2d13f71f6a0ba0b315373  6966  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_v/v2_traces.py
+DERIVED: 3b5a798d076eb453db61203efaa9c13a986dfe185a4df3c37576d56e613f213f  6694  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_v/v3_model.py
+DERIVED: 182eb29b616134d86f961fa084f437d73943f5cba9d35c8e64419d867e4ec84b  1615  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_v/v4b_probe_rounds.py
+DERIVED: 012059f8a56c3f9020fb3c9aa985042dde26426d221e6cf815203b30dd21c7b3  3019  /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_v/v4_probe_wholerun.py
+DERIVED: b59d8cb9e45f9b615669a2763c8d03f5568f567f8ca87460314e561471ad452e  35406  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/ana_rev7_a1.txt
+DERIVED: 1bd26952d1b3f93a678ec159121802fd5eb026b5de3c293f03d7a0a4d301a0a9  180733  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/ana_rev7_a2.txt
+DERIVED: 5710500dc03bbdce80508fb514c2bb09bbe38dcfd65e7c3ad17d1065d1f5d0f2  127  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_pkt_assemble.txt
+DERIVED: 6719745718668185405e82ec06288036daeb09762f0e6be092423c12a837a7aa  8566  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_r1_mem.txt
+DERIVED: 848df8cad2ad81627a84d9a7872adaa2f6db8d73f2f78c5f85d6e948ea3093b7  10781  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_r1_model.txt
+DERIVED: 6b50307dbab21d0449f2668a006bb80a92909d89599b24cc4ef7764d1e578b52  852  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_r1_products.txt
+DERIVED: 00df7def7a3905a25923f7b141920ddc530b8e0184b3ef6eb3ac6ad4307d64e7  4019  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_r1_round.txt
+DERIVED: 36113f77ba0be3747490977e0d9c325d64e0e2c60f24a2c668eb971db6b34246  2839  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_r1_units.txt
+DERIVED: 72d40330441c7b1255f1b949a62f25ad8b060a47fa73ddd6110084d9bc694a86  1386  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_r1_yield.txt
+DERIVED: 5749db90f29b84ec0b0bf299bd1c261d93a4daa3462e477fa7efd98e6d96991c  297397  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_r2_s1.txt
+DERIVED: b6e19a13291e7db7ededce71644f0ccc5da685f42ef66b32b2cd4b8e2546e04a  121619  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_r2_s2.txt
+DERIVED: 124d79fbf6e6ee9ff15ed880212e2d6ffb0cbab7ac8c0ec7021716af50ad2513  11861  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_r2_s3.txt
+DERIVED: 081e85a57937f7c24fc4d81e0a22e74132fa385960c168403ca77f51e5834e45  103514  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_r3_s1.txt
+DERIVED: 43f9c3933af985280d4a942f0c0e2498d586bf44751cfe587b6fa3a5a839fce1  335111  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_r3_s2.txt
+DERIVED: 1607e97b26b6af78e037482e5066133a7c2aa01fb37d58646ad582fe4ccdd827  5678  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_r3_s3.txt
+DERIVED: 17a587e732e6e72a50f85d732969f1ac6879c53dc655a108e74be0c52fb2008e  33590  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_r3_s4.txt
+DERIVED: b568ff850e88d33b3eb35081a057e356568c3fd9e797db46fe78b32aa85bdc7b  18350  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_r3_s5.txt
+DERIVED: 0b89d0128312a662bca60f2d0f0b9ee45cb105a6768fe19759b9cb8b914e575b  8728  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_s1.txt
+DERIVED: 88fac8d1eb992b06a89a7687b1fd189f12d82a4248f4ca6969cb122ef0f07444  2192  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_s2.txt
+DERIVED: 5fb23a98959aff376bb396e9f6bf5d32d7d4a87acf1dfa35d5688c4b1434d8c8  7669  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_s3.txt
+DERIVED: 60a01ed3314caeb53ec4326219ad21f0c66defd29f6c83c9ef9564e034f548ca  9852  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_s4.txt
+DERIVED: aef26be9399a78e5b68b1b02c75812dcdeb4cb6c48e16ea7499ffeb88ecda6b8  1768  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_v_v1b.txt
+DERIVED: 108905209c8737033746ae9efb900d68728368ab393d34ef59366994611f6378  17525  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_v_v1.txt
+DERIVED: 594ec5c7e80d89e673cc7148a114afdbc9f411b0a000b3bc19367350c69ea4a0  27983  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_v_v2.txt
+DERIVED: 9c656242bb8aaf7b3ded630599df30707d3f8b741e3ad4202f1c7ff1ce469278  5679  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_v_v3.txt
+DERIVED: 9179978782a7112774e7abd16f959adb7838ec8d696389193b31c48ce126dd58  2962  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_v_v4b.txt
+DERIVED: f24003684208bcdd15f26803bc66c55678aefdd43721b52ac28a1dabe0e3f216  3186  /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/recon7_v_v4.txt
+# end 2026-10-31T11:38:23Z: copied 303 files, 16272225 B; not transferred 65; missing 0

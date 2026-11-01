@@ -1,0 +1,1 @@
+2195575.42|i4s-i4sb-r3b-2195575|COMPLETED|0:0|01:10:06|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=340G,node=1|3137272K

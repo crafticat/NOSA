@@ -1,0 +1,1 @@
+2195631.11|bf1-bf1b-b3-2195631|COMPLETED|0:0|01:46:29|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=340G,node=1|5060560K

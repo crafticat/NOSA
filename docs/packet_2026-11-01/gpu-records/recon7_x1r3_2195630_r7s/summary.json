@@ -1,0 +1,2697 @@
+{
+ "gates": [
+  {
+   "detail": "union_len min [72, 72, 72] max [72, 72, 72] (want 72 at every (KV head, request), full and both groups)",
+   "must": true,
+   "name": "C128_B216-UNION",
+   "passed": true
+  },
+  {
+   "detail": "NEW blocks per layer window 265 store 265 (want (265, 265))",
+   "must": true,
+   "name": "C128_B216-IDS",
+   "passed": true
+  },
+  {
+   "detail": "2 outputs compared; unequal []",
+   "must": true,
+   "name": "F|M-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "11 outputs compared; unequal []",
+   "must": true,
+   "name": "A|FG-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "6 outputs compared; unequal []",
+   "must": true,
+   "name": "A|F|M-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "5 outputs compared; unequal []",
+   "must": true,
+   "name": "A|F-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "10 outputs compared; unequal []",
+   "must": true,
+   "name": "A|G-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "5 outputs compared; unequal []",
+   "must": true,
+   "name": "A|M-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "2 outputs compared; unequal []",
+   "must": true,
+   "name": "F|M-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "11 outputs compared; unequal []",
+   "must": true,
+   "name": "A|FG-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "6 outputs compared; unequal []",
+   "must": true,
+   "name": "A|F|M-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "11 outputs compared; unequal []",
+   "must": true,
+   "name": "SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "11 outputs compared; unequal []",
+   "must": true,
+   "name": "GRP0-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "11 outputs compared; unequal []",
+   "must": true,
+   "name": "GRP1-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "22 outputs compared; unequal []",
+   "must": true,
+   "name": "GRP-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "22 outputs compared; unequal []",
+   "must": true,
+   "name": "GRP-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "22 outputs compared; unequal []",
+   "must": true,
+   "name": "GRPL-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "12 outputs compared; unequal []",
+   "must": true,
+   "name": "CPY-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "12 outputs compared; unequal []",
+   "must": true,
+   "name": "CPY-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "4 outputs compared; unequal []",
+   "must": true,
+   "name": "A-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "1 outputs compared; unequal []",
+   "must": true,
+   "name": "F-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "6 outputs compared; unequal []",
+   "must": true,
+   "name": "G-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "1 outputs compared; unequal []",
+   "must": true,
+   "name": "M-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "7 outputs compared; unequal []",
+   "must": true,
+   "name": "FG-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "1 outputs compared; unequal []",
+   "must": true,
+   "name": "P-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "5 outputs compared; unequal []",
+   "must": true,
+   "name": "A|F-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "10 outputs compared; unequal []",
+   "must": true,
+   "name": "A|G-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "5 outputs compared; unequal []",
+   "must": true,
+   "name": "A|M-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "DECISION GATE (GRP / GRPL only): the groups' outputs = the full batch's bits: {'Aq': False, 'Ar': False, 'F': True, 'G': True}",
+   "must": false,
+   "name": "C128_B216-GRP-EQ",
+   "passed": false
+  },
+  {
+   "detail": "wall 141.4 s from the shape's start to its last gate (limit 240 s); setup 114.1 s; stop None",
+   "must": true,
+   "name": "C128_B216-BUDGET",
+   "passed": true
+  },
+  {
+   "detail": "26 configurations x 10 order-rotated passes of 32 layers; stop None",
+   "must": true,
+   "name": "C128_B216-RUN",
+   "passed": true
+  },
+  {
+   "detail": "union_len min [72, 72, 72] max [72, 72, 72] (want 72 at every (KV head, request), full and both groups)",
+   "must": true,
+   "name": "C73_B318-UNION",
+   "passed": true
+  },
+  {
+   "detail": "NEW blocks per layer window 1590 store 1590 (want (1590, 1590))",
+   "must": true,
+   "name": "C73_B318-IDS",
+   "passed": true
+  },
+  {
+   "detail": "2 outputs compared; unequal []",
+   "must": true,
+   "name": "F|M-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "11 outputs compared; unequal []",
+   "must": true,
+   "name": "A|FG-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "6 outputs compared; unequal []",
+   "must": true,
+   "name": "A|F|M-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "5 outputs compared; unequal []",
+   "must": true,
+   "name": "A|F-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "10 outputs compared; unequal []",
+   "must": true,
+   "name": "A|G-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "5 outputs compared; unequal []",
+   "must": true,
+   "name": "A|M-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "2 outputs compared; unequal []",
+   "must": true,
+   "name": "F|M-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "11 outputs compared; unequal []",
+   "must": true,
+   "name": "A|FG-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "6 outputs compared; unequal []",
+   "must": true,
+   "name": "A|F|M-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "11 outputs compared; unequal []",
+   "must": true,
+   "name": "SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "11 outputs compared; unequal []",
+   "must": true,
+   "name": "GRP0-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "11 outputs compared; unequal []",
+   "must": true,
+   "name": "GRP1-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "22 outputs compared; unequal []",
+   "must": true,
+   "name": "GRP-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "22 outputs compared; unequal []",
+   "must": true,
+   "name": "GRP-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "22 outputs compared; unequal []",
+   "must": true,
+   "name": "GRPL-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "12 outputs compared; unequal []",
+   "must": true,
+   "name": "CPY-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "12 outputs compared; unequal []",
+   "must": true,
+   "name": "CPY-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "4 outputs compared; unequal []",
+   "must": true,
+   "name": "A-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "1 outputs compared; unequal []",
+   "must": true,
+   "name": "F-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "6 outputs compared; unequal []",
+   "must": true,
+   "name": "G-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "1 outputs compared; unequal []",
+   "must": true,
+   "name": "M-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "7 outputs compared; unequal []",
+   "must": true,
+   "name": "FG-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "1 outputs compared; unequal []",
+   "must": true,
+   "name": "P-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "5 outputs compared; unequal []",
+   "must": true,
+   "name": "A|F-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "10 outputs compared; unequal []",
+   "must": true,
+   "name": "A|G-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "5 outputs compared; unequal []",
+   "must": true,
+   "name": "A|M-SER-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "DECISION GATE (GRP / GRPL only): the groups' outputs = the full batch's bits: {'Aq': True, 'Ar': False, 'F': True, 'G': True}",
+   "must": false,
+   "name": "C73_B318-GRP-EQ",
+   "passed": false
+  },
+  {
+   "detail": "wall 67.6 s from the shape's start to its last gate (limit 240 s); setup 7.5 s; stop None",
+   "must": true,
+   "name": "C73_B318-BUDGET",
+   "passed": true
+  },
+  {
+   "detail": "26 configurations x 10 order-rotated passes of 32 layers; stop None",
+   "must": true,
+   "name": "C73_B318-RUN",
+   "passed": true
+  },
+  {
+   "detail": "run wall 209.1 s (limit 600 s)",
+   "must": true,
+   "name": "RUN-WALL",
+   "passed": true
+  }
+ ],
+ "meta": {
+  "base_commit": "e15d01fa21d353d4d5092c9158dbe2bafda4d451",
+  "block_bytes": 32896,
+  "cell": "r7s",
+  "configs": [
+   [
+    "A",
+    "a",
+    [
+     [
+      "Aq",
+      "Ar"
+     ]
+    ],
+    false
+   ],
+   [
+    "F",
+    "a",
+    [
+     [
+      "F"
+     ]
+    ],
+    false
+   ],
+   [
+    "G",
+    "a",
+    [
+     [
+      "G"
+     ]
+    ],
+    false
+   ],
+   [
+    "M",
+    "a",
+    [
+     [
+      "M"
+     ]
+    ],
+    false
+   ],
+   [
+    "FG",
+    "a",
+    [
+     [
+      "G",
+      "F"
+     ]
+    ],
+    false
+   ],
+   [
+    "P",
+    "a",
+    [
+     [
+      "P"
+     ]
+    ],
+    false
+   ],
+   [
+    "A|F-SER",
+    "c",
+    [
+     [
+      "Aq",
+      "Ar",
+      "F"
+     ]
+    ],
+    false
+   ],
+   [
+    "A|G-SER",
+    "c",
+    [
+     [
+      "Aq",
+      "Ar",
+      "G"
+     ]
+    ],
+    false
+   ],
+   [
+    "A|M-SER",
+    "c",
+    [
+     [
+      "Aq",
+      "Ar",
+      "M"
+     ]
+    ],
+    false
+   ],
+   [
+    "F|M-SER",
+    "c",
+    [
+     [
+      "F",
+      "M"
+     ]
+    ],
+    false
+   ],
+   [
+    "A|FG-SER",
+    "c",
+    [
+     [
+      "Aq",
+      "Ar",
+      "G",
+      "F"
+     ]
+    ],
+    false
+   ],
+   [
+    "A|F|M-SER",
+    "c",
+    [
+     [
+      "Aq",
+      "Ar",
+      "F",
+      "M"
+     ]
+    ],
+    false
+   ],
+   [
+    "A|F",
+    "a",
+    [
+     [
+      "Aq",
+      "Ar"
+     ],
+     [
+      "F"
+     ]
+    ],
+    false
+   ],
+   [
+    "A|G",
+    "a",
+    [
+     [
+      "Aq",
+      "Ar"
+     ],
+     [
+      "G"
+     ]
+    ],
+    false
+   ],
+   [
+    "A|M",
+    "a",
+    [
+     [
+      "Aq",
+      "Ar"
+     ],
+     [
+      "M"
+     ]
+    ],
+    false
+   ],
+   [
+    "F|M",
+    "a",
+    [
+     [
+      "F"
+     ],
+     [
+      "M"
+     ]
+    ],
+    false
+   ],
+   [
+    "A|FG",
+    "a",
+    [
+     [
+      "Aq",
+      "Ar"
+     ],
+     [
+      "G",
+      "F"
+     ]
+    ],
+    false
+   ],
+   [
+    "A|F|M",
+    "a",
+    [
+     [
+      "Aq",
+      "Ar"
+     ],
+     [
+      "F"
+     ],
+     [
+      "M"
+     ]
+    ],
+    false
+   ],
+   [
+    "SER",
+    "c",
+    [
+     [
+      "Aq",
+      "G",
+      "F",
+      "Ar"
+     ]
+    ],
+    false
+   ],
+   [
+    "GRP0",
+    "c",
+    [
+     [
+      "Aq0",
+      "G0",
+      "F0",
+      "Ar0"
+     ]
+    ],
+    false
+   ],
+   [
+    "GRP1",
+    "c",
+    [
+     [
+      "Aq1",
+      "G1",
+      "F1",
+      "Ar1"
+     ]
+    ],
+    false
+   ],
+   [
+    "GRP-SER",
+    "c",
+    [
+     [
+      "Aq0",
+      "G0",
+      "F0",
+      "Ar0",
+      "Aq1",
+      "G1",
+      "F1",
+      "Ar1"
+     ]
+    ],
+    false
+   ],
+   [
+    "GRP",
+    "b",
+    [
+     [
+      "Aq0",
+      "G0",
+      "F0",
+      "Ar0"
+     ],
+     [
+      "Aq1",
+      "G1",
+      "F1",
+      "Ar1"
+     ]
+    ],
+    false
+   ],
+   [
+    "GRPL",
+    "b",
+    [
+     [
+      "Aq0",
+      "G0",
+      "F0",
+      "Ar0"
+     ],
+     [
+      "Aq1",
+      "G1",
+      "F1",
+      "Ar1"
+     ]
+    ],
+    true
+   ],
+   [
+    "CPY-SER",
+    "c",
+    [
+     [
+      "Aq",
+      "G",
+      "F",
+      "Ar",
+      "P"
+     ]
+    ],
+    false
+   ],
+   [
+    "CPY",
+    "b",
+    [
+     [
+      "Aq",
+      "G",
+      "F",
+      "Ar"
+     ],
+     [
+      "P"
+     ]
+    ],
+    false
+   ]
+  ],
+  "control_sum": {
+   "A|F-SER": [
+    "A",
+    "F"
+   ],
+   "A|FG-SER": [
+    "A",
+    "FG"
+   ],
+   "A|F|M-SER": [
+    "A",
+    "F",
+    "M"
+   ],
+   "A|G-SER": [
+    "A",
+    "G"
+   ],
+   "A|M-SER": [
+    "A",
+    "M"
+   ],
+   "CPY-SER": [
+    "SER",
+    "P"
+   ],
+   "F|M-SER": [
+    "F",
+    "M"
+   ],
+   "GRP-SER": [
+    "GRP0",
+    "GRP1"
+   ]
+  },
+  "fork_launch": {
+   "num_stages": 3,
+   "num_warps": 4,
+   "tile_size": 64
+  },
+  "gemms": [
+   [
+    "wqkv",
+    4608,
+    4096
+   ],
+   [
+    "wo",
+    4096,
+    4096
+   ],
+   [
+    "gate_up",
+    32768,
+    4096
+   ],
+   [
+    "down",
+    4096,
+    16384
+   ]
+  ],
+  "gpu": "NVIDIA A100 80GB PCIe",
+  "grant": "2026-10-31T11:38:06Z",
+  "layers": 32,
+  "max_run_s": 600.0,
+  "max_shape_s": 240.0,
+  "nbh": 16,
+  "new_blocks": {
+   "73": 5.0,
+   "128": 1.226
+  },
+  "reps": 10,
+  "row_shift": [
+   0,
+   3,
+   5,
+   8
+  ],
+  "rules": {
+   "absorb": 0.8,
+   "ctl_tol": 0.05,
+   "reach": 1.1,
+   "saving": 0.05,
+   "serial": 0.9,
+   "slow": 0.05
+  },
+  "scope": {
+   "CPY": "a copy of the current pass's NEW-block byte count into an own device buffer, overwritten every layer, never read: COPY INTERFERENCE beside the ordered calls, not a useful prefetch",
+   "GRP": "request groups: group g's rows, fork lists, union tables and gather destinations are written and read by group g's stream only; shared read-only: the weights, the arena (disjoint pages per request), the pinned host KV (disjoint requests). Inputs are synthetic and independent between calls: an ORDERED-CALL screen, not a dependency test",
+   "WINF": "NOT MEASURED: needs the window part's log-sum-exp (the fork's 2D launch has none) or a non-bit-equal split"
+  },
+  "seed": 7,
+  "shapes": {
+   "73": 318,
+   "128": 216
+  },
+  "torch": "2.6.0+cu124",
+  "union_pages": 72,
+  "warmup": 2,
+  "weight_bytes": 473956352,
+  "win_share": 0.5
+ },
+ "shapes": {
+  "C128_B216": {
+   "B": 216,
+   "C": 128,
+   "groups_equal_full": {
+    "Aq": false,
+    "Ar": false,
+    "F": true,
+    "G": true
+   },
+   "meta": {
+    "B": 216,
+    "E": 864,
+    "NB_arena": 15560,
+    "bytes_per_layer": 17434880,
+    "gemm_flop_per_layer": 409498288128,
+    "groups": [
+     [
+      0,
+      108
+     ],
+     [
+      108,
+      216
+     ]
+    ],
+    "ids_store": 265,
+    "ids_win": 265,
+    "new_per_stream": 1.226,
+    "new_store": 265,
+    "new_win": 265,
+    "scope": {
+     "CPY": "a copy of the current pass's NEW-block byte count into an own device buffer, overwritten every layer, never read: COPY INTERFERENCE beside the ordered calls, not a useful prefetch",
+     "GRP": "request groups: group g's rows, fork lists, union tables and gather destinations are written and read by group g's stream only; shared read-only: the weights, the arena (disjoint pages per request), the pinned host KV (disjoint requests). Inputs are synthetic and independent between calls: an ORDERED-CALL screen, not a dependency test",
+     "WINF": "NOT MEASURED: needs the window part's log-sum-exp (the fork's 2D launch has none) or a non-bit-equal split"
+    },
+    "seed": 135,
+    "union": 72,
+    "weight_bytes_per_layer": 473956352
+   },
+   "setup_s": 114.1,
+   "stop": null,
+   "summary": {
+    "capability": "PARTIAL",
+    "concurrent": {
+     "A|F": {
+      "alone": [
+       66.6881,
+       37.5396
+      ],
+      "control": "A|F-SER",
+      "control_consistent": true,
+      "control_ms": 100.1859,
+      "eff_matched": 0.0719,
+      "max": 66.6881,
+      "ms": 97.7778,
+      "over_control": 0.976,
+      "over_max_ideal": 1.4662,
+      "parts": [
+       "A",
+       "F"
+      ],
+      "sum": 104.2277
+     },
+     "A|FG": {
+      "alone": [
+       66.6881,
+       57.8014
+      ],
+      "control": "A|FG-SER",
+      "control_consistent": true,
+      "control_ms": 121.0988,
+      "eff_matched": 0.2024,
+      "max": 66.6881,
+      "ms": 110.086,
+      "over_control": 0.9091,
+      "over_max_ideal": 1.6508,
+      "parts": [
+       "A",
+       "FG"
+      ],
+      "sum": 124.4895
+     },
+     "A|F|M": {
+      "alone": [
+       66.6881,
+       37.5396,
+       22.338
+      ],
+      "control": "A|F|M-SER",
+      "control_consistent": true,
+      "control_ms": 120.8035,
+      "eff_matched": 0.3919,
+      "max": 66.6881,
+      "ms": 99.5944,
+      "over_control": 0.8244,
+      "over_max_ideal": 1.4934,
+      "parts": [
+       "A",
+       "F",
+       "M"
+      ],
+      "sum": 126.5657
+     },
+     "A|G": {
+      "alone": [
+       66.6881,
+       23.2775
+      ],
+      "control": "A|G-SER",
+      "control_consistent": true,
+      "control_ms": 88.5996,
+      "eff_matched": 0.3405,
+      "max": 66.6881,
+      "ms": 81.138,
+      "over_control": 0.9158,
+      "over_max_ideal": 1.2167,
+      "parts": [
+       "A",
+       "G"
+      ],
+      "sum": 89.9656
+     },
+     "A|M": {
+      "alone": [
+       66.6881,
+       22.338
+      ],
+      "control": "A|M-SER",
+      "control_consistent": true,
+      "control_ms": 86.1826,
+      "eff_matched": 0.8853,
+      "max": 66.6881,
+      "ms": 68.9244,
+      "over_control": 0.7997,
+      "over_max_ideal": 1.0335,
+      "parts": [
+       "A",
+       "M"
+      ],
+      "sum": 89.0261
+     },
+     "F|M": {
+      "alone": [
+       37.5396,
+       22.338
+      ],
+      "control": "F|M-SER",
+      "control_consistent": true,
+      "control_ms": 57.8812,
+      "eff_matched": 0.9875,
+      "max": 37.5396,
+      "ms": 37.7931,
+      "over_control": 0.6529,
+      "over_max_ideal": 1.0068,
+      "parts": [
+       "F",
+       "M"
+      ],
+      "sum": 59.8776
+     }
+    },
+    "controls": {
+     "A|F-SER": {
+      "consistent": true,
+      "dev_from_sum": -0.0388,
+      "sum_ms": 104.2277
+     },
+     "A|FG-SER": {
+      "consistent": true,
+      "dev_from_sum": -0.0272,
+      "sum_ms": 124.4895
+     },
+     "A|F|M-SER": {
+      "consistent": true,
+      "dev_from_sum": -0.0455,
+      "sum_ms": 126.5657
+     },
+     "A|G-SER": {
+      "consistent": true,
+      "dev_from_sum": -0.0152,
+      "sum_ms": 89.9656
+     },
+     "A|M-SER": {
+      "consistent": true,
+      "dev_from_sum": -0.0319,
+      "sum_ms": 89.0261
+     },
+     "CPY-SER": {
+      "consistent": true,
+      "dev_from_sum": -0.0241,
+      "sum_ms": 147.365
+     },
+     "F|M-SER": {
+      "consistent": true,
+      "dev_from_sum": -0.0333,
+      "sum_ms": 59.8776
+     },
+     "GRP-SER": {
+      "consistent": true,
+      "dev_from_sum": 0.0003,
+      "sum_ms": 126.2541
+     }
+    },
+    "interference_AM": 0.0335,
+    "median_ms": {
+     "A": 66.6881,
+     "A|F": 97.7778,
+     "A|F-SER": 100.1859,
+     "A|FG": 110.086,
+     "A|FG-SER": 121.0988,
+     "A|F|M": 99.5944,
+     "A|F|M-SER": 120.8035,
+     "A|G": 81.138,
+     "A|G-SER": 88.5996,
+     "A|M": 68.9244,
+     "A|M-SER": 86.1826,
+     "CPY": 124.6579,
+     "CPY-SER": 143.8076,
+     "F": 37.5396,
+     "FG": 57.8014,
+     "F|M": 37.7931,
+     "F|M-SER": 57.8812,
+     "G": 23.2775,
+     "GRP": 110.8388,
+     "GRP-SER": 126.2899,
+     "GRP0": 63.103,
+     "GRP1": 63.1511,
+     "GRPL": 121.7193,
+     "M": 22.338,
+     "P": 22.3736,
+     "SER": 124.9914
+    },
+    "model_s": 0.0868458712,
+    "ordered_screen": {
+     "CPY": {
+      "P_ms": 22.3736,
+      "absorbed_frac": 1.0149,
+      "chain_slowdown": -0.0027,
+      "control_consistent": true,
+      "control_ms": 143.8076,
+      "decision": "COPY ABSORBED (copy interference only, not a prefetch)",
+      "ms": 124.6579,
+      "ser_ms": 124.9914
+     },
+     "GRP": {
+      "control_consistent": true,
+      "control_ms": 126.2899,
+      "decision": "INELIGIBLE: the groups' outputs differ from the full batch's (request-neighbour invariant)",
+      "eligible": false,
+      "ms": 110.8388,
+      "net_frac": 0.1132,
+      "net_ms": 14.1526,
+      "overlap_ms": 15.4511,
+      "ser_ms": 124.9914,
+      "split_cost_ms": 1.2985
+     },
+     "GRPL": {
+      "control_consistent": true,
+      "control_ms": 126.2899,
+      "decision": "INELIGIBLE: the groups' outputs differ from the full batch's (request-neighbour invariant)",
+      "eligible": false,
+      "ms": 121.7193,
+      "net_frac": 0.0262,
+      "net_ms": 3.2721,
+      "overlap_ms": 4.5706,
+      "ser_ms": 124.9914,
+      "split_cost_ms": 1.2985
+     },
+     "WINF": "NOT MEASURED: needs the window part's log-sum-exp (the fork's 2D launch has none) or a non-bit-equal split"
+    },
+    "stats_ms": {
+     "A": {
+      "cv": 0.0177,
+      "max": 67.1857,
+      "median": 66.6881,
+      "min": 62.9743,
+      "n": 10,
+      "q1": 66.0701,
+      "q3": 66.9111
+     },
+     "A|F": {
+      "cv": 0.0029,
+      "max": 98.4017,
+      "median": 97.7778,
+      "min": 97.5684,
+      "n": 10,
+      "q1": 97.5922,
+      "q3": 98.1466
+     },
+     "A|F-SER": {
+      "cv": 0.0034,
+      "max": 100.9951,
+      "median": 100.1859,
+      "min": 99.7835,
+      "n": 10,
+      "q1": 99.9771,
+      "q3": 100.5281
+     },
+     "A|FG": {
+      "cv": 0.0031,
+      "max": 110.3238,
+      "median": 110.086,
+      "min": 109.3547,
+      "n": 10,
+      "q1": 109.7301,
+      "q3": 110.2616
+     },
+     "A|FG-SER": {
+      "cv": 0.001,
+      "max": 121.3436,
+      "median": 121.0988,
+      "min": 120.9281,
+      "n": 10,
+      "q1": 120.995,
+      "q3": 121.2201
+     },
+     "A|F|M": {
+      "cv": 0.0034,
+      "max": 99.8124,
+      "median": 99.5944,
+      "min": 98.8068,
+      "n": 10,
+      "q1": 99.2067,
+      "q3": 99.7685
+     },
+     "A|F|M-SER": {
+      "cv": 0.0011,
+      "max": 121.0341,
+      "median": 120.8035,
+      "min": 120.701,
+      "n": 10,
+      "q1": 120.7263,
+      "q3": 121.0034
+     },
+     "A|G": {
+      "cv": 0.0037,
+      "max": 81.7456,
+      "median": 81.138,
+      "min": 80.726,
+      "n": 10,
+      "q1": 80.8424,
+      "q3": 81.3707
+     },
+     "A|G-SER": {
+      "cv": 0.0091,
+      "max": 88.9344,
+      "median": 88.5996,
+      "min": 85.9657,
+      "n": 10,
+      "q1": 88.1188,
+      "q3": 88.652
+     },
+     "A|M": {
+      "cv": 0.0041,
+      "max": 69.1043,
+      "median": 68.9244,
+      "min": 68.066,
+      "n": 10,
+      "q1": 68.7745,
+      "q3": 69.0054
+     },
+     "A|M-SER": {
+      "cv": 0.0067,
+      "max": 88.0267,
+      "median": 86.1826,
+      "min": 85.9433,
+      "n": 10,
+      "q1": 86.0502,
+      "q3": 86.357
+     },
+     "CPY": {
+      "cv": 0.0011,
+      "max": 125.0474,
+      "median": 124.6579,
+      "min": 124.523,
+      "n": 10,
+      "q1": 124.6034,
+      "q3": 124.7144
+     },
+     "CPY-SER": {
+      "cv": 0.0019,
+      "max": 144.4418,
+      "median": 143.8076,
+      "min": 143.4238,
+      "n": 10,
+      "q1": 143.654,
+      "q3": 144.0473
+     },
+     "F": {
+      "cv": 0.0208,
+      "max": 37.8593,
+      "median": 37.5396,
+      "min": 35.1509,
+      "n": 10,
+      "q1": 37.1041,
+      "q3": 37.6445
+     },
+     "FG": {
+      "cv": 0.002,
+      "max": 58.0434,
+      "median": 57.8014,
+      "min": 57.6785,
+      "n": 10,
+      "q1": 57.7247,
+      "q3": 57.9179
+     },
+     "F|M": {
+      "cv": 0.0043,
+      "max": 38.137,
+      "median": 37.7931,
+      "min": 37.6561,
+      "n": 10,
+      "q1": 37.7128,
+      "q3": 38.0407
+     },
+     "F|M-SER": {
+      "cv": 0.0021,
+      "max": 58.0857,
+      "median": 57.8812,
+      "min": 57.7401,
+      "n": 10,
+      "q1": 57.7622,
+      "q3": 57.9945
+     },
+     "G": {
+      "cv": 0.001,
+      "max": 23.3298,
+      "median": 23.2775,
+      "min": 23.2489,
+      "n": 10,
+      "q1": 23.2571,
+      "q3": 23.294
+     },
+     "GRP": {
+      "cv": 0.0033,
+      "max": 111.5218,
+      "median": 110.8388,
+      "min": 110.1333,
+      "n": 10,
+      "q1": 110.7566,
+      "q3": 111.0277
+     },
+     "GRP-SER": {
+      "cv": 0.0008,
+      "max": 126.3575,
+      "median": 126.2899,
+      "min": 125.9956,
+      "n": 10,
+      "q1": 126.2318,
+      "q3": 126.3107
+     },
+     "GRP0": {
+      "cv": 0.0025,
+      "max": 63.2074,
+      "median": 63.103,
+      "min": 62.7681,
+      "n": 10,
+      "q1": 62.9196,
+      "q3": 63.1939
+     },
+     "GRP1": {
+      "cv": 0.0022,
+      "max": 63.3452,
+      "median": 63.1511,
+      "min": 62.7917,
+      "n": 10,
+      "q1": 63.0582,
+      "q3": 63.1718
+     },
+     "GRPL": {
+      "cv": 0.003,
+      "max": 122.2093,
+      "median": 121.7193,
+      "min": 120.8295,
+      "n": 10,
+      "q1": 121.6364,
+      "q3": 122.0101
+     },
+     "M": {
+      "cv": 0.0011,
+      "max": 22.3736,
+      "median": 22.338,
+      "min": 22.2863,
+      "n": 10,
+      "q1": 22.3149,
+      "q3": 22.3543
+     },
+     "P": {
+      "cv": 0.0006,
+      "max": 22.3796,
+      "median": 22.3736,
+      "min": 22.3335,
+      "n": 10,
+      "q1": 22.3647,
+      "q3": 22.3763
+     },
+     "SER": {
+      "cv": 0.0038,
+      "max": 125.6891,
+      "median": 124.9914,
+      "min": 123.9701,
+      "n": 10,
+      "q1": 124.7387,
+      "q3": 125.3639
+     }
+    }
+   },
+   "times_ms": {
+    "A": [
+     62.974273681640625,
+     66.5704345703125,
+     65.78924560546875,
+     66.7026596069336,
+     66.8202896118164,
+     66.68637084960938,
+     66.68978881835938,
+     67.18572998046875,
+     67.18370819091797,
+     66.16374206542969
+    ],
+    "A|F": [
+     98.0865249633789,
+     97.78841400146484,
+     97.91321563720703,
+     97.5683822631836,
+     97.74342346191406,
+     97.59260559082031,
+     97.5909423828125,
+     97.76726531982422,
+     98.32691192626953,
+     98.40169525146484
+    ],
+    "A|F-SER": [
+     100.17990112304688,
+     99.78352355957031,
+     99.96940612792969,
+     99.9797134399414,
+     100.51036834716797,
+     100.25682830810547,
+     100.58137512207031,
+     100.06169891357422,
+     100.19190216064453,
+     100.99507141113281
+    ],
+    "A|FG": [
+     110.289794921875,
+     109.38745880126953,
+     110.11190032958984,
+     110.0601577758789,
+     110.32383728027344,
+     109.84432220458984,
+     109.95891571044922,
+     110.24668884277344,
+     109.35472106933594,
+     110.25222778320312
+    ],
+    "A|FG-SER": [
+     121.14723205566406,
+     120.99462127685547,
+     121.07798767089844,
+     120.92813110351562,
+     120.99510192871094,
+     121.28697967529297,
+     121.09996795654297,
+     121.0975341796875,
+     121.19779205322266,
+     121.34358215332031
+    ],
+    "A|F|M": [
+     99.80716705322266,
+     99.51232147216797,
+     99.58233642578125,
+     98.8067855834961,
+     99.65558624267578,
+     99.60643005371094,
+     99.30313873291016,
+     99.8123550415039,
+     99.75567626953125,
+     98.91741180419922
+    ],
+    "A|F|M-SER": [
+     121.01126098632812,
+     120.7010269165039,
+     120.73190307617188,
+     120.77232360839844,
+     120.70941162109375,
+     121.03414154052734,
+     121.00077056884766,
+     120.7999038696289,
+     120.9810562133789,
+     120.80713653564453
+    ],
+    "A|G": [
+     81.3160629272461,
+     80.72601318359375,
+     80.84550476074219,
+     81.21142578125,
+     81.06159973144531,
+     81.20851135253906,
+     80.83293151855469,
+     81.06758117675781,
+     81.74559783935547,
+     81.53478240966797
+    ],
+    "A|G-SER": [
+     88.6087646484375,
+     88.1418228149414,
+     88.04966735839844,
+     88.3404769897461,
+     88.93440246582031,
+     88.59033966064453,
+     88.67123413085938,
+     85.9656982421875,
+     88.6456298828125,
+     88.61763000488281
+    ],
+    "A|M": [
+     69.10425567626953,
+     68.68524932861328,
+     68.9234848022461,
+     68.80425262451172,
+     68.9974365234375,
+     69.0291519165039,
+     68.98003387451172,
+     68.87391662597656,
+     68.92537689208984,
+     68.0660171508789
+    ],
+    "A|M-SER": [
+     86.01081848144531,
+     85.94329833984375,
+     86.37996673583984,
+     86.174560546875,
+     86.25004577636719,
+     86.11260986328125,
+     86.19071960449219,
+     86.34928131103516,
+     88.02674865722656,
+     86.06326293945312
+    ],
+    "CPY": [
+     124.52304077148438,
+     124.56639862060547,
+     124.61571502685547,
+     124.67257690429688,
+     124.65715026855469,
+     124.83971405029297,
+     124.65862274169922,
+     124.66636657714844,
+     125.04736328125,
+     124.64086151123047
+    ],
+    "CPY-SER": [
+     143.6241912841797,
+     143.83103942871094,
+     143.42381286621094,
+     143.73043823242188,
+     143.6639404296875,
+     143.816162109375,
+     144.0759735107422,
+     144.0377655029297,
+     144.4418487548828,
+     143.799072265625
+    ],
+    "F": [
+     36.46976089477539,
+     35.15087890625,
+     37.315582275390625,
+     37.57670211791992,
+     37.644287109375,
+     37.561344146728516,
+     37.64531326293945,
+     37.85932922363281,
+     37.45484924316406,
+     37.517887115478516
+    ],
+    "FG": [
+     57.896705627441406,
+     57.8078727722168,
+     57.98134231567383,
+     57.847328186035156,
+     58.043392181396484,
+     57.794944763183594,
+     57.73100662231445,
+     57.67852783203125,
+     57.746238708496094,
+     57.70579147338867
+    ],
+    "F|M": [
+     38.033599853515625,
+     37.68156814575195,
+     37.731361389160156,
+     37.88572692871094,
+     37.6561279296875,
+     38.06195068359375,
+     37.77542495727539,
+     37.723201751708984,
+     37.810752868652344,
+     38.136959075927734
+    ],
+    "F|M-SER": [
+     57.74012756347656,
+     57.89004898071289,
+     58.085697174072266,
+     57.74496078491211,
+     57.95452880859375,
+     57.87241744995117,
+     57.96601486206055,
+     57.767967224121094,
+     57.869728088378906,
+     58.07993698120117
+    ],
+    "G": [
+     23.259136199951172,
+     23.30009651184082,
+     23.329792022705078,
+     23.260160446166992,
+     23.250944137573242,
+     23.2488956451416,
+     23.27449607849121,
+     23.29190444946289,
+     23.28473663330078,
+     23.28041648864746
+    ],
+    "GRP": [
+     111.41324615478516,
+     110.80499267578125,
+     110.64217376708984,
+     110.8490219116211,
+     110.79475402832031,
+     110.87052917480469,
+     110.89920043945312,
+     110.82854461669922,
+     111.52178955078125,
+     110.13334655761719
+    ],
+    "GRP-SER": [
+     126.35750579833984,
+     126.1496353149414,
+     126.33599853515625,
+     126.29811096191406,
+     126.29094696044922,
+     126.26227569580078,
+     126.25920104980469,
+     126.30220794677734,
+     126.28889465332031,
+     125.99561309814453
+    ],
+    "GRP0": [
+     63.104000091552734,
+     62.76812744140625,
+     62.98419189453125,
+     62.77836990356445,
+     63.1992301940918,
+     63.101951599121094,
+     63.16134262084961,
+     63.19206237792969,
+     63.20742416381836,
+     62.96672058105469
+    ],
+    "GRP1": [
+     63.0937614440918,
+     62.79167938232422,
+     63.12345504760742,
+     62.95142364501953,
+     63.17875289916992,
+     63.16953659057617,
+     63.140865325927734,
+     63.16339111328125,
+     63.16134262084961,
+     63.34524917602539
+    ],
+    "GRPL": [
+     122.20928192138672,
+     121.96044921875,
+     121.7105941772461,
+     121.49657440185547,
+     121.72799682617188,
+     121.87340545654297,
+     121.70751953125,
+     121.68294525146484,
+     122.15910339355469,
+     120.82947540283203
+    ],
+    "M": [
+     22.33776092529297,
+     22.353984832763672,
+     22.304576873779297,
+     22.286304473876953,
+     22.33945655822754,
+     22.33577537536621,
+     22.31839942932129,
+     22.373567581176758,
+     22.355424880981445,
+     22.338272094726562
+    ],
+    "P": [
+     22.363584518432617,
+     22.371967315673828,
+     22.379552841186523,
+     22.37727928161621,
+     22.375232696533203,
+     22.33353614807129,
+     22.37596893310547,
+     22.375743865966797,
+     22.36502456665039,
+     22.37004852294922
+    ],
+    "SER": [
+     125.30387115478516,
+     123.97007751464844,
+     124.52159881591797,
+     124.82173156738281,
+     125.68911743164062,
+     125.23712158203125,
+     124.98611450195312,
+     124.9966049194336,
+     125.5439682006836,
+     124.81100463867188
+    ]
+   },
+   "wall_s": 141.4,
+   "warmup_ms": {
+    "A": [
+     64.55398559570312,
+     68.4400634765625
+    ],
+    "A|F": [
+     98.89385223388672,
+     100.39849853515625
+    ],
+    "A|F-SER": [
+     99.79993438720703,
+     102.67955017089844
+    ],
+    "A|FG": [
+     109.10041809082031,
+     109.89826965332031
+    ],
+    "A|FG-SER": [
+     120.72815704345703,
+     121.5989761352539
+    ],
+    "A|F|M": [
+     98.82921600341797,
+     100.35507202148438
+    ],
+    "A|F|M-SER": [
+     120.67263793945312,
+     120.6786880493164
+    ],
+    "A|G": [
+     80.08684539794922,
+     80.28864288330078
+    ],
+    "A|G-SER": [
+     87.83564758300781,
+     86.53311920166016
+    ],
+    "A|M": [
+     69.01148986816406,
+     69.1457290649414
+    ],
+    "A|M-SER": [
+     85.76956939697266,
+     85.63763427734375
+    ],
+    "CPY": [
+     124.0799331665039,
+     124.80908966064453
+    ],
+    "CPY-SER": [
+     143.30809020996094,
+     141.9418487548828
+    ],
+    "F": [
+     37.826560974121094,
+     37.3647346496582
+    ],
+    "FG": [
+     57.88371276855469,
+     57.37062454223633
+    ],
+    "F|M": [
+     37.600799560546875,
+     36.150047302246094
+    ],
+    "F|M-SER": [
+     57.58745574951172,
+     57.28508758544922
+    ],
+    "G": [
+     23.29395294189453,
+     23.2857608795166
+    ],
+    "GRP": [
+     111.31494140625,
+     112.54579162597656
+    ],
+    "GRP-SER": [
+     125.55059051513672,
+     125.60076904296875
+    ],
+    "GRP0": [
+     62.81318283081055,
+     62.78860855102539
+    ],
+    "GRP1": [
+     62.75379180908203,
+     62.78656005859375
+    ],
+    "GRPL": [
+     122.88307189941406,
+     121.02963256835938
+    ],
+    "M": [
+     22.385568618774414,
+     22.35094451904297
+    ],
+    "P": [
+     22.37833595275879,
+     22.34329605102539
+    ],
+    "SER": [
+     124.54003143310547,
+     121.60307312011719
+    ]
+   }
+  },
+  "C73_B318": {
+   "B": 318,
+   "C": 73,
+   "groups_equal_full": {
+    "Aq": true,
+    "Ar": false,
+    "F": true,
+    "G": true
+   },
+   "meta": {
+    "B": 318,
+    "E": 1272,
+    "NB_arena": 22904,
+    "bytes_per_layer": 104609280,
+    "gemm_flop_per_layer": 602872479744,
+    "groups": [
+     [
+      0,
+      159
+     ],
+     [
+      159,
+      318
+     ]
+    ],
+    "ids_store": 1590,
+    "ids_win": 1590,
+    "new_per_stream": 5.0,
+    "new_store": 1590,
+    "new_win": 1590,
+    "scope": {
+     "CPY": "a copy of the current pass's NEW-block byte count into an own device buffer, overwritten every layer, never read: COPY INTERFERENCE beside the ordered calls, not a useful prefetch",
+     "GRP": "request groups: group g's rows, fork lists, union tables and gather destinations are written and read by group g's stream only; shared read-only: the weights, the arena (disjoint pages per request), the pinned host KV (disjoint requests). Inputs are synthetic and independent between calls: an ORDERED-CALL screen, not a dependency test",
+     "WINF": "NOT MEASURED: needs the window part's log-sum-exp (the fork's 2D launch has none) or a non-bit-equal split"
+    },
+    "seed": 80,
+    "union": 72,
+    "weight_bytes_per_layer": 473956352
+   },
+   "setup_s": 7.5,
+   "stop": null,
+   "summary": {
+    "capability": "REACHABLE",
+    "concurrent": {
+     "A|F": {
+      "alone": [
+       84.0852,
+       57.2641
+      ],
+      "control": "A|F-SER",
+      "control_consistent": true,
+      "control_ms": 135.9724,
+      "eff_matched": 0.0622,
+      "max": 84.0852,
+      "ms": 132.7471,
+      "over_control": 0.9763,
+      "over_max_ideal": 1.5787,
+      "parts": [
+       "A",
+       "F"
+      ],
+      "sum": 141.3493
+     },
+     "A|FG": {
+      "alone": [
+       84.0852,
+       184.5195
+      ],
+      "control": "A|FG-SER",
+      "control_consistent": true,
+      "control_ms": 260.1889,
+      "eff_matched": 0.1937,
+      "max": 184.5195,
+      "ms": 245.5353,
+      "over_control": 0.9437,
+      "over_max_ideal": 1.3307,
+      "parts": [
+       "A",
+       "FG"
+      ],
+      "sum": 268.6047
+     },
+     "A|F|M": {
+      "alone": [
+       84.0852,
+       57.2641,
+       133.1781
+      ],
+      "control": "A|F|M-SER",
+      "control_consistent": true,
+      "control_ms": 262.3094,
+      "eff_matched": 0.9784,
+      "max": 133.1781,
+      "ms": 135.965,
+      "over_control": 0.5183,
+      "over_max_ideal": 1.0209,
+      "parts": [
+       "A",
+       "F",
+       "M"
+      ],
+      "sum": 274.5274
+     },
+     "A|G": {
+      "alone": [
+       84.0852,
+       133.7992
+      ],
+      "control": "A|G-SER",
+      "control_consistent": true,
+      "control_ms": 210.6726,
+      "eff_matched": 0.1922,
+      "max": 133.7992,
+      "ms": 195.898,
+      "over_control": 0.9299,
+      "over_max_ideal": 1.4641,
+      "parts": [
+       "A",
+       "G"
+      ],
+      "sum": 217.8844
+     },
+     "A|M": {
+      "alone": [
+       84.0852,
+       133.1781
+      ],
+      "control": "A|M-SER",
+      "control_consistent": true,
+      "control_ms": 211.5345,
+      "eff_matched": 0.9856,
+      "max": 133.1781,
+      "ms": 134.3027,
+      "over_control": 0.6349,
+      "over_max_ideal": 1.0084,
+      "parts": [
+       "A",
+       "M"
+      ],
+      "sum": 217.2633
+     },
+     "F|M": {
+      "alone": [
+       57.2641,
+       133.1781
+      ],
+      "control": "F|M-SER",
+      "control_consistent": true,
+      "control_ms": 186.828,
+      "eff_matched": 0.9648,
+      "max": 133.1781,
+      "ms": 135.0665,
+      "over_control": 0.7229,
+      "over_max_ideal": 1.0142,
+      "parts": [
+       "F",
+       "M"
+      ],
+      "sum": 190.4422
+     }
+    },
+    "controls": {
+     "A|F-SER": {
+      "consistent": true,
+      "dev_from_sum": -0.038,
+      "sum_ms": 141.3493
+     },
+     "A|FG-SER": {
+      "consistent": true,
+      "dev_from_sum": -0.0313,
+      "sum_ms": 268.6047
+     },
+     "A|F|M-SER": {
+      "consistent": true,
+      "dev_from_sum": -0.0445,
+      "sum_ms": 274.5274
+     },
+     "A|G-SER": {
+      "consistent": true,
+      "dev_from_sum": -0.0331,
+      "sum_ms": 217.8844
+     },
+     "A|M-SER": {
+      "consistent": true,
+      "dev_from_sum": -0.0264,
+      "sum_ms": 217.2633
+     },
+     "CPY-SER": {
+      "consistent": true,
+      "dev_from_sum": -0.0022,
+      "sum_ms": 396.38
+     },
+     "F|M-SER": {
+      "consistent": true,
+      "dev_from_sum": -0.019,
+      "sum_ms": 190.4422
+     },
+     "GRP-SER": {
+      "consistent": true,
+      "dev_from_sum": -0.0002,
+      "sum_ms": 279.8336
+     }
+    },
+    "interference_AM": 0.0084,
+    "median_ms": {
+     "A": 84.0852,
+     "A|F": 132.7471,
+     "A|F-SER": 135.9724,
+     "A|FG": 245.5353,
+     "A|FG-SER": 260.1889,
+     "A|F|M": 135.965,
+     "A|F|M-SER": 262.3094,
+     "A|G": 195.898,
+     "A|G-SER": 210.6726,
+     "A|M": 134.3027,
+     "A|M-SER": 211.5345,
+     "CPY": 295.5508,
+     "CPY-SER": 395.4899,
+     "F": 57.2641,
+     "FG": 184.5195,
+     "F|M": 135.0665,
+     "F|M-SER": 186.828,
+     "G": 133.7992,
+     "GRP": 251.8006,
+     "GRP-SER": 279.7901,
+     "GRP0": 140.4022,
+     "GRP1": 139.4314,
+     "GRPL": 258.4412,
+     "M": 133.1781,
+     "P": 133.2645,
+     "SER": 263.1155
+    },
+    "model_s": 0.0868458712,
+    "ordered_screen": {
+     "CPY": {
+      "P_ms": 133.2645,
+      "absorbed_frac": 0.7566,
+      "chain_slowdown": 0.1233,
+      "control_consistent": true,
+      "control_ms": 395.4899,
+      "decision": "COPY NOT ABSORBED",
+      "ms": 295.5508,
+      "ser_ms": 263.1155
+     },
+     "GRP": {
+      "control_consistent": true,
+      "control_ms": 279.7901,
+      "decision": "INELIGIBLE: the groups' outputs differ from the full batch's (request-neighbour invariant)",
+      "eligible": false,
+      "ms": 251.8006,
+      "net_frac": 0.043,
+      "net_ms": 11.3149,
+      "overlap_ms": 27.9895,
+      "ser_ms": 263.1155,
+      "split_cost_ms": 16.6746
+     },
+     "GRPL": {
+      "control_consistent": true,
+      "control_ms": 279.7901,
+      "decision": "INELIGIBLE: the groups' outputs differ from the full batch's (request-neighbour invariant)",
+      "eligible": false,
+      "ms": 258.4412,
+      "net_frac": 0.0178,
+      "net_ms": 4.6743,
+      "overlap_ms": 21.3489,
+      "ser_ms": 263.1155,
+      "split_cost_ms": 16.6746
+     },
+     "WINF": "NOT MEASURED: needs the window part's log-sum-exp (the fork's 2D launch has none) or a non-bit-equal split"
+    },
+    "stats_ms": {
+     "A": {
+      "cv": 0.0046,
+      "max": 84.7121,
+      "median": 84.0852,
+      "min": 83.4642,
+      "n": 10,
+      "q1": 83.8159,
+      "q3": 84.5383
+     },
+     "A|F": {
+      "cv": 0.0052,
+      "max": 133.7297,
+      "median": 132.7471,
+      "min": 131.1751,
+      "n": 10,
+      "q1": 132.3737,
+      "q3": 133.299
+     },
+     "A|F-SER": {
+      "cv": 0.0033,
+      "max": 136.6649,
+      "median": 135.9724,
+      "min": 135.1329,
+      "n": 10,
+      "q1": 135.6072,
+      "q3": 136.2267
+     },
+     "A|FG": {
+      "cv": 0.0008,
+      "max": 245.9243,
+      "median": 245.5353,
+      "min": 245.3634,
+      "n": 10,
+      "q1": 245.4165,
+      "q3": 245.8391
+     },
+     "A|FG-SER": {
+      "cv": 0.0004,
+      "max": 260.3519,
+      "median": 260.1889,
+      "min": 260.0508,
+      "n": 10,
+      "q1": 260.1393,
+      "q3": 260.3117
+     },
+     "A|F|M": {
+      "cv": 0.0014,
+      "max": 136.5428,
+      "median": 135.965,
+      "min": 135.8639,
+      "n": 10,
+      "q1": 135.9117,
+      "q3": 136.003
+     },
+     "A|F|M-SER": {
+      "cv": 0.0006,
+      "max": 262.7639,
+      "median": 262.3094,
+      "min": 262.1888,
+      "n": 10,
+      "q1": 262.2319,
+      "q3": 262.4415
+     },
+     "A|G": {
+      "cv": 0.0009,
+      "max": 196.2221,
+      "median": 195.898,
+      "min": 195.5844,
+      "n": 10,
+      "q1": 195.7566,
+      "q3": 195.9874
+     },
+     "A|G-SER": {
+      "cv": 0.0019,
+      "max": 211.0444,
+      "median": 210.6726,
+      "min": 209.5267,
+      "n": 10,
+      "q1": 210.5221,
+      "q3": 210.827
+     },
+     "A|M": {
+      "cv": 0.0006,
+      "max": 134.3483,
+      "median": 134.3027,
+      "min": 134.1422,
+      "n": 10,
+      "q1": 134.188,
+      "q3": 134.3371
+     },
+     "A|M-SER": {
+      "cv": 0.0016,
+      "max": 212.5658,
+      "median": 211.5345,
+      "min": 211.3055,
+      "n": 10,
+      "q1": 211.4781,
+      "q3": 211.6886
+     },
+     "CPY": {
+      "cv": 0.0007,
+      "max": 295.8286,
+      "median": 295.5508,
+      "min": 295.2034,
+      "n": 10,
+      "q1": 295.3685,
+      "q3": 295.7361
+     },
+     "CPY-SER": {
+      "cv": 0.0004,
+      "max": 395.8165,
+      "median": 395.4899,
+      "min": 395.3801,
+      "n": 10,
+      "q1": 395.4392,
+      "q3": 395.7267
+     },
+     "F": {
+      "cv": 0.0401,
+      "max": 59.8733,
+      "median": 57.2641,
+      "min": 50.8655,
+      "n": 10,
+      "q1": 57.1092,
+      "q3": 58.1015
+     },
+     "FG": {
+      "cv": 0.0003,
+      "max": 184.6205,
+      "median": 184.5195,
+      "min": 184.4338,
+      "n": 10,
+      "q1": 184.4637,
+      "q3": 184.5847
+     },
+     "F|M": {
+      "cv": 0.0007,
+      "max": 135.2035,
+      "median": 135.0665,
+      "min": 134.925,
+      "n": 10,
+      "q1": 134.9745,
+      "q3": 135.1456
+     },
+     "F|M-SER": {
+      "cv": 0.0003,
+      "max": 186.9201,
+      "median": 186.828,
+      "min": 186.7371,
+      "n": 10,
+      "q1": 186.7683,
+      "q3": 186.8889
+     },
+     "G": {
+      "cv": 0.0004,
+      "max": 133.8767,
+      "median": 133.7992,
+      "min": 133.7088,
+      "n": 10,
+      "q1": 133.7528,
+      "q3": 133.8283
+     },
+     "GRP": {
+      "cv": 0.0055,
+      "max": 254.7917,
+      "median": 251.8006,
+      "min": 250.1206,
+      "n": 10,
+      "q1": 251.4447,
+      "q3": 253.8916
+     },
+     "GRP-SER": {
+      "cv": 0.0005,
+      "max": 279.9915,
+      "median": 279.7901,
+      "min": 279.595,
+      "n": 10,
+      "q1": 279.6928,
+      "q3": 279.9457
+     },
+     "GRP0": {
+      "cv": 0.0006,
+      "max": 140.5744,
+      "median": 140.4022,
+      "min": 140.3167,
+      "n": 10,
+      "q1": 140.3333,
+      "q3": 140.4892
+     },
+     "GRP1": {
+      "cv": 0.0005,
+      "max": 139.525,
+      "median": 139.4314,
+      "min": 139.2896,
+      "n": 10,
+      "q1": 139.3564,
+      "q3": 139.4872
+     },
+     "GRPL": {
+      "cv": 0.0026,
+      "max": 259.2184,
+      "median": 258.4412,
+      "min": 256.5205,
+      "n": 10,
+      "q1": 258.3985,
+      "q3": 258.6519
+     },
+     "M": {
+      "cv": 0.0003,
+      "max": 133.2088,
+      "median": 133.1781,
+      "min": 133.0506,
+      "n": 10,
+      "q1": 133.1683,
+      "q3": 133.1845
+     },
+     "P": {
+      "cv": 0.0,
+      "max": 133.283,
+      "median": 133.2645,
+      "min": 133.2594,
+      "n": 10,
+      "q1": 133.2618,
+      "q3": 133.2675
+     },
+     "SER": {
+      "cv": 0.0012,
+      "max": 263.6877,
+      "median": 263.1155,
+      "min": 262.7115,
+      "n": 10,
+      "q1": 262.9264,
+      "q3": 263.4951
+     }
+    }
+   },
+   "times_ms": {
+    "A": [
+     83.46419525146484,
+     84.58335876464844,
+     84.14192199707031,
+     83.90930938720703,
+     84.28797149658203,
+     83.84563446044922,
+     83.72672271728516,
+     84.71212768554688,
+     84.02848052978516,
+     84.52326202392578
+    ],
+    "A|F": [
+     132.17027282714844,
+     132.82386779785156,
+     131.17514038085938,
+     132.6703338623047,
+     133.29193115234375,
+     133.2123260498047,
+     132.50936889648438,
+     133.320068359375,
+     132.44146728515625,
+     133.7296905517578
+    ],
+    "A|F-SER": [
+     135.1328582763672,
+     135.69395446777344,
+     135.34693908691406,
+     136.05894470214844,
+     135.96829223632812,
+     135.97654724121094,
+     136.521728515625,
+     136.12841796875,
+     135.9502716064453,
+     136.66493225097656
+    ],
+    "A|FG": [
+     245.36341857910156,
+     245.8376007080078,
+     245.420166015625,
+     245.40541076660156,
+     245.47836303710938,
+     245.51651000976562,
+     245.5540771484375,
+     245.78944396972656,
+     245.8435821533203,
+     245.92431640625
+    ],
+    "A|FG-SER": [
+     260.05084228515625,
+     260.15570068359375,
+     260.0937805175781,
+     260.1544189453125,
+     260.2371520996094,
+     260.1932678222656,
+     260.1845397949219,
+     260.29962158203125,
+     260.35186767578125,
+     260.34796142578125
+    ],
+    "A|F|M": [
+     135.9735107421875,
+     135.95645141601562,
+     135.9120330810547,
+     136.05686950683594,
+     136.54281616210938,
+     135.86387634277344,
+     135.9107208251953,
+     135.9849853515625,
+     135.9799346923828,
+     135.92848205566406
+    ],
+    "A|F|M-SER": [
+     262.1971740722656,
+     262.2478332519531,
+     262.1887512207031,
+     262.34307861328125,
+     262.27581787109375,
+     262.3448791503906,
+     262.24346923828125,
+     262.42156982421875,
+     262.76385498046875,
+     262.501220703125
+    ],
+    "A|G": [
+     195.8558349609375,
+     195.87957763671875,
+     196.22207641601562,
+     195.63856506347656,
+     195.79592895507812,
+     195.91644287109375,
+     196.03024291992188,
+     195.58438110351562,
+     195.97311401367188,
+     195.9646453857422
+    ],
+    "A|G-SER": [
+     210.4637451171875,
+     210.6675262451172,
+     210.5569305419922,
+     210.54156494140625,
+     210.82009887695312,
+     211.0443572998047,
+     210.67776489257812,
+     209.52671813964844,
+     210.84774780273438,
+     210.7969207763672
+    ],
+    "A|M": [
+     134.33065795898438,
+     134.23516845703125,
+     134.1982421875,
+     134.33404541015625,
+     134.1571807861328,
+     134.31333923339844,
+     134.346435546875,
+     134.14218139648438,
+     134.34828186035156,
+     134.29212951660156
+    ],
+    "A|M-SER": [
+     211.3054656982422,
+     211.4938507080078,
+     211.48822021484375,
+     211.44773864746094,
+     211.54864501953125,
+     211.52032470703125,
+     211.6251220703125,
+     211.6654052734375,
+     212.5657958984375,
+     211.75833129882812
+    ],
+    "CPY": [
+     295.2836608886719,
+     295.203369140625,
+     295.8183898925781,
+     295.8285827636719,
+     295.39678955078125,
+     295.5447082519531,
+     295.5567932128906,
+     295.7087097167969,
+     295.4055480957031,
+     295.5674743652344
+    ],
+    "CPY-SER": [
+     395.4421691894531,
+     395.48541259765625,
+     395.494384765625,
+     395.4840393066406,
+     395.4302978515625,
+     395.3800964355469,
+     395.6514892578125,
+     395.79962158203125,
+     395.70245361328125,
+     395.8164978027344
+    ],
+    "F": [
+     59.38585662841797,
+     50.865535736083984,
+     56.74291229248047,
+     57.232383728027344,
+     57.23545455932617,
+     57.29280090332031,
+     57.231361389160156,
+     57.466880798339844,
+     59.8732795715332,
+     57.67340850830078
+    ],
+    "FG": [
+     184.4337615966797,
+     184.49856567382812,
+     184.51388549804688,
+     184.46556091308594,
+     184.45823669433594,
+     184.61541748046875,
+     184.62045288085938,
+     184.5250244140625,
+     184.57452392578125,
+     184.56288146972656
+    ],
+    "F|M": [
+     135.00131225585938,
+     134.92495727539062,
+     135.15878295898438,
+     135.1411895751953,
+     135.03414916992188,
+     135.2034912109375,
+     134.9871063232422,
+     134.9365692138672,
+     135.09878540039062,
+     135.12106323242188
+    ],
+    "F|M-SER": [
+     186.92005920410156,
+     186.785400390625,
+     186.79843139648438,
+     186.857666015625,
+     186.76022338867188,
+     186.85763549804688,
+     186.90765380859375,
+     186.77098083496094,
+     186.88262939453125,
+     186.737060546875
+    ],
+    "G": [
+     133.81427001953125,
+     133.87673950195312,
+     133.73440551757812,
+     133.82655334472656,
+     133.79994201660156,
+     133.78970336914062,
+     133.75897216796875,
+     133.70880126953125,
+     133.83372497558594,
+     133.79855346679688
+    ],
+    "GRP": [
+     251.83847045898438,
+     251.37254333496094,
+     254.06361389160156,
+     251.72479248046875,
+     254.79168701171875,
+     251.4687957763672,
+     253.83424377441406,
+     251.96237182617188,
+     251.7626953125,
+     250.12063598632812
+    ],
+    "GRP-SER": [
+     279.7240295410156,
+     279.6083068847656,
+     279.720947265625,
+     279.7434997558594,
+     279.836669921875,
+     279.5950012207031,
+     279.89605712890625,
+     279.9390869140625,
+     279.9656982421875,
+     279.991455078125
+    ],
+    "GRP0": [
+     140.33407592773438,
+     140.31666564941406,
+     140.3494415283203,
+     140.38426208496094,
+     140.42214965820312,
+     140.3310089111328,
+     140.4200897216797,
+     140.48562622070312,
+     140.49996948242188,
+     140.57440185546875
+    ],
+    "GRP1": [
+     139.3448944091797,
+     139.36026000976562,
+     139.37356567382812,
+     139.42373657226562,
+     139.4483184814453,
+     139.2895965576172,
+     139.43910217285156,
+     139.49644470214844,
+     139.48416137695312,
+     139.52499389648438
+    ],
+    "GRPL": [
+     258.4289245605469,
+     258.3531494140625,
+     258.4473571777344,
+     258.5251770019531,
+     258.5006103515625,
+     258.41357421875,
+     258.43505859375,
+     259.0320739746094,
+     259.21844482421875,
+     256.5205383300781
+    ],
+    "M": [
+     133.1824951171875,
+     133.16873168945312,
+     133.17864990234375,
+     133.05059814453125,
+     133.16717529296875,
+     133.1775665283203,
+     133.20877075195312,
+     133.17120361328125,
+     133.18966674804688,
+     133.18275451660156
+    ],
+    "P": [
+     133.28297424316406,
+     133.2674560546875,
+     133.2662353515625,
+     133.261474609375,
+     133.26194763183594,
+     133.2593994140625,
+     133.2632293701172,
+     133.2657928466797,
+     133.26258850097656,
+     133.26771545410156
+    ],
+    "SER": [
+     263.4068298339844,
+     262.94256591796875,
+     263.01025390625,
+     262.9656982421875,
+     262.7115173339844,
+     262.8779602050781,
+     263.6877136230469,
+     263.2208251953125,
+     263.4789733886719,
+     263.5433654785156
+    ]
+   },
+   "wall_s": 67.6,
+   "warmup_ms": {
+    "A": [
+     83.30342102050781,
+     89.0224609375
+    ],
+    "A|F": [
+     134.23388671875,
+     139.347900390625
+    ],
+    "A|F-SER": [
+     135.19158935546875,
+     139.1216583251953
+    ],
+    "A|FG": [
+     245.4938507080078,
+     245.45826721191406
+    ],
+    "A|FG-SER": [
+     260.01287841796875,
+     260.031494140625
+    ],
+    "A|F|M": [
+     136.0650634765625,
+     138.68453979492188
+    ],
+    "A|F|M-SER": [
+     262.17889404296875,
+     262.17327880859375
+    ],
+    "A|G": [
+     195.60572814941406,
+     193.53245544433594
+    ],
+    "A|G-SER": [
+     210.61325073242188,
+     209.1161651611328
+    ],
+    "A|M": [
+     134.27638244628906,
+     134.28909301757812
+    ],
+    "A|M-SER": [
+     211.35382080078125,
+     211.37501525878906
+    ],
+    "CPY": [
+     295.2337646484375,
+     294.9384765625
+    ],
+    "CPY-SER": [
+     395.21826171875,
+     395.2415771484375
+    ],
+    "F": [
+     56.71116638183594,
+     52.313087463378906
+    ],
+    "FG": [
+     184.73802185058594,
+     184.7552032470703
+    ],
+    "F|M": [
+     135.17510986328125,
+     135.26947021484375
+    ],
+    "F|M-SER": [
+     186.87893676757812,
+     186.8245391845703
+    ],
+    "G": [
+     133.87059020996094,
+     133.83680725097656
+    ],
+    "GRP": [
+     251.87635803222656,
+     251.3244171142578
+    ],
+    "GRP-SER": [
+     279.4803161621094,
+     279.478271484375
+    ],
+    "GRP0": [
+     140.23065185546875,
+     140.2275848388672
+    ],
+    "GRP1": [
+     139.2394256591797,
+     139.3121337890625
+    ],
+    "GRPL": [
+     258.07666015625,
+     258.3459777832031
+    ],
+    "M": [
+     133.1760711669922,
+     133.06915283203125
+    ],
+    "P": [
+     133.3501434326172,
+     133.24636840820312
+    ],
+    "SER": [
+     262.6374816894531,
+     259.915771484375
+    ]
+   }
+  }
+ }
+}

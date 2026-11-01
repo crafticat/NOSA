@@ -1,0 +1,1 @@
+2195576.8|i4b-i4bsb-w4sb-2195576|COMPLETED|0:0|00:22:49|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=340G,node=1|2987160K

@@ -1,0 +1,1 @@
+2195575.12|i4b-i4bsa-w3sa-2195575|COMPLETED|0:0|00:17:02|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=240G,node=1|3138804K

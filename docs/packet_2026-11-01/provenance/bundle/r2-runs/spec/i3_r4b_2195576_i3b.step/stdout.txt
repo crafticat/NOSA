@@ -1,0 +1,86 @@
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+[r2_i3 07:33:01] model loaded in 11 s
+[r2_i3 07:33:01] arm SH (B 318, 512 steps, C 73)
+[r2_i3 07:51:33] arm L4PT ({'arm': 'L4PT', 'K': 3, 'rounds': 0, 'journal': 256, 'extra': 16, 'X': 193, 'spill': 0, 'tu_gemm': 'natural', 'twin': 'fused', 'body': 'fused', 'graph': True, 'redirect': True, 'probe_every': 16, 'check_every': 0, 'passes': 32, 'check_phase': 0, 'profile': True, 'plant_X': 4, 'fork_store': 0, 'prefill_hook': 'nocopy'})
+[r2_i3 08:08:57] arm L4PTU ({'arm': 'L4PTU', 'K': 3, 'rounds': 0, 'journal': 256, 'extra': 16, 'X': 193, 'spill': 0, 'tu_gemm': 'natural', 'twin': 'fused', 'body': 'fused', 'graph': True, 'redirect': True, 'probe_every': 16, 'check_every': 0, 'passes': 32, 'check_phase': 0, 'profile': True, 'plant_X': 4, 'fork_store': 0, 'prefill_hook': 'nocopy'})
+[r2_i3 08:26:08] arm L4PTF ({'arm': 'L4PTF', 'K': 3, 'rounds': 0, 'journal': 256, 'extra': 16, 'X': 193, 'spill': 0, 'tu_gemm': 'natural', 'twin': 'fused', 'body': 'fused', 'graph': True, 'redirect': True, 'probe_every': 16, 'check_every': 0, 'passes': 32, 'check_phase': 0, 'profile': True, 'plant_X': 4, 'fork_store': 0, 'prefill_hook': 'nocopy'})
+GATE C0_FORK          MUST PASS: /mnt/beegfs/ojerbi/nosi-r2-i3/benchmarks/Efficiency/fork_vllm_unified_attention.py (blob pinned by the step: f0dc0c183a388585e216505a6bbfc696531e8add)
+GATE SH-RUN           MUST PASS: 512 steps, 9 re-warms
+GATE SH-MEM           REPORT PASS: peak allocated 74.964 GB (after the prefill 74.964 GB, prefill None GB) against 84.0 GB; prefill + decode
+GATE L4PT-RUN         MUST PASS: 206 rounds of K 3
+GATE L4PT-ERR         MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE L4PT-COMMIT-N    MUST PASS: committed per request min 512 max 512 (exactly 512 wanted); warm 318 + per-round sum 162498, total 162816; 206 rounds
+GATE L4PT-D1          MUST PASS: residency-undo calls 0 (0 expected); resets 206 for 206 rounds
+GATE L4PT-D3          MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 820 = (K + 1) x 205 passes; one-row J slots 1; 206 rounds
+GATE L4PT-SPAN        MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE L4PT-MEM         REPORT PASS: peak allocated 74.965 GB (after the prefill 74.218 GB, prefill 74.965 GB) against 84.0 GB; {'start_GB': 15.362, 'prefill_peak_GB': 69.817, 'decode_peak_GB': 69.121, 'decode_peak_reserved_GB': 69.848, 'fit_batch_decode_MODEL': 406, 'fit_batch_prefill_MODEL': 400, 'budget_GB': 84.0}
+GATE L4PTU-RUN        MUST PASS: 207 rounds of K 3
+GATE L4PTU-ERR        MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE L4PTU-COMMIT-N   MUST PASS: committed per request min 512 max 512 (exactly 512 wanted); warm 318 + per-round sum 162498, total 162816; 207 rounds
+GATE L4PTU-D1         MUST PASS: residency-undo calls 0 (0 expected); resets 207 for 207 rounds
+GATE L4PTU-D3         MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 828 = (K + 1) x 207 passes; one-row J slots 0; 207 rounds
+GATE L4PTU-SPAN       MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE L4PTU-RESID      MUST PASS: residency calls in joint passes 6624 for 207 joint passes of 32 layers (one per layer and pass); union layers 6624; verify_rows passes 207
+GATE L4PTU-MEM        REPORT PASS: peak allocated 78.26 GB (after the prefill 78.26 GB, prefill 74.965 GB) against 84.0 GB; {'start_GB': 15.362, 'prefill_peak_GB': 69.817, 'decode_peak_GB': 72.885, 'decode_peak_reserved_GB': 73.566, 'fit_batch_decode_MODEL': 379, 'fit_batch_prefill_MODEL': 400, 'budget_GB': 84.0}
+GATE L4PTF-RUN        MUST PASS: 209 rounds of K 3
+GATE L4PTF-ERR        MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE L4PTF-COMMIT-N   MUST PASS: committed per request min 512 max 512 (exactly 512 wanted); warm 318 + per-round sum 162498, total 162816; 209 rounds
+GATE L4PTF-D1         MUST PASS: residency-undo calls 0 (0 expected); resets 209 for 209 rounds
+GATE L4PTF-D3         MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 836 = (K + 1) x 209 passes; one-row J slots 0; 209 rounds
+GATE L4PTF-SPAN       MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE L4PTF-RESID      MUST PASS: residency calls in joint passes 6688 for 209 joint passes of 32 layers (one per layer and pass); union layers 6688; verify_rows passes 209
+GATE L4PTF-ATTN1      MUST PASS: attn calls 6688 for 209 joint passes of 32 layers (one per layer and pass)
+GATE L4PTF-FILL1      MUST PASS: fills calls 6688 for 209 joint passes of 32 layers (one per layer and pass)
+GATE L4PTF-MEM        REPORT PASS: peak allocated 77.685 GB (after the prefill 76.932 GB, prefill 77.685 GB) against 84.0 GB; {'start_GB': 15.362, 'prefill_peak_GB': 72.35, 'arena': {'L': 32, 'B': 318, 'NS': 74, 'H': 2, 'D': 128, 'X': 129, 'bs': 64, 'n_blocks': 794364, 'store_base': 753024, 'store_GB': 2.6989, 'arena_GB': 52.2628, 'dtype': 'torch.bfloat16', 'cb0_base': 794046, 'cb0_GB': 0.0209, 'cb1': 'store slot 0', 'kind': 'chain'}, 'hook': 'nocopy', 'decode_peak_GB': 71.648, 'decode_peak_reserved_GB': 71.885}
+PREDICTION I1-RATIO         CONFIRMED: 0.4824; registered (0.45, 0.51)
+PREDICTION I2X-RATIO        CONFIRMED: 0.5151; registered (0.49, 0.55)
+PREDICTION I3-RATIO         CONFIRMED: 0.5913; registered (0.54, 0.61)
+PREDICTION I3-VS-I1         CONFIRMED: 1.2256; registered (1.1, 1.25)
+PREDICTION I3-VS-I2X        CONFIRMED: 1.1478; registered (1.04, 1.16)
+PREDICTION I3-JOINT-SH      CONFIRMED: 3.0940; registered (2.9, 3.5)
+PREDICTION I3-JOINT-SAVING  CONFIRMED: 82.9320; registered (40.0, 95.0)
+PREDICTION I3-ROLLBACK-SH   CONFIRMED: 0.0686; registered (0.03, 0.3)
+PREDICTION I3-PEAK-GB       CONFIRMED: 76.9320; registered (76.5, 79.5)
+PREDICTION I3-AGREE         CONFIRMED: committed tokens equal to SH's: 0.387904 (first difference (52, 1)); registered >= 0.25
+PREDICTION I3-ABOVE-I2X     CONFIRMED: L4PTF 1514.5 vs L4PTU 1319.5 tok/s (the rung falsifier: below the previous rung); registered True
+PREDICTION I3-VS-STRONGEST  REPORT: median steady tok/s / 3407.2: 0.4445
+REPORT SH B 318 C 73: steady 124.152 ms/step, tok/s median 2561.4 mean 2476.3 effective 1315.6, peak 74.964 GB, memory {'start_GB': 15.349, 'peak_GB': 74.964, 'fit_batch_MODEL': 366, 'budget_GB': 84.0}
+REPORT L4PT K 3: 206 rounds; committed tok/s median 1235.7 mean 1115.1 effective 1028.7; vs SH {'median_tok_s': 0.4824, 'mean_tok_s': 0.4503, 'effective_tok_s': 0.7819}; vs 3407.2 0.3627; joint pass 4.1922 SH steps; phases {'reset': 0.117, 'joint': 520.466, 'commit': 8.588, 'draft': 195.158}; ROLLBACK per round {'median_ms': 8.731, 'mean_ms': 8.963, 'rounds': 193, 'phases': ['reset', 'commit'], 'lower_bound': False, 'sh_steps': 0.0703}; calls {'residency_undo_calls': 0, 'reset_calls': 206, 'commit_calls': 206, 'deferred_recompute_rows': 0, 'remade_rows': 0, 'joint_passes': 205, 'joint_rows': 820, 'j1_passes': 1, 'replays': 55550, 'undo_step_calls': 0}; tokens equal 0.389028 (first (66, 1)); fingerprints {'n': 10211, 'equal': 0.031143, 'max_abs_dmax': 15.375, 'max_abs_dsum': 263332.94925260544}; memory {'start_GB': 15.362, 'prefill_peak_GB': 69.817, 'decode_peak_GB': 69.121, 'decode_peak_reserved_GB': 69.848, 'fit_batch_decode_MODEL': 406, 'fit_batch_prefill_MODEL': 400, 'budget_GB': 84.0}; peak 74.218 GB
+REPORT L4PTU K 3: 207 rounds; committed tok/s median 1319.5 mean 1198.9 effective 1124.5; vs SH {'median_tok_s': 0.5151, 'mean_tok_s': 0.4841, 'effective_tok_s': 0.8547}; vs 3407.2 0.3873; joint pass 3.762 SH steps; phases {'reset': 0.118, 'joint': 467.056, 'commit': 8.568, 'draft': 197.076}; ROLLBACK per round {'median_ms': 8.7, 'mean_ms': 8.913, 'rounds': 194, 'phases': ['reset', 'commit'], 'lower_bound': False, 'sh_steps': 0.0701}; calls {'residency_undo_calls': 0, 'reset_calls': 207, 'commit_calls': 207, 'deferred_recompute_rows': 0, 'remade_rows': 0, 'joint_passes': 207, 'joint_rows': 828, 'j1_passes': 0, 'replays': 55649, 'undo_step_calls': 0}; tokens equal 0.391000 (first (66, 1)); fingerprints {'n': 10042, 'equal': 0.031667, 'max_abs_dmax': 18.3125, 'max_abs_dsum': 259321.17069101334}; memory {'start_GB': 15.362, 'prefill_peak_GB': 69.817, 'decode_peak_GB': 72.885, 'decode_peak_reserved_GB': 73.566, 'fit_batch_decode_MODEL': 379, 'fit_batch_prefill_MODEL': 400, 'budget_GB': 84.0}; peak 78.26 GB
+REPORT L4PTU union: {'joint_passes': 207, 'joint_resid': 6624, 'union_layers': 6624, 'resid_per_joint_pass': 32.0, 'layers': 32, 'calls_per_joint_pass': {'gemm': 129.0, 'attn': 96.0, 'resid': 32.0, 'gather_dev': 64.0, 'gather_host': 64.0, 'fills': 32.0}, 'fills': 1, 'cap': 192, 'counters': {'extras': 0, 'extras_pool': 0, 'extras_host': 0, 'extras_max': 0, 'spill': 0, 'unserved': 0, 'fills_used': 0, 'spill_fills_used': 0, 'dropped': 0, 'skipped': 0, 'vis_bad': 0, 'visible_blocks': 0, 'rows_full': 0, 'rows_res': 0, 'win_sel': 0, 'win_host': 0, 'streamed_rows': 0, 'union_mean': None}, 'rows': {'dropped': [0, 0, 0, 0], 'skipped': [0, 0, 0, 0], 'vis_bad': [0, 0, 0, 0], 'visible': [0, 0, 0, 0], 'selected': [0, 0, 0, 0]}}
+REPORT L4PTU joint-pass phases (probe) {'n_probes': 12, 'labels_median': {'attn': 103.1465, 'buffer': 14.6739, 'fetch': 95.8162, 'merge': 1.6794, 'post': 122.8129, 'resid': 80.1382, 'union': 27.2466, 'write': 11.2102}, 'groups_median': {'residency': 80.1382, 'write': 11.2103, 'union': 27.2466, 'fetch': 95.8161, 'attention': 119.5402, 'spill': 0.0, 'dense_next': 122.813, 'total': 456.0937}, 'layer_ms_median': 13.9182, 'layers_per_pass': 31}
+REPORT L4PTF K 3: 209 rounds; committed tok/s median 1514.5 mean 1367.3 effective 1267.0; vs SH {'median_tok_s': 0.5913, 'mean_tok_s': 0.5522, 'effective_tok_s': 0.9631}; vs 3407.2 0.4445; joint pass 3.094 SH steps; phases {'reset': 0.114, 'joint': 384.124, 'commit': 8.397, 'draft': 196.218}; ROLLBACK per round {'median_ms': 8.522, 'mean_ms': 8.813, 'rounds': 195, 'phases': ['reset', 'commit'], 'lower_bound': False, 'sh_steps': 0.0686}; calls {'residency_undo_calls': 0, 'reset_calls': 209, 'commit_calls': 209, 'deferred_recompute_rows': 0, 'remade_rows': 0, 'joint_passes': 209, 'joint_rows': 836, 'j1_passes': 0, 'replays': 55548, 'undo_step_calls': 0}; tokens equal 0.387904 (first (52, 1)); fingerprints {'n': 10089, 'equal': 0.031519, 'max_abs_dmax': 19.1875, 'max_abs_dsum': 253508.45331811905}; memory {'start_GB': 15.362, 'prefill_peak_GB': 72.35, 'arena': {'L': 32, 'B': 318, 'NS': 74, 'H': 2, 'D': 128, 'X': 129, 'bs': 64, 'n_blocks': 794364, 'store_base': 753024, 'store_GB': 2.6989, 'arena_GB': 52.2628, 'dtype': 'torch.bfloat16', 'cb0_base': 794046, 'cb0_GB': 0.0209, 'cb1': 'store slot 0', 'kind': 'chain'}, 'hook': 'nocopy', 'decode_peak_GB': 71.648, 'decode_peak_reserved_GB': 71.885, 'fit_batch_decode_MODEL': 387, 'fit_batch_prefill_MODEL': 383, 'budget_GB': 84.0}; peak 76.932 GB
+REPORT L4PTF union: {'joint_passes': 209, 'joint_resid': 6688, 'union_layers': 6688, 'resid_per_joint_pass': 32.0, 'layers': 32, 'calls_per_joint_pass': {'gemm': 129.0, 'attn': 32.0, 'resid': 32.0, 'gather_dev': 0.0, 'gather_host': 64.0, 'fills': 32.0}, 'fills': 1, 'cap': 128, 'counters': {'extras': 0, 'extras_pool': 0, 'extras_host': 0, 'extras_max': 0, 'spill': 0, 'unserved': 0, 'fills_used': 0, 'spill_fills_used': 0, 'dropped': 0, 'skipped': 0, 'vis_bad': 0, 'visible_blocks': 0, 'rows_full': 0, 'rows_res': 0, 'win_sel': 0, 'win_host': 0, 'streamed_rows': 0, 'union_mean': None}, 'rows': {'dropped': [0, 0, 0, 0], 'skipped': [0, 0, 0, 0], 'vis_bad': [0, 0, 0, 0], 'visible': [0, 0, 0, 0], 'selected': [0, 0, 0, 0]}}
+REPORT L4PTF fork: {'store_slots': 129, 'bound': 128, 'chunks': [4], 'counters': {'pool_reads': 0, 'store_reads': 0, 'extras_host': 0, 'extras_pool': 0, 'extras_max': 0, 'unserved': 0, 'dropped': 0, 'vis_bad': 0, 'vb_bad': 0, 'vb_rows': 0, 'tail_reads': 0, 'chain_bad': 0, 'chain_rows': 0, 'chain_reads': 0, 'past_edge': 0, 'f4_rows': 0, 'fork_loaded': 0, 'block0_bad': 0}}; joint-pass phases (probe) {'n_probes': 13, 'labels_median': {'attn': 56.4623, 'chain': 4.9428, 'check': 0.0942, 'fetch': 86.8639, 'post': 121.7454, 'resid': 81.8975, 'union': 14.9709, 'write': 11.0868}, 'groups_median': {'residency': 81.8975, 'write': 11.0868, 'chain': 4.9428, 'union': 14.9709, 'fetch': 86.8639, 'attention': 56.4623, 'check': 0.0942, 'dense_next': 121.7454, 'total': 378.7469}, 'layer_ms_median': 11.0746, 'layers_per_pass': 31}; store {'X': 129, 'store_GB': 2.6989, 'cb0_GB': 0.0209}; arena memory {'start_GB': 15.362, 'prefill_peak_GB': 72.35, 'arena': {'L': 32, 'B': 318, 'NS': 74, 'H': 2, 'D': 128, 'X': 129, 'bs': 64, 'n_blocks': 794364, 'store_base': 753024, 'store_GB': 2.6989, 'arena_GB': 52.2628, 'dtype': 'torch.bfloat16', 'cb0_base': 794046, 'cb0_GB': 0.0209, 'cb1': 'store slot 0', 'kind': 'chain'}, 'hook': 'nocopy', 'decode_peak_GB': 71.648, 'decode_peak_reserved_GB': 71.885}; compile {'num_warps': 4, 'num_stages': 3, 'regs': 255, 'local_words': 12, 'shared': 59392}
+r2_i3: 0 MUST gate(s) failed

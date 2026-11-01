@@ -1,0 +1,1930 @@
+R2 bf1 child: host nova07 gpu GPU-33cfb929-315c-8d27-5622-1169affb7e04; hashing the image at 2026-10-31T13:05:41Z
+R2 bf1 child: image sha256 14bfb15e1258821e637b5936f2060d7c7c2be20410fdee2a54ee0ffef754734a OK at 2026-10-31T13:06:07Z
+R2 bf1 child: workload sha256 a25d1e16592c72d40550a3a05a2ac7673df0b57ce7fb1e9293f1451de4c8a0ce OK
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+Missing required keys in `rope_scaling`: 'factor'
+`torch_dtype` is deprecated! Use `dtype` instead!
+Missing required keys in `rope_scaling`: 'factor'
+coverting model:   0%|          | 0/32 [00:00<?, ?it/s]coverting model:   3%|▎         | 1/32 [00:00<00:07,  4.14it/s]coverting model:   6%|▋         | 2/32 [00:00<00:07,  4.19it/s]coverting model:   9%|▉         | 3/32 [00:00<00:06,  4.18it/s]coverting model:  12%|█▎        | 4/32 [00:00<00:06,  4.16it/s]coverting model:  16%|█▌        | 5/32 [00:01<00:06,  4.03it/s]coverting model:  19%|█▉        | 6/32 [00:01<00:06,  4.10it/s]coverting model:  22%|██▏       | 7/32 [00:01<00:06,  4.15it/s]coverting model:  25%|██▌       | 8/32 [00:01<00:05,  4.18it/s]coverting model:  28%|██▊       | 9/32 [00:02<00:05,  4.11it/s]coverting model:  31%|███▏      | 10/32 [00:02<00:05,  4.15it/s]coverting model:  34%|███▍      | 11/32 [00:02<00:05,  4.08it/s]coverting model:  38%|███▊      | 12/32 [00:02<00:04,  4.09it/s]coverting model:  41%|████      | 13/32 [00:03<00:04,  4.13it/s]coverting model:  44%|████▍     | 14/32 [00:03<00:04,  4.16it/s]coverting model:  47%|████▋     | 15/32 [00:03<00:04,  4.21it/s]coverting model:  50%|█████     | 16/32 [00:03<00:03,  4.21it/s]coverting model:  53%|█████▎    | 17/32 [00:04<00:03,  4.13it/s]coverting model:  56%|█████▋    | 18/32 [00:04<00:03,  4.14it/s]coverting model:  59%|█████▉    | 19/32 [00:04<00:03,  4.05it/s]coverting model:  62%|██████▎   | 20/32 [00:04<00:02,  4.08it/s]coverting model:  66%|██████▌   | 21/32 [00:05<00:02,  4.12it/s]coverting model:  69%|██████▉   | 22/32 [00:05<00:02,  4.13it/s]coverting model:  72%|███████▏  | 23/32 [00:05<00:02,  4.16it/s]coverting model:  75%|███████▌  | 24/32 [00:05<00:01,  4.16it/s]coverting model:  78%|███████▊  | 25/32 [00:06<00:01,  4.17it/s]coverting model:  81%|████████▏ | 26/32 [00:06<00:01,  4.19it/s]coverting model:  84%|████████▍ | 27/32 [00:06<00:01,  4.12it/s]coverting model:  88%|████████▊ | 28/32 [00:06<00:00,  4.14it/s]coverting model:  91%|█████████ | 29/32 [00:07<00:00,  4.17it/s]coverting model:  94%|█████████▍| 30/32 [00:07<00:00,  4.19it/s]coverting model:  97%|█████████▋| 31/32 [00:07<00:00,  4.12it/s]coverting model: 100%|██████████| 32/32 [00:07<00:00,  4.07it/s]coverting model: 100%|██████████| 32/32 [00:07<00:00,  4.13it/s]
+Prefilling (batch size=8):   0%|          | 0/1 [00:00<?, ?it/s]
+prefill batch:   0%|          | 0/8 [00:00<?, ?it/s][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   3%|▎         | 1/32 [01:44<54:05, 104.70s/it][A[A
+
+prefill layer:   9%|▉         | 3/32 [01:44<13:09, 27.22s/it] [A[A
+
+prefill layer:  16%|█▌        | 5/32 [01:45<05:58, 13.29s/it][A[A
+
+prefill layer:  19%|█▉        | 6/32 [01:45<04:13,  9.75s/it][A[A
+
+prefill layer:  22%|██▏       | 7/32 [01:45<02:56,  7.08s/it][A[A
+
+prefill layer:  25%|██▌       | 8/32 [01:45<02:02,  5.10s/it][A[A
+
+prefill layer:  28%|██▊       | 9/32 [01:45<01:24,  3.67s/it][A[A
+
+prefill layer:  31%|███▏      | 10/32 [01:45<00:57,  2.63s/it][A[A
+
+prefill layer:  34%|███▍      | 11/32 [01:45<00:39,  1.89s/it][A[A
+
+prefill layer:  38%|███▊      | 12/32 [01:45<00:27,  1.37s/it][A[A
+
+prefill layer:  41%|████      | 13/32 [01:46<00:18,  1.00it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [01:46<00:13,  1.36it/s][A[A
+
+prefill layer:  47%|████▋     | 15/32 [01:46<00:09,  1.82it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [01:46<00:06,  2.38it/s][A[A
+
+prefill layer:  53%|█████▎    | 17/32 [01:46<00:04,  3.03it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [01:46<00:03,  3.75it/s][A[A
+
+prefill layer:  59%|█████▉    | 19/32 [01:46<00:02,  4.50it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [01:46<00:02,  5.24it/s][A[A
+
+prefill layer:  66%|██████▌   | 21/32 [01:47<00:01,  5.92it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [01:47<00:01,  6.45it/s][A[A
+
+prefill layer:  72%|███████▏  | 23/32 [01:47<00:01,  6.97it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [01:47<00:01,  7.36it/s][A[A
+
+prefill layer:  78%|███████▊  | 25/32 [01:47<00:00,  7.66it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [01:47<00:00,  7.88it/s][A[A
+
+prefill layer:  84%|████████▍ | 27/32 [01:47<00:00,  8.06it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [01:47<00:00,  8.19it/s][A[A
+
+prefill layer:  91%|█████████ | 29/32 [01:47<00:00,  8.28it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [01:48<00:00,  8.34it/s][A[A
+
+prefill layer:  97%|█████████▋| 31/32 [01:48<00:00,  8.38it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [01:48<00:00,  8.39it/s][A[Aprefill layer: 100%|██████████| 32/32 [01:48<00:00,  3.39s/it]
+
+prefill batch:  12%|█▎        | 1/8 [01:48<12:38, 108.41s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.22it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.65it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.83it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.95it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.96it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.99it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 14.03it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 14.05it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:00, 14.06it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 14.07it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 14.06it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 14.04it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 14.04it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 14.03it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 14.01it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 14.00it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.98it/s]
+
+prefill batch:  25%|██▌       | 2/8 [01:50<04:35, 45.99s/it] [A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.84it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.99it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.95it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.98it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.99it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.99it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 14.01it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 14.03it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:00, 14.02it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 14.01it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 14.01it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 14.01it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 14.02it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:01<00:00, 14.01it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 14.01it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.99it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 14.00it/s]
+
+prefill batch:  38%|███▊      | 3/8 [01:52<02:10, 26.03s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.95it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.95it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.95it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.98it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.99it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.95it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.94it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.91it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.91it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.90it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.92it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.92it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.93it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.93it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.91it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.90it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.92it/s]
+
+prefill batch:  50%|█████     | 4/8 [01:55<01:06, 16.66s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.92it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.97it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.98it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.96it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.98it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.99it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 14.00it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.90it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.94it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.96it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.96it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.98it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.98it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.99it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.96it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.89it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.95it/s]
+
+prefill batch:  62%|██████▎   | 5/8 [01:57<00:34, 11.48s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.91it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.96it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.99it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.99it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.95it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.96it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.97it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.98it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.99it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 14.00it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 14.00it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 14.00it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.98it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.97it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.97it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.97it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.98it/s]
+
+prefill batch:  75%|███████▌  | 6/8 [01:59<00:16,  8.36s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.91it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.90it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.91it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.93it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.95it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.96it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.96it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.93it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.95it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.95it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.97it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.99it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 14.00it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 14.00it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.99it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.80it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.93it/s]
+
+prefill batch:  88%|████████▊ | 7/8 [02:02<00:06,  6.38s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.70it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.81it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.83it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.86it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.86it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.85it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.88it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.91it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.92it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.96it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.96it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.95it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.94it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.96it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.96it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.97it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.92it/s]
+
+prefill batch: 100%|██████████| 8/8 [02:04<00:00,  5.08s/it][Aprefill batch: 100%|██████████| 8/8 [02:04<00:00, 15.56s/it]
+Prefilling (batch size=8): 100%|██████████| 1/1 [02:04<00:00, 124.48s/it]Prefilling (batch size=8): 100%|██████████| 1/1 [02:04<00:00, 124.48s/it]
+Prefilling (batch size=8):   0%|          | 0/1 [00:00<?, ?it/s]
+prefill batch:   0%|          | 0/8 [00:00<?, ?it/s][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 10.75it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:03,  9.10it/s][A[A
+
+prefill layer:  16%|█▌        | 5/32 [00:00<00:03,  8.81it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:03,  8.64it/s][A[A
+
+prefill layer:  22%|██▏       | 7/32 [00:00<00:02,  8.52it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:02,  8.43it/s][A[A
+
+prefill layer:  28%|██▊       | 9/32 [00:01<00:02,  8.36it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:01<00:02,  8.33it/s][A[A
+
+prefill layer:  34%|███▍      | 11/32 [00:01<00:02,  8.31it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:01<00:02,  8.33it/s][A[A
+
+prefill layer:  41%|████      | 13/32 [00:01<00:02,  8.31it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:02,  8.32it/s][A[A
+
+prefill layer:  47%|████▋     | 15/32 [00:01<00:02,  8.35it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01,  8.37it/s][A[A
+
+prefill layer:  53%|█████▎    | 17/32 [00:01<00:01,  8.34it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:02<00:01,  8.38it/s][A[A
+
+prefill layer:  59%|█████▉    | 19/32 [00:02<00:01,  8.40it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:02<00:01,  8.40it/s][A[A
+
+prefill layer:  66%|██████▌   | 21/32 [00:02<00:01,  8.41it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:02<00:01,  8.41it/s][A[A
+
+prefill layer:  72%|███████▏  | 23/32 [00:02<00:01,  8.39it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:02<00:00,  8.40it/s][A[A
+
+prefill layer:  78%|███████▊  | 25/32 [00:02<00:00,  8.40it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:03<00:00,  8.40it/s][A[A
+
+prefill layer:  84%|████████▍ | 27/32 [00:03<00:00,  8.41it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:03<00:00,  8.42it/s][A[A
+
+prefill layer:  91%|█████████ | 29/32 [00:03<00:00,  8.43it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:03<00:00,  8.42it/s][A[A
+
+prefill layer:  97%|█████████▋| 31/32 [00:03<00:00,  8.40it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:03<00:00,  8.39it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:03<00:00,  8.46it/s]
+
+prefill batch:  12%|█▎        | 1/8 [00:03<00:26,  3.78s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 14.34it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:01, 14.11it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.99it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.95it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.95it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.97it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.97it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.96it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.94it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.96it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.98it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.98it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.96it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.96it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.92it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.91it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.96it/s]
+
+prefill batch:  25%|██▌       | 2/8 [00:06<00:17,  2.91s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.92it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.87it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.89it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.90it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.91it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.89it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.89it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.90it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.94it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.95it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.94it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.93it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.94it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.93it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.91it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.88it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.91it/s]
+
+prefill batch:  38%|███▊      | 3/8 [00:08<00:13,  2.63s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.84it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.86it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.86it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.87it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.87it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.84it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.86it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.88it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.90it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.90it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.87it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.86it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.81it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.80it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.82it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.83it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.85it/s]
+
+prefill batch:  50%|█████     | 4/8 [00:10<00:10,  2.50s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.78it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.86it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.80it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.77it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.81it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.80it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.82it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.86it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.86it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.73it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.82it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.84it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.85it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.85it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.84it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.82it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.82it/s]
+
+prefill batch:  62%|██████▎   | 5/8 [00:13<00:07,  2.44s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.78it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.83it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.85it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.84it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.84it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.84it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.85it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.87it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.87it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.87it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.87it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.88it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.88it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.87it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.86it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.85it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.86it/s]
+
+prefill batch:  75%|███████▌  | 6/8 [00:15<00:04,  2.39s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.78it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.82it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.82it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.84it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.84it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.87it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.87it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.85it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.89it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.89it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.87it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.87it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.88it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.89it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.87it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.84it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.86it/s]
+
+prefill batch:  88%|████████▊ | 7/8 [00:17<00:02,  2.37s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.71it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.80it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.76it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.81it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.82it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.79it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.78it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.77it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.80it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.85it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.88it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.86it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.85it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.84it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.81it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.79it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.81it/s]
+
+prefill batch: 100%|██████████| 8/8 [00:19<00:00,  2.35s/it][Aprefill batch: 100%|██████████| 8/8 [00:19<00:00,  2.49s/it]
+Prefilling (batch size=8): 100%|██████████| 1/1 [00:19<00:00, 19.94s/it]Prefilling (batch size=8): 100%|██████████| 1/1 [00:19<00:00, 19.94s/it]
+Prefilling (batch size=8):   0%|          | 0/1 [00:00<?, ?it/s]
+prefill batch:   0%|          | 0/8 [00:00<?, ?it/s][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 10.80it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:03,  9.14it/s][A[A
+
+prefill layer:  16%|█▌        | 5/32 [00:00<00:03,  8.85it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:02,  8.68it/s][A[A
+
+prefill layer:  22%|██▏       | 7/32 [00:00<00:02,  8.54it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:02,  8.42it/s][A[A
+
+prefill layer:  28%|██▊       | 9/32 [00:01<00:02,  8.41it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:01<00:02,  8.36it/s][A[A
+
+prefill layer:  34%|███▍      | 11/32 [00:01<00:02,  8.34it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:01<00:02,  8.35it/s][A[A
+
+prefill layer:  41%|████      | 13/32 [00:01<00:02,  8.36it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:02,  8.38it/s][A[A
+
+prefill layer:  47%|████▋     | 15/32 [00:01<00:02,  8.39it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01,  8.39it/s][A[A
+
+prefill layer:  53%|█████▎    | 17/32 [00:01<00:01,  8.39it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:02<00:01,  8.42it/s][A[A
+
+prefill layer:  59%|█████▉    | 19/32 [00:02<00:01,  8.43it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:02<00:01,  8.42it/s][A[A
+
+prefill layer:  66%|██████▌   | 21/32 [00:02<00:01,  8.41it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:02<00:01,  8.27it/s][A[A
+
+prefill layer:  72%|███████▏  | 23/32 [00:02<00:01,  8.31it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:02<00:00,  8.35it/s][A[A
+
+prefill layer:  78%|███████▊  | 25/32 [00:02<00:00,  8.36it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:03<00:00,  8.36it/s][A[A
+
+prefill layer:  84%|████████▍ | 27/32 [00:03<00:00,  8.35it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:03<00:00,  8.37it/s][A[A
+
+prefill layer:  91%|█████████ | 29/32 [00:03<00:00,  8.38it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:03<00:00,  8.41it/s][A[A
+
+prefill layer:  97%|█████████▋| 31/32 [00:03<00:00,  8.41it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:03<00:00,  8.41it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:03<00:00,  8.47it/s]
+
+prefill batch:  12%|█▎        | 1/8 [00:03<00:26,  3.78s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 14.15it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.99it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.96it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.95it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.91it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.89it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.91it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.89it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.89it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.89it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.90it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.91it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.89it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.88it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.88it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.86it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.90it/s]
+
+prefill batch:  25%|██▌       | 2/8 [00:06<00:17,  2.91s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.76it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.88it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.90it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.89it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.88it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.87it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.87it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.87it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.88it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.90it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.89it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.73it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.78it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.82it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.84it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.83it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.85it/s]
+
+prefill batch:  38%|███▊      | 3/8 [00:08<00:13,  2.64s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.68it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.80it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.83it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.84it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.82it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.86it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.89it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.87it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.86it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.85it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.84it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.86it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.87it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.87it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.84it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.82it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.84it/s]
+
+prefill batch:  50%|█████     | 4/8 [00:10<00:10,  2.51s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.70it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.79it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.82it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.83it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.81it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.85it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.85it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.83it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.83it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.86it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.86it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.86it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.85it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.81it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.80it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.78it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.82it/s]
+
+prefill batch:  62%|██████▎   | 5/8 [00:13<00:07,  2.44s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.63it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.74it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.75it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.80it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.83it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.85it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.83it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.85it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.85it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.84it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.83it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.85it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.84it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.84it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.86it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.82it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.82it/s]
+
+prefill batch:  75%|███████▌  | 6/8 [00:15<00:04,  2.40s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.74it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.81it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.80it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.78it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.76it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.78it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.82it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.83it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.83it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.86it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.85it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.83it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.82it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.83it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.82it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.79it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.81it/s]
+
+prefill batch:  88%|████████▊ | 7/8 [00:17<00:02,  2.37s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.69it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.73it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.79it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.81it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.81it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.81it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.79it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.82it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.84it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.84it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.83it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.82it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.79it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.79it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.78it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.74it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.79it/s]
+
+prefill batch: 100%|██████████| 8/8 [00:19<00:00,  2.36s/it][Aprefill batch: 100%|██████████| 8/8 [00:19<00:00,  2.50s/it]
+Prefilling (batch size=8): 100%|██████████| 1/1 [00:19<00:00, 19.98s/it]Prefilling (batch size=8): 100%|██████████| 1/1 [00:19<00:00, 19.98s/it]
+Prefilling (batch size=8):   0%|          | 0/1 [00:00<?, ?it/s]
+prefill batch:   0%|          | 0/8 [00:00<?, ?it/s][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 10.82it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:03,  9.16it/s][A[A
+
+prefill layer:  16%|█▌        | 5/32 [00:00<00:03,  8.88it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:02,  8.69it/s][A[A
+
+prefill layer:  22%|██▏       | 7/32 [00:00<00:02,  8.46it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:02,  8.41it/s][A[A
+
+prefill layer:  28%|██▊       | 9/32 [00:01<00:02,  8.37it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:01<00:02,  8.35it/s][A[A
+
+prefill layer:  34%|███▍      | 11/32 [00:01<00:02,  8.34it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:01<00:02,  8.37it/s][A[A
+
+prefill layer:  41%|████      | 13/32 [00:01<00:02,  8.39it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:02,  8.40it/s][A[A
+
+prefill layer:  47%|████▋     | 15/32 [00:01<00:02,  8.40it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01,  8.40it/s][A[A
+
+prefill layer:  53%|█████▎    | 17/32 [00:01<00:01,  8.34it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:02<00:01,  8.36it/s][A[A
+
+prefill layer:  59%|█████▉    | 19/32 [00:02<00:01,  8.39it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:02<00:01,  8.38it/s][A[A
+
+prefill layer:  66%|██████▌   | 21/32 [00:02<00:01,  8.40it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:02<00:01,  8.41it/s][A[A
+
+prefill layer:  72%|███████▏  | 23/32 [00:02<00:01,  8.40it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:02<00:00,  8.39it/s][A[A
+
+prefill layer:  78%|███████▊  | 25/32 [00:02<00:00,  8.40it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:03<00:00,  8.37it/s][A[A
+
+prefill layer:  84%|████████▍ | 27/32 [00:03<00:00,  8.41it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:03<00:00,  8.43it/s][A[A
+
+prefill layer:  91%|█████████ | 29/32 [00:03<00:00,  8.42it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:03<00:00,  8.42it/s][A[A
+
+prefill layer:  97%|█████████▋| 31/32 [00:03<00:00,  8.40it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:03<00:00,  8.40it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:03<00:00,  8.47it/s]
+
+prefill batch:  12%|█▎        | 1/8 [00:03<00:26,  3.78s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 14.22it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.92it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.90it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.88it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.89it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.88it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.85it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.87it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.85it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.85it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.83it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.86it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.87it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.84it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.84it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.80it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.85it/s]
+
+prefill batch:  25%|██▌       | 2/8 [00:06<00:17,  2.91s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.76it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.80it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.83it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.82it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.81it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.75it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.77it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.82it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.85it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.84it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.85it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.83it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.84it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.81it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.83it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.83it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.82it/s]
+
+prefill batch:  38%|███▊      | 3/8 [00:08<00:13,  2.64s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.74it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.76it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.75it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.76it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.80it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.81it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.80it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.82it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.80it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.81it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.83it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.84it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.82it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.82it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.80it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.79it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.80it/s]
+
+prefill batch:  50%|█████     | 4/8 [00:10<00:10,  2.51s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.74it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.72it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.77it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.74it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.75it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.80it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.80it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.79it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.80it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.79it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.80it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.81it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.82it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.80it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.79it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.79it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.79it/s]
+
+prefill batch:  62%|██████▎   | 5/8 [00:13<00:07,  2.44s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.75it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.79it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.74it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.75it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.74it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.76it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.80it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.76it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.74it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.72it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.71it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.73it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.70it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.69it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.69it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.70it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.73it/s]
+
+prefill batch:  75%|███████▌  | 6/8 [00:15<00:04,  2.41s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.68it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.72it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.73it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.77it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.78it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.78it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.79it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.77it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.77it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.79it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.76it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.73it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.71it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.74it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.77it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.72it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.75it/s]
+
+prefill batch:  88%|████████▊ | 7/8 [00:17<00:02,  2.38s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.67it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.71it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.68it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.73it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.75it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.76it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.73it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.74it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.76it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.76it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.77it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.75it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.76it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.77it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.76it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.77it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.75it/s]
+
+prefill batch: 100%|██████████| 8/8 [00:20<00:00,  2.36s/it][Aprefill batch: 100%|██████████| 8/8 [00:20<00:00,  2.50s/it]
+Prefilling (batch size=8): 100%|██████████| 1/1 [00:20<00:00, 20.03s/it]Prefilling (batch size=8): 100%|██████████| 1/1 [00:20<00:00, 20.03s/it]
+Prefilling (batch size=8):   0%|          | 0/1 [00:00<?, ?it/s]
+prefill batch:   0%|          | 0/8 [00:00<?, ?it/s][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 10.53it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:03,  9.07it/s][A[A
+
+prefill layer:  16%|█▌        | 5/32 [00:00<00:03,  8.82it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:03,  8.66it/s][A[A
+
+prefill layer:  22%|██▏       | 7/32 [00:00<00:02,  8.54it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:02,  8.45it/s][A[A
+
+prefill layer:  28%|██▊       | 9/32 [00:01<00:02,  8.39it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:01<00:02,  8.35it/s][A[A
+
+prefill layer:  34%|███▍      | 11/32 [00:01<00:02,  8.33it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:01<00:02,  8.33it/s][A[A
+
+prefill layer:  41%|████      | 13/32 [00:01<00:02,  8.35it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:02,  8.36it/s][A[A
+
+prefill layer:  47%|████▋     | 15/32 [00:01<00:02,  8.38it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01,  8.38it/s][A[A
+
+prefill layer:  53%|█████▎    | 17/32 [00:01<00:01,  8.40it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:02<00:01,  8.41it/s][A[A
+
+prefill layer:  59%|█████▉    | 19/32 [00:02<00:01,  8.42it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:02<00:01,  8.43it/s][A[A
+
+prefill layer:  66%|██████▌   | 21/32 [00:02<00:01,  8.44it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:02<00:01,  8.42it/s][A[A
+
+prefill layer:  72%|███████▏  | 23/32 [00:02<00:01,  8.41it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:02<00:00,  8.41it/s][A[A
+
+prefill layer:  78%|███████▊  | 25/32 [00:02<00:00,  8.41it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:03<00:00,  8.42it/s][A[A
+
+prefill layer:  84%|████████▍ | 27/32 [00:03<00:00,  8.42it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:03<00:00,  8.44it/s][A[A
+
+prefill layer:  91%|█████████ | 29/32 [00:03<00:00,  8.43it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:03<00:00,  8.42it/s][A[A
+
+prefill layer:  97%|█████████▋| 31/32 [00:03<00:00,  8.38it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:03<00:00,  8.38it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:03<00:00,  8.47it/s]
+
+prefill batch:  12%|█▎        | 1/8 [00:03<00:26,  3.78s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 14.22it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.94it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.84it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.83it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.78it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.82it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.83it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.80it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.79it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.82it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.82it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.80it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.80it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.78it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.77it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.79it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.81it/s]
+
+prefill batch:  25%|██▌       | 2/8 [00:06<00:17,  2.92s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.69it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.74it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.75it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.76it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.80it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.79it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.78it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.79it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.79it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.80it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.82it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.81it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.78it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.74it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.72it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.74it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.77it/s]
+
+prefill batch:  38%|███▊      | 3/8 [00:08<00:13,  2.65s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.64it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.73it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.69it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.69it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.74it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.75it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.76it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.74it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.75it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.78it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.77it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.77it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.77it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.76it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.77it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.78it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.75it/s]
+
+prefill batch:  50%|█████     | 4/8 [00:10<00:10,  2.52s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.65it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.66it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.69it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.72it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.76it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.75it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.75it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.74it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.74it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.77it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.79it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.78it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.78it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.75it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.75it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.75it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.75it/s]
+
+prefill batch:  62%|██████▎   | 5/8 [00:13<00:07,  2.45s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.72it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.70it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.72it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.72it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.77it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.78it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.76it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.72it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.73it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.74it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.74it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.73it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.70it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.68it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.69it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.64it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.71it/s]
+
+prefill batch:  75%|███████▌  | 6/8 [00:15<00:04,  2.41s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.65it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.69it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.74it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.73it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.71it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.72it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.74it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.75it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.77it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.78it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.78it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.76it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.73it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.75it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.74it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.75it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.74it/s]
+
+prefill batch:  88%|████████▊ | 7/8 [00:17<00:02,  2.38s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.60it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.69it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.72it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.71it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.74it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.71it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.75it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.77it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.75it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.75it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.73it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.74it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.76it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.72it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.70it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.55it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.69it/s]
+
+prefill batch: 100%|██████████| 8/8 [00:20<00:00,  2.37s/it][Aprefill batch: 100%|██████████| 8/8 [00:20<00:00,  2.51s/it]
+Prefilling (batch size=8): 100%|██████████| 1/1 [00:20<00:00, 20.08s/it]Prefilling (batch size=8): 100%|██████████| 1/1 [00:20<00:00, 20.08s/it]
+Prefilling (batch size=8):   0%|          | 0/1 [00:00<?, ?it/s]
+prefill batch:   0%|          | 0/8 [00:00<?, ?it/s][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 10.59it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:03,  9.07it/s][A[A
+
+prefill layer:  16%|█▌        | 5/32 [00:00<00:03,  8.74it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:03,  8.60it/s][A[A
+
+prefill layer:  22%|██▏       | 7/32 [00:00<00:02,  8.50it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:02,  8.42it/s][A[A
+
+prefill layer:  28%|██▊       | 9/32 [00:01<00:02,  8.37it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:01<00:02,  8.33it/s][A[A
+
+prefill layer:  34%|███▍      | 11/32 [00:01<00:02,  8.31it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:01<00:02,  8.34it/s][A[A
+
+prefill layer:  41%|████      | 13/32 [00:01<00:02,  8.36it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:02,  8.38it/s][A[A
+
+prefill layer:  47%|████▋     | 15/32 [00:01<00:02,  8.39it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01,  8.41it/s][A[A
+
+prefill layer:  53%|█████▎    | 17/32 [00:01<00:01,  8.42it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:02<00:01,  8.39it/s][A[A
+
+prefill layer:  59%|█████▉    | 19/32 [00:02<00:01,  8.39it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:02<00:01,  8.39it/s][A[A
+
+prefill layer:  66%|██████▌   | 21/32 [00:02<00:01,  8.40it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:02<00:01,  8.40it/s][A[A
+
+prefill layer:  72%|███████▏  | 23/32 [00:02<00:01,  8.41it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:02<00:00,  8.41it/s][A[A
+
+prefill layer:  78%|███████▊  | 25/32 [00:02<00:00,  8.42it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:03<00:00,  8.43it/s][A[A
+
+prefill layer:  84%|████████▍ | 27/32 [00:03<00:00,  8.43it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:03<00:00,  8.42it/s][A[A
+
+prefill layer:  91%|█████████ | 29/32 [00:03<00:00,  8.40it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:03<00:00,  8.39it/s][A[A
+
+prefill layer:  97%|█████████▋| 31/32 [00:03<00:00,  8.39it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:03<00:00,  8.34it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:03<00:00,  8.46it/s]
+
+prefill batch:  12%|█▎        | 1/8 [00:03<00:26,  3.78s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 14.22it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.93it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.83it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.79it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.80it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.81it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.78it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.79it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.76it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.78it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.80it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.79it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.79it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.77it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.73it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.75it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.79it/s]
+
+prefill batch:  25%|██▌       | 2/8 [00:06<00:17,  2.92s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.65it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.70it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.58it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.70it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.72it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.73it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.75it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.76it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.77it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.80it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.72it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.73it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.73it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.75it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.75it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.72it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.73it/s]
+
+prefill batch:  38%|███▊      | 3/8 [00:08<00:13,  2.65s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.58it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.66it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.74it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.76it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.75it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.74it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.74it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.77it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.76it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.76it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.76it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.72it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.72it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.68it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.66it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.63it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.71it/s]
+
+prefill batch:  50%|█████     | 4/8 [00:10<00:10,  2.53s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.46it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.53it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.60it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.65it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.71it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.71it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.72it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.72it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.74it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.76it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.75it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.76it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.75it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.74it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.76it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.72it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.71it/s]
+
+prefill batch:  62%|██████▎   | 5/8 [00:13<00:07,  2.46s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.56it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.64it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.71it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.71it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.72it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.57it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.64it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.70it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.71it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.72it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.72it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.73it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.76it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.77it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.76it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.73it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.71it/s]
+
+prefill batch:  75%|███████▌  | 6/8 [00:15<00:04,  2.42s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.63it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.72it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.71it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.72it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.68it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.71it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.71it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.70it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.72it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.69it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.73it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.75it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.72it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.73it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.68it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.68it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.70it/s]
+
+prefill batch:  88%|████████▊ | 7/8 [00:17<00:02,  2.39s/it][A
+
+prefill layer:   0%|          | 0/32 [00:00<?, ?it/s][A[A
+
+prefill layer:   6%|▋         | 2/32 [00:00<00:02, 13.50it/s][A[A
+
+prefill layer:  12%|█▎        | 4/32 [00:00<00:02, 13.52it/s][A[A
+
+prefill layer:  19%|█▉        | 6/32 [00:00<00:01, 13.59it/s][A[A
+
+prefill layer:  25%|██▌       | 8/32 [00:00<00:01, 13.65it/s][A[A
+
+prefill layer:  31%|███▏      | 10/32 [00:00<00:01, 13.62it/s][A[A
+
+prefill layer:  38%|███▊      | 12/32 [00:00<00:01, 13.63it/s][A[A
+
+prefill layer:  44%|████▍     | 14/32 [00:01<00:01, 13.62it/s][A[A
+
+prefill layer:  50%|█████     | 16/32 [00:01<00:01, 13.64it/s][A[A
+
+prefill layer:  56%|█████▋    | 18/32 [00:01<00:01, 13.64it/s][A[A
+
+prefill layer:  62%|██████▎   | 20/32 [00:01<00:00, 13.67it/s][A[A
+
+prefill layer:  69%|██████▉   | 22/32 [00:01<00:00, 13.69it/s][A[A
+
+prefill layer:  75%|███████▌  | 24/32 [00:01<00:00, 13.71it/s][A[A
+
+prefill layer:  81%|████████▏ | 26/32 [00:01<00:00, 13.72it/s][A[A
+
+prefill layer:  88%|████████▊ | 28/32 [00:02<00:00, 13.71it/s][A[A
+
+prefill layer:  94%|█████████▍| 30/32 [00:02<00:00, 13.68it/s][A[A
+
+prefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.66it/s][A[Aprefill layer: 100%|██████████| 32/32 [00:02<00:00, 13.65it/s]
+
+prefill batch: 100%|██████████| 8/8 [00:20<00:00,  2.38s/it][Aprefill batch: 100%|██████████| 8/8 [00:20<00:00,  2.52s/it]
+Prefilling (batch size=8): 100%|██████████| 1/1 [00:20<00:00, 20.12s/it]Prefilling (batch size=8): 100%|██████████| 1/1 [00:20<00:00, 20.12s/it]

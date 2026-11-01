@@ -1,0 +1,27 @@
+# GPU run records: the step record (command, exit, sacct, stdout, stderr) is copied; summary.json is copied
+# when below 5 MB, otherwise listed with its sha256 and size (traces are never copied). Computed on thunder09 at 2026-11-01T00:14:21Z
+COPIED recon7_x1r3_2195630_r7s/summary.json 52155
+COPIED recon7_pm1_2195631_r7pm/summary.json 801341
+COPIED recon7_mem1_2195630_r7mem/summary.json 2119013
+NOT COPIED recon7_pa1_2195631_r7pa/summary.json 6822227 93452001afff79570362c83bb151b053d3358b63cbac4c622a5c26228eea2e8e
+NOT COPIED recon7_pb1_2195630_r7pb/summary.json 9946643 daca253dd0037aac46ed8ff624635e076d9a3204151933875bfff886b80fcb9e
+COPIED j1_m1_2195631_j1m/summary.json 821601
+COPIED j1_f1_2195630_j1f/summary.json 27379
+NOT COPIED j1_a1_2195631_j1a/summary.json 8423808 9c5e78da0d532cb818ad695eda4a22804975f4f766208d2f26d70344c58c8c70
+NOT COPIED j1_b1_2195631_j1b/summary.json 9857253 8979c53390ae40fcf998f6f04e45777a3a38789b4dd2764bacfd63672bb3e510
+COPIED st1_m1_2195630_st1m/summary.json 906202
+NOT COPIED st1_a1_2195631_st1a/summary.json 8412924 37214c67c0e3864fb3bf6b3dadf771a2c13d98293f106e5ecaaf7459735da574
+NOT COPIED st1_b1_2195630_st1b/summary.json 12315087 6dd27c21178cb28b41236fe87ba8cff419e199d092421e8395e0e02c599e35f6
+COPIED bf1_m1_2195631_bf1m/summary.json 467349
+COPIED bf1_m2_2195630_bf1m/summary.json 470465
+NOT COPIED bf1_b1_2195630_bf1b/summary.json 12382884 dbd23d0683f8c9c8776788f3bbeab8648cb5ca338cb98dd130a92f8ac40fa7e7
+COPIED bf1_m3_2195631_bf1m/summary.json 472539
+NOT COPIED bf1_b2_2195631_bf1b/summary.json 12385734 5be704405023c63dafe188c55b5214aecd5027e496c6d8662ca7b84d91ba0cd8
+COPIED bf1_m4_2195631_bf1m/summary.json 472717
+NOT COPIED bf1_b3_2195631_bf1b/summary.json 12385991 6a57b7ad907184dea95af2e3e60d8ed53709e063a7777c2ed82ac0a0b88b1c20
+COPIED int_m1_2195630_intm/summary.json 1328572
+NOT COPIED int_a1_2195630_inta/summary.json 6739442 89cbf9e99066e2f996cd17c23e79c7c839d16f56e093b06bf4619e2ec5d46d4e
+COPIED int_m2_2195630_intm/summary.json 1329532
+NOT COPIED int_b1_2195630_intb/summary.json 17329495 b58eac1c1a273836dcc74b4488e893e832b353d944dcfa8d036b7c8c35115ea0
+NOT COPIED int_c1_2195631_intc/summary.json 8902853 13a2362596d2b7d4b15f4836a8515b5173b0422ceb139da8b115de437b866bf1
+NOT COPIED int_d1_2195630_intd/summary.json 9860163 121fcff674eaf9136f54bffa181858756fe03ab8b78a77daa2bfb5a672791629

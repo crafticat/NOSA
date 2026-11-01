@@ -1,0 +1,113 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+...F.....F......                                                         [100%]
+=================================== FAILURES ===================================
+_________________________ test_j1_equals[gudcd_timing] _________________________
+
+case = 'gudcd_timing'
+
+    @pytest.mark.parametrize("case", list(CASES))
+    def test_j1_equals(case):
+        arm, scen = CASES[case]
+        keep = arm == "GUDKCDJ1"
+        name = ARMS[arm]
+        d = _run("D", scen)
+        _run(C_OF[BASE[arm]], scen)                                        # the C arm first: the joint helpers
+        b = _run(BASE[arm], scen)                                          # the I4DC arm: the draft helpers
+        x = _run(arm, scen)
+        J1 = _mod("r2_j1_select")
+        rd = x["rd"]
+        j = rd["j1"]
+        jp = rd["tent"]["calls"]["joint_passes"]
+        _ev("J1 %s %s: rounds %d; joint passes %d; draft capture passes %d; J1 %s" % (
+            case, name, rd["rounds"], jp, rd["dgraph"]["capture_passes"], j))
+        assert jp > 0 and j["calls"] == jp * L and not j["fallback"] and j["peq_layers"] > 0      # L34 preconditions
+        assert j["peq_bad"] == 0 and j["peq_vals"] > 0
+        assert j["draft"] and j["dwarm"] == 1 and j["dlayers"] == rd["dgraph"]["capture_passes"] * L > 0   # F2 ran
+        assert j["dpeq_layers"] > 0 and j["dpeq_bad"] == 0 and rd["dgraph"]["replay_passes"] >= 10
+>       assert not any(e["capture"] for e in j["events"]) and {e["kind"] for e in j["events"]} <= {"joint", "draft_warm"}
+E       assert (not True)
+E        +  where True = any(<generator object test_j1_equals.<locals>.<genexpr> at 0x7f583e52e260>)
+
+benchmarks/Efficiency/tests_cpu/test_j1.py:380: AssertionError
+----------------------------- Captured stdout call -----------------------------
+J1 gudcd_timing L4PTFDGUDCDJ1: rounds 14; joint passes 13; draft capture passes 2; J1 {'calls': 26, 'fallback': {}, 'events': [{'graphs': 1, 's': 0.179, 'layer': 0, 'capture': False, 'kind': 'draft_warm', 'joint_pass': 0}, {'graphs': 1, 's': 0.147, 'layer': 0, 'capture': True, 'kind': 'draft', 'joint_pass': 0}, {'graphs': 1, 's': 0.166, 'layer': 0, 'capture': False, 'kind': 'joint', 'joint_pass': 0}], 'compile_s': 0.492, 'peq_bad': 0, 'peq_vals': 60672, 'peq_layers': 6, 'draft': True, 'dlayers': 4, 'dwarm': 1, 'dpeq_bad': 0, 'dpeq_vals': 15168, 'dpeq_layers': 6, 'backend': 'inductor', 'j1neg': None}
+____________________________ test_j3_gsection_copy _____________________________
+
+    def test_j3_gsection_copy():
+        J1 = _mod("r2_j1_select")
+        S3 = J1.j1_classes(X.STF)["L4PTFDGUDCDJ3"][0]
+        G = next(c for c in S3.__mro__ if c.__name__ == "_GraphS")
+        mine, orig = _dedented(S3._gsection), _dedented(G._gsection)
+        core = [x for x in mine if not x.rstrip().endswith("# J3")]
+        gone = [x for x in orig if any(w in x for w in ("self._resid_eager(", "if copy_skip:", 'self._sb["skip"].copy_(skip)',
+                                                        'sk0 = self._sb["skip"]', "setattr(self, stub,",
+                                                        "want = expected_delta_s("))]
+        assert len(gone) == 6, gone
+>       assert core == [x for x in orig if x not in gone], [(i, a, b) for i, (a, b) in enumerate(zip(core, orig)) if a != b][:3]
+E       AssertionError: [(0, '    vs = plan.vs', '    """GR:237-280 line for line: `section` in place of the parent\'s _rows_union, the stub n..._counts_s / expected_delta_s)."""'), (2, '    key = None if why is not None else self._key(plan)', '    vs = plan.vs')]
+E       assert ['    vs = pl...= "key"', ...] == ['    """GR:2....get(l)', ...]
+E         
+E         At index 0 diff: '    vs = plan.vs' != '    """GR:237-280 line for line: `section` in place of the parent\'s _rows_union, the stub named `stub`, the skip'
+E         Right contains 2 more items, first extra item: '    self.graph["replays"] += 1'
+E         Use -v to get more diff
+
+benchmarks/Efficiency/tests_cpu/test_j1.py:514: AssertionError
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_layer_copy
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:166: Evidence: J1 COPY: _layer = TentState._layer + 3 J1 lines (the R 1 delegation, the selection call); removed sel = VR._select_rows(plan.vs, layer, q, twin)
+    _ev("J1 COPY: _layer = TentState._layer + %d J1 lines (the R 1 delegation, the selection call); removed %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_pool_fn_equal
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:242: Evidence: J1 POOL: 12 variants (dtype, seed, init, local) bit-equal (eager and Inductor) to the kernel's stand-in and to pool_reference; dynamo {'unique_graphs': 6, 'frames_ok': 0, 'graph_breaks': 0, 'inductor_kernels': 6}
+    _ev("J1 POOL: %d variants (dtype, seed, init, local) bit-equal (eager and Inductor) to the kernel's stand-in and to "
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_equals[gudcd_timing]
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:374: Evidence: J1 gudcd_timing L4PTFDGUDCDJ1: rounds 14; joint passes 13; draft capture passes 2; J1 {'calls': 26, 'fallback': {}, 'events': [{'graphs': 1, 's': 0.179, 'layer': 0, 'capture': False, 'kind': 'draft_warm', 'joint_pass': 0}, {'graphs': 1, 's': 0.147, 'layer': 0, 'capture': True, 'kind': 'draft', 'joint_pass': 0}, {'graphs': 1, 's': 0.166, 'layer': 0, 'capture': False, 'kind': 'joint', 'joint_pass': 0}], 'compile_s': 0.492, 'peq_bad': 0, 'peq_vals': 60672, 'peq_layers': 6, 'draft': True, 'dlayers': 4, 'dwarm': 1, 'dpeq_bad': 0, 'dpeq_vals': 15168, 'dpeq_layers': 6, 'backend': 'inductor', 'j1neg': None}
+    _ev("J1 %s %s: rounds %d; joint passes %d; draft capture passes %d; J1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_equals[gudcd_check]
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:374: Evidence: J1 gudcd_check L4PTFDGUDCDJ1: rounds 14; joint passes 13; draft capture passes 1; J1 {'calls': 26, 'fallback': {}, 'events': [], 'compile_s': 0.0, 'peq_bad': 0, 'peq_vals': 262912, 'peq_layers': 26, 'draft': True, 'dlayers': 2, 'dwarm': 1, 'dpeq_bad': 0, 'dpeq_vals': 131456, 'dpeq_layers': 52, 'backend': 'inductor', 'j1neg': None}
+    _ev("J1 %s %s: rounds %d; joint passes %d; draft capture passes %d; J1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_equals[gudkcd_timing]
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:374: Evidence: J1 gudkcd_timing L4PTFDGUDKWCDJ1: rounds 14; joint passes 13; draft capture passes 2; J1 {'calls': 26, 'fallback': {}, 'events': [], 'compile_s': 0.0, 'peq_bad': 0, 'peq_vals': 60672, 'peq_layers': 6, 'draft': True, 'dlayers': 4, 'dwarm': 1, 'dpeq_bad': 0, 'dpeq_vals': 15168, 'dpeq_layers': 6, 'backend': 'inductor', 'j1neg': None}
+    _ev("J1 %s %s: rounds %d; joint passes %d; draft capture passes %d; J1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_equals[gudkcd_check]
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:374: Evidence: J1 gudkcd_check L4PTFDGUDKWCDJ1: rounds 14; joint passes 13; draft capture passes 1; J1 {'calls': 26, 'fallback': {}, 'events': [], 'compile_s': 0.0, 'peq_bad': 0, 'peq_vals': 262912, 'peq_layers': 26, 'draft': True, 'dlayers': 2, 'dwarm': 1, 'dpeq_bad': 0, 'dpeq_vals': 131456, 'dpeq_layers': 52, 'backend': 'inductor', 'j1neg': None}
+    _ev("J1 %s %s: rounds %d; joint passes %d; draft capture passes %d; J1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_plant_wrong_req
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:424: Evidence: J1 PLANT wrong_req: differs ['acc_hist', 'accepted', 'draft_calls', 'draft_skipped']; EQF False; PEQ bad 22832 of 60672; draft PEQ bad 9548 of 25280
+    _ev("J1 PLANT wrong_req: differs %s; EQF %s; PEQ bad %s of %s; draft PEQ bad %s of %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_stamp_frame_equal
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:494: Evidence: J1 F3 FRAME: 40 calls x 2 layers bit-equal to the shipped stamps; export {'first': [1000, 1000], 'calls': [40, 40], 'stamps_ok': True}; plant (no shift) caught
+    _ev("J1 F3 FRAME: 40 calls x %d layers bit-equal to the shipped stamps; export %s; plant (no shift) caught" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j3_equals
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:530: Evidence: J1 F3 timing: rounds 14; j3 {'joint_captures': 2, 'draft_layers': 4, 'delta_fixed': 4, 'frame': [{'first': [0, 0], 'calls': [42, 42], 'stamps_ok': True}]}; graph captures 2 warm 2 replays 18 eager {'marks': 6}; dgraph keys [[False, False, False], [True, False, False]] captures 8 capture passes 2 replay passes 23 eager {}
+    _ev("J1 F3 timing: rounds %d; j3 %s; graph captures %s warm %s replays %s eager %s; dgraph keys %s captures %s "
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_shpool_equal
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:588: Evidence: J1 SHPOOL: 10 variants bit-equal to the shipped kernel's stand-in; events [{'graphs': 1, 's': 4.338, 'B': 3, 'M': 20, 'capture': False}, {'graphs': 1, 's': 3.339, 'B': 3, 'M': 20, 'capture': False}]; plant caught 9
+    _ev("J1 SHPOOL: %d variants bit-equal to the shipped kernel's stand-in; events %s; plant caught %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_step_script_j1
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:770: Evidence: J1 DRYRUN: 3 cells printed their step command; grants {'j1m': None, 'j1a': None, 'j1b': None}
+    _ev("J1 DRYRUN: 3 cells printed their step command; grants %s" % ({c[0]: getattr(C, "GRANT_%s" % c[0]) for c in
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_equals[gudcd_timing]
+FAILED benchmarks/Efficiency/tests_cpu/test_j1.py::test_j3_gsection_copy - As...
+2 failed, 14 passed, 11 warnings in 664.39s (0:11:04)

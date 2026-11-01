@@ -1,0 +1,20 @@
+tag=wip3_a
+utc_start=2026-10-31T11:46:49Z host=thunder09 slurm_job=2243219 slurm_step=0
+runner=/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_fix/run_receipt.sh
+runner_sha256=0fd02417a94b8d7b616da6aed0f1eccf0859552f28bb69cab15d822ace172b41
+pytest_args=benchmarks/Efficiency/tests_cpu/test_recon7.py -k not\ probe_equal\ and\ not\ probe_gates\ and\ not\ probe_plant\ and\ not\ statistic_fix\ and\ not\ teardown 
+head=6d711c46c84def2d8dff575238116968fa688aed
+status_begin (tracked and untracked under benchmarks docs nosi)
+ M benchmarks/Efficiency/r2_recon7_cell.py
+ M benchmarks/Efficiency/r2_recon7_probe.py
+ M benchmarks/Efficiency/tests_cpu/test_recon7.py
+status_end
+sha256 db226cb5cfd59a428b0357b3ee7ff292cbf4b0fb804db067d4d14799938428a2 benchmarks/Efficiency/r2_recon7_protocol.py
+sha256 c7b3ec8dd5760674e0a473876b8b34bdeda85c67b674724a74c59f9663fc83a5 benchmarks/Efficiency/r2_recon7_probe.py
+sha256 ea4e67749c98d2c659a7575819a0903b9aeedb8e701c697b502d5f47146a4eaa benchmarks/Efficiency/r2_recon7_cell.py
+sha256 4b866558f54f9cfeb47a9e09a0f6b0a15823807882917826cdcab506bc8740ab benchmarks/Efficiency/r2_recon7_streams.py
+sha256 dce11da22e264ffa4740b8f5e0ecd270546528ec401164508bd8f6ee80ea0408 benchmarks/Efficiency/r2_recon7_mem.py
+sha256 158ee291e959949b2b25347673e5a4d9f2aaa31d2304e43ef688dbaee1a4a89e benchmarks/Efficiency/r2_recon7_step.sh
+sha256 54ff9d51cd35dee257753e8c103f6eca79b382af0d70164e1bcbc9311c7e2f3a benchmarks/Efficiency/tests_cpu/test_recon7.py
+sha256 885956862644d6d58430ba397fbde4f0e0f8b8ee5d870bc8a2d843ae560684b1 docs/NOTES_recon7.md
+pytest_exit=0 utc_end=2026-10-31T11:46:58Z

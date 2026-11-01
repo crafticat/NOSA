@@ -1,0 +1,208 @@
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+[r2_bf1 19:35:11] model loaded in 11 s
+[r2_bf1 19:35:12] arm SH (B 8, 72 steps, C 73)
+[r2_bf1 19:37:35] arm L4PTFD ({'arm': 'L4PTFD', 'K': 3, 'journal': 256, 'tu_gemm': 'natural', 'twin': 'fused', 'body': 'fused', 'graph': True, 'redirect': True, 'probe_every': 4, 'check_every': 1, 'fork_store': 0, 'prefill_hook': 'nocopy', 'bf_store': 0, 'bf': None})
+[r2_bf1 19:38:39] arm L4PTFDGUDKWC ({'arm': 'L4PTFDGUDKWC', 'K': 3, 'journal': 256, 'tu_gemm': 'natural', 'twin': 'fused', 'body': 'fused', 'graph': True, 'redirect': True, 'probe_every': 4, 'check_every': 1, 'fork_store': 0, 'prefill_hook': 'nocopy', 'bf_store': 0, 'bf': None})
+[r2_bf1 19:39:34] arm L4PTFDGUDKWCD ({'arm': 'L4PTFDGUDKWCD', 'K': 3, 'journal': 256, 'tu_gemm': 'natural', 'twin': 'fused', 'body': 'fused', 'graph': True, 'redirect': True, 'probe_every': 4, 'check_every': 1, 'fork_store': 0, 'prefill_hook': 'nocopy', 'bf_store': 0, 'bf': None})
+[r2_bf1 19:40:23] arm L4PTFDGUDKWCDX ({'arm': 'L4PTFDGUDKWCDX', 'K': 3, 'journal': 256, 'tu_gemm': 'natural', 'twin': 'fused', 'body': 'fused', 'graph': True, 'redirect': True, 'probe_every': 4, 'check_every': 1, 'fork_store': 0, 'prefill_hook': 'nocopy', 'bf_store': 0, 'bf': {'mode': 'off', 'n_cap': 2048, 'ring': 8, 'worker': 'thread', 'acct': True, 'close_wait_ms': 0.0, 'packer': 'gilfree', 'threads': 14, 'gf': {'cap_groups': 2048}, 'late': 'defer', 'late_wait_ms': 250.0, 'batch': 8}})
+[r2_bf1 19:41:10] arm L4PTFDGUDKWCDB ({'arm': 'L4PTFDGUDKWCDB', 'K': 3, 'journal': 256, 'tu_gemm': 'natural', 'twin': 'fused', 'body': 'fused', 'graph': True, 'redirect': True, 'probe_every': 4, 'check_every': 1, 'fork_store': 0, 'prefill_hook': 'nocopy', 'bf_store': 0, 'bf': {'mode': 'ce', 'n_cap': 2048, 'ring': 8, 'worker': 'thread', 'acct': True, 'close_wait_ms': 0.0, 'packer': 'gilfree', 'threads': 14, 'gf': {'cap_groups': 2048}, 'late': 'defer', 'late_wait_ms': 250.0, 'batch': 8}})
+GATE C0_FORK                  MUST PASS: /mnt/beegfs/ojerbi/nosi-r2-bf1/benchmarks/Efficiency/fork_vllm_unified_attention.py (blob pinned by the step: f0dc0c183a388585e216505a6bbfc696531e8add)
+GATE SH-RUN                   MUST PASS: 72 steps, 2 re-warms
+GATE SH-MEM                   REPORT PASS: peak allocated 20.425 GB (after the prefill 20.425 GB, prefill None GB) against 84.0 GB; prefill + decode; usable ceiling 84.25 GB
+GATE L4PTFD-RUN               MUST PASS: 34 rounds of K 3
+GATE L4PTFD-ERR               MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE L4PTFD-COMMIT-N          MUST PASS: committed per request min 72 max 72 (exactly 72 wanted); warm 8 + per-round sum 568, total 576; 34 rounds
+GATE L4PTFD-D1                MUST PASS: residency-undo calls 0 (0 expected); resets 34 for 34 rounds
+GATE L4PTFD-D3                MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 128 = (K + 1) x 32 passes; one-row J slots 2; 34 rounds
+GATE L4PTFD-SPAN              MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE L4PTFD-STRESS            MUST PASS: commits across an edge 8, rows past an edge 41, F4 fill rows 19, dropped entries 79, tentative-block skips 1088, draft skips 88350; corrections 24, refills 20, final groups 8 (target rows 3, reported) (each > 0; counted on check rounds)
+GATE L4PTFD-RESID             MUST PASS: residency calls in joint passes 1024 for 32 joint passes of 32 layers (one per layer and pass); union layers 1024; verify_rows passes 32
+GATE L4PTFD-ATTN1             MUST PASS: attn calls 1024 for 32 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFD-FILL1             MUST PASS: fills calls 1024 for 32 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFD-PRESENT           MUST PASS: selected blocks of verify rows not present: 0 (recount); unserved list entries 0 (store X 129, bound 128)
+GATE L4PTFD-VIS               MUST PASS: rows whose visible block count (from the kernel's tables) is not their own: 0 (per row [0, 0, 0, 0])
+GATE L4PTFD-VB                MUST PASS: rows whose (block id, tokens) set in the kernel's tables is not their own selection: 0 of 51904
+GATE L4PTFD-TAIL              MUST PASS: union entries that read the window's committed tail slot (D1: the chain image CB0 replaces it): 0
+GATE L4PTFD-CHAIN             MUST PASS: chain-image rows with wrong bytes or a wrong position: 0; buffer rows checked 136960; chain reads 51904
+GATE L4PTFD-IDX               MUST PASS: sampled requests alone against the full launch, bitwise: {'entries': [0, 4, 7], 'equal': [True, True, True]}
+GATE L4PTFD-RA                MUST PASS: a row alone against the full launch, bitwise (rows whose first block is not block 0: 0): {'entries': [0, 16, 31], 'equal': [True, True, True]}
+GATE L4PTFD-FSTRESS           MUST PASS: rows past a block edge 800; F4 rows 448; pool blocks read in place 77061; chain reads 51904; store reads 59127 (each > 0; accounting on)
+GATE L4PTFD-LEAN              MUST PASS: lean passes 69 (one-row passes: draft steps 67 incl. the prelude's 3 + mixed 0 + one-row J 2 = 69); lean layers 2208 (L x passes = 2208)
+GATE L4PTFD-MEM               REPORT PASS: peak allocated 20.496 GB (after the prefill 17.969 GB, prefill 20.496 GB) against 84.0 GB; {'start_GB': 15.32, 'prefill_peak_GB': 19.088, 'arena': {'L': 32, 'B': 8, 'NS': 74, 'H': 2, 'D': 128, 'X': 129, 'bs': 64, 'n_blocks': 19984, 'store_base': 18944, 'store_GB': 0.0679, 'arena_GB': 1.3148, 'dtype': 'torch.bfloat16', 'cb0_base': 19976, 'cb0_GB': 0.0005, 'cb1': 'store slot 0', 'kind': 'chain'}, 'hook': 'nocopy', 'decode_peak_GB': 16.735, 'decode_peak_reserved_GB': 16.775}; usable ceiling 84.25 GB
+GATE L4PTFDGUDKWC-RUN         MUST PASS: 34 rounds of K 3
+GATE L4PTFDGUDKWC-ERR         MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE L4PTFDGUDKWC-COMMIT-N    MUST PASS: committed per request min 72 max 72 (exactly 72 wanted); warm 8 + per-round sum 568, total 576; 34 rounds
+GATE L4PTFDGUDKWC-D1          MUST PASS: residency-undo calls 0 (0 expected); resets 34 for 34 rounds
+GATE L4PTFDGUDKWC-D3          MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 128 = (K + 1) x 32 passes; one-row J slots 2; 34 rounds
+GATE L4PTFDGUDKWC-SPAN        MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE L4PTFDGUDKWC-STRESS      MUST PASS: commits across an edge 8, rows past an edge 41, F4 fill rows 19, dropped entries 79, tentative-block skips 1088, draft skips 88350; corrections 24, refills 20, final groups 8 (target rows 3, reported) (each > 0; counted on check rounds)
+GATE L4PTFDGUDKWC-RESID       MUST PASS: residency calls in joint passes 1024 for 32 joint passes of 32 layers (one per layer and pass); union layers 1024; verify_rows passes 32
+GATE L4PTFDGUDKWC-ATTN1       MUST PASS: attn calls 1024 for 32 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFDGUDKWC-FILL1       MUST PASS: fills calls 1024 for 32 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFDGUDKWC-PRESENT     MUST PASS: selected blocks of verify rows not present: 0 (recount); unserved list entries 0 (store X 129, bound 128)
+GATE L4PTFDGUDKWC-VIS         MUST PASS: rows whose visible block count (from the kernel's tables) is not their own: 0 (per row [0, 0, 0, 0])
+GATE L4PTFDGUDKWC-VB          MUST PASS: rows whose (block id, tokens) set in the kernel's tables is not their own selection: 0 of 51904
+GATE L4PTFDGUDKWC-TAIL        MUST PASS: union entries that read the window's committed tail slot (D1: the chain image CB0 replaces it): 0
+GATE L4PTFDGUDKWC-CHAIN       MUST PASS: chain-image rows with wrong bytes or a wrong position: 0; buffer rows checked 136960; chain reads 51904
+GATE L4PTFDGUDKWC-IDX         MUST PASS: sampled requests alone against the full launch, bitwise: {'entries': [0, 4, 7], 'equal': [True, True, True]}
+GATE L4PTFDGUDKWC-RA          MUST PASS: a row alone against the full launch, bitwise (rows whose first block is not block 0: 0): {'entries': [0, 16, 31], 'equal': [True, True, True]}
+GATE L4PTFDGUDKWC-FSTRESS     MUST PASS: rows past a block edge 800; F4 rows 448; pool blocks read in place 77061; chain reads 51904; store reads 59127 (each > 0; accounting on)
+GATE L4PTFDGUDKWC-LEAN        MUST PASS: lean passes 69 (one-row passes: draft steps 67 incl. the prelude's 3 + mixed 0 + one-row J 2 = 69); lean layers 2208 (L x passes = 2208)
+GATE L4PTFDGUDKWC-MEM         MUST PASS: peak allocated 20.496 GB with the prefill (decode 18.294 GB, reserved 17.111 GB) against 84.0 GB; graph pool 109.052 MB; static inputs 0.296 MB; usable ceiling 84.25 GB
+GATE L4PTFDGUDKWC-GRAPH       MUST PASS: graphs 32 (layers 32); warm 32; replays 735 (incl. the 32 first replays); eager 257 {'probe_F': 1, 'marks': 256}; L x joint passes 32 x 32 = 1024 (eager + warm + replays 1024); skipped-count mismatches []; capture passes [1, 2]
+GATE L4PTFDGUDKWC-COUNTS      MUST PASS: 13 keys compared with L4PTFD's (not compared: ['round_blocks']); differences 0 []; host counts chain 1024, resid 3232, attn 1024, fills 1024, gather_host 2048
+GATE L4PTFDGUDKWC-DGRAPH      MUST PASS: keys captured [[True, False], [True, True]] (warm keys [[True, False], [True, True]]); graphs 128 (2 L x keys = 128); passes: warm 2 + eager 0 {} + capture 2 + replay 65 = 69 (one-row passes 69); replays 4288 (2 L x (capture + replay passes) = 4288); skipped-count mismatches []; capture rounds [(-1, [True, False]), (33, [True, True])]
+GATE L4PTFDGUDKWC-HOIST       MUST PASS: hoist passes 32 (joint passes 32); hoisted layers 1024 (L x joint passes 1024); is_next recounted 0 (checked, must be 0)
+GATE L4PTFDGUDKWC-KEEP        MUST PASS: joint passes counted 32 (union 32); listed 40866, fetched 34671, hits 6195; window loads from the store 11914; union listed host blocks 40866 (compared)
+GATE L4PTFDGUDKWC-CAP         MUST PASS: overflow 0, duplicate keys 0, missing 0, blocks unequal to a fresh fetch 0; store blocks checked 40866 (listed 40866); window blocks checked 11914 (window hits 11914)
+GATE L4PTFDGUDKWC-KEEP-EQ     REPORT FAIL: REPORT: no keep reference (L4PTFKW, L4PTFDGKW or L4PTFDGUDKW) in this job; i4sb / i4ccb passed it
+GATE L4PTFDGUDKWC-KEEP-REF    REPORT PASS: no reference at B 8 pool 10 steps 72; totals {'listed': 40866, 'fetched': 34671, 'win_hits': 11914}
+GATE L4PTFDGUDKWC-COMPILE     MUST PASS: backend inductor; sections 321 (eager + warm + captures 321); fallback {}; calls {'pre': 321, 'loc1': 321, 'loc2': 321, 'kphys': 321, 'lists': 321, 'write': 310}; compile events [('pre', 0, 0, 2.767), ('loc1', 0, 0, 1.176), ('loc2', 0, 0, 1.847), ('kphys', 0, 0, 0.878), ('lists', 0, 0, 1.644), ('write', 0, 1, 1.883)] (late 0; per helper {'pre': 1, 'loc1': 1, 'loc2': 1, 'kphys': 1, 'lists': 1, 'write': 1}); compile 10.196 s; graph breaks 0; dynamo {'unique_graphs': 6, 'frames_ok': 0, 'graph_breaks': 0, 'inductor_kernels': 26}
+GATE L4PTFDGUDKWC-EQF         MUST PASS: committed tokens unequal to L4PTFD's: 0 of 576; fingerprints compared 576 columns, max equal True, sum equal True; state checksums equal True (0 of 227 differ); acceptance record equal True (accepted 541 vs 541)
+GATE L4PTFDGUDKWCD-RUN        MUST PASS: 34 rounds of K 3
+GATE L4PTFDGUDKWCD-ERR        MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE L4PTFDGUDKWCD-COMMIT-N   MUST PASS: committed per request min 72 max 72 (exactly 72 wanted); warm 8 + per-round sum 568, total 576; 34 rounds
+GATE L4PTFDGUDKWCD-D1         MUST PASS: residency-undo calls 0 (0 expected); resets 34 for 34 rounds
+GATE L4PTFDGUDKWCD-D3         MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 128 = (K + 1) x 32 passes; one-row J slots 2; 34 rounds
+GATE L4PTFDGUDKWCD-SPAN       MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE L4PTFDGUDKWCD-STRESS     MUST PASS: commits across an edge 8, rows past an edge 41, F4 fill rows 19, dropped entries 79, tentative-block skips 1088, draft skips 88350; corrections 24, refills 20, final groups 8 (target rows 3, reported) (each > 0; counted on check rounds)
+GATE L4PTFDGUDKWCD-RESID      MUST PASS: residency calls in joint passes 1024 for 32 joint passes of 32 layers (one per layer and pass); union layers 1024; verify_rows passes 32
+GATE L4PTFDGUDKWCD-ATTN1      MUST PASS: attn calls 1024 for 32 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFDGUDKWCD-FILL1      MUST PASS: fills calls 1024 for 32 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFDGUDKWCD-PRESENT    MUST PASS: selected blocks of verify rows not present: 0 (recount); unserved list entries 0 (store X 129, bound 128)
+GATE L4PTFDGUDKWCD-VIS        MUST PASS: rows whose visible block count (from the kernel's tables) is not their own: 0 (per row [0, 0, 0, 0])
+GATE L4PTFDGUDKWCD-VB         MUST PASS: rows whose (block id, tokens) set in the kernel's tables is not their own selection: 0 of 51904
+GATE L4PTFDGUDKWCD-TAIL       MUST PASS: union entries that read the window's committed tail slot (D1: the chain image CB0 replaces it): 0
+GATE L4PTFDGUDKWCD-CHAIN      MUST PASS: chain-image rows with wrong bytes or a wrong position: 0; buffer rows checked 136960; chain reads 51904
+GATE L4PTFDGUDKWCD-IDX        MUST PASS: sampled requests alone against the full launch, bitwise: {'entries': [0, 4, 7], 'equal': [True, True, True]}
+GATE L4PTFDGUDKWCD-RA         MUST PASS: a row alone against the full launch, bitwise (rows whose first block is not block 0: 0): {'entries': [0, 16, 31], 'equal': [True, True, True]}
+GATE L4PTFDGUDKWCD-FSTRESS    MUST PASS: rows past a block edge 800; F4 rows 448; pool blocks read in place 77061; chain reads 51904; store reads 59127 (each > 0; accounting on)
+GATE L4PTFDGUDKWCD-LEAN       MUST PASS: lean passes 69 (one-row passes: draft steps 67 incl. the prelude's 3 + mixed 0 + one-row J 2 = 69); lean layers 2208 (L x passes = 2208)
+GATE L4PTFDGUDKWCD-MEM        MUST PASS: peak allocated 20.504 GB with the prefill (decode 18.233 GB, reserved 17.23 GB) against 84.0 GB; graph pool 109.052 MB; static inputs 0.296 MB; usable ceiling 84.25 GB
+GATE L4PTFDGUDKWCD-GRAPH      MUST PASS: graphs 32 (layers 32); warm 32; replays 735 (incl. the 32 first replays); eager 257 {'probe_F': 1, 'marks': 256}; L x joint passes 32 x 32 = 1024 (eager + warm + replays 1024); skipped-count mismatches []; capture passes [1, 2]
+GATE L4PTFDGUDKWCD-COUNTS     MUST PASS: 14 keys compared with L4PTFDGUDKWC's (not compared: none); differences 0 []; host counts chain 1024, resid 3232, attn 1024, fills 1024, gather_host 2048
+GATE L4PTFDGUDKWCD-DGRAPH     MUST PASS: keys captured [[True, False], [True, True]] (warm keys [[True, False], [True, True]]); graphs 128 (2 L x keys = 128); passes: warm 2 + eager 0 {} + capture 2 + replay 65 = 69 (one-row passes 69); replays 4288 (2 L x (capture + replay passes) = 4288); skipped-count mismatches []; capture rounds [(-1, [True, False]), (33, [True, True])]
+GATE L4PTFDGUDKWCD-HOIST      MUST PASS: hoist passes 32 (joint passes 32); hoisted layers 1024 (L x joint passes 1024); is_next recounted 0 (checked, must be 0)
+GATE L4PTFDGUDKWCD-KEEP       MUST PASS: joint passes counted 32 (union 32); listed 40866, fetched 34671, hits 6195; window loads from the store 11914; union listed host blocks 40866 (compared)
+GATE L4PTFDGUDKWCD-CAP        MUST PASS: overflow 0, duplicate keys 0, missing 0, blocks unequal to a fresh fetch 0; store blocks checked 40866 (listed 40866); window blocks checked 11914 (window hits 11914)
+GATE L4PTFDGUDKWCD-KEEP-EQ    MUST PASS: per pass ['passes', 'listed', 'fetched', 'win_hits', 'check'] compared with L4PTFDGUDKWC's; differ []; totals listed 40866 / 40866, fetched 34671 / 34671, window hits 11914 / 11914
+GATE L4PTFDGUDKWCD-KEEP-REF   REPORT PASS: no reference at B 8 pool 10 steps 72; totals {'listed': 40866, 'fetched': 34671, 'win_hits': 11914}
+GATE L4PTFDGUDKWCD-COMPILE    MUST PASS: backend inductor; joint sections 321 (eager + warm + captures 321); draft sections 128 ((warm + capture passes + eager) x L 128); fallback {} / {}; calls {'dpre': 128, 'dwrite': 128, 'dmask': 128, 'pre': 321, 'loc1': 321, 'loc2': 321, 'kphys': 321, 'lists': 321, 'write': 310}; compile events [('dpre', 'draft', 0, 1, 0, 0, 0.662), ('dwrite', 'draft', 0, 1, 0, 0, 0.561), ('dmask', 'draft', 0, 1, 0, 0, 0.677)] (late 0; per helper {'dpre': 1, 'dwrite': 1, 'dmask': 1}); first draft capture {'dpass': 2, 'joint_pass': 0}; captures begun 160; compile 1.899 s; graph breaks 0; dynamo {'unique_graphs': 3, 'frames_ok': 0, 'graph_breaks': 0, 'inductor_kernels': 5}
+GATE L4PTFDGUDKWCD-EQF        MUST PASS: committed tokens unequal to L4PTFD's: 0 of 576; fingerprints compared 576 columns, max equal True, sum equal True; state checksums equal True (0 of 227 differ); acceptance record equal True (accepted 541 vs 541)
+GATE L4PTFDGUDKWCDX-RUN       MUST PASS: 34 rounds of K 3
+GATE L4PTFDGUDKWCDX-ERR       MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE L4PTFDGUDKWCDX-COMMIT-N  MUST PASS: committed per request min 72 max 72 (exactly 72 wanted); warm 8 + per-round sum 568, total 576; 34 rounds
+GATE L4PTFDGUDKWCDX-D1        MUST PASS: residency-undo calls 0 (0 expected); resets 34 for 34 rounds
+GATE L4PTFDGUDKWCDX-D3        MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 128 = (K + 1) x 32 passes; one-row J slots 2; 34 rounds
+GATE L4PTFDGUDKWCDX-SPAN      MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE L4PTFDGUDKWCDX-STRESS    MUST PASS: commits across an edge 8, rows past an edge 41, F4 fill rows 19, dropped entries 79, tentative-block skips 1088, draft skips 88350; corrections 24, refills 20, final groups 8 (target rows 3, reported) (each > 0; counted on check rounds)
+GATE L4PTFDGUDKWCDX-RESID     MUST PASS: residency calls in joint passes 1024 for 32 joint passes of 32 layers (one per layer and pass); union layers 1024; verify_rows passes 32
+GATE L4PTFDGUDKWCDX-ATTN1     MUST PASS: attn calls 1024 for 32 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFDGUDKWCDX-FILL1     MUST PASS: fills calls 1024 for 32 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFDGUDKWCDX-PRESENT   MUST PASS: selected blocks of verify rows not present: 0 (recount); unserved list entries 0 (store X 129, bound 128)
+GATE L4PTFDGUDKWCDX-VIS       MUST PASS: rows whose visible block count (from the kernel's tables) is not their own: 0 (per row [0, 0, 0, 0])
+GATE L4PTFDGUDKWCDX-VB        MUST PASS: rows whose (block id, tokens) set in the kernel's tables is not their own selection: 0 of 51904
+GATE L4PTFDGUDKWCDX-TAIL      MUST PASS: union entries that read the window's committed tail slot (D1: the chain image CB0 replaces it): 0
+GATE L4PTFDGUDKWCDX-CHAIN     MUST PASS: chain-image rows with wrong bytes or a wrong position: 0; buffer rows checked 136960; chain reads 51904
+GATE L4PTFDGUDKWCDX-IDX       MUST PASS: sampled requests alone against the full launch, bitwise: {'entries': [0, 4, 7], 'equal': [True, True, True]}
+GATE L4PTFDGUDKWCDX-RA        MUST PASS: a row alone against the full launch, bitwise (rows whose first block is not block 0: 0): {'entries': [0, 16, 31], 'equal': [True, True, True]}
+GATE L4PTFDGUDKWCDX-FSTRESS   MUST PASS: rows past a block edge 800; F4 rows 448; pool blocks read in place 77061; chain reads 51904; store reads 59127 (each > 0; accounting on)
+GATE L4PTFDGUDKWCDX-LEAN      MUST PASS: lean passes 69 (one-row passes: draft steps 67 incl. the prelude's 3 + mixed 0 + one-row J 2 = 69); lean layers 2208 (L x passes = 2208)
+GATE L4PTFDGUDKWCDX-MEM       MUST PASS: peak allocated 20.513 GB with the prefill (decode 18.142 GB, reserved 17.094 GB) against 84.0 GB; graph pool 109.052 MB; static inputs 0.296 MB; usable ceiling 84.25 GB
+GATE L4PTFDGUDKWCDX-GRAPH     MUST PASS: graphs 32 (layers 32); warm 32; replays 735 (incl. the 32 first replays); eager 257 {'probe_F': 1, 'marks': 256}; L x joint passes 32 x 32 = 1024 (eager + warm + replays 1024); skipped-count mismatches []; capture passes [1, 2]
+GATE L4PTFDGUDKWCDX-DGRAPH    MUST PASS: keys captured [[True, False], [True, True]] (warm keys [[True, False], [True, True]]); graphs 128 (2 L x keys = 128); passes: warm 2 + eager 0 {} + capture 2 + replay 65 = 69 (one-row passes 69); replays 4288 (2 L x (capture + replay passes) = 4288); skipped-count mismatches []; capture rounds [(-1, [True, False]), (33, [True, True])]
+GATE L4PTFDGUDKWCDX-HOIST     MUST PASS: hoist passes 32 (joint passes 32); hoisted layers 1024 (L x joint passes 1024); is_next recounted 0 (checked, must be 0)
+GATE L4PTFDGUDKWCDX-KEEP      MUST PASS: joint passes counted 32 (union 32); listed 40866, fetched 34671, hits 6195; window loads from the store 11914; union listed host blocks 40866 (compared)
+GATE L4PTFDGUDKWCDX-CAP       MUST PASS: overflow 0, duplicate keys 0, missing 0, blocks unequal to a fresh fetch 0; store blocks checked 40866 (listed 40866); window blocks checked 11914 (window hits 11914)
+GATE L4PTFDGUDKWCDX-COMPILE   MUST PASS: backend inductor; joint sections 321 (eager + warm + captures 321); draft sections 128 ((warm + capture passes + eager) x L 128); fallback {} / {}; calls {'dpre': 128, 'dwrite': 128, 'dmask': 128, 'pre': 321, 'loc1': 321, 'loc2': 321, 'kphys': 321, 'lists': 321, 'write': 310}; compile events [] (late 0; per helper {}); first draft capture {'dpass': 2, 'joint_pass': 0}; captures begun 160; compile 0.0 s; graph breaks 0; dynamo {'unique_graphs': 0, 'frames_ok': 0, 'graph_breaks': 0, 'inductor_kernels': 0}
+GATE L4PTFDGUDKWCDX-EQF       MUST PASS: committed tokens unequal to L4PTFD's: 0 of 576; fingerprints compared 576 columns, max equal True, sum equal True; state checksums equal True (0 of 227 differ); acceptance record equal True (accepted 541 vs 541)
+GATE L4PTFDGUDKWCDX-COUNTS    MUST PASS: 13 keys compared with L4PTFDGUDKWCD's (not compared: ['round_blocks']); differences 0 []; host counts chain 1024, resid 3232, attn 1024, fills 1024, gather_host 2048
+GATE L4PTFDGUDKWCDX-LISTED    MUST PASS: joint passes 32 / 32; listed totals 40866 / 40866; passes that differ 0 []
+GATE L4PTFDGUDKWCDX-BF        MUST PASS: mode off; issued 0; items 0
+GATE L4PTFDGUDKWCDB-RUN       MUST PASS: 34 rounds of K 3
+GATE L4PTFDGUDKWCDB-ERR       MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE L4PTFDGUDKWCDB-COMMIT-N  MUST PASS: committed per request min 72 max 72 (exactly 72 wanted); warm 8 + per-round sum 568, total 576; 34 rounds
+GATE L4PTFDGUDKWCDB-D1        MUST PASS: residency-undo calls 0 (0 expected); resets 34 for 34 rounds
+GATE L4PTFDGUDKWCDB-D3        MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 128 = (K + 1) x 32 passes; one-row J slots 2; 34 rounds
+GATE L4PTFDGUDKWCDB-SPAN      MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE L4PTFDGUDKWCDB-STRESS    MUST PASS: commits across an edge 8, rows past an edge 41, F4 fill rows 19, dropped entries 79, tentative-block skips 1088, draft skips 88350; corrections 24, refills 20, final groups 8 (target rows 3, reported) (each > 0; counted on check rounds)
+GATE L4PTFDGUDKWCDB-RESID     MUST PASS: residency calls in joint passes 1024 for 32 joint passes of 32 layers (one per layer and pass); union layers 1024; verify_rows passes 32
+GATE L4PTFDGUDKWCDB-ATTN1     MUST PASS: attn calls 1024 for 32 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFDGUDKWCDB-FILL1     MUST PASS: fills calls 1024 for 32 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFDGUDKWCDB-PRESENT   MUST PASS: selected blocks of verify rows not present: 0 (recount); unserved list entries 0 (store X 129, bound 128)
+GATE L4PTFDGUDKWCDB-VIS       MUST PASS: rows whose visible block count (from the kernel's tables) is not their own: 0 (per row [0, 0, 0, 0])
+GATE L4PTFDGUDKWCDB-VB        MUST PASS: rows whose (block id, tokens) set in the kernel's tables is not their own selection: 0 of 51904
+GATE L4PTFDGUDKWCDB-TAIL      MUST PASS: union entries that read the window's committed tail slot (D1: the chain image CB0 replaces it): 0
+GATE L4PTFDGUDKWCDB-CHAIN     MUST PASS: chain-image rows with wrong bytes or a wrong position: 0; buffer rows checked 136960; chain reads 51904
+GATE L4PTFDGUDKWCDB-IDX       MUST PASS: sampled requests alone against the full launch, bitwise: {'entries': [0, 4, 7], 'equal': [True, True, True]}
+GATE L4PTFDGUDKWCDB-RA        MUST PASS: a row alone against the full launch, bitwise (rows whose first block is not block 0: 0): {'entries': [0, 16, 31], 'equal': [True, True, True]}
+GATE L4PTFDGUDKWCDB-FSTRESS   MUST PASS: rows past a block edge 800; F4 rows 448; pool blocks read in place 77061; chain reads 51904; store reads 59127 (each > 0; accounting on)
+GATE L4PTFDGUDKWCDB-LEAN      MUST PASS: lean passes 69 (one-row passes: draft steps 67 incl. the prelude's 3 + mixed 0 + one-row J 2 = 69); lean layers 2208 (L x passes = 2208)
+GATE L4PTFDGUDKWCDB-MEM       MUST PASS: peak allocated 20.521 GB with the prefill (decode 18.825 GB, reserved 17.783 GB) against 84.0 GB; graph pool 109.052 MB; static inputs 0.296 MB; usable ceiling 84.25 GB
+GATE L4PTFDGUDKWCDB-GRAPH     MUST PASS: graphs 32 (layers 32); warm 32; replays 735 (incl. the 32 first replays); eager 257 {'probe_F': 1, 'marks': 256}; L x joint passes 32 x 32 = 1024 (eager + warm + replays 1024); skipped-count mismatches []; capture passes [1, 2]
+GATE L4PTFDGUDKWCDB-DGRAPH    MUST PASS: keys captured [[True, False], [True, True]] (warm keys [[True, False], [True, True]]); graphs 128 (2 L x keys = 128); passes: warm 2 + eager 0 {} + capture 2 + replay 65 = 69 (one-row passes 69); replays 4288 (2 L x (capture + replay passes) = 4288); skipped-count mismatches []; capture rounds [(-1, [True, False]), (33, [True, True])]
+GATE L4PTFDGUDKWCDB-HOIST     MUST PASS: hoist passes 32 (joint passes 32); hoisted layers 1024 (L x joint passes 1024); is_next recounted 0 (checked, must be 0)
+GATE L4PTFDGUDKWCDB-KEEP      MUST PASS: joint passes counted 32 (union 32); listed 40866, fetched 26373, hits 14493; window loads from the store 15955; union listed host blocks 40866 (compared)
+GATE L4PTFDGUDKWCDB-CAP       MUST PASS: overflow 0, duplicate keys 0, missing 0, blocks unequal to a fresh fetch 0; store blocks checked 40866 (listed 40866); window blocks checked 15955 (window hits 15955)
+GATE L4PTFDGUDKWCDB-COMPILE   MUST PASS: backend inductor; joint sections 321 (eager + warm + captures 321); draft sections 128 ((warm + capture passes + eager) x L 128); fallback {} / {}; calls {'dpre': 128, 'dwrite': 128, 'dmask': 128, 'pre': 321, 'loc1': 321, 'loc2': 321, 'kphys': 321, 'lists': 321, 'write': 310}; compile events [] (late 0; per helper {}); first draft capture {'dpass': 2, 'joint_pass': 0}; captures begun 160; compile 0.0 s; graph breaks 0; dynamo {'unique_graphs': 0, 'frames_ok': 0, 'graph_breaks': 0, 'inductor_kernels': 0}
+GATE L4PTFDGUDKWCDB-EQF       MUST PASS: committed tokens unequal to L4PTFD's: 0 of 576; fingerprints compared 576 columns, max equal True, sum equal True; state checksums equal True (0 of 227 differ); acceptance record equal True (accepted 541 vs 541)
+GATE L4PTFDGUDKWCDB-COUNTS    MUST PASS: 13 keys compared with L4PTFDGUDKWCD's (not compared: ['round_blocks']); differences 0 []; host counts chain 1024, resid 3232, attn 1024, fills 1024, gather_host 2048
+GATE L4PTFDGUDKWCDB-LISTED    MUST PASS: joint passes 32 / 32; listed totals 40866 / 40866; passes that differ 0 []
+GATE L4PTFDGUDKWCDB-BF        MUST PASS: error None; jobs 2208, issued 1692, late 0; items seen 84202, kept or sent before 27103, capped 0, sent 15766 = device 15766; committed 15766, revived 0, no room 0 (sum ok True); used store 8338, window 3514, unused 3895, pending 19 (tags ok True)
+PREDICTION BF1-VS-X               REPORT: 0.8147 (registered None)
+PREDICTION BF1-VS-R               REPORT: 0.8139 (registered None)
+PREDICTION BF1-NEW-RATIO          REPORT: 0.8125 (registered None)
+PREDICTION BF1-WAIT-SAVING        REPORT: 0.5310 (registered None)
+PREDICTION BF1-JOINT-SAVING       REPORT: -1.7630 (registered None)
+PREDICTION BF1-DRAFT-RATIO        REPORT: 2.0422 (registered None)
+PREDICTION BF1-BARRIER-MS         REPORT: 0.0225 (registered None)
+PREDICTION BF1-EQ                 REPORT: L4PTFDGUDKWCDB-EQF passed True; registered None
+REPORT L61 capture rounds {'L4PTFDGUDKWC': {'joint': [1, 2], 'draft': [33], 'mapped': True}, 'L4PTFDGUDKWCD': {'joint': [1, 2], 'draft': [33], 'mapped': True}, 'L4PTFDGUDKWCDX': {'joint': [1, 2], 'draft': [33], 'mapped': True}, 'L4PTFDGUDKWCDB': {'joint': [1, 2], 'draft': [33], 'mapped': True}}; excluded from every arm's steady set: [1, 2, 33]
+REPORT SH B 8 C 73: steady 24.495 ms/step, tok/s median 326.6 mean 318.6 effective 33.1, peak 20.425 GB
+REPORT L4PTFD K 3: 34 rounds; committed tok/s median 53.4 mean 47.2 effective 16.0; vs SH {'median_tok_s': 0.1635, 'mean_tok_s': 0.1481, 'effective_tok_s': 0.4834}; vs 3407.2 0.0157; round median 369.813 ms; phases {'reset': 0.099, 'joint': 254.258, 'commit': 4.215, 'draft': 111.253}; draft step 55.627 ms; joint 10.38 SH steps; steady rounds 22 (excluded [1, 2, 33]); NEW blocks per steady round 2218.5, probe gather wait median 13.446 ms; tokens equal 0.545139 (first (7, 14)); peak 17.969 GB (with the prefill 20.496 GB)
+REPORT L4PTFDGUDKWC K 3: 34 rounds; committed tok/s median 99.0 mean 87.0 effective 17.4; vs SH {'median_tok_s': 0.3031, 'mean_tok_s': 0.2731, 'effective_tok_s': 0.5257}; vs 3407.2 0.0291; round median 199.455 ms; phases {'reset': 0.102, 'joint': 151.778, 'commit': 1.85, 'draft': 45.682}; draft step 22.841 ms; joint 6.1963 SH steps; steady rounds 22 (excluded [1, 2, 33]); NEW blocks per steady round 1677.0, probe gather wait median 12.73 ms; tokens equal 0.545139 (first (7, 14)); peak 18.294 GB (with the prefill 20.496 GB)
+REPORT L4PTFDGUDKWCD K 3: 34 rounds; committed tok/s median 100.5 mean 88.0 effective 21.2; vs SH {'median_tok_s': 0.3077, 'mean_tok_s': 0.2762, 'effective_tok_s': 0.6405}; vs 3407.2 0.0295; round median 196.56 ms; phases {'reset': 0.103, 'joint': 151.743, 'commit': 1.854, 'draft': 42.797}; draft step 21.398 ms; joint 6.1949 SH steps; steady rounds 22 (excluded [1, 2, 33]); NEW blocks per steady round 1677.0, probe gather wait median 12.569 ms; tokens equal 0.545139 (first (7, 14)); peak 18.233 GB (with the prefill 20.504 GB)
+REPORT L4PTFDGUDKWCDX K 3: 34 rounds; committed tok/s median 100.4 mean 88.0 effective 22.9; vs SH {'median_tok_s': 0.3074, 'mean_tok_s': 0.2762, 'effective_tok_s': 0.6918}; vs 3407.2 0.0295; round median 196.75 ms; phases {'reset': 0.104, 'joint': 151.814, 'commit': 1.855, 'draft': 42.89}; draft step 21.445 ms; joint 6.1978 SH steps; steady rounds 22 (excluded [1, 2, 33]); NEW blocks per steady round 1677.0, probe gather wait median 12.46 ms; tokens equal 0.545139 (first (7, 14)); peak 18.142 GB (with the prefill 20.513 GB)
+BF1 L4PTFDGUDKWCDX: mode off worker thread X 129 n_cap 2048 ring 8; epochs 0, jobs 0, issued 0, late 0 (items None), empty 0; items seen 0, kept / sent before 0, capped 0, SENT 0 (0.0 MB), committed 0, revived 0, no room 0; USED store 0 + window 0 = 0 (0.0 MB), unused 0, pending 0; pack 0.0 s (None GB/s), H2D 0 ms (None GB/s); barrier waits 0, median None ms; close wait 0.0 s; snapshot stalls 0; captures locked 0; device 0.0 MB; NEW blocks per steady round 1677.0, probe gather wait median 12.46 ms; error None
+BF1 L4PTFDGUDKWCDX packer gilfree: transport None
+BF1 L4PTFDGUDKWCDX ROOM: eligible slots per (head, request) at the epoch start mean None min None; demand per (head, request) per epoch None; items dropped for room BEFORE packing None. LATE: queued None, packing None, of the last draft pass None; age at the close median None ms, max None ms; worker busy 0.0 s
+BF1 L4PTFDGUDKWCDX LATE MODE defer (wait budget 250.0 ms per joint pass): deferred jobs None, committed at their layer None, landed after their layer ran (passed) None, host wait in the joint passes 0.0 s, no room at the deferred commit 0 items
+BF1 L4PTFDGUDKWCDX WORKER BUDGET (ms per epoch; the draft window is about 185 ms at C 73 B 318): {'worker_busy_s': 0.0, 'snap_s': 0.0, 'select_s': 0.0, 'entry_s': 0.0, 'cxx_s': 0.0, 'issue_s': 0.0, 'pack_s': 0.0}; batch 8, batches None, carried None; chunks per epoch None, submit None ms per chunk (about 1.3 = per call, about 4 = per byte)
+REPORT L4PTFDGUDKWCDB K 3: 34 rounds; committed tok/s median 81.8 mean 73.8 effective 21.2; vs SH {'median_tok_s': 0.2505, 'mean_tok_s': 0.2316, 'effective_tok_s': 0.6405}; vs 3407.2 0.024; round median 243.842 ms; phases {'reset': 0.151, 'joint': 153.577, 'commit': 1.855, 'draft': 87.592}; draft step 43.796 ms; joint 6.2697 SH steps; steady rounds 22 (excluded [1, 2, 33]); NEW blocks per steady round 1362.5, probe gather wait median 11.929 ms; tokens equal 0.545139 (first (7, 14)); peak 18.825 GB (with the prefill 20.521 GB)
+BF1 L4PTFDGUDKWCDB: mode ce worker thread X 129 n_cap 2048 ring 8; epochs 33, jobs 2208, issued 1692, late 0 (items None), empty 516; items seen 84202, kept / sent before 27103, capped 0, SENT 15766 (516.6 MB), committed 15766, revived 0, no room 0; USED store 8338 + window 3514 = 11852 (388.4 MB), unused 3895, pending 19; pack 1.004 s (0.515 GB/s), H2D 80.69 ms (None GB/s); barrier waits 32, median 0.02252800017595291 ms; close wait 0.0 s; snapshot stalls 0; captures locked 160; device 538.2 MB; NEW blocks per steady round 1362.5, probe gather wait median 11.929 ms; error None
+BF1 L4PTFDGUDKWCDB packer gilfree: transport {'groups': 15766, 'chunks': 1089, 'layers': 5336, 'pack_ns': 130920887, 'wait_ns': 4097583, 'submit_ns': 47501259, 'total_ns': 183239851, 'releases': 1089, 'threads_min': 14, 'threads_max': 14, 'published': 0, 'threads': 14, 'threads_ok': True, 'pack_GBps_native': 3.946, 'submit_ms_per_chunk': 0.0436, 'submit_GBps': 10.876, 'groups_per_chunk': 14.5}
+BF1 L4PTFDGUDKWCDB ROOM: eligible slots per (head, request) at the epoch start mean 56.23 min 0; demand per (head, request) per epoch 110.36; items dropped for room BEFORE packing 41333. LATE: queued None, packing None, of the last draft pass None; age at the close median None ms, max None ms; worker busy 3.725 s
+BF1 L4PTFDGUDKWCDB LATE MODE defer (wait budget 250.0 ms per joint pass): deferred jobs 3, committed at their layer 3, landed after their layer ran (passed) None, host wait in the joint passes 0.0 s, no room at the deferred commit 0 items
+BF1 L4PTFDGUDKWCDB WORKER BUDGET (ms per epoch; the draft window is about 185 ms at C 73 B 318): {'worker_busy_s': 112.879, 'snap_s': 20.692, 'select_s': 12.398, 'entry_s': 2.313, 'cxx_s': 10.579, 'issue_s': 58.906, 'pack_s': 30.425, 'cxx_submit': 1.439, 'cxx_pack': 3.967}; batch 8, batches 1518, carried None; chunks per epoch 33.0, submit 0.0436 ms per chunk (about 1.3 = per call, about 4 = per byte)
+r2_bf1: 0 MUST gate(s) failed

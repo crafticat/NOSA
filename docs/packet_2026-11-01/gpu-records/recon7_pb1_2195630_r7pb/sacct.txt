@@ -1,0 +1,1 @@
+2195630.2|recon7-r7pb-pb1-2195630|FAILED|1:0|01:27:38|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=340G,node=1|3878332K

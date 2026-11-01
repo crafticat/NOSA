@@ -1,0 +1,188 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+......F.FF.                                                              [100%]
+=================================== FAILURES ===================================
+________________________________ test_mem_pure _________________________________
+
+    def test_mem_pure():
+        M = _mod("r2_recon7_mem")
+        a = M.parse_args(["--out", "x", "--workload", "w"])
+        assert (a.batches, a.pool, a.steps, a.probe_rounds, a.margin_gb) == ([64, 192], 18, 512, 49, 0.10)
+        for bad in (["--batches", "64"], ["--batches", "64,64"], ["--spec", "4"], ["--probe-rounds", "20"],
+                    ["--batches", "a"]):
+            with pytest.raises(SystemExit):
+                M.parse_args(["--out", "x", "--workload", "w"] + bad)
+        assert M.main(["--out", "x", "--workload", "w", "--model", "m"]) == 20     # no --cell: refused
+>       assert M.main(["--out", "x", "--workload", "w", "--model", "m", "--cell", "r7mem"]) == 20   # not granted
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py:793: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+argv = ['--out', 'x', '--workload', 'w', '--model', 'm', ...]
+
+    def main(argv=None) -> int:
+        a = parse_args(sys.argv[1:] if argv is None else argv)
+        why = PROT.refusal(a.cell, "r2_recon7_mem", a)
+        if why is not None:
+            print(why, file=sys.stderr)
+            return 20
+        if os.path.exists(a.out):
+            print("REFUSED: --out %s exists" % a.out, file=sys.stderr)
+            return 20
+        if not a.model:
+            print("REFUSED: no --model / NOSI_MODEL_PATH", file=sys.stderr)
+            return 20
+        import torch
+>       import nosi.cache_engine as CEN
+E       ModuleNotFoundError: No module named 'nosi.cache_engine'
+
+benchmarks/Efficiency/r2_recon7_mem.py:254: ModuleNotFoundError
+----------------------------- Captured stderr call -----------------------------
+usage: __main__.py [-h] --out OUT [--cell CELL] [--model MODEL] --workload
+                   WORKLOAD [--batches BATCHES] [--steps STEPS] [--pool POOL]
+                   [--spec SPEC] [--fork-store FORK_STORE]
+                   [--prefill-hook {nocopy,copy}]
+                   [--tu-gemm {natural,rowgroup}]
+                   [--spec-journal-blocks SPEC_JOURNAL_BLOCKS]
+                   [--spec-twin {torch,bi,fused}] [--spec-body {torch,fused}]
+                   [--spec-graph {on,off}] [--spec-redirect {on,off}]
+                   [--probe-every PROBE_EVERY] [--probe-rounds PROBE_ROUNDS]
+                   [--margin-gb MARGIN_GB]
+__main__.py: error: --batches: at least two distinct B >= 1 (a line needs two points)
+usage: __main__.py [-h] --out OUT [--cell CELL] [--model MODEL] --workload
+                   WORKLOAD [--batches BATCHES] [--steps STEPS] [--pool POOL]
+                   [--spec SPEC] [--fork-store FORK_STORE]
+                   [--prefill-hook {nocopy,copy}]
+                   [--tu-gemm {natural,rowgroup}]
+                   [--spec-journal-blocks SPEC_JOURNAL_BLOCKS]
+                   [--spec-twin {torch,bi,fused}] [--spec-body {torch,fused}]
+                   [--spec-graph {on,off}] [--spec-redirect {on,off}]
+                   [--probe-every PROBE_EVERY] [--probe-rounds PROBE_ROUNDS]
+                   [--margin-gb MARGIN_GB]
+__main__.py: error: --batches: at least two distinct B >= 1 (a line needs two points)
+usage: __main__.py [-h] --out OUT [--cell CELL] [--model MODEL] --workload
+                   WORKLOAD [--batches BATCHES] [--steps STEPS] [--pool POOL]
+                   [--spec SPEC] [--fork-store FORK_STORE]
+                   [--prefill-hook {nocopy,copy}]
+                   [--tu-gemm {natural,rowgroup}]
+                   [--spec-journal-blocks SPEC_JOURNAL_BLOCKS]
+                   [--spec-twin {torch,bi,fused}] [--spec-body {torch,fused}]
+                   [--spec-graph {on,off}] [--spec-redirect {on,off}]
+                   [--probe-every PROBE_EVERY] [--probe-rounds PROBE_ROUNDS]
+                   [--margin-gb MARGIN_GB]
+__main__.py: error: --spec: K 3 only
+usage: __main__.py [-h] --out OUT [--cell CELL] [--model MODEL] --workload
+                   WORKLOAD [--batches BATCHES] [--steps STEPS] [--pool POOL]
+                   [--spec SPEC] [--fork-store FORK_STORE]
+                   [--prefill-hook {nocopy,copy}]
+                   [--tu-gemm {natural,rowgroup}]
+                   [--spec-journal-blocks SPEC_JOURNAL_BLOCKS]
+                   [--spec-twin {torch,bi,fused}] [--spec-body {torch,fused}]
+                   [--spec-graph {on,off}] [--spec-redirect {on,off}]
+                   [--probe-every PROBE_EVERY] [--probe-rounds PROBE_ROUNDS]
+                   [--margin-gb MARGIN_GB]
+__main__.py: error: --steps in 8 .. 1000, --probe-every >= 2, --probe-rounds >= 2 x probe_every + 1 (the flat window)
+usage: __main__.py [-h] --out OUT [--cell CELL] [--model MODEL] --workload
+                   WORKLOAD [--batches BATCHES] [--steps STEPS] [--pool POOL]
+                   [--spec SPEC] [--fork-store FORK_STORE]
+                   [--prefill-hook {nocopy,copy}]
+                   [--tu-gemm {natural,rowgroup}]
+                   [--spec-journal-blocks SPEC_JOURNAL_BLOCKS]
+                   [--spec-twin {torch,bi,fused}] [--spec-body {torch,fused}]
+                   [--spec-graph {on,off}] [--spec-redirect {on,off}]
+                   [--probe-every PROBE_EVERY] [--probe-rounds PROBE_ROUNDS]
+                   [--margin-gb MARGIN_GB]
+__main__.py: error: --batches: integers
+REFUSED: r2_recon7_mem: cell None is not one of ('r7pm', 'r7pa', 'r7pb', 'r7s', 'r7mem') (--cell)
+_____________________________ test_protocol_state ______________________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f9523ab6050>
+
+    def test_protocol_state(monkeypatch):
+        """review 3 finding 1: ONE grant per cell, default deny, the profile bound to the grant."""
+        P = _mod("r2_recon7_protocol")
+        src = (EFF / "r2_recon7_protocol.py").read_text()
+        assert not hasattr(P, "PROTOCOL_STAMP_RECON7") and "PROTOCOL_STAMP_RECON7 =" not in src   # the one-for-all stamp
+        for c in P.CELLS:                                                  # one line per cell; the file's state is read
+            line = [x for x in src.splitlines() if x.startswith("GRANT_%s = " % c)]
+            assert len(line) == 1, c
+            assert (line[0] == "GRANT_%s = None" % c) == (P.grant(c) is None), c
+        assert set(P.PROFILES) == set(P.CELLS) == set(P.CELL_MODULE)
+        for c in P.CELLS:
+            if P.grant(c) is None:
+                assert P.refusal(c, P.CELL_MODULE[c], _profile_args(c)).startswith("REFUSED")
+        # an r7s grant runs r7s only
+        monkeypatch.setattr(P, "GRANT_r7s", STAMP)
+        assert P.refusal("r7s", "r2_recon7_streams", _profile_args("r7s")) is None
+        for c in ("r7pm", "r7pa", "r7pb", "r7mem"):
+            why = P.refusal(c, P.CELL_MODULE[c], _profile_args(c))
+>           assert why is not None and "not granted" in why, (c, why)
+E           AssertionError: ('r7pm', None)
+E           assert (None is not None)
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py:917: AssertionError
+___________________________ test_step_script_recon7 ____________________________
+
+tmp_path = PosixPath('/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/pytest-of-ojerbi/pytest-309/test_step_script_recon70')
+
+    def test_step_script_recon7(tmp_path):
+        src = (EFF / "r2_recon7_step.sh").read_text()
+        assert src.rstrip().endswith('then main "$@"; exit $?; fi') and "\nmain() {\n" in src
+        for word in ("python", "perl", "awk", "sed"):                       # no interpreter word outside the cell launch
+            lines = [x for x in src.splitlines() if re.search(r"\b%s\b" % word, x) and "/venv/nosa/bin/python" not in x
+                     and not x.lstrip().startswith("#")]
+            assert lines == [], (word, lines[:3])
+        # THE HASHING BOUNDARY (review 3 finding 5): hashing only inside CHILD (the GPU node), by absolute path
+        lines = src.splitlines()
+        c0 = next(i for i, x in enumerate(lines) if x.startswith("CHILD='"))
+        c1 = next(i for i in range(c0 + 1, len(lines)) if lines[i].endswith("\"$@\"'"))
+        outside = [x for i, x in enumerate(lines) if (i < c0 or i > c1) and not x.lstrip().startswith("#")
+                   and any(h in x for h in HASHERS)]
+        assert outside == [], outside[:3]
+        child = "\n".join(lines[c0:c1 + 1])
+        assert child.count("/usr/bin/sha256sum") == 2 and "IMGSHA" in child and "exit 6" in child and "ulimit -f" in child
+        assert child.index("/usr/bin/sha256sum") < child.index('exec "$A"')               # the pins before the image
+        assert "SIF_SHA=%s" % open("/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif.sha256").read().split()[0] in src \
+            if os.path.exists("/mnt/beegfs/ojerbi/nosa-env/nosa-env.sif.sha256") else "SIF_SHA=" in src
+        assert 'cmp -s -- "$0" <(git -C "$NOSI" show "$NSHA:$SELF")' in src and 'ulimit -f "$FILE_KB"' in src
+        assert "du -sb" in src and "exit 7" in src
+        assert "FORK_BLOB=%s" % FORK_BLOB in src and "NOSI=%s " % STEP_ROOT in src and "OUTROOT/sp_active_$JOB" in src
+        assert "CCROOT=/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_jit " in src
+        for m in MODULES + ("r2_i4c_cell.py", "r2_i4m_cell.py", "r2_wsm_cell.py", "r2_i4dc_cell.py", "r2_p3_profile.py"):
+            assert "benchmarks/Efficiency/%s" % m in src, m
+        # THE CELL GRANTS (review 3 finding 1): granted() on planted protocol texts
+        prot = (EFF / "r2_recon7_protocol.py").read_text()
+        for c in ("r7pm", "r7pa", "r7pb", "r7s", "r7mem"):
+>           assert _granted(c, prot, tmp_path) == 1, c                     # this tree: nothing granted
+E           AssertionError: r7pm
+E           assert 0 == 1
+E            +  where 0 = _granted('r7pm', '"""RECON7 (the reconciliation of revision 7, KS/analysis/plan/HUMAN_RECON_REQUEST_2026-10-30.md; KS =\n/mnt/beegfs/oj... % (\n            module, bad, cell, {k: (getattr(args, k, None), PROFILES[cell][k]) for k in bad})\n    return None\n', PosixPath('/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/pytest-of-ojerbi/pytest-309/test_step_script_recon70'))
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py:1001: AssertionError
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_recon7_copies
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:171: Evidence: RECON7 COPIES: run_arm_r7 = run_arm_d + 5 R7 lines; probe_arm_r7 = probe_arm_x + 2 R7 lines
+    _ev("RECON7 COPIES: run_arm_r7 = run_arm_d + %d R7 lines; probe_arm_r7 = probe_arm_x + %d R7 lines" % (
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_streams_measure_plumbing
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:683: Evidence: RECON7 X1 (CPU plumbing): 26 configurations; planted F -> stop 'EXACT failed in FG', failed ['FG-EXACT']
+    _ev("RECON7 X1 (CPU plumbing): %d configurations; planted F -> stop %r, failed %s" % (len(names), stop, bad))
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_streams_run_shapes
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:779: Evidence: RECON7 X1 (CPU run_shapes): free / UNION / IDS / setup deadline / late wall / exception each STOP THE RUN; GRP-EQ governs GRP only
+    _ev("RECON7 X1 (CPU run_shapes): free / UNION / IDS / setup deadline / late wall / exception each STOP THE RUN; "
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED benchmarks/Efficiency/tests_cpu/test_recon7.py::test_mem_pure - Module...
+FAILED benchmarks/Efficiency/tests_cpu/test_recon7.py::test_protocol_state - ...
+FAILED benchmarks/Efficiency/tests_cpu/test_recon7.py::test_step_script_recon7
+3 failed, 8 passed, 5 deselected, 3 warnings in 5.94s

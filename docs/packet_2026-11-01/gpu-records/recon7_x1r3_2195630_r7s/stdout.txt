@@ -1,0 +1,108 @@
+[r2_recon7_streams 13:39:02] shape C128_B216: NEW 1.226 per (layer, KV head, request); need 13.92 GB of 84.65 GB free
+[r2_recon7_streams 13:41:23] shape C73_B318: NEW 5.0 per (layer, KV head, request); need 19.76 GB of 84.46 GB free
+GATE C128_B216-UNION          MUST PASS: union_len min [72, 72, 72] max [72, 72, 72] (want 72 at every (KV head, request), full and both groups)
+GATE C128_B216-IDS            MUST PASS: NEW blocks per layer window 265 store 265 (want (265, 265))
+GATE F|M-SER-EXACT            MUST PASS: 2 outputs compared; unequal []
+GATE A|FG-SER-EXACT           MUST PASS: 11 outputs compared; unequal []
+GATE A|F|M-SER-EXACT          MUST PASS: 6 outputs compared; unequal []
+GATE A|F-EXACT                MUST PASS: 5 outputs compared; unequal []
+GATE A|G-EXACT                MUST PASS: 10 outputs compared; unequal []
+GATE A|M-EXACT                MUST PASS: 5 outputs compared; unequal []
+GATE F|M-EXACT                MUST PASS: 2 outputs compared; unequal []
+GATE A|FG-EXACT               MUST PASS: 11 outputs compared; unequal []
+GATE A|F|M-EXACT              MUST PASS: 6 outputs compared; unequal []
+GATE SER-EXACT                MUST PASS: 11 outputs compared; unequal []
+GATE GRP0-EXACT               MUST PASS: 11 outputs compared; unequal []
+GATE GRP1-EXACT               MUST PASS: 11 outputs compared; unequal []
+GATE GRP-SER-EXACT            MUST PASS: 22 outputs compared; unequal []
+GATE GRP-EXACT                MUST PASS: 22 outputs compared; unequal []
+GATE GRPL-EXACT               MUST PASS: 22 outputs compared; unequal []
+GATE CPY-SER-EXACT            MUST PASS: 12 outputs compared; unequal []
+GATE CPY-EXACT                MUST PASS: 12 outputs compared; unequal []
+GATE A-EXACT                  MUST PASS: 4 outputs compared; unequal []
+GATE F-EXACT                  MUST PASS: 1 outputs compared; unequal []
+GATE G-EXACT                  MUST PASS: 6 outputs compared; unequal []
+GATE M-EXACT                  MUST PASS: 1 outputs compared; unequal []
+GATE FG-EXACT                 MUST PASS: 7 outputs compared; unequal []
+GATE P-EXACT                  MUST PASS: 1 outputs compared; unequal []
+GATE A|F-SER-EXACT            MUST PASS: 5 outputs compared; unequal []
+GATE A|G-SER-EXACT            MUST PASS: 10 outputs compared; unequal []
+GATE A|M-SER-EXACT            MUST PASS: 5 outputs compared; unequal []
+GATE C128_B216-GRP-EQ         DECISION FAIL: DECISION GATE (GRP / GRPL only): the groups' outputs = the full batch's bits: {'Aq': False, 'Ar': False, 'F': True, 'G': True}
+GATE C128_B216-BUDGET         MUST PASS: wall 141.4 s from the shape's start to its last gate (limit 240 s); setup 114.1 s; stop None
+GATE C128_B216-RUN            MUST PASS: 26 configurations x 10 order-rotated passes of 32 layers; stop None
+GATE C73_B318-UNION           MUST PASS: union_len min [72, 72, 72] max [72, 72, 72] (want 72 at every (KV head, request), full and both groups)
+GATE C73_B318-IDS             MUST PASS: NEW blocks per layer window 1590 store 1590 (want (1590, 1590))
+GATE F|M-SER-EXACT            MUST PASS: 2 outputs compared; unequal []
+GATE A|FG-SER-EXACT           MUST PASS: 11 outputs compared; unequal []
+GATE A|F|M-SER-EXACT          MUST PASS: 6 outputs compared; unequal []
+GATE A|F-EXACT                MUST PASS: 5 outputs compared; unequal []
+GATE A|G-EXACT                MUST PASS: 10 outputs compared; unequal []
+GATE A|M-EXACT                MUST PASS: 5 outputs compared; unequal []
+GATE F|M-EXACT                MUST PASS: 2 outputs compared; unequal []
+GATE A|FG-EXACT               MUST PASS: 11 outputs compared; unequal []
+GATE A|F|M-EXACT              MUST PASS: 6 outputs compared; unequal []
+GATE SER-EXACT                MUST PASS: 11 outputs compared; unequal []
+GATE GRP0-EXACT               MUST PASS: 11 outputs compared; unequal []
+GATE GRP1-EXACT               MUST PASS: 11 outputs compared; unequal []
+GATE GRP-SER-EXACT            MUST PASS: 22 outputs compared; unequal []
+GATE GRP-EXACT                MUST PASS: 22 outputs compared; unequal []
+GATE GRPL-EXACT               MUST PASS: 22 outputs compared; unequal []
+GATE CPY-SER-EXACT            MUST PASS: 12 outputs compared; unequal []
+GATE CPY-EXACT                MUST PASS: 12 outputs compared; unequal []
+GATE A-EXACT                  MUST PASS: 4 outputs compared; unequal []
+GATE F-EXACT                  MUST PASS: 1 outputs compared; unequal []
+GATE G-EXACT                  MUST PASS: 6 outputs compared; unequal []
+GATE M-EXACT                  MUST PASS: 1 outputs compared; unequal []
+GATE FG-EXACT                 MUST PASS: 7 outputs compared; unequal []
+GATE P-EXACT                  MUST PASS: 1 outputs compared; unequal []
+GATE A|F-SER-EXACT            MUST PASS: 5 outputs compared; unequal []
+GATE A|G-SER-EXACT            MUST PASS: 10 outputs compared; unequal []
+GATE A|M-SER-EXACT            MUST PASS: 5 outputs compared; unequal []
+GATE C73_B318-GRP-EQ          DECISION FAIL: DECISION GATE (GRP / GRPL only): the groups' outputs = the full batch's bits: {'Aq': True, 'Ar': False, 'F': True, 'G': True}
+GATE C73_B318-BUDGET          MUST PASS: wall 67.6 s from the shape's start to its last gate (limit 240 s); setup 7.5 s; stop None
+GATE C73_B318-RUN             MUST PASS: 26 configurations x 10 order-rotated passes of 32 layers; stop None
+GATE RUN-WALL                 MUST PASS: run wall 209.1 s (limit 600 s)
+X1 C128_B216 medians ms per pass of 32 layers: {'A': 66.6881, 'F': 37.5396, 'G': 23.2775, 'M': 22.338, 'FG': 57.8014, 'P': 22.3736, 'A|F-SER': 100.1859, 'A|G-SER': 88.5996, 'A|M-SER': 86.1826, 'F|M-SER': 57.8812, 'A|FG-SER': 121.0988, 'A|F|M-SER': 120.8035, 'A|F': 97.7778, 'A|G': 81.138, 'A|M': 68.9244, 'F|M': 37.7931, 'A|FG': 110.086, 'A|F|M': 99.5944, 'SER': 124.9914, 'GRP0': 63.103, 'GRP1': 63.1511, 'GRP-SER': 126.2899, 'GRP': 110.8388, 'GRPL': 121.7193, 'CPY-SER': 143.8076, 'CPY': 124.6579}
+X1 CONTROL C128_B216 A|F-SER: {'consistent': True, 'dev_from_sum': -0.0388, 'sum_ms': 104.2277}
+X1 CONTROL C128_B216 A|G-SER: {'consistent': True, 'dev_from_sum': -0.0152, 'sum_ms': 89.9656}
+X1 CONTROL C128_B216 A|M-SER: {'consistent': True, 'dev_from_sum': -0.0319, 'sum_ms': 89.0261}
+X1 CONTROL C128_B216 F|M-SER: {'consistent': True, 'dev_from_sum': -0.0333, 'sum_ms': 59.8776}
+X1 CONTROL C128_B216 A|FG-SER: {'consistent': True, 'dev_from_sum': -0.0272, 'sum_ms': 124.4895}
+X1 CONTROL C128_B216 A|F|M-SER: {'consistent': True, 'dev_from_sum': -0.0455, 'sum_ms': 126.5657}
+X1 CONTROL C128_B216 GRP-SER: {'consistent': True, 'dev_from_sum': 0.0003, 'sum_ms': 126.2541}
+X1 CONTROL C128_B216 CPY-SER: {'consistent': True, 'dev_from_sum': -0.0241, 'sum_ms': 147.365}
+X1 (a) CAPABILITY C128_B216 A|F: {'ms': 97.7778, 'parts': ['A', 'F'], 'alone': [66.6881, 37.5396], 'max': 66.6881, 'sum': 104.2277, 'control': 'A|F-SER', 'control_ms': 100.1859, 'control_consistent': True, 'over_control': 0.976, 'eff_matched': 0.0719, 'over_max_ideal': 1.4662}
+X1 (a) CAPABILITY C128_B216 A|G: {'ms': 81.138, 'parts': ['A', 'G'], 'alone': [66.6881, 23.2775], 'max': 66.6881, 'sum': 89.9656, 'control': 'A|G-SER', 'control_ms': 88.5996, 'control_consistent': True, 'over_control': 0.9158, 'eff_matched': 0.3405, 'over_max_ideal': 1.2167}
+X1 (a) CAPABILITY C128_B216 A|M: {'ms': 68.9244, 'parts': ['A', 'M'], 'alone': [66.6881, 22.338], 'max': 66.6881, 'sum': 89.0261, 'control': 'A|M-SER', 'control_ms': 86.1826, 'control_consistent': True, 'over_control': 0.7997, 'eff_matched': 0.8853, 'over_max_ideal': 1.0335}
+X1 (a) CAPABILITY C128_B216 F|M: {'ms': 37.7931, 'parts': ['F', 'M'], 'alone': [37.5396, 22.338], 'max': 37.5396, 'sum': 59.8776, 'control': 'F|M-SER', 'control_ms': 57.8812, 'control_consistent': True, 'over_control': 0.6529, 'eff_matched': 0.9875, 'over_max_ideal': 1.0068}
+X1 (a) CAPABILITY C128_B216 A|FG: {'ms': 110.086, 'parts': ['A', 'FG'], 'alone': [66.6881, 57.8014], 'max': 66.6881, 'sum': 124.4895, 'control': 'A|FG-SER', 'control_ms': 121.0988, 'control_consistent': True, 'over_control': 0.9091, 'eff_matched': 0.2024, 'over_max_ideal': 1.6508}
+X1 (a) CAPABILITY C128_B216 A|F|M: {'ms': 99.5944, 'parts': ['A', 'F', 'M'], 'alone': [66.6881, 37.5396, 22.338], 'max': 66.6881, 'sum': 126.5657, 'control': 'A|F|M-SER', 'control_ms': 120.8035, 'control_consistent': True, 'over_control': 0.8244, 'eff_matched': 0.3919, 'over_max_ideal': 1.4934}
+X1 (a) CAPABILITY C128_B216: interference A|M 0.0335 (model s 0.0868458712); DECISION PARTIAL
+X1 (b) ORDERED SCREEN C128_B216 GRP: {'ms': 110.8388, 'control_ms': 126.2899, 'ser_ms': 124.9914, 'split_cost_ms': 1.2985, 'overlap_ms': 15.4511, 'net_ms': 14.1526, 'net_frac': 0.1132, 'control_consistent': True, 'eligible': False, 'decision': "INELIGIBLE: the groups' outputs differ from the full batch's (request-neighbour invariant)"}
+X1 (b) ORDERED SCREEN C128_B216 GRPL: {'ms': 121.7193, 'control_ms': 126.2899, 'ser_ms': 124.9914, 'split_cost_ms': 1.2985, 'overlap_ms': 4.5706, 'net_ms': 3.2721, 'net_frac': 0.0262, 'control_consistent': True, 'eligible': False, 'decision': "INELIGIBLE: the groups' outputs differ from the full batch's (request-neighbour invariant)"}
+X1 (b) ORDERED SCREEN C128_B216 CPY: {'ms': 124.6579, 'control_ms': 143.8076, 'ser_ms': 124.9914, 'P_ms': 22.3736, 'absorbed_frac': 1.0149, 'chain_slowdown': -0.0027, 'control_consistent': True, 'decision': 'COPY ABSORBED (copy interference only, not a prefetch)'}
+X1 (b) ORDERED SCREEN C128_B216 WINF: NOT MEASURED: needs the window part's log-sum-exp (the fork's 2D launch has none) or a non-bit-equal split
+X1 C128_B216 groups' outputs = the full batch's bits {'Aq': False, 'Ar': False, 'F': True, 'G': True}; wall 141.4 s; stop None
+X1 C73_B318 medians ms per pass of 32 layers: {'A': 84.0852, 'F': 57.2641, 'G': 133.7992, 'M': 133.1781, 'FG': 184.5195, 'P': 133.2645, 'A|F-SER': 135.9724, 'A|G-SER': 210.6726, 'A|M-SER': 211.5345, 'F|M-SER': 186.828, 'A|FG-SER': 260.1889, 'A|F|M-SER': 262.3094, 'A|F': 132.7471, 'A|G': 195.898, 'A|M': 134.3027, 'F|M': 135.0665, 'A|FG': 245.5353, 'A|F|M': 135.965, 'SER': 263.1155, 'GRP0': 140.4022, 'GRP1': 139.4314, 'GRP-SER': 279.7901, 'GRP': 251.8006, 'GRPL': 258.4412, 'CPY-SER': 395.4899, 'CPY': 295.5508}
+X1 CONTROL C73_B318 A|F-SER: {'consistent': True, 'dev_from_sum': -0.038, 'sum_ms': 141.3493}
+X1 CONTROL C73_B318 A|G-SER: {'consistent': True, 'dev_from_sum': -0.0331, 'sum_ms': 217.8844}
+X1 CONTROL C73_B318 A|M-SER: {'consistent': True, 'dev_from_sum': -0.0264, 'sum_ms': 217.2633}
+X1 CONTROL C73_B318 F|M-SER: {'consistent': True, 'dev_from_sum': -0.019, 'sum_ms': 190.4422}
+X1 CONTROL C73_B318 A|FG-SER: {'consistent': True, 'dev_from_sum': -0.0313, 'sum_ms': 268.6047}
+X1 CONTROL C73_B318 A|F|M-SER: {'consistent': True, 'dev_from_sum': -0.0445, 'sum_ms': 274.5274}
+X1 CONTROL C73_B318 GRP-SER: {'consistent': True, 'dev_from_sum': -0.0002, 'sum_ms': 279.8336}
+X1 CONTROL C73_B318 CPY-SER: {'consistent': True, 'dev_from_sum': -0.0022, 'sum_ms': 396.38}
+X1 (a) CAPABILITY C73_B318 A|F: {'ms': 132.7471, 'parts': ['A', 'F'], 'alone': [84.0852, 57.2641], 'max': 84.0852, 'sum': 141.3493, 'control': 'A|F-SER', 'control_ms': 135.9724, 'control_consistent': True, 'over_control': 0.9763, 'eff_matched': 0.0622, 'over_max_ideal': 1.5787}
+X1 (a) CAPABILITY C73_B318 A|G: {'ms': 195.898, 'parts': ['A', 'G'], 'alone': [84.0852, 133.7992], 'max': 133.7992, 'sum': 217.8844, 'control': 'A|G-SER', 'control_ms': 210.6726, 'control_consistent': True, 'over_control': 0.9299, 'eff_matched': 0.1922, 'over_max_ideal': 1.4641}
+X1 (a) CAPABILITY C73_B318 A|M: {'ms': 134.3027, 'parts': ['A', 'M'], 'alone': [84.0852, 133.1781], 'max': 133.1781, 'sum': 217.2633, 'control': 'A|M-SER', 'control_ms': 211.5345, 'control_consistent': True, 'over_control': 0.6349, 'eff_matched': 0.9856, 'over_max_ideal': 1.0084}
+X1 (a) CAPABILITY C73_B318 F|M: {'ms': 135.0665, 'parts': ['F', 'M'], 'alone': [57.2641, 133.1781], 'max': 133.1781, 'sum': 190.4422, 'control': 'F|M-SER', 'control_ms': 186.828, 'control_consistent': True, 'over_control': 0.7229, 'eff_matched': 0.9648, 'over_max_ideal': 1.0142}
+X1 (a) CAPABILITY C73_B318 A|FG: {'ms': 245.5353, 'parts': ['A', 'FG'], 'alone': [84.0852, 184.5195], 'max': 184.5195, 'sum': 268.6047, 'control': 'A|FG-SER', 'control_ms': 260.1889, 'control_consistent': True, 'over_control': 0.9437, 'eff_matched': 0.1937, 'over_max_ideal': 1.3307}
+X1 (a) CAPABILITY C73_B318 A|F|M: {'ms': 135.965, 'parts': ['A', 'F', 'M'], 'alone': [84.0852, 57.2641, 133.1781], 'max': 133.1781, 'sum': 274.5274, 'control': 'A|F|M-SER', 'control_ms': 262.3094, 'control_consistent': True, 'over_control': 0.5183, 'eff_matched': 0.9784, 'over_max_ideal': 1.0209}
+X1 (a) CAPABILITY C73_B318: interference A|M 0.0084 (model s 0.0868458712); DECISION REACHABLE
+X1 (b) ORDERED SCREEN C73_B318 GRP: {'ms': 251.8006, 'control_ms': 279.7901, 'ser_ms': 263.1155, 'split_cost_ms': 16.6746, 'overlap_ms': 27.9895, 'net_ms': 11.3149, 'net_frac': 0.043, 'control_consistent': True, 'eligible': False, 'decision': "INELIGIBLE: the groups' outputs differ from the full batch's (request-neighbour invariant)"}
+X1 (b) ORDERED SCREEN C73_B318 GRPL: {'ms': 258.4412, 'control_ms': 279.7901, 'ser_ms': 263.1155, 'split_cost_ms': 16.6746, 'overlap_ms': 21.3489, 'net_ms': 4.6743, 'net_frac': 0.0178, 'control_consistent': True, 'eligible': False, 'decision': "INELIGIBLE: the groups' outputs differ from the full batch's (request-neighbour invariant)"}
+X1 (b) ORDERED SCREEN C73_B318 CPY: {'ms': 295.5508, 'control_ms': 395.4899, 'ser_ms': 263.1155, 'P_ms': 133.2645, 'absorbed_frac': 0.7566, 'chain_slowdown': 0.1233, 'control_consistent': True, 'decision': 'COPY NOT ABSORBED'}
+X1 (b) ORDERED SCREEN C73_B318 WINF: NOT MEASURED: needs the window part's log-sum-exp (the fork's 2D launch has none) or a non-bit-equal split
+X1 C73_B318 groups' outputs = the full batch's bits {'Aq': True, 'Ar': False, 'F': True, 'G': True}; wall 67.6 s; stop None
+r2_recon7_streams: 0 MUST gate(s) failed

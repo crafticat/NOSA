@@ -1,0 +1,7 @@
+exit=3 utc_end=2026-10-31T15:52:24Z
+accounting=exit 3, sacct FAILED 3:0
+bytes /mnt/beegfs/ojerbi/r2-runs/spec/bf1_b1_2195630_bf1b 12382885
+bytes /mnt/beegfs/ojerbi/r2-runs/spec/bf1_b1_2195630_bf1b.step 2984934
+bytes /mnt/beegfs/ojerbi/nosa-env/jit/bf1_b1_2195630_bf1b 21054291
+bytes /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/bf1_jit/bf1_b1_2195630_bf1b 14838516
+output_bytes=51260626 limit_bytes=2147483648 over=0

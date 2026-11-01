@@ -1,0 +1,119 @@
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+[r2_i4dc 10:06:13] model loaded in 11 s
+[r2_i4dc 10:06:13] arm SH (B 318, 512 steps, C 73)
+[r2_i4dc 10:24:44] arm L4PTFD ({'arm': 'L4PTFD', 'K': 3, 'journal': 256, 'tu_gemm': 'natural', 'twin': 'fused', 'body': 'fused', 'graph': True, 'redirect': True, 'probe_every': 16, 'check_every': 0, 'fork_store': 0, 'prefill_hook': 'nocopy'})
+[r2_i4dc 10:41:46] arm L4PTFDGUDKWC ({'arm': 'L4PTFDGUDKWC', 'K': 3, 'journal': 256, 'tu_gemm': 'natural', 'twin': 'fused', 'body': 'fused', 'graph': True, 'redirect': True, 'probe_every': 16, 'check_every': 0, 'fork_store': 0, 'prefill_hook': 'nocopy'})
+[r2_i4dc 10:58:49] arm L4PTFDGUDKWCD ({'arm': 'L4PTFDGUDKWCD', 'K': 3, 'journal': 256, 'tu_gemm': 'natural', 'twin': 'fused', 'body': 'fused', 'graph': True, 'redirect': True, 'probe_every': 16, 'check_every': 0, 'fork_store': 0, 'prefill_hook': 'nocopy'})
+GATE C0_FORK                MUST PASS: /mnt/beegfs/ojerbi/nosi-r2-i4dc/benchmarks/Efficiency/fork_vllm_unified_attention.py (blob pinned by the step: f0dc0c183a388585e216505a6bbfc696531e8add)
+GATE SH-RUN                 MUST PASS: 512 steps, 9 re-warms
+GATE SH-MEM                 REPORT PASS: peak allocated 74.964 GB (after the prefill 74.964 GB, prefill None GB) against 84.0 GB; prefill + decode; usable ceiling 84.25 GB
+GATE L4PTFD-RUN             MUST PASS: 209 rounds of K 3
+GATE L4PTFD-ERR             MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE L4PTFD-COMMIT-N        MUST PASS: committed per request min 512 max 512 (exactly 512 wanted); warm 318 + per-round sum 162498, total 162816; 209 rounds
+GATE L4PTFD-D1              MUST PASS: residency-undo calls 0 (0 expected); resets 209 for 209 rounds
+GATE L4PTFD-D3              MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 836 = (K + 1) x 209 passes; one-row J slots 0; 209 rounds
+GATE L4PTFD-SPAN            MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE L4PTFD-RESID           MUST PASS: residency calls in joint passes 6688 for 209 joint passes of 32 layers (one per layer and pass); union layers 6688; verify_rows passes 209
+GATE L4PTFD-ATTN1           MUST PASS: attn calls 6688 for 209 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFD-FILL1           MUST PASS: fills calls 6688 for 209 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFD-LEAN            MUST PASS: lean passes 419 (one-row passes: draft steps 419 incl. the prelude's 3 + mixed 0 + one-row J 0 = 419); lean layers 13408 (L x passes = 13408)
+GATE L4PTFD-MEM             REPORT PASS: peak allocated 77.685 GB (after the prefill 76.932 GB, prefill 77.685 GB) against 84.0 GB; {'start_GB': 15.362, 'prefill_peak_GB': 72.35, 'arena': {'L': 32, 'B': 318, 'NS': 74, 'H': 2, 'D': 128, 'X': 129, 'bs': 64, 'n_blocks': 794364, 'store_base': 753024, 'store_GB': 2.6989, 'arena_GB': 52.2628, 'dtype': 'torch.bfloat16', 'cb0_base': 794046, 'cb0_GB': 0.0209, 'cb1': 'store slot 0', 'kind': 'chain'}, 'hook': 'nocopy', 'decode_peak_GB': 71.649, 'decode_peak_reserved_GB': 71.885}; usable ceiling 84.25 GB
+GATE L4PTFDGUDKWC-RUN       MUST PASS: 209 rounds of K 3
+GATE L4PTFDGUDKWC-ERR       MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE L4PTFDGUDKWC-COMMIT-N  MUST PASS: committed per request min 512 max 512 (exactly 512 wanted); warm 318 + per-round sum 162498, total 162816; 209 rounds
+GATE L4PTFDGUDKWC-D1        MUST PASS: residency-undo calls 0 (0 expected); resets 209 for 209 rounds
+GATE L4PTFDGUDKWC-D3        MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 836 = (K + 1) x 209 passes; one-row J slots 0; 209 rounds
+GATE L4PTFDGUDKWC-SPAN      MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE L4PTFDGUDKWC-RESID     MUST PASS: residency calls in joint passes 6688 for 209 joint passes of 32 layers (one per layer and pass); union layers 6688; verify_rows passes 209
+GATE L4PTFDGUDKWC-ATTN1     MUST PASS: attn calls 6688 for 209 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFDGUDKWC-FILL1     MUST PASS: fills calls 6688 for 209 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFDGUDKWC-LEAN      MUST PASS: lean passes 419 (one-row passes: draft steps 419 incl. the prelude's 3 + mixed 0 + one-row J 0 = 419); lean layers 13408 (L x passes = 13408)
+GATE L4PTFDGUDKWC-MEM       MUST PASS: peak allocated 77.685 GB with the prefill (decode 76.983 GB, reserved 72.199 GB) against 84.0 GB; graph pool 117.441 MB; static inputs 11.78 MB; usable ceiling 84.25 GB
+GATE L4PTFDGUDKWC-GRAPH     MUST PASS: graphs 32 (layers 32); warm 32; replays 6240 (incl. the 32 first replays); eager 416 {'marks': 416}; L x joint passes 32 x 209 = 6688 (eager + warm + replays 6688); skipped-count mismatches []; capture passes [1]
+GATE L4PTFDGUDKWC-COUNTS    MUST PASS: 13 keys compared with L4PTFD's (not compared: ['round_blocks']); differences 0 []; host counts chain 6688, resid 20096, attn 6688, fills 6688, gather_host 13376
+GATE L4PTFDGUDKWC-DGRAPH    MUST PASS: keys captured [[False, False], [True, False]] (warm keys [[False, False], [True, False]]); graphs 128 (2 L x keys = 128); passes: warm 2 + eager 0 {} + capture 2 + replay 415 = 419 (one-row passes 419); replays 26688 (2 L x (capture + replay passes) = 26688); skipped-count mismatches []; capture rounds [(-1, [False, False]), (16, [True, False])]
+GATE L4PTFDGUDKWC-HOIST     MUST PASS: hoist passes 209 (joint passes 209); hoisted layers 6688 (L x joint passes 6688); is_next recounted 0 (not checked: the checks are off)
+GATE L4PTFDGUDKWC-KEEP      MUST PASS: joint passes counted 209 (union 209); listed 11538293, fetched 9679310, hits 1858983; window loads from the store 3084760; union listed host blocks 0 (not compared: the union statistics are off)
+GATE L4PTFDGUDKWC-KEEP-EQ   REPORT FAIL: REPORT: no keep reference (L4PTFKW, L4PTFDGKW or L4PTFDGUDKW) in this job; i4sb / i4ccb passed it
+GATE L4PTFDGUDKWC-KEEP-REF  REPORT PASS: totals {'listed': 11538293, 'fetched': 9679310, 'win_hits': 3084760}; reference {'listed': 11538293, 'fetched': 9679310, 'win_hits': 3084760} (/mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4b_2195576_i4db.step/stdout.txt (L4PTFKW-KEEP))
+GATE L4PTFDGUDKWC-COMPILE   MUST PASS: backend inductor; sections 480 (eager + warm + captures 480); fallback {}; calls {'pre': 480, 'loc1': 480, 'loc2': 480, 'kphys': 480, 'lists': 480, 'write': 465}; compile events [('pre', 0, 0, 2.817), ('loc1', 0, 0, 1.24), ('loc2', 0, 0, 1.845), ('kphys', 0, 0, 0.908), ('lists', 0, 0, 1.727), ('write', 0, 1, 2.308)] (late 0; per helper {'pre': 1, 'loc1': 1, 'loc2': 1, 'kphys': 1, 'lists': 1, 'write': 1}); compile 10.844 s; graph breaks 0; dynamo {'unique_graphs': 6, 'frames_ok': 0, 'graph_breaks': 0, 'inductor_kernels': 26}
+GATE L4PTFDGUDKWC-EQF       MUST PASS: committed tokens unequal to L4PTFD's: 0 of 162816; fingerprints compared 10089 columns, max equal True, sum equal True; state checksums equal True (0 of 227 differ); acceptance record equal True (accepted 160248 vs 160248)
+GATE L4PTFDGUDKWCD-RUN      MUST PASS: 209 rounds of K 3
+GATE L4PTFDGUDKWCD-ERR      MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE L4PTFDGUDKWCD-COMMIT-N MUST PASS: committed per request min 512 max 512 (exactly 512 wanted); warm 318 + per-round sum 162498, total 162816; 209 rounds
+GATE L4PTFDGUDKWCD-D1       MUST PASS: residency-undo calls 0 (0 expected); resets 209 for 209 rounds
+GATE L4PTFDGUDKWCD-D3       MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 836 = (K + 1) x 209 passes; one-row J slots 0; 209 rounds
+GATE L4PTFDGUDKWCD-SPAN     MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE L4PTFDGUDKWCD-RESID    MUST PASS: residency calls in joint passes 6688 for 209 joint passes of 32 layers (one per layer and pass); union layers 6688; verify_rows passes 209
+GATE L4PTFDGUDKWCD-ATTN1    MUST PASS: attn calls 6688 for 209 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFDGUDKWCD-FILL1    MUST PASS: fills calls 6688 for 209 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFDGUDKWCD-LEAN     MUST PASS: lean passes 419 (one-row passes: draft steps 419 incl. the prelude's 3 + mixed 0 + one-row J 0 = 419); lean layers 13408 (L x passes = 13408)
+GATE L4PTFDGUDKWCD-MEM      MUST PASS: peak allocated 77.694 GB with the prefill (decode 76.991 GB, reserved 72.219 GB) against 84.0 GB; graph pool 117.441 MB; static inputs 11.78 MB; usable ceiling 84.25 GB
+GATE L4PTFDGUDKWCD-GRAPH    MUST PASS: graphs 32 (layers 32); warm 32; replays 6240 (incl. the 32 first replays); eager 416 {'marks': 416}; L x joint passes 32 x 209 = 6688 (eager + warm + replays 6688); skipped-count mismatches []; capture passes [1]
+GATE L4PTFDGUDKWCD-COUNTS   MUST PASS: 14 keys compared with L4PTFDGUDKWC's (not compared: none); differences 0 []; host counts chain 6688, resid 20096, attn 6688, fills 6688, gather_host 13376
+GATE L4PTFDGUDKWCD-DGRAPH   MUST PASS: keys captured [[False, False], [True, False]] (warm keys [[False, False], [True, False]]); graphs 128 (2 L x keys = 128); passes: warm 2 + eager 0 {} + capture 2 + replay 415 = 419 (one-row passes 419); replays 26688 (2 L x (capture + replay passes) = 26688); skipped-count mismatches []; capture rounds [(-1, [False, False]), (16, [True, False])]
+GATE L4PTFDGUDKWCD-HOIST    MUST PASS: hoist passes 209 (joint passes 209); hoisted layers 6688 (L x joint passes 6688); is_next recounted 0 (not checked: the checks are off)
+GATE L4PTFDGUDKWCD-KEEP     MUST PASS: joint passes counted 209 (union 209); listed 11538293, fetched 9679310, hits 1858983; window loads from the store 3084760; union listed host blocks 0 (not compared: the union statistics are off)
+GATE L4PTFDGUDKWCD-KEEP-EQ  MUST PASS: per pass ['passes', 'listed', 'fetched', 'win_hits', 'check'] compared with L4PTFDGUDKWC's; differ []; totals listed 11538293 / 11538293, fetched 9679310 / 9679310, window hits 3084760 / 3084760
+GATE L4PTFDGUDKWCD-KEEP-REF REPORT PASS: totals {'listed': 11538293, 'fetched': 9679310, 'win_hits': 3084760}; reference {'listed': 11538293, 'fetched': 9679310, 'win_hits': 3084760} (/mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4b_2195576_i4db.step/stdout.txt (L4PTFKW-KEEP))
+GATE L4PTFDGUDKWCD-COMPILE  MUST PASS: backend inductor; joint sections 480 (eager + warm + captures 480); draft sections 128 ((warm + capture passes + eager) x L 128); fallback {} / {}; calls {'dpre': 128, 'dwrite': 128, 'dmask': 128, 'pre': 480, 'loc1': 480, 'loc2': 480, 'kphys': 480, 'lists': 480, 'write': 465}; compile events [('dpre', 'draft', 0, 1, 0, 0, 0.858), ('dwrite', 'draft', 0, 1, 0, 0, 0.672), ('dmask', 'draft', 0, 1, 0, 0, 0.688)] (late 0; per helper {'dpre': 1, 'dwrite': 1, 'dmask': 1}); first draft capture {'dpass': 2, 'joint_pass': 0}; captures begun 160; compile 2.219 s; graph breaks 0; dynamo {'unique_graphs': 3, 'frames_ok': 0, 'graph_breaks': 0, 'inductor_kernels': 5}
+GATE L4PTFDGUDKWCD-EQF      MUST PASS: committed tokens unequal to L4PTFD's: 0 of 162816; fingerprints compared 10089 columns, max equal True, sum equal True; state checksums equal True (0 of 227 differ); acceptance record equal True (accepted 160248 vs 160248)
+PREDICTION I4C2KW-VS-D            REPORT: 1.0917 (median tok/s / L4PTFD's, this job)
+PREDICTION I4DC-DRAFT-SAVING      CONFIRMED: 8.5730; registered (4.0, 10.0)
+PREDICTION I4DC-DRAFT-RATIO       CONFIRMED: 0.9537; registered (0.946, 0.978)
+PREDICTION I4DC-JOINT-RATIO       CONFIRMED: 1.0013; registered (0.99, 1.01)
+PREDICTION I4DC-VS-REF            CONFIRMED: 1.0151; registered (1.006, 1.02)
+PREDICTION I4DC-VS-D              CONFIRMED: 1.1081; registered (1.093, 1.119)
+PREDICTION I4DC-RATIO             CONFIRMED: 0.6627; registered (0.655, 0.669)
+PREDICTION I4DC-PEAK-GB           CONFIRMED: 77.6940; registered (77.6, 77.8)
+PREDICTION I4DC-POOL-MB           CONFIRMED: 117.4405; registered (60, 250)
+PREDICTION I4DC-CAPTURE-S         CONFIRMED: 10.1100; registered (6, 13)
+PREDICTION I4DC-COMPILE-S         CONFIRMED: 2.2190; registered (1, 30)
+PREDICTION I4DC-EQ                CONFIRMED: L4PTFDGUDKWCD-EQF passed True; registered True
+PREDICTION I4DC-ABOVE-BEST        REPORT: L4PTFDGUDKWCD 1699.0 vs {'L4PTFD': 1533.2, 'L4PTFDGUDKWC': 1673.8} tok/s (not above every other arm of the job); registered None
+PREDICTION I4DC-ARM               REPORT: X = L4PTFDGUDKWCD, REF = L4PTFDGUDKWC (REF ran: True)
+PREDICTION I4DC-DRAFT-STEP-SAVING REPORT: 4.286 ms per one-row pass (the round's draft phase / 2)
+PREDICTION I4DC-VS-STRONGEST      REPORT: median steady tok/s / 3407.2: 0.4986
+REPORT L61 capture rounds {'L4PTFDGUDKWC': {'joint': [1], 'draft': [16], 'mapped': True}, 'L4PTFDGUDKWCD': {'joint': [1], 'draft': [16], 'mapped': True}}; excluded from every arm's steady set: [1, 16]
+REPORT SH B 318 C 73: steady 124.03 ms/step, tok/s median 2563.9 mean 2479.7 effective 1318.0, peak 74.964 GB
+REPORT L4PTFD K 3: 209 rounds; committed tok/s median 1533.2 mean 1384.3 effective 1250.1 (without capture s 1250.1; without capture and compile s 1250.1); vs SH {'median_tok_s': 0.598, 'mean_tok_s': 0.5583, 'effective_tok_s': 0.9485}; vs 3407.2 0.45; round median 581.75 ms; phases {'reset': 0.119, 'joint': 383.609, 'commit': 8.345, 'draft': 189.543}; draft step 94.772 ms = 0.7641 SH; joint 3.0929 SH steps; steady rounds 194 (excluded [1, 16]; with the capture rounds: median 1532.8 mean 1384.6, phases {'reset': 0.119, 'joint': 383.774, 'commit': 8.345, 'draft': 189.534}); calls {'residency_undo_calls': 0, 'reset_calls': 209, 'commit_calls': 209, 'deferred_recompute_rows': 0, 'remade_rows': 0, 'joint_passes': 209, 'joint_rows': 836, 'j1_passes': 0, 'replays': 55548, 'undo_step_calls': 0}; lean {'passes': 419, 'layers': 13408}; hoist None; tokens equal 0.387904 (first (52, 1)); peak 76.932 GB (with the prefill 77.685 GB)
+REPORT L4PTFDGUDKWC K 3: 209 rounds; committed tok/s median 1673.8 mean 1503.0 effective 1180.8 (without capture s 1272.5; without capture and compile s 1390.3); vs SH {'median_tok_s': 0.6528, 'mean_tok_s': 0.6061, 'effective_tok_s': 0.8959}; vs 3407.2 0.4913; round median 532.525 ms; phases {'reset': 0.124, 'joint': 338.518, 'commit': 8.404, 'draft': 185.01}; draft step 92.505 ms = 0.7458 SH; joint 2.7293 SH steps; steady rounds 194 (excluded [1, 16]; with the capture rounds: median 1672.8 mean 1373.0, phases {'reset': 0.125, 'joint': 338.592, 'commit': 8.403, 'draft': 185.004}); calls {'residency_undo_calls': 0, 'reset_calls': 209, 'commit_calls': 209, 'deferred_recompute_rows': 0, 'remade_rows': 0, 'joint_passes': 209, 'joint_rows': 836, 'j1_passes': 0, 'replays': 55548, 'undo_step_calls': 0}; lean {'passes': 419, 'layers': 13408}; hoist {'passes': 209, 'layers': 6688, 'next_seen': 0}; tokens equal 0.387904 (first (52, 1)); peak 76.983 GB (with the prefill 77.685 GB)
+REPORT L4PTFDGUDKWC joint graphs: captures 32, warm 32, replays 6240, eager 416 {'marks': 416}; pool 117.441 MB; static 11.78 MB; capture 9.798 s; capture rounds (round, joint ms) [(1, 9972.617)]
+REPORT L4PTFDGUDKWC draft graphs: keys [[False, False], [True, False]], warm 2, captures 128, capture passes 2, replay passes 415, eager 0 {}; capture 0.136 s; capture rounds [(-1, [False, False]), (16, [True, False])]
+REPORT L4PTFDGUDKWC compile: backend inductor; compile 10.844 s (one-time, outside the steady set); events [('pre', None, 0, None, 0, None, 2.817), ('loc1', None, 0, None, 0, None, 1.24), ('loc2', None, 0, None, 0, None, 1.845), ('kphys', None, 0, None, 0, None, 0.908), ('lists', None, 0, None, 0, None, 1.727), ('write', None, 0, None, 1, None, 2.308)]; calls {'pre': 480, 'loc1': 480, 'loc2': 480, 'kphys': 480, 'lists': 480, 'write': 465}; sections 480; draft sections None; fallback {} / None; captures begun None; first draft capture None; dynamo {'unique_graphs': 6, 'frames_ok': 0, 'graph_breaks': 0, 'inductor_kernels': 26}
+REPORT L4PTFDGUDKWCD K 3: 209 rounds; committed tok/s median 1699.0 mean 1525.3 effective 1242.5 (without capture s 1346.4; without capture and compile s 1371.6); vs SH {'median_tok_s': 0.6627, 'mean_tok_s': 0.6151, 'effective_tok_s': 0.9427}; vs 3407.2 0.4986; round median 524.659 ms; phases {'reset': 0.125, 'joint': 338.961, 'commit': 8.421, 'draft': 176.437}; draft step 88.219 ms = 0.7113 SH; joint 2.7329 SH steps; steady rounds 194 (excluded [1, 16]; with the capture rounds: median 1698.3 mean 1389.4, phases {'reset': 0.125, 'joint': 339.028, 'commit': 8.416, 'draft': 176.421}); calls {'residency_undo_calls': 0, 'reset_calls': 209, 'commit_calls': 209, 'deferred_recompute_rows': 0, 'remade_rows': 0, 'joint_passes': 209, 'joint_rows': 836, 'j1_passes': 0, 'replays': 55548, 'undo_step_calls': 0}; lean {'passes': 419, 'layers': 13408}; hoist {'passes': 209, 'layers': 6688, 'next_seen': 0}; tokens equal 0.387904 (first (52, 1)); peak 76.991 GB (with the prefill 77.694 GB)
+REPORT L4PTFDGUDKWCD joint graphs: captures 32, warm 32, replays 6240, eager 416 {'marks': 416}; pool 117.441 MB; static 11.78 MB; capture 9.968 s; capture rounds (round, joint ms) [(1, 10140.224)]
+REPORT L4PTFDGUDKWCD draft graphs: keys [[False, False], [True, False]], warm 2, captures 128, capture passes 2, replay passes 415, eager 0 {}; capture 0.142 s; capture rounds [(-1, [False, False]), (16, [True, False])]
+REPORT L4PTFDGUDKWCD compile: backend inductor; compile 2.219 s (one-time, outside the steady set); events [('dpre', 'draft', 0, 1, 0, 0, 0.858), ('dwrite', 'draft', 0, 1, 0, 0, 0.672), ('dmask', 'draft', 0, 1, 0, 0, 0.688)]; calls {'dpre': 128, 'dwrite': 128, 'dmask': 128, 'pre': 480, 'loc1': 480, 'loc2': 480, 'kphys': 480, 'lists': 480, 'write': 465}; sections 480; draft sections 128; fallback {} / {}; captures begun 160; first draft capture {'dpass': 2, 'joint_pass': 0}; dynamo {'unique_graphs': 3, 'frames_ok': 0, 'graph_breaks': 0, 'inductor_kernels': 5}
+r2_i4dc: 0 MUST gate(s) failed

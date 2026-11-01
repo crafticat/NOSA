@@ -1,0 +1,813 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+F..F.FF......s                                                           [100%]
+=================================== FAILURES ===================================
+_____________________________ test_int_gate0_files _____________________________
+
+    def test_int_gate0_files():
+        if not _have(BASE_SHA):
+            pytest.skip("no git or no commit %s in %s" % (BASE_SHA, ROOT))
+        changed = {x for x in _git("diff", "--name-only", BASE_SHA, "--", ".", ":(exclude,glob)**/__pycache__/**").stdout
+                   .split("\n") if x}
+        changed |= {x for x in _git("ls-files", "--others", "--exclude-standard", "--", ".",
+                                    ":(exclude,glob)**/__pycache__/**").stdout.split("\n") if x}
+        allowed = set(INT_NEW) | set(RUNGS) | set(OLD_DECL)
+        assert changed <= allowed, sorted(changed - allowed)                                    # (a)
+        assert all((ROOT / f).is_file() for f in INT_NEW + RUNGS), [f for f in INT_NEW + RUNGS if not (ROOT / f).is_file()]
+        assert _git("diff", "--name-only", BASE_SHA, "--", "nosi").stdout.strip() == ""        # (b) nosi: cd0f0c5's
+        for f in OLD_DECL:                                                    # (c) one INT block each, only added lines
+            old, new = TS._fn_units(_git("show", "%s:%s" % (BASE_SHA, f)).stdout), TS._fn_units((ROOT / f).read_text())
+            assert set(old) == set(new) and all(old[k] == new[k] for k in old), (f, sorted(
+                k for k in set(old) | set(new) if old.get(k) != new.get(k)))
+            d = _git("diff", "-U0", BASE_SHA, "--", f).stdout.splitlines()
+            body = [x for x in d if x[:1] in "+-" and not x.startswith(("+++", "---"))]
+            assert body and all(x.startswith("+") for x in body), (f, body[:5])
+            assert any("r2_int_cell.py" in x for x in body) and any("# INT" in x for x in body), (f, body[:5])
+        for rung, later in RUNG_TESTS.items():                                # (c') the three rungs' Gate-0 tests
+            text = (ROOT / (T_ + "test_%s.py" % rung)).read_text()
+            assert '%s = ("r2_int_arms.py", "r2_int_cell.py")' % later in text and "p.name in %s:" % later in text, rung
+            assert "r2_int_cell.py" in text and "test_int.py" in text, rung
+        assert _git("diff", "--name-only", BASE_SHA, "--", "*.cu", "*.cuh", "*.cpp").stdout.strip() == ""   # no kernel
+        assert _git("rev-parse", "HEAD:benchmarks/Efficiency/fork_vllm_unified_attention.py").stdout.strip() == FORK_BLOB
+        for name in ("r2_int_arms.py", "r2_int_cell.py"):                     # (d) NO HAND-WRITTEN KERNEL
+            text = (EFF / name).read_text()
+            assert not [w for w in HAND_KERNEL if w in text], (name, [w for w in HAND_KERNEL if w in text])
+        tree = ast.parse((EFF / "r2_int_arms.py").read_text())               # (e) the classes' imports
+        mods = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        mods |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+        assert mods == ARMS_IMPORTS, mods
+        for p in list((ROOT / "nosi/nosi").glob("*.py")) + list(EFF.glob("*.py")):     # (f) nobody else names them
+            if p.name.startswith("r2_int_"):
+                continue
+>           assert "r2_int" not in p.read_text(), p.name
+E           AssertionError: r2_st1_cell.py
+E           assert 'r2_int' not in '"""ST1 cell...s.exit(rc)\n'
+E             
+E             'r2_int' is contained here:
+E                       # r2_int_cell reads ST1 (its own runner choice has neither)
+E             ?           ++++++
+E               KFILL_ARMS = ("L4PTFDGUDKWCDMTK", "L4PTFDGUDKWCDMTKR")                     # the arms with ST3
+E               ROOT = dict(L4PTFDGUDCDM="L4PTFDGUDCD", L4PTFDGUDKWCDM="L4PTFDGUDKWCD",      # an ST arm -> the D arm whose runner,
+E                           L4PTFDGUDCDMT="L4PTFDGUDCD", L4PTFDGUDKWCDMT="L4PTFDGUDKWCD",   # gates and compile it takes...
+E             
+E             ...Full output truncated (622 lines hidden), use '-vv' to show
+
+benchmarks/Efficiency/tests_cpu/test_int.py:133: AssertionError
+_________________________ test_int_equal[C128-timing] __________________________
+
+key = 'C128', scen = 'timing'
+
+    @pytest.mark.parametrize("key,scen", [("C128", "timing"), ("C128", "check"), ("C73", "timing"), ("C73", "check")])
+    def test_int_equal(key, scen):
+        ev = _int(key, scen)
+        d, ref = _plain("D", scen), _plain(D_OF[key], scen)
+        rd = ev["rd"]
+        jp = rd["tent"]["calls"]["joint_passes"]
+        tb = ref["rd"]["tent"]
+        assert tb["crossed"] > 0 and sum(ref["rd"]["acc_hist"][1:]) > 0 and tb["replays"] > 0, "preconditions (L34)"
+        keep = key == "C73"
+        skip = SKIP_REC + (BF_REC if keep else ())
+        ts = TST.KV_KEYS + (BF_T if keep else ())
+        bad = TS._diff(ref, ev, skip=skip, tensors_skip=ts)
+        assert bad == [], bad[:10]                                         # THE CLAIM: its D arm's run
+        bad = TS._diff(d, ev, skip=skip + ("hoist",) + (("keep", "round_blocks") if keep else ()), tensors_skip=ts)
+        assert bad == [], bad[:10]                                         # and L4PTFD's
+        assert all(torch.equal(a, b) for a, b in zip(TST._kv_masked(ref["runner"]), TST._kv_masked(ev["runner"])))
+        STC = _mod("r2_st1_commit")
+        assert STC.tail_checksum(ev["runner"].T) == STC.tail_checksum(ref["runner"].T)
+        j, s1, s2 = rd["j1"], rd["st1"], rd["st2"]
+        assert jp > 0 and j["calls"] == jp * L and s2["layers"] == jp * L and s2["fallback"] == 0      # F1 and ST2: both
+        assert j["peq_layers"] > 0 and j["peq_bad"] == 0 and j["f6"] and j["f6calls"] == rd["compile"]["sections"] > 0
+        assert j["dwarm"] == 1 and j["dlayers"] == rd["dgraph"]["capture_passes"] * L > 0 and j["dpeq_bad"] == 0   # F2
+        n = rd["tent"]["calls"]["commit"]
+        assert s1["warm"] == 1 and s1["captures"] == 1 and s1["replays"] == n - 1 and s1["overflow"] == 0   # ST1
+        if keep:
+            bf = rd["bf"]
+            assert bf["committed"] > 0 and bf["used_store"] + bf["used_win"] > 0 and bf["error"] is None, bf   # BF1
+            assert "j3" not in rd                                          # F3 is not in the BF1 arm
+        else:
+            assert rd["j3"]["joint_captures"] > 0 and rd["j3"]["draft_layers"] > 0, rd["j3"]               # F3
+        evg = _int_full(key, scen)                                         # the cell's INT arm: + ST4 (+ ST3 in the keep arm)
+        bad = TS._diff(ev, evg, skip=SKIP_REC + ("st3", "st4", "bf"))
+        assert bad == [], bad[:10]                                         # = the INT run, every bit (BF1's timers aside)
+        if keep:
+            assert all(evg["rd"]["bf"][k] == rd["bf"][k] for k in ("committed", "used_store", "used_win"))
+        gs, rec = _gates(key, scen, evg)
+        names = {g[0][len(INT_ARMS[key]) + 1:] for g in gs if g[0].startswith(INT_ARMS[key] + "-")}
+        want = {"MEM", "GRAPH", "DGRAPH", "HOIST", "COMPILE", "EQF", "J1-PEQ", "J1-COMPILE", "J1-DRAFT", "PEQ", "TAIL-EQ",
+                "CGRAPH", "TWIN", "INT-CLASSES", "INT-LAYER", "COUNTS", "DRESID"}
+        want |= {"KEEP", "LISTED", "BF", "INT-LOCK", "KFILL"} | ({"CAP"} if scen == "check" else set()) if keep else \
+            {"DCOUNTS", "J1-RESID"}
+        assert names == want, (sorted(names - want), sorted(want - names))
+        assert not keep or not ({"KEEP-EQ", "KEEP-REF"} & names)           # BF1 changes them by design (dropped)
+>       assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
+E       AssertionError: [('L4PTFDGUDCDI-DRESID', True, False, "draft residencies through the helper 10 (entered 10; want 10 = (warm 3 + captur... True); fallback {}; compile events [('rpost', 1, 0, 0.132), ('rpost', 12, 0, 0.141)]; compile 0.273 s; control None")]
+E       assert False
+E        +  where False = all(<generator object test_int_equal.<locals>.<genexpr> at 0x7f0d820a7220>)
+
+benchmarks/Efficiency/tests_cpu/test_int.py:347: AssertionError
+----------------------------- Captured stderr call -----------------------------
+No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'
+__________________________ test_int_equal[C73-timing] __________________________
+
+key = 'C73', scen = 'timing'
+
+    @pytest.mark.parametrize("key,scen", [("C128", "timing"), ("C128", "check"), ("C73", "timing"), ("C73", "check")])
+    def test_int_equal(key, scen):
+        ev = _int(key, scen)
+        d, ref = _plain("D", scen), _plain(D_OF[key], scen)
+        rd = ev["rd"]
+        jp = rd["tent"]["calls"]["joint_passes"]
+        tb = ref["rd"]["tent"]
+        assert tb["crossed"] > 0 and sum(ref["rd"]["acc_hist"][1:]) > 0 and tb["replays"] > 0, "preconditions (L34)"
+        keep = key == "C73"
+        skip = SKIP_REC + (BF_REC if keep else ())
+        ts = TST.KV_KEYS + (BF_T if keep else ())
+        bad = TS._diff(ref, ev, skip=skip, tensors_skip=ts)
+        assert bad == [], bad[:10]                                         # THE CLAIM: its D arm's run
+        bad = TS._diff(d, ev, skip=skip + ("hoist",) + (("keep", "round_blocks") if keep else ()), tensors_skip=ts)
+        assert bad == [], bad[:10]                                         # and L4PTFD's
+        assert all(torch.equal(a, b) for a, b in zip(TST._kv_masked(ref["runner"]), TST._kv_masked(ev["runner"])))
+        STC = _mod("r2_st1_commit")
+        assert STC.tail_checksum(ev["runner"].T) == STC.tail_checksum(ref["runner"].T)
+        j, s1, s2 = rd["j1"], rd["st1"], rd["st2"]
+        assert jp > 0 and j["calls"] == jp * L and s2["layers"] == jp * L and s2["fallback"] == 0      # F1 and ST2: both
+        assert j["peq_layers"] > 0 and j["peq_bad"] == 0 and j["f6"] and j["f6calls"] == rd["compile"]["sections"] > 0
+        assert j["dwarm"] == 1 and j["dlayers"] == rd["dgraph"]["capture_passes"] * L > 0 and j["dpeq_bad"] == 0   # F2
+        n = rd["tent"]["calls"]["commit"]
+        assert s1["warm"] == 1 and s1["captures"] == 1 and s1["replays"] == n - 1 and s1["overflow"] == 0   # ST1
+        if keep:
+            bf = rd["bf"]
+            assert bf["committed"] > 0 and bf["used_store"] + bf["used_win"] > 0 and bf["error"] is None, bf   # BF1
+            assert "j3" not in rd                                          # F3 is not in the BF1 arm
+        else:
+            assert rd["j3"]["joint_captures"] > 0 and rd["j3"]["draft_layers"] > 0, rd["j3"]               # F3
+>       evg = _int_full(key, scen)                                         # the cell's INT arm: + ST4 (+ ST3 in the keep arm)
+
+benchmarks/Efficiency/tests_cpu/test_int.py:334: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+benchmarks/Efficiency/tests_cpu/test_int.py:264: in _int_full
+    run.run(N_RUN)
+nosi/nosi/spec_tentative.py:1171: in run
+    return self._run_paper(N, max_rounds=max_rounds, warm=warm)
+/venv/nosa/lib/python3.10/site-packages/torch/utils/_contextlib.py:116: in decorate_context
+    return func(*args, **kwargs)
+nosi/nosi/spec_tentative.py:711: in _run_paper
+    n, m, full = self._ps_round(P, probe)
+nosi/nosi/spec_tentative_union.py:342: in _ps_round
+    return super()._ps_round(P, probe)
+nosi/nosi/spec_tentative.py:958: in _ps_round
+    lg = T.run_pass(self.model, plan)
+benchmarks/Efficiency/r2_bf1_fetch.py:923: in run_pass
+    out = super().run_pass(model, plan)
+/venv/nosa/lib/python3.10/site-packages/torch/utils/_contextlib.py:116: in decorate_context
+    return func(*args, **kwargs)
+benchmarks/Efficiency/r2_i4h_graph.py:268: in run_pass
+    return super().run_pass(model, plan)
+benchmarks/Efficiency/r2_i4a_lean.py:95: in run_pass
+    return super().run_pass(model, plan)
+/venv/nosa/lib/python3.10/site-packages/torch/utils/_contextlib.py:116: in decorate_context
+    return func(*args, **kwargs)
+nosi/nosi/spec_tentative.py:311: in run_pass
+    hidden = self._layer(l, layer, hidden, pos_flat, model.cos_sin_cache, plan)
+benchmarks/Efficiency/r2_int_arms.py:75: in _layer
+    attn = self._rows(l, eng, twin, sel, q4, k4, v4, pbs, plan).reshape(E, 1, -1)
+benchmarks/Efficiency/r2_i4a_lean.py:99: in _rows
+    return super()._rows(l, eng, twin, sel, q4, k4, v4, pbs, plan)
+nosi/nosi/spec_tentative_union.py:113: in _rows
+    out = self._rows_union(l, eng, twin, sel, q4, k4, v4, pbs, plan)
+benchmarks/Efficiency/r2_i4h_graph.py:396: in _rows_union
+    out = super()._rows_union(l, eng, twin, sel, q4, k4, v4, pbs, plan)
+benchmarks/Efficiency/r2_i4s_stack.py:428: in _rows_union
+    out = self._gsection(l, eng, twin, sel, q4, k4, v4, pbs, plan, self._section, "_resid_joint",
+benchmarks/Efficiency/r2_i4s_stack.py:149: in _gsection
+    return section(l, eng, twin, sel, sq, sk, sv, spb, splan)
+benchmarks/Efficiency/r2_i4cc_compile.py:540: in _section
+    lphys, valid = self._keep_fill(l, vs, eng, twin, lst, loc, kern)   # the keep (eager)
+benchmarks/Efficiency/r2_st1_commit.py:586: in _keep_fill
+    score, hit, hs, miss, valid, rank, need, td, used = self._st3_call(
+benchmarks/Efficiency/r2_st1_commit.py:563: in _st3_call
+    out = wrap(name, f, args) if wrap is not None else f(*args)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py:574: in _fn
+    return fn(*args, **kwargs)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:1380: in __call__
+    return self._torchdynamo_orig_callable(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:547: in __call__
+    return _compile(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:986: in _compile
+    guarded_code = compile_inner(code, one_graph, hooks, transform)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:715: in compile_inner
+    return _compile_inner(code, one_graph, hooks, transform)
+/venv/nosa/lib/python3.10/site-packages/torch/_utils_internal.py:95: in wrapper_function
+    return function(*args, **kwargs)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:750: in _compile_inner
+    out_code = transform_code_object(code, transform)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/bytecode_transformation.py:1361: in transform_code_object
+    transformations(instructions, code_options)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:231: in _fn
+    return fn(*args, **kwargs)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:662: in transform
+    tracer.run()
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/symbolic_convert.py:2868: in run
+    super().run()
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/symbolic_convert.py:1052: in run
+    while self.step():
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/symbolic_convert.py:962: in step
+    self.dispatch_table[inst.opcode](self, inst)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/symbolic_convert.py:3048: in RETURN_VALUE
+    self._return(inst)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/symbolic_convert.py:3033: in _return
+    self.output.compile_subgraph(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/output_graph.py:1136: in compile_subgraph
+    self.compile_and_call_fx_graph(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/output_graph.py:1382: in compile_and_call_fx_graph
+    compiled_fn = self.call_user_compiler(gm)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/output_graph.py:1432: in call_user_compiler
+    return self._call_user_compiler(gm)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/output_graph.py:1483: in _call_user_compiler
+    raise BackendCompilerFailed(self.compiler_fn, e).with_traceback(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/output_graph.py:1462: in _call_user_compiler
+    compiled_fn = compiler_fn(gm, self.example_inputs())
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/repro/after_dynamo.py:130: in __call__
+    compiled_gm = compiler_fn(gm, example_inputs)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/repro/after_dynamo.py:130: in __call__
+    compiled_gm = compiler_fn(gm, example_inputs)
+/venv/nosa/lib/python3.10/site-packages/torch/__init__.py:2340: in __call__
+    return compile_fx(model_, inputs_, config_patches=self.config)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:1863: in compile_fx
+    return aot_autograd(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/backends/common.py:83: in __call__
+    cg = aot_module_simplified(gm, example_inputs, **self.kwargs)
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/aot_autograd.py:1155: in aot_module_simplified
+    compiled_fn = dispatch_and_compile()
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/aot_autograd.py:1131: in dispatch_and_compile
+    compiled_fn, _ = create_aot_dispatcher_function(
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/aot_autograd.py:580: in create_aot_dispatcher_function
+    return _create_aot_dispatcher_function(
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/aot_autograd.py:830: in _create_aot_dispatcher_function
+    compiled_fn, fw_metadata = compiler_fn(
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/_aot_autograd/jit_compile_runtime_wrappers.py:203: in aot_dispatch_base
+    compiled_fw = compiler(fw_module, updated_flat_args)
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/aot_autograd.py:489: in __call__
+    return self.compiler_fn(gm, example_inputs)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:1741: in fw_compiler_base
+    return inner_compile(
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:569: in compile_fx_inner
+    return wrap_compiler_debug(_compile_fx_inner, compiler_name="inductor")(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/repro/after_aot.py:102: in debug_wrapper
+    inner_compiled_fn = compiler_fn(gm, example_inputs)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:685: in _compile_fx_inner
+    mb_compiled_graph = fx_codegen_and_compile(
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:1129: in fx_codegen_and_compile
+    return scheme.codegen_and_compile(gm, example_inputs, inputs_to_check, graph_kwargs)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:1044: in codegen_and_compile
+    compiled_fn = graph.compile_to_module().call
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/graph.py:2027: in compile_to_module
+    return self._compile_to_module()
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/graph.py:2068: in _compile_to_module
+    mod = PyCodeCache.load_by_key_path(
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/codecache.py:2759: in load_by_key_path
+    mod = _reload_python_module(key, path)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/runtime/compile_tasks.py:45: in _reload_python_module
+    exec(code, mod.__dict__, mod.__dict__)
+../kstep-cpu-runs/tmp_sc/recon7_inductor/tn/ctneeorxuejptrwihxk4hqkjshgor6sgkxjvbdteiqxqsz4hszxw.py:246: in <module>
+    async_compile.wait(globals())
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/async_compile.py:305: in wait
+    scope[key] = result.result()
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/codecache.py:3253: in result
+    return self.result_fn()
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/codecache.py:2254: in future
+    result = get_result()
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/codecache.py:2044: in load_fn
+    future.result()
+/root/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/concurrent/futures/_base.py:458: in result
+    return self.__get_result()
+/root/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/concurrent/futures/_base.py:403: in __get_result
+    raise self._exception
+/root/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/concurrent/futures/thread.py:58: in run
+    result = self.fn(*self.args, **self.kwargs)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/codecache.py:2085: in _worker_compile_cpp
+    cpp_builder.build()
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/cpp_builder.py:1548: in build
+    status = run_compile_cmd(build_cmd, cwd=_build_tmp_dir)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/cpp_builder.py:349: in run_compile_cmd
+    return _run_compile_cmd(cmd_line, cwd)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cmd_line = 'g++ /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d....-o /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.so'
+cwd = '/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d_CxxBuild'
+
+    def _run_compile_cmd(cmd_line: str, cwd: str) -> bytes:
+        cmd = shlex.split(cmd_line)
+        try:
+            status = subprocess.check_output(args=cmd, cwd=cwd, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as e:
+            output = e.output.decode("utf-8")
+            openmp_problem = "'omp.h' file not found" in output or "libomp" in output
+            if openmp_problem and sys.platform == "darwin":
+                instruction = (
+                    "\n\nOpenMP support not found. Please try one of the following solutions:\n"
+                    "(1) Set the `CXX` environment variable to a compiler other than Apple clang++/g++ "
+                    "that has builtin OpenMP support;\n"
+                    "(2) install OpenMP via conda: `conda install llvm-openmp`;\n"
+                    "(3) install libomp via brew: `brew install libomp`;\n"
+                    "(4) manually setup OpenMP and set the `OMP_PREFIX` environment variable to point to a path"
+                    " with `include/omp.h` under it."
+                )
+                output += instruction
+>           raise exc.CppCompileError(cmd, output) from e
+E           torch._dynamo.exc.BackendCompilerFailed: backend='inductor' raised:
+E           CppCompileError: C++ compile error
+E           
+E           Command:
+E           g++ /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp -D TORCH_INDUCTOR_CPP_WRAPPER -D STANDALONE_TORCH_HEADER -D C10_USING_CUSTOM_GENERATED_MACROS -D CPU_CAPABILITY_AVX512 -shared -fPIC -O3 -DNDEBUG -fno-trapping-math -funsafe-math-optimizations -ffinite-math-only -fno-signed-zeros -fno-math-errno -fexcess-precision=fast -fno-finite-math-only -fno-unsafe-math-optimizations -ffp-contract=off -fno-tree-loop-vectorize -march=native -Wall -std=c++17 -Wno-unused-variable -Wno-unknown-pragmas -fopenmp -I/root/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/include/python3.10 -I/venv/nosa/lib/python3.10/site-packages/torch/include -I/venv/nosa/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/venv/nosa/lib/python3.10/site-packages/torch/include/TH -I/venv/nosa/lib/python3.10/site-packages/torch/include/THC -mavx512f -mavx512dq -mavx512vl -mavx512bw -mfma -D_GLIBCXX_USE_CXX11_ABI=0 -ltorch -ltorch_cpu -ltorch_python -lgomp -L/root/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib -L/venv/nosa/lib/python3.10/site-packages/torch/lib -o /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.so
+E           
+E           Output:
+E           /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp: In function ‘void kernel(const int64_t*, const int64_t*, const int64_t*, const int64_t*, int64_t*, bool*, uint8_t*, int64_t*, bool*, bool*, int64_t*)’:
+E           /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp:92:46: error: no match for ‘operator&’ (operand types are ‘at::vec::CPU_CAPABILITY::VecMask<float, 1>’ and ‘at::vec::CPU_CAPABILITY::VecMask<unsigned char, 1>’)
+E              92 |                             auto tmp6 = tmp4 & tmp5;
+E                 |                                         ~~~~ ^ ~~~~
+E                 |                                         |      |
+E                 |                                         |      VecMask<unsigned char,[...]>
+E                 |                                         VecMask<float,[...]>
+E           In file included from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512.h:8,
+E                            from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec.h:4,
+E                            from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/functional_base.h:6,
+E                            from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/functional.h:3,
+E                            from /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/2r/c2rnilspx43ivnzu4uieul65kx65dfhfbptbh5og4wk6rqebuxoo.h:38,
+E                            from /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp:2:
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_base.h:798:22: note: candidate: ‘template<class T, typename std::enable_if<(! std::is_base_of<at::vec::CPU_CAPABILITY::Vectorizedi, at::vec::CPU_CAPABILITY::Vectorized<T> >::value), int>::type <anonymous> > at::vec::CPU_CAPABILITY::Vectorized<T> at::vec::CPU_CAPABILITY::operator&(const Vectorized<T>&, const Vectorized<T>&)’
+E             798 | inline Vectorized<T> operator&(const Vectorized<T>& a, const Vectorized<T>& b) {
+E                 |                      ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_base.h:798:22: note:   template argument deduction/substitution failed:
+E           /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp:92:48: note:   ‘at::vec::CPU_CAPABILITY::VecMask<float, 1>’ is not derived from ‘const at::vec::CPU_CAPABILITY::Vectorized<T>’
+E              92 |                             auto tmp6 = tmp4 & tmp5;
+E                 |                                                ^~~~
+E           In file included from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_base.h:1163:
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_n.h:365:37: note: candidate: ‘template<class T, int N> at::vec::CPU_CAPABILITY::VectorizedN<T, N> at::vec::CPU_CAPABILITY::operator&(const VectorizedN<T, N>&, const VectorizedN<T, N>&)’
+E             365 | VECTORIZEDN_DEFINE_BINARY_OP_GLOBAL(operator&)
+E                 |                                     ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_n.h:319:28: note: in definition of macro ‘VECTORIZEDN_DEFINE_BINARY_OP_GLOBAL’
+E             319 |   inline VectorizedN<T, N> op(                                                 \
+E                 |                            ^~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_n.h:365:37: note:   template argument deduction/substitution failed:
+E             365 | VECTORIZEDN_DEFINE_BINARY_OP_GLOBAL(operator&)
+E                 |                                     ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_n.h:319:28: note: in definition of macro ‘VECTORIZEDN_DEFINE_BINARY_OP_GLOBAL’
+E             319 |   inline VectorizedN<T, N> op(                                                 \
+E                 |                            ^~
+E           /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp:92:48: note:   ‘at::vec::CPU_CAPABILITY::VecMask<float, 1>’ is not derived from ‘const at::vec::CPU_CAPABILITY::VectorizedN<T, N>’
+E              92 |                             auto tmp6 = tmp4 & tmp5;
+E                 |                                                ^~~~
+E           In file included from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_base.h:1164:
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_mask.h:279:34: note: candidate: ‘template<class T, int N, class V, int M, typename std::enable_if<(at::vec::CPU_CAPABILITY::VecMask<T, N>::size() == at::vec::CPU_CAPABILITY::VecMask<mask_t, mask_n>::size()), int>::type <anonymous> > at::vec::CPU_CAPABILITY::VecMask<dst_t, dst_n> at::vec::CPU_CAPABILITY::operator&(const VecMask<dst_t, dst_n>&, const VecMask<mask_t, mask_n>&)’
+E             279 | VEC_MASK_DEFINE_BINARY_OP_GLOBAL(operator&)
+E                 |                                  ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_mask.h:261:24: note: in definition of macro ‘VEC_MASK_DEFINE_BINARY_OP_GLOBAL’
+E             261 |   inline VecMask<T, N> op(const VecMask<T, N>& a, const VecMask<V, M>& b) {   \
+E                 |                        ^~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_mask.h:279:34: note:   template argument deduction/substitution failed:
+E             279 | VEC_MASK_DEFINE_BINARY_OP_GLOBAL(operator&)
+E                 |                                  ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_mask.h:261:24: note: in definition of macro ‘VEC_MASK_DEFINE_BINARY_OP_GLOBAL’
+E             261 |   inline VecMask<T, N> op(const VecMask<T, N>& a, const VecMask<V, M>& b) {   \
+E                 |                        ^~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_mask.h:260:11: error: no type named ‘type’ in ‘struct std::enable_if<false, int>’
+E             260 |           0>                                                                  \
+E                 |           ^
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_mask.h:279:1: note: in expansion of macro ‘VEC_MASK_DEFINE_BINARY_OP_GLOBAL’
+E             279 | VEC_MASK_DEFINE_BINARY_OP_GLOBAL(operator&)
+E                 | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+E           In file included from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512.h:12:
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512_int.h:1187:22: note: candidate: ‘template<class T, typename std::enable_if<std::is_base_of<at::vec::CPU_CAPABILITY::Vectorizedi, at::vec::CPU_CAPABILITY::Vectorized<T> >::value, int>::type <anonymous> > at::vec::CPU_CAPABILITY::Vectorized<T> at::vec::CPU_CAPABILITY::operator&(const Vectorized<T>&, const Vectorized<T>&)’
+E            1187 | inline Vectorized<T> operator&(const Vectorized<T>& a, const Vectorized<T>& b) {
+E                 |                      ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512_int.h:1187:22: note:   template argument deduction/substitution failed:
+E           /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp:92:48: note:   ‘at::vec::CPU_CAPABILITY::VecMask<float, 1>’ is not derived from ‘const at::vec::CPU_CAPABILITY::Vectorized<T>’
+E              92 |                             auto tmp6 = tmp4 & tmp5;
+E                 |                                                ^~~~
+E           In file included from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512.h:10:
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512_bfloat16.h:732:29: note: candidate: ‘at::vec::CPU_CAPABILITY::Vectorized<c10::BFloat16> at::vec::CPU_CAPABILITY::operator&(const Vectorized<c10::BFloat16>&, const Vectorized<c10::BFloat16>&)’
+E             732 | Vectorized<BFloat16> inline operator&(const Vectorized<BFloat16>& a, const Vectorized<BFloat16>& b) {
+E                 |                             ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512_bfloat16.h:732:67: note:   no known conversion for argument 1 from ‘at::vec::CPU_CAPABILITY::VecMask<float, 1>’ to ‘const at::vec::CPU_CAPABILITY::Vectorized<c10::BFloat16>&’
+E             732 | Vectorized<BFloat16> inline operator&(const Vectorized<BFloat16>& a, const Vectorized<BFloat16>& b) {
+E                 |                                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512_bfloat16.h:1400:25: note: candidate: ‘at::vec::CPU_CAPABILITY::Vectorized<c10::Half> at::vec::CPU_CAPABILITY::operator&(const Vectorized<c10::Half>&, const Vectorized<c10::Half>&)’
+E            1400 | Vectorized<Half> inline operator&(const Vectorized<Half>& a, const Vectorized<Half>& b) {
+E                 |                         ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512_bfloat16.h:1400:59: note:   no known conversion for argument 1 from ‘at::vec::CPU_CAPABILITY::VecMask<float, 1>’ to ‘const at::vec::CPU_CAPABILITY::Vectorized<c10::Half>&’
+E            1400 | Vectorized<Half> inline operator&(const Vectorized<Half>& a, const Vectorized<Half>& b) {
+E                 |                                   ~~~~~~~~~~~~~~~~~~~~~~~~^
+E           /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp:93:56: error: expected primary-expression before ‘,’ token
+E              93 |                             auto tmp7 = tmp6.to<int64_t,2>();
+E                 |                                                        ^
+E           
+E           
+E           Set TORCH_LOGS="+dynamo" and TORCHDYNAMO_VERBOSE=1 for more information
+E           
+E           
+E           You can suppress this exception and fall back to eager by setting:
+E               import torch._dynamo
+E               torch._dynamo.config.suppress_errors = True
+
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/cpp_builder.py:343: BackendCompilerFailed
+__________________________ test_int_equal[C73-check] ___________________________
+
+key = 'C73', scen = 'check'
+
+    @pytest.mark.parametrize("key,scen", [("C128", "timing"), ("C128", "check"), ("C73", "timing"), ("C73", "check")])
+    def test_int_equal(key, scen):
+        ev = _int(key, scen)
+        d, ref = _plain("D", scen), _plain(D_OF[key], scen)
+        rd = ev["rd"]
+        jp = rd["tent"]["calls"]["joint_passes"]
+        tb = ref["rd"]["tent"]
+        assert tb["crossed"] > 0 and sum(ref["rd"]["acc_hist"][1:]) > 0 and tb["replays"] > 0, "preconditions (L34)"
+        keep = key == "C73"
+        skip = SKIP_REC + (BF_REC if keep else ())
+        ts = TST.KV_KEYS + (BF_T if keep else ())
+        bad = TS._diff(ref, ev, skip=skip, tensors_skip=ts)
+        assert bad == [], bad[:10]                                         # THE CLAIM: its D arm's run
+        bad = TS._diff(d, ev, skip=skip + ("hoist",) + (("keep", "round_blocks") if keep else ()), tensors_skip=ts)
+        assert bad == [], bad[:10]                                         # and L4PTFD's
+        assert all(torch.equal(a, b) for a, b in zip(TST._kv_masked(ref["runner"]), TST._kv_masked(ev["runner"])))
+        STC = _mod("r2_st1_commit")
+        assert STC.tail_checksum(ev["runner"].T) == STC.tail_checksum(ref["runner"].T)
+        j, s1, s2 = rd["j1"], rd["st1"], rd["st2"]
+        assert jp > 0 and j["calls"] == jp * L and s2["layers"] == jp * L and s2["fallback"] == 0      # F1 and ST2: both
+        assert j["peq_layers"] > 0 and j["peq_bad"] == 0 and j["f6"] and j["f6calls"] == rd["compile"]["sections"] > 0
+        assert j["dwarm"] == 1 and j["dlayers"] == rd["dgraph"]["capture_passes"] * L > 0 and j["dpeq_bad"] == 0   # F2
+        n = rd["tent"]["calls"]["commit"]
+        assert s1["warm"] == 1 and s1["captures"] == 1 and s1["replays"] == n - 1 and s1["overflow"] == 0   # ST1
+        if keep:
+            bf = rd["bf"]
+            assert bf["committed"] > 0 and bf["used_store"] + bf["used_win"] > 0 and bf["error"] is None, bf   # BF1
+            assert "j3" not in rd                                          # F3 is not in the BF1 arm
+        else:
+            assert rd["j3"]["joint_captures"] > 0 and rd["j3"]["draft_layers"] > 0, rd["j3"]               # F3
+>       evg = _int_full(key, scen)                                         # the cell's INT arm: + ST4 (+ ST3 in the keep arm)
+
+benchmarks/Efficiency/tests_cpu/test_int.py:334: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+benchmarks/Efficiency/tests_cpu/test_int.py:264: in _int_full
+    run.run(N_RUN)
+nosi/nosi/spec_tentative.py:1171: in run
+    return self._run_paper(N, max_rounds=max_rounds, warm=warm)
+/venv/nosa/lib/python3.10/site-packages/torch/utils/_contextlib.py:116: in decorate_context
+    return func(*args, **kwargs)
+nosi/nosi/spec_tentative.py:711: in _run_paper
+    n, m, full = self._ps_round(P, probe)
+nosi/nosi/spec_tentative_union.py:342: in _ps_round
+    return super()._ps_round(P, probe)
+nosi/nosi/spec_tentative.py:958: in _ps_round
+    lg = T.run_pass(self.model, plan)
+benchmarks/Efficiency/r2_bf1_fetch.py:923: in run_pass
+    out = super().run_pass(model, plan)
+/venv/nosa/lib/python3.10/site-packages/torch/utils/_contextlib.py:116: in decorate_context
+    return func(*args, **kwargs)
+benchmarks/Efficiency/r2_i4h_graph.py:268: in run_pass
+    return super().run_pass(model, plan)
+benchmarks/Efficiency/r2_i4a_lean.py:95: in run_pass
+    return super().run_pass(model, plan)
+/venv/nosa/lib/python3.10/site-packages/torch/utils/_contextlib.py:116: in decorate_context
+    return func(*args, **kwargs)
+nosi/nosi/spec_tentative.py:311: in run_pass
+    hidden = self._layer(l, layer, hidden, pos_flat, model.cos_sin_cache, plan)
+benchmarks/Efficiency/r2_int_arms.py:75: in _layer
+    attn = self._rows(l, eng, twin, sel, q4, k4, v4, pbs, plan).reshape(E, 1, -1)
+benchmarks/Efficiency/r2_i4a_lean.py:99: in _rows
+    return super()._rows(l, eng, twin, sel, q4, k4, v4, pbs, plan)
+nosi/nosi/spec_tentative_union.py:113: in _rows
+    out = self._rows_union(l, eng, twin, sel, q4, k4, v4, pbs, plan)
+benchmarks/Efficiency/r2_i4h_graph.py:396: in _rows_union
+    out = super()._rows_union(l, eng, twin, sel, q4, k4, v4, pbs, plan)
+benchmarks/Efficiency/r2_i4s_stack.py:428: in _rows_union
+    out = self._gsection(l, eng, twin, sel, q4, k4, v4, pbs, plan, self._section, "_resid_joint",
+benchmarks/Efficiency/r2_i4s_stack.py:144: in _gsection
+    return section(l, eng, twin, sel, q4, k4, v4, pbs, plan)
+benchmarks/Efficiency/r2_i4cc_compile.py:540: in _section
+    lphys, valid = self._keep_fill(l, vs, eng, twin, lst, loc, kern)   # the keep (eager)
+benchmarks/Efficiency/r2_st1_commit.py:586: in _keep_fill
+    score, hit, hs, miss, valid, rank, need, td, used = self._st3_call(
+benchmarks/Efficiency/r2_st1_commit.py:563: in _st3_call
+    out = wrap(name, f, args) if wrap is not None else f(*args)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py:574: in _fn
+    return fn(*args, **kwargs)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:1380: in __call__
+    return self._torchdynamo_orig_callable(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:547: in __call__
+    return _compile(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:986: in _compile
+    guarded_code = compile_inner(code, one_graph, hooks, transform)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:715: in compile_inner
+    return _compile_inner(code, one_graph, hooks, transform)
+/venv/nosa/lib/python3.10/site-packages/torch/_utils_internal.py:95: in wrapper_function
+    return function(*args, **kwargs)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:750: in _compile_inner
+    out_code = transform_code_object(code, transform)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/bytecode_transformation.py:1361: in transform_code_object
+    transformations(instructions, code_options)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:231: in _fn
+    return fn(*args, **kwargs)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:662: in transform
+    tracer.run()
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/symbolic_convert.py:2868: in run
+    super().run()
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/symbolic_convert.py:1052: in run
+    while self.step():
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/symbolic_convert.py:962: in step
+    self.dispatch_table[inst.opcode](self, inst)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/symbolic_convert.py:3048: in RETURN_VALUE
+    self._return(inst)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/symbolic_convert.py:3033: in _return
+    self.output.compile_subgraph(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/output_graph.py:1136: in compile_subgraph
+    self.compile_and_call_fx_graph(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/output_graph.py:1382: in compile_and_call_fx_graph
+    compiled_fn = self.call_user_compiler(gm)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/output_graph.py:1432: in call_user_compiler
+    return self._call_user_compiler(gm)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/output_graph.py:1483: in _call_user_compiler
+    raise BackendCompilerFailed(self.compiler_fn, e).with_traceback(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/output_graph.py:1462: in _call_user_compiler
+    compiled_fn = compiler_fn(gm, self.example_inputs())
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/repro/after_dynamo.py:130: in __call__
+    compiled_gm = compiler_fn(gm, example_inputs)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/repro/after_dynamo.py:130: in __call__
+    compiled_gm = compiler_fn(gm, example_inputs)
+/venv/nosa/lib/python3.10/site-packages/torch/__init__.py:2340: in __call__
+    return compile_fx(model_, inputs_, config_patches=self.config)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:1863: in compile_fx
+    return aot_autograd(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/backends/common.py:83: in __call__
+    cg = aot_module_simplified(gm, example_inputs, **self.kwargs)
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/aot_autograd.py:1155: in aot_module_simplified
+    compiled_fn = dispatch_and_compile()
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/aot_autograd.py:1131: in dispatch_and_compile
+    compiled_fn, _ = create_aot_dispatcher_function(
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/aot_autograd.py:580: in create_aot_dispatcher_function
+    return _create_aot_dispatcher_function(
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/aot_autograd.py:830: in _create_aot_dispatcher_function
+    compiled_fn, fw_metadata = compiler_fn(
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/_aot_autograd/jit_compile_runtime_wrappers.py:203: in aot_dispatch_base
+    compiled_fw = compiler(fw_module, updated_flat_args)
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/aot_autograd.py:489: in __call__
+    return self.compiler_fn(gm, example_inputs)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:1741: in fw_compiler_base
+    return inner_compile(
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:569: in compile_fx_inner
+    return wrap_compiler_debug(_compile_fx_inner, compiler_name="inductor")(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/repro/after_aot.py:102: in debug_wrapper
+    inner_compiled_fn = compiler_fn(gm, example_inputs)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:685: in _compile_fx_inner
+    mb_compiled_graph = fx_codegen_and_compile(
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:1129: in fx_codegen_and_compile
+    return scheme.codegen_and_compile(gm, example_inputs, inputs_to_check, graph_kwargs)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:1044: in codegen_and_compile
+    compiled_fn = graph.compile_to_module().call
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/graph.py:2027: in compile_to_module
+    return self._compile_to_module()
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/graph.py:2068: in _compile_to_module
+    mod = PyCodeCache.load_by_key_path(
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/codecache.py:2759: in load_by_key_path
+    mod = _reload_python_module(key, path)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/runtime/compile_tasks.py:45: in _reload_python_module
+    exec(code, mod.__dict__, mod.__dict__)
+../kstep-cpu-runs/tmp_sc/recon7_inductor/hn/chnt2plmozemxaifyk27tuahlr7dzjwuzimcrqizj6iwqyieuzwn.py:246: in <module>
+    async_compile.wait(globals())
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/async_compile.py:305: in wait
+    scope[key] = result.result()
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/codecache.py:3253: in result
+    return self.result_fn()
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/codecache.py:2254: in future
+    result = get_result()
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/codecache.py:2044: in load_fn
+    future.result()
+/root/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/concurrent/futures/_base.py:451: in result
+    return self.__get_result()
+/root/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/concurrent/futures/_base.py:403: in __get_result
+    raise self._exception
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/output_graph.py:1462: in _call_user_compiler
+    compiled_fn = compiler_fn(gm, self.example_inputs())
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/repro/after_dynamo.py:130: in __call__
+    compiled_gm = compiler_fn(gm, example_inputs)
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/repro/after_dynamo.py:130: in __call__
+    compiled_gm = compiler_fn(gm, example_inputs)
+/venv/nosa/lib/python3.10/site-packages/torch/__init__.py:2340: in __call__
+    return compile_fx(model_, inputs_, config_patches=self.config)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:1863: in compile_fx
+    return aot_autograd(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/backends/common.py:83: in __call__
+    cg = aot_module_simplified(gm, example_inputs, **self.kwargs)
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/aot_autograd.py:1155: in aot_module_simplified
+    compiled_fn = dispatch_and_compile()
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/aot_autograd.py:1131: in dispatch_and_compile
+    compiled_fn, _ = create_aot_dispatcher_function(
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/aot_autograd.py:580: in create_aot_dispatcher_function
+    return _create_aot_dispatcher_function(
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/aot_autograd.py:830: in _create_aot_dispatcher_function
+    compiled_fn, fw_metadata = compiler_fn(
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/_aot_autograd/jit_compile_runtime_wrappers.py:203: in aot_dispatch_base
+    compiled_fw = compiler(fw_module, updated_flat_args)
+/venv/nosa/lib/python3.10/site-packages/torch/_functorch/aot_autograd.py:489: in __call__
+    return self.compiler_fn(gm, example_inputs)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:1741: in fw_compiler_base
+    return inner_compile(
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:569: in compile_fx_inner
+    return wrap_compiler_debug(_compile_fx_inner, compiler_name="inductor")(
+/venv/nosa/lib/python3.10/site-packages/torch/_dynamo/repro/after_aot.py:102: in debug_wrapper
+    inner_compiled_fn = compiler_fn(gm, example_inputs)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:685: in _compile_fx_inner
+    mb_compiled_graph = fx_codegen_and_compile(
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:1129: in fx_codegen_and_compile
+    return scheme.codegen_and_compile(gm, example_inputs, inputs_to_check, graph_kwargs)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:1044: in codegen_and_compile
+    compiled_fn = graph.compile_to_module().call
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/graph.py:2027: in compile_to_module
+    return self._compile_to_module()
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/graph.py:2068: in _compile_to_module
+    mod = PyCodeCache.load_by_key_path(
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/codecache.py:2759: in load_by_key_path
+    mod = _reload_python_module(key, path)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/runtime/compile_tasks.py:45: in _reload_python_module
+    exec(code, mod.__dict__, mod.__dict__)
+../kstep-cpu-runs/tmp_sc/recon7_inductor/tn/ctneeorxuejptrwihxk4hqkjshgor6sgkxjvbdteiqxqsz4hszxw.py:246: in <module>
+    async_compile.wait(globals())
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/async_compile.py:305: in wait
+    scope[key] = result.result()
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/codecache.py:3253: in result
+    return self.result_fn()
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/codecache.py:2254: in future
+    result = get_result()
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/codecache.py:2044: in load_fn
+    future.result()
+/root/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/concurrent/futures/_base.py:458: in result
+    return self.__get_result()
+/root/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/concurrent/futures/_base.py:403: in __get_result
+    raise self._exception
+/root/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/concurrent/futures/thread.py:58: in run
+    result = self.fn(*self.args, **self.kwargs)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/codecache.py:2085: in _worker_compile_cpp
+    cpp_builder.build()
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/cpp_builder.py:1548: in build
+    status = run_compile_cmd(build_cmd, cwd=_build_tmp_dir)
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/cpp_builder.py:349: in run_compile_cmd
+    return _run_compile_cmd(cmd_line, cwd)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cmd_line = 'g++ /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d....-o /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.so'
+cwd = '/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d_CxxBuild'
+
+    def _run_compile_cmd(cmd_line: str, cwd: str) -> bytes:
+        cmd = shlex.split(cmd_line)
+        try:
+            status = subprocess.check_output(args=cmd, cwd=cwd, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as e:
+            output = e.output.decode("utf-8")
+            openmp_problem = "'omp.h' file not found" in output or "libomp" in output
+            if openmp_problem and sys.platform == "darwin":
+                instruction = (
+                    "\n\nOpenMP support not found. Please try one of the following solutions:\n"
+                    "(1) Set the `CXX` environment variable to a compiler other than Apple clang++/g++ "
+                    "that has builtin OpenMP support;\n"
+                    "(2) install OpenMP via conda: `conda install llvm-openmp`;\n"
+                    "(3) install libomp via brew: `brew install libomp`;\n"
+                    "(4) manually setup OpenMP and set the `OMP_PREFIX` environment variable to point to a path"
+                    " with `include/omp.h` under it."
+                )
+                output += instruction
+>           raise exc.CppCompileError(cmd, output) from e
+E           torch._dynamo.exc.BackendCompilerFailed: backend='inductor' raised:
+E           CppCompileError: C++ compile error
+E           
+E           Command:
+E           g++ /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp -D TORCH_INDUCTOR_CPP_WRAPPER -D STANDALONE_TORCH_HEADER -D C10_USING_CUSTOM_GENERATED_MACROS -D CPU_CAPABILITY_AVX512 -shared -fPIC -O3 -DNDEBUG -fno-trapping-math -funsafe-math-optimizations -ffinite-math-only -fno-signed-zeros -fno-math-errno -fexcess-precision=fast -fno-finite-math-only -fno-unsafe-math-optimizations -ffp-contract=off -fno-tree-loop-vectorize -march=native -Wall -std=c++17 -Wno-unused-variable -Wno-unknown-pragmas -fopenmp -I/root/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/include/python3.10 -I/venv/nosa/lib/python3.10/site-packages/torch/include -I/venv/nosa/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/venv/nosa/lib/python3.10/site-packages/torch/include/TH -I/venv/nosa/lib/python3.10/site-packages/torch/include/THC -mavx512f -mavx512dq -mavx512vl -mavx512bw -mfma -D_GLIBCXX_USE_CXX11_ABI=0 -ltorch -ltorch_cpu -ltorch_python -lgomp -L/root/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib -L/venv/nosa/lib/python3.10/site-packages/torch/lib -o /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.so
+E           
+E           Output:
+E           /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp: In function ‘void kernel(const int64_t*, const int64_t*, const int64_t*, const int64_t*, int64_t*, bool*, uint8_t*, int64_t*, bool*, bool*, int64_t*)’:
+E           /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp:92:46: error: no match for ‘operator&’ (operand types are ‘at::vec::CPU_CAPABILITY::VecMask<float, 1>’ and ‘at::vec::CPU_CAPABILITY::VecMask<unsigned char, 1>’)
+E              92 |                             auto tmp6 = tmp4 & tmp5;
+E                 |                                         ~~~~ ^ ~~~~
+E                 |                                         |      |
+E                 |                                         |      VecMask<unsigned char,[...]>
+E                 |                                         VecMask<float,[...]>
+E           In file included from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512.h:8,
+E                            from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec.h:4,
+E                            from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/functional_base.h:6,
+E                            from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/functional.h:3,
+E                            from /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/2r/c2rnilspx43ivnzu4uieul65kx65dfhfbptbh5og4wk6rqebuxoo.h:38,
+E                            from /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp:2:
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_base.h:798:22: note: candidate: ‘template<class T, typename std::enable_if<(! std::is_base_of<at::vec::CPU_CAPABILITY::Vectorizedi, at::vec::CPU_CAPABILITY::Vectorized<T> >::value), int>::type <anonymous> > at::vec::CPU_CAPABILITY::Vectorized<T> at::vec::CPU_CAPABILITY::operator&(const Vectorized<T>&, const Vectorized<T>&)’
+E             798 | inline Vectorized<T> operator&(const Vectorized<T>& a, const Vectorized<T>& b) {
+E                 |                      ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_base.h:798:22: note:   template argument deduction/substitution failed:
+E           /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp:92:48: note:   ‘at::vec::CPU_CAPABILITY::VecMask<float, 1>’ is not derived from ‘const at::vec::CPU_CAPABILITY::Vectorized<T>’
+E              92 |                             auto tmp6 = tmp4 & tmp5;
+E                 |                                                ^~~~
+E           In file included from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_base.h:1163:
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_n.h:365:37: note: candidate: ‘template<class T, int N> at::vec::CPU_CAPABILITY::VectorizedN<T, N> at::vec::CPU_CAPABILITY::operator&(const VectorizedN<T, N>&, const VectorizedN<T, N>&)’
+E             365 | VECTORIZEDN_DEFINE_BINARY_OP_GLOBAL(operator&)
+E                 |                                     ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_n.h:319:28: note: in definition of macro ‘VECTORIZEDN_DEFINE_BINARY_OP_GLOBAL’
+E             319 |   inline VectorizedN<T, N> op(                                                 \
+E                 |                            ^~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_n.h:365:37: note:   template argument deduction/substitution failed:
+E             365 | VECTORIZEDN_DEFINE_BINARY_OP_GLOBAL(operator&)
+E                 |                                     ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_n.h:319:28: note: in definition of macro ‘VECTORIZEDN_DEFINE_BINARY_OP_GLOBAL’
+E             319 |   inline VectorizedN<T, N> op(                                                 \
+E                 |                            ^~
+E           /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp:92:48: note:   ‘at::vec::CPU_CAPABILITY::VecMask<float, 1>’ is not derived from ‘const at::vec::CPU_CAPABILITY::VectorizedN<T, N>’
+E              92 |                             auto tmp6 = tmp4 & tmp5;
+E                 |                                                ^~~~
+E           In file included from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_base.h:1164:
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_mask.h:279:34: note: candidate: ‘template<class T, int N, class V, int M, typename std::enable_if<(at::vec::CPU_CAPABILITY::VecMask<T, N>::size() == at::vec::CPU_CAPABILITY::VecMask<mask_t, mask_n>::size()), int>::type <anonymous> > at::vec::CPU_CAPABILITY::VecMask<dst_t, dst_n> at::vec::CPU_CAPABILITY::operator&(const VecMask<dst_t, dst_n>&, const VecMask<mask_t, mask_n>&)’
+E             279 | VEC_MASK_DEFINE_BINARY_OP_GLOBAL(operator&)
+E                 |                                  ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_mask.h:261:24: note: in definition of macro ‘VEC_MASK_DEFINE_BINARY_OP_GLOBAL’
+E             261 |   inline VecMask<T, N> op(const VecMask<T, N>& a, const VecMask<V, M>& b) {   \
+E                 |                        ^~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_mask.h:279:34: note:   template argument deduction/substitution failed:
+E             279 | VEC_MASK_DEFINE_BINARY_OP_GLOBAL(operator&)
+E                 |                                  ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_mask.h:261:24: note: in definition of macro ‘VEC_MASK_DEFINE_BINARY_OP_GLOBAL’
+E             261 |   inline VecMask<T, N> op(const VecMask<T, N>& a, const VecMask<V, M>& b) {   \
+E                 |                        ^~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_mask.h:260:11: error: no type named ‘type’ in ‘struct std::enable_if<false, int>’
+E             260 |           0>                                                                  \
+E                 |           ^
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec_mask.h:279:1: note: in expansion of macro ‘VEC_MASK_DEFINE_BINARY_OP_GLOBAL’
+E             279 | VEC_MASK_DEFINE_BINARY_OP_GLOBAL(operator&)
+E                 | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+E           In file included from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512.h:12:
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512_int.h:1187:22: note: candidate: ‘template<class T, typename std::enable_if<std::is_base_of<at::vec::CPU_CAPABILITY::Vectorizedi, at::vec::CPU_CAPABILITY::Vectorized<T> >::value, int>::type <anonymous> > at::vec::CPU_CAPABILITY::Vectorized<T> at::vec::CPU_CAPABILITY::operator&(const Vectorized<T>&, const Vectorized<T>&)’
+E            1187 | inline Vectorized<T> operator&(const Vectorized<T>& a, const Vectorized<T>& b) {
+E                 |                      ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512_int.h:1187:22: note:   template argument deduction/substitution failed:
+E           /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp:92:48: note:   ‘at::vec::CPU_CAPABILITY::VecMask<float, 1>’ is not derived from ‘const at::vec::CPU_CAPABILITY::Vectorized<T>’
+E              92 |                             auto tmp6 = tmp4 & tmp5;
+E                 |                                                ^~~~
+E           In file included from /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512.h:10:
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512_bfloat16.h:732:29: note: candidate: ‘at::vec::CPU_CAPABILITY::Vectorized<c10::BFloat16> at::vec::CPU_CAPABILITY::operator&(const Vectorized<c10::BFloat16>&, const Vectorized<c10::BFloat16>&)’
+E             732 | Vectorized<BFloat16> inline operator&(const Vectorized<BFloat16>& a, const Vectorized<BFloat16>& b) {
+E                 |                             ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512_bfloat16.h:732:67: note:   no known conversion for argument 1 from ‘at::vec::CPU_CAPABILITY::VecMask<float, 1>’ to ‘const at::vec::CPU_CAPABILITY::Vectorized<c10::BFloat16>&’
+E             732 | Vectorized<BFloat16> inline operator&(const Vectorized<BFloat16>& a, const Vectorized<BFloat16>& b) {
+E                 |                                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512_bfloat16.h:1400:25: note: candidate: ‘at::vec::CPU_CAPABILITY::Vectorized<c10::Half> at::vec::CPU_CAPABILITY::operator&(const Vectorized<c10::Half>&, const Vectorized<c10::Half>&)’
+E            1400 | Vectorized<Half> inline operator&(const Vectorized<Half>& a, const Vectorized<Half>& b) {
+E                 |                         ^~~~~~~~
+E           /venv/nosa/lib/python3.10/site-packages/torch/include/ATen/cpu/vec/vec512/vec512_bfloat16.h:1400:59: note:   no known conversion for argument 1 from ‘at::vec::CPU_CAPABILITY::VecMask<float, 1>’ to ‘const at::vec::CPU_CAPABILITY::Vectorized<c10::Half>&’
+E            1400 | Vectorized<Half> inline operator&(const Vectorized<Half>& a, const Vectorized<Half>& b) {
+E                 |                                   ~~~~~~~~~~~~~~~~~~~~~~~~^
+E           /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_inductor/5j/c5jgj5faa2jqbfdmxgyfo4l3h7z7gjdkj4hgj4ugqxxuwt2bgp5d.cpp:93:56: error: expected primary-expression before ‘,’ token
+E              93 |                             auto tmp7 = tmp6.to<int64_t,2>();
+E                 |                                                        ^
+E           
+E           
+E           Set TORCH_LOGS="+dynamo" and TORCHDYNAMO_VERBOSE=1 for more information
+E           
+E           
+E           You can suppress this exception and fall back to eager by setting:
+E               import torch._dynamo
+E               torch._dynamo.config.suppress_errors = True
+
+/venv/nosa/lib/python3.10/site-packages/torch/_inductor/cpp_builder.py:343: BackendCompilerFailed
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_layer_copy
+  /mnt/beegfs/ojerbi/nosi-r2-int-test/benchmarks/Efficiency/tests_cpu/test_int.py:148: Evidence: INT COPY: IntLayer._layer = TwinST2._layer except 2 marked lines
+    _ev("INT COPY: IntLayer._layer = TwinST2._layer except %d marked lines" % len(diff))
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_equal[C128-check]
+  /mnt/beegfs/ojerbi/nosi-r2-int-test/benchmarks/Efficiency/tests_cpu/test_int.py:349: Evidence: INT EQUAL C128 check: rounds 30, joint passes 29, commits 30; j1 calls 58 f6 19 dlayers 2; st2 {'neg': None, 'fused': False, 'passes': 29, 'layers': 58, 'fallback': 0}; st1 {'mode': 'rows', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}; j3 {'joint_captures': 2, 'draft_layers': 2, 'delta_fixed': 2, 'frame': [{'first': [0, 0], 'calls': [90, 90], 'stamps_ok': True}]}; 19 MUST gates pass
+    _ev("INT EQUAL %s %s: rounds %d, joint passes %d, commits %d; j1 calls %d f6 %d dlayers %d; st2 %s; st1 %s; %s; "
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_stacked
+  /mnt/beegfs/ojerbi/nosi-r2-int-test/benchmarks/Efficiency/tests_cpu/test_int.py:370: Evidence: INT CONTROL stacked: silent run; caught by ['J1-PEQ', 'J1-COMPILE', 'INT-CLASSES', 'INT-LAYER']
+    _ev("INT CONTROL stacked: silent run; caught by %s" % [n for n, x in g.items() if not x[2]])
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_lock
+  /mnt/beegfs/ojerbi/nosi-r2-int-test/benchmarks/Efficiency/tests_cpu/test_int.py:388: Evidence: INT LOCK: captures under BF1's lock 11 (wrapped) vs 10 (nolock)
+    _ev("INT LOCK: captures under BF1's lock %d (wrapped) vs %d (nolock)" % (ra["bf"]["captures_locked"],
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int_defer
+  /mnt/beegfs/ojerbi/nosi-r2-int-test/benchmarks/Efficiency/tests_cpu/test_int.py:402: Evidence: INT DEFER: bf late 0, issued 62, committed 461, used 299
+    _ev("INT DEFER: bf late %s, issued %s, committed %s, used %s" % (rd["bf"].get("late"), rd["bf"].get("issued"),
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED benchmarks/Efficiency/tests_cpu/test_int.py::test_int_gate0_files - As...
+FAILED benchmarks/Efficiency/tests_cpu/test_int.py::test_int_equal[C128-timing]
+FAILED benchmarks/Efficiency/tests_cpu/test_int.py::test_int_equal[C73-timing]
+FAILED benchmarks/Efficiency/tests_cpu/test_int.py::test_int_equal[C73-check]
+SKIPPED [1] benchmarks/Efficiency/tests_cpu/test_int.py:584: not a clean checkout of /mnt/beegfs/ojerbi/nosi-r2-int: the full DRYRUN needs one
+4 failed, 9 passed, 1 skipped, 5 warnings in 1316.41s (0:21:56)

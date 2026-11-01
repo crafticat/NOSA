@@ -1,0 +1,1 @@
+2195576.27|i4h-i4hb-j4b-2195576|COMPLETED|0:0|01:11:37|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=340G,node=1|3056336K

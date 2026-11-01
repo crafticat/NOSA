@@ -1,0 +1,1 @@
+2195630.0|recon7-r7s-x1r3-2195630|COMPLETED|0:0|00:04:00|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=64G,node=1|1966388K

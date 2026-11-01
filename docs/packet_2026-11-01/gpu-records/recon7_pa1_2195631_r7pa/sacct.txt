@@ -1,0 +1,1 @@
+2195631.1|recon7-r7pa-pa1-2195631|FAILED|1:0|00:59:32|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=240G,node=1|2966828K

@@ -1,0 +1,79 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+.....F........                                                           [100%]
+=================================== FAILURES ===================================
+_________________________________ test_bf1_off _________________________________
+
+    def test_bf1_off():
+>       ref, ev = _plain("GUDKCD"), _bf("timing", mode="off")
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py:287: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+benchmarks/Efficiency/tests_cpu/test_bf1.py:236: in _bf
+    return _run_bf(scen, mode=mode, worker=worker, bneg=bneg)
+benchmarks/Efficiency/tests_cpu/test_bf1.py:223: in _run_bf
+    rd = run.read()
+/venv/nosa/lib/python3.10/site-packages/torch/utils/_contextlib.py:116: in decorate_context
+    return func(*args, **kwargs)
+benchmarks/Efficiency/r2_bf1_fetch.py:749: in read
+    rep = self.bf.report()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <r2_bf1_fetch.BgFetch object at 0x7fbf45cf0520>
+
+    def report(self) -> dict:
+        self.stop()
+        tps = None
+>       if self.tp is not None:                          # drains the C++ worker, then its totals
+E       AttributeError: 'BgFetch' object has no attribute 'tp'
+
+benchmarks/Efficiency/r2_bf1_fetch.py:646: AttributeError
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_copy
+  /mnt/beegfs/ojerbi/nosi-r2-bf1/benchmarks/Efficiency/tests_cpu/test_bf1.py:151: Evidence: BF1 COPY: run_arm_bf = run_arm_d + 5 BF1 lines
+    _ev("BF1 COPY: run_arm_bf = run_arm_d + %d BF1 lines" % len(extra))
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_equal[timing]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1/benchmarks/Efficiency/tests_cpu/test_bf1.py:277: Evidence: BF1 EQUAL timing: rounds 30; NEW blocks 712 -> 94 (0.132); keep fetched 339 -> 60, window hits 454 -> 793; bf jobs 120, issued 111, items seen 1697, have 714, sent 983, committed 461, revived 522, no room 0, used store 318 + window 249, unused 416, pending 0; check {'overflow': 0, 'dup': 0, 'missing': 0, 'bytes_bad': 0, 'bytes_checked': 0, 'win_checked': 0}
+    _ev("BF1 EQUAL %s: rounds %d; NEW blocks %d -> %d (%.3f); keep fetched %d -> %d, window hits %d -> %d; bf jobs %d, "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_equal[check]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1/benchmarks/Efficiency/tests_cpu/test_bf1.py:277: Evidence: BF1 EQUAL check: rounds 30; NEW blocks 712 -> 94 (0.132); keep fetched 339 -> 60, window hits 454 -> 793; bf jobs 120, issued 111, items seen 1697, have 714, sent 983, committed 461, revived 522, no room 0, used store 318 + window 249, unused 416, pending 0; check {'overflow': 0, 'dup': 0, 'missing': 0, 'bytes_bad': 0, 'bytes_checked': 846, 'win_checked': 793}
+    _ev("BF1 EQUAL %s: rounds %d; NEW blocks %d -> %d (%.3f); keep fetched %d -> %d, window hits %d -> %d; bf jobs %d, "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_thread
+  /mnt/beegfs/ojerbi/nosi-r2-bf1/benchmarks/Efficiency/tests_cpu/test_bf1.py:303: Evidence: BF1 THREAD: jobs 120, issued 111, late 0, empty 9; sent 983, committed 461, used 567
+    _ev("BF1 THREAD: jobs %d, issued %d, late %d, empty %d; sent %d, committed %d, used %d" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_plants[wrong_bytes]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1/benchmarks/Efficiency/tests_cpu/test_bf1.py:316: Evidence: BF1 PLANT wrong_bytes: caught (EQF committed tokens unequal to L4PTFD's: 341 of 384; fingerprints compared 384 columns, max equal False, sum equal False; s; bytes_bad 889)
+    _ev("BF1 PLANT %s: caught (EQF %s; bytes_bad %d)" % (bneg, gs["L4PTFDGUDKWCDB-EQF"][3][:120],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_plants[no_copy]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1/benchmarks/Efficiency/tests_cpu/test_bf1.py:316: Evidence: BF1 PLANT no_copy: caught (EQF committed tokens unequal to L4PTFD's: 303 of 384; fingerprints compared 384 columns, max equal False, sum equal False; s; bytes_bad 1558)
+    _ev("BF1 PLANT %s: caught (EQF %s; bytes_bad %d)" % (bneg, gs["L4PTFDGUDKWCDB-EQF"][3][:120],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_gilfree[inline]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1/benchmarks/Efficiency/tests_cpu/test_bf1.py:349: Evidence: BF1 GILFREE inline: NEW 712 -> 94; sent 983, committed 461, used 567, late 0; transport {'releases': 111, 'groups': 983, 'chunks': 111, 'pack_ns': 11002618, 'threads_min': 2, 'threads_max': 2}
+    _ev("BF1 GILFREE %s: NEW %d -> %d; sent %d, committed %d, used %d, late %d; transport %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_gilfree[thread]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1/benchmarks/Efficiency/tests_cpu/test_bf1.py:349: Evidence: BF1 GILFREE thread: NEW 712 -> 94; sent 983, committed 461, used 567, late 0; transport {'releases': 111, 'groups': 983, 'chunks': 111, 'pack_ns': 9731751, 'threads_min': 2, 'threads_max': 2}
+    _ev("BF1 GILFREE %s: NEW %d -> %d; sent %d, committed %d, used %d, late %d; transport %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_step_script_bf1
+  /mnt/beegfs/ojerbi/nosi-r2-bf1/benchmarks/Efficiency/tests_cpu/test_bf1.py:426: Evidence: BF1 STEP: cells ['bf1a', 'bf1b', 'bf1m'] parse
+    _ev("BF1 STEP: cells %s parse" % sorted(CELLS))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_off - AttributeE...
+1 failed, 13 passed, 9 warnings in 1031.79s (0:17:11)

@@ -1,0 +1,61 @@
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+[r2_i4m 14:25:39] model loaded in 4 s
+[r2_i4m 14:25:39] arm SH (B 64, 512 steps, C 128)
+[r2_i4m 14:31:35] arm L4PTFD ({'arm': 'L4PTFD', 'K': 3, 'journal': 256, 'tu_gemm': 'natural', 'twin': 'fused', 'body': 'fused', 'graph': True, 'redirect': True, 'probe_every': 16, 'check_every': 0, 'fork_store': 0, 'prefill_hook': 'nocopy'}; mode probe, role probe)
+GATE C0_FORK          MUST PASS: /mnt/beegfs/ojerbi/nosi-r2-i4m/benchmarks/Efficiency/fork_vllm_unified_attention.py (blob pinned by the step: f0dc0c183a388585e216505a6bbfc696531e8add)
+GATE SH-RUN           MUST PASS: 512 steps, 9 re-warms
+GATE SH-MEM           REPORT PASS: peak allocated 37.694 GB (after the prefill 37.694 GB, prefill None GB) against 84.0 GB; prefill + decode; usable ceiling 84.25 GB
+GATE L4PTFD-RUN       MUST PASS: 49 rounds of K 3
+GATE L4PTFD-ERR       MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE L4PTFD-D1        MUST PASS: residency-undo calls 0 (0 expected); resets 49 for 49 rounds
+GATE L4PTFD-D3        MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 196 = (K + 1) x 49 passes; one-row J slots 0; 49 rounds
+GATE L4PTFD-SPAN      MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE L4PTFD-COMMIT-P  MUST PASS: 49 rounds (49 asked); committed per request min 110 max 147 (<= 512); warm 64 + per-round sum 8467, total 8531
+GATE L4PTFD-RESID     MUST PASS: residency calls in joint passes 1568 for 49 joint passes of 32 layers (one per layer and pass); union layers 1568; verify_rows passes 49
+GATE L4PTFD-ATTN1     MUST PASS: attn calls 1568 for 49 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFD-FILL1     MUST PASS: fills calls 1568 for 49 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFD-LEAN      MUST PASS: lean passes 101 (one-row passes: draft steps 101 incl. the prelude's 3 + mixed 0 + one-row J 0 = 101); lean layers 3232 (L x passes = 3232)
+GATE L4PTFD-MEM       MUST PASS: peak allocated 38.2412 GB with the prefill against the cap 84.0 GB (usable ceiling 84.25 GB, REPORT); arena {'start_GB': 15.329, 'prefill_peak_GB': 35.615, 'arena': {'L': 32, 'B': 64, 'NS': 129, 'H': 2, 'D': 128, 'X': 129, 'bs': 64, 'n_blocks': 272512, 'store_base': 264192, 'store_GB': 0.5432, 'arena_GB': 17.9291, 'dtype': 'torch.bfloat16', 'cb0_base': 272448, 'cb0_GB': 0.0042, 'cb1': 'store slot 0', 'kind': 'chain'}, 'hook': 'nocopy', 'decode_peak_GB': 33.389, 'decode_peak_reserved_GB': 33.672}
+GATE PR-ROUNDS        MUST PASS: 49 rounds (two probe rounds and a window of 16)
+GATE PR-FILL          MUST PASS: every request committed >= 64 tokens (its first block fill; min 110): the fill paths ran
+GATE PR-FLAT          MUST PASS: flat True, growth 1536.0 B per round (tolerance 8192 B; declared 1536 B); no late rise
+GATE PR-PRE           MUST PASS: the probe's prefill mark 38.2412 GB; the arena prefill's own peak 38.2413 GB (35.615 GiB); tolerance 0.002 GB
+PREDICTION PR-PRE     REPORT: 38.2412 (registered None)
+PREDICTION PR-DEC     REPORT: 36.0386 (registered None)
+REPORT SH B 64 C 128: steady 30.894 ms/step, tok/s median 2071.6 mean 1998.6 effective 452.4, peak 37.694 GB
+REPORT L4PTFD K 3: 49 rounds; committed tok/s median 682.2 mean 677.8 effective 389.0; vs SH {'median_tok_s': 0.3293, 'mean_tok_s': 0.3391, 'effective_tok_s': 0.8599}; round median 257.298 ms; phases {'reset': 0.114, 'joint': 143.557, 'commit': 3.215, 'draft': 109.955}; draft step 54.977 ms = 1.7796 SH; joint 4.6468 SH steps; lean {'passes': 101, 'layers': 3232}; tokens equal 0.644590 (first (33, 1)); peak 36.0386 GB (with the prefill 38.2412 GB); arena {'start_GB': 15.329, 'prefill_peak_GB': 35.615, 'arena': {'L': 32, 'B': 64, 'NS': 129, 'H': 2, 'D': 128, 'X': 129, 'bs': 64, 'n_blocks': 272512, 'store_base': 264192, 'store_GB': 0.5432, 'arena_GB': 17.9291, 'dtype': 'torch.bfloat16', 'cb0_base': 272448, 'cb0_GB': 0.0042, 'cb1': 'store slot 0', 'kind': 'chain'}, 'hook': 'nocopy', 'decode_peak_GB': 33.389, 'decode_peak_reserved_GB': 33.672}
+REPORT PROBE L4PTFD C 128 B 64: prefill 38.2412 GB (reserved 38.5478); decode 36.0386 GB (from rounds: attach 35.7458, rounds 36.0386, end 35.8596); arm 38.2412 GB; reserved decode 38.5478 GB; check {'ok': True, 'rounds_ok': True, 'flat_ok': True, 'growth_ok': True, 'growth_B_per_round': 1536.0, 'window': 16, 'why': []}
+FIT L4PTFD C 128: prefill line a 19.020232 GB + b 0.3003276 GB x B through [(64, 38.2412), (216, 83.891)]; decode line a 16.455461 + b 0.3060349 x B through [(64, 36.041695), (216, 82.559)] (probe decode projected to 2064 rounds: 36.041695 GB); B_fit 216 (line 216, MEASURED floor 216; margin 0.0 GB, cap 84.0 GB): predicted peak 83.891 GB (prefill binds, slope 0.3003276 GB per request), B_fit + 1 84.1913 GB; prefill 83.891 / decode 82.559 GB at B_fit; headroom 0.109 GB; one more request adds at least the arena's 0.280142 GB; int32 limit 502; SH fits 222 (beside: True); device {'need_GB': 84.758, 'capacity_GB': 85.09, 'gap_GB': 0.307, 'fits': True}
+FIT-TABLE L4PTFD C 128: B_fit by margin (GB) {'0.00': 216, '0.10': 216, '0.25': 216}; linearity of the prefill line (REPORT) []
+r2_i4m: 0 MUST gate(s) failed

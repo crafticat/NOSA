@@ -1,0 +1,1 @@
+2195576.18|i4g-i4ga-h4a-2195576|COMPLETED|0:0|00:36:45|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=240G,node=1|3078600K

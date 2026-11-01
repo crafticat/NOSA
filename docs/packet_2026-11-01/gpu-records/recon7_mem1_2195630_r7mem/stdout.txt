@@ -1,0 +1,79 @@
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+[r2_recon7_mem 13:46:24] model loaded in 4 s
+[r2_recon7_mem 13:46:24] B64 arm SH (C 81, 512 steps)
+[r2_recon7_mem 13:52:22] B64 arm L4PTFD probe (49 rounds)
+[r2_recon7_mem 13:55:46] B192 arm SH (C 81, 512 steps)
+[r2_recon7_mem 14:05:50] B192 arm L4PTFD probe (49 rounds)
+GATE C0_FORK                MUST PASS: /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/fork_vllm_unified_attention.py (blob pinned by the step: f0dc0c183a388585e216505a6bbfc696531e8add)
+GATE B64-SH-RUN             MUST PASS: 512 steps
+GATE B64-SH-MEM             REPORT PASS: peak allocated 31.358 GB (after the prefill 31.358 GB, prefill None GB) against 84.0 GB; prefill + decode; usable ceiling 84.25 GB
+GATE B64-L4PTFD-RUN         MUST PASS: 49 rounds
+GATE B64-L4PTFD-ERR         MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE B64-L4PTFD-D1          MUST PASS: residency-undo calls 0 (0 expected); resets 49 for 49 rounds
+GATE B64-L4PTFD-D3          MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 196 = (K + 1) x 49 passes; one-row J slots 0; 49 rounds
+GATE B64-L4PTFD-SPAN        MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE B64-L4PTFD-COMMIT-P    MUST PASS: 49 rounds (49 asked); committed per request min 110 max 143 (<= 512); warm 64 + per-round sum 8193, total 8257
+GATE B64-L4PTFD-RESID       MUST PASS: residency calls in joint passes 1568 for 49 joint passes of 32 layers (one per layer and pass); union layers 1568; verify_rows passes 49
+GATE B64-L4PTFD-ATTN1       MUST PASS: attn calls 1568 for 49 joint passes of 32 layers (one per layer and pass)
+GATE B64-L4PTFD-FILL1       MUST PASS: fills calls 1568 for 49 joint passes of 32 layers (one per layer and pass)
+GATE B64-L4PTFD-LEAN        MUST PASS: lean passes 101 (one-row passes: draft steps 101 incl. the prelude's 3 + mixed 0 + one-row J 0 = 101); lean layers 3232 (L x passes = 3232)
+GATE B64-L4PTFD-MEM         MUST PASS: peak allocated 31.9053 GB with the prefill against the cap 84.0 GB (usable ceiling 84.25 GB, REPORT); arena {'start_GB': 15.329, 'prefill_peak_GB': 29.714, 'arena': {'L': 32, 'B': 64, 'NS': 82, 'H': 2, 'D': 128, 'X': 129, 'bs': 64, 'n_blocks': 176256, 'store_base': 167936, 'store_GB': 0.5432, 'arena_GB': 11.5962, 'dtype': 'torch.bfloat16', 'cb0_base': 176192, 'cb0_GB': 0.0042, 'cb1': 'store slot 0', 'kind': 'chain'}, 'hook': 'nocopy', 'decode_peak_GB': 27.487, 'decode_peak_reserved_GB': 27.752}
+GATE B64-PR-ROUNDS          MUST PASS: 49 rounds (two probe rounds and a window of 16)
+GATE B64-PR-FILL            MUST PASS: every request committed >= 64 tokens (its first block fill; min 110): the fill paths ran
+GATE B64-PR-FLAT            MUST PASS: flat True, growth 1536.0 B per round (tolerance 8192 B; declared 1536 B); no late rise
+GATE B64-PR-PRE             MUST PASS: the probe's prefill mark 31.9053 GB; the arena prefill's own peak 31.9052 GB (29.714 GiB); tolerance 0.002 GB
+GATE B64-OCC                MUST PASS: store fills per layer [49] (joint passes 49); peak listed per (layer, KV head, request) 26 of 128 slots
+GATE B192-SH-RUN            MUST PASS: 512 steps
+GATE B192-SH-MEM            REPORT PASS: peak allocated 68.95 GB (after the prefill 68.95 GB, prefill None GB) against 84.0 GB; prefill + decode; usable ceiling 84.25 GB
+GATE B192-L4PTFD-RUN        MUST PASS: 49 rounds
+GATE B192-L4PTFD-ERR        MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE B192-L4PTFD-D1         MUST PASS: residency-undo calls 0 (0 expected); resets 49 for 49 rounds
+GATE B192-L4PTFD-D3         MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 196 = (K + 1) x 49 passes; one-row J slots 0; 49 rounds
+GATE B192-L4PTFD-SPAN       MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE B192-L4PTFD-COMMIT-P   MUST PASS: 49 rounds (49 asked); committed per request min 100 max 147 (<= 512); warm 192 + per-round sum 24916, total 25108
+GATE B192-L4PTFD-RESID      MUST PASS: residency calls in joint passes 1568 for 49 joint passes of 32 layers (one per layer and pass); union layers 1568; verify_rows passes 49
+GATE B192-L4PTFD-ATTN1      MUST PASS: attn calls 1568 for 49 joint passes of 32 layers (one per layer and pass)
+GATE B192-L4PTFD-FILL1      MUST PASS: fills calls 1568 for 49 joint passes of 32 layers (one per layer and pass)
+GATE B192-L4PTFD-LEAN       MUST PASS: lean passes 101 (one-row passes: draft steps 101 incl. the prelude's 3 + mixed 0 + one-row J 0 = 101); lean layers 3232 (L x passes = 3232)
+GATE B192-L4PTFD-MEM        MUST PASS: peak allocated 57.6757 GB with the prefill against the cap 84.0 GB (usable ceiling 84.25 GB, REPORT); arena {'start_GB': 15.346, 'prefill_peak_GB': 53.715, 'arena': {'L': 32, 'B': 192, 'NS': 82, 'H': 2, 'D': 128, 'X': 129, 'bs': 64, 'n_blocks': 528768, 'store_base': 503808, 'store_GB': 1.6295, 'arena_GB': 34.7887, 'dtype': 'torch.bfloat16', 'cb0_base': 528576, 'cb0_GB': 0.0126, 'cb1': 'store slot 0', 'kind': 'chain'}, 'hook': 'nocopy', 'decode_peak_GB': 51.819, 'decode_peak_reserved_GB': 52.535}
+GATE B192-PR-ROUNDS         MUST PASS: 49 rounds (two probe rounds and a window of 16)
+GATE B192-PR-FILL           MUST PASS: every request committed >= 64 tokens (its first block fill; min 100): the fill paths ran
+GATE B192-PR-FLAT           MUST PASS: flat True, growth 1536.0 B per round (tolerance 8192 B; declared 1536 B); no late rise
+GATE B192-PR-PRE            MUST PASS: the probe's prefill mark 57.6757 GB; the arena prefill's own peak 57.676 GB (53.715 GiB); tolerance 0.002 GB
+GATE B192-OCC               MUST PASS: store fills per layer [49] (joint passes 49); peak listed per (layer, KV head, request) 25 of 128 slots
+GATE FIT                    MUST PASS: probe points prefill [(64, 31.9053), (192, 57.6757)] decode [(64, 29.704995), (192, 56.206595)]
+R7 D3 C 81 B 64: prefill 31.9053 GB, decode 29.7019 GB (reserved 32.2311); occupancy {'fills': [49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49], 'max_by_layer': [15, 7, 5, 13, 5, 14, 14, 12, 13, 20, 19, 16, 14, 21, 14, 17, 26, 16, 22, 21, 17, 19, 20, 22, 19, 19, 21, 12, 19, 22, 19, 16], 'max': 26, 'sum_by_layer': [9029, 5426, 4147, 7285, 3525, 5850, 10662, 4643, 6130, 24551, 10122, 11541, 4603, 22846, 8305, 10157, 29696, 10064, 23178, 14826, 12757, 10733, 21596, 27640, 13219, 14032, 23304, 6448, 14799, 19489, 17303, 9815], 'streams_with_listed': [3725, 3315, 2855, 3759, 2624, 3432, 4266, 2849, 3329, 4303, 4214, 3856, 2845, 5306, 3840, 3868, 5300, 3868, 5119, 4615, 4413, 4082, 4537, 5365, 4243, 4547, 5262, 3603, 4590, 4353, 4606, 4242], 'hist': [69573, 45452, 28137, 17217, 11193, 7671, 5752, 4359, 3222, 2375, 1761, 1261, 890, 642, 449, 309, 180, 117, 64, 41, 18, 13, 7, 0, 0, 0, 1], 'X': 129, 'idle_share_at_max': 0.7969}
+R7 D3 C 81 B 192: prefill 57.6757 GB, decode 56.2035 GB (reserved 58.0324); occupancy {'fills': [49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49], 'max_by_layer': [19, 7, 7, 13, 5, 14, 13, 12, 13, 20, 19, 19, 14, 21, 14, 19, 25, 17, 23, 21, 17, 19, 22, 22, 19, 21, 21, 12, 19, 22, 22, 13], 'max': 25, 'sum_by_layer': [27300, 16464, 12354, 21311, 10620, 17646, 31185, 13425, 17703, 73028, 29866, 33708, 13904, 67835, 24405, 29934, 91461, 30325, 71073, 44744, 37725, 32440, 65231, 84627, 40098, 43466, 70267, 19731, 44316, 59701, 52588, 29261], 'streams_with_listed': [11184, 10057, 8531, 11089, 7913, 10409, 12739, 8306, 9847, 12857, 12338, 11474, 8741, 15874, 11409, 11583, 15974, 11784, 15528, 13752, 13251, 12459, 13628, 16207, 12719, 13753, 15854, 10976, 13759, 13119, 13770, 12763], 'hist': [208465, 136200, 84038, 52106, 33469, 23413, 16867, 13176, 9596, 7308, 5367, 3748, 2742, 1939, 1302, 938, 570, 378, 220, 122, 64, 42, 30, 10, 0, 2], 'X': 129, 'idle_share_at_max': 0.8047}
+R7 D3 FIT C 81: prefill line (19.0201, 0.2013312), decode line (16.454195, 0.2070437) through {'prefill': [(64, 31.9053), (192, 57.6757)], 'decode': [(64, 29.704995), (192, 56.206595)]}; B_fit 322 (margin 0.1 GB; by margin {'0.00': 322, '0.10': 322, '0.25': 321}); B_fit at the usable 83.75 GB 321; peak at B 287 76.8022 GB (fits the usable ceiling True); R3 MODEL B_fit (321.5, 322.8)
+r2_recon7_mem: 0 MUST gate(s) failed

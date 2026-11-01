@@ -1,0 +1,88 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+.....................s                                                   [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st1_copies
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:163: Evidence: ST1 COPIES: run_arm_st1 = run_arm_d + 2 ST1 lines
+    _ev("ST1 COPIES: run_arm_st1 = run_arm_d + %d ST1 lines" % len(extra))
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st1_equal[GUDCD-rows-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:313: Evidence: ST1 EQUAL GUDCD rows timing: rounds 30, commits 30, crossed 8, appended 376; st1 {'mode': 'rows', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}
+    _ev("ST1 EQUAL %s %s %s: rounds %d, commits %d, crossed %d, appended %d; st1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st1_equal[GUDCD-rowsx-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:313: Evidence: ST1 EQUAL GUDCD rowsx timing: rounds 30, commits 30, crossed 8, appended 376; st1 {'mode': 'rowsx', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}
+    _ev("ST1 EQUAL %s %s %s: rounds %d, commits %d, crossed %d, appended %d; st1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st1_equal[GUDCD-where-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:313: Evidence: ST1 EQUAL GUDCD where timing: rounds 30, commits 30, crossed 8, appended 376; st1 {'mode': 'where', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}
+    _ev("ST1 EQUAL %s %s %s: rounds %d, commits %d, crossed %d, appended %d; st1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st1_equal[GUDKCD-rows-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:313: Evidence: ST1 EQUAL GUDKCD rows timing: rounds 30, commits 30, crossed 8, appended 376; st1 {'mode': 'rows', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}
+    _ev("ST1 EQUAL %s %s %s: rounds %d, commits %d, crossed %d, appended %d; st1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st1_equal[GUDKCD-rowsx-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:313: Evidence: ST1 EQUAL GUDKCD rowsx timing: rounds 30, commits 30, crossed 8, appended 376; st1 {'mode': 'rowsx', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}
+    _ev("ST1 EQUAL %s %s %s: rounds %d, commits %d, crossed %d, appended %d; st1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st1_equal[GUDKCD-where-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:313: Evidence: ST1 EQUAL GUDKCD where timing: rounds 30, commits 30, crossed 8, appended 376; st1 {'mode': 'where', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}
+    _ev("ST1 EQUAL %s %s %s: rounds %d, commits %d, crossed %d, appended %d; st1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st1_equal[GUDCD-rows-check]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:313: Evidence: ST1 EQUAL GUDCD rows check: rounds 30, commits 30, crossed 8, appended 376; st1 {'mode': 'rows', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}
+    _ev("ST1 EQUAL %s %s %s: rounds %d, commits %d, crossed %d, appended %d; st1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st1_equal[GUDKCD-rows-check]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:313: Evidence: ST1 EQUAL GUDKCD rows check: rounds 30, commits 30, crossed 8, appended 376; st1 {'mode': 'rows', 'sneg': None, 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}
+    _ev("ST1 EQUAL %s %s %s: rounds %d, commits %d, crossed %d, appended %d; st1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st1_controls[stale]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:333: Evidence: ST1 CONTROL stale: differences 63 (first ['acc_hist', 'accepted', 'draft_calls', 'draft_skipped']); KV equal False; st1 {'mode': 'rows', 'sneg': 'stale', 'J': 5, 'warm': 1, 'captures': 1, 'replays': 50, 'commits': 51, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}
+    _ev("ST1 CONTROL %s: differences %d (first %s); KV equal %s; st1 %s" % (sneg, len(bad), bad[:4], kv_same,
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st1_controls[no_phase2]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:333: Evidence: ST1 CONTROL no_phase2: differences 17 (first ['draft_skipped', 'round_blocks', 'tent', 'bb1']); KV equal False; st1 {'mode': 'rows', 'sneg': 'no_phase2', 'J': 5, 'warm': 1, 'captures': 1, 'replays': 29, 'commits': 30, 'capture_round': 1, 'overflow': 0, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}
+    _ev("ST1 CONTROL %s: differences %d (first %s); KV equal %s; st1 %s" % (sneg, len(bad), bad[:4], kv_same,
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st1_controls[narrow]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:333: Evidence: ST1 CONTROL narrow: differences 57 (first ['acc_hist', 'accepted', 'draft_calls', 'draft_skipped']); KV equal False; st1 {'mode': 'rows', 'sneg': 'narrow', 'J': 1, 'warm': 1, 'captures': 1, 'replays': 21, 'commits': 22, 'capture_round': 1, 'overflow': 127, 'static_bytes': 384, 'capture_s': 0.0, 'pool_bytes': 0, 'backend': 'FakeCommitGraphs'}
+    _ev("ST1 CONTROL %s: differences %d (first %s); KV equal %s; st1 %s" % (sneg, len(bad), bad[:4], kv_same,
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st2_equal[GUDCD-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:356: Evidence: ST2 EQUAL GUDCD timing: joint passes 29, replays 142; st2 {'neg': None, 'fused': False, 'passes': 29, 'layers': 58, 'fallback': 0}
+    _ev("ST2 EQUAL %s %s: joint passes %d, replays %d; st2 %s" % (arm, scen, jp, tb["replays"], s2))
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st2_equal[GUDKCD-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:356: Evidence: ST2 EQUAL GUDKCD timing: joint passes 29, replays 142; st2 {'neg': None, 'fused': False, 'passes': 29, 'layers': 58, 'fallback': 0}
+    _ev("ST2 EQUAL %s %s: joint passes %d, replays %d; st2 %s" % (arm, scen, jp, tb["replays"], s2))
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st2_equal[GUDCD-check]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:356: Evidence: ST2 EQUAL GUDCD check: joint passes 29, replays 142; st2 {'neg': None, 'fused': False, 'passes': 29, 'layers': 58, 'fallback': 0}
+    _ev("ST2 EQUAL %s %s: joint passes %d, replays %d; st2 %s" % (arm, scen, jp, tb["replays"], s2))
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st2_equal[GUDKCD-check]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:356: Evidence: ST2 EQUAL GUDKCD check: joint passes 29, replays 142; st2 {'neg': None, 'fused': False, 'passes': 29, 'layers': 58, 'fallback': 0}
+    _ev("ST2 EQUAL %s %s: joint passes %d, replays %d; st2 %s" % (arm, scen, jp, tb["replays"], s2))
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st2_controls[no_replay_seq]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:369: Evidence: ST2 CONTROL no_replay_seq: differences 64 (first ['acc_hist', 'accepted', 'draft_calls', 'draft_skipped'])
+    _ev("ST2 CONTROL %s: differences %d (first %s)" % (tneg2, len(bad), bad[:4]))
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st2_controls[no_shift]
+  /mnt/beegfs/ojerbi/nosi-r2-int/benchmarks/Efficiency/tests_cpu/test_st1.py:369: Evidence: ST2 CONTROL no_shift: differences 65 (first ['acc_hist', 'accepted', 'draft_calls', 'draft_skipped'])
+    _ev("ST2 CONTROL %s: differences %d (first %s)" % (tneg2, len(bad), bad[:4]))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] benchmarks/Efficiency/tests_cpu/test_st1.py:550: not a clean checkout of /mnt/beegfs/ojerbi/nosi-r2-st1: the full DRYRUN needs one
+21 passed, 1 skipped, 18 warnings in 1791.64s (0:29:51)

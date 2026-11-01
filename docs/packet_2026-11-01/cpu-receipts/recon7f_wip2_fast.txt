@@ -1,0 +1,57 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+.........sF                                                              [100%]
+=================================== FAILURES ===================================
+______________________________ test_notes_recon7 _______________________________
+
+    def test_notes_recon7():
+        doc = (ROOT / "docs/NOTES_recon7.md").read_text()
+        for word in ("test_recon7.py", "GRANT_r7s", "default deny", "STEP_MIN", "NO NEW KERNEL", "r7pm", "r7pa", "r7pb",
+                     "r7s", "r7mem", "falsifier", "decides", "MEASURED", "MODEL", "drain", "PEQ", "D1", "D2", "D3", "D5",
+                     "D6", "D7", "GPU only"):
+            assert word in doc, word
+        assert "PROTOCOL_STAMP_RECON7 = None" not in doc.replace("`PROTOCOL_STAMP_RECON7 = None` (retired", "")
+        x1 = doc[doc.index("## X1 protocol"):doc.index("## 3. THE GPU PROTOCOL")]
+        S = _mod("r2_recon7_streams")
+        for word in ("2195630", "nova05", "STEP_MIN 20", "--mem=64G", "--cpus-per-task=16", "crafticat/NOSA", "r2-recon7",
+                     "MATCHED", "ORDER-ROTATED", "CANNOT", "STOP THE RUN", "FALSIFIERS", "DECISION RULES",
+                     "Duplicate-work evidence", "Output limit", FORK_BLOB, "--seed 7", "--max-shape-s 240", "--reps 10",
+                     "--warmup 2", "--max-run-s 600", "WINF", "GRP-SER", "CPY-SER", "A|F|M-SER", "intra-kernel",
+                     "GRP-EQ", "SUPPRESSED", "474", "948", "ordered synthetic", "copy interference", "/usr/bin/sha256sum"):
+            assert word in x1, word
+        for c in ("GRP", "GRPL", "CPY"):                                   # every screen schedule and its control
+            assert "| %s |" % c in x1 and S.CONTROL_OF[c] in x1, c
+        for word in ("4 x 474", "ATTAINABLE", "PF HIDES"):
+            assert word not in x1, word
+>       assert re.search(r"code commit \| `[0-9a-f]{40}`", x1) and re.search(r"sha256 `[0-9a-f]{64}`", x1)
+E       assert (None)
+E        +  where None = <function search at 0x7f2324d2edd0>('code commit \\| `[0-9a-f]{40}`', "## X1 protocol (repaired after review 3, 2026-10-31)\n\nThe SMALLEST discriminator. X1 = step cell `r7s` = `benchmark...y, a useful\n  prefetch, any intra-kernel overlap, WINF, the unreplayed parts, anything about the drafts' compute.\n\n")
+E        +    where <function search at 0x7f2324d2edd0> = re.search
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py:1062: AssertionError
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_recon7_copies
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:173: Evidence: RECON7 COPIES: run_arm_r7 = run_arm_d + 5 R7 lines; probe_arm_r7 = probe_arm_x + 2 R7 lines
+    _ev("RECON7 COPIES: run_arm_r7 = run_arm_d + %d R7 lines; probe_arm_r7 = probe_arm_x + %d R7 lines" % (
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_streams_measure_plumbing
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:685: Evidence: RECON7 X1 (CPU plumbing): 26 configurations; planted F -> stop 'EXACT failed in FG', failed ['FG-EXACT']
+    _ev("RECON7 X1 (CPU plumbing): %d configurations; planted F -> stop %r, failed %s" % (len(names), stop, bad))
+
+benchmarks/Efficiency/tests_cpu/test_recon7.py::test_streams_run_shapes
+  /mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/tests_cpu/test_recon7.py:779: Evidence: RECON7 X1 (CPU run_shapes): free / UNION / IDS / setup deadline / late wall / exception each STOP THE RUN; GRP-EQ governs GRP only
+    _ev("RECON7 X1 (CPU run_shapes): free / UNION / IDS / setup deadline / late wall / exception each STOP THE RUN; "
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED benchmarks/Efficiency/tests_cpu/test_recon7.py::test_notes_recon7 - as...
+SKIPPED [1] benchmarks/Efficiency/tests_cpu/test_recon7.py:1016: not a clean checkout of /mnt/beegfs/ojerbi/nosi-r2-recon7: the full DRYRUN needs one
+1 failed, 9 passed, 1 skipped, 5 deselected, 3 warnings in 6.25s

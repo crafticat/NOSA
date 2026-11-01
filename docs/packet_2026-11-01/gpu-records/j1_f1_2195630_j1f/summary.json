@@ -1,0 +1,1238 @@
+{
+ "gates": [
+  {
+   "detail": "FORK union_len min 72 max 72 (want 72); FORK1R min 64 max 64 (want 64)",
+   "must": true,
+   "name": "C128_B216-UNION",
+   "passed": true
+  },
+  {
+   "detail": "3D path taken (segment maxima written): True",
+   "must": false,
+   "name": "C128_B216-FORK3D2-PATH",
+   "passed": true
+  },
+  {
+   "detail": "3D path taken (segment maxima written): True",
+   "must": false,
+   "name": "C128_B216-FORK3D4-PATH",
+   "passed": true
+  },
+  {
+   "detail": "3D path taken (segment maxima written): True",
+   "must": false,
+   "name": "C128_B216-FORK3D8-PATH",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.424e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)",
+   "must": true,
+   "name": "C128_B216-FORK-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.424e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)",
+   "must": true,
+   "name": "C128_B216-FORKT-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.104e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)",
+   "must": true,
+   "name": "C128_B216-FORK1R-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.013e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)",
+   "must": true,
+   "name": "C128_B216-NS1R1-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.715e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)",
+   "must": true,
+   "name": "C128_B216-NS1x4-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 8.640e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)",
+   "must": true,
+   "name": "C128_B216-FLASHU1-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.903e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)",
+   "must": true,
+   "name": "C128_B216-NSRU-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.886e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)",
+   "must": false,
+   "name": "C128_B216-FORK3D2-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.581e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)",
+   "must": false,
+   "name": "C128_B216-FORK3D4-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.822e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)",
+   "must": false,
+   "name": "C128_B216-FORK3D8-NUM",
+   "passed": true
+  },
+  {
+   "detail": "FORKT = FORK bit for bit: True",
+   "must": true,
+   "name": "C128_B216-FORKT-EQ",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": true,
+   "name": "C128_B216-FORK-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": true,
+   "name": "C128_B216-FORKT-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": true,
+   "name": "C128_B216-FORK1R-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": true,
+   "name": "C128_B216-NS1R1-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": true,
+   "name": "C128_B216-NS1x4-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": true,
+   "name": "C128_B216-FLASHU1-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": true,
+   "name": "C128_B216-NSRU-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": false,
+   "name": "C128_B216-FORK3D2-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": false,
+   "name": "C128_B216-FORK3D4-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": false,
+   "name": "C128_B216-FORK3D8-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "wall 42.7 s (limit 300); stop None",
+   "must": true,
+   "name": "C128_B216-BUDGET",
+   "passed": true
+  },
+  {
+   "detail": "10 variants x 10 passes of 32 calls",
+   "must": true,
+   "name": "C128_B216-RUN",
+   "passed": true
+  },
+  {
+   "detail": "FORK union_len min 72 max 72 (want 72); FORK1R min 64 max 64 (want 64)",
+   "must": true,
+   "name": "C73_B318-UNION",
+   "passed": true
+  },
+  {
+   "detail": "3D path taken (segment maxima written): True",
+   "must": false,
+   "name": "C73_B318-FORK3D2-PATH",
+   "passed": true
+  },
+  {
+   "detail": "3D path taken (segment maxima written): True",
+   "must": false,
+   "name": "C73_B318-FORK3D4-PATH",
+   "passed": true
+  },
+  {
+   "detail": "3D path taken (segment maxima written): True",
+   "must": false,
+   "name": "C73_B318-FORK3D8-PATH",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.193e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)",
+   "must": true,
+   "name": "C73_B318-FORK-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.193e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)",
+   "must": true,
+   "name": "C73_B318-FORKT-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.193e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)",
+   "must": true,
+   "name": "C73_B318-FORK1R-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 1.006e-05 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)",
+   "must": true,
+   "name": "C73_B318-NS1R1-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 1.006e-05 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)",
+   "must": true,
+   "name": "C73_B318-NS1x4-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 8.300e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)",
+   "must": true,
+   "name": "C73_B318-FLASHU1-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.959e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)",
+   "must": true,
+   "name": "C73_B318-NSRU-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.729e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)",
+   "must": false,
+   "name": "C73_B318-FORK3D2-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.165e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)",
+   "must": false,
+   "name": "C73_B318-FORK3D4-NUM",
+   "passed": true
+  },
+  {
+   "detail": "max |out - float64| 9.883e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)",
+   "must": false,
+   "name": "C73_B318-FORK3D8-NUM",
+   "passed": true
+  },
+  {
+   "detail": "FORKT = FORK bit for bit: True",
+   "must": true,
+   "name": "C73_B318-FORKT-EQ",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": true,
+   "name": "C73_B318-FORK-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": true,
+   "name": "C73_B318-FORKT-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": true,
+   "name": "C73_B318-FORK1R-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": true,
+   "name": "C73_B318-NS1R1-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": true,
+   "name": "C73_B318-NS1x4-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": true,
+   "name": "C73_B318-FLASHU1-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": true,
+   "name": "C73_B318-NSRU-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": false,
+   "name": "C73_B318-FORK3D2-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": false,
+   "name": "C73_B318-FORK3D4-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "output after the last pass = the first output, bit for bit: True",
+   "must": false,
+   "name": "C73_B318-FORK3D8-EXACT",
+   "passed": true
+  },
+  {
+   "detail": "wall 11.1 s (limit 300); stop None",
+   "must": true,
+   "name": "C73_B318-BUDGET",
+   "passed": true
+  },
+  {
+   "detail": "10 variants x 10 passes of 32 calls",
+   "must": true,
+   "name": "C73_B318-RUN",
+   "passed": true
+  },
+  {
+   "detail": "run wall 53.9 s (limit 900)",
+   "must": true,
+   "name": "RUN-WALL",
+   "passed": true
+  }
+ ],
+ "meta": {
+  "base_commit": "7ebb84fd73dac6c6139310cbab1898af50752894",
+  "block_bytes": 32896,
+  "cell": "j1f",
+  "fork_launch": {
+   "num_stages": 3,
+   "num_warps": 4,
+   "tile_size": 64
+  },
+  "gpu": "NVIDIA A100 80GB PCIe",
+  "grant": "2026-10-31T13:22:30Z",
+  "layers": 32,
+  "reps": 10,
+  "row_shift": [
+   0,
+   3,
+   5,
+   8
+  ],
+  "sample": 8,
+  "seed": 7,
+  "segments": [
+   2,
+   4,
+   8
+  ],
+  "shapes": {
+   "73": 318,
+   "128": 216
+  },
+  "splits": 4,
+  "tol": 0.001,
+  "torch": "2.6.0+cu124",
+  "union": 72,
+  "warmup": 2
+ },
+ "shapes": {
+  "C128_B216": {
+   "B": 216,
+   "C": 128,
+   "meta": {
+    "B": 216,
+    "E": 864,
+    "NB": 15560,
+    "sample": [
+     0,
+     31,
+     61,
+     92,
+     123,
+     154,
+     184,
+     215
+    ],
+    "segments": [
+     2,
+     4,
+     8
+    ],
+    "union": 72
+   },
+   "stop": null,
+   "summary": {
+    "best_3d": {
+     "ratio": 1.2447,
+     "saving_ms_per_pass": -8.421,
+     "variant": "FORK3D2"
+    },
+    "fork_minus_flashu1_ms_per_pass": 12.503,
+    "per": {
+     "FLASHU1": {
+      "bytes": 1023197184,
+      "logical_tb_s": 1.4946,
+      "ms_call": 0.68458,
+      "ms_pass": 21.9064,
+      "pages": 31104,
+      "rows": 216,
+      "valid": true
+     },
+     "FORK": {
+      "bytes": 1023197184,
+      "logical_tb_s": 0.9515,
+      "ms_call": 1.07531,
+      "ms_pass": 34.41,
+      "pages": 31104,
+      "rows": 864,
+      "valid": true
+     },
+     "FORK1R": {
+      "bytes": 909508608,
+      "logical_tb_s": 1.31,
+      "ms_call": 0.69427,
+      "ms_pass": 22.2167,
+      "pages": 27648,
+      "rows": 216,
+      "valid": true
+     },
+     "FORK3D2": {
+      "bytes": 1023197184,
+      "logical_tb_s": 0.7644,
+      "ms_call": 1.33848,
+      "ms_pass": 42.8314,
+      "pages": 31104,
+      "rows": 864,
+      "valid": true
+     },
+     "FORK3D4": {
+      "bytes": 1023197184,
+      "logical_tb_s": 0.7251,
+      "ms_call": 1.41104,
+      "ms_pass": 45.1533,
+      "pages": 31104,
+      "rows": 864,
+      "valid": true
+     },
+     "FORK3D8": {
+      "bytes": 1023197184,
+      "logical_tb_s": 0.6519,
+      "ms_call": 1.56965,
+      "ms_pass": 50.2287,
+      "pages": 31104,
+      "rows": 864,
+      "valid": true
+     },
+     "FORKT": {
+      "bytes": 1023197184,
+      "logical_tb_s": 0.9808,
+      "ms_call": 1.04322,
+      "ms_pass": 33.3829,
+      "pages": 31104,
+      "rows": 864,
+      "valid": true
+     },
+     "NS1R1": {
+      "bytes": 909508608,
+      "logical_tb_s": 1.4854,
+      "ms_call": 0.61229,
+      "ms_pass": 19.5932,
+      "pages": 27648,
+      "rows": 216,
+      "valid": true
+     },
+     "NS1x4": {
+      "bytes": 3638034432,
+      "logical_tb_s": 1.5256,
+      "ms_call": 2.38461,
+      "ms_pass": 76.3075,
+      "pages": 110592,
+      "rows": 864,
+      "valid": true
+     },
+     "NSRU": {
+      "bytes": 3865411584,
+      "logical_tb_s": 2.3665,
+      "ms_call": 1.63338,
+      "ms_pass": 52.268,
+      "pages": 117504,
+      "rows": 864,
+      "valid": true
+     }
+    },
+    "ratios": {
+     "FORK/FLASHU1": {
+      "note": null,
+      "ratio": 1.5708,
+      "valid": true,
+      "what": "equal logical bytes (union 72): the 4-row tile's cost at the same bytes"
+     },
+     "FORK/NS1x4": {
+      "note": null,
+      "ratio": 0.4509,
+      "valid": true,
+      "what": "equal rows (4 per request): the shared read's saving vs the baseline's 4 calls"
+     },
+     "FORK1R/NS1R1": {
+      "note": null,
+      "ratio": 1.1339,
+      "valid": true,
+      "what": "equal rows and bytes (1 row, 64 pages): the fork kernel's per-byte efficiency"
+     },
+     "FORK3D2/FORK": {
+      "note": null,
+      "ratio": 1.2447,
+      "valid": true,
+      "what": "the 3D split (2 segments) vs the 2D launch"
+     },
+     "FORK3D4/FORK": {
+      "note": null,
+      "ratio": 1.3122,
+      "valid": true,
+      "what": "the 3D split (4 segments) vs the 2D launch"
+     },
+     "FORK3D8/FORK": {
+      "note": null,
+      "ratio": 1.4597,
+      "valid": true,
+      "what": "the 3D split (8 segments) vs the 2D launch"
+     },
+     "FORKT/FORK": {
+      "note": null,
+      "ratio": 0.9702,
+      "valid": true,
+      "what": "the in-kernel union build's cost"
+     },
+     "NSRU/FORK": {
+      "note": null,
+      "ratio": 1.519,
+      "valid": true,
+      "what": "the shipped kernel's own sharing (L2) vs the fork"
+     }
+    },
+    "stats_ms": {
+     "FLASHU1": {
+      "cv": 0.0036,
+      "max": 21.9587,
+      "median": 21.9064,
+      "min": 21.6668,
+      "n": 10,
+      "q1": 21.8844,
+      "q3": 21.9497
+     },
+     "FORK": {
+      "cv": 0.0027,
+      "max": 34.4596,
+      "median": 34.41,
+      "min": 34.1309,
+      "n": 10,
+      "q1": 34.3434,
+      "q3": 34.431
+     },
+     "FORK1R": {
+      "cv": 0.0027,
+      "max": 22.313,
+      "median": 22.2167,
+      "min": 22.1276,
+      "n": 10,
+      "q1": 22.1519,
+      "q3": 22.2764
+     },
+     "FORK3D2": {
+      "cv": 0.0205,
+      "max": 44.8891,
+      "median": 42.8314,
+      "min": 41.3071,
+      "n": 10,
+      "q1": 42.6225,
+      "q3": 43.2817
+     },
+     "FORK3D4": {
+      "cv": 0.0215,
+      "max": 48.3564,
+      "median": 45.1533,
+      "min": 44.8932,
+      "n": 10,
+      "q1": 44.9805,
+      "q3": 45.3957
+     },
+     "FORK3D8": {
+      "cv": 0.01,
+      "max": 51.7304,
+      "median": 50.2287,
+      "min": 50.0951,
+      "n": 10,
+      "q1": 50.1309,
+      "q3": 50.4579
+     },
+     "FORKT": {
+      "cv": 0.0032,
+      "max": 33.5862,
+      "median": 33.3829,
+      "min": 33.2206,
+      "n": 10,
+      "q1": 33.3409,
+      "q3": 33.5227
+     },
+     "NS1R1": {
+      "cv": 0.0009,
+      "max": 19.6116,
+      "median": 19.5932,
+      "min": 19.5533,
+      "n": 10,
+      "q1": 19.5784,
+      "q3": 19.6006
+     },
+     "NS1x4": {
+      "cv": 0.0008,
+      "max": 76.3945,
+      "median": 76.3075,
+      "min": 76.1672,
+      "n": 10,
+      "q1": 76.2683,
+      "q3": 76.3333
+     },
+     "NSRU": {
+      "cv": 0.0092,
+      "max": 53.2705,
+      "median": 52.268,
+      "min": 51.6209,
+      "n": 10,
+      "q1": 51.9066,
+      "q3": 52.6321
+     }
+    }
+   },
+   "times_ms": {
+    "FLASHU1": [
+     21.950464248657227,
+     21.917695999145508,
+     21.87059211730957,
+     21.90438461303711,
+     21.908479690551758,
+     21.66681671142578,
+     21.88902473449707,
+     21.958656311035156,
+     21.949440002441406,
+     21.90131187438965
+    ],
+    "FORK": [
+     34.130943298339844,
+     34.42483139038086,
+     34.44633483886719,
+     34.28351974487305,
+     34.3633918762207,
+     34.39206314086914,
+     34.41664123535156,
+     34.45964813232422,
+     34.40332794189453,
+     34.42585754394531
+    ],
+    "FORK1R": [
+     22.208511352539062,
+     22.12761688232422,
+     22.153215408325195,
+     22.312959671020508,
+     22.148096084594727,
+     22.215679168701172,
+     22.27302360534668,
+     22.245376586914062,
+     22.28633689880371,
+     22.217727661132812
+    ],
+    "FORK3D2": [
+     43.87839889526367,
+     43.0827522277832,
+     42.8513298034668,
+     42.418174743652344,
+     42.81139373779297,
+     44.88908767700195,
+     42.896385192871094,
+     41.30713653564453,
+     42.69055938720703,
+     42.78886413574219
+    ],
+    "FORK3D4": [
+     45.30995178222656,
+     45.325313568115234,
+     45.20652770996094,
+     44.986366271972656,
+     44.96281433105469,
+     45.606910705566406,
+     45.100032806396484,
+     44.893184661865234,
+     48.356353759765625,
+     45.069313049316406
+    ],
+    "FORK3D8": [
+     50.2558708190918,
+     50.118656158447266,
+     50.0951042175293,
+     50.27635192871094,
+     50.135040283203125,
+     50.22003173828125,
+     50.15244674682617,
+     50.2374382019043,
+     51.00236892700195,
+     51.730430603027344
+    ],
+    "FORKT": [
+     33.34553527832031,
+     33.22060775756836,
+     33.41721725463867,
+     33.368064880371094,
+     33.32710266113281,
+     33.512447357177734,
+     33.39775848388672,
+     33.586177825927734,
+     33.553409576416016,
+     33.35987091064453
+    ],
+    "NS1R1": [
+     19.582975387573242,
+     19.600383758544922,
+     19.564544677734375,
+     19.611648559570312,
+     19.553279876708984,
+     19.594240188598633,
+     19.592191696166992,
+     19.59014320373535,
+     19.601408004760742,
+     19.596288681030273
+    ],
+    "NS1x4": [
+     76.32179260253906,
+     76.30540466308594,
+     76.23987579345703,
+     76.39449310302734,
+     76.16716766357422,
+     76.29618835449219,
+     76.30950164794922,
+     76.32486724853516,
+     76.35865783691406,
+     76.27776336669922
+    ],
+    "NSRU": [
+     53.27052688598633,
+     52.30694580078125,
+     52.331520080566406,
+     51.91680145263672,
+     51.62086486816406,
+     53.0145263671875,
+     52.118526458740234,
+     52.50457763671875,
+     51.87583923339844,
+     52.22911834716797
+    ]
+   },
+   "wall_s": 42.7,
+   "warmup_ms": {
+    "FLASHU1": [
+     21.934080123901367,
+     21.934080123901367
+    ],
+    "FORK": [
+     34.456031799316406,
+     34.47603225708008
+    ],
+    "FORK1R": [
+     22.30681610107422,
+     22.131711959838867
+    ],
+    "FORK3D2": [
+     43.461631774902344,
+     39.89401626586914
+    ],
+    "FORK3D4": [
+     44.11699295043945,
+     43.66233444213867
+    ],
+    "FORK3D8": [
+     50.1104621887207,
+     49.4653434753418
+    ],
+    "FORKT": [
+     33.41004943847656,
+     33.74284744262695
+    ],
+    "NS1R1": [
+     19.628032684326172,
+     19.618816375732422
+    ],
+    "NS1x4": [
+     76.73548889160156,
+     76.5317153930664
+    ],
+    "NSRU": [
+     51.730430603027344,
+     53.90745544433594
+    ]
+   }
+  },
+  "C73_B318": {
+   "B": 318,
+   "C": 73,
+   "meta": {
+    "B": 318,
+    "E": 1272,
+    "NB": 22904,
+    "sample": [
+     0,
+     45,
+     91,
+     136,
+     181,
+     226,
+     272,
+     317
+    ],
+    "segments": [
+     2,
+     4,
+     8
+    ],
+    "union": 72
+   },
+   "stop": null,
+   "summary": {
+    "best_3d": {
+     "ratio": 1.2289,
+     "saving_ms_per_pass": -11.697,
+     "variant": "FORK3D2"
+    },
+    "fork_minus_flashu1_ms_per_pass": 19.128,
+    "per": {
+     "FLASHU1": {
+      "bytes": 1506373632,
+      "logical_tb_s": 1.5079,
+      "ms_call": 0.99899,
+      "ms_pass": 31.9677,
+      "pages": 45792,
+      "rows": 318,
+      "valid": true
+     },
+     "FORK": {
+      "bytes": 1506373632,
+      "logical_tb_s": 0.9434,
+      "ms_call": 1.59675,
+      "ms_pass": 51.0961,
+      "pages": 45792,
+      "rows": 1272,
+      "valid": true
+     },
+     "FORK1R": {
+      "bytes": 1338998784,
+      "logical_tb_s": 1.5433,
+      "ms_call": 0.86765,
+      "ms_pass": 27.7647,
+      "pages": 40704,
+      "rows": 318,
+      "valid": true
+     },
+     "FORK3D2": {
+      "bytes": 1506373632,
+      "logical_tb_s": 0.7677,
+      "ms_call": 1.96229,
+      "ms_pass": 62.7932,
+      "pages": 45792,
+      "rows": 1272,
+      "valid": true
+     },
+     "FORK3D4": {
+      "bytes": 1506373632,
+      "logical_tb_s": 0.7394,
+      "ms_call": 2.03733,
+      "ms_pass": 65.1945,
+      "pages": 45792,
+      "rows": 1272,
+      "valid": true
+     },
+     "FORK3D8": {
+      "bytes": 1506373632,
+      "logical_tb_s": 0.6536,
+      "ms_call": 2.30457,
+      "ms_pass": 73.7464,
+      "pages": 45792,
+      "rows": 1272,
+      "valid": true
+     },
+     "FORKT": {
+      "bytes": 1506373632,
+      "logical_tb_s": 0.9676,
+      "ms_call": 1.55686,
+      "ms_pass": 49.8196,
+      "pages": 45792,
+      "rows": 1272,
+      "valid": true
+     },
+     "NS1R1": {
+      "bytes": 1338998784,
+      "logical_tb_s": 1.505,
+      "ms_call": 0.88968,
+      "ms_pass": 28.4698,
+      "pages": 40704,
+      "rows": 318,
+      "valid": true
+     },
+     "NS1x4": {
+      "bytes": 5355995136,
+      "logical_tb_s": 1.5273,
+      "ms_call": 3.5068,
+      "ms_pass": 112.2176,
+      "pages": 162816,
+      "rows": 1272,
+      "valid": true
+     },
+     "NSRU": {
+      "bytes": 5690744832,
+      "logical_tb_s": 2.3361,
+      "ms_call": 2.436,
+      "ms_pass": 77.952,
+      "pages": 172992,
+      "rows": 1272,
+      "valid": true
+     }
+    },
+    "ratios": {
+     "FORK/FLASHU1": {
+      "note": null,
+      "ratio": 1.5984,
+      "valid": true,
+      "what": "equal logical bytes (union 72): the 4-row tile's cost at the same bytes"
+     },
+     "FORK/NS1x4": {
+      "note": null,
+      "ratio": 0.4553,
+      "valid": true,
+      "what": "equal rows (4 per request): the shared read's saving vs the baseline's 4 calls"
+     },
+     "FORK1R/NS1R1": {
+      "note": null,
+      "ratio": 0.9752,
+      "valid": true,
+      "what": "equal rows and bytes (1 row, 64 pages): the fork kernel's per-byte efficiency"
+     },
+     "FORK3D2/FORK": {
+      "note": null,
+      "ratio": 1.2289,
+      "valid": true,
+      "what": "the 3D split (2 segments) vs the 2D launch"
+     },
+     "FORK3D4/FORK": {
+      "note": null,
+      "ratio": 1.2759,
+      "valid": true,
+      "what": "the 3D split (4 segments) vs the 2D launch"
+     },
+     "FORK3D8/FORK": {
+      "note": null,
+      "ratio": 1.4433,
+      "valid": true,
+      "what": "the 3D split (8 segments) vs the 2D launch"
+     },
+     "FORKT/FORK": {
+      "note": null,
+      "ratio": 0.975,
+      "valid": true,
+      "what": "the in-kernel union build's cost"
+     },
+     "NSRU/FORK": {
+      "note": null,
+      "ratio": 1.5256,
+      "valid": true,
+      "what": "the shipped kernel's own sharing (L2) vs the fork"
+     }
+    },
+    "stats_ms": {
+     "FLASHU1": {
+      "cv": 0.0028,
+      "max": 32.1567,
+      "median": 31.9677,
+      "min": 31.828,
+      "n": 10,
+      "q1": 31.9427,
+      "q3": 32.0735
+     },
+     "FORK": {
+      "cv": 0.0022,
+      "max": 51.2287,
+      "median": 51.0961,
+      "min": 50.8518,
+      "n": 10,
+      "q1": 50.9691,
+      "q3": 51.1401
+     },
+     "FORK1R": {
+      "cv": 0.0008,
+      "max": 27.7955,
+      "median": 27.7647,
+      "min": 27.7094,
+      "n": 10,
+      "q1": 27.7565,
+      "q3": 27.7801
+     },
+     "FORK3D2": {
+      "cv": 0.009,
+      "max": 63.3907,
+      "median": 62.7932,
+      "min": 61.3489,
+      "n": 10,
+      "q1": 62.6153,
+      "q3": 63.2507
+     },
+     "FORK3D4": {
+      "cv": 0.0277,
+      "max": 71.2755,
+      "median": 65.1945,
+      "min": 65.0476,
+      "n": 10,
+      "q1": 65.087,
+      "q3": 65.4502
+     },
+     "FORK3D8": {
+      "cv": 0.0058,
+      "max": 74.8288,
+      "median": 73.7464,
+      "min": 73.2273,
+      "n": 10,
+      "q1": 73.4548,
+      "q3": 73.8616
+     },
+     "FORKT": {
+      "cv": 0.0052,
+      "max": 49.9978,
+      "median": 49.8196,
+      "min": 49.0373,
+      "n": 10,
+      "q1": 49.6596,
+      "q3": 49.8918
+     },
+     "NS1R1": {
+      "cv": 0.0011,
+      "max": 28.5297,
+      "median": 28.4698,
+      "min": 28.4396,
+      "n": 10,
+      "q1": 28.4413,
+      "q3": 28.5041
+     },
+     "NS1x4": {
+      "cv": 0.0011,
+      "max": 112.5274,
+      "median": 112.2176,
+      "min": 112.041,
+      "n": 10,
+      "q1": 112.1359,
+      "q3": 112.2757
+     },
+     "NSRU": {
+      "cv": 0.0139,
+      "max": 80.0307,
+      "median": 77.952,
+      "min": 76.7734,
+      "n": 10,
+      "q1": 77.2017,
+      "q3": 79.5899
+     }
+    }
+   },
+   "times_ms": {
+    "FLASHU1": [
+     31.95699119567871,
+     32.06553649902344,
+     31.95903968811035,
+     32.156673431396484,
+     31.944704055786133,
+     31.82796859741211,
+     32.068607330322266,
+     31.97644805908203,
+     31.936511993408203,
+     32.08806228637695
+    ],
+    "FORK": [
+     50.99417495727539,
+     50.99110412597656,
+     50.90304183959961,
+     51.130367279052734,
+     51.102718353271484,
+     51.08940887451172,
+     50.85184097290039,
+     51.12934494018555,
+     51.22867202758789,
+     51.169281005859375
+    ],
+    "FORK1R": [
+     27.779071807861328,
+     27.76473617553711,
+     27.75347137451172,
+     27.78316879272461,
+     27.709440231323242,
+     27.757568359375,
+     27.795455932617188,
+     27.77292823791504,
+     27.76473617553711,
+     27.76166343688965
+    ],
+    "FORK3D2": [
+     62.679039001464844,
+     62.42406463623047,
+     62.722049713134766,
+     63.098880767822266,
+     62.77017593383789,
+     63.34975814819336,
+     63.2176628112793,
+     61.3488655090332,
+     63.39072036743164,
+     62.81625747680664
+    ],
+    "FORK3D4": [
+     65.0987548828125,
+     65.18169403076172,
+     65.04755401611328,
+     65.70291137695312,
+     65.36601257324219,
+     65.2072982788086,
+     65.21139526367188,
+     65.05165100097656,
+     71.27552032470703,
+     65.17350769042969
+    ],
+    "FORK3D8": [
+     73.23750305175781,
+     73.73004913330078,
+     73.22726440429688,
+     73.52729797363281,
+     73.82015991210938,
+     73.78227233886719,
+     73.7423324584961,
+     73.75052642822266,
+     73.98604583740234,
+     74.82879638671875
+    ],
+    "FORKT": [
+     49.997825622558594,
+     49.03731155395508,
+     49.77151870727539,
+     49.8790397644043,
+     49.800193786621094,
+     49.660926818847656,
+     49.65580749511719,
+     49.930240631103516,
+     49.8606071472168,
+     49.83910369873047
+    ],
+    "NS1R1": [
+     28.5296630859375,
+     28.479488372802734,
+     28.440576553344727,
+     28.441600799560547,
+     28.460031509399414,
+     28.493824005126953,
+     28.443647384643555,
+     28.5163516998291,
+     28.499967575073242,
+     28.439552307128906
+    ],
+    "NS1x4": [
+     112.22528076171875,
+     112.52735900878906,
+     112.27442932128906,
+     112.20992279052734,
+     112.04096221923828,
+     112.13619232177734,
+     112.27954864501953,
+     112.17407989501953,
+     112.25497436523438,
+     112.13516998291016
+    ],
+    "NSRU": [
+     77.23212432861328,
+     77.97657775878906,
+     77.11027526855469,
+     79.71123504638672,
+     76.77337646484375,
+     77.92742156982422,
+     78.32166290283203,
+     79.5494384765625,
+     77.89568328857422,
+     80.03072357177734
+    ]
+   },
+   "wall_s": 11.1,
+   "warmup_ms": {
+    "FLASHU1": [
+     31.97439956665039,
+     31.928319931030273
+    ],
+    "FORK": [
+     50.633216857910156,
+     51.10579299926758
+    ],
+    "FORK1R": [
+     27.75859260559082,
+     27.73811149597168
+    ],
+    "FORK3D2": [
+     62.39129638671875,
+     58.038272857666016
+    ],
+    "FORK3D4": [
+     64.11468505859375,
+     63.826942443847656
+    ],
+    "FORK3D8": [
+     73.25491333007812,
+     72.87602996826172
+    ],
+    "FORKT": [
+     49.930240631103516,
+     49.8606071472168
+    ],
+    "NS1R1": [
+     28.486656188964844,
+     28.5798397064209
+    ],
+    "NS1x4": [
+     112.4290542602539,
+     112.24166107177734
+    ],
+    "NSRU": [
+     76.98841857910156,
+     79.63442993164062
+    ]
+   }
+  }
+ }
+}

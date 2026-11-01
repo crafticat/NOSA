@@ -1,0 +1,140 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+....................FF.....                                              [100%]
+=================================== FAILURES ===================================
+____________________________ test_bf1_gilfree_batch ____________________________
+
+gfext = <module 'gilfree_pack_v3' from '/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/pytest-of-ojerbi/pytest-333/gilfree3_bf10/gilfree_pack_v3.so'>
+
+    def test_bf1_gilfree_batch(gfext):
+        """THE BATCH (bf1b: the worker's cost per CALL bound it): a slow worker (stall 20 ms per job) builds a backlog; the
+        worker takes up to 8 queued jobs of one epoch per batch and makes ONE release of all their layers
+        (NativePipe.submit; cap_groups 1: one chunk per item, so chunks = groups) and ONE commit. The claim, the gates and the counters hold;
+        preconditions (L34): batches of several jobs and several layers ran."""
+        _plain("GUDKC")
+        ref = _plain("GUDKCD")
+        cls = X.W.pkg_load("r2_transport_gilfree_v3").GilfreeTransport
+        ev = _run_bf("timing", worker="thread", packer="gilfree", gf=dict(ext=gfext, cls=cls, cap_groups=1), threads=2,
+                     stall_ms=20.0, late="defer", late_wait_ms=60000.0, batch=8)
+        bad = TS._diff(ref, ev, skip=DIFF_RD, tensors_skip=DIFF_T)
+        assert bad == [], bad[:10]
+        bf = ev["rd"]["bf"]
+        gs = _gates(ev, "timing")
+        assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
+        tp = bf["transport"]
+        assert bf["error"] is None and bf["jobs"] == bf["issued"] + bf["late"] + bf["empty_jobs"], bf
+>       assert bf["batch_jobs_max"] > 1 and bf["batch_layers_max"] > 1 and bf["batches"] < bf["jobs"], bf
+E       AssertionError: {'X': 129, 'acct': True, 'barrier_ms': [], 'barrier_ms_median': None, ...}
+E       assert (1 > 1)
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py:456: AssertionError
+________________________________ test_bf1_carry ________________________________
+
+    def test_bf1_carry():
+        """A job that does not fit the batch's landing entry (n_cap 1: one item per batch) is CARRIED into the next batch,
+        not dropped: carried > 0, the claim, the gates and the counters hold (torch packer, thread worker, backlog)."""
+        ref = _plain("GUDKCD")
+        ev = _run_bf("timing", worker="thread", stall_ms=20.0, late="defer", late_wait_ms=60000.0, n_cap=1, batch=8)
+        bad = TS._diff(ref, ev, skip=DIFF_RD, tensors_skip=DIFF_T)
+        assert bad == [], bad[:10]
+        bf = ev["rd"]["bf"]
+        gs = _gates(ev, "timing")
+        assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
+        assert bf["error"] is None and bf["jobs"] == bf["issued"] + bf["late"] + bf["empty_jobs"], bf
+>       assert bf.get("carried", 0) > 0 and bf["batch_jobs_max"] == 1, bf
+E       AssertionError: {'X': 129, 'acct': True, 'barrier_ms': [], 'barrier_ms_median': None, ...}
+E       assert (0 > 0)
+E        +  where 0 = <built-in method get of dict object at 0x7f4dd8c1ac00>('carried', 0)
+E        +    where <built-in method get of dict object at 0x7f4dd8c1ac00> = {'X': 129, 'acct': True, 'barrier_ms': [], 'barrier_ms_median': None, ...}.get
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py:476: AssertionError
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_copy
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:154: Evidence: BF1 COPY: run_arm_bf = run_arm_d + 5 BF1 lines
+    _ev("BF1 COPY: run_arm_bf = run_arm_d + %d BF1 lines" % len(extra))
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_equal[timing]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:292: Evidence: BF1 EQUAL timing: rounds 30; NEW blocks 712 -> 94 (0.132); keep fetched 339 -> 60, window hits 454 -> 793; bf jobs 120, issued 62, items seen 1697, have 1236, sent 461, committed 461, revived 0, no room 0, used store 141 + window 158, unused 162, pending 0; check {'overflow': 0, 'dup': 0, 'missing': 0, 'bytes_bad': 0, 'bytes_checked': 0, 'win_checked': 0}
+    _ev("BF1 EQUAL %s: rounds %d; NEW blocks %d -> %d (%.3f); keep fetched %d -> %d, window hits %d -> %d; bf jobs %d, "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_equal[check]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:292: Evidence: BF1 EQUAL check: rounds 30; NEW blocks 712 -> 94 (0.132); keep fetched 339 -> 60, window hits 454 -> 793; bf jobs 120, issued 62, items seen 1697, have 1236, sent 461, committed 461, revived 0, no room 0, used store 141 + window 158, unused 162, pending 0; check {'overflow': 0, 'dup': 0, 'missing': 0, 'bytes_bad': 0, 'bytes_checked': 846, 'win_checked': 793}
+    _ev("BF1 EQUAL %s: rounds %d; NEW blocks %d -> %d (%.3f); keep fetched %d -> %d, window hits %d -> %d; bf jobs %d, "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_thread
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:318: Evidence: BF1 THREAD: jobs 120, issued 62, late 0, empty 58; sent 461, committed 461, used 299
+    _ev("BF1 THREAD: jobs %d, issued %d, late %d, empty %d; sent %d, committed %d, used %d" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[off-torch-drop]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:351: Evidence: BF1 REPORT off / torch / drop: device 20640 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[off-gilfree-defer]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:351: Evidence: BF1 REPORT off / gilfree / defer: device 20640 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[ce-torch-drop]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:351: Evidence: BF1 REPORT ce / torch / drop: device 67948704 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[ce-torch-defer]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:351: Evidence: BF1 REPORT ce / torch / defer: device 67948704 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[ce-gilfree-drop]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:351: Evidence: BF1 REPORT ce / gilfree / drop: device 67948704 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[ce-gilfree-defer]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:351: Evidence: BF1 REPORT ce / gilfree / defer: device 67948704 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_late[drop]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:373: Evidence: BF1 LATE drop: jobs 120, issued 2, late 118 (queued 118, packing None, passed None), deferred None / committed None, no room deferred 0, host wait None s, used 62
+    _ev("BF1 LATE %s: jobs %d, issued %d, late %d (queued %s, packing %s, passed %s), deferred %s / committed %s, "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_late[defer]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:373: Evidence: BF1 LATE defer: jobs 120, issued 62, late 0 (queued None, packing None, passed None), deferred 60 / committed 60, no room deferred 0, host wait 19.760952489450574 s, used 299
+    _ev("BF1 LATE %s: jobs %d, issued %d, late %d (queued %s, packing %s, passed %s), deferred %s / committed %s, "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_plants[wrong_bytes]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:388: Evidence: BF1 PLANT wrong_bytes: caught (EQF committed tokens unequal to L4PTFD's: 341 of 384; fingerprints compared 384 columns, max equal False, sum equal False; s; bytes_bad 889)
+    _ev("BF1 PLANT %s: caught (EQF %s; bytes_bad %d)" % (bneg, gs["L4PTFDGUDKWCDB-EQF"][3][:120],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_plants[no_copy]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:388: Evidence: BF1 PLANT no_copy: caught (EQF committed tokens unequal to L4PTFD's: 303 of 384; fingerprints compared 384 columns, max equal False, sum equal False; s; bytes_bad 1558)
+    _ev("BF1 PLANT %s: caught (EQF %s; bytes_bad %d)" % (bneg, gs["L4PTFDGUDKWCDB-EQF"][3][:120],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_gilfree[inline]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:421: Evidence: BF1 GILFREE inline: NEW 712 -> 94; sent 461, committed 461, used 299, late 0; transport {'releases': 62, 'groups': 461, 'chunks': 62, 'pack_ns': 5517541, 'threads_min': 2, 'threads_max': 2}
+    _ev("BF1 GILFREE %s: NEW %d -> %d; sent %d, committed %d, used %d, late %d; transport %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_gilfree[thread]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:421: Evidence: BF1 GILFREE thread: NEW 712 -> 94; sent 461, committed 461, used 299, late 0; transport {'releases': 62, 'groups': 461, 'chunks': 62, 'pack_ns': 4747911, 'threads_min': 2, 'threads_max': 2}
+    _ev("BF1 GILFREE %s: NEW %d -> %d; sent %d, committed %d, used %d, late %d; transport %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_store_x[False]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:506: Evidence: BF1 STORE X 257 (warm False): events [('loc2', 4, None)]; COMPILE False; COUNTS True
+    _ev("BF1 STORE X %d (warm %s): events %s; COMPILE %s; COUNTS %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_store_x[True]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:506: Evidence: BF1 STORE X 193 (warm True): events [('loc2', 0, 'store X 193')]; COMPILE True; COUNTS True
+    _ev("BF1 STORE X %d (warm %s): events %s; COMPILE %s; COUNTS %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_step_script_bf1
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-test/benchmarks/Efficiency/tests_cpu/test_bf1.py:604: Evidence: BF1 STEP: cells ['bf1a', 'bf1b', 'bf1m'] parse
+    _ev("BF1 STEP: cells %s parse" % sorted(CELLS))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_gilfree_batch - ...
+FAILED benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_carry - Assertio...
+2 failed, 25 passed, 19 warnings in 1430.06s (0:23:50)

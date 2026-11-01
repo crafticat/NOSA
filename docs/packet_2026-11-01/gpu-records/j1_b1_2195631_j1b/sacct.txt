@@ -1,0 +1,1 @@
+2195631.6|j1-j1b-b1-2195631|COMPLETED|0:0|01:44:05|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=340G,node=1|3925292K

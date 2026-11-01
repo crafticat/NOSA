@@ -1,0 +1,62 @@
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+[r2_i4m 19:34:11] model loaded in 11 s
+[r2_i4m 19:34:11] arm SH (B 216, 512 steps, C 128)
+[r2_i4m 19:46:59] arm L4PTFD ({'arm': 'L4PTFD', 'K': 3, 'journal': 256, 'tu_gemm': 'natural', 'twin': 'fused', 'body': 'fused', 'graph': True, 'redirect': True, 'probe_every': 16, 'check_every': 0, 'fork_store': 0, 'prefill_hook': 'nocopy'}; mode match, role matched)
+GATE C0_FORK          MUST PASS: /mnt/beegfs/ojerbi/nosi-r2-i4m/benchmarks/Efficiency/fork_vllm_unified_attention.py (blob pinned by the step: f0dc0c183a388585e216505a6bbfc696531e8add)
+GATE SH-RUN           MUST PASS: 512 steps, 9 re-warms
+GATE SH-MEM           REPORT PASS: peak allocated 82.043 GB (after the prefill 82.043 GB, prefill None GB) against 84.0 GB; prefill + decode; usable ceiling 84.25 GB
+GATE L4PTFD-RUN       MUST PASS: 194 rounds of K 3
+GATE L4PTFD-ERR       MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE L4PTFD-COMMIT-N  MUST PASS: committed per request min 512 max 512 (exactly 512 wanted); warm 216 + per-round sum 110376, total 110592; 194 rounds
+GATE L4PTFD-D1        MUST PASS: residency-undo calls 0 (0 expected); resets 194 for 194 rounds
+GATE L4PTFD-D3        MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 776 = (K + 1) x 194 passes; one-row J slots 0; 194 rounds
+GATE L4PTFD-SPAN      MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE L4PTFD-RESID     MUST PASS: residency calls in joint passes 6208 for 194 joint passes of 32 layers (one per layer and pass); union layers 6208; verify_rows passes 194
+GATE L4PTFD-ATTN1     MUST PASS: attn calls 6208 for 194 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFD-FILL1     MUST PASS: fills calls 6208 for 194 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFD-LEAN      MUST PASS: lean passes 389 (one-row passes: draft steps 389 incl. the prelude's 3 + mixed 0 + one-row J 0 = 389); lean layers 12448 (L x passes = 12448)
+GATE L4PTFD-MEM       MUST PASS: peak allocated 83.891 GB with the prefill against the cap 84.0 GB (usable ceiling 84.25 GB, REPORT); arena {'start_GB': 15.349, 'prefill_peak_GB': 78.13, 'arena': {'L': 32, 'B': 216, 'NS': 129, 'H': 2, 'D': 128, 'X': 129, 'bs': 64, 'n_blocks': 919728, 'store_base': 891648, 'store_GB': 1.8332, 'arena_GB': 60.5107, 'dtype': 'torch.bfloat16', 'cb0_base': 919512, 'cb0_GB': 0.0142, 'cb1': 'store slot 0', 'kind': 'chain'}, 'hook': 'nocopy', 'decode_peak_GB': 76.889, 'decode_peak_reserved_GB': 77.064}
+GATE REG              MUST PASS: registered values missing: none
+GATE FIT-B            MUST PASS: the cell's B 216; registered FIT_B_128 216
+GATE GPU              MUST PASS: GPU 33cfb929-315c-8d27-5622-1169affb7e04: registered strongest steady 3410.1 tok/s (same-GPU denominator)
+GATE EDGE             MUST PASS: headroom 0.1090 GB < 4 requests x 0.3003276 GB = 1.2013 GB
+PREDICTION I4M-PEAK   CONFIRMED: 83.8910; registered (83.85, 84.0)
+PREDICTION I4M-MAIN   CONFIRMED: 0.5143; registered (0.5, 0.53)
+PREDICTION I4M-DIAG   CONFIRMED: 0.5240; registered (0.51, 0.53)
+REPORT SH B 216 C 128: steady 64.541 ms/step, tok/s median 3346.7 mean 3180.8 effective 1209.1, peak 82.043 GB
+REPORT L4PTFD K 3: 194 rounds; committed tok/s median 1753.8 mean 1596.6 effective 1363.5; vs SH {'median_tok_s': 0.524, 'mean_tok_s': 0.5019, 'effective_tok_s': 1.1277}; round median 356.898 ms; phases {'reset': 0.116, 'joint': 206.852, 'commit': 5.958, 'draft': 143.671}; draft step 71.835 ms = 1.113 SH; joint 3.205 SH steps; lean {'passes': 389, 'layers': 12448}; tokens equal 0.403411 (first (33, 1)); peak 82.559 GB (with the prefill 83.891 GB); arena {'start_GB': 15.349, 'prefill_peak_GB': 78.13, 'arena': {'L': 32, 'B': 216, 'NS': 129, 'H': 2, 'D': 128, 'X': 129, 'bs': 64, 'n_blocks': 919728, 'store_base': 891648, 'store_GB': 1.8332, 'arena_GB': 60.5107, 'dtype': 'torch.bfloat16', 'cb0_base': 919512, 'cb0_GB': 0.0142, 'cb1': 'store slot 0', 'kind': 'chain'}, 'hook': 'nocopy', 'decode_peak_GB': 76.889, 'decode_peak_reserved_GB': 77.064}
+VERDICT L4PTFD C 128 B 216 (GPU 33cfb929-315c-8d27-5622-1169affb7e04): MAIN 0.5143 = median steady 1753.8 / strongest steady 3410.1; MAIN-MEAN 0.4682
+EFFECTIVE VIEW (elapsed; REPORT, kept apart from the verdict) L4PTFD C 128 B 216: MAIN-EFF 0.4908 = effective 1363.5 / strongest effective 2778.3; same-job SH effective ratio 1.1277
+DIAGNOSTIC (same config, not the verdict) L4PTFD / same-job SH at C 128 B 216: median 0.524; SH / strongest 0.9814
+r2_i4m: 0 MUST gate(s) failed

@@ -1,0 +1,1 @@
+2195575.48|i4cc-i4ccb-v3b-2195575|COMPLETED|0:0|01:10:13|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=340G,node=1|3138808K

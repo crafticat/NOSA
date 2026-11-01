@@ -1,0 +1,2 @@
+exit=1 utc_end=2026-10-29T00:59:08Z
+accounting=exit 1, sacct FAILED 1:0

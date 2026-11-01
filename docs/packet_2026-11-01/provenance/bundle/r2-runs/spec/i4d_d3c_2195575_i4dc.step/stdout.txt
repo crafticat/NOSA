@@ -1,0 +1,62 @@
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+Use InfLLMv2
+[r2_i4d 12:57:35] model loaded in 4 s
+[r2_i4d 12:57:35] arm SH (B 216, 128 steps, C 128)
+[r2_i4d 13:09:13] arm L4PTFD ({'arm': 'L4PTFD', 'K': 3, 'journal': 256, 'tu_gemm': 'natural', 'twin': 'fused', 'body': 'fused', 'graph': True, 'redirect': True, 'probe_every': 16, 'check_every': 0, 'fork_store': 0, 'prefill_hook': 'nocopy', 'store_acct': 1})
+GATE C0_FORK          MUST PASS: /mnt/beegfs/ojerbi/nosi-r2-i4d/benchmarks/Efficiency/fork_vllm_unified_attention.py (blob pinned by the step: f0dc0c183a388585e216505a6bbfc696531e8add)
+GATE SH-RUN           MUST PASS: 128 steps, 2 re-warms
+GATE SH-MEM           REPORT PASS: peak allocated 82.042 GB (after the prefill 82.042 GB, prefill None GB) against 84.0 GB; prefill + decode; usable ceiling 84.25 GB
+GATE L4PTFD-RUN       MUST PASS: 55 rounds of K 3
+GATE L4PTFD-ERR       MUST PASS: body refusal bits 0; twin overflow flags [0]
+GATE L4PTFD-COMMIT-N  MUST PASS: committed per request min 128 max 128 (exactly 128 wanted); warm 216 + per-round sum 27432, total 27648; 55 rounds
+GATE L4PTFD-D1        MUST PASS: residency-undo calls 0 (0 expected); resets 55 for 55 rounds
+GATE L4PTFD-D3        MUST PASS: deferred rows written by a joint pass 0 (0 expected); joint rows 216 = (K + 1) x 54 passes; one-row J slots 1; 55 rounds
+GATE L4PTFD-SPAN      MUST PASS: the chain's largest span past the committed position 5 (at most K + 2 = 5 < MAX_ROLLBACK 32)
+GATE L4PTFD-RESID     MUST PASS: residency calls in joint passes 1728 for 54 joint passes of 32 layers (one per layer and pass); union layers 1728; verify_rows passes 54
+GATE L4PTFD-ATTN1     MUST PASS: attn calls 1728 for 54 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFD-FILL1     MUST PASS: fills calls 1728 for 54 joint passes of 32 layers (one per layer and pass)
+GATE L4PTFD-MEM       REPORT PASS: peak allocated 83.89 GB (after the prefill 82.473 GB, prefill 83.89 GB) against 84.0 GB; {'start_GB': 15.348, 'prefill_peak_GB': 78.129, 'arena': {'L': 32, 'B': 216, 'NS': 129, 'H': 2, 'D': 128, 'X': 129, 'bs': 64, 'n_blocks': 919728, 'store_base': 891648, 'store_GB': 1.8332, 'arena_GB': 60.5107, 'dtype': 'torch.bfloat16', 'cb0_base': 919512, 'cb0_GB': 0.0142, 'cb1': 'store slot 0', 'kind': 'chain'}, 'hook': 'nocopy', 'decode_peak_GB': 76.809, 'decode_peak_reserved_GB': 76.988}; usable ceiling 84.25 GB
+GATE L4PTFD-LEAN      MUST PASS: lean passes 112 (one-row passes: draft steps 111 incl. the prelude's 3 + mixed 0 + one-row J 1 = 112); lean layers 3584 (L x passes = 3584)
+GATE L4PTFD-ACCT      MUST PASS: joint passes 54 (union 54); listed 791076; repeat 101836
+PREDICTION I4A-RATIO        REFUTED: 0.4686; registered (0.51, 0.55)
+PREDICTION I4D-REPEAT-SHARE CONFIRMED: 0.1348; registered (0.05, 0.4)
+PREDICTION I4D-LISTED-PASS  REFUTED: 14253.0200; registered (3000, 12000)
+PREDICTION I4D-WIN-PREV-SHARE CONFIRMED: 0.3496; registered (0.2, 0.7)
+PREDICTION I4D-WIN-PREV-PASS CONFIRMED: 3971.0200; registered (2000, 6400)
+PREDICTION L4PTFK-RUN       NOT_RUN: the arm did not run
+PREDICTION L4PTFKW-RUN      NOT_RUN: the arm did not run
+REPORT SH B 216 C 128: steady 65.891 ms/step, tok/s median 3278.1 mean 3058.8 effective 1052.1, peak 82.042 GB
+REPORT L4PTFD K 3: 55 rounds; committed tok/s median 1536.1 mean 1387.8 effective 876.8; vs SH {'median_tok_s': 0.4686, 'mean_tok_s': 0.4537, 'effective_tok_s': 0.8334}; vs 3407.2 0.4508; round median 362.635 ms; phases {'reset': 0.121, 'joint': 215.004, 'commit': 5.43, 'draft': 140.798}; draft step 70.399 ms = 1.0684 SH; joint 3.263 SH steps; calls {'residency_undo_calls': 0, 'reset_calls': 55, 'commit_calls': 55, 'deferred_recompute_rows': 0, 'remade_rows': 0, 'joint_passes': 54, 'joint_rows': 216, 'j1_passes': 1, 'replays': 9408, 'undo_step_calls': 0}; lean {'passes': 112, 'layers': 3584}; tokens equal 0.623626 (first (33, 1)); fingerprints {'n': 1592, 'equal': 0.135678, 'max_abs_dmax': 13.375, 'max_abs_dsum': 233318.81158216298}; peak 82.473 GB (with the prefill 83.89 GB)
+REPORT L4PTFD store: runner FK {'keep': False, 'acct': True}; NEW host blocks per round 25601.8, host-gather wait median 26.417 ms; record {'passes': 54, 'listed_total': 791076, 'fetched_total': 791076, 'hits_total': 0, 'block_bytes': 32896, 'keep': False, 'acct': True, 'listed_pass_after_first': 14253.02, 'repeat_total': 101836, 'repeat_share_after_first': 0.134809, 'repeat_bytes_pass_after_first': 63207492, 'win_loads_total': 650977, 'win_prev_total': 210464, 'win_loads_pass_after_first': 11359.21, 'win_prev_pass_after_first': 3971.02, 'win_prev_share_after_first': 0.349586, 'win_prev_bytes_pass_after_first': 130630637, 'check': {'overflow': 0, 'dup': 0, 'missing': 0, 'bytes_bad': 0, 'bytes_checked': 0, 'win_checked': 0}}
+REPORT L4PTFD fork: {'store_slots': 129, 'bound': 128, 'chunks': [4], 'counters': {'pool_reads': 0, 'store_reads': 0, 'extras_host': 0, 'extras_pool': 0, 'extras_max': 0, 'unserved': 0, 'dropped': 0, 'vis_bad': 0, 'vb_bad': 0, 'vb_rows': 0, 'tail_reads': 0, 'chain_bad': 0, 'chain_rows': 0, 'chain_reads': 0, 'past_edge': 0, 'f4_rows': 0, 'fork_loaded': 0, 'block0_bad': 0}}; joint-pass phases (probe) {'n_probes': 3, 'labels_median': {'attn': 40.3825, 'chain': 3.8758, 'check': 0.0963, 'fetch': 18.6102, 'post': 94.6893, 'resid': 25.3184, 'union': 14.7466, 'write': 10.7571}, 'groups_median': {'residency': 25.3184, 'write': 10.7571, 'chain': 3.8758, 'union': 14.7466, 'fetch': 18.6102, 'attention': 40.3825, 'check': 0.0963, 'dense_next': 94.6893, 'total': 208.3697}, 'layer_ms_median': 6.4389, 'layers_per_pass': 31}; store {'X': 129, 'store_GB': 1.8332, 'cb0_GB': 0.0142}; arena memory {'start_GB': 15.348, 'prefill_peak_GB': 78.129, 'arena': {'L': 32, 'B': 216, 'NS': 129, 'H': 2, 'D': 128, 'X': 129, 'bs': 64, 'n_blocks': 919728, 'store_base': 891648, 'store_GB': 1.8332, 'arena_GB': 60.5107, 'dtype': 'torch.bfloat16', 'cb0_base': 919512, 'cb0_GB': 0.0142, 'cb1': 'store slot 0', 'kind': 'chain'}, 'hook': 'nocopy', 'decode_peak_GB': 76.809, 'decode_peak_reserved_GB': 76.988}
+r2_i4d: 0 MUST gate(s) failed

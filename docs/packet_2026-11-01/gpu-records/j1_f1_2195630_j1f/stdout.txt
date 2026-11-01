@@ -1,0 +1,94 @@
+GATE C128_B216-UNION              MUST PASS: FORK union_len min 72 max 72 (want 72); FORK1R min 64 max 64 (want 64)
+GATE C128_B216-FORK3D2-PATH       REPORT PASS: 3D path taken (segment maxima written): True
+GATE C128_B216-FORK3D4-PATH       REPORT PASS: 3D path taken (segment maxima written): True
+GATE C128_B216-FORK3D8-PATH       REPORT PASS: 3D path taken (segment maxima written): True
+GATE C128_B216-FORK-NUM           MUST PASS: max |out - float64| 9.424e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)
+GATE C128_B216-FORKT-NUM          MUST PASS: max |out - float64| 9.424e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)
+GATE C128_B216-FORK1R-NUM         MUST PASS: max |out - float64| 9.104e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)
+GATE C128_B216-NS1R1-NUM          MUST PASS: max |out - float64| 9.013e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)
+GATE C128_B216-NS1x4-NUM          MUST PASS: max |out - float64| 9.715e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)
+GATE C128_B216-FLASHU1-NUM        MUST PASS: max |out - float64| 8.640e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)
+GATE C128_B216-NSRU-NUM           MUST PASS: max |out - float64| 9.903e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)
+GATE C128_B216-FORK3D2-NUM        REPORT PASS: max |out - float64| 9.886e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)
+GATE C128_B216-FORK3D4-NUM        REPORT PASS: max |out - float64| 9.581e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)
+GATE C128_B216-FORK3D8-NUM        REPORT PASS: max |out - float64| 9.822e-06 over requests [0, 31, 61, 92, 123, 154, 184, 215] (tol 1e-03)
+GATE C128_B216-FORKT-EQ           MUST PASS: FORKT = FORK bit for bit: True
+GATE C128_B216-FORK-EXACT         MUST PASS: output after the last pass = the first output, bit for bit: True
+GATE C128_B216-FORKT-EXACT        MUST PASS: output after the last pass = the first output, bit for bit: True
+GATE C128_B216-FORK1R-EXACT       MUST PASS: output after the last pass = the first output, bit for bit: True
+GATE C128_B216-NS1R1-EXACT        MUST PASS: output after the last pass = the first output, bit for bit: True
+GATE C128_B216-NS1x4-EXACT        MUST PASS: output after the last pass = the first output, bit for bit: True
+GATE C128_B216-FLASHU1-EXACT      MUST PASS: output after the last pass = the first output, bit for bit: True
+GATE C128_B216-NSRU-EXACT         MUST PASS: output after the last pass = the first output, bit for bit: True
+GATE C128_B216-FORK3D2-EXACT      REPORT PASS: output after the last pass = the first output, bit for bit: True
+GATE C128_B216-FORK3D4-EXACT      REPORT PASS: output after the last pass = the first output, bit for bit: True
+GATE C128_B216-FORK3D8-EXACT      REPORT PASS: output after the last pass = the first output, bit for bit: True
+GATE C128_B216-BUDGET             MUST PASS: wall 42.7 s (limit 300); stop None
+GATE C128_B216-RUN                MUST PASS: 10 variants x 10 passes of 32 calls
+GATE C73_B318-UNION               MUST PASS: FORK union_len min 72 max 72 (want 72); FORK1R min 64 max 64 (want 64)
+GATE C73_B318-FORK3D2-PATH        REPORT PASS: 3D path taken (segment maxima written): True
+GATE C73_B318-FORK3D4-PATH        REPORT PASS: 3D path taken (segment maxima written): True
+GATE C73_B318-FORK3D8-PATH        REPORT PASS: 3D path taken (segment maxima written): True
+GATE C73_B318-FORK-NUM            MUST PASS: max |out - float64| 9.193e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)
+GATE C73_B318-FORKT-NUM           MUST PASS: max |out - float64| 9.193e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)
+GATE C73_B318-FORK1R-NUM          MUST PASS: max |out - float64| 9.193e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)
+GATE C73_B318-NS1R1-NUM           MUST PASS: max |out - float64| 1.006e-05 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)
+GATE C73_B318-NS1x4-NUM           MUST PASS: max |out - float64| 1.006e-05 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)
+GATE C73_B318-FLASHU1-NUM         MUST PASS: max |out - float64| 8.300e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)
+GATE C73_B318-NSRU-NUM            MUST PASS: max |out - float64| 9.959e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)
+GATE C73_B318-FORK3D2-NUM         REPORT PASS: max |out - float64| 9.729e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)
+GATE C73_B318-FORK3D4-NUM         REPORT PASS: max |out - float64| 9.165e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)
+GATE C73_B318-FORK3D8-NUM         REPORT PASS: max |out - float64| 9.883e-06 over requests [0, 45, 91, 136, 181, 226, 272, 317] (tol 1e-03)
+GATE C73_B318-FORKT-EQ            MUST PASS: FORKT = FORK bit for bit: True
+GATE C73_B318-FORK-EXACT          MUST PASS: output after the last pass = the first output, bit for bit: True
+GATE C73_B318-FORKT-EXACT         MUST PASS: output after the last pass = the first output, bit for bit: True
+GATE C73_B318-FORK1R-EXACT        MUST PASS: output after the last pass = the first output, bit for bit: True
+GATE C73_B318-NS1R1-EXACT         MUST PASS: output after the last pass = the first output, bit for bit: True
+GATE C73_B318-NS1x4-EXACT         MUST PASS: output after the last pass = the first output, bit for bit: True
+GATE C73_B318-FLASHU1-EXACT       MUST PASS: output after the last pass = the first output, bit for bit: True
+GATE C73_B318-NSRU-EXACT          MUST PASS: output after the last pass = the first output, bit for bit: True
+GATE C73_B318-FORK3D2-EXACT       REPORT PASS: output after the last pass = the first output, bit for bit: True
+GATE C73_B318-FORK3D4-EXACT       REPORT PASS: output after the last pass = the first output, bit for bit: True
+GATE C73_B318-FORK3D8-EXACT       REPORT PASS: output after the last pass = the first output, bit for bit: True
+GATE C73_B318-BUDGET              MUST PASS: wall 11.1 s (limit 300); stop None
+GATE C73_B318-RUN                 MUST PASS: 10 variants x 10 passes of 32 calls
+GATE RUN-WALL                     MUST PASS: run wall 53.9 s (limit 900)
+J1F C128_B216 FORK      1.0753 ms/call (34.410 ms/pass) rows 864 logical 1.023 GB/call 0.9515 TB/s valid True
+J1F C128_B216 FORKT     1.0432 ms/call (33.383 ms/pass) rows 864 logical 1.023 GB/call 0.9808 TB/s valid True
+J1F C128_B216 FORK1R    0.6943 ms/call (22.217 ms/pass) rows 216 logical 0.910 GB/call 1.31 TB/s valid True
+J1F C128_B216 NS1R1     0.6123 ms/call (19.593 ms/pass) rows 216 logical 0.910 GB/call 1.4854 TB/s valid True
+J1F C128_B216 NS1x4     2.3846 ms/call (76.308 ms/pass) rows 864 logical 3.638 GB/call 1.5256 TB/s valid True
+J1F C128_B216 FLASHU1   0.6846 ms/call (21.906 ms/pass) rows 216 logical 1.023 GB/call 1.4946 TB/s valid True
+J1F C128_B216 NSRU      1.6334 ms/call (52.268 ms/pass) rows 864 logical 3.865 GB/call 2.3665 TB/s valid True
+J1F C128_B216 FORK3D2   1.3385 ms/call (42.831 ms/pass) rows 864 logical 1.023 GB/call 0.7644 TB/s valid True
+J1F C128_B216 FORK3D4   1.4110 ms/call (45.153 ms/pass) rows 864 logical 1.023 GB/call 0.7251 TB/s valid True
+J1F C128_B216 FORK3D8   1.5696 ms/call (50.229 ms/pass) rows 864 logical 1.023 GB/call 0.6519 TB/s valid True
+J1F C128_B216 RATIO FORK/FLASHU1 = 1.5708 (equal logical bytes (union 72): the 4-row tile's cost at the same bytes)
+J1F C128_B216 RATIO FORK1R/NS1R1 = 1.1339 (equal rows and bytes (1 row, 64 pages): the fork kernel's per-byte efficiency)
+J1F C128_B216 RATIO FORK/NS1x4 = 0.4509 (equal rows (4 per request): the shared read's saving vs the baseline's 4 calls)
+J1F C128_B216 RATIO FORKT/FORK = 0.9702 (the in-kernel union build's cost)
+J1F C128_B216 RATIO NSRU/FORK = 1.519 (the shipped kernel's own sharing (L2) vs the fork)
+J1F C128_B216 RATIO FORK3D2/FORK = 1.2447 (the 3D split (2 segments) vs the 2D launch)
+J1F C128_B216 RATIO FORK3D4/FORK = 1.3122 (the 3D split (4 segments) vs the 2D launch)
+J1F C128_B216 RATIO FORK3D8/FORK = 1.4597 (the 3D split (8 segments) vs the 2D launch)
+J1F C128_B216 FORK - FLASHU1 = 12.503 ms per pass; best 3D {'variant': 'FORK3D2', 'ratio': 1.2447, 'saving_ms_per_pass': -8.421}
+J1F C73_B318 FORK      1.5967 ms/call (51.096 ms/pass) rows 1272 logical 1.506 GB/call 0.9434 TB/s valid True
+J1F C73_B318 FORKT     1.5569 ms/call (49.820 ms/pass) rows 1272 logical 1.506 GB/call 0.9676 TB/s valid True
+J1F C73_B318 FORK1R    0.8677 ms/call (27.765 ms/pass) rows 318 logical 1.339 GB/call 1.5433 TB/s valid True
+J1F C73_B318 NS1R1     0.8897 ms/call (28.470 ms/pass) rows 318 logical 1.339 GB/call 1.505 TB/s valid True
+J1F C73_B318 NS1x4     3.5068 ms/call (112.218 ms/pass) rows 1272 logical 5.356 GB/call 1.5273 TB/s valid True
+J1F C73_B318 FLASHU1   0.9990 ms/call (31.968 ms/pass) rows 318 logical 1.506 GB/call 1.5079 TB/s valid True
+J1F C73_B318 NSRU      2.4360 ms/call (77.952 ms/pass) rows 1272 logical 5.691 GB/call 2.3361 TB/s valid True
+J1F C73_B318 FORK3D2   1.9623 ms/call (62.793 ms/pass) rows 1272 logical 1.506 GB/call 0.7677 TB/s valid True
+J1F C73_B318 FORK3D4   2.0373 ms/call (65.195 ms/pass) rows 1272 logical 1.506 GB/call 0.7394 TB/s valid True
+J1F C73_B318 FORK3D8   2.3046 ms/call (73.746 ms/pass) rows 1272 logical 1.506 GB/call 0.6536 TB/s valid True
+J1F C73_B318 RATIO FORK/FLASHU1 = 1.5984 (equal logical bytes (union 72): the 4-row tile's cost at the same bytes)
+J1F C73_B318 RATIO FORK1R/NS1R1 = 0.9752 (equal rows and bytes (1 row, 64 pages): the fork kernel's per-byte efficiency)
+J1F C73_B318 RATIO FORK/NS1x4 = 0.4553 (equal rows (4 per request): the shared read's saving vs the baseline's 4 calls)
+J1F C73_B318 RATIO FORKT/FORK = 0.975 (the in-kernel union build's cost)
+J1F C73_B318 RATIO NSRU/FORK = 1.5256 (the shipped kernel's own sharing (L2) vs the fork)
+J1F C73_B318 RATIO FORK3D2/FORK = 1.2289 (the 3D split (2 segments) vs the 2D launch)
+J1F C73_B318 RATIO FORK3D4/FORK = 1.2759 (the 3D split (4 segments) vs the 2D launch)
+J1F C73_B318 RATIO FORK3D8/FORK = 1.4433 (the 3D split (8 segments) vs the 2D launch)
+J1F C73_B318 FORK - FLASHU1 = 19.128 ms per pass; best 3D {'variant': 'FORK3D2', 'ratio': 1.2289, 'saving_ms_per_pass': -11.697}
+r2_j1_forkbench: 0 MUST gate(s) failed

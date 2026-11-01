@@ -1,0 +1,45 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+...........                                                              [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_layer_copy
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:159: Evidence: J1 COPY: _layer = TentState._layer + 3 J1 lines (the R 1 delegation, the selection call); removed sel = VR._select_rows(plan.vs, layer, q, twin)
+    _ev("J1 COPY: _layer = TentState._layer + %d J1 lines (the R 1 delegation, the selection call); removed %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_pool_fn_equal
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:235: Evidence: J1 POOL: 12 variants (dtype, seed, init, local) bit-equal (eager and Inductor) to the kernel's stand-in and to pool_reference; dynamo {'unique_graphs': 6, 'frames_ok': 0, 'graph_breaks': 0, 'inductor_kernels': 6}
+    _ev("J1 POOL: %d variants (dtype, seed, init, local) bit-equal (eager and Inductor) to the kernel's stand-in and to "
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_equals[gudcd_timing]
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:316: Evidence: J1 gudcd_timing L4PTFDGUDCDJ1: rounds 14; joint passes 13; J1 {'calls': 26, 'fallback': {}, 'events': [{'graphs': 1, 's': 4.033, 'layer': 0, 'capture': False, 'joint_pass': 0}], 'compile_s': 4.033, 'peq_bad': 0, 'peq_vals': 60672, 'peq_layers': 6, 'backend': 'inductor', 'j1neg': None}
+    _ev("J1 %s %s: rounds %d; joint passes %d; J1 %s" % (case, name, rd["rounds"], jp, j))
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_equals[gudcd_check]
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:316: Evidence: J1 gudcd_check L4PTFDGUDCDJ1: rounds 14; joint passes 13; J1 {'calls': 26, 'fallback': {}, 'events': [], 'compile_s': 0.0, 'peq_bad': 0, 'peq_vals': 262912, 'peq_layers': 26, 'backend': 'inductor', 'j1neg': None}
+    _ev("J1 %s %s: rounds %d; joint passes %d; J1 %s" % (case, name, rd["rounds"], jp, j))
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_equals[gudkcd_timing]
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:316: Evidence: J1 gudkcd_timing L4PTFDGUDKWCDJ1: rounds 14; joint passes 13; J1 {'calls': 26, 'fallback': {}, 'events': [], 'compile_s': 0.0, 'peq_bad': 0, 'peq_vals': 60672, 'peq_layers': 6, 'backend': 'inductor', 'j1neg': None}
+    _ev("J1 %s %s: rounds %d; joint passes %d; J1 %s" % (case, name, rd["rounds"], jp, j))
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_equals[gudkcd_check]
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:316: Evidence: J1 gudkcd_check L4PTFDGUDKWCDJ1: rounds 14; joint passes 13; J1 {'calls': 26, 'fallback': {}, 'events': [], 'compile_s': 0.0, 'peq_bad': 0, 'peq_vals': 262912, 'peq_layers': 26, 'backend': 'inductor', 'j1neg': None}
+    rd = x["rd"]
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_plant_wrong_req
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:357: Evidence: J1 PLANT wrong_req: differs ['acc_hist', 'accepted', 'draft_calls', 'draft_skipped']; EQF False; PEQ bad 38120 of 101120
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_step_script_j1
+  /mnt/beegfs/ojerbi/nosi-r2-j1/benchmarks/Efficiency/tests_cpu/test_j1.py:471: Evidence: J1 DRYRUN: 3 cells printed their step command; grants {'j1m': None, 'j1a': None, 'j1b': None}
+    assert a.arms == arms.split(",")
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+11 passed, 8 warnings in 675.92s (0:11:15)

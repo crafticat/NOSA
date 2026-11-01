@@ -1,0 +1,1 @@
+2195576.23|i4g-i4gb-x4b-2195576|COMPLETED|0:0|00:54:40|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=340G,node=1|3000172K

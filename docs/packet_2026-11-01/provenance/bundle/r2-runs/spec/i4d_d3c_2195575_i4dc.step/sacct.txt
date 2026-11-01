@@ -1,0 +1,1 @@
+2195575.17|i4d-i4dc-d3c-2195575|COMPLETED|0:0|00:23:40|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=240G,node=1|3140192K

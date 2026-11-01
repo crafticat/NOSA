@@ -1,0 +1,1 @@
+2195630.12|int-intd-d1-2195630|COMPLETED|0:0|01:42:17|cpu=16,gres/gpu:a100=1,gres/gpu=1,mem=340G,node=1|4092464K
