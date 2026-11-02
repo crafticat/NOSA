@@ -30,6 +30,11 @@ F3        test_stamp_frame_equal (the shifted-age frame = the shipped stamps on 
           residency's kernels as kernel nodes.
 CELL      test_j1_cell_tables (the private copy; the I4DC cell module itself unchanged), test_j1_registration_state,
           test_step_script_j1.
+J1F       test_forkbench_pure; test_forkbench_nonfinite (planted NaN / +Inf / -Inf in output, reference, both: the new
+          NUM and EXACT gates FAIL with count and index; the j1f source's old accumulation, loaded from git, PASSED the
+          identical-NaN plant: the control is not a no-op); test_forkbench_out_view (the flash controls' direct out_
+          write: layout = the op's own return, the argument list = the installed wrapper's); test_forkbench_timing_
+          plumbing (the rotated timing loop with a fake timer; kernel / copy / total per flash control).
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rfEs benchmarks/Efficiency/tests_cpu/test_j1.py
 """
@@ -771,6 +776,9 @@ def test_forkbench_pure():
     assert w["FORK1R"] == w["NS1R1"] == dict(rows=216, pages=2 * 216 * 64)                     # equal rows and bytes
     assert w["NS1x4"] == dict(rows=864, pages=2 * 864 * 64)                                     # equal rows
     assert w["NSRU"]["pages"] == 2 * 216 * (64 + 67 + 69 + 72)
+    for x in FB.FLASH:                                                  # the j1f form: X's work; the copy: none
+        assert w[x + "_CP"] == w[x] and w[x + "_CO"] == dict(rows=0, pages=0), x
+    assert FB.variants(()).index("NS1R1_CP") < FB.variants(()).index("NS1R1_CO")   # the copy's source runs first
     assert FB.rotation(["a", "b", "c"], 4) == ["b", "c", "a"]
     times = {v: [32.0 * (1.0 + 0.1 * i)] * 3 for i, v in enumerate(FB.variants((2,)))}
     times["FORK"] = [32.0 * 1.2] * 3
@@ -784,12 +792,215 @@ def test_forkbench_pure():
     assert s["ratios"]["NSRU/FORK"]["valid"] is False and "INVALID" in s["ratios"]["NSRU/FORK"]["note"]
     assert s["fork_minus_flashu1_ms_per_pass"] == round(0.6 * 32, 3)
     assert s["best_3d"] == dict(variant="FORK3D2", ratio=0.9, saving_ms_per_pass=round(0.12 * 32, 3))
-    assert {"FORK/FLASHU1", "FORK1R/NS1R1", "FORK/NS1x4", "FORKT/FORK", "NSRU/FORK", "FORK3D2/FORK"} == set(s["ratios"])
+    assert {"FORK/FLASHU1", "FORK1R/NS1R1", "FORK/NS1x4", "FORKT/FORK", "NSRU/FORK", "FORK3D2/FORK", "FORK/FLASHU1_CP",
+            "FORK1R/NS1R1_CP", "FORK/NS1x4_CP", "NSRU_CP/FORK"} == set(s["ratios"])
+    assert s["per"]["NS1R1_CO"]["logical_tb_s"] is None and s["per"]["NS1R1_CO"]["bytes"] == 0
+    assert set(s["flash_timing"]) == set(FB.FLASH) and s["flash_timing"]["NSRU"]["valid"] is False
     for bad in (["--out", "x", "--segments", "1"], ["--out", "x", "--reps", "2"], ["--out", "x", "--shapes", "a"]):
         with pytest.raises(SystemExit):
             FB.parse_args(bad)
     assert SEL is not None
     _ev("J1F PURE: work per variant %s; ratios %s" % (w, {k: v["ratio"] for k, v in s["ratios"].items()}))
+
+
+# ------------------------------------------------------------------ the fork microbench: the j1f source follow-up
+J1F_OLD = "cd0e2865924ed59a254fae1e283b1a2fcac4ad52"                  # the j1f source before the follow-up
+
+
+def _fb_old():
+    """r2_j1_forkbench.py as committed at J1F_OLD (the j1f run's source), loaded as a separate module object."""
+    import types
+    if not _have(J1F_OLD):
+        pytest.skip("no git or no commit %s in %s" % (J1F_OLD, ROOT))
+    src = _git("show", "%s:benchmarks/Efficiency/r2_j1_forkbench.py" % J1F_OLD).stdout
+    assert "err = max(err, float((got.double() - want).abs().max()))" in src     # the old accumulation
+    mod = types.ModuleType("r2_j1_forkbench_old")
+    mod.__file__ = str(EFF / "r2_j1_forkbench.py")
+    exec(compile(src, "r2_j1_forkbench@%s" % J1F_OLD[:7], "exec"), mod.__dict__)
+    return mod
+
+
+def _fb_world(FB, B=3, seed=11):
+    """Outputs of FORK (4 rows per request), NS1R1 (= FORK's row 0) and FLASHU1, and float64 references 1e-5 away."""
+    g = torch.Generator().manual_seed(seed)
+    bf = torch.bfloat16
+    fork = (torch.randn(B * FB.R, FB.HQ, FB.HD, generator=g) * 0.05).to(bf)
+    outs = dict(FORK=fork, NS1R1=fork.view(B, FB.R, FB.HQ, FB.HD)[:, 0].reshape(B, 1, FB.HQ, FB.HD).clone(),
+                FLASHU1=(torch.randn(B, 1, FB.HQ, FB.HD, generator=g) * 0.05).to(bf))
+    ref = {}
+    for b in range(B):
+        for r in range(FB.R):
+            ref[(b, r)] = fork[b * FB.R + r].double() + 1e-5
+        ref[(b, "U")] = outs["FLASHU1"].view(B, FB.HQ, FB.HD)[b].double() + 1e-5
+    return outs, ref
+
+
+# where the plant goes: variant -> (reference key, the output row index in out.view(-1, HQ, HD))
+PLANT_AT = dict(FORK=((1, 2), 1 * 4 + 2), NS1R1=((2, 0), 2), FLASHU1=((0, "U"), 0))
+
+
+def test_forkbench_nonfinite():
+    """PLANTED NON-FINITE CONTROL (reviewer finding): NaN and +Inf (and -Inf) in the candidate output, in the float64
+    reference, and in both (identical values): every case FAILS the new NUM gate with its count and first index; the
+    finite case PASSES. The OLD accumulation (the module at J1F_OLD) PASSES the identical-NaN case (and others): the
+    control is not a no-op (L34). Repeatability: identical non-finite bits pass the old bit test and FAIL the new one."""
+    FB = _mod("r2_j1_forkbench")
+    OLD = _fb_old()
+    B = 3
+    h, d = 5, 7
+    old_pass = {}
+    for name, (key, row) in PLANT_AT.items():
+        outs, ref = _fb_world(FB, B)
+        ok, det = FB.num_verdict(FB.num_check(name, outs[name], ref, B))           # the finite case
+        assert ok and "max |out - float64|" in det, (name, det)
+        assert OLD.num_err(name, outs[name], ref, B) <= OLD.TOL                     # the old code agrees here
+        for val in (float("nan"), float("inf"), float("-inf")):
+            for where in ("out", "ref", "both"):
+                outs, ref = _fb_world(FB, B)
+                o = outs[name]
+                if where in ("out", "both"):
+                    o.view(-1, FB.HQ, FB.HD)[row, h, d] = val
+                if where in ("ref", "both"):
+                    ref[key][h, d] = val
+                chk = FB.num_check(name, o, ref, B)
+                ok, det = FB.num_verdict(chk)
+                assert not ok and chk["nonfinite"] == 1, (name, val, where, chk, det)
+                assert det.startswith("NON-FINITE: 1 value(s)"), det
+                assert "request %s row %s head %d dim %d" % (key[0], key[1], h, d) in det, det
+                assert chk["err"] == chk["err"] and chk["err"] < 1e-3, chk      # the max stays finite and honest
+                old_pass[(name, repr(val), where)] = OLD.num_err(name, o, ref, B) <= OLD.TOL
+    for name in PLANT_AT:                                                   # the old hole, per variant
+        assert old_pass[(name, "nan", "both")], (name, old_pass)            # identical NaN: the old gate PASSED
+        assert old_pass[(name, "nan", "out")] and old_pass[(name, "nan", "ref")]
+        assert old_pass[(name, "inf", "both")]                             # inf - inf = NaN: vanished too
+        assert not old_pass[(name, "inf", "out")]                          # a lone Inf was already caught
+    # repeatability: identical bits that hold a non-finite value
+    for val in (float("nan"), float("inf")):
+        outs, _ = _fb_world(FB, B)
+        o = outs["FORK"]
+        o.view(-1, FB.HQ, FB.HD)[6, h, d] = val
+        first = o.clone()
+        assert bool((OLD.bits(o) == OLD.bits(first)).all())                # the old EXACT: PASS (a no-op on NaN)
+        ok, det = FB.repeat_check(o, first)
+        assert not ok and "bit for bit: True" in det and "last 1 (first at (6, %d, %d))" % (h, d) in det, det
+    outs, _ = _fb_world(FB, B)
+    o = outs["FORK"]
+    assert FB.repeat_check(o, o.clone())[0]                                 # finite and identical: PASS
+    o2 = o.clone()
+    o2.view(-1)[123] += 0.5
+    assert not FB.repeat_check(o2, o)[0]                                    # finite and different: FAIL
+    outs, ref = _fb_world(FB, B)                                            # no reference row: FAIL (fail closed)
+    ok, det = FB.num_verdict(FB.num_check("FORK1R", outs["NS1R1"], {k: v for k, v in ref.items() if k[1] != 0}, B))
+    assert not ok and "no row checked" in det
+    # the decision lines: a planted NaN makes the variant INVALID in the ratios and the flash timing
+    outs, ref = _fb_world(FB, B)
+    outs["NS1R1"].view(-1)[0] = float("nan")
+    valid = {v: True for v in FB.variants((2,))}
+    valid["NS1R1"] = FB.num_verdict(FB.num_check("NS1R1", outs["NS1R1"], ref, B))[0]
+    assert valid["NS1R1"] is False
+    s = FB.summarize({v: [32.0, 33.0, 34.0] for v in valid}, 216, 32, valid, (2,))
+    assert s["ratios"]["FORK1R/NS1R1"]["valid"] is False and "INVALID" in s["ratios"]["FORK1R/NS1R1"]["note"]
+    assert s["ratios"]["FORK1R/NS1R1_CP"]["valid"] is True and s["flash_timing"]["NS1R1"]["valid"] is False
+    valid["FLASHU1"] = False
+    assert "fork_minus_flashu1_ms_per_pass" not in FB.summarize({v: [32.0] * 3 for v in valid}, 216, 32, valid, (2,))
+    _ev("J1F NONFINITE: new NUM fails every plant (NaN/+Inf/-Inf x out/ref/both, 3 variants); the old accumulation "
+        "passed %d of %d plants: %s" % (sum(old_pass.values()), len(old_pass),
+                                        sorted(k for k, v in old_pass.items() if v)))
+
+
+def test_forkbench_out_view():
+    """The direct write: swapped_out_view puts the op's swapped output (N, HQ/HKV, HKV, HD) where the op's own return
+    (flash_api.cpp: out.transpose(1, 2).reshape(N, 1, HQ, HD)) puts it, with the strides of the wrapper's own output
+    (torch.empty_like of the swapped q); the call passes it at the op's out_ position, every other argument = the
+    wrapper's; the installed wrapper passes None there; only the _CP variants copy_."""
+    FB = _mod("r2_j1_forkbench")
+    N, G = 3, FB.HQ // FB.HKV
+    out = torch.zeros(N, 1, FB.HQ, FB.HD, dtype=torch.bfloat16)
+    v = FB.swapped_out_view(out, FB.HKV)
+    q = torch.randn(N, 1, FB.HQ, FB.HD).to(torch.bfloat16)
+    qs = q.reshape(N, FB.HKV, G, FB.HD).transpose(1, 2)                   # flash_api.cpp: the swapped q
+    assert tuple(v.shape) == tuple(qs.shape) == (N, G, FB.HKV, FB.HD) and v.data_ptr() == out.data_ptr()
+    assert v.stride() == torch.empty_like(qs).stride() and v.stride(-1) == 1   # = the wrapper's output layout
+    S = torch.randn(N, G, FB.HKV, FB.HD).to(torch.bfloat16)                # what the kernel writes (swapped)
+    v.copy_(S)
+    assert torch.equal(out, S.transpose(1, 2).reshape(N, 1, FB.HQ, FB.HD))   # = the op's own return transform
+    for n, g, k in ((0, 0, 0), (1, 3, 1), (2, G - 1, FB.HKV - 1)):         # head k * G + g = swapped [g, k]
+        assert torch.equal(out[n, 0, k * G + g], S[n, g, k]) and torch.equal(qs[n, g, k], q[n, 0, k * G + g])
+    for bad in (torch.zeros(N, 2, FB.HQ, FB.HD), torch.zeros(N, 1, FB.HQ, FB.HD).transpose(2, 3)):
+        with pytest.raises(AssertionError):
+            FB.swapped_out_view(bad, FB.HKV)
+    src = (EFF / "r2_j1_forkbench.py").read_text()                       # the call: the op's out_ = ov
+    tree = ast.parse(src)
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and
+             n.func.id == "FAOP"]
+    assert len(calls) == 1 and len(calls[0].args) == 21 and not calls[0].keywords
+    got = [ast.unparse(a) for a in calls[0].args]
+    want = ["qx", "kc", "vc", "bc", "None", "None", "lens", "None", "None", "cbi", "None", "None", "None", "ov", "scale",
+            "False", "-1", "-1", "0.0", "True", "SPLITS"]
+    assert got == want, got
+    assert src.count(".copy_(FA(") == 1 and "def wrapper_cp():\n            o_cp.copy_(FA(" in src   # only _CP copies
+    assert "FAOP = FAI.flash_attn_cuda.fwd_kvcache" in src
+    spec = importlib.util.find_spec("flash_attn_nosa")                    # the installed wrapper (not imported)
+    if spec is None or not spec.origin:
+        pytest.skip("flash_attn_nosa not installed here")
+    itxt = (Path(spec.origin).parent / "flash_attn_interface.py").read_text()
+    assert "import flash_attn_2_cuda_nosa as flash_attn_cuda" in itxt
+    m = re.search(r"out, softmax_lse = flash_attn_cuda\.fwd_kvcache\((.*?)\n    \)", itxt, re.S)
+    wargs = [x.strip() for x in m.group(1).split(",") if x.strip()]
+    assert wargs == ["q", "k_cache", "v_cache", "kv_bias", "k", "v", "cache_seqlens", "rotary_cos", "rotary_sin",
+                     "cache_batch_idx", "cache_leftpad", "block_table", "alibi_slopes", "None", "softmax_scale",
+                     "causal", "window_size[0]", "window_size[1]", "softcap", "rotary_interleaved", "num_splits"], wargs
+    for line in ("softcap=0.0", "rotary_interleaved=True", "window_size=(-1, -1)", "causal=False",
+                 "softmax_scale = q.shape[-1] ** (-0.5)"):                 # the wrapper's defaults = the direct call's
+        assert line in itxt, line
+    cpp = ROOT / "dependencies/flash-attention-nosa/csrc/flash_attn_nosa/flash_api.cpp"
+    if cpp.is_file():
+        ctxt = cpp.read_text()
+        sig = ctxt[ctxt.index("mha_fwd_kvcache(at::Tensor &q"):]
+        sig = sig[:sig.index(") {")]
+        params = [x.split("//")[0].strip() for x in sig.split("\n")]
+        names_ = [re.findall(r"&?(\w+)\s*,?$", p)[0] for p in params if p]
+        assert names_.index("out_") == 13 and len(names_) == 21, names_
+        assert "out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});" in ctxt
+        assert "CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_og);" in ctxt
+    _ev("J1F OUTVIEW: the direct call passes the out_ view at position 13 of the installed op %s; layout = the op's "
+        "return" % spec.origin)
+
+
+def test_forkbench_timing_plumbing():
+    """The timing loop with a FAKE timer (CUDA events do not run on the CPU): warm-up passes first, then the rotated
+    rounds, `layers` calls per pass, the stop after the budget; summarize's kernel / copy / total split per control."""
+    FB = _mod("r2_j1_forkbench")
+    names = list(FB.variants((2,)))
+    seen = []
+    parts = {v: (lambda v=v: seen.append(v)) for v in names}
+    ms = {v: 10.0 + i for i, v in enumerate(names)}
+    for x in FB.FLASH:
+        ms[x], ms[x + "_CP"], ms[x + "_CO"] = 20.0, 24.0, 1.5
+    by_fn = {id(parts[v]): v for v in names}
+
+    def fake_timer(fn, layers):
+        for _ in range(layers):
+            fn()
+        return ms[by_fn[id(fn)]]
+    times, warm, stop = FB.time_variants(parts, names, 3, 2, 4, fake_timer, 0.0, 1e9, clock=lambda: 1.0)
+    assert stop is None and all(len(warm[v]) == 2 and len(times[v]) == 4 for v in names)
+    k = 2 * 3 * len(names)                                                  # the warm-up calls, in list order
+    assert seen[:k] == [v for v in names for _ in range(2 * 3)]
+    rounds = [seen[k + i * 3 * len(names):k + (i + 1) * 3 * len(names):3] for i in range(4)]
+    assert rounds == [FB.rotation(names, r) for r in range(4)]
+    assert len(seen) == 3 * len(names) * 6
+    t2, _, stop2 = FB.time_variants(parts, names, 1, 1, 10, fake_timer, 0.0, 5.0, clock=iter([1.0, 6.0, 9.0]).__next__)
+    assert stop2 == "wall clock above 5 s after pass 1" and all(len(t2[v]) == 2 for v in names)
+    s = FB.summarize(times, 216, 32, {v: True for v in names}, (2,))
+    for x in FB.FLASH:
+        assert s["flash_timing"][x] == dict(kernel_ms_pass=20.0, copy_only_ms_pass=1.5, total_j1f_form_ms_pass=24.0,
+                                            rest_ms_pass=2.5, valid=True), s["flash_timing"][x]
+    assert s["ratios"]["FORK1R/NS1R1"]["ratio"] == round(ms["FORK1R"] / 20.0, 4)
+    assert s["ratios"]["FORK1R/NS1R1_CP"]["ratio"] == round(ms["FORK1R"] / 24.0, 4)
+    src = (EFF / "r2_j1_forkbench.py").read_text()                       # run_shape times through this loop
+    assert "time_variants(parts, names, a.layers, a.warmup, a.reps, cuda_timer, t0, a.max_shape_s)" in src
+    _ev("J1F TIMING: fake-timer plumbing; flash split %s" % s["flash_timing"]["NS1R1"])
 
 
 # ------------------------------------------------------------------ CELL

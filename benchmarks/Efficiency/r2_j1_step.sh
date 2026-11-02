@@ -26,7 +26,8 @@
 #        STEP_MIN 125, --mem 240G. STOPS while PRED_STAMP_J1 is None.
 #   j1f  the FORK MICROBENCH (benchmarks/Efficiency/r2_j1_forkbench.py; grant GRANT_j1f in THAT file): no model, no
 #        workload; synthetic pages of the measured shapes (B 216, B 318; union 72); variants FORK, FORKT, FORK3D2/4/8,
-#        FORK1R, NS1R1, NS1x4, FLASHU1, NSRU; 32 calls per pass, 10 order-rotated passes. STEP_MIN 25 (the image hash of
+#        FORK1R, NS1R1, NS1x4, FLASHU1, NSRU (direct out_ write) and each flash control's _CP (j1f form: wrapper +
+#        copy_) and _CO (copy_ alone); 32 calls per pass, 10 order-rotated passes. STEP_MIN 25 (the image hash of
 #        23 GB inside it), --mem 64G, OUT_MB 60.
 #   j1b  timing, C 73 (pool 10), B 318, 512 steps, arms L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDJ1. STEP_MIN
 #        170, --mem 340G. STOPS while PRED_STAMP_J1 is None.

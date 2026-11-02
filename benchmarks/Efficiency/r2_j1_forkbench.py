@@ -16,18 +16,30 @@ of the MEASURED shapes, in matched pairs:
   FLASHU1  the same call on ONE row per request over the 72 UNION pages: the flash rate on the fork's own bytes
   NSRU     the same call on the 4 rows over ONE shared union window per request (cache_batch_idx, per-entry masking
            bias: verify_rows route 1): the shipped kernel's own read sharing (through L2)
+OUTPUT WRITE (j1f source follow-up, 2026-11-02): the FORK variants write their preallocated output directly. The four
+flash controls above (NS1R1, NS1x4, FLASHU1, NSRU) now do the same: they call the library's own binding
+(flash_attn_2_cuda_nosa.fwd_kvcache, the op that flash_attn_with_kvcache calls; the wrapper passes None at its out_
+argument) with out_ = a view of the preallocated output in the kernel's swapped (B, HQ/HKV, HKV, HD) layout
+(swapped_out_view). Each control has two more variants:
+  <X>_CP   the j1f form: the wrapper returns a new tensor and the timed region copy_s it into the output (the old
+           numbers of X were this variant)
+  <X>_CO   the copy_ alone (the same bytes, from <X>_CP's output into a separate buffer)
+So kernel-only = X, copy-only = X_CO, total (j1f form) = X_CP; the rest X_CP - X - X_CO = the wrapper's allocations.
 MATCHED PAIRS (the summary's ratios): FORK / FLASHU1 (equal logical bytes: the cost of 4 rows' tile at the same bytes);
 FORK1R / NS1R1 (equal rows and bytes: the fork kernel's per-byte efficiency); FORK / NS1x4 (equal rows: the saving of
-the shared read); FORKT / FORK (the union build); FORK3Dn / FORK (the split); NSRU / FORK.
+the shared read); FORKT / FORK (the union build); FORK3Dn / FORK (the split); NSRU / FORK. The same pairs against the
+<X>_CP variants reproduce the j1f form. j1f's per-byte ratios need this rerun to be re-scored.
 LOGICAL BYTES per call: pages x BLOCK_BYTES (K + V + bias of one (KV head, block)) x KV heads x requests (or entries);
 achieved logical TB/s = bytes / time. Logical, not DRAM counters: an ncu pass is a separate option of the lead.
 GATES (MUST unless noted): <shape>-RUN; <shape>-UNION (FORK union_len 72, FORK1R 64 everywhere); <shape>-<v>-EXACT
-(every variant's output after its last timed pass = its first output, bit for bit: deterministic); <shape>-FORK3Dn-PATH
-(REPORT: the 3D launch wrote its NaN-filled segment maxima; if not, the variant is INVALID); <shape>-FORKT-EQ
-(FORKT = FORK bit for bit); <shape>-<v>-NUM (max |output - float64 reference| <= TOL on --sample requests, every row
-and head; FORK3Dn: REPORT); <shape>-BUDGET; RUN-WALL. A variant whose NUM or EXACT fails is reported INVALID in the
-ratios.
-NO NEW KERNEL: the fork (fia6's blob), flash_attn_nosa's call, torch ops. Synthetic inputs (seeded, x 0.05 bf16).
+(every variant's output after its last timed pass = its first output, bit for bit, AND both hold only finite values:
+identical NaN bits fail); <shape>-FORK3Dn-PATH (REPORT: the 3D launch wrote its NaN-filled segment maxima; if not, the
+variant is INVALID); <shape>-FORKT-EQ (FORKT = FORK bit for bit); <shape>-<X>-OUTEQ (the direct out_ write = the j1f
+form X_CP, bit for bit); <shape>-<v>-NUM (every checked value of the output, of the float64 reference and of their
+difference is finite (torch.isfinite, before any accumulation; a FAIL names the count and the first index), and max
+|output - float64 reference| <= TOL on --sample requests, every row and head; FORK3Dn: REPORT); <shape>-BUDGET;
+RUN-WALL. A variant whose NUM, EXACT or OUTEQ fails is reported INVALID in the ratios (the decision lines say INVALID).
+NO NEW KERNEL: the fork (fia6's blob), flash_attn_nosa's op, torch ops. Synthetic inputs (seeded, x 0.05 bf16).
 Order-rotated passes (lesson L62) after a warm-up of each variant; one pass = --layers calls (one per layer).
 GRANT: GRANT_j1f below (default deny; r2_j1_step.sh reads it at <sha>).
 EXIT: the number of failed MUST gates (0-19); 20 refused; 30 an exception outside a shape.
@@ -55,7 +67,8 @@ FORK_LAUNCH = dict(num_warps=4, num_stages=3, tile_size=64)   # = verify_rows.FO
 SPLITS = 4                                                    # NOSI_ATTN_SPLITS of the cells (the shipped call)
 MASK_BIAS = -3.0e4                                            # = verify_rows.MASK_BIAS
 TOL = 1e-3                                                    # fia5's numeric tolerance (float64 reference)
-BASE = ("FORK", "FORKT", "FORK1R", "NS1R1", "NS1x4", "FLASHU1", "NSRU")
+FLASH = ("NS1R1", "NS1x4", "FLASHU1", "NSRU")                 # the flash controls (direct out_ write)
+BASE = ("FORK", "FORKT", "FORK1R") + tuple(x + s for x in FLASH for s in ("", "_CP", "_CO"))   # _CP before _CO
 
 
 def log(msg):
@@ -104,7 +117,12 @@ def row_pages(b: int, r: int):
 
 
 def work(name: str, B: int) -> dict:
-    """Rows per call and LOGICAL pages per call (summed over (KV head, request or entry)) of a variant."""
+    """Rows per call and LOGICAL pages per call (summed over (KV head, request or entry)) of a variant. <X>_CP: X's
+    work; <X>_CO (the copy alone): no attention work (rows 0, pages 0)."""
+    if name.endswith("_CO") and name[:-3] in FLASH:
+        return dict(rows=0, pages=0)
+    if name.endswith("_CP") and name[:-3] in FLASH:
+        name = name[:-3]
     if name.startswith("FORK3D") or name in ("FORK", "FORKT"):
         return dict(rows=R * B, pages=HKV * B * UNION)
     if name in ("FORK1R", "NS1R1"):
@@ -138,11 +156,16 @@ PAIRS = (("FORK", "FLASHU1", "equal logical bytes (union 72): the 4-row tile's c
          ("FORK", "NS1x4", "equal rows (4 per request): the shared read's saving vs the baseline's 4 calls"),
          ("FORKT", "FORK", "the in-kernel union build's cost"),
          ("NSRU", "FORK", "the shipped kernel's own sharing (L2) vs the fork"))
+PAIRS_CP = (("FORK", "FLASHU1_CP", "j1f form (flash: wrapper + copy_): equal logical bytes"),
+            ("FORK1R", "NS1R1_CP", "j1f form (flash: wrapper + copy_): equal rows and bytes"),
+            ("FORK", "NS1x4_CP", "j1f form (flash: wrapper + copy_): equal rows"),
+            ("NSRU_CP", "FORK", "j1f form (flash: wrapper + copy_): the shipped kernel's own sharing vs the fork"))
 
 
 def summarize(times: dict, B: int, layers: int, valid: dict, segments) -> dict:
     """Per variant: median ms per pass and per call, logical bytes per call, logical TB/s; the matched ratios (INVALID
-    where a member failed its NUM or EXACT gate); the 3D split vs FORK; the decomposition of FORK - FLASHU1."""
+    where a member failed its NUM, EXACT or OUTEQ gate); the 3D split vs FORK; the decomposition of FORK - FLASHU1;
+    per flash control: kernel-only (X), copy-only (X_CO), total in the j1f form (X_CP) and the rest."""
     st = {k: stats(v) for k, v in times.items()}
     per = {}
     for k, s in st.items():
@@ -152,19 +175,29 @@ def summarize(times: dict, B: int, layers: int, valid: dict, segments) -> dict:
         ms = s["median"] / layers
         by = w["pages"] * BLOCK_BYTES
         per[k] = dict(ms_pass=s["median"], ms_call=round(ms, 5), rows=w["rows"], pages=w["pages"], bytes=by,
-                      logical_tb_s=round(by / (ms * 1e-3) / 1e12, 4) if ms > 0 else None, valid=bool(valid.get(k)))
+                      logical_tb_s=round(by / (ms * 1e-3) / 1e12, 4) if ms > 0 and by > 0 else None,
+                      valid=bool(valid.get(k)))
     ratios = {}
-    pairs = list(PAIRS) + [("FORK3D%d" % s, "FORK", "the 3D split (%d segments) vs the 2D launch" % s)
-                           for s in segments]
+    pairs = list(PAIRS) + list(PAIRS_CP) + [("FORK3D%d" % s, "FORK", "the 3D split (%d segments) vs the 2D launch" % s)
+                                            for s in segments]
     for a_, b_, what in pairs:
         if a_ in per and b_ in per:
             ok = per[a_]["valid"] and per[b_]["valid"]
             ratios["%s/%s" % (a_, b_)] = dict(ratio=round(per[a_]["ms_call"] / per[b_]["ms_call"], 4), what=what,
-                                              valid=ok, note=None if ok else "INVALID: a member failed NUM or EXACT")
+                                              valid=ok, note=None if ok else
+                                              "INVALID: a member failed NUM, EXACT or OUTEQ")
     out = dict(stats_ms=st, per=per, ratios=ratios)
-    if "FORK" in per and "FLASHU1" in per:
+    if "FORK" in per and "FLASHU1" in per and per["FORK"]["valid"] and per["FLASHU1"]["valid"]:
         f, u = per["FORK"]["ms_call"], per["FLASHU1"]["ms_call"]
         out["fork_minus_flashu1_ms_per_pass"] = round((f - u) * layers, 3)
+    ft = {}
+    for x in FLASH:
+        if x in per and x + "_CP" in per and x + "_CO" in per:
+            k_, cp, co = per[x]["ms_pass"], per[x + "_CP"]["ms_pass"], per[x + "_CO"]["ms_pass"]
+            ft[x] = dict(kernel_ms_pass=k_, copy_only_ms_pass=co, total_j1f_form_ms_pass=cp,
+                         rest_ms_pass=round(cp - k_ - co, 4),
+                         valid=per[x]["valid"] and per[x + "_CP"]["valid"] and per[x + "_CO"]["valid"])
+    out["flash_timing"] = ft
     d3 = [(per[k]["ms_call"], k) for k in per if k.startswith("FORK3D") and per[k]["valid"]]
     if d3 and "FORK" in per:
         best = min(d3)
@@ -173,12 +206,126 @@ def summarize(times: dict, B: int, layers: int, valid: dict, segments) -> dict:
     return out
 
 
+def swapped_out_view(out, hkv: int):
+    """The view of a preallocated (N, 1, HQ, HD) output that fwd_kvcache's out_ argument needs. With one query row,
+    HQ > HKV, no window and HD % 8 == 0, the op swaps q to (N, HQ/HKV, HKV, HD) (q.reshape(N, HKV, G, HD).transpose(1,
+    2)) and checks out_ against THAT shape; it then returns out.transpose(1, 2).reshape(N, 1, HQ, HD). This view puts
+    element [n, g, k, d] of the swapped output at [n, 0, k * G + g, d] of `out`: the wrapper's own return layout."""
+    n, s, hq, hd = out.shape
+    assert s == 1 and hq % hkv == 0 and hq > hkv and hd % 8 == 0 and out.is_contiguous(), (tuple(out.shape), hkv)
+    return out.view(n, hkv, hq // hkv, hd).transpose(1, 2)
+
+
+def nonfinite(t):
+    """(count of non-finite values in t, the index of the first one or None). torch.isfinite: NaN, +Inf, -Inf."""
+    import torch
+    bad = ~torch.isfinite(t)
+    n = int(bad.sum())
+    return n, (tuple(int(i) for i in bad.nonzero()[0]) if n else None)
+
+
+def out_row(name: str, out, key, B: int):
+    """The output row (HQ, HD) of variant `name` for the reference key (b, r), or None when the variant does not
+    compute that row. <X>_CP and <X>_CO hold X's rows."""
+    b, r = key
+    base = name[:-3] if name.endswith(("_CP", "_CO")) else name
+    if base in ("FORK1R", "NS1R1"):
+        return out.view(B, HQ, HD)[b] if r == 0 else None
+    if base == "FLASHU1":
+        return out.view(B, HQ, HD)[b] if r == "U" else None
+    return None if r == "U" else out.view(B * R, HQ, HD)[b * R + r]
+
+
+def num_check(name: str, out, ref: dict, B: int) -> dict:
+    """Over the sampled requests (every row the variant computes, every head): torch.isfinite on the output, on the
+    float64 reference and on their difference FIRST; a row with any non-finite value is counted (the first index kept)
+    and never enters the max. err = max |output - reference| over the finite rows (a NaN cannot vanish in the max)."""
+    import torch
+    err, bad, first, rows = 0.0, 0, None, 0
+    for key, want in ref.items():
+        got = out_row(name, out, key, B)
+        if got is None:
+            continue
+        rows += 1
+        g = got.double()
+        d = g - want
+        fin = torch.isfinite(g) & torch.isfinite(want) & torch.isfinite(d)
+        if not bool(fin.all()):
+            nf = ~fin
+            bad += int(nf.sum())
+            if first is None:
+                h, x = (int(i) for i in nf.nonzero()[0])
+                first = dict(request=key[0], row=key[1], head=h, dim=x, out=repr(float(g[h, x])),
+                             ref=repr(float(want[h, x])))
+            continue
+        err = max(err, float(d.abs().max()))
+    return dict(err=err, nonfinite=bad, first=first, rows=rows)
+
+
+def num_verdict(chk: dict, tol: float = TOL):
+    """(passed, detail) of a NUM gate: FAIL on any non-finite value (count and first index), on no checked row, or
+    on err > tol."""
+    if chk["nonfinite"]:
+        f = chk["first"]
+        return False, ("NON-FINITE: %d value(s) in the output, the float64 reference or their difference; first at "
+                       "request %s row %s head %d dim %d (out %s, ref %s); max |out - float64| over the finite rows "
+                       "%.3e" % (chk["nonfinite"], f["request"], f["row"], f["head"], f["dim"], f["out"], f["ref"],
+                                 chk["err"]))
+    if not chk["rows"]:
+        return False, "no row checked (no reference row for this variant)"
+    return chk["err"] <= tol, "max |out - float64| %.3e over %d rows (tol %.0e)" % (chk["err"], chk["rows"], tol)
+
+
+def repeat_check(out, first):
+    """(passed, detail) of an EXACT gate: the output after the last pass = the first output bit for bit AND both
+    hold only finite values (identical NaN bits are equal bits; they FAIL here)."""
+    eq = bool((bits(out) == bits(first)).all())
+    n1, i1 = nonfinite(out)
+    n0, i0 = nonfinite(first)
+    ok = eq and n1 == 0 and n0 == 0
+    return ok, "output after the last pass = the first output, bit for bit: %s; non-finite values: last %d (first at " \
+               "%s), first output %d (first at %s)" % (eq, n1, i1, n0, i0)
+
+
+def time_variants(parts: dict, names, layers: int, warmup: int, reps: int, timer, t0: float, max_s: float,
+                  clock=time.perf_counter):
+    """The order-rotated timing loop: `warmup` passes of each variant, then `reps` rounds in rotated order; one pass =
+    timer(callable, layers) in ms. Stops after a round once clock() - t0 > max_s. Returns (times, warm, stop)."""
+    times = {v: [] for v in names}
+    warm = {v: [] for v in names}
+    for v in names:
+        for _ in range(warmup):
+            warm[v].append(timer(parts[v], layers))
+    stop = None
+    for r in range(reps):
+        for v in rotation(names, r):
+            times[v].append(timer(parts[v], layers))
+        if clock() - t0 > max_s:
+            stop = "wall clock above %.0f s after pass %d" % (max_s, r)
+            break
+    return times, warm, stop
+
+
+def cuda_timer(fn, layers: int) -> float:
+    """One pass on the GPU: `layers` calls between two CUDA events; ms."""
+    import torch
+    e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    e0.record()
+    for _ in range(layers):
+        fn()
+    e1.record()
+    torch.cuda.synchronize()
+    return float(e0.elapsed_time(e1))
+
+
 # ------------------------------------------------------------------ the GPU parts
 def build_gpu(B: int, seed: int, segments, sample: int):
     """The variants of one shape: {name: callable}, {name: output tensor}, meta (the union lengths, the references)."""
     import torch
     import fork_vllm_unified_attention as FK
     from flash_attn_nosa import flash_attn_with_kvcache as FA
+    from flash_attn_nosa import flash_attn_interface as FAI
+    FAOP = FAI.flash_attn_cuda.fwd_kvcache                                   # the op the wrapper FA calls
     dev = "cuda"
     g = torch.Generator(device="cpu").manual_seed(seed)
     bf = torch.bfloat16
@@ -246,30 +393,37 @@ def build_gpu(B: int, seed: int, segments, sample: int):
     bw4 = ab[flat].reshape(E, P_ROW * BS, HKV).contiguous()
     lens4 = ((P_ROW - 1) * BS + lastlen).to(i32).contiguous()
     qe = q.view(E, 1, HQ, HD)
-    oN4 = torch.zeros((E, 1, HQ, HD), dtype=bf, device=dev)
 
-    def ns1x4():
-        oN4.copy_(FA(qe, kw4, vw4, bw4, cache_seqlens=lens4, num_splits=SPLITS))
-    parts["NS1x4"], outs["NS1x4"] = ns1x4, oN4
+    def flash_set(x, qx, kc, vc, bc, lens, cbi=None):
+        """Control x three ways on the same inputs: x (the library op writes the preallocated output directly, as
+        FORK does), x_CP (the j1f form: the wrapper's new tensor copy_d into the output), x_CO (that copy_ alone)."""
+        o_d, o_cp, o_co = (torch.zeros((qx.shape[0], 1, HQ, HD), dtype=bf, device=dev) for _ in range(3))
+        ov = swapped_out_view(o_d, HKV)
+
+        def direct():                    # = flash_attn_with_kvcache's own op call with out_ = ov (it passes None)
+            FAOP(qx, kc, vc, bc, None, None, lens, None, None, cbi, None, None, None, ov, scale, False, -1, -1, 0.0,
+                 True, SPLITS)
+
+        def wrapper_cp():
+            o_cp.copy_(FA(qx, kc, vc, bc, cache_seqlens=lens, cache_batch_idx=cbi, num_splits=SPLITS))
+
+        def copy_co():
+            o_co.copy_(o_cp)
+        parts[x], outs[x] = direct, o_d
+        parts[x + "_CP"], outs[x + "_CP"] = wrapper_cp, o_cp
+        parts[x + "_CO"], outs[x + "_CO"] = copy_co, o_co
+    flash_set("NS1x4", qe, kw4, vw4, bw4, lens4)
     k1 = kw4.view(B, R, P_ROW * BS, HKV, HD)[:, 0].contiguous()
     v1 = vw4.view(B, R, P_ROW * BS, HKV, HD)[:, 0].contiguous()
     b1 = bw4.view(B, R, P_ROW * BS, HKV)[:, 0].contiguous()
     lens1 = torch.full((B,), (P_ROW - 1) * BS + LAST0, dtype=i32, device=dev)
     q1e = q1.view(B, 1, HQ, HD)
-    oN1 = torch.zeros((B, 1, HQ, HD), dtype=bf, device=dev)
-
-    def ns1r1():
-        oN1.copy_(FA(q1e, k1, v1, b1, cache_seqlens=lens1, num_splits=SPLITS))
-    parts["NS1R1"], outs["NS1R1"] = ns1r1, oN1
+    flash_set("NS1R1", q1e, k1, v1, b1, lens1)
     ku = ak[:B * UNION].view(B, UNION * BS, HKV, HD)                        # the union windows: arena views
     vu = av[:B * UNION].view(B, UNION * BS, HKV, HD)
     bu = ab[:B * UNION].view(B, UNION * BS, HKV)
     lensu = torch.full((B,), UNION * BS, dtype=i32, device=dev)
-    oU = torch.zeros((B, 1, HQ, HD), dtype=bf, device=dev)
-
-    def flashu1():
-        oU.copy_(FA(q1e, ku, vu, bu, cache_seqlens=lensu, num_splits=SPLITS))
-    parts["FLASHU1"], outs["FLASHU1"] = flashu1, oU
+    flash_set("FLASHU1", q1e, ku, vu, bu, lensu)
     j = torch.arange(UNION * BS, device=dev).view(1, UNION * BS) // BS           # the page of each union token
     sh = torch.tensor(ROW_SHIFT, device=dev).repeat(B).view(E, 1)
     vis = (j >= sh)                                                           # pages before the row's first: masked
@@ -277,11 +431,7 @@ def build_gpu(B: int, seed: int, segments, sample: int):
                                                                                    device=dev)).contiguous()
     lensR = ((sh.view(E) + P_ROW - 1) * BS + lastlen).to(i32).contiguous()
     cbi = (torch.arange(E, device=dev) // R).to(i32).contiguous()
-    oR = torch.zeros((E, 1, HQ, HD), dtype=bf, device=dev)
-
-    def nsru():
-        oR.copy_(FA(qe, ku, vu, biasE[:B], cache_seqlens=lensR, cache_batch_idx=cbi, num_splits=SPLITS))
-    parts["NSRU"], outs["NSRU"] = nsru, oR
+    flash_set("NSRU", qe, ku, vu, biasE[:B], lensR, cbi)
     # float64 references of the sampled requests
     idx = sorted({int(x) for x in torch.linspace(0, B - 1, min(sample, B)).round().tolist()})
     meta["sample"] = idx
@@ -313,27 +463,6 @@ def _ref(ak, av, ab, qrow, pages, last: int, scale: float):
     return out
 
 
-def num_err(name: str, out, ref: dict, B: int):
-    """max |output - reference| over the sampled requests (every row the variant computes, every head)."""
-    err = 0.0
-    for key, want in ref.items():
-        b, r = key
-        if name in ("FORK1R", "NS1R1"):
-            if r != 0:
-                continue
-            got = out.view(B, HQ, HD)[b]
-        elif name == "FLASHU1":
-            if r != "U":
-                continue
-            got = out.view(B, HQ, HD)[b]
-        else:
-            if r == "U":
-                continue
-            got = out.view(B * R, HQ, HD)[b * R + r]
-        err = max(err, float((got.double() - want).abs().max()))
-    return err
-
-
 def bits(t):
     import torch
     return t.view(torch.int16) if t.dtype == torch.bfloat16 else t
@@ -354,6 +483,10 @@ def run_shape(a, C: int, B: int, t0: float):
             gates.append(("%s-%s-RUN" % (name, v), not v.startswith("FORK3D"), False, "EXCEPTION %s: %s" % (
                 type(e).__name__, str(e)[:200])))
             parts.pop(v)
+    for x in FLASH:                                                           # x_CO copies x_CP's output: without
+        if x + "_CO" in parts and x + "_CP" not in parts:                     # it, the copy has no meaning
+            gates.append(("%s-%s_CO-RUN" % (name, x), True, False, "dropped: its source %s_CP did not run" % x))
+            parts.pop(x + "_CO")
     names = [v for v in names if v in parts]
     torch.cuda.synchronize()
     gates.append(("%s-UNION" % name, True, bool((ln4 == UNION).all()) and bool((ln1 == P_ROW).all()),
@@ -367,40 +500,27 @@ def run_shape(a, C: int, B: int, t0: float):
         gates.append(("%s-%s-PATH" % (name, v), False, path3d[v], "3D path taken (segment maxima written): %s" % (
             path3d[v])))
     for v in names:
-        e = num_err(v, outs[v], ref, B)
-        ok = e <= TOL and path3d.get(v, True)                                # a FORK3D without its 3D launch: INVALID
+        ok, detail = num_verdict(num_check(v, outs[v], ref, B))             # isfinite first, then the max
+        ok = ok and path3d.get(v, True)                                      # a FORK3D without its 3D launch: INVALID
         valid[v] = ok
-        gates.append(("%s-%s-NUM" % (name, v), not v.startswith("FORK3D"), ok, "max |out - float64| %.3e over "
-                      "requests %s (tol %.0e)" % (e, meta["sample"], TOL)))
+        gates.append(("%s-%s-NUM" % (name, v), not v.startswith("FORK3D"), ok, "%s; requests %s" % (
+            detail, meta["sample"])))
     if "FORKT" in first:
         eq = bool((bits(first["FORKT"]) == bits(first["FORK"])).all())
         gates.append(("%s-FORKT-EQ" % name, True, eq, "FORKT = FORK bit for bit: %s" % eq))
-    times = {v: [] for v in names}
-    warm = {v: [] for v in names}
-
-    def one(v):
-        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        e0.record()
-        for _ in range(a.layers):
-            parts[v]()
-        e1.record()
-        torch.cuda.synchronize()
-        return float(e0.elapsed_time(e1))
+    for x in FLASH:                                                          # the direct write = the j1f form
+        if x in first and x + "_CP" in first:
+            eq = bool((bits(first[x]) == bits(first[x + "_CP"])).all())
+            n_d, n_cp = nonfinite(first[x])[0], nonfinite(first[x + "_CP"])[0]
+            ok = eq and n_d == 0 and n_cp == 0
+            valid[x] = valid[x] and ok
+            gates.append(("%s-%s-OUTEQ" % (name, x), True, ok, "direct out_ write = %s_CP (wrapper + copy_) bit for "
+                          "bit: %s; non-finite values: direct %d, %s_CP %d" % (x, eq, n_d, x, n_cp)))
+    times, warm, stop = time_variants(parts, names, a.layers, a.warmup, a.reps, cuda_timer, t0, a.max_shape_s)
     for v in names:
-        for _ in range(a.warmup):
-            warm[v].append(one(v))
-    stop = None
-    for r in range(a.reps):
-        for v in rotation(names, r):
-            times[v].append(one(v))
-        if time.perf_counter() - t0 > a.max_shape_s:
-            stop = "wall clock above %.0f s after pass %d" % (a.max_shape_s, r)
-            break
-    for v in names:
-        eq = bool((bits(outs[v]) == bits(first[v])).all())
+        eq, d = repeat_check(outs[v], first[v])
         valid[v] = valid[v] and eq
-        gates.append(("%s-%s-EXACT" % (name, v), not v.startswith("FORK3D"), eq,
-                      "output after the last pass = the first output, bit for bit: %s" % eq))
+        gates.append(("%s-%s-EXACT" % (name, v), not v.startswith("FORK3D"), eq, d))
     summ = summarize(times, B, a.layers, valid, a.segments)
     wall = time.perf_counter() - t0
     gates.append(("%s-BUDGET" % name, True, wall <= a.max_shape_s and stop is None, "wall %.1f s (limit %.0f); stop "
@@ -458,6 +578,10 @@ def main(argv=None) -> int:
                 name, v, p["ms_call"], p["ms_pass"], p["rows"], p["bytes"] / 1e9, p["logical_tb_s"], p["valid"]))
         for k, v in s["ratios"].items():
             print("J1F %s RATIO %s = %s (%s)%s" % (name, k, v["ratio"], v["what"], "" if v["valid"] else " INVALID"))
+        for x, t in s["flash_timing"].items():
+            print("J1F %s FLASHT %-7s kernel-only %.3f, copy-only %.3f, total (j1f form) %.3f, rest %.3f ms per pass%s"
+                  % (name, x, t["kernel_ms_pass"], t["copy_only_ms_pass"], t["total_j1f_form_ms_pass"],
+                     t["rest_ms_pass"], "" if t["valid"] else " INVALID"))
         print("J1F %s FORK - FLASHU1 = %s ms per pass; best 3D %s" % (name, s.get("fork_minus_flashu1_ms_per_pass"),
                                                                        s.get("best_3d")))
     failed = [g[0] for g in gates if g[1] and not g[2]]
