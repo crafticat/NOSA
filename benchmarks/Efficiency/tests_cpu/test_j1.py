@@ -941,6 +941,108 @@ def test_forkbench_best3d_validity():
     _ev("J1F BEST3D: FORK invalid -> saving suppressed (old source reported %s ms)" % so["best_3d"]["saving_ms_per_pass"])
 
 
+def test_forkbench_rows_sweep_pure():
+    """TRACK 2: the rows sweep's work, row mapping, bit check, slopes, suppression and decision lines (CPU)."""
+    FB = _mod("r2_j1_forkbench")
+    B = 287
+    v = FB.variants((2,))
+    assert all(x in v for x in FB.ROWS) and FB.ROWS == ("RSM1", "RSM2", "RSM3", "RSM4", "RSQ1", "RSQ2", "RSQ4")
+    for x in FB.ROWS:                                                    # fixed union bytes, n active rows
+        assert FB.work(x, B) == dict(rows=int(x[3:]) * B, pages=2 * B * 72), x
+    Bs = 3
+    g = torch.Generator().manual_seed(5)
+    forkt = (torch.randn(Bs * 4, FB.HQ, FB.HD, generator=g) * 0.05).to(torch.bfloat16)
+    for n in (1, 2, 3, 4):
+        got = forkt.view(Bs, 4, FB.HQ, FB.HD)[:, :n].contiguous().view(Bs * n, FB.HQ, FB.HD)
+        for pre in ("RSM", "RSQ") if n != 3 else ("RSM",):
+            ok, det = FB.rows_eq("%s%d" % (pre, n), got, forkt, Bs)
+            assert ok and "0 values differ" in det, det
+            assert torch.equal(FB.out_row("%s%d" % (pre, n), got, (2, n - 1), Bs), forkt[2 * 4 + n - 1])
+            assert FB.out_row("%s%d" % (pre, n), got, (2, n), Bs) is None if n < 4 else True
+        bad = got.clone()
+        bad.view(-1)[7] += 0.25                                         # PLANT: one value off
+        assert not FB.rows_eq("RSM%d" % n, bad, forkt, Bs)[0]
+        bad = got.clone()
+        bad.view(-1)[7] = float("nan")                                  # PLANT: NaN
+        assert "non-finite 1" in FB.rows_eq("RSM%d" % n, bad, forkt, Bs)[1]
+    ms = dict(FORK=34.0, FORKT=33.0, FORK1R=22.0, RSM1=30.0, RSM2=31.0, RSM3=32.0, RSM4=33.0, RSQ1=24.0, RSQ2=27.0,
+              RSQ4=33.0)
+    valid = {x: True for x in ms}
+    s = FB.summarize({x: [t] * 3 for x, t in ms.items()}, B, 32, valid, ())
+    rs = s["rows_sweep"]
+    assert rs["masked"]["slope_ms_per_row"] == 1.0 and rs["masked"]["rsm4_minus_forkt"] == 0.0
+    assert rs["tile"] == dict(ms_pass={1: 24.0, 2: 27.0, 4: 33.0}, per_row_1_to_2=3.0, per_row_2_to_4=3.0)
+    assert rs["e_fork_ms_pass"] == 2.0 and rs["tile4_fork_ms_pass"] == 9.0
+    s = FB.summarize({x: [t] * 3 for x, t in ms.items()}, B, 32, dict(valid, RSM2=False, RSQ1=False), ())
+    rs = s["rows_sweep"]
+    assert rs["masked"] is None and rs["tile"] is None and rs["e_fork_ms_pass"] is None
+    lines = FB.decision_lines("C81_B287", s)
+    assert [x for x in lines if "ROWS masked SUPPRESSED" in x] and [x for x in lines if "ROWS e_fork_ms_pass SUPP" in x]
+    src = (EFF / "r2_j1_forkbench.py").read_text()
+    assert "fork_call(qn, oM, cun, n, *tT, None, block_q=R)" in src and "fork_call(qn, oQ, cun, n, *tT, None)" in src
+    _ev("J1F ROWS: rows sweep plumbing; planted value / NaN detected")
+
+
+NCU_QUERY = """Device NVIDIA A100
+  dram__bytes_read                 # of bytes read from DRAM
+  gpu__time_duration               total duration in nanoseconds
+  lts__t_sectors_srcunit_tex_op_read   # of LTS sectors from unit TEX for reads
+  sm__warps_active                 cumulative # of warps in flight
+  launch__registers_per_thread     registers per thread
+"""
+
+
+def test_forkbench_ncu_plumbing(tmp_path):
+    """TRACK 2: the ncu argv, the metric query filter, the raw CSV parser (the fia6 record's real CSV when present,
+    else a written one) and the per-arm summary; the refusal of a missing ncu binary; the j1n arguments."""
+    FB = _mod("r2_j1_forkbench")
+    names = FB.ncu_metric_names(NCU_QUERY)
+    missing, metrics = FB.ncu_metric_list(names)
+    assert missing == [] and metrics[:3] == list(FB.NCU_REQUIRED)
+    assert "sm__warps_active.avg.pct_of_peak_sustained_active" in metrics and "launch__registers_per_thread" in metrics
+    assert "dram__bytes_write.sum" not in metrics                        # not in this query: not asked
+    assert FB.ncu_metric_list(names - {"dram__bytes_read"})[0] == ["dram__bytes_read.sum"]
+    a = FB.parse_args(["--out", "x", "--cell", "j1n", "--shapes", "81:287", "--segments", "2", "--ncu", "/n/ncu"])
+    argv = FB.ncu_argv("/n/ncu", a, 81, 287, "RSQ2", "/o/child", "/o/rep", metrics)
+    for want in (["--profile-from-start", "off"], ["--cache-control", "all"], ["--replay-mode", "kernel"],
+                 ["--mode", "ncu-cell"], ["--ncu-arms", "RSQ2"], ["--shapes", "81:287"], ["--cell", "j1n"]):
+        i = argv.index(want[0])
+        assert argv[i:i + 2] == want, (want, argv)
+    child = FB.parse_args(argv[argv.index(sys.executable) + 2:])        # the child's own arguments parse
+    assert child.mode == "ncu-cell" and child.ncu_arms == ("RSQ2",) and child.shapes == {81: 287}
+    for bad in (["--out", "x", "--ncu-arms", "NOPE"], ["--out", "x", "--mode", "ncu-cell", "--shapes", "81:287,73:318",
+                                                       "--ncu-arms", "FORK"]):
+        with pytest.raises(SystemExit):
+            FB.parse_args(bad)
+    real = Path("/mnt/beegfs/ojerbi/r2-runs/fiattn/fia6_l2a_2195574/ncu_216x1_raw.csv")
+    if real.is_file():                                                   # the real format (read only)
+        rows = FB.parse_ncu_csv(real.read_text(errors="replace"), ["gpu__time_duration.sum", "dram__bytes_read.sum"])
+        assert rows and all(r["gpu__time_duration.sum"] for r in rows), rows[:2]
+        assert rows[0]["name"] == "_bi_split_kernel" and rows[0]["dram__bytes_read.sum"] > 0
+    head = '"ID","Process ID","Kernel Name","gpu__time_duration.sum","dram__bytes_read.sum",' \
+           '"lts__t_sectors_srcunit_tex_op_read.sum","sm__warps_active.avg.pct_of_peak_sustained_active",' \
+           '"launch__registers_per_thread"'
+    text = "\n".join([head, '"","","","ns","byte","sector","%","register/thread"',
+                      '"0","1","kernel_unified_attention","1,200,000","1000000000","40000000","12.4","255"',
+                      '"1","1","kernel_unified_attention","300000","50000000","2000000","10.0","255"'])
+    rows = FB.parse_ncu_csv(text, metrics)
+    s = FB.ncu_arm_summary(rows, 1_000_000_000)
+    assert s["n_kernels"] == 2 and s["time_us"] == 1500.0 and s["dram_read"] == 1.05e9
+    assert s["dram_over_logical"] == 1.05 and s["l2sm_bytes"] == 42e6 * 32 and s["occupancy_pct"] == 12.4
+    assert s["registers"] == 255.0
+    with pytest.raises(ValueError):
+        FB.parse_ncu_csv("no header", metrics)
+    old = FB.GRANT_j1n
+    FB.GRANT_j1n = "2026-01-01T00:00:00Z"                               # a stand-in grant (restored below)
+    try:
+        assert FB.main(["--out", str(tmp_path / "o"), "--cell", "j1n", "--ncu", str(tmp_path / "no_ncu")]) == 20
+        assert not (tmp_path / "o").exists()
+    finally:
+        FB.GRANT_j1n = old
+    assert FB.GRANT_j1n is None and not FB.granted("j1n")
+    _ev("J1F NCU: argv %s ... ; summary %s" % (argv[:12], s))
+
+
 def test_forkbench_out_view():
     """The direct write: swapped_out_view puts the op's swapped output (N, HQ/HKV, HKV, HD) where the op's own return
     (flash_api.cpp: out.transpose(1, 2).reshape(N, 1, HQ, HD)) puts it, with the strides of the wrapper's own output
@@ -1165,6 +1267,22 @@ for tile in (64, 32):
                     fails.append(("EQ", tile, bname, lvl, build, nd))
                 if build and not torch.equal(t[0][:, :, :U], t0[0][:, :, :U]):
                     fails.append(("tables", tile, bname, lvl))
+        # THE ROWS SWEEP (r2_j1_forkbench RSMn / RSQn): n query rows per request on the same tables; BLOCK_Q 4
+        # (RSM) and BLOCK_Q n (RSQ, n in 1, 2, 4): rows 0 .. n-1 = the 4-row table read's rows
+        for n in (1, 2, 3, 4):
+            qn = q.view(B, R, HQ, HD)[:, :n].contiguous().view(B * n, HQ, HD)
+            cun = torch.arange(0, B * n + 1, n, dtype=i32)
+            for bq in ((R, n) if n in (1, 2) else (R,)):
+                on = torch.zeros(B * n, HQ, HD)
+                tq = tuple(x.clone() for x in t0)
+                FK.unified_attention(qn, ak, av, on, cun, n, seq, BS, scale, True, (-1, -1), tq[0], 0, None, None,
+                                     None, union_ext=tq[1], union_len=tq[2], cis_bias=bias, build_union=None,
+                                     rows_per_q_block=bq, num_warps=4, num_stages=3, tile_size=tile)
+                ok = same(on.view(B, n, HQ, HD).contiguous(), f_table.view(B, R, HQ, HD)[:, :n].contiguous())
+                lines.append("ROWS tile %d %s n %d BLOCK_Q %d: rows = the 4-row read's rows bitwise %s" % (
+                    tile, bname, n, bq, ok))
+                if not ok and bq == R:                        # RSM: MUST; RSQ (another BLOCK_M): REPORT
+                    fails.append(("ROWS", tile, bname, n, bq))
         # PLANT (L34): the failure mode of a wrong shift = tile j reads tile j + 1's page: must differ
         tp = tuple(x.clone() for x in t0)
         tp[0][0, 0, 2] = tp[0][0, 0, 3]
@@ -1516,6 +1634,12 @@ def test_step_script_j1():
                         "32", "--reps", "10", "--warmup", "2", "--seed", "7", "--sample", "8", "--max-shape-s", "300",
                         "--max-run-s", "900"])                          # the step script's j1f arguments parse
     assert fa.shapes == {128: 216, 73: 318} and fa.segments == (2, 4, 8)
+    assert "j1n) POOL=18 BATCH=0 STEPS=0 STEP_MIN=50 MEM=64G NEEDWL=0 OUT_MB=400" in src          # TRACK 2
+    assert "NCU=/opt/nvidia/nsight-compute/2025.1.0/ncu " in src and '--ncu "$NCU" --ncu-cap 240' in src
+    fn = FB.parse_args(["--out", "x", "--cell", "j1n", "--shapes", "81:287", "--segments", "2", "--layers", "32",
+                        "--reps", "6", "--warmup", "2", "--seed", "7", "--sample", "8", "--max-shape-s", "400",
+                        "--max-run-s", "600", "--ncu", "/opt/nvidia/nsight-compute/2025.1.0/ncu", "--ncu-cap", "240"])
+    assert fn.shapes == {81: 287} and fn.ncu_arms == FB.NCU_ARMS and fn.mode == "main"
     for bad in ("i4dca", "j1", "j1c"):
         r = _step(bad)
         assert r.returncode == 1 and "cell '%s'" % bad in r.stderr, (bad, r.returncode, r.stderr[-300:])

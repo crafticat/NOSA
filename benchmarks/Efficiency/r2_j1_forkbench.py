@@ -79,6 +79,18 @@ TOL = 1e-3                                                    # fia5's numeric t
 FLASH = ("NS1R1", "NS1x4", "FLASHU1", "NSRU")                 # the flash controls (end-to-end, direct output)
 AHEAD = ("FORKA1", "FORKA2", "FORKA3")                        # the fork with its loads ahead (ahead = 1, 2, 3)
 BASE = ("FORK", "FORKT") + AHEAD + ("FORK1R",) + tuple(x + s for x in FLASH for s in ("", "_CP", "_CO"))  # _CP < _CO
+# TRACK 2 (2026-11-02): the ROWS SWEEP over the SAME union tables as FORKT (built once by FORK's first call, read):
+ROWS_M = (1, 2, 3, 4)            # RSMn: BLOCK_Q 4 (FORKT's kernel and launch); rows >= n off by the query length
+ROWS_Q = (1, 2, 4)               # RSQn: BLOCK_Q n (tile rows 16 n); the query rows 0 .. n-1 of each request
+ROWS = tuple("RSM%d" % n for n in ROWS_M) + tuple("RSQ%d" % n for n in ROWS_Q)
+GRANT_j1n = None                 # the ncu cell (j1n): C 81 B 287 timing + the rows sweep + ncu per arm
+NCU_ARMS = ("FORK", "FORKT", "FORK1R", "FLASHU1", "NS1R1", "NS1x4", "RSM1", "RSM4", "RSQ1", "RSQ2", "RSQ4")
+NCU_REQUIRED = ("gpu__time_duration.sum", "dram__bytes_read.sum", "lts__t_sectors_srcunit_tex_op_read.sum")
+NCU_OPTIONAL = ("dram__bytes_write.sum", "sm__warps_active.avg.pct_of_peak_sustained_active",
+                "sm__warps_active.avg.per_cycle_active", "lts__t_sector_hit_rate.pct",
+                "launch__registers_per_thread", "launch__shared_mem_per_block_static",
+                "launch__shared_mem_per_block_dynamic", "launch__occupancy_limit_registers",
+                "launch__occupancy_limit_shared_mem", "launch__waves_per_multiprocessor", "launch__grid_size")
 
 
 def log(msg):
@@ -98,12 +110,21 @@ def parse_args(argv):
     ap.add_argument("--sample", type=int, default=8, help="requests checked against the float64 reference")
     ap.add_argument("--max-shape-s", type=float, default=300.0)
     ap.add_argument("--max-run-s", type=float, default=900.0)
+    ap.add_argument("--ncu", default=None, help="the ncu binary: one ncu child per arm and shape after the timing")
+    ap.add_argument("--ncu-arms", default=",".join(NCU_ARMS))
+    ap.add_argument("--ncu-cap", type=float, default=300.0, help="seconds per ncu child")
+    ap.add_argument("--mode", default="main", choices=("main", "ncu-cell"))
     a = ap.parse_args(argv)
     try:
         a.shapes = {int(c): int(b) for c, b in (x.split(":") for x in a.shapes.split(",") if x)}
         a.segments = tuple(int(x) for x in a.segments.split(",") if x)
+        a.ncu_arms = tuple(x for x in a.ncu_arms.split(",") if x)
     except ValueError:
         ap.error("--shapes C:B pairs, --segments integers")
+    if [x for x in a.ncu_arms if x not in variants(a.segments)]:
+        ap.error("--ncu-arms: unknown %s" % [x for x in a.ncu_arms if x not in variants(a.segments)])
+    if a.mode == "ncu-cell" and (len(a.shapes) != 1 or len(a.ncu_arms) != 1):
+        ap.error("--mode ncu-cell: one shape and one arm")
     if not a.shapes or any(b < 1 or b > 1024 for b in a.shapes.values()) or any(s < 2 or s > 64 for s in a.segments):
         ap.error("--shapes B in 1 .. 1024; --segments in 2 .. 64")
     if a.layers < 1 or a.reps < 3 or a.warmup < 1 or a.sample < 1:
@@ -112,12 +133,13 @@ def parse_args(argv):
 
 
 def granted(cell) -> bool:
-    return cell == "j1f" and isinstance(GRANT_j1f, str) and len(GRANT_j1f) == 20 and GRANT_j1f.endswith("Z")
+    g = {"j1f": GRANT_j1f, "j1n": GRANT_j1n}.get(cell)
+    return isinstance(g, str) and len(g) == 20 and g.endswith("Z")
 
 
 # ------------------------------------------------------------------ pure parts (CPU-tested)
 def variants(segments):
-    return BASE + tuple("FORK3D%d" % s for s in segments)
+    return BASE + ROWS + tuple("FORK3D%d" % s for s in segments)
 
 
 def row_pages(b: int, r: int):
@@ -135,6 +157,8 @@ def work(name: str, B: int) -> dict:
         name = name[:-3]
     if name.startswith("FORK3D") or name in ("FORK", "FORKT") + AHEAD:
         return dict(rows=R * B, pages=HKV * B * UNION)
+    if name.startswith(("RSM", "RSQ")) and name in ROWS:           # the same union pages; n active rows
+        return dict(rows=int(name[3:]) * B, pages=HKV * B * UNION)
     if name in ("FORK1R", "NS1R1"):
         return dict(rows=B, pages=HKV * B * P_ROW)
     if name == "NS1x4":
@@ -215,6 +239,7 @@ def summarize(times: dict, B: int, layers: int, valid: dict, segments) -> dict:
                          residual_ms_pass=round(cp - d_ - co, 4),
                          valid=per[x]["valid"] and per[x + "_CP"]["valid"] and per[x + "_CO"]["valid"])
     out["flash_timing"] = ft
+    out["rows_sweep"] = rows_sweep(per, layers)
     d3 = [(per[k]["ms_call"], k) for k in per if k.startswith("FORK3D") and per[k]["valid"]]
     out["best_3d"], out["best_3d_note"] = None, None
     if "FORK" not in per or not per["FORK"]["valid"]:                    # the same rule as the ratios
@@ -225,6 +250,36 @@ def summarize(times: dict, B: int, layers: int, valid: dict, segments) -> dict:
         best = min(d3)
         out["best_3d"] = dict(variant=best[1], ratio=round(best[0] / per["FORK"]["ms_call"], 4),
                               saving_ms_per_pass=round((per["FORK"]["ms_call"] - best[0]) * layers, 3))
+    return out
+
+
+def rows_sweep(per: dict, layers: int) -> dict:
+    """TRACK 2: the rows sweep at fixed union bytes (ms per pass; a value only where every member is valid).
+    masked: RSMn (n = 1..4 active rows by extents; the same kernel, launch and MMA work as FORKT): the marginal ms per
+    extra active row = least squares slope over n (the masking / softmax / V-reach share). tile: RSQn (BLOCK_Q n, tile
+    rows 16 n): ms per pass for n = 1, 2, 4 and the marginal ms per extra row of each step (the MMA rows, registers and
+    occupancy share). e_fork = RSQ1 - FORK1R: one row over the 72-page union minus one row over its own 64 pages, in the
+    fork (the E analogue inside the fork kernel). tile4_fork = FORKT - RSQ1: the 4-row tile at fixed bytes."""
+    def ok(*names):
+        return all(n in per and per[n]["valid"] for n in names)
+
+    def ms(n):
+        return per[n]["ms_pass"]
+    out = dict(masked=None, tile=None, e_fork_ms_pass=None, tile4_fork_ms_pass=None)
+    m = [n for n in ROWS_M if ok("RSM%d" % n)]
+    if len(m) == len(ROWS_M):
+        xs, ys = list(m), [ms("RSM%d" % n) for n in m]
+        xb, yb = sum(xs) / len(xs), sum(ys) / len(ys)
+        slope = sum((x - xb) * (y - yb) for x, y in zip(xs, ys)) / sum((x - xb) ** 2 for x in xs)
+        out["masked"] = dict(ms_pass={n: ms("RSM%d" % n) for n in m}, slope_ms_per_row=round(slope, 4),
+                             rsm4_minus_forkt=round(ms("RSM4") - ms("FORKT"), 4) if ok("FORKT") else None)
+    if ok(*("RSQ%d" % n for n in ROWS_Q)):
+        q = {n: ms("RSQ%d" % n) for n in ROWS_Q}
+        out["tile"] = dict(ms_pass=q, per_row_1_to_2=round(q[2] - q[1], 4), per_row_2_to_4=round((q[4] - q[2]) / 2, 4))
+    if ok("RSQ1", "FORK1R"):
+        out["e_fork_ms_pass"] = round(ms("RSQ1") - ms("FORK1R"), 4)
+    if ok("FORKT", "RSQ1"):
+        out["tile4_fork_ms_pass"] = round(ms("FORKT") - ms("RSQ1"), 4)
     return out
 
 
@@ -244,7 +299,85 @@ def decision_lines(name: str, s: dict):
                                                "SUPPRESSED (FORK or FLASHU1 invalid or missing)"))
     b = s.get("best_3d")
     out.append("J1F %s best 3D %s" % (name, b if b is not None else "SUPPRESSED (%s)" % s.get("best_3d_note")))
+    rs = s.get("rows_sweep") or {}
+    for k in ("masked", "tile", "e_fork_ms_pass", "tile4_fork_ms_pass"):
+        if k in rs:
+            out.append("J1F %s ROWS %s %s" % (name, k, rs[k] if rs[k] is not None else
+                                               "SUPPRESSED (a member invalid or missing)"))
     return out
+
+
+# ------------------------------------------------------------------ ncu (TRACK 2; pure parts CPU-tested)
+def ncu_metric_names(query_text: str):
+    """Metric base names in `ncu --query-metrics --chip ga100` output."""
+    import re
+    return set(re.findall(r"^\s*([a-z0-9_]+__[a-z0-9_]+)", query_text, flags=re.M))
+
+
+def ncu_metric_list(names):
+    """(missing required, the list to ask): the required metrics and the optional ones the query names."""
+    base = lambda m: m.split(".", 1)[0]                                   # noqa: E731
+    missing = [m for m in NCU_REQUIRED if base(m) not in names]
+    return missing, list(NCU_REQUIRED) + [m for m in NCU_OPTIONAL if base(m) in names]
+
+
+def ncu_argv(ncu: str, a, C: int, B: int, arm: str, child_out: str, rep: str, metrics):
+    """One ncu child: the profiler window holds ONE call (one layer) of ONE arm, after its warm-up outside the window;
+    every kernel replayed with the caches flushed (--cache-control all), so DRAM bytes are the arm's own reads."""
+    return [ncu, "--profile-from-start", "off", "--replay-mode", "kernel", "--cache-control", "all",
+            "--clock-control", "none", "--metrics", ",".join(metrics), "--section", "LaunchStats", "--section",
+            "Occupancy", "--target-processes", "application-only", "-f", "-o", rep,
+            sys.executable, os.path.abspath(__file__), "--mode", "ncu-cell", "--out", child_out, "--cell", a.cell,
+            "--shapes", "%d:%d" % (C, B), "--ncu-arms", arm, "--seed", str(a.seed), "--sample", str(a.sample),
+            "--segments", ",".join(str(s) for s in a.segments)]
+
+
+def _num(s):
+    try:
+        return float(str(s).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def parse_ncu_csv(text: str, fields):
+    """Kernel rows of `ncu --import <rep> --csv --page raw --print-units base`: the header row naming 'Kernel Name',
+    then the rows with a numeric ID (the units row has none)."""
+    import csv
+    import io
+    rows = list(csv.reader(io.StringIO(text)))
+    hi = next((i for i, r in enumerate(rows) if "Kernel Name" in r), None)
+    if hi is None:
+        raise ValueError("no header row with 'Kernel Name'")
+    head, out = rows[hi], []
+    for r in rows[hi + 1:]:
+        if len(r) != len(head):
+            continue
+        d = dict(zip(head, r))
+        if not d.get("ID", "").strip().isdigit():
+            continue
+        row = dict(id=int(d["ID"]), name=d["Kernel Name"])
+        row.update({f: _num(d.get(f, "")) for f in fields})
+        out.append(row)
+    return out
+
+
+def ncu_arm_summary(rows, logical_bytes: int) -> dict:
+    """One arm's kernels (one call): time, DRAM bytes read, L2 -> SM bytes (sectors x 32), their ratios to the
+    LOGICAL bytes of the call, achieved occupancy and registers of the longest kernel."""
+    g = lambda r, k: r.get(k) or 0.0                                      # noqa: E731
+    t = sum(g(r, "gpu__time_duration.sum") for r in rows)
+    rd = sum(g(r, "dram__bytes_read.sum") for r in rows)
+    l2 = sum(g(r, "lts__t_sectors_srcunit_tex_op_read.sum") for r in rows) * 32.0
+    top = max(rows, key=lambda r: g(r, "gpu__time_duration.sum")) if rows else {}
+    return dict(n_kernels=len(rows), kernels=sorted({r["name"] for r in rows}), time_us=round(t / 1e3, 3),
+                dram_read=rd, l2sm_bytes=l2, logical_bytes=logical_bytes,
+                dram_over_logical=round(rd / logical_bytes, 4) if logical_bytes else None,
+                l2sm_over_logical=round(l2 / logical_bytes, 4) if logical_bytes else None,
+                occupancy_pct=top.get("sm__warps_active.avg.pct_of_peak_sustained_active"),
+                warps_per_cycle=top.get("sm__warps_active.avg.per_cycle_active"),
+                registers=top.get("launch__registers_per_thread"),
+                limit_registers=top.get("launch__occupancy_limit_registers"),
+                limit_shared=top.get("launch__occupancy_limit_shared_mem"))
 
 
 def swapped_out_view(out, hkv: int):
@@ -270,6 +403,11 @@ def out_row(name: str, out, key, B: int):
     compute that row. <X>_CP and <X>_CO hold X's rows."""
     b, r = key
     base = name[:-3] if name.endswith(("_CP", "_CO")) else name
+    if base in ROWS:                                                # the rows sweep: active rows 0 .. n-1 only
+        n = int(base[3:])
+        if r == "U" or r >= n:
+            return None
+        return out.view(B * n, HQ, HD)[b * n + r]
     if base in ("FORK1R", "NS1R1"):
         return out.view(B, HQ, HD)[b] if r == 0 else None
     if base == "FLASHU1":
@@ -315,6 +453,17 @@ def num_verdict(chk: dict, tol: float = TOL):
     if not chk["rows"]:
         return False, "no row checked (no reference row for this variant)"
     return chk["err"] <= tol, "max |out - float64| %.3e over %d rows (tol %.0e)" % (chk["err"], chk["rows"], tol)
+
+
+def rows_eq(name: str, got, forkt, B: int):
+    """(passed, detail): the rows sweep variant's rows 0 .. n-1 (its output holds n rows per request) = FORKT's same
+    rows bit for bit, and finite."""
+    n = int(name[3:])
+    ref = forkt.view(B, R, HQ, HD)[:, :n].contiguous()
+    act = got.view(B, n, HQ, HD)
+    nd = int((bits(act) != bits(ref)).sum())
+    nf = nonfinite(act)[0]
+    return nd == 0 and nf == 0, "rows 0..%d = FORKT bit for bit: %d values differ; non-finite %d" % (n - 1, nd, nf)
 
 
 def repeat_check(out, first):
@@ -398,12 +547,12 @@ def build_gpu(B: int, seed: int, segments, sample: int):
         return (torch.zeros((HKV, B, width), dtype=i32, device=dev), torch.zeros((HKV, B, width), dtype=i32, device=dev),
                 torch.zeros((HKV, B), dtype=i32, device=dev))
 
-    def fork_call(qx, out, cu, rows, tab, ext, ln, lists, extra=None, mod=None):
+    def fork_call(qx, out, cu, rows, tab, ext, ln, lists, extra=None, mod=None, block_q=None):
         ua = (mod or FK).unified_attention
 
-        def call():
+        def call():                                  # rows = the query rows per request; block_q = BLOCK_Q (default rows)
             ua(qx, ak, av, out, cu, rows, seq, BS, scale, True, (-1, -1), tab, 0, None, None, None,
-               union_ext=ext, union_len=ln, cis_bias=ab, build_union=lists, rows_per_q_block=rows,
+               union_ext=ext, union_len=ln, cis_bias=ab, build_union=lists, rows_per_q_block=block_q or rows,
                **dict(FORK_LAUNCH, **(extra or {})))
         return call
     o = torch.zeros((E, HQ, HD), dtype=bf, device=dev)
@@ -415,6 +564,19 @@ def build_gpu(B: int, seed: int, segments, sample: int):
     tT = tuple(t.clone() for t in t4)
     oT = torch.zeros_like(o)
     parts["FORKT"], outs["FORKT"] = fork_call(q, oT, cu4, R, *tT, None), oT
+    # The rows sweep: FORKT's tables and extents unchanged (the V reach = the 4 rows' largest byte: the same bytes);
+    # the requests carry n query rows (rows 0 .. n-1). RSMn keeps BLOCK_Q 4 (FORKT's kernel and launch): the rows
+    # n .. 3 of each program are off by the query length (masked loads, -inf scores, masked stores). Masking them by
+    # zero extents instead would store 0 / 0 = NaN rows (softmax_step: L becomes 0 when a row sees no token).
+    for n in sorted(set(ROWS_M) | set(ROWS_Q)):
+        qn = q.view(B, R, HQ, HD)[:, :n].contiguous().view(B * n, HQ, HD)
+        cun = torch.arange(0, B * n + 1, n, dtype=i32, device=dev)
+        if n in ROWS_M:
+            oM = torch.zeros((B * n, HQ, HD), dtype=bf, device=dev)
+            parts["RSM%d" % n], outs["RSM%d" % n] = fork_call(qn, oM, cun, n, *tT, None, block_q=R), oM
+        if n in ROWS_Q:                               # BLOCK_Q n: the tile rows 16 n (rows 0 .. n-1 read bytes 0 .. n-1)
+            oQ = torch.zeros((B * n, HQ, HD), dtype=bf, device=dev)
+            parts["RSQ%d" % n], outs["RSQ%d" % n] = fork_call(qn, oQ, cun, n, *tT, None), oQ
     for lvl, v in enumerate(AHEAD, 1):                                       # production mode (build in the kernel)
         oA = torch.zeros_like(o)
         parts[v], outs[v] = fork_call(q, oA, cu4, R, *tables(R * P_ROW), lists4, dict(ahead=lvl), FKA), oA
@@ -562,6 +724,12 @@ def run_shape(a, C: int, B: int, t0: float):
             valid[v] = valid[v] and eq
             gates.append(("%s-%s-EQ" % (name, v), True, eq, "%s = FORK bit for bit: %s (%d values differ)" % (
                 v, eq, nd)))
+    for v in ROWS:                                                           # the rows sweep vs FORKT, row by row
+        if v in first and "FORKT" in first:
+            ok, d = rows_eq(v, first[v], first["FORKT"], B)
+            must = v.startswith("RSM")                    # RSM: the same kernel and launch -> the same bits (MUST)
+            valid[v] = valid[v] and (ok or not must)      # RSQ: another BLOCK_M (tile layout): REPORT only
+            gates.append(("%s-%s-EQ" % (name, v), must, ok, d))
     for x in FLASH:                                                          # the direct write = the j1f form
         if x in first and x + "_CP" in first:
             eq = bool((bits(first[x]) == bits(first[x + "_CP"])).all())
@@ -585,19 +753,93 @@ def run_shape(a, C: int, B: int, t0: float):
                        stop=stop)
 
 
+def run_logged(argv, path, timeout):
+    """argv with stdout + stderr to path, in its own process group, killed at the timeout: the exit or 'timeout'."""
+    import signal
+    import subprocess
+    with open(path, "w") as f:
+        p = subprocess.Popen(argv, stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            return p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            p.wait()
+            return "timeout"
+
+
+def run_ncu(a, C: int, B: int, gates) -> dict:
+    """The ncu children of one shape (one per arm of --ncu-arms); REPORT gates <shape>-NCU-<arm>."""
+    name = "C%d_B%d" % (C, B)
+    qpath = os.path.join(a.out, "ncu_metrics_query.txt")
+    if not os.path.exists(qpath):
+        run_logged([a.ncu, "--query-metrics", "--chip", "ga100"], qpath, 120)
+    missing, metrics = ncu_metric_list(ncu_metric_names(open(qpath, errors="replace").read()))
+    if missing:
+        gates.append(("%s-NCU" % name, False, False, "the metric query misses %s" % missing))
+        return {}
+    res = {}
+    for arm in a.ncu_arms:
+        tag = "%s_%s" % (name, arm)
+        child, rep = os.path.join(a.out, "ncu_" + tag), os.path.join(a.out, "ncu_%s_rep" % tag)
+        t1 = time.time()
+        rc = run_logged(ncu_argv(a.ncu, a, C, B, arm, child, rep, metrics), os.path.join(a.out, "ncu_%s.log" % tag),
+                        a.ncu_cap)
+        exp, summ = None, None
+        if os.path.exists(rep + ".ncu-rep"):
+            csv_path = os.path.join(a.out, "ncu_%s_raw.csv" % tag)
+            exp = run_logged([a.ncu, "--import", rep + ".ncu-rep", "--csv", "--page", "raw", "--print-units", "base"],
+                             csv_path, 300)
+            if exp == 0:
+                rows = parse_ncu_csv(open(csv_path, errors="replace").read(), metrics)
+                summ = ncu_arm_summary(rows, work(arm, B)["pages"] * BLOCK_BYTES)
+        res[arm] = dict(child_exit=rc, export_exit=exp, seconds=round(time.time() - t1, 1), summary=summ)
+        gates.append(("%s-NCU-%s" % (name, arm), False, rc == 0 and exp == 0 and summ is not None,
+                      "child exit %s, export %s; %s" % (rc, exp, summ)))
+    return res
+
+
+def mode_ncu_cell(a) -> int:
+    """Under ncu: build the shape, warm the arm OUTSIDE the profiler window, then ONE call (one layer) inside it."""
+    import torch
+    (C, B), = a.shapes.items()
+    arm = a.ncu_arms[0]
+    with torch.inference_mode():
+        parts, outs, meta = build_gpu(B, a.seed + C, a.segments, a.sample)
+        for _ in range(2):
+            parts[arm]()
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStart()
+        parts[arm]()
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+    with open(os.path.join(a.out, "cell.json"), "w") as f:
+        json.dump(dict(C=C, B=B, arm=arm, logical_bytes=work(arm, B)["pages"] * BLOCK_BYTES, union=UNION,
+                       finite=nonfinite(outs[arm])[0] == 0), f, indent=1)
+    return 0
+
+
 def main(argv=None) -> int:
     a = parse_args(sys.argv[1:] if argv is None else argv)
     if not granted(a.cell):
-        print("REFUSED: cell %r is not granted (GRANT_j1f = %r; default deny)" % (a.cell, GRANT_j1f), file=sys.stderr)
+        print("REFUSED: cell %r is not granted (GRANT_j1f = %r, GRANT_j1n = %r; default deny)" % (
+            a.cell, GRANT_j1f, GRANT_j1n), file=sys.stderr)
         return 20
     if os.path.exists(a.out):
         print("REFUSED: --out %s exists" % a.out, file=sys.stderr)
+        return 20
+    if a.ncu is not None and not os.access(a.ncu, os.X_OK):
+        print("REFUSED: --ncu %s is not executable" % a.ncu, file=sys.stderr)
         return 20
     import torch
     if not torch.cuda.is_available():
         print("REFUSED: no CUDA device", file=sys.stderr)
         return 20
     os.makedirs(a.out)
+    if a.mode == "ncu-cell":
+        return mode_ncu_cell(a)
     gates, raw = [], {}
     t_run = time.perf_counter()
     with torch.inference_mode():
@@ -616,7 +858,10 @@ def main(argv=None) -> int:
                 break
     rw = time.perf_counter() - t_run
     gates.append(("RUN-WALL", True, rw <= a.max_run_s, "run wall %.1f s (limit %.0f)" % (rw, a.max_run_s)))
-    meta = dict(cell=a.cell, grant=GRANT_j1f, shapes=a.shapes, segments=a.segments, layers=a.layers, reps=a.reps,
+    if a.ncu is not None:                                  # after the timing (its wall is not in RUN-WALL)
+        for name, r in raw.items():
+            r["ncu"] = run_ncu(a, r["C"], r["B"], gates)
+    meta = dict(cell=a.cell, grant={"j1f": GRANT_j1f, "j1n": GRANT_j1n}.get(a.cell), shapes=a.shapes, segments=a.segments, layers=a.layers, reps=a.reps,
                 warmup=a.warmup, seed=a.seed, sample=a.sample, fork_launch=FORK_LAUNCH, splits=SPLITS, union=UNION,
                 row_shift=ROW_SHIFT, block_bytes=BLOCK_BYTES, tol=TOL, gpu=torch.cuda.get_device_properties(0).name,
                 torch=torch.__version__, base_commit=os.environ.get("BASE_COMMIT"))
@@ -632,6 +877,8 @@ def main(argv=None) -> int:
                 name, v, p["ms_call"], p["ms_pass"], p["rows"], p["bytes"] / 1e9, p["logical_tb_s"], p["valid"]))
         for line in decision_lines(name, s):
             print(line)
+        for arm, n in (r.get("ncu") or {}).items():
+            print("J1F %s NCU %-7s %s" % (name, arm, n.get("summary") or n))
     failed = [g[0] for g in gates if g[1] and not g[2]]
     print("r2_j1_forkbench: %d MUST gate(s) failed" % len(failed))
     return min(len(failed), 19)

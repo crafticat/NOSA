@@ -30,6 +30,12 @@
 #        FORK1R, NS1R1, NS1x4, FLASHU1, NSRU (end-to-end, direct output) and each flash control's _CP (j1f form: wrapper +
 #        copy_) and _CO (copy_ alone); 32 calls per pass, 10 order-rotated passes. STEP_MIN 25 (the image hash of
 #        23 GB inside it), --mem 64G, OUT_MB 60.
+#   j1n  TRACK 2 (2026-11-02): the fork microbench at the anchor shape C 81 B 287 (grant GRANT_j1n in
+#        r2_j1_forkbench.py): every j1f variant (3D segments 2 only) + the ROWS SWEEP (RSM1-4: BLOCK_Q 4, n query
+#        rows; RSQ1/2/4: BLOCK_Q n), 6 passes; then ncu ($NCU, the fia6 pin): one child per arm of FORK, FORKT,
+#        FORK1R, FLASHU1, NS1R1, NS1x4, RSM1, RSM4, RSQ1, RSQ2, RSQ4, one call each, caches flushed (DRAM bytes read,
+#        L2 -> SM sectors, achieved occupancy, registers). STEP_MIN 50 (MODEL: timing about 3 min + 11 children x
+#        <= 240 s cap, about 1 min each expected + the image hash), --mem 64G, OUT_MB 400 (the ncu reports).
 #   j1b  timing, C 73 (pool 10), B 318, 512 steps, arms L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDJ1. STEP_MIN
 #        170, --mem 340G. STOPS while PRED_STAMP_J1 is None.
 # Every cell also runs SHJ1 right after SH (the shipped run with the compiled pooling: the matched baseline of F2;
@@ -61,6 +67,7 @@ CELLPY=benchmarks/Efficiency/r2_j1_cell.py
 FORKPY=benchmarks/Efficiency/fork_vllm_unified_attention.py
 FORK_BLOB=f0dc0c183a388585e216505a6bbfc696531e8add                                       # PIN (fia6 94d5bb0's fork)
 SPLITS=4
+NCU=/opt/nvidia/nsight-compute/2025.1.0/ncu                                              # PIN (inside the image; = fia6)
 OUT_MB=2048
 # granted <cell> <cell file>: true only when the file holds the cell's grant line with a `date -u` stamp.
 granted() {
@@ -79,13 +86,15 @@ K=3 STRESS=0 CHECK=0 NEEDPRED=0 NEEDWL=1
 case $CELL in
     j1f) POOL=65 BATCH=0 STEPS=0 STEP_MIN=25 MEM=64G NEEDWL=0 OUT_MB=60 ARMS=-
          CELLPY=benchmarks/Efficiency/r2_j1_forkbench.py ;;
+    j1n) POOL=18 BATCH=0 STEPS=0 STEP_MIN=50 MEM=64G NEEDWL=0 OUT_MB=400 ARMS=-
+         CELLPY=benchmarks/Efficiency/r2_j1_forkbench.py ;;
     j1m) POOL=10 BATCH=8 STEPS=72 CHECK=1 STRESS=1 STEP_MIN=35 MEM=100G
          ARMS=L4PTFD,L4PTFKW,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDCDJ1,L4PTFDGUDKWCDJ1,L4PTFDGUDCDJ3 ;;
     j1a) POOL=65 BATCH=216 STEPS=512 NEEDPRED=1 STEP_MIN=125 MEM=240G
          ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDJ1,L4PTFDGUDCDJ3 ;;
     j1b) POOL=10 BATCH=318 STEPS=512 NEEDPRED=1 STEP_MIN=170 MEM=340G
          ARMS=L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDJ1 ;;
-    *) stop "cell '$CELL' (j1m, j1a, j1b or j1f)" ;;
+    *) stop "cell '$CELL' (j1m, j1a, j1b, j1f or j1n)" ;;
 esac
 DESC="arms SH+$ARMS steps $STEPS K $K fork-store 0 check $CHECK stress $STRESS"
 CARGS=(--batch "$BATCH" --steps "$STEPS" --pool "$POOL" --spec "$K" --arms "$ARMS" --fork-store 0 --prefill-hook nocopy
@@ -95,6 +104,11 @@ if [ "$CELL" = j1f ]; then                    # the fork microbench: no model, n
     DESC="fork microbench: shapes C 128 B 216, C 73 B 318; union 72; 3D segments 2,4,8; 32 calls per pass"
     CARGS=(--cell j1f --shapes 128:216,73:318 --segments 2,4,8 --layers 32 --reps 10 --warmup 2 --seed 7 --sample 8
            --max-shape-s 300 --max-run-s 900)
+fi
+if [ "$CELL" = j1n ]; then                    # TRACK 2: the anchor shape C 81 B 287, the rows sweep, ncu per arm
+    DESC="fork microbench + ncu: shape C 81 B 287; union 72; rows sweep; 32 calls per pass; ncu one call per arm"
+    CARGS=(--cell j1n --shapes 81:287 --segments 2 --layers 32 --reps 6 --warmup 2 --seed 7 --sample 8
+           --max-shape-s 400 --max-run-s 600 --ncu "$NCU" --ncu-cap 240)
 fi
 FILE_KB=$((OUT_MB * 1024))
 MIN_LEFT=$((STEP_MIN * 60 + 600))
