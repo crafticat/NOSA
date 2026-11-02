@@ -28,9 +28,9 @@
 #        b3 loop with the ARRIVAL counters; the same-job A/B of the fix). 7 parts. STEP_MIN 230, --mem 340G. STOPS while
 #        PRED_STAMP_BF1R is None (and while PRED_STAMP_BF1 is None).
 #   bf1c THE ANCHOR, C 81 (pool 18), B 287, 512 steps, --bf-store 0 (129 slots: the correctness bound; 257 is a human
-#        decision: MODEL 83.16 GB at B 287 = 0.59 GB under the usable 83.75, at the L60 fit margin; the store holds the
-#        2 KV heads, 2 x 32,896 = 65,792 B per slot per request, 18.9 MB per slot at B 287: INTEGRATION_NOTES section
-#        16.4, LEAD CORRECTION; INT2 text fix), --bf-ncap 6144 --bf-ring 6, arms L4PTFD,L4PTFDGUDKWC,
+#        decision, its fit: INTEGRATION_NOTES section 16.4 as corrected by the lead; the store holds the 2 KV heads,
+#        2 x 32,896 = 65,792 B per slot per request, 18.9 MB per extra slot at B 287; INT2 text fix), --bf-ncap 6144
+#        --bf-ring 6, arms L4PTFD,L4PTFDGUDKWC,
 #        L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB,L4PTFDGUDKWCDR,L4PTFDGUDKWCDS (S: the completed schedule; every ce
 #        arm reports THE LEDGER). 8 parts. STEP_MIN 260, --mem 340G. STOPS while PRED_STAMP_BF1S is None.
 #   bf1a timing, C 128 (pool 65), B 216, 512 steps, probe 16, --bf-store 0 (129), --bf-ncap 2048 --bf-ring 8, arms
