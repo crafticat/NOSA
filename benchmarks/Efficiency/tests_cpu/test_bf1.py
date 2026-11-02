@@ -28,6 +28,9 @@ SNAP / ARRIVAL (bf1r, INTEGRATION_NOTES_2026-10-31.md section 13; fake events th
           control), test_bf1_lifetimes (b: snapshot and staging lifetimes under the pipeline; two planted defects
           caught), test_bf1_arrival_modes (c: the arrival block in every mode, its closures), test_bf1_arrival_late (d:
           a planted late job is counted late, an independent count agrees; the inline control has none).
+          REVIEW 5: test_bf1_worker_failure (query / sync: a raising readiness event outside _prep / _finish; the
+          original exception reaches the compute thread, the worker stops, no slot stays owned),
+          test_bf1_arrival_store_only (acct=False / arrival=True with window-only consumers: the metric is STORE-ONLY).
 CELL      test_cell_pure (arguments, gates on planted records, verdicts), test_counts_gate_bf (bf1b's COUNTS defect and
           its fix), test_step_script_bf1 (the cells' arguments parse; the pins name the BF1 files).
 
@@ -335,10 +338,12 @@ REPORT_KEYS = ("mode", "packer", "late_mode", "late_wait_ms", "lanes_per_entry",
                "no_room_deferred", "used_store", "unused", "pending", "bytes_sent", "bytes_used", "barrier_ms_median",
                "late_age_ms_median", "room_free_mean", "transport", "device_bytes", "item_bytes", "error", "snap_mode",
                "snap_unready_taken", "polls", "arrival")
-ARRIVAL_KEYS = ("enabled", "batches", "items_sent_early", "items_sent_late", "items_sent_nodeadline",
-                "items_useful_early", "items_useful_late", "items_useful_nodeadline", "items_useful_unattributed",
-                "useful_counted", "items_sent_counted", "useful_early_share", "margin_ms_useful", "margin_ms_sent",
-                "consume", "host")
+ARRIVAL_KEYS = ("enabled", "useful_scope", "window_uses_covered", "window_uses_acct", "gil_hold_measured", "batches",
+                "items_sent_early", "items_sent_late", "items_sent_nodeadline", "items_useful_store_early",
+                "items_useful_store_late", "items_useful_store_nodeadline", "items_useful_store_unattributed",
+                "useful_store_counted", "items_sent_counted", "useful_early_share_store", "margin_ms_useful_store",
+                "margin_ms_sent", "items_sent_arrived_after_jstart", "items_useful_store_arrived_after_jstart",
+                "deferred_wait_and_commit", "host")
 
 
 @pytest.mark.parametrize("mode,packer,late", [("off", "torch", "drop"), ("off", "gilfree", "defer"),
@@ -737,10 +742,11 @@ def test_bf1_lifetimes(snap, plant):
                                                    ("ce", "defer", "ready", "gilfree")])
 def test_bf1_arrival_modes(mode, late, snap, packer, request):
     """(c) THE ARRIVAL COUNTERS in every mode (off / drop / defer x newest / ready, the gilfree packer once), thread
-    worker: the block is present; off: disabled, nothing counted; ce: batches > 0, the USEFUL items per (batch, layer)
-    (device counts) close to used store + window, the sent items of the records close to items_sent, early + late +
-    no deadline = the records' items, margins and host overlap present; the claim and the gates (-BF checks the
-    closures too) hold."""
+    worker: the block is present; off: disabled, nothing counted; ce: batches > 0, the USEFUL STORE items per (batch,
+    layer) (device counts) close to used_store (review 5: the window uses are on neither side; with acct=True their
+    total is window_uses_acct = used_win), the sent items of the records close to items_sent, early + late + no
+    deadline = the records' items, margins and host overlap present; the claim and the gates (-BF checks the closures
+    too) hold."""
     gf = None
     if packer == "gilfree":
         gf = dict(ext=request.getfixturevalue("gfext"), cls=X.W.pkg_load("r2_transport_gilfree_v3").GilfreeTransport)
@@ -752,11 +758,11 @@ def test_bf1_arrival_modes(mode, late, snap, packer, request):
     ar = bf["arrival"]
     _ev("BF1 ARRIVAL %s / %s / %s / %s: %s" % (mode, late, snap, packer, {k: ar.get(k) for k in (
         "batches", "batches_deferred", "items_sent_early", "items_sent_late", "items_sent_nodeadline",
-        "items_useful_early", "items_useful_late", "useful_counted", "useful_early_share", "margin_ms_useful",
-        "consume", "host")}))
+        "items_useful_store_early", "items_useful_store_late", "useful_store_counted", "window_uses_acct",
+        "useful_early_share_store", "margin_ms_useful_store", "deferred_wait_and_commit", "host", "memory")}))
     assert [k for k in ARRIVAL_KEYS if k not in ar] == [], [k for k in ARRIVAL_KEYS if k not in ar]
     if mode == "off":
-        assert not ar["enabled"] and ar["batches"] == 0 and ar["useful_counted"] == 0, ar
+        assert not ar["enabled"] and ar["batches"] == 0 and ar["useful_store_counted"] == 0, ar
         return
     bad = TS._diff(ref, ev, skip=DIFF_RD, tensors_skip=DIFF_T)
     assert bad == [], bad[:10]
@@ -764,15 +770,24 @@ def test_bf1_arrival_modes(mode, late, snap, packer, request):
     assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
     recs = ev["runner"].bf.arr_b
     assert ar["enabled"] and ar["batches"] == len(recs) > 0, (ar["batches"], len(recs))
-    assert ar["useful_counted"] == bf["used_store"] + bf["used_win"] > 0, (ar["useful_counted"], bf["used_store"])
-    assert ar["useful_counted"] == sum(ar["items_useful_" + k] for k in ("early", "late", "nodeadline", "unattributed"))
+    assert ar["useful_scope"] == "store_only" and not ar["window_uses_covered"] and not ar["gil_hold_measured"], ar
+    assert ar["useful_store_counted"] == bf["used_store"] > 0, (ar["useful_store_counted"], bf["used_store"])
+    assert ar["window_uses_acct"] == bf["used_win"], (ar["window_uses_acct"], bf["used_win"])   # acct=True here
+    assert ar["useful_store_counted"] == sum(ar["items_useful_store_" + k] for k in (
+        "early", "late", "nodeadline", "unattributed"))
     assert ar["items_sent_counted"] == bf["items_sent"], (ar["items_sent_counted"], bf["items_sent"])
     assert ar["items_sent_early"] + ar["items_sent_late"] + ar["items_sent_nodeadline"] == sum(r["n"] for r in recs)
     assert ar["joint_passes"] > 0 and ar["margin_ms_sent"] is not None and ar["host"]["draft"]["windows"] > 0, ar
-    assert ar["host"]["draft"]["busy"] + ar["host"]["joint"]["busy"] > 0, ar["host"]
-    if late == "defer":                                                # one consume record per committed deferred batch
-        assert ar["consume"]["commits"] == sum(1 for r in recs if r["deferred"] and r["consumed_at"] is not None), (
-            ar["consume"], bf.get("deferred"))
+    assert ar["host"]["draft"]["busy_ms"] + ar["host"]["joint"]["busy_ms"] > 0, ar["host"]
+    mem = ar["memory"]                                                 # the per-epoch counters are in bytes_device
+    run_bf = ev["runner"].bf
+    assert mem["counter_bytes_per_epoch"] == (run_bf.bl_max * run_bf.L + 1) * 8 and mem["epochs_kept"] == len(
+        run_bf.arr_ep) and mem["counter_bytes_total"] == mem["epochs_kept"] * mem["counter_bytes_per_epoch"], mem
+    assert bf["device_bytes"] >= mem["pbid_bytes"] + mem["counter_bytes_total"], (bf["device_bytes"], mem)
+    if late == "defer":                                                # one span per committed deferred batch
+        dw = ar["deferred_wait_and_commit"]
+        assert dw["jobs"] == sum(1 for r in recs if r["deferred"] and r["consumed_at"] is not None), (
+            dw, bf.get("deferred"))
 
 
 def test_bf1_arrival_late():
@@ -795,13 +810,101 @@ def test_bf1_arrival_late():
     ctl = _bf("timing")["rd"]["bf"]["arrival"]                         # inline worker, drop
     _ev("BF1 ARRIVAL LATE: stall: sent early %d / late %d (independent %d / %d), useful early %d / late %d, late ms "
         "mean %s, margins %s; control (inline): early %d, late %d" % (
-            ar["items_sent_early"], ar["items_sent_late"], early, late, ar["items_useful_early"],
-            ar["items_useful_late"], ar["late_ms_useful_mean"], ar["margin_ms_sent"], ctl["items_sent_early"],
-            ctl["items_sent_late"]))
+            ar["items_sent_early"], ar["items_sent_late"], early, late, ar["items_useful_store_early"],
+            ar["items_useful_store_late"], ar["late_ms_useful_store_mean"], ar["margin_ms_sent"],
+            ctl["items_sent_early"], ctl["items_sent_late"]))
     assert ar["items_sent_late"] > 0 and (ar["items_sent_early"], ar["items_sent_late"]) == (early, late), (ar, early,
                                                                                                          late)
     assert ar["margin_ms_sent"]["min"] < 0, ar["margin_ms_sent"]
     assert ctl["items_sent_late"] == 0 and ctl["items_sent_early"] > 0, ctl
+    dw = ar["deferred_wait_and_commit"]                                # deferred jobs ran: the span is recorded
+    assert dw["jobs"] > 0 and dw["ms_total"] >= 0, dw
+
+
+def test_bf1_arrival_store_only():
+    """REVIEW 5 (2): THE TIMING CELLS' REAL COMBINATION acct=False / arrival=True, with WINDOW-ONLY consumers. The same
+    inline world twice (deterministic): acct=True finds window-only uses (used_win > 0: prefetched blocks that the joint
+    pass read only through its window loads); acct=False counts none (on_window returns early) and those tags become
+    "unused" (unused_F = unused_T + used_win_T). The arrival metric is STORE-ONLY in both: useful_store_counted =
+    used_store (the same in both runs), window_uses_covered False, window_uses_acct = used_win_T / None. So the window
+    population is NOT in useful_early_share_store; the label says so."""
+    _plain("GUDKC")
+    _plain("GUDKCD")
+    evT = _run_bf("timing", worker="inline", acct=True)
+    evF = _run_bf("timing", worker="inline", acct=False)
+    bT, bF = evT["rd"]["bf"], evF["rd"]["bf"]
+    aT, aF = bT["arrival"], bF["arrival"]
+    _ev("BF1 ARRIVAL STORE-ONLY: acct True: used store %d, window-only %d, unused %d, arrival useful store %d (share %s), "
+        "window_uses_acct %s; acct False: used store %d, window %d, unused %d, arrival useful store %d (share %s), "
+        "window_uses_acct %s" % (bT["used_store"], bT["used_win"], bT["unused"], aT["useful_store_counted"],
+                                 aT["useful_early_share_store"], aT["window_uses_acct"], bF["used_store"],
+                                 bF["used_win"], bF["unused"], aF["useful_store_counted"],
+                                 aF["useful_early_share_store"], aF["window_uses_acct"]))
+    assert bT["used_win"] > 0, bT["used_win"]                          # L34: window-only consumers exist here
+    assert bF["used_win"] == 0 and bF["acct"] is False, (bF["used_win"], bF["acct"])
+    assert bF["used_store"] == bT["used_store"] and bF["unused"] == bT["unused"] + bT["used_win"], (bT, bF)
+    for a, b in ((aT, bT), (aF, bF)):
+        assert a["useful_scope"] == "store_only" and not a["window_uses_covered"], a
+        assert a["useful_store_counted"] == b["used_store"], (a["useful_store_counted"], b["used_store"])
+    assert aT["window_uses_acct"] == bT["used_win"] and aF["window_uses_acct"] is None, (aT, aF)
+    assert aT["useful_early_share_store"] == aF["useful_early_share_store"], (aT, aF)   # the window is not in it
+    for ev in (evT, evF):
+        gs = _gates(ev, "timing")
+        assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
+
+
+class _RaiseEv:
+    """A snapshot event that is never complete (query False) and RAISES the planted exception in query() ("query") or
+    in synchronize() ("sync"): both are outside _prep / _finish in the ready loop (_ready_count, _wait_oldest)."""
+
+    def __init__(self, where, exc):
+        self.where, self.exc = where, exc
+
+    def record(self, stream=None):
+        return None
+
+    def query(self):
+        if self.where == "query":
+            raise self.exc
+        return False
+
+    def synchronize(self):
+        if self.where == "sync":
+            raise self.exc
+
+    def elapsed_time(self, other):
+        return 0.0
+
+
+@pytest.mark.parametrize("where", ["query", "sync"])
+def test_bf1_worker_failure(where):
+    """REVIEW 5 (1): FAILURE PROPAGATION from the readiness operations OUTSIDE the worker's _prep / _finish (snap
+    ready, thread worker, defer): a snapshot event whose query() (or, separately, synchronize()) raises a planted
+    exception. The worker records THAT exception (error_exc is the same object, error names it), stops (the thread
+    ends, no retry), notifies the compute thread, which raises BFError FROM it at its next hook; no snapshot slot stays
+    owned (snap_busy all False) and the flight counters close (inflight 0)."""
+    planted = RuntimeError("planted %s failure" % where)
+    box = {}
+
+    def setup(run):
+        bf = run.bf
+        bf.snap_ev = [_RaiseEv(where, planted) for _ in range(bf.nsnap)]
+        box["bf"] = bf
+    with pytest.raises(_mod("r2_bf1_fetch").BFError) as ei:
+        _run_bf("timing", worker="thread", late="defer", late_wait_ms=60000.0, snap="ready", setup=setup)
+    bf = box["bf"]
+    th = bf.thread
+    if th is not None:
+        th.join(10.0)
+    _ev("BF1 WORKER FAILURE %s: raised %r (cause %r); error %r; worker alive %s; slots owned %d; inflight %d" % (
+        where, ei.value, ei.value.__cause__, (bf.error or "")[:80], th is not None and th.is_alive(),
+        sum(bf.snap_busy), bf.inflight))
+    assert ei.value.__cause__ is planted, ei.value.__cause__        # the ORIGINAL exception
+    assert bf.error_exc is planted and "planted %s failure" % where in bf.error, bf.error
+    assert th is not None and not th.is_alive()                     # the worker stopped (no retry)
+    assert not any(bf.snap_busy), bf.snap_busy                      # no slot stays owned
+    assert bf.inflight == 0 and bf.q.qsize() == 0, (bf.inflight, bf.q.qsize())
+    bf.stop()
 
 
 def test_bf1_carry():
@@ -893,12 +996,14 @@ def test_cell_pure(monkeypatch):
         assert not C.bf_gate("B", dict(good, **{k: v}), "ce")[2], k
     assert not C.bf_gate("B", dict(good, snap_mode="ready", snap_unready_taken=1), "ce")[2]   # SNAP ready
     assert C.bf_gate("B", dict(good, snap_mode="newest", snap_unready_taken=5), "ce")[2]
-    arr = dict(enabled=True, useful_counted=7, items_sent_counted=10, items_useful_early=5, items_useful_late=1,
-               items_useful_nodeadline=1, items_useful_unattributed=0)
+    arr = dict(enabled=True, useful_scope="store_only", useful_store_counted=6, items_sent_counted=10,
+               items_useful_store_early=4, items_useful_store_late=1, items_useful_store_nodeadline=1,
+               items_useful_store_unattributed=0)                      # used_store 6 (good): STORE-ONLY closures
     assert C.bf_gate("B", dict(good, arrival=arr), "ce")[2]           # ARRIVAL closures
-    for k, v in (("useful_counted", 6), ("items_sent_counted", 9), ("items_useful_late", 2)):
+    for k, v in (("useful_store_counted", 7), ("items_sent_counted", 9), ("items_useful_store_late", 2),
+                 ("useful_scope", "store+window")):
         assert not C.bf_gate("B", dict(good, arrival=dict(arr, **{k: v})), "ce")[2], k
-    assert C.bf_gate("B", dict(good, arrival=dict(arr, enabled=False, useful_counted=0)), "ce")[2]
+    assert C.bf_gate("B", dict(good, arrival=dict(arr, enabled=False, useful_store_counted=0)), "ce")[2]
     ar_ = C.parse_args(base + ["--arms", "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB,"
                                          "L4PTFDGUDKWCDR"])
     assert C.bf_opt(ar_, "L4PTFDGUDKWCDR")["snap"] == "ready" and C.bf_opt(ar_, "L4PTFDGUDKWCDB")["snap"] == "newest"
@@ -924,12 +1029,12 @@ def test_cell_pure(monkeypatch):
     st = C.PRED_STAMP_BF1                                              # None, or a `date -u` stamp with bands
     assert st is None or (re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", st) and P.get("BF1_vs_X") is not None), st
     sp["L4PTFDGUDKWCDR"] = dict(sp["L4PTFDGUDKWCDB"], rates=dict(median_tok_s=111.0),
-                                bf=dict(arrival=dict(useful_early_share=0.9)))
+                                bf=dict(arrival=dict(useful_early_share_store=0.9)))
     sp["L4PTFDGUDKWCDB"]["bf"]["worker_ms_per_epoch"] = dict(snap_rest_s=80.0)
     v = {p[0]: p for p in C.verdicts(sp, 318, True)}
     PR = C.PRED_BF1R_BY_B.get(318) or {}
     for name, key, val in (("BF1R-VS-X", "BF1R_vs_X", 1.11), ("BF1R-VS-B", "BF1R_vs_B", 111.0 / 110.0),
-                           ("BF1R-USEFUL-EARLY", "BF1R_useful_early", 0.9), ("BF1R-SNAP-REST-MS", "BF1R_snap_rest_ms",
+                           ("BF1R-USEFUL-EARLY-STORE", "BF1R_useful_early_store", 0.9), ("BF1R-SNAP-REST-MS", "BF1R_snap_rest_ms",
                                                                               80.0)):
         bb = PR.get(key)
         assert v[name][1] == ("REPORT" if bb is None else ("CONFIRMED" if bb[0] <= val <= bb[1] else "REFUTED")), v[name]

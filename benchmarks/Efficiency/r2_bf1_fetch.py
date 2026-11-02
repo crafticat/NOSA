@@ -139,10 +139,15 @@ ARRIVAL (arrival=True; the record's "arrival" block; cheap, off the hot path: tw
 layer, one index_put_ per commit, one scatter_add_ per joint pass). Per batch: its ARRIVAL event (direct: after its side
 commit; deferred: after its landing) and its items per layer; per joint pass: one event at each layer's residency start
 (the DEADLINE of that layer's items) and the used tags counted per (batch, layer) on the device (pbid). The report
-compares the two clocks after the run: early / late items (sent and USEFUL = used by the joint pass), margin
-quantiles, the bytes that landed after the joint pass's start (they share the link with the urgent gathers), the GPU
-time of the deferred commits on the compute stream (consume), and the worker's host time that overlaps the host draft
-window and the host joint window (busy, wait, active = busy - wait). CPU: host clocks (_HostEvent) stand in.
+compares the two clocks after the run: early / late items (sent, and USEFUL STORE = used by the joint pass through
+the store; window uses are NOT covered), margin quantiles, the items whose usable-arrival event completed after the
+joint pass's start (*_arrived_after_jstart: a completion / deadline classification, not link use during J), the
+compute-stream span of each deferred job (deferred_wait_and_commit: its landing wait plus its commit), and the
+worker's host time that overlaps the host draft window and the host joint window (busy, wait, host_active = busy -
+wait; not a measured GIL hold). CPU: host clocks (_HostEvent) stand in. Labels revised in review 5 (_arrival_report).
+FAILURE PROPAGATION (review 5): _loop's outer boundary (_fatal) covers every worker exception, also the readiness
+operations outside _prep / _finish; the worker stops, the original exception reaches the compute thread (_raise_error:
+BFError from it), no snapshot slot stays owned.
 """
 from __future__ import annotations
 
@@ -363,6 +368,7 @@ class BgFetch:
         self.q = queue.Queue()
         self.thread = None
         self.error = None
+        self.error_exc = None                            # FAILURE PROPAGATION: the worker's original exception
         self._seq = 0
         self.epoch = None
         self.rep = dict(epochs=0, jobs=0, issued=0, late=0, items_seen=0, items_have=0, items_cap=0, items_sent=0,
@@ -466,9 +472,19 @@ class BgFetch:
         """The device bytes BF1 allocated (the landing ring, the snapshot ring, the tags)."""
         if self.mode == "off":
             return sum(t.numel() * t.element_size() for t in (self.ptag, self.pkey, self.ptagw))
-        extra = [self.pbid] if self.pbid is not None else []                  # ARRIVAL (+ 32 KB per epoch counted)
+        extra = [self.pbid] if self.pbid is not None else []                  # ARRIVAL: pbid and the per-epoch
+        extra += [er["cnt"] for er in self.arr_ep]                            # counters (they GROW: arrival_bytes)
         return sum(t.numel() * t.element_size() for t in [self.land_k, self.land_v, self.land_it, self.snap_d,
                                                           self.ptag, self.pkey, self.ptagw] + extra)
+
+    def arrival_bytes(self) -> dict:
+        """ARRIVAL device memory (review 5): pbid (H, B, X) int64, fixed; one (bl_max L + 1) int64 counter per epoch, kept
+        to the report (32,776 B per epoch at bl_max 128, L 32): it grows by that per epoch, without a bound other than
+        the run's epochs (210 epochs at bf1b: 6.9 MB)."""
+        per = (self.bl_max * self.L + 1) * 8
+        pb = self.pbid.numel() * 8 if self.pbid is not None else 0
+        return dict(pbid_bytes=pb, counter_bytes_per_epoch=per if (self.arrival and self.mode != "off") else 0,
+                    epochs_kept=len(self.arr_ep), counter_bytes_total=sum(er["cnt"].numel() * 8 for er in self.arr_ep))
 
     # ---------------------------------------------------------- the capture lock (thread worker)
     def wrap_backend(self, be) -> None:
@@ -537,7 +553,7 @@ class BgFetch:
     def before_joint(self) -> None:
         """J start: close the epoch, the compute stream waits the last issued commit (the barrier)."""
         if self.error is not None:
-            raise BFError("BF1 worker failed: %s" % self.error)
+            self._raise_error()
         if self.mode == "off" or self.epoch is None:
             return
         waited = 0.0
@@ -610,9 +626,9 @@ class BgFetch:
         self.cnt_main[0].add_(used.sum())
         self.cnt_main[1].add_((tg & ~anyu).sum())
         self.cnt_main[2].add_((tg & self.ptagw[..., 1:] & ~used).sum())
-        if er is not None and self.pbid is not None:     # ARRIVAL: the USED tags per (batch, layer), on the device
-            idx = torch.where(anyu, self.pbid[..., 1:], self.bl_dummy)
-            er["cnt"].scatter_add_(0, idx.reshape(-1), anyu.reshape(-1).to(torch.int64))
+        if er is not None and self.pbid is not None:     # ARRIVAL: the STORE uses per (batch, layer), on the device
+            idx = torch.where(used, self.pbid[..., 1:], self.bl_dummy)     # (review 5: STORE-ONLY; the window
+            er["cnt"].scatter_add_(0, idx.reshape(-1), used.reshape(-1).to(torch.int64))   # uses are not covered)
         self._arr_cur = None
         self.ptag.zero_()
         self.ptagw.zero_()
@@ -718,7 +734,7 @@ class BgFetch:
         if self.mode == "off" or self.epoch is None:
             return
         if self.error is not None:
-            raise BFError("BF1 worker failed: %s" % self.error)
+            self._raise_error()
         B = self.B
         lm = eng._load_mask
         cand = skip & (lm >= 0) & (lm < qb3) & drf.view(1, B, 1)
@@ -739,6 +755,65 @@ class BgFetch:
                 self.inflight += 1
                 ep.pend[int(l)] = ep.pend.get(int(l), 0) + 1
             self.q.put(job)
+            if self.error is not None:                   # the worker failed meanwhile: no slot stays owned
+                self._raise_error()
+
+    def _raise_error(self) -> None:
+        """FAILURE PROPAGATION (compute thread): the queued jobs never reach a worker; their snapshot slots are released;
+        then BFError FROM the worker's ORIGINAL exception (error_exc)."""
+        self._drain_release()
+        raise BFError("BF1 worker failed: %s" % self.error) from self.error_exc
+
+    def _record_error(self, e) -> None:
+        """FAILURE PROPAGATION (worker): the FIRST exception is kept (error: its text and traceback; error_exc: the object);
+        every waiter on the cv is notified (the compute thread's DEFER wait and slot wait end on error)."""
+        if self.error is None:
+            self.error = "%s: %s\n%s" % (type(e).__name__, e, traceback.format_exc()[-1500:])
+            self.error_exc = e
+        with self.cv:
+            self.cv.notify_all()
+
+    def _drain_release(self) -> None:
+        """Every queued job out of the queue (either thread): its snapshot slot released, its flight counters closed. A
+        stop sentinel is put back."""
+        stop = False
+        while True:
+            try:
+                x = self.q.get_nowait()
+            except queue.Empty:
+                break
+            if x is None:
+                stop = True
+                continue
+            self._release_snap(x[2])
+            with self.cv:
+                self.inflight -= 1
+                x[0].pend[x[1]] -= 1
+                self.cv.notify_all()
+        if stop:
+            self.q.put(None)
+
+    def _fatal(self, e, owned) -> None:
+        """FAILURE PROPAGATION, the worker loop's outer boundary (r2_bf1 review 5): an exception OUTSIDE _prep / _finish
+        (the readiness query, the poll, the oldest-snapshot wait) or an error recorded inside them STOPS the worker (no
+        retry): the original exception is kept (e None: already recorded), the snapshot slots of `owned` [(job, ids)]
+        that are not read (ids None) and of every queued job are released, their flight counters closed, the waiters
+        notified. A batch already prepared (prev) keeps its counters: it is never issued; its slots were released at
+        its read."""
+        if e is not None:
+            self._record_error(e)
+        for job, ids in owned:                           # taken, not placed: slot (if not read) and flight closed
+            if job is None:
+                continue
+            if ids is None:
+                self._release_snap(job[2])
+            with self.cv:
+                self.inflight -= 1
+                job[0].pend[job[1]] -= 1
+        del owned[:]
+        self._drain_release()
+        with self.cv:
+            self.cv.notify_all()
 
     def _snap_slot(self) -> int:
         with self.cv:
@@ -763,9 +838,20 @@ class BgFetch:
             self.thread.start()
 
     def _loop(self):
-        if self.snap_mode == "ready":
-            return self._loop_ready()
-        return self._loop_newest()
+        """The worker thread. FAILURE PROPAGATION (review 5): every exception of the loop, also outside _prep / _finish
+        (the readiness query, the poll, the oldest-snapshot wait, the queue and hold calls), ends here: _fatal keeps the
+        ORIGINAL exception, releases the slots that the worker (self._own: taken, not read) and the queue still own,
+        notifies the waiters and the worker STOPS (no retry). An error recorded inside _prep / _finish also stops the
+        loop at its next iteration (self.error set: _fatal(None, ...))."""
+        self._own = []
+        try:
+            with torch.inference_mode():                 # L32: the main thread's inference mode
+                if self.snap_mode == "ready":
+                    self._loop_ready()
+                else:
+                    self._loop_newest()
+        except BaseException as e:
+            self._fatal(e, list(self._own))
 
     def _loop_newest(self):
         """BATCHES (bf1b: the per-job cost, not the pack, bound the worker: 3,666 of 13,408 jobs issued, 14 ms of worker
@@ -777,6 +863,10 @@ class BgFetch:
             left = []                                    # (job, ids): read, not placed (the entry was full): first next
             prev = None                                  # PIPELINE: (jobs, pending issue) of the previous batch
             while True:
+                self._own = [(carry, None)] if (have_carry and carry is not None) else []
+                if self.error is not None:               # FAILURE PROPAGATION: stop, no retry
+                    self._fatal(None, self._own)
+                    return
                 if left:
                     first = left[0][0]
                 elif have_carry:
@@ -794,6 +884,8 @@ class BgFetch:
                 if first is None:
                     self._done(prev)
                     return
+                if not left:
+                    self._own = [(first, None)]              # taken from the queue, its snapshot not read
                 if self.hold > 1 and not left and first[0] is not self._held_ep:   # tests: once per epoch
                     prev = self._done(prev)              # the hold waits for jobs; the previous batch first
                     self._hold(first)
@@ -811,6 +903,7 @@ class BgFetch:
                         break
                     batch.append(nxt)
                     idss.append(None)
+                self._own = [(carry, None)] if (have_carry and carry is not None) else []   # _prep owns the batch
                 tj = time.perf_counter()
                 self.rep["batch_in_max"] = max(self.rep.get("batch_in_max", 0), len(batch))   # jobs offered (backlog)
                 pseq = prev[1]["seq"] if (prev is not None and prev[1] is not None) else 0
@@ -818,8 +911,8 @@ class BgFetch:
                 try:
                     left, p = self._prep(batch, idss, pseq)
                 except BaseException as e:               # the compute thread raises it at its next hook
-                    self.error = "%s: %s\n%s" % (type(e).__name__, e, traceback.format_exc()[-1500:])
-                    for job, ids in zip(batch, idss):
+                    self._record_error(e)
+                    for job, ids in zip(batch, idss):    # idss: updated in place by _prep (read = released)
                         if ids is None:
                             self._release_snap(job[2])
                     left, p = [], None
@@ -837,9 +930,13 @@ class BgFetch:
         finish), DROP (no pipeline), the leftovers (carried first) and the stop are the b3 loop's."""
         with torch.inference_mode():                     # L32: the main thread's inference mode
             pend = []                                    # [(job, ids)]: taken, not placed (ids: read, a carried job)
+            self._own = pend                             # FAILURE PROPAGATION: the same list (mutated in place)
             prev = None
             stopping = False
             while True:
+                if self.error is not None:               # FAILURE PROPAGATION: stop, no retry
+                    self._fatal(None, pend)
+                    return
                 if not stopping:
                     stopping = self._drain(pend)
                 if not pend:
@@ -877,8 +974,8 @@ class BgFetch:
                 try:
                     left, p = self._prep(jobs, idss, pseq)
                 except BaseException as e:               # the compute thread raises it at its next hook
-                    self.error = "%s: %s\n%s" % (type(e).__name__, e, traceback.format_exc()[-1500:])
-                    for job, ids in zip(jobs, idss):
+                    self._record_error(e)
+                    for job, ids in zip(jobs, idss):     # idss: updated in place by _prep (read = released)
                         if ids is None:
                             self._release_snap(job[2])
                     left, p = [], None
@@ -962,7 +1059,7 @@ class BgFetch:
             if p is not None:
                 self._finish(p)
         except BaseException as e:                       # the compute thread raises it at its next hook
-            self.error = "%s: %s\n%s" % (type(e).__name__, e, traceback.format_exc()[-1500:])
+            self._record_error(e)
         finally:
             with self.cv:
                 self.inflight -= len(done)
@@ -1030,7 +1127,8 @@ class BgFetch:
         ep = jobs[0][0]
         if self.stall_ms > 0:                            # tests only: a slow worker (late jobs on purpose)
             time.sleep(self.stall_ms * len(jobs) / 1e3)
-        idss = list(idss) if idss is not None else [None] * len(jobs)
+        if idss is None:                                 # a caller's list is updated IN PLACE: on an exception the
+            idss = [None] * len(jobs)                    # caller releases only the snapshots not yet read
         ts = time.perf_counter()
         first = True
         for i, (_, l, s, j, t_enq) in enumerate(jobs):
@@ -1395,6 +1493,7 @@ class BgFetch:
         out.setdefault("polls", 0)
         out.update(snap_mode=self.snap_mode, poll_ms=self.poll_s * 1e3)
         out["arrival"] = self._arrival_report()
+        out["arrival"]["window_uses_acct"] = out["used_win"] if self.acct else None   # not per batch, not timed
         if tps is not None:
             out["worker_ms_per_epoch"]["cxx_submit"] = round(tps.get("submit_ns", 0) / 1e6 / ne, 3)
             out["worker_ms_per_epoch"]["cxx_pack"] = round(tps.get("pack_ns", 0) / 1e6 / ne, 3)
@@ -1403,25 +1502,37 @@ class BgFetch:
 
     def _arrival_report(self) -> dict:
         """ARRIVAL (module docstring), after the run (the device synchronized): per issued batch and per layer of its
-        items, the margin = DEADLINE (the joint layer's residency start) - ARRIVAL, both from the epoch's origin event;
-        early: margin >= 0. USEFUL items: the used tags of the (batch, layer) (the device counts); unattributed: used
-        tags of batches beyond bl_max. in_joint: the arrival is after the joint pass's layer 0 started. No deadline: the
-        epoch's joint pass did not run (the last epoch) or its layer event is missing. consume: the deferred commits'
-        time on the compute stream. host: the worker's host segments that overlap the host draft window (epoch open ->
-        the joint pass's start) and the host joint window (its start -> its end), ms per epoch."""
+        items, the margin = DEADLINE (the joint layer's residency start) - ARRIVAL (the batch's usable-arrival event),
+        both from the epoch's origin event; early: margin >= 0. A completion / deadline CLASSIFICATION, not a measure of
+        link use or of interference. LABELS (review 5):
+        - USEFUL = STORE-ONLY (useful_scope "store_only"): the used STORE tags of the (batch, layer) (the device
+          counts). Window (kwin) uses are NOT covered: on_window counts them only with acct=True (the timing cells run
+          acct=0), and even then they are not attributed to a batch (window_uses_acct: their total, acct only).
+          unattributed: store uses of batches beyond bl_max.
+        - *_arrived_after_jstart: the batch's usable-arrival event completed after the joint pass's layer 0 started.
+          It does NOT intersect the DMA interval with J and is not bounded by J's end: NOT "link bytes during J".
+        - deferred_wait_and_commit: the compute-stream span of a deferred job at its layer = the wait for its landing
+          PLUS its commit (not the commit time alone).
+        - host: the worker's HOST segments (busy, wait, host_active = busy - wait) that overlap the host draft window
+          (epoch open -> the joint pass's start) and the host joint window, ms per epoch. host_active is the worker's
+          host time outside its waits; it is NOT a measured GIL hold (gil_hold_measured False).
+        No deadline: the epoch's joint pass did not run (the last epoch) or its layer event is missing."""
         L, ib = self.L, self.item_bytes
-        z = dict(enabled=self.arrival and self.mode != "off", batches=0, batches_deferred=0, batches_passed=0,
-                 items_sent_early=0, items_sent_late=0, items_sent_nodeadline=0, items_useful_early=0,
-                 items_useful_late=0, items_useful_nodeadline=0, items_useful_unattributed=0, useful_counted=0,
-                 items_sent_in_joint=0, items_useful_in_joint=0, items_sent_counted=0)
+        z = dict(enabled=self.arrival and self.mode != "off", useful_scope="store_only", window_uses_covered=False,
+                 batches=0, batches_deferred=0, batches_passed=0, items_sent_early=0, items_sent_late=0,
+                 items_sent_nodeadline=0, items_useful_store_early=0, items_useful_store_late=0,
+                 items_useful_store_nodeadline=0, items_useful_store_unattributed=0, useful_store_counted=0,
+                 items_sent_arrived_after_jstart=0, items_useful_store_arrived_after_jstart=0, items_sent_counted=0,
+                 gil_hold_measured=False)
         if not z["enabled"]:
-            return dict(z, useful_early_share=None, margin_ms_useful=None, margin_ms_sent=None, consume=None, host=None)
+            return dict(z, useful_early_share_store=None, margin_ms_useful_store=None, margin_ms_sent=None,
+                        deferred_wait_and_commit=None, host=None)
         dead, cnt = {}, {}
         for er in self.arr_ep:
             c = er["cnt"].cpu().numpy()
             cnt[er["seq"]] = c
-            z["useful_counted"] += int(c.sum())
-            z["items_useful_unattributed"] += int(c[-1])
+            z["useful_store_counted"] += int(c.sum())
+            z["items_useful_store_unattributed"] += int(c[-1])
             dl = {}
             for l, ev in er["jl"].items():
                 try:
@@ -1448,26 +1559,27 @@ class BgFetch:
                 d = dl.get(int(l))
                 if ta is None or d is None:
                     z["items_sent_nodeadline"] += k
-                    z["items_useful_nodeadline"] += u
+                    z["items_useful_store_nodeadline"] += u
                     continue
                 m = d - ta
                 side = "early" if m >= 0 else "late"
                 z["items_sent_" + side] += k
-                z["items_useful_" + side] += u
+                z["items_useful_store_" + side] += u
                 ms.append((m, k))
                 if u:
                     mu.append((m, u))
                 if 0 in dl and ta > dl[0]:
-                    z["items_sent_in_joint"] += k
-                    z["items_useful_in_joint"] += u
-        ue, ul = z["items_useful_early"], z["items_useful_late"]
-        z["useful_early_share"] = round(ue / (ue + ul), 4) if (ue + ul) else None
-        for k in ("useful_early", "useful_late", "useful_in_joint", "sent_in_joint", "sent_late"):
+                    z["items_sent_arrived_after_jstart"] += k
+                    z["items_useful_store_arrived_after_jstart"] += u
+        ue, ul = z["items_useful_store_early"], z["items_useful_store_late"]
+        z["useful_early_share_store"] = round(ue / (ue + ul), 4) if (ue + ul) else None
+        for k in ("useful_store_early", "useful_store_late", "useful_store_arrived_after_jstart",
+                  "sent_arrived_after_jstart", "sent_late"):
             z["bytes_" + k] = z["items_" + k] * ib
-        z["margin_ms_useful"] = _wq(mu)
+        z["margin_ms_useful_store"] = _wq(mu)
         z["margin_ms_sent"] = _wq(ms)
         lu = [(m, w) for m, w in mu if m < 0]
-        z["late_ms_useful_mean"] = round(-sum(m * w for m, w in lu) / sum(w for _, w in lu), 3) if lu else 0.0
+        z["late_ms_useful_store_mean"] = round(-sum(m * w for m, w in lu) / sum(w for _, w in lu), 3) if lu else 0.0
         cs = []
         for er, c0, c1 in self.cons_ev:
             try:
@@ -1475,15 +1587,17 @@ class BgFetch:
             except Exception:
                 pass
         npass = sum(1 for er in self.arr_ep if 0 in er["jl"])
-        z["consume"] = dict(commits=len(cs), ms_total=round(sum(cs), 3),
-                            ms_per_joint_pass=round(sum(cs) / npass, 3) if npass else None)
+        z["deferred_wait_and_commit"] = dict(jobs=len(cs), ms_total=round(sum(cs), 3),
+                                             ms_per_joint_pass=round(sum(cs) / npass, 3) if npass else None)
         z["joint_passes"] = npass
         z["host"] = self._host_overlap()
+        z["memory"] = self.arrival_bytes()
         return z
 
     def _host_overlap(self) -> dict:
         """ms per epoch of the worker's busy / wait segments inside the host draft windows and the host joint windows
-        (active = busy - wait: the worker's Python and CUDA calls beside the main thread)."""
+        (host_active = busy - wait: the worker's host time outside its waits, beside the main thread; NOT a measured GIL
+        hold)."""
         dw = [(er["h_open"], er["h_close"]) for er in self.arr_ep if er["h_close"] is not None]
         jw = [(er["h_close"], er["h_end"]) for er in self.arr_ep if er["h_close"] is not None and er["h_end"] is not None]
         out = {}
@@ -1495,8 +1609,8 @@ class BgFetch:
                 for a, b in win:
                     if sg.shape[0]:
                         tot += float(np.clip(np.minimum(sg[:, 1], b) - np.maximum(sg[:, 0], a), 0.0, None).sum())
-                r[kind] = round(tot * 1e3 / max(1, len(win)), 3)
-            r["active"] = round(r["busy"] - r["wait"], 3)
+                r[kind + "_ms"] = round(tot * 1e3 / max(1, len(win)), 3)
+            r["host_active_ms"] = round(r["busy_ms"] - r["wait_ms"], 3)
             r["windows"] = len(win)
             out[name] = r
         return out

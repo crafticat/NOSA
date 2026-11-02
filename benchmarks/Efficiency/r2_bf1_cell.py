@@ -111,10 +111,11 @@ PRED_BF1_BY_B = {
 # bf1r (R = L4PTFDGUDKWCDR, snap "ready"; same job as X and B): NONE until the lead registers them with PRED_STAMP_BF1R;
 # the step script STOPS bf1r while PRED_STAMP_BF1R is None. Keys (low, high): BF1R_vs_X, BF1R_vs_B [x] median steady
 # committed tok/s; BF1R_joint_saving [ms] X's joint median - R's; BF1R_draft_ratio [x] R's draft / X's;
-# BF1R_useful_early [share] R's arrival.useful_early_share; BF1R_snap_rest_ms [ms per epoch] B's snap_rest_s (the wait
-# R removes). The writer's MODEL: INTEGRATION_NOTES_2026-10-31.md section 13.
+# BF1R_useful_early_store [share] R's arrival.useful_early_share_store (STORE uses only; window uses are not covered,
+# review 5); BF1R_snap_rest_ms [ms per epoch] B's snap_rest_s (the wait R removes). The writer's MODEL:
+# INTEGRATION_NOTES_2026-10-31.md section 13.
 PRED_STAMP_BF1R = None
-PRED_KEYS_R = ("BF1R_vs_X", "BF1R_vs_B", "BF1R_joint_saving", "BF1R_draft_ratio", "BF1R_useful_early",
+PRED_KEYS_R = ("BF1R_vs_X", "BF1R_vs_B", "BF1R_joint_saving", "BF1R_draft_ratio", "BF1R_useful_early_store",
                "BF1R_snap_rest_ms")
 PRED_BF1R_BY_B = {}
 
@@ -317,22 +318,25 @@ def bf_gate(arm, bf, mode: str):
     if bf.get("packer") == "gilfree":                                  # the C++ team ran at the requested size
         ok = ok and bool((bf.get("transport") or {}).get("threads_ok"))
     ready = bf.get("snap_mode") != "ready" or not bf.get("snap_unready_taken")    # SNAP ready: no unready snapshot
-    ar = bf.get("arrival") or {}                                       # ARRIVAL: the counters close (when enabled)
-    arr_ok = (not ar.get("enabled")) or (
-        ar.get("useful_counted") == (bf.get("used_store") or 0) + (bf.get("used_win") or 0)
+    ar = bf.get("arrival") or {}                                       # ARRIVAL: the counters close (when enabled);
+    arr_ok = (not ar.get("enabled")) or (                              # STORE-ONLY (review 5): the window uses are on
+        ar.get("useful_scope") == "store_only"                         # neither side of the closure
+        and ar.get("useful_store_counted") == (bf.get("used_store") or 0)
         and ar.get("items_sent_counted") == sent
-        and ar.get("useful_counted") == sum(ar.get("items_useful_" + k, 0) for k in (
+        and ar.get("useful_store_counted") == sum(ar.get("items_useful_store_" + k, 0) for k in (
             "early", "late", "nodeadline", "unattributed")))
     ok = ok and ready and arr_ok
     return ("%s-BF" % arm, True, bool(ok),
             "error %s; jobs %s, issued %s, late %s; items seen %s, kept or sent before %s, capped %s, sent %s = device "
             "%s; committed %s, revived %s, no room %s (sum ok %s); used store %s, window %s, unused %s, pending %s (tags "
-            "ok %s); snap %s, unready taken %s (ok %s); arrival enabled %s, useful counted %s, sent counted %s (ok %s)"
+            "ok %s); snap %s, unready taken %s (ok %s); arrival enabled %s (scope %s), useful store counted %s, sent "
+            "counted %s (ok %s)"
             % (bf.get("error"), bf.get("jobs"), bf.get("issued"), bf.get("late"), bf.get("items_seen"),
                bf.get("items_have"), bf.get("items_cap"), sent, items, bf.get("committed"),
                bf.get("revived"), bf.get("no_room"), cons, bf.get("used_store"), bf.get("used_win"),
                bf.get("unused"), bf.get("pending"), tags, bf.get("snap_mode"), bf.get("snap_unready_taken"), ready,
-               ar.get("enabled"), ar.get("useful_counted"), ar.get("items_sent_counted"), arr_ok))
+               ar.get("enabled"), ar.get("useful_scope"), ar.get("useful_store_counted"), ar.get("items_sent_counted"),
+               arr_ok))
 
 
 STORE_KEYS = ("cap", "store_slots")    # union.<key>: the fork store's size (store_slots = X, cap = X - 1)
@@ -431,8 +435,8 @@ def verdicts(sp, B: int, eqf=None):
         band("BF1R-VS-B", ratio(med(rr), med(b)), PR.get("BF1R_vs_B"))
         band("BF1R-JOINT-SAVING", diff(ph(x, "joint"), ph(rr, "joint")), PR.get("BF1R_joint_saving"))
         band("BF1R-DRAFT-RATIO", ratio(ph(rr, "draft"), ph(x, "draft")), PR.get("BF1R_draft_ratio"))
-        band("BF1R-USEFUL-EARLY", ((rr.get("bf") or {}).get("arrival") or {}).get("useful_early_share"),
-             PR.get("BF1R_useful_early"))
+        band("BF1R-USEFUL-EARLY-STORE", ((rr.get("bf") or {}).get("arrival") or {}).get("useful_early_share_store"),
+             PR.get("BF1R_useful_early_store"))
         band("BF1R-SNAP-REST-MS", ((b.get("bf") or {}).get("worker_ms_per_epoch") or {}).get("snap_rest_s"),
              PR.get("BF1R_snap_rest_ms"))
     return out
