@@ -6,7 +6,10 @@ ONE PROCESS, ONE MODEL, SH FIRST, then the arms in the order of ARMS (the I4DC c
 r2_i4dc_cell.py, imported, not edited) and the BF1 arms last:
   L4PTFDGUDKWCDX  = L4PTFDGUDKWCD with BF1's classes, the fetch OFF, the store X of --bf-store (the matched control: the
                     same code path and memory, no prefetch)
-  L4PTFDGUDKWCDB  = L4PTFDGUDKWCD + BF1 (mode "ce"), the store X of --bf-store
+  L4PTFDGUDKWCDB  = L4PTFDGUDKWCD + BF1 (mode "ce"), the store X of --bf-store, snapshots per --bf-snap (default
+                    "newest": the b3 worker loop)
+  L4PTFDGUDKWCDR  = L4PTFDGUDKWCDB with snap "ready" (bf1r: a batch takes only jobs whose snapshot event completed;
+                    INTEGRATION_NOTES_2026-10-31.md section 13); the same-job A/B of the fix against B
 A BF1 arm needs L4PTFDGUDKWCD EARLIER in the job (its LISTED reference; it also compiled the helpers). Every arm runs
 run_arm_bf = the I4DC cell's run_arm_d line for line plus the lines marked "# BF1" (tests_cpu/test_bf1.py checks it).
 MUST GATES: the I4DC cell's for every arm; a BF1 arm takes L4PTFDGUDKWCD's gates under its own name (EQF = L4PTFD bit for
@@ -41,7 +44,8 @@ S4, CC, IA, GC, DG, LN, GR, HC, KC, UC, DC, KP, SK = (DCC.S4, DCC.CC, DCC.IA, DC
                                                       DCC.KC, DCC.UC, DCC.DC, DCC.KP, DCC.SK)
 I3C, WA, SC, BC = DCC.I3C, DCC.WA, DCC.SC, DCC.BC
 REF = "L4PTFDGUDKWCD"
-BF_ARMS = dict(L4PTFDGUDKWCDX="off", L4PTFDGUDKWCDB="ce")           # a BF1 arm -> its fetch mode
+BF_ARMS = dict(L4PTFDGUDKWCDX="off", L4PTFDGUDKWCDB="ce", L4PTFDGUDKWCDR="ce")    # a BF1 arm -> its fetch mode
+BF_SNAP = dict(L4PTFDGUDKWCDR="ready")                              # an arm with a fixed snap mode (else --bf-snap)
 ARMS = DCC.ARMS + tuple(BF_ARMS)
 GRAPH_ARMS = DCC.GRAPH_ARMS + tuple(BF_ARMS)
 TOPK = DCC.TOPK
@@ -104,6 +108,15 @@ PRED_BF1_BY_B = {
 #   22 S_J = -31 .. -23), BF1_draft_ratio (1.03, 1.08), BF1_barrier_ms (0, 10), BF1_eq True. REPORT-only: worker busy
 #   180 .. 260 ms per epoch, deferred share of jobs 0 .. 0.25 (b2 0.59), host wait in the joint passes 0 .. 10 ms per
 #   round (b2 28.5), overlapped > 0.
+# bf1r (R = L4PTFDGUDKWCDR, snap "ready"; same job as X and B): NONE until the lead registers them with PRED_STAMP_BF1R;
+# the step script STOPS bf1r while PRED_STAMP_BF1R is None. Keys (low, high): BF1R_vs_X, BF1R_vs_B [x] median steady
+# committed tok/s; BF1R_joint_saving [ms] X's joint median - R's; BF1R_draft_ratio [x] R's draft / X's;
+# BF1R_useful_early [share] R's arrival.useful_early_share; BF1R_snap_rest_ms [ms per epoch] B's snap_rest_s (the wait
+# R removes). The writer's MODEL: INTEGRATION_NOTES_2026-10-31.md section 13.
+PRED_STAMP_BF1R = None
+PRED_KEYS_R = ("BF1R_vs_X", "BF1R_vs_B", "BF1R_joint_saving", "BF1R_draft_ratio", "BF1R_useful_early",
+               "BF1R_snap_rest_ms")
+PRED_BF1R_BY_B = {}
 
 
 def runner_choice(arm: str, check: bool):
@@ -153,6 +166,12 @@ def parse_args(argv):
                          "abandoned")
     ap.add_argument("--bf-late-wait-ms", type=float, default=250.0,
                     help="defer: the host wait budget per joint pass for late jobs (the host runs ahead of the GPU)")
+    ap.add_argument("--bf-snap", default="newest", choices=BF.SNAPS,
+                    help="the B arm's batches: newest = wait for every snapshot of the batch (b3); ready = only jobs "
+                         "whose snapshot completed (the R arm always runs ready)")
+    ap.add_argument("--bf-poll-ms", type=float, default=1.0, help="snap ready: the poll period while two waits are open")
+    ap.add_argument("--bf-arrival", type=int, default=1, choices=(0, 1),
+                    help="1: the ARRIVAL counters (deadline margins, useful early share, consume time, host overlap)")
     ap.add_argument("--prefill-hook", default="nocopy", choices=("nocopy", "copy"))
     ap.add_argument("--tu-gemm", default="natural", choices=("natural", "rowgroup"))
     ap.add_argument("--spec-journal-blocks", type=int, default=256)
@@ -187,9 +206,10 @@ def parse_args(argv):
         if x != 0 and x < bound:
             ap.error("%s %d: below the bound 1 + (K - 1) x 64 = %d (0 = the default)" % (name, x, bound))
     if (a.bf_ncap < 1 or a.bf_ring < 2 or a.bf_close_wait_ms < 0 or not 1 <= a.bf_threads <= 64
-            or not 16 <= a.bf_cap_groups <= 4096 or a.bf_late_wait_ms < 0 or not 1 <= a.bf_batch <= 64):
+            or not 16 <= a.bf_cap_groups <= 4096 or a.bf_late_wait_ms < 0 or not 1 <= a.bf_batch <= 64
+            or not 0 < a.bf_poll_ms <= 50):
         ap.error("--bf-ncap >= 1, --bf-ring >= 2, --bf-close-wait-ms >= 0, --bf-threads in 1 .. 64, --bf-cap-groups in "
-                 "16 .. 4096, --bf-late-wait-ms >= 0, --bf-batch in 1 .. 64")
+                 "16 .. 4096, --bf-late-wait-ms >= 0, --bf-batch in 1 .. 64, --bf-poll-ms in (0, 50]")
     if a.bf_packer == "gilfree" and any(x in a.arms for x in BF_ARMS) and not os.environ.get("TORCH_EXTENSIONS_DIR"):
         ap.error("--bf-packer gilfree: TORCH_EXTENSIONS_DIR must name the run's build directory (never HOME)")
     if not 1 <= a.pool <= BC.POOL_MAX:
@@ -201,7 +221,8 @@ def bf_opt(a, arm: str) -> dict:
     """BgFetch's keyword arguments of a BF1 arm."""
     return dict(mode=BF_ARMS[arm], n_cap=a.bf_ncap, ring=a.bf_ring, worker=a.bf_worker, acct=bool(a.bf_acct),
                 close_wait_ms=a.bf_close_wait_ms, packer=a.bf_packer, threads=a.bf_threads,
-                gf=dict(cap_groups=a.bf_cap_groups), late=a.bf_late, late_wait_ms=a.bf_late_wait_ms, batch=a.bf_batch)
+                gf=dict(cap_groups=a.bf_cap_groups), late=a.bf_late, late_wait_ms=a.bf_late_wait_ms, batch=a.bf_batch,
+                snap=BF_SNAP.get(arm, a.bf_snap), poll_ms=a.bf_poll_ms, arrival=bool(a.bf_arrival))
 
 
 # ------------------------------------------------------------------ the arms (GPU)
@@ -295,13 +316,23 @@ def bf_gate(arm, bf, mode: str):
           and (bf.get("committed") or 0) > 0 and cons and tags and room)                                     # cannot place
     if bf.get("packer") == "gilfree":                                  # the C++ team ran at the requested size
         ok = ok and bool((bf.get("transport") or {}).get("threads_ok"))
+    ready = bf.get("snap_mode") != "ready" or not bf.get("snap_unready_taken")    # SNAP ready: no unready snapshot
+    ar = bf.get("arrival") or {}                                       # ARRIVAL: the counters close (when enabled)
+    arr_ok = (not ar.get("enabled")) or (
+        ar.get("useful_counted") == (bf.get("used_store") or 0) + (bf.get("used_win") or 0)
+        and ar.get("items_sent_counted") == sent
+        and ar.get("useful_counted") == sum(ar.get("items_useful_" + k, 0) for k in (
+            "early", "late", "nodeadline", "unattributed")))
+    ok = ok and ready and arr_ok
     return ("%s-BF" % arm, True, bool(ok),
             "error %s; jobs %s, issued %s, late %s; items seen %s, kept or sent before %s, capped %s, sent %s = device "
             "%s; committed %s, revived %s, no room %s (sum ok %s); used store %s, window %s, unused %s, pending %s (tags "
-            "ok %s)" % (bf.get("error"), bf.get("jobs"), bf.get("issued"), bf.get("late"), bf.get("items_seen"),
-                        bf.get("items_have"), bf.get("items_cap"), sent, items, bf.get("committed"),
-                        bf.get("revived"), bf.get("no_room"), cons, bf.get("used_store"), bf.get("used_win"),
-                        bf.get("unused"), bf.get("pending"), tags))
+            "ok %s); snap %s, unready taken %s (ok %s); arrival enabled %s, useful counted %s, sent counted %s (ok %s)"
+            % (bf.get("error"), bf.get("jobs"), bf.get("issued"), bf.get("late"), bf.get("items_seen"),
+               bf.get("items_have"), bf.get("items_cap"), sent, items, bf.get("committed"),
+               bf.get("revived"), bf.get("no_room"), cons, bf.get("used_store"), bf.get("used_win"),
+               bf.get("unused"), bf.get("pending"), tags, bf.get("snap_mode"), bf.get("snap_unready_taken"), ready,
+               ar.get("enabled"), ar.get("useful_counted"), ar.get("items_sent_counted"), arr_ok))
 
 
 STORE_KEYS = ("cap", "store_slots")    # union.<key>: the fork store's size (store_slots = X, cap = X - 1)
@@ -393,6 +424,17 @@ def verdicts(sp, B: int, eqf=None):
     want = P.get("BF1_eq")
     out.append(("BF1-EQ", "REPORT" if (want is None or eqf is None) else ("CONFIRMED" if eqf == bool(want) else "REFUTED"),
                 "L4PTFDGUDKWCDB-EQF passed %s; registered %s" % (eqf, want)))
+    rr = sp.get("L4PTFDGUDKWCDR")                                      # bf1r: the R arm (snap ready), same job
+    if rr is not None:
+        PR = PRED_BF1R_BY_B.get(B) or {k: None for k in PRED_KEYS_R}
+        band("BF1R-VS-X", ratio(med(rr), med(x)), PR.get("BF1R_vs_X"))
+        band("BF1R-VS-B", ratio(med(rr), med(b)), PR.get("BF1R_vs_B"))
+        band("BF1R-JOINT-SAVING", diff(ph(x, "joint"), ph(rr, "joint")), PR.get("BF1R_joint_saving"))
+        band("BF1R-DRAFT-RATIO", ratio(ph(rr, "draft"), ph(x, "draft")), PR.get("BF1R_draft_ratio"))
+        band("BF1R-USEFUL-EARLY", ((rr.get("bf") or {}).get("arrival") or {}).get("useful_early_share"),
+             PR.get("BF1R_useful_early"))
+        band("BF1R-SNAP-REST-MS", ((b.get("bf") or {}).get("worker_ms_per_epoch") or {}).get("snap_rest_s"),
+             PR.get("BF1R_snap_rest_ms"))
     return out
 
 
@@ -433,7 +475,10 @@ def bf_lines(name, r) -> list:
             "PIPELINE: batches selected while the previous one was unfinished %s, with its C++ job still running %s" % (
                 name, bf.get("worker_ms_per_epoch"), bf.get("batch"), bf.get("batches"), bf.get("carried"),
                 bf.get("chunks_per_epoch"), (bf.get("transport") or {}).get("submit_ms_per_chunk"),
-                bf.get("pipelined"), bf.get("overlapped"))]
+                bf.get("pipelined"), bf.get("overlapped")),
+            "BF1 %s SNAP %s: unready snapshots taken %s, polls %s. ARRIVAL %s" % (
+                name, bf.get("snap_mode"), bf.get("snap_unready_taken"), bf.get("polls"),
+                {k: v for k, v in (bf.get("arrival") or {}).items()})]
 
 
 # ------------------------------------------------------------------ main
@@ -579,7 +624,8 @@ def main(argv=None) -> int:
                 tu_gemm=a.tu_gemm, spec_journal_blocks=a.spec_journal_blocks, spec_twin=a.spec_twin,
                 spec_body=a.spec_body, spec_graph=a.spec_graph, spec_redirect=a.spec_redirect,
                 probe_every=a.probe_every, check_every=a.check_every, require_stress=a.require_stress,
-                predictions=dict(stamp=PRED_STAMP_BF1, by_batch=PRED_BF1_BY_B), capture_rounds=caps,
+                predictions=dict(stamp=PRED_STAMP_BF1, by_batch=PRED_BF1_BY_B, stamp_r=PRED_STAMP_BF1R,
+                                 by_batch_r=PRED_BF1R_BY_B), capture_rounds=caps,
                 steady_excluded_rounds=xr, strongest_tok_s=STRONGEST, budget_GB=BUDGET_GB, usable_GB=USABLE_GB,
                 dims=dims, host_mem=mem, base_commit=os.environ.get("BASE_COMMIT"), fork_blob=FORK_BLOB,
                 compile=dict(torch=torch.__version__, inductor_cache=os.environ.get("TORCHINDUCTOR_CACHE_DIR"),

@@ -7,7 +7,7 @@
 # files list and the gate change: no grant file; the TIMING cells STOP while r2_bf1_cell.PRED_STAMP_BF1 is None at <sha>
 # (the I4DC rule). The claim is the SAME as the other spec step scripts' (OUTROOT/sp_active_<holder>).
 #
-#   bash benchmarks/Efficiency/r2_bf1_step.sh --nosi <sha> <holder job> <run id> <bf1m|bf1a|bf1b>
+#   bash benchmarks/Efficiency/r2_bf1_step.sh --nosi <sha> <holder job> <run id> <bf1m|bf1a|bf1b|bf1r>
 #   DRYRUN=1 bash benchmarks/Efficiency/r2_bf1_step.sh --nosi <sha> <holder job> <run id> <cell>
 #        (the pin checks, the uuid file read, the printed step command, the stamp STOP; no squeue, claim, srun or write)
 #
@@ -15,12 +15,17 @@
 # on --spec-redirect on; every cell: SH first, then the arms in the cell's order):
 #   bf1m the MINIATURE: C 73 (pool 10), B 8, 72 steps, probe 4, --check-every 1 (every round a check round: the keep's
 #        fresh-fetch byte checks cover every block that BF1 put into the store), --require-stress 1, --bf-acct 1, arms
-#        L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB. Every gate MUST. Run it first. STEP_MIN 25,
+#        L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB,L4PTFDGUDKWCDR (R: snap ready, since bf1r).
+#        Every gate MUST. Run it first. STEP_MIN 25,
 #        --mem 100G.
 #   bf1b timing, C 73 (pool 10), B 318, 512 steps, probe 16, --bf-store 257 (B and X arms: room for about 123 NEW
 #        head-blocks per (head, request) per round), --bf-ncap 6144 --bf-ring 6 (a batch of 8 jobs x about 588 items;
 #        landing 6 x 6144 x 32 KB = 1.21 GB), arms L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,
 #        L4PTFDGUDKWCDX,L4PTFDGUDKWCDB. STEP_MIN 200, --mem 340G. STOPS while PRED_STAMP_BF1 is None.
+#   bf1r bf1b's settings + the arm L4PTFDGUDKWCDR (snap "ready": INTEGRATION_NOTES_2026-10-31.md section 13), arms
+#        L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB,L4PTFDGUDKWCDR (B keeps --bf-snap newest: the
+#        b3 loop with the ARRIVAL counters; the same-job A/B of the fix). 7 parts. STEP_MIN 230, --mem 340G. STOPS while
+#        PRED_STAMP_BF1R is None (and while PRED_STAMP_BF1 is None).
 #   bf1a timing, C 128 (pool 65), B 216, 512 steps, probe 16, --bf-store 0 (129), --bf-ncap 2048 --bf-ring 8, arms
 #        L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB (the best arm L4PTFDGUDCD in the
 #        same process). STEP_MIN 180, --mem 240G. STOPS while PRED_STAMP_BF1 is None. A DIAGNOSTIC cell (full-B
@@ -65,7 +70,7 @@ FORK_BLOB=f0dc0c183a388585e216505a6bbfc696531e8add                              
 SPLITS=4
 main() {
 stop() { echo "R2 bf1 step: STOP: $*" >&2; exit 1; }
-usage() { echo "usage: r2_bf1_step.sh --nosi <sha> <holder> <run id> <bf1m|bf1a|bf1b>" >&2; exit 2; }
+usage() { echo "usage: r2_bf1_step.sh --nosi <sha> <holder> <run id> <bf1m|bf1a|bf1b|bf1r>" >&2; exit 2; }
 [ $# = 5 ] && [ "$1" = --nosi ] || usage
 NSHA=$2 JOB=$3 RUN=$4 CELL=$5
 DRY=${DRYRUN:-0}
@@ -76,18 +81,22 @@ CK=(--spec 3 --fork-store 0 --prefill-hook nocopy --tu-gemm natural --spec-journ
     --spec-body fused --spec-graph on --spec-redirect on)
 OUT_MB=2048 CHECK=0 STRESS=0 ACCT=0 PE=16
 case $CELL in
-    bf1m) POOL=10 BATCH=8 STEPS=72 ARMS=L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB BFX=0 NCAP=2048
+    bf1m) POOL=10 BATCH=8 STEPS=72 BFX=0 NCAP=2048
+          ARMS=L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB,L4PTFDGUDKWCDR
           RING=8 CHECK=1 STRESS=1 ACCT=1 PE=4 NEEDPRED=0 STEP_MIN=25 MEM=100G ;;
     bf1a) POOL=65 BATCH=216 STEPS=512 BFX=0 NCAP=2048 RING=8 NEEDPRED=1 STEP_MIN=180 MEM=240G
           ARMS=L4PTFD,L4PTFDGUDC,L4PTFDGUDKWC,L4PTFDGUDCD,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB ;;
     bf1b) POOL=10 BATCH=318 STEPS=512 BFX=257 NCAP=6144 RING=6 NEEDPRED=1 STEP_MIN=200 MEM=340G
           ARMS=L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB ;;
-    *) stop "cell '$CELL' (bf1m, bf1a or bf1b)" ;;
+    bf1r) POOL=10 BATCH=318 STEPS=512 BFX=257 NCAP=6144 RING=6 NEEDPRED=2 STEP_MIN=230 MEM=340G
+          ARMS=L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDX,L4PTFDGUDKWCDB,L4PTFDGUDKWCDR ;;
+    *) stop "cell '$CELL' (bf1m, bf1a, bf1b or bf1r)" ;;
 esac
 CARGS=(--batch "$BATCH" --steps "$STEPS" --pool "$POOL" --arms "$ARMS" "${CK[@]}" --probe-every "$PE"
        --check-every "$CHECK" --require-stress "$STRESS" --bf-store "$BFX" --bf-ncap "$NCAP" --bf-ring "$RING"
        --bf-worker thread --bf-acct "$ACCT" --bf-close-wait-ms 0 --bf-packer gilfree --bf-threads 14
-       --bf-cap-groups 2048 --bf-batch 8 --bf-late defer --bf-late-wait-ms 250)
+       --bf-cap-groups 2048 --bf-batch 8 --bf-late defer --bf-late-wait-ms 250 --bf-snap newest --bf-poll-ms 1
+       --bf-arrival 1)
 DESC="arms SH+$ARMS steps $STEPS probe $PE check $CHECK stress $STRESS bf-store $BFX ncap $NCAP acct $ACCT"
 FILE_KB=$((OUT_MB * 1024))
 MIN_LEFT=$((STEP_MIN * 60 + 600))
@@ -125,6 +134,8 @@ done
 [ "$(git -C "$NOSI" rev-parse "$NSHA:$FORKPY")" = "$FORK_BLOB" ] || stop "$FORKPY at $NSHA is not the fia6 blob $FORK_BLOB"
 NOPRED=0
 git -C "$NOSI" show "$NSHA:$CELLPY" | grep -q '^PRED_STAMP_BF1 = None$' && NOPRED=1
+NOPREDR=0
+git -C "$NOSI" show "$NSHA:$CELLPY" | grep -q '^PRED_STAMP_BF1R = None$' && NOPREDR=1
 [ -f "$SIF" ] || stop "no image $SIF (its sha256 is checked on the GPU node)"
 [ "$(stat -c %s "$MODEL/model.safetensors" 2>/dev/null)" = "$MODEL_SIZE" ] || stop "model size is not $MODEL_SIZE"
 [ -f "$WL/c16k_tokens.bin" ] || stop "no $WL/c16k_tokens.bin (its sha256 is checked on the GPU node)"
@@ -181,8 +192,11 @@ if [ "$DRY" = 1 ]; then
     printf '%q ' "${ARGV[@]}"
     echo
 fi
-if [ "$NEEDPRED" = 1 ] && [ "$NOPRED" = 1 ]; then
+if [ "$NEEDPRED" -ge 1 ] && [ "$NOPRED" = 1 ]; then
     stop "r2_bf1_cell.PRED_STAMP_BF1 is None at $NSHA: register PRED_BF1_BY_B and its stamp (date -u) before $CELL"
+fi
+if [ "$NEEDPRED" = 2 ] && [ "$NOPREDR" = 1 ]; then
+    stop "r2_bf1_cell.PRED_STAMP_BF1R is None at $NSHA: register PRED_BF1R_BY_B and its stamp (date -u) before $CELL"
 fi
 [ "$DRY" = 1 ] && exit 0
 line=$(timeout 60 squeue -j "$JOB" -h -o '%u|%T|%L') || stop "squeue failed"
