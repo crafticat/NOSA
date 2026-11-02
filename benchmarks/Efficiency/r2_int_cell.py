@@ -57,7 +57,10 @@ ARMS_J = tuple(J1.ARMS_J1) + tuple(J1.ARMS_J3)
 ST_ARMS = dict(STCELL.ST13)                       # an ST arm -> its PEQ reference (M: D; MT: M; MTK: MT)
 INT_ST3 = ("L4PTFDGUDKWCDI", "L4PTFDGUDKWCDIN")   # the INT arms that also carry ST3 (r2_st1_commit.st3_runner)
 INT_ST4 = ("L4PTFDGUDCDI", "L4PTFDGUDKWCDI", "L4PTFDGUDKWCDIN")   # ... ST4 (st4_runner, after st3_runner)
-BF_ARMS = dict(BFCELL.BF_ARMS)                    # a BF1 arm -> its fetch mode
+# a BF1 arm -> its fetch mode. INT2: only the BF1 arms whose options this cell's bf_opt carries (X, B: the 64e307f set);
+# R / S (r2_bf1_cell.BF_SNAP / BF_FIXED: snap "ready", late "complete", retain) run in the bf1 cells, never here (else
+# they would run as B under another name)
+BF_ARMS = {k: v for k, v in BFCELL.BF_ARMS.items() if k not in BFCELL.BF_SNAP and k not in BFCELL.BF_FIXED}
 D_OF = dict(J1.ARMS_J1, **J1C.BASE_J3, **ARMS_INT)   # the arms that take the I4DC gates of their D arm (own name)
 KEEP_NEW = ("L4PTFDGUDKWCDJ1", "L4PTFDGUDKWCDM", "L4PTFDGUDKWCDMT", "L4PTFDGUDKWCDMTK", "L4PTFDGUDKWCDMTKR",
             "L4PTFDGUDKWCDX", "L4PTFDGUDKWCDB", "L4PTFDGUDKWCDI", "L4PTFDGUDKWCDIN")
@@ -160,7 +163,9 @@ def bf_opt(arm: str) -> dict:
     return dict(mode=BF_ARMS.get(arm, "ce"), n_cap=OPT["bf_ncap"], ring=OPT["bf_ring"], worker=OPT["bf_worker"],
                 acct=bool(OPT["bf_acct"]), close_wait_ms=OPT["bf_close_wait_ms"], packer=OPT["bf_packer"],
                 threads=OPT["bf_threads"], gf=dict(cap_groups=OPT["bf_cap_groups"]), late=OPT["bf_late"],
-                late_wait_ms=OPT["bf_late_wait_ms"], batch=OPT["bf_batch"])   # = r2_bf1_cell.bf_opt (64e307f)
+                late_wait_ms=OPT["bf_late_wait_ms"], batch=OPT["bf_batch"],   # = r2_bf1_cell.bf_opt (64e307f)
+                snap="newest", poll_ms=1.0, arrival=True, ledger=True, retain=False)   # INT2: BF1 4692273's keys at
+    # the B arm's values = BgFetch's own defaults (no behaviour change against the merged code without them)
 
 
 class _HCProxy:

@@ -49,7 +49,8 @@ E_ = "benchmarks/Efficiency/"
 INT_NEW = (E_ + "r2_int_arms.py", E_ + "r2_int_cell.py", E_ + "r2_int_step.sh", T_ + "test_int.py", "docs/NOTES_int.md")
 RUNGS = (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", E_ + "r2_j1_forkbench.py", T_ + "test_j1.py",
          "docs/NOTES_j1.md", E_ + "r2_st1_commit.py", E_ + "r2_st1_cell.py", E_ + "r2_st1_step.sh", T_ + "test_st1.py",
-         E_ + "r2_bf1_fetch.py", E_ + "r2_bf1_cell.py", E_ + "r2_bf1_step.sh", T_ + "test_bf1.py")
+         E_ + "r2_bf1_fetch.py", E_ + "r2_bf1_cell.py", E_ + "r2_bf1_step.sh", T_ + "test_bf1.py",
+         E_ + "fork_vllm_unified_attention_ahead.py")    # INT2: J1's sibling fork file with its loads ahead (timing arm)
 OLD_DECL = tuple(T_ + "test_%s.py" % n for n in ("wsa", "wsb", "wsc", "i2", "i3", "i4a", "i4g", "i4d", "i4k", "i4u", "i4h",
                                                     "i4s", "i4cc", "i4dc", "recon7"))
 R5_FIX = (E_ + "r2_i4h_cell.py",)     # review 5 (ST): the population repair in restrict (an older module, edited)
@@ -484,7 +485,7 @@ def test_int_cell_tables(monkeypatch):
     assert (k1, kw1) == ("SCD", dict(cc_backend="inductor")) and k2 == "SKCD" and kw2["kcheck"] is True
     assert kw2["bf"] == dict(mode="ce", n_cap=2048, ring=8, worker="thread", acct=False, close_wait_ms=0.0,
                              packer="gilfree", threads=14, gf=dict(cap_groups=2048), late="defer", late_wait_ms=250.0,
-                             batch=8)
+                             batch=8, snap="newest", poll_ms=1.0, arrival=True, ledger=True, retain=False)   # INT2
     BFC = _mod("r2_bf1_cell")                                          # the same keywords as the BF1 cell's
     monkeypatch.setenv("TORCH_EXTENSIONS_DIR", "/tmp/x")
     ab = BFC.parse_args(["--out", "x", "--workload", "w", "--arms", "L4PTFD,L4PTFDGUDKWC,L4PTFDGUDKWCD,L4PTFDGUDKWCDB"])
@@ -795,3 +796,44 @@ def test_r5_every_cell_reaches_the_one_restrict():
     assert D.HC.restrict is HC.restrict
     src = (EFF / "r2_i4h_cell.py").read_text()
     assert src.count("population_repair(rec, rd, B, probe_every, steady, xs)") == 1
+
+
+# ------------------------------------------------------------------ INT2: INT + J1 track 2 + BF1 track 1 (merge checks)
+def test_int2_bf_arms_and_options():
+    """After the BF1 4692273 merge: the INT cell keeps the 64e307f BF1 arm set (X, B; R / S need r2_bf1_cell's fixed
+    snap / late / retain options, which this cell does not carry, so they are not arms here), and its BgFetch keywords
+    carry the BF1 cell's new keys at BgFetch's own defaults (the C 73 INT arm's fetch is the merged BF1 code with the
+    B arm's options, no other change)."""
+    import inspect
+    C, D = _cell()
+    BFC = _mod("r2_bf1_cell")
+    BFm = _mod("r2_bf1_fetch")
+    assert C.BF_ARMS == dict(L4PTFDGUDKWCDX="off", L4PTFDGUDKWCDB="ce")
+    for arm in ("L4PTFDGUDKWCDR", "L4PTFDGUDKWCDS"):
+        assert arm in BFC.BF_ARMS and arm not in C.BF_ARMS and arm not in D.ARMS and arm not in C.NEW_ARMS, arm
+    o = C.bf_opt("L4PTFDGUDKWCDI")
+    dflt = {k: p.default for k, p in inspect.signature(BFm.BgFetch.__init__).parameters.items()}
+    new = ("snap", "poll_ms", "arrival", "ledger", "retain")
+    assert {k: o[k] for k in new} == {k: dflt[k] for k in new}, ({k: o[k] for k in new}, dflt)
+    assert o["late"] != "complete" and o["snap"] == "newest" and o["retain"] is False
+    _ev("INT2 bf_opt (INT keep arm): %s; BgFetch defaults of the new keys %s" % (o, {k: dflt[k] for k in new}))
+
+
+def test_int2_st3_shadows_bf_keep_fill():
+    """EVIDENCE (why no INT + keep + BF1 arm S is composed): in the C 73 INT arm, ST3's KeepFillST3 is the first owner
+    of _keep_fill, above TentStateBF._keep_fill (BF1's retention mask, ledger and consumer-address check). Its compiled
+    path does not call the next _keep_fill, so the S options would not reach the keep step."""
+    INTA = _mod("r2_int_arms")
+    STC = _mod("r2_st1_commit")
+    run = _make("L4PTFDGUDKWCDI", "timing")(*X.world(2, 8, 0)[:5])
+    cls = STC.st3_state(type(run.T))
+    names = [k.__name__ for k in cls.__mro__]
+    owners = [k.__name__ for k in cls.__mro__ if "_keep_fill" in k.__dict__]
+    assert INTA.owner(cls, "_keep_fill") == "KeepFillST3" and "TentStateBF" in owners, owners
+    assert names.index("KeepFillST3") < names.index("TentStateBF"), names
+    import inspect
+    src = inspect.getsource(STC.KeepFillST3._keep_fill)
+    body = src.split("return super()._keep_fill(", 1)[1]                 # after the fallback's return
+    assert "super()" not in body, "ST3's compiled path calls the next _keep_fill"
+    assert src.count("super()._keep_fill(") == 1                         # the fallback only
+    _ev("INT2 ST3 x BF1: _keep_fill owners in MRO order %s" % owners)

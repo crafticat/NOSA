@@ -79,6 +79,8 @@ BF1_NEW = BF1_NEW + (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_s
 BF1_LATER = ("r2_int_arms.py", "r2_int_cell.py")                                                  # INT
 # R5 (review 5, ST: the yield / window population repair, r2_i4h_cell.population_repair; its tests in test_int.py)
 BF1_NEW = BF1_NEW + (E_ + "r2_i4h_cell.py",)                                                       # R5
+# INT2 (nosi-r2-int2-dev: INT + J1 track 2 + BF1 track 1): J1's sibling fork file with its loads ahead (a timing arm)
+BF1_NEW = BF1_NEW + (E_ + "fork_vllm_unified_attention_ahead.py",)                                  # INT2
 N_RUN = 48                             # committed tokens per request: about 16 rounds + the drain
 
 
