@@ -1,0 +1,27 @@
+RUN j1_a1_2195631_j1a
+  arm L4PTFDGUDCDJ1 sh_j1 keys ['pool', 'ran', 'rates', 'rewarms', 'steady', 'tokens_equal']
+    pool: {'calls': 576, 'captured': 288, 'compile_s': 4.18, 'peq_bad': 0, 'peq_calls': 288, 'peq_vals': 63839232}
+    ran = True
+    rates: {'effective_tok_s': 1027.2, 'per_request_tok_s': 16.003, 'steady_step_ms': 62.489, 'steady_tok_s': 3456.6, 'total_s': 107.666}
+    steady: {'mean_ms': 65.804, 'median_ms': 62.489, 'n': 503, 'p10_ms': 61.667, 'p90_ms': 68.276}
+    tokens_equal = True
+  STR /predictions[25]/name: J1-VS-SHJ1
+  STR /predictions[26]/detail: MODEL: the strongest whole-step graph 3407.2 tok/s with the same per-step pooling saving as SH -> SHJ1 (2.393 ms): 3540.9 tok/s; X / it 0.5674 (X / 3407.2: 0.5897)
+  STR /predictions[27]/detail: X = L4PTFDGUDCDJ1, REF = L4PTFDGUDCD (REF ran: True); J1 record {'calls': 6208, 'fallback': {}, 'events': [{'graphs': 1, 's': 1.578, 'layer': 0, 'capture': False, 'kind': 'draft_warm', 'joint_pass': 0}, {'graphs': 1, 's': 1.325, 'layer': 0, 'capture': False, 'kind': 'joint', 'joint_pass': 0}], 'compile_s': 2.903, 'peq_bad': 0, 'peq_vals': 346374144, 'peq_layers': 384, 'draft': True, 'dlayers': 64,
+  STR /predictions[33]/name: J3-VS-SHJ1
+RUN j1_b1_2195631_j1b
+  arm L4PTFDGUDKWCDJ1 sh_j1 keys ['pool', 'ran', 'rates', 'rewarms', 'steady', 'tokens_equal']
+    pool: {'calls': 576, 'captured': 288, 'compile_s': 4.207, 'peq_bad': 0, 'peq_calls': 288, 'peq_vals': 93985536}
+    ran = True
+    rates: {'effective_tok_s': 1167.5, 'per_request_tok_s': 8.318, 'steady_step_ms': 120.225, 'steady_tok_s': 2645.0, 'total_s': 139.459}
+    steady: {'mean_ms': 124.43, 'median_ms': 120.225, 'n': 503, 'p10_ms': 116.001, 'p90_ms': 125.197}
+    tokens_equal = True
+  STR /predictions[25]/name: J1-VS-SHJ1
+  STR /predictions[26]/detail: MODEL: the strongest whole-step graph 3407.2 tok/s with the same per-step pooling saving as SH -> SHJ1 (3.621 ms): 3544.7 tok/s; X / it 0.5037 (X / 3407.2: 0.5241)
+  STR /predictions[27]/detail: X = L4PTFDGUDKWCDJ1, REF = L4PTFDGUDKWCD (REF ran: True); J1 record {'calls': 6688, 'fallback': {}, 'events': [{'graphs': 1, 's': 1.539, 'layer': 0, 'capture': False, 'kind': 'draft_warm', 'joint_pass': 0}, {'graphs': 1, 's': 1.342, 'layer': 0, 'capture': False, 'kind': 'joint', 'joint_pass': 0}, {'graphs': 1, 's': 1.247, 'layer': 0, 'capture': False, 'kind': 'f6', 'joint_pass': 0}], 'compile_s': 
+RUN int_a1_2195630_inta
+  STR /predictions[18]/name: INT-VS-SHJ1
+RUN int_c1_2195631_intc
+  STR /predictions[18]/name: INT-VS-SHJ1
+RUN int_d1_2195630_intd
+  STR /predictions[18]/name: INT-VS-SHJ1

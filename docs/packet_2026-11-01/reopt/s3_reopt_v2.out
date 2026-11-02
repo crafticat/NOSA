@@ -1,0 +1,160 @@
+REOPT 2026-11-02 (analysis only; NO NEW KERNELS). Caps: cap 84.00, usable 83.75, margin 0.60 -> STRICT 83.15 GB
+
+== 1. INT cells at the measured B (MEASURED; DERIVED Y_c and T_mean) ==
+C128 B216 int_a1_2195630_inta L4PTFDGUDCDI: median 2096.1 mean 1910.0 tok/s; tokens/round 570.700 -> Y_c 2.642130; round median 298.688, T_mean 298.80 ms; phases {'draft': 125.27, 'joint': 169.468, 'commit': 3.41, 'reset': 0.13}; draft step 62.635; peak 83.909 (plain 83.891); wait 20.217 ms, NEW 557.5 MB/round; store {'X': 129, 'cb0_GB': 0.0142, 'store_GB': 1.8332}
+    joint probe-pass groups (ms): {'attention': 40.3753, 'chain': 3.6332, 'check': 0.0963, 'dense_next': 95.9216, 'fetch': 12.6868, 'residency': 20.8154, 'total': 182.0037, 'union': 4.7606, 'write': 3.0638}
+    plain points: [(64, {'draft': 109.955, 'joint': 143.557, 'commit': 3.215, 'reset': 0.114}, 'i4m_m3p128_2195575_i4mp128 ARM'), (216, {'draft': 143.129, 'joint': 206.235, 'commit': 5.972, 'reset': 0.118}, 'int_a1_2195630_inta L4PTFD')]
+    rho (INT / plain at B0): {'draft': 0.8752, 'joint': 0.8217, 'commit': 0.571, 'reset': 1.1017}
+    local slopes ms/row {'draft': {'lo': 0.2182, 'c': 0.3545, 'hi': 0.4077}, 'joint': {'lo': 0.4124, 'c': 0.5159, 'hi': 0.5933}, 'commit': {'lo': 0.0181, 'c': 0.0273, 'hi': 0.0314}, 'reset': {'lo': 0.0, 'c': 0.0, 'hi': 0.0}}
+    memory line (allocated, prefill) [19.020232, 0.3003276] from i4m_m3p128_2195575_i4mp128; INT delta 0.018 GB
+C81 B287 int_c1_2195631_intc L4PTFDGUDCDI: median 1854.8 mean 1719.6 tok/s; tokens/round 733.290 -> Y_c 2.555017; round median 434.388, T_mean 426.43 ms; phases {'draft': 160.493, 'joint': 269.513, 'commit': 4.043, 'reset': 0.161}; draft step 80.246; peak 76.820 (plain 76.803); wait 90.464 ms, NEW 2023.0 MB/round; store {'X': 129, 'cb0_GB': 0.0189, 'store_GB': 2.4358}
+    joint probe-pass groups (ms): {'attention': 54.7845, 'chain': 4.3925, 'check': 0.0958, 'dense_next': 113.4152, 'fetch': 53.6007, 'residency': 51.3931, 'total': 286.1583, 'union': 5.2357, 'write': 2.687}
+    plain points: [(64, {'draft': 107.429, 'joint': 153.498, 'commit': 3.111, 'reset': 0.113}, 'recon7_mem1_2195630_r7mem 64'), (192, {'draft': 130.621, 'joint': 227.432, 'commit': 4.83, 'reset': 0.116}, 'recon7_mem1_2195630_r7mem 192'), (287, {'draft': 182.734, 'joint': 311.802, 'commit': 7.895, 'reset': 0.118}, 'int_c1_2195631_intc L4PTFD')]
+    rho (INT / plain at B0): {'draft': 0.8783, 'joint': 0.8644, 'commit': 0.5121, 'reset': 1.3644}
+    local slopes ms/row {'draft': {'lo': 0.5486, 'c': 0.5486, 'hi': 0.6308}, 'joint': {'lo': 0.8881, 'c': 0.8881, 'hi': 1.0213}, 'commit': {'lo': 0.0323, 'c': 0.0323, 'hi': 0.0371}, 'reset': {'lo': 0.0, 'c': 0.0, 'hi': 0.0}}
+    memory line (allocated, prefill) [19.0201, 0.2013312] from recon7_mem1_2195630_r7mem; INT delta 0.017 GB
+C73 B318 int_d1_2195630_intd L4PTFDGUDKWCDIN: median 1843.2 mean 1657.9 tok/s; tokens/round 779.526 -> Y_c 2.451340; round median 483.756, T_mean 470.19 ms; phases {'draft': 166.196, 'joint': 312.382, 'commit': 4.117, 'reset': 0.131}; draft step 83.098; peak 77.702 (plain 77.685); wait 114.978 ms, NEW 2564.6 MB/round; store {'X': 129, 'cb0_GB': 0.0209, 'store_GB': 2.6989}
+    joint probe-pass groups (ms): {'attention': 55.4752, 'chain': 4.6889, 'check': 0.0952, 'dense_next': 121.1402, 'fetch': 80.1772, 'residency': 64.4424, 'total': 334.336, 'union': 4.8814, 'write': 2.4248}
+    plain points: [(64, {'draft': 105.43, 'joint': 140.017, 'commit': 3.019, 'reset': 0.111}, 'i4m_m3p73_2195575_i4mp73 ARM'), (318, {'draft': 188.475, 'joint': 381.776, 'commit': 8.376, 'reset': 0.12}, 'int_d1_2195630_intd L4PTFD')]
+    rho (INT / plain at B0): {'draft': 0.8818, 'joint': 0.8182, 'commit': 0.4915, 'reset': 1.0917}
+    local slopes ms/row {'draft': {'lo': 0.3269, 'c': 0.5311, 'hi': 0.6108}, 'joint': {'lo': 0.9518, 'c': 1.1908, 'hi': 1.3694}, 'commit': {'lo': 0.0211, 'c': 0.0317, 'hi': 0.0365}, 'reset': {'lo': 0.0, 'c': 0.0, 'hi': 0.0}}
+    memory line (allocated, prefill) [19.020009, 0.1844811] from i4m_m3p73_2195575_i4mp73; INT delta 0.017 GB
+KAPPA (C81 last segment / chord 64->287) per phase: {'draft': 1.6244, 'joint': 1.2511, 'commit': 1.5039, 'reset': 0.9389}
+
+S calibration at the anchor C81 B287: S - X saving central 7.38, best 20.42, worst -5.67 ms (notes: +7, +21, -6)
+J at B216 / B287 / B318: FORK 34.410 / 46.028 / 51.100 ms; central -1.375 / -1.753 / -1.918; best -6.191 / -8.108 / -8.945; worst_raw 3.441 / 4.603 / 5.110
+
+== 2. Sweep per (C, arm): memory first, then T, then Q (mean basis primary) ==
+C128 INT: B at the 84.0 cap 216; STRICT best B 216; LOOSE best B 216
+   B204 mem 80.305 GB strict True loose True demo False | T_mean 292.3 T_med 292.2 ms | Q_mean 1844.0 [1844.0, 1860.0] | Q_med 2023.6 [2023.6, 2041.2] | author-basis 83.96 GB
+   B208 mem 81.506 GB strict True loose True demo False | T_mean 294.5 T_med 294.4 ms | Q_mean 1866.3 [1866.3, 1877.0] | Q_med 2048.1 [2048.1, 2059.9] | author-basis 85.28 GB
+   B212 mem 82.708 GB strict True loose True demo False | T_mean 296.6 T_med 296.5 ms | Q_mean 1888.3 [1888.3, 1893.7] | Q_med 2072.3 [2072.3, 2078.2] | author-basis 86.59 GB
+   B216 mem 83.909 GB strict True loose True demo True | T_mean 298.8 T_med 298.7 ms | Q_mean 1910.0 [1910.0, 1910.0] | Q_med 2096.1 [2096.1, 2096.1] | author-basis 87.91 GB
+C128 S: B at the 84.0 cap 211; STRICT best B 208; LOOSE best B 210
+   B196 mem 79.339 GB strict True loose True demo False | T_mean 292.4 T_med 292.3 ms | Q_mean 1771.0 [1754.0, 1814.7] | Q_med 1943.6 [1924.9, 1991.5] | author-basis 81.34 GB
+   B200 mem 80.541 GB strict True loose True demo False | T_mean 294.5 T_med 294.4 ms | Q_mean 1794.1 [1776.7, 1833.0] | Q_med 1968.9 [1949.8, 2011.6] | author-basis 82.65 GB
+   B204 mem 81.744 GB strict True loose True demo False | T_mean 296.7 T_med 296.6 ms | Q_mean 1816.9 [1799.0, 1851.0] | Q_med 1993.9 [1974.3, 2031.4] | author-basis 83.96 GB
+   B208 mem 82.947 GB strict True loose True demo False | T_mean 298.8 T_med 298.7 ms | Q_mean 1839.3 [1821.0, 1868.6] | Q_med 2018.5 [1998.4, 2050.7] | author-basis 85.28 GB
+   B210 mem 83.549 GB strict False loose True demo False | T_mean 299.9 T_med 299.7 ms | Q_mean 1850.4 [1831.8, 1877.3] | Q_med 2030.7 [2010.3, 2060.2] | author-basis 85.93 GB
+   B211 mem 83.849 GB strict False loose False demo False | T_mean 300.4 T_med 300.3 ms | Q_mean 1855.9 [1837.3, 1881.6] | Q_med 2036.7 [2016.2, 2064.9] | author-basis 86.26 GB
+C128 J: B at the 84.0 cap 216; STRICT best B 216; LOOSE best B 216
+   B204 mem 80.305 GB strict True loose True demo False | T_mean 291.0 T_med 290.9 ms | Q_mean 1852.3 [1823.7, 1898.4] | Q_med 2032.8 [2001.4, 2083.4] | author-basis 83.96 GB
+   B208 mem 81.506 GB strict True loose True demo False | T_mean 293.1 T_med 293.0 ms | Q_mean 1874.8 [1845.6, 1916.1] | Q_med 2057.5 [2025.4, 2102.8] | author-basis 85.28 GB
+   B212 mem 82.708 GB strict True loose True demo False | T_mean 295.3 T_med 295.2 ms | Q_mean 1897.0 [1867.1, 1933.4] | Q_med 2081.8 [2049.0, 2121.8] | author-basis 86.59 GB
+   B216 mem 83.909 GB strict True loose True demo True | T_mean 297.4 T_med 297.3 ms | Q_mean 1918.8 [1888.3, 1950.4] | Q_med 2105.8 [2072.2, 2140.5] | author-basis 87.91 GB
+C81 INT: B at the 84.0 cap 322; STRICT best B 318; LOOSE best B 321
+   B287 mem 76.819 GB strict True loose True demo True | T_mean 426.4 T_med 434.4 ms | Q_mean 1719.6 [1719.6, 1719.6] | Q_med 1854.8 [1854.8, 1854.8] | author-basis 83.77 GB
+   B306 mem 80.644 GB strict True loose True demo False | T_mean 450.1 T_med 458.5 ms | Q_mean 1737.2 [1723.6, 1737.2] | Q_med 1873.8 [1859.2, 1873.8] | author-basis 88.44 GB
+   B310 mem 81.450 GB strict True loose True demo False | T_mean 455.0 T_med 463.5 ms | Q_mean 1740.7 [1724.4, 1740.7] | Q_med 1877.5 [1860.0, 1877.5] | author-basis 89.43 GB
+   B314 mem 82.255 GB strict True loose True demo False | T_mean 460.0 T_med 468.6 ms | Q_mean 1744.1 [1725.2, 1744.1] | Q_med 1881.2 [1860.8, 1881.2] | author-basis 90.41 GB
+   B318 mem 83.060 GB strict True loose True demo False | T_mean 465.0 T_med 473.6 ms | Q_mean 1747.4 [1725.9, 1747.4] | Q_med 1884.8 [1861.6, 1884.8] | author-basis 91.40 GB
+   B321 mem 83.664 GB strict False loose True demo False | T_mean 468.7 T_med 477.4 ms | Q_mean 1749.9 [1726.5, 1749.9] | Q_med 1887.4 [1862.2, 1887.4] | author-basis 92.13 GB
+   B322 mem 83.866 GB strict False loose False demo False | T_mean 469.9 T_med 478.7 ms | Q_mean 1750.7 [1726.7, 1750.7] | Q_med 1888.3 [1862.4, 1888.3] | author-basis 92.38 GB
+C81 S: B at the 84.0 cap 315; STRICT best B 311; LOOSE best B 314
+   B287 mem 78.291 GB strict True loose True demo False | T_mean 419.1 T_med 427.0 ms | Q_mean 1749.9 [1697.0, 1806.1] | Q_med 1886.8 [1830.9, 1946.3] | author-basis 83.77 GB
+   B299 mem 80.712 GB strict True loose True demo False | T_mean 433.4 T_med 441.6 ms | Q_mean 1762.7 [1700.6, 1819.7] | Q_med 1900.6 [1834.7, 1961.0] | author-basis 86.72 GB
+   B303 mem 81.519 GB strict True loose True demo False | T_mean 438.2 T_med 446.5 ms | Q_mean 1766.7 [1701.7, 1824.1] | Q_med 1905.0 [1835.9, 1965.6] | author-basis 87.70 GB
+   B307 mem 82.326 GB strict True loose True demo False | T_mean 443.0 T_med 451.4 ms | Q_mean 1770.7 [1702.8, 1828.3] | Q_med 1909.3 [1837.0, 1970.2] | author-basis 88.69 GB
+   B311 mem 83.133 GB strict True loose True demo False | T_mean 447.8 T_med 456.3 ms | Q_mean 1774.6 [1703.8, 1832.5] | Q_med 1913.5 [1838.2, 1974.7] | author-basis 89.67 GB
+   B314 mem 83.738 GB strict False loose True demo False | T_mean 451.3 T_med 459.9 ms | Q_mean 1777.5 [1704.6, 1835.6] | Q_med 1916.6 [1839.0, 1978.0] | author-basis 90.41 GB
+   B315 mem 83.939 GB strict False loose False demo False | T_mean 452.5 T_med 461.1 ms | Q_mean 1778.5 [1704.8, 1836.6] | Q_med 1917.6 [1839.3, 1979.1] | author-basis 90.66 GB
+C81 J: B at the 84.0 cap 322; STRICT best B 318; LOOSE best B 321
+   B287 mem 76.819 GB strict True loose True demo True | T_mean 424.7 T_med 432.6 ms | Q_mean 1726.7 [1701.2, 1752.9] | Q_med 1862.3 [1835.4, 1890.1] | author-basis 83.77 GB
+   B306 mem 80.644 GB strict True loose True demo False | T_mean 448.2 T_med 456.6 ms | Q_mean 1744.4 [1705.2, 1771.1] | Q_med 1881.4 [1839.6, 1909.7] | author-basis 88.44 GB
+   B310 mem 81.450 GB strict True loose True demo False | T_mean 453.2 T_med 461.6 ms | Q_mean 1747.9 [1705.9, 1774.7] | Q_med 1885.2 [1840.4, 1913.6] | author-basis 89.43 GB
+   B314 mem 82.255 GB strict True loose True demo False | T_mean 458.1 T_med 466.7 ms | Q_mean 1751.3 [1706.7, 1778.2] | Q_med 1888.8 [1841.2, 1917.4] | author-basis 90.41 GB
+   B318 mem 83.060 GB strict True loose True demo False | T_mean 463.1 T_med 471.7 ms | Q_mean 1754.6 [1707.4, 1781.7] | Q_med 1892.4 [1842.0, 1921.1] | author-basis 91.40 GB
+   B321 mem 83.664 GB strict False loose True demo False | T_mean 466.8 T_med 475.5 ms | Q_mean 1757.1 [1707.9, 1784.2] | Q_med 1895.1 [1842.6, 1923.8] | author-basis 92.13 GB
+   B322 mem 83.866 GB strict False loose False demo False | T_mean 468.0 T_med 476.8 ms | Q_mean 1757.9 [1708.1, 1785.0] | Q_med 1896.0 [1842.8, 1924.7] | author-basis 92.38 GB
+C73 INT: B at the 84.0 cap 352; STRICT best B 347; LOOSE best B 350
+   B318 mem 77.702 GB strict True loose True demo True | T_mean 470.2 T_med 483.8 ms | Q_mean 1657.9 [1657.9, 1657.9] | Q_med 1843.2 [1843.2, 1843.2] | author-basis 87.22 GB
+   B335 mem 80.838 GB strict True loose True demo False | T_mean 494.3 T_med 508.6 ms | Q_mean 1661.2 [1649.2, 1682.7] | Q_med 1846.9 [1833.5, 1870.8] | author-basis 91.18 GB
+   B339 mem 81.576 GB strict True loose True demo False | T_mean 500.0 T_med 514.4 ms | Q_mean 1662.0 [1647.2, 1688.3] | Q_med 1847.7 [1831.3, 1877.0] | author-basis 92.11 GB
+   B343 mem 82.314 GB strict True loose True demo False | T_mean 505.7 T_med 520.3 ms | Q_mean 1662.7 [1645.4, 1693.7] | Q_med 1848.5 [1829.3, 1883.0] | author-basis 93.04 GB
+   B347 mem 83.052 GB strict True loose True demo False | T_mean 511.4 T_med 526.1 ms | Q_mean 1663.4 [1643.5, 1699.1] | Q_med 1849.3 [1827.2, 1889.0] | author-basis 93.98 GB
+   B350 mem 83.605 GB strict False loose True demo False | T_mean 515.6 T_med 530.5 ms | Q_mean 1663.9 [1642.2, 1703.1] | Q_med 1849.9 [1825.8, 1893.5] | author-basis 94.67 GB
+   B351 mem 83.790 GB strict False loose False demo False | T_mean 517.1 T_med 532.0 ms | Q_mean 1664.1 [1641.8, 1704.4] | Q_med 1850.1 [1825.3, 1894.9] | author-basis 94.91 GB
+   B352 mem 83.974 GB strict False loose False demo False | T_mean 518.5 T_med 533.4 ms | Q_mean 1664.3 [1641.3, 1705.7] | Q_med 1850.3 [1824.8, 1896.4] | author-basis 95.14 GB
+C73 S: B at the 84.0 cap 344; STRICT best B 339; LOOSE best B 342
+   B318 mem 79.186 GB strict True loose True demo False | T_mean 459.1 T_med 472.6 ms | Q_mean 1698.1 [1638.9, 1761.7] | Q_med 1886.6 [1822.7, 1955.1] | author-basis 87.22 GB
+   B327 mem 80.850 GB strict True loose True demo False | T_mean 471.4 T_med 485.3 ms | Q_mean 1700.6 [1634.9, 1777.4] | Q_med 1889.4 [1818.1, 1972.6] | author-basis 89.32 GB
+   B331 mem 81.590 GB strict True loose True demo False | T_mean 476.8 T_med 490.9 ms | Q_mean 1701.7 [1633.1, 1784.3] | Q_med 1890.6 [1816.2, 1980.1] | author-basis 90.25 GB
+   B335 mem 82.329 GB strict True loose True demo False | T_mean 482.3 T_med 496.5 ms | Q_mean 1702.7 [1631.4, 1791.0] | Q_med 1891.7 [1814.3, 1987.5] | author-basis 91.18 GB
+   B339 mem 83.069 GB strict True loose True demo False | T_mean 487.7 T_med 502.2 ms | Q_mean 1703.8 [1629.8, 1797.6] | Q_med 1892.9 [1812.5, 1994.9] | author-basis 92.11 GB
+   B342 mem 83.623 GB strict False loose True demo False | T_mean 491.8 T_med 506.4 ms | Q_mean 1704.5 [1628.6, 1802.4] | Q_med 1893.7 [1811.2, 2000.3] | author-basis 92.81 GB
+   B343 mem 83.808 GB strict False loose False demo False | T_mean 493.2 T_med 507.8 ms | Q_mean 1704.8 [1628.2, 1804.1] | Q_med 1894.0 [1810.7, 2002.0] | author-basis 93.04 GB
+   B344 mem 83.993 GB strict False loose False demo False | T_mean 494.6 T_med 509.2 ms | Q_mean 1705.0 [1627.8, 1805.7] | Q_med 1894.3 [1810.3, 2003.8] | author-basis 93.28 GB
+C73 J: B at the 84.0 cap 352; STRICT best B 347; LOOSE best B 350
+   B318 mem 77.702 GB strict True loose True demo True | T_mean 468.3 T_med 481.8 ms | Q_mean 1664.7 [1640.1, 1690.1] | Q_med 1850.5 [1823.9, 1877.9] | author-basis 87.22 GB
+   B335 mem 80.838 GB strict True loose True demo False | T_mean 492.3 T_med 506.6 ms | Q_mean 1668.0 [1631.5, 1715.8] | Q_med 1854.2 [1814.4, 1906.5] | author-basis 91.18 GB
+   B339 mem 81.576 GB strict True loose True demo False | T_mean 498.0 T_med 512.4 ms | Q_mean 1668.7 [1629.6, 1721.5] | Q_med 1855.0 [1812.3, 1912.9] | author-basis 92.11 GB
+   B343 mem 82.314 GB strict True loose True demo False | T_mean 503.6 T_med 518.2 ms | Q_mean 1669.5 [1627.8, 1727.2] | Q_med 1855.8 [1810.3, 1919.2] | author-basis 93.04 GB
+   B347 mem 83.052 GB strict True loose True demo False | T_mean 509.3 T_med 524.1 ms | Q_mean 1670.2 [1626.0, 1732.8] | Q_med 1856.6 [1808.3, 1925.4] | author-basis 93.98 GB
+   B350 mem 83.605 GB strict False loose True demo False | T_mean 513.5 T_med 528.4 ms | Q_mean 1670.7 [1624.7, 1736.9] | Q_med 1857.2 [1806.8, 1930.0] | author-basis 94.67 GB
+   B351 mem 83.790 GB strict False loose False demo False | T_mean 515.0 T_med 529.9 ms | Q_mean 1670.9 [1624.3, 1738.3] | Q_med 1857.4 [1806.3, 1931.5] | author-basis 94.91 GB
+   B352 mem 83.974 GB strict False loose False demo False | T_mean 516.4 T_med 531.3 ms | Q_mean 1671.0 [1623.8, 1739.7] | Q_med 1857.6 [1805.9, 1933.0] | author-basis 95.14 GB
+
+== 3. Per-C cost functions at B0 and at the STRICT best B (INT arm, central; MODEL away from B0) ==
+C128 B216: d(B) per draft step 62.63, J(B) 169.47 (of it the gather wait about 20.2, MODEL x B/B0), commit 3.41, reset 0.13; T_med 298.7, T_mean 298.8 ms; S saving c/best/worst -4.2/-1.1/-7.4; J delta c/best/raw -1.38/-6.19/3.44 ms
+C81 B287: d(B) per draft step 80.25, J(B) 269.51 (of it the gather wait about 90.5, MODEL x B/B0), commit 4.04, reset 0.16; T_med 434.4, T_mean 426.4 ms; S saving c/best/worst 7.4/20.4/-5.7; J delta c/best/raw -1.75/-8.11/4.60 ms
+C81 B318: d(B) per draft step 87.71, J(B) 293.31 (of it the gather wait about 100.2, MODEL x B/B0), commit 4.56, reset 0.16; T_med 473.6, T_mean 465.0 ms; S saving c/best/worst 8.8/23.3/-5.6; J delta c/best/raw -1.92/-8.95/5.11 ms
+C73 B318: d(B) per draft step 83.10, J(B) 312.38 (of it the gather wait about 115.0, MODEL x B/B0), commit 4.12, reset 0.13; T_med 483.8, T_mean 470.2 ms; S saving c/best/worst 11.1/27.7/-5.4; J delta c/best/raw -1.92/-8.95/5.11 ms
+C73 B347: d(B) per draft step 89.89, J(B) 340.64 (of it the gather wait about 125.5, MODEL x B/B0), commit 4.57, reset 0.13; T_med 526.1, T_mean 511.4 ms; S saving c/best/worst 12.7/30.8/-5.4; J delta c/best/raw -2.07/-9.73/5.58 ms
+
+== 4. Baseline SH / SHJ1 (MEASURED points; SHJ1 MODEL away from j1a / j1b) ==
+SHJ1 per-row saving (DERIVED from j1a / j1b): median 0.01123, mean 0.01123 ms per request
+  SHJ1 MEASURED j1_a1_2195631_j1a C128 B216: median 62.489 ms (3456.6 tok/s), mean 65.804 ms (3282.5 tok/s); same-job SH 64.882 / 68.291
+  SHJ1 MEASURED j1_b1_2195631_j1b C73 B318: median 120.225 ms (2645.0 tok/s), mean 124.430 ms (2555.7 tok/s); same-job SH 123.846 / 127.912
+  C63 B344 mbstrong c63b344                         median 180.756 (1903.1) mean 185.453 (1854.9) peak 72.277 strict True | SHJ1 MODEL median 1944.7 mean 1894.4
+  C63 B406 mbstrong c63b406n                        median 217.120 (1869.9) mean 222.762 (1822.6) peak 81.876 strict True | SHJ1 MODEL median 1910.1 mean 1860.7
+  C73 B318 mbstrong c73b318                         median 123.599 (2572.8) mean 127.666 (2490.9) peak 74.962 strict True | SHJ1 MODEL median 2649.4 mean 2562.6
+  C73 B318 mbstrong c73b318n                        median 123.934 (2565.9) mean 128.188 (2480.7) peak 74.962 strict True | SHJ1 MODEL median 2642.0 mean 2551.8
+  C73 B318 int_d1_2195630_intd same-job SH          median 123.546 (2573.9) mean 127.525 (2493.6) peak None strict False | SHJ1 MODEL median 2650.6 mean 2565.5
+  C73 B351 i4m n373 SH (L4PTFD OOM after it)        median 133.529 (2628.6) mean 137.897 (2545.4) peak 80.769 strict True | SHJ1 MODEL median 2708.6 mean 2620.3
+  C73 B355 wsm wm73 SH                              median 135.773 (2614.7) mean 140.209 (2531.9) peak 81.473 strict True | SHJ1 MODEL median 2693.8 mean 2606.0
+  C73 B358 mbstrong c73b358n                        median 135.974 (2632.9) mean 140.659 (2545.2) peak 81.998 strict True | SHJ1 MODEL median 2713.1 mean 2620.1
+  C81 B287 int_c1_2195631_intc same-job SH          median 101.907 (2816.3) mean 105.972 (2708.3) peak None strict False | SHJ1 MODEL median 2908.3 mean 2793.2
+  C81 B290 mbstrong c81b290                         median 101.542 (2856.0) mean 105.447 (2750.2) peak 74.923 strict True | SHJ1 MODEL median 2950.6 mean 2837.9
+  C81 B290 mbstrong c81b290n                        median 101.864 (2846.9) mean 105.841 (2740.0) peak 74.923 strict True | SHJ1 MODEL median 2941.0 mean 2827.0
+  C81 B326 mbstrong c81b326n                        median 110.673 (2945.6) mean 115.346 (2826.3) peak 81.863 strict True | SHJ1 MODEL median 3046.4 mean 2918.9
+  C81 B336 mbstrong c81b336n                        median 113.827 (2951.8) mean 118.773 (2828.9) peak 83.79 strict False | SHJ1 MODEL median 3053.1 mean 2921.8
+  C128 B216 mbstrong mb1 plain                       median 64.194 (3364.8) mean 67.582 (3196.1) peak 82.042 strict True | SHJ1 MODEL median 3497.0 mean 3315.1
+  C128 B216 mbstrong mb1n nogc                       median 64.793 (3333.7) mean 68.158 (3169.1) peak 82.042 strict True | SHJ1 MODEL median 3463.4 mean 3286.1
+  C128 B216 mbstrong j1s1 mb1                        median 63.784 (3386.4) mean 67.144 (3217.0) peak 82.042 strict True | SHJ1 MODEL median 3520.3 mean 3337.6
+  C128 B216 int_a1_2195630_inta same-job SH          median 64.134 (3367.9) mean 67.535 (3198.3) peak None strict False | SHJ1 MODEL median 3500.4 mean 3317.5
+  C128 B217 wsm wm128 SH                             median 65.890 (3293.4) mean 69.32 (3130.4) peak 82.335 strict True | SHJ1 MODEL median 3419.9 mean 3244.5
+  C128 B222 mbstrong c128b222n                       median 67.371 (3295.2) mean 70.802 (3135.5) peak 83.792 strict False | SHJ1 MODEL median 3421.8 mean 3250.0
+SH memory lines (allocated peak, DERIVED from the measured peaks) and STRICT B caps:
+  C128: slope 0.2917 GB/request (B216 82.042 .. B222 83.792); STRICT B cap 219; usable cap 221
+  C81: slope 0.1928 GB/request (B290 74.923 .. B336 83.790); STRICT B cap 332; usable cap 335
+  C73: slope 0.1759 GB/request (B318 74.962 .. B358 81.998); STRICT B cap 364; usable cap 367
+  C63: slope 0.1548 GB/request (B344 72.277 .. B406 81.876); STRICT B cap 414; usable cap 418
+
+== 5. AUTHOR basis (device-used) largest B under 84.0 per C, and at the chosen configurations ==
+  C128: author B_max 204 (83.9633 GB); at B0 216: 87.9055 GB
+  C81: author B_max 287 (83.7655 GB); at B0 287: 83.7655 GB
+  C73: author B_max 304 (83.9570 GB); at B0 318: 87.2188 GB
+  anchor check C81 B287: 83.7655 GB (document 83.7655)
+
+== 6. Verdict table (STRICT feasibility; mean basis primary) ==
+best baseline: SHJ1 C128 B216 (j1a MEASURED): mean 3282.5, median 3456.6 tok/s; inta same-job SHJ1 median DERIVED 3496.4 (2,096.1 / 0.5995, LEDGER_rev7.md:758-761); graph + J1 MODEL 3,540.9 (j1a prediction 26)
+  INT C128 B216 mem 83.91 GB: Q_mean 1910.0 [1910.0, 1910.0] = 0.582 [0.582, 0.582] x SHJ1 mean; Q_med 2096.1 [2096.1, 2096.1] = 0.606 x SHJ1 median (j1a)
+  INT C81 B318 mem 83.06 GB: Q_mean 1747.4 [1725.9, 1747.4] = 0.532 [0.526, 0.532] x SHJ1 mean; Q_med 1884.8 [1861.6, 1884.8] = 0.545 x SHJ1 median (j1a)
+  INT C73 B347 mem 83.05 GB: Q_mean 1663.4 [1643.5, 1699.1] = 0.507 [0.501, 0.518] x SHJ1 mean; Q_med 1849.3 [1827.2, 1889.0] = 0.535 x SHJ1 median (j1a)
+  S   C128 B208 mem 82.95 GB: Q_mean 1839.3 [1821.0, 1868.6] = 0.560 [0.555, 0.569] x SHJ1 mean; Q_med 2018.5 [1998.4, 2050.7] = 0.584 x SHJ1 median (j1a)
+  S   C81 B311 mem 83.13 GB: Q_mean 1774.6 [1703.8, 1832.5] = 0.541 [0.519, 0.558] x SHJ1 mean; Q_med 1913.5 [1838.2, 1974.7] = 0.554 x SHJ1 median (j1a)
+  S   C73 B339 mem 83.07 GB: Q_mean 1703.8 [1629.8, 1797.6] = 0.519 [0.497, 0.548] x SHJ1 mean; Q_med 1892.9 [1812.5, 1994.9] = 0.548 x SHJ1 median (j1a)
+  J   C128 B216 mem 83.91 GB: Q_mean 1918.8 [1888.3, 1950.4] = 0.585 [0.575, 0.594] x SHJ1 mean; Q_med 2105.8 [2072.2, 2140.5] = 0.609 x SHJ1 median (j1a)
+  J   C81 B318 mem 83.06 GB: Q_mean 1754.6 [1707.4, 1781.7] = 0.535 [0.520, 0.543] x SHJ1 mean; Q_med 1892.4 [1842.0, 1921.1] = 0.547 x SHJ1 median (j1a)
+  J   C73 B347 mem 83.05 GB: Q_mean 1670.2 [1626.0, 1732.8] = 0.509 [0.495, 0.528] x SHJ1 mean; Q_med 1856.6 [1808.3, 1925.4] = 0.537 x SHJ1 median (j1a)
+
+== 7. Flip thresholds (DERIVED from the central model) ==
+  C81 B311 (STRICT with the BF parts): INT T_mean 456.3 ms; to pass C128 INT (1910.0) T_mean <= 416.0 ms: S must save >= 40.2 ms per round = 0.41 of the gather wait 98.0 ms (BF MODEL best 22.6)
+  C73 B339 (STRICT with the BF parts): INT T_mean 500.0 ms; to pass C128 INT (1910.0) T_mean <= 435.1 ms: S must save >= 64.9 ms per round = 0.53 of the gather wait 122.6 ms (BF MODEL best 29.9)
+  C128 B216: to tie SHJ1 (mean 3282.5) T_mean <= 173.9 ms vs measured 298.8 (gap 124.9 ms per round); two drafts 125.3 ms = 2 x 62.63 vs SHJ1 step median 62.489 (ratio 1.002)
+  C81 B287: draft step 80.246 vs same-job SH step 101.907 (ratio 0.787)
+  C73 B318: draft step 83.098 vs same-job SH step 123.546 (ratio 0.673)
+  same job (inta): INT / SHJ1 median 0.5995 (DERIVED SHJ1 3496.4); mean 0.5757 (SHJ1 mean MODEL 3317.5 = SH mean step 67.535 - 0.01123 x 216)
+  INT accepted-draft Q at C128 B216 (DERIVED, accepted 2.617130 per request per round, LEDGER_rev7.md:774): 1891.9
+  store already in every INT arm (record field store.store_GB): {128: {'X': 129, 'cb0_GB': 0.0142, 'store_GB': 1.8332}, 81: {'X': 129, 'cb0_GB': 0.0189, 'store_GB': 2.4358}, 73: {'X': 129, 'cb0_GB': 0.0209, 'store_GB': 2.6989}}
+  BF parts at B287: H = 8 basis 1.472 GB; H = 2 basis 1.387 GB

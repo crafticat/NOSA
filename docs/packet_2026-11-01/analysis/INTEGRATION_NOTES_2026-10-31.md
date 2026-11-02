@@ -592,7 +592,9 @@ the main thread, or (iv) M1. Also, "deferred" (54 % of jobs in b3) is a HOST-clo
 inflight_at_close = 31 (the per_epoch records), i.e. at the host's close the GPU still runs D1, and the GPU barrier wait
 is 0.074 ms. So section 12's S_J = deferred share x S (0.79 GB) is a host proxy, not a measured GPU quantity. The new
 counters measure (i) consume.ms_per_joint_pass, (ii) bytes_sent_in_joint / bytes_useful_in_joint, (iii) host.draft /
-host.joint active ms, against the GPU deadlines.
+host.joint active ms, against the GPU deadlines. [SUPERSEDED in part by 13.6: (i) is the landing wait PLUS the commit
+(deferred_wait_and_commit); (ii) is a completion classification, not link bytes in J (*_arrived_after_jstart);
+(iii) is host time outside waits, not a GIL hold (host_active_ms).]
 
 ### 13.2 The fix (scoped): snap = "ready" (dev commit dd95b87 on b051b42; branch r2-bf1-dev, not pushed)
 
@@ -625,6 +627,9 @@ commit, one scatter_add_ per joint pass, 32 KB of device counters per epoch + 5.
 - worker counters: snap_first_s, snap_rest_s, ready_wait_s, polls, snap_unready_taken.
 - -BF gate (MUST) gains: useful_counted = used_store + used_win, items_sent_counted = items_sent, the useful split
   closes; snap "ready": snap_unready_taken = 0.
+[SUPERSEDED by 13.6 (a347f7c): the useful counts are STORE-ONLY (window uses not covered; the closure is
+useful_store_counted = used_store); the key names changed (13.6 label table); the per-epoch counters (32,776 B each)
+are now in device_bytes and they GROW per epoch; "active" is host_active_ms, not a GIL hold.]
 
 ### 13.3 CPU tests and receipts
 
@@ -642,7 +647,8 @@ Evidence lines (from the log):
   event".
 - (c) test_bf1_arrival_modes: off: disabled, all 0. ce (drop / defer x newest / ready, gilfree once): 62 batches,
   useful counted 299 = used store + window, sent counted = items_sent, early 461 / late 0 (the CPU world issues
-  before the joint pass), EQF and gates (with the new -BF closures) pass.
+  before the joint pass), EQF and gates (with the new -BF closures) pass. [SUPERSEDED by 13.6: those fixtures ran
+  acct=True; the 299 mixed store and window uses; the metric is now store-only.]
 - (d) test_bf1_arrival_late: stall 200 ms per job, defer: sent early 227 / late 234 = the independent count from the
   raw clocks (227 / 234); useful early 151 / late 148; margin min -947 ms. CONTROL inline: early 461, late 0.
 - test_bf1_pipeline (newest, ready): pipelined 48, overlapped 47, EQF and gates pass in both loops.
@@ -678,12 +684,86 @@ Bands (MODEL; A's row above; b3: B / X 1.0049, joint saving 14.3 ms, draft ratio
 - BF1R_vs_B (0.998, 1.015); BF1R_vs_X (1.000, 1.022).
 - BF1R_joint_saving (12, 24) ms (b3 B: 14.3; + 2 .. 6).
 - BF1R_draft_ratio (1.03, 1.08) (unchanged work in the draft).
-- BF1R_useful_early (0.80, 1.00): the GPU deadlines are generous (D1 layer l: snapshot at 94 + 2.94 l ms, deadline at
+- BF1R_useful_early (0.80, 1.00) [SUPERSEDED by 13.6: key BF1R_useful_early_store, STORE uses only]: the GPU
+  deadlines are generous (D1 layer l: snapshot at 94 + 2.94 l ms, deadline at
   196 + 10.1 l ms after the draft start; slack 102 + 7.2 l ms vs a worker latency of 40-60 ms).
 - BF1R_snap_rest_ms (40, 110) ms per epoch, measured on B (0.35-0.95 of b3's 115.7).
 REPORT-only: R snap_rest_s < 1 ms per epoch; R batches per epoch 12 .. 25 (smaller batches); B and R
 bytes_sent_in_joint; consume ms per joint pass; host.joint.active ms. DECISION after bf1r: if R / B < 1.005, ready-only
 is not the lever; the arrival block then names the J-side term to attack ((i) consume, (ii) in-J bytes, (iii) host).
+[SUPERSEDED in part by 13.6: the REPORT keys are renamed; the counters do not attribute causes (they classify
+completions against deadlines); the small-batch overhead is an UNRESOLVED RISK and a protocol check.]
+
+### 13.6 Review 5 (2026-11-02T12:02:58Z): failure propagation, store-only arrival, labels (dev commit a347f7c)
+
+Reviewer findings on dd95b87, all accepted. The earlier text stays; the statements it changes are marked [SUPERSEDED].
+
+1. FAILURE PROPAGATION (r2_bf1_fetch.py). At dd95b87 the readiness `event.query()` (_ready_count), the poll (_poll) and
+   the oldest-snapshot `synchronize()` (_wait_oldest) ran outside the worker's _prep / _finish exception boundaries: an
+   exception there ended the daemon thread with self.error unset, and the compute thread could wait on a busy snapshot
+   slot. Fix (a347f7c): `_loop` has an outer boundary `_fatal`. Every worker exception ends there (also the queue and
+   hold calls). It keeps the FIRST exception (error = text and traceback; error_exc = the object), releases the
+   snapshot slots of the jobs taken and not read and of every queued job, closes their flight counters, notifies the
+   cv, and the worker STOPS (no retry). An error recorded inside _prep / _finish (_record_error) also stops the loop at
+   its next iteration. The compute thread raises `BFError(...) from error_exc` at its next hook and also right after
+   its own queue put (`_raise_error`, which first drains the queue and releases those slots). Side fix: _prep updates
+   the caller's idss list in place, so a failed batch releases only the snapshots it did not yet read (before, a read
+   and released slot could be released twice, possibly after the main thread took it again). Not changed: a batch that
+   was already prepared (prev) is not issued after a failure; its snapshots were released at its read.
+   Control test: test_bf1_worker_failure[query, sync] (a snapshot event whose query() or synchronize() raises a planted
+   exception, snap ready, thread worker): the compute thread's BFError.__cause__ is the planted object, error_exc is
+   the planted object, the worker thread ended, snap_busy all False, inflight 0, queue empty.
+
+2. USEFUL-ARRIVAL POPULATION. The timing cells run ACCT=0 with arrival on (r2_bf1_step.sh), and on_window returns at
+   once without acct (r2_bf1_fetch.py on_window), so window (kwin) uses are never seen there. My dd95b87 fixtures ran
+   acct=True; the CPU world had 141 store + 158 window uses. Choice (b): the metric is STORE-ONLY in every mode. The
+   per-(batch, layer) device counts now take the store uses only (`used`, not `used | window`); keys say so; the
+   -BF closure is useful_store_counted = used_store (window uses on neither side). Window uses are NOT covered;
+   with acct=True their total is reported apart (window_uses_acct = used_win), not per batch and not timed. Reason
+   for (b), not (a): counting window uses under acct=False needs on_window's compare of every row-0 load against every
+   tagged slot ((H, B, topk, X - 1) booleans, about 4 launches per joint layer, 32 layers per round) on the compute
+   stream inside J: that changes the joint pass that the run measures. Test: test_bf1_arrival_store_only (the same
+   deterministic inline world with acct=True and acct=False): acct=True used_win > 0 (window-only consumers exist);
+   acct=False used_win = 0 and unused_F = unused_T + used_win_T; useful_store_counted = used_store in both, the same
+   useful_early_share_store in both. I do not predict the GPU store / window mix.
+
+3. LABELS AND MEMORY.
+
+| dd95b87 key | a347f7c key | meaning (exact) |
+|---|---|---|
+| items_useful_{early,late,nodeadline,unattributed} | items_useful_store_{early,late,nodeadline,unattributed} | store uses only |
+| useful_counted | useful_store_counted | store uses only; = used_store (-BF closure) |
+| useful_early_share | useful_early_share_store | store uses only; window not covered |
+| margin_ms_useful | margin_ms_useful_store | margins weighted by store uses |
+| late_ms_useful_mean | late_ms_useful_store_mean | same |
+| (new) | useful_scope = "store_only", window_uses_covered = False, window_uses_acct | the scope, stated in the record |
+| items_sent_in_joint, items_useful_in_joint, bytes_*_in_joint | items_sent_arrived_after_jstart, items_useful_store_arrived_after_jstart, bytes_*_arrived_after_jstart | the batch's usable-arrival event completed after J's layer-0 start; NOT the DMA interval intersected with J, not bounded by J's end, not link bytes during J, not interference |
+| consume = {commits, ms_total, ms_per_joint_pass} | deferred_wait_and_commit = {jobs, ms_total, ms_per_joint_pass} | compute-stream span of a deferred job: its landing wait PLUS its commit |
+| host.{draft,joint}.{busy, wait, active} | host.{draft,joint}.{busy_ms, wait_ms, host_active_ms}; gil_hold_measured = False | host time outside waits; NOT a measured GIL hold |
+| verdict BF1R-USEFUL-EARLY, key BF1R_useful_early | BF1R-USEFUL-EARLY-STORE, BF1R_useful_early_store | store uses only |
+| device_bytes (without the epoch counters) | device_bytes + arrival.memory {pbid_bytes, counter_bytes_per_epoch, epochs_kept, counter_bytes_total} | one (128 x 32 + 1) x 8 = 32,776 B counter per kept epoch (defaults); it grows by that per epoch until the report, no other bound (210 epochs at bf1b: 6.9 MB); pbid fixed (H x B x X x 8 = 5.2 MB at B 318, X 257) |
+
+4. UNRESOLVED RISK (not a speedup claim). In the CPU fixture with snapshots 0.3 s apart, the ready loop raised the
+   worker time (453 vs 330 ms per epoch; 120 batches of 1 job; issue_s 137.5 vs 0.07 ms per epoch): ready-only can
+   make small batches whose per-batch cost (b3: 4.0 ms per batch issue) exceeds the wait it removes. 13.4 row A's
+   MODEL gain stays a MODEL. PROTOCOL CHECK in bf1r: R's batches per epoch, R's worker_busy_s and issue_s per epoch
+   against B's; if R's worker_busy_s per epoch exceeds B's by more than the snap_rest_s it removes, record the risk as
+   realised.
+
+5. RECEIPTS (amd, clean tree at a347f7c, branch r2-bf1-dev, not pushed):
+- The whole BF suite: /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/bf1_a347f7c_t.txt (+ .receipt): head a347f7c3, status
+  clean, SLURM 2250509 on thunder09, 2026-11-02T13:05:36Z -> 13:46:38Z, pytest_exit 0, 45 passed (the 42 of dd95b87
+  + test_bf1_worker_failure[query], [sync] + test_bf1_arrival_store_only).
+- The review-5 subset first: bf1_a347f7c_q.txt (+ .receipt): 13 passed.
+Evidence lines (from bf1_a347f7c_q.txt):
+- worker_failure[query]: BFError from RuntimeError('planted query failure'), raised in _ready_count via _loop_ready;
+  [sync]: from RuntimeError('planted sync failure') in _wait_oldest; both: worker alive False, slots owned 0,
+  inflight 0.
+- arrival_store_only: acct True: used store 141, window-only 158, unused 162, useful store 141 (share 1.0),
+  window_uses_acct 158; acct False: used store 141, window 0, unused 320 (= 162 + 158), useful store 141 (share 1.0),
+  window_uses_acct None.
+- arrival_late (re-run): sent early 286 / late 175 = the independent count; store-useful early 68 / late 73;
+  deferred_wait_and_commit jobs > 0. (The thread worker's timing differs from the dd95b87 run: 227 / 234 there.)
 
 ## 14. j1f source follow-up and the fork edit plan (AREA 1, J owner; written 2026-11-02T10:24:03Z)
 
@@ -700,10 +780,14 @@ The run tree /mnt/beegfs/ojerbi/nosi-r2-j1 is not touched. No grant, no band.
   preallocated output directly). Each control now has three variants. X = the library op
   flash_attn_2_cuda_nosa.fwd_kvcache (the op that flash_attn_with_kvcache calls; the wrapper passes None at its out_
   argument) with out_ = a view of the preallocated output in the op's swapped (B, HQ/HKV, HKV, HD) layout: option (a),
-  kernel-only. X_CP = the j1f form (wrapper + copy_): total. X_CO = the copy_ alone. New MUST gate <shape>-X-OUTEQ:
-  X = X_CP bit for bit. The record adds `flash_timing` (kernel, copy, total, rest) per control and the j1f-form ratios
+  kernel-only [SUPERSEDED by 14.4: an END-TO-END library call into a preallocated output, NOT kernel-only]. X_CP =
+  the j1f form (wrapper + copy_): total. X_CO = the copy_ alone. New MUST gate <shape>-X-OUTEQ:
+  X = X_CP bit for bit. The record adds `flash_timing` (kernel, copy, total, rest) [SUPERSEDED by 14.4: keys
+  direct_e2e_ms_pass and residual_ms_pass] per control and the j1f-form ratios
   (FORK1R/NS1R1_CP etc.). The timing loop moved to `time_variants` (timer injected; `cuda_timer` on the GPU).
 - I do not re-score the old numbers. j1f's per-byte ratios (FORK1R / NS1R1 1.134 / 0.975) need the rerun below.
+  [SUPERSEDED by 14.4 wording: these are time ratios at matched LOGICAL work; they do not give a physical per-byte
+  ceiling or per-byte optimality.]
 - CPU tests (tests_cpu/test_j1.py): test_forkbench_nonfinite (NaN, +Inf, -Inf planted in the output, the reference and
   both, 3 variants: every plant FAILS the new NUM; the j1f source loaded from git at cd0e286 PASSED 15 of the 27
   plants, the identical-NaN plant included: the control is not a no-op; identical non-finite bits pass the old EXACT
@@ -718,6 +802,7 @@ The run tree /mnt/beegfs/ojerbi/nosi-r2-j1 is not touched. No grant, no band.
 ### 14.2 GPU rerun protocol (lead; same shapes as j1f)
 
 1. Bring r2-j1-dev at 8951bc3 into the run tree (lead's merge), set GRANT_j1f in r2_j1_forkbench.py (date -u stamp).
+   [SUPERSEDED by 14.4 reconciliation plan: merge at fd91420, not a fast-forward; re-register before any run.]
 2. `bash benchmarks/Efficiency/r2_j1_step.sh --nosi <sha> <holder> <run id> j1f` (DRYRUN=1 first). The step script
    passes the j1f arguments unchanged: --shapes 128:216,73:318 --segments 2,4,8 --layers 32 --reps 10 --warmup 2
    --seed 7 --sample 8 --max-shape-s 300 --max-run-s 900. Variants per shape: 22 (j1f: 10). MODEL wall: about 2.3x
@@ -726,6 +811,8 @@ The run tree /mnt/beegfs/ojerbi/nosi-r2-j1 is not touched. No grant, no band.
    and FORK/FLASHU1_CP (they must reproduce j1f's 1.134 / 0.975 and FORK - FLASHU1 within the run spread: if not, the
    setup moved and nothing is re-scored); then FORK1R/NS1R1 and FORK/FLASHU1 (direct write) = the re-scored per-byte
    numbers; the FLASHT lines (kernel-only, copy-only, total, rest per control); FORKAn/FORK (14.3).
+   [SUPERSEDED by 14.4: "the re-scored time ratios at matched logical work (end-to-end direct output)"; FLASHT =
+   direct (end-to-end), copy-only, total, residual; the 3D saving line is SUPPRESSED when FORK is invalid.]
 
 ### 14.3 The fork edit plan (lead's request; the 4-row tile is latency / occupancy-bound, not compute-bound)
 
@@ -741,7 +828,7 @@ K + V 32 KB = 1.7 us at the per-SM share of HBM; 8.1 us / 2 programs = about 4 u
 |---|---|---|---|
 | A1 ahead=1: page id + extents word of tile j + 2 read in iteration j, as scalars | 2 of the 3 synchronous loads | YES: the same values reach the same ops; dots, softmax, stores are the fork's lines | BUILT (flag) |
 | A2 ahead=2: A1 + the bias of tile j + 1 read in iteration j | the third synchronous load | YES (as A1) | BUILT (flag) |
-| A3 ahead=3: the fork's page-id / ext_t vector loads kept (for Triton's K / V staging), ext_rows + bias ahead | as A2, keep the async K / V copies | YES (as A1) | BUILT (flag) |
+| A3 ahead=3: the fork's page-id / ext_t vector loads kept (for Triton's K / V staging), ext_rows + bias ahead | as A2, keep the async K / V copies [SUPERSEDED by 14.4: the compiled loop loses them at level 3 too] | YES (as A1) | BUILT (flag) |
 | B1 skip acc x alpha when every alpha = 1 | 64 FMUL per thread per tile | YES (x 1.0 is exact) | NOT BUILT: not on the measured chain |
 | B2 reload Q per tile | registers | YES (same values) | NOT BUILT: Q is live at the QK dot anyway (no peak relief); adds a conversion per tile |
 | B3 num_stages / bf16 bias | staging | YES (fia5 MEASURED) | DONE by fia5 (bf16 shipped; s4 = 1 program per SM, slower) |
@@ -795,4 +882,437 @@ CPU results (receipts j1_ah_k6, j1_8951bc3_t):
 NEXT (lead, GPU): the 14.2 run also times FORKA1-3. Decision rule (proposal): keep a level only if FORKAn-EQ passes at
 both shapes AND FORKAn/FORK <= 0.97 at both (the run spread is about 1 %). Then a production plumbing step (verify_rows
 passes `ahead`) and a j1a / j1b EQF run against L4PTFD; folding the [ahead] lines into the fork (a new blob) needs the
-human's re-pin decision.
+human's re-pin decision. [SUPERSEDED by 14.4: routine pinning of a bit-preserving correction is lead-owned; only
+numerical (bit-changing) edits need the human.]
+
+### 14.4 Review 5 (written 2026-11-02T12:11:25Z; dev commit fd91420 on 8951bc3)
+
+Statements above that this review changes carry "[SUPERSEDED by 14.4]"; nothing is deleted.
+
+COMPARISON VALIDITY (r2_j1_forkbench.py `summarize`, `decision_lines`):
+- best_3d now follows the ratios' rule. FORK invalid (or did not run) -> best_3d None, best_3d_note "INVALID: FORK ...";
+  no valid 3D member -> "INVALID: no valid 3D variant"; the decision line prints "best 3D SUPPRESSED (...)" and no number.
+  FORK - FLASHU1 prints "SUPPRESSED" when either member is invalid. An invalid RATIO line keeps its value and ends in
+  INVALID (unchanged rule).
+- PLANT (test_forkbench_best3d_validity): FORK invalid -> the saving is suppressed; the j1f source at cd0e286 still
+  reported a 4.0 ms saving and FORK - FLASHU1 12.0 ms on the same input (the control is not a no-op). The fastest 3D
+  member invalid -> the next valid one is chosen.
+
+LABELS:
+- The direct form X is an END-TO-END library call into a preallocated output, NOT kernel-only: the pinned C++ op still
+  allocates softmax_lse and the split-KV scratch. Record key `direct_e2e_ms_pass` (was kernel_ms_pass); FLASHT line
+  "direct (end-to-end, preallocated output)"; OUTEQ text "end-to-end direct output = X_CP".
+- X_CP - X - X_CO = `residual_ms_pass` (was rest_ms_pass): a residual of separately timed forms, not an isolated
+  measurement of the wrapper's allocations.
+- FORK1R / NS1R1 is "fork time / flash end-to-end time at matched logical work; not a physical per-byte ceiling". The
+  docstring says the logical-byte ratios do not give a physical per-byte ceiling or optimality (that needs DRAM
+  counters). No decision line says "per-byte efficiency" or "optimal" (test check).
+
+COMPILE SCOPE: the ahead file header, the forkbench docstring and the FORKA3 pair text now state the compile witness:
+every level 1-3, A3 included, loses Triton's async K / V copies (K / V become plain loads); registers stay 251-255, so
+the SM holds 2 programs, as the fork; the spill removal (stack 48 -> 0 B) and 48 KB shared memory imply NO GPU
+speed-up and NO bit equality. The GPU run decides both (FORKAn/FORK, FORKAn-EQ).
+
+PIN SCOPE AND RECONCILIATION PLAN (for the future run version):
+- Facts (git, read-only): the GPU-run pin 89e324e (branch r2-j1, run tree /mnt/beegfs/ojerbi/nosi-r2-j1) and the dev
+  head fd91420 (r2-j1-dev) diverge at 9eb59ef. r2-j1 holds 2 commits after it: 7ebb84f (GRANT_j1f =
+  "2026-10-31T13:22:30Z") and 89e324e (318 bands re-registered F6-inclusive, stamp 2026-10-31T15:47:52Z). r2-j1-dev
+  holds the older 318 bands (joint saving 14.0-18.5 etc.) because it never took those two commits. I do NOT edit the
+  old bands in either branch.
+- A trial merge (`git merge-tree 9eb59ef 89e324e fd91420`, writes no tree) has 0 conflicts: the dev side did not touch
+  the registration lines after 9eb59ef, so a merge keeps 89e324e's 318 bands, PRED_STAMP_J1 and GRANT_j1f lines as
+  registered.
+- Step 1 (lead): MERGE r2-j1-dev at fd91420 into r2-j1 at 89e324e (a merge commit; a fast-forward is not possible).
+  The run tree is then fast-forwarded to that merge commit.
+- What changes at the merge commit (blob ids by `git rev-parse <commit>:<path>`):
+  - fork blob: benchmarks/Efficiency/fork_vllm_unified_attention.py = f0dc0c18 (UNCHANGED; FORK_BLOB pins stay).
+  - new tracked file: benchmarks/Efficiency/fork_vllm_unified_attention_ahead.py (blob dec2ff66 at fd91420); the
+    step script now requires it at NSHA.
+  - wrapper blob: benchmarks/Efficiency/r2_j1_step.sh 4638d912 (89e324e) -> 6d2ca572 (fd91420): comments and the
+    tracked-file list only; the lead's job file / dispatcher pin of the wrapper blob changes.
+  - cell blob: benchmarks/Efficiency/r2_j1_forkbench.py d3f88341 (89e324e) -> the merged blob (fd91420's code plus
+    89e324e's GRANT_j1f line). The old GRANT_j1f stamp named the j1f source; it must not carry over to new code.
+  - r2_j1_select.py: the dev side adds the export j1_wrap / j3_wrap (b4bd542, "no behavior change",
+    test_j1_wrap_export); r2_j1_cell.py: no dev change.
+- Step 2 (lead, before ANY run on the merged commit): re-register with a NEW `date -u` stamp in one lead commit:
+  GRANT_j1f (new stamp; the cell code changed), and PRED_STAMP_J1 / PRED_J1_BY_B re-stamped for the merged commit if a
+  j1a / j1b run follows (values unchanged unless the lead decides otherwise; the old stamps and bands stay in git
+  history). Then DRYRUN the step script at that commit.
+- Ownership: pinning a bit-preserving correction (the forkbench labels and gates; the ahead file as a timing arm) is
+  lead-owned routine work. Numerical (bit-changing) edits (C1-C5 in 14.3) stay a human decision. Folding an `ahead`
+  level into the shipped fork (a new fork blob and every FORK_BLOB pin) is routine ONLY if FORKAn-EQ passes on the GPU
+  at both shapes and the j1a / j1b EQF holds; else it is not done.
+
+CPU receipts (/mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/): j1_fd91420_t (test_j1.py: 26 passed, 1 skipped = the
+DRYRUN), j1_fd91420_g0 (Gate 0 of the 15 older files: 37 passed); targeted runs j1_r5_k1 / k2 (test fixes) and k3
+(6 passed).
+
+## 15. Yield / window population repair (ST; review 5; written 2026-11-02T13:04:43Z)
+
+Dev commit a39aaa9 on b9031c9 (tree /mnt/beegfs/ojerbi/nosi-r2-int-dev, branch r2-int-dev, not pushed).
+
+DEFECT (verified by the lead): summarize (r2_spec_cell.py:343-380; r2_wsa_cell.summarize_w for the L4PT arms) puts
+paper.accepted_per_round_steady_mean and kv_at_verify on SC.steady_rounds(G, probe_every). restrict
+(r2_i4h_cell.py) then removes the capture rounds X from the rates and phases only. inta / intc / intd: the yield on
+181 / 187 / 195 rounds, the rates on 180 / 186 / 194.
+
+FIX: one shared helper r2_i4h_cell.population_repair, called by restrict. Every cell that calls HC.restrict gets it:
+i4h, i4s, i4cc, i4dc, recon7, st1, bf1, and the INT cells (r2_int_cell's _HCProxy forwards restrict). New record fields:
+- yield_final (the FINAL set = the rates' set): rounds, accepted / committed sums, accepted_per_round_mean,
+  accepted_per_request_per_round, committed_per_request_per_round (ratios of sums over the final set);
+- paper.accepted_per_round_steady_mean on the final set; the old value in accepted_per_round_steady_mean_incl_capture;
+  paper also gets accepted_per_request_per_round and committed_per_request_per_round;
+- kv_at_verify: the measurement does NOT change. wait_population = the probe rounds (non-None probe_wait_ms) and their
+  count; the spans are the J / verify slot's host gathers only (meter.timing; spec_tentative.py:954); D-slot loads are
+  counted but not timed (spec_tentative.py:1020). bytes_population = SC.steady_rounds WITH the capture rounds, its count
+  and the capture rounds in it. round_blocks is in read(), so new_blocks_per_round_final / new_MB_per_round_final /
+  final_rounds are on the final set (None + final_note when round_blocks is absent);
+- rec["new"] (BF1 arms): new_blocks_per_round_final, final_rounds;
+- steady_rounds_list (the final set) and populations (the round set of every summary field: final, incl_capture,
+  probe, all rounds, wall). rollback_per_round stays on the incl_capture set (recorded in populations, not changed).
+
+TESTS (test_int.py, section R5): test_r5_final_set_fields (synthetic rd, G 40, probe 16, B 4, X = [1, 16]; final 36
+rounds, old 37; every field = the hand value; *_incl_capture = the old computation; the old and new values differ: the
+precondition), test_r5_missing_vectors_and_controls (no round_accepted / round_blocks: None with notes; X = []: the old
+values; a second call keeps the first old value), test_r5_every_cell_reaches_the_one_restrict.
+
+RECEIPTS (/mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/, one srun job 2250428 on amd, tree at b9031c9 + the edits =
+a39aaa9's bytes): st_r5_a_r5 (3 passed), st_r5_a_g0 (Gate 0 of the 19 tests: 41 passed), st_r5_a_int (test_int.py:
+18 passed, 1 skipped = the DRYRUN), st_r5_a_st1int (test_st1.py -k int: 6 passed), st_r5_a_i4h (test_i4h.py: 12
+passed, 1 skipped = the DRYRUN), st_r5_a_bf1 (test_bf1.py: 27 passed).
+
+PINS (for the lead):
+- r2_i4h_cell.py blob aa8ad290 (b9031c9) -> 141d6ddf (a39aaa9). No step script pins this blob: r2_i4s / i4cc / i4dc /
+  recon7 / j1 / st1 / bf1 / int _step.sh only require it tracked at NSHA. FORK_BLOB is unchanged. The run trees need
+  the new NSHA; the lead decides if the grants of cells that run this code (GRANT_int*) need a new stamp.
+- Gate 0: one "# R5" block of added lines in test_i4s.py (r2_i4h_cell.py also leaves the I4H lever's tip-bytes check),
+  test_i4cc.py, test_i4dc.py, test_recon7.py, test_j1.py, test_st1.py, test_bf1.py; test_int.py R5_FIX in its allowed
+  set. The older Gate-0 tests already list r2_i4h_cell.py.
+- Saved records (inta / intc / intd) keep the old fields; the lead's recomputation from the saved vectors stands
+  (final-set accepted per request per round 2.617130 / 2.521056 / 2.417250; committed 2.642130 / 2.555017 /
+  2.451340).
+
+## 16. TRACK 1, KV movement: the completed-fetch / retention schedule and its ledger (AREA 2, BF; written 2026-11-02T14:15:26Z)
+
+Owner: BF. Human priority of 2026-11-02. Source and CPU only (no GPU allocated). Base: a347f7c (review 5). Dev tree
+/mnt/beegfs/ojerbi/nosi-r2-bf1-dev, branch r2-bf1-dev, not pushed. Reference: the original equations (copy of
+crafticat/speculative-kv-handoff @ad409e2 docs/ORIGINAL_CALCULATIONS.md, in the session scratchpad). Anchor: C81 / K3 /
+B287 / L 2, 84 GB cap. Original: W = B m (n / K) / r = 287 x 6.46583 MB / 10.72418 GB/s = 173.0381 ms, charged inside
+max(G, W) (G = 232.48 ms); the covered retained replay assumes ZERO ADDITIONAL VERIFIER FETCH (not zero transfer).
+intc's best arm (L4PTFDGUDCDI) had BF off: its 90.464 ms J-probe gather span (LEDGER_rev7 16.8) is the no-prefetch
+case; it does not test the intended schedule.
+
+### 16.1 What the intended schedule needs, and where the code stood (source)
+
+Trace of one fetched block (producer -> transfer -> retained destination -> consumer read), file:line at the commit:
+1. PRODUCER: the draft residency of layer l (TentStateFD._resid_lean -> TentStateBF._resid_lean -> BgFetch.on_draft):
+   the draft's selection is known there; the candidates (skipped loads of complete host blocks) are snapshotted and
+   QUEUED AT THAT LAYER. This is the earliest release point the source allows (the selection does not exist earlier);
+   what follows is the worker's latency (section 13: snapshot wait, select, C++ pack and submit, issue).
+2. TRANSFER: the worker packs the rows into pinned staging (gilfree C++ team), the copy stream lands them in the
+   landing ring, the side stream (direct) or the compute stream at the item's joint layer (deferred) COMMITS them into
+   the kept store slot (BgFetch._commit): key = layer x 2^32 + block in kid, age kage = g L + layer.
+3. RETAINED DESTINATION: the kept store (the arena's B x X slots per head, one store for all layers; X = 129 at the
+   anchor). The ONLY evictor between the commit and the read is the joint pass's keep (r2_i4d_keep.keep_assign at each
+   layer: dead slots first, then alive slots with the furthest predicted next use). A committed slot is "alive" with its
+   next use predicted at its layer, so under capacity pressure an earlier layer's miss CAN evict a retained slot before
+   its layer reads it (LOST RETENTION). Nothing protected it before this commit.
+4. CONSUMER READ: at the item's joint layer, keep_assign finds the key (a hit: protected, not refilled), and the fork's
+   page id of that listed block becomes store_b + slot (r2_i4d_keep._keep_fill, the return value `lphys`): the
+   attention reads the retained slot. The keep step is CAPTURED in the graph arms (r2_i4k_combo.py THE SPLIT), so the
+   new code there is graph-safe (device step scalar kpass_d, a persistent accumulator flushed eagerly per pass).
+Completion: in "defer" a job that lands after its layer ran is dropped ("passed"; its blocks are gathered
+synchronously); "drop" abandons every job not issued at the joint pass's start. Neither guarantees completion.
+
+### 16.2 What was built (dev commit 4692273 on a347f7c)
+
+r2_bf1_fetch.py:
+- late = "complete" (new LATES value): a late job commits at its layer; the host waits with NO budget, so no job is
+  passed; the compute stream waits the job's landing event (the GPU waits a late block; it never reads stale bytes).
+- retain = True (RETENTION): before each joint layer's keep, the unread retained slots of LATER layers that still hold
+  their keys join keep_assign's `block` mask for that one step, up to the spare capacity of (head, request): spare =
+  (X - 1) - this layer's listed entries - test-blocked slots. The keep's capacity proof (r2_i4d_keep (iii)) still holds
+  (#misses <= (X - 1) - #hits - |protected|; protected slots hold other layers' keys, so they are never this layer's
+  hits). The rest is the OVERFLOW FALLBACK (retain_overflow: those slots stay evictable). The side commit keeps its own
+  fixed copy of the test-only mask (kblock_d), so it never sees the temporary mask.
+- THE LEDGER (ledger = True, every ce arm): bitmaps req (bool) and com (uint8) of shape (L, H, B, nblk + 1) per epoch
+  (requested at on_draft by the drafts; completed at every commit); per joint layer, after the keep, a per-slot
+  classification (BgFetch.pre_keep / post_keep through TentStateBF._keep_fill), counters per joint pass (=
+  per round), and the CONSUMER-ADDRESS CHECK: the fork's page ids of the listed blocks are marked per slot; every
+  retained hit must be read at its slot (addr_ok), else addr_bad. A retained hit is, by definition, not refilled
+  (host_x < 0 at its slot), so its read is the retained bytes, not a fresh gather.
+- Negative controls (tests only, lneg): "evict_retained" (an eviction before the read), "addr_redirect" (the fork reads
+  slot 0 instead of a retained hit's slot).
+r2_bf1_cell.py: arm L4PTFDGUDKWCDS (S) = ready snapshots + late "complete" + retain; --bf-ledger; the -BF gate adds
+the ledger closure and addr_bad = 0 (MUST), and no passed job in "complete"; REPORT verdicts BF1S-*
+(PRED_STAMP_BF1S = None). r2_bf1_step.sh: cell bf1c (C81 pool 18, B287, 512 steps, --bf-store 0 = 129 slots, arms
+L4PTFD, L4PTFDGUDKWC, L4PTFDGUDKWCD, X, B, R, S; 8 parts, STEP_MIN 260; STOPS while PRED_STAMP_BF1S is None); bf1m gains S.
+No new kernel; no edit outside the BF files.
+REPAIRS MAPPED TO THE EVIDENCE (requirement 3): readiness: the snapshot wait (section 13, P1, 115.7 ms per epoch in b3)
+-> ready-only snapshots (kept; S uses them). Late issue: "defer" drops a job that lands after its layer -> "complete"
+(S). Lifetime: unread retained slots were evictable by earlier layers' misses -> retention with the overflow fallback
+(S). Release point: already the draft layer (16.1 item 1); nothing earlier exists in the source. Packing / queueing
+(C++ pack 94.5 + submit 76.1 ms per epoch, section 13 C2 / C3): the packer inspection's work, not repeated here; the
+blocking call of C3 is still not established. Store size beyond 129 slots: a human decision (16.4).
+
+### 16.3 THE ACCOUNTING (definitions; record bf.arrival.ledger, per joint pass in per_pass, totals)
+
+(a) FETCH side (unique (layer, head, request, block) keys of the epoch): requested (a draft's candidate), completed
+    (committed or revived into the store), completed_before_deadline (arrival block: a batch's items whose usable
+    arrival precedes the residency start of their joint layer).
+(b) DEMAND side, covered: demand = the verifier's unique HOST demand of each joint layer (the keep's listed entries:
+    blocks of the joint pass's four rows that neither the window nor the pool holds). hit_retained = found in the store
+    in a slot this epoch's fetch committed (still holding its key); hit_cache = found in the store otherwise (kept from
+    earlier rounds).
+(c) DEMAND side, NOT covered (each one is a synchronous gather now): miss_verifier_only (no draft requested it),
+    miss_req_incomplete (requested, not completed this epoch: late / dropped / passed / no room), miss_lost (requested
+    AND completed, but not in the map at the read: lost retention).
+NO DOUBLE COUNT: (a) counts fetches, (b) and (c) count demand (different populations); within the demand,
+demand = hit_cache + hit_retained + miss_verifier_only + miss_req_incomplete + miss_lost exactly (a MUST: closure_ok).
+Independent cross-checks (CPU tests): the demand equals the keep's own listed count, the (c) sum its fetched count,
+the (b) sum its hits (r2_i4d_keep keep_read). Extra counters: lost_tagged (retained slots of a layer that lost their key
+before that layer's keep, demanded or not), retain_protected / retain_overflow (slot-steps), addr_ok / addr_bad.
+RESIDUAL VERIFIER TRANSFER = the (c) bytes: residual_MB_per_pass = (c) items x 32,768 B (K + V of one head-block); in
+the original's notation B x verifier_union_MB x (1 - a) / r with a = (hit_cache + hit_retained) / demand. The bytes in W
+(the fetch during drafting) are NOT added again: they are (a), not (c).
+
+### 16.4 Memory at the anchor (the original capacity equation vs ours; MODEL with the stated inputs)
+
+Original (bytes): M = guarded_C63_backbone(B) + (C - 63) B x 2,105,344 + B x [peak_retained_overflow x (1 + 128/32768)
++ tentative_state] + 3 x 17,039,360 <= 84e9; tentative_state = 2 (K + 1 + L) 32768 + K 8192 = 2 x 6 x 32768 + 3 x 8192
+= 417,792 B per request (119.9 MB at B287); extra cache 18 x 287 x 2,105,344 = 10.876 GB; landing 51.1 MB; total
+83.7655 GB at B287 (the document). The retained term is the per-request PEAK.
+Ours at C81 B287 (intc, no BF, INT arm): allocated peak 76.82 GB MEASURED. It already holds the kept store: one store
+for all layers, B x X slots x H 8 x 32,896 B = 263,168 B per slot per request; X 129: 33.9 MB per request, 9.74 GB at
+B287 (our "retained" term: a FIXED 128-slot store, not a peak) and the tentative buffers (2.105 MB + about 3.6 MB of
+workspaces per request, section 11). BF adds (MODEL, defaults of bf1c):
+| part | bytes at B287 | original counterpart |
+|---|---|---|
+| landing ring (ring 6 x n_cap 6144 x 32,768 B) | 1.208 GB | 3 x 17,039,360 = 51.1 MB |
+| transport landing (2 x cap 2048 x 33,296 B) | 0.136 GB | (in the 51.1 MB) |
+| snapshot ring (4 L x H x B x topk 64 x 4 B) | 0.075 GB | none |
+| ledger bitmaps (2 x L x H x B x (nblk 261 + 1) B) | 0.038 GB | none |
+| arrival counters (32,776 B x 210 epochs) + pbid + tags | 0.015 GB | none |
+| sum | 1.47 GB | |
+So S / R / B at the anchor: 76.82 + 1.47 = 78.3 GB (MODEL; the KW arm's own peak at C81 is not measured: the INT arm's
+is used) against the usable 83.75 GB (L60): FITS, about 5.4 GB spare. --bf-store 257 adds 128 x 263,168 x 287 = 9.67 GB:
+88.0 GB: DOES NOT FIT. A store sized to a measured peak with an overflow fallback is a HUMAN DESIGN DECISION (not
+built): each extra slot costs 75.5 MB at B287, so the spare 5.4 GB allows about 71 more slots (X <= about 200). The
+landing ring can also shrink toward the original's 51 MB (smaller n_cap = more batches: the section 13 per-batch cost).
+
+LEAD CORRECTION to 16.4 (2026-11-02T15:57:33Z, `date -u`; checked against records, supersedes the store figures above):
+- H in the store is the KV-head count, 2 (config.json num_key_value_heads 2), not 8. One slot per request is
+  2 x 32,896 = 65,792 B. Record evidence: intd (R/int_d1_2195630_intd, C73 B318, X 129): store_GB 2.6989 =
+  318 x 129 x 65,792 B; LEDGER_rev7 row 7: "ONE store X 129 shared by 32 layers 8.487 MB" per request.
+- RE-CORRECTED (2026-11-02, re-optimization analyst; lead re-grep): intc DOES hold the kept store: its record has
+  store_GB 2.4358 (= 287 x 129 x 65,792 B). The lead's first grep used the wrong quote form and missed the field (rule
+  slip, L70 repeated). The BF owner was right that 76.82 GB holds the store; only its size per slot was wrong.
+- Corrected anchor fit (MODEL, allocated basis): 76.82 (intc, measured, store included) + BF parts 1.47 GB (themselves
+  overstated by about 0.085 GB by the same H 8 error) = about 78.2-78.3 GB. FITS under the usable 83.75 GB (L60) with
+  about 5.4 GB spare.
+- X 257: + 128 x 65,792 x 287 = 2.417 GB -> about 80.7 GB: FITS with about 3 GB spare. Each extra slot costs 18.9 MB at
+  B287 (not 75.5). The 257-slot store at the anchor is FEASIBLE ON THE MODEL; it stays a human decision (overflow
+  fallback, physical fit of the KW arm at C81 not measured).
+- The KW arm's own C81 peak is not measured: 80.74 GB uses the INT arm's peak plus the store, MODEL.
+
+### 16.5 MODEL prediction for the anchor (inputs labelled; prediction -> measurement plan)
+
+Inputs: intc J-probe gather span 90.464 ms for 2,022.975 MB of NEW host blocks per round (MEASURED; scope caveat of
+LEDGER_rev7 16.8); draft-selected coverage of the joint's NEW blocks c_req = 0.47-0.51 (r7pa / r7pb, MEASURED at C128 /
+C73); b3 (C73): sent 1.45 GB per round, draft +11.4 ms, joint overhead beyond the saving 21.3 ms (MEASURED), MODEL
+scaled to C81 by the NEW bytes (2,023 / 2,565 = 0.79).
+- THE ORIGINAL'S ASSUMPTION vs THE LIVE SELECTION: zero additional verifier fetch needs every verifier block requested
+  by a draft and retained. Live, only c_req = 0.47-0.51 of the joint's NEW blocks were draft-selected, so even a
+  PERFECT completed + retained schedule leaves miss_verifier_only of about 0.49-0.53 of the NEW bytes: a residual of
+  44-48 ms of the 90.5 ms (MODEL). The ledger measures this split directly (miss_verifier_only / demand).
+- S (completed + retained): a = c_req x q, q = completion x retention at 129 slots, q = 0.6-0.95 (no measurement at 129
+  slots; b3 at 257 slots used 0.62 of the sent items, which includes selection waste): a = 0.28-0.48. Saving in J:
+  90.46 a = 25-44 ms. Costs: draft 9-11 ms (6.2 + 2.5 x 1.15 GB, section 12's coefficients), J-side 14-20 ms
+  (b3's 21.3 scaled by 0.79, plus the ledger / retention ops about 2-4 ms of 30-50 launches per layer).
+  S - X = -6 .. +21 ms per round, central +7 (a 0.38): round 434-470 ms -> S / X = x0.987 .. x1.049, central x1.016.
+- R (ready-only, defer, no retention) and B (b3's loop) at C81: as section 13.4 row A and b3: B / X x0.995-1.010,
+  R / B x0.998-1.015.
+- Proposed bands (for the lead to register; MODEL above): BF1S_vs_X (0.985, 1.05); BF1S_vs_B (0.995, 1.04); BF1S_vs_R
+  (0.99, 1.03); BF1S_joint_saving (5, 45) ms; BF1S_covered_share (0.40, 0.90) (hit_cache is inside the demand at
+  the anchor and is not modelled separately: wide); BF1S_residual_MB (900, 1,600) MB per joint pass
+  (2,023 x (1 - a) with a 0.28-0.48, plus the cache part). REPORT-only (not banded): miss_verifier_only / demand
+  (MODEL 0.45-0.55), miss_lost and lost_tagged (retention at 129 slots), retain_overflow, completed / requested,
+  completed_before_deadline / completed, late_passed (S: MUST 0), addr_bad (MUST 0).
+- What decides the next lever: if miss_verifier_only / demand is about 0.5, the schedule cannot reach the original's
+  zero additional fetch with today's selection, whatever the transport; the lever is then the selection overlap (the
+  verifier's rows using the drafts' selections, an algorithm change for the human) or the store size. If miss_lost
+  is large, the store size (human decision) or the retention order is the lever. If miss_req_incomplete is large, the
+  worker path (section 13) still is.
+
+### 16.6 GPU protocol (proposed; the lead runs it; no GPU allocated now)
+
+1. DRYRUN=1 bash benchmarks/Efficiency/r2_bf1_step.sh --nosi <commit> <holder> <run> bf1m, then bf1m (B 8, 72 steps,
+   --check-every 1: the keep's overflow / missing / byte checks cover S's retention; every gate MUST). Inspect per ce
+   arm: -BF (closure_ok, addr_bad 0; S: late_passed 0), the ledger block, keep check overflow 0.
+2. Register PRED_BF1S_BY_B[287] and PRED_STAMP_BF1S (`date -u`) in a commit (and R / B bands for C81 if wanted).
+3. bf1c at the anchor (8 parts, STEP_MIN 260, --mem 340G): arms X (fetch off), B (current, b3 loop), R (ready-only),
+   S (completed schedule); every ce arm reports the ledger, so the (a) (b) (c) split is measured for B, R and S in one
+   job. Score: S / X, S / B, S / R, joint saving, covered share, residual MB per pass; then compare the measured
+   residual to 90.46 x (1 - a) with the measured a, and miss_verifier_only / demand to 1 - c_req.
+
+### 16.7 CPU tests and receipts
+
+Pre-commit run of the track-1 selection: /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/bf1_dev3.txt (+ .receipt), 23
+passed (the new tests, gate 0, cell, step, report in every mode, the older plants). Evidence (CPU world, B 8, 48
+tokens; small numbers, plumbing only):
+- test_bf1_ledger (B inline / drop, B thread / defer, S thread / complete / ready / retain): demand 846 = the keep's
+  listed count; hit_cache 645 + hit_retained 141 = its hits; miss_verifier_only 60 = its fetched count; miss_lost 0,
+  miss_req_incomplete 0; addr_ok 141 = hit_retained, addr_bad 0; requested 1,385, completed 461 (all before the
+  deadline); S: retain_protected 227, overflow 0, late_passed 0.
+- test_bf1_ledger_check_rounds (S, check scenario): keep check overflow 0, dup 0, missing 0, bytes_bad 0 of 846 checked:
+  the retention mask keeps the capacity proof and every read byte is the host block's.
+- test_bf1_retention_pressure (kslots = the plain arm's most listed blocks): retain off: lost_tagged 12, miss_lost 6;
+  retain on: lost_tagged 9, miss_lost 4, protected 197, overflow fallback 9; both: overflow 0, bytes_bad 0.
+- PLANT eviction before the read (evict_retained): lost_tagged 310, miss_lost 89 (requested, completed, refetched);
+  bytes_bad 0, EQF holds: lost retention is counted and no stale byte is read.
+- PLANT late fetch: complete: passed 0, deferred committed 62, sent late 234, completed_before_deadline 227 of 461
+  (late but completed, read retained); defer with a 0 ms budget: passed 27, miss_req_incomplete 125 (counted (c)).
+- PLANT verifier-only (no draft request): miss_verifier_only 339 = the keep's fetched count, hit_retained 0,
+  requested 0.
+- PLANT consumer address (addr_redirect): addr_bad 131 = hit_retained, addr_ok 0; -BF FAILS and EQF FAILS (the wrong
+  read is caught by both).
+FULL SUITE at the commit: /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/bf1_4692273_t.txt (+ .receipt): head 46922736,
+status clean, SLURM 2251043 on thunder09 (amd), 2026-11-02T14:56:45Z -> 15:49:53Z, pytest_exit 0, 56 passed (the 45
+of a347f7c + 11 new: test_bf1_ledger x3, ledger_check_rounds, retention_pressure x2, lost_retention_plant,
+late_fetch_plant x2, verifier_only_plant, consumer_address_plant). The suite now takes 53 min of the 60 min srun
+limit: the next additions should split it.
+NOT covered on the CPU: the GPU clocks, the stream order of the deferred commits against the copy stream, the cost of
+the ledger / retention ops inside the captured graphs (MODEL 2-4 ms per round), the store mix at 129 slots and B287.
+
+## 17. TRACK 2, shared KV reads in the joint pass (AREA 1, J owner; written 2026-11-02T14:22:26Z; dev 55de6f9)
+
+Dev tree /mnt/beegfs/ojerbi/nosi-r2-j1-dev (r2-j1-dev; on fd91420, 14.4). Source and CPU only; no GPU job. The
+arithmetic below is printed by /mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/j1_ahead/track2_numbers.py (run on amd; output
+track2_numbers.out beside it). Labels: MEASURED (a record), DERIVED (arithmetic on MEASURED), MODEL (an assumption,
+stated), INFERENCE, UNKNOWN.
+
+### 17.1 What "one physical read" needs
+
+A logical union, shared addresses or a completed CPU transfer do not prove one HBM read. The fork's structure reads each
+union tile ONCE per (request, KV head) for its 64 rows (1 draft + 3 verify rows x 16 heads: fork header lines 20-23).
+Evidence so far: the fia6 ncu MICROBENCH, fork DRAM bytes 1.017-1.021x the union (MEASURED). The LIVE joint pass: no
+ncu (UNKNOWN). 17.3 (cell j1n) and 17.4 (live protocol) are the tests.
+
+### 17.2 Eligible implementations (matched query work = the same 4 rows per request and the same union / per-row
+selections; the output contract = the fork's bits, which EQF against L4PTFD requires: L4PTF's joint attention is the
+fork, spec_tentative_fork.py:386 joint_attn="fork")
+
+| route | matched work | numerical topology (per output) | contract vs the fork | eligibility | evidence |
+|---|---|---|---|---|---|
+| FORK (fia6, FV6) | yes: one program per (request, KV head), 64-row tile, union tables, per-row extents | online softmax over the union tiles in ascending block order; one MMA per tile (w4, tile 64) | the contract | ELIGIBLE (shipped) | verify_rows.py:154; fork :20-28 |
+| FORKA1-3 (ahead, 14.3) | yes | the same ops in the same order; the GPU code differs (compile witness) | GPU gate FORKAn-EQ | ELIGIBLE AS-IS only if FORKAn-EQ passes (CPU interpreter: 32 / 32 bitwise) | 14.3, 14.4 |
+| FORK3D (the fork's split) | yes | segments + reduce_segments: another summation | loses EXACT | NUMERICAL CHANGE (human); MEASURED 1.23-1.46x slower | j1f record; fork :1028-1037 |
+| FORK, num_warps 8 / tile 32 | yes | another MMA layout / softmax grouping | bits differ (MEASURED: 851 / 854 / 127 rows equal at w8; 0 at tile 32) | NUMERICAL CHANGE (human); MEASURED slower | SCORING_fia5.md:79-81, :103-112 |
+| NS1x4 (flash_attn_nosa, 4 one-row calls) | rows yes; reads each row's 64 pages (no union) | FA2 split-KV 4 + combine | another kernel | NOT ELIGIBLE as a shared read (4 x 64 / 72 = 3.6x the union's logical bytes; MEASURED 2.2x FORK) | j1f; verify_rows.py:46 |
+| FLASHU1 type (1 row over the union) | NO (1 row, not 4) | FA2 | another kernel | NOT ELIGIBLE (a control only) | j1f |
+| NSRU / route 1 "fast" (flash_attn_nosa + cache_batch_idx over one union window, per-entry bias) | yes (sharing only through L2) | FA2 split-KV; window order | "FAST is NOT bitwise the serial step" | NUMERICAL CHANGE (human); the route exists (route 1) | verify_rows.py:26-40, :48-52 |
+| FlashAttention kvcache + block_table (paged) | one row per batch entry; no cross-row read | FA2 | another kernel | NOT ELIGIBLE as-is: page_block_size must be a multiple of 256 (ours: 64) | flash_api.cpp:337 |
+| FlashInfer 0.5.3 prefill + custom mask (fia3) | yes (a query tile over the pages); the CIS bias needs a JIT variant | another kernel and order | bits differ | NUMERICAL CHANGE (human); MEASURED 1.68-1.70x of piece 3 (2 CTAs per SM, latency-bound) + 77-100 ms plan / mask per tick | fork :14-17; record fia3_f1a_2195573 |
+| FlashInfer cascade (MultiLevelCascadeAttentionWrapper; Batch{Decode,Prefill}WithSharedPrefixPagedKVCacheWrapper; merge_state / merge_states) | partly: the shared level must be COMMON to all rows of a request; our rows share a union with per-row starts (ROW_SHIFT), so the shared level = the intersection (I), the rest per row | two partial softmaxes merged by log-sum-exp | bits differ | NUMERICAL CHANGE (human); bias via JIT variant (not tried) | flashinfer/cascade.py:34, :160, :216, :548, :788 (image, 0.5.3) |
+| InfLLM-v2 varlen (NOSA prefill) | no bias input | two calls + copies | another kernel | NOT ELIGIBLE (no bias; copies) | verify_rows.py:42-46 |
+
+### 17.3 Smallest useful evidence: the rows sweep and the ncu cell j1n (READY; the lead runs it)
+
+r2_j1_forkbench.py (55de6f9), on FORKT's union tables (the same pages, extents and V reach; built once by FORK):
+- RSMn, n = 1..4: n query rows per request at BLOCK_Q 4 = FORKT's kernel and launch (the same MMA work); MUST gate
+  RSMn-EQ (rows bit-equal to FORKT). Masking rows by zero extents was NOT used: a row that sees no token stores 0 / 0
+  (softmax_step: L becomes 0), so the query length masks them.
+- RSQn, n = 1, 2, 4: BLOCK_Q n (tile rows 16 n); REPORT gate RSQn-EQ (another tile layout).
+- Summary `rows_sweep`: masked slope (ms per extra active row at fixed MMA work), tile steps (16 -> 32 -> 64 rows),
+  e_fork = RSQ1 - FORK1R (one row over the 72-page union minus one row over its own 64 pages, IN THE FORK: the E
+  analogue in the shipped kernel), tile4_fork = FORKT - RSQ1 (the 4-row tile at fixed bytes); SUPPRESSED when a member
+  is invalid.
+- What separates what: repeated physical reads = ncu DRAM read / logical bytes per arm (expect FORK about 1.0-1.03;
+  NS1x4 about 3.6); extra query arithmetic = the RSQ steps (+ ncu occupancy / registers per RSQ); masking / softmax per
+  row = the RSM slope; selection / state = excluded (FORKT form; FORK - FORKT = the in-kernel union build); dispatch =
+  one launch per call in every form (the flash forms' end-to-end / copy split: FLASHT).
+- ncu: --ncu runs one child per arm (FORK, FORKT, FORK1R, FLASHU1, NS1R1, NS1x4, RSM1, RSM4, RSQ1, RSQ2, RSQ4): warm-up
+  outside the profiler window, ONE call (one layer) inside, every kernel replayed with the caches flushed
+  (--cache-control all). Metrics: gpu__time_duration.sum, dram__bytes_read.sum, lts__t_sectors_srcunit_tex_op_read.sum
+  (required); achieved occupancy (sm__warps_active.avg.pct_of_peak_sustained_active), warps per cycle, registers, the
+  occupancy limits, L2 hit rate (when the metric query names them). Per arm: DRAM / logical and L2 -> SM / logical.
+- Shape: C 81 B 287 with the synthetic per-row 64 pages and union 72 (the C128 / C73 records measured unions of 72.2 /
+  72.24; the shape is the same at both, so the C81 "interpolation" is that shape at B 287). The recon7 records' real
+  tables are NOT used (NOT CHECKED whether they hold per-layer union tables).
+- Cell: r2_j1_step.sh j1n (POOL 18 = C 81, 6 passes, 3D segments 2, ncu = the fia6 pin
+  /opt/nvidia/nsight-compute/2025.1.0/ncu, --ncu-cap 240 s per child, STEP_MIN 50 MODEL, OUT_MB 400). GRANT_j1n = None:
+  the lead grants it (date -u) in the reconciled run tree (14.4), DRYRUN first:
+  `DRYRUN=1 bash benchmarks/Efficiency/r2_j1_step.sh --nosi <sha> <holder> <run id> j1n`.
+- CPU tests: test_forkbench_rows_sweep_pure (work, rows mapping, planted value / NaN detected, slopes, suppression),
+  test_forkbench_ncu_plumbing (argv, metric filter, the fia6 record's real raw CSV parsed read-only, the summary
+  arithmetic, the refusal of a missing ncu), test_ahead_interp (TRITON_INTERPRET=1: RSM rows n = 1..4 and RSQ rows
+  n = 1, 2 = the 4-row table read's rows, bitwise, 24 / 24), test_step_script_j1 (the j1n arguments parse).
+
+### 17.4 Live-pass ncu protocol (one joint layer of the INT arm) — PROTOCOL ONLY
+
+Not built: it needs the INT owner's step script (nosi-r2-int: r2_int_step.sh) and a dump hook. Steps:
+1. Arm: an INT arm (r2_int_arms.py:32-36; at C73 B318 L4PTFDGUDKWCDIN now; at C81 B287 when an INT cell exists).
+2. Wrap the cell's python in ncu: `--kernel-name regex:kernel_unified_attention --launch-skip S --launch-count 1`, S =
+   (warm-up joint passes x 32) + l (one steady joint pass, layer l, e.g. 16). Two runs: (a) --cache-control all, the
+   required metrics (the kernel's own physical reads); (b) --cache-control none with dram__bytes_read.sum only (one
+   replay pass: the live L2 state left by the preceding kernels, e.g. the draft's).
+3. Logical bytes of that launch: the union_len of that layer x 32,896 B (a hook in spec_tentative_fork._fork_state that
+   saves the layer's union_len after the call: NOT built).
+4. Decision: (a) DRAM / logical <= 1.05: one physical read per union page in the live pass; > 1.3: repeated reads
+   (then L2 -> SM / logical locates them). (a) - (b) = the live L2 reuse across the draft / verifier kernels.
+5. Cost: one profiled kernel; the rest of the cell runs under ncu's interception (MODEL: wall x 1.1-2).
+
+### 17.5 The chain at the anchor (C81 / K3 / B287 / L2)
+
+E (incremental verifier HBM service; NOT the verification budget):
+- PREDICTION (original, Oct 12): E = td (1 - f)(U - I) / 63 = 48.7803 / 63 x 8.969029 = 0.77429 ms per group x 8.969
+  = 6.9446 ms (DERIVED check: reproduced).
+- MATCHED MEASUREMENT (DERIVED from j1f + MODEL interpolation linear in B): the union-bytes increment of one row in the
+  flash call, FLASHU1 - NS1R1 = 2.32 / 3.50 ms per pass (B216 / B318) -> 3.141 ms at B287 for 8 pages = 0.3927 ms per
+  page; x (U - I) = 3.522 ms = 0.507 x E. Caveats: logical bytes; the j1f flash forms carried the wrapper + copy_ in
+  both members (it cancels to first order); the synthetic U - I is 8 pages vs the model's 8.97 groups.
+- IN THE FORK: e_fork = RSQ1 - FORK1R (j1n: PENDING the GPU).
+- CAUSE of the factor 0.51 (DERIVED + INFERENCE): NS1R1 per page = 0.4027 ms = 0.520 x the model's per-group rate.
+  The model prices a group at the draft's whole KV share of its HBM-service proxy (td (1 - f) / 63); the attention
+  read of a page costs about half of that. The other half of td (1 - f) is draft KV traffic outside the attention
+  read (UNKNOWN: not decomposed here).
+- PHYSICAL SHARING: the draft row and the verify rows read ONE union per (request, KV head) in the fork (structure;
+  microbench DRAM 1.017-1.021x the union, MEASURED). Live: UNKNOWN (17.4).
+- FIX: none needed (E is smaller than predicted). TEST: j1n (FORK DRAM / logical) and 17.4.
+- MODEL EFFECT (what-if: the model's E replaced by 3.522): H 213.9039 -> 210.4812; G 232.4806 -> 228.7606 (x0.98400);
+  Q x1.01626.
+
+THE 4-ROW TILE (absent from the model):
+- PREDICTION: 0. D charges the dense rows g(3B) = 58.3740 (GEMMs), E charges bytes; no term holds the attention
+  arithmetic / latency of 4 rows.
+- MATCHED MEASUREMENT (j1f, equal logical bytes): FORK - FLASHU1 = 12.50 / 19.13 ms per pass -> 17.115 ms at B287
+  (MODEL interpolation). FORK / NS1x4 = 0.4543 at B287 (the shared read saves 55.3 ms vs four one-row calls).
+- CAUSE (MEASURED fia5 + DERIVED): the tile loop is latency / occupancy-bound: 255 registers + 59 KB shared -> 2
+  programs per SM; 3 synchronous loads per tile; 8.1 us per tile vs 0.73 us of MMA and 1.7 us of HBM share per tile.
+  The j1n rows sweep splits it: RSQ steps (tile rows: MMA, registers, occupancy) vs the RSM slope (active rows).
+- FIX (bit-preserving): the ahead levels (built; CPU compile witness: K / V lose the async copies, registers 251-255):
+  MODEL -15 % .. +10 % of FORK (46.028 ms at B287) = -6.904 .. +4.603 ms per pass; the GPU decides (FORKAn/FORK,
+  FORKAn-EQ). F7 (union build outside the kernel): ceiling FORKT - FORK = -1.204 ms per pass (MODEL interpolation),
+  before the outside build's own launches. Grid order (KV head fastest): MODEL about 0 (the two heads read disjoint
+  bytes; the fork is not bandwidth-bound: 46 % of DRAM peak, fia5). Extents loads: inside the ahead levels.
+- MODEL EFFECT on the anchor: the model has no term. Bounding what-ifs (NOT predictions; do not add overlapping times):
+  fully serial with H: H 213.9039 -> 231.0189, G 232.4806 -> 251.0820 (x1.0800), Q x0.9259; the tile minus E (if E were
+  already counting it): G -> 243.5342 (x1.0475). The overlap assumption max(H, D) is UNTESTED here: in one CUDA stream
+  the fork kernel and the GEMMs run one after the other (INFERENCE), so the measured joint pass, not the model's
+  maximum, decides. 17.4 measures the live attention kernel.
+
+### 17.6 Bit-changing routes (the human's list; MODEL gain at B287)
+
+| route | MODEL gain | basis |
+|---|---|---|
+| cascade + merge_state (FlashInfer) | <= 0 | bytes at best equal to the fork's (the union once); FlashInfer's kernel MEASURED 1.68-1.70x of piece 3 (fia3) |
+| num_warps 8 at tile 64 | negative | MEASURED +21-31 % slower at B216 (fia5) |
+| tile 32 | negative | MEASURED +15-90 % (fia5) |
+| row split (BLOCK_Q 2, two programs per request) | UNKNOWN until j1n: gain = FORKT - (the time of two RSQ2 programs at the occupancy they reach) | RSQ2 and its ncu occupancy in j1n; bits: RSQ2-EQ (REPORT) |
+| 3D split | negative | MEASURED 1.23-1.46x slower (j1f) |
+
+### 17.7 Commits and receipts
+
+Commit 55de6f9 (on fd91420; not pushed). Receipts (/mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/): j1_t2_k1 (targeted:
+8 passed, 1 skipped), j1_55de6f9_t (test_j1.py: 28 passed, 1 skipped = the DRYRUN), j1_55de6f9_g0 (Gate 0 of the 15
+older files: 37 passed).

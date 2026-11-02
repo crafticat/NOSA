@@ -10,7 +10,8 @@ D=$T/docs/packet_2026-11-01
 mkdir -p $D/analysis $D/provenance $D/cpu-receipts $D/gpu-records
 for f in HANDOFF_INT_2026-10-31.md DISPOSITION_REVIEW3_2026-10-31.md LEDGER_rev7.md STATUS_LOG.md \
          INTEGRATION_NOTES_2026-10-31.md RECON7_RECEIPTS_RECOVERED.md DESIGN_BGFETCH_2026-10-31.md \
-         DESIGN_JOINT_EFF_2026-10-31.md HANDOFF_RECON7.md HUMAN_RECON_REQUEST_2026-10-30.md; do
+         DESIGN_JOINT_EFF_2026-10-31.md HANDOFF_RECON7.md HUMAN_RECON_REQUEST_2026-10-30.md \
+         REOPT_2026-11-02.md CONSOLIDATED_2026-11-02.md; do
     cp -p --remove-destination $K/analysis/plan/$f $D/analysis/
 done
 cp -p --remove-destination $K/tmp_sc/recon7_prov/PROVENANCE.md $D/provenance/
@@ -18,7 +19,9 @@ cp -p --remove-destination $K/tmp_sc/recon7_prov/PROVENANCE.md $D/provenance/
 [ -d $D/provenance/bundle ] || cp -rp $K/tmp_sc/recon7_prov/bundle $D/provenance/
 cp -p --remove-destination $K/tmp_sc/recon7_fix/run_receipt.sh $K/tmp_sc/recon7_fix/run_receipt_tree.sh \
     $K/tmp_sc/packet_1101/assemble.sh $K/tmp_sc/packet_1102/chunk_summaries.sh $D/cpu-receipts/
-for p in recon7f_ j1_ st1_ st3_ bf1_ int_; do
+mkdir -p $D/reopt
+cp -p --remove-destination $K/tmp_sc/reopt_1102/*.py $K/tmp_sc/reopt_1102/*.out $D/reopt/
+for p in recon7f_ j1_ st1_ st3_ bf1_ int_ int2_; do
     for f in $K/cpu-logs/${p}*; do
         case $f in *.txt|*.receipt) cp -p --remove-destination "$f" $D/cpu-receipts/ ;; esac
     done

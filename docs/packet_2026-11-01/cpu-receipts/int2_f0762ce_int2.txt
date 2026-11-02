@@ -1,0 +1,22 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+....                                                                     [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int2_bf_arms_and_options
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_int.py:819: Evidence: INT2 bf_opt (INT keep arm): {'mode': 'ce', 'n_cap': 2048, 'ring': 8, 'worker': 'thread', 'acct': False, 'close_wait_ms': 0.0, 'packer': 'gilfree', 'threads': 14, 'gf': {'cap_groups': 2048}, 'late': 'defer', 'late_wait_ms': 250.0, 'batch': 8, 'snap': 'newest', 'poll_ms': 1.0, 'arrival': True, 'ledger': True, 'retain': False}; BgFetch defaults of the new keys {'snap': 'newest', 'poll_ms': 1.0, 'arrival': True, 'ledger': True, 'retain': False}
+    _ev("INT2 bf_opt (INT keep arm): %s; BgFetch defaults of the new keys %s" % (o, {k: dflt[k] for k in new}))
+
+benchmarks/Efficiency/tests_cpu/test_int.py::test_int2_st3_shadows_bf_keep_fill
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_int.py:839: Evidence: INT2 ST3 x BF1: _keep_fill owners in MRO order ['KeepFillST3', 'TentStateBF', 'TentStateFKg', 'TentStateFK']
+    _ev("INT2 ST3 x BF1: _keep_fill owners in MRO order %s" % owners)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+4 passed, 17 deselected, 2 warnings in 14.60s

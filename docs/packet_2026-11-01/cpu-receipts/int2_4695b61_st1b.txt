@@ -1,0 +1,104 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+.........................s                                               [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st3_helpers_planted
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:612: Evidence: ST3 PLANTED: 6 plants: hits 70, misses 94, evictions of a held key 23; controls changed no_age 6, remap_off 6
+    _ev("ST3 PLANTED: %d plants: hits %d, misses %d, evictions of a held key %d; controls changed no_age %d, "
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st3_equal[timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:644: Evidence: ST3 EQUAL timing: joint passes 29, keep listed 846 hits 507 fetched 339; st3 {'calls': 18, 'checked': 14, 'fallback': {}, 'events': [{'name': 'kfa', 'graphs': 1, 's': 0.18, 'layer': 0, 'joint_pass': 0, 'capture': False}, {'name': 'kfb', 'graphs': 1, 's': 0.196, 'layer': 0, 'joint_pass': 0, 'capture': False}]}
+    _ev("ST3 EQUAL %s: joint passes %d, keep listed %d hits %d fetched %d; st3 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st3_equal[check]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:644: Evidence: ST3 EQUAL check: joint passes 29, keep listed 846 hits 507 fetched 339; st3 {'calls': 19, 'checked': 19, 'fallback': {}, 'events': []}
+    _ev("ST3 EQUAL %s: joint passes %d, keep listed %d hits %d fetched %d; st3 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st3_controls[no_age]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:662: Evidence: ST3 CONTROL no_age: differences 5 (first ['keep', 'round_blocks', 'blocks', 'kage', 'kid'])
+    _ev("ST3 CONTROL %s: differences %d (first %s)" % (tneg3, len(bad), bad[:6]))
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st3_controls[remap_off]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:662: Evidence: ST3 CONTROL remap_off: differences 66 (first ['acc_hist', 'accepted', 'draft_calls', 'draft_skipped', 'draft_steps', 'fp_ok'])
+    _ev("ST3 CONTROL %s: differences %d (first %s)" % (tneg3, len(bad), bad[:6]))
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st3_int[timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:710: Evidence: ST3 INT timing: keep listed 846 hits 786; bf committed 461; st3 {'calls': 18, 'checked': 14, 'fallback': {}}
+    _ev("ST3 INT %s: keep listed %d hits %d; bf committed %d; st3 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st3_int[check]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:710: Evidence: ST3 INT check: keep listed 846 hits 786; bf committed 461; st3 {'calls': 19, 'checked': 19, 'fallback': {}}
+    _ev("ST3 INT %s: keep listed %d hits %d; bf committed %d; st3 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st3_cell
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:774: Evidence: ST3 CELL: 16 gates (15 MUST) pass on CPU evidence; KFILL fills 18 through the helpers (check passes 14), fallback {}; sections 18; helper calls {'kfa': 18, 'kfb': 18}; compile events [('kfa', 0, 0, 0.18), ('kfb', 0, 0
+    _ev("ST3 CELL: %d gates (%d MUST) pass on CPU evidence; KFILL %s" % (len(gs), sum(1 for g in gs if g[1]),
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_helper_planted
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:850: Evidence: ST4 PLANTED: 6 plants: skips 178 (draft skips 30); controls changed no_block_mask 6, count_off 4
+    _ev("ST4 PLANTED: %d plants: skips %d (draft skips %d); controls changed no_block_mask %d, count_off %d" % (
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_one_graph
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:874: Evidence: ST4 ONE GRAPH: chk as a tensor, 6 calls (3 plants x off / on): graphs 0 after the first call, 0 after all
+    _ev("ST4 ONE GRAPH: chk as a tensor, 6 calls (3 plants x off / on): graphs %d after the first call, %d after all" %
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_placement
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:916: Evidence: ST4 PLACEMENT: overrides above ResidST4 {'GUDCD': [], 'GUDKCD': [], 'L4PTFDGUDCDI': [], 'L4PTFDGUDKWCDI': ['TentStateBF'], 'L4PTFDGUDKWCDIN': []}
+    _ev("ST4 PLACEMENT: overrides above ResidST4 %s" % out)
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_equal[GUDCD-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:946: Evidence: ST4 EQUAL GUDCD timing: skipped 1884 (check counters forced 40 injected 0); dgraph warm 3 capture 2 replay 55 eager 0; st4 {'calls': 120, 'fallback': {}, 'events': [{'name': 'rpost', 'graphs': 1, 's': 0.18, 'layer': 0, 'joint_pass': 0, 'capture': False, 'dpass': 1}]}
+    _ev("ST4 EQUAL %s %s: skipped %d (check counters forced %d injected %d); dgraph warm %d capture %d replay %d "
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_equal[GUDKCD-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:946: Evidence: ST4 EQUAL GUDKCD timing: skipped 1884 (check counters forced 40 injected 0); dgraph warm 3 capture 2 replay 55 eager 0; st4 {'calls': 120, 'fallback': {}, 'events': []}
+    _ev("ST4 EQUAL %s %s: skipped %d (check counters forced %d injected %d); dgraph warm %d capture %d replay %d "
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_equal[GUDCD-check]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:946: Evidence: ST4 EQUAL GUDCD check: skipped 1884 (check counters forced 56 injected 0); dgraph warm 2 capture 1 replay 57 eager 0; st4 {'calls': 120, 'fallback': {}, 'events': []}
+    _ev("ST4 EQUAL %s %s: skipped %d (check counters forced %d injected %d); dgraph warm %d capture %d replay %d "
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_equal[GUDKCD-check]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:946: Evidence: ST4 EQUAL GUDKCD check: skipped 1884 (check counters forced 56 injected 0); dgraph warm 2 capture 1 replay 57 eager 0; st4 {'calls': 120, 'fallback': {}, 'events': []}
+    _ev("ST4 EQUAL %s %s: skipped %d (check counters forced %d injected %d); dgraph warm %d capture %d replay %d "
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_controls[no_block_mask]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:964: Evidence: ST4 CONTROL no_block_mask: differences 63 (first ['acc_hist', 'accepted', 'draft_calls', 'draft_skipped', 'draft_steps', 'fp_ok'])
+    _ev("ST4 CONTROL %s: differences %d (first %s)" % (tneg4, len(bad), bad[:6]))
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_controls[count_off]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:964: Evidence: ST4 CONTROL count_off: differences 3 (first ['draft_skipped', 'tent', 'skipped'])
+    _ev("ST4 CONTROL %s: differences %d (first %s)" % (tneg4, len(bad), bad[:6]))
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_int[C128-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:1003: Evidence: ST4 INT C128 timing: skipped 1884; st4 {'calls': 10, 'fallback': {}, 'events': []}
+    _ev("ST4 INT %s %s: skipped %d; st4 %s" % (key, scen, sum(rd["tent"]["skipped"]),
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_int[C73-timing]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:1003: Evidence: ST4 INT C73 timing: skipped 1884; st4 {'calls': 120, 'fallback': {}, 'events': []}
+    _ev("ST4 INT %s %s: skipped %d; st4 %s" % (key, scen, sum(rd["tent"]["skipped"]),
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_int[C128-check]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:1003: Evidence: ST4 INT C128 check: skipped 1884; st4 {'calls': 6, 'fallback': {}, 'events': []}
+    _ev("ST4 INT %s %s: skipped %d; st4 %s" % (key, scen, sum(rd["tent"]["skipped"]),
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_int[C73-check]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:1003: Evidence: ST4 INT C73 check: skipped 1884; st4 {'calls': 120, 'fallback': {}, 'events': []}
+    _ev("ST4 INT %s %s: skipped %d; st4 %s" % (key, scen, sum(rd["tent"]["skipped"]),
+
+benchmarks/Efficiency/tests_cpu/test_st1.py::test_st4_cell
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_st1.py:1071: Evidence: ST4 CELL: gates and plants on CPU evidence; verdicts ['ST4-ARM', 'ST4-DRAFT-SAVING', 'ST4-VS-REF']
+    _ev("ST4 CELL: gates and plants on CPU evidence; verdicts %s" % sorted(k for k in v if k.startswith("ST4")))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] benchmarks/Efficiency/tests_cpu/test_st1.py:1140: not a clean checkout of /mnt/beegfs/ojerbi/nosi-r2-st1: the full DRYRUN needs one
+25 passed, 1 skipped, 22 warnings in 2671.61s (0:44:31)

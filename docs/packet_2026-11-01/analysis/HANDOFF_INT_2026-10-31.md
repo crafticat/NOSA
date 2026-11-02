@@ -17,7 +17,8 @@ source sha256, pytest exit).
    0.388-0.404 of the checked columns (ledger 16.3); that depends on the FAST tie rule (human decision).
 3. INTEGRATED results (COMMITTED tok/s, median of the per-round rates in the steady window; not Q_accepted):
    - C128 B216 (inta): 2,096.1 = x1.090 over L4PTFDGUDCD; 0.622x SH; 0.5995x the matched optimized baseline SHJ1 of the
-     same job (SHJ1 about 3,496 tok/s, DERIVED from the printed ratio; SHJ1 memory not recorded).
+     same job (SHJ1 about 3,496 tok/s, DERIVED from a rounded ratio; the exact SHJ1 rate and its memory are NOT
+     recorded, so SHJ1's common-cap qualification stays OPEN).
    - C81 B287, the anchor (intc): 1,854.8 = x1.080; round 434.4 ms vs 232.48 predicted; the joint region 269.5 ms vs an
      inferred budget of 88.07 ms. MUST gates passed; THREE baseline-relative bands REFUTED low (INT-RATIO 0.6586,
      INT-VS-SHJ1 0.6369, INT-VS-STRONGEST 0.5444).
@@ -29,8 +30,15 @@ source sha256, pytest exit).
    draft-issued prefetch reached break-even (b3 x1.0049). What they do NOT show: that no joint implementation can do
    better (the one-row attention control does not prove four-row optimality), and that the fetch's host / readiness
    cost is irreducible (ready-only snapshot batching and the transport are unbuilt). The serial reconciliation at the
-   anchor (ledger 16.4) is accounting consistency with the measured draft step and round, not causal closure; its
-   transfer term is ESTIMATED. The earlier draft-only ceiling is conditional (ledger 16.5).
+   anchor (ledger 16.4) is accounting consistency with the measured draft step and round, not causal closure. Its
+   transfer term now uses intc's RECORDED J-probe gather wait (90.464 ms median over 12 probe rounds; bytes 2,023 MB
+   per round over the earlier steady set; scope and non-additivity in ledger 16.8). The earlier draft-only ceiling is
+   conditional (ledger 16.5).
+6. Yield (review 5): on the rates' own round set, ACCEPTED per request per round is 2.617 / 2.521 / 2.417 and COMMITTED
+   2.642 / 2.555 / 2.451 (inta / intc / intd). The earlier 2.807 (median x median / B) is withdrawn. Counterfactuals use
+   one population and ratio-of-sums; phase vectors are not all serialized, so phase-based counterfactuals are
+   approximate. The record field accepted_per_round_steady_mean covers one extra round (capture round 1); the ST owner
+   fixes the population in the cells.
 
 ## 2. Component results (MEASURED; registered bands in the run records)
 

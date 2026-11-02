@@ -1,0 +1,94 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+.......................                                                  [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[off-torch-drop]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:377: Evidence: BF1 REPORT off / torch / drop: device 20640 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[off-gilfree-defer]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:377: Evidence: BF1 REPORT off / gilfree / defer: device 20640 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[ce-torch-drop]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:377: Evidence: BF1 REPORT ce / torch / drop: device 67974792 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[ce-torch-defer]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:377: Evidence: BF1 REPORT ce / torch / defer: device 67974792 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[ce-gilfree-drop]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:377: Evidence: BF1 REPORT ce / gilfree / drop: device 67974792 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[ce-gilfree-defer]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:377: Evidence: BF1 REPORT ce / gilfree / defer: device 67974792 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_plants[wrong_bytes]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:415: Evidence: BF1 PLANT wrong_bytes: caught (EQF committed tokens unequal to L4PTFD's: 341 of 384; fingerprints compared 384 columns, max equal False, sum equal False; s; bytes_bad 889)
+    _ev("BF1 PLANT %s: caught (EQF %s; bytes_bad %d)" % (bneg, gs["L4PTFDGUDKWCDB-EQF"][3][:120],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_plants[no_copy]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:415: Evidence: BF1 PLANT no_copy: caught (EQF committed tokens unequal to L4PTFD's: 303 of 384; fingerprints compared 384 columns, max equal False, sum equal False; s; bytes_bad 1558)
+    _ev("BF1 PLANT %s: caught (EQF %s; bytes_bad %d)" % (bneg, gs["L4PTFDGUDKWCDB-EQF"][3][:120],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_ledger[inline-drop-newest-False]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:952: Evidence: BF1 LEDGER inline / drop / newest / retain False: {'demand': 846, 'hit_cache': 645, 'hit_retained': 141, 'miss_verifier_only': 60, 'miss_req_incomplete': 0, 'miss_lost': 0, 'lost_tagged': 0, 'retain_protected': 0, 'retain_overflow': 0, 'addr_ok': 141, 'addr_bad': 0, 'requested': 1385, 'completed': 461, 'completed_before_deadline': 461}; covered 0.9291, retained 0.1667, residual 2.07 items per pass; completed share 0.3329
+    _ev("BF1 LEDGER %s / %s / %s / retain %s: %s; covered %s, retained %s, residual %s items per pass; completed share "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_ledger[thread-defer-newest-False]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:952: Evidence: BF1 LEDGER thread / defer / newest / retain False: {'demand': 846, 'hit_cache': 645, 'hit_retained': 141, 'miss_verifier_only': 60, 'miss_req_incomplete': 0, 'miss_lost': 0, 'lost_tagged': 0, 'retain_protected': 0, 'retain_overflow': 0, 'addr_ok': 141, 'addr_bad': 0, 'requested': 1385, 'completed': 461, 'completed_before_deadline': 461}; covered 0.9291, retained 0.1667, residual 2.07 items per pass; completed share 0.3329
+    _ev("BF1 LEDGER %s / %s / %s / retain %s: %s; covered %s, retained %s, residual %s items per pass; completed share "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_ledger[thread-complete-ready-True]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:952: Evidence: BF1 LEDGER thread / complete / ready / retain True: {'demand': 846, 'hit_cache': 645, 'hit_retained': 141, 'miss_verifier_only': 60, 'miss_req_incomplete': 0, 'miss_lost': 0, 'lost_tagged': 0, 'retain_protected': 227, 'retain_overflow': 0, 'addr_ok': 141, 'addr_bad': 0, 'requested': 1385, 'completed': 461, 'completed_before_deadline': 461}; covered 0.9291, retained 0.1667, residual 2.07 items per pass; completed share 0.3329
+    _ev("BF1 LEDGER %s / %s / %s / retain %s: %s; covered %s, retained %s, residual %s items per pass; completed share "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_ledger_check_rounds
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:969: Evidence: BF1 LEDGER CHECK: {'demand': 846, 'hit_cache': 645, 'hit_retained': 141, 'miss_verifier_only': 60, 'miss_req_incomplete': 0, 'miss_lost': 0, 'lost_tagged': 0, 'retain_protected': 227, 'retain_overflow': 0, 'addr_ok': 141, 'addr_bad': 0, 'requested': 1385, 'completed': 461, 'completed_before_deadline': 461}; keep check {'overflow': 0, 'dup': 0, 'missing': 0, 'bytes_bad': 0, 'bytes_checked': 846, 'win_checked': 793}
+    _ev("BF1 LEDGER CHECK: %s; keep check %s" % (lg["totals"], ck))
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_retention_pressure[False]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:989: Evidence: BF1 RETENTION kslots 6 retain False: lost_tagged 12, miss_lost 6, protected 0, overflow 0; covered 0.4255; keep check {'overflow': 0, 'dup': 0, 'missing': 0, 'bytes_bad': 0, 'bytes_checked': 846, 'win_checked': 470}
+    _ev("BF1 RETENTION kslots %d retain %s: lost_tagged %d, miss_lost %d, protected %d, overflow %d; covered %s; keep "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_retention_pressure[True]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:989: Evidence: BF1 RETENTION kslots 6 retain True: lost_tagged 9, miss_lost 4, protected 197, overflow 9; covered 0.4267; keep check {'overflow': 0, 'dup': 0, 'missing': 0, 'bytes_bad': 0, 'bytes_checked': 846, 'win_checked': 469}
+    _ev("BF1 RETENTION kslots %d retain %s: lost_tagged %d, miss_lost %d, protected %d, overflow %d; covered %s; keep "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_lost_retention_plant
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:1009: Evidence: BF1 LOST-RETENTION PLANT: {'demand': 846, 'hit_cache': 572, 'hit_retained': 73, 'miss_verifier_only': 112, 'miss_req_incomplete': 0, 'miss_lost': 89, 'lost_tagged': 310, 'retain_protected': 0, 'retain_overflow': 0, 'addr_ok': 73, 'addr_bad': 0, 'requested': 1385, 'completed': 544, 'completed_before_deadline': 544}; keep check {'overflow': 0, 'dup': 0, 'missing': 0, 'bytes_bad': 0, 'bytes_checked': 846, 'win_checked': 623}
+    _ev("BF1 LOST-RETENTION PLANT: %s; keep check %s" % (tot, ck))
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_late_fetch_plant[complete]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:1025: Evidence: BF1 LATE-FETCH complete: passed 0, deferred committed 62, sent late 234; ledger {'demand': 846, 'hit_cache': 645, 'hit_retained': 141, 'miss_verifier_only': 60, 'miss_req_incomplete': 0, 'miss_lost': 0, 'lost_tagged': 0, 'retain_protected': 0, 'retain_overflow': 0, 'addr_ok': 141, 'addr_bad': 0, 'requested': 1385, 'completed': 461, 'completed_before_deadline': 227}
+    _ev("BF1 LATE-FETCH %s: passed %s, deferred committed %s, sent late %d; ledger %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_late_fetch_plant[defer0]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:1025: Evidence: BF1 LATE-FETCH defer0: passed 27, deferred committed 46, sent late 70; ledger {'demand': 846, 'hit_cache': 551, 'hit_retained': 47, 'miss_verifier_only': 123, 'miss_req_incomplete': 125, 'miss_lost': 0, 'lost_tagged': 0, 'retain_protected': 0, 'retain_overflow': 0, 'addr_ok': 47, 'addr_bad': 0, 'requested': 1385, 'completed': 143, 'completed_before_deadline': 143}
+    _ev("BF1 LATE-FETCH %s: passed %s, deferred committed %s, sent late %d; ledger %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_verifier_only_plant
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:1047: Evidence: BF1 VERIFIER-ONLY PLANT: {'demand': 846, 'hit_cache': 507, 'hit_retained': 0, 'miss_verifier_only': 339, 'miss_req_incomplete': 0, 'miss_lost': 0, 'lost_tagged': 0, 'retain_protected': 0, 'retain_overflow': 0, 'addr_ok': 0, 'addr_bad': 0, 'requested': 0, 'completed': 0, 'completed_before_deadline': 0}
+    _ev("BF1 VERIFIER-ONLY PLANT: %s" % tot)
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_consumer_address_plant
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:1063: Evidence: BF1 ADDRESS PLANT: addr_ok 0, addr_bad 131, hit_retained 131; EQF False; BF False
+    _ev("BF1 ADDRESS PLANT: addr_ok %d, addr_bad %d, hit_retained %d; EQF %s; BF %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_step_script_bf1
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:1256: Evidence: BF1 STEP: cells ['bf1a', 'bf1b', 'bf1c', 'bf1m', 'bf1r'] parse
+    _ev("BF1 STEP: cells %s parse" % sorted(CELLS))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+23 passed, 33 deselected, 20 warnings in 1324.55s (0:22:04)

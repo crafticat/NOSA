@@ -1,0 +1,115 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+........s                                                                [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_pure
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:806: Evidence: J1F PURE: work per variant {'FORK': {'rows': 864, 'pages': 31104}, 'FORKT': {'rows': 864, 'pages': 31104}, 'FORKA1': {'rows': 864, 'pages': 31104}, 'FORKA2': {'rows': 864, 'pages': 31104}, 'FORKA3': {'rows': 864, 'pages': 31104}, 'FORK1R': {'rows': 216, 'pages': 27648}, 'NS1R1': {'rows': 216, 'pages': 27648}, 'NS1R1_CP': {'rows': 216, 'pages': 27648}, 'NS1R1_CO': {'rows': 0, 'pages': 0}, 'NS1x4': {'rows': 864, 'pages': 110592}, 'NS1x4_CP': {'rows': 864, 'pages': 110592}, 'NS1x4_CO': {'rows': 0, 'pages': 0}, 'FLASHU1': {'rows': 216, 'pages': 31104}, 'FLASHU1_CP': {'rows': 216, 'pages': 31104}, 'FLASHU1_CO': {'rows': 0, 'pages': 0}, 'NSRU': {'rows': 864, 'pages': 117504}, 'NSRU_CP': {'rows': 864, 'pages': 117504}, 'NSRU_CO': {'rows': 0, 'pages': 0}, 'RSM1': {'rows': 216, 'pages': 31104}, 'RSM2': {'rows': 432, 'pages': 31104}, 'RSM3': {'rows': 648, 'pages': 31104}, 'RSM4': {'rows': 864, 'pages': 31104}, 'RSQ1': {'rows': 216, 'pages': 31104}, 'RSQ2': {'rows': 432, 'pages': 31104}, 'RSQ4': {'rows': 864, 'pages': 31104}, 'FORK3D2': {'rows': 864, 'pages': 31104}, 'FORK3D4': {'rows': 864, 'pages': 31104}}; ratios {'FORK/FLASHU1': 2.0, 'FORK1R/NS1R1': 0.9375, 'FORK/NS1x4': 0.6316, 'FORKT/FORK': 0.9167, 'NSRU/FORK': 2.0833, 'FORKA1/FORK': 1.0, 'FORKA2/FORK': 1.0833, 'FORKA3/FORK': 1.1667, 'FORK/FLASHU1_CP': 0.5217, 'FORK1R/NS1R1_CP': 0.8824, 'FORK/NS1x4_CP': 0.6, 'NSRU_CP/FORK': 2.1667, 'FORK3D2/FORK': 0.9}
+    _ev("J1F PURE: work per variant %s; ratios %s" % (w, {k: v["ratio"] for k, v in s["ratios"].items()}))
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_nonfinite
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:909: Evidence: J1F NONFINITE: new NUM fails every plant (NaN/+Inf/-Inf x out/ref/both, 3 variants); the old accumulation passed 15 of 27 plants: [('FLASHU1', '-inf', 'both'), ('FLASHU1', 'inf', 'both'), ('FLASHU1', 'nan', 'both'), ('FLASHU1', 'nan', 'out'), ('FLASHU1', 'nan', 'ref'), ('FORK', '-inf', 'both'), ('FORK', 'inf', 'both'), ('FORK', 'nan', 'both'), ('FORK', 'nan', 'out'), ('FORK', 'nan', 'ref'), ('NS1R1', '-inf', 'both'), ('NS1R1', 'inf', 'both'), ('NS1R1', 'nan', 'both'), ('NS1R1', 'nan', 'out'), ('NS1R1', 'nan', 'ref')]
+    _ev("J1F NONFINITE: new NUM fails every plant (NaN/+Inf/-Inf x out/ref/both, 3 variants); the old accumulation "
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_best3d_validity
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:941: Evidence: J1F BEST3D: FORK invalid -> saving suppressed (old source reported 4.0 ms)
+    _ev("J1F BEST3D: FORK invalid -> saving suppressed (old source reported %s ms)" % so["best_3d"]["saving_ms_per_pass"])
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_rows_sweep_pure
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:983: Evidence: J1F ROWS: rows sweep plumbing; planted value / NaN detected
+    _ev("J1F ROWS: rows sweep plumbing; planted value / NaN detected")
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_ncu_plumbing
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1043: Evidence: J1F NCU: argv ['/n/ncu', '--profile-from-start', 'off', '--replay-mode', 'kernel', '--cache-control', 'all', '--clock-control', 'none', '--metrics', 'gpu__time_duration.sum,dram__bytes_read.sum,lts__t_sectors_srcunit_tex_op_read.sum,sm__warps_active.avg.pct_of_peak_sustained_active,sm__warps_active.avg.per_cycle_active,launch__registers_per_thread', '--section'] ... ; summary {'n_kernels': 2, 'kernels': ['kernel_unified_attention'], 'time_us': 1500.0, 'dram_read': 1050000000.0, 'l2sm_bytes': 1344000000.0, 'logical_bytes': 1000000000, 'dram_over_logical': 1.05, 'l2sm_over_logical': 1.344, 'occupancy_pct': 12.4, 'warps_per_cycle': None, 'registers': 255.0, 'limit_registers': None, 'limit_shared': None}
+    _ev("J1F NCU: argv %s ... ; summary %s" % (argv[:12], s))
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_out_view
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1101: Evidence: J1F OUTVIEW: the direct call passes the out_ view at position 13 of the installed op /venv/nosa/lib/python3.10/site-packages/flash_attn_nosa/__init__.py; layout = the op's return
+    _ev("J1F OUTVIEW: the direct call passes the out_ view at position 13 of the installed op %s; layout = the op's "
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_timing_plumbing
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1144: Evidence: J1F TIMING: fake-timer plumbing; flash split {'direct_e2e_ms_pass': 20.0, 'copy_only_ms_pass': 1.5, 'total_j1f_form_ms_pass': 24.0, 'residual_ms_pass': 2.5, 'valid': True}
+    _ev("J1F TIMING: fake-timer plumbing; flash split %s" % s["flash_timing"]["NS1R1"])
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_ahead_interp
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1325: Evidence: J1 AHEAD INTERP:
+  REF tile 64: max |fork - float64| 7.89e-08
+  EQ tile 64 bias ahead 0 build: bitwise True (0 differ)
+  EQ tile 64 bias ahead 0 table: bitwise True (0 differ)
+  EQ tile 64 bias ahead 1 build: bitwise True (0 differ)
+  EQ tile 64 bias ahead 1 table: bitwise True (0 differ)
+  EQ tile 64 bias ahead 2 build: bitwise True (0 differ)
+  EQ tile 64 bias ahead 2 table: bitwise True (0 differ)
+  EQ tile 64 bias ahead 3 build: bitwise True (0 differ)
+  EQ tile 64 bias ahead 3 table: bitwise True (0 differ)
+  ROWS tile 64 bias n 1 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  ROWS tile 64 bias n 1 BLOCK_Q 1: rows = the 4-row read's rows bitwise True
+  ROWS tile 64 bias n 2 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  ROWS tile 64 bias n 2 BLOCK_Q 2: rows = the 4-row read's rows bitwise True
+  ROWS tile 64 bias n 3 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  ROWS tile 64 bias n 4 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  PLANT stale page tile 64 bias: 6144 values differ
+  REPORT swapped order tile 64 bias: 2257 values differ, max |d| 5.96e-08
+  EQ tile 64 nobias ahead 0 build: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 0 table: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 1 build: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 1 table: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 2 build: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 2 table: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 3 build: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 3 table: bitwise True (0 differ)
+  ROWS tile 64 nobias n 1 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  ROWS tile 64 nobias n 1 BLOCK_Q 1: rows = the 4-row read's rows bitwise True
+  ROWS tile 64 nobias n 2 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  ROWS tile 64 nobias n 2 BLOCK_Q 2: rows = the 4-row read's rows bitwise True
+  ROWS tile 64 nobias n 3 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  ROWS tile 64 nobias n 4 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  PLANT stale page tile 64 nobias: 6144 values differ
+  REPORT swapped order tile 64 nobias: 2200 values differ, max |d| 5.22e-08
+  REF tile 32: max |fork - float64| 7.57e-08
+  EQ tile 32 bias ahead 0 build: bitwise True (0 differ)
+  EQ tile 32 bias ahead 0 table: bitwise True (0 differ)
+  EQ tile 32 bias ahead 1 build: bitwise True (0 differ)
+  EQ tile 32 bias ahead 1 table: bitwise True (0 differ)
+  EQ tile 32 bias ahead 2 build: bitwise True (0 differ)
+  EQ tile 32 bias ahead 2 table: bitwise True (0 differ)
+  EQ tile 32 bias ahead 3 build: bitwise True (0 differ)
+  EQ tile 32 bias ahead 3 table: bitwise True (0 differ)
+  ROWS tile 32 bias n 1 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  ROWS tile 32 bias n 1 BLOCK_Q 1: rows = the 4-row read's rows bitwise True
+  ROWS tile 32 bias n 2 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  ROWS tile 32 bias n 2 BLOCK_Q 2: rows = the 4-row read's rows bitwise True
+  ROWS tile 32 bias n 3 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  ROWS tile 32 bias n 4 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  PLANT stale page tile 32 bias: 6144 values differ
+  REPORT swapped order tile 32 bias: 2208 values differ, max |d| 5.22e-08
+  EQ tile 32 nobias ahead 0 build: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 0 table: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 1 build: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 1 table: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 2 build: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 2 table: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 3 build: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 3 table: bitwise True (0 differ)
+  ROWS tile 32 nobias n 1 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  ROWS tile 32 nobias n 1 BLOCK_Q 1: rows = the 4-row read's rows bitwise True
+  ROWS tile 32 nobias n 2 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  ROWS tile 32 nobias n 2 BLOCK_Q 2: rows = the 4-row read's rows bitwise True
+  ROWS tile 32 nobias n 3 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  ROWS tile 32 nobias n 4 BLOCK_Q 4: rows = the 4-row read's rows bitwise True
+  PLANT stale page tile 32 nobias: 6144 values differ
+  REPORT swapped order tile 32 nobias: 2344 values differ, max |d| 4.47e-08
+  AHEAD-INTERP OK
+    _ev("J1 AHEAD INTERP:\n" + r.stdout.strip())
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] benchmarks/Efficiency/tests_cpu/test_j1.py:1647: not a clean checkout of /mnt/beegfs/ojerbi/nosi-r2-j1: the full DRYRUN needs one
+8 passed, 1 skipped, 20 deselected, 8 warnings in 41.71s

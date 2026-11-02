@@ -1,0 +1,61 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+..F...                                                                   [100%]
+=================================== FAILURES ===================================
+________________________ test_forkbench_best3d_validity ________________________
+
+    def test_forkbench_best3d_validity():
+        """REVIEW 5: the 3D saving follows the ratios' validity rule. PLANT: FORK invalid -> best_3d None, the note says
+        INVALID and the decision line is SUPPRESSED (no number); the j1f source (cd0e286) still reported the saving (the
+        control is not a no-op). The fastest 3D member invalid -> it is not chosen. FORK - FLASHU1 likewise."""
+        FB = _mod("r2_j1_forkbench")
+        OLD = _fb_old()
+        segs = (2, 4)
+        times = {"FORK": [32.0] * 3, "FLASHU1": [20.0] * 3, "FORK3D2": [28.0] * 3, "FORK3D4": [30.0] * 3}
+        ok = {v: True for v in times}
+        s = FB.summarize(times, 216, 32, ok, segs)
+        assert s["best_3d"]["variant"] == "FORK3D2" and s["best_3d"]["saving_ms_per_pass"] == 4.0 and s["best_3d_note"] is None
+        bad = dict(ok, FORK=False)                                                # PLANT: FORK invalid
+        s = FB.summarize(times, 216, 32, bad, segs)
+        assert s["best_3d"] is None and s["best_3d_note"].startswith("INVALID: FORK")
+        assert "fork_minus_flashu1_ms_per_pass" not in s
+        lines = FB.decision_lines("C128_B216", s)
+        assert [x for x in lines if "best 3D SUPPRESSED (INVALID: FORK" in x]
+>       assert not [x for x in lines if "saving_ms_per_pass" in x or "FORK3D2" in x], lines         # no number printed
+E       AssertionError: ["J1F C128_B216 RATIO FORK/FLASHU1 = 1.6 (equal logical bytes (union 72): the 4-row tile's cost at the same bytes) INV...id or missing)', 'J1F C128_B216 best 3D SUPPRESSED (INVALID: FORK failed NUM or EXACT (or did not run): no 3D saving)']
+E       assert not ['J1F C128_B216 RATIO FORK3D2/FORK = 0.875 (the 3D split (2 segments) vs the 2D launch) INVALID']
+
+benchmarks/Efficiency/tests_cpu/test_j1.py:931: AssertionError
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_pure
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:806: Evidence: J1F PURE: work per variant {'FORK': {'rows': 864, 'pages': 31104}, 'FORKT': {'rows': 864, 'pages': 31104}, 'FORKA1': {'rows': 864, 'pages': 31104}, 'FORKA2': {'rows': 864, 'pages': 31104}, 'FORKA3': {'rows': 864, 'pages': 31104}, 'FORK1R': {'rows': 216, 'pages': 27648}, 'NS1R1': {'rows': 216, 'pages': 27648}, 'NS1R1_CP': {'rows': 216, 'pages': 27648}, 'NS1R1_CO': {'rows': 0, 'pages': 0}, 'NS1x4': {'rows': 864, 'pages': 110592}, 'NS1x4_CP': {'rows': 864, 'pages': 110592}, 'NS1x4_CO': {'rows': 0, 'pages': 0}, 'FLASHU1': {'rows': 216, 'pages': 31104}, 'FLASHU1_CP': {'rows': 216, 'pages': 31104}, 'FLASHU1_CO': {'rows': 0, 'pages': 0}, 'NSRU': {'rows': 864, 'pages': 117504}, 'NSRU_CP': {'rows': 864, 'pages': 117504}, 'NSRU_CO': {'rows': 0, 'pages': 0}, 'FORK3D2': {'rows': 864, 'pages': 31104}, 'FORK3D4': {'rows': 864, 'pages': 31104}}; ratios {'FORK/FLASHU1': 2.0, 'FORK1R/NS1R1': 0.9375, 'FORK/NS1x4': 0.6316, 'FORKT/FORK': 0.9167, 'NSRU/FORK': 2.0833, 'FORKA1/FORK': 1.0, 'FORKA2/FORK': 1.0833, 'FORKA3/FORK': 1.1667, 'FORK/FLASHU1_CP': 0.5217, 'FORK1R/NS1R1_CP': 0.8824, 'FORK/NS1x4_CP': 0.6, 'NSRU_CP/FORK': 2.1667, 'FORK3D2/FORK': 0.9}
+    _ev("J1F PURE: work per variant %s; ratios %s" % (w, {k: v["ratio"] for k, v in s["ratios"].items()}))
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_nonfinite
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:909: Evidence: J1F NONFINITE: new NUM fails every plant (NaN/+Inf/-Inf x out/ref/both, 3 variants); the old accumulation passed 15 of 27 plants: [('FLASHU1', '-inf', 'both'), ('FLASHU1', 'inf', 'both'), ('FLASHU1', 'nan', 'both'), ('FLASHU1', 'nan', 'out'), ('FLASHU1', 'nan', 'ref'), ('FORK', '-inf', 'both'), ('FORK', 'inf', 'both'), ('FORK', 'nan', 'both'), ('FORK', 'nan', 'out'), ('FORK', 'nan', 'ref'), ('NS1R1', '-inf', 'both'), ('NS1R1', 'inf', 'both'), ('NS1R1', 'nan', 'both'), ('NS1R1', 'nan', 'out'), ('NS1R1', 'nan', 'ref')]
+    _ev("J1F NONFINITE: new NUM fails every plant (NaN/+Inf/-Inf x out/ref/both, 3 variants); the old accumulation "
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_out_view
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:998: Evidence: J1F OUTVIEW: the direct call passes the out_ view at position 13 of the installed op /venv/nosa/lib/python3.10/site-packages/flash_attn_nosa/__init__.py; layout = the op's return
+    _ev("J1F OUTVIEW: the direct call passes the out_ view at position 13 of the installed op %s; layout = the op's "
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_timing_plumbing
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1041: Evidence: J1F TIMING: fake-timer plumbing; flash split {'direct_e2e_ms_pass': 20.0, 'copy_only_ms_pass': 1.5, 'total_j1f_form_ms_pass': 24.0, 'residual_ms_pass': 2.5, 'valid': True}
+    _ev("J1F TIMING: fake-timer plumbing; flash split %s" % s["flash_timing"]["NS1R1"])
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_ahead_copy
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1061: Evidence: J1 AHEAD COPY: 70 tagged lines, 8 re-indented fork lines
+    _ev("J1 AHEAD COPY: %d tagged lines, %d re-indented fork lines" % (len(tagged), len(moved)))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_best3d_validity
+1 failed, 5 passed, 21 deselected, 5 warnings in 4.06s

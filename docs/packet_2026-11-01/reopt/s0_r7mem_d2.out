@@ -1,0 +1,80 @@
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/recon7_mem1_2195630_r7mem/summary.json
+/fit/B_fit = 322
+/fit/B_fit_usable = 321
+/fit/B_line = 322
+/fit/C = 81
+/fit/anchor_fits = True
+/fit/arena_next_GB = 0.181191
+/fit/binding = 'prefill'
+/fit/budget_GB = 84.0
+/fit/decode_at_fit = 83.1223
+/fit/decode_line : list[2] head [16.454195, 0.2070437]
+/fit/floor_B = 0
+/fit/headroom_GB = 0.1512
+/fit/int32_limit = 502
+/fit/margin_GB = 0.1
+/fit/margins/0.00 = 322
+/fit/margins/0.10 = 322
+/fit/margins/0.25 = 321
+/fit/peak_at_anchor_GB = 76.8022
+/fit/peak_at_fit = 83.8488
+/fit/peak_next = 84.0501
+/fit/points/decode : list[2]
+/fit/points/prefill : list[2]
+/fit/prefill_at_fit = 83.8488
+/fit/prefill_line : list[2] head [19.0201, 0.2013312]
+/fit/r3_model_bfit : list[2] head [321.5, 322.8]
+/fit/sh_beside = True
+/fit/sh_fit = None
+/fit/slope_binding = 0.2013312
+/gates : list[38]
+/gates[0]/detail = '/mnt/beegfs/ojerbi/nosi-r2-recon7/benchmarks/Efficiency/fork_vllm_unified_attention.py (blob pinned by the step: f0dc0c183a388585e216505a6bbfc696531e8add)'
+/gates[0]/must = True
+/gates[0]/name = 'C0_FORK'
+/gates[0]/passed = True
+/meta/S0 = 16128
+/meta/anchor_B = 287
+/meta/base_commit = '6d711c46c84def2d8dff575238116968fa688aed'
+/meta/batches : list[2] head [64, 192]
+/meta/budget_GB = 84.0
+/meta/capacity_C = 81
+/meta/cell = 'r7mem'
+/meta/dims/D = 128
+/meta/dims/H = 2
+/meta/dims/L = 32
+/meta/dims/block_bytes = 32896
+/meta/dims/topk = 64
+/meta/fork_blob = 'f0dc0c183a388585e216505a6bbfc696531e8add'
+/meta/grant = '2026-10-31T11:43:54Z'
+/meta/host_mem/after_L4PTFD_B192 : dict[4]
+/meta/host_mem/after_L4PTFD_B64 : dict[4]
+/meta/host_mem/after_SH_B192 : dict[4]
+/meta/host_mem/after_SH_B64 : dict[4]
+/meta/host_mem/after_load : dict[4]
+/meta/margin_GB = 0.1
+/meta/opt/K = 3
+/meta/opt/arm = 'L4PTFD'
+/meta/opt/body = 'fused'
+/meta/opt/check_every = 0
+/meta/opt/fork_store = 0
+/meta/opt/graph = True
+/meta/opt/journal = 256
+/meta/opt/prefill_hook = 'nocopy'
+/meta/opt/probe_every = 16
+/meta/opt/redirect = True
+/meta/opt/tu_gemm = 'natural'
+/meta/opt/twin = 'fused'
+/meta/pool_blocks = 18
+/meta/probe_rounds = 49
+/meta/r3_model_bfit : list[2] head [321.5, 322.8]
+/meta/steps = 512
+/meta/usable_r3_GB = 83.75
+/meta/workload_sha256 = 'a25d1e16592c72d40550a3a05a2ac7673df0b57ce7fb1e9293f1451de4c8a0ce'
+/per_batch/192/ARM : dict[38]
+/per_batch/192/SH : dict[8]
+/per_batch/192/occupancy : dict[8]
+/per_batch/192/probe_check : dict[7]
+/per_batch/64/ARM : dict[38]
+/per_batch/64/SH : dict[8]
+/per_batch/64/occupancy : dict[8]
+/per_batch/64/probe_check : dict[7]

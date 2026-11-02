@@ -1,0 +1,98 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+......................                                                   [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_gilfree[inline]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:460: Evidence: BF1 GILFREE inline: NEW 712 -> 94; sent 461, committed 461, used 299, late 0; transport {'releases': 62, 'groups': 461, 'chunks': 62, 'pack_ns': 6615259, 'threads_min': 2, 'threads_max': 2}
+    _ev("BF1 GILFREE %s: NEW %d -> %d; sent %d, committed %d, used %d, late %d; transport %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_gilfree[thread]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:460: Evidence: BF1 GILFREE thread: NEW 712 -> 94; sent 461, committed 461, used 299, late 0; transport {'releases': 62, 'groups': 461, 'chunks': 62, 'pack_ns': 4645002, 'threads_min': 2, 'threads_max': 2}
+    _ev("BF1 GILFREE %s: NEW %d -> %d; sent %d, committed %d, used %d, late %d; transport %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_gilfree_batch
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:492: Evidence: BF1 BATCH: jobs 120 in 33 batches (offered max 4; done per batch -> batches {'4': 29, '1': 4}; max 4 non-empty jobs, 2 layers); hold 3.3497634306550026 s; releases 23, chunks 461, groups 461; sent 461, used 299; worker ms per epoch {'worker_busy_s': 6.304, 'snap_s': 3.684, 'snap_first_s': 3.545, 'snap_rest_s': 0.003, 'ready_wait_s': 0.0, 'select_s': 0.721, 'entry_s': 0.004, 'cxx_s': 0.7, 'cxx_wait_s': 0.621, 'issue_s': 0.995, 'pack_s': 1.436, 'cxx_submit': 0.353, 'cxx_pack': 0.238}
+    _ev("BF1 BATCH: jobs %d in %d batches (offered max %s; done per batch -> batches %s; max %s non-empty jobs, %s "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_pipeline[newest]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:577: Evidence: BF1 PIPELINE newest: jobs 120, batches 120, pipelined 48, overlapped 46; issued 62, deferred 60, late 0; worker ms per epoch {'worker_busy_s': 65.977, 'snap_s': 3.537, 'snap_first_s': 3.229, 'snap_rest_s': 0.0, 'ready_wait_s': 0.0, 'select_s': 1.777, 'entry_s': 0.009, 'cxx_s': 104.157, 'cxx_wait_s': 59.731, 'issue_s': 0.305, 'pack_s': 105.827, 'cxx_submit': 0.549, 'cxx_pack': 0.113}
+    _ev("BF1 PIPELINE %s: jobs %d, batches %d, pipelined %s, overlapped %s; issued %d, deferred %s, late %d; worker ms "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_pipeline[ready]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:577: Evidence: BF1 PIPELINE ready: jobs 120, batches 120, pipelined 48, overlapped 46; issued 62, deferred 60, late 0; worker ms per epoch {'worker_busy_s': 63.071, 'snap_s': 0.631, 'snap_first_s': 0.007, 'snap_rest_s': 0.0, 'ready_wait_s': 0.0, 'select_s': 1.772, 'entry_s': 0.009, 'cxx_s': 104.129, 'cxx_wait_s': 59.723, 'issue_s': 0.319, 'pack_s': 105.822, 'cxx_submit': 0.435, 'cxx_pack': 0.124}
+    _ev("BF1 PIPELINE %s: jobs %d, batches %d, pipelined %s, overlapped %s; issued %d, deferred %s, late %d; worker ms "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_ready_only[ready]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:648: Evidence: BF1 READY-ONLY ready: jobs 120, batches 120 (sizes {'1': 120}), taken 120, unready taken 0 (record 0), polls 1614; worker ms per epoch {'worker_busy_s': 452.713, 'snap_s': 221.718, 'snap_first_s': 221.464, 'snap_rest_s': 0.0, 'ready_wait_s': 57.76, 'select_s': 0.897, 'entry_s': 0.008, 'cxx_s': 103.769, 'cxx_wait_s': 34.527, 'issue_s': 137.223, 'pack_s': 104.7, 'cxx_submit': 0.372, 'cxx_pack': 0.168}
+    _ev("BF1 READY-ONLY %s: jobs %d, batches %d (sizes %s), taken %d, unready taken %d (record %s), polls %s; worker ms "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_ready_only[newest]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:648: Evidence: BF1 READY-ONLY newest: jobs 120, batches 31 (sizes {'4': 29, '2': 2}), taken 120, unready taken 120 (record 120), polls 0; worker ms per epoch {'worker_busy_s': 330.359, 'snap_s': 294.412, 'snap_first_s': 181.373, 'snap_rest_s': 112.682, 'ready_wait_s': 0.0, 'select_s': 0.554, 'entry_s': 0.003, 'cxx_s': 38.421, 'cxx_wait_s': 35.091, 'issue_s': 0.075, 'pack_s': 38.972, 'cxx_submit': 0.466, 'cxx_pack': 0.104}
+    _ev("BF1 READY-ONLY %s: jobs %d, batches %d (sizes %s), taken %d, unready taken %d (record %s), polls %s; worker ms "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_lifetimes[ready-None]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:738: Evidence: BF1 LIFETIMES ready plant None: snapshot accesses 240, staging writes 240, violations 0 []; batches 90, deferred 15
+    _ev("BF1 LIFETIMES %s plant %s: snapshot accesses %d, staging writes %d, violations %d %s; batches %d, deferred %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_lifetimes[newest-None]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:738: Evidence: BF1 LIFETIMES newest plant None: snapshot accesses 240, staging writes 190, violations 0 []; batches 61, deferred 54
+    _ev("BF1 LIFETIMES %s plant %s: snapshot accesses %d, staging writes %d, violations %d %s; batches %d, deferred %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_lifetimes[ready-no_stage_wait]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:738: Evidence: BF1 LIFETIMES ready plant no_stage_wait: snapshot accesses 240, staging writes 240, violations 50 ['staging reused before its H2D']; batches 90, deferred 14
+    _ev("BF1 LIFETIMES %s plant %s: snapshot accesses %d, staging writes %d, violations %d %s; batches %d, deferred %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_lifetimes[newest-no_snap_wait]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:738: Evidence: BF1 LIFETIMES newest plant no_snap_wait: snapshot accesses 240, staging writes 190, violations 60 ['snap read before its event']; batches 62, deferred None
+    _ev("BF1 LIFETIMES %s plant %s: snapshot accesses %d, staging writes %d, violations %d %s; batches %d, deferred %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_arrival_modes[off-drop-newest-torch]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:773: Evidence: BF1 ARRIVAL off / drop / newest / torch: {'batches': 0, 'batches_deferred': 0, 'items_sent_early': 0, 'items_sent_late': 0, 'items_sent_nodeadline': 0, 'items_useful_store_early': 0, 'items_useful_store_late': 0, 'useful_store_counted': 0, 'window_uses_acct': 0, 'useful_early_share_store': None, 'margin_ms_useful_store': None, 'deferred_wait_and_commit': None, 'host': None, 'memory': None}
+    _ev("BF1 ARRIVAL %s / %s / %s / %s: %s" % (mode, late, snap, packer, {k: ar.get(k) for k in (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_arrival_modes[ce-drop-newest-torch]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:773: Evidence: BF1 ARRIVAL ce / drop / newest / torch: {'batches': 62, 'batches_deferred': 0, 'items_sent_early': 461, 'items_sent_late': 0, 'items_sent_nodeadline': 0, 'items_useful_store_early': 141, 'items_useful_store_late': 0, 'useful_store_counted': 141, 'window_uses_acct': 158, 'useful_early_share_store': 1.0, 'margin_ms_useful_store': {'p05': 71.94, 'p50': 464.327, 'p95': 5096.961, 'min': 69.972, 'max': 5096.961}, 'deferred_wait_and_commit': {'jobs': 0, 'ms_total': 0, 'ms_per_joint_pass': 0.0}, 'host': {'draft': {'busy_ms': 12.069, 'wait_ms': 6.669, 'host_active_ms': 5.4, 'windows': 29}, 'joint': {'busy_ms': 0.0, 'wait_ms': 0.0, 'host_active_ms': 0.0, 'windows': 29}}, 'memory': {'pbid_bytes': 16512, 'counter_bytes_per_epoch': 2056, 'epochs_kept': 30, 'counter_bytes_total': 61680, 'ledger_bitmap_bytes': 7312, 'ledger_bytes_per_epoch': 104}}
+    _ev("BF1 ARRIVAL %s / %s / %s / %s: %s" % (mode, late, snap, packer, {k: ar.get(k) for k in (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_arrival_modes[ce-drop-ready-torch]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:773: Evidence: BF1 ARRIVAL ce / drop / ready / torch: {'batches': 62, 'batches_deferred': 0, 'items_sent_early': 461, 'items_sent_late': 0, 'items_sent_nodeadline': 0, 'items_useful_store_early': 141, 'items_useful_store_late': 0, 'useful_store_counted': 141, 'window_uses_acct': 158, 'useful_early_share_store': 1.0, 'margin_ms_useful_store': {'p05': 73.122, 'p50': 198.461, 'p95': 5127.025, 'min': 70.139, 'max': 5127.025}, 'deferred_wait_and_commit': {'jobs': 0, 'ms_total': 0, 'ms_per_joint_pass': 0.0}, 'host': {'draft': {'busy_ms': 5.292, 'wait_ms': 0.206, 'host_active_ms': 5.086, 'windows': 29}, 'joint': {'busy_ms': 0.0, 'wait_ms': 0.0, 'host_active_ms': 0.0, 'windows': 29}}, 'memory': {'pbid_bytes': 16512, 'counter_bytes_per_epoch': 2056, 'epochs_kept': 30, 'counter_bytes_total': 61680, 'ledger_bitmap_bytes': 7312, 'ledger_bytes_per_epoch': 104}}
+    _ev("BF1 ARRIVAL %s / %s / %s / %s: %s" % (mode, late, snap, packer, {k: ar.get(k) for k in (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_arrival_modes[ce-defer-newest-torch]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:773: Evidence: BF1 ARRIVAL ce / defer / newest / torch: {'batches': 62, 'batches_deferred': 0, 'items_sent_early': 461, 'items_sent_late': 0, 'items_sent_nodeadline': 0, 'items_useful_store_early': 141, 'items_useful_store_late': 0, 'useful_store_counted': 141, 'window_uses_acct': 158, 'useful_early_share_store': 1.0, 'margin_ms_useful_store': {'p05': 72.045, 'p50': 194.763, 'p95': 5131.613, 'min': 69.29, 'max': 5131.613}, 'deferred_wait_and_commit': {'jobs': 0, 'ms_total': 0, 'ms_per_joint_pass': 0.0}, 'host': {'draft': {'busy_ms': 12.056, 'wait_ms': 6.593, 'host_active_ms': 5.463, 'windows': 29}, 'joint': {'busy_ms': 0.0, 'wait_ms': 0.0, 'host_active_ms': 0.0, 'windows': 29}}, 'memory': {'pbid_bytes': 16512, 'counter_bytes_per_epoch': 2056, 'epochs_kept': 30, 'counter_bytes_total': 61680, 'ledger_bitmap_bytes': 7312, 'ledger_bytes_per_epoch': 104}}
+    _ev("BF1 ARRIVAL %s / %s / %s / %s: %s" % (mode, late, snap, packer, {k: ar.get(k) for k in (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_arrival_modes[ce-defer-ready-torch]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:773: Evidence: BF1 ARRIVAL ce / defer / ready / torch: {'batches': 62, 'batches_deferred': 0, 'items_sent_early': 461, 'items_sent_late': 0, 'items_sent_nodeadline': 0, 'items_useful_store_early': 141, 'items_useful_store_late': 0, 'useful_store_counted': 141, 'window_uses_acct': 158, 'useful_early_share_store': 1.0, 'margin_ms_useful_store': {'p05': 71.256, 'p50': 194.968, 'p95': 5117.544, 'min': 68.969, 'max': 5117.544}, 'deferred_wait_and_commit': {'jobs': 0, 'ms_total': 0, 'ms_per_joint_pass': 0.0}, 'host': {'draft': {'busy_ms': 5.783, 'wait_ms': 0.217, 'host_active_ms': 5.566, 'windows': 29}, 'joint': {'busy_ms': 0.0, 'wait_ms': 0.0, 'host_active_ms': 0.0, 'windows': 29}}, 'memory': {'pbid_bytes': 16512, 'counter_bytes_per_epoch': 2056, 'epochs_kept': 30, 'counter_bytes_total': 61680, 'ledger_bitmap_bytes': 7312, 'ledger_bytes_per_epoch': 104}}
+    _ev("BF1 ARRIVAL %s / %s / %s / %s: %s" % (mode, late, snap, packer, {k: ar.get(k) for k in (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_arrival_modes[ce-defer-ready-gilfree]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:773: Evidence: BF1 ARRIVAL ce / defer / ready / gilfree: {'batches': 62, 'batches_deferred': 0, 'items_sent_early': 461, 'items_sent_late': 0, 'items_sent_nodeadline': 0, 'items_useful_store_early': 141, 'items_useful_store_late': 0, 'useful_store_counted': 141, 'window_uses_acct': 158, 'useful_early_share_store': 1.0, 'margin_ms_useful_store': {'p05': 72.162, 'p50': 196.681, 'p95': 5085.647, 'min': 68.897, 'max': 5085.647}, 'deferred_wait_and_commit': {'jobs': 0, 'ms_total': 0, 'ms_per_joint_pass': 0.0}, 'host': {'draft': {'busy_ms': 5.559, 'wait_ms': 1.315, 'host_active_ms': 4.244, 'windows': 29}, 'joint': {'busy_ms': 0.0, 'wait_ms': 0.0, 'host_active_ms': 0.0, 'windows': 29}}, 'memory': {'pbid_bytes': 16512, 'counter_bytes_per_epoch': 2056, 'epochs_kept': 30, 'counter_bytes_total': 61680, 'ledger_bitmap_bytes': 7312, 'ledger_bytes_per_epoch': 104}}
+    _ev("BF1 ARRIVAL %s / %s / %s / %s: %s" % (mode, late, snap, packer, {k: ar.get(k) for k in (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_arrival_late
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:825: Evidence: BF1 ARRIVAL LATE: stall: sent early 227 / late 234 (independent 227 / 234), useful early 68 / late 73, late ms mean 786.576, margins {'p05': -948.921, 'p50': -547.038, 'p95': 4955.173, 'min': -948.921, 'max': 4955.173}; control (inline): early 461, late 0
+    _ev("BF1 ARRIVAL LATE: stall: sent early %d / late %d (independent %d / %d), useful early %d / late %d, late ms "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_arrival_store_only
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:851: Evidence: BF1 ARRIVAL STORE-ONLY: acct True: used store 141, window-only 158, unused 162, arrival useful store 141 (share 1.0), window_uses_acct 158; acct False: used store 141, window 0, unused 320, arrival useful store 141 (share 1.0), window_uses_acct None
+    _ev("BF1 ARRIVAL STORE-ONLY: acct True: used store %d, window-only %d, unused %d, arrival useful store %d (share %s), "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_worker_failure[query]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:913: Evidence: BF1 WORKER FAILURE query: raised BFError('BF1 worker failed: RuntimeError: planted query failure\nTraceback (most recent call last):\n  File "/mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/r2_bf1_fetch.py", line 978, in _loop\n    self._loop_ready()\n  File "/mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/r2_bf1_fetch.py", line 1085, in _loop_ready\n    n = self._ready_count(pend)\n  File "/mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/r2_bf1_fetch.py", line 1136, in _ready_count\n    if job[0] is not ep0 or (ids is None and not self.snap_ev[job[2]].query()):\n  File "/mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py", line 882, in query\n    raise self.exc\nRuntimeError: planted query failure\n') (cause RuntimeError('planted query failure')); error 'RuntimeError: planted query failure\nTraceback (most recent call last):\n  File "/'; worker alive False; slots owned 0; inflight 0
+    _ev("BF1 WORKER FAILURE %s: raised %r (cause %r); error %r; worker alive %s; slots owned %d; inflight %d" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_worker_failure[sync]
+  /mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:913: Evidence: BF1 WORKER FAILURE sync: raised BFError('BF1 worker failed: RuntimeError: planted sync failure\nTraceback (most recent call last):\n  File "/mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/r2_bf1_fetch.py", line 978, in _loop\n    self._loop_ready()\n  File "/mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/r2_bf1_fetch.py", line 1092, in _loop_ready\n    self._wait_oldest(pend[0][0])    # nothing else to do\n  File "/mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/r2_bf1_fetch.py", line 1167, in _wait_oldest\n    self.snap_ev[job[2]].synchronize()\n  File "/mnt/beegfs/ojerbi/nosi-r2-int2-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py", line 887, in synchronize\n    raise self.exc\nRuntimeError: planted sync failure\n') (cause RuntimeError('planted sync failure')); error 'RuntimeError: planted sync failure\nTraceback (most recent call last):\n  File "/m'; worker alive False; slots owned 0; inflight 0
+    _ev("BF1 WORKER FAILURE %s: raised %r (cause %r); error %r; worker alive %s; slots owned %d; inflight %d" % (
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+22 passed, 21 warnings in 1914.60s (0:31:54)

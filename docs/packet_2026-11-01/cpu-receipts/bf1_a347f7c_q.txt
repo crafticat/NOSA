@@ -1,0 +1,58 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+.............                                                            [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[off-torch-drop]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:375: Evidence: BF1 REPORT off / torch / drop: device 20640 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[off-gilfree-defer]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:375: Evidence: BF1 REPORT off / gilfree / defer: device 20640 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[ce-torch-drop]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:375: Evidence: BF1 REPORT ce / torch / drop: device 67967272 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[ce-torch-defer]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:375: Evidence: BF1 REPORT ce / torch / defer: device 67967272 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[ce-gilfree-drop]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:375: Evidence: BF1 REPORT ce / gilfree / drop: device 67967272 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_report_every_mode[ce-gilfree-defer]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:375: Evidence: BF1 REPORT ce / gilfree / defer: device 67967272 B, lanes per entry 2048
+    _ev("BF1 REPORT %s / %s / %s: device %d B, lanes per entry %s" % (mode, packer, late, rep["device_bytes"],
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_arrival_late
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:811: Evidence: BF1 ARRIVAL LATE: stall: sent early 286 / late 175 (independent 286 / 175), useful early 68 / late 73, late ms mean 670.742, margins {'p05': -700.503, 'p50': 353.089, 'p95': 5210.054, 'min': -700.503, 'max': 5210.054}; control (inline): early 461, late 0
+    _ev("BF1 ARRIVAL LATE: stall: sent early %d / late %d (independent %d / %d), useful early %d / late %d, late ms "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_arrival_store_only
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:837: Evidence: BF1 ARRIVAL STORE-ONLY: acct True: used store 141, window-only 158, unused 162, arrival useful store 141 (share 1.0), window_uses_acct 158; acct False: used store 141, window 0, unused 320, arrival useful store 141 (share 1.0), window_uses_acct None
+    _ev("BF1 ARRIVAL STORE-ONLY: acct True: used store %d, window-only %d, unused %d, arrival useful store %d (share %s), "
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_worker_failure[query]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:899: Evidence: BF1 WORKER FAILURE query: raised BFError('BF1 worker failed: RuntimeError: planted query failure\nTraceback (most recent call last):\n  File "/mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/r2_bf1_fetch.py", line 850, in _loop\n    self._loop_ready()\n  File "/mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/r2_bf1_fetch.py", line 957, in _loop_ready\n    n = self._ready_count(pend)\n  File "/mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/r2_bf1_fetch.py", line 1008, in _ready_count\n    if job[0] is not ep0 or (ids is None and not self.snap_ev[job[2]].query()):\n  File "/mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py", line 868, in query\n    raise self.exc\nRuntimeError: planted query failure\n') (cause RuntimeError('planted query failure')); error 'RuntimeError: planted query failure\nTraceback (most recent call last):\n  File "/'; worker alive False; slots owned 0; inflight 0
+    _ev("BF1 WORKER FAILURE %s: raised %r (cause %r); error %r; worker alive %s; slots owned %d; inflight %d" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_bf1_worker_failure[sync]
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:899: Evidence: BF1 WORKER FAILURE sync: raised BFError('BF1 worker failed: RuntimeError: planted sync failure\nTraceback (most recent call last):\n  File "/mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/r2_bf1_fetch.py", line 850, in _loop\n    self._loop_ready()\n  File "/mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/r2_bf1_fetch.py", line 964, in _loop_ready\n    self._wait_oldest(pend[0][0])    # nothing else to do\n  File "/mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/r2_bf1_fetch.py", line 1039, in _wait_oldest\n    self.snap_ev[job[2]].synchronize()\n  File "/mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py", line 873, in synchronize\n    raise self.exc\nRuntimeError: planted sync failure\n') (cause RuntimeError('planted sync failure')); error 'RuntimeError: planted sync failure\nTraceback (most recent call last):\n  File "/m'; worker alive False; slots owned 0; inflight 0
+    _ev("BF1 WORKER FAILURE %s: raised %r (cause %r); error %r; worker alive %s; slots owned %d; inflight %d" % (
+
+benchmarks/Efficiency/tests_cpu/test_bf1.py::test_step_script_bf1
+  /mnt/beegfs/ojerbi/nosi-r2-bf1-dev/benchmarks/Efficiency/tests_cpu/test_bf1.py:1085: Evidence: BF1 STEP: cells ['bf1a', 'bf1b', 'bf1m', 'bf1r'] parse
+    _ev("BF1 STEP: cells %s parse" % sorted(CELLS))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+13 passed, 32 deselected, 11 warnings in 590.81s (0:09:50)

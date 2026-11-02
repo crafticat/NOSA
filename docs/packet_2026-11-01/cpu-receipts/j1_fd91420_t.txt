@@ -1,0 +1,159 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+..........................s                                              [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_layer_copy
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:174: Evidence: J1 COPY: _layer = TentState._layer + 3 J1 lines (the R 1 delegation, the selection call); removed sel = VR._select_rows(plan.vs, layer, q, twin)
+    _ev("J1 COPY: _layer = TentState._layer + %d J1 lines (the R 1 delegation, the selection call); removed %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_pool_fn_equal
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:250: Evidence: J1 POOL: 12 variants (dtype, seed, init, local) bit-equal (eager and Inductor) to the kernel's stand-in and to pool_reference; dynamo {'unique_graphs': 6, 'frames_ok': 0, 'graph_breaks': 0, 'inductor_kernels': 6}
+    _ev("J1 POOL: %d variants (dtype, seed, init, local) bit-equal (eager and Inductor) to the kernel's stand-in and to "
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_equals[gudcd_timing]
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:382: Evidence: J1 gudcd_timing L4PTFDGUDCDJ1: rounds 14; joint passes 13; draft capture passes 2; J1 {'calls': 26, 'fallback': {}, 'events': [{'graphs': 1, 's': 0.184, 'layer': 0, 'capture': False, 'kind': 'draft_warm', 'joint_pass': 0}, {'graphs': 1, 's': 0.169, 'layer': 0, 'capture': False, 'kind': 'joint', 'joint_pass': 0}, {'graphs': 1, 's': 0.15, 'layer': 0, 'capture': False, 'kind': 'f6', 'joint_pass': 0}], 'compile_s': 0.503, 'peq_bad': 0, 'peq_vals': 60672, 'peq_layers': 6, 'draft': True, 'dlayers': 4, 'dwarm': 1, 'dpeq_bad': 0, 'dpeq_vals': 15168, 'dpeq_layers': 6, 'f6': True, 'f6calls': 10, 'backend': 'inductor', 'j1neg': None}
+    _ev("J1 %s %s: rounds %d; joint passes %d; draft capture passes %d; J1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_equals[gudcd_check]
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:382: Evidence: J1 gudcd_check L4PTFDGUDCDJ1: rounds 14; joint passes 13; draft capture passes 1; J1 {'calls': 26, 'fallback': {}, 'events': [], 'compile_s': 0.0, 'peq_bad': 0, 'peq_vals': 262912, 'peq_layers': 26, 'draft': True, 'dlayers': 2, 'dwarm': 1, 'dpeq_bad': 0, 'dpeq_vals': 131456, 'dpeq_layers': 52, 'f6': True, 'f6calls': 11, 'backend': 'inductor', 'j1neg': None}
+    _ev("J1 %s %s: rounds %d; joint passes %d; draft capture passes %d; J1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_equals[gudkcd_timing]
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:382: Evidence: J1 gudkcd_timing L4PTFDGUDKWCDJ1: rounds 14; joint passes 13; draft capture passes 2; J1 {'calls': 26, 'fallback': {}, 'events': [], 'compile_s': 0.0, 'peq_bad': 0, 'peq_vals': 60672, 'peq_layers': 6, 'draft': True, 'dlayers': 4, 'dwarm': 1, 'dpeq_bad': 0, 'dpeq_vals': 15168, 'dpeq_layers': 6, 'f6': True, 'f6calls': 10, 'backend': 'inductor', 'j1neg': None}
+    _ev("J1 %s %s: rounds %d; joint passes %d; draft capture passes %d; J1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_equals[gudkcd_check]
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:382: Evidence: J1 gudkcd_check L4PTFDGUDKWCDJ1: rounds 14; joint passes 13; draft capture passes 1; J1 {'calls': 26, 'fallback': {}, 'events': [], 'compile_s': 0.0, 'peq_bad': 0, 'peq_vals': 262912, 'peq_layers': 26, 'draft': True, 'dlayers': 2, 'dwarm': 1, 'dpeq_bad': 0, 'dpeq_vals': 131456, 'dpeq_layers': 52, 'f6': True, 'f6calls': 11, 'backend': 'inductor', 'j1neg': None}
+    _ev("J1 %s %s: rounds %d; joint passes %d; draft capture passes %d; J1 %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j1_plant_wrong_req
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:435: Evidence: J1 PLANT wrong_req: differs ['acc_hist', 'accepted', 'draft_calls', 'draft_skipped']; EQF False; PEQ bad 22832 of 60672; draft PEQ bad 9548 of 25280
+    _ev("J1 PLANT wrong_req: differs %s; EQF %s; PEQ bad %s of %s; draft PEQ bad %s of %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_loc_fn_equal
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:492: Evidence: J1 F6 LOC: 8 variants (seed, pool): loc_fn = I4CC loc1 on the sorted maps for every consumed value
+    _ev("J1 F6 LOC: %d variants (seed, pool): loc_fn = I4CC loc1 on the sorted maps for every consumed value" % n)
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_stamp_frame_equal
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:566: Evidence: J1 F3 FRAME: 40 calls x 2 layers bit-equal to the shipped stamps; export {'first': [1000, 1000], 'calls': [40, 40], 'stamps_ok': True}; plant (no shift) caught
+    _ev("J1 F3 FRAME: 40 calls x %d layers bit-equal to the shipped stamps; export %s; plant (no shift) caught" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_j3_equals
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:607: Evidence: J1 F3 timing: rounds 14; j3 {'joint_captures': 2, 'draft_layers': 4, 'delta_fixed': 4, 'frame': [{'first': [0, 0], 'calls': [42, 42], 'stamps_ok': True}]}; graph captures 2 warm 2 replays 18 eager {'marks': 6}; dgraph keys [[False, False, False], [True, False, False]] captures 8 capture passes 2 replay passes 23 eager {}
+    _ev("J1 F3 timing: rounds %d; j3 %s; graph captures %s warm %s replays %s eager %s; dgraph keys %s captures %s "
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_shpool_equal
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:665: Evidence: J1 SHPOOL: 10 variants bit-equal to the shipped kernel's stand-in; events [{'graphs': 1, 's': 0.649, 'B': 3, 'M': 20, 'capture': False}, {'graphs': 1, 's': 0.472, 'B': 3, 'M': 20, 'capture': False}]; plant caught 9
+    _ev("J1 SHPOOL: %d variants bit-equal to the shipped kernel's stand-in; events %s; plant caught %s" % (
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_pure
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:806: Evidence: J1F PURE: work per variant {'FORK': {'rows': 864, 'pages': 31104}, 'FORKT': {'rows': 864, 'pages': 31104}, 'FORKA1': {'rows': 864, 'pages': 31104}, 'FORKA2': {'rows': 864, 'pages': 31104}, 'FORKA3': {'rows': 864, 'pages': 31104}, 'FORK1R': {'rows': 216, 'pages': 27648}, 'NS1R1': {'rows': 216, 'pages': 27648}, 'NS1R1_CP': {'rows': 216, 'pages': 27648}, 'NS1R1_CO': {'rows': 0, 'pages': 0}, 'NS1x4': {'rows': 864, 'pages': 110592}, 'NS1x4_CP': {'rows': 864, 'pages': 110592}, 'NS1x4_CO': {'rows': 0, 'pages': 0}, 'FLASHU1': {'rows': 216, 'pages': 31104}, 'FLASHU1_CP': {'rows': 216, 'pages': 31104}, 'FLASHU1_CO': {'rows': 0, 'pages': 0}, 'NSRU': {'rows': 864, 'pages': 117504}, 'NSRU_CP': {'rows': 864, 'pages': 117504}, 'NSRU_CO': {'rows': 0, 'pages': 0}, 'FORK3D2': {'rows': 864, 'pages': 31104}, 'FORK3D4': {'rows': 864, 'pages': 31104}}; ratios {'FORK/FLASHU1': 2.0, 'FORK1R/NS1R1': 0.9375, 'FORK/NS1x4': 0.6316, 'FORKT/FORK': 0.9167, 'NSRU/FORK': 2.0833, 'FORKA1/FORK': 1.0, 'FORKA2/FORK': 1.0833, 'FORKA3/FORK': 1.1667, 'FORK/FLASHU1_CP': 0.5217, 'FORK1R/NS1R1_CP': 0.8824, 'FORK/NS1x4_CP': 0.6, 'NSRU_CP/FORK': 2.1667, 'FORK3D2/FORK': 0.9}
+    _ev("J1F PURE: work per variant %s; ratios %s" % (w, {k: v["ratio"] for k, v in s["ratios"].items()}))
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_nonfinite
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:909: Evidence: J1F NONFINITE: new NUM fails every plant (NaN/+Inf/-Inf x out/ref/both, 3 variants); the old accumulation passed 15 of 27 plants: [('FLASHU1', '-inf', 'both'), ('FLASHU1', 'inf', 'both'), ('FLASHU1', 'nan', 'both'), ('FLASHU1', 'nan', 'out'), ('FLASHU1', 'nan', 'ref'), ('FORK', '-inf', 'both'), ('FORK', 'inf', 'both'), ('FORK', 'nan', 'both'), ('FORK', 'nan', 'out'), ('FORK', 'nan', 'ref'), ('NS1R1', '-inf', 'both'), ('NS1R1', 'inf', 'both'), ('NS1R1', 'nan', 'both'), ('NS1R1', 'nan', 'out'), ('NS1R1', 'nan', 'ref')]
+    _ev("J1F NONFINITE: new NUM fails every plant (NaN/+Inf/-Inf x out/ref/both, 3 variants); the old accumulation "
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_best3d_validity
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:941: Evidence: J1F BEST3D: FORK invalid -> saving suppressed (old source reported 4.0 ms)
+    _ev("J1F BEST3D: FORK invalid -> saving suppressed (old source reported %s ms)" % so["best_3d"]["saving_ms_per_pass"])
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_out_view
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:999: Evidence: J1F OUTVIEW: the direct call passes the out_ view at position 13 of the installed op /venv/nosa/lib/python3.10/site-packages/flash_attn_nosa/__init__.py; layout = the op's return
+    _ev("J1F OUTVIEW: the direct call passes the out_ view at position 13 of the installed op %s; layout = the op's "
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_timing_plumbing
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1042: Evidence: J1F TIMING: fake-timer plumbing; flash split {'direct_e2e_ms_pass': 20.0, 'copy_only_ms_pass': 1.5, 'total_j1f_form_ms_pass': 24.0, 'residual_ms_pass': 2.5, 'valid': True}
+    _ev("J1F TIMING: fake-timer plumbing; flash split %s" % s["flash_timing"]["NS1R1"])
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_ahead_copy
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1062: Evidence: J1 AHEAD COPY: 70 tagged lines, 8 re-indented fork lines
+    _ev("J1 AHEAD COPY: %d tagged lines, %d re-indented fork lines" % (len(tagged), len(moved)))
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_ahead_interp
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1207: Evidence: J1 AHEAD INTERP:
+  REF tile 64: max |fork - float64| 7.89e-08
+  EQ tile 64 bias ahead 0 build: bitwise True (0 differ)
+  EQ tile 64 bias ahead 0 table: bitwise True (0 differ)
+  EQ tile 64 bias ahead 1 build: bitwise True (0 differ)
+  EQ tile 64 bias ahead 1 table: bitwise True (0 differ)
+  EQ tile 64 bias ahead 2 build: bitwise True (0 differ)
+  EQ tile 64 bias ahead 2 table: bitwise True (0 differ)
+  EQ tile 64 bias ahead 3 build: bitwise True (0 differ)
+  EQ tile 64 bias ahead 3 table: bitwise True (0 differ)
+  PLANT stale page tile 64 bias: 6144 values differ
+  REPORT swapped order tile 64 bias: 2257 values differ, max |d| 5.96e-08
+  EQ tile 64 nobias ahead 0 build: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 0 table: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 1 build: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 1 table: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 2 build: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 2 table: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 3 build: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 3 table: bitwise True (0 differ)
+  PLANT stale page tile 64 nobias: 6144 values differ
+  REPORT swapped order tile 64 nobias: 2200 values differ, max |d| 5.22e-08
+  REF tile 32: max |fork - float64| 7.57e-08
+  EQ tile 32 bias ahead 0 build: bitwise True (0 differ)
+  EQ tile 32 bias ahead 0 table: bitwise True (0 differ)
+  EQ tile 32 bias ahead 1 build: bitwise True (0 differ)
+  EQ tile 32 bias ahead 1 table: bitwise True (0 differ)
+  EQ tile 32 bias ahead 2 build: bitwise True (0 differ)
+  EQ tile 32 bias ahead 2 table: bitwise True (0 differ)
+  EQ tile 32 bias ahead 3 build: bitwise True (0 differ)
+  EQ tile 32 bias ahead 3 table: bitwise True (0 differ)
+  PLANT stale page tile 32 bias: 6144 values differ
+  REPORT swapped order tile 32 bias: 2208 values differ, max |d| 5.22e-08
+  EQ tile 32 nobias ahead 0 build: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 0 table: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 1 build: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 1 table: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 2 build: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 2 table: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 3 build: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 3 table: bitwise True (0 differ)
+  PLANT stale page tile 32 nobias: 6144 values differ
+  REPORT swapped order tile 32 nobias: 2344 values differ, max |d| 4.47e-08
+  AHEAD-INTERP OK
+    _ev("J1 AHEAD INTERP:\n" + r.stdout.strip())
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_ahead_compile_witness
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1402: Evidence: J1 AHEAD COMPILE WITNESS (sm_80, w4 s3 tile 64, B 216):
+  SAME_CODE bias bfloat16 ahead0_vs_fork: ttgir True (1777 lines) ptx False (5983 lines) sass False, sass with registers renamed False (4096) True
+  DIFF ahead0_vs_fork ttgir None | ptx (58, '\t.reg .b32 \t%r<3843>;', '\t.reg .b32 \t%r<3838>;') | sass (45, 'S2R R93, SR_TID.X ;', 'S2R R95, SR_TID.X ;')
+  REPORT bias bfloat16 CONTROL_fork_copy_vs_fork: ttgir True (1777 lines) ptx True (5983 lines) sass True, sass with registers renamed True (4096)
+  WITNESS bias bfloat16 fork         reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias bfloat16 ahead0       reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias bfloat16 ahead1       reg 251 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias bfloat16 ahead2       reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias bfloat16 ahead3       reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 8 async copies 0 async_wait 0 dots 2
+  WITNESS bias bfloat16 fork_table   reg 255 stack 24 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias bfloat16 ahead2_table reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias bfloat16 ahead3_table reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 8 async copies 0 async_wait 0 dots 2
+  SAME_CODE bias float32 ahead0_vs_fork: ttgir True (1776 lines) ptx True (5976 lines) sass True, sass with registers renamed True (4096) True
+  REPORT bias float32 CONTROL_fork_copy_vs_fork: ttgir True (1776 lines) ptx True (5976 lines) sass True, sass with registers renamed True (4096)
+  WITNESS bias float32 fork         reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias float32 ahead0       reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias float32 ahead1       reg 251 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias float32 ahead2       reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias float32 ahead3       reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 8 async copies 0 async_wait 0 dots 2
+  WITNESS bias float32 fork_table   reg 255 stack 24 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias float32 ahead2_table reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias float32 ahead3_table reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 8 async copies 0 async_wait 0 dots 2
+  REPORT bias bfloat16 ahead0_vs_fork WITHOUT LINE INFO: ttgir True ptx True sass True, renamed True
+  REPORT bias float32 ahead0_vs_fork WITHOUT LINE INFO: ttgir True ptx True sass True, renamed True
+  COMPILE-WITNESS OK
+    _ev("J1 AHEAD COMPILE WITNESS (sm_80, w4 s3 tile 64, B 216):\n" + "\n".join(out))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] benchmarks/Efficiency/tests_cpu/test_j1.py:1523: not a clean checkout of /mnt/beegfs/ojerbi/nosi-r2-j1: the full DRYRUN needs one
+26 passed, 1 skipped, 19 warnings in 826.23s (0:13:46)

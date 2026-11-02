@@ -1609,3 +1609,52 @@ One line per event, UTC from `date -u`. Newest at the bottom.
   below (one CTA per (request, head, block), no CTA cap; MODEL x0.91-0.97 at the measured overlap); gate it with a
   side-stream microbench first. CPU: bf1_dd95b87_t (SLURM 2250122, 42 passed). Proposed bands in INTEGRATION_NOTES 13
   (not registered). No GPU run (the human: no allocation yet).
+- 2026-11-02 (review 5, asynchronous, on packet e8a53ac + J dev 8951bc3 + BF dev dd95b87): items 1-3 to the BF owner
+  (worker error path for the ready loop's device waits; acct=False / arrival=True window-only population; labels for
+  bytes_in_joint, consume, bytes_device + arr_ep cnt, host active vs GIL, small-batch risk); items 4-5 to the J owner
+  (best_3d validity; "direct" = end-to-end library call, residual label; ahead3 staging claim; pin / registration
+  reconciliation plan for 8951bc3 vs 89e324e); item 7 source to a new ST owner (yield / kv_at_verify populations after
+  restrict, dev r2-int-dev ff to b9031c9). Lead: items 6-7 in the ledger (16.3, 16.4, 16.5, 16.8; section 14 rows Y
+  and extra), handoff items 5-6; matched yields computed on amd (yield_matched.py: 2.617130 / 2.521056 / 2.417250
+  accepted, 2.642130 / 2.555017 / 2.451340 committed); lessons L68-L72. Direct resource restriction preserved: the
+  human said no allocation yet (2026-11-02); it is the human's, not a review gate.
+- 2026-11-02T13:51:55Z (date -u): J review 5 DONE fd91420 (j1_fd91420_t 26 passed 1 skipped; _g0 37 passed; checked).
+  BF review 5 DONE a347f7c (bf1_a347f7c_t 45 passed; store-only useful metric; _fatal error boundary with raising-event
+  controls; labels). ST review 5 DONE a39aaa9 (owner receipts on b9031c9 + uncommitted edits; lead clean-commit rerun
+  first refused by AssocMaxSubmitJobLimit while the BF job held the single slot; resubmitted after the slot freed).
+  HUMAN PRIORITY (2026-11-02): two tracks in parallel at C81 / K3 / B287 / L2: track 1 KV movement (BF owner: completed
+  fetch / retention schedule, (a)(b)(c) accounting, producer -> consumer trace); track 2 shared KV reads (J owner:
+  eligible implementations, rows sweep, ncu cell, bit-preserving fixes). Lead: ledger section 17 (equations, schedule
+  and memory mapping to L2 / 84 GB, prediction -> measurement status). External dependency: GPU allocation (the human:
+  no allocation yet).
+- 2026-11-02T13:57:36Z: lead rerun of the ST repair at the CLEAN commit a39aaa9 (SLURM 2250665, thunder09): st_a39aaa9_r5
+  3 passed, st_a39aaa9_g0 41 passed (Gate 0 of 19 files), pytest exit 0 both; tree clean at begin and end.
+- 2026-11-02T14:22:09Z: TRACK 2 (J owner) source + CPU DONE at 55de6f9 (j1_55de6f9_t 28 passed 1 skipped, _g0 37 passed;
+  clean tree; checked). Eligible-implementation table (only FORK and, if GPU-bit-equal, FORKA1-3 keep the contract);
+  cell j1n at C81 B287 READY (rows sweep RSM1-4 bit-gated against FORKT, RSQ1/2/4, ncu per arm: DRAM bytes, L2 sectors,
+  occupancy); live-pass ncu protocol written, not built. Chain at the anchor (MODEL): E 6.9446 predicted vs matched
+  analogue 3.52 ms (FLASHU1 - NS1R1 interpolated: 0.3927 ms per page x 8.969) = 0.51x E; 4-row tile 17.1 ms per pass not
+  in the model; physical live reads UNKNOWN. RULE SLIP #2 (J worker, self-reported): a dummy variable spelling the banned
+  stream-editor name in a login command (ran nothing). Logged. Track 1 (BF) still running.
+- 2026-11-02T15:57:33Z: TRACK 1 (BF owner) source + CPU DONE at 4692273 on a347f7c (bf1_4692273_t: 56 passed, pytest exit
+  0, SLURM 2251043 thunder09, clean tree at begin and end; checked). Arm S (L4PTFDGUDKWCDS: ready snapshots + late
+  "complete" + retention with overflow fallback), the (a)(b)(c) ledger with closure and consumer-address MUST gates,
+  5 plants (late, eviction, verifier-only, address redirect, retention pressure), cell bf1c (STOPS while
+  PRED_STAMP_BF1S is None). MODEL at the anchor: live draft-selected share of the joint's NEW blocks c_req 0.47-0.51 ->
+  even a perfect schedule leaves about half the NEW bytes verifier-only (44-48 of 90.5 ms); S / X x0.987-1.049.
+  LEAD CORRECTION (INTEGRATION_NOTES 16.4): the store slot is 2 KV heads x 32,896 B (not 8): X 129 = 2.436 GB at B287
+  (record intd store_GB 2.6989 at B318); intc has no store. Anchor fit 80.74 GB (MODEL); X 257 = 83.16 GB, feasible on
+  the model at the L60 margin. Suite runtime 53 of 60 min: split before more tests.
+- 2026-11-02 (after the re-optimization report): LEAD SLIP, corrected. "intc has no store" was FALSE: intc's record has
+  store_GB 2.4358 (my grep pattern used double quotes; the field matched only with a quote-free pattern; L70 repeated).
+  Re-corrected 16.4: anchor fit with S about 78.2-78.3 GB; X 257 about 80.7 GB: fits. REOPT_2026-11-02.md written by the
+  analyst: best feasible config is still C128 B216 INT (1,910.0 committed tok/s, mean basis), 0.582x SHJ1 (3,282.5) at
+  the same cell; INT + S best at C81 B311 1,774.6 [1,703.8, 1,832.5] MODEL; INT + J 1,918.8 [1,910.0, 1,950.4] MODEL.
+  s3_reopt.out was emptied by a failed srun (slot busy); section 7 is hand arithmetic until the rerun.
+- 2026-11-02 (after 20:14Z): INTEGRATION r2-int2-dev @ 4695b61 = a39aaa9 + merge j1-dev 55de6f9 (15 Gate-0 list
+  conflicts, mechanical) + merge bf1-dev 4692273 (none) + f0762ce (Gate 0 allow-list, INT cell back to X / B only,
+  bf_opt keys at defaults, 2 INT2 tests) + 86636fe (bf1c comment number-free) + 4695b61 (lead, test-only:
+  test_st4_placement uses BF_INT; the fault existed at a39aaa9). All receipts green (int2_* in cpu-logs; last SLURM
+  2251504: st1b 25 passed 1 skipped, st1g0 1 passed). C81 "INT + keep + S" NOT BUILT: ST3's compiled keep fill bypasses
+  BF1's keep hook (new mechanism needed; option without ST3 = human decision). s3_reopt_v2.out (160 lines) restored.
+  CONSOLIDATED_2026-11-02.md written. RULE SLIP (integration worker, self-reported): one `sleep 1` on login. Logged.

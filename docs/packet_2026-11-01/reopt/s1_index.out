@@ -1,0 +1,884 @@
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/bf1_b1_2195630_bf1b/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGUDKWC', 'L4PTFDGUDKWCD', 'L4PTFDGUDKWCDX', 'L4PTFDGUDKWCDB'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2575.5 step_ms 123.469 mean_tok_s 2496.4 peak 74.964
+    L4PTFD: med_tok_s 1542.700 mean_tok_s 1393.800 round_ms_med 577.812 tpr_mean 779.526 | phases commit=8.317 draft=188.154 joint=380.910 reset=0.117 | draft_step 94.077 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWC: med_tok_s 1683.900 mean_tok_s 1510.200 round_ms_med 529.481 tpr_mean 779.526 | phases commit=8.387 draft=183.866 joint=336.697 reset=0.120 | draft_step 91.933 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWCD: med_tok_s 1707.700 mean_tok_s 1535.500 round_ms_med 521.267 tpr_mean 779.526 | phases commit=8.353 draft=175.548 joint=336.506 reset=0.121 | draft_step 87.774 | peak_alloc 76.991 peak_w_prefill 77.694 rounds 209 used 194
+    L4PTFDGUDKWCDB: med_tok_s 1725.700 mean_tok_s 1539.100 round_ms_med 517.887 tpr_mean 779.526 | phases commit=8.392 draft=182.542 joint=326.213 reset=0.200 | draft_step 91.271 | peak_alloc 80.803 peak_w_prefill 80.803 rounds 209 used 194
+    L4PTFDGUDKWCDX: med_tok_s 1711.200 mean_tok_s 1534.700 round_ms_med 519.998 tpr_mean 779.526 | phases commit=8.396 draft=175.494 joint=335.234 reset=0.121 | draft_step 87.747 | peak_alloc 79.682 peak_w_prefill 80.380 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/bf1_b2_2195631_bf1b/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGUDKWC', 'L4PTFDGUDKWCD', 'L4PTFDGUDKWCDX', 'L4PTFDGUDKWCDB'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2564.2 step_ms 124.016 mean_tok_s 2479.6 peak 74.964
+    L4PTFD: med_tok_s 1533.400 mean_tok_s 1384.800 round_ms_med 581.917 tpr_mean 779.526 | phases commit=8.351 draft=189.536 joint=383.373 reset=0.121 | draft_step 94.768 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWC: med_tok_s 1675.200 mean_tok_s 1502.400 round_ms_med 532.403 tpr_mean 779.526 | phases commit=8.415 draft=184.921 joint=338.350 reset=0.123 | draft_step 92.460 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWCD: med_tok_s 1699.000 mean_tok_s 1525.300 round_ms_med 524.875 tpr_mean 779.526 | phases commit=8.407 draft=176.924 joint=338.626 reset=0.124 | draft_step 88.462 | peak_alloc 76.991 peak_w_prefill 77.694 rounds 209 used 194
+    L4PTFDGUDKWCDB: med_tok_s 1624.600 mean_tok_s 1466.400 round_ms_med 544.790 tpr_mean 779.526 | phases commit=8.527 draft=186.804 joint=348.318 reset=0.201 | draft_step 93.402 | peak_alloc 81.058 peak_w_prefill 81.058 rounds 209 used 194
+    L4PTFDGUDKWCDX: med_tok_s 1704.000 mean_tok_s 1525.100 round_ms_med 523.206 tpr_mean 779.526 | phases commit=8.410 draft=177.005 joint=336.997 reset=0.120 | draft_step 88.502 | peak_alloc 79.682 peak_w_prefill 80.380 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/bf1_b3_2195631_bf1b/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGUDKWC', 'L4PTFDGUDKWCD', 'L4PTFDGUDKWCDX', 'L4PTFDGUDKWCDB'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2564.4 step_ms 124.005 mean_tok_s 2479.0 peak 74.964
+    L4PTFD: med_tok_s 1534.200 mean_tok_s 1384.400 round_ms_med 581.585 tpr_mean 779.526 | phases commit=8.364 draft=189.480 joint=383.482 reset=0.122 | draft_step 94.740 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWC: med_tok_s 1672.000 mean_tok_s 1501.800 round_ms_med 532.854 tpr_mean 779.526 | phases commit=8.420 draft=184.943 joint=338.585 reset=0.125 | draft_step 92.472 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWCD: med_tok_s 1697.000 mean_tok_s 1525.700 round_ms_med 525.013 tpr_mean 779.526 | phases commit=8.403 draft=176.668 joint=338.834 reset=0.126 | draft_step 88.334 | peak_alloc 76.991 peak_w_prefill 77.694 rounds 209 used 194
+    L4PTFDGUDKWCDB: med_tok_s 1711.600 mean_tok_s 1526.500 round_ms_med 520.422 tpr_mean 779.526 | phases commit=8.455 draft=188.127 joint=323.013 reset=0.241 | draft_step 94.064 | peak_alloc 81.058 peak_w_prefill 81.058 rounds 209 used 194
+    L4PTFDGUDKWCDX: med_tok_s 1703.300 mean_tok_s 1525.700 round_ms_med 523.096 tpr_mean 779.526 | phases commit=8.410 draft=176.724 joint=337.291 reset=0.123 | draft_step 88.362 | peak_alloc 79.682 peak_w_prefill 80.380 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/bf1_m1_2195631_bf1m/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFDGUDKWC', 'L4PTFDGUDKWCD', 'L4PTFDGUDKWCDX', 'L4PTFDGUDKWCDB'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 327.2 step_ms 24.452 mean_tok_s 321.5 peak 20.425
+    L4PTFD: med_tok_s 53.900 mean_tok_s 47.400 round_ms_med 368.294 tpr_mean 16.818 | phases commit=4.226 draft=110.335 joint=252.865 reset=0.098 | draft_step 55.167 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 22
+    L4PTFDGUDKWC: med_tok_s 99.100 mean_tok_s 87.000 round_ms_med 199.297 tpr_mean 16.818 | phases commit=1.848 draft=45.606 joint=151.681 reset=0.106 | draft_step 22.803 | peak_alloc 18.294 peak_w_prefill 20.496 rounds 34 used 22
+    L4PTFDGUDKWCD: med_tok_s 100.500 mean_tok_s 88.100 round_ms_med 196.431 tpr_mean 16.818 | phases commit=1.847 draft=42.724 joint=151.698 reset=0.104 | draft_step 21.362 | peak_alloc 18.233 peak_w_prefill 20.504 rounds 34 used 22
+    L4PTFDGUDKWCDB: med_tok_s 74.800 mean_tok_s 65.300 round_ms_med 263.753 tpr_mean 16.818 | phases commit=1.852 draft=107.927 joint=153.452 reset=0.151 | draft_step 53.964 | peak_alloc 19.243 peak_w_prefill 20.521 rounds 34 used 22
+    L4PTFDGUDKWCDX: med_tok_s 100.500 mean_tok_s 88.000 round_ms_med 196.567 tpr_mean 16.818 | phases commit=1.849 draft=42.821 joint=151.795 reset=0.105 | draft_step 21.410 | peak_alloc 18.142 peak_w_prefill 20.513 rounds 34 used 22
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/bf1_m2_2195630_bf1m/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFDGUDKWC', 'L4PTFDGUDKWCD', 'L4PTFDGUDKWCDX', 'L4PTFDGUDKWCDB'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 328.4 step_ms 24.362 mean_tok_s 322.6 peak 20.425
+    L4PTFD: med_tok_s 54.100 mean_tok_s 47.500 round_ms_med 367.899 tpr_mean 16.818 | phases commit=4.220 draft=110.030 joint=252.830 reset=0.097 | draft_step 55.015 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 22
+    L4PTFDGUDKWC: med_tok_s 99.400 mean_tok_s 87.300 round_ms_med 198.680 tpr_mean 16.818 | phases commit=1.830 draft=45.572 joint=151.151 reset=0.106 | draft_step 22.786 | peak_alloc 18.294 peak_w_prefill 20.496 rounds 34 used 22
+    L4PTFDGUDKWCD: med_tok_s 101.000 mean_tok_s 88.500 round_ms_med 195.651 tpr_mean 16.818 | phases commit=1.829 draft=42.532 joint=151.115 reset=0.103 | draft_step 21.266 | peak_alloc 18.233 peak_w_prefill 20.504 rounds 34 used 22
+    L4PTFDGUDKWCDB: med_tok_s 75.100 mean_tok_s 67.200 round_ms_med 264.796 tpr_mean 16.818 | phases commit=1.829 draft=109.829 joint=153.167 reset=0.154 | draft_step 54.914 | peak_alloc 19.243 peak_w_prefill 20.521 rounds 34 used 22
+    L4PTFDGUDKWCDX: med_tok_s 101.000 mean_tok_s 88.500 round_ms_med 195.595 tpr_mean 16.818 | phases commit=1.831 draft=42.578 joint=151.087 reset=0.103 | draft_step 21.289 | peak_alloc 18.142 peak_w_prefill 20.513 rounds 34 used 22
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/bf1_m3_2195631_bf1m/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFDGUDKWC', 'L4PTFDGUDKWCD', 'L4PTFDGUDKWCDX', 'L4PTFDGUDKWCDB'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 326.6 step_ms 24.495 mean_tok_s 318.6 peak 20.425
+    L4PTFD: med_tok_s 53.400 mean_tok_s 47.200 round_ms_med 369.813 tpr_mean 16.818 | phases commit=4.215 draft=111.253 joint=254.258 reset=0.099 | draft_step 55.627 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 22
+    L4PTFDGUDKWC: med_tok_s 99.000 mean_tok_s 87.000 round_ms_med 199.455 tpr_mean 16.818 | phases commit=1.850 draft=45.682 joint=151.778 reset=0.102 | draft_step 22.841 | peak_alloc 18.294 peak_w_prefill 20.496 rounds 34 used 22
+    L4PTFDGUDKWCD: med_tok_s 100.500 mean_tok_s 88.000 round_ms_med 196.560 tpr_mean 16.818 | phases commit=1.854 draft=42.797 joint=151.743 reset=0.103 | draft_step 21.398 | peak_alloc 18.233 peak_w_prefill 20.504 rounds 34 used 22
+    L4PTFDGUDKWCDB: med_tok_s 81.800 mean_tok_s 73.800 round_ms_med 243.842 tpr_mean 16.818 | phases commit=1.855 draft=87.592 joint=153.577 reset=0.151 | draft_step 43.796 | peak_alloc 18.825 peak_w_prefill 20.521 rounds 34 used 22
+    L4PTFDGUDKWCDX: med_tok_s 100.400 mean_tok_s 88.000 round_ms_med 196.750 tpr_mean 16.818 | phases commit=1.855 draft=42.890 joint=151.814 reset=0.104 | draft_step 21.445 | peak_alloc 18.142 peak_w_prefill 20.513 rounds 34 used 22
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/bf1_m4_2195631_bf1m/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFDGUDKWC', 'L4PTFDGUDKWCD', 'L4PTFDGUDKWCDX', 'L4PTFDGUDKWCDB'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 329.2 step_ms 24.298 mean_tok_s 322.2 peak 20.425
+    L4PTFD: med_tok_s 53.500 mean_tok_s 47.300 round_ms_med 369.249 tpr_mean 16.818 | phases commit=4.206 draft=110.929 joint=253.100 reset=0.097 | draft_step 55.465 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 22
+    L4PTFDGUDKWC: med_tok_s 99.200 mean_tok_s 87.100 round_ms_med 199.335 tpr_mean 16.818 | phases commit=1.849 draft=45.602 joint=151.797 reset=0.101 | draft_step 22.801 | peak_alloc 18.294 peak_w_prefill 20.496 rounds 34 used 22
+    L4PTFDGUDKWCD: med_tok_s 100.600 mean_tok_s 88.200 round_ms_med 196.334 tpr_mean 16.818 | phases commit=1.847 draft=42.713 joint=151.640 reset=0.100 | draft_step 21.357 | peak_alloc 18.233 peak_w_prefill 20.504 rounds 34 used 22
+    L4PTFDGUDKWCDB: med_tok_s 87.100 mean_tok_s 77.600 round_ms_med 228.029 tpr_mean 16.818 | phases commit=1.855 draft=70.965 joint=153.832 reset=0.144 | draft_step 35.483 | peak_alloc 18.825 peak_w_prefill 20.521 rounds 34 used 22
+    L4PTFDGUDKWCDX: med_tok_s 100.500 mean_tok_s 88.100 round_ms_med 196.520 tpr_mean 16.818 | phases commit=1.851 draft=42.813 joint=151.674 reset=0.101 | draft_step 21.407 | peak_alloc 18.142 peak_w_prefill 20.513 rounds 34 used 22
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i1p_p2a_2195574_i1p/summary.json | C 128 B 216 batches None arms ['L4PT', 'L4PTN', 'L4PTU'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3351.8 step_ms 64.443 mean_tok_s 3182.4 peak 82.043
+    L4PT: med_tok_s 1320.900 mean_tok_s 1222.300 round_ms_med 470.187 tpr_mean 573.756 | phases commit=6.085 draft=149.731 joint=313.903 reset=0.115 | draft_step None | peak_alloc 80.716 peak_w_prefill None rounds 193 used None
+    L4PTN: med_tok_s 1381.100 mean_tok_s 1285.500 round_ms_med 446.286 tpr_mean 570.895 | phases commit=5.974 draft=149.851 joint=289.686 reset=0.131 | draft_step None | peak_alloc 80.716 peak_w_prefill None rounds 194 used None
+    L4PTU: med_tok_s 1440.400 mean_tok_s 1307.600 round_ms_med 432.077 tpr_mean 561.815 | phases commit=6.034 draft=151.254 joint=273.852 reset=0.129 | draft_step None | peak_alloc 83.461 peak_w_prefill None rounds 197 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i1p_p2m_2195574_i1pm/summary.json | C 73 B 8 batches None arms ['L4PT', 'L4PTN', 'L4PTU'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 329.5 step_ms 24.282 mean_tok_s 323.0 peak 20.425
+    L4PT: med_tok_s 45.700 mean_tok_s 39.400 round_ms_med 454.161 tpr_mean 16.304 | phases commit=3.511 draft=164.445 joint=286.744 reset=0.110 | draft_step None | peak_alloc 17.900 peak_w_prefill None rounds 31 used None
+    L4PTN: med_tok_s 44.700 mean_tok_s 41.100 round_ms_med 434.477 tpr_mean 16.909 | phases commit=5.141 draft=162.991 joint=265.512 reset=0.115 | draft_step None | peak_alloc 17.900 peak_w_prefill None rounds 30 used None
+    L4PTU: med_tok_s 9.500 mean_tok_s 8.800 round_ms_med 2216.426 tpr_mean 19.421 | phases commit=5.243 draft=165.125 joint=2041.995 reset=0.117 | draft_step None | peak_alloc 17.903 peak_w_prefill None rounds 26 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i2_i1m_2195573_i2m/summary.json | C 73 B 8 batches None arms ['L4PT', 'L4PTU', 'SHR', 'TUC'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 331.5 step_ms 24.134 mean_tok_s 324.7 peak 20.425
+    L4PT: med_tok_s 51.000 mean_tok_s 45.700 round_ms_med 367.378 tpr_mean 16.138 | phases commit=2.418 draft=133.188 joint=231.671 reset=0.094 | draft_step None | peak_alloc 17.900 peak_w_prefill None rounds 31 used None
+    L4PTU: med_tok_s 11.900 mean_tok_s 11.000 round_ms_med 1764.427 tpr_mean 19.375 | phases commit=4.238 draft=134.198 joint=1627.402 reset=0.096 | draft_step None | peak_alloc 17.903 peak_w_prefill None rounds 26 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i2_j2ca_2195574_i2ca/summary.json | C 128 B 216 batches None arms ['SHR', 'TUC'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3248.4 step_ms 66.494 mean_tok_s 3032.1 peak 82.042
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i2_j2cb_2195574_i2cb/summary.json | C 73 B 318 batches None arms ['SHR', 'TUC'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2619.8 step_ms 121.382 mean_tok_s 2507.9 peak 74.962
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i2_j2g_2195574_i2g/summary.json | C 73 B 100 batches None arms ['WJ', 'WT', 'WU', 'WUP'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2064.2 step_ms 48.444 mean_tok_s 1984.6 peak 36.612
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i2_j2m_2195574_i2m/summary.json | C 73 B 8 batches None arms ['L4PT', 'L4PTU', 'SHR', 'TUC'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 328.4 step_ms 24.363 mean_tok_s 322.1 peak 20.425
+    L4PT: med_tok_s 50.600 mean_tok_s 45.100 round_ms_med 373.178 tpr_mean 16.138 | phases commit=2.450 draft=136.722 joint=233.948 reset=0.096 | draft_step None | peak_alloc 17.900 peak_w_prefill None rounds 31 used None
+    L4PTU: med_tok_s 11.700 mean_tok_s 10.900 round_ms_med 1788.700 tpr_mean 19.375 | phases commit=4.296 draft=137.634 joint=1648.055 reset=0.098 | draft_step None | peak_alloc 17.903 peak_w_prefill None rounds 26 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i2_t2a_2195574_i2a/summary.json | C 128 B 216 batches None arms ['L4PT', 'L4PTU'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3337.2 step_ms 64.724 mean_tok_s 3170.5 peak 82.043
+    L4PT: med_tok_s 1317.200 mean_tok_s 1217.800 round_ms_med 471.998 tpr_mean 573.756 | phases commit=6.168 draft=150.361 joint=314.959 reset=0.114 | draft_step None | peak_alloc 80.716 peak_w_prefill None rounds 193 used None
+    L4PTU: med_tok_s 1290.000 mean_tok_s 1159.300 round_ms_med 481.194 tpr_mean 555.699 | phases commit=6.076 draft=151.689 joint=322.829 reset=0.116 | draft_step None | peak_alloc 81.400 peak_w_prefill None rounds 199 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i2_t2b_2195574_i2b/summary.json | C 73 B 318 batches None arms ['L4PT', 'L4PTU'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2561.2 step_ms 124.159 mean_tok_s 2477.1 peak 74.964
+    L4PT: med_tok_s 1235.600 mean_tok_s 1115.700 round_ms_med 724.949 tpr_mean 787.477 | phases commit=8.577 draft=195.028 joint=520.241 reset=0.118 | draft_step None | peak_alloc 74.218 peak_w_prefill None rounds 206 used None
+    L4PTU: med_tok_s 1214.600 mean_tok_s 1090.500 round_ms_med 732.087 tpr_mean 775.663 | phases commit=8.589 draft=197.044 joint=525.985 reset=0.114 | draft_step None | peak_alloc 75.225 peak_w_prefill None rounds 210 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i2_x2ax_2195574_i2ax/summary.json | C 128 B 216 batches None arms ['L4PT', 'L4PTU'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3341.4 step_ms 64.643 mean_tok_s 3174.4 peak 82.043
+    L4PT: med_tok_s 1317.700 mean_tok_s 1217.100 round_ms_med 472.068 tpr_mean 573.756 | phases commit=6.170 draft=150.442 joint=315.038 reset=0.111 | draft_step None | peak_alloc 80.716 peak_w_prefill None rounds 193 used None
+    L4PTU: med_tok_s 1440.100 mean_tok_s 1305.400 round_ms_med 432.618 tpr_mean 561.815 | phases commit=6.045 draft=151.840 joint=273.983 reset=0.114 | draft_step None | peak_alloc 83.461 peak_w_prefill None rounds 197 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i2_x2bx_2195574_i2bx/summary.json | C 73 B 318 batches None arms ['L4PT', 'L4PTU'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2563.2 step_ms 124.064 mean_tok_s 2479.3 peak 74.964
+    L4PT: med_tok_s 1239.600 mean_tok_s 1119.900 round_ms_med 722.702 tpr_mean 787.477 | phases commit=8.546 draft=194.114 joint=518.661 reset=0.115 | draft_step None | peak_alloc 74.218 peak_w_prefill None rounds 206 used None
+    L4PTU: med_tok_s 1323.900 mean_tok_s 1202.300 round_ms_med 671.407 tpr_mean 784.289 | phases commit=8.572 draft=196.200 joint=466.248 reset=0.119 | draft_step None | peak_alloc 78.260 peak_w_prefill None rounds 207 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i3_r1g_2195573_i3g/summary.json | C 73 B 100 batches None arms ['WJ', 'WT', 'WF', 'WFP'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2078.8 step_ms 48.105 mean_tok_s 1997.4 peak 36.612
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i3_r2cb_2195574_i3cb/summary.json | C 73 B 318 batches None arms ['SHR', 'TFC'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2620.3 step_ms 121.362 mean_tok_s 2512.3 peak 74.962
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i3_r2m_2195574_i3m/summary.json | C 73 B 8 batches None arms ['L4PT', 'L4PTU', 'L4PTF', 'SHR', 'TFC'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 331.3 step_ms 24.146 mean_tok_s 323.4 peak 20.425
+    L4PT: med_tok_s 46.100 mean_tok_s 42.200 round_ms_med 368.467 tpr_mean 14.694 | phases commit=2.441 draft=133.810 joint=232.131 reset=0.096 | draft_step None | peak_alloc 17.900 peak_w_prefill None rounds 39 used None
+    L4PTF: med_tok_s 50.400 mean_tok_s 45.300 round_ms_med 395.256 tpr_mean 16.968 | phases commit=4.183 draft=137.599 joint=252.960 reset=0.101 | draft_step None | peak_alloc 17.969 peak_w_prefill None rounds 34 used None
+    L4PTU: med_tok_s 59.200 mean_tok_s 53.200 round_ms_med 331.151 tpr_mean 16.594 | phases commit=4.191 draft=136.503 joint=190.362 reset=0.098 | draft_step None | peak_alloc 18.003 peak_w_prefill None rounds 35 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i3_r3a_2195575_i3a/summary.json | C 128 B 216 batches None arms ['L4PT', 'L4PTU', 'L4PTF'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3370.9 step_ms 64.077 mean_tok_s 3200.7 peak 82.043
+    L4PT: med_tok_s 1336.000 mean_tok_s 1233.500 round_ms_med 466.080 tpr_mean 573.756 | phases commit=6.094 draft=148.187 joint=311.463 reset=0.118 | draft_step None | peak_alloc 80.716 peak_w_prefill None rounds 193 used None
+    L4PTF: med_tok_s 1734.000 mean_tok_s 1580.300 round_ms_med 360.650 tpr_mean 570.878 | phases commit=5.968 draft=149.022 joint=205.226 reset=0.112 | draft_step None | peak_alloc 82.559 peak_w_prefill None rounds 194 used None
+    L4PTU: med_tok_s 1449.800 mean_tok_s 1316.900 round_ms_med 429.014 tpr_mean 561.815 | phases commit=6.010 draft=150.160 joint=272.121 reset=0.119 | draft_step None | peak_alloc 83.461 peak_w_prefill None rounds 197 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i3_r3b_2195575_i3b/summary.json | C 73 B 318 batches None arms ['L4PT', 'L4PTU', 'L4PTF'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2575.1 step_ms 123.489 mean_tok_s 2494.9 peak 74.964
+    L4PT: med_tok_s 1242.000 mean_tok_s 1122.900 round_ms_med 720.969 tpr_mean 787.477 | phases commit=8.518 draft=193.654 joint=517.762 reset=0.118 | draft_step None | peak_alloc 74.218 peak_w_prefill None rounds 206 used None
+    L4PTF: med_tok_s 1525.800 mean_tok_s 1377.100 round_ms_med 585.463 tpr_mean 779.995 | phases commit=8.351 draft=194.550 joint=382.041 reset=0.115 | draft_step None | peak_alloc 76.932 peak_w_prefill None rounds 209 used None
+    L4PTU: med_tok_s 1330.500 mean_tok_s 1206.700 round_ms_med 668.615 tpr_mean 784.289 | phases commit=8.588 draft=195.436 joint=464.313 reset=0.116 | draft_step None | peak_alloc 78.260 peak_w_prefill None rounds 207 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i3_r4a_2195576_i3a/summary.json | C 128 B 216 batches None arms ['L4PT', 'L4PTU', 'L4PTF'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3334.0 step_ms 64.787 mean_tok_s 3168.6 peak 82.043
+    L4PT: med_tok_s 1316.200 mean_tok_s 1216.300 round_ms_med 472.283 tpr_mean 573.756 | phases commit=6.179 draft=150.622 joint=315.255 reset=0.113 | draft_step None | peak_alloc 80.716 peak_w_prefill None rounds 193 used None
+    L4PTF: med_tok_s 1709.800 mean_tok_s 1560.500 round_ms_med 365.423 tpr_mean 570.878 | phases commit=6.004 draft=151.363 joint=207.377 reset=0.110 | draft_step None | peak_alloc 82.559 peak_w_prefill None rounds 194 used None
+    L4PTU: med_tok_s 1439.800 mean_tok_s 1304.500 round_ms_med 432.892 tpr_mean 561.815 | phases commit=6.065 draft=152.096 joint=274.199 reset=0.114 | draft_step None | peak_alloc 83.461 peak_w_prefill None rounds 197 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i3_r4b_2195576_i3b/summary.json | C 73 B 318 batches None arms ['L4PT', 'L4PTU', 'L4PTF'] | top ['CHECK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2561.4 step_ms 124.152 mean_tok_s 2476.3 peak 74.964
+    L4PT: med_tok_s 1235.700 mean_tok_s 1115.100 round_ms_med 725.779 tpr_mean 787.477 | phases commit=8.588 draft=195.158 joint=520.466 reset=0.117 | draft_step None | peak_alloc 74.218 peak_w_prefill None rounds 206 used None
+    L4PTF: med_tok_s 1514.500 mean_tok_s 1367.300 round_ms_med 588.939 tpr_mean 779.995 | phases commit=8.397 draft=196.218 joint=384.124 reset=0.114 | draft_step None | peak_alloc 76.932 peak_w_prefill None rounds 209 used None
+    L4PTU: med_tok_s 1319.500 mean_tok_s 1198.900 round_ms_med 672.282 tpr_mean 784.289 | phases commit=8.568 draft=197.076 joint=467.056 reset=0.118 | draft_step None | peak_alloc 78.260 peak_w_prefill None rounds 207 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4a_k3b_2195575_i4ab/summary.json | C 73 B 318 batches None arms ['L4PTF', 'L4PTFD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2574.6 step_ms 123.513 mean_tok_s 2494.3 peak 74.964
+    L4PTF: med_tok_s 1525.900 mean_tok_s 1377.500 round_ms_med 584.537 tpr_mean 779.995 | phases commit=8.367 draft=194.043 joint=381.657 reset=0.124 | draft_step 97.022 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFD: med_tok_s 1538.400 mean_tok_s 1390.400 round_ms_med 580.238 tpr_mean 779.995 | phases commit=8.360 draft=188.902 joint=381.997 reset=0.116 | draft_step 94.451 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4a_k4a_2195576_i4aa/summary.json | C 128 B 216 batches None arms ['L4PTF', 'L4PTFD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3341.9 step_ms 64.634 mean_tok_s 3174.8 peak 82.043
+    L4PTF: med_tok_s 1711.200 mean_tok_s 1559.200 round_ms_med 365.564 tpr_mean 570.878 | phases commit=6.030 draft=151.394 joint=207.434 reset=0.118 | draft_step 75.697 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFD: med_tok_s 1740.200 mean_tok_s 1587.900 round_ms_med 359.092 tpr_mean 570.878 | phases commit=6.026 draft=144.547 joint=207.941 reset=0.112 | draft_step 72.273 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q3a_2195575_i4aa/summary.json | C 128 B 216 batches None arms ['L4PTF', 'L4PTFD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3364.6 step_ms 64.198 mean_tok_s 3196.2 peak 82.043
+    L4PTF: med_tok_s 1726.300 mean_tok_s 1572.600 round_ms_med 362.385 tpr_mean 570.878 | phases commit=5.967 draft=149.788 joint=206.060 reset=0.114 | draft_step 74.894 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFD: med_tok_s 1751.900 mean_tok_s 1599.000 round_ms_med 356.774 tpr_mean 570.878 | phases commit=6.010 draft=143.590 joint=206.726 reset=0.115 | draft_step 71.795 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q3m_2195575_i4am/summary.json | C 73 B 8 batches None arms ['L4PTF', 'L4PTFD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 334.4 step_ms 23.922 mean_tok_s 327.6 peak 20.425
+    L4PTF: med_tok_s 50.200 mean_tok_s 45.200 round_ms_med 395.910 tpr_mean 16.968 | phases commit=4.192 draft=138.889 joint=252.120 reset=0.097 | draft_step 69.445 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used None
+    L4PTFD: med_tok_s 55.300 mean_tok_s 49.600 round_ms_med 361.448 tpr_mean 16.968 | phases commit=4.162 draft=108.400 joint=248.561 reset=0.101 | draft_step 54.200 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4a_q4b_2195576_i4ab/summary.json | C 73 B 318 batches None arms ['L4PTF', 'L4PTFD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2565.4 step_ms 123.957 mean_tok_s 2478.7 peak 74.964
+    L4PTF: med_tok_s 1520.900 mean_tok_s 1372.300 round_ms_med 586.744 tpr_mean 779.995 | phases commit=8.387 draft=195.134 joint=383.110 reset=0.120 | draft_step 97.567 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFD: med_tok_s 1534.100 mean_tok_s 1385.700 round_ms_med 581.576 tpr_mean 779.995 | phases commit=8.380 draft=189.476 joint=383.587 reset=0.121 | draft_step 94.738 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4b_w3m_2195575_i4bm/summary.json | C 73 B 8 batches None arms ['SWP', 'L4PTF', 'L4PTFL'] | top ['SH', 'SPEC', 'SWEEP', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 327.9 step_ms 24.397 mean_tok_s 321.8 peak 20.425
+    L4PTF: med_tok_s 49.700 mean_tok_s 44.700 round_ms_med 400.045 tpr_mean 16.968 | phases commit=4.211 draft=140.830 joint=254.488 reset=0.103 | draft_step None | peak_alloc 17.969 peak_w_prefill None rounds 34 used None
+    L4PTFL: med_tok_s 47.700 mean_tok_s 41.900 round_ms_med 399.000 tpr_mean 16.344 | phases commit=4.194 draft=140.748 joint=254.037 reset=0.103 | draft_step None | peak_alloc 17.969 peak_w_prefill None rounds 35 used None
+    SWP: med_tok_s None mean_tok_s None round_ms_med None tpr_mean None | phases  | draft_step None | peak_alloc 17.969 peak_w_prefill None rounds 34 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4b_w3sa_2195575_i4bsa/summary.json | C 128 B 216 batches None arms ['SWP'] | top ['SH', 'SPEC', 'SWEEP', 'gates', 'meta', 'predictions']
+    SWP: med_tok_s None mean_tok_s None round_ms_med None tpr_mean None | phases  | draft_step None | peak_alloc 82.479 peak_w_prefill None rounds 43 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4b_w4sb_2195576_i4bsb/summary.json | C 73 B 318 batches None arms ['SWP'] | top ['SH', 'SPEC', 'SWEEP', 'gates', 'meta', 'predictions']
+    SWP: med_tok_s None mean_tok_s None round_ms_med None tpr_mean None | phases  | draft_step None | peak_alloc 76.813 peak_w_prefill None rounds 45 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3a_2195575_i4ca/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDP'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3374.7 step_ms 64.006 mean_tok_s 3203.8 peak 82.043
+    L4PTFD: med_tok_s 1756.800 mean_tok_s 1601.500 round_ms_med 355.851 tpr_mean 570.878 | phases commit=5.980 draft=143.030 joint=206.157 reset=0.119 | draft_step 71.515 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFDP: med_tok_s 1757.300 mean_tok_s 1601.500 round_ms_med 355.844 tpr_mean 570.878 | phases commit=5.935 draft=142.994 joint=206.535 reset=0.126 | draft_step 71.497 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c3m_2195575_i4cm/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFDP'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 337.3 step_ms 23.717 mean_tok_s 330.0 peak 20.425
+    L4PTFD: med_tok_s 79.400 mean_tok_s 70.700 round_ms_med 247.873 tpr_mean 16.480 | phases commit=3.842 draft=105.449 joint=137.371 reset=0.097 | draft_step 52.724 | peak_alloc 17.968 peak_w_prefill 20.496 rounds 34 used None
+    L4PTFDP: med_tok_s 70.800 mean_tok_s 62.000 round_ms_med 293.144 tpr_mean 16.480 | phases commit=4.823 draft=125.229 joint=163.037 reset=0.114 | draft_step 62.614 | peak_alloc 17.968 peak_w_prefill 20.496 rounds 34 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4b_2195576_i4cb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDP'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2564.6 step_ms 123.997 mean_tok_s 2484.1 peak 74.964
+    L4PTFD: med_tok_s 1534.100 mean_tok_s 1385.400 round_ms_med 581.517 tpr_mean 779.995 | phases commit=8.344 draft=189.278 joint=383.231 reset=0.117 | draft_step 94.639 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFDP: med_tok_s 1534.700 mean_tok_s 1385.500 round_ms_med 582.166 tpr_mean 779.995 | phases commit=8.342 draft=189.431 joint=383.691 reset=0.131 | draft_step 94.716 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4c_c4m_2195576_i4cm/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFDP'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 329.5 step_ms 24.276 mean_tok_s 321.6 peak 20.425
+    L4PTFD: med_tok_s 78.700 mean_tok_s 70.200 round_ms_med 250.038 tpr_mean 16.480 | phases commit=3.896 draft=105.158 joint=139.307 reset=0.100 | draft_step 52.579 | peak_alloc 17.968 peak_w_prefill 20.496 rounds 34 used None
+    L4PTFDP: med_tok_s 71.200 mean_tok_s 62.200 round_ms_med 292.764 tpr_mean 16.480 | phases commit=4.805 draft=123.447 joint=162.110 reset=0.115 | draft_step 61.724 | peak_alloc 17.968 peak_w_prefill 20.496 rounds 34 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4c_e4a_2195576_i4ca/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDP'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3349.5 step_ms 64.487 mean_tok_s 3181.6 peak 82.043
+    L4PTFD: med_tok_s 1746.900 mean_tok_s 1591.900 round_ms_med 357.981 tpr_mean 570.878 | phases commit=5.977 draft=143.987 joint=207.457 reset=0.115 | draft_step 71.993 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFDP: med_tok_s 1750.600 mean_tok_s 1594.900 round_ms_med 357.275 tpr_mean 570.878 | phases commit=5.961 draft=143.710 joint=207.094 reset=0.128 | draft_step 71.855 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c3a_2195575_i4cca/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGUD', 'L4PTFDGUDC'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3368.9 step_ms 64.116 mean_tok_s 3200.0 peak 82.043
+    L4PTFD: med_tok_s 1759.900 mean_tok_s 1603.400 round_ms_med 355.666 tpr_mean 570.700 | phases commit=5.981 draft=143.241 joint=206.089 reset=0.113 | draft_step 71.621 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDG: med_tok_s 1795.500 mean_tok_s 1636.800 round_ms_med 348.557 tpr_mean 570.700 | phases commit=6.026 draft=143.451 joint=198.571 reset=0.115 | draft_step 71.725 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUD: med_tok_s 1831.000 mean_tok_s 1668.500 round_ms_med 341.923 tpr_mean 570.700 | phases commit=6.022 draft=138.820 joint=196.423 reset=0.118 | draft_step 69.410 | peak_alloc 82.596 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUDC: med_tok_s 1890.500 mean_tok_s 1724.000 round_ms_med 331.001 tpr_mean 570.700 | phases commit=6.068 draft=138.630 joint=185.599 reset=0.113 | draft_step 69.315 | peak_alloc 82.604 peak_w_prefill 83.900 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c3m_2195575_i4cm2/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFKW', 'L4PTFDGUD', 'L4PTFDGUDKW', 'L4PTFDGUDC', 'L4PTFDGUDKWC'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 330.0 step_ms 24.244 mean_tok_s 323.5 peak 20.425
+    L4PTFD: med_tok_s 54.200 mean_tok_s 48.100 round_ms_med 370.607 tpr_mean 17.286 | phases commit=4.198 draft=110.720 joint=255.565 reset=0.101 | draft_step 55.360 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUD: med_tok_s 139.500 mean_tok_s 123.000 round_ms_med 143.308 tpr_mean 17.286 | phases commit=1.803 draft=45.406 joint=95.989 reset=0.101 | draft_step 22.703 | peak_alloc 17.979 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUDC: med_tok_s 147.900 mean_tok_s 130.200 round_ms_med 135.161 tpr_mean 17.286 | phases commit=1.807 draft=45.396 joint=87.840 reset=0.102 | draft_step 22.698 | peak_alloc 18.243 peak_w_prefill 20.513 rounds 34 used 28
+    L4PTFDGUDKW: med_tok_s 96.700 mean_tok_s 85.800 round_ms_med 206.492 tpr_mean 17.286 | phases commit=1.805 draft=45.339 joint=159.243 reset=0.100 | draft_step 22.669 | peak_alloc 18.134 peak_w_prefill 20.504 rounds 34 used 28
+    L4PTFDGUDKWC: med_tok_s 100.700 mean_tok_s 89.300 round_ms_med 198.319 tpr_mean 17.286 | phases commit=1.806 draft=45.329 joint=151.049 reset=0.102 | draft_step 22.665 | peak_alloc 18.318 peak_w_prefill 20.521 rounds 34 used 28
+    L4PTFKW: med_tok_s 45.800 mean_tok_s 40.800 round_ms_med 437.000 tpr_mean 17.286 | phases commit=4.205 draft=110.834 joint=321.381 reset=0.100 | draft_step 55.417 | peak_alloc 18.116 peak_w_prefill 20.496 rounds 34 used 28
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c4b_2195576_i4ccb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGUDKW', 'L4PTFDGUDKWC'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2561.5 step_ms 124.144 mean_tok_s 2479.2 peak 74.964
+    L4PTFD: med_tok_s 1532.700 mean_tok_s 1382.500 round_ms_med 582.324 tpr_mean 779.526 | phases commit=8.386 draft=189.714 joint=383.826 reset=0.120 | draft_step 94.857 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKW: med_tok_s 1635.400 mean_tok_s 1469.300 round_ms_med 544.866 tpr_mean 779.526 | phases commit=8.441 draft=185.125 joint=350.237 reset=0.130 | draft_step 92.562 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWC: med_tok_s 1673.600 mean_tok_s 1501.700 round_ms_med 533.279 tpr_mean 779.526 | phases commit=8.441 draft=185.086 joint=338.598 reset=0.128 | draft_step 92.543 | peak_alloc 76.991 peak_w_prefill 77.694 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_c4m_2195576_i4cm2/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFKW', 'L4PTFDGUD', 'L4PTFDGUDKW', 'L4PTFDGUDC', 'L4PTFDGUDKWC'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 325.8 step_ms 24.556 mean_tok_s 318.6 peak 20.425
+    L4PTFD: med_tok_s 54.700 mean_tok_s 48.700 round_ms_med 365.911 tpr_mean 17.286 | phases commit=4.214 draft=108.476 joint=252.624 reset=0.099 | draft_step 54.238 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUD: med_tok_s 137.600 mean_tok_s 121.300 round_ms_med 145.454 tpr_mean 17.286 | phases commit=1.889 draft=45.906 joint=97.504 reset=0.101 | draft_step 22.953 | peak_alloc 17.979 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUDC: med_tok_s 146.000 mean_tok_s 128.600 round_ms_med 136.958 tpr_mean 17.286 | phases commit=1.892 draft=45.836 joint=89.082 reset=0.102 | draft_step 22.918 | peak_alloc 18.243 peak_w_prefill 20.513 rounds 34 used 28
+    L4PTFDGUDKW: med_tok_s 95.800 mean_tok_s 84.900 round_ms_med 208.528 tpr_mean 17.286 | phases commit=1.892 draft=45.864 joint=160.667 reset=0.102 | draft_step 22.932 | peak_alloc 18.134 peak_w_prefill 20.504 rounds 34 used 28
+    L4PTFDGUDKWC: med_tok_s 99.700 mean_tok_s 88.400 round_ms_med 200.163 tpr_mean 17.286 | phases commit=1.894 draft=45.823 joint=152.311 reset=0.100 | draft_step 22.912 | peak_alloc 18.318 peak_w_prefill 20.521 rounds 34 used 28
+    L4PTFKW: med_tok_s 46.600 mean_tok_s 41.000 round_ms_med 435.513 tpr_mean 17.286 | phases commit=4.242 draft=111.026 joint=319.994 reset=0.099 | draft_step 55.513 | peak_alloc 18.116 peak_w_prefill 20.496 rounds 34 used 28
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_v3b_2195575_i4ccb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGUDKW', 'L4PTFDGUDKWC'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2575.0 step_ms 123.494 mean_tok_s 2494.3 peak 74.964
+    L4PTFD: med_tok_s 1540.000 mean_tok_s 1390.200 round_ms_med 579.473 tpr_mean 779.526 | phases commit=8.365 draft=188.560 joint=381.816 reset=0.118 | draft_step 94.280 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKW: med_tok_s 1643.800 mean_tok_s 1476.000 round_ms_med 541.838 tpr_mean 779.526 | phases commit=8.411 draft=184.315 joint=348.443 reset=0.123 | draft_step 92.157 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWC: med_tok_s 1679.700 mean_tok_s 1508.400 round_ms_med 530.388 tpr_mean 779.526 | phases commit=8.434 draft=183.968 joint=337.380 reset=0.129 | draft_step 91.984 | peak_alloc 76.991 peak_w_prefill 77.694 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_v4a_2195576_i4cca/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGUD', 'L4PTFDGUDC'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3334.3 step_ms 64.782 mean_tok_s 3169.7 peak 82.043
+    L4PTFD: med_tok_s 1743.900 mean_tok_s 1589.700 round_ms_med 358.975 tpr_mean 570.700 | phases commit=6.010 draft=144.361 joint=207.858 reset=0.114 | draft_step 72.180 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDG: med_tok_s 1785.400 mean_tok_s 1626.800 round_ms_med 350.722 tpr_mean 570.700 | phases commit=6.053 draft=144.397 joint=199.805 reset=0.118 | draft_step 72.198 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUD: med_tok_s 1820.300 mean_tok_s 1659.500 round_ms_med 343.891 tpr_mean 570.700 | phases commit=6.031 draft=139.594 joint=197.568 reset=0.115 | draft_step 69.797 | peak_alloc 82.596 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUDC: med_tok_s 1879.100 mean_tok_s 1712.900 round_ms_med 333.209 tpr_mean 570.700 | phases commit=6.118 draft=139.773 joint=186.831 reset=0.118 | draft_step 69.886 | peak_alloc 82.604 peak_w_prefill 83.900 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_w3a_2195575_i4cca/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGUD', 'L4PTFDGUDC'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3374.7 step_ms 64.005 mean_tok_s 3204.2 peak 82.043
+    L4PTFD: med_tok_s 1758.400 mean_tok_s 1604.500 round_ms_med 355.798 tpr_mean 570.700 | phases commit=5.990 draft=143.019 joint=206.133 reset=0.116 | draft_step 71.510 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDG: med_tok_s 1800.800 mean_tok_s 1640.100 round_ms_med 347.747 tpr_mean 570.700 | phases commit=5.992 draft=143.050 joint=198.270 reset=0.112 | draft_step 71.525 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUD: med_tok_s 1828.800 mean_tok_s 1667.500 round_ms_med 342.055 tpr_mean 570.700 | phases commit=6.011 draft=138.940 joint=196.771 reset=0.116 | draft_step 69.470 | peak_alloc 82.596 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUDC: med_tok_s 1887.100 mean_tok_s 1722.000 round_ms_med 331.361 tpr_mean 570.700 | phases commit=6.078 draft=138.882 joint=185.929 reset=0.118 | draft_step 69.441 | peak_alloc 82.604 peak_w_prefill 83.900 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_w4b_2195576_i4ccb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGUDKW', 'L4PTFDGUDKWC'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2561.9 step_ms 124.127 mean_tok_s 2477.2 peak 74.964
+    L4PTFD: med_tok_s 1530.900 mean_tok_s 1381.900 round_ms_med 582.952 tpr_mean 779.526 | phases commit=8.401 draft=189.886 joint=384.146 reset=0.120 | draft_step 94.943 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKW: med_tok_s 1635.600 mean_tok_s 1468.100 round_ms_med 544.836 tpr_mean 779.526 | phases commit=8.439 draft=185.389 joint=350.430 reset=0.122 | draft_step 92.695 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWC: med_tok_s 1672.100 mean_tok_s 1500.000 round_ms_med 533.249 tpr_mean 779.526 | phases commit=8.441 draft=185.242 joint=338.596 reset=0.126 | draft_step 92.621 | peak_alloc 76.991 peak_w_prefill 77.694 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_y3b_2195575_i4ccb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGUDKW', 'L4PTFDGUDKWC'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2577.5 step_ms 123.373 mean_tok_s 2496.6 peak 74.964
+    L4PTFD: med_tok_s 1543.000 mean_tok_s 1393.700 round_ms_med 577.902 tpr_mean 779.526 | phases commit=8.319 draft=188.229 joint=381.057 reset=0.118 | draft_step 94.115 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKW: med_tok_s 1645.100 mean_tok_s 1479.900 round_ms_med 541.070 tpr_mean 779.526 | phases commit=8.372 draft=184.040 joint=347.815 reset=0.124 | draft_step 92.020 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWC: med_tok_s 1681.900 mean_tok_s 1510.100 round_ms_med 530.075 tpr_mean 779.526 | phases commit=8.398 draft=183.858 joint=336.967 reset=0.131 | draft_step 91.929 | peak_alloc 76.991 peak_w_prefill 77.694 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4cc_y4a_2195576_i4cca/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGUD', 'L4PTFDGUDC'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3347.6 step_ms 64.524 mean_tok_s 3181.1 peak 82.043
+    L4PTFD: med_tok_s 1754.900 mean_tok_s 1599.300 round_ms_med 356.622 tpr_mean 570.700 | phases commit=5.973 draft=143.709 joint=206.545 reset=0.115 | draft_step 71.855 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDG: med_tok_s 1790.700 mean_tok_s 1632.800 round_ms_med 349.449 tpr_mean 570.700 | phases commit=5.999 draft=143.874 joint=199.197 reset=0.119 | draft_step 71.937 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUD: med_tok_s 1821.100 mean_tok_s 1662.900 round_ms_med 343.086 tpr_mean 570.700 | phases commit=6.021 draft=139.440 joint=197.214 reset=0.114 | draft_step 69.720 | peak_alloc 82.596 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUDC: med_tok_s 1882.300 mean_tok_s 1717.000 round_ms_med 332.289 tpr_mean 570.700 | phases commit=6.064 draft=139.324 joint=186.438 reset=0.116 | draft_step 69.662 | peak_alloc 82.604 peak_w_prefill 83.900 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3a_2195575_i4da/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFK', 'L4PTFKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3376.8 step_ms 63.965 mean_tok_s 3206.1 peak 82.043
+    L4PTFD: med_tok_s 1759.900 mean_tok_s 1603.200 round_ms_med 355.548 tpr_mean 570.878 | phases commit=5.937 draft=143.095 joint=206.141 reset=0.115 | draft_step 71.547 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFK: med_tok_s 1737.400 mean_tok_s 1581.200 round_ms_med 360.535 tpr_mean 570.878 | phases commit=5.971 draft=143.277 joint=210.587 reset=0.116 | draft_step 71.638 | peak_alloc 82.560 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFKW: med_tok_s 1735.700 mean_tok_s 1579.800 round_ms_med 361.451 tpr_mean 570.878 | phases commit=5.936 draft=143.194 joint=211.663 reset=0.116 | draft_step 71.597 | peak_alloc 82.560 peak_w_prefill 83.891 rounds 194 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3c_2195575_i4dc/summary.json | C 128 B 216 batches None arms ['L4PTFD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3278.1 step_ms 65.891 mean_tok_s 3058.8 peak 82.042
+    L4PTFD: med_tok_s 1536.100 mean_tok_s 1387.800 round_ms_med 362.635 tpr_mean 502.529 | phases commit=5.430 draft=140.798 joint=215.004 reset=0.121 | draft_step 70.399 | peak_alloc 82.473 peak_w_prefill 83.890 rounds 55 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d3m_2195575_i4dm/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFK', 'L4PTFKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 337.9 step_ms 23.675 mean_tok_s 331.2 peak 20.425
+    L4PTFD: med_tok_s 53.500 mean_tok_s 47.800 round_ms_med 373.823 tpr_mean 16.968 | phases commit=4.115 draft=108.860 joint=260.852 reset=0.102 | draft_step 54.430 | peak_alloc 17.970 peak_w_prefill 20.496 rounds 34 used None
+    L4PTFK: med_tok_s 48.500 mean_tok_s 44.000 round_ms_med 408.602 tpr_mean 16.968 | phases commit=4.077 draft=106.659 joint=297.396 reset=0.100 | draft_step 53.330 | peak_alloc 18.116 peak_w_prefill 20.496 rounds 34 used None
+    L4PTFKW: med_tok_s 45.300 mean_tok_s 40.800 round_ms_med 438.954 tpr_mean 16.968 | phases commit=4.130 draft=109.083 joint=325.472 reset=0.102 | draft_step 54.541 | peak_alloc 18.116 peak_w_prefill 20.496 rounds 34 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4b_2195576_i4db/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFK', 'L4PTFKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2562.9 step_ms 124.08 mean_tok_s 2478.5 peak 74.964
+    L4PTFD: med_tok_s 1535.200 mean_tok_s 1385.400 round_ms_med 580.986 tpr_mean 779.995 | phases commit=8.360 draft=189.220 joint=383.101 reset=0.120 | draft_step 94.610 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFK: med_tok_s 1546.300 mean_tok_s 1393.200 round_ms_med 576.392 tpr_mean 779.995 | phases commit=8.363 draft=189.822 joint=377.676 reset=0.122 | draft_step 94.911 | peak_alloc 76.933 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFKW: med_tok_s 1590.400 mean_tok_s 1429.000 round_ms_med 559.436 tpr_mean 779.995 | phases commit=8.395 draft=189.729 joint=361.129 reset=0.124 | draft_step 94.865 | peak_alloc 76.933 peak_w_prefill 77.685 rounds 209 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4d_2195576_i4dd/summary.json | C 73 B 318 batches None arms ['L4PTFD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2616.7 step_ms 121.526 mean_tok_s 2509.2 peak 74.962
+    L4PTFD: med_tok_s 1418.200 mean_tok_s 1206.300 round_ms_med 574.725 tpr_mean 638.373 | phases commit=7.897 draft=189.885 joint=377.066 reset=0.122 | draft_step 94.942 | peak_alloc 76.806 peak_w_prefill 77.682 rounds 63 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4d_d4m_2195576_i4dm/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFK', 'L4PTFKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 332.2 step_ms 24.08 mean_tok_s 326.8 peak 20.425
+    L4PTFD: med_tok_s 53.200 mean_tok_s 47.700 round_ms_med 375.671 tpr_mean 16.968 | phases commit=4.169 draft=109.359 joint=262.063 reset=0.100 | draft_step 54.679 | peak_alloc 17.970 peak_w_prefill 20.496 rounds 34 used None
+    L4PTFK: med_tok_s 47.800 mean_tok_s 43.000 round_ms_med 418.050 tpr_mean 16.968 | phases commit=4.197 draft=110.493 joint=303.670 reset=0.100 | draft_step 55.246 | peak_alloc 18.116 peak_w_prefill 20.496 rounds 34 used None
+    L4PTFKW: med_tok_s 45.700 mean_tok_s 41.000 round_ms_med 437.916 tpr_mean 16.968 | phases commit=4.142 draft=107.872 joint=325.974 reset=0.099 | draft_step 53.936 | peak_alloc 18.116 peak_w_prefill 20.496 rounds 34 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4d_f3b_2195575_i4db/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFK', 'L4PTFKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2573.8 step_ms 123.553 mean_tok_s 2494.9 peak 74.964
+    L4PTFD: med_tok_s 1541.700 mean_tok_s 1390.800 round_ms_med 578.917 tpr_mean 779.995 | phases commit=8.375 draft=188.639 joint=381.892 reset=0.117 | draft_step 94.320 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFK: med_tok_s 1553.200 mean_tok_s 1399.600 round_ms_med 574.176 tpr_mean 779.995 | phases commit=8.353 draft=188.904 joint=376.266 reset=0.118 | draft_step 94.452 | peak_alloc 76.933 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFKW: med_tok_s 1599.200 mean_tok_s 1435.200 round_ms_med 558.069 tpr_mean 779.995 | phases commit=8.382 draft=188.836 joint=359.432 reset=0.114 | draft_step 94.418 | peak_alloc 76.933 peak_w_prefill 77.685 rounds 209 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d3a_2195575_i4dca/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDGUDC', 'L4PTFDGUDCD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3375.5 step_ms 63.99 mean_tok_s 3203.5 peak 82.043
+    L4PTFD: med_tok_s 1757.300 mean_tok_s 1601.500 round_ms_med 356.213 tpr_mean 570.700 | phases commit=5.979 draft=143.265 joint=206.441 reset=0.114 | draft_step 71.632 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUDC: med_tok_s 1888.600 mean_tok_s 1722.400 round_ms_med 331.368 tpr_mean 570.700 | phases commit=6.053 draft=138.696 joint=185.819 reset=0.118 | draft_step 69.348 | peak_alloc 82.596 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUDCD: med_tok_s 1924.100 mean_tok_s 1756.900 round_ms_med 324.883 tpr_mean 570.700 | phases commit=6.058 draft=132.287 joint=186.011 reset=0.120 | draft_step 66.144 | peak_alloc 82.604 peak_w_prefill 83.900 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d3m_2195575_i4dm2/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFKW', 'L4PTFDGUDC', 'L4PTFDGUDKWC', 'L4PTFDGUDCD', 'L4PTFDGUDKWCD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 331.0 step_ms 24.168 mean_tok_s 323.0 peak 20.425
+    L4PTFD: med_tok_s 53.900 mean_tok_s 48.000 round_ms_med 371.372 tpr_mean 17.286 | phases commit=4.193 draft=111.272 joint=255.706 reset=0.101 | draft_step 55.636 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUDC: med_tok_s 147.400 mean_tok_s 129.900 round_ms_med 135.570 tpr_mean 17.286 | phases commit=1.824 draft=45.549 joint=88.002 reset=0.104 | draft_step 22.774 | peak_alloc 18.226 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUDCD: med_tok_s 150.700 mean_tok_s 132.400 round_ms_med 132.642 tpr_mean 17.286 | phases commit=1.831 draft=42.619 joint=88.084 reset=0.101 | draft_step 21.309 | peak_alloc 18.241 peak_w_prefill 20.513 rounds 34 used 28
+    L4PTFDGUDKWC: med_tok_s 100.500 mean_tok_s 89.100 round_ms_med 198.727 tpr_mean 17.286 | phases commit=1.826 draft=45.487 joint=151.298 reset=0.108 | draft_step 22.744 | peak_alloc 18.301 peak_w_prefill 20.504 rounds 34 used 28
+    L4PTFDGUDKWCD: med_tok_s 101.900 mean_tok_s 90.100 round_ms_med 195.895 tpr_mean 17.286 | phases commit=1.827 draft=42.657 joint=151.328 reset=0.102 | draft_step 21.328 | peak_alloc 18.151 peak_w_prefill 20.521 rounds 34 used 28
+    L4PTFKW: med_tok_s 46.200 mean_tok_s 41.300 round_ms_med 431.672 tpr_mean 17.286 | phases commit=4.163 draft=108.911 joint=318.121 reset=0.099 | draft_step 54.456 | peak_alloc 18.116 peak_w_prefill 20.496 rounds 34 used 28
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d4b_2195576_i4dcb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGUDKWC', 'L4PTFDGUDKWCD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2563.9 step_ms 124.03 mean_tok_s 2479.7 peak 74.964
+    L4PTFD: med_tok_s 1533.200 mean_tok_s 1384.300 round_ms_med 581.750 tpr_mean 779.526 | phases commit=8.345 draft=189.543 joint=383.609 reset=0.119 | draft_step 94.772 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWC: med_tok_s 1673.800 mean_tok_s 1503.000 round_ms_med 532.525 tpr_mean 779.526 | phases commit=8.404 draft=185.010 joint=338.518 reset=0.124 | draft_step 92.505 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWCD: med_tok_s 1699.000 mean_tok_s 1525.300 round_ms_med 524.659 tpr_mean 779.526 | phases commit=8.421 draft=176.437 joint=338.961 reset=0.125 | draft_step 88.219 | peak_alloc 76.991 peak_w_prefill 77.694 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_d4m_2195576_i4dm2/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFKW', 'L4PTFDGUDC', 'L4PTFDGUDKWC', 'L4PTFDGUDCD', 'L4PTFDGUDKWCD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 327.8 step_ms 24.403 mean_tok_s 322.8 peak 20.425
+    L4PTFD: med_tok_s 54.900 mean_tok_s 48.900 round_ms_med 364.946 tpr_mean 17.286 | phases commit=4.144 draft=108.125 joint=252.435 reset=0.098 | draft_step 54.062 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUDC: med_tok_s 146.000 mean_tok_s 128.600 round_ms_med 137.133 tpr_mean 17.286 | phases commit=1.884 draft=45.852 joint=89.191 reset=0.101 | draft_step 22.926 | peak_alloc 18.226 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUDCD: med_tok_s 149.300 mean_tok_s 131.200 round_ms_med 133.896 tpr_mean 17.286 | phases commit=1.886 draft=42.995 joint=88.867 reset=0.098 | draft_step 21.497 | peak_alloc 18.241 peak_w_prefill 20.513 rounds 34 used 28
+    L4PTFDGUDKWC: med_tok_s 99.700 mean_tok_s 88.400 round_ms_med 200.360 tpr_mean 17.286 | phases commit=1.886 draft=45.851 joint=152.477 reset=0.104 | draft_step 22.925 | peak_alloc 18.301 peak_w_prefill 20.504 rounds 34 used 28
+    L4PTFDGUDKWCD: med_tok_s 101.100 mean_tok_s 89.500 round_ms_med 197.479 tpr_mean 17.286 | phases commit=1.886 draft=43.133 joint=152.247 reset=0.102 | draft_step 21.567 | peak_alloc 18.151 peak_w_prefill 20.521 rounds 34 used 28
+    L4PTFKW: med_tok_s 46.600 mean_tok_s 41.400 round_ms_med 430.355 tpr_mean 17.286 | phases commit=4.163 draft=108.774 joint=317.662 reset=0.099 | draft_step 54.387 | peak_alloc 18.116 peak_w_prefill 20.496 rounds 34 used 28
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_r3b_2195575_i4dcb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGUDKWC', 'L4PTFDGUDKWCD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2577.9 step_ms 123.357 mean_tok_s 2496.9 peak 74.964
+    L4PTFD: med_tok_s 1543.400 mean_tok_s 1393.700 round_ms_med 578.380 tpr_mean 779.526 | phases commit=8.349 draft=188.377 joint=381.028 reset=0.123 | draft_step 94.189 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWC: med_tok_s 1681.400 mean_tok_s 1510.200 round_ms_med 529.931 tpr_mean 779.526 | phases commit=8.378 draft=183.952 joint=336.537 reset=0.133 | draft_step 91.976 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWCD: med_tok_s 1711.200 mean_tok_s 1534.500 round_ms_med 521.313 tpr_mean 779.526 | phases commit=8.396 draft=175.508 joint=336.973 reset=0.119 | draft_step 87.754 | peak_alloc 76.991 peak_w_prefill 77.694 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4dc_r4a_2195576_i4dca/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDGUDC', 'L4PTFDGUDCD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3333.5 step_ms 64.797 mean_tok_s 3167.0 peak 82.043
+    L4PTFD: med_tok_s 1745.300 mean_tok_s 1589.600 round_ms_med 359.073 tpr_mean 570.700 | phases commit=6.030 draft=144.476 joint=207.980 reset=0.116 | draft_step 72.238 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUDC: med_tok_s 1875.500 mean_tok_s 1711.500 round_ms_med 333.456 tpr_mean 570.700 | phases commit=6.113 draft=139.821 joint=186.948 reset=0.120 | draft_step 69.910 | peak_alloc 82.596 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUDCD: med_tok_s 1916.800 mean_tok_s 1746.400 round_ms_med 326.791 tpr_mean 570.700 | phases commit=6.074 draft=133.106 joint=187.021 reset=0.115 | draft_step 66.553 | peak_alloc 82.604 peak_w_prefill 83.900 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g3a_2195575_i4ga/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3365.7 step_ms 64.176 mean_tok_s 3196.7 peak 82.043
+    L4PTFD: med_tok_s 1764.100 mean_tok_s 1607.300 round_ms_med 354.511 tpr_mean 570.878 | phases commit=5.951 draft=142.719 joint=205.541 reset=0.115 | draft_step 71.359 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFDG: med_tok_s 1797.800 mean_tok_s 1494.000 round_ms_med 348.202 tpr_mean 570.878 | phases commit=6.016 draft=142.913 joint=198.579 reset=0.112 | draft_step 71.457 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g3m_2195575_i4gm/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFDG'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 334.4 step_ms 23.923 mean_tok_s 329.1 peak 20.425
+    L4PTFD: med_tok_s 54.600 mean_tok_s 49.400 round_ms_med 363.396 tpr_mean 16.968 | phases commit=4.162 draft=108.280 joint=250.197 reset=0.099 | draft_step 54.140 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used None
+    L4PTFDG: med_tok_s 102.900 mean_tok_s 45.200 round_ms_med 192.339 tpr_mean 16.968 | phases commit=1.828 draft=92.640 joint=97.635 reset=0.098 | draft_step 46.320 | peak_alloc 17.970 peak_w_prefill 20.496 rounds 34 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g4b_2195576_i4gb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDG'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2562.6 step_ms 124.094 mean_tok_s 2482.0 peak 74.964
+    L4PTFD: med_tok_s 1530.600 mean_tok_s 1383.800 round_ms_med 582.041 tpr_mean 779.995 | phases commit=8.356 draft=189.741 joint=383.820 reset=0.124 | draft_step 94.871 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFDG: med_tok_s 1551.100 mean_tok_s 1325.600 round_ms_med 575.150 tpr_mean 779.995 | phases commit=8.383 draft=189.731 joint=376.094 reset=0.129 | draft_step 94.865 | peak_alloc 76.944 peak_w_prefill 77.685 rounds 209 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4g_g4m_2195576_i4gm/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFDG'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 332.4 step_ms 24.069 mean_tok_s 323.6 peak 20.425
+    L4PTFD: med_tok_s 55.200 mean_tok_s 49.300 round_ms_med 363.340 tpr_mean 16.968 | phases commit=4.149 draft=107.154 joint=251.235 reset=0.099 | draft_step 53.577 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used None
+    L4PTFDG: med_tok_s 101.100 mean_tok_s 45.000 round_ms_med 195.798 tpr_mean 16.968 | phases commit=1.853 draft=95.230 joint=98.600 reset=0.101 | draft_step 47.615 | peak_alloc 17.970 peak_w_prefill 20.496 rounds 34 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4g_h3b_2195575_i4gb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDG'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2575.8 step_ms 123.457 mean_tok_s 2494.8 peak 74.964
+    L4PTFD: med_tok_s 1538.200 mean_tok_s 1390.300 round_ms_med 579.444 tpr_mean 779.995 | phases commit=8.359 draft=188.617 joint=381.823 reset=0.125 | draft_step 94.308 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFDG: med_tok_s 1560.300 mean_tok_s 1329.700 round_ms_med 572.247 tpr_mean 779.995 | phases commit=8.391 draft=188.913 joint=374.552 reset=0.118 | draft_step 94.457 | peak_alloc 76.944 peak_w_prefill 77.685 rounds 209 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4g_h4a_2195576_i4ga/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3345.1 step_ms 64.572 mean_tok_s 3177.7 peak 82.043
+    L4PTFD: med_tok_s 1753.400 mean_tok_s 1597.000 round_ms_med 356.907 tpr_mean 570.878 | phases commit=5.979 draft=143.654 joint=206.640 reset=0.113 | draft_step 71.827 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFDG: med_tok_s 1788.000 mean_tok_s 1489.300 round_ms_med 349.705 tpr_mean 570.878 | phases commit=5.993 draft=143.791 joint=199.276 reset=0.116 | draft_step 71.895 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4g_x3a_2195575_i4ga/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3364.7 step_ms 64.196 mean_tok_s 3197.9 peak 82.043
+    L4PTFD: med_tok_s 1757.800 mean_tok_s 1602.000 round_ms_med 355.831 tpr_mean 570.878 | phases commit=5.966 draft=143.145 joint=206.041 reset=0.115 | draft_step 71.573 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFDG: med_tok_s 1794.500 mean_tok_s 1492.400 round_ms_med 348.453 tpr_mean 570.878 | phases commit=6.033 draft=143.364 joint=198.694 reset=0.117 | draft_step 71.682 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4g_x4b_2195576_i4gb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDG'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2560.6 step_ms 124.188 mean_tok_s 2476.9 peak 74.964
+    L4PTFD: med_tok_s 1531.100 mean_tok_s 1382.200 round_ms_med 582.845 tpr_mean 779.995 | phases commit=8.401 draft=189.787 joint=384.372 reset=0.122 | draft_step 94.894 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFDG: med_tok_s 1550.500 mean_tok_s 1324.200 round_ms_med 575.408 tpr_mean 779.995 | phases commit=8.371 draft=190.200 joint=376.614 reset=0.117 | draft_step 95.100 | peak_alloc 76.944 peak_w_prefill 77.685 rounds 209 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j3a_2195575_i4ha/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3372.8 step_ms 64.041 mean_tok_s 3202.8 peak 82.043
+    L4PTFD: med_tok_s 1759.800 mean_tok_s 1603.400 round_ms_med 355.846 tpr_mean 570.700 | phases commit=5.971 draft=143.035 joint=206.213 reset=0.113 | draft_step 71.517 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDG: med_tok_s 1794.900 mean_tok_s 1637.300 round_ms_med 348.601 tpr_mean 570.700 | phases commit=6.014 draft=143.342 joint=198.748 reset=0.116 | draft_step 71.671 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGD: med_tok_s 1814.300 mean_tok_s 1655.800 round_ms_med 344.618 tpr_mean 570.700 | phases commit=6.013 draft=138.989 joint=199.180 reset=0.117 | draft_step 69.495 | peak_alloc 82.595 peak_w_prefill 83.891 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j3m_2195575_i4hm/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 333.2 step_ms 24.01 mean_tok_s 326.3 peak 20.425
+    L4PTFD: med_tok_s 55.100 mean_tok_s 49.100 round_ms_med 362.960 tpr_mean 17.286 | phases commit=4.153 draft=107.774 joint=251.334 reset=0.099 | draft_step 53.887 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDG: med_tok_s 102.000 mean_tok_s 90.700 round_ms_med 195.455 tpr_mean 17.286 | phases commit=1.803 draft=95.743 joint=97.347 reset=0.101 | draft_step 47.871 | peak_alloc 17.970 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGD: med_tok_s 138.100 mean_tok_s 121.800 round_ms_med 144.808 tpr_mean 17.286 | phases commit=1.802 draft=45.353 joint=97.525 reset=0.100 | draft_step 22.677 | peak_alloc 17.979 peak_w_prefill 20.496 rounds 34 used 28
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j4b_2195576_i4hb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2562.6 step_ms 124.093 mean_tok_s 2482.8 peak 74.964
+    L4PTFD: med_tok_s 1531.800 mean_tok_s 1382.000 round_ms_med 583.216 tpr_mean 779.526 | phases commit=8.416 draft=190.045 joint=384.119 reset=0.121 | draft_step 95.022 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDG: med_tok_s 1551.400 mean_tok_s 1401.100 round_ms_med 575.418 tpr_mean 779.526 | phases commit=8.437 draft=190.051 joint=376.547 reset=0.121 | draft_step 95.025 | peak_alloc 76.944 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGD: med_tok_s 1563.100 mean_tok_s 1413.500 round_ms_med 570.538 tpr_mean 779.526 | phases commit=8.409 draft=185.112 joint=376.370 reset=0.121 | draft_step 92.556 | peak_alloc 76.981 peak_w_prefill 77.685 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4h_j4m_2195576_i4hm/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 329.7 step_ms 24.264 mean_tok_s 322.2 peak 20.425
+    L4PTFD: med_tok_s 54.600 mean_tok_s 48.800 round_ms_med 365.261 tpr_mean 17.286 | phases commit=4.195 draft=107.926 joint=252.353 reset=0.099 | draft_step 53.963 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDG: med_tok_s 102.100 mean_tok_s 90.100 round_ms_med 196.422 tpr_mean 17.286 | phases commit=1.877 draft=95.469 joint=98.748 reset=0.102 | draft_step 47.734 | peak_alloc 17.970 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGD: med_tok_s 136.700 mean_tok_s 120.600 round_ms_med 146.270 tpr_mean 17.286 | phases commit=1.879 draft=45.742 joint=98.485 reset=0.101 | draft_step 22.871 | peak_alloc 17.979 peak_w_prefill 20.496 rounds 34 used 28
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4h_o4a_2195576_i4ha/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3341.8 step_ms 64.635 mean_tok_s 3176.6 peak 82.043
+    L4PTFD: med_tok_s 1748.800 mean_tok_s 1595.100 round_ms_med 358.006 tpr_mean 570.700 | phases commit=5.995 draft=143.970 joint=207.225 reset=0.119 | draft_step 71.985 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDG: med_tok_s 1782.600 mean_tok_s 1627.600 round_ms_med 350.906 tpr_mean 570.700 | phases commit=6.028 draft=144.254 joint=199.836 reset=0.114 | draft_step 72.127 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGD: med_tok_s 1810.800 mean_tok_s 1650.100 round_ms_med 345.847 tpr_mean 570.700 | phases commit=6.027 draft=139.636 joint=199.607 reset=0.116 | draft_step 69.818 | peak_alloc 82.595 peak_w_prefill 83.891 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4h_o4b_2195576_i4hb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2560.2 step_ms 124.21 mean_tok_s 2476.4 peak 74.964
+    L4PTFD: med_tok_s 1529.800 mean_tok_s 1381.100 round_ms_med 583.240 tpr_mean 779.526 | phases commit=8.389 draft=190.087 joint=384.212 reset=0.120 | draft_step 95.043 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDG: med_tok_s 1551.900 mean_tok_s 1400.400 round_ms_med 575.495 tpr_mean 779.526 | phases commit=8.433 draft=190.107 joint=376.473 reset=0.120 | draft_step 95.053 | peak_alloc 76.944 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGD: med_tok_s 1564.600 mean_tok_s 1413.100 round_ms_med 570.785 tpr_mean 779.526 | phases commit=8.408 draft=185.293 joint=376.978 reset=0.121 | draft_step 92.647 | peak_alloc 76.981 peak_w_prefill 77.685 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4h_z3b_2195575_i4hb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2579.7 step_ms 123.27 mean_tok_s 2498.1 peak 74.964
+    L4PTFD: med_tok_s 1544.400 mean_tok_s 1394.000 round_ms_med 577.811 tpr_mean 779.526 | phases commit=8.358 draft=188.006 joint=380.833 reset=0.117 | draft_step 94.003 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDG: med_tok_s 1563.100 mean_tok_s 1411.400 round_ms_med 571.073 tpr_mean 779.526 | phases commit=8.366 draft=188.336 joint=374.018 reset=0.123 | draft_step 94.168 | peak_alloc 76.944 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGD: med_tok_s 1575.300 mean_tok_s 1422.700 round_ms_med 566.708 tpr_mean 779.526 | phases commit=8.337 draft=183.820 joint=373.830 reset=0.116 | draft_step 91.910 | peak_alloc 76.981 peak_w_prefill 77.685 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4h_z4a_2195576_i4ha/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3348.2 step_ms 64.512 mean_tok_s 3181.1 peak 82.043
+    L4PTFD: med_tok_s 1750.800 mean_tok_s 1597.700 round_ms_med 357.036 tpr_mean 570.700 | phases commit=5.994 draft=143.810 joint=206.684 reset=0.117 | draft_step 71.905 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDG: med_tok_s 1792.600 mean_tok_s 1634.600 round_ms_med 349.456 tpr_mean 570.700 | phases commit=5.985 draft=143.672 joint=199.118 reset=0.117 | draft_step 71.836 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGD: med_tok_s 1812.100 mean_tok_s 1651.300 round_ms_med 345.610 tpr_mean 570.700 | phases commit=5.998 draft=139.591 joint=199.548 reset=0.114 | draft_step 69.796 | peak_alloc 82.595 peak_w_prefill 83.891 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k3a_2195575_i4ka/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3376.7 step_ms 63.967 mean_tok_s 3205.7 peak 82.043
+    L4PTFD: med_tok_s 1756.300 mean_tok_s 1600.200 round_ms_med 356.310 tpr_mean 570.878 | phases commit=5.970 draft=143.229 joint=206.568 reset=0.117 | draft_step 71.615 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFDG: med_tok_s 1790.500 mean_tok_s 1487.000 round_ms_med 349.068 tpr_mean 570.878 | phases commit=6.013 draft=143.396 joint=198.811 reset=0.122 | draft_step 71.698 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFDGKW: med_tok_s 1777.900 mean_tok_s 1467.300 round_ms_med 352.461 tpr_mean 570.878 | phases commit=5.985 draft=143.492 joint=202.340 reset=0.113 | draft_step 71.746 | peak_alloc 82.568 peak_w_prefill 83.891 rounds 194 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k3m_2195575_i4km/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFKW', 'L4PTFDGKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 333.1 step_ms 24.014 mean_tok_s 327.7 peak 20.425
+    L4PTFD: med_tok_s 52.600 mean_tok_s 47.300 round_ms_med 377.987 tpr_mean 16.968 | phases commit=4.184 draft=110.772 joint=262.733 reset=0.101 | draft_step 55.386 | peak_alloc 17.970 peak_w_prefill 20.496 rounds 34 used None
+    L4PTFDGKW: med_tok_s 76.000 mean_tok_s 38.100 round_ms_med 260.429 tpr_mean 16.968 | phases commit=1.808 draft=94.553 joint=163.207 reset=0.098 | draft_step 47.276 | peak_alloc 18.117 peak_w_prefill 20.496 rounds 34 used None
+    L4PTFKW: med_tok_s 45.000 mean_tok_s 40.800 round_ms_med 440.696 tpr_mean 16.968 | phases commit=4.168 draft=108.903 joint=327.222 reset=0.099 | draft_step 54.452 | peak_alloc 18.116 peak_w_prefill 20.496 rounds 34 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k4b_2195576_i4kb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFKW', 'L4PTFDGKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2560.5 step_ms 124.195 mean_tok_s 2476.3 peak 74.964
+    L4PTFD: med_tok_s 1528.700 mean_tok_s 1381.200 round_ms_med 583.220 tpr_mean 779.995 | phases commit=8.373 draft=189.929 joint=384.683 reset=0.120 | draft_step 94.965 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFDGKW: med_tok_s 1614.900 mean_tok_s 1359.700 round_ms_med 551.898 tpr_mean 779.995 | phases commit=8.437 draft=190.208 joint=352.620 reset=0.117 | draft_step 95.104 | peak_alloc 76.945 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFKW: med_tok_s 1587.900 mean_tok_s 1424.400 round_ms_med 561.094 tpr_mean 779.995 | phases commit=8.406 draft=189.904 joint=361.918 reset=0.123 | draft_step 94.952 | peak_alloc 76.933 peak_w_prefill 77.685 rounds 209 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4k_k4m_2195576_i4km/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFKW', 'L4PTFDGKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 328.9 step_ms 24.327 mean_tok_s 322.1 peak 20.425
+    L4PTFD: med_tok_s 53.400 mean_tok_s 47.800 round_ms_med 374.126 tpr_mean 16.968 | phases commit=4.167 draft=108.705 joint=260.421 reset=0.100 | draft_step 54.352 | peak_alloc 17.970 peak_w_prefill 20.496 rounds 34 used None
+    L4PTFDGKW: med_tok_s 75.700 mean_tok_s 38.000 round_ms_med 262.056 tpr_mean 16.968 | phases commit=1.887 draft=95.058 joint=164.372 reset=0.100 | draft_step 47.529 | peak_alloc 18.117 peak_w_prefill 20.496 rounds 34 used None
+    L4PTFKW: med_tok_s 44.500 mean_tok_s 40.100 round_ms_med 447.486 tpr_mean 16.968 | phases commit=4.194 draft=111.494 joint=331.613 reset=0.101 | draft_step 55.747 | peak_alloc 18.116 peak_w_prefill 20.496 rounds 34 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4k_r3b_2195575_i4kb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFKW', 'L4PTFDGKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2577.0 step_ms 123.4 mean_tok_s 2497.1 peak 74.964
+    L4PTFD: med_tok_s 1543.200 mean_tok_s 1394.800 round_ms_med 578.090 tpr_mean 779.995 | phases commit=8.319 draft=188.207 joint=381.074 reset=0.118 | draft_step 94.103 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFDGKW: med_tok_s 1625.100 mean_tok_s 1370.800 round_ms_med 547.822 tpr_mean 779.995 | phases commit=8.359 draft=188.340 joint=350.189 reset=0.117 | draft_step 94.170 | peak_alloc 76.945 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFKW: med_tok_s 1599.500 mean_tok_s 1438.300 round_ms_med 555.964 tpr_mean 779.995 | phases commit=8.379 draft=188.606 joint=358.706 reset=0.120 | draft_step 94.303 | peak_alloc 76.933 peak_w_prefill 77.685 rounds 209 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4k_r4a_2195576_i4ka/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3341.7 step_ms 64.638 mean_tok_s 3176.3 peak 82.043
+    L4PTFD: med_tok_s 1742.900 mean_tok_s 1587.600 round_ms_med 359.130 tpr_mean 570.878 | phases commit=6.034 draft=144.459 joint=207.930 reset=0.117 | draft_step 72.230 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFDG: med_tok_s 1781.600 mean_tok_s 1479.800 round_ms_med 350.270 tpr_mean 570.878 | phases commit=6.033 draft=144.374 joint=199.535 reset=0.115 | draft_step 72.187 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFDGKW: med_tok_s 1771.000 mean_tok_s 1466.300 round_ms_med 353.819 tpr_mean 570.878 | phases commit=6.032 draft=144.234 joint=203.090 reset=0.112 | draft_step 72.117 | peak_alloc 82.568 peak_w_prefill 83.891 rounds 194 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4k_t3b_2195575_i4kb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFKW', 'L4PTFDGKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2574.9 step_ms 123.501 mean_tok_s 2494.8 peak 74.964
+    L4PTFD: med_tok_s 1541.800 mean_tok_s 1391.900 round_ms_med 578.704 tpr_mean 779.995 | phases commit=8.349 draft=188.435 joint=381.691 reset=0.118 | draft_step 94.218 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFDGKW: med_tok_s 1623.900 mean_tok_s 1367.700 round_ms_med 548.816 tpr_mean 779.995 | phases commit=8.394 draft=189.029 joint=350.590 reset=0.117 | draft_step 94.514 | peak_alloc 76.945 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFKW: med_tok_s 1599.600 mean_tok_s 1435.400 round_ms_med 557.490 tpr_mean 779.995 | phases commit=8.360 draft=188.852 joint=359.607 reset=0.115 | draft_step 94.426 | peak_alloc 76.933 peak_w_prefill 77.685 rounds 209 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3m_2195575_i4mm/summary.json | C 73 B 8 batches None arms None | top ['ARM', 'SH', 'fit', 'gates', 'meta', 'predictions', 'probe_check', 'verdict']
+    SH: steady_tok_s 331.8 step_ms 24.11 mean_tok_s 325.0 peak 20.425
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3p128_2195575_i4mp128/summary.json | C 128 B 64 batches None arms None | top ['ARM', 'SH', 'fit', 'gates', 'meta', 'predictions', 'probe_check', 'verdict']
+    SH: steady_tok_s 2071.6 step_ms 30.894 mean_tok_s 1998.6 peak 37.694
+    fit: {'B_fit': 216, 'B_line': 216, 'C': 128, 'arena_next_GB': 0.280142, 'binding': 'prefill', 'budget_GB': 84.0, 'decode_at_fit': 82.559, 'decode_line': [16.455461, 0.3060349], 'decode_projected_GB': 36.041695, 'floor_B': 216, 'headroom_GB': 0.109, 'int32_limit': 502, 'linearity': [], 'margin_GB': 0.0, 'peak_at_fit': 83.891, 'peak_next': 84.1913, 'prefill_at_fit': 83.891, 'prefill_line': [19.020232, 0.3003276], 'rounds_projected': 2064, 'sh_beside': True, 'sh_fit': 222, 'slope_binding': 0.3003276}
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4m_m3p73_2195575_i4mp73/summary.json | C 73 B 64 batches None arms None | top ['ARM', 'SH', 'fit', 'gates', 'meta', 'predictions', 'probe_check', 'verdict']
+    SH: steady_tok_s 1686.0 step_ms 37.959 mean_tok_s 1645.3 peak 30.279
+    fit: {'B_fit': 352, 'B_line': 352, 'C': 73, 'arena_next_GB': 0.164348, 'binding': 'prefill', 'budget_GB': 84.0, 'decode_at_fit': 83.3981, 'decode_line': [16.454904, 0.1901795], 'decode_projected_GB': 28.626395, 'floor_B': 318, 'headroom_GB': 0.0426, 'int32_limit': 502, 'linearity': [{'B': 8, 'GB': 20.496, 'line_GB': 20.4959, 'residual_GB': 0.0001}], 'margin_GB': 0.0, 'peak_at_fit': 83.9574, 'peak_next': 84.1418, 'prefill_at_fit': 83.9574, 'prefill_line': [19.020009, 0.1844811], 'rounds_projected': 2064, 'sh_beside': True, 'sh_fit': 358, 'slope_binding': 0.1844811}
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4m_n3128_2195575_i4m128/summary.json | C 128 B 216 batches None arms None | top ['ARM', 'SH', 'fit', 'gates', 'meta', 'predictions', 'probe_check', 'verdict']
+    SH: steady_tok_s 3370.5 step_ms 64.086 mean_tok_s 3200.9 peak 82.043
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4m_n373_2195575_i4m73/summary.json | C 73 B 351 batches None arms None | top ['ARM', 'SH', 'fit', 'gates', 'meta', 'predictions', 'probe_check', 'verdict']
+    SH: steady_tok_s 2628.6 step_ms 133.529 mean_tok_s 2545.4 peak 80.769
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4m_v4128_2195576_i4m128/summary.json | C 128 B 216 batches None arms None | top ['ARM', 'SH', 'fit', 'gates', 'meta', 'predictions', 'probe_check', 'verdict']
+    SH: steady_tok_s 3346.7 step_ms 64.541 mean_tok_s 3180.8 peak 82.043
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4s_p3a_2195575_i4sa/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGUD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3369.1 step_ms 64.112 mean_tok_s 3202.0 peak 82.043
+    L4PTFD: med_tok_s 1759.800 mean_tok_s 1604.600 round_ms_med 355.579 tpr_mean 570.700 | phases commit=5.978 draft=143.026 joint=206.070 reset=0.117 | draft_step 71.513 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDG: med_tok_s 1795.100 mean_tok_s 1637.400 round_ms_med 348.589 tpr_mean 570.700 | phases commit=6.013 draft=143.329 joint=198.723 reset=0.115 | draft_step 71.665 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUD: med_tok_s 1828.300 mean_tok_s 1668.400 round_ms_med 341.821 tpr_mean 570.700 | phases commit=6.020 draft=138.778 joint=196.665 reset=0.122 | draft_step 69.389 | peak_alloc 82.596 peak_w_prefill 83.891 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4s_q3a_2195575_i4sa/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGUD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3368.0 step_ms 64.133 mean_tok_s 3199.0 peak 82.043
+    L4PTFD: med_tok_s 1757.100 mean_tok_s 1601.600 round_ms_med 356.167 tpr_mean 570.700 | phases commit=5.994 draft=143.370 joint=206.446 reset=0.115 | draft_step 71.685 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDG: med_tok_s 1795.400 mean_tok_s 1636.700 round_ms_med 348.668 tpr_mean 570.700 | phases commit=6.018 draft=143.475 joint=198.722 reset=0.113 | draft_step 71.737 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUD: med_tok_s 1828.600 mean_tok_s 1667.200 round_ms_med 342.292 tpr_mean 570.700 | phases commit=6.025 draft=138.931 joint=196.839 reset=0.120 | draft_step 69.466 | peak_alloc 82.596 peak_w_prefill 83.891 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4s_q4b_2195576_i4sb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGKW', 'L4PTFDGUDKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2562.0 step_ms 124.123 mean_tok_s 2477.4 peak 74.964
+    L4PTFD: med_tok_s 1529.600 mean_tok_s 1380.800 round_ms_med 583.137 tpr_mean 779.526 | phases commit=8.377 draft=190.090 joint=384.374 reset=0.119 | draft_step 95.045 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGKW: med_tok_s 1616.700 mean_tok_s 1449.000 round_ms_med 551.942 tpr_mean 779.526 | phases commit=8.441 draft=190.206 joint=352.251 reset=0.120 | draft_step 95.103 | peak_alloc 76.945 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKW: med_tok_s 1636.800 mean_tok_s 1468.800 round_ms_med 544.815 tpr_mean 779.526 | phases commit=8.440 draft=185.314 joint=350.563 reset=0.118 | draft_step 92.657 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4s_r3b_2195575_i4sb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGKW', 'L4PTFDGUDKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2575.4 step_ms 123.478 mean_tok_s 2495.3 peak 74.964
+    L4PTFD: med_tok_s 1540.400 mean_tok_s 1389.700 round_ms_med 579.101 tpr_mean 779.526 | phases commit=8.385 draft=188.802 joint=381.619 reset=0.122 | draft_step 94.401 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGKW: med_tok_s 1624.400 mean_tok_s 1458.000 round_ms_med 548.696 tpr_mean 779.526 | phases commit=8.379 draft=188.959 joint=350.805 reset=0.129 | draft_step 94.480 | peak_alloc 76.945 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKW: med_tok_s 1644.000 mean_tok_s 1476.500 round_ms_med 541.936 tpr_mean 779.526 | phases commit=8.380 draft=184.238 joint=348.555 reset=0.133 | draft_step 92.119 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4s_r4a_2195576_i4sa/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGUD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3342.3 step_ms 64.626 mean_tok_s 3176.1 peak 82.043
+    L4PTFD: med_tok_s 1752.800 mean_tok_s 1597.800 round_ms_med 357.067 tpr_mean 570.700 | phases commit=5.982 draft=143.805 joint=206.796 reset=0.116 | draft_step 71.903 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDG: med_tok_s 1787.200 mean_tok_s 1630.600 round_ms_med 349.890 tpr_mean 570.700 | phases commit=6.012 draft=143.871 joint=199.376 reset=0.117 | draft_step 71.936 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUD: med_tok_s 1823.500 mean_tok_s 1662.400 round_ms_med 343.456 tpr_mean 570.700 | phases commit=6.020 draft=139.376 joint=197.370 reset=0.115 | draft_step 69.688 | peak_alloc 82.596 peak_w_prefill 83.891 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s3a_2195575_i4sa/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDG', 'L4PTFDGUD'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3367.4 step_ms 64.145 mean_tok_s 3198.9 peak 82.043
+    L4PTFD: med_tok_s 1760.400 mean_tok_s 1604.400 round_ms_med 355.710 tpr_mean 570.700 | phases commit=5.977 draft=143.077 joint=206.101 reset=0.113 | draft_step 71.538 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDG: med_tok_s 1793.200 mean_tok_s 1636.800 round_ms_med 348.507 tpr_mean 570.700 | phases commit=6.002 draft=143.378 joint=198.649 reset=0.117 | draft_step 71.689 | peak_alloc 82.567 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUD: med_tok_s 1828.100 mean_tok_s 1667.100 round_ms_med 342.471 tpr_mean 570.700 | phases commit=6.023 draft=138.941 joint=196.881 reset=0.118 | draft_step 69.471 | peak_alloc 82.596 peak_w_prefill 83.891 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s3m_2195575_i4sm/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFKW', 'L4PTFDGUD', 'L4PTFDGUDKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 325.3 step_ms 24.595 mean_tok_s 318.9 peak 20.425
+    L4PTFD: med_tok_s 54.600 mean_tok_s 48.600 round_ms_med 367.017 tpr_mean 17.286 | phases commit=4.188 draft=109.968 joint=252.699 reset=0.101 | draft_step 54.984 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUD: med_tok_s 139.700 mean_tok_s 123.100 round_ms_med 143.137 tpr_mean 17.286 | phases commit=1.787 draft=45.343 joint=95.890 reset=0.103 | draft_step 22.672 | peak_alloc 17.979 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUDKW: med_tok_s 96.900 mean_tok_s 85.900 round_ms_med 206.154 tpr_mean 17.286 | phases commit=1.786 draft=45.286 joint=159.001 reset=0.101 | draft_step 22.643 | peak_alloc 18.134 peak_w_prefill 20.504 rounds 34 used 28
+    L4PTFKW: med_tok_s 46.600 mean_tok_s 41.600 round_ms_med 428.476 tpr_mean 17.286 | phases commit=4.191 draft=108.162 joint=316.456 reset=0.100 | draft_step 54.081 | peak_alloc 18.116 peak_w_prefill 20.496 rounds 34 used 28
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s4b_2195576_i4sb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGKW', 'L4PTFDGUDKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2563.8 step_ms 124.035 mean_tok_s 2479.5 peak 74.964
+    L4PTFD: med_tok_s 1533.800 mean_tok_s 1384.200 round_ms_med 581.505 tpr_mean 779.526 | phases commit=8.367 draft=189.381 joint=383.306 reset=0.121 | draft_step 94.691 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGKW: med_tok_s 1617.600 mean_tok_s 1452.600 round_ms_med 550.926 tpr_mean 779.526 | phases commit=8.400 draft=189.663 joint=351.740 reset=0.125 | draft_step 94.832 | peak_alloc 76.945 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKW: med_tok_s 1636.000 mean_tok_s 1470.400 round_ms_med 544.050 tpr_mean 779.526 | phases commit=8.394 draft=185.126 joint=349.935 reset=0.126 | draft_step 92.563 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4s_s4m_2195576_i4sm/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFKW', 'L4PTFDGUD', 'L4PTFDGUDKW'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 334.0 step_ms 23.954 mean_tok_s 325.6 peak 20.425
+    L4PTFD: med_tok_s 54.800 mean_tok_s 48.700 round_ms_med 366.144 tpr_mean 17.286 | phases commit=4.124 draft=108.219 joint=253.773 reset=0.098 | draft_step 54.109 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUD: med_tok_s 138.300 mean_tok_s 122.100 round_ms_med 144.563 tpr_mean 17.286 | phases commit=1.849 draft=45.620 joint=96.950 reset=0.097 | draft_step 22.810 | peak_alloc 17.979 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUDKW: med_tok_s 96.200 mean_tok_s 85.300 round_ms_med 207.819 tpr_mean 17.286 | phases commit=1.851 draft=45.617 joint=160.152 reset=0.098 | draft_step 22.808 | peak_alloc 18.134 peak_w_prefill 20.504 rounds 34 used 28
+    L4PTFKW: med_tok_s 46.600 mean_tok_s 41.300 round_ms_med 431.419 tpr_mean 17.286 | phases commit=4.119 draft=108.323 joint=319.074 reset=0.100 | draft_step 54.161 | peak_alloc 18.116 peak_w_prefill 20.496 rounds 34 used 28
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4u_o3a_2195575_i4ua/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDU'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3371.6 step_ms 64.065 mean_tok_s 3201.0 peak 82.043
+    L4PTFD: med_tok_s 1760.600 mean_tok_s 1605.400 round_ms_med 355.013 tpr_mean 570.878 | phases commit=5.947 draft=142.750 joint=205.788 reset=0.117 | draft_step 71.375 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFDU: med_tok_s 1785.600 mean_tok_s 1626.000 round_ms_med 350.527 tpr_mean 570.878 | phases commit=5.938 draft=142.663 joint=201.302 reset=0.111 | draft_step 71.332 | peak_alloc 82.560 peak_w_prefill 83.891 rounds 194 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u3a_2195575_i4ua/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDU'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3365.3 step_ms 64.185 mean_tok_s 3197.5 peak 82.043
+    L4PTFD: med_tok_s 1764.500 mean_tok_s 1607.400 round_ms_med 354.592 tpr_mean 570.878 | phases commit=5.958 draft=142.704 joint=205.563 reset=0.116 | draft_step 71.352 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFDU: med_tok_s 1782.000 mean_tok_s 1624.400 round_ms_med 351.017 tpr_mean 570.878 | phases commit=5.983 draft=142.860 joint=201.473 reset=0.113 | draft_step 71.430 | peak_alloc 82.560 peak_w_prefill 83.891 rounds 194 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u3m_2195575_i4um/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFDU'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 334.3 step_ms 23.931 mean_tok_s 327.5 peak 20.425
+    L4PTFD: med_tok_s 55.100 mean_tok_s 49.400 round_ms_med 362.715 tpr_mean 16.968 | phases commit=4.101 draft=108.118 joint=250.165 reset=0.098 | draft_step 54.059 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used None
+    L4PTFDU: med_tok_s 56.600 mean_tok_s 51.100 round_ms_med 350.451 tpr_mean 16.968 | phases commit=4.082 draft=107.572 joint=238.336 reset=0.098 | draft_step 53.786 | peak_alloc 17.970 peak_w_prefill 20.496 rounds 34 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u4b_2195576_i4ub/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDU'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2561.7 step_ms 124.138 mean_tok_s 2477.4 peak 74.964
+    L4PTFD: med_tok_s 1528.700 mean_tok_s 1380.100 round_ms_med 583.679 tpr_mean 779.995 | phases commit=8.394 draft=190.143 joint=384.821 reset=0.122 | draft_step 95.072 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFDU: med_tok_s 1540.400 mean_tok_s 1391.500 round_ms_med 578.827 tpr_mean 779.995 | phases commit=8.385 draft=190.141 joint=380.363 reset=0.125 | draft_step 95.070 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4u_u4m_2195576_i4um/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFDU'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 332.4 step_ms 24.065 mean_tok_s 325.2 peak 20.425
+    L4PTFD: med_tok_s 53.900 mean_tok_s 48.400 round_ms_med 370.983 tpr_mean 16.968 | phases commit=4.234 draft=111.097 joint=255.799 reset=0.099 | draft_step 55.548 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used None
+    L4PTFDU: med_tok_s 55.600 mean_tok_s 50.100 round_ms_med 357.139 tpr_mean 16.968 | phases commit=4.219 draft=110.376 joint=242.676 reset=0.102 | draft_step 55.188 | peak_alloc 17.970 peak_w_prefill 20.496 rounds 34 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4u_y3b_2195575_i4ub/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDU'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2574.7 step_ms 123.508 mean_tok_s 2494.7 peak 74.964
+    L4PTFD: med_tok_s 1536.800 mean_tok_s 1390.500 round_ms_med 579.323 tpr_mean 779.995 | phases commit=8.376 draft=188.747 joint=382.296 reset=0.116 | draft_step 94.374 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+    L4PTFDU: med_tok_s 1549.900 mean_tok_s 1400.000 round_ms_med 576.208 tpr_mean 779.995 | phases commit=8.404 draft=189.065 joint=378.131 reset=0.118 | draft_step 94.532 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/i4u_y4a_2195576_i4ua/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDU'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3337.7 step_ms 64.715 mean_tok_s 3171.1 peak 82.043
+    L4PTFD: med_tok_s 1740.800 mean_tok_s 1588.100 round_ms_med 359.333 tpr_mean 570.878 | phases commit=5.996 draft=144.534 joint=208.063 reset=0.118 | draft_step 72.267 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used None
+    L4PTFDU: med_tok_s 1762.700 mean_tok_s 1606.100 round_ms_med 355.155 tpr_mean 570.878 | phases commit=6.052 draft=144.554 joint=203.971 reset=0.119 | draft_step 72.277 | peak_alloc 82.560 peak_w_prefill 83.891 rounds 194 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/int_a1_2195630_inta/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDGUDC', 'L4PTFDGUDCD', 'L4PTFDGUDCDI'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3367.9 step_ms 64.134 mean_tok_s 3198.3 peak 16.542
+    L4PTFD: med_tok_s 1759.400 mean_tok_s 1603.900 round_ms_med 355.699 tpr_mean 570.700 | phases commit=5.972 draft=143.129 joint=206.235 reset=0.118 | draft_step 71.564 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUDC: med_tok_s 1889.900 mean_tok_s 1722.600 round_ms_med 331.321 tpr_mean 570.700 | phases commit=6.082 draft=138.856 joint=185.905 reset=0.125 | draft_step 69.428 | peak_alloc 82.596 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUDCD: med_tok_s 1923.000 mean_tok_s 1755.200 round_ms_med 325.088 tpr_mean 570.700 | phases commit=6.079 draft=132.325 joint=186.245 reset=0.126 | draft_step 66.162 | peak_alloc 82.604 peak_w_prefill 83.900 rounds 194 used 180
+    L4PTFDGUDCDI: med_tok_s 2096.100 mean_tok_s 1910.000 round_ms_med 298.688 tpr_mean 570.700 | phases commit=3.410 draft=125.270 joint=169.468 reset=0.130 | draft_step 62.635 | peak_alloc 82.615 peak_w_prefill 83.909 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/int_b1_2195630_intb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGUDKWC', 'L4PTFDGUDKWCD', 'L4PTFDGUDKWCDM', 'L4PTFDGUDKWCDMT', 'L4PTFDGUDKWCDMTK', 'L4PTFDGUDKWCDI'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2573.3 step_ms 123.579 mean_tok_s 2494.4 peak 16.586
+    L4PTFD: med_tok_s 1540.500 mean_tok_s 1390.600 round_ms_med 579.617 tpr_mean 779.526 | phases commit=8.349 draft=188.681 joint=382.109 reset=0.120 | draft_step 94.341 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWC: med_tok_s 1681.500 mean_tok_s 1508.700 round_ms_med 530.357 tpr_mean 779.526 | phases commit=8.421 draft=184.006 joint=337.061 reset=0.119 | draft_step 92.003 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWCD: med_tok_s 1706.400 mean_tok_s 1532.300 round_ms_med 522.248 tpr_mean 779.526 | phases commit=8.417 draft=176.030 joint=337.266 reset=0.120 | draft_step 88.015 | peak_alloc 76.991 peak_w_prefill 77.694 rounds 209 used 194
+    L4PTFDGUDKWCDI: med_tok_s 1821.000 mean_tok_s 1636.500 round_ms_med 489.953 tpr_mean 779.526 | phases commit=4.133 draft=175.164 joint=309.315 reset=0.203 | draft_step 87.582 | peak_alloc 81.078 peak_w_prefill 81.078 rounds 209 used 194
+    L4PTFDGUDKWCDM: med_tok_s 1721.900 mean_tok_s 1545.000 round_ms_med 517.768 tpr_mean 779.526 | phases commit=4.093 draft=175.815 joint=337.075 reset=0.123 | draft_step 87.907 | peak_alloc 77.000 peak_w_prefill 77.702 rounds 209 used 194
+    L4PTFDGUDKWCDMT: med_tok_s 1730.000 mean_tok_s 1554.400 round_ms_med 515.062 tpr_mean 779.526 | phases commit=4.089 draft=175.631 joint=334.475 reset=0.123 | draft_step 87.816 | peak_alloc 77.009 peak_w_prefill 77.710 rounds 209 used 194
+    L4PTFDGUDKWCDMTK: med_tok_s 1748.900 mean_tok_s 1570.500 round_ms_med 509.347 tpr_mean 779.526 | phases commit=4.083 draft=175.643 joint=329.030 reset=0.125 | draft_step 87.822 | peak_alloc 77.017 peak_w_prefill 77.719 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/int_c1_2195631_intc/summary.json | C 81 B 287 batches None arms ['L4PTFD', 'L4PTFDGUDC', 'L4PTFDGUDCD', 'L4PTFDGUDCDI'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2816.3 step_ms 101.907 mean_tok_s 2708.3 peak 16.573
+    L4PTFD: med_tok_s 1604.500 mean_tok_s 1484.000 round_ms_med 502.569 tpr_mean 733.290 | phases commit=7.895 draft=182.734 joint=311.802 reset=0.118 | draft_step 91.367 | peak_alloc 75.873 peak_w_prefill 76.803 rounds 200 used 186
+    L4PTFDGUDC: med_tok_s 1692.600 mean_tok_s 1567.000 round_ms_med 476.585 tpr_mean 733.290 | phases commit=7.923 draft=178.102 joint=290.197 reset=0.129 | draft_step 89.051 | peak_alloc 75.918 peak_w_prefill 76.803 rounds 200 used 186
+    L4PTFDGUDCD: med_tok_s 1717.900 mean_tok_s 1591.100 round_ms_med 468.973 tpr_mean 733.290 | phases commit=7.953 draft=170.651 joint=290.565 reset=0.128 | draft_step 85.326 | peak_alloc 75.927 peak_w_prefill 76.811 rounds 200 used 186
+    L4PTFDGUDCDI: med_tok_s 1854.800 mean_tok_s 1719.600 round_ms_med 434.388 tpr_mean 733.290 | phases commit=4.043 draft=160.493 joint=269.513 reset=0.161 | draft_step 80.246 | peak_alloc 75.939 peak_w_prefill 76.820 rounds 200 used 186
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/int_d1_2195630_intd/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGUDKWC', 'L4PTFDGUDKWCD', 'L4PTFDGUDKWCDIN'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2573.9 step_ms 123.546 mean_tok_s 2493.6 peak 16.586
+    L4PTFD: med_tok_s 1539.900 mean_tok_s 1390.900 round_ms_med 579.109 tpr_mean 779.526 | phases commit=8.376 draft=188.475 joint=381.776 reset=0.120 | draft_step 94.237 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWC: med_tok_s 1679.300 mean_tok_s 1508.200 round_ms_med 531.049 tpr_mean 779.526 | phases commit=8.385 draft=184.239 joint=337.512 reset=0.127 | draft_step 92.120 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWCD: med_tok_s 1706.200 mean_tok_s 1533.200 round_ms_med 521.864 tpr_mean 779.526 | phases commit=8.428 draft=175.868 joint=337.204 reset=0.126 | draft_step 87.934 | peak_alloc 76.991 peak_w_prefill 77.694 rounds 209 used 194
+    L4PTFDGUDKWCDIN: med_tok_s 1843.200 mean_tok_s 1657.900 round_ms_med 483.756 tpr_mean 779.526 | phases commit=4.117 draft=166.196 joint=312.382 reset=0.131 | draft_step 83.098 | peak_alloc 77.003 peak_w_prefill 77.702 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/int_m1_2195630_intm/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFDGUDC', 'L4PTFDGUDKWC', 'L4PTFDGUDCD', 'L4PTFDGUDKWCD', 'L4PTFDGUDCDM', 'L4PTFDGUDKWCDM', 'L4PTFDGUDCDMT', 'L4PTFDGUDKWCDMT', 'L4PTFDGUDKWCDMTK', 'L4PTFDGUDCDMTR', 'L4PTFDGUDKWCDMTKR', 'L4PTFDGUDCDI', 'L4PTFDGUDKWCDI'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 329.4 step_ms 24.287 mean_tok_s 323.0 peak 16.454
+    L4PTFD: med_tok_s 53.900 mean_tok_s 47.700 round_ms_med 367.814 tpr_mean 16.818 | phases commit=4.080 draft=110.019 joint=252.941 reset=0.100 | draft_step 55.010 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 22
+    L4PTFDGUDC: med_tok_s 145.700 mean_tok_s 127.200 round_ms_med 135.475 tpr_mean 16.818 | phases commit=1.830 draft=45.559 joint=87.930 reset=0.106 | draft_step 22.779 | peak_alloc 18.226 peak_w_prefill 20.496 rounds 34 used 22
+    L4PTFDGUDCD: med_tok_s 149.100 mean_tok_s 129.700 round_ms_med 132.396 tpr_mean 16.818 | phases commit=1.826 draft=42.553 joint=87.918 reset=0.106 | draft_step 21.276 | peak_alloc 18.241 peak_w_prefill 20.513 rounds 34 used 22
+    L4PTFDGUDCDI: med_tok_s 157.900 mean_tok_s 137.000 round_ms_med 125.452 tpr_mean 16.818 | phases commit=2.048 draft=39.602 joint=83.619 reset=0.100 | draft_step 19.801 | peak_alloc 18.318 peak_w_prefill 20.590 rounds 34 used 22
+    L4PTFDGUDCDM: med_tok_s 148.900 mean_tok_s 129.600 round_ms_med 132.675 tpr_mean 16.818 | phases commit=2.046 draft=42.636 joint=87.878 reset=0.104 | draft_step 21.318 | peak_alloc 18.013 peak_w_prefill 20.530 rounds 34 used 22
+    L4PTFDGUDCDMT: med_tok_s 151.800 mean_tok_s 131.700 round_ms_med 130.578 tpr_mean 16.818 | phases commit=2.069 draft=42.559 joint=85.796 reset=0.105 | draft_step 21.279 | peak_alloc 18.030 peak_w_prefill 20.547 rounds 34 used 22
+    L4PTFDGUDCDMTR: med_tok_s 156.200 mean_tok_s 135.600 round_ms_med 126.871 tpr_mean 16.818 | phases commit=2.051 draft=38.768 joint=85.910 reset=0.107 | draft_step 19.384 | peak_alloc 18.056 peak_w_prefill 20.573 rounds 34 used 22
+    L4PTFDGUDKWC: med_tok_s 99.500 mean_tok_s 87.400 round_ms_med 198.525 tpr_mean 16.818 | phases commit=1.827 draft=45.470 joint=151.066 reset=0.101 | draft_step 22.735 | peak_alloc 18.301 peak_w_prefill 20.504 rounds 34 used 22
+    L4PTFDGUDKWCD: med_tok_s 100.900 mean_tok_s 88.400 round_ms_med 195.806 tpr_mean 16.818 | phases commit=1.827 draft=42.672 joint=151.138 reset=0.102 | draft_step 21.336 | peak_alloc 18.151 peak_w_prefill 20.521 rounds 34 used 22
+    L4PTFDGUDKWCDI: med_tok_s 77.500 mean_tok_s 71.000 round_ms_med 245.625 tpr_mean 16.818 | phases commit=2.045 draft=43.313 joint=200.065 reset=0.155 | draft_step 21.657 | peak_alloc 19.371 peak_w_prefill 20.598 rounds 34 used 22
+    L4PTFDGUDKWCDM: med_tok_s 100.900 mean_tok_s 88.400 round_ms_med 195.876 tpr_mean 16.818 | phases commit=2.064 draft=42.684 joint=150.995 reset=0.103 | draft_step 21.342 | peak_alloc 18.168 peak_w_prefill 20.539 rounds 34 used 22
+    L4PTFDGUDKWCDMT: med_tok_s 102.200 mean_tok_s 89.400 round_ms_med 194.029 tpr_mean 16.818 | phases commit=2.049 draft=42.631 joint=149.117 reset=0.104 | draft_step 21.316 | peak_alloc 18.185 peak_w_prefill 20.556 rounds 34 used 22
+    L4PTFDGUDKWCDMTK: med_tok_s 103.200 mean_tok_s 90.300 round_ms_med 191.984 tpr_mean 16.818 | phases commit=2.064 draft=42.548 joint=147.199 reset=0.102 | draft_step 21.274 | peak_alloc 18.361 peak_w_prefill 20.564 rounds 34 used 22
+    L4PTFDGUDKWCDMTKR: med_tok_s 105.300 mean_tok_s 92.100 round_ms_med 188.110 tpr_mean 16.818 | phases commit=2.049 draft=38.732 joint=147.127 reset=0.108 | draft_step 19.366 | peak_alloc 18.211 peak_w_prefill 20.581 rounds 34 used 22
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/int_m2_2195630_intm/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFDGUDC', 'L4PTFDGUDKWC', 'L4PTFDGUDCD', 'L4PTFDGUDKWCD', 'L4PTFDGUDCDM', 'L4PTFDGUDKWCDM', 'L4PTFDGUDCDMT', 'L4PTFDGUDKWCDMT', 'L4PTFDGUDKWCDMTK', 'L4PTFDGUDCDMTR', 'L4PTFDGUDKWCDMTKR', 'L4PTFDGUDCDI', 'L4PTFDGUDKWCDI'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 329.1 step_ms 24.309 mean_tok_s 322.3 peak 16.454
+    L4PTFD: med_tok_s 53.900 mean_tok_s 47.800 round_ms_med 363.703 tpr_mean 16.818 | phases commit=4.121 draft=108.418 joint=251.466 reset=0.100 | draft_step 54.209 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 22
+    L4PTFDGUDC: med_tok_s 145.800 mean_tok_s 127.000 round_ms_med 135.454 tpr_mean 16.818 | phases commit=1.830 draft=45.562 joint=87.940 reset=0.103 | draft_step 22.781 | peak_alloc 18.226 peak_w_prefill 20.496 rounds 34 used 22
+    L4PTFDGUDCD: med_tok_s 149.000 mean_tok_s 129.600 round_ms_med 132.447 tpr_mean 16.818 | phases commit=1.829 draft=42.554 joint=87.979 reset=0.104 | draft_step 21.277 | peak_alloc 18.241 peak_w_prefill 20.513 rounds 34 used 22
+    L4PTFDGUDCDI: med_tok_s 157.900 mean_tok_s 136.900 round_ms_med 125.456 tpr_mean 16.818 | phases commit=2.049 draft=39.606 joint=83.679 reset=0.100 | draft_step 19.803 | peak_alloc 18.318 peak_w_prefill 20.590 rounds 34 used 22
+    L4PTFDGUDCDM: med_tok_s 148.800 mean_tok_s 129.400 round_ms_med 132.718 tpr_mean 16.818 | phases commit=2.047 draft=42.607 joint=87.969 reset=0.105 | draft_step 21.303 | peak_alloc 18.013 peak_w_prefill 20.530 rounds 34 used 22
+    L4PTFDGUDCDMT: med_tok_s 151.700 mean_tok_s 131.600 round_ms_med 130.628 tpr_mean 16.818 | phases commit=2.070 draft=42.556 joint=85.872 reset=0.106 | draft_step 21.278 | peak_alloc 18.030 peak_w_prefill 20.547 rounds 34 used 22
+    L4PTFDGUDCDMTR: med_tok_s 156.200 mean_tok_s 135.400 round_ms_med 126.884 tpr_mean 16.818 | phases commit=2.052 draft=38.778 joint=85.951 reset=0.104 | draft_step 19.389 | peak_alloc 18.056 peak_w_prefill 20.573 rounds 34 used 22
+    L4PTFDGUDKWC: med_tok_s 99.400 mean_tok_s 87.400 round_ms_med 198.636 tpr_mean 16.818 | phases commit=1.829 draft=45.469 joint=151.222 reset=0.103 | draft_step 22.735 | peak_alloc 18.301 peak_w_prefill 20.504 rounds 34 used 22
+    L4PTFDGUDKWCD: med_tok_s 100.800 mean_tok_s 88.300 round_ms_med 195.841 tpr_mean 16.818 | phases commit=1.828 draft=42.655 joint=151.143 reset=0.101 | draft_step 21.328 | peak_alloc 18.151 peak_w_prefill 20.521 rounds 34 used 22
+    L4PTFDGUDKWCDI: med_tok_s 99.700 mean_tok_s 87.300 round_ms_med 198.539 tpr_mean 16.818 | phases commit=2.047 draft=43.248 joint=153.162 reset=0.156 | draft_step 21.624 | peak_alloc 18.902 peak_w_prefill 20.598 rounds 34 used 22
+    L4PTFDGUDKWCDM: med_tok_s 100.800 mean_tok_s 88.400 round_ms_med 195.919 tpr_mean 16.818 | phases commit=2.065 draft=42.680 joint=151.054 reset=0.104 | draft_step 21.340 | peak_alloc 18.168 peak_w_prefill 20.539 rounds 34 used 22
+    L4PTFDGUDKWCDMT: med_tok_s 102.100 mean_tok_s 89.300 round_ms_med 194.080 tpr_mean 16.818 | phases commit=2.050 draft=42.653 joint=149.146 reset=0.103 | draft_step 21.326 | peak_alloc 18.185 peak_w_prefill 20.556 rounds 34 used 22
+    L4PTFDGUDKWCDMTK: med_tok_s 103.200 mean_tok_s 90.200 round_ms_med 191.964 tpr_mean 16.818 | phases commit=2.064 draft=42.570 joint=147.163 reset=0.104 | draft_step 21.285 | peak_alloc 18.361 peak_w_prefill 20.564 rounds 34 used 22
+    L4PTFDGUDKWCDMTKR: med_tok_s 105.300 mean_tok_s 92.200 round_ms_med 188.129 tpr_mean 16.818 | phases commit=2.052 draft=38.735 joint=147.165 reset=0.105 | draft_step 19.367 | peak_alloc 18.211 peak_w_prefill 20.581 rounds 34 used 22
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/j1_a1_2195631_j1a/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDGUDC', 'L4PTFDGUDCD', 'L4PTFDGUDCDJ1', 'L4PTFDGUDCDJ3'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3329.1 step_ms 64.882 mean_tok_s 3162.9 peak 16.542
+    L4PTFD: med_tok_s 1746.200 mean_tok_s 1589.700 round_ms_med 358.907 tpr_mean 570.700 | phases commit=6.026 draft=144.381 joint=207.732 reset=0.122 | draft_step 72.191 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUDC: med_tok_s 1879.200 mean_tok_s 1713.800 round_ms_med 333.007 tpr_mean 570.700 | phases commit=6.132 draft=139.524 joint=186.786 reset=0.125 | draft_step 69.762 | peak_alloc 82.596 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUDCD: med_tok_s 1909.500 mean_tok_s 1742.500 round_ms_med 327.355 tpr_mean 570.700 | phases commit=6.120 draft=133.167 joint=187.498 reset=0.125 | draft_step 66.584 | peak_alloc 82.604 peak_w_prefill 83.900 rounds 194 used 180
+    L4PTFDGUDCDJ1: med_tok_s 2009.200 mean_tok_s 1833.400 round_ms_med 311.320 tpr_mean 570.700 | phases commit=6.130 draft=128.178 joint=176.374 reset=0.125 | draft_step 64.089 | peak_alloc 82.615 peak_w_prefill 83.909 rounds 194 used 180
+    L4PTFDGUDCDJ3: med_tok_s 2035.300 mean_tok_s 1857.100 round_ms_med 307.255 tpr_mean 570.700 | phases commit=6.153 draft=126.341 joint=174.260 reset=0.127 | draft_step 63.170 | peak_alloc 82.623 peak_w_prefill 83.917 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/j1_b1_2195631_j1b/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGUDKWC', 'L4PTFDGUDKWCD', 'L4PTFDGUDKWCDJ1'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2567.7 step_ms 123.846 mean_tok_s 2486.1 peak 16.586
+    L4PTFD: med_tok_s 1533.200 mean_tok_s 1384.900 round_ms_med 581.557 tpr_mean 779.526 | phases commit=8.343 draft=189.694 joint=383.418 reset=0.125 | draft_step 94.847 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWC: med_tok_s 1671.900 mean_tok_s 1500.700 round_ms_med 533.278 tpr_mean 779.526 | phases commit=8.404 draft=185.248 joint=338.700 reset=0.132 | draft_step 92.624 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWCD: med_tok_s 1698.200 mean_tok_s 1524.100 round_ms_med 524.948 tpr_mean 779.526 | phases commit=8.422 draft=176.844 joint=339.128 reset=0.138 | draft_step 88.422 | peak_alloc 76.991 peak_w_prefill 77.694 rounds 209 used 194
+    L4PTFDGUDKWCDJ1: med_tok_s 1785.600 mean_tok_s 1603.500 round_ms_med 499.510 tpr_mean 779.526 | phases commit=8.429 draft=168.803 joint=321.302 reset=0.133 | draft_step 84.401 | peak_alloc 77.003 peak_w_prefill 77.702 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/j1_f1_2195630_j1f/summary.json | C None B None batches None arms None | top ['gates', 'meta', 'shapes']
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/j1_m1_2195631_j1m/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFKW', 'L4PTFDGUDC', 'L4PTFDGUDKWC', 'L4PTFDGUDCD', 'L4PTFDGUDKWCD', 'L4PTFDGUDCDJ1', 'L4PTFDGUDKWCDJ1', 'L4PTFDGUDCDJ3'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 327.6 step_ms 24.417 mean_tok_s 321.1 peak 16.454
+    L4PTFD: med_tok_s 54.300 mean_tok_s 48.200 round_ms_med 369.037 tpr_mean 17.286 | phases commit=4.104 draft=110.919 joint=253.989 reset=0.102 | draft_step 55.459 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUDC: med_tok_s 145.800 mean_tok_s 128.500 round_ms_med 137.068 tpr_mean 17.286 | phases commit=1.879 draft=45.915 joint=89.125 reset=0.105 | draft_step 22.957 | peak_alloc 18.226 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUDCD: med_tok_s 149.300 mean_tok_s 131.000 round_ms_med 134.029 tpr_mean 17.286 | phases commit=1.882 draft=43.001 joint=88.931 reset=0.102 | draft_step 21.500 | peak_alloc 18.241 peak_w_prefill 20.513 rounds 34 used 28
+    L4PTFDGUDCDJ1: med_tok_s 145.300 mean_tok_s 127.800 round_ms_med 137.430 tpr_mean 17.286 | phases commit=1.885 draft=44.630 joint=90.803 reset=0.105 | draft_step 22.315 | peak_alloc 18.259 peak_w_prefill 20.530 rounds 34 used 28
+    L4PTFDGUDCDJ3: med_tok_s 151.700 mean_tok_s 133.200 round_ms_med 131.830 tpr_mean 17.286 | phases commit=1.889 draft=42.036 joint=87.788 reset=0.103 | draft_step 21.018 | peak_alloc 18.030 peak_w_prefill 20.547 rounds 34 used 28
+    L4PTFDGUDKWC: med_tok_s 99.700 mean_tok_s 88.400 round_ms_med 200.349 tpr_mean 17.286 | phases commit=1.880 draft=45.894 joint=152.462 reset=0.104 | draft_step 22.947 | peak_alloc 18.301 peak_w_prefill 20.504 rounds 34 used 28
+    L4PTFDGUDKWCD: med_tok_s 101.100 mean_tok_s 89.500 round_ms_med 197.435 tpr_mean 17.286 | phases commit=1.883 draft=43.036 joint=152.410 reset=0.103 | draft_step 21.518 | peak_alloc 18.151 peak_w_prefill 20.521 rounds 34 used 28
+    L4PTFDGUDKWCDJ1: med_tok_s 99.500 mean_tok_s 88.100 round_ms_med 200.796 tpr_mean 17.286 | phases commit=1.883 draft=44.590 joint=154.217 reset=0.103 | draft_step 22.295 | peak_alloc 18.168 peak_w_prefill 20.539 rounds 34 used 28
+    L4PTFKW: med_tok_s 47.100 mean_tok_s 41.800 round_ms_med 426.478 tpr_mean 17.286 | phases commit=4.059 draft=107.387 joint=314.671 reset=0.101 | draft_step 53.694 | peak_alloc 18.116 peak_w_prefill 20.496 rounds 34 used 28
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/recon7_mem1_2195630_r7mem/summary.json | C 81 B None batches [64, 192] arms None | top ['fit', 'gates', 'meta', 'per_batch']
+    B192/ARM: med_tok_s 1417.100 mean_tok_s 1403.000 round_ms_med 363.374 tpr_mean 511.600 | phases commit=4.830 draft=130.621 joint=227.432 reset=0.116 | draft_step None | peak_alloc 56.203 peak_w_prefill 57.676 rounds 49 used None
+    B192/SH: {'device_used_end_GB': 68.416, 'gpu_peak_alloc_GB': 68.95, 'gpu_peak_reserved_GB': 69.527, 'prefill_s': 498.5}
+    B64/ARM: med_tok_s 648.300 mean_tok_s 635.900 round_ms_med 264.600 tpr_mean 167.889 | phases commit=3.111 draft=107.429 joint=153.498 reset=0.113 | draft_step None | peak_alloc 29.702 peak_w_prefill 31.905 rounds 49 used None
+    B64/SH: {'device_used_end_GB': 30.16, 'gpu_peak_alloc_GB': 31.358, 'gpu_peak_reserved_GB': 31.709, 'prefill_s': 276.8}
+    fit: {'B_fit': 322, 'B_fit_usable': 321, 'B_line': 322, 'C': 81, 'anchor_fits': True, 'arena_next_GB': 0.181191, 'binding': 'prefill', 'budget_GB': 84.0, 'decode_at_fit': 83.1223, 'decode_line': [16.454195, 0.2070437], 'floor_B': 0, 'headroom_GB': 0.1512, 'int32_limit': 502, 'margin_GB': 0.1, 'peak_at_anchor_GB': 76.8022, 'peak_at_fit': 83.8488, 'peak_next': 84.0501, 'prefill_at_fit': 83.8488, 'prefill_line': [19.0201, 0.2013312], 'r3_model_bfit': [321.5, 322.8], 'sh_beside': True, 'sh_fit': None, 'slope_binding': 0.2013312}
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/recon7_pa1_2195631_r7pa/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDGUDC', 'L4PTFDGUDCD', 'L4PTFDGUDCDP'] | top ['SH', 'SPEC', 'gates', 'meta']
+    SH: steady_tok_s 3340.8 step_ms 64.655 mean_tok_s 3174.5 peak 82.043
+    L4PTFD: med_tok_s 1743.000 mean_tok_s 1588.000 round_ms_med 358.826 tpr_mean 569.989 | phases commit=6.004 draft=144.509 joint=207.726 reset=0.114 | draft_step 72.254 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 177
+    L4PTFDGUDC: med_tok_s 1879.400 mean_tok_s 1709.900 round_ms_med 333.356 tpr_mean 569.989 | phases commit=6.118 draft=139.890 joint=186.933 reset=0.117 | draft_step 69.945 | peak_alloc 82.596 peak_w_prefill 83.891 rounds 194 used 177
+    L4PTFDGUDCD: med_tok_s 1913.800 mean_tok_s 1744.500 round_ms_med 326.728 tpr_mean 569.989 | phases commit=6.108 draft=133.168 joint=186.890 reset=0.112 | draft_step 66.584 | peak_alloc 82.604 peak_w_prefill 83.900 rounds 194 used 177
+    L4PTFDGUDCDP: med_tok_s 1917.500 mean_tok_s 1746.200 round_ms_med 326.393 tpr_mean 569.989 | phases commit=6.077 draft=132.918 joint=186.934 reset=0.125 | draft_step 66.459 | peak_alloc 82.617 peak_w_prefill 83.909 rounds 194 used 177
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/recon7_pb1_2195630_r7pb/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGUDKWC', 'L4PTFDGUDKWCD', 'L4PTFDGUDKWCDP'] | top ['SH', 'SPEC', 'gates', 'meta']
+    SH: steady_tok_s 2576.6 step_ms 123.417 mean_tok_s 2496.0 peak 74.964
+    L4PTFD: med_tok_s 1538.800 mean_tok_s 1389.000 round_ms_med 578.484 tpr_mean 778.052 | phases commit=8.349 draft=188.445 joint=381.691 reset=0.117 | draft_step 94.222 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 191
+    L4PTFDGUDKWC: med_tok_s 1681.200 mean_tok_s 1507.300 round_ms_med 530.694 tpr_mean 778.052 | phases commit=8.410 draft=184.126 joint=336.816 reset=0.128 | draft_step 92.063 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 191
+    L4PTFDGUDKWCD: med_tok_s 1706.300 mean_tok_s 1531.800 round_ms_med 521.508 tpr_mean 778.052 | phases commit=8.410 draft=175.718 joint=337.076 reset=0.120 | draft_step 87.859 | peak_alloc 76.991 peak_w_prefill 77.694 rounds 209 used 191
+    L4PTFDGUDKWCDP: med_tok_s 1705.700 mean_tok_s 1529.100 round_ms_med 522.388 tpr_mean 778.052 | phases commit=8.408 draft=175.938 joint=338.101 reset=0.141 | draft_step 87.969 | peak_alloc 77.007 peak_w_prefill 77.702 rounds 209 used 191
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/recon7_pm1_2195631_r7pm/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFDGUDC', 'L4PTFDGUDKWC', 'L4PTFDGUDCD', 'L4PTFDGUDKWCD', 'L4PTFDGUDCDP', 'L4PTFDGUDKWCDP'] | top ['SH', 'SPEC', 'gates', 'meta']
+    SH: steady_tok_s 335.6 step_ms 23.838 mean_tok_s 327.8 peak 20.425
+    L4PTFD: med_tok_s 76.800 mean_tok_s 68.800 round_ms_med 248.505 tpr_mean 16.524 | phases commit=3.828 draft=106.429 joint=138.081 reset=0.098 | draft_step 53.215 | peak_alloc 17.968 peak_w_prefill 20.496 rounds 34 used 21
+    L4PTFDGUDC: med_tok_s 159.100 mean_tok_s 139.000 round_ms_med 121.462 tpr_mean 16.524 | phases commit=3.466 draft=44.844 joint=73.048 reset=0.102 | draft_step 22.422 | peak_alloc 18.225 peak_w_prefill 20.496 rounds 34 used 21
+    L4PTFDGUDCD: med_tok_s 158.100 mean_tok_s 142.600 round_ms_med 118.171 tpr_mean 16.524 | phases commit=3.428 draft=42.060 joint=72.566 reset=0.102 | draft_step 21.030 | peak_alloc 18.240 peak_w_prefill 20.513 rounds 34 used 21
+    L4PTFDGUDCDP: med_tok_s 150.600 mean_tok_s 131.200 round_ms_med 130.973 tpr_mean 16.524 | phases commit=4.227 draft=42.434 joint=84.031 reset=0.114 | draft_step 21.217 | peak_alloc 18.012 peak_w_prefill 20.530 rounds 34 used 21
+    L4PTFDGUDKWC: med_tok_s 147.800 mean_tok_s 131.200 round_ms_med 128.806 tpr_mean 16.524 | phases commit=3.334 draft=44.731 joint=80.358 reset=0.102 | draft_step 22.366 | peak_alloc 18.233 peak_w_prefill 20.504 rounds 34 used 21
+    L4PTFDGUDKWCD: med_tok_s 151.900 mean_tok_s 136.100 round_ms_med 124.632 tpr_mean 16.524 | phases commit=3.259 draft=41.910 joint=79.498 reset=0.099 | draft_step 20.955 | peak_alloc 18.004 peak_w_prefill 20.521 rounds 34 used 21
+    L4PTFDGUDKWCDP: med_tok_s 128.700 mean_tok_s 118.600 round_ms_med 142.762 tpr_mean 16.524 | phases commit=4.167 draft=42.432 joint=96.189 reset=0.118 | draft_step 21.216 | peak_alloc 18.021 peak_w_prefill 20.539 rounds 34 used 21
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/recon7_x1r3_2195630_r7s/summary.json | C None B None batches None arms None | top ['gates', 'meta', 'shapes']
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_a1a_2195573_sp5a/summary.json | C 128 B 216 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3366.0 step_ms 64.171 mean_tok_s 3197.2 peak 82.043
+    L3: med_tok_s 1005.600 mean_tok_s 984.400 round_ms_med 643.001 tpr_mean 638.413 | phases commit=80.696 draft=313.346 verify=249.027 | draft_step None | peak_alloc 82.044 peak_w_prefill None rounds 171 used None
+    L3P: med_tok_s 859.600 mean_tok_s 847.600 round_ms_med 750.903 tpr_mean 638.469 | phases commit=90.505 draft=329.590 verify=329.776 | draft_step None | peak_alloc 82.044 peak_w_prefill None rounds 171 used None
+    L4P: med_tok_s 699.000 mean_tok_s 695.400 round_ms_med 905.654 tpr_mean 636.494 | phases commit=196.530 draft=154.734 joint=424.002 truncate=130.073 | draft_step None | peak_alloc 83.187 peak_w_prefill None rounds 171 used None
+    L4PP: med_tok_s 619.200 mean_tok_s 617.000 round_ms_med 1028.585 tpr_mean 637.506 | phases commit=208.886 draft=176.269 joint=507.711 truncate=132.331 | draft_step None | peak_alloc 83.511 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_a1b_2195573_sp5b/summary.json | C 73 B 318 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2574.0 step_ms 123.544 mean_tok_s 2495.1 peak 74.964
+    L3: med_tok_s 978.500 mean_tok_s 961.400 round_ms_med 967.882 tpr_mean 937.712 | phases commit=78.614 draft=456.477 verify=433.290 | draft_step None | peak_alloc 74.965 peak_w_prefill None rounds 171 used None
+    L3P: med_tok_s 914.600 mean_tok_s 895.400 round_ms_med 1038.581 tpr_mean 937.650 | phases commit=79.233 draft=496.611 verify=462.246 | draft_step None | peak_alloc 76.820 peak_w_prefill None rounds 171 used None
+    L4P: med_tok_s 737.100 mean_tok_s 732.900 round_ms_med 1263.002 tpr_mean 923.631 | phases commit=268.343 draft=210.636 joint=658.648 truncate=127.428 | draft_step None | peak_alloc 76.818 peak_w_prefill None rounds 171 used None
+    L4PP: med_tok_s 683.500 mean_tok_s 680.000 round_ms_med 1365.494 tpr_mean 924.531 | phases commit=266.376 draft=260.763 joint=710.512 truncate=127.745 | draft_step None | peak_alloc 79.009 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_a1m_2195573_sp5m/summary.json | C 73 B 8 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 332.1 step_ms 24.087 mean_tok_s 324.6 peak 20.425
+    L3: med_tok_s 39.200 mean_tok_s 38.800 round_ms_med 604.559 tpr_mean 23.474 | phases commit=90.864 draft=292.856 verify=220.558 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+    L3P: med_tok_s 33.500 mean_tok_s 33.100 round_ms_med 709.323 tpr_mean 23.526 | phases commit=90.856 draft=308.417 verify=310.479 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+    L4P: med_tok_s 26.100 mean_tok_s 26.000 round_ms_med 839.719 tpr_mean 21.789 | phases commit=204.366 draft=138.779 joint=358.529 truncate=137.440 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+    L4PP: med_tok_s 22.600 mean_tok_s 22.300 round_ms_med 981.682 tpr_mean 21.895 | phases commit=205.500 draft=153.487 joint=484.356 truncate=137.463 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_a2b_2195574_sp5b/summary.json | C 73 B 318 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2562.7 step_ms 124.087 mean_tok_s 2478.2 peak 74.964
+    L3: med_tok_s 969.000 mean_tok_s 952.200 round_ms_med 977.460 tpr_mean 937.712 | phases commit=80.216 draft=461.251 verify=436.219 | draft_step None | peak_alloc 74.965 peak_w_prefill None rounds 171 used None
+    L3P: med_tok_s 914.500 mean_tok_s 894.100 round_ms_med 1038.821 tpr_mean 937.650 | phases commit=80.098 draft=490.319 verify=467.801 | draft_step None | peak_alloc 76.820 peak_w_prefill None rounds 171 used None
+    L4P: med_tok_s 731.600 mean_tok_s 727.500 round_ms_med 1272.025 tpr_mean 923.631 | phases commit=272.069 draft=211.772 joint=661.608 truncate=129.040 | draft_step None | peak_alloc 76.818 peak_w_prefill None rounds 171 used None
+    L4PP: med_tok_s 674.300 mean_tok_s 671.000 round_ms_med 1383.348 tpr_mean 924.531 | phases commit=270.646 draft=266.692 joint=718.294 truncate=129.889 | draft_step None | peak_alloc 79.009 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_a2m_2195574_sp5m/summary.json | C 73 B 8 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 333.8 step_ms 23.963 mean_tok_s 326.5 peak 20.425
+    L3: med_tok_s 37.900 mean_tok_s 37.700 round_ms_med 622.224 tpr_mean 23.474 | phases commit=92.173 draft=301.425 verify=228.512 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+    L3P: med_tok_s 33.300 mean_tok_s 32.900 round_ms_med 715.022 tpr_mean 23.526 | phases commit=91.365 draft=311.621 verify=312.017 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+    L4P: med_tok_s 25.900 mean_tok_s 25.700 round_ms_med 848.674 tpr_mean 21.789 | phases commit=206.279 draft=140.088 joint=363.010 truncate=138.200 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+    L4PP: med_tok_s 22.200 mean_tok_s 22.200 round_ms_med 984.283 tpr_mean 21.895 | phases commit=206.138 draft=154.970 joint=487.128 truncate=137.188 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_a3a_2195575_sp5a/summary.json | C 128 B 216 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3365.4 step_ms 64.182 mean_tok_s 3197.3 peak 82.043
+    L3: med_tok_s 1007.400 mean_tok_s 986.900 round_ms_med 641.544 tpr_mean 638.413 | phases commit=80.978 draft=312.392 verify=248.202 | draft_step None | peak_alloc 82.044 peak_w_prefill None rounds 171 used None
+    L3P: med_tok_s 878.600 mean_tok_s 864.500 round_ms_med 735.480 tpr_mean 638.469 | phases commit=89.115 draft=323.455 verify=323.039 | draft_step None | peak_alloc 82.044 peak_w_prefill None rounds 171 used None
+    L4P: med_tok_s 701.300 mean_tok_s 698.800 round_ms_med 901.645 tpr_mean 636.494 | phases commit=194.361 draft=154.195 joint=422.275 truncate=129.964 | draft_step None | peak_alloc 83.187 peak_w_prefill None rounds 171 used None
+    L4PP: med_tok_s 625.500 mean_tok_s 624.300 round_ms_med 1012.407 tpr_mean 637.506 | phases commit=207.224 draft=171.245 joint=502.635 truncate=130.214 | draft_step None | peak_alloc 83.511 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_a3b_2195575_sp5b/summary.json | C 73 B 318 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2575.4 step_ms 123.475 mean_tok_s 2495.9 peak 74.964
+    L3: med_tok_s 979.600 mean_tok_s 962.400 round_ms_med 968.013 tpr_mean 937.712 | phases commit=80.791 draft=454.947 verify=432.153 | draft_step None | peak_alloc 74.965 peak_w_prefill None rounds 171 used None
+    L3P: med_tok_s 916.500 mean_tok_s 897.800 round_ms_med 1035.281 tpr_mean 937.650 | phases commit=80.987 draft=493.338 verify=460.262 | draft_step None | peak_alloc 76.820 peak_w_prefill None rounds 171 used None
+    L4P: med_tok_s 736.700 mean_tok_s 733.200 round_ms_med 1262.046 tpr_mean 923.631 | phases commit=267.068 draft=210.491 joint=657.130 truncate=130.693 | draft_step None | peak_alloc 76.818 peak_w_prefill None rounds 171 used None
+    L4PP: med_tok_s 681.100 mean_tok_s 677.200 round_ms_med 1372.996 tpr_mean 924.531 | phases commit=266.821 draft=264.859 joint=709.449 truncate=132.258 | draft_step None | peak_alloc 79.009 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_a3m_2195575_sp5m/summary.json | C 73 B 8 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 321.3 step_ms 24.895 mean_tok_s 315.4 peak 20.425
+    L3: med_tok_s 38.100 mean_tok_s 37.600 round_ms_med 623.398 tpr_mean 23.474 | phases commit=92.545 draft=302.084 verify=228.163 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+    L3P: med_tok_s 33.200 mean_tok_s 32.800 round_ms_med 717.755 tpr_mean 23.526 | phases commit=92.104 draft=311.914 verify=315.164 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+    L4P: med_tok_s 25.900 mean_tok_s 25.700 round_ms_med 847.758 tpr_mean 21.789 | phases commit=206.448 draft=140.749 joint=361.173 truncate=138.670 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+    L4PP: med_tok_s 22.200 mean_tok_s 22.100 round_ms_med 992.444 tpr_mean 21.895 | phases commit=206.729 draft=155.168 joint=490.999 truncate=138.516 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_g1c_2195573_wgcm/summary.json | C 73 B 100 batches None arms None | top ['CHK', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2078.7 step_ms 48.106 mean_tok_s None peak None
+    L4F: med_tok_s 416.400 mean_tok_s 370.800 round_ms_med 701.278 tpr_mean 292.421 | phases commit=175.751 draft=139.083 joint=271.592 truncate=113.307 | draft_step None | peak_alloc None peak_w_prefill None rounds 21 used None
+    L4X: med_tok_s 409.800 mean_tok_s 408.700 round_ms_med 721.022 tpr_mean 294.895 | phases commit=179.267 draft=144.744 joint=280.651 truncate=115.668 | draft_step None | peak_alloc None peak_w_prefill None rounds 21 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_g1m_2195573_wgm/summary.json | C 73 B 100 batches None arms None | top ['ACC', 'SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2076.4 step_ms 48.16 mean_tok_s 1997.1 peak 36.612
+    L4F: med_tok_s 432.800 mean_tok_s 431.900 round_ms_med 674.681 tpr_mean 292.421 | phases commit=173.762 draft=136.584 joint=261.789 truncate=102.052 | draft_step None | peak_alloc 36.612 peak_w_prefill None rounds 21 used None
+    L4X: med_tok_s 425.400 mean_tok_s 424.100 round_ms_med 694.092 tpr_mean 294.895 | phases commit=175.699 draft=138.819 joint=267.445 truncate=110.094 | draft_step None | peak_alloc 36.612 peak_w_prefill None rounds 21 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_j2b_2195574_sp3b/summary.json | C 73 B 318 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2567.3 step_ms 123.867 mean_tok_s 2485.7 peak 74.964
+    L3: med_tok_s 973.900 mean_tok_s 956.700 round_ms_med 973.068 tpr_mean 937.712 | phases commit=79.968 draft=458.609 verify=435.017 | draft_step None | peak_alloc 74.965 peak_w_prefill None rounds 171 used None
+    L4F: med_tok_s 797.200 mean_tok_s 790.800 round_ms_med 1185.637 tpr_mean 944.719 | phases commit=224.053 draft=199.730 joint=659.447 truncate=101.174 | draft_step None | peak_alloc 76.701 peak_w_prefill None rounds 171 used None
+    L4X: med_tok_s 850.600 mean_tok_s 843.300 round_ms_med 1118.059 tpr_mean 947.056 | phases commit=211.706 draft=197.635 joint=539.004 truncate=169.805 | draft_step None | peak_alloc 76.366 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_j2m_2195574_sp3m/summary.json | C 128 B 8 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 330.3 step_ms 24.224 mean_tok_s 323.8 peak 21.352
+    L3: med_tok_s 38.800 mean_tok_s 38.400 round_ms_med 615.087 tpr_mean 23.684 | phases commit=92.065 draft=297.847 verify=225.447 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4F: med_tok_s 37.200 mean_tok_s 36.700 round_ms_med 645.350 tpr_mean 23.684 | phases commit=177.768 draft=139.771 joint=212.465 truncate=113.443 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4X: med_tok_s 34.300 mean_tok_s 34.000 round_ms_med 694.273 tpr_mean 23.684 | phases commit=177.385 draft=138.110 joint=268.471 truncate=111.641 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_s1b_2195573_sp3b/summary.json | C 73 B 318 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2576.5 step_ms 123.425 mean_tok_s 2496.3 peak 74.964
+    L3: med_tok_s 987.300 mean_tok_s 968.200 round_ms_med 959.410 tpr_mean 936.663 | phases commit=79.130 draft=451.900 verify=428.385 | draft_step None | peak_alloc 74.965 peak_w_prefill None rounds 171 used None
+    L4F: med_tok_s 806.100 mean_tok_s 800.300 round_ms_med 1172.318 tpr_mean 944.888 | phases commit=218.661 draft=198.110 joint=653.039 truncate=101.158 | draft_step None | peak_alloc 76.701 peak_w_prefill None rounds 171 used None
+    L4X: med_tok_s 858.700 mean_tok_s 850.900 round_ms_med 1105.340 tpr_mean 945.550 | phases commit=205.509 draft=196.427 joint=532.821 truncate=169.255 | draft_step None | peak_alloc 76.366 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_s1m_2195573_sp3m/summary.json | C 128 B 8 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 321.7 step_ms 24.871 mean_tok_s 315.2 peak 21.352
+    L3: med_tok_s 38.100 mean_tok_s 37.700 round_ms_med 630.012 tpr_mean 23.684 | phases commit=94.169 draft=305.155 verify=230.130 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4F: med_tok_s 36.700 mean_tok_s 36.200 round_ms_med 652.731 tpr_mean 23.684 | phases commit=180.303 draft=141.305 joint=215.276 truncate=115.265 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4X: med_tok_s 33.700 mean_tok_s 33.300 round_ms_med 711.167 tpr_mean 23.684 | phases commit=181.614 draft=141.129 joint=272.486 truncate=114.102 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_u2a_2195574_sp3a/summary.json | C 128 B 216 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3340.7 step_ms 64.657 mean_tok_s 3174.2 peak 82.043
+    L3: med_tok_s 1001.400 mean_tok_s 983.000 round_ms_med 645.033 tpr_mean 638.837 | phases commit=77.943 draft=316.237 verify=250.311 | draft_step None | peak_alloc 82.044 peak_w_prefill None rounds 171 used None
+    L4F: med_tok_s 782.500 mean_tok_s 773.900 round_ms_med 824.271 tpr_mean 644.013 | phases commit=159.310 draft=156.856 joint=407.667 truncate=99.357 | draft_step None | peak_alloc 83.007 peak_w_prefill None rounds 171 used None
+    L4P: med_tok_s 700.400 mean_tok_s 697.600 round_ms_med 913.479 tpr_mean 635.312 | phases commit=188.720 draft=167.063 joint=431.708 truncate=126.352 | draft_step None | peak_alloc 83.187 peak_w_prefill None rounds 171 used None
+    L4X: med_tok_s 860.500 mean_tok_s 852.100 round_ms_med 750.136 tpr_mean 644.969 | phases commit=160.879 draft=154.919 joint=332.228 truncate=101.599 | draft_step None | peak_alloc 82.780 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_u2m_2195574_sp3m/summary.json | C 128 B 8 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 328.6 step_ms 24.344 mean_tok_s 321.0 peak 21.352
+    L3: med_tok_s 38.400 mean_tok_s 37.800 round_ms_med 624.620 tpr_mean 23.684 | phases commit=92.748 draft=302.471 verify=228.702 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4F: med_tok_s 37.400 mean_tok_s 37.000 round_ms_med 639.780 tpr_mean 23.684 | phases commit=176.012 draft=138.893 joint=211.296 truncate=112.557 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4P: med_tok_s 25.900 mean_tok_s 25.400 round_ms_med 850.546 tpr_mean 21.632 | phases commit=206.688 draft=140.548 joint=363.750 truncate=138.829 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4X: med_tok_s 34.500 mean_tok_s 34.000 round_ms_med 694.605 tpr_mean 23.684 | phases commit=177.317 draft=137.351 joint=266.888 truncate=111.782 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_w1b_2195573_sp3b/summary.json | C 73 B 318 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2575.0 step_ms 123.496 mean_tok_s 2495.1 peak 74.964
+    L3: med_tok_s 984.800 mean_tok_s 964.400 round_ms_med 963.789 tpr_mean 936.663 | phases commit=79.856 draft=453.476 verify=429.791 | draft_step None | peak_alloc 74.965 peak_w_prefill None rounds 171 used None
+    L4F: med_tok_s 805.100 mean_tok_s 798.800 round_ms_med 1175.812 tpr_mean 944.888 | phases commit=220.084 draft=198.150 joint=654.015 truncate=101.212 | draft_step None | peak_alloc 76.701 peak_w_prefill None rounds 171 used None
+    L4P: med_tok_s 739.800 mean_tok_s 735.000 round_ms_med 1255.432 tpr_mean 921.638 | phases commit=264.511 draft=209.947 joint=655.006 truncate=126.883 | draft_step None | peak_alloc 76.818 peak_w_prefill None rounds 171 used None
+    L4X: med_tok_s 855.900 mean_tok_s 847.700 round_ms_med 1108.677 tpr_mean 945.550 | phases commit=207.066 draft=196.817 joint=533.976 truncate=170.252 | draft_step None | peak_alloc 76.366 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_x13b_2195573_sp3b/summary.json | C 73 B 318 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2577.1 step_ms 123.393 mean_tok_s 2496.4 peak 74.964
+    L3: med_tok_s 979.400 mean_tok_s 963.000 round_ms_med 967.332 tpr_mean 937.712 | phases commit=79.432 draft=455.024 verify=432.563 | draft_step None | peak_alloc 74.965 peak_w_prefill None rounds 171 used None
+    L4F: med_tok_s 801.200 mean_tok_s 795.400 round_ms_med 1178.887 tpr_mean 944.719 | phases commit=221.236 draft=198.476 joint=656.356 truncate=101.865 | draft_step None | peak_alloc 76.701 peak_w_prefill None rounds 171 used None
+    L4X: med_tok_s 857.200 mean_tok_s 849.900 round_ms_med 1109.405 tpr_mean 947.056 | phases commit=208.805 draft=196.368 joint=535.627 truncate=167.982 | draft_step None | peak_alloc 76.366 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_x173_2195573_rb73/summary.json | C 73 B 318 batches None arms ['SH'] | top ['DR', 'GT', 'R2', 'ROLLBACK', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2582.6 step_ms 123.134 mean_tok_s None peak 74.962
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_x173_2195573_rg73/summary.json | C 73 B 318 batches None arms ['SH'] | top ['DR', 'GT', 'R2', 'RAGGED', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2576.3 step_ms 123.434 mean_tok_s None peak 74.964
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_x1m_2195573_sp3m/summary.json | C 128 B 8 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 333.2 step_ms 24.013 mean_tok_s 327.6 peak 21.352
+    L3: med_tok_s 38.300 mean_tok_s 37.900 round_ms_med 625.965 tpr_mean 23.684 | phases commit=93.476 draft=302.919 verify=228.582 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4F: med_tok_s 37.200 mean_tok_s 36.800 round_ms_med 642.489 tpr_mean 23.684 | phases commit=177.957 draft=138.315 joint=210.595 truncate=113.975 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4X: med_tok_s 34.400 mean_tok_s 33.900 round_ms_med 695.200 tpr_mean 23.684 | phases commit=177.427 draft=138.466 joint=266.838 truncate=111.965 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_y1a_2195573_sp3a/summary.json | C 128 B 216 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3373.1 step_ms 64.036 mean_tok_s 3203.7 peak 82.043
+    L3: med_tok_s 1013.600 mean_tok_s 993.000 round_ms_med 637.819 tpr_mean 638.413 | phases commit=78.234 draft=311.692 verify=247.256 | draft_step None | peak_alloc 82.044 peak_w_prefill None rounds 171 used None
+    L4F: med_tok_s 783.000 mean_tok_s 774.000 round_ms_med 824.405 tpr_mean 644.013 | phases commit=162.075 draft=155.391 joint=405.492 truncate=100.642 | draft_step None | peak_alloc 83.007 peak_w_prefill None rounds 171 used None
+    L4P: med_tok_s 708.000 mean_tok_s 705.000 round_ms_med 893.793 tpr_mean 636.494 | phases commit=190.372 draft=154.081 joint=422.344 truncate=126.967 | draft_step None | peak_alloc 83.187 peak_w_prefill None rounds 171 used None
+    L4X: med_tok_s 865.200 mean_tok_s 855.500 round_ms_med 747.254 tpr_mean 644.950 | phases commit=162.848 draft=153.927 joint=328.852 truncate=101.148 | draft_step None | peak_alloc 82.780 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_y1b_2195573_sp3b/summary.json | C 73 B 318 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2575.1 step_ms 123.49 mean_tok_s 2494.8 peak 74.964
+    L3: med_tok_s 975.800 mean_tok_s 958.900 round_ms_med 971.179 tpr_mean 937.712 | phases commit=81.136 draft=456.843 verify=433.844 | draft_step None | peak_alloc 74.965 peak_w_prefill None rounds 171 used None
+    L4F: med_tok_s 795.700 mean_tok_s 789.500 round_ms_med 1187.900 tpr_mean 944.719 | phases commit=222.905 draft=200.444 joint=660.480 truncate=103.458 | draft_step None | peak_alloc 76.701 peak_w_prefill None rounds 171 used None
+    L4P: med_tok_s 738.600 mean_tok_s 734.400 round_ms_med 1259.981 tpr_mean 923.631 | phases commit=268.000 draft=210.066 joint=657.550 truncate=126.716 | draft_step None | peak_alloc 76.818 peak_w_prefill None rounds 171 used None
+    L4X: med_tok_s 852.900 mean_tok_s 846.100 round_ms_med 1115.073 tpr_mean 947.056 | phases commit=210.127 draft=197.510 joint=538.420 truncate=168.660 | draft_step None | peak_alloc 76.366 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_y1m_2195573_sp3m/summary.json | C 128 B 8 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 328.2 step_ms 24.378 mean_tok_s 321.8 peak 21.352
+    L3: med_tok_s 38.400 mean_tok_s 37.900 round_ms_med 624.103 tpr_mean 23.684 | phases commit=92.916 draft=302.760 verify=228.641 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4F: med_tok_s 37.300 mean_tok_s 36.800 round_ms_med 642.219 tpr_mean 23.684 | phases commit=177.149 draft=139.921 joint=212.235 truncate=113.246 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4P: med_tok_s 25.700 mean_tok_s 25.300 round_ms_med 852.357 tpr_mean 21.632 | phases commit=207.275 draft=141.022 joint=362.866 truncate=139.524 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4X: med_tok_s 34.200 mean_tok_s 33.800 round_ms_med 699.916 tpr_mean 23.684 | phases commit=177.684 draft=139.978 joint=269.763 truncate=111.906 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_y2a_2195574_sp3a/summary.json | C 128 B 216 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3349.7 step_ms 64.484 mean_tok_s 3182.5 peak 82.043
+    L3: med_tok_s 1007.700 mean_tok_s 987.000 round_ms_med 641.517 tpr_mean 638.413 | phases commit=78.725 draft=313.805 verify=248.596 | draft_step None | peak_alloc 82.044 peak_w_prefill None rounds 171 used None
+    L4F: med_tok_s 780.900 mean_tok_s 773.000 round_ms_med 826.848 tpr_mean 644.013 | phases commit=159.479 draft=156.903 joint=409.380 truncate=99.693 | draft_step None | peak_alloc 83.007 peak_w_prefill None rounds 171 used None
+    L4P: med_tok_s 708.300 mean_tok_s 703.400 round_ms_med 896.345 tpr_mean 636.494 | phases commit=190.218 draft=154.959 joint=424.233 truncate=127.065 | draft_step None | peak_alloc 83.187 peak_w_prefill None rounds 171 used None
+    L4X: med_tok_s 862.300 mean_tok_s 853.300 round_ms_med 749.440 tpr_mean 644.950 | phases commit=162.275 draft=154.799 joint=330.735 truncate=101.343 | draft_step None | peak_alloc 82.780 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_y2b_2195574_sp3b/summary.json | C 73 B 318 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2564.5 step_ms 124.003 mean_tok_s 2479.2 peak 74.964
+    L3: med_tok_s 971.800 mean_tok_s 954.600 round_ms_med 974.876 tpr_mean 937.712 | phases commit=79.493 draft=459.865 verify=435.417 | draft_step None | peak_alloc 74.965 peak_w_prefill None rounds 171 used None
+    L4F: med_tok_s 796.000 mean_tok_s 789.200 round_ms_med 1188.464 tpr_mean 944.719 | phases commit=225.303 draft=200.270 joint=660.892 truncate=100.496 | draft_step None | peak_alloc 76.701 peak_w_prefill None rounds 171 used None
+    L4P: med_tok_s 734.400 mean_tok_s 729.800 round_ms_med 1267.330 tpr_mean 923.631 | phases commit=271.586 draft=210.848 joint=660.395 truncate=127.170 | draft_step None | peak_alloc 76.818 peak_w_prefill None rounds 171 used None
+    L4X: med_tok_s 847.300 mean_tok_s 840.300 round_ms_med 1122.537 tpr_mean 947.056 | phases commit=213.132 draft=198.223 joint=539.924 truncate=170.563 | draft_step None | peak_alloc 76.366 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_y2m_2195574_sp3m/summary.json | C 128 B 8 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 327.7 step_ms 24.412 mean_tok_s 320.5 peak 21.352
+    L3: med_tok_s 38.500 mean_tok_s 38.100 round_ms_med 617.372 tpr_mean 23.684 | phases commit=91.986 draft=300.697 verify=227.010 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4F: med_tok_s 37.300 mean_tok_s 36.900 round_ms_med 639.330 tpr_mean 23.684 | phases commit=177.136 draft=138.198 joint=211.234 truncate=113.234 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4P: med_tok_s 25.800 mean_tok_s 25.400 round_ms_med 853.079 tpr_mean 21.632 | phases commit=207.391 draft=140.990 joint=362.188 truncate=139.460 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4X: med_tok_s 34.100 mean_tok_s 33.800 round_ms_med 700.872 tpr_mean 23.684 | phases commit=178.066 draft=140.234 joint=269.962 truncate=112.040 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_y4a_2195576_sp3a/summary.json | C 128 B 216 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3342.2 step_ms 64.629 mean_tok_s 3175.3 peak 82.043
+    L3: med_tok_s 996.500 mean_tok_s 976.300 round_ms_med 649.102 tpr_mean 638.413 | phases commit=80.664 draft=316.910 verify=250.876 | draft_step None | peak_alloc 82.044 peak_w_prefill None rounds 171 used None
+    L4F: med_tok_s 778.600 mean_tok_s 769.300 round_ms_med 828.446 tpr_mean 644.013 | phases commit=160.979 draft=157.679 joint=409.938 truncate=100.270 | draft_step None | peak_alloc 83.007 peak_w_prefill None rounds 171 used None
+    L4P: med_tok_s 705.000 mean_tok_s 701.700 round_ms_med 900.485 tpr_mean 636.494 | phases commit=188.676 draft=156.270 joint=427.559 truncate=126.456 | draft_step None | peak_alloc 83.187 peak_w_prefill None rounds 171 used None
+    L4X: med_tok_s 859.800 mean_tok_s 850.700 round_ms_med 752.016 tpr_mean 644.950 | phases commit=161.478 draft=155.130 joint=332.922 truncate=101.723 | draft_step None | peak_alloc 82.780 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_y4b_2195576_sp3b/summary.json | C 73 B 318 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2565.1 step_ms 123.97 mean_tok_s 2479.5 peak 74.964
+    L3: med_tok_s 971.700 mean_tok_s 954.400 round_ms_med 975.390 tpr_mean 937.712 | phases commit=79.828 draft=460.509 verify=435.492 | draft_step None | peak_alloc 74.965 peak_w_prefill None rounds 171 used None
+    L4F: med_tok_s 793.800 mean_tok_s 787.800 round_ms_med 1190.859 tpr_mean 944.719 | phases commit=224.088 draft=201.058 joint=662.582 truncate=102.085 | draft_step None | peak_alloc 76.701 peak_w_prefill None rounds 171 used None
+    L4P: med_tok_s 736.800 mean_tok_s 732.300 round_ms_med 1262.726 tpr_mean 923.631 | phases commit=269.674 draft=210.307 joint=658.730 truncate=127.815 | draft_step None | peak_alloc 76.818 peak_w_prefill None rounds 171 used None
+    L4X: med_tok_s 850.400 mean_tok_s 843.500 round_ms_med 1118.002 tpr_mean 947.056 | phases commit=211.336 draft=197.686 joint=538.839 truncate=169.613 | draft_step None | peak_alloc 76.366 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/sp_y4m_2195576_sp3m/summary.json | C 128 B 8 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 328.0 step_ms 24.391 mean_tok_s 319.0 peak 21.352
+    L3: med_tok_s 38.400 mean_tok_s 38.100 round_ms_med 622.967 tpr_mean 23.684 | phases commit=92.178 draft=301.773 verify=229.033 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4F: med_tok_s 37.100 mean_tok_s 36.800 round_ms_med 644.815 tpr_mean 23.684 | phases commit=176.750 draft=140.909 joint=212.284 truncate=112.930 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4P: med_tok_s 25.800 mean_tok_s 25.400 round_ms_med 847.101 tpr_mean 21.632 | phases commit=207.350 draft=138.991 joint=361.069 truncate=138.915 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+    L4X: med_tok_s 34.100 mean_tok_s 33.700 round_ms_med 702.553 tpr_mean 23.684 | phases commit=177.717 draft=140.476 joint=271.332 truncate=112.101 | draft_step None | peak_alloc 21.354 peak_w_prefill None rounds 21 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/st1_a1_2195631_st1a/summary.json | C 128 B 216 batches None arms ['L4PTFD', 'L4PTFDGUDC', 'L4PTFDGUDCD', 'L4PTFDGUDCDM', 'L4PTFDGUDCDMT'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3347.5 step_ms 64.525 mean_tok_s 3179.6 peak 82.043
+    L4PTFD: med_tok_s 1750.700 mean_tok_s 1596.500 round_ms_med 357.305 tpr_mean 570.700 | phases commit=5.998 draft=143.924 joint=206.999 reset=0.116 | draft_step 71.962 | peak_alloc 82.559 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUDC: med_tok_s 1881.100 mean_tok_s 1716.500 round_ms_med 332.451 tpr_mean 570.700 | phases commit=6.088 draft=139.515 joint=186.390 reset=0.122 | draft_step 69.757 | peak_alloc 82.596 peak_w_prefill 83.891 rounds 194 used 180
+    L4PTFDGUDCD: med_tok_s 1914.600 mean_tok_s 1747.300 round_ms_med 326.394 tpr_mean 570.700 | phases commit=6.075 draft=133.080 joint=186.865 reset=0.124 | draft_step 66.540 | peak_alloc 82.604 peak_w_prefill 83.900 rounds 194 used 180
+    L4PTFDGUDCDM: med_tok_s 1927.500 mean_tok_s 1760.000 round_ms_med 324.058 tpr_mean 570.700 | phases commit=3.446 draft=132.970 joint=187.135 reset=0.121 | draft_step 66.485 | peak_alloc 82.613 peak_w_prefill 83.909 rounds 194 used 180
+    L4PTFDGUDCDMT: med_tok_s 1943.700 mean_tok_s 1773.200 round_ms_med 321.690 tpr_mean 570.700 | phases commit=3.434 draft=133.120 joint=184.562 reset=0.122 | draft_step 66.560 | peak_alloc 82.621 peak_w_prefill 83.917 rounds 194 used 180
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/st1_b1_2195630_st1b/summary.json | C 73 B 318 batches None arms ['L4PTFD', 'L4PTFDGUDKWC', 'L4PTFDGUDKWCD', 'L4PTFDGUDKWCDM', 'L4PTFDGUDKWCDMT'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2576.4 step_ms 123.429 mean_tok_s 2496.2 peak 74.964
+    L4PTFD: med_tok_s 1542.400 mean_tok_s 1392.100 round_ms_med 578.761 tpr_mean 779.526 | phases commit=8.358 draft=188.639 joint=381.505 reset=0.118 | draft_step 94.320 | peak_alloc 76.932 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWC: med_tok_s 1680.200 mean_tok_s 1508.800 round_ms_med 530.530 tpr_mean 779.526 | phases commit=8.399 draft=184.103 joint=337.138 reset=0.127 | draft_step 92.052 | peak_alloc 76.983 peak_w_prefill 77.685 rounds 209 used 194
+    L4PTFDGUDKWCD: med_tok_s 1707.100 mean_tok_s 1533.200 round_ms_med 522.138 tpr_mean 779.526 | phases commit=8.405 draft=175.876 joint=337.082 reset=0.117 | draft_step 87.938 | peak_alloc 76.991 peak_w_prefill 77.694 rounds 209 used 194
+    L4PTFDGUDKWCDM: med_tok_s 1721.300 mean_tok_s 1547.000 round_ms_med 517.555 tpr_mean 779.526 | phases commit=4.087 draft=175.827 joint=336.972 reset=0.119 | draft_step 87.913 | peak_alloc 77.000 peak_w_prefill 77.702 rounds 209 used 194
+    L4PTFDGUDKWCDMT: med_tok_s 1730.000 mean_tok_s 1554.400 round_ms_med 515.187 tpr_mean 779.526 | phases commit=4.080 draft=175.787 joint=334.728 reset=0.121 | draft_step 87.894 | peak_alloc 77.009 peak_w_prefill 77.710 rounds 209 used 194
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/st1_m1_2195630_st1m/summary.json | C 73 B 8 batches None arms ['L4PTFD', 'L4PTFKW', 'L4PTFDGUDC', 'L4PTFDGUDKWC', 'L4PTFDGUDCD', 'L4PTFDGUDKWCD', 'L4PTFDGUDCDM', 'L4PTFDGUDKWCDM', 'L4PTFDGUDCDMT', 'L4PTFDGUDKWCDMT'] | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 326.5 step_ms 24.5 mean_tok_s 321.5 peak 20.425
+    L4PTFD: med_tok_s 54.800 mean_tok_s 48.600 round_ms_med 366.280 tpr_mean 17.286 | phases commit=4.168 draft=108.976 joint=253.108 reset=0.100 | draft_step 54.488 | peak_alloc 17.969 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUDC: med_tok_s 148.200 mean_tok_s 130.600 round_ms_med 134.868 tpr_mean 17.286 | phases commit=1.787 draft=45.340 joint=87.613 reset=0.103 | draft_step 22.670 | peak_alloc 18.226 peak_w_prefill 20.496 rounds 34 used 28
+    L4PTFDGUDCD: med_tok_s 151.400 mean_tok_s 133.000 round_ms_med 132.035 tpr_mean 17.286 | phases commit=1.791 draft=42.414 joint=87.712 reset=0.102 | draft_step 21.207 | peak_alloc 18.241 peak_w_prefill 20.513 rounds 34 used 28
+    L4PTFDGUDCDM: med_tok_s 151.200 mean_tok_s 132.900 round_ms_med 132.214 tpr_mean 17.286 | phases commit=2.038 draft=42.360 joint=87.691 reset=0.105 | draft_step 21.180 | peak_alloc 18.013 peak_w_prefill 20.530 rounds 34 used 28
+    L4PTFDGUDCDMT: med_tok_s 153.700 mean_tok_s 135.200 round_ms_med 130.095 tpr_mean 17.286 | phases commit=2.041 draft=42.377 joint=85.502 reset=0.102 | draft_step 21.189 | peak_alloc 18.030 peak_w_prefill 20.547 rounds 34 used 28
+    L4PTFDGUDKWC: med_tok_s 100.900 mean_tok_s 89.500 round_ms_med 197.821 tpr_mean 17.286 | phases commit=1.789 draft=45.265 joint=150.657 reset=0.103 | draft_step 22.633 | peak_alloc 18.301 peak_w_prefill 20.504 rounds 34 used 28
+    L4PTFDGUDKWCD: med_tok_s 102.300 mean_tok_s 90.500 round_ms_med 195.040 tpr_mean 17.286 | phases commit=1.788 draft=42.446 joint=150.722 reset=0.102 | draft_step 21.223 | peak_alloc 18.151 peak_w_prefill 20.521 rounds 34 used 28
+    L4PTFDGUDKWCDM: med_tok_s 102.200 mean_tok_s 90.500 round_ms_med 195.300 tpr_mean 17.286 | phases commit=2.060 draft=42.486 joint=150.650 reset=0.103 | draft_step 21.243 | peak_alloc 18.168 peak_w_prefill 20.539 rounds 34 used 28
+    L4PTFDGUDKWCDMT: med_tok_s 103.300 mean_tok_s 91.500 round_ms_med 193.494 tpr_mean 17.286 | phases commit=2.058 draft=42.521 joint=148.785 reset=0.108 | draft_step 21.261 | peak_alloc 18.185 peak_w_prefill 20.556 rounds 34 used 28
+    L4PTFKW: med_tok_s 46.300 mean_tok_s 41.300 round_ms_med 430.887 tpr_mean 17.286 | phases commit=4.173 draft=108.621 joint=318.294 reset=0.100 | draft_step 54.310 | peak_alloc 18.116 peak_w_prefill 20.496 rounds 34 used 28
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/wa_k2a_2195574_wa1a/summary.json | C 128 B 216 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3354.3 step_ms 64.394 mean_tok_s 3184.3 peak 82.043
+    L4P: med_tok_s 692.300 mean_tok_s 688.000 round_ms_med 915.899 tpr_mean 636.494 | phases commit=199.213 draft=155.832 joint=426.866 truncate=132.474 | draft_step None | peak_alloc 83.187 peak_w_prefill None rounds 171 used None
+    L4PJ: med_tok_s 680.500 mean_tok_s 632.800 round_ms_med 928.820 tpr_mean 587.438 | phases commit=199.739 draft=169.852 joint=427.290 truncate=129.296 | draft_step None | peak_alloc 83.187 peak_w_prefill None rounds 188 used None
+    L4PT: med_tok_s 1317.400 mean_tok_s 1217.000 round_ms_med 472.346 tpr_mean 573.756 | phases commit=6.158 draft=150.473 joint=315.264 reset=0.111 | draft_step None | peak_alloc 80.716 peak_w_prefill None rounds 193 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/wa_k2b_2195574_wa1b/summary.json | C 73 B 318 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2565.2 step_ms 123.967 mean_tok_s 2482.0 peak 74.964
+    L4P: med_tok_s 732.900 mean_tok_s 728.700 round_ms_med 1269.424 tpr_mean 923.631 | phases commit=270.034 draft=210.909 joint=659.132 truncate=132.222 | draft_step None | peak_alloc 76.818 peak_w_prefill None rounds 171 used None
+    L4PJ: med_tok_s 709.800 mean_tok_s 623.200 round_ms_med 1273.074 tpr_mean 788.176 | phases commit=267.190 draft=213.804 joint=659.882 truncate=130.687 | draft_step None | peak_alloc 76.818 peak_w_prefill None rounds 206 used None
+    L4PT: med_tok_s 1239.700 mean_tok_s 1118.900 round_ms_med 722.520 tpr_mean 787.477 | phases commit=8.526 draft=194.389 joint=518.766 reset=0.117 | draft_step None | peak_alloc 74.218 peak_w_prefill None rounds 206 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/wa_k2m_2195574_wa1m/summary.json | C 73 B 8 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 329.4 step_ms 24.29 mean_tok_s 321.6 peak 20.425
+    L4P: med_tok_s 25.800 mean_tok_s 25.600 round_ms_med 850.205 tpr_mean 21.789 | phases commit=207.970 draft=139.979 joint=361.916 truncate=139.954 | draft_step None | peak_alloc 17.978 peak_w_prefill None rounds 21 used None
+    L4PJ: med_tok_s 22.600 mean_tok_s 19.000 round_ms_med 888.930 tpr_mean 16.750 | phases commit=208.945 draft=168.256 joint=370.134 truncate=140.701 | draft_step None | peak_alloc 17.978 peak_w_prefill None rounds 30 used None
+    L4PT: med_tok_s 49.500 mean_tok_s 44.700 round_ms_med 376.431 tpr_mean 16.138 | phases commit=2.481 draft=137.035 joint=236.810 reset=0.097 | draft_step None | peak_alloc 17.900 peak_w_prefill None rounds 31 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/we_e1a_2195573_we1a/summary.json | C 128 B 216 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3371.1 step_ms 64.074 mean_tok_s 3201.4 peak 82.043
+    L3: med_tok_s 1006.800 mean_tok_s 985.500 round_ms_med 642.137 tpr_mean 638.413 | phases commit=81.345 draft=312.049 verify=248.251 | draft_step None | peak_alloc 82.044 peak_w_prefill None rounds 171 used None
+    L3E: med_tok_s 963.000 mean_tok_s 945.100 round_ms_med 671.380 tpr_mean 638.362 | phases commit=78.221 draft=314.283 verify=278.427 | draft_step None | peak_alloc 82.044 peak_w_prefill None rounds 171 used None
+    L3P: med_tok_s 948.300 mean_tok_s 928.200 round_ms_med 681.487 tpr_mean 638.469 | phases commit=77.716 draft=318.754 verify=285.601 | draft_step None | peak_alloc 82.044 peak_w_prefill None rounds 171 used None
+    L3X: med_tok_s 989.000 mean_tok_s 968.600 round_ms_med 653.653 tpr_mean 638.413 | phases commit=80.887 draft=322.076 verify=249.211 | draft_step None | peak_alloc 82.044 peak_w_prefill None rounds 171 used None
+    L4P: med_tok_s 707.800 mean_tok_s 704.100 round_ms_med 896.361 tpr_mean 636.494 | phases commit=191.697 draft=153.733 joint=421.001 truncate=128.198 | draft_step None | peak_alloc 83.187 peak_w_prefill None rounds 171 used None
+    L4PE: med_tok_s 690.800 mean_tok_s 689.300 round_ms_med 918.042 tpr_mean 638.681 | phases commit=204.481 draft=158.925 joint=425.533 truncate=128.181 | draft_step None | peak_alloc 83.780 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/we_e1am_2195573_we1am/summary.json | C 128 B 216 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3280.6 step_ms 65.842 mean_tok_s 3061.2 peak 82.042
+    L3E: med_tok_s 841.200 mean_tok_s 831.700 round_ms_med 763.369 tpr_mean 634.775 | phases commit=92.985 draft=333.111 verify=338.155 | draft_step None | peak_alloc 82.042 peak_w_prefill None rounds 43 used None
+    L4PE: med_tok_s 604.500 mean_tok_s 603.600 round_ms_med 1031.643 tpr_mean 624.575 | phases commit=213.344 draft=163.572 joint=515.059 truncate=136.644 | draft_step None | peak_alloc 83.680 peak_w_prefill None rounds 43 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/we_e1b_2195573_we1b/summary.json | C 73 B 318 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2579.2 step_ms 123.293 mean_tok_s 2498.1 peak 74.964
+    L3: med_tok_s 980.200 mean_tok_s 963.000 round_ms_med 966.999 tpr_mean 937.712 | phases commit=81.043 draft=454.620 verify=431.879 | draft_step None | peak_alloc 74.965 peak_w_prefill None rounds 171 used None
+    L3E: med_tok_s 997.600 mean_tok_s 980.600 round_ms_med 948.550 tpr_mean 937.600 | phases commit=77.981 draft=478.909 verify=391.849 | draft_step None | peak_alloc 78.981 peak_w_prefill None rounds 171 used None
+    L3P: med_tok_s 953.900 mean_tok_s 933.800 round_ms_med 995.185 tpr_mean 937.650 | phases commit=78.432 draft=482.166 verify=432.723 | draft_step None | peak_alloc 76.820 peak_w_prefill None rounds 171 used None
+    L3X: med_tok_s 933.400 mean_tok_s 917.000 round_ms_med 1014.873 tpr_mean 937.712 | phases commit=77.950 draft=506.970 verify=431.268 | draft_step None | peak_alloc 78.976 peak_w_prefill None rounds 171 used None
+    L4P: med_tok_s 743.100 mean_tok_s 739.300 round_ms_med 1250.944 tpr_mean 923.631 | phases commit=265.880 draft=207.980 joint=652.978 truncate=127.170 | draft_step None | peak_alloc 76.818 peak_w_prefill None rounds 171 used None
+    L4PE: med_tok_s 740.800 mean_tok_s 739.000 round_ms_med 1258.256 tpr_mean 924.519 | phases commit=271.476 draft=230.398 joint=628.128 truncate=128.490 | draft_step None | peak_alloc 81.169 peak_w_prefill None rounds 171 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/we_e1bm_2195573_we1bm/summary.json | C 73 B 318 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2635.1 step_ms 120.68 mean_tok_s 2527.6 peak 74.962
+    L3E: med_tok_s 943.400 mean_tok_s 926.100 round_ms_med 995.697 tpr_mean 931.500 | phases commit=81.787 draft=504.848 verify=409.847 | draft_step None | peak_alloc 78.834 peak_w_prefill None rounds 43 used None
+    L4PE: med_tok_s 708.700 mean_tok_s 703.800 round_ms_med 1256.659 tpr_mean 889.350 | phases commit=265.669 draft=209.448 joint=649.321 truncate=129.836 | draft_step None | peak_alloc 81.022 peak_w_prefill None rounds 43 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/we_e1m_2195573_we1m/summary.json | C 73 B 8 batches None arms None | top ['SH', 'SPEC', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 337.1 step_ms 23.73 mean_tok_s 329.0 peak 20.425
+    L3: med_tok_s 38.900 mean_tok_s 38.300 round_ms_med 614.231 tpr_mean 23.533 | phases commit=91.663 draft=298.528 verify=223.038 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+    L3E: med_tok_s 34.300 mean_tok_s 33.700 round_ms_med 697.094 tpr_mean 23.533 | phases commit=90.314 draft=296.937 verify=309.882 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+    L3P: med_tok_s 33.300 mean_tok_s 33.000 round_ms_med 710.348 tpr_mean 23.533 | phases commit=91.347 draft=308.938 verify=309.215 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+    L3X: med_tok_s 35.700 mean_tok_s 35.300 round_ms_med 669.832 tpr_mean 23.533 | phases commit=91.810 draft=305.155 verify=272.268 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+    L4P: med_tok_s 26.400 mean_tok_s 26.500 round_ms_med 833.593 tpr_mean 22.067 | phases commit=203.882 draft=137.706 joint=355.097 truncate=136.487 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+    L4PE: med_tok_s 22.600 mean_tok_s 22.700 round_ms_med 971.631 tpr_mean 22.067 | phases commit=203.597 draft=144.847 joint=484.496 truncate=136.827 | draft_step None | peak_alloc 20.427 peak_w_prefill None rounds 21 used None
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/wsm_m1128_2195573_wp128/summary.json | C 128 B 64 batches None arms None | top ['ARM', 'SH', 'fit', 'gates', 'inferred_cross_c', 'meta', 'predictions', 'probe_check', 'verdict']
+    SH: steady_tok_s 2069.9 step_ms 30.919 mean_tok_s 1996.1 peak 37.694
+    fit: {'B_fit': 218, 'C': 128, 'budget_GB': 84.0, 'int32_limit': 502, 'line': [18.367833, 0.3000887], 'margin_GB': 0.0, 'peak_at_fit': 83.7872, 'peak_next': 84.0873, 'points': [[64, 37.573512], [216, 83.187]], 'prefill_at_fit': 82.6179}
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/wsm_m173_2195573_wp73/summary.json | C 73 B 64 batches None arms None | top ['ARM', 'SH', 'fit', 'gates', 'inferred_cross_c', 'meta', 'predictions', 'probe_check', 'verdict']
+    SH: steady_tok_s 1692.0 step_ms 37.826 mean_tok_s 1650.8 peak 30.279
+    fit: {'B_fit': 357, 'C': 73, 'budget_GB': 84.0, 'int32_limit': 502, 'line': [18.367612, 0.1838063], 'margin_GB': 0.0, 'peak_at_fit': 83.9864, 'peak_next': 84.1703, 'points': [[64, 30.131212], [318, 76.818]], 'prefill_at_fit': 81.8499}
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/wsm_m1m_2195573_wmm/summary.json | C 73 B 8 batches None arms None | top ['ARM', 'SH', 'fit', 'gates', 'inferred_cross_c', 'meta', 'predictions', 'probe_check', 'verdict']
+    SH: steady_tok_s 327.1 step_ms 24.455 mean_tok_s 321.2 peak 20.425
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/wsm_v1128_2195573_wm128/summary.json | C 128 B 217 batches None arms None | top ['ARM', 'SH', 'fit', 'gates', 'inferred_cross_c', 'meta', 'predictions', 'probe_check', 'verdict']
+    SH: steady_tok_s 3293.4 step_ms 65.89 mean_tok_s 3130.4 peak 82.335
+FILE /mnt/beegfs/ojerbi/r2-runs/spec/wsm_v173_2195573_wm73/summary.json | C 73 B 355 batches None arms None | top ['ARM', 'SH', 'fit', 'gates', 'inferred_cross_c', 'meta', 'predictions', 'probe_check', 'verdict']
+    SH: steady_tok_s 2614.7 step_ms 135.773 mean_tok_s 2531.9 peak 81.473
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_j1s1_2195573_mb1/summary.json | C 128 B 216 batches None arms ['SH'] | top ['AB', 'GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3386.4 step_ms 63.784 mean_tok_s None peak 82.042
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_j1s1_2195573_mb1n/summary.json | C 128 B 216 batches None arms ['SH'] | top ['GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3367.0 step_ms 64.152 mean_tok_s None peak 82.042
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2p_2195574_c128b16/summary.json | C 128 B 16 batches None arms ['SH'] | top ['GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 661.5 step_ms 24.189 mean_tok_s None peak 23.688
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2p_2195574_c128b16n/summary.json | C 128 B 16 batches None arms ['SH'] | top ['AB', 'GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 674.7 step_ms 23.716 mean_tok_s None peak 23.688
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2s1_2195574_mb1/summary.json | C 128 B 216 batches None arms ['SH'] | top ['GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3364.8 step_ms 64.194 mean_tok_s None peak 82.042
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2s1_2195574_mb1n/summary.json | C 128 B 216 batches None arms ['SH'] | top ['AB', 'GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3333.7 step_ms 64.793 mean_tok_s None peak 82.042
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2x128_2195574_c128b222n/summary.json | C 128 B 222 batches None arms ['SH'] | top ['GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 3295.2 step_ms 67.371 mean_tok_s None peak 83.792
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2x63_2195574_c63b344/summary.json | C 63 B 344 batches None arms ['SH'] | top ['GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 1903.1 step_ms 180.756 mean_tok_s None peak 72.277
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2x63_2195574_c63b344n/summary.json | C 63 B 344 batches None arms ['SH'] | top ['AB', 'GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 1901.2 step_ms 180.939 mean_tok_s None peak 72.277
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2x63_2195574_c63b406n/summary.json | C 63 B 406 batches None arms ['SH'] | top ['GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 1869.9 step_ms 217.12 mean_tok_s None peak 81.876
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2x73_2195574_c73b318/summary.json | C 73 B 318 batches None arms ['SH'] | top ['GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2572.8 step_ms 123.599 mean_tok_s None peak 74.962
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2x73_2195574_c73b318n/summary.json | C 73 B 318 batches None arms ['SH'] | top ['AB', 'GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2565.9 step_ms 123.934 mean_tok_s None peak 74.962
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2x73_2195574_c73b358n/summary.json | C 73 B 358 batches None arms ['SH'] | top ['GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2632.9 step_ms 135.974 mean_tok_s None peak 81.998
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2x73_2195574_c73b369n/summary.json | C 73 B 369 batches None arms ['SH'] | top ['GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2x81_2195574_c81b290/summary.json | C 81 B 290 batches None arms ['SH'] | top ['GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2856.0 step_ms 101.542 mean_tok_s None peak 74.923
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2x81_2195574_c81b290n/summary.json | C 81 B 290 batches None arms ['SH'] | top ['AB', 'GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2846.9 step_ms 101.864 mean_tok_s None peak 74.923
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2x81_2195574_c81b326n/summary.json | C 81 B 326 batches None arms ['SH'] | top ['GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2945.6 step_ms 110.673 mean_tok_s None peak 81.863
+FILE /mnt/beegfs/ojerbi/r2-runs/mbstrong/mbs_o2x81_2195574_c81b336n/summary.json | C 81 B 336 batches None arms ['SH'] | top ['GT', 'R2', 'SH', 'agreement', 'gates', 'meta', 'predictions']
+    SH: steady_tok_s 2951.8 step_ms 113.827 mean_tok_s None peak 83.79
