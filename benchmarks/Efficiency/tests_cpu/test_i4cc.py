@@ -94,6 +94,8 @@ I4CC_LATER = I4CC_LATER + ("r2_int_arms.py", "r2_int_cell.py")                  
 # I4CC_LATER: its modules may name the earlier modules (the scan skips them)
 I4CC_NEW = I4CC_NEW + (E_ + "r2_bf1_fetch.py", E_ + "r2_bf1_cell.py", E_ + "r2_bf1_step.sh", T_ + "test_bf1.py")  # BF1
 I4CC_LATER = I4CC_LATER + ("r2_bf1_fetch.py", "r2_bf1_cell.py")                                   # BF1
+# R5 (review 5, ST: the yield / window population repair, r2_i4h_cell.population_repair; its tests in test_int.py)
+I4CC_NEW = I4CC_NEW + (E_ + "r2_i4h_cell.py",)                                                     # R5
 
 
 class Evidence(UserWarning):

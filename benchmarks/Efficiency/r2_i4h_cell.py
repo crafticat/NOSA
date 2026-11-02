@@ -25,6 +25,10 @@ L61 FIX (KS/analysis/plan/NOTES_graph_mean_gap.md): the rounds in which any grap
 joint capture round, the draft capture rounds; r2_i4h_graph records the round, T.round) are REPORTED and EXCLUDED from
 the steady set of EVERY spec arm (the same rounds for every arm: the arms run the same schedule, bit for bit). The rates
 and phases with the capture rounds kept stay in the record (rates_incl_capture, phases_median_incl_capture).
+POPULATION REPAIR (review 5, ST; population_repair, called by restrict): the yield (yield_final and
+paper.accepted_per_round_steady_mean) is on the rates' final set too (the old mean: *_incl_capture); kv_at_verify keeps
+its measurement and records its populations (wait: the probe rounds; bytes: the steady set WITH the capture rounds) and
+the NEW bytes on the final set; steady_rounds_list and populations name the round set of each summary field.
 REGISTERED PREDICTIONS PRED_I4H_BY_B: every value None until the lead registers them with PRED_STAMP_I4H; the step script
 STOPS the timing cells (i4ha, i4hb) while PRED_STAMP_I4H is None. The builder's MODEL with its derivation:
 docs/NOTES_i4h.md section 5. EXIT: the number of failed MUST gates (0-19); 20 refused; 30 an exception outside an arm.
@@ -34,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import statistics
 import sys
 import time
 import traceback
@@ -186,10 +191,12 @@ def excluded_rounds(caps) -> list:
 def restrict(rec, rd, sh, B: int, K: int, probe_every: int, X) -> dict:
     """The L61 fix on one arm's record: rates, vs_sh, vs_strongest, phases_median, draft_step_ms / _sh and
     joint_sh_steps on the steady set (r2_spec_cell.steady_rounds) WITHOUT the rounds X; the old values kept as
-    *_incl_capture. Returns rec (changed in place)."""
+    *_incl_capture; then population_repair (the yield and the transfer fields on the same final set, review 5).
+    Returns rec (changed in place)."""
     G = rd["rounds"]
     xs = set(int(x) for x in X)
     steady = [g for g in SC.steady_rounds(G, probe_every) if g not in xs]
+    population_repair(rec, rd, B, probe_every, steady, xs)
     rates = SC.round_rates(rd["round_committed"], rd["round_ms"], steady, rd["wall_s"], sum(rd["count"]))
     shr = SC.sh_rates(B, sh) if sh else None
     names = WA.PHASES_W["L4P"]
@@ -208,6 +215,102 @@ def restrict(rec, rd, sh, B: int, K: int, probe_every: int, X) -> dict:
     rec["draft_step_sh"] = round(dm / (K - 1) / shm, 4) if (dm and shm) else None
     rec["steady_excluded_rounds"] = sorted(xs)
     rec["steady_rounds_used"] = len(steady)
+    return rec
+
+
+POPULATIONS = {   # the round set of each summary field after restrict (G = rd["rounds"]; SC = r2_spec_cell)
+    "final": "steady_rounds_list: SC.steady_rounds(G, probe_every) without steady_excluded_rounds (the capture rounds)",
+    "incl_capture": "SC.steady_rounds(G, probe_every): rounds 1 .. G-1 without the probe rounds, capture rounds KEPT",
+    "probe": "the probe rounds: g > 0 and g % probe_every == 0 (kv_at_verify.wait_population.rounds)",
+    "all": "every round 0 .. G-1 (the run's totals over B x G)",
+    "wall": "the wall time: every committed token (warm steps included) / wall_s"}
+FIELD_POPULATIONS = (
+    ("rates (median_tok_s, mean_tok_s, steady_rounds, round_ms_median, tokens_per_round_mean), vs_sh, vs_strongest, "
+     "phases_median, joint_sh_steps, draft_step_ms, draft_step_sh", "final"),
+    ("yield_final, paper.accepted_per_round_steady_mean, paper.accepted_per_request_per_round, "
+     "paper.committed_per_request_per_round, kv_at_verify.new_*_final", "final"),
+    ("rates.effective_tok_s", "wall"),
+    ("rates_incl_capture, phases_median_incl_capture, paper.accepted_per_round_steady_mean_incl_capture, "
+     "kv_at_verify.new_blocks_per_round, kv_at_verify.new_MB_per_round, kv_at_verify.ready_slots_per_round, "
+     "rollback_per_round", "incl_capture"),
+    ("kv_at_verify.wait_ms_median, kv_at_verify.wait_rounds", "probe"),
+    ("acceptance (rate, full_fraction, committed_per_request_round), paper.accepted_per_request_round", "all"))
+
+
+def population_repair(rec, rd, B: int, probe_every: int, steady, xs) -> dict:
+    """REVIEW 5 (ST): summarize (r2_spec_cell / r2_wsa_cell.summarize_w) computed paper.accepted_per_round_steady_mean
+    and kv_at_verify on SC.steady_rounds(G, probe_every); restrict takes the capture rounds xs out of the rates only.
+    Here, on the FINAL set `steady` (the rates' set):
+      (1) yield_final: accepted and committed per round and per request per round (ratios of sums over the final set);
+          paper.accepted_per_round_steady_mean on the final set (the old value: *_incl_capture) and the two ratios;
+      (2) kv_at_verify: the measurement unchanged; wait_population (the probe rounds of probe_wait_ms and their count),
+          bytes_population (the round set of new_blocks_per_round and its count) and the NEW blocks / MB per round on
+          the final set (round_blocks; else None with final_note);
+      (3) steady_rounds_list (the final set) and populations (the round set of each summary field);
+      (4) rec["new"] (a BF1 arm's NEW record) when present: the NEW blocks on the final set.
+    Returns rec (changed in place)."""
+    G = int(rd["rounds"])
+    fin = [int(g) for g in steady]
+    incl = list(SC.steady_rounds(G, probe_every))
+    xs = set(int(x) for x in xs)
+    rc = rd.get("round_committed") or []
+    cs = [int(rc[g]) for g in fin if g < len(rc)]
+    yf = dict(rounds=len(fin), B=int(B), committed_rounds=len(cs), committed_sum=sum(cs),
+              committed_per_round_mean=(round(sum(cs) / len(cs), 3) if cs else None),
+              committed_per_request_per_round=(round(sum(cs) / (B * len(cs)), 6) if (cs and B) else None))
+    ra = rd.get("round_accepted")
+    if ra:
+        acc = [int(ra[g]) for g in fin if g < len(ra)]
+        yf.update(accepted_rounds=len(acc), accepted_sum=sum(acc),
+                  accepted_per_round_mean=(round(statistics.fmean(acc), 3) if acc else None),
+                  accepted_per_request_per_round=(round(sum(acc) / (B * len(acc)), 6) if (acc and B) else None))
+    else:
+        yf.update(accepted_rounds=0, accepted_sum=None, accepted_per_round_mean=None,
+                  accepted_per_request_per_round=None,
+                  accepted_note="no round_accepted in read() (not an L4P level): accepted not available per round")
+    yf["population"] = "final"
+    rec["yield_final"] = yf
+    pp = rec.get("paper")
+    if isinstance(pp, dict) and "accepted_per_round_steady_mean" in pp:
+        if "accepted_per_round_steady_mean_incl_capture" not in pp:      # a second call keeps the first old value
+            pp["accepted_per_round_steady_mean_incl_capture"] = pp["accepted_per_round_steady_mean"]
+        pp["accepted_per_round_steady_mean"] = yf["accepted_per_round_mean"]
+        pp["accepted_per_request_per_round"] = yf["accepted_per_request_per_round"]
+        pp["committed_per_request_per_round"] = yf["committed_per_request_per_round"]
+    kv = rec.get("kv_at_verify")
+    rb = rd.get("round_blocks")
+    if isinstance(kv, dict):
+        pw = rd.get("probe_wait_ms") or []
+        prb = [g for g, w in enumerate(pw) if w is not None]
+        kv["wait_population"] = dict(
+            rounds=prb, n=len(prb), population="probe",
+            what="median over the probe rounds of the round's summed KVMeter spans (CUDA events around each host "
+                 "gather_k / gather_v_bias while meter.timing: the J / verify slot only; D-slot loads are not timed)")
+        bi = [g for g in incl if rb is not None and g < len(rb)]
+        kv["bytes_population"] = dict(
+            n=len(bi), population="incl_capture", capture_rounds_in_set=sorted(set(bi) & xs),
+            what="mean over the set of round_blocks: every host block loaded while meter.on (the J / verify slot and "
+                 "the D slots of target rows); a different round set and slot set from wait_population")
+        if rb is not None:
+            bf = [int(rb[g]) for g in fin if g < len(rb)]
+            nb = statistics.fmean(bf) if bf else None
+            bb = kv.get("block_bytes")
+            kv["final_rounds"] = len(bf)
+            kv["new_blocks_per_round_final"] = round(nb, 1) if nb is not None else None
+            kv["new_MB_per_round_final"] = round(nb * bb / 1e6, 3) if (nb is not None and bb) else None
+        else:
+            kv["final_rounds"] = 0
+            kv["new_blocks_per_round_final"] = kv["new_MB_per_round_final"] = None
+            kv["final_note"] = "no round_blocks in read(): the NEW bytes on the final set are not available"
+    nr = rec.get("new")
+    if isinstance(nr, dict) and rb is not None:
+        bf = [int(rb[g]) for g in fin if g < len(rb)]
+        nr["new_blocks_per_round_final"] = round(statistics.fmean(bf), 1) if bf else None
+        nr["final_rounds"] = len(bf)
+    rec["steady_rounds_list"] = fin
+    rec["populations"] = dict(sets=dict(POPULATIONS),
+                              fields=[dict(fields=f, population=p) for f, p in FIELD_POPULATIONS],
+                              final_n=len(fin), incl_capture_n=len(incl), excluded=sorted(xs))
     return rec
 
 

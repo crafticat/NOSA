@@ -79,6 +79,8 @@ ST1_NEW = ST1_NEW + (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_s
                      E_ + "r2_int_arms.py", E_ + "r2_int_cell.py", E_ + "r2_int_step.sh", T_ + "test_int.py",
                      "docs/NOTES_int.md")                                                         # INT
 ST1_LATER = ("r2_int_arms.py", "r2_int_cell.py")                                                  # INT
+# R5 (review 5, ST: the yield / window population repair, r2_i4h_cell.population_repair; its tests in test_int.py)
+ST1_NEW = ST1_NEW + (E_ + "r2_i4h_cell.py",)                                                       # R5
 N_RUN = 48                             # committed tokens per request: about 16 rounds + the drain
 
 

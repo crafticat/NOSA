@@ -108,6 +108,10 @@ I4S_LATER = I4S_LATER + ("r2_int_arms.py", "r2_int_cell.py")                    
 # I4S_LATER: its modules may name the earlier modules (the scan skips them)
 I4S_NEW = I4S_NEW + (E_ + "r2_bf1_fetch.py", E_ + "r2_bf1_cell.py", E_ + "r2_bf1_step.sh", T_ + "test_bf1.py")  # BF1
 I4S_LATER = I4S_LATER + ("r2_bf1_fetch.py", "r2_bf1_cell.py")                                     # BF1
+# R5 (review 5, ST: the yield / window population repair, r2_i4h_cell.population_repair; its tests in test_int.py):
+# r2_i4h_cell.py is a changed file and leaves the I4H tip's bytes (check (c))
+I4S_NEW = I4S_NEW + (E_ + "r2_i4h_cell.py",)                                                       # R5
+LEVER_FILES = dict(LEVER_FILES, I4H=tuple(f for f in LEVER_FILES["I4H"] if f != E_ + "r2_i4h_cell.py"))   # R5
 
 
 class Evidence(UserWarning):

@@ -86,6 +86,8 @@ RECON7_NEW = RECON7_NEW + (E_ + "r2_int_arms.py", E_ + "r2_int_cell.py", E_ + "r
                            "docs/NOTES_int.md")                                                   # INT
 # BF1 (nosi-r2-bf1: RECON7 cd0f0c5 + the draft-issued background fetch): its files (its own Gate 0: tests_cpu/test_bf1.py)
 RECON7_NEW = RECON7_NEW + (E_ + "r2_bf1_fetch.py", E_ + "r2_bf1_cell.py", E_ + "r2_bf1_step.sh", T_ + "test_bf1.py")  # BF1
+# R5 (review 5, ST: the yield / window population repair, r2_i4h_cell.population_repair; its tests in test_int.py)
+RECON7_NEW = RECON7_NEW + (E_ + "r2_i4h_cell.py",)                                                 # R5
 HAND_KERNEL = ("import triton", "@triton.jit", "triton.jit", "load_inline", "cpp_extension", "tl.load", "tl.store")
 PE = 4                                 # the world's timing scenario: probe (and check) rounds every 4 rounds
 N_RUN = 48                             # committed tokens per request: about 16 rounds + the drain

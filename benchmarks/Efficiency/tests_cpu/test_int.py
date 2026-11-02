@@ -13,6 +13,10 @@
               commit capture to BF1's locked captures)
   CELL        the private copy's tables, runner choice / class, the arm rules, the verdicts (registration-aware), main's
               refusal, the registration state, the step script (no interpreter or hash on login, the cells, DRYRUN)
+  R5          review 5 (ST), r2_i4h_cell.population_repair (in restrict): on a synthetic rd with X = [1, 16], the yield
+              fields on the rates' final set = hand values, *_incl_capture = the old computation, kv_at_verify's
+              measurement unchanged with its populations recorded, the populations = steady_rounds_used; missing
+              vectors give None; X = [] gives the old values (control); every cell reaches the one restrict
 Run on amd (srun) by the lead: pytest -q benchmarks/Efficiency/tests_cpu/test_int.py
 """
 from __future__ import annotations
@@ -23,6 +27,7 @@ import importlib.util
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import warnings
@@ -47,6 +52,7 @@ RUNGS = (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", E_ 
          E_ + "r2_bf1_fetch.py", E_ + "r2_bf1_cell.py", E_ + "r2_bf1_step.sh", T_ + "test_bf1.py")
 OLD_DECL = tuple(T_ + "test_%s.py" % n for n in ("wsa", "wsb", "wsc", "i2", "i3", "i4a", "i4g", "i4d", "i4k", "i4u", "i4h",
                                                     "i4s", "i4cc", "i4dc", "recon7"))
+R5_FIX = (E_ + "r2_i4h_cell.py",)     # review 5 (ST): the population repair in restrict (an older module, edited)
 RUNG_TESTS = dict(j1="J1_LATER", st1="ST1_LATER", bf1="BF1_LATER")
 ARMS_IMPORTS = {"torch", "r2_bf1_fetch", "r2_j1_select", "r2_st1_commit"}
 NAMED_BY = ("r2_st1_cell.py", "r2_st1_commit.py")   # modules whose comments / docstrings name INT files (no import)
@@ -103,7 +109,7 @@ def test_int_gate0_files():
                .split("\n") if x}
     changed |= {x for x in _git("ls-files", "--others", "--exclude-standard", "--", ".",
                                 ":(exclude,glob)**/__pycache__/**").stdout.split("\n") if x}
-    allowed = set(INT_NEW) | set(RUNGS) | set(OLD_DECL)
+    allowed = set(INT_NEW) | set(RUNGS) | set(OLD_DECL) | set(R5_FIX)
     assert changed <= allowed, sorted(changed - allowed)                                    # (a)
     assert all((ROOT / f).is_file() for f in INT_NEW + RUNGS), [f for f in INT_NEW + RUNGS if not (ROOT / f).is_file()]
     assert _git("diff", "--name-only", BASE_SHA, "--", "nosi").stdout.strip() == ""        # (b) nosi: cd0f0c5's
@@ -650,3 +656,142 @@ def test_step_script_int(monkeypatch):
             (cell, r.stdout[-600:])
     _ev("INT DRYRUN: 3 cells printed their step command; grants %s" % ({c[0]: getattr(C, "GRANT_%s" % c[0]) for c in
                                                                        CELLS}))
+
+
+# ------------------------------------------------------------------ R5: the yield / window population repair (review 5)
+# The defect: summarize (r2_spec_cell / r2_wsa_cell.summarize_w) put paper.accepted_per_round_steady_mean and
+# kv_at_verify on SC.steady_rounds(G, probe_every); restrict took the capture rounds X out of the rates only (inta /
+# intc / intd: the yield on 181 / 187 / 195 rounds, the rates on 180 / 186 / 194).
+R5_G, R5_PE, R5_B, R5_X = 40, 16, 4, [1, 16]
+R5_CAP = 1                             # the capture round (16 is also a probe round: already out of the steady set)
+R5_OLD = [g for g in range(1, R5_G) if g not in (16, 32)]        # by hand: 37 rounds
+R5_FINAL = [g for g in range(2, R5_G) if g not in (16, 32)]      # by hand: 36 rounds (round 1 out)
+R5_SH = dict(rates=dict(steady_step_ms=60.0, steady_tok_s=3600.0, effective_tok_s=3000.0), steady=dict(mean_ms=60.0))
+
+
+def _r5_rd(accepted=True, blocks=True):
+    """Round g: committed B x (8 + g % 5), accepted B x (4 + g % 3), 10 g NEW blocks, 100 + g ms; the capture round 1 is
+    an outlier (accepted 400, 9000 blocks, 7000 ms), so the old and the final values differ (L34: the precondition)."""
+    G, B = R5_G, R5_B
+    rc = [B * (8 + g % 5) for g in range(G)]
+    ra = [B * (4 + g % 3) for g in range(G)]
+    rb = [10 * g for g in range(G)]
+    ms = [100.0 + g for g in range(G)]
+    ra[R5_CAP], rb[R5_CAP], ms[R5_CAP] = 400, 9000, 7000.0
+    rd = dict(rounds=G, round_committed=rc, round_ms=ms, wall_s=10.0, count=[sum(rc) // B] * B,
+              phases=[[1.0, 50.0 + g, 6.0, 30.0] for g in range(G)],
+              probe_wait_ms=[(0.5 * g if (g > 0 and g % R5_PE == 0) else None) for g in range(G)])
+    if accepted:
+        rd["round_accepted"] = ra
+    if blocks:
+        rd["round_blocks"] = rb
+    return rd
+
+
+def _r5_rec(HC, rd):
+    """The arm's record as summarize / summarize_w leave it (the old population: SC.steady_rounds(G, probe_every))."""
+    SC = HC.SC
+    st = SC.steady_rounds(R5_G, R5_PE)
+    rec = dict(rates=SC.round_rates(rd["round_committed"], rd["round_ms"], st, rd["wall_s"], sum(rd["count"])),
+               phases_median=dict(joint=60.0))
+    if "round_accepted" in rd:
+        ra = [rd["round_accepted"][g] for g in st if g < len(rd["round_accepted"])]
+        rec["paper"] = dict(accepted_per_round_steady_mean=round(statistics.fmean(ra), 3),
+                            accepted_per_request_round=1.0)
+    if "round_blocks" in rd:
+        rec["kv_at_verify"] = SC.kv_at_verify(rd, st, 3, 2, 2, R5_B, 4, 1000)
+    rec["new"] = dict(new_blocks_per_round=(rec.get("kv_at_verify") or {}).get("new_blocks_per_round"))
+    return rec
+
+
+def test_r5_final_set_fields():
+    HC = _mod("r2_i4h_cell")
+    B, FINAL, OLD = R5_B, R5_FINAL, R5_OLD
+    rd = _r5_rd()
+    rec = _r5_rec(HC, rd)
+    old_mean = rec["paper"]["accepted_per_round_steady_mean"]
+    old_kv = dict(rec["kv_at_verify"])
+    HC.restrict(rec, rd, R5_SH, B, 3, R5_PE, R5_X)
+    ra, rc, rb = rd["round_accepted"], rd["round_committed"], rd["round_blocks"]
+    acc_f, com_f = sum(ra[g] for g in FINAL), sum(rc[g] for g in FINAL)
+    assert len(OLD) == 37 and len(FINAL) == 36                         # the populations: one final set, the rates'
+    assert rec["steady_rounds_list"] == FINAL and rec["steady_excluded_rounds"] == R5_X
+    assert rec["steady_rounds_used"] == 36 == rec["rates"]["steady_rounds"] == rec["yield_final"]["rounds"]
+    assert rec["yield_final"]["accepted_rounds"] == rec["yield_final"]["committed_rounds"] == 36
+    pop = rec["populations"]
+    assert (pop["final_n"], pop["incl_capture_n"], pop["excluded"]) == (36, 37, R5_X)
+    y = rec["yield_final"]                                             # the yield on the final set = hand values
+    assert y["accepted_sum"] == acc_f and y["committed_sum"] == com_f
+    assert y["accepted_per_round_mean"] == round(acc_f / 36, 3)
+    assert y["accepted_per_request_per_round"] == round(acc_f / (B * 36), 6)
+    assert y["committed_per_request_per_round"] == round(com_f / (B * 36), 6)
+    assert abs(y["committed_per_request_per_round"] - rec["rates"]["tokens_per_round_mean"] / B) < 1e-3
+    assert rec["rates"]["tokens_per_round_mean"] == round(com_f / 36, 3)   # the rates: the same final set (L61)
+    p = rec["paper"]
+    assert p["accepted_per_round_steady_mean"] == y["accepted_per_round_mean"]
+    assert p["accepted_per_request_per_round"] == y["accepted_per_request_per_round"]
+    assert p["committed_per_request_per_round"] == y["committed_per_request_per_round"]
+    # the old value kept = the old computation (by hand on the 37 rounds); it differs from the final one (precondition)
+    assert p["accepted_per_round_steady_mean_incl_capture"] == old_mean == round(sum(ra[g] for g in OLD) / 37, 3)
+    assert p["accepted_per_round_steady_mean_incl_capture"] != p["accepted_per_round_steady_mean"]
+    assert p["accepted_per_request_round"] == 1.0                      # the all-rounds field: not touched
+    kv = rec["kv_at_verify"]                                           # the measurement unchanged
+    assert all(kv[k] == v for k, v in old_kv.items()), sorted(k for k, v in old_kv.items() if kv[k] != v)
+    assert kv["new_blocks_per_round"] == round(sum(rb[g] for g in OLD) / 37, 1)
+    assert kv["wait_population"]["rounds"] == [16, 32] and kv["wait_population"]["n"] == 2 == kv["wait_rounds"]
+    assert kv["wait_ms_median"] == statistics.median([8.0, 16.0])
+    assert kv["bytes_population"]["n"] == 37 and kv["bytes_population"]["capture_rounds_in_set"] == [R5_CAP]
+    assert kv["final_rounds"] == 36
+    assert kv["new_blocks_per_round_final"] == round(sum(rb[g] for g in FINAL) / 36, 1)
+    assert kv["new_MB_per_round_final"] == round(sum(rb[g] for g in FINAL) / 36 * 1000 / 1e6, 3)
+    assert kv["new_blocks_per_round_final"] != kv["new_blocks_per_round"]
+    assert rec["new"]["new_blocks_per_round_final"] == kv["new_blocks_per_round_final"]
+    assert rec["new"]["final_rounds"] == 36
+    _ev("INT R5: final set %d rounds (old %d); accepted per request per round %.6f (mean per round %s -> %s); "
+        "committed %.6f; NEW blocks %s -> %s" % (
+            36, 37, y["accepted_per_request_per_round"], old_mean, p["accepted_per_round_steady_mean"],
+            y["committed_per_request_per_round"], kv["new_blocks_per_round"], kv["new_blocks_per_round_final"]))
+
+
+def test_r5_missing_vectors_and_controls():
+    HC = _mod("r2_i4h_cell")
+    rd = _r5_rd(accepted=False, blocks=False)                          # no round_accepted / round_blocks: None + notes
+    rec = _r5_rec(HC, rd)
+    rec["kv_at_verify"] = dict(new_blocks_per_round=None, wait_ms_median=None, block_bytes=1000)
+    HC.restrict(rec, rd, R5_SH, R5_B, 3, R5_PE, R5_X)
+    y = rec["yield_final"]
+    assert y["accepted_per_round_mean"] is None and y["accepted_per_request_per_round"] is None and y["accepted_note"]
+    assert y["committed_per_request_per_round"] == round(sum(rd["round_committed"][g] for g in R5_FINAL) / (R5_B * 36),
+                                                         6)
+    kv = rec["kv_at_verify"]
+    assert kv["new_MB_per_round_final"] is None and kv["final_rounds"] == 0 and "not available" in kv["final_note"]
+    assert kv["bytes_population"]["n"] == 0 and kv["wait_population"]["n"] == 2
+    assert "paper" not in rec and "new_blocks_per_round_final" not in rec["new"]
+    rd = _r5_rd()                                                      # CONTROL: X = [] -> the old values
+    rec = _r5_rec(HC, rd)
+    old_mean, old_nb = rec["paper"]["accepted_per_round_steady_mean"], rec["kv_at_verify"]["new_blocks_per_round"]
+    HC.restrict(rec, rd, R5_SH, R5_B, 3, R5_PE, [])
+    assert rec["steady_rounds_list"] == R5_OLD and rec["steady_rounds_used"] == 37
+    assert rec["paper"]["accepted_per_round_steady_mean"] == old_mean
+    assert rec["paper"]["accepted_per_round_steady_mean_incl_capture"] == old_mean
+    assert rec["kv_at_verify"]["new_blocks_per_round_final"] == old_nb
+    assert rec["kv_at_verify"]["bytes_population"]["capture_rounds_in_set"] == []
+    rd = _r5_rd()                                                      # a second call keeps the first old value
+    rec = _r5_rec(HC, rd)
+    old_mean = rec["paper"]["accepted_per_round_steady_mean"]
+    HC.restrict(rec, rd, R5_SH, R5_B, 3, R5_PE, R5_X)
+    HC.population_repair(rec, rd, R5_B, R5_PE, R5_FINAL, R5_X)
+    assert rec["paper"]["accepted_per_round_steady_mean_incl_capture"] == old_mean
+
+
+def test_r5_every_cell_reaches_the_one_restrict():
+    HC = _mod("r2_i4h_cell")
+    for name in ("r2_i4s_cell", "r2_i4cc_cell", "r2_i4dc_cell", "r2_st1_cell", "r2_bf1_cell", "r2_recon7_cell"):
+        m = _mod(name)
+        assert m.HC.restrict is HC.restrict and m.HC.population_repair is HC.population_repair, name
+        assert "HC.restrict(" in Path(m.__file__).read_text(), name
+    assert "\n        restrict(rec, rds[arm]" in (EFF / "r2_i4h_cell.py").read_text()     # the I4H cell itself
+    D = _mod("r2_int_cell").configure()                # the INT cells: the private I4DC copy with _HCProxy
+    assert D.HC.restrict is HC.restrict
+    src = (EFF / "r2_i4h_cell.py").read_text()
+    assert src.count("population_repair(rec, rd, B, probe_every, steady, xs)") == 1

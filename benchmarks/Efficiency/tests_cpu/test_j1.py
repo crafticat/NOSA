@@ -72,6 +72,8 @@ J1_NEW = J1_NEW + (E_ + "r2_st1_commit.py", E_ + "r2_st1_cell.py", E_ + "r2_st1_
                    E_ + "r2_int_arms.py", E_ + "r2_int_cell.py", E_ + "r2_int_step.sh", T_ + "test_int.py",
                    "docs/NOTES_int.md")                                                           # INT
 J1_LATER = ("r2_int_arms.py", "r2_int_cell.py")                                                   # INT
+# R5 (review 5, ST: the yield / window population repair, r2_i4h_cell.population_repair; its tests in test_int.py)
+J1_NEW = J1_NEW + (E_ + "r2_i4h_cell.py",)                                                         # R5
 SELECT_IMPORTS = {"torch", "time", "types", "r2_i4dc_compile"}
 HAND_KERNEL = ("import triton", "@triton.jit", "triton.jit", "load_inline", "cpp_extension", "tl.load", "tl.store")
 LATER_NAMES = ("r2_i4a", "r2_i4cc", "r2_i4h", "r2_i4g", "r2_i4s", "r2_i4k", "r2_i4u", "r2_recon7")
