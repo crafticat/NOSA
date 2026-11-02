@@ -906,8 +906,10 @@ def test_st4_placement():
         cls = type(run.T)
         out[arm] = _st4_mro_ok(cls)
         names = [k.__name__ for k in cls.__mro__]
-        if arm in INTA.KEEP_INT:
+        if arm in INTA.BF_INT:
             assert out[arm] == ["TentStateBF"] and INTA.owner(cls, "_resid_lean") == "TentStateBF", (out[arm], names)
+        elif arm in INTA.KEEP_INT:                                     # the keep arm without BF1 (cell intd)
+            assert out[arm] == [] and "_J3Mix" not in names, (out[arm], names)
         else:
             assert out[arm] == [] and "_J3Mix" in names, (out[arm], names)
         assert INTA.owner(cls, "_layer") == "IntLayer" and INTA.owner(cls, "commit") == "CommitST1"
