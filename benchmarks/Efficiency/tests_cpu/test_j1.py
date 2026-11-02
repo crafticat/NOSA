@@ -911,6 +911,36 @@ def test_forkbench_nonfinite():
                                         sorted(k for k, v in old_pass.items() if v)))
 
 
+def test_forkbench_best3d_validity():
+    """REVIEW 5: the 3D saving follows the ratios' validity rule. PLANT: FORK invalid -> best_3d None, the note says
+    INVALID and the decision line is SUPPRESSED (no number); the j1f source (cd0e286) still reported the saving (the
+    control is not a no-op). The fastest 3D member invalid -> it is not chosen. FORK - FLASHU1 likewise."""
+    FB = _mod("r2_j1_forkbench")
+    OLD = _fb_old()
+    segs = (2, 4)
+    times = {"FORK": [32.0] * 3, "FLASHU1": [20.0] * 3, "FORK3D2": [28.0] * 3, "FORK3D4": [30.0] * 3}
+    ok = {v: True for v in times}
+    s = FB.summarize(times, 216, 32, ok, segs)
+    assert s["best_3d"]["variant"] == "FORK3D2" and s["best_3d"]["saving_ms_per_pass"] == 4.0 and s["best_3d_note"] is None
+    bad = dict(ok, FORK=False)                                                # PLANT: FORK invalid
+    s = FB.summarize(times, 216, 32, bad, segs)
+    assert s["best_3d"] is None and s["best_3d_note"].startswith("INVALID: FORK")
+    assert "fork_minus_flashu1_ms_per_pass" not in s
+    lines = FB.decision_lines("C128_B216", s)
+    assert [x for x in lines if "best 3D SUPPRESSED (INVALID: FORK" in x]
+    assert not [x for x in lines if "saving_ms_per_pass" in x or ("best 3D" in x and "FORK3D2" in x)], lines
+    assert all(x.endswith(" INVALID") for x in lines if "RATIO FORK3D" in x), lines            # the ratio: INVALID
+    assert [x for x in lines if "FORK - FLASHU1 = SUPPRESSED" in x]
+    assert all(v["valid"] is False for k, v in s["ratios"].items() if "FORK" in k.split("/"))
+    so = OLD.summarize(times, 216, 32, bad, segs)                             # the old rule: the saving survived
+    assert so["best_3d"]["saving_ms_per_pass"] == 4.0 and so["fork_minus_flashu1_ms_per_pass"] == 12.0
+    s = FB.summarize(times, 216, 32, dict(ok, FORK3D2=False), segs)           # the fastest 3D member invalid
+    assert s["best_3d"]["variant"] == "FORK3D4"
+    s = FB.summarize(times, 216, 32, dict(ok, FORK3D2=False, FORK3D4=False), segs)
+    assert s["best_3d"] is None and s["best_3d_note"] == "INVALID: no valid 3D variant"
+    _ev("J1F BEST3D: FORK invalid -> saving suppressed (old source reported %s ms)" % so["best_3d"]["saving_ms_per_pass"])
+
+
 def test_forkbench_out_view():
     """The direct write: swapped_out_view puts the op's swapped output (N, HQ/HKV, HKV, HD) where the op's own return
     (flash_api.cpp: out.transpose(1, 2).reshape(N, 1, HQ, HD)) puts it, with the strides of the wrapper's own output
@@ -997,8 +1027,14 @@ def test_forkbench_timing_plumbing():
     assert stop2 == "wall clock above 5 s after pass 1" and all(len(t2[v]) == 2 for v in names)
     s = FB.summarize(times, 216, 32, {v: True for v in names}, (2,))
     for x in FB.FLASH:
-        assert s["flash_timing"][x] == dict(kernel_ms_pass=20.0, copy_only_ms_pass=1.5, total_j1f_form_ms_pass=24.0,
-                                            rest_ms_pass=2.5, valid=True), s["flash_timing"][x]
+        assert s["flash_timing"][x] == dict(direct_e2e_ms_pass=20.0, copy_only_ms_pass=1.5,
+                                            total_j1f_form_ms_pass=24.0, residual_ms_pass=2.5, valid=True), \
+            s["flash_timing"][x]
+    lines = FB.decision_lines("C128_B216", s)
+    assert any("FLASHT NS1R1" in x and "direct (end-to-end, preallocated output) 20.000" in x and "residual 2.500" in x
+               for x in lines), lines
+    assert not [x for x in lines if "FLASHT" in x and ("kernel" in x or " rest " in x)], lines
+    assert not [x for x in lines if "per-byte efficiency" in x or "optimal" in x], lines
     assert s["ratios"]["FORK1R/NS1R1"]["ratio"] == round(ms["FORK1R"] / 20.0, 4)
     assert s["ratios"]["FORK1R/NS1R1_CP"]["ratio"] == round(ms["FORK1R"] / 24.0, 4)
     src = (EFF / "r2_j1_forkbench.py").read_text()                       # run_shape times through this loop

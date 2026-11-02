@@ -9,7 +9,8 @@ of the MEASURED shapes, in matched pairs:
   FORKT    the same with the union tables built before (BUILD_UNION off): the in-kernel build's cost
   FORKA1   FORK through fork_vllm_unified_attention_ahead.py with ahead=1 (the table page id and the extents word read
            two tiles ahead, as scalars); FORKA2: ahead=2 (and the bias one tile ahead); FORKA3: ahead=3 (the fork's
-           K / V page-id loads kept, only ext_rows and the bias ahead). MUST gate <shape>-FORKAn-EQ:
+           K / V page-id loads kept in the source, only ext_rows and the bias ahead; the CPU compile witness shows
+           that every level, 3 included, loses Triton's async K / V copies). MUST gate <shape>-FORKAn-EQ:
            the output = FORK's, bit for bit (no arithmetic change is allowed)
   FORK3Dn  the same with the fork's EXISTING 3D split path (seq_threshold_3D, n segments per (request, KV head),
            reduce_segments), n in --segments: wave balance (never run before: its numeric gate is REPORT)
@@ -28,21 +29,25 @@ argument) with out_ = a view of the preallocated output in the kernel's swapped 
   <X>_CP   the j1f form: the wrapper returns a new tensor and the timed region copy_s it into the output (the old
            numbers of X were this variant)
   <X>_CO   the copy_ alone (the same bytes, from <X>_CP's output into a separate buffer)
-So kernel-only = X, copy-only = X_CO, total (j1f form) = X_CP; the rest X_CP - X - X_CO = the wrapper's allocations.
+So direct = X (an END-TO-END library call into a preallocated output: NOT kernel-only, the pinned C++ still allocates
+softmax_lse and the split-KV scratch), copy-only = X_CO, total (j1f form) = X_CP. residual = X_CP - X - X_CO: a
+difference of separately timed forms, not an isolated measurement of the wrapper's allocations.
 MATCHED PAIRS (the summary's ratios): FORK / FLASHU1 (equal logical bytes: the cost of 4 rows' tile at the same bytes);
-FORK1R / NS1R1 (equal rows and bytes: the fork kernel's per-byte efficiency); FORK / NS1x4 (equal rows: the saving of
-the shared read); FORKT / FORK (the union build); FORK3Dn / FORK (the split); NSRU / FORK. The same pairs against the
-<X>_CP variants reproduce the j1f form. j1f's per-byte ratios need this rerun to be re-scored.
+FORK1R / NS1R1 (equal rows and logical bytes: the time ratio of the fork and the flash call at matched work); FORK /
+NS1x4 (equal rows: the saving of the shared read); FORKT / FORK (the union build); FORK3Dn / FORK (the split); NSRU /
+FORK. The same pairs against the <X>_CP variants reproduce the j1f form. j1f's ratios need this rerun to be re-scored.
 LOGICAL BYTES per call: pages x BLOCK_BYTES (K + V + bias of one (KV head, block)) x KV heads x requests (or entries);
-achieved logical TB/s = bytes / time. Logical, not DRAM counters: an ncu pass is a separate option of the lead.
+achieved logical TB/s = bytes / time. Logical, not DRAM counters: these ratios are time ratios at matched logical work;
+they do not give a physical per-byte ceiling or optimality (that needs DRAM counters, e.g. an ncu pass of the lead).
 GATES (MUST unless noted): <shape>-RUN; <shape>-UNION (FORK union_len 72, FORK1R 64 everywhere); <shape>-<v>-EXACT
 (every variant's output after its last timed pass = its first output, bit for bit, AND both hold only finite values:
 identical NaN bits fail); <shape>-FORK3Dn-PATH (REPORT: the 3D launch wrote its NaN-filled segment maxima; if not, the
-variant is INVALID); <shape>-FORKT-EQ (FORKT = FORK bit for bit); <shape>-<X>-OUTEQ (the direct out_ write = the j1f
-form X_CP, bit for bit); <shape>-<v>-NUM (every checked value of the output, of the float64 reference and of their
+variant is INVALID); <shape>-FORKT-EQ (FORKT = FORK bit for bit); <shape>-<X>-OUTEQ (the end-to-end direct output
+form = the j1f form X_CP, bit for bit); <shape>-<v>-NUM (every checked value of the output, of the float64 reference and of their
 difference is finite (torch.isfinite, before any accumulation; a FAIL names the count and the first index), and max
 |output - float64 reference| <= TOL on --sample requests, every row and head; FORK3Dn: REPORT); <shape>-BUDGET;
-RUN-WALL. A variant whose NUM, EXACT or OUTEQ fails is reported INVALID in the ratios (the decision lines say INVALID).
+RUN-WALL. A variant whose NUM, EXACT, OUTEQ or FORKAn-EQ fails is reported INVALID in the ratios, the 3D saving and
+the flash timing split (the decision lines say INVALID; the 3D saving line is suppressed).
 NO NEW KERNEL: the fork (fia6's blob), flash_attn_nosa's op, torch ops. Synthetic inputs (seeded, x 0.05 bf16).
 Order-rotated passes (lesson L62) after a warm-up of each variant; one pass = --layers calls (one per layer).
 GRANT: GRANT_j1f below (default deny; r2_j1_step.sh reads it at <sha>).
@@ -71,7 +76,7 @@ FORK_LAUNCH = dict(num_warps=4, num_stages=3, tile_size=64)   # = verify_rows.FO
 SPLITS = 4                                                    # NOSI_ATTN_SPLITS of the cells (the shipped call)
 MASK_BIAS = -3.0e4                                            # = verify_rows.MASK_BIAS
 TOL = 1e-3                                                    # fia5's numeric tolerance (float64 reference)
-FLASH = ("NS1R1", "NS1x4", "FLASHU1", "NSRU")                 # the flash controls (direct out_ write)
+FLASH = ("NS1R1", "NS1x4", "FLASHU1", "NSRU")                 # the flash controls (end-to-end, direct output)
 AHEAD = ("FORKA1", "FORKA2", "FORKA3")                        # the fork with its loads ahead (ahead = 1, 2, 3)
 BASE = ("FORK", "FORKT") + AHEAD + ("FORK1R",) + tuple(x + s for x in FLASH for s in ("", "_CP", "_CO"))  # _CP < _CO
 
@@ -157,13 +162,15 @@ def stats(v):
 
 
 PAIRS = (("FORK", "FLASHU1", "equal logical bytes (union 72): the 4-row tile's cost at the same bytes"),
-         ("FORK1R", "NS1R1", "equal rows and bytes (1 row, 64 pages): the fork kernel's per-byte efficiency"),
+         ("FORK1R", "NS1R1", "equal rows and logical bytes (1 row, 64 pages): fork time / flash end-to-end time "
+          "(direct output) at matched logical work; not a physical per-byte ceiling"),
          ("FORK", "NS1x4", "equal rows (4 per request): the shared read's saving vs the baseline's 4 calls"),
          ("FORKT", "FORK", "the in-kernel union build's cost"),
          ("NSRU", "FORK", "the shipped kernel's own sharing (L2) vs the fork"),
          ("FORKA1", "FORK", "the fork with the table and extents read two tiles ahead (bit-equal by FORKA1-EQ)"),
          ("FORKA2", "FORK", "the same and the bias one tile ahead (bit-equal by FORKA2-EQ)"),
-         ("FORKA3", "FORK", "the fork's K / V page-id loads kept; ext_rows and the bias ahead (FORKA3-EQ)"))
+         ("FORKA3", "FORK", "the fork's K / V page-id loads kept in the source; ext_rows and the bias ahead "
+          "(compiled: the async K / V copies are lost as at levels 1-2; FORKA3-EQ)"))
 PAIRS_CP = (("FORK", "FLASHU1_CP", "j1f form (flash: wrapper + copy_): equal logical bytes"),
             ("FORK1R", "NS1R1_CP", "j1f form (flash: wrapper + copy_): equal rows and bytes"),
             ("FORK", "NS1x4_CP", "j1f form (flash: wrapper + copy_): equal rows"),
@@ -172,8 +179,10 @@ PAIRS_CP = (("FORK", "FLASHU1_CP", "j1f form (flash: wrapper + copy_): equal log
 
 def summarize(times: dict, B: int, layers: int, valid: dict, segments) -> dict:
     """Per variant: median ms per pass and per call, logical bytes per call, logical TB/s; the matched ratios (INVALID
-    where a member failed its NUM, EXACT or OUTEQ gate); the 3D split vs FORK; the decomposition of FORK - FLASHU1;
-    per flash control: kernel-only (X), copy-only (X_CO), total in the j1f form (X_CP) and the rest."""
+    where a member failed its NUM, EXACT, OUTEQ or FORKAn-EQ gate); the 3D split vs FORK (only when FORK and the 3D
+    member are valid; else best_3d is None and best_3d_note says why); FORK - FLASHU1 (both valid); per flash
+    control: direct (X: the end-to-end library call into a preallocated output, NOT kernel-only), copy-only (X_CO),
+    total in the j1f form (X_CP) and the residual X_CP - X - X_CO (a difference of separately timed forms)."""
     st = {k: stats(v) for k, v in times.items()}
     per = {}
     for k, s in st.items():
@@ -193,7 +202,7 @@ def summarize(times: dict, B: int, layers: int, valid: dict, segments) -> dict:
             ok = per[a_]["valid"] and per[b_]["valid"]
             ratios["%s/%s" % (a_, b_)] = dict(ratio=round(per[a_]["ms_call"] / per[b_]["ms_call"], 4), what=what,
                                               valid=ok, note=None if ok else
-                                              "INVALID: a member failed NUM, EXACT or OUTEQ")
+                                              "INVALID: a member failed NUM, EXACT, OUTEQ or FORKAn-EQ")
     out = dict(stats_ms=st, per=per, ratios=ratios)
     if "FORK" in per and "FLASHU1" in per and per["FORK"]["valid"] and per["FLASHU1"]["valid"]:
         f, u = per["FORK"]["ms_call"], per["FLASHU1"]["ms_call"]
@@ -201,16 +210,40 @@ def summarize(times: dict, B: int, layers: int, valid: dict, segments) -> dict:
     ft = {}
     for x in FLASH:
         if x in per and x + "_CP" in per and x + "_CO" in per:
-            k_, cp, co = per[x]["ms_pass"], per[x + "_CP"]["ms_pass"], per[x + "_CO"]["ms_pass"]
-            ft[x] = dict(kernel_ms_pass=k_, copy_only_ms_pass=co, total_j1f_form_ms_pass=cp,
-                         rest_ms_pass=round(cp - k_ - co, 4),
+            d_, cp, co = per[x]["ms_pass"], per[x + "_CP"]["ms_pass"], per[x + "_CO"]["ms_pass"]
+            ft[x] = dict(direct_e2e_ms_pass=d_, copy_only_ms_pass=co, total_j1f_form_ms_pass=cp,
+                         residual_ms_pass=round(cp - d_ - co, 4),
                          valid=per[x]["valid"] and per[x + "_CP"]["valid"] and per[x + "_CO"]["valid"])
     out["flash_timing"] = ft
     d3 = [(per[k]["ms_call"], k) for k in per if k.startswith("FORK3D") and per[k]["valid"]]
-    if d3 and "FORK" in per:
+    out["best_3d"], out["best_3d_note"] = None, None
+    if "FORK" not in per or not per["FORK"]["valid"]:                    # the same rule as the ratios
+        out["best_3d_note"] = "INVALID: FORK failed NUM or EXACT (or did not run): no 3D saving"
+    elif not d3:
+        out["best_3d_note"] = "INVALID: no valid 3D variant"
+    else:
         best = min(d3)
         out["best_3d"] = dict(variant=best[1], ratio=round(best[0] / per["FORK"]["ms_call"], 4),
                               saving_ms_per_pass=round((per["FORK"]["ms_call"] - best[0]) * layers, 3))
+    return out
+
+
+def decision_lines(name: str, s: dict):
+    """The summary's decision lines of one shape. An invalid ratio says INVALID; an invalid FORK - FLASHU1 or 3D saving
+    is SUPPRESSED (no number printed)."""
+    out = []
+    for k, v in s["ratios"].items():
+        out.append("J1F %s RATIO %s = %s (%s)%s" % (name, k, v["ratio"], v["what"], "" if v["valid"] else " INVALID"))
+    for x, t in s["flash_timing"].items():
+        out.append("J1F %s FLASHT %-7s direct (end-to-end, preallocated output) %.3f, copy-only %.3f, total (j1f form) "
+                   "%.3f, residual %.3f ms per pass%s" % (name, x, t["direct_e2e_ms_pass"], t["copy_only_ms_pass"],
+                                                         t["total_j1f_form_ms_pass"], t["residual_ms_pass"],
+                                                         "" if t["valid"] else " INVALID"))
+    d = s.get("fork_minus_flashu1_ms_per_pass")
+    out.append("J1F %s FORK - FLASHU1 = %s" % (name, "%s ms per pass" % d if d is not None else
+                                               "SUPPRESSED (FORK or FLASHU1 invalid or missing)"))
+    b = s.get("best_3d")
+    out.append("J1F %s best 3D %s" % (name, b if b is not None else "SUPPRESSED (%s)" % s.get("best_3d_note")))
     return out
 
 
@@ -535,7 +568,7 @@ def run_shape(a, C: int, B: int, t0: float):
             n_d, n_cp = nonfinite(first[x])[0], nonfinite(first[x + "_CP"])[0]
             ok = eq and n_d == 0 and n_cp == 0
             valid[x] = valid[x] and ok
-            gates.append(("%s-%s-OUTEQ" % (name, x), True, ok, "direct out_ write = %s_CP (wrapper + copy_) bit for "
+            gates.append(("%s-%s-OUTEQ" % (name, x), True, ok, "end-to-end direct output = %s_CP (wrapper + copy_) bit for "
                           "bit: %s; non-finite values: direct %d, %s_CP %d" % (x, eq, n_d, x, n_cp)))
     times, warm, stop = time_variants(parts, names, a.layers, a.warmup, a.reps, cuda_timer, t0, a.max_shape_s)
     for v in names:
@@ -597,14 +630,8 @@ def main(argv=None) -> int:
         for v, p in s["per"].items():
             print("J1F %s %-9s %.4f ms/call (%.3f ms/pass) rows %d logical %.3f GB/call %s TB/s valid %s" % (
                 name, v, p["ms_call"], p["ms_pass"], p["rows"], p["bytes"] / 1e9, p["logical_tb_s"], p["valid"]))
-        for k, v in s["ratios"].items():
-            print("J1F %s RATIO %s = %s (%s)%s" % (name, k, v["ratio"], v["what"], "" if v["valid"] else " INVALID"))
-        for x, t in s["flash_timing"].items():
-            print("J1F %s FLASHT %-7s kernel-only %.3f, copy-only %.3f, total (j1f form) %.3f, rest %.3f ms per pass%s"
-                  % (name, x, t["kernel_ms_pass"], t["copy_only_ms_pass"], t["total_j1f_form_ms_pass"],
-                     t["rest_ms_pass"], "" if t["valid"] else " INVALID"))
-        print("J1F %s FORK - FLASHU1 = %s ms per pass; best 3D %s" % (name, s.get("fork_minus_flashu1_ms_per_pass"),
-                                                                       s.get("best_3d")))
+        for line in decision_lines(name, s):
+            print(line)
     failed = [g[0] for g in gates if g[1] and not g[2]]
     print("r2_j1_forkbench: %d MUST gate(s) failed" % len(failed))
     return min(len(failed), 19)

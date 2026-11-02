@@ -40,9 +40,12 @@
 # [ahead]      SCALARS carried in registers; tile j uses the values loaded one or two iterations before. The fia5 TTGIR
 # [ahead]      had these as synchronous loads at the head of each tile's dependent chain (SCORING_fia5.md section 5).
 # [ahead]   2  as 1, and the CIS bias of tile j + 1 is read in iteration j (its address needs the page id of j + 1).
-# [ahead]   3  the fork's own page-id and ext_t vector loads stay (Triton 3.2 stages the K / V copies from them; at
-# [ahead]      levels 1 and 2 the CPU compile witness shows no async copy left in the loop); only ext_rows (from a
-# [ahead]      scalar two tiles ahead) and the bias (one tile ahead) are carried.
+# [ahead]   3  the fork's own page-id and ext_t vector loads stay in the source; only ext_rows (from a scalar two
+# [ahead]      tiles ahead) and the bias (one tile ahead) are carried. The aim was to keep Triton's async K / V
+# [ahead]      staging. It does NOT: the CPU compile witness (tests_cpu/test_j1.py, sm_80) shows that ALL levels
+# [ahead]      1-3 lose the async K / V copies (K / V become plain loads); registers stay 251-255, so the SM still
+# [ahead]      holds 2 programs. The spills go (stack 48 -> 0 B) and shared memory falls to 48 KB; neither implies a
+# [ahead]      GPU speed-up or bit equality. The GPU run decides both (forkbench FORKAn/FORK and FORKAn-EQ).
 # [ahead] NO ARITHMETIC CHANGES: the same values reach the same operations in the same order (the scalars are broadcast
 # [ahead] to the vectors that the fork loads); the dots, the softmax steps and the stores are the fork's lines. Out-of-
 # [ahead] range reads past the last tile are masked. Bit equality on the GPU is still a GPU gate (forkbench FORKA-EQ).
