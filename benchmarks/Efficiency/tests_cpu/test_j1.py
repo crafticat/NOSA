@@ -30,6 +30,11 @@ F3        test_stamp_frame_equal (the shifted-age frame = the shipped stamps on 
           residency's kernels as kernel nodes.
 CELL      test_j1_cell_tables (the private copy; the I4DC cell module itself unchanged), test_j1_registration_state,
           test_step_script_j1.
+J1F       test_forkbench_pure; test_forkbench_nonfinite (planted NaN / +Inf / -Inf in output, reference, both: the new
+          NUM and EXACT gates FAIL with count and index; the j1f source's old accumulation, loaded from git, PASSED the
+          identical-NaN plant: the control is not a no-op); test_forkbench_out_view (the flash controls' direct out_
+          write: layout = the op's own return, the argument list = the installed wrapper's); test_forkbench_timing_
+          plumbing (the rotated timing loop with a fake timer; kernel / copy / total per flash control).
 
     env PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rfEs benchmarks/Efficiency/tests_cpu/test_j1.py
 """
@@ -62,7 +67,8 @@ HOLDER = "2190876"                     # a lead-owned uuid file that exists (HOL
 T_ = "benchmarks/Efficiency/tests_cpu/"
 E_ = "benchmarks/Efficiency/"
 J1_NEW = (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", T_ + "test_j1.py", "docs/NOTES_j1.md",
-          E_ + "r2_j1_forkbench.py")
+          E_ + "r2_j1_forkbench.py", E_ + "fork_vllm_unified_attention_ahead.py")
+FORK_AHEAD = E_ + "fork_vllm_unified_attention_ahead.py"           # the fia6 fork + the [ahead] lines (a sibling)
 J1_DECL = tuple(T_ + "test_%s.py" % n for n in ("wsa", "wsb", "wsc", "i2", "i3", "i4a", "i4g", "i4d", "i4k", "i4u", "i4h",
                                                    "i4s", "i4cc", "i4dc", "recon7"))
 # INT (nosi-r2-int: J1 + ST1 + BF1 in one arm, r2_int_cell.py): the ST1 and BF1 rungs' files and its own (its own Gate
@@ -780,6 +786,9 @@ def test_forkbench_pure():
     assert w["FORK1R"] == w["NS1R1"] == dict(rows=216, pages=2 * 216 * 64)                     # equal rows and bytes
     assert w["NS1x4"] == dict(rows=864, pages=2 * 864 * 64)                                     # equal rows
     assert w["NSRU"]["pages"] == 2 * 216 * (64 + 67 + 69 + 72)
+    for x in FB.FLASH:                                                  # the j1f form: X's work; the copy: none
+        assert w[x + "_CP"] == w[x] and w[x + "_CO"] == dict(rows=0, pages=0), x
+    assert FB.variants(()).index("NS1R1_CP") < FB.variants(()).index("NS1R1_CO")   # the copy's source runs first
     assert FB.rotation(["a", "b", "c"], 4) == ["b", "c", "a"]
     times = {v: [32.0 * (1.0 + 0.1 * i)] * 3 for i, v in enumerate(FB.variants((2,)))}
     times["FORK"] = [32.0 * 1.2] * 3
@@ -793,12 +802,733 @@ def test_forkbench_pure():
     assert s["ratios"]["NSRU/FORK"]["valid"] is False and "INVALID" in s["ratios"]["NSRU/FORK"]["note"]
     assert s["fork_minus_flashu1_ms_per_pass"] == round(0.6 * 32, 3)
     assert s["best_3d"] == dict(variant="FORK3D2", ratio=0.9, saving_ms_per_pass=round(0.12 * 32, 3))
-    assert {"FORK/FLASHU1", "FORK1R/NS1R1", "FORK/NS1x4", "FORKT/FORK", "NSRU/FORK", "FORK3D2/FORK"} == set(s["ratios"])
+    assert {"FORK/FLASHU1", "FORK1R/NS1R1", "FORK/NS1x4", "FORKT/FORK", "NSRU/FORK", "FORK3D2/FORK", "FORK/FLASHU1_CP",
+            "FORK1R/NS1R1_CP", "FORK/NS1x4_CP", "NSRU_CP/FORK", "FORKA1/FORK", "FORKA2/FORK", "FORKA3/FORK"} == set(
+        s["ratios"])
+    assert w["FORKA1"] == w["FORKA2"] == w["FORKA3"] == w["FORK"]
+    assert s["per"]["NS1R1_CO"]["logical_tb_s"] is None and s["per"]["NS1R1_CO"]["bytes"] == 0
+    assert set(s["flash_timing"]) == set(FB.FLASH) and s["flash_timing"]["NSRU"]["valid"] is False
     for bad in (["--out", "x", "--segments", "1"], ["--out", "x", "--reps", "2"], ["--out", "x", "--shapes", "a"]):
         with pytest.raises(SystemExit):
             FB.parse_args(bad)
     assert SEL is not None
     _ev("J1F PURE: work per variant %s; ratios %s" % (w, {k: v["ratio"] for k, v in s["ratios"].items()}))
+
+
+# ------------------------------------------------------------------ the fork microbench: the j1f source follow-up
+J1F_OLD = "cd0e2865924ed59a254fae1e283b1a2fcac4ad52"                  # the j1f source before the follow-up
+
+
+def _fb_old():
+    """r2_j1_forkbench.py as committed at J1F_OLD (the j1f run's source), loaded as a separate module object."""
+    import types
+    if not _have(J1F_OLD):
+        pytest.skip("no git or no commit %s in %s" % (J1F_OLD, ROOT))
+    src = _git("show", "%s:benchmarks/Efficiency/r2_j1_forkbench.py" % J1F_OLD).stdout
+    assert "err = max(err, float((got.double() - want).abs().max()))" in src     # the old accumulation
+    mod = types.ModuleType("r2_j1_forkbench_old")
+    mod.__file__ = str(EFF / "r2_j1_forkbench.py")
+    exec(compile(src, "r2_j1_forkbench@%s" % J1F_OLD[:7], "exec"), mod.__dict__)
+    return mod
+
+
+def _fb_world(FB, B=3, seed=11):
+    """Outputs of FORK (4 rows per request), NS1R1 (= FORK's row 0) and FLASHU1, and float64 references 1e-5 away."""
+    g = torch.Generator().manual_seed(seed)
+    bf = torch.bfloat16
+    fork = (torch.randn(B * FB.R, FB.HQ, FB.HD, generator=g) * 0.05).to(bf)
+    outs = dict(FORK=fork, NS1R1=fork.view(B, FB.R, FB.HQ, FB.HD)[:, 0].reshape(B, 1, FB.HQ, FB.HD).clone(),
+                FLASHU1=(torch.randn(B, 1, FB.HQ, FB.HD, generator=g) * 0.05).to(bf))
+    ref = {}
+    for b in range(B):
+        for r in range(FB.R):
+            ref[(b, r)] = fork[b * FB.R + r].double() + 1e-5
+        ref[(b, "U")] = outs["FLASHU1"].view(B, FB.HQ, FB.HD)[b].double() + 1e-5
+    return outs, ref
+
+
+# where the plant goes: variant -> (reference key, the output row index in out.view(-1, HQ, HD))
+PLANT_AT = dict(FORK=((1, 2), 1 * 4 + 2), NS1R1=((2, 0), 2), FLASHU1=((0, "U"), 0))
+
+
+def test_forkbench_nonfinite():
+    """PLANTED NON-FINITE CONTROL (reviewer finding): NaN and +Inf (and -Inf) in the candidate output, in the float64
+    reference, and in both (identical values): every case FAILS the new NUM gate with its count and first index; the
+    finite case PASSES. The OLD accumulation (the module at J1F_OLD) PASSES the identical-NaN case (and others): the
+    control is not a no-op (L34). Repeatability: identical non-finite bits pass the old bit test and FAIL the new one."""
+    FB = _mod("r2_j1_forkbench")
+    OLD = _fb_old()
+    B = 3
+    h, d = 5, 7
+    old_pass = {}
+    for name, (key, row) in PLANT_AT.items():
+        outs, ref = _fb_world(FB, B)
+        ok, det = FB.num_verdict(FB.num_check(name, outs[name], ref, B))           # the finite case
+        assert ok and "max |out - float64|" in det, (name, det)
+        assert OLD.num_err(name, outs[name], ref, B) <= OLD.TOL                     # the old code agrees here
+        for val in (float("nan"), float("inf"), float("-inf")):
+            for where in ("out", "ref", "both"):
+                outs, ref = _fb_world(FB, B)
+                o = outs[name]
+                if where in ("out", "both"):
+                    o.view(-1, FB.HQ, FB.HD)[row, h, d] = val
+                if where in ("ref", "both"):
+                    ref[key][h, d] = val
+                chk = FB.num_check(name, o, ref, B)
+                ok, det = FB.num_verdict(chk)
+                assert not ok and chk["nonfinite"] == 1, (name, val, where, chk, det)
+                assert det.startswith("NON-FINITE: 1 value(s)"), det
+                assert "request %s row %s head %d dim %d" % (key[0], key[1], h, d) in det, det
+                assert chk["err"] == chk["err"] and chk["err"] < 1e-3, chk      # the max stays finite and honest
+                old_pass[(name, repr(val), where)] = OLD.num_err(name, o, ref, B) <= OLD.TOL
+    for name in PLANT_AT:                                                   # the old hole, per variant
+        assert old_pass[(name, "nan", "both")], (name, old_pass)            # identical NaN: the old gate PASSED
+        assert old_pass[(name, "nan", "out")] and old_pass[(name, "nan", "ref")]
+        assert old_pass[(name, "inf", "both")]                             # inf - inf = NaN: vanished too
+        assert not old_pass[(name, "inf", "out")]                          # a lone Inf was already caught
+    # repeatability: identical bits that hold a non-finite value
+    for val in (float("nan"), float("inf")):
+        outs, _ = _fb_world(FB, B)
+        o = outs["FORK"]
+        o.view(-1, FB.HQ, FB.HD)[6, h, d] = val
+        first = o.clone()
+        assert bool((OLD.bits(o) == OLD.bits(first)).all())                # the old EXACT: PASS (a no-op on NaN)
+        ok, det = FB.repeat_check(o, first)
+        assert not ok and "bit for bit: True" in det and "last 1 (first at (6, %d, %d))" % (h, d) in det, det
+    outs, _ = _fb_world(FB, B)
+    o = outs["FORK"]
+    assert FB.repeat_check(o, o.clone())[0]                                 # finite and identical: PASS
+    o2 = o.clone()
+    o2.view(-1)[123] += 0.5
+    assert not FB.repeat_check(o2, o)[0]                                    # finite and different: FAIL
+    outs, ref = _fb_world(FB, B)                                            # no reference row: FAIL (fail closed)
+    ok, det = FB.num_verdict(FB.num_check("FORK1R", outs["NS1R1"], {k: v for k, v in ref.items() if k[1] != 0}, B))
+    assert not ok and "no row checked" in det
+    # the decision lines: a planted NaN makes the variant INVALID in the ratios and the flash timing
+    outs, ref = _fb_world(FB, B)
+    outs["NS1R1"].view(-1)[0] = float("nan")
+    valid = {v: True for v in FB.variants((2,))}
+    valid["NS1R1"] = FB.num_verdict(FB.num_check("NS1R1", outs["NS1R1"], ref, B))[0]
+    assert valid["NS1R1"] is False
+    s = FB.summarize({v: [32.0, 33.0, 34.0] for v in valid}, 216, 32, valid, (2,))
+    assert s["ratios"]["FORK1R/NS1R1"]["valid"] is False and "INVALID" in s["ratios"]["FORK1R/NS1R1"]["note"]
+    assert s["ratios"]["FORK1R/NS1R1_CP"]["valid"] is True and s["flash_timing"]["NS1R1"]["valid"] is False
+    valid["FLASHU1"] = False
+    assert "fork_minus_flashu1_ms_per_pass" not in FB.summarize({v: [32.0] * 3 for v in valid}, 216, 32, valid, (2,))
+    _ev("J1F NONFINITE: new NUM fails every plant (NaN/+Inf/-Inf x out/ref/both, 3 variants); the old accumulation "
+        "passed %d of %d plants: %s" % (sum(old_pass.values()), len(old_pass),
+                                        sorted(k for k, v in old_pass.items() if v)))
+
+
+def test_forkbench_best3d_validity():
+    """REVIEW 5: the 3D saving follows the ratios' validity rule. PLANT: FORK invalid -> best_3d None, the note says
+    INVALID and the decision line is SUPPRESSED (no number); the j1f source (cd0e286) still reported the saving (the
+    control is not a no-op). The fastest 3D member invalid -> it is not chosen. FORK - FLASHU1 likewise."""
+    FB = _mod("r2_j1_forkbench")
+    OLD = _fb_old()
+    segs = (2, 4)
+    times = {"FORK": [32.0] * 3, "FLASHU1": [20.0] * 3, "FORK3D2": [28.0] * 3, "FORK3D4": [30.0] * 3}
+    ok = {v: True for v in times}
+    s = FB.summarize(times, 216, 32, ok, segs)
+    assert s["best_3d"]["variant"] == "FORK3D2" and s["best_3d"]["saving_ms_per_pass"] == 4.0 and s["best_3d_note"] is None
+    bad = dict(ok, FORK=False)                                                # PLANT: FORK invalid
+    s = FB.summarize(times, 216, 32, bad, segs)
+    assert s["best_3d"] is None and s["best_3d_note"].startswith("INVALID: FORK")
+    assert "fork_minus_flashu1_ms_per_pass" not in s
+    lines = FB.decision_lines("C128_B216", s)
+    assert [x for x in lines if "best 3D SUPPRESSED (INVALID: FORK" in x]
+    assert not [x for x in lines if "saving_ms_per_pass" in x or ("best 3D" in x and "FORK3D2" in x)], lines
+    assert all(x.endswith(" INVALID") for x in lines if "RATIO FORK3D" in x), lines            # the ratio: INVALID
+    assert [x for x in lines if "FORK - FLASHU1 = SUPPRESSED" in x]
+    assert all(v["valid"] is False for k, v in s["ratios"].items() if "FORK" in k.split("/"))
+    so = OLD.summarize(times, 216, 32, bad, segs)                             # the old rule: the saving survived
+    assert so["best_3d"]["saving_ms_per_pass"] == 4.0 and so["fork_minus_flashu1_ms_per_pass"] == 12.0
+    s = FB.summarize(times, 216, 32, dict(ok, FORK3D2=False), segs)           # the fastest 3D member invalid
+    assert s["best_3d"]["variant"] == "FORK3D4"
+    s = FB.summarize(times, 216, 32, dict(ok, FORK3D2=False, FORK3D4=False), segs)
+    assert s["best_3d"] is None and s["best_3d_note"] == "INVALID: no valid 3D variant"
+    _ev("J1F BEST3D: FORK invalid -> saving suppressed (old source reported %s ms)" % so["best_3d"]["saving_ms_per_pass"])
+
+
+def test_forkbench_rows_sweep_pure():
+    """TRACK 2: the rows sweep's work, row mapping, bit check, slopes, suppression and decision lines (CPU)."""
+    FB = _mod("r2_j1_forkbench")
+    B = 287
+    v = FB.variants((2,))
+    assert all(x in v for x in FB.ROWS) and FB.ROWS == ("RSM1", "RSM2", "RSM3", "RSM4", "RSQ1", "RSQ2", "RSQ4")
+    for x in FB.ROWS:                                                    # fixed union bytes, n active rows
+        assert FB.work(x, B) == dict(rows=int(x[3:]) * B, pages=2 * B * 72), x
+    Bs = 3
+    g = torch.Generator().manual_seed(5)
+    forkt = (torch.randn(Bs * 4, FB.HQ, FB.HD, generator=g) * 0.05).to(torch.bfloat16)
+    for n in (1, 2, 3, 4):
+        got = forkt.view(Bs, 4, FB.HQ, FB.HD)[:, :n].contiguous().view(Bs * n, FB.HQ, FB.HD)
+        for pre in ("RSM", "RSQ") if n != 3 else ("RSM",):
+            ok, det = FB.rows_eq("%s%d" % (pre, n), got, forkt, Bs)
+            assert ok and "0 values differ" in det, det
+            assert torch.equal(FB.out_row("%s%d" % (pre, n), got, (2, n - 1), Bs), forkt[2 * 4 + n - 1])
+            assert FB.out_row("%s%d" % (pre, n), got, (2, n), Bs) is None if n < 4 else True
+        bad = got.clone()
+        bad.view(-1)[7] += 0.25                                         # PLANT: one value off
+        assert not FB.rows_eq("RSM%d" % n, bad, forkt, Bs)[0]
+        bad = got.clone()
+        bad.view(-1)[7] = float("nan")                                  # PLANT: NaN
+        assert "non-finite 1" in FB.rows_eq("RSM%d" % n, bad, forkt, Bs)[1]
+    ms = dict(FORK=34.0, FORKT=33.0, FORK1R=22.0, RSM1=30.0, RSM2=31.0, RSM3=32.0, RSM4=33.0, RSQ1=24.0, RSQ2=27.0,
+              RSQ4=33.0)
+    valid = {x: True for x in ms}
+    s = FB.summarize({x: [t] * 3 for x, t in ms.items()}, B, 32, valid, ())
+    rs = s["rows_sweep"]
+    assert rs["masked"]["slope_ms_per_row"] == 1.0 and rs["masked"]["rsm4_minus_forkt"] == 0.0
+    assert rs["tile"] == dict(ms_pass={1: 24.0, 2: 27.0, 4: 33.0}, per_row_1_to_2=3.0, per_row_2_to_4=3.0)
+    assert rs["e_fork_ms_pass"] == 2.0 and rs["tile4_fork_ms_pass"] == 9.0
+    s = FB.summarize({x: [t] * 3 for x, t in ms.items()}, B, 32, dict(valid, RSM2=False, RSQ1=False), ())
+    rs = s["rows_sweep"]
+    assert rs["masked"] is None and rs["tile"] is None and rs["e_fork_ms_pass"] is None
+    lines = FB.decision_lines("C81_B287", s)
+    assert [x for x in lines if "ROWS masked SUPPRESSED" in x] and [x for x in lines if "ROWS e_fork_ms_pass SUPP" in x]
+    src = (EFF / "r2_j1_forkbench.py").read_text()
+    assert "fork_call(qn, oM, cun, n, *tT, None, block_q=R)" in src and "fork_call(qn, oQ, cun, n, *tT, None)" in src
+    _ev("J1F ROWS: rows sweep plumbing; planted value / NaN detected")
+
+
+NCU_QUERY = """Device NVIDIA A100
+  dram__bytes_read                 # of bytes read from DRAM
+  gpu__time_duration               total duration in nanoseconds
+  lts__t_sectors_srcunit_tex_op_read   # of LTS sectors from unit TEX for reads
+  sm__warps_active                 cumulative # of warps in flight
+  launch__registers_per_thread     registers per thread
+"""
+
+
+def test_forkbench_ncu_plumbing(tmp_path):
+    """TRACK 2: the ncu argv, the metric query filter, the raw CSV parser (the fia6 record's real CSV when present,
+    else a written one) and the per-arm summary; the refusal of a missing ncu binary; the j1n arguments."""
+    FB = _mod("r2_j1_forkbench")
+    names = FB.ncu_metric_names(NCU_QUERY)
+    missing, metrics = FB.ncu_metric_list(names)
+    assert missing == [] and metrics[:3] == list(FB.NCU_REQUIRED)
+    assert "sm__warps_active.avg.pct_of_peak_sustained_active" in metrics and "launch__registers_per_thread" in metrics
+    assert "dram__bytes_write.sum" not in metrics                        # not in this query: not asked
+    assert FB.ncu_metric_list(names - {"dram__bytes_read"})[0] == ["dram__bytes_read.sum"]
+    a = FB.parse_args(["--out", "x", "--cell", "j1n", "--shapes", "81:287", "--segments", "2", "--ncu", "/n/ncu"])
+    argv = FB.ncu_argv("/n/ncu", a, 81, 287, "RSQ2", "/o/child", "/o/rep", metrics)
+    for want in (["--profile-from-start", "off"], ["--cache-control", "all"], ["--replay-mode", "kernel"],
+                 ["--mode", "ncu-cell"], ["--ncu-arms", "RSQ2"], ["--shapes", "81:287"], ["--cell", "j1n"]):
+        i = argv.index(want[0])
+        assert argv[i:i + 2] == want, (want, argv)
+    child = FB.parse_args(argv[argv.index(sys.executable) + 2:])        # the child's own arguments parse
+    assert child.mode == "ncu-cell" and child.ncu_arms == ("RSQ2",) and child.shapes == {81: 287}
+    for bad in (["--out", "x", "--ncu-arms", "NOPE"], ["--out", "x", "--mode", "ncu-cell", "--shapes", "81:287,73:318",
+                                                       "--ncu-arms", "FORK"]):
+        with pytest.raises(SystemExit):
+            FB.parse_args(bad)
+    real = Path("/mnt/beegfs/ojerbi/r2-runs/fiattn/fia6_l2a_2195574/ncu_216x1_raw.csv")
+    if real.is_file():                                                   # the real format (read only)
+        rows = FB.parse_ncu_csv(real.read_text(errors="replace"), ["gpu__time_duration.sum", "dram__bytes_read.sum"])
+        assert rows and all(r["gpu__time_duration.sum"] for r in rows), rows[:2]
+        assert rows[0]["name"] == "_bi_split_kernel" and rows[0]["dram__bytes_read.sum"] > 0
+    head = '"ID","Process ID","Kernel Name","gpu__time_duration.sum","dram__bytes_read.sum",' \
+           '"lts__t_sectors_srcunit_tex_op_read.sum","sm__warps_active.avg.pct_of_peak_sustained_active",' \
+           '"launch__registers_per_thread"'
+    text = "\n".join([head, '"","","","ns","byte","sector","%","register/thread"',
+                      '"0","1","kernel_unified_attention","1,200,000","1000000000","40000000","12.4","255"',
+                      '"1","1","kernel_unified_attention","300000","50000000","2000000","10.0","255"'])
+    rows = FB.parse_ncu_csv(text, metrics)
+    s = FB.ncu_arm_summary(rows, 1_000_000_000)
+    assert s["n_kernels"] == 2 and s["time_us"] == 1500.0 and s["dram_read"] == 1.05e9
+    assert s["dram_over_logical"] == 1.05 and s["l2sm_bytes"] == 42e6 * 32 and s["occupancy_pct"] == 12.4
+    assert s["registers"] == 255.0
+    with pytest.raises(ValueError):
+        FB.parse_ncu_csv("no header", metrics)
+    old = FB.GRANT_j1n
+    FB.GRANT_j1n = "2026-01-01T00:00:00Z"                               # a stand-in grant (restored below)
+    try:
+        assert FB.main(["--out", str(tmp_path / "o"), "--cell", "j1n", "--ncu", str(tmp_path / "no_ncu")]) == 20
+        assert not (tmp_path / "o").exists()
+    finally:
+        FB.GRANT_j1n = old
+    assert FB.GRANT_j1n is None and not FB.granted("j1n")
+    _ev("J1F NCU: argv %s ... ; summary %s" % (argv[:12], s))
+
+
+def test_forkbench_out_view():
+    """The direct write: swapped_out_view puts the op's swapped output (N, HQ/HKV, HKV, HD) where the op's own return
+    (flash_api.cpp: out.transpose(1, 2).reshape(N, 1, HQ, HD)) puts it, with the strides of the wrapper's own output
+    (torch.empty_like of the swapped q); the call passes it at the op's out_ position, every other argument = the
+    wrapper's; the installed wrapper passes None there; only the _CP variants copy_."""
+    FB = _mod("r2_j1_forkbench")
+    N, G = 3, FB.HQ // FB.HKV
+    out = torch.zeros(N, 1, FB.HQ, FB.HD, dtype=torch.bfloat16)
+    v = FB.swapped_out_view(out, FB.HKV)
+    q = torch.randn(N, 1, FB.HQ, FB.HD).to(torch.bfloat16)
+    qs = q.reshape(N, FB.HKV, G, FB.HD).transpose(1, 2)                   # flash_api.cpp: the swapped q
+    assert tuple(v.shape) == tuple(qs.shape) == (N, G, FB.HKV, FB.HD) and v.data_ptr() == out.data_ptr()
+    assert v.stride() == torch.empty_like(qs).stride() and v.stride(-1) == 1   # = the wrapper's output layout
+    S = torch.randn(N, G, FB.HKV, FB.HD).to(torch.bfloat16)                # what the kernel writes (swapped)
+    v.copy_(S)
+    assert torch.equal(out, S.transpose(1, 2).reshape(N, 1, FB.HQ, FB.HD))   # = the op's own return transform
+    for n, g, k in ((0, 0, 0), (1, 3, 1), (2, G - 1, FB.HKV - 1)):         # head k * G + g = swapped [g, k]
+        assert torch.equal(out[n, 0, k * G + g], S[n, g, k]) and torch.equal(qs[n, g, k], q[n, 0, k * G + g])
+    for bad in (torch.zeros(N, 2, FB.HQ, FB.HD), torch.zeros(N, 1, FB.HQ, FB.HD).transpose(2, 3)):
+        with pytest.raises(AssertionError):
+            FB.swapped_out_view(bad, FB.HKV)
+    src = (EFF / "r2_j1_forkbench.py").read_text()                       # the call: the op's out_ = ov
+    tree = ast.parse(src)
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and
+             n.func.id == "FAOP"]
+    assert len(calls) == 1 and len(calls[0].args) == 21 and not calls[0].keywords
+    got = [ast.unparse(a) for a in calls[0].args]
+    want = ["qx", "kc", "vc", "bc", "None", "None", "lens", "None", "None", "cbi", "None", "None", "None", "ov", "scale",
+            "False", "-1", "-1", "0.0", "True", "SPLITS"]
+    assert got == want, got
+    assert src.count(".copy_(FA(") == 1 and "def wrapper_cp():\n            o_cp.copy_(FA(" in src   # only _CP copies
+    assert "FAOP = FAI.flash_attn_cuda.fwd_kvcache" in src
+    spec = importlib.util.find_spec("flash_attn_nosa")                    # the installed wrapper (not imported)
+    if spec is None or not spec.origin:
+        pytest.skip("flash_attn_nosa not installed here")
+    itxt = (Path(spec.origin).parent / "flash_attn_interface.py").read_text()
+    assert "import flash_attn_2_cuda_nosa as flash_attn_cuda" in itxt
+    m = re.search(r"out, softmax_lse = flash_attn_cuda\.fwd_kvcache\((.*?)\n    \)", itxt, re.S)
+    wargs = [x.strip() for x in m.group(1).split(",") if x.strip()]
+    assert wargs == ["q", "k_cache", "v_cache", "kv_bias", "k", "v", "cache_seqlens", "rotary_cos", "rotary_sin",
+                     "cache_batch_idx", "cache_leftpad", "block_table", "alibi_slopes", "None", "softmax_scale",
+                     "causal", "window_size[0]", "window_size[1]", "softcap", "rotary_interleaved", "num_splits"], wargs
+    for line in ("softcap=0.0", "rotary_interleaved=True", "window_size=(-1, -1)", "causal=False",
+                 "softmax_scale = q.shape[-1] ** (-0.5)"):                 # the wrapper's defaults = the direct call's
+        assert line in itxt, line
+    cpp = ROOT / "dependencies/flash-attention-nosa/csrc/flash_attn_nosa/flash_api.cpp"
+    if cpp.is_file():
+        ctxt = cpp.read_text()
+        sig = ctxt[ctxt.index("mha_fwd_kvcache(at::Tensor &q"):]
+        sig = sig[:sig.index(") {")]
+        params = [x.split("//")[0].strip() for x in sig.split("\n")]
+        names_ = [re.findall(r"&?(\w+)\s*,?$", p)[0] for p in params if p]
+        assert names_.index("out_") == 13 and len(names_) == 21, names_
+        assert "out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});" in ctxt
+        assert "CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_og);" in ctxt
+    _ev("J1F OUTVIEW: the direct call passes the out_ view at position 13 of the installed op %s; layout = the op's "
+        "return" % spec.origin)
+
+
+def test_forkbench_timing_plumbing():
+    """The timing loop with a FAKE timer (CUDA events do not run on the CPU): warm-up passes first, then the rotated
+    rounds, `layers` calls per pass, the stop after the budget; summarize's kernel / copy / total split per control."""
+    FB = _mod("r2_j1_forkbench")
+    names = list(FB.variants((2,)))
+    seen = []
+    parts = {v: (lambda v=v: seen.append(v)) for v in names}
+    ms = {v: 10.0 + i for i, v in enumerate(names)}
+    for x in FB.FLASH:
+        ms[x], ms[x + "_CP"], ms[x + "_CO"] = 20.0, 24.0, 1.5
+    by_fn = {id(parts[v]): v for v in names}
+
+    def fake_timer(fn, layers):
+        for _ in range(layers):
+            fn()
+        return ms[by_fn[id(fn)]]
+    times, warm, stop = FB.time_variants(parts, names, 3, 2, 4, fake_timer, 0.0, 1e9, clock=lambda: 1.0)
+    assert stop is None and all(len(warm[v]) == 2 and len(times[v]) == 4 for v in names)
+    k = 2 * 3 * len(names)                                                  # the warm-up calls, in list order
+    assert seen[:k] == [v for v in names for _ in range(2 * 3)]
+    rounds = [seen[k + i * 3 * len(names):k + (i + 1) * 3 * len(names):3] for i in range(4)]
+    assert rounds == [FB.rotation(names, r) for r in range(4)]
+    assert len(seen) == 3 * len(names) * 6
+    t2, _, stop2 = FB.time_variants(parts, names, 1, 1, 10, fake_timer, 0.0, 5.0, clock=iter([1.0, 6.0, 9.0]).__next__)
+    assert stop2 == "wall clock above 5 s after pass 1" and all(len(t2[v]) == 2 for v in names)
+    s = FB.summarize(times, 216, 32, {v: True for v in names}, (2,))
+    for x in FB.FLASH:
+        assert s["flash_timing"][x] == dict(direct_e2e_ms_pass=20.0, copy_only_ms_pass=1.5,
+                                            total_j1f_form_ms_pass=24.0, residual_ms_pass=2.5, valid=True), \
+            s["flash_timing"][x]
+    lines = FB.decision_lines("C128_B216", s)
+    assert any("FLASHT NS1R1" in x and "direct (end-to-end, preallocated output) 20.000" in x and "residual 2.500" in x
+               for x in lines), lines
+    assert not [x for x in lines if "FLASHT" in x and ("kernel" in x or " rest " in x)], lines
+    assert not [x for x in lines if "per-byte efficiency" in x or "optimal" in x], lines
+    assert s["ratios"]["FORK1R/NS1R1"]["ratio"] == round(ms["FORK1R"] / 20.0, 4)
+    assert s["ratios"]["FORK1R/NS1R1_CP"]["ratio"] == round(ms["FORK1R"] / 24.0, 4)
+    src = (EFF / "r2_j1_forkbench.py").read_text()                       # run_shape times through this loop
+    assert "time_variants(parts, names, a.layers, a.warmup, a.reps, cuda_timer, t0, a.max_shape_s)" in src
+    _ev("J1F TIMING: fake-timer plumbing; flash split %s" % s["flash_timing"]["NS1R1"])
+
+
+# ------------------------------------------------------------------ the fork with its loads ahead (lead's edit plan)
+def test_ahead_copy():
+    """fork_vllm_unified_attention_ahead.py = the fia6 fork + lines tagged [ahead]: without the tagged lines and with
+    the indentation stripped, its lines are the fork's lines in order (an original line may only move into an
+    `if AHEAD` / `else` block). The fork itself stays the fia6 blob (Gate 0). The flag defaults to 0."""
+    fork = [x for x in (EFF / "fork_vllm_unified_attention.py").read_text().splitlines() if x.strip()]
+    ahead = [x for x in (ROOT / FORK_AHEAD).read_text().splitlines() if x.strip()]    # blank lines aside
+    kept = [x.strip() for x in ahead if "[ahead]" not in x]
+    assert kept == [x.strip() for x in fork], next(
+        ((i, a, b) for i, (a, b) in enumerate(zip(kept, [x.strip() for x in fork])) if a != b), len(kept))
+    tagged = [x for x in ahead if "[ahead]" in x]
+    assert len(tagged) == len(ahead) - len(fork) and len(tagged) > 40, len(tagged)
+    moved = [x for x, y in zip([x for x in ahead if "[ahead]" not in x], fork) if x != y]
+    assert all(x.startswith(" ") for x in moved) and len(moved) <= 8, moved     # re-indented lines only, few
+    assert any(x.startswith("    ahead=0,  # [ahead]") for x in ahead) and "        AHEAD=int(ahead),  # [ahead]" in ahead
+    for w in ("tl.dot", "softmax_step", "tl.store", "tl.exp"):              # no arithmetic in the tagged lines
+        assert not [x for x in tagged if w in x and not x.lstrip().startswith("#")], w
+    _ev("J1 AHEAD COPY: %d tagged lines, %d re-indented fork lines" % (len(tagged), len(moved)))
+
+
+AHEAD_CHILD = r'''
+import os, sys, importlib.util
+assert os.environ.get("TRITON_INTERPRET") == "1" and "triton" not in sys.modules
+sys.dont_write_bytecode = True
+import torch
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+FK = load("fork_fia6", sys.argv[1])
+FA = load("fork_ahead", sys.argv[2])
+HQ, HKV, HD, BS, R, B, P = 32, 2, 128, 64, 4, 2, 5          # the real heads and block; 4 rows; 2 requests; 5 pages
+SHIFT = ((0, 1, 2, 3), (3, 2, 1, 0))                         # per KV head: row r starts SHIFT[h][r] pages in
+LAST = (40, 64, 17, 1)                                       # tokens of each row's last page
+U = P + 3                                                    # union entries per (KV head, request): 8
+E, NB = B * R, B * U + 4
+NANPAGE = NB - 1                                             # unreferenced; the tables' tail points at it
+torch.manual_seed(3)
+ak, av = torch.randn(NB, BS, HKV, HD) * 0.5, torch.randn(NB, BS, HKV, HD)
+ab = torch.randn(NB, BS, HKV) * 0.5
+for t in (ak, av, ab):
+    t[NANPAGE] = float("nan")
+q = torch.randn(E, HQ, HD)
+scale = HD ** -0.5
+i32 = torch.int32
+key = torch.zeros((E, HKV, P), dtype=i32)
+for b in range(B):
+    for r in range(R):
+        for h in range(HKV):
+            key[b * R + r, h] = torch.arange(P, dtype=i32) + b * U + SHIFT[h][r]
+lists = dict(page_key=key, page_table=key.clone(), num_pages=torch.full((E, HKV), P, dtype=i32),
+             last_len=torch.tensor(LAST * B, dtype=i32), seq_idx=torch.zeros(E, dtype=i32), slots_per_entry=1)
+cu = torch.arange(0, E + 1, R, dtype=i32)
+seq = torch.zeros(B, dtype=i32)
+W = R * 8                                                    # BLOCK_Q x P_PAD
+
+
+def tables():
+    return (torch.full((HKV, B, W), NANPAGE, dtype=i32), torch.zeros((HKV, B, W), dtype=i32),
+            torch.zeros((HKV, B), dtype=i32))
+
+
+def run(mod, tab, ext, ln, build, bias, tile, **kw):
+    out = torch.zeros(E, HQ, HD)
+    mod.unified_attention(q, ak, av, out, cu, R, seq, BS, scale, True, (-1, -1), tab, 0, None, None, None,
+                          union_ext=ext, union_len=ln, cis_bias=bias, build_union=lists if build else None,
+                          rows_per_q_block=R, num_warps=4, num_stages=3, tile_size=tile, **kw)
+    return out
+
+
+def ref():
+    out = torch.zeros(E, HQ, HD, dtype=torch.float64)
+    g = HQ // HKV
+    for e in range(E):
+        for hq in range(HQ):
+            h = hq // g
+            pages = key[e, h].long()
+            n = (P - 1) * BS + LAST[e % R]
+            K = ak[pages, :, h].double().reshape(-1, HD)[:n]
+            V = av[pages, :, h].double().reshape(-1, HD)[:n]
+            Bi = ab[pages, :, h].double().reshape(-1)[:n]
+            s = (K @ q[e, hq].double() + Bi) * scale
+            out[e, hq] = torch.softmax(s, 0) @ V
+    return out
+
+
+def same(a, b):
+    return torch.equal(a.view(torch.int32), b.view(torch.int32))
+
+
+fails, lines = [], []
+REF = ref()
+for tile in (64, 32):
+    for bias in (ab, None):
+        bname = "bias" if bias is not None else "nobias"
+        t0 = tables()
+        f_build = run(FK, *t0, True, bias, tile)                  # the fork, union built in the kernel
+        if bias is not None:
+            err = float((f_build.double() - REF).abs().max())
+            lines.append("REF tile %d: max |fork - float64| %.2e" % (tile, err))
+            if not err <= 1e-4:
+                fails.append(("fork_vs_ref", tile, err))
+        if not bool((t0[2] == U).all()):
+            fails.append(("union_len", tile, t0[2].tolist()))
+        f_table = run(FK, *(x.clone() for x in t0), False, bias, tile)   # the fork reading those tables
+        for lvl in (0, 1, 2, 3):
+            for build, want in ((True, f_build), (False, f_table)):
+                t = tables() if build else tuple(x.clone() for x in t0)
+                got = run(FA, *t, build, bias, tile, ahead=lvl)
+                ok = same(got, want) and bool(torch.isfinite(got).all())
+                nd = int((got.view(torch.int32) != want.view(torch.int32)).sum())
+                lines.append("EQ tile %d %s ahead %d %s: bitwise %s (%d differ)" % (
+                    tile, bname, lvl, "build" if build else "table", ok, nd))
+                if not ok:
+                    fails.append(("EQ", tile, bname, lvl, build, nd))
+                if build and not torch.equal(t[0][:, :, :U], t0[0][:, :, :U]):
+                    fails.append(("tables", tile, bname, lvl))
+        # THE ROWS SWEEP (r2_j1_forkbench RSMn / RSQn): n query rows per request on the same tables; BLOCK_Q 4
+        # (RSM) and BLOCK_Q n (RSQ, n in 1, 2, 4): rows 0 .. n-1 = the 4-row table read's rows
+        for n in (1, 2, 3, 4):
+            qn = q.view(B, R, HQ, HD)[:, :n].contiguous().view(B * n, HQ, HD)
+            cun = torch.arange(0, B * n + 1, n, dtype=i32)
+            for bq in ((R, n) if n in (1, 2) else (R,)):
+                on = torch.zeros(B * n, HQ, HD)
+                tq = tuple(x.clone() for x in t0)
+                FK.unified_attention(qn, ak, av, on, cun, n, seq, BS, scale, True, (-1, -1), tq[0], 0, None, None,
+                                     None, union_ext=tq[1], union_len=tq[2], cis_bias=bias, build_union=None,
+                                     rows_per_q_block=bq, num_warps=4, num_stages=3, tile_size=tile)
+                ok = same(on.view(B, n, HQ, HD).contiguous(), f_table.view(B, R, HQ, HD)[:, :n].contiguous())
+                lines.append("ROWS tile %d %s n %d BLOCK_Q %d: rows = the 4-row read's rows bitwise %s" % (
+                    tile, bname, n, bq, ok))
+                if not ok and bq == R:                        # RSM: MUST; RSQ (another BLOCK_M): REPORT
+                    fails.append(("ROWS", tile, bname, n, bq))
+        # PLANT (L34): the failure mode of a wrong shift = tile j reads tile j + 1's page: must differ
+        tp = tuple(x.clone() for x in t0)
+        tp[0][0, 0, 2] = tp[0][0, 0, 3]
+        got = run(FA, *tp, False, bias, tile, ahead=1)
+        nd = int((got.view(torch.int32) != f_table.view(torch.int32)).sum())
+        lines.append("PLANT stale page tile %d %s: %d values differ" % (tile, bname, nd))
+        if nd == 0:
+            fails.append(("PLANT_stale_page_not_detected", tile, bname))
+        # PLANT (REPORT): two union entries swapped (same set, other tile order): the bits see the order
+        tp = tuple(x.clone() for x in t0)
+        tp[0][0, 0, [1, 2]] = tp[0][0, 0, [2, 1]]
+        tp[1][0, 0, [1, 2]] = tp[1][0, 0, [2, 1]]
+        got = run(FA, *tp, False, bias, tile, ahead=1)
+        nd = int((got.view(torch.int32) != f_table.view(torch.int32)).sum())
+        lines.append("REPORT swapped order tile %d %s: %d values differ, max |d| %.2e" % (
+            tile, bname, nd, float((got - f_table).abs().max())))
+print("\n".join(lines))
+if fails:
+    print("FAILS", fails)
+    sys.exit(1)
+print("AHEAD-INTERP OK")
+'''
+
+
+def test_ahead_interp():
+    """THE BIT-PRESERVATION CHECK ON THE CPU (lead's plan, edit A1/A2): under TRITON_INTERPRET=1 (a fresh child, L36),
+    real heads (32 query, 2 KV, dim 128, block 64), 2 requests x 4 rows, per-row shifted pages (union 8), partial last
+    pages, a NaN page behind the tables' tail: the ahead copy with ahead 0, 1, 2 = the fia6 fork BIT FOR BIT, union
+    built in the kernel and read from tables, with and without the bias, tile 64 and 32 (2 tiles per block). The fork
+    = the float64 reference within 1e-4 (the inputs exercise attention). PLANT: a stale page (tile j reads tile j + 1's
+    page) is DETECTED. LIMIT: the interpreter runs numpy; it shows the same values in the same operations. It does not
+    show the GPU code generator's reduction order; the GPU gate FORKAn-EQ (r2_j1_forkbench) does."""
+    if importlib.util.find_spec("triton") is None:
+        pytest.skip("triton is not installed")
+    env = dict(os.environ, TRITON_INTERPRET="1", PYTHONDONTWRITEBYTECODE="1")
+    r = subprocess.run([sys.executable, "-c", AHEAD_CHILD, str(EFF / "fork_vllm_unified_attention.py"),
+                        str(ROOT / FORK_AHEAD)], env=env, cwd=str(ROOT), capture_output=True, text=True, timeout=7200)
+    assert r.returncode == 0 and r.stdout.strip().splitlines()[-1:] == ["AHEAD-INTERP OK"], (
+        "child exit %d\n--- stdout ---\n%s\n--- stderr ---\n%s" % (r.returncode, r.stdout[-4000:], r.stderr[-4000:]))
+    _ev("J1 AHEAD INTERP:\n" + r.stdout.strip())
+
+
+COMPILE_CHILD = r'''
+import os, re, subprocess, sys, importlib.util, tempfile
+assert os.environ.get("TRITON_INTERPRET", "0") != "1"
+sys.dont_write_bytecode = True
+import torch
+import triton
+from triton.backends.compiler import GPUTarget
+from triton.runtime import driver
+
+
+class FakeDriver:                                    # a CPU node: no CUDA driver; compile only (warmup, no launch)
+    def get_current_device(self):
+        return 0
+
+    def get_current_stream(self, device=None):
+        return 0
+
+    def get_current_target(self):
+        return GPUTarget("cuda", 80, 32)             # A100 (sm_80), warp 32: the record's GPU
+
+
+driver.set_active(FakeDriver())
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+FK = load("fork_fia6", sys.argv[1])
+FA = load("fork_ahead", sys.argv[2])
+BIN = os.path.join(os.path.dirname(triton.__file__), "backends", "nvidia", "bin")
+HQ, HKV, HD, BS, R, B, P = 32, 2, 128, 64, 4, 216, 64         # the j1f / production shapes (B 216, 64 pages per row)
+E, NB = B * R, 16                                             # the arena size does not enter the code (strides do)
+bf, i32 = torch.bfloat16, torch.int32
+
+
+class Capture:                                                 # kernel[grid](**kw) -> warmup (compile, no launch)
+    def __init__(self, jit):
+        self.jit, self.kernels = jit, []
+
+    def __getitem__(self, grid):
+        def go(**kw):
+            k = self.jit.warmup(grid=grid, **kw)
+            self.kernels.append(k)
+            return k
+        return go
+
+
+def compiled(mod, bias_dtype, build, **kw):
+    cap = Capture(mod.kernel_unified_attention)
+    real, mod.kernel_unified_attention = mod.kernel_unified_attention, cap
+    try:
+        q = torch.zeros(E, HQ, HD, dtype=bf)
+        k = torch.zeros(NB, BS, HKV, HD, dtype=bf)
+        key = torch.zeros((E, HKV, P), dtype=i32)
+        lists = dict(page_key=key, page_table=key.clone(), num_pages=torch.zeros((E, HKV), dtype=i32),
+                     last_len=torch.zeros(E, dtype=i32), seq_idx=torch.zeros(E, dtype=i32), slots_per_entry=1)
+        tab = torch.zeros((HKV, B, R * P), dtype=i32)
+        mod.unified_attention(q, k, k.clone(), torch.zeros_like(q), torch.arange(0, E + 1, R, dtype=i32), R,
+                              torch.zeros(B, dtype=i32), BS, HD ** -0.5, True, (-1, -1), tab, 0, None, None, None,
+                              union_ext=torch.zeros_like(tab), union_len=torch.zeros((HKV, B), dtype=i32),
+                              cis_bias=torch.zeros(NB, BS, HKV, dtype=bias_dtype), build_union=lists if build else None,
+                              rows_per_q_block=R, num_warps=4, num_stages=3, tile_size=64, **kw)
+    finally:
+        mod.kernel_unified_attention = real
+    return cap.kernels[-1]
+
+
+def usage(kern):
+    with tempfile.NamedTemporaryFile(suffix=".cubin", delete=False) as f:
+        f.write(kern.asm["cubin"])
+    out = subprocess.run([os.path.join(BIN, "cuobjdump"), "--dump-resource-usage", f.name], capture_output=True,
+                         text=True).stdout
+    os.unlink(f.name)
+    m = re.search(r"REG:(\d+) STACK:(\d+) SHARED:(\d+) LOCAL:(\d+)", out)
+    return dict(reg=int(m.group(1)), stack=int(m.group(2)), local=int(m.group(4)), shared=kern.metadata.shared)
+
+
+def sass(kern):
+    """The cubin's SASS instruction lines (cuobjdump -sass), without addresses and encodings."""
+    with tempfile.NamedTemporaryFile(suffix=".cubin", delete=False) as f:
+        f.write(kern.asm["cubin"])
+    out = subprocess.run([os.path.join(BIN, "cuobjdump"), "-sass", f.name], capture_output=True, text=True).stdout
+    os.unlink(f.name)
+    return [re.sub(r"/\*[0-9a-f]+\*/|/\* 0x[0-9a-f]+ \*/", "", x).strip() for x in out.splitlines()
+            if re.search(r"/\*[0-9a-f]{4}\*/", x)]
+
+
+def loop_ops(ttgir):
+    """The tile loop = the scf.for whose body holds the tt.dot ops: its tt.load / async copy / async_wait counts."""
+    lines = ttgir.splitlines()
+    first_dot = next(i for i, x in enumerate(lines) if "tt.dot" in x)
+    start = max(i for i in range(first_dot) if "scf.for" in lines[i])
+    ind = len(lines[start]) - len(lines[start].lstrip())
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].strip().startswith("}")
+               and len(lines[i]) - len(lines[i].lstrip()) == ind)
+    body = lines[start:end]
+    return dict(sync_load=sum(" tt.load " in x for x in body), async_copy=sum("async_copy_global_to_local" in x
+                for x in body), async_wait=sum("async_wait" in x for x in body), dots=sum("tt.dot" in x for x in body))
+
+
+LOC = re.compile(r' ?loc\((?:"[^"]*"(?::\d+:\d+)?|#loc\d*|[^()]*)\)')
+
+
+def strip_loc(s):
+    """TTGIR without source locations (file paths and line numbers differ between the two files)."""
+    return "\n".join(LOC.sub("", x) for x in s.splitlines() if not x.startswith("#loc"))
+
+
+def ptx_code(s):
+    """PTX without its debug information (.file / .loc lines, the .debug sections) and comments."""
+    s = s.split(".section", 1)[0]
+    return [x for x in s.splitlines() if x.strip() and not x.strip().startswith((".loc", ".file", "//", "$L__"))]
+
+
+def canon(lines):
+    """SASS with registers renamed in order of first use: the same instructions on the same data flow."""
+    names = {}
+
+    def ren(m):
+        return names.setdefault(m.group(0), "%s%d" % (m.group(1), len(names)))
+    return [re.sub(r"\b(UR|R|UP|P)(\d+)\b", ren, x) for x in lines]
+
+
+CTRL = os.path.join(os.environ.get("TMPDIR", "/tmp"), "fork_ctrl_%d.py" % os.getpid())   # the fork at another path
+with open(sys.argv[1]) as f, open(CTRL, "w") as g:
+    g.write(f.read())
+FC = load("fork_ctrl", CTRL)
+
+
+def compare(x, y):
+    gx, gy = strip_loc(x.asm["ttgir"]).splitlines(), strip_loc(y.asm["ttgir"]).splitlines()
+    px, py = ptx_code(x.asm["ptx"]), ptx_code(y.asm["ptx"])
+    sx, sy = sass(x), sass(y)
+    first = lambda a, b: next(((i, u, v) for i, (u, v) in enumerate(zip(a, b)) if u != v), None)  # noqa: E731
+    return dict(ttgir=gx == gy, ptx=px == py, sass=sx == sy, sass_canon=canon(sx) == canon(sy), n_ttgir=len(gx),
+                n_ptx=len(px), n_sass=len(sx), d_ttgir=first(gx, gy), d_ptx=first(px, py), d_sass=first(sx, sy))
+
+
+rows = []
+for bias in (torch.bfloat16, torch.float32):
+    base = compiled(FK, bias, True)
+    a0 = compiled(FA, bias, True, ahead=0)
+    for what, other in (("ahead0_vs_fork", a0), ("CONTROL_fork_copy_vs_fork", compiled(FC, bias, True))):
+        c = compare(base, other)
+        same = c["ttgir"] and c["n_ttgir"] > 1000                     # MUST: the same TTGIR (PTX / SASS: REPORT)
+        print("%s bias %s %s: ttgir %s (%d lines) ptx %s (%d lines) sass %s, sass with registers renamed %s (%d)" % (
+            "SAME_CODE" if what.startswith("ahead") else "REPORT", str(bias)[6:], what, c["ttgir"], c["n_ttgir"],
+            c["ptx"], c["n_ptx"], c["sass"], c["sass_canon"], c["n_sass"]) + (" " + str(same) if
+                                                                                what.startswith("ahead") else ""))
+        if not (c["ttgir"] and c["ptx"] and c["sass"]):
+            print("DIFF %s ttgir %s | ptx %s | sass %s" % (what, str(c["d_ttgir"])[:300], str(c["d_ptx"])[:300],
+                                                         str(c["d_sass"])[:300]))
+    for name, kern in (("fork", base), ("ahead0", a0), ("ahead1", compiled(FA, bias, True, ahead=1)),
+                       ("ahead2", compiled(FA, bias, True, ahead=2)), ("ahead3", compiled(FA, bias, True, ahead=3)),
+                       ("fork_table", compiled(FK, bias, False)), ("ahead2_table", compiled(FA, bias, False, ahead=2)),
+                       ("ahead3_table", compiled(FA, bias, False, ahead=3))):
+        u, lo = usage(kern), loop_ops(kern.asm["ttgir"])
+        print("WITNESS bias %s %-12s reg %d stack %d local %d shared %d | loop sync tt.load %d async copies %d "
+              "async_wait %d dots %d" % (str(bias)[6:], name, u["reg"], u["stack"], u["local"], u["shared"],
+                                         lo["sync_load"], lo["async_copy"], lo["async_wait"], lo["dots"]))
+os.environ["TRITON_DISABLE_LINE_INFO"] = "1"                  # the same pair without line info (fresh JIT objects)
+FK2, FA2 = load("fork_fia6_noline", sys.argv[1]), load("fork_ahead_noline", sys.argv[2])
+for bias in (torch.bfloat16, torch.float32):
+    c = compare(compiled(FK2, bias, True), compiled(FA2, bias, True, ahead=0))
+    print("REPORT bias %s ahead0_vs_fork WITHOUT LINE INFO: ttgir %s ptx %s sass %s, renamed %s" % (
+        str(bias)[6:], c["ttgir"], c["ptx"], c["sass"], c["sass_canon"]))
+os.unlink(CTRL)
+print("COMPILE-WITNESS OK")
+'''
+
+
+def test_ahead_compile_witness():
+    """CPU COMPILE WITNESS (no GPU, no launch): Triton 3.2 compiles the fia6 fork and the ahead copy for sm_80 (A100)
+    through JITFunction.warmup with a stand-in driver (target only); cuobjdump --dump-resource-usage reads registers,
+    stack and shared memory from the cubin; the TTGIR tile loop's synchronous tt.load / async copies are counted. MUST:
+    ahead 0 compiles to the fork's TTGIR and PTX (the flag off = the fork's code). REPORT: the rest (evidence for the
+    lead's GPU decision; timing is the GPU's)."""
+    if importlib.util.find_spec("triton") is None:
+        pytest.skip("triton is not installed")
+    env = {k: v for k, v in os.environ.items() if k != "TRITON_INTERPRET"}
+    env.update(PYTHONDONTWRITEBYTECODE="1", TRITON_CACHE_DIR=str(Path(os.environ.get("TMPDIR", "/tmp")) /
+                                                                  ("j1_ahead_cache_%d" % os.getpid())))
+    r = subprocess.run([sys.executable, "-c", COMPILE_CHILD, str(EFF / "fork_vllm_unified_attention.py"),
+                        str(ROOT / FORK_AHEAD)], env=env, cwd=str(ROOT), capture_output=True, text=True, timeout=3600)
+    out = r.stdout.strip().splitlines()
+    assert r.returncode == 0 and out[-1:] == ["COMPILE-WITNESS OK"], (
+        "child exit %d\n--- stdout ---\n%s\n--- stderr ---\n%s" % (r.returncode, r.stdout[-4000:], r.stderr[-4000:]))
+    _ev("J1 AHEAD COMPILE WITNESS (sm_80, w4 s3 tile 64, B 216):\n" + "\n".join(out))
+    assert [x for x in out if x.startswith("SAME_CODE")] and all(x.endswith(" True") for x in out
+                                                                 if x.startswith("SAME_CODE")), "\n".join(out)
 
 
 # ------------------------------------------------------------------ CELL
@@ -913,6 +1643,12 @@ def test_step_script_j1():
                         "32", "--reps", "10", "--warmup", "2", "--seed", "7", "--sample", "8", "--max-shape-s", "300",
                         "--max-run-s", "900"])                          # the step script's j1f arguments parse
     assert fa.shapes == {128: 216, 73: 318} and fa.segments == (2, 4, 8)
+    assert "j1n) POOL=18 BATCH=0 STEPS=0 STEP_MIN=50 MEM=64G NEEDWL=0 OUT_MB=400" in src          # TRACK 2
+    assert "NCU=/opt/nvidia/nsight-compute/2025.1.0/ncu " in src and '--ncu "$NCU" --ncu-cap 240' in src
+    fn = FB.parse_args(["--out", "x", "--cell", "j1n", "--shapes", "81:287", "--segments", "2", "--layers", "32",
+                        "--reps", "6", "--warmup", "2", "--seed", "7", "--sample", "8", "--max-shape-s", "400",
+                        "--max-run-s", "600", "--ncu", "/opt/nvidia/nsight-compute/2025.1.0/ncu", "--ncu-cap", "240"])
+    assert fn.shapes == {81: 287} and fn.ncu_arms == FB.NCU_ARMS and fn.mode == "main"
     for bad in ("i4dca", "j1", "j1c"):
         r = _step(bad)
         assert r.returncode == 1 and "cell '%s'" % bad in r.stderr, (bad, r.returncode, r.stderr[-300:])

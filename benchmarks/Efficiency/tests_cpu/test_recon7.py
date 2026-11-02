@@ -75,7 +75,7 @@ RECON7_EDITED = {T_ + "test_i4dc.py": "test_i4dc_gate0_files"}
 # (its own Gate 0: tests_cpu/test_j1.py)
 RECON7_NEW = RECON7_NEW + (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", T_ + "test_j1.py",
                            "docs/NOTES_j1.md")                                                    # J1
-RECON7_NEW = RECON7_NEW + (E_ + "r2_j1_forkbench.py",)                                            # J1
+RECON7_NEW = RECON7_NEW + (E_ + "r2_j1_forkbench.py", "benchmarks/Efficiency/fork_vllm_unified_attention_ahead.py")                                            # J1
 # ST1 (nosi-r2-st1: RECON7 cd0f0c5 + AREA 3, the captured row commit of the best arms, r2_st1_cell.py): its files (its
 # own Gate 0: tests_cpu/test_st1.py); they do not name the RECON7 modules
 RECON7_NEW = RECON7_NEW + (E_ + "r2_st1_commit.py", E_ + "r2_st1_cell.py", E_ + "r2_st1_step.sh",
