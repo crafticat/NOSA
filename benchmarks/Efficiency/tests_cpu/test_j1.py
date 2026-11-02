@@ -67,7 +67,8 @@ HOLDER = "2190876"                     # a lead-owned uuid file that exists (HOL
 T_ = "benchmarks/Efficiency/tests_cpu/"
 E_ = "benchmarks/Efficiency/"
 J1_NEW = (E_ + "r2_j1_select.py", E_ + "r2_j1_cell.py", E_ + "r2_j1_step.sh", T_ + "test_j1.py", "docs/NOTES_j1.md",
-          E_ + "r2_j1_forkbench.py")
+          E_ + "r2_j1_forkbench.py", E_ + "fork_vllm_unified_attention_ahead.py")
+FORK_AHEAD = E_ + "fork_vllm_unified_attention_ahead.py"           # the fia6 fork + the [ahead] lines (a sibling)
 J1_DECL = tuple(T_ + "test_%s.py" % n for n in ("wsa", "wsb", "wsc", "i2", "i3", "i4a", "i4g", "i4d", "i4k", "i4u", "i4h",
                                                    "i4s", "i4cc", "i4dc", "recon7"))
 SELECT_IMPORTS = {"torch", "time", "types", "r2_i4dc_compile"}
@@ -793,7 +794,9 @@ def test_forkbench_pure():
     assert s["fork_minus_flashu1_ms_per_pass"] == round(0.6 * 32, 3)
     assert s["best_3d"] == dict(variant="FORK3D2", ratio=0.9, saving_ms_per_pass=round(0.12 * 32, 3))
     assert {"FORK/FLASHU1", "FORK1R/NS1R1", "FORK/NS1x4", "FORKT/FORK", "NSRU/FORK", "FORK3D2/FORK", "FORK/FLASHU1_CP",
-            "FORK1R/NS1R1_CP", "FORK/NS1x4_CP", "NSRU_CP/FORK"} == set(s["ratios"])
+            "FORK1R/NS1R1_CP", "FORK/NS1x4_CP", "NSRU_CP/FORK", "FORKA1/FORK", "FORKA2/FORK", "FORKA3/FORK"} == set(
+        s["ratios"])
+    assert w["FORKA1"] == w["FORKA2"] == w["FORKA3"] == w["FORK"]
     assert s["per"]["NS1R1_CO"]["logical_tb_s"] is None and s["per"]["NS1R1_CO"]["bytes"] == 0
     assert set(s["flash_timing"]) == set(FB.FLASH) and s["flash_timing"]["NSRU"]["valid"] is False
     for bad in (["--out", "x", "--segments", "1"], ["--out", "x", "--reps", "2"], ["--out", "x", "--shapes", "a"]):
@@ -1001,6 +1004,368 @@ def test_forkbench_timing_plumbing():
     src = (EFF / "r2_j1_forkbench.py").read_text()                       # run_shape times through this loop
     assert "time_variants(parts, names, a.layers, a.warmup, a.reps, cuda_timer, t0, a.max_shape_s)" in src
     _ev("J1F TIMING: fake-timer plumbing; flash split %s" % s["flash_timing"]["NS1R1"])
+
+
+# ------------------------------------------------------------------ the fork with its loads ahead (lead's edit plan)
+def test_ahead_copy():
+    """fork_vllm_unified_attention_ahead.py = the fia6 fork + lines tagged [ahead]: without the tagged lines and with
+    the indentation stripped, its lines are the fork's lines in order (an original line may only move into an
+    `if AHEAD` / `else` block). The fork itself stays the fia6 blob (Gate 0). The flag defaults to 0."""
+    fork = [x for x in (EFF / "fork_vllm_unified_attention.py").read_text().splitlines() if x.strip()]
+    ahead = [x for x in (ROOT / FORK_AHEAD).read_text().splitlines() if x.strip()]    # blank lines aside
+    kept = [x.strip() for x in ahead if "[ahead]" not in x]
+    assert kept == [x.strip() for x in fork], next(
+        ((i, a, b) for i, (a, b) in enumerate(zip(kept, [x.strip() for x in fork])) if a != b), len(kept))
+    tagged = [x for x in ahead if "[ahead]" in x]
+    assert len(tagged) == len(ahead) - len(fork) and len(tagged) > 40, len(tagged)
+    moved = [x for x, y in zip([x for x in ahead if "[ahead]" not in x], fork) if x != y]
+    assert all(x.startswith(" ") for x in moved) and len(moved) <= 8, moved     # re-indented lines only, few
+    assert any(x.startswith("    ahead=0,  # [ahead]") for x in ahead) and "        AHEAD=int(ahead),  # [ahead]" in ahead
+    for w in ("tl.dot", "softmax_step", "tl.store", "tl.exp"):              # no arithmetic in the tagged lines
+        assert not [x for x in tagged if w in x and not x.lstrip().startswith("#")], w
+    _ev("J1 AHEAD COPY: %d tagged lines, %d re-indented fork lines" % (len(tagged), len(moved)))
+
+
+AHEAD_CHILD = r'''
+import os, sys, importlib.util
+assert os.environ.get("TRITON_INTERPRET") == "1" and "triton" not in sys.modules
+sys.dont_write_bytecode = True
+import torch
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+FK = load("fork_fia6", sys.argv[1])
+FA = load("fork_ahead", sys.argv[2])
+HQ, HKV, HD, BS, R, B, P = 32, 2, 128, 64, 4, 2, 5          # the real heads and block; 4 rows; 2 requests; 5 pages
+SHIFT = ((0, 1, 2, 3), (3, 2, 1, 0))                         # per KV head: row r starts SHIFT[h][r] pages in
+LAST = (40, 64, 17, 1)                                       # tokens of each row's last page
+U = P + 3                                                    # union entries per (KV head, request): 8
+E, NB = B * R, B * U + 4
+NANPAGE = NB - 1                                             # unreferenced; the tables' tail points at it
+torch.manual_seed(3)
+ak, av = torch.randn(NB, BS, HKV, HD) * 0.5, torch.randn(NB, BS, HKV, HD)
+ab = torch.randn(NB, BS, HKV) * 0.5
+for t in (ak, av, ab):
+    t[NANPAGE] = float("nan")
+q = torch.randn(E, HQ, HD)
+scale = HD ** -0.5
+i32 = torch.int32
+key = torch.zeros((E, HKV, P), dtype=i32)
+for b in range(B):
+    for r in range(R):
+        for h in range(HKV):
+            key[b * R + r, h] = torch.arange(P, dtype=i32) + b * U + SHIFT[h][r]
+lists = dict(page_key=key, page_table=key.clone(), num_pages=torch.full((E, HKV), P, dtype=i32),
+             last_len=torch.tensor(LAST * B, dtype=i32), seq_idx=torch.zeros(E, dtype=i32), slots_per_entry=1)
+cu = torch.arange(0, E + 1, R, dtype=i32)
+seq = torch.zeros(B, dtype=i32)
+W = R * 8                                                    # BLOCK_Q x P_PAD
+
+
+def tables():
+    return (torch.full((HKV, B, W), NANPAGE, dtype=i32), torch.zeros((HKV, B, W), dtype=i32),
+            torch.zeros((HKV, B), dtype=i32))
+
+
+def run(mod, tab, ext, ln, build, bias, tile, **kw):
+    out = torch.zeros(E, HQ, HD)
+    mod.unified_attention(q, ak, av, out, cu, R, seq, BS, scale, True, (-1, -1), tab, 0, None, None, None,
+                          union_ext=ext, union_len=ln, cis_bias=bias, build_union=lists if build else None,
+                          rows_per_q_block=R, num_warps=4, num_stages=3, tile_size=tile, **kw)
+    return out
+
+
+def ref():
+    out = torch.zeros(E, HQ, HD, dtype=torch.float64)
+    g = HQ // HKV
+    for e in range(E):
+        for hq in range(HQ):
+            h = hq // g
+            pages = key[e, h].long()
+            n = (P - 1) * BS + LAST[e % R]
+            K = ak[pages, :, h].double().reshape(-1, HD)[:n]
+            V = av[pages, :, h].double().reshape(-1, HD)[:n]
+            Bi = ab[pages, :, h].double().reshape(-1)[:n]
+            s = (K @ q[e, hq].double() + Bi) * scale
+            out[e, hq] = torch.softmax(s, 0) @ V
+    return out
+
+
+def same(a, b):
+    return torch.equal(a.view(torch.int32), b.view(torch.int32))
+
+
+fails, lines = [], []
+REF = ref()
+for tile in (64, 32):
+    for bias in (ab, None):
+        bname = "bias" if bias is not None else "nobias"
+        t0 = tables()
+        f_build = run(FK, *t0, True, bias, tile)                  # the fork, union built in the kernel
+        if bias is not None:
+            err = float((f_build.double() - REF).abs().max())
+            lines.append("REF tile %d: max |fork - float64| %.2e" % (tile, err))
+            if not err <= 1e-4:
+                fails.append(("fork_vs_ref", tile, err))
+        if not bool((t0[2] == U).all()):
+            fails.append(("union_len", tile, t0[2].tolist()))
+        f_table = run(FK, *(x.clone() for x in t0), False, bias, tile)   # the fork reading those tables
+        for lvl in (0, 1, 2, 3):
+            for build, want in ((True, f_build), (False, f_table)):
+                t = tables() if build else tuple(x.clone() for x in t0)
+                got = run(FA, *t, build, bias, tile, ahead=lvl)
+                ok = same(got, want) and bool(torch.isfinite(got).all())
+                nd = int((got.view(torch.int32) != want.view(torch.int32)).sum())
+                lines.append("EQ tile %d %s ahead %d %s: bitwise %s (%d differ)" % (
+                    tile, bname, lvl, "build" if build else "table", ok, nd))
+                if not ok:
+                    fails.append(("EQ", tile, bname, lvl, build, nd))
+                if build and not torch.equal(t[0][:, :, :U], t0[0][:, :, :U]):
+                    fails.append(("tables", tile, bname, lvl))
+        # PLANT (L34): the failure mode of a wrong shift = tile j reads tile j + 1's page: must differ
+        tp = tuple(x.clone() for x in t0)
+        tp[0][0, 0, 2] = tp[0][0, 0, 3]
+        got = run(FA, *tp, False, bias, tile, ahead=1)
+        nd = int((got.view(torch.int32) != f_table.view(torch.int32)).sum())
+        lines.append("PLANT stale page tile %d %s: %d values differ" % (tile, bname, nd))
+        if nd == 0:
+            fails.append(("PLANT_stale_page_not_detected", tile, bname))
+        # PLANT (REPORT): two union entries swapped (same set, other tile order): the bits see the order
+        tp = tuple(x.clone() for x in t0)
+        tp[0][0, 0, [1, 2]] = tp[0][0, 0, [2, 1]]
+        tp[1][0, 0, [1, 2]] = tp[1][0, 0, [2, 1]]
+        got = run(FA, *tp, False, bias, tile, ahead=1)
+        nd = int((got.view(torch.int32) != f_table.view(torch.int32)).sum())
+        lines.append("REPORT swapped order tile %d %s: %d values differ, max |d| %.2e" % (
+            tile, bname, nd, float((got - f_table).abs().max())))
+print("\n".join(lines))
+if fails:
+    print("FAILS", fails)
+    sys.exit(1)
+print("AHEAD-INTERP OK")
+'''
+
+
+def test_ahead_interp():
+    """THE BIT-PRESERVATION CHECK ON THE CPU (lead's plan, edit A1/A2): under TRITON_INTERPRET=1 (a fresh child, L36),
+    real heads (32 query, 2 KV, dim 128, block 64), 2 requests x 4 rows, per-row shifted pages (union 8), partial last
+    pages, a NaN page behind the tables' tail: the ahead copy with ahead 0, 1, 2 = the fia6 fork BIT FOR BIT, union
+    built in the kernel and read from tables, with and without the bias, tile 64 and 32 (2 tiles per block). The fork
+    = the float64 reference within 1e-4 (the inputs exercise attention). PLANT: a stale page (tile j reads tile j + 1's
+    page) is DETECTED. LIMIT: the interpreter runs numpy; it shows the same values in the same operations. It does not
+    show the GPU code generator's reduction order; the GPU gate FORKAn-EQ (r2_j1_forkbench) does."""
+    if importlib.util.find_spec("triton") is None:
+        pytest.skip("triton is not installed")
+    env = dict(os.environ, TRITON_INTERPRET="1", PYTHONDONTWRITEBYTECODE="1")
+    r = subprocess.run([sys.executable, "-c", AHEAD_CHILD, str(EFF / "fork_vllm_unified_attention.py"),
+                        str(ROOT / FORK_AHEAD)], env=env, cwd=str(ROOT), capture_output=True, text=True, timeout=7200)
+    assert r.returncode == 0 and r.stdout.strip().splitlines()[-1:] == ["AHEAD-INTERP OK"], (
+        "child exit %d\n--- stdout ---\n%s\n--- stderr ---\n%s" % (r.returncode, r.stdout[-4000:], r.stderr[-4000:]))
+    _ev("J1 AHEAD INTERP:\n" + r.stdout.strip())
+
+
+COMPILE_CHILD = r'''
+import os, re, subprocess, sys, importlib.util, tempfile
+assert os.environ.get("TRITON_INTERPRET", "0") != "1"
+sys.dont_write_bytecode = True
+import torch
+import triton
+from triton.backends.compiler import GPUTarget
+from triton.runtime import driver
+
+
+class FakeDriver:                                    # a CPU node: no CUDA driver; compile only (warmup, no launch)
+    def get_current_device(self):
+        return 0
+
+    def get_current_stream(self, device=None):
+        return 0
+
+    def get_current_target(self):
+        return GPUTarget("cuda", 80, 32)             # A100 (sm_80), warp 32: the record's GPU
+
+
+driver.set_active(FakeDriver())
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+FK = load("fork_fia6", sys.argv[1])
+FA = load("fork_ahead", sys.argv[2])
+BIN = os.path.join(os.path.dirname(triton.__file__), "backends", "nvidia", "bin")
+HQ, HKV, HD, BS, R, B, P = 32, 2, 128, 64, 4, 216, 64         # the j1f / production shapes (B 216, 64 pages per row)
+E, NB = B * R, 16                                             # the arena size does not enter the code (strides do)
+bf, i32 = torch.bfloat16, torch.int32
+
+
+class Capture:                                                 # kernel[grid](**kw) -> warmup (compile, no launch)
+    def __init__(self, jit):
+        self.jit, self.kernels = jit, []
+
+    def __getitem__(self, grid):
+        def go(**kw):
+            k = self.jit.warmup(grid=grid, **kw)
+            self.kernels.append(k)
+            return k
+        return go
+
+
+def compiled(mod, bias_dtype, build, **kw):
+    cap = Capture(mod.kernel_unified_attention)
+    real, mod.kernel_unified_attention = mod.kernel_unified_attention, cap
+    try:
+        q = torch.zeros(E, HQ, HD, dtype=bf)
+        k = torch.zeros(NB, BS, HKV, HD, dtype=bf)
+        key = torch.zeros((E, HKV, P), dtype=i32)
+        lists = dict(page_key=key, page_table=key.clone(), num_pages=torch.zeros((E, HKV), dtype=i32),
+                     last_len=torch.zeros(E, dtype=i32), seq_idx=torch.zeros(E, dtype=i32), slots_per_entry=1)
+        tab = torch.zeros((HKV, B, R * P), dtype=i32)
+        mod.unified_attention(q, k, k.clone(), torch.zeros_like(q), torch.arange(0, E + 1, R, dtype=i32), R,
+                              torch.zeros(B, dtype=i32), BS, HD ** -0.5, True, (-1, -1), tab, 0, None, None, None,
+                              union_ext=torch.zeros_like(tab), union_len=torch.zeros((HKV, B), dtype=i32),
+                              cis_bias=torch.zeros(NB, BS, HKV, dtype=bias_dtype), build_union=lists if build else None,
+                              rows_per_q_block=R, num_warps=4, num_stages=3, tile_size=64, **kw)
+    finally:
+        mod.kernel_unified_attention = real
+    return cap.kernels[-1]
+
+
+def usage(kern):
+    with tempfile.NamedTemporaryFile(suffix=".cubin", delete=False) as f:
+        f.write(kern.asm["cubin"])
+    out = subprocess.run([os.path.join(BIN, "cuobjdump"), "--dump-resource-usage", f.name], capture_output=True,
+                         text=True).stdout
+    os.unlink(f.name)
+    m = re.search(r"REG:(\d+) STACK:(\d+) SHARED:(\d+) LOCAL:(\d+)", out)
+    return dict(reg=int(m.group(1)), stack=int(m.group(2)), local=int(m.group(4)), shared=kern.metadata.shared)
+
+
+def sass(kern):
+    """The cubin's SASS instruction lines (cuobjdump -sass), without addresses and encodings."""
+    with tempfile.NamedTemporaryFile(suffix=".cubin", delete=False) as f:
+        f.write(kern.asm["cubin"])
+    out = subprocess.run([os.path.join(BIN, "cuobjdump"), "-sass", f.name], capture_output=True, text=True).stdout
+    os.unlink(f.name)
+    return [re.sub(r"/\*[0-9a-f]+\*/|/\* 0x[0-9a-f]+ \*/", "", x).strip() for x in out.splitlines()
+            if re.search(r"/\*[0-9a-f]{4}\*/", x)]
+
+
+def loop_ops(ttgir):
+    """The tile loop = the scf.for whose body holds the tt.dot ops: its tt.load / async copy / async_wait counts."""
+    lines = ttgir.splitlines()
+    first_dot = next(i for i, x in enumerate(lines) if "tt.dot" in x)
+    start = max(i for i in range(first_dot) if "scf.for" in lines[i])
+    ind = len(lines[start]) - len(lines[start].lstrip())
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].strip().startswith("}")
+               and len(lines[i]) - len(lines[i].lstrip()) == ind)
+    body = lines[start:end]
+    return dict(sync_load=sum(" tt.load " in x for x in body), async_copy=sum("async_copy_global_to_local" in x
+                for x in body), async_wait=sum("async_wait" in x for x in body), dots=sum("tt.dot" in x for x in body))
+
+
+LOC = re.compile(r' ?loc\((?:"[^"]*"(?::\d+:\d+)?|#loc\d*|[^()]*)\)')
+
+
+def strip_loc(s):
+    """TTGIR without source locations (file paths and line numbers differ between the two files)."""
+    return "\n".join(LOC.sub("", x) for x in s.splitlines() if not x.startswith("#loc"))
+
+
+def ptx_code(s):
+    """PTX without its debug information (.file / .loc lines, the .debug sections) and comments."""
+    s = s.split(".section", 1)[0]
+    return [x for x in s.splitlines() if x.strip() and not x.strip().startswith((".loc", ".file", "//", "$L__"))]
+
+
+def canon(lines):
+    """SASS with registers renamed in order of first use: the same instructions on the same data flow."""
+    names = {}
+
+    def ren(m):
+        return names.setdefault(m.group(0), "%s%d" % (m.group(1), len(names)))
+    return [re.sub(r"\b(UR|R|UP|P)(\d+)\b", ren, x) for x in lines]
+
+
+CTRL = os.path.join(os.environ.get("TMPDIR", "/tmp"), "fork_ctrl_%d.py" % os.getpid())   # the fork at another path
+with open(sys.argv[1]) as f, open(CTRL, "w") as g:
+    g.write(f.read())
+FC = load("fork_ctrl", CTRL)
+
+
+def compare(x, y):
+    gx, gy = strip_loc(x.asm["ttgir"]).splitlines(), strip_loc(y.asm["ttgir"]).splitlines()
+    px, py = ptx_code(x.asm["ptx"]), ptx_code(y.asm["ptx"])
+    sx, sy = sass(x), sass(y)
+    first = lambda a, b: next(((i, u, v) for i, (u, v) in enumerate(zip(a, b)) if u != v), None)  # noqa: E731
+    return dict(ttgir=gx == gy, ptx=px == py, sass=sx == sy, sass_canon=canon(sx) == canon(sy), n_ttgir=len(gx),
+                n_ptx=len(px), n_sass=len(sx), d_ttgir=first(gx, gy), d_ptx=first(px, py), d_sass=first(sx, sy))
+
+
+rows = []
+for bias in (torch.bfloat16, torch.float32):
+    base = compiled(FK, bias, True)
+    a0 = compiled(FA, bias, True, ahead=0)
+    for what, other in (("ahead0_vs_fork", a0), ("CONTROL_fork_copy_vs_fork", compiled(FC, bias, True))):
+        c = compare(base, other)
+        same = c["ttgir"] and c["n_ttgir"] > 1000                     # MUST: the same TTGIR (PTX / SASS: REPORT)
+        print("%s bias %s %s: ttgir %s (%d lines) ptx %s (%d lines) sass %s, sass with registers renamed %s (%d)" % (
+            "SAME_CODE" if what.startswith("ahead") else "REPORT", str(bias)[6:], what, c["ttgir"], c["n_ttgir"],
+            c["ptx"], c["n_ptx"], c["sass"], c["sass_canon"], c["n_sass"]) + (" " + str(same) if
+                                                                                what.startswith("ahead") else ""))
+        if not (c["ttgir"] and c["ptx"] and c["sass"]):
+            print("DIFF %s ttgir %s | ptx %s | sass %s" % (what, str(c["d_ttgir"])[:300], str(c["d_ptx"])[:300],
+                                                         str(c["d_sass"])[:300]))
+    for name, kern in (("fork", base), ("ahead0", a0), ("ahead1", compiled(FA, bias, True, ahead=1)),
+                       ("ahead2", compiled(FA, bias, True, ahead=2)), ("ahead3", compiled(FA, bias, True, ahead=3)),
+                       ("fork_table", compiled(FK, bias, False)), ("ahead2_table", compiled(FA, bias, False, ahead=2)),
+                       ("ahead3_table", compiled(FA, bias, False, ahead=3))):
+        u, lo = usage(kern), loop_ops(kern.asm["ttgir"])
+        print("WITNESS bias %s %-12s reg %d stack %d local %d shared %d | loop sync tt.load %d async copies %d "
+              "async_wait %d dots %d" % (str(bias)[6:], name, u["reg"], u["stack"], u["local"], u["shared"],
+                                         lo["sync_load"], lo["async_copy"], lo["async_wait"], lo["dots"]))
+os.environ["TRITON_DISABLE_LINE_INFO"] = "1"                  # the same pair without line info (fresh JIT objects)
+FK2, FA2 = load("fork_fia6_noline", sys.argv[1]), load("fork_ahead_noline", sys.argv[2])
+for bias in (torch.bfloat16, torch.float32):
+    c = compare(compiled(FK2, bias, True), compiled(FA2, bias, True, ahead=0))
+    print("REPORT bias %s ahead0_vs_fork WITHOUT LINE INFO: ttgir %s ptx %s sass %s, renamed %s" % (
+        str(bias)[6:], c["ttgir"], c["ptx"], c["sass"], c["sass_canon"]))
+os.unlink(CTRL)
+print("COMPILE-WITNESS OK")
+'''
+
+
+def test_ahead_compile_witness():
+    """CPU COMPILE WITNESS (no GPU, no launch): Triton 3.2 compiles the fia6 fork and the ahead copy for sm_80 (A100)
+    through JITFunction.warmup with a stand-in driver (target only); cuobjdump --dump-resource-usage reads registers,
+    stack and shared memory from the cubin; the TTGIR tile loop's synchronous tt.load / async copies are counted. MUST:
+    ahead 0 compiles to the fork's TTGIR and PTX (the flag off = the fork's code). REPORT: the rest (evidence for the
+    lead's GPU decision; timing is the GPU's)."""
+    if importlib.util.find_spec("triton") is None:
+        pytest.skip("triton is not installed")
+    env = {k: v for k, v in os.environ.items() if k != "TRITON_INTERPRET"}
+    env.update(PYTHONDONTWRITEBYTECODE="1", TRITON_CACHE_DIR=str(Path(os.environ.get("TMPDIR", "/tmp")) /
+                                                                  ("j1_ahead_cache_%d" % os.getpid())))
+    r = subprocess.run([sys.executable, "-c", COMPILE_CHILD, str(EFF / "fork_vllm_unified_attention.py"),
+                        str(ROOT / FORK_AHEAD)], env=env, cwd=str(ROOT), capture_output=True, text=True, timeout=3600)
+    out = r.stdout.strip().splitlines()
+    assert r.returncode == 0 and out[-1:] == ["COMPILE-WITNESS OK"], (
+        "child exit %d\n--- stdout ---\n%s\n--- stderr ---\n%s" % (r.returncode, r.stdout[-4000:], r.stderr[-4000:]))
+    _ev("J1 AHEAD COMPILE WITNESS (sm_80, w4 s3 tile 64, B 216):\n" + "\n".join(out))
+    assert [x for x in out if x.startswith("SAME_CODE")] and all(x.endswith(" True") for x in out
+                                                                 if x.startswith("SAME_CODE")), "\n".join(out)
 
 
 # ------------------------------------------------------------------ CELL

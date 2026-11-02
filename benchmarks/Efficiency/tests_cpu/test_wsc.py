@@ -131,7 +131,7 @@ DECLARED = DECLARED + ("benchmarks/Efficiency/r2_recon7_protocol.py", "benchmark
 DECLARED = DECLARED + ("benchmarks/Efficiency/r2_j1_select.py", "benchmarks/Efficiency/r2_j1_cell.py",
                        "benchmarks/Efficiency/r2_j1_step.sh", "benchmarks/Efficiency/tests_cpu/test_j1.py",
                        "docs/NOTES_j1.md")                                                                 # J1
-DECLARED = DECLARED + ("benchmarks/Efficiency/r2_j1_forkbench.py",)                                       # J1
+DECLARED = DECLARED + ("benchmarks/Efficiency/r2_j1_forkbench.py", "benchmarks/Efficiency/fork_vllm_unified_attention_ahead.py")                                       # J1
 
 
 def _load(name):

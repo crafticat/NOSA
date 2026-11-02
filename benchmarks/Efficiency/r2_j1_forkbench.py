@@ -7,6 +7,10 @@ of the MEASURED shapes, in matched pairs:
            per request, each row 64 pages shifted (0, 3, 5, 8): union 72 per (KV head, request) (MEASURED: 72.2 at C 128,
            r7pa; 72.24 at C 73, V1B); the union built in the kernel (production)
   FORKT    the same with the union tables built before (BUILD_UNION off): the in-kernel build's cost
+  FORKA1   FORK through fork_vllm_unified_attention_ahead.py with ahead=1 (the table page id and the extents word read
+           two tiles ahead, as scalars); FORKA2: ahead=2 (and the bias one tile ahead); FORKA3: ahead=3 (the fork's
+           K / V page-id loads kept, only ext_rows and the bias ahead). MUST gate <shape>-FORKAn-EQ:
+           the output = FORK's, bit for bit (no arithmetic change is allowed)
   FORK3Dn  the same with the fork's EXISTING 3D split path (seq_threshold_3D, n segments per (request, KV head),
            reduce_segments), n in --segments: wave balance (never run before: its numeric gate is REPORT)
   FORK1R   the fork with ONE row per request (row 0's 64 pages; BLOCK_Q 1): the kernel at the baseline's work
@@ -68,7 +72,8 @@ SPLITS = 4                                                    # NOSI_ATTN_SPLITS
 MASK_BIAS = -3.0e4                                            # = verify_rows.MASK_BIAS
 TOL = 1e-3                                                    # fia5's numeric tolerance (float64 reference)
 FLASH = ("NS1R1", "NS1x4", "FLASHU1", "NSRU")                 # the flash controls (direct out_ write)
-BASE = ("FORK", "FORKT", "FORK1R") + tuple(x + s for x in FLASH for s in ("", "_CP", "_CO"))   # _CP before _CO
+AHEAD = ("FORKA1", "FORKA2", "FORKA3")                        # the fork with its loads ahead (ahead = 1, 2, 3)
+BASE = ("FORK", "FORKT") + AHEAD + ("FORK1R",) + tuple(x + s for x in FLASH for s in ("", "_CP", "_CO"))  # _CP < _CO
 
 
 def log(msg):
@@ -123,7 +128,7 @@ def work(name: str, B: int) -> dict:
         return dict(rows=0, pages=0)
     if name.endswith("_CP") and name[:-3] in FLASH:
         name = name[:-3]
-    if name.startswith("FORK3D") or name in ("FORK", "FORKT"):
+    if name.startswith("FORK3D") or name in ("FORK", "FORKT") + AHEAD:
         return dict(rows=R * B, pages=HKV * B * UNION)
     if name in ("FORK1R", "NS1R1"):
         return dict(rows=B, pages=HKV * B * P_ROW)
@@ -155,7 +160,10 @@ PAIRS = (("FORK", "FLASHU1", "equal logical bytes (union 72): the 4-row tile's c
          ("FORK1R", "NS1R1", "equal rows and bytes (1 row, 64 pages): the fork kernel's per-byte efficiency"),
          ("FORK", "NS1x4", "equal rows (4 per request): the shared read's saving vs the baseline's 4 calls"),
          ("FORKT", "FORK", "the in-kernel union build's cost"),
-         ("NSRU", "FORK", "the shipped kernel's own sharing (L2) vs the fork"))
+         ("NSRU", "FORK", "the shipped kernel's own sharing (L2) vs the fork"),
+         ("FORKA1", "FORK", "the fork with the table and extents read two tiles ahead (bit-equal by FORKA1-EQ)"),
+         ("FORKA2", "FORK", "the same and the bias one tile ahead (bit-equal by FORKA2-EQ)"),
+         ("FORKA3", "FORK", "the fork's K / V page-id loads kept; ext_rows and the bias ahead (FORKA3-EQ)"))
 PAIRS_CP = (("FORK", "FLASHU1_CP", "j1f form (flash: wrapper + copy_): equal logical bytes"),
             ("FORK1R", "NS1R1_CP", "j1f form (flash: wrapper + copy_): equal rows and bytes"),
             ("FORK", "NS1x4_CP", "j1f form (flash: wrapper + copy_): equal rows"),
@@ -323,6 +331,7 @@ def build_gpu(B: int, seed: int, segments, sample: int):
     """The variants of one shape: {name: callable}, {name: output tensor}, meta (the union lengths, the references)."""
     import torch
     import fork_vllm_unified_attention as FK
+    import fork_vllm_unified_attention_ahead as FKA                         # the fork + the [ahead] lines (sibling)
     from flash_attn_nosa import flash_attn_with_kvcache as FA
     from flash_attn_nosa import flash_attn_interface as FAI
     FAOP = FAI.flash_attn_cuda.fwd_kvcache                                   # the op the wrapper FA calls
@@ -356,11 +365,13 @@ def build_gpu(B: int, seed: int, segments, sample: int):
         return (torch.zeros((HKV, B, width), dtype=i32, device=dev), torch.zeros((HKV, B, width), dtype=i32, device=dev),
                 torch.zeros((HKV, B), dtype=i32, device=dev))
 
-    def fork_call(qx, out, cu, rows, tab, ext, ln, lists, extra=None):
+    def fork_call(qx, out, cu, rows, tab, ext, ln, lists, extra=None, mod=None):
+        ua = (mod or FK).unified_attention
+
         def call():
-            FK.unified_attention(qx, ak, av, out, cu, rows, seq, BS, scale, True, (-1, -1), tab, 0, None, None, None,
-                                 union_ext=ext, union_len=ln, cis_bias=ab, build_union=lists, rows_per_q_block=rows,
-                                 **dict(FORK_LAUNCH, **(extra or {})))
+            ua(qx, ak, av, out, cu, rows, seq, BS, scale, True, (-1, -1), tab, 0, None, None, None,
+               union_ext=ext, union_len=ln, cis_bias=ab, build_union=lists, rows_per_q_block=rows,
+               **dict(FORK_LAUNCH, **(extra or {})))
         return call
     o = torch.zeros((E, HQ, HD), dtype=bf, device=dev)
     t4 = tables(R * P_ROW)
@@ -371,6 +382,9 @@ def build_gpu(B: int, seed: int, segments, sample: int):
     tT = tuple(t.clone() for t in t4)
     oT = torch.zeros_like(o)
     parts["FORKT"], outs["FORKT"] = fork_call(q, oT, cu4, R, *tT, None), oT
+    for lvl, v in enumerate(AHEAD, 1):                                       # production mode (build in the kernel)
+        oA = torch.zeros_like(o)
+        parts[v], outs[v] = fork_call(q, oA, cu4, R, *tables(R * P_ROW), lists4, dict(ahead=lvl), FKA), oA
     for s in segments:
         o3 = torch.zeros_like(o)
         t3 = tables(R * P_ROW)
@@ -508,6 +522,13 @@ def run_shape(a, C: int, B: int, t0: float):
     if "FORKT" in first:
         eq = bool((bits(first["FORKT"]) == bits(first["FORK"])).all())
         gates.append(("%s-FORKT-EQ" % name, True, eq, "FORKT = FORK bit for bit: %s" % eq))
+    for v in AHEAD:                                                          # the hard constraint: the same bits
+        if v in first and "FORK" in first:
+            eq = bool((bits(first[v]) == bits(first["FORK"])).all())
+            nd = int((bits(first[v]) != bits(first["FORK"])).sum())
+            valid[v] = valid[v] and eq
+            gates.append(("%s-%s-EQ" % (name, v), True, eq, "%s = FORK bit for bit: %s (%d values differ)" % (
+                v, eq, nd)))
     for x in FLASH:                                                          # the direct write = the j1f form
         if x in first and x + "_CP" in first:
             eq = bool((bits(first[x]) == bits(first[x + "_CP"])).all())

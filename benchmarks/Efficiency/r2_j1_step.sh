@@ -25,7 +25,8 @@
 #   j1a  timing, C 128 (pool 65), B 216, 512 steps, arms L4PTFD,L4PTFDGUDC,L4PTFDGUDCD,L4PTFDGUDCDJ1,L4PTFDGUDCDJ3.
 #        STEP_MIN 125, --mem 240G. STOPS while PRED_STAMP_J1 is None.
 #   j1f  the FORK MICROBENCH (benchmarks/Efficiency/r2_j1_forkbench.py; grant GRANT_j1f in THAT file): no model, no
-#        workload; synthetic pages of the measured shapes (B 216, B 318; union 72); variants FORK, FORKT, FORK3D2/4/8,
+#        workload; synthetic pages of the measured shapes (B 216, B 318; union 72); variants FORK, FORKT, FORKA1/2
+#        (fork_vllm_unified_attention_ahead.py, MUST be bit-equal to FORK), FORK3D2/4/8,
 #        FORK1R, NS1R1, NS1x4, FLASHU1, NSRU (direct out_ write) and each flash control's _CP (j1f form: wrapper +
 #        copy_) and _CO (copy_ alone); 32 calls per pass, 10 order-rotated passes. STEP_MIN 25 (the image hash of
 #        23 GB inside it), --mem 64G, OUT_MB 60.
@@ -103,7 +104,8 @@ for v in $(compgen -e); do case $v in SLURM_*|SRUN_*|SALLOC_*|SBATCH_*) stop "th
 [ -z "$(git -C "$NOSI" status --porcelain --untracked-files=all -- nosi)" ] || stop "$NOSI has untracked files in nosi/"
 blob=$(git -C "$NOSI" rev-parse "$NSHA:$SELF") || stop "$SELF is not tracked at $NSHA"
 cmp -s -- "$0" <(git -C "$NOSI" show "$NSHA:$SELF") || stop "$0 is not the bytes of $SELF at $NSHA (blob $blob)"
-for f in "$CELLPY" "$FORKPY" benchmarks/Efficiency/r2_j1_select.py benchmarks/Efficiency/r2_i4dc_cell.py \
+for f in "$CELLPY" "$FORKPY" benchmarks/Efficiency/fork_vllm_unified_attention_ahead.py \
+         benchmarks/Efficiency/r2_j1_select.py benchmarks/Efficiency/r2_i4dc_cell.py \
          benchmarks/Efficiency/r2_i4dc_compile.py benchmarks/Efficiency/r2_i4cc_cell.py \
          benchmarks/Efficiency/r2_i4cc_compile.py benchmarks/Efficiency/r2_i4s_cell.py \
          benchmarks/Efficiency/r2_i4s_stack.py benchmarks/Efficiency/r2_i4h_cell.py \
