@@ -1,5 +1,5 @@
 # GPU run records: the step record (command, exit, sacct, stdout, stderr) is copied; summary.json is copied
-# when below 5 MB, otherwise listed with its sha256 and size (traces are never copied). Computed on thunder09 at 2026-11-01T00:14:21Z
+# when below 5 MB, otherwise listed with its sha256 and size (traces are never copied). Computed on thunder09 at 2026-11-02T11:13:28Z
 COPIED recon7_x1r3_2195630_r7s/summary.json 52155
 COPIED recon7_pm1_2195631_r7pm/summary.json 801341
 COPIED recon7_mem1_2195630_r7mem/summary.json 2119013

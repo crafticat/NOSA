@@ -11,14 +11,16 @@ mkdir -p $D/analysis $D/provenance $D/cpu-receipts $D/gpu-records
 for f in HANDOFF_INT_2026-10-31.md DISPOSITION_REVIEW3_2026-10-31.md LEDGER_rev7.md STATUS_LOG.md \
          INTEGRATION_NOTES_2026-10-31.md RECON7_RECEIPTS_RECOVERED.md DESIGN_BGFETCH_2026-10-31.md \
          DESIGN_JOINT_EFF_2026-10-31.md HANDOFF_RECON7.md HUMAN_RECON_REQUEST_2026-10-30.md; do
-    cp -p $K/analysis/plan/$f $D/analysis/
+    cp -p --remove-destination $K/analysis/plan/$f $D/analysis/
 done
-cp -p $K/tmp_sc/recon7_prov/PROVENANCE.md $D/provenance/
-cp -rp $K/tmp_sc/recon7_prov/bundle $D/provenance/
-cp -p $K/tmp_sc/recon7_fix/run_receipt.sh $K/tmp_sc/recon7_fix/run_receipt_tree.sh $K/tmp_sc/packet_1101/assemble.sh $D/cpu-receipts/
+cp -p --remove-destination $K/tmp_sc/recon7_prov/PROVENANCE.md $D/provenance/
+# The bundle is immutable and keeps read-only modes (cp -rp): copy it once only.
+[ -d $D/provenance/bundle ] || cp -rp $K/tmp_sc/recon7_prov/bundle $D/provenance/
+cp -p --remove-destination $K/tmp_sc/recon7_fix/run_receipt.sh $K/tmp_sc/recon7_fix/run_receipt_tree.sh \
+    $K/tmp_sc/packet_1101/assemble.sh $K/tmp_sc/packet_1102/chunk_summaries.sh $D/cpu-receipts/
 for p in recon7f_ j1_ st1_ st3_ bf1_ int_; do
     for f in $K/cpu-logs/${p}*; do
-        case $f in *.txt|*.receipt) cp -p "$f" $D/cpu-receipts/ ;; esac
+        case $f in *.txt|*.receipt) cp -p --remove-destination "$f" $D/cpu-receipts/ ;; esac
     done
 done
 RUNS="recon7_x1r3_2195630_r7s recon7_pm1_2195631_r7pm recon7_mem1_2195630_r7mem recon7_pa1_2195631_r7pa
@@ -32,12 +34,12 @@ int_a1_2195630_inta int_m2_2195630_intm int_b1_2195630_intb int_c1_2195631_intc 
   for r in $RUNS; do
       [ -d $S/$r.step ] || { echo "MISSING $r"; continue; }
       mkdir -p $D/gpu-records/$r
-      cp -p $S/$r.step/command.txt $S/$r.step/exit.txt $S/$r.step/sacct.txt $S/$r.step/stdout.txt $S/$r.step/stderr.txt \
+      cp -p --remove-destination $S/$r.step/command.txt $S/$r.step/exit.txt $S/$r.step/sacct.txt $S/$r.step/stdout.txt $S/$r.step/stderr.txt \
           $D/gpu-records/$r/ 2>/dev/null || true
       sj=$S/$r/summary.json
       if [ -f $sj ]; then
           sz=$(stat -c %s $sj)
-          if [ "$sz" -lt 5000000 ]; then cp -p $sj $D/gpu-records/$r/; echo "COPIED $r/summary.json $sz";
+          if [ "$sz" -lt 5000000 ]; then cp -p --remove-destination $sj $D/gpu-records/$r/; echo "COPIED $r/summary.json $sz";
           else echo "NOT COPIED $r/summary.json $sz $(sha256sum $sj | cut -d' ' -f1)"; fi
       fi
   done

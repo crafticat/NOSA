@@ -1,0 +1,93 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+...                                                                      [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_ahead_copy
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1026: Evidence: J1 AHEAD COPY: 67 tagged lines, 8 re-indented fork lines
+    _ev("J1 AHEAD COPY: %d tagged lines, %d re-indented fork lines" % (len(tagged), len(moved)))
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_ahead_interp
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1171: Evidence: J1 AHEAD INTERP:
+  REF tile 64: max |fork - float64| 7.89e-08
+  EQ tile 64 bias ahead 0 build: bitwise True (0 differ)
+  EQ tile 64 bias ahead 0 table: bitwise True (0 differ)
+  EQ tile 64 bias ahead 1 build: bitwise True (0 differ)
+  EQ tile 64 bias ahead 1 table: bitwise True (0 differ)
+  EQ tile 64 bias ahead 2 build: bitwise True (0 differ)
+  EQ tile 64 bias ahead 2 table: bitwise True (0 differ)
+  EQ tile 64 bias ahead 3 build: bitwise True (0 differ)
+  EQ tile 64 bias ahead 3 table: bitwise True (0 differ)
+  PLANT stale page tile 64 bias: 6144 values differ
+  REPORT swapped order tile 64 bias: 2257 values differ, max |d| 5.96e-08
+  EQ tile 64 nobias ahead 0 build: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 0 table: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 1 build: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 1 table: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 2 build: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 2 table: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 3 build: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 3 table: bitwise True (0 differ)
+  PLANT stale page tile 64 nobias: 6144 values differ
+  REPORT swapped order tile 64 nobias: 2200 values differ, max |d| 5.22e-08
+  REF tile 32: max |fork - float64| 7.57e-08
+  EQ tile 32 bias ahead 0 build: bitwise True (0 differ)
+  EQ tile 32 bias ahead 0 table: bitwise True (0 differ)
+  EQ tile 32 bias ahead 1 build: bitwise True (0 differ)
+  EQ tile 32 bias ahead 1 table: bitwise True (0 differ)
+  EQ tile 32 bias ahead 2 build: bitwise True (0 differ)
+  EQ tile 32 bias ahead 2 table: bitwise True (0 differ)
+  EQ tile 32 bias ahead 3 build: bitwise True (0 differ)
+  EQ tile 32 bias ahead 3 table: bitwise True (0 differ)
+  PLANT stale page tile 32 bias: 6144 values differ
+  REPORT swapped order tile 32 bias: 2208 values differ, max |d| 5.22e-08
+  EQ tile 32 nobias ahead 0 build: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 0 table: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 1 build: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 1 table: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 2 build: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 2 table: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 3 build: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 3 table: bitwise True (0 differ)
+  PLANT stale page tile 32 nobias: 6144 values differ
+  REPORT swapped order tile 32 nobias: 2344 values differ, max |d| 4.47e-08
+  AHEAD-INTERP OK
+    _ev("J1 AHEAD INTERP:\n" + r.stdout.strip())
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_ahead_compile_witness
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1366: Evidence: J1 AHEAD COMPILE WITNESS (sm_80, w4 s3 tile 64, B 216):
+  SAME_CODE bias bfloat16 ahead0_vs_fork: ttgir True (1777 lines) ptx False (5983 lines) sass False, sass with registers renamed False (4096) True
+  DIFF ahead0_vs_fork ttgir None | ptx (58, '\t.reg .b32 \t%r<3843>;', '\t.reg .b32 \t%r<3838>;') | sass (45, 'S2R R93, SR_TID.X ;', 'S2R R95, SR_TID.X ;')
+  REPORT bias bfloat16 CONTROL_fork_copy_vs_fork: ttgir True (1777 lines) ptx True (5983 lines) sass True, sass with registers renamed True (4096)
+  WITNESS bias bfloat16 fork         reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias bfloat16 ahead0       reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias bfloat16 ahead1       reg 251 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias bfloat16 ahead2       reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias bfloat16 ahead3       reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 8 async copies 0 async_wait 0 dots 2
+  WITNESS bias bfloat16 fork_table   reg 255 stack 24 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias bfloat16 ahead2_table reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias bfloat16 ahead3_table reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 8 async copies 0 async_wait 0 dots 2
+  SAME_CODE bias float32 ahead0_vs_fork: ttgir True (1776 lines) ptx True (5976 lines) sass True, sass with registers renamed True (4096) True
+  REPORT bias float32 CONTROL_fork_copy_vs_fork: ttgir True (1776 lines) ptx True (5976 lines) sass True, sass with registers renamed True (4096)
+  WITNESS bias float32 fork         reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias float32 ahead0       reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias float32 ahead1       reg 251 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias float32 ahead2       reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias float32 ahead3       reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 8 async copies 0 async_wait 0 dots 2
+  WITNESS bias float32 fork_table   reg 255 stack 24 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias float32 ahead2_table reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias float32 ahead3_table reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 8 async copies 0 async_wait 0 dots 2
+  REPORT bias bfloat16 ahead0_vs_fork WITHOUT LINE INFO: ttgir True ptx True sass True, renamed True
+  REPORT bias float32 ahead0_vs_fork WITHOUT LINE INFO: ttgir True ptx True sass True, renamed True
+  COMPILE-WITNESS OK
+    _ev("J1 AHEAD COMPILE WITNESS (sm_80, w4 s3 tile 64, B 216):\n" + "\n".join(out))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+3 passed, 23 deselected, 3 warnings in 148.98s (0:02:28)

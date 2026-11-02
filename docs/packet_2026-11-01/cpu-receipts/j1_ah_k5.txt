@@ -1,0 +1,102 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+F                                                                        [100%]
+=================================== FAILURES ===================================
+__________________________ test_ahead_compile_witness __________________________
+
+    def test_ahead_compile_witness():
+        """CPU COMPILE WITNESS (no GPU, no launch): Triton 3.2 compiles the fia6 fork and the ahead copy for sm_80 (A100)
+        through JITFunction.warmup with a stand-in driver (target only); cuobjdump --dump-resource-usage reads registers,
+        stack and shared memory from the cubin; the TTGIR tile loop's synchronous tt.load / async copies are counted. MUST:
+        ahead 0 compiles to the fork's TTGIR and PTX (the flag off = the fork's code). REPORT: the rest (evidence for the
+        lead's GPU decision; timing is the GPU's)."""
+        if importlib.util.find_spec("triton") is None:
+            pytest.skip("triton is not installed")
+        env = {k: v for k, v in os.environ.items() if k != "TRITON_INTERPRET"}
+        env.update(PYTHONDONTWRITEBYTECODE="1", TRITON_CACHE_DIR=str(Path(os.environ.get("TMPDIR", "/tmp")) /
+                                                                      ("j1_ahead_cache_%d" % os.getpid())))
+        r = subprocess.run([sys.executable, "-c", COMPILE_CHILD, str(EFF / "fork_vllm_unified_attention.py"),
+                            str(ROOT / FORK_AHEAD)], env=env, cwd=str(ROOT), capture_output=True, text=True, timeout=3600)
+        out = r.stdout.strip().splitlines()
+        assert r.returncode == 0 and out[-1:] == ["COMPILE-WITNESS OK"], (
+            "child exit %d\n--- stdout ---\n%s\n--- stderr ---\n%s" % (r.returncode, r.stdout[-4000:], r.stderr[-4000:]))
+        _ev("J1 AHEAD COMPILE WITNESS (sm_80, w4 s3 tile 64, B 216):\n" + "\n".join(out))
+>       assert [x for x in out if x.startswith("SAME_CODE")] and all(x.endswith(" True") for x in out
+                                                                     if x.startswith("SAME_CODE")), "\n".join(out)
+E       AssertionError: SAME_CODE bias bfloat16 ahead0_vs_fork: ttgir True (1777 lines) ptx False (5983 lines) sass False, sass with registers renamed False (4096) False
+E         DIFF ahead0_vs_fork ttgir None | ptx (58, '\t.reg .b32 \t%r<3843>;', '\t.reg .b32 \t%r<3838>;') | sass (45, 'S2R R93, SR_TID.X ;', 'S2R R95, SR_TID.X ;')
+E         REPORT bias bfloat16 CONTROL_fork_copy_vs_fork: ttgir True (1777 lines) ptx True (5983 lines) sass True, sass with registers renamed True (4096)
+E         WITNESS bias bfloat16 fork         reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+E         WITNESS bias bfloat16 ahead0       reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+E         WITNESS bias bfloat16 ahead1       reg 251 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+E         WITNESS bias bfloat16 ahead2       reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+E         WITNESS bias bfloat16 fork_table   reg 255 stack 24 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+E         WITNESS bias bfloat16 ahead2_table reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+E         SAME_CODE bias float32 ahead0_vs_fork: ttgir True (1776 lines) ptx True (5976 lines) sass True, sass with registers renamed True (4096) True
+E         REPORT bias float32 CONTROL_fork_copy_vs_fork: ttgir True (1776 lines) ptx True (5976 lines) sass True, sass with registers renamed True (4096)
+E         WITNESS bias float32 fork         reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+E         WITNESS bias float32 ahead0       reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+E         WITNESS bias float32 ahead1       reg 251 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+E         WITNESS bias float32 ahead2       reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+E         WITNESS bias float32 fork_table   reg 255 stack 24 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+E         WITNESS bias float32 ahead2_table reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+E         COMPILE-WITNESS OK
+E       assert (['SAME_CODE bias bfloat16 ahead0_vs_fork: ttgir True (1777 lines) ptx False (5983 lines) sass False, sass with registe...ahead0_vs_fork: ttgir True (1776 lines) ptx True (5976 lines) sass True, sass with registers renamed True (4096) True'] and False)
+E        +  where False = all(<generator object test_ahead_compile_witness.<locals>.<genexpr> at 0x7fddd0463300>)
+
+benchmarks/Efficiency/tests_cpu/test_j1.py:1359: AssertionError
+----------------------------- Captured stdout call -----------------------------
+J1 AHEAD COMPILE WITNESS (sm_80, w4 s3 tile 64, B 216):
+SAME_CODE bias bfloat16 ahead0_vs_fork: ttgir True (1777 lines) ptx False (5983 lines) sass False, sass with registers renamed False (4096) False
+DIFF ahead0_vs_fork ttgir None | ptx (58, '\t.reg .b32 \t%r<3843>;', '\t.reg .b32 \t%r<3838>;') | sass (45, 'S2R R93, SR_TID.X ;', 'S2R R95, SR_TID.X ;')
+REPORT bias bfloat16 CONTROL_fork_copy_vs_fork: ttgir True (1777 lines) ptx True (5983 lines) sass True, sass with registers renamed True (4096)
+WITNESS bias bfloat16 fork         reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+WITNESS bias bfloat16 ahead0       reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+WITNESS bias bfloat16 ahead1       reg 251 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+WITNESS bias bfloat16 ahead2       reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+WITNESS bias bfloat16 fork_table   reg 255 stack 24 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+WITNESS bias bfloat16 ahead2_table reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+SAME_CODE bias float32 ahead0_vs_fork: ttgir True (1776 lines) ptx True (5976 lines) sass True, sass with registers renamed True (4096) True
+REPORT bias float32 CONTROL_fork_copy_vs_fork: ttgir True (1776 lines) ptx True (5976 lines) sass True, sass with registers renamed True (4096)
+WITNESS bias float32 fork         reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+WITNESS bias float32 ahead0       reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+WITNESS bias float32 ahead1       reg 251 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+WITNESS bias float32 ahead2       reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+WITNESS bias float32 fork_table   reg 255 stack 24 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+WITNESS bias float32 ahead2_table reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+COMPILE-WITNESS OK
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_ahead_compile_witness
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1358: Evidence: J1 AHEAD COMPILE WITNESS (sm_80, w4 s3 tile 64, B 216):
+  SAME_CODE bias bfloat16 ahead0_vs_fork: ttgir True (1777 lines) ptx False (5983 lines) sass False, sass with registers renamed False (4096) False
+  DIFF ahead0_vs_fork ttgir None | ptx (58, '\t.reg .b32 \t%r<3843>;', '\t.reg .b32 \t%r<3838>;') | sass (45, 'S2R R93, SR_TID.X ;', 'S2R R95, SR_TID.X ;')
+  REPORT bias bfloat16 CONTROL_fork_copy_vs_fork: ttgir True (1777 lines) ptx True (5983 lines) sass True, sass with registers renamed True (4096)
+  WITNESS bias bfloat16 fork         reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias bfloat16 ahead0       reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias bfloat16 ahead1       reg 251 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias bfloat16 ahead2       reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias bfloat16 fork_table   reg 255 stack 24 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias bfloat16 ahead2_table reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  SAME_CODE bias float32 ahead0_vs_fork: ttgir True (1776 lines) ptx True (5976 lines) sass True, sass with registers renamed True (4096) True
+  REPORT bias float32 CONTROL_fork_copy_vs_fork: ttgir True (1776 lines) ptx True (5976 lines) sass True, sass with registers renamed True (4096)
+  WITNESS bias float32 fork         reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias float32 ahead0       reg 255 stack 48 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias float32 ahead1       reg 251 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias float32 ahead2       reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  WITNESS bias float32 fork_table   reg 255 stack 24 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2
+  WITNESS bias float32 ahead2_table reg 255 stack 0 local 0 shared 49152 | loop sync tt.load 5 async copies 0 async_wait 0 dots 2
+  COMPILE-WITNESS OK
+    _ev("J1 AHEAD COMPILE WITNESS (sm_80, w4 s3 tile 64, B 216):\n" + "\n".join(out))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED benchmarks/Efficiency/tests_cpu/test_j1.py::test_ahead_compile_witness
+1 failed, 25 deselected, 1 warning in 73.94s (0:01:13)

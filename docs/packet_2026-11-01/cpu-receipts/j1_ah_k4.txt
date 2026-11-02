@@ -1,0 +1,45 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+F                                                                        [100%]
+=================================== FAILURES ===================================
+__________________________ test_ahead_compile_witness __________________________
+
+    def test_ahead_compile_witness():
+        """CPU COMPILE WITNESS (no GPU, no launch): Triton 3.2 compiles the fia6 fork and the ahead copy for sm_80 (A100)
+        through JITFunction.warmup with a stand-in driver (target only); cuobjdump --dump-resource-usage reads registers,
+        stack and shared memory from the cubin; the TTGIR tile loop's synchronous tt.load / async copies are counted. MUST:
+        ahead 0 compiles to the fork's TTGIR and PTX (the flag off = the fork's code). REPORT: the rest (evidence for the
+        lead's GPU decision; timing is the GPU's)."""
+        if importlib.util.find_spec("triton") is None:
+            pytest.skip("triton is not installed")
+        env = {k: v for k, v in os.environ.items() if k != "TRITON_INTERPRET"}
+        env.update(PYTHONDONTWRITEBYTECODE="1", TRITON_CACHE_DIR=str(Path(os.environ.get("TMPDIR", "/tmp")) /
+                                                                      ("j1_ahead_cache_%d" % os.getpid())))
+        r = subprocess.run([sys.executable, "-c", COMPILE_CHILD, str(EFF / "fork_vllm_unified_attention.py"),
+                            str(ROOT / FORK_AHEAD)], env=env, cwd=str(ROOT), capture_output=True, text=True, timeout=3600)
+        out = r.stdout.strip().splitlines()
+>       assert r.returncode == 0 and out[-1:] == ["COMPILE-WITNESS OK"], (
+            "child exit %d\n--- stdout ---\n%s\n--- stderr ---\n%s" % (r.returncode, r.stdout[-4000:], r.stderr[-4000:]))
+E       AssertionError: child exit 1
+E         --- stdout ---
+E         
+E         --- stderr ---
+E           File "<string>", line 159
+E             for name, kern in (("fork", base), ("ahead0", a0), ("ahead1", compiled(FA, bias, True, ahead=1)),
+E         IndentationError: unexpected indent
+E         
+E       assert (1 == 0)
+E        +  where 1 = CompletedProcess(args=['/venv/nosa/bin/python', '-c', '\nimport os, re, subprocess, sys, importlib.util, tempfile\nass...("fork", base), ("ahead0", a0), ("ahead1", compiled(FA, bias, True, ahead=1)),\nIndentationError: unexpected indent\n').returncode
+
+benchmarks/Efficiency/tests_cpu/test_j1.py:1356: AssertionError
+=========================== short test summary info ============================
+FAILED benchmarks/Efficiency/tests_cpu/test_j1.py::test_ahead_compile_witness
+1 failed, 25 deselected in 3.64s

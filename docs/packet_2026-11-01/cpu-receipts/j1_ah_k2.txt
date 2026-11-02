@@ -1,0 +1,85 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+..F                                                                      [100%]
+=================================== FAILURES ===================================
+__________________________ test_ahead_compile_witness __________________________
+
+    def test_ahead_compile_witness():
+        """CPU COMPILE WITNESS (no GPU, no launch): Triton 3.2 compiles the fia6 fork and the ahead copy for sm_80 (A100)
+        through JITFunction.warmup with a stand-in driver (target only); cuobjdump --dump-resource-usage reads registers,
+        stack and shared memory from the cubin; the TTGIR tile loop's synchronous tt.load / async copies are counted. MUST:
+        ahead 0 compiles to the fork's TTGIR and PTX (the flag off = the fork's code). REPORT: the rest (evidence for the
+        lead's GPU decision; timing is the GPU's)."""
+        if importlib.util.find_spec("triton") is None:
+            pytest.skip("triton is not installed")
+        env = {k: v for k, v in os.environ.items() if k != "TRITON_INTERPRET"}
+        env.update(PYTHONDONTWRITEBYTECODE="1", TRITON_CACHE_DIR=str(Path(os.environ.get("TMPDIR", "/tmp")) /
+                                                                      ("j1_ahead_cache_%d" % os.getpid())))
+        r = subprocess.run([sys.executable, "-c", COMPILE_CHILD, str(EFF / "fork_vllm_unified_attention.py"),
+                            str(ROOT / FORK_AHEAD)], env=env, cwd=str(ROOT), capture_output=True, text=True, timeout=3600)
+        out = r.stdout.strip().splitlines()
+        assert r.returncode == 0 and out[-1:] == ["COMPILE-WITNESS OK"], (
+            "child exit %d\n--- stdout ---\n%s\n--- stderr ---\n%s" % (r.returncode, r.stdout[-4000:], r.stderr[-4000:]))
+>       assert [x for x in out if x.startswith("SAME_CODE")] and all(x.endswith(" True") for x in out
+                                                                     if x.startswith("SAME_CODE")), out
+E       AssertionError: ['SAME_CODE bias bfloat16 ahead0_vs_fork ttgir+sass (4096 instructions) False', 'WITNESS bias bfloat16 fork         re...at16 fork_table   reg 255 stack 24 local 0 shared 59392 | loop sync tt.load 3 async copies 5 async_wait 4 dots 2', ...]
+E       assert (['SAME_CODE bias bfloat16 ahead0_vs_fork ttgir+sass (4096 instructions) False', 'SAME_CODE bias float32 ahead0_vs_fork ttgir+sass (4096 instructions) False'] and False)
+E        +  where False = all(<generator object test_ahead_compile_witness.<locals>.<genexpr> at 0x7fcd2dbe77d0>)
+
+benchmarks/Efficiency/tests_cpu/test_j1.py:1316: AssertionError
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_ahead_copy
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1025: Evidence: J1 AHEAD COPY: 63 tagged lines, 8 re-indented fork lines
+    _ev("J1 AHEAD COPY: %d tagged lines, %d re-indented fork lines" % (len(tagged), len(moved)))
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_ahead_interp
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1170: Evidence: J1 AHEAD INTERP:
+  REF tile 64: max |fork - float64| 7.89e-08
+  EQ tile 64 bias ahead 0 build: bitwise True (0 differ)
+  EQ tile 64 bias ahead 0 table: bitwise True (0 differ)
+  EQ tile 64 bias ahead 1 build: bitwise True (0 differ)
+  EQ tile 64 bias ahead 1 table: bitwise True (0 differ)
+  EQ tile 64 bias ahead 2 build: bitwise True (0 differ)
+  EQ tile 64 bias ahead 2 table: bitwise True (0 differ)
+  PLANT stale page tile 64 bias: 6144 values differ
+  REPORT swapped order tile 64 bias: 2257 values differ, max |d| 5.96e-08
+  EQ tile 64 nobias ahead 0 build: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 0 table: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 1 build: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 1 table: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 2 build: bitwise True (0 differ)
+  EQ tile 64 nobias ahead 2 table: bitwise True (0 differ)
+  PLANT stale page tile 64 nobias: 6144 values differ
+  REPORT swapped order tile 64 nobias: 2200 values differ, max |d| 5.22e-08
+  REF tile 32: max |fork - float64| 7.57e-08
+  EQ tile 32 bias ahead 0 build: bitwise True (0 differ)
+  EQ tile 32 bias ahead 0 table: bitwise True (0 differ)
+  EQ tile 32 bias ahead 1 build: bitwise True (0 differ)
+  EQ tile 32 bias ahead 1 table: bitwise True (0 differ)
+  EQ tile 32 bias ahead 2 build: bitwise True (0 differ)
+  EQ tile 32 bias ahead 2 table: bitwise True (0 differ)
+  PLANT stale page tile 32 bias: 6144 values differ
+  REPORT swapped order tile 32 bias: 2208 values differ, max |d| 5.22e-08
+  EQ tile 32 nobias ahead 0 build: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 0 table: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 1 build: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 1 table: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 2 build: bitwise True (0 differ)
+  EQ tile 32 nobias ahead 2 table: bitwise True (0 differ)
+  PLANT stale page tile 32 nobias: 6144 values differ
+  REPORT swapped order tile 32 nobias: 2344 values differ, max |d| 4.47e-08
+  AHEAD-INTERP OK
+    _ev("J1 AHEAD INTERP:\n" + r.stdout.strip())
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED benchmarks/Efficiency/tests_cpu/test_j1.py::test_ahead_compile_witness
+1 failed, 2 passed, 23 deselected, 2 warnings in 95.69s (0:01:35)

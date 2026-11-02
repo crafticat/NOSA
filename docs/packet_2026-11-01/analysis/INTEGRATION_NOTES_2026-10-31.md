@@ -479,7 +479,10 @@ inside INT (the ST components are not separable inside INT: per-phase deltas vs 
 Values per round unless named; X = L4PTFDGUDKWCDX (same code, fetch off, store 257), B = L4PTFDGUDKWCDB, same job.
 Records: /mnt/beegfs/ojerbi/r2-runs/spec/bf1_b1_2195630_bf1b (nosi f2eba43: barrier + drop, 1 job per transport job,
 256-group chunks), bf1_b2_2195631_bf1b (c10bddf: defer + batch 8, one release per batch, 2048-group chunks),
-bf1_b3_2195631_bf1b (b051b42: b2 + the PIPELINE). Every run: 0 MUST failures (EQF bit-exact against L4PTFD).
+bf1_b3_2195631_bf1b (b051b42: b2 + the PIPELINE). CORRECTED (section 13): b1 had 3 MUST failures
+(L4PTFDGUDKWCDX-COMPILE, L4PTFDGUDKWCDX-COUNTS, L4PTFDGUDKWCDB-COUNTS: the gate-spec defects; bf1_b1_2195630_bf1b.step/
+stdout.txt "r2_bf1: 3 MUST gate(s) failed"; exit.txt exit=3; sacct FAILED 3:0). b2 and b3: 0 MUST failures (exit 0,
+sacct COMPLETED 0:0). EQF (bit-exact against L4PTFD) passed in all three runs, for B and X.
 
 | run | B / X tok/s | round B / X ms | NEW ratio | wait saving | joint B - X | draft B - X | worker per epoch | jobs late / deferred | host wait in J |
 |---|---|---|---|---|---|---|---|---|---|
@@ -524,8 +527,12 @@ WHAT WOULD MOVE IT (OPTIONS, not built; the lead stopped BF1 building this round
 - Take into a batch only jobs whose snapshot already completed (event query), so the worker never idles on the newest
   snapshot while older jobs wait: removes most of the 116 ms snapshot wait from the serial chain (MODEL S_J 0.79 ->
   about 0.4 GB, gain about +10 ms, x1.02).
-- In gilfree_pack.cpp (transport owner): overlap the next chunk's pack with the current chunk's H2D (b3 submit 2.73 ms per
-  1,581-group chunk = the copy itself: the copy runs synchronously inside the chunk loop): C++ stage 170 -> about 94 ms.
+- In gilfree_pack.cpp (transport owner): RETRACTED (section 13.1, row C3). The text said "the copy runs synchronously
+  inside the chunk loop". The source does not show that: the staging ring is pinned (r2_transport_gilfree_v3.py:192;
+  checked at gilfree_pack.cpp:280), the copy is non_blocking on the copy stream (gilfree_pack.cpp:636), and submit_ns
+  (gilfree_pack.cpp:619-653) also times the views, an event wait, two index_copy_ launches and two event records. The
+  elapsed time alone does not identify the blocking call (b2 2.17 vs b3 2.73 ms per chunk at the same 51.8 MB chunk).
+  This stays with the packer inspection.
 - Fewer bytes per round (S): the per-byte stages (pack, H2D, link in J) scale with S; only a selection with f clearly
   above 0.62 at the same useful bytes would help, and none is available from the counters (above).
 
@@ -533,3 +540,259 @@ STATUS: MEASURED (b1, b2, b3); MODEL calibrated on b2 and confirmed on b3; BF1 a
 the spread); C 128: no lever (cell docstring decision, MODEL 0.987-1.006). Dev commits: 4981010 (gates, batch, one
 release), 64e307f (tests), a329dc6 (pipeline), b451d91 (drop mode without the pipeline); CPU suites passed at
 a329dc6 except test_bf1_late[drop] (fixed in b451d91).
+
+## 13. BF1 readiness: diagnosis, the ready-only fix, the arrival counters (AREA 2; written 2026-11-02T09:36:26Z)
+
+Owner: BF (area 2). Source and CPU only; no GPU job ran for this section. Records: R = /mnt/beegfs/ojerbi/r2-runs/spec.
+b3 = R/bf1_b3_2195631_bf1b (nosi b051b42), b2 = R/bf1_b2_2195631_bf1b (c10bddf). Per-epoch values: report key
+worker_ms_per_epoch (210 epochs, 209 rounds); C++ values: report key transport (sums over the run, divided by 210).
+Line numbers: r2_bf1_fetch.py at b051b42 (the b3 code; the same file as b451d91), gilfree_pack.cpp and
+nosi/nosi/r2_transport_gilfree_v3.py at the same commit. Dev tree: /mnt/beegfs/ojerbi/nosi-r2-bf1-dev.
+
+### 13.1 Diagnosis: which call blocks, per stage
+
+Python worker thread (bf1-worker). One batch = up to 8 queued jobs (b3: 13,408 jobs in 2,589 batches = 5.18 jobs per
+batch, 12.3 batches per epoch).
+
+| row | stage | the call that blocks (file:line) | counter | b3 ms / epoch | b2 | avoidable? |
+|---|---|---|---|---|---|---|
+| P1 | snapshot wait | `self.snap_ev[s].synchronize()` under cap_lock, r2_bf1_fetch.py:814 (GIL released inside torch) | snap_s | 115.7 | 83.4 | PARTLY: see below |
+| P2 | select | numpy on the host under the GIL, :823-880; `ep.ev_map.synchronize()` :830 once per epoch (complete by then: recorded before the first snapshot in stream order) | select_s | 52.1 | 52.4 | no (work), 0.81 ms per job |
+| P3 | entry | `self.cv.wait(0.05)` while a deferred job holds the landing entry :898; `self.h2d_done[e].synchronize()` :902 | entry_s | 5.2 | 6.2 | small |
+| P4 | C++ wait | `jev.wait_submitted()` :944 -> NativePipe::wait_submitted, a condition-variable wait with the GIL released, gilfree_pack.cpp:772-778 | cxx_wait_s | 63.8 | (serial) | it exposes C3 / C4 |
+| P5 | issue | under cap_lock and the epoch lock :948; about 90 launches of the side commit `_commit` :978; GIL held | issue_s | 49.1 | 51.6 | no (work), 4.0 ms per batch |
+| P6 | glue | lexsort, item table, `h.tolist()` and NativePipe.submit :1012 (the submit itself only queues: gilfree_pack.cpp:355-388) | busy - sum | 25.3 | - | no |
+| C1 | C++ staging ring | `ev_h2d_[s].synchronize()` gilfree_pack.cpp:603 | transport.wait_ns | 1.26 | 0.24 | not a blocker |
+| C2 | C++ pack | OpenMP memcpy into the pinned slot, gilfree_pack.cpp:607-608 | transport.pack_ns | 94.5 | 93.2 | packer owner |
+| C3 | C++ submit | gilfree_pack.cpp:619-653: views, `ev_sc_[s].block` (stream wait), `ld.copy_(st, non_blocking)` :636 from the PINNED slot (allocated pinned at r2_transport_gilfree_v3.py:192, checked at gilfree_pack.cpp:280), two `index_copy_` launches :642-643, two event records | transport.submit_ns | 76.1 (2.73 ms per 1,581-group chunk) | 60.4 (2.17 ms per 1,586-group chunk) | NOT ESTABLISHED |
+| M1 | main thread, joint pass | `self.cv.wait(self.jwait_left)` in on_joint_layer :558 (a deferred job of a layer <= l not finished) | late_wait_s | 4.9 per round | 28.5 | partly (P1 feeds it) |
+| M2 | GPU, joint start | `current_stream().wait_event(last)` :503 (the barrier) | barrier_ms_median | 0.074 | 0.066 | no |
+
+C3, the blocking call is NOT ESTABLISHED. The source makes the copy asynchronous by contract (pinned source, non_blocking,
+own stream). The same chunk bytes took 2.17 ms (b2) and 2.73 ms (b3), so the time is not a fixed per-byte DMA time.
+Candidates that the records cannot separate: (a) the launch calls block (a full launch queue or the driver lock, while
+the main thread launches; b1 already showed about 1 ms per 256-group chunk, 8.4 MB, a per-call cost), (b) the copy call
+blocks. The counters that separate them: a host timer around the `copy_` call and around the two `index_copy_` calls
+inside release_impl, plus a timed event pair around the H2D on the copy stream. That is the packer inspection's work
+(not repeated here). Section 12 line 527-528 is retracted.
+
+P1, the LARGEST AVOIDABLE readiness / host cost on the worker. Mechanism (source): the host queues job (pass, layer)
+when it runs that draft layer's eager residency, ahead of the GPU; `_loop` takes every queued job of the epoch up to 8
+(:701-710) and `_prep` waits for EACH snapshot in order (:810-816), so the batch waits for its NEWEST snapshot. The
+PIPELINE then calls `_done(prev)` (:724) only after `_prep` (:716), so the previous batch's issue (its landing and
+commit) also waits behind that wait. Size: 9.4 ms per batch (115.7 / 12.3); the GPU makes one job per 2.94 ms
+(draft 188.1 ms / 64 jobs), so the newest-oldest spread of a 5.18-job batch is up to 12.3 ms. The records do not split
+the wait for the batch's OLDEST snapshot (not avoidable: no data yet) from the wait for the NEWER ones while the oldest
+was ready (avoidable). The split counters now exist: snap_first_s and snap_rest_s (13.2).
+
+What the records do NOT show (the round-level costs). B vs X in b3: draft +11.4 ms, joint +21.3 ms beyond the 35.6 ms
+wait saving (joint B - X = -14.3). The records cannot assign these to (i) the deferred commits on the compute stream in
+J, (ii) BF1 bytes that cross the link inside J beside the urgent gathers, (iii) the worker's GIL and launches beside
+the main thread, or (iv) M1. Also, "deferred" (54 % of jobs in b3) is a HOST-clock label: in the steady epochs
+inflight_at_close = 31 (the per_epoch records), i.e. at the host's close the GPU still runs D1, and the GPU barrier wait
+is 0.074 ms. So section 12's S_J = deferred share x S (0.79 GB) is a host proxy, not a measured GPU quantity. The new
+counters measure (i) consume.ms_per_joint_pass, (ii) bytes_sent_in_joint / bytes_useful_in_joint, (iii) host.draft /
+host.joint active ms, against the GPU deadlines.
+
+### 13.2 The fix (scoped): snap = "ready" (dev commit dd95b87 on b051b42; branch r2-bf1-dev, not pushed)
+
+r2_bf1_fetch.py `_loop_ready` (the b3 loop stays as `_loop_newest` for the same-job A/B):
+- The worker drains the queue into a local list (queue order). A batch takes only the leading jobs of one epoch whose
+  snapshot event is COMPLETE (`event.query()`, no wait; up to `batch`). Snapshots complete in stream order, so these are
+  a prefix.
+- No ready job: if the previous batch's C++ job was submitted, it issues that batch first. If that C++ job still runs,
+  it polls (1 ms, GIL released while asleep) for the first of the two (oldest snapshot, C++ submission). With nothing
+  else to do, it blocks on the OLDEST snapshot only.
+- The pipeline order (batch k's select and C++ release before batch k-1's issue), DROP (no pipeline), the carried jobs
+  and the stop are the b3 loop's.
+Lifetimes (unchanged rules, now in two named methods): `_read_snap` waits the slot's event, reads, then releases the
+slot to the main thread; `_stage_acquire` waits until no deferred job holds the entry and the entry's last H2D event
+completed, before the worker writes the pinned staging. Exactness: the fetch changes only WHEN bytes arrive; the item
+selection, the room rule, the commit and the store are the same code. EQF against L4PTFD in the CPU world for both loops.
+Reuse note: no new op; torch events (query / synchronize), the existing transport (NativePipe.submitted).
+Cell: new arm L4PTFDGUDKWCDR (= B with snap "ready"); B keeps `--bf-snap newest` (b3's loop, now with the counters).
+Step script: new cell bf1r (bf1b + R; STOPS while PRED_STAMP_BF1R is None), and bf1m now has R too.
+
+ARRIVAL counters (record key bf.arrival; cheap: two timing events per batch, one per joint layer, one index_put_ per
+commit, one scatter_add_ per joint pass, 32 KB of device counters per epoch + 5.2 MB pbid at B 318 X 257):
+- per batch: arrival event (direct: after its side commit; deferred: after its landing) and its items per layer.
+- per joint pass: a deadline event at each layer's residency start (on_joint_layer, compute stream); the USED tags
+  counted per (batch, layer) on the device.
+- report: items_sent_early / _late / _nodeadline, items_useful_early / _late (useful = the joint pass used the slot),
+  useful_early_share, bytes_*_in_joint (arrived after J's layer 0 started), margin_ms_useful / margin_ms_sent (p05, p50,
+  p95, min, max), late_ms_useful_mean, consume (deferred commits: GPU ms on the compute stream per joint pass), host
+  (the worker's busy / wait / active ms per epoch inside the host draft window and the host joint window).
+- worker counters: snap_first_s, snap_rest_s, ready_wait_s, polls, snap_unready_taken.
+- -BF gate (MUST) gains: useful_counted = used_store + used_win, items_sent_counted = items_sent, the useful split
+  closes; snap "ready": snap_unready_taken = 0.
+
+### 13.3 CPU tests and receipts
+
+Receipt (the whole BF suite at the commit, clean tree): /mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/bf1_dd95b87_t.txt and
+.txt.receipt: head dd95b870, status clean, SLURM 2250122 on thunder09 (amd), 2026-11-02T10:29:49Z -> 11:09:22Z,
+pytest_exit 0, 42 passed (the 28 older tests: no regression; 14 new or extended). A partial pre-commit run:
+bf1_dev1.txt (13 passed: gate 0, copy, pure, cell, step, report in every mode).
+Evidence lines (from the log):
+- (a) test_bf1_ready_only: ready: 120 jobs, unready taken 0 (oracle 0, record 0), polls 1,614, snap_rest_s 0.0;
+  CONTROL newest: unready taken 120 (oracle 120, record 120), snap_rest_s 113.6 ms per epoch. Note: with snapshots
+  0.3 s apart the ready loop made 120 batches of 1 job (issue_s 137.5 vs 0.07 ms per epoch): the per-batch cost risk
+  of 13.4 row A is real when the snapshots arrive slowly; the GPU run reports batches per epoch.
+- (b) test_bf1_lifetimes: ready and newest: 240 snapshot accesses, 190-240 staging writes, 0 violations, EQF and gates
+  pass. PLANTS caught: no_stage_wait -> 50 "staging reused before its H2D"; no_snap_wait -> 59 "snap read before its
+  event".
+- (c) test_bf1_arrival_modes: off: disabled, all 0. ce (drop / defer x newest / ready, gilfree once): 62 batches,
+  useful counted 299 = used store + window, sent counted = items_sent, early 461 / late 0 (the CPU world issues
+  before the joint pass), EQF and gates (with the new -BF closures) pass.
+- (d) test_bf1_arrival_late: stall 200 ms per job, defer: sent early 227 / late 234 = the independent count from the
+  raw clocks (227 / 234); useful early 151 / late 148; margin min -947 ms. CONTROL inline: early 461, late 0.
+- test_bf1_pipeline (newest, ready): pipelined 48, overlapped 47, EQF and gates pass in both loops.
+Not covered on the CPU: the CUDA event clocks, the stream order of the deadline events, the GPU cost of the counters.
+
+### 13.4 Options (MODEL from b3's counters; the lead decides the order)
+
+| option | removes | adds | expected gain per round (MODEL) | CPU-testable plumbing |
+|---|---|---|---|---|
+| A. ready-only snapshots (BUILT, 13.2) | the wait for newer snapshots (P1 rest) and the issue's wait behind it | smaller batches (more per-batch issue cost: 4.0 ms per batch) and 1 ms polls | arrivals earlier by about 9-14 ms per batch; at the end of the draft about 7.7 GB/s arrive (1.45 GB / 188 ms), so 0.07-0.11 GB leave J; at section 12's 22 ms/GB that is 1.5-2.4 ms, plus M1 (4.9 ms) partly: +2 .. +6 ms of 520: x1.004 .. x1.012 vs B | done (13.3) |
+| B. GPU-issued prefetch with the shipped zero-copy gather (lead's candidate; NOT built) | the whole host path: P1-P6 (311 ms per epoch) and C1-C3 (172 ms per epoch), the pinned staging (0.54 GB), the GIL contention (section 12: draft 6.2 ms + 2.5 ms per GB) | (1) SM time beside the drafts: the shipped op `flash_h2d_from_mask{,_bias}` has grid (B, H, M), one CTA per (b, h, block) (nosi/nosi/flash_cache_engine/flash_h2d_mask.py:79); each CTA holds its SM slot while its 16 KB cross PCIe. The only measured overlap of a side-stream SM gather with compute: 0.91-0.95 exposed (2026-09). 1.45 GB at 22-27.6 GB/s = 53-66 ms of link time: 48-63 ms exposed in the draft. (2) No CTA cap in the shipped op: a launch with k valid ids still schedules the whole grid (ids < 0 return at :34-35); into the store the grid is (B, H, X) = 654k programs per launch (as the keep fill, benchmarks/Efficiency/r2_i4d_keep.py:478-479); a cap of k = 32 valid ids per launch needs about 22 launches per draft layer per op, 2.8k per round, about 56-112 ms of Python launch time unless they are captured into the draft graphs; a persistent kernel with a grid cap is a NEW kernel (not allowed). (3) the select on the device without a host sync (dedup, room rule, rank): MODEL 6-13 ms of GPU time per round. (4) J must wait the side stream at its start (the map has one writer stream between joint passes): no defer. | at the measured exposure: +35.6 - (48..63) - (6..13) - (0..10) = -47 .. -18 ms: x0.91 .. x0.97 vs X. IF a k-capped launch overlaps like the copy engine (exposure 0.05): +13 .. +27 ms: x1.025 .. x1.05 vs X (launch cost hidden only in a graph). | device select = host select (store_room, group_rank) on random maps; the CPU gather fakes of the world (W.KERNELS gather_k / gather_v_bias) into the store: EQF, the byte checks, the plants. The stream order and the barrier are GPU-only. |
+| C. C++ submit (C3) | 76 ms per epoch of C++ time, if the launch calls block | - | packer inspection owns it | - |
+
+RANKING: A first (built; low risk; its run also measures the J-side terms that B must beat). B ranks BELOW A on the
+only measured exposure; it has the higher ceiling. Gate for B, one GPU microbenchmark with the SHIPPED op only (no new
+kernel): `flash_h2d_from_mask` on a side stream beside a draft-graph replay at C 73 B 318, k valid ids per launch, k in
+{16, 64, 256, all}: the exposed fraction and the achieved GB/s. Build B only if the exposure is <= 0.2 at >= 15 GB/s.
+Ordering and lifetimes for B (source check): the slot choice and the gathers run in one side-stream order, which is the
+map's only writer between joint passes (as now: the drafts never read the store or the map, r2_bf1_fetch.py module
+docstring); J(r + 1) waits the side stream's last event before keep_assign, so the eviction never takes a slot with a
+pending gather; the side stream waits an event recorded at the draft layer, after the write-back of the host rows in
+stream order; the host rows are pinned and live for the run.
+
+### 13.5 Proposed GPU protocol and bands (for the lead; NOT registered)
+
+0. The run tree /mnt/beegfs/ojerbi/nosi-r2-bf1 (lead only) is at b051b42; dd95b87 is its child (a fast-forward).
+1. DRYRUN=1 bash benchmarks/Efficiency/r2_bf1_step.sh --nosi <commit> <holder> <run> bf1m, then bf1m (the miniature, B 8,
+   every gate MUST; R and B with the arrival counters, --check-every 1: the keep's byte checks cover R's blocks).
+   Inspect: R-EQF, R-BF (snap_unready_taken 0, the closures), arrival block present for B and R.
+2. Register PRED_BF1R_BY_B[318] and PRED_STAMP_BF1R (`date -u`) in a commit; then bf1r (7 parts; STEP_MIN 230 from
+   b3's 01:46:29 for 6 parts = 17.7 min per part: 124 min, margin 1.85; --mem 340G).
+Bands (MODEL; A's row above; b3: B / X 1.0049, joint saving 14.3 ms, draft ratio 1.0645, snap 115.7 ms):
+- BF1R_vs_B (0.998, 1.015); BF1R_vs_X (1.000, 1.022).
+- BF1R_joint_saving (12, 24) ms (b3 B: 14.3; + 2 .. 6).
+- BF1R_draft_ratio (1.03, 1.08) (unchanged work in the draft).
+- BF1R_useful_early (0.80, 1.00): the GPU deadlines are generous (D1 layer l: snapshot at 94 + 2.94 l ms, deadline at
+  196 + 10.1 l ms after the draft start; slack 102 + 7.2 l ms vs a worker latency of 40-60 ms).
+- BF1R_snap_rest_ms (40, 110) ms per epoch, measured on B (0.35-0.95 of b3's 115.7).
+REPORT-only: R snap_rest_s < 1 ms per epoch; R batches per epoch 12 .. 25 (smaller batches); B and R
+bytes_sent_in_joint; consume ms per joint pass; host.joint.active ms. DECISION after bf1r: if R / B < 1.005, ready-only
+is not the lever; the arrival block then names the J-side term to attack ((i) consume, (ii) in-J bytes, (iii) host).
+
+## 14. j1f source follow-up and the fork edit plan (AREA 1, J owner; written 2026-11-02T10:24:03Z)
+
+Dev tree /mnt/beegfs/ojerbi/nosi-r2-j1-dev, branch r2-j1-dev. Commits (not pushed): 48da64d (14.1), 8951bc3 (14.3).
+The run tree /mnt/beegfs/ojerbi/nosi-r2-j1 is not touched. No grant, no band.
+
+### 14.1 j1f source follow-up (reviewer finding on r2_j1_forkbench.py)
+
+- NUM: `num_check` applies torch.isfinite to the output, to the float64 reference and to their difference BEFORE
+  the max. A row with a non-finite value does not enter the max. `num_verdict` FAILS with the count and the first index
+  (request, row, head, dim); a variant with no checked row also FAILS. The variant becomes INVALID in the ratios.
+- EXACT: `repeat_check` needs bit equality AND only finite values in both outputs (identical NaN bits now FAIL).
+- Timing: the four flash controls (NS1R1, NS1x4, FLASHU1, NSRU) timed the wrapper plus an output copy_ (FORK writes its
+  preallocated output directly). Each control now has three variants. X = the library op
+  flash_attn_2_cuda_nosa.fwd_kvcache (the op that flash_attn_with_kvcache calls; the wrapper passes None at its out_
+  argument) with out_ = a view of the preallocated output in the op's swapped (B, HQ/HKV, HKV, HD) layout: option (a),
+  kernel-only. X_CP = the j1f form (wrapper + copy_): total. X_CO = the copy_ alone. New MUST gate <shape>-X-OUTEQ:
+  X = X_CP bit for bit. The record adds `flash_timing` (kernel, copy, total, rest) per control and the j1f-form ratios
+  (FORK1R/NS1R1_CP etc.). The timing loop moved to `time_variants` (timer injected; `cuda_timer` on the GPU).
+- I do not re-score the old numbers. j1f's per-byte ratios (FORK1R / NS1R1 1.134 / 0.975) need the rerun below.
+- CPU tests (tests_cpu/test_j1.py): test_forkbench_nonfinite (NaN, +Inf, -Inf planted in the output, the reference and
+  both, 3 variants: every plant FAILS the new NUM; the j1f source loaded from git at cd0e286 PASSED 15 of the 27
+  plants, the identical-NaN plant included: the control is not a no-op; identical non-finite bits pass the old EXACT
+  and FAIL `repeat_check`), test_forkbench_out_view (the view = the op's own return transform; the call's 21 positional
+  arguments = the installed wrapper's, out_ at position 13), test_forkbench_timing_plumbing (fake timer).
+- Receipts (/mnt/beegfs/ojerbi/kstep-cpu-runs/cpu-logs/): j1_48da64d_t (test_j1.py: 22 passed, 1 skipped = the DRYRUN,
+  which needs a clean run-tree checkout), j1_48da64d_g0 (Gate 0 of the 15 older files: 37 passed).
+- OBSERVATION (INFERENCE, not changed): NUM's TOL 1e-3 is about the size of the outputs (x 0.05 inputs: about 8e-4
+  per element). j1f's errors were 8.3e-6 .. 1.0e-5. A mask that adds or drops 3 pages of about 64 changes outputs by
+  about 1e-4 .. 7e-4 (MODEL), so NUM may not see it. A TOL of 1e-4 keeps 10x margin over the measured errors.
+
+### 14.2 GPU rerun protocol (lead; same shapes as j1f)
+
+1. Bring r2-j1-dev at 8951bc3 into the run tree (lead's merge), set GRANT_j1f in r2_j1_forkbench.py (date -u stamp).
+2. `bash benchmarks/Efficiency/r2_j1_step.sh --nosi <sha> <holder> <run id> j1f` (DRYRUN=1 first). The step script
+   passes the j1f arguments unchanged: --shapes 128:216,73:318 --segments 2,4,8 --layers 32 --reps 10 --warmup 2
+   --seed 7 --sample 8 --max-shape-s 300 --max-run-s 900. Variants per shape: 22 (j1f: 10). MODEL wall: about 2.3x
+   j1f's 42.7 / 11.1 s per shape, inside 300 s; STEP_MIN 25 unchanged.
+3. Read, in this order: every MUST gate (the new NUM non-finite text, EXACT, OUTEQ, FORKAn-EQ); then FORK1R/NS1R1_CP
+   and FORK/FLASHU1_CP (they must reproduce j1f's 1.134 / 0.975 and FORK - FLASHU1 within the run spread: if not, the
+   setup moved and nothing is re-scored); then FORK1R/NS1R1 and FORK/FLASHU1 (direct write) = the re-scored per-byte
+   numbers; the FLASHT lines (kernel-only, copy-only, total, rest per control); FORKAn/FORK (14.3).
+
+### 14.3 The fork edit plan (lead's request; the 4-row tile is latency / occupancy-bound, not compute-bound)
+
+MEASURED inputs (SCORING_fia5.md sections 2-5): 255 registers, 59392 B shared memory, 2 programs per SM (both limits),
+8 warps per SM; in the tile loop three synchronous loads before the first dot (page ids in the MMA layout, ext_rows,
+the bias); the K / V copies of tile j + 1 start after both dots and the same iteration waits for them; 8.1 us per tile
+(bf16 bias); stalls: wait 33 %, long scoreboard 27 %. Bits: num_stages and the bias width do not change the bits;
+num_warps 8 at tile 64 does (851 / 854 / 127 rows equal); tile 32 does (0 rows equal).
+The lead's arithmetic checks (DERIVED): 2 x 64 x 64 x 128 x 2 = 2.1 MFLOP per tile = 0.73 us at 312 TF / 108 SM;
+K + V 32 KB = 1.7 us at the per-SM share of HBM; 8.1 us / 2 programs = about 4 us per tile slot.
+
+| edit | target | same reduction order and bits? | status |
+|---|---|---|---|
+| A1 ahead=1: page id + extents word of tile j + 2 read in iteration j, as scalars | 2 of the 3 synchronous loads | YES: the same values reach the same ops; dots, softmax, stores are the fork's lines | BUILT (flag) |
+| A2 ahead=2: A1 + the bias of tile j + 1 read in iteration j | the third synchronous load | YES (as A1) | BUILT (flag) |
+| A3 ahead=3: the fork's page-id / ext_t vector loads kept (for Triton's K / V staging), ext_rows + bias ahead | as A2, keep the async K / V copies | YES (as A1) | BUILT (flag) |
+| B1 skip acc x alpha when every alpha = 1 | 64 FMUL per thread per tile | YES (x 1.0 is exact) | NOT BUILT: not on the measured chain |
+| B2 reload Q per tile | registers | YES (same values) | NOT BUILT: Q is live at the QK dot anyway (no peak relief); adds a conversion per tile |
+| B3 num_stages / bf16 bias | staging | YES (fia5 MEASURED) | DONE by fia5 (bf16 shipped; s4 = 1 program per SM, slower) |
+| C1 num_warps 8 at the 64-row tile | occupancy | NO (fia5 MEASURED: rows differ) | NEEDS A HUMAN DECISION (also +21-31 % slower at B 216) |
+| C2 tile 32 | registers | NO (fia5 MEASURED: 0 rows equal) | NEEDS A HUMAN DECISION (slower) |
+| C3 split the 64 rows over 2 programs (BLOCK_Q 2, 32 rows) | registers -> up to 4 programs per SM | UNPROVEN: the MMA warp layout for M 32 changes the row-sum tree unless num_warps 2; each tile read twice; extents byte offset per q block; a shared union build | NEEDS A HUMAN DECISION |
+| C4 fold the scale into Q (S = Q'K + bias x scale) | one 64x64 multiply per tile | NO (other rounding) | NEEDS A HUMAN DECISION |
+| C5 exp2 with log2(e) folded | MUFU | NO | NEEDS A HUMAN DECISION |
+| C6 3D split | waves | NO (loses EXACT; j1f MEASURED 1.23-1.46x slower) | rejected (j1f) |
+Occupancy: 3 programs per SM need <= 168 registers and <= 54 KB shared. Every source route found to that (C1-C3)
+changes the MMA layout or the tile, so it changes bits or is unproven. Within the bit constraint the lever is the
+per-tile chain of dependent loads (A1-A3).
+
+Implementation: /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/fork_vllm_unified_attention_ahead.py = the
+fia6 fork (blob f0dc0c18, NOT changed) + lines tagged [ahead]. A sibling file keeps the fia6 pins of 15 step scripts
+and the Gate-0 tests valid (an in-place edit changes the blob they pin). Launch flag `ahead` (constexpr AHEAD), default
+0. Declared in the J1 line of the 15 older Gate-0 tests and in r2_j1_step.sh's tracked-file list. r2_j1_forkbench.py:
+variants FORKA1 / FORKA2 / FORKA3 (production mode, union built in the kernel) with the MUST gate <shape>-FORKAn-EQ
+(bit-equal to FORK) and the ratios FORKAn/FORK.
+
+CPU results (receipts j1_ah_k6, j1_8951bc3_t):
+- test_ahead_copy: the file = the fork + 67 tagged lines; 8 fork lines only re-indented (into the `else` branches).
+- test_ahead_interp (TRITON_INTERPRET=1; heads 32 / 2, dim 128, block 64; 2 requests x 4 rows, shifted pages, union 8,
+  partial last pages, a NaN page behind the tables' tail): ahead 0, 1, 2, 3 = the fork BIT FOR BIT in 32 of 32 cases
+  (union built and read, bias on / off, tile 64 / 32); fork vs float64 7.9e-8; PLANT stale page (tile j reads tile
+  j + 1's page): 6144 values differ (DETECTED); swapped tile order: 2200-2344 values differ at 5e-8 (the bits see the
+  order). LIMIT: the interpreter runs numpy. It shows the same values in the same operations, not the GPU code
+  generator's reduction order.
+- test_ahead_compile_witness (NEW METHOD, no GPU: Triton 3.2 compiles both files for sm_80 through JIT warmup with a
+  stand-in driver; cuobjdump reads the cubin; production launch w4 s3 tile 64, B 216). It reproduces fia5's FV
+  resources (255 registers, 59392 B shared):
+
+| arm (bf16 bias; f32 the same) | registers | stack B | shared B | loop: sync tt.load / async copies / async_wait |
+|---|---|---|---|---|
+| fork (fia6) | 255 | 48 | 59392 | 3 / 5 / 4 |
+| ahead 0 | 255 | 48 | 59392 | 3 / 5 / 4 |
+| ahead 1 | 251 | 0 | 49152 | 5 / 0 / 0 |
+| ahead 2 | 255 | 0 | 49152 | 5 / 0 / 0 |
+| ahead 3 | 255 | 0 | 49152 | 8 / 0 / 0 |
+| fork, tables read | 255 | 24 | 59392 | 3 / 5 / 4 |
+
+  FINDINGS: (1) any load carried across iterations makes Triton 3.2's pipeliner drop the K / V async copies (all three
+  levels, A3 included): K / V become plain loads. The spills go (stack 48 -> 0) and shared memory falls to 48 KB, but
+  registers stay at 251-255, so the SM still holds 2 programs. The fork's own copies did not overlap the dots either
+  (fia5 TTGIR), so the GPU timing decides. (2) ahead 0 has the fork's TTGIR (MUST, PASS). Its bf16 PTX and SASS differ
+  from the fork's (register numbering) with line info and are IDENTICAL without line info (TRITON_DISABLE_LINE_INFO=1);
+  a byte copy of the fork at another path (same line numbers) is identical. So shifting source lines alone changes
+  the bf16 machine code. The bits are therefore a GPU question for every arm, ahead 0 included: FORKAn-EQ.
+- Suites at 8951bc3: j1_8951bc3_t (test_j1.py: 25 passed, 1 skipped = the DRYRUN), j1_8951bc3_g0 (37 passed).
+
+NEXT (lead, GPU): the 14.2 run also times FORKA1-3. Decision rule (proposal): keep a level only if FORKAn-EQ passes at
+both shapes AND FORKAn/FORK <= 0.97 at both (the run spread is about 1 %). Then a production plumbing step (verify_rows
+passes `ahead`) and a j1a / j1b EQF run against L4PTFD; folding the [ahead] lines into the fork (a new blob) needs the
+human's re-pin decision.

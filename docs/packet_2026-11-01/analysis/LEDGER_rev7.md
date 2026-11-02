@@ -661,7 +661,7 @@ Values C128 B216 / C73 B318 (BEST arm) unless stated; the section-1 row in [ ]. 
 | Tround | 232.48 anchor; 187.40 / 263.41 | 324.9 / 524.7 ms (BEST; DERIVED: 216 x 2.894 / 1,924.1 tok/s; 318 x 2.803 / 1,699.0) | +137.5 / +261.3 | the rows above | LEAD (integration) | MEASURED INT rounds (median, steady): C128 B216 298.7 ms (inta; was 325.1), C73 B318 483.8 ms without BF1 (intd; was 521.9 in the same job) and the batched BF1 version (intb), the anchor C81 B287 434.4 ms (intc) vs the model's 232.48 (x1.87). The serial corrected model (section 15.4) predicts the anchor within 1-6 % |
 | B | 287 anchor; AUTHOR fit 287.95 (device-used basis) | B216 / B318 RAN; B351 OOM at C73; C81 MISSING (r7mem); temporal peaks, tentative / landing / union buffers, snapshots, allocator slack and rejection transients per row 7 | basis-dependent | device-used vs allocated bases; weight storage is not per-pass traffic | ST (one-basis table, physical fit at C81) | ST one-basis table (DERIVED from the I4M fit lines and the arena record, 2026-10-31): the engine slots agree to 1 MB (58.66 / 49.54 GB); the model's excess over our allocated peak is its harness's restore snapshot (4.21 / 6.20 GB), allocator slack (3.01 / 5.61) and outside-allocator memory (1.03 / 1.12); we carry the store + CB0 (1.85 / 2.72 GB) and a FIXED prefill transient of 2.565 GB (the intercept difference of the prefill and decode lines, equal at C128 and C73; MODEL cause: one 16,129-token request's activations). CORRECTION: the "prefill transient 20.19 MB per request" label (R3) is the persistent per-request non-arena state (compressed KV tables + selection). Without the transient (MLP chunking in the prefill: an option, not built; it moves SH equally): B fit 216 -> 220 at C128 (+1.1 % MODEL), 352 -> 355 at C73. C81 MEASURED (r7mem, R/recon7_mem1_2195630_r7mem, nosi 6d711c4, 0 MUST failures; L4PTFD, allocated basis): prefill line 19.0201 + 0.2013312 B GB, decode line 16.4542 + 0.2070437 B (B64: 31.905 / 29.705; B192: 57.676 / 56.207 GB); B_fit 322 at 84.0 GB with 0.10 GB margin, 321 at 83.75; the anchor B287 peaks at 76.80 GB: B287 FITS our layout (allocated basis) with 7.2 GB to spare. The AUTHOR rule (device-used basis, with the harness's snapshot and slack) gives 287.95: the difference is the basis, not our layout |
 | Y | 3 accepted | 2.889 / 2.780 accepted; committed 2.894 / 2.803 [8] | -3.7 % / -7.3 % | live rejects | ST | QUANTITATIVE EXPLANATION: the same as row n (live reject rate p 2.81 / 4.03 % per group; no change without the verify-K-1 restart). Every INT arm keeps the plain arm's acceptance record bit-equal (intd: accepted 160,248 of 162,816 committed, same as L4PTFD) |
-| Q | Q_accepted 3,703.54 anchor; 3,457.9 / 3,621.8 | COMMITTED 1,924.1 / 1,699.0 tok/s (BEST); ACCEPTED-basis 1,920.8 / 1,685.0 (DERIVED x 2.889 / 2.894, x 2.780 / 2.803); strongest cached NOSA 3,426.2 (C128) | 0.562x the strongest at C128 | the rows above | LEAD | C128 B216 after J1 F1 + F2 + F3 (j1a, same job): 2,035.3 tok/s = 0.611x the same-job SH (3,329.1), 0.597x the strongest whole-step graph 3,407.2 (round 307.3 ms vs 327.4). INTEGRATED C128 MEASURED inta (R/int_a1_2195630_inta, nosi 5418a3a, B216, 0 MUST failures; registered 17:03:19Z, every band CONFIRMED): L4PTFDGUDCDI (F1 + F2 + F6 + F3 + ST1 + ST2 + ST4) 2,096.1 vs L4PTFDGUDCD 1,923.0 tok/s = x1.090; round 325.1 -> 298.7 ms (joint -16.8, draft -7.1, commit -2.7); 0.622x the same-job SH (3,367.9), 0.600x SHJ1, 0.615x the strongest whole-step graph 3,407.2. ANCHOR C81 B287 MEASURED (intc, 0 MUST failures): INTEGRATED 1,854.8 tok/s (round 434.4 ms) vs the same-job SH 2,816.3 tok/s = 0.659x; vs Q_accepted 3,703.5 predicted: 0.50x; the predicted +17.17 % over 3,160.8 is measured as 0.587x of that reference and 0.659x of the anchor's own baseline (section 15.4b). INTEGRATED C73 B318 MEASURED (intb, R/int_b1_2195630_intb, nosi 9aa2171, 0 MUST failures): L4PTFDGUDKWCDI (F1 + F2 + F6 + ST1 + ST2 + ST3 + ST4 + batched BF1) 1,821.0 vs L4PTFDGUDKWCD 1,706.4 tok/s = x1.0672 (band 1.097-1.179 REFUTED low: the batched BF1 adds about 9.8 ms of host contention to the drafts, the draft saving falls to 0.87 ms); 0.708x the same-job SH 2,573.3; ST3 alone x1.0109 (joint -5.45 ms, CONFIRMED). C73 B318 WITHOUT BF1 MEASURED (intd, R/int_d1_2195630_intd, nosi b9031c9, 0 MUST failures; bands registered 22:01:20Z, every band CONFIRMED): L4PTFDGUDKWCDIN (F1 + F2 + F6 + ST1 + ST2 + ST3 + ST4) 1,843.2 vs L4PTFDGUDKWCD 1,706.2 tok/s = x1.0803; round 521.9 -> 483.8 ms (joint -24.8, draft -9.7, commit -4.3); 0.716x the same-job SH (2,573.9), 0.693x SHJ1, 0.541x the strongest 3,407.2; x1.012 over the batched-BF1 INT arm of intb (1,821.0): BF1 not adopted. The best MEASURED specKV throughput under the 84 GB cap: 2,096.1 tok/s at C128 B216 (inta) = 0.615x the strongest cached NOSA 3,407.2 |
+| Q | Q_accepted 3,703.54 anchor; 3,457.9 / 3,621.8 | COMMITTED 1,924.1 / 1,699.0 tok/s (BEST); ACCEPTED-basis 1,920.8 / 1,685.0 (DERIVED x 2.889 / 2.894, x 2.780 / 2.803); strongest cached NOSA 3,426.2 (C128) | 0.562x the strongest at C128 | the rows above | LEAD | C128 B216 after J1 F1 + F2 + F3 (j1a, same job): 2,035.3 tok/s = 0.611x the same-job SH (3,329.1), 0.597x the strongest whole-step graph 3,407.2 (round 307.3 ms vs 327.4). INTEGRATED C128 MEASURED inta (R/int_a1_2195630_inta, nosi 5418a3a, B216, 0 MUST failures; registered 17:03:19Z, every band CONFIRMED): L4PTFDGUDCDI (F1 + F2 + F6 + F3 + ST1 + ST2 + ST4) 2,096.1 vs L4PTFDGUDCD 1,923.0 tok/s = x1.090; round 325.1 -> 298.7 ms (joint -16.8, draft -7.1, commit -2.7); 0.622x the same-job SH (3,367.9), 0.600x SHJ1, 0.615x the strongest whole-step graph 3,407.2. ANCHOR C81 B287 MEASURED (intc, 0 MUST failures): INTEGRATED 1,854.8 tok/s (round 434.4 ms) vs the same-job SH 2,816.3 tok/s = 0.659x; vs Q_accepted 3,703.5 predicted: 0.50x; the predicted +17.17 % over 3,160.8 is measured as 0.587x of that reference and 0.659x of the anchor's own baseline (section 15.4b). INTEGRATED C73 B318 MEASURED (intb, R/int_b1_2195630_intb, nosi 9aa2171, 0 MUST failures): L4PTFDGUDKWCDI (F1 + F2 + F6 + ST1 + ST2 + ST3 + ST4 + batched BF1) 1,821.0 vs L4PTFDGUDKWCD 1,706.4 tok/s = x1.0672 (band 1.097-1.179 REFUTED low: the batched BF1 adds about 9.8 ms of host contention to the drafts, the draft saving falls to 0.87 ms); 0.708x the same-job SH 2,573.3; ST3 alone x1.0109 (joint -5.45 ms, CONFIRMED). C73 B318 WITHOUT BF1 MEASURED (intd, R/int_d1_2195630_intd, nosi b9031c9, 0 MUST failures; bands registered 22:01:20Z, every band CONFIRMED): L4PTFDGUDKWCDIN (F1 + F2 + F6 + ST1 + ST2 + ST3 + ST4) 1,843.2 vs L4PTFDGUDKWCD 1,706.2 tok/s = x1.0803; round 521.9 -> 483.8 ms (joint -24.8, draft -9.7, commit -4.3); 0.716x the same-job SH (2,573.9), 0.693x SHJ1, 0.541x the strongest 3,407.2; x1.012 over the batched-BF1 INT arm of intb (1,821.0): BF1 not adopted. The best MEASURED specKV throughput under the 84 GB cap: 2,096.1 tok/s at C128 B216 (inta) = 0.5995x the matched optimized baseline SHJ1 of the same job (CONFIRMED; SHJ1 about 3,496 tok/s DERIVED, section 16) and 0.615x the FROZEN reference 3,407.2 (not demonstrably the strongest baseline: SHJ1 exceeds it). Committed throughput, not Q_accepted (section 16) |
 
 ## 15. The dependency-feasible round and the corrected model (LEAD; stamp 2026-10-31T15:07:54Z from `date -u`)
 
@@ -712,8 +712,9 @@ bands registered 19:32:23Z before the run). SH (the shipped baseline, same job):
 (the 15.2 extrapolation said 97.9 ms; the original reference 3,160.8 tok/s = 90.80 ms per step). Arms (committed tok/s,
 round ms): L4PTFD 1,604.5 / 502.6; L4PTFDGUDC 1,692.6 / 476.6; L4PTFDGUDCD 1,717.9 / 469.0; INTEGRATED L4PTFDGUDCDI
 1,854.8 / 434.4 (x1.0797 over L4PTFDGUDCD, CONFIRMED; joint -21.1, draft -10.2, commit -3.9 ms, all CONFIRMED; peak
-76.82 GB CONFIRMED). Against the baseline: 0.659x SH (REFUTED low vs the band 0.67-0.73: D / SH at C81 measured 0.610,
-below the interpolated 0.62-0.66), 0.637x SHJ1, 0.544x the strongest at C128 (3,407.2). Against the original model:
+76.82 GB CONFIRMED). Against the baseline: THREE baseline-relative bands REFUTED low: INT-RATIO 0.6586 vs SH (band
+0.67-0.73: D / SH at C81 measured 0.610, below the interpolated 0.62-0.66), INT-VS-SHJ1 0.6369 (band 0.64-0.70),
+INT-VS-STRONGEST 0.5444 vs the frozen reference 3,407.2 (band 0.57-0.63). The MUST gates passed. Against the original model:
 round 434.4 vs 232.48 ms (x1.87); Q committed 1,854.8 vs Q_accepted 3,703.5 (0.50x); vs the old reference 3,160.8:
 0.587x, against the predicted +17.17 %.
 The corrected round of 15.4 checked at the anchor: the draft step 80.25 ms = 1.163 td (inside the 1.10-1.17 used);
@@ -731,11 +732,96 @@ feasible throughput under 84 GB at the same workload (C73 B318 is the configurat
 15.6 RESULT (stamp 2026-11-01T00:12:44Z from `date -u`; all four INT cells passed every MUST gate, committed tokens
 bit-equal to the plain arm). Best measured specKV per configuration (committed tok/s; vs the same-job SH):
 C128 B216 2,096.1 (inta; 0.622x); C81 B287 1,854.8 (intc; 0.659x); C73 B318 1,843.2 (intd, no BF1; 0.716x).
-The best demonstrated specKV under the 84 GB cap is 2,096.1 tok/s = 0.615x the strongest cached NOSA (3,407.2,
-C128 whole-step graph). It does NOT beat the strongest. Term by term (section 14): the fixes realized the bit-exact
-savings their bands predicted (x1.08-1.09 per configuration); the gap that stays is P2. The original expression hides
-verification (dense G(BK), the 4-row attention, verify-row selection, state) and the transfer under two maxima; X1
-shows no stream overlap for these kernels, j1f shows the 4-row tile costs +57-60 % beyond the bytes, and the measured
-draft-issued prefetch reaches only break-even (bf1b b3 x1.0049). The serial corrected model (15.4) predicts the
-measured anchor round within 1-6 %. Routes left: fused in-kernel overlap (new kernels: out of scope) and the human
-decisions in the handoff.
+CONCLUSION (corrected after review 4, section 16): THIS TESTED IMPLEMENTATION MISSES THE ORIGINAL FORECAST, WITH
+SEVERAL MECHANISMS STILL OPEN. The best demonstrated specKV under the 84 GB cap is 2,096.1 committed tok/s (inta) =
+0.5995x the matched optimized baseline SHJ1 of the same job and 0.615x the FROZEN reference 3,407.2 (a reference, not
+demonstrably the strongest baseline). At the anchor: round 434.4 ms vs 232.48 predicted; the joint region alone 269.5 ms
+vs an inferred budget of 88.07 ms (section 16.1). The fixes realized the bit-exact savings their bands predicted
+(x1.08-1.09 per configuration). What the tested implementation shows: verification and the transfer did not hide under
+the two maxima in the TESTED schedule (X1: the tested fixed-shape stream combinations do not overlap; the measured
+draft-issued prefetch reached break-even, b3 x1.0049). What is NOT shown: that no joint implementation can do better
+(the one-row attention control does not prove four-row optimality; other overlap mechanisms were not tested), and that
+the remaining host / readiness cost of the fetch is irreducible (ready-only snapshot batching and the transport are
+unbuilt). Open terms: physical live HBM bytes (ncu), the two PHASE-SUM failures (r7pa, r7pb), INT-ADDITIVITY (REPORT
+with parts {} and product None: not tested), SHJ1 memory (not recorded), FAST / target correctness (section 16.3).
+
+## 16. Review 4 corrections (asynchronous review 2026-11-02; stamp 2026-11-02T09:16:22Z from `date -u`)
+
+16.1 THE ACTUAL COMPARISON AT THE ANCHOR (intc, R/int_c1_2195631_intc, nosi 0567860; 0 MUST failures). Round median
+434.388 ms vs 232.48 predicted. Phases (medians, steady rounds): draft 160.493 (two standalone one-row drafts, 80.246
+each), joint 269.513, commit 4.043, reset 0.161 (sum 434.21). The joint region is 269.5 ms against an inferred budget
+of 88.07 ms (review 4's figure; the lead's bracket for the same quantity: Tround minus two standalone drafts charged
+at td (1 + s) = 82.5 ms, at td = 94.5 ms). This is a whole-region comparison, not an attention-kernel ratio. intc
+REFUTED three baseline-relative bands (INT-RATIO 0.6586, INT-VS-SHJ1 0.6369, INT-VS-STRONGEST 0.5444; section 15.4b)
+while every MUST gate passed.
+
+16.2 THE BASELINE. inta's matched optimized baseline SHJ1 (SH with the compiled pooling, same job): INT / SHJ1 =
+0.5995 (CONFIRMED, band 0.594-0.613). SHJ1's steady rate is NOT serialized in inta's summary.json (the INT cell keeps
+J1C.SH_J1["result"] only in memory; r2_int_cell.py:388-391); DERIVED from the printed ratio: 2,096.1 / 0.5995 = 3,496.4
+tok/s (3,496.0-3,496.7 from the rounding of both inputs). SHJ1 memory: NOT RECORDED. Same derivation: intc SHJ1 about
+2,912 (1,854.8 / 0.6369), intd about 2,659 (1,843.2 / 0.6933). So 3,407.2 is a FROZEN REFERENCE (an earlier whole-step
+graph run), not demonstrably the strongest baseline; every "x the strongest" in this ledger reads "x the frozen
+reference 3,407.2".
+
+16.3 Y AND CORRECTNESS, SEPARATED.
+- Accepted-draft Y vs committed throughput: the expression's Q_accepted = 1000 B Y / Tround counts ACCEPTED drafts per
+  round (Y = 3 assumed). Every measured rate here is COMMITTED tokens per second, the median of the per-round rates in
+  the steady window. At the anchor the record holds accepted 144,682 vs committed 146,944 tokens (EQF line, all
+  rounds, incl. the warm 287); the per-round numerators and windows are in summary.json (packet chunks, section 16.6).
+  The value 2.807 used in 16.4 is DERIVED (median rate x median round / B); it is not an independent measured Y.
+- Same-speculative-arm equivalence vs target correctness: EQF / PEQ certify that each optimized arm commits exactly the
+  tokens of the plain speculative arm L4PTFD (0 of 146,944 differ at the anchor). They do NOT certify FAST / target
+  correctness: L4PTFD's committed tokens equal the shipped SH's on 0.403956 (inta), 0.395954 (intc), 0.387904 (intd)
+  of the checked columns (token_check, r2_spec_cell.py:164; first difference at (request 33, column 1) / (52, 1) /
+  (52, 1); after the first difference a request's continuation diverges). Target correctness depends on the FAST tie
+  rule, which is the human's decision.
+
+16.4 THE SERIAL RECONCILIATION, CORRECTED (anchor, ms per round; ACCOUNTING with the measured draft step and round, NOT
+an independent causal closure):
+| part | ms | label |
+|---|---|---|
+| three draft rows at the measured standalone step, 3 x 80.246 (holds the B draft rows' selection, as td does) | 240.74 | MEASURED step; the third row's standalone charge is a COUNTERFACTUAL (it runs inside the joint) |
+| verify dense G(3B) | 58.37 | the expression's own charge (MODEL; not measured at C81) |
+| old extra term 6.94 | REMOVED | replaced by the next row |
+| union excess FLASHU1 - NS1R1 (2.31 / 3.50 at C128 B216 / C73 B318) | about 3.1 | MODEL scale; j1f, subject to the copy_ timing finding |
+| 4-row tile at equal bytes FORK - FLASHU1 (12.50 / 19.13) | about 17 | MODEL scale; the FLASH controls time an output copy_ while FORK writes directly (review 4): to be re-timed |
+| selection of 4B rows after F1, about 18, MINUS the draft row's share already charged in 3 x td (1 of 4 rows) | about 13.5 | MODEL |
+| tentative state and sorts after ST2 / ST3 | 10-15 | MODEL |
+| commit | 4.04 | MEASURED (intc) |
+| exposed transfer 6.4658 MB x 287 / 24.5 GB/s | 75.8 | ESTIMATED (the C81 gather wait was not measured; 24.5 GB/s from r7pb) |
+| sum | 422.6-427.6 | vs 434.39 measured: residual 6.8-11.8 (1.6-2.7 %) |
+The near-match uses the measured draft step and the measured round / yield: it shows the parts are consistent, not that
+each part's cause is established.
+
+16.5 CEILINGS AND ROUTES, CONDITIONAL. The "draft-only ceiling" in the 2026-11-01 discussion (0.97x / 0.98x / 1.05x the
+frozen reference at C128 / C81 / C73) holds today's standalone draft cost, the committed yield and the batch fixed, and
+charges the joint's draft row a full standalone step. Q <= B Y / (2 d + m), with d the standalone draft step and m the
+MARGINAL cost of the draft row inside the joint (NOT measured; 0 <= m). At the anchor (B Y = 805.7 committed tokens per round, DERIVED): m = d gives
+3,347 tok/s; m = 0 gives 5,020 tok/s. It is a counterfactual for the tested implementation, not an irreducible bound for every joint
+implementation. X1 constrains only the tested fixed-shape stream combinations; the one-row attention control does not
+prove four-row optimality. The "+5 % ceiling" and "the only route" statements are WITHDRAWN as unconditional claims.
+
+16.6 FAILURES PRESERVED AND OPEN TERMS. bf1b b1 had 3 MUST failures (stdout; exit 3, sacct FAILED 3:0); INTEGRATION_NOTES
+section 12 said "every run 0 MUST failures" (corrected by the BF owner). INT-ADDITIVITY: REPORT, parts {}, product None
+(the single-rung arms did not run in the INT jobs: additivity NOT tested). Open: physical live HBM bytes; the PHASE-SUM
+failures of r7pa / r7pb; SHJ1 memory; the j1f source findings (no finite-value check in num_err; copy_ inside the FLASH
+timed region). Not every term is closed. The inta / intc / intd summaries go into the packet as hash-linked chunks.
+
+16.7 WORK CONTINUING (source + CPU; GPU validation waits for an existing holder: none is live, 2197383 / 2197384 ended
+CANCELLED 2026-11-01): BF owner: the actual blocking call of the fetch worker, then the largest avoidable readiness / host
+cost (likely ready-only snapshot batching), with useful-arrival deadline and draft-contention counters. J owner:
+fail-closed finite checks with planted NaN / Inf controls in r2_j1_forkbench, and kernel vs output-copy timing.
+
+16.8 TRANSFER: SOURCE OF EACH NUMBER AND THE HIDING BOUND (human question 2026-11-02). Bytes: the AUTHOR's replay
+(fetch-missing-in-draft, immediate arrival, 4 requests, teacher-forced) gives new draft traffic per request per round
+2.9105 / 6.4658 / 9.0978 MB at C128 / C81 / C73. LIVE verify-pass NEW host bytes (row 6): 2.581 / - / 8.065 MB = 0.887 /
+- / 0.886 of the author's bytes (the volume prediction holds within about 11 %). Rates: the model's 10.724 GB/s = CPU8
+packer + DMA (the author's); our tested path = GPU-core zero-copy gathers in the compute stream, MEASURED 22.0-27.6 GB/s
+(link-bound; bulk pinned reference 25.2). Times per round: C128 MEASURED 21.3 ms device, 20.25 exposed; C73 MEASURED
+exposed 115.6 (best arm); C81 NOT MEASURED: ESTIMATED 67-84 ms (author bytes 1,855.7 MB at 22.0-27.6 GB/s; 75.7 at 24.5)
+or 60-75 ms with the live 0.887 factor. The 2026-11-01 "76 ms" = author bytes / GPU-gather rate. The link time fits
+inside the two standalone drafts (anchor: about 76 vs 160.5 ms), so the transfer is hideable in time; hiding needs the
+blocks known early (draft-selected coverage of the joint's NEW blocks 0.47-0.51, r7pa / r7pb) and an issue path without
+host or SM contention (BF1: the CPU worker failed). UPPER BOUNDS if fully hidden at zero cost (MODEL; rounds minus the
+exposed transfer; committed tok/s vs the same-job SHJ1, DERIVED): C128 278.5 ms, 2,248, 0.643x; C81 350-375 ms,
+2,149-2,302, 0.74-0.79x; C73 368.2 ms, 2,422, 0.911x. Half hidden (coverage 0.5): C81 0.68-0.71x, C73 0.787x.

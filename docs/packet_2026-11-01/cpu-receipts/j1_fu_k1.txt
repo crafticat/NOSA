@@ -1,0 +1,30 @@
+WARNING: Environment variable TMPDIR already has value [/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc], will not forward new value [/tmp] from parent process environment
+"sed": executable file not found in $PATH
+"hostname": executable file not found in $PATH
+"sed": executable file not found in $PATH
+"grep": executable file not found in $PATH
+"cut": executable file not found in $PATH
+15:4: not a valid test operator:  
+15:4: not a valid test operator:  
+21:4: not a valid test operator: (
+21:4: not a valid test operator: 
+....                                                                     [100%]
+=============================== warnings summary ===============================
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_pure
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:803: Evidence: J1F PURE: work per variant {'FORK': {'rows': 864, 'pages': 31104}, 'FORKT': {'rows': 864, 'pages': 31104}, 'FORK1R': {'rows': 216, 'pages': 27648}, 'NS1R1': {'rows': 216, 'pages': 27648}, 'NS1R1_CP': {'rows': 216, 'pages': 27648}, 'NS1R1_CO': {'rows': 0, 'pages': 0}, 'NS1x4': {'rows': 864, 'pages': 110592}, 'NS1x4_CP': {'rows': 864, 'pages': 110592}, 'NS1x4_CO': {'rows': 0, 'pages': 0}, 'FLASHU1': {'rows': 216, 'pages': 31104}, 'FLASHU1_CP': {'rows': 216, 'pages': 31104}, 'FLASHU1_CO': {'rows': 0, 'pages': 0}, 'NSRU': {'rows': 864, 'pages': 117504}, 'NSRU_CP': {'rows': 864, 'pages': 117504}, 'NSRU_CO': {'rows': 0, 'pages': 0}, 'FORK3D2': {'rows': 864, 'pages': 31104}, 'FORK3D4': {'rows': 864, 'pages': 31104}}; ratios {'FORK/FLASHU1': 2.0, 'FORK1R/NS1R1': 0.9231, 'FORK/NS1x4': 0.75, 'FORKT/FORK': 0.9167, 'NSRU/FORK': 1.8333, 'FORK/FLASHU1_CP': 0.6, 'FORK1R/NS1R1_CP': 0.8571, 'FORK/NS1x4_CP': 0.7059, 'NSRU_CP/FORK': 1.9167, 'FORK3D2/FORK': 0.9}
+    _ev("J1F PURE: work per variant %s; ratios %s" % (w, {k: v["ratio"] for k, v in s["ratios"].items()}))
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_nonfinite
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:906: Evidence: J1F NONFINITE: new NUM fails every plant (NaN/+Inf/-Inf x out/ref/both, 3 variants); the old accumulation passed 15 of 27 plants: [('FLASHU1', '-inf', 'both'), ('FLASHU1', 'inf', 'both'), ('FLASHU1', 'nan', 'both'), ('FLASHU1', 'nan', 'out'), ('FLASHU1', 'nan', 'ref'), ('FORK', '-inf', 'both'), ('FORK', 'inf', 'both'), ('FORK', 'nan', 'both'), ('FORK', 'nan', 'out'), ('FORK', 'nan', 'ref'), ('NS1R1', '-inf', 'both'), ('NS1R1', 'inf', 'both'), ('NS1R1', 'nan', 'both'), ('NS1R1', 'nan', 'out'), ('NS1R1', 'nan', 'ref')]
+    _ev("J1F NONFINITE: new NUM fails every plant (NaN/+Inf/-Inf x out/ref/both, 3 variants); the old accumulation "
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_out_view
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:966: Evidence: J1F OUTVIEW: the direct call passes the out_ view at position 13 of the installed op /venv/nosa/lib/python3.10/site-packages/flash_attn_nosa/__init__.py; layout = the op's return
+    _ev("J1F OUTVIEW: the direct call passes the out_ view at position 13 of the installed op %s; layout = the op's "
+
+benchmarks/Efficiency/tests_cpu/test_j1.py::test_forkbench_timing_plumbing
+  /mnt/beegfs/ojerbi/nosi-r2-j1-dev/benchmarks/Efficiency/tests_cpu/test_j1.py:1003: Evidence: J1F TIMING: fake-timer plumbing; flash split {'kernel_ms_pass': 20.0, 'copy_only_ms_pass': 1.5, 'total_j1f_form_ms_pass': 24.0, 'rest_ms_pass': 2.5, 'valid': True}
+    _ev("J1F TIMING: fake-timer plumbing; flash split %s" % s["flash_timing"]["NS1R1"])
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+4 passed, 19 deselected, 4 warnings in 3.92s

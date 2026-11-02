@@ -1578,3 +1578,34 @@ One line per event, UTC from `date -u`. Newest at the bottom.
   tentative state, n, traffic, useful_GBps, Tround, Y, Q and section 15.6 written; HANDOFF_INT final. VERDICT: best
   specKV 2,096.1 tok/s (inta) = 0.615x the strongest; not beaten; the cause is P2 (ledger 15.6). No further GPU work
   planned; successor holders 2197383 / 2197384 get no uuid files.
+- 2026-11-02T09:16:22Z (date -u): review 4 received (asynchronous; packet adbf7f4 + five branch tips). Corrections in
+  LEDGER_rev7 15.4b, 14 row Q, 15.6 (conclusion: this tested implementation misses the original forecast, with several
+  mechanisms still open) and new section 16 (anchor comparison incl. joint 269.5 vs 88.07 ms; SHJ1 0.5995, SHJ1 rate
+  DERIVED about 3,496, memory NOT RECORDED; 3,407.2 = frozen reference; accepted Y vs committed rate; EQF = same-arm
+  equivalence, tokens vs SH 0.388-0.404; corrected serial reconciliation as accounting; conditional ceilings; failures
+  and open terms). HANDOFF_INT revision 2. Holders 2197383 / 2197384 ended CANCELLED 2026-11-01 (not by the lead); no
+  GPU holder is live; no new allocation. Owners launched (source + CPU): BF = the fetch worker's actual blocking call ->
+  scoped fix + arrival-deadline / contention counters; J = forkbench fail-closed finite checks + planted NaN / Inf
+  controls + kernel vs copy_ timing. inta / intc / intd summaries chunked on amd (thunder09, 09:17:54Z), REBUILD_OK
+  against the originals' sha256.
+- 2026-11-02T10:25:28Z (date -u): J owner DONE (dev r2-j1-dev, not pushed). 48da64d: num_err finite checks fail closed
+  (NUM + EXACT), planted NaN / +Inf / -Inf controls (old code at cd0e286 passed 15 of 27 plants: control not a no-op),
+  flash controls in three forms (direct write / old copy_ form / copy only) + OUTEQ gate; receipts j1_48da64d_t (22
+  passed, 1 skipped) and _g0 (37 passed). 8951bc3: bit-preserving fork edit "ahead" levels 1-3 behind a flag (separate
+  file; interpreter bit-equal in 32 cases; CPU cubin: spills 48 -> 0 B, registers stay 251-255, async K / V staging lost:
+  GPU timing decides); bit-changing options listed for the human, not built; receipts j1_8951bc3_t (25 passed, 1
+  skipped), _g0 (37 passed), j1_ah_k6 (3 passed). Observation: NUM tolerance 1e-3 vs measured errors 1e-5 (not changed).
+  RULE SLIP (J worker, self-reported): a login command used a dummy variable whose name contains the banned stream-
+  editor word. Logged. GPU rerun protocol: INTEGRATION_NOTES section 14 (waits for a holder; the human said no
+  allocation yet). BF owner still running.
+- 2026-11-02 (after 11:09Z, receipt utc_start 10:29:49Z): BF owner DONE (dev r2-bf1-dev dd95b87 on b051b42, not pushed).
+  Diagnosis (b3, ms per epoch): snapshot wait snap_ev.synchronize() 115.7 (largest avoidable), select 52.1 (numpy under
+  the GIL), issue 49.1, exposed C++ wait 63.8; C++ submit 2.73 ms per chunk NOT established as a synchronous copy (source:
+  pinned staging, non_blocking; 2.17 vs 2.73 ms for the same chunk): the claim at section 12 lines 527-528 RETRACTED;
+  section 12 line 482 corrected (b1: 3 MUST failures). "Deferred" bytes in the joint = a host-clock proxy, not GPU
+  evidence. Fix: snap="ready" (ready-only batching; the old loop kept as snap="newest" for a same-job A/B), arm
+  L4PTFDGUDKWCDR, cell bf1r (stops while PRED_STAMP_BF1R is None), arrival-deadline / used-early / contention counters
+  with an additive MUST check. MODEL x1.004-1.012 vs B. GPU-issued prefetch with the shipped flash_h2d_from_mask ranks
+  below (one CTA per (request, head, block), no CTA cap; MODEL x0.91-0.97 at the measured overlap); gate it with a
+  side-stream microbench first. CPU: bf1_dd95b87_t (SLURM 2250122, 42 passed). Proposed bands in INTEGRATION_NOTES 13
+  (not registered). No GPU run (the human: no allocation yet).

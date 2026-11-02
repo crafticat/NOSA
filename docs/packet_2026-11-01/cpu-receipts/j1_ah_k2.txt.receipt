@@ -1,0 +1,48 @@
+tag=j1_ah_k2 tree=/mnt/beegfs/ojerbi/nosi-r2-j1-dev
+utc_start=2026-11-02T09:52:19Z host=thunder09 slurm_job=2249964 slurm_step=0
+runner=/mnt/beegfs/ojerbi/kstep-cpu-runs/tmp_sc/recon7_fix/run_receipt_tree.sh runner_sha256=97035598e92941d7ebf1d54f569a1cebbadaec55660ceff700e1a3a327962c22
+pytest_args=benchmarks/Efficiency/tests_cpu/test_j1.py -k ahead 
+head=48da64d5ec5ce0c0ee2ac925c4ddf16a3f641a6a branch=r2-j1-dev
+status_begin (tracked and untracked under benchmarks docs nosi)
+ M benchmarks/Efficiency/r2_j1_forkbench.py
+ M benchmarks/Efficiency/r2_j1_step.sh
+ M benchmarks/Efficiency/tests_cpu/test_i2.py
+ M benchmarks/Efficiency/tests_cpu/test_i3.py
+ M benchmarks/Efficiency/tests_cpu/test_i4a.py
+ M benchmarks/Efficiency/tests_cpu/test_i4cc.py
+ M benchmarks/Efficiency/tests_cpu/test_i4d.py
+ M benchmarks/Efficiency/tests_cpu/test_i4dc.py
+ M benchmarks/Efficiency/tests_cpu/test_i4g.py
+ M benchmarks/Efficiency/tests_cpu/test_i4h.py
+ M benchmarks/Efficiency/tests_cpu/test_i4k.py
+ M benchmarks/Efficiency/tests_cpu/test_i4s.py
+ M benchmarks/Efficiency/tests_cpu/test_i4u.py
+ M benchmarks/Efficiency/tests_cpu/test_j1.py
+ M benchmarks/Efficiency/tests_cpu/test_recon7.py
+ M benchmarks/Efficiency/tests_cpu/test_wsa.py
+ M benchmarks/Efficiency/tests_cpu/test_wsb.py
+ M benchmarks/Efficiency/tests_cpu/test_wsc.py
+?? benchmarks/Efficiency/fork_vllm_unified_attention_ahead.py
+status_end
+sha256 ca7f07d2911c20987c8bb4823a8ae70f42e4973f64c3a092f5eb79a0dc819b66 benchmarks/Efficiency/r2_j1_cell.py
+sha256 a06dcd1e21c3364a597c1ed482b5cce4c18fd64e582dbf84b36a78c55ac966ca benchmarks/Efficiency/r2_j1_forkbench.py
+sha256 c2b2c9a6c2d4e2cacdf700790c1d3ceddd438dfa2effe91025c94f028b87eedc benchmarks/Efficiency/r2_j1_select.py
+sha256 1a72763b6c78d50798050ee486ba1e57f0c2056cc880b96ed3ed854e55ff0bd1 benchmarks/Efficiency/r2_j1_step.sh
+sha256 84589127acfda67898f632f11d7961dcbf0c45f3e5b52ba1ce5d84b88dde29d3 benchmarks/Efficiency/tests_cpu/test_i2.py
+sha256 af6915905ee5799cc7e1fdd2b10d9a533c8b5f935eca138534b6cbf95e44a3a7 benchmarks/Efficiency/tests_cpu/test_i3.py
+sha256 5fb4dd7224bffbfd48cf1f3a7aa39e61891afe87919fb59a43769fff4ddb1a13 benchmarks/Efficiency/tests_cpu/test_i4a.py
+sha256 2597b2b2b993928974720a6cdf56ab2f24250ae13ec730229206ecad4d271a5c benchmarks/Efficiency/tests_cpu/test_i4cc.py
+sha256 cda370b765c11092cc958d4e82de23d1fda5674bb08a91d6c4d93f71ee211fb9 benchmarks/Efficiency/tests_cpu/test_i4d.py
+sha256 429f4157507029d3057e10d3972fcd543e833d599b836f0c4ce9a97bc75ff48a benchmarks/Efficiency/tests_cpu/test_i4dc.py
+sha256 8c926ff53895a67315a70ecde0389aa899fbacdf48d4719e81eac13a9897524c benchmarks/Efficiency/tests_cpu/test_i4g.py
+sha256 9dd75e77dce0ae836e43586e3b0eb56453abed3cc31938fd70a8cf421e36a45e benchmarks/Efficiency/tests_cpu/test_i4h.py
+sha256 3e4f9a202dbfaed02951060467439a14ee48f1a76177f7a36ffc3342a1064bf1 benchmarks/Efficiency/tests_cpu/test_i4k.py
+sha256 715d9680e42a9a2c5798b5e1dcdd6a8abc873acde4d5d2fcd461b8d97ea147c5 benchmarks/Efficiency/tests_cpu/test_i4s.py
+sha256 bca833d8e3b69378d7414414777808b39376cd5bfc166ae34dcdae2bde03bd7e benchmarks/Efficiency/tests_cpu/test_i4u.py
+sha256 a4d82e552e5e835f06f08b59230987a257bcaf9fbdefd115d153ff7d443c71d7 benchmarks/Efficiency/tests_cpu/test_j1.py
+sha256 ad8eca6325418037425c06cdc0bf7184a9d04487c60cb6172425687c3421dd98 benchmarks/Efficiency/tests_cpu/test_recon7.py
+sha256 1c03ede97ea3801406bdc75f5ea071adc57d5909f5b11942a135b466bfd49658 benchmarks/Efficiency/tests_cpu/test_wsa.py
+sha256 798c0181aceae82037448e8542783710e3ba1dcc505409c0f23970822badd35f benchmarks/Efficiency/tests_cpu/test_wsb.py
+sha256 9ea35337bb9e79de270a8bc0bd908b3f94bfa2fbd94dafc5ecada583b2a1da69 benchmarks/Efficiency/tests_cpu/test_wsc.py
+sha256 9c0ab5373ce4e71e5d4d0c477c603cdc95b17b46fb2f55ac9f01e1b10ba0080a docs/NOTES_j1.md
+pytest_exit=1 utc_end=2026-11-02T09:53:57Z
