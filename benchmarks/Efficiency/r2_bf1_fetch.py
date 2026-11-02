@@ -167,8 +167,18 @@ BIGI = 1 << 62
 MODES = ("ce", "off")
 WORKERS = ("thread", "inline")
 PACKERS = ("torch", "gilfree")          # the host pack: torch.index_select (pinned) | r2_transport_gilfree_v3 (C++ team)
-LATES = ("drop", "defer")               # a job not issued at the joint pass's start: abandoned | committed at ITS layer
+LATES = ("drop", "defer", "complete")   # a job not issued at the joint pass's start: abandoned | committed at ITS layer
+#                                         (host wait within late_wait_ms) | committed at its layer, the host waits with
+#                                         NO budget (COMPLETED SCHEDULE: no job is "passed"; the GPU waits its landing)
+# THE LEDGER (section 16, INTEGRATION_NOTES_2026-10-31.md): per joint pass, device int64 counters (LEDGER_KEYS); the
+# demand partition: demand = hit_cache + hit_retained + miss_verifier_only + miss_req_incomplete + miss_lost
+LEDGER_KEYS = ("demand", "hit_cache", "hit_retained", "miss_verifier_only", "miss_req_incomplete", "miss_lost",
+               "lost_tagged", "retain_protected", "retain_overflow", "addr_ok", "addr_bad", "requested", "completed")
 BNEG = (None, "wrong_bytes", "no_copy")
+# ledger negative controls (tests only): "addr_redirect" (the fork's page id of a retained hit points at slot 0: the
+# consumer-address check must count it; the read is wrong, EQF must fail), "evict_retained" (before a layer's keep, every
+# unread retained slot of a LATER layer is dropped from the map: lost retention must be counted, no stale read)
+LNEG = (None, "addr_redirect", "evict_retained")
 SNAPS = ("newest", "ready")             # a batch waits for its newest snapshot (b3) | takes only completed snapshots
 WAIT_KEYS = ("snap_s", "entry_s", "cxx_wait_s", "ready_wait_s")      # the worker's wait stages (ARRIVAL: host overlap)
 # device counters: the side stream's (one tensor) and the compute stream's (another tensor): no tensor has two writers
@@ -314,7 +324,8 @@ class BgFetch:
     def __init__(self, T, mode: str = "ce", n_cap: int = 1024, ring: int = 8, worker: str = "thread",
                  acct: bool = False, bneg=None, close_wait_ms: float = 0.0, packer: str = "torch", threads: int = 8,
                  gf=None, late: str = "drop", late_wait_ms: float = 100.0, stall_ms: float = 0.0, batch: int = 8,
-                 hold: int = 0, snap: str = "newest", arrival: bool = True, poll_ms: float = 1.0, bl_max: int = 128):
+                 hold: int = 0, snap: str = "newest", arrival: bool = True, poll_ms: float = 1.0, bl_max: int = 128,
+                 ledger: bool = True, retain: bool = False, lneg=None):
         if (mode not in MODES or worker not in WORKERS or bneg not in BNEG or packer not in PACKERS
                 or late not in LATES or snap not in SNAPS):
             raise BFError("mode %r / worker %r / bneg %r / packer %r / late %r / snap %r: one of %s / %s / %s / %s / %s "
@@ -333,11 +344,19 @@ class BgFetch:
         self.segs = []                                   # ARRIVAL: the worker's host segments (kind, t0, t1)
         self._arr_cur = None                             # ARRIVAL: the epoch record of the running joint pass
         self.pbid = None                                 # ARRIVAL: device (H, B, X) batch x L + layer (mode "ce")
+        self.req = self.com = self.rdmark = None         # THE LEDGER's bitmaps (mode "ce", ledger)
+        self.led_cur = None                              # THE LEDGER's per-pass accumulator (mode "ce", ledger)
         self.batch = int(batch)                          # jobs per worker batch (one pack / transport job / commit)
         self.hold = int(hold)                            # tests only: before an epoch's first batch the worker waits for
         self._held_ep = None                             # `hold` queued jobs (or the epoch's close): a CERTAIN backlog
         self.packer, self.threads, self.gf = packer, int(threads), dict(gf or {})
         self.late_mode, self.late_wait_ms = late, float(late_wait_ms)
+        self.defer = late in ("defer", "complete")       # a late job commits at its layer of the joint pass
+        if lneg not in LNEG:
+            raise BFError("lneg %r: one of %s" % (lneg, LNEG))
+        self.ledger = bool(ledger) and bool(arrival)     # THE LEDGER (needs the arrival epoch records)
+        self.retain = bool(retain)                       # RETENTION: protect unread retained slots in the keep
+        self.lneg = lneg                                 # tests only: the ledger's negative controls
         self.stall_ms = float(stall_ms)                  # tests only: the worker sleeps per job (forces late jobs)
         if getattr(T, "kid", None) is None or not getattr(T, "kwin", False):
             raise BFError("BF1 needs the kept store with window loads (keep=True, kwin=True)")
@@ -383,6 +402,9 @@ class BgFetch:
         self.jwait_left = 0.0                            # defer: the host wait budget left in this joint pass (s)
         kb = getattr(T, "kblock", None)                  # the keep's test-only slot limit, on the host (ROOM)
         self.kblock_h = kb.cpu().numpy() if kb is not None else None
+        self.kblock_d = kb                               # the same on the device, FIXED here (the joint pass sets
+        #                                                  T.kblock for one keep step: RETENTION; the side commit must
+        #                                                  not see that temporary mask)
         self._alloc()
 
     # ---------------------------------------------------------- buffers
@@ -418,6 +440,14 @@ class BgFetch:
         if self.arrival:                                 # ARRIVAL: the (batch, layer) of each tagged slot's commit
             self.pbid = torch.zeros((H, B, X), dtype=i64, device=dev)
             self.bl_dummy = torch.tensor(self.bl_max * L, dtype=i64, device=dev)   # the overflow / untagged bucket
+        self.req = self.com = self.rdmark = None
+        if self.ledger:                                  # THE LEDGER: per epoch, (layer, head, request, block) bitmaps
+            nb1 = self.nblk + 1                          # column nblk: a dump for masked entries
+            self.req = torch.zeros((L, H, B, nb1), dtype=torch.bool, device=dev)       # requested by a draft
+            self.com = torch.zeros((L, H, B, nb1), dtype=torch.uint8, device=dev)      # committed (count) this epoch
+            self.rdmark = torch.zeros((H, B, X), dtype=torch.bool, device=dev)        # the fork reads slot x
+            self.nb_dump = torch.tensor(self.nblk, dtype=i64, device=dev)
+            self.led_cur = torch.zeros((len(LEDGER_KEYS),), dtype=i64, device=dev)  # the pass's accumulator
         self.snap_d =torch.full((self.nsnap, H, B, self.topk), -1, dtype=torch.int32, device=dev)
         self.snap_h = self._pinned((self.nsnap, H, B, self.topk), torch.int32)
         self.snap_ev = [self._ev() for _ in range(self.nsnap)]
@@ -474,6 +504,8 @@ class BgFetch:
             return sum(t.numel() * t.element_size() for t in (self.ptag, self.pkey, self.ptagw))
         extra = [self.pbid] if self.pbid is not None else []                  # ARRIVAL: pbid and the per-epoch
         extra += [er["cnt"] for er in self.arr_ep]                            # counters (they GROW: arrival_bytes)
+        extra += [t for t in (self.req, self.com, self.rdmark, self.led_cur) if t is not None]   # THE LEDGER
+        extra += [er["led"] for er in self.arr_ep if er.get("led") is not None]
         return sum(t.numel() * t.element_size() for t in [self.land_k, self.land_v, self.land_it, self.snap_d,
                                                           self.ptag, self.pkey, self.ptagw] + extra)
 
@@ -483,8 +515,10 @@ class BgFetch:
         the run's epochs (210 epochs at bf1b: 6.9 MB)."""
         per = (self.bl_max * self.L + 1) * 8
         pb = self.pbid.numel() * 8 if self.pbid is not None else 0
+        lb = sum(t.numel() * t.element_size() for t in (self.req, self.com, self.rdmark) if t is not None)
         return dict(pbid_bytes=pb, counter_bytes_per_epoch=per if (self.arrival and self.mode != "off") else 0,
-                    epochs_kept=len(self.arr_ep), counter_bytes_total=sum(er["cnt"].numel() * 8 for er in self.arr_ep))
+                    epochs_kept=len(self.arr_ep), counter_bytes_total=sum(er["cnt"].numel() * 8 for er in self.arr_ep),
+                    ledger_bitmap_bytes=lb, ledger_bytes_per_epoch=(len(LEDGER_KEYS) * 8 if self.ledger else 0))
 
     # ---------------------------------------------------------- the capture lock (thread worker)
     def wrap_backend(self, be) -> None:
@@ -542,7 +576,9 @@ class BgFetch:
             ref = self._tev()
             ref.record()
             er = dict(seq=self._seq, ref=ref, jl={}, nb=0, h_open=time.perf_counter(), h_close=None, h_end=None,
-                      cnt=torch.zeros((self.bl_max * self.L + 1,), dtype=torch.int64, device=self.dev))
+                      cnt=torch.zeros((self.bl_max * self.L + 1,), dtype=torch.int64, device=self.dev),
+                      led=(torch.zeros((len(LEDGER_KEYS),), dtype=torch.int64, device=self.dev) if self.ledger
+                           else None))
             self.arr_ep.append(er)
         with self.lock:
             self.epoch = _Epoch(self._seq, int(T.kpass), par, ev)
@@ -571,9 +607,10 @@ class BgFetch:
             self._arr_cur = ep.arr                       # ARRIVAL: this joint pass's deadlines and used counts
             if ep.arr is not None:
                 ep.arr["h_close"] = time.perf_counter()
-            if self.late_mode == "defer":                # LATE = DEFER: the jobs not issued yet commit at their layer
-                ep.closing, ep.consumed_upto = True, -1
-                self.jep, self.jwait_left = ep, self.late_wait_ms / 1e3
+            if self.defer:                               # LATE = DEFER / COMPLETE: the jobs not issued yet commit at
+                ep.closing, ep.consumed_upto = True, -1  # their layer (COMPLETE: no host budget)
+                self.jep = ep
+                self.jwait_left = float("inf") if self.late_mode == "complete" else self.late_wait_ms / 1e3
             else:
                 ep.closed = True
             ep.t_close = time.perf_counter()
@@ -615,8 +652,6 @@ class BgFetch:
                     ep.deferred.clear()
                     ep.closed = True
                     self.jep = None
-                    self.rep["late_wait_s"] = self.rep.get("late_wait_s", 0.0) + (self.late_wait_ms / 1e3
-                                                                                  - self.jwait_left)
                 self.cv.notify_all()
         T = self.T
         t1 = int(T.kpass) * self.L
@@ -629,6 +664,13 @@ class BgFetch:
         if er is not None and self.pbid is not None:     # ARRIVAL: the STORE uses per (batch, layer), on the device
             idx = torch.where(used, self.pbid[..., 1:], self.bl_dummy)     # (review 5: STORE-ONLY; the window
             er["cnt"].scatter_add_(0, idx.reshape(-1), used.reshape(-1).to(torch.int64))   # uses are not covered)
+        if er is not None and self.req is not None:      # THE LEDGER (a): requested / completed (unique keys), then
+            nb = self.nblk                               # a clean pair of bitmaps for the next epoch
+            er["led"].add_(self.led_cur)                 # the pass's (captured) keep-step counters, then zeroed
+            self.led_cur.zero_()
+            er["led"][11:13].add_(torch.stack((self.req[..., :nb].sum(), (self.com[..., :nb] > 0).sum())))
+            self.req.zero_()
+            self.com.zero_()
         self._arr_cur = None
         self.ptag.zero_()
         self.ptagw.zero_()
@@ -658,8 +700,10 @@ class BgFetch:
                 if pend == 0 or self.jwait_left <= 0 or self.error is not None:
                     break
                 t0 = time.perf_counter()
-                self.cv.wait(self.jwait_left)
-                self.jwait_left -= time.perf_counter() - t0
+                self.cv.wait(None if self.jwait_left == float("inf") else self.jwait_left)   # COMPLETE: no budget
+                dt = time.perf_counter() - t0
+                self.jwait_left -= dt
+                self.rep["late_wait_s"] = self.rep.get("late_wait_s", 0.0) + dt
             with self.lock:
                 ep.consumed_upto = l
             self.cv.notify_all()
@@ -729,6 +773,88 @@ class BgFetch:
         E = (key.unsqueeze(-1) == self.pkey[:, :, None, 1:]) & self.ptag[:, :, None, 1:]
         self.ptagw[..., 1:] |= E.any(2)
 
+    # ---------------------------------------------------------- THE LEDGER and RETENTION (the joint pass's keep step)
+    def pre_keep(self, T, l: int, lst, big: int):
+        """Before the keep step of joint layer l (compute stream, eager; section 16). Returns None (no ledger) or a
+        context: the RETENTION mask for keep_assign's `block` (retain=True) and the epoch record.
+        LOST RETENTION (lost_tagged): a slot that this epoch's fetch committed for layer l and that no longer holds its
+        key (an earlier layer's miss evicted it). RETENTION (retain): the unread retained slots of LATER layers (still
+        holding their keys) are protected from this layer's misses, but only up to the spare capacity of (head,
+        request): spare = (X - 1) - this layer's listed entries - the test-only blocked slots. Then every miss still
+        finds a non-protected slot (r2_i4d_keep.py capacity proof (iii) holds: #misses <= #valid - #hits <= (X - 1) -
+        #hits - |protected|, the protected slots hold keys of other layers so they are not this layer's hits). The rest
+        (retain_overflow) is the OVERFLOW FALLBACK: those slots stay evictable (the keep's own order).
+        CUDA GRAPHS: the keep step is CAPTURED in the graph arms (r2_i4k_combo.py, THE SPLIT): these ops are recorded and
+        replayed. So they use persistent tensors only, no host value that changes per pass, and the counters go into the
+        persistent accumulator led_cur, which after_joint (eager) adds into the epoch's record and zeroes."""
+        if not self.ledger or self.mode == "off":
+            return None
+        k1, a1 = T.kid[..., 1:], T.kage[..., 1:]
+        tg, pk = self.ptag[..., 1:], self.pkey[..., 1:]
+        lay = pk >> 32
+        held = tg & (k1 == pk)
+        if self.lneg == "evict_retained":                # NEGATIVE CONTROL: unread retained slots of later layers
+            drop = held & (lay > int(l))                 # leave the map (an eviction before the read)
+            k1.masked_fill_(drop, -1)
+            a1.masked_fill_(drop, -(1 << 40))            # r2_i4d_keep.EMPTY_AGE
+            held = tg & (k1 == pk)
+        led = self.led_cur
+        led[6].add_((tg & (lay == int(l)) & ~held).sum())
+        prot = None
+        if self.retain:
+            P = held & (lay > int(l))
+            spare = (self.X - 1) - (lst < big).sum(-1, keepdim=True)
+            if self.kblock_d is not None:
+                spare = spare - self.kblock_d.sum(-1, keepdim=True)
+            prot = P & (P.to(torch.int64).cumsum(-1) <= spare)
+            led[7:9].add_(torch.stack((prot.sum(), (P & ~prot).sum())))
+        return dict(prot=prot)
+
+    def post_keep(self, T, l: int, lst, lphys, vs, ctx, big: int):
+        """After the keep step of joint layer l: THE DEMAND PARTITION and THE CONSUMER-ADDRESS CHECK (section 16).
+        Every listed entry (the verifier's unique host demand of the layer) got a slot with age t (keep_assign); the
+        misses are the slots that the fill wrote (vs.host_x >= 0: a synchronous gather now). So per slot:
+          hit_retained   age t, not filled, holding this epoch's fetched key (ptag, kid == pkey): covered by a RETAINED
+                         ARRIVAL;
+          hit_cache      age t, not filled, other: covered by the kept store (earlier rounds);
+          miss_*         filled now; its block (host_x) was not requested by a draft (verifier_only), requested but not
+                         completed this epoch (req_incomplete), or requested AND completed but not in the map at the read
+                         (lost: evicted / invalid before the read).
+        CONSUMER-ADDRESS: the fork's page ids of the listed blocks (lphys, what the attention reads) are marked per slot;
+        a retained hit must be read there (addr_ok), else addr_bad. A retained hit is not refilled (host_x < 0 at its
+        slot) by definition, so its read is the retained bytes, not a fresh gather. Returns lphys (lneg "addr_redirect":
+        redirected)."""
+        led = self.led_cur
+        H, B, X = self.H, self.B, self.X
+        kd = getattr(T, "kpass_d", None)                 # the graph arms: the DEVICE pass index (a replay updates it)
+        t = (kd * self.L + int(l)) if kd is not None else int(T.kpass) * self.L + int(l)
+        k1, a1 = T.kid[..., 1:], T.kage[..., 1:]
+        hx = vs.host_x[..., 1:]
+        fresh = hx >= 0
+        hits = (a1 == t) & ~fresh
+        ret = self.ptag[..., 1:] & (k1 == self.pkey[..., 1:])
+        hit_ret = hits & ret
+        idx = torch.where(fresh, hx, self.nb_dump)
+        rq = self.req[int(l)].gather(-1, idx)
+        cm = self.com[int(l)].gather(-1, idx) > 0
+        sbv = T._ksb1[0].view(1, B, 1)
+        p = lphys.reshape(H, B, -1)
+        inr = (p >= sbv) & (p < sbv + X)
+        if self.lneg == "addr_redirect":                 # NEGATIVE CONTROL: a retained hit read from slot 0 instead
+            hr = torch.cat((torch.zeros_like(hit_ret[..., :1]), hit_ret), -1)
+            m = inr & hr.gather(-1, torch.where(inr, p - sbv, 0))
+            lphys = torch.where(m.view_as(lphys), sbv.view(1, B, 1, 1).expand_as(lphys), lphys)
+            p = lphys.reshape(H, B, -1)
+            inr = (p >= sbv) & (p < sbv + X)
+        rd = self.rdmark
+        rd.zero_()
+        rd.scatter_(-1, torch.where(inr, p - sbv, 0), True)
+        rd1 = rd[..., 1:]
+        led[0:6].add_(torch.stack(((lst < big).sum(), (hits & ~ret).sum(), hit_ret.sum(), (fresh & ~rq).sum(),
+                                   (fresh & rq & ~cm).sum(), (fresh & rq & cm).sum())))
+        led[9:11].add_(torch.stack(((hit_ret & rd1).sum(), (hit_ret & ~rd1).sum())))
+        return lphys
+
     # ---------------------------------------------------------- the draft residency hook (compute thread)
     def on_draft(self, l: int, eng, skip, drf, qb3) -> None:
         if self.mode == "off" or self.epoch is None:
@@ -738,6 +864,8 @@ class BgFetch:
         B = self.B
         lm = eng._load_mask
         cand = skip & (lm >= 0) & (lm < qb3) & drf.view(1, B, 1)
+        if self.req is not None:                         # THE LEDGER: the draft REQUESTED (layer l, h, b, block)
+            self.req[int(l)].scatter_(-1, torch.where(cand, lm.to(torch.int64), self.nb_dump), True)
         s = self._snap_slot()
         self.snap_d[s].copy_(torch.where(cand, lm, self.m1))
         self.snap_h[s].copy_(self.snap_d[s], non_blocking=self.cuda)
@@ -919,7 +1047,7 @@ class BgFetch:
                 self._busy(tj)
                 prev = self._done(prev)                  # PIPELINE: prev's issue after this batch's select + submit
                 prev = (batch[:len(batch) - len(left)], p)  # the leftovers stay in flight (pend, inflight)
-                if self.late_mode != "defer":            # DROP: no pipeline (a batch must issue before the close; the
+                if not self.defer:                       # DROP: no pipeline (a batch must issue before the close; the
                     prev = self._done(prev)              # pipeline only delays it by the next batch's prep: a329dc6)
 
     def _loop_ready(self):
@@ -983,7 +1111,7 @@ class BgFetch:
                 prev = self._done(prev)                  # PIPELINE: prev's issue after this batch's select + submit
                 prev = (jobs[:len(jobs) - len(left)], p)
                 pend[:0] = left                          # the leftovers: first in the next batch (snapshots read)
-                if self.late_mode != "defer":            # DROP: no pipeline (a329dc6)
+                if not self.defer:                       # DROP: no pipeline (a329dc6)
                     prev = self._done(prev)
 
     def _drain(self, pend) -> bool:
@@ -1399,8 +1527,8 @@ class BgFetch:
         held = torch.zeros((H, B, X - 1), dtype=torch.int64, device=self.dev)
         held.index_put_((h, b, fs0), found.to(torch.int64), accumulate=True)
         elig = ((kid1 < 0) | (kage1 < int(g) * self.L)) & (held == 0)
-        if getattr(T, "kblock", None) is not None:                      # the keep's test-only slot limit (kslots)
-            elig = elig & ~T.kblock
+        if self.kblock_d is not None:                                   # the keep's test-only slot limit (kslots)
+            elig = elig & ~self.kblock_d
         order = torch.sort(torch.where(elig, kage1, torch.full_like(kage1, BIGI)), dim=-1, stable=True).indices
         nel = elig.sum(-1)
         passed = lt < int(min_layer)                                    # DEFER: their layer ran
@@ -1423,6 +1551,8 @@ class BgFetch:
         T.kage.index_put_((h, b, wslot), int(g) * self.L + lt)
         self.ptag.index_put_((h, b, wslot), ok | found)
         self.pkey.index_put_((h, b, wslot), key)
+        if self.com is not None:                         # THE LEDGER: COMPLETED (committed or revived) this epoch
+            self.com.index_put_((lt, h, b, blk), (ok | found).to(torch.uint8), accumulate=True)
         if self.pbid is not None and bix is not None:   # ARRIVAL: the (batch, layer) of the slot's commit
             if int(bix) < self.bl_max:
                 self.pbid.index_put_((h, b, wslot), lt + int(bix) * self.L)
@@ -1491,7 +1621,9 @@ class BgFetch:
         out.setdefault("overlapped", 0)
         out.setdefault("snap_unready_taken", 0)
         out.setdefault("polls", 0)
-        out.update(snap_mode=self.snap_mode, poll_ms=self.poll_s * 1e3)
+        out.update(snap_mode=self.snap_mode, poll_ms=self.poll_s * 1e3, retain=self.retain, ledger=self.ledger,
+                   lneg=self.lneg)
+        out.setdefault("late_passed", 0)
         out["arrival"] = self._arrival_report()
         out["arrival"]["window_uses_acct"] = out["used_win"] if self.acct else None   # not per batch, not timed
         if tps is not None:
@@ -1526,7 +1658,7 @@ class BgFetch:
                  gil_hold_measured=False)
         if not z["enabled"]:
             return dict(z, useful_early_share_store=None, margin_ms_useful_store=None, margin_ms_sent=None,
-                        deferred_wait_and_commit=None, host=None)
+                        deferred_wait_and_commit=None, host=None, ledger=None)
         dead, cnt = {}, {}
         for er in self.arr_ep:
             c = er["cnt"].cpu().numpy()
@@ -1592,7 +1724,58 @@ class BgFetch:
         z["joint_passes"] = npass
         z["host"] = self._host_overlap()
         z["memory"] = self.arrival_bytes()
+        z["ledger"] = self._ledger_report(dead)
         return z
+
+    def _ledger_report(self, dead) -> dict:
+        """THE LEDGER (section 16), per joint pass (= per round) and summed over the passes that ran. DEFINITIONS:
+        (a) FETCH side: requested = unique (layer, head, request, block) keys that a draft requested this epoch;
+            completed = those committed (or revived) into the store this epoch; completed before the deadline = the
+            arrival block's items_sent_early of the epoch (a batch's items are early when its usable-arrival event is
+            before the residency start of each item's joint layer).
+        (b) DEMAND side, covered: the verifier's unique host demand of each joint layer (the keep's listed entries:
+            blocks of the four rows that neither the window nor the pool holds) found in the store: hit_retained (this
+            epoch's fetch, still holding its key) and hit_cache (kept from earlier rounds).
+        (c) DEMAND side, not covered (a synchronous gather now): miss_verifier_only (no draft requested it),
+            miss_req_incomplete (requested, not completed this epoch: late / dropped / no room / passed), miss_lost
+            (requested AND completed, but not in the map at the read: lost retention).
+        (a) counts fetches, (b) and (c) count demand: they are different populations, so nothing is counted twice;
+        demand = hit_cache + hit_retained + miss_verifier_only + miss_req_incomplete + miss_lost (closure, a MUST).
+        lost_tagged: this epoch's retained slots of a layer that no longer held their key at that layer's keep (with
+        or without demand). retain_protected / retain_overflow: slot-steps protected / left unprotected (spare
+        capacity). addr_ok / addr_bad: retained hits that the fork's page ids read at their slot / did not."""
+        rows = []
+        for er in self.arr_ep:
+            if er.get("led") is None or 0 not in er["jl"]:
+                continue
+            v = dict(zip(LEDGER_KEYS, (int(x) for x in er["led"].tolist())))
+            v["seq"] = er["seq"]
+            rows.append(v)
+        early = {}
+        for r in self.arr_b:                             # (a) completed before the deadline, per epoch
+            dl = dead.get(r["ep"]["seq"], {})
+            try:
+                ta = r["ep"]["ref"].elapsed_time(r["arr"])
+            except Exception:
+                continue
+            for l, k in r["lcnt"]:
+                d = dl.get(int(l))
+                if d is not None and d >= ta and not r["passed"]:
+                    early[r["ep"]["seq"]] = early.get(r["ep"]["seq"], 0) + k
+        for v in rows:
+            v["completed_before_deadline"] = early.get(v["seq"], 0)
+        tot = {k: sum(v[k] for v in rows) for k in LEDGER_KEYS + ("completed_before_deadline",)}
+        d = tot["demand"]
+        cov = tot["hit_cache"] + tot["hit_retained"]
+        miss = tot["miss_verifier_only"] + tot["miss_req_incomplete"] + tot["miss_lost"]
+        ib = self.item_bytes
+        n = max(1, len(rows))
+        return dict(enabled=self.ledger, passes=len(rows), totals=tot, closure_ok=(d == cov + miss),
+                    covered_share=(round(cov / d, 4) if d else None), retained_share=(round(tot["hit_retained"] / d, 4)
+                                                                          if d else None),
+                    residual_items_per_pass=round(miss / n, 2), residual_MB_per_pass=round(miss * ib / n / 1e6, 3),
+                    completed_share=(round(tot["completed"] / tot["requested"], 4) if tot["requested"] else None),
+                    per_pass=rows, item_bytes=ib)
 
     def _host_overlap(self) -> dict:
         """ms per epoch of the worker's busy / wait segments inside the host draft windows and the host joint windows
@@ -1666,6 +1849,24 @@ def _make(STF):
             if self.bf is not None:
                 self.bf.on_window(l, eng, skip)
             return skip
+
+        def _keep_fill(self, l, vs, eng, twin, lst, loc, kern):
+            """THE LEDGER and RETENTION around the keep step of joint layer l (BgFetch.pre_keep / post_keep; section 16):
+            the retention mask joins keep_assign's `block` for THIS step only (the side commit uses its own fixed copy
+            of the test-only mask, kblock_d), then the demand partition and the consumer-address check. Graph-safe (the
+            step is captured in the graph arms): device ops on persistent tensors only."""
+            bf = self.bf
+            ctx = bf.pre_keep(self, l, lst, int(STF.VR.FORK_BIG)) if bf is not None else None
+            if ctx is None:
+                return super()._keep_fill(l, vs, eng, twin, lst, loc, kern)
+            kb0 = self.kblock
+            if ctx["prot"] is not None:
+                self.kblock = ctx["prot"] if kb0 is None else (ctx["prot"] | kb0)
+            try:
+                lphys, valid = super()._keep_fill(l, vs, eng, twin, lst, loc, kern)
+            finally:
+                self.kblock = kb0
+            return bf.post_keep(self, l, lst, lphys, vs, ctx, int(STF.VR.FORK_BIG)), valid
 
         def run_pass(self, model, plan):
             if plan.R == 1 or self.bf is None:

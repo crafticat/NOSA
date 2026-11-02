@@ -10,6 +10,9 @@ r2_i4dc_cell.py, imported, not edited) and the BF1 arms last:
                     "newest": the b3 worker loop)
   L4PTFDGUDKWCDR  = L4PTFDGUDKWCDB with snap "ready" (bf1r: a batch takes only jobs whose snapshot event completed;
                     INTEGRATION_NOTES_2026-10-31.md section 13); the same-job A/B of the fix against B
+  L4PTFDGUDKWCDS  = the COMPLETED SCHEDULE (section 16): R + late "complete" (no job dropped; the GPU waits a late
+                    landing) + RETENTION (unread retained slots protected in the keep, spare capacity, overflow fallback)
+                    + THE LEDGER (every ce arm reports it: (a) fetch, (b) covered, (c) missing, the consumer address)
 A BF1 arm needs L4PTFDGUDKWCD EARLIER in the job (its LISTED reference; it also compiled the helpers). Every arm runs
 run_arm_bf = the I4DC cell's run_arm_d line for line plus the lines marked "# BF1" (tests_cpu/test_bf1.py checks it).
 MUST GATES: the I4DC cell's for every arm; a BF1 arm takes L4PTFDGUDKWCD's gates under its own name (EQF = L4PTFD bit for
@@ -44,8 +47,12 @@ S4, CC, IA, GC, DG, LN, GR, HC, KC, UC, DC, KP, SK = (DCC.S4, DCC.CC, DCC.IA, DC
                                                       DCC.KC, DCC.UC, DCC.DC, DCC.KP, DCC.SK)
 I3C, WA, SC, BC = DCC.I3C, DCC.WA, DCC.SC, DCC.BC
 REF = "L4PTFDGUDKWCD"
-BF_ARMS = dict(L4PTFDGUDKWCDX="off", L4PTFDGUDKWCDB="ce", L4PTFDGUDKWCDR="ce")    # a BF1 arm -> its fetch mode
-BF_SNAP = dict(L4PTFDGUDKWCDR="ready")                              # an arm with a fixed snap mode (else --bf-snap)
+BF_ARMS = dict(L4PTFDGUDKWCDX="off", L4PTFDGUDKWCDB="ce", L4PTFDGUDKWCDR="ce", L4PTFDGUDKWCDS="ce")   # -> fetch mode
+BF_SNAP = dict(L4PTFDGUDKWCDR="ready", L4PTFDGUDKWCDS="ready")      # an arm with a fixed snap mode (else --bf-snap)
+# THE COMPLETED SCHEDULE (S, section 16): ready-only snapshots + late "complete" (a late job commits at its layer; the
+# host waits with no budget, so no job is dropped as "passed") + RETENTION (unread retained slots protected in the keep
+# up to the spare capacity, with an overflow fallback)
+BF_FIXED = dict(L4PTFDGUDKWCDS=dict(late="complete", retain=True))
 ARMS = DCC.ARMS + tuple(BF_ARMS)
 GRAPH_ARMS = DCC.GRAPH_ARMS + tuple(BF_ARMS)
 TOPK = DCC.TOPK
@@ -118,6 +125,13 @@ PRED_STAMP_BF1R = None
 PRED_KEYS_R = ("BF1R_vs_X", "BF1R_vs_B", "BF1R_joint_saving", "BF1R_draft_ratio", "BF1R_useful_early_store",
                "BF1R_snap_rest_ms")
 PRED_BF1R_BY_B = {}
+# bf1c (S = L4PTFDGUDKWCDS, the completed schedule, at C 81 B 287; same job as X, B, R): NONE until the lead registers
+# them with PRED_STAMP_BF1S; the step script STOPS bf1c while PRED_STAMP_BF1S is None. Keys (low, high): BF1S_vs_X,
+# BF1S_vs_B, BF1S_vs_R [x]; BF1S_joint_saving [ms]; BF1S_covered_share [share of the verifier's host demand covered by
+# the store]; BF1S_residual_MB [MB per joint pass still gathered]. The writer's MODEL: INTEGRATION_NOTES section 16.
+PRED_STAMP_BF1S = None
+PRED_KEYS_S = ("BF1S_vs_X", "BF1S_vs_B", "BF1S_vs_R", "BF1S_joint_saving", "BF1S_covered_share", "BF1S_residual_MB")
+PRED_BF1S_BY_B = {}
 
 
 def runner_choice(arm: str, check: bool):
@@ -173,6 +187,9 @@ def parse_args(argv):
     ap.add_argument("--bf-poll-ms", type=float, default=1.0, help="snap ready: the poll period while two waits are open")
     ap.add_argument("--bf-arrival", type=int, default=1, choices=(0, 1),
                     help="1: the ARRIVAL counters (deadline margins, useful early share, consume time, host overlap)")
+    ap.add_argument("--bf-ledger", type=int, default=1, choices=(0, 1),
+                    help="1: THE LEDGER (section 16): per joint pass (a) requested / completed, (b) covered, (c) missing "
+                         "(verifier-only, incomplete, lost), the consumer-address check (needs --bf-arrival 1)")
     ap.add_argument("--prefill-hook", default="nocopy", choices=("nocopy", "copy"))
     ap.add_argument("--tu-gemm", default="natural", choices=("natural", "rowgroup"))
     ap.add_argument("--spec-journal-blocks", type=int, default=256)
@@ -219,11 +236,14 @@ def parse_args(argv):
 
 
 def bf_opt(a, arm: str) -> dict:
-    """BgFetch's keyword arguments of a BF1 arm."""
-    return dict(mode=BF_ARMS[arm], n_cap=a.bf_ncap, ring=a.bf_ring, worker=a.bf_worker, acct=bool(a.bf_acct),
-                close_wait_ms=a.bf_close_wait_ms, packer=a.bf_packer, threads=a.bf_threads,
-                gf=dict(cap_groups=a.bf_cap_groups), late=a.bf_late, late_wait_ms=a.bf_late_wait_ms, batch=a.bf_batch,
-                snap=BF_SNAP.get(arm, a.bf_snap), poll_ms=a.bf_poll_ms, arrival=bool(a.bf_arrival))
+    """BgFetch's keyword arguments of a BF1 arm (an arm's fixed options, BF_SNAP / BF_FIXED, override the flags)."""
+    o = dict(mode=BF_ARMS[arm], n_cap=a.bf_ncap, ring=a.bf_ring, worker=a.bf_worker, acct=bool(a.bf_acct),
+             close_wait_ms=a.bf_close_wait_ms, packer=a.bf_packer, threads=a.bf_threads,
+             gf=dict(cap_groups=a.bf_cap_groups), late=a.bf_late, late_wait_ms=a.bf_late_wait_ms, batch=a.bf_batch,
+             snap=BF_SNAP.get(arm, a.bf_snap), poll_ms=a.bf_poll_ms, arrival=bool(a.bf_arrival),
+             ledger=bool(a.bf_ledger), retain=False)
+    o.update(BF_FIXED.get(arm, {}))
+    return o
 
 
 # ------------------------------------------------------------------ the arms (GPU)
@@ -325,18 +345,23 @@ def bf_gate(arm, bf, mode: str):
         and ar.get("items_sent_counted") == sent
         and ar.get("useful_store_counted") == sum(ar.get("items_useful_store_" + k, 0) for k in (
             "early", "late", "nodeadline", "unattributed")))
-    ok = ok and ready and arr_ok
+    lg = ar.get("ledger") or {}                                        # THE LEDGER (section 16): the demand partition
+    led_ok = (not lg.get("enabled")) or (bool(lg.get("closure_ok"))   # closes and every retained hit is read at its
+                                         and (lg.get("totals") or {}).get("addr_bad", 1) == 0)   # slot
+    comp_ok = bf.get("late_mode") != "complete" or not bf.get("late_passed")   # COMPLETE: no job dropped as passed
+    ok = ok and ready and arr_ok and led_ok and comp_ok
     return ("%s-BF" % arm, True, bool(ok),
             "error %s; jobs %s, issued %s, late %s; items seen %s, kept or sent before %s, capped %s, sent %s = device "
             "%s; committed %s, revived %s, no room %s (sum ok %s); used store %s, window %s, unused %s, pending %s (tags "
             "ok %s); snap %s, unready taken %s (ok %s); arrival enabled %s (scope %s), useful store counted %s, sent "
-            "counted %s (ok %s)"
+            "counted %s (ok %s); ledger closure %s, addr_bad %s (ok %s); late mode %s, passed %s (ok %s)"
             % (bf.get("error"), bf.get("jobs"), bf.get("issued"), bf.get("late"), bf.get("items_seen"),
                bf.get("items_have"), bf.get("items_cap"), sent, items, bf.get("committed"),
                bf.get("revived"), bf.get("no_room"), cons, bf.get("used_store"), bf.get("used_win"),
                bf.get("unused"), bf.get("pending"), tags, bf.get("snap_mode"), bf.get("snap_unready_taken"), ready,
                ar.get("enabled"), ar.get("useful_scope"), ar.get("useful_store_counted"), ar.get("items_sent_counted"),
-               arr_ok))
+               arr_ok, lg.get("closure_ok"), (lg.get("totals") or {}).get("addr_bad"), led_ok, bf.get("late_mode"),
+               bf.get("late_passed"), comp_ok))
 
 
 STORE_KEYS = ("cap", "store_slots")    # union.<key>: the fork store's size (store_slots = X, cap = X - 1)
@@ -439,6 +464,16 @@ def verdicts(sp, B: int, eqf=None):
              PR.get("BF1R_useful_early_store"))
         band("BF1R-SNAP-REST-MS", ((b.get("bf") or {}).get("worker_ms_per_epoch") or {}).get("snap_rest_s"),
              PR.get("BF1R_snap_rest_ms"))
+    ss = sp.get("L4PTFDGUDKWCDS")                                      # bf1c: the completed schedule (S), same job
+    if ss is not None:
+        PS = PRED_BF1S_BY_B.get(B) or {k: None for k in PRED_KEYS_S}
+        lg = (((ss.get("bf") or {}).get("arrival") or {}).get("ledger") or {})
+        band("BF1S-VS-X", ratio(med(ss), med(x)), PS.get("BF1S_vs_X"))
+        band("BF1S-VS-B", ratio(med(ss), med(b)), PS.get("BF1S_vs_B"))
+        band("BF1S-VS-R", ratio(med(ss), med(rr)) if rr is not None else None, PS.get("BF1S_vs_R"))
+        band("BF1S-JOINT-SAVING", diff(ph(x, "joint"), ph(ss, "joint")), PS.get("BF1S_joint_saving"))
+        band("BF1S-COVERED-SHARE", lg.get("covered_share"), PS.get("BF1S_covered_share"))
+        band("BF1S-RESIDUAL-MB", lg.get("residual_MB_per_pass"), PS.get("BF1S_residual_MB"))
     return out
 
 
@@ -482,7 +517,10 @@ def bf_lines(name, r) -> list:
                 bf.get("pipelined"), bf.get("overlapped")),
             "BF1 %s SNAP %s: unready snapshots taken %s, polls %s. ARRIVAL %s" % (
                 name, bf.get("snap_mode"), bf.get("snap_unready_taken"), bf.get("polls"),
-                {k: v for k, v in (bf.get("arrival") or {}).items()})]
+                {k: v for k, v in (bf.get("arrival") or {}).items() if k != "ledger"}),
+            "BF1 %s LEDGER (late %s, retain %s): %s" % (
+                name, bf.get("late_mode"), bf.get("retain"),
+                {k: v for k, v in ((bf.get("arrival") or {}).get("ledger") or {}).items() if k != "per_pass"})]
 
 
 # ------------------------------------------------------------------ main
@@ -629,7 +667,8 @@ def main(argv=None) -> int:
                 spec_body=a.spec_body, spec_graph=a.spec_graph, spec_redirect=a.spec_redirect,
                 probe_every=a.probe_every, check_every=a.check_every, require_stress=a.require_stress,
                 predictions=dict(stamp=PRED_STAMP_BF1, by_batch=PRED_BF1_BY_B, stamp_r=PRED_STAMP_BF1R,
-                                 by_batch_r=PRED_BF1R_BY_B), capture_rounds=caps,
+                                 by_batch_r=PRED_BF1R_BY_B, stamp_s=PRED_STAMP_BF1S, by_batch_s=PRED_BF1S_BY_B),
+                capture_rounds=caps,
                 steady_excluded_rounds=xr, strongest_tok_s=STRONGEST, budget_GB=BUDGET_GB, usable_GB=USABLE_GB,
                 dims=dims, host_mem=mem, base_commit=os.environ.get("BASE_COMMIT"), fork_blob=FORK_BLOB,
                 compile=dict(torch=torch.__version__, inductor_cache=os.environ.get("TORCHINDUCTOR_CACHE_DIR"),

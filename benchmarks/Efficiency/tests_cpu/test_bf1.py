@@ -209,7 +209,8 @@ def test_pure_rows_rank_alive():
 # ------------------------------------------------------------------ the world runs
 def _builder(mode="ce", worker="inline", Xs=None, acct=True, bneg=None, check=False, stats=False, kcheck=False,
              phase_marks=False, probe_every=0, n_cap=4096, ring=4, packer="torch", gf=None, threads=2, late="drop",
-             late_wait_ms=100.0, stall_ms=0.0, batch=8, hold=0, snap="newest", arrival=True, poll_ms=1.0):
+             late_wait_ms=100.0, stall_ms=0.0, batch=8, hold=0, snap="newest", arrival=True, poll_ms=1.0,
+             ledger=True, retain=False, lneg=None, kslots=None):
     """i4dc_world.d_builder's L4PTFDGUDKWCD with the BF1 runner and its options (and the store X)."""
     BF = _mod("r2_bf1_fetch")
     W, RE, SR, I3, KA, RW, WB, Z = X.W, X.RE, X.SR, X.I3, X.KA, X.RW, X.WB, X.Z
@@ -227,10 +228,11 @@ def _builder(mode="ce", worker="inline", Xs=None, acct=True, bneg=None, check=Fa
         kw = dict(fork=Z.fake_fork, t0=tok0, hooks=None, check_every=check_every, union_check=check, union_stats=stats,
                   phase_marks=phase_marks, dneg=None, hneg=None, gneg=None, sneg=None, dgneg=None,
                   cc_backend="inductor", ccneg=None, cdneg=None, keep=True, kwin=True, kcheck=kcheck, kneg=None,
-                  kslots=None, cneg=None, bf=dict(mode=mode, worker=worker, acct=acct, bneg=bneg, n_cap=n_cap,
-                                                  ring=ring, packer=packer, gf=gf, threads=threads, late=late,
-                                                  late_wait_ms=late_wait_ms, stall_ms=stall_ms, batch=batch,
-                                                  hold=hold, snap=snap, arrival=arrival, poll_ms=poll_ms))
+                  kslots=kslots, cneg=None, bf=dict(mode=mode, worker=worker, acct=acct, bneg=bneg, n_cap=n_cap,
+                                                    ring=ring, packer=packer, gf=gf, threads=threads, late=late,
+                                                    late_wait_ms=late_wait_ms, stall_ms=stall_ms, batch=batch,
+                                                    hold=hold, snap=snap, arrival=arrival, poll_ms=poll_ms,
+                                                    ledger=ledger, retain=retain, lneg=lneg))
         be = X.FakeGraphsDCD()
         run = Runner(model, rs, sops, BC.HostClock(), graph_backend=be, **kw)
         be.T = run.T
@@ -907,6 +909,164 @@ def test_bf1_worker_failure(where):
     bf.stop()
 
 
+# ------------------------------------------------------------------ section 16: the completed schedule and THE LEDGER
+LEDGER_SUM = ("hit_cache", "hit_retained", "miss_verifier_only", "miss_req_incomplete", "miss_lost")
+
+
+def _ledger_checks(ev, ref, scen="timing", claim=True):
+    """The ledger's closures against INDEPENDENT counters: the keep's own per-pass record (r2_i4d_keep keep_read:
+    listed = the demand, fetched = the misses, hits_total); the claim and the gates (the -BF gate checks closure_ok and
+    addr_bad == 0). Returns (bf record, ledger)."""
+    bf = ev["rd"]["bf"]
+    lg = bf["arrival"]["ledger"]
+    kp = ev["rd"]["keep"]
+    tot = lg["totals"]
+    assert lg["enabled"] and lg["closure_ok"] and lg["passes"] > 0, lg
+    assert tot["demand"] == sum(tot[k] for k in LEDGER_SUM), tot
+    assert tot["demand"] == kp["listed_total"], (tot["demand"], kp["listed_total"])          # independent: the keep
+    assert tot["hit_cache"] + tot["hit_retained"] == kp["hits_total"], (tot, kp["hits_total"])
+    assert tot["miss_verifier_only"] + tot["miss_req_incomplete"] + tot["miss_lost"] == kp["fetched_total"], (
+        tot, kp["fetched_total"])
+    assert tot["addr_bad"] == 0 and tot["addr_ok"] == tot["hit_retained"], tot      # every retained hit read at its slot
+    assert tot["requested"] >= tot["completed"], tot
+    if claim:
+        bad = TS._diff(ref, ev, skip=DIFF_RD, tensors_skip=DIFF_T)
+        assert bad == [], bad[:10]
+        gs = _gates(ev, scen)
+        assert all(g[2] for g in gs if g[1]), [g for g in gs if g[1] and not g[2]]
+    return bf, lg
+
+
+@pytest.mark.parametrize("worker,late,snap,retain", [("inline", "drop", "newest", False),
+                                                     ("thread", "defer", "newest", False),
+                                                     ("thread", "complete", "ready", True)])
+def test_bf1_ledger(worker, late, snap, retain):
+    """SECTION 16, THE LEDGER in the arms B (inline / thread, drop / defer) and S (ready + complete + retain): the demand
+    partition closes and equals the keep's own listed / fetched / hit counters (independent); every retained hit is
+    read at its slot by the fork's page ids (addr_ok = hit_retained, addr_bad 0); the fetch side (requested >=
+    completed > 0) and the coverage are reported; the claim and the gates hold. complete: no job passed."""
+    ref = _plain("GUDKCD")
+    ev = _run_bf("timing", worker=worker, late=late, late_wait_ms=60000.0, snap=snap, retain=retain)
+    bf, lg = _ledger_checks(ev, ref)
+    tot = lg["totals"]
+    _ev("BF1 LEDGER %s / %s / %s / retain %s: %s; covered %s, retained %s, residual %s items per pass; completed share "
+        "%s" % (worker, late, snap, retain, tot, lg["covered_share"], lg["retained_share"],
+                lg["residual_items_per_pass"], lg["completed_share"]))
+    assert tot["hit_retained"] > 0 and tot["completed"] > 0, tot    # L34: the retained path was read
+    if late == "complete":
+        assert not bf["late_passed"] and bf["late_mode"] == "complete", bf["late_passed"]
+
+
+def test_bf1_ledger_check_rounds():
+    """The ledger with RETENTION in the CHECK scenario (every round a check round): the keep's capacity proof still
+    holds with the retention mask (kchk overflow 0, missing 0, dup 0) and the fresh-fetch byte check passes (bytes_bad
+    0): the protected slots never displace this layer's hits, and every read byte is the host block's."""
+    _plain("GUDKC", "check")
+    ref = _plain("GUDKCD", "check")
+    ev = _run_bf("check", worker="thread", late="complete", late_wait_ms=60000.0, snap="ready", retain=True)
+    bf, lg = _ledger_checks(ev, ref, scen="check")
+    ck = ev["rd"]["keep"]["check"]
+    _ev("BF1 LEDGER CHECK: %s; keep check %s" % (lg["totals"], ck))
+    assert ck["overflow"] == 0 and ck["missing"] == 0 and ck["dup"] == 0 and ck["bytes_bad"] == 0, ck
+    assert ck["bytes_checked"] > 0 and lg["totals"]["hit_retained"] > 0, (ck, lg["totals"])
+
+
+@pytest.mark.parametrize("retain", [False, True])
+def test_bf1_retention_pressure(retain):
+    """RETENTION under capacity pressure (kslots = the most listed blocks of one (head, request, layer) of the plain arm,
+    as test_i4d.py's test_keep_pressure: the keep fits, little is spare), check scenario: without retention the keep's
+    eviction may take unread retained slots of later layers; with retention they are protected up to the spare
+    capacity (retain_protected) and the overflow fallback is counted (retain_overflow); in both, the capacity proof and
+    the byte check hold (no stale read) and the claim holds."""
+    _plain("GUDKC", "check")
+    ref = _plain("GUDKCD", "check")
+    em = ((_plain("D", "check")["rd"].get("union") or {}).get("extras_max"))
+    assert em is not None, "no union.extras_max in the plain arm's check record"
+    ks = max(1, int(em))
+    ev = _run_bf("check", worker="inline", late="drop", retain=retain, kslots=ks)
+    bf, lg = _ledger_checks(ev, ref, scen="check")
+    tot, ck = lg["totals"], ev["rd"]["keep"]["check"]
+    _ev("BF1 RETENTION kslots %d retain %s: lost_tagged %d, miss_lost %d, protected %d, overflow %d; covered %s; keep "
+        "check %s" % (ks, retain, tot["lost_tagged"], tot["miss_lost"], tot["retain_protected"],
+                      tot["retain_overflow"], lg["covered_share"], ck))
+    assert ck["overflow"] == 0 and ck["bytes_bad"] == 0 and ck["missing"] == 0, ck
+    if retain:
+        assert tot["retain_protected"] + tot["retain_overflow"] > 0, tot           # L34: there was something to protect
+    else:
+        assert tot["retain_protected"] == 0 and tot["retain_overflow"] == 0, tot
+
+
+def test_bf1_lost_retention_plant():
+    """PLANT: EVICTION BEFORE THE READ (lneg "evict_retained": before every joint layer's keep, every unread retained
+    slot of a LATER layer leaves the map). Lost retention is counted (lost_tagged > 0, miss_lost > 0: requested,
+    completed, missing at the read); the keep refetches those blocks (a synchronous gather), so NO stale byte is read:
+    the claim, the gates and the byte check (check scenario) hold."""
+    _plain("GUDKC", "check")
+    ref = _plain("GUDKCD", "check")
+    ev = _run_bf("check", worker="inline", late="drop", lneg="evict_retained")
+    bf, lg = _ledger_checks(ev, ref, scen="check")
+    tot, ck = lg["totals"], ev["rd"]["keep"]["check"]
+    _ev("BF1 LOST-RETENTION PLANT: %s; keep check %s" % (tot, ck))
+    assert tot["lost_tagged"] > 0 and tot["miss_lost"] > 0, tot
+    assert ck["bytes_bad"] == 0 and ck["bytes_checked"] > 0, ck
+
+
+@pytest.mark.parametrize("late", ["complete", "defer0"])
+def test_bf1_late_fetch_plant(late):
+    """PLANT: A LATE FETCH (a slow worker, stall 200 ms per job). complete: the joint pass WAITS for it (no job passed;
+    deferred jobs commit at their layer; their items are counted late by the arrival block, and their reads are
+    retained hits); defer with a 0 ms budget: jobs that land after their layer ran are PASSED and their demand is
+    counted (c) miss_req_incomplete. In both, no stale byte (the claim holds)."""
+    ref = _plain("GUDKCD")
+    lm, lw = ("complete", 60000.0) if late == "complete" else ("defer", 0.0)
+    ev = _run_bf("timing", worker="thread", late=lm, late_wait_ms=lw, stall_ms=200.0, ring=2)
+    bf, lg = _ledger_checks(ev, ref)
+    tot, ar = lg["totals"], bf["arrival"]
+    _ev("BF1 LATE-FETCH %s: passed %s, deferred committed %s, sent late %d; ledger %s" % (
+        late, bf.get("late_passed"), bf.get("deferred_committed"), ar["items_sent_late"], tot))
+    if late == "complete":
+        assert not bf.get("late_passed") and bf.get("deferred_committed", 0) > 0, bf
+        assert ar["items_sent_late"] > 0, ar["items_sent_late"]       # late, but completed and read retained
+    else:
+        assert bf.get("late_passed", 0) > 0 and tot["miss_req_incomplete"] > 0, (bf.get("late_passed"), tot)
+
+
+def test_bf1_verifier_only_plant():
+    """PLANT: VERIFIER-ONLY DEMAND (no draft requests anything: the draft hook is a no-op). Every missed block is
+    verifier-only (nothing requested, nothing completed, nothing retained): miss_verifier_only = fetched, hit_retained
+    = miss_req_incomplete = miss_lost = requested = 0."""
+    ref = _plain("GUDKCD")
+
+    def setup(run):
+        run.bf.on_draft = lambda *a, **k: None
+    ev = _run_bf("timing", worker="inline", late="drop", setup=setup)
+    bf, lg = _ledger_checks(ev, ref, claim=False)                    # -BF needs issued > 0: not this plant's claim
+    bad = TS._diff(ref, ev, skip=DIFF_RD, tensors_skip=DIFF_T)
+    assert bad == [], bad[:10]
+    tot = lg["totals"]
+    _ev("BF1 VERIFIER-ONLY PLANT: %s" % tot)
+    assert tot["requested"] == tot["completed"] == tot["hit_retained"] == 0, tot
+    assert tot["miss_req_incomplete"] == tot["miss_lost"] == 0, tot
+    assert tot["miss_verifier_only"] == ev["rd"]["keep"]["fetched_total"] > 0, tot
+
+
+def test_bf1_consumer_address_plant():
+    """PLANT: THE CONSUMER-ADDRESS CHECK (lneg "addr_redirect": the fork's page id of every retained hit points at slot
+    0 instead of its slot). The check counts every redirected read (addr_bad = hit_retained > 0, addr_ok 0) and the
+    wrong read changes the output (EQF fails): the check sees the address that the attention reads. CONTROL: the
+    ledger tests (addr_bad 0, addr_ok = hit_retained)."""
+    _plain("GUDKC", "check")
+    _plain("GUDKCD", "check")
+    ev = _run_bf("check", worker="inline", late="drop", lneg="addr_redirect")
+    tot = ev["rd"]["bf"]["arrival"]["ledger"]["totals"]
+    gs = {g[0]: g for g in _gates(ev, "check")}
+    _ev("BF1 ADDRESS PLANT: addr_ok %d, addr_bad %d, hit_retained %d; EQF %s; BF %s" % (
+        tot["addr_ok"], tot["addr_bad"], tot["hit_retained"], gs["L4PTFDGUDKWCDB-EQF"][2], gs["L4PTFDGUDKWCDB-BF"][2]))
+    assert tot["hit_retained"] > 0 and tot["addr_bad"] == tot["hit_retained"] and tot["addr_ok"] == 0, tot
+    assert not gs["L4PTFDGUDKWCDB-BF"][2], gs["L4PTFDGUDKWCDB-BF"]       # the -BF gate fails on addr_bad
+    assert not gs["L4PTFDGUDKWCDB-EQF"][2], gs["L4PTFDGUDKWCDB-EQF"]     # the wrong read is caught downstream too
+
+
 def test_bf1_carry():
     """A job that does not fit the batch's landing entry (n_cap 1: one item per batch) is CARRIED into the next batch,
     not dropped: carried > 0, the claim, the gates and the counters hold (torch packer, thread worker, a certain
@@ -1042,7 +1202,8 @@ def test_cell_pure(monkeypatch):
     assert sr is None or (re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", sr) and PR.get("BF1R_vs_X") is not None), sr
 
 
-CELLS = {"bf1m": (10, 8, 72), "bf1a": (65, 216, 512), "bf1b": (10, 318, 512), "bf1r": (10, 318, 512)}
+CELLS = {"bf1m": (10, 8, 72), "bf1a": (65, 216, 512), "bf1b": (10, 318, 512), "bf1r": (10, 318, 512),
+         "bf1c": (18, 287, 512)}
 
 
 def test_step_script_bf1(monkeypatch, tmp_path):
@@ -1055,7 +1216,10 @@ def test_step_script_bf1(monkeypatch, tmp_path):
     assert "NOSI=/mnt/beegfs/ojerbi/nosi-r2-bf1" in text and "CELLPY=benchmarks/Efficiency/r2_bf1_cell.py" in text
     assert "benchmarks/Efficiency/r2_bf1_fetch.py" in text and "^PRED_STAMP_BF1 = None$" in text   # the STOP rule
     assert "^PRED_STAMP_BF1R = None$" in text and '[ "$NEEDPRED" = 2 ] && [ "$NOPREDR" = 1 ]' in text     # bf1r's
-    assert "--bf-snap newest --bf-poll-ms 1" in text and "--bf-arrival 1" in text
+    assert "--bf-snap newest --bf-poll-ms 1" in text and "--bf-arrival 1 --bf-ledger 1" in text
+    assert "^PRED_STAMP_BF1S = None$" in text and '[ "$NEEDPRED" = 3 ] && [ "$NOPREDS" = 1 ]' in text     # bf1c's
+    ls_ = "PRED_STAMP_BF1S = None" if C.PRED_STAMP_BF1S is None else 'PRED_STAMP_BF1S = "%s"' % C.PRED_STAMP_BF1S
+    assert re.search("^%s$" % re.escape(ls_), (EFF / "r2_bf1_cell.py").read_text(), re.M), ls_
     lr = "PRED_STAMP_BF1R = None" if C.PRED_STAMP_BF1R is None else 'PRED_STAMP_BF1R = "%s"' % C.PRED_STAMP_BF1R
     assert re.search("^%s$" % re.escape(lr), (EFF / "r2_bf1_cell.py").read_text(), re.M), lr
     cell_src = (EFF / "r2_bf1_cell.py").read_text()                   # STATE-AWARE: the cell's line the rule reads
@@ -1073,13 +1237,20 @@ def test_step_script_bf1(monkeypatch, tmp_path):
                 "--check-every", kv.get("CHECK", "0"), "--require-stress", kv.get("STRESS", "0"),
                 "--bf-acct", kv.get("ACCT", "0"), "--bf-packer", "gilfree", "--bf-threads", "14", "--bf-ring",
                 kv["RING"], "--bf-cap-groups", "2048", "--bf-batch", "8", "--bf-late", "defer", "--bf-late-wait-ms",
-                "250", "--bf-snap", "newest", "--bf-poll-ms", "1", "--bf-arrival", "1"]
+                "250", "--bf-snap", "newest", "--bf-poll-ms", "1", "--bf-arrival", "1", "--bf-ledger", "1"]
         a = C.parse_args(argv)
         o = C.bf_opt(a, "L4PTFDGUDKWCDB")
         assert a.bf_packer == "gilfree" and o["late"] == "defer" and o["batch"] == 8 and o["ring"] == int(kv["RING"])
         assert o["gf"] == dict(cap_groups=2048) and o["snap"] == "newest" and o["arrival"] is True
+        assert o["ledger"] is True and o["retain"] is False
         assert "L4PTFDGUDKWCDB" in a.arms and "L4PTFDGUDKWCDX" in a.arms, (cell, a.arms)
-        assert ("L4PTFDGUDKWCDR" in a.arms) == (cell in ("bf1r", "bf1m")), (cell, a.arms)
-        if cell in ("bf1r", "bf1m"):
+        assert ("L4PTFDGUDKWCDR" in a.arms) == (cell in ("bf1r", "bf1m", "bf1c")), (cell, a.arms)
+        assert ("L4PTFDGUDKWCDS" in a.arms) == (cell in ("bf1m", "bf1c")), (cell, a.arms)
+        if cell in ("bf1r", "bf1m", "bf1c"):
             assert C.bf_opt(a, "L4PTFDGUDKWCDR")["snap"] == "ready"
+        if cell in ("bf1m", "bf1c"):
+            s = C.bf_opt(a, "L4PTFDGUDKWCDS")
+            assert (s["snap"], s["late"], s["retain"], s["ledger"]) == ("ready", "complete", True, True), s
+        if cell == "bf1c":
+            assert int(kv["BFX"]) == 0, kv["BFX"]                       # 129 slots at the anchor (memory)
     _ev("BF1 STEP: cells %s parse" % sorted(CELLS))
